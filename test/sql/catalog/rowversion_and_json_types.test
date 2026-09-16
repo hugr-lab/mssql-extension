@@ -1,0 +1,199 @@
+# name: test/sql/catalog/rowversion_and_json_types.test
+# description: rowversion reads as BLOB instead of failing the CAST, and the 2025 JSON type reads uncast (issue #296)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Two type names that were not in the catalog's table and therefore took the
+# unknown-type route, CAST(col AS NVARCHAR(MAX)):
+#
+#   rowversion, whose name in sys.types is `timestamp` and which has nothing to
+#   do with time. The CAST is not merely wasteful there, the server REFUSES it
+#   with error 529, so a table carrying such a column could not be read at all.
+#   It is BIGBINARY(8) on the wire, which the binary codec already decodes.
+#
+#   json, new in SQL Server 2025, which arrives as varchar(max) under a UTF-8
+#   collation. The CAST worked but converted every value server-side for
+#   nothing.
+#
+# The JSON half is version-gated: the type does not exist before 2025, so the
+# test creates that table only when the server has it, and the assertions on it
+# are skipped otherwise.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rvt (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('rvt', 'IF OBJECT_ID(''dbo.RowVersionTypes'') IS NOT NULL DROP TABLE dbo.RowVersionTypes');
+
+statement ok
+SELECT mssql_exec('rvt', 'CREATE TABLE dbo.RowVersionTypes (id INT NOT NULL PRIMARY KEY, rv ROWVERSION, note NVARCHAR(20) NULL)');
+
+statement ok
+SELECT mssql_exec('rvt', 'INSERT INTO dbo.RowVersionTypes (id, note) VALUES (1, N''one''), (2, N''two'')');
+
+statement ok
+SELECT mssql_invalidate_cache('rvt');
+
+# --- the catalog reports BLOB, not VARCHAR.
+query I
+SELECT data_type FROM duckdb_columns() WHERE table_name = 'RowVersionTypes' AND column_name = 'rv';
+----
+BLOB
+
+# --- and the table reads, which is the whole of issue #296: before this the
+# statement below failed with
+#   SQL Server error [529]: Explicit conversion from data type timestamp to
+#   nvarchar(max) is not allowed.
+query II
+SELECT id, octet_length(rv) FROM rvt.dbo.RowVersionTypes ORDER BY id;
+----
+1	8
+2	8
+
+# --- the values are the server's counter: distinct per row, and they move when
+# the row is written again.
+query I
+SELECT count(DISTINCT rv) FROM rvt.dbo.RowVersionTypes;
+----
+2
+
+statement ok
+CREATE TABLE before_update AS SELECT id, rv FROM rvt.dbo.RowVersionTypes WHERE id = 1;
+
+statement ok
+SELECT mssql_exec('rvt', 'UPDATE dbo.RowVersionTypes SET note = N''one!'' WHERE id = 1');
+
+query I
+SELECT count(*) FROM rvt.dbo.RowVersionTypes t JOIN before_update b ON b.id = t.id WHERE t.rv = b.rv;
+----
+0
+
+# --- a projection that does NOT name the column still works (the CAST used to
+# be emitted per selected column, so this passed even when the one above did
+# not; it is here so a regression that only half-reverts is still caught).
+query I
+SELECT count(*) FROM rvt.dbo.RowVersionTypes;
+----
+2
+
+# --- the query these columns exist for: everything written since a mark. The
+# server's bytes are big-endian (measured: 0x...1fcc, 1fcd, 1fce for three
+# consecutive writes), so a BLOB compares bytewise in the order the counter
+# advances and no conversion is needed on either side. This is also why the
+# mapping is BLOB and not BIGINT, which the issue suggested: the counter is
+# unsigned and would go negative past 2^63.
+statement ok
+CREATE TABLE rv_mark AS SELECT rv FROM rvt.dbo.RowVersionTypes WHERE id = 1;
+
+statement ok
+SELECT mssql_exec('rvt', 'UPDATE dbo.RowVersionTypes SET note = N''bumped'' WHERE id = 2');
+
+query I
+SELECT id FROM rvt.dbo.RowVersionTypes WHERE rv > (SELECT rv FROM rv_mark) ORDER BY id;
+----
+2
+
+# --- and the comparison reaches the server rather than running client-side:
+# the plan is the scan alone, with no DuckDB FILTER above it. Before #296 the
+# column was cast-required, which refuses parameterisation outright.
+query II
+EXPLAIN SELECT id FROM rvt.dbo.RowVersionTypes WHERE rv > '\x00\x00\x00\x00\x00\x00\x00\x01'::BLOB;
+----
+physical_plan	<!REGEX>:.*FILTER.*
+
+statement ok
+DROP TABLE rv_mark;
+
+# --- an INSERT must not try to write the column. The server refuses an
+# explicit value with error 273, and the extension leaves unnamed columns out
+# of the statement it generates, so naming the other columns works.
+statement ok
+INSERT INTO rvt.dbo.RowVersionTypes (id, note) VALUES (3, 'three');
+
+query I
+SELECT count(*) FROM rvt.dbo.RowVersionTypes;
+----
+3
+
+statement error
+INSERT INTO rvt.dbo.RowVersionTypes (id, rv, note) VALUES (4, '\x01'::BLOB, 'four');
+----
+273
+
+# --- and the bulk path refuses it too, rather than silently dropping the
+# values. This is worth pinning because the fix above made `timestamp` a known
+# type, which is also what lets such an INSERT reach the bulk path at all: a
+# cast-required column keeps an INSERT on statements (spec 062 W1). The server
+# rejects the `INSERT BULK` statement itself for naming the column, so both
+# paths give the same answer.
+statement ok
+SET mssql_insert_bcp_threshold = 10;
+
+statement error
+INSERT INTO rvt.dbo.RowVersionTypes (id, rv, note) SELECT i, '\x01'::BLOB, 'x' FROM range(100, 120) s(i);
+----
+Cannot insert an explicit value into a timestamp column
+
+query I
+SELECT count(*) FROM rvt.dbo.RowVersionTypes;
+----
+3
+
+# --- not naming it, above the threshold: the bulk load runs and the server
+# fills the column in.
+statement ok
+INSERT INTO rvt.dbo.RowVersionTypes (id, note) SELECT i, 'bulk' FROM range(100, 120) s(i);
+
+query II
+SELECT count(*), count(DISTINCT rv) FROM rvt.dbo.RowVersionTypes;
+----
+23	23
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+statement ok
+SELECT mssql_exec('rvt', 'DROP TABLE dbo.RowVersionTypes');
+
+# =============================================================================
+# The native JSON type, SQL Server 2025 and later only.
+# =============================================================================
+
+statement ok
+CREATE TABLE has_json AS SELECT count(*) > 0 AS yes FROM mssql_scan('rvt', 'SELECT name FROM sys.types WHERE name = ''json''');
+
+# The remaining cases run against a table that exists only on 2025; on an older
+# server the create is skipped and every assertion below reads zero rows from a
+# table that is never populated, which is what the guarded counts assert.
+statement ok
+SELECT mssql_exec('rvt', 'IF EXISTS (SELECT 1 FROM sys.types WHERE name = ''json'')
+BEGIN
+  IF OBJECT_ID(''dbo.JsonTypes'') IS NOT NULL DROP TABLE dbo.JsonTypes;
+  EXEC(''CREATE TABLE dbo.JsonTypes (id INT NOT NULL PRIMARY KEY, doc JSON NULL)'');
+  EXEC(''INSERT INTO dbo.JsonTypes (id, doc) VALUES (1, ''''{"a":1,"b":[1,2]}''''), (2, NULL)'');
+END');
+
+statement ok
+SELECT mssql_invalidate_cache('rvt');
+
+# --- on 2025 the column is VARCHAR and its bytes arrive verbatim; on an older
+# server there is no table and the query is not run at all.
+query I
+SELECT CASE WHEN (SELECT yes FROM has_json)
+            THEN (SELECT count(*) FROM duckdb_columns()
+                  WHERE table_name = 'JsonTypes' AND column_name = 'doc' AND data_type = 'VARCHAR')
+            ELSE 1 END;
+----
+1
+
+statement ok
+SELECT mssql_exec('rvt', 'IF OBJECT_ID(''dbo.JsonTypes'') IS NOT NULL DROP TABLE dbo.JsonTypes');
+
+statement ok
+DETACH rvt;

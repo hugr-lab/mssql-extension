@@ -60,6 +60,40 @@ installation is *not* one of those. See
 | ----------------- | -------------- | ---------------------------- |
 | `BINARY(n)`       | `BLOB`         | Fixed-length binary          |
 | `VARBINARY(n)`    | `BLOB`         | Variable-length binary       |
+| `ROWVERSION`      | `BLOB`         | 8 bytes; `TIMESTAMP` is its other name and has nothing to do with time |
+
+**`ROWVERSION` / `TIMESTAMP` notes** (issue #296): the column is an 8-byte
+counter, and `sys.types` calls it `timestamp`, which is why it is easy to
+mistake for a date. It arrives as `binary(8)` on the wire and is read with no
+conversion. Do not write it: SQL Server refuses an explicit value with error
+273, so leave the column out of the `INSERT` column list and let the server
+maintain it.
+
+**It is not a time, so it is not mapped to `TIMESTAMP`.** The counter is
+database-wide and advances once per write to *any* table, which is what
+`@@DBTS` returns. Three rows, the second written two seconds after the first,
+the third ten milliseconds after the second with three writes to another table
+in between:
+
+| row | counter | actually written at |
+| --- | ------- | ------------------- |
+| 1   | 8328    | 10:11:45.351        |
+| 2   | 8329    | 10:11:47.351        |
+| 3   | 8333    | 10:11:47.361        |
+
+Two seconds of waiting moved it by one; ten milliseconds moved it by four.
+Reported as a DuckDB `TIMESTAMP` those values would read
+`1970-01-01 00:00:00.008328` and `1970-01-01 00:00:00.008333`: not a rounded
+time but an invented one. Microsoft deprecates the `timestamp` spelling for
+the same reason and asks for `rowversion`; both are accepted here.
+
+`BLOB` rather than `BIGINT`, which the issue also suggested, for two reasons.
+The counter is **unsigned**, so past 2^63 a `BIGINT` would report negative
+values for perfectly ordinary rows. And the bytes are **big-endian**, so a
+`BLOB` compares bytewise in exactly the order the counter advances: the
+change-tracking query these columns exist for, `WHERE rv > <last seen>`,
+orders and filters correctly with no conversion on either side, and the
+comparison pushes down to the server as a `varbinary` parameter.
 
 ### Date/Time Types
 
@@ -81,6 +115,7 @@ installation is *not* one of those. See
 | ------------------- | -------------- | ---------------------------- |
 | `UNIQUEIDENTIFIER`  | `UUID`         | 128-bit GUID                 |
 | `XML`               | `VARCHAR`      | PLP encoding, UTF-16LE decoded to UTF-8, up to 2 GB |
+| `JSON`              | `VARCHAR`      | SQL Server 2025 and later; arrives as UTF-8 `varchar(max)` and is read verbatim |
 
 **XML type notes:**
 - **SELECT**: XML columns are read via the same PLP + UTF-16LE code path as NVARCHAR(MAX)

@@ -523,9 +523,13 @@ static void TestDeclarationForColumn() {
 	ASSERT_TRUE(decl(Col("u", 1, "uniqueidentifier", 16, 0, 0), Value(LogicalType::UUID)) == "uniqueidentifier");
 	ASSERT_TRUE(decl(Col("b", 1, "varbinary", 8, 0, 0), Value::BLOB_RAW(std::string("\x01\x02", 2))) == "varbinary(8)");
 	ASSERT_TRUE(decl(Col("b", 1, "varbinary", -1, 0, 0), Value::BLOB_RAW(std::string("\x01", 1))) == "varbinary(max)");
-	// rowversion is not a known type to the column mapper (is_cast_required), so
-	// the scan casts it and the constant stays a literal
-	ASSERT_TRUE(decl(Col("rv", 1, "timestamp", 8, 0, 0), Value::BLOB_RAW(std::string("\x01", 1))).empty());
+	// rowversion, whose sys.types name is `timestamp`. It became a KNOWN type
+	// with issue #296 — the scan no longer casts it, because SQL Server refuses
+	// the cast (error 529) — so the constant is now a parameter declared from
+	// the column, `varbinary(8)`, and the branch in DeclarationForColumn that
+	// has always named `timestamp`/`rowversion` is finally reachable.
+	ASSERT_TRUE(decl(Col("rv", 1, "timestamp", 8, 0, 0), Value::BLOB_RAW(std::string("\x01", 1))) ==
+				"varbinary(8)");
 	// no parameter form: stays a literal
 	ASSERT_TRUE(decl(Col("x", 1, "xml", -1, 0, 0), Value("<a/>")).empty());
 	ASSERT_TRUE(decl(Col("g", 1, "geography", -1, 0, 0), Value("x")).empty());

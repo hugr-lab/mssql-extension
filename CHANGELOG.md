@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ROWVERSION` columns are readable, and the native `JSON` type of SQL
+  Server 2025 is read uncast** ([#296](https://github.com/hugr-lab/mssql-extension/issues/296)).
+  Neither type name was in the catalog's table, so both took the unknown-type
+  route, `CAST(col AS NVARCHAR(MAX))`. For `rowversion` that is not merely
+  wasteful, the server **refuses** it — `[529] Explicit conversion from data
+  type timestamp to nvarchar(max) is not allowed` — so a table carrying such a
+  column could not be read at all. It is `binary(8)` on the wire and now reads
+  as `BLOB` with no conversion; the name to look for in `sys.types` is
+  `timestamp`, which has nothing to do with time. Do not write it: SQL Server
+  refuses an explicit value with error 273, so leave it out of the INSERT
+  column list. The 2025 `JSON` type arrives as `varchar(max)` under a UTF-8
+  collation and now reads as `VARCHAR` directly, where the CAST used to convert
+  every value server-side for nothing.
+
 - **INSERT loads through BCP** (spec 062). An INSERT with more rows than
   `mssql_insert_bcp_threshold` (default 1000), no `RETURNING` and no
   explicitly named identity column goes through `INSERT BULK` — the wire
@@ -28,15 +42,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks constraints, fires triggers and keeps its NULLs — a bulk load
   ignores all three by default, and COPY still does. A failed load names
   the batch and says `rolled back`. The batch size, TABLOCK policy and
-  writer count are the `mssql_copy_*` settings.
+  writer count are the `mssql_copy_*` settings. Reviewed by
+  [@oluies](https://github.com/oluies), who found the writer rule blind to a
+  nonclustered index and pushed the fix (#349, merged into #348) — a heap
+  carrying one takes Sch-M rather than BU, and the extra writers stall 30 s
+  behind it.
 
 - **The catalog knows which columns are IDENTITY** (spec 062 W4, the
   metadata half of #327). `sys.columns.is_identity` rides in the four
   column-metadata queries and on `MSSQLColumnInfo`; the INSERT planner reads
-  it instead of hard-coding false. Not yet visible through DuckDB — the
-  binder half of #327 (omitting the column from a column-list-less INSERT)
-  needs an upstream hook — but it is what routes an INSERT that names an
-  identity column onto the statement path once INSERT goes through BCP.
+  it instead of hard-coding false. It is what routes an INSERT that names an
+  identity column onto the statement path. The other half of #327 — omitting
+  the column from a column-list-less INSERT — is not reachable from an
+  extension: DuckDB's binder compares the value count against the columns the
+  catalog reports, before any extension code runs. See spec 077.
 
 - **Pushed filters are parameterised** (spec 076). The constants of a pushed
   filter travel as `sp_executesql` parameters declared from the column they

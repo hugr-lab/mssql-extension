@@ -286,6 +286,32 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 		return LogicalType::BLOB;
 	}
 
+	// rowversion, whose type name in sys.types is the misleading `timestamp`:
+	// nothing to do with time, an 8-byte counter the server bumps on every
+	// write (issue #296). It arrives as BIGBINARY(8) — `sp_describe_first_result_set`
+	// reports tds_type_id 173, length 8, and the describe path in
+	// mssql_functions.cpp has always mapped it that way — so the binary codec
+	// decodes it with no help. Until this line it fell through to the VARCHAR
+	// default below and was therefore CAST, which SQL Server refuses outright:
+	// `[529] Explicit conversion from data type timestamp to nvarchar(max) is
+	// not allowed`, making every table with such a column unreadable. Both
+	// spellings are accepted because a user writes ROWVERSION and sys.types
+	// answers timestamp.
+	if (lower_type == "timestamp" || lower_type == "rowversion") {
+		return LogicalType::BLOB;
+	}
+
+	// The native JSON type of SQL Server 2025. On the wire it is plain
+	// varchar(max) under a UTF-8 BIN2 collation — `sp_describe_first_result_set`
+	// answers system_type_name `varchar(max)`, tds_type_id 167 — so the bytes
+	// are already what a DuckDB VARCHAR wants and the binary kernel reads them
+	// as they are. Naming it here is only about NOT treating it as unknown:
+	// without the name it is CAST to NVARCHAR(MAX), which works and costs a
+	// server-side conversion of every value for nothing.
+	if (lower_type == "json") {
+		return LogicalType::VARCHAR;
+	}
+
 	// Special types
 	if (lower_type == "uniqueidentifier") {
 		return LogicalType::UUID;
@@ -320,6 +346,11 @@ bool MSSQLColumnInfo::IsKnownSQLServerType(const string &sql_type_name) {
 		   lower_type == "datetime2" || lower_type == "smalldatetime" || lower_type == "datetimeoffset" ||
 		   lower_type == "binary" || lower_type == "varbinary" || lower_type == "image" ||
 		   lower_type == "uniqueidentifier" ||
+		   // rowversion: BIGBINARY(8) on the wire, and CASTing it is not merely
+		   // wasteful but rejected by the server with error 529 (issue #296).
+		   lower_type == "timestamp" || lower_type == "rowversion" ||
+		   // The 2025 JSON type: varchar(max) with a UTF-8 collation on the wire.
+		   lower_type == "json" ||
 		   // XML has dedicated TDS-level support (0xF1) and works without CAST
 		   lower_type == "xml" ||
 		   // Spatial UDTs — handled by table-scan rewrite to STAsBinary() (spec 045 / sub-phase 5).
