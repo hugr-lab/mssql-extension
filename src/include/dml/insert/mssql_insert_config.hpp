@@ -134,10 +134,12 @@ struct MSSQLInsertColumn {
 
 	// Full constructor
 	MSSQLInsertColumn(const string &name, LogicalType duckdb_type, const string &mssql_type, bool is_identity,
-					  bool is_nullable, bool has_default, const string &collation, uint8_t precision, uint8_t scale)
+					  bool is_nullable, bool has_default, const string &collation, uint8_t precision, uint8_t scale,
+					  int16_t max_length = 0)
 		: name(name),
 		  duckdb_type(std::move(duckdb_type)),
 		  mssql_type(mssql_type),
+		  max_length(max_length),
 		  is_identity(is_identity),
 		  is_nullable(is_nullable),
 		  has_default(has_default),

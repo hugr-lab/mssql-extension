@@ -90,10 +90,12 @@ static std::string BuildColumnExpression(const MSSQLColumnInfo &col, const std::
 										 bool convert_varchar_max) {
 	std::string expr = MSSQLColumnInfo::BuildReadExpression(col_name, col.sql_type_name, col.max_length,
 															col.collation_name, convert_varchar_max);
-	if (expr != "[" + FilterEncoder::EscapeBracketIdentifier(col_name) + "]") {
-		MSSQL_SCAN_DEBUG_LOG(2, "  Read rewrite: %s (%s) -> %s", col_name.c_str(), col.sql_type_name.c_str(),
-							 expr.c_str());
-	}
+	// Logged unconditionally at level 2 rather than only when it differs from the
+	// bare name: deciding that meant rebuilding the escaped name for every column
+	// on the scan path, and re-encoding a spelling BuildReadExpression now owns —
+	// so a change there would have silenced the log instead of failing.
+	MSSQL_SCAN_DEBUG_LOG(2, "  Column expression: %s (%s) -> %s", col_name.c_str(), col.sql_type_name.c_str(),
+						 expr.c_str());
 	return expr;
 }
 

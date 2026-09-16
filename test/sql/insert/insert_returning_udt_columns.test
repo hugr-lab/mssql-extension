@@ -114,23 +114,32 @@ INSERT INTO retu.dbo.RetLob (t, nt, n) VALUES ('hello text', 'hello ntext', 5) R
 ----
 1	hello text	hello ntext	5
 
-# --- image too: it takes the VARBINARY(MAX) rewrite, not the NVARCHAR one, so
-# it comes back as a BLOB rather than mojibake.
-statement ok
-SELECT mssql_exec('retu', 'INSERT INTO dbo.RetLob (im, n) VALUES (CONVERT(IMAGE, 0x0102FF), 6)');
-
+# --- image too, and the value has to travel through OUTPUT itself. It takes
+# the VARBINARY(MAX) rewrite, not the NVARCHAR one, so it comes back as bytes
+# rather than mojibake. Inserting the value with mssql_exec and RETURNING a
+# different row would assert nothing: the row reader only dispatches on the
+# type when a value is present, so that version passes with the rewrite
+# removed.
 query III
-INSERT INTO retu.dbo.RetLob (n) VALUES (7) RETURNING id, im, n;
+INSERT INTO retu.dbo.RetLob (im, n) VALUES ('\x01\x02\xFF'::BLOB, 6) RETURNING id, im, n;
 ----
-3	NULL	7
+2	\x01\x02\xFF	6
 
-# --- RETURNING * over the whole width, every rewrite at once.
+# --- RETURNING * over the whole width, every rewrite in one OUTPUT list, with
+# a value in each of the three columns that needs one.
+query IIIII
+INSERT INTO retu.dbo.RetLob (t, nt, im, n) VALUES ('t3', 'nt3', '\xAA\xBB'::BLOB, 7) RETURNING *;
+----
+3	t3	nt3	\xAA\xBB	7
+
+# --- and the same rows read back through the scan path, which is where these
+# rewrites came from.
 query IIIII
 SELECT id, t, nt, im, n FROM retu.dbo.RetLob ORDER BY id;
 ----
 1	hello text	hello ntext	NULL	5
 2	NULL	NULL	\x01\x02\xFF	6
-3	NULL	NULL	NULL	7
+3	t3	nt3	\xAA\xBB	7
 
 statement ok
 SELECT mssql_exec('retu', 'DROP TABLE dbo.RetLob');
