@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A transaction's first statement could fail with `Cannot execute: connection
+  not in Idle state`** ([#356](https://github.com/hugr-lab/mssql-extension/issues/356)).
+  The connection a transaction pins was published to other threads **before**
+  `BEGIN TRANSACTION` had finished on it, and DuckDB initialises a plan's source
+  and its sink on different threads — so the second one could execute on a
+  connection that was still mid-BEGIN. Intermittent, about 4% for a statement
+  that both reads from and writes to the same catalog inside a transaction, and
+  it also leaked the connection out of the pool when it struck. Acquiring,
+  beginning and publishing are now one critical section per transaction, so a
+  second thread waits and then finds a connection that is pinned, begun and
+  idle. Measured: 250 runs of the case that used to fail, in two independent
+  batches, with no failures.
+
 ### Added
 
 - **INSERT loads through BCP** (spec 062). An INSERT with more rows than

@@ -137,6 +137,13 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	MSSQL_CONN_LOG("GetConnection: Explicit transaction mode (context=%p, txn=%p)", (void *)&context, (void *)txn);
 
 	// Check if we already have a pinned connection
+	// One critical section for the whole lazy pin (issue #356): check, acquire,
+	// BEGIN, publish. A second thread arriving mid-sequence waits here and then
+	// finds a connection that is pinned, begun and Idle — instead of either
+	// executing on one that is mid-BEGIN, or starting a second transaction of
+	// its own on a second connection.
+	lock_guard<mutex> pin_lock(txn->PinMutex());
+
 	auto pinned = txn->GetPinnedConnection();
 	if (pinned) {
 		MSSQL_CONN_LOG("GetConnection: Returning existing pinned tds_conn=%p, spid=%d", (void *)pinned.get(),
@@ -159,16 +166,16 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	}
 	MSSQL_CONN_LOG("GetConnection: Acquired tds_conn=%p, spid=%d for pinning", (void *)conn.get(), conn->GetSpid());
 
-	// Pin the connection to this transaction
-	txn->SetPinnedConnection(conn);
+	// NOT pinned yet: publishing here would expose a connection that BEGIN has
+	// not finished with. It is published below, once the transaction is open and
+	// the connection is back to Idle.
 
 	// Start SQL Server transaction lazily (BEGIN TRANSACTION)
 	MSSQL_CONN_LOG("GetConnection: Starting SQL Server transaction");
 
-	if (!conn->ExecuteBatch("BEGIN TRANSACTION")) {
+	if (!conn->ExecuteBatch("BEGIN TRANSACTION", "BEGIN TRANSACTION")) {
 		// Failed to start transaction - release connection and throw
 		MSSQL_CONN_LOG("GetConnection: ExecuteBatch failed: %s", conn->GetLastError().c_str());
-		txn->SetPinnedConnection(nullptr);
 		pool.Release(conn);
 		throw IOException("MSSQL: Failed to start SQL Server transaction: " + conn->GetLastError());
 	}
@@ -176,7 +183,6 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	// Receive the complete TDS response (should be a simple DONE token)
 	auto *socket = conn->GetSocket();
 	if (!socket) {
-		txn->SetPinnedConnection(nullptr);
 		pool.Release(conn);
 		throw IOException("MSSQL: Socket is null after BEGIN TRANSACTION");
 	}
@@ -184,7 +190,6 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	std::vector<uint8_t> response;
 	if (!socket->ReceiveMessage(response, 5000)) {
 		MSSQL_CONN_LOG("GetConnection: ReceiveMessage failed: %s", socket->GetLastError().c_str());
-		txn->SetPinnedConnection(nullptr);
 		conn->Close();
 		pool.Release(conn);
 		throw IOException("MSSQL: Failed to receive BEGIN TRANSACTION response: " + socket->GetLastError());
@@ -209,7 +214,12 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	}
 
 	// Transition connection back to Idle (ExecuteBatch left it in Executing state)
-	conn->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
+	conn->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle, "transaction release");
+
+	// Now it is safe to publish: the transaction is open and the connection is
+	// Idle, so the next thread through the early return above gets something it
+	// can use immediately.
+	txn->SetPinnedConnection(conn);
 
 	// Mark SQL Server transaction as active
 	txn->SetSqlServerTransactionActive(true);

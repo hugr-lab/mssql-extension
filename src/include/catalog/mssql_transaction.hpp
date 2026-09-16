@@ -21,6 +21,11 @@ class MSSQLTransactionManager;
 
 class MSSQLTransaction : public Transaction {
 public:
+	//! See pin_mutex_. Held by ConnectionProvider around the lazy pin.
+	mutex &PinMutex() const {
+		return pin_mutex_;
+	}
+
 	MSSQLTransaction(TransactionManager &manager, ClientContext &context, MSSQLCatalog &catalog);
 	~MSSQLTransaction() override;
 
@@ -89,6 +94,24 @@ private:
 
 	//! Mutex for serializing concurrent operations on pinned connection
 	mutable mutex connection_mutex_;
+
+	//! Held across the whole "is there a pinned connection; if not, take one
+	//! from the pool, BEGIN on it, and publish it" sequence in
+	//! ConnectionProvider::GetConnection — see issue #356.
+	//!
+	//! Two things go wrong without it, and only one of them is obvious.
+	//! Publishing the connection before BEGIN has completed lets another
+	//! thread — DuckDB initialises a plan's source and sink on different
+	//! threads — take the early return and execute on a connection that is
+	//! mid-BEGIN, which is the intermittent
+	//! `Cannot execute: connection not in Idle state`. Publishing it after,
+	//! without this lock, is worse: two threads both miss it, both acquire from
+	//! the pool and both send BEGIN, and one connection is left pinned while
+	//! the other leaks with an open transaction.
+	//!
+	//! LOCK ORDER: this one first, `connection_mutex_` second — the accessors
+	//! take that one inside themselves and never reach for this.
+	mutable mutex pin_mutex_;
 
 	//! True if BEGIN TRANSACTION has been sent to SQL Server
 	bool sql_server_transaction_active_ = false;
