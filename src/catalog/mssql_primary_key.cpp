@@ -152,10 +152,10 @@ PKColumnInfo PKColumnInfo::FromMetadata(const string &name, int32_t column_id, i
 }
 
 //===----------------------------------------------------------------------===//
-// PrimaryKeyInfo Implementation
+// RowIdKeyInfo Implementation
 //===----------------------------------------------------------------------===//
 
-vector<string> PrimaryKeyInfo::GetColumnNames() const {
+vector<string> RowIdKeyInfo::GetColumnNames() const {
 	vector<string> names;
 	names.reserve(columns.size());
 	for (const auto &col : columns) {
@@ -164,7 +164,7 @@ vector<string> PrimaryKeyInfo::GetColumnNames() const {
 	return names;
 }
 
-void PrimaryKeyInfo::ComputeRowIdType() {
+void RowIdKeyInfo::ComputeRowIdType() {
 	if (!exists || columns.empty()) {
 		rowid_type = LogicalType::SQLNULL;
 		return;
@@ -185,7 +185,7 @@ void PrimaryKeyInfo::ComputeRowIdType() {
 	}
 }
 
-const char *PrimaryKeyInfo::DiscoverySqlTemplate() {
+const char *RowIdKeyInfo::DiscoverySqlTemplate() {
 	return PK_DISCOVERY_SQL_TEMPLATE;
 }
 
@@ -201,7 +201,7 @@ static bool ToBool(const string &v) {
 	return v == "1" || v == "true" || v == "True";
 }
 
-bool PrimaryKeyInfo::AppendCandidateRow(PrimaryKeyInfo &info, const vector<string> &values) {
+bool RowIdKeyInfo::AppendCandidateRow(RowIdKeyInfo &info, const vector<string> &values) {
 	if (values.size() < 17) {
 		return false;
 	}
@@ -235,7 +235,7 @@ bool PrimaryKeyInfo::AppendCandidateRow(PrimaryKeyInfo &info, const vector<strin
 	return true;
 }
 
-void PrimaryKeyInfo::FinalizeChoice(const string &database_collation) {
+void RowIdKeyInfo::FinalizeChoice(const string &database_collation) {
 	columns.clear();
 	rejections.clear();
 	index_name.clear();
@@ -272,7 +272,7 @@ static RowIdKeyChoice ChoiceWith(const vector<RowIdKeyRejection> &rejections) {
 	return c;
 }
 
-string PrimaryKeyInfo::RowIdRefusal(const string &schema_name, const string &table_name, const string &verb) const {
+string RowIdKeyInfo::RowIdRefusal(const string &schema_name, const string &table_name, const string &verb) const {
 	// Two different mistakes get two different first sentences: a key that
 	// exists but cannot address a row would send the user to add an index they
 	// already have, so it is named as what it is.
@@ -298,9 +298,9 @@ string PrimaryKeyInfo::RowIdRefusal(const string &schema_name, const string &tab
 	return msg;
 }
 
-PrimaryKeyInfo PrimaryKeyInfo::Discover(tds::TdsConnection &connection, const string &schema_name,
-										const string &table_name, const string &database_collation) {
-	PrimaryKeyInfo info;
+RowIdKeyInfo RowIdKeyInfo::Discover(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
+									const string &database_collation) {
+	RowIdKeyInfo info;
 
 	// Build fully qualified object name
 	string full_name = "[" + schema_name + "].[" + table_name + "]";

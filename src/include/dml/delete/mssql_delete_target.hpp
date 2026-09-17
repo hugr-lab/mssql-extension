@@ -15,8 +15,8 @@
 
 namespace duckdb {
 
-// PrimaryKeyInfo is in mssql namespace
-using mssql::PrimaryKeyInfo;
+// RowIdKeyInfo is in mssql namespace
+using mssql::RowIdKeyInfo;
 
 //===----------------------------------------------------------------------===//
 // MSSQLDeleteTarget - Target table metadata for DELETE operations
@@ -45,7 +45,7 @@ struct MSSQLDeleteTarget {
 	//===----------------------------------------------------------------------===//
 
 	//! PK metadata from MSSQLTableEntry
-	PrimaryKeyInfo pk_info;
+	RowIdKeyInfo pk_info;
 
 	//===----------------------------------------------------------------------===//
 	// Helper Methods

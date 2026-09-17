@@ -10,7 +10,7 @@ namespace duckdb {
 // ExtractSingleRowPK - Extract PK values for a single row
 //===----------------------------------------------------------------------===//
 
-vector<Value> ExtractSingleRowPK(Vector &rowid_vector, idx_t row_idx, const mssql::PrimaryKeyInfo &pk_info) {
+vector<Value> ExtractSingleRowPK(Vector &rowid_vector, idx_t row_idx, const mssql::RowIdKeyInfo &pk_info) {
 	vector<Value> pk_values;
 
 	if (!pk_info.exists || pk_info.columns.empty()) {
@@ -49,7 +49,7 @@ vector<Value> ExtractSingleRowPK(Vector &rowid_vector, idx_t row_idx, const mssq
 // ExtractPKFromRowid - Extract PK values from rowid column (bulk)
 //===----------------------------------------------------------------------===//
 
-vector<vector<Value>> ExtractPKFromRowid(Vector &rowid_vector, idx_t count, const mssql::PrimaryKeyInfo &pk_info) {
+vector<vector<Value>> ExtractPKFromRowid(Vector &rowid_vector, idx_t count, const mssql::RowIdKeyInfo &pk_info) {
 	vector<vector<Value>> result;
 	result.reserve(count);
 

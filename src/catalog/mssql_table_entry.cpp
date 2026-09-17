@@ -306,7 +306,7 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 	}
 
 	// Spec 052 EnsurePKLoaded race fix: serialise concurrent first-loads so
-	// only one thread does the PrimaryKeyInfo::Discover round trip and the
+	// only one thread does the RowIdKeyInfo::Discover round trip and the
 	// `pk_info_ = Discover(...)` write. Without this serialisation, two
 	// threads both loaded and both move-assigned, double-freeing the loser's
 	// previous-value vector<PKColumnInfo>. Caught by ASan in scenario 5.
@@ -335,8 +335,8 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 			// `active_connections_` — ~ConnectionPool then fires its quiescence
 			// warning on teardown and the D_ASSERT aborts the debug build.
 			try {
-				pk_info_ = mssql::PrimaryKeyInfo::Discover(*connection, mssql_schema.name.GetIdentifierName(),
-														   name.GetIdentifierName(), cache.GetDatabaseCollation());
+				pk_info_ = mssql::RowIdKeyInfo::Discover(*connection, mssql_schema.name.GetIdentifierName(),
+														 name.GetIdentifierName(), cache.GetDatabaseCollation());
 			} catch (...) {
 				pool.Release(std::move(connection));
 				throw;
@@ -386,7 +386,7 @@ bool MSSQLTableEntry::HasPrimaryKey(ClientContext &context) {
 	return pk_info_.exists;
 }
 
-const mssql::PrimaryKeyInfo &MSSQLTableEntry::GetPrimaryKeyInfo(ClientContext &context) {
+const mssql::RowIdKeyInfo &MSSQLTableEntry::GetPrimaryKeyInfo(ClientContext &context) {
 	EnsurePKLoaded(context);
 	return pk_info_;
 }

@@ -455,7 +455,7 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	// Spec 076 W2: the primary key in the same batch -- a second result set
 	// off the same @s / @t -- so a fresh table pays one round trip.
 	string query = mssql::BuildExecuteSqlBatch(
-		string(SINGLE_TABLE_METADATA_SQL_TEMPLATE) + ";\n" + mssql::PrimaryKeyInfo::DiscoverySqlTemplate(),
+		string(SINGLE_TABLE_METADATA_SQL_TEMPLATE) + ";\n" + mssql::RowIdKeyInfo::DiscoverySqlTemplate(),
 		"@s sysname, @t sysname",
 		{{"s", mssql::NVarcharLiteral(schema_name)}, {"t", mssql::NVarcharLiteral(table_name)}});
 
@@ -498,11 +498,11 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 			// catalog's copy before anything else, so removing it plans every direct
 			// query at ~1 row.
 			// Routed by which statement of the batch produced the row, never by
-			// its width: the second result set is PrimaryKeyInfo::DiscoverySqlTemplate
+			// its width: the second result set is RowIdKeyInfo::DiscoverySqlTemplate
 			// (review of #345 -- a column added to either query must not silently
 			// drop every primary key in the catalog).
 			if (result_set == 1) {
-				mssql::PrimaryKeyInfo::AppendCandidateRow(table_meta.pk_info, values);
+				mssql::RowIdKeyInfo::AppendCandidateRow(table_meta.pk_info, values);
 				return;
 			}
 			if (result_set != 0) {

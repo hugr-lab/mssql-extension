@@ -30,7 +30,7 @@ struct PKColumnInfo {
 };
 
 //===----------------------------------------------------------------------===//
-// PrimaryKeyInfo - the key a table's rowid is built on
+// RowIdKeyInfo - the key a table's rowid is built on
 //
 // Spec 077 W1: no longer only the primary key. The discovery statement returns
 // every unique index on the table with its key columns and flags, and
@@ -42,7 +42,7 @@ struct PKColumnInfo {
 // the rename to RowIdKeyInfo is its own mechanical commit.)
 //===----------------------------------------------------------------------===//
 
-struct PrimaryKeyInfo {
+struct RowIdKeyInfo {
 	// Key existence (only meaningful once the owning MSSQLTableEntry has
 	// published this struct via its pk_loaded_ atomic — see header).
 	bool exists = false;  // Is there a usable key?
@@ -61,7 +61,7 @@ struct PrimaryKeyInfo {
 	LogicalType rowid_type;	 // Scalar (single col) or STRUCT (composite)
 
 	// Default constructor
-	PrimaryKeyInfo() : exists(false), rowid_type(LogicalType::SQLNULL) {}
+	RowIdKeyInfo() : exists(false), rowid_type(LogicalType::SQLNULL) {}
 
 	// Predicates
 	bool IsScalar() const {
@@ -78,8 +78,8 @@ struct PrimaryKeyInfo {
 	void ComputeRowIdType();
 
 	// Factory method - discovers PK from SQL Server
-	static PrimaryKeyInfo Discover(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
-								   const string &database_collation);
+	static RowIdKeyInfo Discover(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
+								 const string &database_collation);
 
 	//! Spec 076 W2: the discovery statement, parameterised on @s / @t, so the
 	//! catalog can send it in the same batch as the table's metadata and read
@@ -89,7 +89,7 @@ struct PrimaryKeyInfo {
 	//! columns) accumulated as a candidate; false when the row does not have
 	//! that shape. Rows arrive ordered by index_id, key_ordinal, so consecutive
 	//! rows of one index form one candidate.
-	static bool AppendCandidateRow(PrimaryKeyInfo &info, const vector<string> &values);
+	static bool AppendCandidateRow(RowIdKeyInfo &info, const vector<string> &values);
 	//! After the last row: run the choice over the accumulated candidates and
 	//! publish the result into exists / source / index_name / columns /
 	//! rejections / rowid_type. Idempotent on an empty candidate list.
