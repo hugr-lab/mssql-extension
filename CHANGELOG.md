@@ -71,8 +71,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   insert the value NULL into column …" about a value the user had supplied. The
   join is gone from all eight metadata queries — the name comes from
   `ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id))`, which is
-  correct for UDTs and **4.3× cheaper** (497 µs → 115 µs on a 102-column table,
-  interleaved, 200 rounds) — and a source that feeds such a column is now
+  correct for UDTs and **8.7× cheaper on the query itself** (1316 µs → 152 µs
+  per execution on a 101-column table, 2000 executions a run, four interleaved
+  runs). The join is expensive not by itself — without the `ORDER BY` it costs
+  2.7× — but because it defeats the index order on `sys.columns` and makes the
+  server sort for the `ORDER BY c.column_id` every one of these queries
+  carries. A source that feeds such a column is now
   refused by name, **at init, before a row is encoded** — so a COPY that is
   going to fail this way writes nothing rather than committing the batches that
   happened to precede the first value. A source that omits such a column still
