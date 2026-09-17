@@ -44,6 +44,15 @@ struct MSSQLInsertTarget {
 	bool has_identity_column;	  // Table has an IDENTITY column
 	idx_t identity_column_index;  // Index of identity column in columns vector
 
+	// Spec 077 W2: the INSERT names the identity column (explicitly, or
+	// positionally with a value for every column), so the statement path has
+	// to bracket its batches with SET IDENTITY_INSERT — and refuse a NULL in
+	// that column before sending anything, because DuckDB hands DEFAULT and
+	// NULL to us identically. Never set for a view target: SET IDENTITY_INSERT
+	// takes a table, and an explicit identity value through a view is the
+	// server's own refusal.
+	bool identity_in_list = false;
+
 	// Default constructor
 	MSSQLInsertTarget() : has_identity_column(false), identity_column_index(0) {}
 

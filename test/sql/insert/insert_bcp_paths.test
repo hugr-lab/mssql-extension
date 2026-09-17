@@ -86,10 +86,16 @@ TDS parse error
 statement ok
 INSERT INTO bp.dbo.BcpPathsIdent (n) SELECT n FROM src;
 
+# max(rid) is 3500, not 3000, and that is the statement path's fingerprint
+# from the explicit-identity INSERT above: since spec 077 W2 it runs under
+# SET IDENTITY_INSERT ON, its first 500-row statement (1000 constants / 2
+# columns) reached the server with rid 1..500 before the injected desync, the
+# rollback undid the rows — and SQL Server's identity seed is not
+# transactional, so it stayed at 500 and the 3000 bulk rows took 501..3500.
 query II
 SELECT count(*), max(rid) FROM bp.dbo.BcpPathsIdent;
 ----
-3000	3000
+3000	3500
 
 # --- a view: statements (INSERT BULK into a view is the server's call).
 statement ok

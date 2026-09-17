@@ -87,6 +87,46 @@ MSSQLCatalog &MSSQLInsertExecutor::GetMSSQLCatalog() {
 	return catalog.Cast<MSSQLCatalog>();
 }
 
+//===----------------------------------------------------------------------===//
+// Spec 077 W2: the identity column is in the list
+//===----------------------------------------------------------------------===//
+
+void MSSQLInsertExecutor::EnsureIdentityInsert() {
+	if (!target_.identity_in_list || stmt_conn_.IdentityInsertOn()) {
+		return;
+	}
+	try {
+		stmt_conn_.EnableIdentityInsert(target_.schema_name, target_.table_name);
+	} catch (...) {
+		FailStatement(GetMSSQLCatalog());
+		throw;
+	}
+}
+
+void MSSQLInsertExecutor::RefuseNullIdentity(DataChunk &chunk) {
+	if (!target_.identity_in_list) {
+		return;
+	}
+	// The chunk is full-width in table order (see MSSQLBatchBuilder::SerializeRow).
+	auto &vec = chunk.data[target_.identity_column_index];
+	UnifiedVectorFormat fmt;
+	vec.ToUnifiedFormat(chunk.size(), fmt);
+	if (fmt.validity.AllValid()) {
+		return;
+	}
+	for (idx_t r = 0; r < chunk.size(); r++) {
+		if (!fmt.validity.RowIsValid(fmt.sel->get_index(r))) {
+			const auto &col = target_.columns[target_.identity_column_index];
+			throw InvalidInputException(
+				"MSSQL: the INSERT names the identity column '%s' of %s.%s but supplies no value for it in row %llu "
+				"(DEFAULT and NULL both reach the extension as NULL, and the server assigns an identity value only "
+				"when the column is left out of the list). Either leave '%s' out of the column list so the server "
+				"assigns every row, or supply a value for every row; a statement mixing the two has to be split.",
+				col.name, target_.schema_name, target_.table_name, (unsigned long long)r, col.name);
+		}
+	}
+}
+
 void MSSQLInsertExecutor::FailStatement(MSSQLCatalog &catalog) {
 	failed_ = true;
 	stmt_conn_.Fail(context_, catalog);
@@ -127,6 +167,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 	// on it (spec 062 W1c). Throws when none can be had.
 	auto &mssql_catalog = GetMSSQLCatalog();
 	auto connection = stmt_conn_.Acquire(context_, mssql_catalog);
+	EnsureIdentityInsert();
 
 	INSERT_DEBUG(2, "ExecuteBatch: connection acquired, state=%d", (int)connection->GetState());
 
@@ -332,6 +373,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 	const string &sql = batch.sql_statement;
 	auto &mssql_catalog = GetMSSQLCatalog();
 	auto connection = stmt_conn_.Acquire(context_, mssql_catalog);
+	EnsureIdentityInsert();
 
 	auto start_time = std::chrono::steady_clock::now();
 	unique_ptr<DataChunk> result_chunk;
@@ -415,6 +457,7 @@ idx_t MSSQLInsertExecutor::Execute(DataChunk &input_chunk) {
 	}
 
 	EnsureBatchBuilder(false);
+	RefuseNullIdentity(input_chunk);
 
 	idx_t total_inserted = 0;
 
@@ -456,6 +499,7 @@ vector<unique_ptr<DataChunk>> MSSQLInsertExecutor::ExecuteWithReturning(DataChun
 	}
 
 	EnsureBatchBuilder(true);
+	RefuseNullIdentity(input_chunk);
 
 	// Store returning column IDs for later use
 	returning_column_ids_ = returning_column_ids;

@@ -121,6 +121,14 @@ private:
 
 	// Initialize batch builder if needed
 	void EnsureBatchBuilder(bool with_output);
+	//! Spec 077 W2: SET IDENTITY_INSERT ON on the statement's connection, once,
+	//! when the INSERT names the identity column. Called right after Acquire on
+	//! both batch paths; a refusal fails the statement and rethrows explained.
+	void EnsureIdentityInsert();
+	//! Spec 077 W2: a NULL in a named identity column is refused before any row
+	//! is sent — DuckDB hands DEFAULT and NULL to us identically, and the server
+	//! assigns only when the column is left out of the list.
+	void RefuseNullIdentity(DataChunk &chunk);
 
 	// Execute a single batch and return rows affected. Takes the batch, not
 	// its text: an error names the batch's own statement index and row range,

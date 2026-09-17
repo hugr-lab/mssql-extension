@@ -1,0 +1,275 @@
+# name: test/sql/insert/insert_identity.test
+# description: INSERT that names the identity column is bracketed with SET IDENTITY_INSERT (spec 077 W2)
+# group: [insert]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# An INSERT that leaves the identity column out lets the server assign it, as
+# always. One that names it — explicitly, or positionally with a value for
+# every column — used to fail with the server's 544; now the statement's
+# connection is bracketed with SET IDENTITY_INSERT ON / OFF and the values
+# land verbatim. The bracket is session state, so the thing that has to be
+# proved is that it is OFF again on every way out: after success, after a
+# failing batch, after ROLLBACK on a pinned connection. The leak test below is
+# built so that it cannot pass by accident.
+#
+# DuckDB hands DEFAULT and NULL for a named identity column to the extension
+# identically (measured: both arrive as a NULL in the chunk), so a NULL in a
+# named identity column is refused client-side, before anything is sent, with
+# the way out named. That one check covers DEFAULT, NULL and the mixed batch.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# The leak test needs ONE connection in the pool, and the limit is fixed when
+# the pool is created — so it is set before the ATTACH, and the reset that
+# would paper over a leaked ON is off for the whole file.
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+SET mssql_reset_connection = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS idt (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('idt', 'IF OBJECT_ID(''dbo.IdBasic'') IS NOT NULL DROP TABLE dbo.IdBasic; IF OBJECT_ID(''dbo.IdWide'') IS NOT NULL DROP TABLE dbo.IdWide; IF OBJECT_ID(''dbo.IdDown'') IS NOT NULL DROP TABLE dbo.IdDown; IF OBJECT_ID(''dbo.IdTiny'') IS NOT NULL DROP TABLE dbo.IdTiny; IF OBJECT_ID(''dbo.IdView'') IS NOT NULL DROP VIEW dbo.IdView; IF OBJECT_ID(''dbo.IdBase'') IS NOT NULL DROP TABLE dbo.IdBase');
+
+statement ok
+SELECT mssql_exec('idt', 'CREATE TABLE dbo.IdBasic (id INT IDENTITY(1,1) NOT NULL PRIMARY KEY, v INT NOT NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('idt');
+
+# =============================================================================
+# Without the identity column: the server assigns, values ascend.
+# =============================================================================
+
+statement ok
+INSERT INTO idt.dbo.IdBasic (v) VALUES (10), (11);
+
+query II
+SELECT id, v FROM idt.dbo.IdBasic ORDER BY id;
+----
+1	10
+2	11
+
+# =============================================================================
+# With it: the values land verbatim.
+# =============================================================================
+
+statement ok
+INSERT INTO idt.dbo.IdBasic (id, v) VALUES (100, 12), (200, 13);
+
+# positional with every column is the same statement once bound
+statement ok
+INSERT INTO idt.dbo.IdBasic VALUES (300, 14);
+
+query II
+SELECT id, v FROM idt.dbo.IdBasic WHERE id >= 100 ORDER BY id;
+----
+100	12
+200	13
+300	14
+
+# --- and the server keeps counting from where the explicit values left it
+statement ok
+INSERT INTO idt.dbo.IdBasic (v) VALUES (15);
+
+query I
+SELECT id FROM idt.dbo.IdBasic WHERE v = 15;
+----
+301
+
+# =============================================================================
+# The leak test. The pool has one connection, so the mssql_exec below runs on
+# the very session the INSERT used. An explicit identity value through it must
+# fail with the server's 544 — which it only does if IDENTITY_INSERT is OFF
+# again. @@SPID before and after proves it is the same session; without that a
+# reconnect would pass this for the wrong reason.
+# =============================================================================
+
+statement ok
+CREATE TEMP TABLE spid_before AS SELECT * FROM mssql_scan('idt', 'SELECT @@SPID AS spid');
+
+statement error
+SELECT mssql_exec('idt', 'INSERT INTO dbo.IdBasic (id, v) VALUES (999, 99)');
+----
+544
+
+query I
+SELECT (SELECT spid FROM spid_before) = (SELECT spid FROM mssql_scan('idt', 'SELECT @@SPID AS spid'));
+----
+true
+
+# =============================================================================
+# A failing batch in the middle: the second row violates the primary key. The
+# statement rolls back, nothing lands, and IDENTITY_INSERT is OFF afterwards
+# on the same session.
+# =============================================================================
+
+statement error
+INSERT INTO idt.dbo.IdBasic (id, v) VALUES (400, 16), (100, 17);
+----
+PRIMARY KEY
+
+query I
+SELECT count(*) FROM idt.dbo.IdBasic WHERE id = 400;
+----
+0
+
+statement error
+SELECT mssql_exec('idt', 'INSERT INTO dbo.IdBasic (id, v) VALUES (999, 99)');
+----
+544
+
+# =============================================================================
+# Inside an explicit transaction the connection is pinned and cannot be
+# discarded: OFF is sent before the statement lets go of it, and ROLLBACK
+# leaves the session clean.
+# =============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO idt.dbo.IdBasic (id, v) VALUES (500, 18);
+
+query I
+SELECT v FROM idt.dbo.IdBasic WHERE id = 500;
+----
+18
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM idt.dbo.IdBasic WHERE id = 500;
+----
+0
+
+statement error
+SELECT mssql_exec('idt', 'INSERT INTO dbo.IdBasic (id, v) VALUES (999, 99)');
+----
+544
+
+# =============================================================================
+# DEFAULT, NULL, and a batch mixing rows with and without a value: refused
+# before anything is sent, with the way out named. (The server's own answer
+# would be error 339, which does not.)
+# =============================================================================
+
+statement error
+INSERT INTO idt.dbo.IdBasic (id, v) VALUES (DEFAULT, 20);
+----
+names the identity column 'id'
+
+statement error
+INSERT INTO idt.dbo.IdBasic (id, v) VALUES (NULL, 20);
+----
+supplies no value for it in row 0
+
+statement error
+INSERT INTO idt.dbo.IdBasic VALUES (DEFAULT, 20), (600, 21);
+----
+a statement mixing the two has to be split
+
+query I
+SELECT count(*) FROM idt.dbo.IdBasic WHERE v IN (20, 21);
+----
+0
+
+# =============================================================================
+# More rows than mssql_insert_bcp_threshold while naming the identity column:
+# routed to the statement path (spec 062 W4 / 077 W3) and now succeeds where
+# it failed with 544. This is the assertion that pins the routing decision.
+# =============================================================================
+
+statement ok
+SET mssql_insert_bcp_threshold = 100;
+
+statement ok
+INSERT INTO idt.dbo.IdBasic (id, v) SELECT 10000 + i, 1000 + i FROM range(500) t(i);
+
+query I
+SELECT count(*) FROM idt.dbo.IdBasic WHERE id >= 10000;
+----
+500
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+# =============================================================================
+# The type is not always INT: DECIMAL(38,0), TINYINT, and a descending seed.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('idt', 'CREATE TABLE dbo.IdWide (id DECIMAL(38,0) IDENTITY(1,1) NOT NULL PRIMARY KEY, v INT); CREATE TABLE dbo.IdTiny (id TINYINT IDENTITY(1,1) NOT NULL PRIMARY KEY, v INT); CREATE TABLE dbo.IdDown (id INT IDENTITY(0,-1) NOT NULL PRIMARY KEY, v INT)');
+
+statement ok
+SELECT mssql_invalidate_cache('idt');
+
+statement ok
+INSERT INTO idt.dbo.IdWide (id, v) VALUES (12345678901234567890123456789012345678, 1);
+
+query I
+SELECT id::VARCHAR FROM idt.dbo.IdWide;
+----
+12345678901234567890123456789012345678
+
+statement ok
+INSERT INTO idt.dbo.IdTiny (id, v) VALUES (250, 1);
+
+statement ok
+INSERT INTO idt.dbo.IdTiny (v) VALUES (2);
+
+query II
+SELECT id, v FROM idt.dbo.IdTiny ORDER BY id;
+----
+250	1
+251	2
+
+statement ok
+INSERT INTO idt.dbo.IdDown (v) VALUES (1), (2);
+
+statement ok
+INSERT INTO idt.dbo.IdDown (id, v) VALUES (-100, 3);
+
+query II
+SELECT id, v FROM idt.dbo.IdDown ORDER BY v;
+----
+0	1
+-1	2
+-100	3
+
+# =============================================================================
+# A view over a table with an identity column: SET IDENTITY_INSERT takes a
+# table, so the bracket is not attempted, and an explicit identity value
+# through the view is the server's own refusal, by its number.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('idt', 'CREATE TABLE dbo.IdBase (id INT IDENTITY(1,1) NOT NULL PRIMARY KEY, v INT); EXEC(''CREATE VIEW dbo.IdView AS SELECT id, v FROM dbo.IdBase'')');
+
+statement ok
+SELECT mssql_invalidate_cache('idt');
+
+statement error
+INSERT INTO idt.dbo.IdView (id, v) VALUES (7, 1);
+----
+544
+
+statement ok
+SELECT mssql_exec('idt', 'DROP VIEW dbo.IdView; DROP TABLE dbo.IdBase; DROP TABLE dbo.IdBasic; DROP TABLE dbo.IdWide; DROP TABLE dbo.IdTiny; DROP TABLE dbo.IdDown');
+
+statement ok
+DETACH idt;
+
+statement ok
+RESET mssql_connection_limit;
+
+statement ok
+RESET mssql_reset_connection;

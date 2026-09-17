@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An `INSERT` that supplies identity values works** (spec 077 W2). Naming the
+  identity column — explicitly, or positionally with a value for every column —
+  used to fail with the server's error 544; the statement's connection is now
+  bracketed with `SET IDENTITY_INSERT … ON` before its first batch and `OFF`
+  before its `COMMIT`, and the values land verbatim. `OFF` is guaranteed on
+  every way out — after a failing batch, after `ROLLBACK` on a transaction's
+  pinned connection, and from the destructor on an unwind, bounded by a
+  timeout since that path carries no query timeout — and a connection on which
+  it could not be confirmed is discarded rather than returned to the pool.
+  Measured both ways: with the `OFF` deliberately leaked, the next ordinary
+  `INSERT` on that session fails with the server's 545. The server's refusals
+  of the `ON` are explained rather than relayed: 1088 says the statement needs
+  ALTER on the table (the server's own text claims the table may not exist),
+  8106 that the catalog's `is_identity` is stale and `mssql_invalidate_cache()`
+  is the fix, 8107 that another table is already `ON` for this session and
+  where that could have come from. A NULL in a named identity column is refused
+  before anything is sent — DuckDB hands `DEFAULT` and `NULL` to the extension
+  identically — with the way out named, which also covers a batch mixing rows
+  that supply the value with rows that do not. **This stays the statement
+  path:** tens of rows, not millions; loading many rows with their identity
+  values is `COPY`, which keeps a source column named like the identity column
+  and lets the server assign when it is omitted.
+
 - **`rowid`, and with it `UPDATE`/`DELETE`, no longer require a primary key**
   (spec 077 W1). A table with no primary key but a usable unique index — one
   that is not filtered, not disabled, and whose key columns are all NOT NULL —
