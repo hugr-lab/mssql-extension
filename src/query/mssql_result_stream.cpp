@@ -141,7 +141,7 @@ bool MSSQLResultStream::Initialize() {
 	}
 
 	// Send the SQL batch
-	if (!connection_->ExecuteBatch(sql_)) {
+	if (!connection_->ExecuteBatch(sql_, "scan result stream")) {
 		throw IOException("Failed to execute SQL batch: " + connection_->GetLastError());
 	}
 	batch_sent_ = true;

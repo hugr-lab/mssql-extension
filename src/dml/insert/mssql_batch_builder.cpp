@@ -72,6 +72,12 @@ vector<string> MSSQLBatchBuilder::SerializeRow(DataChunk &chunk, idx_t row_index
 		auto &vector = chunk.data[col_idx];
 		auto literal = MSSQLValueSerializer::SerializeFromVector(vector, row_index, col.duckdb_type);
 
+		// A spatial target needs the server's WKB reader around the literal:
+		// a bare 0x value is read as SQL Server's own Spatial Type Binary
+		// Format, not as the OGC WKB a DuckDB GEOMETRY carries. Returns the
+		// literal untouched for every other column type.
+		literal = MSSQLValueSerializer::WrapSpatialLiteral(literal, col.mssql_type);
+
 		// XML columns: reject if serialized literal exceeds SQL Server's TDS buffer limit
 		if (col.mssql_type == "xml" && literal.size() > 4096) {
 			throw InvalidInputException(

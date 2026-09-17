@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/transaction/transaction.hpp"
@@ -21,6 +22,16 @@ class MSSQLTransactionManager;
 
 class MSSQLTransaction : public Transaction {
 public:
+	//! Take the pin lock for the whole lazy-pin sequence — see pin_mutex_.
+	//!
+	//! Hands back the guard rather than the mutex so a caller cannot hold it
+	//! out of order or forget to release it: the lock order this class needs
+	//! (pin_mutex_ before connection_mutex_) is unenforceable if the mutex
+	//! itself is public, which is what the #357 review pointed out.
+	std::unique_lock<mutex> LockForPin() const {
+		return std::unique_lock<mutex>(pin_mutex_);
+	}
+
 	MSSQLTransaction(TransactionManager &manager, ClientContext &context, MSSQLCatalog &catalog);
 	~MSSQLTransaction() override;
 
@@ -49,9 +60,6 @@ public:
 
 	//! Check if this transaction has a pinned connection
 	bool HasPinnedConnection() const;
-
-	//! Get the connection mutex for serializing operations on the pinned connection
-	mutex &GetConnectionMutex();
 
 	//! Check if SQL Server transaction has been started on the pinned connection
 	bool IsSqlServerTransactionActive() const;
@@ -89,6 +97,26 @@ private:
 
 	//! Mutex for serializing concurrent operations on pinned connection
 	mutable mutex connection_mutex_;
+
+	//! Held across the whole "is there a pinned connection; if not, take one
+	//! from the pool, BEGIN on it, and publish it" sequence in
+	//! ConnectionProvider::GetConnection — see issue #356.
+	//!
+	//! Two things go wrong without it, and only one of them is obvious.
+	//! Publishing the connection before BEGIN has completed lets another
+	//! thread — DuckDB initialises a plan's source and sink on different
+	//! threads — take the early return and execute on a connection that is
+	//! mid-BEGIN, which is the intermittent
+	//! `Cannot execute: connection not in Idle state`. Publishing it after,
+	//! without this lock, is worse: two threads both miss it, both acquire from
+	//! the pool and both send BEGIN, and one connection is left pinned while
+	//! the other leaks with an open transaction.
+	//!
+	//! LOCK ORDER: this one first, `connection_mutex_` second — the accessors
+	//! take that one inside themselves and never reach for this. Neither mutex
+	//! is reachable from outside: this one only through LockForPin(), and
+	//! connection_mutex_ not at all.
+	mutable mutex pin_mutex_;
 
 	//! True if BEGIN TRANSACTION has been sent to SQL Server
 	bool sql_server_transaction_active_ = false;
