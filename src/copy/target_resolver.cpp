@@ -1091,17 +1091,18 @@ namespace {
 //! or feeds it an all-NULL one, still loads — the caller drops it from the
 //! load and the server fills it (see BCPCopyInitGlobal).
 //!
-//! The spatial half spells the two names out here rather than sharing a
-//! predicate, because the branch that introduces `MSSQLColumnInfo::IsSpatialType`
-//! (#352) is not merged yet; fold this into it on the rebase.
+//! The spatial half is the shared predicate (#352); the rowversion half is
+//! spelled out and NOT derived from IsKnownSQLServerType, because #296 taught
+//! that predicate `timestamp` and `rowversion` so those columns became
+//! READABLE — deriving from it would silently admit them to the bulk wire and
+//! put error 273 back mid-stream. Readable and writable are different questions
+//! for these types.
 bool BulkWireCanCarry(const string &type_name) {
+	if (MSSQLColumnInfo::IsSpatialType(type_name)) {
+		return false;
+	}
 	const string lower = StringUtil::Lower(type_name);
-	// Spelled out, NOT derived from IsKnownSQLServerType, for the two that the
-	// predicate's answer is about to change under: #296 teaches it `timestamp`
-	// and `rowversion` so those columns become READABLE, which would silently
-	// re-admit them here on the merge and put error 273 back mid-stream.
-	// Readable and writable are different questions for these types.
-	if (lower == "geometry" || lower == "geography" || lower == "timestamp" || lower == "rowversion") {
+	if (lower == "timestamp" || lower == "rowversion") {
 		return false;
 	}
 	return MSSQLColumnInfo::IsKnownSQLServerType(type_name);
