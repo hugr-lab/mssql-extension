@@ -941,11 +941,22 @@ bool scenario_pure_concurrent_writes(const TestConfig &cfg, int num_writers, int
 // a source and a sink on one pinned connection, which is why the body is a COPY
 // out of a table in the same catalog.
 //
-// Why a loop and not one shot: this is a race, measured at roughly 4% per
-// occurrence on the machine it was found on. One iteration proves nothing;
-// a few hundred turn "unlikely" into "certain" — at 4% the chance of surviving
-// 200 iterations unbroken is about 0.03%, so a green run here is evidence and a
-// red one is a reproduction rather than a flake.
+// Why a loop and not one shot, and why this many: this is a race, and the rate
+// that matters is the one measured FOR THIS SCENARIO — 2 failures in 200
+// transactions with the fix reverted, so about 1% per transaction. (The 4%
+// quoted elsewhere is per RUN of sink_reads_own_catalog.test, a different unit;
+// using it here was the arithmetic error the review caught.)
+//
+// At 1%, a 200-iteration run of broken code comes up clean 0.99^200 = 13% of
+// the time — CI would miss a regression of #356 about one run in seven, which
+// is the same small-sample trap the revert on #355 was about. Raising the
+// count does not fix that kind of test, it only makes it slower: 1000
+// iterations cost 15 minutes here. So this is NOT the regression guard for
+// #356. The guard is test/cpp/test_transaction_pin.cpp, which puts eight
+// callers into GetConnection at once and asserts the contract directly — one
+// connection, begun and idle, nothing leaked — and fails in round 1 against
+// the pre-fix provider. This loop stays as the end-to-end smoke through
+// DuckDB's real threading, at a count that costs seconds.
 bool scenario_transaction_pin_race(const TestConfig &cfg, int iterations) {
 	std::cout << "\n=== Transaction pin race (issue #356): " << iterations << " transactions ===" << std::endl;
 
@@ -962,10 +973,12 @@ bool scenario_transaction_pin_race(const TestConfig &cfg, int iterations) {
 		}
 		// Small on purpose: the race is in acquiring the connection, not in the
 		// volume, and 200 transactions have to stay quick.
-		setup.Query("SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.pinrace_src'') IS NOT NULL DROP TABLE "
-					"dbo.pinrace_src')");
-		setup.Query("SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.pinrace_dst'') IS NOT NULL DROP TABLE "
-					"dbo.pinrace_dst')");
+		setup.Query(
+			"SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.pinrace_src'') IS NOT NULL DROP TABLE "
+			"dbo.pinrace_src')");
+		setup.Query(
+			"SELECT mssql_exec('mssql', 'IF OBJECT_ID(''dbo.pinrace_dst'') IS NOT NULL DROP TABLE "
+			"dbo.pinrace_dst')");
 		auto created = setup.Query(
 			"SELECT mssql_exec('mssql', 'CREATE TABLE dbo.pinrace_src(id int NOT NULL, v nvarchar(20) NULL); "
 			"CREATE TABLE dbo.pinrace_dst(id int NOT NULL, v nvarchar(20) NULL)')");
@@ -973,8 +986,9 @@ bool scenario_transaction_pin_race(const TestConfig &cfg, int iterations) {
 			std::cerr << "  setup failed: " << created->GetError() << std::endl;
 			return false;
 		}
-		auto filled = setup.Query("COPY (SELECT i::INTEGER AS id, ('v' || i)::VARCHAR AS v FROM range(1, 201) t(i)) "
-								  "TO 'mssql://mssql/dbo/pinrace_src' (FORMAT 'bcp', CREATE_TABLE false)");
+		auto filled = setup.Query(
+			"COPY (SELECT i::INTEGER AS id, ('v' || i)::VARCHAR AS v FROM range(1, 201) t(i)) "
+			"TO 'mssql://mssql/dbo/pinrace_src' (FORMAT 'bcp', CREATE_TABLE false)");
 		if (filled->HasError()) {
 			std::cerr << "  seeding failed: " << filled->GetError() << std::endl;
 			return false;
@@ -993,8 +1007,9 @@ bool scenario_transaction_pin_race(const TestConfig &cfg, int iterations) {
 		// Reads from and writes to the SAME catalog: source and sink share the
 		// one pinned connection, and this is the first statement of the
 		// transaction, so it is the one that pins it.
-		auto r = conn.Query("COPY (SELECT id, v FROM mssql.dbo.pinrace_src) TO 'mssql://mssql/dbo/pinrace_dst' "
-							"(FORMAT 'bcp', CREATE_TABLE false)");
+		auto r = conn.Query(
+			"COPY (SELECT id, v FROM mssql.dbo.pinrace_src) TO 'mssql://mssql/dbo/pinrace_dst' "
+			"(FORMAT 'bcp', CREATE_TABLE false)");
 		if (r->HasError()) {
 			failures++;
 			if (first_error.empty()) {
@@ -1014,8 +1029,9 @@ bool scenario_transaction_pin_race(const TestConfig &cfg, int iterations) {
 	{
 		Connection cleanup(db);
 		load_extension(cleanup);
-		cleanup.Query("SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.pinrace_src; "
-					  "DROP TABLE IF EXISTS dbo.pinrace_dst')");
+		cleanup.Query(
+			"SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.pinrace_src; "
+			"DROP TABLE IF EXISTS dbo.pinrace_dst')");
 	}
 
 	std::cout << "  " << iterations << " transactions in " << elapsed << " ms, " << failures << " failed" << std::endl;
@@ -1050,7 +1066,7 @@ int main() {
 		ok &= scenario_concurrent_mixed_reads(cfg, 8, 25);
 		ok &= scenario_concurrent_attach(cfg, 4);
 		// Scenario 9 (issue #356): the lazy pin of a transaction's connection.
-		ok &= scenario_transaction_pin_race(cfg, 200);
+		ok &= scenario_transaction_pin_race(cfg, 20);
 		ok &= scenario_concurrent_catalog_reads(cfg, 4, 50);
 		ok &= scenario_concurrent_catalog_reads(cfg, 8, 25);
 		// Scenario 5 (spec 052 US2): 4 readers + invalidator at 50ms cadence

@@ -1009,6 +1009,44 @@ SANITIZER_PRELOAD :=
 endif
 SPEC047_TEST_RPATH := $(SANITIZER_PRELOAD) DYLD_LIBRARY_PATH=build/debug/src LD_LIBRARY_PATH=build/debug/src
 
+# Issue #356: ConnectionProvider::GetConnection under contention — the logical
+# regression guard for the pinned-connection race. Links the extension's static
+# library so the test calls the provider directly (eight callers released from a
+# barrier into one transaction's lazy pin) instead of hoping DuckDB schedules a
+# source and a sink at the right moment. PIN_TEST_BUILD=release is the local
+# choice on macOS, where a debug (ASan) build deadlocks at process start; CI
+# runs it against the debug tree the concurrency job already builds, linked with
+# the sanitizer runtime so the instrumented archive resolves.
+PIN_TEST_BUILD ?= debug
+PIN_TEST_VCPKG := build/$(PIN_TEST_BUILD)/vcpkg_installed
+PIN_TEST_TRIPLET := $(shell ls $(PIN_TEST_VCPKG) 2>/dev/null | head -n 1)
+ifeq ($(PIN_TEST_BUILD),debug)
+PIN_TEST_VCPKG_LIB := $(PIN_TEST_VCPKG)/$(PIN_TEST_TRIPLET)/debug/lib
+else
+PIN_TEST_VCPKG_LIB := $(PIN_TEST_VCPKG)/$(PIN_TEST_TRIPLET)/lib
+endif
+PIN_TEST_LIBS := build/$(PIN_TEST_BUILD)/extension/mssql/libmssql_extension.a \
+    $(PIN_TEST_VCPKG_LIB)/libssl.a $(PIN_TEST_VCPKG_LIB)/libcrypto.a $(PIN_TEST_VCPKG_LIB)/libsimdutf.a \
+    -L build/$(PIN_TEST_BUILD)/src -lduckdb -ldl -pthread
+ifeq ($(shell uname -s),Darwin)
+PIN_TEST_LIBS += -framework GSS -framework Security -framework CoreFoundation \
+    -Wl,-rpath,$(CURDIR)/build/$(PIN_TEST_BUILD)/src
+else ifeq ($(PIN_TEST_BUILD),debug)
+PIN_TEST_LIBS += -fsanitize=address -fsanitize=undefined
+endif
+PIN_TEST_RPATH := DYLD_LIBRARY_PATH=build/$(PIN_TEST_BUILD)/src LD_LIBRARY_PATH=build/$(PIN_TEST_BUILD)/src
+
+test-transaction-pin: $(PIN_TEST_BUILD)
+	@echo "Building issue #356 transaction-pin contention test..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) -I src/include $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_transaction_pin.cpp \
+	    $(PIN_TEST_LIBS) \
+	    -o build/test/test_transaction_pin
+	@echo ""
+	@echo "Running issue #356 transaction-pin contention test..."
+	$(PIN_TEST_RPATH) build/test/test_transaction_pin
+
 test-multi-instance-pool-isolation: debug
 	@echo "Building spec 047 multi-instance pool isolation test (T023)..."
 	@mkdir -p build/test

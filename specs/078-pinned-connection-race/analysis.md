@@ -4,9 +4,13 @@
 from `main` `b84e259`, after four wrong fixes that were each measured and
 withdrawn — the point was to stop guessing and map the actual flow first. It
 worked: §4.1 names the cause and the branch now ships the fix and the
-instrument alongside this document. Sections are left as they were written,
-with the corrections marked, because how the first five hypotheses were reached
-and why one of them was rejected wrongly is the useful part.
+instrument alongside this document.
+
+The corrections are **edited into the text**, marked where they land — §4's
+fifth hypothesis is struck through and forwarded, §5-§7 carry a superseded
+note. Nothing was removed: how the first five hypotheses were reached, and why
+one of them was rejected on a probe that could only make the race rarer, is the
+useful part of this document.
 
 ## 0. What is actually observed
 
@@ -222,9 +226,27 @@ A sqllogictest cannot test a 4% race; it can only flake. What can:
   further theory.
 
 **Both were built.** The logging is `MSSQL_CONN_STATE=1` and it answered the
-question on its first reproduction (§4.1). The C++ test is
-`scenario_transaction_pin_race` in `test/cpp/test_concurrent_reads.cpp`: 200
-transactions each reading from and writing to the same catalog, which is 0/200
-with the fix and 2/200 with it reverted.
+question on its first reproduction (§4.1).
+
+The test went through two shapes. The first, `scenario_transaction_pin_race`
+in `test/cpp/test_concurrent_reads.cpp`, was a loop of COPY statements through
+DuckDB's real threading — 0/200 with the fix, 2/200 reverted — and the review
+pointed out what those numbers mean: at ~1% per transaction, broken code
+passes 200 iterations clean 13% of the time, and raising the count only makes
+the test slower (1000 iterations cost 15 minutes) without making it a guard.
+It stays, at 20 iterations, as the end-to-end smoke.
+
+The guard is `test/cpp/test_transaction_pin.cpp`. It links the extension
+statically and calls `ConnectionProvider::GetConnection` directly: eight
+threads released from a barrier into one transaction's lazy pin, in two
+patterns — all at once, and the first alone with the rest arriving during its
+BEGIN round trip. It asserts the contract rather than the symptom: one
+connection for everyone, Idle when handed out, a server transaction open on
+it, one active in the pool, none after ROLLBACK. Against the pre-fix provider
+it fails in round 1 either way — the all-at-once pattern with the double
+acquire (8 active, 7 leaked), the staggered one with every follower handed the
+connection in `Executing`. With the fix, 20/20 rounds in under a millisecond
+each. Logical, not statistical: the window is a network round trip and the
+callers' start skew is microseconds, so every caller is in it every time.
 
 Both are cheap next to another round of hypothesis-and-revert.
