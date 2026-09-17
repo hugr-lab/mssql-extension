@@ -57,7 +57,7 @@ architecture), [docs/](docs/) (internals), [docs/TESTING.md](docs/TESTING.md),
 - Full DuckDB catalog integration with three-part naming and lazy metadata loading
 - **Filter pushdown**: `WHERE` clauses are translated to T-SQL and evaluated by SQL Server, including mapped functions (`year`, `lower`, `LIKE` patterns, arithmetic). Anything the translator declines is applied locally instead — with the string-comparison caveat below
 - Row-count estimates reported to the DuckDB optimizer, so join order around an MSSQL scan is planned rather than guessed
-- Row identity (`rowid`) support for tables with primary keys
+- Row identity (`rowid`) for tables with a primary key or a usable unique index, which is what `UPDATE`/`DELETE` target rows by
 - Connection pooling with configurable limits and automatic session reset
 - TLS with the server certificate verified by default; `Encrypt`, `TrustServerCertificate` and `HostNameInCertificate` mean what they mean in the Microsoft drivers
 - Full DML support: INSERT (with RETURNING), UPDATE, DELETE — every statement atomic; an INSERT above 1000 rows loads through the BCP protocol

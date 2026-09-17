@@ -250,6 +250,9 @@ COPY source TO 'mssql://db/dbo/target' (FORMAT 'bcp', CREATE_TABLE false);
 | Source has extra columns | Extra columns are ignored |
 | No matching columns | Error: "No matching columns" |
 | Case mismatch (id vs ID) | Matched case-insensitively |
+| Source has a column named like an identity column | Its values are kept verbatim (no `KEEP_IDENTITY` hint needed — the bulk wire keeps a listed identity value); omit it and the server assigns |
 
 > **Note**: Target columns that don't have matching source columns must allow NULL values.
+
+> **Identity columns**: COPY keeps bcp semantics — a source column matching the identity column by name supplies the value and it is honoured, silently, the same way `CHECK_CONSTRAINTS` is off by default here. This is the way to load many rows *with* their identity values; an `INSERT` that names the identity column works too but stays on the statement path.
 

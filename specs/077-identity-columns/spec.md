@@ -1,10 +1,10 @@
 # Spec 077 — IDENTITY columns, and a rowid that does not need a primary key
 
-**Status:** in progress on `spec/077-identity-columns` from `main` `b84e259`
-(spec 062 merged as #348 on 2026-09-16). Reconnaissance done on 2026-09-16
-against the local docker server, SQL Server 2025 RTM-CU8. Spec and
-implementation ship in one PR, which is why #350 is a **draft** until the code
-lands beside the spec.
+**Status:** implemented on `spec/077-identity-columns` (PR #350), on top of
+`main` after #352, #355 and #357. Reconnaissance done on 2026-09-16 against the
+local docker server, SQL Server 2025 RTM-CU8; implementation on 2026-09-17,
+one commit per work item (W1 `9a40661`, W2 `33c0976`, the rename `cd015d1`).
+Spec and implementation ship in one PR.
 **Builds on:** spec 062 — `MSSQLColumnInfo::is_identity` already reaches
 `MSSQLInsertColumn` from `sys.columns` through the metadata cache (W4), and
 `MSSQLStatementConnection` already gives every DML statement one connection of
