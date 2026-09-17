@@ -1,6 +1,6 @@
 # Spec 065 — Direct UPDATE/DELETE: one statement when everything pushes down
 
-**Status:** Draft, **revalidated 2026-09-17** against `main` `3a48795` + #350 —
+**Status:** **CLOSED 2026-09-17 — superseded by spec 080 (`../080-dml-pushdown/spec.md`: its goal on DuckDB 2.0's rewriter, D3 and D5 carried over as W1/W4 there) and spec 079 (the writer). Kept as history.** Was: Draft, revalidated 2026-09-17 against `main` `3a48795` + #350 —
 see `revalidation-2026-09-17.md`. **Proposed retired:** DuckDB 2.0's own
 `RemotePushdownOptimizer` ships a whole UPDATE/DELETE to the remote catalog
 when every piece of it is supported (§ 5 there), which is this spec's goal on

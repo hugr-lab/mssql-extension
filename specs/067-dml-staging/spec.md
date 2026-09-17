@@ -1,6 +1,6 @@
 # Spec 067 — UPDATE/DELETE via staged JOIN: retiring rowid as a requirement
 
-**Status:** Draft, **revalidated 2026-09-17** — see
+**Status:** **CLOSED 2026-09-17 — the match-key ladder and the staged delivery are spec 080 D3 / W3 (`../080-dml-pushdown/spec.md`); #140 closes there. Kept as history.** Was: Draft, revalidated 2026-09-17 — see
 `../065-dml-pushdown-recon/revalidation-2026-09-17.md` § 4. Stands. Rung 2 of
 the ladder is spec 077's `ChooseRowIdKey` (with its two extra criteria); the
 "single-writer session on a held connection" this spec waited for is

@@ -1,6 +1,6 @@
 # Spec 066 — Materialize own-catalog scans before a sink (#239)
 
-**Status:** **Superseded by spec 075 W3** (shipped in #341): own-catalog scans
+**Status:** **CLOSED 2026-09-17 — the remainder below is spec 080 W2 (`../080-dml-pushdown/spec.md`). Kept as history.** Superseded by spec 075 W3 (shipped in #341): own-catalog scans
 are materialised before a sink, inside a transaction only, for the sink's
 catalog only — D1/D2 as this spec proposed, with `ColumnDataCollection` as the
 vehicle. **One remainder** is open and worth its own small PR: the sink set

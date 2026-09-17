@@ -1,5 +1,7 @@
 # Specs 065 / 066 / 067 — revalidation against the tree of 2026-09-17
 
+**Status (2026-09-17):** the research record behind **spec 079** (SELECT pushdown, `../079-select-pushdown/spec.md`) and **spec 080** (DML pushdown + the staged fallback, `../080-dml-pushdown/spec.md`); § 9 was their draft and is superseded by them. Kept as written — the measurements and the decision trail live here and the issues (#361, #362, #363) point into it.
+
 **Why.** The DML reconnaissance (`research.md`) and the three specs it produced
 are dated 2026-08-05/06. Since then the tree shipped spec 062 (INSERT via BCP,
 one connection per statement, atomic DML), spec 075 (read path off the pinned
@@ -204,7 +206,7 @@ path unchanged.
 
 ## 6. Order, now
 
-1. **Spec 078 (new): T-SQL writer + remote pushdown.** Claim `IS_REMOTE` +
+1. **Specs 079/080 (new): T-SQL writer + remote pushdown.** Claim `IS_REMOTE` +
    `EXECUTE_QUERY_NODE`; `RemoteExecute(string)` over `mssql_scan`; the
    writer for SELECT first (joins, aggregates, ORDER/TOP), UPDATE/DELETE
    next, with a veto list written from T-SQL's grammar and the §7 semantic
@@ -216,18 +218,18 @@ path unchanged.
    test lever).
 
    **Decided by the owner, 2026-09-17:** SELECT first, UPDATE/DELETE as the
-   second milestone. And one more item goes into 078's scope: **the fate of
+   second milestone. And one more item goes into 079's scope: **the fate of
    `MSSQLOptimizer`** (specs 039/075/076 — filter, ORDER BY and TOP-N pushed
    into the catalog scan on the *logical* plan). For a single-catalog
    statement the rewriter makes it redundant; it stays meaningful only for
    mixed-catalog plans, where a per-scan TOP-N still saves a transfer. Two
    translators for one dialect — `FilterEncoder` for scan predicates, the
-   new writer for whole statements — is the real cost, so 078 should decide
+   new writer for whole statements — is the real cost, so 079 should decide
    whether the logical optimizer is rewritten to render its scan subtree
    through the same writer, kept as is for the mixed case only, or retired
    with the mixed case left to the scan's own filter pushdown. The owner's
    expectation is that it is rewritten or retired in favour of the rewriter;
-   078 measures which. **Settled in § 9.1 after reading the rewriter's
+   079 measures which. **Settled in § 9.1 after reading the rewriter's
    granularity:** kept, as the fallback for mixed plans, local views and
    subqueries under a non-pushable outer node — which the rewriter cannot
    reach — with the vocabulary shared (one function table, one collation
@@ -246,8 +248,8 @@ path unchanged.
 
 ## 7. Decisions and open questions
 
-Decided (owner, 2026-09-17): 065 is retired in favour of spec 078 on the core
-rewriter; the first writer is SELECT only, UPDATE/DELETE second; 078 also
+Decided (owner, 2026-09-17): 065 is retired in favour of specs 079/080 on the core
+rewriter; the first writer is SELECT only, UPDATE/DELETE second; 079 also
 settles what becomes of `MSSQLOptimizer`'s TOP-N/ORDER BY pushdown.
 
 Answered since, in § 9: default **on** behind `mssql_remote_pushdown`
@@ -263,7 +265,7 @@ Still open:
 - The final word on § 9.3's string rule (proposed there; the reviewer was
   part of the original `<>` discussion, so it is asked in the PR).
 
-## 8. Strings on the server — measured, for 078, 061 and 076
+## 8. Strings on the server — measured, for 079/080, 061 and 076
 
 Raised by the owner: with whole statements on the server, ORDER BY, GROUP BY,
 DISTINCT, join keys, MIN/MAX and every comparison on a string column run
@@ -335,9 +337,9 @@ convert); SQL_ collations are exactly the installation default. The remedy is
 to declare `varchar` when the constant is representable in BOTH the column's
 and the database's code page — for the Latin-1 range on CP1252 that is a
 table lookup, and it is the case that matters — and `nvarchar` otherwise, as
-now. Worth its own issue and small PR; it is independent of 078.
+now. Worth its own issue and small PR; it is independent of 079.
 
-### 8.3 What this means for the T-SQL writer (spec 078)
+### 8.3 What this means for the T-SQL writer (spec 079)
 
 1. **Literals are spelled per column.** A `varchar` literal for a `varchar`
    column when every character is representable in its code page (the seek
@@ -491,7 +493,7 @@ so it is not the expression that costs but the plan change it invites.
 
 **What this adds to § 8.4.** The decision (native `=`, documented) stands; the
 measurement says the strict alternative would cost the server nothing on a
-seek and little elsewhere, so if a strict mode is ever wanted for spec 078's
+seek and little elsewhere, so if a strict mode is ever wanted for spec 080's
 rewritten DML — where § 8.3 already asks for it — the `DATALENGTH` pair is
 the form, not the sentinel and not `LIKE`. And the `char(n)` row is worth a
 line in the documentation next to the padding note: a `char` column's values
@@ -499,7 +501,7 @@ reach DuckDB padded, so a local comparison against a shorter constant misses
 them where the pushed one matches (`rtrim()` on the DuckDB side is the user's
 tool, as it is for any client of `char(n)`).
 
-## 9. Proposal: what we push down, and how (the shape of spec 078)
+## 9. Proposal: what we push down, and how (the shape of specs 079 and 080)
 
 Written from § 5 (the mechanism), § 8 (strings, measured) and a second read
 of `remote_pushdown_optimizer.cpp` on the pinned DuckDB for its granularity.
@@ -532,7 +534,7 @@ statement mixing catalogs blocks it, and a **parameter** (`$1`) reaches
 `SupportsPushdown(ParsedExpression)` for us to veto. So the two logical-level
 mechanisms we ship — the scan's filter pushdown and `MSSQLOptimizer`'s
 ORDER BY / TOP — **stay** as the fallback for mixed plans and views; neither
-is retired by 078. What they share with the writer is one collation
+is retired by 079. What they share with the writer is one collation
 predicate and one function table, so a query cannot answer differently
 depending on which path it took.
 
@@ -663,6 +665,6 @@ on and off and the results are compared, with the string cases of § 9.3 given
 explicit expectations instead; a `remote_pushdown` statement counter under
 `MSSQL_COUNTERS` (spec 063's lesson: an SQL-invisible path needs a counter or
 the suite goes vacuous), and `EXPLAIN` assertions on the emitted T-SQL. Two
-PRs: **078-A** SELECT (writer, vetoes, `mssql_query`, setting, docs, suite),
-then **078-B** DML/DDL. The 076 seek fix and the 061 correction go first as
+PRs: **079** SELECT (writer, vetoes, `mssql_query`, setting, docs, suite),
+then **080** DML/DDL. The 076 seek fix and the 061 correction go first as
 their own small PRs.
