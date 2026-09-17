@@ -120,7 +120,8 @@ SELECT
     ISNULL(c.collation_name, '') AS collation_name,
     ISNULL(shape.index_type, 0) AS index_type,
     ISNULL(shape.is_partitioned, 0) AS is_partitioned,
-    c.is_identity
+    c.is_identity,
+    CAST(COLLATIONPROPERTY(c.collation_name, 'CodePage') AS INT) AS code_page
 FROM sys.objects o
 INNER JOIN sys.columns c ON c.object_id = o.object_id
 OUTER APPLY (SELECT MAX(i.type) AS index_type,
@@ -150,7 +151,8 @@ SELECT
     ISNULL(c.collation_name, '') AS collation_name,
     ISNULL(shape.index_type, 0) AS index_type,
     ISNULL(shape.is_partitioned, 0) AS is_partitioned,
-    c.is_identity
+    c.is_identity,
+    CAST(COLLATIONPROPERTY(c.collation_name, 'CodePage') AS INT) AS code_page
 FROM sys.schemas s
 INNER JOIN sys.objects o ON o.schema_id = s.schema_id
 INNER JOIN sys.columns c ON c.object_id = o.object_id
@@ -206,7 +208,8 @@ SELECT
     ISNULL(c.collation_name, '') AS collation_name,
     ISNULL(shape.index_type, 0) AS index_type,
     ISNULL(shape.is_partitioned, 0) AS is_partitioned,
-    c.is_identity
+    c.is_identity,
+    CAST(COLLATIONPROPERTY(c.collation_name, 'CodePage') AS INT) AS code_page
 FROM sys.schemas s
 INNER JOIN sys.objects o ON o.schema_id = s.schema_id
 INNER JOIN sys.columns c ON c.object_id = o.object_id
@@ -235,13 +238,28 @@ SELECT
     c.scale,
     c.is_nullable,
     ISNULL(c.collation_name, '') AS collation_name,
-    c.is_identity
+    c.is_identity,
+    CAST(COLLATIONPROPERTY(c.collation_name, 'CodePage') AS INT) AS code_page
 FROM sys.columns c
 WHERE c.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
 ORDER BY c.column_id
 )";
 
 // A bit column as the simple-query layer renders it.
+// COLLATIONPROPERTY(name, 'CodePage') as the server sends it: an int, NULL for a
+// non-text column (and for a collation the server has no page for, which
+// then declares as nvarchar — the safe side).
+static int32_t ParseCodePage(const vector<string> &values, idx_t idx) {
+	if (values.size() <= idx || values[idx].empty()) {
+		return 0;
+	}
+	try {
+		return static_cast<int32_t>(std::stoi(values[idx]));
+	} catch (...) {
+		return 0;
+	}
+}
+
 static bool FlagIsSet(const string &value) {
 	return value == "1" || value == "true" || value == "True";
 }
@@ -566,6 +584,10 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 			// planner needs to keep an explicit identity value on the statement
 			// path, where the server decides about it.
 			col_info.is_identity = values.size() > 12 && FlagIsSet(values[12]);
+			// COLLATIONPROPERTY(collation_name, 'CodePage') (issue #361): the page a
+			// varchar parameter is converted to; 0 when the server cannot say.
+			col_info.code_page = ParseCodePage(values, 13);
+			col_info.database_code_page = database_code_page_;
 			table_meta.columns.push_back(std::move(col_info));
 		},
 		reset_slot);
@@ -794,6 +816,10 @@ void MSSQLMetadataCache::LoadAllTableMetadataForSchema(tds::TdsConnection &conne
 			MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
 									 database_collation_);
 			col_info.is_identity = values.size() > 14 && FlagIsSet(values[14]);
+			// COLLATIONPROPERTY(collation_name, 'CodePage') (issue #361): the page a
+			// varchar parameter is converted to; 0 when the server cannot say.
+			col_info.code_page = ParseCodePage(values, 15);
+			col_info.database_code_page = database_code_page_;
 			current_table_meta->columns.push_back(std::move(col_info));
 			column_count++;
 		},
@@ -963,6 +989,10 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 			MSSQLColumnInfo col_info(values[5], col_id, values[7], max_len, prec, scl, nullable, values[12],
 									 database_collation_);
 			col_info.is_identity = values.size() > 15 && FlagIsSet(values[15]);
+			// COLLATIONPROPERTY(collation_name, 'CodePage') (issue #361): the page a
+			// varchar parameter is converted to; 0 when the server cannot say.
+			col_info.code_page = ParseCodePage(values, 16);
+			col_info.database_code_page = database_code_page_;
 			table_meta->columns.push_back(std::move(col_info));
 			column_count++;
 		},
@@ -1222,6 +1252,10 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 				MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
 										 database_collation_);
 				col_info.is_identity = values.size() > 14 && FlagIsSet(values[14]);
+				// COLLATIONPROPERTY(collation_name, 'CodePage') (issue #361): the page a
+				// varchar parameter is converted to; 0 when the server cannot say.
+				col_info.code_page = ParseCodePage(values, 15);
+				col_info.database_code_page = database_code_page_;
 				current_table_meta->columns.push_back(std::move(col_info));
 				schema_columns++;
 				column_count++;
@@ -1389,9 +1423,10 @@ int64_t MSSQLMetadataCache::GetTTL() const {
 	return ttl_seconds_;
 }
 
-void MSSQLMetadataCache::SetDatabaseCollation(const string &collation) {
+void MSSQLMetadataCache::SetDatabaseCollation(const string &collation, int32_t code_page) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	database_collation_ = collation;
+	database_code_page_ = code_page;
 }
 
 string MSSQLMetadataCache::GetDatabaseCollation() const {
@@ -1853,6 +1888,10 @@ void MSSQLMetadataCache::LoadColumns(tds::TdsConnection &connection, const strin
 				MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
 										 database_collation_);
 				col_info.is_identity = values.size() > 8 && FlagIsSet(values[8]);
+				// COLLATIONPROPERTY(collation_name, 'CodePage') (issue #361): the page a
+				// varchar parameter is converted to; 0 when the server cannot say.
+				col_info.code_page = ParseCodePage(values, 9);
+				col_info.database_code_page = database_code_page_;
 				table_metadata.columns.push_back(std::move(col_info));
 			}
 		},

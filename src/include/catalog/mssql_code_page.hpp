@@ -6,18 +6,14 @@
 namespace duckdb {
 namespace mssql {
 
-//! The Windows code page a SQL Server collation stores `varchar` data in, from
-//! the collation's name: the `_CPnnn_` token of a `SQL_` collation (`CP1` is
-//! 1252), the language family of a Windows collation (`Cyrillic_General` is
-//! 1251), `_UTF8` is 65001. 0 when the name is empty or the family is not in
-//! the table — every caller treats 0 as "cannot tell", which is the safe side.
-//! Issue #361: the answer decides whether a non-ASCII constant may travel as a
-//! `varchar` parameter (the seekable form on a `SQL_` collation) or must go as
-//! `nvarchar`.
+//! Code pages as SQL Server reports them — COLLATIONPROPERTY(name, 'CodePage'):
+//! 1252 for SQL_Latin1_General_CP1, 1251 for Cyrillic_General, 65001 for a
+//! _UTF8 collation, 0 (NULL) for a non-text column or a Unicode-only
+//! collation. The metadata loaders read it with the column and the database
+//! collation (issue #361); every consumer treats 0 as "cannot tell", the safe
+//! side: a non-ASCII constant then travels as nvarchar, as it always did.
 constexpr int32_t CODE_PAGE_UNKNOWN = 0;
 constexpr int32_t CODE_PAGE_UTF8 = 65001;
-
-int32_t CodePageOfCollation(const std::string &collation_name);
 
 //! Whether every character of a UTF-8 string has a representation in the code
 //! page. ASCII is representable everywhere SQL Server stores `varchar` (every

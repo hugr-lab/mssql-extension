@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
-#include "catalog/mssql_code_page.hpp"
 #include "codec/target_string_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/extension_type_info.hpp"
@@ -47,8 +46,6 @@ MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const st
 	is_case_sensitive = IsCaseSensitiveCollation(this->collation_name);
 	is_unicode = IsUnicodeType(sql_type_name);
 	is_utf8 = IsUTF8Collation(this->collation_name);
-	code_page = mssql::CodePageOfCollation(this->collation_name);
-	database_code_page = mssql::CodePageOfCollation(database_collation);
 
 	// Map to DuckDB type
 	duckdb_type = MapSQLServerTypeToDuckDB(sql_type_name, max_length, precision, scale);

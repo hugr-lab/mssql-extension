@@ -4,17 +4,18 @@
 // page, and the comparison converts it to the COLUMN's; a constant that either
 // page cannot hold arrives as '?'. So a non-ASCII constant may travel as
 // varchar — the form that keeps an index seek on a SQL_ collation — only when
-// both pages can hold every character of it. The tables below are the
-// single-byte Windows code pages SQL Server stores varchar in, generated from
-// Python's codecs (cp874, cp1250 … cp1258: the code points of bytes 0x80–0xFF
-// that are defined, sorted). Double-byte pages have no table and answer
-// "cannot tell" for anything outside ASCII, which keeps such constants on the
-// nvarchar path they took before.
+// both pages can hold every character of it. Which page a collation uses is
+// the server's answer, COLLATIONPROPERTY(name, 'CodePage'), carried with the
+// column metadata and the database collation; this file only answers whether
+// a page holds a string. The tables are the single-byte Windows code pages SQL
+// Server stores varchar in, generated from Python's codecs (cp874, cp1250 …
+// cp1258: the code points of bytes 0x80–0xFF that are defined, sorted).
+// Double-byte pages have no table and answer "cannot tell" for anything
+// outside ASCII, which keeps such constants on the nvarchar path they took
+// before.
 #include "catalog/mssql_code_page.hpp"
 
 #include <algorithm>
-#include <cctype>
-#include <cstring>
 
 namespace duckdb {
 namespace mssql {
@@ -168,138 +169,7 @@ const CodePageTable *FindTable(int32_t code_page) {
 	return nullptr;
 }
 
-// Windows collation families and the code page each stores varchar in
-// (COLLATIONPROPERTY(name, 'CodePage')). A family name is the prefix of the
-// collation name up to the version / sensitivity tokens, so `Latin1_General`
-// covers `Latin1_General_CI_AS` and `Latin1_General_100_BIN2` alike. Families
-// that are Unicode-only (Indic_General, Divehi, …) are absent on purpose: they
-// resolve to 0, "cannot tell", and stay on the nvarchar path.
-struct CollationFamily {
-	const char *prefix;	 // lower-case, followed by '_' in the name
-	int32_t code_page;
-};
-
-const CollationFamily COLLATION_FAMILIES[] = {
-	// 1252 — Western European
-	{"latin1_general", 1252},
-	{"modern_spanish", 1252},
-	{"traditional_spanish", 1252},
-	{"danish_norwegian", 1252},
-	{"danish_greenlandic", 1252},
-	{"finnish_swedish", 1252},
-	{"icelandic", 1252},
-	{"french", 1252},
-	{"german_phonebook", 1252},
-	{"frisian", 1252},
-	{"norwegian", 1252},
-	{"sami_norway", 1252},
-	{"sami_sweden_finland", 1252},
-	{"corsican", 1252},
-	{"breton", 1252},
-	{"welsh", 1252},
-	{"mapudungan", 1252},
-	{"mohawk", 1252},
-	{"luxembourgish", 1252},
-	// 1250 — Central European
-	{"albanian", 1250},
-	{"croatian", 1250},
-	{"czech", 1250},
-	{"hungarian", 1250},
-	{"polish", 1250},
-	{"romanian", 1250},
-	{"slovak", 1250},
-	{"slovenian", 1250},
-	{"bosnian_latin", 1250},
-	{"serbian_latin", 1250},
-	{"upper_sorbian", 1250},
-	{"turkmen", 1250},
-	// 1251 — Cyrillic
-	{"cyrillic_general", 1251},
-	{"ukrainian", 1251},
-	{"macedonian_fyrom", 1251},
-	{"bosnian_cyrillic", 1251},
-	{"serbian_cyrillic", 1251},
-	{"kazakh", 1251},
-	{"tatar", 1251},
-	{"bashkir", 1251},
-	{"yakut", 1251},
-	{"mongolian", 1251},
-	// 1253 — Greek
-	{"greek", 1253},
-	// 1254 — Turkish
-	{"turkish", 1254},
-	{"azeri_latin", 1254},
-	{"uzbek_latin", 1254},
-	// 1255 — Hebrew
-	{"hebrew", 1255},
-	// 1256 — Arabic
-	{"arabic", 1256},
-	{"persian", 1256},
-	{"urdu", 1256},
-	{"dari", 1256},
-	{"pashto", 1256},
-	{"syriac", 1256},
-	{"uighur", 1256},
-	// 1257 — Baltic
-	{"estonian", 1257},
-	{"latvian", 1257},
-	{"lithuanian", 1257},
-	// 1258 — Vietnamese
-	{"vietnamese", 1258},
-	// 874 — Thai
-	{"thai", 874},
-	// double-byte pages: recognised so the answer is "that page" rather than
-	// "unknown", but no table — non-ASCII constants stay nvarchar
-	{"japanese", 932},
-	{"chinese_prc", 936},
-	{"chinese_simplified", 936},
-	{"korean", 949},
-	{"chinese_taiwan", 950},
-	{"chinese_traditional", 950},
-	{"chinese_hong_kong", 950},
-};
-
-std::string Lower(const std::string &s) {
-	std::string out = s;
-	std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return std::tolower(c); });
-	return out;
-}
-
 }  // namespace
-
-int32_t CodePageOfCollation(const std::string &collation_name) {
-	if (collation_name.empty()) {
-		return CODE_PAGE_UNKNOWN;
-	}
-	const std::string name = Lower(collation_name);
-	if (name.size() >= 5 && name.compare(name.size() - 5, 5, "_utf8") == 0) {
-		return CODE_PAGE_UTF8;
-	}
-	if (name.compare(0, 4, "sql_") == 0) {
-		// SQL_Latin1_General_CP1_CI_AS, SQL_Ukrainian_CP1251_CI_AS, SQL_Scandinavian_CP850_CI_AS
-		const auto cp = name.find("_cp");
-		if (cp == std::string::npos) {
-			return CODE_PAGE_UNKNOWN;
-		}
-		size_t i = cp + 3;
-		int32_t number = 0;
-		while (i < name.size() && std::isdigit(static_cast<unsigned char>(name[i]))) {
-			number = number * 10 + (name[i] - '0');
-			i++;
-		}
-		if (number == 1) {
-			return 1252;
-		}
-		return number;	// 1250 … 1258, or an OEM page (437, 850) with no table
-	}
-	for (const auto &family : COLLATION_FAMILIES) {
-		const size_t len = std::strlen(family.prefix);
-		if (name.size() > len && name.compare(0, len, family.prefix) == 0 && name[len] == '_') {
-			return family.code_page;
-		}
-	}
-	return CODE_PAGE_UNKNOWN;
-}
 
 bool CodePageCanEncode(int32_t code_page, const std::string &utf8) {
 	bool ascii = true;

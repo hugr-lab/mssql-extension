@@ -30,9 +30,11 @@ struct MSSQLColumnInfo {
 	bool is_case_sensitive;		 // Derived from collation (_CS_ or _BIN)
 	bool is_unicode;			 // True for NVARCHAR/NCHAR/NTEXT
 	bool is_utf8;				 // Derived from collation (_UTF8)
-	int32_t code_page;			 // Code page the column's collation stores varchar in; 0 = cannot tell
-	int32_t database_code_page;	 // The same for the database collation — a varchar PARAMETER
-								 // takes this one (issue #361, mssql::CodePageOfCollation)
+	int32_t code_page;			 // COLLATIONPROPERTY(collation, 'CodePage'): the page the column stores
+								 // varchar in; 0 = the server has none (non-text, Unicode-only). Set by
+								 // the metadata loaders after construction, like is_identity (issue #361)
+	int32_t database_code_page;	 // The same for the database collation — a varchar PARAMETER takes
+								 // this page, so a constant must fit both (mssql::CodePageCanEncode)
 	bool is_cast_required;		 // Unsupported type: needs CAST to NVARCHAR(MAX)
 	bool is_geometry;			 // True for SQL Server geometry/geography columns; table scan projects
 								 // [col].STAsBinary() AS [col] so the wire delivers OGC WKB which lands

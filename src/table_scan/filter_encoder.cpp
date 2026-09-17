@@ -266,15 +266,6 @@ std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalTy
 
 namespace {
 
-bool IsAscii(const std::string &text) {
-	for (unsigned char c : text) {
-		if (c >= 0x80) {
-			return false;
-		}
-	}
-	return true;
-}
-
 // UTF-16 code units of a UTF-8 string: one per lead byte, two for a 4-byte
 // sequence (a surrogate pair). This is nvarchar's unit.
 size_t Utf16Units(const std::string &text) {
@@ -420,7 +411,16 @@ std::string FilterEncoder::DeclarationForColumn(const MSSQLColumnInfo &column, c
 		return DeclarationOfValueOrEmpty(value, type);
 	}
 	if (t == "text") {
-		return type.id() == LogicalTypeId::VARCHAR ? "varchar(max)" : DeclarationOfValueOrEmpty(value, type);
+		if (type.id() != LogicalTypeId::VARCHAR) {
+			return DeclarationOfValueOrEmpty(value, type);
+		}
+		// The same two-page rule as varchar below: a text column cannot carry a
+		// UTF-8 collation, so a constant the database's page cannot hold went
+		// as '?' in a varchar(max) parameter and `LIKE 'ы%'` matched '?…' rows.
+		const std::string &text = StringValue::Get(value);
+		const bool fits = mssql::CodePageCanEncode(column.code_page, text) &&
+						  mssql::CodePageCanEncode(column.database_code_page, text);
+		return fits ? "varchar(max)" : "nvarchar(max)";
 	}
 	if (t == "ntext") {
 		return type.id() == LogicalTypeId::VARCHAR ? "nvarchar(max)" : DeclarationOfValueOrEmpty(value, type);

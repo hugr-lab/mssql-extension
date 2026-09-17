@@ -25,6 +25,14 @@ ATTACH '{MSSQL_TESTDB_DSN}' AS vd (TYPE mssql);
 statement ok
 SET mssql_exec_invalidate_cache = true;
 
+# Every plan below assumes the database's code page is 1252; a server started
+# with another default collation would fail the assertions for that reason,
+# so name it here.
+query I
+SELECT * FROM mssql_scan('vd', 'SELECT CAST(COLLATIONPROPERTY(CAST(DATABASEPROPERTYEX(DB_NAME(), ''Collation'') AS NVARCHAR(128)), ''CodePage'') AS INT) AS code_page');
+----
+1252
+
 statement ok
 SELECT mssql_exec('vd', 'DROP TABLE IF EXISTS dbo.VarcharDeclSeek');
 
@@ -97,3 +105,9 @@ true
 
 statement ok
 SELECT mssql_exec('vd', 'DROP TABLE dbo.VarcharDeclSeek');
+
+statement ok
+SET mssql_exec_invalidate_cache = false;
+
+statement ok
+DETACH vd;
