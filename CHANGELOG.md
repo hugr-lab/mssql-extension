@@ -43,9 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **A primary key that cannot address a row now falls through instead of being
   taken.** A `DATETIME` key produced an `UPDATE` that reported success and
   changed nothing ([#358](https://github.com/hugr-lab/mssql-extension/issues/358):
-  no `datetime2` literal at any precision equals a `datetime` column), and a
-  `SQL_VARIANT` key does the same through its lossy read
-  ([#354](https://github.com/hugr-lab/mssql-extension/issues/354)). Such a
+  no `datetime2` literal at any precision equals a `datetime` column), a
+  `TIME(7)` or `DATETIMEOFFSET(7)` key does the same the other way round (the
+  read path keeps microseconds, so a key whose 100 ns digit is set comes back
+  truncated and its literal never matches — measured: three such rows, one
+  updated), and a `SQL_VARIANT` key does the same through its lossy read
+  ([#354](https://github.com/hugr-lab/mssql-extension/issues/354)).
+  `SMALLDATETIME` and `DATETIME2(7)` keys match their literals and stay usable. Such a
   table now uses another unique index if it has one, and otherwise refuses by
   name — a behaviour change, and a deliberate one, since what it replaces is a
   statement that did nothing and said so to nobody. Every refusal names what

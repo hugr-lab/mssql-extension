@@ -38,8 +38,7 @@ struct PKColumnInfo {
 // key if it is usable, else a usable unique index by the documented order.
 // `exists` therefore means "there is a key rowid can be built on", `source`
 // says which kind, and `rejections` names every candidate that was not usable
-// and why — the W5b refusal quotes them. (The struct keeps its name for now;
-// the rename to RowIdKeyInfo is its own mechanical commit.)
+// and why — the W5b refusal quotes them.
 //===----------------------------------------------------------------------===//
 
 struct RowIdKeyInfo {

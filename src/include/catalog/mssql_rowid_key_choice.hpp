@@ -91,15 +91,25 @@ inline std::string Lower(std::string s) {
 	return s;
 }
 
-//! The literal-cannot-match exclusion (issue #358). A `datetime` counts in
-//! 1/300 s ticks, and since compatibility level 130 a datetime compared with a
-//! datetime2 is converted more precisely than datetime2(7) can represent —
-//! measured: no datetime2 literal at any precision equals such a column, so a
-//! rowid built on it finds no row and the UPDATE reports success and changes
-//! nothing. Lifted when #358 renders these keys as CAST(… AS DATETIME).
-inline bool IsLiteralMismatchType(const std::string &type_name) {
+//! The literal-cannot-match exclusion (issue #358), measured on every type of
+//! the family. `datetime` counts in 1/300 s ticks, and since compatibility
+//! level 130 a datetime compared with a datetime2 is converted more precisely
+//! than datetime2(7) can represent, so no datetime2 literal at any precision
+//! equals such a column: a rowid built on it finds no row and the UPDATE
+//! reports success and changes nothing. `time(7)` and `datetimeoffset(7)` fail
+//! the other way round: the read path decodes them to DuckDB's microsecond
+//! TIME / TIMESTAMP_TZ, so a key whose 100 ns digit is set comes back
+//! truncated and the literal never matches (3 rows keyed on such values, 1
+//! updated — the one with a zero seventh digit). `smalldatetime` has no
+//! fraction and matches its datetime2 literal exactly; `datetime2(7)` reads as
+//! TIMESTAMP_NS and round-trips. Lifted when #358 renders these keys in their
+//! own type.
+inline bool IsLiteralMismatch(const std::string &type_name, uint8_t scale) {
 	const std::string t = Lower(type_name);
-	return t == "datetime" || t == "smalldatetime";
+	if (t == "datetime") {
+		return true;
+	}
+	return (t == "time" || t == "datetimeoffset") && scale == 7;
 }
 
 //! Why this candidate cannot address a row. `reason` is empty when it can;
@@ -136,8 +146,9 @@ inline RowIdKeyRejection Unusable(const RowIdKeyCandidate &c) {
 			r.unmatchable = true;
 			return r;
 		}
-		if (IsLiteralMismatchType(col.type_name)) {
-			r.reason = "its key column '" + col.name + "' has type " + col.type_name +
+		if (IsLiteralMismatch(col.type_name, col.scale)) {
+			const std::string spelled = col.type_name + (Lower(col.type_name) == "datetime" ? "" : "(7)");
+			r.reason = "its key column '" + col.name + "' has type " + spelled +
 					   ", which no rowid literal can match (see issue #358)";
 			r.unmatchable = true;
 			return r;

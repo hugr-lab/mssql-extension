@@ -184,7 +184,7 @@ SET mssql_dml_batch_size = 500;
 ### Limitations
 
 - **RETURNING clause is not supported** for UPDATE operations
-- Tables must have a **rowid key**: a primary key, or a unique index that is not filtered, not disabled, and whose key columns are all NOT NULL (a `BIGINT IDENTITY … UNIQUE` is the common shape). A primary key that cannot address a row — `DATETIME`, `SQL_VARIANT` — falls through to another unique index if there is one, and the refusal otherwise names every index it rejected and why
+- Tables must have a **rowid key**: a primary key, or a unique index that is not filtered, not disabled, and whose key columns are all NOT NULL (a `BIGINT IDENTITY … UNIQUE` is the common shape). A primary key that cannot address a row — `DATETIME`, `TIME(7)`, `DATETIMEOFFSET(7)`, `SQL_VARIANT` — falls through to another unique index if there is one, and the refusal otherwise names every index it rejected and why
 - Updates use a single `UPDATE ... FROM target JOIN (VALUES ...)` statement per batch, joining on the rowid key (scalar or composite)
 
 ## String comparisons and collation {#collation}

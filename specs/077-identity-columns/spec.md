@@ -189,7 +189,20 @@ object and pick one deterministically.
 | every key column `is_nullable = 0` | `sys.index_columns` joined to `sys.columns`, `is_included_column = 0` | measured: a unique index on a nullable column accepts exactly one NULL row and refuses the second, so NULL is neither unique nor addressable |
 | `is_disabled = 0`, `is_hypothetical = 0` | `sys.indexes` | a disabled index enforces nothing |
 | no key column is `is_cast_required` | `MSSQLColumnInfo` | **the review's best finding, and it is a live bug on the PK path already — see below** |
-| no key column is `datetime` or `smalldatetime` | `MSSQLColumnInfo::sql_type_name` | the rowid literal cannot be made to match such a column at all — measured, see below. Lifted when [#358](https://github.com/hugr-lab/mssql-extension/issues/358) fixes the renderer |
+| no key column is `datetime`, nor `time` / `datetimeoffset` at scale 7 | `MSSQLColumnInfo::sql_type_name` | the rowid literal cannot be made to match such a column at all — measured, see below. Lifted when [#358](https://github.com/hugr-lab/mssql-extension/issues/358) fixes the renderer |
+
+**The rest of the datetime family, measured (review of #350).** Primary keys
+of every type, one row per shape, `UPDATE … SET n = 1 WHERE n = 0` through the
+extension: `time(7)` and `datetimeoffset(7)` keyed on `.0000001` / `.1234567`
+values — 3 rows, **1 updated** (the one whose seventh digit is zero): the read
+path decodes both to DuckDB's microsecond `TIME` / `TIMESTAMP_TZ`, so the
+literal carries the truncated value and never matches. `time(6)`,
+`datetimeoffset(6)` and `datetime2(7)` (read as `TIMESTAMP_NS`) — every row
+updated. `smalldatetime`, keyed on `10:00:00` / `10:01:00`, matches its
+`CAST(… AS DATETIME2(7))` literal exactly (it has no fraction to lose) and is
+**not** excluded; the earlier draft excluded it on `datetime`'s evidence. The
+criterion is therefore `datetime`, or `time` / `datetimeoffset` at scale 7
+(`RowIdKeyColumn::scale` carries it), and #358 covers all three.
 
 **The cast-required criterion, and the bug it exposes.** A unique index — and a
 PRIMARY KEY — can sit on `sql_variant` or `hierarchyid`; both were created to

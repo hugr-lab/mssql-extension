@@ -355,6 +355,13 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 		pk_info_.discovery_error = e.what();
 	}
 
+	// A discovery FAILURE is not cached (#350 review): the caller's statement
+	// is refused with the error it just met, but pk_loaded_ stays false so the
+	// next bind runs the lookup again — a pool hiccup must not turn into a
+	// refusal that outlives it until someone invalidates the cache.
+	if (!pk_info_.discovery_error.empty()) {
+		return;
+	}
 	// Release-store publishes pk_info_ to any reader doing acquire-load.
 	// MUST be the last write to MSSQLTableEntry state in this function.
 	pk_loaded_.store(true, std::memory_order_release);

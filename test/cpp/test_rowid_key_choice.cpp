@@ -23,16 +23,16 @@ using namespace duckdb::mssql;
 
 static int g_failures = 0;
 
-#define CHECK(cond, what)                                                                    \
-	do {                                                                                     \
-		if (!(cond)) {                                                                       \
+#define CHECK(cond, what)                                                                              \
+	do {                                                                                               \
+		if (!(cond)) {                                                                                 \
 			std::cerr << "  FAIL: " << what << " (" << #cond << ") at line " << __LINE__ << std::endl; \
-			g_failures++;                                                                    \
-		}                                                                                    \
+			g_failures++;                                                                              \
+		}                                                                                              \
 	} while (0)
 
 static RowIdKeyColumn Col(const std::string &name, const std::string &type, int16_t max_length, bool nullable = false,
-						  bool identity = false, bool cast_required = false) {
+						  bool identity = false, bool cast_required = false, uint8_t scale = 0) {
 	RowIdKeyColumn c;
 	c.name = name;
 	c.type_name = type;
@@ -40,6 +40,7 @@ static RowIdKeyColumn Col(const std::string &name, const std::string &type, int1
 	c.is_nullable = nullable;
 	c.is_identity = identity;
 	c.cast_required = cast_required;
+	c.scale = scale;
 	return c;
 }
 
@@ -90,9 +91,26 @@ int main() {
 		CHECK(r.rejections.size() == 1 && Contains(r.rejections[0].reason, "#354"), "lossy read names #354");
 	}
 	{
-		auto pk = Idx(1, "PK_sdt", {Col("k", "smalldatetime", 4)}, true);
-		auto r = ChooseRowIdKey({pk});
-		CHECK(!r.Found() && Contains(r.rejections[0].reason, "no rowid literal can match"), "smalldatetime too");
+		// measured (#350 review): smalldatetime has no fraction and matches its
+		// datetime2 literal, datetime2(7) reads as TIMESTAMP_NS — both usable;
+		// time(7) / datetimeoffset(7) lose their 100 ns digit on read — refused,
+		// while scale 6 of either round-trips
+		CHECK(ChooseRowIdKey({Idx(1, "PK_sdt", {Col("k", "smalldatetime", 4)}, true)}).Found(),
+			  "smalldatetime is usable");
+		CHECK(ChooseRowIdKey({Idx(1, "PK_dt27", {Col("k", "datetime2", 8, false, false, false, 7)}, true)}).Found(),
+			  "datetime2(7) is usable");
+		CHECK(ChooseRowIdKey({Idx(1, "PK_t6", {Col("k", "time", 5, false, false, false, 6)}, true)}).Found(),
+			  "time(6) is usable");
+		CHECK(
+			ChooseRowIdKey({Idx(1, "PK_dto6", {Col("k", "datetimeoffset", 10, false, false, false, 6)}, true)}).Found(),
+			"datetimeoffset(6) is usable");
+		auto t7 = ChooseRowIdKey({Idx(1, "PK_t7", {Col("k", "time", 5, false, false, false, 7)}, true)});
+		CHECK(!t7.Found() && Contains(t7.rejections[0].reason, "time(7)") && Contains(t7.rejections[0].reason, "#358"),
+			  "time(7) is refused by name");
+		auto dto7 = ChooseRowIdKey({Idx(1, "PK_dto7", {Col("k", "datetimeoffset", 10, false, false, false, 7)}, true)});
+		CHECK(!dto7.Found() && Contains(dto7.rejections[0].reason, "datetimeoffset(7)"),
+			  "datetimeoffset(7) is refused");
+		CHECK(dto7.rejections[0].unmatchable, "…as unmatchable");
 	}
 
 	// --- each structural rejection, by text
