@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`COPY` no longer drops a CLR UDT column of an existing target in silence**
+  ([#353](https://github.com/hugr-lab/mssql-extension/issues/353)). The
+  target-metadata query joined `sys.types` on `system_type_id`, which no
+  `sys.types` row satisfies for a `geometry`, `geography` or `hierarchyid`
+  column, so the column never reached the resolver: a source column feeding one
+  was ignored and its values lost, and a NOT NULL target failed with "Cannot
+  insert the value NULL into column …" about a value the user had supplied. The
+  join is gone from all eight metadata queries — the name comes from
+  `ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id))`, which is
+  correct for UDTs and **8.7× cheaper on the query itself** (1316 µs → 152 µs
+  per execution on a 101-column table, 2000 executions a run, four interleaved
+  runs). The join is expensive not by itself — without the `ORDER BY` it costs
+  2.7× — but because it defeats the index order on `sys.columns` and makes the
+  server sort for the `ORDER BY c.column_id` every one of these queries
+  carries. A source that feeds such a column is now
+  refused by name, **at init, before a row is encoded** — so a COPY that is
+  going to fail this way writes nothing rather than committing the batches that
+  happened to precede the first value. A source that omits such a column still
+  loads and the server fills it, exactly as before, and so does one that gives
+  it a constant `NULL AS g`: that is how one says "leave this column alone", it
+  worked before #353 (by accident — the join hid the column), and it is safe
+  because DuckDB types a bare NULL as SQLNULL, which has no other value it
+  could hold. Such a column is dropped from the load rather than declared;
+  declaring it would make the server refuse the whole `INSERT BULK`, since the
+  type mapping gives it the VARCHAR fallback. The two non-UDT types the change
+  also refuses,
+  `sql_variant` and `rowversion`, lose nothing: measured against the server,
+  both already failed mid-stream — `Operand type clash: nvarchar(max) is
+  incompatible with sql_variant` and error 273 respectively — so the refusal
+  only moves the error earlier and names the column.
 - **A transaction's first statement could fail with `Cannot execute: connection
   not in Idle state`** ([#356](https://github.com/hugr-lab/mssql-extension/issues/356)).
   The connection a transaction pins was published to other threads **before**
