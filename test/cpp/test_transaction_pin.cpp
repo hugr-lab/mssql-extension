@@ -129,10 +129,16 @@ int main() {
 		for (int t = 0; t < threads; t++) {
 			workers.emplace_back([&, t]() {
 				ready.fetch_add(1);
+				// Yield rather than spin hot: on a 2-vCPU CI runner eight busy
+				// loops would take the CPU away from the one thread that is
+				// doing the BEGIN round trip, and the staggered pattern depends
+				// on that thread getting ahead.
 				while (!go.load(std::memory_order_acquire)) {
+					std::this_thread::yield();
 				}
 				if (staggered && t > 0) {
 					while (!go_rest.load(std::memory_order_acquire)) {
+						std::this_thread::yield();
 					}
 				}
 				try {
@@ -144,6 +150,7 @@ int main() {
 			});
 		}
 		while (ready.load() < threads) {
+			std::this_thread::yield();
 		}
 		const auto t0 = std::chrono::steady_clock::now();
 		go.store(true, std::memory_order_release);
