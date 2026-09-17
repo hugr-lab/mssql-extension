@@ -112,7 +112,7 @@ SELECT
     CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
     c.name AS column_name,
     c.column_id,
-    ISNULL(t.name, TYPE_NAME(c.user_type_id)) AS type_name,
+    ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS type_name,
     c.max_length,
     c.precision,
     c.scale,
@@ -123,7 +123,6 @@ SELECT
     c.is_identity
 FROM sys.objects o
 INNER JOIN sys.columns c ON c.object_id = o.object_id
-LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
 OUTER APPLY (SELECT MAX(i.type) AS index_type,
                     MAX(CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END) AS is_partitioned
              FROM sys.indexes i
@@ -143,7 +142,7 @@ SELECT
     CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
     c.name AS column_name,
     c.column_id,
-    ISNULL(t.name, TYPE_NAME(c.user_type_id)) AS type_name,
+    ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS type_name,
     c.max_length,
     c.precision,
     c.scale,
@@ -155,7 +154,6 @@ SELECT
 FROM sys.schemas s
 INNER JOIN sys.objects o ON o.schema_id = s.schema_id
 INNER JOIN sys.columns c ON c.object_id = o.object_id
-LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
 OUTER APPLY (SELECT MAX(i.type) AS index_type,
                     MAX(CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END) AS is_partitioned
              FROM sys.indexes i
@@ -200,7 +198,7 @@ SELECT
     CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
     c.name AS column_name,
     c.column_id,
-    ISNULL(t.name, TYPE_NAME(c.user_type_id)) AS type_name,
+    ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS type_name,
     c.max_length,
     c.precision,
     c.scale,
@@ -212,7 +210,6 @@ SELECT
 FROM sys.schemas s
 INNER JOIN sys.objects o ON o.schema_id = s.schema_id
 INNER JOIN sys.columns c ON c.object_id = o.object_id
-LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
 OUTER APPLY (SELECT MAX(i.type) AS index_type,
                     MAX(CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END) AS is_partitioned
              FROM sys.indexes i
@@ -232,7 +229,7 @@ static const char *COLUMN_DISCOVERY_SQL_TEMPLATE = R"(
 SELECT
     c.name AS column_name,
     c.column_id,
-    ISNULL(t.name, TYPE_NAME(c.user_type_id)) AS type_name,
+    ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS type_name,
     c.max_length,
     c.precision,
     c.scale,
@@ -240,7 +237,6 @@ SELECT
     ISNULL(c.collation_name, '') AS collation_name,
     c.is_identity
 FROM sys.columns c
-LEFT JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
 WHERE c.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
 ORDER BY c.column_id
 )";

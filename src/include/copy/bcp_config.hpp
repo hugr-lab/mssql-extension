@@ -127,13 +127,23 @@ struct BCPCopyConfig {
 	bool is_new_table = false;
 
 	// Lowercased names of matched columns whose (source, target) pair
-	// IsTypeCompatible refused. NOT an error at bind: a constant `NULL AS col`
-	// in the source SELECT — the ordinary way to fill an unmatched column —
-	// reaches bind as INTEGER (DuckDB types a bare NULL before the extension
-	// sees it), indistinguishable from real integer data. So the pair is
-	// admitted for the all-NULL case only, and the encoder checks the mask per
-	// chunk: entirely NULL → the column takes the missing-column NullOnly path;
-	// any value → the same type-mismatch error, at first chunk (spec 064).
+	// IsTypeCompatible refused. NOT an error at bind, because a source that is
+	// entirely NULL is the ordinary way to fill such a column and bind cannot
+	// see the values. So the pair is admitted for the all-NULL case only, and
+	// the encoder checks the mask per chunk: entirely NULL → the column takes
+	// the missing-column NullOnly path; any value → the same type-mismatch
+	// error, at first chunk (spec 064).
+	//
+	// These are the TYPED sources. A bare `NULL AS col` is a separate case and
+	// IS distinguishable here: DuckDB types it `SQLNULL` and it is still
+	// SQLNULL at the COPY bind boundary — measured, against the earlier claim
+	// in this comment that it "reaches bind as INTEGER". That distinction is
+	// load-bearing: a column whose target type the bulk wire cannot carry is
+	// dropped from the load only when its source is SQLNULL (no value can ever
+	// appear in it), and refused at init otherwise. Gate that drop on
+	// `null_only_source` instead and a typed source that merely starts with
+	// NULLs gets dropped too — measured, 10000 rows land and the values are
+	// lost in silence, which is issue #353 itself.
 	vector<string> null_only_columns;
 
 	// From mssql_utf8_collation — the collation to give a varchar column this COPY
