@@ -86,12 +86,12 @@ The vocabulary, from § 9.2 — each row is a rendering the agreement suite
 
 | construct | T-SQL | rule |
 |---|---|---|
-| FROM base table, remote view | `[schema].[name]` | one catalog; a view pushes, the server expands it |
-| projections, WHERE, HAVING, ON | the expression writer | column refs, constants, `+ - *` (overflow errors on both sides), `/` → `CAST(a AS float) / NULLIF(b, 0)` (DuckDB: double, NULL on zero), `//` and `%` on integers, CASE, CAST to a mapped type (no TRY_CAST), COALESCE / NULLIF, BETWEEN, IN list, IS [NOT] NULL, AND / OR / NOT with parentheses (three-valued logic is the same), comparisons, LIKE with `[`, `%`, `_` escaped and an ESCAPE clause |
-| scalar functions | one exact form per name | starts from the scan's `function_mapping.hpp` (`lower`, `upper`, `trim`, `ltrim`, `rtrim`, `year` … `second`, `+ - * %`, `negate`, `prefix` / `suffix` / `contains` → LIKE), grows one proven form at a time; vetoes as duckdb-mysql's and 061 § 4.5: `length` (`LEN` drops trailing spaces and counts UTF-16 units), `upper` / `lower` on non-ASCII (simple case mapping only — accepted as-is for the ASCII range: measured pushed today), `sqrt` / `ln` / `log` (server errors where DuckDB gives NaN), `power` / `exp` (overflow errors), `week` / `dayofweek` numbering |
-| GROUP BY + aggregates | positional and alias references **expanded** (T-SQL has neither: errors 164 / 207); `COUNT_BIG(*)` / `COUNT_BIG(x)` / `COUNT_BIG(DISTINCT x)`; `SUM(CAST(int AS bigint))`; `AVG(CAST(x AS float))`; `MIN` / `MAX` (`bit` → `CAST(b AS tinyint)`; strings under D4); `STRING_AGG(CAST(x AS nvarchar(max)), <literal>) WITHIN GROUP (ORDER BY …)`; `STDEV` / `STDEVP` / `VAR` / `VARP`; `agg(x) FILTER (WHERE c)` → `agg(CASE WHEN c THEN x END)` | veto `first` / `any_value`, `arg_*`, `median` / `quantile` / `mode`, `approx_count_distinct` (a different estimator), `list` / `array_agg` / `histogram`, `bit_*`, `corr` / `covar_*` / `regr_*`, a non-literal `string_agg` separator, GROUP BY ALL / ROLLUP / CUBE / GROUPING SETS |
+| FROM base table, remote view | `[schema].[name]`; every column in the SELECT list is rendered through **`MSSQLColumnInfo::BuildReadExpression`** — the read expression the catalog scan and INSERT's OUTPUT list already share: `.STAsBinary()` for geometry / geography, `CAST(… AS NVARCHAR(MAX))` for a cast-required type (hierarchyid, sql_variant, CLR UDT), `CAST(… AS NVARCHAR(n))` for a CHAR / VARCHAR / TEXT column under a non-UTF-8 collation, `NVARCHAR(MAX)` / `VARBINARY(MAX)` for ntext / image; a `*` is expanded from the catalog's column list so each column gets its expression. Without it a non-UTF-8 column (the installation default) arrives as code-page bytes and a geometry column fails the describe at bind. In WHERE / ON / GROUP BY the bare `[c]` is rendered — comparison semantics are the column's, as the scan's filters do today | one catalog; a view pushes, the server expands it |
+| projections, WHERE, HAVING, ON | the expression writer | column refs, constants, `+ - *` (overflow errors on both sides), `/` → `CAST(a AS float) / NULLIF(b, 0)` — DuckDB gives `inf` on a zero divisor (`ieee_floating_point_ops`, measured on the pin), SQL Server's float has no infinity and a bare `/` raises 8134, so `NULLIF` is the least-wrong form and a **recorded divergence** (NULL where DuckDB says `inf`) with its own W5 exemption, `//` and `%` on integers, CASE, CAST to a mapped type (no TRY_CAST), COALESCE / NULLIF, BETWEEN, IN list, IS [NOT] NULL, AND / OR / NOT with parentheses (three-valued logic is the same), comparisons, LIKE with `[`, `%`, `_` escaped and an ESCAPE clause |
+| scalar functions | one exact form per name | starts from the scan's `function_mapping.hpp` (`lower`, `upper`, `trim`, `ltrim`, `rtrim`, `year` … `second`, `+ - * %`) keyed on **parsed** names — LIKE arrives as `~~` / `!~~` (ILIKE `~~*` vetoed), unary minus as `-` with one argument (its own entry beside the binary one); `negate`, `prefix` / `suffix` / `contains` are bound-tree names DuckDB's optimizer rules hand the scan's encoder and never reach the writer — grows one proven form at a time; vetoes as duckdb-mysql's and 061 § 4.5: `length` (`LEN` drops trailing spaces and counts UTF-16 units), `upper` / `lower` on non-ASCII (simple case mapping only — accepted as-is for the ASCII range: measured pushed today), `sqrt` / `ln` / `log` (server errors where DuckDB gives NaN), `power` / `exp` (overflow errors), `week` / `dayofweek` numbering |
+| GROUP BY + aggregates | positional and alias references **expanded** (T-SQL has neither: errors 164 / 207); `COUNT_BIG(*)` / `COUNT_BIG(x)` / `COUNT_BIG(DISTINCT x)`; `SUM(CAST(int AS bigint))`; `AVG(CAST(x AS float))`; `MIN` / `MAX` (`bit` → `CAST(b AS tinyint)`; strings under D4); `STRING_AGG(CAST(x AS nvarchar(max)), <literal>) WITHIN GROUP (ORDER BY …)`; `STDEV` / `STDEVP` / `VAR` / `VARP`; `agg(x) FILTER (WHERE c)` → `agg(CASE WHEN c THEN x END)`, `COUNT(*) FILTER (WHERE c)` → `COUNT_BIG(CASE WHEN c THEN 1 END)` | veto `first` / `any_value`, `arg_*`, `median` / `quantile` / `mode`, `approx_count_distinct` (a different estimator), `list` / `array_agg` / `histogram`, `bit_*`, `corr` / `covar_*` / `regr_*`, a non-literal `string_agg` separator, GROUP BY ALL / ROLLUP / CUBE / GROUPING SETS |
 | JOIN | INNER / LEFT / RIGHT / FULL / CROSS with ON; USING expanded to ON | the ON condition is any expression the writer renders — non-equi, OR, functions, subqueries — nothing join-specific; veto NATURAL, SEMI / ANTI, ASOF, POSITIONAL, LATERAL |
-| ORDER BY | `ORDER BY`, NULL placement emulated as `MSSQLOptimizer` does today (`CASE WHEN x IS NULL …` unless the column is NOT NULL) | string keys under D4 only |
+| ORDER BY | `ORDER BY`; NULL placement: SQL Server has no NULLS FIRST / LAST and sorts NULL lowest (ASC → first, DESC → last) while DuckDB's default is NULLS LAST for both, and `MSSQLOptimizer` **refuses** the mismatch today (`IsNullOrderCompatible`: NOT NULL column, or the requested placement already the server's — a bare `ORDER BY nullable_col` never pushes). The writer **emulates** it — `CASE WHEN x IS NULL THEN 1 ELSE 0 END, x` (0 / 1 by the requested placement) when the column is nullable and the placements differ — new work (W2), shared back into `MSSQLOptimizer` (W4) so both paths push the same shapes | string keys under D4 only; an ORDER BY **inside** a subquery, derived table or CTE renders only with a LIMIT / OFFSET (`TOP` / `OFFSET-FETCH`) — without one it is vetoed: SQL Server rejects it (1033) and DuckDB promises no order there either. The dry run checks renderability per node; this positional rule is the node writer's, which knows its nesting |
 | LIMIT / OFFSET | `TOP n`; `OFFSET … FETCH` (`ORDER BY (SELECT NULL)` when there is no ORDER BY — both sides are arbitrary then) | |
 | DISTINCT, set operations | `DISTINCT`; UNION / UNION ALL / EXCEPT / INTERSECT | veto DISTINCT ON, `EXCEPT ALL` / `INTERSECT ALL`, UNION BY NAME |
 | CTEs, subqueries | `WITH`; scalar / EXISTS / IN / quantified (`= ANY`) subqueries, correlated included | veto recursive CTEs (spec 080 material: UNION ALL only, no RECURSIVE keyword) |
@@ -116,6 +116,29 @@ machinery; `EXPLAIN` shows the call with the T-SQL as its argument, which is
 the review lever. The one describe round trip per planned statement is the
 fixed cost (W3 measures it; a cache keyed on the statement text inside the
 catalog is the lever if it matters).
+
+The ref is **lazy**: `RemoteExecute` builds the function ref and touches the
+server only when the plan runs, so `EXPLAIN` and `PREPARE` of a pushed
+statement execute nothing (the rewriter descends into both).
+
+**Native types from the describe.** The vehicle's bind reports
+`MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` with the collation from the
+describe's `system_type_name` and `collation_name` when
+`mssql_catalog_native_types` is on — the describe returns both, today only
+the type name is read (`DescribedTypeToTdsMetadata`) — so a pushed
+`SELECT *` has the catalog path's column types. This is load-bearing for
+CTAS: the rewriter pushes a CTAS's **query** whenever it cannot push the
+CREATE (`RewriteCreateInfo`), 079 claims no `EXECUTE_STATEMENT`, and no hook
+stops it — so `CREATE TABLE ms.dst AS SELECT * FROM ms.src` reads `ms.src`
+through the vehicle, and without native types it would create `nvarchar(max)`
+where the catalog path creates `varchar(50)` with the source collation. W3
+closes it in the same PR; the interim window is zero.
+
+**Column resolution and the cache.** The dry run resolves columns against
+the metadata cache and **loads a table's metadata on first touch** as any
+catalog access does (spec 076: one round trip per fresh table, on the pinned
+connection inside a transaction); a miss is not a veto — vetoing would
+silently disable pushdown for the first statement against every table.
 
 ### D4 — strings (the § 9.3 rule; asked in PR #364, the reviewer was in the original `<>` discussion)
 
@@ -147,18 +170,35 @@ mechanisms that reach a mixed-catalog plan, a subquery under a non-pushable
 node, or a local view — the rewriter cannot (§ 9.1). They walk bound trees,
 the writer walks parsed ones, so they cannot share a renderer; what they
 share is the vocabulary: **one** function table (`function_mapping.hpp`
-consulted by both, with `NOT IN` added so it stops being the scan's one
-strict exception), **one** collation predicate (`OrdersLikeDuckDB`, #362,
-consulted by `MSSQLOptimizer` and D4), **one** literal/parameter spelling
-(#361). A query cannot answer differently depending on which path took it.
+consulted by both, keyed on parsed names with the scan's bound-name aliases
+beside them, `NOT IN` added so it stops being the scan's one strict
+exception), **one** collation predicate (`OrdersLikeDuckDB`, #362, consulted
+by `MSSQLOptimizer` and D4), **one** literal/parameter spelling (#361),
+**one** column read expression (`MSSQLColumnInfo::BuildReadExpression`,
+already shared by the scan and INSERT's OUTPUT list — D2's base-table row),
+**one** NULL-order emulation (D2's ORDER BY row, back-ported into
+`MSSQLOptimizer`), and **one** identifier quoter — three exist today
+(`mssql_value_serializer.cpp`, `mssql_ddl_translator.cpp`,
+`filter_encoder.cpp`, all doubling `]`); W4 makes them one and the writer
+quotes every identifier through it, aliases included (`SELECT 1 AS "x]y"`). A query cannot answer differently depending on which path took it.
 
 ### D6 — setting and switches
 
-`mssql_remote_pushdown` (BOOLEAN, default **true** once W5 is green): read
-in `Supports`, so a session can turn the rewriter off for one catalog while
-another remote extension keeps it; DuckDB's own
-`SET disabled_optimizers = 'remote_pushdown'` is the global switch and needs
-nothing from us. `MSSQL_COUNTERS` gains a `remote_pushdown` statement counter
+`mssql_remote_pushdown` (BOOLEAN, default **true at merge** — W1–W6 ship as
+one PR): **instance-wide, not per session**. `Supports(RemoteCapability)
+const` takes no `ClientContext`, and a SESSION-scoped extension option is
+invisible to `DBConfig::TryGetCurrentSetting` (the database-level store this
+repo reads its settings from, `mssql_table_entry.cpp`), so the option is
+registered `SetScope::GLOBAL` and read there; there is no per-session switch
+and the docs say so. It gates **`EXECUTE_QUERY_NODE` only — never
+`IS_REMOTE`**: `DatabaseManager` counts remote catalogs from the live answer
+of `Supports(IS_REMOTE)` at ATTACH and DETACH (`remote_catalog_count`, a
+checked integer), so a toggle between the two would leave the counter high
+forever (the rewriter running on every statement in the process) or throw
+out of DETACH; `IS_REMOTE` is a constant `true`. The rewriter consults
+`EXECUTE_QUERY_NODE` at every per-catalog decision, so gating it alone loses
+nothing. DuckDB's own `SET disabled_optimizers = 'remote_pushdown'` is the
+other instance-wide switch and needs nothing from us. `MSSQL_COUNTERS` gains a `remote_pushdown` statement counter
 (spec 063's lesson: an SQL-invisible path needs a counter or its suite goes
 vacuous).
 
@@ -171,8 +211,11 @@ vacuous).
 against the metadata cache, parameter collection; `SupportsPushdown` on
 `MSSQLCatalog` as the dry run (D1); `Supports(IS_REMOTE | EXECUTE_QUERY_NODE)`
 gated by D6. Base-table `SelectNode` with projections, WHERE, ORDER BY,
-LIMIT / OFFSET — the shapes `MSSQLOptimizer` handles today, so W5 can compare
-the two paths on the same statements from the first commit.
+LIMIT / OFFSET — the shapes the scan path pushes today (filters; ORDER BY on
+a NOT NULL key or a placement the server already has; LIMIT), so W5 compares
+the two paths on the same statements from the first commit; the nullable
+ORDER BY shapes have no old-path counterpart and get expected-row assertions
+instead.
 
 ### W2 — joins, aggregates, the rest of the node writer
 
@@ -182,15 +225,21 @@ expansion, positional / alias expansion, NULL-order emulation.
 
 ### W3 — the vehicle and the levers
 
-`RemoteExecute` → `mssql_scan_params` ref (D3); `EXPLAIN` output; the
-counter; the describe cost measured on the wide fixture (one statement
-planned N times) and the cache decided from the number.
+`RemoteExecute` → a lazy `mssql_scan_params` ref (D3); native types from
+the describe (`system_type_name` + `collation_name` → `MSSQL_VARCHAR(n)` with
+collation under `mssql_catalog_native_types`), which also fixes the CTAS
+window D3 names; `EXPLAIN` output; the counter; the describe cost measured
+on the wide fixture (one statement planned N times) and the cache decided
+from the number.
 
 ### W4 — shared vocabulary
 
 `function_mapping.hpp` as the one table (the scan's encoder and the writer
 both consult it; `NOT IN` added), `OrdersLikeDuckDB` shared with
-`MSSQLOptimizer`, the #361 spelling shared with `DeclarationForColumn`.
+`MSSQLOptimizer`, the #361 spelling shared with `DeclarationForColumn`, the
+NULL-order emulation shared with `MSSQLOptimizer` (which then pushes the
+nullable ORDER BY it refuses today), one identifier quoter replacing the
+three.
 
 ### W5 — the agreement suite
 
@@ -203,6 +252,14 @@ vetoes, one statement each, asserting the counter did NOT move and the
 result is right; transactions (a pushed join inside BEGIN … COMMIT on the
 pinned connection, interleaved with a sink); C++ unit tests for the
 expression writer without a server (`test/cpp/test_sql_writer.cpp`).
+
+Fixtures the comparison must include, or "run twice and compare" passes
+while a divergence ships: a `varchar` column under a non-UTF-8 collation
+holding non-ASCII data (the encoding, not the order), a `geometry` column,
+an `ntext` column, a `sql_variant` / `hierarchyid` column (the cast-required
+read expression), a nullable ORDER BY key, a same-catalog CTAS asserting the
+target's length and collation. Exemptions, each with its expected rows on
+both paths: the D4 string cases and division by zero.
 
 ### W6 — docs
 
@@ -229,6 +286,8 @@ the risk named in § 4.
   QUALIFY, LATERAL / CROSS APPLY, SEMI / ANTI → EXISTS — each a later row
   in the D2 table when asked for, none a design change.
 - `vector` search (#363, its own spec after v0.3.0).
+- A per-session switch — not implementable through `Supports` (D6); the
+  instance-wide setting is what there is.
 
 ## 4. Risks
 

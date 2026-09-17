@@ -1,6 +1,6 @@
 # Spec 065 — Direct UPDATE/DELETE: one statement when everything pushes down
 
-**Status:** **CLOSED 2026-09-17 — superseded by spec 080 (`../080-dml-pushdown/spec.md`: its goal on DuckDB 2.0's rewriter, D3 and D5 carried over as W1/W4 there) and spec 079 (the writer). Kept as history.** Was: Draft, revalidated 2026-09-17 against `main` `3a48795` + #350 —
+**Status:** **CLOSED 2026-09-17 — superseded by spec 080 (`../080-dml-pushdown/spec.md`) on DuckDB 2.0's rewriter, with spec 079 as the writer. Where each part went:** D1 (intercept before planning) → the rewriter itself, no plan hook; D2 (the fully-pushed criterion) → 079 D1/D2 (the writer's dry run decides; `BOUND_DEFAULT` → 080 D1's `DEFAULT`-in-SET veto); D3 (one token loop) → 080 W1; D4 (bind-time refusal moves to plan time) → 080 D3; D5 (dead setting, discovery errors) → 080 W4 (deprecate-then-remove); D6 (kill switch) → 079 D6. **Kept as history.** Was: Draft, revalidated 2026-09-17 against `main` `3a48795` + #350 —
 see `revalidation-2026-09-17.md`. **Proposed retired:** DuckDB 2.0's own
 `RemotePushdownOptimizer` ships a whole UPDATE/DELETE to the remote catalog
 when every piece of it is supported (§ 5 there), which is this spec's goal on

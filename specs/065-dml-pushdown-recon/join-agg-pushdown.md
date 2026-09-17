@@ -45,6 +45,16 @@ Divergences split into two classes that must not be conflated:
   not "server semantics anyone expects" — wrappers are MANDATORY regardless
   of the directive:
 
+> **Superseded by spec 079 D2 (2026-09-17) where the two disagree.** 079
+> takes `SUM(CAST(x AS bigint))` for the int family — a bigint overflow is a
+> server error, never a silent value; the `decimal(38,0)` form below is the
+> fallback if those errors are met in practice — and `AVG(CAST(x AS float))`,
+> which loses precision above 2^53 on bigint / decimal input: the decomposition
+> below needs the vehicle to return SUM and COUNT and a DuckDB projection to
+> divide them, and 079 D3 has one writer with no client-side projection layer.
+> "Zero-reachable divisors" is also corrected there: DuckDB yields `inf`, not
+> NULL, on the pin. The other rows agree with 079.
+
 | construct | mandatory form | verified |
 |---|---|---|
 | `count(*)`/`count(x)` | `COUNT_BIG(...)` (T-SQL COUNT is int) | doc |

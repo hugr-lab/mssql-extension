@@ -18,9 +18,12 @@ none. **Closes #140 fully** (065 closed it for pushable statements only;
 later row), MERGE (later), strict string semantics (owner, 2026-09-17: a
 SQL Server user expects SQL Server's DELETE).
 **Depends on:** spec 079 (the writer, `mssql_remote_pushdown`, the agreement
-suite pattern), #350 (spec 077: `ChooseRowIdKey` is rung 2 of the ladder,
-the `IDENTITY_INSERT` bracket), spec 062 W0 (`BulkLoadSession::Adopt`) and
-W1c (the autocommit bracket).
+suite pattern); #350 (spec 077 — **open at the time of writing**, this spec
+follows its merge: `ChooseRowIdKey` becomes rung 2 of the ladder and the
+`IDENTITY_INSERT` bracket is reused); spec 062 as shipped in #348 —
+`BulkLoadSession::Adopt` and the autocommit bracket `mssql::LoadTransaction`
+(CLAUDE.md: "every DML statement is atomic in autocommit"); 062's text
+predates W-numbered headings, so the code symbols are the citation.
 
 ---
 
@@ -33,7 +36,7 @@ W1c (the autocommit bracket).
 | the sink set | § 3 | `CollectSinkCatalogs` counts INSERT and COPY, not UPDATE/DELETE — the 066 remainder |
 | the key ladder | § 4, 067 § 1–2, 077 | rung 2 is `ChooseRowIdKey` (PK, else a usable unique index; datetime / sql_variant keys unusable, #358); rung 3 is value matching over all columns, exact for deterministic statements |
 | strings in DML | § 8.3 → § 9.3 | native: the rowid path pushes the WHERE already and DuckDB does not re-check it, so `DELETE … WHERE a = 'ab'` removes the rows `SELECT … WHERE a = 'ab'` shows; a strict rewrite would remove fewer than the SELECT displays |
-| autocommit atomicity | spec 062 W1c | one statement connection, batches bracketed in a server transaction, the ENVCHANGE descriptor carried |
+| autocommit atomicity | spec 062 (`mssql::LoadTransaction`, #348) | one statement connection, batches bracketed in a server transaction, the ENVCHANGE descriptor carried |
 
 ## 1. Design
 
@@ -52,15 +55,43 @@ W1c (the autocommit bracket).
 | `CREATE TABLE remote AS SELECT … FROM remote` | our CREATE (table kind, collation, lengths — the WITH options keep meaning), then the pushed `INSERT … SELECT` | not `SELECT INTO`; needs `EXECUTE_STATEMENT` claimed for CREATE TABLE AS only, and `SupportsPushdown(const SQLStatement &)` saying yes for that shape alone |
 | `RETURNING`, `MERGE INTO`, `ON CONFLICT` | — | veto; the shipped path handles what it handles today |
 
-Execution: `RemoteExecute` returns a ref to the DML form of the vehicle —
-`mssql_scan_params` with a **count result**: the statement runs through
-`MSSQLStatementConnection` as every DML does (the pinned connection inside a
-transaction; in autocommit one connection bracketed by spec 062 W1c so the
-statement is atomic), the affected count comes from the DONE token and is
-returned as the single BIGINT row DuckDB expects of a DML. Errors surface
-with the server's message and number, as `mssql_exec` reports them. The
-plan is one statement; nothing is buffered on the client; in a transaction
-nothing defers.
+Execution: `RemoteExecute` returns a ref to the **count form** of the
+vehicle — a distinct table function whose result shape is statically one
+BIGINT from the DONE token. It **must not** reuse `MSSQLScanBind`'s shape
+discovery: `DescribeFirstResultSet` answers `ok == false` for a statement
+with no result set and the bind then **runs the statement** (spec 075's F1
+fallback, `executed_at_bind`), and the rewriter descends into `EXPLAIN` and
+`PREPARE` — an inherited bind would make `EXPLAIN UPDATE ms.t …` perform the
+update. The count form needs no describe and executes only when the plan
+runs (W5 asserts `EXPLAIN` / `PREPARE` of a pushed DML change nothing). The
+statement runs through `MSSQLStatementConnection` as every DML does (the
+pinned connection inside a transaction; in autocommit one connection under
+the `mssql::LoadTransaction` bracket, so the statement is atomic); the
+affected count is returned as the single BIGINT row DuckDB expects of a DML;
+errors surface with the server's message and number, as `mssql_exec` reports
+them. The plan is one statement; nothing is buffered on the client; in a
+transaction nothing defers. After the statement the target table's row
+count and statistics cache entries are invalidated (as COPY and CTAS do
+today — a pushed DML passes through no plan hook, so nothing else would).
+
+**Read-only attach.** DuckDB's read-only enforcement is bind-time
+(`modified_databases`, filled only by the DML binders) and the extension's
+`CheckWriteAccess` runs in the `Plan*` hooks — a rewritten DML is a SELECT
+before either runs, so both are skipped and `ATTACH … (READ_ONLY)` would stop
+protecting the catalog. Two guards, as duckdb-mysql's vehicle has:
+`SupportsPushdown` refuses every DML and CTAS node when the catalog
+`IsReadOnly()` (the statement then takes the shipped path, whose hook
+refuses it as today), **and** the count form's bind throws
+`PermissionException` on a read-only catalog, so no route around the first
+guard executes a write. W5 pins both.
+
+**CTAS.** `RemoteExecute(SQLStatement)` for the CREATE TABLE AS shape
+returns a **lazy** ref too — nothing runs at optimize time, so `EXPLAIN` /
+`PREPARE` create nothing. At execution the CREATE and the pushed
+`INSERT … SELECT` run on one connection in **one server transaction** (the
+autocommit bracket; the pinned transaction otherwise), so a failed load
+leaves no table behind. The catalog cache is invalidated as today's CTAS
+invalidates it.
 
 Strings: **native** (D4 of 079 applies unchanged). What the pushed
 statement's WHERE selects is what a pushed SELECT with that WHERE shows.
@@ -81,8 +112,8 @@ The shipped rowid path generalised by 067's ladder, resolved per table at
 plan time:
 
 1. **Primary key** — today's join key.
-2. **A usable unique index** — spec 077's `ChooseRowIdKey`, already the
-   rowid source since #350; its refusals (`RowIdRefusal`) name why a key
+2. **A usable unique index** — spec 077's `ChooseRowIdKey` (PR #350, open at
+   the time of writing), which becomes the rowid source; its refusals (`RowIdRefusal`) name why a key
    is unusable (datetime / sql_variant, #358; a cast-required type, #354).
 3. **All columns, NULL-safe** — the keyless base case (067 § 1's argument:
    for a deterministic WHERE and SET, matching by value updates exactly
@@ -91,17 +122,34 @@ plan time:
    DISTINCT over the key; LOB columns excluded from the key when the rest
    is unique in the staged set. A VOLATILE function in WHERE or SET on
    rung 3 is refused by name ("add a unique index, or make the expression
-   deterministic").
+   deterministic"). So is a rung-3 statement whose WHERE is **not fully
+   pushed to the scan**: 067 § 1's equivalence argument needs both sides to
+   compare under the same semantics, and a predicate the scan's pushdown
+   refuses is evaluated client-side under DuckDB's binary equality while the
+   stage JOIN matches under the column's collation and padding
+   (`DELETE FROM keyless WHERE regexp_matches(v, '^ab$')` selects `ab`
+   client-side, the JOIN also removes `AB` and `ab␣` — § 8.5). The refusal
+   names the unpushed predicate; rungs 1–2 are unaffected, a key identifies
+   its row.
 
 Delivery: rungs 1–2 keep the `VALUES`-join statements below the small-result
 threshold and stage above it; rung 3 always stages. The stage is a
-`##stage_<uuid>` scratch table filled by a `BulkLoadSession` (the writer
-spec 062 W0 built, `Adopt`ed onto the statement's own connection — the
-pinned one in a transaction), the DML is
-`UPDATE t SET t.c = s.c__new … FROM target t JOIN ##stage s ON <key>` /
-`DELETE t FROM target t JOIN ##stage s ON <key>` per ~100k-row batch, and
-the stage is dropped on the way out (067 D2/D3). The `vector<vector<Value>>`
-buffer and the defer machinery go (no per-value path).
+**session-local `#stage_<uuid>`** — 066 D5 chose `##` because the stage was
+filled from a second connection; here it is filled on the statement's own
+connection (`BulkLoadSession::Adopt`, the pinned one in a transaction), so
+the cross-session visibility is neither needed nor wanted. The DML is
+`UPDATE t SET t.c = s.c__new … FROM target t JOIN #stage s ON <key>` /
+`DELETE t FROM target t JOIN #stage s ON <key>` per ~100k-row batch, and the
+stage is dropped on the way out (067 D2). **Stage fully, then join**: the
+JOIN batches start after the feeding scan has finished — 067 D3's pipelined
+autocommit mode (scan ∥ stage-fill ∥ DML on separate connections) is **not**
+used, because a rung-3 JOIN cannot seek (`IS NOT DISTINCT FROM` / the
+INTERSECT form over every column is not SARGable), each batch scans the
+target and escalates toward a table X lock, and a scan still reading the
+same table from a second session while that happens is a blocking pattern
+by construction (a 1205 cycle is plausible, unconfirmed — W5 forces the
+case). The `vector<vector<Value>>` buffer and the defer machinery go (no
+per-value path).
 
 The **066 remainder** lands here because this is where it stops being
 theoretical: `CollectSinkCatalogs` counts `LOGICAL_UPDATE` and
@@ -126,8 +174,10 @@ a D1 row when asked for. Until then MERGE keeps its bind-time PK requirement
 
 `UpdateQueryNode` / `DeleteQueryNode` / `InsertQueryNode` rendering in
 `SQLWriter`; the `IDENTITY_INSERT` bracket reused from 077 W2; the count
-form of `mssql_scan_params` over `MSSQLStatementConnection`; the CTAS shape
-(`EXECUTE_STATEMENT` for CREATE TABLE AS only). The DML token loop exists
+form over `MSSQLStatementConnection` (static shape, lazy, the read-only
+guard); the CTAS shape (`EXECUTE_STATEMENT` for CREATE TABLE AS only, one
+server transaction); row-count / statistics invalidation after a pushed DML
+and catalog invalidation after a pushed CTAS. The DML token loop exists
 once (065 D3): the three shipped executors and the new path call one
 `ExecuteDmlBatch`.
 
@@ -147,10 +197,15 @@ the LOB exclusion; bind-time refusal removed.
 
 ### W4 — riding cleanups from 065 D5
 
-`mssql_dml_use_prepared` retired (loaded, read by nothing since inception);
-`EnsurePKLoaded` no longer degrades a discovery error to "no key" — since
-#350 it records `discovery_error` and the refusal names it, so with D3 a
-hiccup cannot silently change which path a statement takes.
+`mssql_dml_use_prepared` (registered, read into `DMLConfig::use_prepared`,
+referenced nowhere else) is **deprecated, not removed**: unregistering an
+extension option makes `SET mssql_dml_use_prepared = …` throw and kill the
+rest of a `.duckdbrc`, so it stays registered as a documented no-op for one
+minor release (the spec 047 precedent for `mssql_open` / `mssql_close`) with
+a CHANGELOG line, and goes the release after. `EnsurePKLoaded` must not
+degrade a discovery error to "no key" — spec 077 (#350) makes it record
+`discovery_error` and name it in the refusal; with D3 that is what keeps a
+hiccup from silently changing which path a statement takes.
 
 ### W5 — tests
 
@@ -174,6 +229,12 @@ hiccup cannot silently change which path a statement takes.
   `mssql_remote_pushdown = false`, the table state compared after.
 - 065's acceptance 1 as a bench: `UPDATE t SET x = 1 WHERE <pushable>` on
   1M matching rows before / after on the wide fixture.
+- `ATTACH … (READ_ONLY)`: a pushed UPDATE / DELETE / INSERT … SELECT / CTAS
+  is refused (both guards, each exercised); `EXPLAIN` and `PREPARE` of a
+  pushed DML and of a pushed CTAS change no rows and create no table.
+- Rung 3 under load: a keyless DELETE of 200k rows with a concurrent reader
+  scanning the table from another session — completes, no 1205; a rung-3
+  statement whose predicate the scan does not push is refused by name.
 
 ### W6 — docs
 
@@ -205,6 +266,10 @@ One PR after 079's merge; W1 → W6 as commits.
   from the key when the rest is unique.
 - **The remainder's blast radius** — `CollectSinkCatalogs` is on the
   planner's path for every DML; the transaction suite is the guard.
+- **Rung 3 locks** — a JOIN that cannot seek scans the target per batch and
+  escalates toward a table X lock: concurrent readers block for the batch;
+  the stage-fully-then-join order (D3) keeps the statement's own scan out of
+  the cycle, and RCSI on the database is the user's lever for readers.
 
 ## 5. Acceptance
 
