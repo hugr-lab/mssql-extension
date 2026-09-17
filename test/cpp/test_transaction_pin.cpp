@@ -109,6 +109,10 @@ int main() {
 	// Measured against the pre-fix provider: the first pattern hits the
 	// double-acquire in round 1, the second the mid-BEGIN handout.
 	int failures = 0;
+	// Staggered rounds in which the followers were released while thread 0's
+	// BEGIN was still in flight (its connection active, the pin not yet
+	// published) — the window the guard exists for.
+	int overlapped_begin = 0;
 	for (int round = 1; round <= rounds; round++) {
 		const bool staggered = (round % 2 == 1);
 		conn.BeginTransaction();
@@ -155,9 +159,25 @@ int main() {
 		const auto t0 = std::chrono::steady_clock::now();
 		go.store(true, std::memory_order_release);
 		if (staggered) {
-			// Long enough for thread 0 to be inside its BEGIN round trip, far
-			// shorter than that round trip.
-			std::this_thread::sleep_for(std::chrono::microseconds(100));
+			// Release the followers on OBSERVED state, not on a timer (#359
+			// review): a fixed sleep assumed thread 0 was already inside its
+			// BEGIN round trip, and on a loaded runner it may not have been
+			// scheduled yet — the followers then arrived first and the round
+			// silently degraded to the all-at-once case. Instead, wait until
+			// the pool has handed thread 0 its connection (one more active than
+			// before), which under the fix happens inside the critical section
+			// before BEGIN is sent (provider: LockForPin, Acquire, BEGIN, then
+			// SetPinnedConnection); whether the pin was already published when
+			// the followers went says whether they overlapped the BEGIN, and
+			// that is counted and required below.
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (pool.GetStats().active_connections < before.active_connections + 1 &&
+				   std::chrono::steady_clock::now() < deadline) {
+				std::this_thread::yield();
+			}
+			if (!txn.HasPinnedConnection()) {
+				overlapped_begin++;
+			}
 			go_rest.store(true, std::memory_order_release);
 		}
 		for (auto &w : workers) {
@@ -229,6 +249,14 @@ int main() {
 
 	if (failures) {
 		std::cout << "FAIL: " << failures << " assertion(s)" << std::endl;
+		return 1;
+	}
+	// The staggered rounds must have exercised the window at least once, or the
+	// guard was never tested against the defect it exists for.
+	std::cout << "  staggered rounds that overlapped the BEGIN: " << overlapped_begin << " of " << rounds / 2
+			  << std::endl;
+	if (overlapped_begin == 0) {
+		std::cerr << "FAIL: no staggered round released its followers while the BEGIN was in flight" << std::endl;
 		return 1;
 	}
 	std::cout << "PASS: every caller got the one pinned connection, begun and idle, and nothing leaked" << std::endl;
