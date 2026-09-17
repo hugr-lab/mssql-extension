@@ -1149,6 +1149,51 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 		return {"(" + child_result.sql + " IS NOT NULL)", true};
 	}
 
+	// IN arrives here as an operator expression whenever the filter combiner
+	// did not turn it into a table filter: always for NOT IN, which DuckDB
+	// binds as NOT over COMPARE_IN (the NOT case above wraps this one; there
+	// is no NotInFilter, issue #366), and for IN whose operand is not a bare
+	// column. COMPARE_NOT_IN is rendered too, should a plan ever carry it.
+	// Children: [0] the operand, [1..] the list. The list's constants are
+	// declared from the operand's column exactly as a comparison's constant is
+	// (spec 076), so a varchar list keeps the seek. A NULL in the list gives
+	// the same three-valued answer on both sides (no row for NOT IN), so
+	// nothing is special-cased. Without this case NOT IN was the one string
+	// predicate evaluated client-side, under DuckDB's equality, while <>,
+	// NOT LIKE and the ranges beside it were the server's (spec 079 D4).
+	if (expr.GetExpressionType() == ExpressionType::COMPARE_IN ||
+		expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) {
+		const auto &children = expr.GetChildren();
+		if (children.size() < 2) {
+			return {"", false};
+		}
+		auto operand_ctx = ctx.child();
+		auto operand_result = EncodeValueExpression(*children[0], operand_ctx);
+		if (!operand_result.supported) {
+			MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN operand encoding failed");
+			return {"", false};
+		}
+		auto item_ctx = ctx.child();
+		item_ctx.constant_peer = ColumnInfoOf(*children[0], ctx);
+		const bool negated = expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN;
+		std::string sql = "(" + operand_result.sql + (negated ? " NOT IN (" : " IN (");
+		for (idx_t i = 1; i < children.size(); i++) {
+			auto item_result = EncodeValueExpression(*children[i], item_ctx);
+			if (!item_result.supported) {
+				MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN list item %llu encoding failed",
+									   (unsigned long long)i);
+				return {"", false};
+			}
+			if (i > 1) {
+				sql += ", ";
+			}
+			sql += item_result.sql;
+		}
+		sql += "))";
+		MSSQL_FILTER_DEBUG_LOG(2, "EncodeOperatorExpression: encoded -> %s", sql.c_str());
+		return {sql, true};
+	}
+
 	// For other operators, we don't support them yet
 	// Arithmetic is handled via BoundFunctionExpression in DuckDB stable
 	MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: unsupported operator type %d", (int)expr.GetExpressionType());
