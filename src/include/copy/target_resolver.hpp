@@ -117,11 +117,36 @@ struct BCPColumnMetadata {
 	string collation_name;
 
 	// The matched source column's type is incompatible with this target column,
-	// and bind admitted the pair for the all-NULL case only (a constant NULL
-	// source arrives typed — see BCPCopyConfig::null_only_columns). The encoder
-	// verifies the mask per chunk and routes the column through the
-	// missing-column NullOnly path; a value in it is the type-mismatch error.
+	// and bind admitted the pair for the all-NULL case only — see
+	// BCPCopyConfig::null_only_columns. The encoder verifies the mask per chunk
+	// and routes the column through the missing-column NullOnly path; a value in
+	// it is the type-mismatch error.
+	//
+	// This is NOT the test for "the source is a constant NULL": it is set for any
+	// typed source whose pair bind could not check. The constant-NULL test is the
+	// source type being SQLNULL, and BCPCopyInitGlobal says why the difference
+	// matters.
 	bool null_only_source = false;
+
+	// The target column's SQL Server type name, as sys.columns reports it. Kept
+	// for error messages, which have to name the type the user can see rather
+	// than the DuckDB type we mapped it to.
+	string server_type_name;
+
+	// The bulk wire cannot carry this column's type. True for the CLR UDTs
+	// (geometry, geography, hierarchyid) and sql_variant: their wire form is
+	// the server's own, not anything FromServerColumn can declare, and the
+	// VARCHAR fallback it would otherwise pick declares them as nvarchar and
+	// sends the bytes as text.
+	//
+	// Before issue #353 these columns never reached here at all — the metadata
+	// query's INNER JOIN to sys.types dropped every CLR UDT, so a source column
+	// feeding one was silently ignored and the value lost. They are visible now,
+	// which is what makes the refusal possible: a column of this kind that NO
+	// source feeds is left out of the INSERT BULK list exactly as before, and
+	// one that a source DOES feed stops the load with a message instead of
+	// discarding the data.
+	bool bulk_unsupported = false;
 
 	// Default constructor
 	BCPColumnMetadata() = default;

@@ -242,7 +242,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 
 		// Send the SQL batch
 		UPDATE_DEBUG(1, "ExecuteBatch: sending SQL batch...");
-		if (!connection->ExecuteBatch(sql)) {
+		if (!connection->ExecuteBatch(sql, "update statement batch")) {
 			string error = connection->GetLastError();
 			UPDATE_DEBUG(1, "ExecuteBatch: ExecuteBatch failed, error=%s", error.c_str());
 			stmt_conn_.Fail(context_, mssql_catalog);

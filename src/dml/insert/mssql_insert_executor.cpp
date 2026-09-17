@@ -149,7 +149,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 
 		// Send the SQL batch
 		INSERT_DEBUG(1, "ExecuteBatch: sending SQL batch...");
-		if (!connection->ExecuteBatch(sql)) {
+		if (!connection->ExecuteBatch(sql, "insert statement batch")) {
 			INSERT_DEBUG(1, "ExecuteBatch: ExecuteBatch failed, error=%s", connection->GetLastError().c_str());
 			MSSQLInsertError error;
 			error.statement_index = batch_builder_->GetBatchCount() - 1;
@@ -348,7 +348,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 		socket->ClearReceiveBuffer();
 
 		// Send the SQL batch (with OUTPUT clause)
-		if (!connection->ExecuteBatch(sql)) {
+		if (!connection->ExecuteBatch(sql, "insert statement batch")) {
 			MSSQLInsertError error;
 			error.statement_index = batch_builder_->GetBatchCount() - 1;
 			error.row_offset_start = batch.row_offset_start;

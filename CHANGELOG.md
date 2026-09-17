@@ -7,7 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`COPY` no longer drops a CLR UDT column of an existing target in silence**
+  ([#353](https://github.com/hugr-lab/mssql-extension/issues/353)). The
+  target-metadata query joined `sys.types` on `system_type_id`, which no
+  `sys.types` row satisfies for a `geometry`, `geography` or `hierarchyid`
+  column, so the column never reached the resolver: a source column feeding one
+  was ignored and its values lost, and a NOT NULL target failed with "Cannot
+  insert the value NULL into column …" about a value the user had supplied. The
+  join is gone from all eight metadata queries — the name comes from
+  `ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id))`, which is
+  correct for UDTs and **4.3× cheaper** (497 µs → 115 µs on a 102-column table,
+  interleaved, 200 rounds) — and a source that feeds such a column is now
+  refused by name, **at init, before a row is encoded** — so a COPY that is
+  going to fail this way writes nothing rather than committing the batches that
+  happened to precede the first value. A source that omits such a column still
+  loads and the server fills it, exactly as before, and so does one that gives
+  it a constant `NULL AS g`: that is how one says "leave this column alone", it
+  worked before #353 (by accident — the join hid the column), and it is safe
+  because DuckDB types a bare NULL as SQLNULL, which has no other value it
+  could hold. Such a column is dropped from the load rather than declared;
+  declaring it would make the server refuse the whole `INSERT BULK`, since the
+  type mapping gives it the VARCHAR fallback. The two non-UDT types the change
+  also refuses,
+  `sql_variant` and `rowversion`, lose nothing: measured against the server,
+  both already failed mid-stream — `Operand type clash: nvarchar(max) is
+  incompatible with sql_variant` and error 273 respectively — so the refusal
+  only moves the error earlier and names the column.
+- **A transaction's first statement could fail with `Cannot execute: connection
+  not in Idle state`** ([#356](https://github.com/hugr-lab/mssql-extension/issues/356)).
+  The connection a transaction pins was published to other threads **before**
+  `BEGIN TRANSACTION` had finished on it, and DuckDB initialises a plan's source
+  and its sink on different threads — so the second one could execute on a
+  connection that was still mid-BEGIN. Intermittent, about 4% for a statement
+  that both reads from and writes to the same catalog inside a transaction, and
+  it also leaked the connection out of the pool when it struck. Acquiring,
+  beginning and publishing are now one critical section per transaction, so a
+  second thread waits and then finds a connection that is pinned, begun and
+  idle. Measured: 250 runs of the case that used to fail, in two independent
+  batches, with no failures.
+
 ### Added
+
+- **`INSERT … RETURNING` works against a table holding a column the wire cannot
+  decode raw** — a spatial UDT, `sql_variant`, `hierarchyid`. It used to fail
+  with `COLMETADATA parse error: Unsupported SQL Server type: UDT` **even when
+  the RETURNING list did not name that column**, because the generated `OUTPUT`
+  clause carries every column of the table: DuckDB's RETURNING projection sits
+  above the insert and expects the table's full width. The OUTPUT list now uses
+  the same expressions the read path does, `.STAsBinary()` for the spatial
+  types and a CAST to NVARCHAR(MAX) for the rest, so those columns come back in
+  the same shape a catalog scan gives them.
+
+- **A `GEOMETRY` value can be written into a `geometry` / `geography` column**
+  (#296). It used to go as a bare `0x…` literal, which SQL Server reads as its
+  own Spatial Type Binary Format rather than as the OGC WKB a DuckDB GEOMETRY
+  carries, and rejects: `24210: Geometry type with an unexpected version of 0
+  received`. INSERT and UPDATE now wrap it as
+  `geometry::STGeomFromWKB(0x…, srid)`, the server-side reader for that form.
+  The **SRID is an assumption**, because `.STAsBinary()` does not carry one and
+  a value read from SQL Server has already lost it: a `geometry` target gets 0
+  (planar, undefined) and a `geography` target gets 4326 / WGS 84, since
+  geography refuses 0 outright. Set another one server-side after the load. An
+  INSERT naming a spatial column stays on the statement path whatever
+  `mssql_insert_bcp_threshold` says, as it always has — the bulk wire would
+  declare the column nvarchar and send the WKB as text.
+
+- **`ROWVERSION` columns are readable, and the native `JSON` type of SQL
+  Server 2025 is read uncast** ([#296](https://github.com/hugr-lab/mssql-extension/issues/296)).
+  Neither type name was in the catalog's table, so both took the unknown-type
+  route, `CAST(col AS NVARCHAR(MAX))`. For `rowversion` that is not merely
+  wasteful, the server **refuses** it — `[529] Explicit conversion from data
+  type timestamp to nvarchar(max) is not allowed` — so a table carrying such a
+  column could not be read at all. It is `binary(8)` on the wire and now reads
+  as `BLOB` with no conversion; the name to look for in `sys.types` is
+  `timestamp`, which has nothing to do with time. Do not write it: SQL Server
+  refuses an explicit value with error 273, so leave it out of the INSERT
+  column list. The 2025 `JSON` type arrives as `varchar(max)` under a UTF-8
+  collation and now reads as `VARCHAR` directly, where the CAST used to convert
+  every value server-side for nothing. `COPY` into an existing table with a
+  `JSON` column is accepted too: the compatibility table listed `xml` for a
+  VARCHAR source but not `json`, so a COPY was refused at bind while an INSERT
+  into the same column worked.
 
 - **INSERT loads through BCP** (spec 062). An INSERT with more rows than
   `mssql_insert_bcp_threshold` (default 1000), no `RETURNING` and no
@@ -28,15 +110,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks constraints, fires triggers and keeps its NULLs — a bulk load
   ignores all three by default, and COPY still does. A failed load names
   the batch and says `rolled back`. The batch size, TABLOCK policy and
-  writer count are the `mssql_copy_*` settings.
+  writer count are the `mssql_copy_*` settings. Reviewed by
+  [@oluies](https://github.com/oluies), who found the writer rule blind to a
+  nonclustered index and pushed the fix (#349, merged into #348) — a heap
+  carrying one takes Sch-M rather than BU, and the extra writers stall 30 s
+  behind it.
 
 - **The catalog knows which columns are IDENTITY** (spec 062 W4, the
   metadata half of #327). `sys.columns.is_identity` rides in the four
   column-metadata queries and on `MSSQLColumnInfo`; the INSERT planner reads
-  it instead of hard-coding false. Not yet visible through DuckDB — the
-  binder half of #327 (omitting the column from a column-list-less INSERT)
-  needs an upstream hook — but it is what routes an INSERT that names an
-  identity column onto the statement path once INSERT goes through BCP.
+  it instead of hard-coding false. It is what routes an INSERT that names an
+  identity column onto the statement path. The other half of #327 — omitting
+  the column from a column-list-less INSERT — is not reachable from an
+  extension: DuckDB's binder compares the value count against the columns the
+  catalog reports, before any extension code runs. See spec 077.
 
 - **Pushed filters are parameterised** (spec 076). The constants of a pushed
   filter travel as `sp_executesql` parameters declared from the column they

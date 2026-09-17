@@ -1,4 +1,5 @@
 #include "copy/target_resolver.hpp"
+#include "catalog/mssql_column_info.hpp"
 
 #include "tds/encoding/bcp_row_encoder.hpp"
 
@@ -754,8 +755,14 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 			   target_lower == "smallmoney";
 
 	case LogicalTypeId::VARCHAR:
+		// `json` belongs here for the same reason `xml` does: the server takes
+		// a string for it and validates the content itself. Without it a COPY
+		// into an existing table with a JSON column was refused at bind while
+		// an INSERT into the same column worked, which is the kind of split
+		// nobody can guess (issue #296 self-review).
 		return target_lower == "varchar" || target_lower == "nvarchar" || target_lower == "char" ||
-			   target_lower == "nchar" || target_lower == "text" || target_lower == "ntext" || target_lower == "xml";
+			   target_lower == "nchar" || target_lower == "text" || target_lower == "ntext" || target_lower == "xml" ||
+			   target_lower == "json";
 
 	case LogicalTypeId::BLOB:
 		return target_lower == "varbinary" || target_lower == "binary" || target_lower == "image";
@@ -807,17 +814,17 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 	string column_sql;
 	if (target.IsTempTable()) {
 		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale "
+			"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
+			"type_name, c.max_length, c.precision, c.scale "
 			"FROM tempdb.sys.columns c "
-			"JOIN tempdb.sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('tempdb..%s') "
 			"ORDER BY c.column_id",
 			target.GetBracketedTable());
 	} else {
 		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale "
+			"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
+			"type_name, c.max_length, c.precision, c.scale "
 			"FROM sys.columns c "
-			"JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('%s') "
 			"ORDER BY c.column_id",
 			target.GetFullyQualifiedName());
@@ -855,12 +862,17 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 		matched_columns++;
 		const string &target_type_name = it->second.first;
 
-		// An incompatible pair is NOT a bind error: a constant `NULL AS col` in
-		// the source — the ordinary way to fill a column — reaches bind already
-		// typed (DuckDB gives a bare NULL a concrete type first), so it cannot
-		// be told apart from real data here. The pair is admitted for the
-		// all-NULL case only; the encoder checks the mask per chunk and raises
-		// the same type-mismatch error the moment a value shows up.
+		// An incompatible pair is NOT a bind error: an entirely-NULL source is the
+		// ordinary way to fill a column and bind cannot see the values. The pair
+		// is admitted for the all-NULL case only; the encoder checks the mask per
+		// chunk and raises the same type-mismatch error the moment a value shows
+		// up.
+		//
+		// What this does NOT cover is a bare `NULL AS col`, which DuckDB types
+		// SQLNULL and keeps that way to here — measured, against the earlier
+		// claim that a constant NULL "cannot be told apart from real data here".
+		// BCPCopyInitGlobal uses that to drop a column the bulk wire cannot carry
+		// when, and only when, its source can hold no value at all.
 		bool compatible = IsTypeCompatible(source_types[i], target_type_name);
 		if (!compatible) {
 			DebugLog(2, "ValidateExistingTableSchema: column '%s' pair (%s -> %s) admitted for all-NULL only",
@@ -1050,6 +1062,53 @@ static uint16_t SQLServerTypeMaxLength(const string &type_name, int16_t max_leng
 
 //===----------------------------------------------------------------------===//
 // BCPColumnMetadata::FromServerColumn
+namespace {
+
+//! Can the bulk-load wire carry a column of this SQL Server type?
+//!
+//! Two families cannot. The **spatial CLR UDTs** are readable — the scan
+//! rewrites them to `.STAsBinary()` and they arrive as WKB, which is why
+//! `IsKnownSQLServerType` admits them — but their WIRE form on the way back is
+//! SQL Server's own Spatial Type Binary Format, not those bytes, so a bulk load
+//! cannot send them. And the types with no decodable wire form at all
+//! (`sql_variant`, `hierarchyid`, any other CLR UDT) are exactly the ones
+//! `IsKnownSQLServerType` already rejects.
+//!
+//! Two of those the join DID return before #353, so it is worth saying what
+//! they used to do rather than leaving a silent behaviour change. Both were
+//! declared nvarchar by the VARCHAR fallback, and both FAILED — measured
+//! against the server by exempting them here and running the load:
+//!
+//!   - `sql_variant`  -> `Operand type clash: nvarchar(max) is incompatible
+//!                        with sql_variant`. It does NOT convert implicitly.
+//!   - `rowversion` / `timestamp`
+//!                     -> error 273, `Cannot insert an explicit value into a
+//!                        timestamp column` — the column is unwritable by
+//!                        definition.
+//!
+//! So refusing them here loses nothing that worked: it moves a server error
+//! mid-stream to a named refusal at init. A source that omits such a column,
+//! or feeds it an all-NULL one, still loads — the caller drops it from the
+//! load and the server fills it (see BCPCopyInitGlobal).
+//!
+//! The spatial half spells the two names out here rather than sharing a
+//! predicate, because the branch that introduces `MSSQLColumnInfo::IsSpatialType`
+//! (#352) is not merged yet; fold this into it on the rebase.
+bool BulkWireCanCarry(const string &type_name) {
+	const string lower = StringUtil::Lower(type_name);
+	// Spelled out, NOT derived from IsKnownSQLServerType, for the two that the
+	// predicate's answer is about to change under: #296 teaches it `timestamp`
+	// and `rowversion` so those columns become READABLE, which would silently
+	// re-admit them here on the merge and put error 273 back mid-stream.
+	// Readable and writable are different questions for these types.
+	if (lower == "geometry" || lower == "geography" || lower == "timestamp" || lower == "rowversion") {
+		return false;
+	}
+	return MSSQLColumnInfo::IsKnownSQLServerType(type_name);
+}
+
+}  // namespace
+
 //===----------------------------------------------------------------------===//
 
 BCPColumnMetadata BCPColumnMetadata::FromServerColumn(const string &name, const string &type_name, int16_t max_length,
@@ -1122,8 +1181,17 @@ BCPColumnMetadata BCPColumnMetadata::FromServerColumn(const string &name, const 
 		col.duckdb_type = LogicalType::VARCHAR;
 	}
 
-	DebugLog(3, "FromServerColumn: column '%s' type=%s tds=0x%02X max_len=%d prec=%d scale=%d", col.name.c_str(),
-			 type_name.c_str(), col.tds_type_token, col.max_length, col.precision, col.scale);
+	// Types the bulk wire cannot carry. The branch above has just given them the
+	// VARCHAR fallback, which would declare a geometry column as nvarchar and
+	// send WKB as text; the flag is what stops that being used silently. They
+	// only became reachable here with issue #353 — the metadata query used to
+	// drop every CLR UDT before this function ever saw it.
+	col.server_type_name = type_name;
+	col.bulk_unsupported = !BulkWireCanCarry(type_name);
+
+	DebugLog(3, "FromServerColumn: column '%s' type=%s tds=0x%02X max_len=%d prec=%d scale=%d bulk_unsupported=%d",
+			 col.name.c_str(), type_name.c_str(), col.tds_type_token, col.max_length, col.precision, col.scale,
+			 col.bulk_unsupported ? 1 : 0);
 	return col;
 }
 
@@ -1137,19 +1205,19 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 	string column_sql;
 	if (target.IsTempTable()) {
 		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
+			"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
+			"type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
 			"ISNULL(c.collation_name, '') AS collation_name "
 			"FROM tempdb.sys.columns c "
-			"JOIN tempdb.sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('tempdb..%s') "
 			"ORDER BY c.column_id",
 			target.GetBracketedTable());
 	} else {
 		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, t.name AS type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
+			"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
+			"type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
 			"ISNULL(c.collation_name, '') AS collation_name "
 			"FROM sys.columns c "
-			"JOIN sys.types t ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id "
 			"WHERE c.object_id = OBJECT_ID('%s') "
 			"ORDER BY c.column_id",
 			target.GetFullyQualifiedName());

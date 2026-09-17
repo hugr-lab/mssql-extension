@@ -1,0 +1,149 @@
+# name: test/sql/insert/insert_geometry.test
+# description: a GEOMETRY value written into a real geometry/geography column, and the statement-path fallback that carries it (issue #296)
+# group: [insert]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# A DuckDB GEOMETRY vector carries OGC WKB, which is what the read path
+# produces (`.STAsBinary()`). Writing it back was broken: the value went as a
+# bare `0x…` literal, and SQL Server reads a binary value for a geometry column
+# as its OWN Spatial Type Binary Format, so it failed with
+#   [6522] … 24210: Geometry type with an unexpected version of 0 received.
+# The heads of the two encodings differ — WKB `0x01 01000000 <coords>` against
+# internal `0xe6100000 01 0c <the same coords>` — so no cast could bridge them;
+# `STGeomFromWKB` is the server-side reader for the form we have.
+#
+# Nothing here needs the DuckDB `spatial` extension: the values come from SQL
+# Server and go back to SQL Server.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS geoi (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('geoi', 'IF OBJECT_ID(''dbo.GeoInsSrc'') IS NOT NULL DROP TABLE dbo.GeoInsSrc');
+
+statement ok
+SELECT mssql_exec('geoi', 'IF OBJECT_ID(''dbo.GeoInsDst'') IS NOT NULL DROP TABLE dbo.GeoInsDst');
+
+statement ok
+SELECT mssql_exec('geoi', 'CREATE TABLE dbo.GeoInsSrc (id INT NOT NULL PRIMARY KEY, g GEOMETRY NULL, gg GEOGRAPHY NULL)');
+
+statement ok
+SELECT mssql_exec('geoi', 'CREATE TABLE dbo.GeoInsDst (id INT NOT NULL PRIMARY KEY, g GEOMETRY NULL, gg GEOGRAPHY NULL, n INT NULL)');
+
+statement ok
+SELECT mssql_exec('geoi', 'INSERT INTO dbo.GeoInsSrc VALUES
+  (1, geometry::STGeomFromText(''POINT(3 4)'', 0), geography::STGeomFromText(''POINT(3 4)'', 4326)),
+  (2, geometry::STGeomFromText(''LINESTRING(0 0, 5 5)'', 0), NULL),
+  (3, geometry::STGeomFromText(''POLYGON((0 0, 0 3, 3 3, 3 0, 0 0))'', 0), NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('geoi');
+
+# --- the round trip: read from one table, write into another. Every shape
+# below is a different branch of the WKB reader, so a wrapper that only works
+# for points would fail here.
+statement ok
+INSERT INTO geoi.dbo.GeoInsDst (id, g, gg) SELECT id, g, gg FROM geoi.dbo.GeoInsSrc;
+
+query III
+SELECT * FROM mssql_scan('geoi', 'SELECT id, g.STAsText() AS geom, ISNULL(gg.STAsText(), ''(null)'') AS geog FROM dbo.GeoInsDst ORDER BY id');
+----
+1	POINT (3 4)	POINT (3 4)
+2	LINESTRING (0 0, 5 5)	(null)
+3	POLYGON ((0 0, 0 3, 3 3, 3 0, 0 0))	(null)
+
+# --- the SRIDs the wrapper has to assume, because `.STAsBinary()` does not
+# carry one and a value that has made the round trip has already lost it.
+# geometry takes 0, the planar "undefined"; geography REFUSES 0 with error
+# 24204 and is given 4326.
+query II
+SELECT * FROM mssql_scan('geoi', 'SELECT g.STSrid AS geom_srid, gg.STSrid AS geog_srid FROM dbo.GeoInsDst WHERE id = 1');
+----
+0	4326
+
+# --- a NULL spatial value is left as a bare NULL rather than wrapped.
+statement ok
+INSERT INTO geoi.dbo.GeoInsDst (id, g, gg, n) VALUES (9, NULL, NULL, 7);
+
+query I
+SELECT count(*) FROM mssql_scan('geoi', 'SELECT id FROM dbo.GeoInsDst WHERE g IS NULL AND gg IS NULL AND n = 7');
+----
+1
+
+# --- UPDATE takes the same wrapper, inside the VALUES-derived table it builds.
+statement ok
+UPDATE geoi.dbo.GeoInsDst SET g = (SELECT g FROM geoi.dbo.GeoInsSrc WHERE id = 2) WHERE id = 1;
+
+query I
+SELECT * FROM mssql_scan('geoi', 'SELECT g.STAsText() AS geom FROM dbo.GeoInsDst WHERE id = 1');
+----
+LINESTRING (0 0, 5 5)
+
+statement ok
+SELECT mssql_exec('geoi', 'TRUNCATE TABLE dbo.GeoInsDst');
+
+# =============================================================================
+# The statement-path fallback above the bcp threshold.
+# =============================================================================
+#
+# INSERT BULK would declare a geometry column as nvarchar and send the WKB as
+# text, so spec 062 keeps an INSERT that names one on the statement path. The
+# lever below only exists in the statement path's response loops, so an INSERT
+# that FAILS with it set went as statements, and one that succeeds went through
+# INSERT BULK.
+
+statement ok
+SET mssql_insert_bcp_threshold = 5;
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 1;
+
+# --- 20 rows naming the geometry column: statements, despite being four times
+# the threshold.
+statement error
+INSERT INTO geoi.dbo.GeoInsDst (id, g, n) SELECT i, (SELECT g FROM geoi.dbo.GeoInsSrc WHERE id = 1), i FROM range(1, 21) s(i);
+----
+TDS parse error
+
+# --- the same 20 rows without naming it: bulk, so the lever never fires.
+statement ok
+INSERT INTO geoi.dbo.GeoInsDst (id, n) SELECT i, i FROM range(100, 120) s(i);
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 0;
+
+query I
+SELECT count(*) FROM geoi.dbo.GeoInsDst;
+----
+20
+
+# --- and with the lever off the geometry rows do land, through statements.
+statement ok
+INSERT INTO geoi.dbo.GeoInsDst (id, g, n) SELECT i, (SELECT g FROM geoi.dbo.GeoInsSrc WHERE id = 3), i FROM range(1, 21) s(i);
+
+# The two loads use disjoint ranges for `n` -- 100..119 through the bulk path
+# and 1..20 through statements -- so all forty values are distinct.
+query II
+SELECT count(*), count(DISTINCT n) FROM geoi.dbo.GeoInsDst;
+----
+40	40
+
+query I
+SELECT count(*) FROM mssql_scan('geoi', 'SELECT id FROM dbo.GeoInsDst WHERE g IS NOT NULL AND g.STAsText() = ''POLYGON ((0 0, 0 3, 3 3, 3 0, 0 0))''');
+----
+20
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+statement ok
+SELECT mssql_exec('geoi', 'DROP TABLE dbo.GeoInsDst; DROP TABLE dbo.GeoInsSrc');
+
+statement ok
+DETACH geoi;
