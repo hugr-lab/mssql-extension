@@ -1,0 +1,99 @@
+# name: test/sql/catalog/varchar_declaration_seek.test
+# description: A non-ASCII constant is declared varchar when both code pages can hold it, and the index seek survives (issue #361)
+# group: [sql]
+#
+# Spec 076 declared every non-ASCII constant as nvarchar. On a SQL_ collation
+# that puts CONVERT_IMPLICIT on the column and the seek becomes a scan; on a
+# Windows collation the optimizer seeks through the convert, and on a UTF-8
+# column the nvarchar form is the only correct one for a character the
+# database's code page cannot hold (#321). The rule is now: varchar when the
+# column's AND the database's code page hold every character, nvarchar
+# otherwise. Rows alone cannot tell a seek from a scan, so the second half of
+# this file reads the cached plan of each statement back through mssql_scan:
+# the declaration is the statement text's prefix, and the operator is in the
+# plan XML. TestDB is SQL_Latin1_General_CP1_CI_AS (code page 1252).
+#
+# REQUIRES: SQL Server 2019+ (a _UTF8 collation) on localhost:1433 with TestDB
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS vd (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('vd', 'DROP TABLE IF EXISTS dbo.VarcharDeclSeek');
+
+statement ok
+SELECT mssql_exec('vd', 'CREATE TABLE dbo.VarcharDeclSeek (id INT PRIMARY KEY, v VARCHAR(20) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL, w VARCHAR(20) COLLATE Latin1_General_CI_AS NOT NULL, u VARCHAR(20) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL)');
+
+# 20000 rows so the optimizer has a reason to seek, plus the two probes:
+# ñ (U+00F1) is in code page 1252, ы (U+044B) is not.
+statement ok
+SELECT mssql_exec('vd', 'INSERT INTO dbo.VarcharDeclSeek SELECT n, ''f'' + CAST(n AS varchar(10)), ''f'' + CAST(n AS varchar(10)), ''f'' + CAST(n AS varchar(10)) FROM (SELECT TOP 20000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) n FROM sys.all_columns a CROSS JOIN sys.all_columns b) x');
+
+statement ok
+SELECT mssql_exec('vd', 'INSERT INTO dbo.VarcharDeclSeek VALUES (20001, N''ñu'', N''ñu'', N''ñu''), (20002, ''ab'', ''ab'', N''ыы'')');
+
+statement ok
+SELECT mssql_exec('vd', 'CREATE INDEX ix_v ON dbo.VarcharDeclSeek(v)');
+
+statement ok
+SELECT mssql_exec('vd', 'CREATE INDEX ix_w ON dbo.VarcharDeclSeek(w)');
+
+statement ok
+SELECT mssql_exec('vd', 'CREATE INDEX ix_u ON dbo.VarcharDeclSeek(u)');
+
+# The rows: every shape finds its row.
+query I
+SELECT id FROM vd.dbo.VarcharDeclSeek WHERE v = 'ñu';
+----
+20001
+
+query I
+SELECT id FROM vd.dbo.VarcharDeclSeek WHERE w = 'ñu';
+----
+20001
+
+query I
+SELECT id FROM vd.dbo.VarcharDeclSeek WHERE u = 'ñu';
+----
+20001
+
+query I
+SELECT id FROM vd.dbo.VarcharDeclSeek WHERE u = 'ыы';
+----
+20002
+
+# The plans. `[[]` is a literal `[` in a T-SQL LIKE pattern.
+# SQL_ collation, ñ: declared varchar(20), Index Seek — the #361 case.
+query I
+SELECT count(*) >= 1 FROM mssql_scan('vd', 'SELECT 1 AS hit FROM sys.dm_exec_cached_plans cp CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) t CROSS APPLY sys.dm_exec_query_plan(cp.plan_handle) p WHERE t.text LIKE ''(@p0 varchar(20))%VarcharDeclSeek%([[]v] = @p0)%'' AND CAST(p.query_plan AS nvarchar(max)) LIKE ''%PhysicalOp="Index Seek"%''');
+----
+true
+
+# Windows collation, ñ: varchar(20), seek.
+query I
+SELECT count(*) >= 1 FROM mssql_scan('vd', 'SELECT 1 AS hit FROM sys.dm_exec_cached_plans cp CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) t CROSS APPLY sys.dm_exec_query_plan(cp.plan_handle) p WHERE t.text LIKE ''(@p0 varchar(20))%VarcharDeclSeek%([[]w] = @p0)%'' AND CAST(p.query_plan AS nvarchar(max)) LIKE ''%PhysicalOp="Index Seek"%''');
+----
+true
+
+# UTF-8 column, ñ: the database's page holds it, so varchar(20) and a seek.
+query I
+SELECT count(*) >= 1 FROM mssql_scan('vd', 'SELECT 1 AS hit FROM sys.dm_exec_cached_plans cp CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) t CROSS APPLY sys.dm_exec_query_plan(cp.plan_handle) p WHERE t.text LIKE ''(@p0 varchar(20))%VarcharDeclSeek%([[]u] = @p0)%'' AND CAST(p.query_plan AS nvarchar(max)) LIKE ''%PhysicalOp="Index Seek"%''');
+----
+true
+
+# UTF-8 column, ы: the database's page cannot hold it — nvarchar(20), as #321
+# requires, and the UTF-8 column still seeks through the convert.
+query I
+SELECT count(*) >= 1 FROM mssql_scan('vd', 'SELECT 1 AS hit FROM sys.dm_exec_cached_plans cp CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) t CROSS APPLY sys.dm_exec_query_plan(cp.plan_handle) p WHERE t.text LIKE ''(@p0 nvarchar(20))%VarcharDeclSeek%([[]u] = @p0)%'' AND CAST(p.query_plan AS nvarchar(max)) LIKE ''%PhysicalOp="Index Seek"%''');
+----
+true
+
+statement ok
+SELECT mssql_exec('vd', 'DROP TABLE dbo.VarcharDeclSeek');

@@ -26,18 +26,21 @@ struct MSSQLColumnInfo {
 	bool is_nullable;  // Allows NULL values
 
 	// Collation info (for text types)
-	string collation_name;	 // Column collation (may be empty for non-text)
-	bool is_case_sensitive;	 // Derived from collation (_CS_ or _BIN)
-	bool is_unicode;		 // True for NVARCHAR/NCHAR/NTEXT
-	bool is_utf8;			 // Derived from collation (_UTF8)
-	bool is_cast_required;	 // Unsupported type: needs CAST to NVARCHAR(MAX)
-	bool is_geometry;		 // True for SQL Server geometry/geography columns; table scan projects
-							 // [col].STAsBinary() AS [col] so the wire delivers OGC WKB which lands
-							 // in a LogicalType::GEOMETRY() vector via the Binary codec.
-	bool is_identity;		 // sys.columns.is_identity (spec 062 W4, issue #327). Set by the
-							 // metadata loaders after construction; the INSERT planner keeps a
-							 // column list that names one on the statement path, where the server
-							 // decides about the explicit value (error 544 without IDENTITY_INSERT).
+	string collation_name;		 // Column collation (may be empty for non-text)
+	bool is_case_sensitive;		 // Derived from collation (_CS_ or _BIN)
+	bool is_unicode;			 // True for NVARCHAR/NCHAR/NTEXT
+	bool is_utf8;				 // Derived from collation (_UTF8)
+	int32_t code_page;			 // Code page the column's collation stores varchar in; 0 = cannot tell
+	int32_t database_code_page;	 // The same for the database collation — a varchar PARAMETER
+								 // takes this one (issue #361, mssql::CodePageOfCollation)
+	bool is_cast_required;		 // Unsupported type: needs CAST to NVARCHAR(MAX)
+	bool is_geometry;			 // True for SQL Server geometry/geography columns; table scan projects
+								 // [col].STAsBinary() AS [col] so the wire delivers OGC WKB which lands
+								 // in a LogicalType::GEOMETRY() vector via the Binary codec.
+	bool is_identity;			 // sys.columns.is_identity (spec 062 W4, issue #327). Set by the
+								 // metadata loaders after construction; the INSERT planner keeps a
+								 // column list that names one on the statement path, where the server
+								 // decides about the explicit value (error 544 without IDENTITY_INSERT).
 
 	// Default constructor
 	MSSQLColumnInfo();

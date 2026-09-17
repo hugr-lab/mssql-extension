@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include "catalog/mssql_code_page.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "codec/literal_format.hpp"
 #include "codec/string_codec.hpp"
@@ -430,12 +431,16 @@ std::string FilterEncoder::DeclarationForColumn(const MSSQLColumnInfo &column, c
 		}
 		const std::string &text = StringValue::Get(value);
 		// varchar keeps the column's kind -- that is what keeps an index on it
-		// seekable -- for an ASCII constant. A non-ASCII one goes as nvarchar
-		// whatever the column's collation, as the N'...' literal always did: a
-		// varchar VARIABLE takes the DATABASE's code page, not the column's, so
-		// `@p varchar(max) = N'ы...'` against a UTF-8 column arrives as '?'
-		// (annotated_max_string.test, #321, caught the UTF-8 exemption).
-		const bool unicode = column.is_unicode || !IsAscii(text);
+		// seekable: on a SQL_ collation an nvarchar parameter puts a
+		// CONVERT_IMPLICIT on the column and the seek becomes a scan (#361).
+		// A varchar VARIABLE takes the DATABASE's code page and the comparison
+		// converts it to the COLUMN's, so a non-ASCII constant may go as
+		// varchar only when both pages can hold every character of it;
+		// otherwise nvarchar, as the N'...' literal always did -- which is how
+		// `@p varchar(max) = N'ы...'` against a UTF-8 column on a 1252 database
+		// stopped arriving as '?' (annotated_max_string.test, #321).
+		const bool unicode = column.is_unicode || !(mssql::CodePageCanEncode(column.code_page, text) &&
+													mssql::CodePageCanEncode(column.database_code_page, text));
 		if (unicode) {
 			// max_length is bytes; nvarchar counts UTF-16 units.
 			size_t k = column.max_length < 0 ? 0 : static_cast<size_t>(column.max_length) / (column.is_unicode ? 2 : 1);

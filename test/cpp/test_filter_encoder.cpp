@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "catalog/mssql_code_page.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hugeint.hpp"
@@ -463,12 +464,47 @@ static void TestDeclarationForColumn() {
 	ASSERT_TRUE(decl(Col("n", 1, "nvarchar", 20, 0, 0), Value("\xC3\xBC\xC3\xB1\xC3\xAF")) == "nvarchar(10)");
 	ASSERT_TRUE(decl(Col("n", 1, "nvarchar", 4, 0, 0), Value("\xF0\x9F\x98\x80\xF0\x9F\x98\x80\xF0\x9F\x98\x80")) ==
 				"nvarchar(6)");
-	// a non-ASCII constant goes as nvarchar whatever the column's collation, as
-	// the N'...' literal always did: a varchar variable takes the DATABASE's
-	// code page, so even a UTF-8 column would see '?' through a varchar one
-	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0), Value("\xC3\xBC")) == "nvarchar(20)");
+	// #361: a non-ASCII constant goes as varchar when both the column's and the
+	// database's code page (the fixture's database is SQL_Latin1_General_CP1,
+	// i.e. 1252) can hold it -- that is what keeps the seek -- and as nvarchar
+	// otherwise. ü is in 1252: varchar. ы is not: nvarchar, on a 1252 column
+	// and on a UTF-8 column alike, because the varchar PARAMETER takes the
+	// database's page (#321's case) whatever the column can hold.
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0), Value("\xC3\xBC")) == "varchar(20)");
 	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Latin1_General_100_BIN2_UTF8"), Value("\xC3\xBC")) ==
+				"varchar(20)");
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0), Value("\xD1\x8B")) == "nvarchar(20)");
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Latin1_General_100_BIN2_UTF8"), Value("\xD1\x8B")) ==
 				"nvarchar(20)");
+	// the column's page matters too: ü against a Cyrillic column is nvarchar
+	// even though the 1252 database could carry the parameter
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Cyrillic_General_CI_AS"), Value("\xC3\xBC")) == "nvarchar(20)");
+	// a Cyrillic constant on a Cyrillic column of a Cyrillic database: varchar
+	ASSERT_TRUE(FilterEncoder::DeclarationForColumn(MSSQLColumnInfo("v", 1, "varchar", 20, 0, 0, true,
+																	"Cyrillic_General_CI_AS", "Cyrillic_General_CI_AS"),
+													Value("\xD1\x8B"), LogicalType::VARCHAR) == "varchar(20)");
+	// a double-byte or unknown page cannot be told: nvarchar
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Japanese_CI_AS"), Value("\xC3\xBC")) == "nvarchar(20)");
+	// the byte width is still the constant's UTF-8 size when it is the larger
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 2, 0, 0), Value("\xC3\xBC\xC3\xBC")) == "varchar(4)");
+	// the page reader itself
+	ASSERT_TRUE(mssql::CodePageOfCollation("SQL_Latin1_General_CP1_CI_AS") == 1252);
+	ASSERT_TRUE(mssql::CodePageOfCollation("SQL_Ukrainian_CP1251_CI_AS") == 1251);
+	ASSERT_TRUE(mssql::CodePageOfCollation("SQL_Scandinavian_CP850_CI_AS") == 850);
+	ASSERT_TRUE(mssql::CodePageOfCollation("Latin1_General_100_BIN2") == 1252);
+	ASSERT_TRUE(mssql::CodePageOfCollation("Latin1_General_100_BIN2_UTF8") == 65001);
+	ASSERT_TRUE(mssql::CodePageOfCollation("Cyrillic_General_100_CI_AS_SC") == 1251);
+	ASSERT_TRUE(mssql::CodePageOfCollation("Polish_CI_AS") == 1250);
+	ASSERT_TRUE(mssql::CodePageOfCollation("Indic_General_100_CI_AS") == 0);
+	ASSERT_TRUE(mssql::CodePageOfCollation("") == 0);
+	ASSERT_TRUE(mssql::CodePageCanEncode(1252, "\xE2\x82\xAC"));  // € is 0x80 in 1252
+	ASSERT_TRUE(mssql::CodePageCanEncode(1251, "\xE2\x82\xAC"));  // and 0x88 in 1251
+	ASSERT_TRUE(!mssql::CodePageCanEncode(1252, "\xC5\x91"));	  // ő: 1250 only
+	ASSERT_TRUE(mssql::CodePageCanEncode(1250, "\xC5\x91"));
+	ASSERT_TRUE(!mssql::CodePageCanEncode(1252, "\xF0\x9F\x98\x80"));  // above the BMP
+	ASSERT_TRUE(mssql::CodePageCanEncode(932, "ascii only"));
+	ASSERT_TRUE(!mssql::CodePageCanEncode(932, "\xC3\xBC"));
+	ASSERT_TRUE(mssql::CodePageCanEncode(65001, "\xF0\x9F\x98\x80"));
 	ASSERT_TRUE(decl(Col("t", 1, "text", 16, 0, 0), Value("x")) == "varchar(max)");
 	// integers: the wider of column and constant
 	ASSERT_TRUE(decl(Col("i", 1, "int", 4, 10, 0), Value::INTEGER(1)) == "int");
@@ -528,8 +564,7 @@ static void TestDeclarationForColumn() {
 	// the cast (error 529) — so the constant is now a parameter declared from
 	// the column, `varbinary(8)`, and the branch in DeclarationForColumn that
 	// has always named `timestamp`/`rowversion` is finally reachable.
-	ASSERT_TRUE(decl(Col("rv", 1, "timestamp", 8, 0, 0), Value::BLOB_RAW(std::string("\x01", 1))) ==
-				"varbinary(8)");
+	ASSERT_TRUE(decl(Col("rv", 1, "timestamp", 8, 0, 0), Value::BLOB_RAW(std::string("\x01", 1))) == "varbinary(8)");
 	// no parameter form: stays a literal
 	ASSERT_TRUE(decl(Col("x", 1, "xml", -1, 0, 0), Value("<a/>")).empty());
 	ASSERT_TRUE(decl(Col("g", 1, "geography", -1, 0, 0), Value("x")).empty());

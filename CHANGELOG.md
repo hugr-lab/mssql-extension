@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A non-ASCII constant no longer costs the index seek on a `SQL_` collation**
+  ([#361](https://github.com/hugr-lab/mssql-extension/issues/361)). Spec 076
+  declared any non-ASCII constant of a pushed filter as an `nvarchar`
+  parameter whatever the column's collation — right for a UTF-8 column on a
+  Latin-1 database (#321: a `varchar` parameter takes the *database's* code
+  page), and an Index Scan with `CONVERT_IMPLICIT` on the column for the
+  installation default, `SQL_Latin1_General_CP1_CI_AS`, where `'ñu'`,
+  `'Müller'`, `'café'` read the whole index (Windows collations seek through
+  the convert and were unaffected). The declaration is now `varchar` when every
+  character of the constant is representable in **both** the column's and the
+  database's code page — read off the collation names
+  (`mssql::CodePageOfCollation`: the `_CPnnn` token of a `SQL_` collation, the
+  language family of a Windows one, `_UTF8`), answered from tables for the
+  single-byte pages 874 and 1250–1258 — and `nvarchar` otherwise, exactly as
+  before: a double-byte or unknown page, or a character either page cannot
+  hold, keeps the safe form.
 - **`COPY` no longer drops a CLR UDT column of an existing target in silence**
   ([#353](https://github.com/hugr-lab/mssql-extension/issues/353)). The
   target-metadata query joined `sys.types` on `system_type_id`, which no
