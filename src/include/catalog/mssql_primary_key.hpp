@@ -54,6 +54,11 @@ struct RowIdKeyInfo {
 	// Every candidate the choice turned down, with the reason.
 	vector<RowIdKeyRejection> rejections;
 
+	// Non-empty when the discovery query itself failed (no connection, a server
+	// error). `exists` is false then too, but the refusal must not claim the
+	// table has no key when the truth is that nobody could look.
+	string discovery_error;
+
 	// Key structure (only valid if exists == true)
 	vector<PKColumnInfo> columns;  // Ordered by key_ordinal
 

@@ -239,6 +239,7 @@ void RowIdKeyInfo::FinalizeChoice(const string &database_collation) {
 	columns.clear();
 	rejections.clear();
 	index_name.clear();
+	discovery_error.clear();
 	source = RowIdKeySource::NONE;
 
 	auto choice = ChooseRowIdKey(candidates_);
@@ -278,12 +279,15 @@ string RowIdKeyInfo::RowIdRefusal(const string &schema_name, const string &table
 	// already have, so it is named as what it is.
 	bool only_unmatchable = !rejections.empty();
 	for (const auto &r : rejections) {
-		if (r.reason.find("#354") == string::npos && r.reason.find("#358") == string::npos) {
+		if (!r.unmatchable) {
 			only_unmatchable = false;
 		}
 	}
 	string msg = "MSSQL: " + verb + " requires a table with a primary key or a usable unique index. ";
-	if (rejections.empty()) {
+	if (!discovery_error.empty()) {
+		msg += "The indexes of '" + schema_name + "." + table_name +
+			   "' could not be read, so whether it has one is unknown: " + discovery_error;
+	} else if (rejections.empty()) {
 		msg += "Table '" + schema_name + "." + table_name +
 			   "' has neither. Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a filter.";
 	} else if (only_unmatchable) {

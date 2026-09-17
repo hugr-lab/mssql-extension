@@ -343,12 +343,16 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 			}
 			pool.Release(std::move(connection));
 		} else {
-			MSSQL_TE_DEBUG("EnsurePKLoaded: no connection available, assuming no PK");
+			MSSQL_TE_DEBUG("EnsurePKLoaded: no connection available");
 			pk_info_.exists = false;
+			pk_info_.discovery_error = "no connection could be acquired from the pool";
 		}
 	} catch (const std::exception &e) {
-		MSSQL_TE_DEBUG("EnsurePKLoaded: error discovering PK: %s", e.what());
+		// Not "no key": the refusal says the indexes could not be read and why,
+		// instead of telling the user to add an index they may well have.
+		MSSQL_TE_DEBUG("EnsurePKLoaded: error discovering the rowid key: %s", e.what());
 		pk_info_.exists = false;
+		pk_info_.discovery_error = e.what();
 	}
 
 	// Release-store publishes pk_info_ to any reader doing acquire-load.

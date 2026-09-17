@@ -62,6 +62,10 @@ struct RowIdKeyRejection {
 	std::string index_name;
 	bool is_primary_key = false;
 	std::string reason;
+	//! The key EXISTS and is unique, but a rowid literal cannot match one of its
+	//! columns (#354, #358). The refusal words this differently from "no usable
+	//! key": telling the user to add an index they already have is wrong.
+	bool unmatchable = false;
 };
 
 struct RowIdKeyChoice {
@@ -98,39 +102,48 @@ inline bool IsLiteralMismatchType(const std::string &type_name) {
 	return t == "datetime" || t == "smalldatetime";
 }
 
-//! Why this candidate cannot address a row; empty when it can.
-inline std::string Unusable(const RowIdKeyCandidate &c) {
+//! Why this candidate cannot address a row. `reason` is empty when it can;
+//! `unmatchable` marks the two reasons that are about the key's TYPE rather
+//! than its shape.
+inline RowIdKeyRejection Unusable(const RowIdKeyCandidate &c) {
+	RowIdKeyRejection r;
+	r.index_name = c.index_name;
+	r.is_primary_key = c.is_primary_key;
 	if (!c.is_unique) {
-		return "it is not unique";
+		r.reason = "it is not unique";
+	} else if (c.has_filter) {
+		r.reason = "it is a filtered index, so rows outside its filter are unaddressable";
+	} else if (c.is_disabled) {
+		r.reason = "it is disabled";
+	} else if (c.is_hypothetical) {
+		r.reason = "it is hypothetical";
+	} else if (c.columns.empty()) {
+		r.reason = "it has no key columns";
 	}
-	if (c.has_filter) {
-		return "it is a filtered index, so rows outside its filter are unaddressable";
-	}
-	if (c.is_disabled) {
-		return "it is disabled";
-	}
-	if (c.is_hypothetical) {
-		return "it is hypothetical";
-	}
-	if (c.columns.empty()) {
-		return "it has no key columns";
+	if (!r.reason.empty()) {
+		return r;
 	}
 	for (const auto &col : c.columns) {
 		if (col.is_nullable) {
-			return "its key column '" + col.name + "' is nullable, and NULL is neither unique nor addressable";
+			r.reason = "its key column '" + col.name + "' is nullable, and NULL is neither unique nor addressable";
+			return r;
 		}
 	}
 	for (const auto &col : c.columns) {
 		if (col.cast_required) {
-			return "its key column '" + col.name + "' has type " + col.type_name +
-				   ", which is read through a lossy CAST and cannot identify its row (see issue #354)";
+			r.reason = "its key column '" + col.name + "' has type " + col.type_name +
+					   ", which is read through a lossy CAST and cannot identify its row (see issue #354)";
+			r.unmatchable = true;
+			return r;
 		}
 		if (IsLiteralMismatchType(col.type_name)) {
-			return "its key column '" + col.name + "' has type " + col.type_name +
-				   ", which no rowid literal can match (see issue #358)";
+			r.reason = "its key column '" + col.name + "' has type " + col.type_name +
+					   ", which no rowid literal can match (see issue #358)";
+			r.unmatchable = true;
+			return r;
 		}
 	}
-	return "";
+	return r;
 }
 
 //! Declared key width in bytes, for the tie-break. A MAX column is wider than
@@ -177,9 +190,9 @@ inline RowIdKeyChoice ChooseRowIdKey(const std::vector<RowIdKeyCandidate> &candi
 	const RowIdKeyCandidate *usable_pk = nullptr;
 	const RowIdKeyCandidate *best_unique = nullptr;
 	for (const auto &c : candidates) {
-		const std::string why = rowid_key_detail::Unusable(c);
-		if (!why.empty()) {
-			choice.rejections.push_back({c.index_name, c.is_primary_key, why});
+		RowIdKeyRejection why = rowid_key_detail::Unusable(c);
+		if (!why.reason.empty()) {
+			choice.rejections.push_back(std::move(why));
 			continue;
 		}
 		if (c.is_primary_key) {

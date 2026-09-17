@@ -1,5 +1,7 @@
 #include "dml/mssql_statement_connection.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "dml/mssql_identity_insert.hpp"
@@ -62,21 +64,41 @@ void MSSQLStatementConnection::EnableIdentityInsert(const string &schema_name, c
 	identity_table_ = table_name;
 }
 
+static int GetDmlDebugLevel() {
+	static const int level = []() {
+		const char *env = std::getenv("MSSQL_DML_DEBUG");
+		return env ? std::atoi(env) : 0;
+	}();
+	return level;
+}
+
 bool MSSQLStatementConnection::DisableIdentityInsert(int timeout_ms) noexcept {
 	if (!identity_insert_on_) {
 		return true;
 	}
-	identity_insert_on_ = false;  // one attempt, whatever happens
+	// The flag stays set until the server CONFIRMS the OFF. It used to be
+	// cleared on the attempt, so a failed OFF in Commit handed Fail a
+	// connection it believed clean; measured with the OFF sabotaged, Fail
+	// still closed it — a refused SET leaves the connection non-Idle and the
+	// mid-response branch below catches that — so the guarantee held by a side
+	// effect. It now holds by construction: Fail retries, closes if the retry
+	// does not confirm, and the destructor path gets one more attempt on a
+	// pinned connection that is Idle again by then.
 	if (!connection_ || connection_->GetState() != tds::ConnectionState::Idle) {
 		return false;
 	}
+	bool confirmed = false;
 	try {
 		auto result = MSSQLSimpleQuery::Execute(
 			*connection_, mssql::IdentityInsertSql(identity_schema_, identity_table_, false), timeout_ms);
-		return result.success;
+		confirmed = result.success;
 	} catch (...) {
-		return false;
+		confirmed = false;
 	}
+	if (confirmed) {
+		identity_insert_on_ = false;
+	}
+	return confirmed;
 }
 
 void MSSQLStatementConnection::Commit(ClientContext &context, MSSQLCatalog &catalog) {
@@ -112,8 +134,16 @@ void MSSQLStatementConnection::Fail(ClientContext &context, MSSQLCatalog &catalo
 	// identity values in silence. Not confirmed off → the connection is closed
 	// below rather than pooled; a PINNED one cannot be closed (it is the
 	// DuckDB transaction's), so there the attempt is all there is, and the
-	// transaction's own end resets the session.
+	// transaction's end resets the session under the default
+	// mssql_reset_connection — with it off, the rest of that transaction runs
+	// with IDENTITY_INSERT on, which is why it is logged.
 	const bool identity_cleared = DisableIdentityInsert(IDENTITY_INSERT_OFF_TIMEOUT_MS);
+	if (!identity_cleared && transaction_pinned_ && GetDmlDebugLevel() >= 1) {
+		fprintf(stderr,
+				"[MSSQL DML] IDENTITY_INSERT for %s.%s could not be turned off on the transaction's pinned "
+				"connection; it stays on until the transaction ends\n",
+				identity_schema_.c_str(), identity_table_.c_str());
+	}
 	try {
 		if (!transaction_pinned_ &&
 			(!identity_cleared || (connection_->GetState() != tds::ConnectionState::Idle &&
@@ -145,10 +175,17 @@ void MSSQLStatementConnection::ReleaseWithoutContext() noexcept {
 	// Same discipline as Fail, with no ClientContext: OFF, bounded; not
 	// confirmed → Close, so ReleaseBcpConnectionOnError discards it instead of
 	// pooling a session that still accepts identity values.
-	if (!DisableIdentityInsert(IDENTITY_INSERT_OFF_TIMEOUT_MS) && !transaction_pinned_ && connection_) {
-		try {
-			connection_->Close();
-		} catch (...) {
+	if (!DisableIdentityInsert(IDENTITY_INSERT_OFF_TIMEOUT_MS) && connection_) {
+		if (!transaction_pinned_) {
+			try {
+				connection_->Close();
+			} catch (...) {
+			}
+		} else if (GetDmlDebugLevel() >= 1) {
+			fprintf(stderr,
+					"[MSSQL DML] IDENTITY_INSERT for %s.%s could not be turned off on the transaction's pinned "
+					"connection (statement unwound); it stays on until the transaction ends\n",
+					identity_schema_.c_str(), identity_table_.c_str());
 		}
 	}
 	// Closes a non-Idle connection, leaves a pinned one to its transaction, and

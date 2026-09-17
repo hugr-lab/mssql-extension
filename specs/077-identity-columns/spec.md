@@ -376,12 +376,20 @@ Mechanics:
   session-level query timeout reaches it — and "everything caught" covers
   exceptions, not a server or a network that has stopped answering. Without a
   bound, a destructor on a worker thread waits forever and query teardown
-  queues behind it. So the timeout is **captured at `Acquire`**, on the client
-  thread, and carried down to the release path the way `reset_on_release`
-  already is (`ReleaseBcpConnectionOnError` takes it as a parameter with no
-  default, so a new caller cannot skip the question). On expiry the connection
-  is **closed rather than pooled** — the same path a throwing `OFF` takes, and
-  closing the session clears the setting anyway.
+  queues behind it. So the `OFF` is sent through `MSSQLSimpleQuery::Execute`
+  with a **fixed 30 s bound** — the response timeout the batch executor already
+  uses — on every path, not only the destructor's: one bound for all of them
+  is one fewer thing to get wrong, and no session setting reaches the
+  destructor anyway (the implementation chose the constant over a value
+  captured at `Acquire`; what the spec requires is the bound). On expiry, or
+  on any refusal, the connection is **closed rather than pooled** — and the
+  flag that says `ON` was sent stays set until the server confirms the `OFF`,
+  so a failed attempt on one path cannot make the next path believe the
+  session is clean. (The first version cleared it on the attempt; measured
+  with the `OFF` sabotaged, the connection was still closed — a refused `SET`
+  leaves it non-Idle and the mid-response branch catches that — so this is a
+  guarantee moved from a side effect to the code's own logic, not a
+  demonstrated leak.)
 - `SET IDENTITY_INSERT` checks **ALTER on the table** (§ 0.3), and a caller
   without it gets error 1088, which says the object "does not exist or you do
   not have permissions". That message is actively misleading for someone who
