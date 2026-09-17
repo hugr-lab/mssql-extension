@@ -1,0 +1,76 @@
+# name: test/sql/copy/copy_identity.test
+# description: COPY into an existing table with an identity column, both directions (spec 077 W4)
+# group: [copy]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# No new code: this pins what COPY already does. It resolves target columns by
+# NAME, so a source column named like the identity column supplies the value
+# and INSERT BULK keeps it (no KEEP_IDENTITY hint is needed — the wire keeps a
+# listed identity value by default, measured in spec 077 § 0.5), and a source
+# that omits it gets server-assigned values. No warning either way: COPY keeps
+# bcp semantics on purpose, the same reason CHECK_CONSTRAINTS is off there.
+#
+# This is also the fast path for loading many rows WITH their identity values:
+# an INSERT that names the column is bracketed for you (W2) but stays on the
+# statement path — tens of rows, not millions.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cid (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('cid', 'IF OBJECT_ID(''dbo.CopyIdent'') IS NOT NULL DROP TABLE dbo.CopyIdent; CREATE TABLE dbo.CopyIdent (rid BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY, a INT NOT NULL, b VARCHAR(20) NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('cid');
+
+# --- the source omits the identity column: the server assigns
+statement ok
+COPY (SELECT i AS a, 'x' || i AS b FROM range(1, 4) t(i)) TO 'mssql://cid/dbo/CopyIdent' (FORMAT 'bcp', CREATE_TABLE false);
+
+query III
+SELECT rid, a, b FROM cid.dbo.CopyIdent ORDER BY rid;
+----
+1	1	x1
+2	2	x2
+3	3	x3
+
+# --- the source names it: the values are kept verbatim, gaps and all
+statement ok
+COPY (SELECT 500 AS rid, 5 AS a, 'z' AS b UNION ALL SELECT 700, 7, 'w') TO 'mssql://cid/dbo/CopyIdent' (FORMAT 'bcp', CREATE_TABLE false);
+
+query III
+SELECT rid, a, b FROM cid.dbo.CopyIdent WHERE rid >= 500 ORDER BY rid;
+----
+500	5	z
+700	7	w
+
+# --- and the server continues from the highest value it saw
+statement ok
+COPY (SELECT 9 AS a, 'after' AS b) TO 'mssql://cid/dbo/CopyIdent' (FORMAT 'bcp', CREATE_TABLE false);
+
+query I
+SELECT rid FROM cid.dbo.CopyIdent WHERE b = 'after';
+----
+701
+
+# --- many rows with their identity values: the bulk wire, in one statement,
+# is what the docs point at instead of the statement path
+statement ok
+COPY (SELECT 10000 + i AS rid, i AS a, NULL AS b FROM range(5000) t(i)) TO 'mssql://cid/dbo/CopyIdent' (FORMAT 'bcp', CREATE_TABLE false);
+
+query II
+SELECT count(*), max(rid) FROM cid.dbo.CopyIdent WHERE rid >= 10000;
+----
+5000	14999
+
+statement ok
+SELECT mssql_exec('cid', 'DROP TABLE dbo.CopyIdent');
+
+statement ok
+DETACH cid;
