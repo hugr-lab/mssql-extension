@@ -1019,7 +1019,11 @@ SPEC047_TEST_RPATH := $(SANITIZER_PRELOAD) DYLD_LIBRARY_PATH=build/debug/src LD_
 # the sanitizer runtime so the instrumented archive resolves.
 PIN_TEST_BUILD ?= debug
 PIN_TEST_VCPKG := build/$(PIN_TEST_BUILD)/vcpkg_installed
-PIN_TEST_TRIPLET := $(shell ls $(PIN_TEST_VCPKG) 2>/dev/null | head -n 1)
+# The triplet directory, NOT the `vcpkg` bookkeeping directory vcpkg creates
+# beside it: on Linux `vcpkg` sorts before `x64-linux`, so a bare `ls | head`
+# picks it and the link fails with "cannot find …/vcpkg/debug/lib/libssl.a".
+# (On macOS `arm64-osx` happens to sort first, which is why it worked there.)
+PIN_TEST_TRIPLET := $(shell ls $(PIN_TEST_VCPKG) 2>/dev/null | grep -v '^vcpkg$$' | head -n 1)
 ifeq ($(PIN_TEST_BUILD),debug)
 PIN_TEST_VCPKG_LIB := $(PIN_TEST_VCPKG)/$(PIN_TEST_TRIPLET)/debug/lib
 else
