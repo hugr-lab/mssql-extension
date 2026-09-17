@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`rowid`, and with it `UPDATE`/`DELETE`, no longer require a primary key**
+  (spec 077 W1). A table with no primary key but a usable unique index — one
+  that is not filtered, not disabled, and whose key columns are all NOT NULL —
+  gets its rowid from that index; a `BIGINT IDENTITY … UNIQUE` is the common
+  shape. Among several, the order is documented and unit-tested: a
+  single-column identity key first, then the fewest key columns, then the
+  narrowest, then the lowest `index_id`. A usable primary key still wins.
+
+  **A primary key that cannot address a row now falls through instead of being
+  taken.** A `DATETIME` key produced an `UPDATE` that reported success and
+  changed nothing ([#358](https://github.com/hugr-lab/mssql-extension/issues/358):
+  no `datetime2` literal at any precision equals a `datetime` column), and a
+  `SQL_VARIANT` key does the same through its lossy read
+  ([#354](https://github.com/hugr-lab/mssql-extension/issues/354)). Such a
+  table now uses another unique index if it has one, and otherwise refuses by
+  name — a behaviour change, and a deliberate one, since what it replaces is a
+  statement that did nothing and said so to nobody. Every refusal names what
+  was looked for and why each candidate was rejected: the index, the column,
+  and the reason. The discovery query itself lost its `sys.types` join, which
+  dropped every CLR UDT key column and could return a primary key with a column
+  missing — and its `sys.key_constraints` join with it. Returning every unique
+  index therefore costs no more than returning the one primary key did, and on
+  a small catalog less: measured server-side, 2000 executions a run, four
+  interleaved runs, 151 → 38 µs on the test database (a primary key and two
+  ordinary indexes; 267 → 92 µs with eight unique indexes). On a catalog of
+  3000 tables and 9200 indexes the joins matter less and the extra rows a
+  little more: 58 → 49 µs against the query as it shipped, and 6 µs (14%)
+  more than a primary-key-only query without the joins would cost. Tens of
+  microseconds either way, inside a batch that already pays a round trip.
+
 - **`COPY` no longer drops a CLR UDT column of an existing target in silence**
   ([#353](https://github.com/hugr-lab/mssql-extension/issues/353)). The
   target-metadata query joined `sys.types` on `system_type_id`, which no

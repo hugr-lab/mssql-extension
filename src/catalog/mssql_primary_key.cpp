@@ -33,34 +33,50 @@ namespace mssql {
 // SQL Query for Primary Key Discovery
 //===----------------------------------------------------------------------===//
 
-// Query to discover primary key columns for a table
-// Uses sys.key_constraints, sys.indexes, sys.index_columns, sys.columns, sys.types
-// Parameters: %s = [schema].[table] fully qualified name
+// Spec 077 W1: every unique index on the table — the primary key is one of
+// them, is_primary_key says which — with its key columns and the flags the
+// choice needs. Only is_unique is filtered here: a non-unique index is never a
+// candidate under any reading and a table can carry many. Everything else
+// (filtered, disabled, hypothetical, a nullable or unmatchable key column) is
+// decided client-side so that a rejected candidate can be reported WITH its
+// reason; a row filtered out here never comes back.
+//
+// No join to sys.types: it drops every CLR UDT column (#353), which for a key
+// on hierarchyid meant a primary key that came back with a column missing and
+// a rowid built on the wrong shape. TYPE_NAME answers for both families.
+//
+// Parameters: @s schema, @t table (sp_executesql, one plan for every table).
 static const char *PK_DISCOVERY_SQL_TEMPLATE = R"(
 SELECT
+    i.index_id,
+    i.name AS index_name,
+    i.is_primary_key,
+    i.is_unique,
+    i.has_filter,
+    i.is_disabled,
+    i.is_hypothetical,
     c.name AS column_name,
     c.column_id,
     ic.key_ordinal,
-    t.name AS type_name,
+    ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS type_name,
     c.max_length,
     c.precision,
     c.scale,
-    ISNULL(c.collation_name, '') AS collation_name
-FROM sys.key_constraints kc
-JOIN sys.indexes i
-    ON kc.parent_object_id = i.object_id
-    AND kc.unique_index_id = i.index_id
+    ISNULL(c.collation_name, '') AS collation_name,
+    c.is_nullable,
+    c.is_identity
+FROM sys.indexes i
 JOIN sys.index_columns ic
     ON i.object_id = ic.object_id
     AND i.index_id = ic.index_id
 JOIN sys.columns c
     ON ic.object_id = c.object_id
     AND ic.column_id = c.column_id
-JOIN sys.types t
-    ON c.system_type_id = t.user_type_id AND t.system_type_id = t.user_type_id
-WHERE kc.type = 'PK'
-    AND kc.parent_object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
-ORDER BY ic.key_ordinal
+WHERE i.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
+    AND i.is_unique = 1
+    AND ic.is_included_column = 0
+    AND ic.key_ordinal > 0
+ORDER BY i.index_id, ic.key_ordinal
 )";
 
 //===----------------------------------------------------------------------===//
@@ -173,42 +189,113 @@ const char *PrimaryKeyInfo::DiscoverySqlTemplate() {
 	return PK_DISCOVERY_SQL_TEMPLATE;
 }
 
-bool PrimaryKeyInfo::AppendColumnFromRow(PrimaryKeyInfo &info, const vector<string> &values,
-										 const string &database_collation) {
-	if (values.size() < 8) {
+static int32_t ToInt(const string &v, int32_t fallback = 0) {
+	try {
+		return static_cast<int32_t>(std::stoi(v));
+	} catch (...) {
+		return fallback;
+	}
+}
+
+static bool ToBool(const string &v) {
+	return v == "1" || v == "true" || v == "True";
+}
+
+bool PrimaryKeyInfo::AppendCandidateRow(PrimaryKeyInfo &info, const vector<string> &values) {
+	if (values.size() < 17) {
 		return false;
 	}
-	string col_name = values[0];
-	int32_t col_id = 0;
-	try {
-		col_id = static_cast<int32_t>(std::stoi(values[1]));
-	} catch (...) {
+	const int32_t index_id = ToInt(values[0]);
+	if (info.candidates_.empty() || info.candidates_.back().index_id != index_id) {
+		RowIdKeyCandidate cand;
+		cand.index_id = index_id;
+		cand.index_name = values[1];
+		cand.is_primary_key = ToBool(values[2]);
+		cand.is_unique = ToBool(values[3]);
+		cand.has_filter = ToBool(values[4]);
+		cand.is_disabled = ToBool(values[5]);
+		cand.is_hypothetical = ToBool(values[6]);
+		info.candidates_.push_back(std::move(cand));
 	}
-	int32_t key_ordinal = 0;
-	try {
-		key_ordinal = static_cast<int32_t>(std::stoi(values[2]));
-	} catch (...) {
-	}
-	string type_name = values[3];
-	int16_t max_len = 0;
-	try {
-		max_len = static_cast<int16_t>(std::stoi(values[4]));
-	} catch (...) {
-	}
-	uint8_t prec = 0;
-	try {
-		prec = static_cast<uint8_t>(std::stoi(values[5]));
-	} catch (...) {
-	}
-	uint8_t scl = 0;
-	try {
-		scl = static_cast<uint8_t>(std::stoi(values[6]));
-	} catch (...) {
-	}
-	string collation = values[7];
-	info.columns.push_back(PKColumnInfo::FromMetadata(col_name, col_id, key_ordinal, type_name, max_len, prec, scl,
-													  collation, database_collation));
+	RowIdKeyColumn col;
+	col.name = values[7];
+	col.column_id = ToInt(values[8]);
+	col.key_ordinal = ToInt(values[9]);
+	col.type_name = values[10];
+	col.max_length = static_cast<int16_t>(ToInt(values[11]));
+	col.precision = static_cast<uint8_t>(ToInt(values[12]));
+	col.scale = static_cast<uint8_t>(ToInt(values[13]));
+	col.collation_name = values[14];
+	col.is_nullable = ToBool(values[15]);
+	col.is_identity = ToBool(values[16]);
+	// The one client-side fact the SQL cannot supply: is this column read
+	// through the lossy NVARCHAR(MAX) cast? Same predicate MSSQLColumnInfo uses.
+	col.cast_required = !MSSQLColumnInfo::IsKnownSQLServerType(col.type_name);
+	info.candidates_.back().columns.push_back(std::move(col));
 	return true;
+}
+
+void PrimaryKeyInfo::FinalizeChoice(const string &database_collation) {
+	columns.clear();
+	rejections.clear();
+	index_name.clear();
+	source = RowIdKeySource::NONE;
+
+	auto choice = ChooseRowIdKey(candidates_);
+	candidates_.clear();
+
+	rejections = std::move(choice.rejections);
+	if (!choice.Found()) {
+		exists = false;
+		ComputeRowIdType();
+		MSSQL_PK_DEBUG("no usable rowid key (%zu candidate(s) rejected)", rejections.size());
+		return;
+	}
+	source = choice.source;
+	index_name = choice.index_name;
+	for (const auto &col : choice.columns) {
+		columns.push_back(PKColumnInfo::FromMetadata(col.name, col.column_id, col.key_ordinal, col.type_name,
+													 col.max_length, col.precision, col.scale, col.collation_name,
+													 database_collation));
+	}
+	exists = true;
+	ComputeRowIdType();
+	MSSQL_PK_DEBUG("rowid key: %s '%s' with %zu column(s), %zu candidate(s) rejected",
+				   source == RowIdKeySource::PRIMARY_KEY ? "primary key" : "unique index", index_name.c_str(),
+				   columns.size(), rejections.size());
+}
+
+// DescribeRejections works on a RowIdKeyChoice; this struct keeps only the list.
+static RowIdKeyChoice ChoiceWith(const vector<RowIdKeyRejection> &rejections) {
+	RowIdKeyChoice c;
+	c.rejections = rejections;
+	return c;
+}
+
+string PrimaryKeyInfo::RowIdRefusal(const string &schema_name, const string &table_name, const string &verb) const {
+	// Two different mistakes get two different first sentences: a key that
+	// exists but cannot address a row would send the user to add an index they
+	// already have, so it is named as what it is.
+	bool only_unmatchable = !rejections.empty();
+	for (const auto &r : rejections) {
+		if (r.reason.find("#354") == string::npos && r.reason.find("#358") == string::npos) {
+			only_unmatchable = false;
+		}
+	}
+	string msg = "MSSQL: " + verb + " requires a table with a primary key or a usable unique index. ";
+	if (rejections.empty()) {
+		msg += "Table '" + schema_name + "." + table_name +
+			   "' has neither. Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a filter.";
+	} else if (only_unmatchable) {
+		msg += "Table '" + schema_name + "." + table_name +
+			   "' has a key, but rowid cannot address a row through it: " + DescribeRejections(ChoiceWith(rejections)) +
+			   ". Until the linked issue lands, add a UNIQUE index on NOT NULL columns of another type.";
+	} else {
+		msg += "Table '" + schema_name + "." + table_name +
+			   "' has no usable one: " + DescribeRejections(ChoiceWith(rejections)) +
+			   ". Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a filter.";
+	}
+	return msg;
 }
 
 PrimaryKeyInfo PrimaryKeyInfo::Discover(tds::TdsConnection &connection, const string &schema_name,
@@ -226,27 +313,15 @@ PrimaryKeyInfo PrimaryKeyInfo::Discover(tds::TdsConnection &connection, const st
 
 	// Execute PK discovery query
 	ExecuteMetadataQuery(
-		connection, query,
-		[&info, &database_collation](const vector<string> &values) {
-			AppendColumnFromRow(info, values, database_collation);
-		},
+		connection, query, [&info](const vector<string> &values) { AppendCandidateRow(info, values); },
 		[&info]() {
-			// push_back per key column: a composite PK aborted after its first column
-			// would otherwise come back with that column listed twice, and the rowid
-			// STRUCT built from it would be wrong rather than merely missing.
-			info.columns.clear();
+			// One row per key column: a candidate aborted after its first column
+			// would otherwise come back with that column listed twice, and the
+			// rowid STRUCT built from it would be wrong rather than merely missing.
+			info.ClearCandidates();
 		});
 
-	// Check if we found any PK columns
-	if (info.columns.empty()) {
-		MSSQL_PK_DEBUG("No primary key found for %s", full_name.c_str());
-		info.exists = false;
-	} else {
-		MSSQL_PK_DEBUG("Found PK with %zu column(s) for %s", info.columns.size(), full_name.c_str());
-		info.exists = true;
-		info.ComputeRowIdType();
-	}
-
+	info.FinalizeChoice(database_collation);
 	return info;
 }
 

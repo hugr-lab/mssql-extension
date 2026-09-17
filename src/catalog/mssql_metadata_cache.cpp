@@ -502,7 +502,7 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 			// (review of #345 -- a column added to either query must not silently
 			// drop every primary key in the catalog).
 			if (result_set == 1) {
-				mssql::PrimaryKeyInfo::AppendColumnFromRow(table_meta.pk_info, values, database_collation_);
+				mssql::PrimaryKeyInfo::AppendCandidateRow(table_meta.pk_info, values);
 				return;
 			}
 			if (result_set != 0) {
@@ -579,8 +579,8 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	}
 
 	// Cache the result (slot is already in the map)
-	table_meta.pk_info.exists = !table_meta.pk_info.columns.empty();
-	table_meta.pk_info.ComputeRowIdType();
+	// Spec 077 W1: the second result set was every unique index; choose now.
+	table_meta.pk_info.FinalizeChoice(database_collation_);
 	table_meta.pk_loaded = true;
 	table_meta.columns_load_state = CacheLoadState::LOADED;
 	table_meta.columns_last_refresh = std::chrono::steady_clock::now();

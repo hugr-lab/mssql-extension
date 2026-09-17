@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test test-cpp test-cpp-run vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy counters-test help
+.PHONY: azure-test test-cpp test-cpp-run vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-rowid-key-choice test-load-policy counters-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -568,6 +568,18 @@ test-index-kind:
 	@echo ""
 	@echo "Running MSSQLIndexKind unit test..."
 	build/test/test_index_kind
+
+# Spec 077 W1: ChooseRowIdKey — which index becomes a table's rowid, and why
+# each one that does not was rejected. Header-only, no server, no linking.
+test-rowid-key-choice:
+	@echo "Building ChooseRowIdKey unit test (spec 077 W1)..."
+	@mkdir -p build/test
+	$(CXX) $(INDEX_KIND_TEST_FLAGS) $(INDEX_KIND_TEST_INCLUDES) \
+	    test/cpp/test_rowid_key_choice.cpp \
+	    -o build/test/test_rowid_key_choice
+	@echo ""
+	@echo "Running ChooseRowIdKey unit test..."
+	build/test/test_rowid_key_choice
 
 # Spec 063 D1: MSSQLResolveLoadPolicy — who supplies a bulk-load writer's
 # connection, and how many writers there may be.

@@ -265,10 +265,10 @@ the decision across the two would make W5b unable to report a rejected index
 *with its reason*, because a candidate filtered out inside the SQL never comes
 back. So: **the query returns every candidate index with its key columns, and
 the choice runs entirely in C++** — a pure function over the candidate list
-that W6 unit-tests without a server. The SQL keeps the cheap structural
-filters (`is_unique`, `has_filter`, `is_disabled`, `is_hypothetical`) because
-those rows are not candidates under any reading and returning them would only
-grow the result set.
+that W6 unit-tests without a server. The SQL keeps exactly one filter,
+`is_unique = 1`: a non-unique index is not a candidate under any reading and a
+table can carry many of them. Filtered, disabled and hypothetical indexes DO
+come back, because each is a rejection the user may need to see by name.
 
 **Choice, in order** (deterministic, so two sessions never disagree):
 
@@ -315,7 +315,16 @@ the rowid is built from is already a hazard on the PK path, and picking a
 user-maintained unique key widens it. W6 adds the test that pins today's
 behaviour so the hazard is documented rather than discovered. And the
 discovery query rides in the same batch as the table's metadata since spec
-076, so widening it costs no extra round trip.
+076, so widening it costs no extra round trip. Its server time was measured
+rather than assumed (2000 executions a run, four interleaved runs): the widened
+query drops the `sys.key_constraints` and `sys.types` joins, and on the test
+database it is cheaper than the primary-key-only form it replaces — 38 µs
+against 151 µs, 92 against 267 with eight unique indexes on the table. On a
+catalog of 3000 tables and 9200 indexes, where `sys.indexes` is no longer
+trivially small, it is 49 µs against 58 for the form that shipped and 6 µs
+(14%) more than a join-less primary-key-only form would be. That is the whole
+cost of "every unique index": tens of microseconds per table, once per cache
+load.
 
 ### W2 — `IDENTITY_INSERT` when the identity column is in the list
 
@@ -394,25 +403,29 @@ Mechanics:
   by the `GetObjectType() == MSSQLObjectType::VIEW` test the routing already
   makes at `mssql_catalog.cpp:733`; a view target is left alone, and the server
   refuses an explicit identity value through a view on its own terms.
-- **An explicit `NULL` or `DEFAULT` for the identity column.** `DEFAULT` is the
-  form that means "let the server decide", so if DuckDB leaves the column in
-  `insert_col_indices` for it, the column is dropped from the generated list
-  and no `IDENTITY_INSERT` is sent — the same outcome as not naming it. An
-  explicit `NULL` is a value, so it is sent, and the server refuses it; that
-  refusal is the honest one and is not rewritten. Which of the two DuckDB
-  actually produces is the first thing to check when the code is written, and
-  the test pins whichever it is.
+- **An explicit `NULL` or `DEFAULT` for the identity column — measured, and
+  DuckDB does not let us tell them apart.** `INSERT INTO t (id, v) VALUES
+  (DEFAULT, 1)` and `… VALUES (NULL, 1)` both reach `PlanInsert` with `id` in
+  the column list and a NULL in the chunk: DuckDB resolves `DEFAULT` to the
+  column's bound default, an identity column has none on the DuckDB side, and
+  the result is NULL. So "drop the column when DuckDB passes DEFAULT" cannot be
+  built. The rule instead: **a named identity column with a NULL in any row is
+  refused client-side, before anything is sent**, with a message that says the
+  server assigns only when the column is left out of the list, and that a batch
+  mixing rows that supply the value with rows that do not has to be split.
+  That one check covers `DEFAULT`, `NULL` and the mixed batch alike. (The
+  server's own answer for the same shape is error 339, "DEFAULT or NULL are
+  not allowed as explicit identity values" — honest, but it does not name the
+  way out.)
 - **`DEFAULT` and an explicit value for the identity column in the same
   statement.** `INSERT INTO t VALUES (DEFAULT, 1), (42, 2)` asks for both at
-  once, and dropping the column from the list is a per-STATEMENT decision: the
-  column list is shared by every row of the batch, and under
+  once, and the column list is shared by every row of the batch: under
   `IDENTITY_INSERT ON` there is no way to spell "let the server assign" for a
-  single row. **The rule: refuse the statement**, naming the column and saying
-  that a batch either lets the server assign every identity value or supplies
-  every one — and that splitting the `VALUES` into separate statements is the
-  way to do both. Not split automatically: the two halves would land in
-  different batches with different identity semantics, which is a surprising
-  thing to do silently to a statement the user wrote as one. W6 covers it.
+  single row. It is the same NULL-in-a-named-identity-column shape as the
+  bullet above and is caught by the same check. **Not split automatically**:
+  the two halves would land in different batches with different identity
+  semantics, which is a surprising thing to do silently to a statement the
+  user wrote as one. W6 covers it.
 - **Security, said out loud:** turning `IDENTITY_INSERT` on grants nothing. It
   only succeeds where the caller already holds ALTER on the table, and a caller
   with ALTER could issue the same statement themselves through `mssql_exec`.

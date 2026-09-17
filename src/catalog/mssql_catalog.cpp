@@ -836,8 +836,8 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	// Check if table has a primary key (required for DELETE via rowid)
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
 	if (!pk_info.exists) {
-		throw NotImplementedException("MSSQL: DELETE requires a primary key. Table '%s' has no primary key.",
-									  table_entry.name);
+		throw NotImplementedException(pk_info.RowIdRefusal(table_entry.schema.name.GetIdentifierName(),
+														   table_entry.name.GetIdentifierName(), "DELETE"));
 	}
 
 	// Build MSSQLDeleteTarget from table metadata
@@ -875,8 +875,8 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 	// Check if table has a primary key (this will fetch PK info if not cached)
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
 	if (!pk_info.exists) {
-		throw NotImplementedException("MSSQL: UPDATE requires a primary key. Table '%s' has no primary key.",
-									  table_entry.name);
+		throw NotImplementedException(pk_info.RowIdRefusal(table_entry.schema.name.GetIdentifierName(),
+														   table_entry.name.GetIdentifierName(), "UPDATE"));
 	}
 
 	// Get MSSQL column info
@@ -888,7 +888,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 			auto physical_idx = op.columns[i].index;
 			if (physical_idx < mssql_columns.size() && mssql_columns[physical_idx].name == pk_col.name) {
 				throw NotImplementedException(
-					"MSSQL: Updating primary key columns is not supported. Cannot update column '%s'.", pk_col.name);
+					"MSSQL: Updating rowid key columns is not supported. Cannot update column '%s'.", pk_col.name);
 			}
 		}
 	}
