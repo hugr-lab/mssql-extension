@@ -14,7 +14,7 @@
 # The step-1 change — an unusable primary key falls through instead of being
 # taken — closes a live defect: a DATETIME primary key produced an UPDATE that
 # reported success and changed nothing (issue #358), because no datetime2
-# literal can match a datetime column. Measured; the table with a usable unique
+# literal matches a datetime value with a 1/300 s fraction. Measured; the table with a usable unique
 # index beside such a key now updates through the index, and the one without
 # refuses by name.
 
@@ -147,7 +147,7 @@ UPDATE ux.dbo.UxNone SET v = 1;
 has neither. Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a filter
 
 # --- a unique index on a NULLABLE column: it accepts exactly one NULL row and
-# refuses the second, so NULL is neither unique nor addressable
+# refuses the second, but a row keyed by NULL cannot be addressed
 statement ok
 SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxNullable (a INT NULL UNIQUE, v INT)');
 
@@ -157,7 +157,7 @@ SELECT mssql_invalidate_cache('ux');
 statement error
 DELETE FROM ux.dbo.UxNullable;
 ----
-key column 'a' is nullable, and NULL is neither unique nor addressable
+key column 'a' is nullable, and a row keyed by NULL cannot be addressed: = NULL matches nothing
 
 # --- a FILTERED unique index covers a subset of rows; the rest are unaddressable
 statement ok
@@ -210,6 +210,51 @@ statement error
 UPDATE ux.dbo.UxIdent SET id = 500 WHERE v = 3;
 ----
 Updating rowid key columns is not supported
+
+# =============================================================================
+# A varchar key under a SQL_ collation (the installation default). Every rowid
+# value is sent as an N'...' literal, so the key join compared the varchar
+# column under its collation's UNICODE rules, where 'Straße' = 'Strasse' and
+# 'Æ' = 'AE' — while the unique index, under the non-Unicode SQL sort order,
+# holds them as four keys. Measured before the fix: the DELETE of the 'Straße'
+# row deleted 'Strasse' too, and the UPDATE of the 'Æ' row updated 'AE', both
+# silently. Same shape with a varchar PRIMARY KEY, which predates spec 077.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('ux', 'IF OBJECT_ID(''dbo.UxSqlColl'') IS NOT NULL DROP TABLE dbo.UxSqlColl; IF OBJECT_ID(''dbo.UxSqlCollPk'') IS NOT NULL DROP TABLE dbo.UxSqlCollPk; CREATE TABLE dbo.UxSqlColl (code varchar(20) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL, v int NOT NULL); CREATE UNIQUE INDEX UX_UxSqlColl ON dbo.UxSqlColl(code); CREATE TABLE dbo.UxSqlCollPk (code char(10) COLLATE SQL_Latin1_General_CP1_CI_AS PRIMARY KEY, v int NOT NULL); INSERT INTO dbo.UxSqlColl VALUES (''Strasse'', 1), (''Straße'', 2), (''AE'', 3), (''Æ'', 4); INSERT INTO dbo.UxSqlCollPk VALUES (''Strasse'', 1), (''Straße'', 2), (''AE'', 3), (''Æ'', 4)');
+
+statement ok
+SELECT mssql_invalidate_cache('ux');
+
+statement ok
+DELETE FROM ux.dbo.UxSqlColl WHERE v = 2;
+
+statement ok
+UPDATE ux.dbo.UxSqlColl SET v = 40 WHERE v = 4;
+
+query TI
+SELECT code, v FROM ux.dbo.UxSqlColl ORDER BY v;
+----
+Strasse	1
+AE	3
+Æ	40
+
+statement ok
+DELETE FROM ux.dbo.UxSqlCollPk WHERE v = 2;
+
+statement ok
+UPDATE ux.dbo.UxSqlCollPk SET v = 40 WHERE v = 4;
+
+query TI
+SELECT trim(code), v FROM ux.dbo.UxSqlCollPk ORDER BY v;
+----
+Strasse	1
+AE	3
+Æ	40
+
+statement ok
+SELECT mssql_exec('ux', 'DROP TABLE dbo.UxSqlColl; DROP TABLE dbo.UxSqlCollPk');
 
 statement ok
 SELECT mssql_exec('ux', 'DROP TABLE dbo.UxIdent; DROP TABLE dbo.UxDtPk; DROP TABLE dbo.UxDtOnly; DROP TABLE dbo.UxVariant; DROP TABLE dbo.UxNone; DROP TABLE dbo.UxNullable; DROP TABLE dbo.UxFiltered; DROP TABLE dbo.UxBoth; DROP TABLE dbo.UxTie');

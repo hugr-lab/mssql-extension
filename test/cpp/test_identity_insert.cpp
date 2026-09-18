@@ -48,6 +48,7 @@ int main() {
 		CHECK(Has(m, "ALTER"), "names ALTER");
 		CHECK(Has(m, "dbo.T"), "names the table");
 		CHECK(Has(m, "leave the identity column out"), "names the other way out");
+		CHECK(Has(m, "mssql_invalidate_cache()"), "names the stale-catalog reading of the same number");
 		CHECK(Has(m, "Cannot find the object"), "carries the server's text as the cause");
 	}
 	// --- 8106: stale is_identity; names the cache and the function that fixes it

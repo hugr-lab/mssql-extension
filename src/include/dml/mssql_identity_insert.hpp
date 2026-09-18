@@ -60,7 +60,8 @@ inline std::string ExplainIdentityInsertError(uint32_t number, const std::string
 			   "needs ALTER permission on the table, which INSERT does not. Either grant ALTER on " +
 			   target +
 			   " to this login, or leave the identity column out of the INSERT and let the server assign it. "
-			   "The server said: " +
+			   "(The server raises the same error for a table that no longer exists: if it was dropped or renamed "
+			   "since the catalog cached it, run mssql_invalidate_cache() instead.) The server said: " +
 			   server_message;
 	case 8106:
 		return "MSSQL: the catalog believes '" + target +

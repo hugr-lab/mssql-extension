@@ -7,7 +7,7 @@
 # not, the statement would report success and change nothing, so the key is
 # refused by name instead. Measured shapes: time(7) and datetimeoffset(7) lose
 # their 100 ns digit on read (three rows keyed on such values, one updated);
-# datetime never matches (#358); smalldatetime, datetime2(7), time(6) and
+# datetime with a 1/300 s fraction never matches (#358); smalldatetime, datetime2(7), time(6) and
 # datetimeoffset(6) round-trip.
 
 require mssql

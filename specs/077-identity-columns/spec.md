@@ -3,7 +3,7 @@
 **Status:** implemented on `spec/077-identity-columns` (PR #350), on top of
 `main` after #352, #355 and #357. Reconnaissance done on 2026-09-16 against the
 local docker server, SQL Server 2025 RTM-CU8; implementation on 2026-09-17,
-one commit per work item (W1 `9a40661`, W2 `33c0976`, the rename `cd015d1`).
+one commit per work item (W1 `9a40661`, W2 `33c0976`, the rename `4e908d2`).
 Spec and implementation ship in one PR.
 **Builds on:** spec 062 — `MSSQLColumnInfo::is_identity` already reaches
 `MSSQLInsertColumn` from `sys.columns` through the metadata cache (W4), and
@@ -186,7 +186,7 @@ object and pick one deterministically.
 |---|---|---|
 | `is_unique = 1` | `sys.indexes` | otherwise values repeat |
 | `has_filter = 0` | `sys.indexes` | a filtered unique index covers a subset of rows; the rest are unaddressable |
-| every key column `is_nullable = 0` | `sys.index_columns` joined to `sys.columns`, `is_included_column = 0` | measured: a unique index on a nullable column accepts exactly one NULL row and refuses the second, so NULL is neither unique nor addressable |
+| every key column `is_nullable = 0` | `sys.index_columns` joined to `sys.columns`, `is_included_column = 0` | measured: a unique index on a nullable column accepts exactly one NULL row and refuses the second — unique, but a row keyed by NULL cannot be addressed, since `= NULL` matches nothing |
 | `is_disabled = 0`, `is_hypothetical = 0` | `sys.indexes` | a disabled index enforces nothing |
 | no key column is `is_cast_required` | `MSSQLColumnInfo` | **the review's best finding, and it is a live bug on the PK path already — see below** |
 | no key column is `datetime`, nor `time` / `datetimeoffset` at scale 7 | `MSSQLColumnInfo::sql_type_name` | the rowid literal cannot be made to match such a column at all — measured, see below. Lifted when [#358](https://github.com/hugr-lab/mssql-extension/issues/358) fixes the renderer |
@@ -416,10 +416,15 @@ Mechanics:
   cached `is_identity` is stale, most likely after DDL through `mssql_exec`,
   which does not invalidate by default. It is mapped to a message that says so
   and names `mssql_invalidate_cache()`.
-- **`IDENTITY_INSERT` is turned off only if this statement turned it on.** A
+- **`IDENTITY_INSERT` is turned off only if this statement sent the `ON`.** A
   user can set it themselves through `mssql_exec` — on a pinned connection, or
   on a pooled one with `mssql_reset_connection = false` — and clearing it
-  unconditionally would undo session state they set deliberately.
+  unconditionally would undo session state they set deliberately. The limit of
+  that: the server exposes no way to read the setting, and `ON` for a table
+  that is already `ON` succeeds silently, so a statement that names the
+  identity column of the very table the user turned on sends its own `ON`,
+  and its `OFF` then clears the user's too. A different table is `8107`, and
+  refused before anything is sent.
 - The target of `SET IDENTITY_INSERT` is a **table**. The VIEW case is decided
   by the `GetObjectType() == MSSQLObjectType::VIEW` test the routing already
   makes at `mssql_catalog.cpp:733`; a view target is left alone, and the server

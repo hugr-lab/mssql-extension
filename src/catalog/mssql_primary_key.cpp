@@ -7,6 +7,7 @@
 #include <thread>
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "query/mssql_sql_params.hpp"
 
@@ -145,6 +146,23 @@ PKColumnInfo PKColumnInfo::FromMetadata(const string &name, int32_t column_id, i
 	// Map SQL Server type to DuckDB type using MSSQLColumnInfo helper
 	info.duckdb_type = MSSQLColumnInfo::MapSQLServerTypeToDuckDB(type_name, max_length, precision, scale);
 
+	// Only SQL_ collations compare varchar and nvarchar under different rules;
+	// a Windows or UTF-8 collation applies the same rules to both. The name is
+	// spliced into the statement, so anything but a plain collation name is
+	// left alone (and compared as before).
+	string lower_type = StringUtil::Lower(type_name);
+	const string &coll = info.collation_name;
+	bool plain_name = !coll.empty();
+	for (char c : coll) {
+		if (!(isalnum(static_cast<unsigned char>(c)) || c == '_')) {
+			plain_name = false;
+		}
+	}
+	if ((lower_type == "varchar" || lower_type == "char") && plain_name &&
+		StringUtil::StartsWith(StringUtil::Lower(coll), "sql_")) {
+		info.key_compare_type = "varchar(" + (max_length < 0 ? string("max") : std::to_string(max_length)) + ")";
+	}
+
 	MSSQL_PK_DEBUG("  PK column: name=%s ordinal=%d type=%s -> %s", name.c_str(), key_ordinal, type_name.c_str(),
 				   info.duckdb_type.ToString().c_str());
 
@@ -266,6 +284,15 @@ void RowIdKeyInfo::FinalizeChoice(const string &database_collation) {
 				   columns.size(), rejections.size());
 }
 
+string PKColumnInfo::KeyComparand(const string &values_column) const {
+	if (key_compare_type.empty()) {
+		return values_column;
+	}
+	// COLLATE before the CAST: the conversion to varchar uses the code page of
+	// its input's collation, and without it that is the database default's.
+	return "CAST(" + values_column + " COLLATE " + collation_name + " AS " + key_compare_type + ")";
+}
+
 // DescribeRejections works on a RowIdKeyChoice; this struct keeps only the list.
 static RowIdKeyChoice ChoiceWith(const vector<RowIdKeyRejection> &rejections) {
 	RowIdKeyChoice c;
@@ -285,15 +312,23 @@ string RowIdKeyInfo::RowIdRefusal(const string &schema_name, const string &table
 		}
 	}
 	string msg = "MSSQL: " + verb + " requires a table with a primary key or a usable unique index. ";
+	// The answer is cached until invalidated, and an index added through
+	// mssql_exec() does not invalidate it by default — so a user who follows
+	// the advice below is told how to make the next statement see the index.
+	const string invalidate_call = "mssql_invalidate_cache('" +
+								   (catalog_name.empty() ? string("<catalog>") : catalog_name) + "', '" + schema_name +
+								   "', '" + table_name + "')";
+	const string invalidate_hint = " After adding one through mssql_exec(), run " + invalidate_call +
+								   " so the next statement reads the indexes again.";
 	if (!discovery_error.empty()) {
 		msg += "The indexes of '" + schema_name + "." + table_name +
 			   "' could not be read, so whether it has one is unknown: " + discovery_error +
-			   ". The lookup is not retried on its own: mssql_invalidate_cache('" +
-			   (catalog_name.empty() ? string("<catalog>") : catalog_name) + "', '" + schema_name + "', '" +
-			   table_name + "') drops the cached answer so the next statement reads the indexes again.";
+			   ". The lookup is not retried on its own: " + invalidate_call +
+			   " drops the cached answer so the next statement reads the indexes again.";
 	} else if (rejections.empty()) {
 		msg += "Table '" + schema_name + "." + table_name +
-			   "' has neither. Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a filter.";
+			   "' has neither. Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a filter." +
+			   invalidate_hint;
 	} else if (only_unmatchable) {
 		msg += "Table '" + schema_name + "." + table_name +
 			   "' has a key, but rowid cannot address a row through it: " + DescribeRejections(ChoiceWith(rejections)) +
@@ -301,7 +336,7 @@ string RowIdKeyInfo::RowIdRefusal(const string &schema_name, const string &table
 	} else {
 		msg += "Table '" + schema_name + "." + table_name +
 			   "' has no usable one: " + DescribeRejections(ChoiceWith(rejections)) +
-			   ". Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a filter.";
+			   ". Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a filter." + invalidate_hint;
 	}
 	return msg;
 }

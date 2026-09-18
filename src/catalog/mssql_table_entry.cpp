@@ -324,7 +324,8 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 
 	try {
 		auto &pool = mssql_catalog.GetConnectionPool();
-		auto connection = pool.Acquire();
+		std::string acquire_failure;
+		auto connection = pool.Acquire(-1, &acquire_failure);
 
 		if (connection) {
 			auto &cache = mssql_catalog.GetMetadataCache();
@@ -345,7 +346,12 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 		} else {
 			MSSQL_TE_DEBUG("EnsurePKLoaded: no connection available");
 			pk_info_.exists = false;
-			pk_info_.discovery_error = "no connection could be acquired from the pool";
+			// The pool's own reason, when it has one: a login that failed or a
+			// token that expired is cached here until invalidated, and
+			// invalidating does not help until that is fixed — so say which.
+			pk_info_.discovery_error = acquire_failure.empty()
+										   ? string("no connection could be acquired from the pool")
+										   : "no connection could be acquired from the pool (" + acquire_failure + ")";
 		}
 	} catch (const std::exception &e) {
 		// Not "no key": the refusal says the indexes could not be read and why,
@@ -460,7 +466,15 @@ vector<column_t> MSSQLTableEntry::GetRowIdColumns() const {
 							  name.c_str());
 	}
 
-	if (!pk_loaded_.load(std::memory_order_acquire) || !pk_info_.exists) {
+	// pk_info_ may be read without the lock only once pk_loaded_ is observed
+	// true (spec 052): before that, another thread can be move-assigning it
+	// under pk_load_mutex_. GetScanFunction publishes it first on every DML
+	// bind, so the unloaded branch is not expected — but it must not read.
+	if (!pk_loaded_.load(std::memory_order_acquire)) {
+		throw BinderException("MSSQL: UPDATE/DELETE on '%s.%s': its rowid key has not been read yet",
+							  schema.name.c_str(), name.c_str());
+	}
+	if (!pk_info_.exists) {
 		throw BinderException(pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(),
 													"UPDATE/DELETE", catalog.GetName().GetIdentifierName()));
 	}

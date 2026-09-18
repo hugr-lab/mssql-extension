@@ -41,7 +41,7 @@ string MSSQLDeleteStatement::GenerateOnClause() const {
 			sql += " AND ";
 		}
 		string col = EscapeIdentifier(pk_columns[i].name);
-		sql += "t." + col + " = v." + col;
+		sql += "t." + col + " = " + pk_columns[i].KeyComparand("v." + col);
 	}
 	return sql;
 }

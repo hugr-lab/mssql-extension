@@ -65,8 +65,14 @@ void MSSQLStatementConnection::EnableIdentityInsert(const string &schema_name, c
 }
 
 static int GetDmlDebugLevel() {
+	// MSSQL_DML_DEBUG, else the general MSSQL_DEBUG every other DML executor
+	// reads — as the CTAS executor does — so the warnings below are not hidden
+	// from someone who set only the general switch.
 	static const int level = []() {
 		const char *env = std::getenv("MSSQL_DML_DEBUG");
+		if (!env) {
+			env = std::getenv("MSSQL_DEBUG");
+		}
 		return env ? std::atoi(env) : 0;
 	}();
 	return level;
@@ -109,7 +115,18 @@ void MSSQLStatementConnection::Commit(ClientContext &context, MSSQLCatalog &cata
 	// connection must not go back to the pool — or on to the next statement of
 	// a pinned transaction — still accepting identity values.
 	if (identity_insert_on_ && !DisableIdentityInsert(IDENTITY_INSERT_OFF_TIMEOUT_MS)) {
+		// Read before Fail: it does not change it, but the message must say
+		// what Fail actually did, and on a pinned connection it neither rolls
+		// back (the DuckDB transaction owns that) nor closes.
+		const bool pinned = transaction_pinned_;
 		Fail(context, catalog);
+		if (pinned) {
+			throw IOException(
+				"MSSQL: could not turn IDENTITY_INSERT off for %s.%s after the INSERT. The "
+				"transaction's connection cannot be discarded, so the setting may still be on "
+				"until the transaction ends: ROLLBACK it.",
+				identity_schema_, identity_table_);
+		}
 		throw IOException(
 			"MSSQL: could not turn IDENTITY_INSERT off for %s.%s after the INSERT; the statement was "
 			"rolled back and the connection discarded",

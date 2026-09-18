@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An `UPDATE`/`DELETE` through a `varchar` key under a `SQL_` collation no
+  longer changes rows it was not given.** Every rowid value is sent as an
+  `N'…'` literal, so the key join compared a `char`/`varchar` key column under
+  its collation's Unicode rules, where `'Straße'` equals `'Strasse'` and `'Æ'`
+  equals `'AE'` — while the unique index, under the non-Unicode SQL sort
+  order, holds them as distinct keys. Measured on
+  `SQL_Latin1_General_CP1_CI_AS`, the installation default: deleting the
+  `'Straße'` row deleted `'Strasse'` too, and updating `'Æ'` updated `'AE'`,
+  both without an error. The join now converts the sent value back to the
+  column's own type and collation, so the comparison is the one the index
+  made. Present for a `varchar` primary key before spec 077; spec 077 would
+  have extended it to every such unique index. Windows and UTF-8 collations
+  apply the same rules to `varchar` and `nvarchar` and are unchanged.
+
 - **An `INSERT` that supplies identity values works** (spec 077 W2). Naming the
   identity column — explicitly, or positionally with a value for every column —
   used to fail with the server's error 544; the statement's connection is now
@@ -17,7 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every way out — after a failing batch, after `ROLLBACK` on a transaction's
   pinned connection, and from the destructor on an unwind, bounded by a
   timeout since that path carries no query timeout — and a connection on which
-  it could not be confirmed is discarded rather than returned to the pool.
+  it could not be confirmed is discarded rather than returned to the pool. A
+  transaction's pinned connection cannot be discarded: there an unconfirmed
+  `OFF` lasts until the transaction ends, whose session reset clears it under
+  the default `mssql_reset_connection = true` and, by that setting's meaning,
+  not under `false`.
   Measured both ways: with the `OFF` deliberately leaked, the next ordinary
   `INSERT` on that session fails with the server's 545. The server's refusals
   of the `ON` are explained rather than relayed: 1088 says the statement needs
@@ -43,7 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **A primary key that cannot address a row now falls through instead of being
   taken.** A `DATETIME` key produced an `UPDATE` that reported success and
   changed nothing ([#358](https://github.com/hugr-lab/mssql-extension/issues/358):
-  no `datetime2` literal at any precision equals a `datetime` column), a
+  a `datetime` value with a 1/300-second fraction — `.003`, `.007`, most of
+  them — equals no `datetime2` literal at any precision; one on a whole 10 ms
+  did match, and is refused with the rest), a
   `TIME(7)` or `DATETIMEOFFSET(7)` key does the same the other way round (the
   read path keeps microseconds, so a key whose 100 ns digit is set comes back
   truncated and its literal never matches — measured: three such rows, one

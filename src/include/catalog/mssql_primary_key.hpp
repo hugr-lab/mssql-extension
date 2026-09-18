@@ -19,6 +19,10 @@ struct PKColumnInfo {
 	int32_t key_ordinal;	  // Position in PK (1-based, from sys.index_columns)
 	LogicalType duckdb_type;  // Mapped DuckDB type
 	string collation_name;	  // For string columns (may affect DML predicates)
+	// Non-empty for a char/varchar key column under a SQL_ collation: the
+	// type the VALUES side of the key join is converted back to. See
+	// KeyComparand.
+	string key_compare_type;
 
 	// Default constructor
 	PKColumnInfo() : column_id(0), key_ordinal(0), duckdb_type(LogicalType::INTEGER) {}
@@ -27,6 +31,18 @@ struct PKColumnInfo {
 	static PKColumnInfo FromMetadata(const string &name, int32_t column_id, int32_t key_ordinal,
 									 const string &type_name, int16_t max_length, uint8_t precision, uint8_t scale,
 									 const string &collation_name, const string &database_collation);
+
+	// The right-hand side of `t.[k] = <this>` in the UPDATE/DELETE key join,
+	// given the VALUES column it compares against. Every rowid value is sent
+	// as an N'...' literal, so the VALUES column is nvarchar, and a varchar key
+	// column is then compared under its collation's UNICODE rules. Under a
+	// SQL_ collation those differ from the non-Unicode sort order the unique
+	// index enforced: 'Strasse' and 'Straße' are two keys to the index and one
+	// value to the comparison, so a DELETE of one row deleted both (measured).
+	// Converting the sent value back to the column's own type and collation
+	// makes the comparison the one the index made. The value came from this
+	// column, so it survives the conversion.
+	string KeyComparand(const string &values_column) const;
 };
 
 //===----------------------------------------------------------------------===//

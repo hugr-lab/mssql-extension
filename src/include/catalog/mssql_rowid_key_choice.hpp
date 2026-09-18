@@ -94,9 +94,11 @@ inline std::string Lower(std::string s) {
 //! The literal-cannot-match exclusion (issue #358), measured on every type of
 //! the family. `datetime` counts in 1/300 s ticks, and since compatibility
 //! level 130 a datetime compared with a datetime2 is converted more precisely
-//! than datetime2(7) can represent, so no datetime2 literal at any precision
-//! equals such a column: a rowid built on it finds no row and the UPDATE
-//! reports success and changes nothing. `time(7)` and `datetimeoffset(7)` fail
+//! than datetime2(7) can represent, so a value with a 1/300 s fraction
+//! (.003, .007 — most of them) equals no datetime2 literal at any precision:
+//! a rowid built on it finds no row and the UPDATE reports success and
+//! changes nothing. A value on a whole 10 ms matches, but a key is refused
+//! as a whole, not per value. `time(7)` and `datetimeoffset(7)` fail
 //! the other way round: the read path decodes them to DuckDB's microsecond
 //! TIME / TIMESTAMP_TZ, so a key whose 100 ns digit is set comes back
 //! truncated and the literal never matches (3 rows keyed on such values, 1
@@ -135,7 +137,8 @@ inline RowIdKeyRejection Unusable(const RowIdKeyCandidate &c) {
 	}
 	for (const auto &col : c.columns) {
 		if (col.is_nullable) {
-			r.reason = "its key column '" + col.name + "' is nullable, and NULL is neither unique nor addressable";
+			r.reason = "its key column '" + col.name +
+					   "' is nullable, and a row keyed by NULL cannot be addressed: = NULL matches nothing";
 			return r;
 		}
 	}

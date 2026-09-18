@@ -59,11 +59,12 @@ SELECT count(*) FROM lim.dbo.DiscoveryPin;
 ----
 0
 
-# The discovery cannot get a connection: refused with the reason and the way out.
+# The discovery cannot get a connection: refused with the pool's own reason
+# (here: the limit-1 pool timed out) and the way out.
 statement error
 UPDATE lim.dbo.DiscoveryFail SET n = 1 WHERE n = 0;
 ----
-could not be read, so whether it has one is unknown: no connection could be acquired from the pool. The lookup is not retried on its own: mssql_invalidate_cache('lim', 'dbo', 'DiscoveryFail')
+<REGEX>:.*could not be read, so whether it has one is unknown: no connection could be acquired from the pool \(pool '.*' timed out \(1 active of 1, limit 1\)\)\. The lookup is not retried on its own: mssql_invalidate_cache\('lim', 'dbo', 'DiscoveryFail'\).*
 
 statement ok
 ROLLBACK;
