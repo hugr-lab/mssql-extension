@@ -266,8 +266,11 @@ std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalTy
 
 namespace {
 
-// Items an IN / NOT IN operator expression may carry to the server; longer
-// lists are evaluated by DuckDB (see EncodeOperatorExpression).
+// Items ONE IN / NOT IN operator expression may carry to the server; a longer
+// list is evaluated by DuckDB (see EncodeOperatorExpression). The cap is per
+// predicate on purpose: with parameterisation on, the statement's budget is
+// SqlParamSet::MAX_PARAMS (constants past it become literals), and with it
+// off a batch of several capped lists is still bounded by their number.
 constexpr size_t MAX_PUSHED_IN_ITEMS = 256;
 
 // UTF-16 code units of a UTF-8 string: one per lead byte, two for a 4-byte
@@ -1181,7 +1184,11 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 		// one literal of an unbounded batch with parameterisation off, and a
 		// list of thousands is where the server answers 8623/8632 instead of
 		// rows. 256 covers the hand-written and the tool-generated lists;
-		// above it the whole predicate is refused and DuckDB evaluates it.
+		// above it the whole predicate is refused and DuckDB evaluates it. The
+		// cap is per predicate: several lists in one WHERE each get it, and
+		// their total is bounded by SqlParamSet::MAX_PARAMS when parameterised
+		// (the sink turns the rest into literals) and by their count when not.
+		// A bare-column IN is a table filter (EncodeInFilter) and is not capped.
 		if (children.size() - 1 > MAX_PUSHED_IN_ITEMS) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN list of %llu items exceeds %llu, left to DuckDB",
 								   (unsigned long long)(children.size() - 1), (unsigned long long)MAX_PUSHED_IN_ITEMS);
