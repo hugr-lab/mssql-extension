@@ -113,6 +113,7 @@ int main() {
 	// BEGIN was still in flight (its connection active, the pin not yet
 	// published) — the window the guard exists for.
 	int overlapped_begin = 0;
+	int timed_out = 0;
 	for (int round = 1; round <= rounds; round++) {
 		const bool staggered = (round % 2 == 1);
 		conn.BeginTransaction();
@@ -165,18 +166,36 @@ int main() {
 			// scheduled yet — the followers then arrived first and the round
 			// silently degraded to the all-at-once case. Instead, wait until
 			// the pool has handed thread 0 its connection (one more active than
-			// before), which under the fix happens inside the critical section
-			// before BEGIN is sent (provider: LockForPin, Acquire, BEGIN, then
-			// SetPinnedConnection); whether the pin was already published when
-			// the followers went says whether they overlapped the BEGIN, and
-			// that is counted and required below.
+			// before). A round counts as having overlapped the BEGIN only when
+			// that was actually observed AND the BEGIN was in flight at that
+			// moment — under the fixed provider (LockForPin, Acquire, BEGIN,
+			// then SetPinnedConnection) the pin is not published yet; under the
+			// regressed ordering (pin before BEGIN) the pinned connection is
+			// still Executing. A wait that hits the deadline is logged and not
+			// counted: the followers then go blind, and the round tells nothing
+			// about the window.
 			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-			while (pool.GetStats().active_connections < before.active_connections + 1 &&
-				   std::chrono::steady_clock::now() < deadline) {
+			bool observed = false;
+			while (std::chrono::steady_clock::now() < deadline) {
+				if (pool.GetStats().active_connections >= before.active_connections + 1) {
+					observed = true;
+					break;
+				}
 				std::this_thread::yield();
 			}
-			if (!txn.HasPinnedConnection()) {
-				overlapped_begin++;
+			if (observed) {
+				bool in_begin = !txn.HasPinnedConnection();
+				if (!in_begin) {
+					auto pinned = txn.GetPinnedConnection();
+					in_begin = pinned && pinned->GetState() == tds::ConnectionState::Executing;
+				}
+				if (in_begin) {
+					overlapped_begin++;
+				}
+			} else {
+				timed_out++;
+				std::cerr << "  round " << round
+						  << ": thread 0 had no pool connection after 5 s, followers released blind" << std::endl;
 			}
 			go_rest.store(true, std::memory_order_release);
 		}
@@ -253,10 +272,16 @@ int main() {
 	}
 	// The staggered rounds must have exercised the window at least once, or the
 	// guard was never tested against the defect it exists for.
-	std::cout << "  staggered rounds that overlapped the BEGIN: " << overlapped_begin << " of " << rounds / 2
-			  << std::endl;
+	std::cout << "  staggered rounds that overlapped the BEGIN: " << overlapped_begin << " of " << rounds / 2 << " ("
+			  << timed_out << " timed out waiting for thread 0)" << std::endl;
 	if (overlapped_begin == 0) {
-		std::cerr << "FAIL: no staggered round released its followers while the BEGIN was in flight" << std::endl;
+		std::cerr << "FAIL: no staggered round released its followers while the BEGIN was in flight. Either the "
+					 "followers never met the window on this runner ("
+				  << timed_out << " of " << rounds / 2
+				  << " rounds timed out waiting for thread 0's connection), or the provider publishes the pin before "
+					 "BEGIN — the regressed ordering, which the double-acquire and state checks above name when it "
+					 "hands a connection out mid-BEGIN."
+				  << std::endl;
 		return 1;
 	}
 	std::cout << "PASS: every caller got the one pinned connection, begun and idle, and nothing leaked" << std::endl;
