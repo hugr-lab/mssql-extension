@@ -29,6 +29,11 @@ on:
       - 'src/catalog/mssql_transaction.cpp'
       - 'src/include/catalog/mssql_transaction.hpp'
       - '.github/workflows/concurrency-tests.yml'
+      # Issue #369: the rowid copy lives in the scan, and its assertion only
+      # fires under this job's debug build.
+      - 'src/table_scan/**'
+      - 'src/include/table_scan/**'
+      - 'test/sql/rowid/**'
   workflow_dispatch:
 
 concurrency:
@@ -224,14 +229,13 @@ jobs:
       - name: Run transaction-pin contention test (issue #356)
         run: make test-transaction-pin
 
-      # The rowid suite under the DEBUG build (issue #369): the scan's copy
-      # of a projected key column into the rowid slot asserted on the logical
-      # type — MSSQL_VARCHAR(n) against VARCHAR — and a release build never
-      # says so. Eight small files against the server that is already up.
-      - name: Run the rowid suite against the debug build (issue #369)
-        run: |
-          MSSQL_TESTDB_DSN="Server=localhost,1433;Database=TestDB;User Id=sa;Password=${MSSQL_TEST_PASS:-TestPassword1};TrustServerCertificate=yes" \
-            build/debug/test/unittest "test/sql/rowid/*"
+      # The self-contained rowid files under the DEBUG build (issue #369): the
+      # scan's copy of a projected key column into the rowid slot asserted on
+      # the logical type — MSSQL_VARCHAR(n) against VARCHAR — and a release
+      # build never says so. Only the files that CREATE their own tables: this
+      # job's TestDB is created empty, never seeded by docker/init/init.sql.
+      - name: Run the self-contained rowid tests against the debug build (issue #369)
+        run: make test-rowid-debug
 
       - name: Dump SQL Server logs on failure
         if: failure()
