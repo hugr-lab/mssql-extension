@@ -633,7 +633,6 @@ static unique_ptr<LocalTableFunctionState> TableScanInitLocal(ExecutionContext &
 // Execute Function
 //------------------------------------------------------------------------------
 
-// Helper function to populate rowid vector from PK columns
 // A projected key column copied into the rowid slot — a STRUCT child, or the
 // scalar rowid itself. The two vectors share a physical type and can differ
 // in LOGICAL type: the projected column is reported as MSSQL_VARCHAR(n) /
@@ -654,6 +653,7 @@ static void CopyKeyColumn(Vector &src, Vector &dst, idx_t row_count) {
 	VectorOperations::Copy(view, dst, row_count, 0, 0);
 }
 
+// Helper function to populate rowid vector from PK columns
 static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, idx_t row_count) {
 	if (!state.rowid_requested || row_count == 0) {
 		return;
