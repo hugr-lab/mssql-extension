@@ -82,7 +82,8 @@ int main() {
 		CHECK(r.rejections.size() == 1, "the PK is reported");
 		CHECK(r.rejections[0].is_primary_key, "…as the primary key");
 		CHECK(Contains(r.rejections[0].reason, "#358"), "…pointing at #358");
-		CHECK(Contains(DescribeRejections(r), "primary key 'PK_dt' was rejected because"), "describe names it");
+		CHECK(Contains(DescribeRejections(r.rejections), "primary key 'PK_dt' was rejected because"),
+			  "describe names it");
 	}
 	{
 		auto pk = Idx(1, "PK_v", {Col("v", "sql_variant", 8016, false, false, true)}, true);
@@ -194,7 +195,7 @@ int main() {
 	{
 		auto r = ChooseRowIdKey({});
 		CHECK(!r.Found() && r.rejections.empty(), "no candidates: not found, nothing to report");
-		CHECK(DescribeRejections(r).empty(), "…and nothing to describe");
+		CHECK(DescribeRejections(r.rejections).empty(), "…and nothing to describe");
 	}
 
 	// --- the rejection list is complete even when something was chosen

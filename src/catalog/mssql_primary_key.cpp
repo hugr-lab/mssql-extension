@@ -293,13 +293,6 @@ string PKColumnInfo::KeyComparand(const string &values_column) const {
 	return "CAST(" + values_column + " COLLATE " + collation_name + " AS " + key_compare_type + ")";
 }
 
-// DescribeRejections works on a RowIdKeyChoice; this struct keeps only the list.
-static RowIdKeyChoice ChoiceWith(const vector<RowIdKeyRejection> &rejections) {
-	RowIdKeyChoice c;
-	c.rejections = rejections;
-	return c;
-}
-
 string RowIdKeyInfo::RowIdRefusal(const string &schema_name, const string &table_name, const string &verb,
 								  const string &catalog_name) const {
 	// Two different mistakes get two different first sentences: a key that
@@ -331,11 +324,10 @@ string RowIdKeyInfo::RowIdRefusal(const string &schema_name, const string &table
 			   invalidate_hint;
 	} else if (only_unmatchable) {
 		msg += "Table '" + schema_name + "." + table_name +
-			   "' has a key, but rowid cannot address a row through it: " + DescribeRejections(ChoiceWith(rejections)) +
+			   "' has a key, but rowid cannot address a row through it: " + DescribeRejections(rejections) +
 			   ". Until the linked issue lands, add a UNIQUE index on NOT NULL columns of another type.";
 	} else {
-		msg += "Table '" + schema_name + "." + table_name +
-			   "' has no usable one: " + DescribeRejections(ChoiceWith(rejections)) +
+		msg += "Table '" + schema_name + "." + table_name + "' has no usable one: " + DescribeRejections(rejections) +
 			   ". Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a filter." + invalidate_hint;
 	}
 	return msg;

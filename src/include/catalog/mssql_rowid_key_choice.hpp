@@ -70,7 +70,6 @@ struct RowIdKeyRejection {
 
 struct RowIdKeyChoice {
 	RowIdKeySource source = RowIdKeySource::NONE;
-	int32_t index_id = 0;
 	std::string index_name;
 	std::vector<RowIdKeyColumn> columns;
 	std::vector<RowIdKeyRejection> rejections;	// every candidate that was not usable, and why
@@ -220,7 +219,6 @@ inline RowIdKeyChoice ChooseRowIdKey(const std::vector<RowIdKeyCandidate> &candi
 	const RowIdKeyCandidate *best = usable_pk ? usable_pk : best_unique;
 	if (best) {
 		choice.source = best->is_primary_key ? RowIdKeySource::PRIMARY_KEY : RowIdKeySource::UNIQUE_INDEX;
-		choice.index_id = best->index_id;
 		choice.index_name = best->index_name;
 		choice.columns = best->columns;
 	}
@@ -228,9 +226,9 @@ inline RowIdKeyChoice ChooseRowIdKey(const std::vector<RowIdKeyCandidate> &candi
 }
 
 //! One sentence per rejected candidate, for the W5b refusal.
-inline std::string DescribeRejections(const RowIdKeyChoice &choice) {
+inline std::string DescribeRejections(const std::vector<RowIdKeyRejection> &rejections) {
 	std::string out;
-	for (const auto &r : choice.rejections) {
+	for (const auto &r : rejections) {
 		if (!out.empty()) {
 			out += "; ";
 		}
