@@ -18,6 +18,8 @@ MSSQLColumnInfo::MSSQLColumnInfo()
 	  is_case_sensitive(false),
 	  is_unicode(false),
 	  is_utf8(false),
+	  code_page(0),
+	  database_code_page(0),
 	  is_cast_required(false),
 	  is_geometry(false),
 	  is_identity(false) {}

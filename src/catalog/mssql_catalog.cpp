@@ -47,8 +47,13 @@ namespace duckdb {
 // SQL Query for Database Collation
 //===----------------------------------------------------------------------===//
 
+// The database's collation and, since issue #361, the code page it stores
+// varchar in: a varchar PARAMETER of an sp_executesql batch takes this page,
+// so the filter encoder needs it to decide varchar against nvarchar.
 static const char *DATABASE_COLLATION_SQL =
-	"SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)) AS db_collation";
+	"SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)) AS db_collation, "
+	"CAST(COLLATIONPROPERTY(CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)), 'CodePage') AS INT) "
+	"AS code_page";
 
 //===----------------------------------------------------------------------===//
 // Constructor / Destructor
@@ -358,15 +363,30 @@ void MSSQLCatalog::QueryDatabaseCollation() {
 	}
 
 	try {
-		// Use MSSQLSimpleQuery for clean query execution
-		std::string collation = MSSQLSimpleQuery::ExecuteScalar(*connection, DATABASE_COLLATION_SQL);
+		std::string collation;
+		int32_t code_page = 0;
+		MSSQLSimpleQuery::ExecuteWithCallback(*connection, DATABASE_COLLATION_SQL,
+											  [&](const std::vector<std::string> &values) {
+												  if (!values.empty()) {
+													  collation = values[0];
+												  }
+												  if (values.size() > 1 && !values[1].empty()) {
+													  try {
+														  code_page = std::stoi(values[1]);
+													  } catch (...) {
+														  code_page = 0;
+													  }
+												  }
+												  return true;	// one row; keep the stream drained
+											  });
 
 		if (!collation.empty()) {
 			database_collation_ = collation;
+			database_code_page_ = code_page;
 
 			// Update metadata cache with collation
 			if (metadata_cache_) {
-				metadata_cache_->SetDatabaseCollation(database_collation_);
+				metadata_cache_->SetDatabaseCollation(database_collation_, database_code_page_);
 			}
 		}
 	} catch (...) {
@@ -1359,7 +1379,7 @@ void MSSQLCatalog::EnsureCacheLoaded(ClientContext &context) {
 	metadata_cache_->SetTTL(cache_ttl);
 	metadata_cache_->SetMetadataTimeout(LoadMetadataTimeout(context));
 	metadata_cache_->SetTestFailAfterRows(LoadTestFailMetadataAfterRows(context));
-	metadata_cache_->SetDatabaseCollation(database_collation_);
+	metadata_cache_->SetDatabaseCollation(database_collation_, database_code_page_);
 
 	// Note: No eager Refresh() call - lazy loading handles this
 	// Each cache level (schemas, tables, columns) loads independently on first access
