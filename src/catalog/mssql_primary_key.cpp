@@ -273,7 +273,8 @@ static RowIdKeyChoice ChoiceWith(const vector<RowIdKeyRejection> &rejections) {
 	return c;
 }
 
-string RowIdKeyInfo::RowIdRefusal(const string &schema_name, const string &table_name, const string &verb) const {
+string RowIdKeyInfo::RowIdRefusal(const string &schema_name, const string &table_name, const string &verb,
+								  const string &catalog_name) const {
 	// Two different mistakes get two different first sentences: a key that
 	// exists but cannot address a row would send the user to add an index they
 	// already have, so it is named as what it is.
@@ -286,7 +287,10 @@ string RowIdKeyInfo::RowIdRefusal(const string &schema_name, const string &table
 	string msg = "MSSQL: " + verb + " requires a table with a primary key or a usable unique index. ";
 	if (!discovery_error.empty()) {
 		msg += "The indexes of '" + schema_name + "." + table_name +
-			   "' could not be read, so whether it has one is unknown: " + discovery_error;
+			   "' could not be read, so whether it has one is unknown: " + discovery_error +
+			   ". The lookup is not retried on its own: mssql_invalidate_cache('" +
+			   (catalog_name.empty() ? string("<catalog>") : catalog_name) + "', '" + schema_name + "', '" +
+			   table_name + "') drops the cached answer so the next statement reads the indexes again.";
 	} else if (rejections.empty()) {
 		msg += "Table '" + schema_name + "." + table_name +
 			   "' has neither. Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a filter.";

@@ -260,8 +260,8 @@ void MSSQLTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, Log
 	EnsurePKLoaded(context);
 
 	if (!pk_info_.exists) {
-		throw BinderException(
-			pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(), "UPDATE/DELETE"));
+		throw BinderException(pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(),
+													"UPDATE/DELETE", catalog.GetName().GetIdentifierName()));
 	}
 
 	MSSQL_TE_DEBUG("BindUpdateConstraints: PK loaded, %zu columns, type=%s", pk_info_.columns.size(),
@@ -355,13 +355,15 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 		pk_info_.discovery_error = e.what();
 	}
 
-	// A discovery FAILURE is not cached (#350 review): the caller's statement
-	// is refused with the error it just met, but pk_loaded_ stays false so the
-	// next bind runs the lookup again — a pool hiccup must not turn into a
-	// refusal that outlives it until someone invalidates the cache.
-	if (!pk_info_.discovery_error.empty()) {
-		return;
-	}
+	// A discovery FAILURE is cached like a result, on purpose (#350 review,
+	// twice over): every reader of pk_info_ after this point is lock-free and
+	// relies on nothing writing pk_info_ again once pk_loaded_ is published —
+	// the spec 052 contract. Leaving pk_loaded_ false on failure so the next
+	// bind retried let a second thread move-assign pk_info_ under a reader's
+	// feet (the use-after-free that contract exists to prevent), and made
+	// every plain SELECT repeat the round trip — or block in Acquire — for as
+	// long as the failure lasted. So the failure is published, the refusal
+	// names it, and names mssql_invalidate_cache() as the way to retry.
 	// Release-store publishes pk_info_ to any reader doing acquire-load.
 	// MUST be the last write to MSSQLTableEntry state in this function.
 	pk_loaded_.store(true, std::memory_order_release);
@@ -378,8 +380,8 @@ LogicalType MSSQLTableEntry::GetRowIdType(ClientContext &context) {
 
 	// Check if table has a usable key
 	if (!pk_info_.exists) {
-		throw BinderException(
-			pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(), "rowid"));
+		throw BinderException(pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(), "rowid",
+													catalog.GetName().GetIdentifierName()));
 	}
 
 	return pk_info_.rowid_type;
@@ -459,8 +461,8 @@ vector<column_t> MSSQLTableEntry::GetRowIdColumns() const {
 	}
 
 	if (!pk_loaded_.load(std::memory_order_acquire) || !pk_info_.exists) {
-		throw BinderException(
-			pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(), "UPDATE/DELETE"));
+		throw BinderException(pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(),
+													"UPDATE/DELETE", catalog.GetName().GetIdentifierName()));
 	}
 
 	return TableCatalogEntry::GetRowIdColumns();

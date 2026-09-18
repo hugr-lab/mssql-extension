@@ -1,0 +1,113 @@
+# name: test/sql/rowid/rowid_discovery_failure_cached.test
+# description: A failed rowid-key discovery is cached like a result, the refusal names mssql_invalidate_cache() as the retry (spec 077 W5b, review of #350)
+# group: [rowid]
+#
+# The readers of a table's rowid key are lock-free once it is published, so a
+# failed discovery must be published too — retrying on the next bind would let
+# a second thread rewrite the key under a reader (the spec 052 contract) and
+# make every scan bind repeat the round trip while the failure lasts. The
+# refusal therefore names the error it met and mssql_invalidate_cache() as the
+# way to look again.
+#
+# The failure is real, not injected: the pool holds ONE connection (the limit
+# is fixed at ATTACH), a transaction pins it through a scan of another table,
+# and the discovery for this table — which takes a POOL connection — times out
+# after mssql_acquire_timeout. The table's columns are loaded beforehand
+# through duckdb_columns(), which does not touch the rowid key, so the
+# discovery is the first thing inside the transaction that needs the pool.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+SET mssql_acquire_timeout = 1;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS lim (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('lim', 'DROP TABLE IF EXISTS dbo.DiscoveryFail, dbo.DiscoveryPin');
+
+statement ok
+SELECT mssql_exec('lim', 'CREATE TABLE dbo.DiscoveryFail (id INT PRIMARY KEY, n INT NOT NULL)');
+
+statement ok
+SELECT mssql_exec('lim', 'CREATE TABLE dbo.DiscoveryPin (id INT PRIMARY KEY)');
+
+statement ok
+SELECT mssql_exec('lim', 'INSERT INTO dbo.DiscoveryFail VALUES (1, 0), (2, 0)');
+
+# Columns loaded, rowid key not.
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'lim' AND table_name = 'DiscoveryFail';
+----
+2
+
+statement ok
+BEGIN;
+
+# Pins the one connection.
+query I
+SELECT count(*) FROM lim.dbo.DiscoveryPin;
+----
+0
+
+# The discovery cannot get a connection: refused with the reason and the way out.
+statement error
+UPDATE lim.dbo.DiscoveryFail SET n = 1 WHERE n = 0;
+----
+could not be read, so whether it has one is unknown: no connection could be acquired from the pool. The lookup is not retried on its own: mssql_invalidate_cache('lim', 'dbo', 'DiscoveryFail')
+
+statement ok
+ROLLBACK;
+
+# The pool is free again, but the failure is cached: the same refusal, no round trip.
+statement error
+UPDATE lim.dbo.DiscoveryFail SET n = 1 WHERE n = 0;
+----
+mssql_invalidate_cache('lim', 'dbo', 'DiscoveryFail')
+
+# Invalidating the entry is the retry. Inside a transaction, because with a
+# pool of one an autocommit UPDATE cannot run at all — its scan and its
+# batches want a connection each — while a pinned one carries both, and the
+# bind discovers the key before the pin takes the slot.
+statement ok
+SELECT mssql_invalidate_cache('lim', 'dbo', 'DiscoveryFail');
+
+statement ok
+BEGIN;
+
+query I
+UPDATE lim.dbo.DiscoveryFail SET n = 1 WHERE n = 0;
+----
+2
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM lim.dbo.DiscoveryFail WHERE n = 1;
+----
+2
+
+statement ok
+SELECT mssql_exec('lim', 'DROP TABLE dbo.DiscoveryFail, dbo.DiscoveryPin');
+
+statement ok
+SET mssql_exec_invalidate_cache = false;
+
+statement ok
+DETACH lim;
+
+statement ok
+RESET mssql_connection_limit;
+
+statement ok
+RESET mssql_acquire_timeout;

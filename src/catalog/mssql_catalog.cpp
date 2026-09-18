@@ -853,7 +853,8 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
 	if (!pk_info.exists) {
 		throw NotImplementedException(pk_info.RowIdRefusal(table_entry.schema.name.GetIdentifierName(),
-														   table_entry.name.GetIdentifierName(), "DELETE"));
+														   table_entry.name.GetIdentifierName(), "DELETE",
+														   GetName().GetIdentifierName()));
 	}
 
 	// Build MSSQLDeleteTarget from table metadata
@@ -892,7 +893,8 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
 	if (!pk_info.exists) {
 		throw NotImplementedException(pk_info.RowIdRefusal(table_entry.schema.name.GetIdentifierName(),
-														   table_entry.name.GetIdentifierName(), "UPDATE"));
+														   table_entry.name.GetIdentifierName(), "UPDATE",
+														   GetName().GetIdentifierName()));
 	}
 
 	// Get MSSQL column info

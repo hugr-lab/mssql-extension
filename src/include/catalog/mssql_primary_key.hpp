@@ -106,7 +106,11 @@ struct RowIdKeyInfo {
 	//! The W5b refusal for a statement that needs rowid on this table: what
 	//! was looked for, what was found, why each candidate was rejected, and
 	//! what fixes it. `verb` is the statement kind, e.g. "UPDATE/DELETE".
-	string RowIdRefusal(const string &schema_name, const string &table_name, const string &verb) const;
+	//! `catalog_name` is only used by the discovery-error shape, which names
+	//! mssql_invalidate_cache(catalog, schema, table) as the way to retry: a
+	//! failed lookup is cached like a result (the readers are lock-free).
+	string RowIdRefusal(const string &schema_name, const string &table_name, const string &verb,
+						const string &catalog_name = "") const;
 
 private:
 	vector<RowIdKeyCandidate> candidates_;
