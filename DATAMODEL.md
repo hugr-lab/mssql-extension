@@ -559,6 +559,17 @@ version, and `collation_sort_id` holds the SortId byte.
   differ only as SortId 52 vs 106.
 - The installation default is `SQL_Latin1_General_CP1_CI_AS`, so a legacy code
   page is the majority case rather than an edge case.
+- **The code page itself comes from the server**, not from the wire bytes or
+  the collation name: the column metadata queries carry
+  `COLLATIONPROPERTY(c.collation_name, 'CodePage')` and the ATTACH-time
+  database-collation query carries the same for the database
+  (`MSSQLColumnInfo::code_page` / `database_code_page`, issue #361). The
+  invariant on the write side of a **filter parameter**: a `varchar` parameter
+  takes the database's page and the comparison converts it to the column's, so
+  a non-ASCII constant is declared `varchar` only when both pages hold every
+  character of it (`mssql::CodePageCanEncode`, tables for 874 and 1250–1258)
+  and `nvarchar` otherwise — the `varchar` form is what keeps an index seek on
+  a `SQL_` collation.
 
 ```mermaid
 classDiagram

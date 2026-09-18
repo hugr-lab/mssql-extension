@@ -257,7 +257,7 @@ public:
 	int GetMetadataTimeoutMs() const;
 
 	// Set database default collation
-	void SetDatabaseCollation(const string &collation);
+	void SetDatabaseCollation(const string &collation, int32_t code_page);
 
 	// Get database default collation.
 	// Returns by VALUE: a reference would outlive the internal lock and race
@@ -367,7 +367,8 @@ private:
 	const MSSQLCatalogFilter *filter_ = nullptr;		  // Set once at catalog init, before any concurrency
 	unordered_map<string, MSSQLSchemaMetadata> schemas_;  // Cached schemas
 	std::chrono::steady_clock::time_point last_refresh_;  // Last refresh timestamp (backward compat)
-	string database_collation_;							  // Database default collation
+	int32_t database_code_page_ = 0;  // COLLATIONPROPERTY(database collation, 'CodePage'), issue #361
+	string database_collation_;		  // Database default collation
 
 	// Atomics, NOT guarded by mutex_ (issue #178 D4): written by EnsureCacheLoaded
 	// on every catalog lookup while loaders concurrently read them mid-query

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include "catalog/mssql_code_page.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "codec/literal_format.hpp"
 #include "codec/string_codec.hpp"
@@ -265,14 +266,12 @@ std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalTy
 
 namespace {
 
-bool IsAscii(const std::string &text) {
-	for (unsigned char c : text) {
-		if (c >= 0x80) {
-			return false;
-		}
-	}
-	return true;
-}
+// Items ONE IN / NOT IN operator expression may carry to the server; a longer
+// list is evaluated by DuckDB (see EncodeOperatorExpression). The cap is per
+// predicate on purpose: with parameterisation on, the statement's budget is
+// SqlParamSet::MAX_PARAMS (constants past it become literals), and with it
+// off a batch of several capped lists is still bounded by their number.
+constexpr size_t MAX_PUSHED_IN_ITEMS = 256;
 
 // UTF-16 code units of a UTF-8 string: one per lead byte, two for a 4-byte
 // sequence (a surrogate pair). This is nvarchar's unit.
@@ -419,7 +418,16 @@ std::string FilterEncoder::DeclarationForColumn(const MSSQLColumnInfo &column, c
 		return DeclarationOfValueOrEmpty(value, type);
 	}
 	if (t == "text") {
-		return type.id() == LogicalTypeId::VARCHAR ? "varchar(max)" : DeclarationOfValueOrEmpty(value, type);
+		if (type.id() != LogicalTypeId::VARCHAR) {
+			return DeclarationOfValueOrEmpty(value, type);
+		}
+		// The same two-page rule as varchar below: a text column cannot carry a
+		// UTF-8 collation, so a constant the database's page cannot hold went
+		// as '?' in a varchar(max) parameter and `LIKE 'ы%'` matched '?…' rows.
+		const std::string &text = StringValue::Get(value);
+		const bool fits = mssql::CodePageCanEncode(column.code_page, text) &&
+						  mssql::CodePageCanEncode(column.database_code_page, text);
+		return fits ? "varchar(max)" : "nvarchar(max)";
 	}
 	if (t == "ntext") {
 		return type.id() == LogicalTypeId::VARCHAR ? "nvarchar(max)" : DeclarationOfValueOrEmpty(value, type);
@@ -430,12 +438,16 @@ std::string FilterEncoder::DeclarationForColumn(const MSSQLColumnInfo &column, c
 		}
 		const std::string &text = StringValue::Get(value);
 		// varchar keeps the column's kind -- that is what keeps an index on it
-		// seekable -- for an ASCII constant. A non-ASCII one goes as nvarchar
-		// whatever the column's collation, as the N'...' literal always did: a
-		// varchar VARIABLE takes the DATABASE's code page, not the column's, so
-		// `@p varchar(max) = N'ы...'` against a UTF-8 column arrives as '?'
-		// (annotated_max_string.test, #321, caught the UTF-8 exemption).
-		const bool unicode = column.is_unicode || !IsAscii(text);
+		// seekable: on a SQL_ collation an nvarchar parameter puts a
+		// CONVERT_IMPLICIT on the column and the seek becomes a scan (#361).
+		// A varchar VARIABLE takes the DATABASE's code page and the comparison
+		// converts it to the COLUMN's, so a non-ASCII constant may go as
+		// varchar only when both pages can hold every character of it;
+		// otherwise nvarchar, as the N'...' literal always did -- which is how
+		// `@p varchar(max) = N'ы...'` against a UTF-8 column on a 1252 database
+		// stopped arriving as '?' (annotated_max_string.test, #321).
+		const bool unicode = column.is_unicode || !(mssql::CodePageCanEncode(column.code_page, text) &&
+													mssql::CodePageCanEncode(column.database_code_page, text));
 		if (unicode) {
 			// max_length is bytes; nvarchar counts UTF-16 units.
 			size_t k = column.max_length < 0 ? 0 : static_cast<size_t>(column.max_length) / (column.is_unicode ? 2 : 1);
@@ -1147,6 +1159,66 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 			return {"", false};
 		}
 		return {"(" + child_result.sql + " IS NOT NULL)", true};
+	}
+
+	// IN arrives here as an operator expression whenever the filter combiner
+	// did not turn it into a table filter: always for NOT IN, which DuckDB
+	// binds as NOT over COMPARE_IN (the NOT case above wraps this one; there
+	// is no NotInFilter, issue #366), and for IN whose operand is not a bare
+	// column. COMPARE_NOT_IN is rendered too, should a plan ever carry it.
+	// Children: [0] the operand, [1..] the list. The list's constants are
+	// declared from the operand's column exactly as a comparison's constant is
+	// (spec 076), so a varchar list keeps the seek. A NULL in the list gives
+	// the same three-valued answer on both sides (no row for NOT IN), so
+	// nothing is special-cased. Without this case NOT IN was the one string
+	// predicate evaluated client-side, under DuckDB's equality, while <>,
+	// NOT LIKE and the ranges beside it were the server's (spec 079 D4).
+	if (expr.GetExpressionType() == ExpressionType::COMPARE_IN ||
+		expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) {
+		const auto &children = expr.GetChildren();
+		if (children.size() < 2) {
+			return {"", false};
+		}
+		// A long list stays client-side, as it always was (#367 review): every
+		// item is one sp_executesql parameter out of the statement's 2000, or
+		// one literal of an unbounded batch with parameterisation off, and a
+		// list of thousands is where the server answers 8623/8632 instead of
+		// rows. 256 covers the hand-written and the tool-generated lists;
+		// above it the whole predicate is refused and DuckDB evaluates it. The
+		// cap is per predicate: several lists in one WHERE each get it, and
+		// their total is bounded by SqlParamSet::MAX_PARAMS when parameterised
+		// (the sink turns the rest into literals) and by their count when not.
+		// A bare-column IN is a table filter (EncodeInFilter) and is not capped.
+		if (children.size() - 1 > MAX_PUSHED_IN_ITEMS) {
+			MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN list of %llu items exceeds %llu, left to DuckDB",
+								   (unsigned long long)(children.size() - 1), (unsigned long long)MAX_PUSHED_IN_ITEMS);
+			return {"", false};
+		}
+		auto operand_ctx = ctx.child();
+		auto operand_result = EncodeValueExpression(*children[0], operand_ctx);
+		if (!operand_result.supported) {
+			MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN operand encoding failed");
+			return {"", false};
+		}
+		auto item_ctx = ctx.child();
+		item_ctx.constant_peer = ColumnInfoOf(*children[0], ctx);
+		const bool negated = expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN;
+		std::string sql = "(" + operand_result.sql + (negated ? " NOT IN (" : " IN (");
+		for (idx_t i = 1; i < children.size(); i++) {
+			auto item_result = EncodeValueExpression(*children[i], item_ctx);
+			if (!item_result.supported) {
+				MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN list item %llu encoding failed",
+									   (unsigned long long)i);
+				return {"", false};
+			}
+			if (i > 1) {
+				sql += ", ";
+			}
+			sql += item_result.sql;
+		}
+		sql += "))";
+		MSSQL_FILTER_DEBUG_LOG(2, "EncodeOperatorExpression: encoded -> %s", sql.c_str());
+		return {sql, true};
 	}
 
 	// For other operators, we don't support them yet

@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "catalog/mssql_code_page.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hugeint.hpp"
@@ -374,10 +375,16 @@ static void TestModuloExactIntegersOnly() {
 
 namespace {
 
+// The fixture's database is SQL_Latin1_General_CP1_CI_AS, code page 1252; the
+// pages come from the server with the metadata (COLLATIONPROPERTY, #361), so
+// the test sets them the way the loaders do.
 MSSQLColumnInfo Col(const std::string &name, int32_t id, const std::string &sql_type, int16_t max_length,
-					uint8_t precision, uint8_t scale, const std::string &collation = "") {
-	return MSSQLColumnInfo(name, id, sql_type, max_length, precision, scale, true, collation,
-						   "SQL_Latin1_General_CP1_CI_AS");
+					uint8_t precision, uint8_t scale, const std::string &collation = "", int32_t code_page = 1252) {
+	MSSQLColumnInfo c(name, id, sql_type, max_length, precision, scale, true, collation,
+					  "SQL_Latin1_General_CP1_CI_AS");
+	c.code_page = code_page;
+	c.database_code_page = 1252;
+	return c;
 }
 
 }  // namespace
@@ -447,6 +454,97 @@ static void TestParameterSinkDeclaresFromColumn() {
 				"@p0 = @p0, @p1 = @p1, @p2 = @p2, @p3 = @p3");
 }
 
+//==============================================================================
+// Test: IN / NOT IN as operator expressions (#366, #367 review). The combiner
+// builds a table filter only for a bare-column IN; NOT IN — which DuckDB binds
+// as NOT over COMPARE_IN — and IN over an expression operand reach the
+// encoder as BoundOperatorExpressions and used to be refused. Pinned here
+// without a server: the SQL text, the declarations, the NULL item, the
+// all-or-nothing rule, and the length cap.
+//==============================================================================
+static unique_ptr<BoundOperatorExpression> InList(ExpressionType type, unique_ptr<Expression> operand,
+												  std::vector<Value> items) {
+	auto in = make_uniq<BoundOperatorExpression>(type, LogicalType::BOOLEAN);
+	in->GetChildrenMutable().push_back(std::move(operand));
+	for (auto &v : items) {
+		in->GetChildrenMutable().push_back(Const(std::move(v)));
+	}
+	return in;
+}
+
+static void TestInListOperatorExpressions() {
+	std::cout << "  TestInListOperatorExpressions..." << std::endl;
+	Fixture fx;
+	std::vector<MSSQLColumnInfo> cols = {Col("id", 1, "int", 4, 10, 0), Col("dt", 2, "datetime2", 8, 27, 7),
+										 Col("flag", 3, "bit", 1, 1, 0), Col("name", 4, "varchar", 20, 0, 0),
+										 Col("d", 5, "float", 8, 53, 0)};
+	SqlParamSet params;
+	auto ctx = fx.Context();
+	ctx.mssql_columns = &cols;
+	ctx.params = &params;
+
+	// NOT over COMPARE_IN — the shape DuckDB binds `v NOT IN (...)` to — with
+	// the list declared from the operand's column: varchar(20), not nvarchar.
+	auto not_in = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_NOT, LogicalType::BOOLEAN);
+	not_in->GetChildrenMutable().push_back(
+		InList(ExpressionType::COMPARE_IN, ColRef(fx, COL_NAME), {Value("ab"), Value("x")}));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*not_in, ctx), "(NOT ([name] IN (@p0, @p1)))");
+	ASSERT_TRUE(params.params.size() == 2);
+	ASSERT_TRUE(params.params[0].declaration == "varchar(20)");
+	ASSERT_TRUE(params.params[1].declaration == "varchar(20)");
+
+	// COMPARE_NOT_IN rendered directly, should a plan ever carry it.
+	auto direct = InList(ExpressionType::COMPARE_NOT_IN, ColRef(fx, COL_ID), {Value::INTEGER(1), Value::INTEGER(2)});
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*direct, ctx), "([id] NOT IN (@p2, @p3))");
+	ASSERT_TRUE(params.params[2].declaration == "int");
+
+	// An expression operand: no table filter exists for it, so this path is
+	// the only way it reaches the server; the list constants have no column
+	// peer and are declared from their own type.
+	auto plus = Call2("+", LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER, ColRef(fx, COL_ID),
+					  Const(Value::INTEGER(1)));
+	auto expr_in = InList(ExpressionType::COMPARE_IN, std::move(plus), {Value::INTEGER(2), Value::INTEGER(3)});
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*expr_in, ctx), "(([id] + @p4) IN (@p5, @p6))");
+
+	// A NULL item stays a literal NULL and registers no parameter.
+	const size_t before_null = params.params.size();
+	auto with_null =
+		InList(ExpressionType::COMPARE_IN, ColRef(fx, COL_NAME), {Value("ab"), Value(LogicalType::VARCHAR)});
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*with_null, ctx), "([name] IN (@p7, NULL))");
+	ASSERT_TRUE(params.params.size() == before_null + 1);
+
+	// An item the encoder cannot render refuses the WHOLE list — a partial
+	// list is never pushed — and leaves no parameter behind.
+	{
+		auto bad = InList(ExpressionType::COMPARE_IN, ColRef(fx, COL_ID), {Value::INTEGER(1)});
+		bad->GetChildrenMutable().push_back(
+			Call1("no_such_function", LogicalType::INTEGER, LogicalType::INTEGER, ColRef(fx, COL_ID)));
+		const size_t before = params.params.size();
+		ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(*bad, ctx));
+		ASSERT_TRUE(params.params.size() == before);
+	}
+
+	// The length cap: 256 items push, 257 stay client-side.
+	{
+		std::vector<Value> ok_items, long_items;
+		for (int i = 0; i < 256; i++) {
+			ok_items.push_back(Value::INTEGER(i));
+		}
+		long_items = ok_items;
+		long_items.push_back(Value::INTEGER(256));
+		SqlParamSet cap_params;
+		auto cap_ctx = fx.Context();
+		cap_ctx.mssql_columns = &cols;
+		cap_ctx.params = &cap_params;
+		auto ok = InList(ExpressionType::COMPARE_NOT_IN, ColRef(fx, COL_ID), ok_items);
+		ASSERT_TRUE(FilterEncoder::EncodeSearchCondition(*ok, cap_ctx).supported);
+		ASSERT_TRUE(cap_params.params.size() == 256);
+		auto too_long = InList(ExpressionType::COMPARE_NOT_IN, ColRef(fx, COL_ID), long_items);
+		ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(*too_long, cap_ctx));
+		ASSERT_TRUE(cap_params.params.size() == 256);
+	}
+}
+
 // The declaration table of spec 076 W1: the column's kind, never narrower
 // than the constant.
 static void TestDeclarationForColumn() {
@@ -463,12 +561,48 @@ static void TestDeclarationForColumn() {
 	ASSERT_TRUE(decl(Col("n", 1, "nvarchar", 20, 0, 0), Value("\xC3\xBC\xC3\xB1\xC3\xAF")) == "nvarchar(10)");
 	ASSERT_TRUE(decl(Col("n", 1, "nvarchar", 4, 0, 0), Value("\xF0\x9F\x98\x80\xF0\x9F\x98\x80\xF0\x9F\x98\x80")) ==
 				"nvarchar(6)");
-	// a non-ASCII constant goes as nvarchar whatever the column's collation, as
-	// the N'...' literal always did: a varchar variable takes the DATABASE's
-	// code page, so even a UTF-8 column would see '?' through a varchar one
-	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0), Value("\xC3\xBC")) == "nvarchar(20)");
-	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Latin1_General_100_BIN2_UTF8"), Value("\xC3\xBC")) ==
+	// #361: a non-ASCII constant goes as varchar when both the column's and the
+	// database's code page (the fixture's database is SQL_Latin1_General_CP1,
+	// i.e. 1252) can hold it -- that is what keeps the seek -- and as nvarchar
+	// otherwise. ü is in 1252: varchar. ы is not: nvarchar, on a 1252 column
+	// and on a UTF-8 column alike, because the varchar PARAMETER takes the
+	// database's page (#321's case) whatever the column can hold.
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0), Value("\xC3\xBC")) == "varchar(20)");
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Latin1_General_100_BIN2_UTF8", 65001), Value("\xC3\xBC")) ==
+				"varchar(20)");
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0), Value("\xD1\x8B")) == "nvarchar(20)");
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Latin1_General_100_BIN2_UTF8", 65001), Value("\xD1\x8B")) ==
 				"nvarchar(20)");
+	// the column's page matters too: ü against a Cyrillic column is nvarchar
+	// even though the 1252 database could carry the parameter
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Cyrillic_General_CI_AS", 1251), Value("\xC3\xBC")) ==
+				"nvarchar(20)");
+	// a Cyrillic constant on a Cyrillic column of a Cyrillic database: varchar
+	{
+		MSSQLColumnInfo cyr = Col("v", 1, "varchar", 20, 0, 0, "Cyrillic_General_CI_AS", 1251);
+		cyr.database_code_page = 1251;
+		ASSERT_TRUE(decl(cyr, Value("\xD1\x8B")) == "varchar(20)");
+	}
+	// a page the server could not name (NULL -> 0): nvarchar, the old form
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "", 0), Value("\xC3\xBC")) == "nvarchar(20)");
+	// text follows the same rule (#361 review): ы on a 1252 page is nvarchar(max)
+	ASSERT_TRUE(decl(Col("t", 1, "text", 16, 0, 0), Value("\xD1\x8B")) == "nvarchar(max)");
+	ASSERT_TRUE(decl(Col("t", 1, "text", 16, 0, 0), Value("\xC3\xBC")) == "varchar(max)");
+	// a double-byte or unknown page cannot be told: nvarchar
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Japanese_CI_AS", 932), Value("\xC3\xBC")) == "nvarchar(20)");
+	// the byte width is still the constant's UTF-8 size when it is the larger
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 2, 0, 0), Value("\xC3\xBC\xC3\xBC")) == "varchar(4)");
+	// the page tables
+	ASSERT_TRUE(mssql::CodePageCanEncode(1252, "\xE2\x82\xAC"));  // € is 0x80 in 1252
+	ASSERT_TRUE(mssql::CodePageCanEncode(1251, "\xE2\x82\xAC"));  // and 0x88 in 1251
+	ASSERT_TRUE(!mssql::CodePageCanEncode(1252, "\xC5\x91"));	  // ő: 1250 only
+	ASSERT_TRUE(mssql::CodePageCanEncode(1250, "\xC5\x91"));
+	ASSERT_TRUE(!mssql::CodePageCanEncode(1252, "\xF0\x9F\x98\x80"));  // above the BMP
+	ASSERT_TRUE(mssql::CodePageCanEncode(932, "ascii only"));
+	ASSERT_TRUE(mssql::CodePageCanEncode(0, "ascii only"));
+	ASSERT_TRUE(!mssql::CodePageCanEncode(850, "\xC3\xBC"));  // an OEM page: no table
+	ASSERT_TRUE(!mssql::CodePageCanEncode(932, "\xC3\xBC"));
+	ASSERT_TRUE(mssql::CodePageCanEncode(65001, "\xF0\x9F\x98\x80"));
 	ASSERT_TRUE(decl(Col("t", 1, "text", 16, 0, 0), Value("x")) == "varchar(max)");
 	// integers: the wider of column and constant
 	ASSERT_TRUE(decl(Col("i", 1, "int", 4, 10, 0), Value::INTEGER(1)) == "int");
@@ -528,8 +662,7 @@ static void TestDeclarationForColumn() {
 	// the cast (error 529) — so the constant is now a parameter declared from
 	// the column, `varbinary(8)`, and the branch in DeclarationForColumn that
 	// has always named `timestamp`/`rowversion` is finally reachable.
-	ASSERT_TRUE(decl(Col("rv", 1, "timestamp", 8, 0, 0), Value::BLOB_RAW(std::string("\x01", 1))) ==
-				"varbinary(8)");
+	ASSERT_TRUE(decl(Col("rv", 1, "timestamp", 8, 0, 0), Value::BLOB_RAW(std::string("\x01", 1))) == "varbinary(8)");
 	// no parameter form: stays a literal
 	ASSERT_TRUE(decl(Col("x", 1, "xml", -1, 0, 0), Value("<a/>")).empty());
 	ASSERT_TRUE(decl(Col("g", 1, "geography", -1, 0, 0), Value("x")).empty());
@@ -548,6 +681,7 @@ int main() {
 	TestSearchConditionRefusedInValuePosition();
 	TestModuloExactIntegersOnly();
 	TestParameterSinkDeclaresFromColumn();
+	TestInListOperatorExpressions();
 	TestDeclarationForColumn();
 
 	std::cout << "All FilterEncoder tests PASSED!" << std::endl;

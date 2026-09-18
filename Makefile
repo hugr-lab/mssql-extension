@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test test-cpp test-cpp-run vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-rowid-key-choice test-identity-insert test-load-policy counters-test help
+.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy counters-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -1032,6 +1032,55 @@ else
 SANITIZER_PRELOAD :=
 endif
 SPEC047_TEST_RPATH := $(SANITIZER_PRELOAD) DYLD_LIBRARY_PATH=build/debug/src LD_LIBRARY_PATH=build/debug/src
+
+# Issue #356: ConnectionProvider::GetConnection under contention — the logical
+# regression guard for the pinned-connection race. Links the extension's static
+# library so the test calls the provider directly (eight callers released from a
+# barrier into one transaction's lazy pin) instead of hoping DuckDB schedules a
+# source and a sink at the right moment. PIN_TEST_BUILD=release is the local
+# choice on macOS, where a debug (ASan) build deadlocks at process start; CI
+# runs it against the debug tree the concurrency job already builds, linked with
+# the sanitizer runtime so the instrumented archive resolves.
+PIN_TEST_BUILD ?= debug
+# Recursively expanded (`=`, not `:=`) on purpose: the triplet is read off
+# build/<type>/vcpkg_installed with `ls`, and that directory exists only after
+# the `$(PIN_TEST_BUILD)` prerequisite has built the tree. A `:=` ran the `ls`
+# when make parsed this file — on a fresh clone or after `make clean` it came
+# back empty, the tree was built, and the link then looked for
+# `…/vcpkg_installed//debug/lib/libssl.a`; the next run succeeded, so it
+# looked random (#359 review). With `=` the `ls` runs when the recipe expands.
+PIN_TEST_VCPKG = build/$(PIN_TEST_BUILD)/vcpkg_installed
+# The triplet directory, NOT the `vcpkg` bookkeeping directory vcpkg creates
+# beside it: on Linux `vcpkg` sorts before `x64-linux`, so a bare `ls | head`
+# picks it and the link fails with "cannot find …/vcpkg/debug/lib/libssl.a".
+# (On macOS `arm64-osx` happens to sort first, which is why it worked there.)
+PIN_TEST_TRIPLET = $(shell ls $(PIN_TEST_VCPKG) 2>/dev/null | grep -v '^vcpkg$$' | head -n 1)
+ifeq ($(PIN_TEST_BUILD),debug)
+PIN_TEST_VCPKG_LIB = $(PIN_TEST_VCPKG)/$(PIN_TEST_TRIPLET)/debug/lib
+else
+PIN_TEST_VCPKG_LIB = $(PIN_TEST_VCPKG)/$(PIN_TEST_TRIPLET)/lib
+endif
+PIN_TEST_LIBS = build/$(PIN_TEST_BUILD)/extension/mssql/libmssql_extension.a \
+    $(PIN_TEST_VCPKG_LIB)/libssl.a $(PIN_TEST_VCPKG_LIB)/libcrypto.a $(PIN_TEST_VCPKG_LIB)/libsimdutf.a \
+    -L build/$(PIN_TEST_BUILD)/src -lduckdb -ldl -pthread
+ifeq ($(shell uname -s),Darwin)
+PIN_TEST_LIBS += -framework GSS -framework Security -framework CoreFoundation \
+    -Wl,-rpath,$(CURDIR)/build/$(PIN_TEST_BUILD)/src
+else ifeq ($(PIN_TEST_BUILD),debug)
+PIN_TEST_LIBS += -fsanitize=address -fsanitize=undefined
+endif
+PIN_TEST_RPATH := DYLD_LIBRARY_PATH=build/$(PIN_TEST_BUILD)/src LD_LIBRARY_PATH=build/$(PIN_TEST_BUILD)/src
+
+test-transaction-pin: $(PIN_TEST_BUILD)
+	@echo "Building issue #356 transaction-pin contention test..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) -I src/include $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_transaction_pin.cpp \
+	    $(PIN_TEST_LIBS) \
+	    -o build/test/test_transaction_pin
+	@echo ""
+	@echo "Running issue #356 transaction-pin contention test..."
+	$(PIN_TEST_RPATH) build/test/test_transaction_pin
 
 test-multi-instance-pool-isolation: debug
 	@echo "Building spec 047 multi-instance pool isolation test (T023)..."

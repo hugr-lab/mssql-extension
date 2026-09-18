@@ -86,6 +86,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   more than a primary-key-only query without the joins would cost. Tens of
   microseconds either way, inside a batch that already pays a round trip.
 
+- **`NOT IN` on a string column reaches the server**
+  ([#366](https://github.com/hugr-lab/mssql-extension/issues/366)). DuckDB
+  binds `v NOT IN (...)` as `NOT (v IN (...))`, and the filter encoder had no
+  case for `IN` as an operator expression (only for the table filter the
+  combiner builds from a bare-column `IN`), so `NOT IN` — and `IN` over an
+  expression such as `n + 1 IN (2, 3)` — ran client-side after a full
+  transfer, and under DuckDB's byte equality: on a `_CI` collation
+  `v NOT IN ('ab', 'x')` kept `ab␣` and `AB` where `v <> 'ab'` beside it did
+  not. Both now render as `[v] [NOT] IN (@p1, @p2)` with the list declared
+  from the operand's column (spec 076), the server's answer like every other
+  string predicate (spec 079 D4), and a seek where the column is indexed.
+  `NOT IN` lists, and `IN` over an expression, longer than 256 items stay
+  client-side, as they did before this change (each item is one of the
+  statement's 2000 parameters; the cap is per predicate); a bare-column `IN`
+  is a table filter and is not capped, as it never was.
+- **A non-ASCII constant no longer costs the index seek on a `SQL_` collation**
+  ([#361](https://github.com/hugr-lab/mssql-extension/issues/361)). Spec 076
+  declared any non-ASCII constant of a pushed filter as an `nvarchar`
+  parameter whatever the column's collation — right for a UTF-8 column on a
+  Latin-1 database (#321: a `varchar` parameter takes the *database's* code
+  page), and an Index Scan with `CONVERT_IMPLICIT` on the column for the
+  installation default, `SQL_Latin1_General_CP1_CI_AS`, where `'ñu'`,
+  `'Müller'`, `'café'` read the whole index (Windows collations seek through
+  the convert and were unaffected). The declaration is now `varchar` when every
+  character of the constant is representable in **both** the column's and the
+  database's code page, and `nvarchar` otherwise, exactly as before. The pages
+  are the server's own answer — `COLLATIONPROPERTY(collation, 'CodePage')` now
+  rides with the column metadata and the database collation — and
+  representability is answered from tables for the single-byte pages 874 and
+  1250–1258; a double-byte or unknown page keeps the safe form. `text` columns
+  follow the same rule (their `varchar(max)` parameter turned `'ы%'` into
+  `'?%'` and `LIKE` matched rows it should not). **One visible consequence on
+  a `SQL_` collation:** the comparison now runs under the collation's own
+  (non-Unicode) sort rules instead of the Windows Unicode rules an `nvarchar`
+  parameter forced — `'ß' = 'ss'` was true and is now false on
+  `SQL_Latin1_General_CP1_CI_AS`, which is what a T-SQL `varchar` literal
+  answers there.
 - **`COPY` no longer drops a CLR UDT column of an existing target in silence**
   ([#353](https://github.com/hugr-lab/mssql-extension/issues/353)). The
   target-metadata query joined `sys.types` on `system_type_id`, which no

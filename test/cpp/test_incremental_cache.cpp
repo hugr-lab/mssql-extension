@@ -260,7 +260,7 @@ void test_database_collation() {
 	ASSERT_TRUE(cache.GetDatabaseCollation().empty());
 
 	// Set collation
-	cache.SetDatabaseCollation("Latin1_General_CI_AS");
+	cache.SetDatabaseCollation("Latin1_General_CI_AS", 1252);
 	ASSERT_EQ(cache.GetDatabaseCollation(), "Latin1_General_CI_AS");
 
 	std::cout << "PASSED!" << std::endl;

@@ -1,0 +1,108 @@
+# name: test/sql/catalog/not_in_pushdown.test
+# description: NOT IN (and IN over an expression operand) reach the server (issue #366)
+# group: [sql]
+#
+# Until #366 the encoder had no COMPARE_NOT_IN case, so `v NOT IN (...)` was
+# the one string predicate evaluated client-side under DuckDB's byte equality
+# while `=`, `<>`, `NOT LIKE` and the ranges beside it were the server's
+# (spec 079 D4: sets are the server's). The rows below are chosen so the two
+# answers differ: under the CI collation the server calls `ab`, `ab␣` and `AB`
+# one value, DuckDB calls them three.
+#
+# REQUIRES: SQL Server running on localhost:1433 with TestDB initialized
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ni (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('ni', 'DROP TABLE IF EXISTS dbo.NotInPushdown');
+
+statement ok
+SELECT mssql_exec('ni', 'CREATE TABLE dbo.NotInPushdown (id INT PRIMARY KEY, v VARCHAR(10) COLLATE SQL_Latin1_General_CP1_CI_AS, n INT)');
+
+statement ok
+SELECT mssql_exec('ni', 'INSERT INTO dbo.NotInPushdown VALUES (1, ''ab'', 1), (2, ''ab '', 2), (3, ''AB'', 3), (4, ''abc'', 4), (5, ''x'', NULL)');
+
+# The server's answer: ab, ab␣ and AB are all equal to 'ab' under the CI
+# collation, so only abc survives. DuckDB's byte equality would keep 2, 3, 4.
+query I
+SELECT id FROM ni.dbo.NotInPushdown WHERE v NOT IN ('ab', 'x') ORDER BY id;
+----
+4
+
+# IN and NOT IN partition the table — only true when both are the server's.
+query I
+SELECT id FROM ni.dbo.NotInPushdown WHERE v IN ('ab') ORDER BY id;
+----
+1
+2
+3
+
+query I
+SELECT id FROM ni.dbo.NotInPushdown WHERE v NOT IN ('ab') ORDER BY id;
+----
+4
+5
+
+# A NULL in the list: three-valued logic on both sides, no row qualifies.
+query I
+SELECT id FROM ni.dbo.NotInPushdown WHERE v NOT IN ('ab', NULL) ORDER BY id;
+----
+
+# Integer list; the NULL n of row 5 is excluded on both sides.
+query I
+SELECT id FROM ni.dbo.NotInPushdown WHERE n NOT IN (1, 2) ORDER BY id;
+----
+3
+4
+
+# An expression operand takes the same operator path (no table filter is
+# built for it), for IN as well as NOT IN.
+query I
+SELECT id FROM ni.dbo.NotInPushdown WHERE n + 1 IN (2, 3) ORDER BY id;
+----
+1
+2
+
+query I
+SELECT id FROM ni.dbo.NotInPushdown WHERE n + 1 NOT IN (2, 3) ORDER BY id;
+----
+3
+4
+
+# rowid resolves to the scalar primary key on this path (id here), so a
+# rowid list is pushed as a key list.
+query I
+SELECT id FROM ni.dbo.NotInPushdown WHERE rowid NOT IN (1, 2) ORDER BY id;
+----
+3
+4
+5
+
+# Literal path (spec 076 off): the same answers.
+statement ok
+SET mssql_scan_parameterize_filters = false;
+
+query I
+SELECT id FROM ni.dbo.NotInPushdown WHERE v NOT IN ('ab', 'x') ORDER BY id;
+----
+4
+
+query I
+SELECT id FROM ni.dbo.NotInPushdown WHERE n + 1 NOT IN (2, 3) ORDER BY id;
+----
+3
+4
+
+statement ok
+SET mssql_scan_parameterize_filters = true;
+
+statement ok
+SELECT mssql_exec('ni', 'DROP TABLE dbo.NotInPushdown');
