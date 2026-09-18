@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A debug build no longer asserts on `SELECT k, rowid` over a string key
+  column** ([#369](https://github.com/hugr-lab/mssql-extension/issues/369)).
+  With `mssql_catalog_native_types` on (the default) the projected column is
+  `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` while the rowid — the scalar one and
+  every child of a composite key's STRUCT — is typed from the column's plain
+  type; copying the projected vector into the rowid slot was a typed copy
+  across the two, which a debug build refuses (`source_p.GetType() ==
+  target.GetType()`) and a release build performed on the same bytes. The
+  copy now goes through a reinterpreting view of the source in the rowid's
+  type. The rowid suite runs against the debug build in CI from here on, so
+  the class stays caught.
 - **An `UPDATE`/`DELETE` through a `varchar` key under a `SQL_` collation no
   longer changes rows it was not given.** Every rowid value is sent as an
   `N'…'` literal, so the key join compared a `char`/`varchar` key column under

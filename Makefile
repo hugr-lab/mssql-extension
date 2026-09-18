@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy counters-test help
+.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy counters-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -1081,6 +1081,23 @@ test-transaction-pin: $(PIN_TEST_BUILD)
 	@echo ""
 	@echo "Running issue #356 transaction-pin contention test..."
 	$(PIN_TEST_RPATH) build/test/test_transaction_pin
+
+# Issue #369: the rowid files that create their own tables, run through the
+# sqllogictest driver of the DEBUG tree — the one build in which the scan's
+# typed copy of a projected key column into the rowid slot asserts
+# (MSSQL_VARCHAR(n) against VARCHAR); a release build copies the same bytes
+# and says nothing. Explicit files, not the directory: the concurrency job's
+# TestDB is created empty, and the other rowid files read init.sql's tables.
+# MSSQL_TESTDB_DSN is the exported one above, as for every other target.
+ROWID_DEBUG_TESTS := test/sql/rowid/rowid_native_types.test test/sql/rowid/rowid_unique_index.test \
+    test/sql/rowid/rowid_key_types.test test/sql/rowid/rowid_discovery_failure_cached.test
+
+test-rowid-debug: debug
+	@echo "Running the self-contained rowid tests against the debug build (issue #369)..."
+	@for t in $(ROWID_DEBUG_TESTS); do \
+	    echo "  $$t"; \
+	    build/debug/test/unittest "$$t" || exit 1; \
+	done
 
 test-multi-instance-pool-isolation: debug
 	@echo "Building spec 047 multi-instance pool isolation test (T023)..."
