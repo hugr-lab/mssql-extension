@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "catalog/mssql_code_page.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hugeint.hpp"
@@ -374,10 +375,16 @@ static void TestModuloExactIntegersOnly() {
 
 namespace {
 
+// The fixture's database is SQL_Latin1_General_CP1_CI_AS, code page 1252; the
+// pages come from the server with the metadata (COLLATIONPROPERTY, #361), so
+// the test sets them the way the loaders do.
 MSSQLColumnInfo Col(const std::string &name, int32_t id, const std::string &sql_type, int16_t max_length,
-					uint8_t precision, uint8_t scale, const std::string &collation = "") {
-	return MSSQLColumnInfo(name, id, sql_type, max_length, precision, scale, true, collation,
-						   "SQL_Latin1_General_CP1_CI_AS");
+					uint8_t precision, uint8_t scale, const std::string &collation = "", int32_t code_page = 1252) {
+	MSSQLColumnInfo c(name, id, sql_type, max_length, precision, scale, true, collation,
+					  "SQL_Latin1_General_CP1_CI_AS");
+	c.code_page = code_page;
+	c.database_code_page = 1252;
+	return c;
 }
 
 }  // namespace
@@ -554,12 +561,48 @@ static void TestDeclarationForColumn() {
 	ASSERT_TRUE(decl(Col("n", 1, "nvarchar", 20, 0, 0), Value("\xC3\xBC\xC3\xB1\xC3\xAF")) == "nvarchar(10)");
 	ASSERT_TRUE(decl(Col("n", 1, "nvarchar", 4, 0, 0), Value("\xF0\x9F\x98\x80\xF0\x9F\x98\x80\xF0\x9F\x98\x80")) ==
 				"nvarchar(6)");
-	// a non-ASCII constant goes as nvarchar whatever the column's collation, as
-	// the N'...' literal always did: a varchar variable takes the DATABASE's
-	// code page, so even a UTF-8 column would see '?' through a varchar one
-	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0), Value("\xC3\xBC")) == "nvarchar(20)");
-	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Latin1_General_100_BIN2_UTF8"), Value("\xC3\xBC")) ==
+	// #361: a non-ASCII constant goes as varchar when both the column's and the
+	// database's code page (the fixture's database is SQL_Latin1_General_CP1,
+	// i.e. 1252) can hold it -- that is what keeps the seek -- and as nvarchar
+	// otherwise. ü is in 1252: varchar. ы is not: nvarchar, on a 1252 column
+	// and on a UTF-8 column alike, because the varchar PARAMETER takes the
+	// database's page (#321's case) whatever the column can hold.
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0), Value("\xC3\xBC")) == "varchar(20)");
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Latin1_General_100_BIN2_UTF8", 65001), Value("\xC3\xBC")) ==
+				"varchar(20)");
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0), Value("\xD1\x8B")) == "nvarchar(20)");
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Latin1_General_100_BIN2_UTF8", 65001), Value("\xD1\x8B")) ==
 				"nvarchar(20)");
+	// the column's page matters too: ü against a Cyrillic column is nvarchar
+	// even though the 1252 database could carry the parameter
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Cyrillic_General_CI_AS", 1251), Value("\xC3\xBC")) ==
+				"nvarchar(20)");
+	// a Cyrillic constant on a Cyrillic column of a Cyrillic database: varchar
+	{
+		MSSQLColumnInfo cyr = Col("v", 1, "varchar", 20, 0, 0, "Cyrillic_General_CI_AS", 1251);
+		cyr.database_code_page = 1251;
+		ASSERT_TRUE(decl(cyr, Value("\xD1\x8B")) == "varchar(20)");
+	}
+	// a page the server could not name (NULL -> 0): nvarchar, the old form
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "", 0), Value("\xC3\xBC")) == "nvarchar(20)");
+	// text follows the same rule (#361 review): ы on a 1252 page is nvarchar(max)
+	ASSERT_TRUE(decl(Col("t", 1, "text", 16, 0, 0), Value("\xD1\x8B")) == "nvarchar(max)");
+	ASSERT_TRUE(decl(Col("t", 1, "text", 16, 0, 0), Value("\xC3\xBC")) == "varchar(max)");
+	// a double-byte or unknown page cannot be told: nvarchar
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 20, 0, 0, "Japanese_CI_AS", 932), Value("\xC3\xBC")) == "nvarchar(20)");
+	// the byte width is still the constant's UTF-8 size when it is the larger
+	ASSERT_TRUE(decl(Col("v", 1, "varchar", 2, 0, 0), Value("\xC3\xBC\xC3\xBC")) == "varchar(4)");
+	// the page tables
+	ASSERT_TRUE(mssql::CodePageCanEncode(1252, "\xE2\x82\xAC"));  // € is 0x80 in 1252
+	ASSERT_TRUE(mssql::CodePageCanEncode(1251, "\xE2\x82\xAC"));  // and 0x88 in 1251
+	ASSERT_TRUE(!mssql::CodePageCanEncode(1252, "\xC5\x91"));	  // ő: 1250 only
+	ASSERT_TRUE(mssql::CodePageCanEncode(1250, "\xC5\x91"));
+	ASSERT_TRUE(!mssql::CodePageCanEncode(1252, "\xF0\x9F\x98\x80"));  // above the BMP
+	ASSERT_TRUE(mssql::CodePageCanEncode(932, "ascii only"));
+	ASSERT_TRUE(mssql::CodePageCanEncode(0, "ascii only"));
+	ASSERT_TRUE(!mssql::CodePageCanEncode(850, "\xC3\xBC"));  // an OEM page: no table
+	ASSERT_TRUE(!mssql::CodePageCanEncode(932, "\xC3\xBC"));
+	ASSERT_TRUE(mssql::CodePageCanEncode(65001, "\xF0\x9F\x98\x80"));
 	ASSERT_TRUE(decl(Col("t", 1, "text", 16, 0, 0), Value("x")) == "varchar(max)");
 	// integers: the wider of column and constant
 	ASSERT_TRUE(decl(Col("i", 1, "int", 4, 10, 0), Value::INTEGER(1)) == "int");

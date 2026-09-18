@@ -22,6 +22,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string predicate (spec 079 D4), and a seek where the column is indexed. Lists
   longer than 256 items stay client-side, as every list did before: each
   item is one of the statement's 2000 parameters.
+- **A non-ASCII constant no longer costs the index seek on a `SQL_` collation**
+  ([#361](https://github.com/hugr-lab/mssql-extension/issues/361)). Spec 076
+  declared any non-ASCII constant of a pushed filter as an `nvarchar`
+  parameter whatever the column's collation — right for a UTF-8 column on a
+  Latin-1 database (#321: a `varchar` parameter takes the *database's* code
+  page), and an Index Scan with `CONVERT_IMPLICIT` on the column for the
+  installation default, `SQL_Latin1_General_CP1_CI_AS`, where `'ñu'`,
+  `'Müller'`, `'café'` read the whole index (Windows collations seek through
+  the convert and were unaffected). The declaration is now `varchar` when every
+  character of the constant is representable in **both** the column's and the
+  database's code page, and `nvarchar` otherwise, exactly as before. The pages
+  are the server's own answer — `COLLATIONPROPERTY(collation, 'CodePage')` now
+  rides with the column metadata and the database collation — and
+  representability is answered from tables for the single-byte pages 874 and
+  1250–1258; a double-byte or unknown page keeps the safe form. `text` columns
+  follow the same rule (their `varchar(max)` parameter turned `'ы%'` into
+  `'?%'` and `LIKE` matched rows it should not). **One visible consequence on
+  a `SQL_` collation:** the comparison now runs under the collation's own
+  (non-Unicode) sort rules instead of the Windows Unicode rules an `nvarchar`
+  parameter forced — `'ß' = 'ss'` was true and is now false on
+  `SQL_Latin1_General_CP1_CI_AS`, which is what a T-SQL `varchar` literal
+  answers there.
 - **`COPY` no longer drops a CLR UDT column of an existing target in silence**
   ([#353](https://github.com/hugr-lab/mssql-extension/issues/353)). The
   target-metadata query joined `sys.types` on `system_type_id`, which no

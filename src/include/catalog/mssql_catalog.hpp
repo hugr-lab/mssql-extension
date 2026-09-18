@@ -366,8 +366,9 @@ private:
 	shared_ptr<tds::ConnectionPool> connection_pool_;
 	unique_ptr<MSSQLMetadataCache> metadata_cache_;			   // Metadata cache
 	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;  // Statistics provider
-	string database_collation_;								   // Database default collation
-	string default_schema_;									   // Default schema ("dbo")
+	int32_t database_code_page_ = 0;  // COLLATIONPROPERTY(database collation, 'CodePage'), issue #361
+	string database_collation_;		  // Database default collation
+	string default_schema_;			  // Default schema ("dbo")
 	// Spec 052 (Option D): shared_ptr ownership for schema entries. The bind-
 	// time anchor (MSSQLBindAnchors, per ClientContext, released at QueryEnd)
 	// keeps entries alive across concurrent Invalidate / OnDetach. emplace-
