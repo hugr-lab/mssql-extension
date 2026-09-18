@@ -121,7 +121,7 @@ string MSSQLUpdateStatement::GenerateOnClause() const {
 			result += " AND ";
 		}
 		string col_name = EscapeIdentifier(target_.pk_info.columns[i].name);
-		result += "t." + col_name + " = v." + col_name;
+		result += "t." + col_name + " = " + target_.pk_info.columns[i].KeyComparand("v." + col_name);
 	}
 	return result;
 }

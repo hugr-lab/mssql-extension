@@ -1,0 +1,263 @@
+# name: test/sql/rowid/rowid_unique_index.test
+# description: rowid from a primary key OR a usable unique index (spec 077 W1)
+# group: [rowid]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# rowid used to mean "the primary key". It now means "a key this server
+# guarantees to address one row and that we can send back": the primary key if
+# it is usable, else a usable unique index, chosen by a documented order. Every
+# candidate that is NOT usable is named in the refusal with its reason, so the
+# user is told which index to fix rather than to add one they already have.
+#
+# The step-1 change — an unusable primary key falls through instead of being
+# taken — closes a live defect: a DATETIME primary key produced an UPDATE that
+# reported success and changed nothing (issue #358), because no datetime2
+# literal matches a datetime value with a 1/300 s fraction. Measured; the table with a usable unique
+# index beside such a key now updates through the index, and the one without
+# refuses by name.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ux (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('ux', 'IF OBJECT_ID(''dbo.UxIdent'') IS NOT NULL DROP TABLE dbo.UxIdent; IF OBJECT_ID(''dbo.UxDtPk'') IS NOT NULL DROP TABLE dbo.UxDtPk; IF OBJECT_ID(''dbo.UxDtOnly'') IS NOT NULL DROP TABLE dbo.UxDtOnly; IF OBJECT_ID(''dbo.UxVariant'') IS NOT NULL DROP TABLE dbo.UxVariant; IF OBJECT_ID(''dbo.UxNone'') IS NOT NULL DROP TABLE dbo.UxNone; IF OBJECT_ID(''dbo.UxNullable'') IS NOT NULL DROP TABLE dbo.UxNullable; IF OBJECT_ID(''dbo.UxFiltered'') IS NOT NULL DROP TABLE dbo.UxFiltered; IF OBJECT_ID(''dbo.UxBoth'') IS NOT NULL DROP TABLE dbo.UxBoth; IF OBJECT_ID(''dbo.UxTie'') IS NOT NULL DROP TABLE dbo.UxTie');
+
+# =============================================================================
+# A BIGINT IDENTITY that is only UNIQUE — no primary key. rowid resolves to it
+# and UPDATE / DELETE work.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxIdent (id BIGINT IDENTITY(1,1) NOT NULL UNIQUE, v INT); INSERT INTO dbo.UxIdent (v) VALUES (1), (2), (3)');
+
+statement ok
+SELECT mssql_invalidate_cache('ux');
+
+query II
+SELECT rowid, v FROM ux.dbo.UxIdent ORDER BY v;
+----
+1	1
+2	2
+3	3
+
+statement ok
+UPDATE ux.dbo.UxIdent SET v = v + 10 WHERE v = 1;
+
+statement ok
+DELETE FROM ux.dbo.UxIdent WHERE v = 2;
+
+query II
+SELECT rowid, v FROM ux.dbo.UxIdent ORDER BY v;
+----
+3	3
+1	11
+
+# =============================================================================
+# The regression guard for the step-1 change: a DATETIME primary key beside a
+# usable BIGINT UNIQUE. The key value 10:00:00.003 is a 1/300 s tick that no
+# datetime2 literal equals. rowid is the unique index, and the UPDATE that
+# silently changed nothing before now changes the row.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxDtPk (k DATETIME NOT NULL PRIMARY KEY, id BIGINT NOT NULL UNIQUE, v INT); INSERT INTO dbo.UxDtPk VALUES (''2026-01-01 10:00:00.003'', 7, 1)');
+
+statement ok
+SELECT mssql_invalidate_cache('ux');
+
+# rowid is the unique index's column (7), not the datetime key
+query II
+SELECT rowid, v FROM ux.dbo.UxDtPk;
+----
+7	1
+
+statement ok
+UPDATE ux.dbo.UxDtPk SET v = 99 WHERE v = 1;
+
+query I
+SELECT v FROM ux.dbo.UxDtPk;
+----
+99
+
+# --- the same key without a unique index beside it refuses by name, pointing
+# at the issue, rather than reporting success on a statement that did nothing
+statement ok
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxDtOnly (k DATETIME NOT NULL PRIMARY KEY, v INT); INSERT INTO dbo.UxDtOnly VALUES (''2026-01-01 10:00:00.003'', 1)');
+
+statement ok
+SELECT mssql_invalidate_cache('ux');
+
+statement error
+UPDATE ux.dbo.UxDtOnly SET v = 99 WHERE v = 1;
+----
+has a key, but rowid cannot address a row through it
+
+statement error
+DELETE FROM ux.dbo.UxDtOnly WHERE v = 1;
+----
+key column 'k' has type datetime, which no rowid literal can match (see issue #358)
+
+# --- and the row is untouched: the refusal was at bind, nothing ran
+query I
+SELECT v FROM ux.dbo.UxDtOnly;
+----
+1
+
+# =============================================================================
+# A SQL_VARIANT primary key: the read is lossy (issue #354), so it cannot
+# identify its row either. Same two shapes.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxVariant (p SQL_VARIANT NOT NULL PRIMARY KEY, v INT); INSERT INTO dbo.UxVariant VALUES (CAST(''a'' AS NVARCHAR(10)), 1)');
+
+statement ok
+SELECT mssql_invalidate_cache('ux');
+
+statement error
+UPDATE ux.dbo.UxVariant SET v = 2 WHERE v = 1;
+----
+key column 'p' has type sql_variant, which is read through a lossy CAST and cannot identify its row (see issue #354)
+
+# =============================================================================
+# The refusals name what was looked for and why each candidate was rejected.
+# =============================================================================
+
+# --- neither a primary key nor a unique index
+statement ok
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxNone (a INT, v INT)');
+
+statement ok
+SELECT mssql_invalidate_cache('ux');
+
+statement error
+UPDATE ux.dbo.UxNone SET v = 1;
+----
+requires a table with a primary key or a usable unique index
+
+statement error
+UPDATE ux.dbo.UxNone SET v = 1;
+----
+has neither. Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a filter
+
+# --- a unique index on a NULLABLE column: it accepts exactly one NULL row and
+# refuses the second, but a row keyed by NULL cannot be addressed
+statement ok
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxNullable (a INT NULL UNIQUE, v INT)');
+
+statement ok
+SELECT mssql_invalidate_cache('ux');
+
+statement error
+DELETE FROM ux.dbo.UxNullable;
+----
+key column 'a' is nullable, and a row keyed by NULL cannot be addressed: = NULL matches nothing
+
+# --- a FILTERED unique index covers a subset of rows; the rest are unaddressable
+statement ok
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxFiltered (a INT NOT NULL, v INT); CREATE UNIQUE INDEX UX_UxFiltered_a ON dbo.UxFiltered(a) WHERE v > 0');
+
+statement ok
+SELECT mssql_invalidate_cache('ux');
+
+statement error
+DELETE FROM ux.dbo.UxFiltered;
+----
+unique index 'UX_UxFiltered_a' was rejected because it is a filtered index
+
+# =============================================================================
+# The order. A usable primary key wins over any unique index; among unique
+# indexes a single-column identity key outranks a narrower key, and index_id
+# breaks a true tie.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxBoth (pk INT NOT NULL PRIMARY KEY, u BIGINT NOT NULL UNIQUE, v INT); INSERT INTO dbo.UxBoth VALUES (1, 100, 1)');
+
+statement ok
+SELECT mssql_invalidate_cache('ux');
+
+query I
+SELECT rowid FROM ux.dbo.UxBoth;
+----
+1
+
+# --- two usable unique indexes: the BIGINT IDENTITY one outranks the narrower
+# INT one, even though it is wider and was created second
+statement ok
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxTie (code INT NOT NULL, id BIGINT IDENTITY(1,1) NOT NULL, v INT); CREATE UNIQUE INDEX UX_UxTie_code ON dbo.UxTie(code); CREATE UNIQUE INDEX UX_UxTie_id ON dbo.UxTie(id); INSERT INTO dbo.UxTie (code, v) VALUES (500, 1)');
+
+statement ok
+SELECT mssql_invalidate_cache('ux');
+
+query I
+SELECT rowid FROM ux.dbo.UxTie;
+----
+1
+
+# =============================================================================
+# An UPDATE that assigns to the rowid key column is refused today, before any
+# key is widened; pinned so it stays a refusal rather than becoming a hazard.
+# =============================================================================
+
+statement error
+UPDATE ux.dbo.UxIdent SET id = 500 WHERE v = 3;
+----
+Updating rowid key columns is not supported
+
+# =============================================================================
+# A varchar key under a SQL_ collation (the installation default). Every rowid
+# value is sent as an N'...' literal, so the key join compared the varchar
+# column under its collation's UNICODE rules, where 'Straße' = 'Strasse' and
+# 'Æ' = 'AE' — while the unique index, under the non-Unicode SQL sort order,
+# holds them as four keys. Measured before the fix: the DELETE of the 'Straße'
+# row deleted 'Strasse' too, and the UPDATE of the 'Æ' row updated 'AE', both
+# silently. Same shape with a varchar PRIMARY KEY, which predates spec 077.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('ux', 'IF OBJECT_ID(''dbo.UxSqlColl'') IS NOT NULL DROP TABLE dbo.UxSqlColl; IF OBJECT_ID(''dbo.UxSqlCollPk'') IS NOT NULL DROP TABLE dbo.UxSqlCollPk; CREATE TABLE dbo.UxSqlColl (code varchar(20) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL, v int NOT NULL); CREATE UNIQUE INDEX UX_UxSqlColl ON dbo.UxSqlColl(code); CREATE TABLE dbo.UxSqlCollPk (code char(10) COLLATE SQL_Latin1_General_CP1_CI_AS PRIMARY KEY, v int NOT NULL); INSERT INTO dbo.UxSqlColl VALUES (''Strasse'', 1), (''Straße'', 2), (''AE'', 3), (''Æ'', 4); INSERT INTO dbo.UxSqlCollPk VALUES (''Strasse'', 1), (''Straße'', 2), (''AE'', 3), (''Æ'', 4)');
+
+statement ok
+SELECT mssql_invalidate_cache('ux');
+
+statement ok
+DELETE FROM ux.dbo.UxSqlColl WHERE v = 2;
+
+statement ok
+UPDATE ux.dbo.UxSqlColl SET v = 40 WHERE v = 4;
+
+query TI
+SELECT code, v FROM ux.dbo.UxSqlColl ORDER BY v;
+----
+Strasse	1
+AE	3
+Æ	40
+
+statement ok
+DELETE FROM ux.dbo.UxSqlCollPk WHERE v = 2;
+
+statement ok
+UPDATE ux.dbo.UxSqlCollPk SET v = 40 WHERE v = 4;
+
+query TI
+SELECT trim(code), v FROM ux.dbo.UxSqlCollPk ORDER BY v;
+----
+Strasse	1
+AE	3
+Æ	40
+
+statement ok
+SELECT mssql_exec('ux', 'DROP TABLE dbo.UxSqlColl; DROP TABLE dbo.UxSqlCollPk');
+
+statement ok
+SELECT mssql_exec('ux', 'DROP TABLE dbo.UxIdent; DROP TABLE dbo.UxDtPk; DROP TABLE dbo.UxDtOnly; DROP TABLE dbo.UxVariant; DROP TABLE dbo.UxNone; DROP TABLE dbo.UxNullable; DROP TABLE dbo.UxFiltered; DROP TABLE dbo.UxBoth; DROP TABLE dbo.UxTie');
+
+statement ok
+DETACH ux;

@@ -89,7 +89,7 @@ struct MSSQLTableMetadata {
 	// batch as the columns, so a fresh table costs one round trip, not two.
 	// The bulk paths do not, and MSSQLTableEntry then discovers it lazily as
 	// before (pk_loaded == false).
-	mssql::PrimaryKeyInfo pk_info;
+	mssql::RowIdKeyInfo pk_info;
 	bool pk_loaded = false;
 	std::chrono::steady_clock::time_point columns_last_refresh;
 

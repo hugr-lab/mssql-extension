@@ -159,7 +159,7 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 			throw BinderException("MSSQL: rowid requested but PK info not available in bind data");
 		}
 		if (bind_data.pk_column_names.empty()) {
-			throw BinderException("MSSQL: rowid requires a primary key");
+			throw BinderException("MSSQL: rowid requires a table with a primary key or a usable unique index");
 		}
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: PK has %zu columns, composite=%s",
 							 bind_data.pk_column_names.size(), bind_data.pk_is_composite ? "true" : "false");

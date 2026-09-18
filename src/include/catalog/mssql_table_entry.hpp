@@ -126,7 +126,7 @@ public:
 	bool HasPrimaryKey(ClientContext &context);
 
 	// Get full PK metadata (lazy loads if needed)
-	const mssql::PrimaryKeyInfo &GetPrimaryKeyInfo(ClientContext &context);
+	const mssql::RowIdKeyInfo &GetPrimaryKeyInfo(ClientContext &context);
 
 private:
 	// The DuckDB-visible columns. Owned here since the base stopped owning
@@ -146,14 +146,14 @@ private:
 	// `vector<PKColumnInfo>`. Caught by ASan during spec 052 scenario-5
 	// stress.
 	//
-	// pk_loaded_ is a separate atomic (hoisted out of PrimaryKeyInfo so the
+	// pk_loaded_ is a separate atomic (hoisted out of RowIdKeyInfo so the
 	// struct remains move-assignable). The fast path in EnsurePKLoaded and
 	// the publication check in GetVirtualColumns use load(acquire) /
 	// store(release) so a reader observing pk_loaded_ == true is guaranteed
 	// to see the fully-published pk_info_ assigned under the mutex.
 	mutable std::atomic<bool> pk_loaded_{false};
 	mutable std::mutex pk_load_mutex_;
-	mutable mssql::PrimaryKeyInfo pk_info_;
+	mutable mssql::RowIdKeyInfo pk_info_;
 
 	// Ensure PK info is loaded
 	void EnsurePKLoaded(ClientContext &context) const;

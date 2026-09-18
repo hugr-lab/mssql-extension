@@ -119,14 +119,37 @@ SET mssql_insert_use_bcp = false;
 
 A column the INSERT does not name is left out of the statement or the bulk
 column list, so the server generates its identity value or applies its
-DEFAULT. Naming an identity column keeps the INSERT on the statement path,
-where SQL Server decides about the explicit value — error 544 unless
-`IDENTITY_INSERT` is on for that session. The generated values are returned
-via the RETURNING clause.
+DEFAULT. The generated values are returned via the RETURNING clause.
+
+**Naming the identity column works too.** An INSERT that supplies a value for
+it — explicitly, or positionally with a value for every column — is bracketed
+for you with `SET IDENTITY_INSERT … ON` / `OFF` on the statement's own
+connection, so the values land verbatim and the session is clean afterwards.
+Two things to know:
+
+- **It stays on the statement path**, whatever `mssql_insert_bcp_threshold`
+  says: tens of rows, not millions. Loading many rows *with* their identity
+  values is `COPY`'s job — it takes its column list from the source by name,
+  keeps a supplied identity value and lets the server assign when the column is
+  omitted, and it is the fast path (1M rows in 0.51 s against 74.71 s through
+  statements).
+- `SET IDENTITY_INSERT` needs **ALTER** permission on the table, which INSERT
+  does not; without it the statement fails with a message that says so (the
+  server's own text for error 1088 claims the table may not exist). A NULL —
+  or `DEFAULT`, which reaches the extension as the same NULL — in a named
+  identity column is refused before anything is sent: leave the column out of
+  the list to let the server assign, or supply a value for every row; a
+  statement mixing the two has to be split.
+
+An INSERT with **no column list** against a table with an identity column is
+refused by DuckDB's binder (`has N columns but N-1 values were supplied`) before
+the extension sees it; name the columns, as SQL Server's own error 8101 asks
+for the same statement. Issue #327 records why the extension cannot widen that
+check.
 
 ## UPDATE
 
-UPDATE operations are supported for tables with primary keys. The extension uses rowid-based targeting for efficient updates.
+UPDATE operations are supported for tables with a primary key or a usable unique index. The extension uses rowid-based targeting for efficient updates.
 
 ### Basic UPDATE
 
@@ -161,8 +184,8 @@ SET mssql_dml_batch_size = 500;
 ### Limitations
 
 - **RETURNING clause is not supported** for UPDATE operations
-- Tables must have a primary key (uses rowid for row identification)
-- Updates use a single `UPDATE ... FROM target JOIN (VALUES ...)` statement per batch, joining on the primary key (scalar or composite)
+- Tables must have a **rowid key**: a primary key, or a unique index that is not filtered, not disabled, and whose key columns are all NOT NULL (a `BIGINT IDENTITY … UNIQUE` is the common shape). A primary key that cannot address a row — `DATETIME`, `TIME(7)`, `DATETIMEOFFSET(7)`, `SQL_VARIANT` — falls through to another unique index if there is one, and the refusal otherwise names every index it rejected and why
+- Updates use a single `UPDATE ... FROM target JOIN (VALUES ...)` statement per batch, joining on the rowid key (scalar or composite)
 
 ## String comparisons and collation {#collation}
 
@@ -192,7 +215,7 @@ difference is not recoverable.
 
 Pushing the predicate is what makes the operation fast, and the pushed
 predicate is evaluated by the server. `UPDATE`/`DELETE` then target rows by
-primary key (see the rowid note in Limitations above), so the rows acted on are
+their rowid key (see the rowid note in Limitations above), so the rows acted on are
 precisely the rows the scan returned — with the server's comparison rules
 already applied.
 
@@ -242,7 +265,7 @@ lands, the behaviour on this page is what applies.
 
 ## DELETE
 
-DELETE operations are supported for tables with primary keys.
+DELETE operations are supported for tables with a primary key or a usable unique index.
 
 ### Basic DELETE
 
@@ -276,5 +299,5 @@ SET mssql_dml_batch_size = 500;
 ### Limitations
 
 - **RETURNING clause is not supported** for DELETE operations
-- Tables must have a primary key (uses rowid for row identification)
+- Tables must have a rowid key — a primary key or a usable unique index, as for UPDATE above
 

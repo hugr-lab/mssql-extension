@@ -713,6 +713,10 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 		insert_col.mssql_type = col.sql_type_name;
 		insert_col.max_length = col.max_length;
 		insert_col.is_identity = col.is_identity;  // spec 062 W4: from sys.columns, via the cache
+		if (col.is_identity) {
+			target.has_identity_column = true;
+			target.identity_column_index = i;
+		}
 		insert_col.is_nullable = col.is_nullable;
 		insert_col.has_default = false;	 // TODO: Query this from sys.columns
 		insert_col.collation = col.collation_name;
@@ -724,6 +728,18 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	// The OUTPUT list of an INSERT … RETURNING is built by the same function as
 	// the scan's SELECT list, and that function takes this setting.
 	target.convert_varchar_max = LoadConvertVarcharMax(context);
+
+	// Spec 077 W2: is the identity column among the columns being inserted?
+	// Only for a table — SET IDENTITY_INSERT takes a table, and an explicit
+	// identity value through a view is the server's call.
+	if (target.has_identity_column && table_entry.GetObjectType() != MSSQLObjectType::VIEW) {
+		for (auto idx : insert_col_indices) {
+			if (idx == target.identity_column_index) {
+				target.identity_in_list = true;
+				break;
+			}
+		}
+	}
 
 	// Set insert column indices
 	target.insert_column_indices = std::move(insert_col_indices);
@@ -856,8 +872,9 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	// Check if table has a primary key (required for DELETE via rowid)
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
 	if (!pk_info.exists) {
-		throw NotImplementedException("MSSQL: DELETE requires a primary key. Table '%s' has no primary key.",
-									  table_entry.name);
+		throw NotImplementedException(pk_info.RowIdRefusal(table_entry.schema.name.GetIdentifierName(),
+														   table_entry.name.GetIdentifierName(), "DELETE",
+														   GetName().GetIdentifierName()));
 	}
 
 	// Build MSSQLDeleteTarget from table metadata
@@ -895,8 +912,9 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 	// Check if table has a primary key (this will fetch PK info if not cached)
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
 	if (!pk_info.exists) {
-		throw NotImplementedException("MSSQL: UPDATE requires a primary key. Table '%s' has no primary key.",
-									  table_entry.name);
+		throw NotImplementedException(pk_info.RowIdRefusal(table_entry.schema.name.GetIdentifierName(),
+														   table_entry.name.GetIdentifierName(), "UPDATE",
+														   GetName().GetIdentifierName()));
 	}
 
 	// Get MSSQL column info
@@ -908,7 +926,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 			auto physical_idx = op.columns[i].index;
 			if (physical_idx < mssql_columns.size() && mssql_columns[physical_idx].name == pk_col.name) {
 				throw NotImplementedException(
-					"MSSQL: Updating primary key columns is not supported. Cannot update column '%s'.", pk_col.name);
+					"MSSQL: Updating rowid key columns is not supported. Cannot update column '%s'.", pk_col.name);
 			}
 		}
 	}

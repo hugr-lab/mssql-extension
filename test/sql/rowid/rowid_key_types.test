@@ -1,0 +1,111 @@
+# name: test/sql/rowid/rowid_key_types.test
+# description: Which datetime-family key types rowid can address (spec 077 W1, review of #350; issue #358)
+# group: [rowid]
+#
+# A rowid literal is CAST(… AS DATETIME2(7)) / DATETIMEOFFSET(7) / TIME from
+# the value DuckDB read. Where the read is exact the key works; where it is
+# not, the statement would report success and change nothing, so the key is
+# refused by name instead. Measured shapes: time(7) and datetimeoffset(7) lose
+# their 100 ns digit on read (three rows keyed on such values, one updated);
+# datetime with a 1/300 s fraction never matches (#358); smalldatetime, datetime2(7), time(6) and
+# datetimeoffset(6) round-trip.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS kt (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('kt', 'DROP TABLE IF EXISTS dbo.RowidKeyTime7, dbo.RowidKeyTime6, dbo.RowidKeyDto7, dbo.RowidKeyDto6, dbo.RowidKeyDt27, dbo.RowidKeySdt');
+
+statement ok
+SELECT mssql_exec('kt', 'CREATE TABLE dbo.RowidKeyTime7 (k time(7) PRIMARY KEY, n int NOT NULL)');
+
+statement ok
+SELECT mssql_exec('kt', 'CREATE TABLE dbo.RowidKeyTime6 (k time(6) PRIMARY KEY, n int NOT NULL)');
+
+statement ok
+SELECT mssql_exec('kt', 'CREATE TABLE dbo.RowidKeyDto7 (k datetimeoffset(7) PRIMARY KEY, n int NOT NULL)');
+
+statement ok
+SELECT mssql_exec('kt', 'CREATE TABLE dbo.RowidKeyDto6 (k datetimeoffset(6) PRIMARY KEY, n int NOT NULL)');
+
+statement ok
+SELECT mssql_exec('kt', 'CREATE TABLE dbo.RowidKeyDt27 (k datetime2(7) PRIMARY KEY, n int NOT NULL)');
+
+statement ok
+SELECT mssql_exec('kt', 'CREATE TABLE dbo.RowidKeySdt (k smalldatetime PRIMARY KEY, n int NOT NULL)');
+
+statement ok
+SELECT mssql_exec('kt', 'INSERT INTO dbo.RowidKeyTime7 VALUES (''10:00:00.0000001'', 0), (''11:00:00.1234567'', 0), (''12:00:00.123456'', 0)');
+
+statement ok
+SELECT mssql_exec('kt', 'INSERT INTO dbo.RowidKeyTime6 VALUES (''10:00:00.000001'', 0), (''11:00:00.123456'', 0)');
+
+statement ok
+SELECT mssql_exec('kt', 'INSERT INTO dbo.RowidKeyDto7 VALUES (''2026-01-01 10:00:00.0000001 +03:00'', 0), (''2026-01-01 11:00:00.1234567 +00:00'', 0)');
+
+statement ok
+SELECT mssql_exec('kt', 'INSERT INTO dbo.RowidKeyDto6 VALUES (''2026-01-01 10:00:00.000001 +03:00'', 0), (''2026-01-01 11:00:00.123456 +00:00'', 0)');
+
+statement ok
+SELECT mssql_exec('kt', 'INSERT INTO dbo.RowidKeyDt27 VALUES (''2026-01-01 10:00:00.0000001'', 0), (''2026-01-01 11:00:00.1234567'', 0)');
+
+statement ok
+SELECT mssql_exec('kt', 'INSERT INTO dbo.RowidKeySdt VALUES (''2026-01-01 10:00:00'', 0), (''2026-01-01 10:01:00'', 0)');
+
+# The two lossy reads are refused by name — never a statement that does nothing.
+statement error
+UPDATE kt.dbo.RowidKeyTime7 SET n = 1 WHERE n = 0;
+----
+has type time(7), which no rowid literal can match
+
+statement error
+DELETE FROM kt.dbo.RowidKeyDto7 WHERE n = 0;
+----
+has type datetimeoffset(7), which no rowid literal can match
+
+# The exact reads address every row.
+query I
+UPDATE kt.dbo.RowidKeyTime6 SET n = 1 WHERE n = 0;
+----
+2
+
+query I
+UPDATE kt.dbo.RowidKeyDto6 SET n = 1 WHERE n = 0;
+----
+2
+
+query I
+UPDATE kt.dbo.RowidKeyDt27 SET n = 1 WHERE n = 0;
+----
+2
+
+query I
+UPDATE kt.dbo.RowidKeySdt SET n = 1 WHERE n = 0;
+----
+2
+
+query I
+DELETE FROM kt.dbo.RowidKeySdt WHERE n = 1;
+----
+2
+
+query I
+SELECT count(*) FROM kt.dbo.RowidKeySdt;
+----
+0
+
+statement ok
+SELECT mssql_exec('kt', 'DROP TABLE dbo.RowidKeyTime7, dbo.RowidKeyTime6, dbo.RowidKeyDto7, dbo.RowidKeyDto6, dbo.RowidKeyDt27, dbo.RowidKeySdt');
+
+statement ok
+SET mssql_exec_invalidate_cache = false;
+
+statement ok
+DETACH kt;

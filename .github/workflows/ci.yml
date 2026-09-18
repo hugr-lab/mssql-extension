@@ -304,6 +304,22 @@ jobs:
             test/cpp/test_load_policy.cpp -o /tmp/test_load_policy
           /tmp/test_load_policy
 
+      # Spec 077 W1 / W2: the rowid key tie-break (identity first, then fewest
+      # columns, narrowest, lowest index_id) and the IDENTITY_INSERT error
+      # mapping (1088 / 8106 / 8107) are the two things that spec says must
+      # not drift; both are header-only and run here, on every PR.
+      - name: Build + run rowid key choice unit test (spec 077 W1)
+        run: |
+          c++ -std=c++17 -pthread -I src/include \
+            test/cpp/test_rowid_key_choice.cpp -o /tmp/test_rowid_key_choice
+          /tmp/test_rowid_key_choice
+
+      - name: Build + run IDENTITY_INSERT unit test (spec 077 W2)
+        run: |
+          c++ -std=c++17 -pthread -I src/include \
+            test/cpp/test_identity_insert.cpp -o /tmp/test_identity_insert
+          /tmp/test_identity_insert
+
   # ============================================================================
   # Windows SSPI Unit Test - ungated, like cpp-unit-tests above.
   #

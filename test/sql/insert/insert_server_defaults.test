@@ -55,11 +55,16 @@ SELECT id, status FROM defdb.dbo.SrvDefaults WHERE name = 'third';
 ----
 3	pending
 
-# Full-positional INSERT still names every column and the identity column
-# rejects an explicit value without IDENTITY_INSERT — the pre-069 contract.
-statement error
+# Full-positional INSERT names every column, the identity one included. It
+# used to be refused by the server (544, no IDENTITY_INSERT); since spec 077
+# W2 the statement is bracketed with SET IDENTITY_INSERT and the value lands.
+statement ok
 INSERT INTO defdb.dbo.SrvDefaults VALUES (99, 'explicit', 'x', 1);
+
+query IIII
+SELECT id, name, status, retries FROM defdb.dbo.SrvDefaults WHERE name = 'explicit';
 ----
+99	explicit	x	1
 
 statement ok
 SELECT mssql_exec('defdb', 'DROP TABLE dbo.SrvDefaults');

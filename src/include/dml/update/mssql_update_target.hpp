@@ -9,8 +9,8 @@
 
 namespace duckdb {
 
-// PrimaryKeyInfo is in mssql namespace
-using mssql::PrimaryKeyInfo;
+// RowIdKeyInfo is in mssql namespace
+using mssql::RowIdKeyInfo;
 
 //===----------------------------------------------------------------------===//
 // MSSQLUpdateTarget - Target table metadata for UPDATE operations
@@ -40,7 +40,7 @@ struct MSSQLUpdateTarget {
 	//===----------------------------------------------------------------------===//
 
 	// PK metadata from MSSQLTableEntry
-	PrimaryKeyInfo pk_info;
+	RowIdKeyInfo pk_info;
 
 	//===----------------------------------------------------------------------===//
 	// Columns Being Updated

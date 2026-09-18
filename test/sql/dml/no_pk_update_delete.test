@@ -40,14 +40,14 @@ SELECT COUNT(*) FROM mssql.dbo.no_pk_dml_test;
 statement error
 UPDATE mssql.dbo.no_pk_dml_test SET id = 3 WHERE id = 1;
 ----
-requires a table with a primary key
+requires a table with a primary key or a usable unique index
 
 # Issue #141: DELETE on no-PK table must fail with the SAME clean Binder Error,
 # NOT an INTERNAL assertion failure (BindRowIdColumns ...).
 statement error
 DELETE FROM mssql.dbo.no_pk_dml_test WHERE id = 3;
 ----
-requires a table with a primary key
+requires a table with a primary key or a usable unique index
 
 # The failed DML must not have mutated any rows
 query I

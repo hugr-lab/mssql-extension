@@ -473,7 +473,7 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	// Spec 076 W2: the primary key in the same batch -- a second result set
 	// off the same @s / @t -- so a fresh table pays one round trip.
 	string query = mssql::BuildExecuteSqlBatch(
-		string(SINGLE_TABLE_METADATA_SQL_TEMPLATE) + ";\n" + mssql::PrimaryKeyInfo::DiscoverySqlTemplate(),
+		string(SINGLE_TABLE_METADATA_SQL_TEMPLATE) + ";\n" + mssql::RowIdKeyInfo::DiscoverySqlTemplate(),
 		"@s sysname, @t sysname",
 		{{"s", mssql::NVarcharLiteral(schema_name)}, {"t", mssql::NVarcharLiteral(table_name)}});
 
@@ -516,11 +516,11 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 			// catalog's copy before anything else, so removing it plans every direct
 			// query at ~1 row.
 			// Routed by which statement of the batch produced the row, never by
-			// its width: the second result set is PrimaryKeyInfo::DiscoverySqlTemplate
+			// its width: the second result set is RowIdKeyInfo::DiscoverySqlTemplate
 			// (review of #345 -- a column added to either query must not silently
 			// drop every primary key in the catalog).
 			if (result_set == 1) {
-				mssql::PrimaryKeyInfo::AppendColumnFromRow(table_meta.pk_info, values, database_collation_);
+				mssql::RowIdKeyInfo::AppendCandidateRow(table_meta.pk_info, values);
 				return;
 			}
 			if (result_set != 0) {
@@ -601,8 +601,8 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	}
 
 	// Cache the result (slot is already in the map)
-	table_meta.pk_info.exists = !table_meta.pk_info.columns.empty();
-	table_meta.pk_info.ComputeRowIdType();
+	// Spec 077 W1: the second result set was every unique index; choose now.
+	table_meta.pk_info.FinalizeChoice(database_collation_);
 	table_meta.pk_loaded = true;
 	table_meta.columns_load_state = CacheLoadState::LOADED;
 	table_meta.columns_last_refresh = std::chrono::steady_clock::now();

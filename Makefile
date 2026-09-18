@@ -569,6 +569,30 @@ test-index-kind:
 	@echo "Running MSSQLIndexKind unit test..."
 	build/test/test_index_kind
 
+# Spec 077 W1: ChooseRowIdKey — which index becomes a table's rowid, and why
+# each one that does not was rejected. Header-only, no server, no linking.
+test-rowid-key-choice:
+	@echo "Building ChooseRowIdKey unit test (spec 077 W1)..."
+	@mkdir -p build/test
+	$(CXX) $(INDEX_KIND_TEST_FLAGS) $(INDEX_KIND_TEST_INCLUDES) \
+	    test/cpp/test_rowid_key_choice.cpp \
+	    -o build/test/test_rowid_key_choice
+	@echo ""
+	@echo "Running ChooseRowIdKey unit test..."
+	build/test/test_rowid_key_choice
+
+# Spec 077 W2: the IDENTITY_INSERT bracket text and the explained server
+# refusals (1088 / 8106 / 8107). Header-only, no server, no linking.
+test-identity-insert:
+	@echo "Building IDENTITY_INSERT unit test (spec 077 W2)..."
+	@mkdir -p build/test
+	$(CXX) $(INDEX_KIND_TEST_FLAGS) $(INDEX_KIND_TEST_INCLUDES) \
+	    test/cpp/test_identity_insert.cpp \
+	    -o build/test/test_identity_insert
+	@echo ""
+	@echo "Running IDENTITY_INSERT unit test..."
+	build/test/test_identity_insert
+
 # Spec 063 D1: MSSQLResolveLoadPolicy — who supplies a bulk-load writer's
 # connection, and how many writers there may be.
 #

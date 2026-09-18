@@ -9,6 +9,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An `UPDATE`/`DELETE` through a `varchar` key under a `SQL_` collation no
+  longer changes rows it was not given.** Every rowid value is sent as an
+  `N'…'` literal, so the key join compared a `char`/`varchar` key column under
+  its collation's Unicode rules, where `'Straße'` equals `'Strasse'` and `'Æ'`
+  equals `'AE'` — while the unique index, under the non-Unicode SQL sort
+  order, holds them as distinct keys. Measured on
+  `SQL_Latin1_General_CP1_CI_AS`, the installation default: deleting the
+  `'Straße'` row deleted `'Strasse'` too, and updating `'Æ'` updated `'AE'`,
+  both without an error. The join now converts the sent value back to the
+  column's own type and collation, so the comparison is the one the index
+  made. Present for a `varchar` primary key before spec 077; spec 077 would
+  have extended it to every such unique index. Windows and UTF-8 collations
+  apply the same rules to `varchar` and `nvarchar` and are unchanged.
+
+- **An `INSERT` that supplies identity values works** (spec 077 W2). Naming the
+  identity column — explicitly, or positionally with a value for every column —
+  used to fail with the server's error 544; the statement's connection is now
+  bracketed with `SET IDENTITY_INSERT … ON` before its first batch and `OFF`
+  before its `COMMIT`, and the values land verbatim. `OFF` is guaranteed on
+  every way out — after a failing batch, after `ROLLBACK` on a transaction's
+  pinned connection, and from the destructor on an unwind, bounded by a
+  timeout since that path carries no query timeout — and a connection on which
+  it could not be confirmed is discarded rather than returned to the pool. A
+  transaction's pinned connection cannot be discarded: there an unconfirmed
+  `OFF` lasts until the transaction ends, whose session reset clears it under
+  the default `mssql_reset_connection = true` and, by that setting's meaning,
+  not under `false`.
+  Measured both ways: with the `OFF` deliberately leaked, the next ordinary
+  `INSERT` on that session fails with the server's 545. The server's refusals
+  of the `ON` are explained rather than relayed: 1088 says the statement needs
+  ALTER on the table (the server's own text claims the table may not exist),
+  8106 that the catalog's `is_identity` is stale and `mssql_invalidate_cache()`
+  is the fix, 8107 that another table is already `ON` for this session and
+  where that could have come from. A NULL in a named identity column is refused
+  before anything is sent — DuckDB hands `DEFAULT` and `NULL` to the extension
+  identically — with the way out named, which also covers a batch mixing rows
+  that supply the value with rows that do not. **This stays the statement
+  path:** tens of rows, not millions; loading many rows with their identity
+  values is `COPY`, which keeps a source column named like the identity column
+  and lets the server assign when it is omitted.
+
+- **`rowid`, and with it `UPDATE`/`DELETE`, no longer require a primary key**
+  (spec 077 W1). A table with no primary key but a usable unique index — one
+  that is not filtered, not disabled, and whose key columns are all NOT NULL —
+  gets its rowid from that index; a `BIGINT IDENTITY … UNIQUE` is the common
+  shape. Among several, the order is documented and unit-tested: a
+  single-column identity key first, then the fewest key columns, then the
+  narrowest, then the lowest `index_id`. A usable primary key still wins.
+
+  **A primary key that cannot address a row now falls through instead of being
+  taken.** A `DATETIME` key produced an `UPDATE` that reported success and
+  changed nothing ([#358](https://github.com/hugr-lab/mssql-extension/issues/358):
+  a `datetime` value with a 1/300-second fraction — `.003`, `.007`, most of
+  them — equals no `datetime2` literal at any precision; one on a whole 10 ms
+  did match, and is refused with the rest), a
+  `TIME(7)` or `DATETIMEOFFSET(7)` key does the same the other way round (the
+  read path keeps microseconds, so a key whose 100 ns digit is set comes back
+  truncated and its literal never matches — measured: three such rows, one
+  updated), and a `SQL_VARIANT` key does the same through its lossy read
+  ([#354](https://github.com/hugr-lab/mssql-extension/issues/354)).
+  `SMALLDATETIME` and `DATETIME2(7)` keys match their literals and stay usable. Such a
+  table now uses another unique index if it has one, and otherwise refuses by
+  name — a behaviour change, and a deliberate one, since what it replaces is a
+  statement that did nothing and said so to nobody. Every refusal names what
+  was looked for and why each candidate was rejected: the index, the column,
+  and the reason. The discovery query itself lost its `sys.types` join, which
+  dropped every CLR UDT key column and could return a primary key with a column
+  missing — and its `sys.key_constraints` join with it. Returning every unique
+  index therefore costs no more than returning the one primary key did, and on
+  a small catalog less: measured server-side, 2000 executions a run, four
+  interleaved runs, 151 → 38 µs on the test database (a primary key and two
+  ordinary indexes; 267 → 92 µs with eight unique indexes). On a catalog of
+  3000 tables and 9200 indexes the joins matter less and the extra rows a
+  little more: 58 → 49 µs against the query as it shipped, and 6 µs (14%)
+  more than a primary-key-only query without the joins would cost. Tens of
+  microseconds either way, inside a batch that already pays a round trip.
+
 - **`NOT IN` on a string column reaches the server**
   ([#366](https://github.com/hugr-lab/mssql-extension/issues/366)). DuckDB
   binds `v NOT IN (...)` as `NOT (v IN (...))`, and the filter encoder had no
