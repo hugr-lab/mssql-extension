@@ -634,6 +634,26 @@ static unique_ptr<LocalTableFunctionState> TableScanInitLocal(ExecutionContext &
 //------------------------------------------------------------------------------
 
 // Helper function to populate rowid vector from PK columns
+// A projected key column copied into the rowid slot — a STRUCT child, or the
+// scalar rowid itself. The two vectors share a physical type and can differ
+// in LOGICAL type: the projected column is reported as MSSQL_VARCHAR(n) /
+// MSSQL_NVARCHAR(n) under mssql_catalog_native_types (spec 060), while the
+// rowid is typed from the column's plain duckdb_type. A typed Copy asserts on
+// that in a debug build (issue #369; release builds copied the same bytes
+// and returned the rows). The copy goes through a view of the source in the
+// target's type — the same bytes, no cast — which is what the extension-type
+// rule asks for: reinterpret, never a no-op cast.
+static void CopyKeyColumn(Vector &src, Vector &dst, idx_t row_count) {
+	if (src.GetType() == dst.GetType()) {
+		VectorOperations::Copy(src, dst, row_count, 0, 0);
+		return;
+	}
+	D_ASSERT(src.GetType().InternalType() == dst.GetType().InternalType());
+	Vector view(dst.GetType(), nullptr);
+	view.Reinterpret(src);
+	VectorOperations::Copy(view, dst, row_count, 0, 0);
+}
+
 static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, idx_t row_count) {
 	if (!state.rowid_requested || row_count == 0) {
 		return;
@@ -662,7 +682,7 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 					// This PK column is in the projection - copy to STRUCT child
 					auto &src_vector = output.data[output_idx];
 					auto &dst_vector = entries[pk_idx];
-					VectorOperations::Copy(src_vector, dst_vector, row_count, 0, 0);
+					CopyKeyColumn(src_vector, dst_vector, row_count);
 					MSSQL_SCAN_DEBUG_LOG(2, "Execute: copied PK column %llu from output[%llu] to STRUCT child",
 										 (unsigned long long)pk_idx, (unsigned long long)output_idx);
 				}
@@ -688,7 +708,7 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 			auto &dst_vector = entries[pk_idx];
 
 			// Copy the PK column data to the struct child
-			VectorOperations::Copy(src_vector, dst_vector, row_count, 0, 0);
+			CopyKeyColumn(src_vector, dst_vector, row_count);
 		}
 
 		// Set validity for the struct itself (valid if any child is valid)
@@ -704,7 +724,7 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 		auto &src_vector = output.data[src_col_idx];
 
 		// Copy the PK column to rowid vector
-		VectorOperations::Copy(src_vector, rowid_vector, row_count, 0, 0);
+		CopyKeyColumn(src_vector, rowid_vector, row_count);
 
 		MSSQL_SCAN_DEBUG_LOG(2, "Execute: populated scalar rowid from column %llu for %llu rows",
 							 (unsigned long long)src_col_idx, (unsigned long long)row_count);

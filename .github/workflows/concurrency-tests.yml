@@ -224,6 +224,15 @@ jobs:
       - name: Run transaction-pin contention test (issue #356)
         run: make test-transaction-pin
 
+      # The rowid suite under the DEBUG build (issue #369): the scan's copy
+      # of a projected key column into the rowid slot asserted on the logical
+      # type — MSSQL_VARCHAR(n) against VARCHAR — and a release build never
+      # says so. Eight small files against the server that is already up.
+      - name: Run the rowid suite against the debug build (issue #369)
+        run: |
+          MSSQL_TESTDB_DSN="Server=localhost,1433;Database=TestDB;User Id=sa;Password=${MSSQL_TEST_PASS:-TestPassword1};TrustServerCertificate=yes" \
+            build/debug/test/unittest "test/sql/rowid/*"
+
       - name: Dump SQL Server logs on failure
         if: failure()
         run: |

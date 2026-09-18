@@ -1,0 +1,135 @@
+# name: test/sql/rowid/rowid_native_types.test
+# description: rowid over string key columns while the catalog reports native types (issue #369)
+# group: [rowid]
+#
+# Under mssql_catalog_native_types = true (the default, spec 060) a string
+# column is reported as MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n), while the rowid
+# — the scalar one and every child of the composite STRUCT — is typed from
+# the column's plain duckdb_type. When the key column is also projected, the
+# scan copies its vector into the rowid slot: same bytes, two logical types,
+# and the typed copy asserted in a DEBUG build (release builds returned the
+# rows). The copy now goes through a reinterpreting view. This file runs in
+# the debug CI lane for that reason; in a release build it only pins the rows
+# and the types.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS nt (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('nt', 'DROP TABLE IF EXISTS dbo.RowidNativeComposite, dbo.RowidNativeScalar');
+
+statement ok
+SELECT mssql_exec('nt', 'CREATE TABLE dbo.RowidNativeComposite (k1 INT NOT NULL, k2 VARCHAR(10) NOT NULL, v INT, PRIMARY KEY (k1, k2))');
+
+statement ok
+SELECT mssql_exec('nt', 'CREATE TABLE dbo.RowidNativeScalar (k NVARCHAR(10) PRIMARY KEY, v INT)');
+
+statement ok
+SELECT mssql_exec('nt', 'INSERT INTO dbo.RowidNativeComposite VALUES (1, ''x'', 10), (1, ''y'', 11), (2, ''x'', 20)');
+
+statement ok
+SELECT mssql_exec('nt', 'INSERT INTO dbo.RowidNativeScalar VALUES (N''a'', 1), (N''b'', 2)');
+
+# The columns are the native types, the rowid is typed from the plain ones.
+query I
+SELECT typeof(k2) FROM nt.dbo.RowidNativeComposite LIMIT 1;
+----
+MSSQL_VARCHAR(10)
+
+query I
+SELECT typeof(rowid) FROM nt.dbo.RowidNativeComposite LIMIT 1;
+----
+STRUCT(k1 INTEGER, k2 VARCHAR)
+
+# Composite key with the string column projected beside rowid — the shape
+# that asserted.
+query III
+SELECT k1, k2, rowid FROM nt.dbo.RowidNativeComposite ORDER BY k1, k2;
+----
+1	x	{'k1': 1, 'k2': x}
+1	y	{'k1': 1, 'k2': y}
+2	x	{'k1': 2, 'k2': x}
+
+# Only the string key column projected, and only the int one.
+query II
+SELECT k2, rowid FROM nt.dbo.RowidNativeComposite WHERE k1 = 2;
+----
+x	{'k1': 2, 'k2': x}
+
+query II
+SELECT k1, rowid FROM nt.dbo.RowidNativeComposite WHERE k2 = 'y';
+----
+1	{'k1': 1, 'k2': y}
+
+# Scalar string key projected beside rowid.
+query II
+SELECT k, rowid FROM nt.dbo.RowidNativeScalar ORDER BY k;
+----
+a	a
+b	b
+
+query I
+SELECT typeof(rowid) FROM nt.dbo.RowidNativeScalar LIMIT 1;
+----
+VARCHAR
+
+# DML through those rowids still addresses the right rows.
+query I
+UPDATE nt.dbo.RowidNativeComposite SET v = v + 100 WHERE k2 = 'x';
+----
+2
+
+query III
+SELECT k1, k2, v FROM nt.dbo.RowidNativeComposite ORDER BY k1, k2;
+----
+1	x	110
+1	y	11
+2	x	120
+
+query I
+DELETE FROM nt.dbo.RowidNativeScalar WHERE k = 'a';
+----
+1
+
+query I
+SELECT count(*) FROM nt.dbo.RowidNativeScalar;
+----
+1
+
+# The same shapes with native types off: one logical type on both sides.
+statement ok
+SET mssql_catalog_native_types = false;
+
+statement ok
+SELECT mssql_invalidate_cache('nt');
+
+query I
+SELECT typeof(k2) FROM nt.dbo.RowidNativeComposite LIMIT 1;
+----
+VARCHAR
+
+query III
+SELECT k1, k2, rowid FROM nt.dbo.RowidNativeComposite ORDER BY k1, k2;
+----
+1	x	{'k1': 1, 'k2': x}
+1	y	{'k1': 1, 'k2': y}
+2	x	{'k1': 2, 'k2': x}
+
+statement ok
+SET mssql_catalog_native_types = true;
+
+statement ok
+SELECT mssql_exec('nt', 'DROP TABLE dbo.RowidNativeComposite, dbo.RowidNativeScalar');
+
+statement ok
+SET mssql_exec_invalidate_cache = false;
+
+statement ok
+DETACH nt;
