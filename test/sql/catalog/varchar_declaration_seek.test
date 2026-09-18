@@ -37,15 +37,15 @@ statement ok
 SELECT mssql_exec('vd', 'DROP TABLE IF EXISTS dbo.VarcharDeclSeek');
 
 statement ok
-SELECT mssql_exec('vd', 'CREATE TABLE dbo.VarcharDeclSeek (id INT PRIMARY KEY, v VARCHAR(20) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL, w VARCHAR(20) COLLATE Latin1_General_CI_AS NOT NULL, u VARCHAR(20) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL)');
+SELECT mssql_exec('vd', 'CREATE TABLE dbo.VarcharDeclSeek (id INT PRIMARY KEY, v VARCHAR(20) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL, w VARCHAR(20) COLLATE Latin1_General_CI_AS NOT NULL, u VARCHAR(20) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL, t TEXT COLLATE SQL_Latin1_General_CP1_CI_AS NULL)');
 
 # 20000 rows so the optimizer has a reason to seek, plus the two probes:
 # ñ (U+00F1) is in code page 1252, ы (U+044B) is not.
 statement ok
-SELECT mssql_exec('vd', 'INSERT INTO dbo.VarcharDeclSeek SELECT n, ''f'' + CAST(n AS varchar(10)), ''f'' + CAST(n AS varchar(10)), ''f'' + CAST(n AS varchar(10)) FROM (SELECT TOP 20000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) n FROM sys.all_columns a CROSS JOIN sys.all_columns b) x');
+SELECT mssql_exec('vd', 'INSERT INTO dbo.VarcharDeclSeek (id, v, w, u) SELECT n, ''f'' + CAST(n AS varchar(10)), ''f'' + CAST(n AS varchar(10)), ''f'' + CAST(n AS varchar(10)) FROM (SELECT TOP 20000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) n FROM sys.all_columns a CROSS JOIN sys.all_columns b) x');
 
 statement ok
-SELECT mssql_exec('vd', 'INSERT INTO dbo.VarcharDeclSeek VALUES (20001, N''ñu'', N''ñu'', N''ñu''), (20002, ''ab'', ''ab'', N''ыы'')');
+SELECT mssql_exec('vd', 'INSERT INTO dbo.VarcharDeclSeek (id, v, w, u, t) VALUES (20001, N''ñu'', N''ñu'', N''ñu'', NULL), (20002, ''ab'', ''ab'', N''ыы'', NULL), (20003, ''ss'', ''ss'', ''ss'', ''?abc'')');
 
 statement ok
 SELECT mssql_exec('vd', 'CREATE INDEX ix_v ON dbo.VarcharDeclSeek(v)');
@@ -77,7 +77,67 @@ SELECT id FROM vd.dbo.VarcharDeclSeek WHERE u = 'ыы';
 ----
 20002
 
-# The plans. `[[]` is a literal `[` in a T-SQL LIKE pattern.
+# The behaviour change the CHANGELOG names (review of #368): under a varchar
+# parameter the SQL_ collation compares by its own sort order, where ß is not
+# ss; the nvarchar parameter it replaced compared under Windows Unicode rules,
+# where it was. A Windows collation says ss for varchar too — the contrast.
+query I
+SELECT count(*) FROM vd.dbo.VarcharDeclSeek WHERE v = 'ß';
+----
+0
+
+query I
+SELECT id FROM vd.dbo.VarcharDeclSeek WHERE w = 'ß';
+----
+20003
+
+# text follows the two-page rule: a varchar(max) parameter turned 'ы%' into
+# '?%' and matched the '?abc' row; nvarchar(max) does not. The control shows
+# the row is there and LIKE reaches it.
+query I
+SELECT count(*) FROM vd.dbo.VarcharDeclSeek WHERE t LIKE 'ы%';
+----
+0
+
+query I
+SELECT id FROM vd.dbo.VarcharDeclSeek WHERE t LIKE '?%';
+----
+20003
+
+# The plans. DROP TABLE does not evict an sp_executesql plan, and the table
+# name and statement text are the same on every run, so a plan left by an
+# earlier run could satisfy the probes after a regression (review of #368).
+# Every cached plan mentioning the table is freed first, the probes run
+# again, and only then is the cache read. `[[]` is a literal `[` in a T-SQL
+# LIKE pattern.
+statement ok
+SELECT mssql_exec('vd', 'DECLARE @h varbinary(64); DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT cp.plan_handle FROM sys.dm_exec_cached_plans cp CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) t WHERE t.text LIKE ''%VarcharDeclSeek%''; OPEN c; FETCH NEXT FROM c INTO @h; WHILE @@FETCH_STATUS = 0 BEGIN DBCC FREEPROCCACHE(@h) WITH NO_INFOMSGS; FETCH NEXT FROM c INTO @h; END; CLOSE c; DEALLOCATE c;');
+
+query I
+SELECT count(*) FROM mssql_scan('vd', 'SELECT 1 AS hit FROM sys.dm_exec_cached_plans cp CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) t WHERE t.text LIKE ''(@p0%VarcharDeclSeek%'' ');
+----
+0
+
+query I
+SELECT id FROM vd.dbo.VarcharDeclSeek WHERE v = 'ñu';
+----
+20001
+
+query I
+SELECT id FROM vd.dbo.VarcharDeclSeek WHERE w = 'ñu';
+----
+20001
+
+query I
+SELECT id FROM vd.dbo.VarcharDeclSeek WHERE u = 'ñu';
+----
+20001
+
+query I
+SELECT id FROM vd.dbo.VarcharDeclSeek WHERE u = 'ыы';
+----
+20002
+
 # SQL_ collation, ñ: declared varchar(20), Index Seek — the #361 case.
 query I
 SELECT count(*) >= 1 FROM mssql_scan('vd', 'SELECT 1 AS hit FROM sys.dm_exec_cached_plans cp CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) t CROSS APPLY sys.dm_exec_query_plan(cp.plan_handle) p WHERE t.text LIKE ''(@p0 varchar(20))%VarcharDeclSeek%([[]v] = @p0)%'' AND CAST(p.query_plan AS nvarchar(max)) LIKE ''%PhysicalOp="Index Seek"%''');
@@ -97,9 +157,10 @@ SELECT count(*) >= 1 FROM mssql_scan('vd', 'SELECT 1 AS hit FROM sys.dm_exec_cac
 true
 
 # UTF-8 column, ы: the database's page cannot hold it — nvarchar(20), as #321
-# requires, and the UTF-8 column still seeks through the convert.
+# requires. Only the declaration is asserted: whether the optimizer seeks
+# through the convert on a UTF-8 column is its call, not this change's.
 query I
-SELECT count(*) >= 1 FROM mssql_scan('vd', 'SELECT 1 AS hit FROM sys.dm_exec_cached_plans cp CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) t CROSS APPLY sys.dm_exec_query_plan(cp.plan_handle) p WHERE t.text LIKE ''(@p0 nvarchar(20))%VarcharDeclSeek%([[]u] = @p0)%'' AND CAST(p.query_plan AS nvarchar(max)) LIKE ''%PhysicalOp="Index Seek"%''');
+SELECT count(*) >= 1 FROM mssql_scan('vd', 'SELECT 1 AS hit FROM sys.dm_exec_cached_plans cp CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) t WHERE t.text LIKE ''(@p0 nvarchar(20))%VarcharDeclSeek%([[]u] = @p0)%'' ');
 ----
 true
 

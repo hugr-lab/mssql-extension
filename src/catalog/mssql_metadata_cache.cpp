@@ -245,7 +245,6 @@ WHERE c.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
 ORDER BY c.column_id
 )";
 
-// A bit column as the simple-query layer renders it.
 // COLLATIONPROPERTY(name, 'CodePage') as the server sends it: an int, NULL for a
 // non-text column (and for a collation the server has no page for, which
 // then declares as nvarchar — the safe side).
@@ -260,6 +259,7 @@ static int32_t ParseCodePage(const vector<string> &values, idx_t idx) {
 	}
 }
 
+// A bit column as the simple-query layer renders it.
 static bool FlagIsSet(const string &value) {
 	return value == "1" || value == "true" || value == "True";
 }
