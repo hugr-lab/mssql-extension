@@ -266,6 +266,13 @@ std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalTy
 
 namespace {
 
+// Items ONE IN / NOT IN operator expression may carry to the server; a longer
+// list is evaluated by DuckDB (see EncodeOperatorExpression). The cap is per
+// predicate on purpose: with parameterisation on, the statement's budget is
+// SqlParamSet::MAX_PARAMS (constants past it become literals), and with it
+// off a batch of several capped lists is still bounded by their number.
+constexpr size_t MAX_PUSHED_IN_ITEMS = 256;
+
 // UTF-16 code units of a UTF-8 string: one per lead byte, two for a 4-byte
 // sequence (a surrogate pair). This is nvarchar's unit.
 size_t Utf16Units(const std::string &text) {
@@ -1152,6 +1159,66 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 			return {"", false};
 		}
 		return {"(" + child_result.sql + " IS NOT NULL)", true};
+	}
+
+	// IN arrives here as an operator expression whenever the filter combiner
+	// did not turn it into a table filter: always for NOT IN, which DuckDB
+	// binds as NOT over COMPARE_IN (the NOT case above wraps this one; there
+	// is no NotInFilter, issue #366), and for IN whose operand is not a bare
+	// column. COMPARE_NOT_IN is rendered too, should a plan ever carry it.
+	// Children: [0] the operand, [1..] the list. The list's constants are
+	// declared from the operand's column exactly as a comparison's constant is
+	// (spec 076), so a varchar list keeps the seek. A NULL in the list gives
+	// the same three-valued answer on both sides (no row for NOT IN), so
+	// nothing is special-cased. Without this case NOT IN was the one string
+	// predicate evaluated client-side, under DuckDB's equality, while <>,
+	// NOT LIKE and the ranges beside it were the server's (spec 079 D4).
+	if (expr.GetExpressionType() == ExpressionType::COMPARE_IN ||
+		expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) {
+		const auto &children = expr.GetChildren();
+		if (children.size() < 2) {
+			return {"", false};
+		}
+		// A long list stays client-side, as it always was (#367 review): every
+		// item is one sp_executesql parameter out of the statement's 2000, or
+		// one literal of an unbounded batch with parameterisation off, and a
+		// list of thousands is where the server answers 8623/8632 instead of
+		// rows. 256 covers the hand-written and the tool-generated lists;
+		// above it the whole predicate is refused and DuckDB evaluates it. The
+		// cap is per predicate: several lists in one WHERE each get it, and
+		// their total is bounded by SqlParamSet::MAX_PARAMS when parameterised
+		// (the sink turns the rest into literals) and by their count when not.
+		// A bare-column IN is a table filter (EncodeInFilter) and is not capped.
+		if (children.size() - 1 > MAX_PUSHED_IN_ITEMS) {
+			MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN list of %llu items exceeds %llu, left to DuckDB",
+								   (unsigned long long)(children.size() - 1), (unsigned long long)MAX_PUSHED_IN_ITEMS);
+			return {"", false};
+		}
+		auto operand_ctx = ctx.child();
+		auto operand_result = EncodeValueExpression(*children[0], operand_ctx);
+		if (!operand_result.supported) {
+			MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN operand encoding failed");
+			return {"", false};
+		}
+		auto item_ctx = ctx.child();
+		item_ctx.constant_peer = ColumnInfoOf(*children[0], ctx);
+		const bool negated = expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN;
+		std::string sql = "(" + operand_result.sql + (negated ? " NOT IN (" : " IN (");
+		for (idx_t i = 1; i < children.size(); i++) {
+			auto item_result = EncodeValueExpression(*children[i], item_ctx);
+			if (!item_result.supported) {
+				MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN list item %llu encoding failed",
+									   (unsigned long long)i);
+				return {"", false};
+			}
+			if (i > 1) {
+				sql += ", ";
+			}
+			sql += item_result.sql;
+		}
+		sql += "))";
+		MSSQL_FILTER_DEBUG_LOG(2, "EncodeOperatorExpression: encoded -> %s", sql.c_str());
+		return {sql, true};
 	}
 
 	// For other operators, we don't support them yet

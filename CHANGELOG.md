@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`NOT IN` on a string column reaches the server**
+  ([#366](https://github.com/hugr-lab/mssql-extension/issues/366)). DuckDB
+  binds `v NOT IN (...)` as `NOT (v IN (...))`, and the filter encoder had no
+  case for `IN` as an operator expression (only for the table filter the
+  combiner builds from a bare-column `IN`), so `NOT IN` — and `IN` over an
+  expression such as `n + 1 IN (2, 3)` — ran client-side after a full
+  transfer, and under DuckDB's byte equality: on a `_CI` collation
+  `v NOT IN ('ab', 'x')` kept `ab␣` and `AB` where `v <> 'ab'` beside it did
+  not. Both now render as `[v] [NOT] IN (@p1, @p2)` with the list declared
+  from the operand's column (spec 076), the server's answer like every other
+  string predicate (spec 079 D4), and a seek where the column is indexed.
+  `NOT IN` lists, and `IN` over an expression, longer than 256 items stay
+  client-side, as they did before this change (each item is one of the
+  statement's 2000 parameters; the cap is per predicate); a bare-column `IN`
+  is a table filter and is not capped, as it never was.
 - **A non-ASCII constant no longer costs the index seek on a `SQL_` collation**
   ([#361](https://github.com/hugr-lab/mssql-extension/issues/361)). Spec 076
   declared any non-ASCII constant of a pushed filter as an `nvarchar`
