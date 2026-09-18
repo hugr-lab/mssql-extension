@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `v NOT IN ('ab', 'x')` kept `ab␣` and `AB` where `v <> 'ab'` beside it did
   not. Both now render as `[v] [NOT] IN (@p1, @p2)` with the list declared
   from the operand's column (spec 076), the server's answer like every other
-  string predicate (spec 079 D4), and a seek where the column is indexed.
+  string predicate (spec 079 D4), and a seek where the column is indexed. Lists
+  longer than 256 items stay client-side, as every list did before: each
+  item is one of the statement's 2000 parameters.
 - **`COPY` no longer drops a CLR UDT column of an existing target in silence**
   ([#353](https://github.com/hugr-lab/mssql-extension/issues/353)). The
   target-metadata query joined `sys.types` on `system_type_id`, which no

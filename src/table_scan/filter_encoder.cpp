@@ -265,6 +265,10 @@ std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalTy
 
 namespace {
 
+// Items an IN / NOT IN operator expression may carry to the server; longer
+// lists are evaluated by DuckDB (see EncodeOperatorExpression).
+constexpr size_t MAX_PUSHED_IN_ITEMS = 256;
+
 bool IsAscii(const std::string &text) {
 	for (unsigned char c : text) {
 		if (c >= 0x80) {
@@ -1165,6 +1169,17 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 		expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) {
 		const auto &children = expr.GetChildren();
 		if (children.size() < 2) {
+			return {"", false};
+		}
+		// A long list stays client-side, as it always was (#367 review): every
+		// item is one sp_executesql parameter out of the statement's 2000, or
+		// one literal of an unbounded batch with parameterisation off, and a
+		// list of thousands is where the server answers 8623/8632 instead of
+		// rows. 256 covers the hand-written and the tool-generated lists;
+		// above it the whole predicate is refused and DuckDB evaluates it.
+		if (children.size() - 1 > MAX_PUSHED_IN_ITEMS) {
+			MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN list of %llu items exceeds %llu, left to DuckDB",
+								   (unsigned long long)(children.size() - 1), (unsigned long long)MAX_PUSHED_IN_ITEMS);
 			return {"", false};
 		}
 		auto operand_ctx = ctx.child();
