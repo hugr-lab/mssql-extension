@@ -12,6 +12,7 @@
 #include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "mssql_function_docs.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -91,7 +92,6 @@ void RegisterAzureTestFunction(ExtensionLoader &loader) {
 						 AzureAuthTestFunction);
 	func1.SetVolatile();
 	func1.SetFallible();
-	loader.RegisterFunction(func1);
 
 	// Version 2: secret_name + tenant_id (for interactive auth)
 	ScalarFunction func2("mssql_azure_auth_test",
@@ -100,7 +100,14 @@ void RegisterAzureTestFunction(ExtensionLoader &loader) {
 						 AzureAuthTestFunctionWithTenant);
 	func2.SetVolatile();
 	func2.SetFallible();
-	loader.RegisterFunction(func2);
+	RegisterDocumentedFunction(
+		loader, {func1, func2},
+		{{"secret", "tenant"},
+		 "Acquires an Azure AD access token with the named azure secret, without connecting to SQL Server, and "
+		 "returns the start of the token or the error. tenant overrides the secret's tenant for interactive "
+		 "(device code) authentication.",
+		 {"mssql_azure_auth_test('my_azure_secret')"},
+		 {"authentication"}});
 }
 
 }  // namespace azure

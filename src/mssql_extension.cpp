@@ -15,6 +15,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "mssql_function_docs.hpp"
 #include "mssql_functions.hpp"
 #include "mssql_secret.hpp"
 #include "mssql_storage.hpp"
@@ -211,9 +212,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	}
 
 	// 10. Register utility functions (mssql_version)
-	auto mssql_version_func = ScalarFunction("mssql_version", {},  // No arguments
-											 LogicalType::VARCHAR, MssqlVersionFunction);
-	loader.RegisterFunction(mssql_version_func);
+	mssql::RegisterDocumentedFunction(
+		loader, {ScalarFunction("mssql_version", {}, LogicalType::VARCHAR, MssqlVersionFunction)},
+		{{}, "Returns the version of the mssql extension.", {"mssql_version()"}, {"utility"}});
 
 	// 11. Register Azure authentication test function
 	mssql::azure::RegisterAzureTestFunction(loader);

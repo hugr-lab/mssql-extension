@@ -338,7 +338,7 @@ When possible, regex patterns are converted to SQL Server `LIKE` clauses via `Tr
 
 **Files**: `src/catalog/mssql_preload_catalog.cpp`, `src/include/catalog/mssql_preload_catalog.hpp`
 
-The `mssql_preload_catalog(catalog_name [, schema_name])` scalar function triggers `MSSQLMetadataCache::BulkLoadAll()` to load all schemas, tables, and columns in bulk.
+The `mssql_preload_catalog(context [, schema])` scalar function triggers `MSSQLMetadataCache::BulkLoadAll()` to load all schemas, tables, and columns in bulk.
 
 ### Per-Schema Iteration Strategy
 

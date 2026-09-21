@@ -6,6 +6,7 @@
 #include "catalog/mssql_statistics.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/string_vector.hpp"
+#include "mssql_function_docs.hpp"
 #include "mssql_storage.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -162,7 +163,7 @@ static void MSSQLPreloadCatalogExecute(DataChunk &args, ExpressionState &state, 
 //===----------------------------------------------------------------------===//
 
 void RegisterMSSQLPreloadCatalogFunction(ExtensionLoader &loader) {
-	// mssql_preload_catalog(catalog_name VARCHAR [, schema_name VARCHAR]) -> VARCHAR
+	// mssql_preload_catalog(context VARCHAR [, schema VARCHAR]) -> VARCHAR
 	// Trailing ctor arg is varargs = VARCHAR: the optional schema_name.
 	ScalarFunction func("mssql_preload_catalog", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
 						MSSQLPreloadCatalogExecute, MSSQLPreloadCatalogBind, nullptr, nullptr, LogicalType::VARCHAR);
@@ -170,7 +171,14 @@ void RegisterMSSQLPreloadCatalogFunction(ExtensionLoader &loader) {
 	// Mutates the metadata cache: never constant-fold at plan time (issue #178 D1)
 	func.SetVolatile();
 	func.SetFallible();
-	loader.RegisterFunction(func);
+	// The optional schema is a VARCHAR vararg, which a signature cannot name.
+	mssql::RegisterDocumentedFunction(
+		loader, {func},
+		{{"context"},
+		 "Loads the metadata of every schema, table and column of an attached SQL Server database in bulk -- or of "
+		 "one schema, given as a second argument -- and returns a summary of what it loaded.",
+		 {"mssql_preload_catalog('db')", "mssql_preload_catalog('db', 'dbo')"},
+		 {"catalog"}});
 }
 
 }  // namespace duckdb

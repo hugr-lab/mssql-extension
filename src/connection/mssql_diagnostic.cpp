@@ -6,6 +6,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "mssql_function_docs.hpp"
 
 namespace duckdb {
 
@@ -169,7 +170,14 @@ void MSSQLPoolStatsFunction::Execute(ClientContext &context, TableFunctionInput 
 
 void RegisterMSSQLDiagnosticFunctions(ExtensionLoader &loader) {
 	// mssql_pool_stats([context_name] VARCHAR) -> TABLE
-	loader.RegisterFunction(MSSQLPoolStatsFunction::GetFunctionSet());
+	mssql::RegisterDocumentedFunction(
+		loader, MSSQLPoolStatsFunction::GetFunctionSet(),
+		{{},
+		 "Returns connection pool statistics -- total, idle, active and pinned connections, acquire counts and "
+		 "timeouts, creation failures and the last creation error -- for every attached SQL Server database, or for "
+		 "the one named.",
+		 {"SELECT * FROM mssql_pool_stats()", "SELECT * FROM mssql_pool_stats('db')"},
+		 {"diagnostics"}});
 }
 
 }  // namespace duckdb

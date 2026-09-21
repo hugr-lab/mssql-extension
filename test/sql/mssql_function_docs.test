@@ -1,0 +1,58 @@
+# name: test/sql/mssql_function_docs.test
+# description: Every mssql function is documented in duckdb_functions() -- description, examples, parameter names (issue #371)
+# group: [mssql]
+#
+# duckdb_functions() is all a client connected to the database can learn about
+# an extension's functions. A function registered without going through
+# mssql::RegisterDocumentedFunction shows up here with no description and
+# col0, col1, ... as its parameters. No server is needed.
+
+require mssql
+
+# Every overload of every function carries a description and an example.
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name LIKE 'mssql%' AND (description IS NULL OR description = '' OR len(examples) = 0 OR len(categories) = 0);
+----
+0
+
+# Scalar parameters are named. Table functions are not held to it: on the 2.0
+# line duckdb_functions() names a table function's positional parameters by
+# position (col0, col1, ...) whatever the registration says.
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name LIKE 'mssql%' AND function_type = 'scalar'
+  AND len(list_filter(parameters, lambda p: p LIKE 'col%')) > 0;
+----
+0
+
+query II
+SELECT function_name, parameters FROM duckdb_functions()
+WHERE function_name IN ('mssql_exec', 'mssql_exec_params', 'mssql_invalidate_cache')
+ORDER BY function_name, len(parameters);
+----
+mssql_exec	[context, sql]
+mssql_exec_params	[context, statement, params]
+mssql_exec_params	[context, statement, params, declarations]
+mssql_invalidate_cache	[context]
+mssql_invalidate_cache	[context, schema]
+mssql_invalidate_cache	[context, schema, table]
+
+# The names are callable: a named argument binds to the parameter and the call
+# reaches the function, whose own error names the missing catalog.
+statement error
+SELECT mssql_invalidate_cache(context := 'no_such_catalog');
+----
+catalog 'no_such_catalog' not found
+
+statement error
+SELECT mssql_exec(sql := 'SELECT 1', context := 'no_such_catalog');
+----
+no_such_catalog
+
+# A name the function does not have matches no overload, and the binder's
+# candidate list now shows the parameter names instead of col0, col1.
+statement error
+SELECT mssql_exec(catalog := 'x', sql := 'SELECT 1');
+----
+<REGEX>:.*No function matches.*mssql_exec\(context VARCHAR, "sql" VARCHAR\).*
