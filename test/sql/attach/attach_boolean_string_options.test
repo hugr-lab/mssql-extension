@@ -1,0 +1,75 @@
+# name: test/sql/attach/attach_boolean_string_options.test
+# description: Boolean ATTACH options accept a string value, as DuckLake's METADATA_PARAMETERS sends them (issue #325)
+# group: [attach]
+#
+# METADATA_PARAMETERS is a MAP(VARCHAR, VARCHAR), and DuckLake forwards each
+# value to the inner ATTACH as a quoted string, so `lazy_validation` arrives
+# as the VARCHAR 'true'. It used to be read through an int8 cast and refused
+# ("Could not convert string 'true' to INT8"). No server is needed: the host
+# does not resolve, so an ATTACH that validates eagerly fails and one that does
+# not succeeds, which tells the two values apart.
+
+require mssql
+
+# The string the DuckLake path sends.
+statement ok
+ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS bool_str_lazy (TYPE mssql, lazy_validation 'true');
+
+statement ok
+DETACH bool_str_lazy;
+
+# The other spellings of DuckDB's boolean cast, in any case, and the alias.
+statement ok
+ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS bool_str_yes (TYPE mssql, LazyValidation 'YES');
+
+statement ok
+DETACH bool_str_yes;
+
+statement ok
+ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS bool_str_one (TYPE mssql, lazy_validation '1', order_pushdown 'no');
+
+statement ok
+DETACH bool_str_one;
+
+# 'false' is honoured, not only parsed: the ATTACH validates and fails on the host.
+statement error
+ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS bool_str_eager (TYPE mssql, lazy_validation 'false');
+----
+MSSQL connection validation failed
+
+# catalog 'false' disables the catalog; the refusal comes before any connection.
+statement ok
+ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS bool_str_nocat (TYPE mssql, lazy_validation 't', catalog 'false');
+
+statement error
+SELECT mssql_refresh_cache('bool_str_nocat');
+----
+attached with catalog=false
+
+statement ok
+DETACH bool_str_nocat;
+
+# A string that is not a boolean is refused, naming the option.
+statement error
+ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS bool_str_bad (TYPE mssql, lazy_validation 'maybe');
+----
+ATTACH option 'lazy_validation' expects a boolean (true/false, yes/no, 1/0), got 'maybe'
+
+# NULL is refused by DuckDB's binder before the option reaches the extension,
+# which is why the parser has no NULL branch.
+statement error
+ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS bool_str_null (TYPE mssql, catalog NULL);
+----
+NULL is not supported as a valid option for ATTACH option
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name LIKE 'bool_str_%';
+----
+0
+
+# A genuine BOOLEAN keeps working as before.
+statement ok
+ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS bool_native (TYPE mssql, lazy_validation true);
+
+statement ok
+DETACH bool_native;
