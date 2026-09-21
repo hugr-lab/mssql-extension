@@ -46,8 +46,21 @@ make docker-up
 This command:
 - Pulls the SQL Server 2022 Docker image (if not present)
 - Starts SQL Server on `localhost:1433`
-- Waits for SQL Server to be healthy
+- Waits for SQL Server to be healthy, and fails if it turns unhealthy or is not healthy within 120 s
 - Runs `docker/init/init.sql` to create test database and data
+
+No `.env` is needed: every variable has a default (`localhost:1433`, user `sa`,
+password `TestPassword1`). To change one, copy the template and edit it; `make`
+reads it and passes the values on to Docker Compose:
+
+```bash
+cp .env.example .env
+```
+
+The usual reason is the port. If another SQL Server on the machine already
+publishes 1433, the tests connect to that one instead and fail with
+`Login failed for user 'sa'`, which looks like a regression but is not. Set
+`MSSQL_TEST_PORT` in `.env` to a free port.
 
 ### 2. Verify Container Status
 
