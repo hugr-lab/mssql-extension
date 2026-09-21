@@ -21,7 +21,7 @@ This guide provides comprehensive instructions for testing the DuckDB MSSQL Exte
 
 ### Required Software
 
-- **Docker** and **Docker Compose** - For running SQL Server test container
+- **Docker** and **Docker Compose** v2.24 or newer - For running SQL Server test container (the compose file marks `.env` optional with the long `env_file` form, which older Compose cannot parse)
 - **CMake** (3.21+) - Build system
 - **Ninja** - Build tool (recommended)
 - **C++17 compiler** - GCC 9+, Clang 10+, or MSVC 2019+
