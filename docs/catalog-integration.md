@@ -338,17 +338,17 @@ When possible, regex patterns are converted to SQL Server `LIKE` clauses via `Tr
 
 **Files**: `src/catalog/mssql_preload_catalog.cpp`, `src/include/catalog/mssql_preload_catalog.hpp`
 
-The `mssql_preload_catalog(catalog_name [, schema_name])` scalar function triggers `MSSQLMetadataCache::BulkLoadAll()` to load all schemas, tables, and columns in bulk.
+The `mssql_preload_catalog(context [, schema])` scalar function triggers `MSSQLMetadataCache::BulkLoadAll()` to load the catalog's metadata up front instead of table by table.
 
-### Per-Schema Iteration Strategy
+### What one call does
 
-`BulkLoadAll()` uses a per-schema iteration strategy instead of a single cross-schema query:
+1. **The schema list** — `EnsureSchemasLoaded`, the same light `sys.schemas` query every catalog lookup starts with, and a no-op when the list is already loaded. It comes first on both paths (issue #376). Without it, the per-schema path marked the list loaded while holding only the one schema it was given, so every other schema stopped existing for the session. The whole-catalog path left the list unloaded, so the first catalog access afterwards cleared the cache and loaded the whole catalog a second time.
+2. **The metadata**:
+   - With no schema, **one** query covers the whole catalog (`LoadAllSchemasMetadata`, spec 071 W2). Its rows are grouped on `object_id` in a hash map, so there is no `ORDER BY` and no per-schema loop.
+   - With a schema, one query covers that schema's tables and columns (`BULK_METADATA_SCHEMA_SQL_TEMPLATE`). A schema that is not in the list, because it is absent from the database or hidden by `schema_filter`, loads nothing and gets no entry.
+3. **Publication and marking** — nothing is written until the query has returned (issue #317). The per-schema path then marks only what it loaded: the target schema's table list, and the columns of the tables in its answer. Every other schema and table keeps its own state.
 
-1. **Discover schemas** — lightweight query against `sys.schemas`
-2. **Per-schema bulk query** — for each schema, load all tables and columns using `BULK_METADATA_SCHEMA_SQL_TEMPLATE`
-3. **Streaming parse** — results are parsed row-by-row, building `MSSQLTableMetadata` entries
-
-This avoids SQL Server tempdb sort spills that occur when `ORDER BY s.name, o.name, c.column_id` operates on millions of rows in a single cross-schema query. Each per-schema query sorts only within one schema's data, which fits in SQL Server's memory grant.
+The returned summary reports what this call loaded: `Preloaded 5 schemas, 66 tables, 374 columns`, or `Preloaded schema 'dbo': 61 tables, 358 columns`. The numbers are the same on every call. Until issue #375, some counters meant "new to the cache", so a second preload reported `0 tables, 358 columns`.
 
 ### Statistics Pre-Population
 

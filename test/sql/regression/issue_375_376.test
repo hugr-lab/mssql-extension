@@ -1,0 +1,185 @@
+# name: test/sql/regression/issue_375_376.test
+# description: mssql_preload_catalog loads the schema list, marks only what it loaded, and reports it (issues #375, #376)
+# group: [mssql]
+# issue: 375
+# issue: 376
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# #376: neither preload path loaded the schema LIST. The per-schema one marked
+# it LOADED holding only the schema it was given -- every other schema of the
+# database stopped existing for the rest of the session -- and marked every
+# schema's tables and every table's columns LOADED, empty or not. The
+# whole-catalog one left it NOT_LOADED, so the first catalog access cleared the
+# cache and loaded the whole catalog again.
+#
+# #375: the summary counted some things "new to the cache" and others "loaded
+# by this call", so a second preload said "0 tables, 358 columns".
+#
+# A schema of its own gives exact numbers: two tables, five columns.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i375_setup (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('i375_setup', 'DROP TABLE IF EXISTS i375.t1, i375.t2');
+
+statement ok
+SELECT mssql_exec('i375_setup', 'IF SCHEMA_ID(''i375'') IS NULL EXEC(''CREATE SCHEMA i375'')');
+
+statement ok
+SELECT mssql_exec('i375_setup', 'CREATE TABLE i375.t1 (a INT, b INT, c INT)');
+
+statement ok
+SELECT mssql_exec('i375_setup', 'CREATE TABLE i375.t2 (x INT, y INT)');
+
+# =============================================================================
+# #375: both paths report what the call loaded, the same on every call
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i375 (TYPE mssql, schema_filter '^i375$');
+
+query I
+SELECT mssql_preload_catalog('i375');
+----
+Preloaded 1 schemas, 2 tables, 5 columns
+
+query I
+SELECT mssql_preload_catalog('i375');
+----
+Preloaded 1 schemas, 2 tables, 5 columns
+
+query I
+SELECT mssql_preload_catalog('i375', 'i375');
+----
+Preloaded schema 'i375': 2 tables, 5 columns
+
+statement ok
+SELECT mssql_invalidate_cache('i375');
+
+query I
+SELECT mssql_preload_catalog('i375', 'i375');
+----
+Preloaded schema 'i375': 2 tables, 5 columns
+
+# A schema the catalog does not show -- here hidden by schema_filter -- loads
+# nothing and gets no phantom entry.
+query I
+SELECT mssql_preload_catalog('i375', 'dbo');
+----
+Preloaded schema 'dbo': 0 tables, 0 columns
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'i375' AND schema_name = 'dbo';
+----
+0
+
+statement ok
+DETACH i375;
+
+# =============================================================================
+# #376: a per-schema preload on a fresh ATTACH keeps every other schema
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i376a (TYPE mssql);
+
+query I
+SELECT mssql_preload_catalog('i376a', 'i375');
+----
+Preloaded schema 'i375': 2 tables, 5 columns
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'i376a' AND schema_name = 'dbo';
+----
+1
+
+query I
+SELECT count(*) > 0 FROM duckdb_tables() WHERE database_name = 'i376a' AND schema_name = 'dbo';
+----
+true
+
+query I
+SELECT count(*) FROM i376a.dbo.TestSimplePK WHERE false;
+----
+0
+
+statement ok
+DETACH i376a;
+
+# =============================================================================
+# #376: a per-schema preload marks only what it loaded. One table of dbo looked
+# up first loads the schema list and that table alone; the preload of another
+# schema then used to mark dbo's table list LOADED too, so dbo came out as
+# holding the one table looked up, for the rest of the session.
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i376b (TYPE mssql);
+
+query I
+SELECT count(*) FROM i376b.dbo.TestSimplePK WHERE false;
+----
+0
+
+statement ok
+SELECT mssql_preload_catalog('i376b', 'i375');
+
+query I
+SELECT count(*) > 1 FROM duckdb_tables() WHERE database_name = 'i376b' AND schema_name = 'dbo';
+----
+true
+
+statement ok
+DETACH i376b;
+
+# =============================================================================
+# #376: a whole-catalog preload is used, not repeated -- listing the catalog
+# right after it runs no metadata query. The fault-injection setting makes any
+# metadata query that returns a row throw, so the listing passes only if it is
+# served from the cache: before the fix it re-ran the schema discovery and the
+# whole-catalog load. (Counting pool acquires cannot say this: the scan path
+# takes a connection before it finds every table already loaded, and sends
+# nothing on it.)
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i376c (TYPE mssql, schema_filter '^i375$');
+
+query I
+SELECT mssql_preload_catalog('i376c');
+----
+Preloaded 1 schemas, 2 tables, 5 columns
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'i376c';
+----
+5
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
+
+statement ok
+DETACH i376c;
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('i375_setup', 'DROP TABLE IF EXISTS i375.t1, i375.t2');
+
+statement ok
+SELECT mssql_exec('i375_setup', 'DROP SCHEMA IF EXISTS i375');
+
+statement ok
+DETACH i375_setup;

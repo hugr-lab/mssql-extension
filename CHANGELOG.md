@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`mssql_preload_catalog` loads the schema list, marks only what it loaded,
+  and reports it** ([#376](https://github.com/hugr-lab/mssql-extension/issues/376),
+  [#375](https://github.com/hugr-lab/mssql-extension/issues/375)). Neither path
+  loaded the schema list:
+  - **Per-schema preload hid the other schemas.**
+    `mssql_preload_catalog('db', 'dbo')` on a fresh ATTACH marked the list
+    loaded while it held only `dbo`, so every other schema was gone for the
+    session: `schema "test" does not exist`. It also marked every schema's table
+    list and every table's columns loaded, so a schema looked up before the
+    preload stayed at the one table that had been looked up.
+  - **Whole-catalog preload was thrown away.** `mssql_preload_catalog('db')`
+    left the list unloaded, so the first catalog access afterwards cleared the
+    cache and ran the whole-catalog query again.
+
+  Both paths now load the schema list first, which is one light query and free
+  when it is already loaded, and mark only what they loaded. A schema the
+  catalog does not show loads nothing and gets no phantom entry. The summary
+  counts what the call loaded, and the numbers are the same on every call.
+  Before, a second preload said `Preloaded schema 'dbo': 0 tables, 358 columns`.
 - **A debug build no longer asserts on `SELECT k, rowid` over a string key
   column** ([#369](https://github.com/hugr-lab/mssql-extension/issues/369)).
   With `mssql_catalog_native_types` on (the default) the projected column is
