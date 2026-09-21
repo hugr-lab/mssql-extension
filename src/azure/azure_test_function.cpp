@@ -104,8 +104,8 @@ void RegisterAzureTestFunction(ExtensionLoader &loader) {
 		loader, {func1, func2},
 		{{"secret", "tenant"},
 		 "Acquires an Azure AD access token with the named azure secret, without connecting to SQL Server, and "
-		 "returns the start of the token or the error. tenant overrides the secret's tenant for interactive "
-		 "(device code) authentication.",
+		 "returns the token abbreviated to its first and last characters and its length, or the error. tenant "
+		 "overrides the secret's tenant for interactive (device code) authentication.",
 		 {"mssql_azure_auth_test('my_azure_secret')"},
 		 {"authentication"}});
 }

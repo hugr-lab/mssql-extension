@@ -38,6 +38,19 @@ mssql_invalidate_cache	[context]
 mssql_invalidate_cache	[context, schema]
 mssql_invalidate_cache	[context, schema, table]
 
+# mssql_preload_catalog's schema is an overload, not a vararg: named and
+# visible, and a third argument is refused instead of ignored.
+query I
+SELECT parameters FROM duckdb_functions() WHERE function_name = 'mssql_preload_catalog' ORDER BY len(parameters);
+----
+[context]
+[context, schema]
+
+statement error
+SELECT mssql_preload_catalog('no_such_catalog', 'dbo', 'extra');
+----
+No function matches
+
 # The names are callable: a named argument binds to the parameter and the call
 # reaches the function, whose own error names the missing catalog.
 statement error
