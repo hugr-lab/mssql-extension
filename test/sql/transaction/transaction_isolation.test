@@ -1,0 +1,209 @@
+# name: test/sql/transaction/transaction_isolation.test
+# description: transaction_isolation sets the level of the server transaction a DuckDB transaction opens, and puts it back (issue #331)
+# group: [transaction]
+
+# Environment variables required:
+#   MSSQL_TEST_DSN (master), MSSQL_TESTDB_DSN, MSSQL_TEST_HOST/PORT/USER/PASS
+#
+# Several scans of one DuckDB transaction are several statements on its pinned
+# connection; under READ COMMITTED a row another session commits between them
+# is seen by the second and not the first. SNAPSHOT reads the whole transaction
+# as of its first access. SQL Server keeps a session's isolation level across the
+# pool's RESET_CONNECTION, so the level a transaction set is put back to READ
+# COMMITTED before the connection returns to the pool -- including after the
+# server aborted the transaction on an update conflict.
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+require-env MSSQL_TESTDB_DSN
+
+require-env MSSQL_TEST_HOST
+
+require-env MSSQL_TEST_PORT
+
+require-env MSSQL_TEST_USER
+
+require-env MSSQL_TEST_PASS
+
+# =============================================================================
+# TestDB has ALLOW_SNAPSHOT_ISOLATION OFF (the server default)
+# =============================================================================
+
+# An explicit snapshot there is refused at ATTACH, not at the first read of the
+# first transaction (where the server raises 3952).
+statement error
+ATTACH '{MSSQL_TESTDB_DSN}' AS ti_off (TYPE mssql, transaction_isolation 'snapshot');
+----
+needs ALLOW_SNAPSHOT_ISOLATION ON in database 'TestDB', and it is OFF
+
+# auto falls back to the server's default level.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ti_auto_off (TYPE mssql, transaction_isolation 'auto');
+
+statement ok
+BEGIN;
+
+query I
+SELECT * FROM mssql_scan('ti_auto_off', 'SELECT CAST(transaction_isolation_level AS INT) FROM sys.dm_exec_sessions WHERE session_id = @@SPID');
+----
+2
+
+statement ok
+COMMIT;
+
+statement ok
+DETACH ti_auto_off;
+
+# An explicit level is in force inside the transaction, and READ COMMITTED
+# (2) is back on the connection after COMMIT and after ROLLBACK.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN};Application Name=ti_ser' AS ti_ser (TYPE mssql, transaction_isolation 'serializable');
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ti_obs (TYPE mssql);
+
+statement ok
+BEGIN;
+
+query I
+SELECT * FROM mssql_scan('ti_ser', 'SELECT CAST(transaction_isolation_level AS INT) FROM sys.dm_exec_sessions WHERE session_id = @@SPID');
+----
+4
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*) > 0, count(*) FILTER (WHERE l <> 2) FROM mssql_scan('ti_obs', 'SELECT CAST(transaction_isolation_level AS INT) AS l FROM sys.dm_exec_sessions WHERE program_name = ''ti_ser''');
+----
+true	0
+
+statement ok
+BEGIN;
+
+query I
+SELECT * FROM mssql_scan('ti_ser', 'SELECT CAST(transaction_isolation_level AS INT) FROM sys.dm_exec_sessions WHERE session_id = @@SPID');
+----
+4
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FILTER (WHERE l <> 2) FROM mssql_scan('ti_obs', 'SELECT CAST(transaction_isolation_level AS INT) AS l FROM sys.dm_exec_sessions WHERE program_name = ''ti_ser''');
+----
+0
+
+statement ok
+DETACH ti_ser;
+
+statement ok
+DETACH ti_obs;
+
+# =============================================================================
+# SNAPSHOT: a database of its own with ALLOW_SNAPSHOT_ISOLATION ON
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TEST_DSN}' AS ti_master (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('ti_master', 'IF DB_ID(''i331t'') IS NOT NULL BEGIN ALTER DATABASE i331t SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE i331t; END');
+
+statement ok
+SELECT mssql_exec('ti_master', 'CREATE DATABASE i331t');
+
+statement ok
+SELECT mssql_exec('ti_master', 'ALTER DATABASE i331t SET ALLOW_SNAPSHOT_ISOLATION ON');
+
+statement ok
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=i331t;User Id={MSSQL_TEST_USER};Password={MSSQL_TEST_PASS};TrustServerCertificate=yes' AS ti_setup (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('ti_setup', 'CREATE TABLE dbo.k (id INT PRIMARY KEY, v INT); INSERT INTO dbo.k VALUES (1, 10), (2, 20)');
+
+statement ok
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=i331t;User Id={MSSQL_TEST_USER};Password={MSSQL_TEST_PASS};TrustServerCertificate=yes;Application Name=ti_snap' AS ti_snap (TYPE mssql, transaction_isolation 'auto');
+
+# --- two reads of one transaction agree, whatever another session commits
+# between them (con2 is autocommit: its INSERT commits at once).
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT count(*) FROM ti_snap.dbo.k;
+----
+2
+
+statement ok con2
+SELECT mssql_exec('ti_setup', 'INSERT INTO dbo.k VALUES (3, 30)');
+
+query I con1
+SELECT count(*) FROM ti_snap.dbo.k;
+----
+2
+
+query I con1
+SELECT * FROM mssql_scan('ti_snap', 'SELECT CAST(transaction_isolation_level AS INT) FROM sys.dm_exec_sessions WHERE session_id = @@SPID');
+----
+5
+
+statement ok con1
+COMMIT;
+
+query I con1
+SELECT count(*) FROM ti_snap.dbo.k;
+----
+3
+
+# --- updating a row another session changed since the transaction began is
+# an update conflict (3960), which SQL Server answers by aborting the
+# transaction.
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT v FROM ti_snap.dbo.k WHERE id = 2;
+----
+20
+
+statement ok con2
+SELECT mssql_exec('ti_setup', 'UPDATE dbo.k SET v = 99 WHERE id = 2');
+
+statement error con1
+UPDATE ti_snap.dbo.k SET v = v + 1 WHERE id = 2;
+----
+update conflict
+
+statement ok con1
+ROLLBACK;
+
+# The level is back to READ COMMITTED on every connection of the pool, the
+# aborted one included.
+query II
+SELECT count(*) > 0, count(*) FILTER (WHERE l <> 2) FROM mssql_scan('ti_setup', 'SELECT CAST(transaction_isolation_level AS INT) AS l FROM sys.dm_exec_sessions WHERE program_name = ''ti_snap''');
+----
+true	0
+
+query I
+SELECT v FROM ti_snap.dbo.k WHERE id = 2;
+----
+99
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+DETACH ti_snap;
+
+statement ok
+DETACH ti_setup;
+
+statement ok
+SELECT mssql_exec('ti_master', 'ALTER DATABASE i331t SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE i331t');
+
+statement ok
+DETACH ti_master;

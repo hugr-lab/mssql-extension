@@ -27,7 +27,8 @@ constexpr const char *MSSQL_SECRET_AZURE_SECRET = "azure_secret";		 // Optional,
 constexpr const char *MSSQL_SECRET_AZURE_TENANT_ID = "azure_tenant_id";	 // Optional, tenant for interactive auth
 constexpr const char *MSSQL_SECRET_ACCESS_TOKEN = "access_token";	 // Optional, direct Azure AD JWT token (Spec 032)
 constexpr const char *MSSQL_SECRET_SCHEMA_FILTER = "schema_filter";	 // Optional, regex schema visibility filter
-constexpr const char *MSSQL_SECRET_TABLE_FILTER = "table_filter";	 // Optional, regex table visibility filter
+constexpr const char *MSSQL_SECRET_TRANSACTION_ISOLATION = "transaction_isolation";	 // Optional, issue #331
+constexpr const char *MSSQL_SECRET_TABLE_FILTER = "table_filter";  // Optional, regex table visibility filter
 
 // Spec 042: Integrated Authentication (Kerberos / SSPI). All optional.
 constexpr const char *MSSQL_SECRET_AUTHENTICATOR = "authenticator";			   // krb5 / winsspi

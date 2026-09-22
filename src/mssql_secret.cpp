@@ -207,6 +207,7 @@ unique_ptr<BaseSecret> CreateMSSQLSecretFromConfig(ClientContext &context, Creat
 	// Handle optional catalog visibility filters (Spec 033)
 	result->TrySetValue(MSSQL_SECRET_SCHEMA_FILTER, input);
 	result->TrySetValue(MSSQL_SECRET_TABLE_FILTER, input);
+	result->TrySetValue(MSSQL_SECRET_TRANSACTION_ISOLATION, input);
 
 	// Spec 042: Integrated Authentication fields (all optional, no secrets to redact)
 	result->TrySetValue(MSSQL_SECRET_AUTHENTICATOR, input);
@@ -264,6 +265,8 @@ void RegisterMSSQLSecretType(ExtensionLoader &loader) {
 		LogicalType::VARCHAR;  // Optional, regex schema visibility filter (Spec 033)
 	create_func.named_parameters[MSSQL_SECRET_TABLE_FILTER] =
 		LogicalType::VARCHAR;  // Optional, regex table visibility filter (Spec 033)
+	create_func.named_parameters[MSSQL_SECRET_TRANSACTION_ISOLATION] =
+		LogicalType::VARCHAR;  // Optional, isolation level of explicit transactions (issue #331)
 
 	// Spec 042: Integrated Authentication (Kerberos / SSPI), all optional
 	create_func.named_parameters[MSSQL_SECRET_AUTHENTICATOR] = LogicalType::VARCHAR;

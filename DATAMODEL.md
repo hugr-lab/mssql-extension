@@ -205,9 +205,15 @@ physical connection (`@@SPID` unchanged).
 There is no selective form to ask for instead — one bit, two variants, and
 `RESET_CONNECTION_SKIP_TRAN` drops `##g` and a local `#loc` identically. So
 `mssql_reset_connection = false` turns it off wholesale, and what the user takes
-on is not "temp tables" but **all** session state: `SET` options, isolation level,
+on is not "temp tables" but **all** session state the reset clears: `SET` options,
 session variables, `CONTEXT_INFO`, cursors — and an open transaction that then
-keeps its locks until that connection is used again.
+keeps its locks until that connection is used again. The transaction **isolation
+level** is not in that list, reset or not. SQL Server keeps it across
+`RESET_CONNECTION`: SNAPSHOT was still in force after a reset that had dropped the
+session's `#temp` table (measured, issue #331). A transaction that sets a level
+through `transaction_isolation` therefore puts READ COMMITTED back itself, as its
+own statement after COMMIT / ROLLBACK, before the connection returns to the pool.
+A connection whose level could not be put back is closed.
 
 Four release paths honour it, and each learns the answer on the CLIENT thread
 because none of them can ask a `ClientContext` where they run:

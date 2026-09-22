@@ -1,5 +1,6 @@
 #include "catalog/mssql_catalog.hpp"
 #include <openssl/crypto.h>
+#include <cctype>
 #include "codec/target_string_type.hpp"
 
 #include "azure/azure_fedauth.hpp"
@@ -53,7 +54,13 @@ namespace duckdb {
 static const char *DATABASE_COLLATION_SQL =
 	"SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)) AS db_collation, "
 	"CAST(COLLATIONPROPERTY(CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)), 'CodePage') AS INT) "
-	"AS code_page";
+	"AS code_page, "
+	// Issue #331: whether SNAPSHOT isolation is allowed here. Only sys.databases
+	// has it (DATABASEPROPERTYEX has no such property), and a principal sees the
+	// row of a database it can connect to without any grant. NULL -- row not
+	// visible -- reads as unknown, and unknown means `auto` sends nothing.
+	"(SELECT CAST(snapshot_isolation_state AS INT) FROM sys.databases WHERE database_id = DB_ID()) "
+	"AS snapshot_isolation_state";
 
 //===----------------------------------------------------------------------===//
 // Constructor / Destructor
@@ -377,6 +384,13 @@ void MSSQLCatalog::QueryDatabaseCollation() {
 														  code_page = 0;
 													  }
 												  }
+												  if (values.size() > 2 && !values[2].empty()) {
+													  try {
+														  snapshot_isolation_state_ = std::stoi(values[2]);
+													  } catch (...) {
+														  snapshot_isolation_state_ = -1;
+													  }
+												  }
 												  return true;	// one row; keep the stream drained
 											  });
 
@@ -403,6 +417,48 @@ void MSSQLCatalog::QueryDatabaseCollation() {
 
 string MSSQLCatalog::GetCatalogType() {
 	return "mssql";
+}
+
+string MSSQLCatalog::TransactionIsolationStatement() const {
+	const auto &level = connection_info_->transaction_isolation;
+	// Fabric Warehouse enforces snapshot and ignores the SET; Synapse's only
+	// settable level, READ UNCOMMITTED, is already its default, and anything else
+	// is refused at ATTACH (CheckTransactionIsolation).
+	if (level.empty() || connection_info_->IsFabricEndpoint() || connection_info_->IsSynapseEndpoint()) {
+		return "";
+	}
+	if (level == "auto") {
+		if (snapshot_isolation_state_ != 1) {
+			return "";
+		}
+		return "SET TRANSACTION ISOLATION LEVEL SNAPSHOT";
+	}
+	auto words = level;
+	for (auto &c : words) {
+		c = c == '_' ? ' ' : static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+	}
+	return "SET TRANSACTION ISOLATION LEVEL " + words;
+}
+
+string MSSQLCatalog::TransactionIsolationRestoreStatement() const {
+	return TransactionIsolationStatement().empty() ? "" : "SET TRANSACTION ISOLATION LEVEL READ COMMITTED";
+}
+
+void MSSQLCatalog::CheckTransactionIsolation() const {
+	const auto &level = connection_info_->transaction_isolation;
+	if (connection_info_->IsSynapseEndpoint() && !level.empty() && level != "auto" && level != "read_uncommitted") {
+		throw InvalidInputException(
+			"MSSQL ATTACH error: transaction_isolation '%s' is not available on Azure Synapse, whose only settable "
+			"level is READ UNCOMMITTED -- its default",
+			level);
+	}
+	if (level == "snapshot" && snapshot_isolation_state_ == 0 && !connection_info_->IsFabricEndpoint()) {
+		throw InvalidInputException(
+			"MSSQL ATTACH error: transaction_isolation 'snapshot' needs ALLOW_SNAPSHOT_ISOLATION ON in database "
+			"'%s', and it is OFF. ALTER DATABASE ... SET ALLOW_SNAPSHOT_ISOLATION ON, or use 'auto', which falls "
+			"back to the server's default level where snapshot is not allowed",
+			connection_info_->database);
+	}
 }
 
 optional<Identifier> MSSQLCatalog::GetDefaultSchema() const {

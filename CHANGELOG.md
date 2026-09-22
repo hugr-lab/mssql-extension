@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`transaction_isolation`: the isolation level of explicit transactions**
+  ([#331](https://github.com/hugr-lab/mssql-extension/issues/331)). The
+  scans of one DuckDB transaction are separate statements on its pinned
+  connection. Under the server's default READ COMMITTED, a row that another
+  session commits between two scans is seen by one scan and not the other: 3
+  rows then 4 in the same transaction. Under SNAPSHOT both reads say 3.
+  - **Values.** `default` (unset) sends nothing, as before. The five T-SQL
+    levels are sent as `SET TRANSACTION ISOLATION LEVEL …` before
+    `BEGIN TRANSACTION`. `auto` means SNAPSHOT where the database has
+    `ALLOW_SNAPSHOT_ISOLATION ON`; that state is probed at ATTACH in the same
+    query as the collation.
+  - **Checked at ATTACH.** An explicit `snapshot` on a database with snapshot
+    isolation OFF is refused there. Fabric Warehouse and Synapse get nothing.
+  - **Found along the way.** SQL Server does not reset the isolation level with
+    `RESET_CONNECTION`, so a level set in a transaction would follow the pooled
+    connection into every later autocommit statement. The extension now puts
+    READ COMMITTED back after COMMIT or ROLLBACK, including after the server
+    aborted the transaction on an update conflict (3960). A `SET TRANSACTION
+    ISOLATION LEVEL` sent through `mssql_exec()` has always leaked this way.
 - **Every mssql function is documented in `duckdb_functions()`**
   ([#371](https://github.com/hugr-lab/mssql-extension/issues/371)): a
   description, runnable examples and a category on each of the 23 overloads,

@@ -4,6 +4,7 @@
 #include "connection/mssql_connection_provider.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "query/mssql_simple_query.hpp"
 #include "tds/tds_connection.hpp"
 #include "tds/tds_connection_pool.hpp"
 #include "tds/tds_socket.hpp"
@@ -65,6 +66,32 @@ bool VerifyCleanTransactionState(duckdb::tds::TdsConnection &conn) {
 	// In a production implementation, you might want to actually check
 	// @@TRANCOUNT to ensure the transaction is fully closed.
 	return true;
+}
+
+//===----------------------------------------------------------------------===//
+// Helper: put back an isolation level the transaction's BEGIN set (issue #331)
+//===----------------------------------------------------------------------===//
+
+// SQL Server keeps a session's isolation level across the RESET_CONNECTION the
+// pool sends on reuse (measured: SNAPSHOT still in force on the next autocommit
+// statement, the reset having run -- its #temp table gone), so a level set
+// before BEGIN would follow the connection into every later autocommit
+// statement and DML load. Sent on its own, after the transaction descriptor is
+// cleared: appended to the COMMIT / ROLLBACK batch it does not run when the
+// server has already aborted the transaction (a snapshot update conflict,
+// 3960) -- that batch goes out with the stale descriptor and the SET is lost.
+// A connection whose level could not be put back is closed, never pooled.
+void RestoreIsolationLevel(duckdb::MSSQLCatalog &catalog, duckdb::tds::TdsConnection &conn) {
+	auto restore = catalog.TransactionIsolationRestoreStatement();
+	if (restore.empty()) {
+		return;
+	}
+	auto result = duckdb::MSSQLSimpleQuery::Execute(conn, restore);
+	if (!result.success) {
+		MSSQL_TXN_LOG("RestoreIsolationLevel: %s failed (%s) -- closing the connection", restore.c_str(),
+					  result.error_message.c_str());
+		conn.Close();
+	}
 }
 
 }  // anonymous namespace
@@ -250,6 +277,7 @@ ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Tra
 
 		// Clear transaction descriptor on the connection
 		pinned_conn->ClearTransactionDescriptor();
+		RestoreIsolationLevel(catalog_, *pinned_conn);
 
 		// Flag connection for reset — RESET_CONNECTION will be set on next SQL_BATCH TDS header.
 		//
@@ -311,6 +339,7 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 
 		// Clear transaction descriptor on the connection
 		pinned_conn->ClearTransactionDescriptor();
+		RestoreIsolationLevel(catalog_, *pinned_conn);
 
 		// Flag connection for reset — RESET_CONNECTION will be set on next SQL_BATCH TDS header.
 		//
