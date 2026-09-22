@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Boolean ATTACH options accept a string value**
+  ([#325](https://github.com/hugr-lab/mssql-extension/issues/325)).
+  `lazy_validation`, `catalog` and `order_pushdown` were read through an
+  integer cast, so `lazy_validation 'true'` failed with `Could not convert
+  string 'true' to INT8` — and a string is the only thing DuckLake's
+  `METADATA_PARAMETERS` can send, since it is a `MAP(VARCHAR, VARCHAR)` whose
+  values reach the inner `ATTACH` quoted. None of the boolean options were
+  reachable for a `ducklake:mssql:` catalog. A string now goes through DuckDB's
+  own boolean cast, the one `SET` uses (`true`/`false`, `t`/`f`, `yes`/`no`,
+  `y`/`n`, `1`/`0`, any case), and anything else is refused with the option
+  named.
 - **A debug build no longer asserts on `SELECT k, rowid` over a string key
   column** ([#369](https://github.com/hugr-lab/mssql-extension/issues/369)).
   With `mssql_catalog_native_types` on (the default) the projected column is
