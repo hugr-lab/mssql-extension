@@ -180,8 +180,8 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 		bool allow_empty_schema = false;
 
 		if (parts.size() == 2) {
-			// catalog.table - use default schema 'dbo'
-			schema_name = "dbo";
+			// catalog.table - no schema: ResolveCatalog gives it the catalog's
+			// default schema (`dbo` unless ATTACH set one, issue #322)
 			table_name = parts[1];
 		} else {
 			// catalog.schema.table or catalog..#temp (empty schema)

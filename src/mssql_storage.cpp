@@ -272,6 +272,10 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	if (!table_filter_val.IsNull()) {
 		result->table_filter = table_filter_val.ToString();
 	}
+	auto default_schema_val = kv_secret.TryGetValue("default_schema");
+	if (!default_schema_val.IsNull()) {
+		result->default_schema = default_schema_val.ToString();
+	}
 
 	// Spec 042: Integrated Authentication fields
 	auto auth_val = kv_secret.TryGetValue("authenticator");
@@ -465,6 +469,8 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 					result["schema_filter"] = value;
 				} else if (lower_key == "table_filter" || lower_key == "tablefilter") {
 					result["table_filter"] = value;
+				} else if (lower_key == "default_schema" || lower_key == "defaultschema") {
+					result["default_schema"] = value;
 				} else if (lower_key == "authenticator") {
 					// Spec 042: krb5 / winsspi (go-mssqldb names)
 					result["authenticator"] = StringUtil::Lower(value);
@@ -628,6 +634,8 @@ static case_insensitive_map_t<string> ParseConnectionString(const string &connec
 			result["schema_filter"] = value;
 		} else if (lower_key == "tablefilter" || lower_key == "table_filter") {
 			result["table_filter"] = value;
+		} else if (lower_key == "defaultschema" || lower_key == "default_schema" || lower_key == "default schema") {
+			result["default_schema"] = value;
 		} else if (lower_key == "authenticator") {
 			// Spec 042: krb5 / winsspi (go-mssqldb names)
 			result["authenticator"] = StringUtil::Lower(value);
@@ -937,6 +945,9 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 	}
 	if (params.find("table_filter") != params.end()) {
 		result->table_filter = params["table_filter"];
+	}
+	if (params.find("default_schema") != params.end()) {
+		result->default_schema = params["default_schema"];
 	}
 
 	// Spec 042: Integrated Authentication parameters
@@ -1496,6 +1507,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	string schema_filter_option;		 // Spec 033: ATTACH-level schema filter
 	string table_filter_option;			 // Spec 033: ATTACH-level table filter
 	bool schema_filter_specified = false;
+	string default_schema_option;  // Issue #322: ATTACH-level default schema
+	bool default_schema_specified = false;
 	bool table_filter_specified = false;
 	int8_t order_pushdown_option = -1;	// Spec 039: ORDER BY pushdown (-1=unset)
 	bool lazy_validation = false;		// Spec 047 (US2): opt out of eager creds check
@@ -1525,6 +1538,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		} else if (lower_name == "schema_filter") {
 			schema_filter_option = it->second.ToString();
 			schema_filter_specified = true;
+			it = options.options.erase(it);
+		} else if (lower_name == "default_schema" || lower_name == "defaultschema") {
+			default_schema_option = it->second.ToString();
+			default_schema_specified = true;
 			it = options.options.erase(it);
 		} else if (lower_name == "table_filter") {
 			table_filter_option = it->second.ToString();
@@ -1625,6 +1642,27 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			throw InvalidInputException("MSSQL ATTACH error: %s", error);
 		}
 		connection_info->table_filter = table_filter_option;
+	}
+	if (default_schema_specified) {
+		connection_info->default_schema = default_schema_option;
+	}
+	// Surrounding whitespace is never part of a schema name the user means
+	// (review of #379); an empty value -- including an explicit '' on the ATTACH,
+	// which clears a secret's -- means the default, `dbo`.
+	StringUtil::Trim(connection_info->default_schema);
+	// A default schema the schema_filter hides would resolve every unqualified
+	// name against a schema the catalog refuses to show: the configuration
+	// contradicts itself, so it fails here rather than on the first query.
+	// Only an EXPLICIT default is checked (review of #379): an unset one is `dbo`,
+	// and refusing a filter that hides `dbo` would break every existing ATTACH
+	// that pairs such a filter with fully qualified names.
+	if (!connection_info->default_schema.empty() && !connection_info->schema_filter.empty()) {
+		MSSQLCatalogFilter filter;
+		filter.SetSchemaFilter(connection_info->schema_filter);
+		if (!filter.MatchesSchema(connection_info->default_schema)) {
+			throw InvalidInputException("MSSQL ATTACH error: default_schema '%s' is hidden by schema_filter '%s'",
+										connection_info->default_schema, connection_info->schema_filter);
+		}
 	}
 	if (!application_name_option.empty()) {
 		// Spec 047 FR-014: ATTACH-level value wins over connection-string /

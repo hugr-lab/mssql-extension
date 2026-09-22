@@ -154,6 +154,10 @@ struct MSSQLConnectionInfo {
 	//===----------------------------------------------------------------------===//
 	string schema_filter;  // Regex pattern for schema visibility (empty = all visible)
 	string table_filter;   // Regex pattern for table/view visibility (empty = all visible)
+	//! The schema unqualified names resolve against (issue #322); empty = `dbo`.
+	//! The exact name as the server spells it: the catalog's schema lookup is
+	//! case-sensitive.
+	string default_schema;
 
 	//===----------------------------------------------------------------------===//
 	// ORDER BY Pushdown (Spec 039)
