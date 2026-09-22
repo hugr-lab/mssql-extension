@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <thread>
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "query/mssql_sql_params.hpp"
 
@@ -857,6 +858,12 @@ void MSSQLMetadataCache::LoadAllTableMetadataForSchema(tds::TdsConnection &conne
 
 void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, idx_t &schema_count, idx_t &table_count,
 												idx_t &column_count) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	LoadAllSchemasMetadataLocked(connection, schema_count, table_count, column_count);
+}
+
+void MSSQLMetadataCache::LoadAllSchemasMetadataLocked(tds::TdsConnection &connection, idx_t &schema_count,
+													  idx_t &table_count, idx_t &column_count) {
 	schema_count = 0;
 	table_count = 0;
 	column_count = 0;
@@ -877,8 +884,6 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 			sql += " AND " + like_clause;
 		}
 	}
-
-	std::lock_guard<std::mutex> lock(mutex_);
 
 	// Nothing is written into schemas_ until the query has RETURNED. Issue #317:
 	// this used to clear each schema's table map from inside the row callback and
@@ -1024,12 +1029,14 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 	by_object_id.clear();
 
 	// Publish. A schema's old table map is replaced, not merged, so the query's
-	// answer is the whole answer.
+	// answer is the whole answer. Every schema in the answer counts, as its tables
+	// and columns do (issue #375) -- not only the schemas new to the cache, which
+	// is none of them once BulkLoadAll has loaded the schema list first (#376).
+	schema_count = staged.size();
 	for (auto &pair : staged) {
 		auto schema_it = schemas_.find(pair.first);
 		if (schema_it == schemas_.end()) {
 			schema_it = schemas_.emplace(pair.first, MSSQLSchemaMetadata(pair.first)).first;
-			schema_count++;
 		}
 		auto &schema = schema_it->second;
 		schema.tables = std::move(pair.second);
@@ -1059,6 +1066,19 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	table_count = 0;
 	column_count = 0;
 
+	// The schema LIST first, on both paths (issue #376) -- one light query, and a
+	// no-op when it is already loaded. Neither path below loads it: the
+	// per-schema one used to mark it LOADED holding only the schema it had been
+	// given, so every other schema of the database stopped existing for the rest
+	// of the session; the whole-catalog one left it NOT_LOADED, so the first
+	// catalog access after the preload ran EnsureSchemasLoaded, which clears
+	// schemas_, and loaded the whole catalog a second time.
+	//
+	// ONE lock across the list and the load (review of #377): released in
+	// between, an invalidation could clear the list the load then relies on.
+	std::lock_guard<std::mutex> lock(mutex_);
+	EnsureSchemasLoadedLocked(connection);
+
 	// With no schema named, ONE query covers the catalog (spec 071 W2).
 	//
 	// This used to iterate per schema, and the reason recorded here was the sort:
@@ -1069,241 +1089,222 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	// which was also the reason mssql_preload_catalog() was O(schemas x objects)
 	// and could not rescue issue #86 however often it was recommended.
 	if (schema_name.empty()) {
-		LoadAllSchemasMetadata(connection, schema_count, table_count, column_count);
+		LoadAllSchemasMetadataLocked(connection, schema_count, table_count, column_count);
 		return;
 	}
 
-	vector<string> schemas_to_load;
-	if (!schema_name.empty()) {
-		schemas_to_load.push_back(schema_name);
-	} else {
-		// Load schema names first (fast, lightweight query — no lock needed yet)
-		string schema_sql = SCHEMA_DISCOVERY_SQL;
-		if (filter_ && filter_->HasSchemaFilter()) {
-			string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetSchemaPattern(), "s.name");
-			if (!like_clause.empty()) {
-				schema_sql += " AND " + like_clause;
+	// One schema: the exact name, else the ONE schema whose name matches it
+	// ignoring case. Before #376 the name went to the server as @s, which under
+	// the usual case-insensitive collation found `dbo` for 'DBO' (review of
+	// #377). Several matches -- names that differ only in case, under a
+	// case-sensitive collation -- need the exact name. A schema that is not in
+	// the list is absent from the database or hidden by schema_filter; it is
+	// refused by name rather than reported as an empty schema, and gets no
+	// phantom entry.
+	auto schema_it = schemas_.find(schema_name);
+	if (schema_it == schemas_.end()) {
+		idx_t matches = 0;
+		for (auto it = schemas_.begin(); it != schemas_.end(); ++it) {
+			if (StringUtil::CIEquals(it->first, schema_name)) {
+				schema_it = it;
+				matches++;
 			}
 		}
-		schema_sql += "\nORDER BY s.name";
-
-		RunMetadataQuery(
-			connection, schema_sql,
-			[&](const vector<string> &values) {
-				if (!values.empty()) {
-					schemas_to_load.push_back(values[0]);
-				}
-			},
-			metadata_timeout_ms_, [&]() { schemas_to_load.clear(); });
-
-		CACHE_DEBUG(1, "BulkLoadAll: discovered %zu schemas to load", schemas_to_load.size());
+		if (matches > 1) {
+			throw InvalidInputException(
+				"mssql_preload_catalog: schema name '%s' matches %llu schemas that differ only "
+				"in case; give the exact name",
+				schema_name, (unsigned long long)matches);
+		}
 	}
+	if (schema_it == schemas_.end() || (filter_ && !filter_->MatchesSchema(schema_it->first))) {
+		throw InvalidInputException(
+			"mssql_preload_catalog: schema '%s' does not exist in this catalog, or schema_filter hides it",
+			schema_name);
+	}
+	auto &schema = schema_it->second;
+	const string &target_schema = schema_it->first;
 
-	std::lock_guard<std::mutex> lock(mutex_);
+	// Build per-schema query
+	string sql = BULK_METADATA_SCHEMA_SQL_TEMPLATE;
 
-	// Load metadata per schema — each query sorts only within one schema,
-	// keeping the result set small enough to avoid tempdb spills
-	for (const auto &target_schema : schemas_to_load) {
-		// Ensure schema entry exists
-		auto schema_it = schemas_.find(target_schema);
-		if (schema_it == schemas_.end()) {
-			schemas_.emplace(target_schema, MSSQLSchemaMetadata(target_schema));
-			schema_it = schemas_.find(target_schema);
-			schema_count++;
+	// Push table filter to SQL Server if convertible to LIKE
+	if (filter_ && filter_->HasTableFilter()) {
+		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
+		if (!like_clause.empty()) {
+			sql += " AND " + like_clause;
 		}
-		auto &schema = schema_it->second;
+	}
+	sql += "\nORDER BY s.name, o.name, c.column_id";
+	sql = mssql::BuildExecuteSqlBatch(sql, "@s sysname", {{"s", mssql::NVarcharLiteral(target_schema)}});
 
-		// Build per-schema query
-		string sql = BULK_METADATA_SCHEMA_SQL_TEMPLATE;
+	// Streaming group-by parse for this schema.
+	//
+	// Staged, for the reason LoadAllSchemasMetadata is (issue #317) — and here
+	// the corruption was OBSERVABLE, which the whole-catalog one was not. This
+	// loop used to write into the LIVE schemas_ from the callback, including
+	// `columns.clear()` on a table that an earlier single-table load had
+	// already marked columns_load_state = LOADED. A throw between that clear
+	// and the publication below left the table holding whatever columns had
+	// arrived, still claiming to be fully loaded, and the guard in
+	// LoadAllTableMetadata (`all_columns_loaded && !tables.empty()`) then saw
+	// a complete schema and never reloaded. Reproduced: a two-column table
+	// came back from `SELECT *` with one column, for the rest of the session.
+	//
+	// The publication MERGES rather than replaces, which is why the staging is
+	// per table and not a whole table map: this query may not cover every
+	// table the schema legitimately holds (one excluded by table_filter, say),
+	// and those must survive.
+	unordered_map<string, MSSQLTableMetadata> staged_tables;
+	string current_table;
+	MSSQLTableMetadata *current_table_meta = nullptr;
+	idx_t schema_tables = 0;
+	idx_t schema_columns = 0;
 
-		// Push table filter to SQL Server if convertible to LIKE
-		if (filter_ && filter_->HasTableFilter()) {
-			string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
-			if (!like_clause.empty()) {
-				sql += " AND " + like_clause;
+	ExecuteMetadataQuery(
+		connection, sql,
+		[&](const vector<string> &values) {
+			// 15 columns: schema, object, type, approx_rows, the eight per-column
+			// fields, then index_type and is_partitioned. Guard the LAST index read.
+			if (values.size() < 14) {
+				return;
 			}
-		}
-		sql += "\nORDER BY s.name, o.name, c.column_id";
-		sql = mssql::BuildExecuteSqlBatch(sql, "@s sysname", {{"s", mssql::NVarcharLiteral(target_schema)}});
 
-		// Streaming group-by parse for this schema.
-		//
-		// Staged, for the reason LoadAllSchemasMetadata is (issue #317) — and here
-		// the corruption was OBSERVABLE, which the whole-catalog one was not. This
-		// loop used to write into the LIVE schemas_ from the callback, including
-		// `columns.clear()` on a table that an earlier single-table load had
-		// already marked columns_load_state = LOADED. A throw between that clear
-		// and the publication below left the table holding whatever columns had
-		// arrived, still claiming to be fully loaded, and the guard in
-		// LoadAllTableMetadata (`all_columns_loaded && !tables.empty()`) then saw
-		// a complete schema and never reloaded. Reproduced: a two-column table
-		// came back from `SELECT *` with one column, for the rest of the session.
-		//
-		// The publication MERGES rather than replaces, which is why the staging is
-		// per table and not a whole table map: this query may not cover every
-		// table the schema legitimately holds (one excluded by table_filter, say),
-		// and those must survive.
-		unordered_map<string, MSSQLTableMetadata> staged_tables;
-		string current_table;
-		MSSQLTableMetadata *current_table_meta = nullptr;
-		idx_t schema_tables = 0;
-		idx_t schema_columns = 0;
+			string row_table = values[1];
+			string row_type = values[2];
+			string row_approx_rows = values[3];
+			string col_name = values[4];
+			string col_id_str = values[5];
+			string type_name = values[6];
+			string max_len_str = values[7];
+			string prec_str = values[8];
+			string scale_str = values[9];
+			string nullable_str = values[10];
+			string collation = values[11];
 
-		ExecuteMetadataQuery(
-			connection, sql,
-			[&](const vector<string> &values) {
-				// 15 columns: schema, object, type, approx_rows, the eight per-column
-				// fields, then index_type and is_partitioned. Guard the LAST index read.
-				if (values.size() < 14) {
-					return;
-				}
+			// Apply table filter
+			if (filter_ && !filter_->MatchesTable(row_table)) {
+				return;
+			}
 
-				string row_table = values[1];
-				string row_type = values[2];
-				string row_approx_rows = values[3];
-				string col_name = values[4];
-				string col_id_str = values[5];
-				string type_name = values[6];
-				string max_len_str = values[7];
-				string prec_str = values[8];
-				string scale_str = values[9];
-				string nullable_str = values[10];
-				string collation = values[11];
+			// New table group?
+			if (row_table != current_table) {
+				current_table = row_table;
 
-				// Apply table filter
-				if (filter_ && !filter_->MatchesTable(row_table)) {
-					return;
-				}
+				// Seed the staged entry from the cache when the table is
+				// already known, so a field this query does not carry is not
+				// silently dropped; its columns start empty either way,
+				// because this query is the whole answer for them.
+				auto table_it = staged_tables.find(current_table);
+				if (table_it == staged_tables.end()) {
+					MSSQLTableMetadata table_meta;
+					table_meta.name = current_table;
 
-				// New table group?
-				if (row_table != current_table) {
-					current_table = row_table;
-
-					// Seed the staged entry from the cache when the table is
-					// already known, so a field this query does not carry is not
-					// silently dropped; its columns start empty either way,
-					// because this query is the whole answer for them.
-					auto table_it = staged_tables.find(current_table);
-					if (table_it == staged_tables.end()) {
-						MSSQLTableMetadata table_meta;
-						table_meta.name = current_table;
-
-						// Object type
-						if (!row_type.empty() && row_type[0] == 'V') {
-							table_meta.object_type = MSSQLObjectType::VIEW;
-						} else {
-							table_meta.object_type = MSSQLObjectType::TABLE;
-						}
-
-						// Approximate row count
-						try {
-							table_meta.approx_row_count = static_cast<idx_t>(std::stoll(row_approx_rows));
-						} catch (...) {
-							table_meta.approx_row_count = 0;
-						}
-						// Physical shape from the correlated sys.indexes lookup (see the
-						// header): values[12] is sys.indexes.type — 1 clustered rowstore,
-						// 5 clustered COLUMNSTORE, 0 heap — and values[13] says whether the
-						// object sits on a partition scheme. Both drive the write path's
-						// TABLOCK and sort decisions.
-						ParseTableShape(values, 12, 13, table_meta);
-
-						table_it = staged_tables.emplace(current_table, std::move(table_meta)).first;
-						// Counts tables NEW TO THE CACHE, which is what the
-						// preload status message has always reported — not
-						// tables seen in this query. Staging moved the find
-						// off schema.tables, so ask it directly.
-						if (schema.tables.find(current_table) == schema.tables.end()) {
-							schema_tables++;
-							table_count++;
-						}
+					// Object type
+					if (!row_type.empty() && row_type[0] == 'V') {
+						table_meta.object_type = MSSQLObjectType::VIEW;
 					} else {
-						// Same table twice in one pass. The ORDER BY makes that a
-						// non-group, but if it ever happened the second group is
-						// the authority, exactly as before.
-						table_it->second.columns.clear();
+						table_meta.object_type = MSSQLObjectType::TABLE;
 					}
-					current_table_meta = &table_it->second;
-				}
 
-				// Parse column info
-				int32_t col_id = 0;
-				try {
-					col_id = static_cast<int32_t>(std::stoi(col_id_str));
-				} catch (...) {
-				}
-				int16_t max_len = 0;
-				try {
-					max_len = static_cast<int16_t>(std::stoi(max_len_str));
-				} catch (...) {
-				}
-				uint8_t prec = 0;
-				try {
-					prec = static_cast<uint8_t>(std::stoi(prec_str));
-				} catch (...) {
-				}
-				uint8_t scl = 0;
-				try {
-					scl = static_cast<uint8_t>(std::stoi(scale_str));
-				} catch (...) {
-				}
-				bool nullable = FlagIsSet(nullable_str);
+					// Approximate row count
+					try {
+						table_meta.approx_row_count = static_cast<idx_t>(std::stoll(row_approx_rows));
+					} catch (...) {
+						table_meta.approx_row_count = 0;
+					}
+					// Physical shape from the correlated sys.indexes lookup (see the
+					// header): values[12] is sys.indexes.type — 1 clustered rowstore,
+					// 5 clustered COLUMNSTORE, 0 heap — and values[13] says whether the
+					// object sits on a partition scheme. Both drive the write path's
+					// TABLOCK and sort decisions.
+					ParseTableShape(values, 12, 13, table_meta);
 
-				MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
-										 database_collation_);
-				col_info.is_identity = values.size() > 14 && FlagIsSet(values[14]);
-				// COLLATIONPROPERTY(collation_name, 'CodePage') (issue #361): the page a
-				// varchar parameter is converted to; 0 when the server cannot say.
-				col_info.code_page = ParseCodePage(values, 15);
-				col_info.database_code_page = database_code_page_;
-				current_table_meta->columns.push_back(std::move(col_info));
-				schema_columns++;
-				column_count++;
-			},
-			[&]() {
-				// Restartable (PR #308). Nothing published needs undoing since
-				// issue #317 staged this loop — the cache has not been touched at
-				// this point — so the staging area and the group-by cursor go back
-				// together, along with this schema's share of the running totals.
-				staged_tables.clear();
-				current_table.clear();
-				current_table_meta = nullptr;
-				table_count -= schema_tables;
-				column_count -= schema_columns;
-				schema_tables = 0;
-				schema_columns = 0;
-			});
+					table_it = staged_tables.emplace(current_table, std::move(table_meta)).first;
+					// Every table in the answer counts, as every column does (issue
+					// #375). This used to count only tables NEW to the cache, so a
+					// second preload of a schema reported "0 tables, 358 columns".
+					schema_tables++;
+					table_count++;
+				} else {
+					// Same table twice in one pass. The ORDER BY makes that a
+					// non-group, but if it ever happened the second group is
+					// the authority, exactly as before.
+					table_it->second.columns.clear();
+				}
+				current_table_meta = &table_it->second;
+			}
 
-		// Publish, only now that the query has returned. Per table rather than
-		// wholesale: this query may not cover every table the schema legitimately
-		// holds — one excluded by table_filter, or loaded singly and not matched
-		// here — and replacing the map would drop those.
-		for (auto &staged : staged_tables) {
-			schema.tables[staged.first] = std::move(staged.second);
-		}
+			// Parse column info
+			int32_t col_id = 0;
+			try {
+				col_id = static_cast<int32_t>(std::stoi(col_id_str));
+			} catch (...) {
+			}
+			int16_t max_len = 0;
+			try {
+				max_len = static_cast<int16_t>(std::stoi(max_len_str));
+			} catch (...) {
+			}
+			uint8_t prec = 0;
+			try {
+				prec = static_cast<uint8_t>(std::stoi(prec_str));
+			} catch (...) {
+			}
+			uint8_t scl = 0;
+			try {
+				scl = static_cast<uint8_t>(std::stoi(scale_str));
+			} catch (...) {
+			}
+			bool nullable = FlagIsSet(nullable_str);
 
-		CACHE_DEBUG(1, "BulkLoadAll: schema '%s' — %llu tables, %llu columns", target_schema.c_str(),
-					(unsigned long long)schema_tables, (unsigned long long)schema_columns);
+			MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
+									 database_collation_);
+			col_info.is_identity = values.size() > 14 && FlagIsSet(values[14]);
+			// COLLATIONPROPERTY(collation_name, 'CodePage') (issue #361): the page a
+			// varchar parameter is converted to; 0 when the server cannot say.
+			col_info.code_page = ParseCodePage(values, 15);
+			col_info.database_code_page = database_code_page_;
+			current_table_meta->columns.push_back(std::move(col_info));
+			schema_columns++;
+			column_count++;
+		},
+		[&]() {
+			// Restartable (PR #308). Nothing published needs undoing since
+			// issue #317 staged this loop — the cache has not been touched at
+			// this point — so the staging area and the group-by cursor go back
+			// together, along with this schema's share of the running totals.
+			staged_tables.clear();
+			current_table.clear();
+			current_table_meta = nullptr;
+			table_count -= schema_tables;
+			column_count -= schema_columns;
+			schema_tables = 0;
+			schema_columns = 0;
+		});
+
+	// Publish, only now that the query has returned. Per table rather than
+	// wholesale: this query may not cover every table the schema legitimately
+	// holds — one excluded by table_filter, or loaded singly and not matched
+	// here — and replacing the map would drop those.
+	const auto now = std::chrono::steady_clock::now();
+	for (auto &staged : staged_tables) {
+		staged.second.columns_load_state = CacheLoadState::LOADED;
+		staged.second.columns_last_refresh = now;
+		schema.tables[staged.first] = std::move(staged.second);
 	}
 
-	// Mark all load states as LOADED
-	auto now = std::chrono::steady_clock::now();
-	schemas_load_state_ = CacheLoadState::LOADED;
-	schemas_last_refresh_ = now;
+	CACHE_DEBUG(1, "BulkLoadAll: schema '%s' — %llu tables, %llu columns", target_schema.c_str(),
+				(unsigned long long)schema_tables, (unsigned long long)schema_columns);
 
-	for (auto &schema_pair : schemas_) {
-		schema_pair.second.tables_load_state = CacheLoadState::LOADED;
-		schema_pair.second.tables_last_refresh = now;
-
-		for (auto &table_pair : schema_pair.second.tables) {
-			table_pair.second.columns_load_state = CacheLoadState::LOADED;
-			table_pair.second.columns_last_refresh = now;
-		}
-	}
-
-	// Update backward-compat state
-	state_ = MSSQLCacheState::LOADED;
-	last_refresh_ = now;
+	// Only what this call loaded is marked (issue #376): the target schema's
+	// table list, and the columns of the tables in its answer. This used to mark
+	// EVERY schema's table list and EVERY table's columns LOADED, so a schema or
+	// a table this query never touched turned up empty and claiming to be
+	// complete.
+	schema.tables_load_state = CacheLoadState::LOADED;
+	schema.tables_last_refresh = now;
+	schema_count = 1;
 }
 
 void MSSQLMetadataCache::ForEachTable(
@@ -1522,7 +1523,10 @@ void MSSQLMetadataCache::EnsureSchemasLoaded(tds::TdsConnection &connection) {
 	// next to everything around it (a catalog lookup already did a settings
 	// read and a pool interaction to get here).
 	std::lock_guard<std::mutex> lock(mutex_);
+	EnsureSchemasLoadedLocked(connection);
+}
 
+void MSSQLMetadataCache::EnsureSchemasLoadedLocked(tds::TdsConnection &connection) {
 	if (schemas_load_state_ == CacheLoadState::LOADED && !IsTTLExpired(schemas_last_refresh_, ttl_seconds_)) {
 		CACHE_DEBUG(2, "EnsureSchemasLoaded — already loaded (%zu schemas)", schemas_.size());
 		return;
