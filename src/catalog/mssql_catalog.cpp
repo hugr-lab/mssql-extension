@@ -54,12 +54,16 @@ namespace duckdb {
 static const char *DATABASE_COLLATION_SQL =
 	"SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)) AS db_collation, "
 	"CAST(COLLATIONPROPERTY(CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)), 'CodePage') AS INT) "
-	"AS code_page, "
-	// Issue #331: whether SNAPSHOT isolation is allowed here. Only sys.databases
-	// has it (DATABASEPROPERTYEX has no such property), and a principal sees the
-	// row of a database it can connect to without any grant. NULL -- row not
-	// visible -- reads as unknown, and unknown means `auto` sends nothing.
-	"(SELECT CAST(snapshot_isolation_state AS INT) FROM sys.databases WHERE database_id = DB_ID()) "
+	"AS code_page";
+
+// Issue #331: whether SNAPSHOT isolation is allowed here, appended to the
+// collation query only when transaction_isolation needs the answer (see
+// QueryDatabaseCollation). Only sys.databases has it (DATABASEPROPERTYEX has no
+// such property), and a principal sees the row of a database it can connect to
+// without any grant. NULL -- row not visible -- reads as unknown, and unknown
+// means `auto` sends nothing.
+static const char *SNAPSHOT_STATE_COLUMN =
+	", (SELECT CAST(snapshot_isolation_state AS INT) FROM sys.databases WHERE database_id = DB_ID()) "
 	"AS snapshot_isolation_state";
 
 //===----------------------------------------------------------------------===//
@@ -372,27 +376,38 @@ void MSSQLCatalog::QueryDatabaseCollation() {
 	try {
 		std::string collation;
 		int32_t code_page = 0;
-		MSSQLSimpleQuery::ExecuteWithCallback(*connection, DATABASE_COLLATION_SQL,
-											  [&](const std::vector<std::string> &values) {
-												  if (!values.empty()) {
-													  collation = values[0];
-												  }
-												  if (values.size() > 1 && !values[1].empty()) {
-													  try {
-														  code_page = std::stoi(values[1]);
-													  } catch (...) {
-														  code_page = 0;
-													  }
-												  }
-												  if (values.size() > 2 && !values[2].empty()) {
-													  try {
-														  snapshot_isolation_state_ = std::stoi(values[2]);
-													  } catch (...) {
-														  snapshot_isolation_state_ = -1;
-													  }
-												  }
-												  return true;	// one row; keep the stream drained
-											  });
+		// The snapshot probe rides along only when the answer is used: `snapshot`
+		// (refused at ATTACH when OFF) or `auto`, and not on Fabric or Synapse,
+		// where neither consults it. Everyone else's ATTACH query is unchanged,
+		// so a platform whose sys.databases lacks the column or the row cannot
+		// fail an ATTACH that never asked about isolation.
+		const auto &level = connection_info_->transaction_isolation;
+		const bool probe_snapshot = (level == "snapshot" || level == "auto") && !connection_info_->IsFabricEndpoint() &&
+									!connection_info_->IsSynapseEndpoint();
+		string collation_sql = DATABASE_COLLATION_SQL;
+		if (probe_snapshot) {
+			collation_sql += SNAPSHOT_STATE_COLUMN;
+		}
+		MSSQLSimpleQuery::ExecuteWithCallback(*connection, collation_sql, [&](const std::vector<std::string> &values) {
+			if (!values.empty()) {
+				collation = values[0];
+			}
+			if (values.size() > 1 && !values[1].empty()) {
+				try {
+					code_page = std::stoi(values[1]);
+				} catch (...) {
+					code_page = 0;
+				}
+			}
+			if (values.size() > 2 && !values[2].empty()) {
+				try {
+					snapshot_isolation_state_ = std::stoi(values[2]);
+				} catch (...) {
+					snapshot_isolation_state_ = -1;
+				}
+			}
+			return true;  // one row; keep the stream drained
+		});
 
 		if (!collation.empty()) {
 			database_collation_ = collation;

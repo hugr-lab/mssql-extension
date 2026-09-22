@@ -285,6 +285,7 @@ Measured with two reads inside one transaction and a committed insert from anoth
 - **`read_uncommitted`, `read_committed`, `repeatable_read`, `serializable`, `snapshot`**: sent as `SET TRANSACTION ISOLATION LEVEL …` on the pinned connection, as its own statement, before `BEGIN TRANSACTION`. The SET must come before BEGIN, because a transaction cannot switch to SNAPSHOT once it has started.
 - **`auto`**: SNAPSHOT when the database has `ALLOW_SNAPSHOT_ISOLATION ON`, and nothing otherwise, including when that could not be determined.
   - The state is probed at ATTACH: `sys.databases.snapshot_isolation_state`, in the same query as the database collation, so it costs no extra round trip.
+  - The probe runs only when the option is `snapshot` or `auto`, and not on Fabric or Synapse. Every other ATTACH sends the same query as before, so a platform whose `sys.databases` lacks the column cannot fail an ATTACH that never asked about isolation.
   - A missing row reads as unknown, and unknown falls back to nothing.
 
 An explicit `snapshot` against a database where snapshot isolation is OFF is refused at ATTACH. Otherwise BEGIN would succeed and the first read of a user table in the transaction would fail with error 3952.

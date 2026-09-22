@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     levels are sent as `SET TRANSACTION ISOLATION LEVEL …` before
     `BEGIN TRANSACTION`. `auto` means SNAPSHOT where the database has
     `ALLOW_SNAPSHOT_ISOLATION ON`; that state is probed at ATTACH in the same
-    query as the collation.
+    query as the collation, and only when `snapshot` or `auto` asks for it.
   - **Checked at ATTACH.** An explicit `snapshot` on a database with snapshot
     isolation OFF is refused there. Fabric Warehouse and Synapse get nothing.
   - **Found along the way.** SQL Server does not reset the isolation level with
