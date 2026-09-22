@@ -80,7 +80,8 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 	  fedauth_token_utf16le_(std::move(fedauth_token_utf16le)),
 	  access_mode_(access_mode),
 	  catalog_enabled_(catalog_enabled),
-	  default_schema_("dbo") {
+	  default_schema_(connection_info_ && !connection_info_->default_schema.empty() ? connection_info_->default_schema
+																					: string("dbo")) {
 	// Create metadata cache with TTL from settings (0 = manual refresh only)
 	int64_t cache_ttl = 0;	// Default: manual refresh only
 	metadata_cache_ = make_uniq<MSSQLMetadataCache>(cache_ttl);
@@ -485,8 +486,8 @@ void MSSQLCatalog::CheckTransactionIsolation() const {
 
 optional<Identifier> MSSQLCatalog::GetDefaultSchema() const {
 	// See the header: a value (not nullopt, not an empty Identifier) is what says
-	// "probe dbo for unqualified names".
-	return Identifier("dbo");
+	// "probe this schema for unqualified names".
+	return Identifier(default_schema_);
 }
 
 //===----------------------------------------------------------------------===//

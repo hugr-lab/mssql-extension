@@ -230,6 +230,21 @@ uint8_t BCPColumnMetadata::GetLengthPrefixSize() const {
 	return 0;
 }
 
+// The schema an unqualified COPY target lands in: the attached catalog's
+// default (its `default_schema` option, issue #322), `dbo` when it has none or
+// the catalog cannot be found -- the lookup that follows reports a missing
+// catalog by name.
+static string CatalogDefaultSchema(ClientContext &context, const string &catalog_name) {
+	try {
+		auto default_schema = Catalog::GetCatalog(context, Identifier(catalog_name)).GetDefaultSchema();
+		if (default_schema && !default_schema->GetIdentifierName().empty()) {
+			return default_schema->GetIdentifierName();
+		}
+	} catch (CatalogException &) {
+	}
+	return "dbo";
+}
+
 //===----------------------------------------------------------------------===//
 // TargetResolver::ResolveURL
 //===----------------------------------------------------------------------===//
@@ -295,8 +310,8 @@ BCPCopyTarget TargetResolver::ResolveURL(ClientContext &context, const string &u
 	}
 
 	if (parts.size() == 2) {
-		// mssql://<catalog>/<table> - use default schema 'dbo'
-		target.schema_name = "dbo";
+		// mssql://<catalog>/<table> - the catalog's default schema
+		target.schema_name = CatalogDefaultSchema(context, target.catalog_name);
 		target.table_name = parts[1];
 	} else if (parts.size() == 3) {
 		// mssql://<catalog>/<schema>/<table> or mssql://<catalog>//<table> (empty schema)
@@ -357,8 +372,8 @@ BCPCopyTarget TargetResolver::ResolveCatalog(ClientContext &context, const strin
 			"Got table name: '%s'",
 			table);
 	} else if (schema.empty()) {
-		// Default behavior: empty schema defaults to 'dbo'
-		target.schema_name = "dbo";
+		// No schema given: the catalog's default schema (`dbo` unless ATTACH set one)
+		target.schema_name = CatalogDefaultSchema(context, catalog);
 	} else {
 		target.schema_name = schema;
 	}

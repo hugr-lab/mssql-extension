@@ -1,0 +1,33 @@
+# name: test/sql/attach/attach_default_schema.test
+# description: default_schema contradicting schema_filter is refused at ATTACH (issue #322); no server needed
+# group: [attach]
+#
+# A default schema the schema_filter hides would resolve every unqualified name
+# against a schema the catalog refuses to show, so the ATTACH fails instead of
+# the first query. The check needs no connection: lazy_validation and a host
+# that does not resolve keep the server out of it.
+
+require mssql
+
+statement error
+ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS ds_bad (TYPE mssql, lazy_validation true, schema_filter '^sales$', default_schema 'dbo');
+----
+default_schema 'dbo' is hidden by schema_filter '^sales$'
+
+# The same contradiction arriving through the connection string's own keys.
+statement error
+ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p;SchemaFilter=^sales$;DefaultSchema=dbo' AS ds_bad2 (TYPE mssql, lazy_validation true);
+----
+default_schema 'dbo' is hidden by schema_filter '^sales$'
+
+# A default the filter shows is accepted.
+statement ok
+ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS ds_ok (TYPE mssql, lazy_validation true, schema_filter '^sales$', default_schema 'sales');
+
+statement ok
+DETACH ds_ok;
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name LIKE 'ds_bad%';
+----
+0

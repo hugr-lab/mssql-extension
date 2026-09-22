@@ -25,8 +25,9 @@ constexpr const char *MSSQL_SECRET_HOST_NAME_IN_CERTIFICATE = "host_name_in_cert
 constexpr const char *MSSQL_SECRET_CATALOG = "catalog";									   // Optional, defaults to true
 constexpr const char *MSSQL_SECRET_AZURE_SECRET = "azure_secret";		 // Optional, for Azure AD auth
 constexpr const char *MSSQL_SECRET_AZURE_TENANT_ID = "azure_tenant_id";	 // Optional, tenant for interactive auth
-constexpr const char *MSSQL_SECRET_ACCESS_TOKEN = "access_token";	 // Optional, direct Azure AD JWT token (Spec 032)
-constexpr const char *MSSQL_SECRET_SCHEMA_FILTER = "schema_filter";	 // Optional, regex schema visibility filter
+constexpr const char *MSSQL_SECRET_ACCESS_TOKEN = "access_token";	   // Optional, direct Azure AD JWT token (Spec 032)
+constexpr const char *MSSQL_SECRET_SCHEMA_FILTER = "schema_filter";	   // Optional, regex schema visibility filter
+constexpr const char *MSSQL_SECRET_DEFAULT_SCHEMA = "default_schema";  // Optional, issue #322 (empty = dbo)
 constexpr const char *MSSQL_SECRET_TRANSACTION_ISOLATION = "transaction_isolation";	 // Optional, issue #331
 constexpr const char *MSSQL_SECRET_TABLE_FILTER = "table_filter";  // Optional, regex table visibility filter
 

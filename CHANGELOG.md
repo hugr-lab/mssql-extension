@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     READ COMMITTED back after COMMIT or ROLLBACK, including after the server
     aborted the transaction on an update conflict (3960). A `SET TRANSACTION
     ISOLATION LEVEL` sent through `mssql_exec()` has always leaked this way.
+- **`default_schema`: the schema unqualified names resolve against**
+  ([#322](https://github.com/hugr-lab/mssql-extension/issues/322)). It was a
+  hard-coded `dbo`. It is now an option on every configuration path: the ATTACH
+  option `default_schema` (which wins), `DefaultSchema=` in a connection
+  string, `default_schema=` in a URI, and `default_schema` in a secret. It
+  governs `db.table`, `USE db`, CTAS into `db.table`, and COPY into `db.table`
+  or `mssql://db/table`. Unset is `dbo`, as before. A default that
+  `schema_filter` hides is refused at ATTACH.
 - **Every mssql function is documented in `duckdb_functions()`**
   ([#371](https://github.com/hugr-lab/mssql-extension/issues/371)): a
   description, runnable examples and a category on each of the 23 overloads,

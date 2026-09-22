@@ -79,20 +79,21 @@ public:
 	//! any table exists — and issue #129 shows a user working around it by
 	//! CREATEing a schema literally called `main` on the server.
 	//!
-	//! `dbo` is the constant answer rather than a per-login lookup: it is the
-	//! default for every login that has not been given another, and resolving
-	//! SCHEMA_NAME() would put a round trip on ATTACH and need an answer on the
-	//! lazy-validation path, where no connection has been made yet. A login whose
-	//! default schema is not `dbo` still addresses its tables by qualified name;
-	//! only the unqualified default is wrong for it, which is the pre-existing
-	//! behaviour minus the crash.
+	//! `dbo` unless the `default_schema` option names another (issue #322: ATTACH
+	//! option > connection string / URI / secret). Not a per-login SCHEMA_NAME()
+	//! lookup: that would put a round trip on ATTACH, need an answer on the
+	//! lazy-validation path where no connection has been made yet, and still be
+	//! wrong for such a login -- SQL Server resolves an unqualified name through
+	//! the login's default schema THEN `dbo`, while DuckDB has a single default,
+	//! so following the login's default would break unqualified references to
+	//! `dbo` objects. Whoever wants another default says so.
 	//!
 	//! On the duckdb 2.0 line the return type is optional<Identifier>, and the
 	//! three answers are distinct: a value means "probe this schema for
 	//! unqualified names", nullopt means "this catalog HAS no default, never
 	//! probe", and an empty Identifier means "unspecified" elsewhere in the
-	//! catalog. We mean the first, so this returns Identifier("dbo") and neither
-	//! of the empty forms. (The v0.2.x line on duckdb 1.5.5 returns a plain
+	//! catalog. We mean the first, so this returns the configured name (`dbo`
+	//! by default) and neither of the empty forms. (The v0.2.x line on duckdb 1.5.5 returns a plain
 	//! string; that is the only difference between the two ports.)
 	optional<Identifier> GetDefaultSchema() const override;
 
@@ -397,7 +398,7 @@ private:
 	//! run (catalog false, no connection) or the row was not visible.
 	int32_t snapshot_isolation_state_ = -1;
 	string database_collation_;	 // Database default collation
-	string default_schema_;		 // Default schema ("dbo")
+	string default_schema_;		 // Default schema: `default_schema` option, else "dbo"
 	// Spec 052 (Option D): shared_ptr ownership for schema entries. The bind-
 	// time anchor (MSSQLBindAnchors, per ClientContext, released at QueryEnd)
 	// keeps entries alive across concurrent Invalidate / OnDetach. emplace-
