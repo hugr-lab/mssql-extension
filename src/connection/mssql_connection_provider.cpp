@@ -185,6 +185,10 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 			throw IOException("MSSQL: %s failed: %s", isolation, result.error_message);
 		}
 	}
+	// From here the session carries the level. RESET_CONNECTION does not clear it,
+	// so if BEGIN fails the connection must not go back to the pool as it is: it
+	// is closed first (review of #381), on every failure path below.
+	const bool close_on_failure = !isolation.empty();
 
 	// Start SQL Server transaction lazily (BEGIN TRANSACTION)
 	MSSQL_CONN_LOG("GetConnection: Starting SQL Server transaction");
@@ -192,6 +196,9 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	if (!conn->ExecuteBatch("BEGIN TRANSACTION", "BEGIN TRANSACTION")) {
 		// Failed to start transaction - release connection and throw
 		MSSQL_CONN_LOG("GetConnection: ExecuteBatch failed: %s", conn->GetLastError().c_str());
+		if (close_on_failure) {
+			conn->Close();
+		}
 		pool.Release(conn);
 		throw IOException("MSSQL: Failed to start SQL Server transaction: " + conn->GetLastError());
 	}
@@ -199,6 +206,9 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	// Receive the complete TDS response (should be a simple DONE token)
 	auto *socket = conn->GetSocket();
 	if (!socket) {
+		if (close_on_failure) {
+			conn->Close();
+		}
 		pool.Release(conn);
 		throw IOException("MSSQL: Socket is null after BEGIN TRANSACTION");
 	}

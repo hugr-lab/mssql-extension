@@ -384,30 +384,37 @@ void MSSQLCatalog::QueryDatabaseCollation() {
 		const auto &level = connection_info_->transaction_isolation;
 		const bool probe_snapshot = (level == "snapshot" || level == "auto") && !connection_info_->IsFabricEndpoint() &&
 									!connection_info_->IsSynapseEndpoint();
-		string collation_sql = DATABASE_COLLATION_SQL;
-		if (probe_snapshot) {
-			collation_sql += SNAPSHOT_STATE_COLUMN;
+		auto run = [&](const string &sql) {
+			collation.clear();
+			code_page = 0;
+			snapshot_isolation_state_ = -1;
+			return MSSQLSimpleQuery::ExecuteWithCallback(*connection, sql, [&](const std::vector<std::string> &values) {
+				if (!values.empty()) {
+					collation = values[0];
+				}
+				if (values.size() > 1 && !values[1].empty()) {
+					try {
+						code_page = std::stoi(values[1]);
+					} catch (...) {
+						code_page = 0;
+					}
+				}
+				if (values.size() > 2 && !values[2].empty()) {
+					try {
+						snapshot_isolation_state_ = std::stoi(values[2]);
+					} catch (...) {
+						snapshot_isolation_state_ = -1;
+					}
+				}
+				return true;  // one row; keep the stream drained
+			});
+		};
+		// A failed probe must not take the collation and code page with it (review
+		// of #381): the plain query again, the snapshot state left unknown, which
+		// `auto` treats as "send nothing".
+		if (!probe_snapshot || !run(string(DATABASE_COLLATION_SQL) + SNAPSHOT_STATE_COLUMN).success) {
+			run(DATABASE_COLLATION_SQL);
 		}
-		MSSQLSimpleQuery::ExecuteWithCallback(*connection, collation_sql, [&](const std::vector<std::string> &values) {
-			if (!values.empty()) {
-				collation = values[0];
-			}
-			if (values.size() > 1 && !values[1].empty()) {
-				try {
-					code_page = std::stoi(values[1]);
-				} catch (...) {
-					code_page = 0;
-				}
-			}
-			if (values.size() > 2 && !values[2].empty()) {
-				try {
-					snapshot_isolation_state_ = std::stoi(values[2]);
-				} catch (...) {
-					snapshot_isolation_state_ = -1;
-				}
-			}
-			return true;  // one row; keep the stream drained
-		});
 
 		if (!collation.empty()) {
 			database_collation_ = collation;
