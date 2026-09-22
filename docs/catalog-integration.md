@@ -322,7 +322,8 @@ Some rules for the value:
 
 - **Exact spelling.** Give the name as the server spells it, because the catalog's schema lookup is case-sensitive.
 - **No server check at ATTACH.** A name that does not exist is reported at its first unqualified use: `schema "x" does not exist`.
-- **Must be visible.** A default that `schema_filter` hides is refused at ATTACH, because every unqualified name would resolve against a schema the catalog refuses to show.
+- **Must be visible.** A default that `schema_filter` hides is refused at ATTACH, because every unqualified name would resolve against a schema the catalog refuses to show. This is checked only for an explicit value. An unset default (`dbo`) hidden by the filter is not refused, because existing ATTACHes that pair such a filter with qualified names must keep working.
+- **Whitespace and empty values.** Surrounding whitespace is trimmed. An empty value means `dbo`, and that includes an explicit `default_schema ''` on the ATTACH, which clears a value set in the secret.
 
 **Why not the login's own default schema.** The value is not derived from `SCHEMA_NAME()`. SQL Server resolves an unqualified name through the login's default schema and then `dbo`, while DuckDB has a single default schema. Following the login's default automatically would therefore break unqualified references to `dbo` objects for such logins. Unset keeps today's `dbo`.
 

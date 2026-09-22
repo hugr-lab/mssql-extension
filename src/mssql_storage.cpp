@@ -1646,9 +1646,16 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	if (default_schema_specified) {
 		connection_info->default_schema = default_schema_option;
 	}
+	// Surrounding whitespace is never part of a schema name the user means
+	// (review of #379); an empty value -- including an explicit '' on the ATTACH,
+	// which clears a secret's -- means the default, `dbo`.
+	StringUtil::Trim(connection_info->default_schema);
 	// A default schema the schema_filter hides would resolve every unqualified
 	// name against a schema the catalog refuses to show: the configuration
 	// contradicts itself, so it fails here rather than on the first query.
+	// Only an EXPLICIT default is checked (review of #379): an unset one is `dbo`,
+	// and refusing a filter that hides `dbo` would break every existing ATTACH
+	// that pairs such a filter with fully qualified names.
 	if (!connection_info->default_schema.empty() && !connection_info->schema_filter.empty()) {
 		MSSQLCatalogFilter filter;
 		filter.SetSchemaFilter(connection_info->schema_filter);

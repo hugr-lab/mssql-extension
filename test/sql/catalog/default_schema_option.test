@@ -101,8 +101,49 @@ SELECT (SELECT v FROM i322a.i322.copy_t), (SELECT v FROM i322a.i322.copy_u);
 ----
 7	8
 
+# A two-part COPY into a #temp table under a non-dbo default: SQL Server ignores
+# a temp table's schema, so the load lands in the session's #temp as before.
+statement ok
+BEGIN;
+
+statement ok
+COPY (SELECT 1 AS v) TO 'i322a.#tmp322' (FORMAT 'bcp');
+
+query I
+SELECT count(*) FROM mssql_scan('i322a', 'SELECT * FROM #tmp322');
+----
+1
+
+statement ok
+COMMIT;
+
 statement ok
 DETACH i322a;
+
+# The name is matched as the server spells it: the catalog's schema lookup is
+# case-sensitive, so a differently cased default is a schema that does not exist.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i322case (TYPE mssql, default_schema 'I322');
+
+statement error
+SELECT count(*) FROM i322case.only_here;
+----
+schema "I322" does not exist
+
+statement ok
+DETACH i322case;
+
+# Surrounding whitespace is trimmed.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i322ws (TYPE mssql, default_schema '  i322 ');
+
+query I
+SELECT count(*) FROM i322ws.only_here;
+----
+2
+
+statement ok
+DETACH i322ws;
 
 # =============================================================================
 # Connection string, URI, secret -- and the ATTACH option over the secret
@@ -159,6 +200,23 @@ SELECT count(*) FROM i322o.TestSimplePK WHERE false;
 
 statement ok
 DETACH i322o;
+
+# An explicit empty value clears the secret's: the default is dbo again.
+statement ok
+ATTACH '' AS i322e (TYPE mssql, SECRET i322_secret, default_schema '');
+
+statement error
+SELECT count(*) FROM i322e.only_here;
+----
+does not exist
+
+query I
+SELECT count(*) FROM i322e.TestSimplePK WHERE false;
+----
+0
+
+statement ok
+DETACH i322e;
 
 statement ok
 DROP SECRET i322_secret;
