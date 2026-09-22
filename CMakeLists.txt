@@ -111,6 +111,7 @@ set(EXTENSION_SOURCES
     src/mssql_secret.cpp
     src/mssql_storage.cpp
     src/mssql_functions.cpp
+    src/mssql_function_docs.cpp
     # Encoding utilities (in tds namespace)
     src/tds/encoding/utf16.cpp
     src/tds/encoding/decimal_encoding.cpp

@@ -245,8 +245,8 @@ gate widening this further (spec 061).
 | `mssql_scan` | Table | `(context VARCHAR, query VARCHAR)` | Execute raw T-SQL, stream results |
 | `mssql_exec` | Scalar | `(context VARCHAR, sql VARCHAR) → BIGINT` | Execute DDL/DML, return affected rows |
 | `mssql_pool_stats` | Table | `(context VARCHAR?)` | Pool statistics |
-| `mssql_refresh_cache` | Scalar | `(catalog VARCHAR) → BOOLEAN` | Refresh metadata cache |
-| `mssql_preload_catalog` | Scalar | `(catalog VARCHAR, schema? VARCHAR) → VARCHAR` | Bulk-load all metadata per-schema |
+| `mssql_refresh_cache` | Scalar | `(context VARCHAR) → BOOLEAN` | Refresh metadata cache |
+| `mssql_preload_catalog` | Scalar | `(context VARCHAR, schema? VARCHAR) → VARCHAR` | Bulk-load all metadata per-schema |
 | `mssql_azure_auth_test` | Scalar | `(secret VARCHAR, tenant? VARCHAR) → VARCHAR` | Test Azure AD token acquisition |
 | `mssql_version` | Scalar | `() → VARCHAR` | Extension version |
 

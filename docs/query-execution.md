@@ -317,7 +317,7 @@ The inner text and declarations are what the server keys its plan on, so every c
 
 ## mssql_exec Function
 
-`mssql_exec(context_name, sql)` executes a T-SQL statement and returns the affected row count.
+`mssql_exec(context, sql)` executes a T-SQL statement and returns the affected row count.
 
 ```sql
 SELECT mssql_exec('mydb', 'DELETE FROM users WHERE id = 1');
@@ -330,7 +330,7 @@ SELECT mssql_exec('mydb', 'DELETE FROM users WHERE id = 1');
 3. Parse response for DONE token with DONE_COUNT flag
 4. Return row count (0 for DDL/SELECT)
 
-`mssql_exec_params(context_name, statement, {name: value, ...} [, declarations])` takes the same parameter contract as `mssql_scan_params` and runs one `sp_executesql` batch per row, so a statement executed for many rows compiles once on the server:
+`mssql_exec_params(context, statement, params [, declarations])` takes the same parameter contract as `mssql_scan_params` and runs one `sp_executesql` batch per row, so a statement executed for many rows compiles once on the server:
 
 ```sql
 SELECT mssql_exec_params('mydb', 'UPDATE dbo.users SET name = @n WHERE id = @id', {'n': name, 'id': id})
