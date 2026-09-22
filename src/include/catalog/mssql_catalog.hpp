@@ -97,6 +97,31 @@ public:
 	//! string; that is the only difference between the two ports.)
 	optional<Identifier> GetDefaultSchema() const override;
 
+	//! The statement sent before BEGIN TRANSACTION on the connection a DuckDB
+	//! transaction pins (issue #331), or "" to send none -- the server's own
+	//! default, which is what every transaction ran at before the option.
+	//! `transaction_isolation` decides; `auto` means SNAPSHOT when this database
+	//! has ALLOW_SNAPSHOT_ISOLATION ON (probed at ATTACH, in the same query as
+	//! the collation) and nothing otherwise, including when the probe could not
+	//! say. A Fabric Warehouse gets nothing whatever was asked: it enforces
+	//! snapshot isolation on every transaction and ignores the SET. `auto` on
+	//! Synapse gets nothing: its only settable level is READ UNCOMMITTED.
+	string TransactionIsolationStatement() const;
+
+	//! The statement that puts a fresh session's level back once the
+	//! transaction has ended -- "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+	//! when TransactionIsolationStatement is not empty, else "". SQL Server keeps
+	//! the level across the pool's RESET_CONNECTION (issue #331), so the
+	//! transaction manager sends it before the connection goes back to the pool.
+	string TransactionIsolationRestoreStatement() const;
+
+	//! Refuses at ATTACH what the server would refuse only later: an explicit
+	//! `snapshot` against a database the probe found with
+	//! ALLOW_SNAPSHOT_ISOLATION OFF. BEGIN succeeds there and the first read of
+	//! a user table inside the transaction fails (error 3952), so without this
+	//! the error would surface in the middle of the user's first transaction.
+	void CheckTransactionIsolation() const;
+
 	//! Serializes materialized catalog scans against each other (issue #239).
 	//!
 	//! R2 drains a scan inside InitGlobal so the pinned connection is Idle again
@@ -368,8 +393,12 @@ private:
 	unique_ptr<MSSQLMetadataCache> metadata_cache_;			   // Metadata cache
 	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;  // Statistics provider
 	int32_t database_code_page_ = 0;  // COLLATIONPROPERTY(database collation, 'CodePage'), issue #361
-	string database_collation_;		  // Database default collation
-	string default_schema_;			  // Default schema: `default_schema` option, else "dbo"
+	//! sys.databases.snapshot_isolation_state for this database, probed at ATTACH
+	//! (issue #331): 0 OFF, 1 ON, 2/3 in transition; -1 when the probe did not
+	//! run (catalog false, no connection) or the row was not visible.
+	int32_t snapshot_isolation_state_ = -1;
+	string database_collation_;	 // Database default collation
+	string default_schema_;		 // Default schema: `default_schema` option, else "dbo"
 	// Spec 052 (Option D): shared_ptr ownership for schema entries. The bind-
 	// time anchor (MSSQLBindAnchors, per ClientContext, released at QueryEnd)
 	// keeps entries alive across concurrent Invalidate / OnDetach. emplace-

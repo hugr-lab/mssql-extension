@@ -262,14 +262,57 @@ bool ExecuteAndDrain(TdsConnection &conn, const string &sql, int timeout_ms = 50
 
 ## SQL Server Isolation Behavior
 
-The extension does not explicitly set a transaction isolation level. SQL Server defaults to **READ COMMITTED** with locking semantics:
+Unless the `transaction_isolation` option says otherwise, the extension sends no `SET TRANSACTION ISOLATION LEVEL`. The server's default applies, which is **READ COMMITTED**.
 
-- Shared locks held during read operations
-- Exclusive locks held during write operations
-- Shared locks released after each statement (not held until transaction end)
-- Other transactions may see committed changes between statements
+### Why the level matters here
 
-No `SET TRANSACTION ISOLATION LEVEL` is issued by the extension. Users who need different isolation levels can use `mssql_exec()` to set it manually within a transaction.
+Each scan of a DuckDB transaction is its own statement on the pinned connection. Under READ COMMITTED, a row that another session commits between two scans is seen by the second scan and not by the first. A query that reads the same table twice can therefore see two states of it. DuckLake's commit-conflict check does exactly that (issue #331).
+
+Measured with two reads inside one transaction and a committed insert from another session between them:
+
+| Level | First read / second read |
+|---|---|
+| READ COMMITTED | 3 / 4 |
+| SNAPSHOT | 3 / 3 |
+
+`READ_COMMITTED_SNAPSHOT` is not enough: it is consistent per statement, and the two scans are two statements.
+
+### The option
+
+`transaction_isolation` can be an ATTACH option, `TransactionIsolation=` in a connection string, `transaction_isolation=` in a URI, or a secret parameter. The ATTACH option wins. The value is one of:
+
+- **`default`** (or unset): send nothing, as before.
+- **`read_uncommitted`, `read_committed`, `repeatable_read`, `serializable`, `snapshot`**: sent as `SET TRANSACTION ISOLATION LEVEL …` on the pinned connection, as its own statement, before `BEGIN TRANSACTION`. The SET must come before BEGIN, because a transaction cannot switch to SNAPSHOT once it has started.
+- **`auto`**: SNAPSHOT when the database has `ALLOW_SNAPSHOT_ISOLATION ON`, and nothing otherwise, including when that could not be determined.
+  - The state is probed at ATTACH: `sys.databases.snapshot_isolation_state`, in the same query as the database collation, so it costs no extra round trip.
+  - The probe runs only when the option is `snapshot` or `auto`, and not on Fabric or Synapse. Every other ATTACH sends the same query as before, so a platform whose `sys.databases` lacks the column cannot fail an ATTACH that never asked about isolation.
+  - A missing row reads as unknown, and unknown falls back to nothing.
+
+An explicit `snapshot` against a database where snapshot isolation is OFF is refused at ATTACH. Otherwise BEGIN would succeed and the first read of a user table in the transaction would fail with error 3952.
+
+Behaviour on cloud platforms:
+
+- **Fabric Warehouse** gets nothing whatever was asked: it enforces snapshot isolation on every transaction and ignores the SET.
+- **Azure Synapse** gets nothing: its only settable level, READ UNCOMMITTED, is already its default. Any other explicit level is refused at ATTACH.
+
+### What SNAPSHOT changes, measured
+
+- **Write conflicts.** Updating or deleting a row that another session changed since the transaction began fails with error 3960: `Snapshot isolation transaction aborted due to update conflict … Retry the transaction`. SQL Server aborts the transaction. Under READ COMMITTED the same UPDATE simply re-reads the row. A caller that retries on "conflict", as DuckLake does, handles this.
+- **Bulk loads.** COPY and INSERT through `INSERT BULK` inside a SNAPSHOT transaction work, including TABLOCK on a heap, and their rows are visible in the same transaction.
+- **Concurrent readers.** While another session bulk-loads a heap under TABLOCK:
+  - a READ COMMITTED reader of that heap **waits** for the load's commit;
+  - a SNAPSHOT reader does not wait, and sees the committed state.
+
+### The level is put back
+
+SQL Server keeps a session's isolation level across the `RESET_CONNECTION` the pool sends on reuse. This was measured: SNAPSHOT was still in force on the next autocommit statement although the reset had run and dropped the session's `#temp` table.
+
+So when the transaction set a level, COMMIT and ROLLBACK are followed by `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` before the connection returns to the pool.
+
+- **Why it is a separate statement.** Appended to the ROLLBACK batch, it does not run when the server has already aborted the transaction on a conflict: that batch goes out with a stale transaction descriptor.
+- **When it fails.** A connection whose level could not be put back is closed, never pooled.
+
+The same persistence applies to a `SET TRANSACTION ISOLATION LEVEL` sent through `mssql_exec()`. In autocommit it stays on that pooled connection for every later statement, so use the option instead.
 
 ## Connection Pool Interaction
 

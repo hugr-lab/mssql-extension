@@ -159,6 +159,14 @@ struct MSSQLConnectionInfo {
 	//! case-sensitive.
 	string default_schema;
 
+	//! Issue #331: the isolation level of the server transaction a DuckDB
+	//! transaction opens, sent as SET TRANSACTION ISOLATION LEVEL before BEGIN
+	//! on the pinned connection. Canonical after ATTACH: "" (send nothing -- the
+	//! server's default, as before), "read_uncommitted", "read_committed",
+	//! "repeatable_read", "serializable", "snapshot", or "auto" (snapshot when the
+	//! database allows it, else nothing).
+	string transaction_isolation;
+
 	//===----------------------------------------------------------------------===//
 	// ORDER BY Pushdown (Spec 039)
 	//===----------------------------------------------------------------------===//

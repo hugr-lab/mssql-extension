@@ -5,6 +5,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
+#include "query/mssql_simple_query.hpp"
 #include "tds/tds_connection.hpp"
 #include "tds/tds_connection_pool.hpp"
 #include "tds/tds_socket.hpp"
@@ -170,12 +171,34 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	// not finished with. It is published below, once the transaction is open and
 	// the connection is back to Idle.
 
+	// The isolation level first (issue #331): SET TRANSACTION ISOLATION LEVEL has
+	// to precede BEGIN -- a transaction cannot be switched to SNAPSHOT once it has
+	// started -- and it goes as its own statement so a refusal is seen as one.
+	// In the BEGIN batch a failed SET would let BEGIN run at the old level, and
+	// the reply scan below stops at the ERROR token before the descriptor.
+	// Only when the option asks for a level; none means no round trip, as before.
+	auto isolation = catalog.TransactionIsolationStatement();
+	if (!isolation.empty()) {
+		auto result = MSSQLSimpleQuery::Execute(*conn, isolation);
+		if (!result.success) {
+			pool.Release(conn);
+			throw IOException("MSSQL: %s failed: %s", isolation, result.error_message);
+		}
+	}
+	// From here the session carries the level. RESET_CONNECTION does not clear it,
+	// so if BEGIN fails the connection must not go back to the pool as it is: it
+	// is closed first (review of #381), on every failure path below.
+	const bool close_on_failure = !isolation.empty();
+
 	// Start SQL Server transaction lazily (BEGIN TRANSACTION)
 	MSSQL_CONN_LOG("GetConnection: Starting SQL Server transaction");
 
 	if (!conn->ExecuteBatch("BEGIN TRANSACTION", "BEGIN TRANSACTION")) {
 		// Failed to start transaction - release connection and throw
 		MSSQL_CONN_LOG("GetConnection: ExecuteBatch failed: %s", conn->GetLastError().c_str());
+		if (close_on_failure) {
+			conn->Close();
+		}
 		pool.Release(conn);
 		throw IOException("MSSQL: Failed to start SQL Server transaction: " + conn->GetLastError());
 	}
@@ -183,6 +206,9 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	// Receive the complete TDS response (should be a simple DONE token)
 	auto *socket = conn->GetSocket();
 	if (!socket) {
+		if (close_on_failure) {
+			conn->Close();
+		}
 		pool.Release(conn);
 		throw IOException("MSSQL: Socket is null after BEGIN TRANSACTION");
 	}

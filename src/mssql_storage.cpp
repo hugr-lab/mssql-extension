@@ -272,6 +272,10 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	if (!table_filter_val.IsNull()) {
 		result->table_filter = table_filter_val.ToString();
 	}
+	auto isolation_val = kv_secret.TryGetValue("transaction_isolation");
+	if (!isolation_val.IsNull()) {
+		result->transaction_isolation = isolation_val.ToString();
+	}
 	auto default_schema_val = kv_secret.TryGetValue("default_schema");
 	if (!default_schema_val.IsNull()) {
 		result->default_schema = default_schema_val.ToString();
@@ -469,6 +473,8 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 					result["schema_filter"] = value;
 				} else if (lower_key == "table_filter" || lower_key == "tablefilter") {
 					result["table_filter"] = value;
+				} else if (lower_key == "transaction_isolation" || lower_key == "transactionisolation") {
+					result["transaction_isolation"] = value;
 				} else if (lower_key == "default_schema" || lower_key == "defaultschema") {
 					result["default_schema"] = value;
 				} else if (lower_key == "authenticator") {
@@ -634,6 +640,9 @@ static case_insensitive_map_t<string> ParseConnectionString(const string &connec
 			result["schema_filter"] = value;
 		} else if (lower_key == "tablefilter" || lower_key == "table_filter") {
 			result["table_filter"] = value;
+		} else if (lower_key == "transactionisolation" || lower_key == "transaction_isolation" ||
+				   lower_key == "transaction isolation") {
+			result["transaction_isolation"] = value;
 		} else if (lower_key == "defaultschema" || lower_key == "default_schema" || lower_key == "default schema") {
 			result["default_schema"] = value;
 		} else if (lower_key == "authenticator") {
@@ -945,6 +954,9 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 	}
 	if (params.find("table_filter") != params.end()) {
 		result->table_filter = params["table_filter"];
+	}
+	if (params.find("transaction_isolation") != params.end()) {
+		result->transaction_isolation = params["transaction_isolation"];
 	}
 	if (params.find("default_schema") != params.end()) {
 		result->default_schema = params["default_schema"];
@@ -1473,6 +1485,34 @@ void ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_sec
 // Storage Extension callbacks
 //===----------------------------------------------------------------------===//
 
+// transaction_isolation (issue #331), from whichever source set it, to its
+// canonical form: lowercase, words joined by '_' ("READ COMMITTED",
+// "read-committed" and "read_committed" are one value). "" and "default" mean
+// send nothing, as before the option existed.
+static string NormalizeTransactionIsolation(const string &raw) {
+	string value = StringUtil::Lower(raw);
+	StringUtil::Trim(value);
+	for (auto &c : value) {
+		if (c == ' ' || c == '-') {
+			c = '_';
+		}
+	}
+	if (value.empty() || value == "default") {
+		return "";
+	}
+	static const char *const LEVELS[] = {"read_uncommitted", "read_committed", "repeatable_read",
+										 "serializable",	 "snapshot",	   "auto"};
+	for (auto level : LEVELS) {
+		if (value == level) {
+			return value;
+		}
+	}
+	throw InvalidInputException(
+		"MSSQL ATTACH error: transaction_isolation '%s' is not one of default, read_uncommitted, read_committed, "
+		"repeatable_read, serializable, snapshot, auto",
+		raw);
+}
+
 // A boolean ATTACH option arrives as a BOOLEAN when it is written as one
 // (`lazy_validation true`) and as a VARCHAR when something rendered it as a
 // string on the way: DuckLake's METADATA_PARAMETERS is a MAP(VARCHAR, VARCHAR)
@@ -1507,6 +1547,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	string schema_filter_option;		 // Spec 033: ATTACH-level schema filter
 	string table_filter_option;			 // Spec 033: ATTACH-level table filter
 	bool schema_filter_specified = false;
+	string transaction_isolation_option;  // Issue #331: ATTACH-level isolation level
+	bool transaction_isolation_specified = false;
 	string default_schema_option;  // Issue #322: ATTACH-level default schema
 	bool default_schema_specified = false;
 	bool table_filter_specified = false;
@@ -1538,6 +1580,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		} else if (lower_name == "schema_filter") {
 			schema_filter_option = it->second.ToString();
 			schema_filter_specified = true;
+			it = options.options.erase(it);
+		} else if (lower_name == "transaction_isolation" || lower_name == "transactionisolation") {
+			transaction_isolation_option = it->second.ToString();
+			transaction_isolation_specified = true;
 			it = options.options.erase(it);
 		} else if (lower_name == "default_schema" || lower_name == "defaultschema") {
 			default_schema_option = it->second.ToString();
@@ -1643,6 +1689,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		}
 		connection_info->table_filter = table_filter_option;
 	}
+	if (transaction_isolation_specified) {
+		connection_info->transaction_isolation = transaction_isolation_option;
+	}
+	connection_info->transaction_isolation = NormalizeTransactionIsolation(connection_info->transaction_isolation);
 	if (default_schema_specified) {
 		connection_info->default_schema = default_schema_option;
 	}
@@ -1807,6 +1857,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	auto catalog = make_uniq<MSSQLCatalog>(db, name, std::move(connection_info), std::move(tds_pool_config),
 										   std::move(fedauth_token_utf16le), options.access_mode, catalog_enabled);
 	catalog->Initialize(false);
+	catalog->CheckTransactionIsolation();
 
 	return std::move(catalog);
 }
