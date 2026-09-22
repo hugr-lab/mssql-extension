@@ -400,13 +400,23 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 		// mssql_connection_limit allows therefore blocks for mssql_acquire_timeout
 		// and fails HERE, during binding, where the pool exhaustion says nothing
 		// about the option that caused it.
-		if (bind_data.prepared) {
+		//
+		// Only exhaustion gets that advice. GetConnection throws for unrelated
+		// reasons too -- since #302 a creation failure carries the server's own
+		// words ("could not create a connection: Login failed for user 'sa'."),
+		// and the transaction path can fail starting the server transaction. A
+		// wrong password reported as "Raise mssql_connection_limit" points at
+		// the wrong knob, so the reason decides, and anything else is rethrown
+		// unchanged rather than flattened into an IOException.
+		const string reason = e.what();
+		const bool exhausted = reason.find("timed out") != string::npos;
+		if (bind_data.prepared && exhausted) {
 			throw IOException(
 				"mssql_scan: could not acquire a connection for '%s' while binding a `prepared := true` scan: %s. "
 				"Each prepared scan holds one pooled connection for the life of the statement, so a plan with "
 				"several of them can exhaust mssql_connection_limit before it runs. Raise mssql_connection_limit, "
 				"or drop `prepared := true` on some of the scans.",
-				bind_data.context_name, e.what());
+				bind_data.context_name, reason);
 		}
 		throw;
 	}
@@ -611,8 +621,14 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		bool claimed = false;
 		bool lost_claim = false;
 		if (bind_data.prepared_session && bind_data.prepared_session->connection) {
+			// A free claim is not enough: ~MSSQLResultStream closes a connection
+			// that a cancelled stream left out of Idle, and that connection is
+			// the prepared session's. Claiming it would send EXEC sp_execute
+			// down a Disconnected connection -- exactly what the fallback
+			// exists to avoid -- so an unusable session reads as a lost claim.
+			const bool usable = bind_data.prepared_session->connection->GetState() == tds::ConnectionState::Idle;
 			bool expected = false;
-			claimed = bind_data.prepared_session->in_use.compare_exchange_strong(expected, true);
+			claimed = usable && bind_data.prepared_session->in_use.compare_exchange_strong(expected, true);
 			lost_claim = !claimed;
 			if (claimed) {
 				// Held by the global state so its destructor gives the claim back.
@@ -630,6 +646,15 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 			// default path would have served.
 			MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: prepared session already claimed, running ad-hoc");
 			stream = executor.Execute(context, bind_data.fallback_sql);
+		} else if (lost_claim) {
+			// execute_sql is the sp_execute form and its handle lives in a session
+			// this global state does not hold, so running it on a pooled connection
+			// would send a handle the server never gave that session. The two are
+			// set together today, so this is a guard for a future caller that sets
+			// one without the other, not a reachable path.
+			throw InternalException(
+				"mssql_scan: prepared session for '%s' is unavailable and no ad-hoc statement was prepared for it",
+				bind_data.context_name);
 		} else {
 			stream = executor.Execute(context, bind_data.execute_sql);
 		}
