@@ -147,6 +147,38 @@ statement ok
 SET mssql_order_pushdown = false;
 
 # =============================================================================
+# Test 3c (#325, review of #372): the ATTACH option is honoured, not just
+# accepted, in its string form too -- the form DuckLake's METADATA_PARAMETERS
+# sends. The results above are the same pushed or not; the plan is what differs:
+# a pushed ORDER BY leaves no Order By operator above the scan. The key must be
+# NOT NULL -- order_pushdown_test.id is nullable, and a nullable key is never
+# pushed (DuckDB and SQL Server place NULLs differently) -- so the seed's
+# TestSimplePK, whose id is its primary key.
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS opd3y (TYPE mssql, order_pushdown 'yes');
+
+query II
+EXPLAIN SELECT id FROM opd3y.dbo.TestSimplePK ORDER BY id ASC;
+----
+physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
+
+statement ok
+DETACH opd3y;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS opd3n (TYPE mssql, order_pushdown 'no');
+
+query II
+EXPLAIN SELECT id FROM opd3n.dbo.TestSimplePK ORDER BY id ASC;
+----
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
+statement ok
+DETACH opd3n;
+
+# =============================================================================
 # Test 4 (T019/US1): Simple ORDER BY pushdown - single column ASC
 # =============================================================================
 
