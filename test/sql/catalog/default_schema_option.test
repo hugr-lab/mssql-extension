@@ -1,0 +1,192 @@
+# name: test/sql/catalog/default_schema_option.test
+# description: default_schema sets the schema unqualified names resolve against, from every configuration path (issue #322)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN, MSSQL_TESTDB_URI, MSSQL_TEST_HOST/PORT/USER/PASS
+#
+# Unset, the default stays `dbo`, as before (default_schema.test, issue #129).
+# Set, it governs a two-part name
+# (`db.table`), `USE db`, CTAS into `db.table`, and COPY into `db.table` or
+# `mssql://db/table`. ATTACH option > connection string / URI / secret.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+require-env MSSQL_TESTDB_URI
+
+require-env MSSQL_TEST_HOST
+
+require-env MSSQL_TEST_PORT
+
+require-env MSSQL_TEST_USER
+
+require-env MSSQL_TEST_PASS
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i322_setup (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('i322_setup', 'DROP TABLE IF EXISTS i322.only_here, i322.ctas_t, i322.copy_t, i322.copy_u');
+
+statement ok
+SELECT mssql_exec('i322_setup', 'IF SCHEMA_ID(''i322'') IS NULL EXEC(''CREATE SCHEMA i322'')');
+
+statement ok
+SELECT mssql_exec('i322_setup', 'CREATE TABLE i322.only_here (id INT)');
+
+statement ok
+SELECT mssql_exec('i322_setup', 'INSERT INTO i322.only_here VALUES (1), (2)');
+
+# =============================================================================
+# Unset: `dbo`, as before
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i322_dbo (TYPE mssql);
+
+statement error
+SELECT count(*) FROM i322_dbo.only_here;
+----
+does not exist
+
+statement ok
+DETACH i322_dbo;
+
+# =============================================================================
+# ATTACH option: unqualified names, USE, CTAS, COPY
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i322a (TYPE mssql, default_schema 'i322');
+
+query I
+SELECT count(*) FROM i322a.only_here;
+----
+2
+
+statement ok
+USE i322a;
+
+query I
+SELECT current_schema();
+----
+i322
+
+query I
+SELECT count(*) FROM only_here;
+----
+2
+
+statement ok
+USE memory;
+
+statement ok
+CREATE TABLE i322a.ctas_t AS SELECT 42 AS v;
+
+query I
+SELECT schema_name FROM duckdb_tables() WHERE database_name = 'i322a' AND table_name = 'ctas_t';
+----
+i322
+
+statement ok
+COPY (SELECT 7 AS v) TO 'i322a.copy_t' (FORMAT 'bcp');
+
+statement ok
+COPY (SELECT 8 AS v) TO 'mssql://i322a/copy_u' (FORMAT 'bcp');
+
+query II
+SELECT (SELECT v FROM i322a.i322.copy_t), (SELECT v FROM i322a.i322.copy_u);
+----
+7	8
+
+statement ok
+DETACH i322a;
+
+# =============================================================================
+# Connection string, URI, secret -- and the ATTACH option over the secret
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN};DefaultSchema=i322' AS i322c (TYPE mssql);
+
+query I
+SELECT count(*) FROM i322c.only_here;
+----
+2
+
+statement ok
+DETACH i322c;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_URI}&default_schema=i322' AS i322u (TYPE mssql);
+
+query I
+SELECT count(*) FROM i322u.only_here;
+----
+2
+
+statement ok
+DETACH i322u;
+
+statement ok
+CREATE SECRET i322_secret (TYPE mssql, host '{MSSQL_TEST_HOST}', port {MSSQL_TEST_PORT}, database 'TestDB', user '{MSSQL_TEST_USER}', password '{MSSQL_TEST_PASS}', trust_server_certificate true, default_schema 'i322');
+
+statement ok
+ATTACH '' AS i322s (TYPE mssql, SECRET i322_secret);
+
+query I
+SELECT count(*) FROM i322s.only_here;
+----
+2
+
+statement ok
+DETACH i322s;
+
+statement ok
+ATTACH '' AS i322o (TYPE mssql, SECRET i322_secret, default_schema 'dbo');
+
+statement error
+SELECT count(*) FROM i322o.only_here;
+----
+does not exist
+
+query I
+SELECT count(*) FROM i322o.TestSimplePK WHERE false;
+----
+0
+
+statement ok
+DETACH i322o;
+
+statement ok
+DROP SECRET i322_secret;
+
+# =============================================================================
+# A default schema that does not exist: named at the first unqualified use
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i322n (TYPE mssql, default_schema 'i322_no_such');
+
+statement error
+SELECT count(*) FROM i322n.only_here;
+----
+schema "i322_no_such" does not exist
+
+statement ok
+DETACH i322n;
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('i322_setup', 'DROP TABLE IF EXISTS i322.only_here, i322.ctas_t, i322.copy_t, i322.copy_u');
+
+statement ok
+SELECT mssql_exec('i322_setup', 'DROP SCHEMA IF EXISTS i322');
+
+statement ok
+DETACH i322_setup;
