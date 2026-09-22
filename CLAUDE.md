@@ -67,7 +67,7 @@ make clean              # Remove build artifacts
 
 # Test
 make test               # Unit tests (no SQL Server required)
-make docker-up          # Start SQL Server container
+make docker-up          # Start SQL Server container (no .env needed; `cp .env.example .env` to override port/password)
 make integration-test   # Integration tests (requires SQL Server)
 make test-all           # All tests
 make test-debug         # Tests with debug build
