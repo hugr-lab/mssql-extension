@@ -56,15 +56,26 @@ docker-up:
 	@echo "Starting SQL Server test container..."
 	docker compose -f $(DOCKER_COMPOSE) up -d sqlserver
 	@echo "Waiting for SQL Server to be healthy..."
+	@# The health field, not a grep of the status line: "(unhealthy)" contains
+	@# "healthy", so a server whose health check kept failing was reported ready.
 	@timeout=120; while [ $$timeout -gt 0 ]; do \
-		if docker compose -f $(DOCKER_COMPOSE) ps sqlserver | grep -q "healthy"; then \
+		health=$$(docker compose -f $(DOCKER_COMPOSE) ps --format '{{.Health}}' sqlserver 2>/dev/null); \
+		if [ "$$health" = "healthy" ]; then \
 			echo "SQL Server is ready!"; \
 			break; \
+		fi; \
+		if [ "$$health" = "unhealthy" ]; then \
+			echo "SQL Server is unhealthy: docker compose -f $(DOCKER_COMPOSE) logs sqlserver" >&2; \
+			exit 1; \
 		fi; \
 		echo "Waiting... ($$timeout seconds remaining)"; \
 		sleep 5; \
 		timeout=$$((timeout - 5)); \
-	done
+	done; \
+	if [ $$timeout -le 0 ]; then \
+		echo "SQL Server did not become healthy in 120 s: docker compose -f $(DOCKER_COMPOSE) logs sqlserver" >&2; \
+		exit 1; \
+	fi
 	@echo "Running init scripts..."
 	docker compose -f $(DOCKER_COMPOSE) up sqlserver-init
 	@echo "SQL Server is ready for testing!"
@@ -157,7 +168,7 @@ integration-test: release
 	@echo "  MSSQL_TEST_URI=$(MSSQL_TEST_URI)"
 	@echo "  MSSQL_TESTDB_DSN=$(MSSQL_TESTDB_DSN)"
 	@echo ""
-	@if ! docker compose -f $(DOCKER_COMPOSE) ps sqlserver 2>/dev/null | grep -q "healthy"; then \
+	@if [ "$$(docker compose -f $(DOCKER_COMPOSE) ps --format '{{.Health}}' sqlserver 2>/dev/null)" != "healthy" ]; then \
 		echo "WARNING: SQL Server container not detected. Run 'make docker-up' first."; \
 	fi
 	@# The path glob, not the group tags. `[integration]` and `[sql]` match only

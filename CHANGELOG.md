@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Every mssql function is documented in `duckdb_functions()`**
+  ([#371](https://github.com/hugr-lab/mssql-extension/issues/371)): a
+  description, runnable examples and a category on each of the 23 overloads,
+  and real parameter names on the scalar functions — `mssql_exec(context,
+  sql)` instead of `mssql_exec(col0, col1)`. `duckdb_functions()` is all a
+  client connected to the database can read about an extension, so this is
+  what an agent working through SQL sees. The scalar names are also callable,
+  `mssql_exec(context := 'db', sql := '…')`, and binder errors list them.
+  Table functions keep `col0`, `col1`, … for their positional parameters,
+  because DuckDB's `duckdb_functions()` names those by position whatever the
+  registration says; their named parameters (`prepared`) show by name.
+  `mssql_preload_catalog`'s optional schema is now a second parameter instead
+  of a vararg, so it is named too, and a third argument, which used to be
+  accepted and ignored, is refused.
+
 ### Fixed
 
 - **`mssql_preload_catalog` loads the schema list, marks only what it loaded,
@@ -24,10 +41,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     cache and ran the whole-catalog query again.
 
   Both paths now load the schema list first, which is one light query and free
-  when it is already loaded, and mark only what they loaded. A schema the
-  catalog does not show loads nothing and gets no phantom entry. The summary
-  counts what the call loaded, and the numbers are the same on every call.
-  Before, a second preload said `Preloaded schema 'dbo': 0 tables, 358 columns`.
+  when it is already loaded, and mark only what they loaded. The schema name
+  matches ignoring case when exactly one schema does, as it did when the name
+  went to the server. A schema the catalog does not show, because it is absent
+  or hidden by `schema_filter`, is refused by name instead of being reported as
+  empty, and it gets no phantom entry. The summary counts what the call loaded,
+  and the numbers are the same on every call. Before, a second preload said
+  `Preloaded schema 'dbo': 0 tables, 358 columns`.
+- **Boolean ATTACH options accept a string value**
+  ([#325](https://github.com/hugr-lab/mssql-extension/issues/325)).
+  `lazy_validation`, `catalog` and `order_pushdown` were read through an
+  integer cast, so `lazy_validation 'true'` failed with `Could not convert
+  string 'true' to INT8` — and a string is the only thing DuckLake's
+  `METADATA_PARAMETERS` can send, since it is a `MAP(VARCHAR, VARCHAR)` whose
+  values reach the inner `ATTACH` quoted. None of the boolean options were
+  reachable for a `ducklake:mssql:` catalog. A string now goes through DuckDB's
+  own boolean cast, the one `SET` uses (`true`/`false`, `t`/`f`, `yes`/`no`,
+  `y`/`n`, `1`/`0`, any case), and anything else is refused with the option
+  named.
 - **A debug build no longer asserts on `SELECT k, rowid` over a string key
   column** ([#369](https://github.com/hugr-lab/mssql-extension/issues/369)).
   With `mssql_catalog_native_types` on (the default) the projected column is

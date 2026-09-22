@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "tds/auth/winsspi_test_function.hpp"
+#include "mssql_function_docs.hpp"
 #include "tds/auth/auth_strategy_factory.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -215,20 +216,31 @@ void RegisterWinSspiTestFunction(ExtensionLoader &loader) {
 	ScalarFunction f1("mssql_winsspi_auth_test", {LogicalType::VARCHAR}, LogicalType::VARCHAR, WinSspiTestHost);
 	f1.SetVolatile();
 	f1.SetFallible();
-	loader.RegisterFunction(f1);
 
 	// mssql_winsspi_auth_test(host, port)
 	ScalarFunction f2("mssql_winsspi_auth_test", {LogicalType::VARCHAR, LogicalType::INTEGER}, LogicalType::VARCHAR,
 					  WinSspiTestHostPort);
 	f2.SetVolatile();
 	f2.SetFallible();
-	loader.RegisterFunction(f2);
+	RegisterDocumentedFunction(
+		loader, {f1, f2},
+		{{"host", "port"},
+		 "Windows peer of mssql_kerberos_auth_test: builds the SSPI (Negotiate) token for the SQL Server at host and "
+		 "port (default 1433) without connecting to it, and returns the principal, SPN and token size, or the SSPI "
+		 "error.",
+		 {"mssql_winsspi_auth_test('sql.example.com', 1433)"},
+		 {"authentication"}});
 
 	// mssql_winsspi_auth_test_spn(spn)
 	ScalarFunction f3("mssql_winsspi_auth_test_spn", {LogicalType::VARCHAR}, LogicalType::VARCHAR, WinSspiTestSpn);
 	f3.SetVolatile();
 	f3.SetFallible();
-	loader.RegisterFunction(f3);
+	RegisterDocumentedFunction(loader, {f3},
+							   {{"spn"},
+								"mssql_winsspi_auth_test for an explicit service principal name instead of the "
+								"MSSQLSvc/<host>:<port> one derived from host and port.",
+								{"mssql_winsspi_auth_test_spn('MSSQLSvc/sql.example.com:1433')"},
+								{"authentication"}});
 }
 
 }  // namespace winsspi

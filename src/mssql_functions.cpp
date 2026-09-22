@@ -15,6 +15,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "mssql_function_docs.hpp"
 #include "mssql_storage.hpp"
 #include "query/mssql_query_executor.hpp"
 #include "query/mssql_simple_query.hpp"
@@ -1081,11 +1082,16 @@ static void MSSQLExecParamsExecute(DataChunk &args, ExpressionState &state, Vect
 }
 
 void RegisterMSSQLExecFunction(ExtensionLoader &loader) {
-	auto func = MSSQLExecScalarFunction::GetFunction();
-	loader.RegisterFunction(func);
+	mssql::RegisterDocumentedFunction(
+		loader, {MSSQLExecScalarFunction::GetFunction()},
+		{{"context", "sql"},
+		 "Runs a T-SQL statement or batch on an attached SQL Server database and returns the number of rows it "
+		 "affected.",
+		 {"mssql_exec('db', 'CREATE TABLE dbo.notes (id int PRIMARY KEY, body nvarchar(200))')"},
+		 {"query"}});
 
 	// mssql_exec_params(context, statement, STRUCT [, declarations]) -> BIGINT
-	ScalarFunctionSet params_set("mssql_exec_params");
+	vector<ScalarFunction> params_overloads;
 	for (int with_declarations = 0; with_declarations < 2; with_declarations++) {
 		vector<LogicalType> arguments{LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY};
 		if (with_declarations) {
@@ -1096,9 +1102,17 @@ void RegisterMSSQLExecFunction(ExtensionLoader &loader) {
 		f.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 		f.SetVolatile();
 		f.SetFallible();
-		params_set.AddFunction(f);
+		params_overloads.push_back(f);
 	}
-	loader.RegisterFunction(params_set);
+	mssql::RegisterDocumentedFunction(
+		loader, std::move(params_overloads),
+		{{"context", "statement", "params", "declarations"},
+		 "Runs a parameterised T-SQL statement once per row and returns the rows affected: each field of the params "
+		 "STRUCT becomes an @-parameter of an sp_executesql call, declared from its DuckDB type or by the optional "
+		 "declarations list, so the server compiles the statement once.",
+		 {"mssql_exec_params('db', 'INSERT INTO dbo.notes (id, body) VALUES (@id, @body)', {'id': 1, 'body': "
+		  "'hello'})"},
+		 {"query"}});
 }
 
 //===----------------------------------------------------------------------===//
@@ -1113,7 +1127,13 @@ void RegisterMSSQLFunctions(ExtensionLoader &loader) {
 	// Spec 075: `prepared := true` compiles once via sp_prepare instead of
 	// describing at bind and compiling again at execution.
 	mssql_scan.named_parameters["prepared"] = LogicalType::BOOLEAN;
-	loader.RegisterFunction(mssql_scan);
+	mssql::RegisterDocumentedFunction(
+		loader, TableFunctionSet(mssql_scan),
+		{{},
+		 "Runs a T-SQL query on an attached SQL Server database and returns its result set. The shape is described "
+		 "at bind time without running the query; prepared := true compiles it once with sp_prepare instead.",
+		 {"SELECT * FROM mssql_scan('db', 'SELECT TOP 10 name, create_date FROM sys.tables')"},
+		 {"query"}});
 
 	// mssql_scan_params(context, statement, STRUCT [, declarations], prepared := false)
 	TableFunctionSet scan_params("mssql_scan_params");
@@ -1127,7 +1147,15 @@ void RegisterMSSQLFunctions(ExtensionLoader &loader) {
 		f.named_parameters["prepared"] = LogicalType::BOOLEAN;
 		scan_params.AddFunction(f);
 	}
-	loader.RegisterFunction(scan_params);
+	mssql::RegisterDocumentedFunction(
+		loader, std::move(scan_params),
+		{{},
+		 "mssql_scan with parameters: each field of the STRUCT becomes an @-parameter of an sp_executesql call, "
+		 "declared from its DuckDB type or by the optional declarations list, so one server plan serves every call.",
+		 {"SELECT * FROM mssql_scan_params('db', 'SELECT name FROM sys.objects WHERE object_id > @id', {'id': 100})",
+		  "SELECT * FROM mssql_scan_params('db', 'SELECT name FROM sys.objects WHERE create_date > @since', "
+		  "{'since': TIMESTAMP '2024-01-01'}, '@since datetime')"},
+		 {"query"}});
 }
 
 }  // namespace duckdb

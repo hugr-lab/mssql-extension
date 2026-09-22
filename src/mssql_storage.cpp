@@ -8,6 +8,7 @@
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -1461,6 +1462,27 @@ void ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_sec
 // Storage Extension callbacks
 //===----------------------------------------------------------------------===//
 
+// A boolean ATTACH option arrives as a BOOLEAN when it is written as one
+// (`lazy_validation true`) and as a VARCHAR when something rendered it as a
+// string on the way: DuckLake's METADATA_PARAMETERS is a MAP(VARCHAR, VARCHAR)
+// and forwards every value to the inner ATTACH as a quoted string (issue #325).
+// Value::GetValue<bool>() reads a VARCHAR through an int8 cast and refuses
+// 'true', so a string goes through DuckDB's own string-to-boolean cast instead
+// -- the one `SET` uses: true/false, t/f, yes/no, y/n, 1/0, any case.
+// A NULL never gets here: DuckDB's binder refuses it for every ATTACH option.
+static bool BooleanAttachOption(const string &name, const Value &value) {
+	if (value.type().id() != LogicalTypeId::VARCHAR) {
+		return value.GetValue<bool>();
+	}
+	const auto &text = StringValue::Get(value);
+	bool result = false;
+	if (!TryCast::Operation(string_t(text), result, false)) {
+		throw InvalidInputException(
+			"MSSQL Error: ATTACH option '%s' expects a boolean (true/false, yes/no, 1/0), got '%s'", name, text);
+	}
+	return result;
+}
+
 unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
 								AttachedDatabase &db, const string &name, AttachInfo &info, AttachOptions &options) {
 	// Extract SECRET, azure_secret, and access_token parameters (optional if connection string is provided)
@@ -1498,7 +1520,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			it = options.options.erase(it);
 		} else if (lower_name == "catalog") {
 			catalog_option_specified = true;
-			catalog_enabled_option = it->second.GetValue<bool>();
+			catalog_enabled_option = BooleanAttachOption(it->first, it->second);
 			it = options.options.erase(it);
 		} else if (lower_name == "schema_filter") {
 			schema_filter_option = it->second.ToString();
@@ -1509,13 +1531,13 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			table_filter_specified = true;
 			it = options.options.erase(it);
 		} else if (lower_name == "order_pushdown") {
-			order_pushdown_option = it->second.GetValue<bool>() ? 1 : 0;
+			order_pushdown_option = BooleanAttachOption(it->first, it->second) ? 1 : 0;
 			it = options.options.erase(it);
 		} else if (lower_name == "lazy_validation" || lower_name == "lazyvalidation") {
 			// Spec 047 (US2): suppress the eager TCP+LOGIN7 round trip below.
 			// Match the ADO.NET-style alias `LazyValidation` (lowercase via
 			// StringUtil::Lower) alongside the canonical `lazy_validation`.
-			lazy_validation = it->second.GetValue<bool>();
+			lazy_validation = BooleanAttachOption(it->first, it->second);
 			it = options.options.erase(it);
 		} else if (lower_name == "application_name" || lower_name == "applicationname" ||
 				   lower_name == "application name" || lower_name == "app name") {

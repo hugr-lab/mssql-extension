@@ -68,15 +68,27 @@ SELECT mssql_preload_catalog('i375', 'i375');
 ----
 Preloaded schema 'i375': 2 tables, 5 columns
 
-# A schema the catalog does not show -- here hidden by schema_filter -- loads
-# nothing and gets no phantom entry.
+# The name matches ignoring case when exactly one schema does, as the server's
+# @s comparison did under a case-insensitive collation before #376.
 query I
+SELECT mssql_preload_catalog('i375', 'I375');
+----
+Preloaded schema 'I375': 2 tables, 5 columns
+
+# A schema the catalog does not show -- hidden by schema_filter, or absent -- is
+# refused by name rather than reported as empty, and gets no phantom entry.
+statement error
 SELECT mssql_preload_catalog('i375', 'dbo');
 ----
-Preloaded schema 'dbo': 0 tables, 0 columns
+schema 'dbo' does not exist in this catalog, or schema_filter hides it
+
+statement error
+SELECT mssql_preload_catalog('i375', 'no_such_schema');
+----
+schema 'no_such_schema' does not exist in this catalog
 
 query I
-SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'i375' AND schema_name = 'dbo';
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'i375' AND schema_name IN ('dbo', 'no_such_schema');
 ----
 0
 
@@ -138,6 +150,34 @@ true
 
 statement ok
 DETACH i376b;
+
+# =============================================================================
+# #376: the target schema already partly loaded -- one of its tables looked up
+# first -- ends up holding exactly its tables: the preload merges its answer
+# with what was there and marks it complete (review of #377).
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i376p (TYPE mssql);
+
+query I
+SELECT count(*) FROM i376p.i375.t1 WHERE false;
+----
+0
+
+query I
+SELECT mssql_preload_catalog('i376p', 'i375');
+----
+Preloaded schema 'i375': 2 tables, 5 columns
+
+query II
+SELECT (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'i376p' AND schema_name = 'i375'),
+       (SELECT count(*) FROM duckdb_columns() WHERE database_name = 'i376p' AND schema_name = 'i375');
+----
+2	5
+
+statement ok
+DETACH i376p;
 
 # =============================================================================
 # #376: a whole-catalog preload is used, not repeated -- listing the catalog

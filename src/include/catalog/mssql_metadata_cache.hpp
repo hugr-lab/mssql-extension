@@ -313,6 +313,16 @@ public:
 	CacheLoadState GetColumnsState(const string &schema_name, const string &table_name) const;
 
 private:
+	//! The bodies of EnsureSchemasLoaded and LoadAllSchemasMetadata, for a caller
+	//! that already holds mutex_. BulkLoadAll holds ONE lock across the schema
+	//! list and the load that follows it (review of #377): taken apart, a
+	//! concurrent invalidation between the two could clear the list the load then
+	//! relies on, and bring back the #376 state -- tables published into a list
+	//! still marked NOT_LOADED, cleared and reloaded by the next access.
+	void EnsureSchemasLoadedLocked(tds::TdsConnection &connection);
+	void LoadAllSchemasMetadataLocked(tds::TdsConnection &connection, idx_t &schema_count, idx_t &table_count,
+									  idx_t &column_count);
+
 	//===----------------------------------------------------------------------===//
 	// Internal Loading Methods
 	//===----------------------------------------------------------------------===//

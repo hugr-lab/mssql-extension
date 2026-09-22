@@ -4,6 +4,7 @@
 #include "catalog/mssql_refresh_function.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
+#include "mssql_function_docs.hpp"
 #include "mssql_storage.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -140,7 +141,7 @@ static MSSQLCatalog &ResolveMSSQLCatalog(ClientContext &context, const string &c
 	}
 }
 
-// mssql_invalidate_cache(catalog [, schema [, table]]) -> BOOLEAN
+// mssql_invalidate_cache(context [, schema [, table]]) -> BOOLEAN
 // Lazy invalidation at the requested granularity (no eager reload):
 //   1 arg  -> whole catalog          (InvalidateMetadataCache)
 //   2 args -> one schema             (InvalidateSchemaTableSet)
@@ -176,16 +177,21 @@ void RegisterMSSQLRefreshCacheFunction(ExtensionLoader &loader) {
 	// effect during optimization and tripped ExpressionExecutor's
 	// CONSTANT_VECTOR assertion in debug builds — issue #178 finding D1).
 
-	// mssql_refresh_cache(catalog_name VARCHAR) -> BOOLEAN
+	// mssql_refresh_cache(context VARCHAR) -> BOOLEAN
 	ScalarFunction func("mssql_refresh_cache", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, MSSQLRefreshCacheExecute,
 						MSSQLRefreshCacheBind);
 	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	func.SetVolatile();
 	func.SetFallible();
-	loader.RegisterFunction(func);
+	mssql::RegisterDocumentedFunction(loader, {func},
+									  {{"context"},
+									   "Reloads the whole metadata cache -- schemas, tables, columns -- of an attached "
+									   "SQL Server database from the server, now.",
+									   {"mssql_refresh_cache('db')"},
+									   {"catalog"}});
 
-	// mssql_invalidate_cache(catalog [, schema [, table]]) -> BOOLEAN
-	ScalarFunctionSet invalidate("mssql_invalidate_cache");
+	// mssql_invalidate_cache(context [, schema [, table]]) -> BOOLEAN
+	vector<ScalarFunction> invalidate;
 	for (auto &arg_types :
 		 {vector<LogicalType>{LogicalType::VARCHAR}, vector<LogicalType>{LogicalType::VARCHAR, LogicalType::VARCHAR},
 		  vector<LogicalType>{LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}}) {
@@ -193,9 +199,15 @@ void RegisterMSSQLRefreshCacheFunction(ExtensionLoader &loader) {
 		overload.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 		overload.SetVolatile();
 		overload.SetFallible();
-		invalidate.AddFunction(overload);
+		invalidate.push_back(overload);
 	}
-	loader.RegisterFunction(invalidate);
+	mssql::RegisterDocumentedFunction(
+		loader, std::move(invalidate),
+		{{"context", "schema", "table"},
+		 "Marks cached metadata of an attached SQL Server database as stale -- the whole catalog, one schema, or one "
+		 "table -- so it is reloaded from the server on next use; everything else keeps its cache.",
+		 {"mssql_invalidate_cache('db', 'dbo', 'orders')"},
+		 {"catalog"}});
 }
 
 }  // namespace duckdb

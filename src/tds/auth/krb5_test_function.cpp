@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "tds/auth/krb5_test_function.hpp"
+#include "mssql_function_docs.hpp"
 #include "tds/auth/auth_strategy_factory.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -244,21 +245,32 @@ void RegisterKrb5TestFunction(ExtensionLoader &loader) {
 	ScalarFunction func1("mssql_kerberos_auth_test", {LogicalType::VARCHAR}, LogicalType::VARCHAR, Krb5TestHost);
 	func1.SetVolatile();
 	func1.SetFallible();
-	loader.RegisterFunction(func1);
 
 	// mssql_kerberos_auth_test(host, port)
 	ScalarFunction func2("mssql_kerberos_auth_test", {LogicalType::VARCHAR, LogicalType::INTEGER}, LogicalType::VARCHAR,
 						 Krb5TestHostPort);
 	func2.SetVolatile();
 	func2.SetFallible();
-	loader.RegisterFunction(func2);
+	RegisterDocumentedFunction(
+		loader, {func1, func2},
+		{{"host", "port"},
+		 "Builds the Kerberos (GSSAPI) token for the SQL Server at host and port (default 1433) without connecting "
+		 "to it, and returns the principal, SPN and token size, or the GSSAPI error.",
+		 {"mssql_kerberos_auth_test('sql.example.com', 1433)"},
+		 {"authentication"}});
 
 	// mssql_kerberos_auth_test_secret(secret_name)
 	ScalarFunction func3("mssql_kerberos_auth_test_secret", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
 						 Krb5TestSecret);
 	func3.SetVolatile();
 	func3.SetFallible();
-	loader.RegisterFunction(func3);
+	RegisterDocumentedFunction(
+		loader, {func3},
+		{{"secret"},
+		 "mssql_kerberos_auth_test driven by the named MSSQL secret: host, port and the Kerberos options (krb5.conf, "
+		 "keytab, credential cache, realm, SPN override) are read from it, as ATTACH would read them.",
+		 {"mssql_kerberos_auth_test_secret('my_mssql_secret')"},
+		 {"authentication"}});
 }
 
 }  // namespace krb5

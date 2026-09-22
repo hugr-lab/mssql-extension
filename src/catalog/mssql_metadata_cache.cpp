@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <thread>
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "query/mssql_sql_params.hpp"
 
@@ -857,6 +858,12 @@ void MSSQLMetadataCache::LoadAllTableMetadataForSchema(tds::TdsConnection &conne
 
 void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, idx_t &schema_count, idx_t &table_count,
 												idx_t &column_count) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	LoadAllSchemasMetadataLocked(connection, schema_count, table_count, column_count);
+}
+
+void MSSQLMetadataCache::LoadAllSchemasMetadataLocked(tds::TdsConnection &connection, idx_t &schema_count,
+													  idx_t &table_count, idx_t &column_count) {
 	schema_count = 0;
 	table_count = 0;
 	column_count = 0;
@@ -877,8 +884,6 @@ void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, 
 			sql += " AND " + like_clause;
 		}
 	}
-
-	std::lock_guard<std::mutex> lock(mutex_);
 
 	// Nothing is written into schemas_ until the query has RETURNED. Issue #317:
 	// this used to clear each schema's table map from inside the row callback and
@@ -1068,7 +1073,11 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	// of the session; the whole-catalog one left it NOT_LOADED, so the first
 	// catalog access after the preload ran EnsureSchemasLoaded, which clears
 	// schemas_, and loaded the whole catalog a second time.
-	EnsureSchemasLoaded(connection);
+	//
+	// ONE lock across the list and the load (review of #377): released in
+	// between, an invalidation could clear the list the load then relies on.
+	std::lock_guard<std::mutex> lock(mutex_);
+	EnsureSchemasLoadedLocked(connection);
 
 	// With no schema named, ONE query covers the catalog (spec 071 W2).
 	//
@@ -1080,21 +1089,41 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	// which was also the reason mssql_preload_catalog() was O(schemas x objects)
 	// and could not rescue issue #86 however often it was recommended.
 	if (schema_name.empty()) {
-		LoadAllSchemasMetadata(connection, schema_count, table_count, column_count);
+		LoadAllSchemasMetadataLocked(connection, schema_count, table_count, column_count);
 		return;
 	}
 
-	std::lock_guard<std::mutex> lock(mutex_);
-
-	// One schema. Not in the list means not in the database or hidden by
-	// schema_filter: nothing to load, and no phantom entry for it.
+	// One schema: the exact name, else the ONE schema whose name matches it
+	// ignoring case. Before #376 the name went to the server as @s, which under
+	// the usual case-insensitive collation found `dbo` for 'DBO' (review of
+	// #377). Several matches -- names that differ only in case, under a
+	// case-sensitive collation -- need the exact name. A schema that is not in
+	// the list is absent from the database or hidden by schema_filter; it is
+	// refused by name rather than reported as an empty schema, and gets no
+	// phantom entry.
 	auto schema_it = schemas_.find(schema_name);
-	if (schema_it == schemas_.end() || (filter_ && !filter_->MatchesSchema(schema_name))) {
-		CACHE_DEBUG(1, "BulkLoadAll: schema '%s' is not in the catalog -- nothing loaded", schema_name.c_str());
-		return;
+	if (schema_it == schemas_.end()) {
+		idx_t matches = 0;
+		for (auto it = schemas_.begin(); it != schemas_.end(); ++it) {
+			if (StringUtil::CIEquals(it->first, schema_name)) {
+				schema_it = it;
+				matches++;
+			}
+		}
+		if (matches > 1) {
+			throw InvalidInputException(
+				"mssql_preload_catalog: schema name '%s' matches %llu schemas that differ only "
+				"in case; give the exact name",
+				schema_name, (unsigned long long)matches);
+		}
+	}
+	if (schema_it == schemas_.end() || (filter_ && !filter_->MatchesSchema(schema_it->first))) {
+		throw InvalidInputException(
+			"mssql_preload_catalog: schema '%s' does not exist in this catalog, or schema_filter hides it",
+			schema_name);
 	}
 	auto &schema = schema_it->second;
-	const string &target_schema = schema_name;
+	const string &target_schema = schema_it->first;
 
 	// Build per-schema query
 	string sql = BULK_METADATA_SCHEMA_SQL_TEMPLATE;
@@ -1494,7 +1523,10 @@ void MSSQLMetadataCache::EnsureSchemasLoaded(tds::TdsConnection &connection) {
 	// next to everything around it (a catalog lookup already did a settings
 	// read and a pool interaction to get here).
 	std::lock_guard<std::mutex> lock(mutex_);
+	EnsureSchemasLoadedLocked(connection);
+}
 
+void MSSQLMetadataCache::EnsureSchemasLoadedLocked(tds::TdsConnection &connection) {
 	if (schemas_load_state_ == CacheLoadState::LOADED && !IsTTLExpired(schemas_last_refresh_, ttl_seconds_)) {
 		CACHE_DEBUG(2, "EnsureSchemasLoaded — already loaded (%zu schemas)", schemas_.size());
 		return;

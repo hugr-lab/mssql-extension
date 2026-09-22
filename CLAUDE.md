@@ -67,7 +67,7 @@ make clean              # Remove build artifacts
 
 # Test
 make test               # Unit tests (no SQL Server required)
-make docker-up          # Start SQL Server container
+make docker-up          # Start SQL Server container (no .env needed; `cp .env.example .env` to override port/password)
 make integration-test   # Integration tests (requires SQL Server)
 make test-all           # All tests
 make test-debug         # Tests with debug build
@@ -228,7 +228,7 @@ duckdb --unsigned -c "INSTALL mssql FROM local_build_debug; LOAD mssql;"
 | `azure_tenant_id` (or `azure_tenant`) | VARCHAR | Tenant to acquire the Azure AD token against, overriding the tenant carried by the `azure_secret`. Registered as an MSSQL-secret parameter since spec 032 and **read by nothing** until 2026-08-14 (PR #264 review): with no override, `credential_chain` + `interactive` falls back to `AZURE_DEFAULT_TENANT` = `common` inside `azure_device_code.cpp`, so every interactive ATTACH in a single-tenant org authenticated against `/common/` with no way to say otherwise. `TENANT_ID` on the *azure* secret is not the way to do this — duckdb-azure rejects it on `provider='credential_chain'`. The value is part of the `TokenCache` key, so two tenants do not share a token. |
 | `Application Name` / `ApplicationName` / `App Name` / `application_name` | VARCHAR | LOGIN7 `program_name` propagated to SQL Server (visible via `APP_NAME()` / `sys.dm_exec_sessions.program_name`). URI form uses spaceless `applicationname` query parameter; secret form uses `application_name` (canonical) or `applicationname`. Empty falls back to `"DuckDB MSSQL Extension"`; values longer than 128 chars are clamped client-side. Closes [issue #82](https://github.com/hugr-lab/mssql-extension/issues/82) (spec 047 FR-014). |
 
-Available in: ATTACH options, ADO.NET connection strings (`SchemaFilter`/`TableFilter`), URI query parameters, and MSSQL secrets. ATTACH options override secret/connection string values.
+Available in: ATTACH options, ADO.NET connection strings (`SchemaFilter`/`TableFilter`), URI query parameters, and MSSQL secrets. ATTACH options override secret/connection string values. A boolean ATTACH option (`lazy_validation`, `catalog`, `order_pushdown`) also takes a string — `'true'`/`'false'`, `'yes'`/`'no'`, `'1'`/`'0'`, DuckDB's own boolean cast — because DuckLake's `METADATA_PARAMETERS` is a `MAP(VARCHAR, VARCHAR)` and can send nothing else (issue #325).
 
 ## Extension Functions
 
@@ -247,6 +247,8 @@ Available in: ATTACH options, ADO.NET connection strings (`SchemaFilter`/`TableF
 | `mssql_kerberos_auth_test_secret(secret_name)` | Scalar | Same but reads keytab / SPN-override / etc. from an MSSQL secret |
 | `mssql_winsspi_auth_test(host [, port])` | Scalar | Windows SSPI peer of `mssql_kerberos_auth_test` (spec 042 Phase 4); returns OK + SPN / UPN / token size, or verbatim SSPI error |
 | `mssql_winsspi_auth_test_spn(spn)` | Scalar | Same but takes an explicit SPN (overrides default `MSSQLSvc/<host>:<port>` derivation) |
+
+Every scalar and table function is registered through `mssql::RegisterDocumentedFunction` (`src/mssql_function_docs.cpp`, issue #371), which gives it the description, examples and category `duckdb_functions()` reports, and names the scalar parameters in the signature. Those names are **API**: the binder matches named arguments against them (`mssql_exec(context := 'db', sql := '...')`), so renaming one breaks callers. `test/sql/mssql_function_docs.test` fails a function registered without documentation. A table function's positional parameters stay `col0`, `col1`, … in `duckdb_functions()`: DuckDB names them by position whatever the registration says.
 
 ## Active Technologies
 - C++17 (DuckDB extension standard) + DuckDB (main branch), OpenSSL (vcpkg), Winsock2 (Windows system library) (019-fix-winsock-init)
