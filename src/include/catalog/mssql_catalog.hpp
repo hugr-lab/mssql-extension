@@ -1,5 +1,7 @@
 #pragma once
 
+#include <set>
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -119,6 +121,29 @@ public:
 	//! MSSQLTransactionMetadata::MarkChangedLocally for the current transaction;
 	//! a no-op in autocommit.
 	void NoteTransactionChangeLocally(ClientContext &context);
+
+	//! Issue #383: after a transaction has ended, load what it touched into the
+	//! shared cache, on a pool connection -- so it is committed state, taken
+	//! after the transaction rather than during it. Up to
+	//! WARM_TABLES_PER_SCHEMA tables of a schema one by one, more as the
+	//! schema's preload (one round trip). Opportunistic and silent: never on a
+	//! pool of one connection (nothing to share it with, and it would hold the
+	//! only connection), never waiting for one, and a failure leaves the names
+	//! invalidated as they already are. No ClientContext: runs after ROLLBACK
+	//! too, where there may be none.
+	static constexpr idx_t WARM_TABLES_PER_SCHEMA = 8;
+	void WarmSharedCache(const std::set<std::pair<string, string>> &tables) noexcept;
+
+	//! Issue #324: whether Initialize opens mssql_min_connections up front
+	//! (concurrently, Prewarm). Off under lazy_validation, which promises not
+	//! to touch the server at ATTACH.
+	void SetPrewarmOnInitialize(bool prewarm) {
+		prewarm_on_initialize_ = prewarm;
+	}
+	//! Issue #324: the `preload` ATTACH option -- mssql_preload_catalog(name)
+	//! run by the ATTACH itself, where DuckLake's METADATA_PARAMETERS can reach
+	//! it and a function call cannot. Throws on failure: it was asked for.
+	void PreloadAtAttach();
 
 	//! The pool's connection limit, fixed at ATTACH.
 	idx_t GetConnectionLimit() const;
@@ -413,8 +438,9 @@ private:
 	tds::PoolConfiguration pool_config_;			   // Pool config (spec 047)
 	std::vector<uint8_t> fedauth_token_utf16le_;	   // FEDAUTH token (spec 047)
 	AccessMode access_mode_;						   // READ_ONLY enforced
-	bool catalog_enabled_;							   // Catalog integration enabled
-	MSSQLCatalogFilter catalog_filter_;				   // Regex visibility filter
+	bool prewarm_on_initialize_ = false;
+	bool catalog_enabled_;				 // Catalog integration enabled
+	MSSQLCatalogFilter catalog_filter_;	 // Regex visibility filter
 	// Connection pool (per-catalog, spec 047). shared_ptr, but the catalog holds
 	// the ONLY strong reference — teardown stays deterministic at ~MSSQLCatalog.
 	// Result streams hold weak_ptr handles (issue #178 review); a transient

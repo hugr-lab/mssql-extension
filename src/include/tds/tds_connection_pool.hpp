@@ -111,6 +111,16 @@ public:
 	// Release a connection back to the pool
 	void Release(std::shared_ptr<TdsConnection> conn);
 
+	//! Issue #324: open connections up front until the pool holds `target` of
+	//! them (capped at the limit), their logins run CONCURRENTLY -- one thread
+	//! per connection -- and land idle. A TDS login is several round trips
+	//! (~175 ms on loopback), so N of them cost about one instead of N.
+	//! Blocks until every login has finished. Returns how many were opened;
+	//! a failure does not throw -- the pool opens the rest on demand as before
+	//! -- and its reason is recorded like any creation failure and, if
+	//! `failure` is given, handed back.
+	size_t Prewarm(size_t target, std::string *failure = nullptr);
+
 	// Get current pool statistics
 	PoolStatistics GetStats() const;
 

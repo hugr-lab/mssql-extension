@@ -1751,6 +1751,30 @@ CacheLoadState MSSQLMetadataCache::GetTablesState(const string &schema_name) con
 	return it->second.tables_load_state;
 }
 
+MSSQLMetadataCache::CachedTableState MSSQLMetadataCache::TryGetLoadedTableMetadata(const string &schema_name,
+																				   const string &table_name,
+																				   MSSQLTableMetadata &out_meta) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	auto schema_it = schemas_.find(schema_name);
+	if (schema_it == schemas_.end()) {
+		return CachedTableState::Unknown;
+	}
+	auto &schema = schema_it->second;
+	auto table_it = schema.tables.find(table_name);
+	if (table_it != schema.tables.end()) {
+		if (table_it->second.columns_load_state == CacheLoadState::LOADED &&
+			!IsTTLExpired(table_it->second.columns_last_refresh, ttl_seconds_)) {
+			out_meta = table_it->second;
+			return CachedTableState::Loaded;
+		}
+		return CachedTableState::Unknown;
+	}
+	if (schema.tables_load_state == CacheLoadState::LOADED && !IsTTLExpired(schema.tables_last_refresh, ttl_seconds_)) {
+		return CachedTableState::Absent;
+	}
+	return CachedTableState::Unknown;
+}
+
 CacheLoadState MSSQLMetadataCache::GetColumnsState(const string &schema_name, const string &table_name) const {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto schema_it = schemas_.find(schema_name);

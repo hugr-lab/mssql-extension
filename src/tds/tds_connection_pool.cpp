@@ -1,5 +1,8 @@
 #include "tds/tds_connection_pool.hpp"
+
 #include <algorithm>
+#include <thread>
+#include <vector>
 #include "duckdb/common/error_data.hpp"
 
 #include "duckdb/common/assert.hpp"
@@ -396,6 +399,91 @@ void ConnectionPool::Release(std::shared_ptr<TdsConnection> conn) {
 	stats_.idle_connections++;
 
 	available_cv_.notify_one();
+}
+
+size_t ConnectionPool::Prewarm(size_t target, std::string *failure) {
+	if (shutdown_flag_.load()) {
+		return 0;
+	}
+	size_t to_create = 0;
+	{
+		std::lock_guard<std::mutex> lock(pool_mutex_);
+		const size_t cap = target < config_.connection_limit ? target : config_.connection_limit;
+		to_create = cap > stats_.total_connections ? cap - stats_.total_connections : 0;
+		// Reserve the slots before dialling, so a concurrent Acquire cannot take
+		// the pool past its limit while these logins are in flight.
+		stats_.total_connections += to_create;
+	}
+	if (to_create == 0) {
+		return 0;
+	}
+
+	std::vector<std::shared_ptr<TdsConnection>> created(to_create);
+	std::vector<std::string> errors(to_create);
+	std::vector<std::thread> threads;
+	threads.reserve(to_create);
+	for (size_t i = 1; i < to_create; i++) {
+		try {
+			threads.emplace_back([this, &created, &errors, i]() { created[i] = CreateNewConnection(errors[i]); });
+		} catch (...) {
+			// No thread to be had: this one dials it after its own.
+			threads.emplace_back();
+		}
+	}
+	created[0] = CreateNewConnection(errors[0]);
+	for (size_t i = 1; i < to_create; i++) {
+		auto &thread = threads[i - 1];
+		if (thread.joinable()) {
+			thread.join();
+		} else {
+			created[i] = CreateNewConnection(errors[i]);
+		}
+	}
+
+	size_t opened = 0;
+	std::string first_error;
+	{
+		std::lock_guard<std::mutex> lock(pool_mutex_);
+		for (size_t i = 0; i < to_create; i++) {
+			if (!created[i] || shutdown_flag_.load()) {
+				stats_.total_connections--;
+				if (!created[i]) {
+					stats_.creation_failures++;
+					if (first_error.empty()) {
+						first_error = errors[i];
+					}
+				} else {
+					created[i]->Close();
+				}
+				continue;
+			}
+			ConnectionMetadata meta;
+			meta.connection = std::move(created[i]);
+			meta.connection_id = next_connection_id_++;
+			meta.last_released = std::chrono::steady_clock::now();
+			idle_connections_.push(std::move(meta));
+			stats_.idle_connections++;
+			stats_.connections_created++;
+			opened++;
+		}
+		if (opened > 0) {
+			// The same bookkeeping a successful Acquire creation does.
+			create_backoff_ms_ = CREATE_BACKOFF_INITIAL_MS;
+			next_create_allowed_ = std::chrono::steady_clock::time_point{};
+			last_create_error_.clear();
+			last_create_error_at_ = std::chrono::steady_clock::time_point{};
+		} else if (!first_error.empty()) {
+			last_create_error_ = first_error;
+			last_create_error_at_ = std::chrono::steady_clock::now();
+		}
+	}
+	available_cv_.notify_all();
+	if (failure && !first_error.empty()) {
+		*failure = "pool '" + context_name_ + "' could not create a connection: " + first_error;
+	}
+	MSSQL_POOL_DEBUG_LOG(1, "Prewarm: opened %zu of %zu connection(s) concurrently (pool '%s')", opened, to_create,
+						 context_name_.c_str());
+	return opened;
 }
 
 PoolStatistics ConnectionPool::GetStats() const {

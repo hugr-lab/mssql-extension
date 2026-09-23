@@ -1,5 +1,7 @@
 #include "catalog/mssql_transaction.hpp"
+
 #include <cstring>
+#include <set>
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -104,6 +106,20 @@ void ForgetTransactionMetadata(duckdb::MSSQLCatalog &catalog, duckdb::MSSQLTrans
 	if (metadata) {
 		catalog.ForgetTransactionChanges(*metadata);
 	}
+}
+
+// Issue #383: the names the shared cache is warmed with after the transaction
+// -- the tables it loaded itself and the tables it changed. Read before the
+// transaction (and its metadata) is erased.
+std::set<std::pair<std::string, std::string>> TouchedTables(duckdb::MSSQLTransaction &txn) {
+	std::set<std::pair<std::string, std::string>> touched;
+	auto *metadata = txn.TryMetadata();
+	if (metadata) {
+		touched = metadata->GetLoadedTables();
+		auto changes = metadata->GetChanges();
+		touched.insert(changes.tables.begin(), changes.tables.end());
+	}
+	return touched;
 }
 
 }  // anonymous namespace
@@ -270,7 +286,7 @@ Transaction &MSSQLTransactionManager::StartTransaction(ClientContext &context) {
 }
 
 ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
-	lock_guard<mutex> lock(transaction_lock_);
+	unique_lock<mutex> lock(transaction_lock_);
 
 	auto &mssql_txn = transaction.Cast<MSSQLTransaction>();
 
@@ -330,13 +346,18 @@ ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Tra
 		MSSQL_TXN_LOG("CommitTransaction: No active SQL Server transaction (no-op)");
 	}
 
+	const auto touched = TouchedTables(mssql_txn);
 	ForgetTransactionMetadata(catalog_, mssql_txn);
 	transactions_.erase(context);
+	// Outside the manager's lock: it is a round trip, and other transactions of
+	// this catalog must not wait on it to start or end.
+	lock.unlock();
+	catalog_.WarmSharedCache(touched);
 	return ErrorData();
 }
 
 void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
-	lock_guard<mutex> lock(transaction_lock_);
+	unique_lock<mutex> lock(transaction_lock_);
 
 	auto &mssql_txn = transaction.Cast<MSSQLTransaction>();
 
@@ -393,6 +414,7 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 		MSSQL_TXN_LOG("RollbackTransaction: No active SQL Server transaction (no-op)");
 	}
 
+	const auto touched = TouchedTables(mssql_txn);
 	ForgetTransactionMetadata(catalog_, mssql_txn);
 
 	// Try to get the context to remove from our transaction map
@@ -404,6 +426,9 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 	}
 	// If context is gone, the transaction map entry will be cleaned up when
 	// the TransactionManager is destroyed
+
+	lock.unlock();
+	catalog_.WarmSharedCache(touched);
 }
 
 void MSSQLTransactionManager::Checkpoint(ClientContext &context, bool force) {

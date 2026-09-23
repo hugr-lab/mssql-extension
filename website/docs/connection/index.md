@@ -327,6 +327,8 @@ In addition to options propagated from the secret / connection string, the follo
 | `table_filter`      | VARCHAR | Override secret table_filter for this ATTACH                                 |
 | `order_pushdown`    | BOOLEAN | Per-ATTACH ORDER BY pushdown override (overrides `mssql_order_pushdown` setting) |
 | `lazy_validation`   | BOOLEAN | Skip the eager ATTACH-time credential check (default `false`)                |
+| `min_connections`   | BIGINT  | Connections to open at ATTACH, their logins in parallel (overrides `mssql_min_connections`; not under `lazy_validation`) |
+| `preload`           | BOOLEAN | Load the whole catalog's metadata at ATTACH, as `mssql_preload_catalog()` would (default `false`) |
 | `application_name`  | VARCHAR | Override LOGIN7 `program_name` for this ATTACH (also accepts `applicationname`) |
 
 ### Named Instances

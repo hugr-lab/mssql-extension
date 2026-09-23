@@ -340,6 +340,12 @@ ROLLBACK must not leave one behind. The shared cache is still read for names
 the transaction did not change, and at COMMIT or ROLLBACK it forgets the names
 the transaction changed. See `DATAMODEL.md`, "Inside an explicit transaction".
 
+Once the transaction has ended, what it loaded or changed is loaded into the
+shared cache on a pool connection (issue #383) — one table at a time, or the
+whole schema's preload when more than 8 of its tables were touched — so the next
+transaction finds it there instead of loading it again. Skipped on a pool of one
+connection, and never waits for one.
+
 Inside a transaction:
 
 | Call | |

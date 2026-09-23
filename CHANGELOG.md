@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The pool opens its connections at ATTACH, in parallel; `preload` loads the
+  catalog at ATTACH** ([#324](https://github.com/hugr-lab/mssql-extension/issues/324)).
+  - **`mssql_min_connections` did not open anything.** It only kept idle
+    connections from being closed. The pool now opens that many connections
+    at ATTACH, with their logins running concurrently.
+  - **Measured on a local server:** a plain ATTACH takes 0.40 s for one
+    connection (validation plus pool); `min_connections 4` takes 0.54 s for
+    four and `min_connections 8` takes 0.63 s for eight. One after another,
+    four would cost about a second.
+  - **Nothing opened under `lazy_validation`.**
+  - **New ATTACH options:**
+    - `min_connections` is the ATTACH form of the setting.
+    - `preload true` runs `mssql_preload_catalog()` as part of the ATTACH.
+
+    Both exist because DuckLake's `METADATA_PARAMETERS` can forward ATTACH
+    options but neither a setting nor a function call. Both accept the string
+    form it sends. `preload` is refused next to `lazy_validation true` or
+    `catalog false`.
+
 - **`transaction_isolation`: the isolation level of explicit transactions**
   ([#331](https://github.com/hugr-lab/mssql-extension/issues/331)). The
   scans of one DuckDB transaction are separate statements on its pinned
@@ -53,6 +72,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Transactions fill the shared metadata cache again**
+  ([#383](https://github.com/hugr-lab/mssql-extension/issues/383)). Since #380
+  a transaction loads a missing table's metadata into a cache of its own, so a
+  workload that runs everything in transactions (DuckLake) loaded every table
+  once per transaction. After COMMIT or ROLLBACK the tables it loaded or
+  changed are now loaded into the shared cache on a pool connection: one by
+  one, or the schema's preload when more than 8 tables of a schema were
+  touched. 50 transactions reading two tables: 0.215 s → 0.100 s on a local
+  server, against 0.087 s with the cache already warm; against a remote
+  server the difference is one round trip per table per transaction. Not on a
+  pool of one connection.
 - **A table created inside a transaction can be read in it; a pool of one
   connection works in a transaction**
   ([#380](https://github.com/hugr-lab/mssql-extension/issues/380)).

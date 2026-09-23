@@ -165,6 +165,13 @@ public:
 	bool GetTableMetadata(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
 						  MSSQLTableMetadata &out_meta);
 
+	//! What the cache already knows about one table, without a round trip
+	//! (issue #383): its metadata (columns loaded, not expired), that it does
+	//! not exist (the schema's table list is loaded and lacks it), or nothing.
+	enum class CachedTableState { Loaded, Absent, Unknown };
+	CachedTableState TryGetLoadedTableMetadata(const string &schema_name, const string &table_name,
+											   MSSQLTableMetadata &out_meta);
+
 	// Load all table metadata for a schema in one bulk query.
 	// If all tables already have columns loaded (e.g. from preload), returns from cache.
 	// Otherwise loads everything with BULK_METADATA_SCHEMA_SQL_TEMPLATE (one round trip).

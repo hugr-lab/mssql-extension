@@ -1,6 +1,9 @@
 #include "catalog/mssql_catalog.hpp"
 #include <openssl/crypto.h>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
 #include "catalog/mssql_transaction.hpp"
 #include "codec/target_string_type.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
@@ -355,6 +358,16 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 	}
 
 	connection_pool_ = make_shared_ptr<tds::ConnectionPool>(context_name_, pool_config_, std::move(factory));
+
+	// Issue #324: mssql_min_connections is opened here, the logins in parallel,
+	// before anything below takes a connection -- so the collation query runs
+	// on a warm one and a default ATTACH pays about one login's time for N.
+	// Until then the setting only kept connections from being closed as idle;
+	// it never opened one. A failure is not the ATTACH's: the eager validation
+	// has already proved the login, and the pool opens the rest on demand.
+	if (prewarm_on_initialize_ && pool_config_.min_connections > 0) {
+		connection_pool_->Prewarm(pool_config_.min_connections);
+	}
 
 	// Skip metadata initialization when catalog integration is disabled
 	// (mssql_scan/mssql_exec will still work via raw queries)
@@ -1527,6 +1540,95 @@ void MSSQLCatalog::ForgetTransactionChanges(MSSQLTransactionMetadata &metadata) 
 	for (const auto &table : changes.tables) {
 		InvalidateTableEntry(table.first, table.second);
 	}
+}
+
+// House debug pattern: a static level read from MSSQL_DEBUG.
+static int GetCatalogWarmDebugLevel() {
+	static const int level = []() {
+		const char *env = std::getenv("MSSQL_DEBUG");
+		return env ? std::atoi(env) : 0;
+	}();
+	return level;
+}
+
+#define MSSQL_CATALOG_DEBUG_LOG(lvl, fmt, ...)                           \
+	do {                                                                 \
+		if (GetCatalogWarmDebugLevel() >= (lvl)) {                       \
+			fprintf(stderr, "[MSSQL CATALOG] " fmt "\n", ##__VA_ARGS__); \
+		}                                                                \
+	} while (0)
+
+void MSSQLCatalog::WarmSharedCache(const std::set<std::pair<string, string>> &tables) noexcept {
+	if (tables.empty() || !metadata_cache_ || !connection_pool_ || GetConnectionLimit() <= 1) {
+		return;
+	}
+	std::map<string, vector<string>> by_schema;
+	for (const auto &key : tables) {
+		by_schema[key.first].push_back(key.second);
+	}
+	std::shared_ptr<tds::TdsConnection> connection;
+	try {
+		// Never wait: an idle connection, or a new one while the pool is below
+		// its limit, or no warm-up at all. This runs on COMMIT's path.
+		connection = connection_pool_->Acquire(0);
+		if (!connection) {
+			MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: no idle connection, skipped");
+			return;
+		}
+		for (const auto &schema : by_schema) {
+			if (schema.second.size() > WARM_TABLES_PER_SCHEMA) {
+				idx_t schema_count = 0, table_count = 0, column_count = 0;
+				metadata_cache_->BulkLoadAll(*connection, schema.first, schema_count, table_count, column_count);
+				metadata_cache_->ForEachTableInSchema(
+					schema.first, [&](const string &table, const MSSQLTableMetadata &meta) {
+						statistics_provider_->PreloadRowCount(schema.first, table, meta.approx_row_count);
+					});
+				MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: preloaded schema '%s' (%llu tables)", schema.first.c_str(),
+										(unsigned long long)table_count);
+				continue;
+			}
+			for (const auto &table : schema.second) {
+				MSSQLTableMetadata meta;
+				if (metadata_cache_->GetTableMetadata(*connection, schema.first, table, meta)) {
+					statistics_provider_->PreloadRowCount(schema.first, table, meta.approx_row_count);
+				}
+			}
+			MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: loaded %llu table(s) of schema '%s'",
+									(unsigned long long)schema.second.size(), schema.first.c_str());
+		}
+	} catch (std::exception &e) {
+		MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: failed, names stay invalidated: %s", e.what());
+	} catch (...) {
+		MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: failed, names stay invalidated");
+	}
+	if (connection) {
+		try {
+			connection_pool_->Release(connection);
+		} catch (...) {
+		}
+	}
+}
+
+void MSSQLCatalog::PreloadAtAttach() {
+	std::string why;
+	auto connection = connection_pool_ ? connection_pool_->Acquire(-1, &why) : nullptr;
+	if (!connection) {
+		throw IOException("MSSQL ATTACH error: preload could not get a connection: %s", why);
+	}
+	idx_t schema_count = 0, table_count = 0, column_count = 0;
+	try {
+		metadata_cache_->BulkLoadAll(*connection, string(), schema_count, table_count, column_count);
+	} catch (...) {
+		connection_pool_->Release(connection);
+		throw;
+	}
+	connection_pool_->Release(connection);
+	metadata_cache_->ForEachTable([&](const string &schema, const string &table, idx_t row_count) {
+		statistics_provider_->PreloadRowCount(schema, table, row_count);
+	});
+	MSSQL_CATALOG_DEBUG_LOG(1, "PreloadAtAttach: %llu schemas, %llu tables, %llu columns",
+							(unsigned long long)schema_count, (unsigned long long)table_count,
+							(unsigned long long)column_count);
 }
 
 idx_t MSSQLCatalog::GetConnectionLimit() const {

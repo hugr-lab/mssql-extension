@@ -82,6 +82,10 @@ public:
 	//! MarkChanged with an empty schema was called: even the schema list may differ.
 	bool IsAllChanged();
 
+	//! The tables this transaction loaded itself: what the shared cache is
+	//! warmed with once the transaction has ended (issue #383).
+	std::set<std::pair<string, string>> GetLoadedTables();
+
 	//! What the shared cache must forget when the transaction ends.
 	struct Changes {
 		bool all = false;

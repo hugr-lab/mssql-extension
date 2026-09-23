@@ -167,6 +167,7 @@ classDiagram
     class ConnectionPool {
         +Acquire(timeout) shared_ptr~TdsConnection~
         +Release(handle)
+        +Prewarm(target) count
         +Shutdown() noexcept
         -factory : function~TdsConnection()~
         -idle_connections_ : queue
@@ -188,6 +189,7 @@ classDiagram
 
 - **A failed creation is not a full pool (issue #302, spec 073).** The factory THROWS with the reason (the server's login error, a refused dial, an expired token — `ConnectionException`); `CreateNewConnection` catches, records `last_create_error_` with the time it was recorded (`mssql_pool_stats.last_create_error_age_ms`), returns nullptr. A creation success clears it; a reuse clears neither it nor the backoff, because a warm connection says nothing about whether login works — the age is how a reader tells a live failure from an outlived one. `Acquire` then: nothing active → return at once (a `Release` cannot come); others active → keep waiting for the caller's budget but retry creation on a backoff (250 ms → 4 s), never on every wakeup. `ConnectionProvider` renders `GetLastCreateError()` into the exception. Before this, a factory failure fell through to the exhausted-pool wait and reported "(timeout)" after `acquire_timeout`.
 - **The Azure AD factory holds a secret NAME and the `DatabaseInstance`, never a token.** A token lives 60 minutes; the factory captured the ATTACH-time bytes and presented them for every refill, and Azure SQL drops such a connection without an error token. Refresh goes through `AcquireToken(DatabaseInstance &, …, allow_interactive=false)` — a `ClientContext` cannot be captured (the ATTACH context is gone; issue #178's constraint) and `SecretManager` / the system transaction have `DatabaseInstance` forms. Fixed tokens and interactive chains fail by name from the token's own `exp`, before dialing.
+- **`min_connections` are opened at ATTACH, concurrently (issue #324).** `Prewarm(target)` reserves the missing slots in `total_connections` under the lock so a concurrent `Acquire` cannot overshoot the limit, then runs one login per thread outside it, and parks what succeeded as idle. The bookkeeping matches an `Acquire` creation: a success clears the backoff and the recorded error, a failure is recorded like any other. `MSSQLCatalog::Initialize` calls it right after building the pool, before the collation query, so that query runs on a warm connection. It is skipped under `lazy_validation`, and its failures never fail the ATTACH. Before #324, `min_connections` only kept idle connections from being reaped.
 - One pool **per `MSSQLCatalog`** (no process-wide singleton — that was spec 047's headline fix). Lifetime is bounded by catalog lifetime.
 - Background `cleanup_thread_` reaps idle connections past `idle_timeout`. It parks on its **own** `cleanup_cv_` (notified only by `Shutdown()`, so DETACH doesn't wait out a blind 1-second sleep); `available_cv_` is reserved for `Acquire()` waiters — the invariant is that `Release()`'s `notify_one` always reaches a thread blocked on pool exhaustion, never the cleanup thread (spec 054 review).
 - DuckDB's quiescence contract requires every connection be released before `~MSSQLCatalog` runs; the pool's `Shutdown()` emits a warning + assertion if `active_connections_` is non-empty at teardown.
@@ -517,6 +519,21 @@ uncommitted DDL through alias A would be invisible to a check on alias B, and a
 pool connection on B would then block on A's schema lock until
 `mssql_metadata_timeout` — the #380 hang itself.
 `mssql_invalidate_cache()` is allowed either way.
+
+**After the transaction, the shared layers are warmed** (issue #383,
+`MSSQLCatalog::WarmSharedCache`). On its own the rule above made a workload that
+runs everything in transactions (DuckLake) load each table's metadata once per
+transaction — the shared cache was never filled. Once COMMIT or ROLLBACK has
+returned the pinned connection, the tables the transaction loaded or changed are
+loaded into the shared metadata cache on a pool connection: committed state,
+taken after the transaction rather than during it, so a long transaction does not
+publish what it saw at its start. Up to `WARM_TABLES_PER_SCHEMA` (8) tables of a
+schema go one by one; more, and the schema is preloaded in one round trip. The
+warm-up never waits for a connection (`Acquire(0)`), runs outside the transaction
+manager's lock, swallows its failures (the names simply stay invalidated), and is
+skipped on a pool of one connection. A transaction's lookup reads the shared
+**metadata** cache too before going to the server — a table found there is
+committed state and its entry is published into the shared table set.
 
 ```mermaid
 flowchart TD

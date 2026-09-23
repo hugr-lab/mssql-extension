@@ -1521,6 +1521,20 @@ static string NormalizeTransactionIsolation(const string &raw) {
 // 'true', so a string goes through DuckDB's own string-to-boolean cast instead
 // -- the one `SET` uses: true/false, t/f, yes/no, y/n, 1/0, any case.
 // A NULL never gets here: DuckDB's binder refuses it for every ATTACH option.
+// The integer peer (issue #324): `min_connections 4` or, through DuckLake's
+// METADATA_PARAMETERS, `'4'`.
+static int64_t IntegerAttachOption(const string &name, const Value &value) {
+	if (value.type().id() != LogicalTypeId::VARCHAR) {
+		return value.GetValue<int64_t>();
+	}
+	const auto &text = StringValue::Get(value);
+	int64_t result = 0;
+	if (!TryCast::Operation(string_t(text), result, false)) {
+		throw InvalidInputException("MSSQL Error: ATTACH option '%s' expects an integer, got '%s'", name, text);
+	}
+	return result;
+}
+
 static bool BooleanAttachOption(const string &name, const Value &value) {
 	if (value.type().id() != LogicalTypeId::VARCHAR) {
 		return value.GetValue<bool>();
@@ -1552,9 +1566,11 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	string default_schema_option;  // Issue #322: ATTACH-level default schema
 	bool default_schema_specified = false;
 	bool table_filter_specified = false;
-	int8_t order_pushdown_option = -1;	// Spec 039: ORDER BY pushdown (-1=unset)
-	bool lazy_validation = false;		// Spec 047 (US2): opt out of eager creds check
-	string application_name_option;		// Spec 047 (US-AN): ATTACH-level program_name override
+	int8_t order_pushdown_option = -1;	  // Spec 039: ORDER BY pushdown (-1=unset)
+	bool lazy_validation = false;		  // Spec 047 (US2): opt out of eager creds check
+	bool preload_option = false;		  // Issue #324: preload the catalog at ATTACH
+	int64_t min_connections_option = -1;  // Issue #324: ATTACH-level mssql_min_connections (-1=unset)
+	string application_name_option;		  // Spec 047 (US-AN): ATTACH-level program_name override
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto lower_name = StringUtil::Lower(it->first);
 		if (lower_name == "secret") {
@@ -1601,6 +1617,16 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			// Match the ADO.NET-style alias `LazyValidation` (lowercase via
 			// StringUtil::Lower) alongside the canonical `lazy_validation`.
 			lazy_validation = BooleanAttachOption(it->first, it->second);
+			it = options.options.erase(it);
+		} else if (lower_name == "preload") {
+			preload_option = BooleanAttachOption(it->first, it->second);
+			it = options.options.erase(it);
+		} else if (lower_name == "min_connections" || lower_name == "minconnections") {
+			min_connections_option = IntegerAttachOption(it->first, it->second);
+			if (min_connections_option < 0) {
+				throw InvalidInputException("MSSQL ATTACH error: min_connections must be 0 or more, got %lld",
+											(long long)min_connections_option);
+			}
 			it = options.options.erase(it);
 		} else if (lower_name == "application_name" || lower_name == "applicationname" ||
 				   lower_name == "application name" || lower_name == "app name") {
@@ -1845,7 +1871,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	tds_pool_config.connection_cache = pool_config.connection_cache;
 	tds_pool_config.connection_timeout = pool_config.connection_timeout;
 	tds_pool_config.idle_timeout = pool_config.idle_timeout;
-	tds_pool_config.min_connections = pool_config.min_connections;
+	tds_pool_config.min_connections =
+		min_connections_option >= 0 ? static_cast<size_t>(min_connections_option) : pool_config.min_connections;
 	tds_pool_config.acquire_timeout = pool_config.acquire_timeout;
 
 	// Create MSSQLCatalog with connection info, pool config, FEDAUTH token,
@@ -1854,10 +1881,28 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// options.access_mode is set by DuckDB based on the READ_ONLY option in ATTACH.
 	// catalog_enabled flag determines whether schema discovery is available.
 	auto catalog_enabled = connection_info->catalog_enabled;
+	// Issue #324: `preload` asks the server for the whole catalog at ATTACH,
+	// which is exactly what the other two refuse -- say so rather than pick one.
+	if (preload_option && lazy_validation) {
+		throw InvalidInputException(
+			"MSSQL ATTACH error: preload and lazy_validation contradict each other -- "
+			"preload reads the whole catalog at ATTACH, lazy_validation defers every "
+			"connection to the first query. Drop one of them");
+	}
+	if (preload_option && !catalog_enabled) {
+		throw InvalidInputException(
+			"MSSQL ATTACH error: preload needs the catalog, and this ATTACH sets catalog false");
+	}
 	auto catalog = make_uniq<MSSQLCatalog>(db, name, std::move(connection_info), std::move(tds_pool_config),
 										   std::move(fedauth_token_utf16le), options.access_mode, catalog_enabled);
+	// Issue #324: open mssql_min_connections at ATTACH, concurrently -- unless
+	// the ATTACH asked not to touch the server yet.
+	catalog->SetPrewarmOnInitialize(!lazy_validation);
 	catalog->Initialize(false);
 	catalog->CheckTransactionIsolation();
+	if (preload_option) {
+		catalog->PreloadAtAttach();
+	}
 
 	return std::move(catalog);
 }

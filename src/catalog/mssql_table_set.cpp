@@ -487,6 +487,31 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntryInTransaction(ClientContext &c
 				return nullptr;
 			}
 		}
+		// The shared METADATA cache: committed state, filled by an autocommit
+		// load, a preload, or the warm-up after an earlier transaction (issue
+		// #383). The entry built from it is committed state too, so it is
+		// published into entries_ -- epoch-guarded like LoadSingleEntry, so an
+		// invalidation racing this does not resurrect what it cleared.
+		const uint64_t epoch_at_start = invalidation_epoch_.load();
+		MSSQLTableMetadata cached_meta;
+		const auto cached = catalog.GetMetadataCache().TryGetLoadedTableMetadata(schema_name, name, cached_meta);
+		if (cached == MSSQLMetadataCache::CachedTableState::Absent) {
+			return nullptr;
+		}
+		if (cached == MSSQLMetadataCache::CachedTableState::Loaded) {
+			auto entry = CreateTableEntry(cached_meta);
+			if (entry) {
+				std::lock_guard<std::mutex> lock(entry_mutex_);
+				if (invalidation_epoch_.load() == epoch_at_start) {
+					auto result = entries_.emplace(name, entry);
+					attempted_tables_.insert(name);
+					entry = result.first->second;
+				}
+			}
+			if (entry) {
+				return anchor(entry);
+			}
+		}
 	}
 
 	// 3. The table filter hides it.

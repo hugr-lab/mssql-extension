@@ -112,6 +112,15 @@ bool MSSQLTransactionMetadata::IsSchemaChanged(const string &schema) {
 	return false;
 }
 
+std::set<std::pair<string, string>> MSSQLTransactionMetadata::GetLoadedTables() {
+	std::lock_guard<std::mutex> guard(lock_);
+	std::set<Key> loaded;
+	for (const auto &pair : entries_) {
+		loaded.insert(pair.first);
+	}
+	return loaded;
+}
+
 bool MSSQLTransactionMetadata::IsAllChanged() {
 	std::lock_guard<std::mutex> guard(lock_);
 	return all_changed_ || locally_changed_;

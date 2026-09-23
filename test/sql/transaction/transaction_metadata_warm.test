@@ -1,0 +1,201 @@
+# name: test/sql/transaction/transaction_metadata_warm.test
+# description: What a transaction loaded or changed is loaded into the shared cache after it ends, so the next transaction does not load it again (issue #383)
+# group: [transaction]
+# issue: 383
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Inside a transaction a catalog miss is loaded on the pinned connection into
+# the transaction's own cache and never into the shared one (#380). Alone,
+# that made every transaction of a transaction-only workload (DuckLake) pay a
+# metadata round trip per table it touched. After COMMIT or ROLLBACK the
+# tables the transaction loaded or changed are now loaded into the shared
+# cache on a POOL connection -- committed state, taken after the transaction
+# -- one by one, or as the schema's preload when more than 8 of one schema
+# were touched. Not on a pool of one connection.
+#
+# The lever: mssql_test_fail_metadata_after_rows = 1 makes any metadata query
+# fail. A read that succeeds under it ran none.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS w383 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('w383', 'DROP TABLE IF EXISTS dbo.w383_t, dbo.w383_rb; DROP TABLE IF EXISTS w383.t1; DROP TABLE IF EXISTS w383.t2; DROP TABLE IF EXISTS w383.t3; DROP TABLE IF EXISTS w383.t4; DROP TABLE IF EXISTS w383.t5; DROP TABLE IF EXISTS w383.t6; DROP TABLE IF EXISTS w383.t7; DROP TABLE IF EXISTS w383.t8; DROP TABLE IF EXISTS w383.t9; DROP TABLE IF EXISTS w383.t10; DROP SCHEMA IF EXISTS w383');
+
+statement ok
+SELECT mssql_exec('w383', 'CREATE TABLE dbo.w383_t (id int NOT NULL PRIMARY KEY); INSERT INTO dbo.w383_t VALUES (1), (2)');
+
+statement ok
+SELECT mssql_exec('w383', 'EXEC(''CREATE SCHEMA w383''); CREATE TABLE w383.t1 (id int NOT NULL); CREATE TABLE w383.t2 (id int NOT NULL); CREATE TABLE w383.t3 (id int NOT NULL); CREATE TABLE w383.t4 (id int NOT NULL); CREATE TABLE w383.t5 (id int NOT NULL); CREATE TABLE w383.t6 (id int NOT NULL); CREATE TABLE w383.t7 (id int NOT NULL); CREATE TABLE w383.t8 (id int NOT NULL); CREATE TABLE w383.t9 (id int NOT NULL); CREATE TABLE w383.t10 (id int NOT NULL);');
+
+statement ok
+SELECT mssql_invalidate_cache('w383');
+
+#------------------------------------------------------------------------------
+# A few tables: loaded one by one after COMMIT.
+#------------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM w383.dbo.w383_t;
+----
+2
+
+statement ok
+COMMIT;
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+# The next transaction reads it from the shared cache: no metadata query.
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM w383.dbo.w383_t;
+----
+2
+
+statement ok
+COMMIT;
+
+# Neither does another connection in autocommit.
+query I con2
+SELECT count(*) FROM w383.dbo.w383_t;
+----
+2
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
+
+#------------------------------------------------------------------------------
+# More than 8 tables of one schema: the schema is preloaded, so a table of it
+# the transaction never touched is in the shared cache too.
+#------------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+query I
+SELECT (SELECT count(*) FROM w383.w383.t1) + (SELECT count(*) FROM w383.w383.t2) + (SELECT count(*) FROM w383.w383.t3)
+     + (SELECT count(*) FROM w383.w383.t4) + (SELECT count(*) FROM w383.w383.t5) + (SELECT count(*) FROM w383.w383.t6)
+     + (SELECT count(*) FROM w383.w383.t7) + (SELECT count(*) FROM w383.w383.t8) + (SELECT count(*) FROM w383.w383.t9);
+----
+0
+
+statement ok
+COMMIT;
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM w383.w383.t10;
+----
+0
+
+statement ok
+COMMIT;
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
+
+#------------------------------------------------------------------------------
+# After ROLLBACK the warm-up loads committed state: a table the transaction
+# created and read is not there.
+#------------------------------------------------------------------------------
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT mssql_exec('w383', 'CREATE TABLE dbo.w383_rb (id int NOT NULL)');
+
+query I
+SELECT count(*) FROM w383.dbo.w383_rb;
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT count(*) FROM w383.dbo.w383_rb;
+----
+does not exist
+
+statement error con2
+SELECT count(*) FROM w383.dbo.w383_rb;
+----
+does not exist
+
+statement ok
+SET mssql_exec_invalidate_cache = false;
+
+statement ok
+SELECT mssql_exec('w383', 'DROP TABLE IF EXISTS dbo.w383_t; DROP TABLE IF EXISTS w383.t1; DROP TABLE IF EXISTS w383.t2; DROP TABLE IF EXISTS w383.t3; DROP TABLE IF EXISTS w383.t4; DROP TABLE IF EXISTS w383.t5; DROP TABLE IF EXISTS w383.t6; DROP TABLE IF EXISTS w383.t7; DROP TABLE IF EXISTS w383.t8; DROP TABLE IF EXISTS w383.t9; DROP TABLE IF EXISTS w383.t10; DROP SCHEMA IF EXISTS w383');
+
+statement ok
+DETACH w383;
+
+#------------------------------------------------------------------------------
+# A pool of one connection: no warm-up -- the next transaction loads again,
+# which the lever turns into an error.
+#------------------------------------------------------------------------------
+
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS w383one (TYPE mssql);
+
+statement ok
+SELECT mssql_invalidate_cache('w383one');
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) > 0 FROM w383one.dbo.TestSimplePK;
+----
+true
+
+statement ok
+COMMIT;
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+statement ok
+BEGIN;
+
+statement error
+SELECT count(*) FROM w383one.dbo.TestSimplePK;
+----
+mssql_test_fail_metadata_after_rows
+
+statement ok
+ROLLBACK;
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
+
+statement ok
+DETACH w383one;
+
+statement ok
+RESET mssql_connection_limit;
