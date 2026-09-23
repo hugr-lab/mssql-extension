@@ -389,6 +389,7 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		// This ensures the new table schema is visible for subsequent queries
 		if (!bdata.target.IsTempTable() && (bdata.config.create_table || bdata.config.overwrite)) {
 			mssql_catalog.InvalidateSchemaTableSet(bdata.target.schema_name);
+			mssql_catalog.NoteTransactionChange(context, bdata.target.schema_name);
 			CopyDebugLog(2, "BCPCopyInitGlobal: schema '%s' table list invalidated after table creation/modification",
 						 bdata.target.schema_name.c_str());
 		}
@@ -621,7 +622,8 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 			}
 			const auto policy = MSSQLResolveLoadPolicy(bdata.target.is_temp_table, gstate->transaction_pinned,
 													   MSSQLLoadTransactionRole::JoinsTransaction, configured,
-													   static_cast<uint64_t>(context.db->NumberOfThreads()));
+													   static_cast<uint64_t>(context.db->NumberOfThreads()),
+													   static_cast<uint64_t>(mssql_catalog.GetConnectionLimit()));
 			gstate->parallel_writer_limit = static_cast<idx_t>(policy.max_writers);
 		}
 		CopyDebugLog(1, "BCPCopyInitGlobal: parallel_writer_limit=%llu (pinned=%d, session_temp=%d)",

@@ -484,6 +484,54 @@ sequenceDiagram
     C-->>U: rows ✓ (returned "Invalid object name" before the #151 fix)
 ```
 
+### Inside an explicit transaction (issue #380)
+
+**Invariant: the shared caches hold committed state only.** Both layers above,
+and the statistics provider, are one object per catalog, read by every DuckDB
+connection. A transaction's pinned connection sees its own uncommitted DDL; a
+pool connection does not, and waits on its schema locks. So inside an explicit
+transaction the catalog:
+
+- **reads** the shared layers, except for the names the transaction changed;
+- **never writes** them: a miss is loaded on the pinned connection into
+  `MSSQLTransactionMetadata` (`catalog/mssql_transaction_metadata.hpp`), which the
+  `MSSQLTransaction` owns — its own `MSSQLMetadataCache`, the table entries built
+  from it, the names it found absent, the schemas it listed;
+- **invalidates** them as before, and records what it changed
+  (`MSSQLCatalog::NoteTransactionChange` — CTAS, COPY into a new table, catalog
+  DDL, `mssql_exec` DDL under `mssql_exec_invalidate_cache`, `mssql_invalidate_cache`);
+- at COMMIT or ROLLBACK, **forgets** those names in the shared layers
+  (`ForgetTransactionChanges`) and drops its own layer with the transaction. The
+  pinned connection goes back to the pool and the next statement is ordinary
+  autocommit.
+
+`mssql_refresh_cache()` and `mssql_preload_catalog()` are **refused** inside a
+transaction: both are bulk writes into the shared layers. `mssql_invalidate_cache()`
+is allowed.
+
+```mermaid
+flowchart TD
+    Q["bind db.dbo.t inside BEGIN … COMMIT"] --> L{"in the transaction's<br/>own layer?"}
+    L -- yes --> E["entry"]
+    L -- no --> C{"t changed by<br/>this transaction?"}
+    C -- no --> S{"shared layer:<br/>hit or known absent?"}
+    S -- yes --> E
+    S -- miss --> P
+    C -- yes --> P["load on the PINNED connection<br/>into the transaction's layer"]
+    P --> E
+    X["COMMIT / ROLLBACK"] --> F["shared layers forget<br/>the changed names"]
+```
+
+Why not load into the shared layers from the pinned connection, which is the
+obvious fix: measured, it leaks. After ROLLBACK a table created in the
+transaction stayed bound as a phantom, and a second connection found the
+uncommitted table in the cache while the transaction was open, then hung
+reading it. Other paths that used to reach the pool from inside a transaction
+follow the same rule: the rowid key discovery (`EnsurePKLoaded`) and the schema
+list load go on the pinned connection, and the storage info a table listing asks
+for uses the row count loaded with the entry instead of a DMV query per table
+(on a pool of one that query waited `mssql_acquire_timeout` for every table).
+
 ---
 
 ## Layer 5 — Codec (spec 045)
@@ -687,7 +735,7 @@ This is the part that has changed most, and the two operators deliberately diffe
 | | connection for the DDL | connection(s) for the rows | inside an explicit transaction |
 |---|---|---|---|
 | `COPY … TO` | pool (`ExecuteDDL`, autocommits) | pool, one per writer | **pinned**, and exactly one writer — a second would sit outside the transaction, and COPY may be loading into a table it cannot undo |
-| CTAS | pool (`ExecuteDDL`, autocommits) | pool, one per writer | **unchanged** — never pinned, still N writers |
+| CTAS | pool (`ExecuteDDL`, autocommits) | pool, one per writer | **unchanged** — never pinned, still N writers; **except on a pool of ONE connection** (issue #380): the existence checks, the CREATE and the rows all go on the pinned connection, the rows as INSERT statements, and ROLLBACK undoes the table |
 
 Since spec 063 that answer comes from ONE function rather than from each operator
 deriving it: `MSSQLResolveLoadPolicy` (`copy/load_policy.hpp`) reduces the whole
@@ -716,6 +764,17 @@ CREATED is dropping it, which is complete and needs no shared transaction — th
 what `mssql_ctas_drop_on_failure` does. The consequence, which is asserted rather
 than tolerated: `ROLLBACK` undoes neither a CTAS's table nor its rows.
 
+Two exceptions, both from issue #380. A CTAS inside a transaction runs its
+existence checks on the **pinned** connection whatever the pool size — a pool
+connection waits on the schema lock of a table the transaction created. And on a
+pool of **one** connection there is no second connection for the DDL or a bulk
+load to take, so in a transaction the whole CTAS runs on the pinned one (and
+ROLLBACK undoes it), and in either mode its rows go as INSERT statements: a bulk
+load holds its connection from init, before the source scan runs, while statements
+take theirs at the first batch, after the optimizer has materialised a scan of the
+same catalog. The optimizer counts a CTAS as a sink like COPY and INSERT, and on a
+pool of one it materialises in autocommit too.
+
 ### Writers
 
 ```mermaid
@@ -723,7 +782,7 @@ flowchart TD
     subgraph GS["GlobalSinkState (one per statement)"]
         ddl["DDL phase<br/>CREATE TABLE — pool conn, autocommits"]
         gw["shared BulkLoadSession<br/>adopts the operator's connection<br/>(pinned in a txn, else pool)"]
-        lim["parallel_writer_limit<br/>= mssql_copy_parallel_writers,<br/>or NumberOfThreads capped at 8"]
+        lim["parallel_writer_limit<br/>= mssql_copy_parallel_writers,<br/>or NumberOfThreads capped at 8,<br/>never above pool limit − 1"]
         failed["load_failed (atomic)"]
     end
     subgraph T1["worker thread 1"]
@@ -751,6 +810,13 @@ diverged nine ways within it — `ROWS_PER_BATCH` sent by one and not the other,
 interrupt check and no counters on the CTAS side at all. It owns the connection,
 the writer, the batch bookkeeping and the mid-bulk-load release protocol; who may
 open one, and how many, is the policy above and is handed to it.
+
+The policy never grants more writers than the pool has connections to spare:
+**pool limit − 1**, one being held by the statement itself (the pinned
+connection, the shared writer, or the source scan). Measured before the cap
+(issue #380): a CTAS inside a transaction on a pool of two took 30 s — the extra
+writer waited `mssql_acquire_timeout` for a connection that could not free —
+against 0.9 s for 300k rows on the one writer the cap leaves. COPY, CTAS and INSERT via BCP share the rule.
 
 Since spec 062 W0 the **shared** writer is the same type. `TryStart` claims a
 slot and a pool connection and may decline; `Adopt` takes the connection the

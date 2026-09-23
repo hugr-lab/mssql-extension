@@ -184,6 +184,7 @@ set(EXTENSION_SOURCES
     src/catalog/mssql_preload_catalog.cpp
     src/catalog/mssql_refresh_function.cpp
     src/catalog/mssql_transaction.cpp
+    src/catalog/mssql_transaction_metadata.cpp
     src/catalog/mssql_ddl_translator.cpp
     src/catalog/mssql_statistics.cpp
     # Table scan layer (refactored table scan and filter encoding)

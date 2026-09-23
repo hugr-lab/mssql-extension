@@ -183,6 +183,7 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateTable(CatalogTransaction tran
 
 	// Point invalidation: invalidate schema's table list and local table set
 	mssql_catalog.InvalidateSchemaTableSet(name.GetIdentifierName());
+	mssql_catalog.NoteTransactionChange(transaction.GetContext(), name.GetIdentifierName(), table_name);
 
 	// Look up the newly created table (triggers lazy load of table list)
 	return tables_.GetEntry(transaction.GetContext(), table_name);
@@ -374,6 +375,7 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 
 	// Invalidate the local table set cache to pick up column changes
 	mssql_catalog.InvalidateSchemaTableSet(name.GetIdentifierName());
+	mssql_catalog.NoteTransactionChange(transaction.GetContext(), name.GetIdentifierName(), table_name);
 }
 
 void MSSQLSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
@@ -391,6 +393,8 @@ void MSSQLSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 
 		// Point invalidation: invalidate schema's table list and local table set
 		mssql_catalog.InvalidateSchemaTableSet(name.GetIdentifierName());
+		mssql_catalog.NoteTransactionChange(context, name.GetIdentifierName(),
+											info.GetQualifiedName().Name().GetIdentifierName());
 		return;
 	}
 

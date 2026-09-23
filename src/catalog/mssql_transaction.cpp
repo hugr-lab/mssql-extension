@@ -94,6 +94,18 @@ void RestoreIsolationLevel(duckdb::MSSQLCatalog &catalog, duckdb::tds::TdsConnec
 	}
 }
 
+// Issue #380: the transaction's own metadata goes with it (it is owned by the
+// MSSQLTransaction erased right after); what the shared cache must forget --
+// the names the transaction changed -- is invalidated there now, at COMMIT and
+// at ROLLBACK alike. After COMMIT another connection may hold the pre-commit
+// state of those names; after ROLLBACK the invalidation is merely redundant.
+void ForgetTransactionMetadata(duckdb::MSSQLCatalog &catalog, duckdb::MSSQLTransaction &txn) {
+	auto *metadata = txn.TryMetadata();
+	if (metadata) {
+		catalog.ForgetTransactionChanges(*metadata);
+	}
+}
+
 }  // anonymous namespace
 
 namespace duckdb {
@@ -148,6 +160,19 @@ MSSQLTransaction::~MSSQLTransaction() {
 
 MSSQLTransaction &MSSQLTransaction::Get(ClientContext &context, Catalog &catalog) {
 	return Transaction::Get(context, catalog).Cast<MSSQLTransaction>();
+}
+
+MSSQLTransactionMetadata &MSSQLTransaction::Metadata(ClientContext &context) {
+	lock_guard<mutex> lock(metadata_mutex_);
+	if (!metadata_) {
+		metadata_ = make_uniq<MSSQLTransactionMetadata>(catalog_.CreateTransactionMetadataCache(context));
+	}
+	return *metadata_;
+}
+
+MSSQLTransactionMetadata *MSSQLTransaction::TryMetadata() {
+	lock_guard<mutex> lock(metadata_mutex_);
+	return metadata_.get();
 }
 
 std::shared_ptr<tds::TdsConnection> MSSQLTransaction::GetPinnedConnection() {
@@ -263,6 +288,7 @@ ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Tra
 			// The user will need to rollback or retry
 			MSSQL_TXN_LOG("CommitTransaction: COMMIT TRANSACTION failed: %s", pinned_conn->GetLastError().c_str());
 			string error_msg = "MSSQL: Failed to commit transaction: " + pinned_conn->GetLastError();
+			ForgetTransactionMetadata(catalog_, mssql_txn);
 			transactions_.erase(context);
 			return ErrorData(ExceptionType::IO, error_msg);
 		}
@@ -304,6 +330,7 @@ ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Tra
 		MSSQL_TXN_LOG("CommitTransaction: No active SQL Server transaction (no-op)");
 	}
 
+	ForgetTransactionMetadata(catalog_, mssql_txn);
 	transactions_.erase(context);
 	return ErrorData();
 }
@@ -365,6 +392,8 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 	} else {
 		MSSQL_TXN_LOG("RollbackTransaction: No active SQL Server transaction (no-op)");
 	}
+
+	ForgetTransactionMetadata(catalog_, mssql_txn);
 
 	// Try to get the context to remove from our transaction map
 	// The context may have been destroyed during shutdown, in which case

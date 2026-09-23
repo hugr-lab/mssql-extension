@@ -58,45 +58,70 @@ static void TestTheFourConsumers() {
 
 	// COPY, permanent target, no transaction: the ordinary fast path.
 	Check("COPY / permanent / autocommit",
-		  MSSQLResolveLoadPolicy(false, false, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16),
+		  MSSQLResolveLoadPolicy(false, false, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16, 64),
 		  MSSQLLoadConnectionSource::Pool, 8, "derived from threads, capped at 8");
 
 	// COPY inside a transaction: it may be loading into a table that existed
 	// before the statement, so the transaction has to own the load.
 	Check("COPY / permanent / in transaction",
-		  MSSQLResolveLoadPolicy(false, true, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16),
+		  MSSQLResolveLoadPolicy(false, true, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16, 64),
 		  MSSQLLoadConnectionSource::Pinned, 1, "a second writer's rows would not roll back");
 
 	// CTAS: its table is its own and the undo is dropping it, so a transaction
 	// does not cap it. This is the spec 057 decision, pinned here.
-	Check("CTAS / in transaction", MSSQLResolveLoadPolicy(false, true, MSSQLLoadTransactionRole::OwnsTarget, 0, 16),
+	Check("CTAS / in transaction", MSSQLResolveLoadPolicy(false, true, MSSQLLoadTransactionRole::OwnsTarget, 0, 16, 64),
 		  MSSQLLoadConnectionSource::Pool, 8, "owns its target; load is outside the transaction");
 
-	Check("CTAS / autocommit", MSSQLResolveLoadPolicy(false, false, MSSQLLoadTransactionRole::OwnsTarget, 0, 16),
+	Check("CTAS / autocommit", MSSQLResolveLoadPolicy(false, false, MSSQLLoadTransactionRole::OwnsTarget, 0, 16, 64),
 		  MSSQLLoadConnectionSource::Pool, 8, "same answer in or out of a transaction");
 
 	// UPDATE/DELETE staging (spec 062 and after): a #temp table inside a
 	// transaction. It is BOTH session-scoped and transactional, and needs no
 	// rule of its own — which is the test that the predicate generalises.
 	Check("DML staging / #temp / in transaction",
-		  MSSQLResolveLoadPolicy(true, true, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16),
+		  MSSQLResolveLoadPolicy(true, true, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16, 64),
 		  MSSQLLoadConnectionSource::Pinned, 1, "session-scoped AND transactional — no new rule needed");
+}
+
+// Issue #380: the writers never exceed the pool minus one. The statement holds
+// a connection while it loads (the pinned one, or its own source scan), and an
+// extra writer beyond what is left waits mssql_acquire_timeout for nothing.
+static void TestPoolLimitCap() {
+	std::cout << "\n-- pool limit --\n";
+
+	Check("CTAS / in transaction / pool 2",
+		  MSSQLResolveLoadPolicy(false, true, MSSQLLoadTransactionRole::OwnsTarget, 0, 16, 2),
+		  MSSQLLoadConnectionSource::Pool, 1, "the pinned connection holds the other slot");
+	Check("COPY / autocommit / pool 3",
+		  MSSQLResolveLoadPolicy(false, false, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16, 3),
+		  MSSQLLoadConnectionSource::Pool, 2, "pool minus the one the statement holds");
+	Check("COPY / autocommit / pool 3 / explicit 8",
+		  MSSQLResolveLoadPolicy(false, false, MSSQLLoadTransactionRole::JoinsTransaction, 8, 16, 3),
+		  MSSQLLoadConnectionSource::Pool, 2, "an explicit setting does not buy connections the pool lacks");
+	Check("COPY / autocommit / pool 1",
+		  MSSQLResolveLoadPolicy(false, false, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16, 1),
+		  MSSQLLoadConnectionSource::Pool, 1, "never below one writer");
+	Check("COPY / autocommit / pool 64",
+		  MSSQLResolveLoadPolicy(false, false, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16, 64),
+		  MSSQLLoadConnectionSource::Pool, 8, "a roomy pool leaves the thread-derived cap alone");
 }
 
 // The case mssql_reset_connection is about to make dangerous.
 static void TestSessionScopedTarget() {
 	std::cout << "\n-- #temp targets --\n";
 
-	Check("#temp / autocommit", MSSQLResolveLoadPolicy(true, false, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16),
+	Check("#temp / autocommit",
+		  MSSQLResolveLoadPolicy(true, false, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16, 64),
 		  MSSQLLoadConnectionSource::Pool, 1, "no other session can see a # table");
 
 	// The one that must not be inherited from the thread count: an explicit
 	// setting does NOT buy parallel writers against a session-scoped target.
 	Check("#temp / autocommit / mssql_copy_parallel_writers=4",
-		  MSSQLResolveLoadPolicy(true, false, MSSQLLoadTransactionRole::JoinsTransaction, 4, 16),
+		  MSSQLResolveLoadPolicy(true, false, MSSQLLoadTransactionRole::JoinsTransaction, 4, 16, 64),
 		  MSSQLLoadConnectionSource::Pool, 1, "an explicit setting cannot make a # table visible elsewhere");
 
-	Check("#temp / CTAS-shaped role", MSSQLResolveLoadPolicy(true, false, MSSQLLoadTransactionRole::OwnsTarget, 0, 16),
+	Check("#temp / CTAS-shaped role",
+		  MSSQLResolveLoadPolicy(true, false, MSSQLLoadTransactionRole::OwnsTarget, 0, 16, 64),
 		  MSSQLLoadConnectionSource::Pool, 1, "owning the target does not make it visible either");
 
 	// ## is a DIFFERENT answer, and the reason the flag passed in is the LOCAL
@@ -104,7 +129,7 @@ static void TestSessionScopedTarget() {
 	// global temp table is visible across sessions, so it keeps its writers —
 	// that is the workflow #189 asks for.
 	Check("##global / autocommit",
-		  MSSQLResolveLoadPolicy(false, false, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16),
+		  MSSQLResolveLoadPolicy(false, false, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16, 64),
 		  MSSQLLoadConnectionSource::Pool, 8, "## is visible across sessions — N writers is correct");
 }
 
@@ -149,26 +174,34 @@ static void TestPinnedImpliesExactlyOneWriter() {
 			for (int owns = 0; owns <= 1; ++owns) {
 				for (int64_t configured : {int64_t(0), int64_t(1), int64_t(4), int64_t(64)}) {
 					for (uint64_t threads : {uint64_t(0), uint64_t(1), uint64_t(64)}) {
-						const auto role =
-							owns ? MSSQLLoadTransactionRole::OwnsTarget : MSSQLLoadTransactionRole::JoinsTransaction;
-						const auto p = MSSQLResolveLoadPolicy(scoped != 0, txn != 0, role, configured, threads);
-						++checked;
-						if (p.source == MSSQLLoadConnectionSource::Pinned && p.max_writers != 1) {
-							std::cerr << "FAIL: Pinned with max_writers=" << p.max_writers << " (scoped=" << scoped
-									  << " txn=" << txn << " owns=" << owns << " configured=" << configured
-									  << " threads=" << threads << ")\n";
-							++g_failures;
-						}
-						if (p.max_writers < 1) {
-							std::cerr << "FAIL: max_writers=" << p.max_writers << " — a load needs one writer\n";
-							++g_failures;
+						for (uint64_t pool : {uint64_t(0), uint64_t(1), uint64_t(2), uint64_t(64)}) {
+							const auto role = owns ? MSSQLLoadTransactionRole::OwnsTarget
+												   : MSSQLLoadTransactionRole::JoinsTransaction;
+							const auto p =
+								MSSQLResolveLoadPolicy(scoped != 0, txn != 0, role, configured, threads, pool);
+							++checked;
+							if (pool > 1 && p.max_writers > pool - 1) {
+								std::cerr << "FAIL: max_writers=" << p.max_writers << " on a pool of " << pool << "\n";
+								++g_failures;
+							}
+							if (p.source == MSSQLLoadConnectionSource::Pinned && p.max_writers != 1) {
+								std::cerr << "FAIL: Pinned with max_writers=" << p.max_writers << " (scoped=" << scoped
+										  << " txn=" << txn << " owns=" << owns << " configured=" << configured
+										  << " threads=" << threads << ")\n";
+								++g_failures;
+							}
+							if (p.max_writers < 1) {
+								std::cerr << "FAIL: max_writers=" << p.max_writers << " — a load needs one writer\n";
+								++g_failures;
+							}
 						}
 					}
 				}
 			}
 		}
 	}
-	std::cout << "ok: " << checked << " combinations, Pinned always alone and max_writers never 0\n";
+	std::cout << "ok: " << checked
+			  << " combinations, Pinned always alone, max_writers never 0 and never past the pool minus one\n";
 }
 
 //==============================================================================
@@ -190,7 +223,7 @@ static void CheckGate(const char *what, uint64_t actual, uint64_t want, const ch
 }
 
 static void TestWarmupGateRows() {
-	constexpr uint64_t RG = 102400;  // MSSQL_COLUMNSTORE_ROWGROUP_ROWS
+	constexpr uint64_t RG = 102400;	 // MSSQL_COLUMNSTORE_ROWGROUP_ROWS
 
 	CheckGate("heap, flush 102400", MSSQLWarmupGateRows(false, 102400, RG), 0,
 			  "no compression to protect — fan out immediately");
@@ -215,6 +248,7 @@ int main() {
 	TestTheFourConsumers();
 	TestSessionScopedTarget();
 	TestWriterLimitDerivation();
+	TestPoolLimitCap();
 	TestPinnedImpliesExactlyOneWriter();
 	TestWarmupGateRows();
 	if (g_failures == 0) {

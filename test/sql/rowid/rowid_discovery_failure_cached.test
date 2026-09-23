@@ -10,11 +10,14 @@
 # way to look again.
 #
 # The failure is real, not injected: the pool holds ONE connection (the limit
-# is fixed at ATTACH), a transaction pins it through a scan of another table,
-# and the discovery for this table — which takes a POOL connection — times out
-# after mssql_acquire_timeout. The table's columns are loaded beforehand
-# through duckdb_columns(), which does not touch the rowid key, so the
-# discovery is the first thing inside the transaction that needs the pool.
+# is fixed at ATTACH), a transaction on ANOTHER connection (con2) pins it
+# through a scan of another table, and this connection's autocommit discovery
+# — which takes a POOL connection — times out after mssql_acquire_timeout.
+# The table's columns are loaded beforehand through duckdb_columns(), which
+# does not touch the rowid key, so the discovery is the first thing that
+# needs the pool. (Until issue #380 the lever was a transaction on THIS
+# connection: its discovery went to the pool too. It now runs on the
+# transaction's pinned connection and succeeds.)
 
 require mssql
 
@@ -50,11 +53,11 @@ SELECT count(*) FROM duckdb_columns() WHERE database_name = 'lim' AND table_name
 ----
 2
 
-statement ok
+statement ok con2
 BEGIN;
 
-# Pins the one connection.
-query I
+# Pins the one connection -- to con2.
+query I con2
 SELECT count(*) FROM lim.dbo.DiscoveryPin;
 ----
 0
@@ -66,7 +69,7 @@ UPDATE lim.dbo.DiscoveryFail SET n = 1 WHERE n = 0;
 ----
 <REGEX>:.*could not be read, so whether it has one is unknown: no connection could be acquired from the pool \(pool '.*' timed out \(1 active of 1, limit 1\)\)\. The lookup is not retried on its own: mssql_invalidate_cache\('lim', 'dbo', 'DiscoveryFail'\).*
 
-statement ok
+statement ok con2
 ROLLBACK;
 
 # The pool is free again, but the failure is cached: the same refusal, no round trip.

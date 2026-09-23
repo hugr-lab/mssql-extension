@@ -130,9 +130,19 @@ inline uint64_t MSSQLWarmupGateRows(bool warmup_gate, uint64_t flush_rows, uint6
 	return rowgroup_rows;
 }
 
+//!
+//! `pool_limit` is the catalog's mssql_connection_limit (fixed at ATTACH); the
+//! writers never exceed it minus one (issue #380). The statement itself holds a
+//! connection while it loads -- the pinned one in a transaction, the source
+//! scan of the same catalog in autocommit -- and a writer beyond the pool's
+//! remaining capacity does not fail, it WAITS mssql_acquire_timeout (30 s by
+//! default) for a connection that is not coming, then carries on without it.
+//! Measured: a 300k-row CTAS at pool 2 in a transaction took the acquire
+//! timeout, and 0.9 s on one writer. No default: a new caller must say what
+//! pool it loads through.
 inline MSSQLLoadPolicy MSSQLResolveLoadPolicy(bool target_is_session_scoped, bool in_transaction,
 											  MSSQLLoadTransactionRole role, int64_t configured_writers,
-											  uint64_t thread_count) {
+											  uint64_t thread_count, uint64_t pool_limit) {
 	MSSQLLoadPolicy policy;
 
 	policy.source = (in_transaction && role == MSSQLLoadTransactionRole::JoinsTransaction)
@@ -173,6 +183,10 @@ inline MSSQLLoadPolicy MSSQLResolveLoadPolicy(bool target_is_session_scoped, boo
 	}
 
 	policy.max_writers = MSSQLDeriveWriterLimit(configured_writers, thread_count);
+	const uint64_t pool_room = pool_limit > 1 ? pool_limit - 1 : 1;
+	if (policy.max_writers > pool_room) {
+		policy.max_writers = pool_room;
+	}
 	return policy;
 }
 

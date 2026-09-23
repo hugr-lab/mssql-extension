@@ -1,0 +1,199 @@
+# name: test/sql/transaction/transaction_metadata_pinned.test
+# description: Metadata inside an explicit transaction loads on the pinned connection and never enters the shared cache (issue #380)
+# group: [transaction]
+# issue: 380
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# A table created inside a transaction (COPY, mssql_exec) and read in the same
+# transaction used to hang until mssql_metadata_timeout: the catalog loaded its
+# metadata on a POOL connection, which waits on the schema lock of the
+# transaction's uncommitted CREATE. The load now goes on the transaction's
+# pinned connection, into a cache that lives and dies with the transaction:
+# the catalog's shared cache is read, invalidated, never written from inside
+# a transaction -- else a ROLLBACK leaves a phantom behind and another
+# connection finds the uncommitted table in the cache.
+#
+# The metadata timeout is short so that a regression fails in seconds rather
+# than hanging the suite for the default five minutes.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_metadata_timeout = 10;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS tm380 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('tm380', 'DROP TABLE IF EXISTS dbo.tm380_copy, dbo.tm380_exec, dbo.tm380_commit, dbo.tm380_drop');
+
+statement ok
+SELECT mssql_exec('tm380', 'CREATE TABLE dbo.tm380_drop (id int NOT NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('tm380');
+
+# The shared listing is loaded before any transaction, without the tables the
+# transactions below create.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'tm380' AND table_name LIKE 'tm380_%';
+----
+1
+
+#------------------------------------------------------------------------------
+# COPY creates a table in a transaction; the same transaction reads it, lists
+# it; ROLLBACK removes it everywhere.
+#------------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+COPY (SELECT i::INTEGER AS id FROM range(3) t(i)) TO 'mssql://tm380/dbo/tm380_copy' (FORMAT 'bcp', CREATE_TABLE true);
+
+query I
+SELECT count(*) FROM tm380.dbo.tm380_copy;
+----
+3
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'tm380' AND table_name LIKE 'tm380_%';
+----
+2
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT count(*) FROM tm380.dbo.tm380_copy;
+----
+does not exist
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'tm380' AND table_name LIKE 'tm380_%';
+----
+1
+
+# Another connection does not see it either.
+statement error con2
+SELECT count(*) FROM tm380.dbo.tm380_copy;
+----
+does not exist
+
+#------------------------------------------------------------------------------
+# mssql_exec DDL in a transaction, the cache told by mssql_invalidate_cache()
+# -- which is allowed inside a transaction, unlike a reload.
+#------------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT mssql_exec('tm380', 'CREATE TABLE dbo.tm380_exec (id int NOT NULL, v nvarchar(10) NULL); INSERT INTO dbo.tm380_exec VALUES (1, N''a''), (2, N''b'')');
+
+statement ok
+SELECT mssql_invalidate_cache('tm380', 'dbo');
+
+query IT
+SELECT id, v FROM tm380.dbo.tm380_exec ORDER BY id;
+----
+1	a
+2	b
+
+statement error
+SELECT mssql_refresh_cache('tm380');
+----
+cannot run inside a transaction
+
+statement ok
+ROLLBACK;
+
+# The refusal aborted the transaction; the table is gone with it.
+statement error
+SELECT count(*) FROM tm380.dbo.tm380_exec;
+----
+does not exist
+
+statement ok
+BEGIN;
+
+statement error
+SELECT mssql_preload_catalog('tm380');
+----
+cannot run inside a transaction
+
+statement ok
+ROLLBACK;
+
+#------------------------------------------------------------------------------
+# COMMIT publishes: the shared cache forgets what the transaction changed, and
+# another connection loads the committed table.
+#------------------------------------------------------------------------------
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT mssql_exec('tm380', 'CREATE TABLE dbo.tm380_commit (id int NOT NULL); INSERT INTO dbo.tm380_commit VALUES (7)');
+
+query I
+SELECT id FROM tm380.dbo.tm380_commit;
+----
+7
+
+statement ok
+COMMIT;
+
+query I con2
+SELECT id FROM tm380.dbo.tm380_commit;
+----
+7
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'tm380' AND table_name LIKE 'tm380_%';
+----
+2
+
+#------------------------------------------------------------------------------
+# DROP TABLE inside a transaction: gone for the transaction at once. Catalog
+# DDL runs on a pool connection and autocommits (spec 057), so ROLLBACK does
+# not bring it back -- and the shared cache must not either.
+#------------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+DROP TABLE tm380.dbo.tm380_drop;
+
+statement error
+SELECT count(*) FROM tm380.dbo.tm380_drop;
+----
+does not exist
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT count(*) FROM tm380.dbo.tm380_drop;
+----
+does not exist
+
+statement ok
+SET mssql_exec_invalidate_cache = false;
+
+statement ok
+SELECT mssql_exec('tm380', 'DROP TABLE IF EXISTS dbo.tm380_copy, dbo.tm380_exec, dbo.tm380_commit, dbo.tm380_drop');
+
+statement ok
+DETACH tm380;
+
+statement ok
+RESET mssql_metadata_timeout;

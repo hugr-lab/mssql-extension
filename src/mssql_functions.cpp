@@ -1004,6 +1004,7 @@ static int64_t RunExecBatch(ClientContext &client_context, const string &context
 		// mssql_invalidate_cache(); set the flag true to auto-invalidate here.
 		if (ExecSqlMayChangeSchema(statement) && LoadExecInvalidateCache(client_context)) {
 			catalog.InvalidateMetadataCache();
+			catalog.NoteTransactionChange(client_context);
 		}
 
 		// Return affected row count from DONE token

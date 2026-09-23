@@ -53,6 +53,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A table created inside a transaction can be read in it; a pool of one
+  connection works in a transaction**
+  ([#380](https://github.com/hugr-lab/mssql-extension/issues/380)).
+  - **The hang.** `BEGIN; COPY … TO 'mssql://db/dbo/new' …; SELECT … FROM
+    db.dbo.new` waited out `mssql_metadata_timeout` (5 minutes by default). So
+    did the same after `mssql_exec` DDL. The metadata load ran on a pool
+    connection, which waits on the schema lock of the transaction's
+    uncommitted CREATE. It has done so since spec 076.
+  - **Pool of one.** With `mssql_connection_limit = 1`, the first table a
+    transaction touched failed with `pool timed out (1 active of 1)`: its
+    metadata wanted a second connection.
+  - **The fix.** Inside a transaction every metadata load goes on the pinned
+    connection, into a cache that belongs to the transaction. The catalog's
+    shared cache is read for names the transaction did not change and is
+    never written from inside a transaction. Loading into it was measured to
+    leave a phantom table after ROLLBACK and to show another connection the
+    uncommitted table. At COMMIT or ROLLBACK the shared cache forgets what the
+    transaction changed.
+  - **Refused inside a transaction.** `mssql_refresh_cache()` and
+    `mssql_preload_catalog()` are bulk loads into the shared cache.
+    `mssql_invalidate_cache()` is still allowed.
+  - **CTAS on a pool of one.** In a transaction it runs whole on the pinned
+    connection: checks, CREATE, and rows as INSERT statements. ROLLBACK
+    undoes it. In autocommit it loads with INSERT statements, and a scan of
+    the catalog it writes into is materialised first, as for INSERT … SELECT.
+    Both used to fail: `Failed to acquire connection to check table existence`
+    in a transaction, an acquire timeout in autocommit.
+  - **Parallel writers stay below the pool size.** A COPY, CTAS or INSERT via
+    BCP gets at most `mssql_connection_limit − 1` writers. A CTAS in a
+    transaction on a pool of two took 30 s: its extra writer waited
+    `mssql_acquire_timeout` for a connection that could not free. It now
+    takes 0.9 s for 300k rows, on one writer.
+  - **Found along the way.** A CTAS on the INSERT path (`mssql_ctas_use_bcp =
+    false`) reported its row count without the last batch: 1000 for 1500
+    rows.
 - **`mssql_preload_catalog` loads the schema list, marks only what it loaded,
   and reports it** ([#376](https://github.com/hugr-lab/mssql-extension/issues/376),
   [#375](https://github.com/hugr-lab/mssql-extension/issues/375)). Neither path

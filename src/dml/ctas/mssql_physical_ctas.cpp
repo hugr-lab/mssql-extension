@@ -42,6 +42,8 @@ MSSQLPhysicalCreateTableAs::MSSQLPhysicalCreateTableAs(PhysicalPlan &plan, vecto
 
 unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(ClientContext &context) const {
 	auto gstate = make_uniq<MSSQLCTASGlobalSinkState>(context, catalog_, target_, columns_, config_);
+	// Which connection the checks, the DDL and the rows go on (issue #380).
+	gstate->state.ResolveConnectionMode(context, catalog_.GetConnectionLimit());
 
 	// Execute DDL phase immediately (CREATE TABLE or DROP + CREATE for OR REPLACE)
 	// This is done in GetGlobalSinkState to fail fast before any data is processed
@@ -114,7 +116,8 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 			// writers.
 			const auto policy = MSSQLResolveLoadPolicy(
 				gstate->state.bcp_target.is_temp_table, ConnectionProvider::IsInTransaction(context, catalog_),
-				MSSQLLoadTransactionRole::OwnsTarget, configured, static_cast<uint64_t>(context.db->NumberOfThreads()));
+				MSSQLLoadTransactionRole::OwnsTarget, configured, static_cast<uint64_t>(context.db->NumberOfThreads()),
+				static_cast<uint64_t>(catalog_.GetConnectionLimit()));
 			gstate->parallel_writer_limit = static_cast<idx_t>(policy.max_writers);
 		}
 
@@ -433,6 +436,9 @@ SinkFinalizeType MSSQLPhysicalCreateTableAs::Finalize(Pipeline &pipeline, Event 
 
 		// Invalidate catalog cache so the new table is visible
 		gstate.state.InvalidateCache();
+		if (gstate.state.catalog) {
+			gstate.state.catalog->NoteTransactionChange(context, gstate.state.target.schema_name);
+		}
 
 		// Log success metrics
 		gstate.state.LogMetrics();

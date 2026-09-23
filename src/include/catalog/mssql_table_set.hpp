@@ -80,6 +80,14 @@ private:
 	// Internal Methods
 	//===----------------------------------------------------------------------===//
 
+	// Issue #380: the explicit-transaction halves of GetEntry and Scan. They read
+	// the shared entries (committed state) unless the transaction changed the
+	// table or schema, and never write them: a miss loads on the transaction's
+	// pinned connection into MSSQLTransactionMetadata, which dies with the
+	// transaction.
+	optional_ptr<CatalogEntry> GetEntryInTransaction(ClientContext &context, const string &name);
+	void ScanInTransaction(ClientContext &context, const std::function<void(CatalogEntry &)> &callback);
+
 	// Create table entry from metadata
 	// Spec 052: returns shared_ptr — entries co-owned by entries_ map and any
 	// in-flight bind data anchor (MSSQLCatalogScanBindData::table_entry_anchor_).

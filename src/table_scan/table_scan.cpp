@@ -566,9 +566,11 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	// catalog initializes.
 	//
 	// Only reachable when MSSQLOptimizer set the flag, which it does for a plan
-	// holding more than one scan of this catalog inside an explicit transaction —
-	// the case where all of them share the one pinned connection. Streaming is
-	// untouched everywhere else.
+	// holding more than one scan of this catalog (or a scan and a sink into it)
+	// inside an explicit transaction — the case where all of them share the one
+	// pinned connection — and, since issue #380, in autocommit on a catalog whose
+	// pool holds a single connection, which they share by taking turns. Streaming
+	// is untouched everywhere else.
 	//
 	// The drain deliberately reuses the normal execution path rather than a second
 	// row reader: FillChunk applies the projection, the rowid construction and the

@@ -74,6 +74,17 @@ static duckdb::unique_ptr<duckdb::FunctionData> MSSQLRefreshCacheBind(duckdb::Bi
 //===----------------------------------------------------------------------===//
 
 static void MSSQLRefreshCacheExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	// Refused inside an explicit transaction (issue #380): a forced load there
+	// either blocks on the transaction's own uncommitted DDL (a pool connection
+	// waits on its schema lock until the metadata timeout) or, on the pinned
+	// connection, would publish the transaction's uncommitted view into the cache
+	// every other connection reads. Invalidation stays allowed.
+	if (!state.GetContext().transaction.IsAutoCommit()) {
+		throw InvalidInputException(
+			"mssql_refresh_cache cannot run inside a transaction: it would load the catalog's "
+			"metadata while the transaction may hold uncommitted changes. Use "
+			"mssql_invalidate_cache() inside the transaction, or refresh after COMMIT");
+	}
 	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<MSSQLRefreshCacheBindData>();
 
 	auto &catalog_names = args.data[0];
@@ -156,12 +167,19 @@ static void MSSQLInvalidateCacheExecute(DataChunk &args, ExpressionState &state,
 		string catalog_name = args.GetValue(0, row).ToString();
 		auto &catalog = ResolveMSSQLCatalog(client_context, catalog_name, "mssql_invalidate_cache");
 
+		// Inside an explicit transaction the invalidation is also the
+		// transaction's own (issue #380): it stops trusting the shared cache for
+		// the name, and its end invalidates it again.
 		if (col_count >= 3 && !args.GetValue(2, row).IsNull() && !args.GetValue(1, row).IsNull()) {
 			catalog.InvalidateTableEntry(args.GetValue(1, row).ToString(), args.GetValue(2, row).ToString());
+			catalog.NoteTransactionChange(client_context, args.GetValue(1, row).ToString(),
+										  args.GetValue(2, row).ToString());
 		} else if (col_count >= 2 && !args.GetValue(1, row).IsNull()) {
 			catalog.InvalidateSchemaTableSet(args.GetValue(1, row).ToString());
+			catalog.NoteTransactionChange(client_context, args.GetValue(1, row).ToString());
 		} else {
 			catalog.InvalidateMetadataCache();
+			catalog.NoteTransactionChange(client_context);
 		}
 		result_data[row] = true;
 	}
