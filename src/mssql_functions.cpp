@@ -618,7 +618,22 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		// same order table_scan.cpp keeps. Held through the drain below.
 		std::unique_lock<std::mutex> materialize_lock;
 		const bool in_transaction = !context.transaction.IsAutoCommit();
-		if (in_transaction) {
+		// On a pool of one the scans and the sink take turns at the pool exactly
+		// as they take turns on a pinned connection, so this scan materialises
+		// there too. The optimizer sets requires_materialization on that same
+		// flag in autocommit (HasSingleConnectionPool), but it can only set it
+		// on a CATALOG scan's bind data -- a raw scan is counted in the tally
+		// and never flagged, so it must test the pool itself. What matters is
+		// the DRAIN below, not the lock: the lock is uncontended at scan init
+		// anyway, because DuckDB's Pipeline::Reset runs ResetSink before
+		// ResetSource, so a sink taking the same mutex has already let it go.
+		// The connection is what the next statement waits for -- on a pool of
+		// one in autocommit a CTAS loads with INSERT statements that take their
+		// connection at the first batch, and a stream still open holds it until
+		// mssql_acquire_timeout (reviews of #382 and of 7f13a0a).
+		const bool one_connection = mssql_catalog.GetConnectionLimit() <= 1;
+		const bool materialize = in_transaction || one_connection;
+		if (materialize) {
 			materialize_lock = std::unique_lock<std::mutex>(mssql_catalog.MaterializeMutex());
 		}
 		MSSQLQueryExecutor executor(bind_data.context_name);
@@ -672,10 +687,11 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 				"mssql_scan: the statement's result shape changed between bind and execution: bound (%s), got (%s)",
 				TypeListToString(bind_data.return_types), TypeListToString(stream->GetColumnTypes()));
 		}
-		if (in_transaction) {
-			// The stream is on the transaction's ONE pinned connection: drain it now
-			// so the next scan or sink of this catalog finds the connection Idle
-			// (issue #239 / #316).
+		if (materialize) {
+			// The stream is on the ONE connection this statement has to share --
+			// the transaction's pinned one, or the pool's only one -- so drain it
+			// now, so the next scan or sink of this catalog finds it Idle
+			// (issue #239 / #316, issue #380).
 			auto collection = make_uniq<ColumnDataCollection>(context, bind_data.return_types);
 			DataChunk chunk;
 			chunk.Initialize(Allocator::Get(context), bind_data.return_types);
@@ -692,7 +708,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 			stream.reset();
 			result->materialized = std::move(collection);
 			result->materialized->InitializeScan(result->materialized_scan);
-			MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: materialized %llu row(s), pinned connection released",
+			MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: materialized %llu row(s), connection released",
 							   (unsigned long long)total);
 		} else {
 			result->result_stream = std::move(stream);

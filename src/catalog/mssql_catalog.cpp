@@ -531,7 +531,18 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 
 	// T035 (FR-003/Bug 0.2): Check cache BEFORE acquiring connection to reduce connection usage
 	// Fast path: If schemas are already loaded and schema exists in cache, skip connection acquisition
-	if (metadata_cache_->GetSchemasState() == CacheLoadState::LOADED && metadata_cache_->HasSchema(name)) {
+	// Through SchemaListCache, not metadata_cache_ directly (review of #382):
+	// inside a transaction that ran DDL the extension cannot see through, the
+	// shared list still describes committed state and would answer here for a
+	// schema the transaction has since dropped. ScanSchemas already reads the
+	// list this way, and the two must not disagree about which one is
+	// authoritative. With no context, or in autocommit, this IS metadata_cache_.
+	// Bound ONCE for both paths (review of 0e12914): two calls could return
+	// different cache objects if the transaction's IsAllChanged state or the
+	// shared list's load state changed in between, and the miss decision would
+	// then be made against one cache and the load against another.
+	auto &schema_list = SchemaListCache(transaction.context.get());
+	if (schema_list.GetSchemasState() == CacheLoadState::LOADED && schema_list.HasSchema(name)) {
 		auto schema_sp = GetOrCreateSchemaEntryShared(name);
 		if (transaction.context) {
 			MSSQLBindAnchors::For(*transaction.context, *this).AnchorSchema(schema_sp);
@@ -562,7 +573,6 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 	}
 
 	// Trigger lazy loading of schema list (ensure connection released on exception)
-	auto &schema_list = SchemaListCache(transaction.context.get());
 	try {
 		schema_list.EnsureSchemasLoaded(*connection);
 	} catch (...) {

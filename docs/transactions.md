@@ -345,7 +345,7 @@ Inside a transaction:
 | Call | |
 |---|---|
 | `mssql_invalidate_cache()` | allowed — the transaction reloads those names on its pinned connection |
-| `mssql_refresh_cache()`, `mssql_preload_catalog()` | refused — bulk loads into the shared cache; run them after COMMIT |
+| `mssql_refresh_cache()`, `mssql_preload_catalog()` | refused once this transaction has used any MSSQL catalog — bulk loads into the shared cache; run them after COMMIT. Allowed while it has touched none: no pinned connection, nothing uncommitted anywhere. Not narrowed to the one catalog named, because aliases of one database are independent catalogs (review of #382) |
 | `mssql_exec()` DDL (any `mssql_exec_invalidate_cache`) | the rest of the transaction loads metadata on its pinned connection and trusts no shared entry. With the setting `false`, the shared cache itself is left for you to invalidate, as in autocommit |
 
 **What still runs outside the transaction:** catalog DDL (`CREATE TABLE`,

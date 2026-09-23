@@ -61,11 +61,26 @@ public:
 	static void ReleaseConnection(ClientContext &context, MSSQLCatalog &catalog,
 								  std::shared_ptr<tds::TdsConnection> conn);
 
-	//! Check if the context is in an active DuckDB transaction with MSSQL
+	//! Check if the context is in an active DuckDB transaction with MSSQL.
+	//! NOTE: this CREATES the catalog's transaction if the context is in one
+	//! and it does not exist yet -- mssql_exec depends on that, because it
+	//! bypasses the binder path that would otherwise create it. It is therefore
+	//! equivalent to "not autocommit" for any MSSQL catalog, and is NOT the way
+	//! to ask whether a transaction has touched a particular catalog: use
+	//! HasUsedCatalogInTransaction for that (review of 7f13a0a).
 	//! @param context The DuckDB client context
 	//! @param catalog The MSSQL catalog
-	//! @return true if in a DuckDB transaction that has accessed this catalog
+	//! @return true if in an explicit DuckDB transaction
 	static bool IsInTransaction(ClientContext &context, MSSQLCatalog &catalog);
+
+	//! Has an explicit transaction ALREADY touched ANY attached MSSQL catalog?
+	//! Asks without creating anything, so a transaction that has only done
+	//! DuckDB-side work answers false -- it holds no pinned connection and
+	//! nothing uncommitted on any server. Deliberately NOT per-catalog: see the
+	//! implementation for the aliasing hazard that makes that unsafe.
+	//! @param context The DuckDB client context
+	//! @return true only in an explicit transaction that has used MSSQL
+	static bool HasUsedAnyMSSQLCatalogInTransaction(ClientContext &context);
 
 	//! Check if the context has an active SQL Server transaction (BEGIN TRANSACTION sent)
 	//! @param context The DuckDB client context
