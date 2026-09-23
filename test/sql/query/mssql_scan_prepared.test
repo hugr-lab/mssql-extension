@@ -99,6 +99,75 @@ SELECT * FROM mssql_scan('pr75', 'SELECT * FROM dbo.pr75_no_such_table', prepare
 ----
 Invalid object name
 
+# 8. Which bind-time connection failure gets the prepared-scan advice, and
+# which does not. A `prepared := true` scan holds one pooled connection from
+# bind until the bind data dies, so a plan with more of them than
+# mssql_connection_limit allows fails HERE, in the bind, where the pool's
+# "timed out" says nothing about the option that caused it. That case gets the
+# advice. A connection that could not be CREATED must not: the pool renders its
+# exhaustion as `pool 'x' timed out (N active of M, limit L)`, while a dial
+# that times out arrives as "could not create a connection: TCP connect ...
+# Connection timed out" -- matching the bare words sent an unreachable host the
+# advice to raise a limit that was never reached (review of #384).
+
+# --- negative: an unreachable host. 10.255.255.1 is RFC 5737-adjacent private
+# space that does not answer; the dial times out rather than being refused.
+statement ok
+SET mssql_connection_timeout = 2;
+
+statement ok
+ATTACH 'Server=10.255.255.1,1433;Database=master;User Id=sa;Password=x;TrustServerCertificate=yes' AS pr75_dead (TYPE mssql, lazy_validation true, catalog false);
+
+statement error
+SELECT * FROM mssql_scan('pr75_dead', 'SELECT 1 AS x', prepared := true);
+----
+could not create a connection
+
+# The same error must NOT send the user to the connection limit. Anchored at
+# the start: the advice REPLACES this prefix with "mssql_scan: could not
+# acquire a connection for '...' while binding", so a prefix match fails the
+# moment the reclassification goes wrong. (RE2 has no negative lookahead.)
+statement error
+SELECT * FROM mssql_scan('pr75_dead', 'SELECT 1 AS x', prepared := true);
+----
+<REGEX>:^IO Error: MSSQL: Failed to acquire connection: pool 'pr75_dead' could not create a connection.*
+
+statement ok
+DETACH pr75_dead;
+
+statement ok
+RESET mssql_connection_timeout;
+
+# --- positive: two prepared scans of one catalog against a pool of one. The
+# second bind waits for a connection that the first one holds until the
+# statement ends, so it times out inside the pool and the advice applies.
+# The pool takes its limit when the catalog is ATTACHed, so both settings go
+# first; setting them afterwards leaves the pool at the default 64 and the
+# second bind simply succeeds.
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+SET mssql_acquire_timeout = 1;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pr75_one (TYPE mssql);
+
+statement error
+SELECT count(*) FROM mssql_scan('pr75_one', 'SELECT id FROM dbo.pr75_t', prepared := true) a,
+                     mssql_scan('pr75_one', 'SELECT id FROM dbo.pr75_t', prepared := true) b;
+----
+Each prepared scan holds one pooled connection
+
+statement ok
+RESET mssql_acquire_timeout;
+
+statement ok
+RESET mssql_connection_limit;
+
+statement ok
+DETACH pr75_one;
+
 statement ok
 SELECT mssql_exec('pr75', 'DROP TABLE dbo.pr75_t; DROP TABLE dbo.pr75_side');
 

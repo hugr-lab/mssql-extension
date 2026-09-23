@@ -558,9 +558,12 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 				"MSSQL COPY: column '%s' of table '%s' has type %s, which the bulk-load wire cannot "
 				"carry — its wire form is SQL Server's own, not the bytes a DuckDB value holds. "
 				"Use INSERT for this table, or leave the column out of the source. A literal, "
-				"uncast `NULL AS %s` is also accepted and leaves the column NULL — but a TYPED "
-				"null is not: `CAST(NULL AS VARCHAR) AS %s`, or an all-NULL column read from a "
-				"table or a file, carries a type and lands here with everything else.",
+				"uncast `NULL AS %s` is also accepted — the column is then dropped from the load "
+				"exactly like an omitted one and the SERVER fills it: with NULL, with its DEFAULT, "
+				"or with a generated value for a rowversion, and a NOT NULL column without a "
+				"default fails there — but a TYPED null is not: `CAST(NULL AS VARCHAR) AS %s`, or "
+				"an all-NULL column read from a table or a file, carries a type and lands here "
+				"with everything else.",
 				col.name, bdata.target.GetFullyQualifiedName(), col.server_type_name, col.name, col.name);
 		}
 

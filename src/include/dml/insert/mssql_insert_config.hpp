@@ -133,9 +133,15 @@ struct MSSQLInsertColumn {
 		: max_length(0), is_identity(false), is_nullable(true), has_default(false), precision(0), scale(0) {}
 
 	// Full constructor
+	// max_length has NO default on purpose: 0 is not a safe length. For a
+	// char/varchar column under a non-UTF-8 collation BuildReadExpression asks
+	// NVarcharLength for the OUTPUT cast, and 0 renders `CAST([c] AS
+	// NVARCHAR(0))`, which SQL Server rejects with what reads like a syntax or
+	// collation error. sys.columns spells MAX as -1; a caller that has no
+	// length for a non-string column can pass 0, deliberately.
 	MSSQLInsertColumn(const string &name, LogicalType duckdb_type, const string &mssql_type, bool is_identity,
 					  bool is_nullable, bool has_default, const string &collation, uint8_t precision, uint8_t scale,
-					  int16_t max_length = 0)
+					  int16_t max_length)
 		: name(name),
 		  duckdb_type(std::move(duckdb_type)),
 		  mssql_type(mssql_type),

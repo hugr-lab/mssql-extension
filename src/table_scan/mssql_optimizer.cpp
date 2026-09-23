@@ -690,7 +690,7 @@ struct MSSQLCatalogScanTally {
 	idx_t raw_scans = 0;
 };
 
-static void CollectCatalogScans(LogicalOperator &op, std::map<string, MSSQLCatalogScanTally> &by_catalog) {
+static void CollectCatalogScans(LogicalOperator &op, case_insensitive_map_t<MSSQLCatalogScanTally> &by_catalog) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
 		// static_cast, not dynamic_cast: this repo keeps RTTI off the planning path
@@ -774,7 +774,21 @@ static void MaterializeSharedConnectionScans(ClientContext &context, LogicalOper
 	// (HasSingleConnectionPool). The transaction test is the same one the DML
 	// executors use to decide whether they are on a pinned connection.
 	const bool autocommit = context.transaction.IsAutoCommit();
-	std::map<string, MSSQLCatalogScanTally> by_catalog;
+	// Case-insensitive, like sink_catalogs below and like DuckDB's own catalog
+	// lookup: the two producers of this key spell it differently. A catalog
+	// scan is keyed by MSSQLCatalog::GetContextName() (the alias as ATTACHed),
+	// a raw mssql_scan by the user's literal first argument. Keyed by case,
+	// `FROM mssql_scan('SK75', ...) x, sk75.dbo.t y` tallied as two catalogs of
+	// one scan each, and neither reached `scans < 2`. Measured both ways, that
+	// split does not currently produce the #239 collision: a raw scan
+	// materialises at InitGlobal unconditionally inside a transaction (spec
+	// 075), so the two never hold the connection at once. This is a
+	// consistency fix -- the key must agree with DuckDB's case-insensitive
+	// catalog names, as sink_catalogs below already does -- and the test in
+	// test/sql/transaction says the same in its header. The has_sink lookup
+	// had the same split. HasSingleConnectionPool looks the key up through
+	// DuckDB's case-insensitive catalog lookup, so either spelling finds it.
+	case_insensitive_map_t<MSSQLCatalogScanTally> by_catalog;
 	CollectCatalogScans(plan, by_catalog);
 	if (by_catalog.empty()) {
 		return;
