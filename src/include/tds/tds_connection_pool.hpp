@@ -121,6 +121,12 @@ public:
 	//! `failure` is given, handed back.
 	size_t Prewarm(size_t target, std::string *failure = nullptr);
 
+	//! Issue #324: take a connection logged in elsewhere -- the one ATTACH's
+	//! validation opened with the factory's own parameters -- as an idle
+	//! connection of this pool. Returns false (and closes it) when the pool is
+	//! full, shut down, or the connection is not Idle.
+	bool Adopt(std::shared_ptr<TdsConnection> conn);
+
 	// Get current pool statistics
 	PoolStatistics GetStats() const;
 

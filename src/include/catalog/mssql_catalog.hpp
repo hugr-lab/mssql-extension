@@ -140,6 +140,12 @@ public:
 	void SetPrewarmOnInitialize(bool prewarm) {
 		prewarm_on_initialize_ = prewarm;
 	}
+	//! Issue #324: the connection ATTACH's eager validation logged in, handed
+	//! to the pool by Initialize instead of being closed -- one login less per
+	//! ATTACH. Null under lazy_validation.
+	void AdoptOnInitialize(std::shared_ptr<tds::TdsConnection> connection) {
+		adopt_on_initialize_ = std::move(connection);
+	}
 	//! Issue #324: the `preload` ATTACH option -- mssql_preload_catalog(name)
 	//! run by the ATTACH itself, where DuckLake's METADATA_PARAMETERS can reach
 	//! it and a function call cannot. Throws on failure: it was asked for.
@@ -439,6 +445,7 @@ private:
 	std::vector<uint8_t> fedauth_token_utf16le_;	   // FEDAUTH token (spec 047)
 	AccessMode access_mode_;						   // READ_ONLY enforced
 	bool prewarm_on_initialize_ = false;
+	std::shared_ptr<tds::TdsConnection> adopt_on_initialize_;
 	bool catalog_enabled_;				 // Catalog integration enabled
 	MSSQLCatalogFilter catalog_filter_;	 // Regex visibility filter
 	// Connection pool (per-catalog, spec 047). shared_ptr, but the catalog holds

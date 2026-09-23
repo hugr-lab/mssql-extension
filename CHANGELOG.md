@@ -14,10 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`mssql_min_connections` did not open anything.** It only kept idle
     connections from being closed. The pool now opens that many connections
     at ATTACH, with their logins running concurrently.
-  - **Measured on a local server:** a plain ATTACH takes 0.40 s for one
-    connection (validation plus pool); `min_connections 4` takes 0.54 s for
-    four and `min_connections 8` takes 0.63 s for eight. One after another,
-    four would cost about a second.
+  - **ATTACH's validation connection is no longer thrown away.** The
+    connection ATTACH logs in to check the credentials now becomes the pool's
+    first connection, instead of being closed and logged in again. A plain
+    ATTACH is one login, not two.
+  - **Measured on a local server:**
+
+    | ATTACH | before | after |
+    |---|---|---|
+    | plain | 0.40 s | 0.20 s |
+    | `min_connections 4` | 0.54 s | 0.39 s |
+    | `min_connections 8` | 0.63 s | 0.54 s |
+
+    Opened one after another, four connections would cost about a second.
   - **Nothing opened under `lazy_validation`.**
   - **New ATTACH options:**
     - `min_connections` is the ATTACH form of the setting.

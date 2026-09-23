@@ -401,6 +401,28 @@ void ConnectionPool::Release(std::shared_ptr<TdsConnection> conn) {
 	available_cv_.notify_one();
 }
 
+bool ConnectionPool::Adopt(std::shared_ptr<TdsConnection> conn) {
+	if (!conn) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(pool_mutex_);
+	if (shutdown_flag_.load() || stats_.total_connections >= config_.connection_limit ||
+		conn->GetState() != ConnectionState::Idle || !conn->IsAlive()) {
+		conn->Close();
+		return false;
+	}
+	ConnectionMetadata meta;
+	meta.connection = std::move(conn);
+	meta.connection_id = next_connection_id_++;
+	meta.last_released = std::chrono::steady_clock::now();
+	idle_connections_.push(std::move(meta));
+	stats_.idle_connections++;
+	stats_.total_connections++;
+	stats_.connections_created++;
+	available_cv_.notify_one();
+	return true;
+}
+
 size_t ConnectionPool::Prewarm(size_t target, std::string *failure) {
 	if (shutdown_flag_.load()) {
 		return 0;

@@ -365,6 +365,13 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 	// Until then the setting only kept connections from being closed as idle;
 	// it never opened one. A failure is not the ATTACH's: the eager validation
 	// has already proved the login, and the pool opens the rest on demand.
+	//
+	// The validation's connection goes in first: it is already logged in with
+	// the factory's parameters, so it is the pool's first connection and the
+	// prewarm opens only the rest.
+	if (adopt_on_initialize_) {
+		connection_pool_->Adopt(std::move(adopt_on_initialize_));
+	}
 	if (prewarm_on_initialize_ && pool_config_.min_connections > 0) {
 		connection_pool_->Prewarm(pool_config_.min_connections);
 	}

@@ -1160,7 +1160,8 @@ string MSSQLTranslateConnectionError(const string &error, const string &host, ui
 // Azure AD Connection Validation
 //===----------------------------------------------------------------------===//
 
-void ValidateAzureConnection(ClientContext &context, MSSQLConnectionInfo &info, int timeout_seconds) {
+std::shared_ptr<tds::TdsConnection> ValidateAzureConnection(ClientContext &context, MSSQLConnectionInfo &info,
+															int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(
 		1, "ValidateAzureConnection: host=%s port=%d database=%s azure_secret=%s encrypt=%s timeout=%ds",
 		info.host.c_str(), info.port, info.database.c_str(), info.azure_secret_name.c_str(),
@@ -1184,7 +1185,9 @@ void ValidateAzureConnection(ClientContext &context, MSSQLConnectionInfo &info, 
 							fedauth_data.token_utf16le.size());
 
 	// Create a temporary connection to test Azure AD credentials
-	tds::TdsConnection conn;
+	// Issue #324: kept, not closed -- the pool adopts it (MSSQLCatalog::AdoptConnection).
+	auto conn_holder = std::make_shared<tds::TdsConnection>();
+	auto &conn = *conn_holder;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
 	conn.SetRequestUtf8Support(info.utf8_support);
 	conn.SetTlsOptions(info.GetTlsOptions());
@@ -1244,22 +1247,29 @@ void ValidateAzureConnection(ClientContext &context, MSSQLConnectionInfo &info, 
 		}
 	}
 
-	conn.Close();
+	// Handed to the pool rather than closed (issue #324): it is logged in with
+	// the same parameters the pool factory uses, so the ATTACH's first pooled
+	// connection costs no second login.
+	auto validated = conn_holder;
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: validation complete");
+	return validated;
 }
 
 //===----------------------------------------------------------------------===//
 // Manual Token Connection Validation (Spec 032)
 //===----------------------------------------------------------------------===//
 
-void ValidateManualTokenConnection(MSSQLConnectionInfo &info, const std::vector<uint8_t> &token_utf16le,
-								   int timeout_seconds) {
+std::shared_ptr<tds::TdsConnection> ValidateManualTokenConnection(MSSQLConnectionInfo &info,
+																  const std::vector<uint8_t> &token_utf16le,
+																  int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: host=%s port=%d database=%s encrypt=%s timeout=%ds",
 							info.host.c_str(), info.port, info.database.c_str(), info.use_encrypt ? "yes" : "no",
 							timeout_seconds);
 
 	// Create a temporary connection to test the pre-provided token
-	tds::TdsConnection conn;
+	// Issue #324: kept, not closed -- the pool adopts it (MSSQLCatalog::AdoptConnection).
+	auto conn_holder = std::make_shared<tds::TdsConnection>();
+	auto &conn = *conn_holder;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
 	conn.SetRequestUtf8Support(info.utf8_support);
 	conn.SetTlsOptions(info.GetTlsOptions());
@@ -1315,17 +1325,23 @@ void ValidateManualTokenConnection(MSSQLConnectionInfo &info, const std::vector<
 		}
 	}
 
-	conn.Close();
+	// Handed to the pool rather than closed (issue #324): it is logged in with
+	// the same parameters the pool factory uses, so the ATTACH's first pooled
+	// connection costs no second login.
+	auto validated = conn_holder;
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation complete");
+	return validated;
 }
 
-void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
+std::shared_ptr<tds::TdsConnection> ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: host=%s port=%d user=%s database=%s encrypt=%s timeout=%ds",
 							info.host.c_str(), info.port, info.user.c_str(), info.database.c_str(),
 							info.use_encrypt ? "yes" : "no", timeout_seconds);
 
 	// Create a temporary connection to test credentials
-	tds::TdsConnection conn;
+	// Issue #324: kept, not closed -- the pool adopts it (MSSQLCatalog::AdoptConnection).
+	auto conn_holder = std::make_shared<tds::TdsConnection>();
+	auto &conn = *conn_holder;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
 	conn.SetRequestUtf8Support(info.utf8_support);
 	conn.SetTlsOptions(info.GetTlsOptions());
@@ -1393,9 +1409,12 @@ void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 		}
 	}
 
-	// Close the test connection - it will be recreated by the pool
-	conn.Close();
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: validation complete, test connection closed");
+	// Handed to the pool rather than closed (issue #324): it is logged in with
+	// the same parameters the pool factory uses, so the ATTACH's first pooled
+	// connection costs no second login.
+	auto validated = conn_holder;
+	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: validation complete, connection kept for the pool");
+	return validated;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1406,12 +1425,14 @@ void ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 // Surfaces credential / SPN / clock-skew / KDC-reachability errors at ATTACH
 // instead of at first query.
 //===----------------------------------------------------------------------===//
-void ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
+std::shared_ptr<tds::TdsConnection> ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateIntegratedAuthConnection: host=%s port=%d db=%s method=%d timeout=%ds",
 							info.host.c_str(), info.port, info.database.c_str(), static_cast<int>(info.auth_method),
 							timeout_seconds);
 
-	tds::TdsConnection conn;
+	// Issue #324: kept, not closed -- the pool adopts it (MSSQLCatalog::AdoptConnection).
+	auto conn_holder = std::make_shared<tds::TdsConnection>();
+	auto &conn = *conn_holder;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
 	conn.SetRequestUtf8Support(info.utf8_support);
 	conn.SetTlsOptions(info.GetTlsOptions());
@@ -1477,8 +1498,12 @@ void ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_sec
 	}
 	info.utf8_support_acked = conn.UTF8SupportAcked() ? 1 : 0;
 
-	conn.Close();
+	// Handed to the pool rather than closed (issue #324): it is logged in with
+	// the same parameters the pool factory uses, so the ATTACH's first pooled
+	// connection costs no second login.
+	auto validated = conn_holder;
 	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateIntegratedAuthConnection: success");
+	return validated;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1811,6 +1836,9 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 							lazy_validation ? "true" : "false", attach_validation_timeout);
 
 	std::vector<uint8_t> fedauth_token_utf16le;
+	// The connection the eager validation logged in; the pool adopts it (issue
+	// #324). Null under lazy_validation.
+	std::shared_ptr<tds::TdsConnection> validated_connection;
 	if (!connection_info->access_token.empty()) {
 		// Spec 032: Manual token authentication - validate token format and audience at ATTACH time
 		MSSQL_STORAGE_DEBUG_LOG(
@@ -1832,7 +1860,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		fedauth_token_utf16le = auth_strategy->GetFedAuthToken(dummy_info);
 
 		if (!lazy_validation) {
-			ValidateManualTokenConnection(*connection_info, fedauth_token_utf16le, attach_validation_timeout);
+			validated_connection =
+				ValidateManualTokenConnection(*connection_info, fedauth_token_utf16le, attach_validation_timeout);
 		}
 	} else if (connection_info->use_azure_auth) {
 		// Validate FEDAUTH connections at ATTACH time (fail-fast).
@@ -1842,7 +1871,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			1, "Azure auth: %s at ATTACH time",
 			lazy_validation ? "skipping network validation (lazy_validation=true)" : "validating connection");
 		if (!lazy_validation) {
-			ValidateAzureConnection(context, *connection_info, attach_validation_timeout);
+			validated_connection = ValidateAzureConnection(context, *connection_info, attach_validation_timeout);
 		}
 		// Build FEDAUTH token for pool factory (uses validated credentials when
 		// not lazy; on lazy path the token still has to exist for pool fills).
@@ -1857,10 +1886,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			1, "Integrated Auth: %s at ATTACH time",
 			lazy_validation ? "skipping network validation (lazy_validation=true)" : "validating connection");
 		if (!lazy_validation) {
-			ValidateIntegratedAuthConnection(*connection_info, attach_validation_timeout);
+			validated_connection = ValidateIntegratedAuthConnection(*connection_info, attach_validation_timeout);
 		}
 	} else if (!lazy_validation) {
-		ValidateConnection(*connection_info, attach_validation_timeout);
+		validated_connection = ValidateConnection(*connection_info, attach_validation_timeout);
 	}
 
 	// Spec 047: translate MSSQL pool config (DuckDB settings layer) to the
@@ -1898,6 +1927,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// Issue #324: open mssql_min_connections at ATTACH, concurrently -- unless
 	// the ATTACH asked not to touch the server yet.
 	catalog->SetPrewarmOnInitialize(!lazy_validation);
+	catalog->AdoptOnInitialize(std::move(validated_connection));
 	catalog->Initialize(false);
 	catalog->CheckTransactionIsolation();
 	if (preload_option) {
