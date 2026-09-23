@@ -314,7 +314,14 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 	// this catalog and this sink take turns at the only connection. The init
 	// uses it for the target checks and the DDL and gives it back; the bulk load
 	// takes it on its first chunk, after the source has been materialised.
-	const bool defer_connection = !gstate->transaction_pinned && mssql_catalog.GetConnectionLimit() <= 1;
+	// Not for a temp target: a `#` / `##` table lives in the session that created
+	// it, and a connection given back to the pool is reset before its next use
+	// (mssql_reset_connection), which would drop the table the init just created
+	// before the load reached it. A temp target keeps the connection from init to
+	// the end of the load, as on any pool; outliving the statement is what a
+	// transaction is for.
+	const bool defer_connection =
+		!gstate->transaction_pinned && mssql_catalog.GetConnectionLimit() <= 1 && !bdata.target.IsTempTable();
 
 	// Spec 075 W3: inside a transaction the source scans of this catalog drain
 	// under the catalog's MaterializeMutex, and DuckDB initialises this sink on

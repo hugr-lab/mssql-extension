@@ -12,8 +12,10 @@ namespace mssql {
 //! (#380). Over-detection costs a metadata reload -- inside a transaction the
 //! whole transaction's cache, so it has to be tight (review of #382);
 //! under-detection leaves the cache stale, so every form that CAN change
-//! schema counts: CREATE, DROP, ALTER, TRUNCATE, sp_rename, and EXEC / EXECUTE
-//! (a procedure may run DDL).
+//! schema counts: CREATE, DROP, ALTER, TRUNCATE, sp_rename, EXEC / EXECUTE (a
+//! procedure may run DDL), and sp_executesql, which a batch may call without
+//! EXEC as its first statement -- dynamic SQL whose text is a literal this
+//! scan skips.
 //!
 //! A keyword counts only as a whole word OUTSIDE string literals (`'…'`,
 //! `N'…'`), delimited identifiers (`[…]`, `"…"`) and comments (`-- …`,
@@ -23,7 +25,8 @@ namespace mssql {
 //!
 //! Self-contained (standard library only): unit-tested without DuckDB.
 inline bool SqlMayChangeSchema(const std::string &sql) {
-	static const char *const KEYWORDS[] = {"CREATE", "DROP", "ALTER", "TRUNCATE", "EXEC", "EXECUTE", "SP_RENAME"};
+	static const char *const KEYWORDS[] = {"CREATE", "DROP",	"ALTER",	 "TRUNCATE",
+										   "EXEC",	 "EXECUTE", "SP_RENAME", "SP_EXECUTESQL"};
 	const size_t n = sql.size();
 	size_t i = 0;
 	while (i < n) {

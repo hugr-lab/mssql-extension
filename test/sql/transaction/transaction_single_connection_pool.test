@@ -212,6 +212,15 @@ INSERT INTO one380.dbo.one380_ac_ins SELECT * FROM mssql_scan('one380', 'SELECT 
 ----
 10
 
+# A COPY into a #temp target keeps its connection from init to the end of the
+# load, as it does on any pool: given back to the pool between the DDL and the
+# load, the connection would be reset first, and the reset drops the table the
+# init created (self-review of #388). After the statement the table goes with
+# the next reset, as on a larger pool; a #temp meant to outlive the COPY is
+# loaded inside a transaction, whose pinned connection is not reset.
+statement ok
+COPY (SELECT i::INTEGER AS id FROM range(100) t(i)) TO 'mssql://one380/#one380_tmp' (FORMAT 'bcp', CREATE_TABLE true);
+
 # A CTAS from a local source keeps its bulk load on a pool of one (it used to
 # be turned into INSERT statements for nothing).
 query I

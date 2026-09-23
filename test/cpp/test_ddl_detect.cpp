@@ -36,6 +36,9 @@ int main() {
 	Expect("sp_rename 'a', 'b'", true);
 	Expect("INSERT INTO t VALUES (1); CREATE INDEX ix ON t(c)", true);
 	Expect("/* setup */ CREATE TABLE t (id int)", true);
+	// Dynamic SQL called without EXEC as a batch's first statement: its DDL is
+	// inside a literal, so the call itself has to count.
+	Expect("sp_executesql N'DROP TABLE t'", true);
 
 	// Not DDL: the keyword is inside something else.
 	Expect("UPDATE dbo.Orders SET status = 'created'", false);
