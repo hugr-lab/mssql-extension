@@ -249,18 +249,17 @@ bool CTASExecutionState::SchemaExists(ClientContext &context) {
 void CTASExecutionState::ResolveConnectionMode(ClientContext &context, idx_t connection_limit) {
 	in_transaction = !context.transaction.IsAutoCommit();
 	single_connection = in_transaction && connection_limit <= 1;
-	if (connection_limit <= 1) {
-		// A bulk-load session takes its connection HERE, before the source scan
-		// initialises, and keeps it for the whole load: on a pool of one a scan
-		// of this catalog would then wait for it until mssql_acquire_timeout.
-		// Statements take theirs at the first batch, after the optimizer has
-		// materialised that scan and given the connection back.
-		DebugLog(1, "Pool of %llu connection(s): INSERT statements instead of a bulk load",
-				 (unsigned long long)connection_limit);
-		config.use_bcp = false;
-	}
+	// A pool of one connection in autocommit keeps the bulk load (review of
+	// #382, which found turning it off cost a local-source CTAS its 2-10x for
+	// nothing): the session takes its connection on the FIRST chunk instead of
+	// at init, when the source scan of this catalog -- if there is one -- has
+	// been materialised and has given the connection back.
+	defer_bcp_connection = !in_transaction && connection_limit <= 1;
 	if (single_connection) {
 		DebugLog(1, "Single-connection mode: checks, DDL and rows on the transaction's pinned connection");
+		// A bulk load and the source scan cannot share the pinned connection;
+		// statements can, once the optimizer has materialised that scan.
+		config.use_bcp = false;
 		// The CREATE is inside the transaction: ROLLBACK is the complete undo,
 		// and a cleanup DROP would wait for a pool connection that is pinned.
 		config.drop_on_failure = false;
@@ -603,13 +602,6 @@ void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 	// The undo for a table this statement CREATED is dropping it, which is
 	// complete — it did not exist before the statement — and needs no shared
 	// transaction. That is what mssql_ctas_drop_on_failure does.
-	auto &pool = catalog->GetConnectionPool();
-	std::string why;
-	auto connection = pool.Acquire(-1, &why);
-	if (!connection) {
-		throw IOException("CTAS BCP: Failed to acquire connection from pool: " + why);
-	}
-
 	// Built once here, after the TABLOCK decision above: every batch boundary
 	// and every parallel writer re-executes exactly this text.
 	insert_bulk_sql = BuildInsertBulkSql();
@@ -617,20 +609,35 @@ void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 
 	// The session adopts the connection; INSERT BULK and COLMETADATA go down it
 	// on the first chunk, not here (the same deferral COPY runs — spec 075 W3).
-	BulkLoadSessionParams params;
-	params.pool_handle = pool_handle;
-	params.insert_bulk_sql = &insert_bulk_sql;
-	params.target = &bcp_target;
-	params.columns = &bcp_columns;
-	params.flush_rows = config.bcp_flush_rows;
-	params.collect_timings = mssql::CountersEnabled();
-	params.reset_on_release = reset_on_release;
-	bcp_session.Adopt(std::move(connection), params, /*transaction_pinned=*/false);
+	bcp_params.pool_handle = pool_handle;
+	bcp_params.insert_bulk_sql = &insert_bulk_sql;
+	bcp_params.target = &bcp_target;
+	bcp_params.columns = &bcp_columns;
+	bcp_params.flush_rows = config.bcp_flush_rows;
+	bcp_params.collect_timings = mssql::CountersEnabled();
+	bcp_params.reset_on_release = reset_on_release;
+	if (defer_bcp_connection) {
+		// A pool of one: the connection is taken on the first chunk (see
+		// ResolveConnectionMode).
+		bcp_session.DeferAdoption(bcp_params);
+		DebugLog(1, "BCP session deferred: the connection is taken on the first chunk (pool of one)");
+		return;
+	}
+	auto &pool = catalog->GetConnectionPool();
+	std::string why;
+	auto connection = pool.Acquire(-1, &why);
+	if (!connection) {
+		throw IOException("CTAS BCP: Failed to acquire connection from pool: " + why);
+	}
+	bcp_session.Adopt(std::move(connection), bcp_params, /*transaction_pinned=*/false);
 
 	DebugLog(1, "BCP session ready, the stream opens on the first chunk");
 }
 
 void CTASExecutionState::AddChunkBCP(ClientContext &context, DataChunk &chunk) {
+	if (bcp_session.IsDeferred()) {
+		bcp_session.AdoptDeferred();
+	}
 	if (!bcp_session.IsOwned()) {
 		throw InternalException("CTAS BCP: bulk-load session not initialized");
 	}

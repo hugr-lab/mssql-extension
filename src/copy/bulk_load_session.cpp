@@ -1,4 +1,6 @@
 #include "copy/bulk_load_session.hpp"
+#include <cstdio>
+#include <cstdlib>
 
 #include <chrono>
 
@@ -6,6 +8,22 @@
 #include "copy/bcp_config.hpp"
 #include "duckdb/common/exception.hpp"
 #include "query/mssql_simple_query.hpp"
+
+// House debug pattern: a static level read from MSSQL_DEBUG.
+static int GetBulkLoadDebugLevel() {
+	static const int level = []() {
+		const char *env = std::getenv("MSSQL_DEBUG");
+		return env ? std::atoi(env) : 0;
+	}();
+	return level;
+}
+
+#define BULK_LOAD_LOG(fmt, ...)                                       \
+	do {                                                              \
+		if (GetBulkLoadDebugLevel() >= 1) {                           \
+			fprintf(stderr, "[MSSQL BULK] " fmt "\n", ##__VA_ARGS__); \
+		}                                                             \
+	} while (0)
 
 namespace duckdb {
 namespace mssql {
@@ -144,11 +162,19 @@ BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &pa
 		// or none -- and the thread shares the global writer meanwhile. Waiting
 		// out mssql_acquire_timeout for a connection the statement itself holds
 		// (the pinned one, or the source scan's) stalled a CTAS 30 s.
-		conn = params.pool->TryAcquire();
+		std::string why;
+		bool creation_failed = false;
+		conn = params.pool->TryAcquire(&why, &creation_failed);
 		if (!conn) {
-			// Nothing free right now: give the slot back and let the caller ask
-			// again on a later chunk.
 			slots_used.fetch_sub(1);
+			if (creation_failed) {
+				// A login the server refuses does not clear on the next chunk:
+				// stop asking, as before TryAcquire (review of #382) -- else the
+				// thread re-dials on every backoff window for the whole load.
+				BULK_LOAD_LOG("extra writer not started, the pool could not create a connection: %s", why.c_str());
+				return Claim::Unavailable;
+			}
+			// Nothing free right now: let the caller ask again on a later chunk.
 			return Claim::Busy;
 		}
 		if (conn->GetState() != tds::ConnectionState::Idle) {
@@ -329,6 +355,22 @@ void BulkLoadSession::Commit() {
 
 void BulkLoadSession::Release() {
 	ReleaseConnection();
+}
+
+void BulkLoadSession::AdoptDeferred() {
+	if (!deferred_params_ || writer_) {
+		return;
+	}
+	auto pool = deferred_params_->pool_handle.lock();
+	if (!pool) {
+		throw IOException("bulk load: the catalog's connection pool is gone");
+	}
+	std::string why;
+	auto connection = pool->Acquire(-1, &why);
+	if (!connection) {
+		throw IOException("bulk load: could not acquire a connection: %s", why);
+	}
+	Adopt(std::move(connection), *deferred_params_, /*transaction_pinned=*/false);
 }
 
 idx_t BulkLoadSession::Finish() {

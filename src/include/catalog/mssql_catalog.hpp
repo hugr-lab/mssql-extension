@@ -119,6 +119,12 @@ public:
 	//! MSSQLTransactionMetadata::MarkChangedLocally for the current transaction;
 	//! a no-op in autocommit.
 	void NoteTransactionChangeLocally(ClientContext &context);
+	//! Whether the current DuckDB transaction has opened a SERVER transaction on
+	//! this catalog -- a pinned connection that may hold uncommitted state. False
+	//! in autocommit and for a DuckDB transaction that never touched this
+	//! catalog. Never creates the catalog's transaction (review of #382: the
+	//! refresh/preload refusal fired for unrelated DuckDB transactions).
+	bool HasOpenServerTransaction(ClientContext &context);
 
 	//! The pool's connection limit, fixed at ATTACH.
 	idx_t GetConnectionLimit() const;

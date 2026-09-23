@@ -381,7 +381,8 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 
 	// Execute data transfer using BCP or INSERT mode (Spec 027)
 	try {
-		if (gstate.state.config.use_bcp && gstate.state.bcp_session.IsOwned()) {
+		if (gstate.state.config.use_bcp &&
+			(gstate.state.bcp_session.IsOwned() || gstate.state.bcp_session.IsDeferred())) {
 			// BCP mode: delegate to AddChunkBCP
 			const uint64_t encode_before = gstate.state.counter_encode_ns;
 			const uint64_t flush_before = gstate.state.counter_flush_ns;

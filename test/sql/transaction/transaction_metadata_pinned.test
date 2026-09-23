@@ -107,7 +107,7 @@ SELECT id, v FROM tm380.dbo.tm380_exec ORDER BY id;
 statement error
 SELECT mssql_refresh_cache('tm380');
 ----
-cannot run inside a transaction
+cannot run inside a transaction that has used catalog 'tm380'
 
 statement ok
 ROLLBACK;
@@ -118,16 +118,64 @@ SELECT count(*) FROM tm380.dbo.tm380_exec;
 ----
 does not exist
 
+# A DuckDB transaction that has not used the catalog has nothing uncommitted
+# on it: preload runs (review of #382 -- the refusal used to fire for any open
+# DuckDB transaction).
 statement ok
 BEGIN;
+
+statement ok
+SELECT mssql_preload_catalog('tm380');
+
+# Once the transaction has used the catalog, it is refused.
+query I
+SELECT count(*) FROM tm380.dbo.tm380_drop;
+----
+0
 
 statement error
 SELECT mssql_preload_catalog('tm380');
 ----
-cannot run inside a transaction
+cannot run inside a transaction that has used catalog 'tm380'
 
 statement ok
 ROLLBACK;
+
+# mssql_exec DDL detection is word-based (review of #382): a keyword inside a
+# literal is not DDL, so it does not make the transaction distrust the shared
+# cache. The table is in the shared cache (read above in autocommit); the lever
+# is on before BEGIN, so the transaction's own cache is created with it; a
+# read that stayed on the shared entry runs no metadata query, and one that the
+# old substring match sent to the server fails.
+query I
+SELECT count(*) FROM tm380.dbo.tm380_drop;
+----
+0
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM tm380.dbo.tm380_drop;
+----
+0
+
+statement ok
+SELECT mssql_exec('tm380', 'UPDATE dbo.tm380_drop SET id = id WHERE ''created'' = ''dropped''');
+
+query I
+SELECT count(*) FROM tm380.dbo.tm380_drop;
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
 
 #------------------------------------------------------------------------------
 # COMMIT publishes: the shared cache forgets what the transaction changed, and

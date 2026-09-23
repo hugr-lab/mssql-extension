@@ -3,6 +3,7 @@
 #include <cctype>
 #include "catalog/mssql_transaction.hpp"
 #include "codec/target_string_type.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 #include "azure/azure_fedauth.hpp"
 #include "azure/azure_token.hpp"
@@ -531,7 +532,12 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 
 	// T035 (FR-003/Bug 0.2): Check cache BEFORE acquiring connection to reduce connection usage
 	// Fast path: If schemas are already loaded and schema exists in cache, skip connection acquisition
-	if (metadata_cache_->GetSchemasState() == CacheLoadState::LOADED && metadata_cache_->HasSchema(name)) {
+	// Through SchemaListCache like the load below and ScanSchemas (review of
+	// #382): inside a transaction that changed "anything" the shared list is not
+	// the authority, and a hit on it would return a schema the transaction may
+	// have dropped.
+	auto &fast_list = SchemaListCache(transaction.context.get());
+	if (fast_list.GetSchemasState() == CacheLoadState::LOADED && fast_list.HasSchema(name)) {
 		auto schema_sp = GetOrCreateSchemaEntryShared(name);
 		if (transaction.context) {
 			MSSQLBindAnchors::For(*transaction.context, *this).AnchorSchema(schema_sp);
@@ -1495,6 +1501,17 @@ void MSSQLCatalog::NoteTransactionChange(ClientContext &context, const string &s
 		return;
 	}
 	MSSQLTransaction::Get(context, *this).Metadata(context).MarkChanged(schema, table);
+}
+
+bool MSSQLCatalog::HasOpenServerTransaction(ClientContext &context) {
+	if (context.transaction.IsAutoCommit()) {
+		return false;
+	}
+	auto transaction = MetaTransaction::Get(context).TryGetTransaction(GetAttached());
+	if (!transaction) {
+		return false;
+	}
+	return transaction->Cast<MSSQLTransaction>().HasPinnedConnection();
 }
 
 void MSSQLCatalog::NoteTransactionChangeLocally(ClientContext &context) {

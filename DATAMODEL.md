@@ -506,7 +506,9 @@ transaction the catalog:
   autocommit.
 
 `mssql_refresh_cache()` and `mssql_preload_catalog()` are **refused** inside a
-transaction: both are bulk writes into the shared layers. `mssql_invalidate_cache()`
+transaction that has opened a server transaction on the catalog
+(`MSSQLCatalog::HasOpenServerTransaction`; any open DuckDB transaction until the
+review of #382): both are bulk writes into the shared layers. `mssql_invalidate_cache()`
 is allowed.
 
 ```mermaid
@@ -768,12 +770,24 @@ Two exceptions, both from issue #380. A CTAS inside a transaction runs its
 existence checks on the **pinned** connection whatever the pool size — a pool
 connection waits on the schema lock of a table the transaction created. And on a
 pool of **one** connection there is no second connection for the DDL or a bulk
-load to take, so in a transaction the whole CTAS runs on the pinned one (and
-ROLLBACK undoes it), and in either mode its rows go as INSERT statements: a bulk
-load holds its connection from init, before the source scan runs, while statements
-take theirs at the first batch, after the optimizer has materialised a scan of the
-same catalog. The optimizer counts a CTAS as a sink like COPY and INSERT, and on a
-pool of one it materialises in autocommit too.
+load to take, so in a transaction the whole CTAS runs on the pinned one, with its
+rows as INSERT statements, and ROLLBACK undoes it.
+
+In autocommit on a pool of one, the statement takes turns with its source at the
+one connection:
+- **Source scans.** The optimizer counts a CTAS as a sink like COPY and INSERT,
+  and materialises the catalog scans of a catalog the plan sinks into. A raw
+  `mssql_scan` of that catalog materialises at init the same way.
+- **The bulk load keeps BCP.** COPY's and CTAS's bulk-load session takes its
+  connection on its first chunk (`BulkLoadSession::DeferAdoption` /
+  `AdoptDeferred`), not at init: by the first chunk the source has been drained
+  and has given the connection back.
+- **COPY's init** takes `MaterializeMutex` before its connection, so it never
+  waits on a draining scan for the acquire timeout.
+
+(Review of #382. The first cut turned CTAS's bulk load into statements instead,
+which cost a local-source CTAS its speed for nothing, and missed COPY and raw
+scans entirely.)
 
 ### Writers
 

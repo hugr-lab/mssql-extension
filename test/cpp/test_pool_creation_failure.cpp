@@ -242,6 +242,40 @@ static void TestTryAcquireDoesNotCountATimeout() {
 	}
 }
 
+//! TryAcquire's two nulls (review of #382): a pool with nothing free is
+//! transient, a creation the factory refuses is not -- an extra writer that
+//! read the second as the first re-dialled on every backoff window.
+static void TestTryAcquireTellsCreationFailureFromBusy() {
+	int calls = 0;
+	ConnectionPool pool("try2", SmallPool(/*limit=*/2), [&calls]() -> std::shared_ptr<TdsConnection> {
+		calls++;
+		if (calls >= 2) {
+			throw std::runtime_error("Login failed for user 'x'.");
+		}
+		return std::make_shared<TdsConnection>();
+	});
+	auto held = pool.Acquire(500);
+	Check(held != nullptr, "try2: the first connection is created");
+	const auto acquires_before = pool.GetStats().acquire_count;
+
+	std::string why;
+	bool creation_failed = false;
+	auto none = pool.TryAcquire(&why, &creation_failed);
+	Check(none == nullptr, "try2: the second creation fails");
+	Check(creation_failed, "try2: and says so (" + why + ")");
+	Check(Contains(why, "Login failed"), "try2: with the factory's reason (" + why + ")");
+
+	ConnectionPool full("try3", SmallPool(/*limit=*/1), []() { return std::make_shared<TdsConnection>(); });
+	auto only = full.Acquire(500);
+	creation_failed = true;
+	Check(full.TryAcquire(nullptr, &creation_failed) == nullptr, "try3: nothing free at the limit");
+	Check(!creation_failed, "try3: which is not a creation failure");
+
+	Check(pool.GetStats().acquire_count == acquires_before, "try2: TryAcquire is not counted as an acquire");
+	pool.Release(std::move(held));
+	full.Release(std::move(only));
+}
+
 int main() {
 	TestThrowingFactoryFailsFast();
 	TestSilentNullptrFactoryFailsFast();
@@ -250,6 +284,7 @@ int main() {
 	TestSuccessClearsTheError();
 	TestRecoveredPoolReportsTimeoutNotOldError();
 	TestTryAcquireDoesNotCountATimeout();
+	TestTryAcquireTellsCreationFailureFromBusy();
 
 	if (g_failures > 0) {
 		std::cerr << g_failures << " check(s) failed" << std::endl;

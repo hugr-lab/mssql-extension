@@ -47,7 +47,7 @@ statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS one380 (TYPE mssql);
 
 statement ok
-SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins');
+SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins, dbo.one380_ac_copy, dbo.one380_ac_raw, dbo.one380_ac_local');
 
 statement ok
 SELECT mssql_exec('one380', 'CREATE TABLE dbo.one380_src (id int NOT NULL PRIMARY KEY, v nvarchar(10) NULL); INSERT INTO dbo.one380_src SELECT TOP 2500 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), N''x'' FROM sys.all_columns a CROSS JOIN sys.all_columns b');
@@ -191,8 +191,41 @@ SELECT count(*) FROM one380.dbo.one380_ac_ins;
 ----
 2500
 
+# COPY from the catalog it writes into, and CTAS / INSERT from a raw
+# mssql_scan of it (review of #382): the bulk load takes the one connection on
+# its first chunk, and the raw scan is materialised as a catalog scan is.
 statement ok
-SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins');
+COPY (SELECT id, v FROM one380.dbo.one380_src) TO 'mssql://one380/dbo/one380_ac_copy' (FORMAT 'bcp', CREATE_TABLE true);
+
+query I
+SELECT count(*) FROM one380.dbo.one380_ac_copy;
+----
+2500
+
+query I
+CREATE TABLE one380.dbo.one380_ac_raw AS SELECT * FROM mssql_scan('one380', 'SELECT id, v FROM dbo.one380_src');
+----
+2500
+
+query I
+INSERT INTO one380.dbo.one380_ac_ins SELECT * FROM mssql_scan('one380', 'SELECT id, v FROM dbo.one380_src WHERE id <= 10');
+----
+10
+
+# A CTAS from a local source keeps its bulk load on a pool of one (it used to
+# be turned into INSERT statements for nothing).
+query I
+CREATE TABLE one380.dbo.one380_ac_local AS SELECT i::INTEGER AS id FROM range(3000) t(i);
+----
+3000
+
+query I
+SELECT count(*) FROM one380.dbo.one380_ac_local;
+----
+3000
+
+statement ok
+SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins, dbo.one380_ac_copy, dbo.one380_ac_raw, dbo.one380_ac_local');
 
 statement ok
 DETACH one380;

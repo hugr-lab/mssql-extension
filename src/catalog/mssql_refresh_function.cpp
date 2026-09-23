@@ -74,17 +74,6 @@ static duckdb::unique_ptr<duckdb::FunctionData> MSSQLRefreshCacheBind(duckdb::Bi
 //===----------------------------------------------------------------------===//
 
 static void MSSQLRefreshCacheExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	// Refused inside an explicit transaction (issue #380): a forced load there
-	// either blocks on the transaction's own uncommitted DDL (a pool connection
-	// waits on its schema lock until the metadata timeout) or, on the pinned
-	// connection, would publish the transaction's uncommitted view into the cache
-	// every other connection reads. Invalidation stays allowed.
-	if (!state.GetContext().transaction.IsAutoCommit()) {
-		throw InvalidInputException(
-			"mssql_refresh_cache cannot run inside a transaction: it would load the catalog's "
-			"metadata while the transaction may hold uncommitted changes. Use "
-			"mssql_invalidate_cache() inside the transaction, or refresh after COMMIT");
-	}
 	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<MSSQLRefreshCacheBindData>();
 
 	auto &catalog_names = args.data[0];
@@ -117,6 +106,20 @@ static void MSSQLRefreshCacheExecute(DataChunk &args, ExpressionState &state, Ve
 				catalog_name, catalog_name);
 		}
 		auto &catalog = *catalog_ptr;
+		// Refused while this catalog has a server transaction open (issue #380):
+		// a forced load there either blocks on the transaction's own uncommitted
+		// DDL (a pool connection waits on its schema lock until the metadata
+		// timeout) or, on the pinned connection, would publish the transaction's
+		// uncommitted view into the cache every other connection reads. A DuckDB
+		// transaction that never touched this catalog is not refused (review of
+		// #382). Invalidation stays allowed.
+		if (catalog.HasOpenServerTransaction(client_context)) {
+			throw InvalidInputException(
+				"mssql_refresh_cache cannot run inside a transaction that has used catalog '%s': it would load the "
+				"catalog's metadata while the transaction may hold uncommitted changes. Use "
+				"mssql_invalidate_cache() inside the transaction, or refresh after COMMIT",
+				catalog_name);
+		}
 
 		// Perform full cache refresh (invalidates and reloads all metadata)
 		catalog.RefreshCache(client_context);

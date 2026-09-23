@@ -223,6 +223,23 @@ public:
 	void Adopt(std::shared_ptr<tds::TdsConnection> connection, const BulkLoadSessionParams &params,
 			   bool transaction_pinned);
 
+	//! A shared session whose connection is taken on its FIRST chunk rather
+	//! than at init (review of #382). On a pool of ONE connection a bulk load
+	//! that took the pool's only connection at init held it before the source
+	//! scan of the same catalog could run, and the scan waited out
+	//! mssql_acquire_timeout; by the first chunk the source has been
+	//! materialised and given the connection back. `params` must outlive the
+	//! session, like Adopt's.
+	void DeferAdoption(const BulkLoadSessionParams &params) {
+		deferred_params_ = &params;
+	}
+	bool IsDeferred() const {
+		return deferred_params_ != nullptr && writer_ == nullptr;
+	}
+	//! Take the deferred connection from the pool (waiting for it, as any
+	//! statement does) and adopt it. Throws with the pool's reason.
+	void AdoptDeferred();
+
 	//! Does this session hold a connection and a writer? For a per-thread
 	//! session: false means "use the shared writer".
 	bool IsOwned() const {
@@ -321,6 +338,8 @@ private:
 
 	std::shared_ptr<tds::TdsConnection> connection_;
 	unique_ptr<BCPWriter> writer_;
+	//! Set by DeferAdoption; the params AdoptDeferred adopts with.
+	const BulkLoadSessionParams *deferred_params_ = nullptr;
 	//! The ONE release mechanism. There was briefly a raw `tds::ConnectionPool *`
 	//! beside this, used by Finish() while the destructor used the handle — two
 	//! ways to return a connection in one class, which is how they come to

@@ -113,6 +113,9 @@ struct MSSQLCopyGlobalState : public GlobalFunctionData {
 	//! + StartBulkStream + FlushToServer, a second copy of what the per-thread
 	//! sessions already did.
 	mssql::BulkLoadSession shared;
+	//! The shared session's params when its connection is taken on the first
+	//! chunk (a pool of one connection, review of #382); must outlive `shared`.
+	mssql::BulkLoadSessionParams deferred_params;
 
 	// Column metadata for encoding
 	vector<mssql::BCPColumnMetadata> columns;

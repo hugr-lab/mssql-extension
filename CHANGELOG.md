@@ -71,19 +71,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     leave a phantom table after ROLLBACK and to show another connection the
     uncommitted table. At COMMIT or ROLLBACK the shared cache forgets what the
     transaction changed.
-  - **Refused inside a transaction.** `mssql_refresh_cache()` and
-    `mssql_preload_catalog()` are bulk loads into the shared cache.
-    `mssql_invalidate_cache()` is still allowed.
-  - **CTAS on a pool of one.** In a transaction it runs whole on the pinned
-    connection: checks, CREATE, and rows as INSERT statements. ROLLBACK
-    undoes it. In autocommit it loads with INSERT statements, and a scan of
-    the catalog it writes into is materialised first, as for INSERT … SELECT.
-    Both used to fail: `Failed to acquire connection to check table existence`
-    in a transaction, an acquire timeout in autocommit.
+  - **Refused inside a transaction that uses the catalog.**
+    `mssql_refresh_cache()` and `mssql_preload_catalog()` are bulk loads into
+    the shared cache, so they are refused while the DuckDB transaction has a
+    server transaction open on that catalog. A DuckDB transaction that never
+    touched it is not refused. `mssql_invalidate_cache()` is always allowed.
+  - **A pool of one connection.**
+    - *CTAS in a transaction* runs whole on the pinned connection: checks,
+      CREATE, and rows as INSERT statements. ROLLBACK undoes it. It used to
+      fail with `Failed to acquire connection to check table existence`.
+    - *In autocommit*, a scan of the catalog the statement writes into is
+      materialised first, whether it is a catalog scan or a raw `mssql_scan`.
+      A COPY's or CTAS's bulk load then takes the one connection on its first
+      chunk. COPY, CTAS and INSERT … SELECT from the same catalog used to wait
+      out the acquire timeout.
   - **Extra parallel writers never wait for a connection.** For a COPY, CTAS
     or INSERT via BCP, an extra writer takes an idle connection or opens one
     under the limit. Otherwise it shares the main writer, asks again on a
-    later chunk, and is not reported as a pool timeout. It used to wait
+    later chunk, and is not reported as a pool timeout. A connection the pool
+    could not create, such as a login the server refuses, stops the asking. It used to wait
     `mssql_acquire_timeout` for a connection the statement itself held: a
     300k-row CTAS in a transaction on a pool of two took 30 s and now takes
     0.84 s. There are never more writers than `mssql_connection_limit`.
