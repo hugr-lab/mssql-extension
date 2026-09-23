@@ -505,9 +505,18 @@ transaction the catalog:
   pinned connection goes back to the pool and the next statement is ordinary
   autocommit.
 
-`mssql_refresh_cache()` and `mssql_preload_catalog()` are **refused** inside a
-transaction: both are bulk writes into the shared layers. `mssql_invalidate_cache()`
-is allowed.
+`mssql_refresh_cache()` and `mssql_preload_catalog()` are **refused** once the
+transaction has used **any** attached MSSQL catalog: both are bulk writes into the
+shared layers, and such a transaction may hold uncommitted state on the server. A
+transaction that has touched no MSSQL catalog at all — one wrapping unrelated
+DuckDB work in `BEGIN … COMMIT` — has no pinned connection and nothing
+uncommitted anywhere, so the load is ordinary committed state and is allowed
+(review of #382). The test is deliberately not per-catalog: two ATTACHes of one
+DSN under different aliases are independent catalogs with independent pools, so
+uncommitted DDL through alias A would be invisible to a check on alias B, and a
+pool connection on B would then block on A's schema lock until
+`mssql_metadata_timeout` — the #380 hang itself.
+`mssql_invalidate_cache()` is allowed either way.
 
 ```mermaid
 flowchart TD

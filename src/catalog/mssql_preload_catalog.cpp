@@ -4,6 +4,7 @@
 #include "catalog/mssql_preload_catalog.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_statistics.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/string_vector.hpp"
 #include "mssql_function_docs.hpp"
@@ -79,17 +80,6 @@ static duckdb::unique_ptr<duckdb::FunctionData> MSSQLPreloadCatalogBind(duckdb::
 //===----------------------------------------------------------------------===//
 
 static void MSSQLPreloadCatalogExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	// Refused inside an explicit transaction (issue #380): a forced load there
-	// either blocks on the transaction's own uncommitted DDL (a pool connection
-	// waits on its schema lock until the metadata timeout) or, on the pinned
-	// connection, would publish the transaction's uncommitted view into the cache
-	// every other connection reads. Invalidation stays allowed.
-	if (!state.GetContext().transaction.IsAutoCommit()) {
-		throw InvalidInputException(
-			"mssql_preload_catalog cannot run inside a transaction: it would load the "
-			"catalog's metadata while the transaction may hold uncommitted changes. Use "
-			"mssql_invalidate_cache() inside the transaction, or preload after COMMIT");
-	}
 	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<MSSQLPreloadCatalogBindData>();
 
 	auto &catalog_names = args.data[0];
@@ -122,6 +112,30 @@ static void MSSQLPreloadCatalogExecute(DataChunk &args, ExpressionState &state, 
 					catalog_name, catalog_name);
 			}
 			auto &catalog = *catalog_ptr;
+
+			// Refused inside an explicit transaction ON THIS CATALOG (issue
+			// #380): a forced load there either blocks on the transaction's own
+			// uncommitted DDL (a pool connection waits on its schema lock until
+			// the metadata timeout) or, on the pinned connection, would publish
+			// the transaction's uncommitted view into the cache every other
+			// connection reads. Invalidation stays allowed.
+			//
+			// Scoped to "has this transaction used MSSQL at all" rather than to
+			// "not autocommit" (review of #382): a transaction that wraps
+			// unrelated DuckDB work in BEGIN ... COMMIT holds no pinned
+			// connection and nothing uncommitted on any server, so there is
+			// nothing to block on and nothing to leak. Not scoped per catalog --
+			// aliases of one database are independent catalogs, see
+			// HasUsedAnyMSSQLCatalogInTransaction.
+			if (ConnectionProvider::HasUsedAnyMSSQLCatalogInTransaction(client_context)) {
+				throw InvalidInputException(
+					"mssql_preload_catalog cannot run inside a transaction that has used an MSSQL "
+					"catalog: it would load '%s' while the transaction may hold uncommitted "
+					"changes. Use mssql_invalidate_cache() inside the transaction, or preload after "
+					"COMMIT",
+					catalog_name);
+			}
+
 			auto &cache = catalog.GetMetadataCache();
 			auto &pool = catalog.GetConnectionPool();
 

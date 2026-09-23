@@ -47,7 +47,7 @@ statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS one380 (TYPE mssql);
 
 statement ok
-SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins');
+SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins, dbo.one380_ac_raw');
 
 statement ok
 SELECT mssql_exec('one380', 'CREATE TABLE dbo.one380_src (id int NOT NULL PRIMARY KEY, v nvarchar(10) NULL); INSERT INTO dbo.one380_src SELECT TOP 2500 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), N''x'' FROM sys.all_columns a CROSS JOIN sys.all_columns b');
@@ -191,8 +191,23 @@ SELECT count(*) FROM one380.dbo.one380_ac_ins;
 ----
 2500
 
+# A RAW scan as the source, autocommit, pool of one (review of 7f13a0a). The
+# optimizer cannot flag a raw scan -- requires_materialization lives on a
+# catalog scan's bind data -- so MSSQLScanInitGlobal has to materialise on its
+# own here. Unmaterialised, the stream holds the only connection and the CTAS's
+# first INSERT batch waits it out.
+query I
+CREATE TABLE one380.dbo.one380_ac_raw AS SELECT id, v FROM mssql_scan('one380', 'SELECT id, v FROM dbo.one380_src');
+----
+2500
+
+query I
+SELECT count(*) FROM one380.dbo.one380_ac_raw;
+----
+2500
+
 statement ok
-SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins');
+SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins, dbo.one380_ac_raw');
 
 statement ok
 DETACH one380;

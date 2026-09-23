@@ -4,6 +4,7 @@
 #include "catalog/mssql_transaction.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "tds/tds_connection.hpp"
@@ -73,6 +74,48 @@ bool ConnectionProvider::IsInTransaction(ClientContext &context, MSSQLCatalog &c
 	}
 	auto *txn = TryGetMSSQLTransaction(context, catalog);
 	return txn != nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// ConnectionProvider::HasUsedAnyMSSQLCatalogInTransaction
+//===----------------------------------------------------------------------===//
+
+bool ConnectionProvider::HasUsedAnyMSSQLCatalogInTransaction(ClientContext &context) {
+	if (context.transaction.IsAutoCommit()) {
+		return false;
+	}
+	// TryGetTransaction, never GetTransaction: the question is what the
+	// transaction has ALREADY touched, and GetTransaction -- which
+	// TryGetMSSQLTransaction above calls deliberately, so mssql_exec gets a
+	// transaction when it bypasses the binder -- would create one and answer yes
+	// for a catalog nobody has named. That is why IsInTransaction scopes nothing
+	// and this exists (review of 7f13a0a).
+	//
+	// ANY MSSQL catalog, not just the one the caller named (review of 0e12914):
+	// two ATTACHes of the same DSN under different aliases are independent
+	// catalogs with independent pools, so uncommitted DDL done through alias A is
+	// invisible to a per-catalog test on B -- and a pool connection taken on B
+	// then blocks on A's schema lock until mssql_metadata_timeout, which is the
+	// #380 hang this refusal exists to prevent. Comparing the underlying server
+	// and database would be narrower; this is the conservative form, and it
+	// still admits the case the scoping was for: a transaction that wraps
+	// unrelated DuckDB work in BEGIN ... COMMIT and has touched no MSSQL catalog
+	// at all.
+	auto &meta_transaction = MetaTransaction::Get(context);
+	auto &db_manager = DatabaseManager::Get(context);
+	auto attached_dbs = db_manager.GetDatabases(context);
+	for (auto &db : attached_dbs) {
+		if (!db) {
+			continue;
+		}
+		if (db->GetCatalog().GetCatalogType() != "mssql") {
+			continue;
+		}
+		if (meta_transaction.TryGetTransaction(*db)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 //===----------------------------------------------------------------------===//
