@@ -27,6 +27,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "query/mssql_identifier.hpp"
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -36,13 +37,6 @@ namespace mssql {
 
 //! `N'...'` with every quote doubled -- the only way a value enters a batch.
 std::string NVarcharLiteral(const std::string &text);
-
-//! THE identifier quoter (spec 079 W4): `[name]`, with every `]` doubled. Every
-//! identifier the extension sends -- schema, table, column, alias -- goes
-//! through here. There were eight copies of it, and six more places that
-//! bracketed a name without doubling `]`, so a table or column named `a]b`
-//! broke COPY's INSERT BULK and DELETE.
-std::string QuoteIdentifier(const std::string &name);
 
 //! One `@name = <literal>` assignment for the W4 form; `literal` is already
 //! T-SQL text (NVarcharLiteral for a name).

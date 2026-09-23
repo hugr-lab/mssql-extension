@@ -13,20 +13,6 @@
 namespace duckdb {
 namespace mssql {
 
-std::string QuoteIdentifier(const std::string &name) {
-	std::string out;
-	out.reserve(name.size() + 2);
-	out += '[';
-	for (char c : name) {
-		out += c;
-		if (c == ']') {
-			out += ']';
-		}
-	}
-	out += ']';
-	return out;
-}
-
 std::string NVarcharLiteral(const std::string &text) {
 	std::string out;
 	out.reserve(text.size() + 4);

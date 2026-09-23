@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <string>
 
-#include "query/mssql_sql_params.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 namespace mssql {
