@@ -744,9 +744,13 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 			// The warm-up gate is not open yet — keep may_claim and ask again on a
 			// later chunk, once the shared writer has sunk its first batch.
 			break;
+		case BulkLoadSession::Claim::Busy:
+			// No connection free right now; TryAcquire never waits, so asking
+			// again on a later chunk is cheap.
+			break;
 		case BulkLoadSession::Claim::Unavailable:
-			// Cap reached or acquisition failed — no later chunk changes that.
-			// Stop asking, so this thread does not re-block Acquire() every chunk.
+			// Cap reached or the server refused the load — no later chunk
+			// changes that. Stop asking.
 			ldata.may_claim = false;
 			break;
 		}

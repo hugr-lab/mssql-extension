@@ -378,6 +378,7 @@ SinkResultType MSSQLPhysicalInsert::Sink(ExecutionContext &context, DataChunk &c
 							(unsigned long long)gstate.parallel_writer_limit);
 			break;
 		case mssql::BulkLoadSession::Claim::GateClosed:
+		case mssql::BulkLoadSession::Claim::Busy:
 			break;
 		case mssql::BulkLoadSession::Claim::Unavailable:
 			lstate.may_claim = false;

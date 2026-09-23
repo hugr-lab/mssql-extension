@@ -45,14 +45,17 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 	// Which connection the checks, the DDL and the rows go on (issue #380).
 	gstate->state.ResolveConnectionMode(context, catalog_.GetConnectionLimit());
 
-	// Inside a transaction the existence checks -- and on a pool of one the DDL
-	// -- go down the pinned connection, while DuckDB may be initialising a
-	// source scan of this catalog on another thread, draining it on that same
-	// connection under the catalog's MaterializeMutex (the optimizer counts a
-	// CTAS as a sink, spec 075 W3). Wait for the drain, and hold the mutex for
-	// the rest of the init, exactly as COPY's init does (review of #382).
+	// The existence checks -- and on a pool of one the DDL -- share a connection
+	// with a source scan of this catalog that DuckDB may be initialising on
+	// another thread, draining it under the catalog's MaterializeMutex (the
+	// optimizer counts a CTAS as a sink, spec 075 W3): the pinned connection in
+	// a transaction, the pool's only one on a pool of one in autocommit. Wait
+	// for the drain. The condition is the optimizer's own -- a transaction, or
+	// a pool of one -- because the scan takes the mutex on exactly that flag
+	// (reviews of #382).
+	const bool one_connection = catalog_.GetConnectionLimit() <= 1;
 	std::unique_lock<std::mutex> materialize_lock;
-	if (gstate->state.in_transaction) {
+	if (gstate->state.in_transaction || one_connection) {
 		materialize_lock = std::unique_lock<std::mutex>(catalog_.MaterializeMutex());
 	}
 
@@ -61,6 +64,18 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 	try {
 		// Check if table exists and determine if this is a new table (Issue #45 - auto-TABLOCK)
 		bool table_existed = gstate->state.TableExists(context);
+		// Validate schema exists (FR-009) -- asked here, with the other check on
+		// the shared connection; a table that exists answers it already.
+		const bool schema_exists = table_existed || gstate->state.SchemaExists(context);
+
+		// On a pool of more than one, everything below runs on POOL connections
+		// -- the DROP, the CREATE, the bulk load's own -- which the mutex does not
+		// protect, and a blocking Acquire under it would stall every
+		// materialising scan of this catalog on every session. On a pool of one
+		// the DDL shares the one connection with the scan, so it stays held.
+		if (materialize_lock.owns_lock() && !one_connection) {
+			materialize_lock.unlock();
+		}
 
 		// Handle OR REPLACE: check if table exists and drop if needed
 		if (gstate->state.target.or_replace) {
@@ -95,8 +110,7 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 			gstate->state.config.is_new_table = true;
 		}
 
-		// Validate schema exists (FR-009)
-		if (!gstate->state.SchemaExists(context)) {
+		if (!schema_exists) {
 			throw InvalidInputException("CTAS failed: schema '%s' does not exist in SQL Server.",
 										gstate->state.target.schema_name);
 		}
@@ -304,9 +318,12 @@ SinkResultType MSSQLPhysicalCreateTableAs::Sink(ExecutionContext &context, DataC
 		case mssql::BulkLoadSession::Claim::GateClosed:
 			// Gate still closed — keep asking on later chunks.
 			break;
+		case mssql::BulkLoadSession::Claim::Busy:
+			// No connection free right now; TryAcquire never waits, so asking
+			// again on a later chunk is cheap (review of #382).
+			break;
 		case mssql::BulkLoadSession::Claim::Unavailable:
-			// Cap reached or acquisition failed — stop asking (spec 070 W2 review,
-			// finding 1: else a pool-exhausted thread re-blocks Acquire() per chunk).
+			// Cap reached or the server refused the load — stop asking.
 			lstate.may_claim = false;
 			break;
 		}

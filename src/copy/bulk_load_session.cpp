@@ -141,11 +141,17 @@ BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &pa
 	try {
 		// Never wait (review of #382): an extra writer is optional, so it takes
 		// an idle connection, or a new one while the pool is below its limit,
-		// or none -- and the thread shares the global writer. Waiting out
-		// mssql_acquire_timeout for a connection the statement itself holds
+		// or none -- and the thread shares the global writer meanwhile. Waiting
+		// out mssql_acquire_timeout for a connection the statement itself holds
 		// (the pinned one, or the source scan's) stalled a CTAS 30 s.
-		conn = params.pool->Acquire(0);
-		if (!conn || conn->GetState() != tds::ConnectionState::Idle) {
+		conn = params.pool->TryAcquire();
+		if (!conn) {
+			// Nothing free right now: give the slot back and let the caller ask
+			// again on a later chunk.
+			slots_used.fetch_sub(1);
+			return Claim::Busy;
+		}
+		if (conn->GetState() != tds::ConnectionState::Idle) {
 			throw IOException("no idle connection available for a parallel writer");
 		}
 		Adopt(conn, params, /*transaction_pinned=*/false);
@@ -156,10 +162,10 @@ BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &pa
 		return Claim::Started;
 	} catch (std::exception &) {
 		// Falling back is the whole contract: put the connection back and let the
-		// thread share the global writer. This is TERMINAL for the load — the pool
-		// is exhausted or the server refused a bulk load, and neither clears on a
-		// later chunk — so the caller stops asking rather than re-blocking a 30 s
-		// Acquire() every chunk (spec 070 W2 review, finding 1).
+		// thread share the global writer. This is TERMINAL for the load — the
+		// server refused a bulk load, or handed a connection that was not Idle,
+		// and neither clears on a later chunk — so the caller stops asking. A pool
+		// with nothing free is not this case: that returns Busy above.
 		//
 		// Adopted already (the throw came from OpenStream): the session owns the
 		// connection, and an own transaction may be open on it -- Abandon rolls

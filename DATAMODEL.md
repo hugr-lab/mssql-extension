@@ -812,10 +812,11 @@ the writer, the batch bookkeeping and the mid-bulk-load release protocol; who ma
 open one, and how many, is the policy above and is handed to it.
 
 The policy never grants more writers than the pool has connections. An extra
-writer's `TryStart` takes its connection with `Acquire(0)` and never waits: an
-idle connection, a new one while the pool is below its limit, or none, and then
-the thread shares the global writer (issue #380, as revised in the review of
-#382). Waiting was the bug: the statement often holds one of the pool's
+writer's `TryStart` takes its connection with `ConnectionPool::TryAcquire`,
+which never waits and is not counted in `acquire_timeout_count`: an idle
+connection, a new one while the pool is below its limit, or none. With none, the
+claim is `Busy`: transient, so the thread shares the global writer and asks again
+on a later chunk (issue #380, as revised in two review rounds of #382). Waiting was the bug: the statement often holds one of the pool's
 connections itself (the pinned one, or the source scan's), so the extra writer
 waited `mssql_acquire_timeout` for a connection that could not free. A 300k-row
 CTAS inside a transaction on a pool of two took 30 s; it now takes 0.84 s. A cap

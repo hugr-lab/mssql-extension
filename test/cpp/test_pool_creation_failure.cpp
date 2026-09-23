@@ -217,6 +217,31 @@ static void TestRecoveredPoolReportsTimeoutNotOldError() {
 	pool.Release(std::move(held));
 }
 
+//! TryAcquire (review of #382): an optional connection -- an extra bulk-load
+//! writer -- on a full pool is the normal case, not a timeout. It returns at
+//! once and leaves acquire_timeout_count alone; Acquire(0) still counts.
+static void TestTryAcquireDoesNotCountATimeout() {
+	ConnectionPool pool("try", SmallPool(/*limit=*/1), []() { return std::make_shared<TdsConnection>(); });
+	auto held = pool.Acquire(500);
+	Check(held != nullptr, "try: the one connection is taken");
+
+	auto t0 = std::chrono::steady_clock::now();
+	auto none = pool.TryAcquire();
+	Check(none == nullptr, "try: nothing free on a full pool");
+	Check(MsSince(t0) < 100, "try: returned at once");
+	Check(pool.GetStats().acquire_timeout_count == 0, "try: not counted as an acquire timeout");
+
+	Check(pool.Acquire(0) == nullptr, "try: Acquire(0) on the same pool also finds nothing");
+	Check(pool.GetStats().acquire_timeout_count == 1, "try: but Acquire(0) IS counted");
+
+	pool.Release(std::move(held));
+	auto got = pool.TryAcquire();
+	Check(got != nullptr, "try: a released connection is taken");
+	if (got) {
+		pool.Release(std::move(got));
+	}
+}
+
 int main() {
 	TestThrowingFactoryFailsFast();
 	TestSilentNullptrFactoryFailsFast();
@@ -224,6 +249,7 @@ int main() {
 	TestWaitsWhenOthersActiveWithBackoff();
 	TestSuccessClearsTheError();
 	TestRecoveredPoolReportsTimeoutNotOldError();
+	TestTryAcquireDoesNotCountATimeout();
 
 	if (g_failures > 0) {
 		std::cerr << g_failures << " check(s) failed" << std::endl;

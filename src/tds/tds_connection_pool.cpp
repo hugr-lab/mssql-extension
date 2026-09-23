@@ -145,6 +145,14 @@ void ConnectionPool::Shutdown() {
 }
 
 std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms, std::string *failure) {
+	return AcquireImpl(timeout_ms, failure, false);
+}
+
+std::shared_ptr<TdsConnection> ConnectionPool::TryAcquire(std::string *failure) {
+	return AcquireImpl(0, failure, true);
+}
+
+std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::string *failure, bool optional) {
 	MSSQL_POOL_DEBUG_LOG(1, "Acquire called on pool '%s'", context_name_.c_str());
 	if (shutdown_flag_.load()) {
 		if (failure) {
@@ -258,7 +266,9 @@ std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms, std::stri
 
 		// Pool exhausted, wait for a connection to be released
 		if (timeout_ms == 0) {
-			stats_.acquire_timeout_count++;
+			if (!optional) {
+				stats_.acquire_timeout_count++;
+			}
 			if (failure) {
 				*failure = DescribeTimeoutLocked(own_create_error);
 			}

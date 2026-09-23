@@ -82,7 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     in a transaction, an acquire timeout in autocommit.
   - **Extra parallel writers never wait for a connection.** For a COPY, CTAS
     or INSERT via BCP, an extra writer takes an idle connection or opens one
-    under the limit. Otherwise it shares the main writer. It used to wait
+    under the limit. Otherwise it shares the main writer, asks again on a
+    later chunk, and is not reported as a pool timeout. It used to wait
     `mssql_acquire_timeout` for a connection the statement itself held: a
     300k-row CTAS in a transaction on a pool of two took 30 s and now takes
     0.84 s. There are never more writers than `mssql_connection_limit`.
