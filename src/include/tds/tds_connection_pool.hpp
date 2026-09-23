@@ -91,6 +91,14 @@ public:
 	// other thread hit earlier (issue #302, review 1538).
 	std::shared_ptr<TdsConnection> Acquire(int timeout_ms = -1, std::string *failure = nullptr);
 
+	//! Never waits: an idle connection, a new one while the pool is below its
+	//! limit, or null. For an OPTIONAL connection -- an extra bulk-load writer
+	//! -- whose absence is the normal outcome on a pool the statement is already
+	//! using, so a null here is not counted in acquire_timeout_count: every
+	//! parallel load would otherwise report "timeouts" that delayed nothing
+	//! (review of #382).
+	std::shared_ptr<TdsConnection> TryAcquire(std::string *failure = nullptr);
+
 	// Release a connection back to the pool
 	void Release(std::shared_ptr<TdsConnection> conn);
 
@@ -173,6 +181,7 @@ private:
 
 	// Internal methods
 	void CleanupThreadFunc();
+	std::shared_ptr<TdsConnection> AcquireImpl(int timeout_ms, std::string *failure, bool optional);
 	std::shared_ptr<TdsConnection> TryAcquireIdle();
 	// Runs the factory with pool_mutex_ RELEASED (blocking I/O). On failure
 	// returns nullptr and puts the reason in `error`; the caller records it.

@@ -1033,8 +1033,18 @@ static int64_t RunExecBatch(ClientContext &client_context, const string &context
 		// Gated by mssql_exec_invalidate_cache, which defaults to FALSE (like the Postgres
 		// extension's postgres_execute): by default the caller invalidates manually via
 		// mssql_invalidate_cache(); set the flag true to auto-invalidate here.
-		if (ExecSqlMayChangeSchema(statement) && LoadExecInvalidateCache(client_context)) {
-			catalog.InvalidateMetadataCache();
+		if (ExecSqlMayChangeSchema(statement)) {
+			if (LoadExecInvalidateCache(client_context)) {
+				catalog.InvalidateMetadataCache();
+				catalog.NoteTransactionChange(client_context);
+			} else {
+				// Review of #382: the shared cache is the caller's to invalidate
+				// (the setting's contract), but inside a transaction the
+				// transaction's own lookups must not keep trusting it -- the
+				// pinned connection now sees DDL the shared cache does not, and a
+				// rowid key discovered on it would be written to a shared entry.
+				catalog.NoteTransactionChangeLocally(client_context);
+			}
 		}
 
 		// Return affected row count from DONE token

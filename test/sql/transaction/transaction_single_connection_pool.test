@@ -1,0 +1,207 @@
+# name: test/sql/transaction/transaction_single_connection_pool.test
+# description: A catalog whose pool holds ONE connection works in a transaction and in autocommit -- metadata, listing, rowid DML, CTAS, INSERT ... SELECT (issue #380)
+# group: [transaction]
+# issue: 380
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# With mssql_connection_limit = 1 (fixed at ATTACH) everything a statement
+# does has to share the one connection:
+#
+#   * in a transaction, it is pinned -- so the metadata loads go on it too;
+#     before, they asked the pool for a second one and failed with
+#     "pool timed out (1 active of 1)";
+#   * a CTAS in a transaction runs whole on it: the checks, the CREATE and the
+#     rows (as INSERT statements -- a bulk load cannot share the connection
+#     with the source scan), inside the transaction, so ROLLBACK undoes it;
+#   * in autocommit the scans and the sink take turns at the pool, so a scan
+#     of the catalog the plan writes into is materialised first, as it is in
+#     a transaction; a CTAS loads with statements, which take their
+#     connection only at the first batch.
+#
+# A short acquire timeout makes any path that still asks for a second
+# connection fail in seconds instead of thirty.
+#
+# Not covered yet: UPDATE / DELETE in AUTOCOMMIT on a pool of one. Their scan
+# is not materialised (they are not counted as sinks), so their batches wait
+# for the connection the scan holds. Spec 080 W2 closes that and extends
+# this file.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+SET mssql_acquire_timeout = 3;
+
+# Threads, so a CTAS's sink init and its source scan's drain can meet on the
+# one connection (review of #382).
+statement ok
+SET threads = 4;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS one380 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins');
+
+statement ok
+SELECT mssql_exec('one380', 'CREATE TABLE dbo.one380_src (id int NOT NULL PRIMARY KEY, v nvarchar(10) NULL); INSERT INTO dbo.one380_src SELECT TOP 2500 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), N''x'' FROM sys.all_columns a CROSS JOIN sys.all_columns b');
+
+statement ok
+SELECT mssql_exec('one380', 'CREATE TABLE dbo.one380_ac_ins (id int NOT NULL, v nvarchar(10) NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('one380');
+
+#------------------------------------------------------------------------------
+# Transaction: first touch, listing, rowid UPDATE -- all on the pinned one.
+#------------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM one380.dbo.one380_src;
+----
+2500
+
+query I
+SELECT count(*) > 0 FROM duckdb_tables() WHERE database_name = 'one380' AND schema_name = 'dbo';
+----
+true
+
+query I
+UPDATE one380.dbo.one380_src SET v = 'y' WHERE id <= 10;
+----
+10
+
+query I
+SELECT count(*) FROM one380.dbo.one380_src WHERE v = 'y';
+----
+10
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM one380.dbo.one380_src WHERE v = 'y';
+----
+0
+
+#------------------------------------------------------------------------------
+# Transaction: CTAS from a DuckDB source, committed.
+#------------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+query I
+CREATE TABLE one380.dbo.one380_ctas_range AS SELECT i::INTEGER AS id FROM range(1500) t(i);
+----
+1500
+
+query I
+SELECT count(*) FROM one380.dbo.one380_ctas_range;
+----
+1500
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM one380.dbo.one380_ctas_range;
+----
+1500
+
+#------------------------------------------------------------------------------
+# Transaction: CTAS, rolled back -- the table was created inside the
+# transaction, so it is gone, not left behind empty.
+#------------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE one380.dbo.one380_ctas_rb AS SELECT i::INTEGER AS id FROM range(10) t(i);
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM mssql_scan('one380', 'SELECT OBJECT_ID(''dbo.one380_ctas_rb'') AS o') WHERE o IS NOT NULL;
+----
+0
+
+statement error
+SELECT count(*) FROM one380.dbo.one380_ctas_rb;
+----
+does not exist
+
+#------------------------------------------------------------------------------
+# Transaction: CTAS reading the catalog it writes into.
+#------------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+query I
+CREATE TABLE one380.dbo.one380_ctas_self AS SELECT id, v FROM one380.dbo.one380_src;
+----
+2500
+
+query I
+SELECT count(*) FROM one380.dbo.one380_ctas_self;
+----
+2500
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM one380.dbo.one380_ctas_self;
+----
+2500
+
+#------------------------------------------------------------------------------
+# Autocommit: CTAS and INSERT ... SELECT reading the catalog they write into.
+#------------------------------------------------------------------------------
+
+query I
+CREATE TABLE one380.dbo.one380_ac_ctas AS SELECT id, v FROM one380.dbo.one380_src;
+----
+2500
+
+query I
+SELECT count(*) FROM one380.dbo.one380_ac_ctas;
+----
+2500
+
+query I
+INSERT INTO one380.dbo.one380_ac_ins SELECT id, v FROM one380.dbo.one380_src;
+----
+2500
+
+query I
+SELECT count(*) FROM one380.dbo.one380_ac_ins;
+----
+2500
+
+statement ok
+SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins');
+
+statement ok
+DETACH one380;
+
+statement ok
+RESET mssql_connection_limit;
+
+statement ok
+RESET mssql_acquire_timeout;
+
+statement ok
+RESET threads;

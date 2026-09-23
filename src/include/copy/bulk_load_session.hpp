@@ -200,11 +200,15 @@ public:
 	//! The THREE outcomes matter to the caller, which is why this is not a bool
 	//! (spec 070 W2 review): `GateClosed` is cheap and transient — no slot
 	//! claimed, no connection touched — so the caller must keep asking on later
-	//! chunks. `Unavailable` is terminal for this load (limit is one, the slot
-	//! cap is reached, or acquiring a connection failed): the caller must STOP
-	//! asking, or it re-attempts a blocking Acquire() on every chunk under pool
-	//! pressure. Only `Started` means this thread now owns a session.
-	enum class Claim { Started, GateClosed, Unavailable };
+	//! chunks. `Busy` is transient too: a slot was free but no connection was,
+	//! and the connection is asked for with TryAcquire, which never waits, so
+	//! asking again on a later chunk is cheap -- one lost momentary race must not
+	//! cost the thread its writer for the whole load (review of #382).
+	//! `Unavailable` is terminal for this load (limit is one, the slot cap is
+	//! reached, or the server refused the bulk load on the connection it got):
+	//! the caller must STOP asking. Only `Started` means this thread now owns a
+	//! session.
+	enum class Claim { Started, GateClosed, Busy, Unavailable };
 	Claim TryStart(const BulkLoadSessionParams &params, std::atomic<idx_t> &slots_used, idx_t max_writers,
 				   const std::atomic<idx_t> &rows_sunk);
 

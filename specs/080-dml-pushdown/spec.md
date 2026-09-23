@@ -188,6 +188,26 @@ once (065 D3): the three shipped executors and the new path call one
 executors; the transaction suite proves a scan feeding an UPDATE inside
 `BEGIN … COMMIT` materialises and the connection is Idle for the sink.
 
+A **pool of one connection** (`mssql_connection_limit = 1`) must work in
+autocommit too. Since #380 `MaterializeSharedConnectionScans` also
+materialises in autocommit when the catalog's pool limit is 1
+(`HasSingleConnectionPool`): the scans and the sink take turns at the one
+connection. CTAS and INSERT … SELECT already work that way. UPDATE and
+DELETE do not yet: their scan streams while the executor's batches ask the
+pool for the only connection, and they wait out `mssql_acquire_timeout`.
+Counting `LOGICAL_UPDATE` / `LOGICAL_DELETE` as sinks closes that as well.
+Two consequences for the rest of this spec:
+
+- **The staged path (D3) must take its connection after the source scan
+  has given it back.** On a pool of one it must not take it at init. A
+  `BulkLoadSession::Adopt` in the operator's global sink state holds the
+  connection before the source scan's InitGlobal runs, which is exactly why
+  #380 turned CTAS's bulk load off on a pool of one (`ResolveConnectionMode`
+  in `mssql_ctas_executor.cpp`). Either acquire at the first `Sink`, or
+  fall back to the `VALUES`-join statements on a pool of one.
+- **A pushed statement (D1) needs no scan at all,** so it runs on a pool of
+  one as it is. The fallback is what has to be tested there.
+
 ### W3 — the ladder
 
 Rung 3 in `ChooseRowIdKey`'s caller (the plan-time resolution), the two
@@ -232,6 +252,12 @@ hiccup from silently changing which path a statement takes.
 - `ATTACH … (READ_ONLY)`: a pushed UPDATE / DELETE / INSERT … SELECT / CTAS
   is refused (both guards, each exercised); `EXPLAIN` and `PREPARE` of a
   pushed DML and of a pushed CTAS change no rows and create no table.
+- Pool of one (`mssql_connection_limit = 1`, `mssql_acquire_timeout`
+  short so a regression fails fast): UPDATE and DELETE on both the pushed
+  and the fallback path, in autocommit and inside `BEGIN … COMMIT`,
+  including a staged (rung 3) statement. Extends
+  `test/sql/transaction/transaction_single_connection_pool.test` (#380),
+  whose header names the gap.
 - Rung 3 under load: a keyless DELETE of 200k rows with a concurrent reader
   scanning the table from another session — completes, no 1205; a rung-3
   statement whose predicate the scan does not push is refused by name.
@@ -282,4 +308,7 @@ One PR after 079's merge; W1 → W6 as commits.
    suite is green with the setting on and off.
 4. Inside a transaction no DML defers: the connection is Idle after each
    statement, the transaction suite proves it.
+   On a pool of one connection, UPDATE and DELETE run in autocommit and in a
+   transaction, on both paths (#380 left them the last statements that could
+   not).
 5. The token loop exists once; `mssql_dml_use_prepared` is gone.

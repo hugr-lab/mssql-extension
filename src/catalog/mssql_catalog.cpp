@@ -1,6 +1,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include <openssl/crypto.h>
 #include <cctype>
+#include "catalog/mssql_transaction.hpp"
 #include "codec/target_string_type.hpp"
 
 #include "azure/azure_fedauth.hpp"
@@ -494,6 +495,22 @@ optional<Identifier> MSSQLCatalog::GetDefaultSchema() const {
 // Schema Operations
 //===----------------------------------------------------------------------===//
 
+MSSQLMetadataCache &MSSQLCatalog::SchemaListCache(ClientContext *context) {
+	if (!context || context->transaction.IsAutoCommit()) {
+		return *metadata_cache_;
+	}
+	// Issue #380: inside a transaction the list is loaded on the pinned
+	// connection, which sees schemas the transaction created or dropped -- so a
+	// load goes into the transaction's own cache, never the shared one. A shared
+	// list already loaded is committed state and good to read, unless the
+	// transaction changed "anything" (mssql_exec DDL), which may mean schemas.
+	auto &metadata = MSSQLTransaction::Get(*context, *this).Metadata(*context);
+	if (!metadata.IsAllChanged() && metadata_cache_->GetSchemasState() == CacheLoadState::LOADED) {
+		return *metadata_cache_;
+	}
+	return metadata.Cache();
+}
+
 optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction transaction,
 															const EntryLookupInfo &schema_lookup,
 															OnEntryNotFound if_not_found) {
@@ -545,8 +562,9 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 	}
 
 	// Trigger lazy loading of schema list (ensure connection released on exception)
+	auto &schema_list = SchemaListCache(transaction.context.get());
 	try {
-		metadata_cache_->EnsureSchemasLoaded(*connection);
+		schema_list.EnsureSchemasLoaded(*connection);
 	} catch (...) {
 		if (transaction.context) {
 			ConnectionProvider::ReleaseConnection(*transaction.context, *this, std::move(connection));
@@ -564,7 +582,7 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 	}
 
 	// Check if schema exists in cache
-	if (!metadata_cache_->HasSchema(name)) {
+	if (!schema_list.HasSchema(name)) {
 		if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
 			throw CatalogException("Schema '%s' not found in MSSQL database", name);
 		}
@@ -586,7 +604,8 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 	// T036 (FR-003/Bug 0.2): Check cache BEFORE acquiring connection
 	// Fast path: If schemas are already loaded, get names without acquiring connection
 	vector<string> schema_names;
-	if (metadata_cache_->TryGetCachedSchemaNames(schema_names)) {
+	auto &schema_list = SchemaListCache(&context);
+	if (schema_list.TryGetCachedSchemaNames(schema_names)) {
 		// Cache hit - iterate without connection.
 		// Spec 052 (Option D): anchor each schema entry so it survives a
 		// concurrent Invalidate between DuckDB walker phase 1 (collect) and
@@ -611,7 +630,7 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 	}
 
 	try {
-		schema_names = metadata_cache_->GetSchemaNames(*connection);
+		schema_names = schema_list.GetSchemaNames(*connection);
 	} catch (...) {
 		ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
 		throw;
@@ -675,6 +694,9 @@ optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transac
 
 	// Point invalidation: invalidate schema list so new schema is visible
 	metadata_cache_->InvalidateAll();
+	// The transaction's own schema list too, or a CREATE TABLE in the schema
+	// just created is refused as "not found" (review of #382).
+	NoteTransactionChange(transaction.GetContext());
 
 	return &GetOrCreateSchemaEntry(info.SchemaName().GetIdentifierName());
 }
@@ -700,6 +722,7 @@ void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 
 	// Point invalidation: invalidate schema list
 	metadata_cache_->InvalidateAll();
+	NoteTransactionChange(context);
 
 	// Spec 052 (Option D): just erase. Any binder that looked up this schema
 	// before DROP SCHEMA fired is already anchored in its ClientContext's
@@ -1454,6 +1477,49 @@ void MSSQLCatalog::InvalidateTableEntry(const string &schema_name, const string 
 	if (it != schema_entries_.end()) {
 		it->second->GetTableSet().InvalidateEntry(table_name);
 	}
+}
+
+unique_ptr<MSSQLMetadataCache> MSSQLCatalog::CreateTransactionMetadataCache(ClientContext &context) {
+	auto cache = make_uniq<MSSQLMetadataCache>(0);
+	if (catalog_filter_.HasFilters()) {
+		cache->SetFilter(&catalog_filter_);
+	}
+	cache->SetMetadataTimeout(LoadMetadataTimeout(context));
+	cache->SetTestFailAfterRows(LoadTestFailMetadataAfterRows(context));
+	cache->SetDatabaseCollation(database_collation_, database_code_page_);
+	return cache;
+}
+
+void MSSQLCatalog::NoteTransactionChange(ClientContext &context, const string &schema, const string &table) {
+	if (context.transaction.IsAutoCommit()) {
+		return;
+	}
+	MSSQLTransaction::Get(context, *this).Metadata(context).MarkChanged(schema, table);
+}
+
+void MSSQLCatalog::NoteTransactionChangeLocally(ClientContext &context) {
+	if (context.transaction.IsAutoCommit()) {
+		return;
+	}
+	MSSQLTransaction::Get(context, *this).Metadata(context).MarkChangedLocally();
+}
+
+void MSSQLCatalog::ForgetTransactionChanges(MSSQLTransactionMetadata &metadata) {
+	auto changes = metadata.GetChanges();
+	if (changes.all) {
+		InvalidateMetadataCache();
+		return;
+	}
+	for (const auto &schema : changes.schemas) {
+		InvalidateSchemaTableSet(schema);
+	}
+	for (const auto &table : changes.tables) {
+		InvalidateTableEntry(table.first, table.second);
+	}
+}
+
+idx_t MSSQLCatalog::GetConnectionLimit() const {
+	return pool_config_.connection_limit;
 }
 
 void MSSQLCatalog::EnsureCacheLoaded(ClientContext &context) {

@@ -26,6 +26,7 @@ namespace duckdb {
 
 class MSSQLSchemaEntry;
 class MSSQLStatisticsProvider;
+class MSSQLTransactionMetadata;
 class PhysicalPlanGenerator;
 class LogicalCreateTable;
 class LogicalInsert;
@@ -96,6 +97,31 @@ public:
 	//! by default) and neither of the empty forms. (The v0.2.x line on duckdb 1.5.5 returns a plain
 	//! string; that is the only difference between the two ports.)
 	optional<Identifier> GetDefaultSchema() const override;
+
+	//! A metadata cache for one explicit transaction (issue #380), configured
+	//! like the shared one -- filters, collation, timeouts -- but owned by the
+	//! transaction, so what it loads on the pinned connection never reaches
+	//! another connection.
+	unique_ptr<MSSQLMetadataCache> CreateTransactionMetadataCache(ClientContext &context);
+
+	//! Record that the context's explicit transaction changed a table, a schema
+	//! (empty table) or possibly anything (empty schema): the transaction stops
+	//! trusting the shared cache for it, and its end invalidates it there. A
+	//! no-op in autocommit, where the shared invalidation next to every call
+	//! site is the whole story.
+	void NoteTransactionChange(ClientContext &context, const string &schema = string(), const string &table = string());
+
+	//! At COMMIT and ROLLBACK: invalidate in the shared cache what the
+	//! transaction changed. Another connection may have loaded the committed
+	//! state of those names while the transaction was open; after COMMIT that
+	//! state is stale.
+	void ForgetTransactionChanges(MSSQLTransactionMetadata &metadata);
+	//! MSSQLTransactionMetadata::MarkChangedLocally for the current transaction;
+	//! a no-op in autocommit.
+	void NoteTransactionChangeLocally(ClientContext &context);
+
+	//! The pool's connection limit, fixed at ATTACH.
+	idx_t GetConnectionLimit() const;
 
 	//! The statement sent before BEGIN TRANSACTION on the connection a DuckDB
 	//! transaction pins (issue #331), or "" to send none -- the server's own
@@ -351,6 +377,11 @@ protected:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 
 private:
+	//! The cache whose schema list a lookup reads and loads: the shared one, or
+	//! inside a transaction the transaction's own when the shared list is not
+	//! loaded or the transaction changed everything (issue #380).
+	MSSQLMetadataCache &SchemaListCache(ClientContext *context);
+
 	//! See MaterializeMutex(). Not the transaction's connection_mutex_: that one
 	//! guards the pinned-connection member accessors and is taken and released
 	//! inside them, where this must span a whole batch-and-drain.

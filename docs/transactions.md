@@ -324,6 +324,39 @@ The same persistence applies to a `SET TRANSACTION ISOLATION LEVEL` sent through
 | Transaction COMMIT/ROLLBACK | Return pinned connection to pool |
 | Abandoned transaction (destructor) | Close connection (not returned to pool) |
 
+### Catalog metadata inside a transaction (issue #380)
+
+Every metadata load a transaction needs — a table's columns, a schema's table
+list, the schema list, a rowid key — goes on its **pinned** connection. A pool
+connection would not see the transaction's uncommitted DDL and waits on its
+schema locks: a table COPY created inside the transaction, read in the same
+transaction, used to hang until `mssql_metadata_timeout`. On a pool of one it
+had no second connection to take at all.
+
+What such a load finds belongs to the transaction, so it is kept in the
+transaction's own cache (`MSSQLTransactionMetadata`), not the catalog's shared
+one: another connection must not find an uncommitted table there, and a
+ROLLBACK must not leave one behind. The shared cache is still read for names
+the transaction did not change, and at COMMIT or ROLLBACK it forgets the names
+the transaction changed. See `DATAMODEL.md`, "Inside an explicit transaction".
+
+Inside a transaction:
+
+| Call | |
+|---|---|
+| `mssql_invalidate_cache()` | allowed — the transaction reloads those names on its pinned connection |
+| `mssql_refresh_cache()`, `mssql_preload_catalog()` | refused — bulk loads into the shared cache; run them after COMMIT |
+| `mssql_exec()` DDL (any `mssql_exec_invalidate_cache`) | the rest of the transaction loads metadata on its pinned connection and trusts no shared entry. With the setting `false`, the shared cache itself is left for you to invalidate, as in autocommit |
+
+**What still runs outside the transaction:** catalog DDL (`CREATE TABLE`,
+`DROP TABLE`, `ALTER TABLE` through DuckDB) and CTAS go on a pool connection and
+autocommit, so ROLLBACK does not undo them (spec 057; the undo for a CTAS is
+`mssql_ctas_drop_on_failure`). The exception is a pool of **one** connection,
+where there is no second connection: a CTAS then runs whole on the pinned one —
+checks, CREATE and rows, the rows as INSERT statements — and ROLLBACK undoes it.
+DDL sent through `mssql_exec()` has always run on the pinned connection and
+rolls back.
+
 ### Parallel Transactions
 
 Multiple DuckDB connections can have concurrent transactions against the same SQL Server. Each gets its own pinned TDS connection from the pool. SQL Server maintains isolation between them via its normal locking mechanisms.

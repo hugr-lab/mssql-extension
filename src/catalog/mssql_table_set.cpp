@@ -7,6 +7,8 @@
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "catalog/mssql_table_entry.hpp"
+#include "catalog/mssql_transaction.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "duckdb/common/exception.hpp"
 
 // Debug logging for catalog operations
@@ -35,6 +37,9 @@ MSSQLTableSet::MSSQLTableSet(MSSQLSchemaEntry &schema)
 
 optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const string &name) {
 	CATALOG_DEBUG(2, "GetEntry('%s.%s')", schema_.name.c_str(), name.c_str());
+	if (!context.transaction.IsAutoCommit()) {
+		return GetEntryInTransaction(context, name);
+	}
 
 	// Spec 052 Option D: stash a copy of the shared_ptr in the per-context
 	// MSSQLBindAnchors; it's released at QueryEnd. This keeps the entry alive
@@ -124,6 +129,10 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const
 
 void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
 	CATALOG_DEBUG(1, "Scan('%s') — bulk loading all table metadata", schema_.name.c_str());
+	if (!context.transaction.IsAutoCommit()) {
+		ScanInTransaction(context, callback);
+		return;
+	}
 
 	// Issue #178: snapshot the invalidation epoch BEFORE loading; the trailing
 	// names_loaded_/is_fully_loaded_ publication is skipped if it changed.
@@ -420,6 +429,153 @@ void MSSQLTableSet::InvalidateEntry(const string &name) {
 //===----------------------------------------------------------------------===//
 // Internal Methods
 //===----------------------------------------------------------------------===//
+
+//===----------------------------------------------------------------------===//
+// Explicit transaction (issue #380)
+//===----------------------------------------------------------------------===//
+//
+// A metadata load on a POOL connection runs outside the transaction: it cannot
+// see a table the transaction created (COPY, mssql_exec) and waits on that
+// table's schema lock until mssql_metadata_timeout; with the pool at its limit
+// it cannot even get a connection, the pinned one being the transaction's. So
+// inside a transaction loads go on the pinned connection -- and, because that
+// connection sees uncommitted state, into the transaction's own
+// MSSQLTransactionMetadata, never into entries_ or the shared metadata cache
+// that every other connection reads.
+
+optional_ptr<CatalogEntry> MSSQLTableSet::GetEntryInTransaction(ClientContext &context, const string &name) {
+	auto &catalog = schema_.GetMSSQLCatalog();
+	const string schema_name = schema_.name.GetIdentifierName();
+	auto &metadata = MSSQLTransaction::Get(context, catalog).Metadata(context);
+	auto anchor = [&](const shared_ptr<MSSQLTableEntry> &entry) -> optional_ptr<CatalogEntry> {
+		MSSQLBindAnchors::For(context, catalog).AnchorTable(entry);
+		return entry.get();
+	};
+
+	// 1. What this transaction loaded itself.
+	auto own = metadata.FindEntry(schema_name, name);
+	if (own) {
+		return anchor(own);
+	}
+	if (metadata.IsAbsent(schema_name, name)) {
+		return nullptr;
+	}
+
+	// 2. The shared entries -- committed state -- unless this transaction
+	//    changed the table: then they describe what it replaced.
+	if (!metadata.IsChanged(schema_name, name)) {
+		shared_ptr<MSSQLTableEntry> shared;
+		bool known_absent = false;
+		{
+			std::lock_guard<std::mutex> lock(entry_mutex_);
+			auto it = entries_.find(name);
+			if (it != entries_.end()) {
+				shared = it->second;
+			} else {
+				known_absent = attempted_tables_.find(name) != attempted_tables_.end();
+			}
+		}
+		if (shared) {
+			return anchor(shared);
+		}
+		if (known_absent || is_fully_loaded_.load()) {
+			return nullptr;
+		}
+		if (names_loaded_.load()) {
+			std::lock_guard<std::mutex> nlock(names_mutex_);
+			if (names_loaded_.load() && known_table_names_.find(name) == known_table_names_.end()) {
+				return nullptr;
+			}
+		}
+	}
+
+	// 3. The table filter hides it.
+	auto &filter = catalog.GetCatalogFilter();
+	if (filter.HasTableFilter() && !filter.MatchesTable(name)) {
+		metadata.MarkAbsent(schema_name, name);
+		return nullptr;
+	}
+
+	// 4. Load it on the pinned connection, for this transaction only.
+	CATALOG_DEBUG(1, "  -> loading '%s.%s' on the transaction's connection", schema_name.c_str(), name.c_str());
+	catalog.EnsureCacheLoaded(context);
+	auto connection = ConnectionProvider::GetConnection(context, catalog);
+	MSSQLTableMetadata table_meta;
+	bool found = false;
+	try {
+		found = metadata.Cache().GetTableMetadata(*connection, schema_name, name, table_meta);
+	} catch (...) {
+		ConnectionProvider::ReleaseConnection(context, catalog, std::move(connection));
+		throw;
+	}
+	ConnectionProvider::ReleaseConnection(context, catalog, std::move(connection));
+	if (!found) {
+		metadata.MarkAbsent(schema_name, name);
+		return nullptr;
+	}
+	auto entry = CreateTableEntry(table_meta);
+	if (!entry) {
+		return nullptr;
+	}
+	return anchor(metadata.AddEntry(schema_name, name, std::move(entry)));
+}
+
+void MSSQLTableSet::ScanInTransaction(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
+	auto &catalog = schema_.GetMSSQLCatalog();
+	const string schema_name = schema_.name.GetIdentifierName();
+	auto &metadata = MSSQLTransaction::Get(context, catalog).Metadata(context);
+	auto &anchors = MSSQLBindAnchors::For(context, catalog);
+
+	// The shared listing, when it is complete and this transaction changed
+	// nothing in the schema. Re-checked after the snapshot: an Invalidate
+	// racing it may have cleared entries_ half-way, and then the listing is the
+	// transaction's own below.
+	if (!metadata.IsSchemaChanged(schema_name) && is_fully_loaded_.load()) {
+		vector<shared_ptr<MSSQLTableEntry>> snapshot;
+		{
+			std::lock_guard<std::mutex> lock(entry_mutex_);
+			for (const auto &pair : entries_) {
+				snapshot.push_back(pair.second);
+			}
+		}
+		if (is_fully_loaded_.load()) {
+			for (auto &entry : snapshot) {
+				anchors.AnchorTable(entry);
+				callback(*entry);
+			}
+			return;
+		}
+	}
+
+	// The transaction's own listing, on its pinned connection.
+	catalog.EnsureCacheLoaded(context);
+	if (!metadata.IsSchemaListed(schema_name)) {
+		auto connection = ConnectionProvider::GetConnection(context, catalog);
+		try {
+			metadata.Cache().LoadAllTableMetadata(*connection, schema_name);
+		} catch (...) {
+			ConnectionProvider::ReleaseConnection(context, catalog, std::move(connection));
+			throw;
+		}
+		ConnectionProvider::ReleaseConnection(context, catalog, std::move(connection));
+		metadata.MarkSchemaListed(schema_name);
+	}
+	vector<MSSQLTableMetadata> tables;
+	metadata.Cache().ForEachTableInSchema(
+		schema_name, [&](const string &, const MSSQLTableMetadata &table_meta) { tables.push_back(table_meta); });
+	for (auto &table_meta : tables) {
+		auto entry = metadata.FindEntry(schema_name, table_meta.name);
+		if (!entry) {
+			auto created = CreateTableEntry(table_meta);
+			if (!created) {
+				continue;
+			}
+			entry = metadata.AddEntry(schema_name, table_meta.name, std::move(created));
+		}
+		anchors.AnchorTable(entry);
+		callback(*entry);
+	}
+}
 
 shared_ptr<MSSQLTableEntry> MSSQLTableSet::CreateTableEntry(const MSSQLTableMetadata &metadata) {
 	// Spec 052: make_shared_ptr (DuckDB's shared_ptr wrapper) so the entry is

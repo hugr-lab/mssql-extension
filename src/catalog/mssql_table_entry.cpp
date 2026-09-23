@@ -209,6 +209,15 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 		return info;
 	}
 
+	// Inside a transaction, the count loaded with this entry's metadata. A DMV
+	// query would take a POOL connection -- on a pool of one, every table of a
+	// duckdb_tables() listing waited mssql_acquire_timeout for it (issue #380) --
+	// and write the shared statistics cache from inside a transaction.
+	if (!context.transaction.IsAutoCommit()) {
+		info.cardinality = approx_row_count_;
+		return info;
+	}
+
 	// Slow path: acquire connection and query DMV for fresh statistics
 	try {
 		auto &pool = mssql_catalog.GetConnectionPool();
@@ -325,7 +334,27 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 	try {
 		auto &pool = mssql_catalog.GetConnectionPool();
 		std::string acquire_failure;
-		auto connection = pool.Acquire(-1, &acquire_failure);
+		// Inside an explicit transaction the transaction's own connection (issue
+		// #380): a pool connection is a second one the pool may not have -- with
+		// the pinned connection holding the pool's last slot the discovery failed
+		// and that failure was cached in the entry for EVERY connection. The
+		// pinned connection sees the same committed indexes for a table the
+		// transaction did not change; a table it changed is its own entry
+		// (MSSQLTransactionMetadata), never this shared one.
+		const bool in_transaction = !context.transaction.IsAutoCommit();
+		std::shared_ptr<tds::TdsConnection> connection;
+		if (in_transaction) {
+			connection = ConnectionProvider::GetConnection(context, mssql_catalog);
+		} else {
+			connection = pool.Acquire(-1, &acquire_failure);
+		}
+		auto release = [&]() {
+			if (in_transaction) {
+				ConnectionProvider::ReleaseConnection(context, mssql_catalog, std::move(connection));
+			} else {
+				pool.Release(std::move(connection));
+			}
+		};
 
 		if (connection) {
 			auto &cache = mssql_catalog.GetMetadataCache();
@@ -339,10 +368,10 @@ void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
 				pk_info_ = mssql::RowIdKeyInfo::Discover(*connection, mssql_schema.name.GetIdentifierName(),
 														 name.GetIdentifierName(), cache.GetDatabaseCollation());
 			} catch (...) {
-				pool.Release(std::move(connection));
+				release();
 				throw;
 			}
-			pool.Release(std::move(connection));
+			release();
 		} else {
 			MSSQL_TE_DEBUG("EnsurePKLoaded: no connection available");
 			pk_info_.exists = false;

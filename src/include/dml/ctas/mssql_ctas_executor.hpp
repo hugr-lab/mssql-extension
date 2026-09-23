@@ -119,6 +119,20 @@ struct CTASExecutionState {
 	//! round trip that can only report "no such table".
 	bool table_created = false;
 
+	//! Issue #380: the statement runs inside an explicit transaction. Its
+	//! existence checks then ask the transaction's pinned connection: a pool
+	//! connection would wait on the schema lock of DDL the transaction has not
+	//! committed (and, with a pool of one, for a connection that never frees).
+	bool in_transaction = false;
+
+	//! Issue #380: inside a transaction on a pool of ONE connection, the whole
+	//! CTAS -- checks, CREATE TABLE, rows -- runs on the pinned connection:
+	//! there is no second connection for the DDL or a bulk load to take. The
+	//! rows go as INSERT statements (a bulk load and the source scan cannot
+	//! share one connection), and the table is inside the transaction, so
+	//! ROLLBACK undoes it and no cleanup DROP is attempted.
+	bool single_connection = false;
+
 	//! A cleanup DROP has already been issued. The failing Sink thread runs one
 	//! as early as it can, and the destructor covers the aborts that never reach
 	//! a Sink at all; without this the two would both fire on the same table.
@@ -142,6 +156,11 @@ struct CTASExecutionState {
 	// Initialize for execution
 	void Initialize(MSSQLCatalog &catalog_ref, CTASTarget target_p, vector<CTASColumnDef> columns_p,
 					CTASConfig config_p, bool reset_on_release_p);
+
+	//! Decide in_transaction / single_connection for this statement, and on a
+	//! pool of one turn the bulk load off. Before any other call: it rewrites
+	//! config.use_bcp and config.drop_on_failure.
+	void ResolveConnectionMode(ClientContext &context, idx_t connection_limit);
 
 	// Execute CREATE TABLE DDL phase
 	void ExecuteDDL(ClientContext &context);
@@ -196,6 +215,13 @@ struct CTASExecutionState {
 
 	// Get phase name for error messages
 	static string GetPhaseName(CTASPhase phase);
+
+private:
+	//! A DDL statement on the connection single_connection says: the pinned one,
+	//! or a pool connection through the catalog (autocommitting).
+	void RunDDL(ClientContext &context, const string &sql);
+	//! A one-row existence probe; on the pinned connection in a transaction.
+	bool ProbeExists(ClientContext &context, const string &sql, const char *what);
 };
 
 //===----------------------------------------------------------------------===//

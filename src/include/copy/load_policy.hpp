@@ -130,9 +130,17 @@ inline uint64_t MSSQLWarmupGateRows(bool warmup_gate, uint64_t flush_rows, uint6
 	return rowgroup_rows;
 }
 
+//!
+//! `pool_limit` is the catalog's mssql_connection_limit (fixed at ATTACH): no
+//! more writers than the pool has connections (issue #380). Not the limit
+//! minus one for the connection the statement may hold itself: an extra writer
+//! takes its connection with Acquire(0) and falls back to the shared writer
+//! when none is free, so a pool the statement is partly holding costs nothing,
+//! and one it is not holding is used whole (review of #382). No default: a new
+//! caller must say what pool it loads through.
 inline MSSQLLoadPolicy MSSQLResolveLoadPolicy(bool target_is_session_scoped, bool in_transaction,
 											  MSSQLLoadTransactionRole role, int64_t configured_writers,
-											  uint64_t thread_count) {
+											  uint64_t thread_count, uint64_t pool_limit) {
 	MSSQLLoadPolicy policy;
 
 	policy.source = (in_transaction && role == MSSQLLoadTransactionRole::JoinsTransaction)
@@ -173,6 +181,10 @@ inline MSSQLLoadPolicy MSSQLResolveLoadPolicy(bool target_is_session_scoped, boo
 	}
 
 	policy.max_writers = MSSQLDeriveWriterLimit(configured_writers, thread_count);
+	const uint64_t pool_room = pool_limit > 0 ? pool_limit : 1;
+	if (policy.max_writers > pool_room) {
+		policy.max_writers = pool_room;
+	}
 	return policy;
 }
 

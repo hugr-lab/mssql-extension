@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <mutex>
+#include "catalog/mssql_transaction_metadata.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/transaction/transaction.hpp"
@@ -81,6 +82,13 @@ public:
 	//! Generate next savepoint name (for future savepoint support)
 	string GetNextSavepointName();
 
+	//! The catalog metadata this transaction loaded or changed (issue #380).
+	//! Created on first use; dies with the transaction, so nothing of it
+	//! outlives COMMIT or ROLLBACK.
+	MSSQLTransactionMetadata &Metadata(ClientContext &context);
+	//! The same, or null when this transaction never touched metadata.
+	MSSQLTransactionMetadata *TryMetadata();
+
 private:
 	MSSQLCatalog &catalog_;
 
@@ -130,6 +138,9 @@ private:
 
 	//! Counter for generating unique savepoint names
 	uint32_t savepoint_counter_ = 0;
+
+	mutable mutex metadata_mutex_;
+	unique_ptr<MSSQLTransactionMetadata> metadata_;
 };
 
 //===----------------------------------------------------------------------===//

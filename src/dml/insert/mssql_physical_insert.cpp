@@ -212,7 +212,8 @@ void OpenSharedStream(ClientContext &context, MSSQLInsertGlobalSinkState &gstate
 	// mssql_copy_parallel_writers, each in its own server transaction.
 	const auto policy = MSSQLResolveLoadPolicy(bulk.target.is_temp_table, gstate.transaction_pinned,
 											   MSSQLLoadTransactionRole::JoinsTransaction, bulk.configured_writers,
-											   static_cast<uint64_t>(context.db->NumberOfThreads()));
+											   static_cast<uint64_t>(context.db->NumberOfThreads()),
+											   static_cast<uint64_t>(catalog.GetConnectionLimit()));
 	gstate.parallel_writer_limit = static_cast<idx_t>(policy.max_writers);
 
 	// Then a rule COPY does not need, because COPY's writers commit every batch
@@ -377,6 +378,7 @@ SinkResultType MSSQLPhysicalInsert::Sink(ExecutionContext &context, DataChunk &c
 							(unsigned long long)gstate.parallel_writer_limit);
 			break;
 		case mssql::BulkLoadSession::Claim::GateClosed:
+		case mssql::BulkLoadSession::Claim::Busy:
 			break;
 		case mssql::BulkLoadSession::Claim::Unavailable:
 			lstate.may_claim = false;

@@ -129,11 +129,10 @@ void CTASExecutionState::ExecuteDDL(ClientContext &context) {
 	DebugLog(2, "Executing DDL: %s", ddl_sql.c_str());
 
 	try {
-		// Execute CREATE TABLE using catalog's DDL execution method
-		catalog->ExecuteDDL(context, ddl_sql);
+		RunDDL(context, ddl_sql);
 		if (!post_ddl_sql.empty()) {
 			DebugLog(2, "Executing post-DDL: %s", post_ddl_sql.c_str());
-			catalog->ExecuteDDL(context, post_ddl_sql);
+			RunDDL(context, post_ddl_sql);
 		}
 
 		auto ddl_end = std::chrono::steady_clock::now();
@@ -212,7 +211,7 @@ void CTASExecutionState::ExecuteDrop(ClientContext &context) {
 	DebugLog(2, "Executing DROP for OR REPLACE: %s", drop_sql.c_str());
 
 	try {
-		catalog->ExecuteDDL(context, drop_sql);
+		RunDDL(context, drop_sql);
 		DebugLog(1, "DROP TABLE completed for OR REPLACE");
 	} catch (std::exception &e) {
 		// DROP failed - rethrow with context
@@ -230,22 +229,7 @@ bool CTASExecutionState::TableExists(ClientContext &context) {
 		StringUtil::Format("SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '%s' AND TABLE_NAME = '%s'",
 						   MSSQLDDLTranslator::EscapeStringLiteral(target.schema_name),
 						   MSSQLDDLTranslator::EscapeStringLiteral(target.table_name));
-
-	auto &pool = catalog->GetConnectionPool();
-	std::string why;
-	auto conn = pool.Acquire(-1, &why);
-	if (!conn) {
-		throw IOException("Failed to acquire connection to check table existence: " + why);
-	}
-
-	try {
-		auto result = MSSQLSimpleQuery::Execute(*conn, check_sql);
-		pool.Release(std::move(conn));
-		return result.HasRows();
-	} catch (...) {
-		pool.Release(std::move(conn));
-		throw;
-	}
+	return ProbeExists(context, check_sql, "table");
 }
 
 //===----------------------------------------------------------------------===//
@@ -255,16 +239,83 @@ bool CTASExecutionState::TableExists(ClientContext &context) {
 bool CTASExecutionState::SchemaExists(ClientContext &context) {
 	string check_sql = StringUtil::Format("SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = '%s'",
 										  MSSQLDDLTranslator::EscapeStringLiteral(target.schema_name));
+	return ProbeExists(context, check_sql, "schema");
+}
 
+//===----------------------------------------------------------------------===//
+// CTASExecutionState -- which connection (issue #380)
+//===----------------------------------------------------------------------===//
+
+void CTASExecutionState::ResolveConnectionMode(ClientContext &context, idx_t connection_limit) {
+	in_transaction = !context.transaction.IsAutoCommit();
+	single_connection = in_transaction && connection_limit <= 1;
+	if (connection_limit <= 1) {
+		// A bulk-load session takes its connection HERE, before the source scan
+		// initialises, and keeps it for the whole load: on a pool of one a scan
+		// of this catalog would then wait for it until mssql_acquire_timeout.
+		// Statements take theirs at the first batch, after the optimizer has
+		// materialised that scan and given the connection back.
+		DebugLog(1, "Pool of %llu connection(s): INSERT statements instead of a bulk load",
+				 (unsigned long long)connection_limit);
+		config.use_bcp = false;
+	}
+	if (single_connection) {
+		DebugLog(1, "Single-connection mode: checks, DDL and rows on the transaction's pinned connection");
+		// The CREATE is inside the transaction: ROLLBACK is the complete undo,
+		// and a cleanup DROP would wait for a pool connection that is pinned.
+		config.drop_on_failure = false;
+	}
+}
+
+void CTASExecutionState::RunDDL(ClientContext &context, const string &sql) {
+	if (!single_connection) {
+		// A pool connection, autocommitting: the table outlives a ROLLBACK, and
+		// mssql_ctas_drop_on_failure is the undo (see ExecuteBCPInsert).
+		catalog->ExecuteDDL(context, sql);
+		return;
+	}
+	auto conn = ConnectionProvider::GetConnection(context, *catalog);
+	if (!conn) {
+		throw IOException("CTAS: failed to get the transaction's connection for DDL");
+	}
+	SimpleQueryResult result;
+	try {
+		result = MSSQLSimpleQuery::Execute(*conn, sql);
+	} catch (...) {
+		ConnectionProvider::ReleaseConnection(context, *catalog, conn);
+		throw;
+	}
+	ConnectionProvider::ReleaseConnection(context, *catalog, conn);
+	if (!result.success) {
+		throw CatalogException("MSSQL DDL error: %s", result.DescribeError());
+	}
+}
+
+bool CTASExecutionState::ProbeExists(ClientContext &context, const string &sql, const char *what) {
+	if (in_transaction) {
+		// The pinned connection sees what this transaction created or dropped,
+		// and is not blocked by its schema locks (issue #380).
+		auto conn = ConnectionProvider::GetConnection(context, *catalog);
+		if (!conn) {
+			throw IOException("Failed to get the transaction's connection to check %s existence", what);
+		}
+		try {
+			auto result = MSSQLSimpleQuery::Execute(*conn, sql);
+			ConnectionProvider::ReleaseConnection(context, *catalog, conn);
+			return result.HasRows();
+		} catch (...) {
+			ConnectionProvider::ReleaseConnection(context, *catalog, conn);
+			throw;
+		}
+	}
 	auto &pool = catalog->GetConnectionPool();
 	std::string why;
 	auto conn = pool.Acquire(-1, &why);
 	if (!conn) {
-		throw IOException("Failed to acquire connection to check schema existence: " + why);
+		throw IOException("Failed to acquire connection to check %s existence: %s", what, why);
 	}
-
 	try {
-		auto result = MSSQLSimpleQuery::Execute(*conn, check_sql);
+		auto result = MSSQLSimpleQuery::Execute(*conn, sql);
 		pool.Release(std::move(conn));
 		return result.HasRows();
 	} catch (...) {
@@ -301,6 +352,9 @@ void CTASExecutionState::FlushInserts(ClientContext &context) {
 
 		try {
 			insert_executor->Finalize();
+			// The executor's own total: Finalize sends the last batch, and its
+			// rows used to be missing from the count CTAS reports.
+			rows_inserted = insert_executor->GetTotalRowsInserted();
 
 			auto insert_end = std::chrono::steady_clock::now();
 			insert_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(insert_end - insert_start).count();
@@ -330,6 +384,12 @@ void CTASExecutionState::AttemptCleanupNoContext() noexcept {
 		return;
 	}
 	cleanup_attempted = true;
+
+	// The INSERT path's statement connection holds its server transaction, and
+	// with it locks on the very table the DROP needs, until it is released; on
+	// a pool of one it is also the only connection the DROP could take.
+	// Releasing it rolls that transaction back.
+	insert_executor.reset();
 
 	auto pool = pool_handle.lock();
 	if (!pool) {

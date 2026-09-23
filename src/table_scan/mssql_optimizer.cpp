@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
@@ -739,19 +740,40 @@ static void CollectSinkCatalogs(LogicalOperator &op, case_insensitive_set_t &cat
 			MSSQL_OPT_DEBUG(1, "sink: INSERT into catalog '%s'", catalog.GetName().GetIdentifierName().c_str());
 			catalogs.insert(catalog.GetName().GetIdentifierName());
 		}
+	} else if (op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE) {
+		// Issue #380: a CTAS into this catalog. On a pool of one its rows go as
+		// statements on the one connection -- pinned in a transaction, the pool's
+		// only one outside it -- which the source scan must have given back first.
+		auto &catalog = op.Cast<LogicalCreateTable>().schema.ParentCatalog();
+		if (catalog.GetCatalogType() == "mssql") {
+			MSSQL_OPT_DEBUG(1, "sink: CTAS into catalog '%s'", catalog.GetName().GetIdentifierName().c_str());
+			catalogs.insert(catalog.GetName().GetIdentifierName());
+		}
 	}
 	for (auto &child : op.children) {
 		CollectSinkCatalogs(*child, catalogs);
 	}
 }
 
+//! Issue #380: the catalog's pool holds at most one connection. Then autocommit
+//! shares one connection between the scans and the sink as surely as a
+//! transaction does -- they merely take turns at the pool -- and a scan still
+//! streaming holds the only connection the next one waits for until
+//! mssql_acquire_timeout.
+static bool HasSingleConnectionPool(ClientContext &context, const string &catalog_name) {
+	auto catalog = Catalog::GetCatalogEntry(context, Identifier(catalog_name));
+	if (!catalog || catalog->GetCatalogType() != "mssql") {
+		return false;
+	}
+	return catalog->Cast<MSSQLCatalog>().GetConnectionLimit() <= 1;
+}
+
 static void MaterializeSharedConnectionScans(ClientContext &context, LogicalOperator &plan) {
 	// Autocommit gives every scan its own pooled connection, so there is nothing
-	// to share and nothing to serialize. This is the same test the DML executors
-	// use to decide whether they are on a pinned connection.
-	if (context.transaction.IsAutoCommit()) {
-		return;
-	}
+	// to share and nothing to serialize -- unless the pool has only one to give
+	// (HasSingleConnectionPool). The transaction test is the same one the DML
+	// executors use to decide whether they are on a pinned connection.
+	const bool autocommit = context.transaction.IsAutoCommit();
 	// Case-insensitive, like sink_catalogs below and like DuckDB's own catalog
 	// lookup: the two producers of this key spell it differently. A catalog
 	// scan is keyed by MSSQLCatalog::GetContextName() (the alias as ATTACHed),
@@ -764,12 +786,19 @@ static void MaterializeSharedConnectionScans(ClientContext &context, LogicalOper
 	// consistency fix -- the key must agree with DuckDB's case-insensitive
 	// catalog names, as sink_catalogs below already does -- and the test in
 	// test/sql/transaction says the same in its header. The has_sink lookup
-	// had the same split.
+	// had the same split. HasSingleConnectionPool looks the key up through
+	// DuckDB's case-insensitive catalog lookup, so either spelling finds it.
 	case_insensitive_map_t<MSSQLCatalogScanTally> by_catalog;
 	CollectCatalogScans(plan, by_catalog);
+	if (by_catalog.empty()) {
+		return;
+	}
 	case_insensitive_set_t sink_catalogs;
 	CollectSinkCatalogs(plan, sink_catalogs);
 	for (auto &entry : by_catalog) {
+		if (autocommit && !HasSingleConnectionPool(context, entry.first)) {
+			continue;
+		}
 		auto &tally = entry.second;
 		const idx_t scans = tally.catalog_scans.size() + tally.raw_scans;
 		const bool has_sink = sink_catalogs.count(entry.first) > 0;
