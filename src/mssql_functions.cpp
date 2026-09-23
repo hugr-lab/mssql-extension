@@ -5,6 +5,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
@@ -408,8 +409,17 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 		// wrong password reported as "Raise mssql_connection_limit" points at
 		// the wrong knob, so the reason decides, and anything else is rethrown
 		// unchanged rather than flattened into an IOException.
-		const string reason = e.what();
-		const bool exhausted = reason.find("timed out") != string::npos;
+		// RawMessage, not what(): on the 2.0 line a DuckDB exception's what() is
+		// its JSON envelope, and CreateNewConnection already had to stop pasting
+		// `{"exception_type":"Connection",...}` into the user's error.
+		const string reason = ErrorData(e).RawMessage();
+		// The pool's own exhaustion shape, not the words: DescribeTimeoutLocked
+		// always renders `' timed out (`. Matching bare "timed out" also caught a
+		// DIAL timeout -- the socket says "Connection timed out" and the factory
+		// wraps it as "could not create a connection: TCP connect ... Connection
+		// timed out" -- so an unreachable host was told to raise the connection
+		// limit, which is the one misattribution this branch exists to remove.
+		const bool exhausted = reason.find("' timed out (") != string::npos;
 		if (bind_data.prepared && exhausted) {
 			throw IOException(
 				"mssql_scan: could not acquire a connection for '%s' while binding a `prepared := true` scan: %s. "
@@ -448,6 +458,11 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 				// state over this same (shared) bind data needs a way to run.
 				bind_data.fallback_sql = bind_data.execute_sql;
 				bind_data.execute_sql = params.ExecuteByHandleBatch(handle);
+				// Said where the pair is set: InitGlobal falls back to fallback_sql
+				// whenever it cannot claim the session, and execute_sql is by then
+				// a handle only that session can use. Setting one without the other
+				// would send that handle down a pooled connection.
+				D_ASSERT(!bind_data.fallback_sql.empty());
 				MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: prepared handle %d", (int)handle);
 			} else {
 				// The server took the statement but did not settle its shape (a
@@ -646,15 +661,6 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 			// default path would have served.
 			MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: prepared session already claimed, running ad-hoc");
 			stream = executor.Execute(context, bind_data.fallback_sql);
-		} else if (lost_claim) {
-			// execute_sql is the sp_execute form and its handle lives in a session
-			// this global state does not hold, so running it on a pooled connection
-			// would send a handle the server never gave that session. The two are
-			// set together today, so this is a guard for a future caller that sets
-			// one without the other, not a reachable path.
-			throw InternalException(
-				"mssql_scan: prepared session for '%s' is unavailable and no ad-hoc statement was prepared for it",
-				bind_data.context_name);
 		} else {
 			stream = executor.Execute(context, bind_data.execute_sql);
 		}

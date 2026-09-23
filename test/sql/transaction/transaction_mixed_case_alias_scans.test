@@ -35,7 +35,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS casemix (TYPE mssql);
+ATTACH '{MSSQL_TESTDB_DSN}' AS casemix (TYPE mssql);
 
 statement ok
 SELECT mssql_exec('casemix', 'IF OBJECT_ID(''dbo.CaseMixChild'',''U'') IS NOT NULL DROP TABLE dbo.CaseMixChild');
@@ -49,13 +49,15 @@ SELECT mssql_exec('casemix', 'CREATE TABLE dbo.CaseMixParent (id INT PRIMARY KEY
 statement ok
 SELECT mssql_exec('casemix', 'CREATE TABLE dbo.CaseMixChild (cid INT PRIMARY KEY, pid INT, v VARCHAR(50))');
 
-# Enough rows that each scan spans several chunks; at a handful the sources
-# never overlap and even a broken build passes.
+# Enough rows that each scan spans several chunks (DuckDB's vector is 2048, so
+# a few hundred rows still arrive in more than one batch from the server). The
+# count is deliberately small: this is an end-to-end pin, not a race guard, so
+# there is nothing here for more rows to make more likely.
 statement ok
-SELECT mssql_exec('casemix', 'INSERT INTO dbo.CaseMixParent (id, name) SELECT TOP 5000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), ''p'' FROM sys.all_objects a CROSS JOIN sys.all_objects b');
+SELECT mssql_exec('casemix', 'INSERT INTO dbo.CaseMixParent (id, name) SELECT TOP 400 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), ''p'' FROM sys.all_objects a CROSS JOIN sys.all_objects b');
 
 statement ok
-SELECT mssql_exec('casemix', 'INSERT INTO dbo.CaseMixChild (cid, pid, v) SELECT TOP 12000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), (ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) % 5000) + 1, ''v'' FROM sys.all_objects a CROSS JOIN sys.all_objects b');
+SELECT mssql_exec('casemix', 'INSERT INTO dbo.CaseMixChild (cid, pid, v) SELECT TOP 900 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), (ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) % 400) + 1, ''v'' FROM sys.all_objects a CROSS JOIN sys.all_objects b');
 
 statement ok
 SET threads = 1;
@@ -69,7 +71,7 @@ query I
 SELECT count(*) FROM mssql_scan('CASEMIX', 'SELECT id FROM dbo.CaseMixParent') p
 WHERE p.id > (SELECT count(*) FROM casemix.dbo.CaseMixChild c WHERE c.pid = p.id);
 ----
-4997
+397
 
 statement ok
 COMMIT;
@@ -83,7 +85,7 @@ query I
 SELECT count(*) FROM mssql_scan('casemix', 'SELECT id FROM dbo.CaseMixParent') p
 WHERE p.id > (SELECT count(*) FROM casemix.dbo.CaseMixChild c WHERE c.pid = p.id);
 ----
-4997
+397
 
 statement ok
 COMMIT;

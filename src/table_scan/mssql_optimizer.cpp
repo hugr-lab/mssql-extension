@@ -757,9 +757,14 @@ static void MaterializeSharedConnectionScans(ClientContext &context, LogicalOper
 	// scan is keyed by MSSQLCatalog::GetContextName() (the alias as ATTACHed),
 	// a raw mssql_scan by the user's literal first argument. Keyed by case,
 	// `FROM mssql_scan('SK75', ...) x, sk75.dbo.t y` tallied as two catalogs of
-	// one scan each, neither reached `scans < 2`, and the two scans then
-	// collided on the pinned connection -- the #239 shape this function
-	// exists to prevent. The has_sink lookup had the same split.
+	// one scan each, and neither reached `scans < 2`. Measured both ways, that
+	// split does not currently produce the #239 collision: a raw scan
+	// materialises at InitGlobal unconditionally inside a transaction (spec
+	// 075), so the two never hold the connection at once. This is a
+	// consistency fix -- the key must agree with DuckDB's case-insensitive
+	// catalog names, as sink_catalogs below already does -- and the test in
+	// test/sql/transaction says the same in its header. The has_sink lookup
+	// had the same split.
 	case_insensitive_map_t<MSSQLCatalogScanTally> by_catalog;
 	CollectCatalogScans(plan, by_catalog);
 	case_insensitive_set_t sink_catalogs;
