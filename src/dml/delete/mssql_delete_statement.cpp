@@ -2,6 +2,7 @@
 #include "dml/insert/mssql_value_serializer.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "query/mssql_sql_params.hpp"
 
 namespace duckdb {
 
@@ -12,14 +13,7 @@ MSSQLDeleteStatement::MSSQLDeleteStatement(const MSSQLDeleteTarget &target) : ta
 }
 
 string MSSQLDeleteStatement::EscapeIdentifier(const string &identifier) {
-	// Escape square brackets within the identifier by doubling them
-	string escaped = identifier;
-	size_t pos = 0;
-	while ((pos = escaped.find(']', pos)) != string::npos) {
-		escaped.insert(pos, "]");
-		pos += 2;
-	}
-	return "[" + escaped + "]";
+	return mssql::QuoteIdentifier(identifier);
 }
 
 string MSSQLDeleteStatement::GenerateDeleteClause() const {

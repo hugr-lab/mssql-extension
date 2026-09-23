@@ -1,0 +1,86 @@
+# name: test/sql/query/mssql_scan_native_types.test
+# description: mssql_scan reports bounded string columns as MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) with their collation, as the catalog does (spec 079 D3)
+# group: [query]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The catalog has reported a bounded string column as MSSQL_VARCHAR(n) /
+# MSSQL_NVARCHAR(n), carrying the column's collation, since spec 060, so that a
+# table created from it inherits the declared type. mssql_scan read only the
+# type NAME of sp_describe_first_result_set's answer and reported plain
+# VARCHAR, so `CREATE TABLE … AS SELECT * FROM mssql_scan(…)` made
+# nvarchar(max) columns where the catalog path made varchar(n) with the
+# source's collation. It now reads the length and the collation_name too,
+# through the catalog's own MSSQLColumnInfo::NativeDuckDBType. The remote-
+# pushdown vehicle (spec 079) is mssql_scan_params, so a pushed CTAS depends on
+# this.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS snt (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('snt', 'DROP TABLE IF EXISTS dbo.snt_src, dbo.snt_dst');
+
+statement ok
+SELECT mssql_exec('snt', 'CREATE TABLE dbo.snt_src (
+	v varchar(20) COLLATE Latin1_General_100_BIN2_UTF8 NULL,
+	c char(4) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	n nvarchar(30) NULL,
+	m varchar(max) NULL,
+	i int NULL);
+	INSERT INTO dbo.snt_src VALUES (''abc'', ''xy'', N''Привет'', ''long'', 7)');
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'SELECT v, c, n, m, i FROM dbo.snt_src'));
+----
+v	MSSQL_VARCHAR(20)
+c	MSSQL_VARCHAR(4)
+n	MSSQL_NVARCHAR(30)
+m	VARCHAR
+i	INTEGER
+
+# The values are unchanged.
+query TTTTI
+SELECT v, trim(c), n, m, i FROM mssql_scan('snt', 'SELECT v, c, n, m, i FROM dbo.snt_src');
+----
+abc	xy	Привет	long	7
+
+# mssql_scan_params, the remote-pushdown vehicle, the same.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan_params('snt', 'SELECT v FROM dbo.snt_src WHERE i = @i', {'i': 7}));
+----
+v	MSSQL_VARCHAR(20)
+
+# A table created from it keeps the lengths and the collations.
+statement ok
+CREATE TABLE snt.dbo.snt_dst AS SELECT * FROM mssql_scan('snt', 'SELECT v, c, n FROM dbo.snt_src');
+
+query TTIT
+SELECT * FROM mssql_scan('snt', 'SELECT c.name, TYPE_NAME(c.user_type_id) AS t, CAST(c.max_length AS int) AS len, c.collation_name FROM sys.columns c WHERE c.object_id = OBJECT_ID(''dbo.snt_dst'') ORDER BY c.column_id');
+----
+v	varchar	20	Latin1_General_100_BIN2_UTF8
+c	varchar	4	SQL_Latin1_General_CP1_CI_AS
+n	nvarchar	60	SQL_Latin1_General_CP1_CI_AS
+
+# Off: plain VARCHAR, as before.
+statement ok
+SET mssql_catalog_native_types = false;
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'SELECT v FROM dbo.snt_src'));
+----
+v	VARCHAR
+
+statement ok
+RESET mssql_catalog_native_types;
+
+statement ok
+SELECT mssql_exec('snt', 'DROP TABLE dbo.snt_src, dbo.snt_dst');
+
+statement ok
+DETACH snt;

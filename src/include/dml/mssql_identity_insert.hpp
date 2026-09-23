@@ -13,19 +13,13 @@
 #include <cstdint>
 #include <string>
 
+#include "query/mssql_sql_params.hpp"
+
 namespace duckdb {
 namespace mssql {
 
 inline std::string BracketIdentifier(const std::string &name) {
-	std::string out = "[";
-	for (char c : name) {
-		if (c == ']') {
-			out += "]]";
-		} else {
-			out += c;
-		}
-	}
-	return out + "]";
+	return QuoteIdentifier(name);
 }
 
 //! `SET IDENTITY_INSERT [schema].[table] ON|OFF`. Sent as a batch of its own,

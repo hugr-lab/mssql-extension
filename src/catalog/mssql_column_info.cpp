@@ -5,6 +5,7 @@
 #include "codec/target_string_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/extension_type_info.hpp"
+#include "query/mssql_sql_params.hpp"
 #include "table_scan/filter_encoder.hpp"
 
 namespace duckdb {
@@ -335,6 +336,33 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 // Type Checks
 //===----------------------------------------------------------------------===//
 
+bool MSSQLColumnInfo::IsBinary2Collation(const string &collation_name) {
+	string upper_collation = collation_name;
+	std::transform(upper_collation.begin(), upper_collation.end(), upper_collation.begin(),
+				   [](unsigned char c) { return std::toupper(c); });
+	return upper_collation.find("_BIN2") != string::npos;
+}
+
+bool MSSQLColumnInfo::OrdersLikeDuckDB() const {
+	if (is_cast_required || is_geometry) {
+		return false;
+	}
+	string lower_type = sql_type_name;
+	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
+				   [](unsigned char c) { return std::tolower(c); });
+	if (lower_type == "uniqueidentifier" || lower_type == "sql_variant" || lower_type == "text" ||
+		lower_type == "ntext" || lower_type == "image" || lower_type == "xml") {
+		return false;
+	}
+	if (lower_type == "nvarchar" || lower_type == "nchar") {
+		return IsBinary2Collation(collation_name);
+	}
+	if (lower_type == "varchar" || lower_type == "char") {
+		return IsBinary2Collation(collation_name) && is_utf8;
+	}
+	return true;
+}
+
 bool MSSQLColumnInfo::IsSpatialType(const string &sql_type_name) {
 	string lower_type = sql_type_name;
 	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
@@ -462,7 +490,7 @@ string NVarcharLength(const string &sql_type_name, int16_t max_length) {
 string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string &sql_type_name, int16_t max_length,
 											const string &collation_name, bool convert_varchar_max,
 											const string &qualifier) {
-	const string escaped_name = "[" + mssql::FilterEncoder::EscapeBracketIdentifier(col_name) + "]";
+	const string escaped_name = mssql::QuoteIdentifier(col_name);
 	const string reference = qualifier + escaped_name;
 
 	if (IsSpatialType(sql_type_name)) {

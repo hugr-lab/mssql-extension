@@ -1,0 +1,89 @@
+# name: test/sql/catalog/identifier_quoting.test
+# description: Table and column names with ] and ' work through every write and pushdown path (one identifier quoter, spec 079 W4)
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The extension had eight copies of its bracket quoter and six places that put
+# brackets around a name without doubling `]`. A table or column named `q]t`
+# therefore broke COPY's and INSERT's bulk load (`INSERT BULK [dbo].[q]t] ([c]1]
+# ...)`), a rowid DELETE, and the target-shape probe, whose `OBJECT_ID('...')`
+# literal also broke on a `'` in the name. Every identifier now goes through
+# mssql::QuoteIdentifier, and a name inside a string literal through
+# mssql::NVarcharLiteral.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS tq (TYPE mssql, order_pushdown true);
+
+statement ok
+SELECT mssql_exec('tq', 'DROP TABLE IF EXISTS dbo.[q]]t''x], dbo.[c]]tas''x]');
+
+statement ok
+SELECT mssql_exec('tq', 'CREATE TABLE dbo.[q]]t''x] ([c]]1] int NOT NULL PRIMARY KEY, [v''] nvarchar(10) NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('tq');
+
+# 1500 rows: above mssql_insert_bcp_threshold, so the INSERT loads through
+# INSERT BULK -- its column list and the target-shape probe.
+query I
+INSERT INTO tq.dbo."q]t'x" SELECT i::INTEGER, 'x' FROM range(1, 1501) t(i);
+----
+1500
+
+# Statement path, below the threshold.
+query I
+INSERT INTO tq.dbo."q]t'x" VALUES (1501, 'y');
+----
+1
+
+# Filter pushdown on the quoted column.
+query I
+SELECT count(*) FROM tq.dbo."q]t'x" WHERE "v'" = 'y';
+----
+1
+
+# ORDER BY pushdown on the quoted key (NOT NULL int: pushed).
+query I
+SELECT "c]1" FROM tq.dbo."q]t'x" ORDER BY "c]1" DESC LIMIT 2;
+----
+1501
+1500
+
+# rowid UPDATE and DELETE.
+query I
+UPDATE tq.dbo."q]t'x" SET "v'" = 'z' WHERE "c]1" <= 10;
+----
+10
+
+query I
+DELETE FROM tq.dbo."q]t'x" WHERE "c]1" > 1000;
+----
+501
+
+query II
+SELECT count(*), count(*) FILTER (WHERE "v'" = 'z') FROM tq.dbo."q]t'x";
+----
+1000	10
+
+# CTAS into a quoted name with a quoted column (DDL + bulk load).
+query I
+CREATE TABLE tq.dbo."c]tas'x" AS SELECT i::INTEGER AS "k]1" FROM range(5) t(i);
+----
+5
+
+query I
+SELECT sum("k]1") FROM tq.dbo."c]tas'x";
+----
+10
+
+statement ok
+SELECT mssql_exec('tq', 'DROP TABLE dbo.[q]]t''x], dbo.[c]]tas''x]');
+
+statement ok
+DETACH tq;

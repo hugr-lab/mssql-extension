@@ -3,6 +3,8 @@
 #include <climits>
 #include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_column_info.hpp"
+#include "catalog/mssql_table_entry.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/common/error_data.hpp"
@@ -252,14 +254,61 @@ static bool DescribedTypeToTdsMetadata(const string &base, int16_t max_length, u
 	return true;
 }
 
+// The type a described / prepared string column is reported as under
+// mssql_catalog_native_types: MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) through the
+// catalog's own MSSQLColumnInfo::NativeDuckDBType -- so a raw scan and a catalog
+// read of the same column report the same type -- and `stream_type` otherwise.
+// `max_length` in bytes as the server reports it (-1 = MAX). `collation` is the
+// describe's collation_name; sp_prepare's COLMETADATA carries a collation id,
+// not a name, so that path passes none and only the length travels (the two
+// paths still report the same TYPE; a CTAS from a prepared scan gets the
+// database's default collation where a described one keeps the source's).
+static LogicalType NativeStringType(const LogicalType &stream_type, bool native_types, const string &base,
+									int16_t max_length, const string &collation) {
+	if (!native_types || stream_type.id() != LogicalTypeId::VARCHAR ||
+		!(base == "char" || base == "varchar" || base == "nchar" || base == "nvarchar")) {
+		return stream_type;
+	}
+	MSSQLColumnInfo info(string(), 0, base, max_length, 0, 0, true, collation, string());
+	return info.NativeDuckDBType();
+}
+
+// The stream decodes a string column as plain VARCHAR; the bind may have
+// reported it as MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n), the same physical type
+// with a name on it (spec 060). Those agree; anything else is a changed shape.
+static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const vector<LogicalType> &stream) {
+	if (bound.size() != stream.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < bound.size(); i++) {
+		if (bound[i] == stream[i]) {
+			continue;
+		}
+		if (bound[i].id() == LogicalTypeId::VARCHAR && stream[i].id() == LogicalTypeId::VARCHAR) {
+			continue;
+		}
+		return false;
+	}
+	return true;
+}
+
 // sp_describe_first_result_set: one row per column of the FIRST result set,
 // which is also the one MSSQLResultStream serves (a second COLMETADATA is an
 // error there). Each row is turned into the COLMETADATA the server would send
 // for it and mapped by the stream's own converter, so a type the stream
 // refuses (sql_variant, a UDT) is refused here, at bind, with the same message
 // it always had.
+//
+// `native_types` (mssql_catalog_native_types): a bounded char / varchar /
+// nchar / nvarchar column is reported as MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n)
+// with the column's collation, through the SAME MSSQLColumnInfo::
+// NativeDuckDBType the catalog uses, so `CREATE TABLE … AS SELECT * FROM
+// mssql_scan(…)` keeps the source's lengths and collations the way a catalog
+// read does (spec 079 D3). The values are ordinary strings either way.
+// sp_prepare's COLMETADATA and a statement run at bind carry the collation as
+// an id, not a name, so those two shapes stay plain VARCHAR.
 static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection, const string &statement,
-												  const string &declarations, int timeout_ms) {
+												  const string &declarations, int timeout_ms, bool native_types) {
 	MSSQLDescribedShape shape;
 	string batch = "EXEC sp_describe_first_result_set " + mssql::NVarcharLiteral(statement) + ", " +
 				   (declarations.empty() ? string("NULL") : mssql::NVarcharLiteral(declarations)) + ", 0";
@@ -275,6 +324,7 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 	const int scale_idx = FindResultColumn(result.column_names, "scale");
 	const int hidden_idx = FindResultColumn(result.column_names, "is_hidden");
 	const int err_idx = FindResultColumn(result.column_names, "error_number");
+	const int collation_idx = FindResultColumn(result.column_names, "collation_name");
 	if (name_idx < 0 || type_idx < 0 || len_idx < 0 || prec_idx < 0 || scale_idx < 0) {
 		shape.reason = "sp_describe_first_result_set answered with an unexpected shape";
 		return shape;
@@ -310,7 +360,12 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 			shape.reason = "the describe names a type this extension does not map: " + type_name;
 			return shape;
 		}
-		shape.types.push_back(tds::encoding::TypeConverter::GetDuckDBType(column));
+		string collation;
+		if (collation_idx >= 0 && row[collation_idx] != "NULL") {
+			collation = row[collation_idx];
+		}
+		shape.types.push_back(NativeStringType(tds::encoding::TypeConverter::GetDuckDBType(column), native_types, base,
+											   max_length, collation));
 		shape.names.push_back(column.name);
 	}
 	if (shape.types.empty()) {
@@ -325,7 +380,8 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 // COLMETADATA (a zero-row result set) before the handle. The types are read
 // off that token exactly as the stream reads them at execution.
 static MSSQLDescribedShape PrepareStatement(tds::TdsConnection &connection, const string &statement,
-											const string &declarations, int timeout_ms, int32_t &handle) {
+											const string &declarations, int timeout_ms, int32_t &handle,
+											bool native_types) {
 	MSSQLDescribedShape shape;
 	string batch = "DECLARE @h int;\nEXEC sp_prepare @h OUTPUT, " +
 				   (declarations.empty() ? string("NULL") : mssql::NVarcharLiteral(declarations)) + ", " +
@@ -345,7 +401,26 @@ static MSSQLDescribedShape PrepareStatement(tds::TdsConnection &connection, cons
 		return shape;
 	}
 	for (const auto &col : result.result_sets.front()) {
-		shape.types.push_back(tds::encoding::TypeConverter::GetDuckDBType(col));
+		string base;
+		switch (col.type_id) {
+		case tds::TDS_TYPE_BIGCHAR:
+			base = "char";
+			break;
+		case tds::TDS_TYPE_BIGVARCHAR:
+			base = "varchar";
+			break;
+		case tds::TDS_TYPE_NCHAR:
+			base = "nchar";
+			break;
+		case tds::TDS_TYPE_NVARCHAR:
+			base = "nvarchar";
+			break;
+		default:
+			break;
+		}
+		const int16_t max_length = col.max_length == 0xFFFF ? int16_t(-1) : static_cast<int16_t>(col.max_length);
+		shape.types.push_back(NativeStringType(tds::encoding::TypeConverter::GetDuckDBType(col), native_types, base,
+											   max_length, string()));
 		shape.names.push_back(col.name);
 	}
 	shape.ok = true;
@@ -439,7 +514,8 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	try {
 		if (wanted_prepared) {
 			int32_t handle = 0;
-			shape = PrepareStatement(*connection, bind_data.query, declarations, timeout_ms, handle);
+			shape = PrepareStatement(*connection, bind_data.query, declarations, timeout_ms, handle,
+									 MSSQLReportsNativeTypes(mssql_catalog));
 			if (shape.ok) {
 				auto session = make_shared_ptr<MSSQLPreparedSession>();
 				session->handle = handle;
@@ -474,10 +550,12 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 				MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: sp_prepare gave no shape (%s), describing instead",
 								   shape.reason.c_str());
 				bind_data.prepared = false;
-				shape = DescribeFirstResultSet(*connection, bind_data.query, declarations, timeout_ms);
+				shape = DescribeFirstResultSet(*connection, bind_data.query, declarations, timeout_ms,
+											   MSSQLReportsNativeTypes(mssql_catalog));
 			}
 		} else {
-			shape = DescribeFirstResultSet(*connection, bind_data.query, declarations, timeout_ms);
+			shape = DescribeFirstResultSet(*connection, bind_data.query, declarations, timeout_ms,
+										   MSSQLReportsNativeTypes(mssql_catalog));
 		}
 	} catch (...) {
 		ConnectionProvider::ReleaseConnection(context, mssql_catalog, std::move(connection));
@@ -685,7 +763,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 			stream = executor.Execute(context, bind_data.execute_sql);
 		}
 		stream->SurfaceWarnings(context);
-		if (stream->GetColumnTypes() != bind_data.return_types) {
+		if (!StreamMatchesBoundShape(bind_data.return_types, stream->GetColumnTypes())) {
 			// The described shape is what the plan was built on; serving rows of
 			// another shape would be a silent wrong answer.
 			throw InvalidInputException(

@@ -1,4 +1,5 @@
 #include "catalog/mssql_table_options.hpp"
+#include "query/mssql_sql_params.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -8,15 +9,7 @@
 namespace duckdb {
 
 static string QuoteName(const string &name) {
-	string escaped;
-	escaped.reserve(name.size() + 2);
-	for (const char c : name) {
-		escaped += c;
-		if (c == ']') {
-			escaped += ']';
-		}
-	}
-	return "[" + escaped + "]";
+	return mssql::QuoteIdentifier(name);
 }
 
 static MSSQLTableKind ParseTableKind(const string &value) {

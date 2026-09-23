@@ -2,29 +2,13 @@
 // Feature: 013-table-scan-filter-refactor
 
 #include "table_scan/table_scan_bind.hpp"
+#include "query/mssql_sql_params.hpp"
 
 namespace duckdb {
 namespace mssql {
 
 std::string TableScanBindData::GetFullTableName() const {
-	// Returns [schema].[table] format
-	std::string result = "[";
-	// Escape ] as ]]
-	for (char c : schema_name) {
-		result += c;
-		if (c == ']') {
-			result += ']';
-		}
-	}
-	result += "].[";
-	for (char c : table_name) {
-		result += c;
-		if (c == ']') {
-			result += ']';
-		}
-	}
-	result += "]";
-	return result;
+	return mssql::QuoteIdentifier(schema_name) + "." + mssql::QuoteIdentifier(table_name);
 }
 
 bool TableScanBindData::IsValidColumnIndex(idx_t idx) const {

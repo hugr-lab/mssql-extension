@@ -56,6 +56,31 @@ struct MSSQLColumnInfo {
 	static bool IsCaseSensitiveCollation(const string &collation_name);
 	static bool IsAccentSensitiveCollation(const string &collation_name);
 	static bool IsUTF8Collation(const string &collation_name);
+	//! A `_BIN2` collation: pure code-unit comparison. Not `_BIN`, which compares
+	//! the first character by code point and the rest byte by byte -- little-
+	//! endian on nvarchar, so not code-unit order at all.
+	static bool IsBinary2Collation(const string &collation_name);
+
+	//! Whether the SERVER, ordering by this column, gives the order DuckDB gives
+	//! the values it reads (issue #362, spec 079 D4 "orders are DuckDB's"). THE
+	//! predicate: MSSQLOptimizer's ORDER BY / TOP pushdown and the remote-
+	//! pushdown writer both ask it, so a query cannot sort one way through one
+	//! path and another way through the other.
+	//!
+	//! A string orders like DuckDB only under a binary collation whose bytes are
+	//! code points: `nvarchar`/`nchar` under `_BIN2` (UTF-16 code units -- exact
+	//! through the BMP), `varchar`/`char` under `_BIN2_UTF8`. A `varchar` under a
+	//! code-page `_BIN2` orders the code page's bytes (measured: € 0x80 before
+	//! Š 0x8A before é 0xE9), and every non-binary collation is linguistic. The
+	//! one residual is padding: the server calls `ab` and `ab ` equal, so their
+	//! relative order is a tie either side breaks as it likes.
+	//!
+	//! Refused outright: `uniqueidentifier` (the server compares its last six
+	//! bytes first; DuckDB orders a UUID lexicographically), `sql_variant` and
+	//! every cast-required type (ordered by type family, then value), and the
+	//! types the server cannot sort at all (text, ntext, image, xml, geometry,
+	//! geography).
+	bool OrdersLikeDuckDB() const;
 
 	// Map SQL Server type to DuckDB LogicalType
 	//! Spec 060: the type to REPORT for this column — MSSQL_VARCHAR(n) /

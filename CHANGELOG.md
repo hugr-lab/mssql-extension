@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Nullable ORDER BY keys are pushed** under `mssql_order_pushdown`. SQL Server
+  sorts NULL lowest and has no `NULLS FIRST` / `LAST`, so a nullable key asking
+  for another placement stopped the pushdown before. That included DuckDB's
+  default, `NULLS LAST` on an ascending key. A leading `CASE WHEN key IS NULL`
+  key now gets DuckDB's placement.
+- **`mssql_scan` reports `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` with the
+  column's collation**, as the catalog has since spec 060, under
+  `mssql_catalog_native_types`. `CREATE TABLE … AS SELECT * FROM mssql_scan(…)`
+  therefore keeps the source's lengths and collations instead of making
+  `nvarchar(max)`. With `prepared := true` the types are the same but no
+  collation travels: sp_prepare names the collation by id, not by name.
+
 - **`transaction_isolation`: the isolation level of explicit transactions**
   ([#331](https://github.com/hugr-lab/mssql-extension/issues/331)). The
   scans of one DuckDB transaction are separate statements on its pinned
@@ -52,6 +64,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted and ignored, is refused.
 
 ### Fixed
+
+- **ORDER BY pushdown returned SQL Server's order for string keys**
+  ([#362](https://github.com/hugr-lab/mssql-extension/issues/362)). With
+  `mssql_order_pushdown` on, a pushed ORDER BY removes DuckDB's own sort, and
+  nothing checked the key's collation. So `ORDER BY name` on a `varchar` under
+  the installation default `SQL_Latin1_General_CP1_CI_AS` came back in
+  linguistic order, with case and accents interleaved, instead of DuckDB's.
+  - **Rule:** a key is now pushed only when the server sorts it as DuckDB
+    does. For strings that means `nvarchar` under `_BIN2` or `varchar` under
+    `_BIN2_UTF8`.
+  - **Never pushed:** a `uniqueidentifier` (SQL Server compares its last six
+    bytes first) or a `sql_variant`.
+- **Names containing `]` broke the bulk load and DELETE.** Several places put
+  brackets around a table, schema or column name without doubling `]`: the
+  `INSERT BULK` of COPY / INSERT / CTAS, a rowid DELETE, and the target-shape
+  probe (whose `OBJECT_ID('…')` literal also broke on a `'`). Every identifier
+  now goes through one quoter, which replaced eight copies of it.
 
 - **A table created inside a transaction can be read in it; a pool of one
   connection works in a transaction**

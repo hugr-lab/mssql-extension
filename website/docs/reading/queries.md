@@ -89,8 +89,25 @@ ATTACH 'Server=...' AS db (TYPE mssql, order_pushdown true);
 - Multi-column: `ORDER BY category ASC, name DESC`
 - Combined with LIMIT: `ORDER BY id ASC LIMIT 10` → `SELECT TOP 10 ... ORDER BY [id] ASC`
 
+**The order is always DuckDB's.** A pushed ORDER BY removes DuckDB's own sort,
+so a key is pushed only when SQL Server sorts it the way DuckDB would:
+
+- a string key only under a binary collation whose bytes are code points —
+  `nvarchar` / `nchar` under a `_BIN2` collation, `varchar` / `char` under a
+  `_BIN2_UTF8` one (such as the extension's CTAS default,
+  `Latin1_General_100_BIN2_UTF8`). Under any other collation — including the
+  installation default `SQL_Latin1_General_CP1_CI_AS`, which orders
+  linguistically, and a code-page `_BIN2`, which orders the code page's bytes —
+  DuckDB sorts;
+- never a `uniqueidentifier` (SQL Server compares its last six bytes first) or a
+  `sql_variant`.
+
+**NULL placement.** SQL Server sorts NULL lowest (ASC → first, DESC → last) and
+has no `NULLS FIRST` / `LAST`. When a nullable key asks for the other placement —
+including DuckDB's default `NULLS LAST` on an ascending key — the pushdown adds a
+leading `CASE WHEN key IS NULL THEN … END` key to get DuckDB's placement.
+
 **Limitations:**
-- NULL ordering must match SQL Server defaults (ASC = NULLS FIRST, DESC = NULLS LAST); mismatched null ordering falls back to DuckDB
 - Only prefix pushdown: stops at first non-pushable column
 - Expressions like `ORDER BY col * 2` are not pushed
 

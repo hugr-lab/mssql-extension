@@ -13,6 +13,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "query/mssql_sql_params.hpp"
 
 namespace duckdb {
 
@@ -93,19 +94,7 @@ const char *DDLOperationToString(DDLOperation op) {
 //===----------------------------------------------------------------------===//
 
 string MSSQLDDLTranslator::QuoteIdentifier(const string &identifier) {
-	// SQL Server uses square brackets for quoting identifiers
-	// The ] character is escaped by doubling it: ] -> ]]
-	string result;
-	result.reserve(identifier.size() + 2);
-	result += '[';
-	for (char c : identifier) {
-		result += c;
-		if (c == ']') {
-			result += ']';	// Double the ] character
-		}
-	}
-	result += ']';
-	return result;
+	return mssql::QuoteIdentifier(identifier);
 }
 
 string MSSQLDDLTranslator::EscapeStringLiteral(const string &value) {

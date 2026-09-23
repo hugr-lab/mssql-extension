@@ -151,8 +151,9 @@ SET mssql_order_pushdown = false;
 # accepted, in its string form too -- the form DuckLake's METADATA_PARAMETERS
 # sends. The results above are the same pushed or not; the plan is what differs:
 # a pushed ORDER BY leaves no Order By operator above the scan. The key must be
-# NOT NULL -- order_pushdown_test.id is nullable, and a nullable key is never
-# pushed (DuckDB and SQL Server place NULLs differently) -- so the seed's
+# NOT NULL for this check -- order_pushdown_test.id is nullable, and a nullable
+# key whose NULL placement differs from the server's is pushed with an extra
+# CASE key (Test 12), which this check is not about -- so the seed's
 # TestSimplePK, whose id is its primary key.
 # =============================================================================
 
@@ -300,14 +301,22 @@ statement ok
 DROP TABLE local_test;
 
 # =============================================================================
-# Test 12 (T032): NULL ordering edge case - nullable column with non-default
-# null order should skip pushdown (DuckDB handles sort)
+# Test 12 (T032): NULL ordering edge case - nullable column whose requested NULL
+# placement differs from SQL Server's (NULL lowest: ASC -> first, DESC -> last).
+# Until spec 079 this skipped the pushdown; now the placement is emulated with a
+# leading `CASE WHEN score IS NULL THEN 1 ELSE 0 END` key and the sort runs on
+# the server. `, id` keeps the two NULL rows in a defined order: they tie on
+# score, and a tie is either side's to break.
 # =============================================================================
 
-# Nullable column + ASC NULLS LAST does NOT match SQL Server default (ASC NULLS FIRST)
-# Pushdown should be skipped, but results must still be correct
+# ASC NULLS LAST (DuckDB's default) against the server's ASC NULLS FIRST.
+query II
+EXPLAIN SELECT id, name, score FROM opd4.dbo.order_pushdown_test ORDER BY score ASC NULLS LAST, id;
+----
+physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
+
 query ITI
-SELECT id, name, score FROM opd4.dbo.order_pushdown_test ORDER BY score ASC NULLS LAST;
+SELECT id, name, score FROM opd4.dbo.order_pushdown_test ORDER BY score ASC NULLS LAST, id;
 ----
 8	Hank	70
 4	Diana	78
@@ -318,9 +327,9 @@ SELECT id, name, score FROM opd4.dbo.order_pushdown_test ORDER BY score ASC NULL
 2	Bob	NULL
 5	Eve	NULL
 
-# Nullable column + DESC NULLS FIRST does NOT match SQL Server default (DESC NULLS LAST)
+# DESC NULLS FIRST against the server's DESC NULLS LAST.
 query ITI
-SELECT id, name, score FROM opd4.dbo.order_pushdown_test ORDER BY score DESC NULLS FIRST;
+SELECT id, name, score FROM opd4.dbo.order_pushdown_test ORDER BY score DESC NULLS FIRST, id;
 ----
 2	Bob	NULL
 5	Eve	NULL

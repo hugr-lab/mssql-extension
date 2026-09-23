@@ -12,7 +12,10 @@
 # disagree, and this file is where a disagreement would first show. The
 # catalog's mapping (MapSQLServerTypeToDuckDB) is NOT used here: it reports
 # datetime2(3/7) as TIMESTAMP_MS/NS and rowversion as VARCHAR, which the stream
-# does not.
+# does not. The one exception is a bounded string column, which both paths
+# report as MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) under
+# mssql_catalog_native_types (spec 079 PR A) -- the catalog's own
+# NativeDuckDBType, the same physical type as the stream's VARCHAR.
 
 require mssql
 
@@ -36,11 +39,11 @@ c_decimal	DECIMAL(10,2)
 c_numeric	DECIMAL(5,0)
 c_money	DECIMAL(19,4)
 c_smallmoney	DECIMAL(10,4)
-c_char	VARCHAR
-c_varchar	VARCHAR
+c_char	MSSQL_VARCHAR(2)
+c_varchar	MSSQL_VARCHAR(10)
 c_varchar_max	VARCHAR
-c_nchar	VARCHAR
-c_nvarchar	VARCHAR
+c_nchar	MSSQL_NVARCHAR(2)
+c_nvarchar	MSSQL_NVARCHAR(10)
 c_nvarchar_max	VARCHAR
 c_text	VARCHAR
 c_ntext	VARCHAR

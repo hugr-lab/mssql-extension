@@ -46,7 +46,7 @@ SELECT COUNT(*) FROM mssql_scan('scandb', 'SELECT 1 AS val UNION ALL SELECT 2 UN
 query II
 SELECT typeof(id), typeof(name) FROM mssql_scan('scandb', 'SELECT CAST(1 AS INT) AS id, CAST(''test'' AS VARCHAR(50)) AS name');
 ----
-INTEGER	VARCHAR
+INTEGER	MSSQL_VARCHAR(50)
 
 # T047: Test filtering works on results
 query II

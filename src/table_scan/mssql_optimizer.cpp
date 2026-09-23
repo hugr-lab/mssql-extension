@@ -32,6 +32,7 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "mssql_functions.hpp"
 #include "mssql_storage.hpp"
+#include "query/mssql_sql_params.hpp"
 #include "table_scan/filter_encoder.hpp"
 #include "table_scan/function_mapping.hpp"
 
@@ -216,7 +217,7 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 			return false;
 		}
 		out_source_column = bind_data.all_column_names[table_col_idx];
-		out_fragment = "[" + mssql::FilterEncoder::EscapeBracketIdentifier(out_source_column) + "]";
+		out_fragment = mssql::QuoteIdentifier(out_source_column);
 		out_table_col_idx = table_col_idx;
 		return true;
 	}
@@ -251,7 +252,7 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 		}
 
 		string inner_col = bind_data.all_column_names[table_col_idx];
-		string escaped_col = "[" + mssql::FilterEncoder::EscapeBracketIdentifier(inner_col) + "]";
+		string escaped_col = mssql::QuoteIdentifier(inner_col);
 		string tmpl = mapping->sql_template;
 		size_t pos = tmpl.find("{0}");
 		if (pos != string::npos) {
@@ -267,22 +268,30 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 }
 
 //------------------------------------------------------------------------------
-// Helper: Validate NULL ordering compatibility with SQL Server
+// Helper: the ORDER BY term for one key, with DuckDB's NULL placement
 //------------------------------------------------------------------------------
-static bool IsNullOrderCompatible(OrderType order_type, OrderByNullType null_order, bool is_nullable) {
-	// If column is NOT NULL, NULL ordering is irrelevant
+//
+// SQL Server has no NULLS FIRST / LAST: NULL sorts lowest, so ASC puts NULLs
+// first and DESC last, while DuckDB's default is NULLS LAST both ways. A
+// nullable key whose requested placement differs from the server's used to
+// stop the pushdown -- so a bare `ORDER BY nullable_col` never pushed. It is
+// now emulated with a leading key that sorts NULL where DuckDB wants it:
+// `CASE WHEN x IS NULL THEN 1 ELSE 0 END, x ASC` for NULLS LAST ascending
+// (spec 079 D2, shared with the remote-pushdown writer). A NOT NULL key, or a
+// placement the server already has, gets the bare term, as before.
+static string OrderTerm(const string &fragment, OrderType order_type, OrderByNullType null_order, bool is_nullable) {
+	const bool descending = order_type == OrderType::DESCENDING;
+	const string term = fragment + (descending ? " DESC" : " ASC");
 	if (!is_nullable) {
-		return true;
+		return term;
 	}
-
-	// SQL Server defaults:
-	// ASC  -> NULLs FIRST
-	// DESC -> NULLs LAST
-	if (order_type == OrderType::ASCENDING) {
-		return null_order == OrderByNullType::NULLS_FIRST;
-	} else {
-		return null_order == OrderByNullType::NULLS_LAST;
+	const bool nulls_first = null_order == OrderByNullType::NULLS_FIRST;
+	const bool server_puts_nulls_first = !descending;
+	if (nulls_first == server_puts_nulls_first) {
+		return term;
 	}
+	// The leading key sorts ascending: the side that must come first gets 0.
+	return "CASE WHEN " + fragment + " IS NULL THEN " + (nulls_first ? "0 ELSE 1" : "1 ELSE 0") + " END, " + term;
 }
 
 //------------------------------------------------------------------------------
@@ -307,27 +316,26 @@ static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const L
 			break;	// Stop at first non-pushable column (prefix only)
 		}
 
-		// Validate NULL ordering
-		bool is_nullable = true;
-		if (table_col_idx < bind_data.mssql_columns.size()) {
-			is_nullable = bind_data.mssql_columns[table_col_idx].is_nullable;
-		}
-
-		if (!IsNullOrderCompatible(order.type, order.null_order, is_nullable)) {
-			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: NULL order mismatch for nullable column %s", (unsigned long long)i,
+		// Issue #362: the server's order must be DuckDB's. A string key under a
+		// linguistic or code-page collation, a uniqueidentifier, a sql_variant
+		// would come back in the server's order with DuckDB's sort removed from
+		// the plan. Unknown column metadata is refused the same way.
+		if (table_col_idx >= bind_data.mssql_columns.size() ||
+			!bind_data.mssql_columns[table_col_idx].OrdersLikeDuckDB()) {
+			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: %s does not order like DuckDB on the server", (unsigned long long)i,
 							source_column.c_str());
-			break;	// Stop at first incompatible column
+			break;	// Stop at first non-pushable column (prefix only)
 		}
+		const bool is_nullable = bind_data.mssql_columns[table_col_idx].is_nullable;
 
-		// Add direction suffix
-		string direction = (order.type == OrderType::DESCENDING) ? " DESC" : " ASC";
+		const string term = OrderTerm(fragment, order.type, order.null_order, is_nullable);
 		if (!order_clause.empty()) {
 			order_clause += ", ";
 		}
-		order_clause += fragment + direction;
+		order_clause += term;
 		pushed_count++;
 
-		MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: pushed %s%s", (unsigned long long)i, fragment.c_str(), direction.c_str());
+		MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: pushed %s", (unsigned long long)i, term.c_str());
 	}
 
 	out_order_clause = order_clause;
