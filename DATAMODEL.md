@@ -782,7 +782,7 @@ flowchart TD
     subgraph GS["GlobalSinkState (one per statement)"]
         ddl["DDL phase<br/>CREATE TABLE — pool conn, autocommits"]
         gw["shared BulkLoadSession<br/>adopts the operator's connection<br/>(pinned in a txn, else pool)"]
-        lim["parallel_writer_limit<br/>= mssql_copy_parallel_writers,<br/>or NumberOfThreads capped at 8,<br/>never above pool limit − 1"]
+        lim["parallel_writer_limit<br/>= mssql_copy_parallel_writers,<br/>or NumberOfThreads capped at 8,<br/>never above the pool limit"]
         failed["load_failed (atomic)"]
     end
     subgraph T1["worker thread 1"]
@@ -811,12 +811,16 @@ interrupt check and no counters on the CTAS side at all. It owns the connection,
 the writer, the batch bookkeeping and the mid-bulk-load release protocol; who may
 open one, and how many, is the policy above and is handed to it.
 
-The policy never grants more writers than the pool has connections to spare:
-**pool limit − 1**, one being held by the statement itself (the pinned
-connection, the shared writer, or the source scan). Measured before the cap
-(issue #380): a CTAS inside a transaction on a pool of two took 30 s — the extra
-writer waited `mssql_acquire_timeout` for a connection that could not free —
-against 0.9 s for 300k rows on the one writer the cap leaves. COPY, CTAS and INSERT via BCP share the rule.
+The policy never grants more writers than the pool has connections. An extra
+writer's `TryStart` takes its connection with `Acquire(0)` and never waits: an
+idle connection, a new one while the pool is below its limit, or none, and then
+the thread shares the global writer (issue #380, as revised in the review of
+#382). Waiting was the bug: the statement often holds one of the pool's
+connections itself (the pinned one, or the source scan's), so the extra writer
+waited `mssql_acquire_timeout` for a connection that could not free. A 300k-row
+CTAS inside a transaction on a pool of two took 30 s; it now takes 0.84 s. A cap
+of "limit − 1" would also have avoided the wait, but it idles a connection
+whenever the statement holds none. COPY, CTAS and INSERT via BCP share the rule.
 
 Since spec 062 W0 the **shared** writer is the same type. `TryStart` claims a
 slot and a pool connection and may decline; `Adopt` takes the connection the

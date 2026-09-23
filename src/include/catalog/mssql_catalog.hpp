@@ -116,6 +116,9 @@ public:
 	//! state of those names while the transaction was open; after COMMIT that
 	//! state is stale.
 	void ForgetTransactionChanges(MSSQLTransactionMetadata &metadata);
+	//! MSSQLTransactionMetadata::MarkChangedLocally for the current transaction;
+	//! a no-op in autocommit.
+	void NoteTransactionChangeLocally(ClientContext &context);
 
 	//! The pool's connection limit, fixed at ATTACH.
 	idx_t GetConnectionLimit() const;

@@ -80,11 +80,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the catalog it writes into is materialised first, as for INSERT … SELECT.
     Both used to fail: `Failed to acquire connection to check table existence`
     in a transaction, an acquire timeout in autocommit.
-  - **Parallel writers stay below the pool size.** A COPY, CTAS or INSERT via
-    BCP gets at most `mssql_connection_limit − 1` writers. A CTAS in a
-    transaction on a pool of two took 30 s: its extra writer waited
-    `mssql_acquire_timeout` for a connection that could not free. It now
-    takes 0.9 s for 300k rows, on one writer.
+  - **Extra parallel writers never wait for a connection.** For a COPY, CTAS
+    or INSERT via BCP, an extra writer takes an idle connection or opens one
+    under the limit. Otherwise it shares the main writer. It used to wait
+    `mssql_acquire_timeout` for a connection the statement itself held: a
+    300k-row CTAS in a transaction on a pool of two took 30 s and now takes
+    0.84 s. There are never more writers than `mssql_connection_limit`.
   - **Found along the way.** A CTAS on the INSERT path (`mssql_ctas_use_bcp =
     false`) reported its row count without the last batch: 1000 for 1500
     rows.

@@ -83,21 +83,22 @@ static void TestTheFourConsumers() {
 		  MSSQLLoadConnectionSource::Pinned, 1, "session-scoped AND transactional — no new rule needed");
 }
 
-// Issue #380: the writers never exceed the pool minus one. The statement holds
-// a connection while it loads (the pinned one, or its own source scan), and an
-// extra writer beyond what is left waits mssql_acquire_timeout for nothing.
+// Issue #380 (as revised in the review of #382): no more writers than the
+// pool has connections. Not the pool minus one: an extra writer takes its
+// connection with Acquire(0) and falls back to the shared writer when none is
+// free, so the connection the statement may hold itself costs nothing.
 static void TestPoolLimitCap() {
 	std::cout << "\n-- pool limit --\n";
 
 	Check("CTAS / in transaction / pool 2",
 		  MSSQLResolveLoadPolicy(false, true, MSSQLLoadTransactionRole::OwnsTarget, 0, 16, 2),
-		  MSSQLLoadConnectionSource::Pool, 1, "the pinned connection holds the other slot");
+		  MSSQLLoadConnectionSource::Pool, 2, "no more writers than the pool has connections");
 	Check("COPY / autocommit / pool 3",
 		  MSSQLResolveLoadPolicy(false, false, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16, 3),
-		  MSSQLLoadConnectionSource::Pool, 2, "pool minus the one the statement holds");
+		  MSSQLLoadConnectionSource::Pool, 3, "a pool the statement does not hold is used whole");
 	Check("COPY / autocommit / pool 3 / explicit 8",
 		  MSSQLResolveLoadPolicy(false, false, MSSQLLoadTransactionRole::JoinsTransaction, 8, 16, 3),
-		  MSSQLLoadConnectionSource::Pool, 2, "an explicit setting does not buy connections the pool lacks");
+		  MSSQLLoadConnectionSource::Pool, 3, "an explicit setting does not buy connections the pool lacks");
 	Check("COPY / autocommit / pool 1",
 		  MSSQLResolveLoadPolicy(false, false, MSSQLLoadTransactionRole::JoinsTransaction, 0, 16, 1),
 		  MSSQLLoadConnectionSource::Pool, 1, "never below one writer");
@@ -180,7 +181,7 @@ static void TestPinnedImpliesExactlyOneWriter() {
 							const auto p =
 								MSSQLResolveLoadPolicy(scoped != 0, txn != 0, role, configured, threads, pool);
 							++checked;
-							if (pool > 1 && p.max_writers > pool - 1) {
+							if (pool > 0 && p.max_writers > pool) {
 								std::cerr << "FAIL: max_writers=" << p.max_writers << " on a pool of " << pool << "\n";
 								++g_failures;
 							}
@@ -201,7 +202,7 @@ static void TestPinnedImpliesExactlyOneWriter() {
 		}
 	}
 	std::cout << "ok: " << checked
-			  << " combinations, Pinned always alone, max_writers never 0 and never past the pool minus one\n";
+			  << " combinations, Pinned always alone, max_writers never 0 and never past the pool limit\n";
 }
 
 //==============================================================================

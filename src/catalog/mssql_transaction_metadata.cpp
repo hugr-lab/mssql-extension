@@ -82,14 +82,24 @@ void MSSQLTransactionMetadata::MarkChanged(const string &schema, const string &t
 	cache_->InvalidateSchemaTableList(schema);
 }
 
+void MSSQLTransactionMetadata::MarkChangedLocally() {
+	std::lock_guard<std::mutex> guard(lock_);
+	locally_changed_ = true;
+	entries_.clear();
+	absent_.clear();
+	listed_schemas_.clear();
+	cache_->Invalidate();
+}
+
 bool MSSQLTransactionMetadata::IsChanged(const string &schema, const string &table) {
 	std::lock_guard<std::mutex> guard(lock_);
-	return all_changed_ || changed_schemas_.count(schema) > 0 || changed_tables_.count(Key(schema, table)) > 0;
+	return all_changed_ || locally_changed_ || changed_schemas_.count(schema) > 0 ||
+		   changed_tables_.count(Key(schema, table)) > 0;
 }
 
 bool MSSQLTransactionMetadata::IsSchemaChanged(const string &schema) {
 	std::lock_guard<std::mutex> guard(lock_);
-	if (all_changed_ || changed_schemas_.count(schema) > 0) {
+	if (all_changed_ || locally_changed_ || changed_schemas_.count(schema) > 0) {
 		return true;
 	}
 	// A changed table makes the schema's shared listing untrustworthy too: it may
@@ -104,7 +114,7 @@ bool MSSQLTransactionMetadata::IsSchemaChanged(const string &schema) {
 
 bool MSSQLTransactionMetadata::IsAllChanged() {
 	std::lock_guard<std::mutex> guard(lock_);
-	return all_changed_;
+	return all_changed_ || locally_changed_;
 }
 
 MSSQLTransactionMetadata::Changes MSSQLTransactionMetadata::GetChanges() {

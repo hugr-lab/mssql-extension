@@ -139,7 +139,12 @@ BulkLoadSession::Claim BulkLoadSession::TryStart(const BulkLoadSessionParams &pa
 
 	std::shared_ptr<tds::TdsConnection> conn;
 	try {
-		conn = params.pool->Acquire();
+		// Never wait (review of #382): an extra writer is optional, so it takes
+		// an idle connection, or a new one while the pool is below its limit,
+		// or none -- and the thread shares the global writer. Waiting out
+		// mssql_acquire_timeout for a connection the statement itself holds
+		// (the pinned one, or the source scan's) stalled a CTAS 30 s.
+		conn = params.pool->Acquire(0);
 		if (!conn || conn->GetState() != tds::ConnectionState::Idle) {
 			throw IOException("no idle connection available for a parallel writer");
 		}

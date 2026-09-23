@@ -69,6 +69,14 @@ public:
 	//! possibly anything: stop trusting the shared cache for it, and forget what
 	//! this transaction had loaded for it.
 	void MarkChanged(const string &schema, const string &table = string());
+	//! What MarkChanged("") does for THIS transaction's lookups -- stop trusting
+	//! the shared cache for anything, drop what was loaded -- without asking the
+	//! shared cache to forget anything at the end. For DDL the extension cannot
+	//! see through (mssql_exec under mssql_exec_invalidate_cache = false): the
+	//! transaction must not bind, or learn a rowid key, from a shared entry its
+	//! own uncommitted DDL may have changed; the shared cache is the user's to
+	//! invalidate, as in autocommit (review of #382).
+	void MarkChangedLocally();
 	bool IsChanged(const string &schema, const string &table);
 	bool IsSchemaChanged(const string &schema);
 	//! MarkChanged with an empty schema was called: even the schema list may differ.
@@ -91,6 +99,7 @@ private:
 	std::set<Key> absent_;
 	std::set<string> listed_schemas_;
 	bool all_changed_ = false;
+	bool locally_changed_ = false;
 	std::set<string> changed_schemas_;
 	std::set<Key> changed_tables_;
 };

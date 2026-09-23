@@ -29,7 +29,7 @@ statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS tm380 (TYPE mssql);
 
 statement ok
-SELECT mssql_exec('tm380', 'DROP TABLE IF EXISTS dbo.tm380_copy, dbo.tm380_exec, dbo.tm380_commit, dbo.tm380_drop');
+SELECT mssql_exec('tm380', 'DROP TABLE IF EXISTS dbo.tm380_copy, dbo.tm380_exec, dbo.tm380_commit, dbo.tm380_drop, dbo.tm380_src, dbo.tm380_ctas1, dbo.tm380_ctas2, dbo.tm380_ctas3, dbo.tm380_nokey; IF OBJECT_ID(''tm380s.t'') IS NOT NULL DROP TABLE tm380s.t; IF SCHEMA_ID(''tm380s'') IS NOT NULL EXEC(''DROP SCHEMA tm380s'')');
 
 statement ok
 SELECT mssql_exec('tm380', 'CREATE TABLE dbo.tm380_drop (id int NOT NULL)');
@@ -188,6 +188,124 @@ does not exist
 
 statement ok
 SET mssql_exec_invalidate_cache = false;
+
+#------------------------------------------------------------------------------
+# Review of #382, High: a CTAS reading the catalog it writes into, in a
+# transaction, with threads -- its existence checks on the pinned connection
+# must wait for the source scan draining on it (MaterializeMutex).
+#------------------------------------------------------------------------------
+
+statement ok
+SET threads = 4;
+
+statement ok
+SELECT mssql_exec('tm380', 'DROP TABLE IF EXISTS dbo.tm380_src, dbo.tm380_ctas1, dbo.tm380_ctas2, dbo.tm380_ctas3; CREATE TABLE dbo.tm380_src (id int NOT NULL); INSERT INTO dbo.tm380_src SELECT TOP 20000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_columns a CROSS JOIN sys.all_columns b');
+
+statement ok
+SELECT mssql_invalidate_cache('tm380', 'dbo');
+
+statement ok
+BEGIN;
+
+query I
+CREATE TABLE tm380.dbo.tm380_ctas1 AS SELECT id FROM tm380.dbo.tm380_src;
+----
+20000
+
+query I
+CREATE TABLE tm380.dbo.tm380_ctas2 AS SELECT id FROM tm380.dbo.tm380_src WHERE id % 2 = 0;
+----
+10000
+
+query I
+CREATE TABLE tm380.dbo.tm380_ctas3 AS SELECT a.id FROM tm380.dbo.tm380_src a JOIN tm380.dbo.tm380_ctas1 b ON a.id = b.id;
+----
+20000
+
+statement ok
+COMMIT;
+
+statement ok
+RESET threads;
+
+#------------------------------------------------------------------------------
+# Review of #382, Medium: mssql_exec DDL under mssql_exec_invalidate_cache =
+# false, in a transaction -- a rowid key learned on the pinned connection from
+# an index that is then rolled back must not reach the shared entry.
+#------------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('tm380', 'DROP TABLE IF EXISTS dbo.tm380_nokey; CREATE TABLE dbo.tm380_nokey (id int NOT NULL, v int NULL); INSERT INTO dbo.tm380_nokey VALUES (1, 0), (2, 0)');
+
+statement ok
+SELECT mssql_invalidate_cache('tm380', 'dbo', 'tm380_nokey');
+
+# The shared entry exists before the transaction.
+query I
+SELECT count(*) FROM tm380.dbo.tm380_nokey;
+----
+2
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT mssql_exec('tm380', 'CREATE UNIQUE INDEX ux_tm380_nokey ON dbo.tm380_nokey (id)');
+
+query I
+DELETE FROM tm380.dbo.tm380_nokey WHERE id = 1;
+----
+1
+
+statement ok
+ROLLBACK;
+
+# The index is gone with the transaction; so is the key learned from it.
+statement error
+DELETE FROM tm380.dbo.tm380_nokey WHERE id = 1;
+----
+tm380_nokey
+
+query I
+SELECT count(*) FROM tm380.dbo.tm380_nokey;
+----
+2
+
+#------------------------------------------------------------------------------
+# Review of #382, Medium: CREATE SCHEMA in a transaction whose schema list is
+# already loaded -- a table can be created in it at once.
+#------------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('tm380', 'IF OBJECT_ID(''tm380s.t'') IS NOT NULL DROP TABLE tm380s.t; IF SCHEMA_ID(''tm380s'') IS NOT NULL EXEC(''DROP SCHEMA tm380s'')');
+
+statement ok
+SELECT mssql_invalidate_cache('tm380');
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) > 0 FROM duckdb_schemas() WHERE database_name = 'tm380';
+----
+true
+
+statement ok
+CREATE SCHEMA tm380.tm380s;
+
+statement ok
+CREATE TABLE tm380.tm380s.t (id INTEGER);
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM tm380.tm380s.t;
+----
+0
+
+statement ok
+SELECT mssql_exec('tm380', 'DROP TABLE tm380s.t; DROP SCHEMA tm380s; DROP TABLE IF EXISTS dbo.tm380_src, dbo.tm380_ctas1, dbo.tm380_ctas2, dbo.tm380_ctas3, dbo.tm380_nokey');
 
 statement ok
 SELECT mssql_exec('tm380', 'DROP TABLE IF EXISTS dbo.tm380_copy, dbo.tm380_exec, dbo.tm380_commit, dbo.tm380_drop');

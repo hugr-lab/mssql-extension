@@ -346,6 +346,7 @@ Inside a transaction:
 |---|---|
 | `mssql_invalidate_cache()` | allowed — the transaction reloads those names on its pinned connection |
 | `mssql_refresh_cache()`, `mssql_preload_catalog()` | refused — bulk loads into the shared cache; run them after COMMIT |
+| `mssql_exec()` DDL (any `mssql_exec_invalidate_cache`) | the rest of the transaction loads metadata on its pinned connection and trusts no shared entry. With the setting `false`, the shared cache itself is left for you to invalidate, as in autocommit |
 
 **What still runs outside the transaction:** catalog DDL (`CREATE TABLE`,
 `DROP TABLE`, `ALTER TABLE` through DuckDB) and CTAS go on a pool connection and

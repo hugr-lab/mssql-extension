@@ -38,6 +38,11 @@ SET mssql_connection_limit = 1;
 statement ok
 SET mssql_acquire_timeout = 3;
 
+# Threads, so a CTAS's sink init and its source scan's drain can meet on the
+# one connection (review of #382).
+statement ok
+SET threads = 4;
+
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS one380 (TYPE mssql);
 
@@ -197,3 +202,6 @@ RESET mssql_connection_limit;
 
 statement ok
 RESET mssql_acquire_timeout;
+
+statement ok
+RESET threads;

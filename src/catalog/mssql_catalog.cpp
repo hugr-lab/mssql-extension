@@ -694,6 +694,9 @@ optional_ptr<CatalogEntry> MSSQLCatalog::CreateSchema(CatalogTransaction transac
 
 	// Point invalidation: invalidate schema list so new schema is visible
 	metadata_cache_->InvalidateAll();
+	// The transaction's own schema list too, or a CREATE TABLE in the schema
+	// just created is refused as "not found" (review of #382).
+	NoteTransactionChange(transaction.GetContext());
 
 	return &GetOrCreateSchemaEntry(info.SchemaName().GetIdentifierName());
 }
@@ -719,6 +722,7 @@ void MSSQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 
 	// Point invalidation: invalidate schema list
 	metadata_cache_->InvalidateAll();
+	NoteTransactionChange(context);
 
 	// Spec 052 (Option D): just erase. Any binder that looked up this schema
 	// before DROP SCHEMA fired is already anchored in its ClientContext's
@@ -1491,6 +1495,13 @@ void MSSQLCatalog::NoteTransactionChange(ClientContext &context, const string &s
 		return;
 	}
 	MSSQLTransaction::Get(context, *this).Metadata(context).MarkChanged(schema, table);
+}
+
+void MSSQLCatalog::NoteTransactionChangeLocally(ClientContext &context) {
+	if (context.transaction.IsAutoCommit()) {
+		return;
+	}
+	MSSQLTransaction::Get(context, *this).Metadata(context).MarkChangedLocally();
 }
 
 void MSSQLCatalog::ForgetTransactionChanges(MSSQLTransactionMetadata &metadata) {
