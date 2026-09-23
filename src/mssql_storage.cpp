@@ -1185,7 +1185,7 @@ std::shared_ptr<tds::TdsConnection> ValidateAzureConnection(ClientContext &conte
 							fedauth_data.token_utf16le.size());
 
 	// Create a temporary connection to test Azure AD credentials
-	// Issue #324: kept, not closed -- the pool adopts it (MSSQLCatalog::AdoptConnection).
+	// Issue #324: kept, not closed -- MSSQLCatalog::AdoptOnInitialize hands it to ConnectionPool::Adopt.
 	auto conn_holder = std::make_shared<tds::TdsConnection>();
 	auto &conn = *conn_holder;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
@@ -1267,7 +1267,7 @@ std::shared_ptr<tds::TdsConnection> ValidateManualTokenConnection(MSSQLConnectio
 							timeout_seconds);
 
 	// Create a temporary connection to test the pre-provided token
-	// Issue #324: kept, not closed -- the pool adopts it (MSSQLCatalog::AdoptConnection).
+	// Issue #324: kept, not closed -- MSSQLCatalog::AdoptOnInitialize hands it to ConnectionPool::Adopt.
 	auto conn_holder = std::make_shared<tds::TdsConnection>();
 	auto &conn = *conn_holder;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
@@ -1339,7 +1339,7 @@ std::shared_ptr<tds::TdsConnection> ValidateConnection(MSSQLConnectionInfo &info
 							info.use_encrypt ? "yes" : "no", timeout_seconds);
 
 	// Create a temporary connection to test credentials
-	// Issue #324: kept, not closed -- the pool adopts it (MSSQLCatalog::AdoptConnection).
+	// Issue #324: kept, not closed -- MSSQLCatalog::AdoptOnInitialize hands it to ConnectionPool::Adopt.
 	auto conn_holder = std::make_shared<tds::TdsConnection>();
 	auto &conn = *conn_holder;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
@@ -1430,7 +1430,7 @@ std::shared_ptr<tds::TdsConnection> ValidateIntegratedAuthConnection(MSSQLConnec
 							info.host.c_str(), info.port, info.database.c_str(), static_cast<int>(info.auth_method),
 							timeout_seconds);
 
-	// Issue #324: kept, not closed -- the pool adopts it (MSSQLCatalog::AdoptConnection).
+	// Issue #324: kept, not closed -- MSSQLCatalog::AdoptOnInitialize hands it to ConnectionPool::Adopt.
 	auto conn_holder = std::make_shared<tds::TdsConnection>();
 	auto &conn = *conn_holder;
 	conn.SetRequestedPacketSize(info.tds_packet_size);
@@ -1546,6 +1546,19 @@ static string NormalizeTransactionIsolation(const string &raw) {
 // 'true', so a string goes through DuckDB's own string-to-boolean cast instead
 // -- the one `SET` uses: true/false, t/f, yes/no, y/n, 1/0, any case.
 // A NULL never gets here: DuckDB's binder refuses it for every ATTACH option.
+static bool BooleanAttachOption(const string &name, const Value &value) {
+	if (value.type().id() != LogicalTypeId::VARCHAR) {
+		return value.GetValue<bool>();
+	}
+	const auto &text = StringValue::Get(value);
+	bool result = false;
+	if (!TryCast::Operation(string_t(text), result, false)) {
+		throw InvalidInputException(
+			"MSSQL Error: ATTACH option '%s' expects a boolean (true/false, yes/no, 1/0), got '%s'", name, text);
+	}
+	return result;
+}
+
 // The integer peer (issue #324): `min_connections 4` or, through DuckLake's
 // METADATA_PARAMETERS, `'4'`.
 static int64_t IntegerAttachOption(const string &name, const Value &value) {
@@ -1556,19 +1569,6 @@ static int64_t IntegerAttachOption(const string &name, const Value &value) {
 	int64_t result = 0;
 	if (!TryCast::Operation(string_t(text), result, false)) {
 		throw InvalidInputException("MSSQL Error: ATTACH option '%s' expects an integer, got '%s'", name, text);
-	}
-	return result;
-}
-
-static bool BooleanAttachOption(const string &name, const Value &value) {
-	if (value.type().id() != LogicalTypeId::VARCHAR) {
-		return value.GetValue<bool>();
-	}
-	const auto &text = StringValue::Get(value);
-	bool result = false;
-	if (!TryCast::Operation(string_t(text), result, false)) {
-		throw InvalidInputException(
-			"MSSQL Error: ATTACH option '%s' expects a boolean (true/false, yes/no, 1/0), got '%s'", name, text);
 	}
 	return result;
 }

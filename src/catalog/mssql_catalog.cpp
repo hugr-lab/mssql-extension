@@ -1576,8 +1576,10 @@ void MSSQLCatalog::WarmSharedCache(const std::set<std::pair<string, string>> &ta
 	std::shared_ptr<tds::TdsConnection> connection;
 	try {
 		// Never wait: an idle connection, or a new one while the pool is below
-		// its limit, or no warm-up at all. This runs on COMMIT's path.
-		connection = connection_pool_->Acquire(0);
+		// its limit, or no warm-up at all. This runs on COMMIT's path. TryAcquire,
+		// not Acquire(0): a busy pool is the normal case here, not a timeout
+		// worth counting in mssql_pool_stats (#382).
+		connection = connection_pool_->TryAcquire();
 		if (!connection) {
 			MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: no idle connection, skipped");
 			return;

@@ -428,7 +428,12 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 	// the TransactionManager is destroyed
 
 	lock.unlock();
-	catalog_.WarmSharedCache(touched);
+	// Not at shutdown: a rollback whose context is already gone is DuckDB
+	// tearing down, and a metadata round trip -- possibly a login -- would only
+	// delay it for a cache about to be destroyed.
+	if (context_ptr) {
+		catalog_.WarmSharedCache(touched);
+	}
 }
 
 void MSSQLTransactionManager::Checkpoint(ClientContext &context, bool force) {
