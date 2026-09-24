@@ -1,5 +1,5 @@
 #include "catalog/mssql_table_options.hpp"
-#include "query/mssql_sql_params.hpp"
+#include "query/mssql_identifier.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -7,10 +7,6 @@
 #include "duckdb/parser/expression/constant_expression.hpp"
 
 namespace duckdb {
-
-static string QuoteName(const string &name) {
-	return mssql::QuoteIdentifier(name);
-}
 
 static MSSQLTableKind ParseTableKind(const string &value) {
 	const string upper = StringUtil::Upper(value);
@@ -106,8 +102,9 @@ string MSSQLTableOptions::CreateTableSuffix() const {
 string MSSQLTableOptions::PostCreateStatement(const string &schema_name, const string &table_name) const {
 	// A temp table target carries an empty schema — it lives in tempdb under the
 	// session, and "[].[#t]" is not a name SQL Server accepts.
-	const string qualified =
-		schema_name.empty() ? QuoteName(table_name) : QuoteName(schema_name) + "." + QuoteName(table_name);
+	const string qualified = schema_name.empty()
+								 ? mssql::QuoteIdentifier(table_name)
+								 : mssql::QuoteIdentifier(schema_name) + "." + mssql::QuoteIdentifier(table_name);
 
 	switch (kind) {
 	case MSSQLTableKind::COLUMNSTORE:
@@ -116,17 +113,17 @@ string MSSQLTableOptions::PostCreateStatement(const string &schema_name, const s
 		// CREATE TABLE suffix is where they belong, and columnstore brings its
 		// own compression regardless. The index name only has to be unique
 		// within the table.
-		return "CREATE CLUSTERED COLUMNSTORE INDEX " + QuoteName("CCI_" + table_name) + " ON " + qualified;
+		return "CREATE CLUSTERED COLUMNSTORE INDEX " + mssql::QuoteIdentifier("CCI_" + table_name) + " ON " + qualified;
 	case MSSQLTableKind::CLUSTERED: {
 		string keys;
 		for (idx_t i = 0; i < clustered_keys.size(); i++) {
 			if (i > 0) {
 				keys += ", ";
 			}
-			keys += QuoteName(clustered_keys[i]);
+			keys += mssql::QuoteIdentifier(clustered_keys[i]);
 		}
-		string sql =
-			"CREATE CLUSTERED INDEX " + QuoteName("CIX_" + table_name) + " ON " + qualified + " (" + keys + ")";
+		string sql = "CREATE CLUSTERED INDEX " + mssql::QuoteIdentifier("CIX_" + table_name) + " ON " + qualified +
+					 " (" + keys + ")";
 		if (!data_compression.empty()) {
 			sql += " WITH (DATA_COMPRESSION = " + data_compression + ")";
 		}

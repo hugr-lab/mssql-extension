@@ -84,28 +84,44 @@ ATTACH 'Server=...' AS db (TYPE mssql, order_pushdown true);
 **Setting precedence:** The global setting is checked first; if `true`, pushdown is enabled. The ATTACH option is checked second; `true` enables pushdown, `false` is a no-op (does not override global `true`).
 
 **Supported expressions:**
-- Simple column references: `ORDER BY name ASC`, `ORDER BY id DESC`
-- Single-argument functions: `ORDER BY year(date_col)`
-- Multi-column: `ORDER BY category ASC, name DESC`
-- Combined with LIMIT: `ORDER BY id ASC LIMIT 10` → `SELECT TOP 10 ... ORDER BY [id] ASC`
+- Simple column references: `ORDER BY id DESC`, `ORDER BY created_at`
+- Single-argument functions with a non-string result: `ORDER BY year(date_col)`
+- Multi-column: `ORDER BY region_id ASC, created_at DESC`
+- Combined with LIMIT: `ORDER BY id ASC LIMIT 10` on a `NOT NULL` key →
+  `SELECT TOP 10 ... ORDER BY [id] ASC`
 
 **The order is always DuckDB's.** A pushed ORDER BY removes DuckDB's own sort,
 so a key is pushed only when SQL Server sorts it the way DuckDB would:
 
-- a string key only under a binary collation whose bytes are code points —
-  `nvarchar` / `nchar` under a `_BIN2` collation, `varchar` / `char` under a
-  `_BIN2_UTF8` one (such as the extension's CTAS default,
-  `Latin1_General_100_BIN2_UTF8`). Under any other collation — including the
-  installation default `SQL_Latin1_General_CP1_CI_AS`, which orders
-  linguistically, and a code-page `_BIN2`, which orders the code page's bytes —
-  DuckDB sorts;
-- never a `uniqueidentifier` (SQL Server compares its last six bytes first) or a
+- numeric, `bit` and date/time keys;
+- of the strings, only `varchar` / `char` under a `_BIN2` UTF-8 collation (such
+  as the extension's CTAS default, `Latin1_General_100_BIN2_UTF8`), whose bytes
+  order as code points. Under any other collation — including the installation
+  default `SQL_Latin1_General_CP1_CI_AS`, which orders linguistically, and a
+  code-page `_BIN2`, which orders the code page's bytes — DuckDB sorts. So it
+  does for `nvarchar` / `nchar` under any collation: their UTF-16 order puts a
+  character above the BMP (an emoji) before U+E000–U+FFFF, DuckDB after. What
+  still differs on a qualifying key is trailing spaces: the server treats `ab`
+  and `ab ` as equal (a tie, so a TOP N may pick either), and sorts a value
+  continuing with a character below the space (`ab` + TAB) before `ab`;
+- never a string-valued function of a key (`upper(name)`), a
+  `uniqueidentifier` (SQL Server compares its last six bytes first),
+  `binary` / `varbinary` (compared zero-padded: `0x01` = `0x0100`), `json` or
   `sql_variant`.
 
 **NULL placement.** SQL Server sorts NULL lowest (ASC → first, DESC → last) and
 has no `NULLS FIRST` / `LAST`. When a nullable key asks for the other placement —
-including DuckDB's default `NULLS LAST` on an ascending key — the pushdown adds a
-leading `CASE WHEN key IS NULL THEN … END` key to get DuckDB's placement.
+including DuckDB's default `NULLS LAST` on an ascending key — an ORDER BY with a
+LIMIT is pushed with a leading `CASE WHEN key IS NULL THEN … END` key
+(`ORDER BY id LIMIT 10` on a nullable `id` → `SELECT TOP 10 ... ORDER BY CASE
+WHEN [id] IS NULL THEN 1 ELSE 0 END, [id] ASC`), and one without a LIMIT is left
+to DuckDB: the leading key defeats any index, so the server would sort the
+whole table instead. Asking for the server's own placement (`ASC NULLS FIRST`,
+`DESC NULLS LAST`) pushes either way.
+
+**Filters.** A TOP N is pushed only when every filter of the scan is on the
+server too. A filter the extension cannot translate runs on the rows that come
+back, and would otherwise be applied after the server had already cut them to N.
 
 **Limitations:**
 - Only prefix pushdown: stops at first non-pushable column

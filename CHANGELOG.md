@@ -9,17 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Nullable ORDER BY keys are pushed** under `mssql_order_pushdown`. SQL Server
-  sorts NULL lowest and has no `NULLS FIRST` / `LAST`, so a nullable key asking
-  for another placement stopped the pushdown before. That included DuckDB's
-  default, `NULLS LAST` on an ascending key. A leading `CASE WHEN key IS NULL`
-  key now gets DuckDB's placement.
-- **`mssql_scan` reports `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` with the
-  column's collation**, as the catalog has since spec 060, under
-  `mssql_catalog_native_types`. `CREATE TABLE … AS SELECT * FROM mssql_scan(…)`
-  therefore keeps the source's lengths and collations instead of making
-  `nvarchar(max)`. With `prepared := true` the types are the same but no
-  collation travels: sp_prepare names the collation by id, not by name.
+- **ORDER BY … LIMIT on a nullable key is pushed** under
+  `mssql_order_pushdown`. SQL Server sorts NULL lowest and has no
+  `NULLS FIRST` / `LAST`, so a nullable key asking for another placement
+  stopped the pushdown before. That included DuckDB's default, `NULLS LAST` on
+  an ascending key. Under a LIMIT a leading `CASE WHEN key IS NULL` key now
+  gets DuckDB's placement and the server returns only the N rows. A plain
+  ORDER BY still sorts in DuckDB: that leading key defeats any index, so the
+  server would sort the whole table where DuckDB does now.
+- **`mssql_scan` reports `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)`**, as the
+  catalog has since spec 060, under `mssql_catalog_native_types`, so
+  `CREATE TABLE … AS SELECT * FROM mssql_scan(…)` keeps the source's lengths
+  (and a UTF-8 `varchar`'s collation) instead of making `nvarchar(max)`.
+  `typeof()` of such a column changes from `VARCHAR`; setting the option to
+  `false` restores it. A `char` / `varchar` under a code-page collation stays
+  plain `VARCHAR`: a raw scan hands its bytes over untranscoded, and an
+  annotation naming the code page would invite a re-encode. `prepared := true`
+  reports the same types, asking `sp_describe_first_result_set` for the
+  collations `sp_prepare` names only by id.
 
 - **`transaction_isolation`: the isolation level of explicit transactions**
   ([#331](https://github.com/hugr-lab/mssql-extension/issues/331)). The
@@ -72,10 +79,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the installation default `SQL_Latin1_General_CP1_CI_AS` came back in
   linguistic order, with case and accents interleaved, instead of DuckDB's.
   - **Rule:** a key is now pushed only when the server sorts it as DuckDB
-    does. For strings that means `nvarchar` under `_BIN2` or `varchar` under
-    `_BIN2_UTF8`.
-  - **Never pushed:** a `uniqueidentifier` (SQL Server compares its last six
-    bytes first) or a `sql_variant`.
+    does: numeric, `bit` and date/time types, and of the strings only
+    `varchar` / `char` under a `_BIN2` UTF-8 collation. Not `nvarchar`, even
+    under `_BIN2`: its UTF-16 order puts a character above the BMP before
+    U+E000–U+FFFF, DuckDB after. A string-valued function (`upper(name)`) is
+    never pushed.
+  - **Never pushed:** `uniqueidentifier` (SQL Server compares its last six
+    bytes first), `binary` / `varbinary` (compared zero-padded, so `0x01` =
+    `0x0100`), `json`, `sql_variant`.
+- **ORDER BY … LIMIT under-returned when a filter ran client-side.** With
+  `mssql_order_pushdown` on, the TOP N went to the server while a filter the
+  extension cannot translate (a `rowid` field of a composite key) was applied
+  to what came back, so the server's N rows were filtered down, not refilled:
+  `WHERE rowid.a >= 2 ORDER BY k LIMIT 2` returned 0 rows of 2. TOP N is now
+  pushed only when every filter is on the server.
+- **RENAME of a table or column with a dot in its name** failed: `sp_rename`
+  parses the old name as a multi-part name and it was sent unbracketed.
 - **Names containing `]` broke the bulk load and DELETE.** Several places put
   brackets around a table, schema or column name without doubling `]`: the
   `INSERT BULK` of COPY / INSERT / CTAS, a rowid DELETE, and the target-shape

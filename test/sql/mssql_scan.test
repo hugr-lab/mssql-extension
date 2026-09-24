@@ -42,11 +42,17 @@ SELECT COUNT(*) FROM mssql_scan('scandb', 'SELECT 1 AS val UNION ALL SELECT 2 UN
 ----
 3
 
-# T046: Verify column types
+# T046: Verify column types. A varchar under the database's code-page
+# collation is plain VARCHAR; under a UTF-8 one it carries its length.
 query II
 SELECT typeof(id), typeof(name) FROM mssql_scan('scandb', 'SELECT CAST(1 AS INT) AS id, CAST(''test'' AS VARCHAR(50)) AS name');
 ----
-INTEGER	MSSQL_VARCHAR(50)
+INTEGER	VARCHAR
+
+query I
+SELECT typeof(name) FROM mssql_scan('scandb', 'SELECT CAST(''test'' AS VARCHAR(50)) COLLATE Latin1_General_100_BIN2_UTF8 AS name');
+----
+MSSQL_VARCHAR(50)
 
 # T047: Test filtering works on results
 query II

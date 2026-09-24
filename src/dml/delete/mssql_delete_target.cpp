@@ -1,6 +1,6 @@
 #include "dml/delete/mssql_delete_target.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "query/mssql_sql_params.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 

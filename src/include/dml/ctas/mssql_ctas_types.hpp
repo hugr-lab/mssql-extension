@@ -3,7 +3,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
-#include "query/mssql_sql_params.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 namespace mssql {

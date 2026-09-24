@@ -2,7 +2,7 @@
 // Feature: 013-table-scan-filter-refactor
 
 #include "table_scan/table_scan_bind.hpp"
-#include "query/mssql_sql_params.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 namespace mssql {

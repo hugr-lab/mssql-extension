@@ -1,7 +1,7 @@
 #include "copy/bulk_load_session.hpp"
 #include <cstdio>
 #include <cstdlib>
-#include "query/mssql_sql_params.hpp"
+#include "query/mssql_identifier.hpp"
 
 #include <chrono>
 

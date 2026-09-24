@@ -21,7 +21,7 @@ statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS tq (TYPE mssql, order_pushdown true);
 
 statement ok
-SELECT mssql_exec('tq', 'DROP TABLE IF EXISTS dbo.[q]]t''x], dbo.[c]]tas''x]');
+SELECT mssql_exec('tq', 'DROP TABLE IF EXISTS dbo.[q]]t''x], dbo.[c]]tas''x], dbo.[r.x]');
 
 statement ok
 SELECT mssql_exec('tq', 'CREATE TABLE dbo.[q]]t''x] ([c]]1] int NOT NULL PRIMARY KEY, [v''] nvarchar(10) NULL)');
@@ -79,6 +79,31 @@ CREATE TABLE tq.dbo."c]tas'x" AS SELECT i::INTEGER AS "k]1" FROM range(5) t(i);
 
 query I
 SELECT sum("k]1") FROM tq.dbo."c]tas'x";
+----
+10
+
+# RENAME: sp_rename parses the old name as a multi-part name, so a dot in a
+# part split it (review of #387): a table or column named `r.x` could not be
+# renamed at all.
+statement ok
+ALTER TABLE tq.dbo."c]tas'x" RENAME TO "r.x";
+
+statement ok
+ALTER TABLE tq.dbo."r.x" RENAME COLUMN "k]1" TO "k.2";
+
+query I
+SELECT sum("k.2") FROM tq.dbo."r.x";
+----
+10
+
+statement ok
+ALTER TABLE tq.dbo."r.x" RENAME COLUMN "k.2" TO "k.3";
+
+statement ok
+ALTER TABLE tq.dbo."r.x" RENAME TO "c]tas'x";
+
+query I
+SELECT sum("k.3") FROM tq.dbo."c]tas'x";
 ----
 10
 

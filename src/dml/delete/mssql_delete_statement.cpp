@@ -2,7 +2,7 @@
 #include "dml/insert/mssql_value_serializer.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "query/mssql_sql_params.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 
@@ -12,16 +12,12 @@ MSSQLDeleteStatement::MSSQLDeleteStatement(const MSSQLDeleteTarget &target) : ta
 	}
 }
 
-string MSSQLDeleteStatement::EscapeIdentifier(const string &identifier) {
-	return mssql::QuoteIdentifier(identifier);
-}
-
 string MSSQLDeleteStatement::GenerateDeleteClause() const {
 	// DELETE t FROM [schema].[table] AS t
 	string sql = "DELETE t FROM ";
-	sql += EscapeIdentifier(target_.schema_name);
+	sql += mssql::QuoteIdentifier(target_.schema_name);
 	sql += ".";
-	sql += EscapeIdentifier(target_.table_name);
+	sql += mssql::QuoteIdentifier(target_.table_name);
 	sql += " AS t";
 	return sql;
 }
@@ -34,7 +30,7 @@ string MSSQLDeleteStatement::GenerateOnClause() const {
 		if (i > 0) {
 			sql += " AND ";
 		}
-		string col = EscapeIdentifier(pk_columns[i].name);
+		string col = mssql::QuoteIdentifier(pk_columns[i].name);
 		sql += "t." + col + " = " + pk_columns[i].KeyComparand("v." + col);
 	}
 	return sql;
@@ -83,7 +79,7 @@ MSSQLDMLBatch MSSQLDeleteStatement::Build(const vector<vector<Value>> &pk_values
 		if (i > 0) {
 			alias_columns += ", ";
 		}
-		alias_columns += EscapeIdentifier(pk_columns[i].name);
+		alias_columns += mssql::QuoteIdentifier(pk_columns[i].name);
 	}
 	alias_columns += ")";
 

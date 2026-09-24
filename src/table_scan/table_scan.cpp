@@ -24,8 +24,8 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "mssql_functions.hpp"	// For backward compatibility with MSSQLCatalogScanBindData
+#include "query/mssql_identifier.hpp"
 #include "query/mssql_query_executor.hpp"
-#include "query/mssql_sql_params.hpp"
 #include "table_scan/filter_encoder.hpp"
 #include "table_scan/table_scan_bind.hpp"
 #include "table_scan/table_scan_state.hpp"

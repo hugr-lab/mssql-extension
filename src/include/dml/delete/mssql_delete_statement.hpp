@@ -53,9 +53,6 @@ private:
 
 	//! Generate the ON clause for PK matching
 	string GenerateOnClause() const;
-
-	//! Escape a SQL Server identifier with square brackets
-	static string EscapeIdentifier(const string &identifier);
 };
 
 }  // namespace duckdb

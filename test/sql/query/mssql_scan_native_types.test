@@ -15,6 +15,11 @@
 # through the catalog's own MSSQLColumnInfo::NativeDuckDBType. The remote-
 # pushdown vehicle (spec 079) is mssql_scan_params, so a pushed CTAS depends on
 # this.
+#
+# A char / varchar column is annotated only under a UTF-8 collation (review of
+# #387): a raw scan hands a code-page varchar's bytes over untranscoded (issue
+# #224), so an annotation naming the code page would describe values that are
+# not in it. Such a column stays plain VARCHAR.
 
 require mssql
 
@@ -39,7 +44,18 @@ query II
 SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'SELECT v, c, n, m, i FROM dbo.snt_src'));
 ----
 v	MSSQL_VARCHAR(20)
-c	MSSQL_VARCHAR(4)
+c	VARCHAR
+n	MSSQL_NVARCHAR(30)
+m	VARCHAR
+i	INTEGER
+
+# prepared := true reports the same types: sp_prepare's COLMETADATA names a
+# collation by id, so the varchars' collations come from the describe.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'SELECT v, c, n, m, i FROM dbo.snt_src', prepared := true));
+----
+v	MSSQL_VARCHAR(20)
+c	VARCHAR
 n	MSSQL_NVARCHAR(30)
 m	VARCHAR
 i	INTEGER
@@ -56,16 +72,31 @@ SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan_params('
 ----
 v	MSSQL_VARCHAR(20)
 
-# A table created from it keeps the lengths and the collations.
+# A table created from it keeps the annotated lengths and collations.
 statement ok
-CREATE TABLE snt.dbo.snt_dst AS SELECT * FROM mssql_scan('snt', 'SELECT v, c, n FROM dbo.snt_src');
+CREATE TABLE snt.dbo.snt_dst AS SELECT * FROM mssql_scan('snt', 'SELECT v, n FROM dbo.snt_src');
 
 query TTIT
 SELECT * FROM mssql_scan('snt', 'SELECT c.name, TYPE_NAME(c.user_type_id) AS t, CAST(c.max_length AS int) AS len, c.collation_name FROM sys.columns c WHERE c.object_id = OBJECT_ID(''dbo.snt_dst'') ORDER BY c.column_id');
 ----
 v	varchar	20	Latin1_General_100_BIN2_UTF8
-c	varchar	4	SQL_Latin1_General_CP1_CI_AS
 n	nvarchar	60	SQL_Latin1_General_CP1_CI_AS
+
+# The same through prepared := true: the varchar keeps its source collation
+# rather than falling back to mssql_utf8_collation at the target. The source
+# here is a CI UTF-8 collation, which the fallback (BIN2) is not.
+statement ok
+SELECT mssql_exec('snt', 'DROP TABLE IF EXISTS dbo.snt_ci, dbo.snt_dst_p;
+	CREATE TABLE dbo.snt_ci (v varchar(12) COLLATE Latin1_General_100_CI_AS_SC_UTF8 NULL);
+	INSERT INTO dbo.snt_ci VALUES (''abc'')');
+
+statement ok
+CREATE TABLE snt.dbo.snt_dst_p AS SELECT * FROM mssql_scan('snt', 'SELECT v FROM dbo.snt_ci', prepared := true);
+
+query TTIT
+SELECT * FROM mssql_scan('snt', 'SELECT c.name, TYPE_NAME(c.user_type_id) AS t, CAST(c.max_length AS int) AS len, c.collation_name FROM sys.columns c WHERE c.object_id = OBJECT_ID(''dbo.snt_dst_p'') ORDER BY c.column_id');
+----
+v	varchar	12	Latin1_General_100_CI_AS_SC_UTF8
 
 # Off: plain VARCHAR, as before.
 statement ok
@@ -80,7 +111,7 @@ statement ok
 RESET mssql_catalog_native_types;
 
 statement ok
-SELECT mssql_exec('snt', 'DROP TABLE dbo.snt_src, dbo.snt_dst');
+SELECT mssql_exec('snt', 'DROP TABLE dbo.snt_src, dbo.snt_dst, dbo.snt_ci, dbo.snt_dst_p');
 
 statement ok
 DETACH snt;

@@ -22,6 +22,7 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -32,7 +33,7 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "mssql_functions.hpp"
 #include "mssql_storage.hpp"
-#include "query/mssql_sql_params.hpp"
+#include "query/mssql_identifier.hpp"
 #include "table_scan/filter_encoder.hpp"
 #include "table_scan/function_mapping.hpp"
 
@@ -238,6 +239,17 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 			return false;
 		}
 
+		// A function whose RESULT is a string is refused: the collation gate
+		// below reads the argument column, not the result, whose collation the
+		// server derives on its own and whose case mapping is the server's, not
+		// DuckDB's (review of #387). year() and friends return integers and
+		// stay.
+		if (func_expr.GetReturnType().id() == LogicalTypeId::VARCHAR) {
+			MSSQL_OPT_DEBUG(2, "  Function %s: string result -- the server's function is not DuckDB's",
+							func_expr.Function().GetName().GetIdentifierName().c_str());
+			return false;
+		}
+
 		idx_t inner_col_ids_index;
 		if (!ResolveColumnIndex(*func_expr.GetChildren()[0], get, inner_col_ids_index)) {
 			MSSQL_OPT_DEBUG(2, "  Function %s: arg is not a resolvable column ref",
@@ -273,25 +285,40 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 //
 // SQL Server has no NULLS FIRST / LAST: NULL sorts lowest, so ASC puts NULLs
 // first and DESC last, while DuckDB's default is NULLS LAST both ways. A
-// nullable key whose requested placement differs from the server's used to
-// stop the pushdown -- so a bare `ORDER BY nullable_col` never pushed. It is
-// now emulated with a leading key that sorts NULL where DuckDB wants it:
-// `CASE WHEN x IS NULL THEN 1 ELSE 0 END, x ASC` for NULLS LAST ascending
-// (spec 079 D2, shared with the remote-pushdown writer). A NOT NULL key, or a
-// placement the server already has, gets the bare term, as before.
-static string OrderTerm(const string &fragment, OrderType order_type, OrderByNullType null_order, bool is_nullable) {
+// nullable key whose requested placement differs from the server's stops the
+// pushdown -- unless `emulate`, when a leading key sorts NULL where DuckDB wants
+// it: `CASE WHEN [col] IS NULL THEN 1 ELSE 0 END, <key> ASC` for NULLS LAST
+// ascending (spec 079 D2). Emulation is only for TOP N / LIMIT (review of
+// #387): the CASE key is not sargable, so the server sorts every row -- worth it
+// when only N rows cross the wire, a plain loss for a full ORDER BY, which
+// DuckDB sorts as the rows stream in. The NULL test is on the COLUMN, not the
+// fragment: a mapped function is null exactly when its argument is, and the
+// function is then not evaluated twice per row.
+//
+// False (term untouched) when the key cannot be pushed as asked: a placement
+// that needs emulation it may not use, or a null order that is neither FIRST
+// nor LAST -- the binder resolves the default before this runs, and anything
+// else refuses rather than guess (it used to be read as LAST).
+static bool OrderTerm(const string &fragment, const string &column, OrderType order_type, OrderByNullType null_order,
+					  bool is_nullable, bool emulate, string &out_term) {
+	if (null_order != OrderByNullType::NULLS_FIRST && null_order != OrderByNullType::NULLS_LAST) {
+		return false;
+	}
 	const bool descending = order_type == OrderType::DESCENDING;
 	const string term = fragment + (descending ? " DESC" : " ASC");
-	if (!is_nullable) {
-		return term;
-	}
 	const bool nulls_first = null_order == OrderByNullType::NULLS_FIRST;
 	const bool server_puts_nulls_first = !descending;
-	if (nulls_first == server_puts_nulls_first) {
-		return term;
+	if (!is_nullable || nulls_first == server_puts_nulls_first) {
+		out_term = term;
+		return true;
+	}
+	if (!emulate) {
+		return false;
 	}
 	// The leading key sorts ascending: the side that must come first gets 0.
-	return "CASE WHEN " + fragment + " IS NULL THEN " + (nulls_first ? "0 ELSE 1" : "1 ELSE 0") + " END, " + term;
+	out_term = "CASE WHEN " + mssql::QuoteIdentifier(column) + " IS NULL THEN " +
+			   (nulls_first ? "0 ELSE 1" : "1 ELSE 0") + " END, " + term;
+	return true;
 }
 
 //------------------------------------------------------------------------------
@@ -299,7 +326,7 @@ static string OrderTerm(const string &fragment, OrderType order_type, OrderByNul
 //------------------------------------------------------------------------------
 static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const LogicalGet &get,
 								 const LogicalProjection *projection, MSSQLCatalogScanBindData &bind_data,
-								 string &out_order_clause) {
+								 bool emulate_null_order, string &out_order_clause) {
 	string order_clause;
 	idx_t pushed_count = 0;
 
@@ -328,7 +355,12 @@ static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const L
 		}
 		const bool is_nullable = bind_data.mssql_columns[table_col_idx].is_nullable;
 
-		const string term = OrderTerm(fragment, order.type, order.null_order, is_nullable);
+		string term;
+		if (!OrderTerm(fragment, source_column, order.type, order.null_order, is_nullable, emulate_null_order, term)) {
+			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: NULL placement of %s cannot be pushed here", (unsigned long long)i,
+							source_column.c_str());
+			break;
+		}
 		if (!order_clause.empty()) {
 			order_clause += ", ";
 		}
@@ -499,7 +531,8 @@ static void TryPushOrderBy(ClientContext &context, unique_ptr<LogicalOperator> &
 
 	// Process ORDER BY columns
 	string order_clause;
-	idx_t pushed = ProcessOrderByNodes(order.orders, *scan_info.get, scan_info.projection, bind_data, order_clause);
+	idx_t pushed =
+		ProcessOrderByNodes(order.orders, *scan_info.get, scan_info.projection, bind_data, false, order_clause);
 
 	if (pushed == 0) {
 		MSSQL_OPT_DEBUG(1, "No columns pushed down");
@@ -526,6 +559,50 @@ static void TryPushOrderBy(ClientContext &context, unique_ptr<LogicalOperator> &
 	} else {
 		MSSQL_OPT_DEBUG(1, "Partial ORDER BY pushdown (%llu/%llu columns) - keeping LogicalOrder",
 						(unsigned long long)pushed, (unsigned long long)order.orders.size());
+	}
+}
+
+//------------------------------------------------------------------------------
+// Helper: will any of the scan's filters run CLIENT-side?
+//------------------------------------------------------------------------------
+//
+// A filter the encoder refuses is applied by the scan over the rows the server
+// returned (table_scan.cpp's client-filter net; 2.0 does not re-apply a
+// TableFilter behind a filter_pushdown scan). A TOP N folded into the query
+// would then be taken BEFORE that filter: the server sends N rows ignoring it,
+// the scan drops some, and nothing refills -- on a composite key `WHERE
+// rowid.a >= 2 ORDER BY k LIMIT 2` returned 0 rows of 2 (review of #387). So TOP N / LIMIT is not pushed
+// when any filter would stay on the client; a plain ORDER BY still is, since a
+// filter keeps the order of what it passes. Asked with the scan's own encoder,
+// literal form: whether a filter is handled does not depend on parameters.
+// Anything that fails the dry run is treated as client-side.
+static bool ScanHasClientSideFilters(const LogicalGet &get, const MSSQLCatalogScanBindData &bind_data) {
+	if (!get.table_filters.HasFilters()) {
+		return false;
+	}
+	try {
+		std::vector<column_t> column_ids;
+		for (auto &col : get.GetColumnIds()) {
+			column_ids.push_back(col.GetPrimaryIndex());
+		}
+		auto encoded = mssql::FilterEncoder::Encode(&get.table_filters, column_ids, bind_data.all_column_names,
+													bind_data.all_types, &bind_data.mssql_columns, nullptr);
+		// An optional filter -- the dynamic filter TopN itself pushes into the
+		// scan, a join's min/max -- only ever removes rows that cannot be in
+		// the result, so running it after TOP N loses nothing.
+		idx_t mandatory = 0;
+		for (auto &entry : encoded.unhandled) {
+			if (!ExpressionFilter::IsRootOptionalFilter(*entry.second)) {
+				mandatory++;
+			}
+		}
+		if (mandatory > 0) {
+			MSSQL_OPT_DEBUG(1, "TOP N not pushed: %llu filter(s) run client-side", (unsigned long long)mandatory);
+			return true;
+		}
+		return false;
+	} catch (...) {
+		return true;
 	}
 }
 
@@ -574,9 +651,14 @@ static void TryPushLimitOrderBy(ClientContext &context, unique_ptr<LogicalOperat
 					scan_info.projection ? "Projection -> " : "", bind_data.schema_name.c_str(),
 					bind_data.table_name.c_str());
 
+	if (ScanHasClientSideFilters(*scan_info.get, bind_data)) {
+		return;
+	}
+
 	// Process ORDER BY columns
 	string order_clause;
-	idx_t pushed = ProcessOrderByNodes(order.orders, *scan_info.get, scan_info.projection, bind_data, order_clause);
+	idx_t pushed =
+		ProcessOrderByNodes(order.orders, *scan_info.get, scan_info.projection, bind_data, true, order_clause);
 
 	if (pushed == 0) {
 		MSSQL_OPT_DEBUG(1, "No columns pushed down");
@@ -633,9 +715,14 @@ static void TryPushTopN(ClientContext &context, unique_ptr<LogicalOperator> &pla
 					scan_info.projection ? "Projection -> " : "", bind_data.schema_name.c_str(),
 					bind_data.table_name.c_str());
 
+	if (ScanHasClientSideFilters(*scan_info.get, bind_data)) {
+		return;
+	}
+
 	// Process ORDER BY columns
 	string order_clause;
-	idx_t pushed = ProcessOrderByNodes(top_n.orders, *scan_info.get, scan_info.projection, bind_data, order_clause);
+	idx_t pushed =
+		ProcessOrderByNodes(top_n.orders, *scan_info.get, scan_info.projection, bind_data, true, order_clause);
 
 	if (pushed == 0) {
 		MSSQL_OPT_DEBUG(1, "No columns pushed down");

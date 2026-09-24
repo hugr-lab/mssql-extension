@@ -5,8 +5,7 @@
 #include "codec/target_string_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/extension_type_info.hpp"
-#include "query/mssql_sql_params.hpp"
-#include "table_scan/filter_encoder.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 
@@ -350,17 +349,18 @@ bool MSSQLColumnInfo::OrdersLikeDuckDB() const {
 	string lower_type = sql_type_name;
 	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
 				   [](unsigned char c) { return std::tolower(c); });
-	if (lower_type == "uniqueidentifier" || lower_type == "sql_variant" || lower_type == "text" ||
-		lower_type == "ntext" || lower_type == "image" || lower_type == "xml") {
-		return false;
-	}
-	if (lower_type == "nvarchar" || lower_type == "nchar") {
-		return IsBinary2Collation(collation_name);
-	}
 	if (lower_type == "varchar" || lower_type == "char") {
-		return IsBinary2Collation(collation_name) && is_utf8;
+		return is_utf8 && IsBinary2Collation(collation_name);
 	}
-	return true;
+	static const char *const ORDERED_TYPES[] = {
+		"bit",	 "tinyint", "smallint", "int",	"bigint",	"decimal",	 "numeric",		  "money",		   "smallmoney",
+		"float", "real",	"date",		"time", "datetime", "datetime2", "smalldatetime", "datetimeoffset"};
+	for (auto type_name : ORDERED_TYPES) {
+		if (lower_type == type_name) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool MSSQLColumnInfo::IsSpatialType(const string &sql_type_name) {

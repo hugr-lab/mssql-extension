@@ -20,15 +20,20 @@ ATTACH '{MSSQL_TESTDB_DSN}' AS opd_setup (TYPE mssql);
 statement ok
 DROP TABLE IF EXISTS opd_setup.dbo.order_pushdown_test;
 
-# Create table using DuckDB syntax
+# The string columns are varchar under a _BIN2_UTF8 collation: the one string
+# the server orders the way DuckDB does (MSSQLColumnInfo::OrdersLikeDuckDB,
+# issue #362). A DuckDB-created VARCHAR would not qualify, and every ORDER BY
+# on name/category below would quietly stop testing pushdown.
 statement ok
-CREATE TABLE opd_setup.dbo.order_pushdown_test (
-    id INT,
-    name VARCHAR,
-    score INT,
-    created_date DATE,
-    category VARCHAR
-);
+SELECT mssql_exec('opd_setup', 'CREATE TABLE dbo.order_pushdown_test (
+    id INT NULL,
+    name varchar(50) COLLATE Latin1_General_100_BIN2_UTF8 NULL,
+    score INT NULL,
+    created_date DATE NULL,
+    category varchar(10) COLLATE Latin1_General_100_BIN2_UTF8 NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('opd_setup');
 
 # Insert test data using DuckDB syntax
 statement ok
@@ -186,8 +191,16 @@ DETACH opd3n;
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS opd4 (TYPE mssql, order_pushdown true);
 
+# name is nullable: ASC NULLS FIRST is the server's own placement, so this
+# pushes with no emulation. (DuckDB's default NULLS LAST on a plain ORDER BY
+# is not pushed -- Test 12.)
+query II
+EXPLAIN SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY name ASC NULLS FIRST;
+----
+physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
+
 query IT
-SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY name ASC;
+SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY name ASC NULLS FIRST;
 ----
 1	Alice
 2	Bob
@@ -218,8 +231,13 @@ SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY id DESC;
 # Test 6 (T019/US1): Simple ORDER BY pushdown - multi-column
 # =============================================================================
 
+query II
+EXPLAIN SELECT id, name, category FROM opd4.dbo.order_pushdown_test WHERE category IS NOT NULL ORDER BY category ASC NULLS FIRST, name ASC NULLS FIRST;
+----
+physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
+
 query ITT
-SELECT id, name, category FROM opd4.dbo.order_pushdown_test WHERE category IS NOT NULL ORDER BY category ASC, name ASC;
+SELECT id, name, category FROM opd4.dbo.order_pushdown_test WHERE category IS NOT NULL ORDER BY category ASC NULLS FIRST, name ASC NULLS FIRST;
 ----
 1	Alice	A
 3	Charlie	A
@@ -255,8 +273,14 @@ SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY id DESC LIMIT 2;
 # Results should still be correct (DuckDB does final sort)
 # =============================================================================
 
+# The first key is pushed, the second is not, so DuckDB's sort stays.
+query II
+EXPLAIN SELECT id, name, score FROM opd4.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY name ASC NULLS FIRST, score * 2 DESC;
+----
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
 query ITI
-SELECT id, name, score FROM opd4.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY name ASC, score * 2 DESC;
+SELECT id, name, score FROM opd4.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY name ASC NULLS FIRST, score * 2 DESC;
 ----
 1	Alice	85
 3	Charlie	92
@@ -303,17 +327,80 @@ DROP TABLE local_test;
 # =============================================================================
 # Test 12 (T032): NULL ordering edge case - nullable column whose requested NULL
 # placement differs from SQL Server's (NULL lowest: ASC -> first, DESC -> last).
-# Until spec 079 this skipped the pushdown; now the placement is emulated with a
-# leading `CASE WHEN score IS NULL THEN 1 ELSE 0 END` key and the sort runs on
-# the server. `, id` keeps the two NULL rows in a defined order: they tie on
-# score, and a tie is either side's to break.
+# A plain ORDER BY is not pushed: emulating the placement takes a leading
+# `CASE WHEN score IS NULL ...` key, which no index can serve, so the server
+# would sort where DuckDB sorts now. Under a LIMIT it IS pushed with that key:
+# TOP N moves N rows instead of the table, which is worth the sort. `, id` keeps
+# the two NULL rows in a defined order: they tie on score, and a tie is either
+# side's to break.
 # =============================================================================
 
 # ASC NULLS LAST (DuckDB's default) against the server's ASC NULLS FIRST.
 query II
 EXPLAIN SELECT id, name, score FROM opd4.dbo.order_pushdown_test ORDER BY score ASC NULLS LAST, id;
 ----
-physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
+query II
+EXPLAIN SELECT score FROM opd4.dbo.order_pushdown_test ORDER BY score ASC NULLS LAST LIMIT 3;
+----
+physical_plan	<!REGEX>:.*(TOP_N|Top N).*
+
+query I
+SELECT score FROM opd4.dbo.order_pushdown_test ORDER BY score ASC NULLS LAST LIMIT 3;
+----
+70
+78
+85
+
+query II
+EXPLAIN SELECT score FROM opd4.dbo.order_pushdown_test ORDER BY score DESC NULLS FIRST LIMIT 3;
+----
+physical_plan	<!REGEX>:.*(TOP_N|Top N).*
+
+query I
+SELECT score FROM opd4.dbo.order_pushdown_test ORDER BY score DESC NULLS FIRST LIMIT 3;
+----
+NULL
+NULL
+95
+
+# TOP N is not pushed when a filter stays on the client: the server would take
+# its N rows BEFORE the filter, and the filter would then drop some of them
+# (review of #387 -- the composite-key case below returned 0 rows of 2).
+# `rowid.a` on a composite key is a filter the encoder refuses.
+statement ok
+SELECT mssql_exec('opd4', 'DROP TABLE IF EXISTS dbo.order_pushdown_comp');
+
+statement ok
+SELECT mssql_exec('opd4', 'CREATE TABLE dbo.order_pushdown_comp (a int NOT NULL, b int NOT NULL, k int NULL, PRIMARY KEY (a, b));
+INSERT INTO dbo.order_pushdown_comp VALUES (1,1,1),(1,2,2),(2,1,3),(2,2,4),(3,1,5),(3,2,6)');
+
+query II
+EXPLAIN SELECT a, b FROM opd4.dbo.order_pushdown_comp WHERE rowid.a >= 2 ORDER BY k LIMIT 2;
+----
+physical_plan	<REGEX>:.*(TOP_N|Top N).*
+
+query II
+SELECT a, b FROM opd4.dbo.order_pushdown_comp WHERE rowid.a >= 2 ORDER BY k LIMIT 2;
+----
+2	1
+2	2
+
+# A filter the server takes does not block it.
+query II
+EXPLAIN SELECT a, b FROM opd4.dbo.order_pushdown_comp WHERE a >= 2 ORDER BY k LIMIT 2;
+----
+physical_plan	<!REGEX>:.*(TOP_N|Top N).*
+
+query II
+SELECT a, b FROM opd4.dbo.order_pushdown_comp WHERE a >= 2 ORDER BY k LIMIT 2;
+----
+2	1
+2	2
+
+statement ok
+SELECT mssql_exec('opd4', 'DROP TABLE dbo.order_pushdown_comp');
 
 query ITI
 SELECT id, name, score FROM opd4.dbo.order_pushdown_test ORDER BY score ASC NULLS LAST, id;
@@ -393,9 +480,17 @@ DETACH opd_nn;
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS opd_prune (TYPE mssql, order_pushdown true);
 
-# score is used only for ORDER BY, not in output — should be pruned after pushdown
+# score is used only for ORDER BY, not in output — should be pruned after
+# pushdown. It is also the filtered column: the pruned scan must still apply
+# the pushed filter. NULLS FIRST is the server's own placement for ASC, so the
+# ORDER BY is pushed without emulation.
+query II
+EXPLAIN SELECT id, name FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY score ASC NULLS FIRST;
+----
+physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
+
 query IT
-SELECT id, name FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY score ASC;
+SELECT id, name FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY score ASC NULLS FIRST;
 ----
 8	Hank
 4	Diana
@@ -409,8 +504,13 @@ SELECT id, name FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL O
 # ORDER BY score and score is in SELECT → no columns should be pruned
 # =============================================================================
 
+query II
+EXPLAIN SELECT id, name, score FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY score ASC NULLS FIRST;
+----
+physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
+
 query ITI
-SELECT id, name, score FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY score ASC;
+SELECT id, name, score FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY score ASC NULLS FIRST;
 ----
 8	Hank	70
 4	Diana	78
@@ -425,14 +525,40 @@ SELECT id, name, score FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT
 # score is order-only, category is in both output and ORDER
 # =============================================================================
 
+query II
+EXPLAIN SELECT id, name, category FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL AND category IS NOT NULL ORDER BY category ASC NULLS FIRST, score DESC NULLS LAST;
+----
+physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
+
 query ITT
-SELECT id, name, category FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL AND category IS NOT NULL ORDER BY category ASC, score DESC;
+SELECT id, name, category FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL AND category IS NOT NULL ORDER BY category ASC NULLS FIRST, score DESC NULLS LAST;
 ----
 7	Grace	A
 3	Charlie	A
 1	Alice	A
 6	Frank	B
 8	Hank	C
+
+# Test 16b (review of #387): the filter column is neither output nor order key.
+# The pruning after a full ORDER BY pushdown must not cut the column the pushed
+# filter addresses.
+query II
+EXPLAIN SELECT id FROM opd_prune.dbo.order_pushdown_test WHERE category = 'A' ORDER BY score DESC NULLS LAST;
+----
+physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
+
+query I
+SELECT id FROM opd_prune.dbo.order_pushdown_test WHERE category = 'A' ORDER BY score DESC NULLS LAST;
+----
+7
+3
+1
+
+query I
+SELECT id FROM opd_prune.dbo.order_pushdown_test WHERE category = 'B' AND created_date > DATE '2023-01-01' ORDER BY score DESC NULLS LAST, id;
+----
+6
+2
 
 # =============================================================================
 # Test 17: LIMIT + ORDER on output column (existing pattern, no pruning applies)
