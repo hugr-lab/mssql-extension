@@ -532,12 +532,18 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 
 	// T035 (FR-003/Bug 0.2): Check cache BEFORE acquiring connection to reduce connection usage
 	// Fast path: If schemas are already loaded and schema exists in cache, skip connection acquisition
-	// Through SchemaListCache like the load below and ScanSchemas (review of
-	// #382): inside a transaction that changed "anything" the shared list is not
-	// the authority, and a hit on it would return a schema the transaction may
-	// have dropped.
-	auto &fast_list = SchemaListCache(transaction.context.get());
-	if (fast_list.GetSchemasState() == CacheLoadState::LOADED && fast_list.HasSchema(name)) {
+	// Through SchemaListCache, not metadata_cache_ directly (review of #382):
+	// inside a transaction that ran DDL the extension cannot see through, the
+	// shared list still describes committed state and would answer here for a
+	// schema the transaction has since dropped. ScanSchemas already reads the
+	// list this way, and the two must not disagree about which one is
+	// authoritative. With no context, or in autocommit, this IS metadata_cache_.
+	// Bound ONCE for both paths (review of 0e12914): two calls could return
+	// different cache objects if the transaction's IsAllChanged state or the
+	// shared list's load state changed in between, and the miss decision would
+	// then be made against one cache and the load against another.
+	auto &schema_list = SchemaListCache(transaction.context.get());
+	if (schema_list.GetSchemasState() == CacheLoadState::LOADED && schema_list.HasSchema(name)) {
 		auto schema_sp = GetOrCreateSchemaEntryShared(name);
 		if (transaction.context) {
 			MSSQLBindAnchors::For(*transaction.context, *this).AnchorSchema(schema_sp);
@@ -568,7 +574,6 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 	}
 
 	// Trigger lazy loading of schema list (ensure connection released on exception)
-	auto &schema_list = SchemaListCache(transaction.context.get());
 	try {
 		schema_list.EnsureSchemasLoaded(*connection);
 	} catch (...) {
@@ -1501,17 +1506,6 @@ void MSSQLCatalog::NoteTransactionChange(ClientContext &context, const string &s
 		return;
 	}
 	MSSQLTransaction::Get(context, *this).Metadata(context).MarkChanged(schema, table);
-}
-
-bool MSSQLCatalog::HasOpenServerTransaction(ClientContext &context) {
-	if (context.transaction.IsAutoCommit()) {
-		return false;
-	}
-	auto transaction = MetaTransaction::Get(context).TryGetTransaction(GetAttached());
-	if (!transaction) {
-		return false;
-	}
-	return transaction->Cast<MSSQLTransaction>().HasPinnedConnection();
 }
 
 void MSSQLCatalog::NoteTransactionChangeLocally(ClientContext &context) {

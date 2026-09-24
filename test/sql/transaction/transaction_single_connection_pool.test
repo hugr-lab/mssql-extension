@@ -47,7 +47,7 @@ statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS one380 (TYPE mssql);
 
 statement ok
-SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins, dbo.one380_ac_copy, dbo.one380_ac_raw, dbo.one380_ac_local');
+SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins, dbo.one380_ac_copy, dbo.one380_ac_raw, dbo.one380_ac_local, dbo.one380_ac_bind');
 
 statement ok
 SELECT mssql_exec('one380', 'CREATE TABLE dbo.one380_src (id int NOT NULL PRIMARY KEY, v nvarchar(10) NULL); INSERT INTO dbo.one380_src SELECT TOP 2500 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), N''x'' FROM sys.all_columns a CROSS JOIN sys.all_columns b');
@@ -212,6 +212,14 @@ INSERT INTO one380.dbo.one380_ac_ins SELECT * FROM mssql_scan('one380', 'SELECT 
 ----
 10
 
+# A raw scan the server cannot describe runs at BIND: its drain has the same
+# condition, or the stream holds the only connection while the binder resolves
+# the CTAS target (review of #389).
+query I
+CREATE TABLE one380.dbo.one380_ac_bind AS SELECT * FROM mssql_scan('one380', 'SELECT 1 AS id INTO #one380_bx; SELECT id FROM #one380_bx');
+----
+1
+
 # A COPY into a #temp target keeps its connection from init to the end of the
 # load, as it does on any pool: given back to the pool between the DDL and the
 # load, the connection would be reset first, and the reset drops the table the
@@ -234,7 +242,7 @@ SELECT count(*) FROM one380.dbo.one380_ac_local;
 3000
 
 statement ok
-SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins, dbo.one380_ac_copy, dbo.one380_ac_raw, dbo.one380_ac_local');
+SELECT mssql_exec('one380', 'DROP TABLE IF EXISTS dbo.one380_src, dbo.one380_ctas_range, dbo.one380_ctas_rb, dbo.one380_ctas_self, dbo.one380_ac_ctas, dbo.one380_ac_ins, dbo.one380_ac_copy, dbo.one380_ac_raw, dbo.one380_ac_local, dbo.one380_ac_bind');
 
 statement ok
 DETACH one380;

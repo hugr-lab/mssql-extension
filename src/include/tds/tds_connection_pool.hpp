@@ -39,9 +39,13 @@ struct PoolStatistics {
 	size_t active_connections = 0;
 	size_t connections_created = 0;
 	size_t connections_closed = 0;
+	// Times a connection was acquired. A blocking Acquire counts its ATTEMPT
+	// here (so a timeout is counted); an optional TryAcquire counts only when it
+	// actually got one, because an extra bulk-load writer probes once per chunk
+	// and those attempts are not acquisitions (review of 0e12914).
 	size_t acquire_count = 0;
-	size_t acquire_timeout_count = 0;
-	size_t creation_failures = 0;  // factory threw or returned nothing (issue #302)
+	size_t acquire_timeout_count = 0;  // blocking Acquire only; a probe never waits
+	size_t creation_failures = 0;	   // factory threw or returned nothing (issue #302)
 	uint64_t acquire_wait_total_ms = 0;
 	int64_t pinned_count = 0;  // Connections pinned to active transactions (spec 047 FR-005)
 };

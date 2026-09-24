@@ -71,11 +71,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     leave a phantom table after ROLLBACK and to show another connection the
     uncommitted table. At COMMIT or ROLLBACK the shared cache forgets what the
     transaction changed.
-  - **Refused inside a transaction that uses the catalog.**
+  - **Refused inside a transaction that uses MSSQL.**
     `mssql_refresh_cache()` and `mssql_preload_catalog()` are bulk loads into
-    the shared cache, so they are refused while the DuckDB transaction has a
-    server transaction open on that catalog. A DuckDB transaction that never
-    touched it is not refused. `mssql_invalidate_cache()` is always allowed.
+    the shared cache. They are refused once the DuckDB transaction has used
+    any attached MSSQL catalog. Any, not just this one, because two ATTACHes
+    of one database are independent catalogs (#389). A DuckDB transaction that
+    touched no MSSQL catalog is not refused. `mssql_invalidate_cache()` is
+    always allowed.
   - **A pool of one connection.**
     - *CTAS in a transaction* runs whole on the pinned connection: checks,
       CREATE, and rows as INSERT statements. ROLLBACK undoes it. It used to

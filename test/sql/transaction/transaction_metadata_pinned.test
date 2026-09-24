@@ -29,7 +29,7 @@ statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS tm380 (TYPE mssql);
 
 statement ok
-SELECT mssql_exec('tm380', 'DROP TABLE IF EXISTS dbo.tm380_copy, dbo.tm380_exec, dbo.tm380_commit, dbo.tm380_drop, dbo.tm380_src, dbo.tm380_ctas1, dbo.tm380_ctas2, dbo.tm380_ctas3, dbo.tm380_nokey; IF OBJECT_ID(''tm380s.t'') IS NOT NULL DROP TABLE tm380s.t; IF SCHEMA_ID(''tm380s'') IS NOT NULL EXEC(''DROP SCHEMA tm380s'')');
+SELECT mssql_exec('tm380', 'DROP TABLE IF EXISTS dbo.tm380_copy, dbo.tm380_exec, dbo.tm380_commit, dbo.tm380_drop, dbo.tm380_src, dbo.tm380_ctas1, dbo.tm380_ctas2, dbo.tm380_ctas3, dbo.tm380_nokey; IF OBJECT_ID(''tm380s.t'') IS NOT NULL DROP TABLE tm380s.t; IF SCHEMA_ID(''tm380s'') IS NOT NULL EXEC(''DROP SCHEMA tm380s''); IF SCHEMA_ID(''tm380x'') IS NOT NULL EXEC(''DROP SCHEMA tm380x'')');
 
 statement ok
 SELECT mssql_exec('tm380', 'CREATE TABLE dbo.tm380_drop (id int NOT NULL)');
@@ -107,7 +107,7 @@ SELECT id, v FROM tm380.dbo.tm380_exec ORDER BY id;
 statement error
 SELECT mssql_refresh_cache('tm380');
 ----
-cannot run inside a transaction that has used catalog 'tm380'
+cannot run inside a transaction that has used an MSSQL catalog
 
 statement ok
 ROLLBACK;
@@ -124,10 +124,15 @@ does not exist
 statement ok
 BEGIN;
 
+# Review of #382: the refusal asks whether this transaction has used MSSQL at
+# all, not merely whether one is open. A transaction that has touched no MSSQL
+# catalog holds no pinned connection and nothing uncommitted on any server, so a
+# bulk load of committed metadata into the shared cache is safe and allowed --
+# refusing it broke scripts that wrap unrelated work in BEGIN.
 statement ok
 SELECT mssql_preload_catalog('tm380');
 
-# Once the transaction has used the catalog, it is refused.
+# Once the transaction HAS used an MSSQL catalog, it is refused again.
 query I
 SELECT count(*) FROM tm380.dbo.tm380_drop;
 ----
@@ -136,7 +141,7 @@ SELECT count(*) FROM tm380.dbo.tm380_drop;
 statement error
 SELECT mssql_preload_catalog('tm380');
 ----
-cannot run inside a transaction that has used catalog 'tm380'
+cannot run inside a transaction that has used an MSSQL catalog
 
 statement ok
 ROLLBACK;
@@ -351,6 +356,50 @@ query I
 SELECT count(*) FROM tm380.tm380s.t;
 ----
 0
+
+#------------------------------------------------------------------------------
+# Review of 0e12914: LookupSchema's FAST path must read the same schema list
+# ScanSchemas does. mssql_exec DDL under mssql_exec_invalidate_cache = false
+# marks the transaction's own layer (MarkChangedLocally), so the shared list --
+# which still holds the dropped schema, that being the committed state -- must
+# not answer the hit path. The CREATE SCHEMA case above goes through DuckDB's
+# own DDL, which invalidates the shared cache and so never reaches this branch.
+#------------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('tm380', 'IF SCHEMA_ID(''tm380x'') IS NULL EXEC(''CREATE SCHEMA tm380x'')');
+
+statement ok
+SELECT mssql_invalidate_cache('tm380');
+
+statement ok
+SET mssql_exec_invalidate_cache = false;
+
+# Load the shared schema list, so the fast path has something to hit.
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'tm380' AND schema_name = 'tm380x';
+----
+1
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT mssql_exec('tm380', 'DROP SCHEMA tm380x');
+
+# Before the fix the fast path read metadata_cache_ directly, found tm380x in
+# the still-committed shared list and handed back a live schema entry.
+statement error
+CREATE TABLE tm380.tm380x.t (id INTEGER);
+----
+not found
+
+statement ok
+ROLLBACK;
+
+# The ROLLBACK put the schema back; drop it for real.
+statement ok
+SELECT mssql_exec('tm380', 'IF SCHEMA_ID(''tm380x'') IS NOT NULL EXEC(''DROP SCHEMA tm380x'')');
 
 statement ok
 SELECT mssql_exec('tm380', 'DROP TABLE tm380s.t; DROP SCHEMA tm380s; DROP TABLE IF EXISTS dbo.tm380_src, dbo.tm380_ctas1, dbo.tm380_ctas2, dbo.tm380_ctas3, dbo.tm380_nokey');

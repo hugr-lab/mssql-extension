@@ -3,6 +3,7 @@
 
 #include "catalog/mssql_refresh_function.hpp"
 #include "catalog/mssql_catalog.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "mssql_function_docs.hpp"
 #include "mssql_storage.hpp"
@@ -106,17 +107,23 @@ static void MSSQLRefreshCacheExecute(DataChunk &args, ExpressionState &state, Ve
 				catalog_name, catalog_name);
 		}
 		auto &catalog = *catalog_ptr;
-		// Refused while this catalog has a server transaction open (issue #380):
-		// a forced load there either blocks on the transaction's own uncommitted
+		// Refused inside an explicit transaction ON THIS CATALOG (issue #380): a
+		// forced load there either blocks on the transaction's own uncommitted
 		// DDL (a pool connection waits on its schema lock until the metadata
 		// timeout) or, on the pinned connection, would publish the transaction's
-		// uncommitted view into the cache every other connection reads. A DuckDB
-		// transaction that never touched this catalog is not refused (review of
-		// #382). Invalidation stays allowed.
-		if (catalog.HasOpenServerTransaction(client_context)) {
+		// uncommitted view into the cache every other connection reads.
+		// Invalidation stays allowed.
+		//
+		// Scoped to "has this transaction used MSSQL at all" rather than to "not
+		// autocommit" (review of #382): a transaction that wraps unrelated
+		// DuckDB work in BEGIN ... COMMIT holds no pinned connection and nothing
+		// uncommitted on any server, so there is nothing to block on and nothing
+		// to leak. Not scoped per catalog -- aliases of one database are
+		// independent catalogs, see HasUsedAnyMSSQLCatalogInTransaction.
+		if (ConnectionProvider::HasUsedAnyMSSQLCatalogInTransaction(client_context)) {
 			throw InvalidInputException(
-				"mssql_refresh_cache cannot run inside a transaction that has used catalog '%s': it would load the "
-				"catalog's metadata while the transaction may hold uncommitted changes. Use "
+				"mssql_refresh_cache cannot run inside a transaction that has used an MSSQL catalog: "
+				"it would load '%s' while the transaction may hold uncommitted changes. Use "
 				"mssql_invalidate_cache() inside the transaction, or refresh after COMMIT",
 				catalog_name);
 		}

@@ -179,6 +179,17 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 	std::string own_create_error;
 
 	std::unique_lock<std::mutex> lock(pool_mutex_);
+	// A FAILED optional probe is not an acquisition: an extra bulk-load writer
+	// asks once per chunk while it shares the global writer, and counting those
+	// inflates acquire_count in mssql_pool_stats and skews any
+	// acquire_wait_total_ms / acquire_count reading (review of #382 / 7f13a0a).
+	// A probe that GETS a connection is a real checkout -- it is counted in
+	// connections_created / active_connections and later Released -- so it is
+	// counted at the success returns below instead, with its (~0 ms) wait, which
+	// keeps acquire_count meaning "times connections acquired" as the docs say
+	// (review of 0e12914). Counting here would count the attempt, which for a
+	// probe is the wrong event; acquire_timeout_count skips them for the same
+	// reason.
 	if (!optional) {
 		stats_.acquire_count++;
 	}
@@ -195,6 +206,11 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 			// beside a healthy pool without a reuse blanking it.
 			auto elapsed =
 				std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+			if (optional) {
+				// A probe that got one: the acquisition the top of the call did
+				// not count (review of 0e12914).
+				stats_.acquire_count++;
+			}
 			stats_.acquire_wait_total_ms += elapsed;
 			return conn;
 		}
@@ -233,6 +249,9 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 				auto elapsed =
 					std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
 						.count();
+				if (optional) {
+					stats_.acquire_count++;
+				}
 				stats_.acquire_wait_total_ms += elapsed;
 				return conn;
 			}
@@ -265,7 +284,9 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 				auto elapsed =
 					std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
 						.count();
-				stats_.acquire_wait_total_ms += elapsed;
+				if (!optional) {
+					stats_.acquire_wait_total_ms += elapsed;
+				}
 				return nullptr;
 			}
 			// Others are active: a Release may still serve this request, so
