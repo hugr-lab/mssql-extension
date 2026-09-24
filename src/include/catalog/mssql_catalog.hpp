@@ -111,7 +111,8 @@ public:
 	//! trusting the shared cache for it, and its end invalidates it there. A
 	//! no-op in autocommit, where the shared invalidation next to every call
 	//! site is the whole story.
-	void NoteTransactionChange(ClientContext &context, const string &schema = string(), const string &table = string());
+	void NoteTransactionChange(ClientContext &context, const string &schema = string(), const string &table = string(),
+							   bool dropped = false);
 
 	//! At COMMIT and ROLLBACK: invalidate in the shared cache what the
 	//! transaction changed. Another connection may have loaded the committed
@@ -122,16 +123,22 @@ public:
 	//! a no-op in autocommit.
 	void NoteTransactionChangeLocally(ClientContext &context);
 
-	//! Issue #383: after a transaction has ended, load what it touched into the
-	//! shared cache, on a pool connection -- so it is committed state, taken
-	//! after the transaction rather than during it. Up to
-	//! WARM_TABLES_PER_SCHEMA tables of a schema one by one, more as the
-	//! schema's preload (one round trip). Opportunistic and silent: never on a
-	//! pool of one connection (nothing to share it with, and it would hold the
-	//! only connection), never waiting for one, and a failure leaves the names
-	//! invalidated as they already are. No ClientContext: runs after ROLLBACK
+	//! Issue #383: after a transaction has ended, load into the shared cache
+	//! what it touched and the shared cache now LACKS -- a table it changed
+	//! (invalidated at its end) or loaded only on its pinned connection -- so
+	//! the next statement finds committed state without a round trip of its
+	//! own. Synchronous, on COMMIT's path, and therefore small: at most
+	//! WARM_TABLES_LIMIT tables, one by one; more than that is left invalidated
+	//! for lazy loading, which costs nothing now (review of #386: the per-schema
+	//! preload it used to run replaced every table's metadata, keys included,
+	//! and re-ran on every commit). Tables the shared cache still holds, and
+	//! names the table filter hides, are skipped without I/O. Only on an IDLE
+	//! pool connection -- never a login -- and never on a pool of one. A
+	//! failure leaves the names invalidated as they already are. Nothing is
+	//! published to the statistics provider: a count loaded here may lag the
+	//! rows the transaction just wrote. No ClientContext: runs after ROLLBACK
 	//! too, where there may be none.
-	static constexpr idx_t WARM_TABLES_PER_SCHEMA = 8;
+	static constexpr idx_t WARM_TABLES_LIMIT = 5;
 	void WarmSharedCache(const std::set<std::pair<string, string>> &tables) noexcept;
 
 	//! Issue #324: whether Initialize opens mssql_min_connections up front
@@ -146,10 +153,14 @@ public:
 	void AdoptOnInitialize(std::shared_ptr<tds::TdsConnection> connection) {
 		adopt_on_initialize_ = std::move(connection);
 	}
-	//! Issue #324: the `preload` ATTACH option -- mssql_preload_catalog(name)
-	//! run by the ATTACH itself, where DuckLake's METADATA_PARAMETERS can reach
-	//! it and a function call cannot. Throws on failure: it was asked for.
-	void PreloadAtAttach();
+	//! mssql_preload_catalog's body, and the `preload` ATTACH option's (issue
+	//! #324: run by the ATTACH itself, where DuckLake's METADATA_PARAMETERS can
+	//! reach it and a function call cannot) -- ONE implementation, so both keep
+	//! the #380 refusal inside a transaction and the session's cache settings
+	//! (review of #386: the ATTACH copy had dropped both). `caller` names the
+	//! entry point in the errors. Throws on failure: it was asked for.
+	void Preload(ClientContext &context, const string &schema_name, const char *caller, idx_t &schema_count,
+				 idx_t &table_count, idx_t &column_count);
 
 	//! The pool's connection limit, fixed at ATTACH.
 	idx_t GetConnectionLimit() const;

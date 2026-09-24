@@ -86,12 +86,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a transaction loads a missing table's metadata into a cache of its own, so a
   workload that runs everything in transactions (DuckLake) loaded every table
   once per transaction. After COMMIT or ROLLBACK the tables it loaded or
-  changed are now loaded into the shared cache on a pool connection: one by
-  one, or the schema's preload when more than 8 tables of a schema were
-  touched. 50 transactions reading two tables: 0.215 s → 0.100 s on a local
-  server, against 0.087 s with the cache already warm; against a remote
-  server the difference is one round trip per table per transaction. Not on a
-  pool of one connection.
+  changed that the shared cache lacks are now loaded into it, one by one, on
+  an idle pool connection (never a new login), when there are at most 5 of
+  them; more are left to lazy loading. Tables the shared cache still holds,
+  names the table filter hides and tables the transaction dropped cost
+  nothing. Inside a transaction the shared metadata cache is read too. 50
+  transactions reading two tables: 0.215 s → 0.100 s on a local server,
+  against 0.087 s with the cache already warm; against a remote server the
+  difference is one round trip per table per transaction. Not on a pool of
+  one connection.
 - **A table created inside a transaction can be read in it; a pool of one
   connection works in a transaction**
   ([#380](https://github.com/hugr-lab/mssql-extension/issues/380)).

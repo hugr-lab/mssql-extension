@@ -487,31 +487,6 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntryInTransaction(ClientContext &c
 				return nullptr;
 			}
 		}
-		// The shared METADATA cache: committed state, filled by an autocommit
-		// load, a preload, or the warm-up after an earlier transaction (issue
-		// #383). The entry built from it is committed state too, so it is
-		// published into entries_ -- epoch-guarded like LoadSingleEntry, so an
-		// invalidation racing this does not resurrect what it cleared.
-		const uint64_t epoch_at_start = invalidation_epoch_.load();
-		MSSQLTableMetadata cached_meta;
-		const auto cached = catalog.GetMetadataCache().TryGetLoadedTableMetadata(schema_name, name, cached_meta);
-		if (cached == MSSQLMetadataCache::CachedTableState::Absent) {
-			return nullptr;
-		}
-		if (cached == MSSQLMetadataCache::CachedTableState::Loaded) {
-			auto entry = CreateTableEntry(cached_meta);
-			if (entry) {
-				std::lock_guard<std::mutex> lock(entry_mutex_);
-				if (invalidation_epoch_.load() == epoch_at_start) {
-					auto result = entries_.emplace(name, entry);
-					attempted_tables_.insert(name);
-					entry = result.first->second;
-				}
-			}
-			if (entry) {
-				return anchor(entry);
-			}
-		}
 	}
 
 	// 3. The table filter hides it.
@@ -520,10 +495,27 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntryInTransaction(ClientContext &c
 		metadata.MarkAbsent(schema_name, name);
 		return nullptr;
 	}
-
-	// 4. Load it on the pinned connection, for this transaction only.
-	CATALOG_DEBUG(1, "  -> loading '%s.%s' on the transaction's connection", schema_name.c_str(), name.c_str());
 	catalog.EnsureCacheLoaded(context);
+
+	// 4. The shared METADATA cache: committed state, filled by an autocommit
+	//    load, a preload, or the warm-up after an earlier transaction (issue
+	//    #383) -- served without a round trip. The entry built from it goes
+	//    into THIS transaction's layer, not entries_ (review of #386): its
+	//    rowid key may still be discovered, and that discovery runs on the
+	//    pinned connection, whose failure an entry caches for good -- it must
+	//    die with the transaction, not refuse every other session's UPDATE.
+	if (!metadata.IsChanged(schema_name, name)) {
+		MSSQLTableMetadata cached_meta;
+		if (catalog.GetMetadataCache().TryGetLoadedTableMetadata(schema_name, name, cached_meta)) {
+			auto entry = CreateTableEntry(cached_meta);
+			if (entry) {
+				return anchor(metadata.AddEntry(schema_name, name, std::move(entry)));
+			}
+		}
+	}
+
+	// 5. Load it on the pinned connection, for this transaction only.
+	CATALOG_DEBUG(1, "  -> loading '%s.%s' on the transaction's connection", schema_name.c_str(), name.c_str());
 	auto connection = ConnectionProvider::GetConnection(context, catalog);
 	MSSQLTableMetadata table_meta;
 	bool found = false;

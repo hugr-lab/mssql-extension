@@ -50,7 +50,7 @@ void MSSQLTransactionMetadata::MarkSchemaListed(const string &schema) {
 	listed_schemas_.insert(schema);
 }
 
-void MSSQLTransactionMetadata::MarkChanged(const string &schema, const string &table) {
+void MSSQLTransactionMetadata::MarkChanged(const string &schema, const string &table, bool dropped) {
 	std::lock_guard<std::mutex> guard(lock_);
 	if (schema.empty()) {
 		all_changed_ = true;
@@ -74,6 +74,11 @@ void MSSQLTransactionMetadata::MarkChanged(const string &schema, const string &t
 	}
 	Key key(schema, table);
 	changed_tables_.insert(key);
+	if (dropped) {
+		dropped_tables_.insert(key);
+	} else {
+		dropped_tables_.erase(key);
+	}
 	entries_.erase(key);
 	absent_.erase(key);
 	// The listing may have been taken before the table was created or dropped.
@@ -132,6 +137,7 @@ MSSQLTransactionMetadata::Changes MSSQLTransactionMetadata::GetChanges() {
 	changes.all = all_changed_;
 	changes.schemas = changed_schemas_;
 	changes.tables = changed_tables_;
+	changes.dropped = dropped_tables_;
 	return changes;
 }
 

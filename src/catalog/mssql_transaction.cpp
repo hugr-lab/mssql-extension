@@ -108,16 +108,23 @@ void ForgetTransactionMetadata(duckdb::MSSQLCatalog &catalog, duckdb::MSSQLTrans
 	}
 }
 
-// Issue #383: the names the shared cache is warmed with after the transaction
-// -- the tables it loaded itself and the tables it changed. Read before the
-// transaction (and its metadata) is erased.
-std::set<std::pair<std::string, std::string>> TouchedTables(duckdb::MSSQLTransaction &txn) {
+// Issue #383: the names the shared cache may be warmed with after the
+// transaction -- the tables it loaded itself and the tables it changed; the
+// warm-up loads only those the shared cache then lacks. After COMMIT a table
+// the transaction dropped is left out: it cannot load. After ROLLBACK it still
+// exists. Read before the transaction (and its metadata) is erased.
+std::set<std::pair<std::string, std::string>> TouchedTables(duckdb::MSSQLTransaction &txn, bool committed) {
 	std::set<std::pair<std::string, std::string>> touched;
 	auto *metadata = txn.TryMetadata();
 	if (metadata) {
 		touched = metadata->GetLoadedTables();
 		auto changes = metadata->GetChanges();
 		touched.insert(changes.tables.begin(), changes.tables.end());
+		if (committed) {
+			for (const auto &key : changes.dropped) {
+				touched.erase(key);
+			}
+		}
 	}
 	return touched;
 }
@@ -346,7 +353,7 @@ ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Tra
 		MSSQL_TXN_LOG("CommitTransaction: No active SQL Server transaction (no-op)");
 	}
 
-	const auto touched = TouchedTables(mssql_txn);
+	const auto touched = TouchedTables(mssql_txn, true);
 	ForgetTransactionMetadata(catalog_, mssql_txn);
 	transactions_.erase(context);
 	// Outside the manager's lock: it is a round trip, and other transactions of
@@ -414,7 +421,7 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 		MSSQL_TXN_LOG("RollbackTransaction: No active SQL Server transaction (no-op)");
 	}
 
-	const auto touched = TouchedTables(mssql_txn);
+	const auto touched = TouchedTables(mssql_txn, false);
 	ForgetTransactionMetadata(catalog_, mssql_txn);
 
 	// Try to get the context to remove from our transaction map

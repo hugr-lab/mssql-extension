@@ -1521,11 +1521,12 @@ unique_ptr<MSSQLMetadataCache> MSSQLCatalog::CreateTransactionMetadataCache(Clie
 	return cache;
 }
 
-void MSSQLCatalog::NoteTransactionChange(ClientContext &context, const string &schema, const string &table) {
+void MSSQLCatalog::NoteTransactionChange(ClientContext &context, const string &schema, const string &table,
+										 bool dropped) {
 	if (context.transaction.IsAutoCommit()) {
 		return;
 	}
-	MSSQLTransaction::Get(context, *this).Metadata(context).MarkChanged(schema, table);
+	MSSQLTransaction::Get(context, *this).Metadata(context).MarkChanged(schema, table, dropped);
 }
 
 void MSSQLCatalog::NoteTransactionChangeLocally(ClientContext &context) {
@@ -1566,76 +1567,106 @@ static int GetCatalogWarmDebugLevel() {
 	} while (0)
 
 void MSSQLCatalog::WarmSharedCache(const std::set<std::pair<string, string>> &tables) noexcept {
-	if (tables.empty() || !metadata_cache_ || !connection_pool_ || GetConnectionLimit() <= 1) {
-		return;
-	}
-	std::map<string, vector<string>> by_schema;
-	for (const auto &key : tables) {
-		by_schema[key.first].push_back(key.second);
-	}
-	std::shared_ptr<tds::TdsConnection> connection;
 	try {
-		// Never wait: an idle connection, or a new one while the pool is below
-		// its limit, or no warm-up at all. This runs on COMMIT's path. TryAcquire,
-		// not Acquire(0): a busy pool is the normal case here, not a timeout
-		// worth counting in mssql_pool_stats (#382).
-		connection = connection_pool_->TryAcquire();
+		if (tables.empty() || !metadata_cache_ || !connection_pool_ || GetConnectionLimit() <= 1) {
+			return;
+		}
+		// What is missing, decided without I/O: a table the shared cache holds
+		// is served from it, and one the filter hides is never loaded (review
+		// of #386: GetTableMetadata applies no filter).
+		vector<std::pair<string, string>> missing;
+		for (const auto &key : tables) {
+			if (!catalog_filter_.MatchesSchema(key.first) || !catalog_filter_.MatchesTable(key.second)) {
+				continue;
+			}
+			MSSQLTableMetadata cached;
+			if (metadata_cache_->TryGetLoadedTableMetadata(key.first, key.second, cached)) {
+				continue;
+			}
+			missing.push_back(key);
+			if (missing.size() > WARM_TABLES_LIMIT) {
+				MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: more than %llu tables missing, left to lazy loading",
+										(unsigned long long)WARM_TABLES_LIMIT);
+				return;
+			}
+		}
+		if (missing.empty()) {
+			return;
+		}
+		// Idle only: a busy pool, or one with caching off, is not worth a login
+		// on COMMIT's path.
+		auto connection = connection_pool_->TryAcquireIdleOnly();
 		if (!connection) {
 			MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: no idle connection, skipped");
 			return;
 		}
-		for (const auto &schema : by_schema) {
-			if (schema.second.size() > WARM_TABLES_PER_SCHEMA) {
-				idx_t schema_count = 0, table_count = 0, column_count = 0;
-				metadata_cache_->BulkLoadAll(*connection, schema.first, schema_count, table_count, column_count);
-				metadata_cache_->ForEachTableInSchema(
-					schema.first, [&](const string &table, const MSSQLTableMetadata &meta) {
-						statistics_provider_->PreloadRowCount(schema.first, table, meta.approx_row_count);
-					});
-				MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: preloaded schema '%s' (%llu tables)", schema.first.c_str(),
-										(unsigned long long)table_count);
-				continue;
-			}
-			for (const auto &table : schema.second) {
+		idx_t loaded = 0;
+		for (const auto &key : missing) {
+			// One table's failure does not abandon the rest -- unless it left the
+			// connection unusable.
+			try {
 				MSSQLTableMetadata meta;
-				if (metadata_cache_->GetTableMetadata(*connection, schema.first, table, meta)) {
-					statistics_provider_->PreloadRowCount(schema.first, table, meta.approx_row_count);
+				if (metadata_cache_->GetTableMetadata(*connection, key.first, key.second, meta)) {
+					loaded++;
 				}
+			} catch (std::exception &e) {
+				MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: '%s.%s' not loaded: %s", key.first.c_str(),
+										key.second.c_str(), ErrorData(e).RawMessage().c_str());
+			} catch (...) {
+				MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: '%s.%s' not loaded", key.first.c_str(),
+										key.second.c_str());
 			}
-			MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: loaded %llu table(s) of schema '%s'",
-									(unsigned long long)schema.second.size(), schema.first.c_str());
+			if (connection->GetState() != tds::ConnectionState::Idle) {
+				break;
+			}
 		}
-	} catch (std::exception &e) {
-		MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: failed, names stay invalidated: %s", e.what());
+		connection_pool_->Release(connection);
+		MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: loaded %llu of %llu missing table(s)", (unsigned long long)loaded,
+								(unsigned long long)missing.size());
 	} catch (...) {
-		MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: failed, names stay invalidated");
-	}
-	if (connection) {
-		try {
-			connection_pool_->Release(connection);
-		} catch (...) {
-		}
+		// Opportunistic: nothing here may fail a COMMIT that has already
+		// happened on the server.
 	}
 }
 
-void MSSQLCatalog::PreloadAtAttach() {
-	std::string why;
-	auto connection = connection_pool_ ? connection_pool_->Acquire(-1, &why) : nullptr;
-	if (!connection) {
-		throw IOException("MSSQL ATTACH error: preload could not get a connection: %s", why);
+void MSSQLCatalog::Preload(ClientContext &context, const string &schema_name, const char *caller, idx_t &schema_count,
+						   idx_t &table_count, idx_t &column_count) {
+	// Refused inside an explicit transaction that has used ANY MSSQL catalog
+	// (issue #380): a forced load either blocks on the transaction's own
+	// uncommitted DDL (a pool connection waits on its schema lock until the
+	// metadata timeout) or, on the pinned connection, would publish the
+	// transaction's uncommitted view into the cache every other connection
+	// reads. Not scoped per catalog -- aliases of one database are independent
+	// catalogs, and alias A's uncommitted DDL would hang a load on alias B (the
+	// ATTACH of such an alias included). Invalidation stays allowed.
+	if (ConnectionProvider::HasUsedAnyMSSQLCatalogInTransaction(context)) {
+		throw InvalidInputException(
+			"%s cannot run inside a transaction that has used an MSSQL catalog: it would load '%s' while the "
+			"transaction may hold uncommitted changes. Use mssql_invalidate_cache() inside the transaction, or "
+			"preload after COMMIT",
+			caller, context_name_);
 	}
-	idx_t schema_count = 0, table_count = 0, column_count = 0;
+	// The session's cache settings -- TTL, mssql_metadata_timeout, the test
+	// lever -- before the load, not the constructor's placeholders.
+	EnsureCacheLoaded(context);
+	std::string why;
+	auto connection = connection_pool_->Acquire(-1, &why);
+	if (!connection) {
+		throw IOException("%s: failed to acquire connection: %s", caller, why);
+	}
 	try {
-		metadata_cache_->BulkLoadAll(*connection, string(), schema_count, table_count, column_count);
+		metadata_cache_->BulkLoadAll(*connection, schema_name, schema_count, table_count, column_count);
 	} catch (...) {
-		connection_pool_->Release(connection);
+		connection_pool_->Release(std::move(connection));
 		throw;
 	}
-	connection_pool_->Release(connection);
+	connection_pool_->Release(std::move(connection));
+	// Pre-populate the statistics cache with approx_row_count from the load: it
+	// saves a DMV query per table when DuckDB calls GetStorageInfo().
 	metadata_cache_->ForEachTable([&](const string &schema, const string &table, idx_t row_count) {
 		statistics_provider_->PreloadRowCount(schema, table, row_count);
 	});
-	MSSQL_CATALOG_DEBUG_LOG(1, "PreloadAtAttach: %llu schemas, %llu tables, %llu columns",
+	MSSQL_CATALOG_DEBUG_LOG(1, "Preload (%s): %llu schemas, %llu tables, %llu columns", caller,
 							(unsigned long long)schema_count, (unsigned long long)table_count,
 							(unsigned long long)column_count);
 }

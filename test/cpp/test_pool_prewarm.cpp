@@ -5,22 +5,32 @@
 // used to open nothing, so a session paid its logins one by one at the first
 // queries that needed them.
 //
-// No server: the factories sleep to stand in for a login and hand back an
-// unconnected TdsConnection. Part of STANDALONE_TEST_SOURCES (`make
-// test-cpp`), which CI runs.
+// No server: the factories sleep to stand in for a login and hand back a
+// TdsConnection whose socket is connected to a loopback listener and whose
+// state is Idle -- what a real login leaves, and what the pool now checks
+// before a connection goes idle (review of #386). Part of
+// STANDALONE_TEST_SOURCES (`make test-cpp`), which CI runs on Linux and macOS.
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "tds/tds_connection.hpp"
 #include "tds/tds_connection_pool.hpp"
 
 using duckdb::tds::ConnectionPool;
+using duckdb::tds::ConnectionState;
 using duckdb::tds::PoolConfiguration;
 using duckdb::tds::TdsConnection;
 
@@ -34,8 +44,74 @@ static void Check(bool ok, const std::string &what) {
 	g_failures++;
 }
 
-static long long MsSince(std::chrono::steady_clock::time_point t0) {
-	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+//! Accepts on 127.0.0.1 and holds every socket open until destroyed.
+class LoopbackServer {
+public:
+	LoopbackServer() {
+		listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		addr.sin_port = 0;
+		bind(listen_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+		listen(listen_fd_, 64);
+		socklen_t len = sizeof(addr);
+		getsockname(listen_fd_, reinterpret_cast<sockaddr *>(&addr), &len);
+		port_ = ntohs(addr.sin_port);
+		thread_ = std::thread([this]() {
+			for (;;) {
+				int fd = accept(listen_fd_, nullptr, nullptr);
+				if (fd < 0 || stop_.load()) {
+					if (fd >= 0) {
+						close(fd);
+					}
+					return;
+				}
+				std::lock_guard<std::mutex> guard(lock_);
+				accepted_.push_back(fd);
+			}
+		});
+	}
+	~LoopbackServer() {
+		// Woken by a connection of its own: closing the listening socket does
+		// not interrupt accept() on every platform (macOS).
+		stop_.store(true);
+		int wake = socket(AF_INET, SOCK_STREAM, 0);
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		addr.sin_port = htons(port_);
+		connect(wake, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+		thread_.join();
+		close(wake);
+		close(listen_fd_);
+		for (int fd : accepted_) {
+			close(fd);
+		}
+	}
+	uint16_t Port() const {
+		return port_;
+	}
+
+private:
+	int listen_fd_ = -1;
+	std::atomic<bool> stop_{false};
+	uint16_t port_ = 0;
+	std::thread thread_;
+	std::mutex lock_;
+	std::vector<int> accepted_;
+};
+
+static LoopbackServer *g_server = nullptr;
+
+//! What a login leaves: a connected socket, state Idle.
+static std::shared_ptr<TdsConnection> LoggedIn() {
+	auto conn = std::make_shared<TdsConnection>();
+	if (!conn->Connect("127.0.0.1", g_server->Port(), 5) ||
+		!conn->TransitionState(ConnectionState::Authenticating, ConnectionState::Idle)) {
+		throw std::runtime_error("loopback connect failed");
+	}
+	return conn;
 }
 
 static PoolConfiguration Pool(size_t limit) {
@@ -57,15 +133,14 @@ static void TestConcurrentLogins() {
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(LOGIN_MS));
 		--in_flight;
-		return std::make_shared<TdsConnection>();
+		return LoggedIn();
 	});
-	const auto t0 = std::chrono::steady_clock::now();
 	const size_t opened = pool.Prewarm(4);
-	const auto ms = MsSince(t0);
 	Check(opened == 4, "concurrent: opened " + std::to_string(opened) + " of 4");
+	// Concurrency is asserted by overlap, not by wall time: a loaded runner
+	// stretches the clock, never the overlap (review of #386).
 	Check(max_in_flight.load() == 4,
 		  "concurrent: " + std::to_string(max_in_flight.load()) + " logins in flight at once");
-	Check(ms < 2 * LOGIN_MS, "concurrent: took " + std::to_string(ms) + " ms, one after another would be 800");
 	auto stats = pool.GetStats();
 	Check(stats.total_connections == 4 && stats.idle_connections == 4 && stats.connections_created == 4,
 		  "concurrent: 4 total, 4 idle, 4 created");
@@ -74,7 +149,7 @@ static void TestConcurrentLogins() {
 
 //! Never past the limit.
 static void TestCappedAtLimit() {
-	ConnectionPool pool("prewarm-cap", Pool(2), []() { return std::make_shared<TdsConnection>(); });
+	ConnectionPool pool("prewarm-cap", Pool(2), []() { return LoggedIn(); });
 	Check(pool.Prewarm(5) == 2, "cap: opened up to the limit of 2");
 	Check(pool.GetStats().total_connections == 2, "cap: total 2");
 }
@@ -86,7 +161,7 @@ static void TestPartialFailure() {
 		if (++calls == 2) {
 			throw std::runtime_error("Login failed for user 'x'.");
 		}
-		return std::make_shared<TdsConnection>();
+		return LoggedIn();
 	});
 	std::string why;
 	const size_t opened = pool.Prewarm(3, &why);
@@ -96,12 +171,69 @@ static void TestPartialFailure() {
 		  "partial: the failed slot is given back (" + std::to_string(stats.total_connections) + " total)");
 	Check(stats.creation_failures == 1, "partial: one creation failure counted");
 	Check(why.find("Login failed") != std::string::npos, "partial: the reason is handed back (" + why + ")");
+	// The counter and the recorded reason agree: a partial success used to
+	// clear the reason while the counter said something failed.
+	Check(pool.GetLastCreateError().find("Login failed") != std::string::npos,
+		  "partial: the pool records the reason (" + pool.GetLastCreateError() + ")");
+}
+
+//! A factory that throws something that is not a std::exception: a failed
+//! login, not std::terminate over running threads, and the slot given back.
+static void TestNonStandardThrow() {
+	std::atomic<int> calls(0);
+	ConnectionPool pool("prewarm-throw", Pool(4), [&]() -> std::shared_ptr<TdsConnection> {
+		if (++calls == 1) {
+			throw 42;
+		}
+		return LoggedIn();
+	});
+	const size_t opened = pool.Prewarm(3);
+	auto stats = pool.GetStats();
+	Check(opened == 2, "throw: opened 2 of 3 (" + std::to_string(opened) + ")");
+	Check(stats.total_connections == 2, "throw: the failed slot is given back");
+	Check(stats.creation_failures == 1, "throw: counted as a creation failure");
+}
+
+//! mssql_connection_cache = false means no idle connection, ever: nothing is
+//! prewarmed and nothing adopted.
+static void TestCachingOff() {
+	auto cfg = Pool(4);
+	cfg.connection_cache = false;
+	std::atomic<int> calls(0);
+	ConnectionPool pool("prewarm-nocache", cfg, [&]() {
+		++calls;
+		return LoggedIn();
+	});
+	Check(pool.Prewarm(3) == 0, "nocache: prewarm opens nothing");
+	Check(calls.load() == 0, "nocache: no login at all");
+	Check(!pool.Adopt(LoggedIn()), "nocache: adopt refuses");
+	auto stats = pool.GetStats();
+	Check(stats.total_connections == 0 && stats.idle_connections == 0, "nocache: the pool stays empty");
+}
+
+//! Adopt takes only an Idle, connected connection.
+static void TestAdopt() {
+	ConnectionPool pool("adopt", Pool(2), []() { return LoggedIn(); });
+	Check(!pool.Adopt(std::make_shared<TdsConnection>()), "adopt: an unconnected connection is refused");
+	Check(pool.Adopt(LoggedIn()), "adopt: a logged-in one is taken");
+	auto stats = pool.GetStats();
+	Check(stats.total_connections == 1 && stats.idle_connections == 1, "adopt: 1 total, 1 idle");
+	auto held = pool.TryAcquireIdleOnly();
+	Check(held != nullptr, "adopt: the adopted connection is handed out");
+	Check(pool.TryAcquireIdleOnly() == nullptr, "idle-only: nothing idle, and no login to make one");
+	Check(pool.GetStats().connections_created == 1, "idle-only: created nothing");
+	pool.Release(held);
 }
 
 int main() {
+	LoopbackServer server;
+	g_server = &server;
 	TestConcurrentLogins();
 	TestCappedAtLimit();
 	TestPartialFailure();
+	TestNonStandardThrow();
+	TestCachingOff();
+	TestAdopt();
 	if (g_failures > 0) {
 		std::cerr << g_failures << " check(s) failed" << std::endl;
 		return 1;

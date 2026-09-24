@@ -1156,6 +1156,29 @@ string MSSQLTranslateConnectionError(const string &error, const string &host, ui
 	return StringUtil::Format("Connection failed to %s:%d", host, port);
 }
 
+// The validation `SELECT 1`'s answer, read so the connection is Idle for the
+// pool it is handed to (issue #324). A read that does not complete -- a poll
+// timeout leaves the socket connected with the rest of the answer still on the
+// wire -- closes it instead: the pool's Adopt refuses a closed connection, and
+// the first statement to take a pooled connection must not parse a stale
+// `SELECT 1` as its own answer (review of #386: that statement is ATTACH's
+// collation query). The validation itself has already succeeded -- the login
+// and the query were accepted -- so this is not an ATTACH error; the pool logs
+// in afresh when it needs a connection.
+static void DrainValidationQuery(tds::TdsConnection &conn) {
+	auto *socket = conn.GetSocket();
+	if (!socket) {
+		return;
+	}
+	std::vector<uint8_t> response;
+	if (!socket->ReceiveMessage(response, 5000)) {
+		MSSQL_STORAGE_DEBUG_LOG(1, "validation query answer not read completely; connection closed, not pooled");
+		conn.Close();
+		return;
+	}
+	conn.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
+}
+
 //===----------------------------------------------------------------------===//
 // Azure AD Connection Validation
 //===----------------------------------------------------------------------===//
@@ -1230,13 +1253,7 @@ std::shared_ptr<tds::TdsConnection> ValidateAzureConnection(ClientContext &conte
 				throw InvalidInputException("MSSQL Azure connection validation failed: validation query failed: %s",
 											error);
 			}
-			// Drain results
-			auto *socket = conn.GetSocket();
-			if (socket) {
-				std::vector<uint8_t> response;
-				socket->ReceiveMessage(response, 5000);
-				conn.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-			}
+			DrainValidationQuery(conn);
 			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: validation query succeeded");
 		} catch (const std::exception &e) {
 			string error = e.what();
@@ -1308,13 +1325,7 @@ std::shared_ptr<tds::TdsConnection> ValidateManualTokenConnection(MSSQLConnectio
 				conn.Close();
 				throw InvalidInputException("MSSQL manual token connection validation failed: query failed: %s", error);
 			}
-			// Drain results
-			auto *socket = conn.GetSocket();
-			if (socket) {
-				std::vector<uint8_t> response;
-				socket->ReceiveMessage(response, 5000);
-				conn.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-			}
+			DrainValidationQuery(conn);
 			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation query succeeded");
 		} catch (const std::exception &e) {
 			string error = e.what();
@@ -1388,13 +1399,7 @@ std::shared_ptr<tds::TdsConnection> ValidateConnection(MSSQLConnectionInfo &info
 					"The server may have network issues or TLS may be misconfigured. Details: %s",
 					translated);
 			}
-			// Drain any results to reset connection state
-			auto *socket = conn.GetSocket();
-			if (socket) {
-				std::vector<uint8_t> response;
-				socket->ReceiveMessage(response, 5000);
-				conn.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-			}
+			DrainValidationQuery(conn);
 			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TLS validation query succeeded");
 		} catch (const std::exception &e) {
 			string error = e.what();
@@ -1667,6 +1672,18 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		}
 	}
 
+	// Issue #324: `preload` asks the server for the whole catalog at ATTACH,
+	// which is exactly what lazy_validation refuses -- say so rather than pick
+	// one. Here, with the other option conflicts, before anything dials: a
+	// device-code MFA prompt must not come before an error the options alone
+	// decide (review of #386).
+	if (preload_option && lazy_validation) {
+		throw InvalidInputException(
+			"MSSQL ATTACH error: preload and lazy_validation contradict each other -- "
+			"preload reads the whole catalog at ATTACH, lazy_validation defers every "
+			"connection to the first query. Drop one of them");
+	}
+
 	// Get connection string from info.path (the first argument to ATTACH)
 	string connection_string = info.path;
 
@@ -1722,6 +1739,12 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	if (catalog_option_specified) {
 		connection_info->catalog_enabled = catalog_enabled_option;
 		MSSQL_STORAGE_DEBUG_LOG(1, "CATALOG option from ATTACH: %s", catalog_enabled_option ? "true" : "false");
+	}
+	// Here, once the secret / connection string / option have settled it, and
+	// before validation dials.
+	if (preload_option && !connection_info->catalog_enabled) {
+		throw InvalidInputException(
+			"MSSQL ATTACH error: preload needs the catalog, and this ATTACH sets catalog false");
 	}
 
 	// Apply catalog visibility filters from ATTACH options (Spec 033)
@@ -1910,18 +1933,6 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// options.access_mode is set by DuckDB based on the READ_ONLY option in ATTACH.
 	// catalog_enabled flag determines whether schema discovery is available.
 	auto catalog_enabled = connection_info->catalog_enabled;
-	// Issue #324: `preload` asks the server for the whole catalog at ATTACH,
-	// which is exactly what the other two refuse -- say so rather than pick one.
-	if (preload_option && lazy_validation) {
-		throw InvalidInputException(
-			"MSSQL ATTACH error: preload and lazy_validation contradict each other -- "
-			"preload reads the whole catalog at ATTACH, lazy_validation defers every "
-			"connection to the first query. Drop one of them");
-	}
-	if (preload_option && !catalog_enabled) {
-		throw InvalidInputException(
-			"MSSQL ATTACH error: preload needs the catalog, and this ATTACH sets catalog false");
-	}
 	auto catalog = make_uniq<MSSQLCatalog>(db, name, std::move(connection_info), std::move(tds_pool_config),
 										   std::move(fedauth_token_utf16le), options.access_mode, catalog_enabled);
 	// Issue #324: open mssql_min_connections at ATTACH, concurrently -- unless
@@ -1931,7 +1942,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	catalog->Initialize(false);
 	catalog->CheckTransactionIsolation();
 	if (preload_option) {
-		catalog->PreloadAtAttach();
+		idx_t schema_count = 0, table_count = 0, column_count = 0;
+		catalog->Preload(context, string(), "preload", schema_count, table_count, column_count);
 	}
 
 	return std::move(catalog);

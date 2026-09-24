@@ -239,10 +239,7 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 				// that has recovered has nothing to report. The first draft kept
 				// it forever, and every later exhaustion timeout was rendered as
 				// that stale creation failure (review 1538).
-				create_backoff_ms_ = CREATE_BACKOFF_INITIAL_MS;
-				next_create_allowed_ = std::chrono::steady_clock::time_point{};
-				last_create_error_.clear();
-				last_create_error_at_ = std::chrono::steady_clock::time_point{};
+				RecordCreateSuccessLocked();
 				uint64_t id = next_connection_id_++;
 				active_connections_[id] = conn;
 				stats_.total_connections++;
@@ -266,18 +263,11 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 			// Azure AD token cost 600 s and two login attempts, and read
 			// identically to a wrong password or an unreachable host.
 			stats_.creation_failures++;
-			last_create_error_ = error;
-			last_create_error_at_ = std::chrono::steady_clock::now();
+			RecordCreateFailureLocked(error);
 			own_create_error = error;
 			if (creation_failed) {
 				*creation_failed = true;
 			}
-			next_create_allowed_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(create_backoff_ms_);
-			// Not std::min: it binds CREATE_BACKOFF_MAX_MS by reference, which
-			// odr-uses an in-class constexpr with no out-of-line definition
-			// before C++17 (review 1538).
-			create_backoff_ms_ =
-				create_backoff_ms_ * 2 > CREATE_BACKOFF_MAX_MS ? CREATE_BACKOFF_MAX_MS : create_backoff_ms_ * 2;
 			if (stats_.active_connections == 0) {
 				// Nothing can be released, so waiting would only run out the
 				// clock. Fail now, with this call's reason.
@@ -368,37 +358,67 @@ void ConnectionPool::Release(std::shared_ptr<TdsConnection> conn) {
 		}
 	}
 
-	// T010: Validate connection state before returning to pool (FR-002)
-	// Connections must be in Idle state to be safely reused
+	if (!PoolIfReusableLocked(conn, found_id ? found_id : next_connection_id_++)) {
+		stats_.connections_closed++;
+		stats_.total_connections--;
+	}
+	available_cv_.notify_one();
+}
+
+bool ConnectionPool::PoolIfReusableLocked(std::shared_ptr<TdsConnection> &conn, uint64_t connection_id) {
+	// T010: only an Idle connection can be reused safely (FR-002); a dead one,
+	// or any connection while caching is off or the pool is shutting down, is
+	// closed.
 	if (conn->GetState() != ConnectionState::Idle) {
 		MSSQL_POOL_DEBUG_LOG(1, "Closing connection in non-Idle state: %d (pool '%s')",
 							 static_cast<int>(conn->GetState()), context_name_.c_str());
 		conn->Close();
-		stats_.connections_closed++;
-		stats_.total_connections--;
-		available_cv_.notify_one();
-		return;
+		return false;
 	}
-
-	// If caching disabled or connection is dead, close it
-	if (!config_.connection_cache || !conn->IsAlive()) {
+	if (shutdown_flag_.load() || !config_.connection_cache || !conn->IsAlive()) {
 		conn->Close();
-		stats_.connections_closed++;
-		stats_.total_connections--;
-		available_cv_.notify_one();
-		return;
+		return false;
 	}
-
-	// Return to idle pool
 	ConnectionMetadata meta;
 	meta.connection = std::move(conn);
-	meta.connection_id = found_id ? found_id : next_connection_id_++;
+	meta.connection_id = connection_id;
 	meta.last_released = std::chrono::steady_clock::now();
-
 	idle_connections_.push(std::move(meta));
 	stats_.idle_connections++;
+	return true;
+}
 
-	available_cv_.notify_one();
+void ConnectionPool::RecordCreateSuccessLocked() {
+	// A success resets the backoff so a transient failure does not slow the
+	// next refill, and clears the recorded error: a pool that has recovered
+	// has nothing to report (review 1538).
+	create_backoff_ms_ = CREATE_BACKOFF_INITIAL_MS;
+	next_create_allowed_ = std::chrono::steady_clock::time_point{};
+	last_create_error_.clear();
+	last_create_error_at_ = std::chrono::steady_clock::time_point{};
+}
+
+void ConnectionPool::RecordCreateFailureLocked(const std::string &error) {
+	last_create_error_ = error;
+	last_create_error_at_ = std::chrono::steady_clock::now();
+	next_create_allowed_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(create_backoff_ms_);
+	// Not std::min: it binds CREATE_BACKOFF_MAX_MS by reference, which
+	// odr-uses an in-class constexpr with no out-of-line definition before
+	// C++17 (review 1538).
+	create_backoff_ms_ =
+		create_backoff_ms_ * 2 > CREATE_BACKOFF_MAX_MS ? CREATE_BACKOFF_MAX_MS : create_backoff_ms_ * 2;
+}
+
+std::shared_ptr<TdsConnection> ConnectionPool::TryAcquireIdleOnly() {
+	if (shutdown_flag_.load()) {
+		return nullptr;
+	}
+	std::lock_guard<std::mutex> lock(pool_mutex_);
+	auto conn = TryAcquireIdle();
+	if (conn) {
+		stats_.acquire_count++;
+	}
+	return conn;
 }
 
 bool ConnectionPool::Adopt(std::shared_ptr<TdsConnection> conn) {
@@ -406,17 +426,13 @@ bool ConnectionPool::Adopt(std::shared_ptr<TdsConnection> conn) {
 		return false;
 	}
 	std::lock_guard<std::mutex> lock(pool_mutex_);
-	if (shutdown_flag_.load() || stats_.total_connections >= config_.connection_limit ||
-		conn->GetState() != ConnectionState::Idle || !conn->IsAlive()) {
+	if (stats_.total_connections >= config_.connection_limit) {
 		conn->Close();
 		return false;
 	}
-	ConnectionMetadata meta;
-	meta.connection = std::move(conn);
-	meta.connection_id = next_connection_id_++;
-	meta.last_released = std::chrono::steady_clock::now();
-	idle_connections_.push(std::move(meta));
-	stats_.idle_connections++;
+	if (!PoolIfReusableLocked(conn, next_connection_id_++)) {
+		return false;
+	}
 	stats_.total_connections++;
 	stats_.connections_created++;
 	available_cv_.notify_one();
@@ -424,7 +440,9 @@ bool ConnectionPool::Adopt(std::shared_ptr<TdsConnection> conn) {
 }
 
 size_t ConnectionPool::Prewarm(size_t target, std::string *failure) {
-	if (shutdown_flag_.load()) {
+	if (shutdown_flag_.load() || !config_.connection_cache) {
+		// With caching off every connection is closed on release, so one
+		// opened now would be a login for nothing (review of #386).
 		return 0;
 	}
 	size_t to_create = 0;
@@ -432,6 +450,21 @@ size_t ConnectionPool::Prewarm(size_t target, std::string *failure) {
 		std::lock_guard<std::mutex> lock(pool_mutex_);
 		const size_t cap = target < config_.connection_limit ? target : config_.connection_limit;
 		to_create = cap > stats_.total_connections ? cap - stats_.total_connections : 0;
+	}
+	if (to_create == 0) {
+		return 0;
+	}
+	// Allocated before the slots are reserved: a throw past this point would
+	// strand the reservation, and the pool would read full forever.
+	std::vector<std::shared_ptr<TdsConnection>> created(to_create);
+	std::vector<std::string> errors(to_create);
+	std::vector<std::thread> threads;
+	threads.reserve(to_create);
+	{
+		std::lock_guard<std::mutex> lock(pool_mutex_);
+		const size_t cap = target < config_.connection_limit ? target : config_.connection_limit;
+		const size_t room = cap > stats_.total_connections ? cap - stats_.total_connections : 0;
+		to_create = to_create < room ? to_create : room;
 		// Reserve the slots before dialling, so a concurrent Acquire cannot take
 		// the pool past its limit while these logins are in flight.
 		stats_.total_connections += to_create;
@@ -440,67 +473,104 @@ size_t ConnectionPool::Prewarm(size_t target, std::string *failure) {
 		return 0;
 	}
 
-	std::vector<std::shared_ptr<TdsConnection>> created(to_create);
-	std::vector<std::string> errors(to_create);
-	std::vector<std::thread> threads;
-	threads.reserve(to_create);
-	for (size_t i = 1; i < to_create; i++) {
+	// Never throws: a factory that throws something CreateNewConnection does not
+	// catch -- or a bad_alloc from its handler -- is a failed login here, not
+	// an exception unwinding past running threads (std::terminate) and the
+	// reservation above (review of #386).
+	auto dial = [this, &created, &errors](size_t i) noexcept {
 		try {
-			threads.emplace_back([this, &created, &errors, i]() { created[i] = CreateNewConnection(errors[i]); });
-		} catch (...) {
-			// No thread to be had: this one dials it after its own.
-			threads.emplace_back();
-		}
-	}
-	created[0] = CreateNewConnection(errors[0]);
-	for (size_t i = 1; i < to_create; i++) {
-		auto &thread = threads[i - 1];
-		if (thread.joinable()) {
-			thread.join();
-		} else {
 			created[i] = CreateNewConnection(errors[i]);
+		} catch (...) {
+			created[i].reset();
+			try {
+				errors[i] = "connection factory threw a non-standard exception";
+			} catch (...) {
+			}
+		}
+		if (!created[i] && errors[i].empty()) {
+			try {
+				errors[i] = "connection factory failed";
+			} catch (...) {
+			}
+		}
+	};
+	// Joins every thread started, whatever happens between here and the end
+	// of the block: a joinable std::thread destroyed is std::terminate.
+	struct Joiner {
+		std::vector<std::thread> &threads;
+		~Joiner() {
+			for (auto &thread : threads) {
+				if (thread.joinable()) {
+					thread.join();
+				}
+			}
+		}
+	};
+	std::vector<bool> on_thread(to_create, false);
+	{
+		Joiner joiner{threads};
+		for (size_t i = 1; i < to_create; i++) {
+			try {
+				threads.emplace_back(dial, i);
+				on_thread[i] = true;
+			} catch (...) {
+				// No thread to be had: this one dials it after its own.
+			}
+		}
+		dial(0);
+	}
+	for (size_t i = 1; i < to_create; i++) {
+		if (!on_thread[i]) {
+			dial(i);
 		}
 	}
 
 	size_t opened = 0;
+	size_t failed = 0;
 	std::string first_error;
 	{
 		std::lock_guard<std::mutex> lock(pool_mutex_);
+		if (shutdown_flag_.load()) {
+			// Shutdown zeroed the counters while these logins ran; the
+			// reservation is gone with them, and decrementing would underflow.
+			for (auto &conn : created) {
+				if (conn) {
+					conn->Close();
+				}
+			}
+			return 0;
+		}
 		for (size_t i = 0; i < to_create; i++) {
-			if (!created[i] || shutdown_flag_.load()) {
+			if (!created[i]) {
 				stats_.total_connections--;
-				if (!created[i]) {
-					stats_.creation_failures++;
-					if (first_error.empty()) {
-						first_error = errors[i];
-					}
-				} else {
-					created[i]->Close();
+				failed++;
+				if (first_error.empty()) {
+					first_error = errors[i];
 				}
 				continue;
 			}
-			ConnectionMetadata meta;
-			meta.connection = std::move(created[i]);
-			meta.connection_id = next_connection_id_++;
-			meta.last_released = std::chrono::steady_clock::now();
-			idle_connections_.push(std::move(meta));
-			stats_.idle_connections++;
 			stats_.connections_created++;
-			opened++;
+			if (PoolIfReusableLocked(created[i], next_connection_id_++)) {
+				opened++;
+			} else {
+				stats_.connections_closed++;
+				stats_.total_connections--;
+			}
 		}
+		// The same bookkeeping AcquireImpl does, success first so a partial
+		// failure is what the pool reports: `creation_failures` and
+		// `last_create_error` must not disagree (review of #386), and the
+		// backoff is armed as for any failed login (#302).
 		if (opened > 0) {
-			// The same bookkeeping a successful Acquire creation does.
-			create_backoff_ms_ = CREATE_BACKOFF_INITIAL_MS;
-			next_create_allowed_ = std::chrono::steady_clock::time_point{};
-			last_create_error_.clear();
-			last_create_error_at_ = std::chrono::steady_clock::time_point{};
-		} else if (!first_error.empty()) {
-			last_create_error_ = first_error;
-			last_create_error_at_ = std::chrono::steady_clock::now();
+			RecordCreateSuccessLocked();
+		}
+		if (failed > 0) {
+			stats_.creation_failures += failed;
+			RecordCreateFailureLocked(first_error);
 		}
 	}
 	available_cv_.notify_all();
-	if (failure && !first_error.empty()) {
+	if (failure && failed > 0) {
 		*failure = "pool '" + context_name_ + "' could not create a connection: " + first_error;
 	}
 	MSSQL_POOL_DEBUG_LOG(1, "Prewarm: opened %zu of %zu connection(s) concurrently (pool '%s')", opened, to_create,

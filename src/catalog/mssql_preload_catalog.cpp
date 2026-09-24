@@ -113,61 +113,11 @@ static void MSSQLPreloadCatalogExecute(DataChunk &args, ExpressionState &state, 
 			}
 			auto &catalog = *catalog_ptr;
 
-			// Refused inside an explicit transaction ON THIS CATALOG (issue
-			// #380): a forced load there either blocks on the transaction's own
-			// uncommitted DDL (a pool connection waits on its schema lock until
-			// the metadata timeout) or, on the pinned connection, would publish
-			// the transaction's uncommitted view into the cache every other
-			// connection reads. Invalidation stays allowed.
-			//
-			// Scoped to "has this transaction used MSSQL at all" rather than to
-			// "not autocommit" (review of #382): a transaction that wraps
-			// unrelated DuckDB work in BEGIN ... COMMIT holds no pinned
-			// connection and nothing uncommitted on any server, so there is
-			// nothing to block on and nothing to leak. Not scoped per catalog --
-			// aliases of one database are independent catalogs, see
-			// HasUsedAnyMSSQLCatalogInTransaction.
-			if (ConnectionProvider::HasUsedAnyMSSQLCatalogInTransaction(client_context)) {
-				throw InvalidInputException(
-					"mssql_preload_catalog cannot run inside a transaction that has used an MSSQL "
-					"catalog: it would load '%s' while the transaction may hold uncommitted "
-					"changes. Use mssql_invalidate_cache() inside the transaction, or preload after "
-					"COMMIT",
-					catalog_name);
-			}
-
-			auto &cache = catalog.GetMetadataCache();
-			auto &pool = catalog.GetConnectionPool();
-
-			// Ensure cache settings are loaded
-			catalog.EnsureCacheLoaded(client_context);
-
-			// Acquire connection
-			std::string why;
-			auto connection = pool.Acquire(-1, &why);
-			if (!connection) {
-				throw IOException("mssql_preload_catalog: failed to acquire connection: " + why);
-			}
-
-			// Execute bulk preload (ensure connection is returned to pool even on exception)
 			idx_t schema_count = 0;
 			idx_t table_count = 0;
 			idx_t column_count = 0;
-			try {
-				cache.BulkLoadAll(*connection, bind_data.schema_name, schema_count, table_count, column_count);
-			} catch (...) {
-				pool.Release(std::move(connection));
-				throw;
-			}
-
-			pool.Release(std::move(connection));
-
-			// Pre-populate statistics cache with approx_row_count from bulk load
-			// This avoids per-table DMV queries when DuckDB calls GetStorageInfo()
-			auto &stats_provider = catalog.GetStatisticsProvider();
-			cache.ForEachTable([&](const string &schema, const string &table, idx_t row_count) {
-				stats_provider.PreloadRowCount(schema, table, row_count);
-			});
+			catalog.Preload(client_context, bind_data.schema_name, "mssql_preload_catalog", schema_count, table_count,
+							column_count);
 
 			// Build status message
 			string status;
