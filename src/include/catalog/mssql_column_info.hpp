@@ -63,34 +63,34 @@ struct MSSQLColumnInfo {
 
 	//! Whether the SERVER, ordering by this column, gives the order DuckDB gives
 	//! the values it reads (issue #362, spec 079 D4 "orders are DuckDB's"). THE
-	//! predicate: MSSQLOptimizer's ORDER BY / TOP pushdown and the remote-
-	//! pushdown writer both ask it, so a query cannot sort one way through one
-	//! path and another way through the other.
+	//! predicate MSSQLOptimizer's ORDER BY / TOP pushdown asks; spec 079's
+	//! remote-pushdown writer is to ask the same one.
 	//!
 	//! An allow-list: a type is on it because both sides order its values the
 	//! same way, and anything not named -- a type added to SQL Server later
 	//! included -- is refused. On it: the integer types, bit, decimal/numeric,
 	//! money/smallmoney, float/real, and the date/time types (datetimeoffset by
-	//! its UTC instant on both sides).
+	//! its UTC instant on both sides) -- except datetime2(7), which DuckDB reads
+	//! as TIMESTAMP_NS and whose values outside 1677-2262 it reads as NULL.
 	//!
-	//! The one string that qualifies is `varchar`/`char` under a `_BIN2`
-	//! collation with UTF-8 bytes: the server compares the bytes, and UTF-8 byte
-	//! order is code-point order, which is DuckDB's. Not `nvarchar`/`nchar`, even
-	//! under `_BIN2`: its code units are UTF-16, and a character above the BMP
-	//! (surrogates D800-DFFF) sorts BELOW U+E000-U+FFFF there and above them in
-	//! DuckDB. Not a code-page `varchar` under `_BIN2` (measured: the page's bytes,
-	//! € 0x80 before Š 0x8A before é 0xE9), and no linguistic collation. What stays
-	//! different on the qualifying one is padding: the server compares as if the
-	//! shorter value were padded with spaces, so `ab` and `ab ` are equal (a tie
-	//! either side breaks as it likes, which under TOP N can pick a different row
-	//! of the tie), and a value continuing below the space -- `ab` + TAB -- sorts
-	//! before `ab` on the server and after it in DuckDB.
-	//!
-	//! Refused, among others: `uniqueidentifier` (the server compares its last
-	//! six bytes first), `binary`/`varbinary` (padded with zeros the same way),
-	//! `json`, `sql_variant` and every cast-required type, and the types the
-	//! server cannot sort (text, ntext, image, xml, geometry, geography).
+	//! No string is on it. Refused, among others: `nvarchar`/`nchar` under any
+	//! collation (UTF-16 code units put a character above the BMP before
+	//! U+E000-U+FFFF, DuckDB after), `varchar`/`char` ordered as text (even
+	//! under `_BIN2` UTF-8 the server pads with spaces, so `ab` = `ab ` and `ab`
+	//! + TAB sorts before `ab` -- see OrdersLikeDuckDBAsBytes for how such a
+	//! column is pushed), `uniqueidentifier` (the server compares its last six
+	//! bytes first), `binary`/`varbinary` as a column type, `json`,
+	//! `sql_variant` and every cast-required type, and the types the server
+	//! cannot sort (text, ntext, image, xml, geometry, geography).
 	bool OrdersLikeDuckDB() const;
+	//! A `varchar`/`char` whose bytes are UTF-8 (a UTF-8 collation, any
+	//! sensitivity): ordered by `CAST(col AS varbinary(max))` the server
+	//! compares those bytes, which is code-point order, DuckDB's -- measured:
+	//! `aa, ab, ab`+TAB`, ab ` on both sides. The one residual is a trailing NUL:
+	//! the binary comparison pads with 0x00, so `ab` and `ab`+NUL tie. The key is
+	//! not sargable, so the optimizer uses it only under a LIMIT (review of
+	//! #387).
+	bool OrdersLikeDuckDBAsBytes() const;
 
 	// Map SQL Server type to DuckDB LogicalType
 	//! Spec 060: the type to REPORT for this column — MSSQL_VARCHAR(n) /

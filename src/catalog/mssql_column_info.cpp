@@ -349,8 +349,11 @@ bool MSSQLColumnInfo::OrdersLikeDuckDB() const {
 	string lower_type = sql_type_name;
 	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
 				   [](unsigned char c) { return std::tolower(c); });
-	if (lower_type == "varchar" || lower_type == "char") {
-		return is_utf8 && IsBinary2Collation(collation_name);
+	if (lower_type == "datetime2" && scale >= 7) {
+		// TIMESTAMP_NS: the codec reads a value outside 1677-2262 -- the
+		// 9999-12-31 ValidTo sentinel of a temporal table -- as NULL (#168), so
+		// the server orders values DuckDB never sees (review of #387).
+		return false;
 	}
 	static const char *const ORDERED_TYPES[] = {
 		"bit",	 "tinyint", "smallint", "int",	"bigint",	"decimal",	 "numeric",		  "money",		   "smallmoney",
@@ -361,6 +364,16 @@ bool MSSQLColumnInfo::OrdersLikeDuckDB() const {
 		}
 	}
 	return false;
+}
+
+bool MSSQLColumnInfo::OrdersLikeDuckDBAsBytes() const {
+	if (is_cast_required || !is_utf8) {
+		return false;
+	}
+	string lower_type = sql_type_name;
+	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
+				   [](unsigned char c) { return std::tolower(c); });
+	return lower_type == "varchar" || lower_type == "char";
 }
 
 bool MSSQLColumnInfo::IsSpatialType(const string &sql_type_name) {

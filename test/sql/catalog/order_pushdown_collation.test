@@ -1,5 +1,5 @@
 # name: test/sql/catalog/order_pushdown_collation.test
-# description: ORDER BY is pushed only for a key the server orders the way DuckDB does -- binary AND UTF-8-coded strings (issue #362)
+# description: ORDER BY is pushed only for a key the server orders the way DuckDB does; a UTF-8 varchar only under a LIMIT, as its bytes (issue #362)
 # group: [catalog]
 # issue: 362
 
@@ -14,7 +14,13 @@
 # DuckDB's byte order. The predicate now shared by every ORDER BY path
 # (MSSQLColumnInfo::OrdersLikeDuckDB):
 #
-#   varchar under _BIN2_UTF8     -> UTF-8 bytes, DuckDB's order: pushed
+#   varchar under a UTF-8 collation -> ordered as TEXT the server pads with
+#                                   spaces (`ab` = `ab `, `ab`+TAB before
+#                                   `ab`); ordered as its BYTES,
+#                                   CAST(col AS varbinary(max)), it is
+#                                   DuckDB's order (a trailing NUL ties).
+#                                   Pushed that way only under a LIMIT: the
+#                                   key is not sargable
 #   nvarchar under _BIN2         -> UTF-16 code units: DuckDB's order through
 #                                   the BMP, not above it (a surrogate D83D
 #                                   sorts below U+FF5A): NOT pushed
@@ -56,13 +62,26 @@ SELECT mssql_exec('opc', 'INSERT INTO dbo.opc_order VALUES
 	(6, ''A'', ''A'', ''A'', N''A'', ''00000000-0001-0000-0000-000000000000'')');
 
 #------------------------------------------------------------------------------
-# Pushed: the server's order is DuckDB's.
+# A UTF-8 varchar: pushed under a LIMIT as its bytes, not as a plain ORDER BY.
 #------------------------------------------------------------------------------
 
 query II
 EXPLAIN SELECT id FROM opc.dbo.opc_order ORDER BY v_utf8;
 ----
-physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_order ORDER BY v_utf8 LIMIT 4;
+----
+physical_plan	<!REGEX>:.*(TOP_N|Top N).*
+
+query T
+SELECT v_utf8 FROM opc.dbo.opc_order ORDER BY v_utf8 LIMIT 4;
+----
+A
+a
+z
+é
 
 query T
 SELECT v_utf8 FROM opc.dbo.opc_order ORDER BY v_utf8;
@@ -163,7 +182,7 @@ Z
 # A multi-key ORDER BY pushes only its prefix of qualifying keys; the rest
 # keeps DuckDB's sort in the plan.
 query II
-EXPLAIN SELECT id FROM opc.dbo.opc_order ORDER BY v_utf8, v_ci;
+EXPLAIN SELECT id FROM opc.dbo.opc_order ORDER BY id, v_ci;
 ----
 physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
 
@@ -209,6 +228,65 @@ SELECT id FROM opc.dbo.opc_supp ORDER BY b;
 
 statement ok
 SELECT mssql_exec('opc', 'DROP TABLE dbo.opc_supp');
+
+#------------------------------------------------------------------------------
+# Why the bytes (review of #387): under a _BIN2 UTF-8 collation the server
+# orders `ab`+TAB before `ab` and ties `ab` with `ab `. As bytes, under any
+# UTF-8 collation -- a case-insensitive one here -- the order is DuckDB's.
+#------------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE IF EXISTS dbo.opc_pad;
+	CREATE TABLE dbo.opc_pad (id int NOT NULL PRIMARY KEY,
+		v varchar(10) COLLATE Latin1_General_100_CI_AS_SC_UTF8 NOT NULL);
+	INSERT INTO dbo.opc_pad VALUES (1, ''ab''), (2, ''ab'' + CHAR(9)), (3, ''ab ''), (4, ''aa''), (5, ''AB'')');
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_pad ORDER BY v LIMIT 5;
+----
+physical_plan	<!REGEX>:.*(TOP_N|Top N).*
+
+query I
+SELECT id FROM opc.dbo.opc_pad ORDER BY v LIMIT 5;
+----
+5
+4
+1
+2
+3
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE dbo.opc_pad');
+
+#------------------------------------------------------------------------------
+# datetime2(7) is read as TIMESTAMP_NS, and a value past 2262 -- the
+# 9999-12-31 ValidTo sentinel of a temporal table -- as NULL (#168): the
+# server would order a value DuckDB does not see, so the key is not pushed. A
+# datetime2(6) is.
+#------------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE IF EXISTS dbo.opc_dt;
+	CREATE TABLE dbo.opc_dt (id int NOT NULL PRIMARY KEY, t7 datetime2(7) NOT NULL, t6 datetime2(6) NOT NULL);
+	INSERT INTO dbo.opc_dt VALUES (1, ''2024-01-01'', ''2024-01-01''), (2, ''9999-12-31 23:59:59.9999999'', ''2024-06-01'')');
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_dt ORDER BY t7 DESC LIMIT 1;
+----
+physical_plan	<REGEX>:.*(TOP_N|Top N).*
+
+query I
+SELECT id FROM opc.dbo.opc_dt ORDER BY t7 DESC LIMIT 1;
+----
+1
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_dt ORDER BY t6 DESC LIMIT 1;
+----
+physical_plan	<!REGEX>:.*(TOP_N|Top N).*
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE dbo.opc_dt');
 
 statement ok
 SELECT mssql_exec('opc', 'DROP TABLE dbo.opc_order');

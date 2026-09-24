@@ -21,7 +21,7 @@ statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS tq (TYPE mssql, order_pushdown true);
 
 statement ok
-SELECT mssql_exec('tq', 'DROP TABLE IF EXISTS dbo.[q]]t''x], dbo.[c]]tas''x], dbo.[r.x]');
+SELECT mssql_exec('tq', 'DROP TABLE IF EXISTS dbo.[q]]t''x], dbo.[c]]tas''x], dbo.[r.x], dbo.copy_q');
 
 statement ok
 SELECT mssql_exec('tq', 'CREATE TABLE dbo.[q]]t''x] ([c]]1] int NOT NULL PRIMARY KEY, [v''] nvarchar(10) NULL)');
@@ -81,6 +81,20 @@ query I
 SELECT sum("k]1") FROM tq.dbo."c]tas'x";
 ----
 10
+
+# COPY into a table it creates: the CREATE TABLE's column list quotes the
+# names too (review of #387: `[a]b]` broke the CREATE, and with `replace` the
+# DROP had already run).
+statement ok
+COPY (SELECT i::INTEGER AS "a]b" FROM range(3) t(i)) TO 'tq.dbo.copy_q' (FORMAT bcp, CREATE_TABLE true, REPLACE true);
+
+query I
+SELECT sum("a]b") FROM tq.dbo.copy_q;
+----
+3
+
+statement ok
+SELECT mssql_exec('tq', 'DROP TABLE dbo.copy_q');
 
 # RENAME: sp_rename parses the old name as a multi-part name, so a dot in a
 # part split it (review of #387): a table or column named `r.x` could not be

@@ -27,7 +27,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include "query/mssql_identifier.hpp"
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"

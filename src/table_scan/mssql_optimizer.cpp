@@ -167,7 +167,7 @@ static bool ResolveColumnIndex(const Expression &expr, const LogicalGet &get, id
 //------------------------------------------------------------------------------
 static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get, const LogicalProjection *projection,
 								   const MSSQLCatalogScanBindData &bind_data, string &out_fragment,
-								   string &out_source_column, idx_t &out_table_col_idx) {
+								   string &out_source_column, idx_t &out_table_col_idx, bool &out_is_column) {
 	const Expression *resolve_expr = &expr;
 	auto &col_ids = get.GetColumnIds();
 
@@ -220,6 +220,7 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 		out_source_column = bind_data.all_column_names[table_col_idx];
 		out_fragment = mssql::QuoteIdentifier(out_source_column);
 		out_table_col_idx = table_col_idx;
+		out_is_column = true;
 		return true;
 	}
 
@@ -262,6 +263,17 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 		if (table_col_idx >= bind_data.all_column_names.size()) {
 			return false;
 		}
+		// A date part of a datetimeoffset is taken in the value's own offset on
+		// the server and in the session TimeZone by DuckDB (measured: HOUR of
+		// 12:00 +05:00 is 12 there, 7 here in UTC), so the two orders differ
+		// (review of #387).
+		if (table_col_idx < bind_data.mssql_columns.size() &&
+			StringUtil::Lower(bind_data.mssql_columns[table_col_idx].sql_type_name) == "datetimeoffset") {
+			MSSQL_OPT_DEBUG(2, "  Function %s over a datetimeoffset: evaluated in a different time zone",
+							func_expr.Function().GetName().GetIdentifierName().c_str());
+			return false;
+		}
+		out_is_column = false;
 
 		string inner_col = bind_data.all_column_names[table_col_idx];
 		string escaped_col = mssql::QuoteIdentifier(inner_col);
@@ -301,14 +313,21 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 // else refuses rather than guess (it used to be read as LAST).
 static bool OrderTerm(const string &fragment, const string &column, OrderType order_type, OrderByNullType null_order,
 					  bool is_nullable, bool emulate, string &out_term) {
+	const bool descending = order_type == OrderType::DESCENDING;
+	const string term = fragment + (descending ? " DESC" : " ASC");
+	// A NOT NULL key has no placement to honour, whatever the node says
+	// (review of #387: the check below came first and refused ORDER_DEFAULT on
+	// such a key).
+	if (!is_nullable) {
+		out_term = term;
+		return true;
+	}
 	if (null_order != OrderByNullType::NULLS_FIRST && null_order != OrderByNullType::NULLS_LAST) {
 		return false;
 	}
-	const bool descending = order_type == OrderType::DESCENDING;
-	const string term = fragment + (descending ? " DESC" : " ASC");
 	const bool nulls_first = null_order == OrderByNullType::NULLS_FIRST;
 	const bool server_puts_nulls_first = !descending;
-	if (!is_nullable || nulls_first == server_puts_nulls_first) {
+	if (nulls_first == server_puts_nulls_first) {
 		out_term = term;
 		return true;
 	}
@@ -325,8 +344,8 @@ static bool OrderTerm(const string &fragment, const string &column, OrderType or
 // Core: Process ORDER BY nodes and build pushdown clause
 //------------------------------------------------------------------------------
 static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const LogicalGet &get,
-								 const LogicalProjection *projection, MSSQLCatalogScanBindData &bind_data,
-								 bool emulate_null_order, string &out_order_clause) {
+								 const LogicalProjection *projection, MSSQLCatalogScanBindData &bind_data, bool limited,
+								 string &out_order_clause) {
 	string order_clause;
 	idx_t pushed_count = 0;
 
@@ -337,26 +356,35 @@ static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const L
 		string fragment;
 		string source_column;
 		idx_t table_col_idx;
+		bool is_column = false;
 		if (!ResolveOrderExpression(*order.expression, get, projection, bind_data, fragment, source_column,
-									table_col_idx)) {
+									table_col_idx, is_column)) {
 			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: cannot push (unsupported expression)", (unsigned long long)i);
 			break;	// Stop at first non-pushable column (prefix only)
 		}
 
-		// Issue #362: the server's order must be DuckDB's. A string key under a
-		// linguistic or code-page collation, a uniqueidentifier, a sql_variant
-		// would come back in the server's order with DuckDB's sort removed from
-		// the plan. Unknown column metadata is refused the same way.
-		if (table_col_idx >= bind_data.mssql_columns.size() ||
-			!bind_data.mssql_columns[table_col_idx].OrdersLikeDuckDB()) {
-			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: %s does not order like DuckDB on the server", (unsigned long long)i,
-							source_column.c_str());
-			break;	// Stop at first non-pushable column (prefix only)
+		// Issue #362: the server's order must be DuckDB's. A key the server
+		// orders otherwise would come back in the server's order with DuckDB's
+		// sort removed from the plan. Unknown column metadata is refused the same
+		// way. A UTF-8 varchar column is pushed as its bytes -- DuckDB's order --
+		// but that key is not sargable, so only under a LIMIT (`limited`), where
+		// N rows cross the wire instead of the table.
+		if (table_col_idx >= bind_data.mssql_columns.size()) {
+			break;
 		}
-		const bool is_nullable = bind_data.mssql_columns[table_col_idx].is_nullable;
+		const auto &column = bind_data.mssql_columns[table_col_idx];
+		if (!column.OrdersLikeDuckDB()) {
+			if (!(limited && is_column && column.OrdersLikeDuckDBAsBytes())) {
+				MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: %s does not order like DuckDB on the server",
+								(unsigned long long)i, source_column.c_str());
+				break;	// Stop at first non-pushable column (prefix only)
+			}
+			fragment = "CAST(" + fragment + " AS varbinary(max))";
+		}
+		const bool is_nullable = column.is_nullable;
 
 		string term;
-		if (!OrderTerm(fragment, source_column, order.type, order.null_order, is_nullable, emulate_null_order, term)) {
+		if (!OrderTerm(fragment, source_column, order.type, order.null_order, is_nullable, limited, term)) {
 			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: NULL placement of %s cannot be pushed here", (unsigned long long)i,
 							source_column.c_str());
 			break;
@@ -571,9 +599,11 @@ static void TryPushOrderBy(ClientContext &context, unique_ptr<LogicalOperator> &
 // TableFilter behind a filter_pushdown scan). A TOP N folded into the query
 // would then be taken BEFORE that filter: the server sends N rows ignoring it,
 // the scan drops some, and nothing refills -- on a composite key `WHERE
-// rowid.a >= 2 ORDER BY k LIMIT 2` returned 0 rows of 2 (review of #387). So TOP N / LIMIT is not pushed
-// when any filter would stay on the client; a plain ORDER BY still is, since a
-// filter keeps the order of what it passes. Asked with the scan's own encoder,
+// rowid.a >= 2 ORDER BY k LIMIT 2` returned 0 rows of 2 (review of #387). So
+// TOP N / LIMIT is not pushed when any filter would stay on the client. A plain
+// ORDER BY node still is (TryPushOrderBy): a filter keeps the order of what it
+// passes. An ORDER BY under a TopN that stays is not: the TopN sorts anyway.
+// Asked with the scan's own encoder,
 // literal form: whether a filter is handled does not depend on parameters.
 // Anything that fails the dry run is treated as client-side.
 static bool ScanHasClientSideFilters(const LogicalGet &get, const MSSQLCatalogScanBindData &bind_data) {
@@ -651,25 +681,32 @@ static void TryPushLimitOrderBy(ClientContext &context, unique_ptr<LogicalOperat
 					scan_info.projection ? "Projection -> " : "", bind_data.schema_name.c_str(),
 					bind_data.table_name.c_str());
 
+	// A client-side filter would be applied after the server's TOP N. Leave the
+	// pair: the ORDER BY below it is TryPushOrderBy's, which the optimizer
+	// reaches next, and a plain ORDER BY is safe under a filter.
 	if (ScanHasClientSideFilters(*scan_info.get, bind_data)) {
 		return;
 	}
 
-	// Process ORDER BY columns
+	// Not `limited`: DuckDB's TopN optimizer merges LIMIT + ORDER BY into a
+	// LogicalTopN unless N is over 5000 and a sizeable share of the table
+	// (topn_optimizer.cpp, CanOptimize), so this shape means a LARGE N -- where
+	// a non-sargable key (the NULL-placement CASE, a varchar's bytes) would sort
+	// most of the table on the server and ship it anyway (review of #387).
 	string order_clause;
 	idx_t pushed =
-		ProcessOrderByNodes(order.orders, *scan_info.get, scan_info.projection, bind_data, true, order_clause);
+		ProcessOrderByNodes(order.orders, *scan_info.get, scan_info.projection, bind_data, false, order_clause);
 
 	if (pushed == 0) {
 		MSSQL_OPT_DEBUG(1, "No columns pushed down");
 		return;
 	}
 
-	// Store ORDER BY clause
-	bind_data.order_by_clause = order_clause;
-
-	// Full pushdown: also push TOP N and remove both LIMIT and ORDER from plan
+	// Full pushdown: push ORDER BY and TOP N and remove both LIMIT and ORDER
+	// from the plan. A partial one pushes nothing: DuckDB sorts anyway, and the
+	// server's partial order would only cost it a sort.
 	if (pushed == order.orders.size()) {
+		bind_data.order_by_clause = order_clause;
 		idx_t limit_val = limit.limit_val.GetConstantValue();
 		bind_data.top_n = static_cast<int64_t>(limit_val);
 		MSSQL_OPT_DEBUG(1, "Full TOP %llu pushdown with ORDER BY: %s", (unsigned long long)limit_val,
@@ -677,7 +714,7 @@ static void TryPushLimitOrderBy(ClientContext &context, unique_ptr<LogicalOperat
 		// Replace LIMIT -> ORDER -> [Projection ->] GET with [Projection ->] GET
 		plan = std::move(limit_child->children[0]);
 	} else {
-		MSSQL_OPT_DEBUG(1, "Partial ORDER BY pushdown (%llu/%llu) - keeping LIMIT and ORDER",
+		MSSQL_OPT_DEBUG(1, "Partial ORDER BY (%llu/%llu) - nothing pushed, keeping LIMIT and ORDER",
 						(unsigned long long)pushed, (unsigned long long)order.orders.size());
 	}
 }
@@ -715,11 +752,14 @@ static void TryPushTopN(ClientContext &context, unique_ptr<LogicalOperator> &pla
 					scan_info.projection ? "Projection -> " : "", bind_data.schema_name.c_str(),
 					bind_data.table_name.c_str());
 
+	// A client-side filter would be applied after the server's TOP N, so the
+	// TopN stays in the plan -- and with it DuckDB's sort, which the server's
+	// order would not spare: an ORDER BY pushed under a kept TopN only costs the
+	// server a sort.
 	if (ScanHasClientSideFilters(*scan_info.get, bind_data)) {
 		return;
 	}
 
-	// Process ORDER BY columns
 	string order_clause;
 	idx_t pushed =
 		ProcessOrderByNodes(top_n.orders, *scan_info.get, scan_info.projection, bind_data, true, order_clause);
@@ -729,18 +769,20 @@ static void TryPushTopN(ClientContext &context, unique_ptr<LogicalOperator> &pla
 		return;
 	}
 
-	// Store ORDER BY clause
-	bind_data.order_by_clause = order_clause;
-
-	// Full pushdown: replace TopN with its child (Projection -> GET or just GET)
+	// Full pushdown: ORDER BY and TOP N, and the TopN replaced with its child
+	// (Projection -> GET or just GET). A partial one pushes nothing: the TopN
+	// stays and sorts anyway, and a partial key -- possibly a non-sargable one
+	// -- would only have the server sort the whole table for it (review of
+	// #387).
 	if (pushed == top_n.orders.size()) {
+		bind_data.order_by_clause = order_clause;
 		bind_data.top_n = static_cast<int64_t>(top_n.limit);
 		MSSQL_OPT_DEBUG(1, "Full TOP %llu pushdown with ORDER BY: %s", (unsigned long long)top_n.limit,
 						order_clause.c_str());
 		plan = std::move(plan->children[0]);
 	} else {
-		MSSQL_OPT_DEBUG(1, "Partial ORDER BY pushdown (%llu/%llu) - keeping LogicalTopN", (unsigned long long)pushed,
-						(unsigned long long)top_n.orders.size());
+		MSSQL_OPT_DEBUG(1, "Partial ORDER BY (%llu/%llu) - nothing pushed, keeping LogicalTopN",
+						(unsigned long long)pushed, (unsigned long long)top_n.orders.size());
 	}
 }
 

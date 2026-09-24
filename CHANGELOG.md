@@ -22,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CREATE TABLE … AS SELECT * FROM mssql_scan(…)` keeps the source's lengths
   (and a UTF-8 `varchar`'s collation) instead of making `nvarchar(max)`.
   `typeof()` of such a column changes from `VARCHAR`; setting the option to
-  `false` restores it. A `char` / `varchar` under a code-page collation stays
+  `false` restores it. With `mssql_utf8_support = false` the column is still
+  reported as the declared `MSSQL_VARCHAR(n)`, although it travels as
+  nvarchar. A `char` / `varchar` under a code-page collation stays
   plain `VARCHAR`: a raw scan hands its bytes over untranscoded, and an
   annotation naming the code page would invite a re-encode. `prepared := true`
   reports the same types, asking `sp_describe_first_result_set` for the
@@ -79,11 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the installation default `SQL_Latin1_General_CP1_CI_AS` came back in
   linguistic order, with case and accents interleaved, instead of DuckDB's.
   - **Rule:** a key is now pushed only when the server sorts it as DuckDB
-    does: numeric, `bit` and date/time types, and of the strings only
-    `varchar` / `char` under a `_BIN2` UTF-8 collation. Not `nvarchar`, even
-    under `_BIN2`: its UTF-16 order puts a character above the BMP before
-    U+E000–U+FFFF, DuckDB after. A string-valued function (`upper(name)`) is
-    never pushed.
+    does: numeric, `bit` and date/time types (not `datetime2(7)`, whose
+    out-of-range values DuckDB reads as NULL). A `varchar` / `char` under a
+    UTF-8 collation is pushed only under a LIMIT, as its bytes
+    (`CAST(col AS varbinary(max))`): as text the server pads with spaces, so
+    `ab` + TAB would sort before `ab`. Not `nvarchar`, even under `_BIN2`: its
+    UTF-16 order puts a character above the BMP before U+E000–U+FFFF, DuckDB
+    after. Never a string-valued function (`upper(name)`) or a date part of a
+    `datetimeoffset`.
   - **Never pushed:** `uniqueidentifier` (SQL Server compares its last six
     bytes first), `binary` / `varbinary` (compared zero-padded, so `0x01` =
     `0x0100`), `json`, `sql_variant`.

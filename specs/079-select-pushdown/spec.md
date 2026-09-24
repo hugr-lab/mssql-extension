@@ -186,10 +186,14 @@ silently disable pushdown for the first statement against every table.
   runs as today. `nvarchar` under `_BIN2` is vetoed too (PR A review): its
   UTF-16 order puts a character above the BMP before U+E000–U+FFFF, DuckDB
   after — a wrong answer, not a documentable nuance. The predicate is an
-  allow-list (numeric, `bit`, date/time; binary / `json` / uniqueidentifier
-  out), and a string-valued function of a key is never pushed. The residual
-  on a qualifying key is padding (`ab` = `ab `, and `ab`+TAB before `ab`),
-  documented. No `COLLATE` forcing (owner, § 8.4).
+  allow-list (numeric, `bit`, date/time but not `datetime2(7)`, whose values
+  past 2262 DuckDB reads as NULL; binary / `json` / uniqueidentifier out), a
+  string-valued function of a key is never pushed, nor a date part of a
+  `datetimeoffset`. As TEXT even a `_BIN2_UTF8` column pads with spaces (`ab`
+  = `ab `, `ab`+TAB before `ab`, measured), so a UTF-8 `varchar` is ordered
+  by its BYTES, `CAST(col AS varbinary(max))` — DuckDB's order, measured,
+  trailing NUL the one tie — and, that key not being sargable, only under a
+  LIMIT (owner, PR A review). No `COLLATE` forcing (owner, § 8.4).
 - Literals spelled per column (§ 8.3.1, #361).
 - No strict forms, no re-check: § 8.5's `DATALENGTH` pair stays in the
   record as the measured form should strictness ever be asked for.

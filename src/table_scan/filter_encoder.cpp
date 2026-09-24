@@ -29,6 +29,7 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
+#include "query/mssql_identifier.hpp"
 #include "query/mssql_sql_params.hpp"
 #include "table_scan/function_mapping.hpp"
 

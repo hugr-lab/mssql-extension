@@ -98,6 +98,47 @@ SELECT * FROM mssql_scan('snt', 'SELECT c.name, TYPE_NAME(c.user_type_id) AS t, 
 ----
 v	varchar	12	Latin1_General_100_CI_AS_SC_UTF8
 
+# Without UTF8SUPPORT (the escape hatch, or an endpoint that ignores the
+# request) a UTF-8 varchar travels as nvarchar: the bind still names the
+# DECLARED type, and the stream's wire type must not be taken for a changed
+# shape (review of #387: the scan threw on a good stream). A fresh ATTACH, the
+# setting being read at login.
+statement ok
+SET mssql_utf8_support = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS snt16 (TYPE mssql);
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt16', 'SELECT v, c FROM dbo.snt_src'));
+----
+v	MSSQL_VARCHAR(20)
+c	VARCHAR
+
+query TT
+SELECT v, trim(c) FROM mssql_scan('snt16', 'SELECT v, c FROM dbo.snt_src');
+----
+abc	xy
+
+# prepared: the UTF-8 column is found by its collation bit although it arrives
+# as nvarchar, and a code-page column beside it keeps its own type.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt16', 'SELECT c, v FROM dbo.snt_src', prepared := true));
+----
+c	VARCHAR
+v	MSSQL_VARCHAR(20)
+
+query TT
+SELECT trim(c), v FROM mssql_scan('snt16', 'SELECT c, v FROM dbo.snt_src', prepared := true);
+----
+xy	abc
+
+statement ok
+DETACH snt16;
+
+statement ok
+RESET mssql_utf8_support;
+
 # Off: plain VARCHAR, as before.
 statement ok
 SET mssql_catalog_native_types = false;

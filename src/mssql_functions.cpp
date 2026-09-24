@@ -309,11 +309,15 @@ static int16_t StringMaxLengthOf(const tds::ColumnMetadata &col) {
 
 // The stream decodes a string column as plain VARCHAR; the bind may have
 // reported it as MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n), the same physical type
-// with a name on it (spec 060). Those agree when the stream's column is the
-// one the name states -- same kind, same length: a varchar(10) that came back
-// varchar(20) is a changed shape, and a plan built on the bound length would
-// hand a CTAS a column too narrow for what arrives. The collation is not
-// compared: COLMETADATA carries it as an id, not a name.
+// with a name on it (spec 060). Those agree when the stream's column holds the
+// n characters the name states: a varchar(10) that came back varchar(20) is a
+// changed shape, and a plan built on the bound length would hand a CTAS a
+// column too narrow for what arrives. The KIND is not compared: the bind names
+// the DECLARED type and the stream carries the WIRE type, and a UTF-8 varchar
+// travels as nvarchar whenever UTF8SUPPORT was not granted at login
+// (mssql_utf8_support = false, an endpoint that ignores it) -- the same
+// column, transcoded (review of #387). Nor the collation: COLMETADATA carries
+// it as an id, not a name.
 static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQLResultStream &stream) {
 	auto &types = stream.GetColumnTypes();
 	auto &metadata = stream.GetColumnMetadata();
@@ -338,7 +342,7 @@ static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQ
 		const bool unicode = base == "nchar" || base == "nvarchar";
 		const int16_t max_length = StringMaxLengthOf(metadata[i]);
 		const int32_t length = max_length < 0 ? mssql::codec::MAX_LENGTH : (unicode ? max_length / 2 : max_length);
-		if (spec.unicode != unicode || spec.length != length) {
+		if (spec.length != length) {
 			return false;
 		}
 	}
@@ -455,30 +459,47 @@ static MSSQLDescribedShape PrepareStatement(tds::TdsConnection &connection, cons
 		shape.reason = "the statement returns no result set";
 		return shape;
 	}
-	bool has_varchar = false;
+	// The columns whose annotation needs the describe: those whose collation is
+	// a UTF-8 one. That bit is in COLMETADATA whatever travelled -- varchar, or
+	// nvarchar when UTF8SUPPORT was not granted (review of #387: deciding by
+	// the wire type missed the second) -- and a code-page varchar is plain
+	// VARCHAR either way, so it costs no round trip.
+	vector<bool> needs_describe;
+	bool any_needs_describe = false;
 	for (const auto &col : result.result_sets.front()) {
 		const string base = StringBaseOf(col);
-		has_varchar = has_varchar || base == "char" || base == "varchar";
+		const bool utf8_text = !base.empty() && col.IsUtf8Collation();
+		needs_describe.push_back(utf8_text);
+		any_needs_describe = any_needs_describe || utf8_text;
 		shape.types.push_back(NativeStringType(tds::encoding::TypeConverter::GetDuckDBType(col), native_types, base,
 											   StringMaxLengthOf(col), string()));
 		shape.names.push_back(col.name);
 	}
 	shape.ok = true;
-	// COLMETADATA carries a varchar's collation as an id, not the name its
-	// annotation needs, so ask the describe for those columns -- one round trip
-	// more at bind, only when there is a varchar and native types are on, for a
-	// statement compiled once. It names exactly the types the default
-	// (described) path would, so `prepared := true` does not change what a CTAS
-	// from the scan creates. A statement the describe cannot answer keeps its
-	// varchars plain VARCHAR.
-	if (native_types && has_varchar) {
-		auto described = DescribeFirstResultSet(connection, statement, declarations, timeout_ms, true);
-		if (described.ok && described.types.size() == shape.types.size()) {
-			for (idx_t i = 0; i < shape.types.size(); i++) {
-				if (shape.types[i].id() == LogicalTypeId::VARCHAR &&
-					described.types[i].id() == LogicalTypeId::VARCHAR) {
-					shape.types[i] = described.types[i];
+	// COLMETADATA carries a collation as an id, not the name the annotation
+	// needs, so the describe is asked for those columns -- one round trip more
+	// at bind, only when there is one, for a statement compiled once. It names
+	// exactly the types the default (described) path would, so `prepared :=
+	// true` does not change what a CTAS from the scan creates. Taken per column
+	// and only where the NAME at that position agrees: the describe skips
+	// hidden columns, so a position alone could graft one column's type onto
+	// another. Advisory: a describe that fails or throws leaves those columns
+	// as they are, never the bind -- sp_prepare has already answered, and its
+	// handle is the caller's (review of #387).
+	if (native_types && any_needs_describe) {
+		try {
+			auto described = DescribeFirstResultSet(connection, statement, declarations, timeout_ms, true);
+			if (described.ok) {
+				for (idx_t i = 0; i < shape.types.size() && i < described.types.size(); i++) {
+					if (needs_describe[i] && described.names[i] == shape.names[i] &&
+						described.types[i].id() == LogicalTypeId::VARCHAR) {
+						shape.types[i] = described.types[i];
+					}
 				}
+			}
+		} catch (...) {
+			if (connection.GetState() != tds::ConnectionState::Idle) {
+				throw;
 			}
 		}
 	}

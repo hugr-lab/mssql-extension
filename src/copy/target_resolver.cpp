@@ -1,5 +1,6 @@
 #include "copy/target_resolver.hpp"
 #include "catalog/mssql_column_info.hpp"
+#include "query/mssql_identifier.hpp"
 #include "query/mssql_sql_params.hpp"
 
 #include "tds/encoding/bcp_row_encoder.hpp"
@@ -647,7 +648,7 @@ void TargetResolver::CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &
 		if (i > 0) {
 			sql += ",\n";
 		}
-		sql += "  [" + source_names[i] + "] " +
+		sql += "  " + mssql::QuoteIdentifier(source_names[i]) + " " +
 			   GetSQLServerTypeDeclaration(source_types[i], varchar_collation, single_byte_text) + " NULL";
 	}
 

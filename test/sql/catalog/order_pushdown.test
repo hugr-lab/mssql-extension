@@ -20,10 +20,10 @@ ATTACH '{MSSQL_TESTDB_DSN}' AS opd_setup (TYPE mssql);
 statement ok
 DROP TABLE IF EXISTS opd_setup.dbo.order_pushdown_test;
 
-# The string columns are varchar under a _BIN2_UTF8 collation: the one string
-# the server orders the way DuckDB does (MSSQLColumnInfo::OrdersLikeDuckDB,
-# issue #362). A DuckDB-created VARCHAR would not qualify, and every ORDER BY
-# on name/category below would quietly stop testing pushdown.
+# The string columns are varchar under a _BIN2_UTF8 collation: UTF-8 bytes, so
+# under a LIMIT they are pushed as `CAST(col AS varbinary(max))`, DuckDB's order
+# (MSSQLColumnInfo::OrdersLikeDuckDBAsBytes, issue #362). A plain ORDER BY on
+# them is not pushed; the plain-ORDER BY tests below key on created_date/score.
 statement ok
 SELECT mssql_exec('opd_setup', 'CREATE TABLE dbo.order_pushdown_test (
     id INT NULL,
@@ -191,25 +191,25 @@ DETACH opd3n;
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS opd4 (TYPE mssql, order_pushdown true);
 
-# name is nullable: ASC NULLS FIRST is the server's own placement, so this
-# pushes with no emulation. (DuckDB's default NULLS LAST on a plain ORDER BY
-# is not pushed -- Test 12.)
+# created_date is nullable: ASC NULLS FIRST is the server's own placement, so
+# this pushes with no emulation. (DuckDB's default NULLS LAST on a plain ORDER
+# BY is not pushed -- Test 12.)
 query II
-EXPLAIN SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY name ASC NULLS FIRST;
+EXPLAIN SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY created_date ASC NULLS FIRST;
 ----
 physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
 
 query IT
-SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY name ASC NULLS FIRST;
+SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY created_date ASC NULLS FIRST;
 ----
+5	Eve
+3	Charlie
 1	Alice
 2	Bob
-3	Charlie
-4	Diana
-5	Eve
 6	Frank
-7	Grace
 8	Hank
+7	Grace
+4	Diana
 
 # =============================================================================
 # Test 5 (T019/US1): Simple ORDER BY pushdown - single column DESC
@@ -232,20 +232,20 @@ SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY id DESC;
 # =============================================================================
 
 query II
-EXPLAIN SELECT id, name, category FROM opd4.dbo.order_pushdown_test WHERE category IS NOT NULL ORDER BY category ASC NULLS FIRST, name ASC NULLS FIRST;
+EXPLAIN SELECT id, name, category FROM opd4.dbo.order_pushdown_test WHERE category IS NOT NULL ORDER BY score ASC NULLS FIRST, created_date ASC NULLS FIRST;
 ----
 physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
 
 query ITT
-SELECT id, name, category FROM opd4.dbo.order_pushdown_test WHERE category IS NOT NULL ORDER BY category ASC NULLS FIRST, name ASC NULLS FIRST;
+SELECT id, name, category FROM opd4.dbo.order_pushdown_test WHERE category IS NOT NULL ORDER BY score ASC NULLS FIRST, created_date ASC NULLS FIRST;
 ----
+5	Eve	C
+2	Bob	B
+8	Hank	C
 1	Alice	A
+6	Frank	B
 3	Charlie	A
 7	Grace	A
-2	Bob	B
-6	Frank	B
-5	Eve	C
-8	Hank	C
 
 # =============================================================================
 # Test 7 (T027/US3): TOP N pushdown - ORDER BY + LIMIT
@@ -275,19 +275,19 @@ SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY id DESC LIMIT 2;
 
 # The first key is pushed, the second is not, so DuckDB's sort stays.
 query II
-EXPLAIN SELECT id, name, score FROM opd4.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY name ASC NULLS FIRST, score * 2 DESC;
+EXPLAIN SELECT id, name, score FROM opd4.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY created_date ASC NULLS FIRST, score * 2 DESC;
 ----
 physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
 
 query ITI
-SELECT id, name, score FROM opd4.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY name ASC NULLS FIRST, score * 2 DESC;
+SELECT id, name, score FROM opd4.dbo.order_pushdown_test WHERE score IS NOT NULL ORDER BY created_date ASC NULLS FIRST, score * 2 DESC;
 ----
-1	Alice	85
 3	Charlie	92
-4	Diana	78
+1	Alice	85
 6	Frank	88
-7	Grace	95
 8	Hank	70
+7	Grace	95
+4	Diana	78
 
 # =============================================================================
 # Test 10 (T030/US4): Function expression pushdown - YEAR()
@@ -401,6 +401,40 @@ SELECT a, b FROM opd4.dbo.order_pushdown_comp WHERE a >= 2 ORDER BY k LIMIT 2;
 
 statement ok
 SELECT mssql_exec('opd4', 'DROP TABLE dbo.order_pushdown_comp');
+
+# A UTF-8 varchar key is pushed only under a LIMIT, as its bytes
+# (`CAST(name AS varbinary(max))`): DuckDB's order, but not sargable, so a plain
+# ORDER BY on it keeps DuckDB's sort (review of #387).
+query II
+EXPLAIN SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY name ASC NULLS FIRST;
+----
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
+query II
+EXPLAIN SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY name DESC LIMIT 3;
+----
+physical_plan	<!REGEX>:.*(TOP_N|Top N).*
+
+query IT
+SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY name DESC LIMIT 3;
+----
+8	Hank
+7	Grace
+6	Frank
+
+# A partial key list under a LIMIT pushes nothing: the TopN stays and sorts,
+# and the server is not asked for a sort it would do for nothing.
+query II
+EXPLAIN SELECT id FROM opd4.dbo.order_pushdown_test ORDER BY score, score * 2 LIMIT 3;
+----
+physical_plan	<REGEX>:.*(TOP_N|Top N).*
+
+query I
+SELECT id FROM opd4.dbo.order_pushdown_test ORDER BY score, score * 2, id LIMIT 3;
+----
+8
+4
+1
 
 query ITI
 SELECT id, name, score FROM opd4.dbo.order_pushdown_test ORDER BY score ASC NULLS LAST, id;
@@ -526,18 +560,18 @@ SELECT id, name, score FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT
 # =============================================================================
 
 query II
-EXPLAIN SELECT id, name, category FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL AND category IS NOT NULL ORDER BY category ASC NULLS FIRST, score DESC NULLS LAST;
+EXPLAIN SELECT id, name, category FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL AND category IS NOT NULL ORDER BY created_date ASC NULLS FIRST, score DESC NULLS LAST;
 ----
 physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
 
 query ITT
-SELECT id, name, category FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL AND category IS NOT NULL ORDER BY category ASC NULLS FIRST, score DESC NULLS LAST;
+SELECT id, name, category FROM opd_prune.dbo.order_pushdown_test WHERE score IS NOT NULL AND category IS NOT NULL ORDER BY created_date ASC NULLS FIRST, score DESC NULLS LAST;
 ----
-7	Grace	A
 3	Charlie	A
 1	Alice	A
 6	Frank	B
 8	Hank	C
+7	Grace	A
 
 # Test 16b (review of #387): the filter column is neither output nor order key.
 # The pruning after a full ORDER BY pushdown must not cut the column the pushed

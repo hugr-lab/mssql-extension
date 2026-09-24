@@ -90,21 +90,26 @@ ATTACH 'Server=...' AS db (TYPE mssql, order_pushdown true);
 - Combined with LIMIT: `ORDER BY id ASC LIMIT 10` on a `NOT NULL` key →
   `SELECT TOP 10 ... ORDER BY [id] ASC`
 
-**The order is always DuckDB's.** A pushed ORDER BY removes DuckDB's own sort,
-so a key is pushed only when SQL Server sorts it the way DuckDB would:
+**Which keys.** A pushed ORDER BY removes DuckDB's own sort, so a key is pushed
+only when SQL Server sorts it the way DuckDB would:
 
-- numeric, `bit` and date/time keys;
-- of the strings, only `varchar` / `char` under a `_BIN2` UTF-8 collation (such
-  as the extension's CTAS default, `Latin1_General_100_BIN2_UTF8`), whose bytes
-  order as code points. Under any other collation — including the installation
-  default `SQL_Latin1_General_CP1_CI_AS`, which orders linguistically, and a
-  code-page `_BIN2`, which orders the code page's bytes — DuckDB sorts. So it
-  does for `nvarchar` / `nchar` under any collation: their UTF-16 order puts a
-  character above the BMP (an emoji) before U+E000–U+FFFF, DuckDB after. What
-  still differs on a qualifying key is trailing spaces: the server treats `ab`
-  and `ab ` as equal (a tie, so a TOP N may pick either), and sorts a value
-  continuing with a character below the space (`ab` + TAB) before `ab`;
-- never a string-valued function of a key (`upper(name)`), a
+- numeric, `bit` and date/time keys — except `datetime2(7)`, the default
+  `datetime2`, which DuckDB reads as nanosecond timestamps and whose values
+  outside 1677–2262 (the `9999-12-31` end of a temporal table's period) it
+  reads as NULL;
+- a `varchar` / `char` under a **UTF-8** collation (any: `_BIN2_UTF8`, such as
+  the extension's CTAS default, or a case-insensitive `_UTF8` one), and only
+  **under a LIMIT**: it is ordered by its bytes, `CAST(col AS varbinary(max))`,
+  which is DuckDB's order. The one remaining difference is a trailing NUL
+  character, which the server's comparison ignores (`ab` and `ab` + NUL tie).
+  Ordered as text the server would pad with spaces — `ab` equal to `ab `, and
+  `ab` + TAB before `ab` — hence the bytes; and since a key over bytes cannot
+  use an index, a plain ORDER BY on the column is left to DuckDB;
+- never a code-page `varchar` (its bytes are the code page's), an `nvarchar` /
+  `nchar` under any collation (UTF-16 order puts a character above the BMP, an
+  emoji, before U+E000–U+FFFF; DuckDB after), a string-valued function of a key
+  (`upper(name)`), a date part of a `datetimeoffset` (the server takes it in
+  the value's own offset, DuckDB in the session time zone), a
   `uniqueidentifier` (SQL Server compares its last six bytes first),
   `binary` / `varbinary` (compared zero-padded: `0x01` = `0x0100`), `json` or
   `sql_variant`.
@@ -124,7 +129,8 @@ server too. A filter the extension cannot translate runs on the rows that come
 back, and would otherwise be applied after the server had already cut them to N.
 
 **Limitations:**
-- Only prefix pushdown: stops at first non-pushable column
+- Only prefix pushdown: stops at first non-pushable column, and under a LIMIT
+  nothing is pushed unless every key is (the TOP N needs them all)
 - Expressions like `ORDER BY col * 2` are not pushed
 
 ### Row Identity (rowid)
