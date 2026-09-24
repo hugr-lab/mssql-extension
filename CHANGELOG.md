@@ -53,6 +53,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Reading the schema list no longer makes a transaction count as having used
+  the catalog.** `MSSQLCatalog::SchemaListCache` asked the transaction for its
+  metadata layer unconditionally, and that call CREATES this catalog's
+  transaction — so any schema lookup DuckDB makes against an attached MSSQL
+  catalog (search-path resolution, `duckdb_schemas()`, a "did you mean" scan)
+  flipped `HasUsedAnyMSSQLCatalogInTransaction` even when it answered from the
+  shared list and took no connection. `mssql_refresh_cache()` and
+  `mssql_preload_catalog()` were then refused inside a transaction that had
+  touched no server — the case
+  [#380](https://github.com/hugr-lab/mssql-extension/issues/380)'s refusal was
+  narrowed to allow. An already-loaded shared list is now read without creating
+  anything; every other path creates the transaction as before, so a load still
+  lands in its own cache.
+
 - **A table created inside a transaction can be read in it; a pool of one
   connection works in a transaction**
   ([#380](https://github.com/hugr-lab/mssql-extension/issues/380)).

@@ -66,8 +66,9 @@ public:
 	//! and it does not exist yet -- mssql_exec depends on that, because it
 	//! bypasses the binder path that would otherwise create it. It is therefore
 	//! equivalent to "not autocommit" for any MSSQL catalog, and is NOT the way
-	//! to ask whether a transaction has touched a particular catalog: use
-	//! HasUsedCatalogInTransaction for that (review of 7f13a0a).
+	//! to ask whether a transaction has already touched MSSQL: use
+	//! HasUsedAnyMSSQLCatalogInTransaction for that, which is deliberately NOT
+	//! per-catalog (review of 7f13a0a).
 	//! @param context The DuckDB client context
 	//! @param catalog The MSSQL catalog
 	//! @return true if in an explicit DuckDB transaction
