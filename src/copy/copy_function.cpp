@@ -304,6 +304,37 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 	// Check write access
 	mssql_catalog.CheckWriteAccess("COPY TO");
 
+	// Capture the destructor's release targets here, on the client thread — it must not touch a
+	// ClientContext itself (issue #178 / PR #179). Covers the sink-throw path, where neither the
+	// helper below nor BCPCopyFinalize runs (issue #191).
+	gstate->pool_handle = mssql_catalog.GetConnectionPoolHandle();
+	gstate->transaction_pinned = !context.transaction.IsAutoCommit();
+	gstate->reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
+	// A pool of ONE connection in autocommit (review of #382): the source scan of
+	// this catalog and this sink take turns at the only connection. The init
+	// uses it for the target checks and the DDL and gives it back; the bulk load
+	// takes it on its first chunk, after the source has been materialised.
+	// Not for a temp target: a `#` / `##` table lives in the session that created
+	// it, and a connection given back to the pool is reset before its next use
+	// (mssql_reset_connection), which would drop the table the init just created
+	// before the load reached it. A temp target keeps the connection from init to
+	// the end of the load, as on any pool; outliving the statement is what a
+	// transaction is for.
+	const bool defer_connection =
+		!gstate->transaction_pinned && mssql_catalog.GetConnectionLimit() <= 1 && !bdata.target.IsTempTable();
+
+	// Spec 075 W3: inside a transaction the source scans of this catalog drain
+	// under the catalog's MaterializeMutex, and DuckDB initialises this sink on
+	// another thread while they do. Wait for them here rather than find the
+	// pinned connection mid-stream; held for the rest of the init, because the
+	// CREATE TABLE below goes down the same connection. Taken BEFORE the
+	// connection: on a pool of one, a scan draining under the mutex holds the
+	// connection this init would otherwise wait for until the acquire timeout.
+	std::unique_lock<std::mutex> materialize_lock;
+	if (gstate->transaction_pinned || defer_connection) {
+		materialize_lock = std::unique_lock<std::mutex>(mssql_catalog.MaterializeMutex());
+	}
+
 	// Acquire a connection from the pool
 	// For BCP, we need an exclusive connection that will remain in Executing state
 	CopyDebugLog(2, "BCPCopyInitGlobal: acquiring connection from pool");
@@ -311,24 +342,8 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 	if (!gstate->connection) {
 		throw IOException("MSSQL COPY: Failed to acquire connection from pool");
 	}
-	CopyDebugLog(2, "BCPCopyInitGlobal: connection acquired");
-
-	// Capture the destructor's release targets here, on the client thread — it must not touch a
-	// ClientContext itself (issue #178 / PR #179). Covers the sink-throw path, where neither the
-	// helper below nor BCPCopyFinalize runs (issue #191).
-	gstate->pool_handle = mssql_catalog.GetConnectionPoolHandle();
 	gstate->transaction_pinned = ConnectionProvider::IsInTransaction(context, mssql_catalog);
-	gstate->reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
-
-	// Spec 075 W3: inside a transaction the source scans of this catalog drain
-	// under the catalog's MaterializeMutex, and DuckDB initialises this sink on
-	// another thread while they do. Wait for them here rather than find the
-	// pinned connection mid-stream; held for the rest of the init, because the
-	// CREATE TABLE below goes down the same connection.
-	std::unique_lock<std::mutex> materialize_lock;
-	if (gstate->transaction_pinned) {
-		materialize_lock = std::unique_lock<std::mutex>(mssql_catalog.MaterializeMutex());
-	}
+	CopyDebugLog(2, "BCPCopyInitGlobal: connection acquired");
 
 	// Helper to release connection on error
 	auto release_connection_on_error = [&]() {
@@ -646,7 +661,13 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 			params.flush_rows = bdata.config.flush_rows;
 			params.collect_timings = mssql::CountersEnabled();
 			params.reset_on_release = gstate->reset_on_release;
-			gstate->shared.Adopt(std::move(gstate->connection), params, gstate->transaction_pinned);
+			if (defer_connection) {
+				gstate->deferred_params = params;
+				gstate->shared.DeferAdoption(gstate->deferred_params);
+				ConnectionProvider::ReleaseConnection(context, mssql_catalog, std::move(gstate->connection));
+			} else {
+				gstate->shared.Adopt(std::move(gstate->connection), params, gstate->transaction_pinned);
+			}
 			gstate->connection.reset();
 		}
 
@@ -792,6 +813,9 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		// arriving out of 1000000 — no error anywhere, on either side. The
 		// session does both inside one call now, and the lock is around the call.
 		std::unique_lock<std::mutex> shared_lock(gdata.write_mutex);
+		if (gdata.shared.IsDeferred()) {
+			gdata.shared.AdoptDeferred();
+		}
 		const auto written = gdata.shared.Write(input);
 		gdata.rows_sent.fetch_add(written.rows_written);
 		if (written.flushed) {

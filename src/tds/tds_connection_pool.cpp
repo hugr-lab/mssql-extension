@@ -145,14 +145,18 @@ void ConnectionPool::Shutdown() {
 }
 
 std::shared_ptr<TdsConnection> ConnectionPool::Acquire(int timeout_ms, std::string *failure) {
-	return AcquireImpl(timeout_ms, failure, false);
+	return AcquireImpl(timeout_ms, failure, false, nullptr);
 }
 
-std::shared_ptr<TdsConnection> ConnectionPool::TryAcquire(std::string *failure) {
-	return AcquireImpl(0, failure, true);
+std::shared_ptr<TdsConnection> ConnectionPool::TryAcquire(std::string *failure, bool *creation_failed) {
+	return AcquireImpl(0, failure, true, creation_failed);
 }
 
-std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::string *failure, bool optional) {
+std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::string *failure, bool optional,
+														   bool *creation_failed) {
+	if (creation_failed) {
+		*creation_failed = false;
+	}
 	MSSQL_POOL_DEBUG_LOG(1, "Acquire called on pool '%s'", context_name_.c_str());
 	if (shutdown_flag_.load()) {
 		if (failure) {
@@ -262,6 +266,9 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 			last_create_error_ = error;
 			last_create_error_at_ = std::chrono::steady_clock::now();
 			own_create_error = error;
+			if (creation_failed) {
+				*creation_failed = true;
+			}
 			next_create_allowed_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(create_backoff_ms_);
 			// Not std::min: it binds CREATE_BACKOFF_MAX_MS by reference, which
 			// odr-uses an in-class constexpr with no out-of-line definition

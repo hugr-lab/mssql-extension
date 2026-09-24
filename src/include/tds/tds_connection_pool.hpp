@@ -101,7 +101,12 @@ public:
 	//! using, so a null here is not counted in acquire_timeout_count: every
 	//! parallel load would otherwise report "timeouts" that delayed nothing
 	//! (review of #382).
-	std::shared_ptr<TdsConnection> TryAcquire(std::string *failure = nullptr);
+	//! `creation_failed` (optional) is set when the null came from a connection
+	//! this call tried to CREATE and could not -- a login the server refuses,
+	//! an expired token, a refused dial -- rather than from a pool with nothing
+	//! free. The first does not clear on a later try; the second does (review
+	//! of #382). Neither form counts in acquire_count or acquire_timeout_count.
+	std::shared_ptr<TdsConnection> TryAcquire(std::string *failure = nullptr, bool *creation_failed = nullptr);
 
 	// Release a connection back to the pool
 	void Release(std::shared_ptr<TdsConnection> conn);
@@ -185,7 +190,8 @@ private:
 
 	// Internal methods
 	void CleanupThreadFunc();
-	std::shared_ptr<TdsConnection> AcquireImpl(int timeout_ms, std::string *failure, bool optional);
+	std::shared_ptr<TdsConnection> AcquireImpl(int timeout_ms, std::string *failure, bool optional,
+											   bool *creation_failed);
 	std::shared_ptr<TdsConnection> TryAcquireIdle();
 	// Runs the factory with pool_mutex_ RELEASED (blocking I/O). On failure
 	// returns nullptr and puts the reason in `error`; the caller records it.

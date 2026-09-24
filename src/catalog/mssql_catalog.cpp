@@ -3,6 +3,7 @@
 #include <cctype>
 #include "catalog/mssql_transaction.hpp"
 #include "codec/target_string_type.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 #include "azure/azure_fedauth.hpp"
 #include "azure/azure_token.hpp"

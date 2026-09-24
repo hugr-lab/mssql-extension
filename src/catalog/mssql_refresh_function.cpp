@@ -107,7 +107,6 @@ static void MSSQLRefreshCacheExecute(DataChunk &args, ExpressionState &state, Ve
 				catalog_name, catalog_name);
 		}
 		auto &catalog = *catalog_ptr;
-
 		// Refused inside an explicit transaction ON THIS CATALOG (issue #380): a
 		// forced load there either blocks on the transaction's own uncommitted
 		// DDL (a pool connection waits on its schema lock until the metadata

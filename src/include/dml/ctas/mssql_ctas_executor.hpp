@@ -79,6 +79,12 @@ struct CTASExecutionState {
 	//! `connection` + `bcp_rows_in_batch` and its own copy of the
 	//! flush/reopen sequence.
 	BulkLoadSession bcp_session;
+	//! The shared session's params; built in ExecuteBCPInsert and outliving the
+	//! session, which keeps a pointer when its adoption is deferred.
+	BulkLoadSessionParams bcp_params;
+	//! A pool of one connection in autocommit: the bulk load's connection is
+	//! taken on the first chunk (review of #382).
+	bool defer_bcp_connection = false;
 	vector<BCPColumnMetadata> bcp_columns;
 	BCPCopyTarget bcp_target;
 
@@ -157,9 +163,9 @@ struct CTASExecutionState {
 	void Initialize(MSSQLCatalog &catalog_ref, CTASTarget target_p, vector<CTASColumnDef> columns_p,
 					CTASConfig config_p, bool reset_on_release_p);
 
-	//! Decide in_transaction / single_connection for this statement, and on a
-	//! pool of one turn the bulk load off. Before any other call: it rewrites
-	//! config.use_bcp and config.drop_on_failure.
+	//! Decide in_transaction / single_connection / defer_bcp_connection for this
+	//! statement. Before any other call: it rewrites config.use_bcp and
+	//! config.drop_on_failure.
 	void ResolveConnectionMode(ClientContext &context, idx_t connection_limit);
 
 	// Execute CREATE TABLE DDL phase

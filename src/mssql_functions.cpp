@@ -18,6 +18,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "mssql_function_docs.hpp"
 #include "mssql_storage.hpp"
+#include "query/mssql_ddl_detect.hpp"
 #include "query/mssql_query_executor.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "query/mssql_sql_params.hpp"
@@ -521,7 +522,11 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	bind_data.return_types = return_types;
 	bind_data.column_names = result_stream->GetColumnNames();
 
-	if (in_transaction) {
+	// The same rule as a pinned connection on a pool of ONE connection in
+	// autocommit (review of #382): the stream holds the pool's only connection,
+	// and a sink or another scan of this catalog would wait for it until
+	// mssql_acquire_timeout.
+	if (in_transaction || mssql_catalog.GetConnectionLimit() <= 1) {
 		// Issue #316: this connection is the transaction's ONE pinned connection.
 		// Holding it open until execution makes the NEXT mssql_scan fail in its own
 		// Bind, before any InitGlobal runs. Drain here and close it. See the
@@ -627,10 +632,10 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		// the DRAIN below, not the lock: the lock is uncontended at scan init
 		// anyway, because DuckDB's Pipeline::Reset runs ResetSink before
 		// ResetSource, so a sink taking the same mutex has already let it go.
-		// The connection is what the next statement waits for -- on a pool of
-		// one in autocommit a CTAS loads with INSERT statements that take their
-		// connection at the first batch, and a stream still open holds it until
-		// mssql_acquire_timeout (reviews of #382 and of 7f13a0a).
+		// The connection is what the sink waits for -- on a pool of one in
+		// autocommit a COPY's or CTAS's bulk load and an INSERT's statements take
+		// their connection at the first chunk, and a stream still open holds it
+		// until mssql_acquire_timeout (reviews of #382 and of 7f13a0a; #388).
 		const bool one_connection = mssql_catalog.GetConnectionLimit() <= 1;
 		const bool materialize = in_transaction || one_connection;
 		if (materialize) {
@@ -956,21 +961,11 @@ static duckdb::unique_ptr<duckdb::FunctionData> MSSQLExecParamsBind(duckdb::Bind
 	return make_uniq<MSSQLExecBindData>(BindExecContextName(context, *arguments[0], "mssql_exec_params"));
 }
 
-// Heuristic: does this raw T-SQL statement potentially change schema/catalog
-// metadata? Used to invalidate the catalog cache after mssql_exec() runs DDL so
-// that subsequent catalog operations (CREATE TABLE IF NOT EXISTS, reads) don't
-// act on stale existence metadata (issue #151). Over-detection only costs a
-// metadata refresh; under-detection would leave the cache stale, so we err
-// toward invalidating — including EXEC, since a stored procedure may run DDL.
+// The DDL test for mssql_exec's cache invalidation: mssql::SqlMayChangeSchema
+// (query/mssql_ddl_detect.hpp) -- whole-word keywords outside literals,
+// delimited identifiers and comments (review of #382).
 static bool ExecSqlMayChangeSchema(const string &sql) {
-	auto upper = StringUtil::Upper(sql);
-	static const char *kSchemaKeywords[] = {"CREATE", "DROP", "ALTER", "TRUNCATE", "RENAME", "EXEC"};
-	for (auto keyword : kSchemaKeywords) {
-		if (upper.find(keyword) != string::npos) {
-			return true;
-		}
-	}
-	return false;
+	return mssql::SqlMayChangeSchema(sql);
 }
 
 // Run one batch on the named catalog and return the DONE row count: the body
