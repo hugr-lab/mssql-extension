@@ -255,6 +255,34 @@ SELECT id FROM opc.dbo.opc_pad ORDER BY v LIMIT 5;
 2
 3
 
+# char(n) is stored blank-padded and read trimmed, so its bytes are not the
+# values DuckDB orders: `ab`+TAB is stored `ab<TAB> ` and sorts before `ab  `.
+# Not pushed. Nor varchar(max): a sort on an unbounded key.
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE IF EXISTS dbo.opc_char;
+	CREATE TABLE dbo.opc_char (id int NOT NULL PRIMARY KEY,
+		c char(4) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL,
+		m varchar(max) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL);
+	INSERT INTO dbo.opc_char VALUES (1, ''ab'', ''ab''), (2, ''ab'' + CHAR(9), ''ab'' + CHAR(9))');
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_char ORDER BY c LIMIT 1;
+----
+physical_plan	<REGEX>:.*(TOP_N|Top N).*
+
+query I
+SELECT id FROM opc.dbo.opc_char ORDER BY c LIMIT 1;
+----
+1
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_char ORDER BY m LIMIT 1;
+----
+physical_plan	<REGEX>:.*(TOP_N|Top N).*
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE dbo.opc_char');
+
 statement ok
 SELECT mssql_exec('opc', 'DROP TABLE dbo.opc_pad');
 

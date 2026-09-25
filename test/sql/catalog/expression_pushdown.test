@@ -110,6 +110,22 @@ SELECT id FROM ep.dbo.ExprPush WHERE flag AND year(dt) = 2024 ORDER BY id;
 1
 3
 
+# upper/lower/trim are not pushed (review of #387): the server's case mapping
+# is not DuckDB's -- UPPER(N'ß') stays 'ß', DuckDB's upper('ß') is 'ẞ' -- so a
+# pushed `upper(name) = 'ẞ'` lost the row. Applied client-side, it is found.
+statement ok
+SELECT mssql_exec('ep', 'INSERT INTO dbo.ExprPush VALUES (90, N''straße'', ''2024-01-01'', 0)');
+
+query I
+SELECT id FROM ep.dbo.ExprPush WHERE upper(name) = 'STRAẞE';
+----
+90
+
+query I
+SELECT id FROM ep.dbo.ExprPush WHERE lower(name) = 'straße' AND id = 90;
+----
+90
+
 statement ok
 SELECT mssql_exec('ep', 'DROP TABLE dbo.ExprPush');
 

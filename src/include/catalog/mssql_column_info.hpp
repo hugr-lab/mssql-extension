@@ -83,13 +83,15 @@ struct MSSQLColumnInfo {
 	//! `sql_variant` and every cast-required type, and the types the server
 	//! cannot sort (text, ntext, image, xml, geometry, geography).
 	bool OrdersLikeDuckDB() const;
-	//! A `varchar`/`char` whose bytes are UTF-8 (a UTF-8 collation, any
-	//! sensitivity): ordered by `CAST(col AS varbinary(max))` the server
-	//! compares those bytes, which is code-point order, DuckDB's -- measured:
-	//! `aa, ab, ab`+TAB`, ab ` on both sides. The one residual is a trailing NUL:
-	//! the binary comparison pads with 0x00, so `ab` and `ab`+NUL tie. The key is
-	//! not sargable, so the optimizer uses it only under a LIMIT (review of
-	//! #387).
+	//! A bounded `varchar` whose bytes are UTF-8 (a UTF-8 collation, any
+	//! sensitivity): ordered by `CAST(col AS varbinary(n))` the server compares
+	//! those bytes, which is code-point order, DuckDB's -- measured: `aa, ab,
+	//! ab`+TAB`, ab ` on both sides. The one residual is a trailing NUL: the
+	//! binary comparison pads with 0x00, so `ab` and `ab`+NUL tie. The key is not
+	//! sargable, so the optimizer uses it only under a LIMIT (review of #387).
+	//! Not `char(n)`: it is stored blank-padded and read trimmed, so its bytes
+	//! are not the values DuckDB orders (`ab` + TAB is stored `ab\t ` and sorts
+	//! before `ab  `). Not `varchar(max)`: a sort on an unbounded key.
 	bool OrdersLikeDuckDBAsBytes() const;
 
 	// Map SQL Server type to DuckDB LogicalType

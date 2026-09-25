@@ -399,6 +399,21 @@ SELECT a, b FROM opd4.dbo.order_pushdown_comp WHERE a >= 2 ORDER BY k LIMIT 2;
 2	1
 2	2
 
+# LIMIT 6000 over a small table stays LIMIT -> ORDER (DuckDB folds a TopN only
+# for a small N), whose TOP is refused for the client-side filter; the inner
+# ORDER BY is then pushed in full and its order-only column pruned -- which must
+# keep the column the client-side filter reads. (Review of #387 found the
+# prune blind to table_filters; FilterFloor now keeps them. No plan shape found
+# puts a filter-only column at a trailing position -- DuckDB keeps it out of
+# the projection -- so this pins the shape, not the guard.)
+query I
+SELECT b FROM opd4.dbo.order_pushdown_comp WHERE rowid.a >= 2 ORDER BY k NULLS FIRST, a LIMIT 6000;
+----
+1
+2
+1
+2
+
 statement ok
 SELECT mssql_exec('opd4', 'DROP TABLE dbo.order_pushdown_comp');
 

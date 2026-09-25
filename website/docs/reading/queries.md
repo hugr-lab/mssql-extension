@@ -31,8 +31,9 @@ Supported filter operations for pushdown:
 - Date/timestamp comparisons: `date_col >= '2024-01-01'`
 - Boolean comparisons: `is_active = true` (converted to `= 1`)
 - **Mapped functions** inside predicates:
-  - strings: `lower`, `upper`, `trim`, `ltrim`, `rtrim`
-  - dates: `year`, `month`, `day`, `hour`, `minute`, `second`
+  - dates: `year`, `month`, `day`, `hour`, `minute`, `second` — not over a
+    `datetimeoffset`, whose date parts the server takes in the value's own
+    offset and DuckDB in the session time zone
   - arithmetic: `+ - * %`, negation
   - substring matching: `prefix`/`suffix`/`contains` and their
     case-insensitive variants translate to `LIKE` (constant patterns) —
@@ -41,7 +42,10 @@ Supported filter operations for pushdown:
 
 **Not pushed down** (applied locally by DuckDB): unmapped functions —
 `list_contains()`, `regexp_matches()`, and anything else without a T-SQL
-mapping. An expression the encoder cannot translate stays in DuckDB; results
+mapping. That includes the string functions `lower`, `upper`, `trim`, `ltrim`,
+`rtrim` and `length`: SQL Server's versions do not return DuckDB's results
+(`UPPER('ß')` stays `ß`, DuckDB's `upper` gives `ẞ`), and a pushed
+`upper(name) = 'STRAẞE'` would have lost the row. An expression the encoder cannot translate stays in DuckDB; results
 are unchanged either way.
 
 Some functions are unmapped **on purpose**, because the T-SQL form would
@@ -97,15 +101,17 @@ only when SQL Server sorts it the way DuckDB would:
   `datetime2`, which DuckDB reads as nanosecond timestamps and whose values
   outside 1677–2262 (the `9999-12-31` end of a temporal table's period) it
   reads as NULL;
-- a `varchar` / `char` under a **UTF-8** collation (any: `_BIN2_UTF8`, such as
-  the extension's CTAS default, or a case-insensitive `_UTF8` one), and only
-  **under a LIMIT**: it is ordered by its bytes, `CAST(col AS varbinary(max))`,
-  which is DuckDB's order. The one remaining difference is a trailing NUL
+- a bounded `varchar(n)` under a **UTF-8** collation (any: `_BIN2_UTF8`, such
+  as the extension's CTAS default, or a case-insensitive `_UTF8` one), and only
+  **under a LIMIT**: it is ordered by its bytes, `CAST(col AS varbinary(n))`,
+  which is DuckDB's order. Not `char(n)`, which is stored blank-padded and read
+  trimmed, and not `varchar(max)`. The one remaining difference is a trailing NUL
   character, which the server's comparison ignores (`ab` and `ab` + NUL tie).
   Ordered as text the server would pad with spaces — `ab` equal to `ab `, and
   `ab` + TAB before `ab` — hence the bytes; and since a key over bytes cannot
   use an index, a plain ORDER BY on the column is left to DuckDB;
-- never a code-page `varchar` (its bytes are the code page's), an `nvarchar` /
+- never a code-page `varchar` (its bytes are the code page's), a `char(n)`, a
+  `varchar(max)`, an `nvarchar` /
   `nchar` under any collation (UTF-16 order puts a character above the BMP, an
   emoji, before U+E000–U+FFFF; DuckDB after), a string-valued function of a key
   (`upper(name)`), a date part of a `datetimeoffset` (the server takes it in

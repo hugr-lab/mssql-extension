@@ -308,12 +308,14 @@ static void TestSearchConditionRefusedInValuePosition() {
 		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, ColRef(fx, COL_FLAG), std::move(inner_cond));
 	ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(*cmp_operand, ctx));
 
-	// FUNCTION ARGUMENT — lower(id > 5).
+	// FUNCTION ARGUMENT — year(id > 5). A MAPPED function, so the refusal is
+	// the argument's, not the mapping's (lower/upper are no longer mapped,
+	// review of #387).
 	auto inner2 = BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, ColRef(fx, COL_ID),
 													Const(Value::INTEGER(5)));
-	auto fn_arg = Call1("lower", LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(inner2));
+	auto fn_arg = Call1("year", LogicalType::TIMESTAMP, LogicalType::BIGINT, std::move(inner2));
 	auto fn_cmp =
-		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, std::move(fn_arg), Const(Value("x")));
+		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, std::move(fn_arg), Const(Value::BIGINT(1)));
 	ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(*fn_cmp, ctx));
 
 	// BETWEEN input — the third position the previous round asked for, which did
@@ -341,10 +343,18 @@ static void TestSearchConditionRefusedInValuePosition() {
 		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, ColRef(fx, COL_ID), Const(Value::INTEGER(7)));
 	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*ok_plain, ctx), "([id] = 7)");
 
-	auto ok_fn = Call1("lower", LogicalType::VARCHAR, LogicalType::VARCHAR, ColRef(fx, COL_NAME));
-	auto ok_fn_cmp =
-		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, std::move(ok_fn), Const(Value("x")));
-	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*ok_fn_cmp, ctx), "(LOWER([name]) = N'x')");
+	// A mapped function over a column still encodes (TestDatePartOverPrecisionCast covers
+	// year() in full). lower/upper/trim are refused as functions: the server's
+	// case mapping is not DuckDB's -- UPPER('ß') stays 'ß' -- so a pushed
+	// comparison lost rows (review of #387).
+	auto lower_fn = Call1("lower", LogicalType::VARCHAR, LogicalType::VARCHAR, ColRef(fx, COL_NAME));
+	auto lower_cmp =
+		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, std::move(lower_fn), Const(Value("x")));
+	ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(*lower_cmp, ctx));
+	auto upper_fn = Call1("upper", LogicalType::VARCHAR, LogicalType::VARCHAR, ColRef(fx, COL_NAME));
+	auto upper_cmp =
+		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, std::move(upper_fn), Const(Value("X")));
+	ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(*upper_cmp, ctx));
 }
 
 //==============================================================================

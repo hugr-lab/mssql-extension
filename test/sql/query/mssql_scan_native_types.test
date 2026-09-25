@@ -133,8 +133,37 @@ SELECT trim(c), v FROM mssql_scan('snt16', 'SELECT c, v FROM dbo.snt_src', prepa
 ----
 xy	abc
 
+# Past the 4000 characters nvarchar holds inline the transcoded column arrives
+# as nvarchar(max): still the declared varchar(6000), not a changed shape.
+statement ok
+SELECT mssql_exec('snt16', 'DROP TABLE IF EXISTS dbo.snt_wide;
+	CREATE TABLE dbo.snt_wide (w varchar(6000) COLLATE Latin1_General_100_BIN2_UTF8 NULL);
+	INSERT INTO dbo.snt_wide VALUES (''wide'')');
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt16', 'SELECT w FROM dbo.snt_wide'));
+----
+w	MSSQL_VARCHAR(6000)
+
+query T
+SELECT w FROM mssql_scan('snt16', 'SELECT w FROM dbo.snt_wide');
+----
+wide
+
+statement ok
+SELECT mssql_exec('snt16', 'DROP TABLE dbo.snt_wide');
+
 statement ok
 DETACH snt16;
+
+# A batch the server cannot describe runs at bind: its string columns are
+# typed from COLMETADATA as the prepared path's are -- an nvarchar with its
+# length, a varchar plain.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'CREATE TABLE #t (n nvarchar(30), v varchar(10)); INSERT #t VALUES (N''x'', ''y''); SELECT n, v FROM #t'));
+----
+n	MSSQL_NVARCHAR(30)
+v	VARCHAR
 
 statement ok
 RESET mssql_utf8_support;

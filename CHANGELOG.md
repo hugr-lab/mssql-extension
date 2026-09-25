@@ -84,14 +84,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     does: numeric, `bit` and date/time types (not `datetime2(7)`, whose
     out-of-range values DuckDB reads as NULL). A `varchar` / `char` under a
     UTF-8 collation is pushed only under a LIMIT, as its bytes
-    (`CAST(col AS varbinary(max))`): as text the server pads with spaces, so
-    `ab` + TAB would sort before `ab`. Not `nvarchar`, even under `_BIN2`: its
+    (`CAST(col AS varbinary(n))`, bounded `varchar` only — `char(n)` is read
+    trimmed): as text the server pads with spaces, so `ab` + TAB would sort
+    before `ab`. Not `nvarchar`, even under `_BIN2`: its
     UTF-16 order puts a character above the BMP before U+E000–U+FFFF, DuckDB
     after. Never a string-valued function (`upper(name)`) or a date part of a
     `datetimeoffset`.
   - **Never pushed:** `uniqueidentifier` (SQL Server compares its last six
     bytes first), `binary` / `varbinary` (compared zero-padded, so `0x01` =
     `0x0100`), `json`, `sql_variant`.
+- **`upper()` / `lower()` in a filter could lose rows.** They were pushed to
+  SQL Server, whose case mapping is not DuckDB's: `WHERE upper(name) =
+  'STRAẞE'` found nothing, because the server's `UPPER('ß')` is `ß`. They are
+  now applied by DuckDB, as `length()` already was; `trim`, `ltrim` and
+  `rtrim` with them. A date part of a `datetimeoffset` is no longer pushed
+  either: the server takes it in the value's own offset.
 - **ORDER BY … LIMIT under-returned when a filter ran client-side.** With
   `mssql_order_pushdown` on, the TOP N went to the server while a filter the
   extension cannot translate (a `rowid` field of a composite key) was applied

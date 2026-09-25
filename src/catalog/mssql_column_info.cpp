@@ -367,13 +367,13 @@ bool MSSQLColumnInfo::OrdersLikeDuckDB() const {
 }
 
 bool MSSQLColumnInfo::OrdersLikeDuckDBAsBytes() const {
-	if (is_cast_required || !is_utf8) {
+	if (is_cast_required || !is_utf8 || max_length <= 0) {
 		return false;
 	}
 	string lower_type = sql_type_name;
 	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
 				   [](unsigned char c) { return std::tolower(c); });
-	return lower_type == "varchar" || lower_type == "char";
+	return lower_type == "varchar";
 }
 
 bool MSSQLColumnInfo::IsSpatialType(const string &sql_type_name) {

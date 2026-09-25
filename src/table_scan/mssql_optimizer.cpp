@@ -379,7 +379,7 @@ static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const L
 								(unsigned long long)i, source_column.c_str());
 				break;	// Stop at first non-pushable column (prefix only)
 			}
-			fragment = "CAST(" + fragment + " AS varbinary(max))";
+			fragment = "CAST(" + fragment + " AS varbinary(" + std::to_string(column.max_length) + "))";
 		}
 		const bool is_nullable = column.is_nullable;
 
@@ -443,12 +443,32 @@ static void CollectGetReferences(const Expression &expr, unordered_set<idx_t> &r
 // Safety: only prunes trailing positions (beyond max_needed). Non-trailing
 // unused positions would shift indices and break parent bindings.
 //------------------------------------------------------------------------------
+// The fewest column_ids the Get may keep: one past the highest position a
+// TableFilter addresses. The filters are keyed by position in column_ids --
+// pushed ones and the client-side net's alike -- so cutting below it made
+// FilterEncoder::Encode throw "filter column N outside projection" (review of
+// #387: a filter-only column at a trailing position).
+static idx_t FilterFloor(const LogicalGet &get) {
+	idx_t floor = 0;
+	for (const auto &entry : get.table_filters) {
+		floor = MaxValue<idx_t>(floor, entry.GetIndex() + 1);
+	}
+	return floor;
+}
+
 static void TryPruneOrderByOnlyColumns(const vector<idx_t> &projection_map, MSSQLScanInfo &scan_info) {
 	// Empty projection_map means everything is referenced (identity pass-through)
 	if (projection_map.empty()) {
 		MSSQL_OPT_DEBUG(2, "Projection pruning: skipped (empty projection_map = all referenced)");
 		return;
 	}
+	// With projection_ids the Get's output is not its column_ids, and the
+	// positions below would count the wrong thing.
+	if (!scan_info.get->projection_ids.empty()) {
+		MSSQL_OPT_DEBUG(2, "Projection pruning: skipped (Get has projection_ids)");
+		return;
+	}
+	const idx_t filter_floor = FilterFloor(*scan_info.get);
 
 	// Build set of needed positions and find the maximum
 	unordered_set<idx_t> needed_positions(projection_map.begin(), projection_map.end());
@@ -513,20 +533,27 @@ static void TryPruneOrderByOnlyColumns(const vector<idx_t> &projection_map, MSSQ
 			}
 		}
 
-		if (can_truncate_get && max_get_ref + 1 < mut_col_ids.size()) {
+		const idx_t keep = MaxValue<idx_t>(max_get_ref + 1, filter_floor);
+		if (can_truncate_get && keep < mut_col_ids.size()) {
 			idx_t old_get_size = mut_col_ids.size();
-			mut_col_ids.resize(max_get_ref + 1);
+			mut_col_ids.resize(keep);
 			MSSQL_OPT_DEBUG(1, "Projection pruning: truncated Get column_ids %llu -> %llu",
-							(unsigned long long)old_get_size, (unsigned long long)(max_get_ref + 1));
+							(unsigned long long)old_get_size, (unsigned long long)keep);
 		}
 	} else {
 		// Case A: ORDER -> Get (no Projection)
 		// Directly truncate Get column_ids
+		// A filter column past the needed ones stays: the ORDER node's parent
+		// reads positions below new_size only, so a trailing extra is harmless.
 		auto &mut_col_ids = scan_info.get->GetMutableColumnIds();
 		idx_t old_size = mut_col_ids.size();
-		mut_col_ids.resize(new_size);
+		const idx_t keep = MaxValue<idx_t>(new_size, filter_floor);
+		if (keep >= old_size) {
+			return;
+		}
+		mut_col_ids.resize(keep);
 		MSSQL_OPT_DEBUG(1, "Projection pruning: truncated Get column_ids %llu -> %llu", (unsigned long long)old_size,
-						(unsigned long long)new_size);
+						(unsigned long long)keep);
 	}
 }
 
@@ -567,12 +594,13 @@ static void TryPushOrderBy(ClientContext &context, unique_ptr<LogicalOperator> &
 		return;
 	}
 
-	// Store ORDER BY clause in bind_data
-	bind_data.order_by_clause = order_clause;
-	MSSQL_OPT_DEBUG(1, "ORDER BY clause: %s", order_clause.c_str());
-
-	// Full pushdown: remove LogicalOrder from plan, keep Projection if present
+	// Full pushdown: push the clause and remove LogicalOrder from the plan, keep
+	// Projection if present. A partial one pushes nothing (review of #387):
+	// DuckDB's sort stays and orders every key anyway, so a server sort on the
+	// prefix would be work for nothing.
 	if (pushed == order.orders.size()) {
+		bind_data.order_by_clause = order_clause;
+		MSSQL_OPT_DEBUG(1, "ORDER BY clause: %s", order_clause.c_str());
 		// Capture projection_map BEFORE destroying LogicalOrder
 		vector<idx_t> projection_map(order.projection_map.begin(), order.projection_map.end());
 
@@ -585,7 +613,7 @@ static void TryPushOrderBy(ClientContext &context, unique_ptr<LogicalOperator> &
 			TryPruneOrderByOnlyColumns(projection_map, pruned_scan_info);
 		}
 	} else {
-		MSSQL_OPT_DEBUG(1, "Partial ORDER BY pushdown (%llu/%llu columns) - keeping LogicalOrder",
+		MSSQL_OPT_DEBUG(1, "Partial ORDER BY (%llu/%llu columns) - nothing pushed, keeping LogicalOrder",
 						(unsigned long long)pushed, (unsigned long long)order.orders.size());
 	}
 }

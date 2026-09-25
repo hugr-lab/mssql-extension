@@ -1010,6 +1010,19 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 	// Encode all arguments
 	auto child_ctx = ctx.child();
 	const bool datepart = IsDatePartFunction(func_name);
+	// A date part of a datetimeoffset is taken in the value's own offset by the
+	// server and in the session TimeZone by DuckDB (measured: HOUR of 12:00
+	// +05:00 is 12 there, 7 in UTC here), so a pushed `hour(dto) = 12` would
+	// match other rows than DuckDB's (review of #387).
+	if (datepart) {
+		for (const auto &child : expr.GetChildren()) {
+			if (child->GetReturnType().id() == LogicalTypeId::TIMESTAMP_TZ) {
+				MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: %s of a TIMESTAMP WITH TIME ZONE not pushed",
+									   func_name.c_str());
+				return {"", false};
+			}
+		}
+	}
 	std::vector<std::string> encoded_args;
 	for (const auto &child : expr.GetChildren()) {
 		const Expression *arg = child.get();

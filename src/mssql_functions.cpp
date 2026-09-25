@@ -307,18 +307,37 @@ static int16_t StringMaxLengthOf(const tds::ColumnMetadata &col) {
 	return col.max_length == 0xFFFF ? int16_t(-1) : static_cast<int16_t>(col.max_length);
 }
 
+// The type a string column can be reported as from its COLMETADATA alone --
+// sp_prepare's answer, or a statement run at bind: an nchar / nvarchar gets its
+// MSSQL_NVARCHAR(n) (the annotation needs no collation there), and a column
+// whose collation is UTF-8 stays plain VARCHAR, whatever it travelled as: its
+// annotation needs the collation's NAME, and without UTF8SUPPORT a UTF-8
+// varchar arrives as nvarchar, so the wire kind would be the wrong one (review
+// of #387). A code-page varchar is plain VARCHAR anyway.
+static LogicalType WireStringType(const tds::ColumnMetadata &col, bool native_types) {
+	const LogicalType stream_type = tds::encoding::TypeConverter::GetDuckDBType(col);
+	const string base = StringBaseOf(col);
+	if (base.empty() || col.IsUtf8Collation()) {
+		return stream_type;
+	}
+	return NativeStringType(stream_type, native_types, base, StringMaxLengthOf(col), string());
+}
+
 // The stream decodes a string column as plain VARCHAR; the bind may have
 // reported it as MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n), the same physical type
-// with a name on it (spec 060). Those agree when the stream's column holds the
-// n characters the name states: a varchar(10) that came back varchar(20) is a
-// changed shape, and a plan built on the bound length would hand a CTAS a
-// column too narrow for what arrives. The KIND is not compared: the bind names
-// the DECLARED type and the stream carries the WIRE type, and a UTF-8 varchar
-// travels as nvarchar whenever UTF8SUPPORT was not granted at login
-// (mssql_utf8_support = false, an endpoint that ignores it) -- the same
-// column, transcoded (review of #387). Nor the collation: COLMETADATA carries
-// it as an id, not a name.
-static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQLResultStream &stream) {
+// with a name on it (spec 060). Those agree when the stream's column is the one
+// the name states -- same kind, same length: a varchar(10) that came back
+// varchar(20), or a varchar that came back an nvarchar, is a changed shape, and
+// a plan built on the bound type would hand a CTAS a column that does not fit
+// what arrives. One exception (review of #387): a UTF-8 varchar travels as
+// nvarchar when the server did not grant UTF8SUPPORT -- the bind names the
+// DECLARED type, the stream carries the wire one -- as nvarchar(n), or
+// nvarchar(max) past the 4000 characters nvarchar holds inline. Accepted only
+// when the column's collation is UTF-8 and the login was not granted the
+// feature (`utf8_granted` false). The collation itself is not compared:
+// COLMETADATA carries it as an id, not a name.
+static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQLResultStream &stream,
+									bool utf8_granted) {
 	auto &types = stream.GetColumnTypes();
 	auto &metadata = stream.GetColumnMetadata();
 	if (bound.size() != types.size() || metadata.size() != types.size()) {
@@ -341,8 +360,22 @@ static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQ
 		}
 		const bool unicode = base == "nchar" || base == "nvarchar";
 		const int16_t max_length = StringMaxLengthOf(metadata[i]);
-		const int32_t length = max_length < 0 ? mssql::codec::MAX_LENGTH : (unicode ? max_length / 2 : max_length);
-		if (spec.length != length) {
+		const bool stream_max = max_length < 0;
+		const int32_t length = stream_max ? mssql::codec::MAX_LENGTH : (unicode ? max_length / 2 : max_length);
+		if (spec.unicode == unicode) {
+			if (spec.length != length) {
+				return false;
+			}
+			continue;
+		}
+		const bool transcoded = !spec.unicode && unicode && !utf8_granted && metadata[i].IsUtf8Collation();
+		if (!transcoded) {
+			return false;
+		}
+		const bool fits =
+			stream_max ? (mssql::codec::IsMaxLength(spec.length) || spec.length > mssql::codec::MAX_NVARCHAR_LENGTH)
+					   : spec.length == length;
+		if (!fits) {
 			return false;
 		}
 	}
@@ -471,35 +504,32 @@ static MSSQLDescribedShape PrepareStatement(tds::TdsConnection &connection, cons
 		const bool utf8_text = !base.empty() && col.IsUtf8Collation();
 		needs_describe.push_back(utf8_text);
 		any_needs_describe = any_needs_describe || utf8_text;
-		shape.types.push_back(NativeStringType(tds::encoding::TypeConverter::GetDuckDBType(col), native_types, base,
-											   StringMaxLengthOf(col), string()));
+		shape.types.push_back(WireStringType(col, native_types));
 		shape.names.push_back(col.name);
 	}
 	shape.ok = true;
 	// COLMETADATA carries a collation as an id, not the name the annotation
-	// needs, so the describe is asked for those columns -- one round trip more
-	// at bind, only when there is one, for a statement compiled once. It names
-	// exactly the types the default (described) path would, so `prepared :=
-	// true` does not change what a CTAS from the scan creates. Taken per column
-	// and only where the NAME at that position agrees: the describe skips
-	// hidden columns, so a position alone could graft one column's type onto
-	// another. Advisory: a describe that fails or throws leaves those columns
-	// as they are, never the bind -- sp_prepare has already answered, and its
-	// handle is the caller's (review of #387).
+	// needs, so the describe is asked for the UTF-8 columns -- one round trip
+	// more at bind, only when there is one, for a statement compiled once. It
+	// names exactly the types the default (described) path would, so `prepared
+	// := true` does not change what a CTAS from the scan creates. Taken column by
+	// column in step with COLMETADATA, and only while the NAMES agree: the
+	// describe skips hidden columns, so past the first disagreement positions
+	// no longer correspond and nothing more is taken (review of #387). A
+	// column not confirmed by the describe keeps the plain VARCHAR WireStringType
+	// gave it -- never a guessed annotation. A describe the server refuses
+	// (`ok` false) changes nothing; an exception -- a cancel, a timeout, a lost
+	// connection -- is the bind's, as it would be for any query it runs.
 	if (native_types && any_needs_describe) {
-		try {
-			auto described = DescribeFirstResultSet(connection, statement, declarations, timeout_ms, true);
-			if (described.ok) {
-				for (idx_t i = 0; i < shape.types.size() && i < described.types.size(); i++) {
-					if (needs_describe[i] && described.names[i] == shape.names[i] &&
-						described.types[i].id() == LogicalTypeId::VARCHAR) {
-						shape.types[i] = described.types[i];
-					}
+		auto described = DescribeFirstResultSet(connection, statement, declarations, timeout_ms, true);
+		if (described.ok) {
+			for (idx_t i = 0; i < shape.types.size() && i < described.types.size(); i++) {
+				if (described.names[i] != shape.names[i]) {
+					break;
 				}
-			}
-		} catch (...) {
-			if (connection.GetState() != tds::ConnectionState::Idle) {
-				throw;
+				if (needs_describe[i] && described.types[i].id() == LogicalTypeId::VARCHAR) {
+					shape.types[i] = described.types[i];
+				}
 			}
 		}
 	}
@@ -669,7 +699,13 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 		std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - exec_start).count();
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: query executed in %ldms", (long)exec_ms);
 
-	return_types = result_stream->GetColumnTypes();
+	// Typed from COLMETADATA as the prepared path is: nchar / nvarchar with
+	// their length, a UTF-8 or code-page varchar plain VARCHAR (review of #387:
+	// this path reported every string column plain).
+	return_types.clear();
+	for (const auto &col : result_stream->GetColumnMetadata()) {
+		return_types.push_back(WireStringType(col, native_types));
+	}
 	names.clear();
 	for (const auto &name : result_stream->GetColumnNames()) {
 		names.push_back(Identifier(name));
@@ -840,7 +876,8 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 			stream = executor.Execute(context, bind_data.execute_sql);
 		}
 		stream->SurfaceWarnings(context);
-		if (!StreamMatchesBoundShape(bind_data.return_types, *stream)) {
+		if (!StreamMatchesBoundShape(bind_data.return_types, *stream,
+									 mssql_catalog.UTF8SupportState() == MSSQLCatalog::Utf8Support::Granted)) {
 			// The described shape is what the plan was built on; serving rows of
 			// another shape would be a silent wrong answer.
 			throw InvalidInputException(

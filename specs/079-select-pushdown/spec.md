@@ -191,9 +191,13 @@ silently disable pushdown for the first statement against every table.
   string-valued function of a key is never pushed, nor a date part of a
   `datetimeoffset`. As TEXT even a `_BIN2_UTF8` column pads with spaces (`ab`
   = `ab `, `ab`+TAB before `ab`, measured), so a UTF-8 `varchar` is ordered
-  by its BYTES, `CAST(col AS varbinary(max))` — DuckDB's order, measured,
+  by its BYTES, `CAST(col AS varbinary(n))` — DuckDB's order, measured,
   trailing NUL the one tie — and, that key not being sargable, only under a
-  LIMIT (owner, PR A review). No `COLLATE` forcing (owner, § 8.4).
+  LIMIT (owner, PR A review); a bounded `varchar` only (`char(n)` is read
+  trimmed, so its stored bytes are not DuckDB's values). The same rule
+  applies to filters: no string function is pushed (`UPPER('ß')` is `ß` on
+  the server, `ẞ` in DuckDB — a lost row), nor a date part of a
+  `datetimeoffset`. No `COLLATE` forcing (owner, § 8.4).
 - Literals spelled per column (§ 8.3.1, #361).
 - No strict forms, no re-check: § 8.5's `DATALENGTH` pair stays in the
   record as the measured form should strictness ever be asked for.
