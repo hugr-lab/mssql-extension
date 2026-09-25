@@ -43,7 +43,9 @@ class MSSQLTableEntry;
 
 class MSSQLTransactionMetadata {
 public:
-	explicit MSSQLTransactionMetadata(unique_ptr<MSSQLMetadataCache> cache);
+	//! `shared_epoch`: the shared cache's invalidation epoch when this
+	//! transaction first needed metadata of its own (issue #383).
+	MSSQLTransactionMetadata(unique_ptr<MSSQLMetadataCache> cache, uint64_t shared_epoch);
 	~MSSQLTransactionMetadata();
 
 	MSSQLTransactionMetadata(const MSSQLTransactionMetadata &) = delete;
@@ -82,6 +84,13 @@ public:
 	//! MarkChanged with an empty schema was called: even the schema list may differ.
 	bool IsAllChanged();
 
+	//! The tables this transaction loaded itself: what is published into the
+	//! shared cache once the transaction has ended (issue #383).
+	std::set<std::pair<string, string>> GetLoadedTables();
+	uint64_t SharedEpochAtStart() const {
+		return shared_epoch_;
+	}
+
 	//! What the shared cache must forget when the transaction ends.
 	struct Changes {
 		bool all = false;
@@ -102,6 +111,7 @@ private:
 	bool locally_changed_ = false;
 	std::set<string> changed_schemas_;
 	std::set<Key> changed_tables_;
+	const uint64_t shared_epoch_;
 };
 
 }  // namespace duckdb

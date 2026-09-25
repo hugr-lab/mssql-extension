@@ -20,8 +20,11 @@ require-env MSSQL_TESTDB_DSN
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS ft76 (TYPE mssql);
 
-# ATTACH built ONE pool and logged in once through it (the eager validation
-# connection is not pooled). Before: two pools, the first thrown away.
+# ATTACH logged in ONCE: its eager validation is the pool's first login
+# (issue #324, review of #386), and the collation query reuses that
+# connection, so the pool counts exactly one. A validation outside the pool
+# would not show here -- it never reached the pool's counters -- which is why
+# the validation now goes through it.
 query I
 SELECT connections_created FROM mssql_pool_stats('ft76');
 ----

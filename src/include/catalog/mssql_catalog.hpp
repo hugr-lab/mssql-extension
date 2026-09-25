@@ -1,5 +1,7 @@
 #pragma once
 
+#include <set>
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -43,6 +45,22 @@ class LogicalUpdate;
 // Write access (DDL operations) can be disabled by attaching with READ_ONLY.
 //===----------------------------------------------------------------------===//
 
+//! What Initialize does with the server at ATTACH (issue #324). Passed to
+//! the constructor, not set afterwards: an order-dependent setter called
+//! after Initialize would be ignored without a word (review of #386).
+struct MSSQLCatalogStartup {
+	//! Validate the credentials now by taking the pool's first connection
+	//! -- the login IS the check, and the connection stays in the pool.
+	//! Off under lazy_validation.
+	bool validate = false;
+	//! Dial / login-read timeout for that first connection; 0 inherits
+	//! mssql_connection_timeout (mssql_attach_validation_timeout).
+	int validation_timeout_seconds = 0;
+	//! Open mssql_min_connections up front, concurrently (Prewarm). Off
+	//! under lazy_validation.
+	bool prewarm = false;
+};
+
 class MSSQLCatalog : public Catalog {
 public:
 	// Constructor (spec 047: catalog owns its connection pool; sole strong ref —
@@ -54,7 +72,7 @@ public:
 	// mssql_scan/mssql_exec)
 	MSSQLCatalog(AttachedDatabase &db, const string &context_name, shared_ptr<MSSQLConnectionInfo> connection_info,
 				 tds::PoolConfiguration pool_config, std::vector<uint8_t> fedauth_token_utf16le, AccessMode access_mode,
-				 bool catalog_enabled = true);
+				 bool catalog_enabled = true, MSSQLCatalogStartup startup = MSSQLCatalogStartup());
 
 	// noexcept (spec 047 T046k): defaulted body destructs the per-catalog
 	// pool (catalog holds the sole strong reference) and other owned members,
@@ -119,6 +137,37 @@ public:
 	//! MSSQLTransactionMetadata::MarkChangedLocally for the current transaction;
 	//! a no-op in autocommit.
 	void NoteTransactionChangeLocally(ClientContext &context);
+
+	//! Issue #383: at COMMIT and ROLLBACK, publish into the shared metadata
+	//! cache what the transaction loaded on its pinned connection and did not
+	//! change -- committed state, already in memory, so no round trip (review
+	//! of #386: the reload it replaces ran a metadata query on COMMIT's path,
+	//! where another session's uncommitted DDL could hold it for the metadata
+	//! timeout). Not what it changed (forgotten instead, as before), nothing
+	//! after a change it cannot see through, nothing under READ UNCOMMITTED
+	//! (its reads may be uncommitted state), nothing the table filter hides,
+	//! and nothing if the shared cache was invalidated since the transaction
+	//! began loading (PublishTableMetadata) -- which any DDL through the
+	//! catalog does, the transaction's own included: coarse on purpose, and a
+	//! DDL-free transaction, the common one, is unaffected. The schema list it
+	//! loaded goes with it (PublishSchemaNames), and each table's row count
+	//! with the table. A pool of one is no
+	//! exception: nothing is dialled.
+	void PublishTransactionMetadata(MSSQLTransactionMetadata &metadata) noexcept;
+
+	//! Why the ATTACH-time Prewarm opened fewer than mssql_min_connections, or
+	//! "" -- for the ATTACH to log; the pool itself stays healthy.
+	const string &GetPrewarmShortfall() const {
+		return prewarm_shortfall_;
+	}
+	//! mssql_preload_catalog's body, and the `preload` ATTACH option's (issue
+	//! #324: run by the ATTACH itself, where DuckLake's METADATA_PARAMETERS can
+	//! reach it and a function call cannot) -- ONE implementation, so both keep
+	//! the #380 refusal inside a transaction and the session's cache settings
+	//! (review of #386: the ATTACH copy had dropped both). `caller` names the
+	//! entry point in the errors. Throws on failure: it was asked for.
+	void Preload(ClientContext &context, const string &schema_name, const char *caller, idx_t &schema_count,
+				 idx_t &table_count, idx_t &column_count);
 
 	//! The pool's connection limit, fixed at ATTACH.
 	idx_t GetConnectionLimit() const;
@@ -403,6 +452,9 @@ private:
 
 	// Query database default collation
 	void QueryDatabaseCollation();
+	//! Startup::validate: take the pool's first connection (the login is the
+	//! check), prove the TLS data path with SELECT 1, give it back to the pool.
+	void ValidateThroughPool();
 
 	//===----------------------------------------------------------------------===//
 	// Member Variables
@@ -413,8 +465,15 @@ private:
 	tds::PoolConfiguration pool_config_;			   // Pool config (spec 047)
 	std::vector<uint8_t> fedauth_token_utf16le_;	   // FEDAUTH token (spec 047)
 	AccessMode access_mode_;						   // READ_ONLY enforced
-	bool catalog_enabled_;							   // Catalog integration enabled
-	MSSQLCatalogFilter catalog_filter_;				   // Regex visibility filter
+	MSSQLCatalogStartup startup_;
+	string prewarm_shortfall_;
+	// The dial and login-read timeout every factory reads per login. Shared so
+	// the ATTACH-time validation can give the pool's FIRST login
+	// mssql_attach_validation_timeout without a second factory (review of #386:
+	// validation goes through the pool).
+	std::shared_ptr<std::atomic<int>> connect_timeout_;
+	bool catalog_enabled_;				 // Catalog integration enabled
+	MSSQLCatalogFilter catalog_filter_;	 // Regex visibility filter
 	// Connection pool (per-catalog, spec 047). shared_ptr, but the catalog holds
 	// the ONLY strong reference — teardown stays deterministic at ~MSSQLCatalog.
 	// Result streams hold weak_ptr handles (issue #178 review); a transient
