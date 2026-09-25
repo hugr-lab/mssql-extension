@@ -146,6 +146,35 @@ cannot run inside a transaction that has used an MSSQL catalog
 statement ok
 ROLLBACK;
 
+# Reading the SCHEMA LIST does not count as using the catalog (review of
+# db73be6). LookupSchema and ScanSchemas both go through SchemaListCache, which
+# used to ask MSSQLTransaction::Get(...).Metadata(...) unconditionally -- and
+# that CREATES this catalog's transaction, so a schema lookup that answered from
+# the shared list and took no connection still flipped
+# HasUsedAnyMSSQLCatalogInTransaction and got the preload above refused.
+#
+# The list is warmed in autocommit first, so the read inside the transaction is
+# a pure cache hit: if the shortcut ever stops applying, the load takes a
+# connection, the transaction is created after all, and the preload fails here.
+query I
+SELECT count(*) > 0 FROM duckdb_schemas() WHERE database_name = 'tm380';
+----
+true
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) > 0 FROM duckdb_schemas() WHERE database_name = 'tm380';
+----
+true
+
+statement ok
+SELECT mssql_preload_catalog('tm380');
+
+statement ok
+ROLLBACK;
+
 # mssql_exec DDL detection is word-based (review of #382): a keyword inside a
 # literal is not DDL, so it does not make the transaction distrust the shared
 # cache. The table is in the shared cache (read above in autocommit); the lever

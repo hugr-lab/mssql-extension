@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include "catalog/mssql_transaction.hpp"
 #include "codec/target_string_type.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 #include "azure/azure_fedauth.hpp"
 #include "azure/azure_token.hpp"
@@ -600,6 +601,23 @@ MSSQLMetadataCache &MSSQLCatalog::SchemaListCache(ClientContext *context) {
 	// load goes into the transaction's own cache, never the shared one. A shared
 	// list already loaded is committed state and good to read, unless the
 	// transaction changed "anything" (mssql_exec DDL), which may mean schemas.
+	//
+	// Ask non-creatingly first (review of db73be6): MSSQLTransaction::Get ->
+	// MetaTransaction::GetTransaction CREATES this catalog's transaction, and a
+	// transaction that has not touched MSSQL yet has no transaction-local view to
+	// consult -- there is nothing to create it FOR. Creating it here would also
+	// flip HasUsedAnyMSSQLCatalogInTransaction, so any schema lookup DuckDB makes
+	// against an attached MSSQL catalog (search-path resolution, duckdb_schemas(),
+	// a "did you mean" scan) would refuse mssql_refresh_cache /
+	// mssql_preload_catalog for a transaction that has taken no connection -- the
+	// very case issue #380's refusal was narrowed to allow. The shortcut is
+	// limited to an already-LOADED shared list: that is committed state and
+	// answers with no connection. Anything else falls through and creates the
+	// transaction exactly as before, so a LOAD still lands in its cache.
+	if (metadata_cache_->GetSchemasState() == CacheLoadState::LOADED &&
+		!MetaTransaction::Get(*context).TryGetTransaction(GetAttached())) {
+		return *metadata_cache_;
+	}
 	auto &metadata = MSSQLTransaction::Get(*context, *this).Metadata(*context);
 	if (!metadata.IsAllChanged() && metadata_cache_->GetSchemasState() == CacheLoadState::LOADED) {
 		return *metadata_cache_;
