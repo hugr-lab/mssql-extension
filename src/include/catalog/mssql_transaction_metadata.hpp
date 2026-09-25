@@ -43,7 +43,9 @@ class MSSQLTableEntry;
 
 class MSSQLTransactionMetadata {
 public:
-	explicit MSSQLTransactionMetadata(unique_ptr<MSSQLMetadataCache> cache);
+	//! `shared_epoch`: the shared cache's invalidation epoch when this
+	//! transaction first needed metadata of its own (issue #383).
+	MSSQLTransactionMetadata(unique_ptr<MSSQLMetadataCache> cache, uint64_t shared_epoch);
 	~MSSQLTransactionMetadata();
 
 	MSSQLTransactionMetadata(const MSSQLTransactionMetadata &) = delete;
@@ -68,10 +70,7 @@ public:
 	//! This transaction changed the table / the schema / (with an empty schema)
 	//! possibly anything: stop trusting the shared cache for it, and forget what
 	//! this transaction had loaded for it.
-	//! `dropped`: the change was a DROP of the table, which the warm-up after
-	//! COMMIT must not try to load (review of #386). A later change of the
-	//! same name -- a re-CREATE -- clears it.
-	void MarkChanged(const string &schema, const string &table = string(), bool dropped = false);
+	void MarkChanged(const string &schema, const string &table = string());
 	//! What MarkChanged("") does for THIS transaction's lookups -- stop trusting
 	//! the shared cache for anything, drop what was loaded -- without asking the
 	//! shared cache to forget anything at the end. For DDL the extension cannot
@@ -85,17 +84,18 @@ public:
 	//! MarkChanged with an empty schema was called: even the schema list may differ.
 	bool IsAllChanged();
 
-	//! The tables this transaction loaded itself: what the shared cache is
-	//! warmed with once the transaction has ended (issue #383).
+	//! The tables this transaction loaded itself: what is published into the
+	//! shared cache once the transaction has ended (issue #383).
 	std::set<std::pair<string, string>> GetLoadedTables();
+	uint64_t SharedEpochAtStart() const {
+		return shared_epoch_;
+	}
 
 	//! What the shared cache must forget when the transaction ends.
 	struct Changes {
 		bool all = false;
 		std::set<string> schemas;
 		std::set<std::pair<string, string>> tables;
-		//! The subset of `tables` whose last change was a DROP.
-		std::set<std::pair<string, string>> dropped;
 	};
 	Changes GetChanges();
 
@@ -111,7 +111,7 @@ private:
 	bool locally_changed_ = false;
 	std::set<string> changed_schemas_;
 	std::set<Key> changed_tables_;
-	std::set<Key> dropped_tables_;
+	const uint64_t shared_epoch_;
 };
 
 }  // namespace duckdb

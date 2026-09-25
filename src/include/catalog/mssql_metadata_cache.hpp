@@ -173,6 +173,32 @@ public:
 	//! #386).
 	bool TryGetLoadedTableMetadata(const string &schema_name, const string &table_name, MSSQLTableMetadata &out_meta);
 
+	//! Bumped by every invalidation -- a table, a schema, everything, a refresh.
+	//! A transaction reads it when it first loads metadata of its own, so that
+	//! at its end it can tell whether anything was invalidated since (issue
+	//! #383, PublishTableMetadata).
+	uint64_t GetInvalidationEpoch() const {
+		return invalidation_epoch_.load();
+	}
+	//! Issue #383, review of #386: put one table's metadata, loaded by a
+	//! transaction on its pinned connection, into this (the shared) cache -- no
+	//! round trip. Only when nothing was invalidated since `epoch` (a DDL through
+	//! this catalog may have forgotten a name the transaction read before it),
+	//! the schema is known here, and the cache does not already hold the table.
+	//! The row count is not carried: one read inside a transaction may predate
+	//! rows it then wrote, and MSSQLCatalogScanCardinality reads the catalog's
+	//! copy first. Returns whether it was published.
+	bool PublishTableMetadata(const string &schema_name, const MSSQLTableMetadata &meta, uint64_t epoch);
+	//! The schema list, when this cache has it loaded (not expired), and when
+	//! it was loaded -- a transaction's list, for PublishSchemaNames.
+	bool TryGetLoadedSchemaNames(vector<string> &out_names, std::chrono::steady_clock::time_point &out_loaded_at);
+	//! The schema list a transaction loaded, published here when this cache
+	//! has none (never over a loaded one), under the same epoch rule as
+	//! PublishTableMetadata. Without it a published table would not survive the
+	//! first autocommit lookup: loading the list clears the schema map.
+	bool PublishSchemaNames(const vector<string> &names, std::chrono::steady_clock::time_point loaded_at,
+							uint64_t epoch);
+
 	// Load all table metadata for a schema in one bulk query.
 	// If all tables already have columns loaded (e.g. from preload), returns from cache.
 	// Otherwise loads everything with BULK_METADATA_SCHEMA_SQL_TEMPLATE (one round trip).
@@ -381,6 +407,12 @@ private:
 	// trip so partial state is never visible; that also serialises concurrent
 	// metadata loads (correctness over parallel-load throughput).
 	mutable std::mutex mutex_;
+	std::atomic<uint64_t> invalidation_epoch_{0};
+	//! THE cache-hit test for one table: columns loaded and not expired. One
+	//! definition, read by GetTableMetadata, TryGetLoadedTableMetadata and
+	//! PublishTableMetadata (review of #386: three copies of "fresh"). mutex_
+	//! held.
+	bool IsColumnsFreshLocked(const MSSQLTableMetadata &table) const;
 	MSSQLCacheState state_;								  // Current cache state (backward compat)
 	const MSSQLCatalogFilter *filter_ = nullptr;		  // Set once at catalog init, before any concurrency
 	unordered_map<string, MSSQLSchemaMetadata> schemas_;  // Cached schemas

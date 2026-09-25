@@ -1,7 +1,5 @@
 #include "catalog/mssql_transaction.hpp"
-
 #include <cstring>
-#include <set>
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -108,25 +106,14 @@ void ForgetTransactionMetadata(duckdb::MSSQLCatalog &catalog, duckdb::MSSQLTrans
 	}
 }
 
-// Issue #383: the names the shared cache may be warmed with after the
-// transaction -- the tables it loaded itself and the tables it changed; the
-// warm-up loads only those the shared cache then lacks. After COMMIT a table
-// the transaction dropped is left out: it cannot load. After ROLLBACK it still
-// exists. Read before the transaction (and its metadata) is erased.
-std::set<std::pair<std::string, std::string>> TouchedTables(duckdb::MSSQLTransaction &txn, bool committed) {
-	std::set<std::pair<std::string, std::string>> touched;
+// Issue #383: what the transaction loaded itself, and did not change, is
+// committed state -- publish it into the shared cache before the transaction's
+// metadata goes. In memory only: no round trip on COMMIT's or ROLLBACK's path.
+void PublishTransactionMetadata(duckdb::MSSQLCatalog &catalog, duckdb::MSSQLTransaction &txn) {
 	auto *metadata = txn.TryMetadata();
 	if (metadata) {
-		touched = metadata->GetLoadedTables();
-		auto changes = metadata->GetChanges();
-		touched.insert(changes.tables.begin(), changes.tables.end());
-		if (committed) {
-			for (const auto &key : changes.dropped) {
-				touched.erase(key);
-			}
-		}
+		catalog.PublishTransactionMetadata(*metadata);
 	}
-	return touched;
 }
 
 }  // anonymous namespace
@@ -188,7 +175,8 @@ MSSQLTransaction &MSSQLTransaction::Get(ClientContext &context, Catalog &catalog
 MSSQLTransactionMetadata &MSSQLTransaction::Metadata(ClientContext &context) {
 	lock_guard<mutex> lock(metadata_mutex_);
 	if (!metadata_) {
-		metadata_ = make_uniq<MSSQLTransactionMetadata>(catalog_.CreateTransactionMetadataCache(context));
+		metadata_ = make_uniq<MSSQLTransactionMetadata>(catalog_.CreateTransactionMetadataCache(context),
+														catalog_.GetMetadataCache().GetInvalidationEpoch());
 	}
 	return *metadata_;
 }
@@ -293,7 +281,7 @@ Transaction &MSSQLTransactionManager::StartTransaction(ClientContext &context) {
 }
 
 ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
-	unique_lock<mutex> lock(transaction_lock_);
+	lock_guard<mutex> lock(transaction_lock_);
 
 	auto &mssql_txn = transaction.Cast<MSSQLTransaction>();
 
@@ -353,18 +341,14 @@ ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Tra
 		MSSQL_TXN_LOG("CommitTransaction: No active SQL Server transaction (no-op)");
 	}
 
-	const auto touched = TouchedTables(mssql_txn, true);
+	PublishTransactionMetadata(catalog_, mssql_txn);
 	ForgetTransactionMetadata(catalog_, mssql_txn);
 	transactions_.erase(context);
-	// Outside the manager's lock: it is a round trip, and other transactions of
-	// this catalog must not wait on it to start or end.
-	lock.unlock();
-	catalog_.WarmSharedCache(touched);
 	return ErrorData();
 }
 
 void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
-	unique_lock<mutex> lock(transaction_lock_);
+	lock_guard<mutex> lock(transaction_lock_);
 
 	auto &mssql_txn = transaction.Cast<MSSQLTransaction>();
 
@@ -421,7 +405,7 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 		MSSQL_TXN_LOG("RollbackTransaction: No active SQL Server transaction (no-op)");
 	}
 
-	const auto touched = TouchedTables(mssql_txn, false);
+	PublishTransactionMetadata(catalog_, mssql_txn);
 	ForgetTransactionMetadata(catalog_, mssql_txn);
 
 	// Try to get the context to remove from our transaction map
@@ -433,14 +417,6 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 	}
 	// If context is gone, the transaction map entry will be cleaned up when
 	// the TransactionManager is destroyed
-
-	lock.unlock();
-	// Not at shutdown: a rollback whose context is already gone is DuckDB
-	// tearing down, and a metadata round trip -- possibly a login -- would only
-	// delay it for a cache about to be destroyed.
-	if (context_ptr) {
-		catalog_.WarmSharedCache(touched);
-	}
 }
 
 void MSSQLTransactionManager::Checkpoint(ClientContext &context, bool force) {

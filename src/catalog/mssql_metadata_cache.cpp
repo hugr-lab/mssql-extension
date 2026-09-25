@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <unordered_set>
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "query/mssql_simple_query.hpp"
@@ -457,8 +458,7 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 
 	// Check if table already cached with columns loaded
 	auto table_it = schema.tables.find(table_name);
-	if (table_it != schema.tables.end() && table_it->second.columns_load_state == CacheLoadState::LOADED &&
-		!IsTTLExpired(table_it->second.columns_last_refresh, ttl_seconds_)) {
+	if (table_it != schema.tables.end() && IsColumnsFreshLocked(table_it->second)) {
 		CACHE_DEBUG(2, "GetTableMetadata('%s.%s') — cache hit (%zu columns)", schema_name.c_str(), table_name.c_str(),
 					table_it->second.columns.size());
 		out_meta = table_it->second;  // copy under mutex_ — see header contract
@@ -1338,6 +1338,7 @@ void MSSQLMetadataCache::Refresh(tds::TdsConnection &connection, const string &d
 
 	// Mark as loading
 	state_ = MSSQLCacheState::LOADING;
+	invalidation_epoch_++;
 
 	// Clear existing data
 	schemas_.clear();
@@ -1686,6 +1687,7 @@ void MSSQLMetadataCache::EnsureTablesLoaded(tds::TdsConnection &connection, cons
 
 void MSSQLMetadataCache::InvalidateSchema(const string &schema_name) {
 	std::lock_guard<std::mutex> lock(mutex_);
+	invalidation_epoch_++;
 	auto it = schemas_.find(schema_name);
 	if (it != schemas_.end()) {
 		it->second.tables_load_state = CacheLoadState::NOT_LOADED;
@@ -1699,6 +1701,7 @@ void MSSQLMetadataCache::InvalidateSchema(const string &schema_name) {
 
 void MSSQLMetadataCache::InvalidateSchemaTableList(const string &schema_name) {
 	std::lock_guard<std::mutex> lock(mutex_);
+	invalidation_epoch_++;
 	auto it = schemas_.find(schema_name);
 	if (it != schemas_.end()) {
 		// Existence only — re-fetch the table list, but keep every table's cached
@@ -1709,6 +1712,7 @@ void MSSQLMetadataCache::InvalidateSchemaTableList(const string &schema_name) {
 
 void MSSQLMetadataCache::InvalidateTable(const string &schema_name, const string &table_name) {
 	std::lock_guard<std::mutex> lock(mutex_);
+	invalidation_epoch_++;
 	auto schema_it = schemas_.find(schema_name);
 	if (schema_it == schemas_.end()) {
 		return;
@@ -1722,6 +1726,7 @@ void MSSQLMetadataCache::InvalidateTable(const string &schema_name, const string
 
 void MSSQLMetadataCache::InvalidateAll() {
 	std::lock_guard<std::mutex> lock(mutex_);
+	invalidation_epoch_++;
 	schemas_load_state_ = CacheLoadState::NOT_LOADED;
 	for (auto &schema_entry : schemas_) {
 		schema_entry.second.tables_load_state = CacheLoadState::NOT_LOADED;
@@ -1751,6 +1756,11 @@ CacheLoadState MSSQLMetadataCache::GetTablesState(const string &schema_name) con
 	return it->second.tables_load_state;
 }
 
+bool MSSQLMetadataCache::IsColumnsFreshLocked(const MSSQLTableMetadata &table) const {
+	return table.columns_load_state == CacheLoadState::LOADED &&
+		   !IsTTLExpired(table.columns_last_refresh, ttl_seconds_);
+}
+
 bool MSSQLMetadataCache::TryGetLoadedTableMetadata(const string &schema_name, const string &table_name,
 												   MSSQLTableMetadata &out_meta) {
 	std::lock_guard<std::mutex> lock(mutex_);
@@ -1759,11 +1769,66 @@ bool MSSQLMetadataCache::TryGetLoadedTableMetadata(const string &schema_name, co
 		return false;
 	}
 	auto table_it = schema_it->second.tables.find(table_name);
-	if (table_it == schema_it->second.tables.end() || table_it->second.columns_load_state != CacheLoadState::LOADED ||
-		IsTTLExpired(table_it->second.columns_last_refresh, ttl_seconds_)) {
+	if (table_it == schema_it->second.tables.end() || !IsColumnsFreshLocked(table_it->second)) {
 		return false;
 	}
 	out_meta = table_it->second;
+	return true;
+}
+
+bool MSSQLMetadataCache::PublishTableMetadata(const string &schema_name, const MSSQLTableMetadata &meta,
+											  uint64_t epoch) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (invalidation_epoch_.load() != epoch || meta.columns_load_state != CacheLoadState::LOADED) {
+		return false;
+	}
+	auto schema_it = schemas_.find(schema_name);
+	if (schema_it == schemas_.end()) {
+		return false;
+	}
+	auto &tables = schema_it->second.tables;
+	auto table_it = tables.find(meta.name);
+	if (table_it != tables.end() && IsColumnsFreshLocked(table_it->second)) {
+		return false;
+	}
+	MSSQLTableMetadata published = meta;
+	published.approx_row_count = 0;
+	tables[meta.name] = std::move(published);
+	return true;
+}
+
+bool MSSQLMetadataCache::TryGetLoadedSchemaNames(vector<string> &out_names,
+												 std::chrono::steady_clock::time_point &out_loaded_at) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (schemas_load_state_ != CacheLoadState::LOADED || IsTTLExpired(schemas_last_refresh_, ttl_seconds_)) {
+		return false;
+	}
+	out_names.clear();
+	for (const auto &entry : schemas_) {
+		out_names.push_back(entry.first);
+	}
+	out_loaded_at = schemas_last_refresh_;
+	return true;
+}
+
+bool MSSQLMetadataCache::PublishSchemaNames(const vector<string> &names,
+											std::chrono::steady_clock::time_point loaded_at, uint64_t epoch) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (invalidation_epoch_.load() != epoch) {
+		return false;
+	}
+	if (schemas_load_state_ == CacheLoadState::LOADED && !IsTTLExpired(schemas_last_refresh_, ttl_seconds_)) {
+		return false;
+	}
+	std::unordered_set<string> listed(names.begin(), names.end());
+	for (auto it = schemas_.begin(); it != schemas_.end();) {
+		it = listed.count(it->first) ? std::next(it) : schemas_.erase(it);
+	}
+	for (const auto &name : names) {
+		schemas_.emplace(name, MSSQLSchemaMetadata(name));
+	}
+	schemas_load_state_ = CacheLoadState::LOADED;
+	schemas_last_refresh_ = loaded_at;
 	return true;
 }
 

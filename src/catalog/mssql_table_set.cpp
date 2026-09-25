@@ -498,8 +498,8 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntryInTransaction(ClientContext &c
 	catalog.EnsureCacheLoaded(context);
 
 	// 4. The shared METADATA cache: committed state, filled by an autocommit
-	//    load, a preload, or the warm-up after an earlier transaction (issue
-	//    #383) -- served without a round trip. The entry built from it goes
+	//    load, a preload, or what an earlier transaction published at its end
+	//    (issue #383) -- served without a round trip. The entry built from it goes
 	//    into THIS transaction's layer, not entries_ (review of #386): its
 	//    rowid key may still be discovered, and that discovery runs on the
 	//    pinned connection, whose failure an entry caches for good -- it must

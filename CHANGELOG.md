@@ -14,10 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`mssql_min_connections` did not open anything.** It only kept idle
     connections from being closed. The pool now opens that many connections
     at ATTACH, with their logins running concurrently.
-  - **ATTACH's validation connection is no longer thrown away.** The
-    connection ATTACH logs in to check the credentials now becomes the pool's
-    first connection, instead of being closed and logged in again. A plain
-    ATTACH is one login, not two.
+  - **ATTACH validates through the pool.** The credentials check is the
+    pool's first login, and the connection stays in the pool instead of being
+    closed and logged in again: a plain ATTACH is one login, not two. Pool
+    refills now report the same classified reasons the ATTACH did (server error
+    number and state: a paused serverless database, the 18456 login state).
   - **Measured on a local server:**
 
     | ATTACH | before | after |
@@ -27,7 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     | `min_connections 8` | 0.63 s | 0.54 s |
 
     Opened one after another, four connections would cost about a second.
-  - **Nothing opened under `lazy_validation`.**
+  - **Nothing opened under `lazy_validation`.** The ATTACH options `preload` and
+    `min_connections` are refused beside it, and `preload` inside a transaction
+    that has used an MSSQL catalog is refused — all before the ATTACH dials. A
+    `min_connections` shortfall is logged as a WARNING and does not fail the
+    ATTACH.
   - **New ATTACH options:**
     - `min_connections` is the ATTACH form of the setting.
     - `preload true` runs `mssql_preload_catalog()` as part of the ATTACH.
@@ -85,16 +90,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#383](https://github.com/hugr-lab/mssql-extension/issues/383)). Since #380
   a transaction loads a missing table's metadata into a cache of its own, so a
   workload that runs everything in transactions (DuckLake) loaded every table
-  once per transaction. After COMMIT or ROLLBACK the tables it loaded or
-  changed that the shared cache lacks are now loaded into it, one by one, on
-  an idle pool connection (never a new login), when there are at most 5 of
-  them; more are left to lazy loading. Tables the shared cache still holds,
-  names the table filter hides and tables the transaction dropped cost
-  nothing. Inside a transaction the shared metadata cache is read too. 50
-  transactions reading two tables: 0.215 s → 0.100 s on a local server,
-  against 0.087 s with the cache already warm; against a remote server the
-  difference is one round trip per table per transaction. Not on a pool of
-  one connection.
+  once per transaction. At COMMIT or ROLLBACK what the transaction loaded and
+  did not change is now published into the shared cache from memory, with no
+  round trip: 100 transactions reading the same two tables load each table's
+  metadata once. Nothing is published after DDL (the transaction's own through
+  the catalog included, or `mssql_exec` DDL), under READ UNCOMMITTED, or when
+  the shared cache was invalidated while the transaction ran. Inside a
+  transaction the shared metadata cache is read too.
 - **A table created inside a transaction can be read in it; a pool of one
   connection works in a transaction**
   ([#380](https://github.com/hugr-lab/mssql-extension/issues/380)).

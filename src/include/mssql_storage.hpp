@@ -306,21 +306,6 @@ struct MSSQLStorageExtensionInfo : public StorageExtensionInfo {
 // Registration and callbacks
 //===----------------------------------------------------------------------===//
 
-namespace tds {
-class TdsConnection;
-}  // namespace tds
-
-// Validate connection by attempting to connect and authenticate
-// Throws IOException or InvalidInputException with descriptive error on failure
-// Returns the logged-in connection, which the pool adopts (issue #324).
-std::shared_ptr<tds::TdsConnection> ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds = 30);
-
-// Spec 042: Validate an Integrated-Auth (Kerberos / SSPI) connection at ATTACH time
-// so credential / SPN / clock-skew / KDC-reachability errors surface immediately.
-// The LOGIN7 fragmentation boundary (issue #138) is read from info.login7_max_packet.
-std::shared_ptr<tds::TdsConnection> ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info,
-																	 int timeout_seconds = 30);
-
 // Register storage extension for ATTACH TYPE mssql
 void RegisterMSSQLStorageExtension(ExtensionLoader &loader);
 

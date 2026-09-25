@@ -20,12 +20,11 @@ require-env MSSQL_TESTDB_DSN
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS ft76 (TYPE mssql);
 
-# ATTACH logged in ONCE: the connection its eager validation opened is the
-# pool's first (adopted, issue #324), so the pool counts one connection and no
-# second login followed. (Before spec 076 ATTACH built two pools and threw the
-# first away; before #324 the validation connection was closed and the pool
-# logged in again -- also a count of 1 here, so this line no longer tells those
-# apart; the adoption itself is asserted in attach_pool_warmup.test.)
+# ATTACH logged in ONCE: its eager validation is the pool's first login
+# (issue #324, review of #386), and the collation query reuses that
+# connection, so the pool counts exactly one. A validation outside the pool
+# would not show here -- it never reached the pool's counters -- which is why
+# the validation now goes through it.
 query I
 SELECT connections_created FROM mssql_pool_stats('ft76');
 ----

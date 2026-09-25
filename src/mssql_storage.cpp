@@ -5,10 +5,12 @@
 #include "catalog/mssql_catalog_filter.hpp"
 #include "catalog/mssql_transaction.hpp"
 #include "connection/instance_resolver.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -1156,360 +1158,9 @@ string MSSQLTranslateConnectionError(const string &error, const string &host, ui
 	return StringUtil::Format("Connection failed to %s:%d", host, port);
 }
 
-// The validation `SELECT 1`'s answer, read so the connection is Idle for the
-// pool it is handed to (issue #324). A read that does not complete -- a poll
-// timeout leaves the socket connected with the rest of the answer still on the
-// wire -- closes it instead: the pool's Adopt refuses a closed connection, and
-// the first statement to take a pooled connection must not parse a stale
-// `SELECT 1` as its own answer (review of #386: that statement is ATTACH's
-// collation query). The validation itself has already succeeded -- the login
-// and the query were accepted -- so this is not an ATTACH error; the pool logs
-// in afresh when it needs a connection.
-static void DrainValidationQuery(tds::TdsConnection &conn) {
-	auto *socket = conn.GetSocket();
-	if (!socket) {
-		return;
-	}
-	std::vector<uint8_t> response;
-	if (!socket->ReceiveMessage(response, 5000)) {
-		MSSQL_STORAGE_DEBUG_LOG(1, "validation query answer not read completely; connection closed, not pooled");
-		conn.Close();
-		return;
-	}
-	conn.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-}
-
-//===----------------------------------------------------------------------===//
-// Azure AD Connection Validation
-//===----------------------------------------------------------------------===//
-
-std::shared_ptr<tds::TdsConnection> ValidateAzureConnection(ClientContext &context, MSSQLConnectionInfo &info,
-															int timeout_seconds) {
-	MSSQL_STORAGE_DEBUG_LOG(
-		1, "ValidateAzureConnection: host=%s port=%d database=%s azure_secret=%s encrypt=%s timeout=%ds",
-		info.host.c_str(), info.port, info.database.c_str(), info.azure_secret_name.c_str(),
-		info.use_encrypt ? "yes" : "no", timeout_seconds);
-
-	// Acquire Azure AD token
-	auto token_result = mssql::azure::AcquireToken(context, info.azure_secret_name, info.azure_tenant_id);
-	if (!token_result.success) {
-		throw InvalidInputException("MSSQL Azure AD authentication failed: %s", token_result.error_message);
-	}
-
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: token acquired successfully");
-
-	// Build FEDAUTH extension data (encodes token to UTF-16LE)
-	auto fedauth_data = mssql::azure::BuildFedAuthExtension(context, info.azure_secret_name, info.azure_tenant_id);
-	if (!fedauth_data.IsValid()) {
-		throw InvalidInputException("MSSQL Azure AD authentication failed: could not build FEDAUTH data");
-	}
-
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: FEDAUTH data built, token_size=%zu",
-							fedauth_data.token_utf16le.size());
-
-	// Create a temporary connection to test Azure AD credentials
-	// Issue #324: kept, not closed -- MSSQLCatalog::AdoptOnInitialize hands it to ConnectionPool::Adopt.
-	auto conn_holder = std::make_shared<tds::TdsConnection>();
-	auto &conn = *conn_holder;
-	conn.SetRequestedPacketSize(info.tds_packet_size);
-	conn.SetRequestUtf8Support(info.utf8_support);
-	conn.SetTlsOptions(info.GetTlsOptions());
-
-	// Attempt TCP connection
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: attempting TCP connection...");
-	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
-		string error = conn.GetLastError();
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: TCP connection FAILED - %s", error.c_str());
-		throw IOException("MSSQL Azure connection validation failed: %s", error);
-	}
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: TCP connection succeeded");
-
-	// Attempt Azure AD authentication (FEDAUTH)
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: attempting Azure AD authentication...");
-	if (!conn.AuthenticateWithFedAuth(info.database, fedauth_data.token_utf16le, info.use_encrypt,
-									  ResolveAppName(info))) {
-		// Classified, not raw: the Azure-AD path is the one most likely to meet
-		// 40613 on a paused serverless database, which is the case issue #262
-		// was filed about.
-		string error =
-			MSSQLTranslateConnectionError(conn.GetLastError(), info.host, info.port, info.user, info.database,
-										  conn.GetLastErrorNumber(), conn.GetLastErrorState());
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: Azure AD authentication FAILED - raw: %s, translated: %s",
-								conn.GetLastError().c_str(), error.c_str());
-		conn.Close();
-		throw InvalidInputException("MSSQL Azure AD connection validation failed: %s", error);
-	}
-	info.utf8_support_acked = conn.UTF8SupportAcked() ? 1 : 0;
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: Azure AD authentication succeeded");
-
-	// Test query
-	if (info.use_encrypt) {
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: executing validation query (SELECT 1)...");
-		try {
-			if (!conn.ExecuteBatch("SELECT 1", "ping SELECT 1")) {
-				string error = conn.GetLastError();
-				MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: validation query FAILED - %s", error.c_str());
-				conn.Close();
-				throw InvalidInputException("MSSQL Azure connection validation failed: validation query failed: %s",
-											error);
-			}
-			DrainValidationQuery(conn);
-			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: validation query succeeded");
-		} catch (const std::exception &e) {
-			string error = e.what();
-			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: validation query FAILED with exception - %s",
-									error.c_str());
-			conn.Close();
-			throw InvalidInputException("MSSQL Azure connection validation failed: %s", error);
-		}
-	}
-
-	// Handed to the pool rather than closed (issue #324): it is logged in with
-	// the same parameters the pool factory uses, so the ATTACH's first pooled
-	// connection costs no second login.
-	auto validated = conn_holder;
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateAzureConnection: validation complete");
-	return validated;
-}
-
 //===----------------------------------------------------------------------===//
 // Manual Token Connection Validation (Spec 032)
 //===----------------------------------------------------------------------===//
-
-std::shared_ptr<tds::TdsConnection> ValidateManualTokenConnection(MSSQLConnectionInfo &info,
-																  const std::vector<uint8_t> &token_utf16le,
-																  int timeout_seconds) {
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: host=%s port=%d database=%s encrypt=%s timeout=%ds",
-							info.host.c_str(), info.port, info.database.c_str(), info.use_encrypt ? "yes" : "no",
-							timeout_seconds);
-
-	// Create a temporary connection to test the pre-provided token
-	// Issue #324: kept, not closed -- MSSQLCatalog::AdoptOnInitialize hands it to ConnectionPool::Adopt.
-	auto conn_holder = std::make_shared<tds::TdsConnection>();
-	auto &conn = *conn_holder;
-	conn.SetRequestedPacketSize(info.tds_packet_size);
-	conn.SetRequestUtf8Support(info.utf8_support);
-	conn.SetTlsOptions(info.GetTlsOptions());
-
-	// Attempt TCP connection
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting TCP connection...");
-	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
-		string error = conn.GetLastError();
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: TCP connection FAILED - %s", error.c_str());
-		throw IOException("MSSQL manual token connection validation failed: %s", error);
-	}
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: TCP connection succeeded");
-
-	// Attempt Azure AD authentication (FEDAUTH) with the pre-provided token
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: attempting FEDAUTH with manual token...");
-	if (!conn.AuthenticateWithFedAuth(info.database, token_utf16le, info.use_encrypt, ResolveAppName(info))) {
-		string error =
-			MSSQLTranslateConnectionError(conn.GetLastError(), info.host, info.port, info.user, info.database,
-										  conn.GetLastErrorNumber(), conn.GetLastErrorState());
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH FAILED - raw: %s, translated: %s",
-								conn.GetLastError().c_str(), error.c_str());
-		conn.Close();
-		throw InvalidInputException("MSSQL manual token authentication failed: %s", error);
-	}
-	info.utf8_support_acked = conn.UTF8SupportAcked() ? 1 : 0;
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: FEDAUTH succeeded");
-
-	// Test query
-	if (info.use_encrypt) {
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: executing validation query (SELECT 1)...");
-		try {
-			if (!conn.ExecuteBatch("SELECT 1", "ping SELECT 1")) {
-				string error = conn.GetLastError();
-				MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation query FAILED - %s",
-										error.c_str());
-				conn.Close();
-				throw InvalidInputException("MSSQL manual token connection validation failed: query failed: %s", error);
-			}
-			DrainValidationQuery(conn);
-			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation query succeeded");
-		} catch (const std::exception &e) {
-			string error = e.what();
-			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation query FAILED with exception - %s",
-									error.c_str());
-			conn.Close();
-			throw InvalidInputException("MSSQL manual token connection validation failed: %s", error);
-		}
-	}
-
-	// Handed to the pool rather than closed (issue #324): it is logged in with
-	// the same parameters the pool factory uses, so the ATTACH's first pooled
-	// connection costs no second login.
-	auto validated = conn_holder;
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateManualTokenConnection: validation complete");
-	return validated;
-}
-
-std::shared_ptr<tds::TdsConnection> ValidateConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: host=%s port=%d user=%s database=%s encrypt=%s timeout=%ds",
-							info.host.c_str(), info.port, info.user.c_str(), info.database.c_str(),
-							info.use_encrypt ? "yes" : "no", timeout_seconds);
-
-	// Create a temporary connection to test credentials
-	// Issue #324: kept, not closed -- MSSQLCatalog::AdoptOnInitialize hands it to ConnectionPool::Adopt.
-	auto conn_holder = std::make_shared<tds::TdsConnection>();
-	auto &conn = *conn_holder;
-	conn.SetRequestedPacketSize(info.tds_packet_size);
-	conn.SetRequestUtf8Support(info.utf8_support);
-	conn.SetTlsOptions(info.GetTlsOptions());
-
-	// Attempt TCP connection
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting TCP connection...");
-	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
-		string error = conn.GetLastError();
-		string translated = MSSQLTranslateConnectionError(error, info.host, info.port, info.user, info.database);
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TCP connection FAILED - raw: %s, translated: %s", error.c_str(),
-								translated.c_str());
-		throw IOException("MSSQL connection validation failed: %s", translated);
-	}
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TCP connection succeeded");
-
-	// Attempt authentication
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: attempting authentication...");
-	if (!conn.Authenticate(info.user, info.password, info.database, info.use_encrypt, ResolveAppName(info))) {
-		string error = conn.GetLastError();
-		string translated = MSSQLTranslateConnectionError(error, info.host, info.port, info.user, info.database,
-														  conn.GetLastErrorNumber(), conn.GetLastErrorState());
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: authentication FAILED - raw: %s, translated: %s", error.c_str(),
-								translated.c_str());
-		conn.Close();
-		throw InvalidInputException("MSSQL connection validation failed: %s", translated);
-	}
-	info.utf8_support_acked = conn.UTF8SupportAcked() ? 1 : 0;
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: authentication succeeded");
-
-	// If TLS is enabled, execute a simple validation query to verify TLS data path works
-	// This catches TLS issues that may only appear during actual data transfer
-	if (info.use_encrypt) {
-		MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: executing TLS validation query (SELECT 1)...");
-		try {
-			if (!conn.ExecuteBatch("SELECT 1", "ping SELECT 1")) {
-				string error = conn.GetLastError();
-				string translated =
-					MSSQLTranslateConnectionError(error, info.host, info.port, info.user, info.database);
-				MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TLS validation query FAILED - raw: %s, translated: %s",
-										error.c_str(), translated.c_str());
-				conn.Close();
-				throw InvalidInputException(
-					"MSSQL connection validation failed: TLS connection established but validation query failed. "
-					"The server may have network issues or TLS may be misconfigured. Details: %s",
-					translated);
-			}
-			DrainValidationQuery(conn);
-			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TLS validation query succeeded");
-		} catch (const std::exception &e) {
-			string error = e.what();
-			string translated = MSSQLTranslateConnectionError(error, info.host, info.port, info.user, info.database);
-			MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: TLS validation query FAILED with exception - %s",
-									error.c_str());
-			conn.Close();
-			throw InvalidInputException(
-				"MSSQL connection validation failed: TLS connection established but validation query failed. "
-				"Details: %s",
-				translated);
-		}
-	}
-
-	// Handed to the pool rather than closed (issue #324): it is logged in with
-	// the same parameters the pool factory uses, so the ATTACH's first pooled
-	// connection costs no second login.
-	auto validated = conn_holder;
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateConnection: validation complete, connection kept for the pool");
-	return validated;
-}
-
-//===----------------------------------------------------------------------===//
-// ValidateIntegratedAuthConnection -- Spec 042
-//
-// Build a fresh Krb5Authenticator (or WinSspiAuthenticator in Phase 4) via the
-// strategy factory, run a full ATTACH-time login, then close the connection.
-// Surfaces credential / SPN / clock-skew / KDC-reachability errors at ATTACH
-// instead of at first query.
-//===----------------------------------------------------------------------===//
-std::shared_ptr<tds::TdsConnection> ValidateIntegratedAuthConnection(MSSQLConnectionInfo &info, int timeout_seconds) {
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateIntegratedAuthConnection: host=%s port=%d db=%s method=%d timeout=%ds",
-							info.host.c_str(), info.port, info.database.c_str(), static_cast<int>(info.auth_method),
-							timeout_seconds);
-
-	// Issue #324: kept, not closed -- MSSQLCatalog::AdoptOnInitialize hands it to ConnectionPool::Adopt.
-	auto conn_holder = std::make_shared<tds::TdsConnection>();
-	auto &conn = *conn_holder;
-	conn.SetRequestedPacketSize(info.tds_packet_size);
-	conn.SetRequestUtf8Support(info.utf8_support);
-	conn.SetTlsOptions(info.GetTlsOptions());
-	if (!conn.Connect(info.host, info.port, timeout_seconds)) {
-		string error = conn.GetLastError();
-		string translated = MSSQLTranslateConnectionError(error, info.host, info.port, "", info.database);
-		throw IOException("MSSQL connection validation failed: %s", translated);
-	}
-
-	// Build the strategy per login attempt; this triggers Krb5Authenticator
-	// construction (which validates the keytab/realm/etc. early). Spec 068 D3:
-	// a factory rather than an instance, so a routing hop obtains a ticket for
-	// the routed host's SPN. The factory cannot throw across the TDS layer, so
-	// construction errors are captured here and re-thrown after the call
-	// returns — `strategy_error` holds the message the callable could not raise.
-	string strategy_error;
-	// By reference, deliberately, and the exception to the by-value rule in
-	// AuthenticatorFactory's docs: this factory is built and consumed inside
-	// this one synchronous call, and `strategy_error` is how a construction
-	// failure gets back out -- the callable cannot throw across the TDS layer.
-	// The pool's factory (mssql_catalog.cpp) captures by value, because it is
-	// stored and re-run on worker threads.
-	auto auth_factory = [&info, &strategy_error](const std::string &host,
-												 uint16_t port) -> std::shared_ptr<tds::IAuthenticator> {
-		MSSQLConnectionInfo hop_info = info;
-		hop_info.host = host;
-		hop_info.port = port;
-		std::shared_ptr<tds::AuthenticationStrategy> strategy;
-		try {
-			strategy = tds::AuthStrategyFactory::Create(hop_info);
-		} catch (const std::exception &e) {
-			strategy_error = e.what();
-			return nullptr;
-		}
-		if (!strategy) {
-			strategy_error = "failed to construct integrated-auth strategy";
-			return nullptr;
-		}
-		auto authenticator = strategy->GetAuthenticator();
-		if (!authenticator) {
-			strategy_error = "integrated-auth strategy did not provide an authenticator";
-		}
-		return authenticator;
-	};
-
-	if (!conn.AuthenticateIntegrated(info.database, auth_factory, info.use_encrypt, ResolveAppName(info),
-									 info.login7_max_packet)) {
-		// Keep BOTH messages. The connection's own error is the one that says
-		// WHICH target failed -- after a routing hop it names the routed server
-		// and the SPN that would have been requested, which `Kerberos.md`
-		// documents as the one-round field diagnosis for the SPN-over-hop path.
-		// `strategy_error` is the GSSAPI/SSPI cause, which the callable could
-		// not throw across the TDS layer. Reporting only the cause would drop
-		// the routed host; reporting only the driver would drop the reason.
-		string error =
-			MSSQLTranslateConnectionError(conn.GetLastError(), info.host, info.port, info.user, info.database,
-										  conn.GetLastErrorNumber(), conn.GetLastErrorState());
-		if (!strategy_error.empty()) {
-			error += " (" + strategy_error + ")";
-		}
-		conn.Close();
-		throw InvalidInputException("MSSQL connection validation failed: %s", error);
-	}
-	info.utf8_support_acked = conn.UTF8SupportAcked() ? 1 : 0;
-
-	// Handed to the pool rather than closed (issue #324): it is logged in with
-	// the same parameters the pool factory uses, so the ATTACH's first pooled
-	// connection costs no second login.
-	auto validated = conn_holder;
-	MSSQL_STORAGE_DEBUG_LOG(1, "ValidateIntegratedAuthConnection: success");
-	return validated;
-}
 
 //===----------------------------------------------------------------------===//
 // Storage Extension callbacks
@@ -1682,6 +1333,22 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			"MSSQL ATTACH error: preload and lazy_validation contradict each other -- "
 			"preload reads the whole catalog at ATTACH, lazy_validation defers every "
 			"connection to the first query. Drop one of them");
+	}
+	if (min_connections_option > 0 && lazy_validation) {
+		throw InvalidInputException(
+			"MSSQL ATTACH error: min_connections and lazy_validation contradict each other -- "
+			"min_connections opens connections at ATTACH, lazy_validation defers every "
+			"connection to the first query. Drop one of them");
+	}
+	// The #380 refusal of a catalog-wide load inside a transaction that has used
+	// MSSQL, here with the other decisions the ATTACH's own options make -- before
+	// the ATTACH dials, logs in and opens min_connections only to throw them away
+	// (review of #386).
+	if (preload_option && ConnectionProvider::HasUsedAnyMSSQLCatalogInTransaction(context)) {
+		throw InvalidInputException(
+			"MSSQL ATTACH error: preload cannot run inside a transaction that has used an MSSQL catalog -- "
+			"the load would wait on that transaction's uncommitted changes. ATTACH outside the transaction, or "
+			"drop the preload option");
 	}
 
 	// Get connection string from info.path (the first argument to ATTACH)
@@ -1859,9 +1526,6 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 							lazy_validation ? "true" : "false", attach_validation_timeout);
 
 	std::vector<uint8_t> fedauth_token_utf16le;
-	// The connection the eager validation logged in; the pool adopts it (issue
-	// #324). Null under lazy_validation.
-	std::shared_ptr<tds::TdsConnection> validated_connection;
 	if (!connection_info->access_token.empty()) {
 		// Spec 032: Manual token authentication - validate token format and audience at ATTACH time
 		MSSQL_STORAGE_DEBUG_LOG(
@@ -1882,10 +1546,6 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		tds::FedAuthInfo dummy_info;  // Not used by ManualTokenAuthStrategy
 		fedauth_token_utf16le = auth_strategy->GetFedAuthToken(dummy_info);
 
-		if (!lazy_validation) {
-			validated_connection =
-				ValidateManualTokenConnection(*connection_info, fedauth_token_utf16le, attach_validation_timeout);
-		}
 	} else if (connection_info->use_azure_auth) {
 		// Validate FEDAUTH connections at ATTACH time (fail-fast).
 		// Always acquire the token (it's needed by the pool factory anyway);
@@ -1893,8 +1553,15 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		MSSQL_STORAGE_DEBUG_LOG(
 			1, "Azure auth: %s at ATTACH time",
 			lazy_validation ? "skipping network validation (lazy_validation=true)" : "validating connection");
+		// With a ClientContext here and nowhere later: an interactive chain
+		// (device code) can prompt only now, and the token it yields is what
+		// the pool factory -- which never prompts -- finds in TokenCache.
 		if (!lazy_validation) {
-			validated_connection = ValidateAzureConnection(context, *connection_info, attach_validation_timeout);
+			auto token_result = mssql::azure::AcquireToken(context, connection_info->azure_secret_name,
+														   connection_info->azure_tenant_id);
+			if (!token_result.success) {
+				throw InvalidInputException("MSSQL Azure AD authentication failed: %s", token_result.error_message);
+			}
 		}
 		// Build FEDAUTH token for pool factory (uses validated credentials when
 		// not lazy; on lazy path the token still has to exist for pool fills).
@@ -1908,11 +1575,6 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		MSSQL_STORAGE_DEBUG_LOG(
 			1, "Integrated Auth: %s at ATTACH time",
 			lazy_validation ? "skipping network validation (lazy_validation=true)" : "validating connection");
-		if (!lazy_validation) {
-			validated_connection = ValidateIntegratedAuthConnection(*connection_info, attach_validation_timeout);
-		}
-	} else if (!lazy_validation) {
-		validated_connection = ValidateConnection(*connection_info, attach_validation_timeout);
 	}
 
 	// Spec 047: translate MSSQL pool config (DuckDB settings layer) to the
@@ -1933,13 +1595,21 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	// options.access_mode is set by DuckDB based on the READ_ONLY option in ATTACH.
 	// catalog_enabled flag determines whether schema discovery is available.
 	auto catalog_enabled = connection_info->catalog_enabled;
-	auto catalog = make_uniq<MSSQLCatalog>(db, name, std::move(connection_info), std::move(tds_pool_config),
-										   std::move(fedauth_token_utf16le), options.access_mode, catalog_enabled);
-	// Issue #324: open mssql_min_connections at ATTACH, concurrently -- unless
-	// the ATTACH asked not to touch the server yet.
-	catalog->SetPrewarmOnInitialize(!lazy_validation);
-	catalog->AdoptOnInitialize(std::move(validated_connection));
+	// Eager validation (spec 047 FR-011) is the pool's first login (issue #324,
+	// review of #386), and mssql_min_connections is opened with it -- unless the
+	// ATTACH asked not to touch the server yet.
+	MSSQLCatalogStartup startup;
+	startup.validate = !lazy_validation;
+	startup.validation_timeout_seconds = attach_validation_timeout;
+	startup.prewarm = !lazy_validation;
+	auto catalog =
+		make_uniq<MSSQLCatalog>(db, name, std::move(connection_info), std::move(tds_pool_config),
+								std::move(fedauth_token_utf16le), options.access_mode, catalog_enabled, startup);
 	catalog->Initialize(false);
+	if (!catalog->GetPrewarmShortfall().empty()) {
+		DUCKDB_LOG_WARNING(context, "mssql ATTACH %s: min_connections not all opened: %s", name,
+						   catalog->GetPrewarmShortfall());
+	}
 	catalog->CheckTransactionIsolation();
 	if (preload_option) {
 		idx_t schema_count = 0, table_count = 0, column_count = 0;

@@ -409,62 +409,28 @@ void ConnectionPool::RecordCreateFailureLocked(const std::string &error) {
 		create_backoff_ms_ * 2 > CREATE_BACKOFF_MAX_MS ? CREATE_BACKOFF_MAX_MS : create_backoff_ms_ * 2;
 }
 
-std::shared_ptr<TdsConnection> ConnectionPool::TryAcquireIdleOnly() {
-	if (shutdown_flag_.load()) {
-		return nullptr;
-	}
-	std::lock_guard<std::mutex> lock(pool_mutex_);
-	auto conn = TryAcquireIdle();
-	if (conn) {
-		stats_.acquire_count++;
-	}
-	return conn;
-}
-
-bool ConnectionPool::Adopt(std::shared_ptr<TdsConnection> conn) {
-	if (!conn) {
-		return false;
-	}
-	std::lock_guard<std::mutex> lock(pool_mutex_);
-	if (stats_.total_connections >= config_.connection_limit) {
-		conn->Close();
-		return false;
-	}
-	if (!PoolIfReusableLocked(conn, next_connection_id_++)) {
-		return false;
-	}
-	stats_.total_connections++;
-	stats_.connections_created++;
-	available_cv_.notify_one();
-	return true;
-}
-
 size_t ConnectionPool::Prewarm(size_t target, std::string *failure) {
 	if (shutdown_flag_.load() || !config_.connection_cache) {
 		// With caching off every connection is closed on release, so one
 		// opened now would be a login for nothing (review of #386).
 		return 0;
 	}
+	// Everything allocated before the slots are reserved, sized for the most
+	// this call can open: a throw past the reservation would strand it, and
+	// the pool would read full forever (review of #386).
+	const size_t most = target < config_.connection_limit ? target : config_.connection_limit;
+	if (most == 0) {
+		return 0;
+	}
+	std::vector<std::shared_ptr<TdsConnection>> created(most);
+	std::vector<std::string> errors(most);
+	std::vector<std::thread> threads;
+	threads.reserve(most);
+	std::vector<bool> on_thread(most, false);
 	size_t to_create = 0;
 	{
 		std::lock_guard<std::mutex> lock(pool_mutex_);
-		const size_t cap = target < config_.connection_limit ? target : config_.connection_limit;
-		to_create = cap > stats_.total_connections ? cap - stats_.total_connections : 0;
-	}
-	if (to_create == 0) {
-		return 0;
-	}
-	// Allocated before the slots are reserved: a throw past this point would
-	// strand the reservation, and the pool would read full forever.
-	std::vector<std::shared_ptr<TdsConnection>> created(to_create);
-	std::vector<std::string> errors(to_create);
-	std::vector<std::thread> threads;
-	threads.reserve(to_create);
-	{
-		std::lock_guard<std::mutex> lock(pool_mutex_);
-		const size_t cap = target < config_.connection_limit ? target : config_.connection_limit;
-		const size_t room = cap > stats_.total_connections ? cap - stats_.total_connections : 0;
-		to_create = to_create < room ? to_create : room;
+		to_create = most > stats_.total_connections ? most - stats_.total_connections : 0;
 		// Reserve the slots before dialling, so a concurrent Acquire cannot take
 		// the pool past its limit while these logins are in flight.
 		stats_.total_connections += to_create;
@@ -506,7 +472,6 @@ size_t ConnectionPool::Prewarm(size_t target, std::string *failure) {
 			}
 		}
 	};
-	std::vector<bool> on_thread(to_create, false);
 	{
 		Joiner joiner{threads};
 		for (size_t i = 1; i < to_create; i++) {
@@ -527,7 +492,7 @@ size_t ConnectionPool::Prewarm(size_t target, std::string *failure) {
 
 	size_t opened = 0;
 	size_t failed = 0;
-	std::string first_error;
+	size_t first_failed = to_create;
 	{
 		std::lock_guard<std::mutex> lock(pool_mutex_);
 		if (shutdown_flag_.load()) {
@@ -544,8 +509,8 @@ size_t ConnectionPool::Prewarm(size_t target, std::string *failure) {
 			if (!created[i]) {
 				stats_.total_connections--;
 				failed++;
-				if (first_error.empty()) {
-					first_error = errors[i];
+				if (first_failed == to_create) {
+					first_failed = i;
 				}
 				continue;
 			}
@@ -557,21 +522,21 @@ size_t ConnectionPool::Prewarm(size_t target, std::string *failure) {
 				stats_.total_connections--;
 			}
 		}
-		// The same bookkeeping AcquireImpl does, success first so a partial
-		// failure is what the pool reports: `creation_failures` and
-		// `last_create_error` must not disagree (review of #386), and the
-		// backoff is armed as for any failed login (#302).
+		stats_.creation_failures += failed;
 		if (opened > 0) {
 			RecordCreateSuccessLocked();
-		}
-		if (failed > 0) {
-			stats_.creation_failures += failed;
-			RecordCreateFailureLocked(first_error);
+		} else if (failed > 0) {
+			// Nothing opened: the pool's state IS the failure, as for an
+			// Acquire that could not create (#302) -- backoff armed, reason kept.
+			RecordCreateFailureLocked(errors[first_failed]);
 		}
 	}
 	available_cv_.notify_all();
-	if (failure && failed > 0) {
-		*failure = "pool '" + context_name_ + "' could not create a connection: " + first_error;
+	if (failed > 0 && failure) {
+		try {
+			*failure = "pool '" + context_name_ + "' could not create a connection: " + errors[first_failed];
+		} catch (...) {
+		}
 	}
 	MSSQL_POOL_DEBUG_LOG(1, "Prewarm: opened %zu of %zu connection(s) concurrently (pool '%s')", opened, to_create,
 						 context_name_.c_str());

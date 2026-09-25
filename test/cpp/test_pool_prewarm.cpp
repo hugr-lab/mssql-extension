@@ -171,10 +171,26 @@ static void TestPartialFailure() {
 		  "partial: the failed slot is given back (" + std::to_string(stats.total_connections) + " total)");
 	Check(stats.creation_failures == 1, "partial: one creation failure counted");
 	Check(why.find("Login failed") != std::string::npos, "partial: the reason is handed back (" + why + ")");
-	// The counter and the recorded reason agree: a partial success used to
-	// clear the reason while the counter said something failed.
+	// Beside connections that opened, a refused login is not the state of a
+	// healthy pool: counted, handed back, but not left as the pool's recorded
+	// error -- mssql_pool_stats would report it on a pool that works (review
+	// of #386, the rule spec 073 set for Acquire).
+	Check(pool.GetLastCreateError().empty(),
+		  "partial: a healthy pool records no error (" + pool.GetLastCreateError() + ")");
+}
+
+//! Nothing opened: that IS the pool's state, recorded like a failed Acquire.
+static void TestTotalFailure() {
+	ConnectionPool pool("prewarm-dead", Pool(4), []() -> std::shared_ptr<TdsConnection> {
+		throw std::runtime_error("Login failed for user 'x'.");
+	});
+	std::string why;
+	Check(pool.Prewarm(2, &why) == 0, "dead: opened nothing");
+	auto stats = pool.GetStats();
+	Check(stats.total_connections == 0, "dead: every reserved slot given back");
+	Check(stats.creation_failures == 2, "dead: two creation failures counted");
 	Check(pool.GetLastCreateError().find("Login failed") != std::string::npos,
-		  "partial: the pool records the reason (" + pool.GetLastCreateError() + ")");
+		  "dead: the pool records the reason (" + pool.GetLastCreateError() + ")");
 }
 
 //! A factory that throws something that is not a std::exception: a failed
@@ -195,7 +211,7 @@ static void TestNonStandardThrow() {
 }
 
 //! mssql_connection_cache = false means no idle connection, ever: nothing is
-//! prewarmed and nothing adopted.
+//! prewarmed, and a released connection is closed.
 static void TestCachingOff() {
 	auto cfg = Pool(4);
 	cfg.connection_cache = false;
@@ -206,23 +222,9 @@ static void TestCachingOff() {
 	});
 	Check(pool.Prewarm(3) == 0, "nocache: prewarm opens nothing");
 	Check(calls.load() == 0, "nocache: no login at all");
-	Check(!pool.Adopt(LoggedIn()), "nocache: adopt refuses");
+	pool.Release(pool.Acquire());
 	auto stats = pool.GetStats();
 	Check(stats.total_connections == 0 && stats.idle_connections == 0, "nocache: the pool stays empty");
-}
-
-//! Adopt takes only an Idle, connected connection.
-static void TestAdopt() {
-	ConnectionPool pool("adopt", Pool(2), []() { return LoggedIn(); });
-	Check(!pool.Adopt(std::make_shared<TdsConnection>()), "adopt: an unconnected connection is refused");
-	Check(pool.Adopt(LoggedIn()), "adopt: a logged-in one is taken");
-	auto stats = pool.GetStats();
-	Check(stats.total_connections == 1 && stats.idle_connections == 1, "adopt: 1 total, 1 idle");
-	auto held = pool.TryAcquireIdleOnly();
-	Check(held != nullptr, "adopt: the adopted connection is handed out");
-	Check(pool.TryAcquireIdleOnly() == nullptr, "idle-only: nothing idle, and no login to make one");
-	Check(pool.GetStats().connections_created == 1, "idle-only: created nothing");
-	pool.Release(held);
 }
 
 int main() {
@@ -232,8 +234,8 @@ int main() {
 	TestCappedAtLimit();
 	TestPartialFailure();
 	TestNonStandardThrow();
+	TestTotalFailure();
 	TestCachingOff();
-	TestAdopt();
 	if (g_failures > 0) {
 		std::cerr << g_failures << " check(s) failed" << std::endl;
 		return 1;

@@ -1,12 +1,9 @@
 #include "catalog/mssql_catalog.hpp"
 #include <openssl/crypto.h>
 #include <cctype>
-#include <cstdio>
 #include <cstdlib>
-#include <map>
 #include "catalog/mssql_transaction.hpp"
 #include "codec/target_string_type.hpp"
-#include "duckdb/transaction/meta_transaction.hpp"
 
 #include "azure/azure_fedauth.hpp"
 #include "azure/azure_token.hpp"
@@ -42,6 +39,7 @@
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
+#include "mssql_storage.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "tds/auth/auth_strategy_factory.hpp"
 
@@ -77,7 +75,8 @@ static const char *SNAPSHOT_STATE_COLUMN =
 
 MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 						   shared_ptr<MSSQLConnectionInfo> connection_info, tds::PoolConfiguration pool_config,
-						   std::vector<uint8_t> fedauth_token_utf16le, AccessMode access_mode, bool catalog_enabled)
+						   std::vector<uint8_t> fedauth_token_utf16le, AccessMode access_mode, bool catalog_enabled,
+						   MSSQLCatalogStartup startup)
 	: Catalog(db),
 	  context_name_(context_name),
 	  connection_info_(std::move(connection_info)),
@@ -85,6 +84,8 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 	  fedauth_token_utf16le_(std::move(fedauth_token_utf16le)),
 	  access_mode_(access_mode),
 	  catalog_enabled_(catalog_enabled),
+	  startup_(startup),
+	  connect_timeout_(std::make_shared<std::atomic<int>>(pool_config_.connection_timeout)),
 	  default_schema_(connection_info_ && !connection_info_->default_schema.empty() ? connection_info_->default_schema
 																					: string("dbo")) {
 	// Create metadata cache with TTL from settings (0 = manual refresh only)
@@ -198,7 +199,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto tls_options = connection_info_->GetTlsOptions();
 		auto secret_name = connection_info_->azure_secret_name;
 		auto tenant = connection_info_->azure_tenant_id;
-		const int connect_timeout = pool_config_.connection_timeout;
+		auto connect_timeout = connect_timeout_;
 		DatabaseInstance *db = &GetDatabase();
 		factory = [db, host, port, database, encrypt, app_name, tds_packet_size, utf8_support, tls_options, secret_name,
 				   tenant, connect_timeout]() -> std::shared_ptr<tds::TdsConnection> {
@@ -212,12 +213,15 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 			conn->SetRequestedPacketSize(tds_packet_size);
 			conn->SetRequestUtf8Support(utf8_support);
 			conn->SetTlsOptions(tls_options);
-			if (!conn->Connect(host, port, connect_timeout)) {
-				throw ConnectionException("TCP connect to %s:%u failed: %s", host, static_cast<unsigned>(port),
-										  conn->GetLastError());
+			if (!conn->Connect(host, port, connect_timeout->load())) {
+				throw ConnectionException(
+					"%s", MSSQLTranslateConnectionError(conn->GetLastError(), host, port, "", database));
 			}
 			if (!conn->AuthenticateWithFedAuth(database, fedauth.token_utf16le, encrypt, app_name)) {
-				throw ConnectionException("Azure AD authentication failed: %s", conn->GetLastError());
+				throw ConnectionException(
+					"Azure AD authentication failed: %s",
+					MSSQLTranslateConnectionError(conn->GetLastError(), host, port, "", database,
+												  conn->GetLastErrorNumber(), conn->GetLastErrorState()));
 			}
 			return conn;
 		};
@@ -237,7 +241,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto tds_packet_size = connection_info_->tds_packet_size;
 		auto utf8_support = connection_info_->utf8_support;
 		auto tls_options = connection_info_->GetTlsOptions();
-		const int connect_timeout = pool_config_.connection_timeout;
+		auto connect_timeout = connect_timeout_;
 		int64_t exp = 0;
 		{
 			auto claims = mssql::azure::ParseJwtClaims(connection_info_->access_token);
@@ -257,12 +261,15 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 			conn->SetRequestedPacketSize(tds_packet_size);
 			conn->SetRequestUtf8Support(utf8_support);
 			conn->SetTlsOptions(tls_options);
-			if (!conn->Connect(host, port, connect_timeout)) {
-				throw ConnectionException("TCP connect to %s:%u failed: %s", host, static_cast<unsigned>(port),
-										  conn->GetLastError());
+			if (!conn->Connect(host, port, connect_timeout->load())) {
+				throw ConnectionException(
+					"%s", MSSQLTranslateConnectionError(conn->GetLastError(), host, port, "", database));
 			}
 			if (!conn->AuthenticateWithFedAuth(database, token, encrypt, app_name)) {
-				throw ConnectionException("Azure AD authentication failed: %s", conn->GetLastError());
+				throw ConnectionException(
+					"Azure AD authentication failed: %s",
+					MSSQLTranslateConnectionError(conn->GetLastError(), host, port, "", database,
+												  conn->GetLastErrorNumber(), conn->GetLastErrorState()));
 			}
 			return conn;
 		};
@@ -274,15 +281,16 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		// gss_init_sec_context state is independent across pool refills and a
 		// kinit-refreshed ticket is picked up on the next fill. (Spec 042.)
 		MSSQLConnectionInfo info_copy = *connection_info_;
-		const int connect_timeout = pool_config_.connection_timeout;
+		auto connect_timeout = connect_timeout_;
 		factory = [info_copy, app_name, connect_timeout]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
 			conn->SetRequestedPacketSize(info_copy.tds_packet_size);
 			conn->SetRequestUtf8Support(info_copy.utf8_support);
 			conn->SetTlsOptions(info_copy.GetTlsOptions());
-			if (!conn->Connect(info_copy.host, info_copy.port, connect_timeout)) {
-				throw ConnectionException("integrated-auth: TCP connect to %s:%u failed: %s", info_copy.host,
-										  static_cast<unsigned>(info_copy.port), conn->GetLastError());
+			if (!conn->Connect(info_copy.host, info_copy.port, connect_timeout->load())) {
+				throw ConnectionException("integrated-auth: %s",
+										  MSSQLTranslateConnectionError(conn->GetLastError(), info_copy.host,
+																		info_copy.port, "", info_copy.database));
 			}
 			// Spec 068 D3: a factory, not an instance. It is called once per
 			// login attempt, so a routing hop gets a ticket for the ROUTED
@@ -292,8 +300,13 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 			// is unchanged. `DeriveSpn` reads info.host/info.port, and honours
 			// an explicit service_principal_name verbatim, so the override
 			// survives hops with no extra handling here.
-			auto auth_factory = [info_copy](const std::string &host,
-											uint16_t port) -> std::shared_ptr<tds::IAuthenticator> {
+			//
+			// `strategy_error` carries a construction failure out: the callable
+			// cannot throw across the TDS layer. By reference, because this
+			// callable is built and consumed inside this one synchronous call.
+			string strategy_error;
+			auto auth_factory = [&info_copy, &strategy_error](const std::string &host,
+															  uint16_t port) -> std::shared_ptr<tds::IAuthenticator> {
 				MSSQLConnectionInfo hop_info = info_copy;
 				hop_info.host = host;
 				hop_info.port = port;
@@ -301,22 +314,32 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 				try {
 					strategy = tds::AuthStrategyFactory::Create(hop_info);
 				} catch (const std::exception &e) {
-					fprintf(stderr, "[MSSQL POOL] integrated-auth: AuthStrategyFactory::Create failed: %s\n", e.what());
+					strategy_error = ErrorData(e).RawMessage();
 					return nullptr;
 				}
 				if (!strategy) {
-					fprintf(stderr, "[MSSQL POOL] integrated-auth: AuthStrategyFactory returned null strategy\n");
+					strategy_error = "failed to construct integrated-auth strategy";
 					return nullptr;
 				}
 				auto authenticator = strategy->GetAuthenticator();
 				if (!authenticator) {
-					fprintf(stderr, "[MSSQL POOL] integrated-auth: strategy provided no authenticator\n");
+					strategy_error = "integrated-auth strategy did not provide an authenticator";
 				}
 				return authenticator;
 			};
 			if (!conn->AuthenticateIntegrated(info_copy.database, auth_factory, info_copy.use_encrypt, app_name,
 											  info_copy.login7_max_packet)) {
-				throw ConnectionException("integrated-auth: %s", conn->GetLastError());
+				// Both messages: the connection's names WHICH target failed --
+				// after a routing hop the routed server and its SPN, which
+				// Kerberos.md documents as the one-round diagnosis -- and
+				// `strategy_error` the GSSAPI/SSPI cause.
+				string error = MSSQLTranslateConnectionError(conn->GetLastError(), info_copy.host, info_copy.port,
+															 info_copy.user, info_copy.database,
+															 conn->GetLastErrorNumber(), conn->GetLastErrorState());
+				if (!strategy_error.empty()) {
+					error += " (" + strategy_error + ")";
+				}
+				throw ConnectionException("integrated-auth: %s", error);
 			}
 			return conn;
 		};
@@ -334,7 +357,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 		auto tds_packet_size = connection_info_->tds_packet_size;
 		auto utf8_support = connection_info_->utf8_support;
 		auto tls_options = connection_info_->GetTlsOptions();
-		const int connect_timeout = pool_config_.connection_timeout;
+		auto connect_timeout = connect_timeout_;
 		factory = [host, port, username, password, database, encrypt, app_name, tds_packet_size, utf8_support,
 				   tls_options, connect_timeout]() -> std::shared_ptr<tds::TdsConnection> {
 			auto conn = std::make_shared<tds::TdsConnection>();
@@ -344,12 +367,14 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 			// Throw, do not return nullptr: the pool keeps the reason and the
 			// caller finally sees "Login failed for user ..." instead of
 			// "(timeout)" (issue #302).
-			if (!conn->Connect(host, port, connect_timeout)) {
-				throw ConnectionException("TCP connect to %s:%u failed: %s", host, static_cast<unsigned>(port),
-										  conn->GetLastError());
+			if (!conn->Connect(host, port, connect_timeout->load())) {
+				throw ConnectionException(
+					"%s", MSSQLTranslateConnectionError(conn->GetLastError(), host, port, username, database));
 			}
 			if (!conn->Authenticate(username, password, database, encrypt, app_name)) {
-				throw ConnectionException("%s", conn->GetLastError());
+				throw ConnectionException(
+					"%s", MSSQLTranslateConnectionError(conn->GetLastError(), host, port, username, database,
+														conn->GetLastErrorNumber(), conn->GetLastErrorState()));
 			}
 			return conn;
 		};
@@ -359,21 +384,27 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 
 	connection_pool_ = make_shared_ptr<tds::ConnectionPool>(context_name_, pool_config_, std::move(factory));
 
-	// Issue #324: mssql_min_connections is opened here, the logins in parallel,
-	// before anything below takes a connection -- so the collation query runs
-	// on a warm one and a default ATTACH pays about one login's time for N.
-	// Until then the setting only kept connections from being closed as idle;
-	// it never opened one. A failure is not the ATTACH's: the eager validation
-	// has already proved the login, and the pool opens the rest on demand.
-	//
-	// The validation's connection goes in first: it is already logged in with
-	// the factory's parameters, so it is the pool's first connection and the
-	// prewarm opens only the rest.
-	if (adopt_on_initialize_) {
-		connection_pool_->Adopt(std::move(adopt_on_initialize_));
+	// Issue #324, review of #386: the ATTACH validates through the pool. Its
+	// first login is the check -- the factory's own, so the connection that
+	// proved the credentials is the pool's first connection, and there is no
+	// second login routine to keep in step with the factory.
+	if (startup_.validate) {
+		ValidateThroughPool();
 	}
-	if (prewarm_on_initialize_ && pool_config_.min_connections > 0) {
-		connection_pool_->Prewarm(pool_config_.min_connections);
+	// mssql_min_connections is opened here, the logins in parallel, before
+	// anything below takes a connection -- so the collation query runs on a
+	// warm one and a default ATTACH pays about one login's time for N. A
+	// shortfall is not the ATTACH's: the credentials are proved, and the pool
+	// opens the rest on demand; the ATTACH logs it.
+	if (startup_.prewarm && pool_config_.min_connections > 0) {
+		std::string failure;
+		try {
+			const size_t opened = connection_pool_->Prewarm(pool_config_.min_connections, &failure);
+			(void)opened;
+		} catch (std::exception &e) {
+			failure = ErrorData(e).RawMessage();
+		}
+		prewarm_shortfall_ = failure;
 	}
 
 	// Skip metadata initialization when catalog integration is disabled
@@ -384,6 +415,50 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 
 	// Query database collation (needed for column metadata)
 	QueryDatabaseCollation();
+}
+
+void MSSQLCatalog::ValidateThroughPool() {
+	// The first login under mssql_attach_validation_timeout, every later one
+	// under mssql_connection_timeout.
+	const int validation_timeout =
+		startup_.validation_timeout_seconds > 0 ? startup_.validation_timeout_seconds : pool_config_.connection_timeout;
+	connect_timeout_->store(validation_timeout);
+	std::string why;
+	auto connection = connection_pool_->Acquire(validation_timeout * 1000, &why);
+	connect_timeout_->store(pool_config_.connection_timeout);
+	if (!connection) {
+		// The pool's own framing ("pool 'x' could not create a connection: ")
+		// is dropped: here the connection is the ATTACH's, and the factory's
+		// reason -- already classified -- is the message.
+		const std::string marker = "could not create a connection: ";
+		const auto at = why.find(marker);
+		throw InvalidInputException("MSSQL connection validation failed: %s",
+									at == std::string::npos ? why : why.substr(at + marker.size()));
+	}
+	connection_info_->utf8_support_acked = connection->UTF8SupportAcked() ? 1 : 0;
+	// Under TLS a login can succeed while the data path fails, which only a
+	// query shows.
+	if (connection_info_->use_encrypt) {
+		string error;
+		try {
+			auto result = MSSQLSimpleQuery::Execute(*connection, "SELECT 1");
+			if (!result.success) {
+				error = result.error_message;
+			}
+		} catch (std::exception &e) {
+			error = ErrorData(e).RawMessage();
+		}
+		if (!error.empty()) {
+			connection->Close();
+			connection_pool_->Release(connection);
+			throw InvalidInputException(
+				"MSSQL connection validation failed: TLS connection established but validation query failed. The "
+				"server may have network issues or TLS may be misconfigured. Details: %s",
+				MSSQLTranslateConnectionError(error, connection_info_->host, connection_info_->port,
+											  connection_info_->user, connection_info_->database));
+		}
+	}
+	connection_pool_->Release(connection);
 }
 
 void MSSQLCatalog::QueryDatabaseCollation() {
@@ -1521,12 +1596,11 @@ unique_ptr<MSSQLMetadataCache> MSSQLCatalog::CreateTransactionMetadataCache(Clie
 	return cache;
 }
 
-void MSSQLCatalog::NoteTransactionChange(ClientContext &context, const string &schema, const string &table,
-										 bool dropped) {
+void MSSQLCatalog::NoteTransactionChange(ClientContext &context, const string &schema, const string &table) {
 	if (context.transaction.IsAutoCommit()) {
 		return;
 	}
-	MSSQLTransaction::Get(context, *this).Metadata(context).MarkChanged(schema, table, dropped);
+	MSSQLTransaction::Get(context, *this).Metadata(context).MarkChanged(schema, table);
 }
 
 void MSSQLCatalog::NoteTransactionChangeLocally(ClientContext &context) {
@@ -1566,66 +1640,37 @@ static int GetCatalogWarmDebugLevel() {
 		}                                                                \
 	} while (0)
 
-void MSSQLCatalog::WarmSharedCache(const std::set<std::pair<string, string>> &tables) noexcept {
+void MSSQLCatalog::PublishTransactionMetadata(MSSQLTransactionMetadata &metadata) noexcept {
 	try {
-		if (tables.empty() || !metadata_cache_ || !connection_pool_ || GetConnectionLimit() <= 1) {
+		if (!metadata_cache_ || metadata.IsAllChanged()) {
 			return;
 		}
-		// What is missing, decided without I/O: a table the shared cache holds
-		// is served from it, and one the filter hides is never loaded (review
-		// of #386: GetTableMetadata applies no filter).
-		vector<std::pair<string, string>> missing;
-		for (const auto &key : tables) {
-			if (!catalog_filter_.MatchesSchema(key.first) || !catalog_filter_.MatchesTable(key.second)) {
+		if (StringUtil::Contains(StringUtil::Upper(TransactionIsolationStatement()), "UNCOMMITTED")) {
+			return;
+		}
+		const uint64_t epoch = metadata.SharedEpochAtStart();
+		vector<string> schema_names;
+		std::chrono::steady_clock::time_point schemas_loaded_at;
+		if (metadata.Cache().TryGetLoadedSchemaNames(schema_names, schemas_loaded_at)) {
+			metadata_cache_->PublishSchemaNames(schema_names, schemas_loaded_at, epoch);
+		}
+		idx_t published = 0;
+		for (const auto &key : metadata.GetLoadedTables()) {
+			if (metadata.IsChanged(key.first, key.second) || !catalog_filter_.MatchesSchema(key.first) ||
+				!catalog_filter_.MatchesTable(key.second)) {
 				continue;
 			}
-			MSSQLTableMetadata cached;
-			if (metadata_cache_->TryGetLoadedTableMetadata(key.first, key.second, cached)) {
-				continue;
-			}
-			missing.push_back(key);
-			if (missing.size() > WARM_TABLES_LIMIT) {
-				MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: more than %llu tables missing, left to lazy loading",
-										(unsigned long long)WARM_TABLES_LIMIT);
-				return;
+			MSSQLTableMetadata meta;
+			if (metadata.Cache().TryGetLoadedTableMetadata(key.first, key.second, meta) &&
+				metadata_cache_->PublishTableMetadata(key.first, meta, epoch)) {
+				published++;
 			}
 		}
-		if (missing.empty()) {
-			return;
-		}
-		// Idle only: a busy pool, or one with caching off, is not worth a login
-		// on COMMIT's path.
-		auto connection = connection_pool_->TryAcquireIdleOnly();
-		if (!connection) {
-			MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: no idle connection, skipped");
-			return;
-		}
-		idx_t loaded = 0;
-		for (const auto &key : missing) {
-			// One table's failure does not abandon the rest -- unless it left the
-			// connection unusable.
-			try {
-				MSSQLTableMetadata meta;
-				if (metadata_cache_->GetTableMetadata(*connection, key.first, key.second, meta)) {
-					loaded++;
-				}
-			} catch (std::exception &e) {
-				MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: '%s.%s' not loaded: %s", key.first.c_str(),
-										key.second.c_str(), ErrorData(e).RawMessage().c_str());
-			} catch (...) {
-				MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: '%s.%s' not loaded", key.first.c_str(),
-										key.second.c_str());
-			}
-			if (connection->GetState() != tds::ConnectionState::Idle) {
-				break;
-			}
-		}
-		connection_pool_->Release(connection);
-		MSSQL_CATALOG_DEBUG_LOG(1, "WarmSharedCache: loaded %llu of %llu missing table(s)", (unsigned long long)loaded,
-								(unsigned long long)missing.size());
+		MSSQL_CATALOG_DEBUG_LOG(1, "PublishTransactionMetadata: %llu table(s) published",
+								(unsigned long long)published);
 	} catch (...) {
-		// Opportunistic: nothing here may fail a COMMIT that has already
-		// happened on the server.
+		// In memory and opportunistic: nothing here may fail a COMMIT that has
+		// already happened on the server. The names stay unloaded, as before.
 	}
 }
 

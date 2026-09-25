@@ -167,9 +167,7 @@ classDiagram
     class ConnectionPool {
         +Acquire(timeout) shared_ptr~TdsConnection~
         +TryAcquire() shared_ptr~TdsConnection~
-        +TryAcquireIdleOnly() shared_ptr~TdsConnection~
         +Release(handle)
-        +Adopt(connection) bool
         +Prewarm(target) count
         +Shutdown() noexcept
         -factory : function~TdsConnection()~
@@ -192,8 +190,9 @@ classDiagram
 
 - **A failed creation is not a full pool (issue #302, spec 073).** The factory THROWS with the reason (the server's login error, a refused dial, an expired token — `ConnectionException`); `CreateNewConnection` catches, records `last_create_error_` with the time it was recorded (`mssql_pool_stats.last_create_error_age_ms`), returns nullptr. A creation success clears it; a reuse clears neither it nor the backoff, because a warm connection says nothing about whether login works — the age is how a reader tells a live failure from an outlived one. `Acquire` then: nothing active → return at once (a `Release` cannot come); others active → keep waiting for the caller's budget but retry creation on a backoff (250 ms → 4 s), never on every wakeup. `ConnectionProvider` renders `GetLastCreateError()` into the exception. Before this, a factory failure fell through to the exhausted-pool wait and reported "(timeout)" after `acquire_timeout`.
 - **The Azure AD factory holds a secret NAME and the `DatabaseInstance`, never a token.** A token lives 60 minutes; the factory captured the ATTACH-time bytes and presented them for every refill, and Azure SQL drops such a connection without an error token. Refresh goes through `AcquireToken(DatabaseInstance &, …, allow_interactive=false)` — a `ClientContext` cannot be captured (the ATTACH context is gone; issue #178's constraint) and `SecretManager` / the system transaction have `DatabaseInstance` forms. Fixed tokens and interactive chains fail by name from the token's own `exp`, before dialing.
-- **`min_connections` are opened at ATTACH, concurrently (issue #324).** `Prewarm(target)` reserves the missing slots in `total_connections` under the lock so a concurrent `Acquire` cannot overshoot the limit, then runs one login per thread outside it, and parks what succeeded as idle. The bookkeeping is `Acquire`'s own (`RecordCreateSuccessLocked` / `RecordCreateFailureLocked`): a success clears the backoff and the recorded error; a failure, even beside successes, is recorded and arms the backoff, so `creation_failures` and `last_create_error` never disagree. A throw from a login, `std::exception` or not, is a failed login; the logins' threads are joined whatever happens, and slots reserved for failures are given back. `MSSQLCatalog::Initialize` calls it right after building the pool, before the collation query, so that query runs on a warm connection. Before that, `Adopt` makes the connection that ATTACH's eager validation logged in the pool's first idle connection. The validators return that connection instead of closing it; it was logged in with the factory's parameters. A plain ATTACH is therefore one login, not two. It is taken only when the validation query's answer was read completely (a half-read answer would be the next statement's first tokens; such a connection is closed). It is skipped under `lazy_validation`, and its failures never fail the ATTACH. Before #324, `min_connections` only kept idle connections from being reaped; it still only keeps them after ATTACH: a connection lost later is re-opened on demand, not by the cleanup thread, which would otherwise dial a dead server every few seconds and keep DETACH waiting on the attempt.
-- **One way into the idle queue.** `Release`, `Adopt` and `Prewarm` all go through `PoolIfReusableLocked`: Idle, alive, caching on, pool up — else closed. `mssql_connection_cache = false` therefore means no idle connection from any path (review of #386: `Adopt` and `Prewarm` had bypassed it).
+- **`min_connections` are opened at ATTACH, concurrently (issue #324).** `Prewarm(target)` reserves the missing slots in `total_connections` under the lock so a concurrent `Acquire` cannot overshoot the limit, then runs one login per thread outside it, and parks what succeeded as idle. The bookkeeping is `Acquire`'s own (`RecordCreateSuccessLocked` / `RecordCreateFailureLocked`): every failed login counts in `creation_failures`; when NOTHING opened the failure is also the pool's state -- backoff armed, `last_create_error` kept -- and beside connections that did open it is not, because `mssql_pool_stats` would otherwise report a transient refusal on a healthy pool (spec 073's rule). A throw from a login, `std::exception` or not, is a failed login; everything is allocated before the slots are reserved, the logins' threads are joined whatever happens, and slots reserved for failures are given back. `MSSQLCatalog::Initialize` calls it right after the validation, before the collation query, so that query runs on a warm connection; a shortfall is logged by the ATTACH as a WARNING, never fails it. Skipped under `lazy_validation`.
+- **ATTACH validates THROUGH the pool (review of #386).** With eager validation (spec 047 FR-011) `Initialize` takes the pool's first connection (`ValidateThroughPool`): the factory's own login is the check, so the connection that proved the credentials simply stays in the pool, and a plain ATTACH is one login. That login runs under `mssql_attach_validation_timeout` (the factories read their dial and login-read timeout from a shared value, set for that one login); under TLS a `SELECT 1` proves the data path. The factories classify their failures through `MSSQLTranslateConnectionError` (server error number and state included -- the 40613 serverless hint, the 18456 state), which every pool refill now reports too, and the ATTACH reports the factory's reason under "MSSQL connection validation failed". An Azure AD interactive chain acquires its token at ATTACH, where a `ClientContext` can prompt; the factory, which never prompts, finds it in `TokenCache`. This replaced four stand-alone validators and the adoption of their connection. Before #324, `min_connections` only kept idle connections from being reaped; it still only keeps them after ATTACH: a connection lost later is re-opened on demand, not by the cleanup thread, which would otherwise dial a dead server every few seconds and keep DETACH waiting on the attempt.
+- **One way into the idle queue.** `Release` and `Prewarm` both go through `PoolIfReusableLocked`: Idle, alive, caching on, pool up — else closed. `mssql_connection_cache = false` therefore means no idle connection from any path (review of #386: `Prewarm` had bypassed it).
 - One pool **per `MSSQLCatalog`** (no process-wide singleton — that was spec 047's headline fix). Lifetime is bounded by catalog lifetime.
 - Background `cleanup_thread_` reaps idle connections past `idle_timeout`. It parks on its **own** `cleanup_cv_` (notified only by `Shutdown()`, so DETACH doesn't wait out a blind 1-second sleep); `available_cv_` is reserved for `Acquire()` waiters — the invariant is that `Release()`'s `notify_one` always reaches a thread blocked on pool exhaustion, never the cleanup thread (spec 054 review).
 - DuckDB's quiescence contract requires every connection be released before `~MSSQLCatalog` runs; the pool's `Shutdown()` emits a warning + assertion if `active_connections_` is non-empty at teardown.
@@ -524,22 +523,28 @@ pool connection on B would then block on A's schema lock until
 `mssql_metadata_timeout` — the #380 hang itself.
 `mssql_invalidate_cache()` is allowed either way.
 
-**After the transaction, the shared layers are warmed** (issue #383,
-`MSSQLCatalog::WarmSharedCache`). On its own the rule above made a workload that
-runs everything in transactions (DuckLake) load each table's metadata once per
-transaction — the shared cache was never filled. Once COMMIT or ROLLBACK has
-returned the pinned connection, the tables the transaction loaded or changed
-that the shared metadata cache now LACKS — changed ones were just forgotten —
-are loaded into it: committed state, taken after the transaction rather than
-during it. It runs on COMMIT's path, synchronously, so it is kept small (review
-of #386): at most `WARM_TABLES_LIMIT` (5) tables, one by one; more are left to
-lazy loading, as the invalidation already arranged. What it skips costs no I/O:
-tables the shared cache still holds, names the table filter hides, and — after
-COMMIT — tables the transaction dropped. It takes only an IDLE pool connection
-(`TryAcquireIdleOnly`, never a login), is skipped on a pool of one connection,
-publishes nothing to the statistics provider (a count read now may lag the rows
-just written), and swallows its failures table by table (the names stay
-invalidated). A transaction's lookup reads the shared **metadata** cache too,
+**At the end of the transaction, what it loaded is published** (issue #383,
+`MSSQLCatalog::PublishTransactionMetadata`). On its own the rule above made a
+workload that runs everything in transactions (DuckLake) load each table's
+metadata once per transaction — the shared cache was never filled. At COMMIT and
+ROLLBACK, what the transaction loaded on its pinned connection and did NOT
+change is committed state, already in memory: it is put into the shared
+metadata cache — with the schema list it loaded, since loading that list clears
+the schema map — and nothing is sent to the server (review of #386: the reload
+this replaced ran a metadata query on COMMIT's path, where another session's
+uncommitted DDL could hold it until `mssql_metadata_timeout`, or two aliases of
+one database deadlock one session). Withheld: what the transaction changed
+(forgotten, as before), everything after a change it cannot see through
+(`mssql_exec` DDL), everything under READ UNCOMMITTED (its reads may be
+another session's uncommitted state), names the table filter hides, and
+everything when the shared cache was invalidated while the transaction ran —
+`MSSQLMetadataCache::GetInvalidationEpoch`, read when the transaction first
+loads, compared by `PublishTableMetadata` under the cache mutex. That last rule
+is deliberately coarse: it withholds a DDL transaction's reads along with its
+changes (an ALTER forgets the whole schema's columns), and a DDL-free
+transaction, the common one, is unaffected. The row count is not carried: it
+may predate rows the transaction wrote, and the planner reads the catalog's
+copy first. A transaction's lookup reads the shared **metadata** cache too,
 after the table filter and before going to the server; the entry built from it
 goes into the transaction's OWN layer, because its rowid key may still be
 discovered on the pinned connection and a failed discovery is cached in the
@@ -559,17 +564,19 @@ flowchart TD
     M -- no --> P
     C -- yes --> P["load on the PINNED connection<br/>into the transaction's layer"]
     P --> E
-    X["COMMIT / ROLLBACK"] --> F["shared layers forget<br/>the changed names"]
-    F --> W{"≤ 5 touched tables<br/>missing, idle connection?"}
-    W -- yes --> G["load them into the<br/>shared metadata cache"]
-    W -- no --> Z["left to lazy loading"]
+    X["COMMIT / ROLLBACK"] --> U{"shared cache invalidated<br/>since the first load?"}
+    U -- no --> G["publish what it loaded and<br/>did not change (in memory)"]
+    U -- yes --> F
+    G --> F["shared layers forget<br/>the changed names"]
 ```
 
-Why not load into the shared layers from the pinned connection, which is the
-obvious fix: measured, it leaks. After ROLLBACK a table created in the
-transaction stayed bound as a phantom, and a second connection found the
-uncommitted table in the cache while the transaction was open, then hung
-reading it. Other paths that used to reach the pool from inside a transaction
+Why not load into the shared layers from the pinned connection DURING the
+transaction, which is the obvious fix: measured, it leaks. After ROLLBACK a
+table created in the transaction stayed bound as a phantom, and a second
+connection found the uncommitted table in the cache while the transaction was
+open, then hung reading it. Publication at the end avoids both: a changed name
+is never published, and nothing is visible to others before the transaction
+has ended. Other paths that used to reach the pool from inside a transaction
 follow the same rule: the rowid key discovery (`EnsurePKLoaded`) and the schema
 list load go on the pinned connection, and the storage info a table listing asks
 for uses the row count loaded with the entry instead of a DMV query per table

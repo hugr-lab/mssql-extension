@@ -108,15 +108,6 @@ public:
 	//! of #382). Neither form counts in acquire_count or acquire_timeout_count.
 	std::shared_ptr<TdsConnection> TryAcquire(std::string *failure = nullptr, bool *creation_failed = nullptr);
 
-	//! An IDLE connection or null -- never a login. For work that is worth
-	//! doing only if it costs no dial: the cache warm-up after a transaction
-	//! (issue #383), which with `mssql_connection_cache = false`, or after the
-	//! pinned connection was closed, finds nothing idle and is skipped rather
-	//! than paying a TCP+TLS+LOGIN7 on COMMIT's path (review of #386). A
-	//! connection it returns is counted in acquire_count like any checkout; a
-	//! null is counted nowhere.
-	std::shared_ptr<TdsConnection> TryAcquireIdleOnly();
-
 	// Release a connection back to the pool
 	void Release(std::shared_ptr<TdsConnection> conn);
 
@@ -126,15 +117,12 @@ public:
 	//! (~175 ms on loopback), so N of them cost about one instead of N.
 	//! Blocks until every login has finished. Returns how many were opened;
 	//! a failure does not throw -- the pool opens the rest on demand as before
-	//! -- and its reason is recorded like any creation failure and, if
-	//! `failure` is given, handed back.
+	//! -- and, if `failure` is given, its reason is handed back. The pool
+	//! records it like any creation failure (backoff, last_create_error) only
+	//! when NOTHING opened: beside connections that did, a transient refusal
+	//! is not the state of a healthy pool (review of #386, spec 073's rule);
+	//! it is counted in creation_failures either way.
 	size_t Prewarm(size_t target, std::string *failure = nullptr);
-
-	//! Issue #324: take a connection logged in elsewhere -- the one ATTACH's
-	//! validation opened with the factory's own parameters -- as an idle
-	//! connection of this pool. Returns false (and closes it) when the pool is
-	//! full, shut down, or the connection is not Idle.
-	bool Adopt(std::shared_ptr<TdsConnection> conn);
 
 	// Get current pool statistics
 	PoolStatistics GetStats() const;
@@ -218,11 +206,10 @@ private:
 	std::shared_ptr<TdsConnection> AcquireImpl(int timeout_ms, std::string *failure, bool optional,
 											   bool *creation_failed);
 	std::shared_ptr<TdsConnection> TryAcquireIdle();
-	// The one way a connection enters idle_connections_ -- Release, Adopt and
-	// Prewarm alike (review of #386: the two copies had dropped Release's
-	// guards). Pools `conn` when the pool is up, caching is on and the
-	// connection is Idle and alive; otherwise closes it. pool_mutex_ held.
-	// Returns whether it was pooled; the caller owns the stats either way.
+	// The one way a connection enters idle_connections_ -- Release and Prewarm
+	// alike (review of #386: the Prewarm copy had dropped Release's guards). Pools `conn` when the pool is up, caching
+	// is on and the connection is Idle and alive; otherwise closes it. pool_mutex_ held. Returns whether it was pooled;
+	// the caller owns the stats either way.
 	bool PoolIfReusableLocked(std::shared_ptr<TdsConnection> &conn, uint64_t connection_id);
 	// The bookkeeping of a creation that succeeded / failed, shared by
 	// AcquireImpl and Prewarm (issue #302's backoff and recorded reason).

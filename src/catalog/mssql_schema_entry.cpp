@@ -394,7 +394,7 @@ void MSSQLSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 		// Point invalidation: invalidate schema's table list and local table set
 		mssql_catalog.InvalidateSchemaTableSet(name.GetIdentifierName());
 		mssql_catalog.NoteTransactionChange(context, name.GetIdentifierName(),
-											info.GetQualifiedName().Name().GetIdentifierName(), true);
+											info.GetQualifiedName().Name().GetIdentifierName());
 		return;
 	}
 

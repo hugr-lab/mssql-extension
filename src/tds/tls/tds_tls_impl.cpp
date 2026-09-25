@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 
 #ifdef _WIN32
@@ -251,16 +252,25 @@ static int CustomBioDestroy(BIO *bio) {
 }
 
 // Create custom BIO method (thread-safe singleton)
+// Built once, under std::call_once: ConnectionPool::Prewarm runs several TLS
+// handshakes at once on raw threads (issue #324), and a plain lazy `if
+// (!method)` let a racing thread see the pointer before its five callbacks
+// were set, or build a second method (review of #386).
 static BIO_METHOD *GetCustomBioMethod() {
+	static std::once_flag once;
 	static BIO_METHOD *method = nullptr;
-	if (!method) {
-		method = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_get_new_index(), "mssql_tds");
-		BIO_meth_set_write(method, CustomBioWrite);
-		BIO_meth_set_read(method, CustomBioRead);
-		BIO_meth_set_ctrl(method, CustomBioCtrl);
-		BIO_meth_set_create(method, CustomBioCreate);
-		BIO_meth_set_destroy(method, CustomBioDestroy);
-	}
+	std::call_once(once, []() {
+		BIO_METHOD *built = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_get_new_index(), "mssql_tds");
+		if (!built) {
+			return;
+		}
+		BIO_meth_set_write(built, CustomBioWrite);
+		BIO_meth_set_read(built, CustomBioRead);
+		BIO_meth_set_ctrl(built, CustomBioCtrl);
+		BIO_meth_set_create(built, CustomBioCreate);
+		BIO_meth_set_destroy(built, CustomBioDestroy);
+		method = built;
+	});
 	return method;
 }
 

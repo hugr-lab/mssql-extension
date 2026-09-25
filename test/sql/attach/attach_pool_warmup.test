@@ -80,9 +80,21 @@ DETACH pwl;
 statement ok
 RESET mssql_connection_limit;
 
-# lazy_validation promises not to touch the server at ATTACH: nothing opened.
-statement ok
+# lazy_validation promises not to touch the server at ATTACH, and the ATTACH
+# option min_connections asks it to: refused, as preload beside it is (review
+# of #386 -- the two used to answer the same conflict in opposite ways).
+statement error
 ATTACH '{MSSQL_TESTDB_DSN}' AS pwz (TYPE mssql, min_connections 3, lazy_validation true, catalog false);
+----
+min_connections and lazy_validation contradict each other
+
+# The SETTING is session-wide, not this ATTACH's request: under
+# lazy_validation it opens nothing.
+statement ok
+SET mssql_min_connections = 3;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pwz (TYPE mssql, lazy_validation true, catalog false);
 
 query I
 SELECT connections_created FROM mssql_pool_stats('pwz');
@@ -91,6 +103,9 @@ SELECT connections_created FROM mssql_pool_stats('pwz');
 
 statement ok
 DETACH pwz;
+
+statement ok
+RESET mssql_min_connections;
 
 statement error
 ATTACH '{MSSQL_TESTDB_DSN}' AS pwn (TYPE mssql, min_connections -1);
@@ -178,6 +193,24 @@ statement error
 ATTACH '{MSSQL_TESTDB_DSN}' AS pwt2 (TYPE mssql, preload true);
 ----
 cannot run inside a transaction that has used an MSSQL catalog
+
+statement ok
+ROLLBACK;
+
+# ... refused before the ATTACH dials: against a server that cannot be reached
+# the error is still the refusal (review of #386).
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) > 0 FROM pwt.dbo.TestSimplePK;
+----
+true
+
+statement error
+ATTACH 'Server=127.0.0.1,1;Database=x;User Id=u;Password=p;TrustServerCertificate=yes' AS pwt3 (TYPE mssql, preload true);
+----
+preload cannot run inside a transaction that has used an MSSQL catalog
 
 statement ok
 ROLLBACK;

@@ -1,5 +1,5 @@
 # name: test/sql/transaction/transaction_metadata_warm.test
-# description: What a transaction loaded or changed, and the shared cache lacks, is loaded into it after the transaction ends -- up to 5 tables (issue #383)
+# description: What a transaction loaded and did not change is published into the shared cache at its end, with no round trip (issue #383)
 # group: [transaction]
 # issue: 383
 
@@ -9,13 +9,14 @@
 # Inside a transaction a catalog miss is loaded on the pinned connection into
 # the transaction's own cache and never into the shared one (#380). Alone,
 # that made every transaction of a transaction-only workload (DuckLake) pay a
-# metadata round trip per table it touched. After COMMIT or ROLLBACK the
-# tables the transaction loaded or changed, and the shared cache now lacks,
-# are loaded into it on an IDLE pool connection -- committed state, taken
-# after the transaction -- one by one, and only when there are at most 5 of
-# them: the load runs on COMMIT's path, so more is left to lazy loading
-# (review of #386). Inside a transaction the shared cache is read too, into
-# the transaction's own layer. Not on a pool of one connection.
+# metadata round trip per table it touched. At COMMIT and ROLLBACK what the
+# transaction loaded and did NOT change is committed state, already in memory:
+# it is published into the shared cache. No round trip on COMMIT's path -- the
+# reload that preceded this design could wait there on another session's
+# uncommitted DDL for the metadata timeout (review of #386). Not published:
+# what the transaction changed (forgotten, as before), anything after a change
+# it cannot see through, anything under READ UNCOMMITTED, and anything at all
+# if the shared cache was invalidated while the transaction ran.
 #
 # The lever: mssql_test_fail_metadata_after_rows = 1 makes any metadata query
 # fail. A read that succeeds under it ran none.
@@ -28,19 +29,19 @@ statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS w383 (TYPE mssql);
 
 statement ok
-SELECT mssql_exec('w383', 'DROP TABLE IF EXISTS dbo.w383_t, dbo.w383_rb; DROP TABLE IF EXISTS w383.t1; DROP TABLE IF EXISTS w383.t2; DROP TABLE IF EXISTS w383.t3; DROP TABLE IF EXISTS w383.t4; DROP TABLE IF EXISTS w383.t5; DROP TABLE IF EXISTS w383.t6; DROP TABLE IF EXISTS w383.t7; DROP TABLE IF EXISTS w383.t8; DROP TABLE IF EXISTS w383.t9; DROP TABLE IF EXISTS w383.t10; DROP SCHEMA IF EXISTS w383');
+SELECT mssql_exec('w383', 'DROP TABLE IF EXISTS dbo.w383_t, dbo.w383_rb, dbo.w383_other; DROP TABLE IF EXISTS w383.t1; DROP TABLE IF EXISTS w383.t2; DROP TABLE IF EXISTS w383.t3; DROP TABLE IF EXISTS w383.t4; DROP TABLE IF EXISTS w383.t5; DROP TABLE IF EXISTS w383.t6; DROP SCHEMA IF EXISTS w383');
 
 statement ok
-SELECT mssql_exec('w383', 'CREATE TABLE dbo.w383_t (id int NOT NULL PRIMARY KEY); INSERT INTO dbo.w383_t VALUES (1), (2)');
+SELECT mssql_exec('w383', 'CREATE TABLE dbo.w383_t (id int NOT NULL PRIMARY KEY); INSERT INTO dbo.w383_t VALUES (1), (2); CREATE TABLE dbo.w383_other (id int NOT NULL)');
 
 statement ok
-SELECT mssql_exec('w383', 'EXEC(''CREATE SCHEMA w383''); CREATE TABLE w383.t1 (id int NOT NULL); CREATE TABLE w383.t2 (id int NOT NULL); CREATE TABLE w383.t3 (id int NOT NULL); CREATE TABLE w383.t4 (id int NOT NULL); CREATE TABLE w383.t5 (id int NOT NULL); CREATE TABLE w383.t6 (id int NOT NULL); CREATE TABLE w383.t7 (id int NOT NULL); CREATE TABLE w383.t8 (id int NOT NULL); CREATE TABLE w383.t9 (id int NOT NULL); CREATE TABLE w383.t10 (id int NOT NULL);');
+SELECT mssql_exec('w383', 'EXEC(''CREATE SCHEMA w383''); CREATE TABLE w383.t1 (id int NOT NULL); CREATE TABLE w383.t2 (id int NOT NULL); CREATE TABLE w383.t3 (id int NOT NULL); CREATE TABLE w383.t4 (id int NOT NULL); CREATE TABLE w383.t5 (id int NOT NULL); CREATE TABLE w383.t6 (id int NOT NULL);');
 
 statement ok
 SELECT mssql_invalidate_cache('w383');
 
 #------------------------------------------------------------------------------
-# A few tables: loaded one by one after COMMIT.
+# A table the transaction read is published at COMMIT.
 #------------------------------------------------------------------------------
 
 statement ok
@@ -79,8 +80,8 @@ statement ok
 RESET mssql_test_fail_metadata_after_rows;
 
 #------------------------------------------------------------------------------
-# More than 5 tables missing: nothing is loaded after COMMIT, and the next
-# transaction loads on its own -- which the lever turns into an error.
+# There is no limit: publishing costs no I/O, so the six tables of a DuckLake-
+# sized transaction are all there for the next one.
 #------------------------------------------------------------------------------
 
 statement ok
@@ -101,8 +102,142 @@ SET mssql_test_fail_metadata_after_rows = 1;
 statement ok
 BEGIN;
 
+query I
+SELECT (SELECT count(*) FROM w383.w383.t1) + (SELECT count(*) FROM w383.w383.t6);
+----
+0
+
+statement ok
+COMMIT;
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
+
+#------------------------------------------------------------------------------
+# A table the transaction CHANGED is not published -- it is forgotten, and the
+# next read loads it (the lever turns that into an error). Nor is a table it
+# only read beside it: DDL through the catalog invalidates the shared cache
+# (ALTER forgets the whole schema's column metadata), and any invalidation
+# while the transaction ran withholds everything it loaded -- conservative, and
+# a DDL-free transaction, the common one, is unaffected.
+#------------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('w383', 'CREATE TABLE dbo.w383_rb (id int NOT NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('w383');
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM w383.dbo.w383_t;
+----
+2
+
+query I
+SELECT count(*) FROM w383.dbo.w383_rb;
+----
+0
+
+statement ok
+ALTER TABLE w383.dbo.w383_rb ADD COLUMN extra INTEGER;
+
+statement ok
+COMMIT;
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
 statement error
-SELECT count(*) FROM w383.w383.t1;
+SELECT count(*) FROM w383.dbo.w383_t;
+----
+mssql_test_fail_metadata_after_rows
+
+statement error
+SELECT count(*) FROM w383.dbo.w383_rb;
+----
+mssql_test_fail_metadata_after_rows
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
+
+query T
+SELECT column_name FROM (DESCRIBE w383.dbo.w383_rb) ORDER BY column_name;
+----
+extra
+id
+
+#------------------------------------------------------------------------------
+# DDL the extension cannot see through (mssql_exec) makes the whole
+# transaction's view unpublishable -- and after ROLLBACK the shared cache
+# holds the committed shape, not the one the transaction read.
+#------------------------------------------------------------------------------
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT mssql_exec('w383', 'ALTER TABLE dbo.w383_t ADD tx_only int NULL');
+
+query II
+SELECT count(*), count(tx_only) FROM w383.dbo.w383_t;
+----
+2	0
+
+statement ok
+ROLLBACK;
+
+statement ok
+SET mssql_exec_invalidate_cache = false;
+
+query T
+SELECT column_name FROM (DESCRIBE w383.dbo.w383_t);
+----
+id
+
+#------------------------------------------------------------------------------
+# An invalidation elsewhere while the transaction ran: nothing it loaded is
+# published -- a DDL through this catalog may have forgotten a name the
+# transaction read before it.
+#------------------------------------------------------------------------------
+
+# Only w383_t is forgotten, so the schema list stays loaded and what decides
+# the read below is w383_t alone; the invalidation that withholds it comes
+# from another session, in another schema.
+statement ok
+SELECT mssql_invalidate_cache('w383', 'dbo', 'w383_t');
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM w383.dbo.w383_t;
+----
+2
+
+statement ok con2
+SELECT mssql_invalidate_cache('w383', 'w383', 't1');
+
+statement ok
+COMMIT;
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+# Read inside a transaction: that lookup takes the shared metadata cache as it
+# is, so it succeeds exactly when w383_t was published. (An autocommit read
+# would also reload the schema's table list, which the invalidation dropped,
+# and fail either way.)
+statement ok
+BEGIN;
+
+statement error
+SELECT count(*) FROM w383.dbo.w383_t;
 ----
 mssql_test_fail_metadata_after_rows
 
@@ -113,56 +248,8 @@ statement ok
 RESET mssql_test_fail_metadata_after_rows;
 
 #------------------------------------------------------------------------------
-# After ROLLBACK the warm-up loads COMMITTED state. The transaction adds a
-# column on its pinned connection and reads the table with it; the rollback
-# forgets the table in the shared cache, and the warm-up reloads it without
-# the column. Under the lever the next read succeeds only if the warm-up ran,
-# and shows only if it loaded the committed shape. (Removing the warm-up makes
-# the DESCRIBE fail on the lever; a warm-up that published the transaction's
-# view would show `extra`.)
+# A table the transaction dropped is gone for the next statement.
 #------------------------------------------------------------------------------
-
-statement ok
-SET mssql_exec_invalidate_cache = true;
-
-statement ok
-BEGIN;
-
-statement ok
-SELECT mssql_exec('w383', 'ALTER TABLE dbo.w383_t ADD extra int NULL');
-
-query II
-SELECT count(*), count(extra) FROM w383.dbo.w383_t;
-----
-2	0
-
-statement ok
-ROLLBACK;
-
-statement ok
-SET mssql_exec_invalidate_cache = false;
-
-statement ok
-SET mssql_test_fail_metadata_after_rows = 1;
-
-query T
-SELECT column_name FROM (DESCRIBE w383.dbo.w383_t);
-----
-id
-
-statement ok
-RESET mssql_test_fail_metadata_after_rows;
-
-#------------------------------------------------------------------------------
-# A table the transaction dropped is not loaded after COMMIT (it cannot be),
-# and is gone for the next statement.
-#------------------------------------------------------------------------------
-
-statement ok
-SELECT mssql_exec('w383', 'CREATE TABLE dbo.w383_rb (id int NOT NULL)');
-
-statement ok
-SELECT mssql_invalidate_cache('w383');
 
 statement ok
 BEGIN;
@@ -189,17 +276,52 @@ SELECT count(*) FROM w383.dbo.w383_rb;
 does not exist
 
 statement ok
-SELECT mssql_exec('w383', 'DROP TABLE IF EXISTS dbo.w383_t; DROP TABLE IF EXISTS w383.t1; DROP TABLE IF EXISTS w383.t2; DROP TABLE IF EXISTS w383.t3; DROP TABLE IF EXISTS w383.t4; DROP TABLE IF EXISTS w383.t5; DROP TABLE IF EXISTS w383.t6; DROP TABLE IF EXISTS w383.t7; DROP TABLE IF EXISTS w383.t8; DROP TABLE IF EXISTS w383.t9; DROP TABLE IF EXISTS w383.t10; DROP SCHEMA IF EXISTS w383');
+SELECT mssql_exec('w383', 'DROP TABLE IF EXISTS dbo.w383_t, dbo.w383_other; DROP TABLE IF EXISTS w383.t1; DROP TABLE IF EXISTS w383.t2; DROP TABLE IF EXISTS w383.t3; DROP TABLE IF EXISTS w383.t4; DROP TABLE IF EXISTS w383.t5; DROP TABLE IF EXISTS w383.t6; DROP SCHEMA IF EXISTS w383');
 
 statement ok
 DETACH w383;
 
 #------------------------------------------------------------------------------
+# READ UNCOMMITTED: what the transaction read may be another session's
+# uncommitted state, so nothing is published.
+#------------------------------------------------------------------------------
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS w383ru (TYPE mssql, transaction_isolation 'read_uncommitted');
+
+statement ok
+SELECT mssql_invalidate_cache('w383ru');
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) > 0 FROM w383ru.dbo.TestSimplePK;
+----
+true
+
+statement ok
+COMMIT;
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+statement error
+SELECT count(*) FROM w383ru.dbo.TestSimplePK;
+----
+mssql_test_fail_metadata_after_rows
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
+
+statement ok
+DETACH w383ru;
+
+#------------------------------------------------------------------------------
 # A table the shared cache's listing does not know is not "absent" inside a
 # transaction: after `preload` the listing of dbo is loaded, and a table
 # created behind the catalog's back (mssql_exec, no invalidation) is found in a
-# transaction exactly as in autocommit -- it used to be refused there as
-# "does not exist" (review of #386).
+# transaction exactly as in autocommit (review of #386).
 #------------------------------------------------------------------------------
 
 statement ok
@@ -231,9 +353,8 @@ statement ok
 DETACH w383p;
 
 #------------------------------------------------------------------------------
-# The table filter holds across the warm-up: a table it hides that a
-# transaction created is not loaded into the shared cache at COMMIT, and stays
-# hidden inside the next transaction.
+# The table filter holds: a table it hides that a transaction created stays
+# hidden inside the next transaction and outside it.
 #------------------------------------------------------------------------------
 
 statement ok
@@ -274,8 +395,7 @@ statement ok
 DETACH w383f;
 
 #------------------------------------------------------------------------------
-# A pool of one connection: no warm-up -- the next transaction loads again,
-# which the lever turns into an error.
+# A pool of one connection publishes too: nothing is dialled.
 #------------------------------------------------------------------------------
 
 statement ok
@@ -304,13 +424,13 @@ SET mssql_test_fail_metadata_after_rows = 1;
 statement ok
 BEGIN;
 
-statement error
-SELECT count(*) FROM w383one.dbo.TestSimplePK;
+query I
+SELECT count(*) > 0 FROM w383one.dbo.TestSimplePK;
 ----
-mssql_test_fail_metadata_after_rows
+true
 
 statement ok
-ROLLBACK;
+COMMIT;
 
 statement ok
 RESET mssql_test_fail_metadata_after_rows;
