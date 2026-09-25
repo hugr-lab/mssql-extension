@@ -448,7 +448,16 @@ bool TlsImpl::Initialize(const TlsOptions &options) {
 	}
 
 	// Create custom BIO and attach to SSL
-	ctx_->bio = BIO_new(GetCustomBioMethod());
+	BIO_METHOD *bio_method = GetCustomBioMethod();
+	if (!bio_method) {
+		// BIO_meth_new failed when the method was built (an allocation
+		// failure); BIO_new would dereference the null (review of #386).
+		ctx_->last_error_code = 1;	// INIT_FAILED
+		ctx_->last_error = "BIO_meth_new failed: " + FormatOpenSSLError();
+		MSSQL_TLS_DEBUG_LOG(1, "Initialize: FAILED - %s", ctx_->last_error.c_str());
+		return false;
+	}
+	ctx_->bio = BIO_new(bio_method);
 	if (!ctx_->bio) {
 		ctx_->last_error_code = 1;	// INIT_FAILED
 		ctx_->last_error = "BIO_new failed: " + FormatOpenSSLError();

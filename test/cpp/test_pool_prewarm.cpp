@@ -193,6 +193,20 @@ static void TestTotalFailure() {
 		  "dead: the pool records the reason (" + pool.GetLastCreateError() + ")");
 }
 
+//! Logged in, then not usable (dead or not Idle by the time the pool takes
+//! it): nothing opened for that slot, and the shortfall is reported like a
+//! failed login -- it used to be counted nowhere, and the ATTACH logged no
+//! WARNING although nothing had opened (review of #386).
+static void TestRejectedAfterLogin() {
+	ConnectionPool pool("prewarm-rejected", Pool(4), []() { return std::make_shared<TdsConnection>(); });
+	std::string why;
+	Check(pool.Prewarm(2, &why) == 0, "rejected: opened nothing");
+	auto stats = pool.GetStats();
+	Check(stats.total_connections == 0, "rejected: the slots are given back");
+	Check(stats.creation_failures == 2, "rejected: counted as failures");
+	Check(why.find("not usable after login") != std::string::npos, "rejected: the reason is handed back (" + why + ")");
+}
+
 //! A factory that throws something that is not a std::exception: a failed
 //! login, not std::terminate over running threads, and the slot given back.
 static void TestNonStandardThrow() {
@@ -235,6 +249,7 @@ int main() {
 	TestPartialFailure();
 	TestNonStandardThrow();
 	TestTotalFailure();
+	TestRejectedAfterLogin();
 	TestCachingOff();
 	if (g_failures > 0) {
 		std::cerr << g_failures << " check(s) failed" << std::endl;

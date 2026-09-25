@@ -542,9 +542,11 @@ everything when the shared cache was invalidated while the transaction ran —
 loads, compared by `PublishTableMetadata` under the cache mutex. That last rule
 is deliberately coarse: it withholds a DDL transaction's reads along with its
 changes (an ALTER forgets the whole schema's columns), and a DDL-free
-transaction, the common one, is unaffected. The row count is not carried: it
-may predate rows the transaction wrote, and the planner reads the catalog's
-copy first. A transaction's lookup reads the shared **metadata** cache too,
+transaction, the common one, is unaffected. The row count travels with the
+table: the planner reads the catalog's copy first, and a 0 there would plan
+every later scan estimate-less (review of #386). It is a count read under the
+transaction, as stale as one an autocommit load takes, and refreshed the same
+way (invalidation, TTL). A transaction's lookup reads the shared **metadata** cache too,
 after the table filter and before going to the server; the entry built from it
 goes into the transaction's OWN layer, because its rowid key may still be
 discovered on the pinned connection and a failed discovery is cached in the

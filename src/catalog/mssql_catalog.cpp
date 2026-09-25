@@ -83,9 +83,9 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 	  pool_config_(std::move(pool_config)),
 	  fedauth_token_utf16le_(std::move(fedauth_token_utf16le)),
 	  access_mode_(access_mode),
-	  catalog_enabled_(catalog_enabled),
 	  startup_(startup),
 	  connect_timeout_(std::make_shared<std::atomic<int>>(pool_config_.connection_timeout)),
+	  catalog_enabled_(catalog_enabled),
 	  default_schema_(connection_info_ && !connection_info_->default_schema.empty() ? connection_info_->default_schema
 																					: string("dbo")) {
 	// Create metadata cache with TTL from settings (0 = manual refresh only)

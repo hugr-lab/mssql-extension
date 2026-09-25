@@ -185,9 +185,11 @@ public:
 	//! round trip. Only when nothing was invalidated since `epoch` (a DDL through
 	//! this catalog may have forgotten a name the transaction read before it),
 	//! the schema is known here, and the cache does not already hold the table.
-	//! The row count is not carried: one read inside a transaction may predate
-	//! rows it then wrote, and MSSQLCatalogScanCardinality reads the catalog's
-	//! copy first. Returns whether it was published.
+	//! The row count travels with it: MSSQLCatalogScanCardinality and the
+	//! listing's storage info read it, and 0 would plan every later scan
+	//! estimate-less (review of #386). It is a count read under the
+	//! transaction, as stale as one an autocommit load takes -- refreshed by
+	//! invalidation or TTL, like that one. Returns whether it was published.
 	bool PublishTableMetadata(const string &schema_name, const MSSQLTableMetadata &meta, uint64_t epoch);
 	//! The schema list, when this cache has it loaded (not expired), and when
 	//! it was loaded -- a transaction's list, for PublishSchemaNames.

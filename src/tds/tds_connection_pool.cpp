@@ -518,8 +518,19 @@ size_t ConnectionPool::Prewarm(size_t target, std::string *failure) {
 			if (PoolIfReusableLocked(created[i], next_connection_id_++)) {
 				opened++;
 			} else {
+				// Logged in, then found dead or not Idle: nothing opened for
+				// this slot, and the shortfall must be reported like a failed
+				// login (review of #386: it was counted nowhere).
 				stats_.connections_closed++;
 				stats_.total_connections--;
+				failed++;
+				try {
+					errors[i] = "connection was not usable after login";
+				} catch (...) {
+				}
+				if (first_failed == to_create) {
+					first_failed = i;
+				}
 			}
 		}
 		stats_.creation_failures += failed;

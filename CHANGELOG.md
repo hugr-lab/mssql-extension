@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     closed and logged in again: a plain ATTACH is one login, not two. Pool
     refills now report the same classified reasons the ATTACH did (server error
     number and state: a paused serverless database, the 18456 login state).
+    Every ATTACH validation failure is now an `Invalid Input Error` reading
+    "MSSQL connection validation failed: …" -- a refused dial or an unknown
+    host used to be an `IO Error`, and an Azure AD failure read "MSSQL Azure AD
+    connection validation failed: …" (now "…: Azure AD authentication
+    failed: …").
   - **Measured on a local server:**
 
     | ATTACH | before | after |

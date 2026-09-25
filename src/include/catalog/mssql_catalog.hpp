@@ -150,7 +150,8 @@ public:
 	//! began loading (PublishTableMetadata) -- which any DDL through the
 	//! catalog does, the transaction's own included: coarse on purpose, and a
 	//! DDL-free transaction, the common one, is unaffected. The schema list it
-	//! loaded goes with it (PublishSchemaNames). A pool of one is no
+	//! loaded goes with it (PublishSchemaNames), and each table's row count
+	//! with the table. A pool of one is no
 	//! exception: nothing is dialled.
 	void PublishTransactionMetadata(MSSQLTransactionMetadata &metadata) noexcept;
 

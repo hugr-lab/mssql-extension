@@ -1791,9 +1791,7 @@ bool MSSQLMetadataCache::PublishTableMetadata(const string &schema_name, const M
 	if (table_it != tables.end() && IsColumnsFreshLocked(table_it->second)) {
 		return false;
 	}
-	MSSQLTableMetadata published = meta;
-	published.approx_row_count = 0;
-	tables[meta.name] = std::move(published);
+	tables[meta.name] = meta;
 	return true;
 }
 

@@ -76,6 +76,13 @@ SELECT count(*) FROM w383.dbo.w383_t;
 ----
 2
 
+# And the row count travels with it: the planner still has its estimate (a 0
+# published there planned every later scan estimate-less -- review of #386).
+query II con2
+EXPLAIN SELECT * FROM w383.dbo.w383_t;
+----
+physical_plan	<REGEX>:.*~2 rows.*
+
 statement ok
 RESET mssql_test_fail_metadata_after_rows;
 
