@@ -5,7 +5,8 @@
 
 namespace duckdb {
 
-MSSQLTransactionMetadata::MSSQLTransactionMetadata(unique_ptr<MSSQLMetadataCache> cache) : cache_(std::move(cache)) {}
+MSSQLTransactionMetadata::MSSQLTransactionMetadata(unique_ptr<MSSQLMetadataCache> cache, uint64_t shared_epoch)
+	: cache_(std::move(cache)), shared_epoch_(shared_epoch) {}
 
 MSSQLTransactionMetadata::~MSSQLTransactionMetadata() = default;
 
@@ -110,6 +111,15 @@ bool MSSQLTransactionMetadata::IsSchemaChanged(const string &schema) {
 		}
 	}
 	return false;
+}
+
+std::set<std::pair<string, string>> MSSQLTransactionMetadata::GetLoadedTables() {
+	std::lock_guard<std::mutex> guard(lock_);
+	std::set<Key> loaded;
+	for (const auto &pair : entries_) {
+		loaded.insert(pair.first);
+	}
+	return loaded;
 }
 
 bool MSSQLTransactionMetadata::IsAllChanged() {

@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
@@ -303,15 +305,6 @@ struct MSSQLStorageExtensionInfo : public StorageExtensionInfo {
 //===----------------------------------------------------------------------===//
 // Registration and callbacks
 //===----------------------------------------------------------------------===//
-
-// Validate connection by attempting to connect and authenticate
-// Throws IOException or InvalidInputException with descriptive error on failure
-void ValidateConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30);
-
-// Spec 042: Validate an Integrated-Auth (Kerberos / SSPI) connection at ATTACH time
-// so credential / SPN / clock-skew / KDC-reachability errors surface immediately.
-// The LOGIN7 fragmentation boundary (issue #138) is read from info.login7_max_packet.
-void ValidateIntegratedAuthConnection(const MSSQLConnectionInfo &info, int timeout_seconds = 30);
 
 // Register storage extension for ATTACH TYPE mssql
 void RegisterMSSQLStorageExtension(ExtensionLoader &loader);

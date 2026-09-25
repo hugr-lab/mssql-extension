@@ -106,6 +106,16 @@ void ForgetTransactionMetadata(duckdb::MSSQLCatalog &catalog, duckdb::MSSQLTrans
 	}
 }
 
+// Issue #383: what the transaction loaded itself, and did not change, is
+// committed state -- publish it into the shared cache before the transaction's
+// metadata goes. In memory only: no round trip on COMMIT's or ROLLBACK's path.
+void PublishTransactionMetadata(duckdb::MSSQLCatalog &catalog, duckdb::MSSQLTransaction &txn) {
+	auto *metadata = txn.TryMetadata();
+	if (metadata) {
+		catalog.PublishTransactionMetadata(*metadata);
+	}
+}
+
 }  // anonymous namespace
 
 namespace duckdb {
@@ -165,7 +175,8 @@ MSSQLTransaction &MSSQLTransaction::Get(ClientContext &context, Catalog &catalog
 MSSQLTransactionMetadata &MSSQLTransaction::Metadata(ClientContext &context) {
 	lock_guard<mutex> lock(metadata_mutex_);
 	if (!metadata_) {
-		metadata_ = make_uniq<MSSQLTransactionMetadata>(catalog_.CreateTransactionMetadataCache(context));
+		metadata_ = make_uniq<MSSQLTransactionMetadata>(catalog_.CreateTransactionMetadataCache(context),
+														catalog_.GetMetadataCache().GetInvalidationEpoch());
 	}
 	return *metadata_;
 }
@@ -330,6 +341,7 @@ ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Tra
 		MSSQL_TXN_LOG("CommitTransaction: No active SQL Server transaction (no-op)");
 	}
 
+	PublishTransactionMetadata(catalog_, mssql_txn);
 	ForgetTransactionMetadata(catalog_, mssql_txn);
 	transactions_.erase(context);
 	return ErrorData();
@@ -393,6 +405,7 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 		MSSQL_TXN_LOG("RollbackTransaction: No active SQL Server transaction (no-op)");
 	}
 
+	PublishTransactionMetadata(catalog_, mssql_txn);
 	ForgetTransactionMetadata(catalog_, mssql_txn);
 
 	// Try to get the context to remove from our transaction map

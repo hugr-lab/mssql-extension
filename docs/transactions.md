@@ -340,6 +340,13 @@ ROLLBACK must not leave one behind. The shared cache is still read for names
 the transaction did not change, and at COMMIT or ROLLBACK it forgets the names
 the transaction changed. See `DATAMODEL.md`, "Inside an explicit transaction".
 
+At COMMIT or ROLLBACK, what the transaction loaded and did not change is
+published into the shared cache (issue #383) — from memory, with no round trip —
+so the next transaction finds it there instead of loading it again. Nothing is
+published after DDL the extension cannot see through, under READ UNCOMMITTED, or
+when the shared cache was invalidated while the transaction ran (any DDL through
+the catalog does that, the transaction's own included).
+
 Inside a transaction:
 
 | Call | |

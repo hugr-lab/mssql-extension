@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The pool opens its connections at ATTACH, in parallel; `preload` loads the
+  catalog at ATTACH** ([#324](https://github.com/hugr-lab/mssql-extension/issues/324)).
+  - **`mssql_min_connections` did not open anything.** It only kept idle
+    connections from being closed. The pool now opens that many connections
+    at ATTACH, with their logins running concurrently.
+  - **ATTACH validates through the pool.** The credentials check is the
+    pool's first login, and the connection stays in the pool instead of being
+    closed and logged in again: a plain ATTACH is one login, not two. Pool
+    refills now report the same classified reasons the ATTACH did (server error
+    number and state: a paused serverless database, the 18456 login state).
+    Every ATTACH validation failure is now an `Invalid Input Error` reading
+    "MSSQL connection validation failed: …" -- a refused dial or an unknown
+    host used to be an `IO Error`, and an Azure AD failure read "MSSQL Azure AD
+    connection validation failed: …" (now "…: Azure AD authentication
+    failed: …").
+  - **Measured on a local server:**
+
+    | ATTACH | before | after |
+    |---|---|---|
+    | plain | 0.40 s | 0.20 s |
+    | `min_connections 4` | 0.54 s | 0.39 s |
+    | `min_connections 8` | 0.63 s | 0.54 s |
+
+    Opened one after another, four connections would cost about a second.
+  - **Nothing opened under `lazy_validation`.** The ATTACH options `preload` and
+    `min_connections` are refused beside it, and `preload` inside a transaction
+    that has used an MSSQL catalog is refused — all before the ATTACH dials. A
+    `min_connections` shortfall is logged as a WARNING and does not fail the
+    ATTACH.
+  - **New ATTACH options:**
+    - `min_connections` is the ATTACH form of the setting.
+    - `preload true` runs `mssql_preload_catalog()` as part of the ATTACH.
+
+    Both exist because DuckLake's `METADATA_PARAMETERS` can forward ATTACH
+    options but neither a setting nor a function call. Both accept the string
+    form it sends. `preload` is refused next to `lazy_validation true` or
+    `catalog false`.
+
 - **`transaction_isolation`: the isolation level of explicit transactions**
   ([#331](https://github.com/hugr-lab/mssql-extension/issues/331)). The
   scans of one DuckDB transaction are separate statements on its pinned
@@ -53,6 +91,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Transactions fill the shared metadata cache again**
+  ([#383](https://github.com/hugr-lab/mssql-extension/issues/383)). Since #380
+  a transaction loads a missing table's metadata into a cache of its own, so a
+  workload that runs everything in transactions (DuckLake) loaded every table
+  once per transaction. At COMMIT or ROLLBACK what the transaction loaded and
+  did not change is now published into the shared cache from memory, with no
+  round trip: 100 transactions reading the same two tables load each table's
+  metadata once. Nothing is published after DDL (the transaction's own through
+  the catalog included, or `mssql_exec` DDL), under READ UNCOMMITTED, or when
+  the shared cache was invalidated while the transaction ran. Inside a
+  transaction the shared metadata cache is read too.
 - **Reading the schema list no longer makes a transaction count as having used
   the catalog.** `MSSQLCatalog::SchemaListCache` asked the transaction for its
   metadata layer unconditionally, and that call CREATES this catalog's
@@ -66,7 +115,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   narrowed to allow. An already-loaded shared list is now read without creating
   anything; every other path creates the transaction as before, so a load still
   lands in its own cache.
-
 - **A table created inside a transaction can be read in it; a pool of one
   connection works in a transaction**
   ([#380](https://github.com/hugr-lab/mssql-extension/issues/380)).

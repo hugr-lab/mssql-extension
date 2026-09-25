@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 
 #ifdef _WIN32
@@ -251,16 +252,25 @@ static int CustomBioDestroy(BIO *bio) {
 }
 
 // Create custom BIO method (thread-safe singleton)
+// Built once, under std::call_once: ConnectionPool::Prewarm runs several TLS
+// handshakes at once on raw threads (issue #324), and a plain lazy `if
+// (!method)` let a racing thread see the pointer before its five callbacks
+// were set, or build a second method (review of #386).
 static BIO_METHOD *GetCustomBioMethod() {
+	static std::once_flag once;
 	static BIO_METHOD *method = nullptr;
-	if (!method) {
-		method = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_get_new_index(), "mssql_tds");
-		BIO_meth_set_write(method, CustomBioWrite);
-		BIO_meth_set_read(method, CustomBioRead);
-		BIO_meth_set_ctrl(method, CustomBioCtrl);
-		BIO_meth_set_create(method, CustomBioCreate);
-		BIO_meth_set_destroy(method, CustomBioDestroy);
-	}
+	std::call_once(once, []() {
+		BIO_METHOD *built = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_get_new_index(), "mssql_tds");
+		if (!built) {
+			return;
+		}
+		BIO_meth_set_write(built, CustomBioWrite);
+		BIO_meth_set_read(built, CustomBioRead);
+		BIO_meth_set_ctrl(built, CustomBioCtrl);
+		BIO_meth_set_create(built, CustomBioCreate);
+		BIO_meth_set_destroy(built, CustomBioDestroy);
+		method = built;
+	});
 	return method;
 }
 
@@ -438,7 +448,16 @@ bool TlsImpl::Initialize(const TlsOptions &options) {
 	}
 
 	// Create custom BIO and attach to SSL
-	ctx_->bio = BIO_new(GetCustomBioMethod());
+	BIO_METHOD *bio_method = GetCustomBioMethod();
+	if (!bio_method) {
+		// BIO_meth_new failed when the method was built (an allocation
+		// failure); BIO_new would dereference the null (review of #386).
+		ctx_->last_error_code = 1;	// INIT_FAILED
+		ctx_->last_error = "BIO_meth_new failed: " + FormatOpenSSLError();
+		MSSQL_TLS_DEBUG_LOG(1, "Initialize: FAILED - %s", ctx_->last_error.c_str());
+		return false;
+	}
+	ctx_->bio = BIO_new(bio_method);
 	if (!ctx_->bio) {
 		ctx_->last_error_code = 1;	// INIT_FAILED
 		ctx_->last_error = "BIO_new failed: " + FormatOpenSSLError();

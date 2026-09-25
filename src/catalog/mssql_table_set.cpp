@@ -495,10 +495,27 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntryInTransaction(ClientContext &c
 		metadata.MarkAbsent(schema_name, name);
 		return nullptr;
 	}
-
-	// 4. Load it on the pinned connection, for this transaction only.
-	CATALOG_DEBUG(1, "  -> loading '%s.%s' on the transaction's connection", schema_name.c_str(), name.c_str());
 	catalog.EnsureCacheLoaded(context);
+
+	// 4. The shared METADATA cache: committed state, filled by an autocommit
+	//    load, a preload, or what an earlier transaction published at its end
+	//    (issue #383) -- served without a round trip. The entry built from it goes
+	//    into THIS transaction's layer, not entries_ (review of #386): its
+	//    rowid key may still be discovered, and that discovery runs on the
+	//    pinned connection, whose failure an entry caches for good -- it must
+	//    die with the transaction, not refuse every other session's UPDATE.
+	if (!metadata.IsChanged(schema_name, name)) {
+		MSSQLTableMetadata cached_meta;
+		if (catalog.GetMetadataCache().TryGetLoadedTableMetadata(schema_name, name, cached_meta)) {
+			auto entry = CreateTableEntry(cached_meta);
+			if (entry) {
+				return anchor(metadata.AddEntry(schema_name, name, std::move(entry)));
+			}
+		}
+	}
+
+	// 5. Load it on the pinned connection, for this transaction only.
+	CATALOG_DEBUG(1, "  -> loading '%s.%s' on the transaction's connection", schema_name.c_str(), name.c_str());
 	auto connection = ConnectionProvider::GetConnection(context, catalog);
 	MSSQLTableMetadata table_meta;
 	bool found = false;

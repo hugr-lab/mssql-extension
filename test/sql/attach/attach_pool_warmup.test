@@ -1,0 +1,238 @@
+# name: test/sql/attach/attach_pool_warmup.test
+# description: min_connections opens the pool's connections at ATTACH, concurrently; preload loads the catalog at ATTACH (issue #324)
+# group: [attach]
+# issue: 324
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# mssql_min_connections only kept idle connections from being closed; it never
+# opened one, so a session paid its logins one by one at the first queries
+# that needed them. It is now opened at ATTACH, the logins in parallel, and it
+# is an ATTACH option too -- DuckLake's METADATA_PARAMETERS forwards ATTACH
+# options (as strings), not SET settings. `preload` is mssql_preload_catalog()
+# run by the ATTACH, for the same reason.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+#------------------------------------------------------------------------------
+# min_connections: opened at ATTACH, idle.
+#------------------------------------------------------------------------------
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pw3 (TYPE mssql, min_connections 3);
+
+query III
+SELECT total_connections, idle_connections, connections_created FROM mssql_pool_stats('pw3');
+----
+3	3	3
+
+statement ok
+DETACH pw3;
+
+# The string form DuckLake sends.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pw2 (TYPE mssql, min_connections '2');
+
+query I
+SELECT connections_created FROM mssql_pool_stats('pw2');
+----
+2
+
+statement ok
+DETACH pw2;
+
+# The setting does the same.
+statement ok
+SET mssql_min_connections = 2;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pws (TYPE mssql);
+
+query I
+SELECT connections_created FROM mssql_pool_stats('pws');
+----
+2
+
+statement ok
+DETACH pws;
+
+statement ok
+RESET mssql_min_connections;
+
+# Never past the pool's limit.
+statement ok
+SET mssql_connection_limit = 2;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pwl (TYPE mssql, min_connections 5);
+
+query I
+SELECT connections_created FROM mssql_pool_stats('pwl');
+----
+2
+
+statement ok
+DETACH pwl;
+
+statement ok
+RESET mssql_connection_limit;
+
+# lazy_validation promises not to touch the server at ATTACH, and the ATTACH
+# option min_connections asks it to: refused, as preload beside it is (review
+# of #386 -- the two used to answer the same conflict in opposite ways).
+statement error
+ATTACH '{MSSQL_TESTDB_DSN}' AS pwz (TYPE mssql, min_connections 3, lazy_validation true, catalog false);
+----
+min_connections and lazy_validation contradict each other
+
+# The SETTING is session-wide, not this ATTACH's request: under
+# lazy_validation it opens nothing.
+statement ok
+SET mssql_min_connections = 3;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pwz (TYPE mssql, lazy_validation true, catalog false);
+
+query I
+SELECT connections_created FROM mssql_pool_stats('pwz');
+----
+0
+
+statement ok
+DETACH pwz;
+
+statement ok
+RESET mssql_min_connections;
+
+statement error
+ATTACH '{MSSQL_TESTDB_DSN}' AS pwn (TYPE mssql, min_connections -1);
+----
+min_connections must be 0 or more
+
+statement error
+ATTACH '{MSSQL_TESTDB_DSN}' AS pwn (TYPE mssql, min_connections 'many');
+----
+expects an integer
+
+#------------------------------------------------------------------------------
+# preload: the catalog is loaded by the ATTACH -- a read after it runs no
+# metadata query, which mssql_test_fail_metadata_after_rows = 1 would fail.
+#------------------------------------------------------------------------------
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pwp (TYPE mssql, preload 'true');
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+query I
+SELECT count(*) > 0 FROM pwp.dbo.TestSimplePK;
+----
+true
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
+
+statement ok
+DETACH pwp;
+
+statement error
+ATTACH '{MSSQL_TESTDB_DSN}' AS pwx (TYPE mssql, preload true, lazy_validation true);
+----
+preload and lazy_validation contradict each other
+
+statement error
+ATTACH '{MSSQL_TESTDB_DSN}' AS pwx (TYPE mssql, preload true, catalog false);
+----
+preload needs the catalog
+
+# Both contradictions are the options' alone, so they are refused before
+# anything dials (review of #386): against a server that cannot be reached the
+# error is still the contradiction, not a connection failure.
+statement error
+ATTACH 'Server=127.0.0.1,1;Database=x;User Id=u;Password=p;TrustServerCertificate=yes' AS pwx (TYPE mssql, preload true, catalog false);
+----
+preload needs the catalog
+
+statement error
+ATTACH 'Server=127.0.0.1,1;Database=x;User Id=u;Password=p;TrustServerCertificate=yes' AS pwx (TYPE mssql, preload true, lazy_validation true);
+----
+preload and lazy_validation contradict each other
+
+# preload is mssql_preload_catalog's own implementation: the session's cache
+# settings apply to it -- here the test lever, which the ATTACH copy used to
+# ignore (review of #386) ...
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+statement error
+ATTACH '{MSSQL_TESTDB_DSN}' AS pwl (TYPE mssql, preload true);
+----
+mssql_test_fail_metadata_after_rows
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
+
+# ... and so does its refusal inside a transaction that has used an MSSQL
+# catalog: another alias's uncommitted DDL would hang the load (#380).
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pwt (TYPE mssql);
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) > 0 FROM pwt.dbo.TestSimplePK;
+----
+true
+
+statement error
+ATTACH '{MSSQL_TESTDB_DSN}' AS pwt2 (TYPE mssql, preload true);
+----
+cannot run inside a transaction that has used an MSSQL catalog
+
+statement ok
+ROLLBACK;
+
+# ... refused before the ATTACH dials: against a server that cannot be reached
+# the error is still the refusal (review of #386).
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) > 0 FROM pwt.dbo.TestSimplePK;
+----
+true
+
+statement error
+ATTACH 'Server=127.0.0.1,1;Database=x;User Id=u;Password=p;TrustServerCertificate=yes' AS pwt3 (TYPE mssql, preload true);
+----
+preload cannot run inside a transaction that has used an MSSQL catalog
+
+statement ok
+ROLLBACK;
+
+statement ok
+DETACH pwt;
+
+# With mssql_connection_cache = false no connection is ever idle: the
+# validation connection is not adopted and min_connections opens nothing.
+statement ok
+SET mssql_connection_cache = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pwc (TYPE mssql, min_connections 3);
+
+query II
+SELECT idle_connections, total_connections FROM mssql_pool_stats('pwc');
+----
+0	0
+
+statement ok
+DETACH pwc;
+
+statement ok
+RESET mssql_connection_cache;
