@@ -1,5 +1,7 @@
 #include "copy/target_resolver.hpp"
 #include "catalog/mssql_column_info.hpp"
+#include "query/mssql_identifier.hpp"
+#include "query/mssql_sql_params.hpp"
 
 #include "tds/encoding/bcp_row_encoder.hpp"
 
@@ -72,11 +74,11 @@ string BCPCopyTarget::GetFullyQualifiedName() const {
 }
 
 string BCPCopyTarget::GetBracketedSchema() const {
-	return "[" + schema_name + "]";
+	return mssql::QuoteIdentifier(schema_name);
 }
 
 string BCPCopyTarget::GetBracketedTable() const {
-	return "[" + table_name + "]";
+	return mssql::QuoteIdentifier(table_name);
 }
 
 //===----------------------------------------------------------------------===//
@@ -447,6 +449,17 @@ static MSSQLIndexKind ShapeOfCreatedTable(const MSSQLTableOptions &options) {
 	}
 }
 
+// A catalog probe about the target, its name as an sp_executesql parameter
+// rather than a literal in the text: one server plan serves every target, as
+// the catalog's metadata queries do (#334). A #temp target is named through
+// tempdb, where its catalog rows live; sp_executesql runs in the caller's
+// session, so it sees the session's temp tables.
+static string ObjectProbe(const string &statement, const BCPCopyTarget &target) {
+	const string object_name =
+		target.IsTempTable() ? "tempdb.." + target.GetBracketedTable() : target.GetFullyQualifiedName();
+	return mssql::BuildExecuteSqlBatch(statement, "@o nvarchar(776)", {{"o", mssql::NVarcharLiteral(object_name)}});
+}
+
 TableLoadShape TargetResolver::QueryTableShape(tds::TdsConnection &conn, const BCPCopyTarget &target) {
 	// The same sys.indexes row ValidateTarget reads for COPY: index_id 0 is
 	// the heap, index_id 1 the clustered index, rowstore (type 1) or
@@ -458,22 +471,16 @@ TableLoadShape TargetResolver::QueryTableShape(tds::TdsConnection &conn, const B
 	// bulk load takes an exclusive table lock, so two transactional writers
 	// serialise and (their COMMIT deferred to Finalize) hang client-side.
 	// Same round trip, one more scalar subquery.
-	string sql;
-	if (target.IsTempTable()) {
-		sql = StringUtil::Format(
-			"SELECT ISNULL((SELECT TOP 1 i.type FROM tempdb.sys.indexes i "
-			"WHERE i.object_id = OBJECT_ID('tempdb..%s') AND i.index_id <= 1), 0) AS index_type, "
-			"CASE WHEN EXISTS (SELECT 1 FROM tempdb.sys.indexes i "
-			"WHERE i.object_id = OBJECT_ID('tempdb..%s') AND i.index_id > 1) THEN 1 ELSE 0 END AS has_nonclustered",
-			target.GetBracketedTable(), target.GetBracketedTable());
-	} else {
-		sql = StringUtil::Format(
-			"SELECT ISNULL((SELECT TOP 1 i.type FROM sys.indexes i "
-			"WHERE i.object_id = OBJECT_ID('%s') AND i.index_id <= 1), 0) AS index_type, "
-			"CASE WHEN EXISTS (SELECT 1 FROM sys.indexes i "
-			"WHERE i.object_id = OBJECT_ID('%s') AND i.index_id > 1) THEN 1 ELSE 0 END AS has_nonclustered",
-			target.GetFullyQualifiedName(), target.GetFullyQualifiedName());
-	}
+	const string sys = target.IsTempTable() ? "tempdb.sys" : "sys";
+	const string sql =
+		ObjectProbe("SELECT ISNULL((SELECT TOP 1 i.type FROM " + sys +
+						".indexes i "
+						"WHERE i.object_id = OBJECT_ID(@o) AND i.index_id <= 1), 0) AS index_type, "
+						"CASE WHEN EXISTS (SELECT 1 FROM " +
+						sys +
+						".indexes i "
+						"WHERE i.object_id = OBJECT_ID(@o) AND i.index_id > 1) THEN 1 ELSE 0 END AS has_nonclustered",
+					target);
 	auto result = MSSQLSimpleQuery::Execute(conn, sql);
 	if (!result.success) {
 		throw IOException("could not read the shape of %s: %s", target.GetFullyQualifiedName(), result.error_message);
@@ -502,23 +509,15 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 	// clustered index, rowstore or columnstore), which is what decides TABLOCK
 	// under 'auto' (spec 057 step 1). No extra round trip, the same trick spec 049
 	// used for the catalog's index_kind.
-	string object_sql;
-	if (target.IsTempTable()) {
-		// Temp tables are in tempdb, and so are their indexes.
-		object_sql = StringUtil::Format(
-			"SELECT OBJECT_ID('tempdb..%s') AS obj_id, "
-			"OBJECTPROPERTY(OBJECT_ID('tempdb..%s'), 'IsView') AS is_view, "
-			"(SELECT TOP 1 i.type FROM tempdb.sys.indexes i "
-			" WHERE i.object_id = OBJECT_ID('tempdb..%s') AND i.index_id <= 1) AS index_type",
-			target.GetBracketedTable(), target.GetBracketedTable(), target.GetBracketedTable());
-	} else {
-		object_sql = StringUtil::Format(
-			"SELECT OBJECT_ID('%s') AS obj_id, "
-			"OBJECTPROPERTY(OBJECT_ID('%s'), 'IsView') AS is_view, "
-			"(SELECT TOP 1 i.type FROM sys.indexes i "
-			" WHERE i.object_id = OBJECT_ID('%s') AND i.index_id <= 1) AS index_type",
-			target.GetFullyQualifiedName(), target.GetFullyQualifiedName(), target.GetFullyQualifiedName());
-	}
+	// Temp tables are in tempdb, and so are their indexes.
+	const string object_sql = ObjectProbe(
+		"SELECT OBJECT_ID(@o) AS obj_id, "
+		"OBJECTPROPERTY(OBJECT_ID(@o), 'IsView') AS is_view, "
+		"(SELECT TOP 1 i.type FROM " +
+			string(target.IsTempTable() ? "tempdb.sys" : "sys") +
+			".indexes i "
+			" WHERE i.object_id = OBJECT_ID(@o) AND i.index_id <= 1) AS index_type",
+		target);
 
 	DebugLog(3, "ValidateTarget SQL: %s", object_sql.c_str());
 
@@ -649,7 +648,7 @@ void TargetResolver::CreateTable(tds::TdsConnection &conn, const BCPCopyTarget &
 		if (i > 0) {
 			sql += ",\n";
 		}
-		sql += "  [" + source_names[i] + "] " +
+		sql += "  " + mssql::QuoteIdentifier(source_names[i]) + " " +
 			   GetSQLServerTypeDeclaration(source_types[i], varchar_collation, single_byte_text) + " NULL";
 	}
 
@@ -826,24 +825,15 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 												 BCPCopyConfig &config, const vector<LogicalType> &source_types,
 												 const vector<string> &source_names) {
 	// Query the target table's column information
-	string column_sql;
-	if (target.IsTempTable()) {
-		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
-			"type_name, c.max_length, c.precision, c.scale "
-			"FROM tempdb.sys.columns c "
-			"WHERE c.object_id = OBJECT_ID('tempdb..%s') "
+	const string column_sql = ObjectProbe(
+		"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
+		"type_name, c.max_length, c.precision, c.scale "
+		"FROM " +
+			string(target.IsTempTable() ? "tempdb.sys" : "sys") +
+			".columns c "
+			"WHERE c.object_id = OBJECT_ID(@o) "
 			"ORDER BY c.column_id",
-			target.GetBracketedTable());
-	} else {
-		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
-			"type_name, c.max_length, c.precision, c.scale "
-			"FROM sys.columns c "
-			"WHERE c.object_id = OBJECT_ID('%s') "
-			"ORDER BY c.column_id",
-			target.GetFullyQualifiedName());
-	}
+		target);
 
 	DebugLog(3, "ValidateExistingTableSchema SQL: %s", column_sql.c_str());
 
@@ -1218,26 +1208,16 @@ BCPColumnMetadata BCPColumnMetadata::FromServerColumn(const string &name, const 
 vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::TdsConnection &conn,
 																		 const BCPCopyTarget &target) {
 	// Query the target table's column information
-	string column_sql;
-	if (target.IsTempTable()) {
-		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
-			"type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
-			"ISNULL(c.collation_name, '') AS collation_name "
-			"FROM tempdb.sys.columns c "
-			"WHERE c.object_id = OBJECT_ID('tempdb..%s') "
+	const string column_sql = ObjectProbe(
+		"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
+		"type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
+		"ISNULL(c.collation_name, '') AS collation_name "
+		"FROM " +
+			string(target.IsTempTable() ? "tempdb.sys" : "sys") +
+			".columns c "
+			"WHERE c.object_id = OBJECT_ID(@o) "
 			"ORDER BY c.column_id",
-			target.GetBracketedTable());
-	} else {
-		column_sql = StringUtil::Format(
-			"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
-			"type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
-			"ISNULL(c.collation_name, '') AS collation_name "
-			"FROM sys.columns c "
-			"WHERE c.object_id = OBJECT_ID('%s') "
-			"ORDER BY c.column_id",
-			target.GetFullyQualifiedName());
-	}
+		target);
 
 	DebugLog(3, "GetExistingTableColumnMetadata SQL: %s", column_sql.c_str());
 

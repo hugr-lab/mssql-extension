@@ -49,11 +49,6 @@ public:
 	// Identifier Quoting
 	//===----------------------------------------------------------------------===//
 
-	//! Quote a SQL Server identifier using bracket notation
-	//! @param identifier The identifier to quote
-	//! @return Quoted identifier with ] escaped as ]]
-	static string QuoteIdentifier(const string &identifier);
-
 	//===----------------------------------------------------------------------===//
 	// Schema Operations
 	//===----------------------------------------------------------------------===//

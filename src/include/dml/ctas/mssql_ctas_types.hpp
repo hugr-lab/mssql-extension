@@ -3,6 +3,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -32,7 +33,7 @@ struct CTASTarget {
 
 	// Get fully qualified table name [schema].[table]
 	string GetQualifiedName() const {
-		return "[" + schema_name + "].[" + table_name + "]";
+		return mssql::QuoteIdentifier(schema_name) + "." + mssql::QuoteIdentifier(table_name);
 	}
 
 	// Get full three-part name catalog.schema.table

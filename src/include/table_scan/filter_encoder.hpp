@@ -203,11 +203,6 @@ public:
 	static std::string ValueToSQLLiteral(const Value &value, const LogicalType &type);
 
 	/**
-	 * Escape identifier for T-SQL bracket notation (doubles right brackets).
-	 */
-	static std::string EscapeBracketIdentifier(const std::string &identifier);
-
-	/**
 	 * Get T-SQL comparison operator for DuckDB ExpressionType.
 	 * @param type The ExpressionType
 	 * @param out_operator Output: the SQL operator string

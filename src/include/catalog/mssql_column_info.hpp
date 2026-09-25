@@ -26,23 +26,23 @@ struct MSSQLColumnInfo {
 	bool is_nullable;  // Allows NULL values
 
 	// Collation info (for text types)
-	string collation_name;		 // Column collation (may be empty for non-text)
-	bool is_case_sensitive;		 // Derived from collation (_CS_ or _BIN)
-	bool is_unicode;			 // True for NVARCHAR/NCHAR/NTEXT
-	bool is_utf8;				 // Derived from collation (_UTF8)
-	int32_t code_page;			 // COLLATIONPROPERTY(collation, 'CodePage'): the page the column stores
-								 // varchar in; 0 = the server has none (non-text, Unicode-only). Set by
-								 // the metadata loaders after construction, like is_identity (issue #361)
-	int32_t database_code_page;	 // The same for the database collation — a varchar PARAMETER takes
-								 // this page, so a constant must fit both (mssql::CodePageCanEncode)
-	bool is_cast_required;		 // Unsupported type: needs CAST to NVARCHAR(MAX)
-	bool is_geometry;			 // True for SQL Server geometry/geography columns; table scan projects
-								 // [col].STAsBinary() AS [col] so the wire delivers OGC WKB which lands
-								 // in a LogicalType::GEOMETRY() vector via the Binary codec.
-	bool is_identity;			 // sys.columns.is_identity (spec 062 W4, issue #327). Set by the
-								 // metadata loaders after construction; the INSERT planner keeps a
-								 // column list that names one on the statement path, where the server
-								 // decides about the explicit value (error 544 without IDENTITY_INSERT).
+	string collation_name;			 // Column collation (may be empty for non-text)
+	bool is_case_sensitive;			 // Derived from collation (_CS_ or _BIN)
+	bool is_unicode;				 // True for NVARCHAR/NCHAR/NTEXT
+	bool is_utf8;					 // Derived from collation (_UTF8)
+	int32_t code_page = 0;			 // COLLATIONPROPERTY(collation, 'CodePage'): the page the column stores
+									 // varchar in; 0 = the server has none (non-text, Unicode-only). Set by
+									 // the metadata loaders after construction, like is_identity (issue #361)
+	int32_t database_code_page = 0;	 // The same for the database collation — a varchar PARAMETER takes
+									 // this page, so a constant must fit both (mssql::CodePageCanEncode)
+	bool is_cast_required;			 // Unsupported type: needs CAST to NVARCHAR(MAX)
+	bool is_geometry;				 // True for SQL Server geometry/geography columns; table scan projects
+									 // [col].STAsBinary() AS [col] so the wire delivers OGC WKB which lands
+									 // in a LogicalType::GEOMETRY() vector via the Binary codec.
+	bool is_identity;				 // sys.columns.is_identity (spec 062 W4, issue #327). Set by the
+									 // metadata loaders after construction; the INSERT planner keeps a
+									 // column list that names one on the statement path, where the server
+									 // decides about the explicit value (error 544 without IDENTITY_INSERT).
 
 	// Default constructor
 	MSSQLColumnInfo();
@@ -56,6 +56,43 @@ struct MSSQLColumnInfo {
 	static bool IsCaseSensitiveCollation(const string &collation_name);
 	static bool IsAccentSensitiveCollation(const string &collation_name);
 	static bool IsUTF8Collation(const string &collation_name);
+	//! A `_BIN2` collation: pure code-unit comparison. Not `_BIN`, which compares
+	//! the first character by code point and the rest byte by byte -- little-
+	//! endian on nvarchar, so not code-unit order at all.
+	static bool IsBinary2Collation(const string &collation_name);
+
+	//! Whether the SERVER, ordering by this column, gives the order DuckDB gives
+	//! the values it reads (issue #362, spec 079 D4 "orders are DuckDB's"). THE
+	//! predicate MSSQLOptimizer's ORDER BY / TOP pushdown asks; spec 079's
+	//! remote-pushdown writer is to ask the same one.
+	//!
+	//! An allow-list: a type is on it because both sides order its values the
+	//! same way, and anything not named -- a type added to SQL Server later
+	//! included -- is refused. On it: the integer types, bit, decimal/numeric,
+	//! money/smallmoney, float/real, and the date/time types (datetimeoffset by
+	//! its UTC instant on both sides) -- except datetime2(7), which DuckDB reads
+	//! as TIMESTAMP_NS and whose values outside 1677-2262 it reads as NULL.
+	//!
+	//! No string is on it. Refused, among others: `nvarchar`/`nchar` under any
+	//! collation (UTF-16 code units put a character above the BMP before
+	//! U+E000-U+FFFF, DuckDB after), `varchar`/`char` ordered as text (even
+	//! under `_BIN2` UTF-8 the server pads with spaces, so `ab` = `ab ` and `ab`
+	//! + TAB sorts before `ab` -- see OrdersLikeDuckDBAsBytes for how such a
+	//! column is pushed), `uniqueidentifier` (the server compares its last six
+	//! bytes first), `binary`/`varbinary` as a column type, `json`,
+	//! `sql_variant` and every cast-required type, and the types the server
+	//! cannot sort (text, ntext, image, xml, geometry, geography).
+	bool OrdersLikeDuckDB() const;
+	//! A bounded `varchar` whose bytes are UTF-8 (a UTF-8 collation, any
+	//! sensitivity): ordered by `CAST(col AS varbinary(n))` the server compares
+	//! those bytes, which is code-point order, DuckDB's -- measured: `aa, ab,
+	//! ab`+TAB`, ab ` on both sides. The one residual is a trailing NUL: the
+	//! binary comparison pads with 0x00, so `ab` and `ab`+NUL tie. The key is not
+	//! sargable, so the optimizer uses it only under a LIMIT (review of #387).
+	//! Not `char(n)`: it is stored blank-padded and read trimmed, so its bytes
+	//! are not the values DuckDB orders (`ab` + TAB is stored `ab\t ` and sorts
+	//! before `ab  `). Not `varchar(max)`: a sort on an unbounded key.
+	bool OrdersLikeDuckDBAsBytes() const;
 
 	// Map SQL Server type to DuckDB LogicalType
 	//! Spec 060: the type to REPORT for this column — MSSQL_VARCHAR(n) /

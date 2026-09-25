@@ -17,6 +17,7 @@
 #include "catalog/mssql_ddl_translator.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/parser/column_definition.hpp"
+#include "query/mssql_identifier.hpp"
 
 using namespace duckdb;
 
@@ -50,16 +51,16 @@ void test_quote_identifier_basic() {
 	std::cout << "\n=== Test: QuoteIdentifier - Basic ===" << std::endl;
 
 	// Simple identifier
-	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("foo"), "[foo]");
+	ASSERT_EQ(mssql::QuoteIdentifier("foo"), "[foo]");
 
 	// With spaces
-	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("my table"), "[my table]");
+	ASSERT_EQ(mssql::QuoteIdentifier("my table"), "[my table]");
 
 	// With numbers
-	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("table123"), "[table123]");
+	ASSERT_EQ(mssql::QuoteIdentifier("table123"), "[table123]");
 
 	// Empty identifier
-	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier(""), "[]");
+	ASSERT_EQ(mssql::QuoteIdentifier(""), "[]");
 
 	std::cout << "PASSED!" << std::endl;
 }
@@ -71,25 +72,25 @@ void test_quote_identifier_special() {
 	std::cout << "\n=== Test: QuoteIdentifier - Special Characters ===" << std::endl;
 
 	// Contains closing bracket - must be escaped as ]]
-	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("foo]bar"), "[foo]]bar]");
+	ASSERT_EQ(mssql::QuoteIdentifier("foo]bar"), "[foo]]bar]");
 
 	// Multiple closing brackets
-	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("a]b]c"), "[a]]b]]c]");
+	ASSERT_EQ(mssql::QuoteIdentifier("a]b]c"), "[a]]b]]c]");
 
 	// Closing bracket at start
-	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("]foo"), "[]]foo]");
+	ASSERT_EQ(mssql::QuoteIdentifier("]foo"), "[]]foo]");
 
 	// Closing bracket at end
-	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("foo]"), "[foo]]]");
+	ASSERT_EQ(mssql::QuoteIdentifier("foo]"), "[foo]]]");
 
 	// Only closing bracket: [ + the doubled ] + the closing ] = four characters
-	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("]"), "[]]]");
+	ASSERT_EQ(mssql::QuoteIdentifier("]"), "[]]]");
 
 	// Opening bracket (no escaping needed for [)
-	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("foo[bar"), "[foo[bar]");
+	ASSERT_EQ(mssql::QuoteIdentifier("foo[bar"), "[foo[bar]");
 
 	// Unicode characters
-	ASSERT_EQ(MSSQLDDLTranslator::QuoteIdentifier("tbl_name"), "[tbl_name]");
+	ASSERT_EQ(mssql::QuoteIdentifier("tbl_name"), "[tbl_name]");
 
 	std::cout << "PASSED!" << std::endl;
 }
@@ -220,10 +221,11 @@ void test_rename_table() {
 
 	std::string sql = MSSQLDDLTranslator::TranslateRenameTable("dbo", "old_name", "new_name");
 
-	// Should use sp_rename
-	ASSERT_CONTAINS(sql, "sp_rename");
-	ASSERT_CONTAINS(sql, "dbo.old_name");
-	ASSERT_CONTAINS(sql, "'new_name'");
+	// The old name's parts bracketed (sp_rename parses it as a multi-part
+	// name), the new name literal.
+	ASSERT_EQ(sql, "EXEC sp_rename N'[dbo].[old_name]', N'new_name';");
+	ASSERT_EQ(MSSQLDDLTranslator::TranslateRenameTable("s.x", "a.b]'c", "n.m'"),
+			  "EXEC sp_rename N'[s.x].[a.b]]''c]', N'n.m''';");
 
 	std::cout << "PASSED!" << std::endl;
 }
@@ -248,11 +250,9 @@ void test_rename_column() {
 
 	std::string sql = MSSQLDDLTranslator::TranslateRenameColumn("dbo", "users", "old_col", "new_col");
 
-	// Should use sp_rename with COLUMN parameter
-	ASSERT_CONTAINS(sql, "sp_rename");
-	ASSERT_CONTAINS(sql, "dbo.users.old_col");
-	ASSERT_CONTAINS(sql, "'new_col'");
-	ASSERT_CONTAINS(sql, "COLUMN");
+	ASSERT_EQ(sql, "EXEC sp_rename N'[dbo].[users].[old_col]', N'new_col', N'COLUMN';");
+	ASSERT_EQ(MSSQLDDLTranslator::TranslateRenameColumn("dbo", "t.1", "c.1", "d.1"),
+			  "EXEC sp_rename N'[dbo].[t.1].[c.1]', N'd.1', N'COLUMN';");
 
 	std::cout << "PASSED!" << std::endl;
 }

@@ -1,6 +1,7 @@
 #include "copy/bulk_load_session.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include "query/mssql_identifier.hpp"
 
 #include <chrono>
 
@@ -50,7 +51,7 @@ string BuildInsertBulkSql(const BCPCopyTarget &target, const vector<BCPColumnMet
 		if (i > 0) {
 			sql += ", ";
 		}
-		sql += "[" + columns[i].name + "] ";
+		sql += mssql::QuoteIdentifier(columns[i].name) + " ";
 		// The column's own declaration: exact TDS type info for an existing
 		// table, generated types for one this statement is creating.
 		sql += columns[i].GetSQLServerTypeDeclaration();

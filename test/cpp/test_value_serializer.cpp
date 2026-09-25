@@ -29,6 +29,7 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "query/mssql_identifier.hpp"
 
 using namespace duckdb;
 
@@ -76,46 +77,46 @@ using namespace duckdb;
 	} while (0)
 
 //==============================================================================
-// Test: EscapeIdentifier - Basic identifiers
+// Test: QuoteIdentifier - Basic identifiers
 //==============================================================================
 void test_escape_identifier_basic() {
-	std::cout << "\n=== Test: EscapeIdentifier - Basic ===" << std::endl;
+	std::cout << "\n=== Test: QuoteIdentifier - Basic ===" << std::endl;
 
 	// Simple identifier
-	ASSERT_EQ(MSSQLValueSerializer::EscapeIdentifier("foo"), "[foo]");
+	ASSERT_EQ(mssql::QuoteIdentifier("foo"), "[foo]");
 
 	// With spaces
-	ASSERT_EQ(MSSQLValueSerializer::EscapeIdentifier("my table"), "[my table]");
+	ASSERT_EQ(mssql::QuoteIdentifier("my table"), "[my table]");
 
 	// With numbers
-	ASSERT_EQ(MSSQLValueSerializer::EscapeIdentifier("table123"), "[table123]");
+	ASSERT_EQ(mssql::QuoteIdentifier("table123"), "[table123]");
 
 	// Empty identifier
-	ASSERT_EQ(MSSQLValueSerializer::EscapeIdentifier(""), "[]");
+	ASSERT_EQ(mssql::QuoteIdentifier(""), "[]");
 
 	std::cout << "PASSED!" << std::endl;
 }
 
 //==============================================================================
-// Test: EscapeIdentifier - Bracket escaping
+// Test: QuoteIdentifier - Bracket escaping
 //==============================================================================
 void test_escape_identifier_brackets() {
-	std::cout << "\n=== Test: EscapeIdentifier - Bracket Escaping ===" << std::endl;
+	std::cout << "\n=== Test: QuoteIdentifier - Bracket Escaping ===" << std::endl;
 
 	// Contains closing bracket - must be escaped as ]]
-	ASSERT_EQ(MSSQLValueSerializer::EscapeIdentifier("foo]bar"), "[foo]]bar]");
+	ASSERT_EQ(mssql::QuoteIdentifier("foo]bar"), "[foo]]bar]");
 
 	// Multiple closing brackets
-	ASSERT_EQ(MSSQLValueSerializer::EscapeIdentifier("a]b]c"), "[a]]b]]c]");
+	ASSERT_EQ(mssql::QuoteIdentifier("a]b]c"), "[a]]b]]c]");
 
 	// Closing bracket at start
-	ASSERT_EQ(MSSQLValueSerializer::EscapeIdentifier("]foo"), "[]]foo]");
+	ASSERT_EQ(mssql::QuoteIdentifier("]foo"), "[]]foo]");
 
 	// Closing bracket at end
-	ASSERT_EQ(MSSQLValueSerializer::EscapeIdentifier("foo]"), "[foo]]]");
+	ASSERT_EQ(mssql::QuoteIdentifier("foo]"), "[foo]]]");
 
 	// Opening bracket (no escaping needed)
-	ASSERT_EQ(MSSQLValueSerializer::EscapeIdentifier("foo[bar"), "[foo[bar]");
+	ASSERT_EQ(mssql::QuoteIdentifier("foo[bar"), "[foo[bar]");
 
 	std::cout << "PASSED!" << std::endl;
 }

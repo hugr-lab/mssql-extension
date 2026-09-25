@@ -5,7 +5,7 @@
 #include "codec/target_string_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/extension_type_info.hpp"
-#include "table_scan/filter_encoder.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 
@@ -335,6 +335,47 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 // Type Checks
 //===----------------------------------------------------------------------===//
 
+bool MSSQLColumnInfo::IsBinary2Collation(const string &collation_name) {
+	string upper_collation = collation_name;
+	std::transform(upper_collation.begin(), upper_collation.end(), upper_collation.begin(),
+				   [](unsigned char c) { return std::toupper(c); });
+	return upper_collation.find("_BIN2") != string::npos;
+}
+
+bool MSSQLColumnInfo::OrdersLikeDuckDB() const {
+	if (is_cast_required || is_geometry) {
+		return false;
+	}
+	string lower_type = sql_type_name;
+	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
+				   [](unsigned char c) { return std::tolower(c); });
+	if (lower_type == "datetime2" && scale >= 7) {
+		// TIMESTAMP_NS: the codec reads a value outside 1677-2262 -- the
+		// 9999-12-31 ValidTo sentinel of a temporal table -- as NULL (#168), so
+		// the server orders values DuckDB never sees (review of #387).
+		return false;
+	}
+	static const char *const ORDERED_TYPES[] = {
+		"bit",	 "tinyint", "smallint", "int",	"bigint",	"decimal",	 "numeric",		  "money",		   "smallmoney",
+		"float", "real",	"date",		"time", "datetime", "datetime2", "smalldatetime", "datetimeoffset"};
+	for (auto type_name : ORDERED_TYPES) {
+		if (lower_type == type_name) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool MSSQLColumnInfo::OrdersLikeDuckDBAsBytes() const {
+	if (is_cast_required || !is_utf8 || max_length <= 0) {
+		return false;
+	}
+	string lower_type = sql_type_name;
+	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
+				   [](unsigned char c) { return std::tolower(c); });
+	return lower_type == "varchar";
+}
+
 bool MSSQLColumnInfo::IsSpatialType(const string &sql_type_name) {
 	string lower_type = sql_type_name;
 	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
@@ -462,7 +503,7 @@ string NVarcharLength(const string &sql_type_name, int16_t max_length) {
 string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string &sql_type_name, int16_t max_length,
 											const string &collation_name, bool convert_varchar_max,
 											const string &qualifier) {
-	const string escaped_name = "[" + mssql::FilterEncoder::EscapeBracketIdentifier(col_name) + "]";
+	const string escaped_name = mssql::QuoteIdentifier(col_name);
 	const string reference = qualifier + escaped_name;
 
 	if (IsSpatialType(sql_type_name)) {

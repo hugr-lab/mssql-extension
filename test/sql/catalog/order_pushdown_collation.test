@@ -1,0 +1,323 @@
+# name: test/sql/catalog/order_pushdown_collation.test
+# description: ORDER BY is pushed only for a key the server orders the way DuckDB does; a UTF-8 varchar only under a LIMIT, as its bytes (issue #362)
+# group: [catalog]
+# issue: 362
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# A pushed ORDER BY removes DuckDB's own sort from the plan, so the rows come
+# back in the SERVER's order. Until #362 nothing checked what that order was:
+# with mssql_order_pushdown on, `ORDER BY name` on a varchar column under the
+# installation-default SQL_Latin1_General_CP1_CI_AS returned SQL Server's
+# linguistic order (`a A ... z é Š €` interleaving case and accents) instead of
+# DuckDB's byte order. The predicate now shared by every ORDER BY path
+# (MSSQLColumnInfo::OrdersLikeDuckDB):
+#
+#   varchar under a UTF-8 collation -> ordered as TEXT the server pads with
+#                                   spaces (`ab` = `ab `, `ab`+TAB before
+#                                   `ab`); ordered as its BYTES,
+#                                   CAST(col AS varbinary(max)), it is
+#                                   DuckDB's order (a trailing NUL ties).
+#                                   Pushed that way only under a LIMIT: the
+#                                   key is not sargable
+#   nvarchar under _BIN2         -> UTF-16 code units: DuckDB's order through
+#                                   the BMP, not above it (a surrogate D83D
+#                                   sorts below U+FF5A): NOT pushed
+#   varchar under a code-page _BIN2 -> the code page's bytes (€ 0x80 < Š 0x8A
+#                                   < é 0xE9): NOT pushed
+#   varchar under _CI_AS         -> linguistic: NOT pushed
+#   uniqueidentifier             -> the server compares the last six bytes
+#                                   first: NOT pushed
+#
+# Each case asserts the plan (a pushed ORDER BY leaves no Order By operator)
+# and the rows, which must be DuckDB's order either way.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS opc (TYPE mssql, order_pushdown true);
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE IF EXISTS dbo.opc_order');
+
+statement ok
+SELECT mssql_exec('opc', 'CREATE TABLE dbo.opc_order (
+	id int NOT NULL PRIMARY KEY,
+	v_ci varchar(20) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL,
+	v_bin varchar(20) COLLATE Latin1_General_BIN2 NOT NULL,
+	v_utf8 varchar(20) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL,
+	n_bin nvarchar(20) COLLATE Latin1_General_BIN2 NOT NULL,
+	g uniqueidentifier NOT NULL)');
+
+statement ok
+SELECT mssql_exec('opc', 'INSERT INTO dbo.opc_order VALUES
+	(1, ''z'', ''z'', ''z'', N''z'', ''00000000-0000-0000-0000-000000000002''),
+	(2, N''é'', N''é'', N''é'', N''é'', ''00000000-0000-0000-0001-000000000000''),
+	(3, N''Š'', N''Š'', N''Š'', N''Š'', ''00000000-0000-0000-0000-000000000001''),
+	(4, ''a'', ''a'', ''a'', N''a'', ''00000000-0000-0001-0000-000000000000''),
+	(5, N''€'', N''€'', N''€'', N''€'', ''00000001-0000-0000-0000-000000000000''),
+	(6, ''A'', ''A'', ''A'', N''A'', ''00000000-0001-0000-0000-000000000000'')');
+
+#------------------------------------------------------------------------------
+# A UTF-8 varchar: pushed under a LIMIT as its bytes, not as a plain ORDER BY.
+#------------------------------------------------------------------------------
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_order ORDER BY v_utf8;
+----
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_order ORDER BY v_utf8 LIMIT 4;
+----
+physical_plan	<!REGEX>:.*(TOP_N|Top N).*
+
+query T
+SELECT v_utf8 FROM opc.dbo.opc_order ORDER BY v_utf8 LIMIT 4;
+----
+A
+a
+z
+é
+
+query T
+SELECT v_utf8 FROM opc.dbo.opc_order ORDER BY v_utf8;
+----
+A
+a
+z
+é
+Š
+€
+
+#------------------------------------------------------------------------------
+# Not pushed: DuckDB sorts, and the order is still DuckDB's.
+#------------------------------------------------------------------------------
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_order ORDER BY n_bin;
+----
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
+query T
+SELECT n_bin FROM opc.dbo.opc_order ORDER BY n_bin;
+----
+A
+a
+z
+é
+Š
+€
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_order ORDER BY v_ci;
+----
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
+query T
+SELECT v_ci FROM opc.dbo.opc_order ORDER BY v_ci;
+----
+A
+a
+z
+é
+Š
+€
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_order ORDER BY v_bin;
+----
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
+query T
+SELECT v_bin FROM opc.dbo.opc_order ORDER BY v_bin;
+----
+A
+a
+z
+é
+Š
+€
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_order ORDER BY g;
+----
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
+query I
+SELECT id FROM opc.dbo.opc_order ORDER BY g;
+----
+3
+1
+2
+4
+6
+5
+
+# A string-valued function is never pushed, whatever its argument: its result
+# would be ordered under a collation the server derives, not the column's.
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_order ORDER BY upper(v_ci);
+----
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_order ORDER BY upper(v_utf8);
+----
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
+query T
+SELECT upper(v_utf8) FROM opc.dbo.opc_order ORDER BY upper(v_utf8), id;
+----
+A
+A
+Z
+É
+Š
+€
+
+# A multi-key ORDER BY pushes only its prefix of qualifying keys; the rest
+# keeps DuckDB's sort in the plan.
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_order ORDER BY id, v_ci;
+----
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
+#------------------------------------------------------------------------------
+# Above the BMP: why nvarchar under _BIN2 is refused. U+1F600 is the surrogate
+# pair D83D DE00 in UTF-16, which the server orders BELOW U+FF5A; its UTF-8
+# bytes F0 9F 98 80 order ABOVE U+FF5A's EF BD 9A, as DuckDB does. Pushed, this
+# returned the emoji first.
+#------------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE IF EXISTS dbo.opc_supp');
+
+statement ok
+SELECT mssql_exec('opc', 'CREATE TABLE dbo.opc_supp (id int NOT NULL PRIMARY KEY,
+	n_bin nvarchar(10) COLLATE Latin1_General_100_BIN2 NOT NULL,
+	b varbinary(4) NOT NULL)');
+
+statement ok
+SELECT mssql_exec('opc', 'INSERT INTO dbo.opc_supp VALUES (1, NCHAR(0xFF5A), 0x0100), (2, NCHAR(0xD83D) + NCHAR(0xDE00), 0x01)');
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_supp ORDER BY n_bin LIMIT 1;
+----
+physical_plan	<REGEX>:.*(TOP_N|Top N).*
+
+query I
+SELECT id FROM opc.dbo.opc_supp ORDER BY n_bin LIMIT 1;
+----
+1
+
+# varbinary: the server pads the shorter value with zeros, so 0x01 = 0x0100.
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_supp ORDER BY b;
+----
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
+
+query I
+SELECT id FROM opc.dbo.opc_supp ORDER BY b;
+----
+2
+1
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE dbo.opc_supp');
+
+#------------------------------------------------------------------------------
+# Why the bytes (review of #387): under a _BIN2 UTF-8 collation the server
+# orders `ab`+TAB before `ab` and ties `ab` with `ab `. As bytes, under any
+# UTF-8 collation -- a case-insensitive one here -- the order is DuckDB's.
+#------------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE IF EXISTS dbo.opc_pad;
+	CREATE TABLE dbo.opc_pad (id int NOT NULL PRIMARY KEY,
+		v varchar(10) COLLATE Latin1_General_100_CI_AS_SC_UTF8 NOT NULL);
+	INSERT INTO dbo.opc_pad VALUES (1, ''ab''), (2, ''ab'' + CHAR(9)), (3, ''ab ''), (4, ''aa''), (5, ''AB'')');
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_pad ORDER BY v LIMIT 5;
+----
+physical_plan	<!REGEX>:.*(TOP_N|Top N).*
+
+query I
+SELECT id FROM opc.dbo.opc_pad ORDER BY v LIMIT 5;
+----
+5
+4
+1
+2
+3
+
+# char(n) is stored blank-padded and read trimmed, so its bytes are not the
+# values DuckDB orders: `ab`+TAB is stored `ab<TAB> ` and sorts before `ab  `.
+# Not pushed. Nor varchar(max): a sort on an unbounded key.
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE IF EXISTS dbo.opc_char;
+	CREATE TABLE dbo.opc_char (id int NOT NULL PRIMARY KEY,
+		c char(4) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL,
+		m varchar(max) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL);
+	INSERT INTO dbo.opc_char VALUES (1, ''ab'', ''ab''), (2, ''ab'' + CHAR(9), ''ab'' + CHAR(9))');
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_char ORDER BY c LIMIT 1;
+----
+physical_plan	<REGEX>:.*(TOP_N|Top N).*
+
+query I
+SELECT id FROM opc.dbo.opc_char ORDER BY c LIMIT 1;
+----
+1
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_char ORDER BY m LIMIT 1;
+----
+physical_plan	<REGEX>:.*(TOP_N|Top N).*
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE dbo.opc_char');
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE dbo.opc_pad');
+
+#------------------------------------------------------------------------------
+# datetime2(7) is read as TIMESTAMP_NS, and a value past 2262 -- the
+# 9999-12-31 ValidTo sentinel of a temporal table -- as NULL (#168): the
+# server would order a value DuckDB does not see, so the key is not pushed. A
+# datetime2(6) is.
+#------------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE IF EXISTS dbo.opc_dt;
+	CREATE TABLE dbo.opc_dt (id int NOT NULL PRIMARY KEY, t7 datetime2(7) NOT NULL, t6 datetime2(6) NOT NULL);
+	INSERT INTO dbo.opc_dt VALUES (1, ''2024-01-01'', ''2024-01-01''), (2, ''9999-12-31 23:59:59.9999999'', ''2024-06-01'')');
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_dt ORDER BY t7 DESC LIMIT 1;
+----
+physical_plan	<REGEX>:.*(TOP_N|Top N).*
+
+query I
+SELECT id FROM opc.dbo.opc_dt ORDER BY t7 DESC LIMIT 1;
+----
+1
+
+query II
+EXPLAIN SELECT id FROM opc.dbo.opc_dt ORDER BY t6 DESC LIMIT 1;
+----
+physical_plan	<!REGEX>:.*(TOP_N|Top N).*
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE dbo.opc_dt');
+
+statement ok
+SELECT mssql_exec('opc', 'DROP TABLE dbo.opc_order');
+
+statement ok
+DETACH opc;

@@ -180,6 +180,10 @@ With `mssql_catalog_native_types = true` (the default, spec 060), bounded
 string columns of attached tables report as `MSSQL_VARCHAR(n)` /
 `MSSQL_NVARCHAR(n)` in `DESCRIBE` and `duckdb_columns()` rather than bare
 `VARCHAR` — this is what lets a target created from an MSSQL source inherit
-declared lengths and collations with no explicit casts. Set the option to
-`false` to restore plain `VARCHAR` reporting.
+declared lengths and collations with no explicit casts. The columns of an
+`mssql_scan()` / `mssql_scan_params()` result are reported the same way (so
+`typeof()` over one says `MSSQL_VARCHAR(20)`, not `VARCHAR`), except a `char` /
+`varchar` under a code-page collation: a raw scan hands its bytes over
+untranscoded, and it stays plain `VARCHAR`. Set the option to `false` to
+restore plain `VARCHAR` reporting everywhere.
 

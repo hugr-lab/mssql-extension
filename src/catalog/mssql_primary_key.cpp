@@ -8,6 +8,7 @@
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "query/mssql_identifier.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "query/mssql_sql_params.hpp"
 
@@ -338,7 +339,7 @@ RowIdKeyInfo RowIdKeyInfo::Discover(tds::TdsConnection &connection, const string
 	RowIdKeyInfo info;
 
 	// Build fully qualified object name
-	string full_name = "[" + schema_name + "].[" + table_name + "]";
+	string full_name = mssql::QuoteIdentifier(schema_name) + "." + mssql::QuoteIdentifier(table_name);
 	MSSQL_PK_DEBUG("Discovering primary key for %s", full_name.c_str());
 
 	// Spec 075 W4 (#334): names as sp_executesql parameters -- one plan for every table.

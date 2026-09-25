@@ -29,6 +29,7 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
+#include "query/mssql_identifier.hpp"
 #include "query/mssql_sql_params.hpp"
 #include "table_scan/function_mapping.hpp"
 
@@ -175,18 +176,6 @@ static ExpressionEncodeResult EncodeValueExpression(const Expression &expr, cons
 //------------------------------------------------------------------------------
 // Utility Functions
 //------------------------------------------------------------------------------
-
-std::string FilterEncoder::EscapeBracketIdentifier(const std::string &identifier) {
-	std::string result;
-	result.reserve(identifier.size() + 2);
-	for (char c : identifier) {
-		result += c;
-		if (c == ']') {
-			result += ']';	// Double the ] character
-		}
-	}
-	return result;
-}
 
 std::string FilterEncoder::EscapeLikePattern(const std::string &pattern) {
 	std::string result;
@@ -653,7 +642,7 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 
 		const std::string &col_name = column_names[table_col_idx];
 		const LogicalType &col_type = column_types[table_col_idx];
-		std::string escaped_col = "[" + EscapeBracketIdentifier(col_name) + "]";
+		std::string escaped_col = mssql::QuoteIdentifier(col_name);
 		ctx.filter_column_info =
 			(mssql_columns && table_col_idx < mssql_columns->size()) ? &(*mssql_columns)[table_col_idx] : nullptr;
 
@@ -1021,6 +1010,19 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 	// Encode all arguments
 	auto child_ctx = ctx.child();
 	const bool datepart = IsDatePartFunction(func_name);
+	// A date part of a datetimeoffset is taken in the value's own offset by the
+	// server and in the session TimeZone by DuckDB (measured: HOUR of 12:00
+	// +05:00 is 12 there, 7 in UTC here), so a pushed `hour(dto) = 12` would
+	// match other rows than DuckDB's (review of #387).
+	if (datepart) {
+		for (const auto &child : expr.GetChildren()) {
+			if (child->GetReturnType().id() == LogicalTypeId::TIMESTAMP_TZ) {
+				MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: %s of a TIMESTAMP WITH TIME ZONE not pushed",
+									   func_name.c_str());
+				return {"", false};
+			}
+		}
+	}
 	std::vector<std::string> encoded_args;
 	for (const auto &child : expr.GetChildren()) {
 		const Expression *arg = child.get();
@@ -1352,7 +1354,7 @@ ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpres
 	if (table_col_idx == COLUMN_IDENTIFIER_ROW_ID) {
 		// Only scalar PK can be used in arbitrary expressions
 		if (ctx.HasPKInfo() && !ctx.pk_is_composite) {
-			std::string sql = "[" + EscapeBracketIdentifier((*ctx.pk_column_names)[0]) + "]";
+			std::string sql = mssql::QuoteIdentifier((*ctx.pk_column_names)[0]);
 			MSSQL_FILTER_DEBUG_LOG(2, "EncodeColumnRef: rowid (scalar PK) -> %s", sql.c_str());
 			return {sql, true};
 		}
@@ -1375,7 +1377,7 @@ ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpres
 	}
 
 	const std::string &col_name = ctx.column_names[table_col_idx];
-	std::string sql = "[" + EscapeBracketIdentifier(col_name) + "]";
+	std::string sql = mssql::QuoteIdentifier(col_name);
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeColumnRef: encoded -> %s", sql.c_str());
 	return {sql, true};
 }
@@ -1574,7 +1576,7 @@ ExpressionEncodeResult FilterEncoder::EncodeRowidEquality(const Expression &valu
 			if (i > 0) {
 				sql += " AND ";
 			}
-			sql += "[" + EscapeBracketIdentifier((*ctx.pk_column_names)[i]) + "]";
+			sql += mssql::QuoteIdentifier((*ctx.pk_column_names)[i]);
 			sql += " = ";
 			sql += EncodeConstantValue(children[i], (*ctx.pk_column_types)[i], ctx,
 									   ColumnInfoByName((*ctx.pk_column_names)[i], ctx));
@@ -1584,7 +1586,7 @@ ExpressionEncodeResult FilterEncoder::EncodeRowidEquality(const Expression &valu
 		return {sql, true};
 	} else {
 		// Scalar PK: rowid = value
-		std::string sql = "[" + EscapeBracketIdentifier((*ctx.pk_column_names)[0]) + "]";
+		std::string sql = mssql::QuoteIdentifier((*ctx.pk_column_names)[0]);
 		sql += " = ";
 		sql += EncodeConstantValue(const_expr.GetValue(), (*ctx.pk_column_types)[0], ctx,
 								   ColumnInfoByName((*ctx.pk_column_names)[0], ctx));

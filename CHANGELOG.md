@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ORDER BY … LIMIT on a nullable key is pushed** under
+  `mssql_order_pushdown`. SQL Server sorts NULL lowest and has no
+  `NULLS FIRST` / `LAST`, so a nullable key asking for another placement
+  stopped the pushdown before. That included DuckDB's default, `NULLS LAST` on
+  an ascending key. Under a LIMIT a leading `CASE WHEN key IS NULL` key now
+  gets DuckDB's placement and the server returns only the N rows. A plain
+  ORDER BY still sorts in DuckDB: that leading key defeats any index, so the
+  server would sort the whole table where DuckDB does now.
+- **`mssql_scan` reports `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)`**, as the
+  catalog has since spec 060, under `mssql_catalog_native_types`, so
+  `CREATE TABLE … AS SELECT * FROM mssql_scan(…)` keeps the source's lengths
+  (and a UTF-8 `varchar`'s collation) instead of making `nvarchar(max)`.
+  `typeof()` of such a column changes from `VARCHAR`; setting the option to
+  `false` restores it. With `mssql_utf8_support = false` the column is still
+  reported as the declared `MSSQL_VARCHAR(n)`, although it travels as
+  nvarchar. A `char` / `varchar` under a code-page collation stays
+  plain `VARCHAR`: a raw scan hands its bytes over untranscoded, and an
+  annotation naming the code page would invite a re-encode. `prepared := true`
+  reports the same types, asking `sp_describe_first_result_set` for the
+  collations `sp_prepare` names only by id.
 - **The pool opens its connections at ATTACH, in parallel; `preload` loads the
   catalog at ATTACH** ([#324](https://github.com/hugr-lab/mssql-extension/issues/324)).
   - **`mssql_min_connections` did not open anything.** It only kept idle
@@ -91,6 +111,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **ORDER BY pushdown returned SQL Server's order for string keys**
+  ([#362](https://github.com/hugr-lab/mssql-extension/issues/362)). With
+  `mssql_order_pushdown` on, a pushed ORDER BY removes DuckDB's own sort, and
+  nothing checked the key's collation. So `ORDER BY name` on a `varchar` under
+  the installation default `SQL_Latin1_General_CP1_CI_AS` came back in
+  linguistic order, with case and accents interleaved, instead of DuckDB's.
+  - **Rule:** a key is now pushed only when the server sorts it as DuckDB
+    does: numeric, `bit` and date/time types (not `datetime2(7)`, whose
+    out-of-range values DuckDB reads as NULL). A `varchar` / `char` under a
+    UTF-8 collation is pushed only under a LIMIT, as its bytes
+    (`CAST(col AS varbinary(n))`, bounded `varchar` only — `char(n)` is read
+    trimmed): as text the server pads with spaces, so `ab` + TAB would sort
+    before `ab`. Not `nvarchar`, even under `_BIN2`: its
+    UTF-16 order puts a character above the BMP before U+E000–U+FFFF, DuckDB
+    after. Never a string-valued function (`upper(name)`) or a date part of a
+    `datetimeoffset`.
+  - **Never pushed:** `uniqueidentifier` (SQL Server compares its last six
+    bytes first), `binary` / `varbinary` (compared zero-padded, so `0x01` =
+    `0x0100`), `json`, `sql_variant`.
+- **`upper()` / `lower()` in a filter could lose rows.** They were pushed to
+  SQL Server, whose case mapping is not DuckDB's: `WHERE upper(name) =
+  'STRAẞE'` found nothing, because the server's `UPPER('ß')` is `ß`. They are
+  now applied by DuckDB, as `length()` already was; `trim`, `ltrim` and
+  `rtrim` with them. A date part of a `datetimeoffset` is no longer pushed
+  either: the server takes it in the value's own offset.
+- **ORDER BY … LIMIT under-returned when a filter ran client-side.** With
+  `mssql_order_pushdown` on, the TOP N went to the server while a filter the
+  extension cannot translate (a `rowid` field of a composite key) was applied
+  to what came back, so the server's N rows were filtered down, not refilled:
+  `WHERE rowid.a >= 2 ORDER BY k LIMIT 2` returned 0 rows of 2. TOP N is now
+  pushed only when every filter is on the server.
+- **RENAME of a table or column with a dot in its name** failed: `sp_rename`
+  parses the old name as a multi-part name and it was sent unbracketed.
+- **Names containing `]` broke the bulk load and DELETE.** Several places put
+  brackets around a table, schema or column name without doubling `]`: the
+  `INSERT BULK` of COPY / INSERT / CTAS, a rowid DELETE, and the target-shape
+  probe (whose `OBJECT_ID('…')` literal also broke on a `'`). Every identifier
+  now goes through one quoter, which replaced eight copies of it.
 - **Transactions fill the shared metadata cache again**
   ([#383](https://github.com/hugr-lab/mssql-extension/issues/383)). Since #380
   a transaction loads a missing table's metadata into a cache of its own, so a
