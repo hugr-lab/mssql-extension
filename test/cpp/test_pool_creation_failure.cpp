@@ -225,18 +225,35 @@ static void TestTryAcquireDoesNotCountATimeout() {
 	auto held = pool.Acquire(500);
 	Check(held != nullptr, "try: the one connection is taken");
 
+	// A probe that comes back empty is not an acquisition and never waited, so
+	// neither acquire_count nor acquire_wait_total_ms may move: an extra
+	// bulk-load writer asks once per chunk while it shares the global writer,
+	// and counting those grows acquire_count with the chunk count and skews any
+	// acquire_wait_total_ms / acquire_count average (review of #382 / 7f13a0a).
+	// Asserted so a refactor that moves the increment back to the top of
+	// AcquireImpl cannot re-inflate the metric silently.
+	const auto acquires_before_miss = pool.GetStats().acquire_count;
+	const auto wait_before_miss = pool.GetStats().acquire_wait_total_ms;
+
 	auto t0 = std::chrono::steady_clock::now();
 	auto none = pool.TryAcquire();
 	Check(none == nullptr, "try: nothing free on a full pool");
 	Check(MsSince(t0) < 100, "try: returned at once");
 	Check(pool.GetStats().acquire_timeout_count == 0, "try: not counted as an acquire timeout");
+	Check(pool.GetStats().acquire_count == acquires_before_miss, "try: nor as an acquisition");
+	Check(pool.GetStats().acquire_wait_total_ms == wait_before_miss, "try: nor as a wait");
 
 	Check(pool.Acquire(0) == nullptr, "try: Acquire(0) on the same pool also finds nothing");
 	Check(pool.GetStats().acquire_timeout_count == 1, "try: but Acquire(0) IS counted");
 
 	pool.Release(std::move(held));
+	// The other half of the split: a probe that GETS a connection is a real
+	// checkout -- counted in connections_created / active_connections and later
+	// Released -- so it IS counted, at the success return rather than at the top.
+	const auto acquires_before_hit = pool.GetStats().acquire_count;
 	auto got = pool.TryAcquire();
 	Check(got != nullptr, "try: a released connection is taken");
+	Check(pool.GetStats().acquire_count == acquires_before_hit + 1, "try: and a probe that gets one IS counted");
 	if (got) {
 		pool.Release(std::move(got));
 	}
