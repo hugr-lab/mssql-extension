@@ -11,6 +11,10 @@ require mssql
 
 require-env MSSQL_TEST_DSN
 
+# Test 8 loads into a table, so it needs the writable test database rather than
+# the master MSSQL_TEST_DSN points at.
+require-env MSSQL_TESTDB_DSN
+
 # Test 1: Set a low connection limit
 statement ok
 SET mssql_connection_limit = 2;
@@ -95,3 +99,94 @@ DETACH limitdb;
 # Reset settings
 statement ok
 SET mssql_connection_limit = 64;
+
+# =============================================================================
+# Test 8: a bulk-load writer's EMPTY probe is not a checkout (review of #382 /
+# 7f13a0a). An extra COPY writer claims its connection with TryAcquire, which
+# never waits, and asks again on a later chunk when it gets nothing. At
+# mssql_connection_limit = 1 it can NEVER get one, so it asks once per chunk for
+# the whole load -- and while the probe was counted at the top of AcquireImpl
+# that grew acquire_count with the COPY's CHUNK COUNT, which both inflated the
+# figure and skewed acquire_wait_total_ms / acquire_count as an average wait.
+# The C++ peer of this case is TestTryAcquireDoesNotCountATimeout; this one
+# asserts it where a user sees it, through mssql_pool_stats.
+# =============================================================================
+
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS probedb (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+# A writer is claimed by a THREAD on its first chunk, so without several DuckDB
+# threads driving the sink no extra writer is ever asked for and this case would
+# pass while testing nothing (parallel_writers.test pins the count for the same
+# reason). The pool of one then refuses every claim.
+statement ok
+SET threads = 4;
+
+statement ok
+SET mssql_copy_parallel_writers = 4;
+
+statement ok
+SELECT mssql_exec('probedb', 'IF OBJECT_ID(''dbo.PoolProbeTarget'') IS NOT NULL DROP TABLE dbo.PoolProbeTarget;
+CREATE TABLE dbo.PoolProbeTarget (id int, s nvarchar(40))');
+
+# ~30 chunks at DuckDB's 2048-row vector: enough that a per-chunk probe counted
+# as a checkout is unmistakable next to the handful of real ones.
+statement ok
+CREATE OR REPLACE TABLE pool_probe_src AS SELECT i AS id, 'row_' || i AS s FROM range(60000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE pool_probe_before AS SELECT acquire_count AS ac FROM mssql_pool_stats('probedb');
+
+statement ok
+COPY pool_probe_src TO 'probedb.dbo.PoolProbeTarget' (FORMAT bcp, CREATE_TABLE false);
+
+# The load itself still ran, on the one connection.
+query I
+SELECT count(*) FROM probedb.dbo.PoolProbeTarget;
+----
+60000
+
+# The pool never handed out a second connection, so there is nothing an extra
+# writer could legitimately be counted for.
+query I
+SELECT connections_created FROM mssql_pool_stats('probedb');
+----
+1
+
+# Bounded by the real checkouts, not by the chunk count. A double-digit delta
+# here means the refused probes are being counted again.
+query I
+SELECT ((SELECT acquire_count FROM mssql_pool_stats('probedb')) - (SELECT ac FROM pool_probe_before)) <= 10;
+----
+true
+
+# Cleanup
+statement ok
+DROP TABLE pool_probe_src;
+
+statement ok
+DROP TABLE pool_probe_before;
+
+statement ok
+SELECT mssql_exec('probedb', 'DROP TABLE dbo.PoolProbeTarget');
+
+statement ok
+DETACH probedb;
+
+statement ok
+SET mssql_connection_limit = 64;
+
+statement ok
+RESET mssql_copy_parallel_writers;
+
+statement ok
+RESET mssql_exec_invalidate_cache;
+
+statement ok
+RESET threads;
