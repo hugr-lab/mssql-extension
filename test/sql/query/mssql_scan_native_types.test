@@ -168,6 +168,14 @@ v	VARCHAR
 statement ok
 RESET mssql_utf8_support;
 
+# An nvarchar under a UTF-8 collation -- every string column of a database whose
+# default collation is UTF-8 -- keeps its MSSQL_NVARCHAR(n) on a connection
+# granted UTF8SUPPORT, even where COLMETADATA is all there is (review of #387).
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'CREATE TABLE #u (n nvarchar(30) COLLATE Latin1_General_100_CI_AS_SC_UTF8); INSERT #u VALUES (N''x''); SELECT n FROM #u'));
+----
+n	MSSQL_NVARCHAR(30)
+
 # Off: plain VARCHAR, as before.
 statement ok
 SET mssql_catalog_native_types = false;

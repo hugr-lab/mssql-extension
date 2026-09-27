@@ -17,7 +17,7 @@
 #   varchar under a UTF-8 collation -> ordered as TEXT the server pads with
 #                                   spaces (`ab` = `ab `, `ab`+TAB before
 #                                   `ab`); ordered as its BYTES,
-#                                   CAST(col AS varbinary(max)), it is
+#                                   CAST(col AS varbinary(n)), it is
 #                                   DuckDB's order (a trailing NUL ties).
 #                                   Pushed that way only under a LIMIT: the
 #                                   key is not sargable
