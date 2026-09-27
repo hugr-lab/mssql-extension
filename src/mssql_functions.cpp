@@ -348,15 +348,17 @@ static LogicalType WireStringType(const tds::ColumnMetadata &col, bool native_ty
 // nvarchar when the server did not grant UTF8SUPPORT -- the bind names the
 // DECLARED type, the stream carries the wire one -- as nvarchar(n), or
 // nvarchar(max) past the 4000 characters nvarchar holds inline. Accepted only
-// when the column's collation is UTF-8: a varchar declared under one that
-// arrives as nvarchar can only have been transcoded. Not gated on the catalog's
-// cached UTF8SUPPORT answer (review of #387): the collation bit and the kinds
-// already identify the transcoded column, and one answer cached for a whole
-// catalog is a weaker witness of what THIS stream's connection negotiated. The collation itself is not compared:
-// COLMETADATA carries it as an id, not a name.
+// when the column's collation is UTF-8 AND the stream's own connection was not
+// granted UTF8SUPPORT -- the only connection on which a varchar is transcoded,
+// so on a granted one an nvarchar in place of a bound varchar is a real change
+// and refused. The connection's answer, not the catalog's cached one (review of
+// #387). The collation itself is not compared: COLMETADATA carries it as an
+// id, not a name.
 static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQLResultStream &stream) {
 	auto &types = stream.GetColumnTypes();
 	auto &metadata = stream.GetColumnMetadata();
+	auto connection = stream.GetConnection();
+	const bool utf8_acked = connection && connection->UTF8SupportAcked();
 	if (bound.size() != types.size() || metadata.size() != types.size()) {
 		return false;
 	}
@@ -385,7 +387,7 @@ static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQ
 			}
 			continue;
 		}
-		const bool transcoded = !spec.unicode && unicode && metadata[i].IsUtf8Collation();
+		const bool transcoded = !spec.unicode && unicode && !utf8_acked && metadata[i].IsUtf8Collation();
 		if (!transcoded) {
 			return false;
 		}
