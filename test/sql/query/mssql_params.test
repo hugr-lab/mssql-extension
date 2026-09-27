@@ -129,7 +129,7 @@ UUID	6f9619ff-8b86-d011-b42d-00c04fc964ff
 query II
 SELECT column_type, v FROM (DESCRIBE SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 'it''s [a] ünïcode'})) CROSS JOIN mssql_scan_params('pm75', 'SELECT @p AS v', {'p': 'it''s [a] ünïcode'});
 ----
-VARCHAR	it's [a] ünïcode
+MSSQL_NVARCHAR(4000)	it's [a] ünïcode
 
 # Past 4000 bytes the declaration is nvarchar(max)
 query I

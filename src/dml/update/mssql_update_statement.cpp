@@ -2,6 +2,7 @@
 #include "dml/insert/mssql_value_serializer.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 
@@ -89,7 +90,7 @@ string MSSQLUpdateStatement::GenerateSetClause() const {
 		if (i > 0) {
 			result += ", ";
 		}
-		string col_name = EscapeIdentifier(target_.update_columns[i].name);
+		string col_name = mssql::QuoteIdentifier(target_.update_columns[i].name);
 		result += "t." + col_name + " = v." + col_name;
 	}
 	return result;
@@ -103,12 +104,12 @@ string MSSQLUpdateStatement::GenerateValuesColumnList() const {
 		if (i > 0) {
 			result += ", ";
 		}
-		result += EscapeIdentifier(target_.pk_info.columns[i].name);
+		result += mssql::QuoteIdentifier(target_.pk_info.columns[i].name);
 	}
 
 	// Then update columns
 	for (idx_t i = 0; i < target_.update_columns.size(); i++) {
-		result += ", " + EscapeIdentifier(target_.update_columns[i].name);
+		result += ", " + mssql::QuoteIdentifier(target_.update_columns[i].name);
 	}
 
 	return result;
@@ -120,14 +121,10 @@ string MSSQLUpdateStatement::GenerateOnClause() const {
 		if (i > 0) {
 			result += " AND ";
 		}
-		string col_name = EscapeIdentifier(target_.pk_info.columns[i].name);
+		string col_name = mssql::QuoteIdentifier(target_.pk_info.columns[i].name);
 		result += "t." + col_name + " = " + target_.pk_info.columns[i].KeyComparand("v." + col_name);
 	}
 	return result;
-}
-
-string MSSQLUpdateStatement::EscapeIdentifier(const string &name) {
-	return MSSQLValueSerializer::EscapeIdentifier(name);
 }
 
 }  // namespace duckdb

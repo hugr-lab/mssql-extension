@@ -13,6 +13,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 
@@ -92,22 +93,6 @@ const char *DDLOperationToString(DDLOperation op) {
 // Identifier Quoting
 //===----------------------------------------------------------------------===//
 
-string MSSQLDDLTranslator::QuoteIdentifier(const string &identifier) {
-	// SQL Server uses square brackets for quoting identifiers
-	// The ] character is escaped by doubling it: ] -> ]]
-	string result;
-	result.reserve(identifier.size() + 2);
-	result += '[';
-	for (char c : identifier) {
-		result += c;
-		if (c == ']') {
-			result += ']';	// Double the ] character
-		}
-	}
-	result += ']';
-	return result;
-}
-
 string MSSQLDDLTranslator::EscapeStringLiteral(const string &value) {
 	// Escape single quotes by doubling them: ' -> ''
 	string result;
@@ -149,7 +134,7 @@ string MSSQLDDLTranslator::BuildColumnDefinition(const ColumnDefinition &column,
 	string result;
 
 	// Column name
-	result += QuoteIdentifier(column.GetName().GetIdentifierName());
+	result += mssql::QuoteIdentifier(column.GetName().GetIdentifierName());
 	result += " ";
 
 	// Column type
@@ -167,11 +152,11 @@ string MSSQLDDLTranslator::BuildColumnDefinition(const ColumnDefinition &column,
 //===----------------------------------------------------------------------===//
 
 string MSSQLDDLTranslator::TranslateCreateSchema(const string &schema_name) {
-	return "CREATE SCHEMA " + QuoteIdentifier(schema_name) + ";";
+	return "CREATE SCHEMA " + mssql::QuoteIdentifier(schema_name) + ";";
 }
 
 string MSSQLDDLTranslator::TranslateDropSchema(const string &schema_name) {
-	return "DROP SCHEMA " + QuoteIdentifier(schema_name) + ";";
+	return "DROP SCHEMA " + mssql::QuoteIdentifier(schema_name) + ";";
 }
 
 //===----------------------------------------------------------------------===//
@@ -194,9 +179,9 @@ string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const
 	}
 
 	string result = "CREATE TABLE ";
-	result += QuoteIdentifier(schema_name);
+	result += mssql::QuoteIdentifier(schema_name);
 	result += ".";
-	result += QuoteIdentifier(table_name);
+	result += mssql::QuoteIdentifier(table_name);
 	result += " (";
 
 	bool first = true;
@@ -223,7 +208,7 @@ string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const
 						if (i > 0) {
 							result += ", ";
 						}
-						result += QuoteIdentifier(pk_columns[i].GetIdentifierName());
+						result += mssql::QuoteIdentifier(pk_columns[i].GetIdentifierName());
 					}
 				} else if (unique_constraint.HasIndex()) {
 					// Single column constraint by index
@@ -232,7 +217,7 @@ string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const
 					idx_t col_idx = 0;
 					for (auto &column : columns.Logical()) {
 						if (col_idx == idx.index) {
-							result += QuoteIdentifier(column.GetName().GetIdentifierName());
+							result += mssql::QuoteIdentifier(column.GetName().GetIdentifierName());
 							break;
 						}
 						col_idx++;
@@ -249,15 +234,18 @@ string MSSQLDDLTranslator::TranslateCreateTable(const string &schema_name, const
 }
 
 string MSSQLDDLTranslator::TranslateDropTable(const string &schema_name, const string &table_name) {
-	return "DROP TABLE " + QuoteIdentifier(schema_name) + "." + QuoteIdentifier(table_name) + ";";
+	return "DROP TABLE " + mssql::QuoteIdentifier(schema_name) + "." + mssql::QuoteIdentifier(table_name) + ";";
 }
 
 string MSSQLDDLTranslator::TranslateRenameTable(const string &schema_name, const string &old_name,
 												const string &new_name) {
 	// SQL Server uses sp_rename for renaming tables
-	// Syntax: EXEC sp_rename N'schema.old_name', N'new_name'
-	// Note: new_name should not include schema
-	string old_full_name = schema_name + "." + old_name;
+	// Syntax: EXEC sp_rename N'[schema].[old_name]', N'new_name'
+	// The old name is parsed as a multi-part name, so each part is bracketed (a
+	// dot or a bracket inside one would split it); the new name is taken
+	// literally -- brackets there would become part of the name -- and carries
+	// no schema.
+	string old_full_name = mssql::QuoteIdentifier(schema_name) + "." + mssql::QuoteIdentifier(old_name);
 	return "EXEC sp_rename N'" + EscapeStringLiteral(old_full_name) + "', N'" + EscapeStringLiteral(new_name) + "';";
 }
 
@@ -268,9 +256,9 @@ string MSSQLDDLTranslator::TranslateRenameTable(const string &schema_name, const
 string MSSQLDDLTranslator::TranslateAddColumn(const string &schema_name, const string &table_name,
 											  const ColumnDefinition &column) {
 	string result = "ALTER TABLE ";
-	result += QuoteIdentifier(schema_name);
+	result += mssql::QuoteIdentifier(schema_name);
 	result += ".";
-	result += QuoteIdentifier(table_name);
+	result += mssql::QuoteIdentifier(table_name);
 	result += " ADD ";
 	result += BuildColumnDefinition(column);
 	result += ";";
@@ -279,15 +267,17 @@ string MSSQLDDLTranslator::TranslateAddColumn(const string &schema_name, const s
 
 string MSSQLDDLTranslator::TranslateDropColumn(const string &schema_name, const string &table_name,
 											   const string &column_name) {
-	return "ALTER TABLE " + QuoteIdentifier(schema_name) + "." + QuoteIdentifier(table_name) + " DROP COLUMN " +
-		   QuoteIdentifier(column_name) + ";";
+	return "ALTER TABLE " + mssql::QuoteIdentifier(schema_name) + "." + mssql::QuoteIdentifier(table_name) +
+		   " DROP COLUMN " + mssql::QuoteIdentifier(column_name) + ";";
 }
 
 string MSSQLDDLTranslator::TranslateRenameColumn(const string &schema_name, const string &table_name,
 												 const string &old_name, const string &new_name) {
 	// SQL Server uses sp_rename for renaming columns
-	// Syntax: EXEC sp_rename N'schema.table.old_column', N'new_column', N'COLUMN'
-	string old_full_name = schema_name + "." + table_name + "." + old_name;
+	// Syntax: EXEC sp_rename N'[schema].[table].[old_column]', N'new_column', N'COLUMN'
+	// Parts bracketed, new name literal -- see TranslateRenameTable.
+	string old_full_name = mssql::QuoteIdentifier(schema_name) + "." + mssql::QuoteIdentifier(table_name) + "." +
+						   mssql::QuoteIdentifier(old_name);
 	return "EXEC sp_rename N'" + EscapeStringLiteral(old_full_name) + "', N'" + EscapeStringLiteral(new_name) +
 		   "', N'COLUMN';";
 }
@@ -296,11 +286,11 @@ string MSSQLDDLTranslator::TranslateAlterColumnType(const string &schema_name, c
 													const string &column_name, const LogicalType &new_type,
 													bool is_nullable) {
 	string result = "ALTER TABLE ";
-	result += QuoteIdentifier(schema_name);
+	result += mssql::QuoteIdentifier(schema_name);
 	result += ".";
-	result += QuoteIdentifier(table_name);
+	result += mssql::QuoteIdentifier(table_name);
 	result += " ALTER COLUMN ";
-	result += QuoteIdentifier(column_name);
+	result += mssql::QuoteIdentifier(column_name);
 	result += " ";
 	result += MapTypeToSQLServer(new_type);
 	result += is_nullable ? " NULL" : " NOT NULL";
@@ -313,11 +303,11 @@ string MSSQLDDLTranslator::TranslateAlterColumnNullability(const string &schema_
 														   bool set_not_null) {
 	// SQL Server requires specifying the full type when altering nullability
 	string result = "ALTER TABLE ";
-	result += QuoteIdentifier(schema_name);
+	result += mssql::QuoteIdentifier(schema_name);
 	result += ".";
-	result += QuoteIdentifier(table_name);
+	result += mssql::QuoteIdentifier(table_name);
 	result += " ALTER COLUMN ";
-	result += QuoteIdentifier(column_name);
+	result += mssql::QuoteIdentifier(column_name);
 	result += " ";
 	result += MapTypeToSQLServer(current_type);
 	result += set_not_null ? " NOT NULL" : " NULL";
@@ -387,9 +377,9 @@ string MSSQLDDLTranslator::TranslateCreateTableFromSchema(const string &schema_n
 	}
 
 	string result = "CREATE TABLE ";
-	result += QuoteIdentifier(schema_name);
+	result += mssql::QuoteIdentifier(schema_name);
 	result += ".";
-	result += QuoteIdentifier(table_name);
+	result += mssql::QuoteIdentifier(table_name);
 	result += " (";
 
 	bool first = true;
@@ -400,7 +390,7 @@ string MSSQLDDLTranslator::TranslateCreateTableFromSchema(const string &schema_n
 		first = false;
 
 		// Column name (bracket-escaped per FR-010)
-		result += QuoteIdentifier(column.name);
+		result += mssql::QuoteIdentifier(column.name);
 		result += " ";
 
 		// Column type (already resolved to SQL Server type)

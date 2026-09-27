@@ -1,5 +1,6 @@
 #include "dml/update/mssql_update_target.hpp"
 #include "dml/insert/mssql_value_serializer.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 
@@ -8,8 +9,7 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 string MSSQLUpdateTarget::GetFullyQualifiedName() const {
-	return MSSQLValueSerializer::EscapeIdentifier(schema_name) + "." +
-		   MSSQLValueSerializer::EscapeIdentifier(table_name);
+	return mssql::QuoteIdentifier(schema_name) + "." + mssql::QuoteIdentifier(table_name);
 }
 
 idx_t MSSQLUpdateTarget::GetParamsPerRow() const {

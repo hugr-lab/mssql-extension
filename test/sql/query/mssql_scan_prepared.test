@@ -31,7 +31,7 @@ query II
 SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('pr75', 'SELECT id, name FROM dbo.pr75_t ORDER BY id', prepared := true));
 ----
 id	INTEGER
-name	VARCHAR
+name	MSSQL_NVARCHAR(20)
 
 query II
 SELECT id, name FROM mssql_scan('pr75', 'SELECT id, name FROM dbo.pr75_t ORDER BY id', prepared := true);

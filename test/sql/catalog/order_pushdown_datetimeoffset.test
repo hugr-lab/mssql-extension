@@ -1,0 +1,46 @@
+# name: test/sql/catalog/order_pushdown_datetimeoffset.test
+# description: A date part of a datetimeoffset is not pushed as an ORDER BY key -- the server and DuckDB take it in different time zones (review of #387)
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# SQL Server takes DATEPART of a datetimeoffset in the value's own offset
+# (measured: HOUR of 12:00 +05:00 is 12, of 09:00 -05:00 is 9); DuckDB reads the
+# column as TIMESTAMP WITH TIME ZONE and takes hour() in the session TimeZone
+# (UTC: 7 and 14). A pushed `ORDER BY hour(dto)` would return the server's
+# order with DuckDB's sort removed. Date parts of TIMESTAMPTZ are ICU functions:
+# without ICU the query does not bind at all, so this file needs it.
+
+require mssql
+
+require icu
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS opdto (TYPE mssql, order_pushdown true);
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+SELECT mssql_exec('opdto', 'DROP TABLE IF EXISTS dbo.opc_dto;
+	CREATE TABLE dbo.opc_dto (id int NOT NULL PRIMARY KEY, dto datetimeoffset NOT NULL);
+	INSERT INTO dbo.opc_dto VALUES (1, ''2024-01-01 12:00:00 +05:00''), (2, ''2024-01-01 09:00:00 -05:00'')');
+
+query II
+EXPLAIN SELECT id FROM opdto.dbo.opc_dto ORDER BY hour(dto) LIMIT 1;
+----
+physical_plan	<REGEX>:.*(TOP_N|Top N).*
+
+query I
+SELECT id FROM opdto.dbo.opc_dto ORDER BY hour(dto) LIMIT 1;
+----
+1
+
+statement ok
+SELECT mssql_exec('opdto', 'DROP TABLE dbo.opc_dto');
+
+statement ok
+DETACH opdto;

@@ -31,8 +31,9 @@ Supported filter operations for pushdown:
 - Date/timestamp comparisons: `date_col >= '2024-01-01'`
 - Boolean comparisons: `is_active = true` (converted to `= 1`)
 - **Mapped functions** inside predicates:
-  - strings: `lower`, `upper`, `trim`, `ltrim`, `rtrim`
-  - dates: `year`, `month`, `day`, `hour`, `minute`, `second`
+  - dates: `year`, `month`, `day`, `hour`, `minute`, `second` — not over a
+    `datetimeoffset`, whose date parts the server takes in the value's own
+    offset and DuckDB in the session time zone
   - arithmetic: `+ - * %`, negation
   - substring matching: `prefix`/`suffix`/`contains` and their
     case-insensitive variants translate to `LIKE` (constant patterns) —
@@ -41,7 +42,10 @@ Supported filter operations for pushdown:
 
 **Not pushed down** (applied locally by DuckDB): unmapped functions —
 `list_contains()`, `regexp_matches()`, and anything else without a T-SQL
-mapping. An expression the encoder cannot translate stays in DuckDB; results
+mapping. That includes the string functions `lower`, `upper`, `trim`, `ltrim`,
+`rtrim` and `length`: SQL Server's versions do not return DuckDB's results
+(`UPPER('ß')` stays `ß`, DuckDB's `upper` gives `ẞ`), and a pushed
+`upper(name) = 'STRAẞE'` would have lost the row. An expression the encoder cannot translate stays in DuckDB; results
 are unchanged either way.
 
 Some functions are unmapped **on purpose**, because the T-SQL form would
@@ -84,14 +88,55 @@ ATTACH 'Server=...' AS db (TYPE mssql, order_pushdown true);
 **Setting precedence:** The global setting is checked first; if `true`, pushdown is enabled. The ATTACH option is checked second; `true` enables pushdown, `false` is a no-op (does not override global `true`).
 
 **Supported expressions:**
-- Simple column references: `ORDER BY name ASC`, `ORDER BY id DESC`
-- Single-argument functions: `ORDER BY year(date_col)`
-- Multi-column: `ORDER BY category ASC, name DESC`
-- Combined with LIMIT: `ORDER BY id ASC LIMIT 10` → `SELECT TOP 10 ... ORDER BY [id] ASC`
+- Simple column references: `ORDER BY id DESC`, `ORDER BY created_at`
+- Single-argument functions with a non-string result: `ORDER BY year(date_col)`
+- Multi-column: `ORDER BY region_id ASC, created_at DESC`
+- Combined with LIMIT: `ORDER BY id ASC LIMIT 10` on a `NOT NULL` key →
+  `SELECT TOP 10 ... ORDER BY [id] ASC`
+
+**Which keys.** A pushed ORDER BY removes DuckDB's own sort, so a key is pushed
+only when SQL Server sorts it the way DuckDB would:
+
+- numeric, `bit` and date/time keys — except `datetime2(7)`, the default
+  `datetime2`, which DuckDB reads as nanosecond timestamps and whose values
+  outside 1677–2262 (the `9999-12-31` end of a temporal table's period) it
+  reads as NULL;
+- a bounded `varchar(n)` under a **UTF-8** collation (any: `_BIN2_UTF8`, such
+  as the extension's CTAS default, or a case-insensitive `_UTF8` one), and only
+  **under a LIMIT**: it is ordered by its bytes, `CAST(col AS varbinary(n))`,
+  which is DuckDB's order. Not `char(n)`, which is stored blank-padded and read
+  trimmed, and not `varchar(max)`. The one remaining difference is a trailing NUL
+  character, which the server's comparison ignores (`ab` and `ab` + NUL tie).
+  Ordered as text the server would pad with spaces — `ab` equal to `ab `, and
+  `ab` + TAB before `ab` — hence the bytes; and since a key over bytes cannot
+  use an index, a plain ORDER BY on the column is left to DuckDB;
+- never a code-page `varchar` (its bytes are the code page's), a `char(n)`, a
+  `varchar(max)`, an `nvarchar` /
+  `nchar` under any collation (UTF-16 order puts a character above the BMP, an
+  emoji, before U+E000–U+FFFF; DuckDB after), a string-valued function of a key
+  (`upper(name)`), a date part of a `datetimeoffset` (the server takes it in
+  the value's own offset, DuckDB in the session time zone), a
+  `uniqueidentifier` (SQL Server compares its last six bytes first),
+  `binary` / `varbinary` (compared zero-padded: `0x01` = `0x0100`), `json` or
+  `sql_variant`.
+
+**NULL placement.** SQL Server sorts NULL lowest (ASC → first, DESC → last) and
+has no `NULLS FIRST` / `LAST`. When a nullable key asks for the other placement —
+including DuckDB's default `NULLS LAST` on an ascending key — an ORDER BY with a
+LIMIT is pushed with a leading `CASE WHEN key IS NULL THEN … END` key
+(`ORDER BY id LIMIT 10` on a nullable `id` → `SELECT TOP 10 ... ORDER BY CASE
+WHEN [id] IS NULL THEN 1 ELSE 0 END, [id] ASC`), and one without a LIMIT is left
+to DuckDB: the leading key defeats any index, so the server would sort the
+whole table instead. Asking for the server's own placement (`ASC NULLS FIRST`,
+`DESC NULLS LAST`) pushes either way.
+
+**Filters.** A TOP N is pushed only when every filter of the scan is on the
+server too. A filter the extension cannot translate runs on the rows that come
+back, and would otherwise be applied after the server had already cut them to N.
 
 **Limitations:**
-- NULL ordering must match SQL Server defaults (ASC = NULLS FIRST, DESC = NULLS LAST); mismatched null ordering falls back to DuckDB
-- Only prefix pushdown: stops at first non-pushable column
+- Only prefix pushdown: stops at first non-pushable column, and under a LIMIT
+  nothing is pushed unless every key is (the TOP N needs them all)
 - Expressions like `ORDER BY col * 2` are not pushed
 
 ### Row Identity (rowid)

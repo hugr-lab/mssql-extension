@@ -21,16 +21,16 @@ static std::string ToLower(const std::string &str) {
 // Template placeholders: {0}, {1}, {2}, etc.
 static const std::unordered_map<std::string, FunctionMapping> &GetFunctionMappingTable() {
 	static const std::unordered_map<std::string, FunctionMapping> mappings = {
-		// String functions
-		{"lower", {"lower", "LOWER({0})", 1}},
-		{"upper", {"upper", "UPPER({0})", 1}},
-		// length/len deliberately NOT mapped: SQL Server LEN excludes trailing spaces
-		// and counts UTF-16 code units, DuckDB length() counts code points including
-		// them (issue #242). No exact T-SQL form on non-_SC collations. An unmapped
-		// function is applied client-side by the spec-069 net, correct by construction.
-		{"trim", {"trim", "LTRIM(RTRIM({0}))", 1}},
-		{"ltrim", {"ltrim", "LTRIM({0})", 1}},
-		{"rtrim", {"rtrim", "RTRIM({0})", 1}},
+		// No string function is mapped. length/len: SQL Server LEN excludes
+		// trailing spaces and counts UTF-16 code units, DuckDB length() counts
+		// code points including them (issue #242). lower/upper: the server's case
+		// mapping is not DuckDB's -- UPPER('ß') stays 'ß', DuckDB's upper gives
+		// 'ẞ' -- so `WHERE upper(name) = 'ẞ'` pushed LOST the row (review of
+		// #387). trim/ltrim/rtrim go with them: both sides trim spaces only, but a
+		// string function's result is then compared under the server's rules,
+		// which nothing here has checked against DuckDB's. An unmapped function is
+		// applied client-side by the spec-069 net, correct by construction; the
+		// cost is that such a filter reads the rows it rejects.
 
 		// Note: LIKE pattern functions (prefix, suffix, contains, iprefix, isuffix, icontains)
 		// are handled by EncodeLikePattern() directly for proper Unicode (N'') encoding

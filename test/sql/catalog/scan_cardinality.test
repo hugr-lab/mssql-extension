@@ -125,12 +125,11 @@ SELECT count(*) FROM card.dbo.CardScanBig b JOIN card.dbo.CardScanSmall s ON b.i
 # passes — the get's estimate is already taken by the time MSSQLOptimizer could
 # set `top_n`. That is a stage-order property, not a property of this fixture.
 #
-# Measuring it here would also mislead: CardScanBig is COPY-created, so every
-# column is NULLABLE, and DuckDB's default NULLS LAST for ASC fails
-# IsNullOrderCompatible — TryPushTopN bails before touching `top_n` for a reason
-# that has nothing to do with the clamp. Against a NOT NULL column the TopN would
-# fold. So an EXPLAIN assertion here would pass or fail for the wrong reason
-# either way (jobs 1127, 1197).)
+# Measuring it here would also mislead: whether the TopN folds into the scan
+# depends on the key (MSSQLColumnInfo::OrdersLikeDuckDB), on the scan's filters
+# (none may stay client-side), and on order_pushdown being on at all -- none of
+# which has anything to do with the clamp. So an EXPLAIN assertion here would
+# pass or fail for the wrong reason either way (jobs 1127, 1197).)
 
 # -----------------------------------------------------------------------------
 # A count of 0 means UNKNOWN, not empty — the rule with the largest blast radius

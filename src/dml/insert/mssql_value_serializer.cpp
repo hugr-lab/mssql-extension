@@ -6,27 +6,13 @@
 #include "codec/string_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hugeint.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
 // Identifier and String Escaping
 //===----------------------------------------------------------------------===//
-
-string MSSQLValueSerializer::EscapeIdentifier(const string &name) {
-	// T-SQL bracket quoting: ] becomes ]]
-	string result;
-	result.reserve(name.size() + 2);
-	result.push_back('[');
-	for (char c : name) {
-		if (c == ']') {
-			result.push_back(']');
-		}
-		result.push_back(c);
-	}
-	result.push_back(']');
-	return result;
-}
 
 string MSSQLValueSerializer::EscapeString(const string &value) {
 	// SQL string escaping: ' becomes ''

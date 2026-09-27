@@ -1,0 +1,187 @@
+# name: test/sql/query/mssql_scan_native_types.test
+# description: mssql_scan reports bounded string columns as MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) with their collation, as the catalog does (spec 079 D3)
+# group: [query]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The catalog has reported a bounded string column as MSSQL_VARCHAR(n) /
+# MSSQL_NVARCHAR(n), carrying the column's collation, since spec 060, so that a
+# table created from it inherits the declared type. mssql_scan read only the
+# type NAME of sp_describe_first_result_set's answer and reported plain
+# VARCHAR, so `CREATE TABLE … AS SELECT * FROM mssql_scan(…)` made
+# nvarchar(max) columns where the catalog path made varchar(n) with the
+# source's collation. It now reads the length and the collation_name too,
+# through the catalog's own MSSQLColumnInfo::NativeDuckDBType. The remote-
+# pushdown vehicle (spec 079) is mssql_scan_params, so a pushed CTAS depends on
+# this.
+#
+# A char / varchar column is annotated only under a UTF-8 collation (review of
+# #387): a raw scan hands a code-page varchar's bytes over untranscoded (issue
+# #224), so an annotation naming the code page would describe values that are
+# not in it. Such a column stays plain VARCHAR.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS snt (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('snt', 'DROP TABLE IF EXISTS dbo.snt_src, dbo.snt_dst');
+
+statement ok
+SELECT mssql_exec('snt', 'CREATE TABLE dbo.snt_src (
+	v varchar(20) COLLATE Latin1_General_100_BIN2_UTF8 NULL,
+	c char(4) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+	n nvarchar(30) NULL,
+	m varchar(max) NULL,
+	i int NULL);
+	INSERT INTO dbo.snt_src VALUES (''abc'', ''xy'', N''Привет'', ''long'', 7)');
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'SELECT v, c, n, m, i FROM dbo.snt_src'));
+----
+v	MSSQL_VARCHAR(20)
+c	VARCHAR
+n	MSSQL_NVARCHAR(30)
+m	VARCHAR
+i	INTEGER
+
+# prepared := true reports the same types: sp_prepare's COLMETADATA names a
+# collation by id, so the varchars' collations come from the describe.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'SELECT v, c, n, m, i FROM dbo.snt_src', prepared := true));
+----
+v	MSSQL_VARCHAR(20)
+c	VARCHAR
+n	MSSQL_NVARCHAR(30)
+m	VARCHAR
+i	INTEGER
+
+# The values are unchanged.
+query TTTTI
+SELECT v, trim(c), n, m, i FROM mssql_scan('snt', 'SELECT v, c, n, m, i FROM dbo.snt_src');
+----
+abc	xy	Привет	long	7
+
+# mssql_scan_params, the remote-pushdown vehicle, the same.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan_params('snt', 'SELECT v FROM dbo.snt_src WHERE i = @i', {'i': 7}));
+----
+v	MSSQL_VARCHAR(20)
+
+# A table created from it keeps the annotated lengths and collations.
+statement ok
+CREATE TABLE snt.dbo.snt_dst AS SELECT * FROM mssql_scan('snt', 'SELECT v, n FROM dbo.snt_src');
+
+query TTIT
+SELECT * FROM mssql_scan('snt', 'SELECT c.name, TYPE_NAME(c.user_type_id) AS t, CAST(c.max_length AS int) AS len, c.collation_name FROM sys.columns c WHERE c.object_id = OBJECT_ID(''dbo.snt_dst'') ORDER BY c.column_id');
+----
+v	varchar	20	Latin1_General_100_BIN2_UTF8
+n	nvarchar	60	SQL_Latin1_General_CP1_CI_AS
+
+# The same through prepared := true: the varchar keeps its source collation
+# rather than falling back to mssql_utf8_collation at the target. The source
+# here is a CI UTF-8 collation, which the fallback (BIN2) is not.
+statement ok
+SELECT mssql_exec('snt', 'DROP TABLE IF EXISTS dbo.snt_ci, dbo.snt_dst_p;
+	CREATE TABLE dbo.snt_ci (v varchar(12) COLLATE Latin1_General_100_CI_AS_SC_UTF8 NULL);
+	INSERT INTO dbo.snt_ci VALUES (''abc'')');
+
+statement ok
+CREATE TABLE snt.dbo.snt_dst_p AS SELECT * FROM mssql_scan('snt', 'SELECT v FROM dbo.snt_ci', prepared := true);
+
+query TTIT
+SELECT * FROM mssql_scan('snt', 'SELECT c.name, TYPE_NAME(c.user_type_id) AS t, CAST(c.max_length AS int) AS len, c.collation_name FROM sys.columns c WHERE c.object_id = OBJECT_ID(''dbo.snt_dst_p'') ORDER BY c.column_id');
+----
+v	varchar	12	Latin1_General_100_CI_AS_SC_UTF8
+
+# Without UTF8SUPPORT (the escape hatch, or an endpoint that ignores the
+# request) a UTF-8 varchar travels as nvarchar: the bind still names the
+# DECLARED type, and the stream's wire type must not be taken for a changed
+# shape (review of #387: the scan threw on a good stream). A fresh ATTACH, the
+# setting being read at login.
+statement ok
+SET mssql_utf8_support = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS snt16 (TYPE mssql);
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt16', 'SELECT v, c FROM dbo.snt_src'));
+----
+v	MSSQL_VARCHAR(20)
+c	VARCHAR
+
+query TT
+SELECT v, trim(c) FROM mssql_scan('snt16', 'SELECT v, c FROM dbo.snt_src');
+----
+abc	xy
+
+# prepared: the UTF-8 column is found by its collation bit although it arrives
+# as nvarchar, and a code-page column beside it keeps its own type.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt16', 'SELECT c, v FROM dbo.snt_src', prepared := true));
+----
+c	VARCHAR
+v	MSSQL_VARCHAR(20)
+
+query TT
+SELECT trim(c), v FROM mssql_scan('snt16', 'SELECT c, v FROM dbo.snt_src', prepared := true);
+----
+xy	abc
+
+# Past the 4000 characters nvarchar holds inline the transcoded column arrives
+# as nvarchar(max): still the declared varchar(6000), not a changed shape.
+statement ok
+SELECT mssql_exec('snt16', 'DROP TABLE IF EXISTS dbo.snt_wide;
+	CREATE TABLE dbo.snt_wide (w varchar(6000) COLLATE Latin1_General_100_BIN2_UTF8 NULL);
+	INSERT INTO dbo.snt_wide VALUES (''wide'')');
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt16', 'SELECT w FROM dbo.snt_wide'));
+----
+w	MSSQL_VARCHAR(6000)
+
+query T
+SELECT w FROM mssql_scan('snt16', 'SELECT w FROM dbo.snt_wide');
+----
+wide
+
+statement ok
+SELECT mssql_exec('snt16', 'DROP TABLE dbo.snt_wide');
+
+statement ok
+DETACH snt16;
+
+# A batch the server cannot describe runs at bind: its string columns are
+# typed from COLMETADATA as the prepared path's are -- an nvarchar with its
+# length, a varchar plain.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'CREATE TABLE #t (n nvarchar(30), v varchar(10)); INSERT #t VALUES (N''x'', ''y''); SELECT n, v FROM #t'));
+----
+n	MSSQL_NVARCHAR(30)
+v	VARCHAR
+
+statement ok
+RESET mssql_utf8_support;
+
+# Off: plain VARCHAR, as before.
+statement ok
+SET mssql_catalog_native_types = false;
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'SELECT v FROM dbo.snt_src'));
+----
+v	VARCHAR
+
+statement ok
+RESET mssql_catalog_native_types;
+
+statement ok
+SELECT mssql_exec('snt', 'DROP TABLE dbo.snt_src, dbo.snt_dst, dbo.snt_ci, dbo.snt_dst_p');
+
+statement ok
+DETACH snt;

@@ -1,5 +1,6 @@
 #include "dml/insert/mssql_insert_target.hpp"
 #include "dml/insert/mssql_value_serializer.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 
@@ -11,8 +12,7 @@ string MSSQLInsertTarget::GetFullyQualifiedName() const {
 	// [catalog].[schema].[table]
 	// For SQL Server, we typically use just [schema].[table]
 	// as the catalog is specified at connection time
-	return MSSQLValueSerializer::EscapeIdentifier(schema_name) + "." +
-		   MSSQLValueSerializer::EscapeIdentifier(table_name);
+	return mssql::QuoteIdentifier(schema_name) + "." + mssql::QuoteIdentifier(table_name);
 }
 
 }  // namespace duckdb

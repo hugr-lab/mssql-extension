@@ -24,6 +24,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "mssql_functions.hpp"	// For backward compatibility with MSSQLCatalogScanBindData
+#include "query/mssql_identifier.hpp"
 #include "query/mssql_query_executor.hpp"
 #include "query/mssql_sql_params.hpp"
 #include "table_scan/filter_encoder.hpp"
@@ -266,7 +267,7 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		// Select only the first column to minimize data transfer while still returning rows
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: no valid columns, selecting first column only for row counting");
 		if (!bind_data.all_column_names.empty()) {
-			column_list = "[" + FilterEncoder::EscapeBracketIdentifier(bind_data.all_column_names[0]) + "]";
+			column_list = mssql::QuoteIdentifier(bind_data.all_column_names[0]);
 		} else {
 			// Fallback to constant if table has no columns (shouldn't happen)
 			column_list = "1";
@@ -308,8 +309,8 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		result->pk_columns_added ? "true" : "false");
 
 	// Generate the query: SELECT [col1], [col2], ... FROM [schema].[table]
-	string full_table_name = "[" + FilterEncoder::EscapeBracketIdentifier(bind_data.schema_name) + "].[" +
-							 FilterEncoder::EscapeBracketIdentifier(bind_data.table_name) + "]";
+	string full_table_name =
+		mssql::QuoteIdentifier(bind_data.schema_name) + "." + mssql::QuoteIdentifier(bind_data.table_name);
 
 	// Build SELECT prefix (with optional TOP N from ORDER BY + LIMIT pushdown, Spec 039)
 	string select_prefix = "SELECT ";
@@ -1128,10 +1129,12 @@ static unique_ptr<NodeStatistics> MSSQLCatalogScanCardinality(ClientContext &con
 	// N above the scan, with mssql_order_pushdown true as well as false" and
 	// presented that as a general rule. It is not: that measurement used
 	// CardScanBig, which COPY creates with every column NULLABLE, and DuckDB's
-	// default NULLS LAST for ASC then fails IsNullOrderCompatible — so TryPushTopN
-	// bailed before touching top_n. Against a NOT NULL column the TopN WOULD fold
-	// and top_n WOULD be set. The conclusion survives; the reason given for it did
-	// not. That is why scan_cardinality.test carries no EXPLAIN assertion here.
+	// default NULLS LAST for ASC then failed the NULL-placement check — so
+	// TryPushTopN bailed before touching top_n. Against a NOT NULL column the TopN
+	// WOULD fold and top_n WOULD be set -- and since spec 079 so does a nullable
+	// one, its placement emulated with a leading CASE key. The conclusion
+	// survives; the reason given for it did not. That is why
+	// scan_cardinality.test carries no EXPLAIN assertion here.
 	if (bind_data.top_n > 0) {
 		const idx_t top_n = static_cast<idx_t>(bind_data.top_n);
 		MSSQL_SCAN_DEBUG_LOG(1, "Cardinality: %s.%s -> capped at TOP %llu", bind_data.schema_name.c_str(),

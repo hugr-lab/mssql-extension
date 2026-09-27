@@ -55,9 +55,6 @@ private:
 
 	// Generate ON clause: ON t.[pk1] = v.[pk1] AND t.[pk2] = v.[pk2]
 	string GenerateOnClause() const;
-
-	// Escape identifier for T-SQL: name → [name]
-	static string EscapeIdentifier(const string &name);
 };
 
 }  // namespace duckdb

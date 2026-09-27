@@ -69,7 +69,7 @@ Details: [Target Column Types and Table Shape](../writing/table-options.md).
 | `mssql_utf8_collation` | VARCHAR | `Latin1_General_100_BIN2_UTF8` | Collation for created `varchar` columns when the server granted UTF8SUPPORT. BIN2 = binary comparison, case-/accent-**sensitive**; matches Fabric's default. Empty inherits the database default |
 | `mssql_default_string_length` | BIGINT | 0 | Length for unannotated `VARCHAR` columns created by CTAS/COPY (`0` = MAX) |
 | `mssql_default_table_kind` | VARCHAR | `HEAP` | Shape of created tables: `HEAP` or `COLUMNSTORE` (clustered columnstore index created before the load) |
-| `mssql_catalog_native_types` | BOOLEAN | true | Report `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` for bounded string columns of attached tables, so targets inherit declared lengths |
+| `mssql_catalog_native_types` | BOOLEAN | true | Report `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` for bounded string columns of attached tables **and of `mssql_scan` / `mssql_scan_params` results** (a `varchar` there only under a UTF-8 collation), so targets inherit declared lengths |
 | `mssql_convert_varchar_max` | BOOLEAN | true | Convert `VARCHAR(MAX)` to `NVARCHAR(MAX)` in catalog scan SQL for UTF-8 safety on non-UTF-8 collations |
 
 ### ORDER BY Pushdown Settings (Experimental)

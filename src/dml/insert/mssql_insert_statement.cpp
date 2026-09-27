@@ -2,6 +2,7 @@
 #include "catalog/mssql_column_info.hpp"
 #include "dml/insert/mssql_value_serializer.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 
@@ -18,8 +19,7 @@ void MSSQLInsertStatement::InitializeCache() const {
 	}
 
 	// Build table name: [schema].[table]
-	cached_table_name_ = MSSQLValueSerializer::EscapeIdentifier(target_.schema_name) + "." +
-						 MSSQLValueSerializer::EscapeIdentifier(target_.table_name);
+	cached_table_name_ = mssql::QuoteIdentifier(target_.schema_name) + "." + mssql::QuoteIdentifier(target_.table_name);
 
 	// Build column list: [col1], [col2], ...
 	string columns;
@@ -28,7 +28,7 @@ void MSSQLInsertStatement::InitializeCache() const {
 			columns += ", ";
 		}
 		const auto &col = target_.columns[target_.insert_column_indices[i]];
-		columns += MSSQLValueSerializer::EscapeIdentifier(col.name);
+		columns += mssql::QuoteIdentifier(col.name);
 	}
 	cached_column_list_ = columns;
 

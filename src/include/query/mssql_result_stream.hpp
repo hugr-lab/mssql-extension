@@ -72,6 +72,10 @@ public:
 	const vector<string> &GetColumnNames() const {
 		return column_names_;
 	}
+	//! One per column, in the order of GetColumnTypes.
+	const std::vector<tds::ColumnMetadata> &GetColumnMetadata() const {
+		return column_metadata_;
+	}
 	idx_t GetColumnCount() const {
 		return column_types_.size();
 	}

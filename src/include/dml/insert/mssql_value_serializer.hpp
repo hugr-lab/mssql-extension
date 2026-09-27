@@ -78,11 +78,6 @@ public:
 	// Identifier Escaping
 	//===----------------------------------------------------------------------===//
 
-	// Escape identifier for T-SQL using bracket quoting
-	// @param name Raw identifier name
-	// @return Escaped identifier (e.g., "name" → "[name]", "na]me" → "[na]]me]")
-	static string EscapeIdentifier(const string &name);
-
 	// Escape string value for T-SQL (without N'' wrapper)
 	// @param value Raw string value
 	// @return Escaped string with ' → ''
