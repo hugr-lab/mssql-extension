@@ -1,0 +1,127 @@
+# name: test/sql/integration/pool_probe_stats.test
+# description: a bulk-load writer's refused TryAcquire probe is not counted in pool stats
+# group: [integration]
+#
+# REQUIRES: SQL Server running (make integration-test)
+
+require mssql
+
+# The COPY loads into a table, so this needs the writable test database rather
+# than the master MSSQL_TEST_DSN points at.
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# An extra COPY writer claims its connection with ConnectionPool::TryAcquire,
+# which never waits: it takes an idle connection, or a new one while the pool is
+# below its limit, or none -- and on none the thread shares the global writer and
+# asks again on a later chunk. Such a refused claim is NOT a checkout, so it must
+# leave acquire_count and acquire_wait_total_ms alone; a claim that GETS a
+# connection is a real checkout and IS counted, at the success return (review of
+# #382 / 7f13a0a). While the probe was counted at the top of AcquireImpl,
+# acquire_count grew with the COPY's CHUNK COUNT, which inflated the figure and
+# skewed acquire_wait_total_ms / acquire_count as an average wait.
+#
+# Getting a refused probe to happen at all takes care, and the first cut of this
+# file got it wrong (review of #391): at mssql_connection_limit = 1 the writer
+# count is capped at the limit, so the COPY is allowed exactly ONE writer, no
+# extra writer is ever claimed, and no probe happens -- the case passed against
+# the mutant it existed to catch. The limit must therefore be 2, with the second
+# slot held by SOMEONE ELSE for the whole load: con2 opens a transaction and
+# reads the catalog, which pins its connection until COMMIT. The extra writer is
+# then allowed by the cap, finds the pool full, and is refused on every chunk.
+#
+# Measured on the docker server: acquire_count delta over the COPY is 1 as the
+# pool stands, and 31 with the probe counted at the top of AcquireImpl.
+# =============================================================================
+
+statement ok
+SET mssql_connection_limit = 2;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS probedb (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('probedb', 'IF OBJECT_ID(''dbo.PoolProbeTarget'') IS NOT NULL DROP TABLE dbo.PoolProbeTarget;
+CREATE TABLE dbo.PoolProbeTarget (id int, s nvarchar(40))');
+
+# con2 takes the second slot and keeps it: a DuckDB transaction pins one pooled
+# connection from its first MSSQL access until COMMIT.
+statement ok con2
+BEGIN;
+
+query I con2
+SELECT count(*) FROM probedb.dbo.PoolProbeTarget;
+----
+0
+
+# A writer is claimed by a THREAD on its first chunk, so without several DuckDB
+# threads driving the sink no extra writer is asked for and this case would test
+# nothing (parallel_writers.test pins the count for the same reason).
+statement ok
+SET threads = 4;
+
+statement ok
+SET mssql_copy_parallel_writers = 4;
+
+# ~30 chunks at DuckDB's 2048-row vector, so a per-chunk probe counted as a
+# checkout is unmistakable next to the one real one.
+statement ok
+CREATE OR REPLACE TABLE pool_probe_src AS SELECT i AS id, 'row_' || i AS s FROM range(60000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE pool_probe_before AS SELECT acquire_count AS ac FROM mssql_pool_stats('probedb');
+
+statement ok
+COPY pool_probe_src TO 'probedb.dbo.PoolProbeTarget' (FORMAT bcp, CREATE_TABLE false);
+
+# The load still ran, on the one writer it was left with.
+query I
+SELECT count(*) FROM probedb.dbo.PoolProbeTarget;
+----
+60000
+
+# The premise, asserted rather than assumed: con2 still holds its slot, so the
+# extra writer really was refused rather than served. If this read 0 the pool
+# would have been free all along and the delta below would prove nothing.
+query I
+SELECT active_connections >= 1 FROM mssql_pool_stats('probedb');
+----
+true
+
+# Bounded by the real checkouts, not by the chunk count: 1 as the pool stands,
+# 31 with the probes counted.
+query I
+SELECT ((SELECT acquire_count FROM mssql_pool_stats('probedb')) - (SELECT ac FROM pool_probe_before)) <= 10;
+----
+true
+
+statement ok con2
+COMMIT;
+
+# Cleanup
+statement ok
+DROP TABLE pool_probe_src;
+
+statement ok
+DROP TABLE pool_probe_before;
+
+statement ok
+SELECT mssql_exec('probedb', 'DROP TABLE dbo.PoolProbeTarget');
+
+statement ok
+DETACH probedb;
+
+statement ok
+SET mssql_connection_limit = 64;
+
+statement ok
+RESET mssql_copy_parallel_writers;
+
+statement ok
+RESET mssql_exec_invalidate_cache;
+
+statement ok
+RESET threads;
