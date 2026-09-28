@@ -7,11 +7,13 @@ hardware that produced it.
 **Relates to**: [#324](https://github.com/hugr-lab/mssql-extension/issues/324)
 (parallel pool warm-up), **shipped** in `b66d149`. It imposes no ordering on this
 spec: `ConnectionPool::Prewarm` (`tds_connection_pool.cpp`) dials on one
-`std::thread` per connection, so N connections cost about one dial rather than N,
-and every prewarm login reaches `TdsSocket::Connect` through the pool factories,
-so W1 applies to it with no change. What #324 does add is an fd note for AC-4: N
-prewarm threads each staggering through the candidate list hold up to
-N × candidates sockets at once. Spec 073 W3 (the connect timeout now reaches the
+`std::thread` per connection **beyond the first** — the first on the calling
+thread, and any thread it cannot start is dialled serially on the caller afterwards
+— so N connections cost about one dial rather than N *in the good case*, which is
+the case that matters here. Every prewarm login reaches `TdsSocket::Connect`
+through the pool factories, so W1 applies to it with no change. What #324 does add
+is an fd note for AC-4: the prewarm threads each stagger through the candidate list,
+so the pool holds **up to** N × candidates sockets at once. Spec 073 W3 (the connect timeout now reaches the
 dial) is what makes the mitigation in §5 possible at all.
 
 One defect, reported with a correct root-cause analysis attached: **the dial hands
@@ -87,9 +89,18 @@ multi-NIC Windows box manufactures. The reporter observes 4–9 candidates from 
 hostname. At the default 30s that is a 120–270s ceiling, and the 30s they actually
 saw is the cheapest shape of the bug (one dead candidate, then a live one).
 
-`Microsoft.Data.SqlClient` has not behaved this way since .NET 8; it dials
-candidates in parallel on a stagger. A user comparing the two reasonably concludes
-the extension is broken, and they are not wrong.
+A user coming from `Microsoft.Data.SqlClient` and comparing the two reasonably
+concludes the extension is broken, and on F1 they are right.
+
+> Not cited, therefore not claimed: an earlier draft asserted SqlClient "has not
+> behaved this way since .NET 8; it dials candidates in parallel on a stagger", and
+> attributed W1's 250 ms to it. Neither has a citation, §0 forbids that, and the
+> claim may simply be wrong — SqlClient's parallel/staggered dialling is
+> historically gated on `MultiSubnetFailover` / `TransparentNetworkIPResolution`
+> with a 500 ms first interval rather than being an unconditional default, and
+> "since .NET 8" conflates the runtime version with the driver's. Nothing in this
+> spec depends on it: W1's stagger is justified from RFC 8305 alone. Cite the
+> SqlClient source before reinstating any of it.
 
 ### F2 — the candidate list is never pruned
 
@@ -114,7 +125,12 @@ validation round trip, once for the first pooled connection — and that the iss
 does.** `MSSQLCatalog::ValidateThroughPool` acquires the validation connection
 *through the pool* and ends with `connection_pool_->Release(connection)`
 (`src/catalog/mssql_catalog.cpp`), so the connection it logged in stays in the pool
-and the first query reuses it. A plain `ATTACH` is one dial and one login.
+and the first query reuses it. A plain `ATTACH` is one dial and one login —
+**with `mssql_connection_cache` at its default `true`.** With caching off,
+`ConnectionPool::Release` closes the connection instead of pooling it
+(`tds_connection_pool.cpp`, the `!config_.connection_cache` early return), so the
+validation connection is discarded and the first query dials again: exactly the
+doubled-dial mechanism F3 described, surviving as a non-default configuration.
 
 The budget still changes hands across it — the validation login runs under
 `mssql_attach_validation_timeout` (default `0` ⇒ inherit
@@ -148,9 +164,10 @@ routine that owns its own fds and installs only the winner into `fd_`.
 Dial candidates on a stagger rather than in sequence:
 
 1. Start a non-blocking `connect()` to the first candidate.
-2. Every `stagger_ms` (default **250 ms**, the RFC 8305 recommendation and
-   SqlClient's value), if nothing has connected yet, start the next candidate
-   **without abandoning** the ones already in flight.
+2. Every `stagger_ms` (default **250 ms**, the RFC 8305 §5 "Connection Attempt
+   Delay" recommendation — the sole justification; see the note in F1 about the
+   uncited SqlClient figure), if nothing has connected yet, start the next
+   candidate **without abandoning** the ones already in flight.
 3. `poll()` all in-flight sockets together. `getsockopt(SO_ERROR)` decides success
    for any socket that reports an event — never the poll flags alone (see W1.3).
 4. The first socket to report success wins. Close every other socket, install the
@@ -164,7 +181,11 @@ Properties this has to hold, in the order they matter:
 - **A working first address costs nothing.** No second socket is created before
   250 ms, so the common path is byte-for-byte the current path.
 - **A dead candidate costs 250 ms of latency, not 30s.**
-- **The total is bounded by `timeout_seconds`** for the first time.
+- **The total of the call is bounded by `timeout_seconds`** for the first time —
+  a HARD deadline: compute `deadline = now + timeout_seconds` once and clamp every
+  `poll` to it, so a late-started candidate cannot extend the attempt. Stated
+  identically in AC-2; there is no "± one stagger" slack. (The bound is on one
+  `TdsSocket::Connect` call, not on `ATTACH` — see §5's second retraction.)
 - **Candidate order is preserved.** `getaddrinfo` has already applied RFC 6724
   sorting; W1 staggers that order, it does not re-rank it.
 
@@ -173,30 +194,67 @@ Properties this has to hold, in the order they matter:
 members are `fd_`-shaped and must stay that way; `TdsSocket` keeps its single-socket
 invariant, which is the whole reason the class is easy to reason about.
 
-**W1.2 — one error message for the whole attempt.** Today each failing candidate
-overwrites `last_error_`, so the message a user sees is whichever address happened
-to be last, with no indication that four others were tried. W1 collects per-candidate
-outcomes and reports one message naming the host, the number of candidates, and the
-distinct failures — "the address that failed last" is not a diagnosis, and issue
-#122 exists partly because nobody could see what the client was doing. This is
-Principle III: an operation that cannot succeed must say what it actually attempted.
+**W1.2 — one error message for the whole attempt, and the reason has to be
+*captured* first.** The draft of this spec said the problem was that each failing
+candidate overwrites `last_error_`. It is worse than that: on two of `Connect`'s
+three failure paths there is no correct reason to aggregate, because the current
+code never records one.
 
-**W1.3 — `SO_ERROR` is the only success oracle.** Windows maps `poll` to `WSAPoll`
-(`tds_socket.cpp:21`). Microsoft documents that a failed TCP connect is signalled
-as `POLLHUP | POLLERR | POLLWRNORM` **only as of Windows 10 2004**; on older builds
-`WSAPoll` did not report a failed connect at all. Treating the revents as the answer
-is therefore not portable across the very Windows versions this issue lives on.
-Checking `SO_ERROR` whenever any event fires is correct on every platform and every
-build, and the current code already does this for its single socket — W1 keeps that
-and drops nothing.
+| how a candidate fails | what `Connect` does today | reason available? |
+|---|---|---|
+| `connect()` fails **synchronously** (`ECONNREFUSED` — Linux loopback, measured in §4) | neither `EINPROGRESS` nor `EWOULDBLOCK`, so it falls to a branch that **only debug-logs** | **none.** With every candidate refusing this way `last_error_` is still empty and the caller gets the generic `"Failed to connect to <host>:<port>"` |
+| async failure, `poll` reports `POLLERR`/`POLLNVAL`/`POLLHUP` | `WaitForReady` returns false, and `Connect`'s `else` overwrites its reason with the literal **`"Connection timed out"`** | **wrong.** A refusal or an unreachable host is reported as a timeout |
+| async failure, `poll` reports writability only | reaches `getsockopt`, reports `"Connection failed: <strerror>"` | yes — the only path that works |
+
+So W1.2 is two pieces of work, not one: **capture** a per-candidate reason at all
+three sites, then **aggregate** them into one message naming the host, the number
+of candidates and the distinct failures. "The address that failed last" is not a
+diagnosis; neither is "timed out" for a port that sent an RST, and #122 was hard to
+diagnose from outside partly because of it. This is Principle III: an operation that
+cannot succeed must say what it actually attempted.
+
+**W1.3 — `SO_ERROR` is the only success oracle, and today's code is NOT already
+doing this.** Windows maps `poll` to `WSAPoll` (`tds_socket.cpp:21`). Microsoft
+documents that a failed TCP connect is signalled as `POLLHUP | POLLERR |
+POLLWRNORM` **only as of Windows 10 2004**; on older builds `WSAPoll` did not
+report a failed connect at all. Treating the revents as the answer is therefore not
+portable across the very Windows versions this issue lives on. Checking `SO_ERROR`
+whenever any event fires is correct on every platform and every build.
+
+An earlier draft added "and the current code already does this for its single
+socket — W1 keeps that and drops nothing." **That was wrong**, and the table above
+is why: `TdsSocket::WaitForReady` short-circuits on `POLLERR | POLLNVAL` (and on
+`POLLHUP`) and returns false *before* `Connect` reaches its `getsockopt`, and the
+synchronous path never polls at all. W1 therefore **introduces** the `SO_ERROR`
+discipline rather than preserving it, which is more work than "keeps that" implied
+and is the same code that makes W1.2's per-candidate reason possible.
 
 ### W2 — `AI_ADDRCONFIG`
 
-Set it in `hints.ai_flags` at `tds_socket.cpp:164`. Independent of W1, one line,
-and it shortens the list W1 has to stagger through.
+Set it in `hints.ai_flags` at `tds_socket.cpp:164`. Independent of W1, and it
+shortens the list W1 has to stagger through.
 
 Not sufficient alone, and must not be sold as the fix: a host with a genuine IPv6
 address and three IPv4 adapters keeps every one of them.
+
+**And it is not a free one-liner — the flag treats loopback specially.** Per RFC
+3493 `AI_ADDRCONFIG` does **not** count a loopback address as a "configured"
+address for its family, so on a host or container with no non-loopback address in a
+family it can drop answers the current code returns. glibc has additionally applied
+it to *numeric* literals, so `Server=::1` on an IPv4-only container can fail to
+resolve at all; macOS's implementation is not equivalent to glibc's. Every
+`test/cpp` harness in this repo dials `127.0.0.1`, and the Kerberos and
+docker-in-docker lanes dial `localhost` — exactly the shapes the flag treats
+specially.
+
+`/speckit-plan` picks one of:
+
+- skip `AI_ADDRCONFIG` when `inet_pton` succeeds (a numeric host needs no resolver
+  policy), and/or when the host is `localhost`; or
+- retry once without the flag on `EAI_NONAME` / `EAI_ADDRFAMILY`.
+
+Either way **AC-5 must name the case**, not just "the suite passes": an IPv4-only
+container resolving `localhost` and `::1`.
 
 ---
 
@@ -210,9 +268,10 @@ address and three IPv4 adapters keeps every one of them.
 - **Lowering `DEFAULT_CONNECTION_TIMEOUT`.** 30s is a correct ceiling for a WAN dial
   to Azure SQL. The defect is that the ceiling is charged N times, not that it is
   30s.
-- **Threading the caller's budget through the login-phase reads.** Spec 068 scoped
-  that out deliberately and documented why (`src/include/tds/tds_connection.hpp`,
-  the `connect_timeout_seconds_` comment). It is a real gap and it is not this one.
+- **Threading the caller's budget through the login-phase reads.** Already done —
+  see §5, which retracts the claim that it was not. What remains is a *different*
+  gap, scoped out here: every one of those reads is charged the **full** budget
+  again, so W1's bound is per-`Connect`, not per-ATTACH.
 - **Anything about named instances.** The `host\instance` UDP 1434 path (spec 045 /
   #205) has its own resolution problem. W1 sits below it: once a host and port are
   known, this is how they get dialled.
@@ -225,6 +284,15 @@ The precedent is `test/cpp/test_login_routing_hops.cpp` — a `FakeTdsServer` th
 binds `127.0.0.1`, accepts on a thread, and is driven by `make test-login-routing-hops`
 (`Makefile:500`). W1's tests extend it rather than inventing a harness.
 
+**Budget for three recipes, not one.** That make target is referenced nowhere else
+in the repo: CI open-codes the same compile twice more, at
+`.github/workflows/ci.yml` (the POSIX leg) and again in the Windows/MSVC leg. So
+every new source file, include, link flag or test-only define W1 needs has to be
+added in **three** places, and forgetting the third means the Windows leg — the
+platform #122 actually lives on — silently stops building the new cases. Folding
+the CI steps onto the make target first would make this one place instead of three;
+whether to do that here or as a separate chore is `/speckit-plan`'s call.
+
 Three cases, in the order of how much they are worth:
 
 1. **A live first candidate is not slowed down.** Dial a `FakeTdsServer` and assert
@@ -236,14 +304,29 @@ Three cases, in the order of how much they are worth:
    **not** satisfied trivially fast. See "the assertion shape" below: this case
    needs a lower bound as well as an upper one.
 
-**The blackhole already exists in this repository, and CI already runs it.**
+**A blackhole address is already in use in this repository.**
 `TestHopHonoursCallerConnectTimeout` (`test/cpp/test_login_routing_hops.cpp`) has a
 `FakeTdsServer` gateway route the client to **`192.0.2.1`** (RFC 5737 TEST-NET-1)
-and asserts the hop gives up on the caller's 2s budget. It is in the
-`make test-login-routing-hops` list and green on every PR, so `192.0.2.1` blackholes
-in the CI environment as a matter of record, not conjecture. W1's cases 2 and 3
-should reuse that address and cite this test rather than treat the blackhole as an
-unsolved problem.
+and asserts the hop gives up on the caller's 2s budget. W1's cases 2 and 3 should
+reuse that address rather than invent one.
+
+**What is NOT established is that it blackholes in CI.** `192.0.2.1` was measured
+to go unanswered in both environments this spec ran the probe in (§"The platform
+split, measured"), but neither was a GitHub runner, and whether TEST-NET-1 egress is
+dropped or rejected depends on the runner's routing and firewall policy — which is
+not the core TCP-stack behaviour the probe's other rows generalise from. The
+existing test cannot settle it either: its only timing assertion is an upper bound
+(below), so it is green on both branches. Treat "CI drops `192.0.2.1`" as an
+**unmeasured premise**, and therefore:
+
+- the blackhole address is an **input** to W1's cases, with `192.0.2.1` as the
+  documented default, and
+- case 2 **skips with a clear message** when the environment does not provide a
+  blackhole, rather than passing quietly on the refusal branch.
+
+To turn the premise into a fact, add a lower-bound (or per-candidate-reason)
+assertion to the existing test and read one CI run per platform, or run
+`./run_probe.sh` in the Linux CI lane.
 
 **The assertion shape is the real trap, and that same test demonstrates it.** Its
 only timing assertion is `CHECK(secs < 15)` — an **upper** bound. On a host with no
@@ -269,6 +352,12 @@ production path filling it from `getaddrinfo`.
 > `TdsSocket`, or should be file-local with a test-only declaration. Settle in
 > `/speckit-plan`. Note that the routing precedent above needs neither, so the seam
 > is only as wide as the multi-candidate cases require.
+>
+> The seam has to carry **`stagger_ms` as well as the candidate list**: §4 case 1
+> asserts the connect finishes "well inside one stagger interval", which no test can
+> assert without being able to set it, and case 3's lower bound is stated in stagger
+> intervals too. Same question, same answer — whatever shape the list takes, the
+> stagger travels with it.
 
 ### The platform split, measured
 
@@ -300,19 +389,37 @@ half hour twice.
 bound-but-unlistening trick yields a **refusal** — the wrong branch. Cases 2 and 3
 therefore do need an address supplied to them, and the seam above is justified.
 
-**And `192.0.2.1` blackholes in both environments, including the Linux container**
-— the CI shape. So `TestHopHonoursCallerConnectTimeout` really does take the
-timeout branch in CI today. That makes it the right address to reuse, and leaves
-the criticism of its assertion shape exactly where it was: the test cannot *prove*
-which branch it took, and on a host with no default route it would flip to
-`EHOSTUNREACH` and still pass.
+**`192.0.2.1` went unanswered in both environments measured here** — which makes it
+the right address for W1 to reuse, and says nothing about a GitHub runner. That
+distinction is not pedantry: RST-vs-drop for a bound-but-unlistening socket is core
+TCP-stack behaviour and generalises, whereas whether TEST-NET-1 **egress** is
+dropped or rejected is a property of the network the runner sits in. So the
+`192.0.2.1` row transfers to nothing, and §4 treats "CI drops it" as an unmeasured
+premise with a skip for when it does not hold.
 
-Two caveats on the Linux row, stated rather than papered over: it is Docker
-Desktop's linuxkit kernel on arm64, not a GitHub `ubuntu` runner, and the
-container's `192.0.2.1` result depends on it having a default route via the docker
-bridge (a CI runner does too). RST-vs-drop for a bound-but-unlistening socket is
-core TCP-stack behaviour and transfers; if a reader wants the runner itself on
-record, `run_probe.sh` is cheap to drop into the existing Linux CI lane.
+The other caveat on the Linux row, stated rather than papered over: it is Docker
+Desktop's linuxkit kernel on arm64, not a GitHub `ubuntu` runner. For
+bound-but-unlistening that is fine, for the reason just given. If a reader wants
+the runner itself on record, `run_probe.sh` is cheap to drop into the existing
+Linux CI lane.
+
+---
+
+## 4a. Chores this spec creates
+
+Small, tracked here so they are not lost between revisions:
+
+1. **Reword the comment in `TestUnreachableRoutedTargetFails`**
+   (`test/cpp/test_login_routing_hops.cpp`). Its *"That is a Linux behaviour, not a
+   portable one"* is correct read as "getting an RST is the Linux behaviour", but
+   reads as describing the drop in the sentence before it. That ambiguity cost this
+   spec two revisions and a measurement; the next reader should not pay it again.
+   Not done in the spec's own PR, which is documentation-only.
+2. **Consider folding CI's two open-coded routing-hops compiles onto
+   `make test-login-routing-hops`** (§4, "Budget for three recipes").
+3. **Ask the reporter of #122** whether the stall they see is the dial alone or the
+   whole login (§5, second retraction). The answer decides whether a sibling spec
+   is needed.
 
 ---
 
@@ -355,6 +462,35 @@ Consequences, all three of which matter:
   being able to reorder two statements, not on the stall being avoidable once
   `ATTACH` has run.
 
+**"Threading the caller's budget through the login-phase reads is out of scope —
+spec 068 scoped it out and documented why."** Also false, and it cited a comment
+that says the opposite. `src/include/tds/tds_connection.hpp`'s
+`connect_timeout_seconds_` comment reads: *"Scope: the TCP dial AND every handshake
+receive that follows -- PRELOGIN response, TLS enable, LOGIN7 / FEDAUTH responses,
+on all three auth paths, first attempt and routing hop alike. Until issue #302
+those receives passed DEFAULT_CONNECTION_TIMEOUT spelled out…"* — and
+`tds_connection.cpp` passes `connect_timeout_seconds_` into each of them. Issue
+#302 / spec 073 W3 threaded it; this spec's draft asserted the reverse from the
+same comment that refutes it, which is the same mistake as the retraction above.
+
+**The gap that actually remains is the mirror image**, and it bounds what W1 may
+claim: each of those reads is charged the **full** budget again, and a routing hop
+re-dials with the full budget too (`tds_connection.cpp`, the hop's own `Connect`).
+So an `ATTACH` that dials, PRELOGINs, enables TLS, LOGIN7s and takes one routing
+hop can spend several multiples of `mssql_connection_timeout` even with W1 in
+place.
+
+Consequences for this spec, which are now written into the text rather than left
+implied:
+
+- W1's property is **"the total of one `TdsSocket::Connect` call is bounded by
+  `timeout_seconds`"**. It is not a bound on `ATTACH`.
+- AC-1's "under 2s" is an acceptance criterion for the **dial**, measured on a
+  host whose candidate list is the problem. It is not a promise about the whole
+  login, and a reviewer should not read it as one.
+- Whether "N × timeout across the whole login" is also part of #122's complaint is
+  worth asking the reporter. If it is, it is a sibling spec, not this one.
+
 ---
 
 ## 6. Acceptance
@@ -363,22 +499,35 @@ Consequences, all three of which matter:
   blackholing first candidate, `ATTACH` completes in under 2s with the default
   `mssql_connection_timeout`. Confirmed on the reporter's multi-NIC Windows machine
   or an equivalent; per §0 this cannot be signed off from CI alone.
-- **AC-2** — With every candidate dead, `Connect` returns within
-  `timeout_seconds` ± one stagger interval, and the error names the host, the number
-  of candidates tried, and the distinct failures. Asserted with a **lower** bound as
-  well as an upper one (§4, "the assertion shape"): an upper bound alone is also
-  satisfied by an environment that fails every candidate instantly, so on its own it
-  does not witness the timeout branch at all. In-flight candidates are never
-  abandoned, so the deadline must close **all** of them at `timeout_seconds` — a
-  late-started candidate cannot extend the attempt past it.
+- **AC-2** — With every candidate dead, `Connect` returns **within
+  `timeout_seconds`** — the hard deadline of W1's property list, same wording, no
+  stagger slack: in-flight candidates are never abandoned, so the deadline closes
+  **all** of them and a late-started candidate cannot extend the attempt. The error
+  names the host, the number of candidates tried, and the distinct failures, each
+  from its own captured reason (W1.2) rather than from a clock. Asserted with a
+  **lower** bound as well as an upper one (§4, "the assertion shape"): an upper
+  bound alone is also satisfied by an environment that fails every candidate
+  instantly, so on its own it does not witness the timeout branch at all.
 - **AC-3** — A single-address host and a live-first-candidate host show no
   regression against `main` in the harness of §4 case 1.
 - **AC-4** — Exactly one socket is open when `Connect` returns true, and none when
   it returns false. Asserted, not assumed: W1 is the first code in this class to
   hold more than one fd at a time, and a leaked candidate fd is the failure mode it
-  invites. Run the §4 cases under ASan/LSan with an fd-count assertion. Assert it on
-  the **prewarm** path too: with `mssql_min_connections > 0`, `ConnectionPool::Prewarm`
-  runs one dialling thread per connection, so the pool holds up to
-  N × candidates sockets at once and that is where a leaked candidate fd multiplies.
-- **AC-5** — No behavioural change on the `127.0.0.1` paths: the full `test/cpp`
+  invites. **Count open fds directly**, around the `Connect` call — `/proc/self/fd`
+  on Linux, `/dev/fd` on Darwin, or a bracketing `dup()` probe. Not under
+  ASan/LSan: a leaked socket fd is not a heap allocation and neither tool reports
+  it, and the sanitizers are not available in the harness §4 selects anyway
+  (`LOGIN7_TEST_FLAGS` is `-std=c++17 -pthread -Wno-deprecated-declarations
+  -DMSSQL_BENCH_BUILD`, both CI recipes open-code the same flags, and `Makefile`
+  records that ASan hangs at process init on Darwin 25.5). Assert it on the
+  **prewarm** path too: with `mssql_min_connections > 0`, `ConnectionPool::Prewarm`
+  dials on one thread per connection *beyond the first* (the first on the calling
+  thread, and any thread it cannot start is dialled serially on the caller
+  afterwards), so the pool holds **up to** N × candidates sockets at once — an
+  upper bound, and where a leaked candidate fd multiplies.
+- **AC-5** — W2 changes no `localhost` / numeric-literal resolution that works
+  today. Named cases, because "the suite passes" would not have caught it: an
+  **IPv4-only container** resolving `localhost` (must still yield 127.0.0.1) and
+  `::1` (must fail no differently than it does now), plus the same two on a
+  dual-stack host. And no behavioural change on the `127.0.0.1` paths: the full `test/cpp`
   suite and the integration suite pass unchanged.
