@@ -109,6 +109,11 @@ SET mssql_utf8_support = false;
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS snt16 (TYPE mssql);
 
+# Read at ATTACH and captured by snt16's pool: restored at once, so it
+# governs snt16 alone and no later ATTACH.
+statement ok
+RESET mssql_utf8_support;
+
 query II
 SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt16', 'SELECT v, c FROM dbo.snt_src'));
 ----
@@ -153,6 +158,23 @@ wide
 statement ok
 SELECT mssql_exec('snt16', 'DROP TABLE dbo.snt_wide');
 
+# An nvarchar under a UTF-8 collation on a connection NOT granted UTF8SUPPORT:
+# COLMETADATA cannot tell it from a transcoded UTF-8 varchar, so a batch run at
+# bind reports it plain VARCHAR (review of #393) ...
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt16', 'CREATE TABLE #u16 (n nvarchar(30) COLLATE Latin1_General_100_CI_AS_SC_UTF8); INSERT #u16 VALUES (N''x''); SELECT n FROM #u16'));
+----
+n	VARCHAR
+
+# ... and prepared := true gets the declared type back: PrepareStatement asks
+# the describe about the columns COLMETADATA leaves ambiguous. The two cases
+# work as a pair: this one alone would also pass on a connection wrongly taken
+# for granted (no describe needed) -- the case above rules that out.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt16', 'SELECT CAST(N''x'' AS nvarchar(30)) COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS n', prepared := true));
+----
+n	MSSQL_NVARCHAR(30)
+
 statement ok
 DETACH snt16;
 
@@ -165,12 +187,11 @@ SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', '
 n	MSSQL_NVARCHAR(30)
 v	VARCHAR
 
-statement ok
-RESET mssql_utf8_support;
-
 # An nvarchar under a UTF-8 collation -- every string column of a database whose
 # default collation is UTF-8 -- keeps its MSSQL_NVARCHAR(n) on a connection
 # granted UTF8SUPPORT, even where COLMETADATA is all there is (review of #387).
+# snt was attached under the default mssql_utf8_support = true at the top of
+# this file, so its connections are granted it.
 query II
 SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'CREATE TABLE #u (n nvarchar(30) COLLATE Latin1_General_100_CI_AS_SC_UTF8); INSERT #u VALUES (N''x''); SELECT n FROM #u'));
 ----
