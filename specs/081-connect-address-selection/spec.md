@@ -47,11 +47,12 @@ multi-NIC hardware.
 
 Where a platform behaviour is asserted below, it is either cited to Microsoft's
 documentation or to a measurement **already recorded in this repository**
-(`test/cpp/test_login_routing_hops.cpp`). No new platform claim is invented here —
-and that cuts both ways: the one platform claim this spec inherited from that file,
-which of macOS and Linux drops a SYN to a bound-but-unlistening port, turns out not
-to be settled by the comment it was read from. It is now a `[BLOCKING]` question in
-§4 rather than a premise, because it decides how W1's hardest test is written.
+(`test/cpp/test_login_routing_hops.cpp`), or **measured by this spec's own probe**
+(`probe_dial_outcomes.cpp` in this directory, run by `./run_probe.sh`). No platform
+claim here is asserted from memory or from reading a comment: the one this spec
+inherited — which of macOS and Linux drops a SYN to a bound-but-unlistening port —
+was ambiguous in the comment it came from, so §4 now carries the measurement on
+both platforms instead of the citation.
 
 ---
 
@@ -269,27 +270,49 @@ production path filling it from `getaddrinfo`.
 > `/speckit-plan`. Note that the routing precedent above needs neither, so the seam
 > is only as wide as the multi-candidate cases require.
 
-> `[BLOCKING — settle before /speckit-plan]` **Which platform drops a SYN to a
-> bound-but-unlistening `127.0.0.1` port?** This spec's draft asserted it **drops on
-> macOS and is refused on Linux**, and concluded that the obvious in-process trick
-> exercises the wrong branch on the platform CI runs. The comment it cites
-> (`TestUnreachableRoutedTargetFails` in `test_login_routing_hops.cpp`) does not
-> clearly support that: it opens "is wrong on macOS: measured here … the SYN is
-> dropped and connect() sits for ~7.8s" and then closes "**That is a Linux
-> behaviour, not a portable one**", attributing the drop to the other platform. One
-> of the two texts is wrong, and §0 forbids this spec from inventing the answer.
->
-> It is not cosmetic — it decides work:
-> - **drops on macOS / refused on Linux** (the draft's reading): a
->   bound-but-unlistening socket gives CI a refusal, so cases 2 and 3 depend on the
->   injected list and `192.0.2.1` above.
-> - **drops on Linux** (the cited comment's last sentence): CI gets an in-process
->   blackhole for free, needing no injected address and no routing gateway, and the
->   seam shrinks to whatever the multi-candidate list still needs.
->
-> Settle it by measuring on both platforms — a bound-but-unlistening socket, timed
-> `connect()` — and then fix whichever of the two texts is wrong, including the
-> comment in `test_login_routing_hops.cpp` if that is the one.
+### The platform split, measured
+
+This was a `[BLOCKING]` question in the first revision of this spec: which platform
+drops a SYN to a bound-but-unlistening `127.0.0.1` port. The draft asserted "drops
+on macOS, refused on Linux" and built the injectable-seam design on it, while the
+comment it cited (`TestUnreachableRoutedTargetFails`) closed with "That is a Linux
+behaviour, not a portable one", which reads as the opposite attribution.
+
+**Measured on both platforms** with `probe_dial_outcomes.cpp` in this directory
+(`./run_probe.sh` builds it natively and, from a Mac, in a `gcc:13` container).
+The probe dials exactly as `TdsSocket::Connect` does — non-blocking `connect()`,
+`poll()`, `getsockopt(SO_ERROR)` — so it measures what the extension's own dial
+sees:
+
+| | bound, never `listen()` | nothing bound (control) | `192.0.2.1` |
+|---|---|---|---|
+| **macOS** (Darwin 27.2.0, arm64) | **SYN DROPPED** — `connect()` sits **7.8s**, then `ETIMEDOUT` | REFUSED, 0 ms | no answer within 3s |
+| **Linux** (linuxkit 7.0.12, aarch64, container) | **REFUSED** — `ECONNREFUSED`, 0 ms | REFUSED, 0 ms | no answer within 3s |
+
+**The draft's reading was right**, and the 7.8s it quoted reproduces to the
+millisecond. The cited comment is not wrong, only ambiguously worded: its "That"
+refers to *getting an RST*, which is indeed the Linux behaviour and is indeed not
+portable — but it sits next to a sentence about the drop and reads as if it
+describes it. Worth rewording that comment; it costs the next reader the same
+half hour twice.
+
+**So the design conclusion stands.** CI runs on Linux, where the
+bound-but-unlistening trick yields a **refusal** — the wrong branch. Cases 2 and 3
+therefore do need an address supplied to them, and the seam above is justified.
+
+**And `192.0.2.1` blackholes in both environments, including the Linux container**
+— the CI shape. So `TestHopHonoursCallerConnectTimeout` really does take the
+timeout branch in CI today. That makes it the right address to reuse, and leaves
+the criticism of its assertion shape exactly where it was: the test cannot *prove*
+which branch it took, and on a host with no default route it would flip to
+`EHOSTUNREACH` and still pass.
+
+Two caveats on the Linux row, stated rather than papered over: it is Docker
+Desktop's linuxkit kernel on arm64, not a GitHub `ubuntu` runner, and the
+container's `192.0.2.1` result depends on it having a default route via the docker
+bridge (a CI runner does too). RST-vs-drop for a bound-but-unlistening socket is
+core TCP-stack behaviour and transfers; if a reader wants the runner itself on
+record, `run_probe.sh` is cheap to drop into the existing Linux CI lane.
 
 ---
 
