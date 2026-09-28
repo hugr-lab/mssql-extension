@@ -36,15 +36,33 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "mssql_storage.hpp"
+#include "pushdown/mssql_pushdown_resolution.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "tds/auth/auth_strategy_factory.hpp"
 
 #include <cstdio>
+
+// House debug pattern: a static level read from MSSQL_DEBUG.
+static int GetCatalogWarmDebugLevel() {
+	static const int level = []() {
+		const char *env = std::getenv("MSSQL_DEBUG");
+		return env ? std::atoi(env) : 0;
+	}();
+	return level;
+}
+
+#define MSSQL_CATALOG_DEBUG_LOG(lvl, fmt, ...)                           \
+	do {                                                                 \
+		if (GetCatalogWarmDebugLevel() >= (lvl)) {                       \
+			fprintf(stderr, "[MSSQL CATALOG] " fmt "\n", ##__VA_ARGS__); \
+		}                                                                \
+	} while (0)
 
 namespace duckdb {
 
@@ -635,8 +653,22 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 		EnsureCacheLoaded(*transaction.context);
 	}
 
-	// Check schema filter — filtered-out schemas return not found (Spec 033)
-	if (catalog_filter_.HasSchemaFilter() && !catalog_filter_.MatchesSchema(name)) {
+	// Spec 079 § 0.1: DuckDB's remote-pushdown rewriter looks a table of a
+	// two-part name (`db.t`) or of `USE db` up in the hard-coded schema `main`,
+	// not in Catalog::GetDefaultSchema(). SQL Server has no `main`, so without
+	// this the most common spelling would never be pushed. With
+	// mssql_remote_pushdown on, `main` answers as this catalog's default schema
+	// -- the ATTACH `default_schema` option (#322), `dbo` when it is unset, the
+	// same one GetDefaultSchema() reports -- unless the server does have a
+	// schema called `main`, which then wins.
+	const bool main_alias = startup_.remote_pushdown && name == DEFAULT_SCHEMA;
+	auto resolve = [&](MSSQLMetadataCache &schemas) -> string {
+		return main_alias && !schemas.HasSchema(name) ? default_schema_ : name;
+	};
+
+	// Check schema filter — filtered-out schemas return not found (Spec 033).
+	// For the `main` alias the filter judges the schema it resolves to, below.
+	if (!main_alias && catalog_filter_.HasSchemaFilter() && !catalog_filter_.MatchesSchema(name)) {
 		if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
 			throw CatalogException("Schema '%s' not found in MSSQL database", name);
 		}
@@ -656,8 +688,12 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 	// shared list's load state changed in between, and the miss decision would
 	// then be made against one cache and the load against another.
 	auto &schema_list = SchemaListCache(transaction.context.get());
-	if (schema_list.GetSchemasState() == CacheLoadState::LOADED && schema_list.HasSchema(name)) {
-		auto schema_sp = GetOrCreateSchemaEntryShared(name);
+	auto visible = [&](const string &schema) {
+		return schema_list.HasSchema(schema) &&
+			   (!catalog_filter_.HasSchemaFilter() || catalog_filter_.MatchesSchema(schema));
+	};
+	if (schema_list.GetSchemasState() == CacheLoadState::LOADED && visible(resolve(schema_list))) {
+		auto schema_sp = GetOrCreateSchemaEntryShared(resolve(schema_list));
 		if (transaction.context) {
 			MSSQLBindAnchors::For(*transaction.context, *this).AnchorSchema(schema_sp);
 		}
@@ -706,7 +742,8 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 	}
 
 	// Check if schema exists in cache
-	if (!schema_list.HasSchema(name)) {
+	const string resolved = resolve(schema_list);
+	if (!visible(resolved)) {
 		if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
 			throw CatalogException("Schema '%s' not found in MSSQL database", name);
 		}
@@ -714,7 +751,7 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 	}
 
 	// Get or create schema entry
-	auto schema_sp = GetOrCreateSchemaEntryShared(name);
+	auto schema_sp = GetOrCreateSchemaEntryShared(resolved);
 	if (transaction.context) {
 		MSSQLBindAnchors::For(*transaction.context, *this).AnchorSchema(schema_sp);
 	}
@@ -1450,6 +1487,56 @@ void MSSQLCatalog::ValidateTableOptions(const MSSQLTableOptions &options) {
 	}
 }
 
+// The schema a base table of a pushed statement names, or "" when it names
+// none. The rewriter strips the catalog from a QualifiedName in either slot --
+// `db.t` parses as schema.name -- so a "schema" equal to this catalog's name is
+// the catalog, not a schema.
+string MSSQLCatalog::PushdownSchemaOf(const BaseTableRef &ref) const {
+	auto schema = ref.GetQualifiedName().Schema().GetIdentifierName();
+	return StringUtil::CIEquals(schema, GetName().GetIdentifierName()) ? string() : schema;
+}
+
+bool MSSQLCatalog::Supports(RemoteCapability capability) const {
+	switch (capability) {
+	case RemoteCapability::IS_REMOTE:
+	case RemoteCapability::EXECUTE_QUERY_NODE:
+		return startup_.remote_pushdown;
+	default:
+		return false;
+	}
+}
+
+// Nothing is pushed yet: the writer arrives in the next commits. Answering
+// `false` keeps every statement on the scan path even with the setting on.
+bool MSSQLCatalog::SupportsPushdown(const ParsedExpression &expression) {
+	MSSQL_CATALOG_DEBUG_LOG(2, "SupportsPushdown(expression %s)", expression.ToString().c_str());
+	return false;
+}
+
+bool MSSQLCatalog::SupportsPushdown(const TableRef &ref) {
+	if (ref.type == TableReferenceType::BASE_TABLE) {
+		auto &base = ref.Cast<BaseTableRef>();
+		auto entry = mssql::FindResolvedTable(*this, PushdownSchemaOf(base), base.Table().GetIdentifierName());
+		MSSQL_CATALOG_DEBUG_LOG(
+			2, "SupportsPushdown(table ref %s): resolved %s", ref.ToString().c_str(),
+			entry ? (entry->schema.name.GetIdentifierName() + "." + entry->name.GetIdentifierName()).c_str()
+				  : "(nothing)");
+		return false;
+	}
+	MSSQL_CATALOG_DEBUG_LOG(2, "SupportsPushdown(table ref %s)", ref.ToString().c_str());
+	return false;
+}
+
+bool MSSQLCatalog::SupportsPushdown(const QueryNode &node) {
+	MSSQL_CATALOG_DEBUG_LOG(2, "SupportsPushdown(query node %s)", node.ToString().c_str());
+	return false;
+}
+
+// No statement-level pushdown in spec 079: DDL and DML are spec 080's.
+bool MSSQLCatalog::SupportsPushdown(const SQLStatement &) {
+	return false;
+}
+
 ErrorData MSSQLCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
 	auto &base = info.Base().Cast<CreateTableInfo>();
 	// PARTITIONED BY and SORTED BY stay rejected by the base implementation:
@@ -1641,22 +1728,6 @@ void MSSQLCatalog::ForgetTransactionChanges(MSSQLTransactionMetadata &metadata) 
 		InvalidateTableEntry(table.first, table.second);
 	}
 }
-
-// House debug pattern: a static level read from MSSQL_DEBUG.
-static int GetCatalogWarmDebugLevel() {
-	static const int level = []() {
-		const char *env = std::getenv("MSSQL_DEBUG");
-		return env ? std::atoi(env) : 0;
-	}();
-	return level;
-}
-
-#define MSSQL_CATALOG_DEBUG_LOG(lvl, fmt, ...)                           \
-	do {                                                                 \
-		if (GetCatalogWarmDebugLevel() >= (lvl)) {                       \
-			fprintf(stderr, "[MSSQL CATALOG] " fmt "\n", ##__VA_ARGS__); \
-		}                                                                \
-	} while (0)
 
 void MSSQLCatalog::PublishTransactionMetadata(MSSQLTransactionMetadata &metadata) noexcept {
 	try {

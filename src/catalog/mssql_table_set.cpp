@@ -10,6 +10,7 @@
 #include "catalog/mssql_transaction.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "duckdb/common/exception.hpp"
+#include "pushdown/mssql_pushdown_resolution.hpp"
 
 // Debug logging for catalog operations
 static int GetCatalogDebugLevel() {
@@ -63,6 +64,7 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const
 	}
 	if (anchored) {
 		MSSQLBindAnchors::For(context, schema_.GetMSSQLCatalog()).AnchorTable(anchored);
+		mssql::NoteResolvedTable(schema_.GetMSSQLCatalog(), anchored);
 		return anchored.get();
 	}
 
@@ -122,6 +124,7 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const
 	}
 	if (anchored) {
 		MSSQLBindAnchors::For(context, schema_.GetMSSQLCatalog()).AnchorTable(anchored);
+		mssql::NoteResolvedTable(schema_.GetMSSQLCatalog(), anchored);
 		return anchored.get();
 	}
 	return nullptr;
@@ -449,6 +452,7 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntryInTransaction(ClientContext &c
 	auto &metadata = MSSQLTransaction::Get(context, catalog).Metadata(context);
 	auto anchor = [&](const shared_ptr<MSSQLTableEntry> &entry) -> optional_ptr<CatalogEntry> {
 		MSSQLBindAnchors::For(context, catalog).AnchorTable(entry);
+		mssql::NoteResolvedTable(catalog, entry);
 		return entry.get();
 	};
 

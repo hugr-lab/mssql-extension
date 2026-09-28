@@ -1602,6 +1602,11 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	startup.validate = !lazy_validation;
 	startup.validation_timeout_seconds = attach_validation_timeout;
 	startup.prewarm = !lazy_validation;
+	{
+		Value remote_pushdown;
+		startup.remote_pushdown = context.TryGetCurrentSetting("mssql_remote_pushdown", remote_pushdown) &&
+								  !remote_pushdown.IsNull() && remote_pushdown.GetValue<bool>();
+	}
 	auto catalog =
 		make_uniq<MSSQLCatalog>(db, name, std::move(connection_info), std::move(tds_pool_config),
 								std::move(fedauth_token_utf16le), options.access_mode, catalog_enabled, startup);

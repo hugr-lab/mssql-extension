@@ -59,6 +59,9 @@ struct MSSQLCatalogStartup {
 	//! Open mssql_min_connections up front, concurrently (Prewarm). Off
 	//! under lazy_validation.
 	bool prewarm = false;
+	//! Spec 079: mssql_remote_pushdown as it stood at ATTACH -- this catalog's
+	//! answer to Supports(IS_REMOTE / EXECUTE_QUERY_NODE) for its life.
+	bool remote_pushdown = false;
 };
 
 class MSSQLCatalog : public Catalog {
@@ -344,6 +347,23 @@ public:
 	//! validated where they are applied, so an unsupported one is still an error
 	//! rather than a silently ignored request.
 	ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override;
+
+	//===--------------------------------------------------------------------===//
+	// Remote pushdown (spec 079)
+	//===--------------------------------------------------------------------===//
+	//! IS_REMOTE and EXECUTE_QUERY_NODE exactly when mssql_remote_pushdown was on
+	//! at ATTACH (D6); never EXECUTE_STATEMENT or CONNECT.
+	bool Supports(RemoteCapability capability) const override;
+	//! The rewriter's dry run (D1). RemoteExecute cannot decline, so every
+	//! refusal happens here. The base class answers `true` to all four, which
+	//! would hand the rewriter statements this catalog cannot render.
+	bool SupportsPushdown(const ParsedExpression &expression) override;
+	bool SupportsPushdown(const TableRef &ref) override;
+	bool SupportsPushdown(const QueryNode &node) override;
+	bool SupportsPushdown(const SQLStatement &statement) override;
+	//! The schema a pushed statement's base table names, "" for none (the
+	//! rewriter leaves the catalog in the schema slot of `db.t`).
+	string PushdownSchemaOf(const BaseTableRef &ref) const;
 
 	// Get connection info
 	const MSSQLConnectionInfo &GetConnectionInfo() const;
