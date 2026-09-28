@@ -21,7 +21,7 @@ statement ok
 DROP TABLE IF EXISTS opd_setup.dbo.order_pushdown_test;
 
 # The string columns are varchar under a _BIN2_UTF8 collation: UTF-8 bytes, so
-# under a LIMIT they are pushed as `CAST(col AS varbinary(max))`, DuckDB's order
+# under a LIMIT they are pushed as `CAST(col AS varbinary(n))`, DuckDB's order
 # (MSSQLColumnInfo::OrdersLikeDuckDBAsBytes, issue #362). A plain ORDER BY on
 # them is not pushed; the plain-ORDER BY tests below key on created_date/score.
 statement ok
@@ -418,7 +418,7 @@ statement ok
 SELECT mssql_exec('opd4', 'DROP TABLE dbo.order_pushdown_comp');
 
 # A UTF-8 varchar key is pushed only under a LIMIT, as its bytes
-# (`CAST(name AS varbinary(max))`): DuckDB's order, but not sargable, so a plain
+# (`CAST(name AS varbinary(n))`): DuckDB's order, but not sargable, so a plain
 # ORDER BY on it keeps DuckDB's sort (review of #387).
 query II
 EXPLAIN SELECT id, name FROM opd4.dbo.order_pushdown_test ORDER BY name ASC NULLS FIRST;

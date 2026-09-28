@@ -312,17 +312,32 @@ static int16_t StringMaxLengthOf(const tds::ColumnMetadata &col) {
 	return col.max_length == 0xFFFF ? int16_t(-1) : static_cast<int16_t>(col.max_length);
 }
 
+// Whether COLMETADATA alone cannot say what a string column was DECLARED as. A
+// char / varchar under a UTF-8 collation needs the collation's NAME for its
+// annotation. An nchar / nvarchar under one is ambiguous only on a connection
+// that was not granted UTF8SUPPORT, where a UTF-8 varchar travels as nvarchar;
+// where it was granted, a UTF-8 varchar arrives as varchar, so an nvarchar is
+// an nvarchar -- which is every string column of a database whose default
+// collation is UTF-8, Fabric's included (review of #387: testing the collation
+// bit before the base left those unannotated and paid a describe for them).
+// `utf8_acked` is the answer of the connection the COLMETADATA came on, not
+// the catalog's cached one: it is what that connection negotiated.
+static bool IsDeclaredTypeAmbiguous(const tds::ColumnMetadata &col, bool utf8_acked) {
+	const string base = StringBaseOf(col);
+	if (base.empty() || !col.IsUtf8Collation()) {
+		return false;
+	}
+	return base == "char" || base == "varchar" || !utf8_acked;
+}
+
 // The type a string column can be reported as from its COLMETADATA alone --
-// sp_prepare's answer, or a statement run at bind: an nchar / nvarchar gets its
-// MSSQL_NVARCHAR(n) (the annotation needs no collation there), and a column
-// whose collation is UTF-8 stays plain VARCHAR, whatever it travelled as: its
-// annotation needs the collation's NAME, and without UTF8SUPPORT a UTF-8
-// varchar arrives as nvarchar, so the wire kind would be the wrong one (review
-// of #387). A code-page varchar is plain VARCHAR anyway.
-static LogicalType WireStringType(const tds::ColumnMetadata &col, bool native_types) {
+// sp_prepare's answer, or a statement run at bind: MSSQL_NVARCHAR(n) for an
+// nchar / nvarchar (the annotation needs no collation there), plain VARCHAR
+// for a code-page varchar and for anything IsDeclaredTypeAmbiguous.
+static LogicalType WireStringType(const tds::ColumnMetadata &col, bool native_types, bool utf8_acked) {
 	const LogicalType stream_type = tds::encoding::TypeConverter::GetDuckDBType(col);
 	const string base = StringBaseOf(col);
-	if (base.empty() || col.IsUtf8Collation()) {
+	if (base.empty() || IsDeclaredTypeAmbiguous(col, utf8_acked)) {
 		return stream_type;
 	}
 	return NativeStringType(stream_type, native_types, base, StringMaxLengthOf(col), string());
@@ -338,13 +353,17 @@ static LogicalType WireStringType(const tds::ColumnMetadata &col, bool native_ty
 // nvarchar when the server did not grant UTF8SUPPORT -- the bind names the
 // DECLARED type, the stream carries the wire one -- as nvarchar(n), or
 // nvarchar(max) past the 4000 characters nvarchar holds inline. Accepted only
-// when the column's collation is UTF-8 and the login was not granted the
-// feature (`utf8_granted` false). The collation itself is not compared:
-// COLMETADATA carries it as an id, not a name.
-static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQLResultStream &stream,
-									bool utf8_granted) {
+// when the column's collation is UTF-8 AND the stream's own connection was not
+// granted UTF8SUPPORT -- the only connection on which a varchar is transcoded,
+// so on a granted one an nvarchar in place of a bound varchar is a real change
+// and refused. The connection's answer, not the catalog's cached one (review of
+// #387). The collation itself is not compared: COLMETADATA carries it as an
+// id, not a name.
+static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQLResultStream &stream) {
 	auto &types = stream.GetColumnTypes();
 	auto &metadata = stream.GetColumnMetadata();
+	auto connection = stream.GetConnection();
+	const bool utf8_acked = connection && connection->UTF8SupportAcked();
 	if (bound.size() != types.size() || metadata.size() != types.size()) {
 		return false;
 	}
@@ -373,7 +392,7 @@ static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQ
 			}
 			continue;
 		}
-		const bool transcoded = !spec.unicode && unicode && !utf8_granted && metadata[i].IsUtf8Collation();
+		const bool transcoded = !spec.unicode && unicode && !utf8_acked && metadata[i].IsUtf8Collation();
 		if (!transcoded) {
 			return false;
 		}
@@ -498,19 +517,19 @@ static MSSQLDescribedShape PrepareStatement(tds::TdsConnection &connection, cons
 		shape.reason = "the statement returns no result set";
 		return shape;
 	}
-	// The columns whose annotation needs the describe: those whose collation is
-	// a UTF-8 one. That bit is in COLMETADATA whatever travelled -- varchar, or
-	// nvarchar when UTF8SUPPORT was not granted (review of #387: deciding by
-	// the wire type missed the second) -- and a code-page varchar is plain
-	// VARCHAR either way, so it costs no round trip.
+	// The columns whose annotation needs the describe: those whose declared type
+	// COLMETADATA cannot tell (IsDeclaredTypeAmbiguous) -- a UTF-8 varchar,
+	// whatever it travelled as. A code-page varchar is plain VARCHAR either way,
+	// and an nvarchar on a connection granted UTF8SUPPORT is an nvarchar, so
+	// neither costs a round trip.
+	const bool utf8_acked = connection.UTF8SupportAcked();
 	vector<bool> needs_describe;
 	bool any_needs_describe = false;
 	for (const auto &col : result.result_sets.front()) {
-		const string base = StringBaseOf(col);
-		const bool utf8_text = !base.empty() && col.IsUtf8Collation();
-		needs_describe.push_back(utf8_text);
-		any_needs_describe = any_needs_describe || utf8_text;
-		shape.types.push_back(WireStringType(col, native_types));
+		const bool ambiguous = IsDeclaredTypeAmbiguous(col, utf8_acked);
+		needs_describe.push_back(ambiguous);
+		any_needs_describe = any_needs_describe || ambiguous;
+		shape.types.push_back(WireStringType(col, native_types, utf8_acked));
 		shape.names.push_back(col.name);
 		shape.datetime2.push_back(col.type_id == tds::TDS_TYPE_DATETIME2);
 	}
@@ -782,9 +801,11 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	// Typed from COLMETADATA as the prepared path is: nchar / nvarchar with
 	// their length, a UTF-8 or code-page varchar plain VARCHAR (review of #387:
 	// this path reported every string column plain).
+	auto stream_connection = result_stream->GetConnection();
+	const bool utf8_acked = stream_connection && stream_connection->UTF8SupportAcked();
 	return_types.clear();
 	for (const auto &col : result_stream->GetColumnMetadata()) {
-		return_types.push_back(WireStringType(col, native_types));
+		return_types.push_back(WireStringType(col, native_types, utf8_acked));
 	}
 	names.clear();
 	for (const auto &name : result_stream->GetColumnNames()) {
@@ -961,8 +982,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		}
 		stream->SurfaceWarnings(context);
 		const auto &described = bind_data.described_types.empty() ? bind_data.return_types : bind_data.described_types;
-		if (!StreamMatchesBoundShape(described, *stream,
-									 mssql_catalog.UTF8SupportState() == MSSQLCatalog::Utf8Support::Granted)) {
+		if (!StreamMatchesBoundShape(described, *stream)) {
 			// The described shape is what the plan was built on; serving rows of
 			// another shape would be a silent wrong answer.
 			throw InvalidInputException(
