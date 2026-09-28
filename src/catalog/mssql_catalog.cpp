@@ -29,10 +29,12 @@
 #include "dml/update/mssql_physical_update.hpp"
 #include "dml/update/mssql_update_target.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -1492,18 +1494,42 @@ void MSSQLCatalog::ValidateTableOptions(const MSSQLTableOptions &options) {
 	}
 }
 
-// The schema a base table of a pushed statement is in. The rewriter strips
-// the catalog from a QualifiedName in either slot -- `db.t` parses as
-// schema.name -- so no schema, or a "schema" equal to this catalog's name,
-// means the default schema, exactly where the rewriter's own lookup of `main`
-// was answered (LookupSchema). Never "any schema": after the strip `db.t` and
-// `db.s2.t` would otherwise both match the newest note named `t`.
-string MSSQLCatalog::PushdownSchemaOf(const BaseTableRef &ref) const {
-	auto schema = ref.GetQualifiedName().Schema().GetIdentifierName();
-	if (schema.empty() || StringUtil::CIEquals(schema, GetName().GetIdentifierName())) {
+// The schema a pushed statement's base table is in. No schema means the
+// default schema, where the rewriter's own lookup of `main` was answered
+// (LookupSchema) -- never "any schema": after the strip `db.t` and `db.s2.t`
+// would otherwise both match the newest note named `t`. Before the rewriter
+// strips the catalog (the dry run), `db.t` parses as schema.name with no
+// catalog, so a "schema" equal to this catalog's name is the catalog; after the
+// strip (RemoteExecute), and whenever a catalog is written too (`db.db.t`), a
+// schema is a real one.
+string MSSQLCatalog::PushdownSchemaOf(const BaseTableRef &ref, bool stripped) const {
+	const auto &name = ref.GetQualifiedName();
+	auto schema = name.Schema().GetIdentifierName();
+	if (schema.empty()) {
+		return default_schema_;
+	}
+	if (!stripped && name.Catalog().empty() && StringUtil::CIEquals(schema, GetName().GetIdentifierName())) {
 		return default_schema_;
 	}
 	return schema;
+}
+
+// An unqualified `t` binds through the session's search path (`USE db.sales`),
+// but the rewriter looks it up in schema `main`, which LookupSchema answers
+// with the default schema -- so pushing it could read `dbo.t` where the binder
+// reads `sales.t` (measured before this check). Pushed only when every search
+// path entry of this catalog is its default schema.
+bool MSSQLCatalog::SearchPathIsDefaultSchema(ClientContext &context) const {
+	for (auto &entry : ClientData::Get(context).catalog_search_path->Get()) {
+		if (!StringUtil::CIEquals(entry.GetCatalog().GetIdentifierName(), GetName().GetIdentifierName())) {
+			continue;
+		}
+		const auto &schema = entry.GetSchema().GetIdentifierName();
+		if (!schema.empty() && schema != default_schema_ && schema != DEFAULT_SCHEMA) {
+			return false;
+		}
+	}
+	return true;
 }
 
 // The table a pushed base-table reference names. With a context (RemoteExecute)
@@ -1513,7 +1539,7 @@ string MSSQLCatalog::PushdownSchemaOf(const BaseTableRef &ref) const {
 MSSQLCatalog::PushdownTable MSSQLCatalog::ResolvePushdownTable(const BaseTableRef &ref,
 															   optional_ptr<ClientContext> context) {
 	PushdownTable result;
-	const auto schema = PushdownSchemaOf(ref);
+	const auto schema = PushdownSchemaOf(ref, context != nullptr);
 	const auto &name = ref.Table().GetIdentifierName();
 	if (context) {
 		auto entry = GetEntry(*context, CatalogType::TABLE_ENTRY, Identifier(schema), Identifier(name),
@@ -1533,6 +1559,11 @@ MSSQLCatalog::PushdownTable MSSQLCatalog::ResolvePushdownTable(const BaseTableRe
 		// `db.main.t`: the rewriter's lookup of `main` was answered with the
 		// default schema (LookupSchema), so that is what was noted.
 		resolved = mssql::FindResolvedTable(*this, default_schema_, name);
+	}
+	const auto &qualified = ref.GetQualifiedName();
+	if (resolved && qualified.Schema().empty() && qualified.Catalog().empty() &&
+		!SearchPathIsDefaultSchema(*resolved.context)) {
+		return result;
 	}
 	if (resolved) {
 		result.entry = resolved.entry.get();

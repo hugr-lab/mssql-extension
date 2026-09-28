@@ -22,8 +22,12 @@ namespace mssql {
 //! hands out is noted here, thread-locally, and the dry run reads the one the
 //! rewriter itself resolved.
 //!
-//! Weak references: an entry lives while the statement binding it anchors it
-//! (MSSQLBindAnchors); a note that outlives that is simply not found.
+//! Weak references, but not per statement: the shared metadata cache holds
+//! the entries too, so a note can outlive the statement that wrote it. That is
+//! why a lookup always names the schema (the default one when the reference
+//! names none) and the kept run (RemoteExecute) looks the table up again with
+//! its own context. Written only for catalogs attached with
+//! mssql_remote_pushdown on.
 //!
 //! The context that resolved it is noted with it: the dry run has none of its
 //! own, and the statement's defaults (default_order, default_null_order) and

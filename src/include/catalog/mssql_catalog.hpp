@@ -367,9 +367,11 @@ public:
 	bool SupportsPushdown(const QueryNode &node) override;
 	bool SupportsPushdown(const SQLStatement &statement) override;
 	//! The schema a pushed statement's base table is in: the default schema
-	//! when it names none (the rewriter leaves the catalog in the schema slot of
-	//! `db.t`).
-	string PushdownSchemaOf(const BaseTableRef &ref) const;
+	//! when it names none; `stripped` once the rewriter removed the catalog.
+	string PushdownSchemaOf(const BaseTableRef &ref, bool stripped) const;
+	//! Whether every search-path entry of this catalog is its default schema,
+	//! so an unqualified name binds where the rewriter looked it up.
+	bool SearchPathIsDefaultSchema(ClientContext &context) const;
 	struct PushdownTable {
 		MSSQLTableEntry *entry = nullptr;
 		ClientContext *context = nullptr;

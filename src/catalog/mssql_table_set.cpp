@@ -64,7 +64,9 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const
 	}
 	if (anchored) {
 		MSSQLBindAnchors::For(context, schema_.GetMSSQLCatalog()).AnchorTable(anchored);
-		mssql::NoteResolvedTable(context, schema_.GetMSSQLCatalog(), anchored);
+		if (schema_.GetMSSQLCatalog().Supports(RemoteCapability::EXECUTE_QUERY_NODE)) {
+			mssql::NoteResolvedTable(context, schema_.GetMSSQLCatalog(), anchored);
+		}
 		return anchored.get();
 	}
 
@@ -124,7 +126,9 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const
 	}
 	if (anchored) {
 		MSSQLBindAnchors::For(context, schema_.GetMSSQLCatalog()).AnchorTable(anchored);
-		mssql::NoteResolvedTable(context, schema_.GetMSSQLCatalog(), anchored);
+		if (schema_.GetMSSQLCatalog().Supports(RemoteCapability::EXECUTE_QUERY_NODE)) {
+			mssql::NoteResolvedTable(context, schema_.GetMSSQLCatalog(), anchored);
+		}
 		return anchored.get();
 	}
 	return nullptr;
@@ -452,7 +456,9 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntryInTransaction(ClientContext &c
 	auto &metadata = MSSQLTransaction::Get(context, catalog).Metadata(context);
 	auto anchor = [&](const shared_ptr<MSSQLTableEntry> &entry) -> optional_ptr<CatalogEntry> {
 		MSSQLBindAnchors::For(context, catalog).AnchorTable(entry);
-		mssql::NoteResolvedTable(context, catalog, entry);
+		if (catalog.Supports(RemoteCapability::EXECUTE_QUERY_NODE)) {
+			mssql::NoteResolvedTable(context, catalog, entry);
+		}
 		return entry.get();
 	};
 

@@ -237,11 +237,109 @@ UNION ALL (SELECT id FROM loc);
 200
 99
 
+# `USE db`: an unqualified name binds in the default schema, as the rewriter
+# looks it up -- pushed.
+statement ok
+USE rp_on;
+
+query II
+EXPLAIN SELECT id FROM rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*FROM \[dbo\]\.\[rp_t\].*
+
+# `USE db.rp_s`: the binder reads rp_s.rp_t, but the rewriter looks the name up
+# in `main`, answered with dbo -- so it is not pushed (it read dbo.rp_t before
+# the search-path check), and the scan path reads rp_s.
+statement ok
+USE rp_on.rp_s;
+
+query II
+EXPLAIN SELECT id FROM rp_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT id FROM rp_t ORDER BY id LIMIT 5;
+----
+100
+200
+
+statement ok
+USE memory;
+
+# The `default_schema` ATTACH option is where a two-part name resolves.
+statement ok
+SET mssql_remote_pushdown = true;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rp_ds (TYPE mssql, default_schema 'rp_s');
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+query II
+EXPLAIN SELECT id FROM rp_ds.rp_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*FROM \[rp_s\]\.\[rp_t\].*
+
+query I
+SELECT id FROM rp_ds.rp_t ORDER BY id LIMIT 5;
+----
+100
+200
+
+statement ok
+DETACH rp_ds;
+
 statement ok
 SELECT mssql_exec('rp_off', 'DROP TABLE rp_s.rp_t; DROP SCHEMA rp_s');
 
 statement ok
 SELECT mssql_invalidate_cache('rp_on');
+
+# A server schema named like the ATTACH alias: `rp_on.rp_on.rp_t` is that
+# schema, not the default one.
+statement ok
+SELECT mssql_exec('rp_off', 'IF SCHEMA_ID(''rp_on'') IS NULL EXEC(''CREATE SCHEMA rp_on'');
+	DROP TABLE IF EXISTS rp_on.rp_t; CREATE TABLE rp_on.rp_t (id int NOT NULL); INSERT INTO rp_on.rp_t VALUES (7)');
+
+statement ok
+SELECT mssql_invalidate_cache('rp_on');
+
+query II
+EXPLAIN SELECT id FROM rp_on.rp_on.rp_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*FROM \[rp_on\]\.\[rp_t\].*
+
+query I
+SELECT id FROM rp_on.rp_on.rp_t ORDER BY id LIMIT 5;
+----
+7
+
+statement ok
+SELECT mssql_exec('rp_off', 'DROP TABLE rp_on.rp_t; DROP SCHEMA rp_on');
+
+statement ok
+SELECT mssql_invalidate_cache('rp_on');
+
+# A prepared statement is rewritten when it binds, and again on re-execution.
+statement ok
+PREPARE rp_q AS SELECT id FROM rp_on.dbo.rp_t WHERE id >= 2 ORDER BY id LIMIT 2;
+
+query I
+EXECUTE rp_q;
+----
+2
+3
+
+query I
+EXECUTE rp_q;
+----
+2
+3
+
+statement ok
+DEALLOCATE rp_q;
 
 #
 # Types: a pushed SELECT reports the catalog's column types, read into them

@@ -21,7 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than the catalog scan would: in this PR an `ORDER BY` or a `LIMIT`. A node
   without either stays with the catalog scan, which pushes projections and
   filters itself and still takes a filter from an enclosing query. Anything
-  outside that list is left to the scan path, never guessed.
+  outside that list is left to the scan path, never guessed. Not pushed in
+  this PR: `$n` parameters, and an unqualified name while the session's
+  search path puts another schema of the catalog first (`USE db.sales`).
+  While the setting is on, the catalog's schema `main` answers as its default
+  schema for every lookup (`db.main.t`, `CREATE TABLE db.main.x`), DuckDB
+  skips its catalog-or-schema ambiguity check for the catalog, and the
+  rewriter runs on every statement of the instance.
 - **`column_types := [...]` on `mssql_scan` / `mssql_scan_params`**: the type
   each result column is read as, `''` for the described one, checked against
   the server's describe. The rewriter uses it so a pushed `SELECT` has the
