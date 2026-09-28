@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Remote pushdown, first shapes (spec 079 PR B), behind
+  `mssql_remote_pushdown`** (default `false`, read at ATTACH; the default flips
+  to `true` in PR E). An attached catalog answers DuckDB's remote-pushdown
+  rewriter, which then sends a whole single-table `SELECT` to SQL Server as
+  one statement: its columns, a `WHERE` of column-vs-constant comparisons,
+  `IS [NOT] NULL` and `AND` / `OR` / `NOT`, `ORDER BY` on columns, and
+  `LIMIT` / `OFFSET` as `TOP` / `OFFSET … FETCH`. The statement runs through
+  `mssql_scan_params` (or `mssql_scan` when it has no constants), so `EXPLAIN`
+  shows the T-SQL it sends. A node is taken only when it sends the server more
+  than the catalog scan would: in this PR an `ORDER BY` or a `LIMIT`. A node
+  without either stays with the catalog scan, which pushes projections and
+  filters itself and still takes a filter from an enclosing query. Anything
+  outside that list is left to the scan path, never guessed.
+- **`column_types := [...]` on `mssql_scan` / `mssql_scan_params`**: the type
+  each result column is read as, `''` for the described one, checked against
+  the server's describe. The rewriter uses it so a pushed `SELECT` has the
+  catalog's column types: `datetime2(7)` as `TIMESTAMP_NS` with its 100 ns
+  ticks, a `varchar` under a code-page collation as its declared
+  `MSSQL_VARCHAR(n)`, `geometry` as `GEOMETRY`.
+- **`EXPLAIN` shows the statement of an `mssql_scan` / `mssql_scan_params`.**
 - **ORDER BY … LIMIT on a nullable key is pushed** under
   `mssql_order_pushdown`. SQL Server sorts NULL lowest and has no
   `NULLS FIRST` / `LAST`, so a nullable key asking for another placement

@@ -27,6 +27,7 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 class MSSQLSchemaEntry;
+class MSSQLTableEntry;
 class MSSQLStatisticsProvider;
 class MSSQLTransactionMetadata;
 class PhysicalPlanGenerator;
@@ -34,6 +35,10 @@ class LogicalCreateTable;
 class LogicalInsert;
 class LogicalDelete;
 class LogicalUpdate;
+
+namespace mssql {
+struct WrittenQuery;
+}  // namespace mssql
 
 //===----------------------------------------------------------------------===//
 // MSSQLCatalog - DuckDB catalog representing an attached SQL Server database
@@ -361,9 +366,24 @@ public:
 	bool SupportsPushdown(const TableRef &ref) override;
 	bool SupportsPushdown(const QueryNode &node) override;
 	bool SupportsPushdown(const SQLStatement &statement) override;
-	//! The schema a pushed statement's base table names, "" for none (the
-	//! rewriter leaves the catalog in the schema slot of `db.t`).
+	//! The schema a pushed statement's base table is in: the default schema
+	//! when it names none (the rewriter leaves the catalog in the schema slot of
+	//! `db.t`).
 	string PushdownSchemaOf(const BaseTableRef &ref) const;
+	struct PushdownTable {
+		MSSQLTableEntry *entry = nullptr;
+		ClientContext *context = nullptr;
+		shared_ptr<MSSQLTableEntry> keep_entry;	 // held while the writer runs
+		shared_ptr<ClientContext> keep_context;
+	};
+	//! The table a pushed base-table reference names: looked up with
+	//! `context` when there is one, else the entry this thread noted.
+	PushdownTable ResolvePushdownTable(const BaseTableRef &ref, optional_ptr<ClientContext> context);
+	//! Spec 079: the writer's run over `node` -- the dry run and the kept one.
+	bool WritePushdown(const QueryNode &node, mssql::WrittenQuery &out, string &why,
+					   optional_ptr<ClientContext> context = nullptr);
+	//! D3: the node as a call of mssql_scan_params / mssql_scan; lazy.
+	unique_ptr<TableRef> RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) override;
 
 	// Get connection info
 	const MSSQLConnectionInfo &GetConnectionInfo() const;

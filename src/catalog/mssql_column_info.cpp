@@ -502,9 +502,9 @@ string NVarcharLength(const string &sql_type_name, int16_t max_length) {
 
 string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string &sql_type_name, int16_t max_length,
 											const string &collation_name, bool convert_varchar_max,
-											const string &qualifier) {
-	const string escaped_name = mssql::QuoteIdentifier(col_name);
-	const string reference = qualifier + escaped_name;
+											const string &qualifier, const string &alias) {
+	const string escaped_name = mssql::QuoteIdentifier(alias.empty() ? col_name : alias);
+	const string reference = qualifier + mssql::QuoteIdentifier(col_name);
 
 	if (IsSpatialType(sql_type_name)) {
 		return reference + ".STAsBinary() AS " + escaped_name;
@@ -532,7 +532,7 @@ string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string
 
 	// Nothing to rewrite. Unqualified this is just the column; qualified it needs
 	// the alias, or the result would come back named after the qualifier's table.
-	return qualifier.empty() ? escaped_name : reference + " AS " + escaped_name;
+	return qualifier.empty() && alias.empty() ? escaped_name : reference + " AS " + escaped_name;
 }
 
 }  // namespace duckdb

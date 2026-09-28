@@ -5,17 +5,19 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 namespace mssql {
 
 namespace {
 
-struct ResolvedTable {
+struct Note {
 	const MSSQLCatalog *catalog = nullptr;
 	std::string schema;
 	std::string table;
 	weak_ptr<MSSQLTableEntry> entry;
+	weak_ptr<ClientContext> context;
 };
 
 //! The most recent resolutions on this thread, newest last. Bounded: the
@@ -24,14 +26,14 @@ struct ResolvedTable {
 //! notes for every table it ever bound.
 constexpr size_t MAX_NOTES = 64;
 
-std::vector<ResolvedTable> &Notes() {
-	thread_local std::vector<ResolvedTable> notes;
+std::vector<Note> &Notes() {
+	thread_local std::vector<Note> notes;
 	return notes;
 }
 
 }  // namespace
 
-void NoteResolvedTable(const MSSQLCatalog &catalog, const shared_ptr<MSSQLTableEntry> &entry) {
+void NoteResolvedTable(ClientContext &context, const MSSQLCatalog &catalog, const shared_ptr<MSSQLTableEntry> &entry) {
 	if (!entry) {
 		return;
 	}
@@ -47,24 +49,37 @@ void NoteResolvedTable(const MSSQLCatalog &catalog, const shared_ptr<MSSQLTableE
 	if (notes.size() >= MAX_NOTES) {
 		notes.erase(notes.begin());
 	}
-	ResolvedTable note;
+	Note note;
 	note.catalog = &catalog;
 	note.schema = schema;
 	note.table = table;
 	note.entry = entry;
+	note.context = context.shared_from_this();
 	notes.push_back(std::move(note));
 }
 
-shared_ptr<MSSQLTableEntry> FindResolvedTable(const MSSQLCatalog &catalog, const std::string &schema,
-											  const std::string &table) {
+ResolvedTable FindResolvedTable(const MSSQLCatalog &catalog, const std::string &schema, const std::string &table) {
+	// The exact spelling first; then any spelling, as DuckDB's own lookup
+	// matches names case-insensitively (`db.ORDERS` finds `Orders`).
 	auto &notes = Notes();
-	for (auto it = notes.rbegin(); it != notes.rend(); ++it) {
-		if (it->catalog != &catalog || it->table != table || (!schema.empty() && it->schema != schema)) {
-			continue;
+	for (int exact = 1; exact >= 0; exact--) {
+		for (auto it = notes.rbegin(); it != notes.rend(); ++it) {
+			if (it->catalog != &catalog) {
+				continue;
+			}
+			const bool match = exact
+								   ? it->schema == schema && it->table == table
+								   : StringUtil::CIEquals(it->schema, schema) && StringUtil::CIEquals(it->table, table);
+			if (!match) {
+				continue;
+			}
+			ResolvedTable found;
+			found.entry = it->entry.lock();
+			found.context = it->context.lock();
+			return found;
 		}
-		return it->entry.lock();
 	}
-	return nullptr;
+	return ResolvedTable();
 }
 
 }  // namespace mssql

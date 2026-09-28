@@ -34,15 +34,20 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "mssql_storage.hpp"
 #include "pushdown/mssql_pushdown_resolution.hpp"
+#include "pushdown/mssql_sql_writer.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "tds/auth/auth_strategy_factory.hpp"
 
@@ -1487,13 +1492,55 @@ void MSSQLCatalog::ValidateTableOptions(const MSSQLTableOptions &options) {
 	}
 }
 
-// The schema a base table of a pushed statement names, or "" when it names
-// none. The rewriter strips the catalog from a QualifiedName in either slot --
-// `db.t` parses as schema.name -- so a "schema" equal to this catalog's name is
-// the catalog, not a schema.
+// The schema a base table of a pushed statement is in. The rewriter strips
+// the catalog from a QualifiedName in either slot -- `db.t` parses as
+// schema.name -- so no schema, or a "schema" equal to this catalog's name,
+// means the default schema, exactly where the rewriter's own lookup of `main`
+// was answered (LookupSchema). Never "any schema": after the strip `db.t` and
+// `db.s2.t` would otherwise both match the newest note named `t`.
 string MSSQLCatalog::PushdownSchemaOf(const BaseTableRef &ref) const {
 	auto schema = ref.GetQualifiedName().Schema().GetIdentifierName();
-	return StringUtil::CIEquals(schema, GetName().GetIdentifierName()) ? string() : schema;
+	if (schema.empty() || StringUtil::CIEquals(schema, GetName().GetIdentifierName())) {
+		return default_schema_;
+	}
+	return schema;
+}
+
+// The table a pushed base-table reference names. With a context (RemoteExecute)
+// it is looked up through this catalog like any binder lookup, so the kept run
+// never depends on what the thread noted; without one (the SupportsPushdown
+// hooks get none) it is the entry the rewriter's own lookup just noted.
+MSSQLCatalog::PushdownTable MSSQLCatalog::ResolvePushdownTable(const BaseTableRef &ref,
+															   optional_ptr<ClientContext> context) {
+	PushdownTable result;
+	const auto schema = PushdownSchemaOf(ref);
+	const auto &name = ref.Table().GetIdentifierName();
+	if (context) {
+		auto entry = GetEntry(*context, CatalogType::TABLE_ENTRY, Identifier(schema), Identifier(name),
+							  OnEntryNotFound::RETURN_NULL);
+		if (!entry && startup_.remote_pushdown && schema == DEFAULT_SCHEMA) {
+			entry = GetEntry(*context, CatalogType::TABLE_ENTRY, Identifier(default_schema_), Identifier(name),
+							 OnEntryNotFound::RETURN_NULL);
+		}
+		if (entry) {
+			result.entry = &entry->Cast<MSSQLTableEntry>();
+			result.context = context.get();
+		}
+		return result;
+	}
+	auto resolved = mssql::FindResolvedTable(*this, schema, name);
+	if (!resolved && schema == DEFAULT_SCHEMA) {
+		// `db.main.t`: the rewriter's lookup of `main` was answered with the
+		// default schema (LookupSchema), so that is what was noted.
+		resolved = mssql::FindResolvedTable(*this, default_schema_, name);
+	}
+	if (resolved) {
+		result.entry = resolved.entry.get();
+		result.context = resolved.context.get();
+		result.keep_entry = resolved.entry;
+		result.keep_context = resolved.context;
+	}
+	return result;
 }
 
 bool MSSQLCatalog::Supports(RemoteCapability capability) const {
@@ -1506,30 +1553,133 @@ bool MSSQLCatalog::Supports(RemoteCapability capability) const {
 	}
 }
 
-// Nothing is pushed yet: the writer arrives in the next commits. Answering
-// `false` keeps every statement on the scan path even with the setting on.
+// Spec 079 D1: the expression overload is asked only about constructs that
+// reference no catalog (a constant, a function of constants). They are judged
+// where they are used -- the node writer knows the column a constant is
+// compared with and declares it from that column -- so here they pass, and
+// the node's dry run below is the one answer.
 bool MSSQLCatalog::SupportsPushdown(const ParsedExpression &expression) {
 	MSSQL_CATALOG_DEBUG_LOG(2, "SupportsPushdown(expression %s)", expression.ToString().c_str());
-	return false;
+	return true;
 }
 
+// A base table this catalog resolved on this thread (the rewriter's own
+// lookup just did it). Every other table reference is a veto in PR B; joins
+// and subqueries arrive with PR D.
 bool MSSQLCatalog::SupportsPushdown(const TableRef &ref) {
 	if (ref.type == TableReferenceType::BASE_TABLE) {
-		auto &base = ref.Cast<BaseTableRef>();
-		auto entry = mssql::FindResolvedTable(*this, PushdownSchemaOf(base), base.Table().GetIdentifierName());
+		auto resolved = ResolvePushdownTable(ref.Cast<BaseTableRef>(), nullptr);
+		auto entry = resolved.entry;
 		MSSQL_CATALOG_DEBUG_LOG(
 			2, "SupportsPushdown(table ref %s): resolved %s", ref.ToString().c_str(),
 			entry ? (entry->schema.name.GetIdentifierName() + "." + entry->name.GetIdentifierName()).c_str()
 				  : "(nothing)");
-		return false;
+		return entry != nullptr;
 	}
-	MSSQL_CATALOG_DEBUG_LOG(2, "SupportsPushdown(table ref %s)", ref.ToString().c_str());
+	MSSQL_CATALOG_DEBUG_LOG(2, "SupportsPushdown(table ref %s): not a base table", ref.ToString().c_str());
 	return false;
 }
 
+bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out, string &why,
+								 optional_ptr<ClientContext> context) {
+	if (node.type != QueryNodeType::SELECT_NODE) {
+		why = "not a SELECT";
+		return false;
+	}
+	auto &select = node.Cast<SelectNode>();
+	if (!select.from_table || select.from_table->type != TableReferenceType::BASE_TABLE) {
+		why = "FROM is not one base table";
+		return false;
+	}
+	auto resolved = ResolvePushdownTable(select.from_table->Cast<BaseTableRef>(), context);
+	if (!resolved.entry) {
+		why = "the table did not resolve in this catalog";
+		return false;
+	}
+	auto &entry = *resolved.entry;
+	// The session's settings are the context's: RemoteExecute's own, or, for
+	// the context-free hooks, the one that resolved the table.
+	auto options = mssql::SQLWriterOptions::FromContext(*resolved.context);
+	// The types the entry reports, not recomputed: a SET of
+	// mssql_catalog_native_types since the entry was built must not make the
+	// pushed column differ from the catalog's.
+	vector<LogicalType> types;
+	for (auto &column : entry.GetColumns().Logical()) {
+		types.push_back(column.Type());
+	}
+	mssql::SQLWriter writer(options, [&](const BaseTableRef &, mssql::WriterTable &table) {
+		table.schema = entry.schema.name.GetIdentifierName();
+		table.name = entry.name.GetIdentifierName();
+		table.columns = &entry.GetMSSQLColumns();
+		table.types = &types;
+		return true;
+	});
+	return writer.Write(node, out, why);
+}
+
+// The dry run (D1): the node is pushed exactly when the writer renders it --
+// and when the scan path could not serve it as well (`PushesMoreThanScan`).
 bool MSSQLCatalog::SupportsPushdown(const QueryNode &node) {
-	MSSQL_CATALOG_DEBUG_LOG(2, "SupportsPushdown(query node %s)", node.ToString().c_str());
-	return false;
+	if (!mssql::SQLWriter::PushesMoreThanScan(node)) {
+		MSSQL_CATALOG_DEBUG_LOG(2, "SupportsPushdown(query node %s): left to the scan path", node.ToString().c_str());
+		return false;
+	}
+	mssql::WrittenQuery written;
+	string why;
+	if (!WritePushdown(node, written, why)) {
+		MSSQL_CATALOG_DEBUG_LOG(1, "SupportsPushdown(query node %s): no: %s", node.ToString().c_str(), why.c_str());
+		return false;
+	}
+	MSSQL_CATALOG_DEBUG_LOG(1, "SupportsPushdown(query node %s): %s", node.ToString().c_str(),
+							written.statement.c_str());
+	return true;
+}
+
+// D3: the pushed node becomes a call of `mssql_scan_params` (or `mssql_scan`
+// when it carries no parameter) -- the describe at bind, the run at init, the
+// transaction's pinned connection, and EXPLAIN shows the statement. Nothing
+// touches the server here.
+unique_ptr<TableRef> MSSQLCatalog::RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) {
+	mssql::WrittenQuery written;
+	string why;
+	if (!WritePushdown(*node, written, why, context)) {
+		// SupportsPushdown ran the same writer on the same node a moment ago,
+		// so this is not expected -- but it must not be an InternalException,
+		// which invalidates the whole database instance.
+		throw BinderException(
+			"mssql: the pushed query no longer renders (%s); run it with "
+			"mssql_remote_pushdown = false, and please report it",
+			why);
+	}
+	vector<unique_ptr<ParsedExpression>> arguments;
+	arguments.push_back(ConstantExpression::String(GetName().GetIdentifierName()));
+	arguments.push_back(ConstantExpression::String(written.statement));
+	vector<Value> types;
+	for (auto &type : written.column_types) {
+		types.emplace_back(mssql::ColumnTypeName(type));
+	}
+	string function = "mssql_scan";
+	if (!written.params.empty()) {
+		function = "mssql_scan_params";
+		child_list_t<Value> values;
+		for (auto &param : written.params) {
+			values.emplace_back(Identifier(param.name), param.value);
+		}
+		arguments.push_back(ConstantExpression::FromValue(Value::STRUCT(std::move(values))));
+		arguments.push_back(ConstantExpression::String(written.Declarations()));
+	}
+	// A table function's binder reads a named parameter from the argument's
+	// alias (`name => value`), not from FunctionArgument's name.
+	auto column_types = ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, std::move(types)));
+	column_types->SetAlias(Identifier("column_types"));
+	arguments.push_back(std::move(column_types));
+	auto ref = make_uniq<TableFunctionRef>();
+	ref->function = make_uniq<FunctionExpression>(
+		QualifiedName(Identifier(SYSTEM_CATALOG), Identifier(DEFAULT_SCHEMA), Identifier(function)),
+		std::move(arguments));
+	mssql::CountRemotePushdown();
+	MSSQL_CATALOG_DEBUG_LOG(1, "RemoteExecute: %s", written.statement.c_str());
+	return std::move(ref);
 }
 
 // No statement-level pushdown in spec 079: DDL and DML are spec 080's.

@@ -6,6 +6,7 @@
 
 namespace duckdb {
 
+class ClientContext;
 class MSSQLCatalog;
 class MSSQLTableEntry;
 
@@ -23,12 +24,24 @@ namespace mssql {
 //!
 //! Weak references: an entry lives while the statement binding it anchors it
 //! (MSSQLBindAnchors); a note that outlives that is simply not found.
-void NoteResolvedTable(const MSSQLCatalog &catalog, const shared_ptr<MSSQLTableEntry> &entry);
+//!
+//! The context that resolved it is noted with it: the dry run has none of its
+//! own, and the statement's defaults (default_order, default_null_order) and
+//! the extension's settings are that context's.
+void NoteResolvedTable(ClientContext &context, const MSSQLCatalog &catalog, const shared_ptr<MSSQLTableEntry> &entry);
 
-//! The entry most recently resolved on this thread for `table` in `catalog`,
-//! in `schema` when one is given (an empty schema matches any), or null.
-shared_ptr<MSSQLTableEntry> FindResolvedTable(const MSSQLCatalog &catalog, const std::string &schema,
-											  const std::string &table);
+struct ResolvedTable {
+	shared_ptr<MSSQLTableEntry> entry;
+	shared_ptr<ClientContext> context;
+	explicit operator bool() const {
+		return entry && context;
+	}
+};
+
+//! The entry most recently resolved on this thread for `schema`.`table` in
+//! `catalog` (the exact spelling first, then any case), with the context that
+//! resolved it; empty when there is none or either is gone.
+ResolvedTable FindResolvedTable(const MSSQLCatalog &catalog, const std::string &schema, const std::string &table);
 
 }  // namespace mssql
 }  // namespace duckdb

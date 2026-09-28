@@ -153,9 +153,11 @@ struct MSSQLColumnInfo {
 	//! @param qualifier prefix for the column REFERENCE, e.g. `"INSERTED."`.
 	//!                  The alias is never qualified, so the result always comes
 	//!                  back under the column's own name.
+	//! @param alias    the name the column comes back under; empty = its own.
+	//!                  Spec 079's writer passes a SELECT-list alias.
 	static string BuildReadExpression(const string &col_name, const string &sql_type_name, int16_t max_length,
 									  const string &collation_name, bool convert_varchar_max,
-									  const string &qualifier = "");
+									  const string &qualifier = "", const string &alias = "");
 };
 
 }  // namespace duckdb
