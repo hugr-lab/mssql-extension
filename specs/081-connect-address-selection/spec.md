@@ -5,9 +5,14 @@ hardware that produced it.
 **Closes**: [#122](https://github.com/hugr-lab/mssql-extension/issues/122)
 (`ATTACH` can last 30s on Windows with multiple network adapters).
 **Relates to**: [#324](https://github.com/hugr-lab/mssql-extension/issues/324)
-(parallel pool warm-up) — a warm-up that opens N connections up front multiplies
-whatever the dial costs, so this lands first. Spec 073 W3 (the connect timeout now
-reaches the dial) is what makes the mitigation below possible at all.
+(parallel pool warm-up), **shipped** in `b66d149`. It imposes no ordering on this
+spec: `ConnectionPool::Prewarm` (`tds_connection_pool.cpp`) dials on one
+`std::thread` per connection, so N connections cost about one dial rather than N,
+and every prewarm login reaches `TdsSocket::Connect` through the pool factories,
+so W1 applies to it with no change. What #324 does add is an fd note for AC-4: N
+prewarm threads each staggering through the candidate list hold up to
+N × candidates sockets at once. Spec 073 W3 (the connect timeout now reaches the
+dial) is what makes the mitigation in §5 possible at all.
 
 One defect, reported with a correct root-cause analysis attached: **the dial hands
 the full connection timeout to every address `getaddrinfo` returns, one after the
@@ -25,8 +30,12 @@ timeout, not the timeout.
 
 ## 0. What was verified, and what was not
 
-Everything in §1 is verified by reading `origin/main` at `e6ab3a2` and is
-reproducible with `grep`. Nothing in §1 has been **measured**, because the failure
+Everything in §1 is verified by reading `origin/main` at `b660f13` and is
+reproducible with `grep`. References are anchored by **function name** rather than
+line number wherever both would do: `#382` and `#386` have already moved
+`mssql_catalog.cpp` and `mssql_storage.cpp` once since this spec was drafted
+against `e6ab3a2`, and re-verifying against `b660f13` is what retired F3 (below)
+and corrected §5. Nothing in §1 has been **measured**, because the failure
 needs a Windows host with several NICs and a hostname whose first DNS answer
 blackholes — the reporter has one, CI does not.
 
@@ -38,8 +47,11 @@ multi-NIC hardware.
 
 Where a platform behaviour is asserted below, it is either cited to Microsoft's
 documentation or to a measurement **already recorded in this repository**
-(`test/cpp/test_login_routing_hops.cpp`, which measured the macOS/Linux split on
-connecting to a bound-but-unlistening port). No new platform claim is invented here.
+(`test/cpp/test_login_routing_hops.cpp`). No new platform claim is invented here —
+and that cuts both ways: the one platform claim this spec inherited from that file,
+which of macOS and Linux drops a SYN to a bound-but-unlistening port, turns out not
+to be settled by the comment it was read from. It is now a `[BLOCKING]` question in
+§4 rather than a premise, because it decides how W1's hardest test is written.
 
 ---
 
@@ -93,13 +105,29 @@ macOS and Windows. It does not fix F1 — a machine with real IPv6 and several I
 adapters still gets a long list — but it removes the most common source of dead
 leading candidates for the price of one constant.
 
-### F3 — `ATTACH` crosses the dial twice
+### F3 — RETRACTED: `ATTACH` crosses the dial once, not twice
 
-`ATTACH` runs the spec 047 validation round trip (`src/mssql_storage.cpp:1837`,
-budget from `mssql_attach_validation_timeout`, default `0` ⇒ inherit
-`mssql_connection_timeout`), and then the first pooled connection dials again. Both
-cross `TdsSocket::Connect`, so both pay F1. The issue title says 30s; the mechanism
-allows twice that before a single query runs.
+This spec's first draft claimed `ATTACH` pays F1 twice — once for the spec 047
+validation round trip, once for the first pooled connection — and that the issue's
+30s therefore allowed 60s before a single query ran. **That is not what main
+does.** `MSSQLCatalog::ValidateThroughPool` acquires the validation connection
+*through the pool* and ends with `connection_pool_->Release(connection)`
+(`src/catalog/mssql_catalog.cpp`), so the connection it logged in stays in the pool
+and the first query reuses it. A plain `ATTACH` is one dial and one login.
+
+The budget still changes hands across it — the validation login runs under
+`mssql_attach_validation_timeout` (default `0` ⇒ inherit
+`mssql_connection_timeout`) and every later one under `mssql_connection_timeout`,
+which `ValidateThroughPool` implements by storing each into the shared
+`connect_timeout_` atomic around the acquire — but that is one dial's budget, not
+two.
+
+With `mssql_min_connections > 0` there are two dial *phases*: the validation, then
+one `Prewarm` batch whose logins run concurrently (see **Relates to** above). That
+is still one dial's worth of wall clock per phase, not N.
+
+Retained as a numbered finding rather than deleted, because the doubled figure was
+quoted once and the next reader should not have to re-derive that it is wrong.
 
 ### F4 — `WaitForReady` cannot see more than one socket
 
@@ -201,49 +229,108 @@ Three cases, in the order of how much they are worth:
 1. **A live first candidate is not slowed down.** Dial a `FakeTdsServer` and assert
    the connect completes well inside one stagger interval. Cheap, portable,
    protects the common path forever.
-2. **A live candidate behind a dead one wins.** Needs an address that swallows a SYN
-   without refusing. This is the hard part and it is *already documented in this
-   repository*: `test_login_routing_hops.cpp` measured that a bound-but-unlistening
-   `127.0.0.1` port **drops** the SYN on macOS (`connect()` sits ~7.8s) but is
-   **refused** on Linux. So that trick gives a blackhole on macOS and a refusal on
-   Linux — the wrong branch on the platform CI runs.
-3. **Total time is bounded by the budget when every candidate is dead.**
+2. **A live candidate behind a dead one wins.** Needs an address that swallows a
+   SYN without refusing.
+3. **Total time is bounded by the budget when every candidate is dead** — and is
+   **not** satisfied trivially fast. See "the assertion shape" below: this case
+   needs a lower bound as well as an upper one.
 
-For 2 and 3, the candidate list must be **injectable** — a seam taking a prepared
-list of `sockaddr`s, with the production path filling it from `getaddrinfo`. Then a
-test supplies a blackhole address explicitly rather than hoping the kernel provides
-one. `192.0.2.1` (RFC 5737 TEST-NET-1) is the conventional choice, but its behaviour
-depends on the host's routing table: with a default route the SYN leaves and is
-dropped (blackhole, what we want); with none, `EHOSTUNREACH` arrives immediately
-(fast failure, wrong branch). So the blackhole address is an input to the test, with
-a documented default, and case 2 skips with a clear message when the environment
-cannot provide one. A test that silently exercises the refusal branch while claiming
-to test the timeout branch is worse than no test.
+**The blackhole already exists in this repository, and CI already runs it.**
+`TestHopHonoursCallerConnectTimeout` (`test/cpp/test_login_routing_hops.cpp`) has a
+`FakeTdsServer` gateway route the client to **`192.0.2.1`** (RFC 5737 TEST-NET-1)
+and asserts the hop gives up on the caller's 2s budget. It is in the
+`make test-login-routing-hops` list and green on every PR, so `192.0.2.1` blackholes
+in the CI environment as a matter of record, not conjecture. W1's cases 2 and 3
+should reuse that address and cite this test rather than treat the blackhole as an
+unsolved problem.
+
+**The assertion shape is the real trap, and that same test demonstrates it.** Its
+only timing assertion is `CHECK(secs < 15)` — an **upper** bound. On a host with no
+default route, `192.0.2.1` answers `EHOSTUNREACH` in ~0s, and that check passes just
+as happily as it does on the blackhole. The test therefore cannot distinguish the
+branch it is named for from the branch it is not, which is the failure this spec
+elsewhere calls worse than no test — already shipped. W1 must not copy it:
+
+- case 3 and **AC-2** need a **lower** bound too (elapsed ≥ one stagger interval, or
+  ≥ some stated fraction of the budget), or
+- an assertion on the per-candidate outcomes W1.2 collects, which is the stronger
+  form because it names *why* each candidate failed rather than inferring it from a
+  clock.
+
+**Where the candidate list comes from.** The routing path above already delivers an
+arbitrary address into `TdsSocket::Connect` with **no new API surface at all**, which
+covers a single blackhole candidate. What it cannot express is a *multi-candidate*
+list, because a routing hop names one host and `Connect` then resolves it — so
+cases 2 and 3 still need a seam taking a prepared list of `sockaddr`s, with the
+production path filling it from `getaddrinfo`.
 
 > `[NEEDS CLARIFICATION]` Whether the injectable seam is acceptable API surface on
 > `TdsSocket`, or should be file-local with a test-only declaration. Settle in
-> `/speckit-plan`.
+> `/speckit-plan`. Note that the routing precedent above needs neither, so the seam
+> is only as wide as the multi-candidate cases require.
+
+> `[BLOCKING — settle before /speckit-plan]` **Which platform drops a SYN to a
+> bound-but-unlistening `127.0.0.1` port?** This spec's draft asserted it **drops on
+> macOS and is refused on Linux**, and concluded that the obvious in-process trick
+> exercises the wrong branch on the platform CI runs. The comment it cites
+> (`TestUnreachableRoutedTargetFails` in `test_login_routing_hops.cpp`) does not
+> clearly support that: it opens "is wrong on macOS: measured here … the SYN is
+> dropped and connect() sits for ~7.8s" and then closes "**That is a Linux
+> behaviour, not a portable one**", attributing the drop to the other platform. One
+> of the two texts is wrong, and §0 forbids this spec from inventing the answer.
+>
+> It is not cosmetic — it decides work:
+> - **drops on macOS / refused on Linux** (the draft's reading): a
+>   bound-but-unlistening socket gives CI a refusal, so cases 2 and 3 depend on the
+>   injected list and `192.0.2.1` above.
+> - **drops on Linux** (the cited comment's last sentence): CI gets an in-process
+>   blackhole for free, needing no injected address and no routing gateway, and the
+>   seam shrinks to whatever the multi-candidate list still needs.
+>
+> Settle it by measuring on both platforms — a bound-but-unlistening socket, timed
+> `connect()` — and then fix whichever of the two texts is wrong, including the
+> comment in `test_login_routing_hops.cpp` if that is the one.
 
 ---
 
 ## 5. Retracted — do not re-propose
 
 **"`mssql_connection_timeout` never reaches the pool's dial, so there is no
-workaround."** False as of spec 073 W3. `TdsConnection::Connect` now clamps a
-non-positive budget to the compiled-in default and stores it
-(`src/tds/tds_connection.cpp:172-192`), and all four catalog connection factories
-pass `pool_config_.connection_timeout` into the dial
-(`src/catalog/mssql_catalog.cpp:210, 255, 278, 342`).
+workaround."** False as of spec 073 W3. `TdsConnection::Connect` clamps a
+non-positive budget to the compiled-in default and stores it in
+`connect_timeout_seconds_` (`src/tds/tds_connection.cpp:187-192`), and all four
+catalog connection factories capture the catalog's shared `connect_timeout_`
+(`std::shared_ptr<std::atomic<int>>`, initialised from
+`pool_config_.connection_timeout` in the `MSSQLCatalog` ctor) and read it at dial
+time.
 
-Consequences, both of which matter:
+Consequences, all three of which matter:
 
-- **There is a workaround today.** `SET mssql_connection_timeout = 3` cuts the
-  per-candidate allowance to 3s, turning the reporter's 30s stall into 3s. Worth
-  saying on #122 now rather than after W1 ships. It is a blunt instrument — it also
-  shortens the legitimate ceiling for a slow WAN dial — but it is real and it is
-  available in released builds.
-- **#122 is therefore not urgent, only wrong.** The absence of any workaround was
-  the only thing that would have made it a release blocker.
+- **There is a workaround today, and it only works BEFORE `ATTACH`.**
+  `SET mssql_connection_timeout = 3` cuts the per-candidate allowance to 3s,
+  turning the reporter's 30s stall into 3s. But the setting is read **once per
+  catalog, at ATTACH**: `LoadPoolConfig(ClientContext&)`
+  (`src/connection/mssql_settings.cpp`) has exactly one call site, in the ATTACH
+  path of `src/mssql_storage.cpp`, and its answer is frozen into `pool_config_` and
+  from there into `connect_timeout_`, which nothing writes again after
+  `ValidateThroughPool` restores it. So:
+
+  ```sql
+  SET mssql_connection_timeout = 3;   -- first
+  ATTACH '...' AS db (TYPE mssql);    -- then this dial is bounded at 3s
+  ```
+
+  The reverse order does nothing for that catalog, and nothing at all for an
+  `ATTACH` already in flight — which is exactly the operation #122 reports as
+  slow. **Any advice posted on #122 must state the ordering**, or it will be tried
+  the wrong way round and read as "the workaround does not work". The same holds
+  for `mssql_attach_validation_timeout`, the more targeted lever for the ATTACH
+  dial itself: also read at ATTACH, also pre-ATTACH only.
+- It is a blunt instrument either way — it also shortens the legitimate ceiling for
+  a slow WAN dial to Azure SQL.
+- **#122 is therefore not urgent, only wrong** — but "not urgent" rests on users
+  being able to reorder two statements, not on the stall being avoidable once
+  `ATTACH` has run.
 
 ---
 
@@ -255,12 +342,20 @@ Consequences, both of which matter:
   or an equivalent; per §0 this cannot be signed off from CI alone.
 - **AC-2** — With every candidate dead, `Connect` returns within
   `timeout_seconds` ± one stagger interval, and the error names the host, the number
-  of candidates tried, and the distinct failures.
+  of candidates tried, and the distinct failures. Asserted with a **lower** bound as
+  well as an upper one (§4, "the assertion shape"): an upper bound alone is also
+  satisfied by an environment that fails every candidate instantly, so on its own it
+  does not witness the timeout branch at all. In-flight candidates are never
+  abandoned, so the deadline must close **all** of them at `timeout_seconds` — a
+  late-started candidate cannot extend the attempt past it.
 - **AC-3** — A single-address host and a live-first-candidate host show no
   regression against `main` in the harness of §4 case 1.
 - **AC-4** — Exactly one socket is open when `Connect` returns true, and none when
   it returns false. Asserted, not assumed: W1 is the first code in this class to
   hold more than one fd at a time, and a leaked candidate fd is the failure mode it
-  invites. Run the §4 cases under ASan/LSan with an fd-count assertion.
+  invites. Run the §4 cases under ASan/LSan with an fd-count assertion. Assert it on
+  the **prewarm** path too: with `mssql_min_connections > 0`, `ConnectionPool::Prewarm`
+  runs one dialling thread per connection, so the pool holds up to
+  N × candidates sockets at once and that is where a leaked candidate fd multiplies.
 - **AC-5** — No behavioural change on the `127.0.0.1` paths: the full `test/cpp`
   suite and the integration suite pass unchanged.
