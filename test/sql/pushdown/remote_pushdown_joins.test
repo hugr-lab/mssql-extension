@@ -1,0 +1,238 @@
+# name: test/sql/pushdown/remote_pushdown_joins.test
+# description: Spec 079 PR D -- joins of one catalog's tables pushed to SQL Server as one statement; both paths agree on rows and types
+# group: [pushdown]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# As in remote_pushdown_single_table.test: every pushed shape is pinned by
+# EXPLAIN, every veto by EXPLAIN showing the catalog scan, and the same
+# statement against a catalog attached with the setting OFF returns the same
+# rows with the same types.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rj_off (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = true;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rj_on (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+# a: 1..4; b references some of them, one row references nothing, one a has
+# no b -- so every outer join has a NULL-supplied side.
+statement ok
+SELECT mssql_exec('rj_off', 'DROP TABLE IF EXISTS dbo.rj_a, dbo.rj_b;
+	CREATE TABLE dbo.rj_a (id int NOT NULL PRIMARY KEY, name nvarchar(20) NULL, g int NOT NULL);
+	CREATE TABLE dbo.rj_b (id int NOT NULL PRIMARY KEY, a_id int NULL, label nvarchar(20) NULL, qty int NULL, wide bigint NULL);
+	INSERT INTO dbo.rj_a VALUES (1, N''one'', 1), (2, N''two'', 1), (3, N''three'', 2), (4, NULL, 2);
+	INSERT INTO dbo.rj_b VALUES (10, 1, N''x'', 5, 1), (11, 1, N''y'', 7, 1), (12, 3, N''z'', NULL, 3), (13, NULL, N''orphan'', 2, NULL), (2, 2, N''same-id'', 1, 2)');
+
+statement ok
+CREATE TABLE loc AS SELECT 1 AS id;
+
+#
+# Pushed.
+#
+
+query II
+EXPLAIN SELECT a.name, b.label FROM rj_on.dbo.rj_a a JOIN rj_on.dbo.rj_b b ON b.a_id = a.id;
+----
+physical_plan	<REGEX>:.*SELECT \[r1\]\.\[name\] AS \[name\], \[r2\]\.\[label\] AS \[label\] FROM \[dbo\]\.\[rj_a\] AS \[r1\] INNER JOIN \[dbo\]\.\[rj_b\] AS \[r2\] ON \(\[r2\]\.\[a_id\] = \[r1\]\.\[id\]\).*
+
+# Inner, left, right and full joins, with a WHERE: the same rows and types on
+# both paths. Each is its own CTAS / INSERT, whose query the rewriter pushes
+# on its own (a UNION of them would be one remote set operation, which the
+# catalog refuses as a whole and nothing would be pushed).
+statement ok
+CREATE TEMP TABLE j_on AS SELECT a.id AS aid, a.name, b.id AS bid, b.label, b.qty FROM rj_on.dbo.rj_a a JOIN rj_on.dbo.rj_b b ON b.a_id = a.id WHERE a.g = 1;
+
+statement ok
+INSERT INTO j_on SELECT a.id AS aid, a.name, b.id AS bid, b.label, b.qty FROM rj_on.dbo.rj_a a LEFT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id;
+
+statement ok
+INSERT INTO j_on SELECT a.id AS aid, a.name, b.id AS bid, b.label, b.qty FROM rj_on.dbo.rj_a a RIGHT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id;
+
+statement ok
+INSERT INTO j_on SELECT a.id AS aid, a.name, b.id AS bid, b.label, b.qty FROM rj_on.dbo.rj_a a FULL JOIN rj_on.dbo.rj_b b ON b.a_id = a.id;
+
+statement ok
+CREATE TEMP TABLE j_off AS SELECT a.id AS aid, a.name, b.id AS bid, b.label, b.qty FROM rj_off.dbo.rj_a a JOIN rj_off.dbo.rj_b b ON b.a_id = a.id WHERE a.g = 1;
+
+statement ok
+INSERT INTO j_off SELECT a.id AS aid, a.name, b.id AS bid, b.label, b.qty FROM rj_off.dbo.rj_a a LEFT JOIN rj_off.dbo.rj_b b ON b.a_id = a.id;
+
+statement ok
+INSERT INTO j_off SELECT a.id AS aid, a.name, b.id AS bid, b.label, b.qty FROM rj_off.dbo.rj_a a RIGHT JOIN rj_off.dbo.rj_b b ON b.a_id = a.id;
+
+statement ok
+INSERT INTO j_off SELECT a.id AS aid, a.name, b.id AS bid, b.label, b.qty FROM rj_off.dbo.rj_a a FULL JOIN rj_off.dbo.rj_b b ON b.a_id = a.id;
+
+# Each of those queries was pushed (the comparison below would pass on the
+# scan path too).
+query II
+EXPLAIN SELECT a.id AS aid, a.name, b.id AS bid, b.label, b.qty FROM rj_on.dbo.rj_a a JOIN rj_on.dbo.rj_b b ON b.a_id = a.id WHERE a.g = 1;
+----
+physical_plan	<REGEX>:.*INNER JOIN \[dbo\]\.\[rj_b\] AS \[r2\] ON \(\[r2\]\.\[a_id\] = \[r1\]\.\[id\]\) WHERE.*
+
+query II
+EXPLAIN SELECT a.id AS aid, a.name, b.id AS bid, b.label, b.qty FROM rj_on.dbo.rj_a a LEFT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id;
+----
+physical_plan	<REGEX>:.*LEFT JOIN \[dbo\]\.\[rj_b\] AS \[r2\].*
+
+query II
+EXPLAIN SELECT a.id AS aid, a.name, b.id AS bid, b.label, b.qty FROM rj_on.dbo.rj_a a RIGHT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id;
+----
+physical_plan	<REGEX>:.*RIGHT JOIN \[dbo\]\.\[rj_b\] AS \[r2\].*
+
+# The outer joins' own types, beside the scan path's.
+query TTTT
+SELECT typeof(a.id), typeof(a.name), typeof(b.id), typeof(b.qty) FROM rj_on.dbo.rj_a a FULL JOIN rj_on.dbo.rj_b b ON b.a_id = a.id LIMIT 1;
+----
+INTEGER	MSSQL_NVARCHAR(20)	INTEGER	INTEGER
+
+query TTTT
+SELECT typeof(a.id), typeof(a.name), typeof(b.id), typeof(b.qty) FROM rj_off.dbo.rj_a a FULL JOIN rj_off.dbo.rj_b b ON b.a_id = a.id LIMIT 1;
+----
+INTEGER	MSSQL_NVARCHAR(20)	INTEGER	INTEGER
+
+# 3 inner + 5 left + 5 right + 6 full.
+query I
+SELECT count(*) FROM j_on;
+----
+19
+
+query I
+SELECT count(*) FROM (SELECT * FROM j_on EXCEPT ALL SELECT * FROM j_off UNION ALL (SELECT * FROM j_off EXCEPT ALL SELECT * FROM j_on));
+----
+0
+
+query TT
+SELECT a.column_name, a.data_type FROM duckdb_columns() a JOIN duckdb_columns() b USING (column_name)
+WHERE a.table_name = 'j_on' AND b.table_name = 'j_off' AND a.data_type = b.data_type ORDER BY a.column_index;
+----
+aid	INTEGER
+name	MSSQL_NVARCHAR(20)
+bid	INTEGER
+label	MSSQL_NVARCHAR(20)
+qty	INTEGER
+
+query II
+EXPLAIN SELECT a.id AS aid, a.name, b.id AS bid, b.label, b.qty FROM rj_on.dbo.rj_a a FULL JOIN rj_on.dbo.rj_b b ON b.a_id = a.id;
+----
+physical_plan	<REGEX>:.*FROM \[dbo\]\.\[rj_a\] AS \[r1\] FULL JOIN \[dbo\]\.\[rj_b\] AS \[r2\] ON.*
+
+# USING: one condition; `*` lists the column once, from the left.
+query II
+EXPLAIN SELECT * FROM rj_on.dbo.rj_a JOIN rj_on.dbo.rj_b USING (id);
+----
+physical_plan	<REGEX>:.*INNER JOIN \[dbo\]\.\[rj_b\] AS \[r2\] ON \(\[r1\]\.\[id\] = \[r2\]\.\[id\]\).*
+
+query ITIITII
+SELECT * FROM rj_on.dbo.rj_a JOIN rj_on.dbo.rj_b USING (id);
+----
+2	two	1	2	same-id	1	2
+
+query ITIITII
+SELECT * FROM rj_off.dbo.rj_a JOIN rj_off.dbo.rj_b USING (id);
+----
+2	two	1	2	same-id	1	2
+
+# Aggregates over a join, the top-N shape.
+query II
+EXPLAIN SELECT a.name, sum(b.qty) AS s FROM rj_on.dbo.rj_a a JOIN rj_on.dbo.rj_b b ON b.a_id = a.id GROUP BY a.name ORDER BY s DESC LIMIT 2;
+----
+physical_plan	<REGEX>:.*SELECT TOP \(2\) \[r1\]\.\[name\] AS \[name\], SUM\(CAST\(\[r2\]\.\[qty\] AS decimal\(38,0\)\)\) AS \[s\].*GROUP BY \[r1\]\.\[name\].*
+
+query TI
+SELECT a.name, sum(b.qty) AS s FROM rj_on.dbo.rj_a a JOIN rj_on.dbo.rj_b b ON b.a_id = a.id GROUP BY a.name ORDER BY s DESC LIMIT 2;
+----
+one	12
+two	1
+
+# The NULL-supplying side of an outer join is nullable whatever it declares:
+# b.id is NOT NULL, yet a LEFT JOIN gives it NULLs, placed last as DuckDB
+# places them.
+query II
+SELECT a.id, b.id AS bid FROM rj_on.dbo.rj_a a LEFT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id ORDER BY b.id LIMIT 6;
+----
+2	2
+1	10
+1	11
+3	12
+4	NULL
+
+query II
+EXPLAIN SELECT a.id, b.id AS bid FROM rj_on.dbo.rj_a a LEFT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id ORDER BY b.id LIMIT 6;
+----
+physical_plan	<REGEX>:.*ORDER BY CASE WHEN \[r2\]\.\[id\] IS NULL THEN 1 ELSE 0 END, \[r2\]\.\[id\] ASC.*
+
+# A self-join through aliases; DISTINCT over a join with its ORDER BY key.
+query II rowsort
+SELECT DISTINCT x.g, y.name FROM rj_on.dbo.rj_a x JOIN rj_on.dbo.rj_a y ON x.g = y.g AND y.name IS NOT NULL ORDER BY x.g LIMIT 10;
+----
+1	one
+1	two
+2	three
+
+query II
+EXPLAIN SELECT DISTINCT x.g, y.name FROM rj_on.dbo.rj_a x JOIN rj_on.dbo.rj_a y ON x.g = y.g AND y.name IS NOT NULL ORDER BY x.g LIMIT 10;
+----
+physical_plan	<REGEX>:.*SELECT DISTINCT TOP \(10\) \[r1\]\.\[g\] AS \[g\], \[r2\]\.\[name\] AS \[name\].*ORDER BY \[r1\]\.\[g\] ASC.*
+
+#
+# Vetoes: the statement stays on the scan path, with the right rows.
+#
+
+# A join with a local table, or with another catalog: not one server's.
+query II
+EXPLAIN SELECT a.id FROM rj_on.dbo.rj_a a JOIN loc ON loc.id = a.id;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT a.id FROM rj_on.dbo.rj_a a JOIN rj_off.dbo.rj_b b ON b.a_id = a.id;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# int = bigint: DuckDB and the server promote differently.
+query II
+EXPLAIN SELECT a.id FROM rj_on.dbo.rj_a a JOIN rj_on.dbo.rj_b b ON b.wide = a.id;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT a.id FROM rj_on.dbo.rj_a a JOIN rj_on.dbo.rj_b b ON b.wide = a.id ORDER BY a.id;
+----
+1
+1
+2
+3
+
+# A CROSS JOIN alone sends more rows than the two scans.
+query II
+EXPLAIN SELECT a.id, b.id AS bid FROM rj_on.dbo.rj_a a CROSS JOIN rj_on.dbo.rj_b b;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# An ambiguous column is DuckDB's binder error, not the server's.
+statement error
+SELECT id FROM rj_on.dbo.rj_a a JOIN rj_on.dbo.rj_b b ON b.a_id = a.id;
+----
+Ambiguous reference
+
+statement ok
+SELECT mssql_exec('rj_off', 'DROP TABLE dbo.rj_a, dbo.rj_b');
+
+statement ok
+DETACH rj_on;
+
+statement ok
+DETACH rj_off;

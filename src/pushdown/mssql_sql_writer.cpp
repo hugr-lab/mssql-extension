@@ -31,6 +31,7 @@
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -244,10 +245,20 @@ int IntegerRank(LogicalTypeId id) {
 	}
 }
 
+//! One table of the FROM.
+struct Relation {
+	WriterTable table;
+	std::string name;		// how the query names it: its alias, else the table's name
+	std::string sql;		// how the statement names it: [r1] under a join, empty for one table
+	idx_t first = 0;		// its first column in the writer's flat column list
+	bool nullable = false;	// on the NULL-supplying side of an outer join
+};
+
 class NodeWriter {
 public:
-	NodeWriter(const SQLWriterOptions &options, const WriterTable &table, WrittenQuery &out, std::string &why)
-		: options_(options), table_(table), columns_(*table.columns), out_(out), why_(why) {}
+	NodeWriter(const SQLWriterOptions &options, const SQLWriter::TableResolver &resolver, WrittenQuery &out,
+			   std::string &why)
+		: options_(options), resolver_(resolver), out_(out), why_(why) {}
 
 	bool Write(const SelectNode &node);
 
@@ -297,18 +308,49 @@ private:
 	//! Types `constant` from `peer` and renders it. An operand of arithmetic
 	//! keeps its type in literal form too (see the definition).
 	bool BindConstant(const Operand &peer, Operand &constant, bool arithmetic = false);
-	//! A column in WHERE / ORDER BY. One table: its bare name, whose meaning
-	//! is the column's (collation, type). A join will qualify it here.
+	//! A column in WHERE / GROUP BY / an expression. One table: its bare
+	//! name. A join: qualified by the relation's own alias, `[r1].[c]`, which no
+	//! user alias or table name can shadow.
 	std::string ColumnSql(idx_t index) const {
-		return QuoteIdentifier(columns_[index].name);
+		auto &relation = relations_[relation_of_[index]];
+		return (relation.sql.empty() ? "" : relation.sql + ".") + QuoteIdentifier(columns_[index].name);
 	}
+	//! A column as ORDER BY must name it: always qualified, as a bare name there
+	//! is a select-list alias first (measured: `SELECT [id] AS [value] ...
+	//! ORDER BY [value]` sorts by id).
+	std::string OrderColumnSql(idx_t index) const {
+		auto &relation = relations_[relation_of_[index]];
+		return (relation.sql.empty() ? QuoteIdentifier(relation.table.name) : relation.sql) + "." +
+			   QuoteIdentifier(columns_[index].name);
+	}
+	//! The FROM: every base table resolved (its columns appended to the flat
+	//! list), then the join tree rendered with its conditions.
+	bool CollectRelations(const TableRef &ref, std::vector<idx_t> &members);
+	bool WriteFrom(const TableRef &ref, std::string &sql);
+	//! The columns of `relation` that a `*` over the whole FROM lists: all, but
+	//! a USING column of the right side only once (on the left).
+	bool IsHiddenUsingColumn(idx_t index) const;
 	bool WriteOrder(const OrderModifier &order, bool limited, std::string &sql);
 	bool ConstantCount(const ParsedExpression &expr, int64_t &out);
 
 	const SQLWriterOptions &options_;
-	const WriterTable &table_;
-	const std::vector<MSSQLColumnInfo> &columns_;
-	std::string relation_;	// the name the FROM gives the table (alias, else its name)
+	const SQLWriter::TableResolver &resolver_;
+	std::vector<Relation> relations_;
+	//! Every column of every relation, in FROM order -- copies, so a column on
+	//! the NULL-supplying side of an outer join can say it is nullable.
+	std::vector<MSSQLColumnInfo> columns_;
+	//! The DuckDB type the catalog reports for each, parallel to columns_.
+	std::vector<LogicalType> types_;
+	std::vector<idx_t> relation_of_;
+	//! A USING column's name -> the column an unqualified reference to it
+	//! means (the left side's for INNER / LEFT, the right's for RIGHT);
+	//! INVALID for FULL, where it is COALESCE(l, r) and not pushed.
+	std::vector<std::pair<std::string, idx_t>> using_columns_;
+	//! The right side's USING columns, which `*` leaves out.
+	std::vector<idx_t> hidden_using_;
+	//! The relations a column reference can see: while the FROM is written,
+	//! those joined so far (an ON condition cannot name a later one).
+	idx_t visible_ = DConstants::INVALID_INDEX;
 	WrittenQuery &out_;
 	std::string &why_;
 	std::vector<OutputColumn> outputs_;
@@ -342,16 +384,45 @@ public:
 
 int NodeWriter::FindColumn(const ColumnRefExpression &ref, idx_t &out) const {
 	auto &names = ref.ColumnNames();
-	if (names.size() > 2 || (names.size() == 2 && !StringUtil::CIEquals(names[0].GetIdentifierName(), relation_))) {
+	if (names.size() > 2) {
 		return -1;
 	}
 	const auto &name = names.back().GetIdentifierName();
+	idx_t relation = DConstants::INVALID_INDEX;
+	if (names.size() == 2) {
+		for (idx_t r = 0; r < relations_.size(); r++) {
+			if (StringUtil::CIEquals(names[0].GetIdentifierName(), relations_[r].name)) {
+				relation = r;
+			}
+		}
+		if (relation == DConstants::INVALID_INDEX) {
+			return -1;
+		}
+	} else {
+		// An unqualified USING column is the merged one DuckDB's binder makes.
+		for (auto &merged : using_columns_) {
+			if (StringUtil::CIEquals(merged.first, name)) {
+				if (merged.second == DConstants::INVALID_INDEX) {
+					return -1;
+				}
+				out = merged.second;
+				return 1;
+			}
+		}
+	}
+	if (relation != DConstants::INVALID_INDEX && visible_ != DConstants::INVALID_INDEX && relation >= visible_) {
+		return -1;
+	}
 	bool found = false;
 	for (idx_t i = 0; i < columns_.size(); i++) {
-		if (!StringUtil::CIEquals(columns_[i].name, name)) {
+		if ((visible_ != DConstants::INVALID_INDEX && relation_of_[i] >= visible_) ||
+			(relation != DConstants::INVALID_INDEX && relation_of_[i] != relation) ||
+			!StringUtil::CIEquals(columns_[i].name, name)) {
 			continue;
 		}
 		if (found) {
+			// Two relations with the column (DuckDB's ambiguity error), or a
+			// case-sensitive database holding `a` and `A`.
 			return -1;
 		}
 		found = true;
@@ -366,16 +437,190 @@ bool NodeWriter::ResolveColumn(const ColumnRefExpression &ref, idx_t &out) {
 	case 1:
 		return true;
 	case 0:
-		return Veto("column " + names.back().GetIdentifierName() + " is not a column of " + table_.name);
+		return Veto("column " + names.back().GetIdentifierName() + " is not a column of the query's tables");
 	default:
 		if (names.size() > 2) {
 			return Veto("column reference " + ref.ToString() + " has more than two parts");
 		}
-		if (names.size() == 2 && !StringUtil::CIEquals(names[0].GetIdentifierName(), relation_)) {
-			return Veto("column reference " + ref.ToString() + " names another relation");
+		if (names.size() == 2) {
+			bool known = false;
+			for (auto &relation : relations_) {
+				known = known || StringUtil::CIEquals(names[0].GetIdentifierName(), relation.name);
+			}
+			if (!known) {
+				return Veto("column reference " + ref.ToString() + " names another relation");
+			}
 		}
-		return Veto("column name " + names.back().GetIdentifierName() + " matches more than one column");
+		return Veto("column name " + names.back().GetIdentifierName() +
+					" matches more than one column, or a USING column of a FULL join");
 	}
+}
+
+bool NodeWriter::IsHiddenUsingColumn(idx_t index) const {
+	for (auto hidden : hidden_using_) {
+		if (hidden == index) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool NodeWriter::CollectRelations(const TableRef &ref, std::vector<idx_t> &members) {
+	if (ref.type == TableReferenceType::BASE_TABLE) {
+		auto &base = ref.Cast<BaseTableRef>();
+		if (base.sample || !base.column_name_alias.empty() || base.at_clause) {
+			return Veto("TABLESAMPLE / column aliases / AT on a table");
+		}
+		Relation relation;
+		if (!resolver_(base, relation.table) || !relation.table.columns) {
+			return Veto("table " + base.Table().GetIdentifierName() + " does not resolve in this catalog");
+		}
+		relation.name = base.alias.empty() ? relation.table.name : base.alias.GetIdentifierName();
+		for (auto &other : relations_) {
+			if (StringUtil::CIEquals(other.name, relation.name)) {
+				// A self-join without aliases, or two schemas' tables of one name --
+				// which the rewriter's strip would also merge (`db.s1.t.c` -> `t.c`).
+				return Veto("two tables named " + relation.name);
+			}
+		}
+		relation.first = columns_.size();
+		const auto &columns = *relation.table.columns;
+		for (idx_t i = 0; i < columns.size(); i++) {
+			columns_.push_back(columns[i]);
+			types_.push_back(relation.table.types ? (*relation.table.types)[i] : columns[i].NativeDuckDBType());
+			relation_of_.push_back(relations_.size());
+		}
+		members.push_back(relations_.size());
+		relations_.push_back(std::move(relation));
+		return true;
+	}
+	if (ref.type != TableReferenceType::JOIN) {
+		return Veto("FROM holds a " + std::string(ref.type == TableReferenceType::SUBQUERY ? "subquery" : "non-table"));
+	}
+	auto &join = ref.Cast<JoinRef>();
+	if (!join.alias.empty() || !join.column_name_alias.empty() || !join.duplicate_eliminated_columns.empty() ||
+		join.sample) {
+		return Veto("an alias, sample or column aliases on a join");
+	}
+	if (join.ref_type != JoinRefType::REGULAR && join.ref_type != JoinRefType::CROSS) {
+		return Veto("a NATURAL / POSITIONAL / ASOF / LATERAL / NEAREST join");
+	}
+	if (join.type != JoinType::INNER && join.type != JoinType::LEFT && join.type != JoinType::RIGHT &&
+		join.type != JoinType::OUTER) {
+		return Veto("a SEMI / ANTI / MARK join");
+	}
+	if (join.right->type != TableReferenceType::BASE_TABLE) {
+		// Left-deep only: `a JOIN (b JOIN c)` would need its own parentheses and
+		// the nullability of a nested outer join.
+		return Veto("a join whose right side is not a table");
+	}
+	std::vector<idx_t> left;
+	std::vector<idx_t> right;
+	if (!CollectRelations(*join.left, left) || !CollectRelations(*join.right, right)) {
+		return false;
+	}
+	// The NULL-supplying side: its columns can be NULL whatever they declare.
+	if (join.type == JoinType::LEFT || join.type == JoinType::OUTER) {
+		for (auto r : right) {
+			relations_[r].nullable = true;
+		}
+	}
+	if (join.type == JoinType::RIGHT || join.type == JoinType::OUTER) {
+		for (auto r : left) {
+			relations_[r].nullable = true;
+		}
+	}
+	members.insert(members.end(), left.begin(), left.end());
+	members.insert(members.end(), right.begin(), right.end());
+	return true;
+}
+
+bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
+	if (ref.type == TableReferenceType::BASE_TABLE) {
+		// The relations were collected in this same order.
+		auto &relation = relations_[visible_++];
+		sql = QuoteIdentifier(relation.table.schema) + "." + QuoteIdentifier(relation.table.name);
+		if (!relation.sql.empty()) {
+			sql += " AS " + relation.sql;
+		}
+		return true;
+	}
+	auto &join = ref.Cast<JoinRef>();
+	const idx_t left_first = visible_;
+	std::string left;
+	std::string right;
+	if (!WriteFrom(*join.left, left)) {
+		return false;
+	}
+	const idx_t right_relation = visible_;
+	if (!WriteFrom(*join.right, right)) {
+		return false;
+	}
+	if (join.ref_type == JoinRefType::CROSS) {
+		sql = left + " CROSS JOIN " + right;
+		return true;
+	}
+	const char *keyword = join.type == JoinType::INNER	 ? " INNER JOIN "
+						  : join.type == JoinType::LEFT	 ? " LEFT JOIN "
+						  : join.type == JoinType::RIGHT ? " RIGHT JOIN "
+														 : " FULL JOIN ";
+	std::string condition;
+	if (!join.using_columns.empty()) {
+		if (join.type == JoinType::RIGHT || join.type == JoinType::OUTER) {
+			// The merged column is the right side's, or COALESCE of both: its
+			// place in `*` and its value are not the left column's.
+			return Veto("USING in a RIGHT / FULL join");
+		}
+		std::vector<std::string> parts;
+		for (auto &using_name : join.using_columns) {
+			const auto &name = using_name.GetIdentifierName();
+			idx_t left_column = DConstants::INVALID_INDEX;
+			idx_t right_column = DConstants::INVALID_INDEX;
+			for (idx_t i = 0; i < columns_.size(); i++) {
+				if (!StringUtil::CIEquals(columns_[i].name, name)) {
+					continue;
+				}
+				if (relation_of_[i] >= left_first && relation_of_[i] < right_relation) {
+					if (left_column != DConstants::INVALID_INDEX) {
+						return Veto("USING column " + name + " is in more than one table on the left");
+					}
+					left_column = i;
+				} else if (relation_of_[i] == right_relation) {
+					right_column = i;
+				}
+			}
+			if (left_column == DConstants::INVALID_INDEX || right_column == DConstants::INVALID_INDEX) {
+				return Veto("USING column " + name + " is not on both sides");
+			}
+			Operand l;
+			Operand r;
+			for (auto side : {std::make_pair(left_column, &l), std::make_pair(right_column, &r)}) {
+				auto &operand = *side.second;
+				operand.sql = ColumnSql(side.first);
+				operand.type = columns_[side.first].duckdb_type;
+				operand.kind = KindOf(columns_[side.first]);
+				operand.column = &columns_[side.first];
+			}
+			if (!BindPair(l, r, "USING (" + name + ")")) {
+				return false;
+			}
+			parts.push_back(ExpressionVocabulary::Comparison(" = ", l.sql, r.sql));
+			using_columns_.emplace_back(name, left_column);
+			hidden_using_.push_back(right_column);
+		}
+		condition = ExpressionVocabulary::Conjunction(parts, true);
+	} else {
+		if (!join.condition) {
+			return Veto("a join without a condition");
+		}
+		// ON sees the tables joined so far -- a later one is DuckDB's binder
+		// error, not a statement for the server.
+		if (!WritePredicate(*join.condition, condition)) {
+			return false;
+		}
+	}
+	sql = left + keyword + right + " ON " + condition;
+	return true;
 }
 
 bool NodeWriter::CheckGrouped(idx_t index) {
@@ -535,7 +780,7 @@ bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind
 		out.type = arg.type;
 		out.kind = arg.kind;
 		out.column = arg.column;  // a constant compared with it is declared from the column
-		out.result_type = table_.types ? (*table_.types)[index] : arg.column->NativeDuckDBType();
+		out.result_type = types_[index];
 		out.orderable = true;
 		return true;
 	}
@@ -618,14 +863,16 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 		const auto read =
 			MSSQLColumnInfo::BuildReadExpression(column.name, column.sql_type_name, column.max_length,
 												 column.collation_name, options_.convert_varchar_max, "", "");
+		const auto &relation = relations_[relation_of_[index]];
 		list += MSSQLColumnInfo::BuildReadExpression(column.name, column.sql_type_name, column.max_length,
-													 column.collation_name, options_.convert_varchar_max, "", alias);
+													 column.collation_name, options_.convert_varchar_max,
+													 relation.sql.empty() ? "" : relation.sql + ".", alias);
 		OutputColumn entry;
 		entry.name = output;
 		entry.column_index = index;
 		entry.plain_read = read == QuoteIdentifier(column.name);
 		outputs_.push_back(std::move(entry));
-		out_.column_types.push_back(table_.types ? (*table_.types)[index] : column.NativeDuckDBType());
+		out_.column_types.push_back(types_[index]);
 		out_.cast_types.push_back(LogicalType::INVALID);
 		out_.column_names.push_back(output);
 		return true;
@@ -642,11 +889,23 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			if (aggregated_) {
 				return Veto("a * in an aggregate query");
 			}
-			if (!star.RelationName().empty() &&
-				!StringUtil::CIEquals(star.RelationName().GetIdentifierName(), relation_)) {
-				return Veto("a * of another relation");
+			// `*` lists every relation's columns in FROM order, a USING column
+			// once; `r.*` one relation's, all of them.
+			idx_t only = DConstants::INVALID_INDEX;
+			if (!star.RelationName().empty()) {
+				for (idx_t r = 0; r < relations_.size(); r++) {
+					if (StringUtil::CIEquals(star.RelationName().GetIdentifierName(), relations_[r].name)) {
+						only = r;
+					}
+				}
+				if (only == DConstants::INVALID_INDEX) {
+					return Veto("a * of another relation");
+				}
 			}
 			for (idx_t i = 0; i < columns_.size(); i++) {
+				if (only != DConstants::INVALID_INDEX ? relation_of_[i] != only : IsHiddenUsingColumn(i)) {
+					continue;
+				}
 				if (!add(i, "")) {
 					return false;
 				}
@@ -1562,10 +1821,9 @@ bool NodeWriter::WriteOrder(const OrderModifier &order, bool limited, std::strin
 			continue;
 		}
 		const auto &column = columns_[index];
-		// Qualified: a bare ORDER BY name in T-SQL is a select-list alias first
-		// (measured: `SELECT [id] AS [value] ... ORDER BY [value]` sorts by id),
-		// while DuckDB's resolution above already chose the table column.
-		const std::string column_ref = QuoteIdentifier(table_.name) + "." + QuoteIdentifier(column.name);
+		// Qualified (OrderColumnSql): DuckDB's resolution above already chose
+		// the table column, which a bare T-SQL name would not.
+		const std::string column_ref = OrderColumnSql(index);
 		std::string fragment;
 		// Under DISTINCT neither the bytes key nor the NULL-placing CASE is a
 		// result column (145): the key must be sent as it is.
@@ -1591,14 +1849,29 @@ bool NodeWriter::Write(const SelectNode &node) {
 	if (node.qualify || node.sample) {
 		return Veto("QUALIFY / USING SAMPLE");
 	}
-	if (!node.from_table || node.from_table->type != TableReferenceType::BASE_TABLE) {
-		return Veto("FROM is not one base table");
+	if (!node.from_table) {
+		return Veto("no FROM");
 	}
-	auto &from = node.from_table->Cast<BaseTableRef>();
-	if (from.sample || !from.column_name_alias.empty() || from.at_clause) {
-		return Veto("TABLESAMPLE / column aliases / AT on the table");
+	std::vector<idx_t> members;
+	if (!CollectRelations(*node.from_table, members)) {
+		return false;
 	}
-	relation_ = from.alias.empty() ? table_.name : from.alias.GetIdentifierName();
+	if (relations_.size() > 1) {
+		// A join: every relation under its own alias, every column qualified.
+		for (idx_t r = 0; r < relations_.size(); r++) {
+			relations_[r].sql = "[r" + std::to_string(r + 1) + "]";
+		}
+	}
+	for (idx_t i = 0; i < columns_.size(); i++) {
+		columns_[i].is_nullable = columns_[i].is_nullable || relations_[relation_of_[i]].nullable;
+	}
+	// The FROM first: a USING column is known before the select list names it.
+	std::string from_sql;
+	visible_ = 0;
+	if (!WriteFrom(*node.from_table, from_sql)) {
+		return false;
+	}
+	visible_ = DConstants::INVALID_INDEX;
 
 	const OrderModifier *order = nullptr;
 	const LimitModifier *limit = nullptr;
@@ -1671,7 +1944,7 @@ bool NodeWriter::Write(const SelectNode &node) {
 		}
 	}
 	after_grouping_ = false;
-	out_.statement += " FROM " + QuoteIdentifier(table_.schema) + "." + QuoteIdentifier(table_.name);
+	out_.statement += " FROM " + from_sql;
 	if (node.where_clause) {
 		std::string where;
 		if (!WritePredicate(*node.where_clause, where)) {
@@ -1717,16 +1990,7 @@ bool SQLWriter::Write(const QueryNode &node, WrittenQuery &out, std::string &why
 		return false;
 	}
 	auto &select = node.Cast<SelectNode>();
-	if (!select.from_table || select.from_table->type != TableReferenceType::BASE_TABLE) {
-		why = "FROM is not one base table";
-		return false;
-	}
-	WriterTable table;
-	if (!resolver_(select.from_table->Cast<BaseTableRef>(), table) || !table.columns) {
-		why = "the table does not resolve in this catalog";
-		return false;
-	}
-	NodeWriter writer(options_, table, out, why);
+	NodeWriter writer(options_, resolver_, out, why);
 	if (!writer.Write(select)) {
 		return false;
 	}
@@ -1771,6 +2035,20 @@ bool SQLWriter::PushesMoreThanScan(const QueryNode &node) {
 		return false;
 	}
 	auto &select = node.Cast<SelectNode>();
+	// A join with conditions: the server matches the rows, where the scans
+	// would each send their whole (filtered) table. A CROSS JOIN anywhere in
+	// the chain -- a comma join included -- can send the product, more rather
+	// than less, so it is a gain only with one of the others below.
+	bool joined = false;
+	bool crossed = false;
+	for (auto ref = select.from_table.get(); ref && ref->type == TableReferenceType::JOIN;
+		 ref = ref->Cast<JoinRef>().left.get()) {
+		joined = true;
+		crossed = crossed || ref->Cast<JoinRef>().ref_type == JoinRefType::CROSS;
+	}
+	if (joined && !crossed) {
+		return true;
+	}
 	if (!select.groups.group_expressions.empty() || !select.groups.grouping_sets.empty() || select.having ||
 		select.aggregate_handling != AggregateHandling::STANDARD_HANDLING) {
 		return true;

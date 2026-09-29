@@ -46,20 +46,33 @@ static std::vector<MSSQLColumnInfo> Columns() {
 	return columns;
 }
 
+//! A second table for joins: u(id int NOT NULL, t_id int NULL, label nvarchar(50) NULL, big bigint NULL).
+static std::vector<MSSQLColumnInfo> OtherColumns() {
+	std::vector<MSSQLColumnInfo> columns;
+	columns.emplace_back("id", 1, "int", 4, 10, 0, false, "", "SQL_Latin1_General_CP1_CI_AS");
+	columns.emplace_back("t_id", 2, "int", 4, 10, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
+	columns.emplace_back("label", 3, "nvarchar", 100, 0, 0, true, "SQL_Latin1_General_CP1_CI_AS",
+						 "SQL_Latin1_General_CP1_CI_AS");
+	columns.emplace_back("big", 4, "bigint", 8, 19, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
+	return columns;
+}
+
 static bool Write(const std::string &sql, WrittenQuery &out, std::string &why, bool parameterize = true) {
 	static const auto columns = Columns();
+	static const auto other = OtherColumns();
 	Parser parser;
 	parser.ParseQuery(sql);
 	auto &node = *parser.statements[0]->Cast<SelectStatement>().node;
 	SQLWriterOptions options;
 	options.parameterize = parameterize;
 	SQLWriter writer(options, [](const BaseTableRef &ref, WriterTable &table) {
-		if (ref.Table().GetIdentifierName() != "t") {
+		const auto &name = ref.Table().GetIdentifierName();
+		if (name != "t" && name != "u") {
 			return false;
 		}
 		table.schema = "dbo";
-		table.name = "t";
-		table.columns = &columns;
+		table.name = name;
+		table.columns = name == "t" ? &columns : &other;
 		return true;
 	});
 	return writer.Write(node, out, why);
@@ -313,8 +326,9 @@ int main() {
 	ExpectVeto("SELECT rowid FROM t LIMIT 1");
 	ExpectVeto("SELECT * EXCLUDE (id) FROM t LIMIT 1");
 	ExpectVeto("SELECT id, id FROM t LIMIT 1");
-	ExpectVeto("SELECT id FROM u LIMIT 1");
-	ExpectVeto("SELECT t.id FROM t, t AS u LIMIT 1");
+	ExpectVeto("SELECT id FROM w LIMIT 1");
+	ExpectSql("SELECT t.id FROM t, t AS u LIMIT 1",
+			  "SELECT TOP (1) [r1].[id] AS [id] FROM [dbo].[t] AS [r1] CROSS JOIN [dbo].[t] AS [r2]");
 	ExpectVeto("WITH c AS (SELECT 1) SELECT id FROM t LIMIT 1");
 	ExpectVeto("SELECT other.id FROM t LIMIT 1");
 
@@ -410,6 +424,61 @@ int main() {
 	ExpectVeto("SELECT DISTINCT ON (id) id, name FROM t");
 	ExpectVeto("SELECT DISTINCT avg(ratio) FROM t");
 
+	// Joins (PR D): every relation under its own alias, every column qualified.
+	ExpectSql("SELECT t.id, u.label FROM t JOIN u ON u.t_id = t.id",
+			  "SELECT [r1].[id] AS [id], [r2].[label] AS [label] FROM [dbo].[t] AS [r1] INNER JOIN [dbo].[u] AS [r2] "
+			  "ON ([r2].[t_id] = "
+			  "[r1].[id])");
+	ExpectSql("SELECT a.name, b.big FROM t AS a LEFT JOIN u AS b ON a.id = b.t_id WHERE a.id > 1",
+			  "SELECT [r1].[name] AS [name], [r2].[big] AS [big] FROM [dbo].[t] AS [r1] LEFT JOIN [dbo].[u] AS [r2] ON "
+			  "([r1].[id] = "
+			  "[r2].[t_id]) WHERE ([r1].[id] > @p0)");
+	ExpectSql(
+		"SELECT label, count(*) AS c FROM t JOIN u ON t.id = u.t_id GROUP BY label",
+		"SELECT [r2].[label] AS [label], COUNT_BIG(*) AS [c] FROM [dbo].[t] AS [r1] INNER JOIN [dbo].[u] AS [r2] ON "
+		"([r1].[id] = [r2].[t_id]) GROUP BY [r2].[label]");
+	// A self-join, told apart by aliases.
+	ExpectSql("SELECT a.id AS x, b.id AS y FROM t a JOIN t b ON a.id = b.id",
+			  "SELECT [r1].[id] AS [x], [r2].[id] AS [y] FROM [dbo].[t] AS [r1] INNER JOIN [dbo].[t] AS [r2] ON "
+			  "([r1].[id] = [r2].[id])");
+	// USING: one condition per column; the unqualified name is the left one,
+	// and `*` lists it once.
+	ExpectSql("SELECT id, label FROM t JOIN u USING (id)",
+			  "SELECT [r1].[id] AS [id], [r2].[label] AS [label] FROM [dbo].[t] AS [r1] INNER JOIN [dbo].[u] AS [r2] "
+			  "ON ([r1].[id] = "
+			  "[r2].[id])");
+	ExpectSql("SELECT u.* FROM t JOIN u USING (id)",
+			  "SELECT [r2].[id] AS [id], [r2].[t_id] AS [t_id], [r2].[label] AS [label], [r2].[big] AS [big] FROM "
+			  "[dbo].[t] AS [r1] INNER JOIN [dbo].[u] AS "
+			  "[r2] ON ([r1].[id] = [r2].[id])");
+	ExpectSql(
+		"SELECT t.id, name FROM t CROSS JOIN u LIMIT 1",
+		"SELECT TOP (1) [r1].[id] AS [id], [r1].[name] AS [name] FROM [dbo].[t] AS [r1] CROSS JOIN [dbo].[u] AS [r2]");
+	// An outer join's NULL-supplying side is nullable: its NOT NULL id needs
+	// the NULL placement a LIMIT allows.
+	ExpectSql("SELECT u.id FROM t LEFT JOIN u ON t.id = u.t_id ORDER BY u.id LIMIT 3",
+			  "SELECT TOP (3) [r2].[id] AS [id] FROM [dbo].[t] AS [r1] LEFT JOIN [dbo].[u] AS [r2] ON ([r1].[id] = "
+			  "[r2].[t_id]) ORDER BY CASE WHEN [r2].[id] IS NULL THEN 1 ELSE 0 END, [r2].[id] ASC");
+	ExpectVeto("SELECT u.id FROM t LEFT JOIN u ON t.id = u.t_id ORDER BY u.id");
+	ExpectSql(
+		"SELECT t.id FROM t JOIN u ON t.id = u.t_id ORDER BY t.id",
+		"SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] INNER JOIN [dbo].[u] AS [r2] ON ([r1].[id] = [r2].[t_id]) "
+		"ORDER BY [r1].[id] ASC");
+	ExpectVeto("SELECT id FROM t JOIN u ON t.id = u.t_id");	  // id is in both
+	ExpectVeto("SELECT * FROM t JOIN u ON t.id = u.t_id");	  // two result columns named id
+	ExpectVeto("SELECT t.id FROM t JOIN u ON t.id = u.big");  // int = bigint: promotions differ
+	ExpectVeto("SELECT t.id FROM t JOIN t ON t.id = t.id");	  // two tables named t
+	ExpectVeto("SELECT t.id FROM t NATURAL JOIN u");
+	ExpectVeto("SELECT t.id FROM t SEMI JOIN u ON t.id = u.t_id");	// D3
+	ExpectVeto("SELECT t.id FROM t ASOF JOIN u ON t.id >= u.t_id");
+	ExpectVeto("SELECT t.id FROM t POSITIONAL JOIN u");
+	ExpectVeto("SELECT id FROM t RIGHT JOIN u USING (id)");
+	ExpectVeto("SELECT id FROM t FULL JOIN u USING (id)");
+	ExpectVeto("SELECT t.id FROM t JOIN (u JOIN t AS x ON u.t_id = x.id) ON t.id = u.t_id");
+	ExpectVeto("SELECT t.id FROM t JOIN (SELECT * FROM u) s ON t.id = s.t_id");
+	ExpectVeto("SELECT t.id FROM t JOIN v ON t.id = v.id");								  // not this catalog's
+	ExpectVeto("SELECT t.id FROM t JOIN u ON t.id = x.id JOIN t AS x ON x.id = u.t_id");  // ON names a later table
+
 	// The gain rule: a node the catalog scan serves as well stays with it.
 	ExpectGain("SELECT * FROM t", false);
 	ExpectGain("SELECT id FROM t WHERE id = 1", false);
@@ -419,6 +488,10 @@ int main() {
 	ExpectGain("SELECT count(*) FROM t", true);
 	ExpectGain("SELECT id FROM t GROUP BY id", true);
 	ExpectGain("SELECT id + 1 FROM t WHERE id > 1", false);
+	ExpectGain("SELECT t.id FROM t JOIN u ON t.id = u.t_id", true);
+	ExpectGain("SELECT t.id FROM t CROSS JOIN u", false);
+	ExpectGain("SELECT t.id FROM t JOIN u ON t.id = u.t_id CROSS JOIN t AS z", false);
+	ExpectGain("SELECT t.id FROM t, u WHERE t.id = u.t_id", false);
 
 	// column_types spells the collation that ToString leaves out.
 	auto columns = Columns();
