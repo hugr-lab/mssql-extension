@@ -741,14 +741,21 @@ void TestUnreachableRoutedTargetFails() {
 	// the connect is REFUSED immediately.
 	//
 	// The tempting alternative -- keep a socket bound but never listen(), so the
-	// port cannot be reassigned -- is wrong on macOS: measured here, connecting
-	// to a bound-but-unlistening 127.0.0.1 port does NOT get an RST, the SYN is
-	// dropped and connect() sits for ~7.8s. That is a Linux behaviour, not a
-	// portable one. So the port is freed, and the premise the test rests on
-	// ("nothing is listening there") is enforced by assertion instead: if the
-	// kernel handed the gateway that same port, the gateway would route to
-	// itself and this would fail with the hop-limit message, pointing at the
-	// wrong code.
+	// port cannot be reassigned -- is NOT portable. Connecting to a
+	// bound-but-unlistening 127.0.0.1 port, measured on both platforms (spec
+	// 081's dial probe):
+	//
+	//     Linux: RST -- connect() fails with ECONNREFUSED in 0 ms.
+	//     macOS: no RST -- the SYN is dropped and connect() sits for ~7.8 s.
+	//
+	// So relying on that immediate refusal means relying on LINUX's behaviour.
+	// On macOS the same trick would silently exercise the TIMEOUT branch while
+	// claiming to test this one.
+	//
+	// The port is freed instead, and the premise the test rests on ("nothing is
+	// listening there") is enforced by assertion: if the kernel handed the
+	// gateway that same port, the gateway would route to itself and this would
+	// fail with the hop-limit message, pointing at the wrong code.
 	uint16_t dead_port = 0;
 	{
 		FakeTdsServer doomed([](int) { return LoginAckStream(); });
