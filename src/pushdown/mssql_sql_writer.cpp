@@ -13,6 +13,7 @@
 #include <cstdio>
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/decimal.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
@@ -20,6 +21,7 @@
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/type_expression.hpp"
@@ -45,6 +47,10 @@ SQLWriterOptions SQLWriterOptions::FromContext(ClientContext &context) {
 	SQLWriterOptions options;
 	options.convert_varchar_max = LoadConvertVarcharMax(context);
 	options.parameterize = LoadScanParameterizeFilters(context);
+	Value division_errors;
+	if (context.TryGetCurrentSetting("error_on_division_by_zero", division_errors) && !division_errors.IsNull()) {
+		options.division_by_zero_errors = division_errors.GetValue<bool>();
+	}
 	auto &config = DBConfig::GetConfig(context);
 	options.default_order = config.ResolveOrder(context, OrderType::ORDER_DEFAULT);
 	options.default_null_order_asc =
@@ -102,8 +108,42 @@ bool BuiltinTypeOf(const TypeExpression &type, LogicalTypeId &out) {
 
 struct OutputColumn {
 	std::string name;	 // the name DuckDB gives the result column
-	idx_t column_index;	 // into the table's columns
+	idx_t column_index;	 // into the table's columns; INVALID for a computed one
 };
+
+//! An operand of an expression the writer renders, with what its type rules
+//! need. A constant has no type of its own in the parsed tree -- the binder
+//! gives it one from what it meets -- so it waits (`constant`) until its peer
+//! is known, and is then typed as DuckDB would type it or vetoed.
+struct Operand {
+	std::string sql;
+	//! Its DuckDB type; INVALID when the writer cannot know it for sure (a
+	//! decimal product: DuckDB's and the server's scales differ).
+	LogicalType type;
+	//! How a constant compared with / combined with it is typed.
+	ComparableKind kind = ComparableKind::None;
+	//! The table column it IS, for a plain column reference.
+	const MSSQLColumnInfo *column = nullptr;
+	//! An untyped constant, awaiting its peer.
+	const ParsedExpression *constant = nullptr;
+};
+
+//! Integer and exact-decimal types that arithmetic keeps as they are on both
+//! sides: same-type operands give that type, overflow an error on both
+//! (measured: tinyint UTINYINT, smallint, int, bigint; decimal(10,2) +
+//! decimal(10,2) is DECIMAL(11,2) on both).
+bool IsArithmeticType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::DECIMAL:
+		return true;
+	default:
+		return false;
+	}
+}
 
 class NodeWriter {
 public:
@@ -125,8 +165,16 @@ private:
 	bool WriteSelectList(const SelectNode &node);
 	bool WritePredicate(const ParsedExpression &expr, std::string &sql);
 	bool WriteComparison(const ComparisonExpression &cmp, std::string &sql);
-	bool ConstantFor(const MSSQLColumnInfo &column, const ParsedExpression &expr, Value &out);
-	std::string Parameter(const MSSQLColumnInfo &column, const Value &value);
+	bool ConstantFor(ComparableKind kind, const LogicalType &target, const std::string &peer_name,
+					 const ParsedExpression &expr, Value &out);
+	std::string Parameter(const MSSQLColumnInfo *column, const Value &value);
+	//! A value: a column, a constant (left untyped, see Operand), or an
+	//! arithmetic expression over them.
+	bool WriteValue(const ParsedExpression &expr, Operand &out);
+	bool WriteArithmetic(const FunctionExpression &fn, Operand &out);
+	//! Types `constant` from `peer` and renders it. An operand of arithmetic
+	//! keeps its type in literal form too (see the definition).
+	bool BindConstant(const Operand &peer, Operand &constant, bool arithmetic = false);
 	//! A column in WHERE / ORDER BY. One table: its bare name, whose meaning
 	//! is the column's (collation, type). A join will qualify it here.
 	std::string ColumnSql(idx_t index) const {
@@ -237,6 +285,33 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			}
 			break;
 		}
+		case ExpressionClass::FUNCTION: {
+			// A computed column: rendered by the same rules as WHERE, named as
+			// DuckDB names it (the alias, else the expression's text), typed by
+			// the server's describe -- the spec's "types of a pushed query are the
+			// server's" (column_types '' for it).
+			Operand value;
+			if (!WriteValue(*item, value)) {
+				return false;
+			}
+			const std::string output = item->GetName().GetIdentifierName();
+			if (output.size() > 128) {
+				// SQL Server refuses a longer identifier (103); DuckDB does not.
+				return Veto("a result column name longer than 128 characters");
+			}
+			for (auto &existing : outputs_) {
+				if (StringUtil::CIEquals(existing.name, output)) {
+					return Veto("two result columns are named " + output);
+				}
+			}
+			if (!list.empty()) {
+				list += ", ";
+			}
+			list += value.sql + " AS " + QuoteIdentifier(output);
+			outputs_.push_back(OutputColumn{output, DConstants::INVALID_INDEX});
+			out_.column_types.push_back(LogicalType::INVALID);
+			break;
+		}
 		default:
 			return Veto("select-list expression " + item->ToString());
 		}
@@ -245,12 +320,11 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 	return true;
 }
 
-bool NodeWriter::ConstantFor(const MSSQLColumnInfo &column, const ParsedExpression &expr, Value &out) {
-	const auto kind = KindOf(column);
-	if (kind == ComparableKind::None) {
-		return Veto("column " + column.name + " (" + column.sql_type_name + ") is not compared on the server");
+bool NodeWriter::ConstantFor(ComparableKind kind, const LogicalType &target, const std::string &peer_name,
+							 const ParsedExpression &expr, Value &out) {
+	if (kind == ComparableKind::None || target.id() == LogicalTypeId::INVALID) {
+		return Veto(peer_name + " is not compared with a constant on the server");
 	}
-	const auto &target = column.duckdb_type;
 	if (expr.GetExpressionClass() == ExpressionClass::CAST) {
 		// A typed literal: DuckDB compares in the cast's type, which must be the
 		// column's own for the server's comparison to be the same one.
@@ -258,11 +332,11 @@ bool NodeWriter::ConstantFor(const MSSQLColumnInfo &column, const ParsedExpressi
 		LogicalTypeId id;
 		if (cast.IsTryCast() || !BuiltinTypeOf(cast.TargetType(), id) || id != target.id() ||
 			target.id() == LogicalTypeId::DECIMAL || cast.Child().GetExpressionClass() != ExpressionClass::CONSTANT) {
-			return Veto("constant " + expr.ToString() + " against " + column.name);
+			return Veto("constant " + expr.ToString() + " against " + peer_name);
 		}
 		auto &literal = cast.Child().Cast<ConstantExpression>().GetLiteral();
 		if (literal.kind != LiteralKind::STRING) {
-			return Veto("constant " + expr.ToString() + " against " + column.name);
+			return Veto("constant " + expr.ToString() + " against " + peer_name);
 		}
 		auto cast_value = Value(literal.text).DefaultTryCastAs(target, nullptr, true);
 		if (!cast_value) {
@@ -293,7 +367,7 @@ bool NodeWriter::ConstantFor(const MSSQLColumnInfo &column, const ParsedExpressi
 	case LiteralKind::INTEGER:
 	case LiteralKind::NUMERIC: {
 		if (kind != ComparableKind::ExactNumeric) {
-			return Veto("numeric constant against " + column.name + " (" + column.sql_type_name + ")");
+			return Veto("numeric constant against " + peer_name);
 		}
 		// DuckDB compares in the wider of the two types; the server compares in
 		// the column's. They agree exactly when the constant survives the trip
@@ -302,37 +376,183 @@ bool NodeWriter::ConstantFor(const MSSQLColumnInfo &column, const ParsedExpressi
 		const Value original = literal.ToValue();
 		auto cast_value = original.DefaultTryCastAs(target, nullptr, true);
 		if (!cast_value) {
-			return Veto("constant " + literal.text + " does not fit " + column.name);
+			return Veto("constant " + literal.text + " does not fit " + peer_name);
 		}
 		auto back = cast_value->DefaultTryCastAs(original.type(), nullptr, true);
 		if (!back || !Value::NotDistinctFrom(*back, original)) {
-			return Veto("constant " + literal.text + " is not exact in " + column.name);
+			return Veto("constant " + literal.text + " is not exact in " + peer_name);
 		}
 		out = std::move(*cast_value);
 		return true;
 	}
 	case LiteralKind::BOOLEAN:
 		if (kind != ComparableKind::Boolean) {
-			return Veto("boolean constant against " + column.name);
+			return Veto("boolean constant against " + peer_name);
 		}
 		out = literal.ToValue();
 		return true;
 	default:
-		return Veto("constant " + expr.ToString() + " against " + column.name);
+		return Veto("constant " + expr.ToString() + " against " + peer_name);
 	}
 }
 
-std::string NodeWriter::Parameter(const MSSQLColumnInfo &column, const Value &value) {
+std::string NodeWriter::Parameter(const MSSQLColumnInfo *column, const Value &value) {
 	// The vocabulary's constant: @pN declared from the column it is compared
-	// with (076 / #361), or a literal. The vehicle carries each parameter's
-	// VALUE (mssql_scan_params renders its own literal), kept beside the set.
+	// with (076 / #361) -- or, against an expression, from its own value,
+	// already cast to the expression's type -- or a literal. The vehicle
+	// carries each parameter's VALUE (mssql_scan_params renders its own
+	// literal), kept beside the set.
 	const size_t before = params_.params.size();
 	std::string sql =
-		ExpressionVocabulary::Constant(value, value.type(), options_.parameterize ? &params_ : nullptr, &column);
+		ExpressionVocabulary::Constant(value, value.type(), options_.parameterize ? &params_ : nullptr, column);
 	if (params_.params.size() > before) {
 		param_values_.push_back(value);
 	}
 	return sql;
+}
+
+bool NodeWriter::BindConstant(const Operand &peer, Operand &constant, bool arithmetic) {
+	const std::string peer_name = peer.column ? peer.column->name : peer.sql;
+	Value value;
+	if (!ConstantFor(peer.kind, peer.type, peer_name, *constant.constant, value)) {
+		return false;
+	}
+	if (value.IsNull()) {
+		return Veto("a NULL constant");
+	}
+	const size_t before = params_.params.size();
+	constant.sql = Parameter(peer.column, value);
+	if (arithmetic && params_.params.size() == before) {
+		// A literal's type is the server's own reading of it -- `1` an int,
+		// `3000000000` a numeric(10,0) -- so `tiny + 1` would widen there where
+		// DuckDB keeps UTINYINT and overflows at 255, and `big + 3000000000`
+		// turn numeric. A parameter is declared from the column; a literal must
+		// say its type itself.
+		std::string declaration;
+		try {
+			declaration = DeclarationForValue("p", value.type(), value);
+		} catch (const std::exception &) {
+			return Veto("constant " + value.ToString() + " has no T-SQL type");
+		}
+		constant.sql = "CAST(" + constant.sql + " AS " + declaration + ")";
+	}
+	constant.type = value.type();
+	constant.kind = peer.kind;
+	constant.constant = nullptr;
+	return true;
+}
+
+bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
+	out = Operand();
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::COLUMN_REF: {
+		idx_t index;
+		if (!ResolveColumn(expr.Cast<ColumnRefExpression>(), index)) {
+			return false;
+		}
+		const auto &column = columns_[index];
+		out.sql = ColumnSql(index);
+		out.type = column.duckdb_type;
+		out.kind = KindOf(column);
+		out.column = &column;
+		return true;
+	}
+	case ExpressionClass::CONSTANT:
+	case ExpressionClass::CAST:
+		// A constant, or the rewriter's folded typed literal: typed by its peer.
+		out.constant = &expr;
+		return true;
+	case ExpressionClass::FUNCTION:
+		return WriteArithmetic(expr.Cast<FunctionExpression>(), out);
+	default:
+		return Veto("value " + expr.ToString());
+	}
+}
+
+bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
+	const auto &name = fn.FunctionName().GetIdentifierName();
+	const auto &args = fn.GetArguments();
+	const bool binary = args.size() == 2 && (name == "+" || name == "-" || name == "*" || name == "%");
+	const bool unary_minus = args.size() == 1 && name == "-";
+	if (!binary && !unary_minus) {
+		return Veto("function " + fn.ToString());
+	}
+	if (name == "%" && !options_.division_by_zero_errors) {
+		// DuckDB then gives NULL for `x % 0`, the server error 8134.
+		return Veto("% with error_on_division_by_zero = false");
+	}
+	std::vector<Operand> operands(args.size());
+	for (idx_t i = 0; i < args.size(); i++) {
+		if (!WriteValue(args[i].GetExpression(), operands[i])) {
+			return false;
+		}
+	}
+	if (unary_minus) {
+		auto &operand = operands[0];
+		// UTINYINT has no negative values in DuckDB; the server's tinyint
+		// negation widens. Constants never get here: the rewriter folds them.
+		if (operand.constant || operand.kind != ComparableKind::ExactNumeric ||
+			operand.type.id() == LogicalTypeId::UTINYINT || !IsArithmeticType(operand.type)) {
+			return Veto("negation " + fn.ToString());
+		}
+		std::string why;
+		auto mapping = ExpressionVocabulary::FunctionFor("negate", {operand.type}, why);
+		if (!mapping) {
+			return Veto(why);
+		}
+		out.sql = ExpressionVocabulary::ApplyFunction(*mapping, {operand.sql});
+		out.type = operand.type;
+		out.kind = ComparableKind::ExactNumeric;
+		return true;
+	}
+	auto &left = operands[0];
+	auto &right = operands[1];
+	if (left.constant && right.constant) {
+		return Veto("arithmetic on two constants " + fn.ToString());
+	}
+	if (left.constant && !BindConstant(right, left, true)) {
+		return false;
+	}
+	if (right.constant && !BindConstant(left, right, true)) {
+		return false;
+	}
+	// Same type on both sides, or the promotions differ: DuckDB widens
+	// smallint + int to INTEGER, the server by its own precedence.
+	if (left.kind != ComparableKind::ExactNumeric || right.kind != ComparableKind::ExactNumeric ||
+		!IsArithmeticType(left.type) || left.type != right.type) {
+		return Veto("arithmetic over " + left.type.ToString() + " and " + right.type.ToString());
+	}
+	std::string why;
+	auto mapping = ExpressionVocabulary::FunctionFor(name, {left.type, right.type}, why);
+	if (!mapping) {
+		return Veto(why);
+	}
+	out.sql = ExpressionVocabulary::ApplyFunction(*mapping, {left.sql, right.sql});
+	out.kind = ComparableKind::ExactNumeric;
+	if (left.type.id() != LogicalTypeId::DECIMAL) {
+		out.type = left.type;
+	} else if (name == "+" || name == "-") {
+		// DECIMAL(w,s) +/- DECIMAL(w,s) is DECIMAL(w+1,s) on both (measured) --
+		// below 38. At 38 the server's result would need 39 digits, and past 38
+		// it reduces the SCALE (rounding the value) where DuckDB stays exact.
+		const auto width = DecimalType::GetWidth(left.type);
+		if (width >= 38) {
+			return Veto("decimal arithmetic at width 38");
+		}
+		out.type = LogicalType::DECIMAL(width + 1, DecimalType::GetScale(left.type));
+	} else {
+		// A product: DECIMAL(18,4) here, decimal(21,4) there for (10,2) * (10,2)
+		// -- the value agrees while the server's precision p1 + p2 + 1 fits 38.
+		// Past it the server reduces the scale and ROUNDS (measured: (19,4) *
+		// (19,4) is decimal(38,7) there, DECIMAL(38,8) here), so that is vetoed.
+		// The type differs either way, so nothing is compared with a product.
+		if (2 * DecimalType::GetWidth(left.type) + 1 > 38) {
+			return Veto("a decimal product wider than 38 digits");
+		}
+		out.type = LogicalType::INVALID;
+		out.kind = ComparableKind::None;
+	}
+	return true;
 }
 
 bool NodeWriter::WriteComparison(const ComparisonExpression &cmp, std::string &sql) {
@@ -340,36 +560,27 @@ bool NodeWriter::WriteComparison(const ComparisonExpression &cmp, std::string &s
 	if (!ExpressionVocabulary::ComparisonOperator(cmp.GetExpressionType(), op)) {
 		return Veto("comparison " + cmp.ToString());
 	}
-	const ParsedExpression *column_side = &cmp.Left();
-	const ParsedExpression *constant_side = &cmp.Right();
-	bool flipped = false;
-	if (column_side->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
-		std::swap(column_side, constant_side);
-		flipped = true;
+	Operand left;
+	Operand right;
+	if (!WriteValue(cmp.Left(), left) || !WriteValue(cmp.Right(), right)) {
+		return false;
 	}
-	if (column_side->GetExpressionClass() != ExpressionClass::COLUMN_REF ||
-		constant_side->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-		// Column against column waits for the typed operands of a later step:
-		// two string columns under different collations are a server error
-		// (468), and the type mixes need the constant rules' care.
+	if (left.constant && right.constant) {
+		return Veto("comparison of two constants " + cmp.ToString());
+	}
+	if (!left.constant && !right.constant) {
+		// Value against value waits for its own step: two string columns under
+		// different collations are a server error (468), and the type mixes
+		// need the constant rules' care.
 		return Veto("comparison " + cmp.ToString());
 	}
-	idx_t index;
-	if (!ResolveColumn(column_side->Cast<ColumnRefExpression>(), index)) {
+	if (left.constant && !BindConstant(right, left)) {
 		return false;
 	}
-	const auto &column = columns_[index];
-	Value value;
-	if (!ConstantFor(column, *constant_side, value)) {
+	if (right.constant && !BindConstant(left, right)) {
 		return false;
 	}
-	if (value.IsNull()) {
-		return Veto("comparison with NULL");
-	}
-	const std::string column_sql = ColumnSql(index);
-	const std::string constant_sql = Parameter(column, value);
-	sql = flipped ? ExpressionVocabulary::Comparison(op, constant_sql, column_sql)
-				  : ExpressionVocabulary::Comparison(op, column_sql, constant_sql);
+	sql = ExpressionVocabulary::Comparison(op, left.sql, right.sql);
 	return true;
 }
 
@@ -455,11 +666,17 @@ bool NodeWriter::WriteOrder(const OrderModifier &order, bool limited, std::strin
 				return Veto("ORDER BY " + key.ToString());
 			}
 			index = outputs_[position - 1].column_index;
+			if (index == DConstants::INVALID_INDEX) {
+				return Veto("ORDER BY a computed column");
+			}
 		} else if (key.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &ref = key.Cast<ColumnRefExpression>();
 			if (!ref.IsQualified()) {
 				for (auto &output : outputs_) {
 					if (StringUtil::CIEquals(output.name, ref.GetColumnName().GetIdentifierName())) {
+						if (output.column_index == DConstants::INVALID_INDEX) {
+							return Veto("ORDER BY a computed column");
+						}
 						index = output.column_index;
 						break;
 					}
@@ -601,6 +818,10 @@ bool SQLWriter::Write(const QueryNode &node, WrittenQuery &out, std::string &why
 }
 
 std::string ColumnTypeName(const LogicalType &type) {
+	if (type.id() == LogicalTypeId::INVALID) {
+		// A computed column: '' leaves the vehicle the type the server describes.
+		return std::string();
+	}
 	codec::TargetStringType spec;
 	if (!codec::TryGetTargetStringType(type, spec)) {
 		return type.ToString();

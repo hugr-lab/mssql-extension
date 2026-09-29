@@ -35,6 +35,8 @@ static std::vector<MSSQLColumnInfo> Columns() {
 	columns.emplace_back("ts", 7, "datetime2", 8, 27, 7, true, "", "SQL_Latin1_General_CP1_CI_AS");
 	columns.emplace_back("legacy", 8, "varchar", 30, 0, 0, true, "SQL_Latin1_General_CP1_CI_AS",
 						 "SQL_Latin1_General_CP1_CI_AS");
+	columns.emplace_back("wide", 9, "decimal", 17, 38, 10, true, "", "SQL_Latin1_General_CP1_CI_AS");
+	columns.emplace_back("mid", 10, "decimal", 9, 19, 4, true, "", "SQL_Latin1_General_CP1_CI_AS");
 	return columns;
 }
 
@@ -110,7 +112,7 @@ int main() {
 	ExpectSql("SELECT id AS id FROM t LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 	ExpectSql("SELECT * FROM t LIMIT 1",
 			  "SELECT TOP (1) [id], [name], [code], [amount], [day], [flag], [ts], CAST([legacy] AS NVARCHAR(30)) AS "
-			  "[legacy] FROM [dbo].[t]");
+			  "[legacy], [wide], [mid] FROM [dbo].[t]");
 	ExpectSql("SELECT q.id FROM t AS q LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 
 	// WHERE: constants are parameters declared from the column.
@@ -173,9 +175,38 @@ int main() {
 	ExpectSql("SELECT id FROM t OFFSET 2", "SELECT [id] FROM [dbo].[t] ORDER BY (SELECT NULL) OFFSET 2 ROWS");
 	ExpectVeto("SELECT id FROM t LIMIT 10%");
 
+	// Arithmetic: same-type operands keep their type on both sides; a constant
+	// is typed from its peer, as the binder types it.
+	ExpectSql("SELECT id + 1 FROM t LIMIT 1", "SELECT TOP (1) ([id] + @p0) AS [(id + 1)] FROM [dbo].[t]");
+	ExpectParams("SELECT id + 1 FROM t LIMIT 1", "@p0 int");
+	ExpectSql("SELECT id * 2 AS x FROM t LIMIT 1", "SELECT TOP (1) ([id] * @p0) AS [x] FROM [dbo].[t]");
+	ExpectSql("SELECT -id AS n FROM t LIMIT 1", "SELECT TOP (1) (-[id]) AS [n] FROM [dbo].[t]");
+	ExpectSql("SELECT id FROM t WHERE id + 1 > 5 LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([id] + @p0) > @p1)");
+	ExpectSql("SELECT id FROM t WHERE id % 2 = 0 LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([id] % @p0) = @p1)");
+	ExpectSql("SELECT amount + amount AS d FROM t LIMIT 1",
+			  "SELECT TOP (1) ([amount] + [amount]) AS [d] FROM [dbo].[t]");
+	ExpectSql("SELECT id FROM t WHERE amount + 1 > 2 LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([amount] + @p0) > @p1)");
+	ExpectSql("SELECT id + 1 FROM t LIMIT 1", "SELECT TOP (1) ([id] + CAST(1 AS int)) AS [(id + 1)] FROM [dbo].[t]",
+			  false);
+	ExpectVeto("SELECT wide + wide FROM t LIMIT 1");  // width 38: the server would round
+	ExpectVeto("SELECT mid * mid FROM t LIMIT 1");	  // p1 + p2 + 1 > 38: the server reduces the scale
+	ExpectSql("SELECT amount * amount AS p FROM t LIMIT 1",
+			  "SELECT TOP (1) ([amount] * [amount]) AS [p] FROM [dbo].[t]");
+	ExpectVeto("SELECT id + amount FROM t LIMIT 1");				   // int + decimal: the promotions differ
+	ExpectVeto("SELECT id + 2.5 FROM t LIMIT 1");					   // not exact in int
+	ExpectVeto("SELECT name + 1 FROM t LIMIT 1");					   // not a number
+	ExpectVeto("SELECT amount % 2 FROM t LIMIT 1");					   // T-SQL % takes integers only (8117)
+	ExpectVeto("SELECT id FROM t WHERE amount * amount > 1 LIMIT 1");  // a decimal product's type differs
+	ExpectVeto("SELECT -code FROM t LIMIT 1");
+	ExpectVeto("SELECT id + 1 AS x FROM t ORDER BY x LIMIT 1");	 // ORDER BY a computed column
+	ExpectVeto("SELECT id + 1 FROM t ORDER BY 1 LIMIT 1");
+	ExpectVeto("SELECT abs(id) FROM t LIMIT 1");  // functions: a later step
+
 	// Everything outside PR B's vocabulary is a veto, never a guess.
 	ExpectVeto("SELECT rowid FROM t LIMIT 1");
-	ExpectVeto("SELECT id + 1 FROM t LIMIT 1");
 	ExpectVeto("SELECT DISTINCT id FROM t LIMIT 1");
 	ExpectVeto("SELECT id, count(*) FROM t GROUP BY id LIMIT 1");
 	ExpectVeto("SELECT * EXCLUDE (id) FROM t LIMIT 1");
@@ -196,6 +227,10 @@ int main() {
 	auto legacy = ColumnTypeName(columns[7].NativeDuckDBType());
 	if (legacy != "MSSQL_VARCHAR(30, 'SQL_Latin1_General_CP1_CI_AS')") {
 		std::cerr << "FAIL: ColumnTypeName(legacy) = " << legacy << "\n";
+		failures++;
+	}
+	if (!ColumnTypeName(LogicalType::INVALID).empty()) {
+		std::cerr << "FAIL: ColumnTypeName(INVALID) is not empty\n";
 		failures++;
 	}
 	if (ColumnTypeName(columns[6].duckdb_type) != "TIMESTAMP_NS") {

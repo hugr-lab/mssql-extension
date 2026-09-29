@@ -43,13 +43,14 @@ SELECT mssql_exec('rp_off', 'DROP TABLE IF EXISTS dbo.rp_t;
 		amount decimal(10,2) NULL,
 		day date NULL,
 		ts datetime2(7) NULL,
-		g geometry NULL);
+		g geometry NULL,
+		tiny tinyint NULL);
 	INSERT INTO dbo.rp_t VALUES
-		(1, 30, N''alpha'', ''b'', ''caf'' + CHAR(233), 1.50, ''2024-01-01'', ''2024-01-01 00:00:00.1234567'', geometry::STGeomFromText(''POINT (1 2)'', 0)),
-		(2, NULL, N''Beta'', ''a'', ''plain'', 2.00, ''2024-02-01'', ''2024-02-01 00:00:00.0000001'', NULL),
-		(3, 10, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-		(4, 20, N''gamma'', ''B'', ''x'', 4.25, ''2024-04-01'', ''2024-04-01 12:00:00'', geometry::STGeomFromText(''POINT (3 4)'', 0)),
-		(5, NULL, N''delta'', ''ab'', ''y'', 5.00, ''2024-05-01'', ''2024-05-01 00:00:00.9999999'', NULL)');
+		(1, 30, N''alpha'', ''b'', ''caf'' + CHAR(233), 1.50, ''2024-01-01'', ''2024-01-01 00:00:00.1234567'', geometry::STGeomFromText(''POINT (1 2)'', 0), 255),
+		(2, NULL, N''Beta'', ''a'', ''plain'', 2.00, ''2024-02-01'', ''2024-02-01 00:00:00.0000001'', NULL, 1),
+		(3, 10, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+		(4, 20, N''gamma'', ''B'', ''x'', 4.25, ''2024-04-01'', ''2024-04-01 12:00:00'', geometry::STGeomFromText(''POINT (3 4)'', 0), 7),
+		(5, NULL, N''delta'', ''ab'', ''y'', 5.00, ''2024-05-01'', ''2024-05-01 00:00:00.9999999'', NULL, 0)');
 
 statement ok
 CREATE TABLE loc AS SELECT 99 AS id;
@@ -340,6 +341,79 @@ EXECUTE rp_q;
 
 statement ok
 DEALLOCATE rp_q;
+
+#
+# Arithmetic (PR C): same-type operands keep their type on both sides, a
+# constant is typed from its peer, a computed column is named as DuckDB names
+# it and typed by the server's describe.
+#
+
+query II
+EXPLAIN SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_on.dbo.rp_t WHERE n * 2 > 15 ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*\(\[n\] \+ @p0\) AS \[\(n \+ 1\)\], \(\[amount\] \+ \[amount\]\) AS \[twice\], \(-\[n\]\) AS \[neg\], \(\[n\] % @p1\) AS \[m\].*WHERE \(\(\[n\] \* @p2\) > @p3\).*
+
+statement ok
+CREATE TEMP TABLE ar_on AS SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_on.dbo.rp_t WHERE n * 2 > 15 ORDER BY id LIMIT 10;
+
+statement ok
+CREATE TEMP TABLE ar_off AS SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_off.dbo.rp_t WHERE n * 2 > 15 ORDER BY id LIMIT 10;
+
+query IIIII
+SELECT * FROM ar_on ORDER BY id;
+----
+1	31	3.00	-30	2
+3	11	NULL	-10	3
+4	21	8.50	-20	6
+
+query I
+SELECT count(*) FROM (SELECT * FROM ar_on EXCEPT ALL SELECT * FROM ar_off);
+----
+0
+
+# The same names and the same types on both paths.
+query TT
+SELECT a.column_name, a.data_type FROM duckdb_columns() a JOIN duckdb_columns() b USING (column_name)
+WHERE a.table_name = 'ar_on' AND b.table_name = 'ar_off' AND a.data_type = b.data_type ORDER BY a.column_index;
+----
+id	INTEGER
+(n + 1)	INTEGER
+twice	DECIMAL(11,2)
+neg	INTEGER
+m	INTEGER
+
+# Overflow is an error on both paths: tinyint + tinyint stays tinyint.
+query II
+EXPLAIN SELECT id, tiny + 1 FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*\(\[tiny\] \+ @p0\).*
+
+statement error
+SELECT id, tiny + 1 FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+<REGEX>:.*8115.*overflow.*tinyint.*
+
+statement error
+SELECT id, tiny + 1 FROM rp_off.dbo.rp_t ORDER BY id LIMIT 1;
+----
+<REGEX>:.*Overflow.*
+
+# Vetoes: mixed types (the promotions differ), a decimal product compared
+# (its type differs), % on a decimal (T-SQL rejects it).
+query II
+EXPLAIN SELECT id, n + amount FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE amount * amount > 1 ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT id, amount % 2 FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
 
 #
 # Types: a pushed SELECT reports the catalog's column types, read into them

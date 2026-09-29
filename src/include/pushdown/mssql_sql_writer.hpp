@@ -70,6 +70,9 @@ struct SQLWriterOptions {
 	bool convert_varchar_max = true;
 	//! mssql_scan_parameterize_filters: constants as @pN, or literals.
 	bool parameterize = true;
+	//! DuckDB's (deprecated) error_on_division_by_zero: false makes `x % 0`
+	//! NULL here where the server raises 8134, so `%` is then not pushed.
+	bool division_by_zero_errors = true;
 	//! The session's default_order / default_null_order, resolved.
 	OrderType default_order = OrderType::ASCENDING;
 	OrderByNullType default_null_order_asc = OrderByNullType::NULLS_LAST;
@@ -107,7 +110,8 @@ private:
 
 //! A type as `column_types` spells it: its ToString, except the MSSQL string
 //! types, whose collation ToString leaves out (`MSSQL_VARCHAR(50,
-//! 'SQL_Latin1_General_CP1_CI_AS')`, spec 060's cast syntax).
+//! 'SQL_Latin1_General_CP1_CI_AS')`, spec 060's cast syntax). '' for INVALID,
+//! a computed column, whose type is the server's describe.
 std::string ColumnTypeName(const LogicalType &type);
 
 //! Count one statement the rewriter pushed (MSSQL_COUNTERS / MSSQL_DEBUG
