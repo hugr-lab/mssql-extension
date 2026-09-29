@@ -20,6 +20,7 @@
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
+#include "pushdown/mssql_expression_vocabulary.hpp"
 
 namespace duckdb {
 struct MSSQLColumnInfo;
@@ -34,14 +35,6 @@ namespace mssql {
 //------------------------------------------------------------------------------
 // Result Structures
 //------------------------------------------------------------------------------
-
-/**
- * Result of encoding a single expression or filter.
- */
-struct ExpressionEncodeResult {
-	std::string sql;  // T-SQL fragment (empty if not supported)
-	bool supported;	  // True if expression was fully encoded
-};
 
 /**
  * Result of encoding an entire filter set.
