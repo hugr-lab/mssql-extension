@@ -115,18 +115,18 @@ int main() {
 
 	// WHERE: constants are parameters declared from the column.
 	ExpectSql("SELECT id FROM t WHERE id = 5 AND (name = 'a' OR NOT flag = true) LIMIT 2",
-			  "SELECT TOP (2) [id] FROM [dbo].[t] WHERE ([id] = @p1 AND ([name] = @p2 OR (NOT [flag] = @p3)))");
+			  "SELECT TOP (2) [id] FROM [dbo].[t] WHERE (([id] = @p0) AND (([name] = @p1) OR (NOT ([flag] = @p2))))");
 	ExpectParams("SELECT id FROM t WHERE id = 5 AND amount >= 1.5 AND day < '2024-01-01' LIMIT 2",
-				 "@p1 int, @p2 decimal(10,2), @p3 date");
+				 "@p0 int, @p1 decimal(10,2), @p2 date");
 	// A typed constant, as the rewriter's folding leaves `DATE '2024-01-01'`.
-	ExpectParams("SELECT id FROM t WHERE day = CAST('2024-01-01' AS DATE) LIMIT 1", "@p1 date");
+	ExpectParams("SELECT id FROM t WHERE day = CAST('2024-01-01' AS DATE) LIMIT 1", "@p0 date");
 	ExpectVeto("SELECT id FROM t WHERE day = CAST('2024-01-01' AS TIMESTAMP) LIMIT 1");
 	ExpectVeto("SELECT id FROM t WHERE id = TRY_CAST('5' AS INTEGER) LIMIT 1");
-	ExpectSql("SELECT id FROM t WHERE 5 < id LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE @p1 < [id]");
+	ExpectSql("SELECT id FROM t WHERE 5 < id LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (@p0 < [id])");
 	ExpectSql("SELECT id FROM t WHERE name IS NULL AND code IS NOT NULL LIMIT 1",
 			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([name] IS NULL) AND ([code] IS NOT NULL))");
-	ExpectSql("SELECT id FROM t WHERE id = 5 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE [id] = 5", false);
-	ExpectSql("SELECT id FROM t WHERE amount = 2 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE [amount] = 2.00",
+	ExpectSql("SELECT id FROM t WHERE id = 5 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([id] = 5)", false);
+	ExpectSql("SELECT id FROM t WHERE amount = 2 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([amount] = 2.00)",
 			  false);
 
 	// A constant DuckDB and the server would compare differently stays local.

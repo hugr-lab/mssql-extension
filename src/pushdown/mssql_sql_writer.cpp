@@ -4,10 +4,10 @@
 #include "codec/target_string_type.hpp"
 #include "connection/mssql_settings.hpp"
 #include "mssql_counters.hpp"
+#include "pushdown/mssql_expression_vocabulary.hpp"
 #include "pushdown/mssql_order_term.hpp"
 #include "query/mssql_identifier.hpp"
 #include "query/mssql_sql_params.hpp"
-#include "table_scan/filter_encoder.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -127,6 +127,11 @@ private:
 	bool WriteComparison(const ComparisonExpression &cmp, std::string &sql);
 	bool ConstantFor(const MSSQLColumnInfo &column, const ParsedExpression &expr, Value &out);
 	std::string Parameter(const MSSQLColumnInfo &column, const Value &value);
+	//! A column in WHERE / ORDER BY. One table: its bare name, whose meaning
+	//! is the column's (collation, type). A join will qualify it here.
+	std::string ColumnSql(idx_t index) const {
+		return QuoteIdentifier(columns_[index].name);
+	}
 	bool WriteOrder(const OrderModifier &order, bool limited, std::string &sql);
 	bool ConstantCount(const ParsedExpression &expr, int64_t &out);
 
@@ -137,6 +142,20 @@ private:
 	WrittenQuery &out_;
 	std::string &why_;
 	std::vector<OutputColumn> outputs_;
+	SqlParamSet params_;
+	std::vector<Value> param_values_;
+
+public:
+	//! The statement's parameters, once written.
+	void TakeParams(std::vector<WrittenParam> &out) {
+		for (size_t i = 0; i < params_.params.size(); i++) {
+			WrittenParam param;
+			param.name = params_.params[i].name;
+			param.declaration = params_.params[i].declaration;
+			param.value = param_values_[i];
+			out.push_back(std::move(param));
+		}
+	}
 };
 
 bool NodeWriter::ResolveColumn(const ColumnRefExpression &ref, idx_t &out) {
@@ -304,43 +323,21 @@ bool NodeWriter::ConstantFor(const MSSQLColumnInfo &column, const ParsedExpressi
 }
 
 std::string NodeWriter::Parameter(const MSSQLColumnInfo &column, const Value &value) {
-	std::string declaration;
-	if (options_.parameterize && out_.params.size() < SqlParamSet::MAX_PARAMS) {
-		declaration = FilterEncoder::DeclarationForColumn(column, value, value.type());
+	// The vocabulary's constant: @pN declared from the column it is compared
+	// with (076 / #361), or a literal. The vehicle carries each parameter's
+	// VALUE (mssql_scan_params renders its own literal), kept beside the set.
+	const size_t before = params_.params.size();
+	std::string sql =
+		ExpressionVocabulary::Constant(value, value.type(), options_.parameterize ? &params_ : nullptr, &column);
+	if (params_.params.size() > before) {
+		param_values_.push_back(value);
 	}
-	if (declaration.empty()) {
-		return FilterEncoder::ValueToSQLLiteral(value, value.type());
-	}
-	WrittenParam param;
-	param.name = "p" + std::to_string(out_.params.size() + 1);
-	param.declaration = declaration;
-	param.value = value;
-	out_.params.push_back(param);
-	return "@" + param.name;
+	return sql;
 }
 
 bool NodeWriter::WriteComparison(const ComparisonExpression &cmp, std::string &sql) {
 	std::string op;
-	switch (cmp.GetExpressionType()) {
-	case ExpressionType::COMPARE_EQUAL:
-		op = "=";
-		break;
-	case ExpressionType::COMPARE_NOTEQUAL:
-		op = "<>";
-		break;
-	case ExpressionType::COMPARE_LESSTHAN:
-		op = "<";
-		break;
-	case ExpressionType::COMPARE_GREATERTHAN:
-		op = ">";
-		break;
-	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-		op = "<=";
-		break;
-	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-		op = ">=";
-		break;
-	default:
+	if (!ExpressionVocabulary::ComparisonOperator(cmp.GetExpressionType(), op)) {
 		return Veto("comparison " + cmp.ToString());
 	}
 	const ParsedExpression *column_side = &cmp.Left();
@@ -352,9 +349,9 @@ bool NodeWriter::WriteComparison(const ComparisonExpression &cmp, std::string &s
 	}
 	if (column_side->GetExpressionClass() != ExpressionClass::COLUMN_REF ||
 		constant_side->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-		// Column against column waits for PR C: two string columns under
-		// different collations are a server error (468), and the type mixes
-		// need the constant rules' care.
+		// Column against column waits for the typed operands of a later step:
+		// two string columns under different collations are a server error
+		// (468), and the type mixes need the constant rules' care.
 		return Veto("comparison " + cmp.ToString());
 	}
 	idx_t index;
@@ -369,9 +366,10 @@ bool NodeWriter::WriteComparison(const ComparisonExpression &cmp, std::string &s
 	if (value.IsNull()) {
 		return Veto("comparison with NULL");
 	}
-	const std::string column_sql = QuoteIdentifier(column.name);
+	const std::string column_sql = ColumnSql(index);
 	const std::string constant_sql = Parameter(column, value);
-	sql = flipped ? constant_sql + " " + op + " " + column_sql : column_sql + " " + op + " " + constant_sql;
+	sql = flipped ? ExpressionVocabulary::Comparison(op, constant_sql, column_sql)
+				  : ExpressionVocabulary::Comparison(op, column_sql, constant_sql);
 	return true;
 }
 
@@ -379,23 +377,25 @@ bool NodeWriter::WritePredicate(const ParsedExpression &expr, std::string &sql) 
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::CONJUNCTION: {
 		auto &conj = expr.Cast<ConjunctionExpression>();
-		std::string op;
-		if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
-			op = " AND ";
-		} else if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
-			op = " OR ";
-		} else {
+		const bool is_and = expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND;
+		if (!is_and && expr.GetExpressionType() != ExpressionType::CONJUNCTION_OR) {
 			return Veto("conjunction " + expr.ToString());
 		}
-		std::string joined;
+		// All or nothing: RemoteExecute cannot leave a conjunct to DuckDB, so a
+		// refused child vetoes the node (the scan path would push the AND's
+		// supported part and keep the rest in its client-side net).
+		std::vector<std::string> parts;
 		for (auto &child : conj.GetChildren()) {
 			std::string part;
 			if (!WritePredicate(*child, part)) {
 				return false;
 			}
-			joined += (joined.empty() ? "" : op) + part;
+			parts.push_back(part);
 		}
-		sql = "(" + joined + ")";
+		if (parts.empty()) {
+			return Veto("an empty conjunction");
+		}
+		sql = ExpressionVocabulary::Conjunction(parts, is_and);
 		return true;
 	}
 	case ExpressionClass::COMPARISON:
@@ -409,7 +409,7 @@ bool NodeWriter::WritePredicate(const ParsedExpression &expr, std::string &sql) 
 				return false;
 			}
 			// Three-valued NOT is the same on both sides: NOT UNKNOWN is UNKNOWN.
-			sql = "(NOT " + inner + ")";
+			sql = ExpressionVocabulary::Not(inner);
 			return true;
 		}
 		if ((expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||
@@ -419,8 +419,8 @@ bool NodeWriter::WritePredicate(const ParsedExpression &expr, std::string &sql) 
 			if (!ResolveColumn(children[0]->Cast<ColumnRefExpression>(), index)) {
 				return false;
 			}
-			sql = "(" + QuoteIdentifier(columns_[index].name) +
-				  (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ? " IS NULL)" : " IS NOT NULL)");
+			sql = ExpressionVocabulary::IsNull(ColumnSql(index),
+											   expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL);
 			return true;
 		}
 		return Veto("operator " + expr.ToString());
@@ -593,7 +593,11 @@ bool SQLWriter::Write(const QueryNode &node, WrittenQuery &out, std::string &why
 		return false;
 	}
 	NodeWriter writer(options_, table, out, why);
-	return writer.Write(select);
+	if (!writer.Write(select)) {
+		return false;
+	}
+	writer.TakeParams(out.params);
+	return true;
 }
 
 std::string ColumnTypeName(const LogicalType &type) {

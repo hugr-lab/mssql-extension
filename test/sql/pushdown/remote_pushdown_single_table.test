@@ -67,7 +67,7 @@ physical_plan	<REGEX>:.*SELECT TOP \(3\) \[id\], \[n\] FROM \[dbo\]\.\[rp_t\] OR
 query II
 EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE id >= 2 AND day < '2024-05-01' ORDER BY id LIMIT 10;
 ----
-physical_plan	<REGEX>:.*Mssql Scan Params.*WHERE \(\[id\] >= @p1 AND \[day\] < @p2\).*
+physical_plan	<REGEX>:.*Mssql Scan Params.*WHERE \(\(\[id\] >= @p0\) AND \(\[day\] < @p1\)\).*
 
 # The two-part name resolves through the default schema (the rewriter asks
 # for schema `main`, the catalog answers with dbo).
@@ -177,7 +177,7 @@ SELECT id AS k, amount FROM rp_off.dbo.rp_t WHERE amount > 1.5 ORDER BY 1 LIMIT 
 query II
 EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE name = 'BETA' ORDER BY id LIMIT 5;
 ----
-physical_plan	<REGEX>:.*Mssql Scan Params.*\[name\] = @p1.*
+physical_plan	<REGEX>:.*Mssql Scan Params.*\(\[name\] = @p0\).*
 
 query I
 SELECT id FROM rp_on.dbo.rp_t WHERE name = 'BETA' ORDER BY id LIMIT 5;
@@ -488,7 +488,7 @@ SET mssql_scan_parameterize_filters = false;
 query II
 EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE id >= 2 ORDER BY id LIMIT 10;
 ----
-physical_plan	<REGEX>:.*Mssql Scan.*WHERE \[id\] >= 2 ORDER BY.*
+physical_plan	<REGEX>:.*Mssql Scan.*WHERE \(\[id\] >= 2\) ORDER BY.*
 
 statement ok
 RESET mssql_scan_parameterize_filters;
