@@ -35,15 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LIKE, IS NULL of any value, a bit column as a condition, and a column
   compared with a column of the same type and collation. The scan path's
   filter pushdown and the rewriter now render through one vocabulary
-  (`pushdown/mssql_expression_vocabulary`), so a construct answers the same
-  whichever path takes it. What is not pushed, each with a measured reason:
+  (`pushdown/mssql_expression_vocabulary`), so a construct both paths take
+  answers the same whichever takes it. What is not pushed, each with a measured reason:
   mixed-type arithmetic (the promotions differ), decimal arithmetic whose
   result passes 38 digits (the server rounds), a division inside a condition
   (a zero divisor is `inf` in DuckDB and NULL on the server, which would
   change the rows; for a selected value the NULL is the documented
   divergence), ILIKE / GLOB / LIKE … ESCAPE, a code-page `varchar` inside a
-  computed value (it would arrive as its code-page bytes). A computed
-  column's type is the server's, as for any `mssql_scan`.
+  computed value (it would arrive as its code-page bytes), a division under
+  COALESCE, a string constant in a CASE / COALESCE branch wider than its
+  column. A computed column's type is the server's, as for any `mssql_scan`.
 - **`column_types := [...]` on `mssql_scan` / `mssql_scan_params`**: the type
   each result column is read as, `''` for the described one, checked against
   the server's describe. The rewriter uses it so a pushed `SELECT` has the

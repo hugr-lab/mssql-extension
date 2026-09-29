@@ -176,7 +176,11 @@ nvarchar or UTF-8 column (a code-page varchar in a value arrives as its
 code-page bytes, #224). LIKE with `[` escaped (`%` / `_` agree, neither side
 has a default escape); ILIKE, GLOB and ESCAPE are not pushed. DuckDB's
 `nullif` is a system macro its rewriter keeps local, so it never reaches the
-writer. A computed column is named as DuckDB names it and typed by the
+writer (whose NULLIF branches are kept for a DuckDB that hands it over). No
+division under COALESCE (it would turn the zero divisor's NULL into the
+fallback), and a string constant in a CASE / COALESCE branch must fit the
+column's own declaration (a wider one, or a bare literal, would change the
+server's result type -- measured). A computed column is named as DuckDB names it and typed by the
 server's describe (`column_types` '').
 
 **Revised in PR B: the catalog's types, not the describe's.** Run on every
@@ -233,15 +237,16 @@ silently disable pushdown for the first statement against every table.
 - Literals spelled per column (§ 8.3.1, #361).
 - No strict forms, no re-check: § 8.5's `DATALENGTH` pair stays in the
   record as the measured form should strictness ever be asked for.
-- **Invariant (PR B review): the writer compares no string the scan path
-  would not.** The sets are safe to leave to the server because the scan's
-  `FilterEncoder` already sends the same comparisons; a writer that compared
-  more (a type or a form the encoder leaves to DuckDB) would acquire a
-  divergence the scan path does not have. Since PR C both render through one
-  vocabulary (`mssql::ExpressionVocabulary`), and the writer's comparable
-  kinds (`KindOf`: exact numerics, bit, date, char / varchar / nchar /
-  nvarchar) are a subset of the encoder's. Widening either is a change to
-  this rule, not to one path.
+- **Invariant (PR B review): the writer compares no string under rules the
+  scan path would not.** The sets are safe to leave to the server because
+  the scan's `FilterEncoder` already sends the same comparisons; a writer
+  that compared a string type the encoder leaves to DuckDB would acquire a
+  divergence the scan path does not have. The writer's comparable kinds
+  (`KindOf`: exact numerics, bit, date, char / varchar / nchar / nvarchar)
+  are a subset of the encoder's. It also compares the string RESULT of a
+  CASE / COALESCE, which the encoder does not render -- but only of columns
+  of one collation, so the comparison is still one column's collation, the
+  rule above. Widening either is a change to this rule, not to one path.
 
 ### D5 — the fallback stays, the vocabulary is shared
 
@@ -266,8 +271,11 @@ quotes every identifier through it, aliases included (`SELECT 1 AS "x]y"`). A qu
 **Revised in PR C: one vocabulary, two walkers.** The atoms live in
 `mssql::ExpressionVocabulary` (`pushdown/mssql_expression_vocabulary`): the
 constant and its parameter declaration, the value-vs-condition position rule,
-comparisons, NOT, IS NULL, IN and its cap, BETWEEN, CASE, COALESCE / NULLIF,
-CAST, division, AND / OR joining, the function-table gate, LIKE. Each path
+comparisons, NOT, IS NULL, IN and its cap, BETWEEN, CASE, AND / OR joining,
+the function-table gate, LIKE -- the ones both paths render with -- and
+COALESCE / NULLIF, CAST and division, which only the writer renders today
+(the scan's encoder leaves them to DuckDB). A construct both paths take
+renders once. Each path
 keeps its own walk and its own policy -- the scan pushes an AND's supported
 part and leaves the rest to its client-side net, the writer vetoes the whole
 node -- and its own resolution (a join will qualify a column in the writer).

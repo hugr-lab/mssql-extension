@@ -805,9 +805,9 @@ Invariants:
   (`column_types`). The describe remains the init-time shape check. A
   computed column's type is the server's (its describe).
 - **One vocabulary, two walkers** (PR C). `pushdown/mssql_expression_vocabulary`
-  holds the atoms both paths render with -- constants and their parameter
-  declarations, comparisons, IN, BETWEEN, CASE, COALESCE, CAST, division,
-  LIKE, the function table. `FilterEncoder` walks the bound tree and pushes an
+  holds the atoms: those both paths render with -- constants and their
+  parameter declarations, comparisons, IN, BETWEEN, CASE, LIKE, the function
+  table -- and COALESCE, CAST and division, which only the writer uses today. `FilterEncoder` walks the bound tree and pushes an
   AND's supported part; the writer walks the parsed tree, types a constant
   from its peer as the binder would, and vetoes the whole node on any
   refusal. A new construct is added to the vocabulary once.

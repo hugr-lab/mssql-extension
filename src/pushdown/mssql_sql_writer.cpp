@@ -132,6 +132,10 @@ struct Operand {
 	const MSSQLColumnInfo *column = nullptr;
 	//! An untyped constant, awaiting its peer.
 	const ParsedExpression *constant = nullptr;
+	//! It is (a cast of) a division: NULL at a zero divisor where DuckDB says
+	//! inf / NaN -- fine as a selected value, not under COALESCE, which would
+	//! turn that NULL into its fallback.
+	bool division = false;
 };
 
 //! Integer and exact-decimal types that arithmetic keeps as they are on both
@@ -184,7 +188,7 @@ private:
 	bool WriteCase(const CaseExpression &expr, Operand &out);
 	//! COALESCE / NULLIF / CASE branches: one type for all, constants typed
 	//! from the first operand that has one, a NULL constant kept as NULL.
-	bool Unify(std::vector<Operand> &operands, Operand &result);
+	bool Unify(std::vector<Operand> &operands, Operand &result, bool consumes_null = false);
 	//! Two operands compared: a constant is typed from the other; two values
 	//! must have one type, and two strings one collation (else 468).
 	bool BindPair(Operand &left, Operand &right, const std::string &what);
@@ -473,7 +477,21 @@ bool NodeWriter::BindConstant(const Operand &peer, Operand &constant, bool arith
 	}
 	const size_t before = params_.params.size();
 	constant.sql = Parameter(peer.column, value);
-	if (arithmetic && params_.params.size() == before) {
+	if (arithmetic && peer.kind == ComparableKind::String) {
+		// A string constant in a VALUE (a CASE / COALESCE branch) types the
+		// result on the server: a longer one widens it (varchar(30) for a
+		// varchar(20) column), a literal is nvarchar(4000). DuckDB keeps the
+		// column's type. So it must fit the column's own declaration, and a
+		// literal says it (measured, both).
+		const std::string own =
+			ExpressionVocabulary::DeclarationForColumn(*peer.column, Value(""), LogicalType::VARCHAR);
+		if (own.empty() || ExpressionVocabulary::DeclarationForColumn(*peer.column, value, value.type()) != own) {
+			return Veto("a string constant that does not fit " + peer_name);
+		}
+		if (params_.params.size() == before) {
+			constant.sql = ExpressionVocabulary::Cast(constant.sql, own);
+		}
+	} else if (arithmetic && params_.params.size() == before) {
 		// A literal's type is the server's own reading of it -- `1` an int,
 		// `3000000000` a numeric(10,0) -- so `tiny + 1` would widen there where
 		// DuckDB keeps UTINYINT and overflows at 255, and `big + 3000000000`
@@ -541,7 +559,7 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 			// to give (and NULLIF(NULL, x) is T-SQL error 4151).
 			return Veto("value " + expr.ToString());
 		}
-		if (operands.empty() || !Unify(operands, out)) {
+		if (operands.empty() || !Unify(operands, out, true)) {
 			return operands.empty() ? Veto("value " + expr.ToString()) : false;
 		}
 		std::vector<std::string> args;
@@ -559,6 +577,8 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 		if (name == "/" && fn.GetArguments().size() == 2) {
 			return WriteDivide(fn, out);
 		}
+		// Unreachable on the 2.0 pin: DuckDB's nullif is a system macro its
+		// rewriter keeps local. Kept for a DuckDB that hands it over.
 		if (StringUtil::CIEquals(name, "nullif") && fn.GetArguments().size() == 2) {
 			std::vector<Operand> operands(2);
 			for (idx_t i = 0; i < 2; i++) {
@@ -569,7 +589,7 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 			if (operands[0].constant) {
 				return Veto("nullif of a constant");
 			}
-			if (!Unify(operands, out)) {
+			if (!Unify(operands, out, true)) {
 				return false;
 			}
 			out.sql = ExpressionVocabulary::NullIf(operands[0].sql, operands[1].sql);
@@ -582,7 +602,14 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 	}
 }
 
-bool NodeWriter::Unify(std::vector<Operand> &operands, Operand &result) {
+bool NodeWriter::Unify(std::vector<Operand> &operands, Operand &result, bool consumes_null) {
+	for (auto &operand : operands) {
+		if (consumes_null && operand.division) {
+			// COALESCE(x / 0, -1) is -1 there, inf here: the recorded NULL would
+			// become a wrong value.
+			return Veto("a division under COALESCE / NULLIF");
+		}
+	}
 	const Operand *peer = nullptr;
 	for (auto &operand : operands) {
 		if (!operand.constant) {
@@ -660,6 +687,9 @@ bool NodeWriter::WriteCase(const CaseExpression &expr, Operand &out) {
 	if (!Unify(branches, out)) {
 		return false;
 	}
+	for (auto &branch : branches) {
+		out.division = out.division || branch.division;
+	}
 	std::vector<std::string> thens;
 	for (idx_t i = 0; i + 1 < branches.size(); i++) {
 		thens.push_back(branches[i].sql);
@@ -711,6 +741,7 @@ bool NodeWriter::WriteDivide(const FunctionExpression &fn, Operand &out) {
 	out.sql = ExpressionVocabulary::Divide(operands[0].sql, operands[1].sql);
 	out.type = LogicalType::DOUBLE;
 	out.kind = ComparableKind::ExactNumeric;
+	out.division = true;
 	return true;
 }
 
@@ -741,6 +772,7 @@ bool NodeWriter::WriteCast(const CastExpression &cast, Operand &out) {
 		return Veto("cast " + cast.ToString());
 	}
 	out = Operand();
+	out.division = child.division;
 	out.sql = ExpressionVocabulary::Cast(child.sql, tsql);
 	out.type = target == LogicalTypeId::DOUBLE ? LogicalType::DOUBLE : LogicalType(target);
 	out.kind = ComparableKind::ExactNumeric;

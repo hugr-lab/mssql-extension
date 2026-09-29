@@ -738,6 +738,46 @@ RESET mssql_catalog_native_types;
 statement ok
 SELECT mssql_invalidate_cache('rp_on'), mssql_invalidate_cache('rp_off');
 
+# With literals instead of parameters the constant says the column's type
+# itself, so the branch keeps it (a bare N'none' is nvarchar(4000) there).
+statement ok
+SET mssql_scan_parameterize_filters = false;
+
+statement ok
+CREATE TEMP TABLE sl_on AS SELECT id, coalesce(code, 'none') AS c FROM rp_on.dbo.rp_t ORDER BY id LIMIT 10;
+
+statement ok
+CREATE TEMP TABLE sl_off AS SELECT id, coalesce(code, 'none') AS c FROM rp_off.dbo.rp_t ORDER BY id LIMIT 10;
+
+statement ok
+RESET mssql_scan_parameterize_filters;
+
+query TTT
+SELECT a.column_name, a.data_type, b.data_type FROM duckdb_columns() a JOIN duckdb_columns() b USING (column_name)
+WHERE a.table_name = 'sl_on' AND b.table_name = 'sl_off' ORDER BY a.column_index;
+----
+id	INTEGER	INTEGER
+c	MSSQL_VARCHAR(20)	MSSQL_VARCHAR(20)
+
+# A constant wider than the column would widen the server's result type
+# (varchar(30) for a varchar(20) column); DuckDB keeps the column's.
+query II
+EXPLAIN SELECT id, coalesce(code, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# COALESCE over a division would turn the zero divisor's NULL into the
+# fallback (-1 there, inf here).
+query II
+EXPLAIN SELECT id, coalesce(id / tiny, -1) FROM rp_on.dbo.rp_t ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query R
+SELECT coalesce(id / tiny, -1) FROM rp_on.dbo.rp_t WHERE id = 5 ORDER BY id LIMIT 1;
+----
+inf
+
 # Vetoes: branches of two types, a narrowing cast.
 query II
 EXPLAIN SELECT id, CASE WHEN n > 1 THEN n ELSE amount END FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;

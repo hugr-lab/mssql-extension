@@ -246,6 +246,14 @@ int main() {
 	ExpectSql("SELECT id FROM t WHERE id = 2.0 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([id] = @p0)");
 	ExpectSql("SELECT coalesce(name, 'none') AS c FROM t LIMIT 1",
 			  "SELECT TOP (1) COALESCE([name], @p0) AS [c] FROM [dbo].[t]");
+	ExpectSql("SELECT coalesce(name, 'none') AS c FROM t LIMIT 1",
+			  "SELECT TOP (1) COALESCE([name], CAST(N'none' AS nvarchar(100))) AS [c] FROM [dbo].[t]", false);
+	ExpectVeto("SELECT coalesce(code, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') FROM t LIMIT 1");  // wider than varchar(20)
+	ExpectVeto("SELECT coalesce(id / 2, 0) FROM t LIMIT 1");  // COALESCE would hide the zero-divisor NULL
+	ExpectSql("SELECT CASE WHEN id > 1 THEN id / 2 END AS h FROM t LIMIT 1",
+			  "SELECT TOP (1) CASE WHEN ([id] > @p0) THEN (CAST([id] AS float) / NULLIF(CAST(@p1 AS float), 0)) ELSE "
+			  "NULL END AS "
+			  "[h] FROM [dbo].[t]");
 
 	// IN / NOT IN, BETWEEN, LIKE / NOT LIKE, value against value.
 	ExpectSql("SELECT id FROM t WHERE id IN (1, 2) LIMIT 1",
