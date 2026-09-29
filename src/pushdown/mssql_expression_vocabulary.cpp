@@ -575,6 +575,19 @@ bool ExpressionVocabulary::LikePatternText(const std::string &function_name, con
 	return true;
 }
 
+std::string ExpressionVocabulary::LikePattern(const std::string &duckdb_pattern) {
+	std::string pattern;
+	pattern.reserve(duckdb_pattern.size());
+	for (char c : duckdb_pattern) {
+		if (c == '[') {
+			pattern += "[[]";
+		} else {
+			pattern += c;
+		}
+	}
+	return pattern;
+}
+
 std::string ExpressionVocabulary::Like(const std::string &value, const std::string &pattern) {
 	return "(" + value + " LIKE " + pattern + ")";
 }

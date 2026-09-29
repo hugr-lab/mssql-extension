@@ -467,21 +467,36 @@ d	DOUBLE
 c	INTEGER
 co	INTEGER
 
-# A bit column as a condition, and a division in WHERE.
+# A bit column as a condition.
 query II
-EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE flag AND amount / n > 0.1 ORDER BY id LIMIT 10;
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE flag AND n > 15 ORDER BY id LIMIT 10;
 ----
-physical_plan	<REGEX>:.*WHERE \(\(\[flag\] = 1\) AND \(\(CAST\(\[amount\] AS float\) / NULLIF\(CAST\(\[n\] AS float\), 0\)\) > @p0\)\).*
+physical_plan	<REGEX>:.*WHERE \(\(\[flag\] = 1\) AND \(\[n\] > @p0\)\).*
 
 query I
-SELECT id FROM rp_on.dbo.rp_t WHERE flag AND amount / n > 0.1 ORDER BY id LIMIT 10;
+SELECT id FROM rp_on.dbo.rp_t WHERE flag AND n > 15 ORDER BY id LIMIT 10;
 ----
+1
 4
 
 query I
-SELECT id FROM rp_off.dbo.rp_t WHERE flag AND amount / n > 0.1 ORDER BY id LIMIT 10;
+SELECT id FROM rp_off.dbo.rp_t WHERE flag AND n > 15 ORDER BY id LIMIT 10;
 ----
+1
 4
+
+# A division in a condition is not pushed: a zero divisor is inf here and
+# NULL there, which would change the rows (`id / tiny IS NULL` finds row 5
+# only on the server).
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE id / tiny IS NULL ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE id / tiny IS NULL ORDER BY id LIMIT 10;
+----
+3
 
 query I
 SELECT id FROM rp_on.dbo.rp_t WHERE NOT flag ORDER BY id LIMIT 10;
@@ -586,6 +601,76 @@ physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
 
 statement ok
 RESET ieee_floating_point_ops;
+
+# IN / NOT IN, BETWEEN, LIKE / NOT LIKE, IS NULL of an expression, and a value
+# compared with a value of the same type (PR C).
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE n IN (10, 30) AND amount BETWEEN 1 AND 5 AND name LIKE '%a' AND name NOT LIKE 'g%' AND amount >= amount AND (n + 1) IS NOT NULL ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*\(\[n\] IN \(@p0, @p1\)\).*\(\[amount\] BETWEEN @p2 AND @p3\).*\(\[name\] LIKE @p4\).*\(NOT \(\[name\] LIKE @p5\)\).*\(\[amount\] >= \[amount\]\).*IS NOT NULL.*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE n IN (10, 30) AND amount BETWEEN 1 AND 5 AND name LIKE '%a' AND name NOT LIKE 'g%' AND amount >= amount AND (n + 1) IS NOT NULL ORDER BY id LIMIT 10;
+----
+1
+
+query I
+SELECT id FROM rp_off.dbo.rp_t WHERE n IN (10, 30) AND amount BETWEEN 1 AND 5 AND name LIKE '%a' AND name NOT LIKE 'g%' AND amount >= amount AND (n + 1) IS NOT NULL ORDER BY id LIMIT 10;
+----
+1
+
+# NOT IN with a NULL in the list: no row on either side.
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE n NOT IN (10, NULL) ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*\(NOT \(\[n\] IN \(@p0, NULL\)\)\).*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE n NOT IN (10, NULL) ORDER BY id LIMIT 10;
+----
+
+query I
+SELECT id FROM rp_off.dbo.rp_t WHERE n NOT IN (10, NULL) ORDER BY id LIMIT 10;
+----
+
+# `[` is literal in a DuckDB pattern and opens a class in T-SQL: escaped, the
+# pattern finds no row on either side (unescaped, `[a]` would match 'alpha').
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE name LIKE '%[a]%' ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*\(\[name\] LIKE @p0\).*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE name LIKE '%[a]%' ORDER BY id LIMIT 10;
+----
+
+# NOT BETWEEN, IN over an expression, two string columns of one collation.
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE n NOT BETWEEN 15 AND 25 AND n + 1 IN (11, 31) AND name <> legacy ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*\(NOT \(\[n\] BETWEEN @p0 AND @p1\)\).*\(\(\[n\] \+ @p2\) IN \(@p3, @p4\)\).*\(\[name\] <> \[legacy\]\).*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE n NOT BETWEEN 15 AND 25 AND n + 1 IN (11, 31) AND name <> legacy ORDER BY id LIMIT 10;
+----
+1
+
+query I
+SELECT id FROM rp_off.dbo.rp_t WHERE n NOT BETWEEN 15 AND 25 AND n + 1 IN (11, 31) AND name <> legacy ORDER BY id LIMIT 10;
+----
+1
+
+# Vetoes: two collations (468 on the server), ILIKE, a LIKE pattern that is
+# not a constant.
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE name = code ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE name ILIKE 'A%' ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
 
 # nullif is not in the list above: it is a DuckDB macro (CASE WHEN a = b THEN
 # NULL ELSE a END), and DuckDB's rewriter keeps a local macro local -- the

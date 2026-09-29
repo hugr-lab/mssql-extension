@@ -214,9 +214,8 @@ int main() {
 		"SELECT TOP (1) (CAST([id] AS float) / NULLIF(CAST(CAST(2.0 AS float) AS float), 0)) AS [h] FROM [dbo].[t]",
 		false);
 	ExpectParams("SELECT id / 2.5 AS h FROM t LIMIT 1", "@p0 float");
-	ExpectSql(
-		"SELECT id FROM t WHERE amount / id > 0.5 LIMIT 1",
-		"SELECT TOP (1) [id] FROM [dbo].[t] WHERE ((CAST([amount] AS float) / NULLIF(CAST([id] AS float), 0)) > @p0)");
+	ExpectVeto("SELECT id FROM t WHERE amount / id > 0.5 LIMIT 1");	 // a zero divisor would change the rows
+	ExpectVeto("SELECT CASE WHEN id / 2 > 1 THEN id END FROM t LIMIT 1");
 	ExpectVeto("SELECT name / 2 FROM t LIMIT 1");
 
 	// Widening casts only.
@@ -247,6 +246,32 @@ int main() {
 	ExpectSql("SELECT id FROM t WHERE id = 2.0 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([id] = @p0)");
 	ExpectSql("SELECT coalesce(name, 'none') AS c FROM t LIMIT 1",
 			  "SELECT TOP (1) COALESCE([name], @p0) AS [c] FROM [dbo].[t]");
+
+	// IN / NOT IN, BETWEEN, LIKE / NOT LIKE, value against value.
+	ExpectSql("SELECT id FROM t WHERE id IN (1, 2) LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([id] IN (@p0, @p1))");
+	ExpectParams("SELECT id FROM t WHERE id IN (1, 2) LIMIT 1", "@p0 int, @p1 int");
+	ExpectSql("SELECT id FROM t WHERE id NOT IN (1, NULL) LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (NOT ([id] IN (@p0, NULL)))");
+	ExpectSql("SELECT id FROM t WHERE amount BETWEEN 1 AND 2 LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([amount] BETWEEN @p0 AND @p1)");
+	ExpectSql("SELECT id FROM t WHERE name LIKE 'a[b%' LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([name] LIKE N'a[[]b%')", false);
+	ExpectSql("SELECT id FROM t WHERE name NOT LIKE 'x%' LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (NOT ([name] LIKE @p0))");
+	ExpectSql("SELECT id FROM t WHERE amount > amount LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([amount] > [amount])");
+	ExpectSql("SELECT id FROM t WHERE name = legacy LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([name] = [legacy])");
+	ExpectSql("SELECT id FROM t WHERE id + 1 IS NULL LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([id] + @p0) IS NULL)");
+	ExpectVeto("SELECT id FROM t WHERE name = code LIMIT 1");  // two collations: 468
+	ExpectVeto("SELECT id FROM t WHERE id = amount LIMIT 1");  // two types
+	ExpectVeto("SELECT id FROM t WHERE name ILIKE 'x%' LIMIT 1");
+	ExpectVeto("SELECT id FROM t WHERE name GLOB 'x*' LIMIT 1");
+	ExpectVeto("SELECT id FROM t WHERE name LIKE 'x!%' ESCAPE '!' LIMIT 1");
+	ExpectVeto("SELECT id FROM t WHERE id LIKE '1%' LIMIT 1");		// LIKE over an int
+	ExpectVeto("SELECT id FROM t WHERE name LIKE legacy LIMIT 1");	// pattern not a constant
 
 	// Everything outside PR B's vocabulary is a veto, never a guess.
 	ExpectVeto("SELECT rowid FROM t LIMIT 1");

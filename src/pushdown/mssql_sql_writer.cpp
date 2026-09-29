@@ -16,6 +16,7 @@
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/parser/expression/between_expression.hpp"
 #include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -169,6 +170,7 @@ private:
 	bool ResolveColumn(const ColumnRefExpression &ref, idx_t &out);
 	bool WriteSelectList(const SelectNode &node);
 	bool WritePredicate(const ParsedExpression &expr, std::string &sql);
+	bool WritePredicateImpl(const ParsedExpression &expr, std::string &sql);
 	bool WriteComparison(const ComparisonExpression &cmp, std::string &sql);
 	bool ConstantFor(ComparableKind kind, const LogicalType &target, const std::string &peer_name,
 					 const ParsedExpression &expr, Value &out);
@@ -183,6 +185,12 @@ private:
 	//! COALESCE / NULLIF / CASE branches: one type for all, constants typed
 	//! from the first operand that has one, a NULL constant kept as NULL.
 	bool Unify(std::vector<Operand> &operands, Operand &result);
+	//! Two operands compared: a constant is typed from the other; two values
+	//! must have one type, and two strings one collation (else 468).
+	bool BindPair(Operand &left, Operand &right, const std::string &what);
+	bool WriteIn(const OperatorExpression &op, std::string &sql);
+	bool WriteBetween(const BetweenExpression &between, std::string &sql);
+	bool WriteLike(const FunctionExpression &fn, std::string &sql);
 	//! Types `constant` from `peer` and renders it. An operand of arithmetic
 	//! keeps its type in literal form too (see the definition).
 	bool BindConstant(const Operand &peer, Operand &constant, bool arithmetic = false);
@@ -201,6 +209,8 @@ private:
 	WrittenQuery &out_;
 	std::string &why_;
 	std::vector<OutputColumn> outputs_;
+	//! Inside WHERE / a WHEN: a division there is vetoed (see WriteDivide).
+	int predicate_depth_ = 0;
 	SqlParamSet params_;
 	std::vector<Value> param_values_;
 
@@ -668,6 +678,12 @@ bool NodeWriter::WriteDivide(const FunctionExpression &fn, Operand &out) {
 	if (operands[0].constant && operands[1].constant) {
 		return Veto("division of two constants " + fn.ToString());
 	}
+	if (predicate_depth_ > 0) {
+		// A zero divisor gives inf / NaN here and NULL there: recorded for a
+		// selected VALUE (spec 079 D2), but in a condition it changes WHICH rows
+		// come back -- `x / 0 IS NULL`, `NOT (x / 0 < 1)` -- so not in one.
+		return Veto("a division in a condition");
+	}
 	if (!options_.ieee_floating_point_ops) {
 		// Without it DuckDB raises (or, error_on_division_by_zero off, gives
 		// NULL) on a zero divisor: the one case the pushed NULL would hide.
@@ -817,6 +833,30 @@ bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
 	return true;
 }
 
+bool NodeWriter::BindPair(Operand &left, Operand &right, const std::string &what) {
+	if (left.constant && right.constant) {
+		return Veto("a comparison of two constants " + what);
+	}
+	if (left.constant) {
+		return BindConstant(right, left);
+	}
+	if (right.constant) {
+		return BindConstant(left, right);
+	}
+	// Value against value: one type, or DuckDB and the server promote
+	// differently; two strings only as columns of one collation -- two
+	// collations meeting in a comparison are the server's error 468.
+	if (left.kind == ComparableKind::None || left.kind != right.kind || left.type.id() == LogicalTypeId::INVALID ||
+		left.type != right.type) {
+		return Veto("a comparison of " + left.type.ToString() + " and " + right.type.ToString() + " " + what);
+	}
+	if (left.kind == ComparableKind::String &&
+		(!left.column || !right.column || left.column->collation_name != right.column->collation_name)) {
+		return Veto("a comparison of strings that are not columns of one collation " + what);
+	}
+	return true;
+}
+
 bool NodeWriter::WriteComparison(const ComparisonExpression &cmp, std::string &sql) {
 	std::string op;
 	if (!ExpressionVocabulary::ComparisonOperator(cmp.GetExpressionType(), op)) {
@@ -827,26 +867,106 @@ bool NodeWriter::WriteComparison(const ComparisonExpression &cmp, std::string &s
 	if (!WriteValue(cmp.Left(), left) || !WriteValue(cmp.Right(), right)) {
 		return false;
 	}
-	if (left.constant && right.constant) {
-		return Veto("comparison of two constants " + cmp.ToString());
-	}
-	if (!left.constant && !right.constant) {
-		// Value against value waits for its own step: two string columns under
-		// different collations are a server error (468), and the type mixes
-		// need the constant rules' care.
-		return Veto("comparison " + cmp.ToString());
-	}
-	if (left.constant && !BindConstant(right, left)) {
-		return false;
-	}
-	if (right.constant && !BindConstant(left, right)) {
+	if (!BindPair(left, right, cmp.ToString())) {
 		return false;
 	}
 	sql = ExpressionVocabulary::Comparison(op, left.sql, right.sql);
 	return true;
 }
 
+bool NodeWriter::WriteIn(const OperatorExpression &op, std::string &sql) {
+	auto &children = op.GetChildren();
+	if (children.size() < 2 || !ExpressionVocabulary::InListFits(children.size() - 1)) {
+		return Veto("an IN list of " + std::to_string(children.size() - 1) + " items");
+	}
+	Operand operand;
+	if (!WriteValue(*children[0], operand)) {
+		return false;
+	}
+	if (operand.constant) {
+		return Veto("IN over a constant");
+	}
+	std::vector<std::string> items;
+	for (idx_t i = 1; i < children.size(); i++) {
+		Operand item;
+		if (!WriteValue(*children[i], item)) {
+			return false;
+		}
+		// A NULL in the list is three-valued on both sides alike.
+		if (item.constant && item.constant->GetExpressionClass() == ExpressionClass::CONSTANT &&
+			item.constant->Cast<ConstantExpression>().GetLiteral().IsNull()) {
+			items.push_back("NULL");
+			continue;
+		}
+		Operand peer = operand;
+		if (!BindPair(peer, item, op.ToString())) {
+			return false;
+		}
+		items.push_back(item.sql);
+	}
+	sql = ExpressionVocabulary::In(operand.sql, items, op.GetExpressionType() == ExpressionType::COMPARE_NOT_IN);
+	return true;
+}
+
+bool NodeWriter::WriteBetween(const BetweenExpression &between, std::string &sql) {
+	Operand input;
+	if (!WriteValue(between.Input(), input)) {
+		return false;
+	}
+	if (input.constant) {
+		return Veto("BETWEEN over a constant");
+	}
+	Operand lower;
+	Operand upper;
+	if (!WriteValue(between.LowerBound(), lower) || !WriteValue(between.UpperBound(), upper)) {
+		return false;
+	}
+	Operand peer = input;
+	if (!BindPair(peer, lower, between.ToString()) || !BindPair(peer, upper, between.ToString())) {
+		return false;
+	}
+	sql = ExpressionVocabulary::Between(input.sql, lower.sql, upper.sql, true, true);
+	return true;
+}
+
+bool NodeWriter::WriteLike(const FunctionExpression &fn, std::string &sql) {
+	const auto &name = fn.FunctionName().GetIdentifierName();
+	const auto &args = fn.GetArguments();
+	if (args.size() != 2) {
+		return Veto("LIKE " + fn.ToString());
+	}
+	Operand value;
+	if (!WriteValue(args[0].GetExpression(), value)) {
+		return false;
+	}
+	if (value.constant || value.kind != ComparableKind::String) {
+		return Veto("LIKE over " + value.type.ToString());
+	}
+	const auto &pattern = args[1].GetExpression();
+	if (pattern.GetExpressionClass() != ExpressionClass::CONSTANT ||
+		pattern.Cast<ConstantExpression>().GetLiteral().kind != LiteralKind::STRING) {
+		return Veto("LIKE with a pattern that is not a string constant");
+	}
+	// The pattern is compared with the value, so it is declared from its
+	// column (a varchar keeps a seekable prefix); `[` taken literally.
+	const std::string text = ExpressionVocabulary::LikePattern(pattern.Cast<ConstantExpression>().GetLiteral().text);
+	if (text.size() > 4000) {
+		// A LIKE pattern is limited to 8000 bytes on the server.
+		return Veto("a LIKE pattern past 4000 characters");
+	}
+	const std::string like = ExpressionVocabulary::Like(value.sql, Parameter(value.column, Value(text)));
+	sql = name == "!~~" ? ExpressionVocabulary::Not(like) : like;
+	return true;
+}
+
 bool NodeWriter::WritePredicate(const ParsedExpression &expr, std::string &sql) {
+	++predicate_depth_;
+	const bool ok = WritePredicateImpl(expr, sql);
+	--predicate_depth_;
+	return ok;
+}
+
+bool NodeWriter::WritePredicateImpl(const ParsedExpression &expr, std::string &sql) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::CONJUNCTION: {
 		auto &conj = expr.Cast<ConjunctionExpression>();
@@ -873,9 +993,26 @@ bool NodeWriter::WritePredicate(const ParsedExpression &expr, std::string &sql) 
 	}
 	case ExpressionClass::COMPARISON:
 		return WriteComparison(expr.Cast<ComparisonExpression>(), sql);
+	case ExpressionClass::BETWEEN:
+		return WriteBetween(expr.Cast<BetweenExpression>(), sql);
+	case ExpressionClass::FUNCTION: {
+		// LIKE / NOT LIKE (the parser's `~~` / `!~~`). ILIKE (`~~*`), GLOB
+		// (`~~~`) and LIKE … ESCAPE are not: the server has no case folding of
+		// DuckDB's (#392) nor GLOB's syntax.
+		auto &fn = expr.Cast<FunctionExpression>();
+		const auto &name = fn.FunctionName().GetIdentifierName();
+		if (name == "~~" || name == "!~~") {
+			return WriteLike(fn, sql);
+		}
+		return Veto("predicate " + expr.ToString());
+	}
 	case ExpressionClass::OPERATOR: {
 		auto &op = expr.Cast<OperatorExpression>();
 		auto &children = op.GetChildren();
+		if (expr.GetExpressionType() == ExpressionType::COMPARE_IN ||
+			expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) {
+			return WriteIn(op, sql);
+		}
 		if (expr.GetExpressionType() == ExpressionType::OPERATOR_NOT && children.size() == 1) {
 			std::string inner;
 			if (!WritePredicate(*children[0], inner)) {
@@ -887,12 +1024,15 @@ bool NodeWriter::WritePredicate(const ParsedExpression &expr, std::string &sql) 
 		}
 		if ((expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||
 			 expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) &&
-			children.size() == 1 && children[0]->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-			idx_t index;
-			if (!ResolveColumn(children[0]->Cast<ColumnRefExpression>(), index)) {
+			children.size() == 1) {
+			Operand value;
+			if (!WriteValue(*children[0], value)) {
 				return false;
 			}
-			sql = ExpressionVocabulary::IsNull(ColumnSql(index),
+			if (value.constant) {
+				return Veto("IS NULL of a constant");
+			}
+			sql = ExpressionVocabulary::IsNull(value.sql,
 											   expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL);
 			return true;
 		}

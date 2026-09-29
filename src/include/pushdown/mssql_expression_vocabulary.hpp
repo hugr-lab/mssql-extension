@@ -140,6 +140,10 @@ public:
 	//! string sets are the server's). No case-insensitive form: the server's
 	//! LOWER is not DuckDB's lower (#392).
 	static std::string Like(const std::string &value, const std::string &pattern);
+	//! A DuckDB LIKE pattern as T-SQL reads it: `%` and `_` mean the same on
+	//! both sides and neither has a default escape, but `[` opens a character
+	//! class in T-SQL only, so it is taken literally as `[[]`.
+	static std::string LikePattern(const std::string &duckdb_pattern);
 };
 
 }  // namespace mssql
