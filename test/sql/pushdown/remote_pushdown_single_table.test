@@ -1,0 +1,611 @@
+# name: test/sql/pushdown/remote_pushdown_single_table.test
+# description: Spec 079 PR B -- DuckDB's remote-pushdown rewriter sends a single-table SELECT to SQL Server as one statement; both paths agree on rows and types
+# group: [pushdown]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# A result cannot tell which path ran it, so every pushed shape is pinned by
+# EXPLAIN (the vehicle, mssql_scan / mssql_scan_params, shows the statement it
+# sends) and every veto by EXPLAIN showing the catalog scan. The same
+# statements run against a catalog attached with the setting OFF and must
+# return the same rows with the same types (spec 079 W5).
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rp_off (TYPE mssql);
+
+# Read at ATTACH (D6): rp_on answers the rewriter, rp_off never does.
+statement ok
+SET mssql_remote_pushdown = true;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rp_on (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+# The fixture covers what the catalog scan reads through an expression: a
+# varchar under a non-UTF-8 collation holding non-ASCII (read as its NVARCHAR
+# cast), a geometry (STAsBinary), a datetime2(7) with 100 ns ticks (read as
+# TIMESTAMP_NS), a UTF-8 varchar (ordered as its bytes), nullable keys.
+statement ok
+SELECT mssql_exec('rp_off', 'DROP TABLE IF EXISTS dbo.rp_t;
+	CREATE TABLE dbo.rp_t (
+		id int NOT NULL PRIMARY KEY,
+		n int NULL,
+		name nvarchar(50) NULL,
+		code varchar(20) COLLATE Latin1_General_100_BIN2_UTF8 NULL,
+		legacy varchar(20) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+		amount decimal(10,2) NULL,
+		day date NULL,
+		ts datetime2(7) NULL,
+		g geometry NULL);
+	INSERT INTO dbo.rp_t VALUES
+		(1, 30, N''alpha'', ''b'', ''caf'' + CHAR(233), 1.50, ''2024-01-01'', ''2024-01-01 00:00:00.1234567'', geometry::STGeomFromText(''POINT (1 2)'', 0)),
+		(2, NULL, N''Beta'', ''a'', ''plain'', 2.00, ''2024-02-01'', ''2024-02-01 00:00:00.0000001'', NULL),
+		(3, 10, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+		(4, 20, N''gamma'', ''B'', ''x'', 4.25, ''2024-04-01'', ''2024-04-01 12:00:00'', geometry::STGeomFromText(''POINT (3 4)'', 0)),
+		(5, NULL, N''delta'', ''ab'', ''y'', 5.00, ''2024-05-01'', ''2024-05-01 00:00:00.9999999'', NULL)');
+
+statement ok
+CREATE TABLE loc AS SELECT 99 AS id;
+
+#
+# Pushed: the whole node is one statement, visible in EXPLAIN.
+#
+
+query II
+EXPLAIN SELECT id, n FROM rp_on.dbo.rp_t ORDER BY id DESC LIMIT 3;
+----
+physical_plan	<REGEX>:.*SELECT TOP \(3\) \[id\], \[n\] FROM \[dbo\]\.\[rp_t\] ORDER BY \[rp_t\]\.\[id\] DESC.*
+
+# Constants are parameters declared from the column (spec 076 / #361).
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE id >= 2 AND day < '2024-05-01' ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*Mssql Scan Params.*WHERE \(\[id\] >= @p1 AND \[day\] < @p2\).*
+
+# The two-part name resolves through the default schema (the rewriter asks
+# for schema `main`, the catalog answers with dbo).
+query II
+EXPLAIN SELECT id FROM rp_on.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*SELECT TOP \(1\) \[id\] FROM \[dbo\]\.\[rp_t\].*
+
+# The NULL placement DuckDB asks for is emulated under a LIMIT.
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t ORDER BY n LIMIT 5;
+----
+physical_plan	<REGEX>:.*ORDER BY CASE WHEN \[rp_t\]\.\[n\] IS NULL THEN 1 ELSE 0 END, \[rp_t\]\.\[n\] ASC.*
+
+#
+# The same rows on both paths.
+#
+
+# Each pair below is compared only after its pushed half is shown pushed: an
+# agreement that a silent veto would also produce proves nothing.
+query II
+EXPLAIN SELECT id, n FROM rp_on.dbo.rp_t ORDER BY n, id LIMIT 5;
+----
+physical_plan	<REGEX>:.*Mssql Scan.*TOP \(5\).*
+
+query II
+SELECT id, n FROM rp_on.dbo.rp_t ORDER BY n, id LIMIT 5;
+----
+3	10
+4	20
+1	30
+2	NULL
+5	NULL
+
+query II
+SELECT id, n FROM rp_off.dbo.rp_t ORDER BY n, id LIMIT 5;
+----
+3	10
+4	20
+1	30
+2	NULL
+5	NULL
+
+query II
+EXPLAIN SELECT id, n FROM rp_on.dbo.rp_t ORDER BY n DESC NULLS FIRST, id LIMIT 3;
+----
+physical_plan	<REGEX>:.*Mssql Scan.*TOP \(3\).*
+
+query II
+SELECT id, n FROM rp_on.dbo.rp_t ORDER BY n DESC NULLS FIRST, id LIMIT 3;
+----
+2	NULL
+5	NULL
+1	30
+
+query II
+SELECT id, n FROM rp_off.dbo.rp_t ORDER BY n DESC NULLS FIRST, id LIMIT 3;
+----
+2	NULL
+5	NULL
+1	30
+
+# A UTF-8 varchar is ordered by its bytes -- DuckDB's order -- under a LIMIT.
+query II
+EXPLAIN SELECT id, code FROM rp_on.dbo.rp_t ORDER BY code LIMIT 5;
+----
+physical_plan	<REGEX>:.*CAST\(\[rp_t\]\.\[code\] AS varbinary\(20\)\).*
+
+query II
+SELECT id, code FROM rp_on.dbo.rp_t ORDER BY code LIMIT 5;
+----
+4	B
+2	a
+5	ab
+1	b
+3	NULL
+
+query II
+SELECT id, code FROM rp_off.dbo.rp_t ORDER BY code LIMIT 5;
+----
+4	B
+2	a
+5	ab
+1	b
+3	NULL
+
+query II
+EXPLAIN SELECT id AS k, amount FROM rp_on.dbo.rp_t WHERE amount > 1.5 ORDER BY 1 LIMIT 2 OFFSET 1;
+----
+physical_plan	<REGEX>:.*OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY.*
+
+query II
+SELECT id AS k, amount FROM rp_on.dbo.rp_t WHERE amount > 1.5 ORDER BY 1 LIMIT 2 OFFSET 1;
+----
+4	4.25
+5	5.00
+
+query II
+SELECT id AS k, amount FROM rp_off.dbo.rp_t WHERE amount > 1.5 ORDER BY 1 LIMIT 2 OFFSET 1;
+----
+4	4.25
+5	5.00
+
+# Strings compare under the column's collation on the server (D4): the
+# default collation is case-insensitive, so 'BETA' finds 'Beta'. The scan path
+# pushes the same comparison, so both paths agree.
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE name = 'BETA' ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*Mssql Scan Params.*\[name\] = @p1.*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE name = 'BETA' ORDER BY id LIMIT 5;
+----
+2
+
+query I
+SELECT id FROM rp_off.dbo.rp_t WHERE name = 'BETA' ORDER BY id LIMIT 5;
+----
+2
+
+# A select-list alias named like another column: DuckDB orders by the table
+# column, and so must the server, where a bare ORDER BY name is the alias.
+query II
+EXPLAIN SELECT id AS n FROM rp_on.dbo.rp_t ORDER BY rp_t.n DESC, id LIMIT 2;
+----
+physical_plan	<REGEX>:.*AS \[n\].*ORDER BY \[rp_t\]\.\[n\] DESC.*
+
+query I
+SELECT id AS n FROM rp_on.dbo.rp_t ORDER BY rp_t.n DESC, id LIMIT 3;
+----
+1
+4
+3
+
+query I
+SELECT id AS n FROM rp_off.dbo.rp_t ORDER BY rp_t.n DESC, id LIMIT 3;
+----
+1
+4
+3
+
+# Two pushed children of one set operation naming the same table in different
+# schemas: each is written against its own schema. The rewriter looks both up
+# before it pushes either, so a match on the bare name would read the wrong one.
+statement ok
+SELECT mssql_exec('rp_off', 'IF SCHEMA_ID(''rp_s'') IS NULL EXEC(''CREATE SCHEMA rp_s'');
+	DROP TABLE IF EXISTS rp_s.rp_t; CREATE TABLE rp_s.rp_t (id int NOT NULL, other int);
+	INSERT INTO rp_s.rp_t VALUES (100, 1), (200, 2)');
+
+statement ok
+SELECT mssql_invalidate_cache('rp_on');
+
+# No ORDER BY on the whole: DuckDB pushes the children of a set operation one
+# by one only when the set operation itself has no modifiers.
+query II
+EXPLAIN (SELECT id FROM rp_on.rp_t ORDER BY id LIMIT 1) UNION ALL (SELECT id FROM rp_on.rp_s.rp_t ORDER BY id DESC LIMIT 1)
+UNION ALL (SELECT id FROM loc);
+----
+physical_plan	<REGEX>:.*FROM \[dbo\]\.\[rp_t\].*FROM \[rp_s\]\.\[rp_t\].*
+
+query I rowsort
+(SELECT id FROM rp_on.rp_t ORDER BY id LIMIT 1) UNION ALL (SELECT id FROM rp_on.rp_s.rp_t ORDER BY id DESC LIMIT 1)
+UNION ALL (SELECT id FROM loc);
+----
+1
+200
+99
+
+# `USE db`: an unqualified name binds in the default schema, as the rewriter
+# looks it up -- pushed.
+statement ok
+USE rp_on;
+
+query II
+EXPLAIN SELECT id FROM rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*FROM \[dbo\]\.\[rp_t\].*
+
+# `USE db.rp_s`: the binder reads rp_s.rp_t, but the rewriter looks the name up
+# in `main`, answered with dbo -- so it is not pushed (it read dbo.rp_t before
+# the search-path check), and the scan path reads rp_s.
+statement ok
+USE rp_on.rp_s;
+
+query II
+EXPLAIN SELECT id FROM rp_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT id FROM rp_t ORDER BY id LIMIT 5;
+----
+100
+200
+
+statement ok
+USE memory;
+
+# The `default_schema` ATTACH option is where a two-part name resolves.
+statement ok
+SET mssql_remote_pushdown = true;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rp_ds (TYPE mssql, default_schema 'rp_s');
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+query II
+EXPLAIN SELECT id FROM rp_ds.rp_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*FROM \[rp_s\]\.\[rp_t\].*
+
+query I
+SELECT id FROM rp_ds.rp_t ORDER BY id LIMIT 5;
+----
+100
+200
+
+statement ok
+DETACH rp_ds;
+
+statement ok
+SELECT mssql_exec('rp_off', 'DROP TABLE rp_s.rp_t; DROP SCHEMA rp_s');
+
+statement ok
+SELECT mssql_invalidate_cache('rp_on');
+
+# A server schema named like the ATTACH alias: `rp_on.rp_on.rp_t` is that
+# schema, not the default one.
+statement ok
+SELECT mssql_exec('rp_off', 'IF SCHEMA_ID(''rp_on'') IS NULL EXEC(''CREATE SCHEMA rp_on'');
+	DROP TABLE IF EXISTS rp_on.rp_t; CREATE TABLE rp_on.rp_t (id int NOT NULL); INSERT INTO rp_on.rp_t VALUES (7)');
+
+statement ok
+SELECT mssql_invalidate_cache('rp_on');
+
+query II
+EXPLAIN SELECT id FROM rp_on.rp_on.rp_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*FROM \[rp_on\]\.\[rp_t\].*
+
+query I
+SELECT id FROM rp_on.rp_on.rp_t ORDER BY id LIMIT 5;
+----
+7
+
+statement ok
+SELECT mssql_exec('rp_off', 'DROP TABLE rp_on.rp_t; DROP SCHEMA rp_on');
+
+statement ok
+SELECT mssql_invalidate_cache('rp_on');
+
+# A prepared statement is rewritten when it binds, and again on re-execution.
+statement ok
+PREPARE rp_q AS SELECT id FROM rp_on.dbo.rp_t WHERE id >= 2 ORDER BY id LIMIT 2;
+
+query I
+EXECUTE rp_q;
+----
+2
+3
+
+query I
+EXECUTE rp_q;
+----
+2
+3
+
+statement ok
+DEALLOCATE rp_q;
+
+#
+# Types: a pushed SELECT reports the catalog's column types, read into them
+# exactly as the catalog scan reads them (column_types) -- the datetime2(7)
+# keeps its 100 ns ticks, the non-UTF-8 varchar its declared type, geometry.
+#
+
+statement ok
+CREATE TEMP TABLE via_on AS SELECT * FROM rp_on.dbo.rp_t ORDER BY id LIMIT 100;
+
+statement ok
+CREATE TEMP TABLE via_off AS SELECT * FROM rp_off.dbo.rp_t ORDER BY id LIMIT 100;
+
+query II
+EXPLAIN SELECT * FROM rp_on.dbo.rp_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*CAST\(\[legacy\] AS NVARCHAR\(20\)\) AS \[legacy\].*\[g\]\.STAsBinary\(\) AS \[g\].*
+
+query I
+SELECT count(*) FROM (SELECT * FROM via_on EXCEPT ALL SELECT * FROM via_off);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM via_off EXCEPT ALL SELECT * FROM via_on);
+----
+0
+
+query I
+SELECT count(*) FROM via_on;
+----
+5
+
+query TTT
+SELECT column_name, a.data_type, b.data_type FROM duckdb_columns() a JOIN duckdb_columns() b USING (column_name)
+WHERE a.table_name = 'via_on' AND b.table_name = 'via_off' AND a.data_type <> b.data_type;
+----
+
+query T
+SELECT data_type FROM duckdb_columns() WHERE table_name = 'via_on' AND column_name IN ('legacy', 'ts', 'g') ORDER BY column_name;
+----
+GEOMETRY
+MSSQL_VARCHAR(20)
+TIMESTAMP_NS
+
+query II
+SELECT id, epoch_ns(ts) % 1000000000 FROM via_on WHERE ts IS NOT NULL ORDER BY id;
+----
+1	123456700
+2	100
+4	0
+5	999999900
+
+query IT
+SELECT id, legacy FROM via_on WHERE id = 1;
+----
+1	café
+
+#
+# Vetoes: the statement stays on the scan path, with the right rows.
+#
+
+# Nothing gained over the scan (which pushes projections and filters itself):
+# left to it, so an outer filter can still reach the server.
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE id = 2;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# A set operation's child the rewriter would push on its own: a bare child
+# stays with the scan, so the outer WHERE still reaches the server ...
+query II
+EXPLAIN SELECT * FROM (SELECT id FROM rp_on.dbo.rp_t UNION ALL SELECT id FROM loc) WHERE id = 2;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT * FROM (SELECT id FROM rp_on.dbo.rp_t UNION ALL SELECT id FROM loc) WHERE id = 2;
+----
+2
+
+# ... and one with a LIMIT is pushed: nothing outside can pass below a LIMIT.
+query II
+EXPLAIN (SELECT id FROM rp_on.dbo.rp_t ORDER BY id LIMIT 2) UNION ALL (SELECT id FROM loc);
+----
+physical_plan	<REGEX>:.*SELECT TOP \(2\) \[id\] FROM \[dbo\]\.\[rp_t\] ORDER BY \[rp_t\]\.\[id\] ASC.*
+
+query I
+(SELECT id FROM rp_on.dbo.rp_t ORDER BY id LIMIT 2) UNION ALL (SELECT id FROM loc) ORDER BY id;
+----
+1
+2
+99
+
+# nvarchar never orders like DuckDB (#362).
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t ORDER BY name LIMIT 2;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t ORDER BY name LIMIT 2;
+----
+2
+1
+
+# A NULL placement the server lacks, with no LIMIT to justify the CASE key.
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t ORDER BY n;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# rowid, a function, a constant the server would compare differently.
+query II
+EXPLAIN SELECT rowid FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE lower(name) = 'beta' ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE amount = 1.505 ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE amount = 1.505 ORDER BY id LIMIT 1;
+----
+
+# The setting read at ATTACH: rp_off never pushes.
+query II
+EXPLAIN SELECT id FROM rp_off.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+#
+# mssql_scan_parameterize_filters = false renders literals instead.
+#
+
+statement ok
+SET mssql_scan_parameterize_filters = false;
+
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE id >= 2 ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*Mssql Scan.*WHERE \[id\] >= 2 ORDER BY.*
+
+statement ok
+RESET mssql_scan_parameterize_filters;
+
+#
+# Inside a transaction the pushed statement runs on the pinned connection and
+# sees the transaction's own writes.
+#
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO rp_on.dbo.rp_t (id, n) VALUES (6, 5);
+
+query II
+SELECT id, n FROM rp_on.dbo.rp_t ORDER BY n LIMIT 2;
+----
+6	5
+3	10
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM rp_on.dbo.rp_t WHERE id = 6;
+----
+0
+
+#
+# A pushed query feeding a sink of the same catalog: the rewriter pushes the
+# SELECT of an INSERT on its own (the catalog claims no statement), and in a
+# transaction the raw scan materialises before the sink takes the pinned
+# connection. A CTAS keeps the catalog's column types (D3's CTAS window).
+#
+
+statement ok
+SELECT mssql_exec('rp_off', 'DROP TABLE IF EXISTS dbo.rp_ctas; DROP TABLE IF EXISTS dbo.rp_ins; CREATE TABLE dbo.rp_ins (id int, ts datetime2(7))');
+
+statement ok
+SELECT mssql_invalidate_cache('rp_on'), mssql_invalidate_cache('rp_off');
+
+query II
+EXPLAIN INSERT INTO rp_on.dbo.rp_ins SELECT id, ts FROM rp_on.dbo.rp_t ORDER BY id LIMIT 2;
+----
+physical_plan	<REGEX>:.*SELECT TOP \(2\) \[id\], \[ts\] FROM \[dbo\]\.\[rp_t\] ORDER BY \[rp_t\]\.\[id\] ASC.*
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO rp_on.dbo.rp_ins SELECT id, ts FROM rp_on.dbo.rp_t ORDER BY id LIMIT 2;
+
+statement ok
+INSERT INTO rp_on.dbo.rp_ins SELECT id, ts FROM rp_on.dbo.rp_t ORDER BY id DESC LIMIT 1;
+
+statement ok
+COMMIT;
+
+query II
+SELECT id, epoch_ns(ts) % 1000000000 FROM rp_off.dbo.rp_ins ORDER BY id;
+----
+1	123456700
+2	100
+5	999999900
+
+statement ok
+CREATE TABLE rp_on.dbo.rp_ctas AS SELECT id, name, legacy, ts FROM rp_on.dbo.rp_t ORDER BY id LIMIT 2;
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'rp_on' AND table_name = 'rp_ctas'
+AND column_name IN ('name', 'legacy', 'ts') ORDER BY column_name;
+----
+legacy	MSSQL_VARCHAR(20)
+name	MSSQL_NVARCHAR(50)
+ts	TIMESTAMP_NS
+
+statement ok
+SELECT mssql_exec('rp_off', 'DROP TABLE dbo.rp_ins; DROP TABLE dbo.rp_ctas');
+
+#
+# column_types, the vehicle's lever, refuses a type the column cannot be read as.
+#
+
+statement error
+SELECT * FROM mssql_scan('rp_on', 'SELECT 1 AS a', column_types := ['DATE']);
+----
+is described as INTEGER and cannot be read as DATE
+
+statement error
+SELECT * FROM mssql_scan('rp_on', 'SELECT 1 AS a', column_types := ['INTEGER', 'INTEGER']);
+----
+column_types names 2 type(s), the statement returns 1 column(s)
+
+# Only a datetime2 decodes into the vector's unit: a datetime relabelled as
+# TIMESTAMP_NS would read its microseconds as nanoseconds.
+statement error
+SELECT * FROM mssql_scan('rp_on', 'SELECT CAST(''2024-01-01'' AS datetime) AS d', column_types := ['TIMESTAMP_NS']);
+----
+cannot be read as TIMESTAMP_NS
+
+# A batch the server cannot describe runs at bind: refused before it runs.
+statement error
+SELECT * FROM mssql_scan('rp_on', 'CREATE TABLE #rp_x (a int); INSERT INTO #rp_x VALUES (1); SELECT a FROM #rp_x', column_types := ['INTEGER']);
+----
+column_types needs a statement the server can describe
+
+query I
+SELECT typeof(ts) FROM mssql_scan('rp_on', 'SELECT ts FROM dbo.rp_t WHERE id = 1', column_types := ['TIMESTAMP_NS']);
+----
+TIMESTAMP_NS
+
+statement ok
+SELECT mssql_exec('rp_off', 'DROP TABLE dbo.rp_t');
+
+statement ok
+DETACH rp_on;
+
+statement ok
+DETACH rp_off;

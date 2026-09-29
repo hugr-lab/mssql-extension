@@ -55,6 +55,14 @@ struct MSSQLScanBindData : public FunctionData {
 	string query;
 	vector<LogicalType> return_types;
 	vector<string> column_names;
+	//! Spec 079: the types the server DESCRIBED, when `column_types` replaced
+	//! them in return_types -- what the stream is checked against at init.
+	//! Empty otherwise (return_types is then what was described).
+	vector<LogicalType> described_types;
+	//! Bind-time only: whether `column_types` was given (refused for a batch
+	//! that must run at bind), and which described columns are datetime2.
+	bool wants_column_types = false;
+	vector<bool> described_datetime2;
 
 	// UUID handle to retrieve pre-initialized result stream registered on the
 	// owning MSSQLCatalog at Bind time (spec 047 / US3). Empty when there is

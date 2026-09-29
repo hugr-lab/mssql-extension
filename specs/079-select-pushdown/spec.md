@@ -161,6 +161,20 @@ through the vehicle, and without native types it would create `nvarchar(max)`
 where the catalog path creates `varchar(50)` with the source collation. W3
 closes it in the same PR; the interim window is zero.
 
+**Revised in PR B: the catalog's types, not the describe's.** Run on every
+table of the test database, the describe disagreed with the catalog on three
+things, all of them the read expression's doing: a code-page `varchar` read
+through its `NVARCHAR(n)` cast describes as nvarchar, `geometry` read through
+`STAsBinary()` as varbinary, and every `datetime2` as `TIMESTAMP` (µs), where
+the catalog reads `datetime2(0/3/7)` as `TIMESTAMP_S/MS/NS` -- losing the
+100 ns ticks of a `datetime2(7)`, so no DuckDB-side cast afterwards could
+repair it. The vehicle therefore takes `column_types := [...]` and reads each
+column INTO the catalog column's type, as the catalog scan does; the describe
+stays the init-time shape check. A relabel is allowed only where the decode
+honours it (`ColumnTypeFits`): a datetime2 into any TIMESTAMP variant (a
+datetime or smalldatetime decodes to µs whatever the vector), varbinary into
+GEOMETRY, a string into another string label.
+
 **Column resolution and the cache.** The dry run resolves columns against
 the metadata cache and **loads a table's metadata on first touch** as any
 catalog access does (spec 076: one round trip per fresh table, on the pinned

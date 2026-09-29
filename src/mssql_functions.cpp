@@ -58,6 +58,7 @@ unique_ptr<FunctionData> MSSQLScanBindData::Copy() const {
 	result->query = query;
 	result->return_types = return_types;
 	result->column_names = column_names;
+	result->described_types = described_types;
 	result->result_stream_id = result_stream_id;
 	// Shared, not copied: the rows are the same rows (issue #316).
 	result->materialized = materialized;
@@ -74,7 +75,8 @@ bool MSSQLScanBindData::Equals(const FunctionData &other) const {
 	// execute_sql carries the parameter values of mssql_scan_params: two
 	// calls with one text and different values must not be merged into one scan.
 	return context_name == other_data.context_name && query == other_data.query &&
-		   execute_sql == other_data.execute_sql && prepared == other_data.prepared;
+		   execute_sql == other_data.execute_sql && prepared == other_data.prepared &&
+		   return_types == other_data.return_types;
 }
 
 MSSQLScanGlobalState::~MSSQLScanGlobalState() {
@@ -134,6 +136,9 @@ MSSQLPreparedSession::~MSSQLPreparedSession() {
 struct MSSQLDescribedShape {
 	vector<LogicalType> types;
 	vector<string> names;
+	//! Per column: a datetime2, the one temporal type whose decode follows the
+	//! vector's TIMESTAMP unit (datetime / smalldatetime always decode to µs).
+	vector<bool> datetime2;
 	bool ok = false;
 	string reason;	// why not, for the debug log and the prepared error
 };
@@ -478,6 +483,7 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 		shape.types.push_back(NativeStringType(tds::encoding::TypeConverter::GetDuckDBType(column), native_types, base,
 											   max_length, collation));
 		shape.names.push_back(column.name);
+		shape.datetime2.push_back(base == "datetime2");
 	}
 	if (shape.types.empty()) {
 		shape.reason = "the statement returns no visible column";
@@ -525,6 +531,7 @@ static MSSQLDescribedShape PrepareStatement(tds::TdsConnection &connection, cons
 		any_needs_describe = any_needs_describe || ambiguous;
 		shape.types.push_back(WireStringType(col, native_types, utf8_acked));
 		shape.names.push_back(col.name);
+		shape.datetime2.push_back(col.type_id == tds::TDS_TYPE_DATETIME2);
 	}
 	shape.ok = true;
 	// COLMETADATA carries a collation as an id, not the name the annotation
@@ -578,6 +585,72 @@ static bool ReadPreparedOption(const TableFunctionBindInput &input) {
 		return false;
 	}
 	return BooleanValue::Get(it->second);
+}
+
+// Spec 079: whether a column the server describes as `described` can be read
+// into `wanted` -- the same wire value decoded into another DuckDB type, as
+// the catalog scan decodes it. A datetime2 into the TIMESTAMP variant of its
+// scale (the unit is the vector's, so datetime2(7) keeps its 100 ns ticks --
+// datetime2 only: datetime and smalldatetime decode to µs whatever the vector), a
+// varbinary into GEOMETRY (STAsBinary's WKB), a string into another string
+// type (the MSSQL_VARCHAR / MSSQL_NVARCHAR labels, same physical VARCHAR).
+static bool ColumnTypeFits(const LogicalType &described, const LogicalType &wanted, bool datetime2) {
+	if (described == wanted) {
+		return true;
+	}
+	auto is_timestamp = [](LogicalTypeId id) {
+		return id == LogicalTypeId::TIMESTAMP || id == LogicalTypeId::TIMESTAMP_SEC ||
+			   id == LogicalTypeId::TIMESTAMP_MS || id == LogicalTypeId::TIMESTAMP_NS;
+	};
+	if (is_timestamp(described.id()) && is_timestamp(wanted.id())) {
+		// Only a datetime2 decodes into the vector's unit; a datetime's
+		// microseconds written into a TIMESTAMP_NS vector would read 1000x small.
+		return datetime2 || wanted.id() == LogicalTypeId::TIMESTAMP;
+	}
+	if (described.id() == LogicalTypeId::BLOB && wanted.id() == LogicalTypeId::GEOMETRY) {
+		return true;
+	}
+	return described.id() == LogicalTypeId::VARCHAR && wanted.id() == LogicalTypeId::VARCHAR;
+}
+
+static bool HasColumnTypes(const TableFunctionBindInput &input) {
+	auto it = input.named_parameters.find("column_types");
+	return it != input.named_parameters.end() && !it->second.IsNull();
+}
+
+// Spec 079: `column_types := [...]` -- the type each result column is read as,
+// '' for the described one. What the remote-pushdown rewriter passes, so a
+// pushed `SELECT *` has the catalog's column types rather than the describe's
+// (a datetime2(7) is TIMESTAMP_NS, a non-UTF-8 varchar read through its
+// NVARCHAR cast still MSSQL_VARCHAR(n), geometry GEOMETRY). The describe
+// stays the check at init.
+static void ApplyColumnTypes(ClientContext &context, const TableFunctionBindInput &input, MSSQLScanBindData &bind_data,
+							 vector<LogicalType> &return_types) {
+	auto it = input.named_parameters.find("column_types");
+	if (it == input.named_parameters.end() || it->second.IsNull()) {
+		return;
+	}
+	auto &wanted = ListValue::GetChildren(it->second);
+	D_ASSERT(!bind_data.executed_at_bind);	// refused before execution in BindDescribedScan
+	if (wanted.size() != return_types.size()) {
+		throw InvalidInputException("mssql_scan: column_types names %llu type(s), the statement returns %llu column(s)",
+									(unsigned long long)wanted.size(), (unsigned long long)return_types.size());
+	}
+	auto described = return_types;
+	for (idx_t i = 0; i < wanted.size(); i++) {
+		if (wanted[i].IsNull() || wanted[i].ToString().empty()) {
+			continue;
+		}
+		auto type = TransformStringToLogicalType(wanted[i].ToString(), context);
+		const bool datetime2 = i < bind_data.described_datetime2.size() && bind_data.described_datetime2[i];
+		if (!ColumnTypeFits(described[i], type, datetime2)) {
+			throw InvalidInputException("mssql_scan: column %llu is described as %s and cannot be read as %s",
+										(unsigned long long)(i + 1), described[i].ToString(), type.ToString());
+		}
+		return_types[i] = type;
+	}
+	bind_data.described_types = std::move(described);
+	bind_data.return_types = return_types;
 }
 
 // The part of Bind shared by mssql_scan and mssql_scan_params: settle the
@@ -699,6 +772,7 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 		}
 		bind_data.return_types = shape.types;
 		bind_data.column_names = shape.names;
+		bind_data.described_datetime2 = shape.datetime2;
 		auto bind_ms =
 			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - bind_start)
 				.count();
@@ -710,6 +784,12 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	// F1 fallback: the server would not describe it, so learn the shape the way
 	// this function always had -- by running it.
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: describe fell back to execution: %s", shape.reason.c_str());
+	if (bind_data.wants_column_types) {
+		// Refused before the batch runs: its effects would otherwise already have
+		// happened, and a stream registered below would be left behind.
+		throw InvalidInputException("mssql_scan: column_types needs a statement the server can describe (%s)",
+									shape.reason);
+	}
 	bind_data.executed_at_bind = true;
 	auto exec_start = std::chrono::steady_clock::now();
 	MSSQLQueryExecutor executor(bind_data.context_name);
@@ -789,7 +869,9 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 	bind_data->prepared = ReadPreparedOption(input);
 	ValidateScanContext(context, bind_data->context_name);
 	mssql::SqlParamSet no_params;
+	bind_data->wants_column_types = HasColumnTypes(input);
 	BindDescribedScan(context, *bind_data, no_params, return_types, names);
+	ApplyColumnTypes(context, input, *bind_data, return_types);
 	return std::move(bind_data);
 }
 
@@ -813,7 +895,9 @@ unique_ptr<FunctionData> MSSQLScanParamsBind(ClientContext &context, TableFuncti
 	ValidateScanContext(context, bind_data->context_name);
 	auto params = mssql::BuildSqlParams(input.inputs[2], declarations_override);
 	bind_data->execute_sql = params.ExecuteSqlBatch(bind_data->query);
+	bind_data->wants_column_types = HasColumnTypes(input);
 	BindDescribedScan(context, *bind_data, params, return_types, names);
+	ApplyColumnTypes(context, input, *bind_data, return_types);
 	return std::move(bind_data);
 }
 
@@ -897,12 +981,13 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 			stream = executor.Execute(context, bind_data.execute_sql);
 		}
 		stream->SurfaceWarnings(context);
-		if (!StreamMatchesBoundShape(bind_data.return_types, *stream)) {
+		const auto &described = bind_data.described_types.empty() ? bind_data.return_types : bind_data.described_types;
+		if (!StreamMatchesBoundShape(described, *stream)) {
 			// The described shape is what the plan was built on; serving rows of
 			// another shape would be a silent wrong answer.
 			throw InvalidInputException(
 				"mssql_scan: the statement's result shape changed between bind and execution: bound (%s), got (%s)",
-				TypeListToString(bind_data.return_types), TypeListToString(stream->GetColumnTypes()));
+				TypeListToString(described), TypeListToString(stream->GetColumnTypes()));
 		}
 		if (materialize) {
 			// The stream is on the ONE connection this statement has to share --
@@ -1383,6 +1468,18 @@ void RegisterMSSQLExecFunction(ExtensionLoader &loader) {
 // Registration
 //===----------------------------------------------------------------------===//
 
+// EXPLAIN shows the statement a scan sends -- for spec 079 the review lever:
+// what the rewriter pushed is readable in the plan.
+static InsertionOrderPreservingMap<string> MSSQLScanToString(TableFunctionToStringInput &input) {
+	InsertionOrderPreservingMap<string> result;
+	if (input.bind_data) {
+		auto &bind_data = input.bind_data->Cast<MSSQLScanBindData>();
+		result["Database"] = bind_data.context_name;
+		result["Query"] = bind_data.query;
+	}
+	return result;
+}
+
 void RegisterMSSQLFunctions(ExtensionLoader &loader) {
 	// mssql_scan(context_name VARCHAR, query VARCHAR)
 	// -> dynamic return schema based on query result columns
@@ -1391,6 +1488,8 @@ void RegisterMSSQLFunctions(ExtensionLoader &loader) {
 	// Spec 075: `prepared := true` compiles once via sp_prepare instead of
 	// describing at bind and compiling again at execution.
 	mssql_scan.named_parameters["prepared"] = LogicalType::BOOLEAN;
+	mssql_scan.to_string = MSSQLScanToString;
+	mssql_scan.named_parameters["column_types"] = LogicalType::LIST(LogicalType::VARCHAR);
 	mssql::RegisterDocumentedFunction(
 		loader, TableFunctionSet(mssql_scan),
 		{{},
@@ -1409,6 +1508,8 @@ void RegisterMSSQLFunctions(ExtensionLoader &loader) {
 		TableFunction f("mssql_scan_params", arguments, MSSQLScanFunction, MSSQLScanParamsBind, MSSQLScanInitGlobal,
 						MSSQLScanInitLocal);
 		f.named_parameters["prepared"] = LogicalType::BOOLEAN;
+		f.to_string = MSSQLScanToString;
+		f.named_parameters["column_types"] = LogicalType::LIST(LogicalType::VARCHAR);
 		scan_params.AddFunction(f);
 	}
 	mssql::RegisterDocumentedFunction(

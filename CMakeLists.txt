@@ -195,6 +195,9 @@ set(EXTENSION_SOURCES
     src/table_scan/function_mapping.cpp
     src/table_scan/table_scan.cpp
     src/table_scan/mssql_optimizer.cpp
+    src/pushdown/mssql_order_term.cpp
+    src/pushdown/mssql_pushdown_resolution.cpp
+    src/pushdown/mssql_sql_writer.cpp
     # DML shared layer (UPDATE/DELETE common)
     src/dml/mssql_dml_config.cpp
     src/dml/mssql_rowid_extractor.cpp

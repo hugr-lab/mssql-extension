@@ -483,6 +483,18 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption("mssql_order_pushdown", "Enable ORDER BY pushdown to SQL Server (default: false)",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
 
+	// mssql_remote_pushdown - Spec 079: offer whole statements to DuckDB's
+	// remote-pushdown rewriter, which then runs what this catalog can render as
+	// one T-SQL statement on the server. Read once per catalog, at ATTACH: it
+	// fixes the catalog's answer to Supports(IS_REMOTE) and
+	// Supports(EXECUTE_QUERY_NODE) for its life -- DatabaseManager counts remote
+	// catalogs from IS_REMOTE at ATTACH and DETACH, so the answer must not change
+	// under it (spec 079 D6). Off until the vocabulary is complete.
+	config.AddExtensionOption("mssql_remote_pushdown",
+							  "Push whole SELECT statements to SQL Server through DuckDB's remote-pushdown rewriter; "
+							  "read at ATTACH (default: false)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
+
 	// mssql_convert_varchar_max - Convert VARCHAR(MAX) to NVARCHAR(MAX) in table scans
 	// When true: VARCHAR(MAX) with non-UTF8 collation is wrapped in CAST(... AS NVARCHAR(MAX))
 	// When false: VARCHAR(MAX) is NOT converted (preserves 4096-byte TDS buffer capacity)

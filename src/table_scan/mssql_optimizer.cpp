@@ -33,6 +33,7 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "mssql_functions.hpp"
 #include "mssql_storage.hpp"
+#include "pushdown/mssql_order_term.hpp"
 #include "query/mssql_identifier.hpp"
 #include "table_scan/filter_encoder.hpp"
 #include "table_scan/function_mapping.hpp"
@@ -292,55 +293,6 @@ static bool ResolveOrderExpression(const Expression &expr, const LogicalGet &get
 }
 
 //------------------------------------------------------------------------------
-// Helper: the ORDER BY term for one key, with DuckDB's NULL placement
-//------------------------------------------------------------------------------
-//
-// SQL Server has no NULLS FIRST / LAST: NULL sorts lowest, so ASC puts NULLs
-// first and DESC last, while DuckDB's default is NULLS LAST both ways. A
-// nullable key whose requested placement differs from the server's stops the
-// pushdown -- unless `emulate`, when a leading key sorts NULL where DuckDB wants
-// it: `CASE WHEN [col] IS NULL THEN 1 ELSE 0 END, <key> ASC` for NULLS LAST
-// ascending (spec 079 D2). Emulation is only for TOP N / LIMIT (review of
-// #387): the CASE key is not sargable, so the server sorts every row -- worth it
-// when only N rows cross the wire, a plain loss for a full ORDER BY, which
-// DuckDB sorts as the rows stream in. The NULL test is on the COLUMN, not the
-// fragment: a mapped function is null exactly when its argument is, and the
-// function is then not evaluated twice per row.
-//
-// False (term untouched) when the key cannot be pushed as asked: a placement
-// that needs emulation it may not use, or a null order that is neither FIRST
-// nor LAST -- the binder resolves the default before this runs, and anything
-// else refuses rather than guess (it used to be read as LAST).
-static bool OrderTerm(const string &fragment, const string &column, OrderType order_type, OrderByNullType null_order,
-					  bool is_nullable, bool emulate, string &out_term) {
-	const bool descending = order_type == OrderType::DESCENDING;
-	const string term = fragment + (descending ? " DESC" : " ASC");
-	// A NOT NULL key has no placement to honour, whatever the node says
-	// (review of #387: the check below came first and refused ORDER_DEFAULT on
-	// such a key).
-	if (!is_nullable) {
-		out_term = term;
-		return true;
-	}
-	if (null_order != OrderByNullType::NULLS_FIRST && null_order != OrderByNullType::NULLS_LAST) {
-		return false;
-	}
-	const bool nulls_first = null_order == OrderByNullType::NULLS_FIRST;
-	const bool server_puts_nulls_first = !descending;
-	if (nulls_first == server_puts_nulls_first) {
-		out_term = term;
-		return true;
-	}
-	if (!emulate) {
-		return false;
-	}
-	// The leading key sorts ascending: the side that must come first gets 0.
-	out_term = "CASE WHEN " + mssql::QuoteIdentifier(column) + " IS NULL THEN " +
-			   (nulls_first ? "0 ELSE 1" : "1 ELSE 0") + " END, " + term;
-	return true;
-}
-
-//------------------------------------------------------------------------------
 // Core: Process ORDER BY nodes and build pushdown clause
 //------------------------------------------------------------------------------
 static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const LogicalGet &get,
@@ -373,18 +325,16 @@ static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const L
 			break;
 		}
 		const auto &column = bind_data.mssql_columns[table_col_idx];
-		if (!column.OrdersLikeDuckDB()) {
-			if (!(limited && is_column && column.OrdersLikeDuckDBAsBytes())) {
-				MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: %s does not order like DuckDB on the server",
-								(unsigned long long)i, source_column.c_str());
-				break;	// Stop at first non-pushable column (prefix only)
-			}
-			fragment = "CAST(" + fragment + " AS varbinary(" + std::to_string(column.max_length) + "))";
+		if (!mssql::OrderKeyFragment(column, fragment, is_column, limited, fragment)) {
+			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: %s does not order like DuckDB on the server", (unsigned long long)i,
+							source_column.c_str());
+			break;	// Stop at first non-pushable column (prefix only)
 		}
 		const bool is_nullable = column.is_nullable;
 
 		string term;
-		if (!OrderTerm(fragment, source_column, order.type, order.null_order, is_nullable, limited, term)) {
+		if (!mssql::OrderTerm(fragment, mssql::QuoteIdentifier(source_column), order.type, order.null_order,
+							  is_nullable, limited, term)) {
 			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: NULL placement of %s cannot be pushed here", (unsigned long long)i,
 							source_column.c_str());
 			break;

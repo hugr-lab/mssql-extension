@@ -27,6 +27,7 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 class MSSQLSchemaEntry;
+class MSSQLTableEntry;
 class MSSQLStatisticsProvider;
 class MSSQLTransactionMetadata;
 class PhysicalPlanGenerator;
@@ -34,6 +35,10 @@ class LogicalCreateTable;
 class LogicalInsert;
 class LogicalDelete;
 class LogicalUpdate;
+
+namespace mssql {
+struct WrittenQuery;
+}  // namespace mssql
 
 //===----------------------------------------------------------------------===//
 // MSSQLCatalog - DuckDB catalog representing an attached SQL Server database
@@ -59,6 +64,9 @@ struct MSSQLCatalogStartup {
 	//! Open mssql_min_connections up front, concurrently (Prewarm). Off
 	//! under lazy_validation.
 	bool prewarm = false;
+	//! Spec 079: mssql_remote_pushdown as it stood at ATTACH -- this catalog's
+	//! answer to Supports(IS_REMOTE / EXECUTE_QUERY_NODE) for its life.
+	bool remote_pushdown = false;
 };
 
 class MSSQLCatalog : public Catalog {
@@ -344,6 +352,40 @@ public:
 	//! validated where they are applied, so an unsupported one is still an error
 	//! rather than a silently ignored request.
 	ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override;
+
+	//===--------------------------------------------------------------------===//
+	// Remote pushdown (spec 079)
+	//===--------------------------------------------------------------------===//
+	//! IS_REMOTE and EXECUTE_QUERY_NODE exactly when mssql_remote_pushdown was on
+	//! at ATTACH (D6); never EXECUTE_STATEMENT or CONNECT.
+	bool Supports(RemoteCapability capability) const override;
+	//! The rewriter's dry run (D1). RemoteExecute cannot decline, so every
+	//! refusal happens here. The base class answers `true` to all four, which
+	//! would hand the rewriter statements this catalog cannot render.
+	bool SupportsPushdown(const ParsedExpression &expression) override;
+	bool SupportsPushdown(const TableRef &ref) override;
+	bool SupportsPushdown(const QueryNode &node) override;
+	bool SupportsPushdown(const SQLStatement &statement) override;
+	//! The schema a pushed statement's base table is in: the default schema
+	//! when it names none; `stripped` once the rewriter removed the catalog.
+	string PushdownSchemaOf(const BaseTableRef &ref, bool stripped) const;
+	//! Whether every search-path entry of this catalog is its default schema,
+	//! so an unqualified name binds where the rewriter looked it up.
+	bool SearchPathIsDefaultSchema(ClientContext &context) const;
+	struct PushdownTable {
+		MSSQLTableEntry *entry = nullptr;
+		ClientContext *context = nullptr;
+		shared_ptr<MSSQLTableEntry> keep_entry;	 // held while the writer runs
+		shared_ptr<ClientContext> keep_context;
+	};
+	//! The table a pushed base-table reference names: looked up with
+	//! `context` when there is one, else the entry this thread noted.
+	PushdownTable ResolvePushdownTable(const BaseTableRef &ref, optional_ptr<ClientContext> context);
+	//! Spec 079: the writer's run over `node` -- the dry run and the kept one.
+	bool WritePushdown(const QueryNode &node, mssql::WrittenQuery &out, string &why,
+					   optional_ptr<ClientContext> context = nullptr);
+	//! D3: the node as a call of mssql_scan_params / mssql_scan; lazy.
+	unique_ptr<TableRef> RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) override;
 
 	// Get connection info
 	const MSSQLConnectionInfo &GetConnectionInfo() const;

@@ -769,6 +769,41 @@ sequenceDiagram
     BA->>BA: drop anchors — entries refcount may drop to zero if Invalidate ran
 ```
 
+### The remote-pushdown path (spec 079, behind `mssql_remote_pushdown`)
+
+With the setting on at ATTACH the catalog answers DuckDB's
+`RemotePushdownOptimizer`, which runs on the **parsed** statement, before the
+binder. Its own table lookup still reaches `MSSQLTableSet::GetEntry`, which
+notes the entry and the context on a thread-local list
+(`pushdown/mssql_pushdown_resolution`). The rewriter's hooks get no context,
+so this list is how they see the table. `SupportsPushdown(QueryNode)` runs the
+writer (`pushdown/mssql_sql_writer`) as a dry run, and `RemoteExecute` runs it
+again and replaces the node with `mssql_scan_params(…, column_types := […])`.
+From there the statement is an ordinary raw scan: describe at bind, run at
+init, and the pinned connection inside a transaction.
+
+```mermaid
+flowchart LR
+    P[parsed SELECT] --> R{rewriter:<br/>SupportsPushdown}
+    R -- "writer renders it and it sends<br/>more than the scan (ORDER BY / LIMIT)" --> V["mssql_scan_params(T-SQL, params,<br/>column_types) — EXPLAIN shows it"]
+    R -- otherwise --> B[binder → MSSQLCatalogScan<br/>filter / projection pushdown, MSSQLOptimizer]
+```
+
+Invariants:
+
+- **One list.** A construct is pushed iff the writer has an exact form for it
+  (D1). Everything else is a veto and runs on the scan path as before.
+- **No double application.** A pushed node reaches the planner as a raw scan,
+  which has no filter pushdown and which `MSSQLOptimizer` does not rewrite. A
+  vetoed node never reaches the vehicle.
+- **The scan path keeps what it serves as well** (`PushesMoreThanScan`). The
+  rewriter pushes a set operation's children, and an INSERT's or CTAS's query,
+  on their own, and a pushed bare scan there would lose the enclosing
+  filters.
+- **Types are the catalog's.** A pushed column reports the type its catalog
+  column reports, decoded into it as the catalog scan decodes it
+  (`column_types`). The describe remains the init-time shape check.
+
 ---
 
 ## The write path (spec 057)
@@ -1073,6 +1108,7 @@ Two lifetime rules that are easy to get wrong:
 | 052 | `shared_ptr` ownership for schema/table entries + `enable_shared_from_this`; `MSSQLBindAnchors` per-ClientContext anchor holder; `MSSQLTableSet` singleflight loader; `MSSQLTableEntry::pk_load_mutex_` double-checked PK load |
 | #178 | Single cache-wide mutex in `MSSQLMetadataCache` (was split across two, Refresh raced readers → UAF); atomic TTL/timeout config fields; `known_table_names_` consistently under `names_mutex_` (Scan was mutating it under `entry_mutex_`); thread-safe magic-static debug-level init everywhere |
 | 060 | `codec/target_string_type` — a string column's stated SQL Server type on the `LogicalType` (layer 5), read by both DDL translators and the BCP metadata builders. **Layer 3 now reports it**: `MSSQLTableEntry` hands DuckDB `MSSQLColumnInfo::NativeDuckDBType()` rather than a bare VARCHAR, gated by `mssql_catalog_native_types` — which is why the filter encoder had to learn to see through the no-op cast DuckDB inserts. `MSSQLCatalog` gains the collation rules (`ResolveVarcharCollation`, `WireVarcharCollation`) and the endpoint guarantees (`RequiresSingleByteText`, `ValidateStringTargets`, `ValidateTableOptions`) so CREATE TABLE, CTAS and COPY cannot drift apart on them |
+| 079 | The remote-pushdown path (above): `pushdown/` — the thread-local table resolution, the T-SQL writer (the one list of what pushes), `mssql::OrderTerm` / `OrderKeyFragment` shared with `MSSQLOptimizer`; `mssql_scan` / `mssql_scan_params` gain `column_types` and an EXPLAIN rendering |
 | 057 | The write path above. `codec::ResolveWriteColumnOps` resolves a `ScatterArm` per column so the encode loop carries no type test, and one `RowFallback` takes the whole chunk row-major. Both sinks become `ParallelSink`, with writers claimed per thread against a `parallel_writer_limit` (spec 070 W2 makes that claim a per-chunk retry behind a columnstore warm-up gate). CTAS stops using the transaction's pinned connection entirely — its DDL and its rows both go to pool connections, so `ROLLBACK` undoes neither and the compensation is `mssql_ctas_drop_on_failure`'s DROP, wired to `~CTASExecutionState` as well as to the sink's catch blocks. `LogicalTypeId::UTINYINT` becomes the resolved type of a SQL Server `tinyint` column (one unsigned byte), leaving `TINYINT` to mean a signed source that travels as a smallint |
 
 ## Where to read the code
