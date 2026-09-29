@@ -352,6 +352,7 @@ int main() {
 		}
 	}
 	ExpectVeto("SELECT coalesce(sum(id), sum(amount)) FROM t");
+	ExpectVeto("SELECT -sum(id) FROM t");
 	ExpectVeto("SELECT min(name) FROM t");	// strings order by collation (#362)
 	ExpectVeto("SELECT max(ts) FROM t");	// datetime2(7) is off the order list
 	ExpectVeto("SELECT sum(flag) FROM t");	// bit

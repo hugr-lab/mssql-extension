@@ -172,6 +172,17 @@ SELECT count(*), sum(x) FROM ra_off.dbo.ra_e GROUP BY ();
 ----
 0	NULL
 
+# AVG of an exact numeric over no rows: NULL / 0 is NULL there, not 8134.
+query II
+EXPLAIN SELECT avg(x) FROM ra_on.dbo.ra_e;
+----
+physical_plan	<REGEX>:.*CAST\(SUM\(CAST\(\[x\] AS decimal\(38,0\)\)\) AS float\) / COUNT_BIG\(\[x\]\).*
+
+query R
+SELECT avg(x) FROM ra_on.dbo.ra_e;
+----
+NULL
+
 # DISTINCT.
 query II
 EXPLAIN SELECT DISTINCT g FROM ra_on.dbo.ra_t ORDER BY g;

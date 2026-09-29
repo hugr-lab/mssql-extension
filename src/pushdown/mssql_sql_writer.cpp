@@ -1177,6 +1177,11 @@ bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
 			operand.type.id() == LogicalTypeId::UTINYINT || !IsArithmeticType(operand.type)) {
 			return Veto("negation " + fn.ToString());
 		}
+		if (operand.cast_result) {
+			// An integer SUM is HUGEINT here, decimal(38,0) there: its negation
+			// would come back as the server's type.
+			return Veto("negation of an integer SUM");
+		}
 		std::string why;
 		auto mapping =
 			ExpressionVocabulary::FunctionFor("negate", {operand.type}, why, options_.division_by_zero_errors);
