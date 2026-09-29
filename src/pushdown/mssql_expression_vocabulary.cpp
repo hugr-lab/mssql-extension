@@ -524,6 +524,59 @@ const FunctionMapping *ExpressionVocabulary::FunctionFor(const std::string &name
 			}
 		}
 	}
+	if (name == "+" || name == "-" || name == "*") {
+		for (const auto &type : arg_types) {
+			// Numbers only: DuckDB's `date + 1` is a date, T-SQL's `+` refuses
+			// a date and an int (206) -- the bound tree reaches the scan's
+			// encoder with the DATE operand, the parsed one the writer with it.
+			if (!type.IsNumeric()) {
+				why = name + " on " + type.ToString() + " not pushed (T-SQL's operator is numeric)";
+				return nullptr;
+			}
+		}
+		if (name == "*" && arg_types.size() == 2) {
+			for (const auto &type : arg_types) {
+				// A double product overflows near 1e154: error 8115 on the server
+				// -- for every row WHERE passes, TOP's discards included --
+				// where DuckDB gives inf (spec 079 PR D full review).
+				if (type.id() == LogicalTypeId::DOUBLE || type.id() == LogicalTypeId::FLOAT) {
+					why = "* on " + type.ToString() + " not pushed (overflows on the server where DuckDB says inf)";
+					return nullptr;
+				}
+			}
+			// DuckDB types DECIMAL(w1,s1) * DECIMAL(w2,s2) as DECIMAL(w1 + w2,
+			// s1 + s2), but CAPS it at 18 when both factors fit 18 and the
+			// scale does too -- then raising an overflow where the server holds
+			// the value (99999999.99 squared in decimal(10,2)).
+			if (arg_types[0].id() == LogicalTypeId::DECIMAL && arg_types[1].id() == LogicalTypeId::DECIMAL) {
+				const auto w1 = DecimalType::GetWidth(arg_types[0]);
+				const auto w2 = DecimalType::GetWidth(arg_types[1]);
+				const auto s1 = DecimalType::GetScale(arg_types[0]);
+				const auto s2 = DecimalType::GetScale(arg_types[1]);
+				if (w1 <= 18 && w2 <= 18 && w1 + w2 > 18 && s1 + s2 < 18) {
+					why = "a decimal product DuckDB types as DECIMAL(18) not pushed (it overflows there first)";
+					return nullptr;
+				}
+			}
+		}
+		// Past 38 digits the server reduces the result's SCALE, rounding the
+		// value, where DuckDB keeps it exact: decimal(19,4) * decimal(19,4) is
+		// decimal(38,7) there, DECIMAL(38,8) here (measured, PR C); the server's
+		// precision is p1 + p2 + 1 for *, max(s) + max(p - s) + 1 for + and -.
+		if (arg_types.size() == 2 && arg_types[0].id() == LogicalTypeId::DECIMAL &&
+			arg_types[1].id() == LogicalTypeId::DECIMAL) {
+			const auto w1 = DecimalType::GetWidth(arg_types[0]);
+			const auto w2 = DecimalType::GetWidth(arg_types[1]);
+			const auto s1 = DecimalType::GetScale(arg_types[0]);
+			const auto s2 = DecimalType::GetScale(arg_types[1]);
+			const auto server_precision = name == "*" ? w1 + w2 + 1 : std::max(s1, s2) + std::max(w1 - s1, w2 - s2) + 1;
+			if (server_precision > 38) {
+				why = name + " of " + arg_types[0].ToString() + " and " + arg_types[1].ToString() +
+					  " not pushed (past 38 digits the server rounds the scale)";
+				return nullptr;
+			}
+		}
+	}
 	if (mapping->expected_args != static_cast<int>(arg_types.size())) {
 		why = name + " expects " + std::to_string(mapping->expected_args) + " args, got " +
 			  std::to_string(arg_types.size());

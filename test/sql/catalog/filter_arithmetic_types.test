@@ -1,0 +1,63 @@
+# name: test/sql/catalog/filter_arithmetic_types.test
+# description: The scan's filter pushdown sends + - * only where the server computes what DuckDB does (spec 079 C, from PR D's full review)
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The filter encoder and the remote-pushdown writer share one vocabulary
+# (ExpressionVocabulary::FunctionFor). Three shapes it used to send, each a
+# different answer from DuckDB's:
+#   - `date + 1`: a date in DuckDB, error 206 on the server (T-SQL's `+`
+#     refuses a date and an int);
+#   - a double product: inf in DuckDB, error 8115 on the server near 1e154;
+#   - a decimal product DuckDB types as DECIMAL(18): DuckDB overflows first,
+#     where the server returned rows.
+# Each now stays with DuckDB, which answers as it does locally.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS fat (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('fat', 'DROP TABLE IF EXISTS dbo.fat_t;
+	CREATE TABLE dbo.fat_t (id int NOT NULL, dt date NULL, f float NULL, v decimal(10,2) NULL, s decimal(5,2) NULL);
+	INSERT INTO dbo.fat_t VALUES (1, ''2024-05-01'', 1e200, 99999999.99, 999.99), (2, ''2024-01-01'', 2.0, 1.50, 1.50)');
+
+query I
+SELECT id FROM fat.dbo.fat_t WHERE dt + 1 > DATE '2024-05-01' ORDER BY id;
+----
+1
+
+query I
+SELECT id FROM fat.dbo.fat_t WHERE f * f > f ORDER BY id;
+----
+1
+2
+
+statement error
+SELECT id FROM fat.dbo.fat_t WHERE v * v > 1 ORDER BY id;
+----
+Overflow in multiplication of DECIMAL(18)
+
+# A product DuckDB types exactly (5 + 5 digits) is still pushed.
+query I
+SELECT id FROM fat.dbo.fat_t WHERE s * s > 100 ORDER BY id;
+----
+1
+
+# + and - over numbers stay pushed.
+query I
+SELECT id FROM fat.dbo.fat_t WHERE f + f > 3 ORDER BY id;
+----
+1
+2
+
+statement ok
+SELECT mssql_exec('fat', 'DROP TABLE dbo.fat_t');
+
+statement ok
+DETACH fat;

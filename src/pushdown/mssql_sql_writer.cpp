@@ -851,11 +851,10 @@ bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
 		}
 		out.type = LogicalType::DECIMAL(width + 1, DecimalType::GetScale(left.type));
 	} else {
-		// A product: DECIMAL(18,4) here, decimal(21,4) there for (10,2) * (10,2)
-		// -- the value agrees while the server's precision p1 + p2 + 1 fits 38.
-		// Past it the server reduces the scale and ROUNDS (measured: (19,4) *
-		// (19,4) is decimal(38,7) there, DECIMAL(38,8) here), so that is vetoed.
-		// The type differs either way, so nothing is compared with a product.
+		// A product (FunctionFor, below, refuses the ones DuckDB caps at
+		// DECIMAL(18) and the ones past the server's 38 digits): the value
+		// agrees, the type does not (decimal(p1 + p2 + 1, …) there), so nothing
+		// is compared with a product.
 		if (2 * DecimalType::GetWidth(left.type) + 1 > 38) {
 			return Veto("a decimal product wider than 38 digits");
 		}

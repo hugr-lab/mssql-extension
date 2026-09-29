@@ -25,6 +25,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "pushdown/mssql_expression_vocabulary.hpp"
 #include "query/mssql_sql_params.hpp"
 #include "table_scan/filter_encoder.hpp"
 #include "table_scan/function_mapping.hpp"
@@ -687,6 +688,33 @@ int main() {
 	ASSERT_TRUE(!IsLikePatternFunction("icontains"));
 	ASSERT_TRUE(!IsLikePatternFunction("iprefix"));
 	ASSERT_TRUE(!IsLikePatternFunction("isuffix"));
+
+	// Arithmetic operators take numbers only (DuckDB's `date + 1` is a date,
+	// T-SQL refuses it: 206); a double product overflows on the server where
+	// DuckDB says inf; a decimal product DuckDB caps at DECIMAL(18) overflows
+	// there first (spec 079 C, from PR D's full review).
+	{
+		std::string why;
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("+", {LogicalType::DATE, LogicalType::INTEGER}, why));
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("-", {LogicalType::TIMESTAMP, LogicalType::INTERVAL}, why));
+		ASSERT_TRUE(ExpressionVocabulary::FunctionFor("+", {LogicalType::DOUBLE, LogicalType::DOUBLE}, why));
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("*", {LogicalType::DOUBLE, LogicalType::DOUBLE}, why));
+		ASSERT_TRUE(
+			!ExpressionVocabulary::FunctionFor("*", {LogicalType::DECIMAL(10, 2), LogicalType::DECIMAL(10, 2)}, why));
+		ASSERT_TRUE(
+			ExpressionVocabulary::FunctionFor("*", {LogicalType::DECIMAL(9, 2), LogicalType::DECIMAL(9, 2)}, why));
+		ASSERT_TRUE(ExpressionVocabulary::FunctionFor("*", {LogicalType::INTEGER, LogicalType::INTEGER}, why));
+		// DuckDB caps at 18 only while the scale fits: (18,10)^2 is DECIMAL(36,20).
+		ASSERT_TRUE(
+			ExpressionVocabulary::FunctionFor("*", {LogicalType::DECIMAL(18, 10), LogicalType::DECIMAL(18, 10)}, why));
+		// Past 38 digits the server rounds the scale.
+		ASSERT_TRUE(
+			!ExpressionVocabulary::FunctionFor("*", {LogicalType::DECIMAL(19, 4), LogicalType::DECIMAL(19, 4)}, why));
+		ASSERT_TRUE(
+			!ExpressionVocabulary::FunctionFor("+", {LogicalType::DECIMAL(38, 10), LogicalType::DECIMAL(38, 10)}, why));
+		ASSERT_TRUE(
+			ExpressionVocabulary::FunctionFor("+", {LogicalType::DECIMAL(10, 2), LogicalType::DECIMAL(10, 2)}, why));
+	}
 
 	std::cout << "Running FilterEncoder unit tests..." << std::endl;
 

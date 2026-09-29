@@ -191,10 +191,9 @@ int main() {
 			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([amount] + @p0) > @p1)");
 	ExpectSql("SELECT id + 1 FROM t LIMIT 1", "SELECT TOP (1) ([id] + CAST(1 AS int)) AS [(id + 1)] FROM [dbo].[t]",
 			  false);
-	ExpectVeto("SELECT wide + wide FROM t LIMIT 1");  // width 38: the server would round
-	ExpectVeto("SELECT mid * mid FROM t LIMIT 1");	  // p1 + p2 + 1 > 38: the server reduces the scale
-	ExpectSql("SELECT amount * amount AS p FROM t LIMIT 1",
-			  "SELECT TOP (1) ([amount] * [amount]) AS [p] FROM [dbo].[t]");
+	ExpectVeto("SELECT wide + wide FROM t LIMIT 1");				   // width 38: the server would round
+	ExpectVeto("SELECT mid * mid FROM t LIMIT 1");					   // p1 + p2 + 1 > 38: the server reduces the scale
+	ExpectVeto("SELECT amount * amount AS p FROM t LIMIT 1");		   // DuckDB's DECIMAL(18) product overflows first
 	ExpectVeto("SELECT id + amount FROM t LIMIT 1");				   // int + decimal: the promotions differ
 	ExpectVeto("SELECT id + 2.5 FROM t LIMIT 1");					   // not exact in int
 	ExpectVeto("SELECT name + 1 FROM t LIMIT 1");					   // not a number
