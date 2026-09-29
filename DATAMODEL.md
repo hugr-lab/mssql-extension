@@ -785,7 +785,7 @@ init, and the pinned connection inside a transaction.
 ```mermaid
 flowchart LR
     P[parsed SELECT] --> R{rewriter:<br/>SupportsPushdown}
-    R -- "writer renders it and it sends<br/>more than the scan (ORDER BY / LIMIT)" --> V["mssql_scan_params(T-SQL, params,<br/>column_types) — EXPLAIN shows it"]
+    R -- "writer renders it and it sends more than the scan<br/>(ORDER BY / LIMIT / DISTINCT / GROUP BY / aggregate / join)" --> V["mssql_scan_params(T-SQL, params,<br/>column_types) — EXPLAIN shows it"]
     R -- otherwise --> B[binder → MSSQLCatalogScan<br/>filter / projection pushdown, MSSQLOptimizer]
 ```
 
@@ -803,7 +803,21 @@ Invariants:
 - **Types are the catalog's.** A pushed column reports the type its catalog
   column reports, decoded into it as the catalog scan decodes it
   (`column_types`). The describe remains the init-time shape check. A
-  computed column's type is the server's (its describe).
+  computed column's type is the server's (its describe); an aggregate's is
+  DuckDB's, and an integer `sum` -- `decimal(38,0)` on the wire, HUGEINT in
+  DuckDB -- is cast back in a projection `RemoteExecute` puts over the vehicle.
+- **Joins name their own relations** (PR D). The writer resolves every table
+  of the join tree (`MSSQLCatalog::WritePushdown`, before it runs), keeps one
+  flat column list, and aliases each relation `[r1]`, `[r2]`, ... with every
+  column qualified by it, so a user alias or table name never shadows
+  another. A SEMI / ANTI join is an `EXISTS` / `NOT EXISTS` ANDed to WHERE.
+- **Set-operation children are not told apart.** The rewriter pushes a set
+  operation's children one by one when the set operation also reads another
+  catalog or a local table (over this catalog alone it offers the whole set
+  operation, which the writer refuses until PR E). The hook gets the node
+  alone, so a join or an aggregate that is such a child is pushed like a
+  statement and the filters above it apply after -- correct rows, sometimes
+  more of them sent.
 - **One vocabulary, two walkers** (PR C). `pushdown/mssql_expression_vocabulary`
   holds the atoms: those both paths render with -- constants and their
   parameter declarations, comparisons, IN, BETWEEN, CASE, LIKE, the function
