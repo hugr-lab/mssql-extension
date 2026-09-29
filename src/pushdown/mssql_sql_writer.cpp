@@ -27,6 +27,7 @@
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/type_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
@@ -109,11 +110,6 @@ bool BuiltinTypeOf(const TypeExpression &type, LogicalTypeId &out) {
 	return out != LogicalTypeId::INVALID && out != LogicalTypeId::UNBOUND;
 }
 
-struct OutputColumn {
-	std::string name;	 // the name DuckDB gives the result column
-	idx_t column_index;	 // into the table's columns; INVALID for a computed one
-};
-
 //! An operand of an expression the writer renders, with what its type rules
 //! need. A constant has no type of its own in the parsed tree -- the binder
 //! gives it one from what it meets -- so it waits (`constant`) until its peer
@@ -133,7 +129,87 @@ struct Operand {
 	//! inf / NaN -- fine as a selected value, not under COALESCE, which would
 	//! turn that NULL into its fallback.
 	bool division = false;
+	//! A floating-point aggregate (or a value computed from one): DuckDB and
+	//! the server accumulate in different orders, so it differs in its last
+	//! bits (spec 079 D2) -- recorded for a value, vetoed where it would choose
+	//! rows (a condition, an ORDER BY, a DISTINCT).
+	bool approximate = false;
+	//! An aggregate the server orders as DuckDB does (COUNT, an exact SUM, MIN
+	//! / MAX of a column that orders alike): an ORDER BY key.
+	bool orderable = false;
+	//! Never NULL (COUNT): no NULL placement to emulate when ordered.
+	bool not_null = false;
+	//! The DuckDB type of the value as a result column, when the writer knows
+	//! it (an aggregate); INVALID leaves it to the server's describe.
+	LogicalType result_type;
+	//! `result_type` is not what the wire decodes into: cast after the read.
+	bool cast_result = false;
 };
+
+struct OutputColumn {
+	std::string name;	 // the name DuckDB gives the result column
+	idx_t column_index;	 // into the table's columns; INVALID for a computed one
+	//! A column read as itself (no CAST in BuildReadExpression): what an ORDER
+	//! BY under DISTINCT can name (else T-SQL error 145).
+	bool plain_read = false;
+	//! A computed column's value.
+	Operand value;
+};
+
+//! The aggregates the writer renders, by DuckDB name.
+enum class AggregateKind { CountStar, Count, Sum, Avg, Min, Max, Stdev, StdevP, Var, VarP };
+
+bool AggregateFor(const std::string &function_name, AggregateKind &out) {
+	static const std::pair<const char *, AggregateKind> AGGREGATES[] = {{"count_star", AggregateKind::CountStar},
+																		{"count", AggregateKind::Count},
+																		{"sum", AggregateKind::Sum},
+																		{"avg", AggregateKind::Avg},
+																		{"mean", AggregateKind::Avg},
+																		{"min", AggregateKind::Min},
+																		{"max", AggregateKind::Max},
+																		{"stddev", AggregateKind::Stdev},
+																		{"stddev_samp", AggregateKind::Stdev},
+																		{"stddev_pop", AggregateKind::StdevP},
+																		{"variance", AggregateKind::Var},
+																		{"var_samp", AggregateKind::Var},
+																		{"var_pop", AggregateKind::VarP}};
+	for (auto &aggregate : AGGREGATES) {
+		if (StringUtil::CIEquals(function_name, aggregate.first)) {
+			out = aggregate.second;
+			return true;
+		}
+	}
+	return false;
+}
+
+//! Whether `expr` holds one of those aggregates -- what makes a node an
+//! aggregate query in DuckDB's binder as in T-SQL.
+bool ContainsAggregate(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
+		AggregateKind kind;
+		if (AggregateFor(expr.Cast<FunctionExpression>().FunctionName().GetIdentifierName(), kind)) {
+			return true;
+		}
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+		expr, [&](const ParsedExpression &child) { found = found || ContainsAggregate(child); });
+	return found;
+}
+
+//! A column GROUP BY and DISTINCT may take: one the server compares -- and
+//! so groups -- as DuckDB does (strings under D4: their sets are the
+//! server's). Geometry, xml and text are not comparable there at all (249,
+//! 421); datetime2(7) reads values past 2262 as NULL (#168).
+bool IsGroupable(const MSSQLColumnInfo &column) {
+	const auto type = StringUtil::Lower(column.sql_type_name);
+	if ((type == "time" || type == "datetimeoffset") && column.scale >= 7) {
+		// Read as microseconds: two values 100 ns apart are two groups there and
+		// one value here -- harmless for an order, not for a set.
+		return false;
+	}
+	return KindOf(column) != ComparableKind::None || column.OrdersLikeDuckDB();
+}
 
 //! Integer and exact-decimal types that arithmetic keeps as they are on both
 //! sides: same-type operands give that type, overflow an error on both
@@ -149,6 +225,22 @@ bool IsArithmeticType(const LogicalType &type) {
 		return true;
 	default:
 		return false;
+	}
+}
+
+//! Integer width rank, for a widening cast; -1 for a non-integer.
+int IntegerRank(LogicalTypeId id) {
+	switch (id) {
+	case LogicalTypeId::UTINYINT:
+		return 1;
+	case LogicalTypeId::SMALLINT:
+		return 2;
+	case LogicalTypeId::INTEGER:
+		return 3;
+	case LogicalTypeId::BIGINT:
+		return 4;
+	default:
+		return -1;
 	}
 }
 
@@ -169,6 +261,16 @@ private:
 	//! name that is not one of them -- rowid, a column of another relation --
 	//! or matches two (a case-sensitive database may hold `a` and `A`).
 	bool ResolveColumn(const ColumnRefExpression &ref, idx_t &out);
+	//! ResolveColumn without the veto: 1 found, 0 not a column of the table,
+	//! -1 a reference no lookup can answer (another relation, ambiguous).
+	int FindColumn(const ColumnRefExpression &ref, idx_t &out) const;
+	//! After grouping (SELECT, HAVING, ORDER BY of an aggregate query), a bare
+	//! column must be a GROUP BY key -- DuckDB's binder error otherwise, which
+	//! the server's (8120) must not replace.
+	bool CheckGrouped(idx_t index);
+	bool WriteGroups(const SelectNode &node, std::string &sql);
+	bool GroupKeyColumn(const SelectNode &node, const ParsedExpression &key, idx_t &out);
+	bool WriteAggregate(const FunctionExpression &fn, AggregateKind kind, Operand &out);
 	bool WriteSelectList(const SelectNode &node);
 	bool WritePredicate(const ParsedExpression &expr, std::string &sql);
 	bool WritePredicateImpl(const ParsedExpression &expr, std::string &sql);
@@ -212,6 +314,16 @@ private:
 	std::vector<OutputColumn> outputs_;
 	//! Inside WHERE / a WHEN: a division there is vetoed (see WriteDivide).
 	int predicate_depth_ = 0;
+	//! GROUP BY, HAVING or an aggregate: the node is an aggregate query.
+	bool aggregated_ = false;
+	//! The columns GROUP BY names.
+	std::vector<idx_t> group_keys_;
+	//! Writing SELECT / HAVING / ORDER BY -- evaluated after grouping, where an
+	//! aggregate may appear -- rather than WHERE.
+	bool after_grouping_ = false;
+	//! Writing an aggregate's argument.
+	bool in_aggregate_ = false;
+	bool distinct_ = false;
 	SqlParamSet params_;
 	std::vector<Value> param_values_;
 
@@ -228,13 +340,10 @@ public:
 	}
 };
 
-bool NodeWriter::ResolveColumn(const ColumnRefExpression &ref, idx_t &out) {
+int NodeWriter::FindColumn(const ColumnRefExpression &ref, idx_t &out) const {
 	auto &names = ref.ColumnNames();
-	if (names.size() > 2) {
-		return Veto("column reference " + ref.ToString() + " has more than two parts");
-	}
-	if (names.size() == 2 && !StringUtil::CIEquals(names[0].GetIdentifierName(), relation_)) {
-		return Veto("column reference " + ref.ToString() + " names another relation");
+	if (names.size() > 2 || (names.size() == 2 && !StringUtil::CIEquals(names[0].GetIdentifierName(), relation_))) {
+		return -1;
 	}
 	const auto &name = names.back().GetIdentifierName();
 	bool found = false;
@@ -243,13 +352,247 @@ bool NodeWriter::ResolveColumn(const ColumnRefExpression &ref, idx_t &out) {
 			continue;
 		}
 		if (found) {
-			return Veto("column name " + name + " matches more than one column");
+			return -1;
 		}
 		found = true;
 		out = i;
 	}
-	if (!found) {
-		return Veto("column " + name + " is not a column of " + table_.name);
+	return found ? 1 : 0;
+}
+
+bool NodeWriter::ResolveColumn(const ColumnRefExpression &ref, idx_t &out) {
+	auto &names = ref.ColumnNames();
+	switch (FindColumn(ref, out)) {
+	case 1:
+		return true;
+	case 0:
+		return Veto("column " + names.back().GetIdentifierName() + " is not a column of " + table_.name);
+	default:
+		if (names.size() > 2) {
+			return Veto("column reference " + ref.ToString() + " has more than two parts");
+		}
+		if (names.size() == 2 && !StringUtil::CIEquals(names[0].GetIdentifierName(), relation_)) {
+			return Veto("column reference " + ref.ToString() + " names another relation");
+		}
+		return Veto("column name " + names.back().GetIdentifierName() + " matches more than one column");
+	}
+}
+
+bool NodeWriter::CheckGrouped(idx_t index) {
+	if (!aggregated_ || !after_grouping_ || in_aggregate_) {
+		return true;
+	}
+	for (auto key : group_keys_) {
+		if (key == index) {
+			return true;
+		}
+	}
+	return Veto("column " + columns_[index].name + " is neither grouped nor aggregated");
+}
+
+bool NodeWriter::GroupKeyColumn(const SelectNode &node, const ParsedExpression &key, idx_t &out) {
+	if (key.GetExpressionClass() == ExpressionClass::CONSTANT) {
+		// GROUP BY 1: a position in the select list (the rewriter does not fold
+		// group keys), which must itself be a column.
+		int64_t position;
+		auto &literal = key.Cast<ConstantExpression>().GetLiteral();
+		if (literal.kind != LiteralKind::INTEGER || !literal.TryGetInt64(position) || position < 1 ||
+			position > int64_t(node.select_list.size()) ||
+			node.select_list[position - 1]->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+			return Veto("GROUP BY " + key.ToString());
+		}
+		return ResolveColumn(node.select_list[position - 1]->Cast<ColumnRefExpression>(), out);
+	}
+	if (key.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+		return Veto("GROUP BY an expression " + key.ToString());
+	}
+	auto &ref = key.Cast<ColumnRefExpression>();
+	// DuckDB's binder: a column of the FROM wins over a select-list alias.
+	const int found = FindColumn(ref, out);
+	if (found != 0 || ref.IsQualified()) {
+		return found == 1 ? true : ResolveColumn(ref, out);
+	}
+	for (auto &item : node.select_list) {
+		if (StringUtil::CIEquals(item->GetAlias().GetIdentifierName(), ref.GetColumnName().GetIdentifierName())) {
+			if (item->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+				return Veto("GROUP BY the alias of an expression " + key.ToString());
+			}
+			return ResolveColumn(item->Cast<ColumnRefExpression>(), out);
+		}
+	}
+	return ResolveColumn(ref, out);
+}
+
+bool NodeWriter::WriteGroups(const SelectNode &node, std::string &sql) {
+	auto &groups = node.groups;
+	if (groups.group_expressions.empty()) {
+		if (groups.grouping_sets.empty()) {
+			return true;
+		}
+		if (groups.grouping_sets.size() == 1 && groups.grouping_sets[0].empty()) {
+			// GROUP BY (): one row even over no rows in DuckDB, NONE on the server
+			// (measured) -- an aggregate without GROUP BY is the one row there.
+			aggregated_ = true;
+			return true;
+		}
+		return Veto("GROUPING SETS / ROLLUP / CUBE");
+	}
+	// A plain GROUP BY a, b is ONE grouping set holding every key.
+	if (groups.grouping_sets.size() != 1 || groups.grouping_sets[0].size() != groups.group_expressions.size()) {
+		return Veto("GROUPING SETS / ROLLUP / CUBE");
+	}
+	aggregated_ = true;
+	for (auto &key : groups.group_expressions) {
+		idx_t index;
+		if (!GroupKeyColumn(node, *key, index)) {
+			return false;
+		}
+		if (!IsGroupable(columns_[index])) {
+			return Veto("GROUP BY " + columns_[index].name + ": the server does not group " +
+						columns_[index].sql_type_name + " as DuckDB does");
+		}
+		group_keys_.push_back(index);
+		sql += (sql.empty() ? "" : ", ") + ColumnSql(index);
+	}
+	return true;
+}
+
+bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind, Operand &out) {
+	if (!after_grouping_) {
+		return Veto("an aggregate in WHERE");
+	}
+	if (in_aggregate_) {
+		return Veto("an aggregate inside an aggregate");
+	}
+	if (fn.Filter() || (fn.OrderBy() && !fn.OrderBy()->orders.empty()) || fn.ExportState() ||
+		!fn.GetQualifiedName().Schema().empty() || !fn.GetQualifiedName().Catalog().empty()) {
+		return Veto("aggregate " + fn.ToString());
+	}
+	auto &args = fn.GetArguments();
+	out = Operand();
+	out.kind = ComparableKind::ExactNumeric;
+	if (kind == AggregateKind::CountStar) {
+		if (!args.empty()) {
+			return Veto("aggregate " + fn.ToString());
+		}
+		out.sql = "COUNT_BIG(*)";
+		out.type = out.result_type = LogicalType::BIGINT;
+		out.orderable = out.not_null = true;
+		return true;
+	}
+	if (args.size() != 1 || args[0].HasName()) {
+		return Veto("aggregate " + fn.ToString());
+	}
+	Operand arg;
+	in_aggregate_ = true;
+	const bool written = WriteValue(args[0].GetExpression(), arg);
+	in_aggregate_ = false;
+	if (!written) {
+		return false;
+	}
+	if (arg.constant) {
+		// count(1): the rows. Any other aggregate of a constant stays DuckDB's.
+		auto &constant = *arg.constant;
+		if (kind != AggregateKind::Count || fn.Distinct() ||
+			constant.GetExpressionClass() != ExpressionClass::CONSTANT ||
+			constant.Cast<ConstantExpression>().GetLiteral().IsNull()) {
+			return Veto("aggregate of a constant " + fn.ToString());
+		}
+		out.sql = "COUNT_BIG(*)";
+		out.type = out.result_type = LogicalType::BIGINT;
+		out.orderable = out.not_null = true;
+		return true;
+	}
+	if (arg.division) {
+		// A zero divisor is inf / NaN in DuckDB's sum and a NULL the server's
+		// skips: not the recorded divergence of a value any more.
+		return Veto("a division under an aggregate");
+	}
+	const std::string distinct = fn.Distinct() ? "DISTINCT " : "";
+	if (kind == AggregateKind::Count) {
+		if (fn.Distinct() && (arg.column ? !IsGroupable(*arg.column) : arg.kind == ComparableKind::None)) {
+			return Veto("count(DISTINCT) over " + arg.type.ToString());
+		}
+		out.sql = "COUNT_BIG(" + distinct + arg.sql + ")";
+		out.type = out.result_type = LogicalType::BIGINT;
+		out.orderable = out.not_null = true;
+		return true;
+	}
+	if (kind == AggregateKind::Min || kind == AggregateKind::Max) {
+		// The order's extremes: only a column the server orders as DuckDB does
+		// (#362) -- no string, whose order is the collation's. DISTINCT changes
+		// nothing.
+		if (!arg.column || !arg.column->OrdersLikeDuckDB()) {
+			return Veto("min / max over " + (arg.column ? arg.column->sql_type_name : arg.type.ToString()) +
+						": the server does not order it as DuckDB does");
+		}
+		const std::string name = kind == AggregateKind::Min ? "MIN" : "MAX";
+		const idx_t index = idx_t(arg.column - columns_.data());
+		out.sql = arg.kind == ComparableKind::Boolean
+					  // MIN / MAX of bit is error 8117; through tinyint and back.
+					  ? "CAST(" + name + "(CAST(" + arg.sql + " AS tinyint)) AS bit)"
+					  : name + "(" + arg.sql + ")";
+		out.type = arg.type;
+		out.kind = arg.kind;
+		out.column = arg.column;  // a constant compared with it is declared from the column
+		out.result_type = table_.types ? (*table_.types)[index] : arg.column->NativeDuckDBType();
+		out.orderable = true;
+		return true;
+	}
+	// SUM / AVG / STDEV / VAR: an exact numeric, or a float column (or a
+	// widening cast to DOUBLE).
+	const bool integer = arg.kind == ComparableKind::ExactNumeric && IntegerRank(arg.type.id()) > 0;
+	const bool decimal = arg.kind == ComparableKind::ExactNumeric && arg.type.id() == LogicalTypeId::DECIMAL;
+	const bool floating = arg.type.id() == LogicalTypeId::DOUBLE &&
+						  (arg.kind == ComparableKind::ExactNumeric ||
+						   (arg.column && StringUtil::CIEquals(arg.column->sql_type_name, "float")));
+	if (!integer && !decimal && !floating) {
+		return Veto(fn.FunctionName().GetIdentifierName() + " over " + arg.type.ToString());
+	}
+	// An integer sum as decimal(38,0): the server's own SUM of an int is an
+	// int and overflows where DuckDB's HUGEINT does not, and a bigint cast
+	// overflows too (measured).
+	const std::string exact_sum =
+		"SUM(" + distinct + (integer ? ExpressionVocabulary::Cast(arg.sql, "decimal(38,0)") : arg.sql) + ")";
+	out.type = LogicalType::DOUBLE;
+	out.result_type = LogicalType::DOUBLE;
+	switch (kind) {
+	case AggregateKind::Sum:
+		if (floating) {
+			out.sql = "SUM(" + distinct + arg.sql + ")";
+			out.approximate = true;
+		} else {
+			out.sql = exact_sum;
+			// DECIMAL(38, s) on both sides for a decimal; an integer sum is
+			// HUGEINT in DuckDB, read as decimal(38,0) and cast back.
+			out.type = LogicalType::DECIMAL(38, decimal ? DecimalType::GetScale(arg.type) : 0);
+			out.result_type = integer ? LogicalType::HUGEINT : out.type;
+			out.cast_result = integer;
+			out.orderable = true;
+		}
+		break;
+	case AggregateKind::Avg:
+		// An exact sum divided as float -- bit-exact against DuckDB's average of
+		// a decimal where AVG(CAST(… AS float)) is not (measured). Still a double
+		// division: recorded, like a float SUM, as approximate.
+		out.sql = floating
+					  ? "AVG(" + distinct + arg.sql + ")"
+					  : ExpressionVocabulary::Cast(exact_sum, "float") + " / COUNT_BIG(" + distinct + arg.sql + ")";
+		out.approximate = true;
+		break;
+	default: {
+		const char *name = kind == AggregateKind::Stdev	   ? "STDEV"
+						   : kind == AggregateKind::StdevP ? "STDEVP"
+						   : kind == AggregateKind::Var	   ? "VAR"
+														   : "VARP";
+		out.sql = std::string(name) + "(" + distinct + arg.sql + ")";
+		out.approximate = true;
+		break;
+	}
+	}
+	if (out.approximate && predicate_depth_ > 0) {
+		// Last bits apart: which rows pass `avg(x) > 2.5` could differ.
+		return Veto("a floating-point aggregate in a condition");
 	}
 	return true;
 }
@@ -266,13 +609,25 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 				return Veto("two result columns are named " + output);
 			}
 		}
+		if (!CheckGrouped(index)) {
+			return false;
+		}
 		if (!list.empty()) {
 			list += ", ";
 		}
+		const auto read =
+			MSSQLColumnInfo::BuildReadExpression(column.name, column.sql_type_name, column.max_length,
+												 column.collation_name, options_.convert_varchar_max, "", "");
 		list += MSSQLColumnInfo::BuildReadExpression(column.name, column.sql_type_name, column.max_length,
 													 column.collation_name, options_.convert_varchar_max, "", alias);
-		outputs_.push_back(OutputColumn{output, index});
+		OutputColumn entry;
+		entry.name = output;
+		entry.column_index = index;
+		entry.plain_read = read == QuoteIdentifier(column.name);
+		outputs_.push_back(std::move(entry));
 		out_.column_types.push_back(table_.types ? (*table_.types)[index] : column.NativeDuckDBType());
+		out_.cast_types.push_back(LogicalType::INVALID);
+		out_.column_names.push_back(output);
 		return true;
 	};
 	for (auto &item : node.select_list) {
@@ -283,6 +638,9 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			if (star.IsColumns() || !star.ExcludeList().empty() || !star.ReplaceList().empty() ||
 				!star.RenameList().empty() || star.Expression()) {
 				return Veto("a * with COLUMNS / EXCLUDE / REPLACE / RENAME");
+			}
+			if (aggregated_) {
+				return Veto("a * in an aggregate query");
 			}
 			if (!star.RelationName().empty() &&
 				!StringUtil::CIEquals(star.RelationName().GetIdentifierName(), relation_)) {
@@ -314,7 +672,8 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			// A computed column: rendered by the same rules as WHERE, named as
 			// DuckDB names it (the alias, else the expression's text), typed by
 			// the server's describe -- the spec's "types of a pushed query are the
-			// server's" (column_types '' for it).
+			// server's" (column_types '' for it) -- or, for an aggregate, as DuckDB
+			// types it.
 			Operand value;
 			if (!WriteValue(*item, value)) {
 				return false;
@@ -336,8 +695,14 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 				list += ", ";
 			}
 			list += value.sql + " AS " + QuoteIdentifier(output);
-			outputs_.push_back(OutputColumn{output, DConstants::INVALID_INDEX});
-			out_.column_types.push_back(LogicalType::INVALID);
+			out_.column_types.push_back(value.cast_result ? LogicalType::INVALID : value.result_type);
+			out_.cast_types.push_back(value.cast_result ? value.result_type : LogicalType::INVALID);
+			out_.column_names.push_back(output);
+			OutputColumn entry;
+			entry.name = output;
+			entry.column_index = DConstants::INVALID_INDEX;
+			entry.value = std::move(value);
+			outputs_.push_back(std::move(entry));
 			break;
 		}
 		default:
@@ -439,22 +804,6 @@ std::string NodeWriter::Parameter(const MSSQLColumnInfo *column, const Value &va
 	return sql;
 }
 
-//! Integer width rank, for a widening cast; -1 for a non-integer.
-static int IntegerRank(LogicalTypeId id) {
-	switch (id) {
-	case LogicalTypeId::UTINYINT:
-		return 1;
-	case LogicalTypeId::SMALLINT:
-		return 2;
-	case LogicalTypeId::INTEGER:
-		return 3;
-	case LogicalTypeId::BIGINT:
-		return 4;
-	default:
-		return -1;
-	}
-}
-
 bool NodeWriter::BindConstant(const Operand &peer, Operand &constant, bool arithmetic) {
 	const std::string peer_name = peer.column ? peer.column->name : peer.sql;
 	if (arithmetic && constant.constant->GetExpressionClass() == ExpressionClass::CONSTANT &&
@@ -516,6 +865,9 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 		if (!ResolveColumn(expr.Cast<ColumnRefExpression>(), index)) {
 			return false;
 		}
+		if (!CheckGrouped(index)) {
+			return false;
+		}
 		const auto &column = columns_[index];
 		out.sql = ColumnSql(index);
 		out.type = column.duckdb_type;
@@ -571,6 +923,10 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 	case ExpressionClass::FUNCTION: {
 		auto &fn = expr.Cast<FunctionExpression>();
 		const auto &name = fn.FunctionName().GetIdentifierName();
+		AggregateKind aggregate;
+		if (AggregateFor(name, aggregate)) {
+			return WriteAggregate(fn, aggregate, out);
+		}
 		if (name == "/" && fn.GetArguments().size() == 2) {
 			return WriteDivide(fn, out);
 		}
@@ -630,6 +986,12 @@ bool NodeWriter::Unify(std::vector<Operand> &operands, Operand &result, bool con
 		if (operand.kind != peer->kind || operand.type != peer->type) {
 			return Veto("branches of " + peer->type.ToString() + " and " + operand.type.ToString());
 		}
+		// An integer SUM is HUGEINT in DuckDB and decimal(38,0) on the wire: a
+		// COALESCE / CASE over it is cast back as it is, so every branch that is
+		// not a constant (typed from it) must be one too.
+		if (operand.cast_result != peer->cast_result) {
+			return Veto("an integer SUM beside another decimal(38,0)");
+		}
 		if (peer->kind == ComparableKind::String &&
 			(!operand.column || !peer->column || operand.column->collation_name != peer->column->collation_name)) {
 			return Veto("string branches that are not columns of one collation");
@@ -660,6 +1022,11 @@ bool NodeWriter::Unify(std::vector<Operand> &operands, Operand &result, bool con
 	result = Operand();
 	result.type = typed_peer.type;
 	result.kind = typed_peer.kind;
+	result.result_type = typed_peer.result_type;
+	result.cast_result = typed_peer.cast_result;
+	for (auto &operand : operands) {
+		result.approximate = result.approximate || operand.approximate;
+	}
 	return true;
 }
 
@@ -686,6 +1053,7 @@ bool NodeWriter::WriteCase(const CaseExpression &expr, Operand &out) {
 	}
 	for (auto &branch : branches) {
 		out.division = out.division || branch.division;
+		out.approximate = out.approximate || branch.approximate;
 	}
 	std::vector<std::string> thens;
 	for (idx_t i = 0; i + 1 < branches.size(); i++) {
@@ -739,6 +1107,7 @@ bool NodeWriter::WriteDivide(const FunctionExpression &fn, Operand &out) {
 	out.type = LogicalType::DOUBLE;
 	out.kind = ComparableKind::ExactNumeric;
 	out.division = true;
+	out.approximate = operands[0].approximate || operands[1].approximate;
 	return true;
 }
 
@@ -779,6 +1148,7 @@ bool NodeWriter::WriteCast(const CastExpression &cast, Operand &out) {
 	}
 	out = Operand();
 	out.division = child.division;
+	out.approximate = child.approximate;
 	out.sql = ExpressionVocabulary::Cast(child.sql, tsql);
 	out.type = target == LogicalTypeId::DOUBLE ? LogicalType::DOUBLE : LogicalType(target);
 	out.kind = ComparableKind::ExactNumeric;
@@ -1109,7 +1479,9 @@ bool NodeWriter::WriteOrder(const OrderModifier &order, bool limited, std::strin
 	for (auto &node : order.orders) {
 		// DuckDB resolves an ORDER BY name against the select list first, then
 		// the FROM; a bare integer is a position in the select list.
+		const OutputColumn *output = nullptr;
 		idx_t index = DConstants::INVALID_INDEX;
+		Operand computed;
 		const auto &key = *node.expression;
 		if (key.GetExpressionClass() == ExpressionClass::CONSTANT) {
 			int64_t position;
@@ -1118,38 +1490,50 @@ bool NodeWriter::WriteOrder(const OrderModifier &order, bool limited, std::strin
 				position > int64_t(outputs_.size())) {
 				return Veto("ORDER BY " + key.ToString());
 			}
-			index = outputs_[position - 1].column_index;
-			if (index == DConstants::INVALID_INDEX) {
-				return Veto("ORDER BY a computed column");
-			}
+			output = &outputs_[position - 1];
 		} else if (key.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &ref = key.Cast<ColumnRefExpression>();
 			if (!ref.IsQualified()) {
-				for (auto &output : outputs_) {
-					if (StringUtil::CIEquals(output.name, ref.GetColumnName().GetIdentifierName())) {
-						if (output.column_index == DConstants::INVALID_INDEX) {
-							return Veto("ORDER BY a computed column");
-						}
-						index = output.column_index;
+				for (auto &candidate : outputs_) {
+					if (StringUtil::CIEquals(candidate.name, ref.GetColumnName().GetIdentifierName())) {
+						output = &candidate;
 						break;
 					}
 				}
 			}
-			if (index == DConstants::INVALID_INDEX && !ResolveColumn(ref, index)) {
+			if (!output && (!ResolveColumn(ref, index) || !CheckGrouped(index))) {
 				return false;
 			}
 		} else {
-			return Veto("ORDER BY " + key.ToString());
+			// An expression: an aggregate, the top-N shape (`ORDER BY count(*)
+			// DESC LIMIT 10`), rendered as a value.
+			if (!WriteValue(key, computed)) {
+				return false;
+			}
+			if (computed.constant) {
+				return Veto("ORDER BY " + key.ToString());
+			}
 		}
-		const auto &column = columns_[index];
-		// Qualified: a bare ORDER BY name in T-SQL is a select-list alias first
-		// (measured: `SELECT [id] AS [value] ... ORDER BY [value]` sorts by id),
-		// while DuckDB's resolution above already chose the table column.
-		const std::string column_ref = QuoteIdentifier(table_.name) + "." + QuoteIdentifier(column.name);
-		std::string fragment;
-		if (!OrderKeyFragment(column, column_ref, true, limited, fragment)) {
-			return Veto("ORDER BY " + column.name + ": the server does not order " + column.sql_type_name +
-						" as DuckDB does");
+		if (output) {
+			if (output->column_index != DConstants::INVALID_INDEX) {
+				index = output->column_index;
+			} else {
+				computed = output->value;
+			}
+		}
+		if (distinct_) {
+			// Under DISTINCT the key must be a result column as the server spells
+			// it (145) -- a column read through a CAST is not.
+			bool listed = false;
+			for (auto &candidate : outputs_) {
+				listed = listed ||
+						 (index != DConstants::INVALID_INDEX ? candidate.column_index == index && candidate.plain_read
+															 : candidate.column_index == DConstants::INVALID_INDEX &&
+																   candidate.value.sql == computed.sql);
+			}
+			if (!listed) {
+				return Veto("ORDER BY " + key.ToString() + " under DISTINCT: not a result column the server can name");
+			}
 		}
 		const auto type = node.type == OrderType::ORDER_DEFAULT ? options_.default_order : node.type;
 		auto null_order = node.null_order;
@@ -1158,7 +1542,33 @@ bool NodeWriter::WriteOrder(const OrderModifier &order, bool limited, std::strin
 				type == OrderType::DESCENDING ? options_.default_null_order_desc : options_.default_null_order_asc;
 		}
 		std::string term;
-		if (!OrderTerm(fragment, column_ref, type, null_order, column.is_nullable, limited, term)) {
+		if (index == DConstants::INVALID_INDEX) {
+			if (!computed.orderable) {
+				return Veto(computed.approximate ? "ORDER BY a floating-point aggregate"
+												 : "ORDER BY a computed column");
+			}
+			// Under DISTINCT the term must be the key itself: a CASE placing NULLs
+			// is not a result column (145).
+			if (!OrderTerm(computed.sql, computed.sql, type, null_order, !computed.not_null, limited && !distinct_,
+						   term)) {
+				return Veto("ORDER BY " + key.ToString() + ": NULL placement needs a LIMIT to be emulated");
+			}
+			sql += (sql.empty() ? "" : ", ") + term;
+			continue;
+		}
+		const auto &column = columns_[index];
+		// Qualified: a bare ORDER BY name in T-SQL is a select-list alias first
+		// (measured: `SELECT [id] AS [value] ... ORDER BY [value]` sorts by id),
+		// while DuckDB's resolution above already chose the table column.
+		const std::string column_ref = QuoteIdentifier(table_.name) + "." + QuoteIdentifier(column.name);
+		std::string fragment;
+		// Under DISTINCT neither the bytes key nor the NULL-placing CASE is a
+		// result column (145): the key must be sent as it is.
+		if (!OrderKeyFragment(column, column_ref, true, limited && !distinct_, fragment)) {
+			return Veto("ORDER BY " + column.name + ": the server does not order " + column.sql_type_name +
+						" as DuckDB does");
+		}
+		if (!OrderTerm(fragment, column_ref, type, null_order, column.is_nullable, limited && !distinct_, term)) {
 			return Veto("ORDER BY " + column.name + ": NULL placement needs a LIMIT to be emulated");
 		}
 		sql += (sql.empty() ? "" : ", ") + term;
@@ -1170,9 +1580,8 @@ bool NodeWriter::Write(const SelectNode &node) {
 	if (!node.cte_map.map.empty()) {
 		return Veto("a WITH clause");
 	}
-	if (!node.groups.group_expressions.empty() || !node.groups.grouping_sets.empty() || node.having ||
-		node.aggregate_handling != AggregateHandling::STANDARD_HANDLING) {
-		return Veto("GROUP BY / HAVING");
+	if (node.aggregate_handling != AggregateHandling::STANDARD_HANDLING) {
+		return Veto("GROUP BY ALL");
 	}
 	if (node.qualify || node.sample) {
 		return Veto("QUALIFY / USING SAMPLE");
@@ -1188,13 +1597,18 @@ bool NodeWriter::Write(const SelectNode &node) {
 
 	const OrderModifier *order = nullptr;
 	const LimitModifier *limit = nullptr;
-	for (auto &modifier : node.modifiers) {
-		if (modifier->type == ResultModifierType::ORDER_MODIFIER && !order && !limit) {
+	for (idx_t i = 0; i < node.modifiers.size(); i++) {
+		auto &modifier = node.modifiers[i];
+		// The parser puts DISTINCT first; DISTINCT ON is DuckDB's own.
+		if (modifier->type == ResultModifierType::DISTINCT_MODIFIER && i == 0 &&
+			modifier->Cast<DistinctModifier>().distinct_on_targets.empty()) {
+			distinct_ = true;
+		} else if (modifier->type == ResultModifierType::ORDER_MODIFIER && !order && !limit) {
 			order = &modifier->Cast<OrderModifier>();
 		} else if (modifier->type == ResultModifierType::LIMIT_MODIFIER && !limit) {
 			limit = &modifier->Cast<LimitModifier>();
 		} else {
-			return Veto("a DISTINCT, a LIMIT % or a second ORDER BY / LIMIT");
+			return Veto("a DISTINCT ON, a LIMIT % or a second ORDER BY / LIMIT");
 		}
 	}
 	int64_t limit_value = -1;
@@ -1213,11 +1627,45 @@ bool NodeWriter::Write(const SelectNode &node) {
 	}
 	const bool limited = limit_value >= 0;
 	const bool top = limited && offset_value == 0;
+	if (distinct_ && offset_value > 0 && !order) {
+		// OFFSET's `ORDER BY (SELECT NULL)` is not a result column: 145.
+		return Veto("DISTINCT with OFFSET and no ORDER BY");
+	}
 
-	out_.statement = top ? "SELECT TOP (" + std::to_string(limit_value) + ") " : "SELECT ";
+	// An aggregate query: grouped, filtered on groups, or aggregating --
+	// anywhere after grouping, ORDER BY included, as DuckDB's binder decides.
+	std::string group_sql;
+	if (!WriteGroups(node, group_sql)) {
+		return false;
+	}
+	aggregated_ = aggregated_ || node.having;
+	for (auto &item : node.select_list) {
+		aggregated_ = aggregated_ || ContainsAggregate(*item);
+	}
+	if (order) {
+		for (auto &key : order->orders) {
+			aggregated_ = aggregated_ || ContainsAggregate(*key.expression);
+		}
+	}
+
+	out_.statement = std::string("SELECT ") + (distinct_ ? "DISTINCT " : "") +
+					 (top ? "TOP (" + std::to_string(limit_value) + ") " : "");
+	after_grouping_ = true;
 	if (!WriteSelectList(node)) {
 		return false;
 	}
+	if (distinct_) {
+		for (auto &output : outputs_) {
+			if (output.column_index != DConstants::INVALID_INDEX) {
+				if (!IsGroupable(columns_[output.column_index])) {
+					return Veto("DISTINCT over " + columns_[output.column_index].sql_type_name);
+				}
+			} else if (output.value.kind == ComparableKind::None || output.value.approximate || output.value.division) {
+				return Veto("DISTINCT over the computed column " + output.name);
+			}
+		}
+	}
+	after_grouping_ = false;
 	out_.statement += " FROM " + QuoteIdentifier(table_.schema) + "." + QuoteIdentifier(table_.name);
 	if (node.where_clause) {
 		std::string where;
@@ -1225,6 +1673,17 @@ bool NodeWriter::Write(const SelectNode &node) {
 			return false;
 		}
 		out_.statement += " WHERE " + where;
+	}
+	after_grouping_ = true;
+	if (!group_sql.empty()) {
+		out_.statement += " GROUP BY " + group_sql;
+	}
+	if (node.having) {
+		std::string having;
+		if (!WritePredicate(*node.having, having)) {
+			return false;
+		}
+		out_.statement += " HAVING " + having;
 	}
 	std::string order_sql;
 	if (order && !WriteOrder(*order, limited, order_sql)) {
@@ -1298,7 +1757,21 @@ void CountRemotePushdown() {
 bool SQLWriter::PushesMoreThanScan(const QueryNode &node) {
 	for (auto &modifier : node.modifiers) {
 		if (modifier->type == ResultModifierType::ORDER_MODIFIER ||
-			modifier->type == ResultModifierType::LIMIT_MODIFIER) {
+			modifier->type == ResultModifierType::LIMIT_MODIFIER ||
+			modifier->type == ResultModifierType::DISTINCT_MODIFIER) {
+			return true;
+		}
+	}
+	if (node.type != QueryNodeType::SELECT_NODE) {
+		return false;
+	}
+	auto &select = node.Cast<SelectNode>();
+	if (!select.groups.group_expressions.empty() || !select.groups.grouping_sets.empty() || select.having ||
+		select.aggregate_handling != AggregateHandling::STANDARD_HANDLING) {
+		return true;
+	}
+	for (auto &item : select.select_list) {
+		if (ContainsAggregate(*item)) {
 			return true;
 		}
 	}

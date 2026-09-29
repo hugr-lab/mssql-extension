@@ -14,7 +14,10 @@
 // PR B's vocabulary is one base table: its columns (each through
 // `MSSQLColumnInfo::BuildReadExpression`, the read expression the catalog scan
 // uses), a WHERE of column-vs-constant comparisons, IS [NOT] NULL, AND / OR /
-// NOT, ORDER BY on columns, and LIMIT / OFFSET as TOP / OFFSET-FETCH.
+// NOT, ORDER BY on columns, and LIMIT / OFFSET as TOP / OFFSET-FETCH. PR C
+// renders expressions through `ExpressionVocabulary`; PR D adds aggregates
+// (COUNT / SUM / AVG / MIN / MAX / STDEV / VAR), GROUP BY on columns, HAVING
+// and DISTINCT.
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -60,6 +63,12 @@ struct WrittenQuery {
 	//! reads -- the vehicle's `column_types`, so a pushed SELECT has the
 	//! catalog path's types, not the describe's.
 	std::vector<LogicalType> column_types;
+	//! Per result column, the DuckDB type the value is cast to after the read
+	//! (INVALID: none) -- a type no wire type decodes into: SUM over integers
+	//! is HUGEINT in DuckDB, decimal(38,0) on the server.
+	std::vector<LogicalType> cast_types;
+	//! Per result column, its name, as DuckDB names it.
+	std::vector<std::string> column_names;
 
 	//! "@p1 int, @p2 varchar(50)" -- empty without parameters.
 	std::string Declarations() const;
@@ -103,8 +112,9 @@ public:
 	//! set operation's children, an INSERT's and a CTAS's query on their own,
 	//! and a pushed `SELECT * FROM t` there would read the whole table where
 	//! the scan reads what an outer WHERE lets through. So a node the scan
-	//! could serve as well stays with the scan; in PR B the gain is ORDER BY
-	//! and LIMIT / OFFSET.
+	//! could serve as well stays with the scan. The gain is ORDER BY, LIMIT /
+	//! OFFSET, DISTINCT, GROUP BY / HAVING and an aggregate: each sends fewer
+	//! rows than the table's (or its first N).
 	static bool PushesMoreThanScan(const QueryNode &node);
 
 private:

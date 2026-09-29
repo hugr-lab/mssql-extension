@@ -36,12 +36,16 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
@@ -1710,7 +1714,30 @@ unique_ptr<TableRef> MSSQLCatalog::RemoteExecute(ClientContext &context, unique_
 		std::move(arguments));
 	mssql::CountRemotePushdown();
 	MSSQL_CATALOG_DEBUG_LOG(1, "RemoteExecute: %s", written.statement.c_str());
-	return std::move(ref);
+	bool casts = false;
+	for (auto &type : written.cast_types) {
+		casts = casts || type.id() != LogicalTypeId::INVALID;
+	}
+	if (!casts) {
+		return std::move(ref);
+	}
+	// A result column no wire type decodes into -- SUM over integers, HUGEINT
+	// in DuckDB, decimal(38,0) on the server -- is cast after the read, in a
+	// projection over the call: `SELECT c1, CAST(c2 AS HUGEINT) AS c2 FROM …`.
+	auto select = make_uniq<SelectNode>();
+	for (idx_t i = 0; i < written.column_names.size(); i++) {
+		const Identifier name(written.column_names[i]);
+		unique_ptr<ParsedExpression> column = make_uniq<ColumnRefExpression>(name);
+		if (written.cast_types[i].id() != LogicalTypeId::INVALID) {
+			column = make_uniq<CastExpression>(written.cast_types[i], std::move(column));
+		}
+		column->SetAlias(name);
+		select->select_list.push_back(std::move(column));
+	}
+	select->from_table = std::move(ref);
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = std::move(select);
+	return make_uniq<SubqueryRef>(std::move(statement));
 }
 
 // No statement-level pushdown in spec 079: DDL and DML are spec 080's.

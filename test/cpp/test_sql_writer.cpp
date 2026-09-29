@@ -41,6 +41,8 @@ static std::vector<MSSQLColumnInfo> Columns() {
 	// integer type whose rank is 1, so the only one a widening cast can target
 	// without widening (roborev 1819 finding 1).
 	columns.emplace_back("tiny", 11, "tinyint", 1, 3, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
+	columns.emplace_back("ratio", 12, "float", 8, 53, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
+	columns.emplace_back("doc", 13, "xml", -1, 0, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
 	return columns;
 }
 
@@ -116,7 +118,7 @@ int main() {
 	ExpectSql("SELECT id AS id FROM t LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 	ExpectSql("SELECT * FROM t LIMIT 1",
 			  "SELECT TOP (1) [id], [name], [code], [amount], [day], [flag], [ts], CAST([legacy] AS NVARCHAR(30)) AS "
-			  "[legacy], [wide], [mid], [tiny] FROM [dbo].[t]");
+			  "[legacy], [wide], [mid], [tiny], [ratio], [doc] FROM [dbo].[t]");
 	ExpectSql("SELECT q.id FROM t AS q LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 
 	// WHERE: constants are parameters declared from the column.
@@ -309,8 +311,6 @@ int main() {
 
 	// Everything outside PR B's vocabulary is a veto, never a guess.
 	ExpectVeto("SELECT rowid FROM t LIMIT 1");
-	ExpectVeto("SELECT DISTINCT id FROM t LIMIT 1");
-	ExpectVeto("SELECT id, count(*) FROM t GROUP BY id LIMIT 1");
 	ExpectVeto("SELECT * EXCLUDE (id) FROM t LIMIT 1");
 	ExpectVeto("SELECT id, id FROM t LIMIT 1");
 	ExpectVeto("SELECT id FROM u LIMIT 1");
@@ -318,11 +318,106 @@ int main() {
 	ExpectVeto("WITH c AS (SELECT 1) SELECT id FROM t LIMIT 1");
 	ExpectVeto("SELECT other.id FROM t LIMIT 1");
 
+	// Aggregates (PR D): COUNT as COUNT_BIG, an integer SUM as decimal(38,0)
+	// (cast back to HUGEINT after the read), AVG as an exact sum divided.
+	ExpectSql("SELECT count(*) FROM t", "SELECT COUNT_BIG(*) AS [count_star()] FROM [dbo].[t]");
+	ExpectSql("SELECT count(1) AS n FROM t", "SELECT COUNT_BIG(*) AS [n] FROM [dbo].[t]");
+	ExpectSql("SELECT count(DISTINCT name) AS n FROM t", "SELECT COUNT_BIG(DISTINCT [name]) AS [n] FROM [dbo].[t]");
+	ExpectSql("SELECT sum(id) AS s, sum(amount) AS a FROM t",
+			  "SELECT SUM(CAST([id] AS decimal(38,0))) AS [s], SUM([amount]) AS [a] FROM [dbo].[t]");
+	ExpectSql("SELECT avg(id) AS a FROM t",
+			  "SELECT CAST(SUM(CAST([id] AS decimal(38,0))) AS float) / COUNT_BIG([id]) AS [a] FROM [dbo].[t]");
+	ExpectSql("SELECT avg(ratio) AS a, stddev(ratio) AS s, var_pop(id) AS v FROM t",
+			  "SELECT AVG([ratio]) AS [a], STDEV([ratio]) AS [s], VARP([id]) AS [v] FROM [dbo].[t]");
+	ExpectSql("SELECT min(flag) AS f, max(day) AS d FROM t",
+			  "SELECT CAST(MIN(CAST([flag] AS tinyint)) AS bit) AS [f], MAX([day]) AS [d] FROM [dbo].[t]");
+	{
+		WrittenQuery out;
+		std::string why;
+		if (!Write("SELECT sum(id) AS s, count(*) AS c, max(day) AS d FROM t", out, why) ||
+			out.cast_types[0] != LogicalType::HUGEINT || out.column_types[0].id() != LogicalTypeId::INVALID ||
+			out.column_types[1] != LogicalType::BIGINT || out.cast_types[1].id() != LogicalTypeId::INVALID ||
+			out.column_types[2] != LogicalType::DATE || out.column_names[0] != "s") {
+			std::cerr << "FAIL: aggregate result types (" << why << ")\n";
+			failures++;
+		}
+	}
+	{
+		// COALESCE / CASE over an integer SUM stays HUGEINT: cast back as is.
+		WrittenQuery out;
+		std::string why;
+		if (!Write("SELECT coalesce(sum(id), 0) AS s FROM t", out, why) || out.cast_types[0] != LogicalType::HUGEINT) {
+			std::cerr << "FAIL: coalesce(sum(id), 0) is not cast back to HUGEINT (" << why << ")\n";
+			failures++;
+		}
+	}
+	ExpectVeto("SELECT coalesce(sum(id), sum(amount)) FROM t");
+	ExpectVeto("SELECT min(name) FROM t");	// strings order by collation (#362)
+	ExpectVeto("SELECT max(ts) FROM t");	// datetime2(7) is off the order list
+	ExpectVeto("SELECT sum(flag) FROM t");	// bit
+	ExpectVeto("SELECT sum(name) FROM t");
+	ExpectVeto("SELECT count(*) FILTER (WHERE id > 1) FROM t");
+	ExpectVeto("SELECT string_agg(name, ',') FROM t");	// not in the table
+	ExpectVeto("SELECT sum(id / 2) FROM t");			// inf here, a skipped NULL there
+	ExpectVeto("SELECT sum(sum(id)) FROM t");
+	ExpectVeto("SELECT id FROM t WHERE count(*) > 1");	// an aggregate in WHERE
+	ExpectVeto("SELECT id, count(*) FROM t");			// DuckDB's binder error, not the server's
+	ExpectVeto("SELECT * FROM t GROUP BY id");
+
+	// GROUP BY columns -- by name, position or select alias -- and HAVING.
+	ExpectSql("SELECT id, count(*) AS c FROM t GROUP BY id",
+			  "SELECT [id], COUNT_BIG(*) AS [c] FROM [dbo].[t] GROUP BY [id]");
+	ExpectSql(
+		"SELECT legacy, count(*) AS c FROM t GROUP BY 1",
+		"SELECT CAST([legacy] AS NVARCHAR(30)) AS [legacy], COUNT_BIG(*) AS [c] FROM [dbo].[t] GROUP BY [legacy]");
+	ExpectSql("SELECT day AS d, sum(amount) AS s FROM t WHERE id > 0 GROUP BY d HAVING count(*) > 1",
+			  "SELECT [day] AS [d], SUM([amount]) AS [s] FROM [dbo].[t] WHERE ([id] > @p0) GROUP BY [day] HAVING "
+			  "(COUNT_BIG(*) > @p1)");
+	ExpectParams("SELECT id FROM t GROUP BY id HAVING sum(amount) > 10 AND max(day) < '2024-01-01'",
+				 "@p0 decimal(38,2), @p1 date");
+	ExpectSql("SELECT count(*) AS c FROM t GROUP BY ()", "SELECT COUNT_BIG(*) AS [c] FROM [dbo].[t]");
+	ExpectVeto("SELECT id, name, count(*) FROM t GROUP BY id");	 // name neither grouped nor aggregated
+	ExpectVeto("SELECT id FROM t GROUP BY id HAVING name = 'a'");
+	ExpectVeto("SELECT id, count(*) FROM t GROUP BY ROLLUP (id)");
+	ExpectVeto("SELECT id, count(*) FROM t GROUP BY ALL");
+	ExpectVeto("SELECT id + 1, count(*) FROM t GROUP BY id + 1");	   // expression keys: not yet
+	ExpectVeto("SELECT ts, count(*) FROM t GROUP BY ts");			   // datetime2(7)
+	ExpectVeto("SELECT doc, count(*) FROM t GROUP BY doc");			   // xml: 249 there
+	ExpectVeto("SELECT id FROM t GROUP BY id HAVING avg(ratio) > 1");  // last bits choose rows
+
+	// ORDER BY an aggregate: the top-N shape; NULL placement as for columns.
+	ExpectSql("SELECT id, count(*) AS c FROM t GROUP BY id ORDER BY c DESC LIMIT 3",
+			  "SELECT TOP (3) [id], COUNT_BIG(*) AS [c] FROM [dbo].[t] GROUP BY [id] ORDER BY COUNT_BIG(*) DESC");
+	ExpectSql("SELECT id FROM t GROUP BY id ORDER BY count(*) DESC, id LIMIT 3",
+			  "SELECT TOP (3) [id] FROM [dbo].[t] GROUP BY [id] ORDER BY COUNT_BIG(*) DESC, [t].[id] ASC");
+	ExpectSql("SELECT id, sum(amount) AS s FROM t GROUP BY id ORDER BY s LIMIT 3",
+			  "SELECT TOP (3) [id], SUM([amount]) AS [s] FROM [dbo].[t] GROUP BY [id] ORDER BY CASE WHEN "
+			  "SUM([amount]) IS NULL THEN 1 ELSE 0 END, SUM([amount]) ASC");
+	ExpectVeto("SELECT id, avg(amount) AS a FROM t GROUP BY id ORDER BY a LIMIT 3");  // approximate
+	ExpectVeto("SELECT id, sum(amount) AS s FROM t GROUP BY id ORDER BY s");		  // placement, no LIMIT
+	ExpectVeto("SELECT id FROM t GROUP BY id ORDER BY name LIMIT 1");
+
+	// DISTINCT: comparable result columns; an ORDER BY key must be one of them.
+	ExpectSql("SELECT DISTINCT id, name FROM t LIMIT 5", "SELECT DISTINCT TOP (5) [id], [name] FROM [dbo].[t]");
+	ExpectSql("SELECT DISTINCT id FROM t ORDER BY id LIMIT 5",
+			  "SELECT DISTINCT TOP (5) [id] FROM [dbo].[t] ORDER BY [t].[id] ASC");
+	ExpectVeto("SELECT DISTINCT legacy FROM t ORDER BY legacy LIMIT 5");  // read through a CAST: 145
+	ExpectVeto("SELECT DISTINCT day FROM t ORDER BY day LIMIT 5");		  // the NULL-placing CASE: 145
+	ExpectVeto("SELECT DISTINCT code FROM t ORDER BY code LIMIT 5");	  // the varbinary key: 145
+	ExpectVeto("SELECT DISTINCT doc FROM t");							  // xml: 421 there
+	ExpectVeto("SELECT DISTINCT id FROM t OFFSET 2");
+	ExpectVeto("SELECT DISTINCT ON (id) id, name FROM t");
+	ExpectVeto("SELECT DISTINCT avg(ratio) FROM t");
+
 	// The gain rule: a node the catalog scan serves as well stays with it.
 	ExpectGain("SELECT * FROM t", false);
 	ExpectGain("SELECT id FROM t WHERE id = 1", false);
 	ExpectGain("SELECT id FROM t ORDER BY id", true);
 	ExpectGain("SELECT id FROM t LIMIT 1", true);
+	ExpectGain("SELECT DISTINCT id FROM t", true);
+	ExpectGain("SELECT count(*) FROM t", true);
+	ExpectGain("SELECT id FROM t GROUP BY id", true);
+	ExpectGain("SELECT id + 1 FROM t WHERE id > 1", false);
 
 	// column_types spells the collation that ToString leaves out.
 	auto columns = Columns();
