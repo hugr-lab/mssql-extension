@@ -41,13 +41,15 @@ SELECT mssql_exec('ra_off', 'DROP TABLE IF EXISTS dbo.ra_t, dbo.ra_e;
 		ratio float NULL,
 		name nvarchar(20) NULL,
 		legacy varchar(10) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
-		doc xml NULL);
+		doc xml NULL,
+		small decimal(5,2) NULL,
+		tiny tinyint NULL);
 	INSERT INTO dbo.ra_t VALUES
-		(1, 1, 10, 9000000000000000000, 1.50, ''2024-01-01'', 1, 0.5, N''a'', ''a'', NULL),
-		(2, 1, 20, 9000000000000000000, 2.50, ''2024-03-01'', 0, 1.5, N''b'', ''A'', NULL),
-		(3, 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-		(4, 2, 35, 5, 4.00, ''2024-02-01'', 1, 2.0, N''a'', ''b'', NULL),
-		(5, 3, 40, 7, 1.00, ''2024-05-01'', 0, 4.0, N''c'', ''B'', N''<x/>'');
+		(1, 1, 10, 9000000000000000000, 1.50, ''2024-01-01'', 1, 0.5, N''a'', ''a'', NULL, 999.99, 2),
+		(2, 1, 20, 9000000000000000000, 2.50, ''2024-03-01'', 0, 1.5, N''b'', ''A'', NULL, 1.25, 9),
+		(3, 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+		(4, 2, 35, 5, 4.00, ''2024-02-01'', 1, 2.0, N''a'', ''b'', NULL, -3.5, 200),
+		(5, 3, 40, 7, 1.00, ''2024-05-01'', 0, 4.0, N''c'', ''B'', N''<x/>'', 0.01, 0);
 	CREATE TABLE dbo.ra_e (x int NULL)');
 
 #
@@ -222,6 +224,91 @@ query I
 SELECT count(DISTINCT legacy) FROM ra_off.dbo.ra_t;
 ----
 4
+
+#
+# Full review of PR D (differential fuzz).
+#
+
+# A repeated ORDER BY key is dropped: the server refuses one (169).
+query I
+SELECT id FROM ra_on.dbo.ra_t ORDER BY id, id DESC LIMIT 2;
+----
+1
+2
+
+# Doubles: + and - round alike on both sides, pushed; * is not (it overflows
+# near 1e154, an error there where DuckDB says inf).
+query II
+EXPLAIN SELECT id, ratio + ratio - ratio AS r FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*\(\(\[ratio\] \+ \[ratio\]\) - \[ratio\]\) AS \[r\].*
+
+query IR
+SELECT id, ratio + ratio - ratio AS r FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
+----
+1	0.5
+2	1.5
+3	NULL
+4	2.0
+5	4.0
+
+query II
+EXPLAIN SELECT id, ratio * ratio AS r FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# A decimal product DuckDB types exactly is read and cast to DuckDB's type:
+# DECIMAL(10,4), where the server says decimal(11,4).
+statement ok
+CREATE TEMP TABLE p_on AS SELECT id, small * small AS p FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
+
+statement ok
+CREATE TEMP TABLE p_off AS SELECT id, small * small AS p FROM ra_off.dbo.ra_t ORDER BY id LIMIT 5;
+
+query II
+EXPLAIN SELECT id, small * small AS p FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*\(\[small\] \* \[small\]\) AS \[p\].*
+
+query IRT
+SELECT id, p, typeof(p) FROM p_on ORDER BY id;
+----
+1	999980.0001	DECIMAL(10,4)
+2	1.5625	DECIMAL(10,4)
+3	NULL	DECIMAL(10,4)
+4	12.2500	DECIMAL(10,4)
+5	0.0001	DECIMAL(10,4)
+
+query I
+SELECT count(*) FROM (SELECT * FROM p_on EXCEPT ALL SELECT * FROM p_off);
+----
+0
+
+# DuckDB moves the constant across the comparison (`tiny - 5 > 3` is
+# `tiny > 8` there) and never computes `tiny - 5`, which the server would,
+# and overflow on at tiny < 5 (8115). Not pushed.
+query II
+EXPLAIN SELECT id FROM ra_on.dbo.ra_t WHERE tiny - 5 > 3 ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT id FROM ra_on.dbo.ra_t WHERE tiny - 5 > 3 ORDER BY id LIMIT 5;
+----
+2
+4
+
+# A decimal whose DuckDB type the writer cannot tell is not a pushed result
+# column: `amount + 700` is DECIMAL(13,2) in DuckDB, decimal(11,2) there.
+query II
+EXPLAIN SELECT id, amount + 700 AS a FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query T
+SELECT typeof(amount + 700) FROM ra_on.dbo.ra_t LIMIT 1;
+----
+DECIMAL(13,2)
 
 #
 # Vetoes: the statement stays on the scan path, with the right rows.

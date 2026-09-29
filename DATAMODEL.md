@@ -803,9 +803,10 @@ Invariants:
 - **Types are the catalog's.** A pushed column reports the type its catalog
   column reports, decoded into it as the catalog scan decodes it
   (`column_types`). The describe remains the init-time shape check. A
-  computed column's type is the server's (its describe); an aggregate's is
-  DuckDB's, and an integer `sum` -- `decimal(38,0)` on the wire, HUGEINT in
-  DuckDB -- is cast back in a projection `RemoteExecute` puts over the vehicle.
+  computed column has DuckDB's type or is not pushed (PR D full review): where
+  the wire's differs -- an integer `sum`, `decimal(38,0)` there and HUGEINT
+  here; a decimal product -- the value is cast back in a projection
+  `RemoteExecute` puts over the vehicle.
 - **Joins name their own relations** (PR D). The writer resolves every table
   of the join tree (`MSSQLCatalog::WritePushdown`, before it runs), keeps one
   flat column list, and aliases each relation `[r1]`, `[r2]`, ... with every

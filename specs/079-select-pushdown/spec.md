@@ -209,7 +209,12 @@ server's describe (`column_types` '').
   float, any `avg`, `stddev` / `variance` accumulate in a different order on
   each side and differ in the last bits (measured in the same probe: 1e-15 ..
   2e-14 relative on 200k random doubles; no test pins it, the values being
-  data-dependent; DuckDB's own parallel float sum is not bit-stable either). Kept
+  data-dependent; DuckDB's own parallel float sum is not bit-stable either).
+  `stddev` / `variance` can be off by much more: the server computes them in
+  one pass and loses every significant digit on large, close values (full
+  review fuzz: three equal values 1604938.248111 give a variance of 0.000488
+  there, 0 in DuckDB, which uses a stable algorithm). Recorded as such (owner's
+  call: documented, not vetoed; rounding cannot reconcile it). Kept
   for a selected value, like the division of PR C; vetoed where the last bits
   would choose rows -- a condition (HAVING, a WHEN), an ORDER BY key, a
   DISTINCT.
@@ -238,8 +243,9 @@ server's describe (`column_types` '').
   **SEMI / ANTI** (revising the table's veto): `EXISTS` / `NOT EXISTS
   (SELECT 1 FROM r WHERE cond)` ANDed to WHERE -- not `IN` / `NOT IN`, which
   a NULL on the right would empty (DuckDB's ANTI JOIN is NOT EXISTS,
-  measured); the right table is seen only in its condition; vetoed in a
-  chain with an outer join, where the moved EXISTS would not be exact.
+  measured); the right table is seen only in its condition; vetoed under a
+  later RIGHT / FULL join, whose NULL-left rows the moved EXISTS would drop
+  (an outer join before it, or a LEFT join after it, keeps it exact).
   Vetoed: NATURAL / POSITIONAL / ASOF / NEAREST, a right side that is a join
   or a subquery, USING in RIGHT / FULL joins, two tables of one name.
 - *Gain rule.* DISTINCT, GROUP BY / HAVING, an aggregate, and a join whose
@@ -253,6 +259,41 @@ server's describe (`column_types` '').
   the node alone), so a join or an aggregate there is pushed and the outer
   filter applied after it -- the right rows, sometimes more of them over the
   wire. Recorded, not vetoed.
+
+**Revised in PR D's full review (a differential fuzz of 2400 statements,
+pushed against not pushed; a semantic pass of 280 on the live server).**
+
+- *A repeated ORDER BY key* is dropped: it cannot reorder anything, and the
+  server refuses one (169) where DuckDB takes it (a PR B defect).
+- *A constant DuckDB moves.* DuckDB's optimizer moves a constant across a
+  comparison with a constant -- `MoveConstantsRule` for `+`, `-`, `*` over
+  INTEGRAL types, `MoveUnaryMinusRule` for a negation; `t - 5 > 3` is
+  `t > 8` -- and never computes the value the server would, and overflow on
+  (`tinyint` `t - 5` at `t < 5`: error 8115 pushed, rows locally). Such an
+  integer comparison, and a BETWEEN over such a value, is vetoed; a decimal
+  or a double is computed by DuckDB too (no veto), and a value compared with
+  a column or another value is not moved.
+- *Result types of computed columns.* PR C's "a computed column's type is the
+  server's" is narrowed: a result column carries DuckDB's type or is not
+  pushed. Integer arithmetic keeps its type on both sides; a decimal sum of
+  one type is DECIMAL(w+1, s) on both; a decimal product is DuckDB's
+  DECIMAL(w1+w2, s1+s2) -- the server's value cast to it -- when that fits 18
+  digits, and vetoed otherwise (DuckDB caps the product of two such factors
+  at DECIMAL(18) and overflows where the server holds the value: 99999999.99
+  squared). A decimal beside a constant (`v + 700` is DECIMAL(13,2) in DuckDB,
+  decimal(11,2) there; `COALESCE(v, 700)` DECIMAL(12,2) against (10,2)) is
+  kept in a condition, where only the value counts, and vetoed as a result
+  column.
+- *Floating point.* A `float(53)` column is a comparable kind of its own:
+  compared with a constant, and `+`, `-` over doubles (IEEE binary64 on both
+  sides, so each operation rounds alike), `/` as in PR C, `CAST(x AS
+  DOUBLE)`. An overflow is inf in DuckDB and error 8115 on the server, and
+  the server computes a projection for every row WHERE passes, the ones TOP
+  discards included -- so a statement DuckDB completes can fail pushed. A
+  sum needs magnitudes near 1.7e308 (recorded); a product only near 1e154
+  (fuzz: `fl*fl*fl … LIMIT 3` failed on rows it did not return), so `*` over
+  doubles is not pushed (owner's call). `real` stays out (DuckDB promotes FLOAT beside a
+  DOUBLE). `money` / `smallmoney` arithmetic is not in PR D.
 
 **Revised in PR B: the catalog's types, not the describe's.** Run on every
 table of the test database, the describe disagreed with the catalog on three

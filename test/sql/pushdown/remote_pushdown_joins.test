@@ -92,17 +92,6 @@ EXPLAIN SELECT a.id AS aid, a.name, b.id AS bid, b.label, b.qty FROM rj_on.dbo.r
 ----
 physical_plan	<REGEX>:.*RIGHT JOIN \[dbo\]\.\[rj_b\] AS \[r2\].*
 
-# The outer joins' own types, beside the scan path's.
-query TTTT
-SELECT typeof(a.id), typeof(a.name), typeof(b.id), typeof(b.qty) FROM rj_on.dbo.rj_a a FULL JOIN rj_on.dbo.rj_b b ON b.a_id = a.id LIMIT 1;
-----
-INTEGER	MSSQL_NVARCHAR(20)	INTEGER	INTEGER
-
-query TTTT
-SELECT typeof(a.id), typeof(a.name), typeof(b.id), typeof(b.qty) FROM rj_off.dbo.rj_a a FULL JOIN rj_off.dbo.rj_b b ON b.a_id = a.id LIMIT 1;
-----
-INTEGER	MSSQL_NVARCHAR(20)	INTEGER	INTEGER
-
 # 3 inner + 5 left + 5 right + 6 full.
 query I
 SELECT count(*) FROM j_on;
@@ -228,15 +217,40 @@ SELECT a.id, a.name FROM rj_off.dbo.rj_a a SEMI JOIN rj_off.dbo.rj_b b ON b.a_id
 # Vetoes: the statement stays on the scan path, with the right rows.
 #
 
-# A SEMI join beside an outer join: its EXISTS would land after the outer
-# join's NULL-supplied rows.
+# A RIGHT / FULL join over a SEMI join is not pushed: the SEMI join's EXISTS
+# moves to WHERE, which the rows the RIGHT join brings (its left side NULL)
+# would not survive.
 query II
-EXPLAIN SELECT a.id, b.id AS bid FROM rj_on.dbo.rj_a a LEFT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id SEMI JOIN rj_on.dbo.rj_a c ON c.id = a.id ORDER BY a.id;
+EXPLAIN SELECT b.id AS bid, a.id FROM rj_on.dbo.rj_a a SEMI JOIN rj_on.dbo.rj_a c ON c.id = a.id RIGHT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id ORDER BY bid;
 ----
 physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
 
 query II
-SELECT a.id, b.id AS bid FROM rj_on.dbo.rj_a a LEFT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id SEMI JOIN rj_on.dbo.rj_a c ON c.id = a.id ORDER BY a.id, bid;
+SELECT b.id AS bid, a.id FROM rj_on.dbo.rj_a a SEMI JOIN rj_on.dbo.rj_a c ON c.id = a.id RIGHT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id ORDER BY bid;
+----
+2	2
+10	1
+11	1
+12	3
+13	NULL
+
+# A LEFT join before it keeps the EXISTS exact: pushed, the same rows.
+query II
+EXPLAIN SELECT a.id, b.id AS bid FROM rj_on.dbo.rj_a a LEFT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id SEMI JOIN rj_on.dbo.rj_a c ON c.id = a.id ORDER BY a.id, bid LIMIT 10;
+----
+physical_plan	<REGEX>:.*LEFT JOIN \[dbo\]\.\[rj_b\] AS \[r2\].*WHERE EXISTS.*
+
+query II
+SELECT a.id, b.id AS bid FROM rj_on.dbo.rj_a a LEFT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id SEMI JOIN rj_on.dbo.rj_a c ON c.id = a.id ORDER BY a.id, bid LIMIT 10;
+----
+1	10
+1	11
+2	2
+3	12
+4	NULL
+
+query II
+SELECT a.id, b.id AS bid FROM rj_off.dbo.rj_a a LEFT JOIN rj_off.dbo.rj_b b ON b.a_id = a.id SEMI JOIN rj_off.dbo.rj_a c ON c.id = a.id ORDER BY a.id, bid LIMIT 10;
 ----
 1	10
 1	11

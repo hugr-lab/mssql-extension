@@ -43,6 +43,7 @@ static std::vector<MSSQLColumnInfo> Columns() {
 	columns.emplace_back("tiny", 11, "tinyint", 1, 3, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
 	columns.emplace_back("ratio", 12, "float", 8, 53, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
 	columns.emplace_back("doc", 13, "xml", -1, 0, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
+	columns.emplace_back("small", 14, "decimal", 5, 5, 2, true, "", "SQL_Latin1_General_CP1_CI_AS");
 	return columns;
 }
 
@@ -131,7 +132,7 @@ int main() {
 	ExpectSql("SELECT id AS id FROM t LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 	ExpectSql("SELECT * FROM t LIMIT 1",
 			  "SELECT TOP (1) [id], [name], [code], [amount], [day], [flag], [ts], CAST([legacy] AS NVARCHAR(30)) AS "
-			  "[legacy], [wide], [mid], [tiny], [ratio], [doc] FROM [dbo].[t]");
+			  "[legacy], [wide], [mid], [tiny], [ratio], [doc], [small] FROM [dbo].[t]");
 	ExpectSql("SELECT q.id FROM t AS q LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 
 	// WHERE: constants are parameters declared from the column.
@@ -200,14 +201,14 @@ int main() {
 	ExpectParams("SELECT id + 1 FROM t LIMIT 1", "@p0 int");
 	ExpectSql("SELECT id * 2 AS x FROM t LIMIT 1", "SELECT TOP (1) ([id] * @p0) AS [x] FROM [dbo].[t]");
 	ExpectSql("SELECT -id AS n FROM t LIMIT 1", "SELECT TOP (1) (-[id]) AS [n] FROM [dbo].[t]");
-	ExpectSql("SELECT id FROM t WHERE id + 1 > 5 LIMIT 1",
-			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([id] + @p0) > @p1)");
+	ExpectVeto("SELECT id FROM t WHERE id + 1 > 5 LIMIT 1");  // DuckDB moves the constant (full review)
 	ExpectSql("SELECT id FROM t WHERE id % 2 = 0 LIMIT 1",
 			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([id] % @p0) = @p1)");
 	ExpectSql("SELECT amount + amount AS d FROM t LIMIT 1",
 			  "SELECT TOP (1) ([amount] + [amount]) AS [d] FROM [dbo].[t]");
-	ExpectSql("SELECT id FROM t WHERE amount + 1 > 2 LIMIT 1",
-			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([amount] + @p0) > @p1)");
+	ExpectSql(
+		"SELECT id FROM t WHERE amount + 1 > 2 LIMIT 1",
+		"SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([amount] + @p0) > @p1)");  // a decimal: DuckDB computes it too
 	ExpectSql("SELECT id + 1 FROM t LIMIT 1", "SELECT TOP (1) ([id] + CAST(1 AS int)) AS [(id + 1)] FROM [dbo].[t]",
 			  false);
 	ExpectVeto("SELECT wide + wide FROM t LIMIT 1");				   // width 38: the server would round
@@ -271,8 +272,7 @@ int main() {
 	// CASE, COALESCE, NULLIF: one type for every branch.
 	ExpectSql("SELECT CASE WHEN id > 1 THEN id ELSE 0 END AS c FROM t LIMIT 1",
 			  "SELECT TOP (1) CASE WHEN ([id] > @p0) THEN [id] ELSE @p1 END AS [c] FROM [dbo].[t]");
-	ExpectSql("SELECT coalesce(amount, 0) AS c FROM t LIMIT 1",
-			  "SELECT TOP (1) COALESCE([amount], @p0) AS [c] FROM [dbo].[t]");
+	ExpectVeto("SELECT coalesce(amount, 0) AS c FROM t LIMIT 1");  // DECIMAL(12,2) in DuckDB
 	ExpectSql("SELECT nullif(id, 0) AS c FROM t LIMIT 1", "SELECT TOP (1) NULLIF([id], @p0) AS [c] FROM [dbo].[t]");
 	ExpectSql("SELECT CASE WHEN flag THEN id END AS c FROM t LIMIT 1",
 			  "SELECT TOP (1) CASE WHEN ([flag] = 1) THEN [id] ELSE NULL END AS [c] FROM [dbo].[t]");
@@ -322,7 +322,7 @@ int main() {
 	ExpectVeto("SELECT id FROM t WHERE id LIKE '1%' LIMIT 1");		// LIKE over an int
 	ExpectVeto("SELECT id FROM t WHERE name LIKE legacy LIMIT 1");	// pattern not a constant
 
-	// Everything outside PR B's vocabulary is a veto, never a guess.
+	// Everything outside the writer's vocabulary is a veto, never a guess.
 	ExpectVeto("SELECT rowid FROM t LIMIT 1");
 	ExpectVeto("SELECT * EXCLUDE (id) FROM t LIMIT 1");
 	ExpectVeto("SELECT id, id FROM t LIMIT 1");
@@ -481,7 +481,8 @@ int main() {
 		"SELECT * FROM t SEMI JOIN u USING (id) LIMIT 1",
 		"SELECT TOP (1) [r1].[id] AS [id], [r1].[name] AS [name], [r1].[code] AS [code], [r1].[amount] AS [amount], "
 		"[r1].[day] AS [day], [r1].[flag] AS [flag], [r1].[ts] AS [ts], CAST([r1].[legacy] AS NVARCHAR(30)) AS "
-		"[legacy], [r1].[wide] AS [wide], [r1].[mid] AS [mid], [r1].[ratio] AS [ratio], [r1].[doc] AS [doc] FROM "
+		"[legacy], [r1].[wide] AS [wide], [r1].[mid] AS [mid], [r1].[ratio] AS [ratio], [r1].[doc] AS [doc], "
+		"[r1].[small] AS [small] FROM "
 		"[dbo].[t] AS [r1] WHERE EXISTS (SELECT 1 FROM [dbo].[u] AS [r2] WHERE ([r1].[id] = [r2].[id]))");
 	ExpectVeto("SELECT u.label FROM t SEMI JOIN u ON t.id = u.t_id");  // the right side is gone
 	ExpectVeto("SELECT id FROM t SEMI JOIN u ON t.id = u.t_id WHERE u.big > 1");
@@ -491,8 +492,13 @@ int main() {
 	ExpectSql("SELECT t.id FROM t SEMI JOIN u USING (id) JOIN u AS v USING (id)",
 			  "SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] INNER JOIN [dbo].[u] AS [r3] ON ([r1].[id] = [r3].[id]) "
 			  "WHERE EXISTS (SELECT 1 FROM [dbo].[u] AS [r2] WHERE ([r1].[id] = [r2].[id]))");
-	ExpectVeto(
-		"SELECT t.id FROM t LEFT JOIN u ON t.id = u.t_id SEMI JOIN t AS x ON x.id = t.id");	 // beside an outer join
+	// A LEFT join before it keeps the EXISTS exact; a RIGHT / FULL join over it
+	// would bring rows the moved EXISTS drops.
+	ExpectSql("SELECT t.id FROM t LEFT JOIN u ON t.id = u.t_id SEMI JOIN t AS x ON x.id = t.id",
+			  "SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] LEFT JOIN [dbo].[u] AS [r2] ON ([r1].[id] = "
+			  "[r2].[t_id]) WHERE EXISTS (SELECT 1 FROM [dbo].[t] AS [r3] WHERE ([r3].[id] = [r1].[id]))");
+	ExpectVeto("SELECT u.id FROM t SEMI JOIN t AS x ON x.id = t.id RIGHT JOIN u ON u.t_id = t.id");
+	ExpectVeto("SELECT u.id FROM t ANTI JOIN t AS x ON x.id = t.id FULL JOIN u ON u.t_id = t.id");
 	ExpectVeto("SELECT t.id FROM t ASOF JOIN u ON t.id >= u.t_id");
 	ExpectVeto("SELECT t.id FROM t POSITIONAL JOIN u");
 	ExpectVeto("SELECT id FROM t RIGHT JOIN u USING (id)");
@@ -501,6 +507,64 @@ int main() {
 	ExpectVeto("SELECT t.id FROM t JOIN (SELECT * FROM u) s ON t.id = s.t_id");
 	ExpectVeto("SELECT t.id FROM t JOIN v ON t.id = v.id");								  // not this catalog's
 	ExpectVeto("SELECT t.id FROM t JOIN u ON t.id = x.id JOIN t AS x ON x.id = u.t_id");  // ON names a later table
+
+	// Full review of PR D (fuzz): a repeated ORDER BY key is dropped (169).
+	ExpectSql("SELECT id FROM t ORDER BY id, id DESC LIMIT 2",
+			  "SELECT TOP (2) [id] FROM [dbo].[t] ORDER BY [t].[id] ASC");
+	// DuckDB moves a constant across a comparison with a constant and never
+	// computes `id - 5`; the server would, and could overflow.
+	ExpectVeto("SELECT id FROM t WHERE id - 5 > 3 LIMIT 1");
+	ExpectVeto("SELECT id FROM t WHERE id * 2 = 10 LIMIT 1");
+	ExpectVeto("SELECT id FROM t WHERE -id > 3 LIMIT 1");
+	ExpectSql("SELECT id FROM t WHERE -amount > 3 LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ((-[amount]) > @p0)");	// moved, but no overflow
+	ExpectSql("SELECT id FROM t WHERE ratio + 1 > 5 LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([ratio] + @p0) > @p1)");	// integral types only
+	ExpectVeto("SELECT -(amount + 700) AS x FROM t LIMIT 1");  // the negation keeps the uncertainty
+	{
+		WrittenQuery out;
+		std::string why;
+		if (!Write("SELECT id, coalesce(sum(amount), 0) AS s FROM t GROUP BY id", out, why) ||
+			out.column_types[1] != LogicalType::DECIMAL(38, 2)) {
+			std::cerr << "FAIL: coalesce(sum(amount), 0) is not DECIMAL(38,2) (" << why << ")\n";
+			failures++;
+		}
+	}
+	ExpectVeto("SELECT id FROM t WHERE id + 1 BETWEEN 2 AND 5 LIMIT 1");
+	ExpectSql("SELECT id FROM t WHERE id + id > 3 LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([id] + [id]) > @p0)");
+	// A computed decimal carries DuckDB's type, or is not pushed.
+	ExpectVeto("SELECT amount + 700 AS a FROM t LIMIT 1");	// DECIMAL(13,2) there
+	ExpectSql("SELECT id FROM t WHERE id + 1 > id LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([id] + @p0) > [id])");  // beside a column: not moved
+	{
+		WrittenQuery out;
+		std::string why;
+		if (!Write("SELECT amount + amount AS a FROM t LIMIT 1", out, why) ||
+			out.column_types[0] != LogicalType::DECIMAL(11, 2) || out.cast_types[0].id() != LogicalTypeId::INVALID) {
+			std::cerr << "FAIL: amount + amount types (" << why << ")\n";
+			failures++;
+		}
+	}
+	{
+		// A product DuckDB types exactly (5 + 5 digits fit 18): the server's
+		// decimal(11,4) is read and cast to DuckDB's DECIMAL(10,4).
+		WrittenQuery out;
+		std::string why;
+		if (!Write("SELECT small * small AS p FROM t LIMIT 1", out, why) ||
+			out.cast_types[0] != LogicalType::DECIMAL(10, 4) || out.column_types[0].id() != LogicalTypeId::INVALID) {
+			std::cerr << "FAIL: small * small is not cast back to DECIMAL(10,4) (" << why << ")\n";
+			failures++;
+		}
+	}
+	ExpectVeto("SELECT -(small * small) FROM t LIMIT 1");
+	// Doubles: +, -, * round alike on both sides.
+	ExpectSql("SELECT ratio - ratio AS r FROM t WHERE ratio > 1.5 LIMIT 1",
+			  "SELECT TOP (1) ([ratio] - [ratio]) AS [r] FROM [dbo].[t] WHERE ([ratio] > @p0)");
+	ExpectVeto("SELECT ratio * ratio AS r FROM t LIMIT 1");	 // overflows (8115) near 1e154 there, inf here
+	ExpectParams("SELECT ratio + 1 AS r FROM t LIMIT 1", "@p0 float");
+	ExpectVeto("SELECT ratio % 2 FROM t LIMIT 1");
+	ExpectVeto("SELECT ratio + amount FROM t LIMIT 1");
 
 	// The gain rule: a node the catalog scan serves as well stays with it.
 	ExpectGain("SELECT * FROM t", false);

@@ -78,7 +78,7 @@ namespace {
 //! ROUNDED into the parameter on the server and compared exactly by DuckDB
 //! (the #358 lesson), which needs its own rule. text / ntext / xml / the
 //! cast-required types cannot be compared with `=` at all.
-enum class ComparableKind { None, Boolean, ExactNumeric, Date, String };
+enum class ComparableKind { None, Boolean, ExactNumeric, Float, Date, String };
 
 ComparableKind KindOf(const MSSQLColumnInfo &column) {
 	if (column.is_cast_required || column.is_geometry) {
@@ -91,6 +91,11 @@ ComparableKind KindOf(const MSSQLColumnInfo &column) {
 	if (type == "tinyint" || type == "smallint" || type == "int" || type == "bigint" || type == "decimal" ||
 		type == "numeric") {
 		return ComparableKind::ExactNumeric;
+	}
+	if (type == "float" && column.duckdb_type.id() == LogicalTypeId::DOUBLE) {
+		// float(53): IEEE binary64 on both sides, so +, -, * and a comparison
+		// round alike (real stays out: DuckDB promotes FLOAT beside a DOUBLE).
+		return ComparableKind::Float;
 	}
 	if (type == "date") {
 		return ComparableKind::Date;
@@ -145,6 +150,18 @@ struct Operand {
 	LogicalType result_type;
 	//! `result_type` is not what the wire decodes into: cast after the read.
 	bool cast_result = false;
+	//! A decimal whose DuckDB type the writer cannot tell: a constant took
+	//! part, which DuckDB types by its own literal rules (`v + 700` is
+	//! DECIMAL(13,2) there, decimal(11,2) on the server). Fine in a condition,
+	//! not as a result column.
+	bool type_uncertain = false;
+	//! An integer `x + c`, `x - c`, `x * c` or `-x`: DuckDB's optimizer moves
+	//! the constant across a comparison with a constant (MoveConstantsRule, on
+	//! integral types; MoveUnaryMinusRule: `t - 5 > 3` is `t > 8` there) and
+	//! never computes the value the server would -- and overflow on (tinyint
+	//! `t - 5`, error 8115). A decimal or a double DuckDB computes as the
+	//! server does.
+	bool moves_constant = false;
 };
 
 struct OutputColumn {
@@ -250,7 +267,6 @@ struct Relation {
 	WriterTable table;
 	std::string name;		// how the query names it: its alias, else the table's name
 	std::string sql;		// how the statement names it: [r1] under a join, empty for one table
-	idx_t first = 0;		// its first column in the writer's flat column list
 	bool nullable = false;	// on the NULL-supplying side of an outer join
 	//! The right side of a SEMI / ANTI join: sent as an EXISTS / NOT EXISTS,
 	//! its columns visible only in that join's own condition.
@@ -346,8 +362,7 @@ private:
 	std::vector<LogicalType> types_;
 	std::vector<idx_t> relation_of_;
 	//! A USING column's name -> the column an unqualified reference to it
-	//! means (the left side's for INNER / LEFT, the right's for RIGHT);
-	//! INVALID for FULL, where it is COALESCE(l, r) and not pushed.
+	//! means: the left side's (USING in a RIGHT / FULL join is vetoed).
 	std::vector<std::pair<std::string, idx_t>> using_columns_;
 	//! The right side's USING columns, which `*` leaves out.
 	std::vector<idx_t> hidden_using_;
@@ -359,8 +374,6 @@ private:
 	idx_t semi_scope_ = DConstants::INVALID_INDEX;
 	//! The EXISTS / NOT EXISTS a SEMI / ANTI join becomes, ANDed to WHERE.
 	std::vector<std::string> semi_filters_;
-	bool outer_join_ = false;
-	bool semi_join_ = false;
 	WrittenQuery &out_;
 	std::string &why_;
 	std::vector<OutputColumn> outputs_;
@@ -412,9 +425,6 @@ int NodeWriter::FindColumn(const ColumnRefExpression &ref, idx_t &out) const {
 		// An unqualified USING column is the merged one DuckDB's binder makes.
 		for (auto &merged : using_columns_) {
 			if (StringUtil::CIEquals(merged.first, name)) {
-				if (merged.second == DConstants::INVALID_INDEX) {
-					return -1;
-				}
 				out = merged.second;
 				return 1;
 			}
@@ -469,8 +479,7 @@ bool NodeWriter::ResolveColumn(const ColumnRefExpression &ref, idx_t &out) {
 				}
 			}
 		}
-		return Veto("column name " + names.back().GetIdentifierName() +
-					" matches more than one column, or a USING column of a FULL join");
+		return Veto("column name " + names.back().GetIdentifierName() + " matches more than one column");
 	}
 }
 
@@ -501,7 +510,6 @@ bool NodeWriter::CollectRelations(const TableRef &ref, std::vector<idx_t> &membe
 				return Veto("two tables named " + relation.name);
 			}
 		}
-		relation.first = columns_.size();
 		const auto &columns = *relation.table.columns;
 		for (idx_t i = 0; i < columns.size(); i++) {
 			columns_.push_back(columns[i]);
@@ -541,18 +549,22 @@ bool NodeWriter::CollectRelations(const TableRef &ref, std::vector<idx_t> &membe
 	if (!CollectRelations(*join.left, left) || !CollectRelations(*join.right, right)) {
 		return false;
 	}
+	bool semi_on_left = false;
+	for (auto r : left) {
+		semi_on_left = semi_on_left || relations_[r].semi;
+	}
 	if (semi) {
 		for (auto r : right) {
 			relations_[r].semi = true;
 		}
-		semi_join_ = true;
-	} else if (join.type != JoinType::INNER) {
-		outer_join_ = true;
 	}
-	if (semi_join_ && outer_join_) {
-		// Its EXISTS is ANDed to WHERE, after every join: exact while the others
-		// are inner, not beside an outer join's NULL-supplied rows.
-		return Veto("a SEMI / ANTI join in a chain with an outer join");
+	if (semi_on_left && (join.type == JoinType::RIGHT || join.type == JoinType::OUTER)) {
+		// A SEMI join's EXISTS is ANDed to WHERE, after every join. That is
+		// exact for the rows its left side produces, which later INNER and LEFT
+		// joins keep, and whatever joins came before it -- but a later RIGHT /
+		// FULL join adds rows with that side NULL, which the moved EXISTS would
+		// drop.
+		return Veto("a RIGHT / FULL join over a SEMI / ANTI join");
 	}
 	// The NULL-supplying side: its columns can be NULL whatever they declare.
 	if (join.type == JoinType::LEFT || join.type == JoinType::OUTER) {
@@ -757,7 +769,7 @@ bool NodeWriter::WriteGroups(const SelectNode &node, std::string &sql) {
 
 bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind, Operand &out) {
 	if (!after_grouping_) {
-		return Veto("an aggregate in WHERE");
+		return Veto("an aggregate in WHERE / ON");
 	}
 	if (in_aggregate_) {
 		return Veto("an aggregate inside an aggregate");
@@ -841,9 +853,7 @@ bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind
 	// widening cast to DOUBLE).
 	const bool integer = arg.kind == ComparableKind::ExactNumeric && IntegerRank(arg.type.id()) > 0;
 	const bool decimal = arg.kind == ComparableKind::ExactNumeric && arg.type.id() == LogicalTypeId::DECIMAL;
-	const bool floating = arg.type.id() == LogicalTypeId::DOUBLE &&
-						  (arg.kind == ComparableKind::ExactNumeric ||
-						   (arg.column && StringUtil::CIEquals(arg.column->sql_type_name, "float")));
+	const bool floating = arg.type.id() == LogicalTypeId::DOUBLE && arg.kind == ComparableKind::Float;
 	if (!integer && !decimal && !floating) {
 		return Veto(fn.FunctionName().GetIdentifierName() + " over " + arg.type.ToString());
 	}
@@ -997,6 +1007,16 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			if (value.constant) {
 				return Veto("a constant in the select list");
 			}
+			// A result column carries its type: a decimal whose DuckDB type the
+			// writer cannot tell would come back as the server's (fuzz of PR D:
+			// `v + 700` DECIMAL(11,2) pushed, DECIMAL(13,2) local).
+			if (value.type_uncertain ||
+				(value.type.id() == LogicalTypeId::INVALID && value.result_type.id() == LogicalTypeId::INVALID)) {
+				return Veto("a computed decimal whose DuckDB type differs from the server's");
+			}
+			if (value.result_type.id() == LogicalTypeId::INVALID && value.type.id() == LogicalTypeId::DECIMAL) {
+				value.result_type = value.type;
+			}
 			const std::string output = item->GetName().GetIdentifierName();
 			if (output.size() > 128) {
 				// SQL Server refuses a longer identifier (103); DuckDB does not.
@@ -1075,7 +1095,7 @@ bool NodeWriter::ConstantFor(ComparableKind kind, const LogicalType &target, con
 	}
 	case LiteralKind::INTEGER:
 	case LiteralKind::NUMERIC: {
-		if (kind != ComparableKind::ExactNumeric) {
+		if (kind != ComparableKind::ExactNumeric && kind != ComparableKind::Float) {
 			return Veto("numeric constant against " + peer_name);
 		}
 		// DuckDB compares in the wider of the two types; the server compares in
@@ -1321,6 +1341,7 @@ bool NodeWriter::Unify(std::vector<Operand> &operands, Operand &result, bool con
 		}
 	}
 	const Operand typed_peer = *peer;
+	bool typed_constant = false;
 	for (auto &operand : operands) {
 		if (!operand.constant) {
 			continue;
@@ -1334,14 +1355,23 @@ bool NodeWriter::Unify(std::vector<Operand> &operands, Operand &result, bool con
 		if (!BindConstant(typed_peer, operand, true)) {
 			return false;
 		}
+		typed_constant = true;
 	}
 	result = Operand();
 	result.type = typed_peer.type;
 	result.kind = typed_peer.kind;
 	result.result_type = typed_peer.result_type;
 	result.cast_result = typed_peer.cast_result;
+	// A constant branch beside a decimal: DuckDB's type is its literal rules'
+	// (`COALESCE(v, 700)` is DECIMAL(12,2) there, decimal(10,2) here).
+	// An integer SUM is HUGEINT in DuckDB whatever the constant: known.
+	// A DECIMAL(38, s) stays DECIMAL(38, s): the width is capped.
+	result.type_uncertain = typed_constant && typed_peer.type.id() == LogicalTypeId::DECIMAL &&
+							DecimalType::GetWidth(typed_peer.type) < 38 &&
+							!(typed_peer.cast_result && typed_peer.result_type.id() != LogicalTypeId::DECIMAL);
 	for (auto &operand : operands) {
 		result.approximate = result.approximate || operand.approximate;
+		result.type_uncertain = result.type_uncertain || operand.type_uncertain;
 	}
 	return true;
 }
@@ -1404,7 +1434,7 @@ bool NodeWriter::WriteDivide(const FunctionExpression &fn, Operand &out) {
 	// constant is a DOUBLE here (`n / 2.5` included), and each side is cast to
 	// float on the server.
 	Operand as_double;
-	as_double.kind = ComparableKind::ExactNumeric;
+	as_double.kind = ComparableKind::Float;
 	as_double.type = LogicalType::DOUBLE;
 	as_double.sql = "a DOUBLE operand";
 	for (auto &operand : operands) {
@@ -1414,14 +1444,14 @@ bool NodeWriter::WriteDivide(const FunctionExpression &fn, Operand &out) {
 			}
 			continue;
 		}
-		if (operand.kind != ComparableKind::ExactNumeric ||
+		if ((operand.kind != ComparableKind::ExactNumeric && operand.kind != ComparableKind::Float) ||
 			(!IsArithmeticType(operand.type) && operand.type.id() != LogicalTypeId::DOUBLE)) {
 			return Veto("division over " + operand.type.ToString());
 		}
 	}
 	out.sql = ExpressionVocabulary::Divide(operands[0].sql, operands[1].sql);
 	out.type = LogicalType::DOUBLE;
-	out.kind = ComparableKind::ExactNumeric;
+	out.kind = ComparableKind::Float;
 	out.division = true;
 	out.approximate = operands[0].approximate || operands[1].approximate;
 	return true;
@@ -1436,7 +1466,7 @@ bool NodeWriter::WriteCast(const CastExpression &cast, Operand &out) {
 	if (!WriteValue(cast.Child(), child)) {
 		return false;
 	}
-	if (child.constant || child.kind != ComparableKind::ExactNumeric) {
+	if (child.constant || (child.kind != ComparableKind::ExactNumeric && child.kind != ComparableKind::Float)) {
 		return Veto("cast " + cast.ToString());
 	}
 	// Widening only, where both sides convert exactly the same: a wider
@@ -1467,7 +1497,7 @@ bool NodeWriter::WriteCast(const CastExpression &cast, Operand &out) {
 	out.approximate = child.approximate;
 	out.sql = ExpressionVocabulary::Cast(child.sql, tsql);
 	out.type = target == LogicalTypeId::DOUBLE ? LogicalType::DOUBLE : LogicalType(target);
-	out.kind = ComparableKind::ExactNumeric;
+	out.kind = target == LogicalTypeId::DOUBLE ? ComparableKind::Float : ComparableKind::ExactNumeric;
 	return true;
 }
 
@@ -1489,14 +1519,15 @@ bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
 		auto &operand = operands[0];
 		// UTINYINT has no negative values in DuckDB; the server's tinyint
 		// negation widens. Constants never get here: the rewriter folds them.
-		if (operand.constant || operand.kind != ComparableKind::ExactNumeric ||
-			operand.type.id() == LogicalTypeId::UTINYINT || !IsArithmeticType(operand.type)) {
+		const bool floating = operand.kind == ComparableKind::Float;
+		if (operand.constant || (!floating && operand.kind != ComparableKind::ExactNumeric) ||
+			operand.type.id() == LogicalTypeId::UTINYINT || (!floating && !IsArithmeticType(operand.type))) {
 			return Veto("negation " + fn.ToString());
 		}
 		if (operand.cast_result) {
-			// An integer SUM is HUGEINT here, decimal(38,0) there: its negation
-			// would come back as the server's type.
-			return Veto("negation of an integer SUM");
+			// A value read as the server's type and cast back (an integer SUM, a
+			// decimal product): its negation would come back as the server's.
+			return Veto("negation of a value whose type is cast back after the read");
 		}
 		std::string why;
 		auto mapping =
@@ -1506,7 +1537,13 @@ bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
 		}
 		out.sql = ExpressionVocabulary::ApplyFunction(*mapping, {operand.sql});
 		out.type = operand.type;
-		out.kind = ComparableKind::ExactNumeric;
+		out.kind = operand.kind;
+		out.type_uncertain = operand.type_uncertain;
+		out.division = operand.division;
+		out.approximate = operand.approximate;
+		// MoveUnaryMinusRule moves `-x > c` to `x < -c` for any numeric type,
+		// but only an integer negation can overflow (at its minimum).
+		out.moves_constant = IntegerRank(operand.type.id()) > 0;
 		return true;
 	}
 	auto &left = operands[0];
@@ -1514,11 +1551,30 @@ bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
 	if (left.constant && right.constant) {
 		return Veto("arithmetic on two constants " + fn.ToString());
 	}
+	const bool with_constant = left.constant || right.constant;
 	if (left.constant && !BindConstant(right, left, true)) {
 		return false;
 	}
 	if (right.constant && !BindConstant(left, right, true)) {
 		return false;
+	}
+	// A double: + and - round alike on both sides (IEEE binary64). An overflow
+	// is inf here and error 8115 there, and the server computes a projection
+	// for every row WHERE passes, TOP's discards included -- so a statement
+	// DuckDB completes can fail pushed. A sum needs values near 1.7e308 for it
+	// (recorded); a product only near 1e154 (full review fuzz), so * is not
+	// pushed.
+	if (left.kind == ComparableKind::Float && right.kind == ComparableKind::Float &&
+		left.type.id() == LogicalTypeId::DOUBLE && right.type.id() == LogicalTypeId::DOUBLE &&
+		(name == "+" || name == "-")) {
+		out.sql = "(" + left.sql + " " + name + " " + right.sql + ")";
+		out.type = LogicalType::DOUBLE;
+		out.kind = ComparableKind::Float;
+		// MoveConstantsRule matches integral types only: DuckDB computes `f + c`.
+		// x / 0 is NULL there, inf here: still the recorded value divergence.
+		out.division = left.division || right.division;
+		out.approximate = left.approximate || right.approximate;
+		return true;
 	}
 	// Same type on both sides, or the promotions differ: DuckDB widens
 	// smallint + int to INTEGER, the server by its own precedence.
@@ -1526,6 +1582,8 @@ bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
 		!IsArithmeticType(left.type) || left.type != right.type) {
 		return Veto("arithmetic over " + left.type.ToString() + " and " + right.type.ToString());
 	}
+	// MoveConstantsRule (integral types only; `%` not among its operators).
+	out.moves_constant = with_constant && name != "%" && IntegerRank(left.type.id()) > 0;
 	std::string why;
 	auto mapping =
 		ExpressionVocabulary::FunctionFor(name, {left.type, right.type}, why, options_.division_by_zero_errors);
@@ -1545,16 +1603,28 @@ bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
 			return Veto("decimal arithmetic at width 38");
 		}
 		out.type = LogicalType::DECIMAL(width + 1, DecimalType::GetScale(left.type));
+		// A constant beside it is typed by DuckDB's literal rules, not the
+		// column's: `v + 700` is DECIMAL(13,2) there.
+		out.type_uncertain = with_constant || left.type_uncertain || right.type_uncertain;
+		// Over operands cast back after the read (a product) the server's width
+		// grows from THEIR wider types: the sum is cast back too.
+		out.result_type = out.type;
+		out.cast_result = left.cast_result || right.cast_result;
 	} else {
-		// A product (FunctionFor, below, refuses the ones DuckDB caps at
-		// DECIMAL(18) and the ones past the server's 38 digits): the value
-		// agrees, the type does not (decimal(p1 + p2 + 1, …) there), so nothing
-		// is compared with a product.
-		if (2 * DecimalType::GetWidth(left.type) + 1 > 38) {
-			return Veto("a decimal product wider than 38 digits");
+		// A product. FunctionFor (above) has refused the ones DuckDB caps at
+		// DECIMAL(18) -- overflowing where the server's decimal(w1 + w2 + 1, …)
+		// holds the value (99999999.99 squared in DECIMAL(10,2)) -- and the ones
+		// past the server's 38 digits. What is left DuckDB types exactly as
+		// DECIMAL(w1 + w2, s1 + s2): the server's value, read and cast to it.
+		const auto width = DecimalType::GetWidth(left.type);
+		const auto scale = DecimalType::GetScale(left.type);
+		if (2 * width > 38) {
+			return Veto("a decimal product past 38 digits");
 		}
-		out.type = LogicalType::INVALID;
-		out.kind = ComparableKind::None;
+		out.type = LogicalType::DECIMAL(2 * width, 2 * scale);
+		out.result_type = out.type;
+		out.cast_result = true;
+		out.type_uncertain = with_constant || left.type_uncertain || right.type_uncertain;
 	}
 	return true;
 }
@@ -1592,6 +1662,11 @@ bool NodeWriter::WriteComparison(const ComparisonExpression &cmp, std::string &s
 	Operand right;
 	if (!WriteValue(cmp.Left(), left) || !WriteValue(cmp.Right(), right)) {
 		return false;
+	}
+	if ((left.moves_constant && right.constant) || (right.moves_constant && left.constant)) {
+		// DuckDB moves the constant across (`t - 5 > 3` is `t > 8` there) and
+		// never computes what the server would, and could overflow on.
+		return Veto("arithmetic with a constant compared with a constant " + cmp.ToString());
 	}
 	if (!BindPair(left, right, cmp.ToString())) {
 		return false;
@@ -1646,6 +1721,10 @@ bool NodeWriter::WriteBetween(const BetweenExpression &between, std::string &sql
 	Operand upper;
 	if (!WriteValue(between.LowerBound(), lower) || !WriteValue(between.UpperBound(), upper)) {
 		return false;
+	}
+	if (input.moves_constant && (lower.constant || upper.constant)) {
+		// BETWEEN is two comparisons to DuckDB, each moved as above.
+		return Veto("arithmetic with a constant in BETWEEN " + between.ToString());
 	}
 	Operand peer = input;
 	if (!BindPair(peer, lower, between.ToString()) || !BindPair(peer, upper, between.ToString())) {
@@ -1797,6 +1876,18 @@ bool NodeWriter::ConstantCount(const ParsedExpression &expr, int64_t &out) {
 }
 
 bool NodeWriter::WriteOrder(const OrderModifier &order, bool limited, std::string &sql) {
+	// A key already sorted by is dropped: it cannot reorder anything, and the
+	// server refuses a repeated ORDER BY item (169) where DuckDB takes it.
+	std::vector<std::string> keys;
+	auto repeated = [&](const std::string &key) {
+		for (auto &seen : keys) {
+			if (seen == key) {
+				return true;
+			}
+		}
+		keys.push_back(key);
+		return false;
+	};
 	for (auto &node : order.orders) {
 		// DuckDB resolves an ORDER BY name against the select list first, then
 		// the FROM; a bare integer is a position in the select list.
@@ -1863,6 +1954,9 @@ bool NodeWriter::WriteOrder(const OrderModifier &order, bool limited, std::strin
 				type == OrderType::DESCENDING ? options_.default_null_order_desc : options_.default_null_order_asc;
 		}
 		std::string term;
+		if (repeated(index != DConstants::INVALID_INDEX ? OrderColumnSql(index) : computed.sql)) {
+			continue;
+		}
 		if (index == DConstants::INVALID_INDEX) {
 			if (!computed.orderable) {
 				return Veto(computed.approximate ? "ORDER BY a floating-point aggregate"

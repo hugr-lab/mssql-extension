@@ -61,8 +61,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sent without a GROUP BY clause (over no rows the server would return no row
   where DuckDB returns one). Not pushed: FILTER, `string_agg`, ROLLUP /
   CUBE / GROUPING SETS / GROUP BY ALL, expression keys, NATURAL / ASOF /
-  POSITIONAL joins, a join with a subquery or a local table, and a
-  `CROSS JOIN` (or comma join) with nothing else to gain.
+  POSITIONAL joins, a join with a subquery or a local table, a SEMI / ANTI
+  join under a later RIGHT / FULL join, and a `CROSS JOIN` (or comma join)
+  with nothing else to gain. `stddev` / `variance` can differ by far more
+  than the last bits on large, close values (the server computes them in one
+  pass). Arithmetic over `float` columns is pushed as `+`, `-`, `/` (rounding
+  alike on both sides; an overflow near 1.7e308 is `inf` in DuckDB and an
+  error on the server); `*` is not, overflowing already near 1e154.
+  A computed result column now has DuckDB's type or is not pushed: a decimal
+  beside a constant (`v + 700`) stays with DuckDB as a result column. A
+  comparison of an integer `x + c` / `x - c` / `x * c` / `-x` with a constant
+  is not pushed, as DuckDB moves the constant across and never computes a
+  value the server could overflow on. A repeated ORDER BY key no longer fails on the
+  server (error 169, since PR B).
 - **`column_types := [...]` on `mssql_scan` / `mssql_scan_params`**: the type
   each result column is read as, `''` for the described one, checked against
   the server's describe. The rewriter uses it so a pushed `SELECT` has the
