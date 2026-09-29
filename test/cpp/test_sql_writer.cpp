@@ -205,6 +205,49 @@ int main() {
 	ExpectVeto("SELECT id + 1 FROM t ORDER BY 1 LIMIT 1");
 	ExpectVeto("SELECT abs(id) FROM t LIMIT 1");  // functions: a later step
 
+	// Division: DuckDB's `/` is floating (5 / 2 = 2.5); a zero divisor gives
+	// NULL on the server where DuckDB says inf -- the recorded divergence.
+	ExpectSql("SELECT id / 2 AS h FROM t LIMIT 1",
+			  "SELECT TOP (1) (CAST([id] AS float) / NULLIF(CAST(@p0 AS float), 0)) AS [h] FROM [dbo].[t]");
+	ExpectSql(
+		"SELECT id / 2 AS h FROM t LIMIT 1",
+		"SELECT TOP (1) (CAST([id] AS float) / NULLIF(CAST(CAST(2.0 AS float) AS float), 0)) AS [h] FROM [dbo].[t]",
+		false);
+	ExpectParams("SELECT id / 2.5 AS h FROM t LIMIT 1", "@p0 float");
+	ExpectSql(
+		"SELECT id FROM t WHERE amount / id > 0.5 LIMIT 1",
+		"SELECT TOP (1) [id] FROM [dbo].[t] WHERE ((CAST([amount] AS float) / NULLIF(CAST([id] AS float), 0)) > @p0)");
+	ExpectVeto("SELECT name / 2 FROM t LIMIT 1");
+
+	// Widening casts only.
+	ExpectSql("SELECT CAST(id AS BIGINT) AS b FROM t LIMIT 1",
+			  "SELECT TOP (1) CAST([id] AS bigint) AS [b] FROM [dbo].[t]");
+	ExpectSql("SELECT CAST(amount AS DOUBLE) AS d FROM t LIMIT 1",
+			  "SELECT TOP (1) CAST([amount] AS float) AS [d] FROM [dbo].[t]");
+	ExpectVeto("SELECT CAST(id AS SMALLINT) FROM t LIMIT 1");  // narrowing can fail differently
+	ExpectVeto("SELECT CAST(id AS VARCHAR) FROM t LIMIT 1");   // formatting is DuckDB's
+	ExpectVeto("SELECT TRY_CAST(id AS BIGINT) FROM t LIMIT 1");
+
+	// CASE, COALESCE, NULLIF: one type for every branch.
+	ExpectSql("SELECT CASE WHEN id > 1 THEN id ELSE 0 END AS c FROM t LIMIT 1",
+			  "SELECT TOP (1) CASE WHEN ([id] > @p0) THEN [id] ELSE @p1 END AS [c] FROM [dbo].[t]");
+	ExpectSql("SELECT coalesce(amount, 0) AS c FROM t LIMIT 1",
+			  "SELECT TOP (1) COALESCE([amount], @p0) AS [c] FROM [dbo].[t]");
+	ExpectSql("SELECT nullif(id, 0) AS c FROM t LIMIT 1", "SELECT TOP (1) NULLIF([id], @p0) AS [c] FROM [dbo].[t]");
+	ExpectSql("SELECT CASE WHEN flag THEN id END AS c FROM t LIMIT 1",
+			  "SELECT TOP (1) CASE WHEN ([flag] = 1) THEN [id] ELSE NULL END AS [c] FROM [dbo].[t]");
+	ExpectSql("SELECT id FROM t WHERE flag LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([flag] = 1)");
+	ExpectVeto("SELECT CASE WHEN flag THEN 1 END FROM t LIMIT 1");	// constants only: no type to give them
+	ExpectVeto("SELECT id FROM t WHERE id LIMIT 1");				// an int is not a condition
+	ExpectVeto("SELECT CASE WHEN id > 1 THEN id ELSE amount END FROM t LIMIT 1");  // int and decimal
+	ExpectVeto("SELECT coalesce(name, code) FROM t LIMIT 1");					   // two collations
+	ExpectVeto("SELECT coalesce(legacy, 'x') FROM t LIMIT 1");	// a code-page varchar arrives untranscoded
+	ExpectVeto("SELECT CASE WHEN id > 1 THEN id ELSE 2.0 END FROM t LIMIT 1");	// 2.0 widens DuckDB's type
+	ExpectVeto("SELECT id + 2.0 FROM t LIMIT 1");
+	ExpectSql("SELECT id FROM t WHERE id = 2.0 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([id] = @p0)");
+	ExpectSql("SELECT coalesce(name, 'none') AS c FROM t LIMIT 1",
+			  "SELECT TOP (1) COALESCE([name], @p0) AS [c] FROM [dbo].[t]");
+
 	// Everything outside PR B's vocabulary is a veto, never a guess.
 	ExpectVeto("SELECT rowid FROM t LIMIT 1");
 	ExpectVeto("SELECT DISTINCT id FROM t LIMIT 1");

@@ -16,6 +16,7 @@
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
@@ -47,6 +48,10 @@ SQLWriterOptions SQLWriterOptions::FromContext(ClientContext &context) {
 	SQLWriterOptions options;
 	options.convert_varchar_max = LoadConvertVarcharMax(context);
 	options.parameterize = LoadScanParameterizeFilters(context);
+	Value ieee;
+	if (context.TryGetCurrentSetting("ieee_floating_point_ops", ieee) && !ieee.IsNull()) {
+		options.ieee_floating_point_ops = ieee.GetValue<bool>();
+	}
 	Value division_errors;
 	if (context.TryGetCurrentSetting("error_on_division_by_zero", division_errors) && !division_errors.IsNull()) {
 		options.division_by_zero_errors = division_errors.GetValue<bool>();
@@ -172,6 +177,12 @@ private:
 	//! arithmetic expression over them.
 	bool WriteValue(const ParsedExpression &expr, Operand &out);
 	bool WriteArithmetic(const FunctionExpression &fn, Operand &out);
+	bool WriteDivide(const FunctionExpression &fn, Operand &out);
+	bool WriteCast(const CastExpression &cast, Operand &out);
+	bool WriteCase(const CaseExpression &expr, Operand &out);
+	//! COALESCE / NULLIF / CASE branches: one type for all, constants typed
+	//! from the first operand that has one, a NULL constant kept as NULL.
+	bool Unify(std::vector<Operand> &operands, Operand &result);
 	//! Types `constant` from `peer` and renders it. An operand of arithmetic
 	//! keeps its type in literal form too (see the definition).
 	bool BindConstant(const Operand &peer, Operand &constant, bool arithmetic = false);
@@ -285,7 +296,10 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			}
 			break;
 		}
-		case ExpressionClass::FUNCTION: {
+		case ExpressionClass::FUNCTION:
+		case ExpressionClass::CASE:
+		case ExpressionClass::CAST:
+		case ExpressionClass::OPERATOR: {
 			// A computed column: rendered by the same rules as WHERE, named as
 			// DuckDB names it (the alias, else the expression's text), typed by
 			// the server's describe -- the spec's "types of a pushed query are the
@@ -293,6 +307,9 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			Operand value;
 			if (!WriteValue(*item, value)) {
 				return false;
+			}
+			if (value.constant) {
+				return Veto("a constant in the select list");
 			}
 			const std::string output = item->GetName().GetIdentifierName();
 			if (output.size() > 128) {
@@ -411,8 +428,32 @@ std::string NodeWriter::Parameter(const MSSQLColumnInfo *column, const Value &va
 	return sql;
 }
 
+//! Integer width rank, for a widening cast; -1 for a non-integer.
+static int IntegerRank(LogicalTypeId id) {
+	switch (id) {
+	case LogicalTypeId::UTINYINT:
+		return 1;
+	case LogicalTypeId::SMALLINT:
+		return 2;
+	case LogicalTypeId::INTEGER:
+		return 3;
+	case LogicalTypeId::BIGINT:
+		return 4;
+	default:
+		return -1;
+	}
+}
+
 bool NodeWriter::BindConstant(const Operand &peer, Operand &constant, bool arithmetic) {
 	const std::string peer_name = peer.column ? peer.column->name : peer.sql;
+	if (arithmetic && constant.constant->GetExpressionClass() == ExpressionClass::CONSTANT &&
+		constant.constant->Cast<ConstantExpression>().GetLiteral().kind == LiteralKind::NUMERIC &&
+		IntegerRank(peer.type.id()) > 0) {
+		// In a VALUE, a decimal literal widens DuckDB's result (`tiny + 2.0` is
+		// DECIMAL, 257.0 for 255) where the exact-trip typing would keep the
+		// server's tinyint and overflow. A comparison only needs the trip.
+		return Veto("a decimal constant beside " + peer_name);
+	}
 	Value value;
 	if (!ConstantFor(peer.kind, peer.type, peer_name, *constant.constant, value)) {
 		return false;
@@ -458,15 +499,236 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 		return true;
 	}
 	case ExpressionClass::CONSTANT:
-	case ExpressionClass::CAST:
-		// A constant, or the rewriter's folded typed literal: typed by its peer.
+		// A constant: typed by its peer.
 		out.constant = &expr;
 		return true;
-	case ExpressionClass::FUNCTION:
-		return WriteArithmetic(expr.Cast<FunctionExpression>(), out);
+	case ExpressionClass::CAST: {
+		auto &cast = expr.Cast<CastExpression>();
+		if (cast.Child().GetExpressionClass() == ExpressionClass::CONSTANT) {
+			// The rewriter's folded typed literal (`DATE '2024-01-01'`).
+			out.constant = &expr;
+			return true;
+		}
+		return WriteCast(cast, out);
+	}
+	case ExpressionClass::CASE:
+		return WriteCase(expr.Cast<CaseExpression>(), out);
+	case ExpressionClass::OPERATOR: {
+		auto &op = expr.Cast<OperatorExpression>();
+		if (expr.GetExpressionType() != ExpressionType::OPERATOR_COALESCE &&
+			expr.GetExpressionType() != ExpressionType::OPERATOR_NULLIF) {
+			return Veto("value " + expr.ToString());
+		}
+		std::vector<Operand> operands(op.GetChildren().size());
+		for (idx_t i = 0; i < operands.size(); i++) {
+			if (!WriteValue(*op.GetChildren()[i], operands[i])) {
+				return false;
+			}
+		}
+		if (expr.GetExpressionType() == ExpressionType::OPERATOR_NULLIF &&
+			(operands.size() != 2 || operands[0].constant)) {
+			// NULLIF's first operand types its result; a constant there has none
+			// to give (and NULLIF(NULL, x) is T-SQL error 4151).
+			return Veto("value " + expr.ToString());
+		}
+		if (operands.empty() || !Unify(operands, out)) {
+			return operands.empty() ? Veto("value " + expr.ToString()) : false;
+		}
+		std::vector<std::string> args;
+		for (auto &operand : operands) {
+			args.push_back(operand.sql);
+		}
+		out.sql = expr.GetExpressionType() == ExpressionType::OPERATOR_NULLIF
+					  ? ExpressionVocabulary::NullIf(args[0], args[1])
+					  : ExpressionVocabulary::Coalesce(args);
+		return true;
+	}
+	case ExpressionClass::FUNCTION: {
+		auto &fn = expr.Cast<FunctionExpression>();
+		const auto &name = fn.FunctionName().GetIdentifierName();
+		if (name == "/" && fn.GetArguments().size() == 2) {
+			return WriteDivide(fn, out);
+		}
+		if (StringUtil::CIEquals(name, "nullif") && fn.GetArguments().size() == 2) {
+			std::vector<Operand> operands(2);
+			for (idx_t i = 0; i < 2; i++) {
+				if (!WriteValue(fn.GetArguments()[i].GetExpression(), operands[i])) {
+					return false;
+				}
+			}
+			if (operands[0].constant) {
+				return Veto("nullif of a constant");
+			}
+			if (!Unify(operands, out)) {
+				return false;
+			}
+			out.sql = ExpressionVocabulary::NullIf(operands[0].sql, operands[1].sql);
+			return true;
+		}
+		return WriteArithmetic(fn, out);
+	}
 	default:
 		return Veto("value " + expr.ToString());
 	}
+}
+
+bool NodeWriter::Unify(std::vector<Operand> &operands, Operand &result) {
+	const Operand *peer = nullptr;
+	for (auto &operand : operands) {
+		if (!operand.constant) {
+			peer = &operand;
+			break;
+		}
+	}
+	if (!peer) {
+		return Veto("an expression of constants only");
+	}
+	if (peer->kind == ComparableKind::None || peer->type.id() == LogicalTypeId::INVALID) {
+		return Veto("an expression over " + peer->sql);
+	}
+	for (auto &operand : operands) {
+		if (operand.constant) {
+			continue;
+		}
+		// One type for every branch: the promotions differ otherwise. A string
+		// branch must be a column under the peer's collation -- two collations
+		// meeting in one expression are the server's error (468), not a result.
+		if (operand.kind != peer->kind || operand.type != peer->type) {
+			return Veto("branches of " + peer->type.ToString() + " and " + operand.type.ToString());
+		}
+		if (peer->kind == ComparableKind::String &&
+			(!operand.column || !peer->column || operand.column->collation_name != peer->column->collation_name)) {
+			return Veto("string branches that are not columns of one collation");
+		}
+		// A value, not a comparison: it reaches DuckDB as bytes, and a varchar
+		// under a code-page collation arrives untranscoded (#224) -- the catalog
+		// scan reads it through its NVARCHAR cast (BuildReadExpression), a branch
+		// has none. Unicode and UTF-8 columns arrive as DuckDB's UTF-8.
+		if (operand.kind == ComparableKind::String && !operand.column->is_unicode && !operand.column->is_utf8) {
+			return Veto("a code-page varchar in a computed value");
+		}
+	}
+	const Operand typed_peer = *peer;
+	for (auto &operand : operands) {
+		if (!operand.constant) {
+			continue;
+		}
+		if (operand.constant->GetExpressionClass() == ExpressionClass::CONSTANT &&
+			operand.constant->Cast<ConstantExpression>().GetLiteral().IsNull()) {
+			operand.sql = "NULL";
+			operand.constant = nullptr;
+			continue;
+		}
+		if (!BindConstant(typed_peer, operand, true)) {
+			return false;
+		}
+	}
+	result = Operand();
+	result.type = typed_peer.type;
+	result.kind = typed_peer.kind;
+	return true;
+}
+
+bool NodeWriter::WriteCase(const CaseExpression &expr, Operand &out) {
+	std::vector<std::string> whens;
+	std::vector<Operand> branches;
+	for (auto &check : expr.CaseChecks()) {
+		std::string when;
+		if (!WritePredicate(*check.when_expr, when)) {
+			return false;
+		}
+		whens.push_back(when);
+		branches.emplace_back();
+		if (!WriteValue(*check.then_expr, branches.back())) {
+			return false;
+		}
+	}
+	branches.emplace_back();
+	if (!WriteValue(expr.Else(), branches.back())) {
+		return false;
+	}
+	if (!Unify(branches, out)) {
+		return false;
+	}
+	std::vector<std::string> thens;
+	for (idx_t i = 0; i + 1 < branches.size(); i++) {
+		thens.push_back(branches[i].sql);
+	}
+	out.sql = ExpressionVocabulary::Case(whens, thens, branches.back().sql);
+	return true;
+}
+
+bool NodeWriter::WriteDivide(const FunctionExpression &fn, Operand &out) {
+	std::vector<Operand> operands(2);
+	for (idx_t i = 0; i < 2; i++) {
+		if (!WriteValue(fn.GetArguments()[i].GetExpression(), operands[i])) {
+			return false;
+		}
+	}
+	if (operands[0].constant && operands[1].constant) {
+		return Veto("division of two constants " + fn.ToString());
+	}
+	if (!options_.ieee_floating_point_ops) {
+		// Without it DuckDB raises (or, error_on_division_by_zero off, gives
+		// NULL) on a zero divisor: the one case the pushed NULL would hide.
+		return Veto("/ with ieee_floating_point_ops = false");
+	}
+	// DuckDB's `/` divides as DOUBLE whatever the numeric operands, so a
+	// constant is a DOUBLE here (`n / 2.5` included), and each side is cast to
+	// float on the server.
+	Operand as_double;
+	as_double.kind = ComparableKind::ExactNumeric;
+	as_double.type = LogicalType::DOUBLE;
+	as_double.sql = "a DOUBLE operand";
+	for (auto &operand : operands) {
+		if (operand.constant) {
+			if (!BindConstant(as_double, operand, true)) {
+				return false;
+			}
+			continue;
+		}
+		if (operand.kind != ComparableKind::ExactNumeric ||
+			(!IsArithmeticType(operand.type) && operand.type.id() != LogicalTypeId::DOUBLE)) {
+			return Veto("division over " + operand.type.ToString());
+		}
+	}
+	out.sql = ExpressionVocabulary::Divide(operands[0].sql, operands[1].sql);
+	out.type = LogicalType::DOUBLE;
+	out.kind = ComparableKind::ExactNumeric;
+	return true;
+}
+
+bool NodeWriter::WriteCast(const CastExpression &cast, Operand &out) {
+	LogicalTypeId target;
+	if (cast.IsTryCast() || !BuiltinTypeOf(cast.TargetType(), target)) {
+		return Veto("cast " + cast.ToString());
+	}
+	Operand child;
+	if (!WriteValue(cast.Child(), child)) {
+		return false;
+	}
+	if (child.constant || child.kind != ComparableKind::ExactNumeric) {
+		return Veto("cast " + cast.ToString());
+	}
+	// Widening only, where both sides convert exactly the same: a wider
+	// integer, or a double (IEEE nearest on both). Anything that can fail,
+	// round or format -- to a string, a date, a narrower type -- stays DuckDB's.
+	const int from = IntegerRank(child.type.id());
+	const int to = IntegerRank(target);
+	std::string tsql;
+	if (to > 0 && from > 0 && to >= from) {
+		tsql = target == LogicalTypeId::SMALLINT ? "smallint" : target == LogicalTypeId::INTEGER ? "int" : "bigint";
+	} else if (target == LogicalTypeId::DOUBLE &&
+			   (from > 0 || child.type.id() == LogicalTypeId::DECIMAL || child.type.id() == LogicalTypeId::DOUBLE)) {
+		tsql = "float";
+	} else {
+		return Veto("cast " + cast.ToString());
+	}
+	out = Operand();
+	out.sql = ExpressionVocabulary::Cast(child.sql, tsql);
+	out.type = target == LogicalTypeId::DOUBLE ? LogicalType::DOUBLE : LogicalType(target);
+	out.kind = ComparableKind::ExactNumeric;
+	return true;
 }
 
 bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
@@ -635,6 +897,22 @@ bool NodeWriter::WritePredicate(const ParsedExpression &expr, std::string &sql) 
 			return true;
 		}
 		return Veto("operator " + expr.ToString());
+	}
+	case ExpressionClass::COLUMN_REF: {
+		// A bit column as a condition: `WHERE flag` is `([flag] = 1)` in T-SQL
+		// (a bare bit is error 4145).
+		Operand value;
+		if (!WriteValue(expr, value)) {
+			return false;
+		}
+		if (value.kind != ComparableKind::Boolean) {
+			return Veto("predicate " + expr.ToString());
+		}
+		SqlOperand operand;
+		operand.sql = value.sql;
+		operand.type = LogicalType::BOOLEAN;
+		sql = ExpressionVocabulary::AsCondition(operand);
+		return true;
 	}
 	default:
 		return Veto("predicate " + expr.ToString());

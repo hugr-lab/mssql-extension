@@ -94,6 +94,17 @@ public:
 	//! `whens` are conditions, `thens` and `otherwise` values.
 	static std::string Case(const std::vector<std::string> &whens, const std::vector<std::string> &thens,
 							const std::string &otherwise);
+	//! `a / b` as DuckDB's `/` means it -- floating division, whatever the
+	//! operands (5 / 2 = 2.5) -- where T-SQL divides integers as integers:
+	//! `CAST(a AS float) / NULLIF(CAST(b AS float), 0)`. A zero divisor is the
+	//! one recorded divergence (spec 079 D2): DuckDB gives inf / NaN, SQL
+	//! Server's float has no infinity or NaN and a bare `/` raises 8134, so
+	//! NULL (for x / 0 and 0 / 0 alike).
+	static std::string Divide(const std::string &left, const std::string &right);
+	static std::string Coalesce(const std::vector<std::string> &args);
+	static std::string NullIf(const std::string &left, const std::string &right);
+	//! `CAST(value AS type)`, `type` a T-SQL type name.
+	static std::string Cast(const std::string &value, const std::string &type);
 	//! Parts already rendered as conditions; one part is returned as is.
 	static std::string Conjunction(const std::vector<std::string> &parts, bool is_and);
 

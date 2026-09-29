@@ -456,6 +456,26 @@ std::string ExpressionVocabulary::Case(const std::vector<std::string> &whens, co
 	return sql + " ELSE " + otherwise + " END";
 }
 
+std::string ExpressionVocabulary::Divide(const std::string &left, const std::string &right) {
+	return "(CAST(" + left + " AS float) / NULLIF(CAST(" + right + " AS float), 0))";
+}
+
+std::string ExpressionVocabulary::Coalesce(const std::vector<std::string> &args) {
+	std::string sql = "COALESCE(";
+	for (size_t i = 0; i < args.size(); i++) {
+		sql += (i ? ", " : "") + args[i];
+	}
+	return sql + ")";
+}
+
+std::string ExpressionVocabulary::NullIf(const std::string &left, const std::string &right) {
+	return "NULLIF(" + left + ", " + right + ")";
+}
+
+std::string ExpressionVocabulary::Cast(const std::string &value, const std::string &type) {
+	return "CAST(" + value + " AS " + type + ")";
+}
+
 std::string ExpressionVocabulary::Conjunction(const std::vector<std::string> &parts, bool is_and) {
 	if (parts.size() == 1) {
 		return parts[0];

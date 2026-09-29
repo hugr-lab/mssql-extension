@@ -73,6 +73,10 @@ struct SQLWriterOptions {
 	//! DuckDB's (deprecated) error_on_division_by_zero: false makes `x % 0`
 	//! NULL here where the server raises 8134, so `%` is then not pushed.
 	bool division_by_zero_errors = true;
+	//! DuckDB's ieee_floating_point_ops: true gives inf / NaN for `x / 0`,
+	//! which the pushed `/ NULLIF(…, 0)` renders as NULL (the recorded
+	//! divergence); false makes DuckDB raise, so `/` is then not pushed.
+	bool ieee_floating_point_ops = true;
 	//! The session's default_order / default_null_order, resolved.
 	OrderType default_order = OrderType::ASCENDING;
 	OrderByNullType default_null_order_asc = OrderByNullType::NULLS_LAST;
