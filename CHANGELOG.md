@@ -137,6 +137,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **LIKE pushdown is documented as the server's, and its case-insensitive
+  form is gone (#392).** A simple `LIKE` is pushed as T-SQL `LIKE` and
+  evaluated under the column's collation, exactly as `=` is (spec 079 D4): on
+  a case-insensitive collation `LIKE '%abc%'` also returns `'ABC'`. The
+  `LOWER(x) LIKE LOWER(p)` form for `iprefix` / `isuffix` / `icontains` was
+  unreachable on the 2.0 pin, where `ILIKE` stays DuckDB's, and would have lost
+  rows had it been reached: the server's `LOWER(N'ẞ')` stays `ẞ`, DuckDB's
+  `lower` gives `ß`. It is removed so it cannot come back.
+
 - **ORDER BY pushdown returned SQL Server's order for string keys**
   ([#362](https://github.com/hugr-lab/mssql-extension/issues/362)). With
   `mssql_order_pushdown` on, a pushed ORDER BY removes DuckDB's own sort, and

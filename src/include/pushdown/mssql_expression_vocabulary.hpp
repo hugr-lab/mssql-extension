@@ -121,10 +121,14 @@ public:
 	//===--------------------------------------------------------------------===//
 	//! `%`, `_` and `[` taken literally.
 	static std::string EscapeLikePattern(const std::string &pattern);
-	//! The LIKE pattern text for DuckDB's prefix / suffix / contains (and their
-	//! `i` forms) over a constant `needle`; false for another name.
+	//! The LIKE pattern text for DuckDB's prefix / suffix / contains over a
+	//! constant `needle`; false for another name.
 	static bool LikePatternText(const std::string &function_name, const std::string &needle, std::string &out_pattern);
-	static std::string Like(const std::string &value, const std::string &pattern, bool case_insensitive);
+	//! `value LIKE pattern`, evaluated under the value's collation: on a
+	//! case-insensitive one it matches case variants, as `=` does (spec 079 D4:
+	//! string sets are the server's). No case-insensitive form: the server's
+	//! LOWER is not DuckDB's lower (#392).
+	static std::string Like(const std::string &value, const std::string &pattern);
 };
 
 }  // namespace mssql

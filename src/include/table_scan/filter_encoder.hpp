@@ -353,7 +353,7 @@ private:
 
 	/**
 	 * Encode prefix/suffix/contains pattern function.
-	 * @param function_name One of: prefix, suffix, contains, iprefix, isuffix, icontains
+	 * @param function_name One of: prefix, suffix, contains
 	 * @param column_expr The column expression
 	 * @param pattern_expr The pattern expression
 	 * @param ctx Encoding context

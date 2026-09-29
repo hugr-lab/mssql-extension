@@ -543,11 +543,11 @@ bool ExpressionVocabulary::LikePatternText(const std::string &function_name, con
 	std::transform(lower_func.begin(), lower_func.end(), lower_func.begin(),
 				   [](unsigned char c) { return std::tolower(c); });
 	const std::string escaped = EscapeLikePattern(needle);
-	if (lower_func == "prefix" || lower_func == "iprefix") {
+	if (lower_func == "prefix") {
 		out_pattern = escaped + "%";
-	} else if (lower_func == "suffix" || lower_func == "isuffix") {
+	} else if (lower_func == "suffix") {
 		out_pattern = "%" + escaped;
-	} else if (lower_func == "contains" || lower_func == "icontains") {
+	} else if (lower_func == "contains") {
 		out_pattern = "%" + escaped + "%";
 	} else {
 		return false;
@@ -555,11 +555,7 @@ bool ExpressionVocabulary::LikePatternText(const std::string &function_name, con
 	return true;
 }
 
-std::string ExpressionVocabulary::Like(const std::string &value, const std::string &pattern, bool case_insensitive) {
-	if (case_insensitive) {
-		// ILIKE: apply LOWER() to both column and pattern
-		return "(LOWER(" + value + ") LIKE LOWER(" + pattern + "))";
-	}
+std::string ExpressionVocabulary::Like(const std::string &value, const std::string &pattern) {
 	return "(" + value + " LIKE " + pattern + ")";
 }
 

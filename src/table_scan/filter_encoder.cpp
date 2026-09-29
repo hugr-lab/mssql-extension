@@ -586,7 +586,7 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeFunctionExpression: function=%s, args=%zu", func_name.c_str(),
 						   expr.GetChildren().size());
 
-	// Check for LIKE pattern functions (prefix, suffix, contains, iprefix, isuffix, icontains)
+	// Check for LIKE pattern functions (prefix, suffix, contains)
 	if (IsLikePatternFunction(func_name)) {
 		if (expr.GetChildren().size() >= 2) {
 			return EncodeLikePattern(func_name, *expr.GetChildren()[0], *expr.GetChildren()[1], ctx);
@@ -1038,8 +1038,7 @@ ExpressionEncodeResult FilterEncoder::EncodeLikePattern(const std::string &funct
 	// is the N'...' literal it always was.
 	std::string like_pattern =
 		EncodeConstantValue(Value(pattern_text), LogicalType::VARCHAR, child_ctx, ColumnInfoOf(column_expr, ctx));
-	std::string sql =
-		ExpressionVocabulary::Like(column_result.sql, like_pattern, IsCaseInsensitiveLikeFunction(function_name));
+	std::string sql = ExpressionVocabulary::Like(column_result.sql, like_pattern);
 
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeLikePattern: encoded -> %s", sql.c_str());
 	return {sql, true};

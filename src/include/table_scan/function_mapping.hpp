@@ -34,14 +34,9 @@ const FunctionMapping *GetFunctionMapping(const std::string &function_name);
 bool IsFunctionSupported(const std::string &function_name);
 
 /**
- * Check if a function is a LIKE pattern function (prefix, suffix, contains, etc.)
+ * Check if a function is a LIKE pattern function (prefix, suffix, contains)
  */
 bool IsLikePatternFunction(const std::string &function_name);
-
-/**
- * Check if a function is a case-insensitive LIKE pattern function (iprefix, isuffix, icontains)
- */
-bool IsCaseInsensitiveLikeFunction(const std::string &function_name);
 
 }  // namespace mssql
 }  // namespace duckdb

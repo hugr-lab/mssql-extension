@@ -27,6 +27,7 @@
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "query/mssql_sql_params.hpp"
 #include "table_scan/filter_encoder.hpp"
+#include "table_scan/function_mapping.hpp"
 
 using namespace duckdb;
 using namespace duckdb::mssql;
@@ -680,6 +681,13 @@ static void TestDeclarationForColumn() {
 }
 
 int main() {
+	// #392: no case-insensitive LIKE form is pushed (the server's LOWER is not
+	// DuckDB's lower); DuckDB has no such names on the 2.0 pin either.
+	ASSERT_TRUE(IsLikePatternFunction("contains"));
+	ASSERT_TRUE(!IsLikePatternFunction("icontains"));
+	ASSERT_TRUE(!IsLikePatternFunction("iprefix"));
+	ASSERT_TRUE(!IsLikePatternFunction("isuffix"));
+
 	std::cout << "Running FilterEncoder unit tests..." << std::endl;
 
 	TestDatePartOverPrecisionCast();

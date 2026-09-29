@@ -35,9 +35,14 @@ Supported filter operations for pushdown:
     `datetimeoffset`, whose date parts the server takes in the value's own
     offset and DuckDB in the session time zone
   - arithmetic: `+ - * %`, negation
-  - substring matching: `prefix`/`suffix`/`contains` and their
-    case-insensitive variants translate to `LIKE` (constant patterns) —
-    including leading-wildcard forms
+  - substring matching: a simple `LIKE` or `GLOB` (which DuckDB rewrites into
+    `prefix`/`suffix`/`contains`) translates to T-SQL `LIKE` with a constant
+    pattern, including leading-wildcard forms. SQL Server evaluates it under
+    the **column's collation**, exactly as it does `=`: on a case-insensitive
+    collation (the installation default `SQL_Latin1_General_CP1_CI_AS`)
+    `name LIKE '%abc%'` also returns `'ABC'`, where DuckDB alone would not.
+    `ILIKE` is not pushed: the server's `LOWER` does not fold case as DuckDB's
+    `lower` does (`LOWER(N'ẞ')` stays `ẞ`), so DuckDB evaluates it
 - Rowid equality (expands to the primary-key columns)
 
 **Not pushed down** (applied locally by DuckDB): unmapped functions —
