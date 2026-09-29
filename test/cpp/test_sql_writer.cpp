@@ -469,7 +469,30 @@ int main() {
 	ExpectVeto("SELECT t.id FROM t JOIN u ON t.id = u.big");  // int = bigint: promotions differ
 	ExpectVeto("SELECT t.id FROM t JOIN t ON t.id = t.id");	  // two tables named t
 	ExpectVeto("SELECT t.id FROM t NATURAL JOIN u");
-	ExpectVeto("SELECT t.id FROM t SEMI JOIN u ON t.id = u.t_id");	// D3
+	// SEMI / ANTI: EXISTS / NOT EXISTS ANDed to WHERE (not IN / NOT IN, which
+	// a NULL on the right would empty).
+	ExpectSql("SELECT id, name FROM t SEMI JOIN u ON t.id = u.t_id WHERE t.id > 1",
+			  "SELECT [r1].[id] AS [id], [r1].[name] AS [name] FROM [dbo].[t] AS [r1] WHERE (([r1].[id] > @p0) AND "
+			  "EXISTS (SELECT 1 FROM [dbo].[u] AS [r2] WHERE ([r1].[id] = [r2].[t_id])))");
+	ExpectSql("SELECT id FROM t ANTI JOIN u ON t.id = u.t_id",
+			  "SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] WHERE (NOT EXISTS (SELECT 1 FROM [dbo].[u] AS [r2] "
+			  "WHERE ([r1].[id] = [r2].[t_id])))");
+	ExpectSql(
+		"SELECT * FROM t SEMI JOIN u USING (id) LIMIT 1",
+		"SELECT TOP (1) [r1].[id] AS [id], [r1].[name] AS [name], [r1].[code] AS [code], [r1].[amount] AS [amount], "
+		"[r1].[day] AS [day], [r1].[flag] AS [flag], [r1].[ts] AS [ts], CAST([r1].[legacy] AS NVARCHAR(30)) AS "
+		"[legacy], [r1].[wide] AS [wide], [r1].[mid] AS [mid], [r1].[ratio] AS [ratio], [r1].[doc] AS [doc] FROM "
+		"[dbo].[t] AS [r1] WHERE EXISTS (SELECT 1 FROM [dbo].[u] AS [r2] WHERE ([r1].[id] = [r2].[id]))");
+	ExpectVeto("SELECT u.label FROM t SEMI JOIN u ON t.id = u.t_id");  // the right side is gone
+	ExpectVeto("SELECT id FROM t SEMI JOIN u ON t.id = u.t_id WHERE u.big > 1");
+	ExpectVeto("SELECT u.* FROM t SEMI JOIN u ON t.id = u.t_id");
+	// A later USING finds its left column among the tables that left columns.
+	ExpectVeto("SELECT t.id FROM t SEMI JOIN u ON t.id = u.t_id JOIN u AS v USING (label)");
+	ExpectSql("SELECT t.id FROM t SEMI JOIN u USING (id) JOIN u AS v USING (id)",
+			  "SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] INNER JOIN [dbo].[u] AS [r3] ON ([r1].[id] = [r3].[id]) "
+			  "WHERE EXISTS (SELECT 1 FROM [dbo].[u] AS [r2] WHERE ([r1].[id] = [r2].[id]))");
+	ExpectVeto(
+		"SELECT t.id FROM t LEFT JOIN u ON t.id = u.t_id SEMI JOIN t AS x ON x.id = t.id");	 // beside an outer join
 	ExpectVeto("SELECT t.id FROM t ASOF JOIN u ON t.id >= u.t_id");
 	ExpectVeto("SELECT t.id FROM t POSITIONAL JOIN u");
 	ExpectVeto("SELECT id FROM t RIGHT JOIN u USING (id)");

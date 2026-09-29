@@ -187,9 +187,62 @@ EXPLAIN SELECT DISTINCT x.g, y.name FROM rj_on.dbo.rj_a x JOIN rj_on.dbo.rj_a y 
 ----
 physical_plan	<REGEX>:.*SELECT DISTINCT TOP \(10\) \[r1\]\.\[g\] AS \[g\], \[r2\]\.\[name\] AS \[name\].*ORDER BY \[r1\]\.\[g\] ASC.*
 
+# SEMI / ANTI: EXISTS / NOT EXISTS. rj_b holds a NULL a_id, which would empty
+# a NOT IN; the ANTI join keeps a 4, which has no b, on both paths.
+query II
+EXPLAIN SELECT a.id FROM rj_on.dbo.rj_a a ANTI JOIN rj_on.dbo.rj_b b ON b.a_id = a.id ORDER BY a.id;
+----
+physical_plan	<REGEX>:.*WHERE \(NOT EXISTS \(SELECT 1 FROM \[dbo\]\.\[rj_b\] AS \[r2\] WHERE \(\[r2\]\.\[a_id\] = \[r1\]\.\[id\]\)\)\).*
+
+query I
+SELECT a.id FROM rj_on.dbo.rj_a a ANTI JOIN rj_on.dbo.rj_b b ON b.a_id = a.id ORDER BY a.id;
+----
+4
+
+query I
+SELECT a.id FROM rj_off.dbo.rj_a a ANTI JOIN rj_off.dbo.rj_b b ON b.a_id = a.id ORDER BY a.id;
+----
+4
+
+# A SEMI join keeps each matching row once (a 1 has two b rows).
+query II
+EXPLAIN SELECT a.id, a.name FROM rj_on.dbo.rj_a a SEMI JOIN rj_on.dbo.rj_b b ON b.a_id = a.id ORDER BY a.id;
+----
+physical_plan	<REGEX>:.*WHERE EXISTS \(SELECT 1 FROM \[dbo\]\.\[rj_b\] AS \[r2\].*
+
+query IT
+SELECT a.id, a.name FROM rj_on.dbo.rj_a a SEMI JOIN rj_on.dbo.rj_b b ON b.a_id = a.id ORDER BY a.id;
+----
+1	one
+2	two
+3	three
+
+query IT
+SELECT a.id, a.name FROM rj_off.dbo.rj_a a SEMI JOIN rj_off.dbo.rj_b b ON b.a_id = a.id ORDER BY a.id;
+----
+1	one
+2	two
+3	three
+
 #
 # Vetoes: the statement stays on the scan path, with the right rows.
 #
+
+# A SEMI join beside an outer join: its EXISTS would land after the outer
+# join's NULL-supplied rows.
+query II
+EXPLAIN SELECT a.id, b.id AS bid FROM rj_on.dbo.rj_a a LEFT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id SEMI JOIN rj_on.dbo.rj_a c ON c.id = a.id ORDER BY a.id;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+SELECT a.id, b.id AS bid FROM rj_on.dbo.rj_a a LEFT JOIN rj_on.dbo.rj_b b ON b.a_id = a.id SEMI JOIN rj_on.dbo.rj_a c ON c.id = a.id ORDER BY a.id, bid;
+----
+1	10
+1	11
+2	2
+3	12
+4	NULL
 
 # A join with a local table, or with another catalog: not one server's.
 query II

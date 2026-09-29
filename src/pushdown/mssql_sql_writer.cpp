@@ -252,6 +252,9 @@ struct Relation {
 	std::string sql;		// how the statement names it: [r1] under a join, empty for one table
 	idx_t first = 0;		// its first column in the writer's flat column list
 	bool nullable = false;	// on the NULL-supplying side of an outer join
+	//! The right side of a SEMI / ANTI join: sent as an EXISTS / NOT EXISTS,
+	//! its columns visible only in that join's own condition.
+	bool semi = false;
 };
 
 class NodeWriter {
@@ -351,6 +354,13 @@ private:
 	//! The relations a column reference can see: while the FROM is written,
 	//! those joined so far (an ON condition cannot name a later one).
 	idx_t visible_ = DConstants::INVALID_INDEX;
+	//! The SEMI / ANTI relation whose condition is being written: the one
+	//! place its columns can be named.
+	idx_t semi_scope_ = DConstants::INVALID_INDEX;
+	//! The EXISTS / NOT EXISTS a SEMI / ANTI join becomes, ANDed to WHERE.
+	std::vector<std::string> semi_filters_;
+	bool outer_join_ = false;
+	bool semi_join_ = false;
 	WrittenQuery &out_;
 	std::string &why_;
 	std::vector<OutputColumn> outputs_;
@@ -410,12 +420,14 @@ int NodeWriter::FindColumn(const ColumnRefExpression &ref, idx_t &out) const {
 			}
 		}
 	}
-	if (relation != DConstants::INVALID_INDEX && visible_ != DConstants::INVALID_INDEX && relation >= visible_) {
+	if (relation != DConstants::INVALID_INDEX && ((visible_ != DConstants::INVALID_INDEX && relation >= visible_) ||
+												  (relations_[relation].semi && relation != semi_scope_))) {
 		return -1;
 	}
 	bool found = false;
 	for (idx_t i = 0; i < columns_.size(); i++) {
 		if ((visible_ != DConstants::INVALID_INDEX && relation_of_[i] >= visible_) ||
+			(relations_[relation_of_[i]].semi && relation_of_[i] != semi_scope_) ||
 			(relation != DConstants::INVALID_INDEX && relation_of_[i] != relation) ||
 			!StringUtil::CIEquals(columns_[i].name, name)) {
 			continue;
@@ -449,6 +461,12 @@ bool NodeWriter::ResolveColumn(const ColumnRefExpression &ref, idx_t &out) {
 			}
 			if (!known) {
 				return Veto("column reference " + ref.ToString() + " names another relation");
+			}
+			for (auto &relation : relations_) {
+				if (relation.semi && StringUtil::CIEquals(names[0].GetIdentifierName(), relation.name)) {
+					return Veto("column reference " + ref.ToString() +
+								" names a SEMI / ANTI join's table, which only its condition sees");
+				}
 			}
 		}
 		return Veto("column name " + names.back().GetIdentifierName() +
@@ -505,9 +523,13 @@ bool NodeWriter::CollectRelations(const TableRef &ref, std::vector<idx_t> &membe
 	if (join.ref_type != JoinRefType::REGULAR && join.ref_type != JoinRefType::CROSS) {
 		return Veto("a NATURAL / POSITIONAL / ASOF / LATERAL / NEAREST join");
 	}
+	const bool semi = join.type == JoinType::SEMI || join.type == JoinType::ANTI;
 	if (join.type != JoinType::INNER && join.type != JoinType::LEFT && join.type != JoinType::RIGHT &&
-		join.type != JoinType::OUTER) {
-		return Veto("a SEMI / ANTI / MARK join");
+		join.type != JoinType::OUTER && !semi) {
+		return Veto("a MARK / SINGLE join");
+	}
+	if (semi && join.ref_type == JoinRefType::CROSS) {
+		return Veto("a SEMI / ANTI join without a condition");
 	}
 	if (join.right->type != TableReferenceType::BASE_TABLE) {
 		// Left-deep only: `a JOIN (b JOIN c)` would need its own parentheses and
@@ -518,6 +540,19 @@ bool NodeWriter::CollectRelations(const TableRef &ref, std::vector<idx_t> &membe
 	std::vector<idx_t> right;
 	if (!CollectRelations(*join.left, left) || !CollectRelations(*join.right, right)) {
 		return false;
+	}
+	if (semi) {
+		for (auto r : right) {
+			relations_[r].semi = true;
+		}
+		semi_join_ = true;
+	} else if (join.type != JoinType::INNER) {
+		outer_join_ = true;
+	}
+	if (semi_join_ && outer_join_) {
+		// Its EXISTS is ANDed to WHERE, after every join: exact while the others
+		// are inner, not beside an outer join's NULL-supplied rows.
+		return Veto("a SEMI / ANTI join in a chain with an outer join");
 	}
 	// The NULL-supplying side: its columns can be NULL whatever they declare.
 	if (join.type == JoinType::LEFT || join.type == JoinType::OUTER) {
@@ -560,6 +595,11 @@ bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
 		sql = left + " CROSS JOIN " + right;
 		return true;
 	}
+	const bool semi = join.type == JoinType::SEMI || join.type == JoinType::ANTI;
+	if (semi) {
+		// Its columns are named in its condition only.
+		semi_scope_ = right_relation;
+	}
 	const char *keyword = join.type == JoinType::INNER	 ? " INNER JOIN "
 						  : join.type == JoinType::LEFT	 ? " LEFT JOIN "
 						  : join.type == JoinType::RIGHT ? " RIGHT JOIN "
@@ -580,7 +620,9 @@ bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
 				if (!StringUtil::CIEquals(columns_[i].name, name)) {
 					continue;
 				}
-				if (relation_of_[i] >= left_first && relation_of_[i] < right_relation) {
+				// A SEMI / ANTI join's table is not on the left: it left no columns.
+				if (relation_of_[i] >= left_first && relation_of_[i] < right_relation &&
+					!relations_[relation_of_[i]].semi) {
 					if (left_column != DConstants::INVALID_INDEX) {
 						return Veto("USING column " + name + " is in more than one table on the left");
 					}
@@ -618,6 +660,17 @@ bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
 		if (!WritePredicate(*join.condition, condition)) {
 			return false;
 		}
+	}
+	if (semi) {
+		// A SEMI join keeps each left row that has a match, once; an ANTI join
+		// each that has none -- EXISTS / NOT EXISTS, not IN / NOT IN, which a
+		// NULL on the right would empty (measured on DuckDB: ANTI JOIN gives
+		// [2, NULL] where NOT IN gives nothing).
+		semi_scope_ = DConstants::INVALID_INDEX;
+		const std::string exists = "EXISTS (SELECT 1 FROM " + right + " WHERE " + condition + ")";
+		semi_filters_.push_back(join.type == JoinType::ANTI ? ExpressionVocabulary::Not(exists) : exists);
+		sql = left;
+		return true;
 	}
 	sql = left + keyword + right + " ON " + condition;
 	return true;
@@ -902,8 +955,12 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 					return Veto("a * of another relation");
 				}
 			}
+			if (only != DConstants::INVALID_INDEX && relations_[only].semi) {
+				return Veto("a * of a SEMI / ANTI join's table");
+			}
 			for (idx_t i = 0; i < columns_.size(); i++) {
-				if (only != DConstants::INVALID_INDEX ? relation_of_[i] != only : IsHiddenUsingColumn(i)) {
+				if (only != DConstants::INVALID_INDEX ? relation_of_[i] != only
+													  : IsHiddenUsingColumn(i) || relations_[relation_of_[i]].semi) {
 					continue;
 				}
 				if (!add(i, "")) {
@@ -1945,12 +2002,17 @@ bool NodeWriter::Write(const SelectNode &node) {
 	}
 	after_grouping_ = false;
 	out_.statement += " FROM " + from_sql;
+	std::vector<std::string> filters;
 	if (node.where_clause) {
 		std::string where;
 		if (!WritePredicate(*node.where_clause, where)) {
 			return false;
 		}
-		out_.statement += " WHERE " + where;
+		filters.push_back(where);
+	}
+	filters.insert(filters.end(), semi_filters_.begin(), semi_filters_.end());
+	if (!filters.empty()) {
+		out_.statement += " WHERE " + ExpressionVocabulary::Conjunction(filters, true);
 	}
 	after_grouping_ = true;
 	if (!group_sql.empty()) {
