@@ -335,7 +335,8 @@ int main() {
 	ExpectVeto("SELECT id FROM w LIMIT 1");
 	ExpectSql("SELECT t.id FROM t, t AS u LIMIT 1",
 			  "SELECT TOP (1) [r1].[id] AS [id] FROM [dbo].[t] AS [r1] CROSS JOIN [dbo].[t] AS [r2]");
-	ExpectVeto("WITH c AS (SELECT 1) SELECT id FROM t LIMIT 1");
+	// An unused CTE is left out: DuckDB does not bind one either.
+	ExpectSql("WITH c AS (SELECT 1) SELECT id FROM t LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 	ExpectVeto("SELECT other.id FROM t LIMIT 1");
 
 	// Aggregates (PR D): COUNT as COUNT_BIG, an integer SUM as decimal(38,0)
@@ -721,6 +722,40 @@ int main() {
 	ExpectVeto("SELECT s.id FROM (SELECT id FROM t UNION SELECT t_id FROM u ORDER BY id + 1 LIMIT 2) s");
 	ExpectGain("SELECT * FROM (SELECT id FROM t UNION ALL SELECT t_id FROM u) s", false);
 	ExpectGain("SELECT * FROM (SELECT id FROM t UNION SELECT t_id FROM u) s", true);
+
+	// CTEs (PR E1): inlined where referenced, a body seeing the earlier ones.
+	ExpectSql("WITH q AS (SELECT id, count(*) AS c FROM t GROUP BY id) SELECT q.id FROM q WHERE q.c > 1",
+			  "SELECT [r1].[id] AS [id] FROM (SELECT [id], COUNT_BIG(*) AS [c] FROM [dbo].[t] GROUP BY [id]) AS [r1] "
+			  "WHERE ([r1].[c] > @p0)");
+	ExpectSql("WITH a AS (SELECT id FROM t GROUP BY id), b AS (SELECT a.id FROM a) SELECT count(*) FROM b",
+			  "SELECT COUNT_BIG(*) AS [count_star()] FROM (SELECT [r1].[id] AS [id] FROM (SELECT [id] FROM [dbo].[t] "
+			  "GROUP BY [id]) AS [r1]) AS [r1]");
+	// A qualified name is the table, not the CTE of that name.
+	ExpectSql("WITH t AS (SELECT t_id FROM u GROUP BY t_id) SELECT count(*) FROM dbo.t",
+			  "SELECT COUNT_BIG(*) AS [count_star()] FROM [dbo].[t]");
+	ExpectVeto("WITH a AS (SELECT id FROM t ORDER BY id LIMIT 2) SELECT count(*) FROM a x, a y");  // LIMIT twice
+	ExpectVeto("WITH a AS (SELECT id FROM t ORDER BY id LIMIT 2) SELECT id FROM t WHERE id IN (SELECT id FROM a)");
+	ExpectVeto("WITH a(x) AS (SELECT id FROM t GROUP BY id) SELECT count(*) FROM a");  // column aliases
+	ExpectVeto("WITH a AS (SELECT b.id FROM b), b AS (SELECT id FROM t GROUP BY id) SELECT count(*) FROM a");
+	ExpectGain("WITH q AS (SELECT id, count(*) AS c FROM t GROUP BY id) SELECT * FROM q", true);
+	// A LIMIT anywhere in the body, or reached through another CTE under a
+	// subquery expression (review of E1).
+	ExpectVeto("WITH a AS (SELECT * FROM (SELECT id FROM t ORDER BY id LIMIT 1) s) SELECT count(*) FROM a x, a y");
+	ExpectVeto(
+		"WITH a AS (SELECT id FROM t ORDER BY id LIMIT 1), b AS (SELECT id FROM a) SELECT id FROM t WHERE EXISTS "
+		"(SELECT 1 FROM b WHERE b.id = t.id)");
+	{
+		// A body inlined twice renders its constant twice, each its own @pN.
+		WrittenQuery out;
+		std::string why;
+		if (!Write("WITH a AS (SELECT id FROM t WHERE id > 5) SELECT x.id FROM a x JOIN a y ON x.id = y.id", out,
+				   why) ||
+			out.params.size() != 2 || out.statement.find("@p0") == std::string::npos ||
+			out.statement.find("@p1") == std::string::npos) {
+			std::cerr << "FAIL: a CTE inlined twice (" << why << "): " << out.statement << "\n";
+			failures++;
+		}
+	}
 
 	// The gain rule: a node the catalog scan serves as well stays with it.
 	ExpectGain("SELECT * FROM t", false);

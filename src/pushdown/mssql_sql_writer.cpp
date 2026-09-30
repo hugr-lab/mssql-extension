@@ -377,13 +377,15 @@ public:
 		  param_values_(&own_param_values_) {}
 	//! A nested node's writer (a derived table): the statement's parameters
 	//! are one set, numbered once, whichever node renders them.
-	NodeWriter(const NodeWriter &parent, WrittenQuery &out)
+	NodeWriter(NodeWriter &parent, WrittenQuery &out)
 		: options_(parent.options_),
 		  resolver_(parent.resolver_),
 		  out_(out),
 		  why_(parent.why_),
 		  params_(parent.params_),
-		  param_values_(parent.param_values_) {}
+		  param_values_(parent.param_values_),
+		  written_unqualified_(parent.written_unqualified_),
+		  cte_parent_(&parent) {}
 	//! A subquery in an expression (PR E1): it may name the columns of the
 	//! nodes around it (correlation), so its relations are aliased past theirs.
 	struct Correlated {};
@@ -393,12 +395,35 @@ public:
 	}
 
 	bool Write(const SelectNode &node);
+	void SetWrittenUnqualified(const SQLWriter::QualificationProbe *probe) {
+		written_unqualified_ = probe;
+	}
 	//! A SELECT, or a set operation (PR E1: nested in a subquery; the one at
 	//! a statement's top stays with DuckDB, see MSSQLCatalog::RemoteExecute).
 	bool WriteQueryNode(const QueryNode &node);
 
 private:
 	bool WriteSetOperation(const SetOperationNode &node);
+	//! A CTE of a WITH clause, inlined where it is referenced (PR E1): T-SQL's
+	//! WITH stands only at a statement's top, and the server inlines its own
+	//! CTEs anyway. DuckDB evaluates one once, so a body that is not the same
+	//! on every evaluation -- a LIMIT picks among ties -- is inlined only once,
+	//! and never where a subquery expression could evaluate it per row.
+	struct CteEntry {
+		std::string name;
+		const QueryNode *body;
+		idx_t uses;
+	};
+	//! The CTE `name` means here: this node's, then its parents' -- where a CTE
+	//! body sees only the CTEs defined before it. `owner` is the writer that
+	//! holds it, `index` its place there.
+	CteEntry *FindCte(const std::string &name, NodeWriter *&owner, idx_t &index);
+	bool IsWrittenUnqualified(const BaseTableRef &ref) const;
+	//! `per_row`: an inlined CTE body referenced where a subquery expression
+	//! evaluates it per row -- a CTE it reads in turn is evaluated so too.
+	//! `picks_rows` (if set) is whether the node holds a LIMIT / OFFSET.
+	bool CollectDerivedNode(const QueryNode &node, const std::string &name, bool synthetic, NodeWriter *cte_owner,
+							idx_t cte_index, bool per_row, bool *picks_rows, std::vector<idx_t> &members);
 	//! Whether a node around this one has relations a column could be of.
 	bool HasOuterRelations() const {
 		for (auto outer = outer_; outer; outer = outer->outer_) {
@@ -540,6 +565,17 @@ private:
 	bool SubqueryOperand(const NodeWriter &inner, const WrittenQuery &inner_out, const std::string &sql, Operand &out);
 	//! Copies of the columns a subquery's result is, owned for its operand.
 	std::deque<MSSQLColumnInfo> subquery_columns_;
+	//! Whether a table was written unqualified (the SQLWriter's probe).
+	const SQLWriter::QualificationProbe *written_unqualified_ = nullptr;
+	//! This node's CTEs, in their WITH order.
+	std::vector<CteEntry> ctes_;
+	//! The writer this one was made by, for CTE lookups; a CTE body's is the
+	//! writer holding the CTE, of whose CTEs it sees the first
+	//! `cte_parent_limit_`.
+	NodeWriter *cte_parent_ = nullptr;
+	idx_t cte_parent_limit_ = DConstants::INVALID_INDEX;
+	//! A subquery expression's node: evaluated per row of the node around it.
+	bool in_expression_ = false;
 	//! The SELECT * wrapper a set operation's ORDER BY / LIMIT is written
 	//! through, kept while the writer lives.
 	unique_ptr<SelectNode> synthetic_node_;
@@ -702,6 +738,33 @@ bool NodeWriter::CollectRelations(const TableRef &ref, std::vector<idx_t> &membe
 		if (base.sample || !base.column_name_alias.empty() || base.at_clause) {
 			return Veto("TABLESAMPLE / column aliases / AT on a table");
 		}
+		NodeWriter *owner = nullptr;
+		idx_t index = 0;
+		auto cte = IsWrittenUnqualified(base) ? FindCte(base.Table().GetIdentifierName(), owner, index) : nullptr;
+		if (cte) {
+			// Evaluated per row of a node around it: a subquery expression between
+			// this reference and the CTE's WITH (or around a CTE reading it).
+			bool per_row = false;
+			for (auto writer = this; writer && writer != owner; writer = writer->cte_parent_) {
+				per_row = per_row || writer->in_expression_;
+			}
+			bool picks_rows = false;
+			if (!CollectDerivedNode(*cte->body, base.alias.empty() ? cte->name : base.alias.GetIdentifierName(), false,
+									owner, index, per_row, &picks_rows, members)) {
+				return false;
+			}
+			// A body that picks rows anywhere in it (a LIMIT among ties) differs
+			// between evaluations; DuckDB evaluates it once. Deterministic bodies
+			// are inlined as often as referenced -- each a read of its own, which
+			// under concurrent writes can see other committed rows.
+			if (++cte->uses > 1 && picks_rows) {
+				return Veto("a CTE with a LIMIT referenced more than once");
+			}
+			if (picks_rows && per_row) {
+				return Veto("a CTE with a LIMIT under a subquery expression");
+			}
+			return true;
+		}
 		Relation relation;
 		if (!resolver_(base, relation.table) || !relation.table.columns) {
 			return Veto("table " + base.Table().GetIdentifierName() + " does not resolve in this catalog");
@@ -861,12 +924,42 @@ bool NodeWriter::CoversEveryKey(const std::vector<idx_t> &columns) const {
 	return true;
 }
 
+NodeWriter::CteEntry *NodeWriter::FindCte(const std::string &name, NodeWriter *&owner, idx_t &index) {
+	idx_t limit = ctes_.size();
+	for (NodeWriter *writer = this; writer;) {
+		for (idx_t i = 0; i < MinValue<idx_t>(limit, writer->ctes_.size()); i++) {
+			if (StringUtil::CIEquals(writer->ctes_[i].name, name)) {
+				owner = writer;
+				index = i;
+				return &writer->ctes_[i];
+			}
+		}
+		limit = writer->cte_parent_limit_;
+		writer = writer->cte_parent_;
+	}
+	return nullptr;
+}
+
+bool NodeWriter::IsWrittenUnqualified(const BaseTableRef &ref) const {
+	if (written_unqualified_ && *written_unqualified_) {
+		return (*written_unqualified_)(ref);
+	}
+	auto &name = ref.GetQualifiedName();
+	return name.Catalog().empty() && name.Schema().empty();
+}
+
 bool NodeWriter::CollectDerived(const SubqueryRef &ref, std::vector<idx_t> &members) {
 	if (!ref.column_name_alias.empty()) {
 		return Veto("column aliases on a subquery");
 	}
-	auto &node = *ref.subquery->node;
-	const bool synthetic = &ref == synthetic_ref_;
+	return CollectDerivedNode(*ref.subquery->node,
+							  ref.alias.empty() ? "unnamed_subquery" : ref.alias.GetIdentifierName(),
+							  &ref == synthetic_ref_, nullptr, 0, false, nullptr, members);
+}
+
+bool NodeWriter::CollectDerivedNode(const QueryNode &node, const std::string &name, bool synthetic,
+									NodeWriter *cte_owner, idx_t cte_index, bool per_row, bool *picks_rows,
+									std::vector<idx_t> &members) {
 	bool ordered = false;
 	bool limited = false;
 	for (auto &modifier : node.modifiers) {
@@ -886,15 +979,24 @@ bool NodeWriter::CollectDerived(const SubqueryRef &ref, std::vector<idx_t> &memb
 		inner.outer_ = outer_;
 		inner.alias_base_ = alias_base_ + relations_.size() + 1;
 	}
+	if (cte_owner) {
+		inner.cte_parent_ = cte_owner;
+		inner.cte_parent_limit_ = cte_index;
+		inner.in_expression_ = per_row;
+	}
 	if (synthetic ? !inner.WriteSetOperation(*synthetic_setop_) : !inner.WriteQueryNode(node)) {
 		out_.refers_outside = out_.refers_outside || inner_out.refers_outside;
 		return false;
 	}
 	correlated_ = correlated_ || inner.correlated_;
+	out_.picks_rows = out_.picks_rows || inner_out.picks_rows;
+	if (picks_rows) {
+		*picks_rows = inner_out.picks_rows;
+	}
 	Relation relation;
 	relation.derived = true;
 	relation.derived_sql = inner_out.statement;
-	relation.name = ref.alias.empty() ? "unnamed_subquery" : ref.alias.GetIdentifierName();
+	relation.name = name;
 	relation.table.name = relation.name;
 	relation.table.size_known = false;
 	for (auto &other : relations_) {
@@ -933,7 +1035,9 @@ bool NodeWriter::CollectDerived(const SubqueryRef &ref, std::vector<idx_t> &memb
 }
 
 bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
-	if (ref.type == TableReferenceType::SUBQUERY) {
+	// A subquery, or a CTE reference inlined as one.
+	if (ref.type == TableReferenceType::SUBQUERY ||
+		(ref.type == TableReferenceType::BASE_TABLE && relations_[visible_].derived)) {
 		auto &relation = relations_[visible_++];
 		sql = "(" + relation.derived_sql + ") AS " + relation.sql;
 		return true;
@@ -1862,9 +1966,11 @@ bool NodeWriter::WriteScalarSubquery(const SubqueryExpression &subquery, Operand
 	}
 	WrittenQuery inner_out;
 	NodeWriter inner(*this, inner_out, Correlated());
+	inner.in_expression_ = true;
 	if (!WriteSubqueryNode(subquery, inner, 1)) {
 		return false;
 	}
+	out_.picks_rows = out_.picks_rows || inner_out.picks_rows;
 	if (!inner.correlated_ && !(inner.aggregated_ && inner.group_keys_.empty()) &&
 		!(inner.limit_ >= 0 && inner.limit_ <= 1)) {
 		// DuckDB evaluates an uncorrelated one once, even for no outer row, and
@@ -1877,12 +1983,14 @@ bool NodeWriter::WriteScalarSubquery(const SubqueryExpression &subquery, Operand
 bool NodeWriter::WriteSubqueryCondition(const SubqueryExpression &subquery, std::string &sql) {
 	WrittenQuery inner_out;
 	NodeWriter inner(*this, inner_out, Correlated());
+	inner.in_expression_ = true;
 	switch (subquery.GetSubqueryType()) {
 	case SubqueryType::EXISTS:
 	case SubqueryType::NOT_EXISTS: {
 		if (!WriteSubqueryNode(subquery, inner, 0)) {
 			return false;
 		}
+		out_.picks_rows = out_.picks_rows || inner_out.picks_rows;
 		const std::string exists = "EXISTS (" + inner_out.statement + ")";
 		sql = subquery.GetSubqueryType() == SubqueryType::NOT_EXISTS ? ExpressionVocabulary::Not(exists) : exists;
 		return true;
@@ -1899,6 +2007,7 @@ bool NodeWriter::WriteSubqueryCondition(const SubqueryExpression &subquery, std:
 		if (!WriteSubqueryNode(subquery, inner, 1)) {
 			return false;
 		}
+		out_.picks_rows = out_.picks_rows || inner_out.picks_rows;
 		Operand right;
 		if (!SubqueryOperand(inner, inner_out, std::string(), right)) {
 			return false;
@@ -2608,8 +2717,13 @@ bool NodeWriter::WriteOrder(const OrderModifier &order, bool limited, std::strin
 }
 
 bool NodeWriter::Write(const SelectNode &node) {
-	if (!node.cte_map.map.empty()) {
-		return Veto("a WITH clause");
+	for (auto &cte : node.cte_map.map) {
+		auto &info = *cte.second;
+		if (!info.query_node || !info.aliases.empty() || !info.key_targets.empty() ||
+			!info.payload_aggregates.empty()) {
+			return Veto("a CTE with column aliases, USING KEY or no query");
+		}
+		ctes_.push_back(CteEntry{cte.first.GetIdentifierName(), info.query_node.get(), 0});
 	}
 	if (node.aggregate_handling != AggregateHandling::STANDARD_HANDLING) {
 		return Veto("GROUP BY ALL");
@@ -2685,6 +2799,7 @@ bool NodeWriter::Write(const SelectNode &node) {
 	}
 	const bool limited = limit_value >= 0;
 	limit_ = limit_value;
+	out_.picks_rows = out_.picks_rows || limited || offset_value > 0;
 	const bool top = limited && offset_value == 0;
 	if (distinct_ && offset_value > 0 && !order) {
 		// OFFSET's `ORDER BY (SELECT NULL)` is not a result column: 145.
@@ -3018,6 +3133,7 @@ bool NodeWriter::WriteSetOperation(const SetOperationNode &node) {
 		out_.column_names.push_back(child_outs[0].column_names[i]);
 	}
 	for (auto &child_out : child_outs) {
+		out_.picks_rows = out_.picks_rows || child_out.picks_rows;
 		out_.gain_uncertain = out_.gain_uncertain || child_out.gain_uncertain;
 		out_.value_divergence = out_.value_divergence || child_out.value_divergence;
 		out_.largest_input_rows = MaxValue(out_.largest_input_rows, child_out.largest_input_rows);
@@ -3032,6 +3148,7 @@ bool NodeWriter::WriteSetOperation(const SetOperationNode &node) {
 bool SQLWriter::Write(const QueryNode &node, WrittenQuery &out, std::string &why) {
 	out = WrittenQuery();
 	NodeWriter writer(options_, resolver_, out, why);
+	writer.SetWrittenUnqualified(&written_unqualified_);
 	if (!writer.WriteQueryNode(node)) {
 		return false;
 	}
@@ -3064,7 +3181,7 @@ void CountRemotePushdown() {
 	}
 }
 
-bool SQLWriter::PushesMoreThanScan(const QueryNode &node) {
+bool SQLWriter::PushesMoreThanScan(const QueryNode &node, const QualificationProbe *probe) {
 	for (auto &modifier : node.modifiers) {
 		if (modifier->type == ResultModifierType::ORDER_MODIFIER ||
 			modifier->type == ResultModifierType::LIMIT_MODIFIER ||
@@ -3080,7 +3197,7 @@ bool SQLWriter::PushesMoreThanScan(const QueryNode &node) {
 			return true;
 		}
 		for (auto &child : setop.children) {
-			if (PushesMoreThanScan(*child)) {
+			if (PushesMoreThanScan(*child, probe)) {
 				return true;
 			}
 		}
@@ -3094,7 +3211,20 @@ bool SQLWriter::PushesMoreThanScan(const QueryNode &node) {
 	// node around it too: pushed whole, rather than handed back with the part.
 	std::function<bool(const TableRef &)> from_gains = [&](const TableRef &ref) -> bool {
 		if (ref.type == TableReferenceType::SUBQUERY) {
-			return PushesMoreThanScan(*ref.Cast<SubqueryRef>().subquery->node);
+			return PushesMoreThanScan(*ref.Cast<SubqueryRef>().subquery->node, probe);
+		}
+		if (ref.type == TableReferenceType::BASE_TABLE) {
+			// A reference to one of the node's CTEs: its body's gain.
+			auto &base = ref.Cast<BaseTableRef>();
+			auto &name = base.GetQualifiedName();
+			const bool unqualified = probe && *probe ? (*probe)(base) : name.Catalog().empty() && name.Schema().empty();
+			for (auto &cte : select.cte_map.map) {
+				if (unqualified &&
+					StringUtil::CIEquals(cte.first.GetIdentifierName(), name.Name().GetIdentifierName()) &&
+					cte.second->query_node) {
+					return PushesMoreThanScan(*cte.second->query_node, probe);
+				}
+			}
 		}
 		if (ref.type == TableReferenceType::JOIN) {
 			return from_gains(*ref.Cast<JoinRef>().left) || from_gains(*ref.Cast<JoinRef>().right);

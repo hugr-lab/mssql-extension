@@ -1548,12 +1548,21 @@ bool MSSQLCatalog::SearchPathIsDefaultSchema(ClientContext &context) const {
 // it is looked up through this catalog like any binder lookup, so the kept run
 // never depends on what the thread noted; without one (the SupportsPushdown
 // hooks get none) it is the entry the rewriter's own lookup just noted.
+static bool WrittenUnqualified(const BaseTableRef &ref);
+
 MSSQLCatalog::PushdownTable MSSQLCatalog::ResolvePushdownTable(const BaseTableRef &ref,
 															   optional_ptr<ClientContext> context) {
 	PushdownTable result;
 	const auto schema = PushdownSchemaOf(ref, context != nullptr);
 	const auto &name = ref.Table().GetIdentifierName();
 	if (context) {
+		// As below: an unqualified name is this catalog's default schema only
+		// when the search path says so (`USE db.sales` binds sales.t). Asked by
+		// the name the query wrote -- the rewriter has stripped the catalog by
+		// now, and a stripped `db.t` looks unqualified.
+		if (WrittenUnqualified(ref) && !SearchPathIsDefaultSchema(*context)) {
+			return result;
+		}
 		auto entry = GetEntry(*context, CatalogType::TABLE_ENTRY, Identifier(schema), Identifier(name),
 							  OnEntryNotFound::RETURN_NULL);
 		if (!entry && startup_.remote_pushdown && schema == DEFAULT_SCHEMA) {
@@ -1572,9 +1581,7 @@ MSSQLCatalog::PushdownTable MSSQLCatalog::ResolvePushdownTable(const BaseTableRe
 		// default schema (LookupSchema), so that is what was noted.
 		resolved = mssql::FindResolvedTable(*this, default_schema_, name);
 	}
-	const auto &qualified = ref.GetQualifiedName();
-	if (resolved && qualified.Schema().empty() && qualified.Catalog().empty() &&
-		!SearchPathIsDefaultSchema(*resolved.context)) {
+	if (resolved && WrittenUnqualified(ref) && !SearchPathIsDefaultSchema(*resolved.context)) {
 		return result;
 	}
 	if (resolved) {
@@ -1613,7 +1620,8 @@ bool MSSQLCatalog::SupportsPushdown(const ParsedExpression &expression) {
 // push it as a part of a node that does not go whole).
 static void NoteOriginalTableName(const BaseTableRef &ref);
 static bool MayRepeatOutputNames(const QueryNode &node);
-static void CollectPushdownTables(const QueryNode &node, vector<const BaseTableRef *> &refs);
+static void CollectPushdownTables(const QueryNode &node, vector<const BaseTableRef *> &refs,
+								  const vector<string> &scope = {});
 
 bool MSSQLCatalog::SupportsPushdown(const TableRef &ref) {
 	if (ref.type == TableReferenceType::JOIN || ref.type == TableReferenceType::SUBQUERY) {
@@ -1665,6 +1673,9 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 		resolved.push_back(ResolvePushdownTable(*refs[i], context));
 		if (!resolved.back().entry) {
 			why = "table " + refs[i]->Table().GetIdentifierName() + " did not resolve in this catalog";
+			// An unqualified name: a CTE of a node around this one, asked about on
+			// its own (the rewriter asks about every nested node; PR E1).
+			out.refers_outside = WrittenUnqualified(*refs[i]);
 			return false;
 		}
 		for (auto &column : resolved.back().entry->GetColumns().Logical()) {
@@ -1704,6 +1715,7 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 		}
 		return false;
 	});
+	writer.SetWrittenUnqualified(WrittenUnqualified);
 	return writer.Write(node, out, why);
 }
 
@@ -1751,6 +1763,22 @@ bool MSSQLCatalog::SupportsPushdown(const QueryNode &node) {
 namespace {
 struct OriginalTableNames {
 	std::unordered_map<const BaseTableRef *, QualifiedName> names;
+	//! The generation before the last overflow: a statement noted across it
+	//! keeps its names (review of E1 -- a lost note made `db.t` look bare).
+	std::unordered_map<const BaseTableRef *, QualifiedName> previous;
+
+	const QualifiedName *Find(const BaseTableRef &ref) const {
+		auto entry = names.find(&ref);
+		if (entry != names.end()) {
+			return &entry->second;
+		}
+		entry = previous.find(&ref);
+		return entry != previous.end() ? &entry->second : nullptr;
+	}
+	void Erase(const BaseTableRef &ref) {
+		names.erase(&ref);
+		previous.erase(&ref);
+	}
 };
 OriginalTableNames &TableNames() {
 	thread_local OriginalTableNames names;
@@ -1759,13 +1787,14 @@ OriginalTableNames &TableNames() {
 }  // namespace
 
 static void NoteOriginalTableName(const BaseTableRef &ref) {
-	auto &names = TableNames().names;
-	if (names.size() > 4096) {
-		// Entries of statements that were not handed back; a statement's own
-		// are written right before its RemoteExecute.
-		names.clear();
+	auto &table_names = TableNames();
+	if (table_names.names.size() > 4096) {
+		// Entries of statements that were not handed back. Two generations: a
+		// statement whose notes straddle the overflow keeps them.
+		table_names.previous = std::move(table_names.names);
+		table_names.names.clear();
 	}
-	names[&ref] = ref.GetQualifiedName();
+	table_names.names[&ref] = ref.GetQualifiedName();
 }
 
 // Every query node nested in a node and every base table it names, visited as
@@ -1885,10 +1914,42 @@ static void VisitNode(QueryNode &node, const NestedNodeVisitor &on_node, const B
 	}
 }
 
-static void CollectPushdownTables(const QueryNode &node, vector<const BaseTableRef *> &refs) {
+static vector<string> ExtendScope(const QueryNode &node, vector<string> scope);
+
+// Whether the query wrote `ref` with no catalog and no schema, from the name
+// SupportsPushdown(TableRef) noted before the rewriter's strip (`db.t`
+// arrives as a bare `t`); a name it did not note is taken as it stands.
+static bool WrittenUnqualified(const BaseTableRef &ref) {
+	auto original = TableNames().Find(ref);
+	auto &name = original ? *original : ref.GetQualifiedName();
+	return name.Catalog().empty() && name.Schema().empty();
+}
+
+static const mssql::SQLWriter::QualificationProbe &WrittenUnqualifiedProbe() {
+	static const mssql::SQLWriter::QualificationProbe probe = WrittenUnqualified;
+	return probe;
+}
+
+// The base tables a node names, for the writer's resolver -- not a reference
+// to a CTE in scope, which the writer inlines (PR E1). The scope ignores the
+// order CTEs are defined in: a body naming a later sibling leaves that name
+// out here, and the writer, which does track the order, then finds neither a
+// CTE nor a resolved table -- a veto.
+static void CollectPushdownTables(const QueryNode &node, vector<const BaseTableRef *> &refs,
+								  const vector<string> &scope) {
+	auto inner = ExtendScope(node, scope);
 	VisitNode(
-		const_cast<QueryNode &>(node), [&](unique_ptr<QueryNode> &slot) { CollectPushdownTables(*slot, refs); },
-		[&](BaseTableRef &ref) { refs.push_back(&ref); });
+		const_cast<QueryNode &>(node), [&](unique_ptr<QueryNode> &slot) { CollectPushdownTables(*slot, refs, inner); },
+		[&](BaseTableRef &ref) {
+			if (WrittenUnqualified(ref)) {
+				for (auto &cte : inner) {
+					if (StringUtil::CIEquals(cte, ref.Table().GetIdentifierName())) {
+						return;
+					}
+				}
+			}
+			refs.push_back(&ref);
+		});
 }
 
 // Puts back every table name the strip took the catalog off, from the names
@@ -1899,16 +1960,16 @@ static void RestoreTableNames(QueryNode &node) {
 	VisitNode(
 		node, [](unique_ptr<QueryNode> &slot) { RestoreTableNames(*slot); },
 		[](BaseTableRef &ref) {
-			auto &names = TableNames().names;
-			auto entry = names.find(&ref);
-			if (entry == names.end()) {
+			auto &table_names = TableNames();
+			auto original = table_names.Find(ref);
+			if (!original) {
 				throw BinderException(
 					"mssql: remote pushdown lost the name of table %s; run the statement with "
 					"mssql_remote_pushdown = false, and please report it",
 					ref.ToString());
 			}
-			ref.SetQualifiedName(entry->second);
-			names.erase(entry);
+			ref.SetQualifiedName(*original);
+			table_names.Erase(ref);
 		});
 }
 
@@ -1934,7 +1995,18 @@ static vector<string> ExtendScope(const QueryNode &node, vector<string> scope) {
 // The rewriter refuses any nested node under a CTE-holding parent for the
 // same reason (its FinishPushdown FIXME); here only the ones that name one.
 static bool NamesScopeTable(QueryNode &node, const vector<string> &scope) {
-	auto inner = ExtendScope(node, scope);
+	// The node's own CTEs are its to name (PR E1 inlines them); an enclosing
+	// scope's CTE of the same name is shadowed by them.
+	vector<string> inner;
+	for (auto &name : scope) {
+		bool shadowed = false;
+		for (auto &cte : node.cte_map.map) {
+			shadowed = shadowed || StringUtil::CIEquals(cte.first.GetIdentifierName(), name);
+		}
+		if (!shadowed) {
+			inner.push_back(name);
+		}
+	}
 	if (inner.empty()) {
 		return false;
 	}
@@ -1998,8 +2070,8 @@ bool MSSQLCatalog::WritePushablePart(const QueryNode &node, mssql::WrittenQuery 
 	// A set operation goes nested only (the owner's call, PR E1): at a
 	// statement's top its children go as parts and DuckDB combines them.
 	if (!(node.type == QueryNodeType::SELECT_NODE || (nested && node.type == QueryNodeType::SET_OPERATION_NODE)) ||
-		!mssql::SQLWriter::PushesMoreThanScan(node) || NamesScopeTable(const_cast<QueryNode &>(node), scope) ||
-		!WritePushdown(node, written, why, context)) {
+		!mssql::SQLWriter::PushesMoreThanScan(node, &WrittenUnqualifiedProbe()) ||
+		NamesScopeTable(const_cast<QueryNode &>(node), scope) || !WritePushdown(node, written, why, context)) {
 		return false;
 	}
 	if (nested && written.value_divergence) {

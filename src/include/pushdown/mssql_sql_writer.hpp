@@ -96,6 +96,9 @@ struct WrittenQuery {
 	//! node around it could: a correlated subquery asked about on its own
 	//! (the rewriter asks about every nested node; PR E1).
 	bool refers_outside = false;
+	//! A LIMIT / OFFSET somewhere in the node: which rows it gives can differ
+	//! between two evaluations (ties), where DuckDB evaluates a CTE once.
+	bool picks_rows = false;
 
 	//! "@p1 int, @p2 varchar(50)" -- empty without parameters.
 	std::string Declarations() const;
@@ -133,6 +136,15 @@ public:
 
 	SQLWriter(SQLWriterOptions options, TableResolver resolver);
 
+	//! Whether the query wrote `ref` with no catalog and no schema: then a CTE
+	//! in scope of that name is what it means (PR E1). The rewriter strips the
+	//! catalog in place (`db.t` arrives as a bare `t`), so the catalog answers
+	//! from the names it noted; unset, the name as it stands decides.
+	using QualificationProbe = std::function<bool(const BaseTableRef &ref)>;
+	void SetWrittenUnqualified(QualificationProbe probe) {
+		written_unqualified_ = std::move(probe);
+	}
+
 	//! Render `node`. False, with the reason in `why`, when any part of it has
 	//! no exact T-SQL form -- then `out` is unspecified.
 	bool Write(const QueryNode &node, WrittenQuery &out, std::string &why);
@@ -148,11 +160,14 @@ public:
 	//! nested nodes too). The gain is ORDER BY, LIMIT /
 	//! OFFSET, DISTINCT, GROUP BY / HAVING, an aggregate, and a join with no
 	//! CROSS link: each sends fewer rows than the tables' (or their first N).
-	static bool PushesMoreThanScan(const QueryNode &node);
+	//! `probe` tells a CTE reference from a table of that name (see
+	//! SetWrittenUnqualified); unset, the name as it stands decides.
+	static bool PushesMoreThanScan(const QueryNode &node, const QualificationProbe *probe = nullptr);
 
 private:
 	SQLWriterOptions options_;
 	TableResolver resolver_;
+	QualificationProbe written_unqualified_;
 };
 
 //! A type as `column_types` spells it: its ToString, except the MSSQL string
