@@ -215,14 +215,17 @@ static const MSSQLColumnInfo *ColumnInfoByName(const std::string &name, const Ex
 FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const std::vector<column_t> &column_ids,
 										  const std::vector<std::string> &column_names,
 										  const std::vector<LogicalType> &column_types) {
-	return Encode(filters, column_ids, column_names, column_types, nullptr, nullptr);
+	// The convenience overload has no session to ask, so it takes DuckDB's own
+	// default for error_on_division_by_zero. Production paths pass the session's.
+	return Encode(filters, column_ids, column_names, column_types, nullptr, nullptr,
+				  /*division_by_zero_errors=*/true);
 }
 
 FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const std::vector<column_t> &column_ids,
 										  const std::vector<std::string> &column_names,
 										  const std::vector<LogicalType> &column_types,
-										  const std::vector<MSSQLColumnInfo> *mssql_columns,
-										  mssql::SqlParamSet *params) {
+										  const std::vector<MSSQLColumnInfo> *mssql_columns, mssql::SqlParamSet *params,
+										  bool division_by_zero_errors) {
 	FilterEncoderResult result;
 	result.needs_duckdb_filter = false;
 
@@ -236,6 +239,7 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 	ExpressionEncodeContext ctx(column_ids, column_names, column_types);
 	ctx.mssql_columns = mssql_columns;
 	ctx.params = params;
+	ctx.division_by_zero_errors = division_by_zero_errors;
 	std::vector<std::string> where_conditions;
 
 	// Virtual/special column identifiers start at 2^63

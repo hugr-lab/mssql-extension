@@ -82,6 +82,12 @@ int64_t LoadTestFailParseAfterTokens(ClientContext &context);
 bool LoadScanParameterizeFilters(ClientContext &context);
 
 // Load ATTACH credential-validation timeout (spec 047 / US2).
+//! DuckDB's error_on_division_by_zero for this session (default true when unset
+//! or unreadable). Read by every path that may push `%`: the scan's dry run and
+//! its execution-time encode, the optimizer's client-filter probe, and the
+//! remote-pushdown writer.
+bool LoadErrorOnDivisionByZero(ClientContext &context);
+
 // Returns mssql_attach_validation_timeout if > 0, else mssql_connection_timeout.
 int LoadAttachValidationTimeout(ClientContext &context);
 

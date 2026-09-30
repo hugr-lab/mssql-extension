@@ -53,10 +53,7 @@ SQLWriterOptions SQLWriterOptions::FromContext(ClientContext &context) {
 	if (context.TryGetCurrentSetting("ieee_floating_point_ops", ieee) && !ieee.IsNull()) {
 		options.ieee_floating_point_ops = ieee.GetValue<bool>();
 	}
-	Value division_errors;
-	if (context.TryGetCurrentSetting("error_on_division_by_zero", division_errors) && !division_errors.IsNull()) {
-		options.division_by_zero_errors = division_errors.GetValue<bool>();
-	}
+	options.division_by_zero_errors = LoadErrorOnDivisionByZero(context);
 	auto &config = DBConfig::GetConfig(context);
 	options.default_order = config.ResolveOrder(context, OrderType::ORDER_DEFAULT);
 	options.default_null_order_asc =

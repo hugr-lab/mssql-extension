@@ -509,6 +509,14 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 // Loading Configuration
 //===----------------------------------------------------------------------===//
 
+bool LoadErrorOnDivisionByZero(ClientContext &context) {
+	Value value;
+	if (context.TryGetCurrentSetting("error_on_division_by_zero", value) && !value.IsNull()) {
+		return value.GetValue<bool>();
+	}
+	return true;
+}
+
 MSSQLPoolConfig LoadPoolConfig(ClientContext &context) {
 	MSSQLPoolConfig config;
 	Value val;

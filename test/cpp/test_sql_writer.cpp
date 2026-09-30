@@ -239,6 +239,20 @@ int main() {
 			  "SELECT TOP (1) CAST([tiny] AS int) AS [w] FROM [dbo].[t]");
 	ExpectVeto("SELECT CAST(id AS UTINYINT) FROM t LIMIT 1");  // narrowing
 
+	// The overflow agreement for a narrow integer peer rests on the constant
+	// carrying the COLUMN's type: `tinyint + <tinyint>` is tinyint on the server
+	// and overflows at 255 + 1, exactly as DuckDB overflows UINT8. A parameter
+	// takes it from DeclarationForColumn; an UNPARAMETERISED literal takes it
+	// from the CAST that BindConstant wraps it in -- without which T-SQL would
+	// read `1` as an int, widen the sum to 256 and return a row where DuckDB
+	// raises. Only the parameterised form was pinned; roborev 1821 finding 5
+	// read the literal as bare, which it is not, so both forms are pinned now.
+	ExpectSql("SELECT tiny + 1 AS s FROM t LIMIT 1", "SELECT TOP (1) ([tiny] + @p0) AS [s] FROM [dbo].[t]");
+	ExpectSql("SELECT tiny + 1 AS s FROM t LIMIT 1",
+			  "SELECT TOP (1) ([tiny] + CAST(1 AS tinyint)) AS [s] FROM [dbo].[t]", /*parameterize=*/false);
+	ExpectSql("SELECT id + 1 AS s FROM t LIMIT 1", "SELECT TOP (1) ([id] + CAST(1 AS int)) AS [s] FROM [dbo].[t]",
+			  /*parameterize=*/false);
+
 	// CASE, COALESCE, NULLIF: one type for every branch.
 	ExpectSql("SELECT CASE WHEN id > 1 THEN id ELSE 0 END AS c FROM t LIMIT 1",
 			  "SELECT TOP (1) CASE WHEN ([id] > @p0) THEN [id] ELSE @p1 END AS [c] FROM [dbo].[t]");
