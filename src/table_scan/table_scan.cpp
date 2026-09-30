@@ -1307,7 +1307,7 @@ static BindInfo GetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
 // Everything else in the bind data (column lists, PK/rowid metadata) is derived
 // from the table and is therefore implied by schema+table.
 static void CatalogScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
-								 const TableFunction &function) {
+								 const BoundTableFunction &function) {
 	auto &bind_data = bind_data_p->Cast<MSSQLCatalogScanBindData>();
 	serializer.WriteProperty(100, "context_name", bind_data.context_name);
 	serializer.WriteProperty(101, "schema_name", bind_data.schema_name);
@@ -1337,7 +1337,7 @@ static void CatalogScanSerialize(Serializer &serializer, const optional_ptr<Func
 // HasSerializationCallbacks() requires both halves before bind data is written
 // at all, so it is currently unexercised by any test. Keep it obvious rather
 // than clever, and validate defensively.
-static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserializer, BoundTableFunction &function) {
 	auto context_name = deserializer.ReadProperty<string>(100, "context_name");
 	auto schema_name = deserializer.ReadProperty<string>(101, "schema_name");
 	auto table_name = deserializer.ReadProperty<string>(102, "table_name");

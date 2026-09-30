@@ -22,7 +22,19 @@ void RegisterDocumentedFunction(ExtensionLoader &loader, vector<ScalarFunction> 
 		// immutable once added (shared with every function bound from them).
 		auto &signature = overload.GetSignature();
 		for (idx_t i = 0; i < signature.GetParameterCount() && i < doc.parameter_names.size(); i++) {
-			signature.GetParameter(i).SetName(Identifier(doc.parameter_names[i]));
+			// A parameter declared by its type alone is positional-only ("col<N>")
+			// since DuckDB's function-argument unification: re-declared as a
+			// standard one, so the name is callable (`mssql_exec(context := …)`).
+			auto &parameter = signature.GetParameter(i);
+			if (parameter.IsVariadic()) {
+				continue;
+			}
+			optional<Value> default_value;
+			if (parameter.HasDefaultValue()) {
+				default_value = *parameter.GetDefaultValue();
+			}
+			parameter = FunctionParameter(Identifier(doc.parameter_names[i]), parameter.GetType(),
+										  std::move(default_value), FunctionParameterKind::STANDARD);
 		}
 		set.AddFunction(std::move(overload));
 	}
