@@ -690,15 +690,27 @@ int main() {
 	ASSERT_TRUE(!IsLikePatternFunction("isuffix"));
 
 	// Arithmetic operators take numbers only (DuckDB's `date + 1` is a date,
-	// T-SQL refuses it: 206); a double product overflows on the server where
-	// DuckDB says inf; a decimal product DuckDB caps at DECIMAL(18) overflows
-	// there first (spec 079 C, from PR D's full review).
+	// T-SQL refuses it: 206); float arithmetic overflows on the server, which
+	// has no Inf, where DuckDB says inf -- for + and - as well as *, a narrower
+	// value window but the same divergence (roborev 1819 finding 2); a decimal
+	// product DuckDB caps at DECIMAL(18) overflows there first (spec 079 C,
+	// from PR D's full review).
 	{
 		std::string why;
 		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("+", {LogicalType::DATE, LogicalType::INTEGER}, why));
 		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("-", {LogicalType::TIMESTAMP, LogicalType::INTERVAL}, why));
-		ASSERT_TRUE(ExpressionVocabulary::FunctionFor("+", {LogicalType::DOUBLE, LogicalType::DOUBLE}, why));
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("+", {LogicalType::DOUBLE, LogicalType::DOUBLE}, why));
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("-", {LogicalType::DOUBLE, LogicalType::DOUBLE}, why));
 		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("*", {LogicalType::DOUBLE, LogicalType::DOUBLE}, why));
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("+", {LogicalType::FLOAT, LogicalType::FLOAT}, why));
+		// Exact numbers still push.
+		ASSERT_TRUE(ExpressionVocabulary::FunctionFor("+", {LogicalType::INTEGER, LogicalType::INTEGER}, why));
+		// The zero-divisor policy is the vocabulary's, so both walkers get it
+		// (roborev 1819 finding 3): `x % 0` is NULL in DuckDB with
+		// error_on_division_by_zero off, error 8134 on the server.
+		ASSERT_TRUE(ExpressionVocabulary::FunctionFor("%", {LogicalType::INTEGER, LogicalType::INTEGER}, why));
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("%", {LogicalType::INTEGER, LogicalType::INTEGER}, why,
+													   /*division_by_zero_errors=*/false));
 		ASSERT_TRUE(
 			!ExpressionVocabulary::FunctionFor("*", {LogicalType::DECIMAL(10, 2), LogicalType::DECIMAL(10, 2)}, why));
 		ASSERT_TRUE(
