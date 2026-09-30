@@ -45,6 +45,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   computed value (it would arrive as its code-page bytes), a division under
   COALESCE, a string constant in a CASE / COALESCE branch wider than its
   column. A computed column's type is the server's, as for any `mssql_scan`.
+- **Remote pushdown: joins, aggregates, DISTINCT (spec 079 PR D).** A pushed
+  SELECT now carries joins of one catalog's tables (INNER / LEFT / RIGHT /
+  FULL / CROSS with ON or USING; SEMI / ANTI as `EXISTS` / `NOT EXISTS`),
+  `count` / `sum` / `avg` / `min` / `max` / `stddev` / `variance`, GROUP BY on
+  columns (by name, position or select alias), HAVING, `SELECT DISTINCT` and
+  ORDER BY an aggregate (`… ORDER BY count(*) DESC LIMIT 10`). Aggregates have
+  DuckDB's types: an integer `sum` is HUGEINT (sent as `decimal(38,0)` and
+  cast back). A floating-point aggregate (`sum` / `avg` of a float, any `avg`,
+  `stddev` / `variance`) may differ from DuckDB's in its last bits, as
+  DuckDB's own parallel float sum does; it is not pushed where that would
+  choose rows (HAVING, ORDER BY, DISTINCT). Under D4 a string group or
+  DISTINCT follows the column's collation (`a` and `A` are one value on a
+  `_CI` collation); `min` / `max` of a string is not pushed. `GROUP BY ()` is
+  sent without a GROUP BY clause (over no rows the server would return no row
+  where DuckDB returns one). Not pushed: FILTER, `string_agg`, ROLLUP /
+  CUBE / GROUPING SETS / GROUP BY ALL, expression keys, NATURAL / ASOF /
+  POSITIONAL joins, a join with a subquery or a local table, a SEMI / ANTI
+  join under a later RIGHT / FULL join, and a `CROSS JOIN` (or comma join)
+  with nothing else to gain. `stddev` / `variance` can differ by far more
+  than the last bits on large, close values (the server computes them in one
+  pass). A `float` column is compared and divided when pushed, not added,
+  subtracted or multiplied (an overflow is `inf` in DuckDB and an error on
+  the server).
+  A computed result column now has DuckDB's type or is not pushed: a decimal
+  beside a constant (`v + 700`) stays with DuckDB as a result column. A
+  comparison of an integer `x + c` / `x - c` / `x * c` / `-x` with a constant
+  is not pushed, as DuckDB moves the constant across and never computes a
+  value the server could overflow on. A repeated ORDER BY key no longer fails on the
+  server (error 169, since PR B).
 - **`column_types := [...]` on `mssql_scan` / `mssql_scan_params`**: the type
   each result column is read as, `''` for the described one, checked against
   the server's describe. The rewriter uses it so a pushed `SELECT` has the

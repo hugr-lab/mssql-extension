@@ -36,12 +36,17 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
@@ -1595,9 +1600,14 @@ bool MSSQLCatalog::SupportsPushdown(const ParsedExpression &expression) {
 }
 
 // A base table this catalog resolved on this thread (the rewriter's own
-// lookup just did it). Every other table reference is a veto in PR B; joins
-// and subqueries arrive with PR D.
+// lookup just did it), or a join -- whose tables the rewriter has already
+// asked about, and which the node's dry run renders or refuses as a whole.
+// A subquery is refused (spec 079 PR E).
 bool MSSQLCatalog::SupportsPushdown(const TableRef &ref) {
+	if (ref.type == TableReferenceType::JOIN) {
+		MSSQL_CATALOG_DEBUG_LOG(2, "SupportsPushdown(table ref %s): a join", ref.ToString().c_str());
+		return true;
+	}
 	if (ref.type == TableReferenceType::BASE_TABLE) {
 		auto resolved = ResolvePushdownTable(ref.Cast<BaseTableRef>(), nullptr);
 		auto entry = resolved.entry;
@@ -1618,32 +1628,61 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 		return false;
 	}
 	auto &select = node.Cast<SelectNode>();
-	if (!select.from_table || select.from_table->type != TableReferenceType::BASE_TABLE) {
-		why = "FROM is not one base table";
+	// Every base table of the FROM (one, or a join's), resolved before the
+	// writer runs and held until it is done.
+	vector<const BaseTableRef *> refs;
+	vector<const TableRef *> pending;
+	if (select.from_table) {
+		pending.push_back(select.from_table.get());
+	}
+	while (!pending.empty()) {
+		auto ref = pending.back();
+		pending.pop_back();
+		if (ref->type == TableReferenceType::BASE_TABLE) {
+			refs.push_back(&ref->Cast<BaseTableRef>());
+		} else if (ref->type == TableReferenceType::JOIN) {
+			pending.push_back(ref->Cast<JoinRef>().left.get());
+			pending.push_back(ref->Cast<JoinRef>().right.get());
+		} else {
+			why = "FROM holds something other than tables and joins";
+			return false;
+		}
+	}
+	if (refs.empty()) {
+		why = "no FROM";
 		return false;
 	}
-	auto resolved = ResolvePushdownTable(select.from_table->Cast<BaseTableRef>(), context);
-	if (!resolved.entry) {
-		why = "the table did not resolve in this catalog";
-		return false;
-	}
-	auto &entry = *resolved.entry;
-	// The session's settings are the context's: RemoteExecute's own, or, for
-	// the context-free hooks, the one that resolved the table.
-	auto options = mssql::SQLWriterOptions::FromContext(*resolved.context);
-	// The types the entry reports, not recomputed: a SET of
+	vector<PushdownTable> resolved;
+	// The types each entry reports, not recomputed: a SET of
 	// mssql_catalog_native_types since the entry was built must not make the
 	// pushed column differ from the catalog's.
-	vector<LogicalType> types;
-	for (auto &column : entry.GetColumns().Logical()) {
-		types.push_back(column.Type());
+	vector<vector<LogicalType>> types(refs.size());
+	for (idx_t i = 0; i < refs.size(); i++) {
+		resolved.push_back(ResolvePushdownTable(*refs[i], context));
+		if (!resolved.back().entry) {
+			why = "table " + refs[i]->Table().GetIdentifierName() + " did not resolve in this catalog";
+			return false;
+		}
+		for (auto &column : resolved.back().entry->GetColumns().Logical()) {
+			types[i].push_back(column.Type());
+		}
 	}
-	mssql::SQLWriter writer(options, [&](const BaseTableRef &, mssql::WriterTable &table) {
-		table.schema = entry.schema.name.GetIdentifierName();
-		table.name = entry.name.GetIdentifierName();
-		table.columns = &entry.GetMSSQLColumns();
-		table.types = &types;
-		return true;
+	// The session's settings are the context's: RemoteExecute's own, or, for
+	// the context-free hooks, the one that resolved the tables.
+	auto options = mssql::SQLWriterOptions::FromContext(*resolved[0].context);
+	mssql::SQLWriter writer(options, [&](const BaseTableRef &ref, mssql::WriterTable &table) {
+		for (idx_t i = 0; i < refs.size(); i++) {
+			if (refs[i] != &ref) {
+				continue;
+			}
+			auto &entry = *resolved[i].entry;
+			table.schema = entry.schema.name.GetIdentifierName();
+			table.name = entry.name.GetIdentifierName();
+			table.columns = &entry.GetMSSQLColumns();
+			table.types = &types[i];
+			return true;
+		}
+		return false;
 	});
 	return writer.Write(node, out, why);
 }
@@ -1710,7 +1749,30 @@ unique_ptr<TableRef> MSSQLCatalog::RemoteExecute(ClientContext &context, unique_
 		std::move(arguments));
 	mssql::CountRemotePushdown();
 	MSSQL_CATALOG_DEBUG_LOG(1, "RemoteExecute: %s", written.statement.c_str());
-	return std::move(ref);
+	bool casts = false;
+	for (auto &type : written.cast_types) {
+		casts = casts || type.id() != LogicalTypeId::INVALID;
+	}
+	if (!casts) {
+		return std::move(ref);
+	}
+	// A result column no wire type decodes into -- SUM over integers, HUGEINT
+	// in DuckDB, decimal(38,0) on the server -- is cast after the read, in a
+	// projection over the call: `SELECT c1, CAST(c2 AS HUGEINT) AS c2 FROM …`.
+	auto select = make_uniq<SelectNode>();
+	for (idx_t i = 0; i < written.column_names.size(); i++) {
+		const Identifier name(written.column_names[i]);
+		unique_ptr<ParsedExpression> column = make_uniq<ColumnRefExpression>(name);
+		if (written.cast_types[i].id() != LogicalTypeId::INVALID) {
+			column = make_uniq<CastExpression>(written.cast_types[i], std::move(column));
+		}
+		column->SetAlias(name);
+		select->select_list.push_back(std::move(column));
+	}
+	select->from_table = std::move(ref);
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = std::move(select);
+	return make_uniq<SubqueryRef>(std::move(statement));
 }
 
 // No statement-level pushdown in spec 079: DDL and DML are spec 080's.

@@ -346,24 +346,26 @@ DEALLOCATE rp_q;
 #
 # Arithmetic (PR C): same-type operands keep their type on both sides, a
 # constant is typed from its peer, a computed column is named as DuckDB names
-# it and typed by the server's describe.
+# it and typed by the server's describe. The WHERE compares two computed
+# values: `n * 2 > 15` alone is not pushed (PR D full review), since DuckDB
+# moves the constant across (`n > 7`) and never computes `n * 2`.
 #
 
 query II
-EXPLAIN SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_on.dbo.rp_t WHERE n * 2 > 15 ORDER BY id LIMIT 10;
+EXPLAIN SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_on.dbo.rp_t WHERE n * 2 > n + 5 ORDER BY id LIMIT 10;
 ----
-physical_plan	<REGEX>:.*\(\[n\] \+ @p0\) AS \[\(n \+ 1\)\], \(\[amount\] \+ \[amount\]\) AS \[twice\], \(-\[n\]\) AS \[neg\], \(\[n\] % @p1\) AS \[m\].*WHERE \(\(\[n\] \* @p2\) > @p3\).*
+physical_plan	<REGEX>:.*\(\[n\] \+ @p0\) AS \[\(n \+ 1\)\], \(\[amount\] \+ \[amount\]\) AS \[twice\], \(-\[n\]\) AS \[neg\], \(\[n\] % @p1\) AS \[m\].*WHERE \(\(\[n\] \* @p2\) > \(\[n\] \+ @p3\)\).*
 
 query II
-EXPLAIN CREATE TEMP TABLE ar_on AS SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_on.dbo.rp_t WHERE n * 2 > 15 ORDER BY id LIMIT 10;
+EXPLAIN CREATE TEMP TABLE ar_on AS SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_on.dbo.rp_t WHERE n * 2 > n + 5 ORDER BY id LIMIT 10;
 ----
 physical_plan	<REGEX>:.*Mssql Scan Params.*AS \[neg\].*AS \[m\].*
 
 statement ok
-CREATE TEMP TABLE ar_on AS SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_on.dbo.rp_t WHERE n * 2 > 15 ORDER BY id LIMIT 10;
+CREATE TEMP TABLE ar_on AS SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_on.dbo.rp_t WHERE n * 2 > n + 5 ORDER BY id LIMIT 10;
 
 statement ok
-CREATE TEMP TABLE ar_off AS SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_off.dbo.rp_t WHERE n * 2 > 15 ORDER BY id LIMIT 10;
+CREATE TEMP TABLE ar_off AS SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_off.dbo.rp_t WHERE n * 2 > n + 5 ORDER BY id LIMIT 10;
 
 query IIIII
 SELECT * FROM ar_on ORDER BY id;

@@ -1,0 +1,362 @@
+# name: test/sql/pushdown/remote_pushdown_aggregates.test
+# description: Spec 079 PR D -- aggregates, GROUP BY, HAVING and DISTINCT pushed to SQL Server as one statement; both paths agree on rows and types
+# group: [pushdown]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# As in remote_pushdown_single_table.test: every pushed shape is pinned by
+# EXPLAIN, every veto by EXPLAIN showing the catalog scan, and the same
+# statement against a catalog attached with the setting OFF returns the same
+# rows with the same types.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ra_off (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = true;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ra_on (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+# bigint values whose sum passes 2^63 (DuckDB sums into HUGEINT), a bit, a
+# float, a varchar under a case-insensitive code-page collation, an xml.
+statement ok
+SELECT mssql_exec('ra_off', 'DROP TABLE IF EXISTS dbo.ra_t, dbo.ra_e;
+	CREATE TABLE dbo.ra_t (
+		id int NOT NULL PRIMARY KEY,
+		g int NOT NULL,
+		n int NULL,
+		big bigint NULL,
+		amount decimal(10,2) NULL,
+		day date NULL,
+		flag bit NULL,
+		ratio float NULL,
+		name nvarchar(20) NULL,
+		legacy varchar(10) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+		doc xml NULL,
+		small decimal(5,2) NULL,
+		tiny tinyint NULL);
+	INSERT INTO dbo.ra_t VALUES
+		(1, 1, 10, 9000000000000000000, 1.50, ''2024-01-01'', 1, 0.5, N''a'', ''a'', NULL, 999.99, 2),
+		(2, 1, 20, 9000000000000000000, 2.50, ''2024-03-01'', 0, 1.5, N''b'', ''A'', NULL, 1.25, 9),
+		(3, 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+		(4, 2, 35, 5, 4.00, ''2024-02-01'', 1, 2.0, N''a'', ''b'', NULL, -3.5, 200),
+		(5, 3, 40, 7, 1.00, ''2024-05-01'', 0, 4.0, N''c'', ''B'', N''<x/>'', 0.01, 0);
+	CREATE TABLE dbo.ra_e (x int NULL)');
+
+#
+# Pushed: the aggregate node is one statement.
+#
+
+query II
+EXPLAIN SELECT count(*) FROM ra_on.dbo.ra_t;
+----
+physical_plan	<REGEX>:.*SELECT COUNT_BIG\(\*\) AS \[count_star\(\)\] FROM \[dbo\]\.\[ra_t\].*
+
+# An integer SUM is decimal(38,0) on the server (a bigint sum would overflow
+# there) and HUGEINT in DuckDB: read, then cast back.
+statement ok
+CREATE TEMP TABLE a_on AS SELECT count(*) AS c, count(n) AS cn, count(DISTINCT name) AS dn, sum(n) AS sn, sum(big) AS sb, sum(amount) AS sa, min(day) AS d0, max(day) AS d1, min(flag) AS f0, max(flag) AS f1, avg(n) AS an FROM ra_on.dbo.ra_t;
+
+statement ok
+CREATE TEMP TABLE a_off AS SELECT count(*) AS c, count(n) AS cn, count(DISTINCT name) AS dn, sum(n) AS sn, sum(big) AS sb, sum(amount) AS sa, min(day) AS d0, max(day) AS d1, min(flag) AS f0, max(flag) AS f1, avg(n) AS an FROM ra_off.dbo.ra_t;
+
+query IIIIIRTTTTR
+SELECT * FROM a_on;
+----
+5	4	3	105	18000000000000000012	9.00	2024-01-01	2024-05-01	false	true	26.25
+
+query I
+SELECT count(*) FROM (SELECT * FROM a_on EXCEPT ALL SELECT * FROM a_off);
+----
+0
+
+query TT
+SELECT a.column_name, a.data_type FROM duckdb_columns() a JOIN duckdb_columns() b USING (column_name)
+WHERE a.table_name = 'a_on' AND b.table_name = 'a_off' AND a.data_type = b.data_type ORDER BY a.column_index;
+----
+c	BIGINT
+cn	BIGINT
+dn	BIGINT
+sn	HUGEINT
+sb	HUGEINT
+sa	DECIMAL(38,2)
+d0	DATE
+d1	DATE
+f0	BOOLEAN
+f1	BOOLEAN
+an	DOUBLE
+
+# COALESCE over it keeps the type.
+query II
+EXPLAIN SELECT coalesce(sum(n), 0) AS s FROM ra_on.dbo.ra_t WHERE id > 100;
+----
+physical_plan	<REGEX>:.*COALESCE\(SUM\(CAST\(\[n\] AS decimal\(38,0\)\)\).*
+
+statement ok
+CREATE TEMP TABLE c_on AS SELECT coalesce(sum(n), 0) AS s FROM ra_on.dbo.ra_t WHERE id > 100;
+
+query IT
+SELECT s, typeof(s) FROM c_on;
+----
+0	HUGEINT
+
+query II
+EXPLAIN SELECT sum(n) AS sn FROM ra_on.dbo.ra_t;
+----
+physical_plan	<REGEX>:.*SUM\(CAST\(\[n\] AS decimal\(38,0\)\)\) AS \[sn\].*
+
+# GROUP BY, HAVING, ORDER BY a key.
+query II
+EXPLAIN SELECT g, count(*) AS c, sum(n) AS s FROM ra_on.dbo.ra_t GROUP BY g HAVING count(*) > 1 ORDER BY g;
+----
+physical_plan	<REGEX>:.*GROUP BY \[g\] HAVING \(COUNT_BIG\(\*\) > @p0\) ORDER BY \[ra_t\]\.\[g\] ASC.*
+
+query III
+SELECT g, count(*) AS c, sum(n) AS s FROM ra_on.dbo.ra_t GROUP BY g HAVING count(*) > 1 ORDER BY g;
+----
+1	2	30
+2	2	35
+
+query III
+SELECT g, count(*) AS c, sum(n) AS s FROM ra_off.dbo.ra_t GROUP BY g HAVING count(*) > 1 ORDER BY g;
+----
+1	2	30
+2	2	35
+
+# The top-N shape: ORDER BY an aggregate under a LIMIT.
+query II
+EXPLAIN SELECT g, sum(n) AS s FROM ra_on.dbo.ra_t GROUP BY g ORDER BY s DESC LIMIT 2;
+----
+physical_plan	<REGEX>:.*SELECT TOP \(2\) \[g\], SUM\(CAST\(\[n\] AS decimal\(38,0\)\)\) AS \[s\].*ORDER BY.*DESC.*
+
+query II
+SELECT g, sum(n) AS s FROM ra_on.dbo.ra_t GROUP BY g ORDER BY s DESC LIMIT 2;
+----
+3	40
+2	35
+
+# By position and by select alias.
+query II
+EXPLAIN SELECT g AS k, avg(n) FROM ra_on.dbo.ra_t GROUP BY k ORDER BY 1;
+----
+physical_plan	<REGEX>:.*SELECT \[g\] AS \[k\], .* GROUP BY \[g\] ORDER BY \[ra_t\]\.\[g\] ASC.*
+
+query II
+SELECT g AS k, avg(n) FROM ra_on.dbo.ra_t GROUP BY k ORDER BY 1;
+----
+1	15.0
+2	35.0
+3	40.0
+
+# GROUP BY () over no rows is one row in DuckDB and none on the server: it is
+# sent as an aggregate without GROUP BY, which is one row there too.
+query II
+EXPLAIN SELECT count(*), sum(x) FROM ra_on.dbo.ra_e GROUP BY ();
+----
+physical_plan	<REGEX>:.*SELECT COUNT_BIG\(\*\) AS \[count_star\(\)\], SUM\(CAST\(\[x\] AS decimal\(38,0\)\)\) AS \[sum\(x\)\] FROM \[dbo\]\.\[ra_e\].*
+
+query II
+SELECT count(*), sum(x) FROM ra_on.dbo.ra_e GROUP BY ();
+----
+0	NULL
+
+query II
+SELECT count(*), sum(x) FROM ra_off.dbo.ra_e GROUP BY ();
+----
+0	NULL
+
+# AVG of an exact numeric over no rows: NULL / 0 is NULL there, not 8134.
+query II
+EXPLAIN SELECT avg(x) FROM ra_on.dbo.ra_e;
+----
+physical_plan	<REGEX>:.*CAST\(SUM\(CAST\(\[x\] AS decimal\(38,0\)\)\) AS float\) / COUNT_BIG\(\[x\]\).*
+
+query R
+SELECT avg(x) FROM ra_on.dbo.ra_e;
+----
+NULL
+
+# DISTINCT.
+query II
+EXPLAIN SELECT DISTINCT g FROM ra_on.dbo.ra_t ORDER BY g;
+----
+physical_plan	<REGEX>:.*SELECT DISTINCT \[g\] FROM \[dbo\]\.\[ra_t\] ORDER BY \[ra_t\]\.\[g\] ASC.*
+
+query I
+SELECT DISTINCT g FROM ra_on.dbo.ra_t ORDER BY g;
+----
+1
+2
+3
+
+# Under DISTINCT an ORDER BY key is sent as it is: a nullable one needing the
+# NULL-placing CASE stays with DuckDB (the CASE is not a result column, 145).
+query II
+EXPLAIN SELECT DISTINCT day FROM ra_on.dbo.ra_t ORDER BY day LIMIT 3;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query T
+SELECT DISTINCT day FROM ra_on.dbo.ra_t ORDER BY day LIMIT 3;
+----
+2024-01-01
+2024-02-01
+2024-03-01
+
+# D4: a string set is the server's, under the column's collation -- on a
+# case-insensitive one 'a' and 'A' are one value there (documented; the
+# scan path, which reads the column's values, sees four).
+query I
+SELECT count(DISTINCT legacy) FROM ra_on.dbo.ra_t;
+----
+2
+
+query I
+SELECT count(DISTINCT legacy) FROM ra_off.dbo.ra_t;
+----
+4
+
+#
+# Full review of PR D (differential fuzz).
+#
+
+# A repeated ORDER BY key is dropped: the server refuses one (169).
+query I
+SELECT id FROM ra_on.dbo.ra_t ORDER BY id, id DESC LIMIT 2;
+----
+1
+2
+
+# Doubles are compared, not computed: + - * overflow on the server (8115)
+# where DuckDB says inf, for rows TOP discards too (review of #396).
+query II
+EXPLAIN SELECT id FROM ra_on.dbo.ra_t WHERE ratio > 1.0 ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*WHERE \(\[ratio\] > @p0\).*
+
+query II
+EXPLAIN SELECT id, ratio + ratio AS r FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# A decimal product DuckDB types exactly is read and cast to DuckDB's type:
+# DECIMAL(10,4), where the server says decimal(11,4).
+statement ok
+CREATE TEMP TABLE p_on AS SELECT id, small * small AS p FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
+
+statement ok
+CREATE TEMP TABLE p_off AS SELECT id, small * small AS p FROM ra_off.dbo.ra_t ORDER BY id LIMIT 5;
+
+query II
+EXPLAIN SELECT id, small * small AS p FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*\(\[small\] \* \[small\]\) AS \[p\].*
+
+query IRT
+SELECT id, p, typeof(p) FROM p_on ORDER BY id;
+----
+1	999980.0001	DECIMAL(10,4)
+2	1.5625	DECIMAL(10,4)
+3	NULL	DECIMAL(10,4)
+4	12.2500	DECIMAL(10,4)
+5	0.0001	DECIMAL(10,4)
+
+query I
+SELECT count(*) FROM (SELECT * FROM p_on EXCEPT ALL SELECT * FROM p_off);
+----
+0
+
+# DuckDB moves the constant across the comparison (`tiny - 5 > 3` is
+# `tiny > 8` there) and never computes `tiny - 5`, which the server would,
+# and overflow on at tiny < 5 (8115). Not pushed.
+query II
+EXPLAIN SELECT id FROM ra_on.dbo.ra_t WHERE tiny - 5 > 3 ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT id FROM ra_on.dbo.ra_t WHERE tiny - 5 > 3 ORDER BY id LIMIT 5;
+----
+2
+4
+
+# A decimal whose DuckDB type the writer cannot tell is not a pushed result
+# column: `amount + 700` is DECIMAL(13,2) in DuckDB, decimal(11,2) there.
+query II
+EXPLAIN SELECT id, amount + 700 AS a FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query T
+SELECT typeof(amount + 700) FROM ra_on.dbo.ra_t LIMIT 1;
+----
+DECIMAL(13,2)
+
+#
+# Vetoes: the statement stays on the scan path, with the right rows.
+#
+
+# min / max of a string: its order is the collation's (#362).
+query II
+EXPLAIN SELECT min(name) FROM ra_on.dbo.ra_t;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT min(name) FROM ra_on.dbo.ra_t;
+----
+a
+
+# A floating-point aggregate in a condition: its last bits could choose rows.
+query II
+EXPLAIN SELECT g FROM ra_on.dbo.ra_t GROUP BY g HAVING avg(ratio) > 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT g FROM ra_on.dbo.ra_t GROUP BY g HAVING avg(ratio) > 1 ORDER BY g;
+----
+2
+3
+
+# xml is not comparable on the server (421 / 249).
+query II
+EXPLAIN SELECT DISTINCT doc FROM ra_on.dbo.ra_t;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# A column neither grouped nor aggregated is DuckDB's binder error, not the
+# server's.
+statement error
+SELECT g, n, count(*) FROM ra_on.dbo.ra_t GROUP BY g;
+----
+must appear in the GROUP BY clause
+
+# ROLLUP / GROUPING SETS / GROUP BY ALL.
+query II
+EXPLAIN SELECT g, count(*) FROM ra_on.dbo.ra_t GROUP BY ROLLUP (g);
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT g, count(*) FROM ra_on.dbo.ra_t GROUP BY ALL;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+statement ok
+SELECT mssql_exec('ra_off', 'DROP TABLE dbo.ra_t, dbo.ra_e');
+
+statement ok
+DETACH ra_on;
+
+statement ok
+DETACH ra_off;
