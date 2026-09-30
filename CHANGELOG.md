@@ -211,6 +211,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A CTE over an attached table, used more than once under a `LIMIT`, failed
+  with `Table Function with name mssql_catalog_scan does not exist`.**
+  DuckDB inlines such a CTE by copying its plan, and the copy looks the scan
+  function up by name; the catalog scan was never registered. It is now
+  (`mssql_catalog_scan`, internal: called by name it refuses), and the copy
+  rebuilds the scan from the attached table, pushed filters included.
+
 - **Spec 079 PR C follow-up review (roborev 1821): the `%` gate reached only the
   planner.** It is a case where the two pushdown walkers could still answer
   differently.

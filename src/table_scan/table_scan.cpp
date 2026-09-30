@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
+#include "mssql_function_docs.hpp"
 #include "mssql_functions.hpp"	// For backward compatibility with MSSQLCatalogScanBindData
 #include "query/mssql_identifier.hpp"
 #include "query/mssql_query_executor.hpp"
@@ -106,9 +107,13 @@ static std::string BuildColumnExpression(const MSSQLColumnInfo &col, const std::
 
 static unique_ptr<FunctionData> TableScanBind(ClientContext &context, TableFunctionBindInput &input,
 											  vector<LogicalType> &return_types, vector<Identifier> &names) {
-	// This bind function is not used for catalog scans - bind_data is set in GetScanFunction
-	// from MSSQLTableEntry
-	throw InternalException("TableScanBind should not be called directly");
+	// A catalog scan's bind data comes from MSSQLTableEntry::GetScanFunction,
+	// and a copied plan's from CatalogScanDeserialize. The function is in the
+	// catalog only so a plan copy can find it (RegisterCatalogScanFunction);
+	// called by name, there is no table to scan.
+	throw BinderException(
+		"mssql_catalog_scan is internal: read an attached table by name instead "
+		"(SELECT * FROM db.schema.table)");
 }
 
 //------------------------------------------------------------------------------
@@ -1331,12 +1336,11 @@ static void CatalogScanSerialize(Serializer &serializer, const optional_ptr<Func
 	serializer.WriteProperty(108, "complex_filter_param_literals", param_literals);
 }
 
-// NOTE: nothing in DuckDB round-trips a logical plan today — the only caller of
-// LogicalOperator::Deserialize is the generated serializer itself, and the
-// common-subplan optimizer only ever serializes. This exists because
-// HasSerializationCallbacks() requires both halves before bind data is written
-// at all, so it is currently unexercised by any test. Keep it obvious rather
-// than clever, and validate defensively.
+// DuckDB round-trips a logical plan to copy it: CTE inlining copies a CTE
+// used more than once under a LIMIT (LogicalOperatorDeepCopy, through
+// LogicalOperator::Copy). The copy finds this function by name in the
+// catalog, hence RegisterCatalogScanFunction, and rebuilds the bind data here
+// from the live catalog entry. Validate defensively.
 static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserializer, BoundTableFunction &function) {
 	auto context_name = deserializer.ReadProperty<string>(100, "context_name");
 	auto schema_name = deserializer.ReadProperty<string>(101, "schema_name");
@@ -1433,6 +1437,20 @@ TableFunction GetCatalogScanFunction() {
 	func.deserialize = CatalogScanDeserialize;
 
 	return func;
+}
+
+void RegisterCatalogScanFunction(ExtensionLoader &loader) {
+	// Without it a plan copy fails: `WITH c AS (SELECT ... FROM db.t) SELECT
+	// ... FROM c x, c y LIMIT 2` raised "Table Function with name
+	// mssql_catalog_scan does not exist" (CTE inlining copies the CTE, and the
+	// copy looks the function up by name).
+	RegisterDocumentedFunction(
+		loader, TableFunctionSet(GetCatalogScanFunction()),
+		{{},
+		 "Internal: the scan behind an attached SQL Server table. Registered so DuckDB can copy a plan that holds "
+		 "one; read a table by name instead.",
+		 {"SELECT * FROM db.dbo.orders"},
+		 {"query"}});
 }
 
 }  // namespace mssql

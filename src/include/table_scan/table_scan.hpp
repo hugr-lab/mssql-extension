@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -25,6 +26,9 @@ namespace mssql {
  * - MaxThreads() = 1 (single-threaded)
  */
 TableFunction GetCatalogScanFunction();
+
+//! Registers the catalog scan by name, so a copied plan finds it.
+void RegisterCatalogScanFunction(ExtensionLoader &loader);
 
 }  // namespace mssql
 }  // namespace duckdb

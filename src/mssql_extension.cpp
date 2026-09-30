@@ -16,6 +16,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "mssql_function_docs.hpp"
+#include "table_scan/table_scan.hpp"
 #include "mssql_functions.hpp"
 #include "mssql_secret.hpp"
 #include "mssql_storage.hpp"
@@ -157,6 +158,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// 3. Register table functions
 	RegisterMSSQLFunctions(loader);
+
+	// The catalog scan, by name (a plan copy looks it up)
+	mssql::RegisterCatalogScanFunction(loader);
 
 	// 4. Register mssql_exec scalar function
 	RegisterMSSQLExecFunction(loader);
