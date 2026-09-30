@@ -113,7 +113,9 @@ public:
 	//! set operation's children, an INSERT's and a CTAS's query on their own,
 	//! and a pushed `SELECT * FROM t` there would read the whole table where
 	//! the scan reads what an outer WHERE lets through. So a node the scan
-	//! could serve as well stays with the scan. The gain is ORDER BY, LIMIT /
+	//! could serve as well is handed back to it by RemoteExecute (PR E1; the
+	//! dry run answers renderability only, as the rewriter asks it about
+	//! nested nodes too). The gain is ORDER BY, LIMIT /
 	//! OFFSET, DISTINCT, GROUP BY / HAVING, an aggregate, and a join with no
 	//! CROSS link: each sends fewer rows than the tables' (or their first N).
 	static bool PushesMoreThanScan(const QueryNode &node);

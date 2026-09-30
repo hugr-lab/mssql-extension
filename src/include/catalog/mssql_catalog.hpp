@@ -386,6 +386,17 @@ public:
 					   optional_ptr<ClientContext> context = nullptr);
 	//! D3: the node as a call of mssql_scan_params / mssql_scan; lazy.
 	unique_ptr<TableRef> RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) override;
+	//! PR E1: the vehicle (`mssql_scan_params(…)`, a cast projection over it
+	//! where a type is cast back) for a written statement.
+	unique_ptr<TableRef> VehicleFor(mssql::WrittenQuery &written);
+	//! A node that renders AND gains over the catalog scan, written.
+	bool WritePushablePart(const QueryNode &node, mssql::WrittenQuery &written, optional_ptr<ClientContext> context,
+						   const vector<string> &scope);
+	//! Whether a node nested in `node` would be pushed; `scope` holds the CTE
+	//! names visible from outside it.
+	bool HasPushablePart(const QueryNode &node, const vector<string> &scope);
+	//! Push every nested part that renders and gains, in place.
+	void PushNestedParts(ClientContext &context, QueryNode &node, const vector<string> &scope);
 
 	// Get connection info
 	const MSSQLConnectionInfo &GetConnectionInfo() const;

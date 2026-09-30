@@ -1,7 +1,9 @@
 #include "catalog/mssql_catalog.hpp"
+
 #include <openssl/crypto.h>
 #include <cctype>
 #include <cstdlib>
+#include <unordered_map>
 #include "catalog/mssql_transaction.hpp"
 #include "codec/target_string_type.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
@@ -40,11 +42,16 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
@@ -1601,21 +1608,33 @@ bool MSSQLCatalog::SupportsPushdown(const ParsedExpression &expression) {
 
 // A base table this catalog resolved on this thread (the rewriter's own
 // lookup just did it), or a join -- whose tables the rewriter has already
-// asked about, and which the node's dry run renders or refuses as a whole.
-// A subquery is refused (spec 079 PR E).
+// asked about, and which the node's dry run renders or refuses as a whole --
+// or a subquery (PR E1: its node is asked on its own, and RemoteExecute can
+// push it as a part of a node that does not go whole).
+static void NoteOriginalTableName(const BaseTableRef &ref);
+static bool MayRepeatOutputNames(const QueryNode &node);
+
 bool MSSQLCatalog::SupportsPushdown(const TableRef &ref) {
-	if (ref.type == TableReferenceType::JOIN) {
-		MSSQL_CATALOG_DEBUG_LOG(2, "SupportsPushdown(table ref %s): a join", ref.ToString().c_str());
+	if (ref.type == TableReferenceType::JOIN || ref.type == TableReferenceType::SUBQUERY) {
+		// The node's dry run renders or refuses it as a whole (PR E1).
+		MSSQL_CATALOG_DEBUG_LOG(2, "SupportsPushdown(table ref %s): a join / subquery", ref.ToString().c_str());
 		return true;
 	}
 	if (ref.type == TableReferenceType::BASE_TABLE) {
+		NoteOriginalTableName(ref.Cast<BaseTableRef>());
 		auto resolved = ResolvePushdownTable(ref.Cast<BaseTableRef>(), nullptr);
 		auto entry = resolved.entry;
 		MSSQL_CATALOG_DEBUG_LOG(
 			2, "SupportsPushdown(table ref %s): resolved %s", ref.ToString().c_str(),
 			entry ? (entry->schema.name.GetIdentifierName() + "." + entry->name.GetIdentifierName()).c_str()
 				  : "(nothing)");
-		return entry != nullptr;
+		// An unqualified name no noted table answers: a CTE's (the rewriter asks
+		// about a CTE reference when its body is this catalog's), or a table
+		// the search path finds in a schema other than the default one. The
+		// writer refuses both, and a node handed back binds the name as the
+		// query wrote it (RestoreTableNames).
+		const auto &qualified = ref.Cast<BaseTableRef>().GetQualifiedName();
+		return entry != nullptr || (qualified.Catalog().empty() && qualified.Schema().empty());
 	}
 	MSSQL_CATALOG_DEBUG_LOG(2, "SupportsPushdown(table ref %s): not a base table", ref.ToString().c_str());
 	return false;
@@ -1687,40 +1706,339 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 	return writer.Write(node, out, why);
 }
 
-// The dry run (D1): the node is pushed exactly when the writer renders it --
-// and when the scan path could not serve it as well (`PushesMoreThanScan`).
+// The dry run (D1): renderability only. Whether the node gains anything over
+// the catalog scan is RemoteExecute's question, not this one: the rewriter
+// asks this hook about every NESTED node too (a subquery, a CTE body, a set
+// operation's child) and a refusal there poisons the whole statement, so a
+// plain `SELECT … WHERE` inside a subquery must answer yes (PR E1).
 bool MSSQLCatalog::SupportsPushdown(const QueryNode &node) {
-	if (!mssql::SQLWriter::PushesMoreThanScan(node)) {
-		MSSQL_CATALOG_DEBUG_LOG(2, "SupportsPushdown(query node %s): left to the scan path", node.ToString().c_str());
-		return false;
-	}
 	mssql::WrittenQuery written;
 	string why;
-	if (!WritePushdown(node, written, why)) {
-		MSSQL_CATALOG_DEBUG_LOG(1, "SupportsPushdown(query node %s): no: %s", node.ToString().c_str(), why.c_str());
+	if (WritePushdown(node, written, why)) {
+		MSSQL_CATALOG_DEBUG_LOG(1, "SupportsPushdown(query node %s): %s", node.ToString().c_str(),
+								written.statement.c_str());
+		return true;
+	}
+	// Not as a whole -- but RemoteExecute can still push its nested parts, of
+	// a query (never of an INSERT / UPDATE / DELETE / MERGE, which it would
+	// turn into a SELECT).
+	if ((node.type == QueryNodeType::SELECT_NODE || node.type == QueryNodeType::SET_OPERATION_NODE) &&
+		!MayRepeatOutputNames(node) && HasPushablePart(node, {})) {
+		MSSQL_CATALOG_DEBUG_LOG(1, "SupportsPushdown(query node %s): parts (%s)", node.ToString().c_str(), why.c_str());
+		return true;
+	}
+	MSSQL_CATALOG_DEBUG_LOG(1, "SupportsPushdown(query node %s): no: %s", node.ToString().c_str(), why.c_str());
+	return false;
+}
+
+// The table names as the query wrote them, noted by SupportsPushdown(TableRef)
+// before the rewriter's strip. FinishPushdown strips the SAME objects in place
+// and hands them to RemoteExecute, so a node handed back to the binder gets
+// every name back exactly -- a reconstruction from the stripped tree cannot:
+// `db.t` is stripped to a bare `t`, which a CTE of that name would then
+// capture, or the search path bind elsewhere (review of PR E1).
+namespace {
+struct OriginalTableNames {
+	std::unordered_map<const BaseTableRef *, QualifiedName> names;
+};
+OriginalTableNames &TableNames() {
+	thread_local OriginalTableNames names;
+	return names;
+}
+}  // namespace
+
+static void NoteOriginalTableName(const BaseTableRef &ref) {
+	auto &names = TableNames().names;
+	if (names.size() > 4096) {
+		// Entries of statements that were not handed back; a statement's own
+		// are written right before its RemoteExecute.
+		names.clear();
+	}
+	names[&ref] = ref.GetQualifiedName();
+}
+
+// Every query node nested in a node and every base table it names, visited as
+// the rewriter's StripCatalogName visits them: CTE bodies and key targets, the
+// FROM tree (joins and their conditions, subqueries, table function
+// arguments, VALUES rows), the select list, WHERE, GROUP BY, HAVING, QUALIFY,
+// the ORDER BY / LIMIT / OFFSET / DISTINCT ON modifiers, a set operation's
+// children, and the subqueries inside any of those expressions. A nested node
+// is handed to `on_node` by its slot, so it can be replaced; the walk does not
+// descend into it (the callback does, if it wants).
+using NestedNodeVisitor = std::function<void(unique_ptr<QueryNode> &slot)>;
+using BaseTableVisitor = std::function<void(BaseTableRef &ref)>;
+
+static void VisitExpression(ParsedExpression &expr, const NestedNodeVisitor &on_node) {
+	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		auto &subquery = expr.Cast<SubqueryExpression>();
+		if (subquery.GetChildMutable()) {
+			VisitExpression(*subquery.GetChildMutable(), on_node);
+		}
+		on_node(subquery.SubqueryMutable()->node);
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+		expr, [&](unique_ptr<ParsedExpression> &child) { VisitExpression(*child, on_node); });
+}
+
+static void VisitTableRef(TableRef &ref, const NestedNodeVisitor &on_node, const BaseTableVisitor &on_table) {
+	switch (ref.type) {
+	case TableReferenceType::BASE_TABLE:
+		on_table(ref.Cast<BaseTableRef>());
+		break;
+	case TableReferenceType::JOIN: {
+		auto &join = ref.Cast<JoinRef>();
+		VisitTableRef(*join.left, on_node, on_table);
+		VisitTableRef(*join.right, on_node, on_table);
+		if (join.condition) {
+			VisitExpression(*join.condition, on_node);
+		}
+		break;
+	}
+	case TableReferenceType::SUBQUERY:
+		on_node(ref.Cast<SubqueryRef>().subquery->node);
+		break;
+	case TableReferenceType::TABLE_FUNCTION:
+		if (ref.Cast<TableFunctionRef>().function) {
+			VisitExpression(*ref.Cast<TableFunctionRef>().function, on_node);
+		}
+		break;
+	case TableReferenceType::EXPRESSION_LIST:
+		for (auto &row : ref.Cast<ExpressionListRef>().values) {
+			for (auto &value : row) {
+				VisitExpression(*value, on_node);
+			}
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static void VisitNode(QueryNode &node, const NestedNodeVisitor &on_node, const BaseTableVisitor &on_table) {
+	for (auto &cte : node.cte_map.map) {
+		if (cte.second->query_node) {
+			on_node(cte.second->query_node);
+		}
+		for (auto &key : cte.second->key_targets) {
+			VisitExpression(*key, on_node);
+		}
+	}
+	// A RECURSIVE_CTE_NODE is not walked: the writer refuses it, so it is
+	// never pushed nor handed back with parts (checked live).
+	if (node.type == QueryNodeType::SET_OPERATION_NODE) {
+		for (auto &child : node.Cast<SetOperationNode>().children) {
+			on_node(child);
+		}
+	} else if (node.type == QueryNodeType::SELECT_NODE) {
+		auto &select = node.Cast<SelectNode>();
+		if (select.from_table) {
+			VisitTableRef(*select.from_table, on_node, on_table);
+		}
+		for (auto &item : select.select_list) {
+			VisitExpression(*item, on_node);
+		}
+		for (auto &key : select.groups.group_expressions) {
+			VisitExpression(*key, on_node);
+		}
+		for (auto *clause : {&select.where_clause, &select.having, &select.qualify}) {
+			if (*clause) {
+				VisitExpression(**clause, on_node);
+			}
+		}
+	}
+	for (auto &modifier : node.modifiers) {
+		switch (modifier->type) {
+		case ResultModifierType::ORDER_MODIFIER:
+			for (auto &order : modifier->Cast<OrderModifier>().orders) {
+				VisitExpression(*order.expression, on_node);
+			}
+			break;
+		case ResultModifierType::LIMIT_MODIFIER: {
+			auto &limit = modifier->Cast<LimitModifier>();
+			for (auto *count : {&limit.limit, &limit.offset}) {
+				if (*count) {
+					VisitExpression(**count, on_node);
+				}
+			}
+			break;
+		}
+		case ResultModifierType::DISTINCT_MODIFIER:
+			for (auto &target : modifier->Cast<DistinctModifier>().distinct_on_targets) {
+				VisitExpression(*target, on_node);
+			}
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+// Puts back every table name the strip took the catalog off, from the names
+// SupportsPushdown(TableRef) noted. A name it did not note would have to be
+// guessed, so the statement is refused rather than bound to what might be
+// another table.
+static void RestoreTableNames(QueryNode &node) {
+	VisitNode(
+		node, [](unique_ptr<QueryNode> &slot) { RestoreTableNames(*slot); },
+		[](BaseTableRef &ref) {
+			auto &names = TableNames().names;
+			auto entry = names.find(&ref);
+			if (entry == names.end()) {
+				throw BinderException(
+					"mssql: remote pushdown lost the name of table %s; run the statement with "
+					"mssql_remote_pushdown = false, and please report it",
+					ref.ToString());
+			}
+			ref.SetQualifiedName(entry->second);
+			names.erase(entry);
+		});
+}
+
+static unique_ptr<QueryNode> SelectStarFrom(unique_ptr<TableRef> ref) {
+	auto select = make_uniq<SelectNode>();
+	select->select_list.push_back(make_uniq<StarExpression>());
+	select->from_table = std::move(ref);
+	return std::move(select);
+}
+
+// The CTE names visible inside a node: its own and every enclosing node's.
+static vector<string> ExtendScope(const QueryNode &node, vector<string> scope) {
+	for (auto &cte : node.cte_map.map) {
+		scope.push_back(cte.first.GetIdentifierName());
+	}
+	return scope;
+}
+
+// Whether `node` names, anywhere inside, an unqualified table that a CTE in
+// `scope` defines. Such a name is the CTE, not the table the writer would
+// resolve it to (review of PR E1: `WITH o AS (SELECT … FROM db.o WHERE …)
+// SELECT … FROM (SELECT … FROM o …)` read dbo.o and lost the CTE's filter).
+// The rewriter refuses any nested node under a CTE-holding parent for the
+// same reason (its FinishPushdown FIXME); here only the ones that name one.
+static bool NamesScopeTable(QueryNode &node, const vector<string> &scope) {
+	auto inner = ExtendScope(node, scope);
+	if (inner.empty()) {
 		return false;
 	}
-	MSSQL_CATALOG_DEBUG_LOG(1, "SupportsPushdown(query node %s): %s", node.ToString().c_str(),
-							written.statement.c_str());
-	return true;
+	bool found = false;
+	VisitNode(
+		node, [&](unique_ptr<QueryNode> &slot) { found = found || NamesScopeTable(*slot, inner); },
+		[&](BaseTableRef &ref) {
+			auto &name = ref.GetQualifiedName();
+			if (!name.Catalog().empty() || !name.Schema().empty()) {
+				return;
+			}
+			for (auto &cte : inner) {
+				found = found || StringUtil::CIEquals(cte, name.Name().GetIdentifierName());
+			}
+		});
+	return found;
+}
+
+// Whether a node handed back could carry two result columns of one name: the
+// binder deduplicates a subquery's names (`n, n` comes back `n, n_1`), and a
+// node handed back is a subquery. Unknowable before binding for a `*` over a
+// join, so that is refused too; a node the writer renders refuses duplicates
+// itself.
+static bool MayRepeatOutputNames(const QueryNode &node) {
+	if (node.type == QueryNodeType::SET_OPERATION_NODE) {
+		auto &children = node.Cast<SetOperationNode>().children;
+		return !children.empty() && MayRepeatOutputNames(*children[0]);
+	}
+	if (node.type != QueryNodeType::SELECT_NODE) {
+		return true;
+	}
+	auto &select = node.Cast<SelectNode>();
+	vector<string> names;
+	for (auto &item : select.select_list) {
+		if (item->GetExpressionClass() == ExpressionClass::STAR) {
+			if ((select.from_table && select.from_table->type == TableReferenceType::JOIN) ||
+				select.select_list.size() > 1) {
+				return true;
+			}
+			continue;
+		}
+		string name = !item->GetAlias().empty() ? item->GetAlias().GetIdentifierName()
+					  : item->GetExpressionClass() == ExpressionClass::COLUMN_REF
+						  ? item->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName()
+						  : item->GetName().GetIdentifierName();
+		for (auto &existing : names) {
+			if (StringUtil::CIEquals(existing, name)) {
+				return true;
+			}
+		}
+		names.push_back(std::move(name));
+	}
+	return false;
+}
+
+// A node that renders AND gains over the scan, written; else false. Never one
+// that names a CTE of an enclosing scope.
+bool MSSQLCatalog::WritePushablePart(const QueryNode &node, mssql::WrittenQuery &written,
+									 optional_ptr<ClientContext> context, const vector<string> &scope) {
+	string why;
+	return node.type == QueryNodeType::SELECT_NODE && mssql::SQLWriter::PushesMoreThanScan(node) &&
+		   !NamesScopeTable(const_cast<QueryNode &>(node), scope) && WritePushdown(node, written, why, context);
+}
+
+// Whether a node nested in `node` would be pushed (the dry run).
+bool MSSQLCatalog::HasPushablePart(const QueryNode &node, const vector<string> &scope) {
+	auto inner = ExtendScope(node, scope);
+	bool found = false;
+	VisitNode(
+		const_cast<QueryNode &>(node),
+		[&](unique_ptr<QueryNode> &slot) {
+			mssql::WrittenQuery written;
+			found = found || WritePushablePart(*slot, written, nullptr, inner) || HasPushablePart(*slot, inner);
+		},
+		[](BaseTableRef &) {});
+	return found;
+}
+
+// The PR E1 decomposition: every nested node that renders and gains is
+// replaced by `SELECT * FROM <its vehicle>`; one that does not is searched in
+// turn. What is left runs in DuckDB -- the outer node's EXCLUDE, a window, a
+// local join -- over as many vehicles as the statement has parts.
+void MSSQLCatalog::PushNestedParts(ClientContext &context, QueryNode &node, const vector<string> &scope) {
+	auto inner = ExtendScope(node, scope);
+	VisitNode(
+		node,
+		[&](unique_ptr<QueryNode> &slot) {
+			mssql::WrittenQuery written;
+			if (WritePushablePart(*slot, written, context, inner)) {
+				slot = SelectStarFrom(VehicleFor(written));
+				return;
+			}
+			PushNestedParts(context, *slot, inner);
+		},
+		[](BaseTableRef &) {});
+}
+
+unique_ptr<TableRef> MSSQLCatalog::RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) {
+	mssql::WrittenQuery written;
+	if (WritePushablePart(*node, written, context, {})) {
+		return VehicleFor(written);
+	}
+	// The node as a whole does not go: it renders but gains nothing over the
+	// catalog scan, or it holds something the writer has no form for. It is
+	// handed back as itself, a subquery the binder plans -- through the scan
+	// path, which (unlike a pushed node) still takes the filters from ABOVE it
+	// (measured: an outer `id = 2` reaches the scan's WHERE through a UNION) --
+	// with every nested part that renders and gains pushed on its own.
+	PushNestedParts(context, *node, {});
+	RestoreTableNames(*node);
+	MSSQL_CATALOG_DEBUG_LOG(1, "RemoteExecute: handed back, parts pushed: %s", node->ToString().c_str());
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = std::move(node);
+	return make_uniq<SubqueryRef>(std::move(statement));
 }
 
 // D3: the pushed node becomes a call of `mssql_scan_params` (or `mssql_scan`
 // when it carries no parameter) -- the describe at bind, the run at init, the
 // transaction's pinned connection, and EXPLAIN shows the statement. Nothing
 // touches the server here.
-unique_ptr<TableRef> MSSQLCatalog::RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) {
-	mssql::WrittenQuery written;
-	string why;
-	if (!WritePushdown(*node, written, why, context)) {
-		// SupportsPushdown ran the same writer on the same node a moment ago,
-		// so this is not expected -- but it must not be an InternalException,
-		// which invalidates the whole database instance.
-		throw BinderException(
-			"mssql: the pushed query no longer renders (%s); run it with "
-			"mssql_remote_pushdown = false, and please report it",
-			why);
-	}
+unique_ptr<TableRef> MSSQLCatalog::VehicleFor(mssql::WrittenQuery &written) {
 	vector<unique_ptr<ParsedExpression>> arguments;
 	arguments.push_back(ConstantExpression::String(GetName().GetIdentifierName()));
 	arguments.push_back(ConstantExpression::String(written.statement));
