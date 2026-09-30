@@ -294,6 +294,95 @@ pushed against not pushed; a semantic pass of 280 on the live server).**
   refuses all three for both paths (review of #396, merged). `real` stays out (DuckDB promotes FLOAT beside a
   DOUBLE). `money` / `smallmoney` arithmetic is not in PR D.
 
+**Revised in PR E1: composition -- a statement as a whole, or in parts.**
+
+- *The gain is RemoteExecute's decision; the dry run is renderability.* The
+  rewriter asks `SupportsPushdown(QueryNode)` about every nested node too (a
+  subquery, a CTE body, a set operation's child), and a no anywhere poisons
+  the statement, so the dry run answers whether the writer RENDERS the node.
+  `RemoteExecute` then decides whether it gains (`PushesMoreThanScan`); a
+  node that renders but gains nothing, or does not render, is handed back as
+  a subquery with its table names restored exactly as the query wrote them
+  (noted before the rewriter strips the catalog in place: `db.t` arrives as a
+  bare `t`), and every nested part that renders and gains is replaced by
+  `SELECT * FROM <its vehicle>` -- a statement DuckDB cannot send whole (an
+  EXCLUDE, a window, a local join) runs over as many vehicles as it has parts.
+  Guards: a part that names a CTE of an enclosing scope is not pushed alone;
+  a `*` over a join is not decomposed (a handed-back subquery would dedupe
+  `n, n` to `n, n_1`); a part whose result feeds DuckDB's own computation
+  must not carry a division or a floating-point aggregate (its NULL-for-inf
+  or last bits would change rows there).
+- *The join gain check* (`mssql_pushdown_join_rows_threshold`, default
+  1000000; owner's rules). A join link that equates a unique key of one side
+  (the loaded primary or rowid key) with the other, a SEMI / ANTI link, a
+  LIMIT, an aggregate or DISTINCT that does not keep a key of every table,
+  and a single table are certain gains. A many-to-many or CROSS join goes
+  only while every table it joins has fewer rows than the threshold by the
+  count the planner gets (statistics cache, else the entry's; no round
+  trip), a view or a derived table counting as unknown; else it is handed
+  back to the scan path. Not checked inside a transaction or on a pool of one
+  connection (trusted). A plan-based estimate (SHOWPLAN on a separate
+  connection) is a later step.
+- *Derived tables.* A subquery in FROM is rendered in place, `(<T-SQL>) AS
+  [rN]`, sharing the statement's parameter set; its columns are already read
+  (a code-page varchar's NVARCHAR cast is not repeated, an integer `sum` cast
+  back once). A derived column keeps its column's metadata when read as
+  itself; a computed one gets metadata of its type, or is opaque (selectable,
+  never compared nor ordered) -- always so for a division or a floating-point
+  aggregate. Vetoed: ORDER BY without LIMIT inside (1033), column alias
+  lists, an aggregate over a cast-back value.
+- *Subquery expressions.* `x IN (SELECT y ...)` (one column of one type and
+  collation; NOT IN is NOT over it, three-valued alike), `EXISTS` / `NOT
+  EXISTS`, and a scalar subquery as a value, typed as DuckDB types it. DuckDB
+  plans IN / EXISTS as SEMI / ANTI / MARK joins after binding; the rewriter
+  runs before and hands over the parsed subquery. Correlation: a name no
+  relation of the subquery has resolves through the nodes around it, the
+  outer node's columns qualified by its aliases, the subquery's relations
+  aliased past them. The rewriter asks about a correlated subquery on its
+  own, where its outer column does not resolve: the dry run answers yes when
+  the only thing wrong is a name an enclosing node could supply
+  (`refers_outside`; not for `rowid` or a select alias). Vetoed: a
+  correlated column in the subquery's aggregate (DuckDB's outer aggregate),
+  a subquery in an aggregate (130), quantified comparisons other than
+  `= ANY`, a result read through a conversion, a computed string result, an
+  uncorrelated scalar subquery that may return several rows (DuckDB
+  evaluates it once and raises even with no outer row; the server evaluates
+  it per row), and every scalar subquery under
+  `scalar_subquery_error_on_multiple_rows = false`.
+- *Set operations: nested only* (owner's call). At a statement's top the
+  children go as parts and DuckDB combines them; nested -- a derived table,
+  IN / EXISTS, a part -- UNION [ALL] / EXCEPT / INTERSECT is rendered in
+  place. One DuckDB type per column on every side (the server's promotion is
+  not DuckDB's), strings as plain columns of one server type and collation;
+  the comparing forms need groupable columns and compare strings under the
+  server's collation (D4 for sets). A merged column keeps its metadata only
+  when every member has the same server shape (`time(3)` with `time(7)`: a
+  value, opaque outside). A member with ORDER BY / LIMIT goes in a derived
+  table of its own; the operation's own ORDER BY / LIMIT through a `SELECT *`
+  wrapper, keyed on result columns or positions only. Vetoed: EXCEPT ALL /
+  INTERSECT ALL, UNION BY NAME, an ORDER BY without LIMIT in a member.
+- *CTEs, inlined.* T-SQL's WITH stands only at a statement's top, and the
+  server inlines its CTEs anyway: each reference is rendered as a derived
+  table. A body sees only the CTEs defined before it, a nested WITH shadows
+  an outer name, an unused CTE is left out (DuckDB does not bind one). A CTE
+  and a table of one name are told apart by the name the query wrote.
+  DuckDB evaluates a CTE once: a body that picks rows anywhere in it (a
+  LIMIT / OFFSET among ties) is vetoed when referenced twice or under a
+  subquery expression; a deterministic body inlined twice is read twice on
+  the server, which under concurrent writes can see different committed
+  rows (recorded). Vetoed: column aliases, USING KEY, recursive CTEs.
+- *Waiting on DuckDB* (duckdb/duckdb#26280): in a statement that also reads
+  a local table, the rewriter finishes neither a FROM subquery nor a CTE
+  body on its own, so their aggregate or join runs in DuckDB over a plain
+  scan -- the right rows; pushed with no change here once DuckDB finishes the
+  nested node. EXCLUDE / REPLACE / COLUMNS and GROUP BY ALL stay vetoed
+  (owner's call: T-SQL's GROUP BY ALL means something else); an explicit
+  `mssql_scan` is the way to write such a statement against the server.
+- *Search path at RemoteExecute.* The table resolution with a context now
+  applies the same check as the dry run (by the written name): `USE
+  db.sales; SELECT ... FROM t` binds `sales.t`, and with a broader dry-run
+  yes it would otherwise have been pushed reading `dbo.t`.
+
 **Revised in PR B: the catalog's types, not the describe's.** Run on every
 table of the test database, the describe disagreed with the catalog on three
 things, all of them the read expression's doing: a code-page `varchar` read
