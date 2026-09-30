@@ -391,7 +391,7 @@ public:
 	unique_ptr<TableRef> VehicleFor(mssql::WrittenQuery &written);
 	//! A node that renders AND gains over the catalog scan, written.
 	bool WritePushablePart(const QueryNode &node, mssql::WrittenQuery &written, optional_ptr<ClientContext> context,
-						   const vector<string> &scope);
+						   const vector<string> &scope, bool nested);
 	//! Whether a node nested in `node` would be pushed; `scope` holds the CTE
 	//! names visible from outside it.
 	bool HasPushablePart(const QueryNode &node, const vector<string> &scope);

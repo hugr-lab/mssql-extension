@@ -87,6 +87,11 @@ struct WrittenQuery {
 	idx_t largest_input_rows = 0;
 	//! One of them is a view, whose size is unknown.
 	bool input_size_unknown = false;
+	//! A result column is a division or a floating-point aggregate: its
+	//! divergence (NULL for inf, the last bits) is recorded for a value that
+	//! reaches the user -- not for one DuckDB computes on, as a part pushed
+	//! under a node that stays local would have it (review of E1).
+	bool value_divergence = false;
 
 	//! "@p1 int, @p2 varchar(50)" -- empty without parameters.
 	std::string Declarations() const;

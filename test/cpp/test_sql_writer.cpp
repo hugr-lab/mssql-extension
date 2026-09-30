@@ -507,7 +507,9 @@ int main() {
 	ExpectVeto("SELECT id FROM t RIGHT JOIN u USING (id)");
 	ExpectVeto("SELECT id FROM t FULL JOIN u USING (id)");
 	ExpectVeto("SELECT t.id FROM t JOIN (u JOIN t AS x ON u.t_id = x.id) ON t.id = u.t_id");
-	ExpectVeto("SELECT t.id FROM t JOIN (SELECT * FROM u) s ON t.id = s.t_id");
+	ExpectSql("SELECT t.id FROM t JOIN (SELECT * FROM u) s ON t.id = s.t_id",
+			  "SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] INNER JOIN (SELECT [id], [t_id], [label], [big] FROM "
+			  "[dbo].[u]) AS [r2] ON ([r1].[id] = [r2].[t_id])");
 	ExpectVeto("SELECT t.id FROM t JOIN v ON t.id = v.id");								  // not this catalog's
 	ExpectVeto("SELECT t.id FROM t JOIN u ON t.id = x.id JOIN t AS x ON x.id = u.t_id");  // ON names a later table
 
@@ -568,6 +570,43 @@ int main() {
 	ExpectVeto("SELECT ratio * ratio AS r FROM t LIMIT 1");
 	ExpectVeto("SELECT ratio % 2 FROM t LIMIT 1");
 	ExpectVeto("SELECT ratio + amount FROM t LIMIT 1");
+
+	// Derived tables (PR E1): the inner node rendered in place, its columns
+	// already read (the NVARCHAR cast of a code-page varchar is not repeated),
+	// one parameter set for the statement.
+	ExpectSql(
+		"SELECT s.g, s.c FROM (SELECT id AS g, count(*) AS c FROM t WHERE id > 3 GROUP BY id) s WHERE s.c > 1 "
+		"ORDER BY s.g LIMIT 5",
+		"SELECT TOP (5) [r1].[g] AS [g], [r1].[c] AS [c] FROM (SELECT [id] AS [g], COUNT_BIG(*) AS [c] FROM "
+		"[dbo].[t] WHERE ([id] > @p0) GROUP BY [id]) AS [r1] WHERE ([r1].[c] > @p1) ORDER BY [r1].[g] ASC");
+	ExpectSql("SELECT s.legacy FROM (SELECT legacy FROM t ORDER BY id LIMIT 3) s",
+			  "SELECT [r1].[legacy] AS [legacy] FROM (SELECT TOP (3) CAST([legacy] AS NVARCHAR(30)) AS [legacy] FROM "
+			  "[dbo].[t] ORDER BY [t].[id] ASC) AS [r1]");
+	{
+		WrittenQuery out;
+		std::string why;
+		if (!Write("SELECT s.total FROM (SELECT id, sum(id) AS total FROM t GROUP BY id) s WHERE s.total > 10", out,
+				   why) ||
+			out.cast_types[0] != LogicalType::HUGEINT) {
+			std::cerr << "FAIL: a derived integer SUM is not cast back (" << why << ")\n";
+			failures++;
+		}
+	}
+	ExpectVeto("SELECT sum(s.total) FROM (SELECT id, sum(id) AS total FROM t GROUP BY id) s");	// HUGEINT here
+	ExpectVeto("SELECT s.id FROM (SELECT id FROM t ORDER BY id) s");				   // ORDER BY without TOP: 1033
+	ExpectVeto("SELECT s.a FROM (SELECT id FROM t) s(a)");							   // column aliases: not yet
+	ExpectVeto("SELECT s.legacy FROM (SELECT legacy FROM t) s WHERE s.legacy = 'x'");  // read through a CAST
+	// A division or a floating-point aggregate stays a value outside its node.
+	ExpectVeto("SELECT s.id FROM (SELECT id, id / amount AS r FROM t) s WHERE s.r > 1");
+	ExpectVeto("SELECT s.id FROM (SELECT id, id / amount AS r FROM t) s ORDER BY s.r LIMIT 2");
+	ExpectVeto("SELECT coalesce(s.r, -1) FROM (SELECT id, id / amount AS r FROM t) s");
+	ExpectVeto("SELECT s.id FROM (SELECT id, avg(ratio) AS a FROM t GROUP BY id) s WHERE s.a > 1");
+	ExpectSql(
+		"SELECT s.r FROM (SELECT id, id / amount AS r FROM t) s LIMIT 1",
+		"SELECT TOP (1) [r1].[r] AS [r] FROM (SELECT [id], (CAST([id] AS float) / NULLIF(CAST([amount] AS float), 0)) "
+		"AS [r] FROM [dbo].[t]) AS [r1]");
+	ExpectGain("SELECT * FROM (SELECT id, count(*) AS c FROM t GROUP BY id) s", true);
+	ExpectGain("SELECT * FROM (SELECT id FROM t WHERE id > 1) s", false);
 
 	// The PR E1 gain check: a join link that equates a unique key cannot send
 	// more rows than the other side; one that equates none (many-to-many,

@@ -1662,8 +1662,13 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 		} else if (ref->type == TableReferenceType::JOIN) {
 			pending.push_back(ref->Cast<JoinRef>().left.get());
 			pending.push_back(ref->Cast<JoinRef>().right.get());
+		} else if (ref->type == TableReferenceType::SUBQUERY &&
+				   ref->Cast<SubqueryRef>().subquery->node->type == QueryNodeType::SELECT_NODE &&
+				   ref->Cast<SubqueryRef>().subquery->node->Cast<SelectNode>().from_table) {
+			// A derived table's own tables (PR E1).
+			pending.push_back(ref->Cast<SubqueryRef>().subquery->node->Cast<SelectNode>().from_table.get());
 		} else {
-			why = "FROM holds something other than tables and joins";
+			why = "FROM holds something other than tables, joins and subqueries";
 			return false;
 		}
 	}
@@ -1992,10 +1997,16 @@ static bool MayRepeatOutputNames(const QueryNode &node) {
 // A node that renders AND gains over the scan, written; else false. Never one
 // that names a CTE of an enclosing scope.
 bool MSSQLCatalog::WritePushablePart(const QueryNode &node, mssql::WrittenQuery &written,
-									 optional_ptr<ClientContext> context, const vector<string> &scope) {
+									 optional_ptr<ClientContext> context, const vector<string> &scope, bool nested) {
 	string why;
 	if (node.type != QueryNodeType::SELECT_NODE || !mssql::SQLWriter::PushesMoreThanScan(node) ||
 		NamesScopeTable(const_cast<QueryNode &>(node), scope) || !WritePushdown(node, written, why, context)) {
+		return false;
+	}
+	if (nested && written.value_divergence) {
+		// A part's results feed DuckDB's own computation above it (a filter,
+		// a join): a division's NULL-for-inf or a float aggregate's last bits
+		// would change rows there, not just values (review of PR E1).
 		return false;
 	}
 	// A join of uncertain gain (PR E1). Trusted without a check inside a
@@ -2022,7 +2033,7 @@ bool MSSQLCatalog::HasPushablePart(const QueryNode &node, const vector<string> &
 		const_cast<QueryNode &>(node),
 		[&](unique_ptr<QueryNode> &slot) {
 			mssql::WrittenQuery written;
-			found = found || WritePushablePart(*slot, written, nullptr, inner) || HasPushablePart(*slot, inner);
+			found = found || WritePushablePart(*slot, written, nullptr, inner, true) || HasPushablePart(*slot, inner);
 		},
 		[](BaseTableRef &) {});
 	return found;
@@ -2038,7 +2049,7 @@ void MSSQLCatalog::PushNestedParts(ClientContext &context, QueryNode &node, cons
 		node,
 		[&](unique_ptr<QueryNode> &slot) {
 			mssql::WrittenQuery written;
-			if (WritePushablePart(*slot, written, context, inner)) {
+			if (WritePushablePart(*slot, written, context, inner, true)) {
 				slot = SelectStarFrom(VehicleFor(written));
 				return;
 			}
@@ -2049,7 +2060,7 @@ void MSSQLCatalog::PushNestedParts(ClientContext &context, QueryNode &node, cons
 
 unique_ptr<TableRef> MSSQLCatalog::RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) {
 	mssql::WrittenQuery written;
-	if (WritePushablePart(*node, written, context, {})) {
+	if (WritePushablePart(*node, written, context, {}, false)) {
 		return VehicleFor(written);
 	}
 	// The node as a whole does not go: it renders but gains nothing over the

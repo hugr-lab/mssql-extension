@@ -30,8 +30,10 @@
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -271,13 +273,73 @@ struct Relation {
 	//! The right side of a SEMI / ANTI join: sent as an EXISTS / NOT EXISTS,
 	//! its columns visible only in that join's own condition.
 	bool semi = false;
+	//! A subquery in FROM (PR E1): its node rendered as `(<T-SQL>) AS [rN]`;
+	//! its columns are that node's results, already read (a CAST, STAsBinary
+	//! or a cast back applied inside).
+	bool derived = false;
+	std::string derived_sql;
 };
+
+//! A derived table's column as the outer node sees it. A column of the inner
+//! node read as itself keeps that column's metadata -- its type, collation,
+//! comparability; a computed one (an aggregate, arithmetic) gets metadata of
+//! its type where the type maps to a T-SQL type whose values compare as
+//! DuckDB's do, else it is opaque: selectable, never compared nor ordered.
+MSSQLColumnInfo DerivedColumn(const std::string &name, const LogicalType &type) {
+	string sql_type = "derived";  // unknown to IsKnownSQLServerType: not comparable
+	int16_t length = 0;
+	uint8_t precision = 0;
+	uint8_t scale = 0;
+	switch (type.id()) {
+	case LogicalTypeId::BIGINT:
+		sql_type = "bigint", length = 8, precision = 19;
+		break;
+	case LogicalTypeId::INTEGER:
+		sql_type = "int", length = 4, precision = 10;
+		break;
+	case LogicalTypeId::SMALLINT:
+		sql_type = "smallint", length = 2, precision = 5;
+		break;
+	case LogicalTypeId::UTINYINT:
+		sql_type = "tinyint", length = 1, precision = 3;
+		break;
+	case LogicalTypeId::BOOLEAN:
+		sql_type = "bit", length = 1, precision = 1;
+		break;
+	case LogicalTypeId::DECIMAL:
+		sql_type = "decimal", length = 17, precision = DecimalType::GetWidth(type), scale = DecimalType::GetScale(type);
+		break;
+	case LogicalTypeId::DOUBLE:
+		sql_type = "float", length = 8, precision = 53;
+		break;
+	case LogicalTypeId::DATE:
+		sql_type = "date", length = 3, precision = 10;
+		break;
+	default:
+		break;
+	}
+	return MSSQLColumnInfo(name, 0, sql_type, length, precision, scale, true, "", "");
+}
 
 class NodeWriter {
 public:
 	NodeWriter(const SQLWriterOptions &options, const SQLWriter::TableResolver &resolver, WrittenQuery &out,
 			   std::string &why)
-		: options_(options), resolver_(resolver), out_(out), why_(why) {}
+		: options_(options),
+		  resolver_(resolver),
+		  out_(out),
+		  why_(why),
+		  params_(&own_params_),
+		  param_values_(&own_param_values_) {}
+	//! A nested node's writer (a derived table): the statement's parameters
+	//! are one set, numbered once, whichever node renders them.
+	NodeWriter(const NodeWriter &parent, WrittenQuery &out)
+		: options_(parent.options_),
+		  resolver_(parent.resolver_),
+		  out_(out),
+		  why_(parent.why_),
+		  params_(parent.params_),
+		  param_values_(parent.param_values_) {}
 
 	bool Write(const SelectNode &node);
 
@@ -345,6 +407,14 @@ private:
 	//! The FROM: every base table resolved (its columns appended to the flat
 	//! list), then the join tree rendered with its conditions.
 	bool CollectRelations(const TableRef &ref, std::vector<idx_t> &members);
+	bool CollectDerived(const SubqueryRef &ref, std::vector<idx_t> &members);
+	//! Read access to a written node's results, for the node around it.
+	const std::vector<OutputColumn> &Outputs() const {
+		return outputs_;
+	}
+	const MSSQLColumnInfo &FlatColumn(idx_t index) const {
+		return columns_[index];
+	}
 	bool WriteFrom(const TableRef &ref, std::string &sql);
 	//! The columns of `relation` that a `*` over the whole FROM lists: all, but
 	//! a USING column of the right side only once (on the left).
@@ -361,6 +431,14 @@ private:
 	//! The DuckDB type the catalog reports for each, parallel to columns_.
 	std::vector<LogicalType> types_;
 	std::vector<idx_t> relation_of_;
+	//! Per flat column: the type a derived table's column is cast to after the
+	//! read (an integer SUM read as decimal(38,0), HUGEINT here); INVALID else.
+	std::vector<LogicalType> cast_of_;
+	//! Per flat column: a derived table's column, already read by its node.
+	std::vector<bool> already_read_;
+	//! Per flat column: a derived table's division or floating-point
+	//! aggregate -- a value, never a condition's operand outside its node.
+	std::vector<bool> divergent_of_;
 	//! A USING column's name -> the column an unqualified reference to it
 	//! means: the left side's (USING in a RIGHT / FULL join is vetoed).
 	std::vector<std::pair<std::string, idx_t>> using_columns_;
@@ -401,17 +479,19 @@ private:
 	//! Writing an aggregate's argument.
 	bool in_aggregate_ = false;
 	bool distinct_ = false;
-	SqlParamSet params_;
-	std::vector<Value> param_values_;
+	SqlParamSet own_params_;
+	std::vector<Value> own_param_values_;
+	SqlParamSet *params_;
+	std::vector<Value> *param_values_;
 
 public:
 	//! The statement's parameters, once written.
 	void TakeParams(std::vector<WrittenParam> &out) {
-		for (size_t i = 0; i < params_.params.size(); i++) {
+		for (size_t i = 0; i < params_->params.size(); i++) {
 			WrittenParam param;
-			param.name = params_.params[i].name;
-			param.declaration = params_.params[i].declaration;
-			param.value = param_values_[i];
+			param.name = params_->params[i].name;
+			param.declaration = params_->params[i].declaration;
+			param.value = (*param_values_)[i];
 			out.push_back(std::move(param));
 		}
 	}
@@ -527,13 +607,19 @@ bool NodeWriter::CollectRelations(const TableRef &ref, std::vector<idx_t> &membe
 			columns_.push_back(columns[i]);
 			types_.push_back(relation.table.types ? (*relation.table.types)[i] : columns[i].NativeDuckDBType());
 			relation_of_.push_back(relations_.size());
+			cast_of_.push_back(LogicalType::INVALID);
+			already_read_.push_back(false);
+			divergent_of_.push_back(false);
 		}
 		members.push_back(relations_.size());
 		relations_.push_back(std::move(relation));
 		return true;
 	}
+	if (ref.type == TableReferenceType::SUBQUERY) {
+		return CollectDerived(ref.Cast<SubqueryRef>(), members);
+	}
 	if (ref.type != TableReferenceType::JOIN) {
-		return Veto("FROM holds a " + std::string(ref.type == TableReferenceType::SUBQUERY ? "subquery" : "non-table"));
+		return Veto("FROM holds a table function, VALUES or another non-table");
 	}
 	auto &join = ref.Cast<JoinRef>();
 	if (!join.alias.empty() || !join.column_name_alias.empty() || !join.duplicate_eliminated_columns.empty() ||
@@ -551,10 +637,10 @@ bool NodeWriter::CollectRelations(const TableRef &ref, std::vector<idx_t> &membe
 	if (semi && join.ref_type == JoinRefType::CROSS) {
 		return Veto("a SEMI / ANTI join without a condition");
 	}
-	if (join.right->type != TableReferenceType::BASE_TABLE) {
+	if (join.right->type != TableReferenceType::BASE_TABLE && join.right->type != TableReferenceType::SUBQUERY) {
 		// Left-deep only: `a JOIN (b JOIN c)` would need its own parentheses and
 		// the nullability of a nested outer join.
-		return Veto("a join whose right side is not a table");
+		return Veto("a join whose right side is not a table or a subquery");
 	}
 	std::vector<idx_t> left;
 	std::vector<idx_t> right;
@@ -663,7 +749,77 @@ bool NodeWriter::CoversEveryKey(const std::vector<idx_t> &columns) const {
 	return true;
 }
 
+bool NodeWriter::CollectDerived(const SubqueryRef &ref, std::vector<idx_t> &members) {
+	if (!ref.column_name_alias.empty()) {
+		return Veto("column aliases on a subquery");
+	}
+	auto &node = *ref.subquery->node;
+	if (node.type != QueryNodeType::SELECT_NODE) {
+		return Veto("a set operation in FROM");
+	}
+	bool ordered = false;
+	bool limited = false;
+	for (auto &modifier : node.modifiers) {
+		ordered = ordered || modifier->type == ResultModifierType::ORDER_MODIFIER;
+		limited = limited || modifier->type == ResultModifierType::LIMIT_MODIFIER;
+	}
+	if (ordered && !limited) {
+		// T-SQL refuses an ORDER BY in a derived table without TOP / OFFSET
+		// (1033); DuckDB promises no order there either.
+		return Veto("an ORDER BY without LIMIT in a subquery");
+	}
+	WrittenQuery inner_out;
+	NodeWriter inner(*this, inner_out);
+	if (!inner.Write(node.Cast<SelectNode>())) {
+		return false;
+	}
+	Relation relation;
+	relation.derived = true;
+	relation.derived_sql = inner_out.statement;
+	relation.name = ref.alias.empty() ? "unnamed_subquery" : ref.alias.GetIdentifierName();
+	relation.table.name = relation.name;
+	relation.table.size_known = false;
+	for (auto &other : relations_) {
+		if (StringUtil::CIEquals(other.name, relation.name)) {
+			return Veto("two tables named " + relation.name);
+		}
+	}
+	auto &outputs = inner.Outputs();
+	for (idx_t i = 0; i < outputs.size(); i++) {
+		auto &output = outputs[i];
+		if (output.column_index != DConstants::INVALID_INDEX && output.plain_read) {
+			auto column = inner.FlatColumn(output.column_index);
+			column.name = output.name;
+			columns_.push_back(std::move(column));
+		} else {
+			// The operand type the server's value has (an integer SUM is
+			// decimal(38,0) there); computed values of unknown type are opaque.
+			// So is a division or a floating-point aggregate: its divergence
+			// (NULL for inf, the last bits) is recorded for a VALUE only, and
+			// outside its node it would be compared, ordered, grouped or
+			// COALESCEd as a plain float (review of E1: rows differed).
+			const bool opaque =
+				output.column_index != DConstants::INVALID_INDEX || output.value.division || output.value.approximate;
+			columns_.push_back(DerivedColumn(output.name, opaque ? LogicalType::INVALID : output.value.type));
+		}
+		types_.push_back(inner_out.column_types[i]);
+		cast_of_.push_back(inner_out.cast_types[i]);
+		already_read_.push_back(true);
+		divergent_of_.push_back(output.column_index == DConstants::INVALID_INDEX &&
+								(output.value.division || output.value.approximate));
+		relation_of_.push_back(relations_.size());
+	}
+	members.push_back(relations_.size());
+	relations_.push_back(std::move(relation));
+	return true;
+}
+
 bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
+	if (ref.type == TableReferenceType::SUBQUERY) {
+		auto &relation = relations_[visible_++];
+		sql = "(" + relation.derived_sql + ") AS " + relation.sql;
+		return true;
+	}
 	if (ref.type == TableReferenceType::BASE_TABLE) {
 		// The relations were collected in this same order.
 		auto &relation = relations_[visible_++];
@@ -910,6 +1066,12 @@ bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind
 		// skips: not the recorded divergence of a value any more.
 		return Veto("a division under an aggregate");
 	}
+	if (arg.cast_result) {
+		// A value whose DuckDB type is not the wire's (a derived table's integer
+		// SUM: HUGEINT here, decimal(38,0) there) would aggregate into the
+		// server's type.
+		return Veto("an aggregate over a value cast back after the read");
+	}
 	const std::string distinct = fn.Distinct() ? "DISTINCT " : "";
 	if (kind == AggregateKind::Count) {
 		if (fn.Distinct() && (arg.column ? !IsGroupable(*arg.column) : arg.kind == ComparableKind::None)) {
@@ -1015,20 +1177,27 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 		if (!list.empty()) {
 			list += ", ";
 		}
-		const auto read =
-			MSSQLColumnInfo::BuildReadExpression(column.name, column.sql_type_name, column.max_length,
-												 column.collation_name, options_.convert_varchar_max, "", "");
 		const auto &relation = relations_[relation_of_[index]];
-		list += MSSQLColumnInfo::BuildReadExpression(column.name, column.sql_type_name, column.max_length,
-													 column.collation_name, options_.convert_varchar_max,
-													 relation.sql.empty() ? "" : relation.sql + ".", alias);
 		OutputColumn entry;
 		entry.name = output;
 		entry.column_index = index;
-		entry.plain_read = read == QuoteIdentifier(column.name);
+		if (already_read_[index]) {
+			// A derived table's column: its node read it already.
+			list += ColumnSql(index) + " AS " + QuoteIdentifier(output);
+			entry.plain_read = true;
+		} else {
+			const auto read =
+				MSSQLColumnInfo::BuildReadExpression(column.name, column.sql_type_name, column.max_length,
+													 column.collation_name, options_.convert_varchar_max, "", "");
+			list += MSSQLColumnInfo::BuildReadExpression(column.name, column.sql_type_name, column.max_length,
+														 column.collation_name, options_.convert_varchar_max,
+														 relation.sql.empty() ? "" : relation.sql + ".", alias);
+			entry.plain_read = read == QuoteIdentifier(column.name);
+		}
 		outputs_.push_back(std::move(entry));
-		out_.column_types.push_back(types_[index]);
-		out_.cast_types.push_back(LogicalType::INVALID);
+		const bool cast_back = cast_of_[index].id() != LogicalTypeId::INVALID;
+		out_.column_types.push_back(cast_back ? LogicalType::INVALID : types_[index]);
+		out_.cast_types.push_back(cast_of_[index]);
 		out_.column_names.push_back(output);
 		return true;
 	};
@@ -1223,11 +1392,11 @@ std::string NodeWriter::Parameter(const MSSQLColumnInfo *column, const Value &va
 	// already cast to the expression's type -- or a literal. The vehicle
 	// carries each parameter's VALUE (mssql_scan_params renders its own
 	// literal), kept beside the set.
-	const size_t before = params_.params.size();
+	const size_t before = params_->params.size();
 	std::string sql =
-		ExpressionVocabulary::Constant(value, value.type(), options_.parameterize ? &params_ : nullptr, column);
-	if (params_.params.size() > before) {
-		param_values_.push_back(value);
+		ExpressionVocabulary::Constant(value, value.type(), options_.parameterize ? params_ : nullptr, column);
+	if (params_->params.size() > before) {
+		param_values_->push_back(value);
 	}
 	return sql;
 }
@@ -1249,7 +1418,7 @@ bool NodeWriter::BindConstant(const Operand &peer, Operand &constant, bool arith
 	if (value.IsNull()) {
 		return Veto("a NULL constant");
 	}
-	const size_t before = params_.params.size();
+	const size_t before = params_->params.size();
 	constant.sql = Parameter(peer.column, value);
 	if (arithmetic && peer.kind == ComparableKind::String) {
 		// A string constant in a VALUE (a CASE / COALESCE branch) types the
@@ -1262,10 +1431,10 @@ bool NodeWriter::BindConstant(const Operand &peer, Operand &constant, bool arith
 		if (own.empty() || ExpressionVocabulary::DeclarationForColumn(*peer.column, value, value.type()) != own) {
 			return Veto("a string constant that does not fit " + peer_name);
 		}
-		if (params_.params.size() == before) {
+		if (params_->params.size() == before) {
 			constant.sql = ExpressionVocabulary::Cast(constant.sql, own);
 		}
-	} else if (arithmetic && params_.params.size() == before) {
+	} else if (arithmetic && params_->params.size() == before) {
 		// A literal's type is the server's own reading of it -- `1` an int,
 		// `3000000000` a numeric(10,0) -- so `tiny + 1` would widen there where
 		// DuckDB keeps UTINYINT and overflows at 255, and `big + 3000000000`
@@ -1296,11 +1465,19 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 		if (!CheckGrouped(index)) {
 			return false;
 		}
+		if (divergent_of_[index] && predicate_depth_ > 0) {
+			// NULL there where DuckDB says inf (or the last bits differ): a
+			// condition on it would pick other rows (review of PR E1).
+			return Veto("a derived division / floating-point aggregate in a condition");
+		}
 		const auto &column = columns_[index];
 		out.sql = ColumnSql(index);
 		out.type = column.duckdb_type;
 		out.kind = KindOf(column);
 		out.column = &column;
+		// A derived table's integer SUM: decimal(38,0) on the wire, HUGEINT here.
+		out.result_type = cast_of_[index].id() != LogicalTypeId::INVALID ? cast_of_[index] : LogicalType::INVALID;
+		out.cast_result = cast_of_[index].id() != LogicalTypeId::INVALID;
 		return true;
 	}
 	case ExpressionClass::CONSTANT:
@@ -2086,8 +2263,13 @@ bool NodeWriter::Write(const SelectNode &node) {
 	if (!CollectRelations(*node.from_table, members)) {
 		return false;
 	}
-	if (relations_.size() > 1) {
-		// A join: every relation under its own alias, every column qualified.
+	bool any_derived = false;
+	for (auto &relation : relations_) {
+		any_derived = any_derived || relation.derived;
+	}
+	if (relations_.size() > 1 || any_derived) {
+		// A join, or a derived table (which T-SQL requires an alias for): every
+		// relation under its own alias, every column qualified.
 		for (idx_t r = 0; r < relations_.size(); r++) {
 			relations_[r].sql = "[r" + std::to_string(r + 1) + "]";
 		}
@@ -2246,6 +2428,10 @@ bool NodeWriter::Write(const SelectNode &node) {
 		reduces = reduces || !CoversEveryKey(selected);
 	}
 	out_.gain_uncertain = unbounded_links_ > 0 && !reduces;
+	for (auto &output : outputs_) {
+		out_.value_divergence = out_.value_divergence || (output.column_index == DConstants::INVALID_INDEX &&
+														  (output.value.division || output.value.approximate));
+	}
 	for (auto &relation : relations_) {
 		if (relation.semi) {
 			continue;
@@ -2310,6 +2496,20 @@ bool SQLWriter::PushesMoreThanScan(const QueryNode &node) {
 		return false;
 	}
 	auto &select = node.Cast<SelectNode>();
+	// A subquery in FROM that gains (its aggregate, its TOP) gains for the
+	// node around it too: pushed whole, rather than handed back with the part.
+	std::function<bool(const TableRef &)> from_gains = [&](const TableRef &ref) -> bool {
+		if (ref.type == TableReferenceType::SUBQUERY) {
+			return PushesMoreThanScan(*ref.Cast<SubqueryRef>().subquery->node);
+		}
+		if (ref.type == TableReferenceType::JOIN) {
+			return from_gains(*ref.Cast<JoinRef>().left) || from_gains(*ref.Cast<JoinRef>().right);
+		}
+		return false;
+	};
+	if (select.from_table && from_gains(*select.from_table)) {
+		return true;
+	}
 	// A join with conditions: the server matches the rows, where the scans
 	// would each send their whole (filtered) table. A CROSS JOIN anywhere in
 	// the chain -- a comma join included -- can send the product, more rather
