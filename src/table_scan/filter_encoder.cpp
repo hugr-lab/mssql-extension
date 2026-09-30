@@ -6,16 +6,10 @@
 // will be added in subsequent phases.
 
 #include "table_scan/filter_encoder.hpp"
-#include <algorithm>
-#include <cctype>
 #include <cstdlib>
-#include "catalog/mssql_code_page.hpp"
 #include "catalog/mssql_column_info.hpp"
-#include "codec/literal_format.hpp"
-#include "codec/string_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/common/types/decimal.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -29,6 +23,7 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
+#include "pushdown/mssql_expression_vocabulary.hpp"
 #include "query/mssql_identifier.hpp"
 #include "query/mssql_sql_params.hpp"
 #include "table_scan/function_mapping.hpp"
@@ -53,75 +48,6 @@ namespace duckdb {
 namespace mssql {
 
 namespace {
-// A naive (timezone-less) date+time logical type. SQL Server stores all of
-// these as DATETIME2; DuckDB models DATETIME2 as TIMESTAMP_NS and reaches a
-// coarser-precision overload (e.g. year() takes TIMESTAMP) through an implicit
-// cast that only changes sub-second precision. DATE, TIME and TIMESTAMP_TZ are
-// deliberately NOT here: a cast to/from one of them CHANGES THE VALUE (drops the
-// time, drops the date, shifts by an offset), so it is never a free view.
-bool IsNaiveTimestampType(LogicalTypeId id) {
-	switch (id) {
-	case LogicalTypeId::TIMESTAMP_SEC:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_NS:
-		return true;
-	default:
-		return false;
-	}
-}
-
-// A date-part extraction function: its result is invariant to the sub-second
-// precision an IsNaiveTimestampType->IsNaiveTimestampType cast changes, so
-// stripping that cast over the column argument and letting SQL Server apply the
-// extraction to the column's own DATETIME2 type is exact. This is the ONLY place
-// a temporal cast is stripped (spec 070 W1): in a comparison the same cast would
-// change which rows match (dt::DATE truncates the time; dt::TIME drops the date),
-// so a comparison operand keeps its cast and, being unencodable, falls to the
-// client filter net — correct rather than fast.
-bool IsDatePartFunction(const std::string &name) {
-	// Exactly the date-part extractors that ARE in FunctionMapping — the cast
-	// strip only runs after GetFunctionMapping succeeds, so listing a function
-	// that does not map would read as if it pushes when it never reaches here.
-	// Add a name here only when its mapping is added too (PR #269 review).
-	return name == "year" || name == "month" || name == "day" || name == "hour" || name == "minute" || name == "second";
-}
-
-// T-SQL's modulo operator accepts only exact INTEGER operands. `[d] % 2` on a
-// FLOAT column fails with "Operand data type float is invalid for modulo
-// operator" (8117), and because an encoded predicate is ERASED from the DuckDB
-// plan the whole query fails instead of falling to the client filter net.
-//
-// So the gate is a whitelist, not a float blacklist (job 1113). The first
-// version excluded FLOAT/DOUBLE and let everything else through on the reasoning
-// that "integer and decimal behave identically on both sides" — but the encoder
-// sees only the DUCKDB type, and `money` / `smallmoney` reach it as
-// DECIMAL(19,4) / DECIMAL(10,4) (mssql_column_info.cpp). T-SQL rejects `money`
-// for `%` with the same 8117, so a DECIMAL allowance re-opens the bug for any
-// money column, invisibly — the source type is not recoverable here.
-//
-// Cost of the whitelist: `decimal_col % 2` no longer pushes and runs in the
-// client net. That is the project's usual trade — correct by construction over
-// fast — and it is the only form available without threading the SQL Server type
-// name into the encode context.
-bool IsExactIntegerForModulo(LogicalTypeId id) {
-	switch (id) {
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::HUGEINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::UHUGEINT:
-		return true;
-	default:
-		return false;
-	}
-}
-
 // Does this expression already encode to a T-SQL search condition (a predicate
 // valid after WHERE), as opposed to a bit-valued expression? A BOOLEAN column,
 // constant or cast is a VALUE — `WHERE [b]` is a syntax error (SQL Server 4145),
@@ -178,50 +104,11 @@ static ExpressionEncodeResult EncodeValueExpression(const Expression &expr, cons
 //------------------------------------------------------------------------------
 
 std::string FilterEncoder::EscapeLikePattern(const std::string &pattern) {
-	std::string result;
-	result.reserve(pattern.size() + 10);
-	for (char c : pattern) {
-		switch (c) {
-		case '%':
-			result += "[%]";
-			break;
-		case '_':
-			result += "[_]";
-			break;
-		case '[':
-			result += "[[]";
-			break;
-		default:
-			result += c;
-			break;
-		}
-	}
-	return result;
+	return ExpressionVocabulary::EscapeLikePattern(pattern);
 }
 
 bool FilterEncoder::GetComparisonOperator(ExpressionType type, std::string &out_operator) {
-	switch (type) {
-	case ExpressionType::COMPARE_EQUAL:
-		out_operator = " = ";
-		return true;
-	case ExpressionType::COMPARE_NOTEQUAL:
-		out_operator = " <> ";
-		return true;
-	case ExpressionType::COMPARE_LESSTHAN:
-		out_operator = " < ";
-		return true;
-	case ExpressionType::COMPARE_GREATERTHAN:
-		out_operator = " > ";
-		return true;
-	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-		out_operator = " <= ";
-		return true;
-	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-		out_operator = " >= ";
-		return true;
-	default:
-		return false;
-	}
+	return ExpressionVocabulary::ComparisonOperator(type, out_operator);
 }
 
 bool FilterEncoder::GetArithmeticOperator(ExpressionType type, std::string &out_operator) {
@@ -234,278 +121,30 @@ bool FilterEncoder::GetArithmeticOperator(ExpressionType type, std::string &out_
 }
 
 std::string FilterEncoder::ValueToSQLLiteral(const Value &value, const LogicalType &type) {
-	// All supported families route through the canonical codec dispatcher
-	// (handles NULL + 9-arm family switch internally). Unsupported types
-	// throw NotImplementedException; fall back to a string-escaped form so
-	// filter pushdown still produces *something* valid for the SQL Server side
-	// (filter is then compared as text rather than rejected outright).
-	try {
-		return codec::FormatSqlLiteral(value, type, codec::LiteralContext::Filter);
-	} catch (const NotImplementedException &) {
-		if (value.IsNull()) {
-			return "NULL";
-		}
-		return "N'" + codec::string::EscapeSqlSingleQuotes(value.ToString()) + "'";
-	}
+	return ExpressionVocabulary::ValueToSQLLiteral(value, type);
 }
 
 //------------------------------------------------------------------------------
 // Spec 076: constants as parameters, declared from the column
 //------------------------------------------------------------------------------
 
-namespace {
-
-// Items ONE IN / NOT IN operator expression may carry to the server; a longer
-// list is evaluated by DuckDB (see EncodeOperatorExpression). The cap is per
-// predicate on purpose: with parameterisation on, the statement's budget is
-// SqlParamSet::MAX_PARAMS (constants past it become literals), and with it
-// off a batch of several capped lists is still bounded by their number.
-constexpr size_t MAX_PUSHED_IN_ITEMS = 256;
-
-// UTF-16 code units of a UTF-8 string: one per lead byte, two for a 4-byte
-// sequence (a surrogate pair). This is nvarchar's unit.
-size_t Utf16Units(const std::string &text) {
-	size_t units = 0;
-	for (unsigned char c : text) {
-		if ((c & 0xC0) != 0x80) {
-			units += (c >= 0xF0) ? 2 : 1;
-		}
-	}
-	return units;
-}
-
-// Width rank of the integer family, so a parameter is never narrower than
-// the column OR the constant: bit < tinyint < smallint < int < bigint <
-// decimal(20,0) < decimal(38,0). -1 = not an integer type.
-int IntegerRankOfColumn(const std::string &sql_type) {
-	if (sql_type == "bit") {
-		return 0;
-	}
-	if (sql_type == "tinyint") {
-		return 1;
-	}
-	if (sql_type == "smallint") {
-		return 2;
-	}
-	if (sql_type == "int") {
-		return 3;
-	}
-	if (sql_type == "bigint") {
-		return 4;
-	}
-	return -1;
-}
-
-int IntegerRankOfValue(const LogicalType &type) {
-	switch (type.id()) {
-	case LogicalTypeId::BOOLEAN:
-		return 0;
-	case LogicalTypeId::UTINYINT:
-		return 1;
-	case LogicalTypeId::TINYINT:  // signed: SQL Server's tinyint is not
-	case LogicalTypeId::SMALLINT:
-		return 2;
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::INTEGER:
-		return 3;
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::BIGINT:
-		return 4;
-	case LogicalTypeId::UBIGINT:
-		return 5;
-	case LogicalTypeId::HUGEINT:
-	case LogicalTypeId::UHUGEINT:
-		return 6;
-	default:
-		return -1;
-	}
-}
-
-const char *IntegerNameOfRank(int rank) {
-	static const char *names[] = {"bit", "tinyint", "smallint", "int", "bigint", "decimal(20,0)", "decimal(38,0)"};
-	return names[rank];
-}
-
-// Fractional-second digits a DuckDB temporal constant carries.
-int TemporalScaleOfValue(const LogicalType &type) {
-	switch (type.id()) {
-	case LogicalTypeId::TIMESTAMP_SEC:
-		return 0;
-	case LogicalTypeId::TIMESTAMP_MS:
-		return 3;
-	case LogicalTypeId::TIMESTAMP_NS:
-		return 7;
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_TZ:
-	case LogicalTypeId::TIME:
-	case LogicalTypeId::TIME_TZ:
-		return 6;
-	default:
-		return -1;
-	}
-}
-
-// The constant's own declaration (spec 075 W5's table), or empty for a type
-// it refuses; the constant then stays a literal.
-std::string DeclarationOfValueOrEmpty(const Value &value, const LogicalType &type) {
-	try {
-		return mssql::DeclarationForValue("p", type, value);
-	} catch (const std::exception &) {
-		return "";
-	}
-}
-
-}  // namespace
-
 std::string FilterEncoder::DeclarationForColumn(const MSSQLColumnInfo &column, const Value &value,
 												const LogicalType &type) {
-	if (column.is_cast_required || column.is_geometry) {
-		return "";
-	}
-	const std::string t = StringUtil::Lower(column.sql_type_name);
-	const int col_rank = IntegerRankOfColumn(t);
-	if (col_rank >= 0) {
-		const int value_rank = IntegerRankOfValue(type);
-		if (value_rank < 0) {
-			// A DECIMAL or DOUBLE constant against an integer column: DuckDB
-			// compared in the constant's type, so declare it that way.
-			return DeclarationOfValueOrEmpty(value, type);
-		}
-		if (value_rank == 6) {
-			// HUGEINT / UHUGEINT: decimal(38,0) holds +/-(10^38 - 1) and the
-			// constant may not fit. DeclarationForValue applies the shared range
-			// check and names the parameter; the server's bare "Arithmetic
-			// overflow" is what this replaces (review of #345).
-			return mssql::DeclarationForValue("p", type, value);
-		}
-		return IntegerNameOfRank(col_rank > value_rank ? col_rank : value_rank);
-	}
-	if (t == "decimal" || t == "numeric") {
-		if (type.id() != LogicalTypeId::DECIMAL) {
-			return DeclarationOfValueOrEmpty(value, type);
-		}
-		// Never narrower than either side in BOTH dimensions: the wider scale,
-		// and enough precision for the wider INTEGER part on top of it. Taking
-		// the two maxima independently lost integer digits -- decimal(10,8)
-		// against a DECIMAL(11,1) constant gave decimal(11,8), three digits for
-		// a constant that needs ten (review of #345).
-		const int col_int = column.precision - column.scale;
-		const int val_int = DecimalType::GetWidth(type) - DecimalType::GetScale(type);
-		const int scale = column.scale > DecimalType::GetScale(type) ? column.scale : DecimalType::GetScale(type);
-		int precision = (col_int > val_int ? col_int : val_int) + scale;
-		if (precision > 38) {
-			precision = 38;
-		}
-		return "decimal(" + std::to_string(precision) + "," + std::to_string(scale) + ")";
-	}
-	if (t == "money" || t == "smallmoney") {
-		return type.id() == LogicalTypeId::DECIMAL ? t : DeclarationOfValueOrEmpty(value, type);
-	}
-	if (t == "float" || t == "real") {
-		// Value-driven: declaring a DOUBLE constant as real would round it and
-		// turn a DuckDB "not equal" into an "equal".
-		return DeclarationOfValueOrEmpty(value, type);
-	}
-	if (t == "text") {
-		if (type.id() != LogicalTypeId::VARCHAR) {
-			return DeclarationOfValueOrEmpty(value, type);
-		}
-		// The same two-page rule as varchar below: a text column cannot carry a
-		// UTF-8 collation, so a constant the database's page cannot hold went
-		// as '?' in a varchar(max) parameter and `LIKE 'ы%'` matched '?…' rows.
-		const std::string &text = StringValue::Get(value);
-		const bool fits = mssql::CodePageCanEncode(column.code_page, text) &&
-						  mssql::CodePageCanEncode(column.database_code_page, text);
-		return fits ? "varchar(max)" : "nvarchar(max)";
-	}
-	if (t == "ntext") {
-		return type.id() == LogicalTypeId::VARCHAR ? "nvarchar(max)" : DeclarationOfValueOrEmpty(value, type);
-	}
-	if (t == "char" || t == "varchar" || t == "nchar" || t == "nvarchar" || t == "sysname") {
-		if (type.id() != LogicalTypeId::VARCHAR) {
-			return DeclarationOfValueOrEmpty(value, type);
-		}
-		const std::string &text = StringValue::Get(value);
-		// varchar keeps the column's kind -- that is what keeps an index on it
-		// seekable: on a SQL_ collation an nvarchar parameter puts a
-		// CONVERT_IMPLICIT on the column and the seek becomes a scan (#361).
-		// A varchar VARIABLE takes the DATABASE's code page and the comparison
-		// converts it to the COLUMN's, so a non-ASCII constant may go as
-		// varchar only when both pages can hold every character of it;
-		// otherwise nvarchar, as the N'...' literal always did -- which is how
-		// `@p varchar(max) = N'ы...'` against a UTF-8 column on a 1252 database
-		// stopped arriving as '?' (annotated_max_string.test, #321).
-		const bool unicode = column.is_unicode || !(mssql::CodePageCanEncode(column.code_page, text) &&
-													mssql::CodePageCanEncode(column.database_code_page, text));
-		if (unicode) {
-			// max_length is bytes; nvarchar counts UTF-16 units.
-			size_t k = column.max_length < 0 ? 0 : static_cast<size_t>(column.max_length) / (column.is_unicode ? 2 : 1);
-			const size_t units = Utf16Units(text);
-			if (units > k) {
-				k = units;
-			}
-			if (column.max_length < 0 || k > 4000) {
-				return "nvarchar(max)";
-			}
-			return "nvarchar(" + std::to_string(k == 0 ? 1 : k) + ")";
-		}
-		size_t k = column.max_length < 0 ? 0 : static_cast<size_t>(column.max_length);
-		if (text.size() > k) {
-			k = text.size();
-		}
-		if (column.max_length < 0 || k > 8000) {
-			return "varchar(max)";
-		}
-		return "varchar(" + std::to_string(k == 0 ? 1 : k) + ")";
-	}
-	if (t == "date") {
-		return type.id() == LogicalTypeId::DATE ? "date" : DeclarationOfValueOrEmpty(value, type);
-	}
-	if (t == "time" || t == "datetime2" || t == "datetimeoffset") {
-		const int value_scale = TemporalScaleOfValue(type);
-		if (value_scale < 0) {
-			return DeclarationOfValueOrEmpty(value, type);
-		}
-		const int scale = column.scale > value_scale ? column.scale : value_scale;
-		return t + "(" + std::to_string(scale) + ")";
-	}
-	if (t == "datetime" || t == "smalldatetime") {
-		// Value-driven, as the literal form (a CAST to datetime2) always was.
-		return DeclarationOfValueOrEmpty(value, type);
-	}
-	if (t == "uniqueidentifier") {
-		return type.id() == LogicalTypeId::UUID ? "uniqueidentifier" : DeclarationOfValueOrEmpty(value, type);
-	}
-	if (t == "binary" || t == "varbinary" || t == "image" || t == "timestamp" || t == "rowversion") {
-		if (type.id() != LogicalTypeId::BLOB) {
-			return DeclarationOfValueOrEmpty(value, type);
-		}
-		size_t k = (t == "image" || column.max_length < 0) ? 0 : static_cast<size_t>(column.max_length);
-		const size_t bytes = StringValue::Get(value).size();
-		if (bytes > k) {
-			k = bytes;
-		}
-		if (t == "image" || column.max_length < 0 || k > 8000) {
-			return "varbinary(max)";
-		}
-		return "varbinary(" + std::to_string(k == 0 ? 1 : k) + ")";
-	}
-	return "";
+	return ExpressionVocabulary::DeclarationForColumn(column, value, type);
 }
 
 std::string FilterEncoder::EncodeConstantValue(const Value &value, const LogicalType &type,
 											   const ExpressionEncodeContext &ctx, const MSSQLColumnInfo *peer) {
-	std::string literal = ValueToSQLLiteral(value, type);
-	if (!ctx.params || value.IsNull() || ctx.params->params.size() >= mssql::SqlParamSet::MAX_PARAMS) {
-		return literal;
+	const size_t before = ctx.params ? ctx.params->params.size() : 0;
+	std::string sql = ExpressionVocabulary::Constant(value, type, ctx.params, peer);
+	if (ctx.params && ctx.params->params.size() > before) {
+		const auto &param = ctx.params->params.back();
+		MSSQL_FILTER_DEBUG_LOG(2, "EncodeConstantValue: @%s %s = %s", param.name.c_str(), param.declaration.c_str(),
+							   param.literal.c_str());
+	} else {
+		MSSQL_FILTER_DEBUG_LOG(2, "EncodeConstantValue: literal %s", sql.c_str());
 	}
-	std::string declaration = peer ? DeclarationForColumn(*peer, value, type) : DeclarationOfValueOrEmpty(value, type);
-	if (declaration.empty()) {
-		return literal;
-	}
-	std::string name = ctx.params->Add(declaration, literal);
-	MSSQL_FILTER_DEBUG_LOG(2, "EncodeConstantValue: @%s %s = %s", name.c_str(), declaration.c_str(), literal.c_str());
-	return "@" + name;
+	return sql;
 }
 
 // The SQL Server column an expression IS, when it is a plain reference to
@@ -783,19 +422,7 @@ ExpressionEncodeResult FilterEncoder::EncodeConjunctionAnd(const LegacyConjuncti
 		return {"", false};
 	}
 
-	if (conditions.size() == 1) {
-		return {conditions[0], all_supported};
-	}
-
-	std::string sql = "(";
-	for (idx_t i = 0; i < conditions.size(); i++) {
-		if (i > 0) {
-			sql += " AND ";
-		}
-		sql += conditions[i];
-	}
-	sql += ")";
-	return {sql, all_supported};
+	return {ExpressionVocabulary::Conjunction(conditions, true), all_supported};
 }
 
 ExpressionEncodeResult FilterEncoder::EncodeConjunctionOr(const LegacyConjunctionOrFilter &filter,
@@ -818,19 +445,7 @@ ExpressionEncodeResult FilterEncoder::EncodeConjunctionOr(const LegacyConjunctio
 		conditions.push_back(result.sql);
 	}
 
-	if (conditions.size() == 1) {
-		return {conditions[0], true};
-	}
-
-	std::string sql = "(";
-	for (idx_t i = 0; i < conditions.size(); i++) {
-		if (i > 0) {
-			sql += " OR ";
-		}
-		sql += conditions[i];
-	}
-	sql += ")";
-	return {sql, true};
+	return {ExpressionVocabulary::Conjunction(conditions, false), true};
 }
 
 ExpressionEncodeResult FilterEncoder::EncodeExpressionFilter(const ExpressionFilter &filter,
@@ -851,9 +466,12 @@ ExpressionEncodeResult FilterEncoder::EncodeSearchCondition(const Expression &ex
 	// already encode AS a condition (comparison/conjunction/BETWEEN/IN/IS NULL/
 	// NOT/LIKE) are left alone. Boolean operands elsewhere (bit = bit) go through
 	// EncodeExpression, never here, so they keep their bare form.
-	if (result.supported && !result.sql.empty() && expr.GetReturnType().id() == LogicalTypeId::BOOLEAN &&
-		!EncodesAsSearchCondition(expr)) {
-		result.sql = "(" + result.sql + " = 1)";
+	if (result.supported) {
+		SqlOperand operand;
+		operand.sql = result.sql;
+		operand.is_condition = EncodesAsSearchCondition(expr);
+		operand.type = expr.GetReturnType();
+		result.sql = ExpressionVocabulary::AsCondition(operand);
 	}
 	return result;
 }
@@ -921,9 +539,7 @@ ExpressionEncodeResult FilterEncoder::EncodeExpressionImpl(const Expression &exp
 			// unpushed.
 			const auto &target_type = BoundCastExpression::TargetType(func_expr);
 			const auto &cast_child = BoundCastExpression::Child(func_expr);
-			const auto target_id = target_type.id();
-			const auto source_id = cast_child.GetReturnType().id();
-			if (target_id == LogicalTypeId::VARCHAR && source_id == LogicalTypeId::VARCHAR) {
+			if (ExpressionVocabulary::IsTransparentCast(cast_child.GetReturnType(), target_type)) {
 				return EncodeExpression(cast_child, ctx);
 			}
 			// A temporal cast is NOT stripped here. It is a free view only when the
@@ -970,7 +586,7 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeFunctionExpression: function=%s, args=%zu", func_name.c_str(),
 						   expr.GetChildren().size());
 
-	// Check for LIKE pattern functions (prefix, suffix, contains, iprefix, isuffix, icontains)
+	// Check for LIKE pattern functions (prefix, suffix, contains)
 	if (IsLikePatternFunction(func_name)) {
 		if (expr.GetChildren().size() >= 2) {
 			return EncodeLikePattern(func_name, *expr.GetChildren()[0], *expr.GetChildren()[1], ctx);
@@ -980,66 +596,35 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 		return {"", false};
 	}
 
-	// Check for supported functions in the mapping table
-	const FunctionMapping *mapping = GetFunctionMapping(func_name);
+	std::vector<LogicalType> arg_types;
+	for (const auto &child : expr.GetChildren()) {
+		arg_types.push_back(child->GetReturnType());
+	}
+	std::string why;
+	const FunctionMapping *mapping =
+		ExpressionVocabulary::FunctionFor(func_name, arg_types, why, ctx.division_by_zero_errors);
 	if (!mapping) {
-		MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: function %s not supported", func_name.c_str());
-		return {"", false};
-	}
-
-	// Modulo: push only for exact integer operands. T-SQL's `%` rejects float,
-	// real AND money (8117), and money is indistinguishable from decimal here.
-	if (func_name == "%") {
-		for (const auto &child : expr.GetChildren()) {
-			if (!IsExactIntegerForModulo(child->GetReturnType().id())) {
-				MSSQL_FILTER_DEBUG_LOG(
-					1, "EncodeFunctionExpression: %% on %s not pushed (T-SQL modulo takes exact integers only)",
-					child->GetReturnType().ToString().c_str());
-				return {"", false};
-			}
-		}
-	}
-
-	// Validate argument count
-	if (mapping->expected_args != static_cast<int>(expr.GetChildren().size())) {
-		MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: %s expects %d args, got %zu", func_name.c_str(),
-							   mapping->expected_args, expr.GetChildren().size());
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: %s", why.c_str());
 		return {"", false};
 	}
 
 	// Encode all arguments
 	auto child_ctx = ctx.child();
-	const bool datepart = IsDatePartFunction(func_name);
-	// A date part of a datetimeoffset is taken in the value's own offset by the
-	// server and in the session TimeZone by DuckDB (measured: HOUR of 12:00
-	// +05:00 is 12 there, 7 in UTC here), so a pushed `hour(dto) = 12` would
-	// match other rows than DuckDB's (review of #387).
-	if (datepart) {
-		for (const auto &child : expr.GetChildren()) {
-			if (child->GetReturnType().id() == LogicalTypeId::TIMESTAMP_TZ) {
-				MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: %s of a TIMESTAMP WITH TIME ZONE not pushed",
-									   func_name.c_str());
-				return {"", false};
-			}
-		}
-	}
+	const bool datepart = ExpressionVocabulary::IsDatePartFunction(func_name);
 	std::vector<std::string> encoded_args;
 	for (const auto &child : expr.GetChildren()) {
 		const Expression *arg = child.get();
 		// Spec 070 W1: strip the implicit precision cast DuckDB puts over a
-		// DATETIME2 column when a date-part function takes it. DATETIME2 is
-		// TIMESTAMP_NS to DuckDB; year()/hour()/... take TIMESTAMP, so an
-		// implicit TIMESTAMP_NS->TIMESTAMP cast wraps the column. SQL Server's
-		// YEAR([col]) applies to the column's own DATETIME2 and the extraction is
-		// invariant to the sub-second precision the cast changed, so encoding the
-		// cast's child directly is exact. Restricted to naive-timestamp->
-		// naive-timestamp: a DATE/TIME/TZ cast here changes the value and must not
-		// be stripped.
+		// DATETIME2 column when a date-part function takes it (year() takes
+		// TIMESTAMP, the column is TIMESTAMP_NS). SQL Server's YEAR([col])
+		// applies to the column's own DATETIME2 and the extraction is invariant
+		// to the sub-second precision the cast changed, so encoding the cast's
+		// child directly is exact. The ONLY place a temporal cast is stripped.
 		if (datepart && BoundCastExpression::IsCast(*arg)) {
 			const auto &cast_fn = arg->Cast<BoundFunctionExpression>();
 			const auto &cast_child = BoundCastExpression::Child(cast_fn);
-			if (IsNaiveTimestampType(BoundCastExpression::TargetType(cast_fn).id()) &&
-				IsNaiveTimestampType(cast_child.GetReturnType().id())) {
+			if (ExpressionVocabulary::IsNaiveTimestampCast(cast_child.GetReturnType(),
+														   BoundCastExpression::TargetType(cast_fn))) {
 				arg = &cast_child;
 			}
 		}
@@ -1051,17 +636,7 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 		encoded_args.push_back(result.sql);
 	}
 
-	// Apply the template
-	std::string sql = mapping->sql_template;
-	for (size_t i = 0; i < encoded_args.size(); i++) {
-		std::string placeholder = "{" + std::to_string(i) + "}";
-		size_t pos = 0;
-		while ((pos = sql.find(placeholder, pos)) != std::string::npos) {
-			sql.replace(pos, placeholder.length(), encoded_args[i]);
-			pos += encoded_args[i].length();
-		}
-	}
-
+	std::string sql = ExpressionVocabulary::ApplyFunction(*mapping, encoded_args);
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeFunctionExpression: encoded %s -> %s", func_name.c_str(), sql.c_str());
 	return {sql, true};
 }
@@ -1113,7 +688,7 @@ ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundFunc
 		return {"", false};
 	}
 
-	std::string sql = "(" + left_result.sql + op + right_result.sql + ")";
+	std::string sql = ExpressionVocabulary::Comparison(op, left_result.sql, right_result.sql);
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeComparisonExpression: encoded -> %s", sql.c_str());
 	return {sql, true};
 }
@@ -1135,7 +710,7 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 		if (!child_result.supported) {
 			return {"", false};
 		}
-		return {"(NOT " + child_result.sql + ")", true};
+		return {ExpressionVocabulary::Not(child_result.sql), true};
 	}
 
 	// Handle IS NULL / IS NOT NULL operators
@@ -1148,7 +723,7 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 		if (!child_result.supported) {
 			return {"", false};
 		}
-		return {"(" + child_result.sql + " IS NULL)", true};
+		return {ExpressionVocabulary::IsNull(child_result.sql, false), true};
 	}
 
 	if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
@@ -1160,7 +735,7 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 		if (!child_result.supported) {
 			return {"", false};
 		}
-		return {"(" + child_result.sql + " IS NOT NULL)", true};
+		return {ExpressionVocabulary::IsNull(child_result.sql, true), true};
 	}
 
 	// IN arrives here as an operator expression whenever the filter combiner
@@ -1191,9 +766,10 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 		// their total is bounded by SqlParamSet::MAX_PARAMS when parameterised
 		// (the sink turns the rest into literals) and by their count when not.
 		// A bare-column IN is a table filter (EncodeInFilter) and is not capped.
-		if (children.size() - 1 > MAX_PUSHED_IN_ITEMS) {
+		if (!ExpressionVocabulary::InListFits(children.size() - 1)) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN list of %llu items exceeds %llu, left to DuckDB",
-								   (unsigned long long)(children.size() - 1), (unsigned long long)MAX_PUSHED_IN_ITEMS);
+								   (unsigned long long)(children.size() - 1),
+								   (unsigned long long)ExpressionVocabulary::MAX_IN_ITEMS);
 			return {"", false};
 		}
 		auto operand_ctx = ctx.child();
@@ -1205,7 +781,7 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 		auto item_ctx = ctx.child();
 		item_ctx.constant_peer = ColumnInfoOf(*children[0], ctx);
 		const bool negated = expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN;
-		std::string sql = "(" + operand_result.sql + (negated ? " NOT IN (" : " IN (");
+		std::vector<std::string> items;
 		for (idx_t i = 1; i < children.size(); i++) {
 			auto item_result = EncodeValueExpression(*children[i], item_ctx);
 			if (!item_result.supported) {
@@ -1213,12 +789,9 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 									   (unsigned long long)i);
 				return {"", false};
 			}
-			if (i > 1) {
-				sql += ", ";
-			}
-			sql += item_result.sql;
+			items.push_back(item_result.sql);
 		}
-		sql += "))";
+		std::string sql = ExpressionVocabulary::In(operand_result.sql, items, negated);
 		MSSQL_FILTER_DEBUG_LOG(2, "EncodeOperatorExpression: encoded -> %s", sql.c_str());
 		return {sql, true};
 	}
@@ -1234,7 +807,8 @@ ExpressionEncodeResult FilterEncoder::EncodeCaseExpression(const BoundCaseExpres
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeCaseExpression: case_checks=%zu", expr.CaseChecks().size());
 
 	auto child_ctx = ctx.child();
-	std::string sql = "CASE";
+	std::vector<std::string> whens;
+	std::vector<std::string> thens;
 
 	// Encode each WHEN ... THEN clause
 	for (const auto &check : expr.CaseChecks()) {
@@ -1259,7 +833,8 @@ ExpressionEncodeResult FilterEncoder::EncodeCaseExpression(const BoundCaseExpres
 			return {"", false};
 		}
 
-		sql += " WHEN " + when_result.sql + " THEN " + then_result.sql;
+		whens.push_back(when_result.sql);
+		thens.push_back(then_result.sql);
 	}
 
 	// ELSE is VALUE position too — same refusal as THEN.
@@ -1268,7 +843,7 @@ ExpressionEncodeResult FilterEncoder::EncodeCaseExpression(const BoundCaseExpres
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeCaseExpression: ELSE clause encoding failed");
 		return {"", false};
 	}
-	sql += " ELSE " + else_result.sql + " END";
+	std::string sql = ExpressionVocabulary::Case(whens, thens, else_result.sql);
 
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeCaseExpression: encoded -> %s", sql.c_str());
 	return {sql, true};
@@ -1306,19 +881,8 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundFunctio
 		return {"", false};
 	}
 
-	// Build the SQL: (input >= lower AND input <= upper) or variants based on inclusivity
-	// For standard BETWEEN (both inclusive), we can use T-SQL BETWEEN
-	if (lower_inclusive && upper_inclusive) {
-		std::string sql = "(" + input_result.sql + " BETWEEN " + lower_result.sql + " AND " + upper_result.sql + ")";
-		MSSQL_FILTER_DEBUG_LOG(2, "EncodeBetweenExpression: encoded -> %s", sql.c_str());
-		return {sql, true};
-	}
-
-	// For non-standard bounds, use explicit comparisons
-	std::string lower_op = lower_inclusive ? " >= " : " > ";
-	std::string upper_op = upper_inclusive ? " <= " : " < ";
-	std::string sql = "((" + input_result.sql + lower_op + lower_result.sql + ") AND (" + input_result.sql + upper_op +
-					  upper_result.sql + "))";
+	std::string sql = ExpressionVocabulary::Between(input_result.sql, lower_result.sql, upper_result.sql,
+													lower_inclusive, upper_inclusive);
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeBetweenExpression: encoded -> %s", sql.c_str());
 	return {sql, true};
 }
@@ -1400,7 +964,6 @@ ExpressionEncodeResult FilterEncoder::EncodeConjunctionExpression(const BoundCon
 	}
 
 	bool is_and = (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND);
-	std::string conj_op = is_and ? " AND " : " OR ";
 
 	auto child_ctx = ctx.child();
 	std::vector<std::string> conditions;
@@ -1431,19 +994,7 @@ ExpressionEncodeResult FilterEncoder::EncodeConjunctionExpression(const BoundCon
 		return {"", false};
 	}
 
-	if (conditions.size() == 1) {
-		return {conditions[0], all_supported};
-	}
-
-	std::string sql = "(";
-	for (idx_t i = 0; i < conditions.size(); i++) {
-		if (i > 0) {
-			sql += conj_op;
-		}
-		sql += conditions[i];
-	}
-	sql += ")";
-
+	std::string sql = ExpressionVocabulary::Conjunction(conditions, is_and);
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeConjunctionExpression: encoded -> %s", sql.c_str());
 	return {sql, all_supported};
 }
@@ -1478,26 +1029,8 @@ ExpressionEncodeResult FilterEncoder::EncodeLikePattern(const std::string &funct
 		return {"", false};
 	}
 
-	std::string pattern_str = pattern_const.GetValue().ToString();
-	std::string escaped_pattern = EscapeLikePattern(pattern_str);
-
-	// Convert function name to lowercase for comparison
-	std::string lower_func = function_name;
-	std::transform(lower_func.begin(), lower_func.end(), lower_func.begin(),
-				   [](unsigned char c) { return std::tolower(c); });
-
-	// Check if this is a case-insensitive LIKE function
-	bool case_insensitive = IsCaseInsensitiveLikeFunction(function_name);
-
-	// Build the LIKE pattern based on function type
 	std::string pattern_text;
-	if (lower_func == "prefix" || lower_func == "iprefix") {
-		pattern_text = escaped_pattern + "%";
-	} else if (lower_func == "suffix" || lower_func == "isuffix") {
-		pattern_text = "%" + escaped_pattern;
-	} else if (lower_func == "contains" || lower_func == "icontains") {
-		pattern_text = "%" + escaped_pattern + "%";
-	} else {
+	if (!ExpressionVocabulary::LikePatternText(function_name, pattern_const.GetValue().ToString(), pattern_text)) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeLikePattern: unknown LIKE pattern function %s", function_name.c_str());
 		return {"", false};
 	}
@@ -1506,16 +1039,7 @@ ExpressionEncodeResult FilterEncoder::EncodeLikePattern(const std::string &funct
 	// is the N'...' literal it always was.
 	std::string like_pattern =
 		EncodeConstantValue(Value(pattern_text), LogicalType::VARCHAR, child_ctx, ColumnInfoOf(column_expr, ctx));
-
-	// Build the T-SQL expression
-	std::string sql;
-	if (case_insensitive) {
-		// ILIKE: apply LOWER() to both column and pattern
-		sql = "(LOWER(" + column_result.sql + ") LIKE LOWER(" + like_pattern + "))";
-	} else {
-		// Case-sensitive LIKE
-		sql = "(" + column_result.sql + " LIKE " + like_pattern + ")";
-	}
+	std::string sql = ExpressionVocabulary::Like(column_result.sql, like_pattern);
 
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeLikePattern: encoded -> %s", sql.c_str());
 	return {sql, true};

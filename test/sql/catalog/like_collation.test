@@ -1,0 +1,75 @@
+# name: test/sql/catalog/like_collation.test
+# description: LIKE pushdown is evaluated under the column's collation (spec 079 D4, #392); ILIKE is not pushed
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# DuckDB rewrites a simple LIKE into prefix / suffix / contains, which the
+# scan pushes as `[col] LIKE @p`. The server evaluates that under the COLUMN's
+# collation, as it does `=`: on a case-insensitive collation -- the
+# installation default -- `LIKE '%abc%'` also finds 'ABC' (D4: string sets are
+# the server's, documented in reading/queries.md). ILIKE stays DuckDB's: it is
+# never rewritten into a pushed form, and the server's LOWER would lose rows
+# (LOWER(N'ẞ') stays 'ẞ' on the server, DuckDB's lower gives 'ß').
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS lkc (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('lkc', 'DROP TABLE IF EXISTS dbo.like_coll;
+	CREATE TABLE dbo.like_coll (
+		id int NOT NULL,
+		ci nvarchar(40) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,
+		cs nvarchar(40) COLLATE Latin1_General_100_BIN2 NULL,
+		wcs varchar(40) COLLATE Latin1_General_CS_AS NULL);
+	INSERT INTO dbo.like_coll VALUES (1, N''ABC'', N''ABC'', ''ABC''), (2, N''xabcx'', N''xabcx'', ''abc''),
+		(3, N''STRAẞE'', N''STRAẞE'', ''Abcd'')');
+
+# Case-insensitive collation: the case variant matches, as `=` would.
+query I
+SELECT id FROM lkc.dbo.like_coll WHERE ci LIKE '%abc%' ORDER BY id;
+----
+1
+2
+
+query I
+SELECT id FROM lkc.dbo.like_coll WHERE ci LIKE 'abc%' ORDER BY id;
+----
+1
+
+# A binary collation: only the exact case.
+query I
+SELECT id FROM lkc.dbo.like_coll WHERE cs LIKE '%abc%' ORDER BY id;
+----
+2
+
+# ILIKE runs in DuckDB, with DuckDB's case folding: the ẞ row is found.
+query I
+SELECT id FROM lkc.dbo.like_coll WHERE ci ILIKE '%straße%' ORDER BY id;
+----
+3
+
+# An ILIKE with a fixed prefix is where DuckDB's FilterCombiner could derive a
+# range (`col >= 'ABC' AND col < 'abd'`) and hand it to the scan, which the
+# server would then order by its collation: on a Windows _CS_AS collation
+# lowercase sorts before uppercase, so 'abc' would fall outside it. Today the
+# scan's pushdown_complex_filter sees the ILIKE first and leaves it to DuckDB
+# whole, and no range reaches the server (measured). Pinned, as
+# like_pushdown_collation.test pins the same for LIKE.
+query I
+SELECT id FROM lkc.dbo.like_coll WHERE wcs ILIKE 'abc%' ORDER BY id;
+----
+1
+2
+3
+
+statement ok
+SELECT mssql_exec('lkc', 'DROP TABLE dbo.like_coll');
+
+statement ok
+DETACH lkc;

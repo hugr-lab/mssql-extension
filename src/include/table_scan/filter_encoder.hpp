@@ -20,6 +20,7 @@
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
+#include "pushdown/mssql_expression_vocabulary.hpp"
 
 namespace duckdb {
 struct MSSQLColumnInfo;
@@ -34,14 +35,6 @@ namespace mssql {
 //------------------------------------------------------------------------------
 // Result Structures
 //------------------------------------------------------------------------------
-
-/**
- * Result of encoding a single expression or filter.
- */
-struct ExpressionEncodeResult {
-	std::string sql;  // T-SQL fragment (empty if not supported)
-	bool supported;	  // True if expression was fully encoded
-};
 
 /**
  * Result of encoding an entire filter set.
@@ -99,6 +92,13 @@ struct ExpressionEncodeContext {
 	const MSSQLColumnInfo *filter_column_info = nullptr;
 	const MSSQLColumnInfo *constant_peer = nullptr;
 
+	// DuckDB's error_on_division_by_zero as the asking session has it. False
+	// makes `x % 0` NULL in DuckDB and error 8134 on the server, so `%` must
+	// not be pushed -- the same answer the remote-pushdown writer gives
+	// (roborev 1819 finding 3). Carried here because the encoder's walk has no
+	// ClientContext; set by BuildEncodeContext and inherited by children.
+	bool division_by_zero_errors = true;
+
 	ExpressionEncodeContext(const std::vector<column_t> &col_ids, const std::vector<std::string> &col_names,
 							const std::vector<LogicalType> &col_types)
 		: column_ids(col_ids), column_names(col_names), column_types(col_types), depth(0) {}
@@ -126,6 +126,7 @@ struct ExpressionEncodeContext {
 		ctx.params = params;
 		ctx.mssql_columns = mssql_columns;
 		ctx.filter_column_info = filter_column_info;
+		ctx.division_by_zero_errors = division_by_zero_errors;
 		return ctx;
 	}
 
@@ -360,7 +361,7 @@ private:
 
 	/**
 	 * Encode prefix/suffix/contains pattern function.
-	 * @param function_name One of: prefix, suffix, contains, iprefix, isuffix, icontains
+	 * @param function_name One of: prefix, suffix, contains
 	 * @param column_expr The column expression
 	 * @param pattern_expr The pattern expression
 	 * @param ctx Encoding context

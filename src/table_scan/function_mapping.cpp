@@ -32,7 +32,7 @@ static const std::unordered_map<std::string, FunctionMapping> &GetFunctionMappin
 		// applied client-side by the spec-069 net, correct by construction; the
 		// cost is that such a filter reads the rows it rejects.
 
-		// Note: LIKE pattern functions (prefix, suffix, contains, iprefix, isuffix, icontains)
+		// Note: LIKE pattern functions (prefix, suffix, contains)
 		// are handled by EncodeLikePattern() directly for proper Unicode (N'') encoding
 		// and LIKE special character escaping. Do not add them here.
 
@@ -83,15 +83,16 @@ bool IsFunctionSupported(const std::string &function_name) {
 	return GetFunctionMapping(function_name) != nullptr;
 }
 
+// The names DuckDB's LIKE optimizer rewrites a simple case-sensitive LIKE
+// into. There are no case-insensitive counterparts on the 2.0 pin: ILIKE
+// stays `~~*`, which nothing maps, and runs in DuckDB. The `LOWER(x) LIKE
+// LOWER(p)` form the encoder once had for iprefix / isuffix / icontains was
+// unreachable -- and wrong had it been reached: the server's LOWER leaves
+// N'ẞ' as it is where DuckDB's lower gives 'ß' (measured), so rows would have
+// been lost (#392). Removed rather than left to come back.
 bool IsLikePatternFunction(const std::string &function_name) {
 	std::string lower_name = ToLower(function_name);
-	return lower_name == "prefix" || lower_name == "suffix" || lower_name == "contains" || lower_name == "iprefix" ||
-		   lower_name == "isuffix" || lower_name == "icontains";
-}
-
-bool IsCaseInsensitiveLikeFunction(const std::string &function_name) {
-	std::string lower_name = ToLower(function_name);
-	return lower_name == "iprefix" || lower_name == "isuffix" || lower_name == "icontains";
+	return lower_name == "prefix" || lower_name == "suffix" || lower_name == "contains";
 }
 
 }  // namespace mssql

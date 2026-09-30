@@ -34,10 +34,24 @@ Supported filter operations for pushdown:
   - dates: `year`, `month`, `day`, `hour`, `minute`, `second` — not over a
     `datetimeoffset`, whose date parts the server takes in the value's own
     offset and DuckDB in the session time zone
-  - arithmetic: `+ - * %`, negation
-  - substring matching: `prefix`/`suffix`/`contains` and their
-    case-insensitive variants translate to `LIKE` (constant patterns) —
-    including leading-wildcard forms
+  - arithmetic: `+ - * %`, negation — over **exact numeric** operands whose
+    result both sides compute identically. Left to DuckDB otherwise, so the
+    answer is the one you would get without an attached server: a non-numeric
+    operand (`date_col + 1` is a date in DuckDB, error 206 in T-SQL); `+ - *`
+    on a `float`/`real` (SQL Server has no infinity, so it raises where DuckDB
+    returns `inf`); a `decimal` product DuckDB types as `DECIMAL(18)` and
+    overflows before the server would; a `decimal` result whose server
+    precision passes 38 digits (the server rounds the scale, DuckDB keeps it
+    exact); and `%` under `SET error_on_division_by_zero = false` (DuckDB
+    answers `NULL` for `x % 0`, the server raises 8134)
+  - substring matching: a simple `LIKE` or `GLOB` (which DuckDB rewrites into
+    `prefix`/`suffix`/`contains`) translates to T-SQL `LIKE` with a constant
+    pattern, including leading-wildcard forms. SQL Server evaluates it under
+    the **column's collation**, exactly as it does `=`: on a case-insensitive
+    collation (the installation default `SQL_Latin1_General_CP1_CI_AS`)
+    `name LIKE '%abc%'` also returns `'ABC'`, where DuckDB alone would not.
+    `ILIKE` is not pushed: the server's `LOWER` does not fold case as DuckDB's
+    `lower` does (`LOWER(N'ẞ')` stays `ẞ`), so DuckDB evaluates it
 - Rowid equality (expands to the primary-key columns)
 
 **Not pushed down** (applied locally by DuckDB): unmapped functions —

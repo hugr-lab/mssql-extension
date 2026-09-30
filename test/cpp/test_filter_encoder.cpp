@@ -25,8 +25,10 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "pushdown/mssql_expression_vocabulary.hpp"
 #include "query/mssql_sql_params.hpp"
 #include "table_scan/filter_encoder.hpp"
+#include "table_scan/function_mapping.hpp"
 
 using namespace duckdb;
 using namespace duckdb::mssql;
@@ -680,6 +682,52 @@ static void TestDeclarationForColumn() {
 }
 
 int main() {
+	// #392: no case-insensitive LIKE form is pushed (the server's LOWER is not
+	// DuckDB's lower); DuckDB has no such names on the 2.0 pin either.
+	ASSERT_TRUE(IsLikePatternFunction("contains"));
+	ASSERT_TRUE(!IsLikePatternFunction("icontains"));
+	ASSERT_TRUE(!IsLikePatternFunction("iprefix"));
+	ASSERT_TRUE(!IsLikePatternFunction("isuffix"));
+
+	// Arithmetic operators take numbers only (DuckDB's `date + 1` is a date,
+	// T-SQL refuses it: 206); float arithmetic overflows on the server, which
+	// has no Inf, where DuckDB says inf -- for + and - as well as *, a narrower
+	// value window but the same divergence (roborev 1819 finding 2); a decimal
+	// product DuckDB caps at DECIMAL(18) overflows there first (spec 079 C,
+	// from PR D's full review).
+	{
+		std::string why;
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("+", {LogicalType::DATE, LogicalType::INTEGER}, why));
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("-", {LogicalType::TIMESTAMP, LogicalType::INTERVAL}, why));
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("+", {LogicalType::DOUBLE, LogicalType::DOUBLE}, why));
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("-", {LogicalType::DOUBLE, LogicalType::DOUBLE}, why));
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("*", {LogicalType::DOUBLE, LogicalType::DOUBLE}, why));
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("+", {LogicalType::FLOAT, LogicalType::FLOAT}, why));
+		// Exact numbers still push.
+		ASSERT_TRUE(ExpressionVocabulary::FunctionFor("+", {LogicalType::INTEGER, LogicalType::INTEGER}, why));
+		// The zero-divisor policy is the vocabulary's, so both walkers get it
+		// (roborev 1819 finding 3): `x % 0` is NULL in DuckDB with
+		// error_on_division_by_zero off, error 8134 on the server.
+		ASSERT_TRUE(ExpressionVocabulary::FunctionFor("%", {LogicalType::INTEGER, LogicalType::INTEGER}, why));
+		ASSERT_TRUE(!ExpressionVocabulary::FunctionFor("%", {LogicalType::INTEGER, LogicalType::INTEGER}, why,
+													   /*division_by_zero_errors=*/false));
+		ASSERT_TRUE(
+			!ExpressionVocabulary::FunctionFor("*", {LogicalType::DECIMAL(10, 2), LogicalType::DECIMAL(10, 2)}, why));
+		ASSERT_TRUE(
+			ExpressionVocabulary::FunctionFor("*", {LogicalType::DECIMAL(9, 2), LogicalType::DECIMAL(9, 2)}, why));
+		ASSERT_TRUE(ExpressionVocabulary::FunctionFor("*", {LogicalType::INTEGER, LogicalType::INTEGER}, why));
+		// DuckDB caps at 18 only while the scale fits: (18,10)^2 is DECIMAL(36,20).
+		ASSERT_TRUE(
+			ExpressionVocabulary::FunctionFor("*", {LogicalType::DECIMAL(18, 10), LogicalType::DECIMAL(18, 10)}, why));
+		// Past 38 digits the server rounds the scale.
+		ASSERT_TRUE(
+			!ExpressionVocabulary::FunctionFor("*", {LogicalType::DECIMAL(19, 4), LogicalType::DECIMAL(19, 4)}, why));
+		ASSERT_TRUE(
+			!ExpressionVocabulary::FunctionFor("+", {LogicalType::DECIMAL(38, 10), LogicalType::DECIMAL(38, 10)}, why));
+		ASSERT_TRUE(
+			ExpressionVocabulary::FunctionFor("+", {LogicalType::DECIMAL(10, 2), LogicalType::DECIMAL(10, 2)}, why));
+	}
+
 	std::cout << "Running FilterEncoder unit tests..." << std::endl;
 
 	TestDatePartOverPrecisionCast();

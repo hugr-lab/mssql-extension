@@ -889,7 +889,8 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 // cannot drift between the dry-run (pushdown_expression) and the encode
 // (pushdown_complex_filter). `column_ids_out` backs the context's reference and
 // must outlive it.
-static ExpressionEncodeContext BuildEncodeContext(const LogicalGet &get, const MSSQLCatalogScanBindData &bind_data,
+static ExpressionEncodeContext BuildEncodeContext(ClientContext &context, const LogicalGet &get,
+												  const MSSQLCatalogScanBindData &bind_data,
 												  vector<column_t> &column_ids_out) {
 	const auto &get_column_ids = get.GetColumnIds();
 	column_ids_out.clear();
@@ -903,6 +904,13 @@ static ExpressionEncodeContext BuildEncodeContext(const LogicalGet &get, const M
 		ctx.SetPKInfo(&bind_data.pk_column_names, &bind_data.pk_column_types, bind_data.pk_is_composite);
 	}
 	ctx.mssql_columns = &bind_data.mssql_columns;
+	// `error_on_division_by_zero = false` makes `x % 0` NULL in DuckDB and error
+	// 8134 on the server, so the vocabulary refuses `%` -- the answer the
+	// remote-pushdown writer already gave (roborev 1819 finding 3).
+	Value division_errors;
+	if (context.TryGetCurrentSetting("error_on_division_by_zero", division_errors) && !division_errors.IsNull()) {
+		ctx.division_by_zero_errors = division_errors.GetValue<bool>();
+	}
 	return ctx;
 }
 
@@ -977,7 +985,7 @@ static bool MSSQLPushdownExpression(ClientContext &context, const LogicalGet &ge
 	}
 	auto &bind_data = get.bind_data->Cast<MSSQLCatalogScanBindData>();
 	vector<column_t> column_ids;
-	ExpressionEncodeContext ctx = BuildEncodeContext(get, bind_data, column_ids);
+	ExpressionEncodeContext ctx = BuildEncodeContext(context, get, bind_data, column_ids);
 	// Predicate position — the same coercion (bare bit -> `= 1`) the runtime
 	// filter build applies, so the dry-run accepts exactly what will encode.
 	auto result = FilterEncoder::EncodeSearchCondition(expr, ctx);
@@ -1154,7 +1162,7 @@ static void ComplexFilterPushdown(ClientContext &context, LogicalGet &get, Funct
 	MSSQL_SCAN_DEBUG_LOG(1, "ComplexFilterPushdown: processing %zu expression(s)", filters.size());
 
 	vector<column_t> column_ids;
-	ExpressionEncodeContext ctx = BuildEncodeContext(get, bind_data, column_ids);
+	ExpressionEncodeContext ctx = BuildEncodeContext(context, get, bind_data, column_ids);
 	// Spec 076: the constants become parameters, kept on the bind data beside
 	// the clause that refers to them.
 	mssql::SqlParamSet params;

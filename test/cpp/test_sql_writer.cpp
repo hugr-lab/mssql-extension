@@ -35,6 +35,12 @@ static std::vector<MSSQLColumnInfo> Columns() {
 	columns.emplace_back("ts", 7, "datetime2", 8, 27, 7, true, "", "SQL_Latin1_General_CP1_CI_AS");
 	columns.emplace_back("legacy", 8, "varchar", 30, 0, 0, true, "SQL_Latin1_General_CP1_CI_AS",
 						 "SQL_Latin1_General_CP1_CI_AS");
+	columns.emplace_back("wide", 9, "decimal", 17, 38, 10, true, "", "SQL_Latin1_General_CP1_CI_AS");
+	columns.emplace_back("mid", 10, "decimal", 9, 19, 4, true, "", "SQL_Latin1_General_CP1_CI_AS");
+	// tinyint is 0-255 on the server, which is DuckDB's UTINYINT -- the only
+	// integer type whose rank is 1, so the only one a widening cast can target
+	// without widening (roborev 1819 finding 1).
+	columns.emplace_back("tiny", 11, "tinyint", 1, 3, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
 	return columns;
 }
 
@@ -110,23 +116,23 @@ int main() {
 	ExpectSql("SELECT id AS id FROM t LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 	ExpectSql("SELECT * FROM t LIMIT 1",
 			  "SELECT TOP (1) [id], [name], [code], [amount], [day], [flag], [ts], CAST([legacy] AS NVARCHAR(30)) AS "
-			  "[legacy] FROM [dbo].[t]");
+			  "[legacy], [wide], [mid], [tiny] FROM [dbo].[t]");
 	ExpectSql("SELECT q.id FROM t AS q LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 
 	// WHERE: constants are parameters declared from the column.
 	ExpectSql("SELECT id FROM t WHERE id = 5 AND (name = 'a' OR NOT flag = true) LIMIT 2",
-			  "SELECT TOP (2) [id] FROM [dbo].[t] WHERE ([id] = @p1 AND ([name] = @p2 OR (NOT [flag] = @p3)))");
+			  "SELECT TOP (2) [id] FROM [dbo].[t] WHERE (([id] = @p0) AND (([name] = @p1) OR (NOT ([flag] = @p2))))");
 	ExpectParams("SELECT id FROM t WHERE id = 5 AND amount >= 1.5 AND day < '2024-01-01' LIMIT 2",
-				 "@p1 int, @p2 decimal(10,2), @p3 date");
+				 "@p0 int, @p1 decimal(10,2), @p2 date");
 	// A typed constant, as the rewriter's folding leaves `DATE '2024-01-01'`.
-	ExpectParams("SELECT id FROM t WHERE day = CAST('2024-01-01' AS DATE) LIMIT 1", "@p1 date");
+	ExpectParams("SELECT id FROM t WHERE day = CAST('2024-01-01' AS DATE) LIMIT 1", "@p0 date");
 	ExpectVeto("SELECT id FROM t WHERE day = CAST('2024-01-01' AS TIMESTAMP) LIMIT 1");
 	ExpectVeto("SELECT id FROM t WHERE id = TRY_CAST('5' AS INTEGER) LIMIT 1");
-	ExpectSql("SELECT id FROM t WHERE 5 < id LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE @p1 < [id]");
+	ExpectSql("SELECT id FROM t WHERE 5 < id LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (@p0 < [id])");
 	ExpectSql("SELECT id FROM t WHERE name IS NULL AND code IS NOT NULL LIMIT 1",
 			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([name] IS NULL) AND ([code] IS NOT NULL))");
-	ExpectSql("SELECT id FROM t WHERE id = 5 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE [id] = 5", false);
-	ExpectSql("SELECT id FROM t WHERE amount = 2 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE [amount] = 2.00",
+	ExpectSql("SELECT id FROM t WHERE id = 5 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([id] = 5)", false);
+	ExpectSql("SELECT id FROM t WHERE amount = 2 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([amount] = 2.00)",
 			  false);
 
 	// A constant DuckDB and the server would compare differently stays local.
@@ -173,9 +179,122 @@ int main() {
 	ExpectSql("SELECT id FROM t OFFSET 2", "SELECT [id] FROM [dbo].[t] ORDER BY (SELECT NULL) OFFSET 2 ROWS");
 	ExpectVeto("SELECT id FROM t LIMIT 10%");
 
+	// Arithmetic: same-type operands keep their type on both sides; a constant
+	// is typed from its peer, as the binder types it.
+	ExpectSql("SELECT id + 1 FROM t LIMIT 1", "SELECT TOP (1) ([id] + @p0) AS [(id + 1)] FROM [dbo].[t]");
+	ExpectParams("SELECT id + 1 FROM t LIMIT 1", "@p0 int");
+	ExpectSql("SELECT id * 2 AS x FROM t LIMIT 1", "SELECT TOP (1) ([id] * @p0) AS [x] FROM [dbo].[t]");
+	ExpectSql("SELECT -id AS n FROM t LIMIT 1", "SELECT TOP (1) (-[id]) AS [n] FROM [dbo].[t]");
+	ExpectSql("SELECT id FROM t WHERE id + 1 > 5 LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([id] + @p0) > @p1)");
+	ExpectSql("SELECT id FROM t WHERE id % 2 = 0 LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([id] % @p0) = @p1)");
+	ExpectSql("SELECT amount + amount AS d FROM t LIMIT 1",
+			  "SELECT TOP (1) ([amount] + [amount]) AS [d] FROM [dbo].[t]");
+	ExpectSql("SELECT id FROM t WHERE amount + 1 > 2 LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([amount] + @p0) > @p1)");
+	ExpectSql("SELECT id + 1 FROM t LIMIT 1", "SELECT TOP (1) ([id] + CAST(1 AS int)) AS [(id + 1)] FROM [dbo].[t]",
+			  false);
+	ExpectVeto("SELECT wide + wide FROM t LIMIT 1");				   // width 38: the server would round
+	ExpectVeto("SELECT mid * mid FROM t LIMIT 1");					   // p1 + p2 + 1 > 38: the server reduces the scale
+	ExpectVeto("SELECT amount * amount AS p FROM t LIMIT 1");		   // DuckDB's DECIMAL(18) product overflows first
+	ExpectVeto("SELECT id + amount FROM t LIMIT 1");				   // int + decimal: the promotions differ
+	ExpectVeto("SELECT id + 2.5 FROM t LIMIT 1");					   // not exact in int
+	ExpectVeto("SELECT name + 1 FROM t LIMIT 1");					   // not a number
+	ExpectVeto("SELECT amount % 2 FROM t LIMIT 1");					   // T-SQL % takes integers only (8117)
+	ExpectVeto("SELECT id FROM t WHERE amount * amount > 1 LIMIT 1");  // a decimal product's type differs
+	ExpectVeto("SELECT -code FROM t LIMIT 1");
+	ExpectVeto("SELECT id + 1 AS x FROM t ORDER BY x LIMIT 1");	 // ORDER BY a computed column
+	ExpectVeto("SELECT id + 1 FROM t ORDER BY 1 LIMIT 1");
+	ExpectVeto("SELECT abs(id) FROM t LIMIT 1");  // functions: a later step
+
+	// Division: DuckDB's `/` is floating (5 / 2 = 2.5); a zero divisor gives
+	// NULL on the server where DuckDB says inf -- the recorded divergence.
+	ExpectSql("SELECT id / 2 AS h FROM t LIMIT 1",
+			  "SELECT TOP (1) (CAST([id] AS float) / NULLIF(CAST(@p0 AS float), 0)) AS [h] FROM [dbo].[t]");
+	ExpectSql(
+		"SELECT id / 2 AS h FROM t LIMIT 1",
+		"SELECT TOP (1) (CAST([id] AS float) / NULLIF(CAST(CAST(2.0 AS float) AS float), 0)) AS [h] FROM [dbo].[t]",
+		false);
+	ExpectParams("SELECT id / 2.5 AS h FROM t LIMIT 1", "@p0 float");
+	ExpectVeto("SELECT id FROM t WHERE amount / id > 0.5 LIMIT 1");	 // a zero divisor would change the rows
+	ExpectVeto("SELECT CASE WHEN id / 2 > 1 THEN id END FROM t LIMIT 1");
+	ExpectVeto("SELECT name / 2 FROM t LIMIT 1");
+
+	// Widening casts only.
+	ExpectSql("SELECT CAST(id AS BIGINT) AS b FROM t LIMIT 1",
+			  "SELECT TOP (1) CAST([id] AS bigint) AS [b] FROM [dbo].[t]");
+	ExpectSql("SELECT CAST(amount AS DOUBLE) AS d FROM t LIMIT 1",
+			  "SELECT TOP (1) CAST([amount] AS float) AS [d] FROM [dbo].[t]");
+	ExpectVeto("SELECT CAST(id AS SMALLINT) FROM t LIMIT 1");  // narrowing can fail differently
+	ExpectVeto("SELECT CAST(id AS VARCHAR) FROM t LIMIT 1");   // formatting is DuckDB's
+	ExpectVeto("SELECT TRY_CAST(id AS BIGINT) FROM t LIMIT 1");
+	// A UTINYINT target is rank 1, so it passes the widening gate over a
+	// tinyint column and must render as `tinyint`. It used to fall through the
+	// arm list to `bigint`, and then the server computed in bigint what DuckDB
+	// overflows in UINT8 (roborev 1819 finding 1).
+	ExpectSql("SELECT CAST(tiny AS UTINYINT) AS u FROM t LIMIT 1",
+			  "SELECT TOP (1) CAST([tiny] AS tinyint) AS [u] FROM [dbo].[t]");
+	ExpectSql("SELECT CAST(tiny AS INTEGER) AS w FROM t LIMIT 1",
+			  "SELECT TOP (1) CAST([tiny] AS int) AS [w] FROM [dbo].[t]");
+	ExpectVeto("SELECT CAST(id AS UTINYINT) FROM t LIMIT 1");  // narrowing
+
+	// CASE, COALESCE, NULLIF: one type for every branch.
+	ExpectSql("SELECT CASE WHEN id > 1 THEN id ELSE 0 END AS c FROM t LIMIT 1",
+			  "SELECT TOP (1) CASE WHEN ([id] > @p0) THEN [id] ELSE @p1 END AS [c] FROM [dbo].[t]");
+	ExpectSql("SELECT coalesce(amount, 0) AS c FROM t LIMIT 1",
+			  "SELECT TOP (1) COALESCE([amount], @p0) AS [c] FROM [dbo].[t]");
+	ExpectSql("SELECT nullif(id, 0) AS c FROM t LIMIT 1", "SELECT TOP (1) NULLIF([id], @p0) AS [c] FROM [dbo].[t]");
+	ExpectSql("SELECT CASE WHEN flag THEN id END AS c FROM t LIMIT 1",
+			  "SELECT TOP (1) CASE WHEN ([flag] = 1) THEN [id] ELSE NULL END AS [c] FROM [dbo].[t]");
+	ExpectSql("SELECT id FROM t WHERE flag LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([flag] = 1)");
+	ExpectVeto("SELECT CASE WHEN flag THEN 1 END FROM t LIMIT 1");	// constants only: no type to give them
+	ExpectVeto("SELECT id FROM t WHERE id LIMIT 1");				// an int is not a condition
+	ExpectVeto("SELECT CASE WHEN id > 1 THEN id ELSE amount END FROM t LIMIT 1");  // int and decimal
+	ExpectVeto("SELECT coalesce(name, code) FROM t LIMIT 1");					   // two collations
+	ExpectVeto("SELECT coalesce(legacy, 'x') FROM t LIMIT 1");	// a code-page varchar arrives untranscoded
+	ExpectVeto("SELECT CASE WHEN id > 1 THEN id ELSE 2.0 END FROM t LIMIT 1");	// 2.0 widens DuckDB's type
+	ExpectVeto("SELECT id + 2.0 FROM t LIMIT 1");
+	ExpectSql("SELECT id FROM t WHERE id = 2.0 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([id] = @p0)");
+	ExpectSql("SELECT coalesce(name, 'none') AS c FROM t LIMIT 1",
+			  "SELECT TOP (1) COALESCE([name], @p0) AS [c] FROM [dbo].[t]");
+	ExpectSql("SELECT coalesce(name, 'none') AS c FROM t LIMIT 1",
+			  "SELECT TOP (1) COALESCE([name], CAST(N'none' AS nvarchar(100))) AS [c] FROM [dbo].[t]", false);
+	ExpectVeto("SELECT coalesce(code, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') FROM t LIMIT 1");  // wider than varchar(20)
+	ExpectVeto("SELECT coalesce(id / 2, 0) FROM t LIMIT 1");  // COALESCE would hide the zero-divisor NULL
+	ExpectSql("SELECT CASE WHEN id > 1 THEN id / 2 END AS h FROM t LIMIT 1",
+			  "SELECT TOP (1) CASE WHEN ([id] > @p0) THEN (CAST([id] AS float) / NULLIF(CAST(@p1 AS float), 0)) ELSE "
+			  "NULL END AS "
+			  "[h] FROM [dbo].[t]");
+
+	// IN / NOT IN, BETWEEN, LIKE / NOT LIKE, value against value.
+	ExpectSql("SELECT id FROM t WHERE id IN (1, 2) LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([id] IN (@p0, @p1))");
+	ExpectParams("SELECT id FROM t WHERE id IN (1, 2) LIMIT 1", "@p0 int, @p1 int");
+	ExpectSql("SELECT id FROM t WHERE id NOT IN (1, NULL) LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (NOT ([id] IN (@p0, NULL)))");
+	ExpectSql("SELECT id FROM t WHERE amount BETWEEN 1 AND 2 LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([amount] BETWEEN @p0 AND @p1)");
+	ExpectSql("SELECT id FROM t WHERE name LIKE 'a[b%' LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([name] LIKE N'a[[]b%')", false);
+	ExpectSql("SELECT id FROM t WHERE name NOT LIKE 'x%' LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (NOT ([name] LIKE @p0))");
+	ExpectSql("SELECT id FROM t WHERE amount > amount LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([amount] > [amount])");
+	ExpectSql("SELECT id FROM t WHERE name = legacy LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([name] = [legacy])");
+	ExpectSql("SELECT id FROM t WHERE id + 1 IS NULL LIMIT 1",
+			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([id] + @p0) IS NULL)");
+	ExpectVeto("SELECT id FROM t WHERE name = code LIMIT 1");  // two collations: 468
+	ExpectVeto("SELECT id FROM t WHERE id = amount LIMIT 1");  // two types
+	ExpectVeto("SELECT id FROM t WHERE name ILIKE 'x%' LIMIT 1");
+	ExpectVeto("SELECT id FROM t WHERE name GLOB 'x*' LIMIT 1");
+	ExpectVeto("SELECT id FROM t WHERE name LIKE 'x!%' ESCAPE '!' LIMIT 1");
+	ExpectVeto("SELECT id FROM t WHERE id LIKE '1%' LIMIT 1");		// LIKE over an int
+	ExpectVeto("SELECT id FROM t WHERE name LIKE legacy LIMIT 1");	// pattern not a constant
+
 	// Everything outside PR B's vocabulary is a veto, never a guess.
 	ExpectVeto("SELECT rowid FROM t LIMIT 1");
-	ExpectVeto("SELECT id + 1 FROM t LIMIT 1");
 	ExpectVeto("SELECT DISTINCT id FROM t LIMIT 1");
 	ExpectVeto("SELECT id, count(*) FROM t GROUP BY id LIMIT 1");
 	ExpectVeto("SELECT * EXCLUDE (id) FROM t LIMIT 1");
@@ -196,6 +315,10 @@ int main() {
 	auto legacy = ColumnTypeName(columns[7].NativeDuckDBType());
 	if (legacy != "MSSQL_VARCHAR(30, 'SQL_Latin1_General_CP1_CI_AS')") {
 		std::cerr << "FAIL: ColumnTypeName(legacy) = " << legacy << "\n";
+		failures++;
+	}
+	if (!ColumnTypeName(LogicalType::INVALID).empty()) {
+		std::cerr << "FAIL: ColumnTypeName(INVALID) is not empty\n";
 		failures++;
 	}
 	if (ColumnTypeName(columns[6].duckdb_type) != "TIMESTAMP_NS") {

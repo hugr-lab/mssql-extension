@@ -43,13 +43,15 @@ SELECT mssql_exec('rp_off', 'DROP TABLE IF EXISTS dbo.rp_t;
 		amount decimal(10,2) NULL,
 		day date NULL,
 		ts datetime2(7) NULL,
-		g geometry NULL);
+		g geometry NULL,
+		tiny tinyint NULL,
+		flag bit NULL);
 	INSERT INTO dbo.rp_t VALUES
-		(1, 30, N''alpha'', ''b'', ''caf'' + CHAR(233), 1.50, ''2024-01-01'', ''2024-01-01 00:00:00.1234567'', geometry::STGeomFromText(''POINT (1 2)'', 0)),
-		(2, NULL, N''Beta'', ''a'', ''plain'', 2.00, ''2024-02-01'', ''2024-02-01 00:00:00.0000001'', NULL),
-		(3, 10, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-		(4, 20, N''gamma'', ''B'', ''x'', 4.25, ''2024-04-01'', ''2024-04-01 12:00:00'', geometry::STGeomFromText(''POINT (3 4)'', 0)),
-		(5, NULL, N''delta'', ''ab'', ''y'', 5.00, ''2024-05-01'', ''2024-05-01 00:00:00.9999999'', NULL)');
+		(1, 30, N''alpha'', ''b'', ''caf'' + CHAR(233), 1.50, ''2024-01-01'', ''2024-01-01 00:00:00.1234567'', geometry::STGeomFromText(''POINT (1 2)'', 0), 255, 1),
+		(2, NULL, N''Beta'', ''a'', ''plain'', 2.00, ''2024-02-01'', ''2024-02-01 00:00:00.0000001'', NULL, 1, 0),
+		(3, 10, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+		(4, 20, N''gamma'', ''B'', ''x'', 4.25, ''2024-04-01'', ''2024-04-01 12:00:00'', geometry::STGeomFromText(''POINT (3 4)'', 0), 7, 1),
+		(5, NULL, N''delta'', ''ab'', ''y'', 5.00, ''2024-05-01'', ''2024-05-01 00:00:00.9999999'', NULL, 0, 0)');
 
 statement ok
 CREATE TABLE loc AS SELECT 99 AS id;
@@ -67,7 +69,7 @@ physical_plan	<REGEX>:.*SELECT TOP \(3\) \[id\], \[n\] FROM \[dbo\]\.\[rp_t\] OR
 query II
 EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE id >= 2 AND day < '2024-05-01' ORDER BY id LIMIT 10;
 ----
-physical_plan	<REGEX>:.*Mssql Scan Params.*WHERE \(\[id\] >= @p1 AND \[day\] < @p2\).*
+physical_plan	<REGEX>:.*Mssql Scan Params.*WHERE \(\(\[id\] >= @p0\) AND \(\[day\] < @p1\)\).*
 
 # The two-part name resolves through the default schema (the rewriter asks
 # for schema `main`, the catalog answers with dbo).
@@ -177,7 +179,7 @@ SELECT id AS k, amount FROM rp_off.dbo.rp_t WHERE amount > 1.5 ORDER BY 1 LIMIT 
 query II
 EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE name = 'BETA' ORDER BY id LIMIT 5;
 ----
-physical_plan	<REGEX>:.*Mssql Scan Params.*\[name\] = @p1.*
+physical_plan	<REGEX>:.*Mssql Scan Params.*\(\[name\] = @p0\).*
 
 query I
 SELECT id FROM rp_on.dbo.rp_t WHERE name = 'BETA' ORDER BY id LIMIT 5;
@@ -342,6 +344,452 @@ statement ok
 DEALLOCATE rp_q;
 
 #
+# Arithmetic (PR C): same-type operands keep their type on both sides, a
+# constant is typed from its peer, a computed column is named as DuckDB names
+# it and typed by the server's describe.
+#
+
+query II
+EXPLAIN SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_on.dbo.rp_t WHERE n * 2 > 15 ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*\(\[n\] \+ @p0\) AS \[\(n \+ 1\)\], \(\[amount\] \+ \[amount\]\) AS \[twice\], \(-\[n\]\) AS \[neg\], \(\[n\] % @p1\) AS \[m\].*WHERE \(\(\[n\] \* @p2\) > @p3\).*
+
+query II
+EXPLAIN CREATE TEMP TABLE ar_on AS SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_on.dbo.rp_t WHERE n * 2 > 15 ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*Mssql Scan Params.*AS \[neg\].*AS \[m\].*
+
+statement ok
+CREATE TEMP TABLE ar_on AS SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_on.dbo.rp_t WHERE n * 2 > 15 ORDER BY id LIMIT 10;
+
+statement ok
+CREATE TEMP TABLE ar_off AS SELECT id, n + 1, amount + amount AS twice, -n AS neg, n % 7 AS m FROM rp_off.dbo.rp_t WHERE n * 2 > 15 ORDER BY id LIMIT 10;
+
+query IIIII
+SELECT * FROM ar_on ORDER BY id;
+----
+1	31	3.00	-30	2
+3	11	NULL	-10	3
+4	21	8.50	-20	6
+
+query I
+SELECT count(*) FROM (SELECT * FROM ar_on EXCEPT ALL SELECT * FROM ar_off);
+----
+0
+
+# The same names and the same types on both paths.
+query TT
+SELECT a.column_name, a.data_type FROM duckdb_columns() a JOIN duckdb_columns() b USING (column_name)
+WHERE a.table_name = 'ar_on' AND b.table_name = 'ar_off' AND a.data_type = b.data_type ORDER BY a.column_index;
+----
+id	INTEGER
+(n + 1)	INTEGER
+twice	DECIMAL(11,2)
+neg	INTEGER
+m	INTEGER
+
+# Overflow is an error on both paths: tinyint + tinyint stays tinyint.
+query II
+EXPLAIN SELECT id, tiny + 1 FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*\(\[tiny\] \+ @p0\).*
+
+statement error
+SELECT id, tiny + 1 FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+<REGEX>:.*8115.*overflow.*tinyint.*
+
+statement error
+SELECT id, tiny + 1 FROM rp_off.dbo.rp_t ORDER BY id LIMIT 1;
+----
+<REGEX>:.*Overflow.*
+
+# Vetoes: mixed types (the promotions differ), a decimal product compared
+# (its type differs), % on a decimal (T-SQL rejects it).
+query II
+EXPLAIN SELECT id, n + amount FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE amount * amount > 1 ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT id, amount % 2 FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+#
+# Division, casts, CASE, COALESCE, NULLIF (PR C): one type for every branch,
+# widening casts only, DuckDB's floating `/`.
+#
+
+query II
+EXPLAIN SELECT id, n / 4 AS q, CAST(n AS BIGINT) AS b, CAST(amount AS DOUBLE) AS d, CASE WHEN n > 15 THEN n ELSE 0 END AS c, coalesce(n, -1) AS co FROM rp_on.dbo.rp_t ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*NULLIF\(CAST\(@p0 AS float\), 0\)\) AS \[q\], CAST\(\[n\] AS bigint\) AS \[b\], CAST\(\[amount\] AS float\) AS \[d\], CASE WHEN .*COALESCE\(\[n\], @p.\) AS \[co\].*
+
+query II
+EXPLAIN CREATE TEMP TABLE bc_on AS SELECT id, n / 4 AS q, CAST(n AS BIGINT) AS b, CAST(amount AS DOUBLE) AS d, CASE WHEN n > 15 THEN n ELSE 0 END AS c, coalesce(n, -1) AS co FROM rp_on.dbo.rp_t ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*Mssql Scan Params.*AS \[q\].*AS \[co\].*
+
+statement ok
+CREATE TEMP TABLE bc_on AS SELECT id, n / 4 AS q, CAST(n AS BIGINT) AS b, CAST(amount AS DOUBLE) AS d, CASE WHEN n > 15 THEN n ELSE 0 END AS c, coalesce(n, -1) AS co FROM rp_on.dbo.rp_t ORDER BY id LIMIT 10;
+
+statement ok
+CREATE TEMP TABLE bc_off AS SELECT id, n / 4 AS q, CAST(n AS BIGINT) AS b, CAST(amount AS DOUBLE) AS d, CASE WHEN n > 15 THEN n ELSE 0 END AS c, coalesce(n, -1) AS co FROM rp_off.dbo.rp_t ORDER BY id LIMIT 10;
+
+query IRIRII
+SELECT * FROM bc_on ORDER BY id;
+----
+1	7.5	30	1.5	30	30
+2	NULL	NULL	2.0	0	-1
+3	2.5	10	NULL	0	10
+4	5.0	20	4.25	20	20
+5	NULL	NULL	5.0	0	-1
+
+query I
+SELECT count(*) FROM (SELECT * FROM bc_on EXCEPT ALL SELECT * FROM bc_off);
+----
+0
+
+query TT
+SELECT a.column_name, a.data_type FROM duckdb_columns() a JOIN duckdb_columns() b USING (column_name)
+WHERE a.table_name = 'bc_on' AND b.table_name = 'bc_off' AND a.data_type = b.data_type ORDER BY a.column_index;
+----
+id	INTEGER
+q	DOUBLE
+b	BIGINT
+d	DOUBLE
+c	INTEGER
+co	INTEGER
+
+# A bit column as a condition.
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE flag AND n > 15 ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*WHERE \(\(\[flag\] = 1\) AND \(\[n\] > @p0\)\).*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE flag AND n > 15 ORDER BY id LIMIT 10;
+----
+1
+4
+
+query I
+SELECT id FROM rp_off.dbo.rp_t WHERE flag AND n > 15 ORDER BY id LIMIT 10;
+----
+1
+4
+
+# A division in a condition is not pushed: a zero divisor is inf here and
+# NULL there, which would change the rows (`id / tiny IS NULL` finds row 5
+# only on the server).
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE id / tiny IS NULL ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE id / tiny IS NULL ORDER BY id LIMIT 10;
+----
+3
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE NOT flag ORDER BY id LIMIT 10;
+----
+2
+5
+
+# A UTF-8 varchar in a computed value arrives as DuckDB's UTF-8 (as is with
+# UTF8SUPPORT, transcoded by the server without it): pushed, same rows, same
+# type as the local path.
+query II
+EXPLAIN SELECT id, coalesce(code, 'none') AS c FROM rp_on.dbo.rp_t ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*COALESCE\(\[code\], @p0\) AS \[c\].*
+
+statement ok
+CREATE TEMP TABLE u8_on AS SELECT id, coalesce(code, 'none') AS c FROM rp_on.dbo.rp_t ORDER BY id LIMIT 10;
+
+statement ok
+CREATE TEMP TABLE u8_off AS SELECT id, coalesce(code, 'none') AS c FROM rp_off.dbo.rp_t ORDER BY id LIMIT 10;
+
+query IT
+SELECT * FROM u8_on ORDER BY id;
+----
+1	b
+2	a
+3	none
+4	B
+5	ab
+
+query I
+SELECT count(*) FROM (SELECT * FROM u8_on EXCEPT ALL SELECT * FROM u8_off);
+----
+0
+
+query TTT
+SELECT a.column_name, a.data_type, b.data_type FROM duckdb_columns() a JOIN duckdb_columns() b USING (column_name)
+WHERE a.table_name = 'u8_on' AND b.table_name = 'u8_off' ORDER BY a.column_index;
+----
+id	INTEGER	INTEGER
+c	MSSQL_VARCHAR(20)	MSSQL_VARCHAR(20)
+
+# The same on a connection not granted UTF8SUPPORT, where the server sends the
+# UTF-8 column as nvarchar.
+statement ok
+SET mssql_utf8_support = false;
+
+statement ok
+SET mssql_remote_pushdown = true;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rp_nu (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+statement ok
+RESET mssql_utf8_support;
+
+query II
+EXPLAIN SELECT id, coalesce(code, 'none') AS c FROM rp_nu.dbo.rp_t ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*COALESCE\(\[code\], @p0\) AS \[c\].*
+
+statement ok
+CREATE TEMP TABLE u8_nu AS SELECT id, coalesce(code, 'none') AS c FROM rp_nu.dbo.rp_t ORDER BY id LIMIT 10;
+
+query I
+SELECT count(*) FROM (SELECT * FROM u8_nu EXCEPT ALL SELECT * FROM u8_off);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM u8_off EXCEPT ALL SELECT * FROM u8_nu);
+----
+0
+
+statement ok
+DETACH rp_nu;
+
+# A code-page varchar in a computed value would arrive as its code-page bytes
+# (#224): left to the scan, which reads it through its NVARCHAR cast.
+query II
+EXPLAIN SELECT id, coalesce(legacy, 'x') FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query IT
+SELECT id, coalesce(legacy, 'x') FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+1	café
+
+# Without IEEE floating-point ops DuckDB raises on a zero divisor, which the
+# pushed form would turn into NULL: `/` is then not pushed.
+statement ok
+SET ieee_floating_point_ops = false;
+
+query II
+EXPLAIN SELECT id, n / 2 FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+statement ok
+RESET ieee_floating_point_ops;
+
+# IN / NOT IN, BETWEEN, LIKE / NOT LIKE, IS NULL of an expression, and a value
+# compared with a value of the same type (PR C).
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE n IN (10, 30) AND amount BETWEEN 1 AND 5 AND name LIKE '%a' AND name NOT LIKE 'g%' AND amount >= amount AND (n + 1) IS NOT NULL ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*\(\[n\] IN \(@p0, @p1\)\).*\(\[amount\] BETWEEN @p2 AND @p3\).*\(\[name\] LIKE @p4\).*\(NOT \(\[name\] LIKE @p5\)\).*\(\[amount\] >= \[amount\]\).*IS NOT NULL.*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE n IN (10, 30) AND amount BETWEEN 1 AND 5 AND name LIKE '%a' AND name NOT LIKE 'g%' AND amount >= amount AND (n + 1) IS NOT NULL ORDER BY id LIMIT 10;
+----
+1
+
+query I
+SELECT id FROM rp_off.dbo.rp_t WHERE n IN (10, 30) AND amount BETWEEN 1 AND 5 AND name LIKE '%a' AND name NOT LIKE 'g%' AND amount >= amount AND (n + 1) IS NOT NULL ORDER BY id LIMIT 10;
+----
+1
+
+# NOT IN with a NULL in the list: no row on either side.
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE n NOT IN (10, NULL) ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*\(NOT \(\[n\] IN \(@p0, NULL\)\)\).*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE n NOT IN (10, NULL) ORDER BY id LIMIT 10;
+----
+
+query I
+SELECT id FROM rp_off.dbo.rp_t WHERE n NOT IN (10, NULL) ORDER BY id LIMIT 10;
+----
+
+# `[` is literal in a DuckDB pattern and opens a class in T-SQL: escaped, the
+# pattern finds no row on either side (unescaped, `[a]` would match 'alpha').
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE name LIKE '%[a]%' ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*\(\[name\] LIKE @p0\).*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE name LIKE '%[a]%' ORDER BY id LIMIT 10;
+----
+
+# NOT BETWEEN, IN over an expression, two string columns of one collation.
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE n NOT BETWEEN 15 AND 25 AND n + 1 IN (11, 31) AND name <> legacy ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*\(NOT \(\[n\] BETWEEN @p0 AND @p1\)\).*\(\(\[n\] \+ @p2\) IN \(@p3, @p4\)\).*\(\[name\] <> \[legacy\]\).*
+
+query I
+SELECT id FROM rp_on.dbo.rp_t WHERE n NOT BETWEEN 15 AND 25 AND n + 1 IN (11, 31) AND name <> legacy ORDER BY id LIMIT 10;
+----
+1
+
+query I
+SELECT id FROM rp_off.dbo.rp_t WHERE n NOT BETWEEN 15 AND 25 AND n + 1 IN (11, 31) AND name <> legacy ORDER BY id LIMIT 10;
+----
+1
+
+# Vetoes: two collations (468 on the server), ILIKE, a LIKE pattern that is
+# not a constant.
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE name = code ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE name ILIKE 'A%' ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# nullif is not in the list above: it is a DuckDB macro (CASE WHEN a = b THEN
+# NULL ELSE a END), and DuckDB's rewriter keeps a local macro local -- the
+# writer renders NULLIF, but the node never reaches it.
+query II
+EXPLAIN SELECT id, nullif(n, 30) FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# A zero divisor is the one recorded divergence (spec 079 D2): DuckDB's `/`
+# gives inf, the server's float has none and a bare `/` raises 8134, so the
+# pushed form returns NULL.
+query R
+SELECT id / tiny FROM rp_on.dbo.rp_t WHERE id = 5 ORDER BY id LIMIT 1;
+----
+NULL
+
+query R
+SELECT id / tiny FROM rp_off.dbo.rp_t WHERE id = 5 ORDER BY id LIMIT 1;
+----
+inf
+
+# A string branch keeps the catalog type the local path gives it, with native
+# types on and off.
+statement ok
+CREATE TEMP TABLE sc_on AS SELECT id, coalesce(name, 'none') AS c FROM rp_on.dbo.rp_t ORDER BY id LIMIT 10;
+
+statement ok
+CREATE TEMP TABLE sc_off AS SELECT id, coalesce(name, 'none') AS c FROM rp_off.dbo.rp_t ORDER BY id LIMIT 10;
+
+query TTT
+SELECT a.column_name, a.data_type, b.data_type FROM duckdb_columns() a JOIN duckdb_columns() b USING (column_name)
+WHERE a.table_name = 'sc_on' AND b.table_name = 'sc_off' ORDER BY a.column_index;
+----
+id	INTEGER	INTEGER
+c	MSSQL_NVARCHAR(50)	MSSQL_NVARCHAR(50)
+
+query I
+SELECT count(*) FROM (SELECT * FROM sc_on EXCEPT ALL SELECT * FROM sc_off);
+----
+0
+
+statement ok
+SET mssql_catalog_native_types = false;
+
+statement ok
+SELECT mssql_invalidate_cache('rp_on'), mssql_invalidate_cache('rp_off');
+
+statement ok
+CREATE TEMP TABLE sp_on AS SELECT id, coalesce(name, 'none') AS c FROM rp_on.dbo.rp_t ORDER BY id LIMIT 10;
+
+statement ok
+CREATE TEMP TABLE sp_off AS SELECT id, coalesce(name, 'none') AS c FROM rp_off.dbo.rp_t ORDER BY id LIMIT 10;
+
+query TTT
+SELECT a.column_name, a.data_type, b.data_type FROM duckdb_columns() a JOIN duckdb_columns() b USING (column_name)
+WHERE a.table_name = 'sp_on' AND b.table_name = 'sp_off' ORDER BY a.column_index;
+----
+id	INTEGER	INTEGER
+c	VARCHAR	VARCHAR
+
+statement ok
+RESET mssql_catalog_native_types;
+
+statement ok
+SELECT mssql_invalidate_cache('rp_on'), mssql_invalidate_cache('rp_off');
+
+# With literals instead of parameters the constant says the column's type
+# itself, so the branch keeps it (a bare N'none' is nvarchar(4000) there).
+statement ok
+SET mssql_scan_parameterize_filters = false;
+
+statement ok
+CREATE TEMP TABLE sl_on AS SELECT id, coalesce(code, 'none') AS c FROM rp_on.dbo.rp_t ORDER BY id LIMIT 10;
+
+statement ok
+CREATE TEMP TABLE sl_off AS SELECT id, coalesce(code, 'none') AS c FROM rp_off.dbo.rp_t ORDER BY id LIMIT 10;
+
+statement ok
+RESET mssql_scan_parameterize_filters;
+
+query TTT
+SELECT a.column_name, a.data_type, b.data_type FROM duckdb_columns() a JOIN duckdb_columns() b USING (column_name)
+WHERE a.table_name = 'sl_on' AND b.table_name = 'sl_off' ORDER BY a.column_index;
+----
+id	INTEGER	INTEGER
+c	MSSQL_VARCHAR(20)	MSSQL_VARCHAR(20)
+
+# A constant wider than the column would widen the server's result type
+# (varchar(30) for a varchar(20) column); DuckDB keeps the column's.
+query II
+EXPLAIN SELECT id, coalesce(code, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# COALESCE over a division would turn the zero divisor's NULL into the
+# fallback (-1 there, inf here).
+query II
+EXPLAIN SELECT id, coalesce(id / tiny, -1) FROM rp_on.dbo.rp_t ORDER BY id LIMIT 10;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query R
+SELECT coalesce(id / tiny, -1) FROM rp_on.dbo.rp_t WHERE id = 5 ORDER BY id LIMIT 1;
+----
+inf
+
+# Vetoes: branches of two types, a narrowing cast.
+query II
+EXPLAIN SELECT id, CASE WHEN n > 1 THEN n ELSE amount END FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT id, CAST(n AS SMALLINT) FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+#
 # Types: a pushed SELECT reports the catalog's column types, read into them
 # exactly as the catalog scan reads them (column_types) -- the datetime2(7)
 # keeps its 100 ns ticks, the non-UTF-8 varchar its declared type, geometry.
@@ -488,7 +936,7 @@ SET mssql_scan_parameterize_filters = false;
 query II
 EXPLAIN SELECT id FROM rp_on.dbo.rp_t WHERE id >= 2 ORDER BY id LIMIT 10;
 ----
-physical_plan	<REGEX>:.*Mssql Scan.*WHERE \[id\] >= 2 ORDER BY.*
+physical_plan	<REGEX>:.*Mssql Scan.*WHERE \(\[id\] >= 2\) ORDER BY.*
 
 statement ok
 RESET mssql_scan_parameterize_filters;
