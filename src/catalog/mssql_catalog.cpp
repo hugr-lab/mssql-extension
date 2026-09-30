@@ -1643,7 +1643,7 @@ bool MSSQLCatalog::SupportsPushdown(const TableRef &ref) {
 
 bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out, string &why,
 								 optional_ptr<ClientContext> context) {
-	if (node.type != QueryNodeType::SELECT_NODE) {
+	if (node.type != QueryNodeType::SELECT_NODE && node.type != QueryNodeType::SET_OPERATION_NODE) {
 		why = "not a SELECT";
 		return false;
 	}
@@ -1720,7 +1720,9 @@ bool MSSQLCatalog::SupportsPushdown(const QueryNode &node) {
 								written.statement.c_str());
 		return true;
 	}
-	if (written.refers_outside && node.type == QueryNodeType::SELECT_NODE && !MayRepeatOutputNames(node)) {
+	if (written.refers_outside &&
+		(node.type == QueryNodeType::SELECT_NODE || node.type == QueryNodeType::SET_OPERATION_NODE) &&
+		!MayRepeatOutputNames(node)) {
 		// A correlated subquery, asked about on its own: a no would keep the
 		// statement around it from being pushed whole. RemoteExecute renders it
 		// with that statement, or hands it back.
@@ -1993,8 +1995,11 @@ static bool MayRepeatOutputNames(const QueryNode &node) {
 bool MSSQLCatalog::WritePushablePart(const QueryNode &node, mssql::WrittenQuery &written,
 									 optional_ptr<ClientContext> context, const vector<string> &scope, bool nested) {
 	string why;
-	if (node.type != QueryNodeType::SELECT_NODE || !mssql::SQLWriter::PushesMoreThanScan(node) ||
-		NamesScopeTable(const_cast<QueryNode &>(node), scope) || !WritePushdown(node, written, why, context)) {
+	// A set operation goes nested only (the owner's call, PR E1): at a
+	// statement's top its children go as parts and DuckDB combines them.
+	if (!(node.type == QueryNodeType::SELECT_NODE || (nested && node.type == QueryNodeType::SET_OPERATION_NODE)) ||
+		!mssql::SQLWriter::PushesMoreThanScan(node) || NamesScopeTable(const_cast<QueryNode &>(node), scope) ||
+		!WritePushdown(node, written, why, context)) {
 		return false;
 	}
 	if (nested && written.value_divergence) {

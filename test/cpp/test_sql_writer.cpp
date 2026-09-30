@@ -693,6 +693,35 @@ int main() {
 		}
 	}
 
+	// Set operations (PR E1): rendered where nested -- the catalog keeps one
+	// at a statement's top with DuckDB; the writer renders it either way.
+	ExpectSql("SELECT count(*) FROM (SELECT id FROM t UNION ALL SELECT t_id FROM u) s",
+			  "SELECT COUNT_BIG(*) AS [count_star()] FROM (SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] UNION ALL "
+			  "SELECT [r1].[t_id] AS [t_id] FROM [dbo].[u] AS [r1]) AS [r1]");
+	ExpectSql("SELECT id FROM t WHERE id IN (SELECT id FROM t EXCEPT SELECT t_id FROM u)",
+			  "SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] WHERE ([r1].[id] IN (SELECT [r2].[id] AS [id] FROM "
+			  "[dbo].[t] AS [r2] EXCEPT SELECT [r2].[t_id] AS [t_id] FROM [dbo].[u] AS [r2]))");
+	ExpectVeto("SELECT count(*) FROM (SELECT id FROM t EXCEPT ALL SELECT t_id FROM u) s");	   // no EXCEPT ALL
+	ExpectVeto("SELECT count(*) FROM (SELECT id FROM t UNION SELECT big FROM u) s");		   // int with bigint
+	ExpectVeto("SELECT count(*) FROM (SELECT id FROM t UNION BY NAME SELECT t_id FROM u) s");  // BY NAME
+	// Floating-point aggregates compared.
+	ExpectVeto("SELECT count(*) FROM (SELECT avg(ratio) AS a FROM t UNION SELECT avg(ratio) AS a FROM t) s");
+	ExpectVeto("SELECT count(*) FROM (SELECT legacy FROM t UNION ALL SELECT label FROM u) s");	// two string types
+	// ORDER BY / LIMIT of the set operation: a SELECT * wrapper; of a member:
+	// the member in a derived table of its own.
+	ExpectSql("SELECT s.id FROM (SELECT id FROM t UNION SELECT t_id FROM u ORDER BY id LIMIT 2) s LIMIT 5",
+			  "SELECT TOP (5) [r1].[id] AS [id] FROM (SELECT TOP (2) [r1].[id] AS [id] FROM (SELECT [r2].[id] AS [id] "
+			  "FROM [dbo].[t] AS [r2] UNION SELECT [r2].[t_id] AS [t_id] FROM [dbo].[u] AS [r2]) AS [r1] ORDER BY "
+			  "CASE WHEN [r1].[id] IS NULL THEN 1 ELSE 0 END, [r1].[id] ASC) AS [r1]");
+	ExpectSql("SELECT count(*) FROM ((SELECT id FROM t ORDER BY id LIMIT 1) UNION ALL SELECT t_id FROM u) s",
+			  "SELECT COUNT_BIG(*) AS [count_star()] FROM (SELECT * FROM (SELECT TOP (1) [r1].[id] AS [id] FROM "
+			  "[dbo].[t] AS [r1] ORDER BY [r1].[id] ASC) AS [q1] UNION ALL SELECT [r1].[t_id] AS [t_id] FROM [dbo].[u] "
+			  "AS [r1]) AS [r1]");
+	ExpectVeto("SELECT count(*) FROM (SELECT id FROM t UNION ALL (SELECT t_id FROM u ORDER BY t_id)) s");  // 1033
+	ExpectVeto("SELECT s.id FROM (SELECT id FROM t UNION SELECT t_id FROM u ORDER BY id + 1 LIMIT 2) s");
+	ExpectGain("SELECT * FROM (SELECT id FROM t UNION ALL SELECT t_id FROM u) s", false);
+	ExpectGain("SELECT * FROM (SELECT id FROM t UNION SELECT t_id FROM u) s", true);
+
 	// The gain rule: a node the catalog scan serves as well stays with it.
 	ExpectGain("SELECT * FROM t", false);
 	ExpectGain("SELECT id FROM t WHERE id = 1", false);

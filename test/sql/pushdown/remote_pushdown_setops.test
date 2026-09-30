@@ -1,0 +1,271 @@
+# name: test/sql/pushdown/remote_pushdown_setops.test
+# description: Spec 079 PR E1 -- a set operation nested in a subquery (FROM, IN, EXISTS) is rendered in place and the statement goes whole; one at a statement's top stays with DuckDB
+# group: [pushdown]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# At a statement's top DuckDB combines the children (each its own part when
+# it gains); nested, the set operation goes with the statement around it.
+# Every column has one DuckDB type on every side (the server's promotion is
+# not DuckDB's), strings one type and collation; UNION / EXCEPT / INTERSECT
+# compare rows, so their columns must be groupable, and strings are
+# compared under the server's collation (D4, as DISTINCT).
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS so_off (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = true;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS so_on (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+statement ok
+SELECT mssql_exec('so_off', 'DROP TABLE IF EXISTS dbo.so_a; DROP TABLE IF EXISTS dbo.so_b; DROP TABLE IF EXISTS dbo.so_c; DROP TABLE IF EXISTS dbo.so_d;
+	CREATE TABLE dbo.so_a (id int NOT NULL PRIMARY KEY, g int NULL, s nvarchar(10) COLLATE Latin1_General_CI_AS NULL);
+	CREATE TABLE dbo.so_b (id int NOT NULL PRIMARY KEY, g int NULL, s nvarchar(10) COLLATE Latin1_General_CI_AS NULL);
+	CREATE TABLE dbo.so_c (id int NOT NULL PRIMARY KEY, g int NULL, s nvarchar(10) COLLATE Latin1_General_BIN2 NULL);
+	CREATE TABLE dbo.so_d (id int NOT NULL PRIMARY KEY, g bigint NULL);
+	INSERT INTO dbo.so_a VALUES (1, 1, N''x''), (2, 2, N''Y''), (3, NULL, N''z''), (4, 3, NULL);
+	INSERT INTO dbo.so_b VALUES (1, 2, N''y''), (2, 3, N''X''), (3, NULL, N''w''), (4, 5, N''q'');
+	INSERT INTO dbo.so_c VALUES (1, 3, N''x''), (2, 7, N''k'');
+	INSERT INTO dbo.so_d VALUES (1, 1)');
+
+# At the top: DuckDB combines the children.
+query II
+EXPLAIN SELECT g FROM so_on.dbo.so_a UNION SELECT g FROM so_on.dbo.so_b ORDER BY g;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT g FROM so_on.dbo.so_a UNION SELECT g FROM so_on.dbo.so_b ORDER BY g;
+----
+1
+2
+3
+5
+NULL
+
+# In FROM: one statement.
+query II
+EXPLAIN SELECT count(*) FROM (SELECT g FROM so_on.dbo.so_a UNION ALL SELECT g FROM so_on.dbo.so_b) s;
+----
+physical_plan	<REGEX>:.*FROM \(SELECT \[r1\]\.\[g\] AS \[g\] FROM \[dbo\]\.\[so_a\] AS \[r1\] UNION ALL SELECT \[r1\]\.\[g\] AS \[g\] FROM \[dbo\]\.\[so_b\] AS \[r1\]\) AS \[r1\].*
+
+query I
+SELECT count(*) FROM (SELECT g FROM so_on.dbo.so_a UNION ALL SELECT g FROM so_on.dbo.so_b) s;
+----
+8
+
+query I
+SELECT s.g FROM (SELECT g FROM so_on.dbo.so_a UNION SELECT g FROM so_on.dbo.so_b) s ORDER BY s.g LIMIT 10;
+----
+1
+2
+3
+5
+NULL
+
+query I
+SELECT s.g FROM (SELECT g FROM so_off.dbo.so_a UNION SELECT g FROM so_off.dbo.so_b) s ORDER BY s.g LIMIT 10;
+----
+1
+2
+3
+5
+NULL
+
+query I
+SELECT s.g FROM (SELECT g FROM so_on.dbo.so_a INTERSECT SELECT g FROM so_on.dbo.so_b) s ORDER BY s.g LIMIT 10;
+----
+2
+3
+NULL
+
+query I
+SELECT count(*) FROM (SELECT g FROM so_on.dbo.so_a EXCEPT SELECT g FROM so_on.dbo.so_b) s;
+----
+1
+
+# Nested set operations keep their grouping.
+query II
+EXPLAIN SELECT count(*) FROM ((SELECT g FROM so_on.dbo.so_a UNION SELECT g FROM so_on.dbo.so_b) EXCEPT SELECT g FROM so_on.dbo.so_c) s;
+----
+physical_plan	<REGEX>:.*FROM \(\(SELECT .* UNION SELECT .*\) EXCEPT SELECT .*\) AS \[r1\].*
+
+query I
+SELECT count(*) FROM ((SELECT g FROM so_on.dbo.so_a UNION SELECT g FROM so_on.dbo.so_b) EXCEPT SELECT g FROM so_on.dbo.so_c) s;
+----
+4
+
+query I
+SELECT count(*) FROM ((SELECT g FROM so_off.dbo.so_a UNION SELECT g FROM so_off.dbo.so_b) EXCEPT SELECT g FROM so_off.dbo.so_c) s;
+----
+4
+
+# ORDER BY / LIMIT of the set operation, and of a child.
+query I
+SELECT s.g FROM (SELECT g FROM so_on.dbo.so_a UNION SELECT g FROM so_on.dbo.so_b ORDER BY g LIMIT 2) s ORDER BY s.g LIMIT 5;
+----
+1
+2
+
+query I
+SELECT s.g FROM ((SELECT g FROM so_on.dbo.so_a ORDER BY id LIMIT 1) UNION ALL (SELECT g FROM so_on.dbo.so_b ORDER BY id LIMIT 1)) s ORDER BY s.g LIMIT 5;
+----
+1
+2
+
+# IN over a set operation.
+query II
+EXPLAIN SELECT id FROM so_on.dbo.so_a WHERE g IN (SELECT g FROM so_on.dbo.so_b UNION SELECT g FROM so_on.dbo.so_a WHERE id > 2) ORDER BY id;
+----
+physical_plan	<REGEX>:.*IN \(SELECT .* UNION SELECT .*\)\).*
+
+query I
+SELECT id FROM so_on.dbo.so_a WHERE g IN (SELECT g FROM so_on.dbo.so_b UNION SELECT g FROM so_on.dbo.so_a WHERE id > 2) ORDER BY id;
+----
+2
+4
+
+# Correlated children of a set operation under EXISTS.
+query II
+EXPLAIN SELECT id FROM so_on.dbo.so_a a WHERE EXISTS (SELECT 1 FROM so_on.dbo.so_b b WHERE b.g = a.g UNION ALL SELECT 1 FROM so_on.dbo.so_c c WHERE c.g = a.g) ORDER BY id;
+----
+physical_plan	<REGEX>:.*WHERE EXISTS \(SELECT 1 AS \[1\] FROM \[dbo\]\.\[so_b\] AS \[r2\] WHERE \(\[r2\]\.\[g\] = \[r1\]\.\[g\]\) UNION ALL SELECT 1 AS \[1\] FROM \[dbo\]\.\[so_c\] AS \[r2\] WHERE \(\[r2\]\.\[g\] = \[r1\]\.\[g\]\)\).*
+
+query I
+SELECT id FROM so_on.dbo.so_a a WHERE EXISTS (SELECT 1 FROM so_on.dbo.so_b b WHERE b.g = a.g UNION ALL SELECT 1 FROM so_on.dbo.so_c c WHERE c.g = a.g) ORDER BY id;
+----
+2
+4
+
+query I
+SELECT id FROM so_off.dbo.so_a a WHERE EXISTS (SELECT 1 FROM so_off.dbo.so_b b WHERE b.g = a.g UNION ALL SELECT 1 FROM so_off.dbo.so_c c WHERE c.g = a.g) ORDER BY id;
+----
+2
+4
+
+# Strings of one type and collation: compared under the server's collation
+# (D4 for sets, as DISTINCT): case-insensitive there, 6 rows; 8 in DuckDB.
+query I
+SELECT count(*) FROM (SELECT s FROM so_on.dbo.so_a UNION SELECT s FROM so_on.dbo.so_b) x;
+----
+6
+
+query I
+SELECT count(*) FROM (SELECT s FROM so_off.dbo.so_a UNION SELECT s FROM so_off.dbo.so_b) x;
+----
+8
+
+# Vetoes: the rows are DuckDB's.
+# Two collations (the server's 468).
+query I
+SELECT count(*) FROM (SELECT s FROM so_on.dbo.so_a UNION ALL SELECT s FROM so_on.dbo.so_c) x;
+----
+6
+
+# int with bigint: DuckDB's promotion is not the server's.
+query I
+SELECT count(*) FROM (SELECT g FROM so_on.dbo.so_a UNION SELECT g FROM so_on.dbo.so_d) x;
+----
+4
+
+query II
+EXPLAIN SELECT count(*) FROM (SELECT g FROM so_on.dbo.so_a UNION SELECT g FROM so_on.dbo.so_d) x;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# EXCEPT ALL: none in T-SQL.
+query I
+SELECT count(*) FROM (SELECT g FROM so_on.dbo.so_a EXCEPT ALL SELECT g FROM so_on.dbo.so_b) x;
+----
+1
+
+# INTERSECT / EXCEPT against the scan path.
+query I
+SELECT s.g FROM (SELECT g FROM so_off.dbo.so_a INTERSECT SELECT g FROM so_off.dbo.so_b) s ORDER BY s.g LIMIT 10;
+----
+2
+3
+NULL
+
+query I
+SELECT count(*) FROM (SELECT g FROM so_off.dbo.so_a EXCEPT SELECT g FROM so_off.dbo.so_b) s;
+----
+1
+
+# A member ordered without a LIMIT (1033 there): not pushed, DuckDB's rows.
+query I
+SELECT count(*) FROM (SELECT g FROM so_on.dbo.so_a UNION ALL (SELECT g FROM so_on.dbo.so_b ORDER BY g)) s;
+----
+8
+
+# The set operation's ORDER BY takes result columns only: an expression is
+# DuckDB's binder error on both paths (review of E1: the wrapper took it).
+statement error
+SELECT s.g FROM (SELECT g FROM so_on.dbo.so_a UNION SELECT g FROM so_on.dbo.so_b ORDER BY g + 1 LIMIT 3) s;
+----
+ORDER BY
+
+statement error
+SELECT s.g FROM (SELECT g FROM so_off.dbo.so_a UNION SELECT g FROM so_off.dbo.so_b ORDER BY g + 1 LIMIT 3) s;
+----
+ORDER BY
+
+# A correlated set operation with its own ORDER BY / LIMIT.
+query II
+EXPLAIN SELECT id FROM so_on.dbo.so_a a WHERE g IN (SELECT b.g FROM so_on.dbo.so_b b WHERE b.id = a.id UNION SELECT g FROM so_on.dbo.so_c ORDER BY g LIMIT 5) ORDER BY id;
+----
+physical_plan	<REGEX>:.*IN \(SELECT TOP \(5\) .*WHERE \(\[r3\]\.\[id\] = \[r1\]\.\[id\]\) UNION .*
+
+query I
+SELECT id FROM so_on.dbo.so_a a WHERE g IN (SELECT b.g FROM so_on.dbo.so_b b WHERE b.id = a.id UNION SELECT g FROM so_on.dbo.so_c ORDER BY g LIMIT 5) ORDER BY id;
+----
+4
+
+query I
+SELECT id FROM so_off.dbo.so_a a WHERE g IN (SELECT b.g FROM so_off.dbo.so_b b WHERE b.id = a.id UNION SELECT g FROM so_off.dbo.so_c ORDER BY g LIMIT 5) ORDER BY id;
+----
+4
+
+# Members of one DuckDB type but different server shapes: time(3) and
+# time(7) are both TIME, read at microseconds. The merged column is opaque
+# outside the set operation, so the DISTINCT over it stays in DuckDB (one
+# value here; three at 100 ns on the server).
+statement ok
+SELECT mssql_exec('so_off', 'DROP TABLE IF EXISTS dbo.so_e; DROP TABLE IF EXISTS dbo.so_f;
+	CREATE TABLE dbo.so_e (id int NOT NULL PRIMARY KEY, t time(3) NOT NULL);
+	CREATE TABLE dbo.so_f (id int NOT NULL PRIMARY KEY, t time(7) NOT NULL);
+	INSERT INTO dbo.so_e VALUES (1, ''12:00:00'');
+	INSERT INTO dbo.so_f VALUES (1, ''12:00:00.0000001''), (2, ''12:00:00.0000002'')');
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT s.t FROM (SELECT t FROM so_on.dbo.so_e UNION ALL SELECT t FROM so_on.dbo.so_f) s) x;
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT s.t FROM (SELECT t FROM so_off.dbo.so_e UNION ALL SELECT t FROM so_off.dbo.so_f) s) x;
+----
+1
+
+statement ok
+SELECT mssql_exec('so_off', 'DROP TABLE dbo.so_e; DROP TABLE dbo.so_f');
+
+statement ok
+SELECT mssql_exec('so_off', 'DROP TABLE dbo.so_a; DROP TABLE dbo.so_b; DROP TABLE dbo.so_c; DROP TABLE dbo.so_d');
+
+statement ok
+DETACH so_on;
+
+statement ok
+DETACH so_off;

@@ -31,6 +31,7 @@
 #include "duckdb/parser/expression/type_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
@@ -392,8 +393,22 @@ public:
 	}
 
 	bool Write(const SelectNode &node);
+	//! A SELECT, or a set operation (PR E1: nested in a subquery; the one at
+	//! a statement's top stays with DuckDB, see MSSQLCatalog::RemoteExecute).
+	bool WriteQueryNode(const QueryNode &node);
 
 private:
+	bool WriteSetOperation(const SetOperationNode &node);
+	//! Whether a node around this one has relations a column could be of.
+	bool HasOuterRelations() const {
+		for (auto outer = outer_; outer; outer = outer->outer_) {
+			if (!outer->relations_.empty()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	bool Veto(const std::string &reason) {
 		why_ = reason;
 		return false;
@@ -525,6 +540,13 @@ private:
 	bool SubqueryOperand(const NodeWriter &inner, const WrittenQuery &inner_out, const std::string &sql, Operand &out);
 	//! Copies of the columns a subquery's result is, owned for its operand.
 	std::deque<MSSQLColumnInfo> subquery_columns_;
+	//! The SELECT * wrapper a set operation's ORDER BY / LIMIT is written
+	//! through, kept while the writer lives.
+	unique_ptr<SelectNode> synthetic_node_;
+	//! The wrapper's subquery and the set operation it stands for: its tables
+	//! are the original's (the resolver knows those objects, not a copy's).
+	const SubqueryRef *synthetic_ref_ = nullptr;
+	const SetOperationNode *synthetic_setop_ = nullptr;
 	//! The SEMI / ANTI relation whose condition is being written: the one
 	//! place its columns can be named.
 	idx_t semi_scope_ = DConstants::INVALID_INDEX;
@@ -576,6 +598,10 @@ public:
 };
 
 int NodeWriter::FindColumn(const ColumnRefExpression &ref, idx_t &out) const {
+	if (relations_.empty()) {
+		// A set operation's writer: no relation of its own to name.
+		return 0;
+	}
 	auto &names = ref.ColumnNames();
 	if (names.size() > 2) {
 		return -1;
@@ -630,7 +656,7 @@ bool NodeWriter::ResolveColumn(const ColumnRefExpression &ref, idx_t &out) {
 	for (auto &name : select_aliases_) {
 		alias = alias || (names.size() == 1 && StringUtil::CIEquals(names[0].GetIdentifierName(), name));
 	}
-	if (found != 1 && !outer_ && !alias && MayBeOuter(ref, found)) {
+	if (found != 1 && !HasOuterRelations() && !alias && MayBeOuter(ref, found)) {
 		out_.refers_outside = true;
 	}
 	switch (found) {
@@ -840,9 +866,7 @@ bool NodeWriter::CollectDerived(const SubqueryRef &ref, std::vector<idx_t> &memb
 		return Veto("column aliases on a subquery");
 	}
 	auto &node = *ref.subquery->node;
-	if (node.type != QueryNodeType::SELECT_NODE) {
-		return Veto("a set operation in FROM");
-	}
+	const bool synthetic = &ref == synthetic_ref_;
 	bool ordered = false;
 	bool limited = false;
 	for (auto &modifier : node.modifiers) {
@@ -856,9 +880,17 @@ bool NodeWriter::CollectDerived(const SubqueryRef &ref, std::vector<idx_t> &memb
 	}
 	WrittenQuery inner_out;
 	NodeWriter inner(*this, inner_out);
-	if (!inner.Write(node.Cast<SelectNode>())) {
+	if (synthetic) {
+		// The set operation of a wrapper this writer stands in for: correlated
+		// as the wrapper is, its members aliased past the nodes around it.
+		inner.outer_ = outer_;
+		inner.alias_base_ = alias_base_ + relations_.size() + 1;
+	}
+	if (synthetic ? !inner.WriteSetOperation(*synthetic_setop_) : !inner.WriteQueryNode(node)) {
+		out_.refers_outside = out_.refers_outside || inner_out.refers_outside;
 		return false;
 	}
+	correlated_ = correlated_ || inner.correlated_;
 	Relation relation;
 	relation.derived = true;
 	relation.derived_sql = inner_out.statement;
@@ -1755,9 +1787,6 @@ bool NodeWriter::WriteSubqueryNode(const SubqueryExpression &subquery, NodeWrite
 		return Veto("a subquery in an aggregate");
 	}
 	auto &node = *subquery.Subquery()->node;
-	if (node.type != QueryNodeType::SELECT_NODE) {
-		return Veto("a set operation in a subquery");
-	}
 	bool ordered = false;
 	bool limited = false;
 	for (auto &modifier : node.modifiers) {
@@ -1768,7 +1797,7 @@ bool NodeWriter::WriteSubqueryNode(const SubqueryExpression &subquery, NodeWrite
 		// 1033 there, as in a derived table.
 		return Veto("an ORDER BY without LIMIT in a subquery");
 	}
-	if (!inner.Write(node.Cast<SelectNode>())) {
+	if (!inner.WriteQueryNode(node)) {
 		return false;
 	}
 	if (columns > 0 && inner.Outputs().size() != columns) {
@@ -2782,17 +2811,228 @@ bool NodeWriter::Write(const SelectNode &node) {
 	return true;
 }
 
+bool NodeWriter::WriteQueryNode(const QueryNode &node) {
+	if (node.type == QueryNodeType::SELECT_NODE) {
+		return Write(node.Cast<SelectNode>());
+	}
+	if (node.type != QueryNodeType::SET_OPERATION_NODE) {
+		return Veto("a recursive CTE or another query node");
+	}
+	if (!node.cte_map.map.empty()) {
+		return Veto("a WITH clause");
+	}
+	if (node.modifiers.empty()) {
+		return WriteSetOperation(node.Cast<SetOperationNode>());
+	}
+	// ORDER BY / LIMIT over a set operation: `SELECT * FROM (<set operation>)`
+	// with them -- the names are the first child's either way, and the NULL
+	// placement a nullable key needs is an expression, which T-SQL refuses in
+	// a set operation's own ORDER BY (104).
+	auto select = make_uniq<SelectNode>();
+	for (auto &modifier : node.modifiers) {
+		if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
+			for (auto &order : modifier->Cast<OrderModifier>().orders) {
+				// A set operation is ordered by its result columns only (DuckDB's
+				// binder refuses an expression there; the wrapper would take it).
+				auto &key = *order.expression;
+				const bool column = key.GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+									key.Cast<ColumnRefExpression>().ColumnNames().size() == 1;
+				const bool position = key.GetExpressionClass() == ExpressionClass::CONSTANT;
+				if (!column && !position) {
+					return Veto("ORDER BY " + key.ToString() + " over a set operation");
+				}
+			}
+		}
+		select->modifiers.push_back(modifier->Copy());
+	}
+	select->select_list.push_back(make_uniq<StarExpression>());
+	// The set operation itself is written from `node` (see CollectDerived);
+	// the placeholder only gives the subquery a node.
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = make_uniq<SetOperationNode>();
+	select->from_table = make_uniq<SubqueryRef>(std::move(statement));
+	synthetic_ref_ = &select->from_table->Cast<SubqueryRef>();
+	synthetic_setop_ = &node.Cast<SetOperationNode>();
+	synthetic_node_ = std::move(select);
+	return Write(*synthetic_node_);
+}
+
+bool NodeWriter::WriteSetOperation(const SetOperationNode &node) {
+	const char *keyword;
+	switch (node.setop_type) {
+	case SetOperationType::UNION:
+		keyword = node.setop_all ? " UNION ALL " : " UNION ";
+		break;
+	case SetOperationType::EXCEPT:
+		keyword = " EXCEPT ";
+		break;
+	case SetOperationType::INTERSECT:
+		keyword = " INTERSECT ";
+		break;
+	default:
+		return Veto("UNION BY NAME");
+	}
+	if (node.setop_all && node.setop_type != SetOperationType::UNION) {
+		// T-SQL has no EXCEPT ALL / INTERSECT ALL.
+		return Veto("EXCEPT ALL / INTERSECT ALL");
+	}
+	// UNION, EXCEPT and INTERSECT compare rows: a set of values, as DISTINCT's.
+	const bool compares = !(node.setop_type == SetOperationType::UNION && node.setop_all);
+	if (node.children.size() < 2) {
+		return Veto("a set operation of one child");
+	}
+	std::vector<WrittenQuery> child_outs(node.children.size());
+	std::vector<unique_ptr<NodeWriter>> children;
+	std::string sql;
+	for (idx_t c = 0; c < node.children.size(); c++) {
+		auto &child_node = *node.children[c];
+		bool ordered = false;
+		bool limited = false;
+		for (auto &modifier : child_node.modifiers) {
+			ordered = ordered || modifier->type == ResultModifierType::ORDER_MODIFIER;
+			limited = limited || modifier->type == ResultModifierType::LIMIT_MODIFIER;
+		}
+		if (ordered && !limited) {
+			// 1033 there, as in a derived table; DuckDB promises no order.
+			return Veto("an ORDER BY without LIMIT in a set operation's member");
+		}
+		// Its children are aliased past nothing of this node: a correlated
+		// column is the enclosing node's.
+		children.push_back(make_uniq<NodeWriter>(*this, child_outs[c], Correlated()));
+		if (!children.back()->WriteQueryNode(child_node)) {
+			out_.refers_outside = out_.refers_outside || child_outs[c].refers_outside;
+			return false;
+		}
+		std::string part = child_outs[c].statement;
+		if (ordered || limited) {
+			// TOP / ORDER BY / OFFSET inside a set operation's member: in a
+			// derived table of its own, which T-SQL takes.
+			part = "SELECT * FROM (" + part + ") AS [q" + std::to_string(alias_base_ + c + 1) + "]";
+		} else if (child_node.type == QueryNodeType::SET_OPERATION_NODE) {
+			part = "(" + part + ")";
+		}
+		sql += (c == 0 ? "" : keyword) + part;
+	}
+	auto &first = *children[0];
+	const auto width = first.Outputs().size();
+	for (idx_t i = 0; i < width; i++) {
+		bool plain = true;
+		bool nullable = false;
+		bool divergent = false;
+		for (idx_t c = 0; c < children.size(); c++) {
+			auto &child = *children[c];
+			if (child.Outputs().size() != width) {
+				return Veto("set operation children of different widths");
+			}
+			auto &output = child.Outputs()[i];
+			auto &child_out = child_outs[c];
+			// One DuckDB type, known, on every side: the server's promotion
+			// (varchar(10) with varchar(20), int with bigint) is not DuckDB's.
+			if (child_out.column_types[i] != child_outs[0].column_types[i] ||
+				child_out.cast_types[i] != child_outs[0].cast_types[i] ||
+				(child_out.column_types[i].id() == LogicalTypeId::INVALID &&
+				 child_out.cast_types[i].id() == LogicalTypeId::INVALID)) {
+				return Veto("set operation columns of different types");
+			}
+			const bool column = output.column_index != DConstants::INVALID_INDEX;
+			plain = plain && column && output.plain_read;
+			if (plain) {
+				// One server shape too: time(3) and time(7) are both TIME here,
+				// a varchar(5) and a varchar(50) both VARCHAR with native types
+				// off -- the first member's metadata would misdescribe the rest.
+				auto &mine = child.FlatColumn(output.column_index);
+				auto &theirs = first.FlatColumn(first.Outputs()[i].column_index);
+				plain = StringUtil::CIEquals(mine.sql_type_name, theirs.sql_type_name) &&
+						mine.max_length == theirs.max_length && mine.precision == theirs.precision &&
+						mine.scale == theirs.scale;
+			}
+			const auto kind = column ? KindOf(child.FlatColumn(output.column_index)) : output.value.kind;
+			if (kind == ComparableKind::String) {
+				// One collation, or the server's 468 / a different comparison.
+				auto &reference = first.Outputs()[i];
+				if (!column || !output.plain_read || reference.column_index == DConstants::INVALID_INDEX ||
+					!reference.plain_read ||
+					child.FlatColumn(output.column_index).collation_name !=
+						first.FlatColumn(reference.column_index).collation_name ||
+					!StringUtil::CIEquals(child.FlatColumn(output.column_index).sql_type_name,
+										  first.FlatColumn(reference.column_index).sql_type_name)) {
+					return Veto("set operation string columns that are not columns of one type and collation");
+				}
+			}
+			if (compares) {
+				if (column ? !IsGroupable(child.FlatColumn(output.column_index))
+						   : output.value.kind == ComparableKind::None || output.value.approximate ||
+								 output.value.division) {
+					return Veto("a set operation compares " + output.name);
+				}
+			}
+			if (column) {
+				nullable = nullable || child.FlatColumn(output.column_index).is_nullable ||
+						   child.divergent_of_[output.column_index];
+				divergent = divergent || child.divergent_of_[output.column_index];
+			} else {
+				nullable = true;
+				divergent = divergent || output.value.division || output.value.approximate;
+			}
+		}
+		auto &reference = first.Outputs()[i];
+		OutputColumn entry;
+		entry.name = reference.name;
+		if (plain) {
+			auto column = first.FlatColumn(reference.column_index);
+			column.name = reference.name;
+			column.is_nullable = nullable;
+			entry.column_index = columns_.size();
+			entry.plain_read = true;
+			columns_.push_back(std::move(column));
+			// Parallel to columns_ as elsewhere; relation_of_ stays empty, as a
+			// set operation has no relation (FindColumn answers 0 for it).
+			types_.push_back(child_outs[0].column_types[i]);
+			cast_of_.push_back(child_outs[0].cast_types[i]);
+			already_read_.push_back(true);
+			divergent_of_.push_back(divergent);
+		} else {
+			entry.column_index = DConstants::INVALID_INDEX;
+			if (reference.column_index != DConstants::INVALID_INDEX) {
+				// Columns of different server shapes: a value, opaque outside.
+				auto &column = first.FlatColumn(reference.column_index);
+				entry.value.type = column.duckdb_type;
+				entry.value.kind = ComparableKind::None;
+			} else {
+				entry.value = reference.value;
+			}
+			entry.value.column = nullptr;
+			entry.value.constant = nullptr;
+			entry.value.orderable = false;
+			entry.value.not_null = false;
+			entry.value.division = divergent;
+			entry.value.approximate = divergent;
+			entry.value.result_type = child_outs[0].cast_types[i].id() != LogicalTypeId::INVALID
+										  ? child_outs[0].cast_types[i]
+										  : child_outs[0].column_types[i];
+			entry.value.cast_result = child_outs[0].cast_types[i].id() != LogicalTypeId::INVALID;
+		}
+		outputs_.push_back(std::move(entry));
+		out_.column_types.push_back(child_outs[0].column_types[i]);
+		out_.cast_types.push_back(child_outs[0].cast_types[i]);
+		out_.column_names.push_back(child_outs[0].column_names[i]);
+	}
+	for (auto &child_out : child_outs) {
+		out_.gain_uncertain = out_.gain_uncertain || child_out.gain_uncertain;
+		out_.value_divergence = out_.value_divergence || child_out.value_divergence;
+		out_.largest_input_rows = MaxValue(out_.largest_input_rows, child_out.largest_input_rows);
+		out_.input_size_unknown = out_.input_size_unknown || child_out.input_size_unknown;
+	}
+	out_.statement = sql;
+	return true;
+}
+
 }  // namespace
 
 bool SQLWriter::Write(const QueryNode &node, WrittenQuery &out, std::string &why) {
 	out = WrittenQuery();
-	if (node.type != QueryNodeType::SELECT_NODE) {
-		why = "not a SELECT";
-		return false;
-	}
-	auto &select = node.Cast<SelectNode>();
 	NodeWriter writer(options_, resolver_, out, why);
-	if (!writer.Write(select)) {
+	if (!writer.WriteQueryNode(node)) {
 		return false;
 	}
 	writer.TakeParams(out.params);
@@ -2831,6 +3071,20 @@ bool SQLWriter::PushesMoreThanScan(const QueryNode &node) {
 			modifier->type == ResultModifierType::DISTINCT_MODIFIER) {
 			return true;
 		}
+	}
+	if (node.type == QueryNodeType::SET_OPERATION_NODE) {
+		// UNION / EXCEPT / INTERSECT compare rows there, not here; a UNION ALL
+		// gains what its children do (DuckDB pushes a filter into each).
+		auto &setop = node.Cast<SetOperationNode>();
+		if (!(setop.setop_type == SetOperationType::UNION && setop.setop_all)) {
+			return true;
+		}
+		for (auto &child : setop.children) {
+			if (PushesMoreThanScan(*child)) {
+				return true;
+			}
+		}
+		return false;
 	}
 	if (node.type != QueryNodeType::SELECT_NODE) {
 		return false;
