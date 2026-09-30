@@ -285,14 +285,13 @@ pushed against not pushed; a semantic pass of 280 on the live server).**
   kept in a condition, where only the value counts, and vetoed as a result
   column.
 - *Floating point.* A `float(53)` column is a comparable kind of its own:
-  compared with a constant, and `+`, `-` over doubles (IEEE binary64 on both
-  sides, so each operation rounds alike), `/` as in PR C, `CAST(x AS
-  DOUBLE)`. An overflow is inf in DuckDB and error 8115 on the server, and
-  the server computes a projection for every row WHERE passes, the ones TOP
-  discards included -- so a statement DuckDB completes can fail pushed. A
-  sum needs magnitudes near 1.7e308 (recorded); a product only near 1e154
-  (fuzz: `fl*fl*fl … LIMIT 3` failed on rows it did not return), so `*` over
-  doubles is not pushed (owner's call). `real` stays out (DuckDB promotes FLOAT beside a
+  compared with a constant, `/` as in PR C, `CAST(x AS DOUBLE)`. No `+ - *`
+  over doubles: an overflow is inf in DuckDB and error 8115 on the server,
+  and the server computes a projection for every row WHERE passes, the ones
+  TOP discards included -- so a statement DuckDB completes fails pushed
+  (fuzz: `fl*fl*fl … LIMIT 3` failed on rows it did not return). A product
+  gets there near 1e154, a sum near 1.8e308; the shared `FunctionFor`
+  refuses all three for both paths (review of #396, merged). `real` stays out (DuckDB promotes FLOAT beside a
   DOUBLE). `money` / `smallmoney` arithmetic is not in PR D.
 
 **Revised in PR B: the catalog's types, not the describe's.** Run on every

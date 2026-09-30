@@ -481,7 +481,8 @@ int main() {
 		"SELECT * FROM t SEMI JOIN u USING (id) LIMIT 1",
 		"SELECT TOP (1) [r1].[id] AS [id], [r1].[name] AS [name], [r1].[code] AS [code], [r1].[amount] AS [amount], "
 		"[r1].[day] AS [day], [r1].[flag] AS [flag], [r1].[ts] AS [ts], CAST([r1].[legacy] AS NVARCHAR(30)) AS "
-		"[legacy], [r1].[wide] AS [wide], [r1].[mid] AS [mid], [r1].[ratio] AS [ratio], [r1].[doc] AS [doc], "
+		"[legacy], [r1].[wide] AS [wide], [r1].[mid] AS [mid], [r1].[tiny] AS [tiny], [r1].[ratio] AS [ratio], "
+		"[r1].[doc] AS [doc], "
 		"[r1].[small] AS [small] FROM "
 		"[dbo].[t] AS [r1] WHERE EXISTS (SELECT 1 FROM [dbo].[u] AS [r2] WHERE ([r1].[id] = [r2].[id]))");
 	ExpectVeto("SELECT u.label FROM t SEMI JOIN u ON t.id = u.t_id");  // the right side is gone
@@ -518,9 +519,8 @@ int main() {
 	ExpectVeto("SELECT id FROM t WHERE -id > 3 LIMIT 1");
 	ExpectSql("SELECT id FROM t WHERE -amount > 3 LIMIT 1",
 			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ((-[amount]) > @p0)");	// moved, but no overflow
-	ExpectSql("SELECT id FROM t WHERE ratio + 1 > 5 LIMIT 1",
-			  "SELECT TOP (1) [id] FROM [dbo].[t] WHERE (([ratio] + @p0) > @p1)");	// integral types only
-	ExpectVeto("SELECT -(amount + 700) AS x FROM t LIMIT 1");  // the negation keeps the uncertainty
+	ExpectVeto("SELECT id FROM t WHERE ratio + 1 > 5 LIMIT 1");	 // not moved, but a float sum is not pushed
+	ExpectVeto("SELECT -(amount + 700) AS x FROM t LIMIT 1");	 // the negation keeps the uncertainty
 	{
 		WrittenQuery out;
 		std::string why;
@@ -558,11 +558,12 @@ int main() {
 		}
 	}
 	ExpectVeto("SELECT -(small * small) FROM t LIMIT 1");
-	// Doubles: +, -, * round alike on both sides.
-	ExpectSql("SELECT ratio - ratio AS r FROM t WHERE ratio > 1.5 LIMIT 1",
-			  "SELECT TOP (1) ([ratio] - [ratio]) AS [r] FROM [dbo].[t] WHERE ([ratio] > @p0)");
-	ExpectVeto("SELECT ratio * ratio AS r FROM t LIMIT 1");	 // overflows (8115) near 1e154 there, inf here
-	ExpectParams("SELECT ratio + 1 AS r FROM t LIMIT 1", "@p0 float");
+	// Doubles: compared, not computed -- + - * overflow on the server where
+	// DuckDB says inf (review of #396, one rule for both paths).
+	ExpectSql("SELECT id FROM t WHERE ratio > 1.5 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([ratio] > @p0)");
+	ExpectVeto("SELECT ratio - ratio AS r FROM t LIMIT 1");
+	ExpectVeto("SELECT ratio + 1 AS r FROM t LIMIT 1");
+	ExpectVeto("SELECT ratio * ratio AS r FROM t LIMIT 1");
 	ExpectVeto("SELECT ratio % 2 FROM t LIMIT 1");
 	ExpectVeto("SELECT ratio + amount FROM t LIMIT 1");
 

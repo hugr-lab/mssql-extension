@@ -1558,24 +1558,11 @@ bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
 	if (right.constant && !BindConstant(left, right, true)) {
 		return false;
 	}
-	// A double: + and - round alike on both sides (IEEE binary64). An overflow
-	// is inf here and error 8115 there, and the server computes a projection
-	// for every row WHERE passes, TOP's discards included -- so a statement
-	// DuckDB completes can fail pushed. A sum needs values near 1.7e308 for it
-	// (recorded); a product only near 1e154 (full review fuzz), so * is not
-	// pushed.
-	if (left.kind == ComparableKind::Float && right.kind == ComparableKind::Float &&
-		left.type.id() == LogicalTypeId::DOUBLE && right.type.id() == LogicalTypeId::DOUBLE &&
-		(name == "+" || name == "-")) {
-		out.sql = "(" + left.sql + " " + name + " " + right.sql + ")";
-		out.type = LogicalType::DOUBLE;
-		out.kind = ComparableKind::Float;
-		// MoveConstantsRule matches integral types only: DuckDB computes `f + c`.
-		// x / 0 is NULL there, inf here: still the recorded value divergence.
-		out.division = left.division || right.division;
-		out.approximate = left.approximate || right.approximate;
-		return true;
-	}
+	// No arithmetic over doubles: an overflow is inf in DuckDB and error 8115
+	// on the server, raised for every row WHERE passes (TOP's discards
+	// included) -- near 1e154 for a product, 1.8e308 for a sum. FunctionFor
+	// refuses + - * over a float for both paths (review of #396); a double
+	// falls through to the exact-numeric check below and is vetoed.
 	// Same type on both sides, or the promotions differ: DuckDB widens
 	// smallint + int to INTEGER, the server by its own precedence.
 	if (left.kind != ComparableKind::ExactNumeric || right.kind != ComparableKind::ExactNumeric ||

@@ -236,24 +236,15 @@ SELECT id FROM ra_on.dbo.ra_t ORDER BY id, id DESC LIMIT 2;
 1
 2
 
-# Doubles: + and - round alike on both sides, pushed; * is not (it overflows
-# near 1e154, an error there where DuckDB says inf).
+# Doubles are compared, not computed: + - * overflow on the server (8115)
+# where DuckDB says inf, for rows TOP discards too (review of #396).
 query II
-EXPLAIN SELECT id, ratio + ratio - ratio AS r FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
+EXPLAIN SELECT id FROM ra_on.dbo.ra_t WHERE ratio > 1.0 ORDER BY id LIMIT 5;
 ----
-physical_plan	<REGEX>:.*\(\(\[ratio\] \+ \[ratio\]\) - \[ratio\]\) AS \[r\].*
-
-query IR
-SELECT id, ratio + ratio - ratio AS r FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
-----
-1	0.5
-2	1.5
-3	NULL
-4	2.0
-5	4.0
+physical_plan	<REGEX>:.*WHERE \(\[ratio\] > @p0\).*
 
 query II
-EXPLAIN SELECT id, ratio * ratio AS r FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
+EXPLAIN SELECT id, ratio + ratio AS r FROM ra_on.dbo.ra_t ORDER BY id LIMIT 5;
 ----
 physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
 

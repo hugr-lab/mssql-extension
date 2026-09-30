@@ -65,9 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   join under a later RIGHT / FULL join, and a `CROSS JOIN` (or comma join)
   with nothing else to gain. `stddev` / `variance` can differ by far more
   than the last bits on large, close values (the server computes them in one
-  pass). Arithmetic over `float` columns is pushed as `+`, `-`, `/` (rounding
-  alike on both sides; an overflow near 1.7e308 is `inf` in DuckDB and an
-  error on the server); `*` is not, overflowing already near 1e154.
+  pass). A `float` column is compared and divided when pushed, not added,
+  subtracted or multiplied (an overflow is `inf` in DuckDB and an error on
+  the server).
   A computed result column now has DuckDB's type or is not pushed: a decimal
   beside a constant (`v + 700`) stays with DuckDB as a result column. A
   comparison of an integer `x + c` / `x - c` / `x * c` / `-x` with a constant
