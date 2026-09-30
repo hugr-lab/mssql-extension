@@ -601,7 +601,8 @@ ExpressionEncodeResult FilterEncoder::EncodeFunctionExpression(const BoundFuncti
 		arg_types.push_back(child->GetReturnType());
 	}
 	std::string why;
-	const FunctionMapping *mapping = ExpressionVocabulary::FunctionFor(func_name, arg_types, why);
+	const FunctionMapping *mapping =
+		ExpressionVocabulary::FunctionFor(func_name, arg_types, why, ctx.division_by_zero_errors);
 	if (!mapping) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeFunctionExpression: %s", why.c_str());
 		return {"", false};

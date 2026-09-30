@@ -508,7 +508,8 @@ bool ExpressionVocabulary::IsNaiveTimestampCast(const LogicalType &source, const
 }
 
 const FunctionMapping *ExpressionVocabulary::FunctionFor(const std::string &name,
-														 const std::vector<LogicalType> &arg_types, std::string &why) {
+														 const std::vector<LogicalType> &arg_types, std::string &why,
+														 bool division_by_zero_errors) {
 	const FunctionMapping *mapping = GetFunctionMapping(name);
 	if (!mapping) {
 		why = "function " + name + " not supported";
@@ -517,6 +518,17 @@ const FunctionMapping *ExpressionVocabulary::FunctionFor(const std::string &name
 	// Modulo: push only for exact integer operands. T-SQL's `%` rejects float,
 	// real AND money (8117), and money is indistinguishable from decimal here.
 	if (name == "%") {
+		// `error_on_division_by_zero = false` makes DuckDB answer NULL for
+		// `x % 0`; the server answers error 8134, and an encoded predicate is
+		// erased from the DuckDB plan, so the statement fails where DuckDB
+		// alone would simply not return the row. The gate lives here, not in
+		// one walker, because a construct both paths take must answer the same
+		// whichever takes it (roborev 1819 finding 3: the writer declined and
+		// the scan path did not).
+		if (!division_by_zero_errors) {
+			why = "% with error_on_division_by_zero = false (DuckDB gives NULL, the server error 8134)";
+			return nullptr;
+		}
 		for (const auto &type : arg_types) {
 			if (!IsExactIntegerForModulo(type.id())) {
 				why = "% on " + type.ToString() + " not pushed (T-SQL modulo takes exact integers only)";
@@ -534,16 +546,21 @@ const FunctionMapping *ExpressionVocabulary::FunctionFor(const std::string &name
 				return nullptr;
 			}
 		}
-		if (name == "*" && arg_types.size() == 2) {
-			for (const auto &type : arg_types) {
-				// A double product overflows near 1e154: error 8115 on the server
-				// -- for every row WHERE passes, TOP's discards included --
-				// where DuckDB gives inf (spec 079 PR D full review).
-				if (type.id() == LogicalTypeId::DOUBLE || type.id() == LogicalTypeId::FLOAT) {
-					why = "* on " + type.ToString() + " not pushed (overflows on the server where DuckDB says inf)";
-					return nullptr;
-				}
+		for (const auto &type : arg_types) {
+			// SQL Server's float cannot represent Inf, so an overflow is an
+			// error -- 8115 on the server, for every row WHERE passes, TOP's
+			// discards included -- where DuckDB gives inf (spec 079 PR D full
+			// review). A PRODUCT reaches it near 1e154; `+` and `-` need about
+			// 1.8e308, a narrower window but the same divergence, and an
+			// encoded predicate is erased from the DuckDB plan so the whole
+			// query fails rather than falling back to the client-side net.
+			// Hence all three, not the product alone (roborev 1819 finding 2).
+			if (type.id() == LogicalTypeId::DOUBLE || type.id() == LogicalTypeId::FLOAT) {
+				why = name + " on " + type.ToString() + " not pushed (overflows on the server where DuckDB says inf)";
+				return nullptr;
 			}
+		}
+		if (name == "*" && arg_types.size() == 2) {
 			// DuckDB types DECIMAL(w1,s1) * DECIMAL(w2,s2) as DECIMAL(w1 + w2,
 			// s1 + s2), but CAPS it at 18 when both factors fit 18 and the
 			// scale does too -- then raising an overflow where the server holds

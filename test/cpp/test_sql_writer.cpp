@@ -37,6 +37,10 @@ static std::vector<MSSQLColumnInfo> Columns() {
 						 "SQL_Latin1_General_CP1_CI_AS");
 	columns.emplace_back("wide", 9, "decimal", 17, 38, 10, true, "", "SQL_Latin1_General_CP1_CI_AS");
 	columns.emplace_back("mid", 10, "decimal", 9, 19, 4, true, "", "SQL_Latin1_General_CP1_CI_AS");
+	// tinyint is 0-255 on the server, which is DuckDB's UTINYINT -- the only
+	// integer type whose rank is 1, so the only one a widening cast can target
+	// without widening (roborev 1819 finding 1).
+	columns.emplace_back("tiny", 11, "tinyint", 1, 3, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
 	return columns;
 }
 
@@ -112,7 +116,7 @@ int main() {
 	ExpectSql("SELECT id AS id FROM t LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 	ExpectSql("SELECT * FROM t LIMIT 1",
 			  "SELECT TOP (1) [id], [name], [code], [amount], [day], [flag], [ts], CAST([legacy] AS NVARCHAR(30)) AS "
-			  "[legacy], [wide], [mid] FROM [dbo].[t]");
+			  "[legacy], [wide], [mid], [tiny] FROM [dbo].[t]");
 	ExpectSql("SELECT q.id FROM t AS q LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 
 	// WHERE: constants are parameters declared from the column.
@@ -225,6 +229,15 @@ int main() {
 	ExpectVeto("SELECT CAST(id AS SMALLINT) FROM t LIMIT 1");  // narrowing can fail differently
 	ExpectVeto("SELECT CAST(id AS VARCHAR) FROM t LIMIT 1");   // formatting is DuckDB's
 	ExpectVeto("SELECT TRY_CAST(id AS BIGINT) FROM t LIMIT 1");
+	// A UTINYINT target is rank 1, so it passes the widening gate over a
+	// tinyint column and must render as `tinyint`. It used to fall through the
+	// arm list to `bigint`, and then the server computed in bigint what DuckDB
+	// overflows in UINT8 (roborev 1819 finding 1).
+	ExpectSql("SELECT CAST(tiny AS UTINYINT) AS u FROM t LIMIT 1",
+			  "SELECT TOP (1) CAST([tiny] AS tinyint) AS [u] FROM [dbo].[t]");
+	ExpectSql("SELECT CAST(tiny AS INTEGER) AS w FROM t LIMIT 1",
+			  "SELECT TOP (1) CAST([tiny] AS int) AS [w] FROM [dbo].[t]");
+	ExpectVeto("SELECT CAST(id AS UTINYINT) FROM t LIMIT 1");  // narrowing
 
 	// CASE, COALESCE, NULLIF: one type for every branch.
 	ExpectSql("SELECT CASE WHEN id > 1 THEN id ELSE 0 END AS c FROM t LIMIT 1",

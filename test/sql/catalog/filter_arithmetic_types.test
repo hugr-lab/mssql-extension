@@ -49,7 +49,16 @@ SELECT id FROM fat.dbo.fat_t WHERE s * s > 100 ORDER BY id;
 ----
 1
 
-# + and - over numbers stay pushed.
+# + and - stay pushed over EXACT numbers.
+query I
+SELECT id FROM fat.dbo.fat_t WHERE id + 1 > 2 ORDER BY id;
+----
+2
+
+# Not over a float: SQL Server cannot represent Inf, so an overflow is an error
+# where DuckDB gives inf -- the product's divergence, at the narrower window
+# `+` and `-` need (~1.8e308 rather than ~1e154). DuckDB evaluates it, so the
+# rows are the same, which is the point of leaving it there.
 query I
 SELECT id FROM fat.dbo.fat_t WHERE f + f > 3 ORDER BY id;
 ----

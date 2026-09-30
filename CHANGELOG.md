@@ -154,6 +154,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Spec 079 PR C review (roborev 1819): three divergences between the two
+  pushdown paths.** All three are cases where the server and DuckDB would answer
+  differently for a construct one path sent and the other did not — the
+  invariant PR C's own `DATAMODEL.md` states as "a construct both paths take
+  answers the same whichever takes it".
+  - A **widening cast to `UTINYINT`** rendered as T-SQL `bigint`. `UTINYINT` is
+    the only integer rank-1 type (SQL Server's `tinyint` is 0-255), so
+    `CAST(tiny AS UTINYINT)` over a `tinyint` column passed the widening gate
+    and then fell through the arm list to `bigint`, while the writer went on
+    treating the operand as `UTINYINT`. `CAST(tiny AS UTINYINT) + 1` at
+    `tiny = 255` therefore computed 256 on the server where DuckDB raises
+    "Overflow in addition of UINT8". Now renders `tinyint`.
+  - **`+` and `-` on `float` / `real` are no longer pushed**, as the product
+    already was not. SQL Server's `float` cannot represent infinity, so an
+    overflow is error 8115 — for every row `WHERE` passes, `TOP`'s discards
+    included — where DuckDB returns `inf`; and because an encoded predicate is
+    erased from the DuckDB plan, the statement fails rather than falling back to
+    the client-side filter net. A product reaches the window near 1e154 and a
+    sum near 1.8e308, but the divergence is the same one.
+  - **`%` under `SET error_on_division_by_zero = false`** was refused by the
+    remote-pushdown writer and still pushed by the scan path's filter encoder,
+    so `WHERE i % j = 0` with a zero divisor failed with error 8134 through the
+    scan where DuckDB alone answers `NULL` and simply omits the row. The gate
+    moved into `ExpressionVocabulary::FunctionFor`, which both walkers call, so
+    one answer serves both; `ExpressionEncodeContext` carries the session's
+    setting to the encoder's walk.
+
 - **LIKE pushdown is documented as the server's, and its case-insensitive
   form is gone (#392).** A simple `LIKE` is pushed as T-SQL `LIKE` and
   evaluated under the column's collation, exactly as `=` is (spec 079 D4): on

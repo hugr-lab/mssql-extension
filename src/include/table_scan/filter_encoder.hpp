@@ -92,6 +92,13 @@ struct ExpressionEncodeContext {
 	const MSSQLColumnInfo *filter_column_info = nullptr;
 	const MSSQLColumnInfo *constant_peer = nullptr;
 
+	// DuckDB's error_on_division_by_zero as the asking session has it. False
+	// makes `x % 0` NULL in DuckDB and error 8134 on the server, so `%` must
+	// not be pushed -- the same answer the remote-pushdown writer gives
+	// (roborev 1819 finding 3). Carried here because the encoder's walk has no
+	// ClientContext; set by BuildEncodeContext and inherited by children.
+	bool division_by_zero_errors = true;
+
 	ExpressionEncodeContext(const std::vector<column_t> &col_ids, const std::vector<std::string> &col_names,
 							const std::vector<LogicalType> &col_types)
 		: column_ids(col_ids), column_names(col_names), column_types(col_types), depth(0) {}
@@ -119,6 +126,7 @@ struct ExpressionEncodeContext {
 		ctx.params = params;
 		ctx.mssql_columns = mssql_columns;
 		ctx.filter_column_info = filter_column_info;
+		ctx.division_by_zero_errors = division_by_zero_errors;
 		return ctx;
 	}
 

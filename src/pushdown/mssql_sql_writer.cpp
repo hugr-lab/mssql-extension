@@ -764,7 +764,16 @@ bool NodeWriter::WriteCast(const CastExpression &cast, Operand &out) {
 	const int to = IntegerRank(target);
 	std::string tsql;
 	if (to > 0 && from > 0 && to >= from) {
-		tsql = target == LogicalTypeId::SMALLINT ? "smallint" : target == LogicalTypeId::INTEGER ? "int" : "bigint";
+		// UTINYINT is rank 1 -- SQL Server's tinyint is 0-255, which is what
+		// DuckDB spells UTINYINT -- so it reaches here whenever the child is one
+		// too. Without its own arm it fell through to "bigint", and then the
+		// server computed in bigint what DuckDB overflows in UINT8
+		// (`CAST(tiny AS UTINYINT) + 1` at tiny = 255: 256 there, "Overflow in
+		// addition of UINT8" here), while out.type still said UTINYINT.
+		tsql = target == LogicalTypeId::UTINYINT   ? "tinyint"
+			   : target == LogicalTypeId::SMALLINT ? "smallint"
+			   : target == LogicalTypeId::INTEGER  ? "int"
+												   : "bigint";
 	} else if (target == LogicalTypeId::DOUBLE &&
 			   (from > 0 || child.type.id() == LogicalTypeId::DECIMAL || child.type.id() == LogicalTypeId::DOUBLE)) {
 		tsql = "float";
@@ -787,10 +796,6 @@ bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
 	if (!binary && !unary_minus) {
 		return Veto("function " + fn.ToString());
 	}
-	if (name == "%" && !options_.division_by_zero_errors) {
-		// DuckDB then gives NULL for `x % 0`, the server error 8134.
-		return Veto("% with error_on_division_by_zero = false");
-	}
 	std::vector<Operand> operands(args.size());
 	for (idx_t i = 0; i < args.size(); i++) {
 		if (!WriteValue(args[i].GetExpression(), operands[i])) {
@@ -806,7 +811,8 @@ bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
 			return Veto("negation " + fn.ToString());
 		}
 		std::string why;
-		auto mapping = ExpressionVocabulary::FunctionFor("negate", {operand.type}, why);
+		auto mapping =
+			ExpressionVocabulary::FunctionFor("negate", {operand.type}, why, options_.division_by_zero_errors);
 		if (!mapping) {
 			return Veto(why);
 		}
@@ -833,7 +839,8 @@ bool NodeWriter::WriteArithmetic(const FunctionExpression &fn, Operand &out) {
 		return Veto("arithmetic over " + left.type.ToString() + " and " + right.type.ToString());
 	}
 	std::string why;
-	auto mapping = ExpressionVocabulary::FunctionFor(name, {left.type, right.type}, why);
+	auto mapping =
+		ExpressionVocabulary::FunctionFor(name, {left.type, right.type}, why, options_.division_by_zero_errors);
 	if (!mapping) {
 		return Veto(why);
 	}

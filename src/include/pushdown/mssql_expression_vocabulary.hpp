@@ -122,9 +122,16 @@ public:
 	//! The mapping for `name` applied to arguments of `arg_types`, or null with
 	//! the reason: unmapped, wrong arity, `%` on a non-integer (8117), a date
 	//! part of a TIMESTAMP WITH TIME ZONE (the server's offset, not DuckDB's
-	//! TimeZone -- review of #387).
+	//! TimeZone -- review of #387), `+ - *` on a float (the server errors where
+	//! DuckDB says inf), a decimal product DuckDB overflows first.
+	//!
+	//! `division_by_zero_errors` is DuckDB's `error_on_division_by_zero` as the
+	//! asking session has it: false answers NULL for `x % 0` there and error
+	//! 8134 on the server, so `%` is refused. BOTH walkers pass it -- the gate
+	//! is here rather than in one of them because a construct both paths take
+	//! must answer the same whichever takes it.
 	static const FunctionMapping *FunctionFor(const std::string &name, const std::vector<LogicalType> &arg_types,
-											  std::string &why);
+											  std::string &why, bool division_by_zero_errors = true);
 	static std::string ApplyFunction(const FunctionMapping &mapping, const std::vector<std::string> &args);
 
 	//===--------------------------------------------------------------------===//
