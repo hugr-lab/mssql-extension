@@ -245,6 +245,18 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "Send pushed filter constants as sp_executesql parameters (one plan per shape)",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 
+	// mssql_pushdown_join_rows_threshold (spec 079 PR E1): a pushed join whose
+	// gain is not certain -- no aggregate / DISTINCT / LIMIT over it, a link
+	// that equates no unique key (many-to-many, CROSS) -- could send MORE rows
+	// than the two scans. It is pushed while every table it joins has fewer
+	// rows than this (the catalog's cached count, no round trip); else it is
+	// handed back to the scan path. Not checked inside a transaction or on a
+	// pool of one connection. 0 disables the check.
+	config.AddExtensionOption("mssql_pushdown_join_rows_threshold",
+							  "Rows (cached count) from which a remote-pushdown join of uncertain gain stays with the "
+							  "catalog scan (0 = always push)",
+							  LogicalType::BIGINT, Value::BIGINT(1000000), ValidateNonNegative, SetScope::GLOBAL);
+
 	// mssql_enable_statistics - Enable statistics collection for optimizer
 	config.AddExtensionOption("mssql_enable_statistics",
 							  "Enable statistics collection from SQL Server for query optimizer", LogicalType::BOOLEAN,
@@ -590,6 +602,14 @@ int64_t LoadTestFailMetadataAfterRows(ClientContext &context) {
 		return val.GetValue<int64_t>();
 	}
 	return 0;
+}
+
+int64_t LoadPushdownJoinRowsThreshold(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_pushdown_join_rows_threshold", val) && !val.IsNull()) {
+		return val.GetValue<int64_t>();
+	}
+	return 1000000;
 }
 
 bool LoadScanParameterizeFilters(ClientContext &context) {

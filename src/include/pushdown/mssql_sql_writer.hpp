@@ -47,6 +47,14 @@ struct WriterTable {
 	//! The DuckDB types the catalog entry reports, parallel to `columns`;
 	//! null = derive them from `columns` (unit tests).
 	const std::vector<LogicalType> *types = nullptr;
+	//! The row count the planner is given (statistics cache, else the one
+	//! loaded with the table), and the columns of a unique key when it is
+	//! loaded (empty: none known) -- the PR E1 gain check, no round trip.
+	idx_t approx_rows = 0;
+	//! False for a view: it has no row count of its own (sys.partitions has
+	//! none), so its size is unknown, never small.
+	bool size_known = true;
+	std::vector<std::string> unique_key;
 };
 
 //! One `@pN` of the statement: its declaration (from the column it is
@@ -70,6 +78,15 @@ struct WrittenQuery {
 	std::vector<LogicalType> cast_types;
 	//! Per result column, its name, as DuckDB names it.
 	std::vector<std::string> column_names;
+	//! A join whose gain is not certain: a link that equates no unique key of
+	//! either side (many-to-many, CROSS), with no aggregate / DISTINCT / LIMIT
+	//! over it -- it could send more rows than the scans (PR E1).
+	bool gain_uncertain = false;
+	//! The largest cached row count among the tables it joins (not the ones
+	//! only EXISTS / NOT EXISTS reads, which multiply nothing).
+	idx_t largest_input_rows = 0;
+	//! One of them is a view, whose size is unknown.
+	bool input_size_unknown = false;
 
 	//! "@p1 int, @p2 varchar(50)" -- empty without parameters.
 	std::string Declarations() const;

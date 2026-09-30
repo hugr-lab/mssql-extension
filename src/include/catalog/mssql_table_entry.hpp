@@ -128,6 +128,12 @@ public:
 	// Get full PK metadata (lazy loads if needed)
 	const mssql::RowIdKeyInfo &GetPrimaryKeyInfo(ClientContext &context);
 
+	//! The key if it is already loaded (with the table's metadata since spec
+	//! 076), else null -- never a round trip (spec 079 PR E1's gain check).
+	const mssql::RowIdKeyInfo *LoadedPrimaryKeyInfo() const {
+		return pk_loaded_.load(std::memory_order_acquire) ? &pk_info_ : nullptr;
+	}
+
 private:
 	// The DuckDB-visible columns. Owned here since the base stopped owning
 	// them; GetInfo() and the whole binder read the table's shape through

@@ -1699,6 +1699,22 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 			table.name = entry.name.GetIdentifierName();
 			table.columns = &entry.GetMSSQLColumns();
 			table.types = &types[i];
+			// The count the planner gets (GetStorageInfo's fast path): the
+			// statistics cache, else the one loaded with the entry -- no round
+			// trip either way. Both can be stale; the planner's estimate is too.
+			idx_t cached = 0;
+			table.approx_rows = GetStatisticsProvider().TryGetCachedRowCount(
+									table.schema, table.name, LoadStatisticsCacheTTL(*resolved[i].context), cached,
+									/*exempt_catalog_sourced=*/true)
+									? cached
+									: entry.GetApproxRowCount();
+			table.size_known = entry.GetObjectType() != MSSQLObjectType::VIEW;
+			auto key = entry.LoadedPrimaryKeyInfo();
+			if (key && key->exists) {
+				for (auto &column : key->columns) {
+					table.unique_key.push_back(column.name);
+				}
+			}
 			return true;
 		}
 		return false;
@@ -1978,8 +1994,24 @@ static bool MayRepeatOutputNames(const QueryNode &node) {
 bool MSSQLCatalog::WritePushablePart(const QueryNode &node, mssql::WrittenQuery &written,
 									 optional_ptr<ClientContext> context, const vector<string> &scope) {
 	string why;
-	return node.type == QueryNodeType::SELECT_NODE && mssql::SQLWriter::PushesMoreThanScan(node) &&
-		   !NamesScopeTable(const_cast<QueryNode &>(node), scope) && WritePushdown(node, written, why, context);
+	if (node.type != QueryNodeType::SELECT_NODE || !mssql::SQLWriter::PushesMoreThanScan(node) ||
+		NamesScopeTable(const_cast<QueryNode &>(node), scope) || !WritePushdown(node, written, why, context)) {
+		return false;
+	}
+	// A join of uncertain gain (PR E1). Trusted without a check inside a
+	// transaction or on a pool of one connection (the owner's call: nothing
+	// there to spend on asking), and when every table it joins is small by the
+	// cached count; else the scan path keeps it. The dry run (no context)
+	// answers optimistically -- RemoteExecute decides.
+	if (context && written.gain_uncertain && GetConnectionLimit() > 1 && context->transaction.IsAutoCommit()) {
+		const auto threshold = LoadPushdownJoinRowsThreshold(*context);
+		if (threshold > 0 && (written.input_size_unknown || written.largest_input_rows >= idx_t(threshold))) {
+			MSSQL_CATALOG_DEBUG_LOG(1, "RemoteExecute: a join of uncertain gain over %llu rows stays with the scan",
+									(unsigned long long)written.largest_input_rows);
+			return false;
+		}
+	}
+	return true;
 }
 
 // Whether a node nested in `node` would be pushed (the dry run).

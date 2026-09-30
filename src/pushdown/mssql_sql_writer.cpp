@@ -374,6 +374,18 @@ private:
 	idx_t semi_scope_ = DConstants::INVALID_INDEX;
 	//! The EXISTS / NOT EXISTS a SEMI / ANTI join becomes, ANDed to WHERE.
 	std::vector<std::string> semi_filters_;
+	//! Join links that equate no unique key of either side (PR E1 gain check).
+	idx_t unbounded_links_ = 0;
+	//! CROSS links (a comma join included), judged once WHERE is known: its
+	//! equalities bound them as an ON would. {left_first, right_relation}.
+	std::vector<std::pair<idx_t, idx_t>> cross_links_;
+	//! Whether `columns` (flat indexes) cover the unique key of every relation
+	//! the node joins -- then a GROUP BY / DISTINCT over them reduces nothing.
+	bool CoversEveryKey(const std::vector<idx_t> &columns) const;
+	//! Column pairs a link's condition equates (flat column indexes).
+	std::vector<std::pair<idx_t, idx_t>> link_equalities_;
+	void CollectEqualities(const ParsedExpression &condition);
+	bool KeyCovered(idx_t relation, idx_t other_first, idx_t other_last) const;
 	WrittenQuery &out_;
 	std::string &why_;
 	std::vector<OutputColumn> outputs_;
@@ -582,6 +594,75 @@ bool NodeWriter::CollectRelations(const TableRef &ref, std::vector<idx_t> &membe
 	return true;
 }
 
+void NodeWriter::CollectEqualities(const ParsedExpression &condition) {
+	if (condition.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : condition.Cast<ConjunctionExpression>().GetChildren()) {
+			CollectEqualities(*child);
+		}
+		return;
+	}
+	if (condition.GetExpressionType() != ExpressionType::COMPARE_EQUAL) {
+		return;
+	}
+	auto &cmp = condition.Cast<ComparisonExpression>();
+	if (cmp.Left().GetExpressionClass() != ExpressionClass::COLUMN_REF ||
+		cmp.Right().GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+		return;
+	}
+	idx_t left;
+	idx_t right;
+	if (FindColumn(cmp.Left().Cast<ColumnRefExpression>(), left) == 1 &&
+		FindColumn(cmp.Right().Cast<ColumnRefExpression>(), right) == 1) {
+		link_equalities_.emplace_back(left, right);
+	}
+}
+
+// Whether every column of `relation`'s unique key is equated, by this link,
+// with a column of the relations [other_first, other_last).
+bool NodeWriter::KeyCovered(idx_t relation, idx_t other_first, idx_t other_last) const {
+	auto &key = relations_[relation].table.unique_key;
+	if (key.empty()) {
+		return false;
+	}
+	for (auto &key_column : key) {
+		bool equated = false;
+		for (auto &pair : link_equalities_) {
+			for (auto side : {std::make_pair(pair.first, pair.second), std::make_pair(pair.second, pair.first)}) {
+				const auto rel = relation_of_[side.first];
+				const auto other = relation_of_[side.second];
+				equated = equated || (rel == relation && StringUtil::CIEquals(columns_[side.first].name, key_column) &&
+									  other >= other_first && other < other_last);
+			}
+		}
+		if (!equated) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool NodeWriter::CoversEveryKey(const std::vector<idx_t> &columns) const {
+	for (idx_t r = 0; r < relations_.size(); r++) {
+		if (relations_[r].semi) {
+			continue;
+		}
+		auto &key = relations_[r].table.unique_key;
+		if (key.empty()) {
+			return false;
+		}
+		for (auto &key_column : key) {
+			bool found = false;
+			for (auto index : columns) {
+				found = found || (relation_of_[index] == r && StringUtil::CIEquals(columns_[index].name, key_column));
+			}
+			if (!found) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
 bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
 	if (ref.type == TableReferenceType::BASE_TABLE) {
 		// The relations were collected in this same order.
@@ -605,8 +686,10 @@ bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
 	}
 	if (join.ref_type == JoinRefType::CROSS) {
 		sql = left + " CROSS JOIN " + right;
+		cross_links_.emplace_back(left_first, right_relation);
 		return true;
 	}
+	link_equalities_.clear();
 	const bool semi = join.type == JoinType::SEMI || join.type == JoinType::ANTI;
 	if (semi) {
 		// Its columns are named in its condition only.
@@ -661,6 +744,7 @@ bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
 			parts.push_back(ExpressionVocabulary::Comparison(" = ", l.sql, r.sql));
 			using_columns_.emplace_back(name, left_column);
 			hidden_using_.push_back(right_column);
+			link_equalities_.emplace_back(left_column, right_column);
 		}
 		condition = ExpressionVocabulary::Conjunction(parts, true);
 	} else {
@@ -672,6 +756,14 @@ bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
 		if (!WritePredicate(*join.condition, condition)) {
 			return false;
 		}
+		CollectEqualities(*join.condition);
+	}
+	// The gain check (PR E1): a link that equates a unique key of one side
+	// with the other cannot send more rows than the other side has -- FK to
+	// PK. A SEMI / ANTI link never sends more than its left side.
+	if (!semi && !KeyCovered(right_relation, left_first, right_relation) &&
+		!(right_relation - left_first == 1 && KeyCovered(left_first, right_relation, right_relation + 1))) {
+		unbounded_links_++;
 	}
 	if (semi) {
 		// A SEMI join keeps each left row that has a match, once; an ANTI join
@@ -2120,6 +2212,46 @@ bool NodeWriter::Write(const SelectNode &node) {
 		}
 	} else if (!order_sql.empty()) {
 		out_.statement += " ORDER BY " + order_sql;
+	}
+	// A CROSS link (a comma join) is bounded by WHERE's equalities as an ON
+	// link is by its own.
+	if (!cross_links_.empty() && node.where_clause) {
+		link_equalities_.clear();
+		CollectEqualities(*node.where_clause);
+	}
+	for (auto &link : cross_links_) {
+		const auto left_first = link.first;
+		const auto right_relation = link.second;
+		if (!node.where_clause ||
+			(!KeyCovered(right_relation, left_first, right_relation) &&
+			 !(right_relation - left_first == 1 && KeyCovered(left_first, right_relation, right_relation + 1)))) {
+			unbounded_links_++;
+		}
+	}
+	// A LIMIT bounds what crosses the wire whatever the joins multiply; an
+	// aggregate or a DISTINCT does unless it keeps a key of every table (then
+	// it has a row per joined row: GROUP BY x.id, y.id over a many-to-many
+	// join -- review of PR E1).
+	bool reduces = limited;
+	if (aggregated_) {
+		reduces = reduces || !CoversEveryKey(group_keys_);
+	}
+	if (distinct_ && !aggregated_) {
+		std::vector<idx_t> selected;
+		for (auto &output : outputs_) {
+			if (output.column_index != DConstants::INVALID_INDEX) {
+				selected.push_back(output.column_index);
+			}
+		}
+		reduces = reduces || !CoversEveryKey(selected);
+	}
+	out_.gain_uncertain = unbounded_links_ > 0 && !reduces;
+	for (auto &relation : relations_) {
+		if (relation.semi) {
+			continue;
+		}
+		out_.largest_input_rows = MaxValue(out_.largest_input_rows, relation.table.approx_rows);
+		out_.input_size_unknown = out_.input_size_unknown || !relation.table.size_known;
 	}
 	return true;
 }

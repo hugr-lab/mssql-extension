@@ -74,6 +74,8 @@ static bool Write(const std::string &sql, WrittenQuery &out, std::string &why, b
 		table.schema = "dbo";
 		table.name = name;
 		table.columns = name == "t" ? &columns : &other;
+		table.approx_rows = name == "t" ? 5000000 : 10;
+		table.unique_key = {"id"};	// both tables' primary key
 		return true;
 	});
 	return writer.Write(node, out, why);
@@ -566,6 +568,44 @@ int main() {
 	ExpectVeto("SELECT ratio * ratio AS r FROM t LIMIT 1");
 	ExpectVeto("SELECT ratio % 2 FROM t LIMIT 1");
 	ExpectVeto("SELECT ratio + amount FROM t LIMIT 1");
+
+	// The PR E1 gain check: a join link that equates a unique key cannot send
+	// more rows than the other side; one that equates none (many-to-many,
+	// CROSS) is uncertain unless an aggregate / DISTINCT / LIMIT bounds it.
+	{
+		auto uncertain = [&](const std::string &sql, bool expected) {
+			WrittenQuery out;
+			std::string why;
+			if (!Write(sql, out, why) || out.gain_uncertain != expected || out.largest_input_rows != 5000000) {
+				std::cerr << "FAIL: gain_uncertain(" << sql << ") != " << expected << " (" << why << ")\n";
+				failures++;
+			}
+		};
+		uncertain("SELECT t.name FROM t JOIN u ON u.t_id = t.id", false);	// t's key
+		uncertain("SELECT u.label FROM u JOIN t ON t.id = u.t_id", false);	// the right side's key
+		uncertain("SELECT a.label FROM u a JOIN u b ON a.t_id = b.t_id JOIN t ON t.id = a.t_id", true);
+		uncertain(
+			"SELECT a.t_id, count(*) AS c FROM u a JOIN u b ON a.t_id = b.t_id JOIN t ON t.id = a.t_id GROUP BY a.t_id",
+			false);
+		uncertain("SELECT a.label FROM u a JOIN u b ON a.t_id = b.t_id JOIN t ON t.id = a.t_id LIMIT 5", false);
+		uncertain("SELECT t.name FROM t JOIN u ON u.t_id = t.id AND u.label = t.name", false);
+		uncertain("SELECT t.id, u.label FROM t CROSS JOIN u ORDER BY t.id", true);
+		uncertain("SELECT t.name FROM t SEMI JOIN u ON u.t_id = t.id ORDER BY t.id", false);
+		// A GROUP BY / DISTINCT keeping a key of every table reduces nothing.
+		uncertain(
+			"SELECT a.id, b.id AS bid, count(*) AS c FROM u a JOIN u b ON a.t_id = b.t_id JOIN t ON t.id = a.t_id "
+			"GROUP BY a.id, b.id, t.id",
+			true);
+		uncertain(
+			"SELECT DISTINCT a.id, b.id AS bid, t.id AS tid FROM u a JOIN u b ON a.t_id = b.t_id JOIN t ON t.id = "
+			"a.t_id",
+			true);
+		// A comma join is bounded by WHERE's equalities as by an ON.
+		uncertain("SELECT t.name FROM t, u WHERE u.t_id = t.id ORDER BY t.id", false);
+		uncertain("SELECT t.name FROM t, u WHERE u.t_id > t.id ORDER BY t.id", true);
+		// An OR equality bounds nothing.
+		uncertain("SELECT t.name FROM t JOIN u ON u.t_id = t.id OR u.big = 1 ORDER BY t.id", true);
+	}
 
 	// The gain rule: a node the catalog scan serves as well stays with it.
 	ExpectGain("SELECT * FROM t", false);
