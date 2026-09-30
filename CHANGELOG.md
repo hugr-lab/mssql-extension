@@ -155,8 +155,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Spec 079 PR C follow-up review (roborev 1821): the `%` gate reached only the
-  planner, and a narrow-integer literal still disagreed.** Both are cases where
-  the two pushdown walkers could still answer differently.
+  planner.** It is a case where the two pushdown walkers could still answer
+  differently.
   - The `error_on_division_by_zero` gate was read in `BuildEncodeContext` (the
     planner's dry run) but **not** in `FilterEncoder::Encode`'s execution-time
     path or the optimizer's client-side-filter probe, which built their own
@@ -166,20 +166,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     default**, so a new call site has to answer; all four paths (dry run,
     execution encode, optimizer probe, remote-pushdown writer) read it through
     one shared `LoadErrorOnDivisionByZero`.
-  - **Arithmetic against a bare literal is refused when the column is narrower
-    than `int`.** The tinyint/smallint overflow agreement rests on the constant
-    travelling as a parameter *declared from the column*: `tinyint + @p tinyint`
-    is tinyint on the server and overflows at 255 + 1, as DuckDB overflows
-    `UINT8`. Under `mssql_scan_parameterize_filters = false` the constant is a
-    bare literal, which T-SQL types `int`, so the sum was 256 and a row came
-    back where DuckDB raises. Pre-existing for `tiny + 1`; now vetoed for every
-    integer rank below `int`.
   - Tests: the float case in `filter_arithmetic_types.test` could not detect a
     regression (1e200 + 1e200 and 2.0 + 2.0 are both representable, so the rows
     were the same either way) — a `1e308` row now separates them, since a pushed
     sum would raise on the server while DuckDB gives `inf` and returns the row.
-    The `%` gate gained its first end-to-end case, and the parameterised and
-    unparameterised tinyint arithmetic are both pinned in `test_sql_writer.cpp`.
+    The `%` gate gained its first end-to-end case. `test_sql_writer.cpp` also
+    pins the UNPARAMETERISED form of narrow-integer arithmetic, which nothing
+    covered: an unparameterised literal already carries the column's type
+    (`[tiny] + CAST(1 AS tinyint)`) through the cast `BindConstant` wraps it in,
+    so the server overflows at 255 + 1 exactly as DuckDB overflows `UINT8`.
 
 - **Spec 079 PR C review (roborev 1819): three divergences between the two
   pushdown paths.** All three are cases where the server and DuckDB would answer

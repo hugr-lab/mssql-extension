@@ -87,10 +87,10 @@ static void ExpectParams(const std::string &sql, const std::string &declarations
 	}
 }
 
-static void ExpectVeto(const std::string &sql, bool parameterize = true) {
+static void ExpectVeto(const std::string &sql) {
 	WrittenQuery out;
 	std::string why;
-	if (Write(sql, out, why, parameterize)) {
+	if (Write(sql, out, why)) {
 		std::cerr << "FAIL: expected a veto for " << sql << "\n  wrote: " << out.statement << "\n";
 		failures++;
 	}
@@ -239,16 +239,18 @@ int main() {
 			  "SELECT TOP (1) CAST([tiny] AS int) AS [w] FROM [dbo].[t]");
 	ExpectVeto("SELECT CAST(id AS UTINYINT) FROM t LIMIT 1");  // narrowing
 
-	// roborev 1821 finding 5: the overflow agreement for a narrow integer peer
-	// rests on the constant travelling as a parameter DECLARED from the column.
-	// `tinyint + @p tinyint` is tinyint on the server and overflows at 255 + 1,
-	// as DuckDB overflows UINT8; a bare literal is typed `int` by T-SQL, so the
-	// sum is 256 and a row comes back where DuckDB raises. Parameterised: pushed.
+	// The overflow agreement for a narrow integer peer rests on the constant
+	// carrying the COLUMN's type: `tinyint + <tinyint>` is tinyint on the server
+	// and overflows at 255 + 1, exactly as DuckDB overflows UINT8. A parameter
+	// takes it from DeclarationForColumn; an UNPARAMETERISED literal takes it
+	// from the CAST that BindConstant wraps it in -- without which T-SQL would
+	// read `1` as an int, widen the sum to 256 and return a row where DuckDB
+	// raises. Only the parameterised form was pinned; roborev 1821 finding 5
+	// read the literal as bare, which it is not, so both forms are pinned now.
 	ExpectSql("SELECT tiny + 1 AS s FROM t LIMIT 1", "SELECT TOP (1) ([tiny] + @p0) AS [s] FROM [dbo].[t]");
-	// Unparameterised: vetoed for tinyint, and for smallint by the same rank
-	// rule; int and bigint are unaffected, the literal cannot widen them.
-	ExpectVeto("SELECT tiny + 1 AS s FROM t LIMIT 1", /*parameterize=*/false);
-	ExpectSql("SELECT id + 1 AS s FROM t LIMIT 1", "SELECT TOP (1) ([id] + 1) AS [s] FROM [dbo].[t]",
+	ExpectSql("SELECT tiny + 1 AS s FROM t LIMIT 1",
+			  "SELECT TOP (1) ([tiny] + CAST(1 AS tinyint)) AS [s] FROM [dbo].[t]", /*parameterize=*/false);
+	ExpectSql("SELECT id + 1 AS s FROM t LIMIT 1", "SELECT TOP (1) ([id] + CAST(1 AS int)) AS [s] FROM [dbo].[t]",
 			  /*parameterize=*/false);
 
 	// CASE, COALESCE, NULLIF: one type for every branch.
