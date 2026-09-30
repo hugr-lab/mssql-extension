@@ -14,6 +14,7 @@
 #include <set>
 #include <unordered_set>
 #include "catalog/mssql_catalog.hpp"
+#include "connection/mssql_settings.hpp"
 #include "copy/copy_function.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
@@ -584,7 +585,8 @@ static void TryPushOrderBy(ClientContext &context, unique_ptr<LogicalOperator> &
 // Asked with the scan's own encoder,
 // literal form: whether a filter is handled does not depend on parameters.
 // Anything that fails the dry run is treated as client-side.
-static bool ScanHasClientSideFilters(const LogicalGet &get, const MSSQLCatalogScanBindData &bind_data) {
+static bool ScanHasClientSideFilters(ClientContext &context, const LogicalGet &get,
+									 const MSSQLCatalogScanBindData &bind_data) {
 	if (!get.table_filters.HasFilters()) {
 		return false;
 	}
@@ -594,7 +596,8 @@ static bool ScanHasClientSideFilters(const LogicalGet &get, const MSSQLCatalogSc
 			column_ids.push_back(col.GetPrimaryIndex());
 		}
 		auto encoded = mssql::FilterEncoder::Encode(&get.table_filters, column_ids, bind_data.all_column_names,
-													bind_data.all_types, &bind_data.mssql_columns, nullptr);
+													bind_data.all_types, &bind_data.mssql_columns, nullptr,
+													LoadErrorOnDivisionByZero(context));
 		// An optional filter -- the dynamic filter TopN itself pushes into the
 		// scan, a join's min/max -- only ever removes rows that cannot be in
 		// the result, so running it after TOP N loses nothing.
@@ -662,7 +665,7 @@ static void TryPushLimitOrderBy(ClientContext &context, unique_ptr<LogicalOperat
 	// A client-side filter would be applied after the server's TOP N. Leave the
 	// pair: the ORDER BY below it is TryPushOrderBy's, which the optimizer
 	// reaches next, and a plain ORDER BY is safe under a filter.
-	if (ScanHasClientSideFilters(*scan_info.get, bind_data)) {
+	if (ScanHasClientSideFilters(context, *scan_info.get, bind_data)) {
 		return;
 	}
 
@@ -734,7 +737,7 @@ static void TryPushTopN(ClientContext &context, unique_ptr<LogicalOperator> &pla
 	// TopN stays in the plan -- and with it DuckDB's sort, which the server's
 	// order would not spare: an ORDER BY pushed under a kept TopN only costs the
 	// server a sort.
-	if (ScanHasClientSideFilters(*scan_info.get, bind_data)) {
+	if (ScanHasClientSideFilters(context, *scan_info.get, bind_data)) {
 		return;
 	}
 

@@ -53,10 +53,7 @@ SQLWriterOptions SQLWriterOptions::FromContext(ClientContext &context) {
 	if (context.TryGetCurrentSetting("ieee_floating_point_ops", ieee) && !ieee.IsNull()) {
 		options.ieee_floating_point_ops = ieee.GetValue<bool>();
 	}
-	Value division_errors;
-	if (context.TryGetCurrentSetting("error_on_division_by_zero", division_errors) && !division_errors.IsNull()) {
-		options.division_by_zero_errors = division_errors.GetValue<bool>();
-	}
+	options.division_by_zero_errors = LoadErrorOnDivisionByZero(context);
 	auto &config = DBConfig::GetConfig(context);
 	options.default_order = config.ResolveOrder(context, OrderType::ORDER_DEFAULT);
 	options.default_null_order_asc =
@@ -467,6 +464,18 @@ bool NodeWriter::BindConstant(const Operand &peer, Operand &constant, bool arith
 		// DECIMAL, 257.0 for 255) where the exact-trip typing would keep the
 		// server's tinyint and overflow. A comparison only needs the trip.
 		return Veto("a decimal constant beside " + peer_name);
+	}
+	// The overflow agreement for a narrow integer peer rests on the constant
+	// travelling as a PARAMETER declared from the column: `tinyint + @p tinyint`
+	// is tinyint on the server and overflows at 255 + 1, exactly as DuckDB
+	// overflows UINT8. With mssql_scan_parameterize_filters = false the constant
+	// is a bare literal instead, which T-SQL types `int` -- so the sum is 256
+	// and a row comes back where DuckDB raises. Only ranks below int are
+	// affected (tinyint and smallint); int and bigint already compute in a type
+	// the literal cannot widen (roborev 1821 finding 5).
+	if (arithmetic && !options_.parameterize && IntegerRank(peer.type.id()) > 0 &&
+		IntegerRank(peer.type.id()) < IntegerRank(LogicalTypeId::INTEGER)) {
+		return Veto("a literal constant beside " + peer_name + " (a narrow integer needs a declared parameter)");
 	}
 	Value value;
 	if (!ConstantFor(peer.kind, peer.type, peer_name, *constant.constant, value)) {

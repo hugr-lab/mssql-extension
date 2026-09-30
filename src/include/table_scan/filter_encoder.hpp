@@ -171,10 +171,17 @@ public:
 	 * registered there, declared from the column it is compared with; the
 	 * caller wraps the statement with SqlParamSet::ExecuteSqlBatch.
 	 */
+	//! `division_by_zero_errors` is DuckDB's error_on_division_by_zero as the
+	//! asking session has it; it decides whether `%` may be pushed at all (see
+	//! ExpressionVocabulary::FunctionFor). **No default on purpose**: the gate
+	//! was added to the planner's dry run and missed here, so the execution-time
+	//! encode kept pushing a `%` the dry run would refuse. A new call site has
+	//! to answer the question rather than inherit a silent `true`.
 	static FilterEncoderResult Encode(const TableFilterSet *filters, const std::vector<column_t> &column_ids,
 									  const std::vector<std::string> &column_names,
 									  const std::vector<LogicalType> &column_types,
-									  const std::vector<MSSQLColumnInfo> *mssql_columns, mssql::SqlParamSet *params);
+									  const std::vector<MSSQLColumnInfo> *mssql_columns, mssql::SqlParamSet *params,
+									  bool division_by_zero_errors);
 
 	/**
 	 * A constant in the text: its literal, or -- with ctx.params set -- a @pN

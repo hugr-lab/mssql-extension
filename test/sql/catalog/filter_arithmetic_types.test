@@ -65,6 +65,64 @@ SELECT id FROM fat.dbo.fat_t WHERE f + f > 3 ORDER BY id;
 1
 2
 
+# roborev 1821 finding 3: the float case above cannot detect a regression on its
+# own -- 1e200 + 1e200 and 2.0 + 2.0 are both representable, so the rows are the
+# same whether the predicate is pushed or DuckDB evaluates it. A value whose
+# double is NOT representable separates them: DuckDB gives inf (and `inf > 3` is
+# true, so the row comes back), while the server, which has no Inf, raises
+# arithmetic overflow and the whole statement would fail. So a returned row
+# PROVES the predicate stayed with DuckDB.
+statement ok
+SELECT mssql_exec('fat', 'DROP TABLE IF EXISTS dbo.fat_hi;
+	CREATE TABLE dbo.fat_hi (id int NOT NULL, f float NULL);
+	INSERT INTO dbo.fat_hi VALUES (1, 1e308)');
+
+query I
+SELECT id FROM fat.dbo.fat_hi WHERE f + f > 3 ORDER BY id;
+----
+1
+
+query I
+SELECT id FROM fat.dbo.fat_hi WHERE f * f > 3 ORDER BY id;
+----
+1
+
+statement ok
+SELECT mssql_exec('fat', 'DROP TABLE dbo.fat_hi');
+
+# roborev 1821 finding 2: nothing exercised the `%` / error_on_division_by_zero
+# gate end to end -- the unit test covers the vocabulary, but nothing would fail
+# if the setting stopped being read on the way to the encoder. With the setting
+# off DuckDB answers NULL for `a % 0` and simply omits the row; the server
+# answers error 8134, and a pushed predicate is erased from the DuckDB plan, so
+# the statement would fail instead. Rows coming back is the proof the `%` stayed
+# local.
+statement ok
+SELECT mssql_exec('fat', 'DROP TABLE IF EXISTS dbo.fat_mod;
+	CREATE TABLE dbo.fat_mod (id int NOT NULL, a int NULL, b int NULL);
+	INSERT INTO dbo.fat_mod VALUES (1, 10, 0), (2, 10, 5)');
+
+statement ok
+SET error_on_division_by_zero = false;
+
+query I
+SELECT id FROM fat.dbo.fat_mod WHERE a % b = 0 ORDER BY id;
+----
+2
+
+statement ok
+RESET error_on_division_by_zero;
+
+# With the setting at its default the gate does not apply and `%` is pushed
+# again, which is the other half of the contract.
+query I
+SELECT id FROM fat.dbo.fat_mod WHERE b <> 0 AND a % b = 0 ORDER BY id;
+----
+2
+
+statement ok
+SELECT mssql_exec('fat', 'DROP TABLE dbo.fat_mod');
+
 statement ok
 SELECT mssql_exec('fat', 'DROP TABLE dbo.fat_t');
 

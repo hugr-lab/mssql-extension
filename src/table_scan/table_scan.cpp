@@ -334,9 +334,9 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: simple filter pushdown with %zu filter(s)",
 							 static_cast<size_t>(input.filters->FilterCount()));
 
-		auto encode_result =
-			FilterEncoder::Encode(input.filters.get(), column_ids, bind_data.all_column_names, bind_data.all_types,
-								  &bind_data.mssql_columns, parameterize ? &params : nullptr);
+		auto encode_result = FilterEncoder::Encode(
+			input.filters.get(), column_ids, bind_data.all_column_names, bind_data.all_types, &bind_data.mssql_columns,
+			parameterize ? &params : nullptr, LoadErrorOnDivisionByZero(context));
 
 		if (!encode_result.where_clause.empty()) {
 			where_conditions.push_back(encode_result.where_clause);
@@ -907,10 +907,7 @@ static ExpressionEncodeContext BuildEncodeContext(ClientContext &context, const 
 	// `error_on_division_by_zero = false` makes `x % 0` NULL in DuckDB and error
 	// 8134 on the server, so the vocabulary refuses `%` -- the answer the
 	// remote-pushdown writer already gave (roborev 1819 finding 3).
-	Value division_errors;
-	if (context.TryGetCurrentSetting("error_on_division_by_zero", division_errors) && !division_errors.IsNull()) {
-		ctx.division_by_zero_errors = division_errors.GetValue<bool>();
-	}
+	ctx.division_by_zero_errors = LoadErrorOnDivisionByZero(context);
 	return ctx;
 }
 

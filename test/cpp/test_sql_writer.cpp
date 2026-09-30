@@ -87,10 +87,10 @@ static void ExpectParams(const std::string &sql, const std::string &declarations
 	}
 }
 
-static void ExpectVeto(const std::string &sql) {
+static void ExpectVeto(const std::string &sql, bool parameterize = true) {
 	WrittenQuery out;
 	std::string why;
-	if (Write(sql, out, why)) {
+	if (Write(sql, out, why, parameterize)) {
 		std::cerr << "FAIL: expected a veto for " << sql << "\n  wrote: " << out.statement << "\n";
 		failures++;
 	}
@@ -238,6 +238,18 @@ int main() {
 	ExpectSql("SELECT CAST(tiny AS INTEGER) AS w FROM t LIMIT 1",
 			  "SELECT TOP (1) CAST([tiny] AS int) AS [w] FROM [dbo].[t]");
 	ExpectVeto("SELECT CAST(id AS UTINYINT) FROM t LIMIT 1");  // narrowing
+
+	// roborev 1821 finding 5: the overflow agreement for a narrow integer peer
+	// rests on the constant travelling as a parameter DECLARED from the column.
+	// `tinyint + @p tinyint` is tinyint on the server and overflows at 255 + 1,
+	// as DuckDB overflows UINT8; a bare literal is typed `int` by T-SQL, so the
+	// sum is 256 and a row comes back where DuckDB raises. Parameterised: pushed.
+	ExpectSql("SELECT tiny + 1 AS s FROM t LIMIT 1", "SELECT TOP (1) ([tiny] + @p0) AS [s] FROM [dbo].[t]");
+	// Unparameterised: vetoed for tinyint, and for smallint by the same rank
+	// rule; int and bigint are unaffected, the literal cannot widen them.
+	ExpectVeto("SELECT tiny + 1 AS s FROM t LIMIT 1", /*parameterize=*/false);
+	ExpectSql("SELECT id + 1 AS s FROM t LIMIT 1", "SELECT TOP (1) ([id] + 1) AS [s] FROM [dbo].[t]",
+			  /*parameterize=*/false);
 
 	// CASE, COALESCE, NULLIF: one type for every branch.
 	ExpectSql("SELECT CASE WHEN id > 1 THEN id ELSE 0 END AS c FROM t LIMIT 1",
