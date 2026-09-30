@@ -58,14 +58,12 @@ static std::vector<MSSQLColumnInfo> OtherColumns() {
 	return columns;
 }
 
-static bool Write(const std::string &sql, WrittenQuery &out, std::string &why, bool parameterize = true) {
+static bool WriteWith(const SQLWriterOptions &options, const std::string &sql, WrittenQuery &out, std::string &why) {
 	static const auto columns = Columns();
 	static const auto other = OtherColumns();
 	Parser parser;
 	parser.ParseQuery(sql);
 	auto &node = *parser.statements[0]->Cast<SelectStatement>().node;
-	SQLWriterOptions options;
-	options.parameterize = parameterize;
 	SQLWriter writer(options, [](const BaseTableRef &ref, WriterTable &table) {
 		const auto &name = ref.Table().GetIdentifierName();
 		if (name != "t" && name != "u") {
@@ -79,6 +77,12 @@ static bool Write(const std::string &sql, WrittenQuery &out, std::string &why, b
 		return true;
 	});
 	return writer.Write(node, out, why);
+}
+
+static bool Write(const std::string &sql, WrittenQuery &out, std::string &why, bool parameterize = true) {
+	SQLWriterOptions options;
+	options.parameterize = parameterize;
+	return WriteWith(options, sql, out, why);
 }
 
 static void ExpectSql(const std::string &sql, const std::string &expected, bool parameterize = true) {
@@ -644,6 +648,49 @@ int main() {
 		uncertain("SELECT t.name FROM t, u WHERE u.t_id > t.id ORDER BY t.id", true);
 		// An OR equality bounds nothing.
 		uncertain("SELECT t.name FROM t JOIN u ON u.t_id = t.id OR u.big = 1 ORDER BY t.id", true);
+	}
+
+	// Subqueries in expressions (PR E1): IN / EXISTS / a scalar subquery,
+	// correlated through the outer node's aliases, the inner's aliased past them.
+	ExpectSql("SELECT id FROM t WHERE id IN (SELECT t_id FROM u)",
+			  "SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] WHERE ([r1].[id] IN (SELECT [r2].[t_id] AS [t_id] FROM "
+			  "[dbo].[u] AS [r2]))");
+	ExpectSql("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id)",
+			  "SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] WHERE (NOT EXISTS (SELECT 1 AS [1] FROM [dbo].[u] AS "
+			  "[r2] WHERE ([r2].[t_id] = [r1].[id])))");
+	ExpectSql("SELECT id, (SELECT max(t_id) FROM u WHERE u.id = t.id) AS m FROM t",
+			  "SELECT [r1].[id] AS [id], (SELECT MAX([r2].[t_id]) AS [max(t_id)] FROM [dbo].[u] AS [r2] WHERE "
+			  "([r2].[id] = [r1].[id])) AS [m] FROM [dbo].[t] AS [r1]");
+	ExpectVeto("SELECT id FROM t WHERE id IN (SELECT t_id, id FROM u)");			// two columns
+	ExpectVeto("SELECT id FROM t WHERE id IN (SELECT t_id FROM u ORDER BY t_id)");	// 1033
+	ExpectVeto("SELECT id FROM t WHERE id > ANY (SELECT t_id FROM u)");				// not = ANY
+	ExpectVeto("SELECT id FROM t WHERE 0 < (SELECT max(u.t_id + t.id) FROM u)");	// an outer aggregate
+	ExpectVeto("SELECT sum((SELECT max(t_id) FROM u)) FROM t");						// 130 there
+	ExpectVeto("SELECT id FROM u WHERE label IN (SELECT legacy FROM t)");			// read through a CAST
+	ExpectVeto("SELECT id FROM t WHERE (SELECT id / 0 FROM u LIMIT 1) > 1");		// a division compared
+	ExpectGain("SELECT id FROM t WHERE id IN (SELECT t_id FROM u)", true);
+	{
+		// A correlated subquery asked about on its own refers outside.
+		WrittenQuery out;
+		std::string why;
+		if (Write("SELECT 1 FROM u WHERE u.t_id = t.id", out, why) || !out.refers_outside) {
+			std::cerr << "FAIL: a correlated subquery alone does not refer outside (" << why << ")\n";
+			failures++;
+		}
+		if (Write("SELECT 1 FROM u WHERE u.nope = 1", out, why) || out.refers_outside) {
+			std::cerr << "FAIL: an unknown qualified column refers outside\n";
+			failures++;
+		}
+	}
+	{
+		SQLWriterOptions lenient;
+		lenient.scalar_subquery_errors = false;
+		WrittenQuery out;
+		std::string why;
+		if (WriteWith(lenient, "SELECT id FROM t WHERE id = (SELECT t_id FROM u LIMIT 1)", out, why)) {
+			std::cerr << "FAIL: a scalar subquery pushed under scalar_subquery_error_on_multiple_rows = false\n";
+			failures++;
+		}
 	}
 
 	// The gain rule: a node the catalog scan serves as well stays with it.

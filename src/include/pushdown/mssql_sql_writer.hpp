@@ -92,6 +92,10 @@ struct WrittenQuery {
 	//! reaches the user -- not for one DuckDB computes on, as a part pushed
 	//! under a node that stays local would have it (review of E1).
 	bool value_divergence = false;
+	//! The writer stopped at a column that no relation of the node has but a
+	//! node around it could: a correlated subquery asked about on its own
+	//! (the rewriter asks about every nested node; PR E1).
+	bool refers_outside = false;
 
 	//! "@p1 int, @p2 varchar(50)" -- empty without parameters.
 	std::string Declarations() const;
@@ -109,6 +113,10 @@ struct SQLWriterOptions {
 	//! which the pushed `/ NULLIF(…, 0)` renders as NULL (the recorded
 	//! divergence); false makes DuckDB raise, so `/` is then not pushed.
 	bool ieee_floating_point_ops = true;
+	//! DuckDB's scalar_subquery_error_on_multiple_rows: true raises on a
+	//! scalar subquery of several rows, as SQL Server does (512); false returns
+	//! an arbitrary row, and a scalar subquery is then not pushed.
+	bool scalar_subquery_errors = true;
 	//! The session's default_order / default_null_order, resolved.
 	OrderType default_order = OrderType::ASCENDING;
 	OrderByNullType default_null_order_asc = OrderByNullType::NULLS_LAST;

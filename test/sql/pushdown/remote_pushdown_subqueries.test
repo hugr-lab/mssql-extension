@@ -1,0 +1,350 @@
+# name: test/sql/pushdown/remote_pushdown_subqueries.test
+# description: Spec 079 PR E1 -- a subquery in an expression (IN, EXISTS, a scalar subquery, correlated or not) is rendered in place and the statement goes whole; both paths agree
+# group: [pushdown]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# DuckDB turns IN / EXISTS into SEMI / ANTI / MARK joins after binding; the
+# rewriter runs before and hands the parsed subquery over, which the writer
+# sends as T-SQL's IN / EXISTS. A correlated column is qualified by the outer
+# node's own alias, and the subquery's tables are aliased past the outer's.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rs_off (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = true;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rs_on (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+statement ok
+SELECT mssql_exec('rs_off', 'DROP TABLE IF EXISTS dbo.rs_t; DROP TABLE IF EXISTS dbo.rs_u;
+	CREATE TABLE dbo.rs_t (id int NOT NULL PRIMARY KEY, g int NULL, n int NULL);
+	CREATE TABLE dbo.rs_u (k int NOT NULL PRIMARY KEY, g int NULL, w int NOT NULL);
+	INSERT INTO dbo.rs_t VALUES (1, 1, 10), (2, 1, 20), (3, 2, NULL), (4, 3, 40), (5, NULL, 5);
+	INSERT INTO dbo.rs_u VALUES (1, 1, 100), (2, 3, 300), (3, NULL, 0)');
+
+# IN over a subquery: one statement.
+query II
+EXPLAIN SELECT id FROM rs_on.dbo.rs_t WHERE g IN (SELECT g FROM rs_on.dbo.rs_u) ORDER BY id;
+----
+physical_plan	<REGEX>:.*FROM \[dbo\]\.\[rs_t\] AS \[r1\] WHERE \(\[r1\]\.\[g\] IN \(SELECT \[r2\]\.\[g\] AS \[g\] FROM \[dbo\]\.\[rs_u\] AS \[r2\]\)\).*
+
+query I
+SELECT id FROM rs_on.dbo.rs_t WHERE g IN (SELECT g FROM rs_on.dbo.rs_u) ORDER BY id;
+----
+1
+2
+4
+
+query I
+SELECT id FROM rs_off.dbo.rs_t WHERE g IN (SELECT g FROM rs_off.dbo.rs_u) ORDER BY id;
+----
+1
+2
+4
+
+# NOT IN over a subquery holding a NULL: no row, on both sides.
+query I
+SELECT id FROM rs_on.dbo.rs_t WHERE g NOT IN (SELECT g FROM rs_on.dbo.rs_u) ORDER BY id;
+----
+
+query I
+SELECT id FROM rs_off.dbo.rs_t WHERE g NOT IN (SELECT g FROM rs_off.dbo.rs_u) ORDER BY id;
+----
+
+query I
+SELECT id FROM rs_on.dbo.rs_t WHERE g NOT IN (SELECT g FROM rs_on.dbo.rs_u WHERE g IS NOT NULL) ORDER BY id;
+----
+3
+
+# Correlated EXISTS / NOT EXISTS.
+query II
+EXPLAIN SELECT id FROM rs_on.dbo.rs_t t WHERE EXISTS (SELECT 1 FROM rs_on.dbo.rs_u u WHERE u.g = t.g) ORDER BY id;
+----
+physical_plan	<REGEX>:.*WHERE EXISTS \(SELECT 1 AS \[1\] FROM \[dbo\]\.\[rs_u\] AS \[r2\] WHERE \(\[r2\]\.\[g\] = \[r1\]\.\[g\]\)\).*
+
+query I
+SELECT id FROM rs_on.dbo.rs_t t WHERE EXISTS (SELECT 1 FROM rs_on.dbo.rs_u u WHERE u.g = t.g) ORDER BY id;
+----
+1
+2
+4
+
+query I
+SELECT id FROM rs_on.dbo.rs_t t WHERE NOT EXISTS (SELECT 1 FROM rs_on.dbo.rs_u u WHERE u.g = t.g) ORDER BY id;
+----
+3
+5
+
+query I
+SELECT id FROM rs_off.dbo.rs_t t WHERE NOT EXISTS (SELECT 1 FROM rs_off.dbo.rs_u u WHERE u.g = t.g) ORDER BY id;
+----
+3
+5
+
+# An unqualified outer column: not a column of the subquery's table.
+query I
+SELECT id FROM rs_on.dbo.rs_t t WHERE EXISTS (SELECT 1 FROM rs_on.dbo.rs_u u WHERE u.w > n * 10) ORDER BY id;
+----
+1
+2
+5
+
+query I
+SELECT id FROM rs_off.dbo.rs_t t WHERE EXISTS (SELECT 1 FROM rs_off.dbo.rs_u u WHERE u.w > n * 10) ORDER BY id;
+----
+1
+2
+5
+
+# A name both tables have is the subquery's own (g here is rs_u.g).
+query I
+SELECT id FROM rs_on.dbo.rs_t t WHERE EXISTS (SELECT 1 FROM rs_on.dbo.rs_u u WHERE g = 3) ORDER BY id;
+----
+1
+2
+3
+4
+5
+
+# The same table inside and out, unaliased: the inner name is the inner table.
+query I
+SELECT id FROM rs_on.dbo.rs_t WHERE n > (SELECT min(n) FROM rs_on.dbo.rs_t WHERE g = 1) ORDER BY id;
+----
+2
+4
+
+query I
+SELECT id FROM rs_off.dbo.rs_t WHERE n > (SELECT min(n) FROM rs_off.dbo.rs_t WHERE g = 1) ORDER BY id;
+----
+2
+4
+
+# A correlated scalar subquery as a value, typed as DuckDB types it.
+query II
+EXPLAIN SELECT id, (SELECT max(w) FROM rs_on.dbo.rs_u u WHERE u.g = t.g) AS mw FROM rs_on.dbo.rs_t t ORDER BY id;
+----
+physical_plan	<REGEX>:.*\(SELECT MAX\(\[r2\]\.\[w\]\) AS .* FROM \[dbo\]\.\[rs_u\] AS \[r2\] WHERE \(\[r2\]\.\[g\] = \[r1\]\.\[g\]\)\) AS \[mw\].*
+
+query IIT
+SELECT id, mw, typeof(mw) FROM (SELECT id, (SELECT max(w) FROM rs_on.dbo.rs_u u WHERE u.g = t.g) AS mw FROM rs_on.dbo.rs_t t) s ORDER BY id;
+----
+1	100	INTEGER
+2	100	INTEGER
+3	NULL	INTEGER
+4	300	INTEGER
+5	NULL	INTEGER
+
+query IIT
+SELECT id, mw, typeof(mw) FROM (SELECT id, (SELECT max(w) FROM rs_off.dbo.rs_u u WHERE u.g = t.g) AS mw FROM rs_off.dbo.rs_t t) s ORDER BY id;
+----
+1	100	INTEGER
+2	100	INTEGER
+3	NULL	INTEGER
+4	300	INTEGER
+5	NULL	INTEGER
+
+# An integer SUM through a scalar subquery: HUGEINT, as DuckDB types it.
+query IIT
+SELECT id, s, typeof(s) FROM (SELECT id, (SELECT sum(w) FROM rs_on.dbo.rs_u) AS s FROM rs_on.dbo.rs_t WHERE id = 1) x;
+----
+1	400	HUGEINT
+
+# A scalar subquery of several rows is an error on both sides.
+statement error
+SELECT id, (SELECT g FROM rs_on.dbo.rs_u) FROM rs_on.dbo.rs_t;
+----
+
+statement error
+SELECT id, (SELECT g FROM rs_off.dbo.rs_u) FROM rs_off.dbo.rs_t;
+----
+
+# In HAVING of an aggregate query, correlated with a group key.
+query II
+EXPLAIN SELECT g, count(*) FROM rs_on.dbo.rs_t t GROUP BY g HAVING EXISTS (SELECT 1 FROM rs_on.dbo.rs_u u WHERE u.g = t.g) ORDER BY g LIMIT 10;
+----
+physical_plan	<REGEX>:.*GROUP BY \[r1\]\.\[g\] HAVING EXISTS \(SELECT 1 AS \[1\] FROM \[dbo\]\.\[rs_u\] AS \[r2\] WHERE \(\[r2\]\.\[g\] = \[r1\]\.\[g\]\)\).*
+
+query II
+SELECT g, count(*) FROM rs_on.dbo.rs_t t GROUP BY g HAVING EXISTS (SELECT 1 FROM rs_on.dbo.rs_u u WHERE u.g = t.g) ORDER BY g LIMIT 10;
+----
+1	2
+3	1
+
+query II
+SELECT g, count(*) FROM rs_off.dbo.rs_t t GROUP BY g HAVING EXISTS (SELECT 1 FROM rs_off.dbo.rs_u u WHERE u.g = t.g) ORDER BY g LIMIT 10;
+----
+1	2
+3	1
+
+# Vetoes: the scan path answers, the rows are DuckDB's.
+# A correlated column in the subquery's aggregate (DuckDB's outer aggregate).
+query I
+SELECT id FROM rs_on.dbo.rs_t t WHERE 0 < (SELECT max(u.w + t.n) FROM rs_on.dbo.rs_u u) ORDER BY id;
+----
+1
+2
+4
+5
+
+query II
+EXPLAIN SELECT id FROM rs_on.dbo.rs_t t WHERE 0 < (SELECT max(u.w + t.n) FROM rs_on.dbo.rs_u u) ORDER BY id;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# ORDER BY without LIMIT inside (1033 there).
+query I
+SELECT id FROM rs_on.dbo.rs_t WHERE g IN (SELECT g FROM rs_on.dbo.rs_u ORDER BY k) ORDER BY id;
+----
+1
+2
+4
+
+# A quantified comparison other than = ANY.
+query I
+SELECT id FROM rs_on.dbo.rs_t WHERE n > ALL (SELECT w FROM rs_on.dbo.rs_u WHERE w < 30) ORDER BY id;
+----
+1
+2
+4
+5
+
+# Under scalar_subquery_error_on_multiple_rows = false a scalar subquery
+# stays with DuckDB (which picks a row where the server would error).
+statement ok
+SET scalar_subquery_error_on_multiple_rows = false;
+
+query I
+SELECT count(*) FROM rs_on.dbo.rs_t WHERE n > (SELECT w FROM rs_on.dbo.rs_u WHERE k = 3);
+----
+4
+
+statement ok
+RESET scalar_subquery_error_on_multiple_rows;
+
+# Two levels of correlation: the innermost names both nodes around it.
+query I
+SELECT id FROM rs_on.dbo.rs_t t WHERE EXISTS (SELECT 1 FROM rs_on.dbo.rs_u u WHERE u.g = t.g AND EXISTS (SELECT 1 FROM rs_on.dbo.rs_t t2 WHERE t2.id = u.k AND t2.n < t.n + 100)) ORDER BY id;
+----
+1
+2
+4
+
+query I
+SELECT id FROM rs_off.dbo.rs_t t WHERE EXISTS (SELECT 1 FROM rs_off.dbo.rs_u u WHERE u.g = t.g AND EXISTS (SELECT 1 FROM rs_off.dbo.rs_t t2 WHERE t2.id = u.k AND t2.n < t.n + 100)) ORDER BY id;
+----
+1
+2
+4
+
+# A subquery in an ON condition.
+query II
+SELECT t.id, u.k FROM rs_on.dbo.rs_t t JOIN rs_on.dbo.rs_u u ON u.g = t.g AND u.w IN (SELECT w FROM rs_on.dbo.rs_u WHERE w > 50) ORDER BY t.id LIMIT 10;
+----
+1	1
+2	1
+4	2
+
+# A correlated scalar subquery of a column: NULL where it finds no row.
+query II
+SELECT id, (SELECT w FROM rs_on.dbo.rs_u u WHERE u.k = t.id) AS w FROM rs_on.dbo.rs_t t ORDER BY id;
+----
+1	100
+2	300
+3	0
+4	NULL
+5	NULL
+
+# An uncorrelated scalar subquery of several rows raises in DuckDB even with
+# no outer row (it is evaluated once); the server would not (per outer row).
+# Not pushed: DuckDB's error.
+statement error
+SELECT id, (SELECT g FROM rs_on.dbo.rs_u) FROM rs_on.dbo.rs_t WHERE id = -1;
+----
+More than one row returned by a subquery
+
+# NOT IN with a NULL on the left: not a row, on both sides.
+query I
+SELECT id FROM rs_on.dbo.rs_t WHERE g NOT IN (SELECT g FROM rs_on.dbo.rs_u WHERE g = 3) ORDER BY id;
+----
+1
+2
+3
+
+# A constant on the left of IN, typed from the subquery's column.
+query I
+SELECT count(*) FROM rs_on.dbo.rs_t WHERE 300 IN (SELECT w FROM rs_on.dbo.rs_u);
+----
+5
+
+# An integer constant in a select list, named as DuckDB names it.
+query I
+SELECT "1" FROM (SELECT 1 FROM rs_on.dbo.rs_t ORDER BY id LIMIT 2) s;
+----
+1
+1
+
+# A correlated subquery under a set operation that also reads a local table:
+# the remote child is finished on its own, and handed back (it refers
+# outside), still bound to the outer row.
+statement ok
+CREATE TABLE rs_loc AS SELECT 2 AS g;
+
+query I
+SELECT id FROM rs_on.dbo.rs_t t WHERE g IN (SELECT g FROM rs_on.dbo.rs_u u WHERE u.k = t.id UNION ALL SELECT g FROM rs_loc) ORDER BY id;
+----
+1
+3
+
+query I
+SELECT id FROM rs_off.dbo.rs_t t WHERE g IN (SELECT g FROM rs_off.dbo.rs_u u WHERE u.k = t.id UNION ALL SELECT g FROM rs_loc) ORDER BY id;
+----
+1
+3
+
+# A statement that names rowid or a select alias is not taken for a
+# correlated subquery: it keeps DuckDB's names (review of E1: a handed-back
+# node deduplicated `id, id` into `id, id_1`).
+query T
+SELECT column_name FROM (DESCRIBE SELECT rowid, id, id FROM rs_on.dbo.rs_t);
+----
+rowid
+id
+id
+
+query II
+SELECT g, count(*) AS c FROM rs_on.dbo.rs_t GROUP BY g HAVING c > 1 ORDER BY g LIMIT 10;
+----
+1	2
+
+# An UPDATE with a correlated subquery while pushdown is on: not rewritten.
+statement ok
+UPDATE rs_on.dbo.rs_t SET n = n + 1 WHERE EXISTS (SELECT 1 FROM rs_on.dbo.rs_u u WHERE u.g = rs_t.g);
+
+query II
+SELECT id, n FROM rs_off.dbo.rs_t ORDER BY id;
+----
+1	11
+2	21
+3	NULL
+4	41
+5	5
+
+statement ok
+SELECT mssql_exec('rs_off', 'DROP TABLE dbo.rs_t; DROP TABLE dbo.rs_u');
+
+statement ok
+DETACH rs_on;
+
+statement ok
+DETACH rs_off;

@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <deque>
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/decimal.hpp"
@@ -26,6 +27,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/type_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
@@ -58,6 +60,11 @@ SQLWriterOptions SQLWriterOptions::FromContext(ClientContext &context) {
 		options.ieee_floating_point_ops = ieee.GetValue<bool>();
 	}
 	options.division_by_zero_errors = LoadErrorOnDivisionByZero(context);
+	Value scalar_errors;
+	if (context.TryGetCurrentSetting("scalar_subquery_error_on_multiple_rows", scalar_errors) &&
+		!scalar_errors.IsNull()) {
+		options.scalar_subquery_errors = scalar_errors.GetValue<bool>();
+	}
 	auto &config = DBConfig::GetConfig(context);
 	options.default_order = config.ResolveOrder(context, OrderType::ORDER_DEFAULT);
 	options.default_null_order_asc =
@@ -217,6 +224,42 @@ bool ContainsAggregate(const ParsedExpression &expr) {
 	return found;
 }
 
+//! Whether a node's own expressions hold a subquery (PR E1) -- not those of
+//! a derived table in its FROM, which its own writer renders.
+bool HasSubqueryExpression(const SelectNode &node) {
+	for (auto &item : node.select_list) {
+		if (item->HasSubquery()) {
+			return true;
+		}
+	}
+	for (auto &key : node.groups.group_expressions) {
+		if (key->HasSubquery()) {
+			return true;
+		}
+	}
+	if ((node.where_clause && node.where_clause->HasSubquery()) || (node.having && node.having->HasSubquery())) {
+		return true;
+	}
+	for (auto &modifier : node.modifiers) {
+		if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
+			for (auto &order : modifier->Cast<OrderModifier>().orders) {
+				if (order.expression->HasSubquery()) {
+					return true;
+				}
+			}
+		}
+	}
+	std::function<bool(const TableRef &)> in_conditions = [&](const TableRef &ref) -> bool {
+		if (ref.type != TableReferenceType::JOIN) {
+			return false;
+		}
+		auto &join = ref.Cast<JoinRef>();
+		return (join.condition && join.condition->HasSubquery()) || in_conditions(*join.left) ||
+			   in_conditions(*join.right);
+	};
+	return node.from_table && in_conditions(*node.from_table);
+}
+
 //! A column GROUP BY and DISTINCT may take: one the server compares -- and
 //! so groups -- as DuckDB does (strings under D4: their sets are the
 //! server's). Geometry, xml and text are not comparable there at all (249,
@@ -340,6 +383,13 @@ public:
 		  why_(parent.why_),
 		  params_(parent.params_),
 		  param_values_(parent.param_values_) {}
+	//! A subquery in an expression (PR E1): it may name the columns of the
+	//! nodes around it (correlation), so its relations are aliased past theirs.
+	struct Correlated {};
+	NodeWriter(NodeWriter &parent, WrittenQuery &out, Correlated) : NodeWriter(parent, out) {
+		outer_ = &parent;
+		alias_base_ = parent.alias_base_ + parent.relations_.size();
+	}
 
 	bool Write(const SelectNode &node);
 
@@ -447,6 +497,34 @@ private:
 	//! The relations a column reference can see: while the FROM is written,
 	//! those joined so far (an ON condition cannot name a later one).
 	idx_t visible_ = DConstants::INVALID_INDEX;
+	//! The node around a subquery in an expression, for a correlated column;
+	//! null for a statement's node and for a derived table (not correlated).
+	NodeWriter *outer_ = nullptr;
+	//! Relations are aliased [r<alias_base_ + 1>], ...: a correlated subquery's
+	//! aliases must not shadow the outer node's.
+	idx_t alias_base_ = 0;
+	//! It names a column of a node around it (set on every writer between).
+	bool correlated_ = false;
+	//! The node's LIMIT, -1 without one.
+	int64_t limit_ = -1;
+	//! The select list's aliases: a name matching one is DuckDB's alias
+	//! reference, never a correlated column.
+	std::vector<std::string> select_aliases_;
+	//! Whether an unresolved reference may be a correlated one: an unqualified
+	//! name no column here answers, or a qualifier no relation here has.
+	bool MayBeOuter(const ColumnRefExpression &ref, int found) const;
+	//! A column of a node around this one (correlation); `found` false when no
+	//! enclosing node has it either.
+	bool WriteOuterColumn(const ColumnRefExpression &ref, Operand &out, bool &found);
+	bool WriteSubqueryCondition(const SubqueryExpression &subquery, std::string &sql);
+	bool WriteScalarSubquery(const SubqueryExpression &subquery, Operand &out);
+	//! A subquery's node written by a correlated writer: a SELECT, no ORDER BY
+	//! without LIMIT (1033); `columns` its result columns required (0: any).
+	bool WriteSubqueryNode(const SubqueryExpression &subquery, NodeWriter &inner, idx_t columns);
+	//! A written subquery's single result as an operand of the node around it.
+	bool SubqueryOperand(const NodeWriter &inner, const WrittenQuery &inner_out, const std::string &sql, Operand &out);
+	//! Copies of the columns a subquery's result is, owned for its operand.
+	std::deque<MSSQLColumnInfo> subquery_columns_;
 	//! The SEMI / ANTI relation whose condition is being written: the one
 	//! place its columns can be named.
 	idx_t semi_scope_ = DConstants::INVALID_INDEX;
@@ -547,7 +625,15 @@ int NodeWriter::FindColumn(const ColumnRefExpression &ref, idx_t &out) const {
 
 bool NodeWriter::ResolveColumn(const ColumnRefExpression &ref, idx_t &out) {
 	auto &names = ref.ColumnNames();
-	switch (FindColumn(ref, out)) {
+	const int found = FindColumn(ref, out);
+	bool alias = names.size() == 1 && StringUtil::CIEquals(names[0].GetIdentifierName(), "rowid");
+	for (auto &name : select_aliases_) {
+		alias = alias || (names.size() == 1 && StringUtil::CIEquals(names[0].GetIdentifierName(), name));
+	}
+	if (found != 1 && !outer_ && !alias && MayBeOuter(ref, found)) {
+		out_.refers_outside = true;
+	}
+	switch (found) {
 	case 1:
 		return true;
 	case 0:
@@ -1252,10 +1338,45 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			}
 			break;
 		}
+		case ExpressionClass::CONSTANT: {
+			// An integer constant (`EXISTS (SELECT 1 ...)`): INTEGER to DuckDB's
+			// binder as an int literal is to the server. Any other literal is
+			// typed by rules of its own on each side.
+			auto &literal = item->Cast<ConstantExpression>().GetLiteral();
+			int64_t number;
+			if (aggregated_ || literal.kind != LiteralKind::INTEGER || !literal.TryGetInt64(number) ||
+				number > NumericLimits<int32_t>::Maximum()) {
+				return Veto("a constant in the select list");
+			}
+			const std::string output = item->GetName().GetIdentifierName();
+			if (output.size() > 128) {
+				return Veto("a result column name longer than 128 characters");
+			}
+			for (auto &existing : outputs_) {
+				if (StringUtil::CIEquals(existing.name, output)) {
+					return Veto("two result columns are named " + output);
+				}
+			}
+			list += (list.empty() ? "" : ", ") + std::to_string(number) + " AS " + QuoteIdentifier(output);
+			out_.column_types.push_back(LogicalType::INTEGER);
+			out_.cast_types.push_back(LogicalType::INVALID);
+			out_.column_names.push_back(output);
+			OutputColumn entry;
+			entry.name = output;
+			entry.column_index = DConstants::INVALID_INDEX;
+			entry.value.sql = std::to_string(number);
+			entry.value.type = LogicalType::INTEGER;
+			entry.value.result_type = LogicalType::INTEGER;
+			entry.value.kind = ComparableKind::ExactNumeric;
+			entry.value.not_null = true;
+			outputs_.push_back(std::move(entry));
+			break;
+		}
 		case ExpressionClass::FUNCTION:
 		case ExpressionClass::CASE:
 		case ExpressionClass::CAST:
-		case ExpressionClass::OPERATOR: {
+		case ExpressionClass::OPERATOR:
+		case ExpressionClass::SUBQUERY: {
 			// A computed column: rendered by the same rules as WHERE, named as
 			// DuckDB names it (the alias, else the expression's text), typed by
 			// the server's describe -- the spec's "types of a pushed query are the
@@ -1459,7 +1580,18 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::COLUMN_REF: {
 		idx_t index;
-		if (!ResolveColumn(expr.Cast<ColumnRefExpression>(), index)) {
+		auto &ref = expr.Cast<ColumnRefExpression>();
+		if (outer_ && MayBeOuter(ref, FindColumn(ref, index))) {
+			// Not a column here: a correlated one of a node around it.
+			bool found = false;
+			if (!WriteOuterColumn(ref, out, found)) {
+				return false;
+			}
+			if (found) {
+				return true;
+			}
+		}
+		if (!ResolveColumn(ref, index)) {
 			return false;
 		}
 		if (!CheckGrouped(index)) {
@@ -1495,6 +1627,8 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 	}
 	case ExpressionClass::CASE:
 		return WriteCase(expr.Cast<CaseExpression>(), out);
+	case ExpressionClass::SUBQUERY:
+		return WriteScalarSubquery(expr.Cast<SubqueryExpression>(), out);
 	case ExpressionClass::OPERATOR: {
 		auto &op = expr.Cast<OperatorExpression>();
 		if (expr.GetExpressionType() != ExpressionType::OPERATOR_COALESCE &&
@@ -1557,6 +1691,202 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 	}
 	default:
 		return Veto("value " + expr.ToString());
+	}
+}
+
+bool NodeWriter::MayBeOuter(const ColumnRefExpression &ref, int found) const {
+	auto &names = ref.ColumnNames();
+	if (names.size() == 1) {
+		// A name a column here answers, or two do (ambiguous), is this node's.
+		return found == 0;
+	}
+	if (names.size() != 2) {
+		return false;
+	}
+	for (auto &relation : relations_) {
+		if (StringUtil::CIEquals(names[0].GetIdentifierName(), relation.name)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool NodeWriter::WriteOuterColumn(const ColumnRefExpression &ref, Operand &out, bool &found) {
+	found = false;
+	for (auto outer = outer_; outer; outer = outer->outer_) {
+		idx_t index;
+		const int result = outer->FindColumn(ref, index);
+		if (result != 1) {
+			if (outer->MayBeOuter(ref, result)) {
+				continue;
+			}
+			// That node's own reference, ambiguous or unknown there: its veto.
+			return outer->ResolveColumn(ref, index);
+		}
+		if (in_aggregate_) {
+			// DuckDB makes an aggregate over outer columns the outer node's.
+			return Veto("a correlated column in a subquery's aggregate " + ref.ToString());
+		}
+		if (!outer->CheckGrouped(index)) {
+			return false;
+		}
+		if (outer->divergent_of_[index]) {
+			return Veto("a derived division / floating-point aggregate in a subquery");
+		}
+		for (auto writer = this; writer != outer; writer = writer->outer_) {
+			writer->correlated_ = true;
+		}
+		const auto &column = outer->columns_[index];
+		out.sql = outer->ColumnSql(index);
+		out.type = column.duckdb_type;
+		out.kind = KindOf(column);
+		out.column = &column;
+		out.result_type = outer->cast_of_[index];
+		out.cast_result = outer->cast_of_[index].id() != LogicalTypeId::INVALID;
+		found = true;
+		return true;
+	}
+	return true;
+}
+
+bool NodeWriter::WriteSubqueryNode(const SubqueryExpression &subquery, NodeWriter &inner, idx_t columns) {
+	if (in_aggregate_) {
+		// T-SQL refuses a subquery in an aggregate's argument (130).
+		return Veto("a subquery in an aggregate");
+	}
+	auto &node = *subquery.Subquery()->node;
+	if (node.type != QueryNodeType::SELECT_NODE) {
+		return Veto("a set operation in a subquery");
+	}
+	bool ordered = false;
+	bool limited = false;
+	for (auto &modifier : node.modifiers) {
+		ordered = ordered || modifier->type == ResultModifierType::ORDER_MODIFIER;
+		limited = limited || modifier->type == ResultModifierType::LIMIT_MODIFIER;
+	}
+	if (ordered && !limited) {
+		// 1033 there, as in a derived table.
+		return Veto("an ORDER BY without LIMIT in a subquery");
+	}
+	if (!inner.Write(node.Cast<SelectNode>())) {
+		return false;
+	}
+	if (columns > 0 && inner.Outputs().size() != columns) {
+		return Veto("a subquery of " + std::to_string(inner.Outputs().size()) + " columns");
+	}
+	return true;
+}
+
+bool NodeWriter::SubqueryOperand(const NodeWriter &inner, const WrittenQuery &inner_out, const std::string &sql,
+								 Operand &out) {
+	auto &output = inner.Outputs()[0];
+	out = Operand();
+	if (output.column_index != DConstants::INVALID_INDEX) {
+		if (!output.plain_read) {
+			// Read through a CAST / STAsBinary: not the column it compares as.
+			return Veto("a subquery's result read through a conversion");
+		}
+		subquery_columns_.push_back(inner.FlatColumn(output.column_index));
+		auto &column = subquery_columns_.back();
+		// NULL when the subquery finds no row.
+		column.is_nullable = true;
+		// A derived table's division / floating-point aggregate stays one.
+		out.division = inner.divergent_of_[output.column_index];
+		out.approximate = inner.divergent_of_[output.column_index];
+		if (out.approximate && predicate_depth_ > 0) {
+			return Veto("a subquery's division / floating-point aggregate in a condition");
+		}
+		out.sql = sql;
+		out.type = column.duckdb_type;
+		out.kind = KindOf(column);
+		out.column = &column;
+	} else {
+		out = output.value;
+		out.sql = sql;
+		// A string value has no column to carry its collation.
+		if (out.kind == ComparableKind::String) {
+			return Veto("a subquery's computed string result");
+		}
+		if ((out.division || out.approximate) && predicate_depth_ > 0) {
+			return Veto("a subquery's division / floating-point aggregate in a condition");
+		}
+		out.column = nullptr;
+		out.constant = nullptr;
+		// DuckDB moves no constant across a subquery.
+		out.moves_constant = false;
+		out.orderable = false;
+		out.not_null = false;
+	}
+	const auto &cast = inner_out.cast_types[0];
+	out.cast_result = cast.id() != LogicalTypeId::INVALID;
+	out.result_type = out.cast_result ? cast : inner_out.column_types[0];
+	return true;
+}
+
+bool NodeWriter::WriteScalarSubquery(const SubqueryExpression &subquery, Operand &out) {
+	if (subquery.GetSubqueryType() != SubqueryType::SCALAR) {
+		return Veto("an EXISTS / IN subquery as a value");
+	}
+	if (!options_.scalar_subquery_errors) {
+		// DuckDB would return one of several rows; the server errors (512).
+		return Veto("a scalar subquery under scalar_subquery_error_on_multiple_rows = false");
+	}
+	WrittenQuery inner_out;
+	NodeWriter inner(*this, inner_out, Correlated());
+	if (!WriteSubqueryNode(subquery, inner, 1)) {
+		return false;
+	}
+	if (!inner.correlated_ && !(inner.aggregated_ && inner.group_keys_.empty()) &&
+		!(inner.limit_ >= 0 && inner.limit_ <= 1)) {
+		// DuckDB evaluates an uncorrelated one once, even for no outer row, and
+		// raises on several rows; the server only per outer row (no row, no 512).
+		return Veto("an uncorrelated scalar subquery that may return several rows");
+	}
+	return SubqueryOperand(inner, inner_out, "(" + inner_out.statement + ")", out);
+}
+
+bool NodeWriter::WriteSubqueryCondition(const SubqueryExpression &subquery, std::string &sql) {
+	WrittenQuery inner_out;
+	NodeWriter inner(*this, inner_out, Correlated());
+	switch (subquery.GetSubqueryType()) {
+	case SubqueryType::EXISTS:
+	case SubqueryType::NOT_EXISTS: {
+		if (!WriteSubqueryNode(subquery, inner, 0)) {
+			return false;
+		}
+		const std::string exists = "EXISTS (" + inner_out.statement + ")";
+		sql = subquery.GetSubqueryType() == SubqueryType::NOT_EXISTS ? ExpressionVocabulary::Not(exists) : exists;
+		return true;
+	}
+	case SubqueryType::ANY: {
+		// `x IN (SELECT ...)`; NOT IN is NOT over it, three-valued alike.
+		if (subquery.GetComparisonType() != ExpressionType::COMPARE_EQUAL || !subquery.GetChild()) {
+			return Veto("a quantified comparison " + subquery.ToString());
+		}
+		Operand left;
+		if (!WriteValue(*subquery.GetChild(), left)) {
+			return false;
+		}
+		if (!WriteSubqueryNode(subquery, inner, 1)) {
+			return false;
+		}
+		Operand right;
+		if (!SubqueryOperand(inner, inner_out, std::string(), right)) {
+			return false;
+		}
+		if (left.constant) {
+			// Typed from the subquery's column, as the binder types it.
+			if (!BindConstant(right, left)) {
+				return false;
+			}
+		} else if (!BindPair(left, right, subquery.ToString())) {
+			return false;
+		}
+		sql = "(" + left.sql + " IN (" + inner_out.statement + "))";
+		return true;
+	}
+	default:
+		return Veto("subquery " + subquery.ToString());
 	}
 }
 
@@ -2054,6 +2384,8 @@ bool NodeWriter::WritePredicateImpl(const ParsedExpression &expr, std::string &s
 	}
 	case ExpressionClass::COMPARISON:
 		return WriteComparison(expr.Cast<ComparisonExpression>(), sql);
+	case ExpressionClass::SUBQUERY:
+		return WriteSubqueryCondition(expr.Cast<SubqueryExpression>(), sql);
 	case ExpressionClass::BETWEEN:
 		return WriteBetween(expr.Cast<BetweenExpression>(), sql);
 	case ExpressionClass::FUNCTION: {
@@ -2259,6 +2591,11 @@ bool NodeWriter::Write(const SelectNode &node) {
 	if (!node.from_table) {
 		return Veto("no FROM");
 	}
+	for (auto &item : node.select_list) {
+		if (!item->GetAlias().empty()) {
+			select_aliases_.push_back(item->GetAlias().GetIdentifierName());
+		}
+	}
 	std::vector<idx_t> members;
 	if (!CollectRelations(*node.from_table, members)) {
 		return false;
@@ -2267,11 +2604,13 @@ bool NodeWriter::Write(const SelectNode &node) {
 	for (auto &relation : relations_) {
 		any_derived = any_derived || relation.derived;
 	}
-	if (relations_.size() > 1 || any_derived) {
+	// A subquery in an expression may name this node's columns, and its own
+	// tables may be this node's: every name qualified by an alias of its own.
+	if (relations_.size() > 1 || any_derived || outer_ || HasSubqueryExpression(node)) {
 		// A join, or a derived table (which T-SQL requires an alias for): every
 		// relation under its own alias, every column qualified.
 		for (idx_t r = 0; r < relations_.size(); r++) {
-			relations_[r].sql = "[r" + std::to_string(r + 1) + "]";
+			relations_[r].sql = "[r" + std::to_string(alias_base_ + r + 1) + "]";
 		}
 	}
 	for (idx_t i = 0; i < columns_.size(); i++) {
@@ -2316,6 +2655,7 @@ bool NodeWriter::Write(const SelectNode &node) {
 		}
 	}
 	const bool limited = limit_value >= 0;
+	limit_ = limit_value;
 	const bool top = limited && offset_value == 0;
 	if (distinct_ && offset_value > 0 && !order) {
 		// OFFSET's `ORDER BY (SELECT NULL)` is not a result column: 145.
@@ -2508,6 +2848,12 @@ bool SQLWriter::PushesMoreThanScan(const QueryNode &node) {
 		return false;
 	};
 	if (select.from_table && from_gains(*select.from_table)) {
+		return true;
+	}
+	// A subquery in an expression: the server filters (IN / EXISTS) or looks
+	// up (a scalar subquery), where the scan path would read both tables and
+	// join them here.
+	if (HasSubqueryExpression(select)) {
 		return true;
 	}
 	// A join with conditions: the server matches the rows, where the scans

@@ -1613,6 +1613,7 @@ bool MSSQLCatalog::SupportsPushdown(const ParsedExpression &expression) {
 // push it as a part of a node that does not go whole).
 static void NoteOriginalTableName(const BaseTableRef &ref);
 static bool MayRepeatOutputNames(const QueryNode &node);
+static void CollectPushdownTables(const QueryNode &node, vector<const BaseTableRef *> &refs);
 
 bool MSSQLCatalog::SupportsPushdown(const TableRef &ref) {
 	if (ref.type == TableReferenceType::JOIN || ref.type == TableReferenceType::SUBQUERY) {
@@ -1646,32 +1647,11 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 		why = "not a SELECT";
 		return false;
 	}
-	auto &select = node.Cast<SelectNode>();
-	// Every base table of the FROM (one, or a join's), resolved before the
-	// writer runs and held until it is done.
+	// Every base table the node names -- its FROM's, a derived table's, a
+	// subquery expression's (PR E1) -- resolved before the writer runs and
+	// held until it is done. What the writer has no form for it refuses.
 	vector<const BaseTableRef *> refs;
-	vector<const TableRef *> pending;
-	if (select.from_table) {
-		pending.push_back(select.from_table.get());
-	}
-	while (!pending.empty()) {
-		auto ref = pending.back();
-		pending.pop_back();
-		if (ref->type == TableReferenceType::BASE_TABLE) {
-			refs.push_back(&ref->Cast<BaseTableRef>());
-		} else if (ref->type == TableReferenceType::JOIN) {
-			pending.push_back(ref->Cast<JoinRef>().left.get());
-			pending.push_back(ref->Cast<JoinRef>().right.get());
-		} else if (ref->type == TableReferenceType::SUBQUERY &&
-				   ref->Cast<SubqueryRef>().subquery->node->type == QueryNodeType::SELECT_NODE &&
-				   ref->Cast<SubqueryRef>().subquery->node->Cast<SelectNode>().from_table) {
-			// A derived table's own tables (PR E1).
-			pending.push_back(ref->Cast<SubqueryRef>().subquery->node->Cast<SelectNode>().from_table.get());
-		} else {
-			why = "FROM holds something other than tables, joins and subqueries";
-			return false;
-		}
-	}
+	CollectPushdownTables(node, refs);
 	if (refs.empty()) {
 		why = "no FROM";
 		return false;
@@ -1738,6 +1718,14 @@ bool MSSQLCatalog::SupportsPushdown(const QueryNode &node) {
 	if (WritePushdown(node, written, why)) {
 		MSSQL_CATALOG_DEBUG_LOG(1, "SupportsPushdown(query node %s): %s", node.ToString().c_str(),
 								written.statement.c_str());
+		return true;
+	}
+	if (written.refers_outside && node.type == QueryNodeType::SELECT_NODE && !MayRepeatOutputNames(node)) {
+		// A correlated subquery, asked about on its own: a no would keep the
+		// statement around it from being pushed whole. RemoteExecute renders it
+		// with that statement, or hands it back.
+		MSSQL_CATALOG_DEBUG_LOG(1, "SupportsPushdown(query node %s): refers outside (%s)", node.ToString().c_str(),
+								why.c_str());
 		return true;
 	}
 	// Not as a whole -- but RemoteExecute can still push its nested parts, of
@@ -1893,6 +1881,12 @@ static void VisitNode(QueryNode &node, const NestedNodeVisitor &on_node, const B
 			break;
 		}
 	}
+}
+
+static void CollectPushdownTables(const QueryNode &node, vector<const BaseTableRef *> &refs) {
+	VisitNode(
+		const_cast<QueryNode &>(node), [&](unique_ptr<QueryNode> &slot) { CollectPushdownTables(*slot, refs); },
+		[&](BaseTableRef &ref) { refs.push_back(&ref); });
 }
 
 // Puts back every table name the strip took the catalog off, from the names
