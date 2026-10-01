@@ -966,6 +966,15 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 				result->claimed_session = bind_data.prepared_session;
 			}
 		}
+		// The pair the chain below rests on: a lost claim must have an ad-hoc
+		// batch to fall back to, or the final `else` sends execute_sql -- the
+		// `EXEC sp_execute <handle>` form -- down a POOLED connection that never
+		// received the sp_prepare, and the server answers "handle not found"
+		// instead of anything a reader can act on. Asserted here, where the pair
+		// is consumed; BindDescribedScan asserts the same at the point it sets it
+		// (roborev 1721: an assertion at the write site only says the write
+		// happened, not that a future caller kept the pair together).
+		D_ASSERT(!lost_claim || !bind_data.fallback_sql.empty());
 		if (claimed) {
 			// The handle lives in the held session; the stream borrows it and gives
 			// it back to the session, not to the pool.

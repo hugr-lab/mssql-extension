@@ -178,6 +178,14 @@ void CTASExecutionState::ExecuteDDL(ClientContext &context) {
 				col.collation = "";
 				col.precision = 0;
 				col.scale = 0;
+				// MAX, not the default 0: the declared length lives inside
+				// mssql_type here (CTASColumnDef carries none of its own), and
+				// max_length is read by the OUTPUT list of INSERT ... RETURNING
+				// (BuildReadExpression). CTAS sets use_returning_output = false
+				// below, so 0 was harmless -- but it rendered
+				// `CAST([c] AS NVARCHAR(0))` for a non-UTF-8 char/varchar column
+				// the moment anything reused this target (roborev 1719).
+				col.max_length = -1;
 				insert_target.columns.push_back(std::move(col));
 				insert_target.insert_column_indices.push_back(i);
 			}
