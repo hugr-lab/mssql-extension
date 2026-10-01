@@ -109,7 +109,7 @@ int64_t QuerySingleInt(Connection &conn, const std::string &sql) {
 	if (result->RowCount() == 0) {
 		throw std::runtime_error("Query returned no rows");
 	}
-	return result->GetValue(0, 0).GetValue<int64_t>();
+	return result->Collection().GetValue(0, 0).GetValue<int64_t>();
 }
 
 // Test: Two connections can work independently

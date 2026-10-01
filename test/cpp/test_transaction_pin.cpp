@@ -245,7 +245,7 @@ int main() {
 		// And the connection everyone got really is inside a server transaction:
 		// a statement on it, through the ordinary path, sees @@TRANCOUNT = 1.
 		auto tc = conn.Query("SELECT * FROM mssql_scan('mssql', 'SELECT @@TRANCOUNT AS tc')");
-		if (tc->HasError() || tc->RowCount() != 1 || tc->GetValue(0, 0).GetValue<int32_t>() != 1) {
+		if (tc->HasError() || tc->RowCount() != 1 || tc->Collection().GetValue(0, 0).GetValue<int32_t>() != 1) {
 			std::cerr << "  round " << round
 					  << ": @@TRANCOUNT check failed: " << (tc->HasError() ? tc->GetError() : tc->ToString())
 					  << std::endl;
