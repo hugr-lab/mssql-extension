@@ -16,11 +16,11 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "mssql_function_docs.hpp"
-#include "table_scan/table_scan.hpp"
 #include "mssql_functions.hpp"
 #include "mssql_secret.hpp"
 #include "mssql_storage.hpp"
 #include "table_scan/mssql_optimizer.hpp"
+#include "table_scan/table_scan.hpp"
 #include "tds/auth/krb5_test_function.hpp"
 #include "tds/auth/winsspi_test_function.hpp"
 

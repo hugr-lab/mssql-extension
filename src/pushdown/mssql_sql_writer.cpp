@@ -1519,7 +1519,7 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			auto &literal = item->Cast<ConstantExpression>().GetLiteral();
 			int64_t number;
 			if (aggregated_ || literal.kind != LiteralKind::INTEGER || !literal.TryGetInt64(number) ||
-				number > NumericLimits<int32_t>::Maximum()) {
+				number > NumericLimits<int32_t>::Maximum() || number < NumericLimits<int32_t>::Minimum()) {
 				return Veto("a constant in the select list");
 			}
 			const std::string output = item->GetName().GetIdentifierName();
@@ -3019,8 +3019,12 @@ bool NodeWriter::Write(const SelectNode &node) {
 	const bool reduces_derived = limited || (aggregated_ && group_keys_.empty());
 	out_.gain_uncertain = (unbounded_links_ > 0 && !reduces) || (derived_uncertain_ && !reduces_derived);
 	for (auto &output : outputs_) {
-		out_.value_divergence = out_.value_divergence || (output.column_index == DConstants::INVALID_INDEX &&
-														  (output.value.division || output.value.approximate));
+		// Computed here, or a derived table's (or inlined CTE's) column carried
+		// out as it is (review of #399: one level of nesting hid the flag, and
+		// a division's NULL reached DuckDB's filter above the vehicle).
+		out_.value_divergence = out_.value_divergence || (output.column_index == DConstants::INVALID_INDEX
+															  ? output.value.division || output.value.approximate
+															  : divergent_of_[output.column_index]);
 	}
 	for (auto &relation : relations_) {
 		if (relation.semi) {

@@ -128,6 +128,21 @@ SELECT s.id FROM (SELECT id, x / y AS r FROM rd_on.dbo.rd_d ORDER BY id LIMIT 10
 ----
 3
 
+# Carried out of its node by an enclosing one and filtered by DuckDB above a
+# vehicle (an EXCLUDE hands the outer node back): a part holding a division
+# two levels down is not pushed, or NULL-for-inf would reach the filter
+# (review of #399: one level of nesting hid the flag; pushed it returned the
+# rows of ids 1, 3 and 4).
+query I
+SELECT * EXCLUDE (k) FROM (SELECT s.r AS r, 1 AS k FROM (SELECT id, x / y AS r FROM rd_on.dbo.rd_d) s LIMIT 10) q WHERE q.r IS NULL;
+----
+NULL
+
+query I
+SELECT * EXCLUDE (k) FROM (SELECT s.r AS r, 1 AS k FROM (SELECT id, x / y AS r FROM rd_off.dbo.rd_d) s LIMIT 10) q WHERE q.r IS NULL;
+----
+NULL
+
 statement ok
 SELECT mssql_exec('rd_off', 'DROP TABLE dbo.rd_d');
 

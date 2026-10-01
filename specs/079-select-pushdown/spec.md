@@ -328,7 +328,9 @@ pushed against not pushed; a semantic pass of 280 on the live server).**
   count the planner gets (statistics cache, else the entry's; no round
   trip), a view or a derived table counting as unknown; else it is handed
   back to the scan path. Not checked inside a transaction or on a pool of one
-  connection (trusted). A plan-based estimate (SHOWPLAN on a separate
+  connection (trusted) -- where a blow-up is least affordable, but where the
+  scan path's alternative is to materialise every input on the one
+  connection before DuckDB joins them, which costs as much or more. A plan-based estimate (SHOWPLAN on a separate
   connection) is a later step. A join inside a derived table or a CTE is
   checked with the node that holds it (full review: the wrapper skipped the
   check); a derived table is sized by its inputs, and its GROUP BY columns

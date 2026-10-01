@@ -674,7 +674,11 @@ int main() {
 	ExpectSql("SELECT id, (SELECT max(t_id) FROM u WHERE u.id = t.id) AS m FROM t",
 			  "SELECT [r1].[id] AS [id], (SELECT MAX([r2].[t_id]) AS [max(t_id)] FROM [dbo].[u] AS [r2] WHERE "
 			  "([r2].[id] = [r1].[id])) AS [m] FROM [dbo].[t] AS [r1]");
-	ExpectVeto("SELECT id FROM t WHERE id IN (SELECT t_id, id FROM u)");			// two columns
+	ExpectVeto("SELECT id FROM t WHERE id IN (SELECT t_id, id FROM u)");
+	// An integer constant outside int: BIGINT here, numeric(10,0) there
+	// (review of #399: only the upper bound was checked).
+	ExpectVeto("SELECT -3000000000 FROM t LIMIT 1");
+	ExpectVeto("SELECT 3000000000 FROM t LIMIT 1");									// two columns
 	ExpectVeto("SELECT id FROM t WHERE id IN (SELECT t_id FROM u ORDER BY t_id)");	// 1033
 	ExpectVeto("SELECT id FROM t WHERE id > ANY (SELECT t_id FROM u)");				// not = ANY
 	ExpectVeto("SELECT id FROM t WHERE 0 < (SELECT max(u.t_id + t.id) FROM u)");	// an outer aggregate

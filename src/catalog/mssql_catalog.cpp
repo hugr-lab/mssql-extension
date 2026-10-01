@@ -1776,13 +1776,21 @@ struct OriginalTableNames {
 	//! keeps its names (review of E1 -- a lost note made `db.t` look bare).
 	std::unordered_map<const BaseTableRef *, QualifiedName> previous;
 
+	//! The note for `ref`, if it is this ref's: notes are keyed by address,
+	//! and one left by an earlier statement (pushed whole, never restored)
+	//! can sit at an address a new ref reuses. The strip removes only the
+	//! catalog / schema, so a note whose table name differs is another ref's
+	//! (review of #399) -- not found, rather than a silent bind elsewhere.
 	const QualifiedName *Find(const BaseTableRef &ref) const {
-		auto entry = names.find(&ref);
-		if (entry != names.end()) {
-			return &entry->second;
+		for (auto map : {&names, &previous}) {
+			auto entry = map->find(&ref);
+			if (entry != map->end()) {
+				return StringUtil::CIEquals(entry->second.Name().GetIdentifierName(), ref.Table().GetIdentifierName())
+						   ? &entry->second
+						   : nullptr;
+			}
 		}
-		entry = previous.find(&ref);
-		return entry != previous.end() ? &entry->second : nullptr;
+		return nullptr;
 	}
 	void Erase(const BaseTableRef &ref) {
 		names.erase(&ref);

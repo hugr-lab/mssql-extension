@@ -41,9 +41,16 @@ order of priority yet.
 ## Gain decision
 
 - **A plan-based estimate.** The join gain check compares the largest input
-  table with `mssql_pushdown_join_rows_threshold`, from cached counts. A
-  SHOWPLAN on a separate connection (or an `mssql_estimate` function) would
-  estimate the join's output instead (owner's plan, E1).
+  table with `mssql_pushdown_join_rows_threshold`, from cached counts: it
+  bounds the inputs, not the output -- two 900k-row tables joined
+  many-to-many pass at the default and the server may produce ~10^11 rows
+  where the scans would ship 1.8M (raised on #399). For large statements
+  the answer is the server's own estimate: a SHOWPLAN on a separate
+  connection (or an `mssql_estimate` function) read before deciding (owner's
+  plan, E1). Owner's call on #399: not before v0.3.0 unless the rest is done
+  first -- no interim heuristic. A cheaper step on the way, if wanted: a
+  product bound (largest x second-largest input against an output-row
+  threshold of its own), from the same cached counts, no round trip.
 - **Keys through a wrapper.** A derived table's key is its GROUP BY / DISTINCT
   columns only; a plain join of keyed tables inside it carries no key up, so
   a GROUP BY over the wrapper's columns is treated as not reducing (E1 full
