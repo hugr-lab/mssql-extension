@@ -199,6 +199,11 @@ set(EXTENSION_SOURCES
     src/table_scan/table_scan.cpp
     src/table_scan/mssql_optimizer.cpp
     src/pushdown/mssql_expression_vocabulary.cpp
+    src/pushdown/mssql_node_writer.cpp
+    src/pushdown/mssql_node_writer_from.cpp
+    src/pushdown/mssql_node_writer_select.cpp
+    src/pushdown/mssql_node_writer_subqueries.cpp
+    src/pushdown/mssql_node_writer_values.cpp
     src/pushdown/mssql_order_term.cpp
     src/pushdown/mssql_pushdown_resolution.cpp
     src/pushdown/mssql_query_tree.cpp
