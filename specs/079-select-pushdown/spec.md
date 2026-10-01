@@ -306,7 +306,14 @@ pushed against not pushed; a semantic pass of 280 on the live server).**
   (noted before the rewriter strips the catalog in place: `db.t` arrives as a
   bare `t`), and every nested part that renders and gains is replaced by
   `SELECT * FROM <its vehicle>` -- a statement DuckDB cannot send whole (an
-  EXCLUDE, a window, a local join) runs over as many vehicles as it has parts.
+  EXCLUDE, a window over named columns) runs over as many vehicles as it has
+  parts. Not decomposed: a `*` over a join (below), and so a window over
+  `*`; a statement that also reads a local table waits on DuckDB (below). A
+  set operation ordered (or DISTINCT ON) by anything but a position or one of
+  its result names -- an expression, `... ORDER BY g + 1`, or a name the
+  children select under other aliases -- keeps its children's select lists,
+  through nested set operations too: DuckDB binds that key against them, and
+  a vehicle has none (full review of E1).
   Guards: a part that names a CTE of an enclosing scope is not pushed alone;
   a `*` over a join is not decomposed (a handed-back subquery would dedupe
   `n, n` to `n, n_1`); a part whose result feeds DuckDB's own computation
@@ -322,7 +329,10 @@ pushed against not pushed; a semantic pass of 280 on the live server).**
   trip), a view or a derived table counting as unknown; else it is handed
   back to the scan path. Not checked inside a transaction or on a pool of one
   connection (trusted). A plan-based estimate (SHOWPLAN on a separate
-  connection) is a later step.
+  connection) is a later step. A join inside a derived table or a CTE is
+  checked with the node that holds it (full review: the wrapper skipped the
+  check); a derived table is sized by its inputs, and its GROUP BY columns
+  (all of them under DISTINCT) are its key, so a join on them is bounded.
 - *Derived tables.* A subquery in FROM is rendered in place, `(<T-SQL>) AS
   [rN]`, sharing the statement's parameter set; its columns are already read
   (a code-page varchar's NVARCHAR cast is not repeated, an integer `sum` cast
@@ -344,11 +354,18 @@ pushed against not pushed; a semantic pass of 280 on the live server).**
   (`refers_outside`; not for `rowid` or a select alias). Vetoed: a
   correlated column in the subquery's aggregate (DuckDB's outer aggregate),
   a subquery in an aggregate (130), quantified comparisons other than
-  `= ANY`, a result read through a conversion, a computed string result, an
-  uncorrelated scalar subquery that may return several rows (DuckDB
-  evaluates it once and raises even with no outer row; the server evaluates
-  it per row), and every scalar subquery under
-  `scalar_subquery_error_on_multiple_rows = false`.
+  `= ANY`, a result read through a conversion, a computed string result, a
+  scalar subquery that may return several rows -- DuckDB checks every outer
+  row (an uncorrelated one once, even for no outer row) and raises, where the
+  server evaluates it lazily (never under a TOP that stops first, an untaken
+  CASE branch, a COALESCE already answered, a COUNT that drops the column;
+  full review) -- so it is pushed only when it returns one row: an aggregate
+  without GROUP BY, a LIMIT 1, or an equality on every column of its single
+  table's unique key with a constant or an outer column; every scalar
+  subquery under `scalar_subquery_error_on_multiple_rows = false`; and a
+  subquery in a result column without an alias (named after its text, whose
+  table names the rewriter stripped of their catalog). A correlation that
+  skips a level answers yes in the middle node's dry run too.
 - *Set operations: nested only* (owner's call). At a statement's top the
   children go as parts and DuckDB combines them; nested -- a derived table,
   IN / EXISTS, a part -- UNION [ALL] / EXCEPT / INTERSECT is rendered in
@@ -370,7 +387,9 @@ pushed against not pushed; a semantic pass of 280 on the live server).**
   LIMIT / OFFSET among ties) is vetoed when referenced twice or under a
   subquery expression; a deterministic body inlined twice is read twice on
   the server, which under concurrent writes can see different committed
-  rows (recorded). Vetoed: column aliases, USING KEY, recursive CTEs.
+  rows (recorded). Vetoed: column aliases, USING KEY, recursive CTEs, and a
+  derived table or inlined CTE past 1 MB of T-SQL (a CTE read twice by a CTE
+  read twice doubles per level).
 - *Waiting on DuckDB* (duckdb/duckdb#26280): in a statement that also reads
   a local table, the rewriter finishes neither a FROM subquery nor a CTE
   body on its own, so their aggregate or join runs in DuckDB over a plain
@@ -381,7 +400,24 @@ pushed against not pushed; a semantic pass of 280 on the live server).**
 - *Search path at RemoteExecute.* The table resolution with a context now
   applies the same check as the dry run (by the written name): `USE
   db.sales; SELECT ... FROM t` binds `sales.t`, and with a broader dry-run
-  yes it would otherwise have been pushed reading `dbo.t`.
+  yes it would otherwise have been pushed reading `dbo.t`. A name written
+  without a schema is `t` **and `db.t`** (full review: DuckDB's binder reads
+  `db.t` through the catalog's search-path entry, and it was pushed reading
+  `dbo.t` since PR B).
+- *A set operation's child DuckDB finishes on its own* (a set operation that
+  also reads a local table or another catalog) reaches `RemoteExecute` like a
+  statement, which cannot tell the two apart. A division there (NULL for
+  inf) or a floating-point aggregate's last bits are then compared,
+  deduplicated or filtered in DuckDB above it: `SELECT n / 0 ... UNION
+  SELECT NULL::DOUBLE FROM loc` gives {NULL} pushed, {inf, NULL} locally.
+  Recorded, not vetoed: vetoing would take division from every statement's
+  top; a divisor proven non-zero would settle it (`after-0.3.0.md`, the list
+  of what is left for after v0.3.0).
+- *Plan copies find the catalog scan.* DuckDB inlines a CTE used more than
+  once under a LIMIT by copying its plan, which looks the scan function up by
+  name: `mssql_catalog_scan` is registered (internal; called by name its bind
+  refuses), and its deserialize rebuilds the scan from the catalog entry.
+  Found by the E1 fuzz, on the scan path; it predates E1.
 
 **Revised in PR B: the catalog's types, not the describe's.** Run on every
 table of the test database, the describe disagreed with the catalog on three

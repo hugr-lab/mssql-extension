@@ -95,6 +95,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     column's collation when pushed, as `DISTINCT` does (D4).
   - A CTE whose body has a `LIMIT` is not inlined where the server could
     evaluate it twice. A CTE body inlined twice is read twice by the server.
+  - A scalar subquery is pushed only when it returns one row (a key lookup,
+    an aggregate, a `LIMIT 1`): the server evaluates it lazily and would
+    return rows where DuckDB raises "More than one row returned".
+  - A join inside a subquery or a CTE is gain-checked with the statement
+    around it; a subquery's `GROUP BY` columns count as its key.
+  - Under `USE db.sales`, `db.t` is read as DuckDB reads it (`sales.t`); it
+    was pushed reading `dbo.t`.
+  - A set operation's child that DuckDB sends on its own (the set operation
+    also reads a local table) is pushed like a statement: a division by zero
+    in it is NULL, not `inf`, before DuckDB deduplicates or filters.
   - Not pushed: `EXCEPT ALL` / `INTERSECT ALL`, `UNION BY NAME`, recursive
     CTEs, CTE column aliases, `> ANY` / `ALL`, and any scalar subquery under
     `scalar_subquery_error_on_multiple_rows = false`.

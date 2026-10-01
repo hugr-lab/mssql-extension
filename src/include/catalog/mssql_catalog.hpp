@@ -372,6 +372,9 @@ public:
 	//! Whether every search-path entry of this catalog is its default schema,
 	//! so an unqualified name binds where the rewriter looked it up.
 	bool SearchPathIsDefaultSchema(ClientContext &context) const;
+	//! The query wrote `ref` without a schema (`t` or `db.t`), by the name
+	//! noted before the rewriter's strip.
+	bool WrittenWithoutSchema(const BaseTableRef &ref) const;
 	struct PushdownTable {
 		MSSQLTableEntry *entry = nullptr;
 		ClientContext *context = nullptr;
@@ -394,9 +397,11 @@ public:
 						   const vector<string> &scope, bool nested);
 	//! Whether a node nested in `node` would be pushed; `scope` holds the CTE
 	//! names visible from outside it.
-	bool HasPushablePart(const QueryNode &node, const vector<string> &scope);
+	//! `keep`: `node` is a set operation whose children an enclosing set
+	//! operation's ORDER BY / DISTINCT ON binds against -- they stay.
+	bool HasPushablePart(const QueryNode &node, const vector<string> &scope, bool keep = false);
 	//! Push every nested part that renders and gains, in place.
-	void PushNestedParts(ClientContext &context, QueryNode &node, const vector<string> &scope);
+	void PushNestedParts(ClientContext &context, QueryNode &node, const vector<string> &scope, bool keep = false);
 
 	// Get connection info
 	const MSSQLConnectionInfo &GetConnectionInfo() const;

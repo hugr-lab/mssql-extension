@@ -266,6 +266,25 @@ SELECT id FROM rp_t ORDER BY id LIMIT 5;
 100
 200
 
+# `db.t` too: the binder reads it through the catalog's search-path entry
+# (review of E1: it was pushed reading dbo.rp_t).
+query II
+EXPLAIN SELECT id FROM rp_on.rp_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT id FROM rp_on.rp_t ORDER BY id LIMIT 5;
+----
+100
+200
+
+# A schema written is that schema, whatever the search path says.
+query II
+EXPLAIN SELECT id FROM rp_on.dbo.rp_t ORDER BY id LIMIT 5;
+----
+physical_plan	<REGEX>:.*FROM \[dbo\]\.\[rp_t\].*
+
 statement ok
 USE memory;
 

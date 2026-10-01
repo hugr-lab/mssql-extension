@@ -225,6 +225,42 @@ EXPLAIN SELECT x.id AS xid, y.id AS yid FROM rj_on.dbo.rj_b x JOIN rj_on.dbo.rj_
 ----
 physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
 
+# (and no vehicle carries the join: the regex above would match a plan split
+# into a vehicle and a scan too)
+query II
+EXPLAIN SELECT x.id AS xid, y.id AS yid FROM rj_on.dbo.rj_b x JOIN rj_on.dbo.rj_b y ON x.a_id = y.a_id ORDER BY xid, yid;
+----
+physical_plan	<!REGEX>:.*JOIN \[dbo\].*
+
+# Wrapped in a derived table or a CTE, the join is checked all the same
+# (review of E1: the wrapper skipped the check).
+query II
+EXPLAIN SELECT * FROM (SELECT x.id AS xid, y.id AS yid FROM rj_on.dbo.rj_b x JOIN rj_on.dbo.rj_b y ON x.a_id = y.a_id) s ORDER BY 1, 2;
+----
+physical_plan	<!REGEX>:.*JOIN \[dbo\].*
+
+query II
+EXPLAIN WITH s AS (SELECT x.id AS xid, y.id AS yid FROM rj_on.dbo.rj_b x JOIN rj_on.dbo.rj_b y ON x.a_id = y.a_id) SELECT * FROM s ORDER BY 1, 2;
+----
+physical_plan	<!REGEX>:.*JOIN \[dbo\].*
+
+query II
+SELECT * FROM (SELECT x.id AS xid, y.id AS yid FROM rj_on.dbo.rj_b x JOIN rj_on.dbo.rj_b y ON x.a_id = y.a_id) s ORDER BY 1, 2;
+----
+2	2
+10	10
+10	11
+11	10
+11	11
+12	12
+
+# A derived table's GROUP BY columns are its key: a join on them is bounded,
+# and goes without a LIMIT.
+query II
+EXPLAIN SELECT b.id, s.c FROM rj_on.dbo.rj_b b JOIN (SELECT a_id, count(*) AS c FROM rj_on.dbo.rj_b GROUP BY a_id) s ON s.a_id = b.a_id ORDER BY b.id;
+----
+physical_plan	<REGEX>:.*INNER JOIN \(SELECT .* GROUP BY .*\) AS \[r2\].*
+
 query II
 SELECT x.id AS xid, y.id AS yid FROM rj_on.dbo.rj_b x JOIN rj_on.dbo.rj_b y ON x.a_id = y.a_id ORDER BY xid, yid;
 ----
@@ -246,6 +282,11 @@ EXPLAIN SELECT x.id AS xid, y.id AS yid, count(*) AS c FROM rj_on.dbo.rj_b x JOI
 ----
 physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
 
+query II
+EXPLAIN SELECT x.id AS xid, y.id AS yid, count(*) AS c FROM rj_on.dbo.rj_b x JOIN rj_on.dbo.rj_b y ON x.a_id = y.a_id GROUP BY x.id, y.id;
+----
+physical_plan	<!REGEX>:.*JOIN \[dbo\].*
+
 # A comma join on a key is bounded by WHERE's equality: pushed.
 query II
 EXPLAIN SELECT a.name, b.label FROM rj_on.dbo.rj_a a, rj_on.dbo.rj_b b WHERE b.a_id = a.id ORDER BY b.id;
@@ -264,6 +305,11 @@ query II
 EXPLAIN SELECT x.id AS xid, y.id AS yid FROM rj_on.dbo.rj_v x JOIN rj_on.dbo.rj_v y ON x.a_id = y.a_id ORDER BY xid, yid;
 ----
 physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT x.id AS xid, y.id AS yid FROM rj_on.dbo.rj_v x JOIN rj_on.dbo.rj_v y ON x.a_id = y.a_id ORDER BY xid, yid;
+----
+physical_plan	<!REGEX>:.*JOIN \[dbo\].*
 
 statement ok
 SELECT mssql_exec('rj_off', 'DROP VIEW dbo.rj_v');

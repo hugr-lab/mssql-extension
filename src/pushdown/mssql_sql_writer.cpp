@@ -184,6 +184,9 @@ struct OutputColumn {
 	Operand value;
 };
 
+//! The largest derived table / inlined CTE the writer renders.
+constexpr size_t MAX_DERIVED_SQL = 1 << 20;
+
 //! The aggregates the writer renders, by DuckDB name.
 enum class AggregateKind { CountStar, Count, Sum, Avg, Min, Max, Stdev, StdevP, Var, VarP };
 
@@ -576,6 +579,13 @@ private:
 	idx_t cte_parent_limit_ = DConstants::INVALID_INDEX;
 	//! A subquery expression's node: evaluated per row of the node around it.
 	bool in_expression_ = false;
+	//! A derived table (or inlined CTE) whose own joins are of uncertain gain:
+	//! this node's gain is uncertain too unless it reduces the rows.
+	bool derived_uncertain_ = false;
+	//! Whether the written node returns at most one row for each row of the
+	//! node around it: an equality on every column of its single table's
+	//! unique key, with a constant or a column of a node around it.
+	bool KeyedToOneRow(const SelectNode &node) const;
 	//! The SELECT * wrapper a set operation's ORDER BY / LIMIT is written
 	//! through, kept while the writer lives.
 	unique_ptr<SelectNode> synthetic_node_;
@@ -990,15 +1000,43 @@ bool NodeWriter::CollectDerivedNode(const QueryNode &node, const std::string &na
 	}
 	correlated_ = correlated_ || inner.correlated_;
 	out_.picks_rows = out_.picks_rows || inner_out.picks_rows;
+	// Its joins' gain is this node's to settle (review of E1: a many-to-many
+	// join wrapped in a derived table or a CTE skipped the check).
+	derived_uncertain_ = derived_uncertain_ || inner_out.gain_uncertain;
 	if (picks_rows) {
 		*picks_rows = inner_out.picks_rows;
+	}
+	if (inner_out.statement.size() > MAX_DERIVED_SQL) {
+		// A CTE read twice by a CTE read twice ... doubles per level.
+		return Veto("a derived table or inlined CTE past " + std::to_string(MAX_DERIVED_SQL) + " bytes of T-SQL");
 	}
 	Relation relation;
 	relation.derived = true;
 	relation.derived_sql = inner_out.statement;
 	relation.name = name;
 	relation.table.name = relation.name;
-	relation.table.size_known = false;
+	// Sized by its inputs, as a join's tables are; a view among them unknown.
+	relation.table.size_known = !inner_out.input_size_unknown;
+	relation.table.approx_rows = inner_out.largest_input_rows;
+	// Its GROUP BY columns (or all of them under DISTINCT) are a unique key,
+	// when every one of them is a result column.
+	if (inner.aggregated_ && !inner.group_keys_.empty()) {
+		for (auto key : inner.group_keys_) {
+			for (auto &output : inner.Outputs()) {
+				if (output.column_index == key && output.plain_read) {
+					relation.table.unique_key.push_back(output.name);
+					break;
+				}
+			}
+		}
+		if (relation.table.unique_key.size() != inner.group_keys_.size()) {
+			relation.table.unique_key.clear();
+		}
+	} else if (inner.distinct_ && !inner.aggregated_) {
+		for (auto &output : inner.Outputs()) {
+			relation.table.unique_key.push_back(output.name);
+		}
+	}
 	for (auto &other : relations_) {
 		if (StringUtil::CIEquals(other.name, relation.name)) {
 			return Veto("two tables named " + relation.name);
@@ -1535,6 +1573,11 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			if (value.result_type.id() == LogicalTypeId::INVALID && value.type.id() == LogicalTypeId::DECIMAL) {
 				value.result_type = value.type;
 			}
+			if (alias.empty() && item->HasSubquery()) {
+				// Named after its text, which holds the table names the rewriter
+				// stripped of their catalog (review of E1).
+				return Veto("a subquery in a result column without an alias");
+			}
 			const std::string output = item->GetName().GetIdentifierName();
 			if (output.size() > 128) {
 				// SQL Server refuses a longer identifier (103); DuckDB does not.
@@ -1830,6 +1873,58 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 	}
 }
 
+bool NodeWriter::KeyedToOneRow(const SelectNode &node) const {
+	if (relations_.size() != 1 || relations_[0].derived || relations_[0].table.unique_key.empty() ||
+		!node.where_clause || distinct_ || aggregated_) {
+		return false;
+	}
+	std::vector<const ParsedExpression *> conjuncts;
+	std::function<void(const ParsedExpression &)> collect = [&](const ParsedExpression &expr) {
+		if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+			for (auto &child : expr.Cast<ConjunctionExpression>().GetChildren()) {
+				collect(*child);
+			}
+			return;
+		}
+		conjuncts.push_back(&expr);
+	};
+	collect(*node.where_clause);
+	// A side that is fixed for one outer row: a constant, or a column this
+	// node does not have (an outer one -- the write resolved it). A string key
+	// only against a constant: an outer column of another server type (varchar
+	// against nvarchar) compares under other rules, where two keys can meet
+	// one value.
+	auto fixed = [&](const ParsedExpression &side, idx_t key_index) {
+		if (side.GetExpressionClass() == ExpressionClass::CONSTANT) {
+			return true;
+		}
+		idx_t unused;
+		return KindOf(columns_[key_index]) != ComparableKind::String &&
+			   side.GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+			   FindColumn(side.Cast<ColumnRefExpression>(), unused) != 1;
+	};
+	for (auto &key_column : relations_[0].table.unique_key) {
+		bool equated = false;
+		for (auto conjunct : conjuncts) {
+			if (conjunct->GetExpressionType() != ExpressionType::COMPARE_EQUAL) {
+				continue;
+			}
+			auto &cmp = conjunct->Cast<ComparisonExpression>();
+			for (auto pair : {std::make_pair(&cmp.Left(), &cmp.Right()), std::make_pair(&cmp.Right(), &cmp.Left())}) {
+				idx_t index;
+				equated =
+					equated || (pair.first->GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+								FindColumn(pair.first->Cast<ColumnRefExpression>(), index) == 1 &&
+								StringUtil::CIEquals(columns_[index].name, key_column) && fixed(*pair.second, index));
+			}
+		}
+		if (!equated) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool NodeWriter::MayBeOuter(const ColumnRefExpression &ref, int found) const {
 	auto &names = ref.ColumnNames();
 	if (names.size() == 1) {
@@ -1882,6 +1977,9 @@ bool NodeWriter::WriteOuterColumn(const ColumnRefExpression &ref, Operand &out, 
 		found = true;
 		return true;
 	}
+	// No node around this one has it: a node further out, beyond the one the
+	// rewriter asked about on its own (a correlation that skips a level).
+	out_.refers_outside = true;
 	return true;
 }
 
@@ -1902,6 +2000,7 @@ bool NodeWriter::WriteSubqueryNode(const SubqueryExpression &subquery, NodeWrite
 		return Veto("an ORDER BY without LIMIT in a subquery");
 	}
 	if (!inner.WriteQueryNode(node)) {
+		out_.refers_outside = out_.refers_outside || inner.out_.refers_outside;
 		return false;
 	}
 	if (columns > 0 && inner.Outputs().size() != columns) {
@@ -1971,11 +2070,15 @@ bool NodeWriter::WriteScalarSubquery(const SubqueryExpression &subquery, Operand
 		return false;
 	}
 	out_.picks_rows = out_.picks_rows || inner_out.picks_rows;
-	if (!inner.correlated_ && !(inner.aggregated_ && inner.group_keys_.empty()) &&
-		!(inner.limit_ >= 0 && inner.limit_ <= 1)) {
-		// DuckDB evaluates an uncorrelated one once, even for no outer row, and
-		// raises on several rows; the server only per outer row (no row, no 512).
-		return Veto("an uncorrelated scalar subquery that may return several rows");
+	// At most one row, provably: DuckDB checks every outer row (an
+	// uncorrelated subquery once, even for no outer row) and raises on several;
+	// the server evaluates it lazily -- never under a TOP that stops first, an
+	// untaken CASE branch, a COALESCE already answered, a COUNT that drops the
+	// column -- and returns rows where DuckDB errors (review of E1).
+	const auto &subquery_node = *subquery.Subquery()->node;
+	if (!(inner.aggregated_ && inner.group_keys_.empty()) && !(inner.limit_ >= 0 && inner.limit_ <= 1) &&
+		!(subquery_node.type == QueryNodeType::SELECT_NODE && inner.KeyedToOneRow(subquery_node.Cast<SelectNode>()))) {
+		return Veto("a scalar subquery that may return several rows");
 	}
 	return SubqueryOperand(inner, inner_out, "(" + inner_out.statement + ")", out);
 }
@@ -2911,7 +3014,10 @@ bool NodeWriter::Write(const SelectNode &node) {
 		}
 		reduces = reduces || !CoversEveryKey(selected);
 	}
-	out_.gain_uncertain = unbounded_links_ > 0 && !reduces;
+	// A derived table's uncertain join is reduced only by a LIMIT or a
+	// GROUP BY-less aggregate: its keys are not this node's to cover.
+	const bool reduces_derived = limited || (aggregated_ && group_keys_.empty());
+	out_.gain_uncertain = (unbounded_links_ > 0 && !reduces) || (derived_uncertain_ && !reduces_derived);
 	for (auto &output : outputs_) {
 		out_.value_divergence = out_.value_divergence || (output.column_index == DConstants::INVALID_INDEX &&
 														  (output.value.division || output.value.approximate));

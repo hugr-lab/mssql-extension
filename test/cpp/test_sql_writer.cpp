@@ -649,6 +649,18 @@ int main() {
 		uncertain("SELECT t.name FROM t, u WHERE u.t_id > t.id ORDER BY t.id", true);
 		// An OR equality bounds nothing.
 		uncertain("SELECT t.name FROM t JOIN u ON u.t_id = t.id OR u.big = 1 ORDER BY t.id", true);
+		// Wrapped in a derived table or a CTE, the join's gain is still
+		// uncertain (review of E1), unless the node around it reduces.
+		uncertain("SELECT * FROM (SELECT a.id FROM t a JOIN t b ON a.name = b.name) s", true);
+		uncertain("WITH s AS (SELECT a.id FROM t a JOIN t b ON a.name = b.name) SELECT * FROM s", true);
+		uncertain("SELECT count(*) AS c FROM (SELECT a.id FROM t a JOIN t b ON a.name = b.name) s", false);
+		// A GROUP BY over the wrapper's columns does not reduce its join: they
+		// are not keys of the tables inside.
+		uncertain("SELECT s.id, count(*) AS c FROM (SELECT a.id FROM t a JOIN t b ON a.name = b.name) s GROUP BY s.id",
+				  true);
+		// A derived table's GROUP BY columns are its key.
+		uncertain("SELECT t.name, s.c FROM t JOIN (SELECT id, count(*) AS c FROM t GROUP BY id) s ON s.id = t.id",
+				  false);
 	}
 
 	// Subqueries in expressions (PR E1): IN / EXISTS / a scalar subquery,
@@ -738,6 +750,27 @@ int main() {
 	ExpectVeto("WITH a(x) AS (SELECT id FROM t GROUP BY id) SELECT count(*) FROM a");  // column aliases
 	ExpectVeto("WITH a AS (SELECT b.id FROM b), b AS (SELECT id FROM t GROUP BY id) SELECT count(*) FROM a");
 	ExpectGain("WITH q AS (SELECT id, count(*) AS c FROM t GROUP BY id) SELECT * FROM q", true);
+	{
+		// A CTE read twice by a CTE read twice ... doubles per level: past the
+		// cap it is vetoed, and quickly (review of E1).
+		std::string sql = "WITH c0 AS (SELECT id FROM t WHERE id > 1)";
+		for (int level = 1; level <= 30; level++) {
+			sql += ", c" + std::to_string(level) + " AS (SELECT x.id FROM c" + std::to_string(level - 1) + " x JOIN c" +
+				   std::to_string(level - 1) + " y ON x.id = y.id)";
+		}
+		sql += " SELECT count(*) FROM c30";
+		ExpectVeto(sql);
+	}
+	// A scalar subquery pushed only when it returns one row: a key lookup, an
+	// aggregate, a LIMIT 1 (review of E1: lazily evaluated on the server).
+	ExpectSql("SELECT id, (SELECT label FROM u WHERE u.id = t.id) AS l FROM t",
+			  "SELECT [r1].[id] AS [id], (SELECT [r2].[label] AS [label] FROM [dbo].[u] AS [r2] WHERE ([r2].[id] = "
+			  "[r1].[id])) AS [l] FROM [dbo].[t] AS [r1]");
+	ExpectVeto("SELECT id, (SELECT label FROM u WHERE u.t_id = t.id) AS l FROM t");
+	// A string key against an outer column: other rules may meet two keys.
+	ExpectVeto("SELECT id, (SELECT t_id FROM u WHERE u.label = t.name) AS l FROM t");
+	ExpectVeto("SELECT id, (SELECT label FROM u WHERE u.id = t.id OR u.id = 1) AS l FROM t");
+	ExpectVeto("SELECT id, (SELECT max(t_id) FROM u WHERE u.id = t.id) FROM t");  // no alias
 	// A LIMIT anywhere in the body, or reached through another CTE under a
 	// subquery expression (review of E1).
 	ExpectVeto("WITH a AS (SELECT * FROM (SELECT id FROM t ORDER BY id LIMIT 1) s) SELECT count(*) FROM a x, a y");

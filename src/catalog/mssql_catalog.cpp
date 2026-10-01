@@ -1544,23 +1544,32 @@ bool MSSQLCatalog::SearchPathIsDefaultSchema(ClientContext &context) const {
 	return true;
 }
 
+static bool WrittenUnqualified(const BaseTableRef &ref);
+static const QualifiedName &WrittenName(const BaseTableRef &ref);
+
+// A name the query wrote without a schema: `t`, and `db.t` too -- DuckDB's
+// binder reads both through the catalog's search-path entry (`USE db.sales`
+// makes `db.t` sales.t; measured in the E1 review, where `db.t` read dbo.t).
+bool MSSQLCatalog::WrittenWithoutSchema(const BaseTableRef &ref) const {
+	auto &name = WrittenName(ref);
+	return name.Schema().empty() || (name.Catalog().empty() && StringUtil::CIEquals(name.Schema().GetIdentifierName(),
+																					GetName().GetIdentifierName()));
+}
+
 // The table a pushed base-table reference names. With a context (RemoteExecute)
 // it is looked up through this catalog like any binder lookup, so the kept run
 // never depends on what the thread noted; without one (the SupportsPushdown
 // hooks get none) it is the entry the rewriter's own lookup just noted.
-static bool WrittenUnqualified(const BaseTableRef &ref);
-
 MSSQLCatalog::PushdownTable MSSQLCatalog::ResolvePushdownTable(const BaseTableRef &ref,
 															   optional_ptr<ClientContext> context) {
 	PushdownTable result;
 	const auto schema = PushdownSchemaOf(ref, context != nullptr);
 	const auto &name = ref.Table().GetIdentifierName();
 	if (context) {
-		// As below: an unqualified name is this catalog's default schema only
-		// when the search path says so (`USE db.sales` binds sales.t). Asked by
-		// the name the query wrote -- the rewriter has stripped the catalog by
-		// now, and a stripped `db.t` looks unqualified.
-		if (WrittenUnqualified(ref) && !SearchPathIsDefaultSchema(*context)) {
+		// As below: a name without a schema is this catalog's default schema
+		// only when the search path says so. Asked by the name the query wrote
+		// -- the rewriter has stripped the catalog by now.
+		if (WrittenWithoutSchema(ref) && !SearchPathIsDefaultSchema(*context)) {
 			return result;
 		}
 		auto entry = GetEntry(*context, CatalogType::TABLE_ENTRY, Identifier(schema), Identifier(name),
@@ -1581,7 +1590,7 @@ MSSQLCatalog::PushdownTable MSSQLCatalog::ResolvePushdownTable(const BaseTableRe
 		// default schema (LookupSchema), so that is what was noted.
 		resolved = mssql::FindResolvedTable(*this, default_schema_, name);
 	}
-	if (resolved && WrittenUnqualified(ref) && !SearchPathIsDefaultSchema(*resolved.context)) {
+	if (resolved && WrittenWithoutSchema(ref) && !SearchPathIsDefaultSchema(*resolved.context)) {
 		return result;
 	}
 	if (resolved) {
@@ -1919,9 +1928,13 @@ static vector<string> ExtendScope(const QueryNode &node, vector<string> scope);
 // Whether the query wrote `ref` with no catalog and no schema, from the name
 // SupportsPushdown(TableRef) noted before the rewriter's strip (`db.t`
 // arrives as a bare `t`); a name it did not note is taken as it stands.
-static bool WrittenUnqualified(const BaseTableRef &ref) {
+static const QualifiedName &WrittenName(const BaseTableRef &ref) {
 	auto original = TableNames().Find(ref);
-	auto &name = original ? *original : ref.GetQualifiedName();
+	return original ? *original : ref.GetQualifiedName();
+}
+
+static bool WrittenUnqualified(const BaseTableRef &ref) {
+	auto &name = WrittenName(ref);
 	return name.Catalog().empty() && name.Schema().empty();
 }
 
@@ -2014,12 +2027,12 @@ static bool NamesScopeTable(QueryNode &node, const vector<string> &scope) {
 	VisitNode(
 		node, [&](unique_ptr<QueryNode> &slot) { found = found || NamesScopeTable(*slot, inner); },
 		[&](BaseTableRef &ref) {
-			auto &name = ref.GetQualifiedName();
-			if (!name.Catalog().empty() || !name.Schema().empty()) {
+			// By the written name: a stripped `db.t` is a table, not a CTE `t`.
+			if (!WrittenUnqualified(ref)) {
 				return;
 			}
 			for (auto &cte : inner) {
-				found = found || StringUtil::CIEquals(cte, name.Name().GetIdentifierName());
+				found = found || StringUtil::CIEquals(cte, ref.Table().GetIdentifierName());
 			}
 		});
 	return found;
@@ -2096,15 +2109,104 @@ bool MSSQLCatalog::WritePushablePart(const QueryNode &node, mssql::WrittenQuery 
 	return true;
 }
 
-// Whether a node nested in `node` would be pushed (the dry run).
-bool MSSQLCatalog::HasPushablePart(const QueryNode &node, const vector<string> &scope) {
+// The result names a query node's rows carry, as DuckDB names them: an
+// alias, else a bare column's name; false when one is not knowable before
+// binding (a `*`, an expression's text). A set operation's are its first
+// child's.
+static bool ResultNames(const QueryNode &node, vector<string> &out) {
+	if (node.type == QueryNodeType::SET_OPERATION_NODE) {
+		auto &children = node.Cast<SetOperationNode>().children;
+		return !children.empty() && ResultNames(*children[0], out);
+	}
+	if (node.type != QueryNodeType::SELECT_NODE) {
+		return false;
+	}
+	for (auto &item : node.Cast<SelectNode>().select_list) {
+		if (!item->GetAlias().empty()) {
+			out.push_back(item->GetAlias().GetIdentifierName());
+		} else if (item->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			out.push_back(item->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+		} else {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Whether a set operation's children must keep their select lists: DuckDB
+// binds the set operation's ORDER BY / DISTINCT ON key against the children's
+// own select-list expressions -- `... UNION ALL ... ORDER BY g + 1`, or a bare
+// `g` the children select under other names -- which `SELECT * FROM
+// <vehicle>` no longer has (review of E1: a binder error where DuckDB returns
+// rows). A position, or a bare name that is one of the result names, binds by
+// those, which the vehicle keeps. The rewriter itself skips every child under
+// any modifier.
+static bool KeepsChildSelectLists(const QueryNode &node) {
+	if (node.type != QueryNodeType::SET_OPERATION_NODE) {
+		return false;
+	}
+	vector<string> names;
+	const bool known = ResultNames(node, names);
+	auto by_result = [&](const ParsedExpression &key) {
+		if (key.GetExpressionClass() == ExpressionClass::CONSTANT) {
+			return true;
+		}
+		if (!known || key.GetExpressionClass() != ExpressionClass::COLUMN_REF ||
+			key.Cast<ColumnRefExpression>().ColumnNames().size() != 1) {
+			return false;
+		}
+		for (auto &name : names) {
+			if (StringUtil::CIEquals(name, key.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName())) {
+				return true;
+			}
+		}
+		return false;
+	};
+	for (auto &modifier : node.modifiers) {
+		if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
+			for (auto &order : modifier->Cast<OrderModifier>().orders) {
+				if (!by_result(*order.expression)) {
+					return true;
+				}
+			}
+		} else if (modifier->type == ResultModifierType::DISTINCT_MODIFIER) {
+			for (auto &target : modifier->Cast<DistinctModifier>().distinct_on_targets) {
+				if (!by_result(*target)) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+// Whether `slot` is one of `node`'s set-operation children.
+static bool IsSetOperationChild(const QueryNode &node, const unique_ptr<QueryNode> &slot) {
+	if (node.type != QueryNodeType::SET_OPERATION_NODE) {
+		return false;
+	}
+	for (auto &child : node.Cast<SetOperationNode>().children) {
+		if (&child == &slot) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Whether a node nested in `node` would be pushed (the dry run). `keep`: the
+// node is a set operation whose children must keep their select lists (an
+// enclosing set operation binds its key against them, through this one).
+bool MSSQLCatalog::HasPushablePart(const QueryNode &node, const vector<string> &scope, bool keep) {
 	auto inner = ExtendScope(node, scope);
+	keep = keep || KeepsChildSelectLists(node);
 	bool found = false;
 	VisitNode(
 		const_cast<QueryNode &>(node),
 		[&](unique_ptr<QueryNode> &slot) {
+			const bool kept = keep && IsSetOperationChild(node, slot);
 			mssql::WrittenQuery written;
-			found = found || WritePushablePart(*slot, written, nullptr, inner, true) || HasPushablePart(*slot, inner);
+			found = found || (!kept && WritePushablePart(*slot, written, nullptr, inner, true)) ||
+					HasPushablePart(*slot, inner, kept);
 		},
 		[](BaseTableRef &) {});
 	return found;
@@ -2114,17 +2216,19 @@ bool MSSQLCatalog::HasPushablePart(const QueryNode &node, const vector<string> &
 // replaced by `SELECT * FROM <its vehicle>`; one that does not is searched in
 // turn. What is left runs in DuckDB -- the outer node's EXCLUDE, a window, a
 // local join -- over as many vehicles as the statement has parts.
-void MSSQLCatalog::PushNestedParts(ClientContext &context, QueryNode &node, const vector<string> &scope) {
+void MSSQLCatalog::PushNestedParts(ClientContext &context, QueryNode &node, const vector<string> &scope, bool keep) {
 	auto inner = ExtendScope(node, scope);
+	keep = keep || KeepsChildSelectLists(node);
 	VisitNode(
 		node,
 		[&](unique_ptr<QueryNode> &slot) {
+			const bool kept = keep && IsSetOperationChild(node, slot);
 			mssql::WrittenQuery written;
-			if (WritePushablePart(*slot, written, context, inner, true)) {
+			if (!kept && WritePushablePart(*slot, written, context, inner, true)) {
 				slot = SelectStarFrom(VehicleFor(written));
 				return;
 			}
-			PushNestedParts(context, *slot, inner);
+			PushNestedParts(context, *slot, inner, kept);
 		},
 		[](BaseTableRef &) {});
 }

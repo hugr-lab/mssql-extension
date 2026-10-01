@@ -313,19 +313,68 @@ SELECT id FROM rs_off.dbo.rs_t t WHERE g IN (SELECT g FROM rs_off.dbo.rs_u u WHE
 3
 
 # A statement that names rowid or a select alias is not taken for a
-# correlated subquery: it keeps DuckDB's names (review of E1: a handed-back
-# node deduplicated `id, id` into `id, id_1`).
-query T
-SELECT column_name FROM (DESCRIBE SELECT rowid, id, id FROM rs_on.dbo.rs_t);
+# correlated subquery (a handed-back node would dedupe `id, id` into `id,
+# id_1` -- names sqllogictest cannot see, and DESCRIBE is not rewritten, so
+# only the rows are pinned here).
+query III
+SELECT rowid, id, id FROM rs_on.dbo.rs_t WHERE id < 3 ORDER BY id;
 ----
-rowid
-id
-id
+1	1	1
+2	2	2
 
 query II
 SELECT g, count(*) AS c FROM rs_on.dbo.rs_t GROUP BY g HAVING c > 1 ORDER BY g LIMIT 10;
 ----
 1	2
+
+# A correlated scalar subquery that can return several rows: DuckDB checks
+# every outer row and raises; the server evaluates it lazily (under TOP, an
+# untaken CASE branch, a COALESCE, a COUNT) and would return rows. Pushed
+# only when it provably returns one row (review of E1).
+statement error
+SELECT id, (SELECT w FROM rs_on.dbo.rs_u u WHERE u.g IS NOT NULL OR u.g = t.g) AS w FROM rs_on.dbo.rs_t t ORDER BY id DESC LIMIT 1;
+----
+More than one row returned by a subquery
+
+statement error
+SELECT count(*) FROM (SELECT id, (SELECT w FROM rs_on.dbo.rs_u u WHERE u.g IS NOT NULL OR u.g = t.g) AS w FROM rs_on.dbo.rs_t t) x;
+----
+More than one row returned by a subquery
+
+# A key lookup is one row: pushed.
+query II
+EXPLAIN SELECT id, (SELECT w FROM rs_on.dbo.rs_u u WHERE u.k = t.id) AS w FROM rs_on.dbo.rs_t t ORDER BY id;
+----
+physical_plan	<REGEX>:.*\(SELECT \[r2\]\.\[w\] AS \[w\] FROM \[dbo\]\.\[rs_u\] AS \[r2\] WHERE \(\[r2\]\.\[k\] = \[r1\]\.\[id\]\)\) AS \[w\].*
+
+# A correlation that skips a level: the middle node, asked about on its own,
+# does not poison the statement (review of E1).
+query II
+EXPLAIN SELECT id FROM rs_on.dbo.rs_t t WHERE g IN (SELECT u.g FROM rs_on.dbo.rs_u u WHERE EXISTS (SELECT 1 FROM rs_on.dbo.rs_t v WHERE v.id = u.k AND v.n < t.n + 100)) ORDER BY id;
+----
+physical_plan	<REGEX>:.*EXISTS \(SELECT 1 AS \[1\] FROM \[dbo\]\.\[rs_t\] AS \[r3\].*
+
+query I
+SELECT id FROM rs_on.dbo.rs_t t WHERE g IN (SELECT u.g FROM rs_on.dbo.rs_u u WHERE EXISTS (SELECT 1 FROM rs_on.dbo.rs_t v WHERE v.id = u.k AND v.n < t.n + 100)) ORDER BY id;
+----
+1
+2
+4
+
+query I
+SELECT id FROM rs_off.dbo.rs_t t WHERE g IN (SELECT u.g FROM rs_off.dbo.rs_u u WHERE EXISTS (SELECT 1 FROM rs_off.dbo.rs_t v WHERE v.id = u.k AND v.n < t.n + 100)) ORDER BY id;
+----
+1
+2
+4
+
+# A subquery in a result column without an alias: named after its text,
+# which holds table names the rewriter stripped of their catalog -- not
+# pushed (review of E1).
+query II
+EXPLAIN SELECT id, (SELECT max(w) FROM rs_on.dbo.rs_u u WHERE u.g = t.g) FROM rs_on.dbo.rs_t t ORDER BY id;
+----
+physical_plan	<!REGEX>:.*SELECT MAX.*
 
 # An UPDATE with a correlated subquery while pushdown is on: not rewritten.
 statement ok
