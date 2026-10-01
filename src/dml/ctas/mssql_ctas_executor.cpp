@@ -178,13 +178,27 @@ void CTASExecutionState::ExecuteDDL(ClientContext &context) {
 				col.collation = "";
 				col.precision = 0;
 				col.scale = 0;
-				// MAX, not the default 0: the declared length lives inside
-				// mssql_type here (CTASColumnDef carries none of its own), and
-				// max_length is read by the OUTPUT list of INSERT ... RETURNING
-				// (BuildReadExpression). CTAS sets use_returning_output = false
-				// below, so 0 was harmless -- but it rendered
-				// `CAST([c] AS NVARCHAR(0))` for a non-UTF-8 char/varchar column
-				// the moment anything reused this target (roborev 1719).
+				// MAX rather than the default 0, as the value that cannot
+				// truncate -- but max_length is UNREAD on this path at any
+				// value, and the reason matters more than the field.
+				//
+				// mssql_type here is a full DECLARATION, not a type name:
+				// MapLogicalTypeToCTAS returns "NVARCHAR(MAX)",
+				// "VARCHAR(MAX) COLLATE ...", "nvarchar(30)". Every type test
+				// BuildReadExpression uses compares the WHOLE lowercased string
+				// against bare names (IsKnownSQLServerType: `lower_type ==
+				// "varchar"`), so a parenthesised declaration matches none and
+				// the function returns at the `!IsKnownSQLServerType` arm --
+				// `CAST(ref AS NVARCHAR(MAX))` -- before NVarcharLength is ever
+				// consulted. `NVARCHAR(0)` was never reachable from here
+				// (roborev 1719 claimed it was; roborev 1836 corrected it).
+				//
+				// What a future reuser of this insert_target must fix FIRST is
+				// not this field: because mssql_type carries a declaration,
+				// EVERY column -- ints included -- would be cast to
+				// NVARCHAR(MAX) by that same arm, and col.collation is "" below.
+				// Those two, not max_length, are what make this target
+				// unsuitable for a RETURNING path today.
 				col.max_length = -1;
 				insert_target.columns.push_back(std::move(col));
 				insert_target.insert_column_indices.push_back(i);
