@@ -25,7 +25,7 @@ duckdb::TableCatalogEntry
 
 ## MSSQLCatalog
 
-**Files**: `src/catalog/mssql_catalog.cpp`, `src/include/catalog/mssql_catalog.hpp`
+**Files**: `src/catalog/mssql_catalog.cpp` (core), `mssql_catalog_plan.cpp` (DML / CTAS planning), `mssql_catalog_pushdown.cpp` (spec 079 remote pushdown, with the parsed-query walks in `src/pushdown/mssql_query_tree.cpp`), `mssql_catalog_cache.cpp` (metadata cache and transaction metadata), `src/include/catalog/mssql_catalog.hpp`
 
 Top-level catalog for an attached MSSQL database. One instance per `ATTACH ... TYPE mssql` call.
 

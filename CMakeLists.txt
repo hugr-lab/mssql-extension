@@ -176,6 +176,9 @@ set(EXTENSION_SOURCES
     src/catalog/mssql_metadata_cache.cpp
     src/catalog/mssql_primary_key.cpp
     src/catalog/mssql_catalog.cpp
+    src/catalog/mssql_catalog_cache.cpp
+    src/catalog/mssql_catalog_plan.cpp
+    src/catalog/mssql_catalog_pushdown.cpp
     src/catalog/mssql_bind_anchors.cpp
     src/catalog/mssql_schema_entry.cpp
     src/catalog/mssql_table_entry.cpp
@@ -198,6 +201,7 @@ set(EXTENSION_SOURCES
     src/pushdown/mssql_expression_vocabulary.cpp
     src/pushdown/mssql_order_term.cpp
     src/pushdown/mssql_pushdown_resolution.cpp
+    src/pushdown/mssql_query_tree.cpp
     src/pushdown/mssql_sql_writer.cpp
     # DML shared layer (UPDATE/DELETE common)
     src/dml/mssql_dml_config.cpp

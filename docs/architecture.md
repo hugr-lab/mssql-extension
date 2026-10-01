@@ -101,6 +101,9 @@ src/
 │
 ├── catalog/                      # DuckDB catalog integration
 │   ├── mssql_catalog.cpp         # Catalog implementation (extends duckdb::Catalog)
+│   ├── mssql_catalog_plan.cpp    # PlanInsert / PlanUpdate / PlanDelete / PlanCreateTableAs
+│   ├── mssql_catalog_pushdown.cpp # Spec 079 remote pushdown (SupportsPushdown, RemoteExecute)
+│   ├── mssql_catalog_cache.cpp   # Metadata cache invalidation, transaction metadata, preload
 │   ├── mssql_schema_entry.cpp    # Schema entries (extends SchemaCatalogEntry)
 │   ├── mssql_table_entry.cpp     # Table entries (extends TableCatalogEntry)
 │   ├── mssql_table_set.cpp       # Lazy-loaded table collection per schema
