@@ -44,7 +44,11 @@ jobs:
   concurrency-tests:
     name: Concurrency stress
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # A cold debug build (no ccache hit: a new DuckDB pin) takes ~36 min on
+    # its own; the tests after it ~15-20. At 45 the job timed out building
+    # the transaction-pin test (#399), and a cancelled job never saved the
+    # cache, so every later run was cold too.
+    timeout-minutes: 75
 
     # SQL Server 2022 sidecar — same image and credentials as the existing
     # integration-test job in ci.yml. Concurrency tests only need `master`
@@ -112,8 +116,12 @@ jobs:
           echo "After:"
           free -h
 
-      - name: Cache ccache
-        uses: actions/cache@v6
+      # Restored here, saved right after the build (below) rather than at the
+      # job's end: actions/cache saves only when the job succeeds, so a test
+      # failure or a timeout would throw away the build's ccache, and the next
+      # run would be cold again (#399).
+      - name: Restore ccache
+        uses: actions/cache/restore@v6
         with:
           path: ~/.ccache
           key: ccache-concurrency-${{ github.sha }}
@@ -168,6 +176,13 @@ jobs:
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: make debug
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.ccache
+          key: ccache-concurrency-${{ github.sha }}
 
       # See ci.yml's build job for why the binary cache needs pruning.
       - name: Prune stale vcpkg binary archives
