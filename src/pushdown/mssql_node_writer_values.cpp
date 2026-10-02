@@ -265,12 +265,23 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 					  : ExpressionVocabulary::Coalesce(args);
 		return true;
 	}
+	case ExpressionClass::WINDOW:
+		return WriteWindow(expr.Cast<WindowExpression>(), out);
 	case ExpressionClass::FUNCTION: {
 		auto &fn = expr.Cast<FunctionExpression>();
 		const auto &name = fn.FunctionName().GetIdentifierName();
 		AggregateKind aggregate;
 		if (AggregateFor(name, aggregate)) {
-			return WriteAggregate(fn, aggregate, out);
+			const AggregateCall call{
+				fn.GetArguments(),
+				fn.Distinct(),
+				fn.Filter().get(),
+				fn.OrderBy() ? &fn.OrderBy()->orders : nullptr,
+				fn.ExportState() || !fn.GetQualifiedName().Schema().empty() || !fn.GetQualifiedName().Catalog().empty(),
+				name,
+				fn.ToString(),
+				""};
+			return WriteAggregate(call, aggregate, out);
 		}
 		if (name == "/" && fn.GetArguments().size() == 2) {
 			return WriteDivide(fn, out);
@@ -381,6 +392,9 @@ bool NodeWriter::Unify(std::vector<Operand> &operands, Operand &result, bool con
 	for (auto &operand : operands) {
 		result.approximate = result.approximate || operand.approximate;
 		result.type_uncertain = result.type_uncertain || operand.type_uncertain;
+		// A branch's NULL where DuckDB says inf is the result's (a window's
+		// value over a division, review of E2).
+		result.division = result.division || operand.division;
 	}
 	return true;
 }

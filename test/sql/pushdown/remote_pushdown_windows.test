@@ -1,0 +1,377 @@
+# name: test/sql/pushdown/remote_pushdown_windows.test
+# description: Spec 079 PR E2 -- window functions pushed to SQL Server; both paths agree on rows and types
+# group: [pushdown]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Each shape: EXPLAIN pins the T-SQL, then the statement runs against a
+# catalog attached with pushdown ON and one with it OFF, into temp tables,
+# and the two must hold the same rows (EXCEPT ALL both ways) with the same
+# column types. Every veto is pinned by EXPLAIN showing the catalog scan.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rw_off (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = true;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rw_on (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+# Ties in k (and a NULL k), NULL values, an int sum past int's range, a UTF-8
+# varchar (s) and a code-page varchar under a case-insensitive collation (c).
+statement ok
+SELECT mssql_exec('rw_off', 'DROP TABLE IF EXISTS dbo.rw_t;
+	CREATE TABLE dbo.rw_t (id int NOT NULL PRIMARY KEY, g int NULL, k int NULL, x int NULL, d decimal(10,2) NULL,
+		big int NULL, s varchar(20) COLLATE Latin1_General_100_BIN2_UTF8 NULL,
+		c varchar(20) COLLATE SQL_Latin1_General_CP1_CI_AS NULL);
+	INSERT INTO dbo.rw_t VALUES
+		(1, 1, 10, 5, 1.50, 2000000000, ''b'', ''b''), (2, 1, 10, 7, 2.25, 2000000000, ''a'', ''A''),
+		(3, 1, 20, NULL, NULL, 5, ''c'', ''a''), (4, 1, NULL, 3, 0.10, 1, NULL, NULL),
+		(5, 2, 5, 1, 9.99, NULL, ''z'', ''Z''), (6, 2, 5, 2, 8.00, 3, ''y'', ''z''),
+		(7, 2, 6, NULL, 7.00, 4, ''x'', ''y''), (8, 3, NULL, NULL, NULL, NULL, NULL, NULL),
+		(9, 3, 1, 4, 1.00, 2147483647, N''é'', ''q''), (10, 3, 2, 6, 2.00, 1, ''r'', ''R'')');
+
+# Ranks.
+query II
+EXPLAIN SELECT id, row_number() OVER (PARTITION BY g ORDER BY id DESC) AS a, rank() OVER (ORDER BY k) AS b, dense_rank() OVER (ORDER BY k DESC) AS c, ntile(3) OVER (ORDER BY id) AS d FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*ROW_NUMBER\(\) OVER \(PARTITION BY \[g\] ORDER BY \[id\] DESC\).*RANK\(\) OVER \(ORDER BY CASE WHEN \[k\] IS NULL THEN 1 ELSE 0 END, \[k\] ASC\).*NTILE\(3\) OVER.*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, row_number() OVER (PARTITION BY g ORDER BY id DESC) AS a, rank() OVER (ORDER BY k) AS b, dense_rank() OVER (ORDER BY k DESC) AS c, ntile(3) OVER (ORDER BY id) AS d FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, row_number() OVER (PARTITION BY g ORDER BY id DESC) AS a, rank() OVER (ORDER BY k) AS b, dense_rank() OVER (ORDER BY k DESC) AS c, ntile(3) OVER (ORDER BY id) AS d FROM rw_off.dbo.rw_t ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# Running sum, ties under the default RANGE frame.
+query II
+EXPLAIN SELECT id, sum(x) OVER (PARTITION BY g ORDER BY k) AS a, count(*) OVER () AS b, count(x) OVER (PARTITION BY g) AS c FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*SUM\(CAST\(\[x\] AS decimal\(38,0\)\)\) OVER \(PARTITION BY \[g\] ORDER BY CASE WHEN \[k\] IS NULL THEN 1 ELSE 0 END, \[k\] ASC\).*COUNT_BIG\(\*\) OVER \(\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, sum(x) OVER (PARTITION BY g ORDER BY k) AS a, count(*) OVER () AS b, count(x) OVER (PARTITION BY g) AS c FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, sum(x) OVER (PARTITION BY g ORDER BY k) AS a, count(*) OVER () AS b, count(x) OVER (PARTITION BY g) AS c FROM rw_off.dbo.rw_t ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# An int sum past int's range (the server's SUM(int) overflows: 8115).
+query II
+EXPLAIN SELECT id, sum(big) OVER (PARTITION BY g) AS a FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*SUM\(CAST\(\[big\] AS decimal\(38,0\)\)\) OVER \(PARTITION BY \[g\]\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, sum(big) OVER (PARTITION BY g) AS a FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, sum(big) OVER (PARTITION BY g) AS a FROM rw_off.dbo.rw_t ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# Avg: the server's AVG(int) truncates.
+query II
+EXPLAIN SELECT id, avg(x) OVER (PARTITION BY g) AS a, avg(d) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS b FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*CAST\(SUM\(CAST\(\[x\] AS decimal\(38,0\)\)\) OVER \(PARTITION BY \[g\]\) AS float\) / COUNT_BIG\(\[x\]\) OVER \(PARTITION BY \[g\]\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, avg(x) OVER (PARTITION BY g) AS a, avg(d) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS b FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, avg(x) OVER (PARTITION BY g) AS a, avg(d) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS b FROM rw_off.dbo.rw_t ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# ROWS frames, an empty one.
+query II
+EXPLAIN SELECT id, min(d) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING) AS a, max(x) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS b, sum(x) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 3 FOLLOWING AND 4 FOLLOWING) AS c FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING.*ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING.*ROWS BETWEEN 3 FOLLOWING AND 4 FOLLOWING.*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, min(d) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING) AS a, max(x) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS b, sum(x) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 3 FOLLOWING AND 4 FOLLOWING) AS c FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, min(d) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING) AS a, max(x) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS b, sum(x) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 3 FOLLOWING AND 4 FOLLOWING) AS c FROM rw_off.dbo.rw_t ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# Lag / lead, an offset, a default; a UTF-8 varchar value.
+query II
+EXPLAIN SELECT id, lag(x) OVER (ORDER BY id) AS a, lead(x, 2) OVER (PARTITION BY g ORDER BY id) AS b, lag(x, 1, -1) OVER (ORDER BY id) AS c, lead(s) OVER (ORDER BY id) AS e FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*LAG\(\[x\]\) OVER \(ORDER BY \[id\] ASC\).*LEAD\(\[x\], 2\) OVER.*LAG\(\[x\], 1, @p0\) OVER.*LEAD\(\[s\]\) OVER.*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, lag(x) OVER (ORDER BY id) AS a, lead(x, 2) OVER (PARTITION BY g ORDER BY id) AS b, lag(x, 1, -1) OVER (ORDER BY id) AS c, lead(s) OVER (ORDER BY id) AS e FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, lag(x) OVER (ORDER BY id) AS a, lead(x, 2) OVER (PARTITION BY g ORDER BY id) AS b, lag(x, 1, -1) OVER (ORDER BY id) AS c, lead(s) OVER (ORDER BY id) AS e FROM rw_off.dbo.rw_t ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# First_value / last_value, the default frame and a whole-partition one.
+query II
+EXPLAIN SELECT id, first_value(x) OVER (PARTITION BY g ORDER BY k, id) AS a, last_value(x) OVER (PARTITION BY g ORDER BY k, id) AS b, last_value(x) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS e, first_value(s) OVER (PARTITION BY g ORDER BY id) AS f FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*LAST_VALUE\(\[x\]\) OVER \(PARTITION BY \[g\] ORDER BY \[id\] ASC RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, first_value(x) OVER (PARTITION BY g ORDER BY k, id) AS a, last_value(x) OVER (PARTITION BY g ORDER BY k, id) AS b, last_value(x) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS e, first_value(s) OVER (PARTITION BY g ORDER BY id) AS f FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, first_value(x) OVER (PARTITION BY g ORDER BY k, id) AS a, last_value(x) OVER (PARTITION BY g ORDER BY k, id) AS b, last_value(x) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS e, first_value(s) OVER (PARTITION BY g ORDER BY id) AS f FROM rw_off.dbo.rw_t ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# NULL placement in the window's ORDER BY; a UTF-8 varchar key by its bytes.
+query II
+EXPLAIN SELECT id, row_number() OVER (ORDER BY k, id) AS a, row_number() OVER (ORDER BY k DESC, id) AS b, row_number() OVER (ORDER BY k NULLS FIRST, id) AS c, row_number() OVER (ORDER BY s, id) AS e FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*ROW_NUMBER\(\) OVER \(ORDER BY CASE WHEN \[s\] IS NULL THEN 1 ELSE 0 END, CAST\(\[s\] AS varbinary\(20\)\) ASC, \[id\] ASC\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, row_number() OVER (ORDER BY k, id) AS a, row_number() OVER (ORDER BY k DESC, id) AS b, row_number() OVER (ORDER BY k NULLS FIRST, id) AS c, row_number() OVER (ORDER BY s, id) AS e FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, row_number() OVER (ORDER BY k, id) AS a, row_number() OVER (ORDER BY k DESC, id) AS b, row_number() OVER (ORDER BY k NULLS FIRST, id) AS c, row_number() OVER (ORDER BY s, id) AS e FROM rw_off.dbo.rw_t ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# A window over an aggregate.
+query II
+EXPLAIN SELECT g, sum(sum(d)) OVER (ORDER BY g) AS a, rank() OVER (ORDER BY count(*) DESC, g) AS r FROM rw_on.dbo.rw_t GROUP BY g ORDER BY g LIMIT 100;
+----
+physical_plan	<REGEX>:.*SUM\(SUM\(\[d\]\)\) OVER .*RANK\(\) OVER \(ORDER BY COUNT_BIG\(\*\) DESC.*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT g, sum(sum(d)) OVER (ORDER BY g) AS a, rank() OVER (ORDER BY count(*) DESC, g) AS r FROM rw_on.dbo.rw_t GROUP BY g ORDER BY g LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT g, sum(sum(d)) OVER (ORDER BY g) AS a, rank() OVER (ORDER BY count(*) DESC, g) AS r FROM rw_off.dbo.rw_t GROUP BY g ORDER BY g LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# FILTER on a window aggregate.
+query II
+EXPLAIN SELECT id, count(*) FILTER (WHERE x > 2) OVER (PARTITION BY g) AS a, sum(x) FILTER (WHERE k = 10) OVER (PARTITION BY g) AS b FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*COUNT_BIG\(CASE WHEN \(\[x\] > @p0\) THEN 1 END\) OVER \(PARTITION BY \[g\]\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, count(*) FILTER (WHERE x > 2) OVER (PARTITION BY g) AS a, sum(x) FILTER (WHERE k = 10) OVER (PARTITION BY g) AS b FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, count(*) FILTER (WHERE x > 2) OVER (PARTITION BY g) AS a, sum(x) FILTER (WHERE k = 10) OVER (PARTITION BY g) AS b FROM rw_off.dbo.rw_t ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# A window in a derived table, filtered and aggregated above it.
+query II
+EXPLAIN SELECT g, max(rn) AS m, count(*) FILTER (WHERE rn = 1) AS f FROM (SELECT g, row_number() OVER (PARTITION BY g ORDER BY id) AS rn FROM rw_on.dbo.rw_t) t GROUP BY g ORDER BY g LIMIT 10;
+----
+physical_plan	<REGEX>:.*FROM \(SELECT \[g\], ROW_NUMBER\(\) OVER \(PARTITION BY \[g\] ORDER BY \[id\] ASC\) AS \[rn\] FROM \[dbo\]\.\[rw_t\]\) AS \[r1\].*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT g, max(rn) AS m, count(*) FILTER (WHERE rn = 1) AS f FROM (SELECT g, row_number() OVER (PARTITION BY g ORDER BY id) AS rn FROM rw_on.dbo.rw_t) t GROUP BY g ORDER BY g LIMIT 10;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT g, max(rn) AS m, count(*) FILTER (WHERE rn = 1) AS f FROM (SELECT g, row_number() OVER (PARTITION BY g ORDER BY id) AS rn FROM rw_off.dbo.rw_t) t GROUP BY g ORDER BY g LIMIT 10;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# Over a join; a named WINDOW.
+query II
+EXPLAIN SELECT a.id, sum(b.x) OVER w AS s, count(*) OVER w AS n FROM rw_on.dbo.rw_t a JOIN rw_on.dbo.rw_t b ON a.id = b.id WINDOW w AS (PARTITION BY a.g ORDER BY a.id) ORDER BY a.id LIMIT 100;
+----
+physical_plan	<REGEX>:.*SUM\(CAST\(\[r2\]\.\[x\] AS decimal\(38,0\)\)\) OVER \(PARTITION BY \[r1\]\.\[g\] ORDER BY \[r1\]\.\[id\] ASC\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT a.id, sum(b.x) OVER w AS s, count(*) OVER w AS n FROM rw_on.dbo.rw_t a JOIN rw_on.dbo.rw_t b ON a.id = b.id WINDOW w AS (PARTITION BY a.g ORDER BY a.id) ORDER BY a.id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT a.id, sum(b.x) OVER w AS s, count(*) OVER w AS n FROM rw_off.dbo.rw_t a JOIN rw_off.dbo.rw_t b ON a.id = b.id WINDOW w AS (PARTITION BY a.g ORDER BY a.id) ORDER BY a.id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# A window as the statement's ORDER BY key.
+query II
+EXPLAIN SELECT id FROM rw_on.dbo.rw_t ORDER BY row_number() OVER (PARTITION BY g ORDER BY id DESC), id LIMIT 4;
+----
+physical_plan	<REGEX>:.*ORDER BY ROW_NUMBER\(\) OVER \(PARTITION BY \[g\] ORDER BY \[id\] DESC\) ASC.*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id FROM rw_on.dbo.rw_t ORDER BY row_number() OVER (PARTITION BY g ORDER BY id DESC), id LIMIT 4;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id FROM rw_off.dbo.rw_t ORDER BY row_number() OVER (PARTITION BY g ORDER BY id DESC), id LIMIT 4;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# PARTITION BY a string is a set of groups, the server's under D4 like GROUP
+# BY's: under a case-insensitive collation 'a' and 'A' are one partition there.
+query II
+SELECT id, count(*) OVER (PARTITION BY c) FROM rw_on.dbo.rw_t WHERE id <= 3 ORDER BY id LIMIT 10;
+----
+1	1
+2	2
+3	2
+
+query II
+SELECT id, count(*) OVER (PARTITION BY c) FROM rw_off.dbo.rw_t WHERE id <= 3 ORDER BY id LIMIT 10;
+----
+1	1
+2	1
+3	1
+
+#
+# Vetoes: the catalog scan, DuckDB's rows.
+#
+
+# A code-page varchar value (arrives untranscoded).
+query II
+EXPLAIN SELECT id, lag(c) OVER (ORDER BY id) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# A code-page varchar key (the collation's order).
+query II
+EXPLAIN SELECT id, row_number() OVER (ORDER BY c, id) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# No ORDER BY (4112 there).
+query II
+EXPLAIN SELECT id, row_number() OVER () FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# DISTINCT (10759 there).
+query II
+EXPLAIN SELECT id, count(DISTINCT x) OVER (PARTITION BY g) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# RANGE with an offset (4194 there).
+query II
+EXPLAIN SELECT id, sum(x) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# GROUPS.
+query II
+EXPLAIN SELECT id, sum(x) OVER (ORDER BY k GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# EXCLUDE.
+query II
+EXPLAIN SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# IGNORE NULLS (SQL Server 2022 on).
+query II
+EXPLAIN SELECT id, lag(x IGNORE NULLS) OVER (ORDER BY id) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# A frame that starts after it ends (a compile error there).
+query II
+EXPLAIN SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# Percent_rank / cume_dist / nth_value.
+query II
+EXPLAIN SELECT id, percent_rank() OVER (ORDER BY id), cume_dist() OVER (ORDER BY id), nth_value(x, 2) OVER (ORDER BY id) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# String_agg over a window (4113 there).
+query II
+EXPLAIN SELECT id, string_agg(s, ',') OVER (PARTITION BY g) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# A tie in the window's ORDER BY (k = 10 twice) numbers the rows as the
+# evaluation goes: a CTE holding row_number() is not inlined twice -- DuckDB
+# evaluates it once, so its two references always agree.
+query II
+EXPLAIN WITH r AS (SELECT id, row_number() OVER (ORDER BY k) AS rn FROM rw_on.dbo.rw_t) SELECT count(*) FROM r a JOIN r b ON a.id = b.id WHERE a.rn <> b.rn;
+----
+physical_plan	<!REGEX>:.*JOIN \(SELECT.*
+
+query I
+WITH r AS (SELECT id, row_number() OVER (ORDER BY k) AS rn FROM rw_on.dbo.rw_t) SELECT count(*) FROM r a JOIN r b ON a.id = b.id WHERE a.rn <> b.rn;
+----
+0
+
+# A window over a division keeps the division's NULL at a zero divisor (inf
+# in DuckDB): not under COALESCE.
+query II
+EXPLAIN SELECT id, coalesce(lag(x / d) OVER (ORDER BY id), 0) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+statement ok
+SELECT mssql_exec('rw_off', 'DROP TABLE dbo.rw_t');
+
+statement ok
+DETACH rw_on;
+
+statement ok
+DETACH rw_off;

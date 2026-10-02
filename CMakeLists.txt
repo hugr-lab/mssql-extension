@@ -204,6 +204,7 @@ set(EXTENSION_SOURCES
     src/pushdown/mssql_node_writer_select.cpp
     src/pushdown/mssql_node_writer_subqueries.cpp
     src/pushdown/mssql_node_writer_values.cpp
+    src/pushdown/mssql_node_writer_windows.cpp
     src/pushdown/mssql_order_term.cpp
     src/pushdown/mssql_pushdown_resolution.cpp
     src/pushdown/mssql_query_tree.cpp

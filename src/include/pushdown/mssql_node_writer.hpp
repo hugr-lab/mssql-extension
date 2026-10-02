@@ -28,6 +28,7 @@
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/type_expression.hpp"
+#include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
@@ -119,6 +120,23 @@ constexpr size_t MAX_DERIVED_SQL = 1 << 20;
 enum class AggregateKind { CountStar, Count, Sum, Avg, Min, Max, Stdev, StdevP, Var, VarP, StringAgg };
 
 bool AggregateFor(const std::string &function_name, AggregateKind &out);
+
+//! One aggregate call as the writer needs it, from a FunctionExpression or
+//! from a window's aggregate (spec 079 PR E2): both carry their arguments as
+//! FunctionArguments.
+struct AggregateCall {
+	const std::vector<FunctionArgument> &args;
+	bool distinct;
+	const ParsedExpression *filter;
+	//! An ordered aggregate's ORDER BY (string_agg); null when none.
+	const std::vector<OrderByNode> *orders;
+	//! Exported state or a qualified name: not one of ours.
+	bool foreign;
+	std::string name;
+	std::string text;
+	//! ` OVER (...)` after every aggregate call, for a window's aggregate.
+	std::string over;
+};
 
 //! Whether `expr` holds one of those aggregates -- what makes a node an
 //! aggregate query in DuckDB's binder as in T-SQL.
@@ -253,8 +271,11 @@ private:
 	bool CheckGrouped(idx_t index);
 	bool WriteGroups(const SelectNode &node, std::string &sql);
 	bool GroupKeyColumn(const SelectNode &node, const ParsedExpression &key, idx_t &out);
-	bool WriteAggregate(const FunctionExpression &fn, AggregateKind kind, Operand &out);
-	bool WriteStringAgg(const FunctionExpression &fn, const Operand &arg, const std::string &filter, Operand &out);
+	bool WriteAggregate(const AggregateCall &call, AggregateKind kind, Operand &out);
+	bool WriteStringAgg(const AggregateCall &call, const Operand &arg, const std::string &filter, Operand &out);
+	//! A window function (spec 079 PR E2): mssql_node_writer_windows.cpp.
+	bool WriteWindow(const WindowExpression &window, Operand &out);
+	bool WriteWindowFrame(const WindowExpression &window, std::string &sql);
 	bool WriteSelectList(const SelectNode &node);
 	bool WritePredicate(const ParsedExpression &expr, std::string &sql);
 	bool WritePredicateImpl(const ParsedExpression &expr, std::string &sql);
@@ -318,7 +339,7 @@ private:
 	//! varchar goes by its bytes and NULL placement is emulated without the
 	//! LIMIT a statement's ORDER BY needs for either (spec 079 PR E2).
 	bool WriteSortKeys(const std::vector<OrderByNode> &orders, std::string &sql);
-	bool ConstantCount(const ParsedExpression &expr, int64_t &out);
+	bool ConstantCount(const ParsedExpression &expr, int64_t &out, const char *what = "LIMIT / OFFSET");
 
 	const SQLWriterOptions &options_;
 	const SQLWriter::TableResolver &resolver_;

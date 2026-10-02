@@ -116,26 +116,34 @@ bool NodeWriter::WriteGroups(const SelectNode &node, std::string &sql) {
 	return true;
 }
 
-bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind, Operand &out) {
+bool NodeWriter::WriteAggregate(const AggregateCall &call, AggregateKind kind, Operand &out) {
+	// A window's aggregate (PR E2) reads the values of its node's rows -- the
+	// groups' in an aggregate query -- so its argument is written as they are,
+	// and every aggregate call it renders gets the OVER clause.
+	const bool window = !call.over.empty();
 	if (!after_grouping_) {
 		return Veto("an aggregate in WHERE / ON");
 	}
 	if (in_aggregate_) {
 		return Veto("an aggregate inside an aggregate");
 	}
-	const bool ordered = fn.OrderBy() && !fn.OrderBy()->orders.empty();
-	if ((ordered && kind != AggregateKind::StringAgg) || fn.ExportState() || !fn.GetQualifiedName().Schema().empty() ||
-		!fn.GetQualifiedName().Catalog().empty()) {
-		return Veto("aggregate " + fn.ToString());
+	const bool ordered = call.orders && !call.orders->empty();
+	if ((ordered && kind != AggregateKind::StringAgg) || call.foreign) {
+		return Veto("aggregate " + call.text);
 	}
+	if (window && (call.distinct || kind == AggregateKind::StringAgg)) {
+		// Neither takes an OVER clause there (10759, 4113).
+		return Veto("aggregate " + call.text + " over a window");
+	}
+	auto over = [&](const std::string &aggregate) { return aggregate + call.over; };
 	// `agg(x) FILTER (WHERE c)` is `agg(CASE WHEN c THEN x END)`: a row the
 	// condition does not take (false or NULL) gives the aggregate a NULL, which
 	// every aggregate here skips -- measured equal for COUNT(*), COUNT(DISTINCT),
 	// SUM and MAX (spec 079 PR E2). The condition is a row's, like the argument.
 	std::string filter;
-	if (fn.Filter()) {
-		in_aggregate_ = true;
-		const bool written = WritePredicate(*fn.Filter(), filter);
+	if (call.filter) {
+		in_aggregate_ = !window;
+		const bool written = WritePredicate(*call.filter, filter);
 		in_aggregate_ = false;
 		if (!written) {
 			return false;
@@ -144,41 +152,41 @@ bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind
 	auto filtered = [&](const std::string &value) {
 		return filter.empty() ? value : "CASE WHEN " + filter + " THEN " + value + " END";
 	};
-	auto &args = fn.GetArguments();
+	auto &args = call.args;
 	out = Operand();
 	out.kind = ComparableKind::ExactNumeric;
 	if (kind == AggregateKind::CountStar) {
 		if (!args.empty()) {
-			return Veto("aggregate " + fn.ToString());
+			return Veto("aggregate " + call.text);
 		}
-		out.sql = filter.empty() ? "COUNT_BIG(*)" : "COUNT_BIG(" + filtered("1") + ")";
+		out.sql = over(filter.empty() ? "COUNT_BIG(*)" : "COUNT_BIG(" + filtered("1") + ")");
 		out.type = out.result_type = LogicalType::BIGINT;
 		out.orderable = out.not_null = true;
 		return true;
 	}
 	const bool separated = kind == AggregateKind::StringAgg && args.size() == 2;
 	if ((args.size() != 1 && !separated) || args[0].HasName() || (separated && args[1].HasName())) {
-		return Veto("aggregate " + fn.ToString());
+		return Veto("aggregate " + call.text);
 	}
 	Operand arg;
-	in_aggregate_ = true;
+	in_aggregate_ = !window;
 	const bool written = WriteValue(args[0].GetExpression(), arg);
 	in_aggregate_ = false;
 	if (!written) {
 		return false;
 	}
 	if (kind == AggregateKind::StringAgg) {
-		return WriteStringAgg(fn, arg, filter, out);
+		return WriteStringAgg(call, arg, filter, out);
 	}
 	if (arg.constant) {
 		// count(1): the rows. Any other aggregate of a constant stays DuckDB's.
 		auto &constant = *arg.constant;
-		if (kind != AggregateKind::Count || fn.Distinct() ||
+		if (kind != AggregateKind::Count || call.distinct ||
 			constant.GetExpressionClass() != ExpressionClass::CONSTANT ||
 			constant.Cast<ConstantExpression>().GetLiteral().IsNull()) {
-			return Veto("aggregate of a constant " + fn.ToString());
+			return Veto("aggregate of a constant " + call.text);
 		}
-		out.sql = filter.empty() ? "COUNT_BIG(*)" : "COUNT_BIG(" + filtered("1") + ")";
+		out.sql = over(filter.empty() ? "COUNT_BIG(*)" : "COUNT_BIG(" + filtered("1") + ")");
 		out.type = out.result_type = LogicalType::BIGINT;
 		out.orderable = out.not_null = true;
 		return true;
@@ -195,9 +203,9 @@ bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind
 		// server's type.
 		return Veto("an aggregate over a value cast back after the read");
 	}
-	const std::string distinct = fn.Distinct() ? "DISTINCT " : "";
+	const std::string distinct = call.distinct ? "DISTINCT " : "";
 	if (kind == AggregateKind::Count) {
-		if (fn.Distinct() && (arg.column ? !IsGroupable(*arg.column) : arg.kind == ComparableKind::None)) {
+		if (call.distinct && (arg.column ? !IsGroupable(*arg.column) : arg.kind == ComparableKind::None)) {
 			return Veto("count(DISTINCT) over " + arg.type.ToString());
 		}
 		const auto type = arg.column ? StringUtil::Lower(arg.column->sql_type_name) : std::string();
@@ -205,7 +213,7 @@ bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind
 			// The server's COUNT refuses them (8117, measured in PR E2).
 			return Veto("count over " + type);
 		}
-		out.sql = "COUNT_BIG(" + distinct + arg.sql + ")";
+		out.sql = over("COUNT_BIG(" + distinct + arg.sql + ")");
 		out.type = out.result_type = LogicalType::BIGINT;
 		out.orderable = out.not_null = true;
 		return true;
@@ -222,8 +230,8 @@ bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind
 		const idx_t index = idx_t(arg.column - columns_.data());
 		out.sql = arg.kind == ComparableKind::Boolean
 					  // MIN / MAX of bit is error 8117; through tinyint and back.
-					  ? "CAST(" + name + "(CAST(" + arg.sql + " AS tinyint)) AS bit)"
-					  : name + "(" + arg.sql + ")";
+					  ? "CAST(" + over(name + "(CAST(" + arg.sql + " AS tinyint))") + " AS bit)"
+					  : over(name + "(" + arg.sql + ")");
 		out.type = arg.type;
 		out.kind = arg.kind;
 		// A constant compared with it is declared from the column -- for typing
@@ -239,19 +247,19 @@ bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind
 	const bool decimal = arg.kind == ComparableKind::ExactNumeric && arg.type.id() == LogicalTypeId::DECIMAL;
 	const bool floating = arg.type.id() == LogicalTypeId::DOUBLE && arg.kind == ComparableKind::Float;
 	if (!integer && !decimal && !floating) {
-		return Veto(fn.FunctionName().GetIdentifierName() + " over " + arg.type.ToString());
+		return Veto(call.name + " over " + arg.type.ToString());
 	}
 	// An integer sum as decimal(38,0): the server's own SUM of an int is an
 	// int and overflows where DuckDB's HUGEINT does not, and a bigint cast
 	// overflows too (measured).
 	const std::string exact_sum =
-		"SUM(" + distinct + (integer ? ExpressionVocabulary::Cast(arg.sql, "decimal(38,0)") : arg.sql) + ")";
+		over("SUM(" + distinct + (integer ? ExpressionVocabulary::Cast(arg.sql, "decimal(38,0)") : arg.sql) + ")");
 	out.type = LogicalType::DOUBLE;
 	out.result_type = LogicalType::DOUBLE;
 	switch (kind) {
 	case AggregateKind::Sum:
 		if (floating) {
-			out.sql = "SUM(" + distinct + arg.sql + ")";
+			out.sql = over("SUM(" + distinct + arg.sql + ")");
 			out.approximate = true;
 		} else {
 			out.sql = exact_sum;
@@ -267,9 +275,9 @@ bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind
 		// An exact sum divided as float -- bit-exact against DuckDB's average of
 		// a decimal where AVG(CAST(… AS float)) is not (measured). Still a double
 		// division: recorded, like a float SUM, as approximate.
-		out.sql = floating
-					  ? "AVG(" + distinct + arg.sql + ")"
-					  : ExpressionVocabulary::Cast(exact_sum, "float") + " / COUNT_BIG(" + distinct + arg.sql + ")";
+		out.sql = floating ? over("AVG(" + distinct + arg.sql + ")")
+						   : ExpressionVocabulary::Cast(exact_sum, "float") + " / " +
+								 over("COUNT_BIG(" + distinct + arg.sql + ")");
 		out.approximate = true;
 		break;
 	default: {
@@ -277,7 +285,7 @@ bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind
 						   : kind == AggregateKind::StdevP ? "STDEVP"
 						   : kind == AggregateKind::Var	   ? "VAR"
 														   : "VARP";
-		out.sql = std::string(name) + "(" + distinct + arg.sql + ")";
+		out.sql = over(std::string(name) + "(" + distinct + arg.sql + ")");
 		out.approximate = true;
 		break;
 	}
@@ -295,9 +303,9 @@ bool NodeWriter::WriteAggregate(const FunctionExpression &fn, AggregateKind kind
 // code-page varchar into Unicode. NULLs are skipped and a group of none is
 // NULL on both sides; with no ORDER BY the order is arbitrary on both sides,
 // as a LIMIT without one is (owner's call, PR E2). Measured equal, PR E2.
-bool NodeWriter::WriteStringAgg(const FunctionExpression &fn, const Operand &arg, const std::string &filter,
+bool NodeWriter::WriteStringAgg(const AggregateCall &call, const Operand &arg, const std::string &filter,
 								Operand &out) {
-	if (fn.Distinct()) {
+	if (call.distinct) {
 		return Veto("string_agg(DISTINCT): the server's STRING_AGG has none");
 	}
 	// A varchar / nvarchar column: char(n) is read trimmed but concatenated
@@ -306,7 +314,7 @@ bool NodeWriter::WriteStringAgg(const FunctionExpression &fn, const Operand &arg
 	if (arg.constant || (type != "varchar" && type != "nvarchar")) {
 		return Veto("string_agg over " + (arg.column ? arg.column->sql_type_name : arg.type.ToString()));
 	}
-	auto &args = fn.GetArguments();
+	auto &args = call.args;
 	std::string separator = ",";
 	if (args.size() == 2) {
 		const auto &expr = args[1].GetExpression();
@@ -317,9 +325,9 @@ bool NodeWriter::WriteStringAgg(const FunctionExpression &fn, const Operand &arg
 		separator = expr.Cast<ConstantExpression>().GetLiteral().text;
 	}
 	std::string order;
-	if (fn.OrderBy() && !fn.OrderBy()->orders.empty()) {
+	if (call.orders && !call.orders->empty()) {
 		in_aggregate_ = true;
-		const bool written = WriteSortKeys(fn.OrderBy()->orders, order);
+		const bool written = WriteSortKeys(*call.orders, order);
 		in_aggregate_ = false;
 		if (!written) {
 			return false;
@@ -528,7 +536,8 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 		case ExpressionClass::CASE:
 		case ExpressionClass::CAST:
 		case ExpressionClass::OPERATOR:
-		case ExpressionClass::SUBQUERY: {
+		case ExpressionClass::SUBQUERY:
+		case ExpressionClass::WINDOW: {
 			// A computed column: rendered by the same rules as WHERE, named as
 			// DuckDB names it (the alias, else the expression's text), typed by
 			// the server's describe -- the spec's "types of a pushed query are the
@@ -588,13 +597,13 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 	return true;
 }
 
-bool NodeWriter::ConstantCount(const ParsedExpression &expr, int64_t &out) {
+bool NodeWriter::ConstantCount(const ParsedExpression &expr, int64_t &out, const char *what) {
 	if (expr.GetExpressionClass() != ExpressionClass::CONSTANT) {
-		return Veto("LIMIT / OFFSET " + expr.ToString() + " is not a constant");
+		return Veto(std::string(what) + " " + expr.ToString() + " is not a constant");
 	}
 	auto &literal = expr.Cast<ConstantExpression>().GetLiteral();
 	if (literal.kind != LiteralKind::INTEGER || !literal.TryGetInt64(out) || out < 0) {
-		return Veto("LIMIT / OFFSET " + expr.ToString());
+		return Veto(std::string(what) + " " + expr.ToString());
 	}
 	return true;
 }

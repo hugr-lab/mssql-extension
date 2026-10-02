@@ -410,6 +410,68 @@ int main() {
 		"STRING_AGG(CAST([legacy] AS nvarchar(max)), N',') WITHIN GROUP (ORDER BY [id] ASC) AS [b] FROM [dbo].[t]",
 		false);	 // a repeated key once; one order shared by both
 	ExpectVeto("SELECT string_agg(name ORDER BY count(*)) FROM t");
+	// Windows (PR E2).
+	ExpectSql(
+		"SELECT id, row_number() OVER (PARTITION BY flag ORDER BY day DESC) AS r, ntile(4) OVER (ORDER BY id) AS q "
+		"FROM t",
+
+		"SELECT [id], ROW_NUMBER() OVER (PARTITION BY [flag] ORDER BY [day] DESC) AS [r], NTILE(4) OVER (ORDER BY [id] "
+		"ASC) AS [q] FROM [dbo].[t]",
+		false);
+	ExpectSql("SELECT id, sum(id) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS s FROM t",
+			  "SELECT [id], SUM(CAST([id] AS decimal(38,0))) OVER (ORDER BY [id] ASC ROWS BETWEEN 2 PRECEDING AND "
+			  "CURRENT ROW) AS [s] FROM [dbo].[t]",
+			  false);
+	ExpectSql(
+		"SELECT id, lag(amount, 2) OVER (ORDER BY id) AS l, last_value(name) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED "
+		"PRECEDING AND UNBOUNDED FOLLOWING) AS v FROM t",
+
+		"SELECT [id], LAG([amount], 2) OVER (ORDER BY [id] ASC) AS [l], LAST_VALUE([name]) OVER (ORDER BY [id] ASC "
+		"RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS [v] FROM [dbo].[t]",
+		false);
+	ExpectSql(
+		"SELECT id, count(*) FILTER (WHERE flag) OVER (PARTITION BY day) AS c FROM t",
+		"SELECT [id], COUNT_BIG(CASE WHEN ([flag] = 1) THEN 1 END) OVER (PARTITION BY [day]) AS [c] FROM [dbo].[t]",
+		false);
+	ExpectSql("SELECT id, rank() OVER (ORDER BY code) AS r FROM t",
+			  "SELECT [id], RANK() OVER (ORDER BY CASE WHEN [code] IS NULL THEN 1 ELSE 0 END, CAST([code] AS "
+			  "varbinary(20)) ASC) AS [r] FROM [dbo].[t]",
+			  false);  // bytes, NULL placement
+	ExpectSql("SELECT day, max(amount) AS m, rank() OVER (ORDER BY max(amount) DESC) AS r FROM t GROUP BY day",
+			  "SELECT [day], MAX([amount]) AS [m], RANK() OVER (ORDER BY MAX([amount]) DESC) AS [r] FROM [dbo].[t] "
+			  "GROUP BY [day]",
+			  false);  // an aggregate key: nullable, emulated
+	ExpectVeto("SELECT row_number() OVER () FROM t");
+	ExpectVeto("SELECT rank() OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t");	 // 10752
+	ExpectVeto("SELECT sum(id) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t");			 // no ORDER BY
+	ExpectVeto("SELECT sum(id) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t");
+	ExpectVeto("SELECT sum(id) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t");
+	ExpectVeto("SELECT count(DISTINCT id) OVER () FROM t");
+	ExpectVeto("SELECT lag(id IGNORE NULLS) OVER (ORDER BY id) FROM t");
+	ExpectVeto("SELECT lag(legacy) OVER (ORDER BY id) FROM t");		  // a code-page varchar value
+	ExpectVeto("SELECT row_number() OVER (ORDER BY legacy) FROM t");  // its order is the collation's
+	ExpectSql("SELECT row_number() OVER (PARTITION BY ratio ORDER BY id) AS r FROM t",
+			  "SELECT ROW_NUMBER() OVER (PARTITION BY [ratio] ORDER BY [id] ASC) AS [r] FROM [dbo].[t]",
+			  false);															   // groupable as GROUP BY's keys are
+	ExpectVeto("SELECT row_number() OVER (PARTITION BY doc ORDER BY id) FROM t");  // xml
+	ExpectVeto("SELECT row_number() OVER (PARTITION BY id % 2 ORDER BY id) FROM t");  // an expression
+	ExpectVeto("SELECT nth_value(id, 2) OVER (ORDER BY id) FROM t");
+	ExpectVeto("SELECT id FROM t WHERE row_number() OVER (ORDER BY id) = 1");
+	// A window over a division keeps its NULL-at-zero (review of E2).
+	ExpectVeto("SELECT coalesce(lag(id / 2) OVER (ORDER BY id), 0) FROM t");
+	ExpectVeto("SELECT * FROM (SELECT id, lag(id / 2) OVER (ORDER BY id) AS l FROM t) d WHERE l IS NULL");
+	ExpectVeto("SELECT sum(id) OVER (ORDER BY id ROWS BETWEEN 3000000000 PRECEDING AND CURRENT ROW) FROM t");  // 102
+	// A tie-dependent window picks rows: a CTE holding one is not inlined twice.
+	ExpectVeto(
+		"WITH r AS (SELECT id, row_number() OVER (ORDER BY day) AS rn FROM t) SELECT a.id FROM r a JOIN r b ON a.id = "
+		"b.id");
+	ExpectSql(
+		"WITH r AS (SELECT id, rank() OVER (ORDER BY day) AS rk FROM t) SELECT a.id FROM r a JOIN r b ON a.id = b.id",
+
+		"SELECT [r1].[id] AS [id] FROM (SELECT [id], RANK() OVER (ORDER BY CASE WHEN [day] IS NULL THEN 1 ELSE 0 END, "
+		"[day] ASC) AS [rk] FROM [dbo].[t]) AS [r1] INNER JOIN (SELECT [id], RANK() OVER (ORDER BY CASE WHEN [day] IS "
+		"NULL THEN 1 ELSE 0 END, [day] ASC) AS [rk] FROM [dbo].[t]) AS [r2] ON ([r1].[id] = [r2].[id])",
+		false);	 // a peer's answer is the same whatever the order of ties
 	ExpectVeto("SELECT count(*) FILTER (WHERE id / 2 > 1) FROM t");	 // a division in a condition
 	// string_agg (PR E2): over nvarchar(max), one WITHIN GROUP order per node.
 	ExpectSql("SELECT string_agg(name, ';') AS a FROM t",
