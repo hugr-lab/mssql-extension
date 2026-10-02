@@ -1,0 +1,216 @@
+# name: test/sql/pushdown/remote_pushdown_ctes.test
+# description: Spec 079 PR E1 -- a WITH clause over one catalog goes with its statement, each CTE inlined where it is referenced; both paths agree
+# group: [pushdown]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# T-SQL's WITH stands only at a statement's top, and the server inlines its
+# CTEs anyway: the writer renders each reference as a derived table. DuckDB
+# evaluates a CTE once, so a body with a LIMIT (which picks among ties) is
+# inlined only once and never under a subquery expression.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ct_off (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = true;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ct_on (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+statement ok
+SELECT mssql_exec('ct_off', 'DROP TABLE IF EXISTS dbo.ct_t; DROP TABLE IF EXISTS dbo.ct_u;
+	CREATE TABLE dbo.ct_t (id int NOT NULL PRIMARY KEY, g int NULL, n int NULL);
+	CREATE TABLE dbo.ct_u (k int NOT NULL PRIMARY KEY, g int NULL, w int NOT NULL);
+	INSERT INTO dbo.ct_t VALUES (1, 1, 10), (2, 1, 20), (3, 2, NULL), (4, 3, 40);
+	INSERT INTO dbo.ct_u VALUES (1, 1, 100), (2, 3, 300)');
+
+# One CTE: the statement goes whole, the CTE a derived table.
+query II
+EXPLAIN WITH q AS (SELECT g, count(*) AS c FROM ct_on.dbo.ct_t GROUP BY g) SELECT q.g, q.c FROM q ORDER BY q.g LIMIT 10;
+----
+physical_plan	<REGEX>:.*SELECT TOP \(10\) \[r1\]\.\[g\] AS \[g\], \[r1\]\.\[c\] AS \[c\] FROM \(SELECT \[g\], COUNT_BIG\(\*\) AS \[c\] FROM \[dbo\]\.\[ct_t\] GROUP BY \[g\]\) AS \[r1\].*
+
+query II
+WITH q AS (SELECT g, count(*) AS c FROM ct_on.dbo.ct_t GROUP BY g) SELECT q.g, q.c FROM q ORDER BY q.g LIMIT 10;
+----
+1	2
+2	1
+3	1
+
+# A CTE naming an earlier one.
+query I
+WITH a AS (SELECT g, count(*) AS c FROM ct_on.dbo.ct_t GROUP BY g), b AS (SELECT a.g FROM a WHERE a.c > 1) SELECT count(*) FROM b;
+----
+1
+
+# A CTE joined with a table; an integer SUM cast back once.
+query IIT
+SELECT k, s, typeof(s) FROM (WITH a AS (SELECT g, sum(n) AS s FROM ct_on.dbo.ct_t GROUP BY g) SELECT u.k, a.s FROM ct_on.dbo.ct_u u JOIN a ON a.g = u.g ORDER BY u.k LIMIT 10) z;
+----
+1	30	HUGEINT
+2	40	HUGEINT
+
+query II
+EXPLAIN WITH a AS (SELECT g, sum(n) AS s FROM ct_on.dbo.ct_t GROUP BY g) SELECT u.k, a.s FROM ct_on.dbo.ct_u u JOIN a ON a.g = u.g ORDER BY u.k LIMIT 10;
+----
+physical_plan	<REGEX>:.*FROM \[dbo\]\.\[ct_u\] AS \[r1\] INNER JOIN \(SELECT \[g\], SUM\(CAST\(\[n\] AS decimal\(38,0\)\)\) AS \[s\] FROM \[dbo\]\.\[ct_t\] GROUP BY \[g\]\) AS \[r2\].*
+
+query II
+WITH a AS (SELECT g, sum(n) AS s FROM ct_off.dbo.ct_t GROUP BY g) SELECT u.k, a.s FROM ct_off.dbo.ct_u u JOIN a ON a.g = u.g ORDER BY u.k;
+----
+1	30
+2	40
+
+# Referenced twice: inlined twice (deterministic).
+query II
+EXPLAIN WITH a AS (SELECT g, count(*) AS c FROM ct_on.dbo.ct_t GROUP BY g) SELECT x.g FROM a x JOIN a y ON x.g = y.g ORDER BY x.g LIMIT 10;
+----
+physical_plan	<REGEX>:.*GROUP BY \[g\]\) AS \[r1\] INNER JOIN \(SELECT .* GROUP BY \[g\]\) AS \[r2\].*
+
+query I
+WITH a AS (SELECT g, count(*) AS c FROM ct_on.dbo.ct_t GROUP BY g) SELECT x.g FROM a x JOIN a y ON x.g = y.g ORDER BY x.g LIMIT 10;
+----
+1
+2
+3
+
+# In a subquery expression, and a WITH inside a subquery.
+query I
+WITH a AS (SELECT g FROM ct_on.dbo.ct_u) SELECT id FROM ct_on.dbo.ct_t WHERE g IN (SELECT g FROM a) ORDER BY id;
+----
+1
+2
+4
+
+query II
+EXPLAIN WITH a AS (SELECT g FROM ct_on.dbo.ct_u) SELECT id FROM ct_on.dbo.ct_t WHERE g IN (SELECT g FROM a) ORDER BY id;
+----
+physical_plan	<REGEX>:.*IN \(SELECT \[r2\]\.\[g\] AS \[g\] FROM \(SELECT \[g\] FROM \[dbo\]\.\[ct_u\]\) AS \[r2\]\).*
+
+query I
+SELECT count(*) FROM (WITH a AS (SELECT g FROM ct_on.dbo.ct_t GROUP BY g) SELECT g FROM a) s;
+----
+3
+
+# A CTE named like a table: the 2-part name is the table, the bare one the CTE.
+query I
+WITH ct_t AS (SELECT g, count(*) AS c FROM ct_on.dbo.ct_t GROUP BY g) SELECT x.id FROM ct_on.ct_t x ORDER BY x.id LIMIT 10;
+----
+1
+2
+3
+4
+
+query I
+WITH ct_t AS (SELECT g, count(*) AS c FROM ct_on.dbo.ct_t GROUP BY g) SELECT c FROM ct_t ORDER BY g LIMIT 10;
+----
+2
+1
+1
+
+# Nested WITH: an inner CTE shadows an outer one of its name.
+query I
+WITH a AS (SELECT g FROM ct_on.dbo.ct_u) SELECT count(*) FROM (WITH a AS (SELECT g FROM ct_on.dbo.ct_t GROUP BY g) SELECT g FROM a) s;
+----
+3
+
+query I
+WITH a AS (SELECT g FROM ct_on.dbo.ct_u) SELECT id FROM ct_on.dbo.ct_t WHERE g IN (WITH a AS (SELECT g FROM ct_on.dbo.ct_t WHERE id = 3) SELECT g FROM a) ORDER BY id;
+----
+3
+
+# A body does not see its own CTE: under USE, `ct_t` in the body is the
+# table, outside it the CTE.
+statement ok
+USE ct_on;
+
+query I
+WITH ct_t AS (SELECT g FROM ct_t GROUP BY g) SELECT count(*) FROM ct_t;
+----
+3
+
+statement ok
+USE memory;
+
+# Vetoes: the rows are DuckDB's, the body is not inlined. g has ties (1, 1),
+# so a LIMIT picks among them: evaluated twice, the server could pick ids 1
+# and 2 where DuckDB's one evaluation matches itself.
+query I
+WITH a AS (SELECT id, g FROM ct_on.dbo.ct_t ORDER BY g LIMIT 1) SELECT count(*) FROM a x JOIN a y ON x.id = y.id;
+----
+1
+
+query II
+EXPLAIN WITH a AS (SELECT id, g FROM ct_on.dbo.ct_t ORDER BY g LIMIT 1) SELECT count(*) FROM a x JOIN a y ON x.id = y.id;
+----
+physical_plan	<!REGEX>:.*JOIN \(SELECT.*
+
+# ... a LIMIT deeper in the body (review of E1).
+query I
+WITH a AS (SELECT * FROM (SELECT id, g FROM ct_on.dbo.ct_t ORDER BY g LIMIT 1) s) SELECT count(*) FROM a x JOIN a y ON x.id = y.id;
+----
+1
+
+query II
+EXPLAIN WITH a AS (SELECT * FROM (SELECT id, g FROM ct_on.dbo.ct_t ORDER BY g LIMIT 1) s) SELECT count(*) FROM a x JOIN a y ON x.id = y.id;
+----
+physical_plan	<!REGEX>:.*JOIN \(SELECT.*
+
+# ... under a subquery expression (evaluated per row there).
+query I
+WITH a AS (SELECT g FROM ct_on.dbo.ct_u ORDER BY k LIMIT 1) SELECT id FROM ct_on.dbo.ct_t WHERE g IN (SELECT g FROM a) ORDER BY id;
+----
+1
+2
+
+query II
+EXPLAIN WITH a AS (SELECT g FROM ct_on.dbo.ct_u ORDER BY k LIMIT 1) SELECT id FROM ct_on.dbo.ct_t WHERE g IN (SELECT g FROM a) ORDER BY id;
+----
+physical_plan	<!REGEX>:.*IN \(SELECT.*
+
+# ... reached through another CTE under a correlated EXISTS (review of E1).
+query I
+WITH a AS (SELECT g FROM ct_on.dbo.ct_u ORDER BY w LIMIT 1), b AS (SELECT g FROM a) SELECT id FROM ct_on.dbo.ct_t t WHERE EXISTS (SELECT 1 FROM b WHERE b.g = t.g) ORDER BY id;
+----
+1
+2
+
+query II
+EXPLAIN WITH a AS (SELECT g FROM ct_on.dbo.ct_u ORDER BY w LIMIT 1), b AS (SELECT g FROM a) SELECT id FROM ct_on.dbo.ct_t t WHERE EXISTS (SELECT 1 FROM b WHERE b.g = t.g) ORDER BY id;
+----
+physical_plan	<!REGEX>:.*EXISTS \(SELECT.*
+
+# Column aliases on a CTE.
+query I
+WITH a(x) AS (SELECT g FROM ct_on.dbo.ct_t GROUP BY g) SELECT count(*) FROM a;
+----
+3
+
+query II
+EXPLAIN WITH a(x) AS (SELECT g FROM ct_on.dbo.ct_t GROUP BY g) SELECT count(*) FROM a;
+----
+physical_plan	<!REGEX>:.*FROM \(SELECT \[g\] FROM \[dbo\]\.\[ct_t\] GROUP BY \[g\]\) AS.*
+
+# A recursive CTE stays with DuckDB.
+query I
+WITH RECURSIVE r AS (SELECT id FROM ct_on.dbo.ct_t WHERE id = 1 UNION ALL SELECT t.id FROM ct_on.dbo.ct_t t JOIN r ON t.id = r.id + 1) SELECT count(*) FROM r;
+----
+4
+
+statement ok
+SELECT mssql_exec('ct_off', 'DROP TABLE dbo.ct_t; DROP TABLE dbo.ct_u');
+
+statement ok
+DETACH ct_on;
+
+statement ok
+DETACH ct_off;

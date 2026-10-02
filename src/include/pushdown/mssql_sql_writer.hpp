@@ -47,6 +47,14 @@ struct WriterTable {
 	//! The DuckDB types the catalog entry reports, parallel to `columns`;
 	//! null = derive them from `columns` (unit tests).
 	const std::vector<LogicalType> *types = nullptr;
+	//! The row count the planner is given (statistics cache, else the one
+	//! loaded with the table), and the columns of a unique key when it is
+	//! loaded (empty: none known) -- the PR E1 gain check, no round trip.
+	idx_t approx_rows = 0;
+	//! False for a view: it has no row count of its own (sys.partitions has
+	//! none), so its size is unknown, never small.
+	bool size_known = true;
+	std::vector<std::string> unique_key;
 };
 
 //! One `@pN` of the statement: its declaration (from the column it is
@@ -70,6 +78,27 @@ struct WrittenQuery {
 	std::vector<LogicalType> cast_types;
 	//! Per result column, its name, as DuckDB names it.
 	std::vector<std::string> column_names;
+	//! A join whose gain is not certain: a link that equates no unique key of
+	//! either side (many-to-many, CROSS), with no aggregate / DISTINCT / LIMIT
+	//! over it -- it could send more rows than the scans (PR E1).
+	bool gain_uncertain = false;
+	//! The largest cached row count among the tables it joins (not the ones
+	//! only EXISTS / NOT EXISTS reads, which multiply nothing).
+	idx_t largest_input_rows = 0;
+	//! One of them is a view, whose size is unknown.
+	bool input_size_unknown = false;
+	//! A result column is a division or a floating-point aggregate: its
+	//! divergence (NULL for inf, the last bits) is recorded for a value that
+	//! reaches the user -- not for one DuckDB computes on, as a part pushed
+	//! under a node that stays local would have it (review of E1).
+	bool value_divergence = false;
+	//! The writer stopped at a column that no relation of the node has but a
+	//! node around it could: a correlated subquery asked about on its own
+	//! (the rewriter asks about every nested node; PR E1).
+	bool refers_outside = false;
+	//! A LIMIT / OFFSET somewhere in the node: which rows it gives can differ
+	//! between two evaluations (ties), where DuckDB evaluates a CTE once.
+	bool picks_rows = false;
 
 	//! "@p1 int, @p2 varchar(50)" -- empty without parameters.
 	std::string Declarations() const;
@@ -87,6 +116,10 @@ struct SQLWriterOptions {
 	//! which the pushed `/ NULLIF(…, 0)` renders as NULL (the recorded
 	//! divergence); false makes DuckDB raise, so `/` is then not pushed.
 	bool ieee_floating_point_ops = true;
+	//! DuckDB's scalar_subquery_error_on_multiple_rows: true raises on a
+	//! scalar subquery of several rows, as SQL Server does (512); false returns
+	//! an arbitrary row, and a scalar subquery is then not pushed.
+	bool scalar_subquery_errors = true;
 	//! The session's default_order / default_null_order, resolved.
 	OrderType default_order = OrderType::ASCENDING;
 	OrderByNullType default_null_order_asc = OrderByNullType::NULLS_LAST;
@@ -103,6 +136,15 @@ public:
 
 	SQLWriter(SQLWriterOptions options, TableResolver resolver);
 
+	//! Whether the query wrote `ref` with no catalog and no schema: then a CTE
+	//! in scope of that name is what it means (PR E1). The rewriter strips the
+	//! catalog in place (`db.t` arrives as a bare `t`), so the catalog answers
+	//! from the names it noted; unset, the name as it stands decides.
+	using QualificationProbe = std::function<bool(const BaseTableRef &ref)>;
+	void SetWrittenUnqualified(QualificationProbe probe) {
+		written_unqualified_ = std::move(probe);
+	}
+
 	//! Render `node`. False, with the reason in `why`, when any part of it has
 	//! no exact T-SQL form -- then `out` is unspecified.
 	bool Write(const QueryNode &node, WrittenQuery &out, std::string &why);
@@ -113,14 +155,19 @@ public:
 	//! set operation's children, an INSERT's and a CTAS's query on their own,
 	//! and a pushed `SELECT * FROM t` there would read the whole table where
 	//! the scan reads what an outer WHERE lets through. So a node the scan
-	//! could serve as well stays with the scan. The gain is ORDER BY, LIMIT /
+	//! could serve as well is handed back to it by RemoteExecute (PR E1; the
+	//! dry run answers renderability only, as the rewriter asks it about
+	//! nested nodes too). The gain is ORDER BY, LIMIT /
 	//! OFFSET, DISTINCT, GROUP BY / HAVING, an aggregate, and a join with no
 	//! CROSS link: each sends fewer rows than the tables' (or their first N).
-	static bool PushesMoreThanScan(const QueryNode &node);
+	//! `probe` tells a CTE reference from a table of that name (see
+	//! SetWrittenUnqualified); unset, the name as it stands decides.
+	static bool PushesMoreThanScan(const QueryNode &node, const QualificationProbe *probe = nullptr);
 
 private:
 	SQLWriterOptions options_;
 	TableResolver resolver_;
+	QualificationProbe written_unqualified_;
 };
 
 //! A type as `column_types` spells it: its ToString, except the MSSQL string

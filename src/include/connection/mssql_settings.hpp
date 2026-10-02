@@ -80,6 +80,8 @@ int64_t LoadTestFailParseAfterTokens(ClientContext &context);
 
 //! Spec 076: pushed filter constants as sp_executesql parameters (default true).
 bool LoadScanParameterizeFilters(ClientContext &context);
+//! mssql_pushdown_join_rows_threshold (spec 079 PR E1).
+int64_t LoadPushdownJoinRowsThreshold(ClientContext &context);
 
 // Load ATTACH credential-validation timeout (spec 047 / US2).
 //! DuckDB's error_on_division_by_zero for this session (default true when unset

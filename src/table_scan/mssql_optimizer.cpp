@@ -103,7 +103,7 @@ static MSSQLScanInfo FindMSSQLScan(unique_ptr<LogicalOperator> &node) {
 	MSSQLScanInfo info;
 	if (node->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = node->Cast<LogicalGet>();
-		if (get.function.name == "mssql_catalog_scan") {
+		if (get.function.GetName().GetIdentifierName() == "mssql_catalog_scan") {
 			info.get = &get;
 			info.get_owner = &node;
 		}
@@ -113,7 +113,7 @@ static MSSQLScanInfo FindMSSQLScan(unique_ptr<LogicalOperator> &node) {
 		auto &child = node->children[0];
 		if (child->type == LogicalOperatorType::LOGICAL_GET) {
 			auto &get = child->Cast<LogicalGet>();
-			if (get.function.name == "mssql_catalog_scan") {
+			if (get.function.GetName().GetIdentifierName() == "mssql_catalog_scan") {
 				info.get = &get;
 				info.projection = &node->Cast<LogicalProjection>();
 				info.get_owner = &child;
@@ -817,10 +817,12 @@ static void CollectCatalogScans(LogicalOperator &op, case_insensitive_map_t<MSSQ
 		// function-name test above is the discriminator — a LogicalGet naming
 		// mssql_catalog_scan can only carry our bind data, because we are the only
 		// thing that binds it.
-		if (get.function.name == "mssql_catalog_scan" && get.bind_data) {
+		if (get.function.GetName().GetIdentifierName() == "mssql_catalog_scan" && get.bind_data) {
 			auto &bind_data = get.bind_data->Cast<MSSQLCatalogScanBindData>();
 			by_catalog[bind_data.context_name].catalog_scans.push_back(&bind_data);
-		} else if ((get.function.name == "mssql_scan" || get.function.name == "mssql_scan_params") && get.bind_data) {
+		} else if ((get.function.GetName().GetIdentifierName() == "mssql_scan" ||
+					get.function.GetName().GetIdentifierName() == "mssql_scan_params") &&
+				   get.bind_data) {
 			auto &bind_data = get.bind_data->Cast<MSSQLScanBindData>();
 			by_catalog[bind_data.context_name].raw_scans++;
 		}

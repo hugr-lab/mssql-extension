@@ -79,7 +79,7 @@ struct TestConfig {
 	}
 };
 
-void check_no_error(unique_ptr<MaterializedQueryResult> &result, const std::string &context) {
+void check_no_error(unique_ptr<QueryResult> &result, const std::string &context) {
 	if (result->HasError()) {
 		throw std::runtime_error(context + ": " + result->GetError());
 	}
@@ -101,7 +101,7 @@ int64_t query_single_int(Connection &conn, const std::string &sql) {
 	if (r->RowCount() == 0) {
 		throw std::runtime_error("Query returned no rows: " + sql);
 	}
-	return r->GetValue(0, 0).GetValue<int64_t>();
+	return r->Collection().GetValue(0, 0).GetValue<int64_t>();
 }
 
 // ---------------------------------------------------------------------------

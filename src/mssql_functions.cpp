@@ -1487,9 +1487,10 @@ void RegisterMSSQLFunctions(ExtensionLoader &loader) {
 							 MSSQLScanBind, MSSQLScanInitGlobal, MSSQLScanInitLocal);
 	// Spec 075: `prepared := true` compiles once via sp_prepare instead of
 	// describing at bind and compiling again at execution.
-	mssql_scan.named_parameters["prepared"] = LogicalType::BOOLEAN;
+	mssql_scan.GetSignature().AddKeywordOnly("prepared", LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	mssql_scan.to_string = MSSQLScanToString;
-	mssql_scan.named_parameters["column_types"] = LogicalType::LIST(LogicalType::VARCHAR);
+	mssql_scan.GetSignature().AddKeywordOnly("column_types", LogicalType::LIST(LogicalType::VARCHAR),
+											 Value(LogicalType::LIST(LogicalType::VARCHAR)));
 	mssql::RegisterDocumentedFunction(
 		loader, TableFunctionSet(mssql_scan),
 		{{},
@@ -1507,9 +1508,10 @@ void RegisterMSSQLFunctions(ExtensionLoader &loader) {
 		}
 		TableFunction f("mssql_scan_params", arguments, MSSQLScanFunction, MSSQLScanParamsBind, MSSQLScanInitGlobal,
 						MSSQLScanInitLocal);
-		f.named_parameters["prepared"] = LogicalType::BOOLEAN;
+		f.GetSignature().AddKeywordOnly("prepared", LogicalType::BOOLEAN, Value::BOOLEAN(false));
 		f.to_string = MSSQLScanToString;
-		f.named_parameters["column_types"] = LogicalType::LIST(LogicalType::VARCHAR);
+		f.GetSignature().AddKeywordOnly("column_types", LogicalType::LIST(LogicalType::VARCHAR),
+										Value(LogicalType::LIST(LogicalType::VARCHAR)));
 		scan_params.AddFunction(f);
 	}
 	mssql::RegisterDocumentedFunction(

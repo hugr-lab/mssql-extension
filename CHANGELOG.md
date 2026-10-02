@@ -74,6 +74,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is not pushed, as DuckDB moves the constant across and never computes a
   value the server could overflow on. A repeated ORDER BY key no longer fails on the
   server (error 169, since PR B).
+- **Remote pushdown: whole statements and their parts (spec 079 PR E1).**
+  - A statement over one catalog now goes to the server whole when it is
+    built from subqueries in FROM, subqueries in expressions (`IN`,
+    `EXISTS`, a scalar subquery, correlated or not), set operations inside a
+    subquery (`UNION [ALL]`, `EXCEPT`, `INTERSECT`) and `WITH` clauses (each
+    CTE inlined where it is referenced).
+  - A statement that cannot go whole (an `EXCLUDE`, a window, a local
+    table) has each part that can go replaced by its own `mssql_scan`, and
+    DuckDB runs the rest. A set operation at a statement's top always runs
+    this way: DuckDB combines the children.
+  - A node that would send the server nothing the catalog scan does not is
+    left to the scan, which still takes filters from above it.
+  - A join whose gain is uncertain (many-to-many, or `CROSS` with no key
+    equality) is pushed only while every table it joins has fewer rows than
+    the new setting `mssql_pushdown_join_rows_threshold` (default
+    1000000, `0` turns the check off), by the cached row counts. It is not
+    checked inside a transaction or on a pool of one connection.
+  - `UNION` / `EXCEPT` / `INTERSECT` over strings compare under the
+    column's collation when pushed, as `DISTINCT` does (D4).
+  - A CTE whose body has a `LIMIT` is not inlined where the server could
+    evaluate it twice. A CTE body inlined twice is read twice by the server.
+  - A scalar subquery is pushed only when it returns one row (a key lookup,
+    an aggregate, a `LIMIT 1`): the server evaluates it lazily and would
+    return rows where DuckDB raises "More than one row returned".
+  - A join inside a subquery or a CTE is gain-checked with the statement
+    around it; a subquery's `GROUP BY` columns count as its key.
+  - Under `USE db.sales`, `db.t` is read as DuckDB reads it (`sales.t`); it
+    was pushed reading `dbo.t`.
+  - A set operation's child that DuckDB sends on its own (the set operation
+    also reads a local table) is pushed like a statement: a division by zero
+    in it is NULL, not `inf`, before DuckDB deduplicates or filters.
+  - Not pushed: `EXCEPT ALL` / `INTERSECT ALL`, `UNION BY NAME`, recursive
+    CTEs, CTE column aliases, `> ANY` / `ALL`, and any scalar subquery under
+    `scalar_subquery_error_on_multiple_rows = false`.
+  - In a statement that also reads a local table, DuckDB's rewriter does not
+    yet hand a FROM subquery or a CTE body over on its own
+    ([duckdb/duckdb#26280](https://github.com/duckdb/duckdb/issues/26280)),
+    so their aggregate runs in DuckDB.
 - **`column_types := [...]` on `mssql_scan` / `mssql_scan_params`**: the type
   each result column is read as, `''` for the described one, checked against
   the server's describe. The rewriter uses it so a pushed `SELECT` has the
@@ -182,6 +220,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted and ignored, is refused.
 
 ### Fixed
+
+- **A CTE over an attached table, used more than once under a `LIMIT`, failed
+  with `Table Function with name mssql_catalog_scan does not exist`.**
+  DuckDB inlines such a CTE by copying its plan, and the copy looks the scan
+  function up by name; the catalog scan was never registered. It is now
+  (`mssql_catalog_scan`, internal: called by name it refuses), and the copy
+  rebuilds the scan from the attached table, pushed filters included.
 
 - **Spec 079 PR C follow-up review (roborev 1821): the `%` gate reached only the
   planner.** It is a case where the two pushdown walkers could still answer

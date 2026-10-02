@@ -117,7 +117,7 @@ void worker(DuckDB &db, int thread_id, int iterations, std::atomic<bool> &abort_
 			abort_flag.store(true, std::memory_order_relaxed);
 			return;
 		}
-		auto row_count = result->GetValue(0, 0).GetValue<int64_t>();
+		auto row_count = result->Collection().GetValue(0, 0).GetValue<int64_t>();
 		if (row_count <= 0) {
 			out.first_error = "iter " + std::to_string(i) + ": unexpected zero row count";
 			abort_flag.store(true, std::memory_order_relaxed);

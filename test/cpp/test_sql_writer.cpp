@@ -58,14 +58,12 @@ static std::vector<MSSQLColumnInfo> OtherColumns() {
 	return columns;
 }
 
-static bool Write(const std::string &sql, WrittenQuery &out, std::string &why, bool parameterize = true) {
+static bool WriteWith(const SQLWriterOptions &options, const std::string &sql, WrittenQuery &out, std::string &why) {
 	static const auto columns = Columns();
 	static const auto other = OtherColumns();
 	Parser parser;
 	parser.ParseQuery(sql);
 	auto &node = *parser.statements[0]->Cast<SelectStatement>().node;
-	SQLWriterOptions options;
-	options.parameterize = parameterize;
 	SQLWriter writer(options, [](const BaseTableRef &ref, WriterTable &table) {
 		const auto &name = ref.Table().GetIdentifierName();
 		if (name != "t" && name != "u") {
@@ -74,9 +72,17 @@ static bool Write(const std::string &sql, WrittenQuery &out, std::string &why, b
 		table.schema = "dbo";
 		table.name = name;
 		table.columns = name == "t" ? &columns : &other;
+		table.approx_rows = name == "t" ? 5000000 : 10;
+		table.unique_key = {"id"};	// both tables' primary key
 		return true;
 	});
 	return writer.Write(node, out, why);
+}
+
+static bool Write(const std::string &sql, WrittenQuery &out, std::string &why, bool parameterize = true) {
+	SQLWriterOptions options;
+	options.parameterize = parameterize;
+	return WriteWith(options, sql, out, why);
 }
 
 static void ExpectSql(const std::string &sql, const std::string &expected, bool parameterize = true) {
@@ -329,7 +335,8 @@ int main() {
 	ExpectVeto("SELECT id FROM w LIMIT 1");
 	ExpectSql("SELECT t.id FROM t, t AS u LIMIT 1",
 			  "SELECT TOP (1) [r1].[id] AS [id] FROM [dbo].[t] AS [r1] CROSS JOIN [dbo].[t] AS [r2]");
-	ExpectVeto("WITH c AS (SELECT 1) SELECT id FROM t LIMIT 1");
+	// An unused CTE is left out: DuckDB does not bind one either.
+	ExpectSql("WITH c AS (SELECT 1) SELECT id FROM t LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 	ExpectVeto("SELECT other.id FROM t LIMIT 1");
 
 	// Aggregates (PR D): COUNT as COUNT_BIG, an integer SUM as decimal(38,0)
@@ -505,7 +512,9 @@ int main() {
 	ExpectVeto("SELECT id FROM t RIGHT JOIN u USING (id)");
 	ExpectVeto("SELECT id FROM t FULL JOIN u USING (id)");
 	ExpectVeto("SELECT t.id FROM t JOIN (u JOIN t AS x ON u.t_id = x.id) ON t.id = u.t_id");
-	ExpectVeto("SELECT t.id FROM t JOIN (SELECT * FROM u) s ON t.id = s.t_id");
+	ExpectSql("SELECT t.id FROM t JOIN (SELECT * FROM u) s ON t.id = s.t_id",
+			  "SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] INNER JOIN (SELECT [id], [t_id], [label], [big] FROM "
+			  "[dbo].[u]) AS [r2] ON ([r1].[id] = [r2].[t_id])");
 	ExpectVeto("SELECT t.id FROM t JOIN v ON t.id = v.id");								  // not this catalog's
 	ExpectVeto("SELECT t.id FROM t JOIN u ON t.id = x.id JOIN t AS x ON x.id = u.t_id");  // ON names a later table
 
@@ -566,6 +575,224 @@ int main() {
 	ExpectVeto("SELECT ratio * ratio AS r FROM t LIMIT 1");
 	ExpectVeto("SELECT ratio % 2 FROM t LIMIT 1");
 	ExpectVeto("SELECT ratio + amount FROM t LIMIT 1");
+
+	// Derived tables (PR E1): the inner node rendered in place, its columns
+	// already read (the NVARCHAR cast of a code-page varchar is not repeated),
+	// one parameter set for the statement.
+	ExpectSql(
+		"SELECT s.g, s.c FROM (SELECT id AS g, count(*) AS c FROM t WHERE id > 3 GROUP BY id) s WHERE s.c > 1 "
+		"ORDER BY s.g LIMIT 5",
+		"SELECT TOP (5) [r1].[g] AS [g], [r1].[c] AS [c] FROM (SELECT [id] AS [g], COUNT_BIG(*) AS [c] FROM "
+		"[dbo].[t] WHERE ([id] > @p0) GROUP BY [id]) AS [r1] WHERE ([r1].[c] > @p1) ORDER BY [r1].[g] ASC");
+	ExpectSql("SELECT s.legacy FROM (SELECT legacy FROM t ORDER BY id LIMIT 3) s",
+			  "SELECT [r1].[legacy] AS [legacy] FROM (SELECT TOP (3) CAST([legacy] AS NVARCHAR(30)) AS [legacy] FROM "
+			  "[dbo].[t] ORDER BY [t].[id] ASC) AS [r1]");
+	{
+		WrittenQuery out;
+		std::string why;
+		if (!Write("SELECT s.total FROM (SELECT id, sum(id) AS total FROM t GROUP BY id) s WHERE s.total > 10", out,
+				   why) ||
+			out.cast_types[0] != LogicalType::HUGEINT) {
+			std::cerr << "FAIL: a derived integer SUM is not cast back (" << why << ")\n";
+			failures++;
+		}
+	}
+	ExpectVeto("SELECT sum(s.total) FROM (SELECT id, sum(id) AS total FROM t GROUP BY id) s");	// HUGEINT here
+	ExpectVeto("SELECT s.id FROM (SELECT id FROM t ORDER BY id) s");				   // ORDER BY without TOP: 1033
+	ExpectVeto("SELECT s.a FROM (SELECT id FROM t) s(a)");							   // column aliases: not yet
+	ExpectVeto("SELECT s.legacy FROM (SELECT legacy FROM t) s WHERE s.legacy = 'x'");  // read through a CAST
+	// A division or a floating-point aggregate stays a value outside its node.
+	ExpectVeto("SELECT s.id FROM (SELECT id, id / amount AS r FROM t) s WHERE s.r > 1");
+	ExpectVeto("SELECT s.id FROM (SELECT id, id / amount AS r FROM t) s ORDER BY s.r LIMIT 2");
+	ExpectVeto("SELECT coalesce(s.r, -1) FROM (SELECT id, id / amount AS r FROM t) s");
+	ExpectVeto("SELECT s.id FROM (SELECT id, avg(ratio) AS a FROM t GROUP BY id) s WHERE s.a > 1");
+	ExpectSql(
+		"SELECT s.r FROM (SELECT id, id / amount AS r FROM t) s LIMIT 1",
+		"SELECT TOP (1) [r1].[r] AS [r] FROM (SELECT [id], (CAST([id] AS float) / NULLIF(CAST([amount] AS float), 0)) "
+		"AS [r] FROM [dbo].[t]) AS [r1]");
+	ExpectGain("SELECT * FROM (SELECT id, count(*) AS c FROM t GROUP BY id) s", true);
+	ExpectGain("SELECT * FROM (SELECT id FROM t WHERE id > 1) s", false);
+
+	// The PR E1 gain check: a join link that equates a unique key cannot send
+	// more rows than the other side; one that equates none (many-to-many,
+	// CROSS) is uncertain unless an aggregate / DISTINCT / LIMIT bounds it.
+	{
+		auto uncertain = [&](const std::string &sql, bool expected) {
+			WrittenQuery out;
+			std::string why;
+			if (!Write(sql, out, why) || out.gain_uncertain != expected || out.largest_input_rows != 5000000) {
+				std::cerr << "FAIL: gain_uncertain(" << sql << ") != " << expected << " (" << why << ")\n";
+				failures++;
+			}
+		};
+		uncertain("SELECT t.name FROM t JOIN u ON u.t_id = t.id", false);	// t's key
+		uncertain("SELECT u.label FROM u JOIN t ON t.id = u.t_id", false);	// the right side's key
+		uncertain("SELECT a.label FROM u a JOIN u b ON a.t_id = b.t_id JOIN t ON t.id = a.t_id", true);
+		uncertain(
+			"SELECT a.t_id, count(*) AS c FROM u a JOIN u b ON a.t_id = b.t_id JOIN t ON t.id = a.t_id GROUP BY a.t_id",
+			false);
+		uncertain("SELECT a.label FROM u a JOIN u b ON a.t_id = b.t_id JOIN t ON t.id = a.t_id LIMIT 5", false);
+		uncertain("SELECT t.name FROM t JOIN u ON u.t_id = t.id AND u.label = t.name", false);
+		uncertain("SELECT t.id, u.label FROM t CROSS JOIN u ORDER BY t.id", true);
+		uncertain("SELECT t.name FROM t SEMI JOIN u ON u.t_id = t.id ORDER BY t.id", false);
+		// A GROUP BY / DISTINCT keeping a key of every table reduces nothing.
+		uncertain(
+			"SELECT a.id, b.id AS bid, count(*) AS c FROM u a JOIN u b ON a.t_id = b.t_id JOIN t ON t.id = a.t_id "
+			"GROUP BY a.id, b.id, t.id",
+			true);
+		uncertain(
+			"SELECT DISTINCT a.id, b.id AS bid, t.id AS tid FROM u a JOIN u b ON a.t_id = b.t_id JOIN t ON t.id = "
+			"a.t_id",
+			true);
+		// A comma join is bounded by WHERE's equalities as by an ON.
+		uncertain("SELECT t.name FROM t, u WHERE u.t_id = t.id ORDER BY t.id", false);
+		uncertain("SELECT t.name FROM t, u WHERE u.t_id > t.id ORDER BY t.id", true);
+		// An OR equality bounds nothing.
+		uncertain("SELECT t.name FROM t JOIN u ON u.t_id = t.id OR u.big = 1 ORDER BY t.id", true);
+		// Wrapped in a derived table or a CTE, the join's gain is still
+		// uncertain (review of E1), unless the node around it reduces.
+		uncertain("SELECT * FROM (SELECT a.id FROM t a JOIN t b ON a.name = b.name) s", true);
+		uncertain("WITH s AS (SELECT a.id FROM t a JOIN t b ON a.name = b.name) SELECT * FROM s", true);
+		uncertain("SELECT count(*) AS c FROM (SELECT a.id FROM t a JOIN t b ON a.name = b.name) s", false);
+		// A GROUP BY over the wrapper's columns does not reduce its join: they
+		// are not keys of the tables inside.
+		uncertain("SELECT s.id, count(*) AS c FROM (SELECT a.id FROM t a JOIN t b ON a.name = b.name) s GROUP BY s.id",
+				  true);
+		// A derived table's GROUP BY columns are its key.
+		uncertain("SELECT t.name, s.c FROM t JOIN (SELECT id, count(*) AS c FROM t GROUP BY id) s ON s.id = t.id",
+				  false);
+	}
+
+	// Subqueries in expressions (PR E1): IN / EXISTS / a scalar subquery,
+	// correlated through the outer node's aliases, the inner's aliased past them.
+	ExpectSql("SELECT id FROM t WHERE id IN (SELECT t_id FROM u)",
+			  "SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] WHERE ([r1].[id] IN (SELECT [r2].[t_id] AS [t_id] FROM "
+			  "[dbo].[u] AS [r2]))");
+	ExpectSql("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id)",
+			  "SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] WHERE (NOT EXISTS (SELECT 1 AS [1] FROM [dbo].[u] AS "
+			  "[r2] WHERE ([r2].[t_id] = [r1].[id])))");
+	ExpectSql("SELECT id, (SELECT max(t_id) FROM u WHERE u.id = t.id) AS m FROM t",
+			  "SELECT [r1].[id] AS [id], (SELECT MAX([r2].[t_id]) AS [max(t_id)] FROM [dbo].[u] AS [r2] WHERE "
+			  "([r2].[id] = [r1].[id])) AS [m] FROM [dbo].[t] AS [r1]");
+	ExpectVeto("SELECT id FROM t WHERE id IN (SELECT t_id, id FROM u)");
+	// An integer constant outside int: BIGINT here, numeric(10,0) there
+	// (review of #399: only the upper bound was checked).
+	ExpectVeto("SELECT -3000000000 FROM t LIMIT 1");
+	ExpectVeto("SELECT 3000000000 FROM t LIMIT 1");									// two columns
+	ExpectVeto("SELECT id FROM t WHERE id IN (SELECT t_id FROM u ORDER BY t_id)");	// 1033
+	ExpectVeto("SELECT id FROM t WHERE id > ANY (SELECT t_id FROM u)");				// not = ANY
+	ExpectVeto("SELECT id FROM t WHERE 0 < (SELECT max(u.t_id + t.id) FROM u)");	// an outer aggregate
+	ExpectVeto("SELECT sum((SELECT max(t_id) FROM u)) FROM t");						// 130 there
+	ExpectVeto("SELECT id FROM u WHERE label IN (SELECT legacy FROM t)");			// read through a CAST
+	ExpectVeto("SELECT id FROM t WHERE (SELECT id / 0 FROM u LIMIT 1) > 1");		// a division compared
+	ExpectGain("SELECT id FROM t WHERE id IN (SELECT t_id FROM u)", true);
+	{
+		// A correlated subquery asked about on its own refers outside.
+		WrittenQuery out;
+		std::string why;
+		if (Write("SELECT 1 FROM u WHERE u.t_id = t.id", out, why) || !out.refers_outside) {
+			std::cerr << "FAIL: a correlated subquery alone does not refer outside (" << why << ")\n";
+			failures++;
+		}
+		if (Write("SELECT 1 FROM u WHERE u.nope = 1", out, why) || out.refers_outside) {
+			std::cerr << "FAIL: an unknown qualified column refers outside\n";
+			failures++;
+		}
+	}
+	{
+		SQLWriterOptions lenient;
+		lenient.scalar_subquery_errors = false;
+		WrittenQuery out;
+		std::string why;
+		if (WriteWith(lenient, "SELECT id FROM t WHERE id = (SELECT t_id FROM u LIMIT 1)", out, why)) {
+			std::cerr << "FAIL: a scalar subquery pushed under scalar_subquery_error_on_multiple_rows = false\n";
+			failures++;
+		}
+	}
+
+	// Set operations (PR E1): rendered where nested -- the catalog keeps one
+	// at a statement's top with DuckDB; the writer renders it either way.
+	ExpectSql("SELECT count(*) FROM (SELECT id FROM t UNION ALL SELECT t_id FROM u) s",
+			  "SELECT COUNT_BIG(*) AS [count_star()] FROM (SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] UNION ALL "
+			  "SELECT [r1].[t_id] AS [t_id] FROM [dbo].[u] AS [r1]) AS [r1]");
+	ExpectSql("SELECT id FROM t WHERE id IN (SELECT id FROM t EXCEPT SELECT t_id FROM u)",
+			  "SELECT [r1].[id] AS [id] FROM [dbo].[t] AS [r1] WHERE ([r1].[id] IN (SELECT [r2].[id] AS [id] FROM "
+			  "[dbo].[t] AS [r2] EXCEPT SELECT [r2].[t_id] AS [t_id] FROM [dbo].[u] AS [r2]))");
+	ExpectVeto("SELECT count(*) FROM (SELECT id FROM t EXCEPT ALL SELECT t_id FROM u) s");	   // no EXCEPT ALL
+	ExpectVeto("SELECT count(*) FROM (SELECT id FROM t UNION SELECT big FROM u) s");		   // int with bigint
+	ExpectVeto("SELECT count(*) FROM (SELECT id FROM t UNION BY NAME SELECT t_id FROM u) s");  // BY NAME
+	// Floating-point aggregates compared.
+	ExpectVeto("SELECT count(*) FROM (SELECT avg(ratio) AS a FROM t UNION SELECT avg(ratio) AS a FROM t) s");
+	ExpectVeto("SELECT count(*) FROM (SELECT legacy FROM t UNION ALL SELECT label FROM u) s");	// two string types
+	// ORDER BY / LIMIT of the set operation: a SELECT * wrapper; of a member:
+	// the member in a derived table of its own.
+	ExpectSql("SELECT s.id FROM (SELECT id FROM t UNION SELECT t_id FROM u ORDER BY id LIMIT 2) s LIMIT 5",
+			  "SELECT TOP (5) [r1].[id] AS [id] FROM (SELECT TOP (2) [r1].[id] AS [id] FROM (SELECT [r2].[id] AS [id] "
+			  "FROM [dbo].[t] AS [r2] UNION SELECT [r2].[t_id] AS [t_id] FROM [dbo].[u] AS [r2]) AS [r1] ORDER BY "
+			  "CASE WHEN [r1].[id] IS NULL THEN 1 ELSE 0 END, [r1].[id] ASC) AS [r1]");
+	ExpectSql("SELECT count(*) FROM ((SELECT id FROM t ORDER BY id LIMIT 1) UNION ALL SELECT t_id FROM u) s",
+			  "SELECT COUNT_BIG(*) AS [count_star()] FROM (SELECT * FROM (SELECT TOP (1) [r1].[id] AS [id] FROM "
+			  "[dbo].[t] AS [r1] ORDER BY [r1].[id] ASC) AS [q1] UNION ALL SELECT [r1].[t_id] AS [t_id] FROM [dbo].[u] "
+			  "AS [r1]) AS [r1]");
+	ExpectVeto("SELECT count(*) FROM (SELECT id FROM t UNION ALL (SELECT t_id FROM u ORDER BY t_id)) s");  // 1033
+	ExpectVeto("SELECT s.id FROM (SELECT id FROM t UNION SELECT t_id FROM u ORDER BY id + 1 LIMIT 2) s");
+	ExpectGain("SELECT * FROM (SELECT id FROM t UNION ALL SELECT t_id FROM u) s", false);
+	ExpectGain("SELECT * FROM (SELECT id FROM t UNION SELECT t_id FROM u) s", true);
+
+	// CTEs (PR E1): inlined where referenced, a body seeing the earlier ones.
+	ExpectSql("WITH q AS (SELECT id, count(*) AS c FROM t GROUP BY id) SELECT q.id FROM q WHERE q.c > 1",
+			  "SELECT [r1].[id] AS [id] FROM (SELECT [id], COUNT_BIG(*) AS [c] FROM [dbo].[t] GROUP BY [id]) AS [r1] "
+			  "WHERE ([r1].[c] > @p0)");
+	ExpectSql("WITH a AS (SELECT id FROM t GROUP BY id), b AS (SELECT a.id FROM a) SELECT count(*) FROM b",
+			  "SELECT COUNT_BIG(*) AS [count_star()] FROM (SELECT [r1].[id] AS [id] FROM (SELECT [id] FROM [dbo].[t] "
+			  "GROUP BY [id]) AS [r1]) AS [r1]");
+	// A qualified name is the table, not the CTE of that name.
+	ExpectSql("WITH t AS (SELECT t_id FROM u GROUP BY t_id) SELECT count(*) FROM dbo.t",
+			  "SELECT COUNT_BIG(*) AS [count_star()] FROM [dbo].[t]");
+	ExpectVeto("WITH a AS (SELECT id FROM t ORDER BY id LIMIT 2) SELECT count(*) FROM a x, a y");  // LIMIT twice
+	ExpectVeto("WITH a AS (SELECT id FROM t ORDER BY id LIMIT 2) SELECT id FROM t WHERE id IN (SELECT id FROM a)");
+	ExpectVeto("WITH a(x) AS (SELECT id FROM t GROUP BY id) SELECT count(*) FROM a");  // column aliases
+	ExpectVeto("WITH a AS (SELECT b.id FROM b), b AS (SELECT id FROM t GROUP BY id) SELECT count(*) FROM a");
+	ExpectGain("WITH q AS (SELECT id, count(*) AS c FROM t GROUP BY id) SELECT * FROM q", true);
+	{
+		// A CTE read twice by a CTE read twice ... doubles per level: past the
+		// cap it is vetoed, and quickly (review of E1).
+		std::string sql = "WITH c0 AS (SELECT id FROM t WHERE id > 1)";
+		for (int level = 1; level <= 30; level++) {
+			sql += ", c" + std::to_string(level) + " AS (SELECT x.id FROM c" + std::to_string(level - 1) + " x JOIN c" +
+				   std::to_string(level - 1) + " y ON x.id = y.id)";
+		}
+		sql += " SELECT count(*) FROM c30";
+		ExpectVeto(sql);
+	}
+	// A scalar subquery pushed only when it returns one row: a key lookup, an
+	// aggregate, a LIMIT 1 (review of E1: lazily evaluated on the server).
+	ExpectSql("SELECT id, (SELECT label FROM u WHERE u.id = t.id) AS l FROM t",
+			  "SELECT [r1].[id] AS [id], (SELECT [r2].[label] AS [label] FROM [dbo].[u] AS [r2] WHERE ([r2].[id] = "
+			  "[r1].[id])) AS [l] FROM [dbo].[t] AS [r1]");
+	ExpectVeto("SELECT id, (SELECT label FROM u WHERE u.t_id = t.id) AS l FROM t");
+	// A string key against an outer column: other rules may meet two keys.
+	ExpectVeto("SELECT id, (SELECT t_id FROM u WHERE u.label = t.name) AS l FROM t");
+	ExpectVeto("SELECT id, (SELECT label FROM u WHERE u.id = t.id OR u.id = 1) AS l FROM t");
+	ExpectVeto("SELECT id, (SELECT max(t_id) FROM u WHERE u.id = t.id) FROM t");  // no alias
+	// A LIMIT anywhere in the body, or reached through another CTE under a
+	// subquery expression (review of E1).
+	ExpectVeto("WITH a AS (SELECT * FROM (SELECT id FROM t ORDER BY id LIMIT 1) s) SELECT count(*) FROM a x, a y");
+	ExpectVeto(
+		"WITH a AS (SELECT id FROM t ORDER BY id LIMIT 1), b AS (SELECT id FROM a) SELECT id FROM t WHERE EXISTS "
+		"(SELECT 1 FROM b WHERE b.id = t.id)");
+	{
+		// A body inlined twice renders its constant twice, each its own @pN.
+		WrittenQuery out;
+		std::string why;
+		if (!Write("WITH a AS (SELECT id FROM t WHERE id > 5) SELECT x.id FROM a x JOIN a y ON x.id = y.id", out,
+				   why) ||
+			out.params.size() != 2 || out.statement.find("@p0") == std::string::npos ||
+			out.statement.find("@p1") == std::string::npos) {
+			std::cerr << "FAIL: a CTE inlined twice (" << why << "): " << out.statement << "\n";
+			failures++;
+		}
+	}
 
 	// The gain rule: a node the catalog scan serves as well stays with it.
 	ExpectGain("SELECT * FROM t", false);

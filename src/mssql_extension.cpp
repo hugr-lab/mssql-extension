@@ -20,6 +20,7 @@
 #include "mssql_secret.hpp"
 #include "mssql_storage.hpp"
 #include "table_scan/mssql_optimizer.hpp"
+#include "table_scan/table_scan.hpp"
 #include "tds/auth/krb5_test_function.hpp"
 #include "tds/auth/winsspi_test_function.hpp"
 
@@ -157,6 +158,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// 3. Register table functions
 	RegisterMSSQLFunctions(loader);
+
+	// The catalog scan, by name (a plan copy looks it up)
+	mssql::RegisterCatalogScanFunction(loader);
 
 	// 4. Register mssql_exec scalar function
 	RegisterMSSQLExecFunction(loader);

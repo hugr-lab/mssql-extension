@@ -777,16 +777,23 @@ binder. Its own table lookup still reaches `MSSQLTableSet::GetEntry`, which
 notes the entry and the context on a thread-local list
 (`pushdown/mssql_pushdown_resolution`). The rewriter's hooks get no context,
 so this list is how they see the table. `SupportsPushdown(QueryNode)` runs the
-writer (`pushdown/mssql_sql_writer`) as a dry run, and `RemoteExecute` runs it
-again and replaces the node with `mssql_scan_params(…, column_types := […])`.
-From there the statement is an ordinary raw scan: describe at bind, run at
-init, and the pinned connection inside a transaction.
+writer (`pushdown/mssql_sql_writer`) as a dry run -- whether it RENDERS the
+node, since the rewriter asks about every nested node too and a no anywhere
+poisons the statement -- and `RemoteExecute` decides whether it gains, runs
+the writer again and replaces the node with
+`mssql_scan_params(…, column_types := […])`. A node that does not render or
+gain is handed back as a subquery, table names restored as the query wrote
+them, with each nested part that does replaced by `SELECT * FROM <its
+vehicle>` (PR E1). From there each vehicle is an ordinary raw scan: describe
+at bind, run at init, and the pinned connection inside a transaction.
 
 ```mermaid
 flowchart LR
-    P[parsed SELECT] --> R{rewriter:<br/>SupportsPushdown}
-    R -- "writer renders it and it sends more than the scan<br/>(ORDER BY / LIMIT / DISTINCT / GROUP BY / aggregate / join)" --> V["mssql_scan_params(T-SQL, params,<br/>column_types) — EXPLAIN shows it"]
-    R -- otherwise --> B[binder → MSSQLCatalogScan<br/>filter / projection pushdown, MSSQLOptimizer]
+    P[parsed SELECT] --> R{rewriter:<br/>SupportsPushdown<br/>= renders?}
+    R -- no --> B[binder → MSSQLCatalogScan<br/>filter / projection pushdown, MSSQLOptimizer]
+    R -- yes --> E{RemoteExecute:<br/>gains? join gain check}
+    E -- "yes (ORDER BY / LIMIT / DISTINCT / GROUP BY / aggregate /<br/>join / subquery / nested set operation)" --> V["mssql_scan_params(T-SQL, params,<br/>column_types) — EXPLAIN shows it"]
+    E -- "no, or a set operation at the top" --> H["handed back as a subquery:<br/>each part that gains → its own vehicle,<br/>the rest → binder / scan path"]
 ```
 
 Invariants:
@@ -812,13 +819,26 @@ Invariants:
   flat column list, and aliases each relation `[r1]`, `[r2]`, ... with every
   column qualified by it, so a user alias or table name never shadows
   another. A SEMI / ANTI join is an `EXISTS` / `NOT EXISTS` ANDed to WHERE.
-- **Set-operation children are not told apart.** The rewriter pushes a set
-  operation's children one by one when the set operation also reads another
-  catalog or a local table (over this catalog alone it offers the whole set
-  operation, which the writer refuses until PR E). The hook gets the node
-  alone, so a join or an aggregate that is such a child is pushed like a
-  statement and the filters above it apply after -- correct rows, sometimes
-  more of them sent.
+- **Set-operation children are not told apart.** A set operation at a
+  statement's top is never pushed whole (owner's call, PR E1): its children
+  go as parts. The hook gets a child alone, so a join or an aggregate that is
+  such a child is pushed like a statement and the filters above it apply
+  after -- correct rows, sometimes more of them sent. Nested (a derived
+  table, IN / EXISTS, a part), the writer renders the set operation in place.
+- **Composition is the writer's, recursively** (PR E1). One `NodeWriter` per
+  node: a derived table, an inlined CTE, a subquery expression, a set
+  operation's member each get a nested writer sharing the statement's
+  parameter set. A subquery expression's writer can resolve a name through
+  the writers around it (correlation), its relations aliased past theirs; a
+  CTE is found through the chain of writers that made this one, a body seeing
+  only the CTEs defined before it. A CTE and a table of one name are told
+  apart by the name the query wrote, which the catalog noted before the
+  rewriter stripped it (two generations of notes, thread-local).
+- **The join gain check reads no server** (PR E1). Unique keys come from the
+  loaded primary / rowid key, sizes from the statistics cache or the entry;
+  an uncertain join over a table at or above
+  `mssql_pushdown_join_rows_threshold` (or of unknown size: a view, a derived
+  table) is handed back. Skipped inside a transaction and on a pool of one.
 - **One vocabulary, two walkers** (PR C). `pushdown/mssql_expression_vocabulary`
   holds the atoms: those both paths render with -- constants and their
   parameter declarations, comparisons, IN, BETWEEN, CASE, LIKE, the function
