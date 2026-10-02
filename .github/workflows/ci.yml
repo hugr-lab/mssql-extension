@@ -7,20 +7,35 @@ on:
     # NO `branches:` filter, deliberately (issue #285). With `branches: [main]`
     # a PR whose base was another branch ran none of this -- and stacked PRs are
     # normal here. #283 (base main) got 14 checks; #284, open the same day with
-    # base fix/roborev-backlog, got 4, all from workflows that have their own
-    # triggers. No Build, no Integration, no C++ Unit Tests, no Lint. #284's
-    # whole change was to THIS FILE, deleting twelve test blocks on the argument
-    # that `make test-cpp-run` covers them -- exactly what Build verifies, and
-    # exactly what its own checks could not.
+    # base fix/roborev-backlog, got 4. No Build, no Integration, no C++ Unit
+    # Tests, no Lint.
+    #
+    # Exactly those four, read off #284's head 54692a9 by triggering event:
+    #   pull_request         Concurrency Tests, Lint (yaml), Security Scan
+    #   pull_request_target  PR Prompt-Injection Scan
+    # (A `CI` run sits on that SHA too, but its event is `workflow_dispatch` --
+    # someone ran it by hand. It is not evidence about the trigger.)
+    #
+    # Concurrency Tests is paths-scoped and ran because #284 touched
+    # `src/catalog/**` and `src/include/catalog/**`; the other paths-scoped PR
+    # workflows (cflite-pr, docs-build, kerberos, named-instance) did not match
+    # and did not run. #284 changed SEVEN files -- this one, CLAUDE.md,
+    # DATAMODEL.md, docs/architecture.md, the two catalog statistics files and
+    # a C++ test -- of which this one was the CI-relevant edit: it deleted
+    # twelve test blocks on the argument that `make test-cpp-run` covers them,
+    # which is exactly what Build verifies and exactly what its own four checks
+    # could not.
     #
     # The green tick was the problem: four checks ran and passed, so the page
     # looked fine. Only counting them against another PR showed the ten missing.
     #
-    # This also makes ci.yml consistent with every other workflow in the repo:
-    # it was the only one filtering PRs by BASE BRANCH. The rest either scope
-    # by `paths:` (cflite-pr, concurrency-tests, docs-build, kerberos,
-    # named-instance) or take every PR unconditionally (lint-extra,
-    # security-scan) -- which is why those ran on #284 and this did not.
+    # This also makes ci.yml consistent with the repo's other PR workflows: it
+    # was the only one filtering PRs by BASE BRANCH. The others that run on a
+    # PR either scope by `paths:` (cflite-pr, concurrency-tests, docs-build,
+    # kerberos, named-instance) or take every PR (lint-extra, security-scan,
+    # and pr-injection-scan via `pull_request_target`). Not a partition of all
+    # 13 workflows: codeql, fuzz-row-stager, pages and release have no PR
+    # trigger at all.
     #
     # Cost is CI minutes on stacked PRs, which is the point: a PR merging into
     # a feature branch still reaches main eventually.

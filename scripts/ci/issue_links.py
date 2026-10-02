@@ -41,7 +41,11 @@ NUMBERS = re.compile(r"#?(\d+)")
 # Plural, and the separators this tree actually uses: "issues #90",
 # "issue-#89", "issue: 224". Still requires the word, which usefully
 # excludes "PR #213".
-PROSE = re.compile(r"issues?[\s#:,-]*(\d{2,5})", re.I)
+# `\b` so "reissue 1234" / "tissue 99" do not match, and [ \t] rather than \s
+# so a line ending in the word "issue" cannot join the next line's "# 226 rows"
+# into issue 226. `+` rather than `*` because a separator is what distinguishes
+# a reference from a number that merely follows the word (roborev 1431).
+PROSE = re.compile(r"\bissues?[ \t#:,-]+(\d{2,5})", re.I)
 
 
 def header_lines(path):
@@ -144,7 +148,11 @@ def main(argv):
     gone = missing_roots()
     if gone:
         for root in gone:
-            print("ERROR missing docs/test root: %s" % root, file=sys.stderr)
+            # ROOTS are RELATIVE, so the overwhelmingly likely cause is being
+            # invoked from somewhere other than the repo root -- which the old
+            # wording ("docs/test root") did not say, and there is no docs root
+            # in ROOTS to begin with (roborev 1431).
+            print("ERROR test root not found: %s (run from the repository root)" % root, file=sys.stderr)
         return 1
 
     index, backlog, bad = collect()
@@ -186,8 +194,11 @@ def main(argv):
     if bad:
         return 1
 
-    print("%d issue(s) guarded by %d declared test(s)"
-          % (len(index), sum(len(v) for v in index.values())))
+    # DISTINCT files, not pairs: `sum(len(v) for v in index.values())` counted a
+    # file declaring two issues twice, so the figure overstated how many tests
+    # carry a declaration (roborev 1431).
+    declaring = {path for paths in index.values() for path in paths}
+    print("%d issue(s) guarded by %d declared test(s)" % (len(index), len(declaring)))
     if backlog:
         print("%d file(s) mention an issue without declaring one "
               "(see --backlog; not an error)" % len(backlog))
