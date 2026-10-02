@@ -341,6 +341,176 @@ SELECT g, n, count(*) FROM ra_on.dbo.ra_t GROUP BY g;
 ----
 must appear in the GROUP BY clause
 
+# FILTER as CASE and string_agg (PR E2). A row the FILTER does not take is a
+# NULL the aggregate skips; COUNT(*) counts the CASE's 1s.
+query II
+EXPLAIN SELECT g, count(*) FILTER (WHERE n > 15) AS c, sum(n) FILTER (WHERE flag) AS s, count(DISTINCT name) FILTER (WHERE amount IS NOT NULL) AS d, max(day) FILTER (WHERE id > 1) AS m FROM ra_on.dbo.ra_t GROUP BY g ORDER BY g;
+----
+physical_plan	<REGEX>:.*COUNT_BIG\(CASE WHEN \(\[n\] > @p0\) THEN 1 END\).*SUM\(CAST\(CASE WHEN \(\[flag\] = 1\) THEN \[n\] END AS decimal\(38,0\)\)\).*COUNT_BIG\(DISTINCT CASE WHEN.*
+
+query IIIIT
+SELECT g, count(*) FILTER (WHERE n > 15) AS c, sum(n) FILTER (WHERE flag) AS s, count(DISTINCT name) FILTER (WHERE amount IS NOT NULL) AS d, max(day) FILTER (WHERE id > 1) AS m FROM ra_on.dbo.ra_t GROUP BY g ORDER BY g;
+----
+1	1	10	2	2024-03-01
+2	1	35	1	2024-02-01
+3	1	NULL	1	2024-05-01
+
+query IIIIT
+SELECT g, count(*) FILTER (WHERE n > 15) AS c, sum(n) FILTER (WHERE flag) AS s, count(DISTINCT name) FILTER (WHERE amount IS NOT NULL) AS d, max(day) FILTER (WHERE id > 1) AS m FROM ra_off.dbo.ra_t GROUP BY g ORDER BY g;
+----
+1	1	10	2	2024-03-01
+2	1	35	1	2024-02-01
+3	1	NULL	1	2024-05-01
+
+# string_agg over nvarchar(max) (a bounded argument fails past 8000 bytes),
+# one WITHIN GROUP order per node (8711); a group with no value is NULL.
+query II
+EXPLAIN SELECT g, string_agg(name, ';' ORDER BY id DESC) AS a, string_agg(name ORDER BY id DESC) FILTER (WHERE id = 3) AS b FROM ra_on.dbo.ra_t GROUP BY g ORDER BY g;
+----
+physical_plan	<REGEX>:.*STRING_AGG\(CAST\(\[name\] AS nvarchar\(max\)\), @p0\) WITHIN GROUP \(ORDER BY \[id\] DESC\).*
+
+query ITT
+SELECT g, string_agg(name, ';' ORDER BY id DESC) AS a, string_agg(name ORDER BY id DESC) FILTER (WHERE id = 3) AS b FROM ra_on.dbo.ra_t GROUP BY g ORDER BY g;
+----
+1	b;a	NULL
+2	a	NULL
+3	c	NULL
+
+query ITT
+SELECT g, string_agg(name, ';' ORDER BY id DESC) AS a, string_agg(name ORDER BY id DESC) FILTER (WHERE id = 3) AS b FROM ra_off.dbo.ra_t GROUP BY g ORDER BY g;
+----
+1	b;a	NULL
+2	a	NULL
+3	c	NULL
+
+# A code-page varchar as the value (sent as nvarchar), a nullable date key
+# (NULL placement emulated).
+query II
+EXPLAIN SELECT g, listagg(legacy, '' ORDER BY day) FILTER (WHERE id <> 2) AS a FROM ra_on.dbo.ra_t GROUP BY g ORDER BY g;
+----
+physical_plan	<REGEX>:.*WITHIN GROUP \(ORDER BY CASE WHEN \[day\] IS NULL THEN 1 ELSE 0 END, \[day\] ASC\).*
+
+query IT
+SELECT g, listagg(legacy, '' ORDER BY day) FILTER (WHERE id <> 2) AS a FROM ra_on.dbo.ra_t GROUP BY g ORDER BY g;
+----
+1	a
+2	b
+3	B
+
+query IT
+SELECT g, listagg(legacy, '' ORDER BY day) FILTER (WHERE id <> 2) AS a FROM ra_off.dbo.ra_t GROUP BY g ORDER BY g;
+----
+1	a
+2	b
+3	B
+
+# A nullable key with a value beside it (NULL placement emulated: DuckDB puts
+# the NULL last), a UTF-8 varchar key (sorted by its bytes: a < b < é), an
+# unordered string_agg beside ordered ones (accepted by the server: 8711 is
+# for two different orders), and the other FILTER forms.
+statement ok
+SELECT mssql_exec('ra_off', 'DROP TABLE IF EXISTS dbo.ra_s;
+	CREATE TABLE dbo.ra_s (id int NOT NULL PRIMARY KEY, g int NOT NULL, k int NULL, v nvarchar(10) NULL,
+		u varchar(10) COLLATE Latin1_General_100_BIN2_UTF8 NULL, c char(4) NULL, x int NULL, f float NULL,
+		b bit NULL, t text NULL);
+	INSERT INTO dbo.ra_s VALUES (1, 1, 2, N''a'', ''b'', ''ab'', 1, 1.5, 1, ''t''),
+		(2, 1, NULL, N''n'', ''a'', ''cd'', 2, 2.5, 0, NULL), (3, 1, 1, N''c'', N''é'', ''ef'', 3, NULL, 1, ''u''),
+		(4, 2, 5, N''z'', NULL, NULL, 4, 4.0, NULL, NULL), (5, 2, 5, N''y'', ''Z'', ''gh'', NULL, 8.0, 1, ''v'')');
+
+statement ok
+SELECT mssql_invalidate_cache('ra_on'), mssql_invalidate_cache('ra_off');
+
+query II
+EXPLAIN SELECT g, string_agg(v, '' ORDER BY k, id) AS a, string_agg(u) FILTER (WHERE id IN (1, 4)) AS c FROM ra_on.dbo.ra_s GROUP BY g ORDER BY g;
+----
+physical_plan	<REGEX>:.*WITHIN GROUP \(ORDER BY CASE WHEN \[k\] IS NULL THEN 1 ELSE 0 END, \[k\] ASC, \[id\] ASC\).*
+
+query II
+EXPLAIN SELECT g, string_agg(v, '' ORDER BY u, id) AS b FROM ra_on.dbo.ra_s GROUP BY g ORDER BY g;
+----
+physical_plan	<REGEX>:.*WITHIN GROUP \(ORDER BY CASE WHEN \[u\] IS NULL THEN 1 ELSE 0 END, CAST\(\[u\] AS varbinary\(10\)\) ASC, \[id\] ASC\).*
+
+query ITT
+SELECT g, string_agg(v, '' ORDER BY k, id) AS a, string_agg(u) FILTER (WHERE id IN (1, 4)) AS c FROM ra_on.dbo.ra_s GROUP BY g ORDER BY g;
+----
+1	can	b
+2	zy	NULL
+
+query ITT
+SELECT g, string_agg(v, '' ORDER BY k, id) AS a, string_agg(u) FILTER (WHERE id IN (1, 4)) AS c FROM ra_off.dbo.ra_s GROUP BY g ORDER BY g;
+----
+1	can	b
+2	zy	NULL
+
+query IT
+SELECT g, string_agg(v, '' ORDER BY u, id) AS b FROM ra_on.dbo.ra_s GROUP BY g ORDER BY g;
+----
+1	nac
+2	yz
+
+query IT
+SELECT g, string_agg(v, '' ORDER BY u, id) AS b FROM ra_off.dbo.ra_s GROUP BY g ORDER BY g;
+----
+1	nac
+2	yz
+
+query II
+EXPLAIN SELECT g, avg(x) FILTER (WHERE b) AS a, avg(f) FILTER (WHERE id < 5) AS af, stddev(x) FILTER (WHERE id < 4) AS sd, max(b) FILTER (WHERE x > 1) AS m, count(1) FILTER (WHERE t IS NOT NULL) AS c FROM ra_on.dbo.ra_s GROUP BY g ORDER BY g;
+----
+physical_plan	<REGEX>:.*STDEV\(CASE WHEN.*CAST\(MAX\(CAST\(CASE WHEN.*AS tinyint\)\) AS bit\).*
+
+query IRRRTI
+SELECT g, avg(x) FILTER (WHERE b) AS a, avg(f) FILTER (WHERE id < 5) AS af, stddev(x) FILTER (WHERE id < 4) AS sd, max(b) FILTER (WHERE x > 1) AS m, count(1) FILTER (WHERE t IS NOT NULL) AS c FROM ra_on.dbo.ra_s GROUP BY g ORDER BY g;
+----
+1	2.0	2.0	1.0	true	2
+2	NULL	4.0	NULL	NULL	1
+
+query IRRRTI
+SELECT g, avg(x) FILTER (WHERE b) AS a, avg(f) FILTER (WHERE id < 5) AS af, stddev(x) FILTER (WHERE id < 4) AS sd, max(b) FILTER (WHERE x > 1) AS m, count(1) FILTER (WHERE t IS NOT NULL) AS c FROM ra_off.dbo.ra_s GROUP BY g ORDER BY g;
+----
+1	2.0	2.0	1.0	true	2
+2	NULL	4.0	NULL	NULL	1
+
+# char(n) is read trimmed and concatenated padded there; the server's COUNT
+# refuses text (8117): both stay DuckDB's, with the same rows.
+query II
+EXPLAIN SELECT g, string_agg(c) FROM ra_on.dbo.ra_s GROUP BY g;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT g, count(t) FROM ra_on.dbo.ra_s GROUP BY g;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+SELECT g, count(t) FROM ra_on.dbo.ra_s GROUP BY g ORDER BY g;
+----
+1	2
+2	1
+
+# Vetoes: DISTINCT, two orders, a code-page varchar's order, an expression
+# as the value. (A separator that is not a constant is DuckDB's binder error.)
+query II
+EXPLAIN SELECT string_agg(DISTINCT name) FROM ra_on.dbo.ra_t;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT string_agg(name ORDER BY id), string_agg(name ORDER BY day) FROM ra_on.dbo.ra_t;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT string_agg(name ORDER BY legacy) FROM ra_on.dbo.ra_t;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+EXPLAIN SELECT string_agg(CAST(n AS VARCHAR)) FROM ra_on.dbo.ra_t;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
 # ROLLUP / GROUPING SETS / GROUP BY ALL.
 query II
 EXPLAIN SELECT g, count(*) FROM ra_on.dbo.ra_t GROUP BY ROLLUP (g);
@@ -353,7 +523,7 @@ EXPLAIN SELECT g, count(*) FROM ra_on.dbo.ra_t GROUP BY ALL;
 physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
 
 statement ok
-SELECT mssql_exec('ra_off', 'DROP TABLE dbo.ra_t, dbo.ra_e');
+SELECT mssql_exec('ra_off', 'DROP TABLE dbo.ra_t, dbo.ra_e, dbo.ra_s');
 
 statement ok
 DETACH ra_on;

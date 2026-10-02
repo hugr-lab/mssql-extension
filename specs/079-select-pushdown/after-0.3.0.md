@@ -71,6 +71,12 @@ order of priority yet.
   same catalog inside a CTE or a subquery could be inlined as a derived table
   (its describe gives the types, its parameters merge with ours; refuse T-SQL
   that cannot nest: ORDER BY without TOP, several statements, DECLARE).
+- **`IGNORE NULLS` in a window (`last_value(x IGNORE NULLS)`, the
+  forward-fill idiom).** The server takes it from SQL Server 2022 and refuses
+  it as a syntax error before; the extension keeps only the TDS version, which
+  is the same from 2012 on. Vetoed in E2; the product version LOGINACK already
+  carries, kept on the connection, would let a 2022+ server take it (owner,
+  E2).
 - **A correlated scalar subquery on a string key against an outer column.**
   Vetoed unless the key meets a constant (an outer varchar against an
   nvarchar compares under other rules); a same-type, same-collation outer

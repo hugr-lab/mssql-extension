@@ -84,7 +84,10 @@ bool AggregateFor(const std::string &function_name, AggregateKind &out) {
 																		{"stddev_pop", AggregateKind::StdevP},
 																		{"variance", AggregateKind::Var},
 																		{"var_samp", AggregateKind::Var},
-																		{"var_pop", AggregateKind::VarP}};
+																		{"var_pop", AggregateKind::VarP},
+																		{"string_agg", AggregateKind::StringAgg},
+																		{"group_concat", AggregateKind::StringAgg},
+																		{"listagg", AggregateKind::StringAgg}};
 	for (auto &aggregate : AGGREGATES) {
 		if (StringUtil::CIEquals(function_name, aggregate.first)) {
 			out = aggregate.second;

@@ -378,9 +378,62 @@ int main() {
 	ExpectVeto("SELECT max(ts) FROM t");	// datetime2(7) is off the order list
 	ExpectVeto("SELECT sum(flag) FROM t");	// bit
 	ExpectVeto("SELECT sum(name) FROM t");
-	ExpectVeto("SELECT count(*) FILTER (WHERE id > 1) FROM t");
-	ExpectVeto("SELECT string_agg(name, ',') FROM t");	// not in the table
-	ExpectVeto("SELECT sum(id / 2) FROM t");			// inf here, a skipped NULL there
+	// FILTER as CASE (PR E2): a row the condition does not take is a NULL the
+	// aggregate skips; COUNT(*) counts the CASE's 1s.
+	ExpectSql("SELECT count(*) FILTER (WHERE id > 1) AS c, sum(id) FILTER (WHERE flag) AS s FROM t",
+
+			  "SELECT COUNT_BIG(CASE WHEN ([id] > 1) THEN 1 END) AS [c], SUM(CAST(CASE WHEN ([flag] = 1) THEN [id] END "
+			  "AS decimal(38,0))) AS [s] FROM [dbo].[t]",
+			  false);
+	ExpectSql(
+		"SELECT count(DISTINCT day) FILTER (WHERE amount IS NOT NULL) AS c, max(amount) FILTER (WHERE id < 3) AS m "
+		"FROM t",
+
+		"SELECT COUNT_BIG(DISTINCT CASE WHEN ([amount] IS NOT NULL) THEN [day] END) AS [c], MAX(CASE WHEN ([id] < 3) "
+		"THEN [amount] END) AS [m] FROM [dbo].[t]",
+		false);
+	ExpectVeto("SELECT count(*) FILTER (WHERE count(*) > 1) FROM t");  // an aggregate in the filter
+	ExpectSql(
+		"SELECT avg(id) FILTER (WHERE flag) AS a, max(flag) FILTER (WHERE id > 1) AS m, count(1) FILTER (WHERE id > 2) "
+		"AS c FROM t",
+
+		"SELECT CAST(SUM(CAST(CASE WHEN ([flag] = 1) THEN [id] END AS decimal(38,0))) AS float) / COUNT_BIG(CASE WHEN "
+		"([flag] = 1) THEN [id] END) AS [a], CAST(MAX(CAST(CASE WHEN ([id] > 1) THEN [flag] END AS tinyint)) AS bit) "
+		"AS [m], COUNT_BIG(CASE WHEN ([id] > 2) THEN 1 END) AS [c] FROM [dbo].[t]",
+		false);
+	ExpectVeto("SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM u)) FROM t");					   // 130 there
+	ExpectVeto("SELECT count(*) FILTER (WHERE id IN (SELECT t_id FROM u)) FROM t");					   // 130 there
+	ExpectVeto("SELECT id FROM t WHERE id IN (SELECT count(*) FILTER (WHERE u.t_id = t.id) FROM u)");  // 8124
+	ExpectSql(
+		"SELECT string_agg(name ORDER BY id, id DESC) AS a, string_agg(legacy ORDER BY id) AS b FROM t",
+		"SELECT STRING_AGG(CAST([name] AS nvarchar(max)), N',') WITHIN GROUP (ORDER BY [id] ASC) AS [a], "
+		"STRING_AGG(CAST([legacy] AS nvarchar(max)), N',') WITHIN GROUP (ORDER BY [id] ASC) AS [b] FROM [dbo].[t]",
+		false);	 // a repeated key once; one order shared by both
+	ExpectVeto("SELECT string_agg(name ORDER BY count(*)) FROM t");
+	ExpectVeto("SELECT count(*) FILTER (WHERE id / 2 > 1) FROM t");	 // a division in a condition
+	// string_agg (PR E2): over nvarchar(max), one WITHIN GROUP order per node.
+	ExpectSql("SELECT string_agg(name, ';') AS a FROM t",
+			  "SELECT STRING_AGG(CAST([name] AS nvarchar(max)), N';') AS [a] FROM [dbo].[t]", false);
+	ExpectSql("SELECT string_agg(legacy ORDER BY id DESC) AS a, string_agg(name) AS b FROM t",
+			  "SELECT STRING_AGG(CAST([legacy] AS nvarchar(max)), N',') WITHIN GROUP (ORDER BY [id] DESC) AS [a], "
+			  "STRING_AGG(CAST([name] AS nvarchar(max)), N',') AS [b] FROM [dbo].[t]",
+			  false);
+	ExpectSql(
+		"SELECT string_agg(name, ',' ORDER BY code) FILTER (WHERE id > 1) AS a FROM t",
+		"SELECT STRING_AGG(CASE WHEN ([id] > 1) THEN CAST([name] AS nvarchar(max)) END, N',') WITHIN GROUP (ORDER BY "
+		"CASE WHEN [code] IS NULL THEN 1 ELSE 0 END, CAST([code] AS varbinary(20)) ASC) AS [a] FROM [dbo].[t]",
+		false);
+	ExpectSql("SELECT string_agg(name ORDER BY day) AS a FROM t",
+			  "SELECT STRING_AGG(CAST([name] AS nvarchar(max)), N',') WITHIN GROUP (ORDER BY CASE WHEN [day] IS NULL "
+			  "THEN 1 ELSE 0 END, [day] ASC) AS [a] FROM [dbo].[t]",
+			  false);  // NULL placement emulated
+	ExpectVeto("SELECT string_agg(DISTINCT name) FROM t");
+	ExpectVeto("SELECT string_agg(name ORDER BY id), string_agg(legacy ORDER BY day) FROM t");	// 8711
+	ExpectVeto("SELECT string_agg(name ORDER BY legacy) FROM t");  // a code-page varchar's order
+	ExpectVeto("SELECT string_agg(name, code) FROM t");			   // a separator that is not a constant
+	ExpectVeto("SELECT string_agg(doc) FROM t");
+	ExpectVeto("SELECT string_agg(name) FROM t HAVING string_agg(name) = 'a'");	 // no comparison (D4)
+	ExpectVeto("SELECT sum(id / 2) FROM t");									 // inf here, a skipped NULL there
 	ExpectVeto("SELECT sum(sum(id)) FROM t");
 	ExpectVeto("SELECT id FROM t WHERE count(*) > 1");	// an aggregate in WHERE
 	ExpectVeto("SELECT id, count(*) FROM t");			// DuckDB's binder error, not the server's

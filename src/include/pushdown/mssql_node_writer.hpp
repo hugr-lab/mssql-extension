@@ -116,7 +116,7 @@ struct OutputColumn {
 constexpr size_t MAX_DERIVED_SQL = 1 << 20;
 
 //! The aggregates the writer renders, by DuckDB name.
-enum class AggregateKind { CountStar, Count, Sum, Avg, Min, Max, Stdev, StdevP, Var, VarP };
+enum class AggregateKind { CountStar, Count, Sum, Avg, Min, Max, Stdev, StdevP, Var, VarP, StringAgg };
 
 bool AggregateFor(const std::string &function_name, AggregateKind &out);
 
@@ -254,6 +254,7 @@ private:
 	bool WriteGroups(const SelectNode &node, std::string &sql);
 	bool GroupKeyColumn(const SelectNode &node, const ParsedExpression &key, idx_t &out);
 	bool WriteAggregate(const FunctionExpression &fn, AggregateKind kind, Operand &out);
+	bool WriteStringAgg(const FunctionExpression &fn, const Operand &arg, const std::string &filter, Operand &out);
 	bool WriteSelectList(const SelectNode &node);
 	bool WritePredicate(const ParsedExpression &expr, std::string &sql);
 	bool WritePredicateImpl(const ParsedExpression &expr, std::string &sql);
@@ -311,6 +312,12 @@ private:
 	//! a USING column of the right side only once (on the left).
 	bool IsHiddenUsingColumn(idx_t index) const;
 	bool WriteOrder(const OrderModifier &order, bool limited, std::string &sql);
+	//! The ORDER BY of an ordered aggregate (`string_agg(x, ',' ORDER BY k)`)
+	//! or of a window: keys named from the FROM, never a result name or a
+	//! position. The server sorts these rows whatever the key, so a UTF-8
+	//! varchar goes by its bytes and NULL placement is emulated without the
+	//! LIMIT a statement's ORDER BY needs for either (spec 079 PR E2).
+	bool WriteSortKeys(const std::vector<OrderByNode> &orders, std::string &sql);
 	bool ConstantCount(const ParsedExpression &expr, int64_t &out);
 
 	const SQLWriterOptions &options_;
@@ -423,6 +430,10 @@ private:
 	//! Writing an aggregate's argument.
 	bool in_aggregate_ = false;
 	bool distinct_ = false;
+	//! The WITHIN GROUP order of the node's first ordered string_agg: the
+	//! server refuses two different ones in one scope (8711).
+	bool string_agg_ordered_ = false;
+	std::string string_agg_order_;
 	SqlParamSet own_params_;
 	std::vector<Value> own_param_values_;
 	SqlParamSet *params_;
