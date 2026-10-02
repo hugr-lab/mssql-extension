@@ -457,6 +457,30 @@ int main() {
 	ExpectVeto("SELECT row_number() OVER (PARTITION BY id % 2 ORDER BY id) FROM t");  // an expression
 	ExpectVeto("SELECT nth_value(id, 2) OVER (ORDER BY id) FROM t");
 	ExpectVeto("SELECT id FROM t WHERE row_number() OVER (ORDER BY id) = 1");
+	// QUALIFY (PR E2): a wrapper over the node, its condition a hidden bit.
+	ExpectSql("SELECT id, row_number() OVER (PARTITION BY day ORDER BY id) AS rn FROM t QUALIFY rn = 1",
+			  "SELECT [r1].[id] AS [id], [r1].[rn] AS [rn] FROM (SELECT [id], ROW_NUMBER() OVER (PARTITION BY [day] "
+			  "ORDER BY [id] ASC) AS [rn] FROM [dbo].[t]) AS [r1] WHERE ([r1].[rn] = 1)",
+			  false);
+	ExpectSql("SELECT id FROM t QUALIFY lag(id) OVER (ORDER BY id) IS NULL ORDER BY id LIMIT 3",
+			  "SELECT TOP (3) [r1].[id] AS [id] FROM (SELECT [id], CAST(CASE WHEN (LAG([id]) OVER (ORDER BY [id] ASC) "
+			  "IS NULL) THEN 1 ELSE 0 END AS bit) AS [mssql_qualify] FROM [dbo].[t]) AS [r1] WHERE "
+			  "([r1].[mssql_qualify] = 1) ORDER BY [r1].[id] ASC",
+			  false);
+	ExpectVeto("SELECT id AS mssql_qualify FROM t QUALIFY row_number() OVER (ORDER BY id) = 1");	   // the name
+	ExpectVeto("SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id) = 1 ORDER BY day LIMIT 3");   // not a result
+	ExpectVeto("SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id) = 1 ORDER BY t.id LIMIT 3");  // qualified
+	ExpectVeto(
+		"SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id) = 1 ORDER BY id + 1 LIMIT 3");	   // an expression
+	ExpectVeto("SELECT id, row_number() OVER (ORDER BY day) AS rn FROM t QUALIFY rn = 1 AND id > 0");  // twice
+	ExpectVeto("SELECT id AS day, row_number() OVER (ORDER BY id) AS rn FROM t QUALIFY day IS NULL");  // a column too
+	ExpectSql(
+		"SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id) = 1 AND EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id)",
+
+		"SELECT [r1].[id] AS [id] FROM (SELECT [r2].[id] AS [id], CAST(CASE WHEN ((ROW_NUMBER() OVER (ORDER BY "
+		"[r2].[id] ASC) = 1) AND EXISTS (SELECT 1 AS [1] FROM [dbo].[u] AS [r3] WHERE ([r3].[t_id] = [r2].[id]))) THEN "
+		"1 ELSE 0 END AS bit) AS [mssql_qualify] FROM [dbo].[t] AS [r2]) AS [r1] WHERE ([r1].[mssql_qualify] = 1)",
+		false);	 // a correlated QUALIFY: every name qualified
 	// A window over a division keeps its NULL-at-zero (review of E2).
 	ExpectVeto("SELECT coalesce(lag(id / 2) OVER (ORDER BY id), 0) FROM t");
 	ExpectVeto("SELECT * FROM (SELECT id, lag(id / 2) OVER (ORDER BY id) AS l FROM t) d WHERE l IS NULL");

@@ -388,7 +388,12 @@ bool NodeWriter::CollectDerivedNode(const QueryNode &node, const std::string &na
 		inner.cte_parent_limit_ = cte_index;
 		inner.in_expression_ = per_row;
 	}
-	if (synthetic ? !inner.WriteSetOperation(*synthetic_setop_) : !inner.WriteQueryNode(node)) {
+	if (synthetic && synthetic_select_) {
+		inner.qualifying_ = true;
+		inner.qualify_names_ = qualify_names_;
+	}
+	if (synthetic ? (synthetic_select_ ? !inner.Write(*synthetic_select_) : !inner.WriteSetOperation(*synthetic_setop_))
+				  : !inner.WriteQueryNode(node)) {
 		out_.refers_outside = out_.refers_outside || inner_out.refers_outside;
 		return false;
 	}

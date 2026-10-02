@@ -187,18 +187,41 @@ bool NodeWriter::WriteValue(const ParsedExpression &expr, Operand &out) {
 	case ExpressionClass::COLUMN_REF: {
 		idx_t index;
 		auto &ref = expr.Cast<ColumnRefExpression>();
-		if (outer_ && MayBeOuter(ref, FindColumn(ref, index))) {
-			// Not a column here: a correlated one of a node around it.
-			bool found = false;
-			if (!WriteOuterColumn(ref, out, found)) {
-				return false;
-			}
-			if (found) {
-				return true;
+		const OutputColumn *alias = nullptr;
+		if (qualify_aliases_ && ref.ColumnNames().size() == 1 && FindColumn(ref, index) == 0) {
+			// QUALIFY naming a select-list alias (no FROM column has the name).
+			for (auto &output : outputs_) {
+				if (StringUtil::CIEquals(output.name, ref.GetColumnName().GetIdentifierName())) {
+					alias = &output;
+					break;
+				}
 			}
 		}
-		if (!ResolveColumn(ref, index)) {
-			return false;
+		if (alias && alias->column_index == DConstants::INVALID_INDEX) {
+			if ((alias->value.division || alias->value.approximate) && predicate_depth_ > 0) {
+				// As a condition on the expression itself would be (review of E2).
+				return Veto("a division / floating-point value in QUALIFY");
+			}
+			out = alias->value;
+			qualify_named_alias_ = true;
+			return true;
+		}
+		if (alias) {
+			index = alias->column_index;
+		} else {
+			if (outer_ && MayBeOuter(ref, FindColumn(ref, index))) {
+				// Not a column here: a correlated one of a node around it.
+				bool found = false;
+				if (!WriteOuterColumn(ref, out, found)) {
+					return false;
+				}
+				if (found) {
+					return true;
+				}
+			}
+			if (!ResolveColumn(ref, index)) {
+				return false;
+			}
 		}
 		if (!CheckGrouped(index)) {
 			return false;

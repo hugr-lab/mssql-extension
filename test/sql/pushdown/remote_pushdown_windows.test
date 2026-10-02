@@ -277,6 +277,210 @@ SELECT id, count(*) OVER (PARTITION BY c) FROM rw_off.dbo.rw_t WHERE id <= 3 ORD
 2	1
 3	1
 
+# QUALIFY on an alias: the wrapper filters the derived table on its column, the
+# window evaluated once.
+query II
+EXPLAIN SELECT id, g, row_number() OVER (PARTITION BY g ORDER BY id DESC) AS rn FROM rw_on.dbo.rw_t QUALIFY rn = 1 ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*FROM \(SELECT \[id\], \[g\], ROW_NUMBER\(\) OVER \(PARTITION BY \[g\] ORDER BY \[id\] DESC\) AS \[rn\] FROM \[dbo\]\.\[rw_t\]\) AS \[r1\] WHERE \(\[r1\]\.\[rn\] = @p0\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, g, row_number() OVER (PARTITION BY g ORDER BY id DESC) AS rn FROM rw_on.dbo.rw_t QUALIFY rn = 1 ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, g, row_number() OVER (PARTITION BY g ORDER BY id DESC) AS rn FROM rw_off.dbo.rw_t QUALIFY rn = 1 ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# A FROM column comes before an alias of its name (DuckDB's order); NULL drops the row.
+query II
+EXPLAIN SELECT id, x * 0 AS x FROM rw_on.dbo.rw_t QUALIFY x > 3 AND lag(x) OVER (ORDER BY id) IS NOT NULL ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*CASE WHEN \(\(\[x\] > @p\d\) AND \(LAG\(\[x\]\) OVER \(ORDER BY \[id\] ASC\) IS NOT NULL\)\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, x * 0 AS x FROM rw_on.dbo.rw_t QUALIFY x > 3 AND lag(x) OVER (ORDER BY id) IS NOT NULL ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, x * 0 AS x FROM rw_off.dbo.rw_t QUALIFY x > 3 AND lag(x) OVER (ORDER BY id) IS NOT NULL ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# DISTINCT / ORDER BY / LIMIT apply after QUALIFY: on the wrapper.
+query II
+EXPLAIN SELECT DISTINCT g FROM rw_on.dbo.rw_t QUALIFY row_number() OVER (ORDER BY id) <= 5 ORDER BY g NULLS FIRST LIMIT 10;
+----
+physical_plan	<REGEX>:.*SELECT DISTINCT TOP \(10\) \[r1\]\.\[g\] AS \[g\] FROM \(SELECT \[g\], CAST\(CASE WHEN.*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT DISTINCT g FROM rw_on.dbo.rw_t QUALIFY row_number() OVER (ORDER BY id) <= 5 ORDER BY g NULLS FIRST LIMIT 10;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT DISTINCT g FROM rw_off.dbo.rw_t QUALIFY row_number() OVER (ORDER BY id) <= 5 ORDER BY g NULLS FIRST LIMIT 10;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# A QUALIFY over a join, with a subquery in its condition.
+query II
+EXPLAIN SELECT a.id, b.g FROM rw_on.dbo.rw_t a JOIN rw_on.dbo.rw_t b ON a.id = b.id QUALIFY row_number() OVER (PARTITION BY b.g ORDER BY a.id) = 1 AND a.id IN (SELECT id FROM rw_on.dbo.rw_t WHERE x IS NOT NULL) ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*AS \[mssql_qualify\] FROM \[dbo\]\.\[rw_t\] AS \[r2\] INNER JOIN.*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT a.id, b.g FROM rw_on.dbo.rw_t a JOIN rw_on.dbo.rw_t b ON a.id = b.id QUALIFY row_number() OVER (PARTITION BY b.g ORDER BY a.id) = 1 AND a.id IN (SELECT id FROM rw_on.dbo.rw_t WHERE x IS NOT NULL) ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT a.id, b.g FROM rw_off.dbo.rw_t a JOIN rw_off.dbo.rw_t b ON a.id = b.id QUALIFY row_number() OVER (PARTITION BY b.g ORDER BY a.id) = 1 AND a.id IN (SELECT id FROM rw_off.dbo.rw_t WHERE x IS NOT NULL) ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# A QUALIFY under a *, an aggregate window.
+query II
+EXPLAIN SELECT * FROM rw_on.dbo.rw_t QUALIFY sum(x) OVER (PARTITION BY g) > 10 ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*CASE WHEN \(SUM\(CAST\(\[x\] AS decimal\(38,0\)\)\) OVER \(PARTITION BY \[g\]\) > @p0\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT * FROM rw_on.dbo.rw_t QUALIFY sum(x) OVER (PARTITION BY g) > 10 ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT * FROM rw_off.dbo.rw_t QUALIFY sum(x) OVER (PARTITION BY g) > 10 ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# A filter around a derived table's window: the gain the scan path cannot have.
+query II
+EXPLAIN SELECT * FROM (SELECT id, g, row_number() OVER (PARTITION BY g ORDER BY id) AS rn FROM rw_on.dbo.rw_t) t WHERE rn = 1;
+----
+physical_plan	<REGEX>:.*WHERE \(\[r1\]\.\[rn\] = @p0\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT * FROM (SELECT id, g, row_number() OVER (PARTITION BY g ORDER BY id) AS rn FROM rw_on.dbo.rw_t) t WHERE rn = 1;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT * FROM (SELECT id, g, row_number() OVER (PARTITION BY g ORDER BY id) AS rn FROM rw_off.dbo.rw_t) t WHERE rn = 1;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# Any other condition: the node's hidden bit column, the wrapper keeping the 1s.
+query II
+EXPLAIN SELECT id, g FROM rw_on.dbo.rw_t QUALIFY row_number() OVER (PARTITION BY g ORDER BY x DESC NULLS LAST, id) = 1 ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*CAST\(CASE WHEN \(ROW_NUMBER\(\) OVER \(PARTITION BY \[g\] ORDER BY \[x\] DESC, \[id\] ASC\) = @p0\) THEN 1 ELSE 0 END AS bit\) AS \[mssql_qualify\] FROM \[dbo\]\.\[rw_t\]\) AS \[r1\] WHERE \(\[r1\]\.\[mssql_qualify\] = 1\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, g FROM rw_on.dbo.rw_t QUALIFY row_number() OVER (PARTITION BY g ORDER BY x DESC NULLS LAST, id) = 1 ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, g FROM rw_off.dbo.rw_t QUALIFY row_number() OVER (PARTITION BY g ORDER BY x DESC NULLS LAST, id) = 1 ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# A correlated subquery in QUALIFY over one table: the outer column qualified (review of E2: a bare [id] bound to the subquery's own).
+query II
+EXPLAIN SELECT id, x FROM rw_on.dbo.rw_t t QUALIFY row_number() OVER (ORDER BY id) <= 6 AND EXISTS (SELECT 1 FROM rw_on.dbo.rw_t u WHERE u.id = t.id + 1 AND u.x IS NOT NULL) ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*EXISTS \(SELECT 1 AS \[1\] FROM \[dbo\]\.\[rw_t\] AS \[r3\] WHERE \(\(\[r3\]\.\[id\] = \(\[r2\]\.\[id\] \+ @p\d\)\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, x FROM rw_on.dbo.rw_t t QUALIFY row_number() OVER (ORDER BY id) <= 6 AND EXISTS (SELECT 1 FROM rw_on.dbo.rw_t u WHERE u.id = t.id + 1 AND u.x IS NOT NULL) ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, x FROM rw_off.dbo.rw_t t QUALIFY row_number() OVER (ORDER BY id) <= 6 AND EXISTS (SELECT 1 FROM rw_off.dbo.rw_t u WHERE u.id = t.id + 1 AND u.x IS NOT NULL) ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# A CTE shadowing its table: the body reads the table (review of E2: it saw itself).
+query II
+EXPLAIN WITH rw_t AS (SELECT id, x + 1 AS x FROM rw_on.dbo.rw_t) SELECT id, x FROM rw_t QUALIFY row_number() OVER (ORDER BY id) <= 3 ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*FROM \(SELECT \[id\], \(\[x\] \+ @p0\) AS \[x\] FROM \[dbo\]\.\[rw_t\]\) AS \[r2\].*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS WITH rw_t AS (SELECT id, x + 1 AS x FROM rw_on.dbo.rw_t) SELECT id, x FROM rw_t QUALIFY row_number() OVER (ORDER BY id) <= 3 ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS WITH rw_t AS (SELECT id, x + 1 AS x FROM rw_off.dbo.rw_t) SELECT id, x FROM rw_t QUALIFY row_number() OVER (ORDER BY id) <= 3 ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# A rank's alias beside a row_number in the condition (a rank's ties are its peers).
+query II
+EXPLAIN SELECT id, g, rank() OVER (ORDER BY k) AS rk FROM rw_on.dbo.rw_t QUALIFY rk <= 3 AND row_number() OVER (ORDER BY id) > 1 ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*AS \[rk\], CAST\(CASE WHEN \(\(RANK\(\) OVER.*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, g, rank() OVER (ORDER BY k) AS rk FROM rw_on.dbo.rw_t QUALIFY rk <= 3 AND row_number() OVER (ORDER BY id) > 1 ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, g, rank() OVER (ORDER BY k) AS rk FROM rw_off.dbo.rw_t QUALIFY rk <= 3 AND row_number() OVER (ORDER BY id) > 1 ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
+# Vetoed under QUALIFY: an ORDER BY expression or window (DuckDB evaluates it
+# before QUALIFY, over every row, and binds a name in it to the FROM first),
+# a tie-dependent window evaluated twice (the alias's and the condition's).
+query II
+EXPLAIN SELECT id, x FROM rw_on.dbo.rw_t QUALIFY row_number() OVER (ORDER BY x) <> 2 ORDER BY ntile(2) OVER (ORDER BY x), id DESC LIMIT 1;
+----
+physical_plan	<!REGEX>:.*mssql_qualify.*
+
+query II
+EXPLAIN SELECT id, x * 0 AS x FROM rw_on.dbo.rw_t QUALIFY row_number() OVER (ORDER BY id) <= 10 ORDER BY x + id LIMIT 3;
+----
+physical_plan	<!REGEX>:.*mssql_qualify.*
+
+query II
+EXPLAIN SELECT id, g, row_number() OVER (PARTITION BY g ORDER BY k) AS rn FROM rw_on.dbo.rw_t QUALIFY rn = 1 AND id > 0 ORDER BY id LIMIT 100;
+----
+physical_plan	<!REGEX>:.*mssql_qualify.*
+
+# The wrapper's ORDER BY sees the node's result columns only, by their names:
+# a FROM column outside them, or one qualified by its table (`a.id`), hands
+# the node back (its parts pushed), rows still DuckDB's.
+query II
+EXPLAIN SELECT id, g FROM rw_on.dbo.rw_t QUALIFY row_number() OVER (PARTITION BY g ORDER BY id) = 1 ORDER BY k LIMIT 5;
+----
+physical_plan	<!REGEX>:.*mssql_qualify.*
+
+query II
+SELECT id, g FROM rw_on.dbo.rw_t QUALIFY row_number() OVER (PARTITION BY g ORDER BY id) = 1 ORDER BY k NULLS LAST, id LIMIT 5;
+----
+5	2
+1	1
+8	3
+
 #
 # Vetoes: the catalog scan, DuckDB's rows.
 #

@@ -121,7 +121,8 @@ bool HasSubqueryExpression(const SelectNode &node) {
 			return true;
 		}
 	}
-	if ((node.where_clause && node.where_clause->HasSubquery()) || (node.having && node.having->HasSubquery())) {
+	if ((node.where_clause && node.where_clause->HasSubquery()) || (node.having && node.having->HasSubquery()) ||
+		(node.qualify && node.qualify->HasSubquery())) {
 		return true;
 	}
 	for (auto &modifier : node.modifiers) {

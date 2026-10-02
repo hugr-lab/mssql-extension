@@ -476,8 +476,10 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 				return Veto("a * of a SEMI / ANTI join's table");
 			}
 			for (idx_t i = 0; i < columns_.size(); i++) {
-				if (only != DConstants::INVALID_INDEX ? relation_of_[i] != only
-													  : IsHiddenUsingColumn(i) || relations_[relation_of_[i]].semi) {
+				if (only != DConstants::INVALID_INDEX
+						? relation_of_[i] != only
+						: IsHiddenUsingColumn(i) || relations_[relation_of_[i]].semi ||
+							  (!hidden_column_.empty() && columns_[i].name == hidden_column_)) {
 					continue;
 				}
 				if (!add(i, "")) {
@@ -724,6 +726,11 @@ bool NodeWriter::WriteOrder(const OrderModifier &order, bool limited, std::strin
 }
 
 bool NodeWriter::Write(const SelectNode &node) {
+	if (node.qualify && !qualifying_) {
+		// Before the CTEs: the node's own writer registers them, once (review
+		// of E2: registered on the wrapper too, a body saw itself).
+		return WriteQualified(node);
+	}
 	for (auto &cte : node.cte_map.map) {
 		auto &info = *cte.second;
 		if (!info.query_node || !info.aliases.empty() || !info.key_targets.empty() ||
@@ -735,8 +742,8 @@ bool NodeWriter::Write(const SelectNode &node) {
 	if (node.aggregate_handling != AggregateHandling::STANDARD_HANDLING) {
 		return Veto("GROUP BY ALL");
 	}
-	if (node.qualify || node.sample) {
-		return Veto("QUALIFY / USING SAMPLE");
+	if (node.sample) {
+		return Veto("USING SAMPLE");
 	}
 	if (!node.from_table) {
 		return Veto("no FROM");
@@ -776,7 +783,8 @@ bool NodeWriter::Write(const SelectNode &node) {
 
 	const OrderModifier *order = nullptr;
 	const LimitModifier *limit = nullptr;
-	for (idx_t i = 0; i < node.modifiers.size(); i++) {
+	// Inside a QUALIFY wrapper the modifiers are the wrapper's.
+	for (idx_t i = 0; i < (qualifying_ ? 0 : node.modifiers.size()); i++) {
 		auto &modifier = node.modifiers[i];
 		// The parser puts DISTINCT first; DISTINCT ON is DuckDB's own.
 		if (modifier->type == ResultModifierType::DISTINCT_MODIFIER && i == 0 &&
@@ -819,7 +827,7 @@ bool NodeWriter::Write(const SelectNode &node) {
 	if (!WriteGroups(node, group_sql)) {
 		return false;
 	}
-	aggregated_ = aggregated_ || node.having;
+	aggregated_ = aggregated_ || node.having || (qualifying_ && ContainsAggregate(*node.qualify));
 	for (auto &item : node.select_list) {
 		aggregated_ = aggregated_ || ContainsAggregate(*item);
 	}
@@ -833,6 +841,9 @@ bool NodeWriter::Write(const SelectNode &node) {
 					 (top ? "TOP (" + std::to_string(limit_value) + ") " : "");
 	after_grouping_ = true;
 	if (!WriteSelectList(node)) {
+		return false;
+	}
+	if (qualifying_ && !WriteQualifyColumn(node)) {
 		return false;
 	}
 	if (distinct_) {

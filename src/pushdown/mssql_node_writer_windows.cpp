@@ -1,12 +1,21 @@
 #include "pushdown/mssql_node_writer.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 namespace mssql {
 namespace node_writer {
+
+//! The QUALIFY wrapper's hidden column.
+static constexpr const char *QUALIFY_COLUMN = "mssql_qualify";
 
 // A window function (spec 079 PR E2), measured equal against DuckDB on SQL
 // Server 2025: ROW_NUMBER / RANK / DENSE_RANK / NTILE, LAG / LEAD with an
@@ -69,6 +78,7 @@ bool NodeWriter::WriteWindow(const WindowExpression &window, Operand &out) {
 						 type == ExpressionType::WINDOW_LEAD || type == ExpressionType::WINDOW_FIRST_VALUE ||
 						 type == ExpressionType::WINDOW_LAST_VALUE;
 	out_.picks_rows = out_.picks_rows || by_rows;
+	tie_windows_ += by_rows ? 1 : 0;
 	if (framed && order.empty()) {
 		// A ROWS / RANGE frame needs an ORDER BY there.
 		return Veto("a window frame without an ORDER BY");
@@ -266,6 +276,118 @@ bool NodeWriter::WriteWindowFrame(const WindowExpression &window, std::string &s
 		return Veto("a window frame that starts after it ends");
 	}
 	sql = std::string(rows ? "ROWS" : "RANGE") + " BETWEEN " + from + " AND " + to;
+	return true;
+}
+
+// QUALIFY (PR E2): T-SQL has none, so the node is written as a derived table
+// and a wrapper keeps the rows QUALIFY keeps, then applies the node's DISTINCT /
+// ORDER BY / LIMIT, which DuckDB applies after QUALIFY. A condition on
+// select-list aliases only (`QUALIFY rn = 1`) is the wrapper's WHERE on the
+// derived table's columns, the window evaluated once; any other is the node's
+// last result column -- `CASE WHEN <qualify> THEN 1 ELSE 0 END`, a bit (a NULL
+// condition drops the row, as QUALIFY does) -- and the wrapper keeps the 1s.
+// The wrapper's ORDER BY takes a result column's name or position only: its
+// rows are QUALIFY's, where DuckDB evaluates a window in ORDER BY before it and
+// binds a name inside an expression to the FROM first (review of E2).
+// Measured equal against DuckDB, PR E2.
+bool NodeWriter::WriteQualified(const SelectNode &node) {
+	auto select = make_uniq<SelectNode>();
+	for (auto &modifier : node.modifiers) {
+		if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
+			for (auto &order : modifier->Cast<OrderModifier>().orders) {
+				auto &key = *order.expression;
+				const bool column = key.GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+									key.Cast<ColumnRefExpression>().ColumnNames().size() == 1;
+				const bool position = key.GetExpressionClass() == ExpressionClass::CONSTANT;
+				if (!column && !position) {
+					return Veto("ORDER BY " + key.ToString() + " under QUALIFY");
+				}
+			}
+		}
+		select->modifiers.push_back(modifier->Copy());
+	}
+	select->select_list.push_back(make_uniq<StarExpression>());
+	// On aliases only: every name in the condition is one, and nothing in it
+	// is evaluated per row of the node (a window, a subquery).
+	std::vector<std::string> names;
+	bool on_aliases = !node.qualify->IsWindow() && !node.qualify->HasSubquery();
+	std::function<void(const ParsedExpression &)> collect = [&](const ParsedExpression &expr) {
+		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &ref = expr.Cast<ColumnRefExpression>();
+			bool alias = false;
+			for (auto &item : node.select_list) {
+				alias = alias || (ref.ColumnNames().size() == 1 &&
+								  StringUtil::CIEquals(item->GetAlias().GetIdentifierName(),
+													   ref.GetColumnName().GetIdentifierName()));
+			}
+			on_aliases = on_aliases && alias;
+			names.push_back(ref.GetColumnName().GetIdentifierName());
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(expr, collect);
+	};
+	collect(*node.qualify);
+	on_aliases = on_aliases && !names.empty();
+	select->where_clause =
+		on_aliases ? node.qualify->Copy() : make_uniq<ColumnRefExpression>(Identifier(QUALIFY_COLUMN));
+	// The node itself is written from `node` (CollectDerivedNode); the
+	// placeholder only gives the subquery a node.
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = make_uniq<SelectNode>();
+	select->from_table = make_uniq<SubqueryRef>(std::move(statement));
+	synthetic_ref_ = &select->from_table->Cast<SubqueryRef>();
+	synthetic_select_ = &node;
+	if (on_aliases) {
+		qualify_names_ = std::move(names);
+	} else {
+		hidden_column_ = QUALIFY_COLUMN;
+	}
+	synthetic_node_ = std::move(select);
+	return Write(*synthetic_node_);
+}
+
+bool NodeWriter::WriteQualifyColumn(const SelectNode &node) {
+	if (!qualify_names_.empty()) {
+		// The wrapper filters on the aliases -- which DuckDB reads as FROM
+		// columns when one has the name.
+		for (auto &name : qualify_names_) {
+			idx_t index;
+			if (FindColumn(ColumnRefExpression(Identifier(name)), index) != 0) {
+				return Veto("QUALIFY on " + name + ", a FROM column and an alias");
+			}
+		}
+		return true;
+	}
+	for (auto &output : outputs_) {
+		if (StringUtil::CIEquals(output.name, QUALIFY_COLUMN)) {
+			return Veto("a result column named " + std::string(QUALIFY_COLUMN));
+		}
+	}
+	const idx_t select_ties = tie_windows_;
+	std::string condition;
+	qualify_aliases_ = true;
+	const bool written = WritePredicate(*node.qualify, condition);
+	qualify_aliases_ = false;
+	if (!written) {
+		return false;
+	}
+	if (select_ties > 0 && (tie_windows_ > select_ties || qualify_named_alias_)) {
+		// The select list's window and the condition's are evaluated apart
+		// there, once here: ties could be broken two ways (review of E2).
+		return Veto("a tie-dependent window evaluated twice under QUALIFY");
+	}
+	out_.statement +=
+		", CAST(CASE WHEN " + condition + " THEN 1 ELSE 0 END AS bit) AS " + QuoteIdentifier(QUALIFY_COLUMN);
+	out_.column_types.push_back(LogicalType::BOOLEAN);
+	out_.cast_types.push_back(LogicalType::INVALID);
+	out_.column_names.push_back(QUALIFY_COLUMN);
+	OutputColumn entry;
+	entry.name = QUALIFY_COLUMN;
+	entry.column_index = DConstants::INVALID_INDEX;
+	entry.value.type = entry.value.result_type = LogicalType::BOOLEAN;
+	entry.value.kind = ComparableKind::Boolean;
+	entry.value.not_null = true;
+	outputs_.push_back(std::move(entry));
 	return true;
 }
 

@@ -276,6 +276,11 @@ private:
 	//! A window function (spec 079 PR E2): mssql_node_writer_windows.cpp.
 	bool WriteWindow(const WindowExpression &window, Operand &out);
 	bool WriteWindowFrame(const WindowExpression &window, std::string &sql);
+	//! A node with QUALIFY (PR E2): `SELECT * FROM (<the node, its QUALIFY a
+	//! hidden bit column>) WHERE <it>` with the node's DISTINCT / ORDER BY /
+	//! LIMIT, which DuckDB applies after QUALIFY.
+	bool WriteQualified(const SelectNode &node);
+	bool WriteQualifyColumn(const SelectNode &node);
 	bool WriteSelectList(const SelectNode &node);
 	bool WritePredicate(const ParsedExpression &expr, std::string &sql);
 	bool WritePredicateImpl(const ParsedExpression &expr, std::string &sql);
@@ -419,6 +424,24 @@ private:
 	//! are the original's (the resolver knows those objects, not a copy's).
 	const SubqueryRef *synthetic_ref_ = nullptr;
 	const SetOperationNode *synthetic_setop_ = nullptr;
+	//! The node a QUALIFY wrapper stands for, written by the inner writer.
+	const SelectNode *synthetic_select_ = nullptr;
+	//! Writing the node inside a QUALIFY wrapper: no modifiers (the wrapper's),
+	//! the QUALIFY condition as a hidden result column.
+	bool qualifying_ = false;
+	//! Writing that condition: a name that is no FROM column may be a
+	//! select-list alias (DuckDB's order: the column first).
+	bool qualify_aliases_ = false;
+	//! The wrapper's hidden column, left out of its `*`.
+	std::string hidden_column_;
+	//! A QUALIFY on select-list aliases only, filtered by the wrapper on its
+	//! columns: the names, none of which may be a FROM column.
+	std::vector<std::string> qualify_names_;
+	//! Tie-dependent windows written (WriteWindow), and whether the QUALIFY
+	//! condition named a computed alias: a window evaluated twice could break
+	//! its ties two ways.
+	idx_t tie_windows_ = 0;
+	bool qualify_named_alias_ = false;
 	//! The SEMI / ANTI relation whose condition is being written: the one
 	//! place its columns can be named.
 	idx_t semi_scope_ = DConstants::INVALID_INDEX;
