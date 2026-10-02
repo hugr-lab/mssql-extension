@@ -73,6 +73,12 @@ struct TestConfig {
 	}
 };
 
+// Remote pushdown (spec 079) for the catalogs ATTACHed after this: off for
+// the scenarios as written (the catalog scan's entry lifetime, #178), on for a
+// second pass of the catalog-read scenarios, which then run through pushed
+// statements and the describe cache (PR E2). Read at ATTACH.
+static bool g_remote_pushdown = false;
+
 void load_extension(Connection &conn) {
 	auto r1 = conn.Query("LOAD 'build/debug/extension/mssql/mssql.duckdb_extension'");
 	if (r1->HasError()) {
@@ -80,6 +86,10 @@ void load_extension(Connection &conn) {
 		if (r2->HasError()) {
 			throw std::runtime_error("Failed to LOAD mssql extension: " + r2->GetError());
 		}
+	}
+	auto r3 = conn.Query(g_remote_pushdown ? "SET mssql_remote_pushdown = true" : "SET mssql_remote_pushdown = false");
+	if (r3->HasError()) {
+		throw std::runtime_error("SET mssql_remote_pushdown: " + r3->GetError());
 	}
 }
 
@@ -1080,6 +1090,14 @@ int main() {
 		ok &= scenario_concurrent_writes_shared(cfg, 4, sec);
 		// Scenario 8 (spec 052): pure concurrent INSERTs into one table.
 		ok &= scenario_pure_concurrent_writes(cfg, 4, sec);
+		// The catalog reads again with remote pushdown (spec 079 PR E2): their
+		// aggregates and TOP N run as pushed statements, binding through the
+		// catalog's describe cache while the invalidator clears it.
+		g_remote_pushdown = true;
+		ok &= scenario_concurrent_catalog_reads(cfg, 4, 50);
+		ok &= scenario_invalidation_race(cfg, 4, sec, 50);
+		ok &= scenario_sibling_cache_stress(cfg, 4, sec, 50);
+		g_remote_pushdown = false;
 	} catch (const std::exception &e) {
 		std::cerr << "\nTEST CRASHED: " << e.what() << std::endl;
 		return 2;

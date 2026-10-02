@@ -9,6 +9,11 @@ require mssql
 
 require-env MSSQL_TESTDB_DSN
 
+# The table-scan path's own behaviour: remote pushdown (on by default since
+# spec 079 PR E2) would take these statements whole.
+statement ok
+SET mssql_remote_pushdown = false;
+
 # =============================================================================
 # Every string column of an attached table used to report a bare VARCHAR, which
 # meant a target created from it became nvarchar(max) — 4.1x slower to load and

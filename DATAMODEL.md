@@ -769,7 +769,7 @@ sequenceDiagram
     BA->>BA: drop anchors — entries refcount may drop to zero if Invalidate ran
 ```
 
-### The remote-pushdown path (spec 079, behind `mssql_remote_pushdown`)
+### The remote-pushdown path (spec 079, `mssql_remote_pushdown`, on by default since PR E2)
 
 With the setting on at ATTACH the catalog answers DuckDB's
 `RemotePushdownOptimizer`, which runs on the **parsed** statement, before the
@@ -785,7 +785,9 @@ the writer again and replaces the node with
 gain is handed back as a subquery, table names restored as the query wrote
 them, with each nested part that does replaced by `SELECT * FROM <its
 vehicle>` (PR E1). From there each vehicle is an ordinary raw scan: describe
-at bind, run at init, and the pinned connection inside a transaction.
+at bind, run at init, and the pinned connection inside a transaction -- except
+that the describe of a statement the rewriter wrote is cached per catalog
+(PR E2, below).
 
 ```mermaid
 flowchart LR
@@ -839,6 +841,26 @@ Invariants:
   an uncertain join over a table at or above
   `mssql_pushdown_join_rows_threshold` (or of unknown size: a view, a derived
   table) is handed back. Skipped inside a transaction and on a pool of one.
+- **A pushed statement's shape is cached by its text** (PR E2,
+  `query/mssql_describe_cache`). `VehicleFor` notes the statement in the
+  catalog's `DescribeCache`; its bind takes the shape from there (no round
+  trip, no connection) while the metadata cache's invalidation epoch is the
+  one the describe ran under (and `mssql_catalog_cache_ttl`, when set);
+  `mssql_preload_catalog` clears it. Constants are parameters, so the key is
+  the shape. Not in an explicit transaction (#380's rule: the shared state
+  is committed state) nor for a prepared scan. A stream that differs from
+  the bound shape at init -- datetime vs datetime2 compared too, both read
+  as TIMESTAMP -- fails the statement and clears every shape, so a column
+  typed by the describe recovers on the next run; one the catalog types stays
+  wrong until the catalog is invalidated, as on the scan path.
+- **Windows and QUALIFY** (PR E2). A window is a computed column; a
+  tie-dependent one (ROW_NUMBER, NTILE, LAG / LEAD, FIRST / LAST_VALUE, a
+  ROWS frame) sets `picks_rows` like a LIMIT, so a CTE holding one is not
+  inlined twice. QUALIFY is a synthetic wrapper over the node, written as a
+  derived table by the node's own writer (like the set-operation wrapper of
+  E1): an alias-only condition is the wrapper's WHERE, any other a hidden
+  bit column the wrapper filters on; the node's modifiers move to the
+  wrapper, whose ORDER BY takes result columns only.
 - **One vocabulary, two walkers** (PR C). `pushdown/mssql_expression_vocabulary`
   holds the atoms: those both paths render with -- constants and their
   parameter declarations, comparisons, IN, BETWEEN, CASE, LIKE, the function

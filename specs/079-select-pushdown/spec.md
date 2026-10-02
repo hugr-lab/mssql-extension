@@ -421,6 +421,71 @@ pushed against not pushed; a semantic pass of 280 on the live server).**
   refuses), and its deserialize rebuilds the scan from the catalog entry.
   Found by the E1 fuzz, on the scan path; it predates E1.
 
+**Revised in PR E2: windows, QUALIFY, FILTER, string_agg; the cost; the
+default.** Each shape measured equal against DuckDB on SQL Server 2025 (rows
+compared with EXCEPT ALL both ways, types by DESCRIBE); the recon is in the
+PR.
+
+- *FILTER* is `agg(CASE WHEN c THEN x END)` -- a row it does not take is a
+  NULL every aggregate here skips; `count(*)` counts the CASE's 1s. The
+  condition is a row's: an aggregate, a subquery or an outer column in it is
+  vetoed (130 / 8124 there).
+- *string_agg* (`group_concat`, `listagg`) is `STRING_AGG(CAST(x AS
+  nvarchar(max)), sep) [WITHIN GROUP (ORDER BY …)]`: a varchar / nvarchar
+  column (char(n) is read trimmed, concatenated padded there), a constant
+  separator, no DISTINCT, one WITHIN GROUP order per node (8711). Without an
+  ORDER BY its order is arbitrary on both sides (owner's call, as a LIMIT
+  without one). Its result neither compares nor orders (D4). Not over a
+  window (4113).
+- *Windows*: ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG / LEAD (an offset, a
+  default), FIRST_VALUE / LAST_VALUE, the aggregates OVER with their FILTER.
+  PARTITION BY takes a groupable column (a set: D4, below). The window's
+  ORDER BY follows D4's order rule, with two differences from a statement's
+  ORDER BY, the server sorting those rows whatever the key: a UTF-8
+  `varchar` goes by its bytes and NULL placement is emulated without a LIMIT
+  (owner's call). DuckDB's default frame is the server's default and is sent
+  as none; ROWS frames with literal offsets (a parameter is a syntax error
+  there; past int too); RANGE only between UNBOUNDED and CURRENT ROW (4194).
+  An int SUM OVER goes through decimal(38,0) and is cast back (the server's
+  overflows: 8115); AVG OVER in the exact form (the server's AVG(int)
+  truncates). Vetoed: DISTINCT (10759), GROUPS, EXCLUDE, IGNORE NULLS (SQL
+  Server 2022 on; `after-0.3.0.md`), a ranking / value function without an
+  ORDER BY (4112) or with a frame (10752), a frame that starts after it ends,
+  percent_rank / cume_dist / nth_value / fill. A window whose answer depends
+  on the order of ties (ROW_NUMBER, NTILE, LAG / LEAD, FIRST / LAST_VALUE, a
+  ROWS frame) picks rows: a CTE holding one is not inlined twice or under a
+  subquery expression, as a LIMIT is not (E1).
+- *QUALIFY* has no T-SQL form: the node is a derived table and a wrapper
+  keeps QUALIFY's rows, then applies the node's DISTINCT / ORDER BY / LIMIT
+  (DuckDB applies them after QUALIFY). A condition on select-list aliases
+  only (`QUALIFY rn = 1`) is the wrapper's WHERE on the derived columns, the
+  window evaluated once; any other is the node's hidden last column, a bit
+  `CASE WHEN … THEN 1 ELSE 0 END` (a NULL condition drops the row). Names
+  resolve column first, then alias, as DuckDB's do (measured). The wrapper's
+  ORDER BY takes a result column's name or position only. A tie-dependent
+  window evaluated twice (an alias in a mixed condition) is vetoed.
+- *The cost of a pushed statement*, measured on a local server: the
+  rewriter's pass costs nothing measurable on every statement of the
+  instance; the vehicle's describe costs a round trip (1.5-3 ms locally, a
+  network round trip on a remote server) and a connection at every bind. The
+  describe of the statements the rewriter writes is cached per catalog
+  (`DescribeCache`), keyed by the text (constants are parameters: one entry
+  per shape), living as the catalog's metadata does (the invalidation epoch,
+  `mssql_preload_catalog`, `mssql_catalog_cache_ttl`); not in an explicit
+  transaction or for a prepared scan. A shape changed behind the catalog
+  (`mssql_exec` DDL) fails its statement loudly and drops every cached shape
+  -- a column typed by the describe recovers on the next run, one the catalog
+  types (`column_types`) stays wrong until the catalog is invalidated, as on
+  the scan path; the init-time check compares datetime against datetime2 too, both
+  reading as TIMESTAMP. On a 1M-row table an aggregate, a TOP N, a QUALIFY
+  and a join were 4-15x faster pushed; on a few thousand rows an aggregate or
+  a QUALIFY is a few ms faster on the scan path (a local server, no network).
+  `mssql_pushdown_min_rows` (default 0) is the user's floor: a statement
+  whose tables hold fewer rows together (cached counts) stays with the
+  scans. No default floor: joins and TOP N gain from a few thousand rows,
+  and a network moves the line down.
+- *The default* is `true`: every catalog attached answers the rewriter.
+
 **Revised in PR B: the catalog's types, not the describe's.** Run on every
 table of the test database, the describe disagreed with the catalog on three
 things, all of them the read expression's doing: a code-page `varchar` read
@@ -486,6 +551,25 @@ silently disable pushdown for the first statement against every table.
   of one collation, so the comparison is still one column's collation, the
   rule above. Widening either is a change to this rule, not to one path.
 
+**Revised in PR E2: what D4 for sets means with the default on** (raised on
+#399). For a comparison in WHERE D4 changes nothing a user could see: the scan
+path already pushes the predicate, so both paths take the server's equality.
+GROUP BY, DISTINCT, `count(DISTINCT …)`, a join key, PARTITION BY and a set
+operation's deduplication are where the two paths part: the scan path never
+pushes them, so with remote pushdown they move from DuckDB's byte equality to
+the column collation's -- on `SQL_Latin1_General_CP1_CI_AS`, the installation
+default, `count(DISTINCT legacy)` over `'a', 'A', 'b', 'B'` is 2 pushed and 4
+not, a `UNION` keeps one of `'ab'` and `'AB'`, a PARTITION BY puts them in one
+partition (a set operation at a statement's top is combined by DuckDB, so
+its deduplication stays DuckDB's). Said loudly in the settings row, the user docs and the release
+note, with the switch (`SET mssql_remote_pushdown = false` before ATTACH, or a
+second ATTACH of the same database with it off for the statements that need
+DuckDB's equality) and an explicit `mssql_scan` with a binary `COLLATE` for
+the server's side. Which
+path a statement takes can depend on the data's size --
+`mssql_pushdown_join_rows_threshold`, `mssql_pushdown_min_rows` -- and so can
+these answers; the docs say that too.
+
 ### D5 — the fallback stays, the vocabulary is shared
 
 The scan's filter pushdown (`FilterEncoder`, `pushdown_complex_filter`) and
@@ -527,8 +611,11 @@ catalog, at ATTACH**, and fixes that catalog's answer to **both** `IS_REMOTE`
 and `EXECUTE_QUERY_NODE` for its life: the counter `DatabaseManager` keeps from
 `IS_REMOTE` stays consistent because the answer never changes under it, and a
 catalog attached with the setting off has none of `IS_REMOTE`'s side effects
-(§ 0.1). Default **false** until PR E, which flips it. The text below is the
-draft's, kept for the reasoning about scopes:
+(§ 0.1). Default **false** until PR E; **`true` since PR E2**, which also adds
+the ATTACH option `remote_pushdown`: the catalog's own answer over the setting,
+the switch DuckLake's `METADATA_PARAMETERS` (ATTACH options only) can reach for
+a metadata catalog. The text below is the draft's, kept for the reasoning
+about scopes:
 
 `mssql_remote_pushdown` (BOOLEAN, default **true at merge** — W1–W6 ship as
 one PR): **instance-wide, not per session**. `Supports(RemoteCapability)

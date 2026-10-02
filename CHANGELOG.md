@@ -112,6 +112,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     yet hand a FROM subquery or a CTE body over on its own
     ([duckdb/duckdb#26280](https://github.com/duckdb/duckdb/issues/26280)),
     so their aggregate runs in DuckDB.
+- **Remote pushdown: windows, QUALIFY, FILTER, string_agg; the describe
+  result shapes cached (spec 079 PR E2).**
+  - Window functions go to the server: `row_number`, `rank`, `dense_rank`,
+    `ntile`, `lag` / `lead` (an offset, a default), `first_value` /
+    `last_value`, and aggregates `OVER (…)` with `PARTITION BY`, `ORDER BY`
+    and `ROWS` frames. An integer `sum` over a window goes through
+    `decimal(38,0)` (the server's `SUM(int)` overflows) and `avg` in an exact
+    form (the server's `AVG(int)` truncates).
+  - `QUALIFY` goes too: `QUALIFY rn = 1` filters the window's result in an
+    outer query, the window evaluated once.
+  - `agg(x) FILTER (WHERE c)` as `agg(CASE WHEN c THEN x END)`;
+    `string_agg` / `group_concat` / `listagg` as `STRING_AGG(… nvarchar(max) …)
+    WITHIN GROUP (ORDER BY …)`.
+  - Not pushed: `IGNORE NULLS` (SQL Server 2022 on), `percent_rank`,
+    `cume_dist`, `nth_value`, `RANGE` frames with offsets, `GROUPS`,
+    `EXCLUDE`, `count(DISTINCT …) OVER`, `string_agg(DISTINCT …)`.
+  - The result shape of a pushed statement is cached per statement form
+    (constants are parameters), so planning it again costs no round trip and
+    no connection; the cache ends with the catalog's metadata. Measured on a
+    local server: planning 1.9 ms → 0.68 ms, a point read 4.6 ms → 2.7 ms;
+    on a 1M-row table an aggregate, a TOP N, a QUALIFY and a join ran 4-15x
+    faster pushed.
+  - `mssql_pushdown_min_rows` (default 0): a statement whose tables hold
+    fewer rows together than this is left to the plain scans.
+  - The ATTACH option `remote_pushdown true/false` gives one database its own
+    answer, over the setting — what DuckLake's `METADATA_PARAMETERS` can pass.
 - **`column_types := [...]` on `mssql_scan` / `mssql_scan_params`**: the type
   each result column is read as, `''` for the described one, checked against
   the server's describe. The rewriter uses it so a pushed `SELECT` has the
@@ -723,6 +749,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`mssql_remote_pushdown` is on by default** (spec 079 PR E2). A SELECT
+  over one attached database with a join, an aggregate, `DISTINCT`, `ORDER
+  BY` or `LIMIT` runs on SQL Server as one statement. **String
+  `GROUP BY`, `DISTINCT`, `count(DISTINCT …)`, join keys, `PARTITION BY` and
+  a nested `UNION`'s deduplication now follow the column's collation**, as `WHERE`
+  already did: on a case-insensitive collation (`SQL_Latin1_General_CP1_CI_AS`
+  is SQL Server's installation default) `'a'` and `'A'` are one group —
+  `count(DISTINCT legacy)` over `'a', 'A', 'b', 'B'` is 2 where it was 4.
+  String orders stay DuckDB's. `SET mssql_remote_pushdown = false;` before
+  `ATTACH` (or the ATTACH option `remote_pushdown false`) restores the
+  previous behaviour. While on, the database's schema
+  `main` answers as its default schema, for DDL too (`DROP TABLE
+  db.main.x` drops `dbo.x`), and DuckDB skips its catalog-or-schema ambiguity
+  check for it.
+- **An error names its cause.** When the server answers a metadata query, an
+  `mssql_exec` or a result-shape describe with several errors, the first one
+  is reported (it was the last), as a result stream already did: a pushed
+  statement over a dropped table says `Invalid object name 'dbo.t'` instead
+  of `sp_describe_first_result_set`'s "see previous error".
 - **No INSERT statement carries more than 1000 constants** (spec 062 W1b).
   SQL Server auto-parameterises a multi-row `VALUES` INSERT — one cached
   plan per (table, column list, row count), compiled once — only up to 1000

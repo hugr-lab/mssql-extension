@@ -16,6 +16,10 @@ require mssql
 
 require-env MSSQL_TESTDB_DSN
 
+# The comparison catalog: pushdown off (on by default since PR E2).
+statement ok
+SET mssql_remote_pushdown = false;
+
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS rc_off (TYPE mssql);
 
@@ -191,6 +195,60 @@ physical_plan	<REGEX>:.*COUNT_BIG.*
 
 statement ok
 COMMIT;
+
+# The default: on (PR E2). A catalog attached with the setting untouched
+# answers the rewriter.
+statement ok
+RESET mssql_remote_pushdown;
+
+query I
+SELECT current_setting('mssql_remote_pushdown');
+----
+true
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rc_default (TYPE mssql);
+
+statement ok
+SET mssql_pushdown_min_rows = 0;
+
+query II
+EXPLAIN SELECT g, count(*) FROM rc_default.dbo.rc_t GROUP BY g ORDER BY g LIMIT 10;
+----
+physical_plan	<REGEX>:.*COUNT_BIG.*
+
+statement ok
+DETACH rc_default;
+
+# The ATTACH option `remote_pushdown` wins over the setting for its catalog
+# -- what DuckLake's METADATA_PARAMETERS can reach (a string: '1' / 'no' too).
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rc_opt_off (TYPE mssql, remote_pushdown 'false');
+
+query II
+EXPLAIN SELECT g, count(*) FROM rc_opt_off.dbo.rc_t GROUP BY g ORDER BY g LIMIT 10;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rc_opt_on (TYPE mssql, remote_pushdown true);
+
+query II
+EXPLAIN SELECT g, count(*) FROM rc_opt_on.dbo.rc_t GROUP BY g ORDER BY g LIMIT 10;
+----
+physical_plan	<REGEX>:.*COUNT_BIG.*
+
+statement ok
+DETACH rc_opt_on;
+
+statement ok
+DETACH rc_opt_off;
+
+statement ok
+RESET mssql_remote_pushdown;
 
 statement ok
 RESET mssql_pushdown_min_rows;

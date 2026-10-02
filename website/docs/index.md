@@ -52,6 +52,7 @@ SELECT * FROM mssql.dbo.SalesOrderHeader LIMIT 10;
 - [Kerberos / Windows SSPI integrated authentication](./connection/kerberos.md) — POSIX (`kinit` / keytab / raw credentials) and Windows (current logon session via `secur32.dll`)
 - Custom `Application Name` propagated to SQL Server `APP_NAME()` / `sys.dm_exec_sessions.program_name`
 - ATTACH-time credential validation (opt-out via `lazy_validation true`)
+- **Remote pushdown** (on by default): joins, aggregates, window functions, subqueries and CTEs over one attached database run on SQL Server as one statement — see [Remote Pushdown](reading/queries.md#remote-pushdown-whole-statements)
 - **Experimental**: ORDER BY pushdown to SQL Server (opt-in via `mssql_order_pushdown` setting)
 
 

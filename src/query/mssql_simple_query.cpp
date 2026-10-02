@@ -318,9 +318,14 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithSetCallback(tds::TdsConnection &c
 
 			case tds::ParsedTokenType::Error: {
 				const tds::TdsError &error = parser.GetError();
+				if (result.success) {
+					// The first error is the cause; the server's later ones follow
+					// from it (sp_describe_first_result_set's 11529 "see previous
+					// error" after the 208 naming the missing object, spec 079 E2).
+					result.error_number = error.number;
+					result.error_message = error.message;
+				}
 				result.success = false;
-				result.error_number = error.number;
-				result.error_message = error.message;
 				// Continue reading to drain the response
 				break;
 			}

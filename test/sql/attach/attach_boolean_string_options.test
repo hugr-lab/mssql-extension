@@ -26,7 +26,7 @@ statement ok
 DETACH bool_str_yes;
 
 statement ok
-ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS bool_str_one (TYPE mssql, lazy_validation '1', order_pushdown 'no');
+ATTACH 'Server=unreachable.invalid,1433;Database=db;User Id=u;Password=p' AS bool_str_one (TYPE mssql, lazy_validation '1', order_pushdown 'no', remote_pushdown 'no');
 
 statement ok
 DETACH bool_str_one;

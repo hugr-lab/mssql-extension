@@ -37,6 +37,11 @@ require mssql
 
 require-env MSSQL_TESTDB_DSN
 
+# The table-scan path's own behaviour: remote pushdown (on by default since
+# spec 079 PR E2) would take these statements whole.
+statement ok
+SET mssql_remote_pushdown = false;
+
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS opc (TYPE mssql, order_pushdown true);
 
