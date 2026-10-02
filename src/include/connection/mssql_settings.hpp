@@ -82,6 +82,8 @@ int64_t LoadTestFailParseAfterTokens(ClientContext &context);
 bool LoadScanParameterizeFilters(ClientContext &context);
 //! mssql_pushdown_join_rows_threshold (spec 079 PR E1).
 int64_t LoadPushdownJoinRowsThreshold(ClientContext &context);
+//! mssql_pushdown_min_rows (spec 079 PR E2).
+int64_t LoadPushdownMinRows(ClientContext &context);
 
 // Load ATTACH credential-validation timeout (spec 047 / US2).
 //! DuckDB's error_on_division_by_zero for this session (default true when unset

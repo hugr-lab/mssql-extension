@@ -22,6 +22,7 @@
 #include "mssql_function_docs.hpp"
 #include "mssql_storage.hpp"
 #include "query/mssql_ddl_detect.hpp"
+#include "query/mssql_describe_cache.hpp"
 #include "query/mssql_query_executor.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "query/mssql_sql_params.hpp"
@@ -67,6 +68,9 @@ unique_ptr<FunctionData> MSSQLScanBindData::Copy() const {
 	result->prepared = prepared;
 	result->prepared_session = prepared_session;
 	result->executed_at_bind = executed_at_bind;
+	result->described_datetime2 = described_datetime2;
+	result->wants_column_types = wants_column_types;
+	result->describe_cache_key = describe_cache_key;
 	return std::move(result);
 }
 
@@ -359,6 +363,21 @@ static LogicalType WireStringType(const tds::ColumnMetadata &col, bool native_ty
 // and refused. The connection's answer, not the catalog's cached one (review of
 // #387). The collation itself is not compared: COLMETADATA carries it as an
 // id, not a name.
+// Every datetime type reads as TIMESTAMP, so the shape check above cannot tell
+// a datetime from a datetime2 -- and only a datetime2 decodes into a
+// TIMESTAMP_MS / _NS vector's unit (ColumnTypeFits). A shape bound as one and
+// served as the other would be 1000x off, silently (review of E2: a cached
+// shape outliving `mssql_exec` DDL).
+static bool StreamMatchesDatetime2(const vector<bool> &described_datetime2, const MSSQLResultStream &stream) {
+	auto &metadata = stream.GetColumnMetadata();
+	for (idx_t i = 0; i < described_datetime2.size() && i < metadata.size(); i++) {
+		if (described_datetime2[i] != (metadata[i].type_id == tds::TDS_TYPE_DATETIME2)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQLResultStream &stream) {
 	auto &types = stream.GetColumnTypes();
 	auto &metadata = stream.GetColumnMetadata();
@@ -666,6 +685,32 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	const bool in_transaction = !context.transaction.IsAutoCommit();
 	const int timeout_ms = QueryTimeoutMs(context);
 	const string declarations = params.Declarations();
+	const bool native_types = MSSQLReportsNativeTypes(mssql_catalog);
+
+	// Spec 079 PR E2: a pushed statement of a shape already described binds
+	// without the round trip -- or a connection. Not in an explicit transaction
+	// (whose own DDL the shared shapes must not see, #380), not for a prepared
+	// scan (whose handle is the point).
+	uint64_t cache_epoch = 0;
+	if (!bind_data.prepared && !in_transaction) {
+		bind_data.describe_cache_key = mssql::DescribeCache::Key(bind_data.query, declarations, native_types);
+		cache_epoch = mssql_catalog.GetMetadataCache().GetInvalidationEpoch();
+		mssql::CachedShape cached;
+		if (mssql_catalog.GetDescribeCache().Lookup(bind_data.describe_cache_key, cache_epoch,
+													LoadCatalogCacheTTL(context), cached)) {
+			return_types.assign(cached.types.begin(), cached.types.end());
+			names.clear();
+			for (const auto &name : cached.names) {
+				names.push_back(Identifier(name));
+			}
+			bind_data.return_types = return_types;
+			bind_data.column_names.assign(cached.names.begin(), cached.names.end());
+			bind_data.described_datetime2.assign(cached.datetime2.begin(), cached.datetime2.end());
+			MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: shape of %llu column(s) from the describe cache",
+							   (unsigned long long)return_types.size());
+			return;
+		}
+	}
 
 	MSSQLDescribedShape shape;
 	std::shared_ptr<tds::TdsConnection> connection;
@@ -712,7 +757,6 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	}
 	bool held = false;
 	const bool wanted_prepared = bind_data.prepared;
-	const bool native_types = MSSQLReportsNativeTypes(mssql_catalog);
 	try {
 		if (wanted_prepared) {
 			int32_t handle = 0;
@@ -773,6 +817,13 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 		bind_data.return_types = shape.types;
 		bind_data.column_names = shape.names;
 		bind_data.described_datetime2 = shape.datetime2;
+		if (!bind_data.describe_cache_key.empty()) {
+			mssql::CachedShape cached;
+			cached.types.assign(shape.types.begin(), shape.types.end());
+			cached.names.assign(shape.names.begin(), shape.names.end());
+			cached.datetime2.assign(shape.datetime2.begin(), shape.datetime2.end());
+			mssql_catalog.GetDescribeCache().Store(bind_data.describe_cache_key, cache_epoch, std::move(cached));
+		}
 		auto bind_ms =
 			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - bind_start)
 				.count();
@@ -982,7 +1033,17 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		}
 		stream->SurfaceWarnings(context);
 		const auto &described = bind_data.described_types.empty() ? bind_data.return_types : bind_data.described_types;
-		if (!StreamMatchesBoundShape(described, *stream)) {
+		if (!StreamMatchesBoundShape(described, *stream) ||
+			!StreamMatchesDatetime2(bind_data.described_datetime2, *stream)) {
+			if (!bind_data.describe_cache_key.empty()) {
+				// A table changed behind the catalog's back (`mssql_exec` DDL): every
+				// cached shape may read it, so all of them are asked again -- one
+				// failed statement per change, not one per shape (review of E2).
+				Catalog::GetCatalog(context, Identifier(bind_data.context_name))
+					.Cast<MSSQLCatalog>()
+					.GetDescribeCache()
+					.Clear();
+			}
 			// The described shape is what the plan was built on; serving rows of
 			// another shape would be a silent wrong answer.
 			throw InvalidInputException(

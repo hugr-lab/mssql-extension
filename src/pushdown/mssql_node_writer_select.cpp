@@ -942,6 +942,9 @@ bool NodeWriter::Write(const SelectNode &node) {
 															  : divergent_of_[output.column_index]);
 	}
 	for (auto &relation : relations_) {
+		out_.total_input_rows += relation.derived ? relation.total_rows : relation.table.approx_rows;
+		out_.total_size_unknown =
+			out_.total_size_unknown || (relation.derived ? relation.total_unknown : !relation.table.size_known);
 		if (relation.semi) {
 			continue;
 		}
@@ -1163,6 +1166,8 @@ bool NodeWriter::WriteSetOperation(const SetOperationNode &node) {
 		out_.value_divergence = out_.value_divergence || child_out.value_divergence;
 		out_.largest_input_rows = MaxValue(out_.largest_input_rows, child_out.largest_input_rows);
 		out_.input_size_unknown = out_.input_size_unknown || child_out.input_size_unknown;
+		out_.total_input_rows += child_out.total_input_rows;
+		out_.total_size_unknown = out_.total_size_unknown || child_out.total_size_unknown;
 	}
 	out_.statement = sql;
 	return true;

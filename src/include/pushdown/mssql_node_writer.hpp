@@ -175,6 +175,9 @@ struct Relation {
 	//! or a cast back applied inside).
 	bool derived = false;
 	std::string derived_sql;
+	//! A derived table's total_input_rows / total_size_unknown.
+	idx_t total_rows = 0;
+	bool total_unknown = false;
 };
 
 //! A derived table's column as the outer node sees it. A column of the inner

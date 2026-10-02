@@ -58,6 +58,24 @@ order of priority yet.
 - **Derived table size.** A derived table is sized by its largest input, not
   by what it returns (an aggregate's group count).
 
+## Execution
+
+- **A vehicle that runs at bind: `mssql_scan_unsafe` / `mssql_scan_params_unsafe`.**
+  Since spec 075 a scan describes at bind (`sp_describe_first_result_set`) and
+  runs at init, because a query started at bind holds its connection from bind
+  to execution, in an order DuckDB does not define: inside a transaction, or
+  on a pool short of connections, two scans of one statement would contend for
+  the one connection and could not be materialised in turn. A variant that
+  starts the query at bind and takes the shape from the stream's own
+  COLMETADATA saves the describe's round trip (measured E2: 1.5-3 ms a
+  statement on a local server; a network round trip on a remote one); it
+  would be refused inside a transaction and on a pool of one, and remote
+  pushdown would use it only outside them (in autocommit with more than one
+  connection), keeping the describing vehicle there. EXPLAIN would then run
+  the statement (the cost spec 075 removed) unless the vehicle defers when
+  only planning. E2 caches the describe of pushed statements instead (owner,
+  E2: after spec 079).
+
 ## Shapes not pushed yet
 
 - **E2** (planned): windows and QUALIFY, FILTER as CASE, `string_agg`, the

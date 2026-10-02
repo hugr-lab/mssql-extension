@@ -314,6 +314,16 @@ bool MSSQLCatalog::WritePushablePart(const QueryNode &node, mssql::WrittenQuery 
 			return false;
 		}
 	}
+	// A floor the user set (PR E2): small reads stay with the scans. Not in a
+	// transaction or on a pool of one (trusted, as above), nor over a view.
+	if (context && GetConnectionLimit() > 1 && context->transaction.IsAutoCommit()) {
+		const auto min_rows = LoadPushdownMinRows(*context);
+		if (min_rows > 0 && !written.total_size_unknown && written.total_input_rows < idx_t(min_rows)) {
+			MSSQL_CATALOG_DEBUG_LOG(1, "RemoteExecute: %llu rows in all stay with the scans (mssql_pushdown_min_rows)",
+									(unsigned long long)written.total_input_rows);
+			return false;
+		}
+	}
 	return true;
 }
 
@@ -403,6 +413,9 @@ unique_ptr<TableRef> MSSQLCatalog::VehicleFor(mssql::WrittenQuery &written) {
 	auto column_types = ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, std::move(types)));
 	column_types->SetAlias(Identifier("column_types"));
 	arguments.push_back(std::move(column_types));
+	// Its shape may be cached (the statement is ours: DescribeCache).
+	describe_cache_.NotePushed(
+		mssql::DescribeCache::Key(written.statement, written.Declarations(), MSSQLReportsNativeTypes(*this)));
 	auto ref = make_uniq<TableFunctionRef>();
 	ref->function = make_uniq<FunctionExpression>(
 		QualifiedName(Identifier(SYSTEM_CATALOG), Identifier(DEFAULT_SCHEMA), Identifier(function)),
