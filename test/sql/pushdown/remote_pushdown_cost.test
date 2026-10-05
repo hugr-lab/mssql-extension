@@ -176,6 +176,30 @@ DROP TABLE IF EXISTS rc_on.dbo.rc_tx;
 statement ok
 SELECT mssql_invalidate_cache('rc_on'), mssql_invalidate_cache('rc_off');
 
+# LIMIT 0 is no gain: DuckDB plans an empty result and asks the server
+# nothing, where a vehicle would describe and execute. DuckLake's attach probes
+# every inlined-data table so, in one UNION ALL (#406 bench: a thousand of them
+# made every attach 1.6-1.8x slower).
+query II
+EXPLAIN SELECT g, count(*) FROM rc_on.dbo.rc_t GROUP BY g ORDER BY g LIMIT 0;
+----
+physical_plan	<REGEX>:.*Empty Result.*
+
+query II
+EXPLAIN (SELECT id FROM rc_on.dbo.rc_t LIMIT 0) UNION ALL (SELECT id FROM rc_on.dbo.rc_t WHERE g = 1 LIMIT 0);
+----
+physical_plan	<!REGEX>:.*Mssql Scan.*
+
+query I
+SELECT count(*) FROM ((SELECT id FROM rc_on.dbo.rc_t LIMIT 0) UNION ALL (SELECT id FROM rc_on.dbo.rc_t WHERE g = 1 LIMIT 0)) s;
+----
+0
+
+query II
+EXPLAIN SELECT id FROM rc_on.dbo.rc_t ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*TOP \(1\).*
+
 #
 # mssql_pushdown_min_rows: 0 by default (no floor). Set, a statement whose
 # tables hold fewer rows together (cached counts) stays with the scans.

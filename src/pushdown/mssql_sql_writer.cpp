@@ -121,6 +121,23 @@ void CountRemotePushdown() {
 
 bool SQLWriter::PushesMoreThanScan(const QueryNode &node, const QualificationProbe *probe) {
 	for (auto &modifier : node.modifiers) {
+		// LIMIT 0: DuckDB plans an empty result and asks the server nothing,
+		// where a vehicle would cost a describe and an execution. DuckLake's
+		// attach probes every inlined-data table with one in a UNION ALL, and a
+		// thousand of them were seconds pushed (#406 bench).
+		if (modifier->type == ResultModifierType::LIMIT_MODIFIER) {
+			auto &limit = modifier->Cast<LimitModifier>();
+			if (limit.limit_type == LimitValueType::ROW_COUNT && limit.limit &&
+				limit.limit->GetExpressionClass() == ExpressionClass::CONSTANT) {
+				int64_t rows;
+				const auto &literal = limit.limit->Cast<ConstantExpression>().GetLiteral();
+				if (literal.kind == LiteralKind::INTEGER && literal.TryGetInt64(rows) && rows == 0) {
+					return false;
+				}
+			}
+		}
+	}
+	for (auto &modifier : node.modifiers) {
 		if (modifier->type == ResultModifierType::ORDER_MODIFIER ||
 			modifier->type == ResultModifierType::LIMIT_MODIFIER ||
 			modifier->type == ResultModifierType::DISTINCT_MODIFIER) {
