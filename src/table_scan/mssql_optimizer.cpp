@@ -808,6 +808,13 @@ struct MSSQLCatalogScanTally {
 	idx_t raw_scans = 0;
 };
 
+// The raw scans: the two that describe at bind and, since spec 081, the two that
+// take the caller's shape. All four execute at InitGlobal on the same connection.
+static bool IsRawScanName(const string &name) {
+	return name == "mssql_scan" || name == "mssql_scan_params" || name == "mssql_scan_unsafe" ||
+		   name == "mssql_scan_params_unsafe";
+}
+
 static void CollectCatalogScans(LogicalOperator &op, case_insensitive_map_t<MSSQLCatalogScanTally> &by_catalog) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
@@ -820,9 +827,7 @@ static void CollectCatalogScans(LogicalOperator &op, case_insensitive_map_t<MSSQ
 		if (get.function.GetName().GetIdentifierName() == "mssql_catalog_scan" && get.bind_data) {
 			auto &bind_data = get.bind_data->Cast<MSSQLCatalogScanBindData>();
 			by_catalog[bind_data.context_name].catalog_scans.push_back(&bind_data);
-		} else if ((get.function.GetName().GetIdentifierName() == "mssql_scan" ||
-					get.function.GetName().GetIdentifierName() == "mssql_scan_params") &&
-				   get.bind_data) {
+		} else if (IsRawScanName(get.function.GetName().GetIdentifierName()) && get.bind_data) {
 			auto &bind_data = get.bind_data->Cast<MSSQLScanBindData>();
 			by_catalog[bind_data.context_name].raw_scans++;
 		}

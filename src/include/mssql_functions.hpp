@@ -114,6 +114,10 @@ struct MSSQLScanBindData : public FunctionData {
 	// temp table, a procedure, dynamic SQL) and Bind executed as it always had;
 	// result_stream_id / materialized are then set exactly as before.
 	bool executed_at_bind = false;
+	//! Spec 081: the function that took the caller's shape (`mssql_scan_unsafe`,
+	//! `mssql_scan_params_unsafe`, from `columns :=`) without asking the server;
+	//! the stream is checked against it at init. Empty for a described scan.
+	string trusted_function;
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;

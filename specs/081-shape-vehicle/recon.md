@@ -62,6 +62,55 @@ Design sketch:
 - Users: their own T-SQL whose shape they know (mssql-ducklake's statements
   pay a describe today, inside transactions too).
 
-Open questions: the STRUCT form vs two lists for `columns`; whether the
-`_unsafe` name or a `columns :=` keyword on the existing functions (the
-owner named the functions `_unsafe`); how EXPLAIN shows it.
+Measured (2026-10-05): a temporary log line in `VehicleFor` over the
+`test/sql/pushdown` suite -- 297 vehicles:
+
+| what the writer knows | vehicles |
+|---|---|
+| every column's type (`column_types` has no `''`) | 229 (77%) |
+| every column's WIRE type, counting the cast-back columns (an integer `sum`: decimal(38,0) on the wire, HUGEINT after the projection) | 33 (11%) |
+| a server-typed computed column (arithmetic, CASE, `lag` over an expression) | 35 (12%) |
+
+So about 88% of pushed statements can skip the describe entirely, once the
+writer also hands over the wire type of a cast-back column (`WrittenQuery`
+keeps `column_types` = the read-as type or INVALID for a cast-back column,
+`cast_types` = the type after the projection; a third list, the type the
+stream decodes into, is what the vehicle needs). The rest keep the E2 cache.
+
+The argument form has a precedent: `read_csv(…, columns := {'name': 'TYPE',
+…})` -- a keyword-only parameter of type ANY that must be a STRUCT, field
+names in order, values parsed with `TransformStringToLogicalType` (which
+already parses our `MSSQL_VARCHAR(n, 'collation')` labels for
+`column_types`). The init-time check needs no new rule: today
+`ApplyColumnTypes` checks each `column_types` entry against the DESCRIBE with
+`ColumnTypeFits(described, wanted, datetime2)`; the trusting vehicle checks
+the same predicate against the STREAM (its type, and whether its TDS type is
+datetime2), plus the column count. A string into any string label fits (the
+values are strings either way); an INTEGER declared where the stream says
+BIGINT does not, and fails loudly.
+
+Plan (commits after 1/n):
+
+- 2/n: `mssql_scan_unsafe(context, query, columns := {…})` and
+  `mssql_scan_params_unsafe(context, statement, params [, declarations],
+  columns := {…})`: bind returns `columns` and touches no server (no
+  connection, no describe; `prepared := true` refused); init runs the batch as
+  today and checks the stream against `columns` (count, `ColumnTypeFits` per
+  column, datetime2 from the stream's metadata). Tests: a right shape, a wrong
+  type, a wrong count, inside a transaction with two of them in one statement
+  (the case that fails when a scan runs at bind), pool stats showing one
+  acquire per execution and none at bind.
+- 3/n: the writer hands over the wire type of every column it knows, and
+  `VehicleFor` calls the `_unsafe` function when it knows all of them; a
+  server-typed column keeps the describing vehicle and the E2 cache. Tests:
+  EXPLAIN names the function; the first execution of a new shape costs one
+  acquire (was two).
+- 4/n: docs (functions page, CLAUDE.md, DATAMODEL, CHANGELOG, a short spec).
+
+Settled in 2/n: the check is strict (lossless widenings later, if asked for);
+a declared type no SQL Server column is read as (TINYINT, a LIST, a STRUCT) is
+refused at bind, before anything is sent; EXPLAIN says `Shape: given
+(columns :=)`; a GEOMETRY column must arrive as WKB (`STAsBinary()`), as for
+`column_types`. The optimizer counts the two new functions as raw scans: a
+catalog scan beside one in a transaction materialises (uncounted, a UNION ALL
+of the two found the pinned connection Executing).

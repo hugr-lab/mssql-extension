@@ -74,6 +74,7 @@ unique_ptr<FunctionData> MSSQLScanBindData::Copy() const {
 	result->wants_column_types = wants_column_types;
 	result->describe_cache_key = describe_cache_key;
 	result->shape_from_cache = shape_from_cache;
+	result->trusted_function = trusted_function;
 	return std::move(result);
 }
 
@@ -635,6 +636,94 @@ static bool ColumnTypeFits(const LogicalType &described, const LogicalType &want
 	return described.id() == LogicalTypeId::VARCHAR && wanted.id() == LogicalTypeId::VARCHAR;
 }
 
+// Spec 081: a stream read into the shape its caller declared. Not the
+// describe-based StreamMatchesBoundShape (there is no describe): the same
+// predicate column_types is held to, against the stream's own types and its
+// datetime2 columns.
+static bool StreamFitsTrustedShape(const vector<LogicalType> &declared, const MSSQLResultStream &stream) {
+	auto &types = stream.GetColumnTypes();
+	auto &metadata = stream.GetColumnMetadata();
+	if (declared.size() != types.size() || metadata.size() != types.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < declared.size(); i++) {
+		if (!ColumnTypeFits(types[i], declared[i], metadata[i].type_id == tds::TDS_TYPE_DATETIME2)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Spec 081: whether some column of a stream can be read into `declared` --
+// the types the TDS decoder produces (TypeConverter), plus what ColumnTypeFits
+// reads them into: the TIMESTAMP variants and GEOMETRY. Anything else (a
+// TINYINT, a LIST, a STRUCT) fails every stream, so it is refused at bind,
+// before a statement is sent.
+static bool StreamCanProduce(const LogicalType &declared) {
+	switch (declared.id()) {
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::BLOB:
+	case LogicalTypeId::GEOMETRY:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::UUID:
+		return true;
+	default:
+		return false;
+	}
+}
+
+// Spec 081: `columns := {'name': 'TYPE', ...}` -- the result's names in STRUCT
+// order and the type each is read as (the forms column_types takes), as
+// read_csv takes its columns.
+static void BindTrustedShape(ClientContext &context, const TableFunctionBindInput &input, const string &function,
+							 MSSQLScanBindData &bind_data, vector<LogicalType> &return_types,
+							 vector<Identifier> &names) {
+	auto it = input.named_parameters.find("columns");
+	if (it == input.named_parameters.end() || it->second.IsNull() || it->second.type().id() != LogicalTypeId::STRUCT) {
+		throw InvalidInputException(
+			"%s: columns := {'name': 'TYPE', ...} is required -- the shape the statement returns", function);
+	}
+	auto &value = it->second;
+	auto &children = StructValue::GetChildren(value);
+	if (children.empty()) {
+		throw InvalidInputException("%s: columns names no column", function);
+	}
+	return_types.clear();
+	names.clear();
+	bind_data.column_names.clear();
+	for (idx_t i = 0; i < children.size(); i++) {
+		auto &name = StructType::GetChildName(value.type(), i);
+		if (children[i].IsNull() || children[i].type().id() != LogicalTypeId::VARCHAR) {
+			throw InvalidInputException("%s: the type of column %s must be given as a string", function,
+										name.GetIdentifierName());
+		}
+		auto type = TransformStringToLogicalType(StringValue::Get(children[i]), context);
+		if (!StreamCanProduce(type)) {
+			throw InvalidInputException("%s: column %s is declared %s, which no SQL Server column is read as", function,
+										name.GetIdentifierName(), type.ToString());
+		}
+		return_types.push_back(std::move(type));
+		names.push_back(name);
+		bind_data.column_names.push_back(name.GetIdentifierName());
+	}
+	bind_data.return_types = return_types;
+	bind_data.trusted_function = function;
+}
+
 static bool HasColumnTypes(const TableFunctionBindInput &input) {
 	auto it = input.named_parameters.find("column_types");
 	return it != input.named_parameters.end() && !it->second.IsNull();
@@ -962,6 +1051,46 @@ unique_ptr<FunctionData> MSSQLScanParamsBind(ClientContext &context, TableFuncti
 	return std::move(bind_data);
 }
 
+// Spec 081: mssql_scan_unsafe(context, query, columns := {...}) -- the shape is
+// the caller's; the bind asks the server nothing (no connection, no describe),
+// so it binds inside a transaction and on a pool of one like any other
+// statement, and the init checks the stream against it.
+unique_ptr<FunctionData> MSSQLScanUnsafeBind(ClientContext &context, TableFunctionBindInput &input,
+											 vector<LogicalType> &return_types, vector<Identifier> &names) {
+	if (input.inputs.size() != 2) {
+		throw InvalidInputException("mssql_scan_unsafe requires a context name and a query, and columns := {...}");
+	}
+	auto bind_data = make_uniq<MSSQLScanBindData>();
+	bind_data->context_name = input.inputs[0].GetValue<string>();
+	bind_data->query = input.inputs[1].GetValue<string>();
+	bind_data->execute_sql = bind_data->query;
+	ValidateScanContext(context, bind_data->context_name);
+	BindTrustedShape(context, input, "mssql_scan_unsafe", *bind_data, return_types, names);
+	return std::move(bind_data);
+}
+
+// mssql_scan_params_unsafe(context, statement, {name: value, ...} [, declarations], columns := {...})
+unique_ptr<FunctionData> MSSQLScanParamsUnsafeBind(ClientContext &context, TableFunctionBindInput &input,
+												   vector<LogicalType> &return_types, vector<Identifier> &names) {
+	if (input.inputs.size() < 3 || input.inputs.size() > 4) {
+		throw InvalidInputException(
+			"mssql_scan_params_unsafe requires a context name, a statement and a STRUCT of parameters, with an "
+			"optional declaration list, and columns := {...}");
+	}
+	auto bind_data = make_uniq<MSSQLScanBindData>();
+	bind_data->context_name = input.inputs[0].GetValue<string>();
+	bind_data->query = input.inputs[1].GetValue<string>();
+	string declarations_override;
+	if (input.inputs.size() == 4 && !input.inputs[3].IsNull()) {
+		declarations_override = input.inputs[3].GetValue<string>();
+	}
+	ValidateScanContext(context, bind_data->context_name);
+	auto params = mssql::BuildSqlParams(input.inputs[2], declarations_override);
+	bind_data->execute_sql = params.ExecuteSqlBatch(bind_data->query);
+	BindTrustedShape(context, input, "mssql_scan_params_unsafe", *bind_data, return_types, names);
+	return std::move(bind_data);
+}
+
 unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto init_start = std::chrono::steady_clock::now();
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanInitGlobal: START");
@@ -1043,8 +1172,18 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		}
 		stream->SurfaceWarnings(context);
 		const auto &described = bind_data.described_types.empty() ? bind_data.return_types : bind_data.described_types;
-		if (!StreamMatchesBoundShape(described, *stream) ||
-			!StreamMatchesDatetime2(bind_data.described_datetime2, *stream)) {
+		if (!bind_data.trusted_function.empty()) {
+			// Spec 081: the caller's shape, never described -- the stream must
+			// have as many columns, each read as declared by the rule
+			// column_types follows against a describe (ColumnTypeFits).
+			if (!StreamFitsTrustedShape(bind_data.return_types, *stream)) {
+				throw InvalidInputException(
+					"%s: the statement returned (%s), which its declared columns (%s) cannot read",
+					bind_data.trusted_function, TypeListToString(stream->GetColumnTypes()),
+					TypeListToString(bind_data.return_types));
+			}
+		} else if (!StreamMatchesBoundShape(described, *stream) ||
+				   !StreamMatchesDatetime2(bind_data.described_datetime2, *stream)) {
 			if (!bind_data.describe_cache_key.empty()) {
 				// A table changed behind the catalog's back (`mssql_exec` DDL): every
 				// cached shape may read it, so all of them are asked again -- one
@@ -1557,6 +1696,9 @@ static InsertionOrderPreservingMap<string> MSSQLScanToString(TableFunctionToStri
 		auto &bind_data = input.bind_data->Cast<MSSQLScanBindData>();
 		result["Database"] = bind_data.context_name;
 		result["Query"] = bind_data.query;
+		if (!bind_data.trusted_function.empty()) {
+			result["Shape"] = "given (columns :=)";
+		}
 	}
 	return result;
 }
@@ -1603,6 +1745,45 @@ void RegisterMSSQLFunctions(ExtensionLoader &loader) {
 		 {"SELECT * FROM mssql_scan_params('db', 'SELECT name FROM sys.objects WHERE object_id > @id', {'id': 100})",
 		  "SELECT * FROM mssql_scan_params('db', 'SELECT name FROM sys.objects WHERE create_date > @since', "
 		  "{'since': TIMESTAMP '2024-01-01'}, '@since datetime')"},
+		 {"query"}});
+
+	// Spec 081: the same two with the result's shape given, not described.
+	TableFunction scan_unsafe("mssql_scan_unsafe", {LogicalType::VARCHAR, LogicalType::VARCHAR}, MSSQLScanFunction,
+							  MSSQLScanUnsafeBind, MSSQLScanInitGlobal, MSSQLScanInitLocal);
+	scan_unsafe.GetSignature().AddKeywordOnly("columns", LogicalType::ANY);
+	scan_unsafe.to_string = MSSQLScanToString;
+	mssql::RegisterDocumentedFunction(
+		loader, TableFunctionSet(scan_unsafe),
+		{{},
+		 "mssql_scan with the result's shape given instead of described: columns := {'name': 'TYPE', ...} is "
+		 "returned at bind without asking the server (no connection, no describe), and the rows are checked "
+		 "against it when the query runs. The caller vouches for the shape; a stream that does not fit it fails. "
+		 "Types are read as by the catalog: tinyint UTINYINT, datetime2(7) TIMESTAMP_NS, a GEOMETRY column must "
+		 "arrive as WKB (STAsBinary()).",
+		 {"SELECT * FROM mssql_scan_unsafe('db', 'SELECT object_id, name FROM sys.objects', "
+		  "columns := {'object_id': 'INTEGER', 'name': 'VARCHAR'})"},
+		 {"query"}});
+
+	TableFunctionSet scan_params_unsafe("mssql_scan_params_unsafe");
+	for (int with_declarations = 0; with_declarations < 2; with_declarations++) {
+		vector<LogicalType> arguments{LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY};
+		if (with_declarations) {
+			arguments.push_back(LogicalType::VARCHAR);
+		}
+		TableFunction f("mssql_scan_params_unsafe", arguments, MSSQLScanFunction, MSSQLScanParamsUnsafeBind,
+						MSSQLScanInitGlobal, MSSQLScanInitLocal);
+		f.GetSignature().AddKeywordOnly("columns", LogicalType::ANY);
+		f.to_string = MSSQLScanToString;
+		scan_params_unsafe.AddFunction(f);
+	}
+	mssql::RegisterDocumentedFunction(
+		loader, std::move(scan_params_unsafe),
+		{{},
+		 "mssql_scan_params with the result's shape given instead of described (columns := {'name': 'TYPE', "
+		 "...}): nothing is asked of the server at bind, and the rows are checked against the shape when the "
+		 "statement runs.",
+		 {"SELECT * FROM mssql_scan_params_unsafe('db', 'SELECT name FROM sys.objects WHERE object_id > @id', "
+		  "{'id': 100}, columns := {'name': 'VARCHAR'})"},
 		 {"query"}});
 }
 
