@@ -209,17 +209,22 @@ SELECT count(*) FROM (SELECT g FROM so_on.dbo.so_a UNION ALL (SELECT g FROM so_o
 ----
 8
 
-# The set operation's ORDER BY takes result columns only: an expression is
-# DuckDB's binder error on both paths (review of E1: the wrapper took it).
-statement error
+# A set operation ordered by an expression: DuckDB's binder takes it since the
+# 2026-10 pin (it was a binder error); the writer does not push it (a set
+# operation's ORDER BY takes result columns only), and both paths agree.
+query I
 SELECT s.g FROM (SELECT g FROM so_on.dbo.so_a UNION SELECT g FROM so_on.dbo.so_b ORDER BY g + 1 LIMIT 3) s;
 ----
-ORDER BY
+1
+2
+3
 
-statement error
+query I
 SELECT s.g FROM (SELECT g FROM so_off.dbo.so_a UNION SELECT g FROM so_off.dbo.so_b ORDER BY g + 1 LIMIT 3) s;
 ----
-ORDER BY
+1
+2
+3
 
 # A correlated set operation with its own ORDER BY / LIMIT.
 query II
