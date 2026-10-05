@@ -485,6 +485,25 @@ SELECT id, g FROM rw_on.dbo.rw_t QUALIFY row_number() OVER (PARTITION BY g ORDER
 1	1
 8	3
 
+# A frame that starts after it ends, its bounds pointing one way: empty on
+# both sides (one pointing both ways is DuckDB's parser error, and the
+# server's compile error).
+query II
+EXPLAIN SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) AS a, count(x) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 2 PRECEDING) AS b FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+----
+physical_plan	<REGEX>:.*ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING.*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_on AS SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) AS a, count(x) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 2 PRECEDING) AS b FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE w_off AS SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) AS a, count(x) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 2 PRECEDING) AS b FROM rw_off.dbo.rw_t ORDER BY id LIMIT 100;
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off) UNION ALL (SELECT * FROM w_off EXCEPT ALL SELECT * FROM w_on))), (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_on)) = (SELECT string_agg(column_type, ',') FROM (DESCRIBE w_off));
+----
+0	true
+
 #
 # Vetoes: the catalog scan, DuckDB's rows.
 #
@@ -534,12 +553,6 @@ physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
 # IGNORE NULLS (SQL Server 2022 on).
 query II
 EXPLAIN SELECT id, lag(x IGNORE NULLS) OVER (ORDER BY id) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
-----
-physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
-
-# A frame that starts after it ends (a compile error there).
-query II
-EXPLAIN SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
 ----
 physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
 

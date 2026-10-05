@@ -450,7 +450,7 @@ PR.
   overflows: 8115); AVG OVER in the exact form (the server's AVG(int)
   truncates). Vetoed: DISTINCT (10759), GROUPS, EXCLUDE, IGNORE NULLS (SQL
   Server 2022 on; `after-0.3.0.md`), a ranking / value function without an
-  ORDER BY (4112) or with a frame (10752), a frame that starts after it ends,
+  ORDER BY (4112) or with a frame (10752),
   percent_rank / cume_dist / nth_value / fill. A window whose answer depends
   on the order of ties (ROW_NUMBER, NTILE, LAG / LEAD, FIRST / LAST_VALUE, a
   ROWS frame) picks rows: a CTE holding one is not inlined twice or under a

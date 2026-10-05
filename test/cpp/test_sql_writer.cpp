@@ -444,7 +444,10 @@ int main() {
 	ExpectVeto("SELECT row_number() OVER () FROM t");
 	ExpectVeto("SELECT rank() OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t");	 // 10752
 	ExpectVeto("SELECT sum(id) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t");			 // no ORDER BY
-	ExpectVeto("SELECT sum(id) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t");
+	ExpectSql("SELECT sum(id) OVER (ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) AS s FROM t",
+			  "SELECT SUM(CAST([id] AS decimal(38,0))) OVER (ORDER BY [id] ASC ROWS BETWEEN 2 FOLLOWING AND 1 "
+			  "FOLLOWING) AS [s] FROM [dbo].[t]",
+			  false);  // empty on both sides
 	ExpectVeto("SELECT sum(id) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t");
 	ExpectVeto("SELECT count(DISTINCT id) OVER () FROM t");
 	ExpectVeto("SELECT lag(id IGNORE NULLS) OVER (ORDER BY id) FROM t");

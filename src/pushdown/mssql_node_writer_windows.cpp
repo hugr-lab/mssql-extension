@@ -252,29 +252,6 @@ bool NodeWriter::WriteWindowFrame(const WindowExpression &window, std::string &s
 	if (!bound(start, window.StartExpr(), from) || !bound(end, window.EndExpr(), to)) {
 		return false;
 	}
-	// A frame that starts after it ends is empty in DuckDB and a compile error
-	// there (measured: `1 FOLLOWING AND 1 PRECEDING`).
-	auto position = [](WindowBoundary boundary, const unique_ptr<ParsedExpression> &expr) -> int64_t {
-		int64_t offset = 0;
-		if (expr && expr->GetExpressionClass() == ExpressionClass::CONSTANT) {
-			expr->Cast<ConstantExpression>().GetLiteral().TryGetInt64(offset);
-		}
-		switch (boundary) {
-		case WindowBoundary::UNBOUNDED_PRECEDING:
-			return NumericLimits<int64_t>::Minimum();
-		case WindowBoundary::UNBOUNDED_FOLLOWING:
-			return NumericLimits<int64_t>::Maximum();
-		case WindowBoundary::EXPR_PRECEDING_ROWS:
-			return -offset;
-		case WindowBoundary::EXPR_FOLLOWING_ROWS:
-			return offset;
-		default:
-			return 0;
-		}
-	};
-	if (position(start, window.StartExpr()) > position(end, window.EndExpr())) {
-		return Veto("a window frame that starts after it ends");
-	}
 	sql = std::string(rows ? "ROWS" : "RANGE") + " BETWEEN " + from + " AND " + to;
 	return true;
 }
