@@ -61,7 +61,7 @@ static std::vector<MSSQLColumnInfo> OtherColumns() {
 static bool WriteWith(const SQLWriterOptions &options, const std::string &sql, WrittenQuery &out, std::string &why) {
 	static const auto columns = Columns();
 	static const auto other = OtherColumns();
-	Parser parser;
+	auto parser = Parser::GetBuiltinParser();
 	parser.ParseQuery(sql);
 	auto &node = *parser.statements[0]->Cast<SelectStatement>().node;
 	SQLWriter writer(options, [](const BaseTableRef &ref, WriterTable &table) {
@@ -119,7 +119,7 @@ static void ExpectVeto(const std::string &sql) {
 }
 
 static void ExpectGain(const std::string &sql, bool expected) {
-	Parser parser;
+	auto parser = Parser::GetBuiltinParser();
 	parser.ParseQuery(sql);
 	auto &node = *parser.statements[0]->Cast<SelectStatement>().node;
 	if (SQLWriter::PushesMoreThanScan(node) != expected) {
