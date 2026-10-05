@@ -10,8 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Remote pushdown, first shapes (spec 079 PR B), behind
-  `mssql_remote_pushdown`** (default `false`, read at ATTACH; the default flips
-  to `true` in PR E). An attached catalog answers DuckDB's remote-pushdown
+  `mssql_remote_pushdown`** (read at ATTACH; on by default since PR E2, see
+  Changed). An attached catalog answers DuckDB's remote-pushdown
   rewriter, which then sends a whole single-table `SELECT` to SQL Server as
   one statement: its columns, a `WHERE` of column-vs-constant comparisons,
   `IS [NOT] NULL` and `AND` / `OR` / `NOT`, `ORDER BY` on columns, and
@@ -130,7 +130,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `EXCLUDE`, `count(DISTINCT …) OVER`, `string_agg(DISTINCT …)`.
   - The result shape of a pushed statement is cached per statement form
     (constants are parameters), so planning it again costs no round trip and
-    no connection; the cache ends with the catalog's metadata. Measured on a
+    no connection, in a transaction too while it has changed no schema; the
+    cache ends with the catalog's metadata. A table changed by another client
+    fails the next pushed statement over it once, saying to run it again. Measured on a
     local server: planning 1.9 ms → 0.68 ms, a point read 4.6 ms → 2.7 ms;
     on a 1M-row table an aggregate, a TOP N, a QUALIFY and a join ran 4-15x
     faster pushed.

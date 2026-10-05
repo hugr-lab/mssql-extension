@@ -109,13 +109,69 @@ SELECT mssql_exec('rc_off', 'ALTER TABLE dbo.rc_t ALTER COLUMN g bigint NOT NULL
 statement error
 SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2;
 ----
-result shape changed between bind and execution
+result shape changed since it was cached
 
 query II
 SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2;
 ----
 1	2
 2	3
+
+# Inside a transaction that has changed no schema, the shapes are read too
+# (no round trip for a pushed statement there); one that has changed a schema
+# describes its own. Shown by a shape made stale behind the catalog: the first
+# transaction uses it and fails, the second describes afresh.
+query II
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2;
+----
+1	2
+2	3
+
+statement ok
+SELECT mssql_exec('rc_off', 'ALTER TABLE dbo.rc_t ALTER COLUMN g int NOT NULL; EXEC sp_refreshview ''dbo.rc_v''');
+
+statement ok
+BEGIN;
+
+statement error
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2;
+----
+result shape changed since it was cached
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2;
+----
+1	2
+2	3
+
+statement ok
+SELECT mssql_exec('rc_off', 'ALTER TABLE dbo.rc_t ALTER COLUMN g bigint NOT NULL; EXEC sp_refreshview ''dbo.rc_v''');
+
+statement ok
+DROP TABLE IF EXISTS rc_on.dbo.rc_tx;
+
+statement ok
+BEGIN;
+
+# Catalog DDL runs in autocommit (spec 057): the table stays after ROLLBACK,
+# and is dropped below; the transaction has noted the change all the same.
+statement ok
+CREATE TABLE rc_on.dbo.rc_tx (x int);
+
+query II
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2;
+----
+1	2
+2	3
+
+statement ok
+ROLLBACK;
+
+statement ok
+DROP TABLE IF EXISTS rc_on.dbo.rc_tx;
 
 statement ok
 SELECT mssql_invalidate_cache('rc_on'), mssql_invalidate_cache('rc_off');

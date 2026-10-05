@@ -471,9 +471,11 @@ PR.
   describe of the statements the rewriter writes is cached per catalog
   (`DescribeCache`), keyed by the text (constants are parameters: one entry
   per shape), living as the catalog's metadata does (the invalidation epoch,
-  `mssql_preload_catalog`, `mssql_catalog_cache_ttl`); not in an explicit
-  transaction or for a prepared scan. A shape changed behind the catalog
-  (`mssql_exec` DDL) fails its statement loudly and drops every cached shape
+  `mssql_preload_catalog`, `mssql_catalog_cache_ttl`); in a transaction only
+  while it has changed no schema, never for a prepared scan. A shape changed
+  outside the catalog (any client's DDL; review of #406: a migration, SSMS,
+  `mssql_exec`) fails its statement loudly, saying to run it again, and drops
+  every cached shape
   -- a column typed by the describe recovers on the next run, one the catalog
   types (`column_types`) stays wrong until the catalog is invalidated, as on
   the scan path; the init-time check compares datetime against datetime2 too, both

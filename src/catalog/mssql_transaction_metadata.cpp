@@ -127,6 +127,11 @@ bool MSSQLTransactionMetadata::IsAllChanged() {
 	return all_changed_ || locally_changed_;
 }
 
+bool MSSQLTransactionMetadata::HasChanged() {
+	std::lock_guard<std::mutex> guard(lock_);
+	return all_changed_ || locally_changed_ || !changed_schemas_.empty() || !changed_tables_.empty();
+}
+
 MSSQLTransactionMetadata::Changes MSSQLTransactionMetadata::GetChanges() {
 	std::lock_guard<std::mutex> guard(lock_);
 	Changes changes;

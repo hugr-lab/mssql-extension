@@ -72,6 +72,11 @@ void DescribeCache::Store(const std::string &key, uint64_t epoch, CachedShape sh
 		return;
 	}
 	auto &entry = found->second;
+	if (entry.described && entry.epoch > epoch) {
+		// A bind that read the epoch before an invalidation another bind has
+		// already described past: keep the newer shape (review of #406).
+		return;
+	}
 	entry.described = true;
 	entry.epoch = epoch;
 	entry.stored = std::chrono::steady_clock::now();

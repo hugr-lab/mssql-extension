@@ -106,6 +106,8 @@ struct MSSQLScanBindData : public FunctionData {
 	//! Spec 079 PR E2: the DescribeCache key this bind's shape came from or went
 	//! to; the init-time shape check drops the entry when the stream differs.
 	string describe_cache_key;
+	//! The shape came from that cache (not from a describe at this bind).
+	bool shape_from_cache = false;
 	bool prepared = false;
 	shared_ptr<MSSQLPreparedSession> prepared_session;
 	// The F1 fallback: the describe could not settle the shape (a batch with a

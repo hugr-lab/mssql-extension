@@ -847,8 +847,9 @@ Invariants:
   trip, no connection) while the metadata cache's invalidation epoch is the
   one the describe ran under (and `mssql_catalog_cache_ttl`, when set);
   `mssql_preload_catalog` clears it. Constants are parameters, so the key is
-  the shape. Not in an explicit transaction (#380's rule: the shared state
-  is committed state) nor for a prepared scan. A stream that differs from
+  the shape. Inside an explicit transaction only while it has changed no
+  schema (#383's rule for the shared metadata: committed state only), and
+  never for a prepared scan. A stream that differs from
   the bound shape at init -- datetime vs datetime2 compared too, both read
   as TIMESTAMP -- fails the statement and clears every shape, so a column
   typed by the describe recovers on the next run; one the catalog types stays

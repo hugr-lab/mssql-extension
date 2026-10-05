@@ -474,7 +474,13 @@ int main() {
 	ExpectVeto("SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id) = 1 ORDER BY day LIMIT 3");   // not a result
 	ExpectVeto("SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id) = 1 ORDER BY t.id LIMIT 3");  // qualified
 	ExpectVeto(
-		"SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id) = 1 ORDER BY id + 1 LIMIT 3");	   // an expression
+		"SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id) = 1 ORDER BY id + 1 LIMIT 3");  // an expression
+	// Names spelled in another case resolve to the derived table's column, and
+	// are sent as it spells them (a case-sensitive database, review of #406).
+	ExpectSql("SELECT id, row_number() OVER (ORDER BY id) AS rn FROM t QUALIFY RN = 1 ORDER BY ID LIMIT 3",
+			  "SELECT TOP (3) [r1].[id] AS [id], [r1].[rn] AS [rn] FROM (SELECT [id], ROW_NUMBER() OVER (ORDER BY [id] "
+			  "ASC) AS [rn] FROM [dbo].[t]) AS [r1] WHERE ([r1].[rn] = 1) ORDER BY [r1].[id] ASC",
+			  false);
 	ExpectVeto("SELECT id, row_number() OVER (ORDER BY day) AS rn FROM t QUALIFY rn = 1 AND id > 0");  // twice
 	ExpectVeto("SELECT id AS day, row_number() OVER (ORDER BY id) AS rn FROM t QUALIFY day IS NULL");  // a column too
 	ExpectSql(

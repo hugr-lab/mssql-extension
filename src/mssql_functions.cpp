@@ -5,6 +5,8 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "catalog/mssql_table_entry.hpp"
+#include "catalog/mssql_transaction.hpp"
+#include "catalog/mssql_transaction_metadata.hpp"
 #include "codec/target_string_type.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
@@ -71,6 +73,7 @@ unique_ptr<FunctionData> MSSQLScanBindData::Copy() const {
 	result->described_datetime2 = described_datetime2;
 	result->wants_column_types = wants_column_types;
 	result->describe_cache_key = describe_cache_key;
+	result->shape_from_cache = shape_from_cache;
 	return std::move(result);
 }
 
@@ -688,11 +691,17 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	const bool native_types = MSSQLReportsNativeTypes(mssql_catalog);
 
 	// Spec 079 PR E2: a pushed statement of a shape already described binds
-	// without the round trip -- or a connection. Not in an explicit transaction
-	// (whose own DDL the shared shapes must not see, #380), not for a prepared
-	// scan (whose handle is the point).
+	// without the round trip -- or a connection. Inside an explicit transaction
+	// only while it has changed no schema (#383's rule for the shared metadata:
+	// its own DDL is not the shared shapes' to see, nor its describes theirs to
+	// keep); never for a prepared scan (whose handle is the point).
 	uint64_t cache_epoch = 0;
-	if (!bind_data.prepared && !in_transaction) {
+	bool shapes_shared = !bind_data.prepared;
+	if (shapes_shared && in_transaction) {
+		auto metadata = MSSQLTransaction::Get(context, mssql_catalog).TryMetadata();
+		shapes_shared = !metadata || !metadata->HasChanged();
+	}
+	if (shapes_shared) {
 		bind_data.describe_cache_key = mssql::DescribeCache::Key(bind_data.query, declarations, native_types);
 		cache_epoch = mssql_catalog.GetMetadataCache().GetInvalidationEpoch();
 		mssql::CachedShape cached;
@@ -706,6 +715,7 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 			bind_data.return_types = return_types;
 			bind_data.column_names.assign(cached.names.begin(), cached.names.end());
 			bind_data.described_datetime2.assign(cached.datetime2.begin(), cached.datetime2.end());
+			bind_data.shape_from_cache = true;
 			MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: shape of %llu column(s) from the describe cache",
 							   (unsigned long long)return_types.size());
 			return;
@@ -1046,6 +1056,16 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 			}
 			// The described shape is what the plan was built on; serving rows of
 			// another shape would be a silent wrong answer.
+			if (bind_data.shape_from_cache) {
+				// Its shape was described before, at another statement's bind: the
+				// table changed since, behind the catalog (review of #406).
+				throw InvalidInputException(
+					"mssql_scan: the statement's result shape changed since it was cached: bound (%s), got (%s). A "
+					"table it reads was changed outside this catalog (another client, a migration, mssql_exec). Run "
+					"the statement again -- its shape is described anew -- or call mssql_invalidate_cache() after "
+					"such DDL",
+					TypeListToString(described), TypeListToString(stream->GetColumnTypes()));
+			}
 			throw InvalidInputException(
 				"mssql_scan: the statement's result shape changed between bind and execution: bound (%s), got (%s)",
 				TypeListToString(described), TypeListToString(stream->GetColumnTypes()));

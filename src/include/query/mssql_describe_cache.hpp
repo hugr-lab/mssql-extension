@@ -35,9 +35,12 @@ struct CachedShape {
 //! mssql_refresh_cache; mssql_preload_catalog clears it), or past
 //! mssql_catalog_cache_ttl when that is set. The statement text carries no
 //! constants (they are @pN parameters), so one entry serves every execution of
-//! a shape. A shape changed behind the catalog's
-//! back is caught by the init-time check, which drops every entry (`Clear`):
-//! that statement fails once, the next one describes again.
+//! a shape. Inside an explicit transaction it is read and written only while
+//! the transaction has changed no schema (MSSQLTransactionMetadata::HasChanged,
+//! #383's rule). A shape changed outside the catalog (any client's DDL) is
+//! caught by the init-time check, which drops every entry (`Clear`): that
+//! statement fails once, saying to run it again, and the next one describes
+//! again.
 class DescribeCache {
 public:
 	//! The number of statements remembered; the least recently used goes.

@@ -150,6 +150,12 @@ these answers. To keep DuckDB's byte equality, attach with pushdown off —
 `SET mssql_remote_pushdown = false;` before `ATTACH` for every database — or
 attach the same database a second time with it off for the statements that
 need it.
+
+Two more things change for a database attached with pushdown on: its schema
+`main`, when the server has no schema of that name, stands for the default
+schema — for reads **and DDL** (`DROP TABLE db.main.x` drops `dbo.x`) — and
+DuckDB skips its check for a name that could be either a catalog or a schema
+of it. A real schema called `main` on the server is used as it is.
 :::
 
 The other differences: a **division by zero** in a computed column is `NULL`
@@ -175,16 +181,23 @@ statement form — constants are sent as parameters
 (`mssql_scan_parameterize_filters`, on by default), so `WHERE id = 1` and
 `WHERE id = 2` share it — until the catalog's metadata is invalidated
 (`mssql_invalidate_cache()`, DDL through the catalog, `mssql_refresh_cache()`,
-`mssql_preload_catalog()`, or `mssql_catalog_cache_ttl`). If a table changes
-behind the catalog's back (DDL through `mssql_exec` with
-`mssql_exec_invalidate_cache = false`), pushed statements over it fail —
-*"the statement's result shape changed"*, or the server's own error — until
-`mssql_invalidate_cache()` runs; set `mssql_exec_invalidate_cache = true` to
-have `mssql_exec` do that. On very small tables a pushed aggregate can be a
-few milliseconds slower than reading the rows; `mssql_pushdown_min_rows` sets
-a floor below which statements are left to the table scan. Inside an
-explicit transaction pushed statements run on the transaction's connection
-and their shape is asked every time (not cached).
+`mssql_preload_catalog()`, or `mssql_catalog_cache_ttl`). Inside an explicit
+transaction the cached shapes are used too, as long as the transaction has
+not changed a schema itself; pushed statements there run on the
+transaction's connection.
+
+If a table changes **outside this catalog** — another client, a migration,
+SSMS, or `mssql_exec` with `mssql_exec_invalidate_cache = false` — the next
+pushed statement over it fails once with *"the statement's result shape
+changed since it was cached … Run the statement again"*: running it again
+describes it anew. A column whose type the statement takes from the catalog
+stays wrong until the catalog is invalidated, as for the table scan; call
+`mssql_invalidate_cache()` after such DDL (or set a
+`mssql_catalog_cache_ttl`).
+
+On very small tables a pushed aggregate can be a few milliseconds slower than
+reading the rows; `mssql_pushdown_min_rows` sets a floor below which
+statements are left to the table scan.
 
 See [Remote Pushdown Settings](../reference/settings.md#remote-pushdown-settings).
 

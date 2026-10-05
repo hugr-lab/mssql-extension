@@ -51,6 +51,9 @@ int main() {
 		cache.Store(key, 3, Shape("a"));
 		Expect(!cache.Lookup(key, 2, 0, out), "described after an invalidation the asker has not seen: not served");
 		Expect(cache.Lookup(key, 3, 0, out), "... and not wiped either");
+		cache.Store(key, 2, Shape("stale"));
+		Expect(cache.Lookup(key, 3, 0, out) && out.names[0] == "a",
+			   "a slower bind's older shape does not overwrite a newer one");
 		cache.Clear();
 		Expect(!cache.Lookup(key, 3, 0, out), "cleared");
 		const auto long_key = DescribeCache::Key(std::string(DescribeCache::MAX_STATEMENT + 1, 'x'), "", true);

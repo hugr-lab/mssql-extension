@@ -479,7 +479,7 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 				if (only != DConstants::INVALID_INDEX
 						? relation_of_[i] != only
 						: IsHiddenUsingColumn(i) || relations_[relation_of_[i]].semi ||
-							  (!hidden_column_.empty() && columns_[i].name == hidden_column_)) {
+							  (!hidden_column_.empty() && StringUtil::CIEquals(columns_[i].name, hidden_column_))) {
 					continue;
 				}
 				if (!add(i, "")) {
