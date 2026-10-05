@@ -58,23 +58,28 @@ order of priority yet.
 - **Derived table size.** A derived table is sized by its largest input, not
   by what it returns (an aggregate's group count).
 
-## Execution
+## Before spec 080: a vehicle that trusts the shape it is given
 
-- **A vehicle that runs at bind: `mssql_scan_unsafe` / `mssql_scan_params_unsafe`.**
+- **The shape passed in, not asked for: `mssql_scan_unsafe` /
+  `mssql_scan_params_unsafe`, and the writer's shape for pushed statements.**
   Since spec 075 a scan describes at bind (`sp_describe_first_result_set`) and
-  runs at init, because a query started at bind holds its connection from bind
-  to execution, in an order DuckDB does not define: inside a transaction, or
-  on a pool short of connections, two scans of one statement would contend for
-  the one connection and could not be materialised in turn. A variant that
-  starts the query at bind and takes the shape from the stream's own
-  COLMETADATA saves the describe's round trip (measured E2: 1.5-3 ms a
-  statement on a local server; a network round trip on a remote one); it
-  would be refused inside a transaction and on a pool of one, and remote
-  pushdown would use it only outside them (in autocommit with more than one
-  connection), keeping the describing vehicle there. EXPLAIN would then run
-  the statement (the cost spec 075 removed) unless the vehicle defers when
-  only planning. E2 caches the describe of pushed statements instead (owner,
-  E2: after spec 079).
+  runs at init. Running at bind is not the way out: DuckLake runs its reads in
+  transactions, and several scans of one statement bound there contend for the
+  one pinned connection (the reason 075 moved execution to init). Instead the
+  bind trusts a shape given to it: it returns those names and types without
+  asking the server (no round trip, no connection, so inside a transaction and
+  on a pool of one too), and execution, at init as always, returns the rows in
+  that shape. A stream of another shape is a loud error at init, never a silent
+  conversion (lossless widenings, int into bigint, could be allowed). Hence
+  "unsafe": the caller vouches for the shape and the check waits for execution.
+  Two users: the remote-pushdown writer, which knows the shape of table columns
+  and aggregates and passes it (a statement with a computed column whose type
+  is the server's keeps the describe cache, else the describe); and users'
+  own T-SQL whose shape they know (mssql-ducklake's own statements pay a
+  describe today). The describe cost measured in E2: 1.5-3 ms a statement
+  locally, a network round trip remotely; the E2 cache covers repeated shapes,
+  this covers the first one too. Owner's call (E2): its own small spec after
+  #406, before spec 080, which builds its DML pushdown on the same vehicle.
 
 ## Shapes not pushed yet
 
