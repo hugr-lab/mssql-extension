@@ -82,6 +82,47 @@ SELECT * FROM mssql_scan_params('spr', 'SELECT 1 AS x', {'aaaaaaaaaaaaaaaaaaaaaa
 ----
 at most 128 characters
 
+# prepared := true: sp_prepare at bind, then sp_execute over RPC with the
+# values as positional typed parameters.
+query IIIII
+SELECT * FROM mssql_scan_params('spr',
+	'SELECT @i AS i, @d AS d, CONVERT(varchar(30), @ts, 121) AS ts, @s AS s, @g AS g',
+	{'i': 42::BIGINT, 'd': -12.34::DECIMAL(10,2), 'ts': TIMESTAMP_NS '2024-01-02 10:11:12.1234567', 's': 'привет',
+	 'g': '6F9619FF-8B86-D011-B42D-00C04FC964FF'::UUID}, prepared := true);
+----
+42	-12.34	2024-01-02 10:11:12.1234567	привет	6f9619ff-8b86-d011-b42d-00c04fc964ff
+
+query I
+SELECT t FROM mssql_scan_params('spr', 'SELECT @g.STAsText() AS t', {'g': 'POINT (3 4)'}, '@g geometry', prepared := true);
+----
+POINT (3 4)
+
+# A typed NULL, a value past nvarchar(4000) (PLP), and a declarations list
+# written in another order than the STRUCT: the values follow sp_prepare's
+# parameter list, which is the STRUCT's order.
+query III
+SELECT n IS NULL, len, b FROM mssql_scan_params('spr', 'SELECT @n AS n, LEN(@s) AS len, @b AS b',
+	{'n': NULL::INTEGER, 's': repeat('x', 5000), 'b': 7}, '@b int, @s nvarchar(max), @n int', prepared := true);
+----
+true	5000	7
+
+# Inside a transaction the handle runs on the pinned connection.
+statement ok
+BEGIN;
+
+query I
+SELECT v FROM mssql_scan_params('spr', 'SELECT @v * 2 AS v', {'v': 21}, prepared := true);
+----
+42
+
+statement ok
+COMMIT;
+
+# That the handle goes as an sp_execute RPC call (and a CLR declaration as
+# the batch) is asserted on the request itself, in test/cpp/test_sql_params.cpp:
+# a cheap ad-hoc batch is not kept in the plan cache, so the server cannot
+# tell the two forms apart from SQL.
+
 # mssql_exec_params: one RPC call per row.
 statement ok
 SELECT mssql_exec('spr', 'DROP TABLE IF EXISTS dbo.spr_t; CREATE TABLE dbo.spr_t (id int, d decimal(10,2), s nvarchar(20))');

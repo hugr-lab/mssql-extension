@@ -951,7 +951,7 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 				// only from the one session that owns it, and a second global
 				// state over this same (shared) bind data needs a way to run.
 				bind_data.fallback_sql = bind_data.execute_sql;
-				bind_data.execute_sql = params.ExecuteByHandleBatch(handle);
+				bind_data.execute_sql = params.ExecuteByHandleRequest(handle);
 				// Said where the pair is set: InitGlobal falls back to fallback_sql
 				// whenever it cannot claim the session, and execute_sql is by then
 				// a handle only that session can use. Setting one without the other

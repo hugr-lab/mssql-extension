@@ -533,8 +533,10 @@ void AddNVarcharParam(tds::RpcRequestBuilder &rpc, const std::string &name, cons
 //! False when this parameter has no RPC encoding -- an unknown declaration, or
 //! a value the declared type cannot take: the whole call then goes as the batch
 //! form, and the server answers it as it always has.
-bool AddTypedParam(tds::RpcRequestBuilder &rpc, const SqlParam &param) {
-	const auto name = "@" + param.name;
+bool AddTypedParam(tds::RpcRequestBuilder &rpc, const SqlParam &param, bool positional = false) {
+	// sp_executesql binds by name; sp_execute takes its values in declaration
+	// order, unnamed.
+	const auto name = positional ? std::string() : "@" + param.name;
 	DeclaredType declared;
 	if (!ParseDeclaredType(param.declaration, declared)) {
 		return false;
@@ -625,6 +627,24 @@ tds::Request SqlParamSet::ExecuteSqlRequest(const std::string &statement) const 
 		}
 	}
 	return tds::Request::Rpc(rpc.Finish(), ExecuteSqlBatch(statement));
+}
+
+tds::Request SqlParamSet::ExecuteByHandleRequest(int32_t handle) const {
+	for (const auto &p : params) {
+		if (!p.has_value) {
+			return tds::Request(ExecuteByHandleBatch(handle));
+		}
+	}
+	tds::RpcRequestBuilder rpc(tds::RPC_PROC_SP_EXECUTE);
+	// @handle int, then the values in declaration order.
+	rpc.BeginParam("");
+	AppendTypedValue(rpc, BCPColumnMetadata::FromServerColumn("", "int", 4, 0, 0, true, ""), Value::INTEGER(handle));
+	for (const auto &p : params) {
+		if (!AddTypedParam(rpc, p, true)) {
+			return tds::Request(ExecuteByHandleBatch(handle));
+		}
+	}
+	return tds::Request::Rpc(rpc.Finish(), ExecuteByHandleBatch(handle));
 }
 
 }  // namespace mssql

@@ -13,6 +13,8 @@
 //     forms, the override list (parenthesised commas, case-insensitive
 //     names) and its errors; a non-STRUCT and a key that is not an
 //     identifier.
+//   - ExecuteByHandleRequest (spec 083): sp_execute as an RPC call, its bytes
+//     and parameter order; a CLR declaration keeps the batch form.
 //
 // Build & run:
 //   make test-cpp-run
@@ -27,6 +29,7 @@
 
 #include <iostream>
 #include <string>
+#include <vector>
 
 using duckdb::Hugeint;
 using duckdb::hugeint_t;
@@ -232,6 +235,30 @@ void TestBuildSqlParamsRefusals() {
 	CHECK_THROWS_WITH(BuildSqlParams(Struct({{Identifier("p"), Value()}}), ""), "parameter 'p' is NULL of no type");
 }
 
+void TestExecuteByHandleRequest() {
+	// sp_execute over RPC: ProcID 12, no flags, then the handle and the values
+	// as unnamed parameters, in the STRUCT's order (sp_prepare's), whatever
+	// order the declarations list was written in.
+	auto set = BuildSqlParams(Struct({{Identifier("a"), Value::INTEGER(42)}, {Identifier("b"), Value("x")}}),
+							  "@b nvarchar(10), @a int");
+	auto request = set.ExecuteByHandleRequest(7);
+	CHECK_EQ(request.IsRpc(), true);
+	const std::vector<uint8_t> prefix = {0xFF, 0xFF, 0x0C, 0x00, 0x00, 0x00,  // ProcIDSwitch, sp_execute, OptionFlags
+										 0x00, 0x00, 0x26, 0x04, 0x04, 0x07, 0x00, 0x00, 0x00,	// @handle int = 7
+										 0x00, 0x00, 0x26, 0x04, 0x04, 0x2A, 0x00, 0x00, 0x00,	// @a int = 42
+										 0x00, 0x00, 0xE7};										// @b nvarchar ...
+	CHECK_EQ(request.rpc_body.size() > prefix.size(), true);
+	CHECK_EQ(std::vector<uint8_t>(request.rpc_body.begin(), request.rpc_body.begin() + prefix.size()) == prefix, true);
+	// The batch text rides along for logs and errors.
+	CHECK_EQ(request.sql, set.ExecuteByHandleBatch(7));
+
+	// A declaration the encoder does not know (a CLR type) keeps the batch form.
+	auto geometry = BuildSqlParams(Struct({{Identifier("g"), Value("POINT (1 2)")}}), "@g geometry");
+	auto fallback = geometry.ExecuteByHandleRequest(7);
+	CHECK_EQ(fallback.IsRpc(), false);
+	CHECK_EQ(fallback.sql, geometry.ExecuteByHandleBatch(7));
+}
+
 }  // namespace
 
 int main() {
@@ -242,6 +269,7 @@ int main() {
 	TestBuildSqlParamsOverride();
 	TestBuildSqlParamsRefusals();
 	TestBuildSqlParamsCaseCollision();
+	TestExecuteByHandleRequest();
 	if (failures) {
 		std::cerr << failures << " failure(s)\n";
 		return 1;

@@ -102,9 +102,12 @@ postgres; that is the environment, not the extension.
     (`mssql_functions.cpp`).
   - The metadata queries (`mssql_metadata_cache.cpp`, `mssql_primary_key.cpp`,
     `mssql_statistics.cpp`, `target_resolver.cpp`).
-  - `prepared := true` (`sp_prepare` ProcID 11 / `sp_execute` ProcID 12): the
-    prepare and execute calls go over RPC too. The handle comes back as a
-    RETURNVALUE token instead of a result row.
+  - `prepared := true`: each execution is an `sp_execute` RPC call (ProcID
+    12), with the handle and the values as positional typed parameters.
+    Measured: server CPU 304 -> 240 ms over 500 executions. `sp_prepare`
+    stays a batch (`... SELECT @h`): it runs once per bind, and its RPC form
+    returns the handle as a RETURNVALUE token, which the reader does not parse
+    yet. That comes with OUTPUT parameters (D5).
   - `mssql_scan_parameterize_filters = false` keeps meaning "literals in the
     text".
 - **D4: staging allocates on demand.** `ColumnStaging::Configure` reserves

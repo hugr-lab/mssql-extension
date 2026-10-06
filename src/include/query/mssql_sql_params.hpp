@@ -99,6 +99,10 @@ struct SqlParamSet {
 	tds::Request ExecuteSqlRequest(const std::string &statement) const;
 	//! DECLARE ...; EXEC sp_execute <handle>[, @a, @b]
 	std::string ExecuteByHandleBatch(int32_t handle) const;
+	//! Spec 083: the same call as an RPC request (sp_execute, ProcID 12): the
+	//! handle and the values as positional typed parameters, so no outer batch
+	//! is compiled per execution. The batch form when a value has no encoding.
+	tds::Request ExecuteByHandleRequest(int32_t handle) const;
 };
 
 //! The SQL Server declaration for a DuckDB value of `type` (spec 075 W5's
