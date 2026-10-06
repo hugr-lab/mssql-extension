@@ -389,15 +389,18 @@ unique_ptr<TableRef> MSSQLCatalog::RemoteExecute(ClientContext &context, unique_
 // D3: the pushed node becomes a call of `mssql_scan_params` (or `mssql_scan`
 // when it carries no parameter) -- the describe at bind, the run at init, the
 // transaction's pinned connection, and EXPLAIN shows the statement. Nothing
-// touches the server here.
+// touches the server here. Spec 081: when the writer knows the type of every
+// result column, the call is the `_unsafe` form with that shape as `columns`,
+// and the bind asks the server nothing either; the stream is held at init to
+// the same rule the describe is held to through `column_types`.
 unique_ptr<TableRef> MSSQLCatalog::VehicleFor(mssql::WrittenQuery &written) {
+	bool shape_known = !written.column_types.empty();
+	for (auto &type : written.column_types) {
+		shape_known = shape_known && type.id() != LogicalTypeId::INVALID;
+	}
 	vector<unique_ptr<ParsedExpression>> arguments;
 	arguments.push_back(ConstantExpression::String(GetName().GetIdentifierName()));
 	arguments.push_back(ConstantExpression::String(written.statement));
-	vector<Value> types;
-	for (auto &type : written.column_types) {
-		types.emplace_back(mssql::ColumnTypeName(type));
-	}
 	string function = "mssql_scan";
 	if (!written.params.empty()) {
 		function = "mssql_scan_params";
@@ -410,12 +413,28 @@ unique_ptr<TableRef> MSSQLCatalog::VehicleFor(mssql::WrittenQuery &written) {
 	}
 	// A table function's binder reads a named parameter from the argument's
 	// alias (`name => value`), not from FunctionArgument's name.
-	auto column_types = ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, std::move(types)));
-	column_types->SetAlias(Identifier("column_types"));
-	arguments.push_back(std::move(column_types));
-	// Its shape may be cached (the statement is ours: DescribeCache).
-	describe_cache_.NotePushed(
-		mssql::DescribeCache::Key(written.statement, written.Declarations(), MSSQLReportsNativeTypes(*this)));
+	if (shape_known) {
+		function += "_unsafe";
+		child_list_t<Value> columns;
+		for (idx_t i = 0; i < written.column_types.size(); i++) {
+			columns.emplace_back(Identifier(written.column_names[i]),
+								 Value(mssql::ColumnTypeName(written.column_types[i])));
+		}
+		auto shape = ConstantExpression::FromValue(Value::STRUCT(std::move(columns)));
+		shape->SetAlias(Identifier("columns"));
+		arguments.push_back(std::move(shape));
+	} else {
+		vector<Value> types;
+		for (auto &type : written.column_types) {
+			types.emplace_back(mssql::ColumnTypeName(type));
+		}
+		auto column_types = ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, std::move(types)));
+		column_types->SetAlias(Identifier("column_types"));
+		arguments.push_back(std::move(column_types));
+		// Its shape may be cached (the statement is ours: DescribeCache).
+		describe_cache_.NotePushed(
+			mssql::DescribeCache::Key(written.statement, written.Declarations(), MSSQLReportsNativeTypes(*this)));
+	}
 	auto ref = make_uniq<TableFunctionRef>();
 	ref->function = make_uniq<FunctionExpression>(
 		QualifiedName(Identifier(SYSTEM_CATALOG), Identifier(DEFAULT_SCHEMA), Identifier(function)),

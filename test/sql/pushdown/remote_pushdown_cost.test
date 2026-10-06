@@ -45,8 +45,15 @@ statement ok
 SELECT mssql_invalidate_cache('rc_on'), mssql_invalidate_cache('rc_off');
 
 #
-# The describe cache.
+# A statement whose every result column the writer types (spec 081) goes as
+# mssql_scan_params_unsafe: no describe at all, one acquire, even on a cold
+# catalog.
 #
+
+query II
+EXPLAIN SELECT g, count(*) FROM rc_on.dbo.rc_t WHERE g > 0 GROUP BY g ORDER BY g LIMIT 10;
+----
+physical_plan	<REGEX>:.*given \(columns :=\).*
 
 query II
 SELECT g, count(*) FROM rc_on.dbo.rc_t WHERE g > 0 GROUP BY g ORDER BY g LIMIT 10;
@@ -57,14 +64,44 @@ SELECT g, count(*) FROM rc_on.dbo.rc_t WHERE g > 0 GROUP BY g ORDER BY g LIMIT 1
 4	20
 
 statement ok
+SELECT mssql_invalidate_cache('rc_on');
+
+statement ok
+DESCRIBE rc_on.dbo.rc_t;
+
+statement ok
 CREATE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('rc_on');
+
+query II
+SELECT g, count(*) FROM rc_on.dbo.rc_t WHERE g > 3 GROUP BY g ORDER BY g LIMIT 10;
+----
+4	20
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('rc_on')) - (SELECT n FROM acquired);
+----
+1
+
+#
+# The describe cache: a server-typed column (g + 1) keeps the describing
+# vehicle.
+#
+
+query II
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t WHERE id > 0 ORDER BY id LIMIT 2;
+----
+1	2
+2	3
+
+statement ok
+CREATE OR REPLACE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('rc_on');
 
 # The same shape with another constant: bound from the cache, one acquire.
 query II
-SELECT g, count(*) FROM rc_on.dbo.rc_t WHERE g > 2 GROUP BY g ORDER BY g LIMIT 10;
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t WHERE id > 1 ORDER BY id LIMIT 2;
 ----
-3	20
-4	20
+2	3
+3	4
 
 query I
 SELECT (SELECT acquire_count FROM mssql_pool_stats('rc_on')) - (SELECT n FROM acquired);
@@ -84,9 +121,10 @@ statement ok
 CREATE OR REPLACE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('rc_on');
 
 query II
-SELECT g, count(*) FROM rc_on.dbo.rc_t WHERE g > 3 GROUP BY g ORDER BY g LIMIT 10;
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t WHERE id > 2 ORDER BY id LIMIT 2;
 ----
-4	20
+3	4
+4	5
 
 query I
 SELECT (SELECT acquire_count FROM mssql_pool_stats('rc_on')) - (SELECT n FROM acquired);
@@ -175,6 +213,30 @@ DROP TABLE IF EXISTS rc_on.dbo.rc_tx;
 
 statement ok
 SELECT mssql_invalidate_cache('rc_on'), mssql_invalidate_cache('rc_off');
+
+# A typed statement (spec 081: mssql_scan_params_unsafe, its shape from the
+# catalog) over a table changed behind the catalog fails at execution, naming
+# the statement and the way out; after the invalidation it reads the new type.
+query II
+SELECT g, count(*) FROM rc_on.dbo.rc_t WHERE g > 3 GROUP BY g ORDER BY g LIMIT 10;
+----
+4	20
+
+statement ok
+SELECT mssql_exec('rc_off', 'ALTER TABLE dbo.rc_t ALTER COLUMN g int NOT NULL; EXEC sp_refreshview ''dbo.rc_v''');
+
+statement error
+SELECT g, count(*) FROM rc_on.dbo.rc_t WHERE g > 3 GROUP BY g ORDER BY g LIMIT 10;
+----
+<REGEX>:.*mssql_scan_params_unsafe: the statement returned.*statement: SELECT.*call mssql_invalidate_cache\(\).*
+
+statement ok
+SELECT mssql_invalidate_cache('rc_on'), mssql_invalidate_cache('rc_off');
+
+query II
+SELECT g, count(*) FROM rc_on.dbo.rc_t WHERE g > 3 GROUP BY g ORDER BY g LIMIT 10;
+----
+4	20
 
 # LIMIT 0 is no gain: DuckDB plans an empty result and asks the server
 # nothing, where a vehicle would describe and execute. DuckLake's attach probes

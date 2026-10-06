@@ -114,3 +114,13 @@ refused at bind, before anything is sent; EXPLAIN says `Shape: given
 `column_types`. The optimizer counts the two new functions as raw scans: a
 catalog scan beside one in a transaction materialises (uncounted, a UNION ALL
 of the two found the pinned connection Executing).
+
+3/n as built: `VehicleFor` takes the `_unsafe` form only when every
+`column_types` entry is a type (the 77% row). A cast-back column keeps the
+describing vehicle: the writer knows its wire type exactly only for an integer
+`sum` (decimal(38,0)); a decimal sum or product over cast-back operands is
+widened by the server in ways the writer does not model, and the strict check
+would turn a statement that works today into an error. A typed statement over
+a table changed behind the catalog now fails at execution rather than at bind
+(the same failure, later), naming the statement and `mssql_invalidate_cache()`,
+and clears the describe cache as the describing path does.

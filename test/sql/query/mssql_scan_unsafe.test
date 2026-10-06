@@ -133,7 +133,7 @@ mssql_scan_unsafe: the statement returned
 statement error
 SELECT * FROM mssql_scan_unsafe('su', 'SELECT big FROM dbo.su_t', columns := {'big': 'INTEGER'});
 ----
-cannot read
+cannot read; statement: SELECT big FROM dbo.su_t
 
 statement error
 SELECT * FROM mssql_scan_unsafe('su', 'SELECT id, name FROM dbo.su_t', columns := {'id': 'INTEGER'});

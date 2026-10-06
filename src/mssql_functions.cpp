@@ -1177,10 +1177,30 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 			// have as many columns, each read as declared by the rule
 			// column_types follows against a describe (ColumnTypeFits).
 			if (!StreamFitsTrustedShape(bind_data.return_types, *stream)) {
+				// Named by its text: a mismatch can surface from inside a batch of
+				// statements (a DuckLake commit), where two shapes alone do not say
+				// which one it was.
+				auto statement = bind_data.query;
+				if (statement.size() > 200) {
+					// Cut at a character boundary: the message must stay UTF-8.
+					idx_t cut = 200;
+					while (cut > 0 && (static_cast<unsigned char>(statement[cut]) & 0xC0) == 0x80) {
+						cut--;
+					}
+					statement = statement.substr(0, cut) + "...";
+				}
+				// The remote-pushdown rewriter declares the shape from the catalog's
+				// metadata: a table changed outside the catalog (mssql_exec DDL, another
+				// client) shows here. The cached describes may read it too.
+				Catalog::GetCatalog(context, Identifier(bind_data.context_name))
+					.Cast<MSSQLCatalog>()
+					.GetDescribeCache()
+					.Clear();
 				throw InvalidInputException(
-					"%s: the statement returned (%s), which its declared columns (%s) cannot read",
+					"%s: the statement returned (%s), which its declared columns (%s) cannot read; statement: %s. If "
+					"a table it reads was changed outside this catalog, call mssql_invalidate_cache()",
 					bind_data.trusted_function, TypeListToString(stream->GetColumnTypes()),
-					TypeListToString(bind_data.return_types));
+					TypeListToString(bind_data.return_types), statement);
 			}
 		} else if (!StreamMatchesBoundShape(described, *stream) ||
 				   !StreamMatchesDatetime2(bind_data.described_datetime2, *stream)) {
