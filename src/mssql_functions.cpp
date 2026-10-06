@@ -10,6 +10,7 @@
 #include "codec/target_string_type.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
+#include "duckdb/catalog/default/default_types.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -686,6 +687,81 @@ static bool StreamCanProduce(const LogicalType &declared) {
 	}
 }
 
+// Whether `text` parses the same in every context, so its LogicalType can be
+// shared by all of them (review of spec 081): a DuckDB built-in that resolved
+// to its own type id (not a user type shadowing the name through the search
+// path), or one of this extension's MSSQL_VARCHAR / MSSQL_NVARCHAR labels BY
+// NAME (a user type defined as a label resolves to the label too). Modifiers
+// must be literals -- digits, or for a label a quoted collation / 'MAX' --
+// since a modifier can be an expression (`getvariable`) or read the context
+// (GEOMETRY's CRS).
+static bool IsCacheableTypeText(const string &text, const LogicalType &type) {
+	const auto open = text.find('(');
+	auto name = text.substr(0, open);
+	StringUtil::Trim(name);
+	const bool label = StringUtil::CIEquals(name, "MSSQL_VARCHAR") || StringUtil::CIEquals(name, "MSSQL_NVARCHAR");
+	if (label) {
+		mssql::codec::TargetStringType spec;
+		if (!mssql::codec::TryGetTargetStringType(type, spec)) {
+			return false;
+		}
+	} else {
+		const auto builtin = DefaultTypeGenerator::GetDefaultType(Identifier(name));
+		if (builtin == LogicalTypeId::INVALID || builtin != type.id()) {
+			return false;
+		}
+	}
+	if (open == string::npos) {
+		return true;
+	}
+	if (text.back() != ')') {
+		return false;
+	}
+	bool quoted = false;
+	for (idx_t i = open + 1; i + 1 < text.size(); i++) {
+		const char c = text[i];
+		if (quoted) {
+			if (c == '\'') {
+				quoted = false;
+			}
+			continue;
+		}
+		if (c == '\'' && label) {
+			quoted = true;
+		} else if (!(c >= '0' && c <= '9') && c != ',' && c != ' ') {
+			return false;
+		}
+	}
+	return !quoted;
+}
+
+// Spec 081: the declared types of `columns :=`, parsed once per process. The
+// parse goes through DuckDB's parser (~20 us a type), and pushed statements and
+// DuckLake's metadata reads repeat the same few. Only what parses the same in
+// every context is kept (IsCacheableTypeText): a user type (CREATE TYPE)
+// belongs to a database and can be redefined, so it is parsed every time.
+static LogicalType ParseDeclaredType(const string &text, ClientContext &context) {
+	static std::mutex cache_mutex;
+	static unordered_map<string, LogicalType> cache;
+	static constexpr size_t CAPACITY = 1024;
+	{
+		std::lock_guard<std::mutex> lock(cache_mutex);
+		auto it = cache.find(text);
+		if (it != cache.end()) {
+			return it->second;
+		}
+	}
+	auto type = TransformStringToLogicalType(text, context);
+	if (IsCacheableTypeText(text, type)) {
+		std::lock_guard<std::mutex> lock(cache_mutex);
+		if (cache.size() >= CAPACITY) {
+			cache.clear();
+		}
+		cache.emplace(text, type);
+	}
+	return type;
+}
+
 // Spec 081: `columns := {'name': 'TYPE', ...}` -- the result's names in STRUCT
 // order and the type each is read as (the forms column_types takes), as
 // read_csv takes its columns.
@@ -711,7 +787,7 @@ static void BindTrustedShape(ClientContext &context, const TableFunctionBindInpu
 			throw InvalidInputException("%s: the type of column %s must be given as a string", function,
 										name.GetIdentifierName());
 		}
-		auto type = TransformStringToLogicalType(StringValue::Get(children[i]), context);
+		auto type = ParseDeclaredType(StringValue::Get(children[i]), context);
 		if (!StreamCanProduce(type)) {
 			throw InvalidInputException("%s: column %s is declared %s, which no SQL Server column is read as", function,
 										name.GetIdentifierName(), type.ToString());

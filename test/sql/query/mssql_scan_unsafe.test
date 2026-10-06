@@ -129,6 +129,54 @@ SELECT d FROM mssql_scan_unsafe('su', 'SELECT CAST(1.5 AS decimal(10,2)) AS d', 
 ----
 mssql_scan_unsafe: the statement returned
 
+# Declared types are parsed once per process -- built-in ones and the MSSQL
+# labels. A user type is parsed every time: redefined, it reads as its new
+# definition (here BIGINT, then INTEGER, which the bigint column refuses).
+statement ok
+CREATE TYPE su_id AS BIGINT;
+
+query I
+SELECT big FROM mssql_scan_unsafe('su', 'SELECT big FROM dbo.su_t WHERE id = 1', columns := {'big': 'su_id'});
+----
+10
+
+statement ok
+DROP TYPE su_id;
+
+statement ok
+CREATE TYPE su_id AS INTEGER;
+
+statement error
+SELECT big FROM mssql_scan_unsafe('su', 'SELECT big FROM dbo.su_t WHERE id = 1', columns := {'big': 'su_id'});
+----
+cannot read
+
+statement ok
+DROP TYPE su_id;
+
+# So is a user type defined as one of this extension's labels.
+statement ok
+CREATE TYPE su_name AS MSSQL_VARCHAR(10);
+
+query T
+SELECT typeof(name) FROM mssql_scan_unsafe('su', 'SELECT name FROM dbo.su_t WHERE id = 1', columns := {'name': 'su_name'});
+----
+MSSQL_VARCHAR(10)
+
+statement ok
+DROP TYPE su_name;
+
+statement ok
+CREATE TYPE su_name AS MSSQL_NVARCHAR(20);
+
+query T
+SELECT typeof(name) FROM mssql_scan_unsafe('su', 'SELECT name FROM dbo.su_t WHERE id = 1', columns := {'name': 'su_name'});
+----
+MSSQL_NVARCHAR(20)
+
+statement ok
+DROP TYPE su_name;
+
 # A shape the stream does not fit fails when the query runs, naming both.
 statement error
 SELECT * FROM mssql_scan_unsafe('su', 'SELECT big FROM dbo.su_t', columns := {'big': 'INTEGER'});
