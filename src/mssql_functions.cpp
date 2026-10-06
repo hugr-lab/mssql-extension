@@ -735,29 +735,19 @@ static bool IsCacheableTypeText(const string &text, const LogicalType &type) {
 	return !quoted;
 }
 
-// Spec 081: the declared types of `columns :=`, parsed once per process. The
+// Spec 081: the declared types of `columns :=`, parsed once per catalog. The
 // parse goes through DuckDB's parser (~20 us a type), and pushed statements and
 // DuckLake's metadata reads repeat the same few. Only what parses the same in
 // every context is kept (IsCacheableTypeText): a user type (CREATE TYPE)
 // belongs to a database and can be redefined, so it is parsed every time.
-static LogicalType ParseDeclaredType(const string &text, ClientContext &context) {
-	static std::mutex cache_mutex;
-	static unordered_map<string, LogicalType> cache;
-	static constexpr size_t CAPACITY = 1024;
-	{
-		std::lock_guard<std::mutex> lock(cache_mutex);
-		auto it = cache.find(text);
-		if (it != cache.end()) {
-			return it->second;
-		}
+static LogicalType ParseDeclaredType(const string &text, ClientContext &context, MSSQLCatalog &catalog) {
+	LogicalType cached;
+	if (catalog.TryGetDeclaredType(text, cached)) {
+		return cached;
 	}
 	auto type = TransformStringToLogicalType(text, context);
 	if (IsCacheableTypeText(text, type)) {
-		std::lock_guard<std::mutex> lock(cache_mutex);
-		if (cache.size() >= CAPACITY) {
-			cache.clear();
-		}
-		cache.emplace(text, type);
+		catalog.StoreDeclaredType(text, type);
 	}
 	return type;
 }
@@ -774,6 +764,7 @@ static void BindTrustedShape(ClientContext &context, const TableFunctionBindInpu
 			"%s: columns := {'name': 'TYPE', ...} is required -- the shape the statement returns", function);
 	}
 	auto &value = it->second;
+	auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name)).Cast<MSSQLCatalog>();
 	auto &children = StructValue::GetChildren(value);
 	if (children.empty()) {
 		throw InvalidInputException("%s: columns names no column", function);
@@ -787,7 +778,7 @@ static void BindTrustedShape(ClientContext &context, const TableFunctionBindInpu
 			throw InvalidInputException("%s: the type of column %s must be given as a string", function,
 										name.GetIdentifierName());
 		}
-		auto type = ParseDeclaredType(StringValue::Get(children[i]), context);
+		auto type = ParseDeclaredType(StringValue::Get(children[i]), context, catalog);
 		if (!StreamCanProduce(type)) {
 			throw InvalidInputException("%s: column %s is declared %s, which no SQL Server column is read as", function,
 										name.GetIdentifierName(), type.ToString());

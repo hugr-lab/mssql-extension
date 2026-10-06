@@ -287,6 +287,27 @@ public:
 
 	// Get statistics provider
 	MSSQLStatisticsProvider &GetStatisticsProvider();
+	//! Spec 081: the declared types of `columns :=` this catalog's unsafe scans
+	//! parsed (mssql_functions.cpp's ParseDeclaredType decides what may be kept).
+	//! Per catalog, never per process: nothing is shared between database
+	//! instances, and a DETACH drops it.
+	bool TryGetDeclaredType(const string &text, LogicalType &out) {
+		std::lock_guard<std::mutex> lock(declared_types_mutex_);
+		auto it = declared_types_.find(text);
+		if (it == declared_types_.end()) {
+			return false;
+		}
+		out = it->second;
+		return true;
+	}
+	void StoreDeclaredType(const string &text, const LogicalType &type) {
+		std::lock_guard<std::mutex> lock(declared_types_mutex_);
+		if (declared_types_.size() >= 1024) {
+			declared_types_.clear();
+		}
+		declared_types_.emplace(text, type);
+	}
+
 	mssql::DescribeCache &GetDescribeCache() {
 		return describe_cache_;
 	}
@@ -548,6 +569,8 @@ private:
 	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;  // Statistics provider
 	//! Spec 079 PR E2: the shapes of the statements remote pushdown sends.
 	mssql::DescribeCache describe_cache_;
+	std::mutex declared_types_mutex_;
+	unordered_map<string, LogicalType> declared_types_;
 	int32_t database_code_page_ = 0;  // COLLATIONPROPERTY(database collation, 'CodePage'), issue #361
 	//! sys.databases.snapshot_isolation_state for this database, probed at ATTACH
 	//! (issue #331): 0 OFF, 1 ON, 2/3 in transition; -1 when the probe did not
