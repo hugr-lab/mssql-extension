@@ -388,7 +388,12 @@ bool NodeWriter::CollectDerivedNode(const QueryNode &node, const std::string &na
 		inner.cte_parent_limit_ = cte_index;
 		inner.in_expression_ = per_row;
 	}
-	if (synthetic ? !inner.WriteSetOperation(*synthetic_setop_) : !inner.WriteQueryNode(node)) {
+	if (synthetic && synthetic_select_) {
+		inner.qualifying_ = true;
+		inner.qualify_names_ = qualify_names_;
+	}
+	if (synthetic ? (synthetic_select_ ? !inner.Write(*synthetic_select_) : !inner.WriteSetOperation(*synthetic_setop_))
+				  : !inner.WriteQueryNode(node)) {
 		out_.refers_outside = out_.refers_outside || inner_out.refers_outside;
 		return false;
 	}
@@ -412,6 +417,8 @@ bool NodeWriter::CollectDerivedNode(const QueryNode &node, const std::string &na
 	// Sized by its inputs, as a join's tables are; a view among them unknown.
 	relation.table.size_known = !inner_out.input_size_unknown;
 	relation.table.approx_rows = inner_out.largest_input_rows;
+	relation.total_rows = inner_out.total_input_rows;
+	relation.total_unknown = inner_out.total_size_unknown;
 	// Its GROUP BY columns (or all of them under DISTINCT) are a unique key,
 	// when every one of them is a result column.
 	if (inner.aggregated_ && !inner.group_keys_.empty()) {

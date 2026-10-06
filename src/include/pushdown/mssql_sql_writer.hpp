@@ -87,6 +87,12 @@ struct WrittenQuery {
 	idx_t largest_input_rows = 0;
 	//! One of them is a view, whose size is unknown.
 	bool input_size_unknown = false;
+	//! The cached row counts of every table the statement reads -- joined,
+	//! EXISTS-read, inside a derived table or a subquery expression: what the
+	//! scan path would read instead (mssql_pushdown_min_rows, PR E2).
+	idx_t total_input_rows = 0;
+	//! One of those is a view, whose size is unknown.
+	bool total_size_unknown = false;
 	//! A result column is a division or a floating-point aggregate: its
 	//! divergence (NULL for inf, the last bits) is recorded for a value that
 	//! reaches the user -- not for one DuckDB computes on, as a part pushed

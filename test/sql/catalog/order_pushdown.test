@@ -9,6 +9,11 @@ require mssql
 
 require-env MSSQL_TESTDB_DSN
 
+# The scan path's own behaviour: remote pushdown (on by default since spec
+# 079 PR E2) would take these statements whole.
+statement ok
+SET mssql_remote_pushdown = false;
+
 # =============================================================================
 # Setup: Create test table with various column types using DuckDB syntax
 # =============================================================================

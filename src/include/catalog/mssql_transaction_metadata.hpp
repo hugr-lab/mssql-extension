@@ -83,6 +83,10 @@ public:
 	bool IsSchemaChanged(const string &schema);
 	//! MarkChanged with an empty schema was called: even the schema list may differ.
 	bool IsAllChanged();
+	//! This transaction changed anything, or ran DDL the extension cannot see
+	//! through: the shared shapes of pushed statements are not its to use
+	//! (spec 079 PR E2).
+	bool HasChanged();
 
 	//! The tables this transaction loaded itself: what is published into the
 	//! shared cache once the transaction has ended (issue #383).

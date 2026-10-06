@@ -257,6 +257,19 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "catalog scan (0 = always push)",
 							  LogicalType::BIGINT, Value::BIGINT(1000000), ValidateNonNegative, SetScope::GLOBAL);
 
+	// mssql_pushdown_min_rows (spec 079 PR E2): a statement whose tables hold
+	// fewer rows than this together (the cached counts, no round trip) stays
+	// with the scan path, where a small read costs less than the server's
+	// execution (measured on a local server: an aggregate or QUALIFY over 5k-50k
+	// rows). 0 = no floor, the default: joins and TOP N gain from a few thousand
+	// rows, and a network moves the line down. Not checked inside a
+	// transaction or on a pool of one connection, nor when a view (no count of
+	// its own) is read.
+	config.AddExtensionOption("mssql_pushdown_min_rows",
+							  "Rows (cached counts, summed over the tables a statement reads) below which remote "
+							  "pushdown leaves it to the catalog scans (0 = no floor)",
+							  LogicalType::BIGINT, Value::BIGINT(0), ValidateNonNegative, SetScope::GLOBAL);
+
 	// mssql_enable_statistics - Enable statistics collection for optimizer
 	config.AddExtensionOption("mssql_enable_statistics",
 							  "Enable statistics collection from SQL Server for query optimizer", LogicalType::BOOLEAN,
@@ -501,11 +514,11 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	// fixes the catalog's answer to Supports(IS_REMOTE) and
 	// Supports(EXECUTE_QUERY_NODE) for its life -- DatabaseManager counts remote
 	// catalogs from IS_REMOTE at ATTACH and DETACH, so the answer must not change
-	// under it (spec 079 D6). Off until the vocabulary is complete.
+	// under it (spec 079 D6). On by default since PR E2.
 	config.AddExtensionOption("mssql_remote_pushdown",
 							  "Push whole SELECT statements to SQL Server through DuckDB's remote-pushdown rewriter; "
-							  "read at ATTACH (default: false)",
-							  LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
+							  "read at ATTACH (default: true)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 
 	// mssql_convert_varchar_max - Convert VARCHAR(MAX) to NVARCHAR(MAX) in table scans
 	// When true: VARCHAR(MAX) with non-UTF8 collation is wrapped in CAST(... AS NVARCHAR(MAX))
@@ -610,6 +623,14 @@ int64_t LoadPushdownJoinRowsThreshold(ClientContext &context) {
 		return val.GetValue<int64_t>();
 	}
 	return 1000000;
+}
+
+int64_t LoadPushdownMinRows(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_pushdown_min_rows", val) && !val.IsNull()) {
+		return val.GetValue<int64_t>();
+	}
+	return 0;
 }
 
 bool LoadScanParameterizeFilters(ClientContext &context) {

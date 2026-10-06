@@ -85,7 +85,125 @@ return different rows than DuckDB does (issue #242):
 > different answer but a different set of rows modified — see
 > [String comparisons and collation](../writing/dml.md#collation).
 
+### Remote Pushdown (whole statements)
+
+A SELECT that reads only one attached SQL Server database and has something
+for the server to do — a join, an aggregate, `DISTINCT`, `ORDER BY` or `LIMIT`
+— is sent to the server **as one T-SQL statement**: the server joins,
+aggregates, sorts and filters, and only the result crosses the wire. A plain
+filter-and-columns SELECT stays on the table scan, which already sends its
+`WHERE`. On by default (`mssql_remote_pushdown`), read when the database is
+ATTACHed. `EXPLAIN` shows the T-SQL that is sent:
+
+```sql
+EXPLAIN SELECT c.region, count(*) AS orders, sum(o.total) AS revenue
+FROM sqlserver.dbo.orders o JOIN sqlserver.dbo.customers c ON o.customer_id = c.id
+WHERE o.placed >= DATE '2026-01-01'
+GROUP BY c.region ORDER BY revenue DESC LIMIT 10;
+-- Mssql Scan Params: SELECT TOP (10) [r2].[region] AS [region], COUNT_BIG(*) AS [orders], ...
+```
+
+What goes to the server:
+
+- joins (`INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS`, `USING`, SEMI / ANTI),
+  `WHERE`, `GROUP BY`, `HAVING`, `DISTINCT`, `ORDER BY`, `LIMIT` / `OFFSET`;
+- aggregates: `count`, `sum`, `avg`, `min` / `max` (not of strings), `stddev`
+  / `variance`, `string_agg`, and `FILTER (WHERE …)` on any of them;
+- window functions: `row_number`, `rank`, `dense_rank`, `ntile`, `lag` /
+  `lead`, `first_value` / `last_value`, aggregates `OVER (…)` with `ROWS`
+  frames; and `QUALIFY`;
+- subqueries in `FROM`, `IN` / `EXISTS` / scalar subqueries (correlated too),
+  `WITH` (CTEs), and set operations nested in a subquery or a CTE (at a
+  statement's top level each side is pushed and DuckDB combines them).
+
+Anything without an exact T-SQL equivalent is left to DuckDB, and a
+statement that cannot go whole is split: each part that can is pushed on its
+own, and DuckDB does the rest. An `ORDER BY` the server cannot reproduce
+exactly — a string key without a `LIMIT`, a nullable key without a `LIMIT` —
+keeps the whole statement in DuckDB, aggregate included; `EXPLAIN` shows which
+path a statement took. The rows and the column types are DuckDB's either way,
+with the exceptions below.
+
+:::warning String equality is the server's — including GROUP BY, DISTINCT and joins
+
+A pushed statement compares strings under the **column's collation**. For
+`WHERE` this is nothing new (filter pushdown already sends it). But **GROUP
+BY, DISTINCT, `count(DISTINCT …)`, join keys, `PARTITION BY` and a nested
+`UNION`'s deduplication** used to run in DuckDB and now run on the server. On a
+case-insensitive collation — `SQL_Latin1_General_CP1_CI_AS` is SQL Server's
+installation default — `'a'` and `'A'` become **one** group, one distinct
+value, one partition:
+
+```sql
+-- legacy holds 'a', 'A', 'b', 'B' in a _CI_ collation
+SELECT count(DISTINCT legacy) FROM sqlserver.dbo.t;   -- 2 pushed, 4 in DuckDB
+```
+
+Orders stay DuckDB's: a string `ORDER BY` is pushed only for a bounded UTF-8
+`varchar`, compared as bytes, and only under a `LIMIT` (a window's `ORDER BY`
+takes such a key without one); `min` / `max` of a string is never pushed.
+
+Which path a statement takes can depend on table sizes
+(`mssql_pushdown_join_rows_threshold`, `mssql_pushdown_min_rows`), and so can
+these answers. To keep DuckDB's byte equality, attach with pushdown off —
+`ATTACH '…' AS db (TYPE mssql, remote_pushdown false)`, or
+`SET mssql_remote_pushdown = false;` before `ATTACH` for every database — or
+attach the same database a second time with it off for the statements that
+need it.
+
+Two more things change for a database attached with pushdown on: its schema
+`main`, when the server has no schema of that name, stands for the default
+schema — for reads **and DDL** (`DROP TABLE db.main.x` drops `dbo.x`) — and
+DuckDB skips its check for a name that could be either a catalog or a schema
+of it. A real schema called `main` on the server is used as it is.
+:::
+
+The other differences: a **division by zero** in a computed column is `NULL`
+on the server where DuckDB returns `inf` / `NaN` (SQL Server's float has no
+infinity), and a floating-point `sum` / `avg` / `stddev` / `variance` can
+differ in its last bits (the two add in different orders). Neither is ever
+pushed inside a condition, an `ORDER BY` or a `DISTINCT`.
+
+Not pushed (they run in DuckDB): `SELECT * EXCLUDE / REPLACE / COLUMNS(…)`,
+`GROUP BY ALL` / `ROLLUP` / `CUBE`, `IGNORE NULLS`, `percent_rank` /
+`cume_dist` / `nth_value`, `RANGE` frames with offsets, recursive CTEs,
+`$n` parameters, statements that also read a local table or another catalog
+(their single-catalog parts still go). To run such a statement on the server,
+write the T-SQL yourself with [`mssql_scan`](../reference/functions.md):
+
+```sql
+SELECT * FROM mssql_scan('sqlserver', 'SELECT id, name FROM dbo.customers WHERE region = ''EU''');
+```
+
+**Cost.** Planning a pushed statement asks the server for its result shape
+(`sp_describe_first_result_set`, one round trip). The shape is cached per
+statement form — constants are sent as parameters
+(`mssql_scan_parameterize_filters`, on by default), so `WHERE id = 1` and
+`WHERE id = 2` share it — until the catalog's metadata is invalidated
+(`mssql_invalidate_cache()`, DDL through the catalog, `mssql_refresh_cache()`,
+`mssql_preload_catalog()`, or `mssql_catalog_cache_ttl`). Inside an explicit
+transaction the cached shapes are used too, as long as the transaction has
+not changed a schema itself; pushed statements there run on the
+transaction's connection.
+
+If a table changes **outside this catalog** — another client, a migration,
+SSMS, or `mssql_exec` with `mssql_exec_invalidate_cache = false` — the next
+pushed statement over it fails once with *"the statement's result shape
+changed since it was cached … Run the statement again"*: running it again
+describes it anew. A column whose type the statement takes from the catalog
+stays wrong until the catalog is invalidated, as for the table scan; call
+`mssql_invalidate_cache()` after such DDL (or set a
+`mssql_catalog_cache_ttl`).
+
+On very small tables a pushed aggregate can be a few milliseconds slower than
+reading the rows; `mssql_pushdown_min_rows` sets a floor below which
+statements are left to the table scan.
+
+See [Remote Pushdown Settings](../reference/settings.md#remote-pushdown-settings).
+
 ### ORDER BY Pushdown (Experimental)
+
+This setting governs the **table-scan** path only; a statement taken by [remote pushdown](#remote-pushdown-whole-statements) sends its `ORDER BY` / `TOP` regardless of it.
 
 When enabled, ORDER BY clauses on simple column references and supported functions are pushed to SQL Server, avoiding a local sort in DuckDB. Combined ORDER BY + LIMIT is pushed as `SELECT TOP N ... ORDER BY ...`.
 

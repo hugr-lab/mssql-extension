@@ -326,6 +326,7 @@ In addition to options propagated from the secret / connection string, the follo
 | `schema_filter`     | VARCHAR | Override secret schema_filter for this ATTACH                                |
 | `table_filter`      | VARCHAR | Override secret table_filter for this ATTACH                                 |
 | `order_pushdown`    | BOOLEAN | Per-ATTACH ORDER BY pushdown override (overrides `mssql_order_pushdown` setting) |
+| `remote_pushdown`   | BOOLEAN | Per-ATTACH remote pushdown (overrides the `mssql_remote_pushdown` setting); `false` keeps DuckDB's string equality for GROUP BY / DISTINCT / joins — see [Remote Pushdown](../reading/queries.md#remote-pushdown-whole-statements) |
 | `lazy_validation`   | BOOLEAN | Skip the eager ATTACH-time credential check (default `false`)                |
 | `min_connections`   | BIGINT  | Connections to open at ATTACH, their logins in parallel (overrides `mssql_min_connections`). Refused beside `lazy_validation true`. Fewer than asked is logged as a WARNING, not an error |
 | `preload`           | BOOLEAN | Load the whole catalog's metadata at ATTACH, as `mssql_preload_catalog()` would (default `false`). Refused beside `lazy_validation true` or `catalog false`, and inside a transaction that has already used an MSSQL catalog |

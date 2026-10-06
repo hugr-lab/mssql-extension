@@ -17,6 +17,7 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "mssql_storage.hpp"
+#include "query/mssql_describe_cache.hpp"
 #include "query/mssql_result_stream.hpp"
 #include "tds/tds_connection_pool.hpp"
 
@@ -284,6 +285,9 @@ public:
 
 	// Get statistics provider
 	MSSQLStatisticsProvider &GetStatisticsProvider();
+	mssql::DescribeCache &GetDescribeCache() {
+		return describe_cache_;
+	}
 
 	// Get database default collation
 	const string &GetDatabaseCollation() const;
@@ -540,6 +544,8 @@ private:
 	shared_ptr<tds::ConnectionPool> connection_pool_;
 	unique_ptr<MSSQLMetadataCache> metadata_cache_;			   // Metadata cache
 	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;  // Statistics provider
+	//! Spec 079 PR E2: the shapes of the statements remote pushdown sends.
+	mssql::DescribeCache describe_cache_;
 	int32_t database_code_page_ = 0;  // COLLATIONPROPERTY(database collation, 'CodePage'), issue #361
 	//! sys.databases.snapshot_isolation_state for this database, probed at ATTACH
 	//! (issue #331): 0 OFF, 1 ON, 2/3 in transition; -1 when the probe did not

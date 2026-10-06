@@ -1,0 +1,319 @@
+# name: test/sql/pushdown/remote_pushdown_cost.test
+# description: Spec 079 PR E2 -- what a pushed statement costs: its describe is cached per shape; mssql_pushdown_min_rows leaves small reads to the scans
+# group: [pushdown]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# A pushed statement binds through sp_describe_first_result_set: one round
+# trip, and a pooled connection, each time it is planned. The shape of a
+# statement the rewriter wrote is kept (DescribeCache): its constants are
+# parameters, so every execution of a shape after the first binds without a
+# connection -- what mssql_pool_stats' acquire_count shows (one acquire, the
+# execution's). The entry lives as the catalog's metadata does.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# The comparison catalog: pushdown off (on by default since PR E2).
+statement ok
+SET mssql_remote_pushdown = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rc_off (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = true;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rc_on (TYPE mssql);
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+statement ok
+SELECT mssql_exec('rc_off', 'DROP VIEW IF EXISTS dbo.rc_v; DROP TABLE IF EXISTS dbo.rc_t;
+	CREATE TABLE dbo.rc_t (id int NOT NULL PRIMARY KEY, g int NOT NULL);
+	INSERT INTO dbo.rc_t SELECT TOP 100 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), 0 FROM sys.all_objects;
+	UPDATE dbo.rc_t SET g = id % 5');
+
+statement ok
+SELECT mssql_exec('rc_off', 'CREATE VIEW dbo.rc_v AS SELECT id, g FROM dbo.rc_t');
+
+statement ok
+SELECT mssql_invalidate_cache('rc_on'), mssql_invalidate_cache('rc_off');
+
+#
+# The describe cache.
+#
+
+query II
+SELECT g, count(*) FROM rc_on.dbo.rc_t WHERE g > 0 GROUP BY g ORDER BY g LIMIT 10;
+----
+1	20
+2	20
+3	20
+4	20
+
+statement ok
+CREATE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('rc_on');
+
+# The same shape with another constant: bound from the cache, one acquire.
+query II
+SELECT g, count(*) FROM rc_on.dbo.rc_t WHERE g > 2 GROUP BY g ORDER BY g LIMIT 10;
+----
+3	20
+4	20
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('rc_on')) - (SELECT n FROM acquired);
+----
+1
+
+# Invalidating the catalog drops the shapes too: described again -- two
+# acquires, the describe's and the execution's (the table's metadata loaded
+# first, outside the count).
+statement ok
+SELECT mssql_invalidate_cache('rc_on');
+
+statement ok
+DESCRIBE rc_on.dbo.rc_t;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('rc_on');
+
+query II
+SELECT g, count(*) FROM rc_on.dbo.rc_t WHERE g > 3 GROUP BY g ORDER BY g LIMIT 10;
+----
+4	20
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('rc_on')) - (SELECT n FROM acquired);
+----
+2
+
+# A table changed behind the catalog (mssql_exec DDL; the catalog is not
+# invalidated by default): the cached shape no longer matches the stream, the
+# statement fails loudly once and every shape is dropped; the next run
+# describes again. (g + 1 is typed by the server's describe.)
+query II
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2;
+----
+1	2
+2	3
+
+statement ok
+SELECT mssql_exec('rc_off', 'ALTER TABLE dbo.rc_t ALTER COLUMN g bigint NOT NULL; EXEC sp_refreshview ''dbo.rc_v''');
+
+statement error
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2;
+----
+result shape changed since it was cached
+
+query II
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2;
+----
+1	2
+2	3
+
+# Inside a transaction that has changed no schema, the shapes are read too
+# (no round trip for a pushed statement there); one that has changed a schema
+# describes its own. Shown by a shape made stale behind the catalog: the first
+# transaction uses it and fails, the second describes afresh.
+query II
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2;
+----
+1	2
+2	3
+
+statement ok
+SELECT mssql_exec('rc_off', 'ALTER TABLE dbo.rc_t ALTER COLUMN g int NOT NULL; EXEC sp_refreshview ''dbo.rc_v''');
+
+statement ok
+BEGIN;
+
+statement error
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2;
+----
+result shape changed since it was cached
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2;
+----
+1	2
+2	3
+
+statement ok
+SELECT mssql_exec('rc_off', 'ALTER TABLE dbo.rc_t ALTER COLUMN g bigint NOT NULL; EXEC sp_refreshview ''dbo.rc_v''');
+
+statement ok
+DROP TABLE IF EXISTS rc_on.dbo.rc_tx;
+
+statement ok
+BEGIN;
+
+# Catalog DDL runs in autocommit (spec 057): the table stays after ROLLBACK,
+# and is dropped below; the transaction has noted the change all the same.
+statement ok
+CREATE TABLE rc_on.dbo.rc_tx (x int);
+
+query II
+SELECT id, g + 1 AS h FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2;
+----
+1	2
+2	3
+
+statement ok
+ROLLBACK;
+
+statement ok
+DROP TABLE IF EXISTS rc_on.dbo.rc_tx;
+
+statement ok
+SELECT mssql_invalidate_cache('rc_on'), mssql_invalidate_cache('rc_off');
+
+#
+# mssql_pushdown_min_rows: 0 by default (no floor). Set, a statement whose
+# tables hold fewer rows together (cached counts) stays with the scans.
+#
+
+query II
+EXPLAIN SELECT g, count(*) FROM rc_on.dbo.rc_t GROUP BY g ORDER BY g LIMIT 10;
+----
+physical_plan	<REGEX>:.*COUNT_BIG.*
+
+statement ok
+SET mssql_pushdown_min_rows = 101;
+
+query II
+EXPLAIN SELECT g, count(*) FROM rc_on.dbo.rc_t GROUP BY g ORDER BY g LIMIT 10;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query II
+SELECT g, count(*) FROM rc_on.dbo.rc_t GROUP BY g ORDER BY g LIMIT 10;
+----
+0	20
+1	20
+2	20
+3	20
+4	20
+
+# A join reads both tables: 200 rows in all.
+query II
+EXPLAIN SELECT a.g, count(*) FROM rc_on.dbo.rc_t a JOIN rc_on.dbo.rc_t b ON a.id = b.id GROUP BY a.g ORDER BY a.g LIMIT 10;
+----
+physical_plan	<REGEX>:.*COUNT_BIG.*
+
+statement ok
+SET mssql_pushdown_min_rows = 201;
+
+query II
+EXPLAIN SELECT a.g, count(*) FROM rc_on.dbo.rc_t a JOIN rc_on.dbo.rc_t b ON a.id = b.id GROUP BY a.g ORDER BY a.g LIMIT 10;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# ... so does a subquery expression's table.
+query II
+EXPLAIN SELECT count(*) FROM rc_on.dbo.rc_t WHERE id IN (SELECT id FROM rc_on.dbo.rc_t WHERE g = 1);
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+statement ok
+SET mssql_pushdown_min_rows = 150;
+
+query II
+EXPLAIN SELECT count(*) FROM rc_on.dbo.rc_t WHERE id IN (SELECT id FROM rc_on.dbo.rc_t WHERE g = 1);
+----
+physical_plan	<REGEX>:.*COUNT_BIG.*
+
+# A view has no count of its own: never under the floor.
+statement ok
+SET mssql_pushdown_min_rows = 1000000;
+
+query II
+EXPLAIN SELECT g, count(*) FROM rc_on.dbo.rc_v GROUP BY g ORDER BY g LIMIT 10;
+----
+physical_plan	<REGEX>:.*COUNT_BIG.*
+
+# Inside a transaction the floor is not applied (trusted, as the join check).
+statement ok
+BEGIN;
+
+query II
+EXPLAIN SELECT g, count(*) FROM rc_on.dbo.rc_t GROUP BY g ORDER BY g LIMIT 10;
+----
+physical_plan	<REGEX>:.*COUNT_BIG.*
+
+statement ok
+COMMIT;
+
+# The default: on (PR E2). A catalog attached with the setting untouched
+# answers the rewriter.
+statement ok
+RESET mssql_remote_pushdown;
+
+query I
+SELECT current_setting('mssql_remote_pushdown');
+----
+true
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rc_default (TYPE mssql);
+
+statement ok
+SET mssql_pushdown_min_rows = 0;
+
+query II
+EXPLAIN SELECT g, count(*) FROM rc_default.dbo.rc_t GROUP BY g ORDER BY g LIMIT 10;
+----
+physical_plan	<REGEX>:.*COUNT_BIG.*
+
+statement ok
+DETACH rc_default;
+
+# The ATTACH option `remote_pushdown` wins over the setting for its catalog
+# -- what DuckLake's METADATA_PARAMETERS can reach (a string: '1' / 'no' too).
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rc_opt_off (TYPE mssql, remote_pushdown 'false');
+
+query II
+EXPLAIN SELECT g, count(*) FROM rc_opt_off.dbo.rc_t GROUP BY g ORDER BY g LIMIT 10;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rc_opt_on (TYPE mssql, remote_pushdown true);
+
+query II
+EXPLAIN SELECT g, count(*) FROM rc_opt_on.dbo.rc_t GROUP BY g ORDER BY g LIMIT 10;
+----
+physical_plan	<REGEX>:.*COUNT_BIG.*
+
+statement ok
+DETACH rc_opt_on;
+
+statement ok
+DETACH rc_opt_off;
+
+statement ok
+RESET mssql_remote_pushdown;
+
+statement ok
+RESET mssql_pushdown_min_rows;
+
+statement ok
+SELECT mssql_exec('rc_off', 'DROP VIEW dbo.rc_v; DROP TABLE dbo.rc_t');
+
+statement ok
+DETACH rc_on;
+
+statement ok
+DETACH rc_off;

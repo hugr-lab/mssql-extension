@@ -145,6 +145,22 @@ bool SQLWriter::PushesMoreThanScan(const QueryNode &node, const QualificationPro
 		return false;
 	}
 	auto &select = node.Cast<SelectNode>();
+	// QUALIFY drops rows after a window the scan path computes here (PR E2).
+	if (select.qualify) {
+		return true;
+	}
+	// A filter over a derived table's window (`WHERE rn = 1` around
+	// row_number()): the scan path cannot push it into the scan.
+	if (select.where_clause && select.from_table && select.from_table->type == TableReferenceType::SUBQUERY) {
+		auto &inner = *select.from_table->Cast<SubqueryRef>().subquery->node;
+		if (inner.type == QueryNodeType::SELECT_NODE) {
+			for (auto &item : inner.Cast<SelectNode>().select_list) {
+				if (item->IsWindow()) {
+					return true;
+				}
+			}
+		}
+	}
 	// A subquery in FROM that gains (its aggregate, its TOP) gains for the
 	// node around it too: pushed whole, rather than handed back with the part.
 	std::function<bool(const TableRef &)> from_gains = [&](const TableRef &ref) -> bool {

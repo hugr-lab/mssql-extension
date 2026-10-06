@@ -14,6 +14,10 @@ require mssql
 
 require-env MSSQL_TESTDB_DSN
 
+# The comparison catalog: pushdown off (on by default since PR E2).
+statement ok
+SET mssql_remote_pushdown = false;
+
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS rd_off (TYPE mssql);
 

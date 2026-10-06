@@ -28,6 +28,7 @@
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/type_expression.hpp"
+#include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
@@ -116,9 +117,26 @@ struct OutputColumn {
 constexpr size_t MAX_DERIVED_SQL = 1 << 20;
 
 //! The aggregates the writer renders, by DuckDB name.
-enum class AggregateKind { CountStar, Count, Sum, Avg, Min, Max, Stdev, StdevP, Var, VarP };
+enum class AggregateKind { CountStar, Count, Sum, Avg, Min, Max, Stdev, StdevP, Var, VarP, StringAgg };
 
 bool AggregateFor(const std::string &function_name, AggregateKind &out);
+
+//! One aggregate call as the writer needs it, from a FunctionExpression or
+//! from a window's aggregate (spec 079 PR E2): both carry their arguments as
+//! FunctionArguments.
+struct AggregateCall {
+	const std::vector<FunctionArgument> &args;
+	bool distinct;
+	const ParsedExpression *filter;
+	//! An ordered aggregate's ORDER BY (string_agg); null when none.
+	const std::vector<OrderByNode> *orders;
+	//! Exported state or a qualified name: not one of ours.
+	bool foreign;
+	std::string name;
+	std::string text;
+	//! ` OVER (...)` after every aggregate call, for a window's aggregate.
+	std::string over;
+};
 
 //! Whether `expr` holds one of those aggregates -- what makes a node an
 //! aggregate query in DuckDB's binder as in T-SQL.
@@ -157,6 +175,9 @@ struct Relation {
 	//! or a cast back applied inside).
 	bool derived = false;
 	std::string derived_sql;
+	//! A derived table's total_input_rows / total_size_unknown.
+	idx_t total_rows = 0;
+	bool total_unknown = false;
 };
 
 //! A derived table's column as the outer node sees it. A column of the inner
@@ -253,7 +274,16 @@ private:
 	bool CheckGrouped(idx_t index);
 	bool WriteGroups(const SelectNode &node, std::string &sql);
 	bool GroupKeyColumn(const SelectNode &node, const ParsedExpression &key, idx_t &out);
-	bool WriteAggregate(const FunctionExpression &fn, AggregateKind kind, Operand &out);
+	bool WriteAggregate(const AggregateCall &call, AggregateKind kind, Operand &out);
+	bool WriteStringAgg(const AggregateCall &call, const Operand &arg, const std::string &filter, Operand &out);
+	//! A window function (spec 079 PR E2): mssql_node_writer_windows.cpp.
+	bool WriteWindow(const WindowExpression &window, Operand &out);
+	bool WriteWindowFrame(const WindowExpression &window, std::string &sql);
+	//! A node with QUALIFY (PR E2): `SELECT * FROM (<the node, its QUALIFY a
+	//! hidden bit column>) WHERE <it>` with the node's DISTINCT / ORDER BY /
+	//! LIMIT, which DuckDB applies after QUALIFY.
+	bool WriteQualified(const SelectNode &node);
+	bool WriteQualifyColumn(const SelectNode &node);
 	bool WriteSelectList(const SelectNode &node);
 	bool WritePredicate(const ParsedExpression &expr, std::string &sql);
 	bool WritePredicateImpl(const ParsedExpression &expr, std::string &sql);
@@ -311,7 +341,13 @@ private:
 	//! a USING column of the right side only once (on the left).
 	bool IsHiddenUsingColumn(idx_t index) const;
 	bool WriteOrder(const OrderModifier &order, bool limited, std::string &sql);
-	bool ConstantCount(const ParsedExpression &expr, int64_t &out);
+	//! The ORDER BY of an ordered aggregate (`string_agg(x, ',' ORDER BY k)`)
+	//! or of a window: keys named from the FROM, never a result name or a
+	//! position. The server sorts these rows whatever the key, so a UTF-8
+	//! varchar goes by its bytes and NULL placement is emulated without the
+	//! LIMIT a statement's ORDER BY needs for either (spec 079 PR E2).
+	bool WriteSortKeys(const std::vector<OrderByNode> &orders, std::string &sql);
+	bool ConstantCount(const ParsedExpression &expr, int64_t &out, const char *what = "LIMIT / OFFSET");
 
 	const SQLWriterOptions &options_;
 	const SQLWriter::TableResolver &resolver_;
@@ -391,6 +427,24 @@ private:
 	//! are the original's (the resolver knows those objects, not a copy's).
 	const SubqueryRef *synthetic_ref_ = nullptr;
 	const SetOperationNode *synthetic_setop_ = nullptr;
+	//! The node a QUALIFY wrapper stands for, written by the inner writer.
+	const SelectNode *synthetic_select_ = nullptr;
+	//! Writing the node inside a QUALIFY wrapper: no modifiers (the wrapper's),
+	//! the QUALIFY condition as a hidden result column.
+	bool qualifying_ = false;
+	//! Writing that condition: a name that is no FROM column may be a
+	//! select-list alias (DuckDB's order: the column first).
+	bool qualify_aliases_ = false;
+	//! The wrapper's hidden column, left out of its `*`.
+	std::string hidden_column_;
+	//! A QUALIFY on select-list aliases only, filtered by the wrapper on its
+	//! columns: the names, none of which may be a FROM column.
+	std::vector<std::string> qualify_names_;
+	//! Tie-dependent windows written (WriteWindow), and whether the QUALIFY
+	//! condition named a computed alias: a window evaluated twice could break
+	//! its ties two ways.
+	idx_t tie_windows_ = 0;
+	bool qualify_named_alias_ = false;
 	//! The SEMI / ANTI relation whose condition is being written: the one
 	//! place its columns can be named.
 	idx_t semi_scope_ = DConstants::INVALID_INDEX;
@@ -423,6 +477,10 @@ private:
 	//! Writing an aggregate's argument.
 	bool in_aggregate_ = false;
 	bool distinct_ = false;
+	//! The WITHIN GROUP order of the node's first ordered string_agg: the
+	//! server refuses two different ones in one scope (8711).
+	bool string_agg_ordered_ = false;
+	std::string string_agg_order_;
 	SqlParamSet own_params_;
 	std::vector<Value> own_param_values_;
 	SqlParamSet *params_;

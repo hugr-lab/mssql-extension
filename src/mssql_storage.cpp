@@ -1248,6 +1248,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	bool default_schema_specified = false;
 	bool table_filter_specified = false;
 	int8_t order_pushdown_option = -1;	  // Spec 039: ORDER BY pushdown (-1=unset)
+	int8_t remote_pushdown_option = -1;	  // Spec 079 PR E2: mssql_remote_pushdown per catalog (-1=unset)
 	bool lazy_validation = false;		  // Spec 047 (US2): opt out of eager creds check
 	bool preload_option = false;		  // Issue #324: preload the catalog at ATTACH
 	int64_t min_connections_option = -1;  // Issue #324: ATTACH-level mssql_min_connections (-1=unset)
@@ -1292,6 +1293,12 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			it = options.options.erase(it);
 		} else if (lower_name == "order_pushdown") {
 			order_pushdown_option = BooleanAttachOption(it->first, it->second) ? 1 : 0;
+			it = options.options.erase(it);
+		} else if (lower_name == "remote_pushdown") {
+			// Spec 079 PR E2: the catalog's own answer to the rewriter, over
+			// mssql_remote_pushdown -- what DuckLake's METADATA_PARAMETERS can
+			// reach (it forwards ATTACH options, not settings).
+			remote_pushdown_option = BooleanAttachOption(it->first, it->second) ? 1 : 0;
 			it = options.options.erase(it);
 		} else if (lower_name == "lazy_validation" || lower_name == "lazyvalidation") {
 			// Spec 047 (US2): suppress the eager TCP+LOGIN7 round trip below.
@@ -1602,7 +1609,9 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	startup.validate = !lazy_validation;
 	startup.validation_timeout_seconds = attach_validation_timeout;
 	startup.prewarm = !lazy_validation;
-	{
+	if (remote_pushdown_option >= 0) {
+		startup.remote_pushdown = remote_pushdown_option == 1;
+	} else {
 		Value remote_pushdown;
 		startup.remote_pushdown = context.TryGetCurrentSetting("mssql_remote_pushdown", remote_pushdown) &&
 								  !remote_pushdown.IsNull() && remote_pushdown.GetValue<bool>();

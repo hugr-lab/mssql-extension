@@ -80,6 +80,14 @@ Details: [Target Column Types and Table Shape](../writing/table-options.md).
 
 The `order_pushdown` ATTACH option provides per-database control. See [ORDER BY Pushdown](../reading/queries.md#order-by-pushdown-experimental) for details.
 
+### Remote Pushdown Settings
+
+| Setting                              | Type    | Default | Range | Description |
+| ------------------------------------ | ------- | ------- | ----- | ----------- |
+| `mssql_remote_pushdown`              | BOOLEAN | true    | -     | Send whole SELECT statements over one attached database to SQL Server as one T-SQL statement. **Read at ATTACH** and fixed for that database's life: set it before `ATTACH`, or give the database its own with the ATTACH option `remote_pushdown true/false`. Global (no per-session switch). While on, GROUP BY / DISTINCT / join keys / PARTITION BY compare strings under the column's collation — see [Remote Pushdown](../reading/queries.md#remote-pushdown-whole-statements). Also while on: the database's schema `main` answers as its default schema for reads **and writes** (`db.main.t` reads `dbo.t`; `CREATE` / `DROP TABLE db.main.x` act on `dbo.x`, where without it `main` is not found), DuckDB skips its catalog-or-schema ambiguity check for it, and DuckDB's pushdown rewriter runs on every statement of the instance |
+| `mssql_pushdown_join_rows_threshold` | BIGINT  | 1000000 | ≥0    | A join whose gain is not certain (many-to-many, CROSS) is pushed only while every table it joins has fewer rows than this (cached counts, no round trip); else the table scans keep it; a view (no row count of its own) never counts as small. 0 = always push. Not checked inside a transaction or on a pool of one connection |
+| `mssql_pushdown_min_rows`            | BIGINT  | 0       | ≥0    | A statement whose tables hold fewer rows than this **together** (cached counts) is left to the table scans. The counts are the cached, approximate ones, and a table read twice (a self-join) counts twice. 0 = no floor. Not applied inside a transaction, on a pool of one connection, or when a view is read |
+
 ### INSERT Settings
 
 | Setting                            | Type    | Default  | Range  | Description                           |

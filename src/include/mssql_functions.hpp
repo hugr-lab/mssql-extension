@@ -103,6 +103,11 @@ struct MSSQLScanBindData : public FunctionData {
 	//! a second global state over this same bind data cannot use that handle.
 	//! Empty unless the prepared path took over.
 	string fallback_sql;
+	//! Spec 079 PR E2: the DescribeCache key this bind's shape came from or went
+	//! to; the init-time shape check drops the entry when the stream differs.
+	string describe_cache_key;
+	//! The shape came from that cache (not from a describe at this bind).
+	bool shape_from_cache = false;
 	bool prepared = false;
 	shared_ptr<MSSQLPreparedSession> prepared_session;
 	// The F1 fallback: the describe could not settle the shape (a batch with a

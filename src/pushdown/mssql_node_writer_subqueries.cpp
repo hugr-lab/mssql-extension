@@ -234,6 +234,8 @@ bool NodeWriter::WriteScalarSubquery(const SubqueryExpression &subquery, Operand
 		return false;
 	}
 	out_.picks_rows = out_.picks_rows || inner_out.picks_rows;
+	out_.total_input_rows += inner_out.total_input_rows;
+	out_.total_size_unknown = out_.total_size_unknown || inner_out.total_size_unknown;
 	// At most one row, provably: DuckDB checks every outer row (an
 	// uncorrelated subquery once, even for no outer row) and raises on several;
 	// the server evaluates it lazily -- never under a TOP that stops first, an
@@ -258,6 +260,8 @@ bool NodeWriter::WriteSubqueryCondition(const SubqueryExpression &subquery, std:
 			return false;
 		}
 		out_.picks_rows = out_.picks_rows || inner_out.picks_rows;
+		out_.total_input_rows += inner_out.total_input_rows;
+		out_.total_size_unknown = out_.total_size_unknown || inner_out.total_size_unknown;
 		const std::string exists = "EXISTS (" + inner_out.statement + ")";
 		sql = subquery.GetSubqueryType() == SubqueryType::NOT_EXISTS ? ExpressionVocabulary::Not(exists) : exists;
 		return true;
@@ -275,6 +279,8 @@ bool NodeWriter::WriteSubqueryCondition(const SubqueryExpression &subquery, std:
 			return false;
 		}
 		out_.picks_rows = out_.picks_rows || inner_out.picks_rows;
+		out_.total_input_rows += inner_out.total_input_rows;
+		out_.total_size_unknown = out_.total_size_unknown || inner_out.total_size_unknown;
 		Operand right;
 		if (!SubqueryOperand(inner, inner_out, std::string(), right)) {
 			return false;

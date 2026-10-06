@@ -58,6 +58,29 @@ order of priority yet.
 - **Derived table size.** A derived table is sized by its largest input, not
   by what it returns (an aggregate's group count).
 
+## Before spec 080: a vehicle that trusts the shape it is given
+
+- **The shape passed in, not asked for: `mssql_scan_unsafe` /
+  `mssql_scan_params_unsafe`, and the writer's shape for pushed statements.**
+  Since spec 075 a scan describes at bind (`sp_describe_first_result_set`) and
+  runs at init. Running at bind is not the way out: DuckLake runs its reads in
+  transactions, and several scans of one statement bound there contend for the
+  one pinned connection (the reason 075 moved execution to init). Instead the
+  bind trusts a shape given to it: it returns those names and types without
+  asking the server (no round trip, no connection, so inside a transaction and
+  on a pool of one too), and execution, at init as always, returns the rows in
+  that shape. A stream of another shape is a loud error at init, never a silent
+  conversion (lossless widenings, int into bigint, could be allowed). Hence
+  "unsafe": the caller vouches for the shape and the check waits for execution.
+  Two users: the remote-pushdown writer, which knows the shape of table columns
+  and aggregates and passes it (a statement with a computed column whose type
+  is the server's keeps the describe cache, else the describe); and users'
+  own T-SQL whose shape they know (mssql-ducklake's own statements pay a
+  describe today). The describe cost measured in E2: 1.5-3 ms a statement
+  locally, a network round trip remotely; the E2 cache covers repeated shapes,
+  this covers the first one too. Owner's call (E2): its own small spec after
+  #406, before spec 080, which builds its DML pushdown on the same vehicle.
+
 ## Shapes not pushed yet
 
 - **E2** (planned): windows and QUALIFY, FILTER as CASE, `string_agg`, the
@@ -71,6 +94,12 @@ order of priority yet.
   same catalog inside a CTE or a subquery could be inlined as a derived table
   (its describe gives the types, its parameters merge with ours; refuse T-SQL
   that cannot nest: ORDER BY without TOP, several statements, DECLARE).
+- **`IGNORE NULLS` in a window (`last_value(x IGNORE NULLS)`, the
+  forward-fill idiom).** The server takes it from SQL Server 2022 and refuses
+  it as a syntax error before; the extension keeps only the TDS version, which
+  is the same from 2012 on. Vetoed in E2; the product version LOGINACK already
+  carries, kept on the connection, would let a 2022+ server take it (owner,
+  E2).
 - **A correlated scalar subquery on a string key against an outer column.**
   Vetoed unless the key meets a constant (an outer varchar against an
   nvarchar compares under other rules); a same-type, same-collation outer

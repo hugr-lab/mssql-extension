@@ -162,6 +162,7 @@ set(EXTENSION_SOURCES
     # Query execution layer (DuckDB integration)
     src/query/mssql_query_executor.cpp
     src/query/mssql_result_stream.cpp
+    src/query/mssql_describe_cache.cpp
     src/query/mssql_simple_query.cpp
     src/query/mssql_sql_params.cpp
     # Connection management layer (DuckDB integration)
@@ -204,6 +205,7 @@ set(EXTENSION_SOURCES
     src/pushdown/mssql_node_writer_select.cpp
     src/pushdown/mssql_node_writer_subqueries.cpp
     src/pushdown/mssql_node_writer_values.cpp
+    src/pushdown/mssql_node_writer_windows.cpp
     src/pushdown/mssql_order_term.cpp
     src/pushdown/mssql_pushdown_resolution.cpp
     src/pushdown/mssql_query_tree.cpp

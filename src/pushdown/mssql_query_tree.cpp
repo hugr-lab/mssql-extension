@@ -227,8 +227,8 @@ void RestoreTableNames(QueryNode &node) {
 			auto original = table_names.Find(ref);
 			if (!original) {
 				throw BinderException(
-					"mssql: remote pushdown lost the name of table %s; run the statement with "
-					"mssql_remote_pushdown = false, and please report it",
+					"mssql: remote pushdown lost the name of table %s; SET mssql_remote_pushdown = false and "
+					"ATTACH the database again to run the statement, and please report it",
 					ref.ToString());
 			}
 			ref.SetQualifiedName(*original);
