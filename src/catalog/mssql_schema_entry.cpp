@@ -136,6 +136,8 @@ SimilarCatalogEntry MSSQLSchemaEntry::GetSimilarEntry(CatalogTransaction transac
 			catalog.GetConnectionPool().Release(std::move(connection));
 			shared.TryGetTableNames(schema_name, names);
 		}
+	} catch (const InterruptException &) {
+		throw;
 	} catch (const std::exception &) {
 		return result;
 	}
