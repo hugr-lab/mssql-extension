@@ -249,6 +249,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A query naming a missing table loaded every column of the catalog, and
+  reloaded it every time when the database had a schema without tables**
+  (#412). DuckDB walks every schema for its "did you mean" hint; that walk now
+  reads table names only -- from the cache, or one names-only query for all
+  schemas -- instead of building every table's entry with its columns. And a
+  schema with no table or view (a new one, one holding only procedures) never
+  counted as loaded, so each full listing of it ran the whole-catalog metadata
+  query again; it now loads once, like any other. Measured by the
+  mssql-ducklake side on a 4,724-table catalog database: 13-34 s a
+  missing-table query, every time.
+
 - **A CTE over an attached table, used more than once under a `LIMIT`, failed
   with `Table Function with name mssql_catalog_scan does not exist`.**
   DuckDB inlines such a CTE by copying its plan, and the copy looks the scan

@@ -3,7 +3,10 @@
 #include "catalog/mssql_ddl_translator.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "catalog/mssql_table_options.hpp"
+#include "catalog/mssql_transaction.hpp"
+#include "catalog/mssql_transaction_metadata.hpp"
 #include "codec/target_string_type.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception.hpp"
@@ -73,6 +76,78 @@ void MSSQLSchemaEntry::Scan(ClientContext &context, CatalogType type,
 
 	// Scan all tables
 	tables_.Scan(context, callback);
+}
+
+SimilarCatalogEntry MSSQLSchemaEntry::GetSimilarEntry(CatalogTransaction transaction,
+													  const EntryLookupInfo &lookup_info) {
+	SimilarCatalogEntry result;
+	if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY || !transaction.HasContext()) {
+		// Scan lists tables only, and needs a context to list them.
+		return result;
+	}
+	auto &context = transaction.GetContext();
+	auto &catalog = GetMSSQLCatalog();
+	const string schema_name = name.GetIdentifierName();
+	catalog.EnsureCacheLoaded(context);
+	vector<string> names;
+	// Only a hint: DuckDB asks every attached schema whenever any name is
+	// missing, a local table's included, so a server that cannot answer must
+	// not turn "does not exist" into a connection error (review of #412).
+	try {
+		auto &shared = catalog.GetMetadataCache();
+		const bool in_transaction = !context.transaction.IsAutoCommit();
+		// A transaction that changed this schema reads its own names, on its
+		// pinned connection (#380: the shared cache holds committed state only);
+		// so does one on a pool of ONE, whose only connection it may hold.
+		// Otherwise the committed names, through a pool connection -- a hint
+		// does not pin a connection or open a server transaction.
+		bool own = false;
+		if (in_transaction) {
+			auto &metadata = MSSQLTransaction::Get(context, catalog).Metadata(context);
+			own = metadata.IsSchemaChanged(schema_name) ||
+				  (catalog.GetConnectionLimit() <= 1 && !shared.TryGetTableNames(schema_name, names));
+			if (own) {
+				auto &cache = metadata.Cache();
+				if (!cache.TryGetTableNames(schema_name, names)) {
+					auto connection = ConnectionProvider::GetConnection(context, catalog);
+					try {
+						cache.LoadAllTableNames(*connection);
+					} catch (...) {
+						ConnectionProvider::ReleaseConnection(context, catalog, std::move(connection));
+						throw;
+					}
+					ConnectionProvider::ReleaseConnection(context, catalog, std::move(connection));
+					cache.TryGetTableNames(schema_name, names);
+				}
+			}
+		}
+		if (!own && !shared.TryGetTableNames(schema_name, names)) {
+			std::string why;
+			auto connection = catalog.GetConnectionPool().Acquire(-1, &why);
+			if (!connection) {
+				throw IOException("Failed to acquire connection for table names: " + why);
+			}
+			try {
+				shared.LoadAllTableNames(*connection);
+			} catch (...) {
+				catalog.GetConnectionPool().Release(std::move(connection));
+				throw;
+			}
+			catalog.GetConnectionPool().Release(std::move(connection));
+			shared.TryGetTableNames(schema_name, names);
+		}
+	} catch (const std::exception &) {
+		return result;
+	}
+	const auto &wanted = lookup_info.GetEntryName();
+	for (const auto &table_name : names) {
+		auto score = StringUtil::SimilarityRating(table_name, wanted);
+		if (score > result.score) {
+			result.score = score;
+			result.name = Identifier(table_name);
+		}
+	}
+	return result;
 }
 
 void MSSQLSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {

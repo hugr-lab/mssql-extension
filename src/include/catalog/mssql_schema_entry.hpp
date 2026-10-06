@@ -59,6 +59,11 @@ public:
 	void Alter(CatalogTransaction transaction, AlterInfo &info) override;
 
 	void Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
+	//! Issue #412: DuckDB's "did you mean" hint for a missing table reads entry
+	//! names only, and the default walks Scan, which loads every column of the
+	//! catalog. This one compares table names, from the cache or one
+	//! names-only query.
+	SimilarCatalogEntry GetSimilarEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override;
 
 	void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
 

@@ -348,6 +348,17 @@ public:
 	// Get column metadata load state for table
 	CacheLoadState GetColumnsState(const string &schema_name, const string &table_name) const;
 
+	//! Issue #412: the names of a schema's tables and views, for DuckDB's "did
+	//! you mean" hint on a missing table -- from the schema's loaded table list,
+	//! else from the names-only list LoadAllTableNames read (until any
+	//! invalidation, or past the TTL). False when neither holds them.
+	bool TryGetTableNames(const string &schema_name, vector<string> &out_names);
+	//! Issue #412: every schema's table and view names in one query, no columns
+	//! -- what the hint needs, where a Scan loads every column of the catalog.
+	//! Kept apart from the table lists, which carry row counts and shapes this
+	//! query does not read.
+	void LoadAllTableNames(tds::TdsConnection &connection);
+
 private:
 	//! The bodies of EnsureSchemasLoaded and LoadAllSchemasMetadata, for a caller
 	//! that already holds mutex_. BulkLoadAll holds ONE lock across the schema
@@ -432,6 +443,13 @@ private:
 	// Incremental cache state for schema list (catalog-level) — guarded by mutex_
 	CacheLoadState schemas_load_state_ = CacheLoadState::NOT_LOADED;
 	std::chrono::steady_clock::time_point schemas_last_refresh_;
+
+	// Issue #412: LoadAllTableNames' answer, valid while invalidation_epoch_ is
+	// table_names_epoch_ (any invalidation ends it) -- guarded by mutex_.
+	unordered_map<string, vector<string>> table_names_;
+	bool table_names_loaded_ = false;
+	uint64_t table_names_epoch_ = 0;
+	std::chrono::steady_clock::time_point table_names_loaded_at_;
 };
 
 }  // namespace duckdb
