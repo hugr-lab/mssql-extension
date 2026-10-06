@@ -417,11 +417,12 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: ORDER BY pushdown: %s", bind_data.order_by_clause.c_str());
 	}
 
-	if (!params.params.empty()) {
-		// The text is now one fixed string per shape; the values ride in the
-		// DECLARE line, and the server keeps one plan for all of them.
-		query = params.ExecuteSqlBatch(query);
-	}
+	// Spec 083: with parameters, the statement goes as an RPC call of
+	// sp_executesql -- one fixed text per shape, the values bound as typed
+	// parameters. The batch form (`DECLARE ...; EXEC sp_executesql ...`) made the
+	// server parse and compile the outer batch on every scan.
+	tds::Request request = params.params.empty() ? tds::Request(query) : params.ExecuteSqlRequest(query);
+	query = request.sql;
 	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: generated query = %s", query.c_str());
 
 	// Execute the query.
@@ -439,7 +440,7 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		materialize_lock = std::unique_lock<std::mutex>(catalog.MaterializeMutexFor(context));
 	}
 	MSSQLQueryExecutor executor(bind_data.context_name);
-	result->result_stream = executor.Execute(context, query);
+	result->result_stream = executor.Execute(context, request);
 
 	// COLMETADATA is known now, so say what is wrong with the columns before any
 	// rows move. Waiting for the drain-end call loses this entirely on a query
@@ -1328,12 +1329,18 @@ static void CatalogScanSerialize(Serializer &serializer, const optional_ptr<Func
 	// lists (names are positional: p0, p1, ...).
 	vector<string> param_declarations;
 	vector<string> param_literals;
+	vector<Value> param_values;
 	for (const auto &p : bind_data.complex_filter_params.params) {
 		param_declarations.push_back(p.declaration);
 		param_literals.push_back(p.literal);
+		// Spec 083: the value, which the RPC request binds; a literal-only
+		// parameter (none is made today) round-trips as SQLNULL and keeps the
+		// batch form.
+		param_values.push_back(p.has_value ? p.value : Value(LogicalType::SQLNULL));
 	}
 	serializer.WriteProperty(107, "complex_filter_param_declarations", param_declarations);
 	serializer.WriteProperty(108, "complex_filter_param_literals", param_literals);
+	serializer.WritePropertyWithDefault(109, "complex_filter_param_values", param_values);
 }
 
 // DuckDB round-trips a logical plan to copy it: CTE inlining copies a CTE
@@ -1351,6 +1358,7 @@ static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserialize
 	auto requires_materialization = deserializer.ReadProperty<bool>(106, "requires_materialization");
 	auto param_declarations = deserializer.ReadProperty<vector<string>>(107, "complex_filter_param_declarations");
 	auto param_literals = deserializer.ReadProperty<vector<string>>(108, "complex_filter_param_literals");
+	auto param_values = deserializer.ReadPropertyWithDefault<vector<Value>>(109, "complex_filter_param_values");
 
 	auto &context = deserializer.Get<ClientContext &>();
 
@@ -1381,7 +1389,11 @@ static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserialize
 		throw SerializationException("MSSQL: catalog scan parameter lists differ in length");
 	}
 	for (idx_t i = 0; i < param_declarations.size(); i++) {
-		result.complex_filter_params.Add(param_declarations[i], param_literals[i]);
+		if (i < param_values.size() && param_values[i].type().id() != LogicalTypeId::SQLNULL) {
+			result.complex_filter_params.Add(param_declarations[i], param_literals[i], param_values[i]);
+		} else {
+			result.complex_filter_params.Add(param_declarations[i], param_literals[i]);
+		}
 	}
 	result.order_by_clause = order_by_clause;
 	result.top_n = top_n;

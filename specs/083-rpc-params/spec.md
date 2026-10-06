@@ -119,6 +119,23 @@ postgres; that is the environment, not the extension.
   (`mssql_exec_params` returning rows) are later work. mssql-ducklake asked for
   them. The encoder and the token handling here are what they build on.
 
+## Later (not in this spec)
+
+- **String parameters as UTF-8.** On a connection the server granted
+  `UTF8SUPPORT` (SQL Server 2019+), a string parameter could go as `varchar`
+  (0xA7) with a UTF-8 collation and its bytes as they are, the way the BCP
+  write path already sends UTF-8 columns (spec 060), instead of being transcoded
+  to UTF-16.
+  - The semantics would not change: the comparison runs on the DECLARED
+    parameter type, and the server converts the argument to it through Unicode,
+    exactly as it converts the nvarchar argument today.
+  - The gain is small. `@stmt` and `@params` must stay `nvarchar` (sp_executesql
+    takes nothing else), and they are most of the call; the values DuckLake
+    sends are short.
+  - It also adds a second inline/PLP boundary: 8000 bytes of UTF-8, up to 4
+    bytes a character.
+  - Worth it only if a measurement shows string parameter transfer to matter.
+
 ## Tests
 
 - **Every parameter type of D2, over RPC.** A round trip through
@@ -132,6 +149,11 @@ postgres; that is the environment, not the extension.
   form cannot come back unnoticed. The budget is loose enough for CI.
 - **Staging.** An empty scan of a wide table allocates no payload, via the
   existing staging counters; the current shrink and grow tests.
+- **Parameter collation (review of step 1).** A string parameter goes as
+  `nvarchar` with Latin1_General_CI_AS bytes in its TYPE_INFO. Its conversion
+  to a declared `varchar` should follow the database's collation (#361's code
+  page), whatever those bytes say. To be confirmed against a database whose
+  default is not code page 1252 before the PR leaves draft.
 
 ## Measured in the PR
 

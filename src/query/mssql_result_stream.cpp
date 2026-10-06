@@ -40,7 +40,7 @@ namespace duckdb {
 // MSSQLResultStream Implementation
 //===----------------------------------------------------------------------===//
 
-MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql,
+MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const tds::Request &request,
 									 const string &context_name, weak_ptr<tds::ConnectionPool> pool_handle,
 									 bool transaction_pinned, int query_timeout_seconds, bool reset_on_release)
 	: connection_(std::move(connection)),
@@ -48,7 +48,8 @@ MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connect
 	  pool_handle_(std::move(pool_handle)),
 	  transaction_pinned_(transaction_pinned),
 	  reset_on_release_(reset_on_release),
-	  sql_(sql),
+	  sql_(request.sql),
+	  request_(request.IsRpc() ? request : tds::Request()),
 	  state_(MSSQLResultStreamState::Initializing),
 	  is_cancelled_(false),
 	  rows_read_(0),
@@ -141,7 +142,9 @@ bool MSSQLResultStream::Initialize() {
 	}
 
 	// Send the SQL batch
-	if (!connection_->ExecuteBatch(sql_, "scan result stream")) {
+	const bool sent = request_.IsRpc() ? connection_->ExecuteRequest(request_, "scan result stream")
+									   : connection_->ExecuteBatch(sql_, "scan result stream");
+	if (!sent) {
 		throw IOException("Failed to execute SQL batch: " + connection_->GetLastError());
 	}
 	batch_sent_ = true;
