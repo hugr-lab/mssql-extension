@@ -46,7 +46,7 @@ void ColumnStaging::GrowPayload(idx_t needed) {
 	}
 	// Double, so a steady stream allocates once and then never again — capacity
 	// is retained across chunks by the arena.
-	idx_t target = buffer.size() * 2;
+	idx_t target = buffer.empty() ? idx_t(4096) : buffer.size() * 2;
 	if (target < needed) {
 		target = needed;
 	}

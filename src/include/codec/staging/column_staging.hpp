@@ -284,15 +284,10 @@ struct ColumnStaging {
 			lengths.resize(STANDARD_VECTOR_SIZE);
 			// The provable worst case for a whole chunk. uint64 arithmetic: a
 			// declared max_length near 0xFFFF times 2048 overflows uint32.
-			const idx_t bound = static_cast<idx_t>(max_value_bytes) * STANDARD_VECTOR_SIZE;
-			if (max_value_bytes > 0 && bound <= STAGING_PREALLOC_BUDGET_BYTES) {
-				buffer.resize(bound);
-				// Nothing can exceed this, so growth is now unreachable and the
-				// arena must not shrink it back into reach.
-				payload_bounded = true;
-			} else if (buffer.size() < STAGING_UNBOUNDED_INITIAL_BYTES) {
-				buffer.resize(STAGING_UNBOUNDED_INITIAL_BYTES);
-			}
+			// RECON (lazy staging): no payload allocation here -- an empty result
+			// zero-filled up to 2 MB per bounded string column and 64 KB per MAX
+			// column on every scan. GrowPayload allocates on the first value.
+			(void)max_value_bytes;
 		} else {
 			offsets.clear();
 			lengths.clear();
