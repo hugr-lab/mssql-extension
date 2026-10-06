@@ -80,6 +80,11 @@ order of priority yet.
   locally, a network round trip remotely; the E2 cache covers repeated shapes,
   this covers the first one too. Owner's call (E2): its own small spec after
   #406, before spec 080, which builds its DML pushdown on the same vehicle.
+  **Done in spec 081** (`specs/081-shape-vehicle/`), for statements whose
+  every column the writer types. Left: a cast-back column (the integer `sum`
+  as decimal(38,0) is exact; decimal arithmetic over cast-back operands is
+  widened by the server in ways the writer does not model) and lossless
+  widenings at the check.
 
 ## Shapes not pushed yet
 

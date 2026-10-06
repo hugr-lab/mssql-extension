@@ -781,20 +781,22 @@ writer (`pushdown/mssql_sql_writer`) as a dry run -- whether it RENDERS the
 node, since the rewriter asks about every nested node too and a no anywhere
 poisons the statement -- and `RemoteExecute` decides whether it gains, runs
 the writer again and replaces the node with
-`mssql_scan_params(…, column_types := […])`. A node that does not render or
+`mssql_scan_params(…, column_types := […])` -- or, when the writer types every
+result column, `mssql_scan_params_unsafe(…, columns := {…})`, whose bind asks
+the server nothing (spec 081). A node that does not render or
 gain is handed back as a subquery, table names restored as the query wrote
 them, with each nested part that does replaced by `SELECT * FROM <its
 vehicle>` (PR E1). From there each vehicle is an ordinary raw scan: describe
-at bind, run at init, and the pinned connection inside a transaction -- except
-that the describe of a statement the rewriter wrote is cached per catalog
-(PR E2, below).
+at bind (none for an `_unsafe` vehicle), run at init, and the pinned
+connection inside a transaction -- except that the describe of a statement the
+rewriter wrote is cached per catalog (PR E2, below).
 
 ```mermaid
 flowchart LR
     P[parsed SELECT] --> R{rewriter:<br/>SupportsPushdown<br/>= renders?}
     R -- no --> B[binder → MSSQLCatalogScan<br/>filter / projection pushdown, MSSQLOptimizer]
     R -- yes --> E{RemoteExecute:<br/>gains? join gain check}
-    E -- "yes (ORDER BY / LIMIT / DISTINCT / GROUP BY / aggregate /<br/>join / subquery / nested set operation)" --> V["mssql_scan_params(T-SQL, params,<br/>column_types) — EXPLAIN shows it"]
+    E -- "yes (ORDER BY / LIMIT / DISTINCT / GROUP BY / aggregate /<br/>join / subquery / nested set operation)" --> V["mssql_scan_params(T-SQL, params, column_types),<br/>or _unsafe(…, columns) when every type is known<br/>— EXPLAIN shows it"]
     E -- "no, or a set operation at the top" --> H["handed back as a subquery:<br/>each part that gains → its own vehicle,<br/>the rest → binder / scan path"]
 ```
 
@@ -841,6 +843,16 @@ Invariants:
   an uncertain join over a table at or above
   `mssql_pushdown_join_rows_threshold` (or of unknown size: a view, a derived
   table) is handed back. Skipped inside a transaction and on a pool of one.
+- **A statement whose every column is typed is not described at all**
+  (spec 081). `VehicleFor` calls `mssql_scan_params_unsafe` /
+  `mssql_scan_unsafe` with the writer's `column_types` as `columns`; the bind
+  takes them as the shape, and the init holds the stream to them by the rule
+  `column_types` is held to against a describe (`ColumnTypeFits`), so the
+  check is the same one, made against the stream. A cast-back column (an
+  integer `sum`, HUGEINT over decimal(38,0)) or a server-typed one keeps the
+  describing vehicle: the writer does not know the wire type exactly there.
+  Such a statement over a table changed behind the catalog fails at init,
+  naming the statement, and clears the describe cache.
 - **A pushed statement's shape is cached by its text** (PR E2,
   `query/mssql_describe_cache`). `VehicleFor` notes the statement in the
   catalog's `DescribeCache`; its bind takes the shape from there (no round

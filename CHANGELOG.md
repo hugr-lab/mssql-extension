@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`mssql_scan_unsafe` / `mssql_scan_params_unsafe`** (spec 081): `mssql_scan`
+  / `mssql_scan_params` with the result's shape given as
+  `columns := {'name': 'TYPE', ...}` instead of described. The bind asks the
+  server nothing, so the call binds inside a transaction, on a pool of one
+  connection, and for a batch the server cannot describe (a `#temp` read) like
+  any other statement; the rows are checked against the shape when the
+  statement runs (column count, the kind of each column as the catalog reads
+  it, no conversion; a string's length and collation are not checked), and a
+  mismatch fails the statement naming it. A type no SQL
+  Server column is read as is refused at bind. `EXPLAIN` shows
+  `Shape: given (columns :=)`.
+
 - **Remote pushdown, first shapes (spec 079 PR B), behind
   `mssql_remote_pushdown`** (read at ATTACH; on by default since PR E2, see
   Changed). An attached catalog answers DuckDB's remote-pushdown
@@ -248,6 +260,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted and ignored, is refused.
 
 ### Fixed
+
+- **A pushed `LIMIT 0` cost a describe and an execution** (spec 081): DuckDB
+  answers it with an empty result and asks the server nothing, so the rewriter
+  now leaves it alone. DuckLake's attach probes every inlined-data table in one
+  `UNION ALL` of `LIMIT 0` branches, and a thousand of them made each attach
+  1.6-1.8x slower with pushdown on.
 
 - **A CTE over an attached table, used more than once under a `LIMIT`, failed
   with `Table Function with name mssql_catalog_scan does not exist`.**
@@ -750,6 +768,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than one statement — degrades to the default path.
 
 ### Changed
+
+- **A pushed statement whose every column the extension types is planned
+  without a round trip** (spec 081): the remote-pushdown rewriter sends it
+  through `mssql_scan_params_unsafe` with the catalog's types, so its first
+  run takes one connection instead of two and its bind needs no connection
+  (77% of the pushdown suite's statements). A statement with a column the
+  server types (`g + 1`) or one cast back after the read (an integer `sum`) is
+  described as before, through
+  the shape cache. Over a table changed outside the catalog such a statement
+  now fails at execution rather than at bind, naming the statement and
+  `mssql_invalidate_cache()`.
 
 - **`mssql_remote_pushdown` is on by default** (spec 079 PR E2). A SELECT
   over one attached database with a join, an aggregate, `DISTINCT`, `ORDER

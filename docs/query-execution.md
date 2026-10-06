@@ -315,6 +315,10 @@ EXEC sp_executesql N'SELECT id, name FROM dbo.users WHERE id > @id AND created >
 
 The inner text and declarations are what the server keys its plan on, so every call with the same statement — from any session — reuses one plan. The DECLARE line differs per call and is a trivial batch. A bare `NULL` (no type), a LIST/STRUCT (a table-valued parameter needs RPC) and a key that is not a T-SQL identifier are refused at bind with the fix named.
 
+### mssql_scan_unsafe / mssql_scan_params_unsafe
+
+`mssql_scan_unsafe(context, query, columns := {...})` and `mssql_scan_params_unsafe(context, statement, params [, declarations], columns := {...})` (spec 081) skip step 1: Bind takes `columns` (a STRUCT of type names, parsed by `TransformStringToLogicalType`, so the `MSSQL_VARCHAR` / `MSSQL_NVARCHAR` labels work) as the shape and touches no connection; `trusted_function` on the bind data says so. A type `TypeConverter` never produces and `ColumnTypeFits` never reads into is refused there (`StreamCanProduce`). InitGlobal runs the batch as for `mssql_scan` and checks the stream with `StreamFitsTrustedShape`: the column count, then per column `ColumnTypeFits(stream type, declared, stream column is datetime2)` -- the predicate `column_types` is held to against a describe, here held against the stream. A mismatch names the statement (its first 200 characters) and clears the catalog's describe cache. `MSSQLOptimizer` counts both as raw scans of their catalog, so a catalog scan beside one in a transaction materialises. `MSSQLCatalog::VehicleFor` uses them for a pushed statement whose `WrittenQuery::column_types` has no INVALID entry.
+
 ## mssql_exec Function
 
 `mssql_exec(context, sql)` executes a T-SQL statement and returns the affected row count.
