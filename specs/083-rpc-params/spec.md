@@ -175,8 +175,13 @@ postgres; that is the environment, not the extension.
 - **Parameter collation (review of step 1).** A string parameter goes as
   `nvarchar` with Latin1_General_CI_AS bytes in its TYPE_INFO. Its conversion
   to a declared `varchar` should follow the database's collation (#361's code
-  page), whatever those bytes say. To be confirmed against a database whose
-  default is not code page 1252 before the PR leaves draft.
+  page), whatever those bytes say. Confirmed on a database created with
+  `Cyrillic_General_CI_AS` (code page 1251), the branch base and this branch
+  alike: a pushed `v = 'привет'` on a `varchar(20)` column and
+  `mssql_scan_params(..., '@v varchar(20)')` each find the row; the parameter
+  as `varbinary` is `EF F0 E8 E2 E5 F2`, the 1251 bytes the stored value has;
+  an `mssql_exec_params` INSERT through `@v varchar(20)` stores the same
+  bytes. The argument's own collation does not decide the conversion.
 
 ## Measured in the PR
 
