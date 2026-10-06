@@ -51,6 +51,13 @@ struct SqlParamAssignment {
 std::string BuildExecuteSqlBatch(const std::string &statement, const std::string &declarations,
 								 const std::vector<SqlParamAssignment> &assignments);
 
+//! Spec 083: the same call as an RPC request (sp_executesql, ProcID 10), for
+//! the W4 queries whose parameters are all strings (names -- sysname,
+//! nvarchar(776)): each goes as an nvarchar parameter. Its description is
+//! BuildExecuteSqlBatch's text.
+tds::Request BuildExecuteSqlRequest(const std::string &statement, const std::string &declarations,
+									const std::vector<std::pair<std::string, std::string>> &string_values);
+
 //! One caller parameter (W5): its name, its T-SQL declaration type and the
 //! literal (or expression) that initialises it.
 struct SqlParam {

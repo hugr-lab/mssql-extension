@@ -32,6 +32,10 @@ struct Request {
 	bool IsRpc() const {
 		return !rpc_body.empty();
 	}
+
+	bool operator==(const Request &other) const {
+		return sql == other.sql && rpc_body == other.rpc_body;
+	}
 };
 
 }  // namespace tds

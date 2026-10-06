@@ -159,9 +159,8 @@ idx_t MSSQLStatisticsProvider::FetchRowCount(tds::TdsConnection &connection, con
 	// Spec 075 W4 (#334): the names travel as sp_executesql parameters, so one
 	// plan serves every table; the quoting the old snprintf path did by hand
 	// is NVarcharLiteral's.
-	std::string sql = mssql::BuildExecuteSqlBatch(
-		ROW_COUNT_SQL_TEMPLATE, "@s sysname, @t sysname",
-		{{"s", mssql::NVarcharLiteral(schema_name)}, {"t", mssql::NVarcharLiteral(table_name)}});
+	const tds::Request sql = mssql::BuildExecuteSqlRequest(ROW_COUNT_SQL_TEMPLATE, "@s sysname, @t sysname",
+														   {{"s", schema_name}, {"t", table_name}});
 
 	// Execute query and get result
 	std::string result = MSSQLSimpleQuery::ExecuteScalar(connection, sql);

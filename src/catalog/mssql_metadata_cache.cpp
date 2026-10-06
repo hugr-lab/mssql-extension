@@ -308,20 +308,20 @@ using MetadataRowCallback = std::function<void(const vector<string> &values)>;
 
 using MetadataSetRowCallback = std::function<void(idx_t result_set, const vector<string> &values)>;
 
-static void RunMetadataQuerySets(tds::TdsConnection &connection, const string &sql, MetadataSetRowCallback callback,
-								 int timeout_ms, const std::function<void()> &reset);
+static void RunMetadataQuerySets(tds::TdsConnection &connection, const tds::Request &sql,
+								 MetadataSetRowCallback callback, int timeout_ms, const std::function<void()> &reset);
 
-static void RunMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback,
+static void RunMetadataQuery(tds::TdsConnection &connection, const tds::Request &sql, MetadataRowCallback callback,
 							 int timeout_ms, const std::function<void()> &reset) {
 	RunMetadataQuerySets(
 		connection, sql, [&callback](idx_t, const vector<string> &values) { callback(values); }, timeout_ms, reset);
 }
 
-static void RunMetadataQuerySets(tds::TdsConnection &connection, const string &sql, MetadataSetRowCallback callback,
-								 int timeout_ms, const std::function<void()> &reset) {
+static void RunMetadataQuerySets(tds::TdsConnection &connection, const tds::Request &sql,
+								 MetadataSetRowCallback callback, int timeout_ms, const std::function<void()> &reset) {
 	// Log the query being executed (truncated for readability)
-	CACHE_DEBUG(1, "RunMetadataQuery: timeout=%dms, sql=%.120s%s", timeout_ms, sql.c_str(),
-				sql.size() > 120 ? "..." : "");
+	CACHE_DEBUG(1, "RunMetadataQuery: timeout=%dms, sql=%.120s%s", timeout_ms, sql.sql.c_str(),
+				sql.sql.size() > 120 ? "..." : "");
 
 	// Deadlock victim (server error 1205) is retried: metadata queries are pure
 	// reads and the server's own message says "Rerun the transaction". DuckDB
@@ -473,10 +473,9 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	// text -- and the server's cached plan -- is the same for every table.
 	// Spec 076 W2: the primary key in the same batch -- a second result set
 	// off the same @s / @t -- so a fresh table pays one round trip.
-	string query = mssql::BuildExecuteSqlBatch(
+	const tds::Request query_request = mssql::BuildExecuteSqlRequest(
 		string(SINGLE_TABLE_METADATA_SQL_TEMPLATE) + ";\n" + mssql::RowIdKeyInfo::DiscoverySqlTemplate(),
-		"@s sysname, @t sysname",
-		{{"s", mssql::NVarcharLiteral(schema_name)}, {"t", mssql::NVarcharLiteral(table_name)}});
+		"@s sysname, @t sysname", {{"s", schema_name}, {"t", table_name}});
 
 	// Populate the cache slot in place so we never take the address of a stack
 	// local that gets moved out. GCC's -Wreturn-local-addr can't prove the
@@ -506,7 +505,7 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 		first_row = true;
 	};
 	ExecuteMetadataQuerySets(
-		connection, query,
+		connection, query_request,
 		[this, &table_meta, &first_row](idx_t result_set, const vector<string> &values) {
 			// 11 columns: object_type, the eight per-column fields, then index_type
 			// and is_partitioned. The guard has to cover the LAST index read.
@@ -720,7 +719,7 @@ void MSSQLMetadataCache::LoadAllTableMetadataForSchema(tds::TdsConnection &conne
 	}
 	sql += "\nORDER BY s.name, o.name, c.column_id";
 	// Spec 075 W4: one plan per schema-load shape, the schema as a parameter.
-	sql = mssql::BuildExecuteSqlBatch(sql, "@s sysname", {{"s", mssql::NVarcharLiteral(schema_name)}});
+	const tds::Request sql_request = mssql::BuildExecuteSqlRequest(sql, "@s sysname", {{"s", schema_name}});
 
 	// Streaming group-by parse (same as BulkLoadAll but for one schema)
 	string current_table;
@@ -739,7 +738,7 @@ void MSSQLMetadataCache::LoadAllTableMetadataForSchema(tds::TdsConnection &conne
 	schema.tables.clear();
 
 	ExecuteMetadataQuery(
-		connection, sql,
+		connection, sql_request,
 		[&](const vector<string> &values) {
 			// 15 columns: schema, object, type, approx_rows, the eight per-column
 			// fields, then index_type and is_partitioned. Guard the LAST index read.
@@ -1136,7 +1135,7 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 		}
 	}
 	sql += "\nORDER BY s.name, o.name, c.column_id";
-	sql = mssql::BuildExecuteSqlBatch(sql, "@s sysname", {{"s", mssql::NVarcharLiteral(target_schema)}});
+	const tds::Request sql_request = mssql::BuildExecuteSqlRequest(sql, "@s sysname", {{"s", target_schema}});
 
 	// Streaming group-by parse for this schema.
 	//
@@ -1162,7 +1161,7 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	idx_t schema_columns = 0;
 
 	ExecuteMetadataQuery(
-		connection, sql,
+		connection, sql_request,
 		[&](const vector<string> &values) {
 			// 15 columns: schema, object, type, approx_rows, the eight per-column
 			// fields, then index_type and is_partitioned. Guard the LAST index read.
@@ -1448,7 +1447,7 @@ void MSSQLMetadataCache::SetTestFailAfterRows(int64_t rows) {
 	test_fail_after_rows_ = rows;
 }
 
-void MSSQLMetadataCache::ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql,
+void MSSQLMetadataCache::ExecuteMetadataQuery(tds::TdsConnection &connection, const tds::Request &sql,
 											  MSSQLMetadataCache::MetadataRowCallback callback,
 											  MSSQLMetadataCache::MetadataResetCallback reset) {
 	// Issue #317: the only deliberate way to a mid-query failure. Everything
@@ -1486,7 +1485,7 @@ void MSSQLMetadataCache::ExecuteMetadataQuery(tds::TdsConnection &connection, co
 	RunMetadataQuery(connection, sql, std::move(callback), metadata_timeout_ms_, reset);
 }
 
-void MSSQLMetadataCache::ExecuteMetadataQuerySets(tds::TdsConnection &connection, const string &sql,
+void MSSQLMetadataCache::ExecuteMetadataQuerySets(tds::TdsConnection &connection, const tds::Request &sql,
 												  MSSQLMetadataCache::MetadataSetRowCallback callback,
 												  MSSQLMetadataCache::MetadataResetCallback reset) {
 	// The #317 lever, as in ExecuteMetadataQuery: counts rows across every
@@ -1624,10 +1623,10 @@ void MSSQLMetadataCache::EnsureTablesLoaded(tds::TdsConnection &connection, cons
 			}
 		}
 		query += "\nORDER BY o.name";
-		query = mssql::BuildExecuteSqlBatch(query, "@s sysname", {{"s", mssql::NVarcharLiteral(schema_name)}});
+		const tds::Request query_request = mssql::BuildExecuteSqlRequest(query, "@s sysname", {{"s", schema_name}});
 
 		ExecuteMetadataQuery(
-			connection, query,
+			connection, query_request,
 			[&schema](const vector<string> &values) {
 				// 5 columns: object_name, object_type, approx_rows, index_type,
 				// is_partitioned. Guard the LAST index read, not the first.
@@ -1886,12 +1885,12 @@ void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string
 		}
 	}
 	query += "\nORDER BY o.name";
-	query = mssql::BuildExecuteSqlBatch(query, "@s sysname", {{"s", mssql::NVarcharLiteral(schema_name)}});
+	const tds::Request query_request = mssql::BuildExecuteSqlRequest(query, "@s sysname", {{"s", schema_name}});
 
 	auto &schema_meta = schemas_[schema_name];
 
 	ExecuteMetadataQuery(
-		connection, query,
+		connection, query_request,
 		[&schema_meta](const vector<string> &values) {
 			// 5 columns: object_name, object_type, approx_rows, index_type,
 			// is_partitioned. Guard the LAST index read, not the first.
@@ -1935,12 +1934,11 @@ void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string
 
 void MSSQLMetadataCache::LoadColumns(tds::TdsConnection &connection, const string &schema_name,
 									 const string &table_name, MSSQLTableMetadata &table_metadata) {
-	string query = mssql::BuildExecuteSqlBatch(
-		COLUMN_DISCOVERY_SQL_TEMPLATE, "@s sysname, @t sysname",
-		{{"s", mssql::NVarcharLiteral(schema_name)}, {"t", mssql::NVarcharLiteral(table_name)}});
+	const tds::Request query_request = mssql::BuildExecuteSqlRequest(
+		COLUMN_DISCOVERY_SQL_TEMPLATE, "@s sysname, @t sysname", {{"s", schema_name}, {"t", table_name}});
 
 	ExecuteMetadataQuery(
-		connection, query,
+		connection, query_request,
 		[this, &table_metadata](const vector<string> &values) {
 			if (values.size() >= 8) {
 				string col_name = values[0];

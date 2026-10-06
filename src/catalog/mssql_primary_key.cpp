@@ -87,7 +87,7 @@ ORDER BY i.index_id, ic.key_ordinal
 
 using MetadataRowCallback = std::function<void(const vector<string> &values)>;
 
-static void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback,
+static void ExecuteMetadataQuery(tds::TdsConnection &connection, const tds::Request &sql, MetadataRowCallback callback,
 								 const std::function<void()> &reset) {
 	// Deadlock-victim retry, same contract as RunMetadataQuery in
 	// mssql_metadata_cache.cpp: 1205 on a pure-read metadata query reruns
@@ -343,9 +343,8 @@ RowIdKeyInfo RowIdKeyInfo::Discover(tds::TdsConnection &connection, const string
 	MSSQL_PK_DEBUG("Discovering primary key for %s", full_name.c_str());
 
 	// Spec 075 W4 (#334): names as sp_executesql parameters -- one plan for every table.
-	string query = mssql::BuildExecuteSqlBatch(
-		PK_DISCOVERY_SQL_TEMPLATE, "@s sysname, @t sysname",
-		{{"s", mssql::NVarcharLiteral(schema_name)}, {"t", mssql::NVarcharLiteral(table_name)}});
+	const tds::Request query = mssql::BuildExecuteSqlRequest(PK_DISCOVERY_SQL_TEMPLATE, "@s sysname, @t sysname",
+															 {{"s", schema_name}, {"t", table_name}});
 
 	// Execute PK discovery query
 	ExecuteMetadataQuery(

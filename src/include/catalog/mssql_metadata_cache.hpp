@@ -386,14 +386,14 @@ private:
 	//! that it has thought about restartability. Every call site supplies one,
 	//! including the ones whose accumulation is already idempotent, which say so.
 	using MetadataResetCallback = std::function<void()>;
-	void ExecuteMetadataQuery(tds::TdsConnection &connection, const string &sql, MetadataRowCallback callback,
+	void ExecuteMetadataQuery(tds::TdsConnection &connection, const tds::Request &sql, MetadataRowCallback callback,
 							  MetadataResetCallback reset);
 	//! The same for a batch of several statements: the callback gets the
 	//! ordinal of the result set a row came from (spec 076 W2 sends the table
 	//! metadata and the primary key as one batch and reads two result sets).
 	using MetadataSetRowCallback = std::function<void(idx_t result_set, const vector<string> &values)>;
-	void ExecuteMetadataQuerySets(tds::TdsConnection &connection, const string &sql, MetadataSetRowCallback callback,
-								  MetadataResetCallback reset);
+	void ExecuteMetadataQuerySets(tds::TdsConnection &connection, const tds::Request &sql,
+								  MetadataSetRowCallback callback, MetadataResetCallback reset);
 
 	//===----------------------------------------------------------------------===//
 	// Member Variables

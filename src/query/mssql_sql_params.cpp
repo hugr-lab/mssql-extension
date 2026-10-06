@@ -5,6 +5,7 @@
 
 #include "codec/integer_codec.hpp"
 #include "codec/literal_format.hpp"
+#include "codec/sql_server_type_text.hpp"
 #include "codec/target_string_type.hpp"
 #include "copy/bcp_writer.hpp"
 #include "copy/target_resolver.hpp"
@@ -13,6 +14,7 @@
 #include "duckdb/common/types/decimal.hpp"
 #include "tds/encoding/bcp_row_encoder.hpp"
 #include "tds/encoding/utf16.hpp"
+#include "tds/tds_rpc.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -239,7 +241,9 @@ static std::string Trimmed(const std::string &text) {
 }
 
 static bool IsSqlIdentifier(const std::string &name) {
-	if (name.empty()) {
+	// 128 is SQL Server's identifier limit (error 103 past it); an RPC
+	// parameter name has to fit a B_VARCHAR as well (spec 083).
+	if (name.empty() || name.size() > 128) {
 		return false;
 	}
 	if (!(std::isalpha(static_cast<unsigned char>(name[0])) || name[0] == '_')) {
@@ -323,7 +327,8 @@ SqlParamSet BuildSqlParams(const Value &params, const std::string &declarations_
 		const Value &value = children[i];
 		if (!IsSqlIdentifier(name)) {
 			throw InvalidInputException(
-				"parameter name '%s' is not a T-SQL identifier (letters, digits and '_', not starting with a digit)",
+				"parameter name '%s' is not a T-SQL identifier (letters, digits and '_', not starting with a digit, "
+				"at most 128 characters)",
 				name);
 		}
 		// T-SQL variable names are case-insensitive, so two keys differing only in
@@ -386,10 +391,14 @@ SqlParamSet BuildSqlParams(const Value &params, const std::string &declarations_
 //===----------------------------------------------------------------------===//
 // Spec 083: sp_executesql over RPC
 //===----------------------------------------------------------------------===//
+//
+// The frame (procedure id, parameter names and flags) is tds::RpcRequestBuilder's;
+// each parameter's TYPE_INFO and value are the codecs' (BCPWriter::WriteTypeInfo,
+// BCPRowEncoder), the same bytes a bulk load writes for a column of that type.
 
 namespace {
 
-//! A declaration's type, as FromServerColumn takes it: the name and
+//! A declaration's type as FromServerColumn takes it: the name and
 //! sys.columns' max_length (bytes, -1 for MAX), precision and scale.
 struct DeclaredType {
 	std::string name;
@@ -398,25 +407,16 @@ struct DeclaredType {
 	uint8_t scale = 0;
 };
 
-//! False when the declaration is not one this encoder knows: the caller then
+//! False when the declaration is not one this encoder knows -- a CLR type
+//! (geometry, geography, hierarchyid), sql_variant, an alias type
+//! (`dbo.Name`), a synonym spelling, modifiers out of range: the caller then
 //! sends the batch form, which the server parses as it always has.
 bool ParseDeclaredType(const std::string &declaration, DeclaredType &result) {
-	std::string text = StringUtil::Lower(declaration);
-	StringUtil::Trim(text);
-	const auto open = text.find('(');
-	result.name = text.substr(0, open);
-	StringUtil::Trim(result.name);
-	std::vector<std::string> args;
-	if (open != std::string::npos) {
-		const auto close = text.find(')', open);
-		if (close == std::string::npos || text.find_first_not_of(' ', close + 1) != std::string::npos) {
-			return false;
-		}
-		for (auto &arg : StringUtil::Split(text.substr(open + 1, close - open - 1), ',')) {
-			StringUtil::Trim(arg);
-			args.push_back(arg);
-		}
+	codec::SqlServerTypeText text;
+	if (!codec::ParseSqlServerTypeText(declaration, text)) {
+		return false;
 	}
+	const auto &args = text.args;
 	bool ok = true;
 	auto number = [&](size_t i, int fallback, int max) -> int {
 		if (i >= args.size()) {
@@ -433,15 +433,16 @@ bool ParseDeclaredType(const std::string &declaration, DeclaredType &result) {
 		}
 		return v;
 	};
-	const auto &n = result.name;
+	const auto &n = text.base;
+	result.name = n;
 	if (n == "decimal" || n == "numeric") {
 		result.precision = static_cast<uint8_t>(number(0, 18, 38));
 		result.scale = static_cast<uint8_t>(number(1, 0, 38));
 		ok = ok && result.precision >= 1 && result.scale <= result.precision && args.size() <= 2;
 	} else if (n == "money" || n == "smallmoney") {
+		result.name = "decimal";
 		result.precision = n == "money" ? 19 : 10;
 		result.scale = 4;
-		result.name = "decimal";
 		ok = args.empty();
 	} else if (n == "datetime" || n == "smalldatetime") {
 		// Sent as datetime2(7); the server converts it to the declared type as
@@ -478,20 +479,44 @@ bool IsBinaryFamily(const std::string &name) {
 	return name == "binary" || name == "varbinary" || name == "image";
 }
 
-//! Parameter metadata: B_VARCHAR name ("" for positional) and StatusFlags 0.
-void WriteParamHeader(vector<uint8_t> &out, const std::string &name) {
-	const auto utf16 = tds::encoding::Utf16LEEncode(name);
-	out.push_back(static_cast<uint8_t>(utf16.size() / 2));
-	out.insert(out.end(), utf16.begin(), utf16.end());
-	out.push_back(0);
+//! TYPE_INFO and value of `value` as `col` declares it, appended to the open
+//! parameter.
+void AppendTypedValue(tds::RpcRequestBuilder &rpc, const BCPColumnMetadata &col, const Value &value) {
+	vector<uint8_t> bytes;
+	BCPWriter::WriteTypeInfo(bytes, col);
+	if (col.duckdb_type.id() == LogicalTypeId::DECIMAL && !value.IsNull()) {
+		// The mantissa at the declared scale, read by the value's physical type.
+		// BCPRowEncoder::EncodeValue's Value path takes GetValue<hugeint_t>(),
+		// the value cast to an integer -- the fraction is lost, and a 38-digit
+		// value came out wrong (the bulk path encodes from vectors and never
+		// reaches it).
+		hugeint_t mantissa;
+		switch (col.duckdb_type.InternalType()) {
+		case PhysicalType::INT16:
+			mantissa = hugeint_t(value.GetValueUnsafe<int16_t>());
+			break;
+		case PhysicalType::INT32:
+			mantissa = hugeint_t(value.GetValueUnsafe<int32_t>());
+			break;
+		case PhysicalType::INT64:
+			mantissa = hugeint_t(value.GetValueUnsafe<int64_t>());
+			break;
+		default:
+			mantissa = value.GetValueUnsafe<hugeint_t>();
+			break;
+		}
+		tds::encoding::BCPRowEncoder::EncodeDecimal(bytes, mantissa, col.precision, col.scale);
+	} else {
+		tds::encoding::BCPRowEncoder::EncodeValue(bytes, value, col);
+	}
+	rpc.Append(bytes.data(), bytes.size());
 }
 
 //! A string parameter as nvarchar: inline up to 8000 bytes, PLP past that.
 //! A char-family declaration takes it too -- the server converts an nvarchar
 //! argument to the declared varchar exactly as it converts the N'...' literal
 //! of the batch form, so the semantics (and #361's seek) do not change.
-void WriteNVarcharParam(vector<uint8_t> &out, const std::string &name, const Value &value) {
-	WriteParamHeader(out, name);
+void AddNVarcharParam(tds::RpcRequestBuilder &rpc, const std::string &name, const Value &value) {
 	// UTF-16 never takes more than twice the UTF-8 bytes, so only a long value
 	// is measured exactly (the encoder converts it once more).
 	idx_t utf16_bytes = 0;
@@ -499,27 +524,27 @@ void WriteNVarcharParam(vector<uint8_t> &out, const std::string &name, const Val
 		const auto &utf8 = StringValue::Get(value);
 		utf16_bytes = utf8.size() * 2 <= 8000 ? utf8.size() * 2 : tds::encoding::Utf16LEEncode(utf8).size();
 	}
-	auto col = BCPColumnMetadata::FromServerColumn(name, "nvarchar", utf16_bytes > 8000 ? -1 : 8000, 0, 0, true, "");
-	BCPWriter::WriteTypeInfo(out, col);
-	tds::encoding::BCPRowEncoder::EncodeValue(out, value, col);
+	rpc.BeginParam(name);
+	AppendTypedValue(
+		rpc, BCPColumnMetadata::FromServerColumn(name, "nvarchar", utf16_bytes > 8000 ? -1 : 8000, 0, 0, true, ""),
+		value);
 }
 
 //! False when this parameter has no RPC encoding -- an unknown declaration, or
 //! a value the declared type cannot take: the whole call then goes as the batch
 //! form, and the server answers it as it always has.
-bool WriteTypedParam(vector<uint8_t> &out, const SqlParam &param) {
+bool AddTypedParam(tds::RpcRequestBuilder &rpc, const SqlParam &param) {
 	const auto name = "@" + param.name;
 	DeclaredType declared;
 	if (!ParseDeclaredType(param.declaration, declared)) {
 		return false;
 	}
 	if (IsCharFamily(declared.name)) {
-		const Value text =
-			param.value.IsNull() ? Value(LogicalType::VARCHAR) : param.value.DefaultCastAs(LogicalType::VARCHAR);
-		WriteNVarcharParam(out, name, text);
+		AddNVarcharParam(
+			rpc, name,
+			param.value.IsNull() ? Value(LogicalType::VARCHAR) : param.value.DefaultCastAs(LogicalType::VARCHAR));
 		return true;
 	}
-	BCPColumnMetadata col;
 	if (IsBinaryFamily(declared.name)) {
 		Value blob(LogicalType::BLOB);
 		if (!param.value.IsNull()) {
@@ -530,14 +555,14 @@ bool WriteTypedParam(vector<uint8_t> &out, const SqlParam &param) {
 			blob = std::move(*cast);
 		}
 		const idx_t bytes = blob.IsNull() ? 0 : StringValue::Get(blob).size();
-		col = BCPColumnMetadata::FromServerColumn(name, "varbinary", bytes > 8000 ? -1 : 8000, 0, 0, true, "");
-		WriteParamHeader(out, name);
-		BCPWriter::WriteTypeInfo(out, col);
-		tds::encoding::BCPRowEncoder::EncodeValue(out, blob, col);
+		rpc.BeginParam(name);
+		AppendTypedValue(
+			rpc, BCPColumnMetadata::FromServerColumn(name, "varbinary", bytes > 8000 ? -1 : 8000, 0, 0, true, ""),
+			blob);
 		return true;
 	}
-	col = BCPColumnMetadata::FromServerColumn(name, declared.name, declared.max_length, declared.precision,
-											  declared.scale, true, "");
+	auto col = BCPColumnMetadata::FromServerColumn(name, declared.name, declared.max_length, declared.precision,
+												   declared.scale, true, "");
 	if (col.bulk_unsupported || col.duckdb_type.id() == LogicalTypeId::VARCHAR) {
 		return false;
 	}
@@ -558,37 +583,30 @@ bool WriteTypedParam(vector<uint8_t> &out, const SqlParam &param) {
 		}
 		typed = std::move(*cast);
 	}
-	WriteParamHeader(out, name);
-	BCPWriter::WriteTypeInfo(out, col);
-	if (col.duckdb_type.id() == LogicalTypeId::DECIMAL && !typed.IsNull()) {
-		// The mantissa at the declared scale, read by the value's physical type.
-		// BCPRowEncoder::EncodeValue's Value path takes GetValue<hugeint_t>(),
-		// the value cast to an integer -- the fraction is lost, and a 38-digit
-		// value came out wrong (the bulk path encodes from vectors and never
-		// reaches it).
-		hugeint_t mantissa;
-		switch (col.duckdb_type.InternalType()) {
-		case PhysicalType::INT16:
-			mantissa = hugeint_t(typed.GetValueUnsafe<int16_t>());
-			break;
-		case PhysicalType::INT32:
-			mantissa = hugeint_t(typed.GetValueUnsafe<int32_t>());
-			break;
-		case PhysicalType::INT64:
-			mantissa = hugeint_t(typed.GetValueUnsafe<int64_t>());
-			break;
-		default:
-			mantissa = typed.GetValueUnsafe<hugeint_t>();
-			break;
-		}
-		tds::encoding::BCPRowEncoder::EncodeDecimal(out, mantissa, col.precision, col.scale);
-		return true;
-	}
-	tds::encoding::BCPRowEncoder::EncodeValue(out, typed, col);
+	rpc.BeginParam(name);
+	AppendTypedValue(rpc, col, typed);
 	return true;
 }
 
 }  // namespace
+
+tds::Request BuildExecuteSqlRequest(const std::string &statement, const std::string &declarations,
+									const std::vector<std::pair<std::string, std::string>> &string_values) {
+	// Named values need their declarations: the batch form drops them without
+	// one, and the two forms must say the same thing.
+	D_ASSERT(!declarations.empty() || string_values.empty());
+	std::vector<SqlParamAssignment> assignments;
+	tds::RpcRequestBuilder rpc(tds::RPC_PROC_SP_EXECUTESQL);
+	AddNVarcharParam(rpc, "", Value(statement));
+	if (!declarations.empty()) {
+		AddNVarcharParam(rpc, "", Value(declarations));
+	}
+	for (const auto &named : string_values) {
+		AddNVarcharParam(rpc, "@" + named.first, Value(named.second));
+		assignments.push_back({named.first, NVarcharLiteral(named.second)});
+	}
+	return tds::Request::Rpc(rpc.Finish(), BuildExecuteSqlBatch(statement, declarations, assignments));
+}
 
 tds::Request SqlParamSet::ExecuteSqlRequest(const std::string &statement) const {
 	for (const auto &p : params) {
@@ -596,24 +614,17 @@ tds::Request SqlParamSet::ExecuteSqlRequest(const std::string &statement) const 
 			return tds::Request(ExecuteSqlBatch(statement));
 		}
 	}
-	vector<uint8_t> body;
-	// RPCReqBatch: ProcIDSwitch 0xFFFF, ProcID 10 (sp_executesql), OptionFlags 0.
-	body.push_back(0xFF);
-	body.push_back(0xFF);
-	body.push_back(10);
-	body.push_back(0);
-	body.push_back(0);
-	body.push_back(0);
-	WriteNVarcharParam(body, "", Value(statement));
+	tds::RpcRequestBuilder rpc(tds::RPC_PROC_SP_EXECUTESQL);
+	AddNVarcharParam(rpc, "", Value(statement));
 	if (!params.empty()) {
-		WriteNVarcharParam(body, "", Value(Declarations()));
+		AddNVarcharParam(rpc, "", Value(Declarations()));
 		for (const auto &p : params) {
-			if (!WriteTypedParam(body, p)) {
+			if (!AddTypedParam(rpc, p)) {
 				return tds::Request(ExecuteSqlBatch(statement));
 			}
 		}
 	}
-	return tds::Request::Rpc(std::vector<uint8_t>(body.begin(), body.end()), ExecuteSqlBatch(statement));
+	return tds::Request::Rpc(rpc.Finish(), ExecuteSqlBatch(statement));
 }
 
 }  // namespace mssql

@@ -1,0 +1,48 @@
+# name: test/sql/catalog/metadata_rpc_names.test
+# description: Spec 083 -- the catalog's metadata queries pass schema and table names as RPC parameters; a name with quotes, brackets or non-ASCII characters resolves as before
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS mrn (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('mrn', 'IF SCHEMA_ID(N''схема ]''''x'') IS NULL EXEC(N''CREATE SCHEMA [схема ]]''''x]'');
+	IF OBJECT_ID(N''[схема ]]''''x].[таб ]]''''ле]'') IS NOT NULL DROP TABLE [схема ]]''x].[таб ]]''ле];
+	CREATE TABLE [схема ]]''x].[таб ]]''ле] (id int NOT NULL PRIMARY KEY, [колонка] nvarchar(10));
+	INSERT INTO [схема ]]''x].[таб ]]''ле] VALUES (1, N''раз''), (2, N''два'')');
+
+statement ok
+SELECT mssql_invalidate_cache('mrn');
+
+query II
+SELECT id, "колонка" FROM mrn."схема ]'x"."таб ]'ле" ORDER BY id;
+----
+1	раз
+2	два
+
+# The primary key (rowid) and the row count come from the same parameterised queries.
+query I
+SELECT count(rowid) FROM mrn."схема ]'x"."таб ]'ле";
+----
+2
+
+statement ok
+UPDATE mrn."схема ]'x"."таб ]'ле" SET "колонка" = 'три' WHERE id = 2;
+
+query I
+SELECT "колонка" FROM mrn."схема ]'x"."таб ]'ле" WHERE id = 2;
+----
+три
+
+statement ok
+SELECT mssql_exec('mrn', 'DROP TABLE [схема ]]''x].[таб ]]''ле]; DROP SCHEMA [схема ]]''x]');
+
+statement ok
+DETACH mrn;
