@@ -261,6 +261,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **In-transaction scans of different DuckDB connections ran one at a time**
+  (#409): the lock that keeps a transaction's scans and sinks from using its
+  pinned connection at once was one per attached catalog, so every
+  transaction in the process waited for every other one's batch and drain,
+  while SQL Server sat idle (measured by the mssql-ducklake side: 70 reads/s at
+  16 readers). It is now the transaction's own; the catalog's is kept for
+  autocommit on a pool of one connection, which every statement shares.
+
 - **A pushed `LIMIT 0` cost a describe and an execution** (spec 081): DuckDB
   answers it with an empty result and asks the server nothing, so the rewriter
   now leaves it alone. DuckLake's attach probes every inlined-data table in one

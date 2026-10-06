@@ -1,0 +1,50 @@
+# name: test/sql/transaction/materialize_lock_per_transaction.test
+# description: Issue #409 -- the materialize lock is the pinned connection's, so in-transaction scans of different DuckDB connections run in parallel
+# group: [transaction]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Four connections opened at ATTACH, so no login falls inside the timed batches.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS mlt (TYPE mssql, min_connections 4);
+
+statement ok
+SELECT mssql_exec('mlt', 'DROP TABLE IF EXISTS dbo.mlt_log; CREATE TABLE dbo.mlt_log (k int NOT NULL, started datetime2(7) NOT NULL, ended datetime2(7) NOT NULL)');
+
+# Four DuckDB connections, each in its own transaction (its own pinned
+# connection), each running a scan that is materialised under the lock and
+# takes a second on the server. Each records when its batch ran.
+concurrentloop i 0 4
+
+statement ok
+BEGIN;
+
+query I
+SELECT x = {i} FROM mssql_scan_unsafe('mlt', 'DECLARE @s datetime2(7) = SYSDATETIME(); WAITFOR DELAY ''00:00:01''; INSERT INTO dbo.mlt_log VALUES ({i}, @s, SYSDATETIME()); SELECT {i} AS x', columns := {'x': 'INTEGER'});
+----
+true
+
+statement ok
+COMMIT;
+
+endloop
+
+query I
+SELECT count(*) FROM mlt.dbo.mlt_log;
+----
+4
+
+# With one lock per catalog (before #409) the four batches ran one after
+# another and no two of them overlapped; with one per transaction they do.
+query I
+SELECT count(*) > 0 FROM mssql_scan('mlt', 'SELECT 1 AS o FROM dbo.mlt_log a JOIN dbo.mlt_log b ON a.k < b.k AND a.started < b.ended AND b.started < a.ended');
+----
+true
+
+statement ok
+SELECT mssql_exec('mlt', 'DROP TABLE dbo.mlt_log');

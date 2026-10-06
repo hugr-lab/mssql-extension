@@ -217,13 +217,15 @@ public:
 	//! "not in Idle state". Materialization alone cannot fix that, because the
 	//! race is between the initializations, not inside them.
 	//!
-	//! So a materialized scan holds this from before its batch until after its
-	//! drain. It is contended only by scans that are already serialized by
-	//! construction — they share one pinned connection and cannot run in parallel
-	//! anyway — so it costs nothing that was not already sequential.
-	std::mutex &MaterializeMutex() {
-		return materialize_mutex_;
-	}
+	//! So a materialized scan holds a lock from before its batch until after its
+	//! drain, and a sink takes it before it uses the connection. The lock is
+	//! the one of the connection they share (MaterializeMutexFor): inside a
+	//! transaction the transaction's own -- its pinned connection is shared by
+	//! nothing else, so scans of other DuckDB connections, each on its own
+	//! pinned connection, never wait for it (issue #409: one lock per catalog
+	//! serialised every transaction in the process); in autocommit this one, the
+	//! catalog's, for the pool of one connection every statement shares.
+	std::mutex &MaterializeMutexFor(ClientContext &context);
 
 	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction, const EntryLookupInfo &schema_lookup,
 												  OnEntryNotFound if_not_found) override;
@@ -493,8 +495,8 @@ private:
 	//! loaded or the transaction changed everything (issue #380).
 	MSSQLMetadataCache &SchemaListCache(ClientContext *context);
 
-	//! See MaterializeMutex(). Not the transaction's connection_mutex_: that one
-	//! guards the pinned-connection member accessors and is taken and released
+	//! See MaterializeMutexFor(): autocommit's lock. Not the transaction's
+	//! connection_mutex_: that one guards the pinned-connection member accessors and is taken and released
 	//! inside them, where this must span a whole batch-and-drain.
 	std::mutex materialize_mutex_;
 

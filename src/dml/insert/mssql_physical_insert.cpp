@@ -161,12 +161,12 @@ void OpenSharedStream(ClientContext &context, MSSQLInsertGlobalSinkState &gstate
 	gstate.reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
 
 	// Spec 075 W3: inside a transaction the source scans of this catalog were
-	// materialised under the catalog's MaterializeMutex before a row reached
-	// this sink; taking it here is the guarantee that nothing is still
+	// materialised under the connection's materialize lock (MaterializeMutexFor)
+	// before a row reached this sink; taking it here is the guarantee that nothing is still
 	// draining on the pinned connection the stream is about to use.
 	std::unique_lock<std::mutex> materialize_lock;
 	if (gstate.transaction_pinned) {
-		materialize_lock = std::unique_lock<std::mutex>(catalog.MaterializeMutex());
+		materialize_lock = std::unique_lock<std::mutex>(catalog.MaterializeMutexFor(context));
 	}
 
 	auto connection = ConnectionProvider::GetConnection(context, catalog);

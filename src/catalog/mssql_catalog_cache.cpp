@@ -98,6 +98,13 @@ unique_ptr<MSSQLMetadataCache> MSSQLCatalog::CreateTransactionMetadataCache(Clie
 	return cache;
 }
 
+std::mutex &MSSQLCatalog::MaterializeMutexFor(ClientContext &context) {
+	if (context.transaction.IsAutoCommit()) {
+		return materialize_mutex_;
+	}
+	return MSSQLTransaction::Get(context, *this).MaterializeMutex();
+}
+
 void MSSQLCatalog::NoteTransactionChange(ClientContext &context, const string &schema, const string &table) {
 	if (context.transaction.IsAutoCommit()) {
 		return;

@@ -1104,9 +1104,10 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name));
 		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 		// Inside a transaction the stream is on the ONE pinned connection: take the
-		// catalog's MaterializeMutex BEFORE sending the batch, so a catalog scan
-		// materialising on another thread has drained (or has not started) -- the
-		// same order table_scan.cpp keeps. Held through the drain below.
+		// connection's materialize lock (MaterializeMutexFor) BEFORE sending the
+		// batch, so a catalog scan materialising on another thread has drained
+		// (or has not started) -- the same order table_scan.cpp keeps. Held
+		// through the drain below.
 		std::unique_lock<std::mutex> materialize_lock;
 		const bool in_transaction = !context.transaction.IsAutoCommit();
 		// On a pool of one the scans and the sink take turns at the pool exactly
@@ -1125,7 +1126,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		const bool one_connection = mssql_catalog.GetConnectionLimit() <= 1;
 		const bool materialize = in_transaction || one_connection;
 		if (materialize) {
-			materialize_lock = std::unique_lock<std::mutex>(mssql_catalog.MaterializeMutex());
+			materialize_lock = std::unique_lock<std::mutex>(mssql_catalog.MaterializeMutexFor(context));
 		}
 		MSSQLQueryExecutor executor(bind_data.context_name);
 		unique_ptr<MSSQLResultStream> stream;

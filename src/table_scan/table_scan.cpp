@@ -436,7 +436,7 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	if (bind_data.requires_materialization) {
 		// Identifier at the DuckDB API boundary, std::string inside (CLAUDE.md).
 		auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name)).Cast<MSSQLCatalog>();
-		materialize_lock = std::unique_lock<std::mutex>(catalog.MaterializeMutex());
+		materialize_lock = std::unique_lock<std::mutex>(catalog.MaterializeMutexFor(context));
 	}
 	MSSQLQueryExecutor executor(bind_data.context_name);
 	result->result_stream = executor.Execute(context, query);
