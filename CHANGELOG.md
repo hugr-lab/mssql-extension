@@ -249,6 +249,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`mssql_invalidate_cache(ctx, schema)` did nothing for a schema created
+  after the catalog listed its schemas**: the schema stayed "does not exist"
+  until a whole-catalog invalidate. Naming a schema the cache has not listed
+  now re-reads the schema list, and the re-read keeps what is cached for the
+  schemas it already knew instead of starting from an empty cache.
+
 - **A CTE over an attached table, used more than once under a `LIMIT`, failed
   with `Table Function with name mssql_catalog_scan does not exist`.**
   DuckDB inlines such a CTE by copying its plan, and the copy looks the scan

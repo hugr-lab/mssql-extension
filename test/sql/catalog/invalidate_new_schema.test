@@ -1,0 +1,95 @@
+# name: test/sql/catalog/invalidate_new_schema.test
+# description: mssql_invalidate_cache(ctx, schema) naming a schema created after the catalog listed its schemas re-reads the list, and keeps what is cached for the others
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ins (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('ins', 'IF OBJECT_ID(''dbo.ins_keep'') IS NOT NULL DROP TABLE dbo.ins_keep;
+	IF OBJECT_ID(''ins_new.t1'') IS NOT NULL DROP TABLE ins_new.t1;
+	IF OBJECT_ID(''ins_new.t2'') IS NOT NULL DROP TABLE ins_new.t2;
+	IF SCHEMA_ID(''ins_new'') IS NOT NULL DROP SCHEMA ins_new;
+	CREATE TABLE dbo.ins_keep (id int)');
+
+statement ok
+SELECT mssql_invalidate_cache('ins');
+
+# The catalog lists its schemas and loads dbo's metadata -- dbo.ins_keep's
+# columns included -- without binding the table.
+statement ok
+SELECT mssql_preload_catalog('ins', 'dbo');
+
+# A schema created behind the catalog, with a table in it.
+statement ok
+SELECT mssql_exec('ins', 'EXEC(''CREATE SCHEMA ins_new''); CREATE TABLE ins_new.t1 (id int)');
+
+statement error
+SELECT count(*) FROM ins.ins_new.t1;
+----
+does not exist
+
+# Naming the new schema re-reads the schema list.
+statement ok
+SELECT mssql_invalidate_cache('ins', 'ins_new');
+
+query I
+SELECT count(*) FROM ins.ins_new.t1;
+----
+0
+
+# The re-read kept what was cached for the other schemas: dbo.ins_keep, never
+# bound, is read from the preloaded metadata without another metadata query
+# (one would fail here; the list used to be re-read over a cleared map).
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+query I
+SELECT count(*) FROM ins.dbo.ins_keep;
+----
+0
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 0;
+
+# A known schema, empty table list at first: a table created behind the catalog
+# shows after the schema is invalidated (it always did).
+statement ok
+SELECT mssql_exec('ins', 'CREATE TABLE ins_new.t2 (id int)');
+
+statement ok
+SELECT mssql_invalidate_cache('ins', 'ins_new');
+
+query I
+SELECT count(*) FROM ins.ins_new.t2;
+----
+0
+
+# After a whole-catalog invalidate and a per-schema preload, a table dropped on
+# the server is not listed.
+statement ok
+SELECT mssql_exec('ins', 'DROP TABLE ins_new.t1');
+
+statement ok
+SELECT mssql_invalidate_cache('ins');
+
+statement ok
+SELECT mssql_preload_catalog('ins', 'ins_new');
+
+query T
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'ins' AND schema_name = 'ins_new' ORDER BY table_name;
+----
+t2
+
+statement ok
+SELECT mssql_exec('ins', 'DROP TABLE ins_new.t2; DROP SCHEMA ins_new; DROP TABLE dbo.ins_keep');
+
+statement ok
+DETACH ins;
