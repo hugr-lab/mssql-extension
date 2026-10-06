@@ -180,7 +180,33 @@ postgres; that is the environment, not the extension.
 
 ## Measured in the PR
 
-- The table in R1 again, per call site: catalog scan, `mssql_scan_params`,
-  metadata.
-- mssql-ducklake's catalog-load step table, before and after, on their 300-table
-  lake.
+Same machine and server as the recon: the branch base (`dbe43bb`, spec 081)
+against this branch, three rounds interleaved old/new, median per call. Each
+run is one transaction, so every call goes down one pinned connection and one
+server session; server CPU is that session's `sys.dm_exec_sessions.cpu_time`
+delta, which the machine's load does not touch. Every call has distinct values,
+which is what made the batch form recompile. Wall is the whole process (ATTACH
+included) over the call count; client is the process's user CPU. The new build
+carries D4 as well.
+
+| per call (calls in the run) | server CPU old -> new | wall old -> new | client CPU old -> new |
+|---|---:|---:|---:|
+| catalog scan, two pushed constants (2000) | 0.262 -> **0.051** ms | 1.21 -> **0.74** ms | 0.47 -> 0.38 ms |
+| `mssql_scan_params_unsafe`, two params (2000) | 0.222 -> **0.046** ms | 1.01 -> **0.74** ms | 0.46 -> 0.42 ms |
+| `mssql_scan_params`, two params (2000) | 0.618 -> 0.460 ms | 2.10 -> 1.82 ms | 0.81 -> 0.80 ms |
+| `prepared := true`, prepare + execute (500) | 0.416 -> 0.270 ms | 2.22 -> 2.04 ms | 0.84 -> 0.80 ms |
+| `mssql_invalidate_cache` + first scan of the table (300) | 0.807 -> **0.397** ms | 3.30 -> **2.07** ms | 1.23 -> 1.10 ms |
+
+- The catalog scan and the unsafe vehicle -- what remote pushdown and the
+  DuckLake catalog scans use -- cost the server a fifth of what they did, the
+  literal's price as the recon predicted, and 0.27-0.47 ms less wall per call.
+- `mssql_scan_params` gains less: its bind asks `sp_describe_first_result_set`
+  on every call, a compile the RPC form does not remove (the describe cache is
+  for pushed statements, spec 079). `prepared := true` likewise keeps its
+  `sp_prepare`.
+- The metadata row is a table's first touch: the single-table metadata batch
+  (columns, key) and the first scan, both over RPC now.
+- After the new build's runs, the plan cache held one `Prepared` plan per statement shape
+  and no `Adhoc` entry for any of them.
+- mssql-ducklake's catalog-load step table on their 300-table lake, before and
+  after, is theirs to run on the PR.
