@@ -1,4 +1,4 @@
-// Spec 079 PR E2: the describe cache of pushed statements -- only noted
+// Spec 079 PR E2, issue #410: the describe cache of mssql_scan shapes -- only noted
 // statements are kept, an entry dies with the invalidation epoch or the TTL,
 // the least recently used goes past the capacity, and Forget drops a shape.
 
@@ -35,8 +35,8 @@ int main() {
 		DescribeCache cache;
 		CachedShape out;
 		cache.Store(key, 1, Shape("a"));
-		Expect(!cache.Lookup(key, 1, 0, out), "a statement the rewriter did not note is not kept");
-		cache.NotePushed(key);
+		Expect(!cache.Lookup(key, 1, 0, out), "a statement not noted is not kept");
+		cache.Note(key);
 		Expect(!cache.Lookup(key, 1, 0, out), "noted, not yet described");
 		cache.Store(key, 1, Shape("a"));
 		Expect(cache.Lookup(key, 1, 0, out) && out.names.size() == 1 && out.names[0] == "a", "described: kept");
@@ -57,14 +57,14 @@ int main() {
 		cache.Clear();
 		Expect(!cache.Lookup(key, 3, 0, out), "cleared");
 		const auto long_key = DescribeCache::Key(std::string(DescribeCache::MAX_STATEMENT + 1, 'x'), "", true);
-		cache.NotePushed(long_key);
+		cache.Note(long_key);
 		cache.Store(long_key, 3, Shape("a"));
 		Expect(!cache.Lookup(long_key, 3, 0, out), "a statement past MAX_STATEMENT is not remembered");
 	}
 	{
 		DescribeCache cache;
 		CachedShape out;
-		cache.NotePushed(key);
+		cache.Note(key);
 		cache.Store(key, 1, Shape("a"));
 		std::this_thread::sleep_for(std::chrono::milliseconds(1100));
 		Expect(!cache.Lookup(key, 1, 1, out), "older than the TTL: gone");
@@ -74,7 +74,7 @@ int main() {
 		CachedShape out;
 		for (size_t i = 0; i <= DescribeCache::CAPACITY; i++) {
 			const auto k = DescribeCache::Key("SELECT " + std::to_string(i), "", true);
-			cache.NotePushed(k);
+			cache.Note(k);
 			cache.Store(k, 1, Shape("x"));
 			if (i == 0) {
 				continue;

@@ -84,7 +84,7 @@ public:
 	//! MarkChanged with an empty schema was called: even the schema list may differ.
 	bool IsAllChanged();
 	//! This transaction changed anything, or ran DDL the extension cannot see
-	//! through: the shared shapes of pushed statements are not its to use
+	//! through: the shared describe shapes are not its to use
 	//! (spec 079 PR E2).
 	bool HasChanged();
 

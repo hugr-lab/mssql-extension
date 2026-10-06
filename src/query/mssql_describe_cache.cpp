@@ -19,7 +19,7 @@ void DescribeCache::Touch(Entry &entry) {
 	recency_.splice(recency_.begin(), recency_, entry.recency);
 }
 
-void DescribeCache::NotePushed(const std::string &key) {
+void DescribeCache::Note(const std::string &key) {
 	if (key.size() > MAX_STATEMENT) {
 		return;
 	}

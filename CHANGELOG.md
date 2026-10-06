@@ -751,6 +751,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A user's `mssql_scan` / `mssql_scan_params` of a text already described
+  binds from the describe cache** (#410): no `sp_describe_first_result_set`,
+  no connection at bind. The describe was most of a short query's cost on the
+  0.3.0 line -- a TOP 1 took 3.5 ms against 0.65 ms on v0.2.5, and 1.1 ms
+  with the shape given. The first run of a text still describes. A shape
+  changed behind the catalog (`mssql_exec` DDL, another client) fails that
+  statement once, saying to run it again; `mssql_invalidate_cache()` drops
+  the shapes.
+
 - **`mssql_remote_pushdown` is on by default** (spec 079 PR E2). A SELECT
   over one attached database with a join, an aggregate, `DISTINCT`, `ORDER
   BY` or `LIMIT` runs on SQL Server as one statement. **String
