@@ -88,6 +88,7 @@ Byte 7:    Window (reserved, always 0)
 | Type | Value | Direction | Purpose |
 |---|---|---|---|
 | `SQL_BATCH` | 0x01 | Client → Server | Execute SQL statement |
+| `RPC` | 0x03 | Client → Server | Call a procedure with typed parameters (`sp_executesql`, `sp_execute`; spec 083) |
 | `PRELOGIN` | 0x12 | Both | Pre-authentication negotiation |
 | `TABULAR_RESULT` | 0x04 | Server → Client | Query results |
 | `ATTENTION` | 0x06 | Client → Server | Cancel running query |
@@ -104,7 +105,7 @@ Byte 7:    Window (reserved, always 0)
 | `RESET_CONNECTION` | 0x08 | Reset connection state (session cleanup) |
 | `RESET_SKIP_TRAN` | 0x10 | Reset connection but preserve transaction |
 
-**RESET_CONNECTION**: When set on the first packet of a `SQL_BATCH`, SQL Server resets session state (temp tables, session variables, SET options) before executing the batch. This is used by ADO.NET/JDBC/ODBC drivers for connection pool hygiene. The extension sets this flag on connections returned to the pool (via `TdsConnection::SetNeedsReset()`).
+**RESET_CONNECTION**: When set on the first packet of a `SQL_BATCH` or `RPC` request, SQL Server resets session state (temp tables, session variables, SET options) before executing the batch. This is used by ADO.NET/JDBC/ODBC drivers for connection pool hygiene. The extension sets this flag on connections returned to the pool (via `TdsConnection::SetNeedsReset()`).
 
 ### SQL_BATCH with ALL_HEADERS
 
@@ -120,6 +121,24 @@ When a transaction descriptor is active, SQL_BATCH packets include an ALL_HEADER
   OutstandingRequestCount:  4 bytes LE (1)
 [SQL text in UTF-16LE]
 ```
+
+### RPC requests (spec 083)
+
+An RPC request carries the same ALL_HEADERS, then one RPCReqBatch:
+
+```
+[ALL_HEADERS]                      as above
+ProcIDSwitch:   2 bytes (0xFFFF)   the procedure is named by number
+ProcID:         2 bytes LE         10 = sp_executesql, 11 = sp_prepare, 12 = sp_execute
+OptionFlags:    2 bytes LE (0)
+per parameter:
+  Name:         B_VARCHAR          "@p0", or empty for a positional parameter
+  StatusFlags:  1 byte (0)         0x01 would be an OUTPUT parameter
+  TYPE_INFO                        as in COLMETADATA (BCPWriter::WriteTypeInfo)
+  Value                            as in a bulk-load row (BCPRowEncoder::EncodeValue)
+```
+
+`tds::RpcRequestBuilder` (`tds/tds_rpc.hpp`) writes it; `TdsProtocol::BuildRpcMultiPacket` prepends ALL_HEADERS and fragments it like a batch. `sp_executesql` gets the statement and the declarations as its first two parameters, unnamed, as `nvarchar(4000)` inline up to 8000 bytes and PLP `nvarchar(max)` past that, then the values by name; `sp_execute` gets the handle and the values unnamed, in declaration order. The response contains `RETURNSTATUS` and `DONEPROC`, which a batch's `EXEC` produces too, so the token readers need nothing new.
 
 ## PRELOGIN Handshake
 
@@ -311,7 +330,7 @@ Detection via `IsAzureEndpoint()`, `IsFabricEndpoint()`, `IsSynapseEndpoint()` i
 | `TABNAME` | 0xA4 | Table names for a browsable result (USHORT length, skipped) |
 | `COLINFO` | 0xA5 | Column provenance for a browsable result (USHORT length, skipped) |
 | `RETURNSTATUS` | 0x79 | Stored procedure return value — **fixed**: type byte + LONG, five bytes, no length field |
-| `RETURNVALUE` | 0xAC | OUTPUT parameter / UDF return — **no length field**; sized by its own TypeInfo. Sent only for RPC, which this extension does not issue; refused by name if it ever arrives |
+| `RETURNVALUE` | 0xAC | OUTPUT parameter / UDF return — **no length field**; sized by its own TypeInfo. Sent only for an RPC call's OUTPUT parameters, which this extension does not request (spec 083 sends none); refused by name if it ever arrives |
 
 Two traps recorded from issue #323. `RETURNSTATUS` was skipped as if it carried a
 USHORT length, so its value was read as one — a procedure returning 0 left two

@@ -44,7 +44,7 @@ FROM mssql_scan('sqlserver', 'SELECT id, name FROM dbo.users WHERE id > 100', pr
 
 ### mssql_scan_params()
 
-`mssql_scan` with parameters. The STRUCT's keys become `@name` variables, declared from the DuckDB types and passed through `sp_executesql`, so SQL Server keeps one compiled plan for the statement and reuses it for every call, from every session.
+`mssql_scan` with parameters. The STRUCT's keys become `@name` variables, declared from the DuckDB types and passed through `sp_executesql` as an RPC call with typed values, so SQL Server keeps one compiled plan for the statement and reuses it for every call, from every session.
 
 **Signature:** `mssql_scan_params(context VARCHAR, statement VARCHAR, params STRUCT [, declarations VARCHAR] [, prepared := false]) -> TABLE(...)`
 

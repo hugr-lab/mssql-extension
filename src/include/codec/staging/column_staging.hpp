@@ -83,23 +83,24 @@ static const idx_t MAX_STAGING_PAYLOAD_BYTES = 2047ULL * 1024ULL * 1024ULL;
 //! short, so ending early costs a slightly smaller chunk and nothing else.
 static const idx_t STAGING_CHUNK_PAYLOAD_BUDGET_BYTES = 32ULL * 1024ULL * 1024ULL;
 
-//! Per-column budget for preallocating a column's PROVABLE worst case.
+//! Per-column budget for a column's PROVABLE worst case.
 //!
 //! For a non-MAX variable column the declared type bounds every value exactly
 //! (nvarchar(16) is at most 32 bytes on the wire), so max_length *
 //! STANDARD_VECTOR_SIZE is the largest payload a chunk can possibly produce.
-//! Reserving that up front means the column can never resize again — not
-//! "rarely", never.
+//! Growth stops there: a column that has reached it can never resize again and
+//! is never shrunk. Nothing is reserved up front (spec 083 D4) -- an empty
+//! result used to zero-fill this much per string column on every scan.
 //!
-//! It is only worth doing while the bound is cheap. nvarchar(16) needs 64 KB and
-//! nvarchar(200) 800 KB, but nvarchar(4000) would demand 16 MB per column for a
+//! It is only worth capping while the bound is cheap. nvarchar(16) needs 64 KB
+//! and nvarchar(200) 800 KB, but nvarchar(4000) would be 16 MB per column for a
 //! width real data almost never reaches. Past this budget the high-water mark
 //! finds the actual size within a chunk or two and the column is resize-free
 //! from then on anyway.
 static const idx_t STAGING_PREALLOC_BUDGET_BYTES = 2ULL * 1024ULL * 1024ULL;
 
-//! Starting payload capacity for columns with no usable bound (PLP / MAX types).
-static const idx_t STAGING_UNBOUNDED_INITIAL_BYTES = 64ULL * 1024ULL;
+//! A Var column's payload capacity on its first value; it doubles from there.
+static const idx_t STAGING_INITIAL_PAYLOAD_BYTES = 4ULL * 1024ULL;
 
 //===----------------------------------------------------------------------===//
 // StagingKind
@@ -239,8 +240,11 @@ struct ColumnStaging {
 	//! immediately, so resizing per value would write every payload byte twice.
 	idx_t payload_used = 0;
 
-	//! The payload was preallocated to this column's provable worst case, so it
-	//! can never grow and must never be shrunk.
+	//! This column's provable worst case for a chunk (STAGING_PREALLOC_BUDGET_BYTES),
+	//! or 0 when it has none worth capping at: growth stops there.
+	idx_t payload_bound = 0;
+	//! The payload has reached payload_bound, so it can never grow again and
+	//! must never be shrunk.
 	bool payload_bounded = false;
 	//! Times this column's payload had to grow. Written by GrowPayload, which is
 	//! out of line and cold; a bounded column can never touch it.
@@ -271,12 +275,13 @@ struct ColumnStaging {
 	//! Configure the column once, after COLMETADATA.
 	//!
 	//! `max_value_bytes` is the declared upper bound on ONE value's wire size,
-	//! from the column metadata; 0 means unbounded (PLP / MAX types). Every
-	//! allocation this column will ever make happens here whenever that bound is
-	//! usable — see STAGING_PREALLOC_BUDGET_BYTES.
+	//! from the column metadata; 0 means unbounded (PLP / MAX types). No payload
+	//! is allocated here: the first value does it (GrowPayload), so an empty
+	//! result allocates none. See STAGING_PREALLOC_BUDGET_BYTES.
 	void Configure(StagingKind kind_p, uint32_t stride_p, uint32_t max_value_bytes = 0) {
 		kind = kind_p;
 		stride = stride_p;
+		payload_bound = 0;
 		payload_bounded = false;
 		validity_words.resize(VALIDITY_WORDS_PER_CHUNK);
 		if (kind == StagingKind::Var) {
@@ -284,10 +289,18 @@ struct ColumnStaging {
 			lengths.resize(STANDARD_VECTOR_SIZE);
 			// The provable worst case for a whole chunk. uint64 arithmetic: a
 			// declared max_length near 0xFFFF times 2048 overflows uint32.
-			// RECON (lazy staging): no payload allocation here -- an empty result
-			// zero-filled up to 2 MB per bounded string column and 64 KB per MAX
-			// column on every scan. GrowPayload allocates on the first value.
-			(void)max_value_bytes;
+			const idx_t bound = static_cast<idx_t>(max_value_bytes) * STANDARD_VECTOR_SIZE;
+			payload_bound = max_value_bytes > 0 && bound <= STAGING_PREALLOC_BUDGET_BYTES ? bound : 0;
+			// A buffer the arena kept from an earlier result set may already be
+			// exactly it. One larger than it (a MAX column's in the same slot) is
+			// left to the watermark shrink, not pinned.
+			payload_bounded = payload_bound > 0 && buffer.size() == payload_bound;
+			// Capacity without size: allocated, not zero-filled. Keeps data()
+			// non-null for a chunk of empty values, which never grows the buffer
+			// and still hands data() + 0 to memcmp and the decoders.
+			if (buffer.capacity() == 0) {
+				buffer.reserve(STAGING_INITIAL_PAYLOAD_BYTES);
+			}
 		} else {
 			offsets.clear();
 			lengths.clear();

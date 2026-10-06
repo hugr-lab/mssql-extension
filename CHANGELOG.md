@@ -259,6 +259,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of a vararg, so it is named too, and a third argument, which used to be
   accepted and ignored, is refused.
 
+### Changed
+
+- **Parameters go as an RPC call, not a batch** (spec 083). Every
+  `sp_executesql` the extension sends -- a pushed filter's constants,
+  `mssql_scan_params`, `mssql_scan_params_unsafe`, `mssql_exec_params`, the
+  per-table metadata queries -- is now a TDS RPC request (packet type 3) with
+  the values as typed parameters, and a `prepared := true` execution an
+  `sp_execute` RPC call. The batch form, `DECLARE @p0 ... = ...; EXEC
+  sp_executesql ...`, made the server parse and compile the outer batch on
+  every call, because its text changes with every value: measured locally, a
+  scan with a pushed filter cost the server 0.26-0.29 ms of CPU that way and
+  0.06-0.07 ms over RPC -- what a literal costs, while keeping one plan per
+  filter shape. A declaration with no RPC encoding (a CLR type such as
+  `geometry`, an alias type, `sql_variant`), or a value its declared type
+  cannot take, keeps the batch form for the whole call, decided before
+  anything is sent. `sp_prepare` stays a batch: it runs once per bind.
+- **A scan allocates its string staging on demand** (spec 083 D4). Each
+  string column's payload buffer used to be sized and zero-filled for a full
+  chunk when the stream opened -- up to 2 MB for a bounded `nvarchar(n)`, 64 KB
+  for a MAX column -- even when the result was empty. It now starts at 4 KB on
+  the first value and doubles, stopping at the column's provable worst case,
+  which used to be reserved up front.
+
 ### Fixed
 
 - **In-transaction scans of different DuckDB connections ran one at a time**

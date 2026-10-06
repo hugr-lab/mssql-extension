@@ -78,8 +78,10 @@ postgres; that is the environment, not the extension.
 ## Decisions
 
 - **D1: one RPC entry point in the TDS layer.**
-  `TdsConnection::ExecuteRpc(proc, params, reason)` sits beside `ExecuteBatch`.
-  It handles the same Idle -> Executing transition, the same transaction
+  As built: a request is a `tds::Request` (batch text, or an RPC body from
+  `tds::RpcRequestBuilder` with the batch text beside it for logs and errors),
+  and `TdsConnection::ExecuteRequest` sends either through the one private
+  `SendRequest` that `ExecuteBatch` uses too. It handles the same Idle -> Executing transition, the same transaction
   descriptor in ALL_HEADERS, RESET_CONNECTION on the first packet, and the same
   multi-packet send. The response is the same token stream, so the result
   stream and the simple-query reader consume it unchanged. RETURNSTATUS and
@@ -94,8 +96,17 @@ postgres; that is the environment, not the extension.
     rank as `decimal(38,0)`), money, date/time/datetime2/datetimeoffset/
     datetime/smalldatetime, uniqueidentifier, char/varchar with the column's
     collation, nchar/nvarchar, binary/varbinary, and NULL of any of them.
-  - A type with no encoder is refused at bind as today. It does not fall back to
-    a batch, so a statement never runs in two different forms.
+  - As built, a declaration with no RPC encoding (a CLR type such as
+    `geometry` / `geography` / `hierarchyid`, an alias type, `sql_variant`)
+    or a value its declared type cannot take keeps the batch form for the
+    whole call, decided before anything is sent. Refusing them, as first
+    planned, would have broken calls that work today (`'@g geometry'`), and
+    the two forms are the same call to the server: the declarations and the
+    statement text are identical, only the carrier differs. Strings go as
+    `nvarchar` and binary as `varbinary`, converted by the server to the
+    declared type exactly as it converted the batch's `N'...'` / `0x...`
+    literal; `datetime` / `smalldatetime` values go as `datetime2(7)`, `money`
+    as `decimal(19,4)`.
 - **D3: every `sp_executesql` call site moves.**
   - The catalog scan's pushed filters (`table_scan.cpp`).
   - `mssql_scan_params`, `mssql_scan_params_unsafe` and `mssql_exec_params`
@@ -117,6 +128,15 @@ postgres; that is the environment, not the extension.
   for a full chunk of a bounded column) is measured in the PR, not assumed.
   `payload_bounded` then means "reached its bound", so the arena's shrink rule
   keeps holding.
+  - As built: `ColumnStaging::payload_bound` is the chunk's provable worst case
+    (`max_value_bytes * 2048`, within the 2 MB budget, else 0), and
+    `GrowPayload` grows from `STAGING_INITIAL_PAYLOAD_BYTES` (4 KB) by doubling,
+    stopping at the bound. The first growth does not jump straight to the
+    bound: a bounded column fills its worst case in at most ~9 doublings
+    (4 KB -> 1 MB for `nvarchar(255)`), each a copy of what is staged so far,
+    so the whole growth copies less than the bound once, once per stream; a
+    result of a few rows -- the catalog scans this spec is about -- stays at
+    4 KB instead of the bound.
 - **D5: out of scope, enabled by D1/D2.** Table-valued parameters, OUTPUT
   parameters and a procedure's return value to the caller
   (`mssql_exec_params` returning rows) are later work. mssql-ducklake asked for

@@ -46,9 +46,22 @@ void ColumnStaging::GrowPayload(idx_t needed) {
 	}
 	// Double, so a steady stream allocates once and then never again — capacity
 	// is retained across chunks by the arena.
-	idx_t target = buffer.empty() ? idx_t(4096) : buffer.size() * 2;
+	idx_t target = buffer.empty() ? STAGING_INITIAL_PAYLOAD_BYTES : buffer.size() * 2;
 	if (target < needed) {
 		target = needed;
+	}
+	// A value longer than its declared type allows (the wire's length is not
+	// checked against COLMETADATA): there is no bound after all, and clamping
+	// would turn every later growth into an exact-size reallocation.
+	if (needed > payload_bound) {
+		payload_bound = 0;
+		payload_bounded = false;
+	}
+	// Never past the column's provable worst case: once there it cannot grow
+	// again, and the arena leaves it alone.
+	if (payload_bound > 0 && target >= payload_bound) {
+		target = payload_bound;
+		payload_bounded = true;
 	}
 	buffer.resize(target);
 }

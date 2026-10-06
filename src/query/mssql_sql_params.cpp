@@ -218,7 +218,7 @@ std::string DeclarationForValue(const std::string &name, const LogicalType &type
 	case LogicalTypeId::MAP:
 	case LogicalTypeId::UNION:
 		throw InvalidInputException(
-			"parameter '%s' is a %s; a table-valued parameter needs RPC, which this extension does not speak -- "
+			"parameter '%s' is a %s; table-valued parameters are not supported -- "
 			"pass a scalar, or unnest on the DuckDB side",
 			name, type.ToString());
 	default:

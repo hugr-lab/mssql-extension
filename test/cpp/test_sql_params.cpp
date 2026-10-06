@@ -161,7 +161,7 @@ void TestDeclarationForValue() {
 	CHECK_THROWS_WITH(DeclarationForValue("p", LogicalType::SQLNULL, Value()), "parameter 'p' is NULL of no type");
 	CHECK_THROWS_WITH(DeclarationForValue("p", LogicalType::LIST(LogicalType::INTEGER),
 										  Value::LIST(LogicalType::INTEGER, {Value::INTEGER(1)})),
-					  "table-valued parameter needs RPC");
+					  "table-valued parameters are not supported");
 	CHECK_THROWS_WITH(DeclarationForValue("p", LogicalType::INTERVAL, Value(LogicalType::INTERVAL)),
 					  "no SQL Server parameter type");
 }
