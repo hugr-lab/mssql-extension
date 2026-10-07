@@ -1,0 +1,28 @@
+CREATE OR ALTER PROCEDURE dbo.md_gen @schema sysname, @n int AS
+BEGIN
+  SET NOCOUNT ON;
+  IF SCHEMA_ID(@schema) IS NULL EXEC(N'CREATE SCHEMA ' + @schema);
+  DECLARE @i int = 0, @sql nvarchar(max), @cols int, @c int, @t sysname;
+  WHILE @i < @n
+  BEGIN
+    SET @t = QUOTENAME(@schema) + N'.' + QUOTENAME(N't' + CAST(@i AS nvarchar(10)));
+    IF @i % 50 = 49
+      SET @sql = N'CREATE VIEW ' + @t + N' AS SELECT id, c1, c2 FROM ' + QUOTENAME(@schema) + N'.' + QUOTENAME(N't' + CAST(@i - 1 AS nvarchar(10)));
+    ELSE
+    BEGIN
+      SET @cols = 5 + (@i * 7) % 36;
+      SET @sql = N'CREATE TABLE ' + @t + N' (id int NOT NULL' + CASE WHEN @i % 3 <> 0 THEN N' PRIMARY KEY' ELSE N'' END;
+      SET @c = 1;
+      WHILE @c < @cols
+      BEGIN
+        SET @sql += N', c' + CAST(@c AS nvarchar(5)) + N' ' + CASE @c % 6
+          WHEN 0 THEN N'int' WHEN 1 THEN N'nvarchar(50)' WHEN 2 THEN N'decimal(18,4)'
+          WHEN 3 THEN N'datetime2(3)' WHEN 4 THEN N'varchar(100)' ELSE N'bigint' END;
+        SET @c += 1;
+      END;
+      SET @sql += CASE WHEN @i % 10 = 5 THEN N', CONSTRAINT ' + QUOTENAME(N'uq_' + @schema + N'_' + CAST(@i AS nvarchar(10))) + N' UNIQUE (c1)' ELSE N'' END + N')';
+    END;
+    EXEC(@sql);
+    SET @i += 1;
+  END
+END
