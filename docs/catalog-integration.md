@@ -287,7 +287,7 @@ All cache access is protected by `std::mutex`. The mutex is held during the enti
 
 **Files**: `src/catalog/mssql_statistics.cpp`, `src/include/catalog/mssql_statistics.hpp`
 
-Caches row count statistics from `sys.dm_db_partition_stats` with configurable TTL.
+Caches row count statistics with configurable TTL. A count it fetches itself comes from `OBJECTPROPERTYEX(id, 'Cardinality')`, as the catalog's metadata queries read it (spec 083; until then it queried `sys.dm_db_partition_stats` through a column name that view does not have, and every fetch failed).
 
 ### Methods
 

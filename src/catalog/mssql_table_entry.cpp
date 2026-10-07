@@ -234,7 +234,7 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 				idx_t row_count = stats_provider.GetRowCount(*connection, mssql_schema.name.GetIdentifierName(),
 															 name.GetIdentifierName(), stats_ttl);
 				info.cardinality = row_count;
-				MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (from DMV)", mssql_schema.name.c_str(),
+				MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (from server)", mssql_schema.name.c_str(),
 							   name.c_str(), (unsigned long long)row_count);
 			} catch (...) {
 				pool.Release(std::move(connection));

@@ -284,6 +284,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The row count a table's storage info asks the server for always failed.**
+  It read `sys.dm_db_partition_stats` through `p.rows`, but that view's column
+  is `row_count`, so every call failed with error 207 from spec 008 on. The
+  empty answer was taken as 0 and cached. That path is reached when DuckDB asks
+  a table for its storage info in autocommit before any listing, for example
+  when binding `INSERT ... ON CONFLICT`. The 0 then reached the planner for a
+  table the catalog had loaded while it was empty: its scan planned with no
+  estimate. The count now comes from `OBJECTPROPERTYEX(..., 'Cardinality')`,
+  as the catalog's own metadata queries read it: 3 logical reads, against a
+  scan of `sysrowsets` (spec 071). A failed count is no longer cached as 0.
+
 - **In-transaction scans of different DuckDB connections ran one at a time**
   (#409): the lock that keeps a transaction's scans and sinks from using its
   pinned connection at once was one per attached catalog, so every

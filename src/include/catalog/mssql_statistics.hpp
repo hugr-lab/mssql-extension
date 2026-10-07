@@ -16,7 +16,9 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 struct MSSQLTableStatistics {
-	//! Approximate row count from sys.dm_db_partition_stats
+	//! Approximate row count: OBJECTPROPERTYEX(id, 'Cardinality') -- the server
+	//! round trip older comments here call the "DMV" query (spec 083 replaced
+	//! sys.dm_db_partition_stats, which this query read as `p.rows` and failed on).
 	idx_t row_count = 0;
 
 	//! When these statistics were last fetched
@@ -30,7 +32,7 @@ struct MSSQLTableStatistics {
 	//! metadata is invalidated — so the TTL does not apply to it (job 1217).
 	//!
 	//! Without this, `SET mssql_statistics_cache_ttl_seconds = 0` turned
-	//! `SHOW ALL TABLES` into one pool acquire + one sys.dm_db_partition_stats
+	//! `SHOW ALL TABLES` into one pool acquire + one row-count
 	//! round trip PER TABLE, on a catalog that had just loaded every count in a
 	//! single query. "Always fresh" should not mean "N connections per listing".
 	bool from_catalog_metadata = false;
