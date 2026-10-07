@@ -604,7 +604,7 @@ bool scenario_sibling_cache_stress(const TestConfig &cfg, int num_readers, int d
 	});
 
 	// Schema-walker thread — exercises MSSQLCatalog::schema_entries_,
-	// MSSQLMetadataCache::GetTableNames, and the schema-level cache paths.
+	// the schema listings (bulk metadata loads), and the schema-level cache paths.
 	threads.emplace_back([&]() {
 		Connection conn(db);
 		int i = 0;

@@ -52,18 +52,22 @@ namespace duckdb {
 // O(1); they had no business sharing a subquery. Worse, what forced the GROUP BY
 // was COUNT(*) AS partition_count — a value nothing in the tree ever read.
 //
-// The shape now comes from a correlated OUTER APPLY over sys.indexes (seekable),
-// with "is this partitioned" answered by sys.partition_schemes rather than by
-// counting partitions. index_id IN (0, 1) still selects the heap (0) or the
+// The shape now comes from sys.indexes (seekable; a LEFT JOIN on index 0/1, not
+// hypothetical, since spec 084), with "is this partitioned" answered by
+// sys.partition_schemes rather than by counting partitions. index_id IN (0, 1) still selects the heap (0) or the
 // clustered index (1); a table has exactly one of the two.
 //
 // Row counts come from OBJECTPROPERTYEX(object_id, 'Cardinality'), which answers
-// out of object metadata — 3 logical reads on sysschobjs, 0 ms CPU — and needs
-// neither sys.partitions nor statistics to exist on the table. Measured against
-// sys.partitions on the same objects it agrees exactly, including 0 for an empty
-// table and NULL (-> 0) for a VIEW, which is the value the catalog already
-// carried for a view. Fetching every row count in the database costs 84 ms this
-// way against 2400 ms through sys.partitions or sys.dm_db_partition_stats.
+// out of object metadata and needs neither sys.partitions nor statistics to
+// exist on the table. Measured against sys.partitions on the same objects it
+// agrees exactly, including 0 for an empty table and NULL (-> 0) for a VIEW,
+// which is the value the catalog already carried for a view. What it costs
+// depends on the catalog: spec 071 measured 3 logical reads a call (84 ms for
+// every count in the database) on tables without keys in one schema; spec 084
+// measured ~110 a call (23 s for 200k objects) on tables with keys and
+// constraints in 100 schemas. So it is called once per OBJECT, never per column
+// row, and the whole-catalog load takes its counts from one pass over
+// sys.dm_db_partition_stats instead (BuildBulkMetadataBatch).
 //
 // Dropping the count instead was tried and rejected: it is what gives the
 // planner its cardinality (MSSQLCatalogScanCardinality reads the catalog's copy
@@ -85,30 +89,6 @@ WHERE s.schema_id NOT IN (3, 4)
   AND s.name NOT IN ('guest', 'INFORMATION_SCHEMA', 'sys', 'db_owner', 'db_accessadmin',
                      'db_securityadmin', 'db_ddladmin', 'db_backupoperator', 'db_datareader',
                      'db_datawriter', 'db_denydatareader', 'db_denydatawriter'))";
-
-// Query to discover tables and views in a schema (@s).
-// Note: the table filter's LIKE and the ORDER BY are appended dynamically.
-//
-// Spec 084 F3/D2: the schema is matched as `o.schema_id = SCHEMA_ID(@s)`, not
-// `SCHEMA_NAME(o.schema_id) = @s`. Neither form seeks (the sysschobjs scan is a
-// floor, spec 071 F3), but the latter calls a function on every object in the
-// DATABASE: 617-686 ms against 216 ms for one schema of a 200k-object catalog.
-// The shape comes from a plain LEFT JOIN: a table has exactly one of index 0
-// (heap) and index 1 (clustered), so OUTER APPLY + MAX bought nothing; a
-// hypothetical index (the tuning advisor's) is excluded so it cannot add a row.
-static const char *TABLE_DISCOVERY_SQL_TEMPLATE = R"(
-SELECT
-    o.name AS object_name,
-    o.type AS object_type,
-    CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
-    ISNULL(i.type, 0) AS index_type,
-    CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END AS is_partitioned
-FROM sys.objects o
-LEFT JOIN sys.indexes i ON i.object_id = o.object_id AND i.index_id IN (0, 1) AND i.is_hypothetical = 0
-LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
-WHERE o.type IN ('U', 'V')
-  AND o.is_ms_shipped = 0
-  AND o.schema_id = SCHEMA_ID(@s))";
 
 // Issue #412: the names of every schema's tables and views, nothing else -- for
 // DuckDB's "did you mean" hint, which reads entry names only.
@@ -145,7 +125,7 @@ LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
 WHERE o.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
 )";
 
-// The bulk loads (spec 071 W2, spec 084 D1): one batch, two result sets --
+// The bulk loads (spec 071 W2, spec 084 D1/D5): one batch, three result sets --
 // the OBJECTS (one row each: object_id, schema, name, type, row count, shape)
 // and their COLUMNS (object_id, then the column fields) -- grouped on object_id
 // client-side. Two things this shape is for:
@@ -158,7 +138,7 @@ WHERE o.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
 // the server overran the memory grant -- the reason the per-schema loop
 // existed, spec 071 W2).
 //
-// `scope` is appended to both statements' WHERE: the one schema
+// `scope` is appended to all three statements' WHERE: the one schema
 // (`s.schema_id = SCHEMA_ID(@s)`, not a per-object SCHEMA_NAME(), spec 084 F3)
 // and the LIKE forms of schema_filter / table_filter.
 //
@@ -475,25 +455,6 @@ vector<string> MSSQLMetadataCache::GetSchemaNames(tds::TdsConnection &connection
 	return names;
 }
 
-vector<string> MSSQLMetadataCache::GetTableNames(tds::TdsConnection &connection, const string &schema_name) {
-	// Trigger lazy loading of schemas and tables for this schema
-	EnsureTablesLoaded(connection, schema_name);
-
-	std::lock_guard<std::mutex> lock(mutex_);
-	vector<string> names;
-	auto it = schemas_.find(schema_name);
-	if (it != schemas_.end()) {
-		for (const auto &pair : it->second.tables) {
-			// Apply table filter if set
-			if (filter_ && !filter_->MatchesTable(pair.first)) {
-				continue;
-			}
-			names.push_back(pair.first);
-		}
-	}
-	return names;
-}
-
 bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const string &schema_name,
 										  const string &table_name, MSSQLTableMetadata &out_meta) {
 	// Only load schemas (fast — just schema names, no tables)
@@ -777,9 +738,8 @@ void MSSQLMetadataCache::LoadAllSchemasMetadataLocked(tds::TdsConnection &connec
 	// !tables.empty()`) and reloaded. The emptiness half of that test is gone
 	// (issue #412: it reloaded the whole catalog on every Scan of an empty
 	// schema); the staging below is what keeps a failed load from publishing.
-	// The one reader that would trust the broken
-	// state, EnsureTablesLoaded, is reachable only from GetTableNames, which has
-	// no callers.
+	// (The one reader that would have trusted the broken state,
+	// EnsureTablesLoaded, had no callers and was deleted in spec 084.)
 	//
 	// So the old code was safe by three deferrals happening to line up, on
 	// layers that do not know about each other. This one is safe because this
@@ -934,7 +894,7 @@ void MSSQLMetadataCache::LoadObjectsAndColumnsLocked(tds::TdsConnection &connect
 													 BulkLoadStage &stage) {
 	// Both filters push to the server where they convert to LIKE -- the schema
 	// one is the only thing that can make a whole-catalog load smaller than the
-	// catalog. They go into BOTH statements; the regex is applied client-side
+	// catalog. They go into all three statements; the regex is applied client-side
 	// after, as before.
 	string scope;
 	if (one_schema) {
@@ -1328,106 +1288,6 @@ void MSSQLMetadataCache::EnsureSchemasLoadedLocked(tds::TdsConnection &connectio
 	}
 }
 
-void MSSQLMetadataCache::EnsureTablesLoaded(tds::TdsConnection &connection, const string &schema_name) {
-	// First ensure schemas are loaded (takes and releases mutex_ internally)
-	EnsureSchemasLoaded(connection);
-
-	// Issue #178 (D6): everything below runs under the cache-wide mutex_. The
-	// old code found the schema and checked its load state with NO lock, then
-	// mutated schema.tables under the per-schema load_mutex — which excluded
-	// nothing: every other reader/writer of the same containers holds mutex_.
-	std::lock_guard<std::mutex> lock(mutex_);
-
-	auto schema_it = schemas_.find(schema_name);
-	if (schema_it == schemas_.end()) {
-		return;	 // Schema doesn't exist
-	}
-
-	MSSQLSchemaMetadata &schema = schema_it->second;
-
-	if (schema.tables_load_state == CacheLoadState::LOADED && !IsTTLExpired(schema.tables_last_refresh, ttl_seconds_)) {
-		CACHE_DEBUG(2, "EnsureTablesLoaded('%s') — already loaded (%zu tables)", schema_name.c_str(),
-					schema.tables.size());
-		return;
-	}
-	CACHE_DEBUG(1, "EnsureTablesLoaded('%s') — loading table names from SQL Server", schema_name.c_str());
-
-	// Mark as loading
-	schema.tables_load_state = CacheLoadState::LOADING;
-
-	try {
-		// Clear existing tables
-		schema.tables.clear();
-
-		// Build query with schema name
-		string query = TABLE_DISCOVERY_SQL_TEMPLATE;
-		// Push table filter to SQL Server if convertible to LIKE
-		if (filter_ && filter_->HasTableFilter()) {
-			string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
-			if (!like_clause.empty()) {
-				query += " AND " + like_clause;
-				CACHE_DEBUG(1, "EnsureTablesLoaded('%s') — server-side table filter: %s", schema_name.c_str(),
-							like_clause.c_str());
-			}
-		}
-		query += "\nORDER BY o.name";
-		const tds::Request query_request = mssql::BuildExecuteSqlRequest(query, "@s sysname", {{"s", schema_name}});
-
-		ExecuteMetadataQuery(
-			connection, query_request,
-			[&schema](const vector<string> &values) {
-				// 5 columns: object_name, object_type, approx_rows, index_type,
-				// is_partitioned. Guard the LAST index read, not the first.
-				if (values.size() >= 5) {
-					MSSQLTableMetadata table_meta;
-					table_meta.name = values[0];
-
-					// Object type: 'U' = table, 'V' = view
-					string type_char = values[1];
-					if (!type_char.empty()) {
-						char c = type_char[0];
-						table_meta.object_type = (c == 'V') ? MSSQLObjectType::VIEW : MSSQLObjectType::TABLE;
-					} else {
-						table_meta.object_type = MSSQLObjectType::TABLE;
-					}
-
-					// Row count from OBJECTPROPERTYEX, not sys.partitions: it answers from
-					// object metadata (3 logical reads on sysschobjs) where a lookup through
-					// sys.partitions scans sysrowsets, which cannot be seeked by object_id.
-					try {
-						table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[2]));
-					} catch (...) {
-						table_meta.approx_row_count = 0;
-					}
-					// values[3] is sys.indexes.type — 1 clustered rowstore, 5 clustered
-					// COLUMNSTORE, 0 heap — and values[4] says whether the object sits on a
-					// partition scheme. Both drive the write path's TABLOCK and sort decisions.
-					ParseTableShape(values, 3, 4, table_meta);
-
-					// Note: columns NOT loaded (columns_load_state = NOT_LOADED by default)
-					schema.tables.emplace(table_meta.name, std::move(table_meta));
-				}
-			},
-			[&schema]() {
-				// emplace() is a no-op on a key already present, so a partial pass
-				// followed by a full one lands the same entries — but only because
-				// this query carries no columns. Clear anyway: entries this attempt
-				// created hold a row count and index shape read from a catalog that
-				// a concurrent DDL was in the middle of changing.
-				schema.tables.clear();
-			});
-
-		// Update state
-		CACHE_DEBUG(1, "EnsureTablesLoaded('%s') — loaded %zu tables (no column queries)", schema_name.c_str(),
-					schema.tables.size());
-		schema.tables_load_state = CacheLoadState::LOADED;
-		schema.tables_last_refresh = std::chrono::steady_clock::now();
-	} catch (...) {
-		schema.tables_load_state = CacheLoadState::NOT_LOADED;
-		throw;
-	}
-}
-
 //===----------------------------------------------------------------------===//
 // Point Invalidation (T034, T040, T043)
 //===----------------------------------------------------------------------===//
@@ -1619,85 +1479,6 @@ void MSSQLMetadataCache::LoadSchemas(tds::TdsConnection &connection) {
 			// schemas_[name] = ... overwrites, so re-running only rewrites the same
 			// entries. Not cleared: schemas_ may hold tables loaded earlier that
 			// this query does not re-report.
-		});
-}
-
-void MSSQLMetadataCache::LoadTables(tds::TdsConnection &connection, const string &schema_name) {
-	// Build query with schema name (safe: schema names are identifiers, not user input)
-	string query = TABLE_DISCOVERY_SQL_TEMPLATE;
-	// Push table filter to SQL Server if convertible to LIKE
-	if (filter_ && filter_->HasTableFilter()) {
-		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
-		if (!like_clause.empty()) {
-			query += " AND " + like_clause;
-		}
-	}
-	query += "\nORDER BY o.name";
-	const tds::Request query_request = mssql::BuildExecuteSqlRequest(query, "@s sysname", {{"s", schema_name}});
-
-	auto &schema_meta = schemas_[schema_name];
-
-	ExecuteMetadataQuery(
-		connection, query_request,
-		[&schema_meta](const vector<string> &values) {
-			// 5 columns: object_name, object_type, approx_rows, index_type,
-			// is_partitioned. Guard the LAST index read, not the first.
-			if (values.size() >= 5) {
-				MSSQLTableMetadata table_meta;
-				table_meta.name = values[0];
-
-				// Object type: 'U' = table, 'V' = view
-				string type_char = values[1];
-				if (!type_char.empty()) {
-					// Trim whitespace from type (SQL Server pads char columns)
-					char c = type_char[0];
-					table_meta.object_type = (c == 'V') ? MSSQLObjectType::VIEW : MSSQLObjectType::TABLE;
-				} else {
-					table_meta.object_type = MSSQLObjectType::TABLE;
-				}
-
-				// Row count from OBJECTPROPERTYEX, not sys.partitions: it answers from
-				// object metadata (3 logical reads on sysschobjs) where a lookup through
-				// sys.partitions scans sysrowsets, which cannot be seeked by object_id.
-				try {
-					table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[2]));
-				} catch (...) {
-					table_meta.approx_row_count = 0;
-				}
-				// values[3] is sys.indexes.type — 1 clustered rowstore, 5 clustered
-				// COLUMNSTORE, 0 heap — and values[4] says whether the object sits on a
-				// partition scheme. Both drive the write path's TABLOCK and sort decisions.
-				ParseTableShape(values, 3, 4, table_meta);
-
-				schema_meta.tables[table_meta.name] = std::move(table_meta);
-			}
-		},
-		[&schema_meta]() {
-			// tables[name] = ... overwrites rather than appends, so the rerun is
-			// idempotent for the rows it re-reads; clearing gives back the entries
-			// the aborted pass had already written from a catalog mid-change.
-			schema_meta.tables.clear();
-		});
-}
-
-void MSSQLMetadataCache::LoadColumns(tds::TdsConnection &connection, const string &schema_name,
-									 const string &table_name, MSSQLTableMetadata &table_metadata) {
-	const tds::Request query_request = mssql::BuildExecuteSqlRequest(
-		COLUMN_DISCOVERY_SQL_TEMPLATE, "@s sysname, @t sysname", {{"s", schema_name}, {"t", table_name}});
-
-	ExecuteMetadataQuery(
-		connection, query_request,
-		[this, &table_metadata](const vector<string> &values) {
-			if (values.size() >= 8) {
-				table_metadata.columns.push_back(
-					ColumnFromRow(values, 0, 8, 9, database_collation_, database_code_page_));
-			}
-		},
-		[&table_metadata]() {
-			// push_back: the one accumulation that is outright wrong to repeat.
-			// This is the "Column with name x already exists!" the old
-			// rows_delivered == 0 guard existed to prevent.
-			table_metadata.columns.clear();
 		});
 }
 

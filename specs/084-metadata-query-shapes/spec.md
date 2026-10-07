@@ -1,6 +1,6 @@
 # Spec 084: the shape of the metadata queries
 
-Status: recon done, step 1 in progress.
+Status: implemented (steps 0-5), PR into `spec/083-rpc-params`.
 
 Origin: mssql-ducklake's Query Store showed the extension's own `sys.*` queries
 to be the most expensive compiles on a DuckLake catalog database (key discovery
@@ -127,9 +127,11 @@ though, depends on what runs per row.
 
 Who runs these:
 - `TABLE_NAMES_SQL` runs on every missing-name "did you mean" walk (#412).
-- `TABLE_DISCOVERY_SQL_TEMPLATE` is nearly dead code. `EnsureTablesLoaded` has
-  no live caller, so it runs only from `Refresh()`, i.e. `mssql_refresh_cache`
-  (see F7).
+- `TABLE_DISCOVERY_SQL_TEMPLATE` was nearly dead code. `EnsureTablesLoaded`
+  had no live caller, so it ran only from `Refresh()`, i.e.
+  `mssql_refresh_cache` (see F7). Step 1 reshaped it; once D6 moved `Refresh`
+  to the whole-catalog load, it had no caller at all and step 5 deleted it,
+  with `EnsureTablesLoaded`, `GetTableNames`, `LoadTables` and `LoadColumns`.
 
 ### F4: the whole-catalog load
 
@@ -202,12 +204,13 @@ The parameterized forms, through the RPC path (spec 083's
   check is reached, before and after the change
   (`ctas_existence_checks.test` passes on both builds).
 
-### F7: `mssql_refresh_cache` sends one columns query per table
+### F7: `mssql_refresh_cache` sent one columns query per table
 
-`Refresh()` lists each schema (`LoadTables`, `TABLE_DISCOVERY_SQL_TEMPLATE`),
-then runs `COLUMN_DISCOVERY_SQL_TEMPLATE` once per table: one round trip per
-table, 200k on `md_huge`. It never loads keys (`pk_loaded` stays false). The
-whole-catalog load (F4) does the same work in one batch.
+Before D6, `Refresh()` listed each schema (`LoadTables`,
+`TABLE_DISCOVERY_SQL_TEMPLATE`), then ran `COLUMN_DISCOVERY_SQL_TEMPLATE` once
+per table: one round trip per table, 200k on `md_huge`. It never loaded keys
+(`pk_loaded` stayed false). The whole-catalog load (F4) does the same work in
+one batch.
 
 ### Not worth changing
 
@@ -401,7 +404,7 @@ metadata code. One PR, these steps:
 | 2/n | D1, single table: object row, columns, keys as three result sets |
 | 3/n | D1, the bulk loads: one schema; the whole catalog with `@rc` and its fallbacks |
 | 4/n | D5: the bulk loads carry the keys (measured on `md_huge` first); D6: `Refresh()` |
-| 5/n | docs (`DATAMODEL.md`, `CLAUDE.md`, CHANGELOG, the source comments F2 contradicts); delete the dead `LoadAllTableMetadataForSchema`; the measurements |
+| 5/n | docs (`DATAMODEL.md`, `CLAUDE.md`, CHANGELOG, the source comments F2 contradicts); delete the dead `GetTableNames`, `EnsureTablesLoaded`, `LoadTables`, `LoadColumns`, `TABLE_DISCOVERY_SQL_TEMPLATE` (`LoadAllTableMetadataForSchema` went in step 3); the measurements |
 
 ## Tests
 
@@ -444,3 +447,25 @@ metadata code. One PR, these steps:
   run.
 - Interleave the variants, and repeat any comparison: the first compiles and
   the first runs on a new database are not representative (F1, F2).
+
+## Measured in the PR
+
+`md_huge` (200k tables, 100 schemas, 4.4M columns), the branch base against the
+branch. Each operation is a fresh process; the server is the same docker
+SQL Server 2025.
+
+| operation | before | after |
+|---|---:|---:|
+| `mssql_preload_catalog` of the whole catalog | 166.4 s | 24.1-28.7 s |
+| the same, client CPU | 9.4 s | 3.9 s |
+| `mssql_preload_catalog` of one schema (2,000 tables) | 1.88 s | 0.53 s |
+| a table's first touch, server CPU (object + columns) | 1.86 ms | 0.39 ms |
+| `TABLE_NAMES_SQL` (#413's names query), server CPU | 680-700 ms | 297 ms |
+| CTAS existence check, compile per name | ~10 ms | 9.2 ms once for all names |
+
+- Both builds loaded the same 100 schemas, 200,000 tables and 4,419,200
+  columns.
+- The whole-catalog figure includes the keys (D5, ~3.3 s): the before figure
+  did not load them.
+- Not measured here: mssql-ducklake's catalog-load and preload numbers on its
+  own lake, which are for the PR.

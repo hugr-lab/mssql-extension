@@ -157,10 +157,7 @@ public:
 	// Get all schema names (triggers lazy loading of schema list)
 	vector<string> GetSchemaNames(tds::TdsConnection &connection);
 
-	// Get tables/views in a schema (triggers lazy loading of table list)
-	vector<string> GetTableNames(tds::TdsConnection &connection, const string &schema_name);
-
-	// Get table metadata: loads schemas (fast) + columns for the specific table in one query.
+	// Get table metadata: loads schemas (fast) + the table's object row, columns and keys in one batch.
 	// Does NOT load all tables in the schema. Returns false if the table doesn't exist.
 	//
 	// Issue #178 review: copies the metadata into out_meta UNDER the cache mutex.
@@ -315,9 +312,6 @@ public:
 	// Ensure schema list is loaded (lazy loading with double-checked locking)
 	void EnsureSchemasLoaded(tds::TdsConnection &connection);
 
-	// Ensure table list for schema is loaded
-	void EnsureTablesLoaded(tds::TdsConnection &connection, const string &schema_name);
-
 	//===----------------------------------------------------------------------===//
 	// Point Invalidation
 	//===----------------------------------------------------------------------===//
@@ -375,7 +369,7 @@ private:
 	//! relies on, and bring back the #376 state -- tables published into a list
 	//! still marked NOT_LOADED, cleared and reloaded by the next access.
 	void EnsureSchemasLoadedLocked(tds::TdsConnection &connection);
-	// Spec 084 D1: the objects and their columns in one batch, two result sets,
+	// Spec 084 D1/D5: the objects, their columns and keys in one batch, three result sets,
 	// staged (nothing published): every schema, or the one named. Shared by
 	// LoadAllSchemasMetadataLocked and BulkLoadAll's per-schema path.
 	void LoadObjectsAndColumnsLocked(tds::TdsConnection &connection, const string *one_schema, BulkLoadStage &stage);
@@ -388,13 +382,6 @@ private:
 
 	// Load schemas from sys.schemas
 	void LoadSchemas(tds::TdsConnection &connection);
-
-	// Load tables and views from sys.objects
-	void LoadTables(tds::TdsConnection &connection, const string &schema_name);
-
-	// Load columns from sys.columns
-	void LoadColumns(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
-					 MSSQLTableMetadata &table_metadata);
 
 	// Execute metadata query with configured timeout (metadata_timeout_ms_)
 	using MetadataRowCallback = std::function<void(const vector<string> &values)>;
@@ -413,7 +400,7 @@ private:
 							  MetadataResetCallback reset);
 	//! The same for a batch of several statements: the callback gets the
 	//! ordinal of the result set a row came from (spec 076 W2 sends the table
-	//! metadata and the primary key as one batch and reads two result sets).
+	//! metadata and the primary key as one batch; three result sets since spec 084).
 	using MetadataSetRowCallback = std::function<void(idx_t result_set, const vector<string> &values)>;
 	void ExecuteMetadataQuerySets(tds::TdsConnection &connection, const tds::Request &sql,
 								  MetadataSetRowCallback callback, MetadataResetCallback reset);

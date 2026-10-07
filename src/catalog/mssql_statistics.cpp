@@ -12,8 +12,8 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 // The table's row count, as the catalog's own metadata queries read it:
-// OBJECTPROPERTYEX(id, 'Cardinality') answers out of object metadata (3 logical
-// reads, spec 071 F1), 0 for an empty table, NULL -> 0 for a view.
+// OBJECTPROPERTYEX(id, 'Cardinality') answers out of object metadata (3 to ~110
+// logical reads, specs 071 / 084), 0 for an empty table, NULL -> 0 for a view.
 //
 // Until spec 083 this read sys.dm_db_partition_stats, whose column is
 // `row_count`, through `p.rows` (sys.partitions' name): every call failed with

@@ -1,3 +1,6 @@
+# Recon harness for spec 084, written against the PRE-084 source: the query
+# constants it extracts were reshaped or removed by the spec; queries.json keeps
+# the measured text, and const() returns '' for a constant that is gone.
 import re, sys, json
 import os
 ROOT=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'src', 'catalog') + os.sep
