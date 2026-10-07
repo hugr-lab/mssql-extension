@@ -106,6 +106,14 @@ WHERE o.type IN ('U', 'V')
   AND o.is_ms_shipped = 0
   AND SCHEMA_NAME(o.schema_id) = @s)";
 
+// Issue #412: the names of every schema's tables and views, nothing else -- for
+// DuckDB's "did you mean" hint, which reads entry names only.
+static const char *TABLE_NAMES_SQL = R"(
+SELECT SCHEMA_NAME(o.schema_id) AS schema_name, o.name AS object_name
+FROM sys.objects o
+WHERE o.type IN ('U', 'V')
+  AND o.is_ms_shipped = 0)";
+
 // Single-table metadata query: loads object type, row count, and all columns for ONE table
 // in a single round trip. Used by GetTableMetadata() to avoid loading all tables in schema.
 static const char *SINGLE_TABLE_METADATA_SQL_TEMPLATE = R"(
@@ -672,7 +680,8 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 		auto &schema = schema_it->second;
 
 		// If tables are loaded and all have columns loaded (not invalidated), use cache
-		if (schema.tables_load_state == CacheLoadState::LOADED) {
+		if (schema.tables_load_state == CacheLoadState::LOADED &&
+			!IsTTLExpired(schema.tables_last_refresh, ttl_seconds_)) {
 			bool all_columns_loaded = true;
 			for (const auto &table_pair : schema.tables) {
 				if (table_pair.second.columns_load_state != CacheLoadState::LOADED ||
@@ -681,7 +690,12 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 					break;
 				}
 			}
-			if (all_columns_loaded && !schema.tables.empty()) {
+			// An EMPTY schema counts too (issue #412): the whole-catalog load marks
+			// it LOADED for exactly this, and every Scan of it -- DuckDB's "did you
+			// mean" walks every schema on a missing table -- reloaded the whole
+			// catalog. A failed load publishes nothing (issue #317), so an empty
+			// LOADED schema is a genuinely empty one.
+			if (all_columns_loaded) {
 				CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — all %zu tables already loaded", schema_name.c_str(),
 							schema.tables.size());
 				return;
@@ -900,8 +914,11 @@ void MSSQLMetadataCache::LoadAllSchemasMetadataLocked(tds::TdsConnection &connec
 	// here: the publication of each table's columns_load_state is ALSO deferred
 	// to after the query, so a touched schema comes out of a failed load either
 	// empty or holding tables whose columns say NOT_LOADED -- and
-	// LoadAllTableMetadata rejects both (`all_columns_loaded &&
-	// !tables.empty()`) and reloads. The one reader that would trust the broken
+	// LoadAllTableMetadata rejected both (`all_columns_loaded &&
+	// !tables.empty()`) and reloaded. The emptiness half of that test is gone
+	// (issue #412: it reloaded the whole catalog on every Scan of an empty
+	// schema); the staging below is what keeps a failed load from publishing.
+	// The one reader that would trust the broken
 	// state, EnsureTablesLoaded, is reachable only from GetTableNames, which has
 	// no callers.
 	//
@@ -1146,7 +1163,8 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	// already marked columns_load_state = LOADED. A throw between that clear
 	// and the publication below left the table holding whatever columns had
 	// arrived, still claiming to be fully loaded, and the guard in
-	// LoadAllTableMetadata (`all_columns_loaded && !tables.empty()`) then saw
+	// LoadAllTableMetadata (`all_columns_loaded`, `&& !tables.empty()` until
+	// issue #412) then saw
 	// a complete schema and never reloaded. Reproduced: a two-column table
 	// came back from `SELECT *` with one column, for the rest of the session.
 	//
@@ -1982,6 +2000,50 @@ void MSSQLMetadataCache::LoadColumns(tds::TdsConnection &connection, const strin
 			// rows_delivered == 0 guard existed to prevent.
 			table_metadata.columns.clear();
 		});
+}
+
+bool MSSQLMetadataCache::TryGetTableNames(const string &schema_name, vector<string> &out_names) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	out_names.clear();
+	auto schema_it = schemas_.find(schema_name);
+	if (schema_it != schemas_.end() && schema_it->second.tables_load_state == CacheLoadState::LOADED &&
+		!IsTTLExpired(schema_it->second.tables_last_refresh, ttl_seconds_)) {
+		for (const auto &pair : schema_it->second.tables) {
+			out_names.push_back(pair.first);
+		}
+		return true;
+	}
+	if (!table_names_loaded_ || table_names_epoch_ != invalidation_epoch_.load() ||
+		IsTTLExpired(table_names_loaded_at_, ttl_seconds_)) {
+		return false;
+	}
+	auto names_it = table_names_.find(schema_name);
+	if (names_it != table_names_.end()) {
+		out_names = names_it->second;
+	}
+	return true;
+}
+
+void MSSQLMetadataCache::LoadAllTableNames(tds::TdsConnection &connection) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	unordered_map<string, vector<string>> staged;
+	ExecuteMetadataQuery(
+		connection, TABLE_NAMES_SQL,
+		[&](const vector<string> &values) {
+			if (values.size() < 2) {
+				return;
+			}
+			if (filter_ && (!filter_->MatchesSchema(values[0]) || !filter_->MatchesTable(values[1]))) {
+				return;
+			}
+			staged[values[0]].push_back(values[1]);
+		},
+		[&]() { staged.clear(); });
+	table_names_ = std::move(staged);
+	table_names_loaded_ = true;
+	table_names_epoch_ = invalidation_epoch_.load();
+	table_names_loaded_at_ = std::chrono::steady_clock::now();
+	CACHE_DEBUG(1, "LoadAllTableNames — %zu schema(s) with tables", table_names_.size());
 }
 
 }  // namespace duckdb
