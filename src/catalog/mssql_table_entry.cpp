@@ -38,6 +38,13 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 bool MSSQLReportsNativeTypes(Catalog &catalog) {
+	// The catalog's own `native_types` ATTACH option wins over the setting.
+	if (catalog.GetCatalogType() == "mssql") {
+		const auto option = catalog.Cast<MSSQLCatalog>().GetNativeTypesOption();
+		if (option >= 0) {
+			return option == 1;
+		}
+	}
 	Value setting;
 	if (!DBConfig::GetConfig(catalog.GetDatabase()).TryGetCurrentSetting("mssql_catalog_native_types", setting)) {
 		return true;

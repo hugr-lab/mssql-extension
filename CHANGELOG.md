@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`native_types` ATTACH option**: `mssql_catalog_native_types` for one
+  catalog, over the global setting. `ATTACH '…' AS meta (TYPE mssql,
+  native_types false)` reports that catalog's bounded string columns as plain
+  `VARCHAR`, in its tables and its `mssql_scan` results, while every other
+  attached catalog keeps `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)`. Takes a
+  string too (`'false'`, `'no'`), so DuckLake's `METADATA_PARAMETERS` can set it
+  for a metadata catalog. Unset, the setting decides as before.
+
 - **`mssql_scan_unsafe` / `mssql_scan_params_unsafe`** (spec 081): `mssql_scan`
   / `mssql_scan_params` with the result's shape given as
   `columns := {'name': 'TYPE', ...}` instead of described. The bind asks the

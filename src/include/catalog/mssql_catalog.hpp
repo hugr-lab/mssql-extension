@@ -68,6 +68,12 @@ struct MSSQLCatalogStartup {
 	//! Spec 079: mssql_remote_pushdown as it stood at ATTACH -- this catalog's
 	//! answer to Supports(IS_REMOTE / EXECUTE_QUERY_NODE) for its life.
 	bool remote_pushdown = false;
+	//! The `native_types` ATTACH option: 1 / 0 over mssql_catalog_native_types
+	//! for this catalog's life, -1 = unset (the setting decides, read where it
+	//! always was). DuckLake's METADATA_PARAMETERS reaches ATTACH options, not
+	//! settings, and the setting is GLOBAL: turning it off for a metadata
+	//! catalog must not change the user's own catalogs.
+	int8_t native_types = -1;
 };
 
 class MSSQLCatalog : public Catalog {
@@ -168,6 +174,11 @@ public:
 	//! "" -- for the ATTACH to log; the pool itself stays healthy.
 	const string &GetPrewarmShortfall() const {
 		return prewarm_shortfall_;
+	}
+	//! The `native_types` ATTACH option (1 / 0), or -1 when the ATTACH did not
+	//! give one. Read through MSSQLReportsNativeTypes, never directly.
+	int8_t GetNativeTypesOption() const {
+		return startup_.native_types;
 	}
 	//! mssql_preload_catalog's body, and the `preload` ATTACH option's (issue
 	//! #324: run by the ATTACH itself, where DuckLake's METADATA_PARAMETERS can
