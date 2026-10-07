@@ -681,7 +681,8 @@ bool scenario_sibling_cache_stress(const TestConfig &cfg, int num_readers, int d
 // reached concurrently from N+1 binders simultaneously, each going through
 // LookupSchema → LookupEntry → GetScanFunction (read) or DML binder path
 // (writes). Concurrent shared_from_this() on the same entry, concurrent
-// EnsurePKLoaded (pk_load_mutex_ from US2), and any race in the catalog
+// reads of the entry's rowid key (published by its constructor since spec
+// 084 D5; US2's pk_load_mutex_ is gone with the lazy discovery), and any race in the catalog
 // integration layer between writes and reads would surface here.
 // ---------------------------------------------------------------------------
 bool scenario_concurrent_writes_shared(const TestConfig &cfg, int num_writers, int duration_seconds) {
@@ -838,8 +839,8 @@ bool scenario_concurrent_writes_shared(const TestConfig &cfg, int num_writers, i
 // concurrently using disjoint PK ranges (no SQL Server row-lock conflict).
 // Pure DML pipeline stress: catalog-bound INSERT bind path runs concurrently
 // on the same MSSQLTableEntry across all threads; shared_from_this() racing
-// on the same entry; EnsurePKLoaded races (each binder triggers PK discovery
-// the first time, pk_load_mutex_ must serialise them).
+// on the same entry; concurrent reads of the rowid key, which the entry's
+// constructor published (spec 084 D5: no lazy discovery left to race).
 // ---------------------------------------------------------------------------
 bool scenario_pure_concurrent_writes(const TestConfig &cfg, int num_writers, int duration_seconds) {
 	std::cout << "\n=== Pure concurrent writes to ONE table: " << num_writers << " writers for " << duration_seconds

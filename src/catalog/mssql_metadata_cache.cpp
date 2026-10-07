@@ -230,7 +230,17 @@ FROM sys.schemas s
 INNER JOIN sys.objects o ON o.schema_id = s.schema_id
 INNER JOIN sys.columns c ON c.object_id = o.object_id
 WHERE )" + string(BULK_SCHEMA_EXCLUSIONS) +
-			 scope;
+			 scope + ";\n";
+	// Spec 084 D5: every object's usable unique keys, so a table a bulk load
+	// published carries its rowid key (pk_loaded) and a transaction does not
+	// discover it again per table on the pinned connection (measured: 22 key
+	// queries over 15 transactions after a preload, 2 without). 3.1-3.4 s over a
+	// 200k-object catalog, 57 ms for one schema of 2,000.
+	batch += mssql::RowIdKeyInfo::BulkDiscoverySql(
+		"FROM sys.schemas s\n"
+		"INNER JOIN sys.objects o ON o.schema_id = s.schema_id\n"
+		"INNER JOIN sys.indexes i ON i.object_id = o.object_id",
+		string(BULK_SCHEMA_EXCLUSIONS) + scope);
 	return batch;
 }
 
@@ -551,51 +561,60 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 		table_meta.name = table_name;
 		have_object = false;
 	};
-	ExecuteMetadataQuerySets(
-		connection, query_request,
-		[this, &table_meta, &have_object](idx_t result_set, const vector<string> &values) {
-			// Routed by which statement of the batch produced the row, never by
-			// its width (review of #345 -- a column added to one query must not
-			// silently land in another's parser).
-			if (result_set == 0) {
-				// The object row: object_type, approx_rows, index_type,
-				// is_partitioned. approx_rows has to stay --
-				// MSSQLCatalogScanCardinality reads the catalog's copy before
-				// anything else, so removing it plans every direct query at ~1 row.
-				if (values.size() < 4) {
+	// A failure that is not retried must not leave the half-filled slot in the
+	// shared map: a concurrent listing would copy it and build an entry with
+	// partial columns and no key (review of spec 084 step 4). The slot was this
+	// call's own, so erasing it is the whole undo.
+	try {
+		ExecuteMetadataQuerySets(
+			connection, query_request,
+			[this, &table_meta, &have_object](idx_t result_set, const vector<string> &values) {
+				// Routed by which statement of the batch produced the row, never by
+				// its width (review of #345 -- a column added to one query must not
+				// silently land in another's parser).
+				if (result_set == 0) {
+					// The object row: object_type, approx_rows, index_type,
+					// is_partitioned. approx_rows has to stay --
+					// MSSQLCatalogScanCardinality reads the catalog's copy before
+					// anything else, so removing it plans every direct query at ~1 row.
+					if (values.size() < 4) {
+						return;
+					}
+					have_object = true;
+					table_meta.object_type =
+						(!values[0].empty() && values[0][0] == 'V') ? MSSQLObjectType::VIEW : MSSQLObjectType::TABLE;
+					try {
+						table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[1]));
+					} catch (...) {
+						table_meta.approx_row_count = 0;
+					}
+					// values[2] is sys.indexes.type -- 1 clustered rowstore, 5 clustered
+					// COLUMNSTORE, 0 heap -- and values[3] says whether the object sits
+					// on a partition scheme. Both drive the write path's TABLOCK and
+					// sort decisions.
+					ParseTableShape(values, 2, 3, table_meta);
+					CACHE_DEBUG(2, "table shape: %s kind=%d partitioned=%d", table_meta.name.c_str(),
+								(int)table_meta.index_kind, (int)table_meta.is_partitioned);
 					return;
 				}
-				have_object = true;
-				table_meta.object_type =
-					(!values[0].empty() && values[0][0] == 'V') ? MSSQLObjectType::VIEW : MSSQLObjectType::TABLE;
-				try {
-					table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[1]));
-				} catch (...) {
-					table_meta.approx_row_count = 0;
+				if (result_set == 1) {
+					// COLUMN_DISCOVERY_SQL_TEMPLATE: the eight column fields, then
+					// is_identity and code_page.
+					if (values.size() >= 8) {
+						table_meta.columns.push_back(
+							ColumnFromRow(values, 0, 8, 9, database_collation_, database_code_page_));
+					}
+					return;
 				}
-				// values[2] is sys.indexes.type -- 1 clustered rowstore, 5 clustered
-				// COLUMNSTORE, 0 heap -- and values[3] says whether the object sits
-				// on a partition scheme. Both drive the write path's TABLOCK and
-				// sort decisions.
-				ParseTableShape(values, 2, 3, table_meta);
-				CACHE_DEBUG(2, "table shape: %s kind=%d partitioned=%d", table_meta.name.c_str(),
-							(int)table_meta.index_kind, (int)table_meta.is_partitioned);
-				return;
-			}
-			if (result_set == 1) {
-				// COLUMN_DISCOVERY_SQL_TEMPLATE: the eight column fields, then
-				// is_identity and code_page.
-				if (values.size() >= 8) {
-					table_meta.columns.push_back(
-						ColumnFromRow(values, 0, 8, 9, database_collation_, database_code_page_));
+				if (result_set == 2) {
+					mssql::RowIdKeyInfo::AppendCandidateRow(table_meta.pk_info, values);
 				}
-				return;
-			}
-			if (result_set == 2) {
-				mssql::RowIdKeyInfo::AppendCandidateRow(table_meta.pk_info, values);
-			}
-		},
-		reset_slot);
+			},
+			reset_slot);
+	} catch (...) {
+		schema.tables.erase(slot_it);
+		throw;
+	}
 
 	// Found means an object row AND at least one column, as when the columns were
 	// a join on the object: OBJECT_ID also resolves a synonym, a procedure or a
@@ -990,6 +1009,14 @@ void MSSQLMetadataCache::LoadObjectsAndColumnsLocked(tds::TdsConnection &connect
 				found->second->columns.push_back(
 					ColumnFromRow(values, 1, 9, 10, database_collation_, database_code_page_));
 				stage.column_count++;
+				return;
+			}
+			if (result_set == 2) {
+				// The keys: object_id, then the key discovery's 17 columns.
+				auto found = by_object_id.find(values.empty() ? string() : values[0]);
+				if (found != by_object_id.end()) {
+					mssql::RowIdKeyInfo::AppendCandidateRow(found->second->pk_info, values, 1);
+				}
 			}
 		},
 		[&]() {
@@ -1018,6 +1045,11 @@ void MSSQLMetadataCache::LoadObjectsAndColumnsLocked(tds::TdsConnection &connect
 			}
 			std::sort(columns.begin(), columns.end(),
 					  [](const MSSQLColumnInfo &a, const MSSQLColumnInfo &b) { return a.column_id < b.column_id; });
+			// Spec 077 W1's choice over the unique indexes the third result set
+			// listed -- "no usable key" is an answer too, so every table is
+			// pk_loaded (MSSQLTableEntry seeds its key from it).
+			it->second.pk_info.FinalizeChoice(database_collation_);
+			it->second.pk_loaded = true;
 			it->second.columns_load_state = CacheLoadState::LOADED;
 			it->second.columns_last_refresh = now;
 			stage.table_count++;
@@ -1067,15 +1099,11 @@ void MSSQLMetadataCache::Refresh(tds::TdsConnection &connection, const string &d
 		// Load schemas
 		LoadSchemas(connection);
 
-		// Load tables for each schema
-		for (auto &pair : schemas_) {
-			LoadTables(connection, pair.first);
-
-			// Load columns for each table
-			for (auto &table_pair : pair.second.tables) {
-				LoadColumns(connection, pair.first, table_pair.first, table_pair.second);
-			}
-		}
+		// Spec 084 D6: the whole catalog in one batch -- objects, columns, keys --
+		// instead of one listing per schema and one columns query PER TABLE
+		// (200k round trips on a 200k-object catalog, and no keys).
+		idx_t schema_count = 0, table_count = 0, column_count = 0;
+		LoadAllSchemasMetadataLocked(connection, schema_count, table_count, column_count);
 
 		// Update state and timestamp (backward-compat)
 		state_ = MSSQLCacheState::LOADED;

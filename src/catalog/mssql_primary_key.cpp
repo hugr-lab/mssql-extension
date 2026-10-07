@@ -2,15 +2,10 @@
 // Feature: 001-pk-rowid-semantics
 
 #include "catalog/mssql_primary_key.hpp"
-#include <chrono>
 #include <cstdlib>
-#include <thread>
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "query/mssql_identifier.hpp"
-#include "query/mssql_simple_query.hpp"
-#include "query/mssql_sql_params.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetPKDebugLevel() {
@@ -48,8 +43,11 @@ namespace mssql {
 // a rowid built on the wrong shape. TYPE_NAME answers for both families.
 //
 // Parameters: @s schema, @t table (sp_executesql, one plan for every table).
-static const char *PK_DISCOVERY_SQL_TEMPLATE = R"(
-SELECT
+// The key query's SELECT list and conditions, ONE definition for the
+// single-table statement (DiscoverySqlTemplate) and the bulk loads'
+// (BulkDiscoverySql, spec 084 D5), so the two cannot drift: a column added here
+// reaches both, and AppendCandidateRow reads both.
+static const char *PK_DISCOVERY_COLUMNS = R"(
     i.index_id,
     i.name AS index_name,
     i.is_primary_key,
@@ -66,63 +64,26 @@ SELECT
     c.scale,
     ISNULL(c.collation_name, '') AS collation_name,
     c.is_nullable,
-    c.is_identity
-FROM sys.indexes i
+    c.is_identity)";
+
+static const char *PK_DISCOVERY_JOINS = R"(
 JOIN sys.index_columns ic
     ON i.object_id = ic.object_id
     AND i.index_id = ic.index_id
 JOIN sys.columns c
     ON ic.object_id = c.object_id
-    AND ic.column_id = c.column_id
-WHERE i.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
+    AND ic.column_id = c.column_id)";
+
+static const char *PK_DISCOVERY_CONDITIONS = R"(
     AND i.is_unique = 1
     AND ic.is_included_column = 0
-    AND ic.key_ordinal > 0
-ORDER BY i.index_id, ic.key_ordinal
-)";
+    AND ic.key_ordinal > 0)";
 
-//===----------------------------------------------------------------------===//
-// Helper: Execute metadata query using MSSQLSimpleQuery
-//===----------------------------------------------------------------------===//
-
-using MetadataRowCallback = std::function<void(const vector<string> &values)>;
-
-static void ExecuteMetadataQuery(tds::TdsConnection &connection, const tds::Request &sql, MetadataRowCallback callback,
-								 const std::function<void()> &reset) {
-	// Deadlock-victim retry, same contract as RunMetadataQuery in
-	// mssql_metadata_cache.cpp: 1205 on a pure-read metadata query reruns
-	// (bounded), and `reset` undoes whatever the aborted attempt accumulated so
-	// the rerun is legal after rows have already been delivered. A PK query
-	// returns one row per key column, so a composite key can and does die
-	// mid-stream.
-	constexpr int MAX_ATTEMPTS = 6;
-	for (int attempt = 1;; attempt++) {
-		idx_t rows_delivered = 0;
-		auto result = MSSQLSimpleQuery::ExecuteWithCallback(
-			connection, sql, [&callback, &rows_delivered](const std::vector<std::string> &row) {
-				// Convert std::vector to duckdb::vector
-				vector<string> duckdb_row;
-				duckdb_row.reserve(row.size());
-				for (const auto &val : row) {
-					duckdb_row.push_back(val);
-				}
-				rows_delivered++;
-				callback(duckdb_row);
-				return true;  // continue processing
-			});
-
-		if (!result.HasError()) {
-			return;
-		}
-		if (result.error_number == 1205 && attempt < MAX_ATTEMPTS && (rows_delivered == 0 || reset)) {
-			if (rows_delivered > 0) {
-				reset();
-			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
-			continue;
-		}
-		throw IOException("Primary key metadata query failed: %s", result.error_message);
-	}
+static const string &PkDiscoverySql() {
+	static const string sql = string("\nSELECT") + PK_DISCOVERY_COLUMNS + "\nFROM sys.indexes i" + PK_DISCOVERY_JOINS +
+							  "\nWHERE i.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))" +
+							  PK_DISCOVERY_CONDITIONS + "\nORDER BY i.index_id, ic.key_ordinal\n";
+	return sql;
 }
 
 //===----------------------------------------------------------------------===//
@@ -205,7 +166,15 @@ void RowIdKeyInfo::ComputeRowIdType() {
 }
 
 const char *RowIdKeyInfo::DiscoverySqlTemplate() {
-	return PK_DISCOVERY_SQL_TEMPLATE;
+	return PkDiscoverySql().c_str();
+}
+
+string RowIdKeyInfo::BulkDiscoverySql(const string &from, const string &where) {
+	// object_id first, then the single-table statement's columns; ordered so
+	// each object's candidates arrive together, index by index, key column by
+	// key column, as AppendCandidateRow groups them.
+	return string("SELECT i.object_id,") + PK_DISCOVERY_COLUMNS + "\n" + from + PK_DISCOVERY_JOINS + "\nWHERE " +
+		   where + PK_DISCOVERY_CONDITIONS + "\nORDER BY i.object_id, i.index_id, ic.key_ordinal";
 }
 
 static int32_t ToInt(const string &v, int32_t fallback = 0) {
@@ -220,33 +189,35 @@ static bool ToBool(const string &v) {
 	return v == "1" || v == "true" || v == "True";
 }
 
-bool RowIdKeyInfo::AppendCandidateRow(RowIdKeyInfo &info, const vector<string> &values) {
-	if (values.size() < 17) {
+bool RowIdKeyInfo::AppendCandidateRow(RowIdKeyInfo &info, const vector<string> &all_values, idx_t base) {
+	if (all_values.size() < base + 17) {
 		return false;
 	}
-	const int32_t index_id = ToInt(values[0]);
+	// The statement's 17 columns, wherever they start in the row.
+	auto values = [&all_values, base](idx_t i) -> const string & { return all_values[base + i]; };
+	const int32_t index_id = ToInt(values(0));
 	if (info.candidates_.empty() || info.candidates_.back().index_id != index_id) {
 		RowIdKeyCandidate cand;
 		cand.index_id = index_id;
-		cand.index_name = values[1];
-		cand.is_primary_key = ToBool(values[2]);
-		cand.is_unique = ToBool(values[3]);
-		cand.has_filter = ToBool(values[4]);
-		cand.is_disabled = ToBool(values[5]);
-		cand.is_hypothetical = ToBool(values[6]);
+		cand.index_name = values(1);
+		cand.is_primary_key = ToBool(values(2));
+		cand.is_unique = ToBool(values(3));
+		cand.has_filter = ToBool(values(4));
+		cand.is_disabled = ToBool(values(5));
+		cand.is_hypothetical = ToBool(values(6));
 		info.candidates_.push_back(std::move(cand));
 	}
 	RowIdKeyColumn col;
-	col.name = values[7];
-	col.column_id = ToInt(values[8]);
-	col.key_ordinal = ToInt(values[9]);
-	col.type_name = values[10];
-	col.max_length = static_cast<int16_t>(ToInt(values[11]));
-	col.precision = static_cast<uint8_t>(ToInt(values[12]));
-	col.scale = static_cast<uint8_t>(ToInt(values[13]));
-	col.collation_name = values[14];
-	col.is_nullable = ToBool(values[15]);
-	col.is_identity = ToBool(values[16]);
+	col.name = values(7);
+	col.column_id = ToInt(values(8));
+	col.key_ordinal = ToInt(values(9));
+	col.type_name = values(10);
+	col.max_length = static_cast<int16_t>(ToInt(values(11)));
+	col.precision = static_cast<uint8_t>(ToInt(values(12)));
+	col.scale = static_cast<uint8_t>(ToInt(values(13)));
+	col.collation_name = values(14);
+	col.is_nullable = ToBool(values(15));
+	col.is_identity = ToBool(values(16));
 	// The one client-side fact the SQL cannot supply: is this column read
 	// through the lossy NVARCHAR(MAX) cast? Same predicate MSSQLColumnInfo uses.
 	col.cast_required = !MSSQLColumnInfo::IsKnownSQLServerType(col.type_name);
@@ -258,7 +229,6 @@ void RowIdKeyInfo::FinalizeChoice(const string &database_collation) {
 	columns.clear();
 	rejections.clear();
 	index_name.clear();
-	discovery_error.clear();
 	source = RowIdKeySource::NONE;
 
 	auto choice = ChooseRowIdKey(candidates_);
@@ -314,12 +284,7 @@ string RowIdKeyInfo::RowIdRefusal(const string &schema_name, const string &table
 								   "', '" + table_name + "')";
 	const string invalidate_hint = " After adding one through mssql_exec(), run " + invalidate_call +
 								   " so the next statement reads the indexes again.";
-	if (!discovery_error.empty()) {
-		msg += "The indexes of '" + schema_name + "." + table_name +
-			   "' could not be read, so whether it has one is unknown: " + discovery_error +
-			   ". The lookup is not retried on its own: " + invalidate_call +
-			   " drops the cached answer so the next statement reads the indexes again.";
-	} else if (rejections.empty()) {
+	if (rejections.empty()) {
 		msg += "Table '" + schema_name + "." + table_name +
 			   "' has neither. Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a filter." +
 			   invalidate_hint;
@@ -332,32 +297,6 @@ string RowIdKeyInfo::RowIdRefusal(const string &schema_name, const string &table
 			   ". Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a filter." + invalidate_hint;
 	}
 	return msg;
-}
-
-RowIdKeyInfo RowIdKeyInfo::Discover(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
-									const string &database_collation) {
-	RowIdKeyInfo info;
-
-	// Build fully qualified object name
-	string full_name = mssql::QuoteIdentifier(schema_name) + "." + mssql::QuoteIdentifier(table_name);
-	MSSQL_PK_DEBUG("Discovering primary key for %s", full_name.c_str());
-
-	// Spec 075 W4 (#334): names as sp_executesql parameters -- one plan for every table.
-	const tds::Request query = mssql::BuildExecuteSqlRequest(PK_DISCOVERY_SQL_TEMPLATE, "@s sysname, @t sysname",
-															 {{"s", schema_name}, {"t", table_name}});
-
-	// Execute PK discovery query
-	ExecuteMetadataQuery(
-		connection, query, [&info](const vector<string> &values) { AppendCandidateRow(info, values); },
-		[&info]() {
-			// One row per key column: a candidate aborted after its first column
-			// would otherwise come back with that column listed twice, and the
-			// rowid STRUCT built from it would be wrong rather than merely missing.
-			info.ClearCandidates();
-		});
-
-	info.FinalizeChoice(database_collation);
-	return info;
 }
 
 }  // namespace mssql

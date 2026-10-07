@@ -84,11 +84,10 @@ struct MSSQLTableMetadata {
 	// Issue #178 (D6): all fields — including these states — are guarded by the
 	// cache-wide MSSQLMetadataCache::mutex_; the former per-table load_mutex is gone.
 	CacheLoadState columns_load_state = CacheLoadState::NOT_LOADED;
-	// Spec 076 W2: the primary key, when the load that filled this entry
-	// carried it -- GetTableMetadata sends the discovery statement in the same
-	// batch as the columns, so a fresh table costs one round trip, not two.
-	// The bulk paths do not, and MSSQLTableEntry then discovers it lazily as
-	// before (pk_loaded == false).
+	// Spec 076 W2 / 084 D5: the rowid key, loaded in the same batch as the
+	// columns by every load that publishes them -- GetTableMetadata's third
+	// result set and the bulk loads' -- so pk_loaded is true whenever
+	// columns_load_state is LOADED, and MSSQLTableEntry is born with it.
 	mssql::RowIdKeyInfo pk_info;
 	bool pk_loaded = false;
 	std::chrono::steady_clock::time_point columns_last_refresh;

@@ -329,12 +329,37 @@ The `@rc` row count (`SUM(row_count)` over `index_id IN (0, 1)`) equals
       including tables with no key rows (the "no usable key" answer is an
       answer).
     - `MSSQLTableEntry`'s constructor already seeds `pk_info_` from
-      `metadata.pk_loaded`; `mssql_table_set.cpp` needs no change.
+      `metadata.pk_loaded`.
   - **Cost.** The key result set's cost on `md_huge` is measured before it
     ships, because it lands on every whole-catalog load (every listing).
-  - **Fallback.** If it is too dear, the cheaper alternative is to carry an
-    existing entry's keys forward in the per-schema merge, which is what the
-    comment promised.
+  - **Measured:** 3.1-3.4 s on `md_huge` for the whole catalog (+~13% on a
+    24 s load), 57 ms for one schema of 2,000 (+~11%). Taken.
+  - **The lazy path is removed (owner's decision, step 4).** With every load
+    that publishes a table's columns carrying its key -- the single-table
+    batch, the bulk loads, `Refresh` (D6) -- `MSSQLTableEntry::EnsurePKLoaded`'s
+    `RowIdKeyInfo::Discover` was unreachable. Removed with it: `Discover`,
+    `discovery_error` and the "could not be read" refusal, `pk_load_mutex_`,
+    and spec 077 W5b's `rowid_discovery_failure_cached.test`, whose premise
+    ("the columns loaded, the key not") no longer exists. The invariant is
+    columns LOADED => `pk_loaded`; the entry's constructor and `EnsurePKLoaded`
+    assert it, and `CreateTableEntry` builds no entry from metadata that
+    breaks it.
+  - **Failures, invalidation, refresh.** A key that cannot be read now fails
+    the metadata load it rides in: nothing is cached, and the next access
+    retries (077 W5b cached the failure on the entry, to keep the lock-free
+    readers safe from a rewrite; the key now arrives before the entry exists,
+    so there is nothing to rewrite). `mssql_invalidate_cache` (table, schema,
+    catalog), TTL, catalog DDL and `mssql_refresh_cache` reload the key with
+    the columns. Inside a transaction the pinned load carries the key, COMMIT
+    publishes it with the rest, a table the transaction changed is forgotten,
+    and after `mssql_exec` DDL (`MarkChangedLocally`) the transaction reloads on
+    its own connection.
+  - **Behaviour change.** A key changed behind the catalog's back (an index
+    added by another client, or through `mssql_exec` without
+    `mssql_exec_invalidate_cache`) is now as stale as the columns: until an
+    invalidation or the TTL. It used to be read lazily, at the first scan of
+    the table. The "has neither" refusal names `mssql_invalidate_cache` for
+    exactly this.
 - **D6: `Refresh()` goes through the whole-catalog load** (F7), picking up D1
   and D5, instead of one columns query per table.
 
@@ -394,7 +419,10 @@ metadata code. One PR, these steps:
   - **D5:** after a preload, `SET mssql_test_fail_metadata_after_rows = 1`,
     then a transaction that scans preloaded tables must succeed. Any metadata
     query in it would fail, so this is deterministic where the plan-cache
-    counter is not;
+    counter is not (`bulk_load_keys.test`; it also runs in the debug-build
+    rowid job, where the constructor's assert is live);
+  - `rowid_discovery_failure_cached.test` (spec 077 W5b) is deleted with the
+    behaviour it tested (D5);
   - **D1 permission fallback:** a login without `VIEW DATABASE STATE` lists the
     catalog and gets the same row counts;
   - D1 consistency: a filtered whole-catalog load returns exactly the

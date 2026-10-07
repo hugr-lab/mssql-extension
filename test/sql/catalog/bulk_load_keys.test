@@ -1,0 +1,140 @@
+# name: test/sql/catalog/bulk_load_keys.test
+# description: the bulk loads and mssql_refresh_cache carry every table's rowid key (spec 084 D5/D6), so a transaction does not discover it again
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Before spec 084 a preload built every table's metadata without its key, and
+# each transaction then ran the key query on its pinned connection for every
+# table it scanned (22 key queries over 15 transactions, against 2 without a
+# preload). Here, after the load, every further metadata query is made to fail
+# (mssql_test_fail_metadata_after_rows = 1): a transaction that scans the
+# tables and reads their rowid must need none.
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS blk (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('blk', $$
+IF OBJECT_ID('blk_s.KeyPk', 'U') IS NOT NULL DROP TABLE blk_s.KeyPk;
+IF OBJECT_ID('blk_s.KeyUq', 'U') IS NOT NULL DROP TABLE blk_s.KeyUq;
+IF OBJECT_ID('blk_s.KeyNone', 'U') IS NOT NULL DROP TABLE blk_s.KeyNone;
+IF OBJECT_ID('blk_s.KeyFallback', 'U') IS NOT NULL DROP TABLE blk_s.KeyFallback;
+IF SCHEMA_ID('blk_s') IS NULL EXEC('CREATE SCHEMA blk_s');
+$$);
+
+statement ok
+SELECT mssql_exec('blk', $$
+CREATE TABLE blk_s.KeyPk (a int NOT NULL, b int NOT NULL, v int, CONSTRAINT pk_blk PRIMARY KEY (b, a));
+INSERT INTO blk_s.KeyPk VALUES (1, 10, 100), (2, 20, 200);
+CREATE TABLE blk_s.KeyUq (id int NOT NULL, v int, CONSTRAINT uq_blk UNIQUE (id));
+INSERT INTO blk_s.KeyUq VALUES (5, 50);
+CREATE TABLE blk_s.KeyNone (v int);
+INSERT INTO blk_s.KeyNone VALUES (1);
+CREATE TABLE blk_s.KeyFallback (at datetime NOT NULL PRIMARY KEY, code int NOT NULL, v int, CONSTRAINT uq_blk_code UNIQUE (code));
+INSERT INTO blk_s.KeyFallback VALUES ('2024-01-02T03:04:05', 7, 70);
+$$);
+
+# --- After a one-schema preload ---------------------------------------------
+statement ok
+SELECT mssql_invalidate_cache('blk');
+
+statement ok
+SELECT mssql_preload_catalog('blk', 'blk_s');
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+statement ok
+BEGIN;
+
+# A composite primary key, in key order (b, a).
+query II
+SELECT rowid, v FROM blk.blk_s.KeyPk ORDER BY v;
+----
+{'b': 10, 'a': 1}	100
+{'b': 20, 'a': 2}	200
+
+# A unique constraint stands in for a missing primary key (spec 077 W1).
+query II
+SELECT rowid, v FROM blk.blk_s.KeyUq;
+----
+5	50
+
+# A datetime primary key is not usable (#358); the choice falls through to the
+# unique int, over candidates the bulk load delivered (spec 077 W1).
+query II
+SELECT rowid, v FROM blk.blk_s.KeyFallback;
+----
+7	70
+
+statement ok
+COMMIT;
+
+# "No usable key" was loaded too: the refusal needs no query either.
+statement error
+UPDATE blk.blk_s.KeyNone SET v = 2;
+----
+has neither
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
+
+# --- After a whole-catalog preload ------------------------------------------
+statement ok
+SELECT mssql_invalidate_cache('blk');
+
+statement ok
+SELECT mssql_preload_catalog('blk');
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+statement ok
+BEGIN;
+
+query I
+SELECT (SELECT count(rowid) FROM blk.blk_s.KeyPk) + (SELECT count(rowid) FROM blk.blk_s.KeyUq);
+----
+3
+
+statement ok
+COMMIT;
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
+
+# --- After mssql_refresh_cache (D6: one batch, keys included) ---------------
+statement ok
+SELECT mssql_refresh_cache('blk');
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+statement ok
+BEGIN;
+
+query II
+SELECT rowid, v FROM blk.blk_s.KeyUq;
+----
+5	50
+
+statement ok
+COMMIT;
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
+
+statement ok
+SELECT mssql_exec('blk', 'DROP TABLE blk_s.KeyPk; DROP TABLE blk_s.KeyUq; DROP TABLE blk_s.KeyNone; DROP TABLE blk_s.KeyFallback; DROP SCHEMA blk_s;');
+
+statement ok
+DETACH blk;

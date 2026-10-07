@@ -271,9 +271,8 @@ classDiagram
     }
     class MSSQLTableEntry {
         +GetScanFunction() TableFunction
-        +EnsurePKLoaded()
         -pk_info_ : RowIdKeyInfo
-        -pk_load_mutex_ : mutex
+        -pk_loaded_ : atomic~bool~
     }
     class MSSQLBindAnchors {
         <<ClientContextState>>
@@ -437,7 +436,7 @@ classDiagram
 - `TokenCache` is the only remaining process-wide static, but it is **namespaced by `DatabaseInstance*`** (spec 047 FR-012) so two embeddings can use the same Azure secret name without aliasing.
 - Result streams (large `mssql_scan` results) live in `MSSQLCatalog::active_streams_`, keyed by a UUID handle that bridges Bind-time stream creation and InitGlobal-time consumption (spec 047 US3). Since spec 075 that bridge is the **fallback** only: Bind learns the shape from `sp_describe_first_result_set` (or from `sp_prepare`'s answer with `prepared := true`) and the query runs at InitGlobal; a statement the server cannot describe still executes at Bind and registers its stream here. Inside a transaction every scan of a catalog drains at init under the materialize lock of the connection it shares (`MSSQLCatalog::MaterializeMutexFor`: the transaction's own mutex, held by nothing outside it -- one lock per catalog serialised the transactions of every DuckDB connection, issue #409 -- or the catalog's in autocommit on a pool of one), and the optimizer flags the catalog scans of any catalog the plan also **sinks into** (COPY, INSERT) for materialisation, because the sink's batches go down the same pinned connection.
 - Pushed filters (spec 076): the encoder registers each constant in a `mssql::SqlParamSet` on the way through — `EncodeConstantValue`, declared from the column by `DeclarationForColumn` — and `TableScanInitGlobal` wraps the statement with `ExecuteSqlRequest`, an `sp_executesql` RPC call whose values are encoded from their declared types (spec 083); the plan-time complex filters keep their set on the bind data (`complex_filter_params`, serialised with the clause, values included). One statement text per filter shape, one server plan, and no outer batch for the server to compile per call.
-- A fresh table's first touch (spec 076 W2): `GetTableMetadata` sends one batch of three statements -- the object row (type, row count, shape; spec 084 D1, so the row count is computed once and not once per column), its columns (`COLUMN_DISCOVERY_SQL_TEMPLATE`) and `RowIdKeyInfo::DiscoverySqlTemplate()` -- and routes the result sets by ordinal: the key off the third (17-column rows — every unique index with its key columns and flags, spec 077 W1). A table is found when the object row AND at least one column arrive (a synonym or procedure resolves through `OBJECT_ID` but has no columns), so `MSSQLTableMetadata` carries `pk_info` / `pk_loaded` and `MSSQLTableEntry` is constructed with the key; `EnsurePKLoaded` still discovers lazily for entries the bulk paths built.
+- A fresh table's first touch (spec 076 W2): `GetTableMetadata` sends one batch of three statements -- the object row (type, row count, shape; spec 084 D1, so the row count is computed once and not once per column), its columns (`COLUMN_DISCOVERY_SQL_TEMPLATE`) and `RowIdKeyInfo::DiscoverySqlTemplate()` -- and routes the result sets by ordinal: the key off the third (17-column rows — every unique index with its key columns and flags, spec 077 W1). A table is found when the object row AND at least one column arrive (a synonym or procedure resolves through `OBJECT_ID` but has no columns), so `MSSQLTableMetadata` carries `pk_info` / `pk_loaded` and `MSSQLTableEntry` is constructed with the key. The bulk loads (preload, listings, `mssql_refresh_cache`) carry every table's key the same way (spec 084 D5), so an entry is always born with it.
 - The per-table metadata queries — table list, columns, primary key, row count — carry the schema and table names as `sp_executesql` parameters (`@s sysname, @t sysname`; `query/mssql_sql_params.hpp`; an RPC call since spec 083, `BuildExecuteSqlRequest`), so their text is one fixed string per shape and the server keeps one plan for every table instead of compiling one per first touch (#334).
 
 ### Cache invalidation
@@ -548,9 +547,11 @@ every later scan estimate-less (review of #386). It is a count read under the
 transaction, as stale as one an autocommit load takes, and refreshed the same
 way (invalidation, TTL). A transaction's lookup reads the shared **metadata** cache too,
 after the table filter and before going to the server; the entry built from it
-goes into the transaction's OWN layer, because its rowid key may still be
-discovered on the pinned connection and a failed discovery is cached in the
-entry. A miss there is never a "does not exist": autocommit re-queries a name a
+goes into the transaction's OWN layer. Since spec 084 D5 the entry is born with
+its rowid key: every load that publishes a table's columns -- the single-table
+batch, the bulk loads, `mssql_refresh_cache` -- carries the key in the same
+batch, so no key is discovered later, on any connection, and a failed load
+caches nothing. A miss there is never a "does not exist": autocommit re-queries a name a
 loaded listing lacks, and so does the transaction.
 
 ```mermaid
@@ -579,8 +580,9 @@ connection found the uncommitted table in the cache while the transaction was
 open, then hung reading it. Publication at the end avoids both: a changed name
 is never published, and nothing is visible to others before the transaction
 has ended. Other paths that used to reach the pool from inside a transaction
-follow the same rule: the rowid key discovery (`EnsurePKLoaded`) and the schema
-list load go on the pinned connection, and the storage info a table listing asks
+follow the same rule: the schema list load goes on the pinned connection (the
+rowid key needs no query of its own since spec 084 D5: it comes with the
+table's metadata), and the storage info a table listing asks
 for uses the row count loaded with the entry instead of a DMV query per table
 (on a pool of one that query waited `mssql_acquire_timeout` for every table).
 
