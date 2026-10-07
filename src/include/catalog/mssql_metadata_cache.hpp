@@ -135,6 +135,13 @@ enum class MSSQLCacheState : uint8_t {
 // MSSQLMetadataCache - In-memory cache of schema/table/column metadata
 //===----------------------------------------------------------------------===//
 
+// What one bulk load staged before publishing: schema -> table -> metadata.
+struct BulkLoadStage {
+	unordered_map<string, unordered_map<string, MSSQLTableMetadata>> tables;
+	idx_t table_count = 0;
+	idx_t column_count = 0;
+};
+
 class MSSQLMetadataCache {
 public:
 	explicit MSSQLMetadataCache(int64_t ttl_seconds = 0);
@@ -203,13 +210,8 @@ public:
 
 	// Load all table metadata for a schema in one bulk query.
 	// If all tables already have columns loaded (e.g. from preload), returns from cache.
-	// Otherwise loads everything with BULK_METADATA_SCHEMA_SQL_TEMPLATE (one round trip).
+	// Otherwise loads the whole catalog in one batch (LoadAllSchemasMetadataLocked).
 	void LoadAllTableMetadata(tds::TdsConnection &connection, const string &schema_name);
-
-	//! The single-schema bulk load. Kept because mssql_preload_catalog('schema')
-	//! names one deliberately; the listing path goes through
-	//! LoadAllSchemasMetadata instead. Caller must hold mutex_ via the public entry.
-	void LoadAllTableMetadataForSchema(tds::TdsConnection &connection, const string &schema_name);
 
 	//! Load EVERY schema's tables and columns in one query (spec 071 W2).
 	//!
@@ -295,6 +297,13 @@ public:
 	// Set database default collation
 	void SetDatabaseCollation(const string &collation, int32_t code_page);
 
+	// Spec 084 D1: whether the whole-catalog load may take its row counts from one
+	// pass over sys.dm_db_partition_stats. Off on Fabric / Synapse, where the DMV
+	// and table variables are unverified. Set once at catalog init.
+	void SetRowCountPass(bool allowed) {
+		row_count_pass_ = allowed;
+	}
+
 	// Get database default collation.
 	// Returns by VALUE: a reference would outlive the internal lock and race
 	// with Refresh() overwriting the string (issue #178 D6 audit).
@@ -367,6 +376,10 @@ private:
 	//! relies on, and bring back the #376 state -- tables published into a list
 	//! still marked NOT_LOADED, cleared and reloaded by the next access.
 	void EnsureSchemasLoadedLocked(tds::TdsConnection &connection);
+	// Spec 084 D1: the objects and their columns in one batch, two result sets,
+	// staged (nothing published): every schema, or the one named. Shared by
+	// LoadAllSchemasMetadataLocked and BulkLoadAll's per-schema path.
+	void LoadObjectsAndColumnsLocked(tds::TdsConnection &connection, const string *one_schema, BulkLoadStage &stage);
 	void LoadAllSchemasMetadataLocked(tds::TdsConnection &connection, idx_t &schema_count, idx_t &table_count,
 									  idx_t &column_count);
 
@@ -427,6 +440,7 @@ private:
 	//! held.
 	bool IsColumnsFreshLocked(const MSSQLTableMetadata &table) const;
 	MSSQLCacheState state_;								  // Current cache state (backward compat)
+	bool row_count_pass_ = true;						  // SetRowCountPass; set once at catalog init
 	const MSSQLCatalogFilter *filter_ = nullptr;		  // Set once at catalog init, before any concurrency
 	unordered_map<string, MSSQLSchemaMetadata> schemas_;  // Cached schemas
 	std::chrono::steady_clock::time_point last_refresh_;  // Last refresh timestamp (backward compat)

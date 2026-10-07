@@ -145,98 +145,94 @@ LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
 WHERE o.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
 )";
 
-// Bulk metadata query scoped to a single schema
-// Note: ORDER BY is appended dynamically after optional filter clauses
-static const char *BULK_METADATA_SCHEMA_SQL_TEMPLATE = R"(
-SELECT
-    s.name AS schema_name,
-    o.name AS object_name,
-    o.type AS object_type,
-    CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
-    c.name AS column_name,
-    c.column_id,
-    ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS type_name,
-    c.max_length,
-    c.precision,
-    c.scale,
-    c.is_nullable,
-    ISNULL(c.collation_name, '') AS collation_name,
-    ISNULL(shape.index_type, 0) AS index_type,
-    ISNULL(shape.is_partitioned, 0) AS is_partitioned,
-    c.is_identity,
-    CAST(COLLATIONPROPERTY(c.collation_name, 'CodePage') AS INT) AS code_page
-FROM sys.schemas s
-INNER JOIN sys.objects o ON o.schema_id = s.schema_id
-INNER JOIN sys.columns c ON c.object_id = o.object_id
-OUTER APPLY (SELECT MAX(i.type) AS index_type,
-                    MAX(CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END) AS is_partitioned
-             FROM sys.indexes i
-             LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
-             WHERE i.object_id = o.object_id AND i.index_id IN (0, 1)) shape
-WHERE s.schema_id NOT IN (3, 4)
-  AND s.principal_id != 0
-  AND s.name NOT IN ('guest', 'INFORMATION_SCHEMA', 'sys', 'db_owner', 'db_accessadmin',
-                     'db_securityadmin', 'db_ddladmin', 'db_backupoperator', 'db_datareader',
-                     'db_datawriter', 'db_denydatareader', 'db_denydatawriter')
-  AND o.type IN ('U', 'V')
-  AND o.is_ms_shipped = 0
-  AND s.name = @s)";
-
-// Whole-catalog metadata: every schema, every table, every column, in ONE query.
+// The bulk loads (spec 071 W2, spec 084 D1): one batch, two result sets --
+// the OBJECTS (one row each: object_id, schema, name, type, row count, shape)
+// and their COLUMNS (object_id, then the column fields) -- grouped on object_id
+// client-side. Two things this shape is for:
+// - the row count is computed once per object. Beside the columns, the server
+//   ran OBJECTPROPERTYEX once per COLUMN row: a schema of 2,000 tables in a
+//   200k-object catalog took 1.8 s, the whole catalog 170 s;
+// - the object fields are not repeated on every column row.
+// No ORDER BY: rows are grouped by object_id in a hash map and each table's
+// columns sorted by column_id before publishing (sorting millions of rows on
+// the server overran the memory grant -- the reason the per-schema loop
+// existed, spec 071 W2).
 //
-// Spec 071 W2. What made this impossible before was the ORDER BY, not the size:
-// BulkLoadAll iterated schema by schema precisely because sorting millions of
-// rows by (schema, object, column_id) overran the memory grant and spilled to
-// tempdb. But the sort was only ever there to let a STREAMING group-by parse
-// detect table boundaries. Group on object_id in a hash map instead and the sort
-// is not needed, so neither is the loop.
+// `scope` is appended to both statements' WHERE: the one schema
+// (`s.schema_id = SCHEMA_ID(@s)`, not a per-object SCHEMA_NAME(), spec 084 F3)
+// and the LIKE forms of schema_filter / table_filter.
 //
-// That loop is the whole of issue #86. Listing one schema costs a pass over the
-// catalog whatever the predicate says -- sys.objects filters metadata visibility
-// per object in the DATABASE, so an EMPTY schema measured 484 ms of server CPU at
-// 200K objects, and no form of the schema predicate turns that scan into a seek
-// (sys.objects, sys.tables and INFORMATION_SCHEMA.TABLES all plan as a Clustered
-// Index Scan on sysschobjs.clst, with a literal nsid as much as with SCHEMA_ID()).
-// N schemas therefore cost N passes: 10,000 empty schemas extrapolate to ~80
-// minutes. One query for all of them measured 1917 ms. Break-even is under five
-// schemas, so there is no catalog size at which the per-schema loop wins.
-//
-// object_id leads the SELECT list because it is the grouping key: two schemas may
-// hold tables of the same name, so the name alone cannot identify the group.
-static const char *BULK_METADATA_ALL_SQL = R"(
-SELECT
-    o.object_id,
-    s.name AS schema_name,
-    o.name AS object_name,
-    o.type AS object_type,
-    CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
-    c.name AS column_name,
-    c.column_id,
-    ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS type_name,
-    c.max_length,
-    c.precision,
-    c.scale,
-    c.is_nullable,
-    ISNULL(c.collation_name, '') AS collation_name,
-    ISNULL(shape.index_type, 0) AS index_type,
-    ISNULL(shape.is_partitioned, 0) AS is_partitioned,
-    c.is_identity,
-    CAST(COLLATIONPROPERTY(c.collation_name, 'CodePage') AS INT) AS code_page
-FROM sys.schemas s
-INNER JOIN sys.objects o ON o.schema_id = s.schema_id
-INNER JOIN sys.columns c ON c.object_id = o.object_id
-OUTER APPLY (SELECT MAX(i.type) AS index_type,
-                    MAX(CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END) AS is_partitioned
-             FROM sys.indexes i
-             LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
-             WHERE i.object_id = o.object_id AND i.index_id IN (0, 1)) shape
-WHERE s.schema_id NOT IN (3, 4)
+// `rc_pass`: the row counts of the whole catalog from ONE pass over
+// sys.dm_db_partition_stats into @rc (4.3 s at 200k objects against 23 s of
+// per-object OBJECTPROPERTYEX, ~110 logical reads a call on a catalog with keys
+// and constraints). Only for an unfiltered whole-catalog load -- the pass
+// covers the whole database whatever the filters say -- and only where it is
+// allowed (not Fabric / Synapse). The DMV needs VIEW DATABASE STATE, which
+// OBJECTPROPERTYEX does not: without it, or on any error, @rc stays empty and
+// every object takes the OBJECTPROPERTYEX branch, so a db_datareader-only login
+// keeps its catalog. A view has no partition rows and takes that branch too; an
+// indexed view agrees either way (measured), a memory-optimized table has no
+// index 0/1 row and reads 0 from OBJECTPROPERTYEX as it always did. A deadlock
+// victim (1205) is rethrown, for RunMetadataQuerySets to rerun the batch.
+static const char *BULK_SCHEMA_EXCLUSIONS = R"(s.schema_id NOT IN (3, 4)
   AND s.principal_id != 0
   AND s.name NOT IN ('guest', 'INFORMATION_SCHEMA', 'sys', 'db_owner', 'db_accessadmin',
                      'db_securityadmin', 'db_ddladmin', 'db_backupoperator', 'db_datareader',
                      'db_datawriter', 'db_denydatareader', 'db_denydatawriter')
   AND o.type IN ('U', 'V')
   AND o.is_ms_shipped = 0)";
+
+static string BuildBulkMetadataBatch(const string &scope, bool rc_pass) {
+	string batch;
+	string row_count = "CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT)";
+	string rc_join;
+	if (rc_pass) {
+		batch += R"(DECLARE @rc TABLE (object_id int PRIMARY KEY, rows_ bigint);
+IF HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DATABASE STATE') = 1
+BEGIN TRY
+    INSERT INTO @rc (object_id, rows_)
+    SELECT ps.object_id, SUM(ps.row_count)
+    FROM sys.dm_db_partition_stats ps
+    WHERE ps.index_id IN (0, 1)
+    GROUP BY ps.object_id;
+END TRY
+BEGIN CATCH
+    IF ERROR_NUMBER() = 1205 THROW;
+END CATCH;
+)";
+		row_count = "CASE WHEN rc.object_id IS NOT NULL THEN rc.rows_ ELSE " + row_count + " END";
+		rc_join = "LEFT JOIN @rc rc ON rc.object_id = o.object_id\n";
+	}
+	batch += "SELECT o.object_id, s.name AS schema_name, o.name AS object_name, o.type AS object_type,\n    " +
+			 row_count +
+			 " AS approx_rows,\n"
+			 "    ISNULL(i.type, 0) AS index_type,\n"
+			 "    CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END AS is_partitioned\n"
+			 "FROM sys.schemas s\n"
+			 "INNER JOIN sys.objects o ON o.schema_id = s.schema_id\n" +
+			 rc_join +
+			 "LEFT JOIN sys.indexes i ON i.object_id = o.object_id AND i.index_id IN (0, 1) AND i.is_hypothetical = 0\n"
+			 "LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id\n"
+			 "WHERE " +
+			 string(BULK_SCHEMA_EXCLUSIONS) + scope + ";\n";
+	batch += R"(SELECT c.object_id,
+    c.name AS column_name,
+    c.column_id,
+    ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS type_name,
+    c.max_length,
+    c.precision,
+    c.scale,
+    c.is_nullable,
+    ISNULL(c.collation_name, '') AS collation_name,
+    c.is_identity,
+    CAST(COLLATIONPROPERTY(c.collation_name, 'CodePage') AS INT) AS code_page
+FROM sys.schemas s
+INNER JOIN sys.objects o ON o.schema_id = s.schema_id
+INNER JOIN sys.columns c ON c.object_id = o.object_id
+WHERE )" + string(BULK_SCHEMA_EXCLUSIONS) +
+			 scope;
+	return batch;
+}
 
 // Query to discover columns in a table/view
 // Note: ISNULL is used for collation_name to avoid NBCROW parsing issues with NULL values
@@ -722,148 +718,6 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 	LoadAllSchemasMetadata(connection, all_schemas, all_tables, all_columns);
 }
 
-void MSSQLMetadataCache::LoadAllTableMetadataForSchema(tds::TdsConnection &connection, const string &schema_name) {
-	string sql = BULK_METADATA_SCHEMA_SQL_TEMPLATE;
-
-	// Push table filter to SQL Server if convertible to LIKE
-	if (filter_ && filter_->HasTableFilter()) {
-		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
-		if (!like_clause.empty()) {
-			sql += " AND " + like_clause;
-			CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — server-side table filter: %s", schema_name.c_str(),
-						like_clause.c_str());
-		}
-	}
-	sql += "\nORDER BY s.name, o.name, c.column_id";
-	// Spec 075 W4: one plan per schema-load shape, the schema as a parameter.
-	const tds::Request sql_request = mssql::BuildExecuteSqlRequest(sql, "@s sysname", {{"s", schema_name}});
-
-	// Streaming group-by parse (same as BulkLoadAll but for one schema)
-	string current_table;
-	MSSQLTableMetadata *current_table_meta = nullptr;
-	idx_t table_count = 0;
-	idx_t column_count = 0;
-
-	std::lock_guard<std::mutex> lock(mutex_);
-	auto schema_it = schemas_.find(schema_name);
-	if (schema_it == schemas_.end()) {
-		return;
-	}
-	auto &schema = schema_it->second;
-
-	// Clear old table entries — bulk reload replaces everything
-	schema.tables.clear();
-
-	ExecuteMetadataQuery(
-		connection, sql_request,
-		[&](const vector<string> &values) {
-			// 15 columns: schema, object, type, approx_rows, the eight per-column
-			// fields, then index_type and is_partitioned. Guard the LAST index read.
-			if (values.size() < 14) {
-				return;
-			}
-
-			string row_table = values[1];
-			string row_type = values[2];
-			string row_approx_rows = values[3];
-			string col_name = values[4];
-			string col_id_str = values[5];
-			string type_name = values[6];
-			string max_len_str = values[7];
-			string prec_str = values[8];
-			string scale_str = values[9];
-			string nullable_str = values[10];
-			string collation = values[11];
-
-			// Apply table filter
-			if (filter_ && !filter_->MatchesTable(row_table)) {
-				return;
-			}
-
-			// New table group?
-			if (row_table != current_table) {
-				current_table = row_table;
-
-				MSSQLTableMetadata table_meta;
-				table_meta.name = current_table;
-				if (!row_type.empty() && row_type[0] == 'V') {
-					table_meta.object_type = MSSQLObjectType::VIEW;
-				} else {
-					table_meta.object_type = MSSQLObjectType::TABLE;
-				}
-				try {
-					table_meta.approx_row_count = static_cast<idx_t>(std::stoll(row_approx_rows));
-				} catch (...) {
-					table_meta.approx_row_count = 0;
-				}
-				// Physical shape from the correlated sys.indexes lookup (see the header):
-				// values[12] is sys.indexes.type — 1 clustered rowstore, 5 clustered
-				// COLUMNSTORE, 0 heap — and values[13] says whether the object sits on a
-				// partition scheme. Both drive the write path's TABLOCK and sort decisions.
-				ParseTableShape(values, 12, 13, table_meta);
-				schema.tables.emplace(current_table, std::move(table_meta));
-				auto table_it = schema.tables.find(current_table);
-				current_table_meta = &table_it->second;
-				table_count++;
-			}
-
-			// Parse column
-			int32_t col_id = 0;
-			try {
-				col_id = static_cast<int32_t>(std::stoi(col_id_str));
-			} catch (...) {
-			}
-			int16_t max_len = 0;
-			try {
-				max_len = static_cast<int16_t>(std::stoi(max_len_str));
-			} catch (...) {
-			}
-			uint8_t prec = 0;
-			try {
-				prec = static_cast<uint8_t>(std::stoi(prec_str));
-			} catch (...) {
-			}
-			uint8_t scl = 0;
-			try {
-				scl = static_cast<uint8_t>(std::stoi(scale_str));
-			} catch (...) {
-			}
-			bool nullable = FlagIsSet(nullable_str);
-
-			MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
-									 database_collation_);
-			col_info.is_identity = values.size() > 14 && FlagIsSet(values[14]);
-			// COLLATIONPROPERTY(collation_name, 'CodePage') (issue #361): the page a
-			// varchar parameter is converted to; 0 when the server cannot say.
-			col_info.code_page = ParseCodePage(values, 15);
-			col_info.database_code_page = database_code_page_;
-			current_table_meta->columns.push_back(std::move(col_info));
-			column_count++;
-		},
-		[&]() {
-			// The pre-query state was an empty table map (cleared above) and a
-			// group-by parse that has not seen a row. Restoring both is the undo;
-			// the counters are the caller's totals for THIS schema, so they go too.
-			schema.tables.clear();
-			current_table.clear();
-			current_table_meta = nullptr;
-			table_count = 0;
-			column_count = 0;
-		});
-
-	// Mark all tables as loaded
-	auto now = std::chrono::steady_clock::now();
-	schema.tables_load_state = CacheLoadState::LOADED;
-	schema.tables_last_refresh = now;
-	for (auto &table_pair : schema.tables) {
-		table_pair.second.columns_load_state = CacheLoadState::LOADED;
-		table_pair.second.columns_last_refresh = now;
-	}
-
-	CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — loaded %llu tables, %llu columns in one query", schema_name.c_str(),
-				(unsigned long long)table_count, (unsigned long long)column_count);
-}
-
 //===----------------------------------------------------------------------===//
 // Bulk Catalog Preload (Spec 033: US5)
 //===----------------------------------------------------------------------===//
@@ -883,23 +737,6 @@ void MSSQLMetadataCache::LoadAllSchemasMetadataLocked(tds::TdsConnection &connec
 	schema_count = 0;
 	table_count = 0;
 	column_count = 0;
-
-	string sql = BULK_METADATA_ALL_SQL;
-	// Both filters push to the server where they convert to LIKE. The schema one
-	// matters most here: it is the only thing that can make this query smaller
-	// than the whole catalog, which is what a user with 10,000 schemas reaches for.
-	if (filter_ && filter_->HasSchemaFilter()) {
-		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetSchemaPattern(), "s.name");
-		if (!like_clause.empty()) {
-			sql += " AND " + like_clause;
-		}
-	}
-	if (filter_ && filter_->HasTableFilter()) {
-		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
-		if (!like_clause.empty()) {
-			sql += " AND " + like_clause;
-		}
-	}
 
 	// Nothing is written into schemas_ until the query has RETURNED. Issue #317:
 	// this used to clear each schema's table map from inside the row callback and
@@ -938,114 +775,12 @@ void MSSQLMetadataCache::LoadAllSchemasMetadataLocked(tds::TdsConnection &connec
 	// Staging the TABLE MAPS rather than whole MSSQLSchemaMetadata values keeps
 	// each schema's other fields (its name, and any state a future field adds)
 	// instead of rebuilding them from nothing.
-	unordered_map<string, unordered_map<string, MSSQLTableMetadata>> staged;
-	// object_id -> the entry it owns, pointing into `staged`. Valid across
-	// insertion because both containers are node-based unordered_maps, and read
-	// only before the publication below moves anything.
-	unordered_map<string, MSSQLTableMetadata *> by_object_id;
-
-	ExecuteMetadataQuery(
-		connection, sql,
-		[&](const vector<string> &values) {
-			// 16 columns: object_id, schema, object, type, approx_rows, the eight
-			// per-column fields, then index_type and is_partitioned. Guard the LAST
-			// index read.
-			if (values.size() < 15) {
-				return;
-			}
-			const string &object_id = values[0];
-			auto found = by_object_id.find(object_id);
-			MSSQLTableMetadata *table_meta;
-			if (found == by_object_id.end()) {
-				const string &schema_name = values[1];
-				if (filter_ && !filter_->MatchesSchema(schema_name)) {
-					return;
-				}
-				const string &table_name = values[2];
-				if (filter_ && !filter_->MatchesTable(table_name)) {
-					return;
-				}
-				// Creating the staged map IS what "this pass touched the schema"
-				// means; the cache itself is not consulted or modified here.
-				auto &tables = staged[schema_name];
-				auto &slot = tables[table_name];
-				slot = MSSQLTableMetadata();
-				slot.name = table_name;
-				if (!values[3].empty() && values[3][0] == 'V') {
-					slot.object_type = MSSQLObjectType::VIEW;
-				} else {
-					slot.object_type = MSSQLObjectType::TABLE;
-				}
-				try {
-					slot.approx_row_count = static_cast<idx_t>(std::stoll(values[4]));
-				} catch (...) {
-					slot.approx_row_count = 0;
-				}
-				ParseTableShape(values, 13, 14, slot);
-				table_meta = &slot;
-				by_object_id.emplace(object_id, table_meta);
-				table_count++;
-			} else {
-				table_meta = found->second;
-			}
-
-			int32_t col_id = 0;
-			try {
-				col_id = static_cast<int32_t>(std::stoi(values[6]));
-			} catch (...) {
-			}
-			int16_t max_len = 0;
-			try {
-				max_len = static_cast<int16_t>(std::stoi(values[8]));
-			} catch (...) {
-			}
-			uint8_t prec = 0;
-			try {
-				prec = static_cast<uint8_t>(std::stoi(values[9]));
-			} catch (...) {
-			}
-			uint8_t scl = 0;
-			try {
-				scl = static_cast<uint8_t>(std::stoi(values[10]));
-			} catch (...) {
-			}
-			const bool nullable = FlagIsSet(values[11]);
-			MSSQLColumnInfo col_info(values[5], col_id, values[7], max_len, prec, scl, nullable, values[12],
-									 database_collation_);
-			col_info.is_identity = values.size() > 15 && FlagIsSet(values[15]);
-			// COLLATIONPROPERTY(collation_name, 'CodePage') (issue #361): the page a
-			// varchar parameter is converted to; 0 when the server cannot say.
-			col_info.code_page = ParseCodePage(values, 16);
-			col_info.database_code_page = database_code_page_;
-			table_meta->columns.push_back(std::move(col_info));
-			column_count++;
-		},
-		[&]() {
-			// Restartable (PR #308): a deadlock victim reruns from the top, so the
-			// grouping state goes back. Nothing published needs undoing any more —
-			// the cache has not been touched at this point (issue #317).
-			staged.clear();
-			by_object_id.clear();
-			schema_count = 0;
-			table_count = 0;
-			column_count = 0;
-		});
-
-	// Everything below runs only if ExecuteMetadataQuery returned. A throw takes
-	// the staged copy with it and leaves the cache exactly as it was (#317).
-
-	// Columns arrive in no particular order, so put each table's list back into
-	// column_id order before publishing: every consumer indexes by position.
-	// Must precede the move below, which invalidates by_object_id.
+	BulkLoadStage stage;
+	LoadObjectsAndColumnsLocked(connection, nullptr, stage);
+	auto &staged = stage.tables;
+	table_count = stage.table_count;
+	column_count = stage.column_count;
 	const auto now = std::chrono::steady_clock::now();
-	for (auto &pair : by_object_id) {
-		auto &columns = pair.second->columns;
-		std::sort(columns.begin(), columns.end(),
-				  [](const MSSQLColumnInfo &a, const MSSQLColumnInfo &b) { return a.column_id < b.column_id; });
-		pair.second->columns_load_state = CacheLoadState::LOADED;
-		pair.second->columns_last_refresh = now;
-	}
-	by_object_id.clear();
 
 	// Publish. A schema's old table map is replaced, not merged, so the query's
 	// answer is the whole answer. Every schema in the answer counts, as its tables
@@ -1144,178 +879,27 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	auto &schema = schema_it->second;
 	const string &target_schema = schema_it->first;
 
-	// Build per-schema query
-	string sql = BULK_METADATA_SCHEMA_SQL_TEMPLATE;
+	// The schema's objects and columns, staged (issue #317: nothing reaches the
+	// cache until the query has returned, so a failure mid-load leaves it as it
+	// was).
+	BulkLoadStage stage;
+	LoadObjectsAndColumnsLocked(connection, &target_schema, stage);
 
-	// Push table filter to SQL Server if convertible to LIKE
-	if (filter_ && filter_->HasTableFilter()) {
-		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
-		if (!like_clause.empty()) {
-			sql += " AND " + like_clause;
+	// Publish per table rather than wholesale: this query may not cover every
+	// table the schema legitimately holds -- one excluded by table_filter, or
+	// loaded singly and not matched here -- and replacing the map would drop
+	// those. Every table in the answer counts, as every column does (#375).
+	const auto now = std::chrono::steady_clock::now();
+	for (auto &staged_schema : stage.tables) {
+		for (auto &staged : staged_schema.second) {
+			schema.tables[staged.first] = std::move(staged.second);
 		}
 	}
-	sql += "\nORDER BY s.name, o.name, c.column_id";
-	const tds::Request sql_request = mssql::BuildExecuteSqlRequest(sql, "@s sysname", {{"s", target_schema}});
-
-	// Streaming group-by parse for this schema.
-	//
-	// Staged, for the reason LoadAllSchemasMetadata is (issue #317) — and here
-	// the corruption was OBSERVABLE, which the whole-catalog one was not. This
-	// loop used to write into the LIVE schemas_ from the callback, including
-	// `columns.clear()` on a table that an earlier single-table load had
-	// already marked columns_load_state = LOADED. A throw between that clear
-	// and the publication below left the table holding whatever columns had
-	// arrived, still claiming to be fully loaded, and the guard in
-	// LoadAllTableMetadata (`all_columns_loaded`, `&& !tables.empty()` until
-	// issue #412) then saw
-	// a complete schema and never reloaded. Reproduced: a two-column table
-	// came back from `SELECT *` with one column, for the rest of the session.
-	//
-	// The publication MERGES rather than replaces, which is why the staging is
-	// per table and not a whole table map: this query may not cover every
-	// table the schema legitimately holds (one excluded by table_filter, say),
-	// and those must survive.
-	unordered_map<string, MSSQLTableMetadata> staged_tables;
-	string current_table;
-	MSSQLTableMetadata *current_table_meta = nullptr;
-	idx_t schema_tables = 0;
-	idx_t schema_columns = 0;
-
-	ExecuteMetadataQuery(
-		connection, sql_request,
-		[&](const vector<string> &values) {
-			// 15 columns: schema, object, type, approx_rows, the eight per-column
-			// fields, then index_type and is_partitioned. Guard the LAST index read.
-			if (values.size() < 14) {
-				return;
-			}
-
-			string row_table = values[1];
-			string row_type = values[2];
-			string row_approx_rows = values[3];
-			string col_name = values[4];
-			string col_id_str = values[5];
-			string type_name = values[6];
-			string max_len_str = values[7];
-			string prec_str = values[8];
-			string scale_str = values[9];
-			string nullable_str = values[10];
-			string collation = values[11];
-
-			// Apply table filter
-			if (filter_ && !filter_->MatchesTable(row_table)) {
-				return;
-			}
-
-			// New table group?
-			if (row_table != current_table) {
-				current_table = row_table;
-
-				// Seed the staged entry from the cache when the table is
-				// already known, so a field this query does not carry is not
-				// silently dropped; its columns start empty either way,
-				// because this query is the whole answer for them.
-				auto table_it = staged_tables.find(current_table);
-				if (table_it == staged_tables.end()) {
-					MSSQLTableMetadata table_meta;
-					table_meta.name = current_table;
-
-					// Object type
-					if (!row_type.empty() && row_type[0] == 'V') {
-						table_meta.object_type = MSSQLObjectType::VIEW;
-					} else {
-						table_meta.object_type = MSSQLObjectType::TABLE;
-					}
-
-					// Approximate row count
-					try {
-						table_meta.approx_row_count = static_cast<idx_t>(std::stoll(row_approx_rows));
-					} catch (...) {
-						table_meta.approx_row_count = 0;
-					}
-					// Physical shape from the correlated sys.indexes lookup (see the
-					// header): values[12] is sys.indexes.type — 1 clustered rowstore,
-					// 5 clustered COLUMNSTORE, 0 heap — and values[13] says whether the
-					// object sits on a partition scheme. Both drive the write path's
-					// TABLOCK and sort decisions.
-					ParseTableShape(values, 12, 13, table_meta);
-
-					table_it = staged_tables.emplace(current_table, std::move(table_meta)).first;
-					// Every table in the answer counts, as every column does (issue
-					// #375). This used to count only tables NEW to the cache, so a
-					// second preload of a schema reported "0 tables, 358 columns".
-					schema_tables++;
-					table_count++;
-				} else {
-					// Same table twice in one pass. The ORDER BY makes that a
-					// non-group, but if it ever happened the second group is
-					// the authority, exactly as before.
-					table_it->second.columns.clear();
-				}
-				current_table_meta = &table_it->second;
-			}
-
-			// Parse column info
-			int32_t col_id = 0;
-			try {
-				col_id = static_cast<int32_t>(std::stoi(col_id_str));
-			} catch (...) {
-			}
-			int16_t max_len = 0;
-			try {
-				max_len = static_cast<int16_t>(std::stoi(max_len_str));
-			} catch (...) {
-			}
-			uint8_t prec = 0;
-			try {
-				prec = static_cast<uint8_t>(std::stoi(prec_str));
-			} catch (...) {
-			}
-			uint8_t scl = 0;
-			try {
-				scl = static_cast<uint8_t>(std::stoi(scale_str));
-			} catch (...) {
-			}
-			bool nullable = FlagIsSet(nullable_str);
-
-			MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
-									 database_collation_);
-			col_info.is_identity = values.size() > 14 && FlagIsSet(values[14]);
-			// COLLATIONPROPERTY(collation_name, 'CodePage') (issue #361): the page a
-			// varchar parameter is converted to; 0 when the server cannot say.
-			col_info.code_page = ParseCodePage(values, 15);
-			col_info.database_code_page = database_code_page_;
-			current_table_meta->columns.push_back(std::move(col_info));
-			schema_columns++;
-			column_count++;
-		},
-		[&]() {
-			// Restartable (PR #308). Nothing published needs undoing since
-			// issue #317 staged this loop — the cache has not been touched at
-			// this point — so the staging area and the group-by cursor go back
-			// together, along with this schema's share of the running totals.
-			staged_tables.clear();
-			current_table.clear();
-			current_table_meta = nullptr;
-			table_count -= schema_tables;
-			column_count -= schema_columns;
-			schema_tables = 0;
-			schema_columns = 0;
-		});
-
-	// Publish, only now that the query has returned. Per table rather than
-	// wholesale: this query may not cover every table the schema legitimately
-	// holds — one excluded by table_filter, or loaded singly and not matched
-	// here — and replacing the map would drop those.
-	const auto now = std::chrono::steady_clock::now();
-	for (auto &staged : staged_tables) {
-		staged.second.columns_load_state = CacheLoadState::LOADED;
-		staged.second.columns_last_refresh = now;
-		schema.tables[staged.first] = std::move(staged.second);
-	}
+	table_count = stage.table_count;
+	column_count = stage.column_count;
 
 	CACHE_DEBUG(1, "BulkLoadAll: schema '%s' — %llu tables, %llu columns", target_schema.c_str(),
-				(unsigned long long)schema_tables, (unsigned long long)schema_columns);
+				(unsigned long long)table_count, (unsigned long long)column_count);
 
 	// Only what this call loaded is marked (issue #376): the target schema's
 	// table list, and the columns of the tables in its answer. This used to mark
@@ -1325,6 +909,121 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	schema.tables_load_state = CacheLoadState::LOADED;
 	schema.tables_last_refresh = now;
 	schema_count = 1;
+}
+
+void MSSQLMetadataCache::LoadObjectsAndColumnsLocked(tds::TdsConnection &connection, const string *one_schema,
+													 BulkLoadStage &stage) {
+	// Both filters push to the server where they convert to LIKE -- the schema
+	// one is the only thing that can make a whole-catalog load smaller than the
+	// catalog. They go into BOTH statements; the regex is applied client-side
+	// after, as before.
+	string scope;
+	if (one_schema) {
+		scope += "\n  AND s.schema_id = SCHEMA_ID(@s)";
+	}
+	bool filtered = false;
+	if (filter_ && filter_->HasSchemaFilter()) {
+		filtered = true;
+		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetSchemaPattern(), "s.name");
+		if (!like_clause.empty()) {
+			scope += " AND " + like_clause;
+		}
+	}
+	if (filter_ && filter_->HasTableFilter()) {
+		filtered = true;
+		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
+		if (!like_clause.empty()) {
+			scope += " AND " + like_clause;
+		}
+	}
+	const bool rc_pass = !one_schema && !filtered && row_count_pass_;
+	const string batch = BuildBulkMetadataBatch(scope, rc_pass);
+	const tds::Request request =
+		one_schema ? mssql::BuildExecuteSqlRequest(batch, "@s sysname", {{"s", *one_schema}}) : tds::Request(batch);
+
+	// object_id -> the entry it owns, pointing into stage.tables. Valid across
+	// insertion because both containers are node-based unordered_maps.
+	unordered_map<string, MSSQLTableMetadata *> by_object_id;
+	ExecuteMetadataQuerySets(
+		connection, request,
+		[&](idx_t result_set, const vector<string> &values) {
+			if (result_set == 0) {
+				// The objects: object_id, schema, name, type, approx_rows,
+				// index_type, is_partitioned.
+				if (values.size() < 7) {
+					return;
+				}
+				const string &schema_name = values[1];
+				const string &table_name = values[2];
+				if (filter_ && (!filter_->MatchesSchema(schema_name) || !filter_->MatchesTable(table_name))) {
+					return;
+				}
+				auto &slot = stage.tables[schema_name][table_name];
+				slot = MSSQLTableMetadata();
+				slot.name = table_name;
+				slot.object_type =
+					(!values[3].empty() && values[3][0] == 'V') ? MSSQLObjectType::VIEW : MSSQLObjectType::TABLE;
+				try {
+					slot.approx_row_count = static_cast<idx_t>(std::stoll(values[4]));
+				} catch (...) {
+					slot.approx_row_count = 0;
+				}
+				// values[5] is sys.indexes.type -- 1 clustered rowstore, 5 clustered
+				// COLUMNSTORE, 0 heap -- and values[6] whether the object sits on a
+				// partition scheme: the write path's TABLOCK and sort decisions.
+				ParseTableShape(values, 5, 6, slot);
+				by_object_id[values[0]] = &slot;
+				return;
+			}
+			if (result_set == 1) {
+				// The columns: object_id, then the eight column fields,
+				// is_identity and code_page. A column of an object the first
+				// statement did not return (filtered out, or created between the
+				// two statements) is dropped.
+				if (values.size() < 9) {
+					return;
+				}
+				auto found = by_object_id.find(values[0]);
+				if (found == by_object_id.end()) {
+					return;
+				}
+				found->second->columns.push_back(
+					ColumnFromRow(values, 1, 9, 10, database_collation_, database_code_page_));
+				stage.column_count++;
+			}
+		},
+		[&]() {
+			// Restartable (PR #308): a deadlock victim reruns from the top, so the
+			// grouping state goes back. Nothing is published yet (issue #317).
+			stage.tables.clear();
+			stage.table_count = 0;
+			stage.column_count = 0;
+			by_object_id.clear();
+		});
+	by_object_id.clear();
+
+	// Columns arrive in no particular order: put each table's list into
+	// column_id order, since every consumer indexes by position. An object with
+	// no columns is not published -- the two statements can disagree under
+	// concurrent DDL (dropped between them), and the old single join could not
+	// produce such a table either.
+	const auto now = std::chrono::steady_clock::now();
+	for (auto &staged_schema : stage.tables) {
+		auto &tables = staged_schema.second;
+		for (auto it = tables.begin(); it != tables.end();) {
+			auto &columns = it->second.columns;
+			if (columns.empty()) {
+				it = tables.erase(it);
+				continue;
+			}
+			std::sort(columns.begin(), columns.end(),
+					  [](const MSSQLColumnInfo &a, const MSSQLColumnInfo &b) { return a.column_id < b.column_id; });
+			it->second.columns_load_state = CacheLoadState::LOADED;
+			it->second.columns_last_refresh = now;
+			stage.table_count++;
+			++it;
+		}
+	}
 }
 
 void MSSQLMetadataCache::ForEachTable(
