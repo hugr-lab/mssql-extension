@@ -124,33 +124,25 @@ INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
 WHERE o.type IN ('U', 'V')
   AND o.is_ms_shipped = 0)";
 
-// Single-table metadata query: loads object type, row count, and all columns for ONE table
-// in a single round trip. Used by GetTableMetadata() to avoid loading all tables in schema.
-static const char *SINGLE_TABLE_METADATA_SQL_TEMPLATE = R"(
+// Single-table metadata, first statement of the batch: the OBJECT row -- type,
+// row count, physical shape -- for ONE table. Its columns are the second
+// statement (COLUMN_DISCOVERY_SQL_TEMPLATE) and its keys the third.
+//
+// Spec 084 F2/F5: the row count used to sit in the same SELECT list as the
+// columns, and the server ran OBJECTPROPERTYEX once per COLUMN row, ~110 logical
+// reads a call on a catalog with keys and constraints: 1.86 ms / 986 reads for
+// one table of a 200k-object catalog, against 0.18 + 0.21 ms / 42 + 8 reads as
+// two statements.
+static const char *SINGLE_TABLE_OBJECT_SQL_TEMPLATE = R"(
 SELECT
     o.type AS object_type,
     CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
-    c.name AS column_name,
-    c.column_id,
-    ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS type_name,
-    c.max_length,
-    c.precision,
-    c.scale,
-    c.is_nullable,
-    ISNULL(c.collation_name, '') AS collation_name,
-    ISNULL(shape.index_type, 0) AS index_type,
-    ISNULL(shape.is_partitioned, 0) AS is_partitioned,
-    c.is_identity,
-    CAST(COLLATIONPROPERTY(c.collation_name, 'CodePage') AS INT) AS code_page
+    ISNULL(i.type, 0) AS index_type,
+    CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END AS is_partitioned
 FROM sys.objects o
-INNER JOIN sys.columns c ON c.object_id = o.object_id
-OUTER APPLY (SELECT MAX(i.type) AS index_type,
-                    MAX(CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END) AS is_partitioned
-             FROM sys.indexes i
-             LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
-             WHERE i.object_id = o.object_id AND i.index_id IN (0, 1)) shape
+LEFT JOIN sys.indexes i ON i.object_id = o.object_id AND i.index_id IN (0, 1) AND i.is_hypothetical = 0
+LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
 WHERE o.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
-ORDER BY c.column_id
 )";
 
 // Bulk metadata query scoped to a single schema
@@ -282,6 +274,44 @@ static int32_t ParseCodePage(const vector<string> &values, idx_t idx) {
 // A bit column as the simple-query layer renders it.
 static bool FlagIsSet(const string &value) {
 	return value == "1" || value == "true" || value == "True";
+}
+
+// One column out of a metadata row: column_name, column_id, type_name,
+// max_length, precision, scale, is_nullable, collation_name at values[base] ..
+// values[base + 7], and is_identity / code_page where the query puts them (the
+// bulk queries carry the table's shape between collation_name and is_identity).
+static MSSQLColumnInfo ColumnFromRow(const vector<string> &values, idx_t base, idx_t identity_idx, idx_t code_page_idx,
+									 const string &database_collation, int32_t database_code_page) {
+	int32_t col_id = 0;
+	try {
+		col_id = static_cast<int32_t>(std::stoi(values[base + 1]));
+	} catch (...) {
+	}
+	int16_t max_len = 0;
+	try {
+		max_len = static_cast<int16_t>(std::stoi(values[base + 3]));
+	} catch (...) {
+	}
+	uint8_t prec = 0;
+	try {
+		prec = static_cast<uint8_t>(std::stoi(values[base + 4]));
+	} catch (...) {
+	}
+	uint8_t scl = 0;
+	try {
+		scl = static_cast<uint8_t>(std::stoi(values[base + 5]));
+	} catch (...) {
+	}
+	MSSQLColumnInfo col_info(values[base], col_id, values[base + 2], max_len, prec, scl, FlagIsSet(values[base + 6]),
+							 values[base + 7], database_collation);
+	// sys.columns.is_identity (spec 062 W4, issue #327): what the INSERT planner
+	// needs to keep an explicit identity value on the statement path.
+	col_info.is_identity = values.size() > identity_idx && FlagIsSet(values[identity_idx]);
+	// COLLATIONPROPERTY(collation_name, 'CodePage') (issue #361): the page a
+	// varchar parameter is converted to; 0 when the server cannot say.
+	col_info.code_page = ParseCodePage(values, code_page_idx);
+	col_info.database_code_page = database_code_page;
+	return col_info;
 }
 
 //===----------------------------------------------------------------------===//
@@ -483,17 +513,20 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 		return true;
 	}
 
-	// Single-table query: load object type + columns in one round trip
-	CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — loading from SQL Server (single query)", schema_name.c_str(),
+	// Single-table batch: object row, columns and keys in one round trip
+	CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — loading from SQL Server (one batch)", schema_name.c_str(),
 				table_name.c_str());
 
 	// Spec 075 W4 (#334): the names travel as sp_executesql parameters, so the
 	// text -- and the server's cached plan -- is the same for every table.
-	// Spec 076 W2: the primary key in the same batch -- a second result set
-	// off the same @s / @t -- so a fresh table pays one round trip.
-	const tds::Request query_request = mssql::BuildExecuteSqlRequest(
-		string(SINGLE_TABLE_METADATA_SQL_TEMPLATE) + ";\n" + mssql::RowIdKeyInfo::DiscoverySqlTemplate(),
-		"@s sysname, @t sysname", {{"s", schema_name}, {"t", table_name}});
+	// Spec 076 W2: the primary key in the same batch, off the same @s / @t, so a
+	// fresh table pays one round trip. Spec 084 D1: three result sets -- the
+	// object row, its columns, its keys -- so the row count is computed once,
+	// not once per column.
+	const tds::Request query_request =
+		mssql::BuildExecuteSqlRequest(string(SINGLE_TABLE_OBJECT_SQL_TEMPLATE) + ";\n" + COLUMN_DISCOVERY_SQL_TEMPLATE +
+										  ";\n" + mssql::RowIdKeyInfo::DiscoverySqlTemplate(),
+									  "@s sysname, @t sysname", {{"s", schema_name}, {"t", table_name}});
 
 	// Populate the cache slot in place so we never take the address of a stack
 	// local that gets moved out. GCC's -Wreturn-local-addr can't prove the
@@ -514,104 +547,64 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	MSSQLTableMetadata &table_meta = slot_it->second;
 	table_meta.name = table_name;
 
-	bool first_row = true;
+	bool have_object = false;
 	// Restartable: the slot was created empty by the erase/emplace above, so
 	// putting it back to that state is the whole undo.
-	auto reset_slot = [&table_meta, &table_name, &first_row]() {
+	auto reset_slot = [&table_meta, &table_name, &have_object]() {
 		table_meta = MSSQLTableMetadata();
 		table_meta.name = table_name;
-		first_row = true;
+		have_object = false;
 	};
 	ExecuteMetadataQuerySets(
 		connection, query_request,
-		[this, &table_meta, &first_row](idx_t result_set, const vector<string> &values) {
-			// 11 columns: object_type, the eight per-column fields, then index_type
-			// and is_partitioned. The guard has to cover the LAST index read.
-			//
-			// approx_rows is still here, but it no longer costs a scan of
-			// sys.sysrowsets: 3200 logical reads for these six rows became 3 (see the
-			// header). It has to stay — MSSQLCatalogScanCardinality reads the
-			// catalog's copy before anything else, so removing it plans every direct
-			// query at ~1 row.
+		[this, &table_meta, &have_object](idx_t result_set, const vector<string> &values) {
 			// Routed by which statement of the batch produced the row, never by
-			// its width: the second result set is RowIdKeyInfo::DiscoverySqlTemplate
-			// (review of #345 -- a column added to either query must not silently
-			// drop every primary key in the catalog).
-			if (result_set == 1) {
-				mssql::RowIdKeyInfo::AppendCandidateRow(table_meta.pk_info, values);
-				return;
-			}
-			if (result_set != 0) {
-				return;
-			}
-			if (values.size() < 12) {
-				return;
-			}
-
-			// First row: extract object type and physical shape
-			if (first_row) {
-				first_row = false;
-				if (!values[0].empty() && values[0][0] == 'V') {
-					table_meta.object_type = MSSQLObjectType::VIEW;
-				} else {
-					table_meta.object_type = MSSQLObjectType::TABLE;
+			// its width (review of #345 -- a column added to one query must not
+			// silently land in another's parser).
+			if (result_set == 0) {
+				// The object row: object_type, approx_rows, index_type,
+				// is_partitioned. approx_rows has to stay --
+				// MSSQLCatalogScanCardinality reads the catalog's copy before
+				// anything else, so removing it plans every direct query at ~1 row.
+				if (values.size() < 4) {
+					return;
 				}
-				// values[9] is sys.indexes.type — 1 clustered rowstore, 5 clustered
-				// COLUMNSTORE, 0 heap — and values[10] says whether the object sits on
-				// a partition scheme. Both drive the write path's TABLOCK and sort
-				// decisions. Per object, so it belongs in the first-row branch.
+				have_object = true;
+				table_meta.object_type =
+					(!values[0].empty() && values[0][0] == 'V') ? MSSQLObjectType::VIEW : MSSQLObjectType::TABLE;
 				try {
 					table_meta.approx_row_count = static_cast<idx_t>(std::stoll(values[1]));
 				} catch (...) {
 					table_meta.approx_row_count = 0;
 				}
-				ParseTableShape(values, 10, 11, table_meta);
+				// values[2] is sys.indexes.type -- 1 clustered rowstore, 5 clustered
+				// COLUMNSTORE, 0 heap -- and values[3] says whether the object sits
+				// on a partition scheme. Both drive the write path's TABLOCK and
+				// sort decisions.
+				ParseTableShape(values, 2, 3, table_meta);
 				CACHE_DEBUG(2, "table shape: %s kind=%d partitioned=%d", table_meta.name.c_str(),
 							(int)table_meta.index_kind, (int)table_meta.is_partitioned);
+				return;
 			}
-
-			// Parse column info
-			string col_name = values[2];
-			int32_t col_id = 0;
-			try {
-				col_id = static_cast<int32_t>(std::stoi(values[3]));
-			} catch (...) {
+			if (result_set == 1) {
+				// COLUMN_DISCOVERY_SQL_TEMPLATE: the eight column fields, then
+				// is_identity and code_page.
+				if (values.size() >= 8) {
+					table_meta.columns.push_back(
+						ColumnFromRow(values, 0, 8, 9, database_collation_, database_code_page_));
+				}
+				return;
 			}
-			string type_name = values[4];
-			int16_t max_len = 0;
-			try {
-				max_len = static_cast<int16_t>(std::stoi(values[5]));
-			} catch (...) {
+			if (result_set == 2) {
+				mssql::RowIdKeyInfo::AppendCandidateRow(table_meta.pk_info, values);
 			}
-			uint8_t prec = 0;
-			try {
-				prec = static_cast<uint8_t>(std::stoi(values[6]));
-			} catch (...) {
-			}
-			uint8_t scl = 0;
-			try {
-				scl = static_cast<uint8_t>(std::stoi(values[7]));
-			} catch (...) {
-			}
-			bool nullable = FlagIsSet(values[8]);
-			string collation = values[9];
-
-			MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
-									 database_collation_);
-			// sys.columns.is_identity (spec 062 W4, issue #327): what the INSERT
-			// planner needs to keep an explicit identity value on the statement
-			// path, where the server decides about it.
-			col_info.is_identity = values.size() > 12 && FlagIsSet(values[12]);
-			// COLLATIONPROPERTY(collation_name, 'CodePage') (issue #361): the page a
-			// varchar parameter is converted to; 0 when the server cannot say.
-			col_info.code_page = ParseCodePage(values, 13);
-			col_info.database_code_page = database_code_page_;
-			table_meta.columns.push_back(std::move(col_info));
 		},
 		reset_slot);
 
-	// If no rows returned, table doesn't exist -- roll back the slot we inserted.
-	if (first_row) {
+	// Found means an object row AND at least one column, as when the columns were
+	// a join on the object: OBJECT_ID also resolves a synonym, a procedure or a
+	// scalar function, which have no columns and are not tables.
+	if (!have_object || table_meta.columns.empty()) {
 		schema.tables.erase(slot_it);
 		CACHE_DEBUG(1, "GetTableMetadata('%s.%s') — table not found on SQL Server", schema_name.c_str(),
 					table_name.c_str());
@@ -619,7 +612,7 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	}
 
 	// Cache the result (slot is already in the map)
-	// Spec 077 W1: the second result set was every unique index; choose now.
+	// Spec 077 W1: the key result set was every unique index; choose now.
 	table_meta.pk_info.FinalizeChoice(database_collation_);
 	table_meta.pk_loaded = true;
 	table_meta.columns_load_state = CacheLoadState::LOADED;
@@ -1969,39 +1962,8 @@ void MSSQLMetadataCache::LoadColumns(tds::TdsConnection &connection, const strin
 		connection, query_request,
 		[this, &table_metadata](const vector<string> &values) {
 			if (values.size() >= 8) {
-				string col_name = values[0];
-				int32_t col_id = 0;
-				try {
-					col_id = static_cast<int32_t>(std::stoi(values[1]));
-				} catch (...) {
-				}
-				string type_name = values[2];
-				int16_t max_len = 0;
-				try {
-					max_len = static_cast<int16_t>(std::stoi(values[3]));
-				} catch (...) {
-				}
-				uint8_t prec = 0;
-				try {
-					prec = static_cast<uint8_t>(std::stoi(values[4]));
-				} catch (...) {
-				}
-				uint8_t scl = 0;
-				try {
-					scl = static_cast<uint8_t>(std::stoi(values[5]));
-				} catch (...) {
-				}
-				bool nullable = FlagIsSet(values[6]);
-				string collation = values[7];
-
-				MSSQLColumnInfo col_info(col_name, col_id, type_name, max_len, prec, scl, nullable, collation,
-										 database_collation_);
-				col_info.is_identity = values.size() > 8 && FlagIsSet(values[8]);
-				// COLLATIONPROPERTY(collation_name, 'CodePage') (issue #361): the page a
-				// varchar parameter is converted to; 0 when the server cannot say.
-				col_info.code_page = ParseCodePage(values, 9);
-				col_info.database_code_page = database_code_page_;
-				table_metadata.columns.push_back(std::move(col_info));
+				table_metadata.columns.push_back(
+					ColumnFromRow(values, 0, 8, 9, database_collation_, database_code_page_));
 			}
 		},
 		[&table_metadata]() {

@@ -103,7 +103,8 @@ struct RowIdKeyInfo {
 
 	//! Spec 076 W2: the discovery statement, parameterised on @s / @t, so the
 	//! catalog can send it in the same batch as the table's metadata and read
-	//! its rows off the second result set instead of paying a round trip.
+	//! its rows off the third result set (after the object row and the columns,
+	//! spec 084 D1) instead of paying a round trip.
 	static const char *DiscoverySqlTemplate();
 	//! One row of that statement (17 columns: the index, then one of its key
 	//! columns) accumulated as a candidate; false when the row does not have

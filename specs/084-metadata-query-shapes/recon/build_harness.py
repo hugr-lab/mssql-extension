@@ -4,7 +4,7 @@ ROOT=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 
 def const(path, name):
     s=open(ROOT+path).read()
     m=re.search(r'static const char \*'+name+r' = R"\((.*?)\)";', s, re.S)
-    return m.group(1).strip()
+    return m.group(1).strip() if m else ''  # gone from the source: queries.json keeps the measured text
 def coll():
     s=open(ROOT+'mssql_catalog.cpp').read()
     m=re.search(r'DATABASE_COLLATION_SQL =\s*(.*?);\n', s, re.S)
