@@ -86,31 +86,41 @@ WHERE s.schema_id NOT IN (3, 4)
                      'db_securityadmin', 'db_ddladmin', 'db_backupoperator', 'db_datareader',
                      'db_datawriter', 'db_denydatareader', 'db_denydatawriter'))";
 
-// Query to discover tables and views in a schema
-// Uses simple string replacement for schema_name (safe for schema names)
-// Note: ORDER BY is appended dynamically after optional filter clauses
+// Query to discover tables and views in a schema (@s).
+// Note: the table filter's LIKE and the ORDER BY are appended dynamically.
+//
+// Spec 084 F3/D2: the schema is matched as `o.schema_id = SCHEMA_ID(@s)`, not
+// `SCHEMA_NAME(o.schema_id) = @s`. Neither form seeks (the sysschobjs scan is a
+// floor, spec 071 F3), but the latter calls a function on every object in the
+// DATABASE: 617-686 ms against 216 ms for one schema of a 200k-object catalog.
+// The shape comes from a plain LEFT JOIN: a table has exactly one of index 0
+// (heap) and index 1 (clustered), so OUTER APPLY + MAX bought nothing; a
+// hypothetical index (the tuning advisor's) is excluded so it cannot add a row.
 static const char *TABLE_DISCOVERY_SQL_TEMPLATE = R"(
 SELECT
     o.name AS object_name,
     o.type AS object_type,
     CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
-    ISNULL(shape.index_type, 0) AS index_type,
-    ISNULL(shape.is_partitioned, 0) AS is_partitioned
+    ISNULL(i.type, 0) AS index_type,
+    CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END AS is_partitioned
 FROM sys.objects o
-OUTER APPLY (SELECT MAX(i.type) AS index_type,
-                    MAX(CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END) AS is_partitioned
-             FROM sys.indexes i
-             LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
-             WHERE i.object_id = o.object_id AND i.index_id IN (0, 1)) shape
+LEFT JOIN sys.indexes i ON i.object_id = o.object_id AND i.index_id IN (0, 1) AND i.is_hypothetical = 0
+LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
 WHERE o.type IN ('U', 'V')
   AND o.is_ms_shipped = 0
-  AND SCHEMA_NAME(o.schema_id) = @s)";
+  AND o.schema_id = SCHEMA_ID(@s))";
 
 // Issue #412: the names of every schema's tables and views, nothing else -- for
 // DuckDB's "did you mean" hint, which reads entry names only.
+//
+// The schema's name by a join, not SCHEMA_NAME() per object: the query passes
+// over every object in the database, and the per-row call is most of its CPU
+// (measured on 200k objects in 100 schemas: 680-700 ms -> 297 ms; the result
+// is identical, compared row by row on 7.5k objects).
 static const char *TABLE_NAMES_SQL = R"(
-SELECT SCHEMA_NAME(o.schema_id) AS schema_name, o.name AS object_name
+SELECT s.name AS schema_name, o.name AS object_name
 FROM sys.objects o
+INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
 WHERE o.type IN ('U', 'V')
   AND o.is_ms_shipped = 0)";
 
