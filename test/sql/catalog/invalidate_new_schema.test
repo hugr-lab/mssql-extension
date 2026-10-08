@@ -17,6 +17,8 @@ SELECT mssql_exec('ins', 'IF OBJECT_ID(''dbo.ins_keep'') IS NOT NULL DROP TABLE 
 	IF OBJECT_ID(''ins_new.t1'') IS NOT NULL DROP TABLE ins_new.t1;
 	IF OBJECT_ID(''ins_new.t2'') IS NOT NULL DROP TABLE ins_new.t2;
 	IF SCHEMA_ID(''ins_new'') IS NOT NULL DROP SCHEMA ins_new;
+	IF OBJECT_ID(''ins_new3.t3'') IS NOT NULL DROP TABLE ins_new3.t3;
+	IF SCHEMA_ID(''ins_new3'') IS NOT NULL DROP SCHEMA ins_new3;
 	CREATE TABLE dbo.ins_keep (id int)');
 
 statement ok
@@ -71,6 +73,27 @@ query I
 SELECT count(*) FROM ins.ins_new.t2;
 ----
 0
+
+# The three-argument form, naming a table in a schema created behind the
+# catalog, re-reads the list too (review of #408).
+statement ok
+SELECT mssql_exec('ins', 'EXEC(''CREATE SCHEMA ins_new3''); CREATE TABLE ins_new3.t3 (id int)');
+
+statement error
+SELECT count(*) FROM ins.ins_new3.t3;
+----
+does not exist
+
+statement ok
+SELECT mssql_invalidate_cache('ins', 'ins_new3', 't3');
+
+query I
+SELECT count(*) FROM ins.ins_new3.t3;
+----
+0
+
+statement ok
+SELECT mssql_exec('ins', 'DROP TABLE ins_new3.t3; DROP SCHEMA ins_new3');
 
 # After a whole-catalog invalidate and a per-schema preload, a table dropped on
 # the server is not listed.

@@ -1071,8 +1071,9 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	// per-schema one used to mark it LOADED holding only the schema it had been
 	// given, so every other schema of the database stopped existing for the rest
 	// of the session; the whole-catalog one left it NOT_LOADED, so the first
-	// catalog access after the preload ran EnsureSchemasLoaded, which clears
-	// schemas_, and loaded the whole catalog a second time.
+	// catalog access after the preload ran EnsureSchemasLoaded, which then
+	// cleared schemas_ (it merges since #408), and loaded the whole catalog a
+	// second time.
 	//
 	// ONE lock across the list and the load (review of #377): released in
 	// between, an invalidation could clear the list the load then relies on.
@@ -1712,11 +1713,16 @@ void MSSQLMetadataCache::InvalidateSchemaTableList(const string &schema_name) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	invalidation_epoch_++;
 	auto it = schemas_.find(schema_name);
-	if (it != schemas_.end()) {
-		// Existence only — re-fetch the table list, but keep every table's cached
-		// column metadata (the expensive part). Used by per-table invalidation.
-		it->second.tables_load_state = CacheLoadState::NOT_LOADED;
+	if (it == schemas_.end()) {
+		// A schema the cache has not listed: re-read the list, as InvalidateSchema
+		// does -- the table it names may be in a schema created behind the catalog
+		// (review of #408).
+		schemas_load_state_ = CacheLoadState::NOT_LOADED;
+		return;
 	}
+	// Existence only — re-fetch the table list, but keep every table's cached
+	// column metadata (the expensive part). Used by per-table invalidation.
+	it->second.tables_load_state = CacheLoadState::NOT_LOADED;
 }
 
 void MSSQLMetadataCache::InvalidateTable(const string &schema_name, const string &table_name) {
