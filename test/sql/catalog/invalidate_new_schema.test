@@ -1,0 +1,230 @@
+# name: test/sql/catalog/invalidate_new_schema.test
+# description: mssql_invalidate_cache(ctx, schema) naming a schema created after the catalog listed its schemas re-reads the list, and keeps what is cached for the others
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ins (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('ins', 'IF OBJECT_ID(''dbo.ins_keep'') IS NOT NULL DROP TABLE dbo.ins_keep;
+	IF OBJECT_ID(''ins_new.t1'') IS NOT NULL DROP TABLE ins_new.t1;
+	IF OBJECT_ID(''ins_new.t2'') IS NOT NULL DROP TABLE ins_new.t2;
+	IF SCHEMA_ID(''ins_new'') IS NOT NULL DROP SCHEMA ins_new;
+	IF OBJECT_ID(''ins_new3.t3'') IS NOT NULL DROP TABLE ins_new3.t3;
+	IF SCHEMA_ID(''ins_new3'') IS NOT NULL DROP SCHEMA ins_new3;
+	CREATE TABLE dbo.ins_keep (id int)');
+
+statement ok
+SELECT mssql_invalidate_cache('ins');
+
+# The catalog lists its schemas and loads dbo's metadata -- dbo.ins_keep's
+# columns included -- without binding the table.
+statement ok
+SELECT mssql_preload_catalog('ins', 'dbo');
+
+# A schema created behind the catalog, with a table in it.
+statement ok
+SELECT mssql_exec('ins', 'EXEC(''CREATE SCHEMA ins_new''); CREATE TABLE ins_new.t1 (id int)');
+
+statement error
+SELECT count(*) FROM ins.ins_new.t1;
+----
+does not exist
+
+# Naming the new schema re-reads the schema list.
+statement ok
+SELECT mssql_invalidate_cache('ins', 'ins_new');
+
+query I
+SELECT count(*) FROM ins.ins_new.t1;
+----
+0
+
+# The re-read kept what was cached for the other schemas: dbo.ins_keep, never
+# bound, is read from the preloaded metadata without another metadata query
+# (one would fail here; the list used to be re-read over a cleared map).
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+query I
+SELECT count(*) FROM ins.dbo.ins_keep;
+----
+0
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 0;
+
+# A known schema, empty table list at first: a table created behind the catalog
+# shows after the schema is invalidated (it always did).
+statement ok
+SELECT mssql_exec('ins', 'CREATE TABLE ins_new.t2 (id int)');
+
+statement ok
+SELECT mssql_invalidate_cache('ins', 'ins_new');
+
+query I
+SELECT count(*) FROM ins.ins_new.t2;
+----
+0
+
+# The three-argument form, naming a table in a schema created behind the
+# catalog, re-reads the list too (review of #408).
+statement ok
+SELECT mssql_exec('ins', 'EXEC(''CREATE SCHEMA ins_new3''); CREATE TABLE ins_new3.t3 (id int)');
+
+statement error
+SELECT count(*) FROM ins.ins_new3.t3;
+----
+does not exist
+
+statement ok
+SELECT mssql_invalidate_cache('ins', 'ins_new3', 't3');
+
+query I
+SELECT count(*) FROM ins.ins_new3.t3;
+----
+0
+
+statement ok
+SELECT mssql_exec('ins', 'DROP TABLE ins_new3.t3; DROP SCHEMA ins_new3');
+
+# Inside a transaction, each form in a transaction of its own, on a pool of
+# many and on a pool of ONE (whose only connection the transaction pins): the
+# schema list is re-read -- on the transaction's own connection -- and the
+# table is found.
+statement ok
+SET mssql_acquire_timeout = 3;
+
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ins1 (TYPE mssql);
+
+statement ok
+RESET mssql_connection_limit;
+
+statement ok
+RESET mssql_acquire_timeout;
+
+foreach cat ins ins1
+
+statement ok
+SELECT mssql_exec('${cat}', 'IF OBJECT_ID(''ins_tx2.t'') IS NOT NULL DROP TABLE ins_tx2.t;
+	IF SCHEMA_ID(''ins_tx2'') IS NOT NULL DROP SCHEMA ins_tx2;
+	IF OBJECT_ID(''ins_tx3.t'') IS NOT NULL DROP TABLE ins_tx3.t;
+	IF SCHEMA_ID(''ins_tx3'') IS NOT NULL DROP SCHEMA ins_tx3');
+
+# The two-argument form. The shared schema list is loaded (by this lookup)
+# before the schema is created behind the catalog.
+statement ok
+SELECT mssql_invalidate_cache('${cat}');
+
+query I
+SELECT count(*) FROM ${cat}.dbo.ins_keep;
+----
+0
+
+statement ok
+SELECT mssql_exec('${cat}', 'EXEC(''CREATE SCHEMA ins_tx2''); CREATE TABLE ins_tx2.t (id int)');
+
+statement ok
+BEGIN;
+
+statement ok
+SET current_transaction_invalidation_policy = 'SYNTACTIC_ERRORS_DO_NOT_INVALIDATE';
+
+# Not seen before the invalidation: the listed schemas are trusted.
+statement error
+SELECT count(*) FROM ${cat}.ins_tx2.t;
+----
+does not exist
+
+statement ok
+SELECT mssql_invalidate_cache('${cat}', 'ins_tx2');
+
+query I
+SELECT count(*) FROM ${cat}.ins_tx2.t;
+----
+0
+
+statement ok
+COMMIT;
+
+# The three-argument form, the same way: the shared list re-read without the
+# schema first, so only the invalidation can make it visible.
+statement ok
+SELECT mssql_invalidate_cache('${cat}');
+
+query I
+SELECT count(*) FROM ${cat}.dbo.ins_keep;
+----
+0
+
+statement ok
+SELECT mssql_exec('${cat}', 'EXEC(''CREATE SCHEMA ins_tx3''); CREATE TABLE ins_tx3.t (id int)');
+
+statement ok
+BEGIN;
+
+statement ok
+SET current_transaction_invalidation_policy = 'SYNTACTIC_ERRORS_DO_NOT_INVALIDATE';
+
+statement error
+SELECT count(*) FROM ${cat}.ins_tx3.t;
+----
+does not exist
+
+statement ok
+SELECT mssql_invalidate_cache('${cat}', 'ins_tx3', 't');
+
+query I
+SELECT count(*) FROM ${cat}.ins_tx3.t;
+----
+0
+
+statement ok
+COMMIT;
+
+# After COMMIT, in autocommit, both are still found.
+query II
+SELECT (SELECT count(*) FROM ${cat}.ins_tx2.t), (SELECT count(*) FROM ${cat}.ins_tx3.t);
+----
+0	0
+
+statement ok
+SELECT mssql_exec('${cat}', 'DROP TABLE ins_tx2.t; DROP SCHEMA ins_tx2; DROP TABLE ins_tx3.t; DROP SCHEMA ins_tx3');
+
+endloop
+
+statement ok
+DETACH ins1;
+
+# After a whole-catalog invalidate and a per-schema preload, a table dropped on
+# the server is not listed.
+statement ok
+SELECT mssql_exec('ins', 'DROP TABLE ins_new.t1');
+
+statement ok
+SELECT mssql_invalidate_cache('ins');
+
+statement ok
+SELECT mssql_preload_catalog('ins', 'ins_new');
+
+query T
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'ins' AND schema_name = 'ins_new' ORDER BY table_name;
+----
+t2
+
+statement ok
+SELECT mssql_exec('ins', 'DROP TABLE ins_new.t2; DROP SCHEMA ins_new; DROP TABLE dbo.ins_keep');
+
+statement ok
+DETACH ins;
