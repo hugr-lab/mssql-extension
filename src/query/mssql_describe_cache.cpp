@@ -19,32 +19,16 @@ void DescribeCache::Touch(Entry &entry) {
 	recency_.splice(recency_.begin(), recency_, entry.recency);
 }
 
-void DescribeCache::Note(const std::string &key) {
-	if (key.size() > MAX_STATEMENT) {
-		return;
-	}
-	std::lock_guard<std::mutex> lock(mutex_);
-	auto found = entries_.find(key);
-	if (found != entries_.end()) {
-		Touch(found->second);
-		return;
-	}
-	while (!recency_.empty() && (entries_.size() >= CAPACITY || bytes_ + key.size() > BYTES)) {
-		bytes_ -= recency_.back().size();
-		entries_.erase(recency_.back());
-		recency_.pop_back();
-	}
-	bytes_ += key.size();
-	recency_.push_front(key);
-	Entry entry;
-	entry.recency = recency_.begin();
-	entries_.emplace(key, std::move(entry));
+void DescribeCache::EraseLocked(std::unordered_map<std::string, Entry>::iterator found) {
+	bytes_ -= found->first.size();
+	recency_.erase(found->second.recency);
+	entries_.erase(found);
 }
 
 bool DescribeCache::Lookup(const std::string &key, uint64_t epoch, int64_t ttl_seconds, CachedShape &out) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto found = entries_.find(key);
-	if (found == entries_.end() || !found->second.described) {
+	if (found == entries_.end()) {
 		return false;
 	}
 	auto &entry = found->second;
@@ -56,8 +40,7 @@ bool DescribeCache::Lookup(const std::string &key, uint64_t epoch, int64_t ttl_s
 		return false;
 	}
 	if (entry.epoch != epoch || expired) {
-		entry.described = false;
-		entry.shape = CachedShape();
+		EraseLocked(found);
 		return false;
 	}
 	Touch(entry);
@@ -66,18 +49,26 @@ bool DescribeCache::Lookup(const std::string &key, uint64_t epoch, int64_t ttl_s
 }
 
 void DescribeCache::Store(const std::string &key, uint64_t epoch, CachedShape shape) {
+	if (key.size() > MAX_STATEMENT) {
+		return;
+	}
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto found = entries_.find(key);
 	if (found == entries_.end()) {
-		return;
-	}
-	auto &entry = found->second;
-	if (entry.described && entry.epoch > epoch) {
+		while (!recency_.empty() && (entries_.size() >= CAPACITY || bytes_ + key.size() > BYTES)) {
+			EraseLocked(entries_.find(recency_.back()));
+		}
+		bytes_ += key.size();
+		recency_.push_front(key);
+		Entry entry;
+		entry.recency = recency_.begin();
+		found = entries_.emplace(key, std::move(entry)).first;
+	} else if (found->second.epoch > epoch) {
 		// A bind that read the epoch before an invalidation another bind has
 		// already described past: keep the newer shape (review of #406).
 		return;
 	}
-	entry.described = true;
+	auto &entry = found->second;
 	entry.epoch = epoch;
 	entry.stored = std::chrono::steady_clock::now();
 	entry.shape = std::move(shape);
@@ -86,18 +77,16 @@ void DescribeCache::Store(const std::string &key, uint64_t epoch, CachedShape sh
 
 void DescribeCache::Clear() {
 	std::lock_guard<std::mutex> lock(mutex_);
-	for (auto &entry : entries_) {
-		entry.second.described = false;
-		entry.second.shape = CachedShape();
-	}
+	entries_.clear();
+	recency_.clear();
+	bytes_ = 0;
 }
 
 void DescribeCache::Forget(const std::string &key) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto found = entries_.find(key);
 	if (found != entries_.end()) {
-		found->second.described = false;
-		found->second.shape = CachedShape();
+		EraseLocked(found);
 	}
 }
 

@@ -24,7 +24,7 @@ struct CachedShape {
 //! Spec 079 PR E2: the shapes `mssql_scan` / `mssql_scan_params` were described
 //! with, so a statement already described binds without the describe's round
 //! trip (and without a connection). Per catalog. First the statements remote
-//! pushdown sends; since issue #410 every describing scan (`Note`), because the
+//! pushdown sends; since issue #410 every describing scan (`Store`), because the
 //! describe is most of what a short query costs: a TOP 1 took 3.5 ms where the
 //! execution alone takes 1.1 (2.4 ms of compile on the server per describe).
 //! A user's T-SQL can read what the catalog does not see change (a view, a
@@ -54,26 +54,28 @@ public:
 
 	static std::string Key(const std::string &statement, const std::string &declarations, bool native_types);
 
-	//! A scan described `key`: its shape may be cached (Store follows).
-	void Note(const std::string &key);
-	//! The cached shape of `key`, if it is a noted statement described under
-	//! `epoch` and not older than `ttl_seconds` (0: no limit).
+	//! The cached shape of `key`, if it was described under `epoch` and is not
+	//! older than `ttl_seconds` (0: no limit). A stale entry is dropped.
 	bool Lookup(const std::string &key, uint64_t epoch, int64_t ttl_seconds, CachedShape &out);
-	//! Keeps `shape` for a noted statement; ignored for any other.
+	//! A scan described `key` under `epoch`: keeps its shape (a text past
+	//! MAX_STATEMENT is not kept). Only a described statement is stored, so a
+	//! text the server cannot describe (a procedure, a #temp batch) takes no
+	//! place in the cache.
 	void Store(const std::string &key, uint64_t epoch, CachedShape shape);
+	//! Drops one shape.
 	void Forget(const std::string &key);
 	//! Drops every shape (a mismatch at execution, mssql_preload_catalog).
 	void Clear();
 
 private:
 	struct Entry {
-		bool described = false;
 		uint64_t epoch = 0;
 		std::chrono::steady_clock::time_point stored;
 		CachedShape shape;
 		std::list<std::string>::iterator recency;
 	};
 	void Touch(Entry &entry);
+	void EraseLocked(std::unordered_map<std::string, Entry>::iterator found);
 
 	std::mutex mutex_;
 	std::unordered_map<std::string, Entry> entries_;

@@ -845,9 +845,8 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 			cached.types.assign(shape.types.begin(), shape.types.end());
 			cached.names.assign(shape.names.begin(), shape.names.end());
 			cached.datetime2.assign(shape.datetime2.begin(), shape.datetime2.end());
-			// Noted only once described: a text the server cannot describe (a
+			// Stored only once described: a text the server cannot describe (a
 			// procedure, a #temp batch) takes no place in the cache.
-			mssql_catalog.GetDescribeCache().Note(bind_data.describe_cache_key);
 			mssql_catalog.GetDescribeCache().Store(bind_data.describe_cache_key, cache_epoch, std::move(cached));
 		}
 		auto bind_ms =

@@ -93,7 +93,24 @@ SELECT id, w FROM mssql_scan('sdc', 'SELECT * FROM dbo.sdc_t ORDER BY id');
 1	10
 2	20
 
-# mssql_invalidate_cache drops the shapes with the metadata: described again.
+# mssql_invalidate_cache drops the shapes with the metadata. The text just
+# described again is cached: one connection, to execute ...
+statement ok
+CREATE OR REPLACE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('sdc');
+
+query II
+SELECT id, w FROM mssql_scan('sdc', 'SELECT * FROM dbo.sdc_t ORDER BY id');
+----
+1	10
+2	20
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('sdc')) - (SELECT n FROM acquired);
+----
+1
+
+# ... and after the invalidation the same text is described again: two (review
+# of #411: the case used to run a text never cached, which passes either way).
 statement ok
 SELECT mssql_invalidate_cache('sdc');
 
@@ -101,9 +118,10 @@ statement ok
 CREATE OR REPLACE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('sdc');
 
 query II
-SELECT * FROM mssql_scan('sdc', 'SELECT TOP 1 id, w FROM dbo.sdc_t ORDER BY id');
+SELECT id, w FROM mssql_scan('sdc', 'SELECT * FROM dbo.sdc_t ORDER BY id');
 ----
 1	10
+2	20
 
 query I
 SELECT (SELECT acquire_count FROM mssql_pool_stats('sdc')) - (SELECT n FROM acquired);

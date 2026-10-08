@@ -34,10 +34,7 @@ int main() {
 	{
 		DescribeCache cache;
 		CachedShape out;
-		cache.Store(key, 1, Shape("a"));
-		Expect(!cache.Lookup(key, 1, 0, out), "a statement not noted is not kept");
-		cache.Note(key);
-		Expect(!cache.Lookup(key, 1, 0, out), "noted, not yet described");
+		Expect(!cache.Lookup(key, 1, 0, out), "not described yet");
 		cache.Store(key, 1, Shape("a"));
 		Expect(cache.Lookup(key, 1, 0, out) && out.names.size() == 1 && out.names[0] == "a", "described: kept");
 		Expect(!cache.Lookup(key, 2, 0, out), "the epoch moved: gone");
@@ -47,7 +44,7 @@ int main() {
 		cache.Forget(key);
 		Expect(!cache.Lookup(key, 2, 0, out), "forgotten after a shape mismatch");
 		cache.Store(key, 2, Shape("a"));
-		Expect(cache.Lookup(key, 2, 0, out), "still noted after Forget: described again");
+		Expect(cache.Lookup(key, 2, 0, out), "described again after Forget");
 		cache.Store(key, 3, Shape("a"));
 		Expect(!cache.Lookup(key, 2, 0, out), "described after an invalidation the asker has not seen: not served");
 		Expect(cache.Lookup(key, 3, 0, out), "... and not wiped either");
@@ -57,14 +54,12 @@ int main() {
 		cache.Clear();
 		Expect(!cache.Lookup(key, 3, 0, out), "cleared");
 		const auto long_key = DescribeCache::Key(std::string(DescribeCache::MAX_STATEMENT + 1, 'x'), "", true);
-		cache.Note(long_key);
 		cache.Store(long_key, 3, Shape("a"));
 		Expect(!cache.Lookup(long_key, 3, 0, out), "a statement past MAX_STATEMENT is not remembered");
 	}
 	{
 		DescribeCache cache;
 		CachedShape out;
-		cache.Note(key);
 		cache.Store(key, 1, Shape("a"));
 		std::this_thread::sleep_for(std::chrono::milliseconds(1100));
 		Expect(!cache.Lookup(key, 1, 1, out), "older than the TTL: gone");
@@ -74,7 +69,6 @@ int main() {
 		CachedShape out;
 		for (size_t i = 0; i <= DescribeCache::CAPACITY; i++) {
 			const auto k = DescribeCache::Key("SELECT " + std::to_string(i), "", true);
-			cache.Note(k);
 			cache.Store(k, 1, Shape("x"));
 			if (i == 0) {
 				continue;
