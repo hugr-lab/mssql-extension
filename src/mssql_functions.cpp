@@ -1238,7 +1238,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		// is consumed; BindDescribedScan asserts the same at the point it sets it
 		// (roborev 1721: an assertion at the write site only says the write
 		// happened, not that a future caller kept the pair together).
-		D_ASSERT(!lost_claim || !bind_data.fallback_sql.empty());
+		D_ASSERT(!lost_claim || !bind_data.fallback_sql.sql.empty());
 		if (claimed) {
 			// The handle lives in the held session; the stream borrows it and gives
 			// it back to the session, not to the pool.
