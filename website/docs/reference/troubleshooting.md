@@ -113,6 +113,9 @@ types, so the same query runs there. Tracked as
   SELECT mssql_invalidate_cache('mydb');
   ```
 
+  Or for one catalog only, at ATTACH:
+  `ATTACH '…' AS mydb (TYPE mssql, native_types false)`.
+
   The cost is what the setting's name says: `DESCRIBE` shows `VARCHAR`
   instead of the declared length and collation, and a CTAS or COPY back to
   SQL Server no longer inherits them

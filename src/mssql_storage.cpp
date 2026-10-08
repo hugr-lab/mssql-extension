@@ -1249,6 +1249,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	bool table_filter_specified = false;
 	int8_t order_pushdown_option = -1;	  // Spec 039: ORDER BY pushdown (-1=unset)
 	int8_t remote_pushdown_option = -1;	  // Spec 079 PR E2: mssql_remote_pushdown per catalog (-1=unset)
+	int8_t native_types_option = -1;	  // mssql_catalog_native_types per catalog (-1=unset)
 	bool lazy_validation = false;		  // Spec 047 (US2): opt out of eager creds check
 	bool preload_option = false;		  // Issue #324: preload the catalog at ATTACH
 	int64_t min_connections_option = -1;  // Issue #324: ATTACH-level mssql_min_connections (-1=unset)
@@ -1299,6 +1300,11 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			// mssql_remote_pushdown -- what DuckLake's METADATA_PARAMETERS can
 			// reach (it forwards ATTACH options, not settings).
 			remote_pushdown_option = BooleanAttachOption(it->first, it->second) ? 1 : 0;
+			it = options.options.erase(it);
+		} else if (lower_name == "native_types") {
+			// mssql_catalog_native_types for this catalog only: the setting is
+			// GLOBAL, and DuckLake's METADATA_PARAMETERS reaches ATTACH options.
+			native_types_option = BooleanAttachOption(it->first, it->second) ? 1 : 0;
 			it = options.options.erase(it);
 		} else if (lower_name == "lazy_validation" || lower_name == "lazyvalidation") {
 			// Spec 047 (US2): suppress the eager TCP+LOGIN7 round trip below.
@@ -1616,6 +1622,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		startup.remote_pushdown = context.TryGetCurrentSetting("mssql_remote_pushdown", remote_pushdown) &&
 								  !remote_pushdown.IsNull() && remote_pushdown.GetValue<bool>();
 	}
+	startup.native_types = native_types_option;
 	auto catalog =
 		make_uniq<MSSQLCatalog>(db, name, std::move(connection_info), std::move(tds_pool_config),
 								std::move(fedauth_token_utf16le), options.access_mode, catalog_enabled, startup);
