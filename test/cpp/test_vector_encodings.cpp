@@ -109,7 +109,7 @@ static void FillFlat(DataChunk &chunk) {
 	chunk.Initialize(Allocator::DefaultAllocator(), TestTypes());
 	for (idx_t c = 0; c < TestTypes().size(); c++) {
 		for (idx_t r = 0; r < ROWS; r++) {
-			chunk.SetValue(c, r, BaseValue(c, SEL[r]));
+			chunk.data[c].SetValue(r, BaseValue(c, SEL[r]));
 		}
 	}
 	chunk.SetChildCardinality(ROWS);
@@ -120,7 +120,7 @@ static void FillDictionary(DataChunk &base, DataChunk &dict) {
 	base.Initialize(Allocator::DefaultAllocator(), TestTypes());
 	for (idx_t c = 0; c < TestTypes().size(); c++) {
 		for (idx_t k = 0; k < 5; k++) {
-			base.SetValue(c, k, BaseValue(c, k));
+			base.data[c].SetValue(k, BaseValue(c, k));
 		}
 	}
 	base.SetChildCardinality(5);
@@ -182,18 +182,19 @@ static void test_dictionary_on_scatter_path() {
 	DataChunk base;
 	base.Initialize(Allocator::DefaultAllocator(), types);
 	for (idx_t k = 0; k < 5; k++) {
-		base.SetValue(0, k, k == 4 ? Value(LogicalType::INTEGER) : Value::INTEGER(static_cast<int32_t>(7 * k)));
-		base.SetValue(1, k, k == 4 ? Value(LogicalType::BIGINT) : Value::BIGINT(static_cast<int64_t>(1) << (2 * k)));
+		base.data[0].SetValue(k, k == 4 ? Value(LogicalType::INTEGER) : Value::INTEGER(static_cast<int32_t>(7 * k)));
+		base.data[1].SetValue(k,
+							  k == 4 ? Value(LogicalType::BIGINT) : Value::BIGINT(static_cast<int64_t>(1) << (2 * k)));
 	}
 	base.SetChildCardinality(5);
 
 	SelectionVector sel(ROWS);
 	for (idx_t r = 0; r < ROWS; r++) {
 		sel.set_index(r, SEL[r]);
-		flat.SetValue(0, r,
-					  SEL[r] == 4 ? Value(LogicalType::INTEGER) : Value::INTEGER(static_cast<int32_t>(7 * SEL[r])));
-		flat.SetValue(
-			1, r, SEL[r] == 4 ? Value(LogicalType::BIGINT) : Value::BIGINT(static_cast<int64_t>(1) << (2 * SEL[r])));
+		flat.data[0].SetValue(
+			r, SEL[r] == 4 ? Value(LogicalType::INTEGER) : Value::INTEGER(static_cast<int32_t>(7 * SEL[r])));
+		flat.data[1].SetValue(
+			r, SEL[r] == 4 ? Value(LogicalType::BIGINT) : Value::BIGINT(static_cast<int64_t>(1) << (2 * SEL[r])));
 	}
 	flat.SetChildCardinality(ROWS);
 
@@ -235,7 +236,7 @@ static void test_constant_encodes_like_flat() {
 	for (idx_t c = 0; c < types.size(); c++) {
 		Value v = (c == 5) ? Value(LogicalType::BIGINT) : BaseValue(c, 1);
 		for (idx_t r = 0; r < ROWS; r++) {
-			flat.SetValue(c, r, v);
+			flat.data[c].SetValue(r, v);
 		}
 	}
 	flat.SetChildCardinality(ROWS);

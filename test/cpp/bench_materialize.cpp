@@ -644,6 +644,8 @@ BcpFixture BuildBcpFixture(const BcpCellSpec &s) {
 		if (has_null) {
 			f.dict_base->SetValue(s.card, duckdb::Value(type));
 		}
+		// The 2.0 pin checks the dictionary's own size against dict_size.
+		duckdb::FlatVector::SetSize(*f.dict_base, duckdb::count_t(dict_size));
 		duckdb::SelectionVector sel(CHUNK_ROWS);
 		for (idx_t row = 0; row < CHUNK_ROWS; ++row) {
 			sel.set_index(row, RowIsNull(s.null_pct, row) ? s.card : (row % s.card));
@@ -729,7 +731,7 @@ size_t EncodeChunkColumnarFixed(BcpFixture &f, duckdb::vector<uint8_t> &buf) {
 	for (idx_t c = 0; c < ncols; ++c) {
 		f.chunk->data[c].ToUnifiedFormat(fmts[c]);
 		stride += 1 + f.cols[c].max_length;
-		all_valid = all_valid && fmts[c].validity.AllValid();
+		all_valid = all_valid && fmts[c].validity.CannotHaveNull();
 	}
 
 	size_t total;
@@ -1484,7 +1486,7 @@ size_t EncodeChunkBulkUtf16(BcpFixture &f, duckdb::vector<uint8_t> &buf) {
 // then copying it into the accumulator (two passes over data that no longer
 // fits cache), process `block_rows` at a time so the gathered UTF-8, the
 // converted UTF-16 and the accumulator slice stay resident while they are used.
-// Also takes the validity mask straight from the vector: `AllValid()` removes
+// Also takes the validity mask straight from the vector: `CannotHaveNull()` removes
 // the per-row NULL branch entirely, and NULL rows are skipped before the gather
 // (they contribute nothing to convert — only a fixed-size wire marker).
 size_t EncodeChunkBulkUtf16Blocked(BcpFixture &f, duckdb::vector<uint8_t> &buf, idx_t block_rows) {
@@ -1494,9 +1496,9 @@ size_t EncodeChunkBulkUtf16Blocked(BcpFixture &f, duckdb::vector<uint8_t> &buf, 
 
 	auto &vec = f.chunk->data[0];
 	duckdb::UnifiedVectorFormat fmt;
-	vec.ToUnifiedFormat(CHUNK_ROWS, fmt);
+	vec.ToUnifiedFormat(fmt);
 	const auto *strs = duckdb::UnifiedVectorFormat::GetData<string_t>(fmt);
-	const bool all_valid = fmt.validity.AllValid();
+	const bool all_valid = fmt.validity.CannotHaveNull();
 
 	if (in_off.size() < CHUNK_ROWS) {
 		in_off.resize(CHUNK_ROWS);
