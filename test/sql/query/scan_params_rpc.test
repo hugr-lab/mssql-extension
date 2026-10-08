@@ -69,6 +69,39 @@ SELECT l, r FROM mssql_scan_params('spr', 'SELECT LEN(@s) AS l, RIGHT(@s, 3) AS 
 ----
 5003	end
 
+# A value whose conversion to the declared type DuckDB and the server do not
+# agree on keeps the batch form, and the SERVER converts it, as before spec 083
+# (review of #414): a boolean is 1 in a varchar, a TIMESTAMP is datetime2's own
+# text, a decimal into an int is truncated (DuckDB's cast rounds 12.5 to 13).
+query IIIII
+SELECT * FROM mssql_scan_params('spr', 'SELECT @b AS b, @d AS d, @x AS x, @i AS i, @f AS f',
+	{'b': true, 'd': TIMESTAMP '2024-01-02 10:11:12.123456', 'x': 'abc'::BLOB, 'i': 12.5::DECIMAL(3,1), 'f': 2.5::DOUBLE},
+	'@b varchar(5), @d varchar(30), @x varchar(5), @i int, @f int');
+----
+1	2024-01-02 10:11:12.1234560	abc	12	2
+
+# The native string types are strings: declared from their own annotation or
+# by a written list, and a '42' of them into an int converts like any VARCHAR.
+query IIIIII
+SELECT * FROM mssql_scan_params('spr',
+	'SELECT @a AS a, @b AS b, CAST(SQL_VARIANT_PROPERTY(@a, ''BaseType'') AS varchar(20)) AS ta, CAST(SQL_VARIANT_PROPERTY(@b, ''BaseType'') AS varchar(20)) AS tb, @c AS c, @d AS d',
+	{'a': 'abc'::MSSQL_VARCHAR(10), 'b': 'привет'::MSSQL_NVARCHAR(20), 'c': '42'::MSSQL_VARCHAR(5), 'd': 'xyz'::MSSQL_NVARCHAR('MAX')});
+----
+abc	привет	varchar	nvarchar	42	xyz
+
+query II
+SELECT * FROM mssql_scan_params('spr', 'SELECT @c + 1 AS c, @s AS s',
+	{'c': '42'::MSSQL_VARCHAR(5), 's': 'abc'::MSSQL_NVARCHAR(10)}, '@c int, @s varchar(10)');
+----
+43	abc
+
+# A string into a varbinary is not an implicit conversion the server makes;
+# the RPC form had sent the UTF-8 bytes instead.
+statement error
+SELECT * FROM mssql_scan_params('spr', 'SELECT @v AS v', {'v': 'abc'}, '@v varbinary(10)');
+----
+Implicit conversion from data type nvarchar to varbinary is not allowed
+
 # A value the declared type cannot take keeps the batch form, and the server
 # answers as it always has.
 statement error
