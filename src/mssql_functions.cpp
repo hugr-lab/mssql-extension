@@ -1663,8 +1663,8 @@ static int64_t RunExecBatch(ClientContext &client_context, const string &context
 				// Review of #382: the shared cache is the caller's to invalidate
 				// (the setting's contract), but inside a transaction the
 				// transaction's own lookups must not keep trusting it -- the
-				// pinned connection now sees DDL the shared cache does not, and a
-				// rowid key discovered on it would be written to a shared entry.
+				// pinned connection now sees DDL the shared cache does not, and
+				// what it loads would be published into the shared cache.
 				catalog.NoteTransactionChangeLocally(client_context);
 			}
 		}

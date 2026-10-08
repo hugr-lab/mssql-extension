@@ -223,9 +223,11 @@ extension option makes `SET mssql_dml_use_prepared = …` throw and kill the
 rest of a `.duckdbrc`, so it stays registered as a documented no-op for one
 minor release (the spec 047 precedent for `mssql_open` / `mssql_close`) with
 a CHANGELOG line, and goes the release after. `EnsurePKLoaded` must not
-degrade a discovery error to "no key" — spec 077 (#350) makes it record
+degrade a discovery error to "no key" — spec 077 (#350) made it record
 `discovery_error` and name it in the refusal; with D3 that is what keeps a
-hiccup from silently changing which path a statement takes.
+hiccup from silently changing which path a statement takes. (Spec 084 D5
+superseded this: the key now comes in the same batch as the table's metadata,
+so a failure fails the metadata load and no "no key" answer can come from it.)
 
 ### W5 — tests
 

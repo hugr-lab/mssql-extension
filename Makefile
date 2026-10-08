@@ -1105,7 +1105,7 @@ test-transaction-pin: $(PIN_TEST_BUILD)
 # TestDB is created empty, and the other rowid files read init.sql's tables.
 # MSSQL_TESTDB_DSN is the exported one above, as for every other target.
 ROWID_DEBUG_TESTS := test/sql/rowid/rowid_native_types.test test/sql/rowid/rowid_unique_index.test \
-    test/sql/rowid/rowid_key_types.test test/sql/rowid/rowid_discovery_failure_cached.test
+    test/sql/rowid/rowid_key_types.test test/sql/catalog/bulk_load_keys.test
 
 test-rowid-debug: debug
 	@echo "Running the self-contained rowid tests against the debug build (issue #369)..."

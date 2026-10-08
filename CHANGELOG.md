@@ -261,6 +261,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Metadata queries compute a table's row count once, not once per column**
+  (spec 084). Every query that returned columns carried
+  `OBJECTPROPERTYEX(..., 'Cardinality')` in the same SELECT list, and the
+  server evaluated it on every column row: about 110 logical reads per call on a
+  catalog with keys and constraints. The loads now read the object row and the
+  columns as separate result sets of one batch. A whole-catalog load without
+  filters takes its row counts from one pass over `sys.dm_db_partition_stats`;
+  without the `VIEW DATABASE STATE` permission, on Fabric / Synapse and inside a
+  transaction, it falls back to per-object calls with the same counts. Measured
+  on 200k tables in 100 schemas:
+
+  | operation | before | after |
+  |---|---:|---:|
+  | `mssql_preload_catalog` of the whole catalog | 166 s | 24-29 s |
+  | preload of one schema of 2,000 tables | 1.88 s | 0.53 s |
+  | a table's first touch, server CPU | 1.86 ms | 0.39 ms |
+  | a missing name's "did you mean" names query | 680-700 ms | 297 ms |
+
+- **The bulk loads and `mssql_refresh_cache` carry every table's rowid key**
+  (spec 084). After a preload or a listing, each transaction used to discover
+  the key of every table it scanned on its pinned connection, one extra round
+  trip per table per transaction. The key now comes in the same batch as the
+  columns, everywhere. `mssql_refresh_cache` reloads the catalog in one batch
+  instead of one columns query per table.
+  - A key that cannot be read now fails the metadata load and is retried on the
+    next access. It is no longer cached as a refusal naming
+    `mssql_invalidate_cache`, and the "could not be read" refusal is gone.
+  - A key changed behind the catalog's back (an index added by another client
+    or through `mssql_exec`) is seen after an invalidation or the TTL, like a
+    column. It used to be read at the table's first scan.
+- **CTAS's table and schema existence checks are parameterized** (spec 084):
+  one cached plan for every name instead of an ad-hoc plan per name, and
+  non-ASCII names are checked correctly. A check that fails now reports its
+  error instead of reading as "does not exist".
+
 - **Parameters go as an RPC call, not a batch** (spec 083). Every
   `sp_executesql` the extension sends -- a pushed filter's constants,
   `mssql_scan_params`, `mssql_scan_params_unsafe`, `mssql_exec_params`, the
@@ -308,6 +343,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now leaves it alone. DuckLake's attach probes every inlined-data table in one
   `UNION ALL` of `LIMIT 0` branches, and a thousand of them made each attach
   1.6-1.8x slower with pushdown on.
+
+- **A query naming a missing table loaded every column of the catalog, and
+  reloaded it every time when the database had a schema without tables**
+  (#412). DuckDB walks every schema for its "did you mean" hint; that walk now
+  reads table names only -- from the cache, or one names-only query for all
+  schemas -- instead of building every table's entry with its columns. And a
+  schema with no table or view (a new one, one holding only procedures) never
+  counted as loaded, so each full listing of it ran the whole-catalog metadata
+  query again; it now loads once, like any other. Measured by the
+  mssql-ducklake side on a 4,724-table catalog database: 13-34 s a
+  missing-table query, every time.
 
 - **A CTE over an attached table, used more than once under a `LIMIT`, failed
   with `Table Function with name mssql_catalog_scan does not exist`.**

@@ -1,0 +1,190 @@
+# name: test/sql/catalog/missing_table_empty_schema.test
+# description: Issue #412 -- a query naming a missing table reads table names only for DuckDB's "did you mean" hint, once; and a schema with no table loads once, so a full listing does not reload the catalog for it again
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS mte (TYPE mssql);
+
+# A schema with no table and no view: DuckLake's catalog database has such
+# schemas, and so does any database with a schema holding only procedures.
+statement ok
+SELECT mssql_exec('mte', 'IF SCHEMA_ID(''mte_empty'') IS NULL EXEC(''CREATE SCHEMA mte_empty'');
+	DROP TABLE IF EXISTS dbo.mte_orders; CREATE TABLE dbo.mte_orders (id int)');
+
+statement ok
+SELECT mssql_invalidate_cache('mte');
+
+# The hint names the near table: DuckDB walks every schema for it.
+statement error
+SELECT * FROM mte.dbo.mte_order;
+----
+Did you mean "mte_orders"
+
+# It read names only, once: the next missing-table queries ask the server
+# nothing (a metadata query fails here) ...
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+statement error
+SELECT * FROM mte.dbo.mte_order;
+----
+Did you mean "mte_orders"
+
+statement error
+SELECT * FROM mte.mte_empty.mte_no_such_table;
+----
+does not exist
+
+# ... and no column was loaded: the table itself still needs its metadata
+# query (before #412 the hint loaded every column of the catalog).
+statement error
+SELECT * FROM mte.dbo.mte_orders;
+----
+injected metadata failure
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 0;
+
+# Inside a transaction that changed nothing the hint reads the committed
+# names, through a pool connection (a hint pins nothing).
+statement ok
+SELECT mssql_invalidate_cache('mte');
+
+statement ok
+BEGIN;
+
+statement error
+SELECT * FROM mte.dbo.mte_order;
+----
+Did you mean "mte_orders"
+
+statement ok
+ROLLBACK;
+
+# On a pool of ONE the hint in a transaction that holds no connection reads
+# the committed names through the pool and gives the connection back: it does
+# not pin the pool's only connection, nor open a server transaction on it, to
+# build a suggestion (review of #417). The catalog's transaction exists by then
+# all the same -- DuckDB creates it for the lookup -- so what is asked is
+# whether it holds a connection.
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS mte1 (TYPE mssql);
+
+statement ok
+SET mssql_connection_limit = 64;
+
+query I
+SELECT count(*) FROM mte1.dbo.mte_orders;
+----
+0
+
+statement ok
+SELECT mssql_invalidate_cache('mte1', 'dbo');
+
+statement ok
+BEGIN;
+
+statement ok
+SET current_transaction_invalidation_policy = 'SYNTACTIC_ERRORS_DO_NOT_INVALIDATE';
+
+statement error
+SELECT * FROM mte_orderz;
+----
+Did you mean
+
+query I
+SELECT active_connections FROM mssql_pool_stats('mte1');
+----
+0
+
+statement ok
+ROLLBACK;
+
+# mssql_invalidate_cache(ctx, schema) in a transaction marks the schema
+# changed for the transaction's lookups, but takes no connection: the hint
+# after it still reads the committed names through the pool and pins nothing.
+statement ok
+BEGIN;
+
+statement ok
+SET current_transaction_invalidation_policy = 'SYNTACTIC_ERRORS_DO_NOT_INVALIDATE';
+
+statement ok
+SELECT mssql_invalidate_cache('mte1', 'dbo');
+
+query I
+SELECT active_connections FROM mssql_pool_stats('mte1');
+----
+0
+
+statement error
+SELECT * FROM mte_orderz;
+----
+Did you mean
+
+query I
+SELECT active_connections FROM mssql_pool_stats('mte1');
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+DETACH mte1;
+
+# A server that cannot answer the names query costs the hint, never the
+# error: "does not exist", not a connection or metadata failure.
+statement ok
+SELECT mssql_invalidate_cache('mte');
+
+query I
+SELECT count(*) FROM mte.dbo.mte_orders;
+----
+0
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+statement error
+SELECT * FROM mte.dbo.mte_order;
+----
+does not exist
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 0;
+
+# A full listing loads the catalog once, the empty schema included; listing
+# again asks nothing (before #412 every walk of the empty schema reloaded the
+# whole catalog).
+query I
+SELECT count(*) > 0 FROM duckdb_tables() WHERE database_name = 'mte' AND schema_name = 'dbo';
+----
+true
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+query I
+SELECT count(*) > 0 FROM duckdb_tables() WHERE database_name = 'mte' AND schema_name = 'dbo';
+----
+true
+
+statement ok
+SET mssql_test_fail_metadata_after_rows = 0;
+
+statement ok
+SELECT mssql_exec('mte', 'DROP TABLE dbo.mte_orders; DROP SCHEMA mte_empty');
+
+statement ok
+DETACH mte;

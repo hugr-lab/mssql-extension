@@ -84,11 +84,10 @@ struct MSSQLTableMetadata {
 	// Issue #178 (D6): all fields — including these states — are guarded by the
 	// cache-wide MSSQLMetadataCache::mutex_; the former per-table load_mutex is gone.
 	CacheLoadState columns_load_state = CacheLoadState::NOT_LOADED;
-	// Spec 076 W2: the primary key, when the load that filled this entry
-	// carried it -- GetTableMetadata sends the discovery statement in the same
-	// batch as the columns, so a fresh table costs one round trip, not two.
-	// The bulk paths do not, and MSSQLTableEntry then discovers it lazily as
-	// before (pk_loaded == false).
+	// Spec 076 W2 / 084 D5: the rowid key, loaded in the same batch as the
+	// columns by every load that publishes them -- GetTableMetadata's third
+	// result set and the bulk loads' -- so pk_loaded is true whenever
+	// columns_load_state is LOADED, and MSSQLTableEntry is born with it.
 	mssql::RowIdKeyInfo pk_info;
 	bool pk_loaded = false;
 	std::chrono::steady_clock::time_point columns_last_refresh;
@@ -135,6 +134,13 @@ enum class MSSQLCacheState : uint8_t {
 // MSSQLMetadataCache - In-memory cache of schema/table/column metadata
 //===----------------------------------------------------------------------===//
 
+// What one bulk load staged before publishing: schema -> table -> metadata.
+struct BulkLoadStage {
+	unordered_map<string, unordered_map<string, MSSQLTableMetadata>> tables;
+	idx_t table_count = 0;
+	idx_t column_count = 0;
+};
+
 class MSSQLMetadataCache {
 public:
 	explicit MSSQLMetadataCache(int64_t ttl_seconds = 0);
@@ -151,10 +157,7 @@ public:
 	// Get all schema names (triggers lazy loading of schema list)
 	vector<string> GetSchemaNames(tds::TdsConnection &connection);
 
-	// Get tables/views in a schema (triggers lazy loading of table list)
-	vector<string> GetTableNames(tds::TdsConnection &connection, const string &schema_name);
-
-	// Get table metadata: loads schemas (fast) + columns for the specific table in one query.
+	// Get table metadata: loads schemas (fast) + the table's object row, columns and keys in one batch.
 	// Does NOT load all tables in the schema. Returns false if the table doesn't exist.
 	//
 	// Issue #178 review: copies the metadata into out_meta UNDER the cache mutex.
@@ -203,13 +206,8 @@ public:
 
 	// Load all table metadata for a schema in one bulk query.
 	// If all tables already have columns loaded (e.g. from preload), returns from cache.
-	// Otherwise loads everything with BULK_METADATA_SCHEMA_SQL_TEMPLATE (one round trip).
+	// Otherwise loads the whole catalog in one batch (LoadAllSchemasMetadataLocked).
 	void LoadAllTableMetadata(tds::TdsConnection &connection, const string &schema_name);
-
-	//! The single-schema bulk load. Kept because mssql_preload_catalog('schema')
-	//! names one deliberately; the listing path goes through
-	//! LoadAllSchemasMetadata instead. Caller must hold mutex_ via the public entry.
-	void LoadAllTableMetadataForSchema(tds::TdsConnection &connection, const string &schema_name);
 
 	//! Load EVERY schema's tables and columns in one query (spec 071 W2).
 	//!
@@ -295,6 +293,13 @@ public:
 	// Set database default collation
 	void SetDatabaseCollation(const string &collation, int32_t code_page);
 
+	// Spec 084 D1: whether the whole-catalog load may take its row counts from one
+	// pass over sys.dm_db_partition_stats. Off on Fabric / Synapse, where the DMV
+	// and table variables are unverified. Set once at catalog init.
+	void SetRowCountPass(bool allowed) {
+		row_count_pass_ = allowed;
+	}
+
 	// Get database default collation.
 	// Returns by VALUE: a reference would outlive the internal lock and race
 	// with Refresh() overwriting the string (issue #178 D6 audit).
@@ -306,9 +311,6 @@ public:
 
 	// Ensure schema list is loaded (lazy loading with double-checked locking)
 	void EnsureSchemasLoaded(tds::TdsConnection &connection);
-
-	// Ensure table list for schema is loaded
-	void EnsureTablesLoaded(tds::TdsConnection &connection, const string &schema_name);
 
 	//===----------------------------------------------------------------------===//
 	// Point Invalidation
@@ -348,6 +350,17 @@ public:
 	// Get column metadata load state for table
 	CacheLoadState GetColumnsState(const string &schema_name, const string &table_name) const;
 
+	//! Issue #412: the names of a schema's tables and views, for DuckDB's "did
+	//! you mean" hint on a missing table -- from the schema's loaded table list,
+	//! else from the names-only list LoadAllTableNames read (until any
+	//! invalidation, or past the TTL). False when neither holds them.
+	bool TryGetTableNames(const string &schema_name, vector<string> &out_names);
+	//! Issue #412: every schema's table and view names in one query, no columns
+	//! -- what the hint needs, where a Scan loads every column of the catalog.
+	//! Kept apart from the table lists, which carry row counts and shapes this
+	//! query does not read.
+	void LoadAllTableNames(tds::TdsConnection &connection);
+
 private:
 	//! The bodies of EnsureSchemasLoaded and LoadAllSchemasMetadata, for a caller
 	//! that already holds mutex_. BulkLoadAll holds ONE lock across the schema
@@ -356,6 +369,10 @@ private:
 	//! relies on, and bring back the #376 state -- tables published into a list
 	//! still marked NOT_LOADED, cleared and reloaded by the next access.
 	void EnsureSchemasLoadedLocked(tds::TdsConnection &connection);
+	// Spec 084 D1/D5: the objects, their columns and keys in one batch, three result sets,
+	// staged (nothing published): every schema, or the one named. Shared by
+	// LoadAllSchemasMetadataLocked and BulkLoadAll's per-schema path.
+	void LoadObjectsAndColumnsLocked(tds::TdsConnection &connection, const string *one_schema, BulkLoadStage &stage);
 	void LoadAllSchemasMetadataLocked(tds::TdsConnection &connection, idx_t &schema_count, idx_t &table_count,
 									  idx_t &column_count);
 
@@ -365,13 +382,6 @@ private:
 
 	// Load schemas from sys.schemas
 	void LoadSchemas(tds::TdsConnection &connection);
-
-	// Load tables and views from sys.objects
-	void LoadTables(tds::TdsConnection &connection, const string &schema_name);
-
-	// Load columns from sys.columns
-	void LoadColumns(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
-					 MSSQLTableMetadata &table_metadata);
 
 	// Execute metadata query with configured timeout (metadata_timeout_ms_)
 	using MetadataRowCallback = std::function<void(const vector<string> &values)>;
@@ -390,7 +400,7 @@ private:
 							  MetadataResetCallback reset);
 	//! The same for a batch of several statements: the callback gets the
 	//! ordinal of the result set a row came from (spec 076 W2 sends the table
-	//! metadata and the primary key as one batch and reads two result sets).
+	//! metadata and the primary key as one batch; three result sets since spec 084).
 	using MetadataSetRowCallback = std::function<void(idx_t result_set, const vector<string> &values)>;
 	void ExecuteMetadataQuerySets(tds::TdsConnection &connection, const tds::Request &sql,
 								  MetadataSetRowCallback callback, MetadataResetCallback reset);
@@ -416,6 +426,7 @@ private:
 	//! held.
 	bool IsColumnsFreshLocked(const MSSQLTableMetadata &table) const;
 	MSSQLCacheState state_;								  // Current cache state (backward compat)
+	bool row_count_pass_ = true;						  // SetRowCountPass; set once at catalog init
 	const MSSQLCatalogFilter *filter_ = nullptr;		  // Set once at catalog init, before any concurrency
 	unordered_map<string, MSSQLSchemaMetadata> schemas_;  // Cached schemas
 	std::chrono::steady_clock::time_point last_refresh_;  // Last refresh timestamp (backward compat)
@@ -432,6 +443,13 @@ private:
 	// Incremental cache state for schema list (catalog-level) — guarded by mutex_
 	CacheLoadState schemas_load_state_ = CacheLoadState::NOT_LOADED;
 	std::chrono::steady_clock::time_point schemas_last_refresh_;
+
+	// Issue #412: LoadAllTableNames' answer, valid while invalidation_epoch_ is
+	// table_names_epoch_ (any invalidation ends it) -- guarded by mutex_.
+	unordered_map<string, vector<string>> table_names_;
+	bool table_names_loaded_ = false;
+	uint64_t table_names_epoch_ = 0;
+	std::chrono::steady_clock::time_point table_names_loaded_at_;
 };
 
 }  // namespace duckdb

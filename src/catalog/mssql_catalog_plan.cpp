@@ -299,7 +299,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 	// Get the target table entry
 	auto &table_entry = op.table.Cast<MSSQLTableEntry>();
 
-	// Check if table has a primary key (this will fetch PK info if not cached)
+	// Check if table has a primary key (loaded with its metadata, spec 084 D5)
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
 	if (!pk_info.exists) {
 		throw NotImplementedException(pk_info.RowIdRefusal(table_entry.schema.name.GetIdentifierName(),
