@@ -112,6 +112,42 @@ SELECT (SELECT acquire_count FROM mssql_pool_stats('su')) - (SELECT n FROM acqui
 ----
 1
 
+# A batch the server cannot describe (it reads a #temp table it creates):
+# mssql_scan has to run it at bind, so even its EXPLAIN takes connections ...
+statement ok
+CREATE OR REPLACE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('su');
+
+statement ok
+EXPLAIN SELECT * FROM mssql_scan('su', 'CREATE TABLE #su_tmp (id int); INSERT INTO #su_tmp VALUES (7); SELECT id FROM #su_tmp');
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('su')) - (SELECT n FROM acquired) > 0;
+----
+true
+
+# ... while the _unsafe form binds without looking at the statement, and runs
+# it once, at init (review of #407).
+statement ok
+CREATE OR REPLACE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('su');
+
+statement ok
+EXPLAIN SELECT * FROM mssql_scan_unsafe('su', 'CREATE TABLE #su_tmp (id int); INSERT INTO #su_tmp VALUES (7); SELECT id FROM #su_tmp', columns := {'id': 'INTEGER'});
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('su')) - (SELECT n FROM acquired);
+----
+0
+
+query I
+SELECT id FROM mssql_scan_unsafe('su', 'CREATE TABLE #su_tmp (id int); INSERT INTO #su_tmp VALUES (7); SELECT id FROM #su_tmp', columns := {'id': 'INTEGER'});
+----
+7
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('su')) - (SELECT n FROM acquired);
+----
+1
+
 # EXPLAIN says where the shape came from.
 query II
 EXPLAIN SELECT * FROM mssql_scan_unsafe('su', 'SELECT id FROM dbo.su_t', columns := {'id': 'INTEGER'});
