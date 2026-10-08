@@ -145,12 +145,12 @@ WHERE o.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
 // `rc_pass`: the row counts of the whole catalog from ONE pass over
 // sys.dm_db_partition_stats into @rc (4.3 s at 200k objects against 23 s of
 // per-object OBJECTPROPERTYEX, ~110 logical reads a call on a catalog with keys
-// and constraints). Only for an unfiltered whole-catalog load -- the pass
-// covers the whole database whatever the filters say -- and only where it is
-// allowed (not Fabric / Synapse). The DMV needs VIEW DATABASE STATE, which
-// OBJECTPROPERTYEX does not: without it, or on any error, @rc stays empty and
-// every object takes the OBJECTPROPERTYEX branch, so a db_datareader-only login
-// keeps its catalog. A view has no partition rows and takes that branch too; an
+// and constraints). Only for a whole-catalog load the server does not narrow
+// -- the pass covers the whole database whatever the filters say -- and only
+// where it is allowed (not Fabric / Synapse). The DMV needs VIEW DATABASE
+// STATE, which OBJECTPROPERTYEX does not: without it, or on any error, @rc
+// stays empty and every object takes the OBJECTPROPERTYEX branch, so a
+// db_datareader-only login keeps its catalog. A view has no partition rows and takes that branch too; an
 // indexed view agrees either way (measured), a memory-optimized table has no
 // index 0/1 row and reads 0 from OBJECTPROPERTYEX as it always did. A deadlock
 // victim (1205) is rethrown, for RunMetadataQuerySets to rerun the batch.
@@ -900,22 +900,26 @@ void MSSQLMetadataCache::LoadObjectsAndColumnsLocked(tds::TdsConnection &connect
 	if (one_schema) {
 		scope += "\n  AND s.schema_id = SCHEMA_ID(@s)";
 	}
-	bool filtered = false;
+	// The row-count pass is for a load that reads the whole catalog: a filter
+	// the server applies makes it read less, while one that does not convert to
+	// LIKE (`.*_prod$`) still lists every object and keeps the pass, which
+	// costs the same whatever is listed (review of #417).
+	bool narrowed = false;
 	if (filter_ && filter_->HasSchemaFilter()) {
-		filtered = true;
 		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetSchemaPattern(), "s.name");
 		if (!like_clause.empty()) {
 			scope += " AND " + like_clause;
+			narrowed = true;
 		}
 	}
 	if (filter_ && filter_->HasTableFilter()) {
-		filtered = true;
 		string like_clause = MSSQLCatalogFilter::TryRegexToSQLLike(filter_->GetTablePattern(), "o.name");
 		if (!like_clause.empty()) {
 			scope += " AND " + like_clause;
+			narrowed = true;
 		}
 	}
-	const bool rc_pass = !one_schema && !filtered && row_count_pass_;
+	const bool rc_pass = !one_schema && !narrowed && row_count_pass_;
 	const string batch = BuildBulkMetadataBatch(scope, rc_pass);
 	const tds::Request request =
 		one_schema ? mssql::BuildExecuteSqlRequest(batch, "@s sysname", {{"s", *one_schema}}) : tds::Request(batch);

@@ -68,6 +68,81 @@ Did you mean "mte_orders"
 statement ok
 ROLLBACK;
 
+# On a pool of ONE the hint in a transaction that holds no connection reads
+# the committed names through the pool and gives the connection back: it does
+# not pin the pool's only connection, nor open a server transaction on it, to
+# build a suggestion (review of #417). The catalog's transaction exists by then
+# all the same -- DuckDB creates it for the lookup -- so what is asked is
+# whether it holds a connection.
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS mte1 (TYPE mssql);
+
+statement ok
+SET mssql_connection_limit = 64;
+
+query I
+SELECT count(*) FROM mte1.dbo.mte_orders;
+----
+0
+
+statement ok
+SELECT mssql_invalidate_cache('mte1', 'dbo');
+
+statement ok
+BEGIN;
+
+statement ok
+SET current_transaction_invalidation_policy = 'SYNTACTIC_ERRORS_DO_NOT_INVALIDATE';
+
+statement error
+SELECT * FROM mte_orderz;
+----
+Did you mean
+
+query I
+SELECT active_connections FROM mssql_pool_stats('mte1');
+----
+0
+
+statement ok
+ROLLBACK;
+
+# mssql_invalidate_cache(ctx, schema) in a transaction marks the schema
+# changed for the transaction's lookups, but takes no connection: the hint
+# after it still reads the committed names through the pool and pins nothing.
+statement ok
+BEGIN;
+
+statement ok
+SET current_transaction_invalidation_policy = 'SYNTACTIC_ERRORS_DO_NOT_INVALIDATE';
+
+statement ok
+SELECT mssql_invalidate_cache('mte1', 'dbo');
+
+query I
+SELECT active_connections FROM mssql_pool_stats('mte1');
+----
+0
+
+statement error
+SELECT * FROM mte_orderz;
+----
+Did you mean
+
+query I
+SELECT active_connections FROM mssql_pool_stats('mte1');
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+DETACH mte1;
+
 # A server that cannot answer the names query costs the hint, never the
 # error: "does not exist", not a connection or metadata failure.
 statement ok

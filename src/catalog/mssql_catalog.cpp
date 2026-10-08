@@ -596,13 +596,15 @@ MSSQLMetadataCache &MSSQLCatalog::SchemaListCache(ClientContext *context) {
 	// transaction that has not touched MSSQL yet has no transaction-local view to
 	// consult -- there is nothing to create it FOR. Creating it here would also
 	// flip HasUsedAnyMSSQLCatalogInTransaction, so any schema lookup DuckDB makes
-	// against an attached MSSQL catalog (search-path resolution, duckdb_schemas(),
-	// a "did you mean" scan) would refuse mssql_refresh_cache /
-	// mssql_preload_catalog for a transaction that has taken no connection -- the
+	// against an attached MSSQL catalog (search-path resolution, duckdb_schemas())
+	// would refuse mssql_refresh_cache / mssql_preload_catalog for a
+	// transaction that has taken no connection -- the
 	// very case issue #380's refusal was narrowed to allow. The shortcut is
 	// limited to an already-LOADED shared list: that is committed state and
 	// answers with no connection. Anything else falls through and creates the
-	// transaction exactly as before, so a LOAD still lands in its cache.
+	// transaction exactly as before, so a LOAD still lands in its cache. (A
+	// "did you mean" scan is out of reach: DuckDB creates the transaction for it
+	// before asking -- see MSSQLSchemaEntry::GetSimilarEntry.)
 	if (metadata_cache_->GetSchemasState() == CacheLoadState::LOADED &&
 		!MetaTransaction::Get(*context).TryGetTransaction(GetAttached())) {
 		return *metadata_cache_;

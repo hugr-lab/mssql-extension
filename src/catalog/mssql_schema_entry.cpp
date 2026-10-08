@@ -95,17 +95,28 @@ SimilarCatalogEntry MSSQLSchemaEntry::GetSimilarEntry(CatalogTransaction transac
 	// not turn "does not exist" into a connection error (review of #412).
 	try {
 		auto &shared = catalog.GetMetadataCache();
-		const bool in_transaction = !context.transaction.IsAutoCommit();
-		// A transaction that changed this schema reads its own names, on its
-		// pinned connection (#380: the shared cache holds committed state only);
-		// so does one on a pool of ONE, whose only connection it may hold.
-		// Otherwise the committed names, through a pool connection -- a hint
-		// does not pin a connection or open a server transaction.
+		// Only a transaction that holds a pinned connection has names of its
+		// own (#380: the shared cache holds committed state only): one that
+		// changed this schema on it (mssql_exec DDL), or one on a pool of ONE
+		// that holds the pool's only connection. Otherwise the committed names,
+		// through a pool connection -- a hint does not pin a connection or open
+		// a server transaction. Catalog DDL inside a transaction marks the
+		// schema changed too, but it ran and committed on a pool connection
+		// and invalidated the shared names, so those are the right answer.
+		//
+		// The catalog's transaction exists by now whether or not the statement
+		// touched the catalog: DuckDB builds the CatalogTransaction it passes
+		// here with Transaction::Get, which creates it. So "own" is asked of
+		// what the transaction holds, not of whether it exists; asking
+		// existence pinned a pool of one's only connection, and opened a server
+		// transaction, to build a suggestion (review of #417).
 		bool own = false;
-		if (in_transaction) {
-			auto &metadata = MSSQLTransaction::Get(context, catalog).Metadata(context);
-			own = metadata.IsSchemaChanged(schema_name) ||
-				  (catalog.GetConnectionLimit() <= 1 && !shared.TryGetTableNames(schema_name, names));
+		if (!context.transaction.IsAutoCommit()) {
+			auto &transaction = MSSQLTransaction::Get(context, catalog);
+			auto &metadata = transaction.Metadata(context);
+			own = transaction.HasPinnedConnection() &&
+				  (metadata.IsSchemaChanged(schema_name) ||
+				   (catalog.GetConnectionLimit() <= 1 && !shared.TryGetTableNames(schema_name, names)));
 			if (own) {
 				auto &cache = metadata.Cache();
 				if (!cache.TryGetTableNames(schema_name, names)) {
