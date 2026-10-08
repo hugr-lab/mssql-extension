@@ -1,0 +1,18 @@
+# name: p07_delete_from_join
+# group: [fabric_probe]
+
+require mssql
+
+require-env AZURE_WH_HOST
+
+require-env AZURE_WH_NAME
+
+require-env AZURE_WH_TOKEN
+
+statement ok
+ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (TYPE mssql, ACCESS_TOKEN '{AZURE_WH_TOKEN}');
+
+query I
+SELECT * FROM mssql_scan_unsafe('wh', 'CREATE TABLE #s (id int); INSERT INTO #s VALUES (3); DELETE t FROM dbo.p080_t AS t JOIN #s AS s ON t.id = s.id; SELECT COUNT(*) AS c FROM dbo.p080_t', columns := {'c': 'INTEGER'});
+----
+X

@@ -1,0 +1,18 @@
+# name: p02_output_into_tvar
+# group: [fabric_probe]
+
+require mssql
+
+require-env AZURE_WH_HOST
+
+require-env AZURE_WH_NAME
+
+require-env AZURE_WH_TOKEN
+
+statement ok
+ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (TYPE mssql, ACCESS_TOKEN '{AZURE_WH_TOKEN}');
+
+query II
+SELECT * FROM mssql_scan_unsafe('wh', 'DECLARE @o TABLE (id int, v int); UPDATE dbo.p080_t SET v = v + 1 OUTPUT inserted.id, inserted.v INTO @o WHERE id = 1; SELECT id, v FROM @o', columns := {'id': 'INTEGER', 'v': 'INTEGER'});
+----
+X

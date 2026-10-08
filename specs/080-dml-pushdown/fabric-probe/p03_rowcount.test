@@ -1,0 +1,18 @@
+# name: p03_rowcount
+# group: [fabric_probe]
+
+require mssql
+
+require-env AZURE_WH_HOST
+
+require-env AZURE_WH_NAME
+
+require-env AZURE_WH_TOKEN
+
+statement ok
+ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (TYPE mssql, ACCESS_TOKEN '{AZURE_WH_TOKEN}');
+
+query I
+SELECT * FROM mssql_scan_unsafe('wh', 'UPDATE dbo.p080_t SET v = v + 1 WHERE id IN (1, 2); SELECT CAST(@@ROWCOUNT AS BIGINT) AS rc', columns := {'rc': 'BIGINT'});
+----
+X

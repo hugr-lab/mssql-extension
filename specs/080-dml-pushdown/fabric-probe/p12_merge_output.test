@@ -1,0 +1,18 @@
+# name: p12_merge_output
+# group: [fabric_probe]
+
+require mssql
+
+require-env AZURE_WH_HOST
+
+require-env AZURE_WH_NAME
+
+require-env AZURE_WH_TOKEN
+
+statement ok
+ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (TYPE mssql, ACCESS_TOKEN '{AZURE_WH_TOKEN}');
+
+query II
+SELECT * FROM mssql_scan_unsafe('wh', 'CREATE TABLE #s (id int, v int); INSERT INTO #s VALUES (1, 5); MERGE dbo.p080_m2 AS t USING #s AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v OUTPUT inserted.id, inserted.v;', columns := {'id': 'INTEGER', 'v': 'INTEGER'});
+----
+X

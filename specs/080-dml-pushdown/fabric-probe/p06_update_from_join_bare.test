@@ -1,0 +1,18 @@
+# name: p06_update_from_join_bare
+# group: [fabric_probe]
+
+require mssql
+
+require-env AZURE_WH_HOST
+
+require-env AZURE_WH_NAME
+
+require-env AZURE_WH_TOKEN
+
+statement ok
+ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (TYPE mssql, ACCESS_TOKEN '{AZURE_WH_TOKEN}');
+
+query I
+SELECT * FROM mssql_scan_unsafe('wh', 'CREATE TABLE #s (id int, v int); INSERT INTO #s VALUES (1, 101); UPDATE dbo.p080_t SET v = s.v FROM dbo.p080_t JOIN #s AS s ON dbo.p080_t.id = s.id; SELECT COUNT(*) AS c FROM dbo.p080_t WHERE v = 101', columns := {'c': 'INTEGER'});
+----
+X
