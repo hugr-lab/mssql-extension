@@ -363,6 +363,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mssql-ducklake side on a 4,724-table catalog database: 13-34 s a
   missing-table query, every time.
 
+- **`mssql_invalidate_cache(ctx, schema)` did nothing for a schema created
+  after the catalog listed its schemas**: the schema stayed "does not exist"
+  until a whole-catalog invalidate. Naming a schema the cache has not listed
+  now re-reads the schema list, and the re-read keeps what is cached for the
+  schemas it already knew instead of starting from an empty cache.
+
 - **A CTE over an attached table, used more than once under a `LIMIT`, failed
   with `Table Function with name mssql_catalog_scan does not exist`.**
   DuckDB inlines such a CTE by copying its plan, and the copy looks the scan
@@ -875,6 +881,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the shape cache. Over a table changed outside the catalog such a statement
   now fails at execution rather than at bind, naming the statement and
   `mssql_invalidate_cache()`.
+
+- **A user's `mssql_scan` / `mssql_scan_params` of a text already described
+  binds from the describe cache** (#410): no `sp_describe_first_result_set`,
+  no connection at bind. The describe was most of a short query's cost on the
+  0.3.0 line -- a TOP 1 took 3.5 ms against 0.65 ms on v0.2.5, and 1.1 ms
+  with the shape given. The first run of a text still describes. A shape
+  changed behind the catalog (`mssql_exec` DDL, another client) fails that
+  statement once, saying to run it again; `mssql_invalidate_cache()` drops
+  the shapes.
 
 - **`mssql_remote_pushdown` is on by default** (spec 079 PR E2). A SELECT
   over one attached database with a join, an aggregate, `DISTINCT`, `ORDER

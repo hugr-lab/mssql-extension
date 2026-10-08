@@ -804,8 +804,9 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	// per-schema one used to mark it LOADED holding only the schema it had been
 	// given, so every other schema of the database stopped existing for the rest
 	// of the session; the whole-catalog one left it NOT_LOADED, so the first
-	// catalog access after the preload ran EnsureSchemasLoaded, which clears
-	// schemas_, and loaded the whole catalog a second time.
+	// catalog access after the preload ran EnsureSchemasLoaded, which then
+	// cleared schemas_ (it merges since #408), and loaded the whole catalog a
+	// second time.
 	//
 	// ONE lock across the list and the load (review of #377): released in
 	// between, an invalidation could clear the list the load then relies on.
@@ -1249,10 +1250,10 @@ void MSSQLMetadataCache::EnsureSchemasLoadedLocked(tds::TdsConnection &connectio
 	schemas_load_state_ = CacheLoadState::LOADING;
 
 	try {
-		// Clear existing schemas (preserve database_collation_)
-		schemas_.clear();
-
-		// Load schema names only (no tables/columns)
+		// Load schema names only (no tables/columns). Merged into schemas_ below,
+		// not loaded over a cleared map: a re-read of the list (a schema created
+		// behind the catalog, `mssql_invalidate_cache(ctx, schema)` naming one it
+		// had not seen) must not drop what is cached for the schemas it keeps.
 		string schema_sql = SCHEMA_DISCOVERY_SQL;
 		// Push schema filter to SQL Server if convertible to LIKE
 		if (filter_ && filter_->HasSchemaFilter()) {
@@ -1264,19 +1265,24 @@ void MSSQLMetadataCache::EnsureSchemasLoadedLocked(tds::TdsConnection &connectio
 		}
 		schema_sql += "\nORDER BY s.name";
 
+		vector<string> names;
 		ExecuteMetadataQuery(
 			connection, schema_sql,
-			[this](const vector<string> &values) {
+			[&names](const vector<string> &values) {
 				if (!values.empty()) {
-					string schema_name = values[0];
-					// Create schema with only name - tables NOT loaded (tables_load_state = NOT_LOADED)
-					schemas_.emplace(schema_name, MSSQLSchemaMetadata(schema_name));
+					names.push_back(values[0]);
 				}
 			},
-			[]() {
-				// Nothing to undo: emplace() on an existing key is a no-op, so a
-				// second pass over the same schema names converges on the same map.
-			});
+			[&names]() { names.clear(); });
+
+		std::unordered_set<string> listed(names.begin(), names.end());
+		for (auto it = schemas_.begin(); it != schemas_.end();) {
+			it = listed.count(it->first) ? std::next(it) : schemas_.erase(it);
+		}
+		for (const auto &name : names) {
+			// A new schema starts with its tables NOT_LOADED; a kept one keeps its state.
+			schemas_.emplace(name, MSSQLSchemaMetadata(name));
+		}
 
 		// Update state
 		CACHE_DEBUG(1, "EnsureSchemasLoaded — loaded %zu schemas", schemas_.size());
@@ -1300,13 +1306,17 @@ void MSSQLMetadataCache::InvalidateSchema(const string &schema_name) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	invalidation_epoch_++;
 	auto it = schemas_.find(schema_name);
-	if (it != schemas_.end()) {
-		it->second.tables_load_state = CacheLoadState::NOT_LOADED;
-		// Also invalidate all cached table column metadata in this schema
-		// so that GetTableMetadata re-fetches columns from SQL Server
-		for (auto &table_pair : it->second.tables) {
-			table_pair.second.columns_load_state = CacheLoadState::NOT_LOADED;
-		}
+	if (it == schemas_.end()) {
+		// A schema the cache has not listed -- created behind the catalog after the
+		// list was read: re-read the list, which keeps every schema already cached.
+		schemas_load_state_ = CacheLoadState::NOT_LOADED;
+		return;
+	}
+	it->second.tables_load_state = CacheLoadState::NOT_LOADED;
+	// Also invalidate all cached table column metadata in this schema
+	// so that GetTableMetadata re-fetches columns from SQL Server
+	for (auto &table_pair : it->second.tables) {
+		table_pair.second.columns_load_state = CacheLoadState::NOT_LOADED;
 	}
 }
 
@@ -1314,11 +1324,16 @@ void MSSQLMetadataCache::InvalidateSchemaTableList(const string &schema_name) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	invalidation_epoch_++;
 	auto it = schemas_.find(schema_name);
-	if (it != schemas_.end()) {
-		// Existence only — re-fetch the table list, but keep every table's cached
-		// column metadata (the expensive part). Used by per-table invalidation.
-		it->second.tables_load_state = CacheLoadState::NOT_LOADED;
+	if (it == schemas_.end()) {
+		// A schema the cache has not listed: re-read the list, as InvalidateSchema
+		// does -- the table it names may be in a schema created behind the catalog
+		// (review of #408).
+		schemas_load_state_ = CacheLoadState::NOT_LOADED;
+		return;
 	}
+	// Existence only — re-fetch the table list, but keep every table's cached
+	// column metadata (the expensive part). Used by per-table invalidation.
+	it->second.tables_load_state = CacheLoadState::NOT_LOADED;
 }
 
 void MSSQLMetadataCache::InvalidateTable(const string &schema_name, const string &table_name) {
@@ -1339,12 +1354,12 @@ void MSSQLMetadataCache::InvalidateAll() {
 	std::lock_guard<std::mutex> lock(mutex_);
 	invalidation_epoch_++;
 	schemas_load_state_ = CacheLoadState::NOT_LOADED;
-	for (auto &schema_entry : schemas_) {
-		schema_entry.second.tables_load_state = CacheLoadState::NOT_LOADED;
-		for (auto &table_entry : schema_entry.second.tables) {
-			table_entry.second.columns_load_state = CacheLoadState::NOT_LOADED;
-		}
-	}
+	// Everything goes: nothing here is still usable, and a table list kept past
+	// a whole-catalog invalidate would outlive the re-read of the schema list
+	// (which merges since the list is re-read for a single unknown schema too) --
+	// a per-schema preload publishes table by table and would keep a table
+	// dropped on the server, with its old row count.
+	schemas_.clear();
 	// Update backward-compat state
 	state_ = MSSQLCacheState::INVALID;
 }

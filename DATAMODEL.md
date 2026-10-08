@@ -791,8 +791,9 @@ gain is handed back as a subquery, table names restored as the query wrote
 them, with each nested part that does replaced by `SELECT * FROM <its
 vehicle>` (PR E1). From there each vehicle is an ordinary raw scan: describe
 at bind (none for an `_unsafe` vehicle), run at init, and the pinned
-connection inside a transaction -- except that the describe of a statement the
-rewriter wrote is cached per catalog (PR E2, below).
+connection inside a transaction -- except that the describe is cached per
+catalog (PR E2, below; since issue #410 for every describing scan, not only
+the rewriter's).
 
 ```mermaid
 flowchart LR
@@ -856,9 +857,11 @@ Invariants:
   describing vehicle: the writer does not know the wire type exactly there.
   Such a statement over a table changed behind the catalog fails at init,
   naming the statement, and clears the describe cache.
-- **A pushed statement's shape is cached by its text** (PR E2,
-  `query/mssql_describe_cache`). `VehicleFor` notes the statement in the
-  catalog's `DescribeCache`; its bind takes the shape from there (no round
+- **A described statement's shape is cached by its text** (PR E2,
+  `query/mssql_describe_cache`; first the rewriter's statements, since issue
+  #410 every `mssql_scan` / `mssql_scan_params` that describes -- the describe
+  was 2.4 ms of a 3.5 ms TOP 1). The bind stores the statement in the
+  catalog's `DescribeCache`; it takes the shape from there (no round
   trip, no connection) while the metadata cache's invalidation epoch is the
   one the describe ran under (and `mssql_catalog_cache_ttl`, when set);
   `mssql_preload_catalog` clears it. Constants are parameters, so the key is

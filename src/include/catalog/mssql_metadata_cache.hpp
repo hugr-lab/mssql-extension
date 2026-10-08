@@ -199,8 +199,9 @@ public:
 	bool TryGetLoadedSchemaNames(vector<string> &out_names, std::chrono::steady_clock::time_point &out_loaded_at);
 	//! The schema list a transaction loaded, published here when this cache
 	//! has none (never over a loaded one), under the same epoch rule as
-	//! PublishTableMetadata. Without it a published table would not survive the
-	//! first autocommit lookup: loading the list clears the schema map.
+	//! PublishTableMetadata. It marks the shared list LOADED from the
+	//! transaction's with no round trip: without it the first autocommit lookup
+	//! after COMMIT would read the list from the server again.
 	bool PublishSchemaNames(const vector<string> &names, std::chrono::steady_clock::time_point loaded_at,
 							uint64_t epoch);
 
@@ -321,7 +322,8 @@ public:
 
 	// Invalidate ONLY the schema's table list (existence), keeping every table's cached
 	// column metadata. Used by per-table invalidation so a CREATE/DROP is reflected without
-	// re-fetching the columns of every other table in the schema.
+	// re-fetching the columns of every other table in the schema. A schema the cache has
+	// not listed marks the schema LIST stale instead (it may have been created since).
 	void InvalidateSchemaTableList(const string &schema_name);
 
 	// Invalidate table's column metadata (for ALTER TABLE)

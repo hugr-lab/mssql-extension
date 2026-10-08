@@ -431,9 +431,6 @@ unique_ptr<TableRef> MSSQLCatalog::VehicleFor(mssql::WrittenQuery &written) {
 		auto column_types = ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, std::move(types)));
 		column_types->SetAlias(Identifier("column_types"));
 		arguments.push_back(std::move(column_types));
-		// Its shape may be cached (the statement is ours: DescribeCache).
-		describe_cache_.NotePushed(
-			mssql::DescribeCache::Key(written.statement, written.Declarations(), MSSQLReportsNativeTypes(*this)));
 	}
 	auto ref = make_uniq<TableFunctionRef>();
 	ref->function = make_uniq<FunctionExpression>(

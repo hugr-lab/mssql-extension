@@ -32,7 +32,7 @@ FROM mssql_scan('sqlserver', 'SELECT * INTO #t FROM dbo.src; SELECT * FROM #t');
 
 The return schema is dynamic based on the query result columns. Multi-statement batches support intermediate DML/DDL statements that don't return results, but only one result-producing statement is allowed per call.
 
-The shape is learned without running the statement: bind asks SQL Server to describe it (`sp_describe_first_result_set`), and the query runs when the scan starts. So a `DESCRIBE` or `EXPLAIN` of a batch that inserts before it selects inserts nothing, and a query with a side effect runs exactly once. A statement the server cannot describe — a batch that reads a `#temp` table it creates, a stored procedure — is run at bind instead, as every statement was before 0.3.0.
+The shape is learned without running the statement: bind asks SQL Server to describe it (`sp_describe_first_result_set`), and the query runs when the scan starts. The answer is remembered per statement text, so a text run again binds with no round trip (a shape changed behind the catalog — `mssql_exec` DDL, another client — fails that statement once with *"the statement's result shape changed since it was cached … Run the statement again"*; `mssql_invalidate_cache()` drops the remembered shapes). So a `DESCRIBE` or `EXPLAIN` of a batch that inserts before it selects inserts nothing, and a query with a side effect runs exactly once. A statement the server cannot describe — a batch that reads a `#temp` table it creates, a stored procedure — is run at bind instead, as every statement was before 0.3.0.
 
 Inside a transaction the rows are read in full when the scan starts, so the transaction's single connection is free for the next scan or for a `COPY` / `INSERT` in the same statement.
 

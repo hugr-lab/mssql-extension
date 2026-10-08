@@ -181,6 +181,19 @@ static string TypeListToString(const vector<LogicalType> &types) {
 	return out;
 }
 
+// "a INTEGER, b VARCHAR": the cache-mismatch message names the columns, since
+// a rename or a swap changes no type.
+static string NamedTypeListToString(const vector<string> &names, const vector<LogicalType> &types) {
+	string result;
+	for (idx_t i = 0; i < types.size(); i++) {
+		if (i > 0) {
+			result += ", ";
+		}
+		result += (i < names.size() ? names[i] + " " : string()) + types[i].ToString();
+	}
+	return result;
+}
+
 // The TDS type the server sends for a column sp_describe_first_result_set
 // names -- `nvarchar(50)`, `decimal(10,2)`, `timestamp` -- with the length,
 // precision and scale beside it. The described shape is then whatever
@@ -852,8 +865,8 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	const string declarations = params.Declarations();
 	const bool native_types = MSSQLReportsNativeTypes(mssql_catalog);
 
-	// Spec 079 PR E2: a pushed statement of a shape already described binds
-	// without the round trip -- or a connection. Inside an explicit transaction
+	// Spec 079 PR E2, issue #410: a statement of a shape already described
+	// binds without the round trip -- or a connection. Inside an explicit transaction
 	// only while it has changed no schema (#383's rule for the shared metadata:
 	// its own DDL is not the shared shapes' to see, nor its describes theirs to
 	// keep); never for a prepared scan (whose handle is the point).
@@ -994,6 +1007,8 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 			cached.types.assign(shape.types.begin(), shape.types.end());
 			cached.names.assign(shape.names.begin(), shape.names.end());
 			cached.datetime2.assign(shape.datetime2.begin(), shape.datetime2.end());
+			// Stored only once described: a text the server cannot describe (a
+			// procedure, a #temp batch) takes no place in the cache.
 			mssql_catalog.GetDescribeCache().Store(bind_data.describe_cache_key, cache_epoch, std::move(cached));
 		}
 		auto bind_ms =
@@ -1255,6 +1270,12 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		}
 		stream->SurfaceWarnings(context);
 		const auto &described = bind_data.described_types.empty() ? bind_data.return_types : bind_data.described_types;
+		// A shape from the cache is checked by its column names too: a column
+		// renamed or two swapped behind the catalog keep their types, and a
+		// user's `SELECT *` or a view would serve the rows under the old names
+		// (review of #410). A shape described for this very bind is not: it
+		// is the server's answer of a moment ago.
+		const bool names_differ = bind_data.shape_from_cache && stream->GetColumnNames() != bind_data.column_names;
 		if (!bind_data.trusted_function.empty()) {
 			// Spec 081: the caller's shape, never described -- the stream must
 			// have as many columns, each read as declared by the rule
@@ -1285,7 +1306,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 					bind_data.trusted_function, TypeListToString(stream->GetColumnTypes()),
 					TypeListToString(bind_data.return_types), statement);
 			}
-		} else if (!StreamMatchesBoundShape(described, *stream) ||
+		} else if (names_differ || !StreamMatchesBoundShape(described, *stream) ||
 				   !StreamMatchesDatetime2(bind_data.described_datetime2, *stream)) {
 			if (!bind_data.describe_cache_key.empty()) {
 				// A table changed behind the catalog's back (`mssql_exec` DDL): every
@@ -1306,7 +1327,8 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 					"table it reads was changed outside this catalog (another client, a migration, mssql_exec). Run "
 					"the statement again -- its shape is described anew -- or call mssql_invalidate_cache() after "
 					"such DDL",
-					TypeListToString(described), TypeListToString(stream->GetColumnTypes()));
+					NamedTypeListToString(bind_data.column_names, described),
+					NamedTypeListToString(stream->GetColumnNames(), stream->GetColumnTypes()));
 			}
 			throw InvalidInputException(
 				"mssql_scan: the statement's result shape changed between bind and execution: bound (%s), got (%s)",
