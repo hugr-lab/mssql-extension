@@ -19,6 +19,7 @@
 // Build & run:
 //   make test-cpp-run
 
+#include "codec/target_string_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/identifier.hpp"
 #include "duckdb/common/limits.hpp"
@@ -259,6 +260,62 @@ void TestExecuteByHandleRequest() {
 	CHECK_EQ(fallback.sql, geometry.ExecuteByHandleBatch(7));
 }
 
+void TestExecuteSqlRequestForm() {
+	// A value goes as an RPC parameter only where DuckDB's conversion of it
+	// cannot differ from the server's; otherwise the whole call keeps the batch
+	// form and the server converts the typed literal, as before spec 083
+	// (review of #414).
+	auto IsRpc = [](const Value &v, const std::string &declarations) {
+		return BuildSqlParams(Struct({{Identifier("p"), v}}), declarations).ExecuteSqlRequest("SELECT @p").IsRpc();
+	};
+	// Of the declared family, or converted with nothing lost.
+	CHECK_EQ(IsRpc(Value("abc"), "@p varchar(5)"), true);
+	CHECK_EQ(IsRpc(Value::BLOB("abc"), "@p varbinary(10)"), true);
+	CHECK_EQ(IsRpc(Value::INTEGER(42), "@p bigint"), true);
+	CHECK_EQ(IsRpc(Value::BOOLEAN(true), "@p int"), true);
+	CHECK_EQ(IsRpc(Value("42"), "@p int"), true);
+	CHECK_EQ(IsRpc(Value::DECIMAL(int16_t(125), 3, 1), "@p decimal(10,2)"), true);
+	CHECK_EQ(IsRpc(Value::DATE(duckdb::date_t(0)), "@p datetime2(6)"), true);
+	CHECK_EQ(IsRpc(Value::DOUBLE(0.5), "@p float"), true);
+	CHECK_EQ(IsRpc(Value(LogicalType::BOOLEAN), "@p varchar(5)"), true);  // a NULL is a NULL
+	CHECK_EQ(IsRpc(Value(LogicalType::VARCHAR), "@p varbinary(10)"), true);
+	// A string declaration and a value of another type: `true` is `1` there.
+	CHECK_EQ(IsRpc(Value::BOOLEAN(true), "@p varchar(5)"), false);
+	CHECK_EQ(IsRpc(Value::TIMESTAMP(duckdb::timestamp_t(0)), "@p varchar(30)"), false);
+	CHECK_EQ(IsRpc(Value::BLOB("abc"), "@p varchar(5)"), false);
+	// A binary declaration and a string: error 257 there (no implicit conversion).
+	CHECK_EQ(IsRpc(Value("abc"), "@p varbinary(10)"), false);
+	// A lossy conversion: 12.5 into an int is 12 there, 13 by DuckDB's cast.
+	CHECK_EQ(IsRpc(Value::DECIMAL(int16_t(125), 3, 1), "@p int"), false);
+	CHECK_EQ(IsRpc(Value::DOUBLE(2.5), "@p int"), false);
+	CHECK_EQ(IsRpc(Value("12.5"), "@p int"), false);
+	// A floating-point value into another type: decimal text there, the binary
+	// value here (0.1f as a float: 0.100000001 there, 0.10000000149011612 here).
+	CHECK_EQ(IsRpc(Value::FLOAT(0.1f), "@p float"), false);
+	CHECK_EQ(IsRpc(Value::DOUBLE(0.1), "@p decimal(38,20)"), false);
+
+	// The native string types (spec 060) are VARCHARs: they take the string
+	// path, with their own declaration (no list) or a written one, and convert
+	// into another type by the same rule.
+	duckdb::mssql::codec::TargetStringType varchar_spec;
+	varchar_spec.unicode = false;
+	varchar_spec.length = 10;
+	duckdb::mssql::codec::TargetStringType nvarchar_spec;
+	nvarchar_spec.unicode = true;
+	nvarchar_spec.length = duckdb::mssql::codec::MAX_LENGTH;
+	const auto mssql_varchar = duckdb::mssql::codec::MakeTargetStringType(varchar_spec);
+	const auto mssql_nvarchar = duckdb::mssql::codec::MakeTargetStringType(nvarchar_spec);
+	const auto Native = [](const char *text, const LogicalType &type) { return Value(text).DefaultCastAs(type); };
+	CHECK_EQ(IsRpc(Native("abc", mssql_varchar), ""), true);
+	CHECK_EQ(IsRpc(Native("abc", mssql_nvarchar), ""), true);
+	CHECK_EQ(IsRpc(Native("abc", mssql_varchar), "@p varchar(10)"), true);
+	CHECK_EQ(IsRpc(Native("abc", mssql_nvarchar), "@p nvarchar(max)"), true);
+	CHECK_EQ(IsRpc(Native("42", mssql_varchar), "@p int"), true);
+	CHECK_EQ(IsRpc(Native("12.5", mssql_nvarchar), "@p int"), false);
+	CHECK_EQ(IsRpc(Native("abc", mssql_varchar), "@p varbinary(10)"), false);
+	CHECK_EQ(IsRpc(Value(mssql_varchar), "@p varchar(10)"), true);
+}
+
 }  // namespace
 
 int main() {
@@ -270,6 +327,7 @@ int main() {
 	TestBuildSqlParamsRefusals();
 	TestBuildSqlParamsCaseCollision();
 	TestExecuteByHandleRequest();
+	TestExecuteSqlRequestForm();
 	if (failures) {
 		std::cerr << failures << " failure(s)\n";
 		return 1;

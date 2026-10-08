@@ -541,21 +541,28 @@ bool AddTypedParam(tds::RpcRequestBuilder &rpc, const SqlParam &param, bool posi
 	if (!ParseDeclaredType(param.declaration, declared)) {
 		return false;
 	}
+	// A string or binary declaration takes only a value of its own family. Any
+	// other value is converted by the SERVER from its typed literal in the batch
+	// form, and DuckDB's cast does not agree with it: `true` is `1` there and
+	// `true` here, a TIMESTAMP is datetime2(7)'s text there (seven digits), a
+	// VARCHAR into varbinary is an error there (257, no implicit conversion) and
+	// its UTF-8 bytes here (review of #414).
 	if (IsCharFamily(declared.name)) {
-		AddNVarcharParam(
-			rpc, name,
-			param.value.IsNull() ? Value(LogicalType::VARCHAR) : param.value.DefaultCastAs(LogicalType::VARCHAR));
+		if (param.value.IsNull()) {
+			AddNVarcharParam(rpc, name, Value(LogicalType::VARCHAR));
+			return true;
+		}
+		if (param.value.type().id() != LogicalTypeId::VARCHAR) {
+			return false;
+		}
+		AddNVarcharParam(rpc, name, param.value);
 		return true;
 	}
 	if (IsBinaryFamily(declared.name)) {
-		Value blob(LogicalType::BLOB);
-		if (!param.value.IsNull()) {
-			auto cast = param.value.DefaultTryCastAs(LogicalType::BLOB, nullptr, true);
-			if (!cast) {
-				return false;
-			}
-			blob = std::move(*cast);
+		if (!param.value.IsNull() && param.value.type().id() != LogicalTypeId::BLOB) {
+			return false;
 		}
+		const Value blob = param.value.IsNull() ? Value(LogicalType::BLOB) : param.value;
 		const idx_t bytes = blob.IsNull() ? 0 : StringValue::Get(blob).size();
 		rpc.BeginParam(name);
 		AppendTypedValue(
@@ -582,6 +589,21 @@ bool AddTypedParam(tds::RpcRequestBuilder &rpc, const SqlParam &param, bool posi
 		auto cast = param.value.DefaultTryCastAs(col.duckdb_type, nullptr, true);
 		if (!cast) {
 			return false;
+		}
+		if (param.value.type() != col.duckdb_type) {
+			// Only a conversion that loses nothing, where DuckDB and the server
+			// cannot disagree: 12.5 into an int is 13 by DuckDB's cast and 12 by
+			// the server's, '12.5' an error there. A floating-point value is sent
+			// in the batch form as decimal text of 9 or 17 digits, which the
+			// server converts, not the binary value DuckDB's cast converts: 0.1f
+			// as a float is 0.100000001 there, 0.10000000149011612 here.
+			if (value_id == LogicalTypeId::FLOAT || value_id == LogicalTypeId::DOUBLE) {
+				return false;
+			}
+			auto back = cast->DefaultTryCastAs(param.value.type(), nullptr, true);
+			if (!back || !Value::NotDistinctFrom(*back, param.value)) {
+				return false;
+			}
 		}
 		typed = std::move(*cast);
 	}
