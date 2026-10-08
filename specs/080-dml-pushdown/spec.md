@@ -337,8 +337,7 @@ a D1 row when asked for. Until then MERGE keeps its bind-time PK requirement
 
 ### D5 — the DML switch
 
-`mssql_dml_pushdown` (BOOLEAN, `SetScope::GLOBAL`; **false** in PR 3, **true**
-from PR 4 — § 2.7, and the pattern 079 D6 used for its own setting), read in
+`mssql_dml_pushdown` (BOOLEAN, default **true**, `SetScope::GLOBAL`), read in
 `SupportsPushdown(const QueryNode &)` for the three DML nodes and in
 `SupportsPushdown(const SQLStatement &)` for CTAS. `mssql_remote_pushdown`
 cannot serve as the DML lever: 079 D6 reads it **once at ATTACH** because it
@@ -543,13 +542,20 @@ that can veto into them.
 
 **Spec 079 is already shipped through its PR E2** (`mssql_remote_pushdown`
 defaults to **true**, `mssql_settings.cpp`: "On by default since PR E2"), so
-this spec cannot borrow 079's "the setting stays off until the last PR" safety
-— the rewriter is live on every attached catalog today. `mssql_dml_pushdown`
-(D5) carries that safety instead: it ships **false** in PR 3 and flips to
-**true** in PR 4, so PR 3's pushed DML is opt-in while its suite earns trust,
-and every intermediate main behaves exactly as it does now. PRs 1 and 2 change
-the shipped path only and are on from the moment they merge, which is the
-point of putting them first.
+this spec cannot borrow 079's "the setting stays off until the last PR"
+safety: the rewriter is live on every attached catalog today, and PR 3 turns
+pushed DML on for all of them the moment it merges. `mssql_dml_pushdown`
+nonetheless ships **true** (owner, 2026-10-08) — a staged rollout was
+considered and declined. **W5's suite is the gate instead**, and that places a
+condition on PR 3 rather than on the setting: the agreement suite must be
+green through both ATTACH aliases, on every shape in D1's table, with the
+rung-3 hazards and the exactly-once assertions, **before PR 3 merges** — not
+after, and not behind a flag nobody turns on. A setting that defaults to false
+gets the suite it deserves, which is the argument for not having one. The
+switch stays as the escape hatch § 4's first risk needs (a user who hits the
+native-string divergence on a pushed DELETE), not as a rollout stage. PRs 1
+and 2 change the shipped path only and are on from the moment they merge,
+which is the point of putting them first.
 
 ## 3. Not proposed
 
