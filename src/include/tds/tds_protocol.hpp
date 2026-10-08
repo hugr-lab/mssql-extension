@@ -210,6 +210,10 @@ public:
 	//   sql - SQL statement to execute
 	//   max_packet_size - maximum TDS packet size
 	//   transaction_descriptor - 8-byte transaction descriptor (nullptr = no active transaction)
+	// Spec 083: an RPC request -- ALL_HEADERS (transaction descriptor) followed
+	// by `body` (RPCReqBatch) -- fragmented to the negotiated packet size.
+	static std::vector<TdsPacket> BuildRpcMultiPacket(const std::vector<uint8_t> &body, size_t max_packet_size,
+													  const uint8_t *transaction_descriptor);
 	static std::vector<TdsPacket> BuildSqlBatchMultiPacket(const std::string &sql,
 														   size_t max_packet_size = TDS_DEFAULT_PACKET_SIZE,
 														   const uint8_t *transaction_descriptor = nullptr);

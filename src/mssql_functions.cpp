@@ -7,6 +7,7 @@
 #include "catalog/mssql_table_entry.hpp"
 #include "catalog/mssql_transaction.hpp"
 #include "catalog/mssql_transaction_metadata.hpp"
+#include "codec/sql_server_type_text.hpp"
 #include "codec/target_string_type.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
@@ -489,7 +490,12 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 			shape.reason = "sp_describe_first_result_set reported a column without a type";
 			return shape;
 		}
-		string base = StringUtil::Lower(type_name.substr(0, type_name.find('(')));
+		// Only the base name: the describe reports length, precision and scale
+		// in columns of their own. A malformed name leaves `base` as written up
+		// to the parenthesis, which the mapping below then refuses by name.
+		mssql::codec::SqlServerTypeText type_text;
+		(void)mssql::codec::ParseSqlServerTypeText(type_name, type_text);
+		const string &base = type_text.base;
 		auto max_length = static_cast<int16_t>(std::atoi(row[len_idx].c_str()));
 		auto precision = static_cast<uint8_t>(std::atoi(row[prec_idx].c_str()));
 		auto scale = static_cast<uint8_t>(std::atoi(row[scale_idx].c_str()));
@@ -945,12 +951,12 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 				// only from the one session that owns it, and a second global
 				// state over this same (shared) bind data needs a way to run.
 				bind_data.fallback_sql = bind_data.execute_sql;
-				bind_data.execute_sql = params.ExecuteByHandleBatch(handle);
+				bind_data.execute_sql = params.ExecuteByHandleRequest(handle);
 				// Said where the pair is set: InitGlobal falls back to fallback_sql
 				// whenever it cannot claim the session, and execute_sql is by then
 				// a handle only that session can use. Setting one without the other
 				// would send that handle down a pooled connection.
-				D_ASSERT(!bind_data.fallback_sql.empty());
+				D_ASSERT(!bind_data.fallback_sql.sql.empty());
 				MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: prepared handle %d", (int)handle);
 			} else {
 				// The server took the statement but did not settle its shape (a
@@ -1111,7 +1117,7 @@ unique_ptr<FunctionData> MSSQLScanParamsBind(ClientContext &context, TableFuncti
 	bind_data->prepared = ReadPreparedOption(input);
 	ValidateScanContext(context, bind_data->context_name);
 	auto params = mssql::BuildSqlParams(input.inputs[2], declarations_override);
-	bind_data->execute_sql = params.ExecuteSqlBatch(bind_data->query);
+	bind_data->execute_sql = params.ExecuteSqlRequest(bind_data->query);
 	bind_data->wants_column_types = HasColumnTypes(input);
 	BindDescribedScan(context, *bind_data, params, return_types, names);
 	ApplyColumnTypes(context, input, *bind_data, return_types);
@@ -1153,7 +1159,7 @@ unique_ptr<FunctionData> MSSQLScanParamsUnsafeBind(ClientContext &context, Table
 	}
 	ValidateScanContext(context, bind_data->context_name);
 	auto params = mssql::BuildSqlParams(input.inputs[2], declarations_override);
-	bind_data->execute_sql = params.ExecuteSqlBatch(bind_data->query);
+	bind_data->execute_sql = params.ExecuteSqlRequest(bind_data->query);
 	BindTrustedShape(context, input, "mssql_scan_params_unsafe", *bind_data, return_types, names);
 	return std::move(bind_data);
 }
@@ -1229,7 +1235,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 			// it back to the session, not to the pool.
 			stream = executor.ExecuteOn(context, bind_data.prepared_session->connection, bind_data.execute_sql, false,
 										false);
-		} else if (lost_claim && !bind_data.fallback_sql.empty()) {
+		} else if (lost_claim && !bind_data.fallback_sql.sql.empty()) {
 			// Run the ad-hoc batch on a pooled connection of our own. Same rows, no
 			// handle, one plan compilation more -- which beats failing a query the
 			// default path would have served.
@@ -1577,7 +1583,7 @@ static bool ExecSqlMayChangeSchema(const string &sql) {
 // of mssql_exec, shared with mssql_exec_params. `statement` is the caller's
 // text for the DDL heuristic -- for mssql_exec_params the batch wraps it in
 // sp_executesql, whose name would otherwise trip the EXEC keyword every time.
-static int64_t RunExecBatch(ClientContext &client_context, const string &context_name, const string &sql,
+static int64_t RunExecBatch(ClientContext &client_context, const string &context_name, const tds::Request &sql,
 							const string &statement, const char *function_name) {
 	// Get the MSSQL catalog (Spec 047: per-catalog ownership)
 	MSSQLCatalog *catalog_ptr = nullptr;
@@ -1657,8 +1663,8 @@ static int64_t RunExecBatch(ClientContext &client_context, const string &context
 				// Review of #382: the shared cache is the caller's to invalidate
 				// (the setting's contract), but inside a transaction the
 				// transaction's own lookups must not keep trusting it -- the
-				// pinned connection now sees DDL the shared cache does not, and a
-				// rowid key discovered on it would be written to a shared entry.
+				// pinned connection now sees DDL the shared cache does not, and
+				// what it loads would be published into the shared cache.
 				catalog.NoteTransactionChangeLocally(client_context);
 			}
 		}
@@ -1732,8 +1738,10 @@ static void MSSQLExecParamsExecute(DataChunk &args, ExpressionState &state, Vect
 		string context_name = bind_data.context_name.empty() ? context_val.ToString() : bind_data.context_name;
 		string statement = sql_val.ToString();
 		auto params = mssql::BuildSqlParams(params_val, decl_val.IsNull() ? string() : decl_val.ToString());
-		string batch = params.ExecuteSqlBatch(statement);
-		MSSQL_FN_DEBUG_LOG(1, "mssql_exec_params: context=%s, batch=%s", context_name.c_str(), batch.c_str());
+		// Spec 083: an RPC call of sp_executesql, the values bound as typed
+		// parameters -- no outer batch for the server to compile per row.
+		const tds::Request batch = params.ExecuteSqlRequest(statement);
+		MSSQL_FN_DEBUG_LOG(1, "mssql_exec_params: context=%s, batch=%s", context_name.c_str(), batch.sql.c_str());
 		out[i] = RunExecBatch(client_context, context_name, batch, statement, "mssql_exec_params");
 	}
 }

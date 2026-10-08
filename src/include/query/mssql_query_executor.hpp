@@ -22,7 +22,7 @@ public:
 	// Execute a SQL query and return a streaming result
 	// Acquires connection from pool, sends SQL_BATCH, returns result stream
 	// Throws on connection failure or initial protocol errors
-	unique_ptr<MSSQLResultStream> Execute(ClientContext &context, const std::string &sql);
+	unique_ptr<MSSQLResultStream> Execute(ClientContext &context, const tds::Request &request);
 
 	//! Spec 075: run `sql` on a connection the caller already holds -- the
 	//! transaction's pinned one, or the session a prepared handle lives in. When
@@ -30,7 +30,7 @@ public:
 	//! the caller keeps ownership; when true the stream returns it to the pool as
 	//! the pool-acquired path does.
 	unique_ptr<MSSQLResultStream> ExecuteOn(ClientContext &context, std::shared_ptr<tds::TdsConnection> connection,
-											const std::string &sql, bool transaction_pinned, bool release_to_pool);
+											const tds::Request &request, bool transaction_pinned, bool release_to_pool);
 
 	// Validate that the context exists
 	void ValidateContext(ClientContext &context);

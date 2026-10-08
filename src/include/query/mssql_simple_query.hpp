@@ -86,10 +86,10 @@ public:
 	using RowCallback = std::function<bool(const std::vector<std::string> &values)>;
 
 	// Execute a query and return all results as strings
-	static SimpleQueryResult Execute(tds::TdsConnection &connection, const std::string &sql, int timeout_ms = 30000);
+	static SimpleQueryResult Execute(tds::TdsConnection &connection, const tds::Request &sql, int timeout_ms = 30000);
 
 	// Execute a query with row callback (for large results)
-	static SimpleQueryResult ExecuteWithCallback(tds::TdsConnection &connection, const std::string &sql,
+	static SimpleQueryResult ExecuteWithCallback(tds::TdsConnection &connection, const tds::Request &sql,
 												 RowCallback callback, int timeout_ms = 30000);
 
 	//! The same, with the ordinal of the result set each row belongs to (0 for
@@ -97,11 +97,11 @@ public:
 	//! read off this: rows are routed by which statement produced them, never
 	//! by their width (spec 076 W2, review of #345).
 	using RowSetCallback = std::function<bool(size_t result_set, const std::vector<std::string> &values)>;
-	static SimpleQueryResult ExecuteWithSetCallback(tds::TdsConnection &connection, const std::string &sql,
+	static SimpleQueryResult ExecuteWithSetCallback(tds::TdsConnection &connection, const tds::Request &sql,
 													RowSetCallback callback, int timeout_ms = 30000);
 
 	// Execute a query and return single scalar value
-	static std::string ExecuteScalar(tds::TdsConnection &connection, const std::string &sql, int timeout_ms = 30000);
+	static std::string ExecuteScalar(tds::TdsConnection &connection, const tds::Request &sql, int timeout_ms = 30000);
 };
 
 }  // namespace duckdb

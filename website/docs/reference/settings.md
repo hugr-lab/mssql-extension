@@ -26,7 +26,7 @@ sidebar_position: 1
 
 | Setting | Type | Default | Range | Description |
 |---|---|---|---|---|
-| `mssql_scan_parameterize_filters` | BOOLEAN | true | - | Send the constants of a pushed filter as `sp_executesql` parameters, declared from the column's SQL Server type, so SQL Server keeps one plan per filter shape instead of one per distinct value set. `false` restores literal SQL (the escape hatch for parameter sniffing). |
+| `mssql_scan_parameterize_filters` | BOOLEAN | true | - | Send the constants of a pushed filter as `sp_executesql` parameters (an RPC call with typed values), declared from the column's SQL Server type, so SQL Server keeps one plan per filter shape instead of one per distinct value set. `false` restores literal SQL (the escape hatch for parameter sniffing). |
 
 ### Statistics Settings
 

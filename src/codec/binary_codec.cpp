@@ -174,7 +174,11 @@ void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duc
 }
 
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
-	auto blob = string_t(value.GetValueUnsafe<std::string>());
+	// A reference to the Value's own storage: a string_t over a temporary
+	// std::string pointed into freed memory past 12 bytes (spec 083 review --
+	// unreachable until RPC parameters encoded blobs from a Value).
+	const auto &bytes = StringValue::Get(value);
+	auto blob = string_t(bytes.data(), static_cast<uint32_t>(bytes.size()));
 	if (col.IsPLPType()) {
 		tds::encoding::BCPRowEncoder::EncodeBinaryPLP(buf, blob);
 	} else {

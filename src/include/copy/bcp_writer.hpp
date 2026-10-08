@@ -56,6 +56,11 @@ public:
 	// BCP Protocol Operations
 	//===----------------------------------------------------------------------===//
 
+	//! TYPE_INFO of `col`: the token and its type-specific metadata, exactly as
+	//! COLMETADATA carries it. Shared with RPC parameters (spec 083), whose
+	//! TYPE_INFO has the same layout.
+	static void WriteTypeInfo(vector<uint8_t> &buffer, const BCPColumnMetadata &col);
+
 	// Write COLMETADATA token to start the bulk load
 	// Must be called once before any WriteRows calls
 	// @throws IOException on network error

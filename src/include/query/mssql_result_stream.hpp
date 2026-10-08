@@ -50,7 +50,8 @@ public:
 	// query_timeout_seconds: query execution timeout (0 = no timeout, default: 30)
 	// reset_on_release: `mssql_reset_connection`, resolved on the client thread
 	//                   for the same reason transaction_pinned is (issue #178).
-	MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const string &sql, const string &context_name,
+	MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const tds::Request &request,
+					  const string &context_name,
 					  weak_ptr<tds::ConnectionPool> pool_handle = weak_ptr<tds::ConnectionPool>(),
 					  bool transaction_pinned = false, int query_timeout_seconds = 30,
 					  bool reset_on_release = tds::DEFAULT_RESET_CONNECTION);
@@ -204,6 +205,9 @@ private:
 
 	// Query
 	string sql_;
+	//! Spec 083: the RPC body when the request is a procedure call; `sql_` then
+	//! describes it.
+	tds::Request request_;
 
 	// State
 	MSSQLResultStreamState state_;

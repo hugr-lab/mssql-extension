@@ -123,6 +123,7 @@ set(EXTENSION_SOURCES
     # foundational dispatch helpers + per-family stubs; family bodies are
     # populated in Phase 3 (US1 Integer MVP) onwards.
     src/codec/type_family.cpp
+    src/codec/sql_server_type_text.cpp
     src/codec/staging/column_staging.cpp
     src/codec/staging/column_ops.cpp
     src/codec/write_column_ops.cpp
@@ -144,6 +145,7 @@ set(EXTENSION_SOURCES
     src/tds/tds_packet.cpp
     src/tds/tds_socket.cpp
     src/tds/tds_protocol.cpp
+    src/tds/tds_rpc.cpp
     src/tds/tds_connection.cpp
     src/tds/tds_connection_pool.cpp
     src/tds/tds_column_metadata.cpp

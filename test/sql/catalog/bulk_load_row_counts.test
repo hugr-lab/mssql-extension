@@ -1,0 +1,119 @@
+# name: test/sql/catalog/bulk_load_row_counts.test
+# description: the bulk loads read objects and columns as two result sets, row counts once per object (spec 084 D1) -- from one DMV pass when unfiltered, from OBJECTPROPERTYEX when filtered
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS blr (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('blr', $$
+IF OBJECT_ID('blr_s.Counted', 'U') IS NOT NULL DROP TABLE blr_s.Counted;
+IF OBJECT_ID('blr_s.Wide', 'U') IS NOT NULL DROP TABLE blr_s.Wide;
+IF OBJECT_ID('blr_s.CountedView', 'V') IS NOT NULL DROP VIEW blr_s.CountedView;
+IF SCHEMA_ID('blr_s') IS NULL EXEC('CREATE SCHEMA blr_s');
+$$);
+
+statement ok
+SELECT mssql_exec('blr', $$
+CREATE TABLE blr_s.Counted (id int PRIMARY KEY, v nvarchar(20));
+INSERT INTO blr_s.Counted SELECT value, N'x' FROM GENERATE_SERIES(1, 777);
+CREATE TABLE blr_s.Wide (c3 int, c1 int, c2 varchar(5));
+$$);
+
+statement ok
+SELECT mssql_exec('blr', 'CREATE VIEW blr_s.CountedView AS SELECT id FROM blr_s.Counted');
+
+# --- Whole catalog, unfiltered: the row counts come from the DMV pass ---------
+statement ok
+SELECT mssql_invalidate_cache('blr');
+
+statement ok
+SELECT mssql_preload_catalog('blr');
+
+query II
+EXPLAIN SELECT * FROM blr.blr_s.Counted;
+----
+physical_plan	<REGEX>:.*~777 rows.*
+
+# Columns in column_id order, whatever order the server sent them in.
+query I
+SELECT column_name FROM duckdb_columns() WHERE database_name = 'blr' AND table_name = 'Wide' ORDER BY column_index;
+----
+c3
+c1
+c2
+
+# The view is listed with the tables (the catalog's own convention); it has no
+# partition rows, so its count takes the OBJECTPROPERTYEX branch: 0.
+query II
+SELECT table_name, estimated_size FROM duckdb_tables() WHERE database_name = 'blr' AND schema_name = 'blr_s' ORDER BY table_name;
+----
+Counted	777
+CountedView	0
+Wide	0
+
+# --- One schema --------------------------------------------------------------
+statement ok
+SELECT mssql_invalidate_cache('blr');
+
+query I
+SELECT mssql_preload_catalog('blr', 'blr_s');
+----
+Preloaded schema 'blr_s': 3 tables, 6 columns
+
+query II
+EXPLAIN SELECT * FROM blr.blr_s.Counted;
+----
+physical_plan	<REGEX>:.*~777 rows.*
+
+statement ok
+DETACH blr;
+
+# --- Whole catalog, filtered: OBJECTPROPERTYEX per object, only what matches --
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS blf (TYPE mssql, schema_filter '^blr_s$', table_filter '^Count');
+
+statement ok
+SELECT mssql_preload_catalog('blf');
+
+query II
+SELECT table_name, estimated_size FROM duckdb_tables() WHERE database_name = 'blf' ORDER BY table_name;
+----
+Counted	777
+CountedView	0
+
+query II
+EXPLAIN SELECT * FROM blf.blr_s.Counted;
+----
+physical_plan	<REGEX>:.*~777 rows.*
+
+# One schema, filtered: the LIKE goes into both statements, the regex after.
+statement ok
+SELECT mssql_invalidate_cache('blf');
+
+query I
+SELECT mssql_preload_catalog('blf', 'blr_s');
+----
+Preloaded schema 'blr_s': 2 tables, 3 columns
+
+statement ok
+DETACH blf;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS blr (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('blr', 'DROP VIEW blr_s.CountedView; DROP TABLE blr_s.Counted; DROP TABLE blr_s.Wide; DROP SCHEMA blr_s;');
+
+statement ok
+DETACH blr;

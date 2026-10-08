@@ -510,10 +510,8 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntryInTransaction(ClientContext &c
 	// 4. The shared METADATA cache: committed state, filled by an autocommit
 	//    load, a preload, or what an earlier transaction published at its end
 	//    (issue #383) -- served without a round trip. The entry built from it goes
-	//    into THIS transaction's layer, not entries_ (review of #386): its
-	//    rowid key may still be discovered, and that discovery runs on the
-	//    pinned connection, whose failure an entry caches for good -- it must
-	//    die with the transaction, not refuse every other session's UPDATE.
+	//    into THIS transaction's layer, not entries_ (review of #386): an
+	//    entry built inside a transaction lives and dies with it.
 	if (!metadata.IsChanged(schema_name, name)) {
 		MSSQLTableMetadata cached_meta;
 		if (catalog.GetMetadataCache().TryGetLoadedTableMetadata(schema_name, name, cached_meta)) {
@@ -605,6 +603,13 @@ void MSSQLTableSet::ScanInTransaction(ClientContext &context, const std::functio
 }
 
 shared_ptr<MSSQLTableEntry> MSSQLTableSet::CreateTableEntry(const MSSQLTableMetadata &metadata) {
+	// An entry is built only from metadata whose columns AND key are loaded
+	// (spec 084 D5): a listing can copy a slot another thread's single-table
+	// load has emptied and not refilled yet. Every caller treats null as "not
+	// here".
+	if (metadata.columns_load_state != CacheLoadState::LOADED || !metadata.pk_loaded) {
+		return nullptr;
+	}
 	// Spec 052: make_shared_ptr (DuckDB's shared_ptr wrapper) so the entry is
 	// owned via shared_ptr from the moment of construction. Required for
 	// enable_shared_from_this to work in MSSQLTableEntry::GetScanFunction's

@@ -1223,6 +1223,49 @@ std::vector<TdsPacket> TdsProtocol::BuildSqlBatchMultiPacket(const std::string &
 	return packets;
 }
 
+std::vector<TdsPacket> TdsProtocol::BuildRpcMultiPacket(const std::vector<uint8_t> &body, size_t max_packet_size,
+														const uint8_t *transaction_descriptor) {
+	// ALL_HEADERS exactly as for a batch: TotalLength 22, one Transaction
+	// Descriptor header (18 bytes: length, type 0x0002, descriptor, outstanding
+	// request count 1). An RPC inside a transaction must carry the descriptor
+	// just as a batch must (error 3989 otherwise).
+	std::vector<uint8_t> payload;
+	payload.reserve(22 + body.size());
+	const uint32_t total_length = 22;
+	const uint32_t header_length = 18;
+	for (int i = 0; i < 4; i++) {
+		payload.push_back(static_cast<uint8_t>((total_length >> (8 * i)) & 0xFF));
+	}
+	for (int i = 0; i < 4; i++) {
+		payload.push_back(static_cast<uint8_t>((header_length >> (8 * i)) & 0xFF));
+	}
+	payload.push_back(0x02);
+	payload.push_back(0x00);
+	for (int i = 0; i < 8; i++) {
+		payload.push_back(transaction_descriptor ? transaction_descriptor[i] : 0x00);
+	}
+	payload.push_back(0x01);
+	payload.push_back(0x00);
+	payload.push_back(0x00);
+	payload.push_back(0x00);
+	payload.insert(payload.end(), body.begin(), body.end());
+
+	std::vector<TdsPacket> packets;
+	const size_t max_payload = max_packet_size - TDS_HEADER_SIZE;
+	size_t offset = 0;
+	do {
+		const size_t chunk_size = std::min(max_payload, payload.size() - offset);
+		TdsPacket packet(PacketType::RPC);
+		if (offset + chunk_size < payload.size()) {
+			packet.SetEndOfMessage(false);
+		}
+		packet.AppendPayload(payload.data() + offset, chunk_size);
+		packets.push_back(std::move(packet));
+		offset += chunk_size;
+	} while (offset < payload.size());
+	return packets;
+}
+
 std::vector<TdsPacket> TdsProtocol::BuildBulkLoadMultiPacket(const std::vector<uint8_t> &payload,
 															 size_t max_packet_size) {
 	std::vector<TdsPacket> packets;

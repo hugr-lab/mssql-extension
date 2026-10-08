@@ -169,13 +169,15 @@ ParsedTokenType TokenParser::TryParseNext() {
 		case TokenType::RETURNVALUE:
 			// No length field either ([MS-TDS] 2.2.7.17: ParamOrdinal, ParamName,
 			// Status, UserType, Flags, TypeInfo, Value) -- its size is only knowable
-			// by parsing TypeInfo. It cannot be skipped, and it cannot arrive: the
-			// server sends it only in reply to an RPC request (packet type 3), and
-			// this extension sends SQL_BATCH only. Verified: an OUTPUT parameter over
-			// SQL_BATCH stays server-side and comes back as an ordinary row. So it
-			// fails BY NAME here rather than mis-skipping silently as it used to,
-			// and this arm is where TypeInfo parsing goes if RPC is ever added.
-			parse_error_ = "RETURNVALUE (0xAC) token: sent only for RPC requests, which this extension does not issue";
+			// by parsing TypeInfo. It cannot be skipped, and it does not arrive: the
+			// server sends it only for an OUTPUT parameter of an RPC request (packet
+			// type 3), and the extension's RPC calls (spec 083: sp_executesql) bind
+			// no OUTPUT parameter. Verified: an OUTPUT parameter over SQL_BATCH stays
+			// server-side and comes back as an ordinary row. So it fails BY NAME here
+			// rather than mis-skipping silently as it used to, and this arm is where
+			// TypeInfo parsing goes when OUTPUT parameters are added.
+			parse_error_ =
+				"RETURNVALUE (0xAC) token: sent only for RPC OUTPUT parameters, which this extension does not bind";
 			state_ = ParserState::Error;
 			return ParsedTokenType::None;
 

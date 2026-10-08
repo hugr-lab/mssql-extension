@@ -1321,6 +1321,16 @@ void TdsConnection::ClearTransactionDescriptor() {
 }
 
 bool TdsConnection::ExecuteBatch(const std::string &sql, const char *reason) {
+	return SendRequest(&sql, nullptr, reason);
+}
+
+bool TdsConnection::ExecuteRequest(const Request &request, const char *reason) {
+	return request.IsRpc() ? SendRequest(&request.sql, &request.rpc_body, reason)
+						   : SendRequest(&request.sql, nullptr, reason);
+}
+
+bool TdsConnection::SendRequest(const std::string *sql_p, const std::vector<uint8_t> *rpc_body, const char *reason) {
+	const std::string &sql = *sql_p;
 	MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: starting, state=%d, socket_connected=%d", static_cast<int>(state_.load()),
 						 socket_ ? socket_->IsConnected() : -1);
 
@@ -1350,7 +1360,9 @@ bool TdsConnection::ExecuteBatch(const std::string &sql, const char *reason) {
 	// This was received via ENVCHANGE during LOGIN7
 	// Pass the transaction descriptor if one is set (from BEGIN TRANSACTION response)
 	const uint8_t *txn_desc = has_transaction_descriptor_ ? transaction_descriptor_ : nullptr;
-	std::vector<TdsPacket> packets = TdsProtocol::BuildSqlBatchMultiPacket(sql, negotiated_packet_size_, txn_desc);
+	std::vector<TdsPacket> packets =
+		rpc_body ? TdsProtocol::BuildRpcMultiPacket(*rpc_body, negotiated_packet_size_, txn_desc)
+				 : TdsProtocol::BuildSqlBatchMultiPacket(sql, negotiated_packet_size_, txn_desc);
 
 	MSSQL_CONN_DEBUG_LOG(1, "ExecuteBatch: using transaction descriptor: %s",
 						 has_transaction_descriptor_ ? "yes" : "no");

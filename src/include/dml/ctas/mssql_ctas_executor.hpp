@@ -9,6 +9,7 @@
 #include "dml/insert/mssql_insert_target.hpp"
 #include "tds/tds_connection.hpp"
 #include "tds/tds_connection_pool.hpp"
+#include "tds/tds_request.hpp"
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -227,7 +228,7 @@ private:
 	//! or a pool connection through the catalog (autocommitting).
 	void RunDDL(ClientContext &context, const string &sql);
 	//! A one-row existence probe; on the pinned connection in a transaction.
-	bool ProbeExists(ClientContext &context, const string &sql, const char *what);
+	bool ProbeExists(ClientContext &context, const tds::Request &sql, const char *what);
 };
 
 //===----------------------------------------------------------------------===//

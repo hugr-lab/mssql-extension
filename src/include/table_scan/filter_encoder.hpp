@@ -169,7 +169,7 @@ public:
 	 * Spec 076: the same, with the SQL Server column types and a parameter
 	 * sink. With `params` non-null every constant is rendered as @pN and
 	 * registered there, declared from the column it is compared with; the
-	 * caller wraps the statement with SqlParamSet::ExecuteSqlBatch.
+	 * caller wraps the statement with SqlParamSet::ExecuteSqlRequest.
 	 */
 	//! `division_by_zero_errors` is DuckDB's error_on_division_by_zero as the
 	//! asking session has it; it decides whether `%` may be pushed at all (see

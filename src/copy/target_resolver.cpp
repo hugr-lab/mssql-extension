@@ -454,10 +454,10 @@ static MSSQLIndexKind ShapeOfCreatedTable(const MSSQLTableOptions &options) {
 // the catalog's metadata queries do (#334). A #temp target is named through
 // tempdb, where its catalog rows live; sp_executesql runs in the caller's
 // session, so it sees the session's temp tables.
-static string ObjectProbe(const string &statement, const BCPCopyTarget &target) {
+static tds::Request ObjectProbe(const string &statement, const BCPCopyTarget &target) {
 	const string object_name =
 		target.IsTempTable() ? "tempdb.." + target.GetBracketedTable() : target.GetFullyQualifiedName();
-	return mssql::BuildExecuteSqlBatch(statement, "@o nvarchar(776)", {{"o", mssql::NVarcharLiteral(object_name)}});
+	return mssql::BuildExecuteSqlRequest(statement, "@o nvarchar(776)", {{"o", object_name}});
 }
 
 TableLoadShape TargetResolver::QueryTableShape(tds::TdsConnection &conn, const BCPCopyTarget &target) {
@@ -472,7 +472,7 @@ TableLoadShape TargetResolver::QueryTableShape(tds::TdsConnection &conn, const B
 	// serialise and (their COMMIT deferred to Finalize) hang client-side.
 	// Same round trip, one more scalar subquery.
 	const string sys = target.IsTempTable() ? "tempdb.sys" : "sys";
-	const string sql =
+	const tds::Request sql =
 		ObjectProbe("SELECT ISNULL((SELECT TOP 1 i.type FROM " + sys +
 						".indexes i "
 						"WHERE i.object_id = OBJECT_ID(@o) AND i.index_id <= 1), 0) AS index_type, "
@@ -510,7 +510,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 	// under 'auto' (spec 057 step 1). No extra round trip, the same trick spec 049
 	// used for the catalog's index_kind.
 	// Temp tables are in tempdb, and so are their indexes.
-	const string object_sql = ObjectProbe(
+	const tds::Request object_sql = ObjectProbe(
 		"SELECT OBJECT_ID(@o) AS obj_id, "
 		"OBJECTPROPERTY(OBJECT_ID(@o), 'IsView') AS is_view, "
 		"(SELECT TOP 1 i.type FROM " +
@@ -519,7 +519,7 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 			" WHERE i.object_id = OBJECT_ID(@o) AND i.index_id <= 1) AS index_type",
 		target);
 
-	DebugLog(3, "ValidateTarget SQL: %s", object_sql.c_str());
+	DebugLog(3, "ValidateTarget SQL: %s", object_sql.sql.c_str());
 
 	// Execute check
 	auto result = MSSQLSimpleQuery::Execute(conn, object_sql);
@@ -825,7 +825,7 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 												 BCPCopyConfig &config, const vector<LogicalType> &source_types,
 												 const vector<string> &source_names) {
 	// Query the target table's column information
-	const string column_sql = ObjectProbe(
+	const tds::Request column_sql = ObjectProbe(
 		"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
 		"type_name, c.max_length, c.precision, c.scale "
 		"FROM " +
@@ -835,7 +835,7 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 			"ORDER BY c.column_id",
 		target);
 
-	DebugLog(3, "ValidateExistingTableSchema SQL: %s", column_sql.c_str());
+	DebugLog(3, "ValidateExistingTableSchema SQL: %s", column_sql.sql.c_str());
 
 	auto result = MSSQLSimpleQuery::Execute(conn, column_sql);
 	if (!result.success) {
@@ -1208,7 +1208,7 @@ BCPColumnMetadata BCPColumnMetadata::FromServerColumn(const string &name, const 
 vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::TdsConnection &conn,
 																		 const BCPCopyTarget &target) {
 	// Query the target table's column information
-	const string column_sql = ObjectProbe(
+	const tds::Request column_sql = ObjectProbe(
 		"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
 		"type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
 		"ISNULL(c.collation_name, '') AS collation_name "
@@ -1219,7 +1219,7 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 			"ORDER BY c.column_id",
 		target);
 
-	DebugLog(3, "GetExistingTableColumnMetadata SQL: %s", column_sql.c_str());
+	DebugLog(3, "GetExistingTableColumnMetadata SQL: %s", column_sql.sql.c_str());
 
 	auto result = MSSQLSimpleQuery::Execute(conn, column_sql);
 	if (!result.success) {

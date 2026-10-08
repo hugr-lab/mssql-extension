@@ -1,4 +1,5 @@
 #include "catalog/mssql_statistics.hpp"
+#include "duckdb/common/exception.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "query/mssql_sql_params.hpp"
 
@@ -10,16 +11,18 @@ namespace duckdb {
 // SQL Query for Row Count from DMV
 //===----------------------------------------------------------------------===//
 
-// Query sys.dm_db_partition_stats to get approximate row count
-// index_id IN (0, 1) captures both heaps (0) and clustered indexes (1)
+// The table's row count, as the catalog's own metadata queries read it:
+// OBJECTPROPERTYEX(id, 'Cardinality') answers out of object metadata (3 to ~110
+// logical reads, specs 071 / 084), 0 for an empty table, NULL -> 0 for a view.
+//
+// Until spec 083 this read sys.dm_db_partition_stats, whose column is
+// `row_count`, through `p.rows` (sys.partitions' name): every call failed with
+// error 207, ExecuteScalar handed back "", and a 0 was cached -- since spec 008.
+// The DMV was also the expensive source: a scan of sysrowsets whatever the
+// filter (spec 071 F1).
 static const char *ROW_COUNT_SQL_TEMPLATE = R"(
-SELECT ISNULL(SUM(p.rows), 0) AS row_count
-FROM sys.dm_db_partition_stats p
-INNER JOIN sys.objects o ON p.object_id = o.object_id
-INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
-WHERE s.name = @s
-  AND o.name = @t
-  AND p.index_id IN (0, 1)
+SELECT CAST(ISNULL(OBJECTPROPERTYEX(OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t)), 'Cardinality'), 0) AS BIGINT)
+    AS row_count
 )";
 
 MSSQLStatisticsProvider::MSSQLStatisticsProvider(int64_t cache_ttl_seconds) : cache_ttl_seconds_(cache_ttl_seconds) {}
@@ -159,22 +162,26 @@ idx_t MSSQLStatisticsProvider::FetchRowCount(tds::TdsConnection &connection, con
 	// Spec 075 W4 (#334): the names travel as sp_executesql parameters, so one
 	// plan serves every table; the quoting the old snprintf path did by hand
 	// is NVarcharLiteral's.
-	std::string sql = mssql::BuildExecuteSqlBatch(
-		ROW_COUNT_SQL_TEMPLATE, "@s sysname, @t sysname",
-		{{"s", mssql::NVarcharLiteral(schema_name)}, {"t", mssql::NVarcharLiteral(table_name)}});
+	const tds::Request sql = mssql::BuildExecuteSqlRequest(ROW_COUNT_SQL_TEMPLATE, "@s sysname, @t sysname",
+														   {{"s", schema_name}, {"t", table_name}});
 
-	// Execute query and get result
-	std::string result = MSSQLSimpleQuery::ExecuteScalar(connection, sql);
-
-	if (result.empty()) {
+	// A failed query throws rather than reading as 0: GetRowCount would cache
+	// the 0 as a fresh count. GetStorageInfo catches and falls back to the
+	// count the entry carries.
+	auto result_set = MSSQLSimpleQuery::Execute(connection, sql);
+	if (result_set.HasError()) {
+		throw IOException("MSSQL: row count of %s.%s failed: %s", schema_name, table_name, result_set.DescribeError());
+	}
+	if (result_set.rows.empty() || result_set.rows[0].empty() || result_set.rows[0][0].empty()) {
 		return 0;
 	}
+	const std::string &result = result_set.rows[0][0];
 
 	try {
 		return static_cast<idx_t>(std::stoull(result));
 	} catch (...) {
-		// If parsing fails, return 0
-		return 0;
+		// A BIGINT that does not parse is a broken result, not an empty table.
+		throw IOException("MSSQL: row count of %s.%s is not a number: '%s'", schema_name, table_name, result);
 	}
 }
 

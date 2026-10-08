@@ -1,0 +1,92 @@
+# name: test/sql/ctas/ctas_existence_checks.test
+# description: CTAS's own table and schema existence checks (spec 084 D3) -- reached only for objects the catalog does not know, so they are created here behind its back
+# group: [ctas]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# The checks are parameterized sys.objects / SCHEMA_ID lookups since spec 084
+# (they were INFORMATION_SCHEMA queries with the names as literals). They must
+# answer as INFORMATION_SCHEMA did: TABLES lists views too.
+#
+# When the catalog already has an entry for the name, DuckDB answers IF NOT
+# EXISTS and the duplicate CREATE itself and these checks never run. So every
+# object below is created with mssql_exec AFTER the catalog has listed the
+# schema: mssql_exec does not invalidate the cache by default, the catalog says
+# "no such table", and CTAS asks the server.
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cex (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('cex', $$
+IF OBJECT_ID('dbo.CtasExistView', 'V') IS NOT NULL DROP VIEW dbo.CtasExistView;
+IF OBJECT_ID('dbo.[ctas]]odd.name]', 'U') IS NOT NULL DROP TABLE dbo.[ctas]]odd.name];
+IF OBJECT_ID('ctas_gone.t', 'U') IS NOT NULL DROP TABLE ctas_gone.t;
+IF SCHEMA_ID('ctas_gone') IS NOT NULL DROP SCHEMA ctas_gone;
+$$);
+
+statement ok
+SELECT mssql_invalidate_cache('cex');
+
+# The catalog lists dbo now, without the objects created below.
+statement ok
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'cex' AND schema_name = 'dbo';
+
+statement ok
+SELECT mssql_exec('cex', 'CREATE VIEW dbo.CtasExistView AS SELECT 1 AS v');
+
+# A view holds the name: TableExists says so. IF NOT EXISTS skips...
+statement ok
+CREATE TABLE IF NOT EXISTS cex.dbo.CtasExistView AS SELECT 2 AS v;
+
+query I
+SELECT * FROM mssql_scan('cex', 'SELECT v FROM dbo.CtasExistView');
+----
+1
+
+# ...and a plain CTAS is refused by the extension's own check, not the server.
+statement error
+CREATE TABLE cex.dbo.CtasExistView AS SELECT 2 AS v;
+----
+CTAS failed: table
+
+# A name with ] and . is found through QUOTENAME.
+statement ok
+SELECT mssql_exec('cex', 'CREATE TABLE dbo.[ctas]]odd.name] (v int); INSERT INTO dbo.[ctas]]odd.name] VALUES (1);');
+
+statement ok
+CREATE TABLE IF NOT EXISTS cex.dbo."ctas]odd.name" AS SELECT 2 AS v;
+
+query I
+SELECT * FROM mssql_scan('cex', 'SELECT v FROM dbo.[ctas]]odd.name]');
+----
+1
+
+# A schema the catalog knows but the server has dropped: SchemaExists says so.
+statement ok
+SELECT mssql_exec('cex', 'EXEC(''CREATE SCHEMA ctas_gone'')');
+
+statement ok
+SELECT mssql_invalidate_cache('cex');
+
+statement ok
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'cex' AND schema_name = 'ctas_gone';
+
+statement ok
+SELECT mssql_exec('cex', 'DROP SCHEMA ctas_gone');
+
+statement error
+CREATE TABLE cex.ctas_gone.t AS SELECT 1 AS v;
+----
+schema 'ctas_gone' does not exist in SQL Server
+
+statement ok
+SELECT mssql_exec('cex', 'DROP VIEW dbo.CtasExistView; DROP TABLE dbo.[ctas]]odd.name];');
+
+statement ok
+DETACH cex;

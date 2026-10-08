@@ -7,9 +7,9 @@
 #include "copy/target_resolver.hpp"
 #include "dml/insert/mssql_insert_executor.hpp"
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/string_util.hpp"
 #include "mssql_counters.hpp"
 #include "query/mssql_simple_query.hpp"
+#include "query/mssql_sql_params.hpp"
 #include "tds/tds_connection.hpp"
 #include "tds/tds_connection_pool.hpp"
 
@@ -224,12 +224,17 @@ void CTASExecutionState::ExecuteDrop(ClientContext &context) {
 // CTASExecutionState::TableExists
 //===----------------------------------------------------------------------===//
 
+// Spec 084 D3: the names travel as parameters of one sp_executesql RPC call, so
+// one plan serves every name -- the INFORMATION_SCHEMA literal compiled anew
+// (~10 ms) and cached an ad-hoc plan for each. `type IN ('U', 'V')` is what
+// INFORMATION_SCHEMA.TABLES lists: tables and views. A row comes back only when
+// the object exists, as before.
 bool CTASExecutionState::TableExists(ClientContext &context) {
-	string check_sql =
-		StringUtil::Format("SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '%s' AND TABLE_NAME = '%s'",
-						   MSSQLDDLTranslator::EscapeStringLiteral(target.schema_name),
-						   MSSQLDDLTranslator::EscapeStringLiteral(target.table_name));
-	return ProbeExists(context, check_sql, "table");
+	const tds::Request check = mssql::BuildExecuteSqlRequest(
+		"SELECT 1 WHERE EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + "
+		"QUOTENAME(@t)) AND type IN ('U', 'V'))",
+		"@s sysname, @t sysname", {{"s", target.schema_name}, {"t", target.table_name}});
+	return ProbeExists(context, check, "table");
 }
 
 //===----------------------------------------------------------------------===//
@@ -237,9 +242,9 @@ bool CTASExecutionState::TableExists(ClientContext &context) {
 //===----------------------------------------------------------------------===//
 
 bool CTASExecutionState::SchemaExists(ClientContext &context) {
-	string check_sql = StringUtil::Format("SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = '%s'",
-										  MSSQLDDLTranslator::EscapeStringLiteral(target.schema_name));
-	return ProbeExists(context, check_sql, "schema");
+	const tds::Request check = mssql::BuildExecuteSqlRequest("SELECT 1 WHERE SCHEMA_ID(@s) IS NOT NULL", "@s sysname",
+															 {{"s", target.schema_name}});
+	return ProbeExists(context, check, "schema");
 }
 
 //===----------------------------------------------------------------------===//
@@ -290,7 +295,8 @@ void CTASExecutionState::RunDDL(ClientContext &context, const string &sql) {
 	}
 }
 
-bool CTASExecutionState::ProbeExists(ClientContext &context, const string &sql, const char *what) {
+bool CTASExecutionState::ProbeExists(ClientContext &context, const tds::Request &sql, const char *what) {
+	SimpleQueryResult result;
 	if (in_transaction) {
 		// The pinned connection sees what this transaction created or dropped,
 		// and is not blocked by its schema locks (issue #380).
@@ -299,28 +305,33 @@ bool CTASExecutionState::ProbeExists(ClientContext &context, const string &sql, 
 			throw IOException("Failed to get the transaction's connection to check %s existence", what);
 		}
 		try {
-			auto result = MSSQLSimpleQuery::Execute(*conn, sql);
-			ConnectionProvider::ReleaseConnection(context, *catalog, conn);
-			return result.HasRows();
+			result = MSSQLSimpleQuery::Execute(*conn, sql);
 		} catch (...) {
 			ConnectionProvider::ReleaseConnection(context, *catalog, conn);
 			throw;
 		}
-	}
-	auto &pool = catalog->GetConnectionPool();
-	std::string why;
-	auto conn = pool.Acquire(-1, &why);
-	if (!conn) {
-		throw IOException("Failed to acquire connection to check %s existence: %s", what, why);
-	}
-	try {
-		auto result = MSSQLSimpleQuery::Execute(*conn, sql);
+		ConnectionProvider::ReleaseConnection(context, *catalog, conn);
+	} else {
+		auto &pool = catalog->GetConnectionPool();
+		std::string why;
+		auto conn = pool.Acquire(-1, &why);
+		if (!conn) {
+			throw IOException("Failed to acquire connection to check %s existence: %s", what, why);
+		}
+		try {
+			result = MSSQLSimpleQuery::Execute(*conn, sql);
+		} catch (...) {
+			pool.Release(std::move(conn));
+			throw;
+		}
 		pool.Release(std::move(conn));
-		return result.HasRows();
-	} catch (...) {
-		pool.Release(std::move(conn));
-		throw;
 	}
+	// A failed check used to read as "does not exist" (no rows), and the CREATE
+	// that followed failed with a less telling error.
+	if (!result.success) {
+		throw IOException("MSSQL CTAS: could not check %s existence: %s", what, result.DescribeError());
+	}
+	return result.HasRows();
 }
 
 //===----------------------------------------------------------------------===//

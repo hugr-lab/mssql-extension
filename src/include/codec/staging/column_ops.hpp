@@ -145,8 +145,8 @@ struct ColumnOps {
 	//! single shape.
 	bool needs_value_fallback = false;
 	//! Var only: the most bytes ONE value can occupy IN THE STAGING BUFFER, or 0
-	//! when the type has no bound (PLP / MAX). Lets the buffer be preallocated to
-	//! a chunk's provable worst case, so a narrow column never resizes at all.
+	//! when the type has no bound (PLP / MAX). Bounds the buffer's growth at a
+	//! chunk's provable worst case, so a narrow column stops resizing there.
 	//!
 	//! Buffer cost, not wire size: a delimited string column stages a U+0000
 	//! after every value, and those two bytes are as real as the value's own.

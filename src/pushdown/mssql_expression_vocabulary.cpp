@@ -332,7 +332,7 @@ std::string ExpressionVocabulary::Constant(const Value &value, const LogicalType
 	if (declaration.empty()) {
 		return literal;
 	}
-	return "@" + params->Add(declaration, literal);
+	return "@" + params->Add(declaration, literal, value);
 }
 
 std::string ExpressionVocabulary::ValueToSQLLiteral(const Value &value, const LogicalType &type) {

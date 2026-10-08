@@ -333,7 +333,7 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 				// nothing at all.
 				if (ops_[i].max_value_bytes == 0) {
 					counters_.unbounded_columns++;
-				} else if (arena_.Column(i).payload_bounded) {
+				} else if (arena_.Column(i).payload_bound > 0) {
 					counters_.prealloc_bounded_columns++;
 				} else {
 					counters_.prealloc_capped_columns++;
