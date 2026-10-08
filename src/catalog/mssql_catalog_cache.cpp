@@ -197,7 +197,7 @@ void MSSQLCatalog::Preload(ClientContext &context, const string &schema_name, co
 	metadata_cache_->ForEachTable([&](const string &schema, const string &table, idx_t row_count) {
 		statistics_provider_->PreloadRowCount(schema, table, row_count);
 	});
-	// The loaded columns are the server's now; a pushed statement's shape
+	// The loaded columns are the server's now; a statement's shape
 	// described before may not be (preload does not move the epoch).
 	describe_cache_.Clear();
 	MSSQL_CATALOG_DEBUG_LOG(1, "Preload (%s): %llu schemas, %llu tables, %llu columns", caller,

@@ -1,0 +1,135 @@
+# name: test/sql/query/mssql_scan_describe_cache.test
+# description: Issue #410 -- a user's mssql_scan of a text already described binds from the describe cache (one connection, no describe); a shape changed behind the catalog fails once and is described again
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS sdc (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('sdc', 'DROP TABLE IF EXISTS dbo.sdc_t; CREATE TABLE dbo.sdc_t (id int NOT NULL PRIMARY KEY, v int NULL); INSERT INTO dbo.sdc_t VALUES (1, 10), (2, 20)');
+
+# First call: described (one connection) and executed (another).
+query II
+SELECT * FROM mssql_scan('sdc', 'SELECT TOP 1 id, v FROM dbo.sdc_t ORDER BY id');
+----
+1	10
+
+statement ok
+CREATE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('sdc');
+
+# The same text again: its shape from the cache, one connection for the run.
+query II
+SELECT * FROM mssql_scan('sdc', 'SELECT TOP 1 id, v FROM dbo.sdc_t ORDER BY id');
+----
+1	10
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('sdc')) - (SELECT n FROM acquired);
+----
+1
+
+# So does mssql_scan_params: its constants are parameters, the text is the key.
+query I
+SELECT v FROM mssql_scan_params('sdc', 'SELECT v FROM dbo.sdc_t WHERE id = @id', {'id': 1});
+----
+10
+
+statement ok
+CREATE OR REPLACE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('sdc');
+
+query I
+SELECT v FROM mssql_scan_params('sdc', 'SELECT v FROM dbo.sdc_t WHERE id = @id', {'id': 2});
+----
+20
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('sdc')) - (SELECT n FROM acquired);
+----
+1
+
+# A column changed behind the catalog (mssql_exec does not invalidate it by
+# default): the cached shape no longer matches the stream, the statement fails
+# once, saying to run it again, and the next run describes it anew.
+statement ok
+SELECT mssql_exec('sdc', 'ALTER TABLE dbo.sdc_t ALTER COLUMN v bigint NULL');
+
+statement error
+SELECT * FROM mssql_scan('sdc', 'SELECT TOP 1 id, v FROM dbo.sdc_t ORDER BY id');
+----
+result shape changed since it was cached
+
+query IT
+SELECT v, typeof(v) FROM mssql_scan('sdc', 'SELECT TOP 1 id, v FROM dbo.sdc_t ORDER BY id');
+----
+10	BIGINT
+
+# A column renamed behind the catalog changes no type: the names are checked
+# too, so the rows are never served under the old name. The shape is cached
+# first (two runs of the same text).
+query II
+SELECT * FROM mssql_scan('sdc', 'SELECT * FROM dbo.sdc_t ORDER BY id');
+----
+1	10
+2	20
+
+statement ok
+SELECT mssql_exec('sdc', 'EXEC sp_rename ''dbo.sdc_t.v'', ''w'', ''COLUMN''');
+
+statement error
+SELECT * FROM mssql_scan('sdc', 'SELECT * FROM dbo.sdc_t ORDER BY id');
+----
+result shape changed since it was cached
+
+query II
+SELECT id, w FROM mssql_scan('sdc', 'SELECT * FROM dbo.sdc_t ORDER BY id');
+----
+1	10
+2	20
+
+# mssql_invalidate_cache drops the shapes with the metadata. The text just
+# described again is cached: one connection, to execute ...
+statement ok
+CREATE OR REPLACE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('sdc');
+
+query II
+SELECT id, w FROM mssql_scan('sdc', 'SELECT * FROM dbo.sdc_t ORDER BY id');
+----
+1	10
+2	20
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('sdc')) - (SELECT n FROM acquired);
+----
+1
+
+# ... and after the invalidation the same text is described again: two (review
+# of #411: the case used to run a text never cached, which passes either way).
+statement ok
+SELECT mssql_invalidate_cache('sdc');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('sdc');
+
+query II
+SELECT id, w FROM mssql_scan('sdc', 'SELECT * FROM dbo.sdc_t ORDER BY id');
+----
+1	10
+2	20
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('sdc')) - (SELECT n FROM acquired);
+----
+2
+
+statement ok
+SELECT mssql_exec('sdc', 'DROP TABLE dbo.sdc_t');
+
+statement ok
+DETACH sdc;
