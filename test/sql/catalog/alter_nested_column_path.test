@@ -1,0 +1,55 @@
+# name: test/sql/catalog/alter_nested_column_path.test
+# description: ALTER COLUMN on a nested field path is refused (DuckDB 2.0 names the column as a path; SQL Server has no nested columns)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS anp (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('anp', 'DROP TABLE IF EXISTS dbo.AlterNestedPath; CREATE TABLE dbo.AlterNestedPath (s int NULL, v int NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('anp');
+
+# Before DuckDB 2.0 kept the path, `s.a` reached the catalog as column `s`.
+statement error
+ALTER TABLE anp.dbo.AlterNestedPath ALTER COLUMN s.a SET NOT NULL;
+----
+nested field is not supported
+
+statement error
+ALTER TABLE anp.dbo.AlterNestedPath ALTER COLUMN s.a DROP NOT NULL;
+----
+nested field is not supported
+
+statement error
+ALTER TABLE anp.dbo.AlterNestedPath ALTER COLUMN s.a TYPE BIGINT;
+----
+nested field is not supported
+
+# The column itself is untouched, and the plain form still works.
+query I
+SELECT is_nullable FROM mssql_scan('anp', 'SELECT CAST(is_nullable AS int) AS is_nullable FROM sys.columns WHERE object_id = OBJECT_ID(''dbo.AlterNestedPath'') AND name = ''s''');
+----
+1
+
+statement ok
+ALTER TABLE anp.dbo.AlterNestedPath ALTER COLUMN v SET NOT NULL;
+
+query I
+SELECT is_nullable FROM mssql_scan('anp', 'SELECT CAST(is_nullable AS int) AS is_nullable FROM sys.columns WHERE object_id = OBJECT_ID(''dbo.AlterNestedPath'') AND name = ''v''');
+----
+0
+
+statement ok
+SELECT mssql_exec('anp', 'DROP TABLE dbo.AlterNestedPath');
+
+statement ok
+DETACH anp;

@@ -82,8 +82,19 @@ run_attempt() {
             my $t = shift;
             my $p = fork;
             die "fork failed: $!" unless defined $p;
-            if (!$p) { setpgrp(0, 0); exec @ARGV; exit 127 }
-            $SIG{ALRM} = sub { kill("KILL", -$p); waitpid($p, 0); exit 142 };
+            # setpgrp is best-effort: it is NOT implemented on native Win32
+            # perl (Strawberry, which is on the PATH of GitHub windows-*
+            # runners). Unguarded it dies BEFORE exec, so git never runs and
+            # every attempt fails in milliseconds -- a hard red on the MSVC and
+            # MinGW release legs, which are not dispatch-gated. Git Bash
+            # normally resolves /usr/bin/perl (MSYS2), but "perl found but the
+            # wrapper cannot work" had no fallback (roborev 1460).
+            if (!$p) { eval { setpgrp(0, 0) }; exec @ARGV; exit 127 }
+            # And if the group was never created, killing -$p addresses a group
+            # that does not exist: git would keep running past the timeout,
+            # which is the orphan this wrapper exists to prevent. Fall back to
+            # the pid.
+            $SIG{ALRM} = sub { kill("KILL", -$p) or kill("KILL", $p); waitpid($p, 0); exit 142 };
             alarm $t;
             waitpid($p, 0);
             my $st = $?;
@@ -99,29 +110,52 @@ run_attempt() {
 }
 
 reset_state() {
-    # BOTH candidates, because where a submodule's git dir lives depends on how
-    # the checkout was made. Measured in this repo's own worktree:
-    #   --git-dir        .git/worktrees/<name>   modules/duckdb PRESENT
-    #   --git-common-dir .git                    modules/duckdb ABSENT
-    # A plain clone puts it under the common dir instead. Removing only one is
-    # how a stale submodule gitdir survives a "reset" and poisons the retry.
-    local git_dir common_dir
+    # Resolve the submodule's ACTUAL gitdir rather than guessing two locations.
+    #
+    # The previous form removed both `--git-dir/modules/duckdb` and
+    # `--git-common-dir/modules/duckdb`. In a WORKTREE those are different
+    # trees and the common dir is the MAIN clone's .git, so running this from a
+    # worktree deleted the main checkout's submodule gitdir -- leaving its
+    # populated duckdb/ an orphaned working tree whose `git -C duckdb status`
+    # fails and whose next `submodule update` re-clones from scratch. The
+    # comment here used to record "--git-common-dir .git modules/duckdb ABSENT"
+    # as if that were general; it held only because that checkout happened not
+    # to have initialised the submodule (roborev 1460). The script is anchored
+    # at `git rev-parse --show-toplevel` and is runnable by hand, so this was
+    # reachable, not theoretical.
+    #
+    # `--git-path` does worktree-correct resolution, and when duckdb/ exists
+    # its `.git` file names the gitdir exactly. The common dir is used only
+    # when it IS this checkout's git dir (a plain clone), never to reach across.
+    local sub_gitdir git_dir common_dir
+    sub_gitdir="$(git rev-parse --git-path modules/duckdb)"
     git_dir="$(git rev-parse --git-dir)"
     common_dir="$(git rev-parse --git-common-dir)"
-    # Unchecked, an empty result would make the next line rm -rf "/modules/duckdb"
-    # -- an absolute path outside the repository.
-    if [ -z "$git_dir" ] || [ -z "$common_dir" ]; then
+    # Unchecked, an empty result would make the rm below take an absolute path
+    # outside the repository.
+    if [ -z "$sub_gitdir" ] || [ -z "$git_dir" ] || [ -z "$common_dir" ]; then
         echo "::error::could not resolve the git dir; refusing to reset"
         exit 1
     fi
 
-    git submodule deinit -f duckdb >/dev/null 2>&1 || true
-    rm -rf duckdb "${git_dir}/modules/duckdb" "${common_dir}/modules/duckdb"
-
-    if [ -e duckdb ] || [ -e "${git_dir}/modules/duckdb" ] || [ -e "${common_dir}/modules/duckdb" ]; then
-        echo "::error::could not reset partial DuckDB submodule state"
-        exit 1
+    local -a targets=(duckdb "$sub_gitdir")
+    # A plain clone: the common dir is this checkout's own, so the legacy
+    # location is ours to clear too. In a worktree the two differ and we leave
+    # the main clone alone.
+    if [ "$git_dir" = "$common_dir" ] && [ "$sub_gitdir" != "${common_dir}/modules/duckdb" ]; then
+        targets+=("${common_dir}/modules/duckdb")
     fi
+
+    git submodule deinit -f duckdb >/dev/null 2>&1 || true
+    rm -rf "${targets[@]}"
+
+    local t
+    for t in "${targets[@]}"; do
+        if [ -e "$t" ]; then
+            echo "::error::could not reset partial DuckDB submodule state (${t} remains)"
+            exit 1
+        fi
+    done
 }
 
 for attempt in $(seq 1 "$ATTEMPTS"); do

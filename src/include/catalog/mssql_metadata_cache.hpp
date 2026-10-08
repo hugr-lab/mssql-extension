@@ -207,11 +207,6 @@ public:
 	// Otherwise loads everything with BULK_METADATA_SCHEMA_SQL_TEMPLATE (one round trip).
 	void LoadAllTableMetadata(tds::TdsConnection &connection, const string &schema_name);
 
-	//! The single-schema bulk load. Kept because mssql_preload_catalog('schema')
-	//! names one deliberately; the listing path goes through
-	//! LoadAllSchemasMetadata instead. Caller must hold mutex_ via the public entry.
-	void LoadAllTableMetadataForSchema(tds::TdsConnection &connection, const string &schema_name);
-
 	//! Load EVERY schema's tables and columns in one query (spec 071 W2).
 	//!
 	//! Both the listing path and mssql_preload_catalog() go through here. It costs

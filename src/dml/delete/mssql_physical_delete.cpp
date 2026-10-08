@@ -74,7 +74,7 @@ SourceResultType MSSQLPhysicalDelete::GetDataInternal(ExecutionContext &context,
 
 	// Return the count of deleted rows
 	chunk.SetChildCardinality(1);
-	chunk.SetValue(0, 0, Value::BIGINT(gstate.total_rows_deleted));
+	chunk.data[0].SetValue(0, Value::BIGINT(gstate.total_rows_deleted));
 	gstate.returned = true;
 
 	return SourceResultType::FINISHED;
