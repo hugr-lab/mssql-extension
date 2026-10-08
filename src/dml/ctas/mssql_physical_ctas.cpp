@@ -508,7 +508,7 @@ SourceResultType MSSQLPhysicalCreateTableAs::GetDataInternal(ExecutionContext &c
 
 	// Return the count of inserted rows
 	chunk.SetChildCardinality(1);
-	chunk.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(gstate.state.rows_inserted)));
+	chunk.data[0].SetValue(0, Value::BIGINT(static_cast<int64_t>(gstate.state.rows_inserted)));
 
 	return SourceResultType::FINISHED;
 }

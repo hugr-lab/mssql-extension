@@ -331,6 +331,18 @@ optional_ptr<CatalogEntry> MSSQLSchemaEntry::CreateType(CatalogTransaction trans
 	throw NotImplementedException("MSSQL catalog: CREATE TYPE is not supported");
 }
 
+// DuckDB 2.0 names the column of an ALTER as a path, for a field of a STRUCT
+// column ("s.a"). SQL Server has no nested columns: one element, or a refusal.
+static const Identifier &SingleColumnOf(const vector<Identifier> &column_path, const char *what) {
+	if (column_path.size() != 1) {
+		throw NotImplementedException(
+			"MSSQL catalog: %s on a nested field is not supported; SQL Server has no nested "
+			"columns",
+			what);
+	}
+	return column_path[0];
+}
+
 void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	auto &mssql_catalog = GetMSSQLCatalog();
 	mssql_catalog.CheckWriteAccess("ALTER");
@@ -382,14 +394,16 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		auto &type_info = alter_table_info.Cast<ChangeColumnTypeInfo>();
 		// SQL Server requires specifying nullability when altering type
 		// We default to NULL since we don't have that info easily available
-		tsql = MSSQLDDLTranslator::TranslateAlterColumnType(name.GetIdentifierName(), table_name,
-															type_info.column_name.GetIdentifierName(),
-															type_info.target_type, true);
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnType(
+			name.GetIdentifierName(), table_name,
+			SingleColumnOf(type_info.column_path, "ALTER COLUMN TYPE").GetIdentifierName(), type_info.target_type,
+			true);
 		break;
 	}
 
 	case AlterTableType::SET_NOT_NULL: {
 		auto &notnull_info = alter_table_info.Cast<SetNotNullInfo>();
+		const Identifier &column_name = SingleColumnOf(notnull_info.column_path, "SET NOT NULL");
 		// For SET NOT NULL, we need the column's current type
 		// Look up the table to get the column type
 		if (!transaction.HasContext()) {
@@ -403,22 +417,23 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		LogicalType col_type;
 		bool found = false;
 		for (auto &col : mssql_table.GetMSSQLColumns()) {
-			if (col.name == notnull_info.column_name) {
+			if (col.name == column_name) {
 				col_type = col.duckdb_type;
 				found = true;
 				break;
 			}
 		}
 		if (!found) {
-			throw CatalogException("Column '%s' not found in table '%s'", notnull_info.column_name, table_name);
+			throw CatalogException("Column '%s' not found in table '%s'", column_name, table_name);
 		}
-		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(
-			name.GetIdentifierName(), table_name, notnull_info.column_name.GetIdentifierName(), col_type, true);
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name.GetIdentifierName(), table_name,
+																   column_name.GetIdentifierName(), col_type, true);
 		break;
 	}
 
 	case AlterTableType::DROP_NOT_NULL: {
 		auto &dropnull_info = alter_table_info.Cast<DropNotNullInfo>();
+		const Identifier &column_name = SingleColumnOf(dropnull_info.column_path, "DROP NOT NULL");
 		// For DROP NOT NULL, we need the column's current type
 		if (!transaction.HasContext()) {
 			throw InternalException("Cannot execute DROP NOT NULL without client context");
@@ -431,17 +446,17 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		LogicalType col_type;
 		bool found = false;
 		for (auto &col : mssql_table.GetMSSQLColumns()) {
-			if (col.name == dropnull_info.column_name) {
+			if (col.name == column_name) {
 				col_type = col.duckdb_type;
 				found = true;
 				break;
 			}
 		}
 		if (!found) {
-			throw CatalogException("Column '%s' not found in table '%s'", dropnull_info.column_name, table_name);
+			throw CatalogException("Column '%s' not found in table '%s'", column_name, table_name);
 		}
-		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(
-			name.GetIdentifierName(), table_name, dropnull_info.column_name.GetIdentifierName(), col_type, false);
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name.GetIdentifierName(), table_name,
+																   column_name.GetIdentifierName(), col_type, false);
 		break;
 	}
 
