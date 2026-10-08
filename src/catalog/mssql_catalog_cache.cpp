@@ -95,7 +95,18 @@ unique_ptr<MSSQLMetadataCache> MSSQLCatalog::CreateTransactionMetadataCache(Clie
 	cache->SetMetadataTimeout(LoadMetadataTimeout(context));
 	cache->SetTestFailAfterRows(LoadTestFailMetadataAfterRows(context));
 	cache->SetDatabaseCollation(database_collation_, database_code_page_);
+	// No DMV pass inside a transaction: it would run on the pinned connection,
+	// in the user's server transaction, and read sysrowsets, where a deadlock
+	// victim rolls that transaction back (spec 084 Risks).
+	cache->SetRowCountPass(false);
 	return cache;
+}
+
+std::mutex &MSSQLCatalog::MaterializeMutexFor(ClientContext &context) {
+	if (context.transaction.IsAutoCommit()) {
+		return materialize_mutex_;
+	}
+	return MSSQLTransaction::Get(context, *this).MaterializeMutex();
 }
 
 void MSSQLCatalog::NoteTransactionChange(ClientContext &context, const string &schema, const string &table) {

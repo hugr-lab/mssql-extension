@@ -16,6 +16,7 @@
 #include "query/mssql_result_stream.hpp"
 #include "query/mssql_sql_params.hpp"
 #include "table_scan/table_scan_state.hpp"
+#include "tds/tds_request.hpp"
 
 #include <atomic>
 #include <memory>
@@ -96,13 +97,13 @@ struct MSSQLScanBindData : public FunctionData {
 	// the query itself runs at InitGlobal. `execute_sql` is what InitGlobal
 	// sends: the query, the sp_executesql batch of mssql_scan_params, or
 	// `EXEC sp_execute <handle>`.
-	string execute_sql;
+	tds::Request execute_sql;
 	//! The ad-hoc batch that needs no prepared handle -- the query, or the
 	//! sp_executesql batch of mssql_scan_params. Kept because `execute_sql` is
 	//! overwritten with `EXEC sp_execute <handle>` when sp_prepare succeeds, and
 	//! a second global state over this same bind data cannot use that handle.
 	//! Empty unless the prepared path took over.
-	string fallback_sql;
+	tds::Request fallback_sql;
 	//! Spec 079 PR E2: the DescribeCache key this bind's shape came from or went
 	//! to; the init-time shape check drops the entry when the stream differs.
 	string describe_cache_key;
@@ -114,6 +115,10 @@ struct MSSQLScanBindData : public FunctionData {
 	// temp table, a procedure, dynamic SQL) and Bind executed as it always had;
 	// result_stream_id / materialized are then set exactly as before.
 	bool executed_at_bind = false;
+	//! Spec 081: the function that took the caller's shape (`mssql_scan_unsafe`,
+	//! `mssql_scan_params_unsafe`, from `columns :=`) without asking the server;
+	//! the stream is checked against it at init. Empty for a described scan.
+	string trusted_function;
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;

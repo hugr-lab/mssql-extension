@@ -447,6 +447,79 @@ void BCPWriter::ResetForNextBatch() {
 // Token Builders
 //===----------------------------------------------------------------------===//
 
+void BCPWriter::WriteTypeInfo(vector<uint8_t> &buffer, const BCPColumnMetadata &col) {
+	WriteUInt8(buffer, col.tds_type_token);
+
+	switch (col.tds_type_token) {
+	case tds::TDS_TYPE_INTN:  // 0x26 - Nullable int
+		WriteUInt8(buffer, static_cast<uint8_t>(col.max_length));
+		break;
+
+	case tds::TDS_TYPE_BITN:  // 0x68 - Nullable bit
+		WriteUInt8(buffer, 1);
+		break;
+
+	case tds::TDS_TYPE_FLOATN:	// 0x6D - Nullable float
+		WriteUInt8(buffer, static_cast<uint8_t>(col.max_length));
+		break;
+
+	case tds::TDS_TYPE_DECIMAL:	 // 0x6A - Decimal
+	case tds::TDS_TYPE_NUMERIC:	 // 0x6C - Numeric
+		WriteUInt8(buffer, static_cast<uint8_t>(col.max_length));
+		WriteUInt8(buffer, col.precision);
+		WriteUInt8(buffer, col.scale);
+		break;
+
+	case tds::TDS_TYPE_NVARCHAR:	// 0xE7 - Unicode string
+	case tds::TDS_TYPE_BIGVARCHAR:	// 0xA7 - single-byte string; UTF-8 when the collation says so
+		WriteUInt16LE(buffer, col.max_length);
+		// Collation (5 bytes)
+		for (int i = 0; i < 5; i++) {
+			WriteUInt8(buffer, col.collation[i]);
+		}
+		break;
+
+	case tds::TDS_TYPE_BIGVARBINARY:  // 0xA5 - Binary
+		WriteUInt16LE(buffer, col.max_length);
+		break;
+
+	case tds::TDS_TYPE_UNIQUEIDENTIFIER:  // 0x24 - GUID
+		WriteUInt8(buffer, 16);
+		break;
+
+	case tds::TDS_TYPE_XML:	 // 0xF1
+		// SQL Server rejects XML type (0xF1) in BCP COLMETADATA.
+		// Rewrite as NVARCHAR(MAX) — SQL Server auto-converts to XML on the target column.
+		// No length limitation: nvarchar(max) supports up to 2 GB, same as XML.
+		buffer.back() = tds::TDS_TYPE_NVARCHAR;
+		WriteUInt16LE(buffer, 0xFFFF);	// MAX indicator
+		// Collation (5 bytes)
+		for (int i = 0; i < 5; i++) {
+			WriteUInt8(buffer, col.collation[i]);
+		}
+		break;
+
+	case tds::TDS_TYPE_DATE:  // 0x28
+		// No additional metadata
+		break;
+
+	case tds::TDS_TYPE_TIME:  // 0x29
+		WriteUInt8(buffer, col.scale);
+		break;
+
+	case tds::TDS_TYPE_DATETIME2:  // 0x2A
+		WriteUInt8(buffer, col.scale);
+		break;
+
+	case tds::TDS_TYPE_DATETIMEOFFSET:	// 0x2B
+		WriteUInt8(buffer, col.scale);
+		break;
+
+	default:
+		throw NotImplementedException("MSSQL: Unsupported TDS type 0x%02X in COLMETADATA", col.tds_type_token);
+	}
+}
+
 void BCPWriter::BuildColmetadataToken(vector<uint8_t> &buffer) {
 	// COLMETADATA token format:
 	// Token (1 byte): 0x81
@@ -472,76 +545,7 @@ void BCPWriter::BuildColmetadataToken(vector<uint8_t> &buffer) {
 		WriteUInt16LE(buffer, col.GetFlags());
 
 		// TYPE_INFO varies by type
-		WriteUInt8(buffer, col.tds_type_token);
-
-		switch (col.tds_type_token) {
-		case tds::TDS_TYPE_INTN:  // 0x26 - Nullable int
-			WriteUInt8(buffer, static_cast<uint8_t>(col.max_length));
-			break;
-
-		case tds::TDS_TYPE_BITN:  // 0x68 - Nullable bit
-			WriteUInt8(buffer, 1);
-			break;
-
-		case tds::TDS_TYPE_FLOATN:	// 0x6D - Nullable float
-			WriteUInt8(buffer, static_cast<uint8_t>(col.max_length));
-			break;
-
-		case tds::TDS_TYPE_DECIMAL:	 // 0x6A - Decimal
-		case tds::TDS_TYPE_NUMERIC:	 // 0x6C - Numeric
-			WriteUInt8(buffer, static_cast<uint8_t>(col.max_length));
-			WriteUInt8(buffer, col.precision);
-			WriteUInt8(buffer, col.scale);
-			break;
-
-		case tds::TDS_TYPE_NVARCHAR:	// 0xE7 - Unicode string
-		case tds::TDS_TYPE_BIGVARCHAR:	// 0xA7 - single-byte string; UTF-8 when the collation says so
-			WriteUInt16LE(buffer, col.max_length);
-			// Collation (5 bytes)
-			for (int i = 0; i < 5; i++) {
-				WriteUInt8(buffer, col.collation[i]);
-			}
-			break;
-
-		case tds::TDS_TYPE_BIGVARBINARY:  // 0xA5 - Binary
-			WriteUInt16LE(buffer, col.max_length);
-			break;
-
-		case tds::TDS_TYPE_UNIQUEIDENTIFIER:  // 0x24 - GUID
-			WriteUInt8(buffer, 16);
-			break;
-
-		case tds::TDS_TYPE_XML:	 // 0xF1
-			// SQL Server rejects XML type (0xF1) in BCP COLMETADATA.
-			// Rewrite as NVARCHAR(MAX) — SQL Server auto-converts to XML on the target column.
-			// No length limitation: nvarchar(max) supports up to 2 GB, same as XML.
-			buffer.back() = tds::TDS_TYPE_NVARCHAR;
-			WriteUInt16LE(buffer, 0xFFFF);	// MAX indicator
-			// Collation (5 bytes)
-			for (int i = 0; i < 5; i++) {
-				WriteUInt8(buffer, col.collation[i]);
-			}
-			break;
-
-		case tds::TDS_TYPE_DATE:  // 0x28
-			// No additional metadata
-			break;
-
-		case tds::TDS_TYPE_TIME:  // 0x29
-			WriteUInt8(buffer, col.scale);
-			break;
-
-		case tds::TDS_TYPE_DATETIME2:  // 0x2A
-			WriteUInt8(buffer, col.scale);
-			break;
-
-		case tds::TDS_TYPE_DATETIMEOFFSET:	// 0x2B
-			WriteUInt8(buffer, col.scale);
-			break;
-
-		default:
-			throw NotImplementedException("MSSQL: Unsupported TDS type 0x%02X in COLMETADATA", col.tds_type_token);
-		}
+		WriteTypeInfo(buffer, col);
 
 		// Column name (B_VARCHAR format: length byte + UTF-16LE)
 		WriteUTF16LEString(buffer, col.name);

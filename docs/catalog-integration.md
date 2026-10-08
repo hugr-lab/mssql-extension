@@ -19,7 +19,7 @@ duckdb::SchemaCatalogEntry
 duckdb::TableCatalogEntry
   └── MSSQLTableEntry
         ├── mssql_columns_: vector<MSSQLColumnInfo>
-        ├── pk_info_: PrimaryKeyInfo (lazy-loaded)
+        ├── pk_info_: RowIdKeyInfo (loaded with the table's metadata)
         └── object_type_: TABLE or VIEW
 ```
 
@@ -129,9 +129,9 @@ struct MSSQLColumnInfo {
 
 ### Primary Key and Rowid Support
 
-Primary key metadata is lazy-loaded on first access via `EnsurePKLoaded()`.
+The rowid key is loaded with the table's metadata, in the same batch: the single-table first touch's third result set, and the bulk loads' (preload, listings, `mssql_refresh_cache`; spec 084 D5). An entry is born with it; nothing discovers it later.
 
-**Discovery query** joins `sys.key_constraints`, `sys.indexes`, `sys.index_columns`, `sys.columns`, and `sys.types` to find the PK constraint and its columns ordered by `key_ordinal`.
+**Discovery query** reads `sys.indexes`, `sys.index_columns` and `sys.columns`: every unique index's key columns, ordered by `index_id, key_ordinal`. The choice prefers the primary key when it is usable, else a usable unique index (spec 077 W1).
 
 ```cpp
 struct PrimaryKeyInfo {
@@ -287,7 +287,7 @@ All cache access is protected by `std::mutex`. The mutex is held during the enti
 
 **Files**: `src/catalog/mssql_statistics.cpp`, `src/include/catalog/mssql_statistics.hpp`
 
-Caches row count statistics from `sys.dm_db_partition_stats` with configurable TTL.
+Caches row count statistics with configurable TTL. A count it fetches itself comes from `OBJECTPROPERTYEX(id, 'Cardinality')`, as the catalog's metadata queries read it (spec 083; until then it queried `sys.dm_db_partition_stats` through a column name that view does not have, and every fetch failed).
 
 ### Methods
 
@@ -410,7 +410,7 @@ MSSQLTableSet::GetEntry(table_name)
   └─ LoadSingleEntry() → load only this table's metadata
 
 MSSQLTableEntry::GetScanFunction()
-  ├─ EnsurePKLoaded() → Query sys.key_constraints
+  ├─ rowid key: already in the entry (loaded with its metadata)
   └─ Return table function with rowid support
 ```
 

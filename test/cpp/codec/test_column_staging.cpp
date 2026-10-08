@@ -346,52 +346,104 @@ void TestColumnOpsResolution() {
 	CHECK_TRUE(!threw, "unknown wire type does not throw during resolution");
 }
 
-void TestPreallocatedBoundNeverResizes() {
-	std::cout << "[8] prealloc: a bounded column never resizes (D3)..." << std::endl;
+void TestBoundStopsGrowth() {
+	std::cout << "[8] bound: nothing up front, growth stops at the worst case (D3, spec 083 D4)..." << std::endl;
 	// nvarchar(16) is 32 wire bytes per value, so a chunk cannot exceed
-	// 32 * STANDARD_VECTOR_SIZE. Preallocating that makes growth unreachable.
+	// 32 * STANDARD_VECTOR_SIZE. Growth stops there and never resumes.
 	const uint32_t per_value = 32;
+	const idx_t worst = static_cast<idx_t>(per_value) * STANDARD_VECTOR_SIZE;
 	ColumnStaging col;
 	col.Configure(StagingKind::Var, 0, per_value);
-	CHECK_TRUE(col.payload_bounded, "narrow column reports a provable bound");
-	const idx_t reserved = col.buffer.size();
-	CHECK_EQ(reserved, static_cast<idx_t>(per_value) * STANDARD_VECTOR_SIZE, "reserved exactly the worst case");
+	CHECK_EQ(col.payload_bound, worst, "narrow column knows its provable bound");
+	CHECK_TRUE(!col.payload_bounded, "not reached before any value");
+	CHECK_EQ(col.buffer.size(), static_cast<idx_t>(0), "an empty result allocates no payload");
 
-	// Fill a full chunk with worst-case values: the buffer must not move.
+	// A worst-case chunk grows to exactly the bound, and a second one does not
+	// move the buffer.
 	std::vector<uint8_t> value(per_value, 0x41);
-	const uint8_t *base_before = col.buffer.data();
 	col.BeginChunk(nullptr);
 	for (idx_t i = 0; i < STANDARD_VECTOR_SIZE; i++) {
 		col.AppendVar(value.data(), per_value);
 	}
-	CHECK_EQ(col.buffer.size(), reserved, "capacity unchanged after a worst-case chunk");
-	CHECK_TRUE(col.buffer.data() == base_before, "payload never reallocated");
-	CHECK_EQ(col.PayloadSize(), reserved, "worst-case chunk exactly fills the reservation");
+	CHECK_TRUE(col.payload_bounded, "worst-case chunk reaches the bound");
+	CHECK_EQ(col.buffer.size(), worst, "capacity stops at the worst case");
+	const uint8_t *base_before = col.buffer.data();
+	const idx_t grows_before = col.grow_events;
+	col.BeginChunk(nullptr);
+	for (idx_t i = 0; i < STANDARD_VECTOR_SIZE; i++) {
+		col.AppendVar(value.data(), per_value);
+	}
+	CHECK_TRUE(col.buffer.data() == base_before, "payload never reallocated once bounded");
+	CHECK_EQ(col.grow_events, grows_before, "no growth once bounded");
+	CHECK_EQ(col.PayloadSize(), worst, "worst-case chunk exactly fills it");
 
-	// The arena must not shrink it back into reach of growth.
+	// A few small values grow it only to the initial size.
+	ColumnStaging small_col;
+	small_col.Configure(StagingKind::Var, 0, per_value);
+	const uint8_t one = 1;
+	small_col.AppendVar(&one, 1);
+	CHECK_EQ(small_col.buffer.size(), duckdb::mssql::codec::staging::STAGING_INITIAL_PAYLOAD_BYTES,
+			 "first value allocates the initial size, not the bound");
+	CHECK_TRUE(!small_col.payload_bounded, "below the bound");
+
+	// The arena must not shrink a column that reached its bound back into reach
+	// of growth.
 	StagingArena arena;
 	arena.Configure(1);
 	arena.Column(0).Configure(StagingKind::Var, 0, per_value);
-	const idx_t bounded_size = arena.Column(0).buffer.size();
-	const uint8_t small = 1;
+	arena.Column(0).BeginChunk(nullptr);
+	for (idx_t i = 0; i < STANDARD_VECTOR_SIZE; i++) {
+		arena.Column(0).AppendVar(value.data(), per_value);
+	}
+	arena.EndChunk();
 	for (idx_t i = 0; i < StagingArena::SHRINK_INTERVAL_CHUNKS * 2 + 2; i++) {
 		arena.Column(0).BeginChunk(nullptr);
-		arena.Column(0).AppendVar(&small, 1);
+		arena.Column(0).AppendVar(&one, 1);
 		arena.EndChunk();
 	}
-	CHECK_EQ(arena.Column(0).buffer.size(), bounded_size, "bounded column is never shrunk");
+	CHECK_EQ(arena.Column(0).buffer.size(), worst, "bounded column is never shrunk");
 
-	// An unbounded column (PLP / MAX) has no such guarantee and starts small.
+	// An unbounded column (PLP / MAX) has no bound and allocates nothing either.
 	ColumnStaging unbounded;
 	unbounded.Configure(StagingKind::Var, 0, 0);
-	CHECK_TRUE(!unbounded.payload_bounded, "PLP column has no provable bound");
-	CHECK_EQ(unbounded.buffer.size(), duckdb::mssql::codec::staging::STAGING_UNBOUNDED_INITIAL_BYTES,
-			 "unbounded column starts at the initial size");
+	CHECK_EQ(unbounded.payload_bound, static_cast<idx_t>(0), "PLP column has no provable bound");
+	CHECK_EQ(unbounded.buffer.size(), static_cast<idx_t>(0), "unbounded column allocates nothing up front");
 
-	// A bound too large to prepay is not preallocated; growth handles it.
+	// A chunk of empty values never grows the buffer, and still hands out a
+	// real pointer (memcmp and the decoders get data() + 0).
+	ColumnStaging empties;
+	empties.Configure(StagingKind::Var, 0, per_value);
+	empties.AppendVar(nullptr, 0);
+	empties.AppendVar(nullptr, 0);
+	CHECK_TRUE(empties.ValueAt(1) != nullptr, "an empty value has a non-null address");
+
+	// A value longer than the declared type (the wire is not checked against
+	// COLMETADATA) drops the bound: growth doubles again, never one exact-size
+	// reallocation per value.
+	ColumnStaging liar;
+	liar.Configure(StagingKind::Var, 0, per_value);
+	std::vector<uint8_t> big(60000, 0x42);
+	for (idx_t i = 0; i < 64; i++) {
+		liar.AppendVar(big.data(), static_cast<uint32_t>(big.size()));
+	}
+	CHECK_EQ(liar.payload_bound, static_cast<idx_t>(0), "an over-long value drops the bound");
+	CHECK_TRUE(!liar.payload_bounded, "and the column is not pinned");
+	CHECK_TRUE(liar.grow_events < 16, "growth still doubles");
+
+	// A buffer kept from an earlier result set that is LARGER than the new
+	// column's bound is not pinned as bounded, so the watermark can release it.
+	ColumnStaging reused;
+	reused.Configure(StagingKind::Var, 0, 0);
+	reused.AppendVar(big.data(), static_cast<uint32_t>(big.size()));
+	reused.AppendVar(big.data(), static_cast<uint32_t>(big.size()));
+	reused.Configure(StagingKind::Var, 0, 8);
+	CHECK_TRUE(reused.buffer.size() > reused.payload_bound, "kept buffer is past the new bound");
+	CHECK_TRUE(!reused.payload_bounded, "an oversized kept buffer is not pinned");
+
+	// A bound too large to stop at is not one; growth finds the size.
 	ColumnStaging wide;
 	wide.Configure(StagingKind::Var, 0, 8000);	// nvarchar(4000)
-	CHECK_TRUE(!wide.payload_bounded, "over-budget bound is not prepaid");
+	CHECK_EQ(wide.payload_bound, static_cast<idx_t>(0), "over-budget bound is not used");
 }
 
 }  // namespace
@@ -409,7 +461,7 @@ int main() {
 		TestArenaAddressStability();
 		TestWatermarkRetainsThenReleases();
 		TestColumnOpsResolution();
-		TestPreallocatedBoundNeverResizes();
+		TestBoundStopsGrowth();
 	} catch (const std::exception &e) {
 		std::cerr << "UNCAUGHT EXCEPTION: " << e.what() << std::endl;
 		return 2;

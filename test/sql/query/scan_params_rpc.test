@@ -1,0 +1,226 @@
+# name: test/sql/query/scan_params_rpc.test
+# description: Spec 083 -- mssql_scan_params / mssql_exec_params bind their values as typed parameters of an sp_executesql RPC call; a declaration the encoder does not know (a CLR or alias type) keeps the batch form
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS spr (TYPE mssql);
+
+# Every value reaches the server as itself.
+query IIIIIII
+SELECT * FROM mssql_scan_params('spr',
+	'SELECT @i AS i, @d AS d, CONVERT(varchar(30), @ts, 121) AS ts, @s AS s, DATALENGTH(@b) AS b, @g AS g, @dt AS dt',
+	{'i': 42::BIGINT, 'd': 12.34::DECIMAL(10,2), 'ts': TIMESTAMP_NS '2024-01-02 10:11:12.1234567', 's': 'привет',
+	 'b': '\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13'::BLOB,
+	 'g': '6F9619FF-8B86-D011-B42D-00C04FC964FF'::UUID, 'dt': DATE '2024-01-02'});
+----
+42	12.34	2024-01-02 10:11:12.1234567	привет	20	6f9619ff-8b86-d011-b42d-00c04fc964ff	2024-01-02
+
+# A typed NULL.
+query I
+SELECT x IS NULL FROM mssql_scan_params('spr', 'SELECT @n AS x', {'n': NULL::INTEGER});
+----
+true
+
+# xml: the string goes as nvarchar and the server converts it to the declared xml.
+query I
+SELECT v FROM mssql_scan_params('spr', 'SELECT @x.value(''(/a)[1]'', ''int'') AS v', {'x': '<a>7</a>'}, '@x xml');
+----
+7
+
+# A CLR type and an alias type have no RPC encoding: the call keeps the batch
+# form (DECLARE @g geometry = N'...'), as it always did.
+query I
+SELECT t FROM mssql_scan_params('spr', 'SELECT @g.STAsText() AS t', {'g': 'POINT (1 2)'}, '@g geometry');
+----
+POINT (1 2)
+
+statement ok
+SELECT mssql_exec('spr', 'IF TYPE_ID(''dbo.spr_name'') IS NULL CREATE TYPE dbo.spr_name FROM nvarchar(20)');
+
+query I
+SELECT n FROM mssql_scan_params('spr', 'SELECT @n AS n', {'n': 'abc'}, '@n dbo.spr_name');
+----
+abc
+
+statement ok
+SELECT mssql_exec('spr', 'DROP TYPE dbo.spr_name');
+
+# More declared types: money, datetime, smalldatetime, a negative decimal(38,2),
+# an nvarchar(max) declaration.
+query IIIII
+SELECT * FROM mssql_scan_params('spr',
+	'SELECT @m AS m, CONVERT(varchar(23), @dt, 121) AS dt, CONVERT(varchar(16), @sd, 121) AS sd, @d AS d, @s AS s',
+	{'m': 12.3456::DECIMAL(19,4), 'dt': TIMESTAMP '2024-01-02 10:11:12.123', 'sd': TIMESTAMP '2024-01-02 10:11:29.600',
+	 'd': -12345678901234567890123456789012345.67::DECIMAL(38,2), 's': 'x'},
+	'@m money, @dt datetime, @sd smalldatetime, @d decimal(38,2), @s nvarchar(max)');
+----
+12.3456	2024-01-02 10:11:12.123	2024-01-02 10:11	-12345678901234567890123456789012345.67	x
+
+# A statement and a value past 4000 characters: nvarchar(max), sent as PLP.
+query II
+SELECT l, r FROM mssql_scan_params('spr', 'SELECT LEN(@s) AS l, RIGHT(@s, 3) AS r /*' || repeat('x', 4500) || '*/', {'s': repeat('a', 5000) || 'end'});
+----
+5003	end
+
+# A value whose conversion to the declared type DuckDB and the server do not
+# agree on keeps the batch form, and the SERVER converts it, as before spec 083
+# (review of #414): a boolean is 1 in a varchar, a TIMESTAMP is datetime2's own
+# text, a decimal into an int is truncated (DuckDB's cast rounds 12.5 to 13).
+query IIIII
+SELECT * FROM mssql_scan_params('spr', 'SELECT @b AS b, @d AS d, @x AS x, @i AS i, @f AS f',
+	{'b': true, 'd': TIMESTAMP '2024-01-02 10:11:12.123456', 'x': 'abc'::BLOB, 'i': 12.5::DECIMAL(3,1), 'f': 2.5::DOUBLE},
+	'@b varchar(5), @d varchar(30), @x varchar(5), @i int, @f int');
+----
+1	2024-01-02 10:11:12.1234560	abc	12	2
+
+# The native string types are strings: declared from their own annotation or
+# by a written list, and a '42' of them into an int converts like any VARCHAR.
+query IIIIII
+SELECT * FROM mssql_scan_params('spr',
+	'SELECT @a AS a, @b AS b, CAST(SQL_VARIANT_PROPERTY(@a, ''BaseType'') AS varchar(20)) AS ta, CAST(SQL_VARIANT_PROPERTY(@b, ''BaseType'') AS varchar(20)) AS tb, @c AS c, @d AS d',
+	{'a': 'abc'::MSSQL_VARCHAR(10), 'b': 'привет'::MSSQL_NVARCHAR(20), 'c': '42'::MSSQL_VARCHAR(5), 'd': 'xyz'::MSSQL_NVARCHAR('MAX')});
+----
+abc	привет	varchar	nvarchar	42	xyz
+
+query II
+SELECT * FROM mssql_scan_params('spr', 'SELECT @c + 1 AS c, @s AS s',
+	{'c': '42'::MSSQL_VARCHAR(5), 's': 'abc'::MSSQL_NVARCHAR(10)}, '@c int, @s varchar(10)');
+----
+43	abc
+
+# A string into a varbinary is not an implicit conversion the server makes;
+# the RPC form had sent the UTF-8 bytes instead.
+statement error
+SELECT * FROM mssql_scan_params('spr', 'SELECT @v AS v', {'v': 'abc'}, '@v varbinary(10)');
+----
+Implicit conversion from data type nvarchar to varbinary is not allowed
+
+# A value the declared type cannot take keeps the batch form, and the server
+# answers as it always has.
+statement error
+SELECT * FROM mssql_scan_params('spr', 'SELECT @i AS i', {'i': 'abc'}, '@i int');
+----
+Conversion failed
+
+# A parameter name past SQL Server's 128 characters is refused before anything is sent.
+statement error
+SELECT * FROM mssql_scan_params('spr', 'SELECT 1 AS x', {'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa': 1});
+----
+at most 128 characters
+
+# prepared := true: sp_prepare at bind, then sp_execute over RPC with the
+# values as positional typed parameters.
+query IIIII
+SELECT * FROM mssql_scan_params('spr',
+	'SELECT @i AS i, @d AS d, CONVERT(varchar(30), @ts, 121) AS ts, @s AS s, @g AS g',
+	{'i': 42::BIGINT, 'd': -12.34::DECIMAL(10,2), 'ts': TIMESTAMP_NS '2024-01-02 10:11:12.1234567', 's': 'привет',
+	 'g': '6F9619FF-8B86-D011-B42D-00C04FC964FF'::UUID}, prepared := true);
+----
+42	-12.34	2024-01-02 10:11:12.1234567	привет	6f9619ff-8b86-d011-b42d-00c04fc964ff
+
+query I
+SELECT t FROM mssql_scan_params('spr', 'SELECT @g.STAsText() AS t', {'g': 'POINT (3 4)'}, '@g geometry', prepared := true);
+----
+POINT (3 4)
+
+# A typed NULL, a value past nvarchar(4000) (PLP), and a declarations list
+# written in another order than the STRUCT: the values follow sp_prepare's
+# parameter list, which is the STRUCT's order.
+query III
+SELECT n IS NULL, len, b FROM mssql_scan_params('spr', 'SELECT @n AS n, LEN(@s) AS len, @b AS b',
+	{'n': NULL::INTEGER, 's': repeat('x', 5000), 'b': 7}, '@b int, @s nvarchar(max), @n int', prepared := true);
+----
+true	5000	7
+
+# Inside a transaction the handle runs on the pinned connection.
+statement ok
+BEGIN;
+
+query I
+SELECT v FROM mssql_scan_params('spr', 'SELECT @v * 2 AS v', {'v': 21}, prepared := true);
+----
+42
+
+statement ok
+COMMIT;
+
+# That the handle goes as an sp_execute RPC call (and a CLR declaration as
+# the batch) is asserted on the request itself, in test/cpp/test_sql_params.cpp:
+# a cheap ad-hoc batch is not kept in the plan cache, so the server cannot
+# tell the two forms apart from SQL.
+
+# mssql_exec_params: one RPC call per row.
+statement ok
+SELECT mssql_exec('spr', 'DROP TABLE IF EXISTS dbo.spr_t; CREATE TABLE dbo.spr_t (id int, d decimal(10,2), s nvarchar(20))');
+
+query I
+SELECT sum(mssql_exec_params('spr', 'INSERT INTO dbo.spr_t VALUES (@id, @d, @s)', {'id': i::INTEGER, 'd': (i * 1.5)::DECIMAL(10,2), 's': 'v' || i})) FROM range(1, 4) t(i);
+----
+3
+
+query III
+SELECT * FROM mssql_scan('spr', 'SELECT id, d, s FROM dbo.spr_t ORDER BY id');
+----
+1	1.50	v1
+2	3.00	v2
+3	4.50	v3
+
+# A NULL value, and inside a transaction: the RPC carries the descriptor and
+# rolls back with it.
+statement ok
+SELECT mssql_exec_params('spr', 'INSERT INTO dbo.spr_t VALUES (@id, @d, @s)', {'id': 9::INTEGER, 'd': NULL::DECIMAL(10,2), 's': NULL::VARCHAR});
+
+query III
+SELECT * FROM mssql_scan('spr', 'SELECT id, d, s FROM dbo.spr_t WHERE id = 9');
+----
+9	NULL	NULL
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT mssql_exec_params('spr', 'INSERT INTO dbo.spr_t VALUES (@id, @d, @s)', {'id': 10::INTEGER, 'd': 1.00::DECIMAL(10,2), 's': 'tx'});
+
+query I
+SELECT count(*) FROM mssql_scan_params('spr', 'SELECT id FROM dbo.spr_t WHERE id = @id', {'id': 10});
+----
+1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM mssql_scan_params('spr', 'SELECT id FROM dbo.spr_t WHERE id = @id', {'id': 10});
+----
+0
+
+# A pool of one connection.
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+DETACH spr;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS spr (TYPE mssql);
+
+query I
+SELECT count(*) FROM mssql_scan_params('spr', 'SELECT id FROM dbo.spr_t WHERE id > @id', {'id': 0});
+----
+4
+
+statement ok
+RESET mssql_connection_limit;
+
+statement ok
+SELECT mssql_exec('spr', 'DROP TABLE dbo.spr_t');
+
+statement ok
+DETACH spr;

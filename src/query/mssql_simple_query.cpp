@@ -94,7 +94,7 @@ static std::string ConvertValueToString(const std::vector<uint8_t> &value, const
 // MSSQLSimpleQuery Implementation
 //===----------------------------------------------------------------------===//
 
-SimpleQueryResult MSSQLSimpleQuery::Execute(tds::TdsConnection &connection, const std::string &sql, int timeout_ms) {
+SimpleQueryResult MSSQLSimpleQuery::Execute(tds::TdsConnection &connection, const tds::Request &sql, int timeout_ms) {
 	SimpleQueryResult result;
 
 	// Use callback version to collect all rows
@@ -118,7 +118,7 @@ SimpleQueryResult MSSQLSimpleQuery::Execute(tds::TdsConnection &connection, cons
 	return result;
 }
 
-std::string MSSQLSimpleQuery::ExecuteScalar(tds::TdsConnection &connection, const std::string &sql, int timeout_ms) {
+std::string MSSQLSimpleQuery::ExecuteScalar(tds::TdsConnection &connection, const tds::Request &sql, int timeout_ms) {
 	SimpleQueryResult result = Execute(connection, sql, timeout_ms);
 	if (result.HasError() || result.rows.empty() || result.rows[0].empty()) {
 		return "";
@@ -126,14 +126,14 @@ std::string MSSQLSimpleQuery::ExecuteScalar(tds::TdsConnection &connection, cons
 	return result.rows[0][0];
 }
 
-SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &connection, const std::string &sql,
+SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &connection, const tds::Request &sql,
 														RowCallback callback, int timeout_ms) {
 	return ExecuteWithSetCallback(
 		connection, sql, [&callback](size_t, const std::vector<std::string> &values) { return callback(values); },
 		timeout_ms);
 }
 
-SimpleQueryResult MSSQLSimpleQuery::ExecuteWithSetCallback(tds::TdsConnection &connection, const std::string &sql,
+SimpleQueryResult MSSQLSimpleQuery::ExecuteWithSetCallback(tds::TdsConnection &connection, const tds::Request &sql,
 														   RowSetCallback callback, int timeout_ms) {
 	SimpleQueryResult result;
 
@@ -159,7 +159,7 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithSetCallback(tds::TdsConnection &c
 	socket->ClearReceiveBuffer();
 
 	// Send the SQL batch
-	if (!connection.ExecuteBatch(sql, "simple query (metadata/DDL)")) {
+	if (!connection.ExecuteRequest(sql, "simple query (metadata/DDL)")) {
 		result.success = false;
 		result.error_message = "Failed to send SQL batch: " + connection.GetLastError();
 		return result;

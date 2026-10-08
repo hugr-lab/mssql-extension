@@ -141,6 +141,17 @@ private:
 
 	mutable mutex metadata_mutex_;
 	unique_ptr<MSSQLTransactionMetadata> metadata_;
+
+public:
+	//! The materialize lock of this transaction's scans and sinks (see
+	//! MSSQLCatalog::MaterializeMutexFor): they share its one pinned connection,
+	//! and nothing else does (issue #409).
+	std::mutex &MaterializeMutex() {
+		return materialize_mutex_;
+	}
+
+private:
+	std::mutex materialize_mutex_;
 };
 
 //===----------------------------------------------------------------------===//

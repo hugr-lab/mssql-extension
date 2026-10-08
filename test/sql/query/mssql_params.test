@@ -194,7 +194,7 @@ parameter 'p' is NULL of no type; cast it to the column's type, e.g. NULL::INTEG
 statement error
 SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'p': [1, 2]});
 ----
-a table-valued parameter needs RPC
+table-valued parameters are not supported
 
 statement error
 SELECT * FROM mssql_scan_params('pm75', 'SELECT @p AS v', {'my p': 1});

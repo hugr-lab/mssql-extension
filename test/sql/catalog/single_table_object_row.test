@@ -1,0 +1,112 @@
+# name: test/sql/catalog/single_table_object_row.test
+# description: a table's first touch reads its object row, columns and keys as three result sets (spec 084 D1); only an object WITH columns is a table
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# Every check below is the FIRST touch of its object after an invalidation, and
+# nothing lists the schema before it: a listing (duckdb_tables(),
+# duckdb_columns(), SHOW) loads the schema in bulk and the single-table batch
+# would never run.
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS sto (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('sto', $$
+IF OBJECT_ID('dbo.StoSyn', 'SN') IS NOT NULL DROP SYNONYM dbo.StoSyn;
+IF OBJECT_ID('dbo.StoProc', 'P') IS NOT NULL DROP PROCEDURE dbo.StoProc;
+IF OBJECT_ID('dbo.StoTvf', 'IF') IS NOT NULL DROP FUNCTION dbo.StoTvf;
+IF OBJECT_ID('dbo.StoKeyed', 'U') IS NOT NULL DROP TABLE dbo.StoKeyed;
+IF OBJECT_ID('dbo.StoHeap', 'U') IS NOT NULL DROP TABLE dbo.StoHeap;
+IF OBJECT_ID('dbo.[sto]]odd.name]', 'U') IS NOT NULL DROP TABLE dbo.[sto]]odd.name];
+CREATE TABLE dbo.StoKeyed (id int PRIMARY KEY, a nvarchar(10), b decimal(9,2) NOT NULL);
+INSERT INTO dbo.StoKeyed VALUES (1, N'x', 1.50), (2, N'y', 2.50), (3, NULL, 3.50);
+CREATE TABLE dbo.StoHeap (v int);
+INSERT INTO dbo.StoHeap SELECT value FROM GENERATE_SERIES(1, 40);
+CREATE TABLE dbo.[sto]]odd.name] (id int PRIMARY KEY, c int);
+INSERT INTO dbo.[sto]]odd.name] VALUES (7, 8);
+CREATE SYNONYM dbo.StoSyn FOR dbo.StoKeyed;
+$$);
+
+statement ok
+SELECT mssql_exec('sto', 'CREATE PROCEDURE dbo.StoProc AS SELECT 1 AS x');
+
+statement ok
+SELECT mssql_exec('sto', 'CREATE FUNCTION dbo.StoTvf() RETURNS TABLE AS RETURN SELECT 1 AS x');
+
+statement ok
+SELECT mssql_invalidate_cache('sto');
+
+# First touch: one batch loads the object row, the columns and the keys.
+query I
+SELECT count(*) FROM sto.dbo.StoKeyed;
+----
+3
+
+# The keys came with it (the third result set): with every further metadata
+# query made to fail, the rowid still resolves.
+statement ok
+SET mssql_test_fail_metadata_after_rows = 1;
+
+query II
+SELECT rowid, b FROM sto.dbo.StoKeyed ORDER BY id;
+----
+1	1.50
+2	2.50
+3	3.50
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE sto.dbo.StoKeyed);
+----
+id	INTEGER
+a	MSSQL_NVARCHAR(10)
+b	DECIMAL(9,2)
+
+statement ok
+RESET mssql_test_fail_metadata_after_rows;
+
+# The row count, from the object row, reaches the planner (40 rows, no filter).
+query II
+EXPLAIN SELECT * FROM sto.dbo.StoHeap;
+----
+physical_plan	<REGEX>:.*~40 rows.*
+
+# A name with ] and . resolves through QUOTENAME, key included.
+query II
+SELECT rowid, c FROM sto.dbo."sto]odd.name";
+----
+7	8
+
+# OBJECT_ID resolves a synonym and a procedure too, but they have no columns:
+# not tables, as before.
+statement error
+SELECT * FROM sto.dbo.StoSyn;
+----
+does not exist
+
+statement error
+SELECT * FROM sto.dbo.StoProc;
+----
+does not exist
+
+# An inline table-valued function has columns and is still taken for a table
+# (unchanged; reading it is the server's to refuse).
+query I
+SELECT column_name FROM (DESCRIBE sto.dbo.StoTvf);
+----
+x
+
+statement ok
+SELECT mssql_exec('sto', 'DROP SYNONYM dbo.StoSyn; DROP PROCEDURE dbo.StoProc; DROP FUNCTION dbo.StoTvf; DROP TABLE dbo.StoKeyed; DROP TABLE dbo.StoHeap; DROP TABLE dbo.[sto]]odd.name];');
+
+statement ok
+DETACH sto;

@@ -38,6 +38,13 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 bool MSSQLReportsNativeTypes(Catalog &catalog) {
+	// The catalog's own `native_types` ATTACH option wins over the setting.
+	if (catalog.GetCatalogType() == "mssql") {
+		const auto option = catalog.Cast<MSSQLCatalog>().GetNativeTypesOption();
+		if (option >= 0) {
+			return option == 1;
+		}
+	}
 	Value setting;
 	if (!DBConfig::GetConfig(catalog.GetDatabase()).TryGetCurrentSetting("mssql_catalog_native_types", setting)) {
 		return true;
@@ -84,8 +91,9 @@ MSSQLTableEntry::MSSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, c
 	  object_type_(metadata.object_type),
 	  approx_row_count_(metadata.approx_row_count),
 	  index_kind_(metadata.index_kind) {
-	// Spec 076 W2: a load that carried the primary key seeds it here, and
-	// EnsurePKLoaded has nothing to fetch.
+	// Spec 076 W2 / 084 D5: every load that publishes a table's columns carries
+	// its key, so the entry is born with it.
+	D_ASSERT(metadata.pk_loaded);
 	if (metadata.pk_loaded) {
 		pk_info_ = metadata.pk_info;
 		pk_loaded_.store(true, std::memory_order_release);
@@ -135,11 +143,7 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 	//===----------------------------------------------------------------------===//
 	// Primary Key / RowId Support (Spec 001-pk-rowid-semantics)
 	//===----------------------------------------------------------------------===//
-	// Pre-populate PK info so InitGlobal can use it for rowid handling.
-	// We load PK info here even if rowid is not requested because:
-	// 1. We don't know if rowid will be requested until InitGlobal
-	// 2. PK discovery is lazy-loaded and cached, so subsequent calls are fast
-	// 3. This enables consistent error handling for views and no-PK tables
+	// The rowid key came with the entry's metadata (spec 084 D5); views have none.
 
 	if (object_type_ == MSSQLObjectType::VIEW) {
 		// Views cannot have rowid - mark as not available
@@ -147,7 +151,6 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 		MSSQL_TE_DEBUG("GetScanFunction: %s.%s is a VIEW (rowid not supported)", mssql_schema.name.c_str(),
 					   name.c_str());
 	} else {
-		// Load PK info (lazy-loaded, cached)
 		EnsurePKLoaded(context);
 
 		if (pk_info_.exists) {
@@ -234,7 +237,7 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 				idx_t row_count = stats_provider.GetRowCount(*connection, mssql_schema.name.GetIdentifierName(),
 															 name.GetIdentifierName(), stats_ttl);
 				info.cardinality = row_count;
-				MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (from DMV)", mssql_schema.name.c_str(),
+				MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (from server)", mssql_schema.name.c_str(),
 							   name.c_str(), (unsigned long long)row_count);
 			} catch (...) {
 				pool.Release(std::move(connection));
@@ -306,102 +309,14 @@ MSSQLSchemaEntry &MSSQLTableEntry::GetMSSQLSchema() {
 //===----------------------------------------------------------------------===//
 
 void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
-	// Fast path: already loaded. Acquire-load synchronises with the
-	// release-store at the end of the slow path so any thread observing
-	// pk_loaded_ == true is guaranteed to also see the fully-published
-	// pk_info_ fields.
-	if (pk_loaded_.load(std::memory_order_acquire)) {
-		return;
-	}
-
-	// Spec 052 EnsurePKLoaded race fix: serialise concurrent first-loads so
-	// only one thread does the RowIdKeyInfo::Discover round trip and the
-	// `pk_info_ = Discover(...)` write. Without this serialisation, two
-	// threads both loaded and both move-assigned, double-freeing the loser's
-	// previous-value vector<PKColumnInfo>. Caught by ASan in scenario 5.
-	std::lock_guard<std::mutex> lock(pk_load_mutex_);
-	// Double-check under the mutex. The mutex provides the happens-before
-	// edge here, so a relaxed load is sufficient.
-	if (pk_loaded_.load(std::memory_order_relaxed)) {
-		return;
-	}
-
-	MSSQL_TE_DEBUG("EnsurePKLoaded: loading PK for %s.%s", schema.name.c_str(), name.c_str());
-
-	auto &mssql_catalog = const_cast<MSSQLTableEntry *>(this)->GetMSSQLCatalog();
-	auto &mssql_schema = const_cast<MSSQLTableEntry *>(this)->GetMSSQLSchema();
-
-	try {
-		auto &pool = mssql_catalog.GetConnectionPool();
-		std::string acquire_failure;
-		// Inside an explicit transaction the transaction's own connection (issue
-		// #380): a pool connection is a second one the pool may not have -- with
-		// the pinned connection holding the pool's last slot the discovery failed
-		// and that failure was cached in the entry for EVERY connection. The
-		// pinned connection sees the same committed indexes for a table the
-		// transaction did not change; a table it changed is its own entry
-		// (MSSQLTransactionMetadata), never this shared one.
-		const bool in_transaction = !context.transaction.IsAutoCommit();
-		std::shared_ptr<tds::TdsConnection> connection;
-		if (in_transaction) {
-			connection = ConnectionProvider::GetConnection(context, mssql_catalog);
-		} else {
-			connection = pool.Acquire(-1, &acquire_failure);
-		}
-		auto release = [&]() {
-			if (in_transaction) {
-				ConnectionProvider::ReleaseConnection(context, mssql_catalog, std::move(connection));
-			} else {
-				pool.Release(std::move(connection));
-			}
-		};
-
-		if (connection) {
-			auto &cache = mssql_catalog.GetMetadataCache();
-			// Spec 052 PR #127: nested try so the connection is returned to the
-			// pool BEFORE the outer catch swallows the exception. Without this
-			// inner release, a Discover() throw under stress (concurrent TDS
-			// hiccup in scenario 5/8) leaks the connection into
-			// `active_connections_` — ~ConnectionPool then fires its quiescence
-			// warning on teardown and the D_ASSERT aborts the debug build.
-			try {
-				pk_info_ = mssql::RowIdKeyInfo::Discover(*connection, mssql_schema.name.GetIdentifierName(),
-														 name.GetIdentifierName(), cache.GetDatabaseCollation());
-			} catch (...) {
-				release();
-				throw;
-			}
-			release();
-		} else {
-			MSSQL_TE_DEBUG("EnsurePKLoaded: no connection available");
-			pk_info_.exists = false;
-			// The pool's own reason, when it has one: a login that failed or a
-			// token that expired is cached here until invalidated, and
-			// invalidating does not help until that is fixed — so say which.
-			pk_info_.discovery_error = acquire_failure.empty()
-										   ? string("no connection could be acquired from the pool")
-										   : "no connection could be acquired from the pool (" + acquire_failure + ")";
-		}
-	} catch (const std::exception &e) {
-		// Not "no key": the refusal says the indexes could not be read and why,
-		// instead of telling the user to add an index they may well have.
-		MSSQL_TE_DEBUG("EnsurePKLoaded: error discovering the rowid key: %s", e.what());
-		pk_info_.exists = false;
-		pk_info_.discovery_error = e.what();
-	}
-
-	// A discovery FAILURE is cached like a result, on purpose (#350 review,
-	// twice over): every reader of pk_info_ after this point is lock-free and
-	// relies on nothing writing pk_info_ again once pk_loaded_ is published —
-	// the spec 052 contract. Leaving pk_loaded_ false on failure so the next
-	// bind retried let a second thread move-assign pk_info_ under a reader's
-	// feet (the use-after-free that contract exists to prevent), and made
-	// every plain SELECT repeat the round trip — or block in Acquire — for as
-	// long as the failure lasted. So the failure is published, the refusal
-	// names it, and names mssql_invalidate_cache() as the way to retry.
-	// Release-store publishes pk_info_ to any reader doing acquire-load.
-	// MUST be the last write to MSSQLTableEntry state in this function.
-	pk_loaded_.store(true, std::memory_order_release);
+	// Spec 084 D5: the key came with the metadata the entry was built from (the
+	// single-table batch's third result set, or the bulk loads'), so there is
+	// nothing to discover here. Until spec 084 this ran a key query per table
+	// -- per transaction, after a preload, on the pinned connection -- and
+	// cached a failed one; a failure now fails the metadata load instead, and
+	// nothing is cached.
+	(void)context;
+	D_ASSERT(pk_loaded_.load(std::memory_order_acquire));
 }
 
 LogicalType MSSQLTableEntry::GetRowIdType(ClientContext &context) {
@@ -442,7 +357,7 @@ const mssql::RowIdKeyInfo &MSSQLTableEntry::GetPrimaryKeyInfo(ClientContext &con
 virtual_column_map_t MSSQLTableEntry::GetVirtualColumns() const {
 	virtual_column_map_t result;
 
-	// Spec 052: acquire-load pairs with EnsurePKLoaded's release-store so
+	// Spec 052: acquire-load pairs with the constructor's release-store so
 	// reading pk_info_.exists / pk_info_.rowid_type below is safe whenever
 	// this load returns true.
 	const bool pk_loaded = pk_loaded_.load(std::memory_order_acquire);
@@ -457,8 +372,7 @@ virtual_column_map_t MSSQLTableEntry::GetVirtualColumns() const {
 	}
 
 	// Check if PK info is loaded and has a primary key
-	// Note: PK info is lazy-loaded in GetScanFunction(), which is called before this
-	// method during binding. If not loaded yet, we can't expose rowid.
+	// The constructor published it (spec 084 D5); without it, no rowid.
 	if (!pk_loaded) {
 		MSSQL_TE_DEBUG("GetVirtualColumns: PK info not loaded for %s, not exposing rowid", name.c_str());
 		return result;
@@ -487,18 +401,16 @@ vector<column_t> MSSQLTableEntry::GetRowIdColumns() const {
 	// that UPDATE produces via BindUpdateConstraints() (issue #140) so both DML paths behave
 	// consistently.
 	//
-	// PK info is lazy-loaded in GetScanFunction(), which runs while the table reference is
-	// bound — before any rowid binding — so pk_info_ is published (pk_loaded_) by the time
-	// we get here. Read pk_loaded_ with acquire ordering, matching GetVirtualColumns().
+	// pk_info_ was published by the constructor (spec 084 D5). Read pk_loaded_
+	// with acquire ordering, matching GetVirtualColumns().
 	if (object_type_ == MSSQLObjectType::VIEW) {
 		throw BinderException("MSSQL: UPDATE/DELETE is not supported on views. '%s.%s' is a view.", schema.name.c_str(),
 							  name.c_str());
 	}
 
-	// pk_info_ may be read without the lock only once pk_loaded_ is observed
-	// true (spec 052): before that, another thread can be move-assigning it
-	// under pk_load_mutex_. GetScanFunction publishes it first on every DML
-	// bind, so the unloaded branch is not expected — but it must not read.
+	// pk_info_ is read only once pk_loaded_ is observed true (spec 052); the
+	// constructor publishes it (spec 084 D5), so the unloaded branch is not
+	// expected -- but it must not read.
 	if (!pk_loaded_.load(std::memory_order_acquire)) {
 		throw BinderException("MSSQL: UPDATE/DELETE on '%s.%s': its rowid key has not been read yet",
 							  schema.name.c_str(), name.c_str());

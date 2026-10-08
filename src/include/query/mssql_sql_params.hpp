@@ -30,6 +30,7 @@
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "tds/tds_request.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -50,12 +51,23 @@ struct SqlParamAssignment {
 std::string BuildExecuteSqlBatch(const std::string &statement, const std::string &declarations,
 								 const std::vector<SqlParamAssignment> &assignments);
 
+//! Spec 083: the same call as an RPC request (sp_executesql, ProcID 10), for
+//! the W4 queries whose parameters are all strings (names -- sysname,
+//! nvarchar(776)): each goes as an nvarchar parameter. Its description is
+//! BuildExecuteSqlBatch's text.
+tds::Request BuildExecuteSqlRequest(const std::string &statement, const std::string &declarations,
+									const std::vector<std::pair<std::string, std::string>> &string_values);
+
 //! One caller parameter (W5): its name, its T-SQL declaration type and the
 //! literal (or expression) that initialises it.
 struct SqlParam {
 	std::string name;		  // without the leading '@'
 	std::string declaration;  // e.g. "int", "nvarchar(4000)", "datetime2(6)"
 	std::string literal;	  // T-SQL constant or expression, "NULL" for a typed NULL
+	//! Spec 083: the value itself, which an RPC request sends as a typed
+	//! parameter. `has_value` false for a parameter known by its literal only.
+	Value value;
+	bool has_value = false;
 };
 
 struct SqlParamSet {
@@ -69,6 +81,8 @@ struct SqlParamSet {
 	//! numbered by position so a set copied from the bind data and extended
 	//! at init stays collision-free.
 	std::string Add(const std::string &declaration, const std::string &literal);
+	//! Spec 083: the same with the value, so the parameter can travel over RPC.
+	std::string Add(const std::string &declaration, const std::string &literal, const Value &value);
 
 	//! "@a int, @b nvarchar(4000)" -- sp_executesql's / sp_prepare's second
 	//! argument; empty when there are no parameters.
@@ -78,8 +92,17 @@ struct SqlParamSet {
 	std::string DeclareBlock() const;
 	//! DECLARE ...; EXEC sp_executesql N'<statement>'[, N'<decl>', @a = @a, ...]
 	std::string ExecuteSqlBatch(const std::string &statement) const;
+	//! Spec 083: the same call as an RPC request (sp_executesql, ProcID 10),
+	//! every parameter encoded from its declared type; its description is
+	//! ExecuteSqlBatch's text. The batch form when a parameter has no value (a
+	//! literal-only parameter).
+	tds::Request ExecuteSqlRequest(const std::string &statement) const;
 	//! DECLARE ...; EXEC sp_execute <handle>[, @a, @b]
 	std::string ExecuteByHandleBatch(int32_t handle) const;
+	//! Spec 083: the same call as an RPC request (sp_execute, ProcID 12): the
+	//! handle and the values as positional typed parameters, so no outer batch
+	//! is compiled per execution. The batch form when a value has no encoding.
+	tds::Request ExecuteByHandleRequest(int32_t handle) const;
 };
 
 //! The SQL Server declaration for a DuckDB value of `type` (spec 075 W5's

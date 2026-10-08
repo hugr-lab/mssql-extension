@@ -760,6 +760,9 @@ int main() {
 		"AS [r] FROM [dbo].[t]) AS [r1]");
 	ExpectGain("SELECT * FROM (SELECT id, count(*) AS c FROM t GROUP BY id) s", true);
 	ExpectGain("SELECT * FROM (SELECT id FROM t WHERE id > 1) s", false);
+	ExpectGain("SELECT id FROM t ORDER BY id LIMIT 0", false);	// an empty result, DuckDB's
+	ExpectGain("SELECT count(*) FROM t LIMIT 0", false);
+	ExpectGain("SELECT id FROM t LIMIT 1", true);
 
 	// The PR E1 gain check: a join link that equates a unique key cannot send
 	// more rows than the other side; one that equates none (many-to-many,

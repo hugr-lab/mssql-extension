@@ -75,8 +75,10 @@ struct StagingCounters {
 	uint64_t constant_columns = 0;
 	uint64_t constant_null_columns = 0;
 	//! Columns by how their payload was sized, counted once per result set.
-	//! `capped` is the interesting one: a bound existed but was too large to
-	//! preallocate, so the column finds its size by growing.
+	//! `bounded`: growth stops at the column's worst case (spec 083 D4: reached
+	//! on demand, not reserved). `capped` is the interesting one: a bound
+	//! existed but was too large to stop at, so the column finds its size by
+	//! growing.
 	uint64_t prealloc_bounded_columns = 0;
 	uint64_t prealloc_capped_columns = 0;
 	uint64_t unbounded_columns = 0;

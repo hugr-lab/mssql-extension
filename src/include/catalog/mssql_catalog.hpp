@@ -68,6 +68,12 @@ struct MSSQLCatalogStartup {
 	//! Spec 079: mssql_remote_pushdown as it stood at ATTACH -- this catalog's
 	//! answer to Supports(IS_REMOTE / EXECUTE_QUERY_NODE) for its life.
 	bool remote_pushdown = false;
+	//! The `native_types` ATTACH option: 1 / 0 over mssql_catalog_native_types
+	//! for this catalog's life, -1 = unset (the setting decides, read where it
+	//! always was). DuckLake's METADATA_PARAMETERS reaches ATTACH options, not
+	//! settings, and the setting is GLOBAL: turning it off for a metadata
+	//! catalog must not change the user's own catalogs.
+	int8_t native_types = -1;
 };
 
 class MSSQLCatalog : public Catalog {
@@ -169,6 +175,11 @@ public:
 	const string &GetPrewarmShortfall() const {
 		return prewarm_shortfall_;
 	}
+	//! The `native_types` ATTACH option (1 / 0), or -1 when the ATTACH did not
+	//! give one. Read through MSSQLReportsNativeTypes, never directly.
+	int8_t GetNativeTypesOption() const {
+		return startup_.native_types;
+	}
 	//! mssql_preload_catalog's body, and the `preload` ATTACH option's (issue
 	//! #324: run by the ATTACH itself, where DuckLake's METADATA_PARAMETERS can
 	//! reach it and a function call cannot) -- ONE implementation, so both keep
@@ -217,13 +228,15 @@ public:
 	//! "not in Idle state". Materialization alone cannot fix that, because the
 	//! race is between the initializations, not inside them.
 	//!
-	//! So a materialized scan holds this from before its batch until after its
-	//! drain. It is contended only by scans that are already serialized by
-	//! construction — they share one pinned connection and cannot run in parallel
-	//! anyway — so it costs nothing that was not already sequential.
-	std::mutex &MaterializeMutex() {
-		return materialize_mutex_;
-	}
+	//! So a materialized scan holds a lock from before its batch until after its
+	//! drain, and a sink takes it before it uses the connection. The lock is
+	//! the one of the connection they share (MaterializeMutexFor): inside a
+	//! transaction the transaction's own -- its pinned connection is shared by
+	//! nothing else, so scans of other DuckDB connections, each on its own
+	//! pinned connection, never wait for it (issue #409: one lock per catalog
+	//! serialised every transaction in the process); in autocommit this one, the
+	//! catalog's, for the pool of one connection every statement shares.
+	std::mutex &MaterializeMutexFor(ClientContext &context);
 
 	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction, const EntryLookupInfo &schema_lookup,
 												  OnEntryNotFound if_not_found) override;
@@ -285,6 +298,27 @@ public:
 
 	// Get statistics provider
 	MSSQLStatisticsProvider &GetStatisticsProvider();
+	//! Spec 081: the declared types of `columns :=` this catalog's unsafe scans
+	//! parsed (mssql_functions.cpp's ParseDeclaredType decides what may be kept).
+	//! Per catalog, never per process: nothing is shared between database
+	//! instances, and a DETACH drops it.
+	bool TryGetDeclaredType(const string &text, LogicalType &out) {
+		std::lock_guard<std::mutex> lock(declared_types_mutex_);
+		auto it = declared_types_.find(text);
+		if (it == declared_types_.end()) {
+			return false;
+		}
+		out = it->second;
+		return true;
+	}
+	void StoreDeclaredType(const string &text, const LogicalType &type) {
+		std::lock_guard<std::mutex> lock(declared_types_mutex_);
+		if (declared_types_.size() >= 1024) {
+			declared_types_.clear();
+		}
+		declared_types_.emplace(text, type);
+	}
+
 	mssql::DescribeCache &GetDescribeCache() {
 		return describe_cache_;
 	}
@@ -493,8 +527,8 @@ private:
 	//! loaded or the transaction changed everything (issue #380).
 	MSSQLMetadataCache &SchemaListCache(ClientContext *context);
 
-	//! See MaterializeMutex(). Not the transaction's connection_mutex_: that one
-	//! guards the pinned-connection member accessors and is taken and released
+	//! See MaterializeMutexFor(): autocommit's lock. Not the transaction's
+	//! connection_mutex_: that one guards the pinned-connection member accessors and is taken and released
 	//! inside them, where this must span a whole batch-and-drain.
 	std::mutex materialize_mutex_;
 
@@ -546,6 +580,8 @@ private:
 	unique_ptr<MSSQLStatisticsProvider> statistics_provider_;  // Statistics provider
 	//! Spec 079 PR E2: the shapes of the statements remote pushdown sends.
 	mssql::DescribeCache describe_cache_;
+	std::mutex declared_types_mutex_;
+	unordered_map<string, LogicalType> declared_types_;
 	int32_t database_code_page_ = 0;  // COLLATIONPROPERTY(database collation, 'CodePage'), issue #361
 	//! sys.databases.snapshot_isolation_state for this database, probed at ATTACH
 	//! (issue #331): 0 OFF, 1 ON, 2/3 in transition; -1 when the probe did not

@@ -1,0 +1,275 @@
+# name: test/sql/query/mssql_scan_unsafe.test
+# description: Spec 081 -- mssql_scan_unsafe / mssql_scan_params_unsafe take the result's shape from columns := {...}, ask the server nothing at bind, and check the stream against it at init
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS su (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('su', 'DROP TABLE IF EXISTS dbo.su_t;
+	CREATE TABLE dbo.su_t (id int NOT NULL PRIMARY KEY, name nvarchar(20) NULL, ts datetime2(7) NULL, dt datetime NULL, big bigint NULL);
+	INSERT INTO dbo.su_t VALUES (1, N''a'', ''2024-01-01 10:00:00.1234567'', ''2024-01-01 10:00:00'', 10), (2, N''b'', NULL, NULL, NULL)');
+
+# The shape is the caller's: names in STRUCT order, types as given.
+query ITT
+SELECT id, name, typeof(name) FROM mssql_scan_unsafe('su', 'SELECT id, name FROM dbo.su_t ORDER BY id', columns := {'id': 'INTEGER', 'name': 'VARCHAR'});
+----
+1	a	VARCHAR
+2	b	VARCHAR
+
+query IT
+SELECT k, label FROM mssql_scan_unsafe('su', 'SELECT id, name FROM dbo.su_t ORDER BY id', columns := {'k': 'INTEGER', 'label': 'MSSQL_NVARCHAR(20)'});
+----
+1	a
+2	b
+
+# A datetime2 into a TIMESTAMP_NS (the unit it decodes into), as column_types takes it.
+query T
+SELECT ts FROM mssql_scan_unsafe('su', 'SELECT ts FROM dbo.su_t WHERE id = 1', columns := {'ts': 'TIMESTAMP_NS'});
+----
+2024-01-01 10:00:00.1234567
+
+# The bind asks the server nothing: no connection is taken to plan it.
+statement ok
+CREATE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('su');
+
+statement ok
+EXPLAIN SELECT * FROM mssql_scan_unsafe('su', 'SELECT id FROM dbo.su_t', columns := {'id': 'INTEGER'});
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('su')) - (SELECT n FROM acquired);
+----
+0
+
+# With parameters.
+query I
+SELECT id FROM mssql_scan_params_unsafe('su', 'SELECT id FROM dbo.su_t WHERE id > @min ORDER BY id', {'min': 1}, columns := {'id': 'INTEGER'});
+----
+2
+
+query I
+SELECT id FROM mssql_scan_params_unsafe('su', 'SELECT id FROM dbo.su_t WHERE id > @min ORDER BY id', {'min': 0}, '@min int', columns := {'id': 'INTEGER'});
+----
+1
+2
+
+# Two in one statement inside a transaction: nothing runs at bind, so they do
+# not contend for the pinned connection there.
+statement ok
+BEGIN;
+
+query II
+SELECT a.id, b.big FROM mssql_scan_unsafe('su', 'SELECT id FROM dbo.su_t', columns := {'id': 'INTEGER'}) a
+JOIN mssql_scan_unsafe('su', 'SELECT id, big FROM dbo.su_t', columns := {'id': 'INTEGER', 'big': 'BIGINT'}) b USING (id)
+ORDER BY a.id;
+----
+1	10
+2	NULL
+
+statement ok
+COMMIT;
+
+# Beside a catalog scan of the same catalog inside a transaction: the optimizer
+# counts the unsafe scan as a raw scan, so the catalog scan materialises and the
+# two take turns on the pinned connection (uncounted, the catalog scan streamed
+# and the unsafe scan found the connection Executing).
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM (SELECT id FROM su.dbo.su_t UNION ALL
+SELECT id FROM mssql_scan_unsafe('su', 'SELECT id FROM dbo.su_t', columns := {'id': 'INTEGER'}));
+----
+4
+
+query II
+SELECT t.id, u.big FROM su.dbo.su_t t
+JOIN mssql_scan_unsafe('su', 'SELECT id, big FROM dbo.su_t', columns := {'id': 'INTEGER', 'big': 'BIGINT'}) u USING (id)
+ORDER BY t.id;
+----
+1	10
+2	NULL
+
+statement ok
+COMMIT;
+
+# One connection per execution, none to bind.
+statement ok
+CREATE OR REPLACE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('su');
+
+statement ok
+SELECT * FROM mssql_scan_unsafe('su', 'SELECT id FROM dbo.su_t', columns := {'id': 'INTEGER'});
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('su')) - (SELECT n FROM acquired);
+----
+1
+
+# A batch the server cannot describe (it reads a #temp table it creates):
+# mssql_scan has to run it at bind, so even its EXPLAIN takes connections ...
+statement ok
+CREATE OR REPLACE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('su');
+
+statement ok
+EXPLAIN SELECT * FROM mssql_scan('su', 'CREATE TABLE #su_tmp (id int); INSERT INTO #su_tmp VALUES (7); SELECT id FROM #su_tmp');
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('su')) - (SELECT n FROM acquired) > 0;
+----
+true
+
+# ... while the _unsafe form binds without looking at the statement, and runs
+# it once, at init (review of #407).
+statement ok
+CREATE OR REPLACE TEMP TABLE acquired AS SELECT acquire_count AS n FROM mssql_pool_stats('su');
+
+statement ok
+EXPLAIN SELECT * FROM mssql_scan_unsafe('su', 'CREATE TABLE #su_tmp (id int); INSERT INTO #su_tmp VALUES (7); SELECT id FROM #su_tmp', columns := {'id': 'INTEGER'});
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('su')) - (SELECT n FROM acquired);
+----
+0
+
+query I
+SELECT id FROM mssql_scan_unsafe('su', 'CREATE TABLE #su_tmp (id int); INSERT INTO #su_tmp VALUES (7); SELECT id FROM #su_tmp', columns := {'id': 'INTEGER'});
+----
+7
+
+query I
+SELECT (SELECT acquire_count FROM mssql_pool_stats('su')) - (SELECT n FROM acquired);
+----
+1
+
+# EXPLAIN says where the shape came from.
+query II
+EXPLAIN SELECT * FROM mssql_scan_unsafe('su', 'SELECT id FROM dbo.su_t', columns := {'id': 'INTEGER'});
+----
+physical_plan	<REGEX>:.*given \(columns :=\).*
+
+# DECIMAL is read at the precision and scale the server sends.
+query T
+SELECT d FROM mssql_scan_unsafe('su', 'SELECT CAST(1.5 AS decimal(10,2)) AS d', columns := {'d': 'DECIMAL(10,2)'});
+----
+1.50
+
+statement error
+SELECT d FROM mssql_scan_unsafe('su', 'SELECT CAST(1.5 AS decimal(10,2)) AS d', columns := {'d': 'DECIMAL(12,2)'});
+----
+mssql_scan_unsafe: the statement returned
+
+# Declared types are parsed once per process -- built-in ones and the MSSQL
+# labels. A user type is parsed every time: redefined, it reads as its new
+# definition (here BIGINT, then INTEGER, which the bigint column refuses).
+statement ok
+CREATE TYPE su_id AS BIGINT;
+
+query I
+SELECT big FROM mssql_scan_unsafe('su', 'SELECT big FROM dbo.su_t WHERE id = 1', columns := {'big': 'su_id'});
+----
+10
+
+statement ok
+DROP TYPE su_id;
+
+statement ok
+CREATE TYPE su_id AS INTEGER;
+
+statement error
+SELECT big FROM mssql_scan_unsafe('su', 'SELECT big FROM dbo.su_t WHERE id = 1', columns := {'big': 'su_id'});
+----
+cannot read
+
+statement ok
+DROP TYPE su_id;
+
+# So is a user type defined as one of this extension's labels.
+statement ok
+CREATE TYPE su_name AS MSSQL_VARCHAR(10);
+
+query T
+SELECT typeof(name) FROM mssql_scan_unsafe('su', 'SELECT name FROM dbo.su_t WHERE id = 1', columns := {'name': 'su_name'});
+----
+MSSQL_VARCHAR(10)
+
+statement ok
+DROP TYPE su_name;
+
+statement ok
+CREATE TYPE su_name AS MSSQL_NVARCHAR(20);
+
+query T
+SELECT typeof(name) FROM mssql_scan_unsafe('su', 'SELECT name FROM dbo.su_t WHERE id = 1', columns := {'name': 'su_name'});
+----
+MSSQL_NVARCHAR(20)
+
+statement ok
+DROP TYPE su_name;
+
+# A shape the stream does not fit fails when the query runs, naming both.
+statement error
+SELECT * FROM mssql_scan_unsafe('su', 'SELECT big FROM dbo.su_t', columns := {'big': 'INTEGER'});
+----
+cannot read; statement: SELECT big FROM dbo.su_t
+
+statement error
+SELECT * FROM mssql_scan_unsafe('su', 'SELECT id, name FROM dbo.su_t', columns := {'id': 'INTEGER'});
+----
+cannot read
+
+# A datetime (microseconds) is not a TIMESTAMP_NS's unit: refused, not read 1000x off.
+statement error
+SELECT * FROM mssql_scan_unsafe('su', 'SELECT dt FROM dbo.su_t', columns := {'dt': 'TIMESTAMP_NS'});
+----
+cannot read
+
+# columns is required (DuckDB's binder: a keyword without a default), and is
+# a STRUCT of type names.
+statement error
+SELECT * FROM mssql_scan_unsafe('su', 'SELECT id FROM dbo.su_t');
+----
+"columns" ANY
+
+statement error
+SELECT * FROM mssql_scan_unsafe('su', 'SELECT id FROM dbo.su_t', columns := ['INTEGER']);
+----
+columns := {'name': 'TYPE', ...} is required
+
+statement error
+SELECT * FROM mssql_scan_unsafe('su', 'SELECT id FROM dbo.su_t', columns := {'id': 42});
+----
+must be given as a string
+
+statement error
+SELECT * FROM mssql_scan_unsafe('su', 'SELECT id FROM dbo.su_t', columns := {'id': NULL});
+----
+must be given as a string
+
+statement error
+SELECT * FROM mssql_scan_unsafe('su', 'SELECT id FROM dbo.su_t', columns := {'id': 'NOT_A_TYPE'});
+----
+NOT_A_TYPE
+
+# A type no SQL Server column is read as is refused at bind, before anything is sent.
+statement error
+SELECT * FROM mssql_scan_params_unsafe('su', 'SELECT id FROM dbo.su_t WHERE id = @i', {'i': 1}, columns := {'id': 'TINYINT'});
+----
+mssql_scan_params_unsafe: column id is declared TINYINT, which no SQL Server column is read as
+
+statement error
+SELECT * FROM mssql_scan_unsafe('su', 'SELECT id FROM dbo.su_t', columns := {'id': 'INTEGER[]'});
+----
+which no SQL Server column is read as
+
+statement ok
+SELECT mssql_exec('su', 'DROP TABLE dbo.su_t');
+
+statement ok
+DETACH su;

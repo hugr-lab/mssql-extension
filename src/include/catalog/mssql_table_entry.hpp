@@ -76,7 +76,7 @@ public:
 	//===----------------------------------------------------------------------===//
 
 	// Override to expose rowid virtual column with correct type based on PK
-	// Note: PK info is lazy-loaded in GetScanFunction(), which is called before this
+	// The key came with the metadata the entry was built from (spec 084 D5).
 	virtual_column_map_t GetVirtualColumns() const override;
 
 	// Override to gate the rowid column required by UPDATE/DELETE binding.
@@ -122,10 +122,10 @@ public:
 	// - VIEW: throws BinderException
 	LogicalType GetRowIdType(ClientContext &context);
 
-	// Check if table has a primary key (lazy loads PK info)
+	// Check if table has a primary key
 	bool HasPrimaryKey(ClientContext &context);
 
-	// Get full PK metadata (lazy loads if needed)
+	// Get full PK metadata
 	const mssql::RowIdKeyInfo &GetPrimaryKeyInfo(ClientContext &context);
 
 	//! The key if it is already loaded (with the table's metadata since spec
@@ -145,23 +145,15 @@ private:
 	idx_t approx_row_count_;				 // Cardinality estimate
 	MSSQLIndexKind index_kind_;				 // Physical shape (spec 049)
 
-	// Lazy-loaded PK cache.
-	// Spec 052 EnsurePKLoaded race fix: pk_load_mutex_ serialises concurrent
-	// callers. Without it, two threads both saw the load flag false and both
-	// did `pk_info_ = Discover(...)`, double-freeing the loser's previous
-	// `vector<PKColumnInfo>`. Caught by ASan during spec 052 scenario-5
-	// stress.
-	//
-	// pk_loaded_ is a separate atomic (hoisted out of RowIdKeyInfo so the
-	// struct remains move-assignable). The fast path in EnsurePKLoaded and
-	// the publication check in GetVirtualColumns use load(acquire) /
-	// store(release) so a reader observing pk_loaded_ == true is guaranteed
-	// to see the fully-published pk_info_ assigned under the mutex.
+	// The rowid key, set by the constructor from the metadata it is built from
+	// and never written again (spec 084 D5: every load that publishes a
+	// table's columns carries its key -- the single-table batch and the bulk
+	// loads -- so nothing discovers it later). pk_loaded_ is the release /
+	// acquire publication flag its lock-free readers check (spec 052).
 	mutable std::atomic<bool> pk_loaded_{false};
-	mutable std::mutex pk_load_mutex_;
 	mutable mssql::RowIdKeyInfo pk_info_;
 
-	// Ensure PK info is loaded
+	// The key is loaded with the metadata; this only asserts it (spec 084 D5).
 	void EnsurePKLoaded(ClientContext &context) const;
 };
 

@@ -303,6 +303,7 @@ test/
 │   │   ├── mssql_scan_bind_describe.test # mssql_scan describes at bind, runs at init (spec 075)
 │   │   ├── mssql_scan_describe_types.test # describe's types agree with the stream's (spec 075)
 │   │   ├── mssql_scan_prepared.test # prepared := true via sp_prepare (spec 075)
+│   │   ├── mssql_scan_unsafe.test   # mssql_scan_unsafe / _params_unsafe: shape given, checked at init (spec 081)
 │   │   └── type_mapping.test
 │   ├── rowid/                      # Rowid pseudo-column tests
 │   │   ├── composite_pk_rowid.test # Composite PK rowid behavior

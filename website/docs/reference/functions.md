@@ -44,7 +44,7 @@ FROM mssql_scan('sqlserver', 'SELECT id, name FROM dbo.users WHERE id > 100', pr
 
 ### mssql_scan_params()
 
-`mssql_scan` with parameters. The STRUCT's keys become `@name` variables, declared from the DuckDB types and passed through `sp_executesql`, so SQL Server keeps one compiled plan for the statement and reuses it for every call, from every session.
+`mssql_scan` with parameters. The STRUCT's keys become `@name` variables, declared from the DuckDB types and passed through `sp_executesql` as an RPC call with typed values, so SQL Server keeps one compiled plan for the statement and reuses it for every call, from every session.
 
 **Signature:** `mssql_scan_params(context VARCHAR, statement VARCHAR, params STRUCT [, declarations VARCHAR] [, prepared := false]) -> TABLE(...)`
 
@@ -61,6 +61,45 @@ FROM mssql_scan_params('sqlserver',
 ```
 
 Derived declarations: `BOOLEAN` → `bit`, `TINYINT`/`SMALLINT` → `smallint`, `UTINYINT` → `tinyint`, `INTEGER` → `int`, `BIGINT` → `bigint`, `HUGEINT` → `decimal(38,0)`, `FLOAT` → `real`, `DOUBLE` → `float`, `DECIMAL(p,s)` → `decimal(p,s)`, `DATE` → `date`, `TIME` → `time(6)`, `TIMESTAMP` → `datetime2(6)` (`_S`/`_MS`/`_NS` → `datetime2(0/3/7)`), `TIMESTAMP WITH TIME ZONE` → `datetimeoffset(6)`, `BLOB` → `varbinary(max)`, `UUID` → `uniqueidentifier`, `VARCHAR` → `nvarchar(4000)` (or `nvarchar(max)` past 4000 bytes), `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` → `varchar(n)` / `nvarchar(n)`. A bare `NULL` has no type — cast it (`NULL::INTEGER`); a LIST or STRUCT value cannot travel as a scalar parameter; a key must be a T-SQL identifier (letters, digits, `_`).
+
+### mssql_scan_unsafe() / mssql_scan_params_unsafe()
+
+`mssql_scan` / `mssql_scan_params` with the result's shape **given** instead of described. Bind returns the shape you pass and asks the server nothing — no connection, no `sp_describe_first_result_set` — so it binds inside a transaction, on a pool of one connection, and for a batch the server cannot describe (one that reads a `#temp` table it creates) exactly like any other statement. When the statement runs, its rows are checked against the shape; a stream that does not fit fails the statement, naming it. "Unsafe" means you vouch for the shape.
+
+**Signatures:**
+`mssql_scan_unsafe(context VARCHAR, query VARCHAR, columns := {'name': 'TYPE', ...}) -> TABLE(...)`
+`mssql_scan_params_unsafe(context VARCHAR, statement VARCHAR, params STRUCT [, declarations VARCHAR], columns := {'name': 'TYPE', ...}) -> TABLE(...)`
+
+```sql
+FROM mssql_scan_unsafe('sqlserver', 'SELECT id, name FROM dbo.users',
+    columns := {'id': 'INTEGER', 'name': 'VARCHAR'});
+
+FROM mssql_scan_params_unsafe('sqlserver',
+    'SELECT COUNT_BIG(*) AS n FROM dbo.users WHERE created > @since',
+    {'since': TIMESTAMP '2024-01-02 00:00:00'},
+    columns := {'n': 'BIGINT'});
+```
+
+`columns` is a STRUCT, as `read_csv` takes it: the field names are the result's column names, in order; each value is a type name. Declare each column as the catalog reads its SQL Server type. The check is strict on the kind of each column and nothing is converted; a string column's length and collation are not checked (any string type reads any string):
+
+| SQL Server | declare |
+|---|---|
+| `bit` | `BOOLEAN` |
+| `tinyint` / `smallint` / `int` / `bigint` | `UTINYINT` / `SMALLINT` / `INTEGER` / `BIGINT` (`COUNT(*)` is `int`, `COUNT_BIG(*)` is `bigint`) |
+| `real` / `float` | `FLOAT` / `DOUBLE` |
+| `decimal(p,s)` / `numeric(p,s)` | `DECIMAL(p,s)`, the same precision and scale |
+| `money` / `smallmoney` | `DECIMAL(19,4)` / `DECIMAL(10,4)` |
+| `char` / `varchar` / `nchar` / `nvarchar` / `text` / `ntext` / `xml` | `VARCHAR`, or `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` |
+| `binary` / `varbinary` / `image` / `rowversion` | `BLOB` |
+| `date` / `time` | `DATE` / `TIME` |
+| `datetime` / `smalldatetime` | `TIMESTAMP` |
+| `datetime2(n)` | any TIMESTAMP variant; the one of its scale keeps full precision (`TIMESTAMP_NS` for `datetime2(7)`) |
+| `datetimeoffset` | `TIMESTAMP WITH TIME ZONE` |
+| `uniqueidentifier` | `UUID` |
+| `geometry` | `GEOMETRY`, sent as WKB: `SELECT shape.STAsBinary() AS shape …` |
+| `sql_variant`, `hierarchyid`, other UDTs | not readable as such: cast them in the T-SQL (`CAST(v AS nvarchar(4000))`, `h.ToString()`) |
+
+A type no SQL Server column is read as (`TINYINT`, a LIST, a STRUCT) is refused at bind. Casting each column in the T-SQL to the type you declare keeps the shape from drifting when a table changes. `EXPLAIN` shows `Shape: given (columns :=)`. The remote-pushdown rewriter uses these two for every pushed statement whose column types it knows.
 
 ### mssql_exec()
 

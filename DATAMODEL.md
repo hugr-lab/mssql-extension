@@ -114,7 +114,7 @@ classDiagram
     AuthenticationStrategy <|.. IAuthenticator : adapter (Krb5/WinSSPI)
 ```
 
-- `TdsConnection` owns the socket and (when `encrypt=true`) the TLS context. It exposes the packet-level operations the rest of the extension uses: PRELOGIN, LOGIN7, SQL_BATCH, ATTENTION.
+- `TdsConnection` owns the socket and (when `encrypt=true`) the TLS context. It exposes the packet-level operations the rest of the extension uses: PRELOGIN, LOGIN7, SQL_BATCH, RPC, ATTENTION. A request above this layer is a `tds::Request` -- batch text, or an RPC body built by `tds::RpcRequestBuilder` (spec 083) -- and `ExecuteRequest` sends either through the same path: the transaction descriptor in ALL_HEADERS, RESET_CONNECTION on the first packet, fragmentation at the negotiated packet size. The response is the same token stream, so the result stream and the simple-query reader read both.
 - **The TLS context verifies the server certificate unless told not to** (spec 074): chain against the platform trust store, loaded the way the Azure OAuth client loads it, and subject against the host the socket dialled -- which after a routing hop is the routed host, so the expected name follows the hop with no code of its own. `TlsOptions` (`verify_certificate`, `expected_host` = `HostNameInCertificate`) travel `MSSQLConnectionInfo` -> `TdsConnection::SetTlsOptions` -> `TdsSocket::EnableTls` -> `TlsImpl::Initialize`; a rejected certificate surfaces as `TlsErrorCode::CERT_VERIFY_FAILED` with OpenSSL's reason.
 - Auth strategies cover SQL auth, FEDAUTH (Azure AD), Kerberos (POSIX), and Windows SSPI. `IAuthenticator` is the SPNEGO continuation interface for integrated auth (spec 042).
 - All destructors in this layer are `noexcept` (spec 047 T046k) — the teardown chain has no place to swallow errors except via `MSSQL_POOL_DEBUG_LOG`.
@@ -271,9 +271,8 @@ classDiagram
     }
     class MSSQLTableEntry {
         +GetScanFunction() TableFunction
-        +EnsurePKLoaded()
         -pk_info_ : RowIdKeyInfo
-        -pk_load_mutex_ : mutex
+        -pk_loaded_ : atomic~bool~
     }
     class MSSQLBindAnchors {
         <<ClientContextState>>
@@ -435,10 +434,11 @@ classDiagram
   `FilterPushdown::PushdownGet` and is estimated normally — so the blind spot is
   exactly the successful pushdowns.
 - `TokenCache` is the only remaining process-wide static, but it is **namespaced by `DatabaseInstance*`** (spec 047 FR-012) so two embeddings can use the same Azure secret name without aliasing.
-- Result streams (large `mssql_scan` results) live in `MSSQLCatalog::active_streams_`, keyed by a UUID handle that bridges Bind-time stream creation and InitGlobal-time consumption (spec 047 US3). Since spec 075 that bridge is the **fallback** only: Bind learns the shape from `sp_describe_first_result_set` (or from `sp_prepare`'s answer with `prepared := true`) and the query runs at InitGlobal; a statement the server cannot describe still executes at Bind and registers its stream here. Inside a transaction every scan of a catalog drains at init under `MSSQLCatalog::MaterializeMutex()`, and the optimizer flags the catalog scans of any catalog the plan also **sinks into** (COPY, INSERT) for materialisation, because the sink's batches go down the same pinned connection.
-- Pushed filters (spec 076): the encoder registers each constant in a `mssql::SqlParamSet` on the way through — `EncodeConstantValue`, declared from the column by `DeclarationForColumn` — and `TableScanInitGlobal` wraps the statement with `ExecuteSqlBatch`; the plan-time complex filters keep their set on the bind data (`complex_filter_params`, serialised with the clause). One statement text per filter shape, one server plan.
-- A fresh table's first touch (spec 076 W2): `GetTableMetadata` sends the single-table metadata statement and `RowIdKeyInfo::DiscoverySqlTemplate()` as one batch and reads the key off the second result set (17-column rows — every unique index with its key columns and flags, spec 077 W1; the table rows have 12), so `MSSQLTableMetadata` carries `pk_info` / `pk_loaded` and `MSSQLTableEntry` is constructed with the key; `EnsurePKLoaded` still discovers lazily for entries the bulk paths built.
-- The per-table metadata queries — table list, columns, primary key, row count — carry the schema and table names as `sp_executesql` parameters (`@s sysname, @t sysname`; `query/mssql_sql_params.hpp`), so their text is one fixed string per shape and the server keeps one plan for every table instead of compiling one per first touch (#334).
+- Result streams (large `mssql_scan` results) live in `MSSQLCatalog::active_streams_`, keyed by a UUID handle that bridges Bind-time stream creation and InitGlobal-time consumption (spec 047 US3). Since spec 075 that bridge is the **fallback** only: Bind learns the shape from `sp_describe_first_result_set` (or from `sp_prepare`'s answer with `prepared := true`) and the query runs at InitGlobal; a statement the server cannot describe still executes at Bind and registers its stream here. Inside a transaction every scan of a catalog drains at init under the materialize lock of the connection it shares (`MSSQLCatalog::MaterializeMutexFor`: the transaction's own mutex, held by nothing outside it -- one lock per catalog serialised the transactions of every DuckDB connection, issue #409 -- or the catalog's in autocommit on a pool of one), and the optimizer flags the catalog scans of any catalog the plan also **sinks into** (COPY, INSERT) for materialisation, because the sink's batches go down the same pinned connection.
+- Pushed filters (spec 076): the encoder registers each constant in a `mssql::SqlParamSet` on the way through — `EncodeConstantValue`, declared from the column by `DeclarationForColumn` — and `TableScanInitGlobal` wraps the statement with `ExecuteSqlRequest`, an `sp_executesql` RPC call whose values are encoded from their declared types (spec 083); the plan-time complex filters keep their set on the bind data (`complex_filter_params`, serialised with the clause, values included). One statement text per filter shape, one server plan, and no outer batch for the server to compile per call.
+- A fresh table's first touch (spec 076 W2): `GetTableMetadata` sends one batch of three statements -- the object row (type, row count, shape; spec 084 D1, so the row count is computed once and not once per column), its columns (`COLUMN_DISCOVERY_SQL_TEMPLATE`) and `RowIdKeyInfo::DiscoverySqlTemplate()` -- and routes the result sets by ordinal: the key off the third (17-column rows — every unique index with its key columns and flags, spec 077 W1). A table is found when the object row AND at least one column arrive (a synonym or procedure resolves through `OBJECT_ID` but has no columns), so `MSSQLTableMetadata` carries `pk_info` / `pk_loaded` and `MSSQLTableEntry` is constructed with the key. The bulk loads (preload, listings, `mssql_refresh_cache`) carry every table's key the same way (spec 084 D5), so an entry is always born with it.
+- The bulk loads (spec 071 W2, spec 084 D1/D5/D6): `LoadObjectsAndColumnsLocked` is the one shape behind the whole-catalog load (listing, `mssql_preload_catalog(db)`, `mssql_refresh_cache`) and the one-schema preload -- one batch, three result sets (the objects with row count and shape, their columns, their unique-index keys), grouped on `object_id` client-side, published only after the batch returns (#317). The row count is computed once per object: from one pass over `sys.dm_db_partition_stats` into a table variable `@rc` for an unfiltered whole-catalog load where `VIEW DATABASE STATE` is held (a 1205 inside it is rethrown for the retry; not on Fabric / Synapse; never inside a transaction, where it would run in the user's server transaction), else `OBJECTPROPERTYEX` per object. Objects without columns are not published and columns without an object are dropped (the statements can disagree under concurrent DDL).
+- The per-table metadata queries — object row, columns, keys, row count — carry the schema and table names as `sp_executesql` parameters (`@s sysname, @t sysname`; `query/mssql_sql_params.hpp`; an RPC call since spec 083, `BuildExecuteSqlRequest`), so their text is one fixed string per shape and the server keeps one plan for every table instead of compiling one per first touch (#334).
 
 ### Cache invalidation
 
@@ -548,9 +548,11 @@ every later scan estimate-less (review of #386). It is a count read under the
 transaction, as stale as one an autocommit load takes, and refreshed the same
 way (invalidation, TTL). A transaction's lookup reads the shared **metadata** cache too,
 after the table filter and before going to the server; the entry built from it
-goes into the transaction's OWN layer, because its rowid key may still be
-discovered on the pinned connection and a failed discovery is cached in the
-entry. A miss there is never a "does not exist": autocommit re-queries a name a
+goes into the transaction's OWN layer. Since spec 084 D5 the entry is born with
+its rowid key: every load that publishes a table's columns -- the single-table
+batch, the bulk loads, `mssql_refresh_cache` -- carries the key in the same
+batch, so no key is discovered later, on any connection, and a failed load
+caches nothing. A miss there is never a "does not exist": autocommit re-queries a name a
 loaded listing lacks, and so does the transaction.
 
 ```mermaid
@@ -579,8 +581,9 @@ connection found the uncommitted table in the cache while the transaction was
 open, then hung reading it. Publication at the end avoids both: a changed name
 is never published, and nothing is visible to others before the transaction
 has ended. Other paths that used to reach the pool from inside a transaction
-follow the same rule: the rowid key discovery (`EnsurePKLoaded`) and the schema
-list load go on the pinned connection, and the storage info a table listing asks
+follow the same rule: the schema list load goes on the pinned connection (the
+rowid key needs no query of its own since spec 084 D5: it comes with the
+table's metadata), and the storage info a table listing asks
 for uses the row count loaded with the entry instead of a DMV query per table
 (on a pool of one that query waited `mssql_acquire_timeout` for every table).
 
@@ -781,20 +784,23 @@ writer (`pushdown/mssql_sql_writer`) as a dry run -- whether it RENDERS the
 node, since the rewriter asks about every nested node too and a no anywhere
 poisons the statement -- and `RemoteExecute` decides whether it gains, runs
 the writer again and replaces the node with
-`mssql_scan_params(…, column_types := […])`. A node that does not render or
+`mssql_scan_params(…, column_types := […])` -- or, when the writer types every
+result column, `mssql_scan_params_unsafe(…, columns := {…})`, whose bind asks
+the server nothing (spec 081). A node that does not render or
 gain is handed back as a subquery, table names restored as the query wrote
 them, with each nested part that does replaced by `SELECT * FROM <its
 vehicle>` (PR E1). From there each vehicle is an ordinary raw scan: describe
-at bind, run at init, and the pinned connection inside a transaction -- except
-that the describe is cached per catalog (PR E2, below; since issue #410 for
-every describing scan, not only the rewriter's).
+at bind (none for an `_unsafe` vehicle), run at init, and the pinned
+connection inside a transaction -- except that the describe is cached per
+catalog (PR E2, below; since issue #410 for every describing scan, not only
+the rewriter's).
 
 ```mermaid
 flowchart LR
     P[parsed SELECT] --> R{rewriter:<br/>SupportsPushdown<br/>= renders?}
     R -- no --> B[binder → MSSQLCatalogScan<br/>filter / projection pushdown, MSSQLOptimizer]
     R -- yes --> E{RemoteExecute:<br/>gains? join gain check}
-    E -- "yes (ORDER BY / LIMIT / DISTINCT / GROUP BY / aggregate /<br/>join / subquery / nested set operation)" --> V["mssql_scan_params(T-SQL, params,<br/>column_types) — EXPLAIN shows it"]
+    E -- "yes (ORDER BY / LIMIT / DISTINCT / GROUP BY / aggregate /<br/>join / subquery / nested set operation)" --> V["mssql_scan_params(T-SQL, params, column_types),<br/>or _unsafe(…, columns) when every type is known<br/>— EXPLAIN shows it"]
     E -- "no, or a set operation at the top" --> H["handed back as a subquery:<br/>each part that gains → its own vehicle,<br/>the rest → binder / scan path"]
 ```
 
@@ -841,10 +847,20 @@ Invariants:
   an uncertain join over a table at or above
   `mssql_pushdown_join_rows_threshold` (or of unknown size: a view, a derived
   table) is handed back. Skipped inside a transaction and on a pool of one.
+- **A statement whose every column is typed is not described at all**
+  (spec 081). `VehicleFor` calls `mssql_scan_params_unsafe` /
+  `mssql_scan_unsafe` with the writer's `column_types` as `columns`; the bind
+  takes them as the shape, and the init holds the stream to them by the rule
+  `column_types` is held to against a describe (`ColumnTypeFits`), so the
+  check is the same one, made against the stream. A cast-back column (an
+  integer `sum`, HUGEINT over decimal(38,0)) or a server-typed one keeps the
+  describing vehicle: the writer does not know the wire type exactly there.
+  Such a statement over a table changed behind the catalog fails at init,
+  naming the statement, and clears the describe cache.
 - **A described statement's shape is cached by its text** (PR E2,
   `query/mssql_describe_cache`; first the rewriter's statements, since issue
   #410 every `mssql_scan` / `mssql_scan_params` that describes -- the describe
-  was 2.4 ms of a 3.5 ms TOP 1). The bind notes the statement in the
+  was 2.4 ms of a 3.5 ms TOP 1). The bind stores the statement in the
   catalog's `DescribeCache`; it takes the shape from there (no round
   trip, no connection) while the metadata cache's invalidation epoch is the
   one the describe ran under (and `mssql_catalog_cache_ttl`, when set);
@@ -935,7 +951,7 @@ one connection:
   connection on its first chunk (`BulkLoadSession::DeferAdoption` /
   `AdoptDeferred`), not at init: by the first chunk the source has been drained
   and has given the connection back.
-- **COPY's init** takes `MaterializeMutex` before its connection, so it never
+- **COPY's init** takes the materialize lock (`MaterializeMutexFor`) before its connection, so it never
   waits on a draining scan for the acquire timeout.
 
 (Review of #382. The first cut turned CTAS's bulk load into statements instead,

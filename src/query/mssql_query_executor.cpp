@@ -35,7 +35,7 @@ MSSQLQueryExecutor::MSSQLQueryExecutor(const std::string &context_name) : contex
 
 unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::ExecuteOn(ClientContext &context,
 															std::shared_ptr<tds::TdsConnection> connection,
-															const std::string &sql, bool transaction_pinned,
+															const tds::Request &request, bool transaction_pinned,
 															bool release_to_pool) {
 	ValidateContext(context);
 	auto &catalog = Catalog::GetCatalog(context, Identifier(context_name_));
@@ -49,7 +49,7 @@ unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::ExecuteOn(ClientContext &conte
 	if (release_to_pool && !transaction_pinned) {
 		pool_handle = mssql_catalog.GetConnectionPoolHandle();
 	}
-	auto result_stream = make_uniq<MSSQLResultStream>(std::move(connection), sql, context_name_, pool_handle,
+	auto result_stream = make_uniq<MSSQLResultStream>(std::move(connection), request, context_name_, pool_handle,
 													  transaction_pinned, query_timeout, reset_on_release);
 	if (!result_stream->Initialize()) {
 		throw IOException("Failed to initialize query result stream");
@@ -73,7 +73,7 @@ void MSSQLQueryExecutor::ValidateContext(ClientContext &context) {
 	}
 }
 
-unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::Execute(ClientContext &context, const std::string &sql) {
+unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::Execute(ClientContext &context, const tds::Request &request) {
 	MSSQL_EXEC_DEBUG_LOG(1, "Execute: START context='%s'", context_name_.c_str());
 	auto total_start = std::chrono::steady_clock::now();
 
@@ -112,9 +112,9 @@ unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::Execute(ClientContext &context
 	// TransactionContext::Commit).
 	const bool transaction_pinned = ConnectionProvider::IsInTransaction(context, mssql_catalog);
 	const bool reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
-	auto result_stream =
-		make_uniq<MSSQLResultStream>(std::move(connection), sql, context_name_, mssql_catalog.GetConnectionPoolHandle(),
-									 transaction_pinned, query_timeout, reset_on_release);
+	auto result_stream = make_uniq<MSSQLResultStream>(std::move(connection), request, context_name_,
+													  mssql_catalog.GetConnectionPoolHandle(), transaction_pinned,
+													  query_timeout, reset_on_release);
 
 	// Initialize the stream (sends query, waits for COLMETADATA)
 	// If Initialize() throws, result_stream destructor will release connection back to pool

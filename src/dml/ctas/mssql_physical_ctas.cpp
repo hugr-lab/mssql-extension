@@ -47,8 +47,8 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 
 	// The existence checks -- and on a pool of one the DDL -- share a connection
 	// with a source scan of this catalog that DuckDB may be initialising on
-	// another thread, draining it under the catalog's MaterializeMutex (the
-	// optimizer counts a CTAS as a sink, spec 075 W3): the pinned connection in
+	// another thread, draining it under the connection's materialize lock
+	// (MaterializeMutexFor; the optimizer counts a CTAS as a sink, spec 075 W3): the pinned connection in
 	// a transaction, the pool's only one on a pool of one in autocommit. Wait
 	// for the drain. The condition is the optimizer's own -- a transaction, or
 	// a pool of one -- because the scan takes the mutex on exactly that flag
@@ -56,7 +56,7 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 	const bool one_connection = catalog_.GetConnectionLimit() <= 1;
 	std::unique_lock<std::mutex> materialize_lock;
 	if (gstate->state.in_transaction || one_connection) {
-		materialize_lock = std::unique_lock<std::mutex>(catalog_.MaterializeMutex());
+		materialize_lock = std::unique_lock<std::mutex>(catalog_.MaterializeMutexFor(context));
 	}
 
 	// Execute DDL phase immediately (CREATE TABLE or DROP + CREATE for OR REPLACE)

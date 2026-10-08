@@ -100,7 +100,8 @@ EXPLAIN SELECT c.region, count(*) AS orders, sum(o.total) AS revenue
 FROM sqlserver.dbo.orders o JOIN sqlserver.dbo.customers c ON o.customer_id = c.id
 WHERE o.placed >= DATE '2026-01-01'
 GROUP BY c.region ORDER BY revenue DESC LIMIT 10;
--- Mssql Scan Params: SELECT TOP (10) [r2].[region] AS [region], COUNT_BIG(*) AS [orders], ...
+-- (o.total is a decimal column, so every result type is known: no describe)
+-- Mssql Scan Params Unsafe: SELECT TOP (10) [r2].[region] AS [region], COUNT_BIG(*) AS [orders], ...
 ```
 
 What goes to the server:
@@ -175,8 +176,13 @@ write the T-SQL yourself with [`mssql_scan`](../reference/functions.md):
 SELECT * FROM mssql_scan('sqlserver', 'SELECT id, name FROM dbo.customers WHERE region = ''EU''');
 ```
 
-**Cost.** Planning a pushed statement asks the server for its result shape
-(`sp_describe_first_result_set`, one round trip). The shape is cached per
+**Cost.** A pushed statement whose every result column has a type the
+extension knows — columns, `count`, an exact `sum` of decimals, `avg`, window
+ranks, and most others — is planned with no round trip at all: it runs through
+[`mssql_scan_unsafe` / `mssql_scan_params_unsafe`](../reference/functions.md),
+its shape taken from the catalog. A statement with a column the server types (arithmetic such as
+`g + 1`, an integer `sum`) asks the server for its result shape
+(`sp_describe_first_result_set`, one round trip). That shape is cached per
 statement form — constants are sent as parameters
 (`mssql_scan_parameterize_filters`, on by default), so `WHERE id = 1` and
 `WHERE id = 2` share it — until the catalog's metadata is invalidated
@@ -191,7 +197,9 @@ SSMS, or `mssql_exec` with `mssql_exec_invalidate_cache = false` — the next
 pushed statement over it fails once with *"the statement's result shape
 changed since it was cached … Run the statement again"*: running it again
 describes it anew. A column whose type the statement takes from the catalog
-stays wrong until the catalog is invalidated, as for the table scan; call
+(including every column of a statement planned without a round trip, which
+then fails naming the statement) stays wrong until the catalog is
+invalidated, as for the table scan; call
 `mssql_invalidate_cache()` after such DDL (or set a
 `mssql_catalog_cache_ttl`).
 

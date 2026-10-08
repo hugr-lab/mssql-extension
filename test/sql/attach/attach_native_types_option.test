@@ -1,0 +1,150 @@
+# name: test/sql/attach/attach_native_types_option.test
+# description: the native_types ATTACH option turns mssql_catalog_native_types on or off for one catalog, over the global setting
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# mssql_catalog_native_types is GLOBAL. DuckLake's METADATA_PARAMETERS reaches
+# ATTACH options, not settings, and a metadata catalog read row by row through
+# Value::ToString pays a cast lookup per value for MSSQL_VARCHAR(n): the option
+# turns that off for the one catalog and leaves the user's catalogs as they are.
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS nto_on (TYPE mssql);
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS nto_off (TYPE mssql, native_types false);
+
+# A string, as METADATA_PARAMETERS (a MAP of VARCHAR) sends it.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS nto_str (TYPE mssql, native_types 'no');
+
+statement ok
+SELECT mssql_exec('nto_on', $$
+IF OBJECT_ID('dbo.NativeTypesOption') IS NOT NULL DROP TABLE dbo.NativeTypesOption;
+CREATE TABLE dbo.NativeTypesOption (id int, n nvarchar(50), v varchar(30));
+INSERT INTO dbo.NativeTypesOption VALUES (1, N'ключ', 'ascii');
+$$);
+
+statement ok
+SELECT mssql_invalidate_cache('nto_on');
+
+statement ok
+SELECT mssql_invalidate_cache('nto_off');
+
+statement ok
+SELECT mssql_invalidate_cache('nto_str');
+
+query III
+SELECT database_name, column_name, data_type FROM duckdb_columns()
+WHERE database_name IN ('nto_on', 'nto_off', 'nto_str') AND table_name = 'NativeTypesOption' AND column_name <> 'id'
+ORDER BY database_name, column_index;
+----
+nto_off	n	VARCHAR
+nto_off	v	VARCHAR
+nto_on	n	MSSQL_NVARCHAR(50)
+nto_on	v	MSSQL_VARCHAR(30)
+nto_str	n	VARCHAR
+nto_str	v	VARCHAR
+
+# The values are the same either way.
+query TT
+SELECT a.n = b.n AND a.v = b.v, typeof(b.n) FROM nto_on.dbo.NativeTypesOption a, nto_off.dbo.NativeTypesOption b;
+----
+true	VARCHAR
+
+# A raw scan of the catalog follows the catalog's option too.
+query T
+SELECT typeof(n) FROM mssql_scan('nto_off', 'SELECT n FROM dbo.NativeTypesOption');
+----
+VARCHAR
+
+query T
+SELECT typeof(n) FROM mssql_scan('nto_on', 'SELECT n FROM dbo.NativeTypesOption');
+----
+MSSQL_NVARCHAR(50)
+
+# The option wins over the setting, both ways: with the setting off, a catalog
+# attached with native_types true keeps the native types, and one attached
+# without the option follows the setting.
+statement ok
+SET mssql_catalog_native_types = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS nto_forced (TYPE mssql, native_types 'true');
+
+query T
+SELECT data_type FROM duckdb_columns()
+WHERE database_name = 'nto_forced' AND table_name = 'NativeTypesOption' AND column_name = 'n';
+----
+MSSQL_NVARCHAR(50)
+
+statement ok
+SELECT mssql_invalidate_cache('nto_on');
+
+query T
+SELECT data_type FROM duckdb_columns()
+WHERE database_name = 'nto_on' AND table_name = 'NativeTypesOption' AND column_name = 'n';
+----
+VARCHAR
+
+statement ok
+RESET mssql_catalog_native_types;
+
+# Remote pushdown types the pushed statement from the catalog's entry, so it
+# follows the option as well.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS nto_push_off (TYPE mssql, remote_pushdown true, native_types false);
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS nto_push_on (TYPE mssql, remote_pushdown true);
+
+query II
+EXPLAIN SELECT n FROM nto_push_off.dbo.NativeTypesOption ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*Mssql Scan Unsafe.*TOP \(1\).*
+
+query T
+SELECT typeof(n) FROM nto_push_off.dbo.NativeTypesOption ORDER BY id LIMIT 1;
+----
+VARCHAR
+
+query T
+SELECT typeof(n) FROM nto_push_on.dbo.NativeTypesOption ORDER BY id LIMIT 1;
+----
+MSSQL_NVARCHAR(50)
+
+statement ok
+DETACH nto_push_off;
+
+statement ok
+DETACH nto_push_on;
+
+# A string that is not a boolean is refused, naming the option.
+statement error
+ATTACH '{MSSQL_TESTDB_DSN}' AS nto_bad (TYPE mssql, native_types 'maybe');
+----
+ATTACH option 'native_types' expects a boolean
+
+statement ok
+SELECT mssql_exec('nto_on', 'DROP TABLE dbo.NativeTypesOption');
+
+statement ok
+DETACH nto_on;
+
+statement ok
+DETACH nto_off;
+
+statement ok
+DETACH nto_str;
+
+statement ok
+DETACH nto_forced;

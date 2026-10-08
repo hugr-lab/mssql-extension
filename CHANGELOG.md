@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`native_types` ATTACH option**: `mssql_catalog_native_types` for one
+  catalog, over the global setting. `ATTACH '…' AS meta (TYPE mssql,
+  native_types false)` reports that catalog's bounded string columns as plain
+  `VARCHAR`, in its tables and its `mssql_scan` results, while every other
+  attached catalog keeps `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)`. Takes a
+  string too (`'false'`, `'no'`), so DuckLake's `METADATA_PARAMETERS` can set it
+  for a metadata catalog. Unset, the setting decides as before.
+
+- **`mssql_scan_unsafe` / `mssql_scan_params_unsafe`** (spec 081): `mssql_scan`
+  / `mssql_scan_params` with the result's shape given as
+  `columns := {'name': 'TYPE', ...}` instead of described. The bind asks the
+  server nothing, so the call binds inside a transaction, on a pool of one
+  connection, and for a batch the server cannot describe (a `#temp` read) like
+  any other statement; the rows are checked against the shape when the
+  statement runs (column count, the kind of each column as the catalog reads
+  it, no conversion; a string's length and collation are not checked), and a
+  mismatch fails the statement naming it. A type no SQL
+  Server column is read as is refused at bind. `EXPLAIN` shows
+  `Shape: given (columns :=)`.
+
 - **Remote pushdown, first shapes (spec 079 PR B), behind
   `mssql_remote_pushdown`** (read at ATTACH; on by default since PR E2, see
   Changed). An attached catalog answers DuckDB's remote-pushdown
@@ -247,7 +267,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of a vararg, so it is named too, and a third argument, which used to be
   accepted and ignored, is refused.
 
+### Changed
+
+- **Metadata queries compute a table's row count once, not once per column**
+  (spec 084). Every query that returned columns carried
+  `OBJECTPROPERTYEX(..., 'Cardinality')` in the same SELECT list, and the
+  server evaluated it on every column row: about 110 logical reads per call on a
+  catalog with keys and constraints. The loads now read the object row and the
+  columns as separate result sets of one batch. A whole-catalog load without
+  filters takes its row counts from one pass over `sys.dm_db_partition_stats`;
+  without the `VIEW DATABASE STATE` permission, on Fabric / Synapse and inside a
+  transaction, it falls back to per-object calls with the same counts. Measured
+  on 200k tables in 100 schemas:
+
+  | operation | before | after |
+  |---|---:|---:|
+  | `mssql_preload_catalog` of the whole catalog | 166 s | 24-29 s |
+  | preload of one schema of 2,000 tables | 1.88 s | 0.53 s |
+  | a table's first touch, server CPU | 1.86 ms | 0.39 ms |
+  | a missing name's "did you mean" names query | 680-700 ms | 297 ms |
+
+- **The bulk loads and `mssql_refresh_cache` carry every table's rowid key**
+  (spec 084). After a preload or a listing, each transaction used to discover
+  the key of every table it scanned on its pinned connection, one extra round
+  trip per table per transaction. The key now comes in the same batch as the
+  columns, everywhere. `mssql_refresh_cache` reloads the catalog in one batch
+  instead of one columns query per table.
+  - A key that cannot be read now fails the metadata load and is retried on the
+    next access. It is no longer cached as a refusal naming
+    `mssql_invalidate_cache`, and the "could not be read" refusal is gone.
+  - A key changed behind the catalog's back (an index added by another client
+    or through `mssql_exec`) is seen after an invalidation or the TTL, like a
+    column. It used to be read at the table's first scan.
+- **CTAS's table and schema existence checks are parameterized** (spec 084):
+  one cached plan for every name instead of an ad-hoc plan per name, and
+  non-ASCII names are checked correctly. A check that fails now reports its
+  error instead of reading as "does not exist".
+
+- **Parameters go as an RPC call, not a batch** (spec 083). Every
+  `sp_executesql` the extension sends -- a pushed filter's constants,
+  `mssql_scan_params`, `mssql_scan_params_unsafe`, `mssql_exec_params`, the
+  per-table metadata queries -- is now a TDS RPC request (packet type 3) with
+  the values as typed parameters, and a `prepared := true` execution an
+  `sp_execute` RPC call. The batch form, `DECLARE @p0 ... = ...; EXEC
+  sp_executesql ...`, made the server parse and compile the outer batch on
+  every call, because its text changes with every value: measured locally, a
+  scan with a pushed filter cost the server 0.26-0.29 ms of CPU that way and
+  0.06-0.07 ms over RPC -- what a literal costs, while keeping one plan per
+  filter shape. A declaration with no RPC encoding (a CLR type such as
+  `geometry`, an alias type, `sql_variant`), or a value its declared type
+  cannot take, keeps the batch form for the whole call, decided before
+  anything is sent. `sp_prepare` stays a batch: it runs once per bind.
+- **A scan allocates its string staging on demand** (spec 083 D4). Each
+  string column's payload buffer used to be sized and zero-filled for a full
+  chunk when the stream opened -- up to 2 MB for a bounded `nvarchar(n)`, 64 KB
+  for a MAX column -- even when the result was empty. It now starts at 4 KB on
+  the first value and doubles, stopping at the column's provable worst case,
+  which used to be reserved up front.
+
 ### Fixed
+
+- **The row count a table's storage info asks the server for always failed.**
+  It read `sys.dm_db_partition_stats` through `p.rows`, but that view's column
+  is `row_count`, so every call failed with error 207 from spec 008 on. The
+  empty answer was taken as 0 and cached. That path is reached when DuckDB asks
+  a table for its storage info in autocommit before any listing, for example
+  when binding `INSERT ... ON CONFLICT`. The 0 then reached the planner for a
+  table the catalog had loaded while it was empty: its scan planned with no
+  estimate. The count now comes from `OBJECTPROPERTYEX(..., 'Cardinality')`,
+  as the catalog's own metadata queries read it: 3 logical reads, against a
+  scan of `sysrowsets` (spec 071). A failed count is no longer cached as 0.
+
+- **In-transaction scans of different DuckDB connections ran one at a time**
+  (#409): the lock that keeps a transaction's scans and sinks from using its
+  pinned connection at once was one per attached catalog, so every
+  transaction in the process waited for every other one's batch and drain,
+  while SQL Server sat idle (measured by the mssql-ducklake side: 70 reads/s at
+  16 readers). It is now the transaction's own; the catalog's is kept for
+  autocommit on a pool of one connection, which every statement shares.
+
+- **A pushed `LIMIT 0` cost a describe and an execution** (spec 081): DuckDB
+  answers it with an empty result and asks the server nothing, so the rewriter
+  now leaves it alone. DuckLake's attach probes every inlined-data table in one
+  `UNION ALL` of `LIMIT 0` branches, and a thousand of them made each attach
+  1.6-1.8x slower with pushdown on.
+
+- **A query naming a missing table loaded every column of the catalog, and
+  reloaded it every time when the database had a schema without tables**
+  (#412). DuckDB walks every schema for its "did you mean" hint; that walk now
+  reads table names only -- from the cache, or one names-only query for all
+  schemas -- instead of building every table's entry with its columns. And a
+  schema with no table or view (a new one, one holding only procedures) never
+  counted as loaded, so each full listing of it ran the whole-catalog metadata
+  query again; it now loads once, like any other. Measured by the
+  mssql-ducklake side on a 4,724-table catalog database: 13-34 s a
+  missing-table query, every time.
 
 - **`mssql_invalidate_cache(ctx, schema)` did nothing for a schema created
   after the catalog listed its schemas**: the schema stayed "does not exist"
@@ -756,6 +870,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than one statement — degrades to the default path.
 
 ### Changed
+
+- **A pushed statement whose every column the extension types is planned
+  without a round trip** (spec 081): the remote-pushdown rewriter sends it
+  through `mssql_scan_params_unsafe` with the catalog's types, so its first
+  run takes one connection instead of two and its bind needs no connection
+  (77% of the pushdown suite's statements). A statement with a column the
+  server types (`g + 1`) or one cast back after the read (an integer `sum`) is
+  described as before, through
+  the shape cache. Over a table changed outside the catalog such a statement
+  now fails at execution rather than at bind, naming the statement and
+  `mssql_invalidate_cache()`.
 
 - **A user's `mssql_scan` / `mssql_scan_params` of a text already described
   binds from the describe cache** (#410): no `sp_describe_first_result_set`,

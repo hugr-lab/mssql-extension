@@ -324,15 +324,15 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		!gstate->transaction_pinned && mssql_catalog.GetConnectionLimit() <= 1 && !bdata.target.IsTempTable();
 
 	// Spec 075 W3: inside a transaction the source scans of this catalog drain
-	// under the catalog's MaterializeMutex, and DuckDB initialises this sink on
-	// another thread while they do. Wait for them here rather than find the
+	// under the connection's materialize lock (MaterializeMutexFor), and DuckDB
+	// initialises this sink on another thread while they do. Wait for them here rather than find the
 	// pinned connection mid-stream; held for the rest of the init, because the
 	// CREATE TABLE below goes down the same connection. Taken BEFORE the
 	// connection: on a pool of one, a scan draining under the mutex holds the
 	// connection this init would otherwise wait for until the acquire timeout.
 	std::unique_lock<std::mutex> materialize_lock;
 	if (gstate->transaction_pinned || defer_connection) {
-		materialize_lock = std::unique_lock<std::mutex>(mssql_catalog.MaterializeMutex());
+		materialize_lock = std::unique_lock<std::mutex>(mssql_catalog.MaterializeMutexFor(context));
 	}
 
 	// Acquire a connection from the pool

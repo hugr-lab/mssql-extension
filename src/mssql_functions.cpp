@@ -7,9 +7,11 @@
 #include "catalog/mssql_table_entry.hpp"
 #include "catalog/mssql_transaction.hpp"
 #include "catalog/mssql_transaction_metadata.hpp"
+#include "codec/sql_server_type_text.hpp"
 #include "codec/target_string_type.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
+#include "duckdb/catalog/default/default_types.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -74,6 +76,7 @@ unique_ptr<FunctionData> MSSQLScanBindData::Copy() const {
 	result->wants_column_types = wants_column_types;
 	result->describe_cache_key = describe_cache_key;
 	result->shape_from_cache = shape_from_cache;
+	result->trusted_function = trusted_function;
 	return std::move(result);
 }
 
@@ -500,7 +503,12 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 			shape.reason = "sp_describe_first_result_set reported a column without a type";
 			return shape;
 		}
-		string base = StringUtil::Lower(type_name.substr(0, type_name.find('(')));
+		// Only the base name: the describe reports length, precision and scale
+		// in columns of their own. A malformed name leaves `base` as written up
+		// to the parenthesis, which the mapping below then refuses by name.
+		mssql::codec::SqlServerTypeText type_text;
+		(void)mssql::codec::ParseSqlServerTypeText(type_name, type_text);
+		const string &base = type_text.base;
 		auto max_length = static_cast<int16_t>(std::atoi(row[len_idx].c_str()));
 		auto precision = static_cast<uint8_t>(std::atoi(row[prec_idx].c_str()));
 		auto scale = static_cast<uint8_t>(std::atoi(row[scale_idx].c_str()));
@@ -646,6 +654,160 @@ static bool ColumnTypeFits(const LogicalType &described, const LogicalType &want
 		return true;
 	}
 	return described.id() == LogicalTypeId::VARCHAR && wanted.id() == LogicalTypeId::VARCHAR;
+}
+
+// Spec 081: a stream read into the shape its caller declared. Not the
+// describe-based StreamMatchesBoundShape (there is no describe): the same
+// predicate column_types is held to, against the stream's own types and its
+// datetime2 columns.
+static bool StreamFitsTrustedShape(const vector<LogicalType> &declared, const MSSQLResultStream &stream) {
+	auto &types = stream.GetColumnTypes();
+	auto &metadata = stream.GetColumnMetadata();
+	if (declared.size() != types.size() || metadata.size() != types.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < declared.size(); i++) {
+		if (!ColumnTypeFits(types[i], declared[i], metadata[i].type_id == tds::TDS_TYPE_DATETIME2)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Spec 081: whether some column of a stream can be read into `declared` --
+// the types the TDS decoder produces (TypeConverter), plus what ColumnTypeFits
+// reads them into: the TIMESTAMP variants and GEOMETRY. Anything else (a
+// TINYINT, a LIST, a STRUCT) fails every stream, so it is refused at bind,
+// before a statement is sent.
+static bool StreamCanProduce(const LogicalType &declared) {
+	switch (declared.id()) {
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::BLOB:
+	case LogicalTypeId::GEOMETRY:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::UUID:
+		return true;
+	default:
+		return false;
+	}
+}
+
+// Whether `text` parses the same in every context, so its LogicalType can be
+// shared by all of them (review of spec 081): a DuckDB built-in that resolved
+// to its own type id (not a user type shadowing the name through the search
+// path), or one of this extension's MSSQL_VARCHAR / MSSQL_NVARCHAR labels BY
+// NAME (a user type defined as a label resolves to the label too). Modifiers
+// must be literals -- digits, or for a label a quoted collation / 'MAX' --
+// since a modifier can be an expression (`getvariable`) or read the context
+// (GEOMETRY's CRS).
+static bool IsCacheableTypeText(const string &text, const LogicalType &type) {
+	const auto open = text.find('(');
+	auto name = text.substr(0, open);
+	StringUtil::Trim(name);
+	const bool label = StringUtil::CIEquals(name, "MSSQL_VARCHAR") || StringUtil::CIEquals(name, "MSSQL_NVARCHAR");
+	if (label) {
+		mssql::codec::TargetStringType spec;
+		if (!mssql::codec::TryGetTargetStringType(type, spec)) {
+			return false;
+		}
+	} else {
+		const auto builtin = DefaultTypeGenerator::GetDefaultType(Identifier(name));
+		if (builtin == LogicalTypeId::INVALID || builtin != type.id()) {
+			return false;
+		}
+	}
+	if (open == string::npos) {
+		return true;
+	}
+	if (text.back() != ')') {
+		return false;
+	}
+	bool quoted = false;
+	for (idx_t i = open + 1; i + 1 < text.size(); i++) {
+		const char c = text[i];
+		if (quoted) {
+			if (c == '\'') {
+				quoted = false;
+			}
+			continue;
+		}
+		if (c == '\'' && label) {
+			quoted = true;
+		} else if (!(c >= '0' && c <= '9') && c != ',' && c != ' ') {
+			return false;
+		}
+	}
+	return !quoted;
+}
+
+// Spec 081: the declared types of `columns :=`, parsed once per catalog. The
+// parse goes through DuckDB's parser (~20 us a type), and pushed statements and
+// DuckLake's metadata reads repeat the same few. Only what parses the same in
+// every context is kept (IsCacheableTypeText): a user type (CREATE TYPE)
+// belongs to a database and can be redefined, so it is parsed every time.
+static LogicalType ParseDeclaredType(const string &text, ClientContext &context, MSSQLCatalog &catalog) {
+	LogicalType cached;
+	if (catalog.TryGetDeclaredType(text, cached)) {
+		return cached;
+	}
+	auto type = TransformStringToLogicalType(text, context);
+	if (IsCacheableTypeText(text, type)) {
+		catalog.StoreDeclaredType(text, type);
+	}
+	return type;
+}
+
+// Spec 081: `columns := {'name': 'TYPE', ...}` -- the result's names in STRUCT
+// order and the type each is read as (the forms column_types takes), as
+// read_csv takes its columns.
+static void BindTrustedShape(ClientContext &context, const TableFunctionBindInput &input, const string &function,
+							 MSSQLScanBindData &bind_data, vector<LogicalType> &return_types,
+							 vector<Identifier> &names) {
+	auto it = input.named_parameters.find("columns");
+	if (it == input.named_parameters.end() || it->second.IsNull() || it->second.type().id() != LogicalTypeId::STRUCT) {
+		throw InvalidInputException(
+			"%s: columns := {'name': 'TYPE', ...} is required -- the shape the statement returns", function);
+	}
+	auto &value = it->second;
+	auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name)).Cast<MSSQLCatalog>();
+	auto &children = StructValue::GetChildren(value);
+	if (children.empty()) {
+		throw InvalidInputException("%s: columns names no column", function);
+	}
+	return_types.clear();
+	names.clear();
+	bind_data.column_names.clear();
+	for (idx_t i = 0; i < children.size(); i++) {
+		auto &name = StructType::GetChildName(value.type(), i);
+		if (children[i].IsNull() || children[i].type().id() != LogicalTypeId::VARCHAR) {
+			throw InvalidInputException("%s: the type of column %s must be given as a string", function,
+										name.GetIdentifierName());
+		}
+		auto type = ParseDeclaredType(StringValue::Get(children[i]), context, catalog);
+		if (!StreamCanProduce(type)) {
+			throw InvalidInputException("%s: column %s is declared %s, which no SQL Server column is read as", function,
+										name.GetIdentifierName(), type.ToString());
+		}
+		return_types.push_back(std::move(type));
+		names.push_back(name);
+		bind_data.column_names.push_back(name.GetIdentifierName());
+	}
+	bind_data.return_types = return_types;
+	bind_data.trusted_function = function;
 }
 
 static bool HasColumnTypes(const TableFunctionBindInput &input) {
@@ -802,12 +964,12 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 				// only from the one session that owns it, and a second global
 				// state over this same (shared) bind data needs a way to run.
 				bind_data.fallback_sql = bind_data.execute_sql;
-				bind_data.execute_sql = params.ExecuteByHandleBatch(handle);
+				bind_data.execute_sql = params.ExecuteByHandleRequest(handle);
 				// Said where the pair is set: InitGlobal falls back to fallback_sql
 				// whenever it cannot claim the session, and execute_sql is by then
 				// a handle only that session can use. Setting one without the other
 				// would send that handle down a pooled connection.
-				D_ASSERT(!bind_data.fallback_sql.empty());
+				D_ASSERT(!bind_data.fallback_sql.sql.empty());
 				MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: prepared handle %d", (int)handle);
 			} else {
 				// The server took the statement but did not settle its shape (a
@@ -970,10 +1132,50 @@ unique_ptr<FunctionData> MSSQLScanParamsBind(ClientContext &context, TableFuncti
 	bind_data->prepared = ReadPreparedOption(input);
 	ValidateScanContext(context, bind_data->context_name);
 	auto params = mssql::BuildSqlParams(input.inputs[2], declarations_override);
-	bind_data->execute_sql = params.ExecuteSqlBatch(bind_data->query);
+	bind_data->execute_sql = params.ExecuteSqlRequest(bind_data->query);
 	bind_data->wants_column_types = HasColumnTypes(input);
 	BindDescribedScan(context, *bind_data, params, return_types, names);
 	ApplyColumnTypes(context, input, *bind_data, return_types);
+	return std::move(bind_data);
+}
+
+// Spec 081: mssql_scan_unsafe(context, query, columns := {...}) -- the shape is
+// the caller's; the bind asks the server nothing (no connection, no describe),
+// so it binds inside a transaction and on a pool of one like any other
+// statement, and the init checks the stream against it.
+unique_ptr<FunctionData> MSSQLScanUnsafeBind(ClientContext &context, TableFunctionBindInput &input,
+											 vector<LogicalType> &return_types, vector<Identifier> &names) {
+	if (input.inputs.size() != 2) {
+		throw InvalidInputException("mssql_scan_unsafe requires a context name and a query, and columns := {...}");
+	}
+	auto bind_data = make_uniq<MSSQLScanBindData>();
+	bind_data->context_name = input.inputs[0].GetValue<string>();
+	bind_data->query = input.inputs[1].GetValue<string>();
+	bind_data->execute_sql = bind_data->query;
+	ValidateScanContext(context, bind_data->context_name);
+	BindTrustedShape(context, input, "mssql_scan_unsafe", *bind_data, return_types, names);
+	return std::move(bind_data);
+}
+
+// mssql_scan_params_unsafe(context, statement, {name: value, ...} [, declarations], columns := {...})
+unique_ptr<FunctionData> MSSQLScanParamsUnsafeBind(ClientContext &context, TableFunctionBindInput &input,
+												   vector<LogicalType> &return_types, vector<Identifier> &names) {
+	if (input.inputs.size() < 3 || input.inputs.size() > 4) {
+		throw InvalidInputException(
+			"mssql_scan_params_unsafe requires a context name, a statement and a STRUCT of parameters, with an "
+			"optional declaration list, and columns := {...}");
+	}
+	auto bind_data = make_uniq<MSSQLScanBindData>();
+	bind_data->context_name = input.inputs[0].GetValue<string>();
+	bind_data->query = input.inputs[1].GetValue<string>();
+	string declarations_override;
+	if (input.inputs.size() == 4 && !input.inputs[3].IsNull()) {
+		declarations_override = input.inputs[3].GetValue<string>();
+	}
+	ValidateScanContext(context, bind_data->context_name);
+	auto params = mssql::BuildSqlParams(input.inputs[2], declarations_override);
+	bind_data->execute_sql = params.ExecuteSqlRequest(bind_data->query);
+	BindTrustedShape(context, input, "mssql_scan_params_unsafe", *bind_data, return_types, names);
 	return std::move(bind_data);
 }
 
@@ -990,9 +1192,10 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name));
 		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
 		// Inside a transaction the stream is on the ONE pinned connection: take the
-		// catalog's MaterializeMutex BEFORE sending the batch, so a catalog scan
-		// materialising on another thread has drained (or has not started) -- the
-		// same order table_scan.cpp keeps. Held through the drain below.
+		// connection's materialize lock (MaterializeMutexFor) BEFORE sending the
+		// batch, so a catalog scan materialising on another thread has drained
+		// (or has not started) -- the same order table_scan.cpp keeps. Held
+		// through the drain below.
 		std::unique_lock<std::mutex> materialize_lock;
 		const bool in_transaction = !context.transaction.IsAutoCommit();
 		// On a pool of one the scans and the sink take turns at the pool exactly
@@ -1011,7 +1214,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		const bool one_connection = mssql_catalog.GetConnectionLimit() <= 1;
 		const bool materialize = in_transaction || one_connection;
 		if (materialize) {
-			materialize_lock = std::unique_lock<std::mutex>(mssql_catalog.MaterializeMutex());
+			materialize_lock = std::unique_lock<std::mutex>(mssql_catalog.MaterializeMutexFor(context));
 		}
 		MSSQLQueryExecutor executor(bind_data.context_name);
 		unique_ptr<MSSQLResultStream> stream;
@@ -1050,13 +1253,13 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		// is consumed; BindDescribedScan asserts the same at the point it sets it
 		// (roborev 1721: an assertion at the write site only says the write
 		// happened, not that a future caller kept the pair together).
-		D_ASSERT(!lost_claim || !bind_data.fallback_sql.empty());
+		D_ASSERT(!lost_claim || !bind_data.fallback_sql.sql.empty());
 		if (claimed) {
 			// The handle lives in the held session; the stream borrows it and gives
 			// it back to the session, not to the pool.
 			stream = executor.ExecuteOn(context, bind_data.prepared_session->connection, bind_data.execute_sql, false,
 										false);
-		} else if (lost_claim && !bind_data.fallback_sql.empty()) {
+		} else if (lost_claim && !bind_data.fallback_sql.sql.empty()) {
 			// Run the ad-hoc batch on a pooled connection of our own. Same rows, no
 			// handle, one plan compilation more -- which beats failing a query the
 			// default path would have served.
@@ -1073,8 +1276,38 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		// (review of #410). A shape described for this very bind is not: it
 		// is the server's answer of a moment ago.
 		const bool names_differ = bind_data.shape_from_cache && stream->GetColumnNames() != bind_data.column_names;
-		if (names_differ || !StreamMatchesBoundShape(described, *stream) ||
-			!StreamMatchesDatetime2(bind_data.described_datetime2, *stream)) {
+		if (!bind_data.trusted_function.empty()) {
+			// Spec 081: the caller's shape, never described -- the stream must
+			// have as many columns, each read as declared by the rule
+			// column_types follows against a describe (ColumnTypeFits).
+			if (!StreamFitsTrustedShape(bind_data.return_types, *stream)) {
+				// Named by its text: a mismatch can surface from inside a batch of
+				// statements (a DuckLake commit), where two shapes alone do not say
+				// which one it was.
+				auto statement = bind_data.query;
+				if (statement.size() > 200) {
+					// Cut at a character boundary: the message must stay UTF-8.
+					idx_t cut = 200;
+					while (cut > 0 && (static_cast<unsigned char>(statement[cut]) & 0xC0) == 0x80) {
+						cut--;
+					}
+					statement = statement.substr(0, cut) + "...";
+				}
+				// The remote-pushdown rewriter declares the shape from the catalog's
+				// metadata: a table changed outside the catalog (mssql_exec DDL, another
+				// client) shows here. The cached describes may read it too.
+				Catalog::GetCatalog(context, Identifier(bind_data.context_name))
+					.Cast<MSSQLCatalog>()
+					.GetDescribeCache()
+					.Clear();
+				throw InvalidInputException(
+					"%s: the statement returned (%s), which its declared columns (%s) cannot read; statement: %s. If "
+					"a table it reads was changed outside this catalog, call mssql_invalidate_cache()",
+					bind_data.trusted_function, TypeListToString(stream->GetColumnTypes()),
+					TypeListToString(bind_data.return_types), statement);
+			}
+		} else if (names_differ || !StreamMatchesBoundShape(described, *stream) ||
+				   !StreamMatchesDatetime2(bind_data.described_datetime2, *stream)) {
 			if (!bind_data.describe_cache_key.empty()) {
 				// A table changed behind the catalog's back (`mssql_exec` DDL): every
 				// cached shape may read it, so all of them are asked again -- one
@@ -1381,7 +1614,7 @@ static bool ExecSqlMayChangeSchema(const string &sql) {
 // of mssql_exec, shared with mssql_exec_params. `statement` is the caller's
 // text for the DDL heuristic -- for mssql_exec_params the batch wraps it in
 // sp_executesql, whose name would otherwise trip the EXEC keyword every time.
-static int64_t RunExecBatch(ClientContext &client_context, const string &context_name, const string &sql,
+static int64_t RunExecBatch(ClientContext &client_context, const string &context_name, const tds::Request &sql,
 							const string &statement, const char *function_name) {
 	// Get the MSSQL catalog (Spec 047: per-catalog ownership)
 	MSSQLCatalog *catalog_ptr = nullptr;
@@ -1461,8 +1694,8 @@ static int64_t RunExecBatch(ClientContext &client_context, const string &context
 				// Review of #382: the shared cache is the caller's to invalidate
 				// (the setting's contract), but inside a transaction the
 				// transaction's own lookups must not keep trusting it -- the
-				// pinned connection now sees DDL the shared cache does not, and a
-				// rowid key discovered on it would be written to a shared entry.
+				// pinned connection now sees DDL the shared cache does not, and
+				// what it loads would be published into the shared cache.
 				catalog.NoteTransactionChangeLocally(client_context);
 			}
 		}
@@ -1536,8 +1769,10 @@ static void MSSQLExecParamsExecute(DataChunk &args, ExpressionState &state, Vect
 		string context_name = bind_data.context_name.empty() ? context_val.ToString() : bind_data.context_name;
 		string statement = sql_val.ToString();
 		auto params = mssql::BuildSqlParams(params_val, decl_val.IsNull() ? string() : decl_val.ToString());
-		string batch = params.ExecuteSqlBatch(statement);
-		MSSQL_FN_DEBUG_LOG(1, "mssql_exec_params: context=%s, batch=%s", context_name.c_str(), batch.c_str());
+		// Spec 083: an RPC call of sp_executesql, the values bound as typed
+		// parameters -- no outer batch for the server to compile per row.
+		const tds::Request batch = params.ExecuteSqlRequest(statement);
+		MSSQL_FN_DEBUG_LOG(1, "mssql_exec_params: context=%s, batch=%s", context_name.c_str(), batch.sql.c_str());
 		out[i] = RunExecBatch(client_context, context_name, batch, statement, "mssql_exec_params");
 	}
 }
@@ -1588,6 +1823,9 @@ static InsertionOrderPreservingMap<string> MSSQLScanToString(TableFunctionToStri
 		auto &bind_data = input.bind_data->Cast<MSSQLScanBindData>();
 		result["Database"] = bind_data.context_name;
 		result["Query"] = bind_data.query;
+		if (!bind_data.trusted_function.empty()) {
+			result["Shape"] = "given (columns :=)";
+		}
 	}
 	return result;
 }
@@ -1634,6 +1872,45 @@ void RegisterMSSQLFunctions(ExtensionLoader &loader) {
 		 {"SELECT * FROM mssql_scan_params('db', 'SELECT name FROM sys.objects WHERE object_id > @id', {'id': 100})",
 		  "SELECT * FROM mssql_scan_params('db', 'SELECT name FROM sys.objects WHERE create_date > @since', "
 		  "{'since': TIMESTAMP '2024-01-01'}, '@since datetime')"},
+		 {"query"}});
+
+	// Spec 081: the same two with the result's shape given, not described.
+	TableFunction scan_unsafe("mssql_scan_unsafe", {LogicalType::VARCHAR, LogicalType::VARCHAR}, MSSQLScanFunction,
+							  MSSQLScanUnsafeBind, MSSQLScanInitGlobal, MSSQLScanInitLocal);
+	scan_unsafe.GetSignature().AddKeywordOnly("columns", LogicalType::ANY);
+	scan_unsafe.to_string = MSSQLScanToString;
+	mssql::RegisterDocumentedFunction(
+		loader, TableFunctionSet(scan_unsafe),
+		{{},
+		 "mssql_scan with the result's shape given instead of described: columns := {'name': 'TYPE', ...} is "
+		 "returned at bind without asking the server (no connection, no describe), and the rows are checked "
+		 "against it when the query runs. The caller vouches for the shape; a stream that does not fit it fails. "
+		 "Types are read as by the catalog: tinyint UTINYINT, datetime2(7) TIMESTAMP_NS, a GEOMETRY column must "
+		 "arrive as WKB (STAsBinary()).",
+		 {"SELECT * FROM mssql_scan_unsafe('db', 'SELECT object_id, name FROM sys.objects', "
+		  "columns := {'object_id': 'INTEGER', 'name': 'VARCHAR'})"},
+		 {"query"}});
+
+	TableFunctionSet scan_params_unsafe("mssql_scan_params_unsafe");
+	for (int with_declarations = 0; with_declarations < 2; with_declarations++) {
+		vector<LogicalType> arguments{LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY};
+		if (with_declarations) {
+			arguments.push_back(LogicalType::VARCHAR);
+		}
+		TableFunction f("mssql_scan_params_unsafe", arguments, MSSQLScanFunction, MSSQLScanParamsUnsafeBind,
+						MSSQLScanInitGlobal, MSSQLScanInitLocal);
+		f.GetSignature().AddKeywordOnly("columns", LogicalType::ANY);
+		f.to_string = MSSQLScanToString;
+		scan_params_unsafe.AddFunction(f);
+	}
+	mssql::RegisterDocumentedFunction(
+		loader, std::move(scan_params_unsafe),
+		{{},
+		 "mssql_scan_params with the result's shape given instead of described (columns := {'name': 'TYPE', "
+		 "...}): nothing is asked of the server at bind, and the rows are checked against the shape when the "
+		 "statement runs.",
+		 {"SELECT * FROM mssql_scan_params_unsafe('db', 'SELECT name FROM sys.objects WHERE object_id > @id', "
+		  "{'id': 100}, columns := {'name': 'VARCHAR'})"},
 		 {"query"}});
 }
 

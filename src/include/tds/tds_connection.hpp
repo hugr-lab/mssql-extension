@@ -8,6 +8,7 @@
 #include "tds/auth/iauthenticator.hpp"
 #include "tds_platform.hpp"
 #include "tds_protocol.hpp"
+#include "tds_request.hpp"
 #include "tds_socket.hpp"
 #include "tds_types.hpp"
 
@@ -152,6 +153,11 @@ public:
 	// Returns true if batch was sent successfully
 	// After this, use ReceiveData() to read response packets
 	bool ExecuteBatch(const std::string &sql, const char *reason = "SQL batch");
+	//! Spec 083: send a batch or an RPC request, whichever `request` holds. The
+	//! same Idle -> Executing transition, transaction descriptor and
+	//! RESET_CONNECTION handling as ExecuteBatch; the response is the same token
+	//! stream.
+	bool ExecuteRequest(const Request &request, const char *reason = "SQL batch");
 
 	// Receive more response data into provided buffer
 	// Returns bytes received, 0 on connection close, -1 on error
@@ -308,6 +314,10 @@ public:
 	}
 
 private:
+	//! ExecuteBatch / ExecuteRequest: send a batch (`rpc_body` null) or an RPC request; `sql` is the text
+	//! for a batch and the description of an RPC.
+	bool SendRequest(const std::string *sql, const std::vector<uint8_t> *rpc_body, const char *reason);
+
 	// Issue #225: record what the server granted. Assignment, not accumulation —
 	// a routed reconnect logs in again, and the new server's answer is the one
 	// that counts. Only a feature this client asked for can be granted: the

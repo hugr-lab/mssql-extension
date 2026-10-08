@@ -4,7 +4,6 @@
 #include <vector>
 #include "catalog/mssql_rowid_key_choice.hpp"
 #include "duckdb/common/types.hpp"
-#include "tds/tds_connection_pool.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -69,11 +68,6 @@ struct RowIdKeyInfo {
 	// Every candidate the choice turned down, with the reason.
 	vector<RowIdKeyRejection> rejections;
 
-	// Non-empty when the discovery query itself failed (no connection, a server
-	// error). `exists` is false then too, but the refusal must not claim the
-	// table has no key when the truth is that nobody could look.
-	string discovery_error;
-
 	// Key structure (only valid if exists == true)
 	vector<PKColumnInfo> columns;  // Ordered by key_ordinal
 
@@ -97,34 +91,35 @@ struct RowIdKeyInfo {
 	// Build rowid type from columns
 	void ComputeRowIdType();
 
-	// Factory method - discovers PK from SQL Server
-	static RowIdKeyInfo Discover(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
-								 const string &database_collation);
-
 	//! Spec 076 W2: the discovery statement, parameterised on @s / @t, so the
 	//! catalog can send it in the same batch as the table's metadata and read
-	//! its rows off the second result set instead of paying a round trip.
+	//! its rows off the third result set (after the object row and the columns,
+	//! spec 084 D1) instead of paying a round trip.
 	static const char *DiscoverySqlTemplate();
 	//! One row of that statement (17 columns: the index, then one of its key
 	//! columns) accumulated as a candidate; false when the row does not have
 	//! that shape. Rows arrive ordered by index_id, key_ordinal, so consecutive
 	//! rows of one index form one candidate.
-	static bool AppendCandidateRow(RowIdKeyInfo &info, const vector<string> &values);
+	//! `base`: where those 17 columns start in the row (1 for the bulk loads'
+	//! rows, which lead with object_id).
+	static bool AppendCandidateRow(RowIdKeyInfo &info, const vector<string> &values, idx_t base = 0);
+	//! Spec 084 D5: the same statement for every object a bulk load covers,
+	//! leading with i.object_id and ordered by object_id, index_id, key_ordinal.
+	//! `from` is the FROM clause up to and including the join to sys.indexes i;
+	//! `where` the caller's predicates (the conditions on i / ic are appended).
+	static string BulkDiscoverySql(const string &from, const string &where);
 	//! After the last row: run the choice over the accumulated candidates and
 	//! publish the result into exists / source / index_name / columns /
 	//! rejections / rowid_type. Idempotent on an empty candidate list.
 	void FinalizeChoice(const string &database_collation);
-	//! Discard accumulated candidates (a deadlock-victim rerun starts over).
-	void ClearCandidates() {
-		candidates_.clear();
-	}
 
 	//! The W5b refusal for a statement that needs rowid on this table: what
 	//! was looked for, what was found, why each candidate was rejected, and
 	//! what fixes it. `verb` is the statement kind, e.g. "UPDATE/DELETE".
-	//! `catalog_name` is only used by the discovery-error shape, which names
-	//! mssql_invalidate_cache(catalog, schema, table) as the way to retry: a
-	//! failed lookup is cached like a result (the readers are lock-free).
+	//! `catalog_name` goes into the hint naming
+	//! mssql_invalidate_cache(catalog, schema, table): the key is cached with
+	//! the table's metadata, so an index added behind the catalog's back is
+	//! seen after that call.
 	string RowIdRefusal(const string &schema_name, const string &table_name, const string &verb,
 						const string &catalog_name = "") const;
 

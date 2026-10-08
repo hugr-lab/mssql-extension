@@ -1,0 +1,64 @@
+# name: test/sql/catalog/row_count_storage_info.test
+# description: the row count GetStorageInfo asks the server for runs and returns the table's count (it failed with error 207 from spec 008 to spec 083)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# GetStorageInfo asks the server for a row count when the statistics cache has
+# none, in autocommit. The query read sys.dm_db_partition_stats through `p.rows`
+# -- that DMV's column is `row_count` -- so every call failed with error 207 and
+# a 0 was cached. Nothing surfaced it: the failure read as an empty result.
+#
+# The path is reached by binding INSERT ... ON CONFLICT on an MSSQL table that
+# was resolved without a listing (DuckDB asks the table for its storage info
+# there). The statement itself is refused by DuckDB's binder: an MSSQL table
+# carries no DuckDB-side constraints.
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rcs (TYPE mssql);
+
+# The table is EMPTY when the catalog loads it, so the count the entry carries
+# is 0; rows then arrive behind the catalog's back. The planner reads the
+# entry's count first and, when it is 0, the statistics cache -- where the
+# server's answer to GetStorageInfo's row count lands. With the broken query
+# that answer was 0 too, and the scan planned with no estimate.
+statement ok
+SELECT mssql_exec('rcs', $$
+IF OBJECT_ID('dbo.RowCountStorageInfo') IS NOT NULL DROP TABLE dbo.RowCountStorageInfo;
+CREATE TABLE dbo.RowCountStorageInfo (id int PRIMARY KEY, v int);
+$$);
+
+statement ok
+SELECT mssql_invalidate_cache('rcs');
+
+query I
+SELECT count(*) FROM rcs.dbo.RowCountStorageInfo;
+----
+0
+
+statement ok
+SELECT mssql_exec('rcs', 'INSERT INTO dbo.RowCountStorageInfo SELECT value, value FROM GENERATE_SERIES(1, 1234)');
+
+statement error
+INSERT INTO rcs.dbo.RowCountStorageInfo VALUES (1, 10) ON CONFLICT DO NOTHING;
+----
+ON CONFLICT
+
+query II
+EXPLAIN SELECT * FROM rcs.dbo.RowCountStorageInfo;
+----
+physical_plan	<REGEX>:.*~1,234 rows.*
+
+statement ok
+SELECT mssql_exec('rcs', 'DROP TABLE dbo.RowCountStorageInfo');
+
+statement ok
+DETACH rcs;
