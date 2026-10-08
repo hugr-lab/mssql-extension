@@ -621,7 +621,7 @@ inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t ren
 		// An all-valid column inside a NULL-bearing chunk still writes every
 		// payload — it just cannot use a stride, because OTHER columns moved the
 		// rows apart. Its inner loop carries no validity test at all.
-		const bool col_all_valid = st.fmt.validity.AllValid();
+		const bool col_all_valid = st.fmt.validity.CannotHaveNull();
 		switch (ops[c].arm) {
 		case mssql::codec::ScatterArm::DirectCopy1:
 			CursorDirect<1>(dst, cursor, r0, rend, st.fmt);
@@ -744,7 +744,7 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 		// indexed per column, not per value.
 		widths[c] = ops[c].wire_width;
 		stride += 1 + widths[c];
-		if (states[c].vec && !states[c].fmt.validity.AllValid()) {
+		if (states[c].vec && !states[c].fmt.validity.CannotHaveNull()) {
 			all_valid = false;
 		}
 	}
@@ -792,7 +792,7 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 				// base_row. Nothing varies, nothing to subtract.
 				continue;
 			}
-			if (st.fmt.validity.AllValid()) {
+			if (st.fmt.validity.CannotHaveNull()) {
 				continue;  // contributes its full width to every row already
 			}
 			const uint32_t w = widths[c];

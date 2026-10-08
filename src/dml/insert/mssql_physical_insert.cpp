@@ -602,7 +602,7 @@ SourceResultType MSSQLPhysicalInsert::GetDataInternal(ExecutionContext &context,
 
 		// Return the count
 		chunk.SetChildCardinality(1);
-		chunk.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(gstate.total_rows_inserted)));
+		chunk.data[0].SetValue(0, Value::BIGINT(static_cast<int64_t>(gstate.total_rows_inserted)));
 
 		return SourceResultType::FINISHED;
 	}

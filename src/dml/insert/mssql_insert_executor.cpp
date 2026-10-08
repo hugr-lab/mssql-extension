@@ -110,8 +110,8 @@ void MSSQLInsertExecutor::RefuseNullIdentity(DataChunk &chunk) {
 	// The chunk is full-width in table order (see MSSQLBatchBuilder::SerializeRow).
 	auto &vec = chunk.data[target_.identity_column_index];
 	UnifiedVectorFormat fmt;
-	vec.ToUnifiedFormat(chunk.size(), fmt);
-	if (fmt.validity.AllValid()) {
+	vec.ToUnifiedFormat(fmt);
+	if (fmt.validity.CannotHaveNull()) {
 		return;
 	}
 	for (idx_t r = 0; r < chunk.size(); r++) {
