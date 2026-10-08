@@ -294,27 +294,11 @@ void CTASExecutionState::ResolveConnectionMode(ClientContext &context, idx_t con
 }
 
 void CTASExecutionState::RunDDL(ClientContext &context, const string &sql) {
-	if (!single_connection) {
-		// A pool connection, autocommitting: the table outlives a ROLLBACK, and
-		// mssql_ctas_drop_on_failure is the undo (see ExecuteBCPInsert).
-		catalog->ExecuteDDL(context, sql);
-		return;
-	}
-	auto conn = ConnectionProvider::GetConnection(context, *catalog);
-	if (!conn) {
-		throw IOException("CTAS: failed to get the transaction's connection for DDL");
-	}
-	SimpleQueryResult result;
-	try {
-		result = MSSQLSimpleQuery::Execute(*conn, sql);
-	} catch (...) {
-		ConnectionProvider::ReleaseConnection(context, *catalog, conn);
-		throw;
-	}
-	ConnectionProvider::ReleaseConnection(context, *catalog, conn);
-	if (!result.success) {
-		throw CatalogException("MSSQL DDL error: %s", result.DescribeError());
-	}
+	// A pool connection, autocommitting: the table outlives a ROLLBACK, and
+	// mssql_ctas_drop_on_failure is the undo (see ExecuteBCPInsert). In single-
+	// connection mode the catalog runs it on the transaction's pinned connection
+	// instead, as it does any catalog DDL there (issue #419).
+	catalog->ExecuteDDL(context, sql);
 }
 
 bool CTASExecutionState::ProbeExists(ClientContext &context, const tds::Request &sql, const char *what) {
@@ -406,8 +390,9 @@ void CTASExecutionState::FlushInserts(ClientContext &context) {
 
 void CTASExecutionState::AttemptCleanup(ClientContext &context) {
 	// One implementation, and it is the context-free one: the DROP needs a
-	// connection and a table name, never anything off the ClientContext.
-	// MSSQLCatalog::ExecuteDDL does not read its own `context` parameter either.
+	// connection and a table name, never anything off the ClientContext. (It
+	// is never reached on the pinned connection: single-connection mode sets
+	// drop_on_failure = false, ROLLBACK being the undo.)
 	AttemptCleanupNoContext();
 }
 

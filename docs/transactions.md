@@ -360,7 +360,13 @@ Inside a transaction:
 autocommit, so ROLLBACK does not undo them (spec 057; the undo for a CTAS is
 `mssql_ctas_drop_on_failure`). The exception is a pool of **one** connection,
 where there is no second connection: a CTAS then runs whole on the pinned one —
-checks, CREATE and rows, the rows as INSERT statements — and ROLLBACK undoes it.
+checks, CREATE and rows, the rows as INSERT statements — and ROLLBACK undoes it;
+so does any catalog DDL (`CREATE` / `DROP` / `ALTER TABLE`, `CREATE` / `DROP
+SCHEMA`), which before issue #419 waited out `mssql_acquire_timeout` for a
+second connection and failed. Under `transaction_isolation = 'snapshot'` (or
+`'auto'` resolving to it) SQL Server refuses `ALTER TABLE` and index DDL
+(a `table_kind = 'columnstore'` CREATE) inside the transaction (error 3964);
+`CREATE` / `DROP TABLE` are allowed.
 DDL sent through `mssql_exec()` has always run on the pinned connection and
 rolls back.
 

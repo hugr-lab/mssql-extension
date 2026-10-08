@@ -1,0 +1,226 @@
+# name: test/sql/transaction/ddl_single_connection_pool.test
+# description: Catalog DDL in a transaction on a pool of ONE connection runs on the transaction's pinned connection and rolls back with it (issue #419)
+# group: [transaction]
+# issue: 419
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Catalog DDL runs on a pool connection and autocommits (spec 057). In a
+# transaction on a pool of one the transaction holds the only connection --
+# any lookup it made pinned it -- so the DDL asked the pool for a second one
+# and waited out mssql_acquire_timeout. It now runs on the pinned connection,
+# inside the transaction, as CTAS does since #380. A short acquire timeout
+# makes any path that still asks for a second connection fail in seconds.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+SET mssql_acquire_timeout = 3;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dsp (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('dsp', 'DROP TABLE IF EXISTS dbo.dsp_t; DROP TABLE IF EXISTS dbo.dsp_gone;
+	IF OBJECT_ID(''dsp_s.dsp_in_s'') IS NOT NULL DROP TABLE dsp_s.dsp_in_s;
+	IF SCHEMA_ID(''dsp_s'') IS NOT NULL DROP SCHEMA dsp_s');
+
+# --- CREATE, ALTER, rows, COMMIT ----------------------------------------------
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE dsp.dbo.dsp_t (id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO dsp.dbo.dsp_t VALUES (1, 'a'), (2, 'b');
+
+statement ok
+ALTER TABLE dsp.dbo.dsp_t ADD COLUMN w INTEGER;
+
+statement ok
+ALTER TABLE dsp.dbo.dsp_t RENAME COLUMN v TO name;
+
+query ITI
+SELECT id, name, w FROM dsp.dbo.dsp_t ORDER BY id;
+----
+1	a	NULL
+2	b	NULL
+
+statement ok
+COMMIT;
+
+# Committed: visible in autocommit, with the altered columns.
+query ITI
+SELECT id, name, w FROM dsp.dbo.dsp_t ORDER BY id;
+----
+1	a	NULL
+2	b	NULL
+
+# --- CREATE then ROLLBACK: the table is gone -----------------------------------
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE dsp.dbo.dsp_gone (id INTEGER);
+
+statement ok
+INSERT INTO dsp.dbo.dsp_gone VALUES (1);
+
+query I
+SELECT count(*) FROM dsp.dbo.dsp_gone;
+----
+1
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT count(*) FROM dsp.dbo.dsp_gone;
+----
+does not exist
+
+query I
+SELECT count(*) FROM mssql_scan('dsp', 'SELECT 1 AS x WHERE OBJECT_ID(''dbo.dsp_gone'') IS NOT NULL');
+----
+0
+
+# --- DROP then ROLLBACK: the table is back, rows and all -----------------------
+statement ok
+BEGIN;
+
+statement ok
+DROP TABLE dsp.dbo.dsp_t;
+
+statement error
+SELECT count(*) FROM dsp.dbo.dsp_t;
+----
+does not exist
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM dsp.dbo.dsp_t;
+----
+2
+
+# --- ALTER then ROLLBACK: the column is gone again -----------------------------
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE dsp.dbo.dsp_t ADD COLUMN extra INTEGER;
+
+query I
+SELECT count(extra) FROM dsp.dbo.dsp_t;
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT extra FROM dsp.dbo.dsp_t;
+----
+not found
+
+# --- CREATE OR REPLACE in a transaction ----------------------------------------
+statement ok
+BEGIN;
+
+statement ok
+CREATE OR REPLACE TABLE dsp.dbo.dsp_t (k BIGINT);
+
+query I
+SELECT count(*) FROM dsp.dbo.dsp_t;
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM dsp.dbo.dsp_t;
+----
+2
+
+# --- CREATE SCHEMA and a table in it, COMMIT -----------------------------------
+statement ok
+BEGIN;
+
+statement ok
+CREATE SCHEMA dsp.dsp_s;
+
+statement ok
+CREATE TABLE dsp.dsp_s.dsp_in_s (id INTEGER);
+
+statement ok
+INSERT INTO dsp.dsp_s.dsp_in_s VALUES (7);
+
+statement ok
+COMMIT;
+
+query I
+SELECT id FROM dsp.dsp_s.dsp_in_s;
+----
+7
+
+# --- DROP TABLE and DROP SCHEMA, COMMIT ----------------------------------------
+statement ok
+BEGIN;
+
+statement ok
+DROP TABLE dsp.dsp_s.dsp_in_s;
+
+statement ok
+DROP SCHEMA dsp.dsp_s;
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM mssql_scan('dsp', 'SELECT 1 AS x WHERE SCHEMA_ID(''dsp_s'') IS NOT NULL');
+----
+0
+
+# --- COPY into a new table ------------------------------------------------------
+# Not through ExecuteDDL: COPY creates the table on its load's connection, the
+# pinned one in a transaction, so it rolls back on any pool size. Kept here as
+# coverage of the pool-of-one transaction.
+statement ok
+SELECT mssql_exec('dsp', 'DROP TABLE IF EXISTS dbo.dsp_copy');
+
+statement ok
+CREATE TEMP TABLE dsp_src AS SELECT range::INTEGER AS id FROM range(5);
+
+statement ok
+BEGIN;
+
+statement ok
+COPY dsp_src TO 'mssql://dsp/dbo/dsp_copy' (FORMAT 'bcp', CREATE_TABLE true);
+
+query I
+SELECT count(*) FROM dsp.dbo.dsp_copy;
+----
+5
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM mssql_scan('dsp', 'SELECT 1 AS x WHERE OBJECT_ID(''dbo.dsp_copy'') IS NOT NULL');
+----
+0
+
+statement ok
+DROP TABLE dsp.dbo.dsp_t;
+
+statement ok
+DETACH dsp;

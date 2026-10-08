@@ -224,8 +224,9 @@ struct CTASExecutionState {
 	static string GetPhaseName(CTASPhase phase);
 
 private:
-	//! A DDL statement on the connection single_connection says: the pinned one,
-	//! or a pool connection through the catalog (autocommitting).
+	//! A DDL statement through MSSQLCatalog::ExecuteDDL, which picks the
+	//! connection: the pinned one in a transaction on a pool of one (the
+	//! single_connection case), a pool connection autocommitting otherwise.
 	void RunDDL(ClientContext &context, const string &sql);
 	//! A one-row existence probe; on the pinned connection in a transaction.
 	bool ProbeExists(ClientContext &context, const tds::Request &sql, const char *what);

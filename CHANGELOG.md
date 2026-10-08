@@ -327,6 +327,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Catalog DDL in a transaction on a pool of one connection failed after
+  `mssql_acquire_timeout`** (#419): `CREATE` / `DROP` / `ALTER TABLE` and
+  `CREATE` / `DROP SCHEMA` asked the pool for a second connection while the
+  transaction held the only one. On a pool of one they now run on the
+  transaction's own connection, as CTAS does since #380, and roll back with it.
+
 - **The row count a table's storage info asks the server for always failed.**
   It read `sys.dm_db_partition_stats` through `p.rows`, but that view's column
   is `row_count`, so every call failed with error 207 from spec 008 on. The
