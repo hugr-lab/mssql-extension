@@ -402,6 +402,7 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	// client that SQL Server's deadlock detector cannot see. Deferred, every
 	// action writes after every sink has finished. The cost is the rows held
 	// in memory; spec 080 PR 4 gives the actions one connection instead.
+	config.defer_to_finalize = planning_merge_actions;
 
 	// Result type is BIGINT (row count)
 	vector<LogicalType> result_types;
@@ -505,6 +506,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 	// client that SQL Server's deadlock detector cannot see. Deferred, every
 	// action writes after every sink has finished. The cost is the rows held
 	// in memory; spec 080 PR 4 gives the actions one connection instead.
+	config.defer_to_finalize = planning_merge_actions;
 
 	// Result type is BIGINT (row count)
 	vector<LogicalType> result_types;
