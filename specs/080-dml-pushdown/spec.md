@@ -53,7 +53,9 @@ refused (D4), and no batching of a staged statement (D3).
     "disabled" and "filtered" (`sys.indexes` / `sys.key_constraints` carry
     it), so on Synapse every UPDATE / DELETE through the catalog is refused by
     name. That is a behaviour change on a platform we cannot test, chosen over
-    a wrong-rows hazard (PR 2).
+    a wrong-rows hazard (PR 2);
+  - **MERGE is refused by name** (D4, review of #424): its MERGE is in
+    preview, and after PR 4 the catalog has no native MERGE path to keep.
 
   The host test tells Synapse apart (D0).
 - Synapse serverless: no DML at all.
@@ -558,11 +560,36 @@ through our `PlanUpdate` / `PlanDelete` / `PlanInsert`):
     function) is computed by DuckDB into a `#src` column, so only what touches
     the target is written in T-SQL: the ON condition, the WHEN conditions, and
     SET / INSERT values that read the target;
-  - `#src` is created with the source's DuckDB types through the CTAS mapping,
-    a string column compared with a target column carrying that column's
-    collation (else error 468), filled by INSERT BULK on the statement's
-    connection (as D3's stage: the first `Sink`, `DeferAdoption`), then one
-    `MERGE [s].[t] AS t USING #src AS s ON … WHEN …;`, then dropped;
+  - **What the rewrite takes apart** (review of #424). The binder builds the
+    match below `LogicalMergeInto`: a projection over a join of source and
+    target (bind_merge_into.cpp:445-447), the join type chosen from the
+    actions present (:314-320; INNER, LEFT, RIGHT, FULL), the sides inverted
+    for a RIGHT join (:341), and for WHEN NOT MATCHED BY SOURCE a
+    `source_marker` column added by that projection (:381-402). Every action
+    expression is bound against that projection. The rewrite removes the
+    projection, the join and the target's scan; the join type is not kept
+    (T-SQL's MERGE has its own); and each action expression's column
+    references are remapped through the deleted projection onto the target
+    table's columns (`t.[col]`) or the `#src` columns (`s.[cN]`), the
+    inverted case included. A reference the remapping cannot place (the
+    `source_marker`, a row id) is a refusal, never a guess;
+  - `#src` columns are typed with the source's DuckDB types through the CTAS
+    mapping, **except a column the ON condition compares with a target
+    column** (review of #424): that one is declared with the target column's
+    own SQL Server type and collation, as rung 3's stage is, so the server
+    compares like with like (`datetime` against `datetime`, #358; a string
+    under one collation, else error 468). A target column the ON condition
+    reads must pass `IsRoundTripExactForKey`, the predicate rungs 2-3 use,
+    or the MERGE is refused by name: a mismatch there is worse than in an
+    UPDATE -- the unmatched row makes WHEN NOT MATCHED INSERT fire and
+    duplicates the target row;
+  - `#src` is D3's stage in every other respect, by reference: the fill per
+    platform (INSERT BULK on the statement's connection, the first `Sink`,
+    `DeferAdoption`; `INSERT … VALUES` batches on Fabric until `stage_bulk`),
+    created inside the statement's server transaction so a failure's ROLLBACK
+    drops it, a connection left mid-response closed rather than pooled, one
+    writer (063 D1); then one `MERGE [s].[t] AS t USING #src AS s ON … WHEN
+    …;`, then dropped;
   - the bound expressions render through `ExpressionVocabulary`, the atoms the
     scan path and the 079 writer share, with a resolver for two relations:
     a target binding to `t.[col]`, a source binding to `s.[cN]`.
@@ -604,6 +631,12 @@ its own step.
 `mssql_dml_pushdown` (BOOLEAN, default **true**, `SetScope::GLOBAL`) is read
 in `SupportsPushdown` for the DML and MERGE nodes, and in
 `SupportsPushdown(const SQLStatement &)` for CTAS (D6).
+
+It governs the **pushed** form only (review of #424). A MERGE whose source the
+setting keeps from being pushed takes the staged form (`#src`, D4), which
+`MSSQLOptimizer` applies whatever the setting: after PR 4 a MERGE into the
+catalog has no other way to run, so the setting cannot send it "down D3's
+path" -- D3's ladder is UPDATE / DELETE's.
 
 `mssql_remote_pushdown` cannot be the DML lever. 079 D6 reads it once at
 ATTACH: it also answers `IS_REMOTE`, so after attaching it is not a switch,
@@ -796,7 +829,10 @@ And these:
 - MERGE: each action kind, keyed and keyless targets, a source on the same
   server and a DuckDB source (a table, VALUES, a file); a target row matched
   twice errors; each refusal of D4 by name; atomic in autocommit (a failing
-  action leaves nothing).
+  action leaves nothing); ON over a `datetime` column (every row matched, no
+  duplicate inserted) and over a `time(7)` column (refused by name); a RIGHT
+  join shape (WHEN NOT MATCHED only) and WHEN NOT MATCHED BY SOURCE (the
+  `source_marker` case).
 - Pool of one: UPDATE, DELETE and MERGE in autocommit and in a transaction,
   pushed and staged (extends `transaction_single_connection_pool.test`).
 - The `fabric-probe/` files stay probes (`# group: [fabric_probe]`, a
@@ -950,8 +986,10 @@ merge, which is why they come first.
 9. A read-only catalog and a read-only database each refuse every pushed
    write, through both guards, with the shipped path's message (#421).
 10. `mssql_dml_pushdown = false` leaves pushed SELECTs pushed and sends every
-    DML down D3's path. Once `EXECUTE_STATEMENT` is claimed, it restores
-    behaviour, not routing (#421).
+    UPDATE / DELETE / INSERT … SELECT down D3's path, and every MERGE through
+    `#src` (D4; it still runs on the server or is refused). Once
+    `EXECUTE_STATEMENT` is claimed, it restores behaviour, not routing
+    (#421).
 11. A keyless UPDATE or DELETE over a `time(7)` or `datetimeoffset(7)`
     column is refused by name and never reports 0 rows; rungs 2 and 3 answer
     through the same predicate (#421). The same holds for `datetime`
