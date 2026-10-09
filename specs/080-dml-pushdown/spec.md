@@ -19,7 +19,7 @@ from there.
 - MERGE INTO works, natively, and pushed when both sides are remote.
 - **Closes #140 on SQL Server / Azure SQL.** It was reopened on 2026-10-08:
   #364 closed it with text, not code. Fabric follows once the probe settles
-  `stage_bulk` / `merge`. Synapse dedicated keeps today's refusal. A keyless
+  `stage_bulk` (Fabric's `merge` is GA, D0). Synapse keeps today's refusal. A keyless
   statement with a volatile function, or with a predicate the scan does not
   push, is refused by name on every platform.
 
@@ -48,17 +48,26 @@ DML forms differ by platform (R§4), so the catalog resolves a
 `DmlCapabilities` once per ATTACH, next to `is_fabric_endpoint` and the
 Synapse flag.
 
-**Detection** reads `SERVERPROPERTY('EngineEdition')` and
-`SERVERPROPERTY('ProductMajorVersion')`, both added to the ATTACH collation
-query. The host test cannot do it:
-- `IsSynapseEndpoint` matches only `*-ondemand` (serverless), so a dedicated
-  pool classifies as Azure SQL today and would get OUTPUT, table variables
-  and aliased targets.
-- 6 is Synapse dedicated.
-- 11 is serverless.
-- Fabric Warehouse's value is to be read by the probe.
+**Detection** is the existing host test, which already separates the three
+platform families that matter here (review of #422; an earlier revision quoted
+a stale comment of the function rather than its behaviour):
+- `IsFabricEndpoint`: `.datawarehouse.fabric.microsoft.com` and
+  `.pbidedicated.windows.net` (`azure_fedauth.cpp:114`);
+- `IsSynapseEndpoint`: the whole `.sql.azuresynapse.net` domain
+  (`ContainsIgnoreCase`, `azure_fedauth.cpp:126`). Dedicated and serverless
+  are not told apart, and need not be: both keep today's DML path, and on
+  serverless the server refuses DML itself;
+- everything else is SQL Server / Azure SQL.
 
-The host test stays as a fallback when the query cannot run.
+`SERVERPROPERTY('EngineEdition')` and `ProductMajorVersion` are added to the
+ATTACH collation query for one thing only: `null_safe` (below). They are
+**not** a platform switch. Fabric Warehouse is commonly reported with
+EngineEdition 11, the value Synapse serverless reports too, so an edition test
+would have classified Fabric as "no DML". A custom DNS name in front of Fabric
+or Synapse defeats the host test, as it already does for the row-count pass;
+that case is in Open. `fabric-probe/p17_server_properties` reads
+`EngineEdition`, `ProductMajorVersion`, `@@VERSION` and `DB_NAME()` on a live
+warehouse, so that the value is recorded rather than assumed.
 
 Both properties ride the collation query as `SNAPSHOT_STATE_COLUMN` did
 (#331), so there is no extra round trip, and they are cached on the catalog.
@@ -68,15 +77,16 @@ that way is speed (#421).
 
 | capability | SQL Server / Azure SQL | Fabric |
 |---|---|---|
-| `output_clause` (RETURNING rows; OUTPUT INTO a table variable) | yes | until the probe: no |
+| `output_bare` (`… OUTPUT inserted.c`, p01) | yes, unless the target has an enabled trigger | until the probe: no |
+| `output_into_tvar` (`… OUTPUT … INTO @t`, p02; what RETURNING uses) | yes | until the probe: no |
 | `exact_count` (`ROWCOUNT_BIG()` into an RPC OUTPUT parameter) | yes | until the probe: no (the DONE count is used) |
 | `update_from_join` (`UPDATE … FROM … JOIN`, `DELETE … FROM … JOIN`) | yes | **no** (documented) |
 | `merge` | yes | yes (GA) |
 | `stage_bulk` (`INSERT BULK` into `#stage`) | yes | until the probe: no (stage filled with `INSERT … VALUES` batches) |
 | `null_safe` | `IS NOT DISTINCT FROM` when `ProductMajorVersion >= 16` or `EngineEdition IN (5, 8)` (Azure SQL DB / MI report version 12 while having the operator), otherwise `EXISTS (SELECT t.c… INTERSECT SELECT s.c…)` | the INTERSECT form until the probe confirms the operator |
 
-Synapse dedicated (EngineEdition 6) gets none of these. Its DML takes
-today's path unchanged (§ Platforms). Its documented abilities (FROM … JOIN
+Synapse (the host test) gets none of these. Its DML takes today's path
+unchanged (§ Platforms). Its documented abilities (FROM … JOIN
 with a bare target, MERGE in preview, no DDL inside a transaction) are recorded
 in R§4 for later.
 
@@ -91,12 +101,21 @@ spec revision.
 decision is made there, in the dry run** (R§3: `RemoteExecute` cannot hand a
 DML node back). It answers yes only when all of these hold:
 
-- the node is a whole statement (or an INSERT's / CTAS's query). DuckDB
-  calls `FinishPushdown` for nothing else (opt:256 / 458 / 627 / 702), and
-  the writer vetoes a DML node that appears as a CTE body. An `EXPLAIN` wraps
-  the statement and the DML inside is still pushed: `EXPLAIN` binds the
-  vehicle without running it, and `EXPLAIN ANALYZE` runs it, as it runs a
-  native DML;
+- the node is not the body of a CTE. The hook carries no position: it is
+  asked for every node whose result is one remote catalog (opt:315) and for
+  nested nodes (opt:205), the same way for a statement-top DML and for
+  `WITH c AS (UPDATE ms.t … RETURNING *) SELECT * FROM c` (review of #422).
+  The mechanism is 079's per-rewrite thread state: the writer's dry run of an
+  enclosing node records the DML nodes it meets as CTE bodies, and a later
+  `SupportsPushdown` of one of those nodes answers no. W2 verifies DuckDB's
+  call order (enclosing node before nested); **if it is the other way round,
+  a DML node with a RETURNING list is vetoed outright** until a mechanism
+  exists, since that is the only DML that can be a CTE body. The expected
+  behaviour of the CTE case is then the shipped path: the CTE's DML runs on
+  D3, RETURNING through `OUTPUT … INTO @o` where the platform has it, refused
+  by name where not. An `EXPLAIN` wraps the statement and the DML inside is
+  still pushed: `EXPLAIN` binds the vehicle without running it, and `EXPLAIN
+  ANALYZE` runs it, as it runs a native DML;
 - the catalog is not read-only;
 - no `$n` parameter appears;
 - every name is resolvable under the search-path rule 079 applies;
@@ -126,7 +145,7 @@ DML node back). It answers yes only when all of these hold:
   most one source row: the join equates a unique key of the source. T-SQL
   updates from an arbitrary one of several matches, and DuckDB's own
   semantics for that case are pinned by a W8 test, not assumed;
-- RETURNING without `output_clause`.
+- RETURNING without `output_into_tvar`.
 
 A SET of a key column is **not** vetoed on the pushed path: T-SQL updates key
 columns. The ban exists only on the fallback, where the key identifies the
@@ -163,7 +182,11 @@ change:
   writes `input.binder->GetStatementProperties().result_eagerness = FORCED`.
   `GetStatementProperties()` is the global binder state shared by every child
   binder (`binder.cpp:234`), and the planner copies it after binding
-  (`planner.cpp:250`).
+  (`planner.cpp:250`). `input.binder` is an `optional_ptr`: when it is absent
+  the vehicle's bind **refuses** the statement, by name, rather than run
+  without `FORCED` and without `RegisterDBModify` (review of #422). W8 checks
+  it is present on every path the rewriter reaches (statement, EXPLAIN,
+  PREPARE / EXECUTE).
 - **`CHANGED_ROWS`.** `Bind(SelectStatement)` already gives a bare table-function
   passthrough the function's own `call_return_type` (`bind_select.cpp:14-19`).
   `SELECT * FROM <ref>` is exactly the shape the rewriter builds
@@ -175,11 +198,14 @@ outside: open a stream over a pushed UPDATE, close it without consuming a
 row, and assert the rows changed. **PR 3 does not merge if that assertion
 fails.** It is the one finding that could veto the pushed half.
 
-**Read-only** is refused with the shipped path's class and message, through
-`MSSQLCatalog::CheckWriteAccess` (#421), at two points:
-- in the dry run, so the statement takes the shipped path, whose hook
-  refuses it;
-- in the vehicle's bind, so no route around the dry run can execute a write.
+**Read-only** is refused at two points (#421, corrected in the review of #422):
+- in the dry run, by a plain `IsReadOnly()` test that answers **false**, so
+  the statement takes the shipped path and its hook refuses it with the
+  shipped message. Not `CheckWriteAccess`: that throws
+  (`mssql_catalog.cpp:1150`), which would abort the rewrite instead of
+  declining it, with a message naming the wrong operation;
+- in the vehicle's bind, through `CheckWriteAccess`, so no route around the
+  dry run can execute a write.
 
 There is one contract, not two. A database **opened** read-only
 (`duckdb --readonly`) propagates `AccessMode::READ_ONLY` into the ATTACH, so
@@ -201,6 +227,24 @@ return type would see a query. This is documented next to 079's
 "result types change for a pushed statement", with `mssql_dml_pushdown`
 (D5) as the way back.
 
+**A server error inside a transaction** (review of #422) takes the path a
+shipped DML batch's error takes today: `MSSQLStatementConnection::Fail` on the
+pinned connection does not roll back (the DuckDB transaction owns that) and
+does not close it; the statement's exception aborts the DuckDB transaction,
+and its ROLLBACK rolls the server transaction back. A server that already
+doomed or ended the transaction (3960 update conflict under SNAPSHOT, a
+deadlock victim) is the case #331 handled for ROLLBACK: the stale descriptor is
+tolerated and the isolation level restored as its own statement.
+`mssql_reset_connection = false` changes nothing here: it governs what happens
+when the connection goes back to the pool, after the transaction. W8 forces a
+3960 conflict and a constraint violation inside a transaction and asserts the
+connection serves the next transaction.
+
+**The vehicles are registered** through `mssql::RegisterDocumentedFunction`
+(`mssql_function_docs.test` fails otherwise). They are callable, so they are
+documented as internal: the rewriter's targets, not an API, with no
+compatibility promise on their arguments.
+
 - **`mssql_dml(context, statement, …)`**, the count form.
   - Its result is one BIGINT named `Count`.
   - It runs on a `MSSQLStatementConnection`: the pinned connection in a
@@ -218,7 +262,7 @@ return type would see a query. This is documented next to 079's
       statement itself, the last DONE with a count before the batch's final
       DONE. No platform without `exact_count` has triggers.
 - **`mssql_dml_returning(context, statement, columns := {…})`**, the row
-  form, only with `output_clause`.
+  form, only with `output_into_tvar`.
   - The statement is
     `DECLARE @o TABLE (…); <DML> OUTPUT inserted.… | deleted.… INTO @o …; SELECT … FROM @o`.
   - `INTO @o`, not a bare OUTPUT: a bare OUTPUT is refused while the target
@@ -353,8 +397,13 @@ The key is resolved per table at plan time:
   - The stage is dropped on the way out.
 
 **Batching (#421):**
-- A DELETE batches at about 100k staged rows: a deleted row cannot match a
-  later batch.
+- The `VALUES`-join statements keep today's sizing (`mssql_dml_batch_size`,
+  capped by `mssql_dml_max_parameters`). A staged JOIN batch is a fixed
+  100000 staged rows: it carries no parameters, so neither setting bounds it,
+  and W3 measures whether the constant should become a setting (review of
+  #422).
+- A DELETE batches by the staged batch: a deleted row cannot match a later
+  batch.
 - An UPDATE on rungs 1–2 batches too. A SET of a rowid-key column is refused
   there, so no batch can move a row into another batch's key.
 - **An UPDATE on rung 3 is one statement over the whole stage.** There the key
@@ -396,14 +445,14 @@ refuses these columns on both rungs, as rung 2 does today):
 
 The `<key>` comparison on rung 3 uses `null_safe` (D0).
 
-**RETURNING on the fallback**, with `output_clause`:
+**RETURNING on the fallback**, with `output_into_tvar`:
 - The JOIN / VALUES statement carries `OUTPUT … INTO @o`.
 - The operator returns DuckDB's RETURNING chunk: every non-generated column,
   in table order, at DuckDB's types (binder.cpp:571-580). That is the
   post-image for UPDATE and the pre-image for DELETE.
 - `@o` is declared under the rules of the row vehicle (D1).
 
-Without `output_clause`, RETURNING is refused by name at plan time:
+Without `output_into_tvar`, RETURNING is refused by name at plan time:
 `PlanUpdate` / `PlanDelete` read `op.return_chunk`. That is the
 InternalException fix (R§2).
 
@@ -452,11 +501,10 @@ desync naming what the server executed (#323).
   the operator, in autocommit committed when the statement's own
   `MSSQLTransaction` commits. The staged path (D3) then replaces their
   per-value buffers.
-- **IDENTITY in a MERGE INSERT action** (found in PR 1). DuckDB plans the
-  action full-width, so the identity column arrives as an explicit NULL and
-  the INSERT is refused by name: "names the identity column … but supplies no
-  value". PR 4 drops an identity column from a MERGE action's list when the
-  MERGE's own INSERT clause does not name it.
+- **Unnamed columns of a MERGE INSERT action** were fixed in PR 1 (review of
+  #423): DuckDB binds the action full width, so `MSSQLCatalog::PlanMergeInto`
+  works out which columns the action did not name, and those keep their
+  identity / DEFAULT / computed value.
 - **Pushed** (both sides in the catalog): `MergeQueryNode` → T-SQL `MERGE`
   with `merge` (D0).
   - Only shapes T-SQL can express are pushed; anything else is vetoed:
@@ -635,7 +683,9 @@ From #421:
 - rung 3's hazards: the `(1, 1)` / `(2, 2)` `SET a = a + 1` shape forced past
   the threshold and the batch size; keyless tables with an `xml` / a
   `geometry` column;
-- both join forms (the INTERSECT form forced in a debug build);
+- both join forms (the INTERSECT form forced by
+  `mssql_test_force_intersect_join_form`, in the release-build integration
+  lane);
 - DROP / ALTER / CREATE SCHEMA / CREATE VIEW unchanged after the
   `EXECUTE_STATEMENT` claim;
 - `mssql_dml_pushdown = false`;
@@ -661,9 +711,18 @@ And these:
   action kind; a target row matched twice errors.
 - Pool of one: UPDATE, DELETE and MERGE in autocommit and in a transaction,
   pushed and staged (extends `transaction_single_connection_pool.test`).
-- The `fabric-probe/` files, kept runnable under `[fabric]`.
+- The `fabric-probe/` files stay probes (`# group: [fabric_probe]`, a
+  placeholder answer that prints the server's): they are run by hand per
+  their README, never in the `[fabric]` lane. What a probe settles becomes an
+  ordinary `[fabric]` test in the PR that flips the D0 row.
 
 ### W9: docs
+**Each PR documents what it ships** (review of #422): its settings, its
+refusal messages, its semantics (rung 3's "duplicates move together" with PR
+2, the deprecation line with PR 1), in CHANGELOG, CLAUDE.md, DATAMODEL and the
+website. PR 5 adds only pushed CTAS's part and the final pass. The whole, when
+done:
+
 README / website DML page:
 - what runs on the server;
 - the ladder;
@@ -688,10 +747,10 @@ risk", and this spec is no smaller. Each PR merges before the next opens
 | PR | contents | stands on its own because |
 |---|---|---|
 | **1** | W4 (the 066 remainder: sinks, defer removed, pool of one); RETURNING on UPDATE / DELETE **refused by name** at plan time (the InternalException fix); W6 | fixes UPDATE / DELETE on a pool of one and the crash, behind no setting |
-| **2** | W3 (the ladder, rung 3, `#stage`, `mssql_dml_stage_threshold`, #358) and W5's capability read (`EngineEdition` / `ProductMajorVersion`); RETURNING through `OUTPUT … INTO @o` on the fallback where `output_clause` holds; the `fabric-probe/` run if the warehouse answers by then (the rows it settles flip, one line each) | closes #140 and #358 with no rewriter involved |
+| **2** | W3 (the ladder, rung 3, `#stage`, `mssql_dml_stage_threshold`, #358) and W5's capability read (`EngineEdition` / `ProductMajorVersion`); RETURNING through `OUTPUT … INTO @o` on the fallback where `output_into_tvar` holds; the `fabric-probe/` run if the warehouse answers by then (the rows it settles flip, one line each) | closes #140 and #358 with no rewriter involved |
 | **3** | W1 + W2 (the vehicles, the exact count, `ExecuteDmlBatch`, the writer's UPDATE / DELETE / INSERT … SELECT, `mssql_dml_pushdown`); the agreement harness | pushed DML end to end, PR 2's path under every veto |
-| **4** | W7: one statement connection for a MERGE's actions (atomic in autocommit), IDENTITY in an INSERT action, pushed MERGE | MERGE on top of PRs 2–3 (PR 1 already made the native MERGE run in a transaction and on a pool of one, #423) |
-| **5** | D6 (pushed CTAS) and W9 (docs) | droppable without touching PRs 1–4 |
+| **4** | W7: one statement connection for a MERGE's actions (atomic in autocommit), pushed MERGE | MERGE on top of PRs 2–3 (PR 1 already made the native MERGE run in a transaction and on a pool of one, #423) |
+| **5** | D6 (pushed CTAS) and its docs; W9's final pass | droppable without touching PRs 1–4: every earlier PR carries its own docs |
 
 PRs 1 and 2 change the shipped path only and are live from the moment they
 merge, which is why they come first.
@@ -760,6 +819,10 @@ merge, which is why they come first.
   measured.
 - MERGE with a source in DuckDB through `#stage` (D4): a logical rewrite in
   `MSSQLOptimizer`, after 0.3.0.
+- Fabric or Synapse behind a custom DNS name, which the host test misses (as
+  it misses it for the row-count pass). An ATTACH option naming the platform
+  is the likely answer; EngineEdition alone cannot tell Fabric from Synapse
+  serverless.
 
 ## Acceptance
 

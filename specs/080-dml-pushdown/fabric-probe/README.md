@@ -22,6 +22,7 @@ Each file answers one question from the Fabric column of
 | `p14_intersect_form` | the `EXISTS (… INTERSECT …)` null-safe form |
 | `p15_bulk_into_temp` | `INSERT BULK` into `#stage` inside a transaction |
 | `p16_dml_count_done` | the DONE count of a plain UPDATE |
+| `p17_server_properties` | `EngineEdition`, `ProductMajorVersion`, `@@VERSION`, `DB_NAME()` |
 | `p99_cleanup` | drops the probe tables |
 
 **The files are probes, not tests.** The ones that ask a question expect a
