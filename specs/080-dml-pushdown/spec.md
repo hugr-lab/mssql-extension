@@ -448,7 +448,7 @@ The key is resolved per table at plan time:
 - **Rungs 1–2, up to `mssql_dml_stage_threshold` rows** (BIGINT, default
   1000, the shape of `mssql_insert_bcp_threshold`; rows counted as they
   arrive, never estimated; W3 measures the crossover locally and at a 20 ms
-  RTT): today's `VALUES`-join statements. Those statements are
+  RTT; measured, #433 -- see below): today's `VALUES`-join statements. Those statements are
   `UPDATE … FROM … JOIN (VALUES …)`, which Fabric does not have, so on Fabric
   every rung stages.
 - **Everything else**: a session-local `#stage_<uuid>` on the statement's own
@@ -473,6 +473,26 @@ The key is resolved per table at plan time:
     closed rather than pooled, unless it is pinned, where the transaction's end
     takes it. Without that, `mssql_reset_connection = false` would let
     repeated failures accumulate `#stage_*` tables in a pooled session.
+
+**The threshold, measured** (#433, local SQL Server 2025, UPDATE by primary
+key, median of 5 interleaved runs, ms):
+
+| rows | VALUES join | `#stage` |
+|---:|---:|---:|
+| 10 | 6 | 12 |
+| 100 | 13 | 13 |
+| 300 | 29 | 19 |
+| 1000 | 79 | 26 |
+| 3000 | 240 | 44 |
+| 10000 | 774 | 99 |
+
+Locally the stage wins from ~100 rows. It costs ~7 round trips (BEGIN, the
+stage's CREATE, INSERT BULK and its data, the JOIN, the DROP, COMMIT) against
+the VALUES path's 2 + ⌈N / batch⌉, so at a 20 ms RTT the two meet near 1000
+rows (≈160 ms each) and VALUES wins below it (300 rows: 89 vs 159 ms). 1000
+is where the stage never loses by more than a round trip or two on a
+network and by ~50 ms locally -- `mssql_insert_bcp_threshold`'s reasoning
+(spec 062 § 6.2). A local deployment can set it near 100.
 
 **Batching (#421; owner, 2026-10-09):**
 - The `VALUES`-join statements keep today's sizing (`mssql_dml_batch_size`,
