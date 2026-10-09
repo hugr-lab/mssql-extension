@@ -112,8 +112,13 @@ hints.ai_flags = 0;
 
 `AF_UNSPEC` with no `AI_ADDRCONFIG` asks the resolver for every family regardless of
 what the host can actually route. `AI_ADDRCONFIG` restricts answers to families for
-which the host has a configured non-loopback address, and it is supported on Linux,
-macOS and Windows. It does not fix F1 — a machine with real IPv6 and several IPv4
+which the host has a configured non-loopback address. It is available on every
+platform this extension ships for, but the implementations are **not equivalent**
+and this spec does not assert otherwise from memory (§ 0): RFC 3493 § 6.1 defines
+the flag, `getaddrinfo(3)` on Linux (glibc) and on macOS document their own
+behaviour, and Microsoft documents it for `ADDRINFOA` / `getaddrinfo` on Windows.
+The differences are the subject of W2 below, which is why the flag is not the
+one-liner it looks like. It does not fix F1 — a machine with real IPv6 and several IPv4
 adapters still gets a long list — but it removes the most common source of dead
 leading candidates for the price of one constant.
 
@@ -188,6 +193,34 @@ Properties this has to hold, in the order they matter:
   `TdsSocket::Connect` call, not on `ATTACH` — see §5's second retraction.)
 - **Candidate order is preserved.** `getaddrinfo` has already applied RFC 6724
   sorting; W1 staggers that order, it does not re-rank it.
+- **The number of sockets in flight is bounded.** With the reporter's 4–9
+  candidates, a 250 ms stagger and a 30 s budget, "never abandon an in-flight
+  candidate" means every candidate ends up open at once — and AC-4 observes that
+  `Prewarm` multiplies that by `mssql_min_connections` (`mssql_connection_limit`
+  defaults to 64). RFC 8305 § 5 permits a cap, so W1 takes one: **at most K
+  candidates in flight** (`K = 4` unless /speckit-plan measures otherwise), the
+  oldest pending one closed when a new one starts past the cap. That makes the fd
+  peak a design decision rather than AC-4's observation, and it is the one place
+  this spec knowingly departs from "never abandoned": a candidate retired at the
+  cap is reported as retired-at-cap, not as a failure.
+
+**W1 ships in two parts, and the first needs no new seam.** Only the staggered
+multi-socket dial needs the injectable candidate-list / `stagger_ms` seam that is
+still an open `[NEEDS CLARIFICATION]`, and only it needs a usable blackhole
+address; the misreporting this spec opens with — a refused or unreachable candidate
+announced as `"Connection timed out"` — is fixable on today's sequential loop. As
+one item, the user-visible half is blocked behind an unresolved API question and an
+unmeasured CI premise:
+
+- **W1a — the hard deadline and the honest reason.** Compute the deadline once and
+  clamp every `poll` to it, on the **existing** sequential loop; capture a
+  per-candidate reason at the five sites of W1.2; aggregate per W1.2a. No new seam,
+  no blackhole needed — testable with the routing harness §4 already selects. Note
+  that W1a **alone changes the error text**, so W1.2a's classifier question must be
+  settled with it, not after.
+- **W1b — the staggered dial.** Everything in the numbered list above: the 250 ms
+  stagger, the K-candidate cap, the single-winner selection, and the seam that makes
+  it testable.
 
 **W1.1 — where the code goes.** A free function in `tds_socket.cpp` owning a
 `std::vector` of candidate fds, not a `TdsSocket` member. Per F4, the existing
@@ -206,12 +239,49 @@ code never records one.
 | async failure, `poll` reports `POLLERR`/`POLLNVAL`/`POLLHUP` | `WaitForReady` returns false, and `Connect`'s `else` overwrites its reason with the literal **`"Connection timed out"`** | **wrong.** A refusal or an unreachable host is reported as a timeout |
 | async failure, `poll` reports writability only | reaches `getsockopt`, reports `"Connection failed: <strerror>"` | yes — the only path that works |
 
+Two more sites fail without recording anything, and a three-row table invites an
+implementer to reproduce all of them in the new multi-socket code:
+
+| how a candidate fails | what `Connect` does today | reason available? |
+|---|---|---|
+| `getsockopt` **itself** fails | the success test is `getsockopt(...) == 0 && error == 0` (`tds_socket.cpp:221`), so a failing `getsockopt` falls through with `error` still 0 and formats `strerror(0)` | **wrong, and absurd**: the user is told `Connection failed: Success` / `Undefined error: 0` |
+| `socket()` fails (`:183`) | `continue` | **none** — the candidate vanishes from the attempt |
+| `SetNonBlocking(true)` fails (`:191`) | `continue` | **none** — same |
+
 So W1.2 is two pieces of work, not one: **capture** a per-candidate reason at all
-three sites, then **aggregate** them into one message naming the host, the number
-of candidates and the distinct failures. "The address that failed last" is not a
+**five** sites, then **aggregate** them into one message naming the host, the number
+of candidates and the distinct failures. One rule covers the three rows above: a
+failed `getsockopt` reports its **own** errno rather than formatting `strerror(0)`,
+and a candidate that never reached `connect()` records why instead of disappearing.
+"The address that failed last" is not a
 diagnosis; neither is "timed out" for a port that sent an RST, and #122 was hard to
 diagnose from outside partly because of it. This is Principle III: an operation that
 cannot succeed must say what it actually attempted.
+
+**W1.2a — the aggregate is parsed downstream, so its wording is not free.** Every
+ATTACH and pool-factory dial failure passes `conn->GetLastError()` through
+`MSSQLTranslateConnectionError` (`catalog/mssql_catalog.cpp:208, 256, 282, 326,
+362, 447`), which classifies it by **substring, in a fixed order**
+(`mssql_storage.cpp:1056`). The order is the trap: `"connection refused"` is tested
+first, then the DNS branch — which matches the bare substring **`"host"`**
+(`:1141`) — and only then `"timeout"` / `"timed out"` (`:1147`). Today's literal
+`"Connection timed out"` lands on the timeout branch **by accident**. An aggregate
+that names the host, as the paragraph above requires, would be reported as
+`Cannot resolve hostname 'X' - check server name`; one that names a single refusal
+among several candidates would advise checking whether SQL Server is running. Both
+are worse than what #122 reports today.
+
+`/speckit-plan` picks one:
+
+- **Structured, preferred.** `TdsSocket` exposes the per-candidate outcomes as data
+  (a typed vector, or a separate accessor beside `GetLastError()`), and
+  `MSSQLTranslateConnectionError` is never asked to parse the aggregate.
+- **Worded against the classifier.** The aggregate's text is written so the
+  intended branch wins given that order, with the fragile dependency stated in a
+  comment at both ends.
+
+Either way **AC-2 gains a clause**: a fully blackholed multi-candidate `ATTACH`
+still reports as a **timeout**, not as a DNS failure or a refusal.
 
 **W1.3 — `SO_ERROR` is the only success oracle, and today's code is NOT already
 doing this.** Windows maps `poll` to `WSAPoll` (`tds_socket.cpp:21`). Microsoft
@@ -228,6 +298,19 @@ is why: `TdsSocket::WaitForReady` short-circuits on `POLLERR | POLLNVAL` (and on
 synchronous path never polls at all. W1 therefore **introduces** the `SO_ERROR`
 discipline rather than preserving it, which is more work than "keeps that" implied
 and is the same code that makes W1.2's per-candidate reason possible.
+
+### W1.4 — the docs that W1 changes the meaning of
+
+`mssql_connection_timeout`'s row in `CLAUDE.md` describes its scope (the dial plus
+every login-phase read) **without saying it is charged once per DNS answer** — the
+defect F1 names. After W1 it becomes a true whole-attempt bound for the dial, so the
+row has to say so, and the §5 retraction (each login-phase read is charged the full
+budget again) belongs beside it or the row over-promises in the other direction.
+`DATAMODEL.md`'s TDS-layer section gets the dial's new shape if it describes the
+dial at all, and the candidate-selection change is user-visible enough for a
+CHANGELOG line. In the same PR as W1 — the repo convention asks every PR to consider
+whether the architecture docs need updating, and this one changes what a documented
+setting means.
 
 ### W2 — `AI_ADDRCONFIG`
 
@@ -321,8 +404,16 @@ existing test cannot settle it either: its only timing assertion is an upper bou
 
 - the blackhole address is an **input** to W1's cases, with `192.0.2.1` as the
   documented default, and
-- case 2 **skips with a clear message** when the environment does not provide a
-  blackhole, rather than passing quietly on the refusal branch.
+- **cases 2 and 3 both skip with a clear message** when the environment does not
+  provide a blackhole, rather than passing quietly on the refusal branch. Case 3
+  ("total time is bounded by the budget when every candidate is dead") carries a
+  **lower** bound, and so does AC-2 — in an environment that refuses or declares
+  the supplied address unreachable, every candidate fails in ~0 ms and a lower
+  bound goes **red** rather than skipping. Gating only case 2 would convert an
+  explicitly unmeasured environment property into a failing test.
+- Prefer the **per-candidate-reason** assertion over the clock wherever both are
+  available (§4 names it): it witnesses the same branch without depending on the
+  environment at all.
 
 To turn the premise into a fact, add a lower-bound (or per-candidate-reason)
 assertion to the existing test and read one CI run per platform, or run
@@ -369,9 +460,16 @@ behaviour, not a portable one", which reads as the opposite attribution.
 
 **Measured on both platforms** with `probe_dial_outcomes.cpp` in this directory
 (`./run_probe.sh` builds it natively and, from a Mac, in a `gcc:13` container).
-The probe dials exactly as `TdsSocket::Connect` does — non-blocking `connect()`,
-`poll()`, `getsockopt(SO_ERROR)` — so it measures what the extension's own dial
-sees:
+The probe reproduces the dial's **timing mechanics** — non-blocking `connect()`,
+`poll()`, `getsockopt(SO_ERROR)` — and deliberately **not**
+`TdsSocket::WaitForReady`'s revents handling, which short-circuits on
+`POLLERR | POLLNVAL` and on `POLLHUP` (`tds_socket.cpp:885-903`) and returns false
+*before* `Connect` reaches its `getsockopt` (`:221`). So the **timings** below
+transfer to the extension's dial; the **per-candidate reason** does not, and that
+gap is exactly what W1.2 and W1.3 exist to close. (Three earlier revisions of this
+section claimed the probe dials "exactly as `TdsSocket::Connect` does", which the
+probe's own header and W1.3 both contradict — the claim invited the reading that
+the `SO_ERROR` discipline is already there, which is what W1.3 retracts.)
 
 | | bound, never `listen()` | nothing bound (control) | `192.0.2.1` |
 |---|---|---|---|
@@ -496,18 +594,45 @@ implied:
 ## 6. Acceptance
 
 - **AC-1** — On a host whose hostname resolves to several addresses with a
-  blackholing first candidate, `ATTACH` completes in under 2s with the default
-  `mssql_connection_timeout`. Confirmed on the reporter's multi-NIC Windows machine
-  or an equivalent; per §0 this cannot be signed off from CI alone.
+  blackholing first candidate, **one `TdsSocket::Connect` call returns in under
+  2s** with the default `mssql_connection_timeout`. Stated against `Connect` and
+  not `ATTACH` deliberately: §5's second retraction records that each login-phase
+  read and each routing hop is charged the full budget again, so an `ATTACH`
+  wall-clock bound is something W1 cannot deliver and a sign-off against it would
+  fail on any host that takes a hop. If an `ATTACH`-level figure is still wanted,
+  it is a **separate** criterion with its measurement conditions named — no
+  routing hop, and a server that completes PRELOGIN/LOGIN7 promptly — so a
+  reviewer can tell a W1 regression from a login-phase charge. Confirmed on the
+  reporter's multi-NIC Windows machine or an equivalent; per §0 this cannot be
+  signed off from CI alone.
 - **AC-2** — With every candidate dead, `Connect` returns **within
   `timeout_seconds`** — the hard deadline of W1's property list, same wording, no
   stagger slack: in-flight candidates are never abandoned, so the deadline closes
   **all** of them and a late-started candidate cannot extend the attempt. The error
-  names the host, the number of candidates tried, and the distinct failures, each
-  from its own captured reason (W1.2) rather than from a clock. Asserted with a
+  names the host, the number of candidates tried, and the distinct failures. Each
+  candidate is described from **its own outcome**, and there are three kinds, not
+  one — the earlier wording ("each from its own captured reason rather than from a
+  clock") was unsatisfiable in exactly the case this criterion is written for,
+  because a candidate still in flight when the deadline fires has no `SO_ERROR` to
+  capture and the clock **is** its only honest reason:
+  - a candidate that **reported an event** is described from its captured
+    `SO_ERROR` / `errno` (W1.2);
+  - a candidate still **pending at the deadline** is described as
+    pending-at-deadline, naming the budget. That is a legitimate per-candidate
+    outcome, not a clock inference about the whole attempt — and it is also what a
+    pre-2004 Windows build produces for a dead candidate, where `WSAPoll` does not
+    report a failed connect at all (W1.3);
+  - a candidate **retired at the in-flight cap** is described as retired, not
+    failed (W1's property list).
+
+  Asserted with a
   **lower** bound as well as an upper one (§4, "the assertion shape"): an upper
   bound alone is also satisfied by an environment that fails every candidate
-  instantly, so on its own it does not witness the timeout branch at all.
+  instantly, so on its own it does not witness the timeout branch at all — and per
+  §4 the lower bound **skips with a message** where the environment provides no
+  blackhole. The aggregate must also survive classification: a fully blackholed
+  multi-candidate `ATTACH` is reported as a **timeout**, not as a DNS failure or a
+  refusal (W1.2a).
 - **AC-3** — A single-address host and a live-first-candidate host show no
   regression against `main` in the harness of §4 case 1.
 - **AC-4** — Exactly one socket is open when `Connect` returns true, and none when
@@ -529,5 +654,7 @@ implied:
   today. Named cases, because "the suite passes" would not have caught it: an
   **IPv4-only container** resolving `localhost` (must still yield 127.0.0.1) and
   `::1` (must fail no differently than it does now), plus the same two on a
-  dual-stack host. And no behavioural change on the `127.0.0.1` paths: the full `test/cpp`
+  dual-stack host, **plus a Windows case** — #122 lives on Windows and its resolver
+  policy differs again, so a multi-NIC Windows host resolving both a hostname and a
+  numeric literal must yield the candidates it yields today. And no behavioural change on the `127.0.0.1` paths: the full `test/cpp`
   suite and the integration suite pass unchanged.

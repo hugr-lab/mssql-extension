@@ -287,9 +287,15 @@ int main() {
 	{
 		uint16_t port = 0;
 		int fd = BindEphemeral(&port);
-		if (fd >= 0) {
-			::close(fd); // free it: nothing is bound to `port` now
+		if (fd < 0) {
+			// Same doctrine as QUESTION A below: a setup failure must not print a
+			// row. Falling through with fd < 0 leaves port == 0 and dials
+			// 127.0.0.1:0, which answers REFUSED on both platforms and would be
+			// reported as the control's result.
+			std::fprintf(stderr, "\nCONTROL setup FAILED (nothing bound): %s\n", std::strerror(errno));
+			return 1;
 		}
+		::close(fd); // free it: nothing is bound to `port` now
 		std::printf("\nCONTROL — nothing bound (what the repo's test uses)\n");
 		const DialResult r = Dial("127.0.0.1", port, 12000);
 		Report("freed port", r);
