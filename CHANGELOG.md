@@ -269,6 +269,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`mssql_dml_use_prepared` is deprecated** (spec 080): it was read by
+  nothing. It stays registered, as a documented no-op, for one more release,
+  so a `SET` of it in a `.duckdbrc` does not throw; it is removed in the
+  release after.
+
 - **Metadata queries compute a table's row count once, not once per column**
   (spec 084). Every query that returned columns carried
   `OBJECTPROPERTYEX(..., 'Cardinality')` in the same SELECT list, and the
@@ -326,6 +331,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which used to be reserved up front.
 
 ### Fixed
+
+- **UPDATE and DELETE on a pool of one connection in autocommit waited out
+  `mssql_acquire_timeout`, and so did a MERGE** (spec 080 PR 1): the scan
+  feeding them held the only connection. UPDATE / DELETE / MERGE now count as
+  sinks of their catalog, so that scan is materialised first, in autocommit on
+  a pool of one as in a transaction. In a transaction they no longer defer
+  every batch to the end of the statement with all its rows buffered: batches
+  go out as the rows arrive.
+
+- **A MERGE in a transaction whose actions included an INSERT failed with
+  "connection not in Idle state"** when its source was a table of the same
+  catalog (spec 080 PR 1). Its actions are fed from several threads onto the
+  one pinned connection. Each action now sends its rows at its own Finalize
+  (an INSERT action as statements, never a bulk stream held open across the
+  sink), and each batch on the pinned connection holds the transaction's
+  materialize lock. A MERGE's actions are still separate statements to the
+  server (spec 080 PR 4 makes them one): in autocommit they are not atomic
+  together, and on a pool of one connection they take turns at it, bounded by
+  `mssql_acquire_timeout`.
+
+- **A MERGE's `WHEN NOT MATCHED THEN INSERT (cols)` wrote NULL into the
+  columns it did not name**, where the server had a DEFAULT, and refused a
+  table with an IDENTITY column (spec 080 PR 1, review of #423). DuckDB binds
+  the action full width, with a copy of each column's bound default where the
+  INSERT named nothing; those columns now stay out of the INSERT, so the server
+  supplies their identity, DEFAULT or computed value, as for a plain INSERT.
+
+- **`INSERT … DEFAULT VALUES` sent an empty column list** and failed with
+  server error 102 (as did a MERGE action's `INSERT DEFAULT VALUES`). It is
+  refused by name until the statement builder has a `DEFAULT VALUES` form.
+
+- **UPDATE / DELETE … RETURNING ended in an InternalException** ("Vector::Reference
+  used on vector of different type"), which invalidates the database. They are
+  refused by name until RETURNING maps to T-SQL's OUTPUT (spec 080).
 
 - **Catalog DDL in a transaction on a pool of one connection failed after
   `mssql_acquire_timeout`** (#419): `CREATE` / `DROP` / `ALTER TABLE` and

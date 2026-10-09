@@ -237,9 +237,9 @@ MSSQLPhysicalUpdate (PhysicalOperator)
   └─ GetData() → Return row count
 ```
 
-### Transaction-Aware Deferred Execution
+### In a transaction
 
-When inside an explicit DuckDB transaction, the UPDATE executor defers all SQL execution to `Finalize()`. This is because the pinned connection may be in `Executing` state while streaming rowid values during the scan phase. All rows are buffered and executed in batches after the scan completes.
+Batches are sent as the rows arrive, in a transaction too. The optimizer counts an UPDATE (and a DELETE or MERGE) as a sink of its catalog, so the scan feeding it is materialised at init and the pinned connection is idle when the first batch goes out. Each batch on the pinned connection holds the transaction's materialize lock from its send to the end of its response, because a MERGE's actions are fed from several threads (spec 080 PR 1). Until then the executor deferred every batch to `Finalize()` with all rows buffered.
 
 ### Batch Size Calculation
 
@@ -278,7 +278,7 @@ MSSQLPhysicalDelete (PhysicalOperator)
   └─ GetData() → Return row count
 ```
 
-DELETE also uses deferred execution in explicit transactions.
+DELETE sends its batches as the rows arrive, as UPDATE does.
 
 ## Rowid Extraction
 

@@ -107,6 +107,41 @@ bool MSSQLStatementConnection::DisableIdentityInsert(int timeout_ms) noexcept {
 	return confirmed;
 }
 
+//! Whether this thread holds a PinnedLock: Fail runs both inside a batch (under
+//! the lock) and after one (not), and std::mutex is not recursive.
+static thread_local bool holds_pinned_lock = false;
+
+MSSQLStatementConnection::PinnedLock::PinnedLock(std::mutex &mutex) : lock_(mutex) {
+	holds_pinned_lock = true;
+}
+
+MSSQLStatementConnection::PinnedLock::PinnedLock(PinnedLock &&other) noexcept : lock_(std::move(other.lock_)) {}
+
+MSSQLStatementConnection::PinnedLock::~PinnedLock() {
+	if (lock_.owns_lock()) {
+		holds_pinned_lock = false;
+	}
+}
+
+MSSQLStatementConnection::PinnedLock MSSQLStatementConnection::LockPinned(ClientContext &context,
+																		  MSSQLCatalog &catalog) const {
+	if (!transaction_pinned_ || holds_pinned_lock) {
+		return PinnedLock();
+	}
+	return PinnedLock(catalog.MaterializeMutexFor(context));
+}
+
+void MSSQLStatementConnection::RequireIdle(tds::TdsConnection &connection, const char *operation) {
+	if (connection.GetState() == tds::ConnectionState::Idle) {
+		return;
+	}
+	throw InvalidInputException(
+		"MSSQL %s: the transaction's connection is busy (state: %s) -- a result set is still being read on it. "
+		"The scan feeding the statement was not materialised (is the extension's optimizer disabled?); run the "
+		"statement outside the transaction, or re-enable the optimizer",
+		operation, tds::ConnectionStateToString(connection.GetState()));
+}
+
 void MSSQLStatementConnection::Commit(ClientContext &context, MSSQLCatalog &catalog) {
 	if (!connection_) {
 		return;
@@ -114,7 +149,14 @@ void MSSQLStatementConnection::Commit(ClientContext &context, MSSQLCatalog &cata
 	// OFF before COMMIT: it is session state, not transaction state, and the
 	// connection must not go back to the pool — or on to the next statement of
 	// a pinned transaction — still accepting identity values.
-	if (identity_insert_on_ && !DisableIdentityInsert(IDENTITY_INSERT_OFF_TIMEOUT_MS)) {
+	// The OFF batch goes down the pinned connection like any other: a MERGE's
+	// other actions may be sending on it (review of #423).
+	bool identity_off = true;
+	if (identity_insert_on_) {
+		auto pinned_lock = LockPinned(context, catalog);
+		identity_off = DisableIdentityInsert(IDENTITY_INSERT_OFF_TIMEOUT_MS);
+	}
+	if (!identity_off) {
 		// Read before Fail: it does not change it, but the message must say
 		// what Fail actually did, and on a pinned connection it neither rolls
 		// back (the DuckDB transaction owns that) nor closes.
@@ -154,7 +196,19 @@ void MSSQLStatementConnection::Fail(ClientContext &context, MSSQLCatalog &catalo
 	// transaction's end resets the session under the default
 	// mssql_reset_connection — with it off, the rest of that transaction runs
 	// with IDENTITY_INSERT on, which is why it is logged.
-	const bool identity_cleared = DisableIdentityInsert(IDENTITY_INSERT_OFF_TIMEOUT_MS);
+	// Under the pinned connection's batch lock unless this thread already holds
+	// it (Fail is called from inside a batch too). Locking cannot fail in a way
+	// this noexcept path could report; an exception from it is swallowed and
+	// the OFF is skipped, which the code below treats as "not confirmed".
+	bool identity_cleared = !identity_insert_on_;
+	if (identity_insert_on_) {
+		try {
+			auto pinned_lock = LockPinned(context, catalog);
+			identity_cleared = DisableIdentityInsert(IDENTITY_INSERT_OFF_TIMEOUT_MS);
+		} catch (...) {
+			identity_cleared = false;
+		}
+	}
 	if (!identity_cleared && transaction_pinned_ && GetDmlDebugLevel() >= 1) {
 		fprintf(stderr,
 				"[MSSQL DML] IDENTITY_INSERT for %s.%s could not be turned off on the transaction's pinned "
@@ -188,6 +242,10 @@ void MSSQLStatementConnection::ReleaseWithoutContext() noexcept {
 	if (!connection_) {
 		return;
 	}
+	// No PinnedLock here: there is no ClientContext to find the transaction's
+	// mutex with, and this runs only when the executor is destroyed -- after
+	// the pipeline's tasks have stopped, so no other sink of the plan is sending
+	// on the pinned connection any more.
 	transaction_.Rollback();
 	// Same discipline as Fail, with no ClientContext: OFF, bounded; not
 	// confirmed → Close, so ReleaseBcpConnectionOnError discards it instead of

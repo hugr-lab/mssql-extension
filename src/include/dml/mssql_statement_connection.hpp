@@ -19,6 +19,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 
 #include "copy/load_transaction.hpp"
 #include "duckdb/common/shared_ptr.hpp"
@@ -56,6 +57,43 @@ public:
 	bool IsPinned() const {
 		return transaction_pinned_;
 	}
+
+	//! Spec 080 PR 1: one batch at a time on the pinned connection. The sinks
+	//! of one plan share it -- a MERGE's UPDATE / DELETE / INSERT actions are
+	//! fed from several threads -- so each batch, from its send to the end of
+	//! its response, holds the transaction's materialize lock
+	//! (MSSQLCatalog::MaterializeMutexFor), the one a materialising scan and
+	//! the bulk-load stream take. Empty in autocommit, where the statement's
+	//! connection is its own, and when this thread already holds it (Fail runs
+	//! inside a batch as well as after one; std::mutex is not recursive). The
+	//! flag is per thread, not per mutex: no path holds one catalog's lock while
+	//! asking for another's, and the scans / bulk streams that take
+	//! MaterializeMutexFor directly never call Commit or Fail under it.
+	//! Commit and Fail take it for the IDENTITY_INSERT OFF batch. Call after
+	//! Acquire.
+	class PinnedLock {
+	public:
+		PinnedLock() = default;
+		explicit PinnedLock(std::mutex &mutex);
+		PinnedLock(PinnedLock &&other) noexcept;
+		PinnedLock &operator=(PinnedLock &&) = delete;
+		PinnedLock(const PinnedLock &) = delete;
+		~PinnedLock();
+
+	private:
+		std::unique_lock<std::mutex> lock_;
+	};
+	PinnedLock LockPinned(ClientContext &context, MSSQLCatalog &catalog) const;
+
+	//! The runtime net under the plan-time rule that a DML's feeding scan is
+	//! materialised before the first batch (CollectSinkCatalogs; review of
+	//! #423). That rule is set by MSSQLOptimizer, which DuckDB skips under
+	//! `SET enable_optimizer = false` / `disabled_optimizers = 'extension'`;
+	//! a batch sent then would clear the receive buffer of a scan still reading
+	//! on the pinned connection, and the scan would misread rather than fail.
+	//! Throws, touching nothing, when the connection is not Idle. Call after
+	//! LockPinned, before anything is sent or cleared.
+	static void RequireIdle(tds::TdsConnection &connection, const char *operation);
 
 	//! After the last batch: COMMIT in autocommit, then the connection goes back
 	//! through ConnectionProvider (a no-op for the pinned one). Throws if the

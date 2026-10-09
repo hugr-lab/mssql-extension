@@ -167,6 +167,8 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 	// on it (spec 062 W1c). Throws when none can be had.
 	auto &mssql_catalog = GetMSSQLCatalog();
 	auto connection = stmt_conn_.Acquire(context_, mssql_catalog);
+	auto pinned_lock = stmt_conn_.LockPinned(context_, mssql_catalog);
+	MSSQLStatementConnection::RequireIdle(*connection, "INSERT");
 	EnsureIdentityInsert();
 
 	INSERT_DEBUG(2, "ExecuteBatch: connection acquired, state=%d", (int)connection->GetState());
@@ -373,6 +375,8 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 	const string &sql = batch.sql_statement;
 	auto &mssql_catalog = GetMSSQLCatalog();
 	auto connection = stmt_conn_.Acquire(context_, mssql_catalog);
+	auto pinned_lock = stmt_conn_.LockPinned(context_, mssql_catalog);
+	MSSQLStatementConnection::RequireIdle(*connection, "INSERT");
 	EnsureIdentityInsert();
 
 	auto start_time = std::chrono::steady_clock::now();

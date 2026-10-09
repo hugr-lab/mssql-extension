@@ -26,12 +26,15 @@
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
 #include "mssql_functions.hpp"
 #include "mssql_storage.hpp"
 #include "pushdown/mssql_order_term.hpp"
@@ -863,6 +866,27 @@ static void CollectSinkCatalogs(LogicalOperator &op, case_insensitive_set_t &cat
 		auto &catalog = insert.table.ParentCatalog();
 		if (catalog.GetCatalogType() == "mssql") {
 			MSSQL_OPT_DEBUG(1, "sink: INSERT into catalog '%s'", catalog.GetName().GetIdentifierName().c_str());
+			catalogs.insert(catalog.GetName().GetIdentifierName());
+		}
+	} else if (op.type == LogicalOperatorType::LOGICAL_UPDATE || op.type == LogicalOperatorType::LOGICAL_DELETE ||
+			   op.type == LogicalOperatorType::LOGICAL_MERGE_INTO) {
+		// Spec 080 PR 1: an UPDATE / DELETE / MERGE sends its batches down the
+		// same connection as the scan that feeds it -- the pinned one in a
+		// transaction, the pool's only one on a pool of one. The scan is
+		// materialised first, so the executors send as rows arrive; they used
+		// to defer every batch to Finalize in a transaction, and on a pool of
+		// one in autocommit they waited out mssql_acquire_timeout.
+		TableCatalogEntry *table = nullptr;
+		if (op.type == LogicalOperatorType::LOGICAL_UPDATE) {
+			table = &op.Cast<LogicalUpdate>().table;
+		} else if (op.type == LogicalOperatorType::LOGICAL_DELETE) {
+			table = &op.Cast<LogicalDelete>().table;
+		} else {
+			table = &op.Cast<LogicalMergeInto>().table;
+		}
+		auto &catalog = table->ParentCatalog();
+		if (catalog.GetCatalogType() == "mssql") {
+			MSSQL_OPT_DEBUG(1, "sink: DML into catalog '%s'", catalog.GetName().GetIdentifierName().c_str());
 			catalogs.insert(catalog.GetName().GetIdentifierName());
 		}
 	} else if (op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE) {

@@ -37,10 +37,6 @@ MSSQLDMLConfig LoadDMLConfig(ClientContext &context) {
 		config.max_parameters = static_cast<idx_t>(val.GetValue<int64_t>());
 	}
 
-	if (context.TryGetCurrentSetting("mssql_dml_use_prepared", val)) {
-		config.use_prepared = val.GetValue<bool>();
-	}
-
 	// Validate loaded config
 	config.Validate();
 

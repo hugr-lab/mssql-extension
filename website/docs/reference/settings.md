@@ -109,7 +109,7 @@ started it. See [INSERT](../writing/dml.md#two-paths-statements-and-bcp).
 | ---------------------------------- | ------- | -------- | ------ | ------------------------------------- |
 | `mssql_dml_batch_size`             | BIGINT  | 500      | ≥1     | Rows per UPDATE/DELETE batch          |
 | `mssql_dml_max_parameters`         | BIGINT  | 2000     | ≥1     | Max parameters per statement (~2100 limit) |
-| `mssql_dml_use_prepared`           | BOOLEAN | true     | -      | Use prepared statements for DML       |
+| `mssql_dml_use_prepared`           | BOOLEAN | true     | -      | Deprecated, no effect; removed in the next release |
 
 ### Usage Examples
 

@@ -292,7 +292,7 @@ gate widening this further (spec 061).
 |---|---|---|
 | `mssql_dml_batch_size` | 500 | Rows per UPDATE/DELETE batch |
 | `mssql_dml_max_parameters` | 2000 | Max SQL parameters per statement |
-| `mssql_dml_use_prepared` | true | Use prepared statements for DML |
+| `mssql_dml_use_prepared` | true | Deprecated, no effect; removed in the next release |
 
 ### CTAS (CREATE TABLE AS SELECT)
 | Setting | Default | Description |

@@ -261,6 +261,13 @@ public:
 	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
 								 PhysicalOperator &plan) override;
 
+	//! DuckDB's own MERGE planning, with the actions marked so their rows go out
+	//! at each action's Finalize (MSSQLDMLConfig::defer_to_finalize; spec 080
+	//! PR 1). A MERGE pushed whole, and one statement connection for all its
+	//! actions, are spec 080 PR 4.
+	PhysicalOperator &PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner, LogicalMergeInto &op,
+									PhysicalOperator &plan) override;
+
 	unique_ptr<LogicalOperator> BindCreateIndex(Binder &binder, CreateStatement &stmt, TableCatalogEntry &table,
 												unique_ptr<LogicalOperator> plan) override;
 

@@ -152,9 +152,6 @@ private:
 	// acquire publication flag its lock-free readers check (spec 052).
 	mutable std::atomic<bool> pk_loaded_{false};
 	mutable mssql::RowIdKeyInfo pk_info_;
-
-	// The key is loaded with the metadata; this only asserts it (spec 084 D5).
-	void EnsurePKLoaded(ClientContext &context) const;
 };
 
 }  // namespace duckdb
