@@ -66,6 +66,10 @@ struct MSSQLStagedDmlTarget {
 	//! rungs 1-2, the rowid key's columns in key order.
 	vector<MSSQLColumnInfo> key_columns;
 	MSSQLStagedKeySource key_source = MSSQLStagedKeySource::TRAILING_COLUMNS;
+	//! Where the key sits in the chunk, when the plan says (a DELETE's
+	//! row-id expressions; review of 2b): rung 3, one index per key column;
+	//! rungs 1-2, the rowid's. Empty: the trailing columns / the last one.
+	vector<idx_t> key_chunk_index;
 	//! UPDATE: the SET columns and where each value sits in the chunk.
 	vector<MSSQLColumnInfo> set_columns;
 	vector<idx_t> set_chunk_index;
@@ -83,6 +87,28 @@ struct MSSQLStagedDmlTarget {
 	//! extension's optimizer did not run): hold every row until Finalize, when
 	//! the scan has drained (review of #423).
 	bool hold_until_finalize = false;
+
+	//! Spec 080 PR 2b: UPDATE / DELETE ... RETURNING. The JOIN statement's
+	//! OUTPUT goes INTO a session #out (OUTPUT INTO a table works where a bare
+	//! OUTPUT is refused, beside an enabled trigger), read back after the count
+	//! check into the rows DuckDB's RETURNING projection expects.
+	bool returning = false;
+	//! Every column of the table in table order, and the types DuckDB reads
+	//! them as: the first part of the RETURNING chunk (UPDATE: the post-image,
+	//! inserted.*; DELETE: the pre-image, deleted.*).
+	vector<MSSQLColumnInfo> table_columns;
+	vector<LogicalType> table_types;
+	//! DELETE only: LogicalDelete appends the table's virtual columns after its
+	//! columns, in GetVirtualColumns()' order. Each entry is the table column a
+	//! virtual column repeats (rung 3's hidden key columns), or -1 for the rowid.
+	vector<int64_t> virtual_sources;
+	//! The rowid's type, and the table index of each key column it is built from.
+	LogicalType rowid_type;
+	vector<idx_t> key_table_index;
+	//! The RETURNING chunk's types (the logical operator's).
+	vector<LogicalType> returning_types;
+	//! mssql_convert_varchar_max, for reading #out as the scan reads the table.
+	bool convert_varchar_max = true;
 };
 
 class MSSQLStagedDml {
@@ -98,9 +124,18 @@ public:
 	//! server reports for the statement.
 	idx_t Finalize(ClientContext &context);
 
+	//! The rows RETURNING produced (null without RETURNING); valid after
+	//! Finalize.
+	unique_ptr<ColumnDataCollection> TakeReturned() {
+		return std::move(returned_);
+	}
+
 	//! The texts the operator sends, exposed for the unit test.
 	static string CreateStageSql(const MSSQLStagedDmlTarget &target, const string &stage_name);
-	static string JoinStatementSql(const MSSQLStagedDmlTarget &target, const string &stage_name);
+	//! `out_name` non-empty: the statement carries OUTPUT ... INTO it.
+	static string JoinStatementSql(const MSSQLStagedDmlTarget &target, const string &stage_name,
+								   const string &out_name = string());
+	static string CreateOutSql(const MSSQLStagedDmlTarget &target, const string &out_name);
 
 private:
 	void Start(ClientContext &context);
@@ -110,6 +145,8 @@ private:
 	//! The JOIN found every staged row (rungs 1-2: every distinct key; rung 3:
 	//! at least one row), or the statement fails before its commit.
 	void CheckMatchedEverything(ClientContext &context, idx_t matched);
+	//! Read #out into returned_, in the RETURNING chunk's layout.
+	void ReadReturned(ClientContext &context);
 
 	MSSQLStagedDmlTarget target_;
 	MSSQLCatalog &catalog_;
@@ -125,6 +162,8 @@ private:
 	mssql::BulkLoadSessionParams session_params_;
 	mssql::BulkLoadSession session_;
 	idx_t rows_staged_ = 0;
+	string out_name_;
+	unique_ptr<ColumnDataCollection> returned_;
 	bool finalized_ = false;
 };
 

@@ -1,0 +1,154 @@
+# name: test/sql/dml/dml_returning.test
+# description: UPDATE / DELETE ... RETURNING return the rows, through #stage and OUTPUT ... INTO #out (spec 080 PR 2b)
+# group: [dml]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS drr (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('drr', 'DROP TABLE IF EXISTS dbo.drr_t; CREATE TABLE dbo.drr_t (id int PRIMARY KEY, v int, s nvarchar(10) NULL); INSERT INTO dbo.drr_t VALUES (1, 10, N''a''), (2, 20, NULL), (3, 30, N''c'')');
+
+# UPDATE returns the post-image
+query II rowsort
+UPDATE drr.dbo.drr_t SET v = v + 1 WHERE id <= 2 RETURNING id, v;
+----
+1	11
+2	21
+
+query III
+UPDATE drr.dbo.drr_t SET s = 'z' WHERE id = 3 RETURNING *;
+----
+3	30	z
+
+# DELETE returns the pre-image, and the rowid with it
+query III
+DELETE FROM drr.dbo.drr_t WHERE id = 2 RETURNING id, v, s;
+----
+2	21	NULL
+
+query II
+DELETE FROM drr.dbo.drr_t WHERE id = 3 RETURNING rowid, v;
+----
+3	30
+
+# `WHERE rowid = …` binds the rowid first in the DELETE's chunk; with
+# RETURNING every other column follows it. The key is taken where the plan put
+# it, not from the last column (an int beside the int key would otherwise have
+# deleted the rows keyed by its value).
+statement ok
+SELECT mssql_exec('drr', 'DROP TABLE IF EXISTS dbo.drr_r; CREATE TABLE dbo.drr_r (id int PRIMARY KEY, other int NOT NULL); INSERT INTO dbo.drr_r VALUES (1, 3), (2, 1), (3, 2)');
+
+query II
+DELETE FROM drr.dbo.drr_r WHERE rowid = 1 RETURNING *;
+----
+1	3
+
+query II
+SELECT id, other FROM drr.dbo.drr_r ORDER BY id;
+----
+2	1
+3	2
+
+# nothing selected: no rows
+query I
+UPDATE drr.dbo.drr_t SET v = 0 WHERE id = 99 RETURNING id;
+----
+
+query III
+SELECT id, v, s FROM drr.dbo.drr_t;
+----
+1	11	a
+
+# a composite key's rowid is the STRUCT of its columns
+statement ok
+SELECT mssql_exec('drr', 'DROP TABLE IF EXISTS dbo.drr_c; CREATE TABLE dbo.drr_c (a int NOT NULL, b nvarchar(5) NOT NULL, v int, PRIMARY KEY (a, b)); INSERT INTO dbo.drr_c VALUES (1, N''x'', 5)');
+
+query II
+DELETE FROM drr.dbo.drr_c RETURNING rowid, v;
+----
+{'a': 1, 'b': x}	5
+
+# a table with no key (rung 3), and many rows
+statement ok
+SELECT mssql_exec('drr', 'DROP TABLE IF EXISTS dbo.drr_k; CREATE TABLE dbo.drr_k (a int NULL, b int NULL); INSERT INTO dbo.drr_k SELECT TOP (3000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), NULL FROM sys.all_objects a CROSS JOIN sys.all_objects b');
+
+query II
+WITH u AS (UPDATE drr.dbo.drr_k SET b = a * 2 WHERE a > 1000 RETURNING a, b) SELECT count(*), sum(b) FROM u;
+----
+2000	8002000
+
+query I
+WITH d AS (DELETE FROM drr.dbo.drr_k WHERE a <= 10 RETURNING *) SELECT count(*) FROM d;
+----
+10
+
+# in a transaction, rolled back
+statement ok
+BEGIN;
+
+query I
+WITH d AS (DELETE FROM drr.dbo.drr_k RETURNING a) SELECT count(*) FROM d;
+----
+2990
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM drr.dbo.drr_k;
+----
+2990
+
+# an AFTER trigger on the target: a bare OUTPUT would be refused (334);
+# OUTPUT ... INTO is not. Identity, computed and rowversion columns come back
+# as the scan reads them.
+statement ok
+SELECT mssql_exec('drr', 'DROP TABLE IF EXISTS dbo.drr_log; DROP TABLE IF EXISTS dbo.drr_trg; CREATE TABLE dbo.drr_log (n int); CREATE TABLE dbo.drr_trg (id int IDENTITY(1,1) PRIMARY KEY, v int NOT NULL, twice AS (v * 2), rv rowversion); INSERT INTO dbo.drr_trg (v) VALUES (1), (2)');
+
+statement ok
+SELECT mssql_exec('drr', 'CREATE TRIGGER dbo.drr_trg_au ON dbo.drr_trg AFTER UPDATE, DELETE AS INSERT INTO dbo.drr_log SELECT COUNT(*) FROM deleted');
+
+query III rowsort
+UPDATE drr.dbo.drr_trg SET v = v + 10 RETURNING id, v, twice;
+----
+1	11	22
+2	12	24
+
+query II
+DELETE FROM drr.dbo.drr_trg WHERE id = 1 RETURNING id, octet_length(rv);
+----
+1	8
+
+query I
+SELECT * FROM mssql_scan('drr', 'SELECT SUM(n) AS n FROM dbo.drr_log');
+----
+3
+
+# a geometry column that is neither key nor SET comes back as the scan reads
+# it (WKB); #out holds the read expression, never the native type
+statement ok
+SELECT mssql_exec('drr', 'DROP TABLE IF EXISTS dbo.drr_g; CREATE TABLE dbo.drr_g (id int PRIMARY KEY, v int, g geometry NULL); INSERT INTO dbo.drr_g VALUES (1, 0, geometry::Point(1, 2, 0))');
+
+query II
+UPDATE drr.dbo.drr_g SET v = 1 RETURNING id, g IS NOT NULL;
+----
+1	true
+
+# INSERT ... RETURNING still works.
+query I
+INSERT INTO drr.dbo.drr_t VALUES (4, 40, NULL) RETURNING id;
+----
+4
+
+statement ok
+SELECT mssql_exec('drr', 'DROP TABLE dbo.drr_t; DROP TABLE dbo.drr_c; DROP TABLE dbo.drr_k; DROP TABLE dbo.drr_trg; DROP TABLE dbo.drr_log; DROP TABLE dbo.drr_r; DROP TABLE dbo.drr_g');
+
+statement ok
+DETACH drr;

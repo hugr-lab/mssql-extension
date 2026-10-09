@@ -60,7 +60,11 @@ public:
 	//! MSSQLStagedDmlTarget::hold_until_finalize: the rows, until Finalize.
 	unique_ptr<ColumnDataCollection> held;
 	idx_t rows = 0;
-	bool returned = false;
+	//! Spec 080 PR 2b: the RETURNING rows, and where the source is in them.
+	unique_ptr<ColumnDataCollection> returned;
+	ColumnDataScanState scan_state;
+	bool scan_started = false;
+	bool returned_count = false;
 	std::mutex mutex;
 };
 

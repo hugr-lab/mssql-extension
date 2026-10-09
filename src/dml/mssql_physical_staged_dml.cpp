@@ -37,6 +37,7 @@ SinkFinalizeType MSSQLPhysicalStagedDml::Finalize(Pipeline &pipeline, Event &eve
 		gstate.held.reset();
 	}
 	gstate.rows = gstate.staged.Finalize(context);
+	gstate.returned = gstate.staged.TakeReturned();
 	return SinkFinalizeType::READY;
 }
 
@@ -48,12 +49,24 @@ SourceResultType MSSQLPhysicalStagedDml::GetDataInternal(ExecutionContext &conte
 														 OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<MSSQLStagedDmlGlobalSinkState>();
 	std::lock_guard<std::mutex> lock(gstate.mutex);
-	if (gstate.returned) {
+	if (target_.returning) {
+		// The RETURNING rows; none when nothing was selected.
+		if (!gstate.returned) {
+			return SourceResultType::FINISHED;
+		}
+		if (!gstate.scan_started) {
+			gstate.returned->InitializeScan(gstate.scan_state);
+			gstate.scan_started = true;
+		}
+		gstate.returned->Scan(gstate.scan_state, chunk);
+		return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+	}
+	if (gstate.returned_count) {
 		return SourceResultType::FINISHED;
 	}
 	chunk.SetChildCardinality(1);
 	chunk.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(gstate.rows)));
-	gstate.returned = true;
+	gstate.returned_count = true;
 	return SourceResultType::FINISHED;
 }
 

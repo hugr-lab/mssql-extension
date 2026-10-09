@@ -19,6 +19,7 @@
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -519,10 +520,85 @@ static bool KeyedStagedTarget(ClientContext &context, MSSQLCatalog &catalog, MSS
 	return true;
 }
 
+//! Spec 080 PR 2b: what RETURNING needs on the staged operator. `types` are
+//! the logical operator's (LogicalUpdate / LogicalDelete::ResolveTypes): the
+//! table's columns, then for a DELETE its virtual columns in
+//! GetVirtualColumns()' order -- asked here the same way, so the order agrees.
+static void PrepareReturning(ClientContext &context, MSSQLTableEntry &table_entry, MSSQLStagedDmlTarget &target,
+							 const vector<LogicalType> &types) {
+	target.returning = true;
+	target.returning_types = types;
+	target.table_columns = table_entry.GetMSSQLColumns();
+	for (auto &col : table_entry.GetColumns().Physical()) {
+		target.table_types.push_back(col.Type());
+	}
+	target.convert_varchar_max = LoadConvertVarcharMax(context);
+	const idx_t ncols = target.table_types.size();
+	if (ncols != target.table_columns.size()) {
+		throw InternalException("MSSQL RETURNING: %llu DuckDB columns, %llu SQL Server columns",
+								(unsigned long long)ncols, (unsigned long long)target.table_columns.size());
+	}
+	if (target.kind == MSSQLStagedDmlKind::DELETE_ROWS) {
+		for (auto &entry : table_entry.GetVirtualColumns()) {
+			if (entry.first == COLUMN_IDENTIFIER_ROW_ID) {
+				target.virtual_sources.push_back(-1);
+			} else if (mssql::IsKeylessKeyColumn(entry.first)) {
+				target.virtual_sources.push_back(static_cast<int64_t>(mssql::ResolveKeylessKeyColumn(entry.first)));
+			} else {
+				throw InternalException("MSSQL DELETE ... RETURNING: unexpected virtual column %llu",
+										(unsigned long long)entry.first);
+			}
+		}
+		const auto *pk_info = table_entry.LoadedPrimaryKeyInfo();
+		if (pk_info && pk_info->exists) {
+			target.rowid_type = pk_info->rowid_type;
+			for (auto &key : pk_info->columns) {
+				for (idx_t i = 0; i < target.table_columns.size(); i++) {
+					if (target.table_columns[i].name == key.name) {
+						target.key_table_index.push_back(i);
+					}
+				}
+			}
+		}
+	}
+	if (types.size() != ncols + target.virtual_sources.size()) {
+		throw InternalException("MSSQL RETURNING: %llu columns expected, the table gives %llu",
+								(unsigned long long)types.size(),
+								(unsigned long long)(ncols + target.virtual_sources.size()));
+	}
+}
+
+//! RETURNING goes through the stage, so it needs one (spec 080 PR 2b).
+static void RequireReturningStage(MSSQLCatalog &catalog, const char *verb, MSSQLTableEntry &table_entry) {
+	const auto caps = catalog.GetDmlCapabilities();
+	if (!caps.update_from_join || !caps.stage_bulk || !caps.output_into_table) {
+		throw NotImplementedException(
+			"MSSQL: %s ... RETURNING on '%s.%s' is not supported on %s yet: it runs through a #stage table and "
+			"OUTPUT ... INTO, which this platform does not take",
+			verb, table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName(),
+			caps.platform == mssql::DmlPlatform::Fabric ? "Fabric Warehouse" : "this platform");
+	}
+}
+
+//! A DELETE's row-id expressions say where its key sits in the chunk -- not
+//! always last: `WHERE rowid = …` binds the rowid first, and with RETURNING
+//! every other column follows it (review of 2b). As DuckCatalog::PlanDelete.
+static vector<idx_t> RowIdChunkIndexes(const LogicalDelete &op) {
+	vector<idx_t> indexes;
+	for (auto &expr : op.expressions) {
+		if (expr->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+			throw InternalException("MSSQL DELETE: a row-id expression is not a column reference");
+		}
+		indexes.push_back(expr->Cast<BoundReferenceExpression>().Index());
+	}
+	return indexes;
+}
+
 //! Rung 3: refuse by name, or the staged operator.
 static PhysicalOperator &PlanKeylessDml(ClientContext &context, PhysicalPlanGenerator &planner, MSSQLCatalog &catalog,
 										MSSQLTableEntry &table_entry, MSSQLStagedDmlTarget target,
-										PhysicalOperator &plan, idx_t estimated_cardinality) {
+										PhysicalOperator &plan, idx_t estimated_cardinality,
+										const vector<LogicalType> *returning_types) {
 	const char *verb = target.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "UPDATE" : "DELETE";
 	const auto schema_name = table_entry.schema.name.GetIdentifierName();
 	const auto table_name = table_entry.name.GetIdentifierName();
@@ -560,6 +636,10 @@ static PhysicalOperator &PlanKeylessDml(ClientContext &context, PhysicalPlanGene
 	target.table_entry = &table_entry;
 	target.hold_until_finalize = ConnectionShared(context, catalog) && FeedsFromStreamingScan(context, catalog, plan);
 	vector<LogicalType> result_types{LogicalType::BIGINT};
+	if (returning_types) {
+		PrepareReturning(context, table_entry, target, *returning_types);
+		result_types = *returning_types;
+	}
 	auto &op = planner.Make<MSSQLPhysicalStagedDml>(std::move(result_types), estimated_cardinality, std::move(target));
 	op.children.push_back(plan);
 	return op;
@@ -592,15 +672,12 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	auto &table_entry = op.table.Cast<MSSQLTableEntry>();
 	RefuseKeyedDmlOnSynapse(*this, "DELETE", table_entry);
 
-	// The operator returns the affected count, never rows. Planned with
-	// RETURNING, DuckDB's projection over it read the BIGINT count as the
-	// returned columns and failed with an InternalException, which invalidates
-	// the database. Refused by name until RETURNING maps to OUTPUT (spec 080).
+	// RETURNING returns rows, not the count: the staged operator, whatever the
+	// row count, with OUTPUT ... INTO #out (spec 080 PR 2b). Before 2b the
+	// count operator was planned under DuckDB's RETURNING projection, which
+	// read the BIGINT as the returned columns -- an InternalException.
 	if (op.return_chunk) {
-		throw NotImplementedException(
-			"MSSQL: DELETE ... RETURNING is not supported yet on '%s.%s' (INSERT ... "
-			"RETURNING is)",
-			table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName());
+		RequireReturningStage(*this, "DELETE", table_entry);
 	}
 
 	// Rung 1-2: the rowid key (primary key or a usable unique index); rung 3,
@@ -609,7 +686,9 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	if (!pk_info.exists) {
 		MSSQLStagedDmlTarget staged;
 		staged.kind = MSSQLStagedDmlKind::DELETE_ROWS;
-		return PlanKeylessDml(context, planner, *this, table_entry, std::move(staged), plan, op.estimated_cardinality);
+		staged.key_chunk_index = RowIdChunkIndexes(op);
+		return PlanKeylessDml(context, planner, *this, table_entry, std::move(staged), plan, op.estimated_cardinality,
+							  op.return_chunk ? &op.types : nullptr);
 	}
 
 	// Build MSSQLDeleteTarget from table metadata
@@ -641,7 +720,21 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	// Create the physical operator using planner.Make<T>()
 	MSSQLStagedDmlTarget staged;
 	staged.kind = MSSQLStagedDmlKind::DELETE_ROWS;
+	staged.key_chunk_index = RowIdChunkIndexes(op);
 	const bool can_stage = KeyedStagedTarget(context, *this, table_entry, pk_info, staged);
+	if (op.return_chunk) {
+		if (!can_stage) {
+			throw NotImplementedException(
+				"MSSQL: DELETE ... RETURNING on '%s.%s' is not supported: a key column "
+				"cannot be bulk-loaded into the #stage table it runs through",
+				table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName());
+		}
+		staged.hold_until_finalize = ConnectionShared(context, *this) && FeedsFromStreamingScan(context, *this, plan);
+		PrepareReturning(context, table_entry, staged, op.types);
+		auto &returning = planner.Make<MSSQLPhysicalStagedDml>(op.types, op.estimated_cardinality, std::move(staged));
+		returning.children.push_back(plan);
+		return returning;
+	}
 	auto &physical_delete =
 		planner.Make<MSSQLPhysicalDelete>(std::move(result_types), op.estimated_cardinality, std::move(target), config);
 	physical_delete.Cast<MSSQLPhysicalDelete>().SetTableEntry(table_entry);
@@ -664,15 +757,17 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 	auto &table_entry = op.table.Cast<MSSQLTableEntry>();
 	RefuseKeyedDmlOnSynapse(*this, "UPDATE", table_entry);
 
-	// The operator returns the affected count, never rows. Planned with
-	// RETURNING, DuckDB's projection over it read the BIGINT count as the
-	// returned columns and failed with an InternalException, which invalidates
-	// the database. Refused by name until RETURNING maps to OUTPUT (spec 080).
+	// RETURNING: the staged operator with OUTPUT ... INTO #out (spec 080 PR
+	// 2b; see PlanDelete). The OLD image DuckDB captures for its own triggers
+	// is not produced.
 	if (op.return_chunk) {
-		throw NotImplementedException(
-			"MSSQL: UPDATE ... RETURNING is not supported yet on '%s.%s' (INSERT ... "
-			"RETURNING is)",
-			table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName());
+		RequireReturningStage(*this, "UPDATE", table_entry);
+		if (op.capture_old_rows) {
+			throw NotImplementedException(
+				"MSSQL: UPDATE on '%s.%s' with a trigger reading the old rows is not "
+				"supported",
+				table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName());
+		}
 	}
 
 	// Get MSSQL column info
@@ -694,7 +789,8 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 			staged.set_columns.push_back(mssql_columns[physical_idx]);
 			staged.set_chunk_index.push_back(i);
 		}
-		return PlanKeylessDml(context, planner, *this, table_entry, std::move(staged), plan, op.estimated_cardinality);
+		return PlanKeylessDml(context, planner, *this, table_entry, std::move(staged), plan, op.estimated_cardinality,
+							  op.return_chunk ? &op.types : nullptr);
 	}
 
 	// Check if any PK column is being updated (reject if so)
@@ -773,6 +869,19 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 			staged.set_chunk_index.push_back(i);
 		}
 		stage_update = StageCanCarry(staged.set_columns);
+	}
+	if (op.return_chunk) {
+		if (!stage_update) {
+			throw NotImplementedException(
+				"MSSQL: UPDATE ... RETURNING on '%s.%s' is not supported: a key or SET "
+				"column cannot be bulk-loaded into the #stage table it runs through",
+				table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName());
+		}
+		staged.hold_until_finalize = ConnectionShared(context, *this) && FeedsFromStreamingScan(context, *this, plan);
+		PrepareReturning(context, table_entry, staged, op.types);
+		auto &returning = planner.Make<MSSQLPhysicalStagedDml>(op.types, op.estimated_cardinality, std::move(staged));
+		returning.children.push_back(plan);
+		return returning;
 	}
 	auto &physical_update =
 		planner.Make<MSSQLPhysicalUpdate>(std::move(result_types), op.estimated_cardinality, std::move(target), config);

@@ -174,7 +174,7 @@ WHERE id = 42;
 
 ### Limitations
 
-- **RETURNING is not supported yet** for UPDATE; it is refused by name
+- **RETURNING** returns the rows as written (see [RETURNING](#update-and-delete--returning))
 - A SET of a rowid key column is refused (on a table with no key, any column may be SET)
 - On Azure Synapse every UPDATE through the catalog is refused: its primary keys and unique constraints are `NOT ENFORCED`, so a key could match rows the statement did not select. Use `mssql_exec()`
 
@@ -280,8 +280,26 @@ WHERE order_id IN (SELECT id FROM sqlserver.dbo.orders WHERE status = 'cancelled
 
 ### Limitations
 
-- **RETURNING is not supported yet** for DELETE; it is refused by name
+- **RETURNING** returns the rows as they were, with the `rowid`
 - On Azure Synapse every DELETE through the catalog is refused, as for UPDATE
+
+## UPDATE and DELETE … RETURNING
+
+```sql
+UPDATE sqlserver.dbo.products SET price = price * 1.1 WHERE category = 'premium'
+RETURNING id, price;
+
+DELETE FROM sqlserver.dbo.orders WHERE status = 'cancelled' RETURNING *;
+```
+
+An UPDATE returns each row as the server wrote it — computed and `rowversion`
+columns included — and a DELETE each row as it was before. Such a statement
+always goes through the `#stage` path below, whatever its size, with
+`OUTPUT … INTO` a session table that is then read back; that form works on a
+table with triggers, where a bare `OUTPUT` is refused. Not available on Fabric
+Warehouse and Azure Synapse yet, nor when a key or SET column cannot be
+bulk-loaded (`geometry`, `geography`). A RETURNING statement costs a few round
+trips more than the same statement without it, even for one row.
 
 ## How UPDATE and DELETE reach the server
 
