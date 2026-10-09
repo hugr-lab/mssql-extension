@@ -12,11 +12,10 @@
 # user is told which index to fix rather than to add one they already have.
 #
 # The step-1 change — an unusable primary key falls through instead of being
-# taken — closes a live defect: a DATETIME primary key produced an UPDATE that
-# reported success and changed nothing (issue #358), because no datetime2
-# literal matches a datetime value with a 1/300 s fraction. Measured; the table with a usable unique
-# index beside such a key now updates through the index, and the one without
-# refuses by name.
+# taken — closed a live defect: a DATETIME primary key produced an UPDATE that
+# reported success and changed nothing (issue #358). A datetime key is usable
+# since spec 080 W3 (it is matched in its own type); the fall-through is guarded
+# here with time(7), whose 100 ns digit no read keeps.
 
 require mssql
 
@@ -59,19 +58,18 @@ SELECT rowid, v FROM ux.dbo.UxIdent ORDER BY v;
 1	11
 
 # =============================================================================
-# The regression guard for the step-1 change: a DATETIME primary key beside a
-# usable BIGINT UNIQUE. The key value 10:00:00.003 is a 1/300 s tick that no
-# datetime2 literal equals. rowid is the unique index, and the UPDATE that
-# silently changed nothing before now changes the row.
+# The regression guard for the step-1 change: a TIME(7) primary key beside a
+# usable BIGINT UNIQUE. The key's seventh digit is set, so no literal read
+# back matches it. rowid is the unique index, and the UPDATE changes the row.
 # =============================================================================
 
 statement ok
-SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxDtPk (k DATETIME NOT NULL PRIMARY KEY, id BIGINT NOT NULL UNIQUE, v INT); INSERT INTO dbo.UxDtPk VALUES (''2026-01-01 10:00:00.003'', 7, 1)');
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxDtPk (k TIME(7) NOT NULL PRIMARY KEY, id BIGINT NOT NULL UNIQUE, v INT); INSERT INTO dbo.UxDtPk VALUES (''10:00:00.1234567'', 7, 1)');
 
 statement ok
 SELECT mssql_invalidate_cache('ux');
 
-# rowid is the unique index's column (7), not the datetime key
+# rowid is the unique index's column (7), not the time(7) key
 query II
 SELECT rowid, v FROM ux.dbo.UxDtPk;
 ----
@@ -88,7 +86,7 @@ SELECT v FROM ux.dbo.UxDtPk;
 # --- the same key without a unique index beside it refuses by name, pointing
 # at the issue, rather than reporting success on a statement that did nothing
 statement ok
-SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxDtOnly (k DATETIME NOT NULL PRIMARY KEY, v INT); INSERT INTO dbo.UxDtOnly VALUES (''2026-01-01 10:00:00.003'', 1)');
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxDtOnly (k TIME(7) NOT NULL PRIMARY KEY, v INT); INSERT INTO dbo.UxDtOnly VALUES (''10:00:00.1234567'', 1)');
 
 statement ok
 SELECT mssql_invalidate_cache('ux');
@@ -101,13 +99,59 @@ has a key, but rowid cannot address a row through it
 statement error
 DELETE FROM ux.dbo.UxDtOnly WHERE v = 1;
 ----
-key column 'k' has type datetime, which no rowid literal can match (see issue #358)
+key column 'k' has type time(7), which no rowid literal can match (see issue #358)
 
 # --- and the row is untouched: the refusal was at bind, nothing ran
 query I
 SELECT v FROM ux.dbo.UxDtOnly;
 ----
 1
+
+# =============================================================================
+# #358 itself: a DATETIME primary key with 1/300 s ticks (.003, .007, .997) is
+# usable, on the VALUES-join path (the key converted to datetime) and on the
+# #stage path (a datetime stage column), every row found.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('ux', 'IF OBJECT_ID(''dbo.UxDatetime'') IS NOT NULL DROP TABLE dbo.UxDatetime; CREATE TABLE dbo.UxDatetime (k DATETIME NOT NULL PRIMARY KEY, v INT); INSERT INTO dbo.UxDatetime VALUES (''2026-01-01 10:00:00.003'', 1), (''2026-01-01 10:00:00.007'', 1), (''2026-01-01 10:00:00.997'', 1), (''1753-01-01 00:00:00.003'', 1)');
+
+statement ok
+SELECT mssql_invalidate_cache('ux');
+
+query I
+UPDATE ux.dbo.UxDatetime SET v = 2;
+----
+4
+
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+query I
+UPDATE ux.dbo.UxDatetime SET v = 3 WHERE v = 2;
+----
+4
+
+query I
+DELETE FROM ux.dbo.UxDatetime WHERE k < '2000-01-01'::TIMESTAMP;
+----
+1
+
+statement ok
+RESET mssql_dml_stage_threshold;
+
+query I
+DELETE FROM ux.dbo.UxDatetime WHERE v = 3 AND k > '2026-01-01 10:00:00.005'::TIMESTAMP;
+----
+2
+
+query I
+SELECT count(*) FROM ux.dbo.UxDatetime;
+----
+1
+
+statement ok
+SELECT mssql_exec('ux', 'DROP TABLE dbo.UxDatetime');
 
 # =============================================================================
 # A SQL_VARIANT primary key: the read is lossy (issue #354), so it cannot

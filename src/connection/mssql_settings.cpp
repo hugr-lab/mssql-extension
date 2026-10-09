@@ -353,6 +353,17 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 		"mssql_dml_batch_size", "Maximum rows per UPDATE/DELETE batch (default: 500, affects parameter count)",
 		LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_DML_BATCH_SIZE), ValidatePositive, SetScope::GLOBAL);
 
+	// mssql_dml_stage_threshold - spec 080 D3. Rows up to which an UPDATE /
+	// DELETE on a keyed table goes as VALUES-join statements (rows counted as
+	// they arrive); past it the rows go into a session #stage by INSERT BULK and
+	// one UPDATE / DELETE ... JOIN #stage writes them. A keyless table always
+	// stages. 0 stages every statement.
+	config.AddExtensionOption("mssql_dml_stage_threshold",
+							  "Rows up to which an UPDATE/DELETE on a keyed table is sent as VALUES-join statements; "
+							  "past it the rows go through a #stage table (0 = always stage, default: 1000)",
+							  LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_DML_STAGE_THRESHOLD),
+							  ValidateNonNegative, SetScope::GLOBAL);
+
 	// mssql_dml_max_parameters - Maximum parameters per DML statement
 	// SQL Server limit is approximately 2100, we use 2000 for safety margin
 	config.AddExtensionOption(

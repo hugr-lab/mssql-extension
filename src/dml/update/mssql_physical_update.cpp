@@ -22,8 +22,11 @@ SinkResultType MSSQLPhysicalUpdate::Sink(ExecutionContext &context, DataChunk &c
 	auto &gstate = input.global_state.Cast<MSSQLUpdateGlobalSinkState>();
 	lock_guard<mutex> lock(gstate.mutex);
 
-	// Process the chunk through the executor
-	gstate.executor->Execute(chunk);
+	if (gstate.stage_switch) {
+		gstate.stage_switch->Sink(context.client, chunk);
+	} else {
+		gstate.executor->Execute(chunk);
+	}
 
 	return SinkResultType::NEED_MORE_INPUT;
 }
@@ -38,7 +41,14 @@ SinkFinalizeType MSSQLPhysicalUpdate::Finalize(Pipeline &pipeline, Event &event,
 	auto &gstate = input.global_state.Cast<MSSQLUpdateGlobalSinkState>();
 	lock_guard<mutex> lock(gstate.mutex);
 
+	if (!gstate.finalized && gstate.stage_switch && gstate.stage_switch->IsStaged()) {
+		gstate.total_rows_updated = gstate.stage_switch->FinalizeStaged(context);
+		gstate.finalized = true;
+	}
 	if (!gstate.finalized) {
+		if (gstate.stage_switch) {
+			gstate.stage_switch->Replay([&](DataChunk &held) { gstate.executor->Execute(held); });
+		}
 		auto result = gstate.executor->Finalize();
 		if (!result.success) {
 			throw IOException("%s", result.FormatError("UPDATE"));
@@ -52,7 +62,11 @@ SinkFinalizeType MSSQLPhysicalUpdate::Finalize(Pipeline &pipeline, Event &event,
 }
 
 unique_ptr<GlobalSinkState> MSSQLPhysicalUpdate::GetGlobalSinkState(ClientContext &context) const {
-	return make_uniq<MSSQLUpdateGlobalSinkState>(context, target_, config_);
+	auto gstate = make_uniq<MSSQLUpdateGlobalSinkState>(context, target_, config_);
+	if (staged_target_ && !config_.defer_to_finalize) {
+		gstate->stage_switch = make_uniq<MSSQLStageSwitch>(*staged_target_, config_.stage_threshold);
+	}
+	return std::move(gstate);
 }
 
 unique_ptr<LocalSinkState> MSSQLPhysicalUpdate::GetLocalSinkState(ExecutionContext &context) const {

@@ -48,6 +48,11 @@ SELECT mssql_invalidate_cache('i344');
 statement ok
 SET mssql_insert_use_bcp = false;
 
+# Likewise UPDATE / DELETE: past mssql_dml_stage_threshold they go through a
+# #stage and one JOIN statement (spec 080 D3); the lever is in the VALUES path.
+statement ok
+SET mssql_dml_stage_threshold = 1000000;
+
 statement ok
 INSERT INTO i344.dbo.i344 SELECT i, 1 FROM range(1, 1201) t(i);
 

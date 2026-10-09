@@ -393,10 +393,25 @@ The key is resolved per table at plan time:
    - **On rung 3 the stage carries the old values (the match) and the new
      values (the SET).** So a SET of any column is allowed there: the "no SET
      of a key column" rule exists for rungs 1–2 only.
-   - The stage is DISTINCT over the key, which is every column. A
-     deterministic SET over equal rows gives equal new values, so the
-     DISTINCT loses nothing. Without it, Fabric's MERGE fallback fails with
-     8672 on duplicate stage rows.
+   - On Fabric's MERGE form the stage is DISTINCT over the key, which is
+     every column: a deterministic SET over equal rows gives equal new values,
+     so the DISTINCT loses nothing, and without it MERGE fails with 8672 on
+     duplicate stage rows. SQL Server's `UPDATE … JOIN` / `DELETE … JOIN`
+     take duplicate stage rows as they are (PR 2).
+   - **A string key column is matched by its bytes as well** (found in PR
+     2's review): under the column's collation `'Ab'` equals `'ab'` and `'a'`
+     equals `'a '`, so each such row would match the other's stage row -- an
+     UPDATE could write one row's new value into the other, and a DELETE
+     whose pushed LIKE told them apart would take both. The join adds
+     `CAST(t.c AS varbinary(max)) = CAST(s.c AS varbinary(max))` beside `=`
+     (kept for the seek); stage and target share type and collation.
+   - **How the key reaches the operator** (PR 2): DuckDB's binder appends
+     the ids `GetRowIdColumns()` names and looks each up in
+     `GetVirtualColumns()`, which takes virtual ids only, so the entry
+     exposes one hidden virtual column per physical column
+     (`MSSQL_KEYLESS_KEY_START + i`, named like the column, so a name
+     resolves to the column and the hidden ones cannot be referenced), and the
+     scan reads each as its column.
    - **Duplicates move together.** Target rows identical in every column are
      one match, so they are updated or deleted together. A row
      DuckDB's plan selected once can therefore count twice. This is the
@@ -488,8 +503,13 @@ refuses these columns on both rungs, as rung 2 does today):
 
 The `<key>` comparison on rung 3 uses `null_safe` (D0).
 
-**RETURNING on the fallback**, with `output_into_tvar`:
-- The JOIN / VALUES statement carries `OUTPUT … INTO @o`.
+**RETURNING on the fallback**, with `output_into_tvar` -- its own PR right
+after PR 2 (owner, 2026-10-09: DuckDB's RETURNING chunk carries the old image
+as well under `capture_old_rows`, and a DELETE's carries the virtual columns,
+on rung 3 one per column):
+- Every RETURNING statement stages, whatever the row count, and the JOIN
+  statement carries `OUTPUT inserted.… / deleted.… INTO #out`; `#out` is read
+  back as a stream.
 - The operator returns DuckDB's RETURNING chunk: every non-generated column,
   in table order, at DuckDB's types (binder.cpp:571-580). That is the
   post-image for UPDATE and the pre-image for DELETE.
@@ -806,7 +826,8 @@ risk", and this spec is no smaller. Each PR merges before the next opens
 | PR | contents | stands on its own because |
 |---|---|---|
 | **1** | W4 (the 066 remainder: sinks, defer removed, pool of one); RETURNING on UPDATE / DELETE **refused by name** at plan time (the InternalException fix); W6 | fixes UPDATE / DELETE on a pool of one and the crash, behind no setting |
-| **2** | W3 (the ladder, rung 3, `#stage`, `mssql_dml_stage_threshold`, #358) and W5's capability read (`EngineEdition` / `ProductMajorVersion`); RETURNING through `OUTPUT … INTO @o` on the fallback where `output_into_tvar` holds; the `fabric-probe/` run if the warehouse answers by then (the rows it settles flip, one line each) | closes #140 and #358 with no rewriter involved |
+| **2** | W3 (the ladder, rung 3, `#stage`, `mssql_dml_stage_threshold`, #358) and W5's capability read (`EngineEdition` / `ProductMajorVersion`); the `fabric-probe/` run if the warehouse answers by then (the rows it settles flip, one line each) | closes #140 and #358 with no rewriter involved |
+| **2b** | RETURNING on the fallback (`OUTPUT … INTO #out`), split from PR 2 (owner, 2026-10-09) | UPDATE / DELETE … RETURNING return rows instead of a named refusal |
 | **3** | W1 + W2 (the count vehicle, the run-once latch, the exact count, `ExecuteDmlBatch`, the writer's UPDATE / DELETE / INSERT … SELECT, `mssql_dml_pushdown`); the agreement harness | pushed DML end to end, PR 2's path under every veto |
 | **4** | W7: one statement connection for a MERGE's actions (atomic in autocommit), pushed MERGE | MERGE on top of PRs 2–3 (PR 1 already made the native MERGE run in a transaction and on a pool of one, #423) |
 | **5** | D6 (pushed CTAS) and its docs; W9's final pass | droppable without touching PRs 1–4: every earlier PR carries its own docs |

@@ -218,7 +218,7 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 	// duckdb_tables() listing waited mssql_acquire_timeout for it (issue #380) --
 	// and write the shared statistics cache from inside a transaction.
 	if (!context.transaction.IsAutoCommit()) {
-		info.cardinality = approx_row_count_;
+		info.cardinality = approx_row_count_.load(std::memory_order_relaxed);
 		return info;
 	}
 
@@ -246,14 +246,15 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 			}
 			pool.Release(std::move(connection));
 		} else {
-			info.cardinality = approx_row_count_;
+			info.cardinality = approx_row_count_.load(std::memory_order_relaxed);
 			MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (cached, no connection)",
-						   mssql_schema.name.c_str(), name.c_str(), (unsigned long long)approx_row_count_);
+						   mssql_schema.name.c_str(), name.c_str(),
+						   (unsigned long long)approx_row_count_.load(std::memory_order_relaxed));
 		}
 	} catch (...) {
-		info.cardinality = approx_row_count_;
+		info.cardinality = approx_row_count_.load(std::memory_order_relaxed);
 		MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (cached, exception)", mssql_schema.name.c_str(),
-					   name.c_str(), (unsigned long long)approx_row_count_);
+					   name.c_str(), (unsigned long long)approx_row_count_.load(std::memory_order_relaxed));
 	}
 
 	return info;
@@ -291,8 +292,27 @@ MSSQLObjectType MSSQLTableEntry::GetObjectType() const {
 	return object_type_;
 }
 
+void MSSQLTableEntry::NoteRowsDeleted(idx_t rows) {
+	if (rows == 0) {
+		return;
+	}
+	auto &statistics = GetMSSQLCatalog().GetStatisticsProvider();
+	auto current = approx_row_count_.load(std::memory_order_relaxed);
+	if (current == 0) {
+		// 0 is "unknown" (a view, Fabric, no VIEW DATABASE STATE): the planner
+		// then asks the statistics cache, whose count is stale now too.
+		statistics.InvalidateTable(schema.name.GetIdentifierName(), name.GetIdentifierName());
+		return;
+	}
+	idx_t next;
+	do {
+		next = current > rows + 1 ? current - rows : 1;
+	} while (!approx_row_count_.compare_exchange_weak(current, next, std::memory_order_relaxed));
+	statistics.InvalidateTable(schema.name.GetIdentifierName(), name.GetIdentifierName());
+}
+
 idx_t MSSQLTableEntry::GetApproxRowCount() const {
-	return approx_row_count_;
+	return approx_row_count_.load(std::memory_order_relaxed);
 }
 
 MSSQLCatalog &MSSQLTableEntry::GetMSSQLCatalog() {

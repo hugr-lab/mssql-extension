@@ -3,6 +3,7 @@
 #include <memory>
 #include <mutex>
 #include "dml/mssql_dml_config.hpp"
+#include "dml/mssql_staged_dml.hpp"
 #include "dml/update/mssql_update_target.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/physical_operator.hpp"
@@ -35,6 +36,11 @@ public:
 	// @param config DML configuration
 	MSSQLPhysicalUpdate(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
 						MSSQLUpdateTarget target, MSSQLDMLConfig config);
+
+	//! Spec 080 D3: stage past mssql_dml_stage_threshold rows.
+	void SetStagedTarget(MSSQLStagedDmlTarget target) {
+		staged_target_ = make_uniq<MSSQLStagedDmlTarget>(std::move(target));
+	}
 
 	//===----------------------------------------------------------------------===//
 	// Target Information
@@ -98,6 +104,9 @@ public:
 
 private:
 	MSSQLUpdateTarget target_;
+	//! Spec 080 D3, rungs 1-2: the #stage form of this statement, taken past
+	//! mssql_dml_stage_threshold rows; null where the platform has no stage.
+	unique_ptr<MSSQLStagedDmlTarget> staged_target_;
 	MSSQLDMLConfig config_;
 };
 
@@ -109,6 +118,10 @@ class MSSQLUpdateGlobalSinkState : public GlobalSinkState {
 public:
 	explicit MSSQLUpdateGlobalSinkState(ClientContext &context, const MSSQLUpdateTarget &target,
 										const MSSQLDMLConfig &config);
+
+	//! Spec 080 D3: holds the rows until the threshold decides; null when the
+	//! statement cannot stage (a MERGE action, a platform with no stage).
+	unique_ptr<MSSQLStageSwitch> stage_switch;
 
 	// The update executor
 	unique_ptr<MSSQLUpdateExecutor> executor;

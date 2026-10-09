@@ -31,6 +31,12 @@ SELECT mssql_invalidate_cache('sa');
 statement ok
 SET mssql_dml_batch_size = 500;
 
+# The VALUES-join statement path, whatever the row count (spec 080 D3 sends
+# more than mssql_dml_stage_threshold rows through #stage; that path is
+# checked at the end of this file).
+statement ok
+SET mssql_dml_stage_threshold = 1000000;
+
 # --- INSERT ... RETURNING: statements whatever the size. Row 950 violates the
 # CHECK, in statement 3 of 4 (333 rows each); statements 1 and 2 are rolled
 # back with it.
@@ -117,6 +123,55 @@ query I
 SELECT count(*) FROM sa.dbo.StmtAtomic WHERE n = 777777;
 ----
 1100
+
+# --- the #stage path (spec 080 D3): one UPDATE / DELETE ... JOIN #stage, run
+# whole or not at all.
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+statement error
+UPDATE sa.dbo.StmtAtomic SET n = CASE WHEN id = 1150 THEN 1000000 ELSE 555555 END;
+----
+nothing was written: the statement's server transaction was rolled back
+
+query I
+SELECT count(*) FROM sa.dbo.StmtAtomic WHERE n = 555555;
+----
+0
+
+statement error
+DELETE FROM sa.dbo.StmtAtomic;
+----
+nothing was written
+
+query I
+SELECT count(*) FROM sa.dbo.StmtAtomic;
+----
+1200
+
+query I
+SELECT active_connections FROM mssql_pool_stats('sa');
+----
+0
+
+statement ok
+BEGIN;
+
+statement error
+UPDATE sa.dbo.StmtAtomic SET n = CASE WHEN id = 1150 THEN 1000000 ELSE 666666 END;
+----
+the open transaction must be rolled back
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM sa.dbo.StmtAtomic WHERE n = 666666;
+----
+0
+
+statement ok
+RESET mssql_dml_stage_threshold;
 
 statement ok
 SELECT mssql_exec('sa', 'DROP TABLE dbo.StmtAtomicChild; DROP TABLE dbo.StmtAtomic');

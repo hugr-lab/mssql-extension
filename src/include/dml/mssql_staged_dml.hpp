@@ -33,23 +33,38 @@
 #include "copy/target_resolver.hpp"
 #include "dml/mssql_dml_config.hpp"
 #include "dml/mssql_statement_connection.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+
+#include <functional>
 
 namespace duckdb {
 
 class ClientContext;
 class MSSQLCatalog;
+class MSSQLTableEntry;
 
 enum class MSSQLStagedDmlKind : uint8_t { UPDATE, DELETE };
+
+//! Where a chunk carries the key the stage matches by.
+enum class MSSQLStagedKeySource : uint8_t {
+	//! Rung 3: the last key_columns.size() columns (the hidden key columns,
+	//! catalog/mssql_keyless_key.hpp).
+	TRAILING_COLUMNS,
+	//! Rungs 1-2: the rowid, the chunk's last column -- the key value itself
+	//! for a one-column key, a STRUCT of the key columns for a composite one.
+	ROWID
+};
 
 struct MSSQLStagedDmlTarget {
 	MSSQLStagedDmlKind kind = MSSQLStagedDmlKind::UPDATE;
 	string catalog_name;
 	string schema_name;
 	string table_name;
-	//! The columns the stage matches by: rung 3, every column in table order.
-	//! They arrive as the LAST key_columns.size() columns of each chunk.
+	//! The columns the stage matches by: rung 3, every column in table order;
+	//! rungs 1-2, the rowid key's columns in key order.
 	vector<MSSQLColumnInfo> key_columns;
+	MSSQLStagedKeySource key_source = MSSQLStagedKeySource::TRAILING_COLUMNS;
 	//! UPDATE: the SET columns and where each value sits in the chunk.
 	vector<MSSQLColumnInfo> set_columns;
 	vector<idx_t> set_chunk_index;
@@ -60,6 +75,9 @@ struct MSSQLStagedDmlTarget {
 	idx_t flush_rows = 0;
 	//! mssql_query_timeout, in seconds (0 = none), for the JOIN statement.
 	int query_timeout_seconds = 0;
+	//! The target's entry, for the planner's row estimate after a DELETE
+	//! (spec 080 W3). Alive for the query: the bind anchors hold it.
+	optional_ptr<MSSQLTableEntry> table_entry;
 };
 
 class MSSQLStagedDml {
@@ -80,7 +98,9 @@ public:
 	static string JoinStatementSql(const MSSQLStagedDmlTarget &target, const string &stage_name);
 
 private:
-	void Start(ClientContext &context, DataChunk &first_chunk);
+	void Start(ClientContext &context);
+	//! The staged columns of `chunk`, in stage order, as references.
+	void BuildFillChunk(DataChunk &chunk);
 	void FailAndThrow(ClientContext &context, const string &message);
 
 	MSSQLStagedDmlTarget target_;
@@ -92,12 +112,40 @@ private:
 	// The stage fill: INSERT BULK into the stage, on the statement's connection.
 	mssql::BCPCopyTarget bcp_target_;
 	vector<mssql::BCPColumnMetadata> bcp_columns_;
-	vector<int32_t> column_mapping_;
+	DataChunk fill_;
 	string insert_bulk_sql_;
 	mssql::BulkLoadSessionParams session_params_;
 	mssql::BulkLoadSession session_;
 	idx_t rows_staged_ = 0;
 	bool finalized_ = false;
+};
+
+//! Spec 080 D3, rungs 1-2: a keyed UPDATE / DELETE holds its rows until it
+//! knows its path. Up to `threshold` rows (counted as they arrive) it goes as
+//! today's VALUES-join statements; past it, every row -- the held ones first --
+//! goes through #stage and one JOIN statement. Shared by MSSQL_UPDATE and
+//! MSSQL_DELETE. Callers hold their operator's mutex.
+class MSSQLStageSwitch {
+public:
+	MSSQLStageSwitch(const MSSQLStagedDmlTarget &target, idx_t threshold) : target_(target), threshold_(threshold) {}
+
+	void Sink(ClientContext &context, DataChunk &chunk);
+
+	bool IsStaged() const {
+		return staged_ != nullptr;
+	}
+
+	//! The staged path's ending: the JOIN, the DROP, the commit; its count.
+	idx_t FinalizeStaged(ClientContext &context);
+
+	//! The statement path's: every held chunk, in arrival order.
+	void Replay(const std::function<void(DataChunk &)> &send);
+
+private:
+	const MSSQLStagedDmlTarget &target_;
+	idx_t threshold_;
+	unique_ptr<ColumnDataCollection> held_;
+	unique_ptr<MSSQLStagedDml> staged_;
 };
 
 }  // namespace duckdb

@@ -74,16 +74,25 @@ int main() {
 	// --- an unusable primary key falls through to a usable unique index,
 	// and is listed as rejected with its reason (the step-1 change)
 	{
-		auto pk = Idx(1, "PK_dt", {Col("k", "datetime", 8)}, true);
+		auto pk = Idx(1, "PK_dt", {Col("k", "time", 5, false, false, false, 7)}, true);
 		auto ux = Idx(2, "UX_id", {Col("id", "bigint", 8)});
 		auto r = ChooseRowIdKey({pk, ux});
-		CHECK(r.source == RowIdKeySource::UNIQUE_INDEX, "datetime PK falls through");
+		CHECK(r.source == RowIdKeySource::UNIQUE_INDEX, "time(7) PK falls through");
 		CHECK(r.index_name == "UX_id", "the unique index is chosen");
 		CHECK(r.rejections.size() == 1, "the PK is reported");
 		CHECK(r.rejections[0].is_primary_key, "…as the primary key");
 		CHECK(Contains(r.rejections[0].reason, "#358"), "…pointing at #358");
 		CHECK(Contains(DescribeRejections(r.rejections), "primary key 'PK_dt' was rejected because"),
 			  "describe names it");
+	}
+	// --- a datetime key is usable since spec 080 W3 (#358): the VALUES side is
+	// converted to datetime, the stage column is datetime
+	{
+		auto pk = Idx(1, "PK_dt", {Col("k", "datetime", 8)}, true);
+		auto ux = Idx(2, "UX_id", {Col("id", "bigint", 8)});
+		auto r = ChooseRowIdKey({pk, ux});
+		CHECK(r.source == RowIdKeySource::PRIMARY_KEY && r.index_name == "PK_dt", "a datetime PK is chosen");
+		CHECK(r.rejections.empty(), "…and rejected by nothing");
 	}
 	{
 		auto pk = Idx(1, "PK_v", {Col("v", "sql_variant", 8016, false, false, true)}, true);
@@ -200,7 +209,7 @@ int main() {
 
 	// --- the rejection list is complete even when something was chosen
 	{
-		auto pk = Idx(1, "PK_dt", {Col("k", "datetime", 8)}, true);
+		auto pk = Idx(1, "PK_dt", {Col("k", "datetimeoffset", 10, false, false, false, 7)}, true);
 		auto bad = Idx(2, "UX_nullable", {Col("n", "int", 4, true)});
 		auto good = Idx(3, "UX_id", {Col("id", "int", 4)});
 		auto r = ChooseRowIdKey({pk, bad, good});
@@ -216,7 +225,8 @@ int main() {
 			  "datetime2(7) reads as TIMESTAMP_NS");
 		CHECK(IsRoundTripExactForKey("smalldatetime", 0, false) == KeyFidelity::Exact, "smalldatetime has no fraction");
 		CHECK(IsRoundTripExactForKey("time", 6, false) == KeyFidelity::Exact, "time(6) fits microseconds");
-		CHECK(IsRoundTripExactForKey("datetime", 3, false) == KeyFidelity::NotRoundTrip, "datetime: 1/300 s ticks");
+		CHECK(IsRoundTripExactForKey("datetime", 3, false) == KeyFidelity::Exact,
+			  "datetime: matched in its own type (#358, spec 080 W3)");
 		CHECK(IsRoundTripExactForKey("time", 7, false) == KeyFidelity::NotRoundTrip, "time(7): 100 ns digit lost");
 		CHECK(IsRoundTripExactForKey("DATETIMEOFFSET", 7, false) == KeyFidelity::NotRoundTrip,
 			  "datetimeoffset(7), any case");

@@ -112,6 +112,12 @@ public:
 	// Get approximate row count
 	idx_t GetApproxRowCount() const;
 
+	//! Spec 080 W3: an autocommit DELETE through the catalog removed `rows`
+	//! rows; the planner's estimate follows (never down to 0, which reads as
+	//! "unknown"), and the statistics cache's count for the table is dropped.
+	//! Not called inside a transaction: the shared entry holds committed state.
+	void NoteRowsDeleted(idx_t rows);
+
 	//! Physical shape of the object (heap / clustered rowstore / clustered
 	//! columnstore), from the catalog's metadata query (spec 049). What the
 	//! bulk-load TABLOCK policy and the columnstore warm-up gate read for an
@@ -157,8 +163,10 @@ private:
 
 	vector<MSSQLColumnInfo> mssql_columns_;	 // Column metadata with collation
 	MSSQLObjectType object_type_;			 // TABLE or VIEW
-	idx_t approx_row_count_;				 // Cardinality estimate
-	MSSQLIndexKind index_kind_;				 // Physical shape (spec 049)
+	//! Cardinality estimate; atomic since a DELETE adjusts it (spec 080 W3)
+	//! while other sessions plan against it.
+	std::atomic<idx_t> approx_row_count_;
+	MSSQLIndexKind index_kind_;	 // Physical shape (spec 049)
 
 	// The rowid key, set by the constructor from the metadata it is built from
 	// and never written again (spec 084 D5: every load that publishes a

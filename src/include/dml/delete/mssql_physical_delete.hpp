@@ -10,6 +10,7 @@
 
 #include "dml/delete/mssql_delete_target.hpp"
 #include "dml/mssql_dml_config.hpp"
+#include "dml/mssql_staged_dml.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 
@@ -31,6 +32,16 @@ public:
 	//! @param config DML configuration
 	MSSQLPhysicalDelete(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
 						MSSQLDeleteTarget target, MSSQLDMLConfig config);
+
+	//! Spec 080 W3: the entry whose row estimate an autocommit DELETE adjusts.
+	void SetTableEntry(MSSQLTableEntry &entry) {
+		table_entry_ = &entry;
+	}
+
+	//! Spec 080 D3: stage past mssql_dml_stage_threshold rows.
+	void SetStagedTarget(MSSQLStagedDmlTarget target) {
+		staged_target_ = make_uniq<MSSQLStagedDmlTarget>(std::move(target));
+	}
 
 	//! Get the name of this operator
 	string GetName() const override {
@@ -75,6 +86,10 @@ public:
 private:
 	//! Target table metadata
 	MSSQLDeleteTarget target_;
+	//! Spec 080 D3, rungs 1-2: the #stage form of this statement, taken past
+	//! mssql_dml_stage_threshold rows; null where the platform has no stage.
+	unique_ptr<MSSQLStagedDmlTarget> staged_target_;
+	MSSQLTableEntry *table_entry_ = nullptr;
 
 	//! DML configuration
 	MSSQLDMLConfig config_;
@@ -85,6 +100,10 @@ class MSSQLDeleteGlobalSinkState : public GlobalSinkState {
 public:
 	explicit MSSQLDeleteGlobalSinkState(ClientContext &context, const MSSQLDeleteTarget &target,
 										const MSSQLDMLConfig &config);
+
+	//! Spec 080 D3: holds the rows until the threshold decides; null when the
+	//! statement cannot stage (a MERGE action, a platform with no stage).
+	unique_ptr<MSSQLStageSwitch> stage_switch;
 
 	//! The executor that handles batch accumulation and execution
 	unique_ptr<MSSQLDeleteExecutor> executor;

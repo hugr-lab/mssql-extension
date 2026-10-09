@@ -431,6 +431,63 @@ static string KeylessPlanRefusal(ClientContext &context, PhysicalOperator &plan,
 	return "";
 }
 
+//! Whether INSERT BULK can carry every column into the stage. A geometry /
+//! geography, alias or CLR type goes out under the VARCHAR fallback and fails
+//! mid-stream (BCPColumnMetadata::bulk_unsupported); such a statement keeps
+//! the VALUES path, which renders those values as literals (#352).
+static bool StageCanCarry(const vector<MSSQLColumnInfo> &columns) {
+	for (const auto &col : columns) {
+		const auto t = StringUtil::Lower(col.sql_type_name);
+		if (t == "timestamp" || t == "rowversion") {
+			continue;  // staged as binary(8)
+		}
+		auto meta = mssql::BCPColumnMetadata::FromServerColumn(
+			col.name, col.sql_type_name, col.max_length, col.precision, col.scale, col.is_nullable, col.collation_name);
+		if (meta.bulk_unsupported) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! Spec 080 D3, rungs 1-2: the #stage form a keyed UPDATE / DELETE switches to
+//! past mssql_dml_stage_threshold rows, or false where the platform has no
+//! stage (Fabric and Synapse keep the VALUES-join statements).
+static bool KeyedStagedTarget(ClientContext &context, MSSQLCatalog &catalog, MSSQLTableEntry &table_entry,
+							  const mssql::RowIdKeyInfo &pk_info, MSSQLStagedDmlTarget &target) {
+	const auto caps = catalog.GetDmlCapabilities();
+	if (!caps.update_from_join || !caps.stage_bulk) {
+		return false;
+	}
+	const auto &columns = table_entry.GetMSSQLColumns();
+	for (const auto &key : pk_info.columns) {
+		bool found = false;
+		for (const auto &col : columns) {
+			if (col.name == key.name) {
+				target.key_columns.push_back(col);
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			throw InternalException("MSSQL: rowid key column '%s' is not a column of '%s'", key.name,
+									table_entry.name.GetIdentifierName());
+		}
+	}
+	target.key_source = MSSQLStagedKeySource::ROWID;
+	if (!StageCanCarry(target.key_columns)) {
+		return false;
+	}
+	target.catalog_name = catalog.GetName().GetIdentifierName();
+	target.schema_name = table_entry.ParentSchema().name.GetIdentifierName();
+	target.table_name = table_entry.name.GetIdentifierName();
+	target.null_safe_operator = caps.null_safe_operator && !LoadTestForceIntersectJoinForm(context);
+	target.flush_rows = mssql::LoadBCPCopyConfig(context).flush_rows;
+	target.query_timeout_seconds = LoadQueryTimeout(context);
+	target.table_entry = &table_entry;
+	return true;
+}
+
 //! Rung 3: refuse by name, or the staged operator.
 static PhysicalOperator &PlanKeylessDml(ClientContext &context, PhysicalPlanGenerator &planner, MSSQLCatalog &catalog,
 										MSSQLTableEntry &table_entry, MSSQLStagedDmlTarget target,
@@ -463,6 +520,7 @@ static PhysicalOperator &PlanKeylessDml(ClientContext &context, PhysicalPlanGene
 		catalog.GetDmlCapabilities().null_safe_operator && !LoadTestForceIntersectJoinForm(context);
 	target.flush_rows = mssql::LoadBCPCopyConfig(context).flush_rows;
 	target.query_timeout_seconds = LoadQueryTimeout(context);
+	target.table_entry = &table_entry;
 	vector<LogicalType> result_types{LogicalType::BIGINT};
 	auto &op = planner.Make<MSSQLPhysicalStagedDml>(std::move(result_types), estimated_cardinality, std::move(target));
 	op.children.push_back(plan);
@@ -542,8 +600,15 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	result_types.push_back(LogicalType::BIGINT);
 
 	// Create the physical operator using planner.Make<T>()
+	MSSQLStagedDmlTarget staged;
+	staged.kind = MSSQLStagedDmlKind::DELETE;
+	const bool can_stage = KeyedStagedTarget(context, *this, table_entry, pk_info, staged);
 	auto &physical_delete =
 		planner.Make<MSSQLPhysicalDelete>(std::move(result_types), op.estimated_cardinality, std::move(target), config);
+	physical_delete.Cast<MSSQLPhysicalDelete>().SetTableEntry(table_entry);
+	if (can_stage) {
+		physical_delete.Cast<MSSQLPhysicalDelete>().SetStagedTarget(std::move(staged));
+	}
 
 	// Add child operator (provides rowid values)
 	physical_delete.children.push_back(plan);
@@ -658,8 +723,22 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 	result_types.push_back(LogicalType::BIGINT);
 
 	// Create the physical operator using planner.Make<T>()
+	MSSQLStagedDmlTarget staged;
+	staged.kind = MSSQLStagedDmlKind::UPDATE;
+	const bool can_stage = KeyedStagedTarget(context, *this, table_entry, pk_info, staged);
+	bool stage_update = can_stage;
+	if (stage_update) {
+		for (idx_t i = 0; i < op.columns.size(); i++) {
+			staged.set_columns.push_back(mssql_columns[op.columns[i].index]);
+			staged.set_chunk_index.push_back(i);
+		}
+		stage_update = StageCanCarry(staged.set_columns);
+	}
 	auto &physical_update =
 		planner.Make<MSSQLPhysicalUpdate>(std::move(result_types), op.estimated_cardinality, std::move(target), config);
+	if (stage_update) {
+		physical_update.Cast<MSSQLPhysicalUpdate>().SetStagedTarget(std::move(staged));
+	}
 
 	// Add child operator (provides rowid + new values)
 	physical_update.children.push_back(plan);

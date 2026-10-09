@@ -3,10 +3,12 @@
 #include <algorithm>
 
 #include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_table_entry.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "query/mssql_identifier.hpp"
 #include "query/mssql_simple_query.hpp"
@@ -131,13 +133,19 @@ MSSQLStagedDml::MSSQLStagedDml(ClientContext &context, MSSQLStagedDmlTarget targ
 MSSQLStagedDml::~MSSQLStagedDml() = default;
 
 void MSSQLStagedDml::FailAndThrow(ClientContext &context, const string &message) {
+	// One statement over the whole stage: the server ran it whole or not at
+	// all. In autocommit its own transaction is rolled back here; inside a
+	// DuckDB transaction the stage and the statement sit in the open one.
+	const bool pinned = stmt_conn_.IsPinned();
 	session_.Abandon();
 	stmt_conn_.Fail(context, catalog_);
 	connection_.reset();
-	throw IOException("%s", message);
+	throw IOException("%s %s", message,
+					  pinned ? "(the open transaction must be rolled back)"
+							 : "(nothing was written: the statement's server transaction was rolled back)");
 }
 
-void MSSQLStagedDml::Start(ClientContext &context, DataChunk &first_chunk) {
+void MSSQLStagedDml::Start(ClientContext &context) {
 	const char *verb = target_.kind == MSSQLStagedDmlKind::UPDATE ? "UPDATE" : "DELETE";
 	connection_ = stmt_conn_.Acquire(context, catalog_);
 	{
@@ -151,16 +159,9 @@ void MSSQLStagedDml::Start(ClientContext &context, DataChunk &first_chunk) {
 		}
 	}
 
-	// The fill: every staged column from its chunk position. The key is the
-	// last key_columns.size() columns (the hidden key columns the binder
-	// appended, mssql_keyless_key.hpp); a SET value sits where the binder put it.
-	const idx_t key_count = target_.key_columns.size();
-	if (first_chunk.ColumnCount() < key_count) {
-		throw InternalException("MSSQL %s: chunk has %llu columns, the key %llu", verb,
-								(unsigned long long)first_chunk.ColumnCount(), (unsigned long long)key_count);
-	}
-	const idx_t key_start = first_chunk.ColumnCount() - key_count;
-	auto add_column = [&](const MSSQLColumnInfo &col, const string &name, idx_t chunk_index) {
+	// The stage's columns, in the order BuildFillChunk lays them out: the key,
+	// then the new values.
+	auto add_column = [&](const MSSQLColumnInfo &col, const string &name) {
 		if (IsRowVersion(col)) {
 			bcp_columns_.push_back(mssql::BCPColumnMetadata::FromServerColumn(name, "binary", 8, 0, 0, true, string()));
 		} else {
@@ -168,13 +169,12 @@ void MSSQLStagedDml::Start(ClientContext &context, DataChunk &first_chunk) {
 																			  col.precision, col.scale, col.is_nullable,
 																			  col.collation_name));
 		}
-		column_mapping_.push_back(static_cast<int32_t>(chunk_index));
 	};
-	for (idx_t i = 0; i < key_count; i++) {
-		add_column(target_.key_columns[i], KeyName(i), key_start + i);
+	for (idx_t i = 0; i < target_.key_columns.size(); i++) {
+		add_column(target_.key_columns[i], KeyName(i));
 	}
 	for (idx_t i = 0; i < target_.set_columns.size(); i++) {
-		add_column(target_.set_columns[i], NewValueName(i), target_.set_chunk_index[i]);
+		add_column(target_.set_columns[i], NewValueName(i));
 	}
 	bcp_target_ = mssql::BCPCopyTarget(target_.catalog_name, string(), stage_name_);
 	// KEEP_NULLS: a NULL is a value of the key, not a request for a default.
@@ -186,7 +186,7 @@ void MSSQLStagedDml::Start(ClientContext &context, DataChunk &first_chunk) {
 	session_params_.insert_bulk_sql = &insert_bulk_sql_;
 	session_params_.target = &bcp_target_;
 	session_params_.columns = &bcp_columns_;
-	session_params_.column_mapping = &column_mapping_;
+	session_params_.column_mapping = nullptr;  // positional: the fill chunk is in stage order
 	session_params_.flush_rows = target_.flush_rows;
 	session_params_.reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
 	// The statement's server transaction already brackets the fill.
@@ -198,6 +198,49 @@ void MSSQLStagedDml::Start(ClientContext &context, DataChunk &first_chunk) {
 	session_.Adopt(connection_, session_params_, true);
 }
 
+void MSSQLStagedDml::BuildFillChunk(DataChunk &chunk) {
+	const idx_t key_count = target_.key_columns.size();
+	vector<reference<Vector>> columns;
+	if (target_.key_source == MSSQLStagedKeySource::TRAILING_COLUMNS) {
+		if (chunk.ColumnCount() < key_count) {
+			throw InternalException("MSSQL staged DML: chunk has %llu columns, the key %llu",
+									(unsigned long long)chunk.ColumnCount(), (unsigned long long)key_count);
+		}
+		for (idx_t i = chunk.ColumnCount() - key_count; i < chunk.ColumnCount(); i++) {
+			columns.push_back(chunk.data[i]);
+		}
+	} else {
+		auto &rowid = chunk.data.back();
+		if (key_count == 1) {
+			columns.push_back(rowid);
+		} else {
+			// A composite key's rowid is a STRUCT of the key columns, in key order.
+			rowid.Flatten();
+			auto &entries = StructVector::GetEntries(rowid);
+			if (entries.size() != key_count) {
+				throw InternalException("MSSQL staged DML: rowid has %llu fields, the key %llu",
+										(unsigned long long)entries.size(), (unsigned long long)key_count);
+			}
+			for (auto &entry : entries) {
+				columns.push_back(entry);
+			}
+		}
+	}
+	for (auto index : target_.set_chunk_index) {
+		columns.push_back(chunk.data[index]);
+	}
+	vector<LogicalType> types;
+	for (auto &column : columns) {
+		types.push_back(column.get().GetType());
+	}
+	fill_.Destroy();
+	fill_.InitializeEmpty(types);
+	for (idx_t i = 0; i < columns.size(); i++) {
+		fill_.data[i].Reference(columns[i].get());
+	}
+	fill_.SetCardinalityUnsafe(chunk.size());
+}
+
 void MSSQLStagedDml::Execute(ClientContext &context, DataChunk &chunk) {
 	if (finalized_) {
 		throw InternalException("MSSQLStagedDml::Execute called after Finalize");
@@ -206,11 +249,12 @@ void MSSQLStagedDml::Execute(ClientContext &context, DataChunk &chunk) {
 		return;
 	}
 	if (!connection_) {
-		Start(context, chunk);
+		Start(context);
 	}
+	BuildFillChunk(chunk);
 	auto pinned_lock = stmt_conn_.LockPinned(context, catalog_);
 	try {
-		session_.Write(chunk);
+		session_.Write(fill_);
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
 		FailAndThrow(context, StringUtil::Format("MSSQL %s on '%s.%s': filling the stage failed after %llu rows: %s",
@@ -257,8 +301,46 @@ idx_t MSSQLStagedDml::Finalize(ClientContext &context) {
 		}
 	}
 	connection_.reset();
+	const bool pinned = stmt_conn_.IsPinned();
 	stmt_conn_.Commit(context, catalog_);
+	if (target_.kind == MSSQLStagedDmlKind::DELETE && !pinned && target_.table_entry) {
+		target_.table_entry->NoteRowsDeleted(rows);
+	}
 	return rows;
+}
+
+void MSSQLStageSwitch::Sink(ClientContext &context, DataChunk &chunk) {
+	if (staged_) {
+		staged_->Execute(context, chunk);
+		return;
+	}
+	if (!held_) {
+		// The context's allocator, so a large hold spills like any collection.
+		held_ = make_uniq<ColumnDataCollection>(context, chunk.GetTypes());
+	}
+	held_->Append(chunk);
+	if (held_->Count() <= threshold_) {
+		return;
+	}
+	staged_ = make_uniq<MSSQLStagedDml>(context, target_);
+	for (auto &held_chunk : held_->Chunks()) {
+		staged_->Execute(context, held_chunk);
+	}
+	held_.reset();
+}
+
+idx_t MSSQLStageSwitch::FinalizeStaged(ClientContext &context) {
+	return staged_->Finalize(context);
+}
+
+void MSSQLStageSwitch::Replay(const std::function<void(DataChunk &)> &send) {
+	if (!held_) {
+		return;
+	}
+	for (auto &held_chunk : held_->Chunks()) {
+		send(held_chunk);
+	}
+	held_.reset();
 }
 
 }  // namespace duckdb
