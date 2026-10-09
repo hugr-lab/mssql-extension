@@ -1,0 +1,311 @@
+# name: test/sql/dml/keyless_dml.test
+# description: UPDATE / DELETE on a table with no usable key, keyed by every column through #stage (spec 080 D3 rung 3)
+# group: [dml]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS kl (TYPE mssql);
+
+# --- duplicates move together; NULLs match NULLs ---------------------------
+
+statement ok
+SELECT mssql_exec('kl', 'DROP TABLE IF EXISTS dbo.kl_dup; CREATE TABLE dbo.kl_dup (a int NULL, b nvarchar(20) NULL, c decimal(10,2) NOT NULL); INSERT INTO dbo.kl_dup VALUES (1, N''x'', 1.50), (2, NULL, 2.00), (NULL, N''y'', 3.00), (2, NULL, 2.00)');
+
+# Two identical rows are one match: both move, and both count.
+query I
+UPDATE kl.dbo.kl_dup SET c = c + 10 WHERE a = 2;
+----
+2
+
+query III
+SELECT a, b, c FROM kl.dbo.kl_dup ORDER BY a NULLS FIRST, c;
+----
+NULL	y	3.00
+1	x	1.50
+2	NULL	12.00
+2	NULL	12.00
+
+# A NULL key column (a) is matched NULL-safely, with the operator ...
+query I
+UPDATE kl.dbo.kl_dup SET c = 4 WHERE b = 'y';
+----
+1
+
+# ... and through EXISTS (... INTERSECT ...), the form every server takes.
+statement ok
+SET mssql_test_force_intersect_join_form = true;
+
+query I
+UPDATE kl.dbo.kl_dup SET c = 5 WHERE b = 'y';
+----
+1
+
+query I
+DELETE FROM kl.dbo.kl_dup WHERE a = 2;
+----
+2
+
+statement ok
+RESET mssql_test_force_intersect_join_form;
+
+query III
+SELECT a, b, c FROM kl.dbo.kl_dup ORDER BY a NULLS FIRST, c;
+----
+NULL	y	5.00
+1	x	1.50
+
+# No row selected: nothing is sent.
+query I
+UPDATE kl.dbo.kl_dup SET c = 0 WHERE a = 99;
+----
+0
+
+# --- a SET of a key column is one statement, not batches -------------------
+# (1, 1) and (2, 2), SET a = a + 1: batched, the first row's new (2, 1) would be
+# matched again by the second row's key. One statement matches the table as it
+# stood before it.
+
+statement ok
+SELECT mssql_exec('kl', 'DROP TABLE IF EXISTS dbo.kl_shift; CREATE TABLE dbo.kl_shift (a int NOT NULL, b int NOT NULL); INSERT INTO dbo.kl_shift VALUES (1, 1), (2, 2)');
+
+query I
+UPDATE kl.dbo.kl_shift SET a = a + 1;
+----
+2
+
+query II
+SELECT a, b FROM kl.dbo.kl_shift ORDER BY b;
+----
+2	1
+3	2
+
+# --- refusals by name, nothing written --------------------------------------
+
+statement error
+UPDATE kl.dbo.kl_shift SET b = (random() * 100)::int WHERE a = 2;
+----
+volatile function
+
+# lower() runs on the client (the server's case mapping is not DuckDB's), so
+# the server would not select the same rows.
+statement ok
+SELECT mssql_exec('kl', 'DROP TABLE IF EXISTS dbo.kl_str; CREATE TABLE dbo.kl_str (s nvarchar(10) COLLATE Latin1_General_CI_AS NOT NULL, v int NOT NULL); INSERT INTO dbo.kl_str VALUES (N''Ab'', 1), (N''ab'', 2)');
+
+statement error
+UPDATE kl.dbo.kl_str SET v = 0 WHERE lower(s) = 'ab';
+----
+selected on the client
+
+statement error
+UPDATE kl.dbo.kl_shift SET b = 0 FROM kl.dbo.kl_str WHERE kl_shift.b = kl_str.v;
+----
+selected on the client
+
+statement error
+DELETE FROM kl.dbo.kl_shift USING kl.dbo.kl_str WHERE kl_shift.b = kl_str.v;
+----
+selected on the client
+
+statement error
+MERGE INTO kl.dbo.kl_shift AS t USING (SELECT 2 AS b) AS s ON t.b = s.b WHEN MATCHED THEN UPDATE SET a = 0;
+----
+MERGE's join
+
+# INSERT only: DuckDB would tell matched from not matched by the first key
+# column, which is a value here, so MERGE keeps its key requirement.
+statement error
+MERGE INTO kl.dbo.kl_shift AS t USING (SELECT 9 AS b) AS s ON t.b = s.b WHEN NOT MATCHED THEN INSERT VALUES (9, 9);
+----
+MERGE INTO a table without one is not supported
+
+query II
+SELECT a, b FROM kl.dbo.kl_shift ORDER BY b;
+----
+2	1
+3	2
+
+# rowid stays unavailable on a keyless table: the key is not a rowid, and the
+# hidden key columns cannot be named (a name resolves to the column first).
+statement error
+SELECT rowid FROM kl.dbo.kl_shift;
+----
+Referenced column "rowid" not found
+
+# --- the server's selection is the statement's: a pushed WHERE on a _CI_
+# collation selects 'Ab' and 'ab' alike, and both are written ---------------
+
+query I
+UPDATE kl.dbo.kl_str SET v = 9 WHERE s = 'ab';
+----
+2
+
+# Each staged row matches only the rows equal to it in every byte: 'Ab' and
+# 'ab' are equal under the collation, and each keeps its own new value.
+query I
+UPDATE kl.dbo.kl_str SET s = s || '!' WHERE v = 9;
+----
+2
+
+query II
+SELECT s, v FROM kl.dbo.kl_str ORDER BY ascii(s);
+----
+Ab!	9
+ab!	9
+
+# The same through nullable columns, with the operator and the INTERSECT form;
+# 'a' and 'a ' are equal to `=` (trailing spaces) and stay apart here.
+statement ok
+SELECT mssql_exec('kl', 'DROP TABLE IF EXISTS dbo.kl_sp; CREATE TABLE dbo.kl_sp (s varchar(10) COLLATE Latin1_General_CI_AS NULL, v int NULL); INSERT INTO dbo.kl_sp VALUES (''a'', 1), (''a '', 2), (''A'', 3), (NULL, 4)');
+
+query I
+UPDATE kl.dbo.kl_sp SET s = s || 'x' WHERE v <= 3;
+----
+3
+
+statement ok
+SET mssql_test_force_intersect_join_form = true;
+
+query I
+UPDATE kl.dbo.kl_sp SET s = s || 'y' WHERE v <= 3;
+----
+3
+
+# A pushed LIKE tells 'ax y' from 'axy': only the selected row goes.
+query I
+DELETE FROM kl.dbo.kl_sp WHERE s LIKE 'a %';
+----
+1
+
+statement ok
+RESET mssql_test_force_intersect_join_form;
+
+query II
+SELECT s, v FROM kl.dbo.kl_sp ORDER BY v;
+----
+axy	1
+Axy	3
+NULL	4
+
+# The optimizer can prove a WHERE selects nothing; that is no refusal.
+query I
+DELETE FROM kl.dbo.kl_sp WHERE 1 = 0;
+----
+0
+
+# --- columns that cannot be a key are refused by name, never 0 rows ---------
+
+statement ok
+SELECT mssql_exec('kl', 'DROP TABLE IF EXISTS dbo.kl_dt; CREATE TABLE dbo.kl_dt (id int, ts datetime); INSERT INTO dbo.kl_dt VALUES (1, ''2024-01-01 10:00:00.003'')');
+
+statement error
+UPDATE kl.dbo.kl_dt SET id = 2 WHERE id = 1;
+----
+column 'ts' has type datetime, whose value does not survive the round trip through DuckDB
+
+statement ok
+SELECT mssql_exec('kl', 'DROP TABLE IF EXISTS dbo.kl_t7; CREATE TABLE dbo.kl_t7 (id int, t time(7)); INSERT INTO dbo.kl_t7 VALUES (1, ''10:00:00.1234567'')');
+
+statement error
+DELETE FROM kl.dbo.kl_t7 WHERE id = 1;
+----
+column 't' has type time(7), whose value does not survive the round trip through DuckDB
+
+statement ok
+SELECT mssql_exec('kl', 'DROP TABLE IF EXISTS dbo.kl_geo; CREATE TABLE dbo.kl_geo (id int, g geometry); INSERT INTO dbo.kl_geo VALUES (1, geometry::Point(1, 2, 0))');
+
+statement error
+DELETE FROM kl.dbo.kl_geo WHERE id = 1;
+----
+column 'g' has type geometry, which the catalog does not read in a form that identifies a row
+
+# --- identity, computed and rowversion columns: the stage is plain ----------
+
+statement ok
+SELECT mssql_exec('kl', 'DROP TABLE IF EXISTS dbo.kl_kinds; CREATE TABLE dbo.kl_kinds (id int IDENTITY(1,1) NOT NULL, v int NOT NULL, twice AS (v * 2), rv rowversion NOT NULL, ch char(5) NULL); INSERT INTO dbo.kl_kinds (v, ch) VALUES (1, ''a''), (2, ''bb''), (3, NULL)');
+
+query I
+UPDATE kl.dbo.kl_kinds SET v = v + 10 WHERE v >= 2;
+----
+2
+
+query I
+DELETE FROM kl.dbo.kl_kinds WHERE ch = 'a';
+----
+1
+
+query III
+SELECT id, v, twice FROM kl.dbo.kl_kinds ORDER BY id;
+----
+2	12	24
+3	13	26
+
+# --- in a transaction: on the pinned connection, rolled back with it --------
+
+statement ok
+BEGIN;
+
+query I
+UPDATE kl.dbo.kl_shift SET b = b * 10;
+----
+2
+
+query II
+SELECT a, b FROM kl.dbo.kl_shift ORDER BY b;
+----
+2	10
+3	20
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT a, b FROM kl.dbo.kl_shift ORDER BY b;
+----
+2	1
+3	2
+
+statement ok
+BEGIN;
+
+query I
+DELETE FROM kl.dbo.kl_shift WHERE a = 2;
+----
+1
+
+statement ok
+COMMIT;
+
+query II
+SELECT a, b FROM kl.dbo.kl_shift ORDER BY b;
+----
+3	2
+
+# --- a failure leaves no stage behind and the table as it was --------------
+
+statement ok
+SELECT mssql_exec('kl', 'DROP TABLE IF EXISTS dbo.kl_chk; CREATE TABLE dbo.kl_chk (v int NOT NULL CHECK (v < 100)); INSERT INTO dbo.kl_chk VALUES (1), (2)');
+
+statement error
+UPDATE kl.dbo.kl_chk SET v = v + 100 WHERE v = 2;
+----
+CHECK constraint
+
+query I
+SELECT v FROM kl.dbo.kl_chk ORDER BY v;
+----
+1
+2
+
+# --- cleanup ----------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('kl', 'DROP TABLE dbo.kl_dup; DROP TABLE dbo.kl_shift; DROP TABLE dbo.kl_str; DROP TABLE dbo.kl_sp; DROP TABLE dbo.kl_dt; DROP TABLE dbo.kl_t7; DROP TABLE dbo.kl_geo; DROP TABLE dbo.kl_kinds; DROP TABLE dbo.kl_chk');
+
+statement ok
+DETACH kl;

@@ -217,6 +217,12 @@ struct MSSQLCatalogScanBindData : public FunctionData {
 	// The rowid type (scalar or STRUCT)
 	LogicalType rowid_type;
 
+	//! Spec 080 D3, rung 3: the table has no usable key, so an UPDATE / DELETE
+	//! keys it by every column, read through hidden virtual columns
+	//! (catalog/mssql_keyless_key.hpp). Derived from the table entry, so a
+	//! deserialised copy rebuilds it through GetScanFunction.
+	bool keyless_key = false;
+
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;
 };

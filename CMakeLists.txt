@@ -235,6 +235,9 @@ set(EXTENSION_SOURCES
     src/dml/delete/mssql_delete_statement.cpp
     src/dml/delete/mssql_delete_executor.cpp
     src/dml/delete/mssql_physical_delete.cpp
+    # DML staged UPDATE/DELETE through #stage (spec 080 D3)
+    src/dml/mssql_staged_dml.cpp
+    src/dml/mssql_physical_staged_dml.cpp
     # DML CTAS layer (CREATE TABLE AS SELECT)
     src/dml/ctas/mssql_ctas_executor.cpp
     src/dml/ctas/mssql_ctas_planner.cpp

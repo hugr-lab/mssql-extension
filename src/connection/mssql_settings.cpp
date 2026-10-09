@@ -149,6 +149,19 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "TEST ONLY: make a metadata query fail after this many rows (0 = off)",
 							  LogicalType::BIGINT, Value::BIGINT(0), ValidateNonNegative, SetScope::GLOBAL);
 
+	// mssql_test_force_intersect_join_form - TEST ONLY (spec 080 D3).
+	//
+	// A keyless (rung 3) UPDATE / DELETE matches its nullable columns with
+	// IS NOT DISTINCT FROM where the server has it (2022+, Azure SQL), and
+	// through EXISTS (... INTERSECT ...) everywhere else -- the default, and the
+	// only form correct on every server. The integration lane runs a server that
+	// takes the operator, so without this the INTERSECT form would never run in
+	// CI.
+	config.AddExtensionOption("mssql_test_force_intersect_join_form",
+							  "TEST ONLY: match a keyless UPDATE / DELETE through EXISTS (... INTERSECT ...) even "
+							  "where the server has IS NOT DISTINCT FROM",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
+
 	// mssql_test_fail_parse_after_tokens - TEST ONLY (issues #323, #344).
 	//
 	// Puts the TDS token parser of a DML response (INSERT batch, INSERT ...
@@ -644,6 +657,14 @@ bool LoadScanParameterizeFilters(ClientContext &context) {
 		return val.GetValue<bool>();
 	}
 	return true;
+}
+
+bool LoadTestForceIntersectJoinForm(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_test_force_intersect_join_form", val)) {
+		return val.GetValue<bool>();
+	}
+	return false;
 }
 
 int64_t LoadTestFailParseAfterTokens(ClientContext &context) {

@@ -1,5 +1,6 @@
 #include "catalog/mssql_catalog.hpp"
 
+#include "catalog/mssql_keyless_key.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "catalog/mssql_transaction.hpp"
 #include "connection/mssql_settings.hpp"
@@ -12,14 +13,19 @@
 #include "dml/insert/mssql_insert_target.hpp"
 #include "dml/insert/mssql_physical_insert.hpp"
 #include "dml/mssql_dml_config.hpp"
+#include "dml/mssql_physical_staged_dml.hpp"
 #include "dml/update/mssql_physical_update.hpp"
 #include "dml/update/mssql_update_target.hpp"
+#include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
+#include "mssql_functions.hpp"
+#include "table_scan/filter_encoder.hpp"
 
 namespace duckdb {
 
@@ -298,6 +304,21 @@ PhysicalOperator &MSSQLCatalog::PlanCreateTableAs(ClientContext &context, Physic
 
 PhysicalOperator &MSSQLCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
 											  LogicalMergeInto &op, PhysicalOperator &plan) {
+	// Spec 080 D3: a table with no usable key is keyed by every column for an
+	// UPDATE / DELETE, but DuckDB's MERGE tells matched from not matched by the
+	// first row-id column -- here the value of the table's first column, NULL in
+	// a matched row whenever that column is -- so a WHEN NOT MATCHED INSERT or
+	// an ERROR action would misfire. MERGE keeps its key requirement.
+	auto &merge_target = op.table.Cast<MSSQLTableEntry>();
+	if (merge_target.UsesKeylessKey()) {
+		const auto schema_name = merge_target.schema.name.GetIdentifierName();
+		const auto table_name = merge_target.name.GetIdentifierName();
+		throw NotImplementedException(
+			"%s MERGE INTO a table without one is not supported: its rows are selected by MERGE's join on the client.",
+			merge_target.GetPrimaryKeyInfo(context).RowIdRefusal(schema_name, table_name, "MERGE",
+																 GetName().GetIdentifierName()));
+	}
+
 	// Which columns each INSERT action did not name, in DuckDB's planning order
 	// (the actions map, then each vector -- Catalog::PlanMergeInto's loop). An
 	// unnamed column's expression is a copy of its bound default; a named one's
@@ -356,6 +377,98 @@ PhysicalOperator &MSSQLCatalog::PlanMergeInto(ClientContext &context, PhysicalPl
 	return Catalog::PlanMergeInto(context, planner, op, plan);
 }
 
+// Spec 080 D3, rung 3: a keyless table's selected rows are matched on the
+// server by value, every column, so DuckDB's selection and the server's must
+// be the same set. That holds when the plan under the DML is projections over
+// this table's own catalog scan, every filter of that scan runs on the server,
+// and nothing volatile is computed: the scan's rows are then exactly the rows
+// the server's WHERE selects, and a row equal in every column to a selected
+// one is selected too. Returns why not, or empty.
+static string KeylessPlanRefusal(ClientContext &context, PhysicalOperator &plan, MSSQLTableEntry &table) {
+	reference<PhysicalOperator> op = plan;
+	while (op.get().type == PhysicalOperatorType::PROJECTION) {
+		auto &projection = op.get().Cast<PhysicalProjection>();
+		for (auto &expr : projection.select_list) {
+			if (expr->IsVolatile()) {
+				return "the statement computes a volatile function (random(), gen_random_uuid(), ...), so equal rows "
+					   "would not get equal values";
+			}
+		}
+		op = op.get().children[0];
+	}
+	if (op.get().type == PhysicalOperatorType::EMPTY_RESULT) {
+		// The optimizer proved the WHERE selects nothing (`WHERE 1 = 0`).
+		return "";
+	}
+	if (op.get().type != PhysicalOperatorType::TABLE_SCAN) {
+		return "its rows are selected on the client (a join, USING / FROM, a subquery, or a condition the scan does "
+			   "not send to the server)";
+	}
+	auto &scan = op.get().Cast<PhysicalTableScan>();
+	if (scan.function.GetName().GetIdentifierName() != "mssql_catalog_scan" || !scan.bind_data) {
+		return "its rows are not read by the table's own scan";
+	}
+	auto &bind_data = scan.bind_data->Cast<MSSQLCatalogScanBindData>();
+	if (bind_data.table_entry.get() != &table) {
+		return "its rows are read from another table";
+	}
+	if (scan.table_filters && scan.table_filters->HasFilters()) {
+		vector<column_t> column_ids;
+		for (auto &column : scan.column_ids) {
+			column_ids.push_back(mssql::ResolveKeylessKeyColumn(column.GetPrimaryIndex()));
+		}
+		// The scan's own encode, dry: a filter it would refuse runs in its
+		// client-side net (table_scan.cpp), not on the server.
+		mssql::SqlParamSet params;
+		auto encoded = mssql::FilterEncoder::Encode(scan.table_filters.get(), column_ids, bind_data.all_column_names,
+													bind_data.all_types, &bind_data.mssql_columns,
+													LoadScanParameterizeFilters(context) ? &params : nullptr,
+													LoadErrorOnDivisionByZero(context));
+		if (encoded.needs_duckdb_filter || !encoded.unhandled.empty()) {
+			return "part of its WHERE runs on the client, where it can compare differently from the server";
+		}
+	}
+	return "";
+}
+
+//! Rung 3: refuse by name, or the staged operator.
+static PhysicalOperator &PlanKeylessDml(ClientContext &context, PhysicalPlanGenerator &planner, MSSQLCatalog &catalog,
+										MSSQLTableEntry &table_entry, MSSQLStagedDmlTarget target,
+										PhysicalOperator &plan, idx_t estimated_cardinality) {
+	const char *verb = target.kind == MSSQLStagedDmlKind::UPDATE ? "UPDATE" : "DELETE";
+	const auto schema_name = table_entry.schema.name.GetIdentifierName();
+	const auto table_name = table_entry.name.GetIdentifierName();
+	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
+	auto refuse = [&](const string &why) -> PhysicalOperator & {
+		throw NotImplementedException(
+			"%s It is keyed by all its columns instead, which needs the server to select the same rows as DuckDB, "
+			"and here %s. Add a primary key or a unique index to %s.%s.",
+			pk_info.RowIdRefusal(schema_name, table_name, verb, catalog.GetName().GetIdentifierName()), why,
+			schema_name, table_name);
+	};
+	if (!table_entry.UsesKeylessKey()) {
+		throw NotImplementedException(
+			"%s %s", pk_info.RowIdRefusal(schema_name, table_name, verb, catalog.GetName().GetIdentifierName()),
+			table_entry.KeylessKeyRefusal());
+	}
+	const auto why = KeylessPlanRefusal(context, plan, table_entry);
+	if (!why.empty()) {
+		return refuse(why);
+	}
+	target.catalog_name = catalog.GetName().GetIdentifierName();
+	target.schema_name = table_entry.ParentSchema().name.GetIdentifierName();
+	target.table_name = table_name;
+	target.key_columns = table_entry.GetMSSQLColumns();
+	target.null_safe_operator =
+		catalog.GetDmlCapabilities().null_safe_operator && !LoadTestForceIntersectJoinForm(context);
+	target.flush_rows = mssql::LoadBCPCopyConfig(context).flush_rows;
+	target.query_timeout_seconds = LoadQueryTimeout(context);
+	vector<LogicalType> result_types{LogicalType::BIGINT};
+	auto &op = planner.Make<MSSQLPhysicalStagedDml>(std::move(result_types), estimated_cardinality, std::move(target));
+	op.children.push_back(plan);
+	return op;
+}
+
 // Spec 080 (review of #422): Synapse dedicated accepts PRIMARY KEY / UNIQUE
 // only as NOT ENFORCED, so a key there can match several rows and an UPDATE /
 // DELETE through it can hit rows the statement did not select. The host test
@@ -394,12 +507,13 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 			table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName());
 	}
 
-	// Check if table has a primary key (required for DELETE via rowid)
+	// Rung 1-2: the rowid key (primary key or a usable unique index); rung 3,
+	// a table with none: keyed by every column through #stage (spec 080 D3).
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
 	if (!pk_info.exists) {
-		throw NotImplementedException(pk_info.RowIdRefusal(table_entry.schema.name.GetIdentifierName(),
-														   table_entry.name.GetIdentifierName(), "DELETE",
-														   GetName().GetIdentifierName()));
+		MSSQLStagedDmlTarget staged;
+		staged.kind = MSSQLStagedDmlKind::DELETE;
+		return PlanKeylessDml(context, planner, *this, table_entry, std::move(staged), plan, op.estimated_cardinality);
 	}
 
 	// Build MSSQLDeleteTarget from table metadata
@@ -457,16 +571,27 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 			table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName());
 	}
 
-	// Check if table has a primary key (loaded with its metadata, spec 084 D5)
-	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
-	if (!pk_info.exists) {
-		throw NotImplementedException(pk_info.RowIdRefusal(table_entry.schema.name.GetIdentifierName(),
-														   table_entry.name.GetIdentifierName(), "UPDATE",
-														   GetName().GetIdentifierName()));
-	}
-
 	// Get MSSQL column info
 	auto &mssql_columns = table_entry.GetMSSQLColumns();
+
+	// Rung 1-2: the rowid key (loaded with its metadata, spec 084 D5); rung 3,
+	// a table with none: keyed by every column through #stage (spec 080 D3).
+	// The stage carries the old values (the match) and the new ones, so a SET
+	// of any column is allowed there.
+	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
+	if (!pk_info.exists) {
+		MSSQLStagedDmlTarget staged;
+		staged.kind = MSSQLStagedDmlKind::UPDATE;
+		for (idx_t i = 0; i < op.columns.size(); i++) {
+			const auto physical_idx = op.columns[i].index;
+			if (physical_idx >= mssql_columns.size()) {
+				throw InternalException("MSSQL UPDATE: SET column %llu out of range", (unsigned long long)physical_idx);
+			}
+			staged.set_columns.push_back(mssql_columns[physical_idx]);
+			staged.set_chunk_index.push_back(i);
+		}
+		return PlanKeylessDml(context, planner, *this, table_entry, std::move(staged), plan, op.estimated_cardinality);
+	}
 
 	// Check if any PK column is being updated (reject if so)
 	for (auto &pk_col : pk_info.columns) {

@@ -1,13 +1,14 @@
 # name: test/sql/dml/no_pk_update_delete.test
-# description: UPDATE/DELETE on tables without a primary key must fail with a clean, consistent BinderException (regression for issues #140 and #141)
+# description: UPDATE/DELETE on a table without a primary key (issues #140 and #141; spec 080 D3 rung 3)
 # group: [mssql]
 # issue: 140, 141
 #
-# Issue #140: UPDATE on a no-PK table fails with a Binder Error (working as designed).
-# Issue #141: DELETE on a no-PK table fails with an INTERNAL assertion failure
-#             ("BindRowIdColumns could not find the row id column ...") instead of the
-#             same clean Binder Error that UPDATE produces. DELETE must surface the
-#             same user-facing error as UPDATE, never an internal assertion.
+# Issue #140: UPDATE on a no-PK table was refused. Since spec 080 PR 2 such a
+#             table is keyed by every column (rung 3) and the statement runs.
+# Issue #141: DELETE on a no-PK table hit an INTERNAL assertion failure
+#             ("BindRowIdColumns could not find the row id column ...") where
+#             UPDATE gave a clean error. A table that cannot be keyed at all
+#             must still be refused by name on both verbs, never internally.
 #
 # Environment variables required:
 #   MSSQL_TESTDB_DSN - Connection string to test database
@@ -30,32 +31,48 @@ CREATE TABLE mssql.dbo.no_pk_dml_test (id INTEGER);
 statement ok
 INSERT INTO mssql.dbo.no_pk_dml_test VALUES (1), (2), (3);
 
-# Sanity: SELECT and INSERT work regardless of PK
+# Issue #140: UPDATE on a no-PK table runs (keyed by every column)
 query I
-SELECT COUNT(*) FROM mssql.dbo.no_pk_dml_test;
+UPDATE mssql.dbo.no_pk_dml_test SET id = 4 WHERE id = 1;
 ----
-3
+1
 
-# Issue #140: UPDATE on no-PK table must fail with a clean Binder Error
-statement error
-UPDATE mssql.dbo.no_pk_dml_test SET id = 3 WHERE id = 1;
-----
-requires a table with a primary key or a usable unique index
-
-# Issue #141: DELETE on no-PK table must fail with the SAME clean Binder Error,
-# NOT an INTERNAL assertion failure (BindRowIdColumns ...).
-statement error
+query I
 DELETE FROM mssql.dbo.no_pk_dml_test WHERE id = 3;
 ----
-requires a table with a primary key or a usable unique index
+1
 
-# The failed DML must not have mutated any rows
 query I
-SELECT COUNT(*) FROM mssql.dbo.no_pk_dml_test;
+SELECT id FROM mssql.dbo.no_pk_dml_test ORDER BY id;
 ----
-3
+2
+4
+
+# Issue #141: a table that cannot be keyed by its columns (xml does not
+# compare) is refused by name on both verbs -- never an INTERNAL assertion.
+statement ok
+SELECT mssql_exec('mssql', 'DROP TABLE IF EXISTS dbo.no_pk_dml_xml; CREATE TABLE dbo.no_pk_dml_xml (id int, doc xml); INSERT INTO dbo.no_pk_dml_xml VALUES (1, ''<a/>'')');
+
+statement error
+UPDATE mssql.dbo.no_pk_dml_xml SET id = 3 WHERE id = 1;
+----
+column 'doc' has type xml, which the catalog does not read in a form that identifies a row
+
+statement error
+DELETE FROM mssql.dbo.no_pk_dml_xml WHERE id = 1;
+----
+column 'doc' has type xml, which the catalog does not read in a form that identifies a row
+
+# The refused DML did not touch a row
+query I
+SELECT COUNT(*) FROM mssql.dbo.no_pk_dml_xml;
+----
+1
 
 # Cleanup
+statement ok
+SELECT mssql_exec('mssql', 'DROP TABLE dbo.no_pk_dml_xml');
+
 statement ok
 DROP TABLE mssql.dbo.no_pk_dml_test;
 

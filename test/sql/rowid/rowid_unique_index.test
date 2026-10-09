@@ -129,9 +129,13 @@ key column 'p' has type sql_variant, which is read through a lossy CAST and cann
 # The refusals name what was looked for and why each candidate was rejected.
 # =============================================================================
 
+# The tables below carry an xml column: without a usable rowid key a table is
+# keyed by all its columns (spec 080 rung 3), and xml cannot be one of them, so
+# the statement is refused and the refusal shows what was looked for.
+
 # --- neither a primary key nor a unique index
 statement ok
-SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxNone (a INT, v INT)');
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxNone (a INT, v INT, doc xml)');
 
 statement ok
 SELECT mssql_invalidate_cache('ux');
@@ -149,7 +153,7 @@ has neither. Add a PRIMARY KEY, or a UNIQUE index on NOT NULL columns without a 
 # --- a unique index on a NULLABLE column: it accepts exactly one NULL row and
 # refuses the second, but a row keyed by NULL cannot be addressed
 statement ok
-SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxNullable (a INT NULL UNIQUE, v INT)');
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxNullable (a INT NULL UNIQUE, v INT, doc xml)');
 
 statement ok
 SELECT mssql_invalidate_cache('ux');
@@ -161,7 +165,7 @@ key column 'a' is nullable, and a row keyed by NULL cannot be addressed: = NULL 
 
 # --- a FILTERED unique index covers a subset of rows; the rest are unaddressable
 statement ok
-SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxFiltered (a INT NOT NULL, v INT); CREATE UNIQUE INDEX UX_UxFiltered_a ON dbo.UxFiltered(a) WHERE v > 0');
+SELECT mssql_exec('ux', 'CREATE TABLE dbo.UxFiltered (a INT NOT NULL, v INT, doc xml); CREATE UNIQUE INDEX UX_UxFiltered_a ON dbo.UxFiltered(a) WHERE v > 0');
 
 statement ok
 SELECT mssql_invalidate_cache('ux');

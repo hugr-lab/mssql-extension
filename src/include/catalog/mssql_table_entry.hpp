@@ -84,6 +84,21 @@ public:
 	// instead of letting DuckDB's BindRowIdColumns() hit an internal assertion (issue #141).
 	vector<column_t> GetRowIdColumns() const override;
 
+	//! Spec 080 D3, rung 3: why this table cannot be keyed by every column, or
+	//! empty when it can (a base table with no usable key, on a platform that
+	//! takes keyless DML, whose every column round-trips exactly). Answerable
+	//! from the metadata alone; the statement-shape guards (a fully pushed
+	//! WHERE, no volatile function, no FROM / USING / MERGE) are plan time's.
+	string KeylessKeyRefusal() const;
+
+	//! Whether UPDATE / DELETE key this table by every column (rung 3).
+	bool UsesKeylessKey() const;
+
+private:
+	//! KeylessKeyRefusal() with a leading space, or empty.
+	string KeylessSuffix() const;
+
+public:
 	//===----------------------------------------------------------------------===//
 	// MSSQL-specific Accessors
 	//===----------------------------------------------------------------------===//

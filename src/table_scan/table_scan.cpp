@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <mutex>
 #include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_keyless_key.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "connection/mssql_settings.hpp"
@@ -134,7 +135,13 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	// COLUMN_IDENTIFIER_EMPTY for operations like COUNT(*). These are virtual column IDs
 	// that start at 2^63, so any value >= that is a special identifier to skip.
 	string column_list;
-	const auto &column_ids = input.column_ids;
+	// Spec 080 D3, rung 3: a hidden key column reads its physical column, so
+	// from here on it is an ordinary (possibly repeated) projected column.
+	vector<column_t> column_ids;
+	column_ids.reserve(input.column_ids.size());
+	for (const auto column_id : input.column_ids) {
+		column_ids.push_back(ResolveKeylessKeyColumn(column_id));
+	}
 
 	// Virtual/special column identifiers start at 2^63
 	constexpr column_t VIRTUAL_COL_START = UINT64_C(9223372036854775808);
@@ -902,7 +909,12 @@ static ExpressionEncodeContext BuildEncodeContext(ClientContext &context, const 
 	column_ids_out.clear();
 	column_ids_out.reserve(get_column_ids.size());
 	for (const auto &col_idx : get_column_ids) {
-		column_ids_out.push_back(col_idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID : col_idx.GetPrimaryIndex());
+		const auto id = col_idx.GetPrimaryIndex();
+		if (IsKeylessKeyColumn(id)) {
+			column_ids_out.push_back(ResolveKeylessKeyColumn(id));
+		} else {
+			column_ids_out.push_back(col_idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID : id);
+		}
 	}
 
 	ExpressionEncodeContext ctx(column_ids_out, bind_data.all_column_names, bind_data.all_types);
@@ -1242,6 +1254,14 @@ static virtual_column_map_t GetVirtualColumns(ClientContext &context, optional_p
 	} else {
 		MSSQL_SCAN_DEBUG_LOG(1, "GetVirtualColumns: rowid not available (rowid_requested=%s, pk_columns=%zu)",
 							 bind_data.rowid_requested ? "true" : "false", bind_data.pk_column_names.size());
+	}
+	// Spec 080 D3, rung 3: the same hidden key columns the table entry names in
+	// GetRowIdColumns, so the LogicalGet can type the ones the binder adds.
+	if (bind_data.keyless_key) {
+		for (idx_t i = 0; i < bind_data.all_column_names.size(); i++) {
+			virtual_columns.insert(make_pair(
+				KeylessKeyColumn(i), TableColumn(Identifier(bind_data.all_column_names[i]), bind_data.all_types[i])));
+		}
 	}
 
 	return virtual_columns;

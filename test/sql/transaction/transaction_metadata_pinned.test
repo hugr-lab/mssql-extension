@@ -316,8 +316,10 @@ RESET threads;
 # an index that is then rolled back must not reach the shared entry.
 #------------------------------------------------------------------------------
 
+# The xml column keeps the table from being keyed by all its columns (spec 080
+# rung 3), so only a rowid key can serve the DELETE below.
 statement ok
-SELECT mssql_exec('tm380', 'DROP TABLE IF EXISTS dbo.tm380_nokey; CREATE TABLE dbo.tm380_nokey (id int NOT NULL, v int NULL); INSERT INTO dbo.tm380_nokey VALUES (1, 0), (2, 0)');
+SELECT mssql_exec('tm380', 'DROP TABLE IF EXISTS dbo.tm380_nokey; CREATE TABLE dbo.tm380_nokey (id int NOT NULL, v int NULL, doc xml NULL); INSERT INTO dbo.tm380_nokey (id, v) VALUES (1, 0), (2, 0)');
 
 statement ok
 SELECT mssql_invalidate_cache('tm380', 'dbo', 'tm380_nokey');
