@@ -30,9 +30,18 @@ sequential PRs, and `mssql_remote_pushdown` read **once per catalog at
 ATTACH** (079 D6), which is why the agreement suite here attaches twice
 rather than `SET`ting it (W5) and why the DML half gets its own switch
 (D5) — and against the design review of this text: the ladder's
-non-comparable-type base case, the rung-3 anti-rematch rule, the stage
+unusable-column base case, the rung-3 anti-rematch rule, the stage
 threshold, the join-form capability probe, the client-visible DML
 properties, the CTAS type source, and a PR split of its own (§ 2.7).
+**Revised again 2026-10-09** against the branch review of those revisions:
+rung 3's key is **round-trip fidelity over every column, or a refusal** (the
+server-comparability criterion missed `datetime` / `time(7)` /
+`datetimeoffset(7)`, which match nothing and report 0 rows, and
+`is_cast_required` does not cover `xml`), the reduced key and its LOB cost
+exclusion are withdrawn (§ 3), `result_eagerness` joins the client-visible
+properties as an at-least-once **gate**, cache invalidation inside a
+transaction goes through `NoteTransactionChange`, and
+`EXECUTE_STATEMENT`'s ATTACH-time reach is bounded to PR 4.
 
 ---
 
@@ -83,9 +92,21 @@ in a column named **`Count`** — the name DuckDB's own DML binders give it
 `bind_insert.cpp`), so the printed result is byte-identical to the shipped
 path's; errors surface with the server's message and number, as `mssql_exec`
 reports them. The plan is one statement; nothing is buffered on the client; in
-a transaction nothing defers. After the statement the target table's row
-count and statistics cache entries are invalidated (as COPY and CTAS do
-today — a pushed DML passes through no plan hook, so nothing else would).
+a transaction nothing defers. After the statement the target table's cached
+row count and statistics entry are invalidated — but **by which path depends
+on the transaction**, and a pushed DML passes through no plan hook, so
+nothing does it unless this says so. In **autocommit**: invalidate the shared
+entry, as COPY and CTAS do today. Inside an **explicit transaction**: the
+change was made on the pinned connection and is not committed, so the shared
+cache must not learn it — call `MSSQLCatalog::NoteTransactionChange(context,
+schema, table)` (and `NoteTransactionChangeLocally` where the transaction's
+own later reads must stop trusting the shared entry), the same
+`MSSQLTransactionMetadata::MarkChanged[Locally]` route the catalog's own DDL
+takes (`catalog/mssql_catalog_cache.cpp`), so COMMIT publishes and ROLLBACK
+forgets the right names (#380, #383). Without this a pushed UPDATE inside
+`BEGIN … ROLLBACK` either leaks uncommitted state into the shared cache or
+leaves the transaction reading a stale row count; W5 asserts the rolled-back
+case leaves the shared cache exactly as it was.
 
 **Exactly once.** A pushed DML executes once per plan execution: the count
 form has **one global init and no parallel local state**, and it is not a
@@ -94,6 +115,27 @@ invariant is load-bearing in a way a SELECT vehicle's is not: a table
 function DuckDB initialised twice would run the UPDATE twice. A `PREPARE`d
 pushed DML executed twice must affect its rows twice, as the shipped path
 does. W5 pins both ends (`threads = 4`, and `PREPARE` + two `EXECUTE`s).
+
+**At least once — the eagerness this must not lose.** Exactly-once bounds the
+statement from above; `StatementProperties::result_eagerness` bounds it from
+below, and the rewrite drops it. All three DML binders set
+`ResultEagerness::FORCED` (`bind_update.cpp:288`, `bind_delete.cpp:130`,
+`bind_insert.cpp:722`) while a statement bound as a SELECT gets `AUTO`
+(`bind_select.cpp:10`); `QueryResultStream` rejects **only** FORCED
+(`query_result_stream.cpp`) and `ClientContext` pre-retains **only** for
+FORCED. So a pushed UPDATE can be opened as a streaming result and closed
+unconsumed — JDBC `executeQuery` + `close`, the C API stream fetch — and the
+write may never run, where the shipped path always completes inside the call.
+This is **not** something the extension can set: `result_eagerness` is the
+binder's, and by the time the rewriter has replaced the statement the binder
+has been told it is a SELECT. So it is stated as a **requirement on the
+mechanism, and a gate**: a rewritten DML must keep DML eagerness (the ask
+upstream is that the rewriter preserve `FORCED` when the node it replaced was
+a DML), and W5 asserts it from the outside — open a stream over a pushed
+UPDATE, close it without consuming a row, assert the rows changed. **If that
+assertion cannot be made to pass, the DML nodes are not pushed** and PR 3
+does not merge; it is the one finding here that can veto the design rather
+than shape it. Recorded in § 4 and in PR 3's gate (§ 2.7).
 
 **What stops being a DML to DuckDB.** The rewriter replaces the whole
 statement with a SELECT over the vehicle's ref (`FinishPushdown` /
@@ -120,10 +162,14 @@ through `MSSQLCatalog::CheckWriteAccess` (`catalog/mssql_catalog.cpp`), so the
 class and the wording are the shipped path's —
 `CatalogException("Cannot execute %s: MSSQL catalog '%s' is attached in
 read-only mode")` — and the same refusal does not grow a second contract. A
-read-only **database** (`SET access_mode = read_only`, `duckdb --readonly`)
-is DuckDB's own bind-time check and is skipped for the same reason, so the
-count form's bind refuses that too, with DuckDB's wording. W5 exercises all
-three refusals.
+read-only **database** needs no third wording: `SET access_mode` cannot be
+used to make one (`AccessModeSetting::OnGlobalSet` throws "Cannot change
+access_mode setting while database is running", `custom_settings.cpp`, so it
+cannot appear in a `.test` at all), and a database **opened** read-only
+(`duckdb --readonly`) propagates `AccessMode::READ_ONLY` into the ATTACH — so
+the catalog is already `IsReadOnly()` and both guards are the same
+`CheckWriteAccess` refusal with the same message. W5 opens the database
+read-only rather than setting the option, and exercises both guards.
 
 **CTAS.** `RemoteExecute(SQLStatement)` for the CREATE TABLE AS shape
 returns a **lazy** ref too — nothing runs at optimize time, so `EXPLAIN` /
@@ -190,37 +236,50 @@ plan time:
 2. **A usable unique index** — spec 077's `ChooseRowIdKey` (PR #350, open at
    the time of writing), which becomes the rowid source; its refusals (`RowIdRefusal`) name why a key
    is unusable (datetime / sql_variant, #358; a cast-required type, #354).
-3. **Every comparable column, NULL-safe** — the keyless base case (067 § 1's
+3. **Every column, NULL-safe, or nothing** — the keyless base case (067 § 1's
    argument: for a deterministic WHERE and SET, matching by value updates
-   exactly the set DuckDB would). The key is every column the **server** can
-   compare, and the ones it cannot are excluded **by type, with a refusal —
-   not by cost**: a column marked `MSSQLColumnInfo::is_cast_required` (the
-   catalog's own marker for a type it reads as NVARCHAR(MAX): `xml`,
-   `sql_variant`, `hierarchyid`, CLR UDT), one marked `is_geometry` /
-   `MSSQLColumnInfo::IsSpatialType` (`geometry`, `geography`), and the
-   deprecated LOBs `text` / `ntext` / `image` are usable in no `=`, no
-   `IS NOT DISTINCT FROM`, no `INTERSECT` and no `DISTINCT`. They are left
-   out of the key, and if the remaining columns are **not unique in the
-   staged set** the statement is **refused by name**, naming the column and
-   its type ("`t.payload` is `xml`: the server cannot compare it, and the
-   other columns do not distinguish these rows — add a unique index"). 067
-   § 2 anticipated half of this as a cost note; here it is a refusal, because
-   there is no key to fall back to. MAX-length columns (`varchar(max)`,
-   `nvarchar(max)`, `varbinary(max)`) **are** comparable and stay in the key
-   unless the cost exclusion below drops them.
+   exactly the set DuckDB would). The key is **every column of the table**,
+   and a column that cannot be in it does not shrink the key — it **refuses
+   the statement**. There is no reduced rung-3 key, by decision (§ 3): a key
+   over a subset is only sound if the **target** is unique on that subset,
+   which the stage cannot show (it holds the rows the statement selected, not
+   the table) and which proving costs a round trip and still races. So the
+   rule is all or nothing, and every rung-3 refusal below is answerable **at
+   plan time**, from the catalog's column metadata and the statement's shape,
+   before anything is sent.
+   The test a column must pass is **round-trip fidelity, not server
+   comparability** — the staged value is read into a DuckDB type and written
+   back, so a type the server compares perfectly well can still fail to match
+   itself. Two reasons, and the refusal says which:
+   - **"the catalog does not read its value"** — a column whose declared type
+     the read path does not carry natively: `MSSQLColumnInfo::is_cast_required`
+     (read as NVARCHAR(MAX): `sql_variant`, `hierarchyid`, CLR UDT), plus
+     **`xml` by name** and `is_geometry` / `MSSQLColumnInfo::IsSpatialType`
+     (`geometry`, `geography`), plus the deprecated LOBs `text` / `ntext` /
+     `image`. `xml` and `image` must be named explicitly because
+     `is_cast_required` is **false** for both — `IsKnownSQLServerType` lists
+     them (`catalog/mssql_column_info.cpp`: "XML has dedicated TDS-level
+     support (0xF1) and works without CAST") — and `sql_variant` and
+     `hierarchyid` are in fact comparable in T-SQL, so the older wording
+     "the server cannot compare it" was untrue for them.
+   - **"its value does not survive the round trip"** — a type the read path
+     narrows: `datetime` (1/300 s ticks), `time(7)` and `datetimeoffset(7)`
+     (100 ns on the server, µs in DuckDB's TIME / TIMESTAMP_TZ). These are
+     exactly what `IsLiteralMismatch`
+     (`include/catalog/mssql_rowid_key_choice.hpp`) already marks
+     `unmatchable` for **rung 2** under #358, and they are the dangerous
+     case: the server compares them happily, the staged value differs in the
+     last digit, the JOIN matches nothing, and the statement reports **0 rows
+     with no error**. Rung 3 must therefore ask the **same question rung 2
+     asks**, through one shared predicate factored where `IsLiteralMismatch`
+     lives (`IsRoundTripExactForKey`), so a column rung 2 refuses by name can
+     never be silently mis-keyed by rung 3.
    The join form is `IS NOT DISTINCT FROM` where the server has it, else
    `EXISTS (SELECT t.c1, t.c2, … INTERSECT SELECT s.c1, s.c2, …)` — NULL-safe
    on every version (067 § 2), and the **default**: see the capability probe
-   below. The stage is DISTINCT over the key.
-   LOB-sized columns may be dropped from the key **for cost** when the rest
-   is unique in the staged set — but **never when any SET expression or the
-   WHERE references a dropped column**. Two staged rows then share the
-   reduced key while carrying different new values, and SQL Server's
-   `UPDATE … FROM … JOIN` with several matching source rows picks one
-   arbitrarily and raises nothing: the target silently takes whichever row
-   the server chose. The rule is that the staged set must be unique on the
-   reduced key **and** on the computed new values, or the column stays in the
-   key.
+   below. The stage is DISTINCT over the key, and with the key covering every
+   column the DISTINCT is also what makes "duplicates move together" the
+   documented semantics rather than an accident.
    A VOLATILE function in WHERE or SET on rung 3 is refused by name ("add a
    unique index, or make the expression deterministic"). So is a rung-3
    statement whose WHERE is **not fully
@@ -266,8 +325,14 @@ if the measurement says so. The stage is a **session-local `#stage_<uuid>`** —
 066 D5 chose `##` because the stage was filled from a second connection; here
 it is filled on the statement's own connection (`BulkLoadSession::Adopt`, the
 pinned one in a transaction), so the cross-session visibility is neither
-needed nor wanted, and a `#` name also stays clear of spec 063 D1's refusal
-of a second bulk-load writer against a session-scoped target. The connection
+needed nor wanted. A `#` name is **caught** by spec 063 D1 — not clear of it:
+`target_is_session_scoped` sets `policy.max_writers = 1`
+(`include/copy/load_policy.hpp`), as the pinned-connection branch does — so
+the stage fill is **single-writer by that policy**, which is the behaviour
+this path wants (the rows are going down one connection anyway) and a
+throughput ceiling W3 must measure rather than assume (the stage-fill rate
+for a large keyless statement). `##` would keep N writers, which is exactly
+what must not happen here. The connection
 is taken at the **first `Sink`**, never at init (W2's first consequence). The
 DML is `UPDATE t SET t.c = s.c__new … FROM target t JOIN #stage s ON <key>` /
 `DELETE t FROM target t JOIN #stage s ON <key>`, and the stage is dropped on
@@ -314,7 +379,8 @@ pinned connection by the same rule INSERT already follows.
 bind (065 D4; the two `RowIdRefusal` throws in `catalog/mssql_table_entry.cpp`,
 `BindUpdateConstraints` and `GetRowIdColumns`): the refusal moves to
 plan time, where rung 3 names what is left — the volatile guard, the
-unpushed predicate, the non-comparable-column case. Two things those
+unpushed predicate, and the two unusable-column cases (the catalog cannot
+read the value; the value does not survive the round trip). Two things those
 bind-time refusals **also** covered, and that must stay refused by name at
 bind rather than fall through to a path that cannot serve them:
 
@@ -349,6 +415,24 @@ database-level store (`DBConfig::TryGetCurrentSetting`), so this one can be
 flipped at any time, costs one lookup per rewrite when on, and leaves every
 pushed SELECT alone when off (the statement then takes D3's path). There is
 still **no per-session** form — D6's reason is unchanged, and the docs say so.
+
+**What the setting cannot switch.** `Supports(EXECUTE_STATEMENT)` is answered
+without a `ClientContext` and is fixed for the catalog's life, like
+`IS_REMOTE` and `EXECUTE_QUERY_NODE` (079 D6), so `mssql_dml_pushdown` cannot
+withdraw it. Claiming it makes DuckDB route **every** `CREATE` / `DROP` /
+`ALTER` / `CREATE SCHEMA` against the catalog through `ResolveDDLTarget` →
+`EntryExistsInLocalCatalog` → `VerifyStatementSupport`
+(`duckdb/src/optimizer/remote_pushdown_optimizer.cpp`) for as long as it is
+attached. Two consequences, both decisions:
+- The capability is claimed **only from PR 4** (§ 2.7), the PR that adds
+  pushed CTAS, and only when the catalog's ATTACH-time `remote_pushdown`
+  answer is on — the same flag 079 D6 already stores per catalog. PRs 1–3
+  therefore change no DDL routing at all.
+- With it claimed, `mssql_dml_pushdown = false` restores pre-080
+  **behaviour**, not pre-080 **routing**: every DDL statement still passes
+  through the rewriter's DDL path, `SupportsPushdown(SQLStatement)` vetoes it
+  there, and it lands on the shipped path unchanged. Acceptance 8 says so, and
+  W5 asserts the DDL shapes behave identically with the setting off.
 
 ## 2. Work
 
@@ -407,16 +491,19 @@ Two consequences for the rest of this spec:
 ### W3 — the ladder
 
 Rung 3 in `ChooseRowIdKey`'s caller (the plan-time resolution); the
-non-comparable-column exclusion (`is_cast_required` / `is_geometry` /
-`text`|`ntext`|`image`) and its named refusal; the two NULL-safe join forms
+whole-table key with its two named refusals, over one shared
+`IsRoundTripExactForKey` predicate that rung 2's `IsLiteralMismatch` call
+sites move to (`is_cast_required`, `is_geometry`, `xml` and `image` by name,
+`text`/`ntext`, and the lossy `datetime` / `time(7)` / `datetimeoffset(7)`); the two NULL-safe join forms
 with the capability probe riding the ATTACH collation query (the
 `SERVERPROPERTY` pair, the `EngineEdition IN (5, 8)` branch, the INTERSECT
 default, the answer cached on the catalog); the volatile guard and the
 unpushed-predicate refusal; the staged delivery — `#stage_<uuid>`, `Adopt` at
 the first `Sink`, the batched JOIN DELETE and the **single-statement** rung-3
-UPDATE; the DISTINCT stage, and the cost-only LOB exclusion with its
-SET/WHERE restriction; `mssql_dml_stage_threshold` and the crossover
-measurement that fixes its default; the bind-time refusals replaced by the
+UPDATE; the DISTINCT stage over the whole-table key;
+`mssql_test_force_intersect_join_form`; `mssql_dml_stage_threshold` and the
+crossover measurement that fixes its default, plus the stage-fill rate for a
+large keyless statement (single-writer by spec 063 D1); the bind-time refusals replaced by the
 plan-time ones, with RETURNING and the `rowid` pseudo-column still refused at
 bind.
 
@@ -471,14 +558,25 @@ so a failure fails the metadata load and no "no key" answer can come from it.)
 - Rung 3's hazards: a keyless UPDATE whose SET produces values that collide
   with another stage batch's key (the `(1,1)`/`(2,2)`, `SET a = a + 1` shape
   of D3, forced past `mssql_dml_stage_threshold` and past the ~100k batch
-  size) affects each row once; a keyless table carrying an `xml` column and
-  one carrying a `geometry` column — refused by name when the remaining
-  columns do not distinguish the rows, staged normally when they do; a
-  keyless UPDATE whose SET reads a LOB column that the cost exclusion would
-  have dropped (the column stays in the key, the result is deterministic).
+  size) affects each row once; a keyless table carrying an `xml` column, one
+  carrying a `geometry` column and one carrying a `text` column — each
+  **refused by name** with "the catalog does not read its value", never
+  staged with the column dropped; a keyless UPDATE and DELETE over a
+  `time(7)` column and over a `datetime` column — refused by name with "its
+  value does not survive the round trip", and in particular **never reporting
+  0 rows**, which is what the old server-comparability rule would have
+  produced; the same statements on a keyed table unaffected.
 - Both join forms: the NULL-bearing key cases run against a server that takes
-  `IS NOT DISTINCT FROM` and against one that gets the INTERSECT form (forced
-  by overriding the cached probe answer in a debug build).
+  `IS NOT DISTINCT FROM` **and** against the INTERSECT form. The integration
+  lane is a **release** build against `mssql/server:2022-latest`
+  (`docker/docker-compose.yml`), which answers `ProductMajorVersion` 16, so a
+  debug-only override would mean the INTERSECT form — the one D3 calls the
+  default and the only one correct on every version — **never runs in CI**.
+  It is forced by a registered test-only setting,
+  `mssql_test_force_intersect_join_form`, in the style the repo already uses
+  for exactly this problem (`mssql_test_fail_metadata_after_rows`,
+  `mssql_test_fail_parse_after_tokens`): present in release builds, off by
+  default, costing one comparison where the form is chosen.
 - After the `EXECUTE_STATEMENT` claim, `DROP TABLE` / `ALTER TABLE` /
   `CREATE SCHEMA` / `CREATE VIEW` against the catalog still take the shipped
   path and behave exactly as before.
@@ -536,8 +634,8 @@ that can veto into them.
 | PR | contents | stands on its own because |
 |---|---|---|
 | **1** | **W2** — the 066 remainder: `CollectSinkCatalogs` += `LOGICAL_UPDATE` / `LOGICAL_DELETE`, `defer_execution_` and its buffers gone, the transaction and pool-of-one suites | behind no setting and valuable alone: it fixes UPDATE and DELETE on a pool of one in autocommit and in a transaction — the last statements #380 left unable to run there — and retires the defer machinery |
-| **2** | **W3 + W4** — the ladder (rungs 1–3, the non-comparable refusal, the probe, the staged delivery, `mssql_dml_stage_threshold`), the bind-time refusals moved, the `mssql_dml_use_prepared` deprecation and `EnsurePKLoaded`'s discovery error | **closes #140 by itself**, with no rewriter involved: a keyless table becomes writable on the shipped path |
-| **3** | **W1** — the DML writer, the count vehicle, `mssql_dml_pushdown`, the read-only guards, UPDATE / DELETE / INSERT … SELECT pushed behind the setting; the agreement harness | the mechanism end to end on the three DML shapes, with PR 2's path underneath every veto |
+| **2** | **W3 + W4** — the ladder (rungs 1–3, the two unusable-column refusals over one shared round-trip predicate, the probe and its test-only override, the staged delivery, `mssql_dml_stage_threshold`), the bind-time refusals moved, the `mssql_dml_use_prepared` deprecation and `EnsurePKLoaded`'s discovery error | **closes #140 by itself**, with no rewriter involved: a keyless table becomes writable on the shipped path |
+| **3** | **W1** — the DML writer, the count vehicle, `mssql_dml_pushdown`, the read-only guards, UPDATE / DELETE / INSERT … SELECT pushed and **on from merge**, with the setting as the escape hatch; the agreement harness | the mechanism end to end on the three DML shapes, with PR 2's path underneath every veto |
 | **4** | the CTAS shape (`EXECUTE_STATEMENT`, the describe type source, one server transaction) and **W6**'s docs | the one shape needing a round trip before it decides; droppable without touching PRs 1–3 |
 
 **Spec 079 is already shipped through its PR E2** (`mssql_remote_pushdown`
@@ -548,8 +646,10 @@ pushed DML on for all of them the moment it merges. `mssql_dml_pushdown`
 nonetheless ships **true** (owner, 2026-10-08) — a staged rollout was
 considered and declined. **W5's suite is the gate instead**, and that places a
 condition on PR 3 rather than on the setting: the agreement suite must be
-green through both ATTACH aliases, on every shape in D1's table, with the
-rung-3 hazards and the exactly-once assertions, **before PR 3 merges** — not
+green through both ATTACH aliases on **the shapes PR 3 ships** — UPDATE,
+DELETE, `INSERT … SELECT`; D1's CREATE TABLE AS row and W5's CTAS assertions
+gate PR 4 instead — together with the rung-3 hazards, the exactly-once
+assertions and the at-least-once one, **before PR 3 merges** — not
 after, and not behind a flag nobody turns on. A setting that defaults to false
 gets the suite it deserves, which is the argument for not having one. The
 switch stays as the escape hatch § 4's first risk needs (a user who hits the
@@ -565,6 +665,13 @@ which is the point of putting them first.
 - RETURNING through `OUTPUT` — a later D1 row; the shipped path keeps its
   RETURNING behaviour, and a statement with RETURNING is not pushed.
 - Pushing a relaxed predicate for a DML (research § 2).
+- **A reduced rung-3 key** — dropping a column from the key for cost, or
+  because the catalog cannot read it, and keeping the statement. Sound only if
+  the **target** is unique on the remaining columns, which the stage cannot
+  establish (it holds the selected rows, not the table): proving it costs a
+  `GROUP BY … HAVING COUNT_BIG(*) > 1` round trip and still races the next
+  writer. Rung 3 is therefore all columns or a refusal (D3), and the LOB cost
+  exclusion earlier drafts carried is withdrawn with it.
 - A per-session pushdown switch, for the DML half or the read half — 079 D6's
   reason stands (`Supports` takes no `ClientContext`); `mssql_dml_pushdown`
   (D5) is instance-wide like its neighbour.
@@ -589,13 +696,19 @@ which is the point of putting them first.
 - **`INSERT … SELECT` and identity seed** — SQL Server's identity seed is
   not transactional (077); a rolled-back pushed insert still advances it,
   as a rolled-back statement insert does.
-- **Rung 3 on a wide table** — the stage carries every column; LOB columns
-  make the JOIN expensive (067 § 2's note): measured in W3, LOB-sized columns
-  excluded from the key for cost when the rest is unique **and** the SET and
-  WHERE do not read them (D3).
-- **Rung 3 on a table with a non-comparable column** — `xml`, `geometry`,
-  `sql_variant`, `hierarchyid`, `text`/`ntext`/`image` cannot be in the key
-  at all, so a keyless table whose other columns do not distinguish its rows
+- **Rung 3 on a wide table** — the stage carries every column and the key is
+  every column, with no cost exclusion (§ 3): a LOB-bearing keyless table
+  makes the JOIN expensive (067 § 2's note), and the stage fill is
+  single-writer by spec 063 D1. Measured in W3; the lever for a user is a
+  unique index, which moves the table to rung 2.
+- **A pushed DML could be streamed and abandoned** — `result_eagerness` is
+  the binder's and the rewrite loses it (D1): W5's at-least-once assertion is
+  what proves the mechanism keeps the write, and it can veto the pushed-DML
+  path rather than merely shape it.
+- **Rung 3 on a table with an unusable column** — `xml`, `geometry`,
+  `sql_variant`, `hierarchyid`, `text`/`ntext`/`image`, and the lossy
+  `datetime` / `time(7)` / `datetimeoffset(7)`, cannot be in the key at all,
+  so a keyless table carrying one of them
   has **no** rung 3 and is refused by name (D3). That is a real table shape
   this spec does not make writable; the fix for the user is a unique index.
 - **The join-form probe** — read at ATTACH from `SERVERPROPERTY`, so a
@@ -605,6 +718,15 @@ which is the point of putting them first.
   performance, not results.
 - **The remainder's blast radius** — `CollectSinkCatalogs` is on the
   planner's path for every DML; the transaction suite is the guard.
+- **Pushed CTAS over an undescribable SELECT fails where the shipped path
+  succeeds** — spec 075's F1 runs such a batch at bind today. By the time the
+  describe is asked the CREATE has been replaced by the vehicle's ref
+  (`FinishPushdown` / `WrapRemoteRef`), so there is no shipped path left to
+  fall back to: the "veto at execution" in D1 is a **regression**, not a
+  graceful decline. Kept deliberately — moving the describe early enough to
+  hand the statement back would cost a round trip at optimize time on every
+  CTAS, `EXPLAIN` included — with `mssql_dml_pushdown = false` as the way back
+  and a W5 case covering it.
 - **Rung 3 locks** — a JOIN that cannot seek scans the target per batch and
   escalates toward a table X lock: concurrent readers block for the batch;
   the stage-fully-then-join order (D3) keeps the statement's own scan out of
@@ -640,4 +762,12 @@ which is the point of putting them first.
 7. A read-only catalog and a read-only database each refuse every pushed
    write with the shipped path's message, by both guards.
 8. `mssql_dml_pushdown = false` leaves pushed SELECTs pushed and sends every
-   DML down D3's path.
+   DML down D3's path. It restores pre-080 **behaviour**, not pre-080
+   **routing**: once `EXECUTE_STATEMENT` is claimed (PR 4) every DDL
+   statement still passes through the rewriter's DDL path and is vetoed
+   there, which the DDL shapes assert with the setting both on and off.
+9. A keyless UPDATE or DELETE over a `datetime`, `time(7)` or
+   `datetimeoffset(7)` column is refused by name and **never reports 0 rows**;
+   rung 2 and rung 3 answer that question through the same predicate.
+10. A pushed DML opened as a streaming result and closed unconsumed still
+    changed its rows.
