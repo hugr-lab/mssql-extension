@@ -395,6 +395,25 @@ desync naming what the server executed (#323).
     composite rowid. DuckDB's duplicate check (physical_merge_into.cpp:398)
     then reports "the same target row more than once" for rows that are in
     fact two. Documented; a key is the fix.
+- **One statement connection for all actions** (found in PR 1, #423). DuckDB
+  plans each action as its own operator. Each has its own
+  `MSSQLStatementConnection`, and they are fed from several threads. PR 1
+  makes them send at their own Finalize, under the pinned connection's lock.
+  The rest is PR 4:
+  - in autocommit the actions are separate server transactions, so a failing
+    action leaves the others committed (as on `main` before PR 1);
+  - on a pool of one they take turns, bounded by `mssql_acquire_timeout`;
+  - UPDATE / DELETE actions hold their rows in memory until Finalize.
+
+  The fix: the actions share one connection and one server transaction for
+  the operator, in autocommit committed when the statement's own
+  `MSSQLTransaction` commits. The staged path (D3) then replaces their
+  per-value buffers.
+- **IDENTITY in a MERGE INSERT action** (found in PR 1). DuckDB plans the
+  action full-width, so the identity column arrives as an explicit NULL and
+  the INSERT is refused by name: "names the identity column … but supplies no
+  value". PR 4 drops an identity column from a MERGE action's list when the
+  MERGE's own INSERT clause does not name it.
 - **Pushed** (both sides in the catalog): `MergeQueryNode` → T-SQL `MERGE`
   with `merge` (D0).
   - Only shapes T-SQL can express are pushed; anything else is vetoed:
@@ -597,7 +616,7 @@ risk", and this spec is no smaller. Each PR merges before the next opens
 | **1** | W4 (the 066 remainder: sinks, defer removed, pool of one); RETURNING on UPDATE / DELETE **refused by name** at plan time (the InternalException fix); W6 | fixes UPDATE / DELETE on a pool of one and the crash, behind no setting |
 | **2** | W3 (the ladder, rung 3, `#stage`, `mssql_dml_stage_threshold`, #358) and W5's capability read (`EngineEdition` / `ProductMajorVersion`); RETURNING through `OUTPUT … INTO @o` on the fallback where `output_clause` holds; the `fabric-probe/` run if the warehouse answers by then (the rows it settles flip, one line each) | closes #140 and #358 with no rewriter involved |
 | **3** | W1 + W2 (the vehicles, the exact count, `ExecuteDmlBatch`, the writer's UPDATE / DELETE / INSERT … SELECT, `mssql_dml_pushdown`); the agreement harness | pushed DML end to end, PR 2's path under every veto |
-| **4** | W7 (MERGE native tests, pushed MERGE) | MERGE on top of PRs 2–3 |
+| **4** | W7: one statement connection for a MERGE's actions (atomic in autocommit), IDENTITY in an INSERT action, pushed MERGE | MERGE on top of PRs 2–3 (PR 1 already made the native MERGE run in a transaction and on a pool of one, #423) |
 | **5** | D6 (pushed CTAS) and W9 (docs) | droppable without touching PRs 1–4 |
 
 PRs 1 and 2 change the shipped path only and are live from the moment they
