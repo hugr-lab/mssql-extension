@@ -47,7 +47,11 @@ refused (D4), and no batching of a staged statement (D3).
   pushdown and no stage, and documented as untested, with two changes:
   - UPDATE / DELETE … RETURNING is refused by name instead of ending in the
     InternalException (PR 1);
-  - **a rowid key must be enforced** (review of #422). Synapse dedicated
+  - **a rowid key must be enforced** (review of #422; for a table with no
+    key the refusal gives the same reason, #437; and when the ATTACH query
+    did not read `EngineEdition` -- the one way to tell a dedicated pool
+    behind a foreign host name -- the first UPDATE / DELETE reads it, and
+    refuses if it cannot rather than take the server for SQL Server). Synapse dedicated
     accepts PRIMARY KEY / UNIQUE only as `NOT ENFORCED`, so such a key can
     match several rows and a keyed UPDATE / DELETE can hit rows the statement
     did not select. `ChooseRowIdKey` gains "the key is not enforced" beside
@@ -507,6 +511,14 @@ refuses these columns on both rungs, as rung 2 does today):
   conversion recovers it. They stay refused.
 - **`datetime2(7)` in range is lossless** (it reads as TIMESTAMP_NS). Out of
   range it reads as NULL, and the refusal covers it.
+- **Measured and closed (PR 2, #425):** 603 of 603 on both paths; the key path
+  (UPDATE / DELETE, `#stage`, `rowid =`) compares a `datetime` key as
+  `datetime`. **A non-goal of W3** (#438, folded into #426): the general filter
+  path keeps comparing a `datetime` column as `datetime2`. Rounding is sound for
+  equality only -- a range against a constant between two ticks would move its
+  boundary (`k > '….005'` became `k > '….007'` and dropped the `.007` row,
+  measured) -- so whoever fixes #426 keeps the two apart: equality in the
+  column's type, ranges as `datetime2`.
 
 | step | SQL Server / Azure | Fabric |
 |---|---|---|

@@ -201,6 +201,31 @@ INSERT INTO fe.dbo.fe_k VALUES (9001, 0, NULL);
 ----
 1
 
+# --- Synapse (emulated): UPDATE / DELETE refused with its reason, keyed or not
+# (issue #437: a table with no key used to get a reasonless refusal) ---------
+
+statement ok
+SET mssql_test_dml_platform = 'synapse';
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS fs (TYPE mssql);
+
+statement ok
+RESET mssql_test_dml_platform;
+
+statement error
+UPDATE fs.dbo.fe_k SET v = 1 WHERE id = 1;
+----
+NOT ENFORCED
+
+statement error
+DELETE FROM fs.dbo.fe_n WHERE v = 1;
+----
+NOT ENFORCED
+
+statement ok
+DETACH fs;
+
 statement ok
 SELECT mssql_exec('fe', 'DROP TABLE dbo.fe_k; DROP TABLE dbo.fe_c; DROP TABLE dbo.fe_n; DROP TABLE dbo.fe_two; DROP TABLE dbo.fe_u; DROP TABLE fe_s.stg__; DROP SCHEMA fe_s');
 

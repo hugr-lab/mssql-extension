@@ -691,6 +691,7 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 										   PhysicalOperator &plan) {
 	// Check write access first (throws if read-only)
 	CheckWriteAccess("DELETE");
+	EnsureServerProperties(context, "DELETE");
 
 	// Get the target table entry
 	auto &table_entry = op.table.Cast<MSSQLTableEntry>();
@@ -778,6 +779,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 										   PhysicalOperator &plan) {
 	// Check write access first (throws if read-only)
 	CheckWriteAccess("UPDATE");
+	EnsureServerProperties(context, "UPDATE");
 
 	// Get the target table entry
 	auto &table_entry = op.table.Cast<MSSQLTableEntry>();

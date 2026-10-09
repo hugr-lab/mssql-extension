@@ -499,18 +499,25 @@ void MSSQLCatalog::QueryDatabaseCollation() {
 			snapshot_isolation_state_ = -1;
 			engine_edition_ = -1;
 			product_major_version_ = -1;
+			bool properties_in_row = false;
 			// Positions: the plain query has 0-1, the D0 query adds 2-3, the
 			// snapshot column is 4. A query without a column leaves it unread.
-			return MSSQLSimpleQuery::ExecuteWithCallback(*connection, sql, [&](const std::vector<std::string> &values) {
-				if (!values.empty()) {
-					collation = values[0];
-				}
-				code_page = read_int(values, 1, 0);
-				engine_edition_ = read_int(values, 2, -1);
-				product_major_version_ = read_int(values, 3, -1);
-				snapshot_isolation_state_ = read_int(values, 4, -1);
-				return true;  // one row; keep the stream drained
-			});
+			auto result =
+				MSSQLSimpleQuery::ExecuteWithCallback(*connection, sql, [&](const std::vector<std::string> &values) {
+					if (!values.empty()) {
+						collation = values[0];
+					}
+					code_page = read_int(values, 1, 0);
+					engine_edition_ = read_int(values, 2, -1);
+					product_major_version_ = read_int(values, 3, -1);
+					snapshot_isolation_state_ = read_int(values, 4, -1);
+					properties_in_row = values.size() > 3;
+					return true;  // one row; keep the stream drained
+				});
+			if (result.success && properties_in_row) {
+				server_properties_read_ = true;
+			}
+			return result;
 		};
 		// A failed probe must not take the collation and code page with it (review
 		// of #381), nor the server properties with the snapshot column: each
@@ -977,7 +984,50 @@ mssql::DmlCapabilities MSSQLCatalog::GetDmlCapabilities() const {
 	} else if (connection_info_ && connection_info_->IsSynapseEndpoint()) {
 		platform = mssql::DmlPlatform::Synapse;
 	}
-	return mssql::DmlCapabilities::Resolve(platform, engine_edition_, product_major_version_);
+	return mssql::DmlCapabilities::Resolve(platform, engine_edition_.load(), product_major_version_.load());
+}
+
+void MSSQLCatalog::EnsureServerProperties(ClientContext &context, const char *verb) {
+	if (server_properties_read_.load()) {
+		return;
+	}
+	std::lock_guard<std::mutex> guard(server_properties_mutex_);
+	if (server_properties_read_.load()) {
+		return;
+	}
+	string error;
+	auto connection = ConnectionProvider::GetConnection(context, *this);
+	if (!connection) {
+		error = "no connection";
+	} else {
+		int32_t edition = -1;
+		int32_t major = -1;
+		auto result = MSSQLSimpleQuery::ExecuteWithCallback(
+			*connection,
+			"SELECT CAST(SERVERPROPERTY('EngineEdition') AS INT) AS e, "
+			"TRY_CAST(CAST(SERVERPROPERTY('ProductMajorVersion') AS NVARCHAR(16)) AS INT) AS v",
+			[&](const std::vector<std::string> &values) {
+				if (!values.empty() && !values[0].empty()) {
+					edition = std::stoi(values[0]);
+				}
+				if (values.size() > 1 && !values[1].empty()) {
+					major = std::stoi(values[1]);
+				}
+				return true;
+			});
+		ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
+		if (result.success && edition >= 0) {
+			engine_edition_ = edition;
+			product_major_version_ = major;
+			server_properties_read_ = true;
+			return;
+		}
+		error = result.success ? "the server returned no EngineEdition" : result.error_message;
+	}
+	throw NotImplementedException(
+		"MSSQL: %s through '%s' needs SERVERPROPERTY('EngineEdition') to tell Azure Synapse, whose keys are NOT "
+		"ENFORCED, from SQL Server, and it could not be read (%s). Use mssql_exec() to run the statement on the server",
+		verb, GetName().GetIdentifierName(), error);
 }
 
 MSSQLCatalog::Utf8Support MSSQLCatalog::UTF8SupportState() {

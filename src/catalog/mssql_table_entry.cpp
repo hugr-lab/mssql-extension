@@ -456,6 +456,12 @@ string MSSQLTableEntry::KeylessKeyRefusal() const {
 		return "";
 	}
 	const auto caps = catalog.Cast<MSSQLCatalog>().GetDmlCapabilities();
+	if (caps.IsSynapse()) {
+		// Issue #437: Synapse's own reason, as RefuseKeyedDmlOnSynapse gives it.
+		return "Azure Synapse refuses UPDATE / DELETE through the catalog: its PRIMARY KEY and UNIQUE constraints "
+			   "are NOT ENFORCED, so a key can match rows the statement did not select. Use mssql_exec() to run the "
+			   "statement on the server.";
+	}
 	if (!caps.keyless_dml) {
 		return caps.platform == mssql::DmlPlatform::Fabric
 				   ? "Keying a table by all its columns is not available on Fabric Warehouse yet."
