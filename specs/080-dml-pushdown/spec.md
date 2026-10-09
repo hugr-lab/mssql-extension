@@ -7,7 +7,8 @@ folded in and marked "(#421)". That file holds the code inventory, the DuckDB AP
 `4fbae437b22` and the Fabric/Synapse matrix, each with sources. This spec
 cites it as "R§n". The first draft (2026-09-17, PR #364) is superseded; its
 measured ground still stands in `../065-dml-pushdown-recon/` and is cited
-from there.
+from there. Revised again 2026-10-09 (owner): MERGE always on the server or
+refused (D4), and no batching of a staged statement (D3).
 
 **Goal**
 - A DML statement the writer can express runs on the server as **one
@@ -16,7 +17,10 @@ from there.
   by the best key the table has, or by all its columns if it has none.
 - RETURNING works where the platform can return rows and is refused by name
   where it cannot. It never ends in an InternalException.
-- MERGE INTO works, natively, and pushed when both sides are remote.
+- MERGE INTO a catalog table runs on the server, always: pushed when the
+  source is on the same server, through a `#src` filled by BCP otherwise, and
+  refused by name when its conditions cannot be written in T-SQL (D4, owner
+  2026-10-09).
 - **Closes #140 on SQL Server / Azure SQL in PR 2.** It was reopened on
   2026-10-08: #364 closed it with text, not code. **Fabric:** the keyless path
   there (stage filled with `INSERT … VALUES`, the staged DML a `MERGE`) needs
@@ -49,7 +53,9 @@ from there.
     "disabled" and "filtered" (`sys.indexes` / `sys.key_constraints` carry
     it), so on Synapse every UPDATE / DELETE through the catalog is refused by
     name. That is a behaviour change on a platform we cannot test, chosen over
-    a wrong-rows hazard (PR 2).
+    a wrong-rows hazard (PR 2);
+  - **MERGE is refused by name** (D4, review of #424): its MERGE is in
+    preview, and after PR 4 the catalog has no native MERGE path to keep.
 
   The host test tells Synapse apart (D0).
 - Synapse serverless: no DML at all.
@@ -179,6 +185,7 @@ No gain threshold applies. A DML either goes whole or plans as today.
 | `DELETE FROM t USING u WHERE …` | `DELETE [r1] FROM … JOIN …` | `DELETE FROM [s].[t] WHERE EXISTS (…)` (a semi-join, so no duplicate rows) |
 | `INSERT INTO t (cols) SELECT …` (both remote) | `INSERT INTO [s].[t] ([cols]) SELECT …`; a named identity column is bracketed with IDENTITY_INSERT (077 W2) | same |
 | `MERGE INTO t USING s ON … WHEN …` (both remote) | `MERGE [s].[t] AS [r1] USING … ON … WHEN …;` (D4) | same (GA) |
+| `MERGE INTO t USING <anything else> …` | not the rewriter's: `MSSQLOptimizer` stages the source in `#src` and sends `MERGE … USING #src` (D4) | same |
 | CTAS from remote to remote | our CREATE, then the pushed `INSERT … SELECT` (D6, the last PR) | same |
 
 ### The vehicles
@@ -462,27 +469,25 @@ The key is resolved per table at plan time:
     takes it. Without that, `mssql_reset_connection = false` would let
     repeated failures accumulate `#stage_*` tables in a pooled session.
 
-**Batching (#421):**
+**Batching (#421; owner, 2026-10-09):**
 - The `VALUES`-join statements keep today's sizing (`mssql_dml_batch_size`,
-  capped by `mssql_dml_max_parameters`). A staged JOIN batch is a fixed
-  100000 staged rows: it carries no parameters, so neither setting bounds it,
-  and W3 measures whether the constant should become a setting (review of
-  #422).
-- A DELETE batches by the staged batch: a deleted row cannot match a later
-  batch.
-- An UPDATE on rungs 1–2 batches too. A SET of a rowid-key column is refused
-  there, so no batch can move a row into another batch's key.
-- **An UPDATE on rung 3 is one statement over the whole stage.** There the key
-  is every compared column, and any SET rewrites part of it. In batches it
-  corrupts silently:
-  - keyless `(a, b)` holds `(1, 1)` and `(2, 2)`, and the statement is
-    `UPDATE t SET a = a + 1`;
-  - batch 1 turns `(1, 1)` into `(2, 1)`;
-  - batch 2's key `(2, …)` then matches it again.
+  capped by `mssql_dml_max_parameters`).
+- **A staged statement is one statement over the whole stage**, on every rung
+  and for MERGE (D4). How much one statement writes is the business of whoever
+  writes it, and the extension does not split it. Splitting is also not
+  equivalent in general:
+  - on rung 3 the key is every compared column, and any SET rewrites part of
+    it. Keyless `(a, b)` holds `(1, 1)` and `(2, 2)`, the statement is
+    `UPDATE t SET a = a + 1`; batch 1 turns `(1, 1)` into `(2, 1)`, and batch
+    2's key `(2, …)` matches it again;
+  - for MERGE, `WHEN NOT MATCHED BY SOURCE` would take every target row
+    outside the batch, a target row matched from two batches would be written
+    twice instead of refused, and a SET of an ON column moves a row into a
+    later batch's match.
 
-  One statement matches against the target as it stood before the statement.
-  If one statement ever proves too much for the log, the way back is a
-  key-stable generation guard in the stage, not batching as it stands.
+  One statement matches against the target as it stood before it. The stage
+  fill itself still goes in `mssql_copy_flush_rows` bulk-load batches; that is
+  the wire, not the statement.
 
 **#358, a proposal measured in W3** (until then `IsRoundTripExactForKey`
 refuses these columns on both rungs, as rung 2 does today):
@@ -550,64 +555,116 @@ desync naming what the server executed (#323).
 
 ## D4: MERGE INTO
 
-- **Native.** DuckDB plans each action through our hooks (R§1), so MERGE
-  rides D3. DuckDB's binder needs `GetRowIdColumns`, and on a keyless table
-  that now answers with rung 3's key. RETURNING in MERGE is refused by DuckDB
-  itself. Tests pin what works today and what rung 3 adds.
-  - **Known limit on rung 3:** identical duplicate target rows share one
-    composite rowid. DuckDB's duplicate check (physical_merge_into.cpp:398)
-    then reports "the same target row more than once" for rows that are in
-    fact two. Documented; a key is the fix.
-- **One statement connection for all actions** (found in PR 1, #423). DuckDB
-  plans each action as its own operator. Each has its own
-  `MSSQLStatementConnection`, and they are fed from several threads. PR 1
-  makes them send at their own Finalize, under the pinned connection's lock.
-  The rest is PR 4:
-  - in autocommit the actions are separate server transactions, so a failing
-    action leaves the others committed (as on `main` before PR 1);
-  - on a pool of one they take turns, bounded by `mssql_acquire_timeout`;
-  - UPDATE / DELETE actions hold their rows in memory until Finalize.
+Owner's decision, 2026-10-09: **a MERGE into a catalog table runs on the
+server, always, or is refused by name** -- as DuckLake does. There is no
+native MERGE path for the catalog after PR 4.
 
-  The fix: the actions share one connection and one server transaction for
-  the operator, in autocommit committed when the statement's own
-  `MSSQLTransaction` commits. The staged path (D3) then replaces their
-  per-value buffers.
-- **Unnamed columns of a MERGE INSERT action** were fixed in PR 1 (review of
-  #423): DuckDB binds the action full width, so `MSSQLCatalog::PlanMergeInto`
-  works out which columns the action did not name, and those keep their
-  identity / DEFAULT / computed value.
-- **Pushed** (both sides in the catalog): `MergeQueryNode` → T-SQL `MERGE`
-  with `merge` (D0).
-  - Only shapes T-SQL can express are pushed; anything else is vetoed:
-    - at most two WHEN MATCHED clauses, one UPDATE and one DELETE, the first
-      of them conditional;
-    - one WHEN NOT MATCHED [BY TARGET];
-    - at most two WHEN NOT MATCHED BY SOURCE.
+Why not the native path (DuckDB's `Catalog::PlanMergeInto`, each action
+through our `PlanUpdate` / `PlanDelete` / `PlanInsert`):
+- each action is its own operator with its own `MSSQLStatementConnection`, so
+  in autocommit a failing action leaves the others committed, the actions take
+  turns on a pool of one, and UPDATE / DELETE actions hold their rows until
+  Finalize (found in PR 1, #423);
+- DuckDB tells a matched row from an unmatched one by its first row-id column
+  (`PhysicalMergeInto::ComputeMatches`: "the first row-ID component is also
+  the target-presence marker"). On a keyless table (rung 3) that is the value
+  of the first column, NULL whenever the column is, so a WHEN NOT MATCHED
+  INSERT or an ERROR action would fire on a matched row (found in PR 2).
 
-    DuckDB allows any number, with first-match semantics.
-  - **DO NOTHING** is pushed only as the last clause of its kind, where
-    omitting it changes nothing. Elsewhere it is vetoed: a later clause with
-    an overlapping condition would otherwise take its rows.
-  - Vetoed: ERROR, `UPDATE SET *`, `INSERT *` / BY NAME, an INSERT action
-    naming the identity column (no IDENTITY_INSERT bracket inside MERGE in
-    this spec), and a source that is not a table of the same catalog or a
-    pushable query over them.
-  - T-SQL refuses a target row matched twice (it errors), and DuckDB refuses
-    it too: same outcome, kept.
-  - The count is `exact_count`'s where the platform has it, otherwise the
-    MERGE's DONE count.
-- **Source in DuckDB, target remote** (`MERGE INTO ms.t USING local_df …`):
-  this **moves to `after-0.3.0`**. `PlanMergeInto` receives the already-planned
-  physical join of source and target (plan_merge_into.cpp:351-356), so the
-  source cannot be taken from there. Staging it would need a logical rewrite
-  in `MSSQLOptimizer`, which is a design of its own. Until then such a MERGE
-  takes the native path: per-action rowid batches through D3.
+**Two forms, one T-SQL writer:**
+- **The source is on the same server** (a table of the catalog, or a query
+  over them that the writer renders): the rewriter hands the `MergeQueryNode`
+  over whole (duckdb#24854), and the vehicle sends
+  `MERGE [s].[t] AS t USING (<query>) AS s ON … WHEN …;`.
+- **Any other source** (a DuckDB table, a file, another catalog, a VALUES
+  list): the rewriter sees two catalogs and does not offer the node
+  (`RemotePushdownOptimizer::RewriteNode(MergeQueryNode)` merges to Unknown).
+  `MSSQLOptimizer` takes the `LogicalMergeInto` instead, before physical
+  planning (`PlanMergeInto` receives the source already joined to the target,
+  plan_merge_into.cpp:351-356, too late):
+  - the source subtree stays as the operator's child; the join and the
+    target's scan go;
+  - every expression over source columns only (`s.a * 2`, any DuckDB
+    function) is computed by DuckDB into a `#src` column, so only what touches
+    the target is written in T-SQL: the ON condition, the WHEN conditions, and
+    SET / INSERT values that read the target;
+  - **What the rewrite takes apart** (review of #424). The binder builds the
+    match below `LogicalMergeInto`: a projection over a join of source and
+    target (bind_merge_into.cpp:445-447), the join type chosen from the
+    actions present (:314-320; INNER, LEFT, RIGHT, FULL), the sides inverted
+    for a RIGHT join (:341), and for WHEN NOT MATCHED BY SOURCE a
+    `source_marker` column added by that projection (:381-402). Every action
+    expression is bound against that projection. The rewrite removes the
+    projection, the join and the target's scan; the join type is not kept
+    (T-SQL's MERGE has its own); and each action expression's column
+    references are remapped through the deleted projection onto the target
+    table's columns (`t.[col]`) or the `#src` columns (`s.[cN]`), the
+    inverted case included. A reference the remapping cannot place (the
+    `source_marker`, a row id) is a refusal, never a guess;
+  - `#src` columns are typed with the source's DuckDB types through the CTAS
+    mapping, **except a column the ON condition compares with a target
+    column** (review of #424): that one is declared with the target column's
+    own SQL Server type and collation, as rung 3's stage is, so the server
+    compares like with like (`datetime` against `datetime`, #358; a string
+    under one collation, else error 468). A target column the ON condition
+    reads must pass `IsRoundTripExactForKey`, the predicate rungs 2-3 use,
+    or the MERGE is refused by name: a mismatch there is worse than in an
+    UPDATE -- the unmatched row makes WHEN NOT MATCHED INSERT fire and
+    duplicates the target row;
+  - `#src` is D3's stage in every other respect, by reference: the fill per
+    platform (INSERT BULK on the statement's connection, the first `Sink`,
+    `DeferAdoption`; `INSERT … VALUES` batches on Fabric until `stage_bulk`),
+    created inside the statement's server transaction so a failure's ROLLBACK
+    drops it, a connection left mid-response closed rather than pooled, one
+    writer (063 D1); then one `MERGE [s].[t] AS t USING #src AS s ON … WHEN
+    …;`, then dropped;
+  - the bound expressions render through `ExpressionVocabulary`, the atoms the
+    scan path and the 079 writer share, with a resolver for two relations:
+    a target binding to `t.[col]`, a source binding to `s.[cN]`.
+
+**Refused by name** (the whole statement, nothing sent):
+- a condition or value touching the target that the vocabulary cannot write;
+- a shape T-SQL does not have: more than two WHEN MATCHED clauses (one UPDATE
+  and one DELETE, the first conditional), more than one WHEN NOT MATCHED [BY
+  TARGET], more than two WHEN NOT MATCHED BY SOURCE; DuckDB allows any number,
+  with first-match semantics;
+- DO NOTHING anywhere but last of its kind (omitting it there changes
+  nothing; elsewhere a later clause with an overlapping condition would take
+  its rows); ERROR; `UPDATE SET *`; RETURNING (DuckDB refuses it itself);
+- an INSERT action naming the identity column (no IDENTITY_INSERT bracket
+  inside MERGE in this spec);
+- Synapse (MERGE in preview there; D0).
+
+**Semantics.** The source is evaluated by DuckDB, the match and the conditions
+by the server, under the column collations (D4 of 079: native). A target row
+matched by two source rows is an error in T-SQL (8672) as in DuckDB: same
+outcome. One statement, no batches (D3), atomic: one connection and one server
+transaction, committed with the statement's `MSSQLTransaction` in autocommit.
+No key is needed, so keyed and keyless targets are the same case. The count is
+`exact_count`'s where the platform has it, else the MERGE's DONE count.
+
+**Until PR 4** the native path stays for keyed tables, with PR 1's fixes
+(`PlanMergeInto` names the INSERT action's unnamed columns; actions defer to
+Finalize, since in autocommit on a larger pool they hold separate server
+transactions and would deadlock through the client otherwise). A keyless
+target is refused by name from PR 2.
+
+The same `#src` mechanism serves `UPDATE t … FROM <local>` and
+`DELETE FROM t USING <local>` (`UPDATE t SET … FROM [s].[t] AS t JOIN #src
+AS s ON …`), today a client-side join that rung 3 refuses; it follows PR 4 as
+its own step.
 
 ## D5: the DML switch (#421)
 
 `mssql_dml_pushdown` (BOOLEAN, default **true**, `SetScope::GLOBAL`) is read
 in `SupportsPushdown` for the DML and MERGE nodes, and in
 `SupportsPushdown(const SQLStatement &)` for CTAS (D6).
+
+It governs the **pushed** form only (review of #424). A MERGE whose source the
+setting keeps from being pushed takes the staged form (`#src`, D4), which
+`MSSQLOptimizer` applies whatever the setting: after PR 4 a MERGE into the
+catalog has no other way to run, so the setting cannot send it "down D3's
+path" -- D3's ladder is UPDATE / DELETE's.
 
 `mssql_remote_pushdown` cannot be the DML lever. 079 D6 reads it once at
 ATTACH: it also answers `IS_REMOTE`, so after attaching it is not a switch,
@@ -733,8 +790,13 @@ failed load leaves no table behind.
 - `EnsurePKLoaded` deleted (a `D_ASSERT` since 084).
 
 ### W7: MERGE
-- Native tests, including the rung-3 duplicate limit.
-- The pushed MERGE (W2), with the shape vetoes of D4.
+- The T-SQL MERGE writer with D4's shape vetoes, shared by both forms.
+- The pushed form (the source on the same server) through the vehicles.
+- The staged form: the `LogicalMergeInto` rewrite in `MSSQLOptimizer`, `#src`
+  (types, collations, source-only expressions computed by DuckDB), the
+  two-relation resolver over `ExpressionVocabulary`.
+- The native path retired for the catalog; every MERGE test runs on the
+  server or is a named refusal.
 
 ### W8: tests
 From the first draft:
@@ -765,8 +827,8 @@ From #421:
   state is read through the `remote_pushdown false` alias both times, so the
   reader itself is never pushed (review of #422);
 - exactly once (`threads = 4`; `PREPARE` executed twice);
-- rung 3's hazards: the `(1, 1)` / `(2, 2)` `SET a = a + 1` shape forced past
-  the threshold and the batch size; keyless tables with an `xml` / a
+- rung 3's hazards: the `(1, 1)` / `(2, 2)` `SET a = a + 1` shape on a stage
+  of more than one fill batch; keyless tables with an `xml` / a
   `geometry` column;
 - both join forms (the INTERSECT form forced by
   `mssql_test_force_intersect_join_form`, in the release-build integration
@@ -792,8 +854,13 @@ And these:
   transaction is refused by DuckDB's own rule.
 - An AFTER trigger on the target: the `exact_count` count is the
   statement's. A target with an INSTEAD OF trigger is not pushed.
-- MERGE: native on rungs 1–3 (with the duplicate limit); pushed with each
-  action kind; a target row matched twice errors.
+- MERGE: each action kind, keyed and keyless targets, a source on the same
+  server and a DuckDB source (a table, VALUES, a file); a target row matched
+  twice errors; each refusal of D4 by name; atomic in autocommit (a failing
+  action leaves nothing); ON over a `datetime` column (every row matched, no
+  duplicate inserted) and over a `time(7)` column (refused by name); a RIGHT
+  join shape (WHEN NOT MATCHED only) and WHEN NOT MATCHED BY SOURCE (the
+  `source_marker` case).
 - Pool of one: UPDATE, DELETE and MERGE in autocommit and in a transaction,
   pushed and staged (extends `transaction_single_connection_pool.test`).
 - The `fabric-probe/` files stay probes (`# group: [fabric_probe]`, a
@@ -837,7 +904,7 @@ risk", and this spec is no smaller. Each PR merges before the next opens
 | **2** | W3 (the ladder, rung 3, `#stage`, `mssql_dml_stage_threshold`, #358) and W5's capability read (`EngineEdition` / `ProductMajorVersion`); the `fabric-probe/` run if the warehouse answers by then (the rows it settles flip, one line each) | closes #140 and #358 with no rewriter involved |
 | **2b** | RETURNING on the fallback (`OUTPUT … INTO #out`), split from PR 2 (owner, 2026-10-09) | UPDATE / DELETE … RETURNING return rows instead of a named refusal |
 | **3** | W1 + W2 (the count vehicle, the run-once latch, the exact count, `ExecuteDmlBatch`, the writer's UPDATE / DELETE / INSERT … SELECT, `mssql_dml_pushdown`); the agreement harness | pushed DML end to end, PR 2's path under every veto |
-| **4** | W7: one statement connection for a MERGE's actions (atomic in autocommit), pushed MERGE | MERGE on top of PRs 2–3 (PR 1 already made the native MERGE run in a transaction and on a pool of one, #423) |
+| **4** | W7: MERGE on the server -- pushed when the source is on the same server, through `#src` otherwise, refused by name when not writable in T-SQL; the native path retired for the catalog | MERGE on top of PRs 2–3 (PR 1 made the native MERGE run in a transaction and on a pool of one, #423; it stays until this PR) |
 | **5** | D6 (pushed CTAS) and its docs; W9's final pass | droppable without touching PRs 1–4: every earlier PR carries its own docs |
 
 PRs 1 and 2 change the shipped path only and are live from the moment they
@@ -857,8 +924,11 @@ merge, which is why they come first.
   is unique on the rest, which the stage cannot establish. Earlier drafts
   carried it, including this revision's "re-apply the WHERE" form; it is
   withdrawn for the simpler all-or-refusal rule.
-- Batching the rung-3 UPDATE behind a generation guard (D3 names the hazard;
-  one statement is the decision until a measurement makes it untenable).
+- Batching a staged statement or a MERGE, by a setting or otherwise (owner,
+  2026-10-09: the volume of one statement is its author's business; D3 names
+  why batches are not equivalent).
+- A native MERGE fallback for a statement the T-SQL writer refuses (owner,
+  2026-10-09; DuckLake refuses the same way).
 
 ## Risks
 
@@ -888,8 +958,13 @@ merge, which is why they come first.
   path for every DML; the transaction suite is the guard (#421).
 - **A large UPDATE in a transaction materialises its source scan.** Its rows
   are held on the client, spilling as `ColumnDataCollection` does.
-- **Native MERGE on a keyless table** with identical duplicate target rows
-  reports a false duplicate match (D4).
+- **MERGE refuses more than it used to.** A keyed MERGE whose WHEN condition
+  uses a DuckDB-only function over a target column ran natively until PR 4 and
+  is refused from it; the user rewrites the condition or sends the statement
+  with `mssql_exec`.
+- **One large staged statement** (an UPDATE / DELETE through `#stage`, a MERGE
+  through `#src`) holds its stage in tempdb and its changes in one
+  transaction's log; nothing splits it (D3).
 - **The join-form probe** errs toward the INTERSECT form on an unknown
   edition. That form is correct everywhere and only slower on 2022+.
 - **Rung 3 on a table with an unusable column** (`xml`, `geometry`,
@@ -905,8 +980,8 @@ merge, which is why they come first.
 - ON CONFLICT (DuckDB's upsert) → T-SQL `MERGE`: a D1 row once D4 is in.
 - `UPDATE … FROM` on Fabric through `MERGE`: once the Fabric forms are
   measured.
-- MERGE with a source in DuckDB through `#stage` (D4): a logical rewrite in
-  `MSSQLOptimizer`, after 0.3.0.
+- `UPDATE … FROM` / `DELETE … USING` a DuckDB source through `#src` (D4's
+  mechanism): after PR 4, as its own step.
 - Fabric or Synapse behind a custom DNS name, which the host test misses (as
   it misses it for the row-count pass). An ATTACH option naming the platform
   is the likely answer; EngineEdition alone cannot tell Fabric from Synapse
@@ -929,9 +1004,10 @@ merge, which is why they come first.
    MERGE run in autocommit and in a transaction, on both paths.
 5. `UPDATE` / `DELETE … RETURNING` return the rows, or are refused by name.
    None ends in an InternalException.
-6. MERGE works natively on keyed and keyless tables (with D4's documented
-   duplicate limit), and pushed when both sides are remote and the shape is
-   expressible in T-SQL.
+6. MERGE into a catalog table runs on the server as one statement, for keyed
+   and keyless targets alike: pushed when the source is on the same server,
+   through `#src` otherwise. A MERGE the writer cannot express in T-SQL is
+   refused by name, and nothing is sent.
 7. The four DML token loops are one. `mssql_dml_use_prepared` is a
    registered no-op with its deprecation line in the CHANGELOG.
 8. A pushed DML executes exactly once per execution, and twice for two
@@ -939,8 +1015,10 @@ merge, which is why they come first.
 9. A read-only catalog and a read-only database each refuse every pushed
    write, through both guards, with the shipped path's message (#421).
 10. `mssql_dml_pushdown = false` leaves pushed SELECTs pushed and sends every
-    DML down D3's path. Once `EXECUTE_STATEMENT` is claimed, it restores
-    behaviour, not routing (#421).
+    UPDATE / DELETE / INSERT … SELECT down D3's path, and every MERGE through
+    `#src` (D4; it still runs on the server or is refused). Once
+    `EXECUTE_STATEMENT` is claimed, it restores behaviour, not routing
+    (#421).
 11. A keyless UPDATE or DELETE over a `time(7)` or `datetimeoffset(7)`
     column is refused by name and never reports 0 rows; rungs 2 and 3 answer
     through the same predicate (#421). The same holds for `datetime`
