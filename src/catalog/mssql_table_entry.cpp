@@ -1,7 +1,9 @@
 #include "catalog/mssql_table_entry.hpp"
 #include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_keyless_key.hpp"
 #include "catalog/mssql_primary_key.hpp"
+#include "catalog/mssql_rowid_key_choice.hpp"
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "connection/mssql_connection_provider.hpp"
@@ -167,8 +169,9 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 						   mssql_schema.name.c_str(), name.c_str(), pk_info_.columns.size(),
 						   pk_info_.IsComposite() ? "true" : "false", pk_info_.rowid_type.ToString().c_str());
 		} else {
-			// Table has no PK - rowid not supported
+			// Table has no PK - rowid not supported; rung 3 keys it by every column
 			catalog_bind_data->rowid_requested = false;
+			catalog_bind_data->keyless_key = UsesKeylessKey();
 			MSSQL_TE_DEBUG("GetScanFunction: %s.%s has no PK (rowid not supported)", mssql_schema.name.c_str(),
 						   name.c_str());
 		}
@@ -215,7 +218,7 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 	// duckdb_tables() listing waited mssql_acquire_timeout for it (issue #380) --
 	// and write the shared statistics cache from inside a transaction.
 	if (!context.transaction.IsAutoCommit()) {
-		info.cardinality = approx_row_count_;
+		info.cardinality = approx_row_count_.load(std::memory_order_relaxed);
 		return info;
 	}
 
@@ -243,14 +246,15 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 			}
 			pool.Release(std::move(connection));
 		} else {
-			info.cardinality = approx_row_count_;
+			info.cardinality = approx_row_count_.load(std::memory_order_relaxed);
 			MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (cached, no connection)",
-						   mssql_schema.name.c_str(), name.c_str(), (unsigned long long)approx_row_count_);
+						   mssql_schema.name.c_str(), name.c_str(),
+						   (unsigned long long)approx_row_count_.load(std::memory_order_relaxed));
 		}
 	} catch (...) {
-		info.cardinality = approx_row_count_;
+		info.cardinality = approx_row_count_.load(std::memory_order_relaxed);
 		MSSQL_TE_DEBUG("GetStorageInfo: table=%s.%s cardinality=%llu (cached, exception)", mssql_schema.name.c_str(),
-					   name.c_str(), (unsigned long long)approx_row_count_);
+					   name.c_str(), (unsigned long long)approx_row_count_.load(std::memory_order_relaxed));
 	}
 
 	return info;
@@ -266,9 +270,10 @@ void MSSQLTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, Log
 	//
 	MSSQL_TE_DEBUG("BindUpdateConstraints: ensuring PK loaded for %s.%s", schema.name.c_str(), name.c_str());
 
-	if (!pk_info_.exists) {
+	if (!pk_info_.exists && !UsesKeylessKey()) {
 		throw BinderException(pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(),
-													"UPDATE/DELETE", catalog.GetName().GetIdentifierName()));
+													"UPDATE/DELETE", catalog.GetName().GetIdentifierName()) +
+							  KeylessSuffix());
 	}
 
 	MSSQL_TE_DEBUG("BindUpdateConstraints: PK loaded, %zu columns, type=%s", pk_info_.columns.size(),
@@ -287,8 +292,27 @@ MSSQLObjectType MSSQLTableEntry::GetObjectType() const {
 	return object_type_;
 }
 
+void MSSQLTableEntry::NoteRowsDeleted(idx_t rows) {
+	if (rows == 0) {
+		return;
+	}
+	auto &statistics = GetMSSQLCatalog().GetStatisticsProvider();
+	auto current = approx_row_count_.load(std::memory_order_relaxed);
+	if (current == 0) {
+		// 0 is "unknown" (a view, Fabric, no VIEW DATABASE STATE): the planner
+		// then asks the statistics cache, whose count is stale now too.
+		statistics.InvalidateTable(schema.name.GetIdentifierName(), name.GetIdentifierName());
+		return;
+	}
+	idx_t next;
+	do {
+		next = current > rows + 1 ? current - rows : 1;
+	} while (!approx_row_count_.compare_exchange_weak(current, next, std::memory_order_relaxed));
+	statistics.InvalidateTable(schema.name.GetIdentifierName(), name.GetIdentifierName());
+}
+
 idx_t MSSQLTableEntry::GetApproxRowCount() const {
-	return approx_row_count_;
+	return approx_row_count_.load(std::memory_order_relaxed);
 }
 
 MSSQLCatalog &MSSQLTableEntry::GetMSSQLCatalog() {
@@ -328,6 +352,10 @@ bool MSSQLTableEntry::HasPrimaryKey(ClientContext &context) {
 }
 
 const mssql::RowIdKeyInfo &MSSQLTableEntry::GetPrimaryKeyInfo(ClientContext &context) {
+	// Every load that publishes columns carries the key (spec 084 D5); an entry
+	// without it would answer "no key" here (review of #423: the assertion
+	// lived in EnsurePKLoaded, removed in spec 080 PR 1).
+	D_ASSERT(pk_loaded_.load(std::memory_order_acquire));
 	return pk_info_;
 }
 
@@ -356,6 +384,15 @@ virtual_column_map_t MSSQLTableEntry::GetVirtualColumns() const {
 	}
 
 	if (!pk_info_.exists) {
+		// Spec 080 D3, rung 3: no rowid, but the hidden key columns
+		// GetRowIdColumns names, one per physical column, typed as the scan reads
+		// them (the entry's own column types, spec 060).
+		if (UsesKeylessKey()) {
+			for (auto &col : columns_.Physical()) {
+				result.insert(
+					make_pair(mssql::KeylessKeyColumn(col.Physical().index), TableColumn(col.Name(), col.Type())));
+			}
+		}
 		MSSQL_TE_DEBUG("GetVirtualColumns: %s has no PK, not exposing rowid", name.c_str());
 		return result;
 	}
@@ -393,11 +430,61 @@ vector<column_t> MSSQLTableEntry::GetRowIdColumns() const {
 							  schema.name.c_str(), name.c_str());
 	}
 	if (!pk_info_.exists) {
-		throw BinderException(pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(),
-													"UPDATE/DELETE", catalog.GetName().GetIdentifierName()));
+		if (!UsesKeylessKey()) {
+			throw BinderException(pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(),
+														"UPDATE/DELETE", catalog.GetName().GetIdentifierName()) +
+								  KeylessSuffix());
+		}
+		// Rung 3: every column, in table order, as hidden virtual columns
+		// (catalog/mssql_keyless_key.hpp); the operator finds them as the last
+		// columns of its chunk.
+		vector<column_t> key_columns;
+		for (auto &col : columns_.Physical()) {
+			key_columns.push_back(mssql::KeylessKeyColumn(col.Physical().index));
+		}
+		return key_columns;
 	}
 
 	return TableCatalogEntry::GetRowIdColumns();
+}
+
+string MSSQLTableEntry::KeylessKeyRefusal() const {
+	if (object_type_ == MSSQLObjectType::VIEW) {
+		return "A view has no key.";
+	}
+	if (!pk_loaded_.load(std::memory_order_acquire) || pk_info_.exists) {
+		return "";
+	}
+	const auto caps = catalog.Cast<MSSQLCatalog>().GetDmlCapabilities();
+	if (!caps.keyless_dml) {
+		return caps.platform == mssql::DmlPlatform::Fabric
+				   ? "Keying a table by all its columns is not available on Fabric Warehouse yet."
+				   : "Keying a table by all its columns is not available on this platform.";
+	}
+	for (const auto &col : mssql_columns_) {
+		switch (mssql::IsRoundTripExactForKey(col.sql_type_name, col.scale, col.is_cast_required)) {
+		case mssql::KeyFidelity::Exact:
+			break;
+		case mssql::KeyFidelity::NotRead:
+			return "It cannot be keyed by all its columns either: column '" + col.name + "' has type " +
+				   col.sql_type_name + ", which the catalog does not read in a form that identifies a row.";
+		case mssql::KeyFidelity::NotRoundTrip:
+			return "It cannot be keyed by all its columns either: column '" + col.name + "' has type " +
+				   mssql::SpelledKeyType(col.sql_type_name, col.scale) +
+				   ", whose value does not survive the round trip through DuckDB (see issue #358).";
+		}
+	}
+	return "";
+}
+
+string MSSQLTableEntry::KeylessSuffix() const {
+	const auto why = KeylessKeyRefusal();
+	return why.empty() ? string() : " " + why;
+}
+
+bool MSSQLTableEntry::UsesKeylessKey() const {
+	return object_type_ != MSSQLObjectType::VIEW && pk_loaded_.load(std::memory_order_acquire) && !pk_info_.exists &&
+		   KeylessKeyRefusal().empty();
 }
 
 }  // namespace duckdb

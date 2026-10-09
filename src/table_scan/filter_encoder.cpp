@@ -133,6 +133,33 @@ std::string FilterEncoder::DeclarationForColumn(const MSSQLColumnInfo &column, c
 	return ExpressionVocabulary::DeclarationForColumn(column, value, type);
 }
 
+//! #358: a rowid key value against a DATETIME key column, compared in the
+//! column's own type. A datetime holds 1/300 s ticks; compared with a
+//! datetime2 it is converted more precisely than any value read back can
+//! match (200 of 603 matched), while converted to datetime the value lands on
+//! its tick (603 of 603) -- the UPDATE / DELETE key join's rule
+//! (PKColumnInfo::KeyComparand). Equality only: a range against a constant
+//! between two ticks would round it and move the boundary, so the general
+//! filter path keeps comparing as datetime2.
+static std::string DatetimeKeyEquality(const Value &value, const LogicalType &type, const ExpressionEncodeContext &ctx,
+									   const MSSQLColumnInfo &peer) {
+	auto literal = ExpressionVocabulary::ValueToSQLLiteral(value, type);
+	if (ctx.params && !value.IsNull() && ctx.params->params.size() < SqlParamSet::MAX_PARAMS) {
+		return "@" + ctx.params->Add("datetime", literal, value);
+	}
+	return "CAST(CAST(" + literal + " AS datetime2(7)) AS datetime)";
+}
+
+//! A rowid key component's constant: a DATETIME key in its own type, any
+//! other through EncodeConstantValue.
+static std::string EncodeKeyConstant(const Value &value, const LogicalType &type, const ExpressionEncodeContext &ctx,
+									 const MSSQLColumnInfo *peer) {
+	if (peer && StringUtil::Lower(peer->sql_type_name) == "datetime") {
+		return DatetimeKeyEquality(value, type, ctx, *peer);
+	}
+	return FilterEncoder::EncodeConstantValue(value, type, ctx, peer);
+}
+
 std::string FilterEncoder::EncodeConstantValue(const Value &value, const LogicalType &type,
 											   const ExpressionEncodeContext &ctx, const MSSQLColumnInfo *peer) {
 	const size_t before = ctx.params ? ctx.params->params.size() : 0;
@@ -1106,8 +1133,8 @@ ExpressionEncodeResult FilterEncoder::EncodeRowidEquality(const Expression &valu
 			}
 			sql += mssql::QuoteIdentifier((*ctx.pk_column_names)[i]);
 			sql += " = ";
-			sql += EncodeConstantValue(children[i], (*ctx.pk_column_types)[i], ctx,
-									   ColumnInfoByName((*ctx.pk_column_names)[i], ctx));
+			sql += EncodeKeyConstant(children[i], (*ctx.pk_column_types)[i], ctx,
+									 ColumnInfoByName((*ctx.pk_column_names)[i], ctx));
 		}
 		sql += ")";
 		MSSQL_FILTER_DEBUG_LOG(2, "EncodeRowidEquality: composite PK -> %s", sql.c_str());
@@ -1116,8 +1143,8 @@ ExpressionEncodeResult FilterEncoder::EncodeRowidEquality(const Expression &valu
 		// Scalar PK: rowid = value
 		std::string sql = mssql::QuoteIdentifier((*ctx.pk_column_names)[0]);
 		sql += " = ";
-		sql += EncodeConstantValue(const_expr.GetValue(), (*ctx.pk_column_types)[0], ctx,
-								   ColumnInfoByName((*ctx.pk_column_names)[0], ctx));
+		sql += EncodeKeyConstant(const_expr.GetValue(), (*ctx.pk_column_types)[0], ctx,
+								 ColumnInfoByName((*ctx.pk_column_names)[0], ctx));
 		MSSQL_FILTER_DEBUG_LOG(2, "EncodeRowidEquality: scalar PK -> %s", sql.c_str());
 		return {sql, true};
 	}

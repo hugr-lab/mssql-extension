@@ -37,6 +37,10 @@ MSSQLDMLConfig LoadDMLConfig(ClientContext &context) {
 		config.max_parameters = static_cast<idx_t>(val.GetValue<int64_t>());
 	}
 
+	if (context.TryGetCurrentSetting("mssql_dml_stage_threshold", val)) {
+		config.stage_threshold = static_cast<idx_t>(val.GetValue<int64_t>());
+	}
+
 	// Validate loaded config
 	config.Validate();
 

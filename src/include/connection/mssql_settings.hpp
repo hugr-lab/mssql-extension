@@ -77,6 +77,8 @@ int64_t LoadTestFailMetadataAfterRows(ClientContext &context);
 //! TEST ONLY (issues #323, #344): tokens after which a DML response parser is
 //! put into Error, as a desync would. 0 = off.
 int64_t LoadTestFailParseAfterTokens(ClientContext &context);
+//! Spec 080 D3: mssql_test_force_intersect_join_form (test only).
+bool LoadTestForceIntersectJoinForm(ClientContext &context);
 
 //! Spec 076: pushed filter constants as sp_executesql parameters (default true).
 bool LoadScanParameterizeFilters(ClientContext &context);

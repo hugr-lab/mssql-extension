@@ -18,6 +18,10 @@ constexpr idx_t MSSQL_DEFAULT_DML_BATCH_SIZE = 500;
 // SQL Server limit is approximately 2100, we use 2000 for safety margin
 constexpr idx_t MSSQL_DEFAULT_DML_MAX_PARAMETERS = 2000;
 
+// Spec 080 D3: rows up to which a keyed UPDATE / DELETE goes as VALUES-join
+// statements; past it, through #stage. The shape of mssql_insert_bcp_threshold.
+constexpr idx_t MSSQL_DEFAULT_DML_STAGE_THRESHOLD = 1000;
+
 // Default: use prepared statements for DML operations
 constexpr bool MSSQL_DEFAULT_DML_USE_PREPARED = true;
 
@@ -41,6 +45,10 @@ struct MSSQLDMLConfig {
 	//! holding the connection mid-sink would starve the others. Set by
 	//! MSSQLCatalog::PlanMergeInto; a plain UPDATE / DELETE sends as it goes.
 	bool defer_to_finalize = false;
+
+	//! Spec 080 D3: mssql_dml_stage_threshold. Rows are counted as they arrive,
+	//! never estimated; 0 stages every statement.
+	idx_t stage_threshold = MSSQL_DEFAULT_DML_STAGE_THRESHOLD;
 
 	//===----------------------------------------------------------------------===//
 	// Effective Batch Size Calculation

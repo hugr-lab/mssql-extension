@@ -1,0 +1,261 @@
+# name: test/sql/dml/keyed_staged_dml.test
+# description: UPDATE / DELETE on a keyed table past mssql_dml_stage_threshold go through #stage and one JOIN statement (spec 080 D3, rungs 1-2)
+# group: [dml]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ks (TYPE mssql);
+
+# --- crossing the threshold: the held rows go into the stage first -----------
+
+statement ok
+SELECT mssql_exec('ks', 'DROP TABLE IF EXISTS dbo.ks_int; CREATE TABLE dbo.ks_int (id int NOT NULL PRIMARY KEY, v int NOT NULL); INSERT INTO dbo.ks_int SELECT TOP (3000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), 0 FROM sys.all_objects a CROSS JOIN sys.all_objects b');
+
+statement ok
+SET mssql_dml_stage_threshold = 100;
+
+# 50 rows: under the threshold, VALUES-join statements
+query I
+UPDATE ks.dbo.ks_int SET v = 1 WHERE id <= 50;
+----
+50
+
+# 2500 rows: past it, the stage
+query I
+UPDATE ks.dbo.ks_int SET v = v + 2 WHERE id > 500;
+----
+2500
+
+query III
+SELECT count(*) FILTER (WHERE v = 1), count(*) FILTER (WHERE v = 2), count(*) FILTER (WHERE v = 0) FROM ks.dbo.ks_int;
+----
+50	2500	450
+
+query I
+DELETE FROM ks.dbo.ks_int WHERE id > 1000;
+----
+2000
+
+query I
+SELECT count(*) FROM ks.dbo.ks_int;
+----
+1000
+
+# The planner's estimate follows an autocommit DELETE (spec 080 W3): it was the
+# 3000 rows the table was loaded with.
+query II
+EXPLAIN SELECT id FROM ks.dbo.ks_int;
+----
+physical_plan	<REGEX>:.*~1[,.]?000 rows.*
+
+# The same on the VALUES-join path (10 rows, under the threshold).
+query I
+DELETE FROM ks.dbo.ks_int WHERE id > 990;
+----
+10
+
+query II
+EXPLAIN SELECT id FROM ks.dbo.ks_int;
+----
+physical_plan	<REGEX>:.*~990 rows.*
+
+# Exactly the threshold stays on the statements; one more stages. Both write.
+query I
+UPDATE ks.dbo.ks_int SET v = 7 WHERE id <= 100;
+----
+100
+
+query I
+UPDATE ks.dbo.ks_int SET v = 8 WHERE id <= 101;
+----
+101
+
+# 0 stages every statement, one row included.
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+query I
+UPDATE ks.dbo.ks_int SET v = 9 WHERE id = 1;
+----
+1
+
+query II
+SELECT id, v FROM ks.dbo.ks_int WHERE id IN (1, 2, 101, 102) ORDER BY id;
+----
+1	9
+2	8
+101	8
+102	0
+
+# --- a composite key: the rowid is a STRUCT of the key columns ---------------
+
+statement ok
+SELECT mssql_exec('ks', 'DROP TABLE IF EXISTS dbo.ks_comp; CREATE TABLE dbo.ks_comp (a int NOT NULL, b nvarchar(10) NOT NULL, v int NULL, PRIMARY KEY (a, b)); INSERT INTO dbo.ks_comp VALUES (1, N''x'', 0), (1, N''y'', 0), (2, N''x'', 0)');
+
+query I
+UPDATE ks.dbo.ks_comp SET v = 5 WHERE b = 'x';
+----
+2
+
+query I
+DELETE FROM ks.dbo.ks_comp WHERE a = 1 AND b = 'y';
+----
+1
+
+query III
+SELECT a, b, v FROM ks.dbo.ks_comp ORDER BY a, b;
+----
+1	x	5
+2	x	5
+
+# --- a varchar key under a SQL_ collation: 'Strasse' and 'Strasse' with an
+# eszett are two keys to the index; the stage is typed like the column, so a
+# DELETE of one never takes the other (#350's case on the VALUES path) --------
+
+statement ok
+SELECT mssql_exec('ks', 'DROP TABLE IF EXISTS dbo.ks_sql; CREATE TABLE dbo.ks_sql (k varchar(20) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL PRIMARY KEY, v int NOT NULL); INSERT INTO dbo.ks_sql VALUES (''Strasse'', 1), (''Stra'' + CHAR(223) + ''e'', 2)');
+
+query I
+DELETE FROM ks.dbo.ks_sql WHERE v = 1;
+----
+1
+
+# and the non-ASCII key goes through the stage's code page as well
+query I
+DELETE FROM ks.dbo.ks_sql WHERE v = 2;
+----
+1
+
+query I
+SELECT count(*) FROM ks.dbo.ks_sql;
+----
+0
+
+# --- rung 2: a unique index; uniqueidentifier and datetime2 keys -------------
+
+statement ok
+SELECT mssql_exec('ks', 'DROP TABLE IF EXISTS dbo.ks_ux; CREATE TABLE dbo.ks_ux (g uniqueidentifier NOT NULL, ts datetime2(7) NOT NULL, v int NULL); CREATE UNIQUE INDEX ux_ks_ux ON dbo.ks_ux (g, ts); INSERT INTO dbo.ks_ux VALUES (''6F9619FF-8B86-D011-B42D-00C04FC964FF'', ''2024-01-01 10:00:00.1234567'', 0), (''7F9619FF-8B86-D011-B42D-00C04FC964FF'', ''2024-01-01 10:00:00.1234568'', 0)');
+
+query I
+UPDATE ks.dbo.ks_ux SET v = 3 WHERE v = 0;
+----
+2
+
+query I
+DELETE FROM ks.dbo.ks_ux WHERE ts > '2024-01-01 10:00:00.1234567'::TIMESTAMP_NS;
+----
+1
+
+query II
+SELECT g, v FROM ks.dbo.ks_ux;
+----
+6f9619ff-8b86-d011-b42d-00c04fc964ff	3
+
+# --- char(n) and varbinary keys ---------------------------------------------
+
+statement ok
+SELECT mssql_exec('ks', 'DROP TABLE IF EXISTS dbo.ks_bin; CREATE TABLE dbo.ks_bin (c char(4) NOT NULL, b varbinary(8) NOT NULL, v int NULL, PRIMARY KEY (c, b)); INSERT INTO dbo.ks_bin VALUES (''ab'', 0x0102, 0), (''ab'', 0x0103, 0), (''abc'', 0x01, 0)');
+
+query I
+UPDATE ks.dbo.ks_bin SET v = 1 WHERE b = '\x01\x02'::BLOB;
+----
+1
+
+query I
+DELETE FROM ks.dbo.ks_bin WHERE c = 'ab';
+----
+2
+
+query III
+SELECT rtrim(c), b, v FROM ks.dbo.ks_bin;
+----
+abc	\x01	0
+
+# --- a geometry SET cannot go through INSERT BULK: past the threshold the
+# statement keeps the VALUES path, which renders the value (#352) -------------
+
+statement ok
+SELECT mssql_exec('ks', 'DROP TABLE IF EXISTS dbo.ks_geo; CREATE TABLE dbo.ks_geo (id int NOT NULL PRIMARY KEY, g geometry NULL); INSERT INTO dbo.ks_geo (id) SELECT TOP (5) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects; UPDATE dbo.ks_geo SET g = geometry::Point(1, 2, 0) WHERE id = 1');
+
+query I
+UPDATE ks.dbo.ks_geo SET g = (SELECT g FROM ks.dbo.ks_geo WHERE id = 1) WHERE id > 1;
+----
+4
+
+query I
+SELECT * FROM mssql_scan('ks', 'SELECT COUNT(*) AS c FROM dbo.ks_geo WHERE g.STX = 1');
+----
+5
+
+# --- a datetime key matched in the column's own type (#358): every value read
+# back finds its row, through the stage, the VALUES join and `rowid =` (as a
+# parameter and as a literal) ------------------------------------------------
+
+statement ok
+SELECT mssql_exec('ks', 'DROP TABLE IF EXISTS dbo.ks_dt; CREATE TABLE dbo.ks_dt (k datetime NOT NULL PRIMARY KEY, v int NULL); INSERT INTO dbo.ks_dt VALUES (''2026-01-01 10:00:00.003'', 0), (''2026-01-01 10:00:00.007'', 0), (''2026-01-01 10:00:00.010'', 0)');
+
+query I
+SELECT count(*) FROM ks.dbo.ks_dt a JOIN ks.dbo.ks_dt b ON a.k = b.k;
+----
+3
+
+query I
+SELECT count(*) FROM ks.dbo.ks_dt WHERE rowid = (SELECT min(rowid) FROM ks.dbo.ks_dt);
+----
+1
+
+statement ok
+SET mssql_scan_parameterize_filters = false;
+
+query I
+SELECT count(*) FROM ks.dbo.ks_dt WHERE rowid = (SELECT max(rowid) FROM ks.dbo.ks_dt WHERE v = 0);
+----
+1
+
+statement ok
+RESET mssql_scan_parameterize_filters;
+
+query I
+UPDATE ks.dbo.ks_dt SET v = 1;
+----
+3
+
+# --- a SET of a key column stays refused on rungs 1-2 ------------------------
+
+statement error
+UPDATE ks.dbo.ks_int SET id = id + 10000 WHERE id = 5;
+----
+Updating rowid key columns is not supported
+
+# --- in a transaction, on the pinned connection -----------------------------
+
+statement ok
+BEGIN;
+
+query I
+UPDATE ks.dbo.ks_int SET v = 42;
+----
+990
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ks.dbo.ks_int WHERE v = 42;
+----
+0
+
+statement ok
+RESET mssql_dml_stage_threshold;
+
+statement ok
+SELECT mssql_exec('ks', 'DROP TABLE dbo.ks_int; DROP TABLE dbo.ks_comp; DROP TABLE dbo.ks_sql; DROP TABLE dbo.ks_ux; DROP TABLE dbo.ks_bin; DROP TABLE dbo.ks_geo; DROP TABLE dbo.ks_dt');
+
+statement ok
+DETACH ks;

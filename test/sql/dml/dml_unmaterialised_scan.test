@@ -1,0 +1,86 @@
+# name: test/sql/dml/dml_unmaterialised_scan.test
+# description: With the extension's optimizer disabled the scan feeding a DML in a transaction is not materialised; the statement holds its rows until Finalize instead of sending while the scan streams (review of #423)
+# group: [dml]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# MSSQLOptimizer materialises the scans that share a DML's connection (a
+# transaction's pinned one, a pool of one). DuckDB skips it under
+# `SET enable_optimizer = false`, so the scan streams on that connection while
+# the DML sinks. PlanUpdate / PlanDelete see the unflagged scan and hold the
+# rows until Finalize, after the scan drained -- as every DML did before spec
+# 080 PR 1 -- on the VALUES path, the #stage path and for a table with no key.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dus (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('dus', 'DROP TABLE IF EXISTS dbo.dus_t; CREATE TABLE dbo.dus_t (id int PRIMARY KEY, v int); INSERT INTO dbo.dus_t SELECT value, 0 FROM GENERATE_SERIES(1, 3000); DROP TABLE IF EXISTS dbo.dus_kl; CREATE TABLE dbo.dus_kl (id int NOT NULL, v int NULL); INSERT INTO dbo.dus_kl SELECT value, 0 FROM GENERATE_SERIES(1, 3000)');
+
+statement ok
+SET enable_optimizer = false;
+
+# With the optimizer off no filter reaches the scan, so on a table with no key
+# a WHERE is refused by name (rung 3 needs the server to select the rows).
+statement error
+UPDATE dus.dbo.dus_kl SET v = 2 WHERE id <= 1500;
+----
+its rows are selected on the client
+
+statement ok
+BEGIN;
+
+# Past one batch (500 rows) and past the stage threshold (1000).
+query I
+UPDATE dus.dbo.dus_t SET v = 1 WHERE id <= 2000;
+----
+2000
+
+query I
+DELETE FROM dus.dbo.dus_t WHERE id > 2500;
+----
+500
+
+# A table with no key, through #stage; the whole table (see above for a WHERE).
+query I
+UPDATE dus.dbo.dus_kl SET v = 2;
+----
+3000
+
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+query I
+UPDATE dus.dbo.dus_t SET v = 3 WHERE id <= 100;
+----
+100
+
+statement ok
+RESET mssql_dml_stage_threshold;
+
+statement ok
+COMMIT;
+
+statement ok
+RESET enable_optimizer;
+
+query III
+SELECT count(*), count(*) FILTER (WHERE v = 1), count(*) FILTER (WHERE v = 3) FROM dus.dbo.dus_t;
+----
+2500	1900	100
+
+query I
+SELECT count(*) FILTER (WHERE v = 2) FROM dus.dbo.dus_kl;
+----
+3000
+
+statement ok
+SELECT mssql_exec('dus', 'DROP TABLE dbo.dus_t; DROP TABLE dbo.dus_kl');
+
+statement ok
+DETACH dus;

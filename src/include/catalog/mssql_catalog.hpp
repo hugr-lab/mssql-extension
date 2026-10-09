@@ -13,6 +13,7 @@
 #include "catalog/mssql_metadata_cache.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "catalog/mssql_table_options.hpp"
+#include "dml/mssql_dml_capabilities.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/storage/storage_extension.hpp"
@@ -333,6 +334,11 @@ public:
 	// Get database default collation
 	const string &GetDatabaseCollation() const;
 
+	//! Spec 080 D0: the DML forms this server takes. The platform is the host
+	//! test's; EngineEdition / ProductMajorVersion (read at ATTACH with the
+	//! collation, -1 when unread) decide only IS NOT DISTINCT FROM.
+	mssql::DmlCapabilities GetDmlCapabilities() const;
+
 	//! Did this server grant the LOGIN7 UTF8SUPPORT feature (issue #225)?
 	//! Every connection in the pool asks for the same thing, so one observation
 	//! answers for all of them; it is taken from an already-logged-in pooled
@@ -594,6 +600,10 @@ private:
 	//! (issue #331): 0 OFF, 1 ON, 2/3 in transition; -1 when the probe did not
 	//! run (catalog false, no connection) or the row was not visible.
 	int32_t snapshot_isolation_state_ = -1;
+	//! SERVERPROPERTY('EngineEdition') / ('ProductMajorVersion'), read with the
+	//! collation at ATTACH (spec 080 D0); -1 when not read.
+	int32_t engine_edition_ = -1;
+	int32_t product_major_version_ = -1;
 	string database_collation_;	 // Database default collation
 	string default_schema_;		 // Default schema: `default_schema` option, else "dbo"
 	// Spec 052 (Option D): shared_ptr ownership for schema entries. The bind-

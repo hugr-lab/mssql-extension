@@ -44,6 +44,17 @@ namespace duckdb {
 static const char *DATABASE_COLLATION_SQL =
 	"SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)) AS db_collation, "
 	"CAST(COLLATIONPROPERTY(CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)), 'CodePage') AS INT) "
+	"AS code_page, "
+	// Spec 080 D0: whether the server has IS NOT DISTINCT FROM. Always present,
+	// so the snapshot column below stays at a fixed position.
+	"CAST(SERVERPROPERTY('EngineEdition') AS INT) AS engine_edition, "
+	"TRY_CAST(CAST(SERVERPROPERTY('ProductMajorVersion') AS NVARCHAR(16)) AS INT) AS product_major_version";
+
+// The query before spec 080, the fallback when the one above fails: a platform
+// that refuses a server property must not fail an ATTACH or lose the collation.
+static const char *DATABASE_COLLATION_PLAIN_SQL =
+	"SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)) AS db_collation, "
+	"CAST(COLLATIONPROPERTY(CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)), 'CodePage') AS INT) "
 	"AS code_page";
 
 // Issue #331: whether SNAPSHOT isolation is allowed here, appended to the
@@ -466,42 +477,53 @@ void MSSQLCatalog::QueryDatabaseCollation() {
 		int32_t code_page = 0;
 		// The snapshot probe rides along only when the answer is used: `snapshot`
 		// (refused at ATTACH when OFF) or `auto`, and not on Fabric or Synapse,
-		// where neither consults it. Everyone else's ATTACH query is unchanged,
-		// so a platform whose sys.databases lacks the column or the row cannot
-		// fail an ATTACH that never asked about isolation.
+		// where neither consults it. Everyone else's ATTACH query carries no
+		// sys.databases read, so a platform whose sys.databases lacks the column
+		// or the row cannot fail an ATTACH that never asked about isolation.
 		const auto &level = connection_info_->transaction_isolation;
 		const bool probe_snapshot = (level == "snapshot" || level == "auto") && !connection_info_->IsFabricEndpoint() &&
 									!connection_info_->IsSynapseEndpoint();
+		auto read_int = [](const std::vector<std::string> &values, size_t i, int32_t fallback) -> int32_t {
+			if (values.size() <= i || values[i].empty()) {
+				return fallback;
+			}
+			try {
+				return static_cast<int32_t>(std::stoi(values[i]));
+			} catch (...) {
+				return fallback;
+			}
+		};
 		auto run = [&](const string &sql) {
 			collation.clear();
 			code_page = 0;
 			snapshot_isolation_state_ = -1;
+			engine_edition_ = -1;
+			product_major_version_ = -1;
+			// Positions: the plain query has 0-1, the D0 query adds 2-3, the
+			// snapshot column is 4. A query without a column leaves it unread.
 			return MSSQLSimpleQuery::ExecuteWithCallback(*connection, sql, [&](const std::vector<std::string> &values) {
 				if (!values.empty()) {
 					collation = values[0];
 				}
-				if (values.size() > 1 && !values[1].empty()) {
-					try {
-						code_page = std::stoi(values[1]);
-					} catch (...) {
-						code_page = 0;
-					}
-				}
-				if (values.size() > 2 && !values[2].empty()) {
-					try {
-						snapshot_isolation_state_ = std::stoi(values[2]);
-					} catch (...) {
-						snapshot_isolation_state_ = -1;
-					}
-				}
+				code_page = read_int(values, 1, 0);
+				engine_edition_ = read_int(values, 2, -1);
+				product_major_version_ = read_int(values, 3, -1);
+				snapshot_isolation_state_ = read_int(values, 4, -1);
 				return true;  // one row; keep the stream drained
 			});
 		};
 		// A failed probe must not take the collation and code page with it (review
-		// of #381): the plain query again, the snapshot state left unknown, which
-		// `auto` treats as "send nothing".
-		if (!probe_snapshot || !run(string(DATABASE_COLLATION_SQL) + SNAPSHOT_STATE_COLUMN).success) {
-			run(DATABASE_COLLATION_SQL);
+		// of #381), nor the server properties with the snapshot column: each
+		// failure drops one step, and what is left unread stays unknown -- `auto`
+		// then sends nothing, and rung 3 takes the INTERSECT form, which is
+		// correct everywhere. A server error leaves the connection Idle for the
+		// next step; a broken connection fails them all, as before.
+		bool done = probe_snapshot && run(string(DATABASE_COLLATION_SQL) + SNAPSHOT_STATE_COLUMN).success;
+		if (!done) {
+			done = run(DATABASE_COLLATION_SQL).success;
+		}
+		if (!done) {
+			run(DATABASE_COLLATION_PLAIN_SQL);
 		}
 
 		if (!collation.empty()) {
@@ -940,6 +962,16 @@ MSSQLStatisticsProvider &MSSQLCatalog::GetStatisticsProvider() {
 
 const string &MSSQLCatalog::GetDatabaseCollation() const {
 	return database_collation_;
+}
+
+mssql::DmlCapabilities MSSQLCatalog::GetDmlCapabilities() const {
+	auto platform = mssql::DmlPlatform::SqlServer;
+	if (connection_info_ && connection_info_->IsFabricEndpoint()) {
+		platform = mssql::DmlPlatform::Fabric;
+	} else if (connection_info_ && connection_info_->IsSynapseEndpoint()) {
+		platform = mssql::DmlPlatform::Synapse;
+	}
+	return mssql::DmlCapabilities::Resolve(platform, engine_edition_, product_major_version_);
 }
 
 MSSQLCatalog::Utf8Support MSSQLCatalog::UTF8SupportState() {

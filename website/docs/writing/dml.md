@@ -149,7 +149,7 @@ check.
 
 ## UPDATE
 
-UPDATE operations are supported for tables with a primary key or a usable unique index. The extension uses rowid-based targeting for efficient updates.
+UPDATE runs on any table: keyed by its primary key or a usable unique index when it has one, and by all of its columns when it has neither (see [How UPDATE and DELETE reach the server](#how-update-and-delete-reach-the-server)).
 
 ### Basic UPDATE
 
@@ -172,20 +172,11 @@ SET name = 'John Doe', email = 'john@example.com', updated_at = NOW()
 WHERE id = 42;
 ```
 
-### Batch Configuration
-
-Large updates are automatically batched:
-
-```sql
--- Set batch size (default: 500)
-SET mssql_dml_batch_size = 500;
-```
-
 ### Limitations
 
-- **RETURNING clause is not supported** for UPDATE operations
-- Tables must have a **rowid key**: a primary key, or a unique index that is not filtered, not disabled, and whose key columns are all NOT NULL (a `BIGINT IDENTITY … UNIQUE` is the common shape). A primary key that cannot address a row — `DATETIME`, `TIME(7)`, `DATETIMEOFFSET(7)`, `SQL_VARIANT` — falls through to another unique index if there is one, and the refusal otherwise names every index it rejected and why
-- Updates use a single `UPDATE ... FROM target JOIN (VALUES ...)` statement per batch, joining on the rowid key (scalar or composite)
+- **RETURNING is not supported yet** for UPDATE; it is refused by name
+- A SET of a rowid key column is refused (on a table with no key, any column may be SET)
+- On Azure Synapse every UPDATE through the catalog is refused: its primary keys and unique constraints are `NOT ENFORCED`, so a key could match rows the statement did not select. Use `mssql_exec()`
 
 ## String comparisons and collation {#collation}
 
@@ -265,7 +256,7 @@ lands, the behaviour on this page is what applies.
 
 ## DELETE
 
-DELETE operations are supported for tables with a primary key or a usable unique index.
+DELETE runs on any table, keyed as for [UPDATE](#update).
 
 ### Basic DELETE
 
@@ -287,17 +278,74 @@ DELETE FROM sqlserver.dbo.order_items
 WHERE order_id IN (SELECT id FROM sqlserver.dbo.orders WHERE status = 'cancelled');
 ```
 
-### Batch Configuration
-
-Large deletes are automatically batched:
-
-```sql
--- Set batch size (default: 500)
-SET mssql_dml_batch_size = 500;
-```
-
 ### Limitations
 
-- **RETURNING clause is not supported** for DELETE operations
-- Tables must have a rowid key — a primary key or a usable unique index, as for UPDATE above
+- **RETURNING is not supported yet** for DELETE; it is refused by name
+- On Azure Synapse every DELETE through the catalog is refused, as for UPDATE
+
+## How UPDATE and DELETE reach the server
+
+DuckDB selects the rows (its WHERE, its joins); the extension sends what to
+change. How it says which rows depends on the table's key and the row count.
+
+**The key** is chosen per table:
+
+1. the **primary key**;
+2. else a **usable unique index**: not filtered, not disabled, every key column
+   NOT NULL;
+3. else **every column of the table** (a table with no key).
+
+A key column must read back exactly. `TIME(7)` and `DATETIMEOFFSET(7)` lose
+their 100 ns digit on read, and `SQL_VARIANT`, `HIERARCHYID`, CLR types,
+`XML`, `IMAGE`, `TEXT` / `NTEXT`, `GEOMETRY` / `GEOGRAPHY` are not read in a
+form that identifies a row. A primary key with such a column falls through to
+a unique index; a table with no usable key and such a column is refused by
+name, never with a statement that changes nothing. `DATETIME` keys are fine:
+they are compared in their own type.
+
+**The delivery:**
+
+- A table with a key, up to `mssql_dml_stage_threshold` rows (default 1000,
+  counted as they arrive): `UPDATE … FROM t JOIN (VALUES …)` statements, up to
+  `mssql_dml_batch_size` rows each, all in one server transaction.
+- Past the threshold, and always for a table with no key: the rows go into a
+  session temp table `#stage_<id>` by bulk load, and **one** statement joins
+  it to the table — `UPDATE t SET … FROM t JOIN #stage` / `DELETE t FROM t
+  JOIN #stage`. It is never split into batches: how much one statement writes
+  is up to the statement.
+
+```sql
+SET mssql_dml_stage_threshold = 0;      -- stage every UPDATE / DELETE
+SET mssql_dml_stage_threshold = 100000; -- VALUES statements up to 100k rows
+```
+
+Either way a statement is atomic: a failure rolls back everything it wrote.
+A staged statement also checks that the server found every row it staged, and
+fails before its commit if not, rather than reporting fewer rows. The stage
+lives in `tempdb` for the statement's length and holds the selected rows'
+key (and new) values.
+
+### A table with no key
+
+Every column is the key: a selected row is found again by being equal to
+it in every column (NULL equal to NULL, strings byte for byte). So:
+
+- **Rows identical in every column move together.** If a table holds two
+  identical rows and the statement selects one, both are updated or deleted,
+  and the count says 2. A key is the fix.
+- **The server must select the same rows as DuckDB.** The statement runs only
+  when its rows come from the table's own scan with every condition sent to the
+  server. It is refused by name otherwise: when part of its WHERE runs in
+  DuckDB (a string function such as `lower()`, a subquery — `IN (SELECT …)`,
+  `EXISTS (…)` — or any condition the scan cannot send), when it computes a
+  volatile function (`random()`, `gen_random_uuid()`), for `UPDATE … FROM` /
+  `DELETE … USING`, and for `MERGE INTO`. The way out is a key: a primary key or
+  a unique index makes all of these work.
+- **No concurrent writer is assumed.** The rows are read, then found again by
+  value in a second step. In autocommit another session can insert an equal row
+  between the two (it is then updated too) or change a selected one (it is then
+  not found, and the statement fails rather than report fewer rows). Run the
+  statement in a transaction with `transaction_isolation 'snapshot'` (or
+  `'repeatable_read'`) on the ATTACH when other sessions write the table.
+- `rowid` stays unavailable: there is no key to expose.
 

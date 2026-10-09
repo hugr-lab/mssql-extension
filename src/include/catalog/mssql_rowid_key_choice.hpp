@@ -91,26 +91,64 @@ inline std::string Lower(std::string s) {
 }
 
 //! The literal-cannot-match exclusion (issue #358), measured on every type of
-//! the family. `datetime` counts in 1/300 s ticks, and since compatibility
-//! level 130 a datetime compared with a datetime2 is converted more precisely
-//! than datetime2(7) can represent, so a value with a 1/300 s fraction
-//! (.003, .007 — most of them) equals no datetime2 literal at any precision:
-//! a rowid built on it finds no row and the UPDATE reports success and
-//! changes nothing. A value on a whole 10 ms matches, but a key is refused
-//! as a whole, not per value. `time(7)` and `datetimeoffset(7)` fail
-//! the other way round: the read path decodes them to DuckDB's microsecond
-//! TIME / TIMESTAMP_TZ, so a key whose 100 ns digit is set comes back
-//! truncated and the literal never matches (3 rows keyed on such values, 1
-//! updated — the one with a zero seventh digit). `smalldatetime` has no
-//! fraction and matches its datetime2 literal exactly; `datetime2(7)` reads as
-//! TIMESTAMP_NS and round-trips. Lifted when #358 renders these keys in their
-//! own type.
+//! the family. `time(7)` and `datetimeoffset(7)`: the read path decodes them
+//! to DuckDB's microsecond TIME / TIMESTAMP_TZ, so a key whose 100 ns digit is
+//! set comes back truncated and the literal never matches (3 rows keyed on
+//! such values, 1 updated — the one with a zero seventh digit); no conversion
+//! recovers the digit. `smalldatetime` has no fraction and matches its
+//! datetime2 literal exactly; `datetime2(7)` reads as TIMESTAMP_NS and
+//! round-trips.
+//!
+//! `datetime` is no longer here (spec 080 W3, #358). It counts in 1/300 s
+//! ticks, and compared with a datetime2 it is converted more precisely than
+//! datetime2(7) can represent, so a bare literal matched only the values on a
+//! whole 10 ms (200 of 603 measured). Converted to the column's own type first
+//! it lands on the stored tick: `CAST(CAST(lit AS datetime2(7)) AS datetime)`
+//! (PKColumnInfo::KeyComparand, the VALUES path) matched 603 of 603, and the
+//! value written into a datetime stage column by INSERT BULK (the #stage path)
+//! 603 of 603 -- every tick of two seconds and both ends of the range.
 inline bool IsLiteralMismatch(const std::string &type_name, uint8_t scale) {
 	const std::string t = Lower(type_name);
-	if (t == "datetime") {
-		return true;
-	}
 	return (t == "time" || t == "datetimeoffset") && scale == 7;
+}
+
+//! Spec 080 D3: whether a column's value, read into DuckDB and written back,
+//! still equals the stored value -- the question a key column must answer yes
+//! to, on rung 2 (a unique index) and on rung 3 (every column of a keyless
+//! table) alike, so a column one rung refuses by name the other can never
+//! silently mis-key into a 0-row UPDATE.
+enum class KeyFidelity : uint8_t {
+	Exact,		  //!< read losslessly, compares exactly
+	NotRead,	  //!< the catalog does not read its value (CAST, LOB, spatial)
+	NotRoundTrip  //!< read, but rounded: no literal matches it (#358)
+};
+
+//! cast_required: MSSQLColumnInfo::is_cast_required (sql_variant, hierarchyid,
+//! CLR UDTs -- read as NVARCHAR(MAX)). xml, image, text, ntext and the spatial
+//! types are named, because the catalog knows those types (no CAST flag) and
+//! still cannot match by them: xml / image / text / ntext do not compare, and
+//! a spatial value is read as WKB, not as the stored serialisation.
+inline KeyFidelity IsRoundTripExactForKey(const std::string &type_name, uint8_t scale, bool cast_required) {
+	if (cast_required) {
+		return KeyFidelity::NotRead;
+	}
+	const std::string t = Lower(type_name);
+	if (t == "xml" || t == "image" || t == "text" || t == "ntext" || t == "geometry" || t == "geography") {
+		return KeyFidelity::NotRead;
+	}
+	if (IsLiteralMismatch(type_name, scale)) {
+		return KeyFidelity::NotRoundTrip;
+	}
+	return KeyFidelity::Exact;
+}
+
+//! The type as a refusal spells it: `time(7)`, not `time`.
+inline std::string SpelledKeyType(const std::string &type_name, uint8_t scale) {
+	const std::string t = Lower(type_name);
+	if ((t == "time" || t == "datetimeoffset") && scale == 7) {
+		return type_name + "(7)";
+	}
+	return type_name;
 }
 
 //! Why this candidate cannot address a row. `reason` is empty when it can;
@@ -142,15 +180,16 @@ inline RowIdKeyRejection Unusable(const RowIdKeyCandidate &c) {
 		}
 	}
 	for (const auto &col : c.columns) {
-		if (col.cast_required) {
+		switch (IsRoundTripExactForKey(col.type_name, col.scale, col.cast_required)) {
+		case KeyFidelity::Exact:
+			break;
+		case KeyFidelity::NotRead:
 			r.reason = "its key column '" + col.name + "' has type " + col.type_name +
 					   ", which is read through a lossy CAST and cannot identify its row (see issue #354)";
 			r.unmatchable = true;
 			return r;
-		}
-		if (IsLiteralMismatch(col.type_name, col.scale)) {
-			const std::string spelled = col.type_name + (Lower(col.type_name) == "datetime" ? "" : "(7)");
-			r.reason = "its key column '" + col.name + "' has type " + spelled +
+		case KeyFidelity::NotRoundTrip:
+			r.reason = "its key column '" + col.name + "' has type " + SpelledKeyType(col.type_name, col.scale) +
 					   ", which no rowid literal can match (see issue #358)";
 			r.unmatchable = true;
 			return r;
@@ -192,6 +231,11 @@ inline bool Before(const RowIdKeyCandidate &a, const RowIdKeyCandidate &b) {
 }
 
 }  // namespace rowid_key_detail
+
+// Rung 3 (a keyless table keyed by every column) asks the same question.
+using rowid_key_detail::IsRoundTripExactForKey;
+using rowid_key_detail::KeyFidelity;
+using rowid_key_detail::SpelledKeyType;
 
 //! The choice. Step 1: the primary key, if usable. Steps 2-5 order the usable
 //! unique indexes; they order rather than filter, because duplicate indexes

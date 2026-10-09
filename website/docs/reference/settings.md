@@ -109,6 +109,7 @@ started it. See [INSERT](../writing/dml.md#two-paths-statements-and-bcp).
 | ---------------------------------- | ------- | -------- | ------ | ------------------------------------- |
 | `mssql_dml_batch_size`             | BIGINT  | 500      | ≥1     | Rows per UPDATE/DELETE batch          |
 | `mssql_dml_max_parameters`         | BIGINT  | 2000     | ≥1     | Max parameters per statement (~2100 limit) |
+| `mssql_dml_stage_threshold`        | BIGINT  | 1000     | ≥0     | Rows up to which an UPDATE/DELETE on a keyed table goes as VALUES statements; past it, through a `#stage` table and one statement (0 = always stage) |
 | `mssql_dml_use_prepared`           | BOOLEAN | true     | -      | Deprecated, no effect; removed in the next release |
 
 ### Usage Examples

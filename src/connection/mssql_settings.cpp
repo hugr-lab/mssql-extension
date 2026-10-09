@@ -149,6 +149,19 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "TEST ONLY: make a metadata query fail after this many rows (0 = off)",
 							  LogicalType::BIGINT, Value::BIGINT(0), ValidateNonNegative, SetScope::GLOBAL);
 
+	// mssql_test_force_intersect_join_form - TEST ONLY (spec 080 D3).
+	//
+	// A keyless (rung 3) UPDATE / DELETE matches its nullable columns with
+	// IS NOT DISTINCT FROM where the server has it (2022+, Azure SQL), and
+	// through EXISTS (... INTERSECT ...) everywhere else -- the default, and the
+	// only form correct on every server. The integration lane runs a server that
+	// takes the operator, so without this the INTERSECT form would never run in
+	// CI.
+	config.AddExtensionOption("mssql_test_force_intersect_join_form",
+							  "TEST ONLY: match a keyless UPDATE / DELETE through EXISTS (... INTERSECT ...) even "
+							  "where the server has IS NOT DISTINCT FROM",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
+
 	// mssql_test_fail_parse_after_tokens - TEST ONLY (issues #323, #344).
 	//
 	// Puts the TDS token parser of a DML response (INSERT batch, INSERT ...
@@ -339,6 +352,17 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption(
 		"mssql_dml_batch_size", "Maximum rows per UPDATE/DELETE batch (default: 500, affects parameter count)",
 		LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_DML_BATCH_SIZE), ValidatePositive, SetScope::GLOBAL);
+
+	// mssql_dml_stage_threshold - spec 080 D3. Rows up to which an UPDATE /
+	// DELETE on a keyed table goes as VALUES-join statements (rows counted as
+	// they arrive); past it the rows go into a session #stage by INSERT BULK and
+	// one UPDATE / DELETE ... JOIN #stage writes them. A keyless table always
+	// stages. 0 stages every statement.
+	config.AddExtensionOption("mssql_dml_stage_threshold",
+							  "Rows up to which an UPDATE/DELETE on a keyed table is sent as VALUES-join statements; "
+							  "past it the rows go through a #stage table (0 = always stage, default: 1000)",
+							  LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_DML_STAGE_THRESHOLD),
+							  ValidateNonNegative, SetScope::GLOBAL);
 
 	// mssql_dml_max_parameters - Maximum parameters per DML statement
 	// SQL Server limit is approximately 2100, we use 2000 for safety margin
@@ -644,6 +668,14 @@ bool LoadScanParameterizeFilters(ClientContext &context) {
 		return val.GetValue<bool>();
 	}
 	return true;
+}
+
+bool LoadTestForceIntersectJoinForm(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_test_force_intersect_join_form", val)) {
+		return val.GetValue<bool>();
+	}
+	return false;
 }
 
 int64_t LoadTestFailParseAfterTokens(ClientContext &context) {

@@ -84,6 +84,21 @@ public:
 	// instead of letting DuckDB's BindRowIdColumns() hit an internal assertion (issue #141).
 	vector<column_t> GetRowIdColumns() const override;
 
+	//! Spec 080 D3, rung 3: why this table cannot be keyed by every column, or
+	//! empty when it can (a base table with no usable key, on a platform that
+	//! takes keyless DML, whose every column round-trips exactly). Answerable
+	//! from the metadata alone; the statement-shape guards (a fully pushed
+	//! WHERE, no volatile function, no FROM / USING / MERGE) are plan time's.
+	string KeylessKeyRefusal() const;
+
+	//! Whether UPDATE / DELETE key this table by every column (rung 3).
+	bool UsesKeylessKey() const;
+
+private:
+	//! KeylessKeyRefusal() with a leading space, or empty.
+	string KeylessSuffix() const;
+
+public:
 	//===----------------------------------------------------------------------===//
 	// MSSQL-specific Accessors
 	//===----------------------------------------------------------------------===//
@@ -96,6 +111,12 @@ public:
 
 	// Get approximate row count
 	idx_t GetApproxRowCount() const;
+
+	//! Spec 080 W3: an autocommit DELETE through the catalog removed `rows`
+	//! rows; the planner's estimate follows (never down to 0, which reads as
+	//! "unknown"), and the statistics cache's count for the table is dropped.
+	//! Not called inside a transaction: the shared entry holds committed state.
+	void NoteRowsDeleted(idx_t rows);
 
 	//! Physical shape of the object (heap / clustered rowstore / clustered
 	//! columnstore), from the catalog's metadata query (spec 049). What the
@@ -142,8 +163,10 @@ private:
 
 	vector<MSSQLColumnInfo> mssql_columns_;	 // Column metadata with collation
 	MSSQLObjectType object_type_;			 // TABLE or VIEW
-	idx_t approx_row_count_;				 // Cardinality estimate
-	MSSQLIndexKind index_kind_;				 // Physical shape (spec 049)
+	//! Cardinality estimate; atomic since a DELETE adjusts it (spec 080 W3)
+	//! while other sessions plan against it.
+	std::atomic<idx_t> approx_row_count_;
+	MSSQLIndexKind index_kind_;	 // Physical shape (spec 049)
 
 	// The rowid key, set by the constructor from the metadata it is built from
 	// and never written again (spec 084 D5: every load that publishes a

@@ -37,10 +37,10 @@ CREATE TABLE blk_s.KeyPk (a int NOT NULL, b int NOT NULL, v int, CONSTRAINT pk_b
 INSERT INTO blk_s.KeyPk VALUES (1, 10, 100), (2, 20, 200);
 CREATE TABLE blk_s.KeyUq (id int NOT NULL, v int, CONSTRAINT uq_blk UNIQUE (id));
 INSERT INTO blk_s.KeyUq VALUES (5, 50);
-CREATE TABLE blk_s.KeyNone (v int);
-INSERT INTO blk_s.KeyNone VALUES (1);
-CREATE TABLE blk_s.KeyFallback (at datetime NOT NULL PRIMARY KEY, code int NOT NULL, v int, CONSTRAINT uq_blk_code UNIQUE (code));
-INSERT INTO blk_s.KeyFallback VALUES ('2024-01-02T03:04:05', 7, 70);
+CREATE TABLE blk_s.KeyNone (v int, doc xml);
+INSERT INTO blk_s.KeyNone (v) VALUES (1);
+CREATE TABLE blk_s.KeyFallback (at time(7) NOT NULL PRIMARY KEY, code int NOT NULL, v int, CONSTRAINT uq_blk_code UNIQUE (code));
+INSERT INTO blk_s.KeyFallback VALUES ('03:04:05.1234567', 7, 70);
 $$);
 
 # --- After a one-schema preload ---------------------------------------------
@@ -69,7 +69,7 @@ SELECT rowid, v FROM blk.blk_s.KeyUq;
 ----
 5	50
 
-# A datetime primary key is not usable (#358); the choice falls through to the
+# A time(7) primary key is not usable (#358); the choice falls through to the
 # unique int, over candidates the bulk load delivered (spec 077 W1).
 query II
 SELECT rowid, v FROM blk.blk_s.KeyFallback;

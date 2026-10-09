@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **UPDATE and DELETE on a table with no key** (spec 080, #140). A table with
+  no primary key and no usable unique index is keyed by all of its columns: the
+  selected rows go into a session `#stage` by bulk load and one
+  `UPDATE … JOIN #stage` / `DELETE … JOIN #stage` finds them again by value
+  (NULL equal to NULL, strings byte for byte). Rows identical in every column
+  move together, and the count includes them. Refused by name — never a
+  statement that changes nothing — when the server would not select the same
+  rows as DuckDB (part of the WHERE runs in DuckDB, a volatile function,
+  `UPDATE … FROM` / `DELETE … USING`, `MERGE INTO`), or when a column cannot
+  be a key (`xml`, spatial, `text`, `sql_variant`, `time(7)`, …).
+
+- **`mssql_dml_stage_threshold`** (default 1000, spec 080): an UPDATE / DELETE
+  on a keyed table with more rows than this goes through the same `#stage`,
+  as one statement, instead of `VALUES` statements of `mssql_dml_batch_size`
+  rows. 0 stages every statement.
+
 - **`native_types` ATTACH option**: `mssql_catalog_native_types` for one
   catalog, over the global setting. `ATTACH '…' AS meta (TYPE mssql,
   native_types false)` reports that catalog's bounded string columns as plain
@@ -269,6 +285,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **UPDATE and DELETE through the catalog are refused on Azure Synapse**
+  (spec 080): its primary keys and unique constraints are `NOT ENFORCED`, so a
+  key could match rows the statement did not select. `mssql_exec()` still
+  sends what you write. Synapse is recognised by its host name, or by
+  `SERVERPROPERTY('EngineEdition') = 6` behind any other name.
+
+- **A `DATETIME` key is a rowid key again** (spec 080, #358). On a table whose
+  primary key is `DATETIME` beside a usable unique index, `rowid` is now the
+  primary key, as for any other usable primary key.
+
 - **`mssql_dml_use_prepared` is deprecated** (spec 080): it was read by
   nothing. It stays registered, as a documented no-op, for one more release,
   so a `SET` of it in a `.duckdbrc` does not throw; it is removed in the
@@ -331,6 +357,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which used to be reserved up front.
 
 ### Fixed
+
+- **UPDATE / DELETE through a `DATETIME` key** (#358). A key value with a
+  1/300 s fraction (`.003`, `.007`, …) matched no literal, so the statement
+  reported success and changed nothing; since spec 077 such a key was refused.
+  The key is now compared in its own type —
+  `CAST(CAST(<literal> AS datetime2(7)) AS datetime)`, or a `datetime` stage
+  column — and lands on the stored tick: 603 of 603 values measured either
+  way, against 200 of 603 before. A `WHERE rowid = …` on such a table compares the same
+  way. (A plain `WHERE dt = …` filter on a `datetime` column still compares as
+  `datetime2`; #426.)
+
+- **The planner's row estimate follows a DELETE** (spec 080). After an
+  autocommit DELETE through the catalog the table's estimate drops by the rows
+  deleted, instead of keeping the count it was loaded with until
+  `mssql_invalidate_cache()`.
 
 - **UPDATE and DELETE on a pool of one connection in autocommit waited out
   `mssql_acquire_timeout`, and so did a MERGE** (spec 080 PR 1): the scan

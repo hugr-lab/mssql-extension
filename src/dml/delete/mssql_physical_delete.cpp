@@ -1,4 +1,7 @@
 #include "dml/delete/mssql_physical_delete.hpp"
+#include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_table_entry.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "dml/delete/mssql_delete_executor.hpp"
 #include "duckdb/common/exception.hpp"
 
@@ -22,8 +25,11 @@ SinkResultType MSSQLPhysicalDelete::Sink(ExecutionContext &context, DataChunk &c
 	auto &gstate = input.global_state.Cast<MSSQLDeleteGlobalSinkState>();
 	lock_guard<mutex> lock(gstate.mutex);
 
-	// Process the chunk through the executor
-	gstate.executor->Execute(chunk);
+	if (gstate.stage_switch) {
+		gstate.stage_switch->Sink(context.client, chunk);
+	} else {
+		gstate.executor->Execute(chunk);
+	}
 
 	return SinkResultType::NEED_MORE_INPUT;
 }
@@ -38,7 +44,14 @@ SinkFinalizeType MSSQLPhysicalDelete::Finalize(Pipeline &pipeline, Event &event,
 	auto &gstate = input.global_state.Cast<MSSQLDeleteGlobalSinkState>();
 	lock_guard<mutex> lock(gstate.mutex);
 
+	if (!gstate.finalized && gstate.stage_switch && gstate.stage_switch->IsStaged()) {
+		gstate.total_rows_deleted = gstate.stage_switch->FinalizeStaged(context);
+		gstate.finalized = true;
+	}
 	if (!gstate.finalized) {
+		if (gstate.stage_switch) {
+			gstate.stage_switch->Replay([&](DataChunk &held) { gstate.executor->Execute(held); });
+		}
 		auto result = gstate.executor->Finalize();
 		if (!result.success) {
 			throw IOException("%s", result.FormatError("DELETE"));
@@ -46,13 +59,22 @@ SinkFinalizeType MSSQLPhysicalDelete::Finalize(Pipeline &pipeline, Event &event,
 		gstate.total_rows_deleted = gstate.executor->GetTotalRowsDeleted();
 		gstate.batch_count = gstate.executor->GetBatchCount();
 		gstate.finalized = true;
+		// Spec 080 W3: the planner's estimate follows an autocommit DELETE (the
+		// staged path does the same in MSSQLStagedDml::Finalize).
+		if (table_entry_ && !ConnectionProvider::IsInTransaction(context, table_entry_->GetMSSQLCatalog())) {
+			table_entry_->NoteRowsDeleted(gstate.total_rows_deleted);
+		}
 	}
 
 	return SinkFinalizeType::READY;
 }
 
 unique_ptr<GlobalSinkState> MSSQLPhysicalDelete::GetGlobalSinkState(ClientContext &context) const {
-	return make_uniq<MSSQLDeleteGlobalSinkState>(context, target_, config_);
+	auto gstate = make_uniq<MSSQLDeleteGlobalSinkState>(context, target_, config_);
+	if (staged_target_ && !config_.defer_to_finalize) {
+		gstate->stage_switch = make_uniq<MSSQLStageSwitch>(*staged_target_, config_.stage_threshold);
+	}
+	return std::move(gstate);
 }
 
 unique_ptr<LocalSinkState> MSSQLPhysicalDelete::GetLocalSinkState(ExecutionContext &context) const {

@@ -124,6 +124,11 @@ PKColumnInfo PKColumnInfo::FromMetadata(const string &name, int32_t column_id, i
 		StringUtil::StartsWith(StringUtil::Lower(coll), "sql_")) {
 		info.key_compare_type = "varchar(" + (max_length < 0 ? string("max") : std::to_string(max_length)) + ")";
 	}
+	// #358: a datetime key matches its literal only in its own type (see
+	// rowid_key_detail::IsLiteralMismatch).
+	if (lower_type == "datetime") {
+		info.key_compare_type = "datetime";
+	}
 
 	MSSQL_PK_DEBUG("  PK column: name=%s ordinal=%d type=%s -> %s", name.c_str(), key_ordinal, type_name.c_str(),
 				   info.duckdb_type.ToString().c_str());
@@ -258,6 +263,11 @@ void RowIdKeyInfo::FinalizeChoice(const string &database_collation) {
 string PKColumnInfo::KeyComparand(const string &values_column) const {
 	if (key_compare_type.empty()) {
 		return values_column;
+	}
+	if (key_compare_type == "datetime") {
+		// Through datetime2(7): a literal with six fractional digits is no
+		// datetime literal, and datetime2 -> datetime rounds to the tick.
+		return "CAST(CAST(" + values_column + " AS datetime2(7)) AS datetime)";
 	}
 	// COLLATE before the CAST: the conversion to varchar uses the code page of
 	// its input's collation, and without it that is the database default's.
