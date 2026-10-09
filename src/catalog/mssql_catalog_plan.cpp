@@ -483,14 +483,16 @@ static bool StageCanCarry(const vector<MSSQLColumnInfo> &columns) {
 }
 
 //! Spec 080 D3, rungs 1-2: the #stage form a keyed UPDATE / DELETE switches to
-//! past mssql_dml_stage_threshold rows, or false where the platform has no
-//! stage (Fabric and Synapse keep the VALUES-join statements).
+//! past mssql_dml_stage_threshold rows (on a platform without the VALUES join,
+//! Fabric, the only form), or false where the platform has no stage (Synapse)
+//! or a key column cannot be bulk-loaded.
 static bool KeyedStagedTarget(ClientContext &context, MSSQLCatalog &catalog, MSSQLTableEntry &table_entry,
 							  const mssql::RowIdKeyInfo &pk_info, MSSQLStagedDmlTarget &target) {
 	const auto caps = catalog.GetDmlCapabilities();
-	if (!caps.update_from_join || !caps.stage_bulk) {
+	if (!caps.stage_bulk) {
 		return false;
 	}
+	target.join_by_subquery = !caps.update_from_join;
 	const auto &columns = table_entry.GetMSSQLColumns();
 	for (const auto &key : pk_info.columns) {
 		bool found = false;
@@ -518,6 +520,27 @@ static bool KeyedStagedTarget(ClientContext &context, MSSQLCatalog &catalog, MSS
 	target.query_timeout_seconds = LoadQueryTimeout(context);
 	target.table_entry = &table_entry;
 	return true;
+}
+
+//! The staged operator is the only way this statement can run (RETURNING, or
+//! a platform without the VALUES join) and it cannot: refuse by name. A
+//! native MERGE's actions are refused there too -- they defer to Finalize on
+//! the VALUES path (spec 080 PR 4 moves MERGE to the server).
+static void RefuseUnstageable(const char *verb, MSSQLTableEntry &table_entry, bool can_stage, bool returning) {
+	const auto schema = table_entry.schema.name.GetIdentifierName();
+	const auto table = table_entry.name.GetIdentifierName();
+	if (planning_merge_actions) {
+		throw NotImplementedException(
+			"MSSQL: MERGE INTO '%s.%s' with an UPDATE or DELETE action is not supported on "
+			"Fabric Warehouse yet (spec 080 PR 4)",
+			schema, table);
+	}
+	if (!can_stage) {
+		throw NotImplementedException(
+			"MSSQL: %s%s on '%s.%s' is not supported: it runs through a #stage table, "
+			"and a key or SET column cannot be bulk-loaded into one",
+			verb, returning ? " ... RETURNING" : "", schema, table);
+	}
 }
 
 //! Spec 080 PR 2b: what RETURNING needs on the staged operator. `types` are
@@ -631,6 +654,7 @@ static PhysicalOperator &PlanKeylessDml(ClientContext &context, PhysicalPlanGene
 	target.key_columns = table_entry.GetMSSQLColumns();
 	target.null_safe_operator =
 		catalog.GetDmlCapabilities().null_safe_operator && !LoadTestForceIntersectJoinForm(context);
+	target.join_by_subquery = !catalog.GetDmlCapabilities().update_from_join;
 	target.flush_rows = mssql::LoadBCPCopyConfig(context).flush_rows;
 	target.query_timeout_seconds = LoadQueryTimeout(context);
 	target.table_entry = &table_entry;
@@ -722,18 +746,20 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	staged.kind = MSSQLStagedDmlKind::DELETE_ROWS;
 	staged.key_chunk_index = RowIdChunkIndexes(op);
 	const bool can_stage = KeyedStagedTarget(context, *this, table_entry, pk_info, staged);
-	if (op.return_chunk) {
-		if (!can_stage) {
-			throw NotImplementedException(
-				"MSSQL: DELETE ... RETURNING on '%s.%s' is not supported: a key column "
-				"cannot be bulk-loaded into the #stage table it runs through",
-				table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName());
-		}
+	// RETURNING, and a platform with no VALUES join (Fabric, D0): the staged
+	// operator, whatever the row count.
+	const bool always_stage = op.return_chunk || !GetDmlCapabilities().update_from_join;
+	if (always_stage) {
+		RefuseUnstageable("DELETE", table_entry, can_stage, op.return_chunk);
 		staged.hold_until_finalize = ConnectionShared(context, *this) && FeedsFromStreamingScan(context, *this, plan);
-		PrepareReturning(context, table_entry, staged, op.types);
-		auto &returning = planner.Make<MSSQLPhysicalStagedDml>(op.types, op.estimated_cardinality, std::move(staged));
-		returning.children.push_back(plan);
-		return returning;
+		vector<LogicalType> types{LogicalType::BIGINT};
+		if (op.return_chunk) {
+			PrepareReturning(context, table_entry, staged, op.types);
+			types = op.types;
+		}
+		auto &staged_op = planner.Make<MSSQLPhysicalStagedDml>(types, op.estimated_cardinality, std::move(staged));
+		staged_op.children.push_back(plan);
+		return staged_op;
 	}
 	auto &physical_delete =
 		planner.Make<MSSQLPhysicalDelete>(std::move(result_types), op.estimated_cardinality, std::move(target), config);
@@ -870,18 +896,18 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 		}
 		stage_update = StageCanCarry(staged.set_columns);
 	}
-	if (op.return_chunk) {
-		if (!stage_update) {
-			throw NotImplementedException(
-				"MSSQL: UPDATE ... RETURNING on '%s.%s' is not supported: a key or SET "
-				"column cannot be bulk-loaded into the #stage table it runs through",
-				table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName());
-		}
+	const bool always_stage = op.return_chunk || !GetDmlCapabilities().update_from_join;
+	if (always_stage) {
+		RefuseUnstageable("UPDATE", table_entry, stage_update, op.return_chunk);
 		staged.hold_until_finalize = ConnectionShared(context, *this) && FeedsFromStreamingScan(context, *this, plan);
-		PrepareReturning(context, table_entry, staged, op.types);
-		auto &returning = planner.Make<MSSQLPhysicalStagedDml>(op.types, op.estimated_cardinality, std::move(staged));
-		returning.children.push_back(plan);
-		return returning;
+		vector<LogicalType> types{LogicalType::BIGINT};
+		if (op.return_chunk) {
+			PrepareReturning(context, table_entry, staged, op.types);
+			types = op.types;
+		}
+		auto &staged_op = planner.Make<MSSQLPhysicalStagedDml>(types, op.estimated_cardinality, std::move(staged));
+		staged_op.children.push_back(plan);
+		return staged_op;
 	}
 	auto &physical_update =
 		planner.Make<MSSQLPhysicalUpdate>(std::move(result_types), op.estimated_cardinality, std::move(target), config);

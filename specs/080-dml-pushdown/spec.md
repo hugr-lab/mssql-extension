@@ -22,13 +22,14 @@ refused (D4), and no batching of a staged statement (D3).
   refused by name when its conditions cannot be written in T-SQL (D4, owner
   2026-10-09).
 - **Closes #140 on SQL Server / Azure SQL in PR 2.** It was reopened on
-  2026-10-08: #364 closed it with text, not code. **Fabric:** the keyless path
-  there (stage filled with `INSERT … VALUES`, the staged DML a `MERGE`) needs
-  no `stage_bulk`. It hangs on one construct, a correlated
-  `EXISTS (SELECT t.c… INTERSECT SELECT s.c…)` in a `MERGE … ON` clause, which
-  `fabric-probe/p18_merge_on_intersect` settles. Until p18 has passed on a live
-  warehouse, a keyless statement on Fabric is refused by name in PR 2; the row
-  flips with the probe (review of #422). Synapse keeps today's refusal. A keyless
+  2026-10-08: #364 closed it with text, not code. **Fabric** (the Fabric DML
+  PR, owner 2026-10-09): the stage is filled by INSERT BULK -- Fabric's BCP
+  API, in preview, which COPY and CTAS already use there -- and the staged
+  statement selects its rows through `WHERE EXISTS` / a correlated subquery
+  (D3), so keyed and keyless UPDATE / DELETE run there. With no live
+  warehouse at hand, the forms run against SQL Server emulating Fabric
+  (`mssql_test_dml_platform`); `fabric-probe/` p19 / p20 are to confirm them
+  on a warehouse. Synapse keeps today's refusal. A keyless
   statement with a volatile function, or with a predicate the scan does not
   push, is refused by name on every platform.
 
@@ -102,7 +103,7 @@ that way is speed (#421).
 | `exact_count` (`ROWCOUNT_BIG()` into an RPC OUTPUT parameter) | yes | until the probe: no (the DONE count is used) |
 | `update_from_join` (`UPDATE … FROM … JOIN`, `DELETE … FROM … JOIN`) | yes | **no** (documented) |
 | `merge` | yes | yes (GA) |
-| `stage_bulk` (`INSERT BULK` into `#stage`) | yes | until the probe: no (stage filled with `INSERT … VALUES` batches) |
+| `stage_bulk` (`INSERT BULK` into `#stage`) | yes | yes: the BCP API (preview); COPY / CTAS use it already; a session `#temp` target to be confirmed by p19 |
 | `null_safe` | `IS NOT DISTINCT FROM` when `ProductMajorVersion >= 16` or `EngineEdition IN (5, 8)` (Azure SQL DB / MI report version 12 while having the operator), otherwise `EXISTS (SELECT t.c… INTERSECT SELECT s.c…)` | the INTERSECT form until the probe confirms the operator |
 
 Synapse (the host test) gets none of these. Its DML takes today's path
@@ -509,9 +510,24 @@ refuses these columns on both rungs, as rung 2 does today):
 
 | step | SQL Server / Azure | Fabric |
 |---|---|---|
-| fill | `INSERT BULK`, adopted at the first `Sink` (`DeferAdoption` / `AdoptDeferred`) | `INSERT … VALUES` batches (1000-constant rule) until `stage_bulk` |
-| UPDATE | `UPDATE [t] SET … FROM [s].[t] AS [t] JOIN #stage AS s ON <key>` | `MERGE [s].[t] AS t USING #stage AS s ON <key> WHEN MATCHED THEN UPDATE SET …` |
-| DELETE | `DELETE [t] FROM … JOIN #stage …` | `MERGE … WHEN MATCHED THEN DELETE` |
+| fill | `INSERT BULK`, adopted at the first `Sink` (`DeferAdoption` / `AdoptDeferred`) | the same (BCP API) |
+| UPDATE | `UPDATE [t] SET … FROM [s].[t] AS [t] JOIN #stage AS s ON <key>` | `UPDATE [s].[t] SET [c] = (SELECT TOP (1) stg.[n] FROM #stage AS stg WHERE <key>) … WHERE EXISTS (SELECT 1 FROM #stage AS stg WHERE <key>)` |
+| DELETE | `DELETE [t] FROM … JOIN #stage …` | `DELETE FROM [s].[t] WHERE EXISTS (SELECT 1 FROM #stage AS stg WHERE <key>)` |
+| rows | up to `mssql_dml_stage_threshold` as VALUES-join statements, past it the stage | always the stage: the VALUES join is an `UPDATE … FROM` too |
+
+**Not MERGE on Fabric** (the Fabric DML PR): MERGE refuses a target row matched
+twice (8672), so it needs a deduplicated stage, and a `DISTINCT` under the
+column's collation folds rows the byte-exact match keeps apart: `'a'` and
+`'a '` even under Fabric's default `Latin1_General_100_BIN2_UTF8` (BIN2 still
+ignores trailing spaces), and `'Ab'` / `'ab'` too on a warehouse created
+case-insensitive (`…_CI_AS_KS_WS_SC_UTF8`) -- one stage row would match only
+one of them, leaving the other unwritten. The subquery forms take duplicate stage rows as they are: `EXISTS`
+does not count them, and stage rows matching one target row are equal in the
+key; where they differ (DuckDB stages one rowid twice under `UPDATE … FROM`
+with two matching source rows) every SET column's `TOP (1)` takes the same
+stage row, under one total order over the new values, as the JOIN form takes
+one row for the whole target row. A native MERGE's UPDATE / DELETE actions are refused on Fabric until
+PR 4 (they run the VALUES join).
 | in a transaction | stage created on the pinned connection | same |
 
 The `<key>` comparison on rung 3 uses `null_safe` (D0).

@@ -75,6 +75,11 @@ struct MSSQLCatalogStartup {
 	//! settings, and the setting is GLOBAL: turning it off for a metadata
 	//! catalog must not change the user's own catalogs.
 	int8_t native_types = -1;
+	//! TEST ONLY (spec 080): mssql_test_dml_platform as it stood at ATTACH --
+	//! "fabric" / "synapse" / "sqlserver" make GetDmlCapabilities answer for
+	//! that platform, so its DML forms run against a SQL Server; empty = the
+	//! host test decides.
+	string dml_platform;
 };
 
 class MSSQLCatalog : public Catalog {

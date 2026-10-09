@@ -98,28 +98,17 @@ string MSSQLStagedDml::CreateOutSql(const MSSQLStagedDmlTarget &target, const st
 	return "SELECT " + list + " INTO " + mssql::QuoteIdentifier(out_name) + from + " UNION ALL SELECT " + list + from;
 }
 
-string MSSQLStagedDml::JoinStatementSql(const MSSQLStagedDmlTarget &target, const string &stage_name,
-										const string &out_name) {
-	// A stage row must match exactly the rows equal to it in every byte. A
-	// string compares under its collation -- case, accents, trailing spaces --
-	// so 'Ab' and 'ab' (on a _CI_ collation), or 'a' and 'a ', would each match
-	// the other's stage row: an UPDATE could write one row's new value into the
-	// other, and a DELETE whose pushed LIKE told them apart would remove both.
-	// A string column is therefore compared as its bytes (stage and target share
-	// type and collation, so the encodings agree), with the collation `=` kept
-	// beside it on a NOT NULL column so an index on it can still seek.
-	//
-	// NOT NULL columns compare with `=`; the nullable ones with IS NOT DISTINCT
-	// FROM where the server has it, else together through one
-	// EXISTS (… INTERSECT …), which treats NULL as equal to NULL everywhere.
+//! The stage-to-target match, every key column (see JoinStatementSql):
+//! `tq` / `sq` qualify the target's and the stage's columns.
+static string MatchCondition(const MSSQLStagedDmlTarget &target, const string &tq, const string &sq) {
 	string on;
 	string intersect_target;
 	string intersect_stage;
 	auto add = [&](const string &term) { on += (on.empty() ? "" : " AND ") + term; };
 	for (idx_t i = 0; i < target.key_columns.size(); i++) {
 		const auto &col = target.key_columns[i];
-		const auto t = "t." + mssql::QuoteIdentifier(col.name);
-		const auto s = "s." + mssql::QuoteIdentifier(KeyName(i));
+		const auto t = tq + mssql::QuoteIdentifier(col.name);
+		const auto s = sq + mssql::QuoteIdentifier(KeyName(i));
 		string t_value = t;
 		string s_value = s;
 		if (IsRowVersion(col)) {
@@ -143,7 +132,74 @@ string MSSQLStagedDml::JoinStatementSql(const MSSQLStagedDmlTarget &target, cons
 	if (!intersect_target.empty()) {
 		add("EXISTS (SELECT " + intersect_target + " INTERSECT SELECT " + intersect_stage + ")");
 	}
+	return on;
+}
+
+//! Spec 080 D0: a platform without UPDATE / DELETE ... FROM ... JOIN (Fabric
+//! Warehouse). DELETE through WHERE EXISTS; UPDATE through a correlated
+//! subquery per SET column, each TOP (1) under the SAME total order over the
+//! new values, so every column of a target row comes from one stage row --
+//! DuckDB can stage one rowid twice with different values (UPDATE ... FROM with
+//! two matching source rows), and the JOIN form picks one of them for the whole
+//! row too (review of the Fabric DML work). A legacy text / ntext / image SET
+//! column cannot be a subquery's value (error 279); Fabric has none.
+//! Not MERGE: MERGE refuses a target row matched twice (8672), so it needs a
+//! deduplicated stage, and a DISTINCT under the column's collation folds rows
+//! the byte-exact match keeps apart -- 'a' and 'a ' even under Fabric's default
+//! Latin1_General_100_BIN2_UTF8 (BIN2 ignores trailing spaces), 'Ab' and 'ab'
+//! on a case-insensitive warehouse -- into one stage row that matches only one
+//! of them, leaving the other unwritten.
+static string SubqueryStatementSql(const MSSQLStagedDmlTarget &target, const string &stage_name) {
 	const auto table = mssql::QuoteIdentifier(target.schema_name) + "." + mssql::QuoteIdentifier(target.table_name);
+	// The target is named, not aliased: neither statement takes a FROM here.
+	// The stage's alias must differ from that name, or the stage's columns
+	// would shadow the target's -- with a key column k0 the match would read
+	// `[stg__].[k0] = [stg__].[k0]` and take every row.
+	const auto tq = mssql::QuoteIdentifier(target.table_name) + ".";
+	string alias = "stg__";
+	while (StringUtil::CIEquals(alias, target.table_name)) {
+		alias += "_";
+	}
+	const auto sq = mssql::QuoteIdentifier(alias) + ".";
+	const auto stage = mssql::QuoteIdentifier(stage_name) + " AS " + mssql::QuoteIdentifier(alias);
+	const auto on = MatchCondition(target, tq, sq);
+	const auto exists = " WHERE EXISTS (SELECT 1 FROM " + stage + " WHERE " + on + ")";
+	if (target.kind == MSSQLStagedDmlKind::DELETE_ROWS) {
+		return "DELETE FROM " + table + exists;
+	}
+	string order;
+	for (idx_t i = 0; i < target.set_columns.size(); i++) {
+		order +=
+			(i ? ", " : "") + string("CAST(") + sq + mssql::QuoteIdentifier(NewValueName(i)) + " AS varbinary(max))";
+	}
+	string set;
+	for (idx_t i = 0; i < target.set_columns.size(); i++) {
+		set += (set.empty() ? "" : ", ") + mssql::QuoteIdentifier(target.set_columns[i].name) + " = (SELECT TOP (1) " +
+			   sq + mssql::QuoteIdentifier(NewValueName(i)) + " FROM " + stage + " WHERE " + on + " ORDER BY " + order +
+			   ")";
+	}
+	return "UPDATE " + table + " SET " + set + exists;
+}
+
+string MSSQLStagedDml::JoinStatementSql(const MSSQLStagedDmlTarget &target, const string &stage_name,
+										const string &out_name) {
+	// A stage row must match exactly the rows equal to it in every byte. A
+	// string compares under its collation -- case, accents, trailing spaces --
+	// so 'Ab' and 'ab' (on a _CI_ collation), or 'a' and 'a ', would each match
+	// the other's stage row: an UPDATE could write one row's new value into the
+	// other, and a DELETE whose pushed LIKE told them apart would remove both.
+	// A string column is therefore compared as its bytes (stage and target share
+	// type and collation, so the encodings agree), with the collation `=` kept
+	// beside it on a NOT NULL column so an index on it can still seek.
+	//
+	// NOT NULL columns compare with `=`; the nullable ones with IS NOT DISTINCT
+	// FROM where the server has it, else together through one
+	// EXISTS (… INTERSECT …), which treats NULL as equal to NULL everywhere.
+	const auto table = mssql::QuoteIdentifier(target.schema_name) + "." + mssql::QuoteIdentifier(target.table_name);
+	if (target.join_by_subquery) {
+		return SubqueryStatementSql(target, stage_name);
+	}
+	const auto on = MatchCondition(target, "t.", "s.");
 	const auto join = " FROM " + table + " AS t INNER JOIN " + mssql::QuoteIdentifier(stage_name) + " AS s ON " + on;
 	string output;
 	if (!out_name.empty()) {

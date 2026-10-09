@@ -1,0 +1,208 @@
+# name: test/sql/dml/fabric_emulated_dml.test
+# description: Fabric Warehouse's UPDATE / DELETE forms, run against SQL Server with mssql_test_dml_platform = 'fabric' (spec 080 D0)
+# group: [dml]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Fabric has no UPDATE / DELETE ... FROM ... JOIN, so every UPDATE / DELETE
+# goes through #stage (INSERT BULK) and selects the stage's rows through
+# WHERE EXISTS / a correlated subquery, with no VALUES join and no RETURNING.
+# No live warehouse is at hand; mssql_test_dml_platform makes an ATTACH answer
+# with Fabric's capabilities, and SQL Server runs the same T-SQL.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_test_dml_platform = 'fabric';
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS fe (TYPE mssql);
+
+statement ok
+RESET mssql_test_dml_platform;
+
+# --- a keyed table: even one row takes the staged operator -----------------
+
+statement ok
+SELECT mssql_exec('fe', 'DROP TABLE IF EXISTS dbo.fe_k; CREATE TABLE dbo.fe_k (id int PRIMARY KEY, v int NOT NULL, s nvarchar(10) NULL); INSERT INTO dbo.fe_k SELECT TOP (2000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), 0, NULL FROM sys.all_objects a CROSS JOIN sys.all_objects b');
+
+query II
+EXPLAIN UPDATE fe.dbo.fe_k SET v = 1 WHERE id = 1;
+----
+physical_plan	<REGEX>:.*Mssql Staged Update.*
+
+query I
+UPDATE fe.dbo.fe_k SET v = 1 WHERE id = 1;
+----
+1
+
+query I
+UPDATE fe.dbo.fe_k SET v = v + 2, s = 'x' WHERE id > 1000;
+----
+1000
+
+query I
+DELETE FROM fe.dbo.fe_k WHERE id > 1500;
+----
+500
+
+query III
+SELECT count(*), count(*) FILTER (WHERE v = 2 AND s = 'x'), count(*) FILTER (WHERE v = 1) FROM fe.dbo.fe_k;
+----
+1500	500	1
+
+# a composite key
+statement ok
+SELECT mssql_exec('fe', 'DROP TABLE IF EXISTS dbo.fe_c; CREATE TABLE dbo.fe_c (a int NOT NULL, b nvarchar(5) NOT NULL, v int NULL, PRIMARY KEY (a, b)); INSERT INTO dbo.fe_c VALUES (1, N''x'', 0), (1, N''y'', 0), (2, N''x'', 0)');
+
+query I
+UPDATE fe.dbo.fe_c SET v = 5 WHERE b = 'x';
+----
+2
+
+query I
+DELETE FROM fe.dbo.fe_c WHERE a = 1 AND b = 'y';
+----
+1
+
+# --- a table with no key: every column, NULL-safe through INTERSECT ----------
+
+statement ok
+SELECT mssql_exec('fe', 'DROP TABLE IF EXISTS dbo.fe_n; CREATE TABLE dbo.fe_n (s varchar(10) COLLATE Latin1_General_CI_AS NULL, v int NULL); INSERT INTO dbo.fe_n VALUES (''a'', 1), (''a '', 2), (''A'', 3), (NULL, 4), (NULL, 4)');
+
+# rows equal under the collation keep their own new values
+query I
+UPDATE fe.dbo.fe_n SET s = s || 'x' WHERE v <= 3;
+----
+3
+
+# identical rows move together, NULL matching NULL
+query I
+UPDATE fe.dbo.fe_n SET v = 5 WHERE v = 4;
+----
+2
+
+query II
+SELECT s, v FROM fe.dbo.fe_n ORDER BY v, s;
+----
+ax	1
+a x	2
+Ax	3
+NULL	5
+NULL	5
+
+query I
+DELETE FROM fe.dbo.fe_n WHERE s LIKE 'a %';
+----
+1
+
+# --- UPDATE ... FROM with two source rows for one target row: every SET column
+# comes from the same one, as with the JOIN form ------------------------------
+
+statement ok
+SELECT mssql_exec('fe', 'DROP TABLE IF EXISTS dbo.fe_two; CREATE TABLE dbo.fe_two (id int PRIMARY KEY, a int NULL, b int NULL); INSERT INTO dbo.fe_two VALUES (1, 0, 0)');
+
+statement ok
+CREATE TEMP TABLE src2 AS SELECT * FROM (VALUES (1, 10, 21), (1, 11, 20)) t(id, x, y);
+
+statement ok
+UPDATE fe.dbo.fe_two SET a = src2.x, b = src2.y FROM src2 WHERE fe_two.id = src2.id;
+
+query I
+SELECT (a, b) IN ((10, 21), (11, 20)) FROM fe.dbo.fe_two;
+----
+true
+
+# --- a target named like the stage's alias, in another schema ----------------
+
+statement ok
+SELECT mssql_exec('fe', 'IF SCHEMA_ID(''fe_s'') IS NULL EXEC(''CREATE SCHEMA fe_s''); DROP TABLE IF EXISTS fe_s.stg__; CREATE TABLE fe_s.stg__ (k0 int NOT NULL, v int NULL); INSERT INTO fe_s.stg__ VALUES (1, 0), (2, 0), (3, 0)');
+
+statement ok
+SELECT mssql_invalidate_cache('fe');
+
+query I
+DELETE FROM fe.fe_s.stg__ WHERE v = 0 AND k0 = 2;
+----
+1
+
+query I
+SELECT count(*) FROM fe.fe_s.stg__;
+----
+2
+
+# --- a MERGE with only an INSERT action is unchanged --------------------------
+
+query I
+MERGE INTO fe.dbo.fe_k AS t USING (SELECT 9100 AS id) AS s ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, 0, NULL);
+----
+1
+
+# --- Fabric's own collation: varchar under Latin1_General_100_BIN2_UTF8, the
+# warehouse default -- UTF-8 through INSERT BULK into the stage, non-ASCII
+# keys, trailing spaces kept apart (BIN2 still ignores them in `=`) ------------
+
+statement ok
+SELECT mssql_exec('fe', 'DROP TABLE IF EXISTS dbo.fe_u; CREATE TABLE dbo.fe_u (s varchar(20) COLLATE Latin1_General_100_BIN2_UTF8 NULL, v int NULL); INSERT INTO dbo.fe_u VALUES (N''Привет'', 1), (N''Привет '', 2), (N''привет'', 3), (N''日本'', 4)');
+
+query I
+UPDATE fe.dbo.fe_u SET s = s || '!' WHERE v <= 3;
+----
+3
+
+query I
+DELETE FROM fe.dbo.fe_u WHERE s = '日本';
+----
+1
+
+query II
+SELECT s, v FROM fe.dbo.fe_u ORDER BY v;
+----
+Привет!	1
+Привет !	2
+привет!	3
+
+# --- in a transaction --------------------------------------------------------
+
+statement ok
+BEGIN;
+
+query I
+UPDATE fe.dbo.fe_k SET v = 9;
+----
+1501
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM fe.dbo.fe_k WHERE v = 9;
+----
+0
+
+# --- refused by name ---------------------------------------------------------
+
+statement error
+UPDATE fe.dbo.fe_k SET v = 1 WHERE id = 1 RETURNING id;
+----
+is not supported on Fabric Warehouse yet
+
+statement error
+MERGE INTO fe.dbo.fe_k AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = 7;
+----
+is not supported on Fabric Warehouse yet (spec 080 PR 4)
+
+# INSERT is unchanged
+query I
+INSERT INTO fe.dbo.fe_k VALUES (9001, 0, NULL);
+----
+1
+
+statement ok
+SELECT mssql_exec('fe', 'DROP TABLE dbo.fe_k; DROP TABLE dbo.fe_c; DROP TABLE dbo.fe_n; DROP TABLE dbo.fe_two; DROP TABLE dbo.fe_u; DROP TABLE fe_s.stg__; DROP SCHEMA fe_s');
+
+statement ok
+DETACH fe;

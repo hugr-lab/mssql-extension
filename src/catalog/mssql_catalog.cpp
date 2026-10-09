@@ -966,7 +966,13 @@ const string &MSSQLCatalog::GetDatabaseCollation() const {
 
 mssql::DmlCapabilities MSSQLCatalog::GetDmlCapabilities() const {
 	auto platform = mssql::DmlPlatform::SqlServer;
-	if (connection_info_ && connection_info_->IsFabricEndpoint()) {
+	if (startup_.dml_platform == "fabric") {
+		platform = mssql::DmlPlatform::Fabric;
+	} else if (startup_.dml_platform == "synapse") {
+		platform = mssql::DmlPlatform::Synapse;
+	} else if (startup_.dml_platform == "sqlserver") {
+		platform = mssql::DmlPlatform::SqlServer;
+	} else if (connection_info_ && connection_info_->IsFabricEndpoint()) {
 		platform = mssql::DmlPlatform::Fabric;
 	} else if (connection_info_ && connection_info_->IsSynapseEndpoint()) {
 		platform = mssql::DmlPlatform::Synapse;
