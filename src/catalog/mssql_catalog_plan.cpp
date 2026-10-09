@@ -523,7 +523,7 @@ static bool KeyedStagedTarget(ClientContext &context, MSSQLCatalog &catalog, MSS
 static PhysicalOperator &PlanKeylessDml(ClientContext &context, PhysicalPlanGenerator &planner, MSSQLCatalog &catalog,
 										MSSQLTableEntry &table_entry, MSSQLStagedDmlTarget target,
 										PhysicalOperator &plan, idx_t estimated_cardinality) {
-	const char *verb = target.kind == MSSQLStagedDmlKind::UPDATE ? "UPDATE" : "DELETE";
+	const char *verb = target.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "UPDATE" : "DELETE";
 	const auto schema_name = table_entry.schema.name.GetIdentifierName();
 	const auto table_name = table_entry.name.GetIdentifierName();
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
@@ -538,6 +538,12 @@ static PhysicalOperator &PlanKeylessDml(ClientContext &context, PhysicalPlanGene
 		throw NotImplementedException(
 			"%s %s", pk_info.RowIdRefusal(schema_name, table_name, verb, catalog.GetName().GetIdentifierName()),
 			table_entry.KeylessKeyRefusal());
+	}
+	// Every column is a key column here, already through IsRoundTripExactForKey;
+	// the bulk wire is asked as well, so the two lists cannot drift apart
+	// (review of #425).
+	if (!StageCanCarry(table_entry.GetMSSQLColumns())) {
+		return refuse("a column cannot be bulk-loaded into the stage");
 	}
 	const auto why = KeylessPlanRefusal(context, plan, table_entry);
 	if (!why.empty()) {
@@ -602,7 +608,7 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
 	if (!pk_info.exists) {
 		MSSQLStagedDmlTarget staged;
-		staged.kind = MSSQLStagedDmlKind::DELETE;
+		staged.kind = MSSQLStagedDmlKind::DELETE_ROWS;
 		return PlanKeylessDml(context, planner, *this, table_entry, std::move(staged), plan, op.estimated_cardinality);
 	}
 
@@ -634,7 +640,7 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 
 	// Create the physical operator using planner.Make<T>()
 	MSSQLStagedDmlTarget staged;
-	staged.kind = MSSQLStagedDmlKind::DELETE;
+	staged.kind = MSSQLStagedDmlKind::DELETE_ROWS;
 	const bool can_stage = KeyedStagedTarget(context, *this, table_entry, pk_info, staged);
 	auto &physical_delete =
 		planner.Make<MSSQLPhysicalDelete>(std::move(result_types), op.estimated_cardinality, std::move(target), config);
@@ -679,7 +685,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
 	if (!pk_info.exists) {
 		MSSQLStagedDmlTarget staged;
-		staged.kind = MSSQLStagedDmlKind::UPDATE;
+		staged.kind = MSSQLStagedDmlKind::UPDATE_ROWS;
 		for (idx_t i = 0; i < op.columns.size(); i++) {
 			const auto physical_idx = op.columns[i].index;
 			if (physical_idx >= mssql_columns.size()) {
@@ -758,7 +764,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 
 	// Create the physical operator using planner.Make<T>()
 	MSSQLStagedDmlTarget staged;
-	staged.kind = MSSQLStagedDmlKind::UPDATE;
+	staged.kind = MSSQLStagedDmlKind::UPDATE_ROWS;
 	const bool can_stage = KeyedStagedTarget(context, *this, table_entry, pk_info, staged);
 	bool stage_update = can_stage;
 	if (stage_update) {

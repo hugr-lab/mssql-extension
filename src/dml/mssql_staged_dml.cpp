@@ -111,7 +111,7 @@ string MSSQLStagedDml::JoinStatementSql(const MSSQLStagedDmlTarget &target, cons
 	}
 	const auto table = mssql::QuoteIdentifier(target.schema_name) + "." + mssql::QuoteIdentifier(target.table_name);
 	const auto join = " FROM " + table + " AS t INNER JOIN " + mssql::QuoteIdentifier(stage_name) + " AS s ON " + on;
-	if (target.kind == MSSQLStagedDmlKind::DELETE) {
+	if (target.kind == MSSQLStagedDmlKind::DELETE_ROWS) {
 		return "DELETE t" + join;
 	}
 	string set;
@@ -146,7 +146,7 @@ void MSSQLStagedDml::FailAndThrow(ClientContext &context, const string &message)
 }
 
 void MSSQLStagedDml::Start(ClientContext &context) {
-	const char *verb = target_.kind == MSSQLStagedDmlKind::UPDATE ? "UPDATE" : "DELETE";
+	const char *verb = target_.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "UPDATE" : "DELETE";
 	connection_ = stmt_conn_.Acquire(context, catalog_);
 	{
 		auto pinned_lock = stmt_conn_.LockPinned(context, catalog_);
@@ -258,11 +258,55 @@ void MSSQLStagedDml::Execute(ClientContext &context, DataChunk &chunk) {
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
 		FailAndThrow(context, StringUtil::Format("MSSQL %s on '%s.%s': filling the stage failed after %llu rows: %s",
-												 target_.kind == MSSQLStagedDmlKind::UPDATE ? "UPDATE" : "DELETE",
+												 target_.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "UPDATE" : "DELETE",
 												 target_.schema_name, target_.table_name,
 												 (unsigned long long)rows_staged_, error.RawMessage()));
 	}
 	rows_staged_ += chunk.size();
+}
+
+void MSSQLStagedDml::CheckMatchedEverything(ClientContext &context, idx_t matched) {
+	// Review of #425: "never a statement that changes nothing" is otherwise
+	// only enforced statically, by the key-type table and the plan shape. A
+	// staged row the JOIN does not find means its value did not come back as
+	// read for a reason that table does not name, or another session changed
+	// or removed the row since the scan -- either way the count would be
+	// silently short. Checked before the commit, so nothing is written.
+	const char *verb = target_.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "UPDATE" : "DELETE";
+	idx_t expected = 0;
+	if (target_.key_source == MSSQLStagedKeySource::ROWID) {
+		// A unique key: every distinct staged key is one row. DuckDB may hand
+		// a rowid over twice (UPDATE ... FROM with two matching source rows),
+		// so the distinct count is asked only when the plain one falls short.
+		if (matched >= rows_staged_) {
+			return;
+		}
+		string keys;
+		for (idx_t i = 0; i < target_.key_columns.size(); i++) {
+			keys += (i ? ", " : "") + mssql::QuoteIdentifier(KeyName(i));
+		}
+		auto distinct = MSSQLSimpleQuery::ExecuteScalar(*connection_,
+														"SELECT COUNT_BIG(*) FROM (SELECT DISTINCT " + keys + " FROM " +
+															mssql::QuoteIdentifier(stage_name_) + ") AS d",
+														QueryTimeoutMs(target_));
+		expected = static_cast<idx_t>(std::stoull(distinct.empty() ? string("0") : distinct));
+		if (matched >= expected) {
+			return;
+		}
+	} else {
+		// Every column: rows identical in all of them are one match, so the
+		// count can be below the staged rows legitimately; none at all cannot.
+		if (rows_staged_ == 0 || matched > 0) {
+			return;
+		}
+		expected = 1;
+	}
+	FailAndThrow(context,
+				 StringUtil::Format("MSSQL %s on '%s.%s': %llu row(s) were selected, but the server found only %llu of "
+									"them. Another session changed or removed them since they were read, or a key "
+									"value did not come back exactly as it was read (please report the column types)",
+									verb, target_.schema_name, target_.table_name, (unsigned long long)expected,
+									(unsigned long long)matched));
 }
 
 idx_t MSSQLStagedDml::Finalize(ClientContext &context) {
@@ -274,7 +318,7 @@ idx_t MSSQLStagedDml::Finalize(ClientContext &context) {
 		// Nothing selected: no connection was taken, nothing to send.
 		return 0;
 	}
-	const char *verb = target_.kind == MSSQLStagedDmlKind::UPDATE ? "UPDATE" : "DELETE";
+	const char *verb = target_.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "UPDATE" : "DELETE";
 	idx_t rows = 0;
 	{
 		auto pinned_lock = stmt_conn_.LockPinned(context, catalog_);
@@ -293,6 +337,7 @@ idx_t MSSQLStagedDml::Finalize(ClientContext &context) {
 													 target_.table_name, result.error_message));
 		}
 		rows = static_cast<idx_t>(result.rows_affected);
+		CheckMatchedEverything(context, rows);
 		auto dropped = MSSQLSimpleQuery::Execute(*connection_, "DROP TABLE " + mssql::QuoteIdentifier(stage_name_),
 												 QueryTimeoutMs(target_));
 		if (!dropped.success) {
@@ -303,7 +348,7 @@ idx_t MSSQLStagedDml::Finalize(ClientContext &context) {
 	connection_.reset();
 	const bool pinned = stmt_conn_.IsPinned();
 	stmt_conn_.Commit(context, catalog_);
-	if (target_.kind == MSSQLStagedDmlKind::DELETE && !pinned && target_.table_entry) {
+	if (target_.kind == MSSQLStagedDmlKind::DELETE_ROWS && !pinned && target_.table_entry) {
 		target_.table_entry->NoteRowsDeleted(rows);
 	}
 	return rows;

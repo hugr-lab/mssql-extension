@@ -366,7 +366,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column — and lands on the stored tick: 603 of 603 values measured either
   way, against 200 of 603 before. A `WHERE rowid = …` on such a table compares the same
   way. (A plain `WHERE dt = …` filter on a `datetime` column still compares as
-  `datetime2`; tracked separately.)
+  `datetime2`; #426.)
 
 - **The planner's row estimate follows a DELETE** (spec 080). After an
   autocommit DELETE through the catalog the table's estimate drops by the rows

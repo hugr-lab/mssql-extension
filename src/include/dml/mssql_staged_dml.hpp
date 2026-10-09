@@ -44,7 +44,8 @@ class ClientContext;
 class MSSQLCatalog;
 class MSSQLTableEntry;
 
-enum class MSSQLStagedDmlKind : uint8_t { UPDATE, DELETE };
+// Not UPDATE / DELETE: <windows.h> defines DELETE as a macro (review of #425).
+enum class MSSQLStagedDmlKind : uint8_t { UPDATE_ROWS, DELETE_ROWS };
 
 //! Where a chunk carries the key the stage matches by.
 enum class MSSQLStagedKeySource : uint8_t {
@@ -57,7 +58,7 @@ enum class MSSQLStagedKeySource : uint8_t {
 };
 
 struct MSSQLStagedDmlTarget {
-	MSSQLStagedDmlKind kind = MSSQLStagedDmlKind::UPDATE;
+	MSSQLStagedDmlKind kind = MSSQLStagedDmlKind::UPDATE_ROWS;
 	string catalog_name;
 	string schema_name;
 	string table_name;
@@ -106,6 +107,9 @@ private:
 	//! The staged columns of `chunk`, in stage order, as references.
 	void BuildFillChunk(DataChunk &chunk);
 	void FailAndThrow(ClientContext &context, const string &message);
+	//! The JOIN found every staged row (rungs 1-2: every distinct key; rung 3:
+	//! at least one row), or the statement fails before its commit.
+	void CheckMatchedEverything(ClientContext &context, idx_t matched);
 
 	MSSQLStagedDmlTarget target_;
 	MSSQLCatalog &catalog_;

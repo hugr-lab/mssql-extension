@@ -137,6 +137,37 @@ SELECT rowid FROM kl.dbo.kl_shift;
 ----
 Referenced column "rowid" not found
 
+# The hidden key columns are named like their columns and bound after them, so
+# nothing that lists or resolves columns sees them (review of #425: this rests
+# on DuckDB's Binding::Initialize filling the name map first -- a change there
+# fails here, not silently).
+query I
+SELECT count(*) FROM (DESCRIBE kl.dbo.kl_shift);
+----
+2
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'kl' AND table_name = 'kl_shift';
+----
+2
+
+# duckdb_columns() loaded the catalog's table list; the tables created below
+# through mssql_exec() need it read again.
+statement ok
+SELECT mssql_invalidate_cache('kl');
+
+query II
+SELECT * FROM kl.dbo.kl_shift ORDER BY b;
+----
+2	1
+3	2
+
+query I
+SELECT a + b FROM kl.dbo.kl_shift ORDER BY b;
+----
+3
+5
+
 # --- the server's selection is the statement's: a pushed WHERE on a _CI_
 # collation selects 'Ab' and 'ab' alike, and both are written ---------------
 
@@ -226,6 +257,24 @@ DELETE FROM kl.dbo.kl_geo WHERE id = 1;
 ----
 column 'g' has type geometry, which the catalog does not read in a form that identifies a row
 
+# --- a value that does not come back as read: an unpaired UTF-16 surrogate in
+# an nvarchar is no valid UTF-8, so the stage holds something else and the
+# JOIN finds nothing. The statement fails before its commit, never 0 rows
+# reported as success (review of #425) --------------------------------------
+
+statement ok
+SELECT mssql_exec('kl', 'DROP TABLE IF EXISTS dbo.kl_sur; CREATE TABLE dbo.kl_sur (s nvarchar(10) NULL, v int NULL); INSERT INTO dbo.kl_sur VALUES (NCHAR(55296), 0)');
+
+statement error
+UPDATE kl.dbo.kl_sur SET v = 1;
+----
+the server found only 0 of them
+
+query I
+SELECT * FROM mssql_scan('kl', 'SELECT v FROM dbo.kl_sur');
+----
+0
+
 # --- identity, computed and rowversion columns: the stage is plain ----------
 
 statement ok
@@ -307,7 +356,7 @@ SELECT v FROM kl.dbo.kl_chk ORDER BY v;
 # --- cleanup ----------------------------------------------------------------
 
 statement ok
-SELECT mssql_exec('kl', 'DROP TABLE dbo.kl_dup; DROP TABLE dbo.kl_shift; DROP TABLE dbo.kl_str; DROP TABLE dbo.kl_sp; DROP TABLE dbo.kl_dt; DROP TABLE dbo.kl_t7; DROP TABLE dbo.kl_geo; DROP TABLE dbo.kl_kinds; DROP TABLE dbo.kl_chk');
+SELECT mssql_exec('kl', 'DROP TABLE dbo.kl_dup; DROP TABLE dbo.kl_shift; DROP TABLE dbo.kl_str; DROP TABLE dbo.kl_sp; DROP TABLE dbo.kl_sur; DROP TABLE dbo.kl_dt; DROP TABLE dbo.kl_t7; DROP TABLE dbo.kl_geo; DROP TABLE dbo.kl_kinds; DROP TABLE dbo.kl_chk');
 
 statement ok
 DETACH kl;

@@ -405,6 +405,14 @@ The key is resolved per table at plan time:
      whose pushed LIKE told them apart would take both. The join adds
      `CAST(t.c AS varbinary(max)) = CAST(s.c AS varbinary(max))` beside `=`
      (kept for the seek); stage and target share type and collation.
+   - **No concurrent writer** (review of #425): the scan and the JOIN are two
+     steps, in autocommit two server transactions, and the key is the row's
+     value, so a row another session inserts equal to a staged one in between
+     is written too, and a selected row changed in between is not found. The
+     latter, and a value that did not come back as read, are caught: the
+     statement fails before its commit when the JOIN finds no row (rung 3) or
+     fewer rows than distinct staged keys (rungs 1-2). The former is the
+     user's to prevent: SNAPSHOT / REPEATABLE READ (`transaction_isolation`).
    - **How the key reaches the operator** (PR 2): DuckDB's binder appends
      the ids `GetRowIdColumns()` names and looks each up in
      `GetVirtualColumns()`, which takes virtual ids only, so the entry

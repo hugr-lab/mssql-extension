@@ -25,7 +25,7 @@ public:
 						   MSSQLStagedDmlTarget target);
 
 	string GetName() const override {
-		return target_.kind == MSSQLStagedDmlKind::UPDATE ? "MSSQL_STAGED_UPDATE" : "MSSQL_STAGED_DELETE";
+		return target_.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "MSSQL_STAGED_UPDATE" : "MSSQL_STAGED_DELETE";
 	}
 
 	bool IsSink() const override {

@@ -320,6 +320,10 @@ SET mssql_dml_stage_threshold = 100000; -- VALUES statements up to 100k rows
 ```
 
 Either way a statement is atomic: a failure rolls back everything it wrote.
+A staged statement also checks that the server found every row it staged, and
+fails before its commit if not, rather than reporting fewer rows. The stage
+lives in `tempdb` for the statement's length and holds the selected rows'
+key (and new) values.
 
 ### A table with no key
 
@@ -329,10 +333,19 @@ it in every column (NULL equal to NULL, strings byte for byte). So:
 - **Rows identical in every column move together.** If a table holds two
   identical rows and the statement selects one, both are updated or deleted,
   and the count says 2. A key is the fix.
-- **The server must select the same rows as DuckDB.** The statement is refused
-  by name when part of its WHERE runs in DuckDB rather than on the server (a
-  string function such as `lower()`, for instance), when it computes a volatile
-  function (`random()`, `gen_random_uuid()`), for `UPDATE … FROM` /
-  `DELETE … USING`, and for `MERGE INTO`.
+- **The server must select the same rows as DuckDB.** The statement runs only
+  when its rows come from the table's own scan with every condition sent to the
+  server. It is refused by name otherwise: when part of its WHERE runs in
+  DuckDB (a string function such as `lower()`, a subquery — `IN (SELECT …)`,
+  `EXISTS (…)` — or any condition the scan cannot send), when it computes a
+  volatile function (`random()`, `gen_random_uuid()`), for `UPDATE … FROM` /
+  `DELETE … USING`, and for `MERGE INTO`. The way out is a key: a primary key or
+  a unique index makes all of these work.
+- **No concurrent writer is assumed.** The rows are read, then found again by
+  value in a second step. In autocommit another session can insert an equal row
+  between the two (it is then updated too) or change a selected one (it is then
+  not found, and the statement fails rather than report fewer rows). Run the
+  statement in a transaction with `transaction_isolation 'snapshot'` (or
+  `'repeatable_read'`) on the ATTACH when other sessions write the table.
 - `rowid` stays unavailable: there is no key to expose.
 
