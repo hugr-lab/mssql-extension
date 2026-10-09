@@ -35,8 +35,12 @@ struct MSSQLDMLConfig {
 	// Maximum parameters per SQL statement (SQL Server limit ~2100)
 	idx_t max_parameters = MSSQL_DEFAULT_DML_MAX_PARAMETERS;
 
-	// Use prepared statements for execution
-	bool use_prepared = MSSQL_DEFAULT_DML_USE_PREPARED;
+	//! Spec 080 PR 1: an action of a native MERGE. Its rows are sent only at the
+	//! action's Finalize, after every action's sink has run: a MERGE's actions
+	//! are fed from several threads, and on a pool of one connection an action
+	//! holding the connection mid-sink would starve the others. Set by
+	//! MSSQLCatalog::PlanMergeInto; a plain UPDATE / DELETE sends as it goes.
+	bool defer_to_finalize = false;
 
 	//===----------------------------------------------------------------------===//
 	// Effective Batch Size Calculation

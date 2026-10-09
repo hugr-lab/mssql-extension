@@ -23,10 +23,10 @@
 # A short acquire timeout makes any path that still asks for a second
 # connection fail in seconds instead of thirty.
 #
-# Not covered yet: UPDATE / DELETE in AUTOCOMMIT on a pool of one. Their scan
-# is not materialised (they are not counted as sinks), so their batches wait
-# for the connection the scan holds. Spec 080 W2 closes that and extends
-# this file.
+# UPDATE / DELETE / MERGE count as sinks too (spec 080 PR 1): their feeding
+# scan is materialised, in autocommit as in a transaction, and their batches
+# go out as the rows arrive. Before, in autocommit their batches waited for
+# the connection the scan held.
 
 require mssql
 
@@ -238,6 +238,72 @@ CREATE TABLE one380.dbo.one380_ac_local AS SELECT i::INTEGER AS id FROM range(30
 
 query I
 SELECT count(*) FROM one380.dbo.one380_ac_local;
+----
+3000
+
+#------------------------------------------------------------------------------
+# Autocommit: UPDATE / DELETE / MERGE over the catalog they write into, each
+# past one batch (500 rows) and fed by one streaming scan (spec 080 PR 1).
+#------------------------------------------------------------------------------
+
+query I
+UPDATE one380.dbo.one380_src SET v = 'u' WHERE id <= 1200;
+----
+1200
+
+query I
+DELETE FROM one380.dbo.one380_src WHERE id > 1800;
+----
+700
+
+# Two actions, both past one batch: they take turns at the one connection.
+query I
+MERGE INTO one380.dbo.one380_src AS t USING (SELECT i::INTEGER AS id FROM range(1, 3001) r(i)) AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = 'm'
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, 'n');
+----
+3000
+
+query II
+SELECT count(*) FILTER (WHERE v = 'm'), count(*) FILTER (WHERE v = 'n') FROM one380.dbo.one380_src;
+----
+1800	1200
+
+#------------------------------------------------------------------------------
+# Transaction: the same shapes on the pinned connection, the batches sent as
+# the rows arrive (they used to wait for the end of the statement).
+#------------------------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+query I
+UPDATE one380.dbo.one380_src SET v = 't' WHERE id <= 1500;
+----
+1500
+
+query I
+DELETE FROM one380.dbo.one380_src WHERE id > 2400;
+----
+600
+
+query I
+MERGE INTO one380.dbo.one380_src AS t USING (SELECT i::INTEGER AS id FROM range(1501, 3601) r(i)) AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = 'x'
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, 'y');
+----
+2100
+
+query III
+SELECT count(*) FILTER (WHERE v = 't'), count(*) FILTER (WHERE v = 'x'), count(*) FILTER (WHERE v = 'y') FROM one380.dbo.one380_src;
+----
+1500	900	1200
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM one380.dbo.one380_src;
 ----
 3000
 

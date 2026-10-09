@@ -18,9 +18,14 @@
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 
 namespace duckdb {
+
+//! Set while DuckDB plans a MERGE's actions through PlanUpdate / PlanDelete /
+//! PlanInsert below (planning is single-threaded per statement).
+static thread_local bool planning_merge_actions = false;
 
 //===----------------------------------------------------------------------===//
 // Write Operations (all throw - read-only catalog)
@@ -185,6 +190,13 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	}
 	if (bulk.statement_path_reason.empty()) {
 		bulk.enabled = true;
+		if (planning_merge_actions) {
+			// A MERGE's INSERT action: its rows stay staged until the action's
+			// Finalize and go as statements then (MSSQLDMLConfig::
+			// defer_to_finalize). A bulk stream kept open across the sink would
+			// hold the pinned connection while the other actions send.
+			bulk.threshold = NumericLimits<idx_t>::Maximum();
+		}
 		bulk.target.catalog_name = target.catalog_name;
 		bulk.target.schema_name = target.schema_name;
 		bulk.target.table_name = target.table_name;
@@ -251,6 +263,20 @@ PhysicalOperator &MSSQLCatalog::PlanCreateTableAs(ClientContext &context, Physic
 	return mssql::CTASPlanner::Plan(context, planner, *this, op, plan);
 }
 
+PhysicalOperator &MSSQLCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
+											  LogicalMergeInto &op, PhysicalOperator &plan) {
+	struct MergePlanningScope {
+		bool previous;
+		MergePlanningScope() : previous(planning_merge_actions) {
+			planning_merge_actions = true;
+		}
+		~MergePlanningScope() {
+			planning_merge_actions = previous;
+		}
+	} scope;
+	return Catalog::PlanMergeInto(context, planner, op, plan);
+}
+
 PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
 										   PhysicalOperator &plan) {
 	// Check write access first (throws if read-only)
@@ -258,6 +284,17 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 
 	// Get the target table entry
 	auto &table_entry = op.table.Cast<MSSQLTableEntry>();
+
+	// The operator returns the affected count, never rows. Planned with
+	// RETURNING, DuckDB's projection over it read the BIGINT count as the
+	// returned columns and failed with an InternalException, which invalidates
+	// the database. Refused by name until RETURNING maps to OUTPUT (spec 080).
+	if (op.return_chunk) {
+		throw NotImplementedException(
+			"MSSQL: DELETE ... RETURNING is not supported yet on '%s.%s' (INSERT ... "
+			"RETURNING is)",
+			table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName());
+	}
 
 	// Check if table has a primary key (required for DELETE via rowid)
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
@@ -276,6 +313,7 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 
 	// Load DML configuration from settings
 	MSSQLDMLConfig config = LoadDMLConfig(context);
+	config.defer_to_finalize = planning_merge_actions;
 
 	// Result type is BIGINT (row count)
 	vector<LogicalType> result_types;
@@ -298,6 +336,17 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 
 	// Get the target table entry
 	auto &table_entry = op.table.Cast<MSSQLTableEntry>();
+
+	// The operator returns the affected count, never rows. Planned with
+	// RETURNING, DuckDB's projection over it read the BIGINT count as the
+	// returned columns and failed with an InternalException, which invalidates
+	// the database. Refused by name until RETURNING maps to OUTPUT (spec 080).
+	if (op.return_chunk) {
+		throw NotImplementedException(
+			"MSSQL: UPDATE ... RETURNING is not supported yet on '%s.%s' (INSERT ... "
+			"RETURNING is)",
+			table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName());
+	}
 
 	// Check if table has a primary key (loaded with its metadata, spec 084 D5)
 	const auto &pk_info = table_entry.GetPrimaryKeyInfo(context);
@@ -358,6 +407,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 
 	// Load DML configuration from settings
 	MSSQLDMLConfig config = LoadDMLConfig(context);
+	config.defer_to_finalize = planning_merge_actions;
 
 	// Result type is BIGINT (row count)
 	vector<LogicalType> result_types;

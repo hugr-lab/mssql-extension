@@ -46,20 +46,11 @@ MSSQLUpdateExecutor::MSSQLUpdateExecutor(ClientContext &context, const MSSQLUpda
 	UPDATE_DEBUG(1, "UpdateExecutor: effective_batch_size=%llu (params_per_row=%llu)",
 				 (unsigned long long)effective_batch_size_, (unsigned long long)target_.GetParamsPerRow());
 
-	// Check if we need to defer execution until Finalize
-	// This is required when in an explicit transaction because:
-	// 1. The scan uses the pinned connection to stream rowids
-	// 2. UPDATE batches would need the same pinned connection
-	// 3. But the connection is in "Executing" state while streaming
-	// Solution: Buffer all data during Sink, execute in Finalize after scan completes
-	if (!context.transaction.IsAutoCommit()) {
-		auto &catalog = Catalog::GetCatalog(context, Identifier(target_.catalog_name));
-		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
-		if (ConnectionProvider::IsInTransaction(context, mssql_catalog)) {
-			defer_execution_ = true;
-			UPDATE_DEBUG(1, "UpdateExecutor: defer_execution=true (in transaction)");
-		}
-	}
+	// Batches go out as the rows arrive, in a transaction too: the scan feeding
+	// the UPDATE is materialised at init (spec 080 PR 1 -- UPDATE / DELETE /
+	// MERGE count as sinks in MSSQLOptimizer's CollectSinkCatalogs), so the
+	// pinned connection is idle by the time the first batch is sent. Until then
+	// the statement deferred every batch to Finalize with its rows buffered.
 }
 
 MSSQLUpdateExecutor::~MSSQLUpdateExecutor() = default;
@@ -87,9 +78,7 @@ idx_t MSSQLUpdateExecutor::Execute(DataChunk &chunk) {
 	for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
 		AccumulateRow(chunk, row_idx);
 
-		// Check if we need to flush the batch
-		// In defer_execution_ mode, we accumulate everything and flush in Finalize
-		if (!defer_execution_ && pending_pk_values_.size() >= effective_batch_size_) {
+		if (!config_.defer_to_finalize && pending_pk_values_.size() >= effective_batch_size_) {
 			UPDATE_DEBUG(1, "Execute: batch full at row %llu, flushing...", (unsigned long long)row_idx);
 			auto result = FlushBatch();
 			if (!result.success) {
@@ -105,8 +94,8 @@ idx_t MSSQLUpdateExecutor::Execute(DataChunk &chunk) {
 }
 
 MSSQLDMLResult MSSQLUpdateExecutor::Finalize() {
-	UPDATE_DEBUG(1, "Finalize: starting, finalized=%d, pending=%llu, defer_execution=%d", finalized_,
-				 (unsigned long long)pending_pk_values_.size(), defer_execution_);
+	UPDATE_DEBUG(1, "Finalize: starting, finalized=%d, pending=%llu", finalized_,
+				 (unsigned long long)pending_pk_values_.size());
 
 	if (finalized_) {
 		return MSSQLDMLResult::Success(total_rows_updated_, batch_count_);
@@ -114,8 +103,8 @@ MSSQLDMLResult MSSQLUpdateExecutor::Finalize() {
 
 	finalized_ = true;
 
-	// Flush all remaining rows in batches
-	// In defer_execution_ mode, we may have accumulated many batches worth of rows
+	// Flush the remaining rows: less than one batch, or every row of a MERGE
+	// action (MSSQLDMLConfig::defer_to_finalize)
 	while (!pending_pk_values_.empty()) {
 		UPDATE_DEBUG(1, "Finalize: flushing batch, pending=%llu", (unsigned long long)pending_pk_values_.size());
 		auto result = FlushBatch();
@@ -223,6 +212,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 	// else a pool connection with the statement's own server transaction begun
 	// on it (spec 062 W1c). Throws when none can be had.
 	auto connection = stmt_conn_.Acquire(context_, mssql_catalog);
+	auto pinned_lock = stmt_conn_.LockPinned(context_, mssql_catalog);
 
 	UPDATE_DEBUG(2, "ExecuteBatch: connection acquired");
 

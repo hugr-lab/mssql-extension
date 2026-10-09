@@ -1,0 +1,112 @@
+# name: test/sql/dml/merge_native.test
+# description: MERGE INTO an MSSQL table through DuckDB's own planner (each action through PlanUpdate / PlanDelete / PlanInsert), in autocommit and in a transaction (spec 080 PR 1)
+# group: [dml]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS mgn (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('mgn', 'DROP TABLE IF EXISTS dbo.mgn_t; DROP TABLE IF EXISTS dbo.mgn_s; CREATE TABLE dbo.mgn_t (id int PRIMARY KEY, v int); CREATE TABLE dbo.mgn_s (id int PRIMARY KEY, w int); INSERT INTO dbo.mgn_t VALUES (1, 10), (2, 20), (3, 30); INSERT INTO dbo.mgn_s VALUES (2, 200), (3, NULL), (4, 400)');
+
+# A DuckDB source: UPDATE, DELETE and INSERT actions in one statement.
+query I
+MERGE INTO mgn.dbo.mgn_t AS t
+USING (SELECT * FROM (VALUES (1, 11), (2, NULL), (9, 90)) AS x(id, w)) AS s ON t.id = s.id
+WHEN MATCHED AND s.w IS NULL THEN DELETE
+WHEN MATCHED THEN UPDATE SET v = s.w
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.w);
+----
+3
+
+query II
+SELECT id, v FROM mgn.dbo.mgn_t ORDER BY id;
+----
+1	11
+3	30
+9	90
+
+# A source in the same catalog, in a transaction: the scans are materialised
+# and the actions run on the pinned connection.
+statement ok
+BEGIN;
+
+query I
+MERGE INTO mgn.dbo.mgn_t AS t USING mgn.dbo.mgn_s AS s ON t.id = s.id
+WHEN MATCHED AND s.w IS NULL THEN DELETE
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.w);
+----
+3
+
+query II
+SELECT id, v FROM mgn.dbo.mgn_t ORDER BY id;
+----
+1	11
+2	200
+4	400
+9	90
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT id, v FROM mgn.dbo.mgn_t ORDER BY id;
+----
+1	11
+3	30
+9	90
+
+# A transaction on a pool of many, threads on: an UPDATE action past one batch
+# and an INSERT action past the bulk-load threshold. The actions are fed from
+# several threads onto the one pinned connection; each sends at its own
+# Finalize, the INSERT as statements (spec 080 PR 1).
+statement ok
+SET threads = 4;
+
+statement ok
+SELECT mssql_exec('mgn', 'DROP TABLE IF EXISTS dbo.mgn_big; CREATE TABLE dbo.mgn_big (id int PRIMARY KEY, v int); INSERT INTO dbo.mgn_big SELECT value, 0 FROM GENERATE_SERIES(1, 800)');
+
+statement ok
+BEGIN;
+
+query I
+MERGE INTO mgn.dbo.mgn_big AS t USING (SELECT i::INTEGER AS id FROM range(1, 3001) r(i)) AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = 1
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, 2);
+----
+3000
+
+query II
+SELECT count(*) FILTER (WHERE v = 1), count(*) FILTER (WHERE v = 2) FROM mgn.dbo.mgn_big;
+----
+800	2200
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM mgn.dbo.mgn_big;
+----
+3000
+
+statement ok
+RESET threads;
+
+# DuckDB refuses a target row matched twice; nothing is sent.
+statement error
+MERGE INTO mgn.dbo.mgn_t AS t USING (SELECT * FROM (VALUES (1, 1), (1, 2)) AS x(id, w)) AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = s.w;
+----
+more than once
+
+statement ok
+SELECT mssql_exec('mgn', 'DROP TABLE dbo.mgn_t; DROP TABLE dbo.mgn_s; DROP TABLE dbo.mgn_big');
+
+statement ok
+DETACH mgn;

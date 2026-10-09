@@ -19,6 +19,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 
 #include "copy/load_transaction.hpp"
 #include "duckdb/common/shared_ptr.hpp"
@@ -56,6 +57,15 @@ public:
 	bool IsPinned() const {
 		return transaction_pinned_;
 	}
+
+	//! Spec 080 PR 1: one batch at a time on the pinned connection. The sinks
+	//! of one plan share it -- a MERGE's UPDATE / DELETE / INSERT actions are
+	//! fed from several threads -- so each batch, from its send to the end of
+	//! its response, holds the transaction's materialize lock
+	//! (MSSQLCatalog::MaterializeMutexFor), the one a materialising scan and
+	//! the bulk-load stream take. Empty in autocommit, where the statement's
+	//! connection is its own. Call after Acquire.
+	std::unique_lock<std::mutex> LockPinned(ClientContext &context, MSSQLCatalog &catalog) const;
 
 	//! After the last batch: COMMIT in autocommit, then the connection goes back
 	//! through ConnectionProvider (a no-op for the pinned one). Throws if the

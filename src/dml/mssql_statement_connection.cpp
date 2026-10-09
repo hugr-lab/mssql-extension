@@ -107,6 +107,13 @@ bool MSSQLStatementConnection::DisableIdentityInsert(int timeout_ms) noexcept {
 	return confirmed;
 }
 
+std::unique_lock<std::mutex> MSSQLStatementConnection::LockPinned(ClientContext &context, MSSQLCatalog &catalog) const {
+	if (!transaction_pinned_) {
+		return std::unique_lock<std::mutex>();
+	}
+	return std::unique_lock<std::mutex>(catalog.MaterializeMutexFor(context));
+}
+
 void MSSQLStatementConnection::Commit(ClientContext &context, MSSQLCatalog &catalog) {
 	if (!connection_) {
 		return;

@@ -50,20 +50,8 @@ MSSQLDeleteExecutor::MSSQLDeleteExecutor(ClientContext &context, const MSSQLDele
 	DELETE_DEBUG(1, "DeleteExecutor: effective_batch_size=%llu (params_per_row=%llu)",
 				 (unsigned long long)effective_batch_size_, (unsigned long long)statement_->GetParametersPerRow());
 
-	// Check if we need to defer execution until Finalize
-	// This is required when in an explicit transaction because:
-	// 1. The scan uses the pinned connection to stream rowids
-	// 2. DELETE batches would need the same pinned connection
-	// 3. But the connection is in "Executing" state while streaming
-	// Solution: Buffer all rowids during Sink, execute in Finalize after scan completes
-	if (!context.transaction.IsAutoCommit()) {
-		auto &catalog = Catalog::GetCatalog(context, Identifier(target_.catalog_name));
-		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
-		if (ConnectionProvider::IsInTransaction(context, mssql_catalog)) {
-			defer_execution_ = true;
-			DELETE_DEBUG(1, "DeleteExecutor: defer_execution=true (in transaction)");
-		}
-	}
+	// Batches go out as the rows arrive, in a transaction too: the scan feeding
+	// the DELETE is materialised at init (spec 080 PR 1, as for UPDATE).
 }
 
 MSSQLDeleteExecutor::~MSSQLDeleteExecutor() = default;
@@ -91,8 +79,7 @@ idx_t MSSQLDeleteExecutor::Execute(DataChunk &chunk) {
 		pending_pk_values_.push_back(std::move(pk));
 
 		// Check if we need to flush the batch
-		// In defer_execution_ mode, we accumulate everything and flush in Finalize
-		if (!defer_execution_ && pending_pk_values_.size() >= effective_batch_size_) {
+		if (!config_.defer_to_finalize && pending_pk_values_.size() >= effective_batch_size_) {
 			DELETE_DEBUG(1, "Execute: batch full, flushing %llu rows...",
 						 (unsigned long long)pending_pk_values_.size());
 			auto result = FlushBatch();
@@ -109,8 +96,8 @@ idx_t MSSQLDeleteExecutor::Execute(DataChunk &chunk) {
 }
 
 MSSQLDMLResult MSSQLDeleteExecutor::Finalize() {
-	DELETE_DEBUG(1, "Finalize: starting, finalized=%d, pending=%llu, defer_execution=%d", finalized_,
-				 (unsigned long long)pending_pk_values_.size(), defer_execution_);
+	DELETE_DEBUG(1, "Finalize: starting, finalized=%d, pending=%llu", finalized_,
+				 (unsigned long long)pending_pk_values_.size());
 
 	if (finalized_) {
 		return MSSQLDMLResult::Success(total_rows_deleted_, batch_count_);
@@ -119,7 +106,6 @@ MSSQLDMLResult MSSQLDeleteExecutor::Finalize() {
 	finalized_ = true;
 
 	// Flush all remaining rows in batches
-	// In defer_execution_ mode, we may have accumulated many batches worth of rows
 	while (!pending_pk_values_.empty()) {
 		DELETE_DEBUG(1, "Finalize: flushing batch, pending=%llu", (unsigned long long)pending_pk_values_.size());
 		auto result = FlushBatch();
@@ -194,6 +180,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 		DELETE_DEBUG(1, "ExecuteBatch: failed to acquire connection");
 		return MSSQLDMLResult::Failure(string("DELETE execution failed: ") + e.what(), 0, batch_count_);
 	}
+	auto pinned_lock = stmt_conn_.LockPinned(context_, mssql_catalog);
 
 	DELETE_DEBUG(2, "ExecuteBatch: connection acquired");
 

@@ -678,8 +678,6 @@ SET mssql_dml_batch_size = 100;
 # Configure max parameters per batch (default: 2000)
 SET mssql_dml_max_parameters = 500;
 
-# Enable/disable prepared statements (default: true)
-SET mssql_dml_use_prepared = false;
 ```
 
 ### 7. Writing Transaction Tests

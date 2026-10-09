@@ -151,8 +151,6 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 		MSSQL_TE_DEBUG("GetScanFunction: %s.%s is a VIEW (rowid not supported)", mssql_schema.name.c_str(),
 					   name.c_str());
 	} else {
-		EnsurePKLoaded(context);
-
 		if (pk_info_.exists) {
 			// Table has a PK - populate rowid support fields
 			catalog_bind_data->rowid_requested = true;	// Mark as available for InitGlobal
@@ -268,9 +266,6 @@ void MSSQLTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, Log
 	//
 	MSSQL_TE_DEBUG("BindUpdateConstraints: ensuring PK loaded for %s.%s", schema.name.c_str(), name.c_str());
 
-	// Load PK info if not already loaded
-	EnsurePKLoaded(context);
-
 	if (!pk_info_.exists) {
 		throw BinderException(pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(),
 													"UPDATE/DELETE", catalog.GetName().GetIdentifierName()));
@@ -308,25 +303,11 @@ MSSQLSchemaEntry &MSSQLTableEntry::GetMSSQLSchema() {
 // Primary Key / RowId Support
 //===----------------------------------------------------------------------===//
 
-void MSSQLTableEntry::EnsurePKLoaded(ClientContext &context) const {
-	// Spec 084 D5: the key came with the metadata the entry was built from (the
-	// single-table batch's third result set, or the bulk loads'), so there is
-	// nothing to discover here. Until spec 084 this ran a key query per table
-	// -- per transaction, after a preload, on the pinned connection -- and
-	// cached a failed one; a failure now fails the metadata load instead, and
-	// nothing is cached.
-	(void)context;
-	D_ASSERT(pk_loaded_.load(std::memory_order_acquire));
-}
-
 LogicalType MSSQLTableEntry::GetRowIdType(ClientContext &context) {
 	// Views don't support rowid
 	if (object_type_ == MSSQLObjectType::VIEW) {
 		throw BinderException("MSSQL: rowid not supported for views");
 	}
-
-	// Ensure PK info is loaded
-	EnsurePKLoaded(context);
 
 	// Check if table has a usable key
 	if (!pk_info_.exists) {
@@ -343,14 +324,10 @@ bool MSSQLTableEntry::HasPrimaryKey(ClientContext &context) {
 		return false;
 	}
 
-	// Ensure PK info is loaded
-	EnsurePKLoaded(context);
-
 	return pk_info_.exists;
 }
 
 const mssql::RowIdKeyInfo &MSSQLTableEntry::GetPrimaryKeyInfo(ClientContext &context) {
-	EnsurePKLoaded(context);
 	return pk_info_;
 }
 

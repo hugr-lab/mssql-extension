@@ -346,10 +346,15 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 		"mssql_dml_max_parameters", "Maximum parameters per UPDATE/DELETE statement (SQL Server limit ~2100)",
 		LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_DML_MAX_PARAMETERS), ValidatePositive, SetScope::GLOBAL);
 
-	// mssql_dml_use_prepared - Use prepared statements for DML operations
-	config.AddExtensionOption("mssql_dml_use_prepared", "Use prepared statements for UPDATE/DELETE operations",
+	// mssql_dml_use_prepared - DEPRECATED (spec 080): read by nothing (the
+	// DMLConfig field it filled was used by nothing and is gone). Hidden from
+	// duckdb_settings() unless asked with deprecated := true. Kept
+	// registered for one release so `SET mssql_dml_use_prepared = …` in a
+	// .duckdbrc does not throw and abort the rest of the file; removed in the
+	// release after.
+	config.AddExtensionOption("mssql_dml_use_prepared", "Deprecated, has no effect; removed in the next release",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(MSSQL_DEFAULT_DML_USE_PREPARED), nullptr,
-							  SetScope::GLOBAL);
+							  SetScope::GLOBAL, false, true);
 
 	//===----------------------------------------------------------------------===//
 	// CTAS (CREATE TABLE AS SELECT) Settings
