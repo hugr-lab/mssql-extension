@@ -257,12 +257,28 @@ DELETE FROM one380.dbo.one380_src WHERE id > 1800;
 700
 
 # Two actions, both past one batch: they take turns at the one connection.
+# With one INSERT action DuckDB runs the actions in parallel, so the one that
+# waits does so for as long as the other's Finalize takes. The acquire timeout
+# is read at ATTACH, so this block uses an alias of its own with a generous one:
+# a test of the behaviour, not of the CI machine's speed (review of #423).
+statement ok
+SET mssql_acquire_timeout = 60;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS one380m (TYPE mssql);
+
+statement ok
+SET mssql_acquire_timeout = 3;
+
 query I
-MERGE INTO one380.dbo.one380_src AS t USING (SELECT i::INTEGER AS id FROM range(1, 3001) r(i)) AS s ON t.id = s.id
+MERGE INTO one380m.dbo.one380_src AS t USING (SELECT i::INTEGER AS id FROM range(1, 3001) r(i)) AS s ON t.id = s.id
 WHEN MATCHED THEN UPDATE SET v = 'm'
 WHEN NOT MATCHED THEN INSERT VALUES (s.id, 'n');
 ----
 3000
+
+statement ok
+DETACH one380m;
 
 query II
 SELECT count(*) FILTER (WHERE v = 'm'), count(*) FILTER (WHERE v = 'n') FROM one380.dbo.one380_src;

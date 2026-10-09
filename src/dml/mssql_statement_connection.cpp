@@ -131,6 +131,17 @@ MSSQLStatementConnection::PinnedLock MSSQLStatementConnection::LockPinned(Client
 	return PinnedLock(catalog.MaterializeMutexFor(context));
 }
 
+void MSSQLStatementConnection::RequireIdle(tds::TdsConnection &connection, const char *operation) {
+	if (connection.GetState() == tds::ConnectionState::Idle) {
+		return;
+	}
+	throw InvalidInputException(
+		"MSSQL %s: the transaction's connection is busy (state: %s) -- a result set is still being read on it. "
+		"The scan feeding the statement was not materialised (is the extension's optimizer disabled?); run the "
+		"statement outside the transaction, or re-enable the optimizer",
+		operation, tds::ConnectionStateToString(connection.GetState()));
+}
+
 void MSSQLStatementConnection::Commit(ClientContext &context, MSSQLCatalog &catalog) {
 	if (!connection_) {
 		return;

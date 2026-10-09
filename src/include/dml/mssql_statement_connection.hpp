@@ -85,6 +85,16 @@ public:
 	};
 	PinnedLock LockPinned(ClientContext &context, MSSQLCatalog &catalog) const;
 
+	//! The runtime net under the plan-time rule that a DML's feeding scan is
+	//! materialised before the first batch (CollectSinkCatalogs; review of
+	//! #423). That rule is set by MSSQLOptimizer, which DuckDB skips under
+	//! `SET enable_optimizer = false` / `disabled_optimizers = 'extension'`;
+	//! a batch sent then would clear the receive buffer of a scan still reading
+	//! on the pinned connection, and the scan would misread rather than fail.
+	//! Throws, touching nothing, when the connection is not Idle. Call after
+	//! LockPinned, before anything is sent or cleared.
+	static void RequireIdle(tds::TdsConnection &connection, const char *operation);
+
 	//! After the last batch: COMMIT in autocommit, then the connection goes back
 	//! through ConnectionProvider (a no-op for the pinned one). Throws if the
 	//! server refuses the commit — the transaction is then rolled back and the

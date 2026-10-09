@@ -392,7 +392,16 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 
 	// Load DML configuration from settings
 	MSSQLDMLConfig config = LoadDMLConfig(context);
-	config.defer_to_finalize = planning_merge_actions;
+	// Always for a MERGE action, not only where the actions share a connection.
+	// In autocommit on a larger pool each action has its own connection and
+	// its own server transaction, committed at its Finalize; streaming, an
+	// UPDATE action would hold its locks while an INSERT action's bulk load (BU
+	// lock under TABLOCK on a heap) waits on them, the INSERT pipeline would
+	// stall, DuckDB's exchange would block the MERGE, and the UPDATE action
+	// would never reach the Finalize that commits -- a cycle through the
+	// client that SQL Server's deadlock detector cannot see. Deferred, every
+	// action writes after every sink has finished. The cost is the rows held
+	// in memory; spec 080 PR 4 gives the actions one connection instead.
 
 	// Result type is BIGINT (row count)
 	vector<LogicalType> result_types;
@@ -486,7 +495,16 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 
 	// Load DML configuration from settings
 	MSSQLDMLConfig config = LoadDMLConfig(context);
-	config.defer_to_finalize = planning_merge_actions;
+	// Always for a MERGE action, not only where the actions share a connection.
+	// In autocommit on a larger pool each action has its own connection and
+	// its own server transaction, committed at its Finalize; streaming, an
+	// UPDATE action would hold its locks while an INSERT action's bulk load (BU
+	// lock under TABLOCK on a heap) waits on them, the INSERT pipeline would
+	// stall, DuckDB's exchange would block the MERGE, and the UPDATE action
+	// would never reach the Finalize that commits -- a cycle through the
+	// client that SQL Server's deadlock detector cannot see. Deferred, every
+	// action writes after every sink has finished. The cost is the rows held
+	// in memory; spec 080 PR 4 gives the actions one connection instead.
 
 	// Result type is BIGINT (row count)
 	vector<LogicalType> result_types;

@@ -181,6 +181,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 		return MSSQLDMLResult::Failure(string("DELETE execution failed: ") + e.what(), 0, batch_count_);
 	}
 	auto pinned_lock = stmt_conn_.LockPinned(context_, mssql_catalog);
+	MSSQLStatementConnection::RequireIdle(*connection, "DELETE");
 
 	DELETE_DEBUG(2, "ExecuteBatch: connection acquired");
 
