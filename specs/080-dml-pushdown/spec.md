@@ -2,7 +2,8 @@
 
 **Status:** revised 2026-10-08 after the reconnaissance in
 `recon-2026-10-08.md`, merged with oluies' design-review revision (#421, 21
-findings). Its decisions are folded in and marked "(#421)". That file holds the code inventory, the DuckDB API at
+findings, then 12 more from its branch review in `e2940db`). Its decisions are
+folded in and marked "(#421)". That file holds the code inventory, the DuckDB API at
 `4fbae437b22` and the Fabric/Synapse matrix, each with sources. This spec
 cites it as "R§n". The first draft (2026-09-17, PR #364) is superseded; its
 measured ground still stands in `../065-dml-pushdown-recon/` and is cited
@@ -147,21 +148,45 @@ No gain threshold applies. A DML either goes whole or plans as today.
 
 `RemoteExecute` returns a ref to one of two table functions. Both bind with
 no describe and no execution (081's bind, R§3), so `EXPLAIN` and `PREPARE`
-change nothing. Both set the statement properties a native DML has
-(`result_eagerness = FORCED`, and `CHANGED_ROWS` for the count form;
-bind_update.cpp:287-289). Without them, a streaming client would not finish
-the DML until it fetched, and row-count APIs would change. Both also call
-`RegisterDBModify` on the binder (R§1).
+change nothing.
 
-Read-only is refused with the shipped path's class and message, through
+**At least once: the vehicles keep a DML's eagerness (#421).** The DML binders
+set `ResultEagerness::FORCED` (`bind_update.cpp:288`, `bind_delete.cpp:130`,
+`bind_insert.cpp:722`). A statement bound as a SELECT gets `AUTO`
+(`bind_select.cpp:10`), which is streamable. A pushed UPDATE opened as a
+stream and closed unconsumed (JDBC `executeQuery` + `close`, the C API stream
+fetch) could then never run, where the shipped path always completes inside
+the call. The extension restores both properties itself, with no upstream
+change:
+- **`FORCED`.** `Bind(SelectStatement)` sets `AUTO` *before* it binds the node
+  (`bind_select.cpp:9-11`). The vehicle's bind runs inside that, later, and
+  writes `input.binder->GetStatementProperties().result_eagerness = FORCED`.
+  `GetStatementProperties()` is the global binder state shared by every child
+  binder (`binder.cpp:234`), and the planner copies it after binding
+  (`planner.cpp:250`).
+- **`CHANGED_ROWS`.** `Bind(SelectStatement)` already gives a bare table-function
+  passthrough the function's own `call_return_type` (`bind_select.cpp:14-19`).
+  `SELECT * FROM <ref>` is exactly the shape the rewriter builds
+  (`WrapRemoteRef`), so the count form declares `call_return_type =
+  CHANGED_ROWS`.
+
+Only `StatementType` stays `SELECT`. W8 asserts at-least-once from the
+outside: open a stream over a pushed UPDATE, close it without consuming a
+row, and assert the rows changed. **PR 3 does not merge if that assertion
+fails.** It is the one finding that could veto the pushed half.
+
+**Read-only** is refused with the shipped path's class and message, through
 `MSSQLCatalog::CheckWriteAccess` (#421), at two points:
 - in the dry run, so the statement takes the shipped path, whose hook
   refuses it;
 - in the vehicle's bind, so no route around the dry run can execute a write.
 
-`RegisterDBModify` adds what `CheckWriteAccess` cannot: DuckDB's own refusal
-for a read-only *database* (`SET access_mode = read_only`) and its
-one-writable-database-per-transaction rule.
+There is one contract, not two. A database **opened** read-only
+(`duckdb --readonly`) propagates `AccessMode::READ_ONLY` into the ATTACH, so
+the catalog is already `IsReadOnly()`. `SET access_mode` cannot make one at
+all, because `AccessModeSetting::OnGlobalSet` throws while the database runs.
+W8 therefore opens the database read-only. `RegisterDBModify` in the vehicle's
+bind adds DuckDB's one-writable-database-per-transaction rule.
 
 **Exactly once (#421).** A vehicle has one global init and no parallel local
 state. It is not a scan: there is no range to split and nothing to
@@ -172,7 +197,7 @@ twice affects its rows twice, as the shipped path does.
 **What still changes for a client (#421).** The statement's
 `StatementType` stays `SELECT`, since the rewriter wraps the vehicle in a
 SELECT. A binding keyed on the statement type rather than on the
-`CHANGED_ROWS` property would see a query. This is documented next to 079's
+return type would see a query. This is documented next to 079's
 "result types change for a pushed statement", with `mssql_dml_pushdown`
 (D5) as the way back.
 
@@ -210,9 +235,20 @@ SELECT. A binding keyed on the statement type rather than on the
   - The shape is the RETURNING list typed by the writer, read through the
     081 trusted-shape check.
 
-After a pushed DML, the target table's row count is invalidated in the
-statistics provider (`InvalidateTable`). The table's metadata is not touched:
-no epoch bump, describe cache kept (R§3).
+**After a pushed DML** the target's cached row count and statistics entry are
+invalidated. How depends on the transaction (#421):
+- **In autocommit:** the shared entry is invalidated, as COPY and CTAS do
+  today.
+- **In an explicit transaction:** the change is uncommitted on the pinned
+  connection, so the shared cache must not learn it. The path is
+  `NoteTransactionChange(context, schema, table)`, plus
+  `NoteTransactionChangeLocally` where the transaction's own later reads must
+  stop trusting the shared entry. That is the route the catalog's own DDL
+  takes: COMMIT publishes, ROLLBACK forgets (#380, #383). W8 asserts that a
+  rolled-back pushed DML leaves the shared cache exactly as it was.
+
+The table's column metadata is not touched: no epoch bump, describe cache
+kept (R§3).
 
 ## D2: what a veto leads to
 
@@ -243,42 +279,47 @@ The key is resolved per table at plan time:
      - a VOLATILE function appears in WHERE or SET;
      - the WHERE is not fully pushed to the scan (067 § 1: both sides must
        compare under the same semantics; first draft § D3).
-   - **Which columns match.** Every column the server can compare exactly.
-     Left out by type:
-     - `text`, `ntext`, `image`, `xml`, `geometry`, `geography`, which cannot
-       be in an `=`;
-     - `cast_required` columns (`sql_variant`, `hierarchyid`, CLR types),
-       which read lossily.
+   - **The key is every column of the table, or a refusal (#421).** A column
+     that cannot be in the key does not shrink it; it refuses the statement.
+     A key over a subset is sound only if the **target** is unique on that
+     subset. The stage cannot show that: it holds the selected rows, not the
+     table, and proving it costs a round trip and still races. Every refusal
+     is answerable at plan time, from the column metadata and the statement's
+     shape. The test is **round-trip fidelity**, not server comparability:
+     the staged value is read into a DuckDB type and written back. There are
+     two reasons, and the refusal names which one applies:
+     - **"the catalog does not read its value":**
+       - `is_cast_required` columns (read as NVARCHAR(MAX): `sql_variant`,
+         `hierarchyid`, CLR UDT);
+       - `xml` and `image` by name, because `is_cast_required` is false for
+         both (`IsKnownSQLServerType` lists them);
+       - `is_geometry` columns (`geometry`, `geography`);
+       - `text` / `ntext`.
+     - **"its value does not survive the round trip":**
+       - `datetime` (1/300 s ticks);
+       - `time(7)` and `datetimeoffset(7)` (100 ns on the server, µs in
+         DuckDB).
 
-     The MAX types (`varchar(max)`, `nvarchar(max)`, `varbinary(max)`) **are**
-     comparable and stay in the key. They may be left out for cost only when
-     neither the SET nor the WHERE reads them (#421; W3 measures the cost).
-   - **The WHERE is re-applied on the target side of the JOIN.** Rung 3
-     requires it to be fully pushed. That is what makes leaving columns out
-     sound: a target row that the WHERE did not select can never match, even
-     when its compared columns equal a selected row's.
+       These are exactly what `IsLiteralMismatch` already refuses on rung 2
+       (#358). Mis-keyed, they would match nothing and report **0 rows with
+       no error**.
+
+     Rungs 2 and 3 ask one shared predicate, `IsRoundTripExactForKey`,
+     factored where `IsLiteralMismatch` lives, so a column rung 2 refuses by
+     name can never be silently mis-keyed by rung 3. The MAX types compare
+     exactly and stay in the key.
    - **`UPDATE … FROM` / `DELETE … USING` on rung 3 are refused by name.**
-     The join condition is not a scan filter, so it cannot be re-applied on
-     the target side. Such a table needs a key.
-   - A SET expression may not read a column left out by type. Two rows equal on the
-     compared columns would then take different new values, and the server's
-     `UPDATE … FROM … JOIN` would take an arbitrary one of them without
-     raising anything (#421). Refused by name, naming the column and its type
-     ("`t.payload` is `xml`: the server cannot compare it, and the SET reads
-     it — add a unique index").
-   - A `time(7)` / `datetimeoffset(7)` / out-of-range `datetime2(7)` column
-     reads lossily. It is compared by the microsecond range below; an
-     out-of-range one reads as NULL and is left out.
+     Their join selects rows on the client, which is outside "the WHERE is
+     fully pushed". Such a table needs a key.
    - **On rung 3 the stage carries the old values (the match) and the new
      values (the SET).** So a SET of any column is allowed there: the "no SET
      of a key column" rule exists for rungs 1–2 only.
-   - The stage is DISTINCT over the old values of the compared columns
-     together with the new values. Because the SET reads only compared
-     columns and is deterministic, two staged rows with equal old values carry
-     equal new values. Without the DISTINCT, Fabric's MERGE fallback fails
-     with 8672 on duplicate stage rows.
-   - **Duplicates move together.** Target rows identical in every compared
-     column are one match, so they are updated or deleted together. A row
+   - The stage is DISTINCT over the key, which is every column. A
+     deterministic SET over equal rows gives equal new values, so the
+     DISTINCT loses nothing. Without it, Fabric's MERGE fallback fails with
+     8672 on duplicate stage rows.
+   - **Duplicates move together.** Target rows identical in every column are
+     one match, so they are updated or deleted together. A row
      DuckDB's plan selected once can therefore count twice. This is the
      documented semantics of a keyless table, stated in the docs (W9) and in
      acceptance 3, not compared by the agreement harness.
@@ -298,9 +339,11 @@ The key is resolved per table at plan time:
   every rung stages.
 - **Everything else**: a session-local `#stage_<uuid>` on the statement's own
   connection. A `#` name, not `##`: the stage is filled on the statement's
-  own connection, so no other session needs to see it, and a `#` name stays
-  clear of spec 063 D1's refusal of a second bulk-load writer against a
-  session-scoped target (#421).
+  own connection, so no other session needs to see it.
+  - A `#` name is **caught** by spec 063 D1 (`target_is_session_scoped` sets
+    `policy.max_writers = 1`), so the stage fill is single-writer. That is
+    what this path wants, since the rows go down one connection anyway, and
+    it is a throughput ceiling W3 measures (#421).
   - The connection is taken at the **first `Sink`**, never at init
     (`BulkLoadSession::DeferAdoption` / `AdoptDeferred`, as COPY and CTAS
     do). On a pool of one, the source scan has given the connection back by
@@ -326,23 +369,23 @@ The key is resolved per table at plan time:
   If one statement ever proves too much for the log, the way back is a
   key-stable generation guard in the stage, not batching as it stands.
 
-**#358** (a `datetime` key that never matches):
-- **The cause.** The key is read as a microsecond TIMESTAMP and sent back as
-  a `datetime2(7)` value. The server compares `datetime` with `datetime2`
-  exactly, and the two never meet.
-- **The fix, on both delivery forms.** The key is converted to **the column's
-  own type** before the comparison:
-  - the `VALUES` literal is rendered `CAST(… AS datetime)`;
-  - the stage column is declared `datetime`. BCP sends it as `datetime2`, and
+**#358, a proposal measured in W3** (until then `IsRoundTripExactForKey`
+refuses these columns on both rungs, as rung 2 does today):
+- **The cause.** A `datetime` key is read as a microsecond TIMESTAMP and sent
+  back as a `datetime2(7)` value. The server compares `datetime` with
+  `datetime2` exactly, and the two never meet.
+- **The proposed fix:** convert the key to **the column's own type** before
+  the comparison.
+  - The `VALUES` literal is rendered `CAST(… AS datetime)`.
+  - The stage column is declared `datetime`; BCP sends it as `datetime2` and
     the server rounds it to the tick (write_column_ops.cpp:145).
-  - Either way, it lands on the same 1/300 s tick as the stored value.
-- **`time(7)` and `datetimeoffset(7)`** lose their 100 ns digit on read; an
-  out-of-range `datetime2(7)` reads as NULL. These match by the microsecond
-  range: `t.c >= s.c AND t.c < DATEADD(microsecond, 1, s.c)`. As a rowid key
-  they stay refused on rungs 1–2 (077), where a range could match two rows.
-- **`datetime2(7)` in range is lossless** (it reads as TIMESTAMP_NS) and needs
-  nothing.
-- W3 measures all of this before #358 is closed.
+  - Either way it should land on the stored value's 1/300 s tick.
+  - **If W3 measures that exact** across the tick values, `datetime` leaves
+    the refusal list on both rungs and #358 closes for it.
+- **`time(7)` and `datetimeoffset(7)`** lose their 100 ns digit on read; no
+  conversion recovers it. They stay refused.
+- **`datetime2(7)` in range is lossless** (it reads as TIMESTAMP_NS). Out of
+  range it reads as NULL, and the refusal covers it.
 
 | step | SQL Server / Azure | Fabric |
 |---|---|---|
@@ -465,7 +508,16 @@ collation, lengths: the WITH options keep their meaning) followed by a pushed
 `INSERT … SELECT`, run on one connection in one server transaction, so a
 failed load leaves no table behind.
 
-- It needs `EXECUTE_STATEMENT`, a **catalog-wide** claim.
+- It needs `EXECUTE_STATEMENT`, a **catalog-wide** claim, fixed at ATTACH
+  like `IS_REMOTE` (079 D6), so `mssql_dml_pushdown` cannot withdraw it
+  (#421).
+  - It is claimed only from the PR that adds pushed CTAS (PR 5), and only
+    when the catalog's ATTACH-time `remote_pushdown` answer is on. PRs 1–4
+    change no DDL routing.
+  - Once it is claimed, `mssql_dml_pushdown = false` restores pre-080
+    **behaviour**, not pre-080 **routing**: DDL still passes through the
+    rewriter's DDL path, is vetoed there, and lands on the shipped path
+    unchanged.
   `SupportsPushdown(const SQLStatement &)` answers false for every other
   shape: DROP, ALTER, CREATE SCHEMA and CREATE VIEW keep the shipped path,
   and W8 asserts that.
@@ -487,6 +539,13 @@ failed load leaves no table behind.
 - When CTAS is vetoed, the rewriter still pushes its query alone, as today.
 - **Droppable.** It is the one shape that needs a round trip before it can
   decide. If it is dropped, nothing in the other PRs changes.
+- **A known regression, kept (#421).** Over a SELECT the server cannot
+  describe, pushed CTAS fails where the shipped path succeeds (075's F1
+  runs such a batch at bind). By describe time the CREATE has already been
+  replaced, so there is no shipped path left to hand it back to. Moving the
+  describe earlier would cost a round trip at optimize time on every CTAS,
+  `EXPLAIN` included. `mssql_dml_pushdown = false` is the way back, and a W8
+  case covers it.
 
 ## Work
 
@@ -511,6 +570,14 @@ failed load leaves no table behind.
 - The unique-source rule for `UPDATE … FROM`.
 
 ### W3: the ladder and the stage
+- `IsRoundTripExactForKey`, shared by rungs 2 and 3, with the two named
+  refusals (#421).
+- `mssql_test_force_intersect_join_form`: a registered test-only setting,
+  off by default, in the style of `mssql_test_fail_metadata_after_rows`.
+  The integration lane is a release build against SQL Server 2022, which
+  takes the operator, so without it the INTERSECT form (the default, and the
+  only form correct everywhere) would never run in CI (#421).
+- The stage-fill rate of a large keyless statement (single-writer by 063 D1).
 - Rung 3.
 - `#stage` with columns typed as the target's, both fills, the JOIN / MERGE
   forms per platform, `null_safe`, the volatile and unpushed-predicate
@@ -572,7 +639,14 @@ From #421:
 - DROP / ALTER / CREATE SCHEMA / CREATE VIEW unchanged after the
   `EXECUTE_STATEMENT` claim;
 - `mssql_dml_pushdown = false`;
-- the read-only refusals: catalog, `access_mode`, both guards.
+- the read-only refusals: a read-only catalog and a database opened
+  read-only, both guards, one message;
+- **at least once**: a pushed UPDATE opened as a stream and closed unconsumed
+  changed its rows (PR 3's gate);
+- a rolled-back pushed DML leaves the shared cache as it was;
+- keyless tables with an `xml`, a `geometry`, a `text`, a `time(7)` and a
+  `datetime` column: each refused by name with its reason, never 0 rows;
+- pushed CTAS over an undescribable SELECT: the documented failure.
 
 And these:
 - `UPDATE` / `DELETE … RETURNING` on both paths: rows match DuckDB's own
@@ -631,6 +705,11 @@ merge, which is why they come first.
 - ON CONFLICT through `MERGE` (Open).
 - A per-session pushdown switch, for the DML half or the read half (079 D6:
   `Supports` takes no `ClientContext`).
+- **A reduced rung-3 key** (#421): dropping a column for cost or because it
+  cannot be read, and keeping the statement. It is sound only if the target
+  is unique on the rest, which the stage cannot establish. Earlier drafts
+  carried it, including this revision's "re-apply the WHERE" form; it is
+  withdrawn for the simpler all-or-refusal rule.
 - Batching the rung-3 UPDATE behind a generation guard (D3 names the hazard;
   one statement is the decision until a measurement makes it untenable).
 
@@ -666,9 +745,13 @@ merge, which is why they come first.
   reports a false duplicate match (D4).
 - **The join-form probe** errs toward the INTERSECT form on an unknown
   edition. That form is correct everywhere and only slower on 2022+.
-- **Rung 3 on a table with a column that cannot compare**, when the SET reads
-  that column, has no rung 3 and is refused by name. Such a table needs a
-  unique index (#421).
+- **Rung 3 on a table with an unusable column** (`xml`, `geometry`,
+  `sql_variant`, `hierarchyid`, `text` / `ntext` / `image`, `datetime`,
+  `time(7)`, `datetimeoffset(7)`) has no rung 3 and is refused by name. That
+  is a real table shape this spec does not make writable; the fix for the
+  user is a unique index (#421).
+- **At least once** depends on the vehicle setting `FORCED` from its bind.
+  W8's assertion proves it, and it gates PR 3 (#421).
 
 ## Open, decided later
 
@@ -705,4 +788,10 @@ merge, which is why they come first.
 9. A read-only catalog and a read-only database each refuse every pushed
    write, through both guards, with the shipped path's message (#421).
 10. `mssql_dml_pushdown = false` leaves pushed SELECTs pushed and sends every
-    DML down D3's path (#421).
+    DML down D3's path. Once `EXECUTE_STATEMENT` is claimed, it restores
+    behaviour, not routing (#421).
+11. A keyless UPDATE or DELETE over a `datetime`, `time(7)` or
+    `datetimeoffset(7)` column is refused by name and never reports 0 rows;
+    rungs 2 and 3 answer through the same predicate (#421).
+12. A pushed DML opened as a streaming result and closed unconsumed still
+    changed its rows (#421).
