@@ -329,6 +329,13 @@ jobs:
             test/cpp/test_rowid_key_choice.cpp -o /tmp/test_rowid_key_choice
           /tmp/test_rowid_key_choice
 
+      # Spec 080 D0: the platform table of DML forms.
+      - name: Build + run DML capabilities unit test (spec 080 D0)
+        run: |
+          c++ -std=c++17 -pthread -I src/include \
+            test/cpp/test_dml_capabilities.cpp -o /tmp/test_dml_capabilities
+          /tmp/test_dml_capabilities
+
       - name: Build + run IDENTITY_INSERT unit test (spec 077 W2)
         run: |
           c++ -std=c++17 -pthread -I src/include \

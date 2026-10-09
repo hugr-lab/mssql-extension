@@ -113,6 +113,45 @@ inline bool IsLiteralMismatch(const std::string &type_name, uint8_t scale) {
 	return (t == "time" || t == "datetimeoffset") && scale == 7;
 }
 
+//! Spec 080 D3: whether a column's value, read into DuckDB and written back,
+//! still equals the stored value -- the question a key column must answer yes
+//! to, on rung 2 (a unique index) and on rung 3 (every column of a keyless
+//! table) alike, so a column one rung refuses by name the other can never
+//! silently mis-key into a 0-row UPDATE.
+enum class KeyFidelity : uint8_t {
+	Exact,		  //!< read losslessly, compares exactly
+	NotRead,	  //!< the catalog does not read its value (CAST, LOB, spatial)
+	NotRoundTrip  //!< read, but rounded: no literal matches it (#358)
+};
+
+//! cast_required: MSSQLColumnInfo::is_cast_required (sql_variant, hierarchyid,
+//! CLR UDTs -- read as NVARCHAR(MAX)). xml, image, text, ntext and the spatial
+//! types are named, because the catalog knows those types (no CAST flag) and
+//! still cannot match by them: xml / image / text / ntext do not compare, and
+//! a spatial value is read as WKB, not as the stored serialisation.
+inline KeyFidelity IsRoundTripExactForKey(const std::string &type_name, uint8_t scale, bool cast_required) {
+	if (cast_required) {
+		return KeyFidelity::NotRead;
+	}
+	const std::string t = Lower(type_name);
+	if (t == "xml" || t == "image" || t == "text" || t == "ntext" || t == "geometry" || t == "geography") {
+		return KeyFidelity::NotRead;
+	}
+	if (IsLiteralMismatch(type_name, scale)) {
+		return KeyFidelity::NotRoundTrip;
+	}
+	return KeyFidelity::Exact;
+}
+
+//! The type as a refusal spells it: `time(7)`, not `time`.
+inline std::string SpelledKeyType(const std::string &type_name, uint8_t scale) {
+	const std::string t = Lower(type_name);
+	if ((t == "time" || t == "datetimeoffset") && scale == 7) {
+		return type_name + "(7)";
+	}
+	return type_name;
+}
+
 //! Why this candidate cannot address a row. `reason` is empty when it can;
 //! `unmatchable` marks the two reasons that are about the key's TYPE rather
 //! than its shape.
@@ -142,15 +181,16 @@ inline RowIdKeyRejection Unusable(const RowIdKeyCandidate &c) {
 		}
 	}
 	for (const auto &col : c.columns) {
-		if (col.cast_required) {
+		switch (IsRoundTripExactForKey(col.type_name, col.scale, col.cast_required)) {
+		case KeyFidelity::Exact:
+			break;
+		case KeyFidelity::NotRead:
 			r.reason = "its key column '" + col.name + "' has type " + col.type_name +
 					   ", which is read through a lossy CAST and cannot identify its row (see issue #354)";
 			r.unmatchable = true;
 			return r;
-		}
-		if (IsLiteralMismatch(col.type_name, col.scale)) {
-			const std::string spelled = col.type_name + (Lower(col.type_name) == "datetime" ? "" : "(7)");
-			r.reason = "its key column '" + col.name + "' has type " + spelled +
+		case KeyFidelity::NotRoundTrip:
+			r.reason = "its key column '" + col.name + "' has type " + SpelledKeyType(col.type_name, col.scale) +
 					   ", which no rowid literal can match (see issue #358)";
 			r.unmatchable = true;
 			return r;
@@ -192,6 +232,11 @@ inline bool Before(const RowIdKeyCandidate &a, const RowIdKeyCandidate &b) {
 }
 
 }  // namespace rowid_key_detail
+
+// Rung 3 (a keyless table keyed by every column) asks the same question.
+using rowid_key_detail::IsRoundTripExactForKey;
+using rowid_key_detail::KeyFidelity;
+using rowid_key_detail::SpelledKeyType;
 
 //! The choice. Step 1: the primary key, if usable. Steps 2-5 order the usable
 //! unique indexes; they order rather than filter, because duplicate indexes

@@ -356,6 +356,24 @@ PhysicalOperator &MSSQLCatalog::PlanMergeInto(ClientContext &context, PhysicalPl
 	return Catalog::PlanMergeInto(context, planner, op, plan);
 }
 
+// Spec 080 (review of #422): Synapse dedicated accepts PRIMARY KEY / UNIQUE
+// only as NOT ENFORCED, so a key there can match several rows and an UPDATE /
+// DELETE through it can hit rows the statement did not select. The host test
+// cannot tell dedicated from serverless, and serverless refuses DML itself, so
+// every UPDATE / DELETE through the catalog is refused on the whole domain:
+// a behaviour change on a platform without a test environment, chosen over a
+// wrong-rows hazard. mssql_exec() still sends what the user writes.
+static void RefuseKeyedDmlOnSynapse(const MSSQLCatalog &catalog, const char *verb, MSSQLTableEntry &table_entry) {
+	if (!catalog.GetDmlCapabilities().IsSynapse()) {
+		return;
+	}
+	throw NotImplementedException(
+		"MSSQL: %s on '%s.%s' is not supported on Azure Synapse: its PRIMARY KEY and UNIQUE constraints are NOT "
+		"ENFORCED, so a key can match rows the statement did not select. Use mssql_exec() to run the statement on "
+		"the server",
+		verb, table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName());
+}
+
 PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
 										   PhysicalOperator &plan) {
 	// Check write access first (throws if read-only)
@@ -363,6 +381,7 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 
 	// Get the target table entry
 	auto &table_entry = op.table.Cast<MSSQLTableEntry>();
+	RefuseKeyedDmlOnSynapse(*this, "DELETE", table_entry);
 
 	// The operator returns the affected count, never rows. Planned with
 	// RETURNING, DuckDB's projection over it read the BIGINT count as the
@@ -425,6 +444,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 
 	// Get the target table entry
 	auto &table_entry = op.table.Cast<MSSQLTableEntry>();
+	RefuseKeyedDmlOnSynapse(*this, "UPDATE", table_entry);
 
 	// The operator returns the affected count, never rows. Planned with
 	// RETURNING, DuckDB's projection over it read the BIGINT count as the

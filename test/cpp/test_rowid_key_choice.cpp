@@ -208,6 +208,27 @@ int main() {
 		CHECK(r.rejections.size() == 2, "both unusable ones are listed");
 	}
 
+	// --- spec 080 D3: the predicate rungs 2 and 3 share
+	{
+		CHECK(IsRoundTripExactForKey("int", 0, false) == KeyFidelity::Exact, "int is exact");
+		CHECK(IsRoundTripExactForKey("nvarchar", 0, false) == KeyFidelity::Exact, "nvarchar (incl. MAX) is exact");
+		CHECK(IsRoundTripExactForKey("datetime2", 7, false) == KeyFidelity::Exact,
+			  "datetime2(7) reads as TIMESTAMP_NS");
+		CHECK(IsRoundTripExactForKey("smalldatetime", 0, false) == KeyFidelity::Exact, "smalldatetime has no fraction");
+		CHECK(IsRoundTripExactForKey("time", 6, false) == KeyFidelity::Exact, "time(6) fits microseconds");
+		CHECK(IsRoundTripExactForKey("datetime", 3, false) == KeyFidelity::NotRoundTrip, "datetime: 1/300 s ticks");
+		CHECK(IsRoundTripExactForKey("time", 7, false) == KeyFidelity::NotRoundTrip, "time(7): 100 ns digit lost");
+		CHECK(IsRoundTripExactForKey("DATETIMEOFFSET", 7, false) == KeyFidelity::NotRoundTrip,
+			  "datetimeoffset(7), any case");
+		CHECK(IsRoundTripExactForKey("sql_variant", 0, true) == KeyFidelity::NotRead, "a CAST column is not read");
+		const char *named[] = {"xml", "image", "text", "ntext", "geometry", "geography"};
+		for (auto t : named) {
+			CHECK(IsRoundTripExactForKey(t, 0, false) == KeyFidelity::NotRead, std::string(t) + " is named");
+		}
+		CHECK(SpelledKeyType("time", 7) == "time(7)", "time(7) spelled with its scale");
+		CHECK(SpelledKeyType("datetime", 3) == "datetime", "datetime spelled bare");
+	}
+
 	if (g_failures) {
 		std::cout << "FAIL: " << g_failures << " check(s)" << std::endl;
 		return 1;

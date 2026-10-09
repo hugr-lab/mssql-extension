@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy counters-test help
+.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -591,6 +591,18 @@ test-rowid-key-choice:
 	@echo ""
 	@echo "Running ChooseRowIdKey unit test..."
 	build/test/test_rowid_key_choice
+
+# Spec 080 D0: DmlCapabilities::Resolve -- the DML forms each platform takes and
+# when rung 3 may use IS NOT DISTINCT FROM. Header-only, no server, no linking.
+test-dml-capabilities:
+	@echo "Building DmlCapabilities unit test (spec 080 D0)..."
+	@mkdir -p build/test
+	$(CXX) $(INDEX_KIND_TEST_FLAGS) $(INDEX_KIND_TEST_INCLUDES) \
+	    test/cpp/test_dml_capabilities.cpp \
+	    -o build/test/test_dml_capabilities
+	@echo ""
+	@echo "Running DmlCapabilities unit test..."
+	build/test/test_dml_capabilities
 
 # Spec 077 W2: the IDENTITY_INSERT bracket text and the explained server
 # refusals (1088 / 8106 / 8107). Header-only, no server, no linking.
