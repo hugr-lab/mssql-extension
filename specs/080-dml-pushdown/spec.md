@@ -17,9 +17,14 @@ from there.
 - RETURNING works where the platform can return rows and is refused by name
   where it cannot. It never ends in an InternalException.
 - MERGE INTO works, natively, and pushed when both sides are remote.
-- **Closes #140 on SQL Server / Azure SQL.** It was reopened on 2026-10-08:
-  #364 closed it with text, not code. Fabric follows once the probe settles
-  `stage_bulk` (Fabric's `merge` is GA, D0). Synapse keeps today's refusal. A keyless
+- **Closes #140 on SQL Server / Azure SQL in PR 2.** It was reopened on
+  2026-10-08: #364 closed it with text, not code. **Fabric:** the keyless path
+  there (stage filled with `INSERT … VALUES`, the staged DML a `MERGE`) needs
+  no `stage_bulk`. It hangs on one construct, a correlated
+  `EXISTS (SELECT t.c… INTERSECT SELECT s.c…)` in a `MERGE … ON` clause, which
+  `fabric-probe/p18_merge_on_intersect` settles. Until p18 has passed on a live
+  warehouse, a keyless statement on Fabric is refused by name in PR 2; the row
+  flips with the probe (review of #422). Synapse keeps today's refusal. A keyless
   statement with a volatile function, or with a predicate the scan does not
   push, is refused by name on every platform.
 
@@ -34,10 +39,19 @@ from there.
   below.
 - Fabric Warehouse: per the platform rule in D0.
 - Synapse dedicated: no test environment. Today's DML path is kept, with no
-  pushdown and no stage, and documented as untested. The one change there:
-  UPDATE / DELETE … RETURNING is refused by name instead of ending in the
-  InternalException. Telling it apart
-  from Azure SQL needs `EngineEdition` (D0).
+  pushdown and no stage, and documented as untested, with two changes:
+  - UPDATE / DELETE … RETURNING is refused by name instead of ending in the
+    InternalException (PR 1);
+  - **a rowid key must be enforced** (review of #422). Synapse dedicated
+    accepts PRIMARY KEY / UNIQUE only as `NOT ENFORCED`, so such a key can
+    match several rows and a keyed UPDATE / DELETE can hit rows the statement
+    did not select. `ChooseRowIdKey` gains "the key is not enforced" beside
+    "disabled" and "filtered" (`sys.indexes` / `sys.key_constraints` carry
+    it), so on Synapse every UPDATE / DELETE through the catalog is refused by
+    name. That is a behaviour change on a platform we cannot test, chosen over
+    a wrong-rows hazard (PR 2).
+
+  The host test tells Synapse apart (D0).
 - Synapse serverless: no DML at all.
 
 ---
@@ -105,12 +119,16 @@ DML node back). It answers yes only when all of these hold:
   asked for every node whose result is one remote catalog (opt:315) and for
   nested nodes (opt:205), the same way for a statement-top DML and for
   `WITH c AS (UPDATE ms.t … RETURNING *) SELECT * FROM c` (review of #422).
-  The mechanism is 079's per-rewrite thread state: the writer's dry run of an
-  enclosing node records the DML nodes it meets as CTE bodies, and a later
-  `SupportsPushdown` of one of those nodes answers no. W2 verifies DuckDB's
-  call order (enclosing node before nested); **if it is the other way round,
-  a DML node with a RETURNING list is vetoed outright** until a mechanism
-  exists, since that is the only DML that can be a CTE body. The expected
+  **The rule is: a DML node with a RETURNING list is not pushed** (review of
+  #422). DuckDB accepts a DML as a CTE body only with RETURNING (a checked
+  claim, W2), so this vetoes every CTE-body DML without needing to know the
+  node's position, and without an identity key that a plan copy (079's
+  inlined CTEs) could break. The cost: a top-level `UPDATE … RETURNING` is not
+  pushed either; it runs on D3, with RETURNING through `OUTPUT … INTO @o` from
+  PR 2. `mssql_dml_returning`, the row vehicle, is therefore kept in the
+  design but **not built in PR 3**; it comes back with a position mechanism
+  (079's per-rewrite thread state, keyed by something a copy preserves) when
+  one is measured to work. The expected
   behaviour of the CTE case is then the shipped path: the CTE's DML runs on
   D3, RETURNING through `OUTPUT … INTO @o` where the platform has it, refused
   by name where not. An `EXPLAIN` wraps the statement and the DML inside is
@@ -214,11 +232,21 @@ all, because `AccessModeSetting::OnGlobalSet` throws while the database runs.
 W8 therefore opens the database read-only. `RegisterDBModify` in the vehicle's
 bind adds DuckDB's one-writable-database-per-transaction rule.
 
-**Exactly once (#421).** A vehicle has one global init and no parallel local
-state. It is not a scan: there is no range to split and nothing to
-re-initialise. A table function DuckDB initialised twice would run the UPDATE
-twice, so this invariant is load-bearing. A `PREPARE`d pushed DML executed
-twice affects its rows twice, as the shipped path does.
+**Where it executes: InitGlobal** (review of #422), as the 075 read path
+does. Not at bind (EXPLAIN / PREPARE), not lazily on the first scan call: the
+at-least-once gate, exactly-once and the pool-of-one behaviour all rest on one
+known point. On a pool of one the vehicle takes the connection there and
+gives it back before its result is returned.
+
+**Exactly once (#421), enforced.** A vehicle has one global init and no
+parallel local state. It is not a scan: there is no range to split and
+nothing to re-initialise. A table function DuckDB initialised twice would run
+the UPDATE twice, so the argument is backed by a **run-once latch** in the
+bind data: a second InitGlobal of the same bound vehicle throws a named
+InternalException instead of writing twice (review of #422). A future DuckDB
+change that copies or re-initialises the plan then fails loudly. A `PREPARE`d
+pushed DML executed twice affects its rows twice, as the shipped path does:
+each EXECUTE rebinds, so each has its own latch.
 
 **What still changes for a client (#421).** The statement's
 `StatementType` stays `SELECT`, since the rewriter wraps the vehicle in a
@@ -226,6 +254,13 @@ SELECT. A binding keyed on the statement type rather than on the
 return type would see a query. This is documented next to 079's
 "result types change for a pushed statement", with `mssql_dml_pushdown`
 (D5) as the way back.
+
+**Constants are parameters** (review of #422). The writer renders a DML's
+constants as `@pN`, as it does a pushed SELECT's (079 through 076/083's
+`SqlParamSet`), and the vehicle sends the statement as `sp_executesql` over
+RPC, with `@rc bigint OUTPUT` added when `exact_count` holds. One plan per
+statement shape, which matters most on the write path, where one shape
+repeats.
 
 **A server error inside a transaction** (review of #422) takes the path a
 shipped DML batch's error takes today: `MSSQLStatementConnection::Fail` on the
@@ -394,7 +429,15 @@ The key is resolved per table at plan time:
     then (#421).
   - The stage is filled fully first, then the JOIN runs (first draft § D3:
     no scan ∥ DML pipelining; rung 3 cannot seek).
-  - The stage is dropped on the way out.
+  - The stage is dropped on the way out, including on failure (review of
+    #422). A statement that throws mid-fill unwinds through destructors on
+    worker threads with no `ClientContext` (the #178 / #191 contract), as a
+    failed bulk load does: the cleanup follows `ReleaseBcpConnectionOnError`,
+    with its `reset_on_release` parameter carried and never defaulted. An Idle
+    connection gets `DROP TABLE #stage_<uuid>`; one left mid-response is
+    closed rather than pooled, unless it is pinned, where the transaction's end
+    takes it. Without that, `mssql_reset_connection = false` would let
+    repeated failures accumulate `#stage_*` tables in a pooled session.
 
 **Batching (#421):**
 - The `VALUES`-join statements keep today's sizing (`mssql_dml_batch_size`,
@@ -576,8 +619,10 @@ failed load leaves no table behind.
   - The types then go through the shipped CTAS type mapping
     (`mssql_ctas_text_type`, `mssql_default_string_length`,
     `mssql_utf8_collation`, `mssql_default_table_kind`).
-  - A describe the server cannot answer is a **veto at execution**, never
-    075's run-for-the-shape fallback.
+  - A describe the server cannot answer **fails the statement at execution**,
+    never 075's run-for-the-shape fallback. It is not a veto in this spec's
+    sense (decline and let the shipped path run): by then there is no shipped
+    path left (see the kept regression below).
 - `OR REPLACE` / `IF NOT EXISTS` / `WITH (table_kind = …)` behave as they do
   on the shipped CTAS.
 - After it, the catalog is invalidated as the shipped CTAS invalidates it
@@ -602,12 +647,17 @@ failed load leaves no table behind.
   `MSSQLStatementConnection`).
 - RETURNVALUE parsing for the `exact_count` OUTPUT parameter.
 - `ExecuteDmlBatch`, with the four DML loops folded into it.
-- Statistics invalidation after a DML on both paths (today's path does none,
-  R§3).
+- Statistics invalidation after a pushed DML (the staged / `VALUES` path gets
+  its own in PR 2, W3).
 
 ### W2: the writer's DML nodes
 - `WriteUpdate` / `WriteDelete` / `WriteInsertSelect` / `WriteMerge`, with
   the platform forms of D1.
+- **The DML path bypasses `SQLWriter::PushesMoreThanScan`** and the join /
+  `mssql_pushdown_min_rows` thresholds (R§3): they veto every non-SELECT, and
+  a DML is decided on renderability alone (review of #422).
+- The RETURNING veto (D1), and a test pinning the claim it rests on: DuckDB
+  refuses a DML CTE body without RETURNING.
 - Columns resolved against the entries 079 D1 recorded for this rewrite, on
   this thread (#421). Never a fresh lookup by name: without a `ClientContext`
   that lookup reads the shared cache and misses the transaction's own layer
@@ -618,6 +668,10 @@ failed load leaves no table behind.
 - The unique-source rule for `UPDATE … FROM`.
 
 ### W3: the ladder and the stage
+- Row-count / statistics invalidation after a `VALUES` or staged DML, landing
+  with the staged path in PR 2 rather than with the pushed path in PR 3, so
+  the planner never reads a stale count between the two (review of #422).
+- The enforced-key requirement in `ChooseRowIdKey` (Synapse `NOT ENFORCED`).
 - `IsRoundTripExactForKey`, shared by rungs 2 and 3, with the two named
   refusals (#421).
 - `mssql_test_force_intersect_join_form`: a registered test-only setting,
@@ -677,8 +731,11 @@ From the first draft:
 
 From #421:
 - the agreement harness: the same DSN attached twice, once with the ATTACH
-  option `remote_pushdown false`, every pushed shape compared on table state
-  and `Count`;
+  option `remote_pushdown false`. For each pushed shape: seed the table, run
+  the statement through the pushed alias, read the state and `Count`;
+  re-seed, run it through the other alias, read again; compare. The final
+  state is read through the `remote_pushdown false` alias both times, so the
+  reader itself is never pushed (review of #422);
 - exactly once (`threads = 4`; `PREPARE` executed twice);
 - rung 3's hazards: the `(1, 1)` / `(2, 2)` `SET a = a + 1` shape forced past
   the threshold and the batch size; keyless tables with an `xml` / a
@@ -734,7 +791,9 @@ Also:
 - DATAMODEL: the DML flow (rewriter → one statement | plan → ladder →
   stage);
 - the CLAUDE.md DML line and the new settings (`mssql_dml_pushdown`,
-  `mssql_dml_stage_threshold`);
+  `mssql_dml_stage_threshold`, and the test-only
+  `mssql_test_force_intersect_join_form`, documented as the other
+  `mssql_test_*` options are);
 - CHANGELOG;
 - "what a pushed DML changes for a client" (#421).
 
@@ -748,7 +807,7 @@ risk", and this spec is no smaller. Each PR merges before the next opens
 |---|---|---|
 | **1** | W4 (the 066 remainder: sinks, defer removed, pool of one); RETURNING on UPDATE / DELETE **refused by name** at plan time (the InternalException fix); W6 | fixes UPDATE / DELETE on a pool of one and the crash, behind no setting |
 | **2** | W3 (the ladder, rung 3, `#stage`, `mssql_dml_stage_threshold`, #358) and W5's capability read (`EngineEdition` / `ProductMajorVersion`); RETURNING through `OUTPUT … INTO @o` on the fallback where `output_into_tvar` holds; the `fabric-probe/` run if the warehouse answers by then (the rows it settles flip, one line each) | closes #140 and #358 with no rewriter involved |
-| **3** | W1 + W2 (the vehicles, the exact count, `ExecuteDmlBatch`, the writer's UPDATE / DELETE / INSERT … SELECT, `mssql_dml_pushdown`); the agreement harness | pushed DML end to end, PR 2's path under every veto |
+| **3** | W1 + W2 (the count vehicle, the run-once latch, the exact count, `ExecuteDmlBatch`, the writer's UPDATE / DELETE / INSERT … SELECT, `mssql_dml_pushdown`); the agreement harness | pushed DML end to end, PR 2's path under every veto |
 | **4** | W7: one statement connection for a MERGE's actions (atomic in autocommit), pushed MERGE | MERGE on top of PRs 2–3 (PR 1 already made the native MERGE run in a transaction and on a pool of one, #423) |
 | **5** | D6 (pushed CTAS) and its docs; W9's final pass | droppable without touching PRs 1–4: every earlier PR carries its own docs |
 
@@ -853,8 +912,11 @@ merge, which is why they come first.
 10. `mssql_dml_pushdown = false` leaves pushed SELECTs pushed and sends every
     DML down D3's path. Once `EXECUTE_STATEMENT` is claimed, it restores
     behaviour, not routing (#421).
-11. A keyless UPDATE or DELETE over a `datetime`, `time(7)` or
-    `datetimeoffset(7)` column is refused by name and never reports 0 rows;
-    rungs 2 and 3 answer through the same predicate (#421).
+11. A keyless UPDATE or DELETE over a `time(7)` or `datetimeoffset(7)`
+    column is refused by name and never reports 0 rows; rungs 2 and 3 answer
+    through the same predicate (#421). The same holds for `datetime`
+    **unless W3 measured the column-type conversion exact**, in which case a
+    `datetime` key matches on both rungs and #358 closes for it (review of
+    #422).
 12. A pushed DML opened as a streaming result and closed unconsumed still
     changed its rows (#421).

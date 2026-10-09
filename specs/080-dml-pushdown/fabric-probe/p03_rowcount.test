@@ -12,7 +12,13 @@ require-env AZURE_WH_TOKEN
 statement ok
 ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (TYPE mssql, ACCESS_TOKEN '{AZURE_WH_TOKEN}');
 
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.p080_03_t; CREATE TABLE dbo.p080_03_t (id INT NOT NULL, v INT); INSERT INTO dbo.p080_03_t VALUES (1,10),(2,20),(3,30)');
+
 query I
-SELECT * FROM mssql_scan_unsafe('wh', 'UPDATE dbo.p080_t SET v = v + 1 WHERE id IN (1, 2); SELECT CAST(@@ROWCOUNT AS BIGINT) AS rc', columns := {'rc': 'BIGINT'});
+SELECT * FROM mssql_scan_unsafe('wh', 'UPDATE dbo.p080_03_t SET v = v + 1 WHERE id IN (1, 2); SELECT CAST(@@ROWCOUNT AS BIGINT) AS rc', columns := {'rc': 'BIGINT'});
 ----
 X
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.p080_03_t');

@@ -1,0 +1,26 @@
+# name: p18_merge_on_intersect
+# group: [fabric_probe]
+
+require mssql
+
+require-env AZURE_WH_HOST
+
+require-env AZURE_WH_NAME
+
+require-env AZURE_WH_TOKEN
+
+statement ok
+ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (TYPE mssql, ACCESS_TOKEN '{AZURE_WH_TOKEN}');
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.p080_18_t; CREATE TABLE dbo.p080_18_t (a INT NULL, b VARCHAR(10) NULL, v INT NULL); INSERT INTO dbo.p080_18_t VALUES (1, ''x'', 0), (NULL, ''y'', 0), (2, NULL, 0)');
+
+# The staged shape spec 080 D3 sends on Fabric for a keyless table: a #stage
+# matched by a correlated EXISTS (... INTERSECT ...) in the MERGE ON clause.
+query I
+SELECT * FROM mssql_scan_unsafe('wh', 'CREATE TABLE #stage (a INT NULL, b VARCHAR(10) NULL, v__new INT NULL); INSERT INTO #stage VALUES (1, ''x'', 1), (NULL, ''y'', 2); MERGE dbo.p080_18_t AS t USING #stage AS s ON EXISTS (SELECT t.a, t.b INTERSECT SELECT s.a, s.b) WHEN MATCHED THEN UPDATE SET v = s.v__new; SELECT COUNT(*) AS c FROM dbo.p080_18_t WHERE v > 0', columns := {'c': 'INTEGER'});
+----
+2
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.p080_18_t');

@@ -9,7 +9,7 @@ Each file answers one question from the Fabric column of
 | `p01_output` | OUTPUT |
 | `p02_output_into_tvar` | OUTPUT INTO a table variable |
 | `p03_rowcount` | `@@ROWCOUNT` |
-| `p04_out_param` | an OUTPUT parameter through `sp_executesql` |
+| `p04_out_param` | `SET @rc = ROWCOUNT_BIG()` into a `bigint OUTPUT` parameter through `sp_executesql` (the T-SQL form; the RPC RETURNVALUE path is W1's, tested on SQL Server) |
 | `p05_update_from_join` | UPDATE … FROM … JOIN, aliased target |
 | `p06_update_from_join_bare` | UPDATE … FROM … JOIN, bare target |
 | `p07_delete_from_join` | DELETE … FROM … JOIN |
@@ -23,7 +23,13 @@ Each file answers one question from the Fabric column of
 | `p15_bulk_into_temp` | `INSERT BULK` into `#stage` inside a transaction |
 | `p16_dml_count_done` | the DONE count of a plain UPDATE |
 | `p17_server_properties` | `EngineEdition`, `ProductMajorVersion`, `@@VERSION`, `DB_NAME()` |
+| `p18_merge_on_intersect` | the Fabric keyless shape: `MERGE … USING #stage ON EXISTS (… INTERSECT …)` |
 | `p99_cleanup` | drops the probe tables |
+
+**Each file is self-contained** (review of #422): it creates the table it
+reads and drops it at the end, so files can be run singly, in any order, and
+again. `p00_setup` / `p99_cleanup` cover only the shared tables of `p10`,
+`p11` and `p16`.
 
 **The files are probes, not tests.** The ones that ask a question expect a
 placeholder `X`, so a run prints the server's actual answer or its error
