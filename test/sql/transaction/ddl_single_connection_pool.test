@@ -12,6 +12,10 @@
 # and waited out mssql_acquire_timeout. It now runs on the pinned connection,
 # inside the transaction, as CTAS does since #380. A short acquire timeout
 # makes any path that still asks for a second connection fail in seconds.
+#
+# The SET of mssql_connection_limit must stay BEFORE the ATTACH: the limit is
+# read once, at ATTACH (LoadPoolConfig), so a SET after it leaves this file on
+# the pool-of-many path -- still green, testing nothing (review of #420).
 
 require mssql
 
