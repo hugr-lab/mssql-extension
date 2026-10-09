@@ -351,6 +351,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   together, and on a pool of one connection they take turns at it, bounded by
   `mssql_acquire_timeout`.
 
+- **A MERGE's `WHEN NOT MATCHED THEN INSERT (cols)` wrote NULL into the
+  columns it did not name**, where the server had a DEFAULT, and refused a
+  table with an IDENTITY column (spec 080 PR 1, review of #423). DuckDB binds
+  the action full width, with a copy of each column's bound default where the
+  INSERT named nothing; those columns now stay out of the INSERT, so the server
+  supplies their identity, DEFAULT or computed value, as for a plain INSERT.
+
+- **`INSERT … DEFAULT VALUES` sent an empty column list** and failed with
+  server error 102 (as did a MERGE action's `INSERT DEFAULT VALUES`). It is
+  refused by name until the statement builder has a `DEFAULT VALUES` form.
+
 - **UPDATE / DELETE … RETURNING ended in an InternalException** ("Vector::Reference
   used on vector of different type"), which invalidates the database. They are
   refused by name until RETURNING maps to T-SQL's OUTPUT (spec 080).

@@ -64,8 +64,26 @@ public:
 	//! its response, holds the transaction's materialize lock
 	//! (MSSQLCatalog::MaterializeMutexFor), the one a materialising scan and
 	//! the bulk-load stream take. Empty in autocommit, where the statement's
-	//! connection is its own. Call after Acquire.
-	std::unique_lock<std::mutex> LockPinned(ClientContext &context, MSSQLCatalog &catalog) const;
+	//! connection is its own, and when this thread already holds it (Fail runs
+	//! inside a batch as well as after one; std::mutex is not recursive). The
+	//! flag is per thread, not per mutex: no path holds one catalog's lock while
+	//! asking for another's, and the scans / bulk streams that take
+	//! MaterializeMutexFor directly never call Commit or Fail under it.
+	//! Commit and Fail take it for the IDENTITY_INSERT OFF batch. Call after
+	//! Acquire.
+	class PinnedLock {
+	public:
+		PinnedLock() = default;
+		explicit PinnedLock(std::mutex &mutex);
+		PinnedLock(PinnedLock &&other) noexcept;
+		PinnedLock &operator=(PinnedLock &&) = delete;
+		PinnedLock(const PinnedLock &) = delete;
+		~PinnedLock();
+
+	private:
+		std::unique_lock<std::mutex> lock_;
+	};
+	PinnedLock LockPinned(ClientContext &context, MSSQLCatalog &catalog) const;
 
 	//! After the last batch: COMMIT in autocommit, then the connection goes back
 	//! through ConnectionProvider (a no-op for the pinned one). Throws if the

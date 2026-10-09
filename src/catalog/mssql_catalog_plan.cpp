@@ -27,6 +27,16 @@ namespace duckdb {
 //! PlanInsert below (planning is single-threaded per statement).
 static thread_local bool planning_merge_actions = false;
 
+//! For each INSERT action of the MERGE being planned, in the order DuckDB plans
+//! them, which table columns (storage order) the action did NOT name. DuckDB
+//! binds a MERGE's INSERT action full width -- an unnamed column carries a copy
+//! of its bound default -- and copies every bound default into the synthesized
+//! LogicalInsert, so the null-slot tell PlanInsert uses for a plain INSERT does
+//! not exist there (review of #423). Filled by PlanMergeInto, consumed by
+//! PlanInsert.
+static thread_local vector<vector<bool>> merge_insert_unnamed;
+static thread_local idx_t merge_insert_next = 0;
+
 //===----------------------------------------------------------------------===//
 // Write Operations (all throw - read-only catalog)
 //===----------------------------------------------------------------------===//
@@ -51,7 +61,20 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	// Determine which columns are being inserted
 	// If no column map is specified, use all non-identity columns
 	vector<idx_t> insert_col_indices;
-	if (op.column_index_map.empty()) {
+	if (planning_merge_actions) {
+		// A MERGE's INSERT action: the columns it did not name stay out of the
+		// list, so the server applies their identity / DEFAULT / computed value,
+		// as for a plain INSERT (see merge_insert_unnamed).
+		if (merge_insert_next >= merge_insert_unnamed.size()) {
+			throw InternalException("MSSQL: MERGE INSERT action planned without its column set");
+		}
+		const auto &unnamed = merge_insert_unnamed[merge_insert_next++];
+		for (idx_t i = 0; i < mssql_columns.size(); i++) {
+			if (i >= unnamed.size() || !unnamed[i]) {
+				insert_col_indices.push_back(i);
+			}
+		}
+	} else if (op.column_index_map.empty()) {
 		// 2.0 no longer populates column_index_map: the binder expands the
 		// child plan to every physical column and fills the ones the INSERT
 		// did not name with their bound default. The tell is the move in
@@ -134,6 +157,16 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 				break;
 			}
 		}
+	}
+
+	// Every column left to the server is `INSERT … DEFAULT VALUES` (or a MERGE
+	// action's `INSERT DEFAULT VALUES`), which the statement builder has no
+	// form for: it sent an empty column list, refused with error 102.
+	if (insert_col_indices.empty()) {
+		throw NotImplementedException(
+			"MSSQL: INSERT ... DEFAULT VALUES is not supported yet on '%s.%s'; name "
+			"at least one column",
+			target.schema_name, target.table_name);
 	}
 
 	// Set insert column indices
@@ -265,15 +298,61 @@ PhysicalOperator &MSSQLCatalog::PlanCreateTableAs(ClientContext &context, Physic
 
 PhysicalOperator &MSSQLCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
 											  LogicalMergeInto &op, PhysicalOperator &plan) {
+	// Which columns each INSERT action did not name, in DuckDB's planning order
+	// (the actions map, then each vector -- Catalog::PlanMergeInto's loop). An
+	// unnamed column's expression is a copy of its bound default; a named one's
+	// refers to the action's projection, never a copy of the default.
+	vector<vector<bool>> unnamed_sets;
+	for (auto &entry : op.actions) {
+		for (auto &action : entry.second) {
+			if (action->action_type != MergeActionType::MERGE_INSERT) {
+				continue;
+			}
+			vector<bool> unnamed(op.bound_defaults.size(), false);
+			if (!action->column_index_map.empty()) {
+				// The deprecated form (a deserialized plan): the map says which
+				// physical column each expression fills.
+				for (auto &col : op.table.GetColumns().Physical()) {
+					const auto storage_idx = col.StorageOid();
+					if (storage_idx < unnamed.size()) {
+						unnamed[storage_idx] = action->column_index_map[col.Physical()] == DConstants::INVALID_INDEX;
+					}
+				}
+				unnamed_sets.push_back(std::move(unnamed));
+				continue;
+			}
+			idx_t expr_idx = 0;
+			for (auto &col : op.table.GetColumns().Physical()) {
+				const auto storage_idx = col.StorageOid();
+				if (expr_idx < action->expressions.size() && storage_idx < op.bound_defaults.size() &&
+					op.bound_defaults[storage_idx]) {
+					auto &expr = *action->expressions[expr_idx];
+					unnamed[storage_idx] = expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF &&
+										   expr.Equals(*op.bound_defaults[storage_idx]);
+				}
+				expr_idx++;
+			}
+			unnamed_sets.push_back(std::move(unnamed));
+		}
+	}
 	struct MergePlanningScope {
 		bool previous;
-		MergePlanningScope() : previous(planning_merge_actions) {
+		vector<vector<bool>> previous_sets;
+		idx_t previous_next;
+		MergePlanningScope(vector<vector<bool>> sets)
+			: previous(planning_merge_actions),
+			  previous_sets(std::move(merge_insert_unnamed)),
+			  previous_next(merge_insert_next) {
 			planning_merge_actions = true;
+			merge_insert_unnamed = std::move(sets);
+			merge_insert_next = 0;
 		}
 		~MergePlanningScope() {
 			planning_merge_actions = previous;
+			merge_insert_unnamed = std::move(previous_sets);
+			merge_insert_next = previous_next;
 		}
-	} scope;
+	} scope(std::move(unnamed_sets));
 	return Catalog::PlanMergeInto(context, planner, op, plan);
 }
 

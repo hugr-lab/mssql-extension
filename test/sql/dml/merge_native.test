@@ -98,6 +98,107 @@ SELECT count(*) FROM mgn.dbo.mgn_big;
 statement ok
 RESET threads;
 
+# An INSERT action that names some columns: the others keep their server-side
+# values -- identity, DEFAULT, computed -- as for a plain INSERT. DuckDB binds
+# the action full width, so this is decided in MSSQLCatalog::PlanMergeInto
+# (review of #423: a server DEFAULT was written NULL, an identity column refused).
+statement ok
+SELECT mssql_exec('mgn', 'DROP TABLE IF EXISTS dbo.mgn_def; CREATE TABLE dbo.mgn_def (id int IDENTITY(1,1) PRIMARY KEY, code int NOT NULL UNIQUE, v int NULL, created datetime2 NULL DEFAULT SYSDATETIME(), tag nvarchar(10) NOT NULL DEFAULT N''dflt'', twice AS (v * 2)); INSERT INTO dbo.mgn_def (code, v) VALUES (10, 1), (20, 2)');
+
+query I
+MERGE INTO mgn.dbo.mgn_def AS t USING (SELECT * FROM (VALUES (10, 100), (30, 300), (40, 400)) AS x(code, v)) AS s ON t.code = s.code
+WHEN MATCHED THEN UPDATE SET v = s.v
+WHEN NOT MATCHED THEN INSERT (code, v) VALUES (s.code, s.v);
+----
+3
+
+query IIIIII
+SELECT code, v, id IS NOT NULL, created IS NOT NULL, tag, twice FROM mgn.dbo.mgn_def ORDER BY code;
+----
+10	100	true	true	dflt	200
+20	2	true	true	dflt	4
+30	300	true	true	dflt	600
+40	400	true	true	dflt	800
+
+# The same inside a transaction, the INSERT action past one batch.
+statement ok
+BEGIN;
+
+query I
+MERGE INTO mgn.dbo.mgn_def AS t USING (SELECT (i + 1000)::INTEGER AS code FROM range(0, 1200) r(i)) AS s ON t.code = s.code
+WHEN NOT MATCHED THEN INSERT (code) VALUES (s.code);
+----
+1200
+
+query III
+SELECT count(*), count(*) FILTER (WHERE tag = 'dflt' AND created IS NOT NULL AND v IS NULL), count(DISTINCT id) FROM mgn.dbo.mgn_def WHERE code >= 1000;
+----
+1200	1200	1200
+
+statement ok
+ROLLBACK;
+
+# A NULL the INSERT action names is a NULL, not the column's DEFAULT: the
+# NOT NULL column refuses it.
+statement error
+MERGE INTO mgn.dbo.mgn_def AS t USING (SELECT 70 AS code) AS s ON t.code = s.code
+WHEN NOT MATCHED THEN INSERT (code, tag) VALUES (s.code, NULL);
+----
+NULL
+
+# An INSERT action that names the identity column, in a transaction, beside an
+# UPDATE action: IDENTITY_INSERT goes ON for the INSERT and OFF at its Commit,
+# under the pinned connection's batch lock (review of #423).
+statement ok
+BEGIN;
+
+query I
+MERGE INTO mgn.dbo.mgn_def AS t USING (SELECT * FROM (VALUES (10, 7, 9001), (50, 5, 9050)) AS x(code, v, id)) AS s ON t.code = s.code
+WHEN MATCHED THEN UPDATE SET v = s.v
+WHEN NOT MATCHED THEN INSERT (id, code, v) VALUES (s.id, s.code, s.v);
+----
+2
+
+query III
+SELECT id, code, v FROM mgn.dbo.mgn_def WHERE code IN (10, 50) ORDER BY code;
+----
+1	10	7
+9050	50	5
+
+statement ok
+COMMIT;
+
+# The same shape failing on the server (a duplicate code): the batch's Fail runs
+# inside the batch lock and turns IDENTITY_INSERT off without taking it again.
+statement ok
+BEGIN;
+
+statement error
+MERGE INTO mgn.dbo.mgn_def AS t USING (SELECT * FROM (VALUES (60, 6, 9060, 1), (61, 6, 9061, 1)) AS x(code, v, id, k)) AS s ON t.code = s.code
+WHEN NOT MATCHED THEN INSERT (id, code, v) VALUES (s.id, 20, s.v);
+----
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM mgn.dbo.mgn_def WHERE id IN (9060, 9061);
+----
+0
+
+# INSERT … DEFAULT VALUES has no statement form yet: refused by name, as an
+# INSERT and as a MERGE action (it sent an empty column list, error 102).
+statement error
+INSERT INTO mgn.dbo.mgn_def DEFAULT VALUES;
+----
+DEFAULT VALUES is not supported yet
+
+statement error
+MERGE INTO mgn.dbo.mgn_def AS t USING (SELECT 99 AS code) AS s ON t.code = s.code
+WHEN NOT MATCHED THEN INSERT DEFAULT VALUES;
+----
+DEFAULT VALUES is not supported yet
+
 # DuckDB refuses a target row matched twice; nothing is sent.
 statement error
 MERGE INTO mgn.dbo.mgn_t AS t USING (SELECT * FROM (VALUES (1, 1), (1, 2)) AS x(id, w)) AS s ON t.id = s.id
@@ -106,7 +207,7 @@ WHEN MATCHED THEN UPDATE SET v = s.w;
 more than once
 
 statement ok
-SELECT mssql_exec('mgn', 'DROP TABLE dbo.mgn_t; DROP TABLE dbo.mgn_s; DROP TABLE dbo.mgn_big');
+SELECT mssql_exec('mgn', 'DROP TABLE dbo.mgn_t; DROP TABLE dbo.mgn_s; DROP TABLE dbo.mgn_big; DROP TABLE dbo.mgn_def');
 
 statement ok
 DETACH mgn;
