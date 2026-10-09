@@ -101,8 +101,10 @@ SimilarCatalogEntry MSSQLSchemaEntry::GetSimilarEntry(CatalogTransaction transac
 		// that holds the pool's only connection. Otherwise the committed names,
 		// through a pool connection -- a hint does not pin a connection or open
 		// a server transaction. Catalog DDL inside a transaction marks the
-		// schema changed too, but it ran and committed on a pool connection
-		// and invalidated the shared names, so those are the right answer.
+		// schema changed too, but on a pool of many it ran and committed on a
+		// pool connection and invalidated the shared names, so those are the
+		// right answer; on a pool of one it ran on the pinned connection
+		// (#419), which the transaction then holds.
 		//
 		// The catalog's transaction exists by now whether or not the statement
 		// touched the catalog: DuckDB builds the CatalogTransaction it passes

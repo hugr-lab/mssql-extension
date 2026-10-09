@@ -1167,6 +1167,32 @@ void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql) {
 		throw IOException("MSSQL connection pool not initialized - cannot execute DDL");
 	}
 
+	// Catalog DDL runs on a pool connection and autocommits (spec 057) -- except
+	// in a transaction on a pool of ONE connection (issue #419), as CTAS does
+	// since #380: the transaction holds the only connection (any lookup it made
+	// pinned it), and a second Acquire waited out mssql_acquire_timeout. There
+	// it runs on the pinned connection, inside the transaction, and rolls back
+	// with it; COMMIT / ROLLBACK forget the names it changed
+	// (ForgetTransactionChanges), as for any change the transaction made.
+	if (!context.transaction.IsAutoCommit() && GetConnectionLimit() <= 1) {
+		auto connection = ConnectionProvider::GetConnection(context, *this);
+		if (!connection) {
+			throw IOException("Failed to get the transaction's connection for DDL execution");
+		}
+		SimpleQueryResult result;
+		try {
+			result = MSSQLSimpleQuery::Execute(*connection, tsql);
+		} catch (...) {
+			ConnectionProvider::ReleaseConnection(context, *this, connection);
+			throw;
+		}
+		ConnectionProvider::ReleaseConnection(context, *this, connection);
+		if (!result.success) {
+			throw CatalogException("MSSQL DDL error: %s", result.DescribeError());
+		}
+		return;
+	}
+
 	std::string why;
 	auto connection = connection_pool_->Acquire(-1, &why);
 	if (!connection) {
