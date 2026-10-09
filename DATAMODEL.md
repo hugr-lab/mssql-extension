@@ -905,8 +905,15 @@ This is the part that has changed most, and the two operators deliberately diffe
 
 | | connection for the DDL | connection(s) for the rows | inside an explicit transaction |
 |---|---|---|---|
-| `COPY … TO` | pool (`ExecuteDDL`, autocommits) | pool, one per writer | **pinned**, and exactly one writer — a second would sit outside the transaction, and COPY may be loading into a table it cannot undo |
+| `COPY … TO` | the load's own connection (`TargetResolver::CreateTable`): a pool one in autocommit, the pinned one in a transaction | pool, one per writer | **pinned**, and exactly one writer — a second would sit outside the transaction, and COPY may be loading into a table it cannot undo |
 | CTAS | pool (`ExecuteDDL`, autocommits) | pool, one per writer | **unchanged** — never pinned, still N writers; **except on a pool of ONE connection** (issue #380): the existence checks, the CREATE and the rows all go on the pinned connection, the rows as INSERT statements, and ROLLBACK undoes the table |
+
+On a pool of ONE connection in a transaction, `ExecuteDDL` itself runs on the
+pinned connection (issue #419): CTAS's DDL and every catalog DDL (`CREATE` /
+`DROP` / `ALTER TABLE`, `CREATE` / `DROP SCHEMA`) are then inside the
+transaction and roll back with it. Before, they asked the pool for a second
+connection the transaction was holding and waited out `mssql_acquire_timeout`.
+(COPY never went through `ExecuteDDL`: its CREATE is on the load's connection.)
 
 Since spec 063 that answer comes from ONE function rather than from each operator
 deriving it: `MSSQLResolveLoadPolicy` (`copy/load_policy.hpp`) reduces the whole
