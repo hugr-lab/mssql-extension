@@ -352,6 +352,10 @@ bool MSSQLTableEntry::HasPrimaryKey(ClientContext &context) {
 }
 
 const mssql::RowIdKeyInfo &MSSQLTableEntry::GetPrimaryKeyInfo(ClientContext &context) {
+	// Every load that publishes columns carries the key (spec 084 D5); an entry
+	// without it would answer "no key" here (review of #423: the assertion
+	// lived in EnsurePKLoaded, removed in spec 080 PR 1).
+	D_ASSERT(pk_loaded_.load(std::memory_order_acquire));
 	return pk_info_;
 }
 

@@ -10,6 +10,13 @@ SinkResultType MSSQLPhysicalStagedDml::Sink(ExecutionContext &context, DataChunk
 											OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<MSSQLStagedDmlGlobalSinkState>();
 	std::lock_guard<std::mutex> lock(gstate.mutex);
+	if (target_.hold_until_finalize) {
+		if (!gstate.held) {
+			gstate.held = make_uniq<ColumnDataCollection>(context.client, chunk.GetTypes());
+		}
+		gstate.held->Append(chunk);
+		return SinkResultType::NEED_MORE_INPUT;
+	}
 	gstate.staged.Execute(context.client, chunk);
 	return SinkResultType::NEED_MORE_INPUT;
 }
@@ -23,6 +30,12 @@ SinkFinalizeType MSSQLPhysicalStagedDml::Finalize(Pipeline &pipeline, Event &eve
 												  OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<MSSQLStagedDmlGlobalSinkState>();
 	std::lock_guard<std::mutex> lock(gstate.mutex);
+	if (gstate.held) {
+		for (auto &held_chunk : gstate.held->Chunks()) {
+			gstate.staged.Execute(context, held_chunk);
+		}
+		gstate.held.reset();
+	}
 	gstate.rows = gstate.staged.Finalize(context);
 	return SinkFinalizeType::READY;
 }

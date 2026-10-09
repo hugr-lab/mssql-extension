@@ -57,6 +57,8 @@ public:
 		: staged(context, target) {}
 
 	MSSQLStagedDml staged;
+	//! MSSQLStagedDmlTarget::hold_until_finalize: the rows, until Finalize.
+	unique_ptr<ColumnDataCollection> held;
 	idx_t rows = 0;
 	bool returned = false;
 	std::mutex mutex;

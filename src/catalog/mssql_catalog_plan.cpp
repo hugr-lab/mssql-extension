@@ -431,6 +431,37 @@ static string KeylessPlanRefusal(ClientContext &context, PhysicalOperator &plan,
 	return "";
 }
 
+//! Review of #423: a DML's batches go down the connection its feeding scans
+//! read from when that connection is shared -- the transaction's pinned one, or
+//! a pool of one -- so MSSQLOptimizer materialises those scans
+//! (MaterializeSharedConnectionScans, the same test). DuckDB skips the
+//! extension's optimizer under `SET enable_optimizer = false`; such a scan
+//! still streams when the first batch would go, and RequireIdle refuses it.
+//! Then the statement holds its rows until Finalize, after the scan drained,
+//! as every DML did before spec 080 PR 1.
+static bool FeedsFromStreamingScan(ClientContext &context, MSSQLCatalog &catalog, PhysicalOperator &op) {
+	if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+		auto &scan = op.Cast<PhysicalTableScan>();
+		if (scan.function.GetName().GetIdentifierName() == "mssql_catalog_scan" && scan.bind_data) {
+			auto &bind_data = scan.bind_data->Cast<MSSQLCatalogScanBindData>();
+			if (StringUtil::CIEquals(bind_data.context_name, catalog.GetContextName()) &&
+				!bind_data.requires_materialization) {
+				return true;
+			}
+		}
+	}
+	for (auto &child : op.children) {
+		if (FeedsFromStreamingScan(context, catalog, child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool ConnectionShared(ClientContext &context, MSSQLCatalog &catalog) {
+	return !context.transaction.IsAutoCommit() || catalog.GetConnectionLimit() <= 1;
+}
+
 //! Whether INSERT BULK can carry every column into the stage. A geometry /
 //! geography, alias or CLR type goes out under the VARCHAR fallback and fails
 //! mid-stream (BCPColumnMetadata::bulk_unsupported); such a statement keeps
@@ -521,6 +552,7 @@ static PhysicalOperator &PlanKeylessDml(ClientContext &context, PhysicalPlanGene
 	target.flush_rows = mssql::LoadBCPCopyConfig(context).flush_rows;
 	target.query_timeout_seconds = LoadQueryTimeout(context);
 	target.table_entry = &table_entry;
+	target.hold_until_finalize = ConnectionShared(context, catalog) && FeedsFromStreamingScan(context, catalog, plan);
 	vector<LogicalType> result_types{LogicalType::BIGINT};
 	auto &op = planner.Make<MSSQLPhysicalStagedDml>(std::move(result_types), estimated_cardinality, std::move(target));
 	op.children.push_back(plan);
@@ -593,7 +625,8 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	// client that SQL Server's deadlock detector cannot see. Deferred, every
 	// action writes after every sink has finished. The cost is the rows held
 	// in memory; spec 080 PR 4 gives the actions one connection instead.
-	config.defer_to_finalize = planning_merge_actions;
+	config.defer_to_finalize =
+		planning_merge_actions || (ConnectionShared(context, *this) && FeedsFromStreamingScan(context, *this, plan));
 
 	// Result type is BIGINT (row count)
 	vector<LogicalType> result_types;
@@ -716,7 +749,8 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 	// client that SQL Server's deadlock detector cannot see. Deferred, every
 	// action writes after every sink has finished. The cost is the rows held
 	// in memory; spec 080 PR 4 gives the actions one connection instead.
-	config.defer_to_finalize = planning_merge_actions;
+	config.defer_to_finalize =
+		planning_merge_actions || (ConnectionShared(context, *this) && FeedsFromStreamingScan(context, *this, plan));
 
 	// Result type is BIGINT (row count)
 	vector<LogicalType> result_types;

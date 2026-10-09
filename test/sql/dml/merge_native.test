@@ -177,6 +177,7 @@ statement error
 MERGE INTO mgn.dbo.mgn_def AS t USING (SELECT * FROM (VALUES (60, 6, 9060, 1), (61, 6, 9061, 1)) AS x(code, v, id, k)) AS s ON t.code = s.code
 WHEN NOT MATCHED THEN INSERT (id, code, v) VALUES (s.id, 20, s.v);
 ----
+Cannot insert duplicate key in object 'dbo.mgn_def'
 
 statement ok
 ROLLBACK;

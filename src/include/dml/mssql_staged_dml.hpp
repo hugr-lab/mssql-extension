@@ -78,6 +78,10 @@ struct MSSQLStagedDmlTarget {
 	//! The target's entry, for the planner's row estimate after a DELETE
 	//! (spec 080 W3). Alive for the query: the bind anchors hold it.
 	optional_ptr<MSSQLTableEntry> table_entry;
+	//! The scan feeding the statement shares its connection and streams (the
+	//! extension's optimizer did not run): hold every row until Finalize, when
+	//! the scan has drained (review of #423).
+	bool hold_until_finalize = false;
 };
 
 class MSSQLStagedDml {
