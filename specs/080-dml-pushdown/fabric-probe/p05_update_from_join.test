@@ -1,0 +1,24 @@
+# name: p05_update_from_join
+# group: [fabric_probe]
+
+require mssql
+
+require-env AZURE_WH_HOST
+
+require-env AZURE_WH_NAME
+
+require-env AZURE_WH_TOKEN
+
+statement ok
+ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (TYPE mssql, ACCESS_TOKEN '{AZURE_WH_TOKEN}');
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.p080_05_t; CREATE TABLE dbo.p080_05_t (id INT NOT NULL, v INT); INSERT INTO dbo.p080_05_t VALUES (1,10),(2,20),(3,30)');
+
+query I
+SELECT * FROM mssql_scan_unsafe('wh', 'CREATE TABLE #s (id int, v int); INSERT INTO #s VALUES (1, 100), (2, 200); UPDATE t SET t.v = s.v FROM dbo.p080_05_t AS t JOIN #s AS s ON t.id = s.id; SELECT CAST(@@ROWCOUNT AS BIGINT) AS rc', columns := {'rc': 'BIGINT'});
+----
+X
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.p080_05_t');

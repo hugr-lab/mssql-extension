@@ -1,0 +1,24 @@
+# name: p09_delete_exists
+# group: [fabric_probe]
+
+require mssql
+
+require-env AZURE_WH_HOST
+
+require-env AZURE_WH_NAME
+
+require-env AZURE_WH_TOKEN
+
+statement ok
+ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (TYPE mssql, ACCESS_TOKEN '{AZURE_WH_TOKEN}');
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.p080_09_t; CREATE TABLE dbo.p080_09_t (id INT NOT NULL, v INT); INSERT INTO dbo.p080_09_t VALUES (1,10),(2,20),(3,30)');
+
+query I
+SELECT * FROM mssql_scan_unsafe('wh', 'CREATE TABLE #s (id int); INSERT INTO #s VALUES (2); DELETE FROM dbo.p080_09_t WHERE EXISTS (SELECT 1 FROM #s AS s WHERE s.id = dbo.p080_09_t.id); SELECT COUNT(*) AS c FROM dbo.p080_09_t', columns := {'c': 'INTEGER'});
+----
+X
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.p080_09_t');

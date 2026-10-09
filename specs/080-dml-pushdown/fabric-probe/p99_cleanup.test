@@ -1,0 +1,16 @@
+# name: p99_cleanup
+# group: [fabric_probe]
+
+require mssql
+
+require-env AZURE_WH_HOST
+
+require-env AZURE_WH_NAME
+
+require-env AZURE_WH_TOKEN
+
+statement ok
+ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (TYPE mssql, ACCESS_TOKEN '{AZURE_WH_TOKEN}');
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.p080_t; DROP TABLE IF EXISTS dbo.p080_m; DROP TABLE IF EXISTS dbo.p080_m2; DROP TABLE IF EXISTS dbo.p080_c');

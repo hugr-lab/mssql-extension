@@ -1,0 +1,21 @@
+# name: p10_merge
+# group: [fabric_probe]
+
+require mssql
+
+require-env AZURE_WH_HOST
+
+require-env AZURE_WH_NAME
+
+require-env AZURE_WH_TOKEN
+
+statement ok
+ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (TYPE mssql, ACCESS_TOKEN '{AZURE_WH_TOKEN}');
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.p080_m; CREATE TABLE dbo.p080_m (id INT NOT NULL, v INT); INSERT INTO dbo.p080_m VALUES (1,10),(2,20),(3,30)');
+
+query I
+SELECT * FROM mssql_scan_unsafe('wh', 'CREATE TABLE #s (id int, v int); INSERT INTO #s VALUES (1, 1), (2, NULL), (9, 9); MERGE dbo.p080_m AS t USING #s AS s ON t.id = s.id WHEN MATCHED AND s.v IS NULL THEN DELETE WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v); SELECT CAST(@@ROWCOUNT AS BIGINT) AS rc', columns := {'rc': 'BIGINT'});
+----
+X
