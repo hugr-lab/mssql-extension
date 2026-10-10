@@ -27,8 +27,10 @@ enum class DmlPlatform : uint8_t {
 
 struct DmlCapabilities {
 	DmlPlatform platform = DmlPlatform::SqlServer;
-	//! `UPDATE … OUTPUT … INTO @t` (RETURNING on the staged / VALUES path).
-	bool output_into_tvar = false;
+	//! `UPDATE / DELETE … OUTPUT … INTO <table>` (RETURNING, spec 080 PR 2b: INTO
+	//! a session #out; works beside an enabled trigger, where a bare OUTPUT does
+	//! not).
+	bool output_into_table = false;
 	//! `UPDATE … FROM … JOIN`, `DELETE … FROM … JOIN`. Fabric documents neither.
 	bool update_from_join = false;
 	//! T-SQL MERGE.
@@ -59,7 +61,7 @@ struct DmlCapabilities {
 		caps.platform = platform;
 		switch (platform) {
 		case DmlPlatform::SqlServer:
-			caps.output_into_tvar = true;
+			caps.output_into_table = true;
 			caps.update_from_join = true;
 			caps.merge = true;
 			caps.stage_bulk = true;

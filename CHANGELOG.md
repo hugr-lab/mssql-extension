@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **UPDATE / DELETE … RETURNING** (spec 080 PR 2b). The rows go through the
+  same `#stage` as a large UPDATE / DELETE, whatever their number, and the
+  JOIN statement carries `OUTPUT inserted.* / deleted.* INTO #out`, which is
+  read back as the scan reads the table: UPDATE returns the rows as written
+  (computed and rowversion columns included), DELETE as they were, with the
+  `rowid`. `OUTPUT … INTO` works beside an enabled trigger, where a bare
+  `OUTPUT` is refused. Refused by name on Fabric and Synapse (no stage yet),
+  and where a key or SET column cannot be bulk-loaded (geometry).
+
 - **UPDATE and DELETE on a table with no key** (spec 080, #140). A table with
   no primary key and no usable unique index is keyed by all of its columns: the
   selected rows go into a session `#stage` by bulk load and one
@@ -404,8 +413,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused by name until the statement builder has a `DEFAULT VALUES` form.
 
 - **UPDATE / DELETE … RETURNING ended in an InternalException** ("Vector::Reference
-  used on vector of different type"), which invalidates the database. They are
-  refused by name until RETURNING maps to T-SQL's OUTPUT (spec 080).
+  used on vector of different type"), which invalidates the database. They now
+  return their rows (see Added).
 
 - **Catalog DDL in a transaction on a pool of one connection failed after
   `mssql_acquire_timeout`** (#419): `CREATE` / `DROP` / `ALTER TABLE` and

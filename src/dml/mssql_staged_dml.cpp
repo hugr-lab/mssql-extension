@@ -11,6 +11,7 @@
 #include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "query/mssql_identifier.hpp"
+#include "query/mssql_result_stream.hpp"
 #include "query/mssql_simple_query.hpp"
 
 namespace duckdb {
@@ -65,7 +66,40 @@ static bool IsCharacterString(const MSSQLColumnInfo &col) {
 	return t == "char" || t == "varchar" || t == "nchar" || t == "nvarchar" || t == "sysname";
 }
 
-string MSSQLStagedDml::JoinStatementSql(const MSSQLStagedDmlTarget &target, const string &stage_name) {
+static string OutName(idx_t i) {
+	return "c" + std::to_string(i);
+}
+
+//! A table column as RETURNING reads it, from `qualifier` (t. / inserted. /
+//! deleted.), named cN: the scan's own read expression (BuildReadExpression:
+//! spatial as WKB, legacy LOBs and CLR / alias types cast), so #out holds
+//! only what the read path decodes -- no UDT or schema-bound type has to exist
+//! in tempdb (review of 2b) -- and rowversion as binary(8), since OUTPUT
+//! cannot write a rowversion column.
+static string ReturningExpression(const MSSQLStagedDmlTarget &target, idx_t i, const string &qualifier) {
+	const auto &col = target.table_columns[i];
+	if (IsRowVersion(col)) {
+		return "CAST(" + qualifier + mssql::QuoteIdentifier(col.name) + " AS binary(8)) AS " +
+			   mssql::QuoteIdentifier(OutName(i));
+	}
+	return MSSQLColumnInfo::BuildReadExpression(col.name, col.sql_type_name, col.max_length, col.collation_name,
+												target.convert_varchar_max, qualifier, OutName(i));
+}
+
+string MSSQLStagedDml::CreateOutSql(const MSSQLStagedDmlTarget &target, const string &out_name) {
+	// Typed by SELECT INTO from the read expressions; the UNION ALL drops the
+	// IDENTITY property a bare column would carry over.
+	string list;
+	for (idx_t i = 0; i < target.table_columns.size(); i++) {
+		list += (i ? ", " : "") + ReturningExpression(target, i, "t.");
+	}
+	const auto from = " FROM " + mssql::QuoteIdentifier(target.schema_name) + "." +
+					  mssql::QuoteIdentifier(target.table_name) + " AS t WHERE 1 = 0";
+	return "SELECT " + list + " INTO " + mssql::QuoteIdentifier(out_name) + from + " UNION ALL SELECT " + list + from;
+}
+
+string MSSQLStagedDml::JoinStatementSql(const MSSQLStagedDmlTarget &target, const string &stage_name,
+										const string &out_name) {
 	// A stage row must match exactly the rows equal to it in every byte. A
 	// string compares under its collation -- case, accents, trailing spaces --
 	// so 'Ab' and 'ab' (on a _CI_ collation), or 'a' and 'a ', would each match
@@ -111,15 +145,26 @@ string MSSQLStagedDml::JoinStatementSql(const MSSQLStagedDmlTarget &target, cons
 	}
 	const auto table = mssql::QuoteIdentifier(target.schema_name) + "." + mssql::QuoteIdentifier(target.table_name);
 	const auto join = " FROM " + table + " AS t INNER JOIN " + mssql::QuoteIdentifier(stage_name) + " AS s ON " + on;
+	string output;
+	if (!out_name.empty()) {
+		const char *image = target.kind == MSSQLStagedDmlKind::DELETE_ROWS ? "deleted." : "inserted.";
+		string values;
+		string names;
+		for (idx_t i = 0; i < target.table_columns.size(); i++) {
+			values += (i ? ", " : "") + ReturningExpression(target, i, image);
+			names += (i ? ", " : "") + mssql::QuoteIdentifier(OutName(i));
+		}
+		output = " OUTPUT " + values + " INTO " + mssql::QuoteIdentifier(out_name) + " (" + names + ")";
+	}
 	if (target.kind == MSSQLStagedDmlKind::DELETE_ROWS) {
-		return "DELETE t" + join;
+		return "DELETE t" + output + join;
 	}
 	string set;
 	for (idx_t i = 0; i < target.set_columns.size(); i++) {
 		set += (set.empty() ? "" : ", ") + string("t.") + mssql::QuoteIdentifier(target.set_columns[i].name) + " = s." +
 			   mssql::QuoteIdentifier(NewValueName(i));
 	}
-	return "UPDATE t SET " + set + join;
+	return "UPDATE t SET " + set + output + join;
 }
 
 MSSQLStagedDml::MSSQLStagedDml(ClientContext &context, MSSQLStagedDmlTarget target)
@@ -128,6 +173,7 @@ MSSQLStagedDml::MSSQLStagedDml(ClientContext &context, MSSQLStagedDmlTarget targ
 	auto uuid = UUID::ToString(UUID::GenerateRandomUUID());
 	uuid.erase(std::remove(uuid.begin(), uuid.end(), '-'), uuid.end());
 	stage_name_ = "#stage_" + uuid;
+	out_name_ = "#out_" + uuid;
 }
 
 MSSQLStagedDml::~MSSQLStagedDml() = default;
@@ -201,13 +247,49 @@ void MSSQLStagedDml::Start(ClientContext &context) {
 void MSSQLStagedDml::BuildFillChunk(DataChunk &chunk) {
 	const idx_t key_count = target_.key_columns.size();
 	vector<reference<Vector>> columns;
-	if (target_.key_source == MSSQLStagedKeySource::TRAILING_COLUMNS) {
+	// The plan's key positions must fit the chunk and the key (issue #439):
+	// a drift between the two lists would stage the wrong columns silently.
+	if (!target_.key_chunk_index.empty()) {
+		const idx_t expected = target_.key_source == MSSQLStagedKeySource::TRAILING_COLUMNS ? key_count : 1;
+		if (target_.key_chunk_index.size() != expected) {
+			throw InternalException("MSSQL staged DML: %llu key position(s) for a key of %llu",
+									(unsigned long long)target_.key_chunk_index.size(), (unsigned long long)expected);
+		}
+		for (auto index : target_.key_chunk_index) {
+			if (index >= chunk.ColumnCount()) {
+				throw InternalException("MSSQL staged DML: key position %llu past the chunk's %llu columns",
+										(unsigned long long)index, (unsigned long long)chunk.ColumnCount());
+			}
+		}
+	}
+	if (target_.key_source == MSSQLStagedKeySource::TRAILING_COLUMNS && !target_.key_chunk_index.empty()) {
+		for (auto index : target_.key_chunk_index) {
+			columns.push_back(chunk.data[index]);
+		}
+	} else if (target_.key_source == MSSQLStagedKeySource::TRAILING_COLUMNS) {
 		if (chunk.ColumnCount() < key_count) {
 			throw InternalException("MSSQL staged DML: chunk has %llu columns, the key %llu",
 									(unsigned long long)chunk.ColumnCount(), (unsigned long long)key_count);
 		}
 		for (idx_t i = chunk.ColumnCount() - key_count; i < chunk.ColumnCount(); i++) {
 			columns.push_back(chunk.data[i]);
+		}
+	} else if (!target_.key_chunk_index.empty()) {
+		// Where the plan put the key (a DELETE's rowid is not always last:
+		// `WHERE rowid = …` binds it first, review of 2b).
+		auto &rowid = chunk.data[target_.key_chunk_index[0]];
+		if (key_count == 1) {
+			columns.push_back(rowid);
+		} else {
+			rowid.Flatten();
+			auto &entries = StructVector::GetEntries(rowid);
+			if (entries.size() != key_count) {
+				throw InternalException("MSSQL staged DML: rowid has %llu fields, the key %llu",
+										(unsigned long long)entries.size(), (unsigned long long)key_count);
+			}
+			for (auto &entry : entries) {
+				columns.push_back(entry);
+			}
 		}
 	} else {
 		auto &rowid = chunk.data.back();
@@ -309,6 +391,83 @@ void MSSQLStagedDml::CheckMatchedEverything(ClientContext &context, idx_t matche
 									(unsigned long long)matched));
 }
 
+//! `dst` shows `src`'s data in `dst`'s own type: a rowid component is typed
+//! from the plain duckdb_type, the column it repeats from the entry's (an
+//! MSSQL_NVARCHAR(n) under native types), and a typed Reference asserts on
+//! that in a debug build (issue #369). Same bytes, no cast: the
+//! extension-type rule, as CopyKeyColumn in table_scan.cpp.
+static void ReferenceAs(Vector &dst, Vector &src) {
+	if (dst.GetType() == src.GetType()) {
+		dst.Reference(src);
+		return;
+	}
+	D_ASSERT(dst.GetType().InternalType() == src.GetType().InternalType());
+	Vector view(dst.GetType(), nullptr);
+	view.Reinterpret(src);
+	dst.Reference(view);
+}
+
+void MSSQLStagedDml::ReadReturned(ClientContext &context) {
+	const char *verb = target_.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "UPDATE" : "DELETE";
+	// Read #out as the scan reads the table (the same expressions, so the
+	// same types): BuildReadExpression is what the INSERT ... RETURNING
+	// OUTPUT list uses too.
+	// #out already holds the read expressions' results (ReturningExpression).
+	string list;
+	for (idx_t i = 0; i < target_.table_columns.size(); i++) {
+		list += (i ? ", " : "") + mssql::QuoteIdentifier(OutName(i));
+	}
+	const auto sql = "SELECT " + list + " FROM " + mssql::QuoteIdentifier(out_name_);
+	returned_ = make_uniq<ColumnDataCollection>(context, target_.returning_types);
+	try {
+		// The statement's own connection, held by it: "pinned" to the stream so
+		// the stream never releases it.
+		MSSQLResultStream stream(connection_, sql, target_.catalog_name, weak_ptr<tds::ConnectionPool>(), true,
+								 target_.query_timeout_seconds);
+		if (!stream.Initialize()) {
+			throw IOException("reading the RETURNING rows failed");
+		}
+		DataChunk read;
+		read.Initialize(context, target_.table_types);
+		DataChunk out;
+		out.InitializeEmpty(target_.returning_types);
+		while (true) {
+			read.Reset();
+			const auto count = stream.FillChunk(read);
+			if (count == 0) {
+				break;
+			}
+			const idx_t ncols = target_.table_types.size();
+			for (idx_t i = 0; i < ncols; i++) {
+				out.data[i].Reference(read.data[i]);
+			}
+			for (idx_t v = 0; v < target_.virtual_sources.size(); v++) {
+				auto &dst = out.data[ncols + v];
+				const auto source = target_.virtual_sources[v];
+				if (source >= 0) {
+					ReferenceAs(dst, read.data[static_cast<idx_t>(source)]);
+				} else if (target_.key_table_index.size() == 1) {
+					ReferenceAs(dst, read.data[target_.key_table_index[0]]);
+				} else {
+					// A composite key's rowid: a STRUCT of the key columns.
+					Vector rowid(target_.rowid_type, count);
+					auto &entries = StructVector::GetEntries(rowid);
+					for (idx_t k = 0; k < entries.size(); k++) {
+						ReferenceAs(entries[k], read.data[target_.key_table_index[k]]);
+					}
+					dst.Reference(rowid);
+				}
+			}
+			out.SetChildCardinality(count);
+			returned_->Append(out);
+		}
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		FailAndThrow(context, StringUtil::Format("MSSQL %s ... RETURNING on '%s.%s': reading the rows failed: %s", verb,
+												 target_.schema_name, target_.table_name, error.RawMessage()));
+	}
+}
+
 idx_t MSSQLStagedDml::Finalize(ClientContext &context) {
 	if (finalized_) {
 		return 0;
@@ -330,7 +489,16 @@ idx_t MSSQLStagedDml::Finalize(ClientContext &context) {
 													 target_.schema_name, target_.table_name, error.RawMessage()));
 		}
 		session_.Release();
-		const auto sql = JoinStatementSql(target_, stage_name_);
+		if (target_.returning) {
+			auto created =
+				MSSQLSimpleQuery::Execute(*connection_, CreateOutSql(target_, out_name_), QueryTimeoutMs(target_));
+			if (!created.success) {
+				FailAndThrow(context,
+							 StringUtil::Format("MSSQL %s on '%s.%s': creating the RETURNING table failed: %s", verb,
+												target_.schema_name, target_.table_name, created.error_message));
+			}
+		}
+		const auto sql = JoinStatementSql(target_, stage_name_, target_.returning ? out_name_ : string());
 		auto result = MSSQLSimpleQuery::Execute(*connection_, sql, QueryTimeoutMs(target_));
 		if (!result.success) {
 			FailAndThrow(context, StringUtil::Format("MSSQL %s on '%s.%s' failed: %s", verb, target_.schema_name,
@@ -338,8 +506,12 @@ idx_t MSSQLStagedDml::Finalize(ClientContext &context) {
 		}
 		rows = static_cast<idx_t>(result.rows_affected);
 		CheckMatchedEverything(context, rows);
-		auto dropped = MSSQLSimpleQuery::Execute(*connection_, "DROP TABLE " + mssql::QuoteIdentifier(stage_name_),
-												 QueryTimeoutMs(target_));
+		string drop = "DROP TABLE " + mssql::QuoteIdentifier(stage_name_);
+		if (target_.returning) {
+			ReadReturned(context);
+			drop += "; DROP TABLE " + mssql::QuoteIdentifier(out_name_);
+		}
+		auto dropped = MSSQLSimpleQuery::Execute(*connection_, drop, QueryTimeoutMs(target_));
 		if (!dropped.success) {
 			FailAndThrow(context, StringUtil::Format("MSSQL %s on '%s.%s': dropping the stage failed: %s", verb,
 													 target_.schema_name, target_.table_name, dropped.error_message));

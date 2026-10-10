@@ -29,7 +29,7 @@ static int g_failures = 0;
 int main() {
 	// SQL Server 2022: every form, the operator.
 	auto s22 = DmlCapabilities::Resolve(DmlPlatform::SqlServer, 3, 16);
-	CHECK(s22.output_into_tvar && s22.update_from_join && s22.merge && s22.stage_bulk && s22.keyless_dml,
+	CHECK(s22.output_into_table && s22.update_from_join && s22.merge && s22.stage_bulk && s22.keyless_dml,
 		  "SQL Server takes every form");
 	CHECK(s22.null_safe_operator, "SQL Server 2022 has IS NOT DISTINCT FROM");
 	CHECK(!s22.IsSynapse(), "SQL Server is not Synapse");
@@ -53,7 +53,7 @@ int main() {
 	auto fabric = DmlCapabilities::Resolve(DmlPlatform::Fabric, 11, 12);
 	CHECK(fabric.merge, "Fabric has MERGE (GA)");
 	CHECK(!fabric.update_from_join, "Fabric documents no UPDATE/DELETE FROM … JOIN");
-	CHECK(!fabric.output_into_tvar && !fabric.stage_bulk && !fabric.null_safe_operator,
+	CHECK(!fabric.output_into_table && !fabric.stage_bulk && !fabric.null_safe_operator,
 		  "Fabric's probe rows are off until the probe");
 	CHECK(!fabric.keyless_dml, "keyless DML on Fabric waits for p18");
 	CHECK(!fabric.IsSynapse(), "Fabric is not Synapse");
@@ -63,7 +63,7 @@ int main() {
 	// Synapse: nothing.
 	auto syn = DmlCapabilities::Resolve(DmlPlatform::Synapse, 6, 10);
 	CHECK(syn.IsSynapse(), "Synapse is Synapse");
-	CHECK(!syn.output_into_tvar && !syn.update_from_join && !syn.merge && !syn.stage_bulk && !syn.null_safe_operator &&
+	CHECK(!syn.output_into_table && !syn.update_from_join && !syn.merge && !syn.stage_bulk && !syn.null_safe_operator &&
 			  !syn.keyless_dml,
 		  "Synapse takes none of the new forms");
 

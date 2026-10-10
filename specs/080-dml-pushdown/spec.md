@@ -98,7 +98,7 @@ that way is speed (#421).
 | capability | SQL Server / Azure SQL | Fabric |
 |---|---|---|
 | `output_bare` (`… OUTPUT inserted.c`, p01) | yes, unless the target has an enabled trigger | until the probe: no |
-| `output_into_tvar` (`… OUTPUT … INTO @t`, p02; what RETURNING uses) | yes | until the probe: no |
+| `output_into_table` (`… OUTPUT … INTO <table>`, p02; what RETURNING uses: `#out` since PR 2b) | yes | until the probe: no |
 | `exact_count` (`ROWCOUNT_BIG()` into an RPC OUTPUT parameter) | yes | until the probe: no (the DONE count is used) |
 | `update_from_join` (`UPDATE … FROM … JOIN`, `DELETE … FROM … JOIN`) | yes | **no** (documented) |
 | `merge` | yes | yes (GA) |
@@ -169,7 +169,7 @@ DML node back). It answers yes only when all of these hold:
   most one source row: the join equates a unique key of the source. T-SQL
   updates from an arbitrary one of several matches, and DuckDB's own
   semantics for that case are pinned by a W8 test, not assumed;
-- RETURNING without `output_into_tvar`.
+- RETURNING without `output_into_table`.
 
 A SET of a key column is **not** vetoed on the pushed path: T-SQL updates key
 columns. The ban exists only on the fallback, where the key identifies the
@@ -304,7 +304,7 @@ compatibility promise on their arguments.
       statement itself, the last DONE with a count before the batch's final
       DONE. No platform without `exact_count` has triggers.
 - **`mssql_dml_returning(context, statement, columns := {…})`**, the row
-  form, only with `output_into_tvar`.
+  form, only with `output_into_table`.
   - The statement is
     `DECLARE @o TABLE (…); <DML> OUTPUT inserted.… | deleted.… INTO @o …; SELECT … FROM @o`.
   - `INTO @o`, not a bare OUTPUT: a bare OUTPUT is refused while the target
@@ -516,7 +516,7 @@ refuses these columns on both rungs, as rung 2 does today):
 
 The `<key>` comparison on rung 3 uses `null_safe` (D0).
 
-**RETURNING on the fallback**, with `output_into_tvar` -- its own PR right
+**RETURNING on the fallback**, with `output_into_table` -- its own PR right
 after PR 2 (owner, 2026-10-09: DuckDB's RETURNING chunk carries the old image
 as well under `capture_old_rows`, and a DELETE's carries the virtual columns,
 on rung 3 one per column):
@@ -526,9 +526,18 @@ on rung 3 one per column):
 - The operator returns DuckDB's RETURNING chunk: every non-generated column,
   in table order, at DuckDB's types (binder.cpp:571-580). That is the
   post-image for UPDATE and the pre-image for DELETE.
-- `@o` is declared under the rules of the row vehicle (D1).
+- `#out` is created like the stage (`SELECT … INTO … UNION ALL`), from the
+  scan's own read expressions (`BuildReadExpression`: spatial as WKB, legacy
+  LOBs and CLR / alias types cast; rowversion as `binary(8)`), and OUTPUT
+  writes the same expressions over `inserted.` / `deleted.`: tempdb never has
+  to know a user type, and `#out` is read back bare (review of 2b). A
+  DELETE's chunk appends the table's virtual columns (the rowid, or rung 3's
+  hidden key columns), and its key is taken where the plan's row-id
+  expressions put it (`WHERE rowid = …` binds the rowid first).
+- The price is the stage's round trips even for one row: create the stage,
+  INSERT BULK, create `#out`, the JOIN, the read, the DROP.
 
-Without `output_into_tvar`, RETURNING is refused by name at plan time:
+Without `output_into_table`, RETURNING is refused by name at plan time:
 `PlanUpdate` / `PlanDelete` read `op.return_chunk`. That is the
 InternalException fix (R§2).
 
@@ -902,7 +911,7 @@ risk", and this spec is no smaller. Each PR merges before the next opens
 |---|---|---|
 | **1** | W4 (the 066 remainder: sinks, defer removed, pool of one); RETURNING on UPDATE / DELETE **refused by name** at plan time (the InternalException fix); W6 | fixes UPDATE / DELETE on a pool of one and the crash, behind no setting |
 | **2** | W3 (the ladder, rung 3, `#stage`, `mssql_dml_stage_threshold`, #358) and W5's capability read (`EngineEdition` / `ProductMajorVersion`); the `fabric-probe/` run if the warehouse answers by then (the rows it settles flip, one line each) | closes #140 and #358 with no rewriter involved |
-| **2b** | RETURNING on the fallback (`OUTPUT … INTO #out`), split from PR 2 (owner, 2026-10-09) | UPDATE / DELETE … RETURNING return rows instead of a named refusal |
+| **2b** | RETURNING on the fallback (`OUTPUT … INTO #out`), split from PR 2 (owner, 2026-10-09); the capability is `output_into_table` (it was named after `@t`) | UPDATE / DELETE … RETURNING return rows instead of a named refusal |
 | **3** | W1 + W2 (the count vehicle, the run-once latch, the exact count, `ExecuteDmlBatch`, the writer's UPDATE / DELETE / INSERT … SELECT, `mssql_dml_pushdown`); the agreement harness | pushed DML end to end, PR 2's path under every veto |
 | **4** | W7: MERGE on the server -- pushed when the source is on the same server, through `#src` otherwise, refused by name when not writable in T-SQL; the native path retired for the catalog | MERGE on top of PRs 2–3 (PR 1 made the native MERGE run in a transaction and on a pool of one, #423; it stays until this PR) |
 | **5** | D6 (pushed CTAS) and its docs; W9's final pass | droppable without touching PRs 1–4: every earlier PR carries its own docs |
