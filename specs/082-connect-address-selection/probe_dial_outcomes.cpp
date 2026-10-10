@@ -1,4 +1,4 @@
-// Spec 081 probe — what does connect() actually do on this platform?
+// Spec 082 probe — what does connect() actually do on this platform?
 //
 // ANSWERED. Measured on both platforms; the table is in spec.md §4.
 //
@@ -7,7 +7,7 @@
 //          (7.8s, ETIMEDOUT)
 //   Linux: REFUSED, 0ms     REFUSED, 0ms       no answer within 3s
 //
-// So macOS drops and Linux refuses, which is what spec 081's draft said. The
+// So macOS drops and Linux refuses, which is what spec 082's draft said. The
 // comment in TestUnreachableRoutedTargetFails (test/cpp/test_login_routing_hops.cpp)
 // is consistent with that once its "That is a Linux behaviour" is read as
 // referring to getting an RST — it is ambiguously worded, not wrong. Rewording it
@@ -44,7 +44,7 @@
 // #122 is about the candidate LIST, not about RST-vs-drop.
 //
 // Build & run:
-//   c++ -std=c++11 -O0 -o /tmp/probe081 probe_dial_outcomes.cpp && /tmp/probe081
+//   c++ -std=c++11 -O0 -o /tmp/probe082 probe_dial_outcomes.cpp && /tmp/probe082
 // Or both platforms from a Mac, via run_probe.sh in this directory.
 
 #include <arpa/inet.h>
@@ -112,7 +112,7 @@ Outcome Classify(int e) {
 // A measurement artifact must fail loudly rather than print a plausible wrong
 // row, so every input is checked and every syscall return is consulted.
 void Fatal(const char *what, const char *detail) {
-	std::fprintf(stderr, "probe081: FATAL %s: %s\n", what, detail);
+	std::fprintf(stderr, "probe082: FATAL %s: %s\n", what, detail);
 	std::exit(2);
 }
 
@@ -249,9 +249,9 @@ int BindEphemeral(uint16_t *port_out) {
 int main() {
 	utsname u;
 	if (::uname(&u) == 0) {
-		std::printf("spec 081 dial probe — %s %s (%s)\n\n", u.sysname, u.release, u.machine);
+		std::printf("spec 082 dial probe — %s %s (%s)\n\n", u.sysname, u.release, u.machine);
 	} else {
-		std::printf("spec 081 dial probe\n\n");
+		std::printf("spec 082 dial probe\n\n");
 	}
 
 	// ---- Control: a LISTENING port must connect, or nothing below means anything.

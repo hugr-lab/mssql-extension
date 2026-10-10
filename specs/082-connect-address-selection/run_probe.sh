@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Spec 081 — run probe_dial_outcomes.cpp natively and, on a Mac, on Linux too.
+# Spec 082 — run probe_dial_outcomes.cpp natively and, on a Mac, on Linux too.
 #
 # The question it settles (RST vs dropped SYN for a bound-but-unlistening port)
 # is answered differently by macOS and Linux, so one platform's run is half an
@@ -22,8 +22,8 @@ note_failure() { # $1 = stage status; remember the first non-zero
 }
 
 echo "=============== native ==============="
-if c++ -std=c++11 -O0 -Wall -o /tmp/probe081 probe_dial_outcomes.cpp; then
-	/tmp/probe081
+if c++ -std=c++11 -O0 -Wall -o /tmp/probe082 probe_dial_outcomes.cpp; then
+	/tmp/probe082
 	note_failure $?
 else
 	echo "  native build FAILED" >&2

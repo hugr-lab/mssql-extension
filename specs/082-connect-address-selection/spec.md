@@ -1,4 +1,4 @@
-# Spec 081 — Connecting to a hostname that resolves to more than one address
+# Spec 082 — Connecting to a hostname that resolves to more than one address
 
 **Status**: DRAFT. Not implemented. Triaged from a report, not yet measured on the
 hardware that produced it.
