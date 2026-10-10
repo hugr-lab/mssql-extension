@@ -141,7 +141,11 @@ static string MatchCondition(const MSSQLStagedDmlTarget &target, const string &t
 //! new values, so every column of a target row comes from one stage row --
 //! DuckDB can stage one rowid twice with different values (UPDATE ... FROM with
 //! two matching source rows), and the JOIN form picks one of them for the whole
-//! row too (review of the Fabric DML work). A legacy text / ntext / image SET
+//! row too (review of the Fabric DML work). The order is a byte order, and
+//! varbinary compares with trailing 0x00 ignored: two stage rows for one
+//! target row differing only in trailing NULs of a new value could still be
+//! picked apart per column -- equal as DuckDB strings they are not, so the
+//! residue is that one. A legacy text / ntext / image SET
 //! column cannot be a subquery's value (error 279); Fabric has none.
 //! Not MERGE: MERGE refuses a target row matched twice (8672), so it needs a
 //! deduplicated stage, and a DISTINCT under the column's collation folds rows

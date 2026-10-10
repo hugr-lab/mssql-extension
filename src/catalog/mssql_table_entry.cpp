@@ -271,9 +271,7 @@ void MSSQLTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, Log
 	MSSQL_TE_DEBUG("BindUpdateConstraints: ensuring PK loaded for %s.%s", schema.name.c_str(), name.c_str());
 
 	if (!pk_info_.exists && !UsesKeylessKey()) {
-		throw BinderException(pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(),
-													"UPDATE/DELETE", catalog.GetName().GetIdentifierName()) +
-							  KeylessSuffix());
+		throw BinderException(NoKeyRefusal("UPDATE/DELETE"));
 	}
 
 	MSSQL_TE_DEBUG("BindUpdateConstraints: PK loaded, %zu columns, type=%s", pk_info_.columns.size(),
@@ -431,9 +429,7 @@ vector<column_t> MSSQLTableEntry::GetRowIdColumns() const {
 	}
 	if (!pk_info_.exists) {
 		if (!UsesKeylessKey()) {
-			throw BinderException(pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(),
-														"UPDATE/DELETE", catalog.GetName().GetIdentifierName()) +
-								  KeylessSuffix());
+			throw BinderException(NoKeyRefusal("UPDATE/DELETE"));
 		}
 		// Rung 3: every column, in table order, as hidden virtual columns
 		// (catalog/mssql_keyless_key.hpp); the operator finds them as the last
@@ -486,6 +482,19 @@ string MSSQLTableEntry::KeylessKeyRefusal() const {
 string MSSQLTableEntry::KeylessSuffix() const {
 	const auto why = KeylessKeyRefusal();
 	return why.empty() ? string() : " " + why;
+}
+
+string MSSQLTableEntry::NoKeyRefusal(const string &verb) const {
+	// On Synapse the platform is the reason, not the missing key: "add a
+	// primary key" would be advice that does not help (review of the Fabric
+	// DML work).
+	if (catalog.Cast<MSSQLCatalog>().GetDmlCapabilities().IsSynapse()) {
+		return "MSSQL: " + verb + " on '" + schema.name.GetIdentifierName() + "." + name.GetIdentifierName() + "': " +
+			   KeylessKeyRefusal();
+	}
+	return pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(), verb,
+								 catalog.GetName().GetIdentifierName()) +
+		   KeylessSuffix();
 }
 
 bool MSSQLTableEntry::UsesKeylessKey() const {

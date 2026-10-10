@@ -511,7 +511,9 @@ void MSSQLCatalog::QueryDatabaseCollation() {
 					engine_edition_ = read_int(values, 2, -1);
 					product_major_version_ = read_int(values, 3, -1);
 					snapshot_isolation_state_ = read_int(values, 4, -1);
-					properties_in_row = values.size() > 3;
+					// Read only when EngineEdition itself came back (review of the
+					// Fabric DML work: a NULL would never be read again).
+					properties_in_row = values.size() > 3 && !values[2].empty();
 					return true;  // one row; keep the stream drained
 				});
 			if (result.success && properties_in_row) {
@@ -987,34 +989,55 @@ mssql::DmlCapabilities MSSQLCatalog::GetDmlCapabilities() const {
 	return mssql::DmlCapabilities::Resolve(platform, engine_edition_.load(), product_major_version_.load());
 }
 
+//! An integer column of a SimpleQuery row, or -1 (empty / NULL / malformed).
+static int32_t ParseIntOrUnknown(const std::vector<std::string> &values, size_t i) {
+	if (values.size() <= i || values[i].empty()) {
+		return -1;
+	}
+	try {
+		return static_cast<int32_t>(std::stoi(values[i]));
+	} catch (...) {
+		return -1;
+	}
+}
+
 void MSSQLCatalog::EnsureServerProperties(ClientContext &context, const char *verb) {
 	if (server_properties_read_.load()) {
 		return;
 	}
+	// Only a server the host test (or the test emulation) did not place needs
+	// EngineEdition: Fabric and Synapse are decided already (review of the
+	// Fabric DML work).
+	if (!startup_.dml_platform.empty() ||
+		(connection_info_ && (connection_info_->IsFabricEndpoint() || connection_info_->IsSynapseEndpoint()))) {
+		return;
+	}
+	// Held across one pool acquire, and only while the properties are unread:
+	// other DML planning on this catalog waits for the one read.
 	std::lock_guard<std::mutex> guard(server_properties_mutex_);
 	if (server_properties_read_.load()) {
 		return;
 	}
 	string error;
-	auto connection = ConnectionProvider::GetConnection(context, *this);
-	if (!connection) {
-		error = "no connection";
-	} else {
+	try {
+		auto connection = ConnectionProvider::GetConnection(context, *this);
 		int32_t edition = -1;
 		int32_t major = -1;
-		auto result = MSSQLSimpleQuery::ExecuteWithCallback(
-			*connection,
-			"SELECT CAST(SERVERPROPERTY('EngineEdition') AS INT) AS e, "
-			"TRY_CAST(CAST(SERVERPROPERTY('ProductMajorVersion') AS NVARCHAR(16)) AS INT) AS v",
-			[&](const std::vector<std::string> &values) {
-				if (!values.empty() && !values[0].empty()) {
-					edition = std::stoi(values[0]);
-				}
-				if (values.size() > 1 && !values[1].empty()) {
-					major = std::stoi(values[1]);
-				}
-				return true;
-			});
+		SimpleQueryResult result;
+		try {
+			result = MSSQLSimpleQuery::ExecuteWithCallback(
+				*connection,
+				"SELECT CAST(SERVERPROPERTY('EngineEdition') AS INT) AS e, "
+				"TRY_CAST(CAST(SERVERPROPERTY('ProductMajorVersion') AS NVARCHAR(16)) AS INT) AS v",
+				[&](const std::vector<std::string> &values) {
+					edition = ParseIntOrUnknown(values, 0);
+					major = ParseIntOrUnknown(values, 1);
+					return true;
+				});
+		} catch (...) {
+			ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
+			throw;
+		}
 		ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
 		if (result.success && edition >= 0) {
 			engine_edition_ = edition;
@@ -1023,6 +1046,8 @@ void MSSQLCatalog::EnsureServerProperties(ClientContext &context, const char *ve
 			return;
 		}
 		error = result.success ? "the server returned no EngineEdition" : result.error_message;
+	} catch (std::exception &ex) {
+		error = ErrorData(ex).RawMessage();
 	}
 	throw NotImplementedException(
 		"MSSQL: %s through '%s' needs SERVERPROPERTY('EngineEdition') to tell Azure Synapse, whose keys are NOT "

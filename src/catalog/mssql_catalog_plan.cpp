@@ -537,8 +537,8 @@ static void RefuseUnstageable(const char *verb, MSSQLTableEntry &table_entry, bo
 	}
 	if (!can_stage) {
 		throw NotImplementedException(
-			"MSSQL: %s%s on '%s.%s' is not supported: it runs through a #stage table, "
-			"and a key or SET column cannot be bulk-loaded into one",
+			"MSSQL: %s%s on '%s.%s' is not supported: a key or SET column cannot be bulk-loaded into the #stage "
+			"table it runs through",
 			verb, returning ? " ... RETURNING" : "", schema, table);
 	}
 }
@@ -634,9 +634,7 @@ static PhysicalOperator &PlanKeylessDml(ClientContext &context, PhysicalPlanGene
 			schema_name, table_name);
 	};
 	if (!table_entry.UsesKeylessKey()) {
-		throw NotImplementedException(
-			"%s %s", pk_info.RowIdRefusal(schema_name, table_name, verb, catalog.GetName().GetIdentifierName()),
-			table_entry.KeylessKeyRefusal());
+		throw NotImplementedException("%s", table_entry.NoKeyRefusal(verb));
 	}
 	// Every column is a key column here, already through IsRoundTripExactForKey;
 	// the bulk wire is asked as well, so the two lists cannot drift apart

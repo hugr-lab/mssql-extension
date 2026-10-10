@@ -99,6 +99,14 @@ private:
 	string KeylessSuffix() const;
 
 public:
+	//! The refusal for a table with no usable key that rung 3 cannot take
+	//! either: the platform's reason alone on Synapse, else RowIdRefusal plus
+	//! KeylessKeyRefusal.
+	string NoKeyRefusal(const string &verb) const;
+
+private:
+
+public:
 	//===----------------------------------------------------------------------===//
 	// MSSQL-specific Accessors
 	//===----------------------------------------------------------------------===//

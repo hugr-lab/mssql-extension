@@ -543,8 +543,8 @@ refuses these columns on both rungs, as rung 2 does today):
 | step | SQL Server / Azure | Fabric |
 |---|---|---|
 | fill | `INSERT BULK`, adopted at the first `Sink` (`DeferAdoption` / `AdoptDeferred`) | the same (BCP API) |
-| UPDATE | `UPDATE [t] SET … FROM [s].[t] AS [t] JOIN #stage AS s ON <key>` | `UPDATE [s].[t] SET [c] = (SELECT TOP (1) stg.[n] FROM #stage AS stg WHERE <key>) … WHERE EXISTS (SELECT 1 FROM #stage AS stg WHERE <key>)` |
-| DELETE | `DELETE [t] FROM … JOIN #stage …` | `DELETE FROM [s].[t] WHERE EXISTS (SELECT 1 FROM #stage AS stg WHERE <key>)` |
+| UPDATE | `UPDATE [t] SET … FROM [s].[t] AS [t] JOIN #stage AS s ON <key>` | `UPDATE [s].[t] SET [c] = (SELECT TOP (1) [stg__].[n0] FROM #stage AS [stg__] WHERE <key> ORDER BY CAST([stg__].[n0] AS varbinary(max)), …) … WHERE EXISTS (SELECT 1 FROM #stage AS [stg__] WHERE <key>)` -- the alias never equals the target's name |
+| DELETE | `DELETE [t] FROM … JOIN #stage …` | `DELETE FROM [s].[t] WHERE EXISTS (SELECT 1 FROM #stage AS [stg__] WHERE <key>)` |
 | rows | up to `mssql_dml_stage_threshold` as VALUES-join statements, past it the stage | always the stage: the VALUES join is an `UPDATE … FROM` too |
 
 **Not MERGE on Fabric** (the Fabric DML PR): MERGE refuses a target row matched
@@ -561,6 +561,14 @@ stage row, under one total order over the new values, as the JOIN form takes
 one row for the whole target row. A native MERGE's UPDATE / DELETE actions are refused on Fabric until
 PR 4 (they run the VALUES join).
 | in a transaction | stage created on the pinned connection | same |
+
+**The subquery forms' cost** (measured on SQL Server emulating Fabric, the only
+proxy at hand; UPDATE of two columns by primary key through the stage, median
+of 3, ms): 1000 rows 135 vs the JOIN form's 23, 10000 rows 160 vs 106, 100000
+rows 1121 vs 343 -- about 3x at size, from the per-row correlated `TOP (1)`
+over an unindexed stage. It is Fabric's only form, so it is a cost, not a
+choice; an index on the stage's key columns after the fill is the lever, left
+open until a warehouse can measure it.
 
 The `<key>` comparison on rung 3 uses `null_safe` (D0).
 
