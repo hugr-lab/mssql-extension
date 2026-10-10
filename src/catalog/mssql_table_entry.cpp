@@ -489,8 +489,8 @@ string MSSQLTableEntry::NoKeyRefusal(const string &verb) const {
 	// primary key" would be advice that does not help (review of the Fabric
 	// DML work).
 	if (catalog.Cast<MSSQLCatalog>().GetDmlCapabilities().IsSynapse()) {
-		return "MSSQL: " + verb + " on '" + schema.name.GetIdentifierName() + "." + name.GetIdentifierName() + "': " +
-			   KeylessKeyRefusal();
+		return "MSSQL: " + verb + " on '" + schema.name.GetIdentifierName() + "." + name.GetIdentifierName() +
+			   "': " + KeylessKeyRefusal();
 	}
 	return pk_info_.RowIdRefusal(schema.name.GetIdentifierName(), name.GetIdentifierName(), verb,
 								 catalog.GetName().GetIdentifierName()) +
