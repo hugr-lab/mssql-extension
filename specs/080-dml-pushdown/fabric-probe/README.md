@@ -23,7 +23,9 @@ Each file answers one question from the Fabric column of
 | `p15_bulk_into_temp` | `INSERT BULK` into `#stage` inside a transaction |
 | `p16_dml_count_done` | the DONE count of a plain UPDATE |
 | `p17_server_properties` | `EngineEdition`, `ProductMajorVersion`, `@@VERSION`, `DB_NAME()` |
-| `p18_merge_on_intersect` | the Fabric keyless shape: `MERGE … USING #stage ON EXISTS (… INTERSECT …)` |
+| `p18_merge_on_intersect` | `MERGE … USING #stage ON EXISTS (… INTERSECT …)` (PR 4's form; not what UPDATE / DELETE send) |
+| `p19_bulk_into_temp_in_txn` | INSERT BULK into a session `#temp` (the stage's fill; `stage_bulk`) |
+| `p20_subquery_dml_forms` | the forms UPDATE / DELETE send on Fabric: the stage matched through `WHERE EXISTS` / a correlated `TOP (1)` subquery, `EXISTS (… INTERSECT …)` for NULLs, duplicate stage rows |
 | `p99_cleanup` | drops the probe tables |
 
 **Each file is self-contained** (review of #422): it creates the table it

@@ -27,6 +27,14 @@ static void ValidateNonNegative(ClientContext &context, SetScope scope, Value &p
 	}
 }
 
+static void ValidateDmlPlatform(ClientContext &context, SetScope scope, Value &parameter) {
+	const auto v = StringUtil::Lower(parameter.ToString());
+	if (!v.empty() && v != "sqlserver" && v != "fabric" && v != "synapse") {
+		throw InvalidInputException("mssql_test_dml_platform must be '', 'sqlserver', 'fabric' or 'synapse', got '%s'",
+									parameter.ToString());
+	}
+}
+
 // A collation name goes into generated DDL as a bare identifier — COLLATE takes
 // no quoting in T-SQL — so it is checked here rather than concatenated blind.
 // SQL Server's own collation names are letters, digits and underscores only.
@@ -148,6 +156,15 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption("mssql_test_fail_metadata_after_rows",
 							  "TEST ONLY: make a metadata query fail after this many rows (0 = off)",
 							  LogicalType::BIGINT, Value::BIGINT(0), ValidateNonNegative, SetScope::GLOBAL);
+
+	// mssql_test_dml_platform - TEST ONLY (spec 080 D0). Read at ATTACH: the
+	// catalog then answers GetDmlCapabilities for this platform whatever its
+	// host, so Fabric's DML forms (the subquery form, no VALUES join, no
+	// RETURNING) run against a SQL Server while no warehouse is at hand.
+	config.AddExtensionOption("mssql_test_dml_platform",
+							  "TEST ONLY: the platform whose DML forms an ATTACH uses ('' = by host, 'sqlserver', "
+							  "'fabric', 'synapse'); read at ATTACH",
+							  LogicalType::VARCHAR, Value(""), ValidateDmlPlatform, SetScope::GLOBAL);
 
 	// mssql_test_force_intersect_join_form - TEST ONLY (spec 080 D3).
 	//

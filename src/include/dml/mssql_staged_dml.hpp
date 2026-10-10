@@ -76,6 +76,10 @@ struct MSSQLStagedDmlTarget {
 	//! `IS NOT DISTINCT FROM` for a nullable key column (D0), else the
 	//! `EXISTS (… INTERSECT …)` form over the nullable ones.
 	bool null_safe_operator = false;
+	//! The platform has no UPDATE / DELETE ... FROM ... JOIN (D0
+	//! update_from_join, Fabric): the statement selects the stage's rows
+	//! through EXISTS / correlated subqueries instead.
+	bool join_by_subquery = false;
 	//! mssql_copy_flush_rows: the stage fill's batch boundary.
 	idx_t flush_rows = 0;
 	//! mssql_query_timeout, in seconds (0 = none), for the JOIN statement.

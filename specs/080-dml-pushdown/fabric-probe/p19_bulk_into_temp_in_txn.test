@@ -1,0 +1,30 @@
+# name: p19_bulk_into_temp_in_txn
+# group: [fabric_probe]
+
+require mssql
+
+require-env AZURE_WH_HOST
+
+require-env AZURE_WH_NAME
+
+require-env AZURE_WH_TOKEN
+
+statement ok
+ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (TYPE mssql, ACCESS_TOKEN '{AZURE_WH_TOKEN}');
+
+# INSERT BULK into a session #temp: what spec 080's stage needs. In a
+# transaction the COPY and the read share the pinned connection, so the #temp
+# is still there to count.
+statement ok
+BEGIN;
+
+statement ok
+COPY (SELECT i::INTEGER AS id, 'x' || i AS s FROM range(1000) t(i)) TO 'mssql://wh/#p19' (FORMAT 'bcp', CREATE_TABLE true);
+
+query I
+SELECT * FROM mssql_scan_unsafe('wh', 'SELECT COUNT_BIG(*) AS c FROM #p19', columns := {'c': 'BIGINT'});
+----
+X
+
+statement ok
+ROLLBACK;

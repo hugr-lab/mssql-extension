@@ -1,0 +1,40 @@
+# name: p20_subquery_dml_forms
+# group: [fabric_probe]
+
+require mssql
+
+require-env AZURE_WH_HOST
+
+require-env AZURE_WH_NAME
+
+require-env AZURE_WH_TOKEN
+
+statement ok
+ATTACH 'Server={AZURE_WH_HOST};Database={AZURE_WH_NAME}' AS wh (TYPE mssql, ACCESS_TOKEN '{AZURE_WH_TOKEN}');
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.p080_20_t; CREATE TABLE dbo.p080_20_t (a INT NULL, b VARCHAR(10) NULL, v INT NULL); INSERT INTO dbo.p080_20_t VALUES (1, ''x'', 0), (NULL, ''y'', 0), (2, NULL, 0), (2, NULL, 0)');
+
+# The statements MSSQLStagedDml::JoinStatementSql sends on Fabric (verbatim
+# shape: the [stg__] alias, strings matched by bytes, every TOP (1) under one
+# ORDER BY over the new values as varbinary(max)), which has no UPDATE / DELETE ...
+# FROM ... JOIN: the stage matched through WHERE EXISTS / a correlated
+# subquery, nullable columns through EXISTS (... INTERSECT ...), duplicate
+# stage rows taken as they are.
+query I
+SELECT * FROM mssql_scan_unsafe('wh', 'CREATE TABLE #stg (k0 INT NULL, k1 VARCHAR(10) NULL, n0 INT NULL); INSERT INTO #stg VALUES (NULL, ''y'', 5), (2, NULL, 6), (2, NULL, 6); UPDATE [dbo].[p080_20_t] SET [v] = (SELECT TOP (1) [stg__].[n0] FROM [#stg] AS [stg__] WHERE EXISTS (SELECT [p080_20_t].[a], CAST([p080_20_t].[b] AS varbinary(max)) INTERSECT SELECT [stg__].[k0], CAST([stg__].[k1] AS varbinary(max))) ORDER BY CAST([stg__].[n0] AS varbinary(max))) WHERE EXISTS (SELECT 1 FROM [#stg] AS [stg__] WHERE EXISTS (SELECT [p080_20_t].[a], CAST([p080_20_t].[b] AS varbinary(max)) INTERSECT SELECT [stg__].[k0], CAST([stg__].[k1] AS varbinary(max)))); SELECT CAST(@@ROWCOUNT AS BIGINT) AS rc', columns := {'rc': 'BIGINT'});
+----
+X
+
+query I
+SELECT * FROM mssql_scan_unsafe('wh', 'CREATE TABLE #stg (k0 INT NULL, k1 VARCHAR(10) NULL); INSERT INTO #stg VALUES (1, ''x''); DELETE FROM [dbo].[p080_20_t] WHERE EXISTS (SELECT 1 FROM [#stg] AS [stg__] WHERE EXISTS (SELECT [p080_20_t].[a], CAST([p080_20_t].[b] AS varbinary(max)) INTERSECT SELECT [stg__].[k0], CAST([stg__].[k1] AS varbinary(max)))); SELECT CAST(@@ROWCOUNT AS BIGINT) AS rc', columns := {'rc': 'BIGINT'});
+----
+X
+
+query III
+SELECT a, b, v FROM wh.dbo.p080_20_t ORDER BY v;
+----
+X	X	X
+
+statement ok
+SELECT mssql_exec('wh', 'DROP TABLE IF EXISTS dbo.p080_20_t');

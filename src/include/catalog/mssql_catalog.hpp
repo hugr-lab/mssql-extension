@@ -75,6 +75,11 @@ struct MSSQLCatalogStartup {
 	//! settings, and the setting is GLOBAL: turning it off for a metadata
 	//! catalog must not change the user's own catalogs.
 	int8_t native_types = -1;
+	//! TEST ONLY (spec 080): mssql_test_dml_platform as it stood at ATTACH --
+	//! "fabric" / "synapse" / "sqlserver" make GetDmlCapabilities answer for
+	//! that platform, so its DML forms run against a SQL Server; empty = the
+	//! host test decides.
+	string dml_platform;
 };
 
 class MSSQLCatalog : public Catalog {
@@ -339,6 +344,13 @@ public:
 	//! collation, -1 when unread) decide only IS NOT DISTINCT FROM.
 	mssql::DmlCapabilities GetDmlCapabilities() const;
 
+	//! Issue #437: EngineEdition 6 is what tells a Synapse dedicated pool
+	//! behind a foreign host name, and an UPDATE / DELETE there must be
+	//! refused (its keys are NOT ENFORCED). When the ATTACH query did not read
+	//! the properties, read them now, once, on the statement's connection; if
+	//! they cannot be read, refuse rather than take the server for SQL Server.
+	void EnsureServerProperties(ClientContext &context, const char *verb);
+
 	//! Did this server grant the LOGIN7 UTF8SUPPORT feature (issue #225)?
 	//! Every connection in the pool asks for the same thing, so one observation
 	//! answers for all of them; it is taken from an already-logged-in pooled
@@ -602,8 +614,11 @@ private:
 	int32_t snapshot_isolation_state_ = -1;
 	//! SERVERPROPERTY('EngineEdition') / ('ProductMajorVersion'), read with the
 	//! collation at ATTACH (spec 080 D0); -1 when not read.
-	int32_t engine_edition_ = -1;
-	int32_t product_major_version_ = -1;
+	std::atomic<int32_t> engine_edition_{-1};
+	std::atomic<int32_t> product_major_version_{-1};
+	//! Whether the two were read (the ATTACH query, or EnsureServerProperties).
+	std::atomic<bool> server_properties_read_{false};
+	std::mutex server_properties_mutex_;
 	string database_collation_;	 // Database default collation
 	string default_schema_;		 // Default schema: `default_schema` option, else "dbo"
 	// Spec 052 (Option D): shared_ptr ownership for schema entries. The bind-

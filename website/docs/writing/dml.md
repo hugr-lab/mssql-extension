@@ -338,6 +338,11 @@ SET mssql_dml_stage_threshold = 100000; -- VALUES statements up to 100k rows
 ```
 
 Either way a statement is atomic: a failure rolls back everything it wrote.
+
+On **Fabric Warehouse** every UPDATE / DELETE takes the `#stage` path (Fabric
+has no `UPDATE … FROM … JOIN`, which the VALUES statements are) and finds its
+rows through `WHERE EXISTS`. RETURNING is not available there yet. On
+**Azure Synapse** UPDATE / DELETE through the catalog are refused.
 A staged statement also checks that the server found every row it staged, and
 fails before its commit if not, rather than reporting fewer rows. The stage
 lives in `tempdb` for the statement's length and holds the selected rows'
