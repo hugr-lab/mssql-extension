@@ -546,6 +546,7 @@ refuses these columns on both rungs, as rung 2 does today):
 | UPDATE | `UPDATE [t] SET … FROM [s].[t] AS [t] JOIN #stage AS s ON <key>` | `UPDATE [s].[t] SET [c] = (SELECT TOP (1) [stg__].[n0] FROM #stage AS [stg__] WHERE <key> ORDER BY CAST([stg__].[n0] AS varbinary(max)), …) … WHERE EXISTS (SELECT 1 FROM #stage AS [stg__] WHERE <key>)` -- the alias never equals the target's name |
 | DELETE | `DELETE [t] FROM … JOIN #stage …` | `DELETE FROM [s].[t] WHERE EXISTS (SELECT 1 FROM #stage AS [stg__] WHERE <key>)` |
 | rows | up to `mssql_dml_stage_threshold` as VALUES-join statements, past it the stage | always the stage: the VALUES join is an `UPDATE … FROM` too |
+| in a transaction | stage created on the pinned connection | same |
 
 **Not MERGE on Fabric** (the Fabric DML PR): MERGE refuses a target row matched
 twice (8672), so it needs a deduplicated stage, and a `DISTINCT` under the
@@ -560,7 +561,6 @@ with two matching source rows) every SET column's `TOP (1)` takes the same
 stage row, under one total order over the new values, as the JOIN form takes
 one row for the whole target row. A native MERGE's UPDATE / DELETE actions are refused on Fabric until
 PR 4 (they run the VALUES join).
-| in a transaction | stage created on the pinned connection | same |
 
 **The subquery forms' cost** (measured on SQL Server emulating Fabric, the only
 proxy at hand; UPDATE of two columns by primary key through the stage, median
@@ -569,6 +569,22 @@ rows 1121 vs 343 -- about 3x at size, from the per-row correlated `TOP (1)`
 over an unindexed stage. It is Fabric's only form, so it is a cost, not a
 choice; an index on the stage's key columns after the fill is the lever, left
 open until a warehouse can measure it.
+
+**Unmeasured on a warehouse** (#445). The shape of the cost: an UPDATE is one
+correlated `WHERE EXISTS` per target row plus one correlated `TOP (1)` subquery
+per SET column, each re-evaluating the whole match condition and ordering by
+every new-value column, so a wide UPDATE costs about (target rows x SET
+columns) correlated evaluations with a sort each, where the JOIN form makes one
+join. A NOT NULL key keeps a plain `t = s` beside the byte comparison of a
+string, so an index on the target can still seek; a nullable key column
+matches through `EXISTS (… INTERSECT …)` (Fabric has no `IS NOT DISTINCT
+FROM`), which cannot. And `mssql_dml_stage_threshold` does not apply: on
+Fabric every UPDATE / DELETE stages whatever its row count, a one-row UPDATE
+included, paying the stage's fixed round trips that SQL Server's VALUES join
+skips under the threshold (that comparison is not measured; the 1000-row
+figure above, ~6x the JOIN form's, is the subquery form against the JOIN form,
+both through the stage). A slow Fabric UPDATE starts from this paragraph; the
+figure is to be taken with `fabric-probe/` when a warehouse answers.
 
 The `<key>` comparison on rung 3 uses `null_safe` (D0).
 

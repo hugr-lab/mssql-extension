@@ -146,7 +146,8 @@ static string MatchCondition(const MSSQLStagedDmlTarget &target, const string &t
 //! target row differing only in trailing NULs of a new value could still be
 //! picked apart per column -- equal as DuckDB strings they are not, so the
 //! residue is that one. A legacy text / ntext / image SET
-//! column cannot be a subquery's value (error 279); Fabric has none.
+//! column cannot be a subquery's value (error 279): Fabric has none, and the
+//! planner keeps one off this form under the emulation (StageCanCarry, #444).
 //! Not MERGE: MERGE refuses a target row matched twice (8672), so it needs a
 //! deduplicated stage, and a DISTINCT under the column's collation folds rows
 //! the byte-exact match keeps apart -- 'a' and 'a ' even under Fabric's default

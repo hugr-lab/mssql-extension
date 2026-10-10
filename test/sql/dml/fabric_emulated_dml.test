@@ -195,6 +195,16 @@ MERGE INTO fe.dbo.fe_k AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATC
 ----
 is not supported on Fabric Warehouse yet (spec 080 PR 4)
 
+# a legacy text SET column cannot be the subquery's value (error 279): Fabric
+# has none, SQL Server under the emulation does -- refused by name (#444)
+statement ok
+SELECT mssql_exec('fe', 'DROP TABLE IF EXISTS dbo.fe_t; CREATE TABLE dbo.fe_t (id int PRIMARY KEY, t text NULL); INSERT INTO dbo.fe_t VALUES (1, ''a'')');
+
+statement error
+UPDATE fe.dbo.fe_t SET t = 'b' WHERE id = 1;
+----
+a text / ntext / image SET column cannot be a subquery's value there
+
 # INSERT is unchanged
 query I
 INSERT INTO fe.dbo.fe_k VALUES (9001, 0, NULL);
@@ -227,7 +237,7 @@ statement ok
 DETACH fs;
 
 statement ok
-SELECT mssql_exec('fe', 'DROP TABLE dbo.fe_k; DROP TABLE dbo.fe_c; DROP TABLE dbo.fe_n; DROP TABLE dbo.fe_two; DROP TABLE dbo.fe_u; DROP TABLE fe_s.stg__; DROP SCHEMA fe_s');
+SELECT mssql_exec('fe', 'DROP TABLE dbo.fe_k; DROP TABLE dbo.fe_c; DROP TABLE dbo.fe_n; DROP TABLE dbo.fe_two; DROP TABLE dbo.fe_u; DROP TABLE dbo.fe_t; DROP TABLE fe_s.stg__; DROP SCHEMA fe_s');
 
 statement ok
 DETACH fe;

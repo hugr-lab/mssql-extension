@@ -467,9 +467,16 @@ static bool ConnectionShared(ClientContext &context, MSSQLCatalog &catalog) {
 //! geography, alias or CLR type goes out under the VARCHAR fallback and fails
 //! mid-stream (BCPColumnMetadata::bulk_unsupported); such a statement keeps
 //! the VALUES path, which renders those values as literals (#352).
-static bool StageCanCarry(const vector<MSSQLColumnInfo> &columns) {
+//! `as_subquery_value`: the columns are SET values of the subquery form
+//! (join_by_subquery), where a legacy text / ntext / image column cannot be a
+//! subquery's value (error 279). Fabric has no such type, but SQL Server under
+//! mssql_test_dml_platform = 'fabric' does (#444).
+static bool StageCanCarry(const vector<MSSQLColumnInfo> &columns, bool as_subquery_value = false) {
 	for (const auto &col : columns) {
 		const auto t = StringUtil::Lower(col.sql_type_name);
+		if (as_subquery_value && (t == "text" || t == "ntext" || t == "image")) {
+			return false;
+		}
 		if (t == "timestamp" || t == "rowversion") {
 			continue;  // staged as binary(8)
 		}
@@ -522,24 +529,33 @@ static bool KeyedStagedTarget(ClientContext &context, MSSQLCatalog &catalog, MSS
 	return true;
 }
 
+static const char *DmlPlatformLabel(const mssql::DmlCapabilities &caps) {
+	return caps.platform == mssql::DmlPlatform::Fabric ? "Fabric Warehouse" : "this platform";
+}
+
 //! The staged operator is the only way this statement can run (RETURNING, or
 //! a platform without the VALUES join) and it cannot: refuse by name. A
-//! native MERGE's actions are refused there too -- they defer to Finalize on
-//! the VALUES path (spec 080 PR 4 moves MERGE to the server).
-static void RefuseUnstageable(const char *verb, MSSQLTableEntry &table_entry, bool can_stage, bool returning) {
+//! native MERGE's actions are refused on a platform without the VALUES join
+//! -- they defer to Finalize on that path (spec 080 PR 4 moves MERGE to the
+//! server). Only there: DuckDB plans a catalog's MERGE actions with no
+//! return_chunk, so on SQL Server an action never reaches here (#443).
+static void RefuseUnstageable(const mssql::DmlCapabilities &caps, const char *verb, MSSQLTableEntry &table_entry,
+							  bool can_stage, bool returning) {
 	const auto schema = table_entry.schema.name.GetIdentifierName();
 	const auto table = table_entry.name.GetIdentifierName();
-	if (planning_merge_actions) {
+	if (planning_merge_actions && !caps.update_from_join) {
 		throw NotImplementedException(
-			"MSSQL: MERGE INTO '%s.%s' with an UPDATE or DELETE action is not supported on "
-			"Fabric Warehouse yet (spec 080 PR 4)",
-			schema, table);
+			"MSSQL: MERGE INTO '%s.%s' with an UPDATE or DELETE action is not supported on %s yet (spec 080 PR 4)",
+			schema, table, DmlPlatformLabel(caps));
 	}
 	if (!can_stage) {
 		throw NotImplementedException(
 			"MSSQL: %s%s on '%s.%s' is not supported: a key or SET column cannot be bulk-loaded into the #stage "
-			"table it runs through",
-			verb, returning ? " ... RETURNING" : "", schema, table);
+			"table it runs through%s",
+			verb, returning ? " ... RETURNING" : "", schema, table,
+			caps.update_from_join || string(verb) != "UPDATE"
+				? ""
+				: ", or a text / ntext / image SET column cannot be a subquery's value there");
 	}
 }
 
@@ -599,7 +615,7 @@ static void RequireReturningStage(MSSQLCatalog &catalog, const char *verb, MSSQL
 			"MSSQL: %s ... RETURNING on '%s.%s' is not supported on %s yet: it runs through a #stage table and "
 			"OUTPUT ... INTO, which this platform does not take",
 			verb, table_entry.schema.name.GetIdentifierName(), table_entry.name.GetIdentifierName(),
-			caps.platform == mssql::DmlPlatform::Fabric ? "Fabric Warehouse" : "this platform");
+			DmlPlatformLabel(caps));
 	}
 }
 
@@ -747,9 +763,10 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	const bool can_stage = KeyedStagedTarget(context, *this, table_entry, pk_info, staged);
 	// RETURNING, and a platform with no VALUES join (Fabric, D0): the staged
 	// operator, whatever the row count.
-	const bool always_stage = op.return_chunk || !GetDmlCapabilities().update_from_join;
+	const auto caps = GetDmlCapabilities();
+	const bool always_stage = op.return_chunk || !caps.update_from_join;
 	if (always_stage) {
-		RefuseUnstageable("DELETE", table_entry, can_stage, op.return_chunk);
+		RefuseUnstageable(caps, "DELETE", table_entry, can_stage, op.return_chunk);
 		staged.hold_until_finalize = ConnectionShared(context, *this) && FeedsFromStreamingScan(context, *this, plan);
 		vector<LogicalType> types{LogicalType::BIGINT};
 		if (op.return_chunk) {
@@ -894,11 +911,12 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 			staged.set_columns.push_back(mssql_columns[op.columns[i].index]);
 			staged.set_chunk_index.push_back(i);
 		}
-		stage_update = StageCanCarry(staged.set_columns);
+		stage_update = StageCanCarry(staged.set_columns, staged.join_by_subquery);
 	}
-	const bool always_stage = op.return_chunk || !GetDmlCapabilities().update_from_join;
+	const auto caps = GetDmlCapabilities();
+	const bool always_stage = op.return_chunk || !caps.update_from_join;
 	if (always_stage) {
-		RefuseUnstageable("UPDATE", table_entry, stage_update, op.return_chunk);
+		RefuseUnstageable(caps, "UPDATE", table_entry, stage_update, op.return_chunk);
 		staged.hold_until_finalize = ConnectionShared(context, *this) && FeedsFromStreamingScan(context, *this, plan);
 		vector<LogicalType> types{LogicalType::BIGINT};
 		if (op.return_chunk) {
