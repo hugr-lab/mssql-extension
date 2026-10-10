@@ -145,7 +145,7 @@ UPDATE drr.dbo.drr_g SET v = 1 RETURNING id, g IS NOT NULL;
 
 # A SET column INSERT BULK cannot carry into the stage RETURNING runs through.
 statement error
-UPDATE drr.dbo.drr_g SET g = (SELECT g FROM drr.dbo.drr_g WHERE id = 1) RETURNING id;
+UPDATE drr.dbo.drr_g SET g = NULL RETURNING id;
 ----
 cannot be bulk-loaded into the #stage table
 
