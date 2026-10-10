@@ -141,6 +141,34 @@ UPDATE drr.dbo.drr_g SET v = 1 RETURNING id, g IS NOT NULL;
 ----
 1	true
 
+# --- refused by name, nothing sent (issue #440) ----------------------------
+
+# A SET column INSERT BULK cannot carry into the stage RETURNING runs through.
+statement error
+UPDATE drr.dbo.drr_g SET g = (SELECT g FROM drr.dbo.drr_g WHERE id = 1) RETURNING id;
+----
+cannot be bulk-loaded into the #stage table
+
+# A table with no key that cannot be keyed by all its columns either (xml).
+statement ok
+SELECT mssql_exec('drr', 'DROP TABLE IF EXISTS dbo.drr_x; CREATE TABLE dbo.drr_x (id int, doc xml); INSERT INTO dbo.drr_x VALUES (1, ''<a/>'')');
+
+statement error
+DELETE FROM drr.dbo.drr_x WHERE id = 1 RETURNING id;
+----
+column 'doc' has type xml
+
+# The rows are untouched.
+query I
+SELECT count(*) FROM drr.dbo.drr_x;
+----
+1
+
+query I
+SELECT count(*) FROM drr.dbo.drr_g WHERE g IS NOT NULL;
+----
+1
+
 # INSERT ... RETURNING still works.
 query I
 INSERT INTO drr.dbo.drr_t VALUES (4, 40, NULL) RETURNING id;
@@ -148,7 +176,7 @@ INSERT INTO drr.dbo.drr_t VALUES (4, 40, NULL) RETURNING id;
 4
 
 statement ok
-SELECT mssql_exec('drr', 'DROP TABLE dbo.drr_t; DROP TABLE dbo.drr_c; DROP TABLE dbo.drr_k; DROP TABLE dbo.drr_trg; DROP TABLE dbo.drr_log; DROP TABLE dbo.drr_r; DROP TABLE dbo.drr_g');
+SELECT mssql_exec('drr', 'DROP TABLE dbo.drr_t; DROP TABLE dbo.drr_c; DROP TABLE dbo.drr_k; DROP TABLE dbo.drr_trg; DROP TABLE dbo.drr_log; DROP TABLE dbo.drr_r; DROP TABLE dbo.drr_g; DROP TABLE dbo.drr_x');
 
 statement ok
 DETACH drr;

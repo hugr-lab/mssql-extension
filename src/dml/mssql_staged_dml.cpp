@@ -247,6 +247,21 @@ void MSSQLStagedDml::Start(ClientContext &context) {
 void MSSQLStagedDml::BuildFillChunk(DataChunk &chunk) {
 	const idx_t key_count = target_.key_columns.size();
 	vector<reference<Vector>> columns;
+	// The plan's key positions must fit the chunk and the key (issue #439):
+	// a drift between the two lists would stage the wrong columns silently.
+	if (!target_.key_chunk_index.empty()) {
+		const idx_t expected = target_.key_source == MSSQLStagedKeySource::TRAILING_COLUMNS ? key_count : 1;
+		if (target_.key_chunk_index.size() != expected) {
+			throw InternalException("MSSQL staged DML: %llu key position(s) for a key of %llu",
+									(unsigned long long)target_.key_chunk_index.size(), (unsigned long long)expected);
+		}
+		for (auto index : target_.key_chunk_index) {
+			if (index >= chunk.ColumnCount()) {
+				throw InternalException("MSSQL staged DML: key position %llu past the chunk's %llu columns",
+										(unsigned long long)index, (unsigned long long)chunk.ColumnCount());
+			}
+		}
+	}
 	if (target_.key_source == MSSQLStagedKeySource::TRAILING_COLUMNS && !target_.key_chunk_index.empty()) {
 		for (auto index : target_.key_chunk_index) {
 			columns.push_back(chunk.data[index]);
