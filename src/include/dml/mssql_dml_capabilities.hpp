@@ -40,8 +40,7 @@ struct DmlCapabilities {
 	//! `a IS NOT DISTINCT FROM b`; otherwise rung 3 compares through
 	//! `EXISTS (SELECT t.c… INTERSECT SELECT s.c…)`, which is correct everywhere.
 	bool null_safe_operator = false;
-	//! Whether keyless (rung 3) UPDATE / DELETE may run. Fabric: until
-	//! fabric-probe/p18_merge_on_intersect has passed on a live warehouse.
+	//! Whether keyless (rung 3) UPDATE / DELETE may run.
 	bool keyless_dml = false;
 
 	//! Synapse keeps today's path: no stage, no pushdown, and (since its keys are
@@ -71,9 +70,18 @@ struct DmlCapabilities {
 			caps.null_safe_operator = product_major_version >= 16 || engine_edition == 5 || engine_edition == 8;
 			break;
 		case DmlPlatform::Fabric:
-			// The "until the probe" rows of D0 stay off until fabric-probe/
-			// settles them; each flips with one line and a [fabric] test.
+			// Per Microsoft Learn (2026-10): MERGE is GA; the BCP API (INSERT
+			// BULK) is in preview -- and the extension's COPY / CTAS use it
+			// there already (test/sql/fabric/fabric_types.test); INTERSECT is
+			// supported. So the stage and a table with no key are on, through
+			// the subquery form (no UPDATE / DELETE ... FROM ... JOIN). The
+			// rows fabric-probe/ settles on a live warehouse (p18, p19: bulk
+			// load into a session #temp) confirm them; until then the DML
+			// tests run against SQL Server emulating Fabric
+			// (mssql_test_dml_platform). OUTPUT ... INTO stays off.
 			caps.merge = true;
+			caps.stage_bulk = true;
+			caps.keyless_dml = true;
 			break;
 		case DmlPlatform::Synapse:
 			break;

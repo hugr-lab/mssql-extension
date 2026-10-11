@@ -1623,6 +1623,10 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 								  !remote_pushdown.IsNull() && remote_pushdown.GetValue<bool>();
 	}
 	startup.native_types = native_types_option;
+	Value dml_platform;
+	if (context.TryGetCurrentSetting("mssql_test_dml_platform", dml_platform) && !dml_platform.IsNull()) {
+		startup.dml_platform = StringUtil::Lower(dml_platform.ToString());
+	}
 	auto catalog =
 		make_uniq<MSSQLCatalog>(db, name, std::move(connection_info), std::move(tds_pool_config),
 								std::move(fedauth_token_utf16le), options.access_mode, catalog_enabled, startup);

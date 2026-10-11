@@ -53,9 +53,9 @@ int main() {
 	auto fabric = DmlCapabilities::Resolve(DmlPlatform::Fabric, 11, 12);
 	CHECK(fabric.merge, "Fabric has MERGE (GA)");
 	CHECK(!fabric.update_from_join, "Fabric documents no UPDATE/DELETE FROM … JOIN");
-	CHECK(!fabric.output_into_table && !fabric.stage_bulk && !fabric.null_safe_operator,
-		  "Fabric's probe rows are off until the probe");
-	CHECK(!fabric.keyless_dml, "keyless DML on Fabric waits for p18");
+	CHECK(!fabric.output_into_table && !fabric.null_safe_operator, "Fabric: no OUTPUT ... INTO, no operator");
+	CHECK(fabric.stage_bulk, "Fabric has the BCP API (preview)");
+	CHECK(fabric.keyless_dml, "Fabric keys a keyless table through the subquery form");
 	CHECK(!fabric.IsSynapse(), "Fabric is not Synapse");
 	CHECK(!DmlCapabilities::Resolve(DmlPlatform::Fabric, 5, 16).null_safe_operator,
 		  "Fabric never takes the operator from the edition or the version");

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **UPDATE and DELETE on Fabric Warehouse** (spec 080). Fabric has no
+  `UPDATE / DELETE … FROM … JOIN`, which the VALUES-join statements are, so a
+  keyed UPDATE / DELETE there failed on the server. Every UPDATE / DELETE on
+  Fabric now goes through `#stage` (filled by Fabric's BCP API, in preview,
+  which COPY and CTAS already use) and selects the stage's rows through
+  `WHERE EXISTS` / a correlated subquery; a table with no key works the same
+  way. RETURNING and a MERGE with an UPDATE / DELETE action stay refused by
+  name there. Tested against SQL Server emulating Fabric
+  (`mssql_test_dml_platform`, test only); `fabric-probe/` p19 / p20 are to
+  confirm the forms on a live warehouse.
+
 - **UPDATE / DELETE … RETURNING** (spec 080 PR 2b). The rows go through the
   same `#stage` as a large UPDATE / DELETE, whatever their number, and the
   JOIN statement carries `OUTPUT inserted.* / deleted.* INTO #out`, which is
