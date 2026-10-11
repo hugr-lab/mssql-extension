@@ -103,5 +103,19 @@ inline EncodePathCounters &GetEncodePathCounters() {
 	return counters;
 }
 
+//===----------------------------------------------------------------------===//
+// DML path attribution (spec 080 W8)
+//
+// Which way an UPDATE / DELETE went: pushed whole to the server (mssql_dml),
+// through #stage and one JOIN statement, or as VALUES-join statements. Printed
+// per operator that sent something (a MERGE counts each action) under
+// MSSQL_COUNTERS, with the running totals, so a test or a benchmark can tell a
+// fallback from a pushed statement without reading the plan.
+//===----------------------------------------------------------------------===//
+
+enum class DmlPath : uint8_t { PUSHED, STAGED, VALUES_JOIN };
+
+void CountDml(DmlPath path);
+
 }  // namespace mssql
 }  // namespace duckdb

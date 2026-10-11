@@ -238,6 +238,8 @@ set(EXTENSION_SOURCES
     # DML staged UPDATE/DELETE through #stage (spec 080 D3)
     src/dml/mssql_staged_dml.cpp
     src/dml/mssql_physical_staged_dml.cpp
+    # The vehicle of a pushed DML (spec 080 D1)
+    src/dml/mssql_dml_function.cpp
     # DML CTAS layer (CREATE TABLE AS SELECT)
     src/dml/ctas/mssql_ctas_executor.cpp
     src/dml/ctas/mssql_ctas_planner.cpp

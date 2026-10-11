@@ -25,6 +25,13 @@ on:
       - 'Makefile'
       - 'test/cpp/test_concurrent_reads.cpp'
       - 'test/cpp/test_transaction_pin.cpp'
+      # Spec 080 PR 3b: the at-least-once gate of mssql_dml runs here, the one
+      # job with a build tree to link a live C++ test against.
+      - 'test/cpp/test_dml_vehicle.cpp'
+      - 'src/dml/**'
+      - 'src/include/dml/**'
+      # The gate checks DuckDB's behaviour: a pin bump runs it too.
+      - 'duckdb'
       - 'src/connection/mssql_connection_provider.cpp'
       - 'src/catalog/mssql_transaction.cpp'
       - 'src/include/catalog/mssql_transaction.hpp'
@@ -243,6 +250,11 @@ jobs:
       # against the debug tree built above. Seconds, not a statistical loop.
       - name: Run transaction-pin contention test (issue #356)
         run: make test-transaction-pin
+
+      # Spec 080 PR 3b: a pushed DML's vehicle submitted and never read still
+      # runs (ResultEagerness::FORCED), as a native UPDATE does.
+      - name: Run the mssql_dml at-least-once test (spec 080)
+        run: make test-dml-vehicle
 
       # The self-contained rowid files under the DEBUG build (issue #369): the
       # scan's copy of a projected key column into the rowid slot asserted on

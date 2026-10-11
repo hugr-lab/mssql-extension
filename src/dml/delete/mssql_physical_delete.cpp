@@ -4,6 +4,7 @@
 #include "connection/mssql_connection_provider.hpp"
 #include "dml/delete/mssql_delete_executor.hpp"
 #include "duckdb/common/exception.hpp"
+#include "mssql_counters.hpp"
 
 namespace duckdb {
 
@@ -59,6 +60,9 @@ SinkFinalizeType MSSQLPhysicalDelete::Finalize(Pipeline &pipeline, Event &event,
 		gstate.total_rows_deleted = gstate.executor->GetTotalRowsDeleted();
 		gstate.batch_count = gstate.executor->GetBatchCount();
 		gstate.finalized = true;
+		if (gstate.batch_count > 0) {
+			mssql::CountDml(mssql::DmlPath::VALUES_JOIN);
+		}
 		// Spec 080 W3: the planner's estimate follows an autocommit DELETE (the
 		// staged path does the same in MSSQLStagedDml::Finalize).
 		if (table_entry_ && !ConnectionProvider::IsInTransaction(context, table_entry_->GetMSSQLCatalog())) {

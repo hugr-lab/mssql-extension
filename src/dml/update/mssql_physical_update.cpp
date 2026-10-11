@@ -1,6 +1,7 @@
 #include "dml/update/mssql_physical_update.hpp"
 #include "dml/update/mssql_update_executor.hpp"
 #include "duckdb/common/exception.hpp"
+#include "mssql_counters.hpp"
 
 namespace duckdb {
 
@@ -56,6 +57,9 @@ SinkFinalizeType MSSQLPhysicalUpdate::Finalize(Pipeline &pipeline, Event &event,
 		gstate.total_rows_updated = gstate.executor->GetTotalRowsUpdated();
 		gstate.batch_count = gstate.executor->GetBatchCount();
 		gstate.finalized = true;
+		if (gstate.batch_count > 0) {
+			mssql::CountDml(mssql::DmlPath::VALUES_JOIN);
+		}
 	}
 
 	return SinkFinalizeType::READY;
