@@ -470,8 +470,10 @@ static bool ConnectionShared(ClientContext &context, MSSQLCatalog &catalog) {
 //! `as_subquery_value`: the columns are SET values of the subquery form
 //! (join_by_subquery), where a legacy text / ntext / image column cannot be a
 //! subquery's value (error 279). Fabric has no such type, but SQL Server under
-//! mssql_test_dml_platform = 'fabric' does (#444).
-static bool StageCanCarry(const vector<MSSQLColumnInfo> &columns, bool as_subquery_value = false) {
+//! mssql_test_dml_platform = 'fabric' does (#444). No default: a new caller
+//! answers the question (key columns pass false -- IsRoundTripExactForKey
+//! already refuses those types as keys).
+static bool StageCanCarry(const vector<MSSQLColumnInfo> &columns, bool as_subquery_value) {
 	for (const auto &col : columns) {
 		const auto t = StringUtil::Lower(col.sql_type_name);
 		if (as_subquery_value && (t == "text" || t == "ntext" || t == "image")) {
@@ -516,7 +518,7 @@ static bool KeyedStagedTarget(ClientContext &context, MSSQLCatalog &catalog, MSS
 		}
 	}
 	target.key_source = MSSQLStagedKeySource::ROWID;
-	if (!StageCanCarry(target.key_columns)) {
+	if (!StageCanCarry(target.key_columns, false)) {
 		return false;
 	}
 	target.catalog_name = catalog.GetName().GetIdentifierName();
@@ -655,7 +657,7 @@ static PhysicalOperator &PlanKeylessDml(ClientContext &context, PhysicalPlanGene
 	// Every column is a key column here, already through IsRoundTripExactForKey;
 	// the bulk wire is asked as well, so the two lists cannot drift apart
 	// (review of #425).
-	if (!StageCanCarry(table_entry.GetMSSQLColumns())) {
+	if (!StageCanCarry(table_entry.GetMSSQLColumns(), false)) {
 		return refuse("a column cannot be bulk-loaded into the stage");
 	}
 	const auto why = KeylessPlanRefusal(context, plan, table_entry);
