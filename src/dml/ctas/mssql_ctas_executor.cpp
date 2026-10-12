@@ -274,8 +274,17 @@ bool CTASExecutionState::SchemaExists(ClientContext &context) {
 //===----------------------------------------------------------------------===//
 
 void CTASExecutionState::ResolveConnectionMode(ClientContext &context, idx_t connection_limit) {
-	in_transaction = !context.transaction.IsAutoCommit();
-	single_connection = in_transaction && connection_limit <= 1;
+	// mssql_ctas_use_bcp = false (issue #451): the CTAS runs whole inside the
+	// DuckDB transaction -- in autocommit the statement's own, which it joins
+	// here -- as on a pool of one, rows as INSERT statements. With the bulk
+	// load (the default) it commits as it loads, parallel writers and all.
+	// config.use_bcp was read at planning, as the optimizer read it.
+	const bool whole_in_transaction = !config.use_bcp;
+	if (whole_in_transaction) {
+		ConnectionProvider::JoinStatementTransaction(context, *catalog);
+	}
+	in_transaction = ConnectionProvider::IsInTransaction(context, *catalog);
+	single_connection = in_transaction && (connection_limit <= 1 || whole_in_transaction);
 	// A pool of one connection in autocommit keeps the bulk load (review of
 	// #382, which found turning it off cost a local-source CTAS its 2-10x for
 	// nothing): the session takes its connection on the FIRST chunk instead of
@@ -298,7 +307,7 @@ void CTASExecutionState::RunDDL(ClientContext &context, const string &sql) {
 	// mssql_ctas_drop_on_failure is the undo (see ExecuteBCPInsert). In single-
 	// connection mode the catalog runs it on the transaction's pinned connection
 	// instead, as it does any catalog DDL there (issue #419).
-	catalog->ExecuteDDL(context, sql);
+	catalog->ExecuteDDL(context, sql, single_connection);
 }
 
 bool CTASExecutionState::ProbeExists(ClientContext &context, const tds::Request &sql, const char *what) {

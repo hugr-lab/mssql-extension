@@ -1,4 +1,5 @@
 #include "dml/update/mssql_physical_update.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "dml/update/mssql_update_executor.hpp"
 #include "duckdb/common/exception.hpp"
 #include "mssql_counters.hpp"
@@ -66,6 +67,8 @@ SinkFinalizeType MSSQLPhysicalUpdate::Finalize(Pipeline &pipeline, Event &event,
 }
 
 unique_ptr<GlobalSinkState> MSSQLPhysicalUpdate::GetGlobalSinkState(ClientContext &context) const {
+	// Issue #451: the statement runs on the catalog as a transaction of one.
+	ConnectionProvider::JoinStatementTransaction(context, target_.catalog_name);
 	auto gstate = make_uniq<MSSQLUpdateGlobalSinkState>(context, target_, config_);
 	if (staged_target_ && !config_.defer_to_finalize) {
 		gstate->stage_switch = make_uniq<MSSQLStageSwitch>(*staged_target_, config_.stage_threshold);

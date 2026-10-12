@@ -1,4 +1,5 @@
 #include "dml/mssql_physical_staged_dml.hpp"
+#include "connection/mssql_connection_provider.hpp"
 
 namespace duckdb {
 
@@ -42,6 +43,8 @@ SinkFinalizeType MSSQLPhysicalStagedDml::Finalize(Pipeline &pipeline, Event &eve
 }
 
 unique_ptr<GlobalSinkState> MSSQLPhysicalStagedDml::GetGlobalSinkState(ClientContext &context) const {
+	// Issue #451: the statement runs on the catalog as a transaction of one.
+	ConnectionProvider::JoinStatementTransaction(context, target_.catalog_name);
 	return make_uniq<MSSQLStagedDmlGlobalSinkState>(context, target_);
 }
 

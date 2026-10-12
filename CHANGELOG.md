@@ -362,6 +362,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: an autocommit UPDATE / DELETE / MERGE commits and rolls back
+  with DuckDB** (#451). Such a statement now runs on its catalog as a
+  transaction of one statement, as postgres_scanner and mysql_scanner run every
+  DuckDB transaction: one pinned connection, `COMMIT` / `ROLLBACK` when DuckDB
+  commits or rolls back the statement.
+  - An error later in the same statement now undoes the write, as do Ctrl-C and
+    a result dropped before its query ended. The write used to be committed at
+    its operator's end. Example: `WITH u AS (UPDATE … RETURNING id) SELECT
+    error('boom') FROM u`.
+  - Since DuckDB ef5b57f94ad, DuckDB aborts such a dropped result and rolls
+    back a DuckDB table. An MSSQL table now behaves the same.
+  - The statement reads the scans of that catalog as in a transaction:
+    materialized, on its connection. It holds that connection until DuckDB
+    ends the query.
+  - A MERGE's actions now share one connection and commit together.
+  - `mssql_insert_use_bcp = false` makes an INSERT join the same way, and
+    `mssql_ctas_use_bcp = false` makes a CTAS run whole inside the DuckDB
+    transaction, also inside `BEGIN … COMMIT`. A CTAS then runs its checks,
+    `CREATE` and rows (as INSERT statements) on one connection, and a
+    `ROLLBACK` drops the table.
+  - With both settings `true` (the default), an INSERT and a CTAS commit as
+    they load, with their parallel writers, as before.
+  - COPY TO always commits on its own. `mssql_exec()` does too, unless it is
+    called inside a statement that has joined its catalog.
+
 - **UPDATE and DELETE through the catalog are refused on Azure Synapse**
   (spec 080): its primary keys and unique constraints are `NOT ENFORCED`, so a
   key could match rows the statement did not select. `mssql_exec()` still
@@ -434,6 +459,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which used to be reserved up front.
 
 ### Fixed
+
+- **A materialized scan crashed on a composite rowid key it did not project,
+  and ignored the filters DuckDB applies itself** (found by #451). A scan is
+  materialized inside an explicit transaction, on a pool of one connection,
+  and now in an autocommit DML statement.
+  - The rowid STRUCT's key fields were written only into the streaming
+    chunk. The drain appended garbage, and an `UPDATE` in a transaction on
+    such a table crashed (SIGBUS).
+  - The filters the encoder does not push, which run in DuckDB, ran only on
+    the streaming path. A materialized scan returned the rows they reject, so
+    an `UPDATE … WHERE lower(name) = 'x'` in a transaction changed rows it
+    should not have.
+- **A `COMMIT` the server refused counted as done, and a failed `COMMIT` kept
+  its connection out of the pool for good.** The transaction manager now reads
+  the answer to `COMMIT` / `ROLLBACK` and closes a connection whose state it
+  cannot confirm.
+  - A failed `COMMIT` says whether nothing was written (the server refused it)
+    or whether the outcome is unknown (no answer).
+  - The `COMMIT` round trip no longer holds the lock every statement on the
+    catalog takes to start its transaction.
 
 - **An INSERT that cannot use the bulk path counted its last batch as 0
   rows.** This is an INSERT naming the identity column, with a geometry, CLR

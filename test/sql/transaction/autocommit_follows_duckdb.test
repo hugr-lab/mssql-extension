@@ -1,0 +1,505 @@
+# name: test/sql/transaction/autocommit_follows_duckdb.test
+# description: An autocommit write to SQL Server commits and rolls back with DuckDB (issue #451)
+# group: [transaction]
+# issue: 451
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# An autocommit UPDATE / DELETE / MERGE on an MSSQL catalog runs on it as a
+# transaction of one statement -- one pinned connection, COMMIT / ROLLBACK when
+# DuckDB commits or rolls back the statement's transaction -- as
+# postgres_scanner and mysql_scanner do; so does an INSERT under
+# mssql_insert_use_bcp = false and a CTAS under mssql_ctas_use_bcp = false.
+# With those true (the default) an INSERT / CTAS commits as it loads, with its
+# parallel writers. So a joined write is undone by anything that
+# undoes the statement AFTER the write's operator finished: here, an error in
+# the query a DML CTE feeds, with a DuckDB table beside it as the control. A
+# handle dropped before its query ended (QueryResult::Close, DuckDB
+# ef5b57f94ad) is the same rollback; sqllogictest cannot drop a handle, so that
+# lives in test/cpp/test_dml_vehicle.cpp.
+#
+# The scans of the catalog a statement writes to are now materialised in
+# autocommit, as in a transaction, and that path had two bugs of its own, both
+# covered here in a transaction and in autocommit:
+#   * a composite key the scan does not project went into the rowid STRUCT's
+#     children of the Execute chunk only, so the drain appended garbage -- an
+#     UPDATE in a transaction crashed (SIGBUS) copying it;
+#   * the filters the encoder refused to push ran in Execute only, so the
+#     drain kept the rows they reject -- an UPDATE changed them all.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS acf (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('acf', 'DROP TABLE IF EXISTS dbo.AcfKeyed; DROP TABLE IF EXISTS dbo.AcfComposite; DROP TABLE IF EXISTS dbo.AcfCtas; CREATE TABLE dbo.AcfKeyed (id INT PRIMARY KEY, name NVARCHAR(20), v INT, d DATE); INSERT INTO dbo.AcfKeyed VALUES (1, N''Alpha'', 0, ''2020-01-01''), (2, N''beta'', 0, NULL), (3, N''ALPHA'', 0, ''2021-01-01''), (4, N''gamma'', 0, NULL); CREATE TABLE dbo.AcfComposite (k1 INT NOT NULL, k2 VARCHAR(10) NOT NULL, v INT, PRIMARY KEY (k1, k2)); INSERT INTO dbo.AcfComposite VALUES (1, ''x'', 10), (1, ''y'', 11), (2, ''x'', 20)');
+
+statement ok
+CREATE TABLE acf_local AS SELECT range::INT AS id, 0 AS v FROM range(1, 5);
+
+#
+# 1. A write undone after its operator finished: a DML CTE, then an error.
+#
+
+statement error
+WITH u AS (UPDATE acf_local SET v = v + 1 RETURNING id) SELECT error('boom') FROM u;
+----
+boom
+
+query I
+SELECT sum(v) FROM acf_local;
+----
+0
+
+# The shipped UPDATE (the rewriter does not push a DML with RETURNING).
+statement error
+WITH u AS (UPDATE acf.dbo.AcfKeyed SET v = v + 1 RETURNING id) SELECT error('boom') FROM u;
+----
+boom
+
+query I
+SELECT sum(v) FROM acf.dbo.AcfKeyed;
+----
+0
+
+statement error
+WITH d AS (DELETE FROM acf.dbo.AcfKeyed WHERE id = 4 RETURNING id) SELECT error('boom') FROM d;
+----
+boom
+
+statement ok
+SET mssql_insert_use_bcp = false;
+
+statement error
+WITH i AS (INSERT INTO acf.dbo.AcfKeyed (id, name, v) VALUES (5, 'delta', 0) RETURNING id) SELECT error('boom') FROM i;
+----
+boom
+
+query II
+SELECT count(*), max(id) FROM acf.dbo.AcfKeyed;
+----
+4	4
+
+# With the bulk path on (the default) an INSERT commits on its own at its
+# Finalize: the error after it leaves the row.
+statement ok
+RESET mssql_insert_use_bcp;
+
+statement error
+WITH i AS (INSERT INTO acf.dbo.AcfKeyed (id, name, v) VALUES (5, 'delta', 0) RETURNING id) SELECT error('boom') FROM i;
+----
+boom
+
+query II
+SELECT count(*), max(id) FROM acf.dbo.AcfKeyed;
+----
+5	5
+
+statement ok
+DELETE FROM acf.dbo.AcfKeyed WHERE id = 5;
+
+# The same statements without the error commit, and the next statement reads
+# them on another pooled connection -- which an uncommitted write would block.
+query I
+WITH u AS (UPDATE acf.dbo.AcfKeyed SET v = v + 1 RETURNING id) SELECT count(*) FROM u;
+----
+4
+
+query I
+SELECT sum(v) FROM acf.dbo.AcfKeyed;
+----
+4
+
+query I
+SELECT active_connections FROM mssql_pool_stats('acf');
+----
+0
+
+# A plain autocommit UPDATE / DELETE / INSERT, pushed or shipped.
+statement ok
+UPDATE acf.dbo.AcfKeyed SET v = v + 10 WHERE id = 1;
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+UPDATE acf.dbo.AcfKeyed SET v = v + 10 WHERE id = 2;
+
+statement ok
+RESET mssql_dml_pushdown;
+
+query II
+SELECT id, v FROM acf.dbo.AcfKeyed ORDER BY id;
+----
+1	11
+2	11
+3	1
+4	1
+
+query I
+SELECT active_connections FROM mssql_pool_stats('acf');
+----
+0
+
+#
+# 2. The filters the encoder does not push, on a materialised scan -- the scan
+#    feeding a shipped UPDATE, in autocommit and in a transaction. A DATE the
+#    server cannot hold is never pushed (#447): `d < 'infinity'` runs in DuckDB
+#    and rejects the NULLs.
+#
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+query I
+UPDATE acf.dbo.AcfKeyed SET v = 100 WHERE d < 'infinity'::DATE;
+----
+2
+
+query II
+SELECT id, v FROM acf.dbo.AcfKeyed ORDER BY id;
+----
+1	100
+2	11
+3	100
+4	1
+
+statement ok
+BEGIN;
+
+query I
+UPDATE acf.dbo.AcfKeyed SET v = 200 WHERE d < 'infinity'::DATE AND id = 1;
+----
+1
+
+statement ok
+COMMIT;
+
+query II
+SELECT id, v FROM acf.dbo.AcfKeyed ORDER BY id;
+----
+1	200
+2	11
+3	100
+4	1
+
+#
+# 3. A composite key the scan does not project, on a materialised scan.
+#
+
+query I
+UPDATE acf.dbo.AcfComposite SET v = v + 100 WHERE k2 = 'x';
+----
+2
+
+statement ok
+BEGIN;
+
+query I
+UPDATE acf.dbo.AcfComposite SET v = v + 1000 WHERE k1 = 1;
+----
+2
+
+query I
+DELETE FROM acf.dbo.AcfComposite WHERE v = 120;
+----
+1
+
+statement ok
+COMMIT;
+
+query III
+SELECT k1, k2, v FROM acf.dbo.AcfComposite ORDER BY k1, k2;
+----
+1	x	1110
+1	y	1011
+
+statement ok
+RESET mssql_dml_pushdown;
+
+#
+# 4. MERGE with two actions: they share the statement's one connection.
+#
+
+query I
+MERGE INTO acf.dbo.AcfKeyed t USING (SELECT * FROM (VALUES (1, 'Alpha', 7), (9, 'omega', 9)) s(id, name, v)) s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = s.v
+WHEN NOT MATCHED THEN INSERT (id, name, v) VALUES (s.id, s.name, s.v);
+----
+2
+
+query II
+SELECT id, v FROM acf.dbo.AcfKeyed WHERE id IN (1, 9) ORDER BY id;
+----
+1	7
+9	9
+
+query I
+SELECT active_connections FROM mssql_pool_stats('acf');
+----
+0
+
+#
+# 5. mssql_ctas_use_bcp: a CTAS commits as it loads by default, also inside a
+#    transaction (spec 057); set false, it runs whole in the transaction.
+#
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE acf.dbo.AcfCtas AS SELECT range::INT AS id FROM range(3);
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM acf.dbo.AcfCtas;
+----
+3
+
+statement ok
+SELECT mssql_exec('acf', 'DROP TABLE dbo.AcfCtas');
+
+statement ok
+SELECT mssql_invalidate_cache('acf');
+
+statement ok
+SET mssql_ctas_use_bcp = false;
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE acf.dbo.AcfCtas AS SELECT range::INT AS id FROM range(3);
+
+query I
+SELECT count(*) FROM acf.dbo.AcfCtas;
+----
+3
+
+statement ok
+ROLLBACK;
+
+statement ok
+SELECT mssql_invalidate_cache('acf');
+
+query I
+SELECT count(*) FROM mssql_scan('acf', 'SELECT name FROM sys.tables WHERE name = ''AcfCtas''');
+----
+0
+
+# In autocommit, reading the catalog it writes to.
+statement ok
+CREATE TABLE acf.dbo.AcfCtas AS SELECT id FROM acf.dbo.AcfKeyed;
+
+query I
+SELECT count(*) FROM acf.dbo.AcfCtas;
+----
+5
+
+query I
+SELECT active_connections FROM mssql_pool_stats('acf');
+----
+0
+
+statement ok
+RESET mssql_ctas_use_bcp;
+
+statement ok
+SELECT mssql_exec('acf', 'DROP TABLE dbo.AcfCtas');
+
+statement ok
+SELECT mssql_invalidate_cache('acf');
+
+#
+# 6. A pool of ONE connection: the statement holds it from the first write
+#    to DuckDB's COMMIT, and its scans take turns with the sink on it.
+#
+
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS acf1 (TYPE mssql);
+
+statement ok
+RESET mssql_connection_limit;
+
+statement ok
+SET mssql_acquire_timeout = 5;
+
+statement error
+WITH u AS (UPDATE acf1.dbo.AcfKeyed SET v = v + 1 RETURNING id) SELECT error('boom') FROM u;
+----
+boom
+
+query I
+UPDATE acf1.dbo.AcfKeyed SET v = v + 1 WHERE id IN (SELECT id FROM acf1.dbo.AcfKeyed WHERE v > 50);
+----
+1
+
+query I
+MERGE INTO acf1.dbo.AcfKeyed t USING (SELECT * FROM (VALUES (1, 'Alpha', 70), (10, 'tau', 10)) s(id, name, v)) s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = s.v
+WHEN NOT MATCHED THEN INSERT (id, name, v) VALUES (s.id, s.name, s.v);
+----
+2
+
+query II
+SELECT id, v FROM acf1.dbo.AcfKeyed ORDER BY id;
+----
+1	70
+2	11
+3	101
+4	1
+9	9
+10	10
+
+query I
+SELECT active_connections FROM mssql_pool_stats('acf1');
+----
+0
+
+statement ok
+RESET mssql_acquire_timeout;
+
+statement ok
+DETACH acf1;
+
+#
+# 7. Scans of the catalog that DuckDB initialises BEFORE the sink -- a join's
+#    build side, a MERGE's source -- on an empty pool (lazy_validation: no
+#    connection opened at ATTACH) and threads = 4. Each scan joins at its own
+#    init, so none reads on a pool connection labelled pinned (review of #451:
+#    such a connection never went back to the pool). Repeated, and the pool
+#    must end every statement with nothing checked out.
+#
+
+statement ok
+SET threads = 4;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS acfl (TYPE mssql, lazy_validation true);
+
+statement ok
+SELECT mssql_exec('acfl', 'DROP TABLE IF EXISTS dbo.AcfSrc; CREATE TABLE dbo.AcfSrc (id INT PRIMARY KEY, w INT); INSERT INTO dbo.AcfSrc VALUES (1, 1), (2, 2), (3, 3), (4, 4)');
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+loop i 0 3
+
+query I
+UPDATE acfl.dbo.AcfKeyed SET v = s.w FROM acfl.dbo.AcfSrc s WHERE acfl.dbo.AcfKeyed.id = s.id;
+----
+4
+
+query I
+MERGE INTO acfl.dbo.AcfKeyed t USING acfl.dbo.AcfSrc s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = s.w + 1;
+----
+4
+
+query I
+SELECT active_connections FROM mssql_pool_stats('acfl');
+----
+0
+
+endloop
+
+statement ok
+RESET mssql_dml_pushdown;
+
+query II
+SELECT id, v FROM acfl.dbo.AcfKeyed WHERE id <= 4 ORDER BY id;
+----
+1	2
+2	3
+3	4
+4	5
+
+# A DML CTE, then a read of its target in the same statement: the read runs on
+# the statement's connection and sees the write.
+query I
+WITH u AS (UPDATE acfl.dbo.AcfKeyed SET v = 0 WHERE id = 1 RETURNING id) SELECT (SELECT v FROM acfl.dbo.AcfKeyed WHERE id = 1) FROM u;
+----
+0
+
+# A CTAS that runs whole in the statement's transaction, from a join of two
+# tables of the catalog it writes to.
+statement ok
+SET mssql_ctas_use_bcp = false;
+
+statement ok
+CREATE TABLE acfl.dbo.AcfCtasJoin AS SELECT k.id, k.v, s.w FROM acfl.dbo.AcfKeyed k JOIN acfl.dbo.AcfSrc s ON k.id = s.id;
+
+query I
+SELECT count(*) FROM acfl.dbo.AcfCtasJoin;
+----
+4
+
+statement ok
+RESET mssql_ctas_use_bcp;
+
+query I
+SELECT active_connections FROM mssql_pool_stats('acfl');
+----
+0
+
+statement ok
+SELECT mssql_exec('acfl', 'DROP TABLE dbo.AcfSrc; DROP TABLE dbo.AcfCtasJoin');
+
+statement ok
+DETACH acfl;
+
+statement ok
+RESET threads;
+
+#
+# 8. Fabric's DML forms (always staged, matched through WHERE EXISTS), emulated
+#    on SQL Server: an error after the write rolls it back there too.
+#
+
+statement ok
+SET mssql_test_dml_platform = 'fabric';
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS acff (TYPE mssql);
+
+statement ok
+RESET mssql_test_dml_platform;
+
+statement ok
+CREATE TABLE acff_before AS SELECT sum(v) AS s FROM acff.dbo.AcfKeyed;
+
+# RETURNING is not available on Fabric, so the DML CTE has none.
+statement error
+WITH u AS (UPDATE acff.dbo.AcfKeyed SET v = v + 1000) SELECT error('boom');
+----
+boom
+
+query I
+SELECT (SELECT sum(v) FROM acff.dbo.AcfKeyed) = (SELECT s FROM acff_before);
+----
+true
+
+query I
+SELECT active_connections FROM mssql_pool_stats('acff');
+----
+0
+
+statement ok
+DETACH acff;
+
+statement ok
+SELECT mssql_exec('acf', 'DROP TABLE dbo.AcfKeyed; DROP TABLE dbo.AcfComposite');
+
+statement ok
+DETACH acf;

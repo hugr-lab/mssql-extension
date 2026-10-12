@@ -67,13 +67,45 @@ static MSSQLTransaction *TryGetMSSQLTransaction(ClientContext &context, MSSQLCat
 // ConnectionProvider::IsInTransaction
 //===----------------------------------------------------------------------===//
 
-bool ConnectionProvider::IsInTransaction(ClientContext &context, MSSQLCatalog &catalog) {
-	// In autocommit mode, we're not in an explicit transaction
-	if (context.transaction.IsAutoCommit()) {
+//! Whether `txn`'s connection is pinned: an explicit transaction, or an
+//! autocommit statement that joined (issue #451).
+static bool UsesPinnedConnection(ClientContext &context, MSSQLTransaction *txn) {
+	if (!txn) {
 		return false;
 	}
+	return !context.transaction.IsAutoCommit() || txn->IsStatementJoined();
+}
+
+bool ConnectionProvider::IsInTransaction(ClientContext &context, MSSQLCatalog &catalog) {
+	return UsesPinnedConnection(context, TryGetMSSQLTransaction(context, catalog));
+}
+
+//===----------------------------------------------------------------------===//
+// ConnectionProvider::JoinStatementTransaction
+//===----------------------------------------------------------------------===//
+
+void ConnectionProvider::JoinStatementTransaction(ClientContext &context, MSSQLCatalog &catalog) {
+	if (!context.transaction.IsAutoCommit()) {
+		return;
+	}
+	MSSQLTransaction::Get(context, catalog).JoinStatement();
+}
+
+bool ConnectionProvider::IsPinnedConnection(ClientContext &context, MSSQLCatalog &catalog,
+											const std::shared_ptr<tds::TdsConnection> &conn) {
 	auto *txn = TryGetMSSQLTransaction(context, catalog);
-	return txn != nullptr;
+	if (!conn || !UsesPinnedConnection(context, txn)) {
+		return false;
+	}
+	return txn->GetPinnedConnection() == conn;
+}
+
+void ConnectionProvider::JoinStatementTransaction(ClientContext &context, const string &catalog_name) {
+	if (!context.transaction.IsAutoCommit()) {
+		return;
+	}
+	auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name)).Cast<MSSQLCatalog>();
+	MSSQLTransaction::Get(context, catalog).JoinStatement();
 }
 
 //===----------------------------------------------------------------------===//
@@ -135,12 +167,9 @@ bool ConnectionProvider::ShouldResetOnRelease(ClientContext &context) {
 //===----------------------------------------------------------------------===//
 
 bool ConnectionProvider::IsSqlServerTransactionActive(ClientContext &context, MSSQLCatalog &catalog) {
-	// In autocommit mode, SQL Server transactions are never active (each statement is independent)
-	if (context.transaction.IsAutoCommit()) {
-		return false;
-	}
+	// In autocommit, each statement is independent -- unless it joined (#451).
 	auto *txn = TryGetMSSQLTransaction(context, catalog);
-	if (!txn) {
+	if (!UsesPinnedConnection(context, txn)) {
 		return false;
 	}
 	return txn->IsSqlServerTransactionActive();
@@ -150,13 +179,15 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 																	  int timeout_ms) {
 	auto *txn = TryGetMSSQLTransaction(context, catalog);
 
-	// Check if we're in autocommit mode (implicit transaction per statement)
-	// In autocommit mode, each statement is independent - no need to pin a connection
-	bool is_autocommit = context.transaction.IsAutoCommit();
+	// In autocommit each statement is independent and takes what it needs from
+	// the pool -- unless it writes to this catalog and joined (issue #451).
+	const bool is_autocommit = context.transaction.IsAutoCommit();
+	const bool pinned_mode = UsesPinnedConnection(context, txn);
 
-	MSSQL_CONN_LOG("GetConnection: context=%p, txn=%p, is_autocommit=%d", (void *)&context, (void *)txn, is_autocommit);
+	MSSQL_CONN_LOG("GetConnection: context=%p, txn=%p, is_autocommit=%d, pinned=%d", (void *)&context, (void *)txn,
+				   is_autocommit, pinned_mode);
 
-	if (!txn || is_autocommit) {
+	if (!pinned_mode) {
 		// Not in a transaction OR in autocommit mode - acquire from pool
 		MSSQL_CONN_LOG("GetConnection: Autocommit mode (txn=%p, is_autocommit=%d), acquiring from pool", (void *)txn,
 					   is_autocommit);
@@ -220,13 +251,17 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	// In the BEGIN batch a failed SET would let BEGIN run at the old level, and
 	// the reply scan below stops at the ERROR token before the descriptor.
 	// Only when the option asks for a level; none means no round trip, as before.
-	auto isolation = catalog.TransactionIsolationStatement();
+	// Not for an autocommit statement that joined (issue #451): the option is
+	// the level of the transactions a DuckDB BEGIN opens, and an autocommit
+	// write keeps the level it always ran at.
+	auto isolation = is_autocommit ? string() : catalog.TransactionIsolationStatement();
 	if (!isolation.empty()) {
 		auto result = MSSQLSimpleQuery::Execute(*conn, isolation);
 		if (!result.success) {
 			pool.Release(conn);
 			throw IOException("MSSQL: %s failed: %s", isolation, result.error_message);
 		}
+		txn->SetIsolationSent();
 	}
 	// From here the session carries the level. RESET_CONNECTION does not clear it,
 	// so if BEGIN fails the connection must not go back to the pool as it is: it
@@ -311,9 +346,10 @@ void ConnectionProvider::ReleaseConnection(ClientContext &context, MSSQLCatalog 
 	}
 
 	auto *txn = TryGetMSSQLTransaction(context, catalog);
-	bool is_autocommit = context.transaction.IsAutoCommit();
 
-	if (!txn || is_autocommit) {
+	// By identity, not by mode: a pool connection taken just before the
+	// statement joined (review of #451) goes back to the pool like any other.
+	if (!UsesPinnedConnection(context, txn) || txn->GetPinnedConnection() != conn) {
 		// Not in a transaction OR in autocommit mode - flag for reset and return to pool
 		// The RESET_CONNECTION flag will be set on the TDS header of the next SQL_BATCH,
 		// which is how ADO.NET/JDBC drivers reset session state (temp tables, variables, SET options)
@@ -334,14 +370,8 @@ void ConnectionProvider::ReleaseConnection(ClientContext &context, MSSQLCatalog 
 		return;
 	}
 
-	// In a transaction - no-op (connection stays pinned until commit/rollback)
+	// The pinned connection: a no-op, it stays pinned until COMMIT / ROLLBACK.
 	MSSQL_CONN_LOG("ReleaseConnection: Transaction mode, keeping connection pinned (no-op)");
-	// Verify it's the pinned connection
-	auto pinned = txn->GetPinnedConnection();
-	if (pinned != conn) {
-		MSSQL_CONN_LOG("WARNING: ReleaseConnection called with non-pinned connection in transaction");
-	}
-	// Do nothing - connection stays pinned
 }
 
 namespace mssql {

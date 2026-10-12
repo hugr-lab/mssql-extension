@@ -71,9 +71,11 @@ unique_ptr<GlobalSinkState> MSSQLPhysicalCreateTableAs::GetGlobalSinkState(Clien
 		// On a pool of more than one, everything below runs on POOL connections
 		// -- the DROP, the CREATE, the bulk load's own -- which the mutex does not
 		// protect, and a blocking Acquire under it would stall every
-		// materialising scan of this catalog on every session. On a pool of one
-		// the DDL shares the one connection with the scan, so it stays held.
-		if (materialize_lock.owns_lock() && !one_connection) {
+		// materialising scan of this catalog on every session. On a pool of one,
+		// and whenever the CTAS runs whole on the pinned connection
+		// (mssql_ctas_use_bcp = false, issue #451), the DDL shares that connection
+		// with the scans, so it stays held.
+		if (materialize_lock.owns_lock() && !one_connection && !gstate->state.single_connection) {
 			materialize_lock.unlock();
 		}
 

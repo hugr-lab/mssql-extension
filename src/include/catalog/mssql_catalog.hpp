@@ -533,8 +533,12 @@ public:
 	// Execute a DDL statement on SQL Server
 	// @param context Client context
 	// @param tsql T-SQL statement to execute
+	// @param on_transaction_connection run it on the transaction's pinned
+	//        connection, inside the transaction, whatever the pool size -- a
+	//        CTAS that runs whole in the transaction (mssql_ctas_use_bcp =
+	//        false, issue #451). Otherwise only on a pool of one (issue #419).
 	// @throws on SQL Server error or connection failure
-	void ExecuteDDL(ClientContext &context, const string &tsql);
+	void ExecuteDDL(ClientContext &context, const string &tsql, bool on_transaction_connection = false);
 
 	// Invalidate the metadata cache (forces refresh on next access)
 	void InvalidateMetadataCache();

@@ -83,6 +83,25 @@ DML statement is atomic (issue #344), and holds its one pool connection for
 its whole duration. Inside an explicit transaction the helper is a no-op —
 the pinned connection's transaction already spans every request.
 
+Since issue #451 an autocommit UPDATE / DELETE / MERGE goes further: it
+**joins DuckDB's own transaction for the statement** -- DuckDB runs every
+autocommit statement in a transaction -- so the server COMMIT comes when DuckDB
+commits the statement, and an error later in it, Ctrl-C, or a result DuckDB
+aborts (a handle dropped before its query ended, DuckDB ef5b57f94ad) rolls the
+write back, as for a DuckDB table. postgres_scanner and mysql_scanner do the
+same for every DuckDB transaction. Mechanically it is the explicit-transaction
+path for one statement: the write's sink calls
+`ConnectionProvider::JoinStatementTransaction` when it is initialised (before
+DuckDB initialises the scans of its pipeline), `MSSQLTransaction::JoinStatement`
+marks the catalog's transaction, and from then on `GetConnection` pins (BEGIN
+on first use, no `transaction_isolation` SET -- autocommit keeps its level),
+the scans of that catalog materialise, and `MSSQLTransactionManager` ends the
+server transaction. An INSERT joins the same way under `mssql_insert_use_bcp =
+false` (and as a MERGE action); a CTAS under `mssql_ctas_use_bcp = false` runs
+whole in the transaction. With those settings true (the default) INSERT and CTAS
+keep the per-statement bracket above and their parallel writers. COPY and
+`mssql_exec()` never join.
+
 ### Explicit Transaction Mode
 
 After `BEGIN` is issued:
@@ -319,6 +338,7 @@ The same persistence applies to a `SET TRANSACTION ISOLATION LEVEL` sent through
 | Scenario | Pool Behavior |
 |---|---|
 | Autocommit statement | Acquire → use → return to pool |
+| Autocommit UPDATE / DELETE / MERGE (INSERT / CTAS when their `use_bcp` is off) | Pin at the first use in the statement → return at DuckDB's COMMIT / ROLLBACK of the statement (issue #451) |
 | Transaction first DML | Acquire from pool → pin to transaction |
 | Transaction subsequent DML | Reuse pinned connection (no pool interaction) |
 | Transaction COMMIT/ROLLBACK | Return pinned connection to pool |
@@ -363,7 +383,9 @@ where there is no second connection: a CTAS then runs whole on the pinned one �
 checks, CREATE and rows, the rows as INSERT statements — and ROLLBACK undoes it;
 so does any catalog DDL (`CREATE` / `DROP` / `ALTER TABLE`, `CREATE` / `DROP
 SCHEMA`), which before issue #419 waited out `mssql_acquire_timeout` for a
-second connection and failed. Under `transaction_isolation = 'snapshot'` (or
+second connection and failed. A CTAS also runs whole on the pinned connection
+under `mssql_ctas_use_bcp = false`, whatever the pool size (issue #451; in
+autocommit on the statement's own); other catalog DDL does not. Under `transaction_isolation = 'snapshot'` (or
 `'auto'` resolving to it) SQL Server refuses `ALTER TABLE` and index DDL
 (a `table_kind = 'columnstore'` CREATE) inside the transaction (error 3964);
 `CREATE` / `DROP TABLE` are allowed.

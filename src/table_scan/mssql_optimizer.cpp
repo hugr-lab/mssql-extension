@@ -16,6 +16,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "connection/mssql_settings.hpp"
 #include "copy/copy_function.hpp"
+#include "dml/insert/mssql_insert_config.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/main/database.hpp"
@@ -789,9 +790,9 @@ static void TryPushTopN(ClientContext &context, unique_ptr<LogicalOperator> &pla
 // With threads > 1 the two run concurrently and it is a torn stream instead.
 //
 // So: in an explicit transaction, a plan with MORE THAN ONE scan of the same
-// catalog materializes all of them. Autocommit is untouched — there each scan
-// takes its own pooled connection, which is why the same query passes outside a
-// transaction.
+// catalog materializes all of them. Autocommit gives each scan its own pooled
+// connection -- except for a catalog the statement writes to and joins (issue
+// #451), which is pinned as in a transaction, and a pool of one (#380).
 //
 // ALL of them, not "all but the first": which source DuckDB initializes first is
 // a scheduling detail rather than a plan property, and the DELIM case initializes
@@ -809,6 +810,9 @@ static void TryPushTopN(ClientContext &context, unique_ptr<LogicalOperator> &pla
 struct MSSQLCatalogScanTally {
 	vector<MSSQLCatalogScanBindData *> catalog_scans;
 	idx_t raw_scans = 0;
+	//! The raw scans' bind data, for the join mark (issue #451) -- a raw scan
+	//! is never flagged for materialisation here (it decides at init).
+	vector<MSSQLScanBindData *> raw_scan_data;
 };
 
 // The raw scans: the two that describe at bind and, since spec 081, the two that
@@ -833,6 +837,7 @@ static void CollectCatalogScans(LogicalOperator &op, case_insensitive_map_t<MSSQ
 		} else if (IsRawScanName(get.function.GetName().GetIdentifierName()) && get.bind_data) {
 			auto &bind_data = get.bind_data->Cast<MSSQLScanBindData>();
 			by_catalog[bind_data.context_name].raw_scans++;
+			by_catalog[bind_data.context_name].raw_scan_data.push_back(&bind_data);
 		}
 	}
 	for (auto &child : op.children) {
@@ -853,7 +858,15 @@ static void CollectCatalogScans(LogicalOperator &op, case_insensitive_map_t<MSSQ
 // 'mssql://SK75/dbo/dst' is a legal way to write a sink into `sk75`. Matching
 // those with a case-sensitive set silently finds no sink and skips the
 // materialization, which is issue #239 back again with no diagnostic.
-static void CollectSinkCatalogs(LogicalOperator &op, case_insensitive_set_t &catalogs) {
+//! `joining` (issue #451): the catalogs an AUTOCOMMIT statement joins -- runs on
+//! as a transaction of one statement, on one pinned connection
+//! (ConnectionProvider::JoinStatementTransaction): every UPDATE / DELETE / MERGE
+//! target, an INSERT's when `insert_joins` (mssql_insert_use_bcp = false), a
+//! CTAS's when `ctas_joins` (mssql_ctas_use_bcp = false) -- the same settings
+//! PlanInsert and the CTAS planner read. A COPY never joins: it keeps its own
+//! commits and its writers.
+static void CollectSinkCatalogs(LogicalOperator &op, case_insensitive_set_t &catalogs, case_insensitive_set_t &joining,
+								bool insert_joins, bool ctas_joins) {
 	if (op.type == LogicalOperatorType::LOGICAL_COPY_TO_FILE) {
 		auto &copy = op.Cast<LogicalCopyToFile>();
 		if (copy.function.name == "bcp" && copy.bind_data) {
@@ -867,6 +880,9 @@ static void CollectSinkCatalogs(LogicalOperator &op, case_insensitive_set_t &cat
 		if (catalog.GetCatalogType() == "mssql") {
 			MSSQL_OPT_DEBUG(1, "sink: INSERT into catalog '%s'", catalog.GetName().GetIdentifierName().c_str());
 			catalogs.insert(catalog.GetName().GetIdentifierName());
+			if (insert_joins) {
+				joining.insert(catalog.GetName().GetIdentifierName());
+			}
 		}
 	} else if (op.type == LogicalOperatorType::LOGICAL_UPDATE || op.type == LogicalOperatorType::LOGICAL_DELETE ||
 			   op.type == LogicalOperatorType::LOGICAL_MERGE_INTO) {
@@ -888,6 +904,7 @@ static void CollectSinkCatalogs(LogicalOperator &op, case_insensitive_set_t &cat
 		if (catalog.GetCatalogType() == "mssql") {
 			MSSQL_OPT_DEBUG(1, "sink: DML into catalog '%s'", catalog.GetName().GetIdentifierName().c_str());
 			catalogs.insert(catalog.GetName().GetIdentifierName());
+			joining.insert(catalog.GetName().GetIdentifierName());
 		}
 	} else if (op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE) {
 		// Issue #380: a CTAS into this catalog. On a pool of one its rows go as
@@ -897,10 +914,13 @@ static void CollectSinkCatalogs(LogicalOperator &op, case_insensitive_set_t &cat
 		if (catalog.GetCatalogType() == "mssql") {
 			MSSQL_OPT_DEBUG(1, "sink: CTAS into catalog '%s'", catalog.GetName().GetIdentifierName().c_str());
 			catalogs.insert(catalog.GetName().GetIdentifierName());
+			if (ctas_joins) {
+				joining.insert(catalog.GetName().GetIdentifierName());
+			}
 		}
 	}
 	for (auto &child : op.children) {
-		CollectSinkCatalogs(*child, catalogs);
+		CollectSinkCatalogs(*child, catalogs, joining, insert_joins, ctas_joins);
 	}
 }
 
@@ -943,9 +963,24 @@ static void MaterializeSharedConnectionScans(ClientContext &context, LogicalOper
 		return;
 	}
 	case_insensitive_set_t sink_catalogs;
-	CollectSinkCatalogs(plan, sink_catalogs);
+	case_insensitive_set_t joining_catalogs;
+	CollectSinkCatalogs(plan, sink_catalogs, joining_catalogs, !LoadInsertConfig(context).use_bcp,
+						!LoadCTASUseBCP(context));
 	for (auto &entry : by_catalog) {
-		if (autocommit && !HasSingleConnectionPool(context, entry.first)) {
+		// A catalog the statement writes to is pinned for it even in autocommit
+		// (issue #451): its scans share the connection with the sink as they do
+		// in a transaction, so the same rule applies -- and each of them joins
+		// at its own init, whichever DuckDB initialises first.
+		const bool joining = joining_catalogs.count(entry.first) > 0;
+		if (joining) {
+			for (auto *bind_data : entry.second.catalog_scans) {
+				bind_data->joins_statement = true;
+			}
+			for (auto *bind_data : entry.second.raw_scan_data) {
+				bind_data->joins_statement = true;
+			}
+		}
+		if (autocommit && !HasSingleConnectionPool(context, entry.first) && !joining) {
 			continue;
 		}
 		auto &tally = entry.second;
