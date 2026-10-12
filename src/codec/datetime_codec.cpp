@@ -51,6 +51,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "codec/datetime_codec.hpp"
+#include "duckdb/common/error_data.hpp"
 
 #include "codec/scatter_position.hpp"
 
@@ -635,15 +636,35 @@ static void ScatterChunkPos(POS pos, bool all_valid, idx_t row_begin, idx_t rows
 #undef MSSQL_DT2_ARM
 }
 
+// Issue #447: a value the server cannot hold is refused by the encoders,
+// which know the value but not the column; the column (or parameter) is
+// named here, where a wide COPY needs it.
+[[noreturn]] static void ThrowNamingColumn(const InvalidInputException &ex, const mssql::BCPColumnMetadata &col) {
+	ErrorData error(ex);
+	if (col.name.empty()) {
+		throw InvalidInputException(error.RawMessage());
+	}
+	throw InvalidInputException("%s (%s %s)", error.RawMessage(), col.name[0] == '@' ? "parameter" : "column",
+								col.name);
+}
+
 void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector &in,
 						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col) {
 	// Strided implies all-valid: a NULL would have made the rows differ in length.
-	ScatterChunkPos(StridePos{dst, stride}, /*all_valid=*/true, row_begin, rows, in, fmt, col);
+	try {
+		ScatterChunkPos(StridePos{dst, stride}, /*all_valid=*/true, row_begin, rows, in, fmt, col);
+	} catch (const InvalidInputException &ex) {
+		ThrowNamingColumn(ex, col);
+	}
 }
 
 void ScatterChunkCursor(uint8_t *dst, size_t *cursor, idx_t row_begin, idx_t rows, Vector &in,
 						const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col, bool all_valid) {
-	ScatterChunkPos(CursorPos{dst, cursor, row_begin}, all_valid, row_begin, rows, in, fmt, col);
+	try {
+		ScatterChunkPos(CursorPos{dst, cursor, row_begin}, all_valid, row_begin, rows, in, fmt, col);
+	} catch (const InvalidInputException &ex) {
+		ThrowNamingColumn(ex, col);
+	}
 }
 
 //===----------------------------------------------------------------------===//
@@ -911,8 +932,8 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 // EncodeToBcp — Vector overload
 //===----------------------------------------------------------------------===//
 
-void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
-				 duckdb::vector<uint8_t> &buf) {
+static void EncodeToBcpUnnamed(Vector &in, const UnifiedVectorFormat &fmt, idx_t row,
+							   const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
 	// The raw int64 in the vector is counted in the SOURCE type's unit; the wire
 	// form and its scale come from the target column. Those are two different
 	// types and only coincide when the column metadata was built from the source
@@ -998,6 +1019,15 @@ bool ServerHoldsTemporal(const Value &value) {
 	return day >= BCPRowEncoder::SERVER_MIN_EPOCH_DAY && day <= BCPRowEncoder::SERVER_MAX_EPOCH_DAY;
 }
 
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
+				 duckdb::vector<uint8_t> &buf) {
+	try {
+		EncodeToBcpUnnamed(in, fmt, row, col, buf);
+	} catch (const InvalidInputException &ex) {
+		ThrowNamingColumn(ex, col);
+	}
+}
+
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
 	EncodeToBcpViaFormat(EncodeToBcp, in, row, col, buf);
 }
@@ -1006,7 +1036,19 @@ void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duc
 // EncodeToBcp — Value overload
 //===----------------------------------------------------------------------===//
 
+static void EncodeValueToBcpUnnamed(const Value &value, const mssql::BCPColumnMetadata &col,
+									duckdb::vector<uint8_t> &buf);
+
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+	try {
+		EncodeValueToBcpUnnamed(value, col, buf);
+	} catch (const InvalidInputException &ex) {
+		ThrowNamingColumn(ex, col);
+	}
+}
+
+static void EncodeValueToBcpUnnamed(const Value &value, const mssql::BCPColumnMetadata &col,
+									duckdb::vector<uint8_t> &buf) {
 	// Use the *Value::Get extractors instead of Value::GetValue<T>() —
 	// the latter invokes DuckDB cast operators that fail for TIMESTAMP_TZ
 	// (no TIMESTAMP_TZ→TIMESTAMP cast is registered in some builds). The
@@ -1082,8 +1124,12 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 	}
 	switch (type.id()) {
 	case LogicalTypeId::DATE:
+		// Issue #447: refused by name here too, not left to the server's 241
+		// (and a non-finite date_t never reaches Date::Convert).
+		tds::encoding::BCPRowEncoder::RequireServerDay(DateValue::Get(v).days);
 		return "'" + FormatDateText(DateValue::Get(v)) + "'";
 	case LogicalTypeId::TIME:
+		tds::encoding::BCPRowEncoder::RequireServerTime(TimeValue::Get(v).value);
 		return "'" + FormatTimeText(TimeValue::Get(v)) + "'";
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_MS:

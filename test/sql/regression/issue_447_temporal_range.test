@@ -1,6 +1,7 @@
 # name: test/sql/regression/issue_447_temporal_range.test
 # description: Issue #447 -- a DATE / TIMESTAMP outside SQL Server's 0001-01-01..9999-12-31 ('infinity', a year past 9999) is never wrapped into another date: a filter with one runs in DuckDB, a load refuses it by name
-# group: [regression]
+# group: [mssql]
+# issue: 447
 
 # Environment variables required:
 #   MSSQL_TESTDB_DSN - Connection string to test database
@@ -128,7 +129,7 @@ SELECT count(*) FROM i447.dbo.i447_t;
 statement error
 INSERT INTO i447.dbo.i447_t (id, d) SELECT 1000 + i, CASE WHEN i = 1500 THEN DATE 'infinity' ELSE DATE '2024-01-01' END FROM range(2000) r(i);
 ----
-outside SQL Server's range
+dated infinity is outside SQL Server's range (0001-01-01 to 9999-12-31) and cannot be sent: the wire would turn it into another date (column d)
 
 statement error
 INSERT INTO i447.dbo.i447_t (id, ts) SELECT 1000 + i, CASE WHEN i = 1500 THEN TIMESTAMP '-infinity' ELSE TIMESTAMP '2024-01-01' END FROM range(2000) r(i);
@@ -168,11 +169,17 @@ SELECT count(*) FROM i447.dbo.i447_t;
 ----
 3
 
-# as statements (under the threshold) the value is a literal, which the server
-# refuses -- an error either way, never another date
+# as statements (under the threshold) the value is a literal: refused by name
+# too, not left to the server's error 241
 statement error
 INSERT INTO i447.dbo.i447_t (id, d) VALUES (900, DATE 'infinity');
 ----
+outside SQL Server's range
+
+statement error
+INSERT INTO i447.dbo.i447_t (id, t6) VALUES (902, TIME '24:00:00');
+----
+TIME '24:00:00'
 
 # a TIMESTAMP literal is rendered through the same day split: it was the
 # datetime2(7) literal '2262-04-11T23:47:16.8547758', which the server took

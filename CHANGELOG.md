@@ -398,8 +398,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `d = 'infinity'` matches nothing, `d < 'infinity'` everything. A keyless
     UPDATE / DELETE with one is refused by name: part of its WHERE runs in
     DuckDB.
-  - A load, a parameter or a timestamp literal carrying one fails, naming it.
-    A DATE literal is refused by the server.
+  - A load, a parameter or a literal carrying one fails, naming the value
+    and the column.
   - A timestamp that rounds past 9999-12-31 at the column's scale fails too:
     `datetime2(4)` ← `23:59:59.99999` would carry into a day that does not
     exist.
