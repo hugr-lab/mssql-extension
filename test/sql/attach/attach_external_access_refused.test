@@ -1,0 +1,44 @@
+# name: test/sql/attach/attach_external_access_refused.test
+# description: Issue #452 -- with enable_external_access = false an ATTACH
+#              (TYPE mssql) and mssql_azure_auth_test are refused by name,
+#              before anything is dialled, so no server is needed. The setting
+#              cannot be turned back on. A catalog attached BEFORE the SET
+#              keeps working: attach_external_access.test (needs a server).
+#              The Kerberos / SSPI test functions carry the same one-line
+#              check but exist only where the build has that support.
+# group: [attach]
+
+require mssql
+
+statement ok
+SET enable_external_access = false;
+
+# 127.0.0.1,1: nothing listens there, so without the check this would fail on
+# the dial with another message.
+statement error
+ATTACH 'Server=127.0.0.1,1;Database=master;User Id=u;Password=p' AS eaoff (TYPE mssql);
+----
+<REGEX>:.*Permission Error: MSSQL: ATTACH of 'eaoff' \(TYPE mssql\) is refused: it connects to SQL Server, and external access is disabled \(enable_external_access = false\).*
+
+# lazy_validation dials at the first query instead of the ATTACH: refused too.
+statement error
+ATTACH 'Server=127.0.0.1,1;Database=master;User Id=u;Password=p' AS eaoff (TYPE mssql, lazy_validation true);
+----
+<REGEX>:.*ATTACH of 'eaoff' \(TYPE mssql\) is refused.*enable_external_access.*
+
+statement error
+ATTACH 'mssql://u:p@127.0.0.1:1/master' AS eaoff (TYPE mssql, lazy_validation true);
+----
+<REGEX>:.*ATTACH of 'eaoff' \(TYPE mssql\) is refused.*enable_external_access.*
+
+# Without the check the missing secret comes back as a result string, not an
+# error.
+statement error
+SELECT mssql_azure_auth_test('no_such_secret');
+----
+<REGEX>:.*mssql_azure_auth_test is refused: it requests a token from Azure AD.*enable_external_access.*
+
+statement error
+SELECT mssql_azure_auth_test('no_such_secret', 'no_such_tenant');
+----
+<REGEX>:.*mssql_azure_auth_test is refused.*enable_external_access.*

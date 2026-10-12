@@ -8,6 +8,7 @@
 
 #include "azure/azure_test_function.hpp"
 #include "azure/azure_token.hpp"
+#include "connection/mssql_settings.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
@@ -37,6 +38,7 @@ static std::string TruncateToken(const std::string &token) {
 // AzureAuthTestFunction - Scalar function implementation (1 arg)
 //===----------------------------------------------------------------------===//
 static void AzureAuthTestFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	MSSQLRequireExternalAccess(state.GetContext(), "mssql_azure_auth_test", "requests a token from Azure AD");
 	auto &secret_name_vec = args.data[0];
 
 	UnaryExecutor::Execute<string_t, string_t>(secret_name_vec, result, args.size(), [&](string_t secret_name) {
@@ -58,6 +60,7 @@ static void AzureAuthTestFunction(DataChunk &args, ExpressionState &state, Vecto
 // AzureAuthTestFunctionWithTenant - Scalar function implementation (2 args)
 //===----------------------------------------------------------------------===//
 static void AzureAuthTestFunctionWithTenant(DataChunk &args, ExpressionState &state, Vector &result) {
+	MSSQLRequireExternalAccess(state.GetContext(), "mssql_azure_auth_test", "requests a token from Azure AD");
 	auto &secret_name_vec = args.data[0];
 	auto &tenant_vec = args.data[1];
 

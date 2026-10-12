@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "tds/auth/winsspi_test_function.hpp"
+#include "connection/mssql_settings.hpp"
 #include "mssql_function_docs.hpp"
 #include "tds/auth/auth_strategy_factory.hpp"
 
@@ -126,7 +127,9 @@ static std::string RunWinSspiTest(tds::WinSspiConfig config) {
 //===----------------------------------------------------------------------===//
 // WinSspiTestHost - mssql_winsspi_auth_test(host VARCHAR) -> VARCHAR
 //===----------------------------------------------------------------------===//
-static void WinSspiTestHost(DataChunk &args, ExpressionState & /*state*/, Vector &result) {
+static void WinSspiTestHost(DataChunk &args, ExpressionState &state, Vector &result) {
+	MSSQLRequireExternalAccess(state.GetContext(), "mssql_winsspi_auth_test",
+							   "asks the domain controller for a service ticket");
 	auto &host_vec = args.data[0];
 	UnaryExecutor::Execute<string_t, string_t>(host_vec, result, args.size(), [&](string_t host) {
 		std::string h = host.GetString();
@@ -142,7 +145,9 @@ static void WinSspiTestHost(DataChunk &args, ExpressionState & /*state*/, Vector
 //===----------------------------------------------------------------------===//
 // WinSspiTestHostPort - mssql_winsspi_auth_test(host VARCHAR, port INTEGER)
 //===----------------------------------------------------------------------===//
-static void WinSspiTestHostPort(DataChunk &args, ExpressionState & /*state*/, Vector &result) {
+static void WinSspiTestHostPort(DataChunk &args, ExpressionState &state, Vector &result) {
+	MSSQLRequireExternalAccess(state.GetContext(), "mssql_winsspi_auth_test",
+							   "asks the domain controller for a service ticket");
 	auto &host_vec = args.data[0];
 	auto &port_vec = args.data[1];
 	BinaryExecutor::Execute<string_t, int32_t, string_t>(
@@ -164,7 +169,9 @@ static void WinSspiTestHostPort(DataChunk &args, ExpressionState & /*state*/, Ve
 // e.g. when the host is an IP/alias and the registered SPN is something
 // else. Equivalent to the service_principal_name connection-string knob.
 //===----------------------------------------------------------------------===//
-static void WinSspiTestSpn(DataChunk &args, ExpressionState & /*state*/, Vector &result) {
+static void WinSspiTestSpn(DataChunk &args, ExpressionState &state, Vector &result) {
+	MSSQLRequireExternalAccess(state.GetContext(), "mssql_winsspi_auth_test_spn",
+							   "asks the domain controller for a service ticket");
 	auto &spn_vec = args.data[0];
 	UnaryExecutor::Execute<string_t, string_t>(spn_vec, result, args.size(), [&](string_t spn) {
 		tds::WinSspiConfig cfg;

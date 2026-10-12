@@ -1231,6 +1231,9 @@ static int64_t IntegerAttachOption(const string &name, const Value &value) {
 
 unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
 								AttachedDatabase &db, const string &name, AttachInfo &info, AttachOptions &options) {
+	// Issue #452: before anything is read or dialled. A lazy_validation ATTACH
+	// dials at its first query instead, so it is refused here as well.
+	MSSQLRequireExternalAccess(context, "ATTACH of '" + name + "' (TYPE mssql)", "connects to SQL Server");
 	// Extract SECRET, azure_secret, and access_token parameters (optional if connection string is provided)
 	// Remove them from options so DuckDB's StorageOptions doesn't reject them as unrecognized
 	string secret_name;

@@ -6,6 +6,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
 
 namespace duckdb {
 
@@ -943,6 +944,17 @@ bool LoadExecInvalidateCache(ClientContext &context) {
 		return val.GetValue<bool>();
 	}
 	return false;  // Default: do NOT auto-invalidate; manual invalidation like postgres_execute (#151)
+}
+
+void MSSQLRequireExternalAccess(ClientContext &context, const string &what, const string &reaches) {
+	if (Settings::Get<EnableExternalAccessSetting>(context)) {
+		return;
+	}
+	throw PermissionException(
+		"MSSQL: %s is refused: it %s, and external access is disabled "
+		"(enable_external_access = false). An MSSQL database attached before external access "
+		"was disabled stays usable.",
+		what, reaches);
 }
 
 }  // namespace duckdb
