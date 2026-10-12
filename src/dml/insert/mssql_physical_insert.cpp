@@ -463,8 +463,15 @@ SinkFinalizeType MSSQLPhysicalInsert::Finalize(Pipeline &pipeline, Event &event,
 				gstate.result_chunks.push_back(std::move(result));
 			}
 		} else {
-			// Normal mode - just finalize
+			// Normal mode - just finalize. The last batch is sent here, and its
+			// rows count too: the count used to miss them -- Count 0 for an
+			// INSERT that fitted one batch, short by the last batch otherwise --
+			// on every statement-path INSERT that cannot use BCP (the identity
+			// column named, geometry, a view, a CLR / sql_variant column,
+			// mssql_insert_use_bcp = false). Found by spec 080 PR 3d's
+			// agreement suite.
 			gstate.executor->Finalize();
+			gstate.total_rows_inserted = gstate.executor->GetTotalRowsInserted();
 		}
 
 		return SinkFinalizeType::READY;

@@ -184,6 +184,28 @@ int main() {
 	}
 	Check(RowsAt(conn, 2) == 10, "and each row exactly once more");
 
+	std::cout << "=== Ctrl-C cancels a statement that has no deadline ===" << std::endl;
+	{
+		// Interrupt() from another thread while the server sits in WAITFOR: the
+		// vehicle's wait sees it within a second, sends ATTENTION, and the
+		// server rolls the statement back.
+		std::thread interrupter([&conn]() {
+			std::this_thread::sleep_for(std::chrono::seconds(2));
+			conn.Interrupt();
+		});
+		const auto started = std::chrono::steady_clock::now();
+		auto result = conn.Query(
+			"SELECT * FROM mssql_dml('mssql', 'WAITFOR DELAY ''00:00:30''; UPDATE [dbo].[dml_vehicle_gate] SET [v] = "
+			"[v] + 100', kind := 'update', target_schema := 'dbo', target_table := 'dml_vehicle_gate')");
+		const auto seconds =
+			std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count();
+		interrupter.join();
+		Check(result->HasError() && result->GetErrorType() == ExceptionType::INTERRUPT, "the statement is interrupted");
+		Check(seconds < 15, "within seconds, not the 30 of the WAITFOR");
+	}
+	Check(RowsAt(conn, 2) == 10, "no row changed");
+	Check(Scalar(conn, "SELECT count(*) FROM mssql.dbo.dml_vehicle_gate") == 10, "the next statement runs");
+
 	Run(conn, "SELECT mssql_exec('mssql', 'DROP TABLE dbo.dml_vehicle_gate')");
 	if (failures) {
 		std::cout << failures << " check(s) failed" << std::endl;

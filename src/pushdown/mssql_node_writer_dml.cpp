@@ -21,7 +21,10 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "pushdown/mssql_expression_vocabulary.hpp"
 
 namespace duckdb {
@@ -44,6 +47,18 @@ bool IsNullConstant(const ParsedExpression &expr) {
 bool SameDeclaration(const MSSQLColumnInfo &a, const MSSQLColumnInfo &b) {
 	return StringUtil::CIEquals(a.sql_type_name, b.sql_type_name) && a.max_length == b.max_length &&
 		   a.precision == b.precision && a.scale == b.scale && StringUtil::CIEquals(a.collation_name, b.collation_name);
+}
+
+//! A value of type `from` written into a column of type `to` as DuckDB
+//! writes it: the same type, or an integer widened (exact on both sides --
+//! tinyint is UTINYINT, 0..255, so it widens into smallint too).
+bool WritesAsIs(const LogicalType &from, const LogicalType &to) {
+	if (from == to) {
+		return true;
+	}
+	const int from_rank = IntegerRank(from.id());
+	const int to_rank = IntegerRank(to.id());
+	return from_rank > 0 && to_rank > 0 && from_rank <= to_rank;
 }
 
 //! An aggregate or a window function anywhere in `expr`: DuckDB's binder
@@ -161,7 +176,7 @@ bool NodeWriter::WriteSetValue(const ParsedExpression &expr, idx_t index, std::s
 	if (value.type_uncertain || value.cast_result || value.type.id() == LogicalTypeId::INVALID) {
 		return Veto("SET " + column.name + " = a value whose type DuckDB and the server may not agree on");
 	}
-	if (value.type != column.duckdb_type) {
+	if (!WritesAsIs(value.type, column.duckdb_type)) {
 		// DuckDB casts the value to the column's type (DOUBLE -> INT rounds),
 		// the server converts it implicitly (and truncates).
 		return Veto("SET " + column.name + " = a " + value.type.ToString() + " value into a " +
@@ -341,6 +356,132 @@ bool NodeWriter::WriteDelete(const DeleteQueryNode &node) {
 	out_.dml_kind = "delete";
 	out_.target_schema = target.schema;
 	out_.target_table = target.name;
+	return true;
+}
+
+//===----------------------------------------------------------------------===//
+// Spec 080 PR 3d: INSERT INTO [s].[t] ([c], ...) <SELECT>
+//
+// Both sides on the server, so no row crosses the wire. The SELECT is the
+// SELECT writer's, with its columns written as themselves (raw_columns_): the
+// value never leaves the server, so the read expression a client needs (a
+// code-page varchar's NVARCHAR cast, geometry's STAsBinary) is not applied.
+// Each value must reach its column as DuckDB's INSERT would write it -- the
+// SET rule of PR 3c -- and an omitted column gets the server's DEFAULT on
+// both paths (the shipped INSERT names only the named columns, measured).
+//===----------------------------------------------------------------------===//
+
+bool NodeWriter::WriteInsert(const InsertQueryNode &node, const BaseTableRef &target) {
+	if (!node.returning_list.empty()) {
+		return Veto("RETURNING");
+	}
+	if (node.on_conflict_info) {
+		return Veto("ON CONFLICT");
+	}
+	if (node.default_values) {
+		return Veto("DEFAULT VALUES");
+	}
+	if (node.column_order != InsertColumnOrder::INSERT_BY_POSITION) {
+		return Veto("INSERT BY NAME");
+	}
+	if (!node.cte_map.map.empty() || !node.modifiers.empty()) {
+		return Veto("a WITH clause or a modifier on an INSERT");
+	}
+	if (!node.select_statement || !node.select_statement->node) {
+		return Veto("an INSERT without a SELECT");
+	}
+	if (node.GetValuesList()) {
+		// The rows come from DuckDB: the shipped path's business.
+		return Veto("INSERT ... VALUES");
+	}
+	const auto &select = *node.select_statement->node;
+	if (select.type != QueryNodeType::SELECT_NODE) {
+		return Veto("an INSERT from a set operation");
+	}
+
+	WriterTable table;
+	if (!resolver_(target, table) || !table.columns) {
+		return Veto("the target does not resolve in this catalog");
+	}
+	const auto &target_columns = *table.columns;
+	std::vector<idx_t> into;
+	if (node.columns.empty()) {
+		for (idx_t c = 0; c < target_columns.size(); c++) {
+			into.push_back(c);
+		}
+	} else {
+		for (auto &name : node.columns) {
+			idx_t index = DConstants::INVALID_INDEX;
+			for (idx_t c = 0; c < target_columns.size(); c++) {
+				if (!StringUtil::CIEquals(target_columns[c].name, name.GetIdentifierName())) {
+					continue;
+				}
+				if (index != DConstants::INVALID_INDEX) {
+					return Veto("INSERT column " + name.GetIdentifierName() + " matches more than one column");
+				}
+				index = c;
+			}
+			if (index == DConstants::INVALID_INDEX) {
+				return Veto("INSERT column " + name.GetIdentifierName() + " is not a column of the target");
+			}
+			for (auto done : into) {
+				if (done == index) {
+					return Veto("INSERT column " + name.GetIdentifierName() + " named twice");
+				}
+			}
+			into.push_back(index);
+		}
+	}
+
+	WrittenQuery inner_out;
+	NodeWriter inner(*this, inner_out);
+	inner.raw_columns_ = true;
+	if (!inner.WriteQueryNode(select)) {
+		return false;
+	}
+	const auto &outputs = inner.Outputs();
+	if (outputs.size() != into.size()) {
+		return Veto("the SELECT gives " + std::to_string(outputs.size()) + " columns for " +
+					std::to_string(into.size()));
+	}
+	for (idx_t i = 0; i < into.size(); i++) {
+		const auto &column = target_columns[into[i]];
+		const auto &output = outputs[i];
+		const auto kind = KindOf(column);
+		const bool typed_by_duckdb = kind == ComparableKind::ExactNumeric || kind == ComparableKind::Float ||
+									 kind == ComparableKind::Boolean || kind == ComparableKind::Date;
+		if (i < inner_out.cast_types.size() && inner_out.cast_types[i].id() != LogicalTypeId::INVALID) {
+			return Veto("INSERT column " + column.name + ": a value DuckDB casts after the read");
+		}
+		if (output.column_index != DConstants::INVALID_INDEX) {
+			const auto &source = inner.FlatColumn(output.column_index);
+			if (typed_by_duckdb ? !WritesAsIs(source.duckdb_type, column.duckdb_type)
+								: (inner.already_read_[output.column_index] || !SameDeclaration(source, column))) {
+				// Beyond numerics, bit and date, only a column declared alike
+				// is written as DuckDB writes it (see WriteSetValue).
+				return Veto("INSERT column " + column.name + " from " + source.sql_type_name + " column " +
+							source.name);
+			}
+			continue;
+		}
+		const auto &value = output.value;
+		const auto type = value.result_type.id() != LogicalTypeId::INVALID ? value.result_type : value.type;
+		if (!typed_by_duckdb || value.division || value.approximate || value.type_uncertain || value.cast_result ||
+			!WritesAsIs(type, column.duckdb_type)) {
+			return Veto("INSERT column " + column.name + " from a computed value");
+		}
+	}
+
+	std::string column_list;
+	for (auto index : into) {
+		column_list += (column_list.empty() ? "" : ", ") + QuoteIdentifier(target_columns[index].name);
+		out_.identity_insert = out_.identity_insert || (target_columns[index].is_identity && !table.is_view);
+	}
+	out_.statement = "INSERT INTO " + QuoteIdentifier(table.schema) + "." + QuoteIdentifier(table.name) + " (" +
+					 column_list + ") " + inner_out.statement;
+	out_.dml_kind = "insert";
+	out_.target_schema = table.schema;
+	out_.target_table = table.name;
 	return true;
 }
 

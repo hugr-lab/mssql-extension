@@ -431,6 +431,9 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			// A derived table's column: its node read it already.
 			list += ColumnSql(index) + " AS " + QuoteIdentifier(output);
 			entry.plain_read = true;
+		} else if (raw_columns_) {
+			list += ColumnSql(index) + (alias.empty() ? "" : " AS " + QuoteIdentifier(alias));
+			entry.plain_read = true;
 		} else {
 			const auto read =
 				MSSQLColumnInfo::BuildReadExpression(column.name, column.sql_type_name, column.max_length,

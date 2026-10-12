@@ -21,6 +21,12 @@ require mssql
 
 require-env MSSQL_TESTDB_DSN
 
+# The sinks here are the shipped ones: an INSERT ... SELECT within one catalog
+# goes to the server whole since spec 080 PR 3d (no sink, no scan), which
+# test/sql/pushdown/remote_pushdown_dml*.test cover.
+statement ok
+SET mssql_dml_pushdown = false;
+
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS sk75 (TYPE mssql);
 

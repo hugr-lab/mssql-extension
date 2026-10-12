@@ -6,7 +6,8 @@
 // Spec 080 D1 / PR 3b: the count vehicle of a pushed DML.
 //
 //   SELECT * FROM mssql_dml(context, statement [, params [, declarations]],
-//                           kind := 'update' | 'delete',
+//                           kind := 'update' | 'delete' | 'insert',
+//                           [identity_insert := true,]
 //                           target_schema := ..., target_table := ...)
 //
 // What it owes the statement it replaces:
@@ -89,7 +90,7 @@ void CountDml(DmlPath path) {
 
 namespace {
 
-enum class DmlKind : uint8_t { UPDATE, DELETE };
+enum class DmlKind : uint8_t { UPDATE, DELETE, INSERT };
 
 struct MSSQLDmlBindData : public TableFunctionData {
 	string context_name;
@@ -98,6 +99,9 @@ struct MSSQLDmlBindData : public TableFunctionData {
 	DmlKind kind = DmlKind::UPDATE;
 	string schema_name;
 	string table_name;
+	//! PR 3d: an INSERT ... SELECT naming the identity column runs between SET
+	//! IDENTITY_INSERT ON and OFF (spec 077 W2's bracket).
+	bool identity_insert = false;
 	//! Shared by the copies of this bind data (FunctionData::Copy), so a copy
 	//! cannot reset it.
 	shared_ptr<std::atomic<bool>> executed = make_shared_ptr<std::atomic<bool>>(false);
@@ -110,6 +114,7 @@ struct MSSQLDmlBindData : public TableFunctionData {
 		copy->kind = kind;
 		copy->schema_name = schema_name;
 		copy->table_name = table_name;
+		copy->identity_insert = identity_insert;
 		copy->executed = executed;
 		return std::move(copy);
 	}
@@ -130,6 +135,17 @@ struct MSSQLDmlGlobalState : public GlobalTableFunctionState {
 		return 1;
 	}
 };
+
+const char *VerbOf(DmlKind kind) {
+	switch (kind) {
+	case DmlKind::UPDATE:
+		return "UPDATE";
+	case DmlKind::DELETE:
+		return "DELETE";
+	default:
+		return "INSERT";
+	}
+}
 
 MSSQLCatalog &DmlCatalog(ClientContext &context, const string &context_name) {
 	optional_ptr<Catalog> catalog;
@@ -169,9 +185,14 @@ unique_ptr<FunctionData> MSSQLDmlBind(ClientContext &context, TableFunctionBindI
 		bind_data->kind = DmlKind::UPDATE;
 	} else if (kind == "delete") {
 		bind_data->kind = DmlKind::DELETE;
+	} else if (kind == "insert") {
+		bind_data->kind = DmlKind::INSERT;
 	} else {
-		throw InvalidInputException("mssql_dml: kind := must be 'update' or 'delete', got '%s'", kind);
+		throw InvalidInputException("mssql_dml: kind := must be 'update', 'delete' or 'insert', got '%s'", kind);
 	}
+	auto identity = input.named_parameters.find("identity_insert");
+	bind_data->identity_insert =
+		identity != input.named_parameters.end() && !identity->second.IsNull() && identity->second.GetValue<bool>();
 	bind_data->schema_name = NamedString(input, "target_schema");
 	bind_data->table_name = NamedString(input, "target_table");
 	if (bind_data->schema_name.empty() || bind_data->table_name.empty()) {
@@ -180,12 +201,12 @@ unique_ptr<FunctionData> MSSQLDmlBind(ClientContext &context, TableFunctionBindI
 
 	if (mssql::SqlMayChangeSchema(bind_data->statement)) {
 		throw InvalidInputException(
-			"mssql_dml runs an UPDATE or DELETE; use mssql_exec() for a statement that may "
+			"mssql_dml runs an UPDATE, DELETE or INSERT; use mssql_exec() for a statement that may "
 			"change the schema");
 	}
 
 	auto &catalog = DmlCatalog(context, bind_data->context_name);
-	catalog.CheckWriteAccess(kind == "update" ? "UPDATE" : "DELETE");
+	catalog.CheckWriteAccess(VerbOf(bind_data->kind));
 	// Without the binder there is no way to make the statement run whole or to
 	// register the write with DuckDB: refused rather than run streamable and
 	// past the read-only and one-writable-database rules. A plan copy rebinds
@@ -198,8 +219,9 @@ unique_ptr<FunctionData> MSSQLDmlBind(ClientContext &context, TableFunctionBindI
 	auto &properties = input.binder->GetStatementProperties();
 	properties.result_eagerness = ResultEagerness::FORCED;
 	properties.RegisterDBModify(catalog, context,
-								bind_data->kind == DmlKind::UPDATE ? DatabaseModificationType::UPDATE_DATA
-																   : DatabaseModificationType::DELETE_DATA);
+								bind_data->kind == DmlKind::UPDATE	 ? DatabaseModificationType::UPDATE_DATA
+								: bind_data->kind == DmlKind::DELETE ? DatabaseModificationType::DELETE_DATA
+																	 : DatabaseModificationType::INSERT_DATA);
 
 	if (input.inputs.size() >= 3) {
 		string declarations_override;
@@ -217,15 +239,6 @@ unique_ptr<FunctionData> MSSQLDmlBind(ClientContext &context, TableFunctionBindI
 	return std::move(bind_data);
 }
 
-int QueryTimeoutMs(ClientContext &context) {
-	const int64_t seconds = LoadQueryTimeout(context);
-	if (seconds <= 0) {
-		return 0;
-	}
-	const int64_t ms = seconds * 1000;
-	return ms > NumericLimits<int32_t>::Maximum() ? NumericLimits<int32_t>::Maximum() : static_cast<int>(ms);
-}
-
 unique_ptr<GlobalTableFunctionState> MSSQLDmlInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<MSSQLDmlBindData>();
 	// Not an InternalException, which would invalidate the database: user SQL
@@ -237,7 +250,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLDmlInitGlobal(ClientContext &context, 
 			bind_data.statement);
 	}
 	auto &catalog = DmlCatalog(context, bind_data.context_name);
-	const char *verb = bind_data.kind == DmlKind::UPDATE ? "UPDATE" : "DELETE";
+	const char *verb = VerbOf(bind_data.kind);
 	auto state = make_uniq<MSSQLDmlGlobalState>();
 
 	// As the shipped DELETE does, the planner's estimate follows an autocommit
@@ -260,12 +273,34 @@ unique_ptr<GlobalTableFunctionState> MSSQLDmlInitGlobal(ClientContext &context, 
 
 	MSSQLStatementConnection statement;
 	auto connection = statement.Acquire(context, catalog);
+	if (bind_data.identity_insert) {
+		auto pinned_lock = statement.LockPinned(context, catalog);
+		MSSQLStatementConnection::RequireIdle(*connection, verb);
+		try {
+			statement.EnableIdentityInsert(bind_data.schema_name, bind_data.table_name);
+		} catch (...) {
+			connection.reset();
+			statement.Fail(context, catalog);
+			throw;
+		}
+	}
 	{
 		auto pinned_lock = statement.LockPinned(context, catalog);
 		MSSQLStatementConnection::RequireIdle(*connection, verb);
-		auto result = MSSQLSimpleQuery::Execute(*connection, bind_data.request, QueryTimeoutMs(context));
+		// No deadline: the statement answers nothing until its DONE, and a
+		// pushed INSERT ... SELECT copying millions of rows takes as long as it
+		// takes -- the shipped path streams and never hit mssql_query_timeout
+		// for it. Ctrl-C cancels it (ATTENTION; the server rolls the statement
+		// back); a dead connection ends the wait through TCP keepalive.
+		const MSSQLSimpleQuery::InterruptProbe interrupted = [&context]() { return context.IsInterrupted(); };
+		auto result = MSSQLSimpleQuery::ExecuteInterruptible(*connection, bind_data.request, interrupted);
 		for (const auto &info : result.info_messages) {
 			LogTdsInfo(context, info);
+		}
+		if (result.interrupted) {
+			connection.reset();
+			statement.Fail(context, catalog);
+			throw InterruptException();
 		}
 		if (!result.success) {
 			const bool pinned = statement.IsPinned();
@@ -304,6 +339,9 @@ InsertionOrderPreservingMap<string> MSSQLDmlToString(TableFunctionToStringInput 
 		auto &bind_data = input.bind_data->Cast<MSSQLDmlBindData>();
 		result["Database"] = bind_data.context_name;
 		result["Statement"] = bind_data.statement;
+		if (bind_data.identity_insert) {
+			result["Identity insert"] = "on";
+		}
 	}
 	return result;
 }
@@ -328,6 +366,7 @@ void RegisterMSSQLDmlFunction(ExtensionLoader &loader) {
 		f.GetSignature().AddKeywordOnly("kind", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 		f.GetSignature().AddKeywordOnly("target_schema", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 		f.GetSignature().AddKeywordOnly("target_table", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
+		f.GetSignature().AddKeywordOnly("identity_insert", LogicalType::BOOLEAN, Value::BOOLEAN(false));
 		f.cardinality = MSSQLDmlCardinality;
 		f.to_string = MSSQLDmlToString;
 		// `SELECT * FROM mssql_dml(...)` reports a changed-row count, as the
@@ -341,7 +380,8 @@ void RegisterMSSQLDmlFunction(ExtensionLoader &loader) {
 	mssql::RegisterDocumentedFunction(
 		loader, std::move(set),
 		{{},
-		 "Internal: the vehicle a pushed UPDATE / DELETE runs through (spec 080). Runs the T-SQL statement once on "
+		 "Internal: the vehicle a pushed UPDATE / DELETE / INSERT ... SELECT runs through (spec 080). Runs the T-SQL "
+		 "statement once on "
 		 "the attached database -- atomically in autocommit, on the transaction's connection inside one -- and "
 		 "returns its row count as Count. The remote-pushdown rewriter's target, not an API: its arguments carry no "
 		 "compatibility promise.",

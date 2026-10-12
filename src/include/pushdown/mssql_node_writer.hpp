@@ -30,6 +30,7 @@
 #include "duckdb/parser/expression/type_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/query_node/delete_query_node.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
@@ -228,6 +229,7 @@ public:
 	//! Spec 080 D1: a pushed UPDATE / DELETE (mssql_node_writer_dml.cpp).
 	bool WriteUpdate(const UpdateQueryNode &node);
 	bool WriteDelete(const DeleteQueryNode &node);
+	bool WriteInsert(const InsertQueryNode &node, const BaseTableRef &target);
 
 private:
 	bool WriteSetOperation(const SetOperationNode &node);
@@ -482,6 +484,11 @@ private:
 	std::vector<OutputColumn> outputs_;
 	//! Inside WHERE / a WHEN: a division there is vetoed (see WriteDivide).
 	int predicate_depth_ = 0;
+	//! Spec 080 PR 3d: the SELECT of an INSERT ... SELECT, whose values never
+	//! leave the server -- a column is written as itself, not through the read
+	//! expression a client needs (a code-page varchar's NVARCHAR cast,
+	//! geometry's STAsBinary).
+	bool raw_columns_ = false;
 	//! GROUP BY, HAVING or an aggregate: the node is an aggregate query.
 	bool aggregated_ = false;
 	//! The columns GROUP BY names.

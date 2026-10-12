@@ -9,6 +9,7 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
@@ -193,8 +194,9 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 // DML node back.
 bool MSSQLCatalog::WriteDmlPushdown(const QueryNode &node, mssql::WrittenQuery &out, string &why,
 									optional_ptr<ClientContext> context) {
-	if (node.type != QueryNodeType::UPDATE_QUERY_NODE && node.type != QueryNodeType::DELETE_QUERY_NODE) {
-		why = "not an UPDATE / DELETE";
+	if (node.type != QueryNodeType::UPDATE_QUERY_NODE && node.type != QueryNodeType::DELETE_QUERY_NODE &&
+		node.type != QueryNodeType::INSERT_QUERY_NODE) {
+		why = "not an UPDATE / DELETE / INSERT";
 		return false;
 	}
 	if (IsReadOnly()) {
@@ -204,7 +206,7 @@ bool MSSQLCatalog::WriteDmlPushdown(const QueryNode &node, mssql::WrittenQuery &
 		return false;
 	}
 	if (GetDmlCapabilities().IsSynapse()) {
-		why = "Synapse: UPDATE / DELETE are refused there";
+		why = "Synapse: its DML keeps the shipped path (UPDATE / DELETE refused, NOT ENFORCED keys)";
 		return false;
 	}
 	return WriteResolved(node, out, why, context, true);
@@ -216,6 +218,12 @@ bool MSSQLCatalog::WriteResolved(const QueryNode &node, mssql::WrittenQuery &out
 	// subquery expression's (PR E1) -- resolved before the writer runs and
 	// held until it is done. What the writer has no form for it refuses.
 	vector<const BaseTableRef *> refs;
+	// An INSERT's target is a name, not a reference in the tree (PR 3d).
+	BaseTableRef insert_target;
+	if (node.type == QueryNodeType::INSERT_QUERY_NODE) {
+		insert_target.SetQualifiedName(node.Cast<InsertQueryNode>().qualified_name);
+		refs.push_back(&insert_target);
+	}
 	CollectPushdownTables(node, refs);
 	if (refs.empty()) {
 		why = "no FROM";
@@ -284,6 +292,9 @@ bool MSSQLCatalog::WriteResolved(const QueryNode &node, mssql::WrittenQuery &out
 		return false;
 	});
 	writer.SetWrittenUnqualified(WrittenUnqualified);
+	if (node.type == QueryNodeType::INSERT_QUERY_NODE) {
+		return writer.WriteInsert(node, insert_target, out, why);
+	}
 	return dml ? writer.WriteDml(node, out, why) : writer.Write(node, out, why);
 }
 
@@ -295,8 +306,13 @@ bool MSSQLCatalog::WriteResolved(const QueryNode &node, mssql::WrittenQuery &out
 bool MSSQLCatalog::SupportsPushdown(const QueryNode &node) {
 	mssql::WrittenQuery written;
 	string why;
-	if (node.type == QueryNodeType::UPDATE_QUERY_NODE || node.type == QueryNodeType::DELETE_QUERY_NODE) {
-		// Spec 080 D1: whole, or the shipped path -- never in parts.
+	if (node.type == QueryNodeType::UPDATE_QUERY_NODE || node.type == QueryNodeType::DELETE_QUERY_NODE ||
+		node.type == QueryNodeType::INSERT_QUERY_NODE) {
+		// Spec 080 D1: whole, or the shipped path -- never in parts (a refused
+		// INSERT keeps the rewriter's own fallback: its SELECT pushed alone).
+		if (node.type == QueryNodeType::INSERT_QUERY_NODE && HoldsDmlCte(node)) {
+			return false;
+		}
 		const bool pushed = WriteDmlPushdown(node, written, why);
 		MSSQL_CATALOG_DEBUG_LOG(1, "SupportsPushdown(DML node %s): %s", node.ToString().c_str(),
 								pushed ? written.statement.c_str() : ("no: " + why).c_str());
@@ -422,7 +438,8 @@ void MSSQLCatalog::PushNestedParts(ClientContext &context, QueryNode &node, cons
 
 unique_ptr<TableRef> MSSQLCatalog::RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) {
 	mssql::WrittenQuery written;
-	if (node->type == QueryNodeType::UPDATE_QUERY_NODE || node->type == QueryNodeType::DELETE_QUERY_NODE) {
+	if (node->type == QueryNodeType::UPDATE_QUERY_NODE || node->type == QueryNodeType::DELETE_QUERY_NODE ||
+		node->type == QueryNodeType::INSERT_QUERY_NODE) {
 		string why;
 		if (!WriteDmlPushdown(*node, written, why, context)) {
 			// The dry run said yes and a DML node cannot be handed back.
@@ -430,7 +447,10 @@ unique_ptr<TableRef> MSSQLCatalog::RemoteExecute(ClientContext &context, unique_
 				"mssql: the remote-pushdown rewriter took this %s for the server, and it cannot be "
 				"written now (%s); SET mssql_dml_pushdown = false to run it on the shipped path, and "
 				"please report it",
-				node->type == QueryNodeType::UPDATE_QUERY_NODE ? "UPDATE" : "DELETE", why);
+				node->type == QueryNodeType::UPDATE_QUERY_NODE	 ? "UPDATE"
+				: node->type == QueryNodeType::DELETE_QUERY_NODE ? "DELETE"
+																 : "INSERT",
+				why);
 		}
 		return DmlVehicleFor(written);
 	}
@@ -550,6 +570,11 @@ unique_ptr<TableRef> MSSQLCatalog::DmlVehicleFor(mssql::WrittenQuery &written) {
 		  std::make_pair("target_table", written.target_table)}) {
 		auto argument = ConstantExpression::String(named.second);
 		argument->SetAlias(Identifier(named.first));
+		arguments.push_back(std::move(argument));
+	}
+	if (written.identity_insert) {
+		auto argument = ConstantExpression::FromValue(Value::BOOLEAN(true));
+		argument->SetAlias(Identifier("identity_insert"));
 		arguments.push_back(std::move(argument));
 	}
 	auto ref = make_uniq<TableFunctionRef>();

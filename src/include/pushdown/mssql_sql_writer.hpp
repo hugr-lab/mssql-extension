@@ -115,6 +115,9 @@ struct WrittenQuery {
 	std::string dml_kind;
 	std::string target_schema;
 	std::string target_table;
+	//! A pushed INSERT ... SELECT names the target's identity column: the
+	//! vehicle brackets the statement with SET IDENTITY_INSERT (spec 077 W2).
+	bool identity_insert = false;
 
 	//! "@p1 int, @p2 varchar(50)" -- empty without parameters.
 	std::string Declarations() const;
@@ -173,6 +176,9 @@ public:
 	//! its SET values and WHERE exactly as DuckDB would compute and select
 	//! them; false, with the reason in `why`, when any part has no exact form.
 	bool WriteDml(const QueryNode &node, WrittenQuery &out, std::string &why);
+	//! Spec 080 PR 3d: an INSERT ... SELECT, whose target is `target` (the
+	//! rewriter carries it as a name, not as a reference in the tree).
+	bool WriteInsert(const QueryNode &node, const BaseTableRef &target, WrittenQuery &out, std::string &why);
 
 	//! Whether pushing `node` sends the server more than the catalog scan
 	//! would. The scan already pushes projections and filters, and unlike a

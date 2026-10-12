@@ -37,7 +37,7 @@ statement ok
 RESET mssql_test_dml_platform;
 
 statement ok
-SELECT mssql_exec('ag', 'DROP TABLE IF EXISTS dbo.ag_t; DROP TABLE IF EXISTS dbo.ag_src; DROP TABLE IF EXISTS dbo.ag_dup; CREATE TABLE dbo.ag_t (id int PRIMARY KEY, a int NOT NULL, b nvarchar(10) NULL, c decimal(10,2) NULL, e nvarchar(10) NULL); CREATE TABLE dbo.ag_src (id int PRIMARY KEY, w int NOT NULL); INSERT INTO dbo.ag_src VALUES (2, 200), (4, 400), (11, 1100); CREATE TABLE dbo.ag_dup (id int NOT NULL); INSERT INTO dbo.ag_dup VALUES (3), (3), (5)');
+SELECT mssql_exec('ag', 'DROP TABLE IF EXISTS dbo.ag_t; DROP TABLE IF EXISTS dbo.ag_src; DROP TABLE IF EXISTS dbo.ag_dup; CREATE TABLE dbo.ag_t (id int PRIMARY KEY, a int NOT NULL, b nvarchar(10) NULL, c decimal(10,2) NULL, e nvarchar(10) NULL); CREATE TABLE dbo.ag_src (id int PRIMARY KEY, w int NOT NULL); INSERT INTO dbo.ag_src VALUES (2, 200), (4, 400), (11, 1100); CREATE TABLE dbo.ag_dup (id int NOT NULL); INSERT INTO dbo.ag_dup VALUES (3), (3), (5); DROP TABLE IF EXISTS dbo.ag_dst; DROP TABLE IF EXISTS dbo.ag_idt; CREATE TABLE dbo.ag_dst (id int IDENTITY PRIMARY KEY, v int NOT NULL, s nvarchar(10) NULL, d int NOT NULL DEFAULT 7, n bigint NULL); CREATE TABLE dbo.ag_idt (id int IDENTITY PRIMARY KEY, v int NOT NULL)');
 
 statement ok
 SELECT mssql_invalidate_cache('ag');
@@ -54,7 +54,7 @@ SELECT mssql_invalidate_cache('agf_sh');
 # --- 1: two SET columns, a range
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag.dbo.ag_t SET a = a + 1, b = 'k' WHERE id BETWEEN 3 AND 7;
@@ -70,7 +70,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag_sh.dbo.ag_t SET a = a + 1, b = 'k' WHERE id BETWEEN 3 AND 7;
@@ -93,7 +93,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 2: a decimal times a constant: not pushed (a decimal beside a constant has a type DuckDB and the server may not agree on)
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag.dbo.ag_t SET c = c * 2 WHERE c IS NOT NULL;
@@ -109,7 +109,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag_sh.dbo.ag_t SET c = c * 2 WHERE c IS NOT NULL;
@@ -132,7 +132,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 3: SET NULL, a string equality
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag.dbo.ag_t SET b = NULL WHERE b = 'x';
@@ -148,7 +148,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag_sh.dbo.ag_t SET b = NULL WHERE b = 'x';
@@ -171,7 +171,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 4: CASE in SET, no WHERE
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag.dbo.ag_t SET a = CASE WHEN a > 5 THEN 0 ELSE a END;
@@ -187,7 +187,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag_sh.dbo.ag_t SET a = CASE WHEN a > 5 THEN 0 ELSE a END;
@@ -210,7 +210,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 5: UPDATE ... FROM by the source's key
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag.dbo.ag_t SET a = ag_src.w FROM ag.dbo.ag_src WHERE ag_t.id = ag_src.id;
@@ -226,7 +226,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag_sh.dbo.ag_t SET a = ag_src.w FROM ag_sh.dbo.ag_src WHERE ag_t.id = ag_src.id;
@@ -249,7 +249,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 6: UPDATE ... FROM the table itself
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag.dbo.ag_t SET a = t2.a + 100 FROM ag.dbo.ag_t AS t2 WHERE ag_t.id = t2.id AND t2.b = 'y';
@@ -265,7 +265,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag_sh.dbo.ag_t SET a = t2.a + 100 FROM ag_sh.dbo.ag_t AS t2 WHERE ag_t.id = t2.id AND t2.b = 'y';
@@ -288,7 +288,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 7: a scalar subquery in SET, one row by the source's key
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag.dbo.ag_t SET a = (SELECT w FROM ag.dbo.ag_src WHERE ag_src.id = ag_t.id) WHERE id IN (2, 4);
@@ -304,7 +304,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag_sh.dbo.ag_t SET a = (SELECT w FROM ag_sh.dbo.ag_src WHERE ag_src.id = ag_t.id) WHERE id IN (2, 4);
@@ -327,7 +327,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 8: a string column copied into one declared alike
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag.dbo.ag_t SET e = b WHERE id <= 6;
@@ -343,7 +343,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag_sh.dbo.ag_t SET e = b WHERE id <= 6;
@@ -366,7 +366,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 9: IN (subquery)
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag.dbo.ag_t SET a = 1 WHERE id IN (SELECT id FROM ag.dbo.ag_src);
@@ -382,7 +382,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag_sh.dbo.ag_t SET a = 1 WHERE id IN (SELECT id FROM ag_sh.dbo.ag_src);
@@ -405,7 +405,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 10: every row
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag.dbo.ag_t SET a = 7;
@@ -421,7 +421,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag_sh.dbo.ag_t SET a = 7;
@@ -444,7 +444,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 11: no row
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag.dbo.ag_t SET a = 3 WHERE id > 100;
@@ -460,7 +460,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag_sh.dbo.ag_t SET a = 3 WHERE id > 100;
@@ -483,7 +483,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 12: a string equality under the column's collation (D4: the server's set on both paths)
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag.dbo.ag_t SET b = 'Ab' WHERE b = 'ab';
@@ -499,7 +499,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag_sh.dbo.ag_t SET b = 'Ab' WHERE b = 'ab';
@@ -522,7 +522,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 13: integer arithmetic
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag.dbo.ag_t SET a = a * 2 WHERE id > 5;
@@ -538,7 +538,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE ag_sh.dbo.ag_t SET a = a * 2 WHERE id > 5;
@@ -561,7 +561,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 14: DELETE, IS NULL
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN DELETE FROM ag.dbo.ag_t WHERE b IS NULL;
@@ -577,7 +577,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN DELETE FROM ag_sh.dbo.ag_t WHERE b IS NULL;
@@ -600,7 +600,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 15: DELETE ... USING
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN DELETE FROM ag.dbo.ag_t USING ag.dbo.ag_src WHERE ag_t.id = ag_src.id;
@@ -616,7 +616,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN DELETE FROM ag_sh.dbo.ag_t USING ag_sh.dbo.ag_src WHERE ag_t.id = ag_src.id;
@@ -639,7 +639,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 16: DELETE ... USING a source matching one row twice: deleted once
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN DELETE FROM ag.dbo.ag_t USING ag.dbo.ag_dup WHERE ag_t.id = ag_dup.id;
@@ -655,7 +655,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN DELETE FROM ag_sh.dbo.ag_t USING ag_sh.dbo.ag_dup WHERE ag_t.id = ag_dup.id;
@@ -678,7 +678,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 17: DELETE, OR / BETWEEN / LIKE (the column's collation: 'Yz' matches 'y%')
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN DELETE FROM ag.dbo.ag_t WHERE a BETWEEN 2 AND 4 OR b LIKE 'y%';
@@ -694,7 +694,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN DELETE FROM ag_sh.dbo.ag_t WHERE a BETWEEN 2 AND 4 OR b LIKE 'y%';
@@ -717,7 +717,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # --- 18: DELETE every row
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN DELETE FROM ag.dbo.ag_t;
@@ -733,7 +733,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN DELETE FROM ag_sh.dbo.ag_t;
@@ -753,10 +753,244 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 ----
 0
 
-# --- 19: Fabric: the single-table UPDATE
+# --- 19: INSERT ... SELECT: named columns, a filter, a string column declared alike
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+
+query II
+EXPLAIN INSERT INTO ag.dbo.ag_dst (v, s) SELECT a, b FROM ag.dbo.ag_t WHERE id > 3;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*
+
+query I
+INSERT INTO ag.dbo.ag_dst (v, s) SELECT a, b FROM ag.dbo.ag_t WHERE id > 3;
+----
+7
+
+statement ok
+CREATE OR REPLACE TEMP TABLE s_push AS SELECT * EXCLUDE (id) FROM ag_sh.dbo.ag_dst;
+
+statement ok
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+
+query II
+EXPLAIN INSERT INTO ag_sh.dbo.ag_dst (v, s) SELECT a, b FROM ag_sh.dbo.ag_t WHERE id > 3;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query I
+INSERT INTO ag_sh.dbo.ag_dst (v, s) SELECT a, b FROM ag_sh.dbo.ag_t WHERE id > 3;
+----
+7
+
+statement ok
+CREATE OR REPLACE TEMP TABLE s_ship AS SELECT * EXCLUDE (id) FROM ag_sh.dbo.ag_dst;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNION ALL (SELECT * FROM s_ship EXCEPT ALL SELECT * FROM s_push));
+----
+0
+
+# --- 20: INSERT ... SELECT: an integer expression and the source's key
+
+statement ok
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+
+query II
+EXPLAIN INSERT INTO ag.dbo.ag_dst (v, n) SELECT a * 2 + 1, id FROM ag.dbo.ag_t;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*
+
+query I
+INSERT INTO ag.dbo.ag_dst (v, n) SELECT a * 2 + 1, id FROM ag.dbo.ag_t;
+----
+10
+
+statement ok
+CREATE OR REPLACE TEMP TABLE s_push AS SELECT * EXCLUDE (id) FROM ag_sh.dbo.ag_dst;
+
+statement ok
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+
+query II
+EXPLAIN INSERT INTO ag_sh.dbo.ag_dst (v, n) SELECT a * 2 + 1, id FROM ag_sh.dbo.ag_t;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query I
+INSERT INTO ag_sh.dbo.ag_dst (v, n) SELECT a * 2 + 1, id FROM ag_sh.dbo.ag_t;
+----
+10
+
+statement ok
+CREATE OR REPLACE TEMP TABLE s_ship AS SELECT * EXCLUDE (id) FROM ag_sh.dbo.ag_dst;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNION ALL (SELECT * FROM s_ship EXCEPT ALL SELECT * FROM s_push));
+----
+0
+
+# --- 21: INSERT ... SELECT: an aggregate
+
+statement ok
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+
+query II
+EXPLAIN INSERT INTO ag.dbo.ag_dst (v, n) SELECT max(a), count(*) FROM ag.dbo.ag_t WHERE b IS NOT NULL;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*
+
+query I
+INSERT INTO ag.dbo.ag_dst (v, n) SELECT max(a), count(*) FROM ag.dbo.ag_t WHERE b IS NOT NULL;
+----
+1
+
+statement ok
+CREATE OR REPLACE TEMP TABLE s_push AS SELECT * EXCLUDE (id) FROM ag_sh.dbo.ag_dst;
+
+statement ok
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+
+query II
+EXPLAIN INSERT INTO ag_sh.dbo.ag_dst (v, n) SELECT max(a), count(*) FROM ag_sh.dbo.ag_t WHERE b IS NOT NULL;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query I
+INSERT INTO ag_sh.dbo.ag_dst (v, n) SELECT max(a), count(*) FROM ag_sh.dbo.ag_t WHERE b IS NOT NULL;
+----
+1
+
+statement ok
+CREATE OR REPLACE TEMP TABLE s_ship AS SELECT * EXCLUDE (id) FROM ag_sh.dbo.ag_dst;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNION ALL (SELECT * FROM s_ship EXCEPT ALL SELECT * FROM s_push));
+----
+0
+
+# --- 22: INSERT ... SELECT: a join
+
+statement ok
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+
+query II
+EXPLAIN INSERT INTO ag.dbo.ag_dst (v, s) SELECT ag_src.w, ag_t.b FROM ag.dbo.ag_t JOIN ag.dbo.ag_src ON ag_t.id = ag_src.id;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*
+
+query I
+INSERT INTO ag.dbo.ag_dst (v, s) SELECT ag_src.w, ag_t.b FROM ag.dbo.ag_t JOIN ag.dbo.ag_src ON ag_t.id = ag_src.id;
+----
+2
+
+statement ok
+CREATE OR REPLACE TEMP TABLE s_push AS SELECT * EXCLUDE (id) FROM ag_sh.dbo.ag_dst;
+
+statement ok
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+
+query II
+EXPLAIN INSERT INTO ag_sh.dbo.ag_dst (v, s) SELECT ag_src.w, ag_t.b FROM ag_sh.dbo.ag_t JOIN ag_sh.dbo.ag_src ON ag_t.id = ag_src.id;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query I
+INSERT INTO ag_sh.dbo.ag_dst (v, s) SELECT ag_src.w, ag_t.b FROM ag_sh.dbo.ag_t JOIN ag_sh.dbo.ag_src ON ag_t.id = ag_src.id;
+----
+2
+
+statement ok
+CREATE OR REPLACE TEMP TABLE s_ship AS SELECT * EXCLUDE (id) FROM ag_sh.dbo.ag_dst;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNION ALL (SELECT * FROM s_ship EXCEPT ALL SELECT * FROM s_push));
+----
+0
+
+# --- 23: INSERT ... SELECT: the identity column named (IDENTITY_INSERT on both paths)
+
+statement ok
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+
+query II
+EXPLAIN INSERT INTO ag.dbo.ag_idt (id, v) SELECT id + 100, a FROM ag.dbo.ag_t;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*
+
+query I
+INSERT INTO ag.dbo.ag_idt (id, v) SELECT id + 100, a FROM ag.dbo.ag_t;
+----
+10
+
+statement ok
+CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_idt;
+
+statement ok
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+
+query II
+EXPLAIN INSERT INTO ag_sh.dbo.ag_idt (id, v) SELECT id + 100, a FROM ag_sh.dbo.ag_t;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query I
+INSERT INTO ag_sh.dbo.ag_idt (id, v) SELECT id + 100, a FROM ag_sh.dbo.ag_t;
+----
+10
+
+statement ok
+CREATE OR REPLACE TEMP TABLE s_ship AS SELECT * FROM ag_sh.dbo.ag_idt;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNION ALL (SELECT * FROM s_ship EXCEPT ALL SELECT * FROM s_push));
+----
+0
+
+# --- 24: INSERT ... SELECT: a string constant is the server's to type -- not pushed
+
+statement ok
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+
+query II
+EXPLAIN INSERT INTO ag.dbo.ag_dst (v, s) SELECT a, 'k' FROM ag.dbo.ag_t;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query I
+INSERT INTO ag.dbo.ag_dst (v, s) SELECT a, 'k' FROM ag.dbo.ag_t;
+----
+10
+
+statement ok
+CREATE OR REPLACE TEMP TABLE s_push AS SELECT * EXCLUDE (id) FROM ag_sh.dbo.ag_dst;
+
+statement ok
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+
+query II
+EXPLAIN INSERT INTO ag_sh.dbo.ag_dst (v, s) SELECT a, 'k' FROM ag_sh.dbo.ag_t;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query I
+INSERT INTO ag_sh.dbo.ag_dst (v, s) SELECT a, 'k' FROM ag_sh.dbo.ag_t;
+----
+10
+
+statement ok
+CREATE OR REPLACE TEMP TABLE s_ship AS SELECT * EXCLUDE (id) FROM ag_sh.dbo.ag_dst;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNION ALL (SELECT * FROM s_ship EXCEPT ALL SELECT * FROM s_push));
+----
+0
+
+# --- 25: Fabric: the single-table UPDATE
+
+statement ok
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE agf.dbo.ag_t SET a = a + 1, e = 'f' WHERE id <= 5;
@@ -772,7 +1006,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE agf_sh.dbo.ag_t SET a = a + 1, e = 'f' WHERE id <= 5;
@@ -792,10 +1026,10 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 ----
 0
 
-# --- 20: Fabric: the single-table DELETE
+# --- 26: Fabric: the single-table DELETE
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN DELETE FROM agf.dbo.ag_t WHERE b = 'y' OR c IS NULL;
@@ -811,7 +1045,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN DELETE FROM agf_sh.dbo.ag_t WHERE b = 'y' OR c IS NULL;
@@ -831,10 +1065,10 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 ----
 0
 
-# --- 21: Fabric: a subquery stays staged on both
+# --- 27: Fabric: a subquery stays staged on both
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE agf.dbo.ag_t SET a = 0 WHERE id IN (SELECT id FROM agf.dbo.ag_src);
@@ -850,7 +1084,7 @@ statement ok
 CREATE OR REPLACE TEMP TABLE s_push AS SELECT * FROM ag_sh.dbo.ag_t;
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query II
 EXPLAIN UPDATE agf_sh.dbo.ag_t SET a = 0 WHERE id IN (SELECT id FROM agf_sh.dbo.ag_src);
@@ -874,7 +1108,7 @@ SELECT count(*) FROM ((SELECT * FROM s_push EXCEPT ALL SELECT * FROM s_ship) UNI
 # shipped path refuses it on rungs 1-2 (D3: the key identifies the row)
 
 statement ok
-SELECT mssql_exec('ag', 'DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
+SELECT mssql_exec('ag', 'TRUNCATE TABLE dbo.ag_dst; TRUNCATE TABLE dbo.ag_idt; DELETE FROM dbo.ag_t; INSERT INTO dbo.ag_t VALUES (1, 1, N''x'', 1.25, N''e1''), (2, 2, N''x'', NULL, NULL), (3, 3, N''y'', 3.75, N''e3''), (4, 4, N''ab'', NULL, N''e4''), (5, 5, N''AB'', 6.25, NULL), (6, 6, N''Ab'', NULL, N''e6''), (7, 7, NULL, 8.75, N''e7''), (8, 8, NULL, NULL, NULL), (9, 9, N''y'', 11.25, N''e9''), (10, 10, N''Yz'', NULL, N''e10'')');
 
 query I
 UPDATE ag.dbo.ag_t SET id = id + 100 WHERE id = 1;
@@ -889,7 +1123,7 @@ Updating rowid key columns is not supported
 # --- cleanup
 
 statement ok
-SELECT mssql_exec('ag', 'DROP TABLE dbo.ag_t; DROP TABLE dbo.ag_src; DROP TABLE dbo.ag_dup');
+SELECT mssql_exec('ag', 'DROP TABLE dbo.ag_t; DROP TABLE dbo.ag_src; DROP TABLE dbo.ag_dup; DROP TABLE dbo.ag_dst; DROP TABLE dbo.ag_idt');
 
 statement ok
 DETACH agf_sh;

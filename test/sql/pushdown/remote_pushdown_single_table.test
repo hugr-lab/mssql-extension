@@ -998,6 +998,11 @@ SELECT count(*) FROM rp_on.dbo.rp_t WHERE id = 6;
 # connection. A CTAS keeps the catalog's column types (D3's CTAS window).
 #
 
+# (the shipped sink: an INSERT ... SELECT within one catalog goes to the server
+# whole since spec 080 PR 3d, which test/sql/pushdown/remote_pushdown_dml*.test cover)
+statement ok
+SET mssql_dml_pushdown = false;
+
 statement ok
 SELECT mssql_exec('rp_off', 'DROP TABLE IF EXISTS dbo.rp_ctas; DROP TABLE IF EXISTS dbo.rp_ins; CREATE TABLE dbo.rp_ins (id int, ts datetime2(7))');
 
@@ -1027,6 +1032,9 @@ SELECT id, epoch_ns(ts) % 1000000000 FROM rp_off.dbo.rp_ins ORDER BY id;
 1	123456700
 2	100
 5	999999900
+
+statement ok
+RESET mssql_dml_pushdown;
 
 statement ok
 CREATE TABLE rp_on.dbo.rp_ctas AS SELECT id, name, legacy, ts FROM rp_on.dbo.rp_t ORDER BY id LIMIT 2;

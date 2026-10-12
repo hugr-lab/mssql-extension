@@ -99,6 +99,32 @@ SELECT id, v FROM pd.dbo.pd_t WHERE id <= 2 ORDER BY id;
 1	100
 2	200
 
+# an integer widened into a wider column goes (exact on both sides); the other
+# way DuckDB casts down, and stays on the shipped path
+statement ok
+SELECT mssql_exec('pd', 'DROP TABLE IF EXISTS dbo.pd_w; CREATE TABLE dbo.pd_w (id int PRIMARY KEY, small smallint NOT NULL, big bigint NULL); INSERT INTO dbo.pd_w VALUES (1, 300, NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('pd');
+
+query II
+EXPLAIN UPDATE pd.dbo.pd_w SET big = small;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*
+
+query I
+UPDATE pd.dbo.pd_w SET big = small;
+----
+1
+
+query II
+EXPLAIN UPDATE pd.dbo.pd_w SET small = big;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+statement ok
+SELECT mssql_exec('pd', 'DROP TABLE dbo.pd_w');
+
 # a SET of a key column goes too (T-SQL updates keys; only the fallback needs them fixed)
 query II
 EXPLAIN UPDATE pd.dbo.pd_t SET id = id + 100 WHERE id = 10;
@@ -464,6 +490,134 @@ RESET mssql_connection_limit;
 
 statement ok
 RESET mssql_acquire_timeout;
+
+# =============================================================================
+# INSERT ... SELECT (PR 3d): both sides on the server, no row crosses the wire
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('pd', 'DROP TABLE IF EXISTS dbo.pdi_src; DROP TABLE IF EXISTS dbo.pdi_dst; CREATE TABLE dbo.pdi_src (id int PRIMARY KEY, v int NOT NULL, s varchar(10) COLLATE SQL_Latin1_General_CP1_CI_AS NULL, g geometry NULL); INSERT INTO dbo.pdi_src VALUES (1, 10, ''caf'' + CHAR(233), geometry::Point(1, 2, 4326)), (2, 20, ''b'', NULL), (3, 30, NULL, NULL); CREATE TABLE dbo.pdi_dst (id int IDENTITY PRIMARY KEY, v int NOT NULL, s varchar(10) COLLATE SQL_Latin1_General_CP1_CI_AS NULL, g geometry NULL, d int NOT NULL DEFAULT 7)');
+
+statement ok
+SELECT mssql_invalidate_cache('pd');
+
+# the columns are written as themselves: no NVARCHAR cast for the code-page
+# varchar, no STAsBinary for the geometry -- the values never leave the server
+query II
+EXPLAIN INSERT INTO pd.dbo.pdi_dst (v, s, g) SELECT v, s, g FROM pd.dbo.pdi_src WHERE v > 5;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*INSERT INTO \[dbo\]\.\[pdi_dst\] \(\[v\], \[s\], \[g\]\) SELECT \[v\], \[s\], \[g\] FROM \[dbo\]\.\[pdi_src\] WHERE.*
+
+query I
+INSERT INTO pd.dbo.pdi_dst (v, s, g) SELECT v, s, g FROM pd.dbo.pdi_src WHERE v > 5;
+----
+3
+
+# the omitted column took the server's DEFAULT, the non-ASCII byte survived, the
+# geometry is the source's
+query III
+SELECT id, s, d FROM pd.dbo.pdi_dst ORDER BY id;
+----
+1	café	7
+2	b	7
+3	NULL	7
+
+# the geometry kept its SRID 4326: copied on the server -- the row path, which
+# reads it as WKB, writes SRID 0
+query III
+SELECT * FROM mssql_scan('pd', 'SELECT id, CASE WHEN g IS NULL THEN ''-'' ELSE g.STAsText() END AS g, ISNULL(g.STSrid, -1) AS srid FROM dbo.pdi_dst ORDER BY id');
+----
+1	POINT (1 2)	4326
+2	-	-1
+3	-	-1
+
+# naming the identity column: IDENTITY_INSERT around the statement
+query II
+EXPLAIN INSERT INTO pd.dbo.pdi_dst (id, v) SELECT id + 100, v FROM pd.dbo.pdi_src;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*
+
+query I
+INSERT INTO pd.dbo.pdi_dst (id, v) SELECT id + 100, v FROM pd.dbo.pdi_src;
+----
+3
+
+query I
+SELECT count(*) FROM pd.dbo.pdi_dst WHERE id > 100;
+----
+3
+
+# an aggregate of the column's type goes; count(*) is BIGINT, which an int
+# column does not take as it is (DuckDB casts it down), and a string constant
+# is the server's to type: both stay on the shipped path
+query II
+EXPLAIN INSERT INTO pd.dbo.pdi_dst (v) SELECT max(v) FROM pd.dbo.pdi_src;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*
+
+query II
+EXPLAIN INSERT INTO pd.dbo.pdi_dst (v) SELECT count(*) FROM pd.dbo.pdi_src;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query II
+EXPLAIN INSERT INTO pd.dbo.pdi_dst (v, s) SELECT v, 'k' FROM pd.dbo.pdi_src;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+# the shipped path's shapes: VALUES, a local source, RETURNING, ON CONFLICT
+query II
+EXPLAIN INSERT INTO pd.dbo.pdi_dst (v) VALUES (1);
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query II
+EXPLAIN INSERT INTO pd.dbo.pdi_dst (v) SELECT i::INTEGER FROM range(3) r(i);
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query II
+EXPLAIN INSERT INTO pd.dbo.pdi_dst (v) SELECT v FROM pd.dbo.pdi_src RETURNING id;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+# in a transaction: undone by ROLLBACK
+statement ok
+BEGIN;
+
+query I
+INSERT INTO pd.dbo.pdi_dst (v) SELECT v FROM pd.dbo.pdi_src;
+----
+3
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM pd.dbo.pdi_dst;
+----
+6
+
+# Fabric (emulated): the same form
+statement ok
+SET mssql_test_dml_platform = 'fabric';
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pdf (TYPE mssql);
+
+statement ok
+RESET mssql_test_dml_platform;
+
+query II
+EXPLAIN INSERT INTO pdf.dbo.pdi_dst (v) SELECT v FROM pdf.dbo.pdi_src;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*INSERT INTO \[dbo\]\.\[pdi_dst\].*
+
+statement ok
+DETACH pdf;
+
+statement ok
+SELECT mssql_exec('pd', 'DROP TABLE dbo.pdi_src; DROP TABLE dbo.pdi_dst');
 
 # --- cleanup -----------------------------------------------------------------
 
