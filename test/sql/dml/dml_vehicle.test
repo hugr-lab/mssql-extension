@@ -1,0 +1,479 @@
+# name: test/sql/dml/dml_vehicle.test
+# description: mssql_dml, the vehicle a pushed UPDATE / DELETE runs through (spec 080 PR 3b): runs once, counts like a native DML, keeps the write rules, transactions, a pool of one
+# group: [dml]
+
+# Environment variables required:
+#   MSSQL_TEST_DSN, MSSQL_TESTDB_DSN, MSSQL_TEST_HOST / _PORT / _USER / _PASS
+#
+# The rewriter does not call it yet (PR 3c); here it is called directly, as the
+# rewriter will: `SELECT * FROM mssql_dml(...)`. The at-least-once gate -- a
+# submitted statement that is never read still runs -- is C++
+# (test/cpp/test_dml_vehicle.cpp): sqllogictest always reads.
+
+require mssql
+
+require-env MSSQL_TEST_DSN
+
+require-env MSSQL_TESTDB_DSN
+
+require-env MSSQL_TEST_HOST
+
+require-env MSSQL_TEST_PORT
+
+require-env MSSQL_TEST_USER
+
+require-env MSSQL_TEST_PASS
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dv (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('dv', 'DROP TABLE IF EXISTS dbo.dv_t; DROP TABLE IF EXISTS dbo.dv_log; CREATE TABLE dbo.dv_t (id int PRIMARY KEY, v int NOT NULL CHECK (v < 100)); CREATE TABLE dbo.dv_log (x int); INSERT INTO dbo.dv_t SELECT TOP (10) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), 0 FROM sys.all_objects; INSERT INTO dbo.dv_log SELECT TOP (7) 0 FROM sys.all_objects');
+
+statement ok
+SELECT mssql_invalidate_cache('dv');
+
+# --- the result: one BIGINT named Count, the server's count ------------------
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 99', kind := 'update', target_schema := 'dbo', target_table := 'dv_t'));
+----
+Count	BIGINT
+
+# DESCRIBE bound it and ran nothing
+query I
+SELECT count(*) FROM dv.dbo.dv_t WHERE v = 99;
+----
+0
+
+query I
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 1 WHERE [id] <= 3', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+3
+
+# parameters, declared from the value and by the caller's own list
+query I
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = @a WHERE [id] > @b', {'a': 5, 'b': 8}, kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+2
+
+query I
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = @a WHERE [id] = @b', {'a': 6, 'b': 4}, '@a smallint, @b int', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+1
+
+query III
+SELECT count(*) FILTER (WHERE v = 1), count(*) FILTER (WHERE v = 5), count(*) FILTER (WHERE v = 6) FROM dv.dbo.dv_t;
+----
+3	2	1
+
+# --- EXPLAIN binds without running ------------------------------------------
+
+statement ok
+EXPLAIN SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 77', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+
+query I
+SELECT count(*) FROM dv.dbo.dv_t WHERE v = 77;
+----
+0
+
+# --- exactly once: every EXECUTE of a PREPARE writes once (each binds again),
+# and with threads to spare the statement still runs once ----------------------
+
+statement ok
+PREPARE dv_p AS SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = [v] + 10 WHERE [id] = 10', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+
+query I
+EXECUTE dv_p;
+----
+1
+
+query I
+EXECUTE dv_p;
+----
+1
+
+query I
+SELECT v FROM dv.dbo.dv_t WHERE id = 10;
+----
+25
+
+statement ok
+SET threads = 4;
+
+query I
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = [v] + 1 WHERE [id] = 1', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+1
+
+query I
+SELECT v FROM dv.dbo.dv_t WHERE id = 1;
+----
+2
+
+statement ok
+RESET threads;
+
+# --- an AFTER trigger's own counts arrive before the statement's: the count is
+# the statement's (the trigger updates 7 rows) --------------------------------
+
+statement ok
+SELECT mssql_exec('dv', 'CREATE TRIGGER dbo.dv_trg ON dbo.dv_t AFTER UPDATE AS BEGIN UPDATE dbo.dv_log SET x = x + 1; END');
+
+query I
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = [v] WHERE [id] <= 3', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+3
+
+statement ok
+SELECT mssql_exec('dv', 'DROP TRIGGER dbo.dv_trg');
+
+# an INSTEAD OF trigger runs in the statement's place: the count is the
+# statement's, as on every shipped path (spec 080 D1, measured)
+statement ok
+SELECT mssql_exec('dv', 'CREATE TRIGGER dbo.dv_itrg ON dbo.dv_t INSTEAD OF UPDATE AS BEGIN UPDATE dbo.dv_log SET x = x + 1; END');
+
+query I
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 98 WHERE [id] <= 3', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+3
+
+query I
+SELECT count(*) FROM dv.dbo.dv_t WHERE v = 98;
+----
+0
+
+statement ok
+SELECT mssql_exec('dv', 'DROP TRIGGER dbo.dv_itrg');
+
+# --- a failure in autocommit writes nothing: the first statement of the batch
+# succeeds, the second breaks the CHECK on id 10 (v = 25), and the server
+# transaction around both rolls the first back -----------------------------
+
+statement error
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 60 WHERE [id] = 5; UPDATE [dbo].[dv_t] SET [v] = [v] + 90', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+nothing was written
+
+query II
+SELECT count(*) FILTER (WHERE v >= 90), count(*) FILTER (WHERE v = 60) FROM dv.dbo.dv_t;
+----
+0	0
+
+# --- a DELETE, and the planner's estimate follows it in autocommit ------------
+
+query II
+EXPLAIN SELECT id FROM dv.dbo.dv_t;
+----
+physical_plan	<REGEX>:.*~10 rows.*
+
+query I
+SELECT * FROM mssql_dml('dv', 'DELETE FROM [dbo].[dv_t] WHERE [id] = 9', kind := 'delete', target_schema := 'dbo', target_table := 'dv_t');
+----
+1
+
+query II
+EXPLAIN SELECT id FROM dv.dbo.dv_t;
+----
+physical_plan	<REGEX>:.*~9 rows.*
+
+# --- in a transaction: on the pinned connection, undone by ROLLBACK; the
+# shared estimate is not touched by a DELETE that rolled back -----------------
+
+statement ok
+BEGIN;
+
+query I
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 50 WHERE [id] = 2', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+1
+
+query I
+SELECT * FROM mssql_dml('dv', 'DELETE FROM [dbo].[dv_t] WHERE [id] = 8', kind := 'delete', target_schema := 'dbo', target_table := 'dv_t');
+----
+1
+
+query I
+SELECT v FROM dv.dbo.dv_t WHERE id = 2;
+----
+50
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE v = 50) FROM dv.dbo.dv_t;
+----
+9	0
+
+query II
+EXPLAIN SELECT id FROM dv.dbo.dv_t;
+----
+physical_plan	<REGEX>:.*~9 rows.*
+
+statement ok
+BEGIN;
+
+query I
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 50 WHERE [id] = 2', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+1
+
+statement ok
+COMMIT;
+
+query I
+SELECT v FROM dv.dbo.dv_t WHERE id = 2;
+----
+50
+
+# a server error inside a transaction: DuckDB's transaction is aborted, its
+# ROLLBACK undoes the server's, and the connection serves the next one
+statement ok
+BEGIN;
+
+query I
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 51 WHERE [id] = 2', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+1
+
+statement error
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = [v] + 90', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+the open transaction must be rolled back
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+query I
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 52 WHERE [id] = 3', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+1
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*) FILTER (WHERE v = 51), count(*) FILTER (WHERE v = 52) FROM dv.dbo.dv_t;
+----
+0	1
+
+# --- the write rules ---------------------------------------------------------
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dv_ro (TYPE mssql, READ_ONLY);
+
+statement error
+SELECT * FROM mssql_dml('dv_ro', 'UPDATE [dbo].[dv_t] SET [v] = 0', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+read-only
+
+statement ok
+DETACH dv_ro;
+
+# a read-only DuckDB transaction refuses it through RegisterDBModify, the
+# catalog being writable
+statement ok
+BEGIN TRANSACTION READ ONLY;
+
+statement error
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 0', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+transaction is launched in read-only mode
+
+statement ok
+ROLLBACK;
+
+# one writable database per transaction, DuckDB's own rule (RegisterDBModify)
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dv2 (TYPE mssql);
+
+statement ok
+BEGIN;
+
+query I
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = [v] WHERE [id] = 1', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+1
+
+statement error
+SELECT * FROM mssql_dml('dv2', 'UPDATE [dbo].[dv_t] SET [v] = [v] WHERE [id] = 1', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+can only write to a single attached database
+
+statement ok
+ROLLBACK;
+
+statement ok
+DETACH dv2;
+
+# the arguments the rewriter always passes
+statement error
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 0', kind := 'merge', target_schema := 'dbo', target_table := 'dv_t');
+----
+kind := must be 'update' or 'delete'
+
+statement error
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 0', kind := 'update');
+----
+target_schema := and target_table :=
+
+statement error
+SELECT * FROM mssql_dml('no_such_db', 'UPDATE t SET v = 0', kind := 'update', target_schema := 'dbo', target_table := 't');
+----
+Unknown context 'no_such_db'
+
+# an UPDATE / DELETE only: a statement that may change the schema would pass
+# by the cache rules mssql_exec keeps
+statement error
+SELECT * FROM mssql_dml('dv', 'DROP TABLE [dbo].[dv_t]', kind := 'delete', target_schema := 'dbo', target_table := 'dv_t');
+----
+use mssql_exec()
+
+# a source initialised again (a recursive CTE's iteration) is refused, not
+# written twice -- and not an internal error, which would end the database.
+# The first initialisation has run the statement by then, and in autocommit
+# committed it: the shape no rewrite produces fails after writing once.
+statement error
+WITH RECURSIVE r(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM r, mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = [v] + 1 WHERE [id] = 6', kind := 'update', target_schema := 'dbo', target_table := 'dv_t') WHERE n < 3) SELECT count(*) FROM r;
+----
+initialised a second time
+
+query I
+SELECT v FROM dv.dbo.dv_t WHERE id = 6;
+----
+1
+
+# --- a pool of one: the statement takes the one connection and gives it back,
+# in autocommit and in a transaction beside a read --------------------------
+
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+SET mssql_acquire_timeout = 5;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dv1 (TYPE mssql);
+
+query I
+SELECT * FROM mssql_dml('dv1', 'UPDATE [dbo].[dv_t] SET [v] = 7 WHERE [id] = 4', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+1
+
+query I
+SELECT v FROM dv1.dbo.dv_t WHERE id = 4;
+----
+7
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM dv1.dbo.dv_t;
+----
+9
+
+query I
+SELECT * FROM mssql_dml('dv1', 'UPDATE [dbo].[dv_t] SET [v] = 8 WHERE [id] = 4', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+1
+
+query I
+SELECT v FROM dv1.dbo.dv_t WHERE id = 4;
+----
+8
+
+statement ok
+COMMIT;
+
+statement ok
+DETACH dv1;
+
+statement ok
+RESET mssql_connection_limit;
+
+statement ok
+RESET mssql_acquire_timeout;
+
+# --- an update conflict (3960) under SNAPSHOT: the server aborts the
+# transaction; ROLLBACK and the next transaction still work -------------------
+
+statement ok
+ATTACH '{MSSQL_TEST_DSN}' AS dv_master (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('dv_master', 'IF DB_ID(''i080v'') IS NOT NULL BEGIN ALTER DATABASE i080v SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE i080v; END');
+
+statement ok
+SELECT mssql_exec('dv_master', 'CREATE DATABASE i080v');
+
+statement ok
+SELECT mssql_exec('dv_master', 'ALTER DATABASE i080v SET ALLOW_SNAPSHOT_ISOLATION ON');
+
+statement ok
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=i080v;User Id={MSSQL_TEST_USER};Password={MSSQL_TEST_PASS};TrustServerCertificate=yes' AS dv_setup (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('dv_setup', 'CREATE TABLE dbo.k (id INT PRIMARY KEY, v INT); INSERT INTO dbo.k VALUES (1, 10), (2, 20)');
+
+statement ok
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=i080v;User Id={MSSQL_TEST_USER};Password={MSSQL_TEST_PASS};TrustServerCertificate=yes' AS dv_snap (TYPE mssql, transaction_isolation 'snapshot');
+
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT v FROM dv_snap.dbo.k WHERE id = 2;
+----
+20
+
+statement ok con2
+SELECT mssql_exec('dv_setup', 'UPDATE dbo.k SET v = 99 WHERE id = 2');
+
+statement error con1
+SELECT * FROM mssql_dml('dv_snap', 'UPDATE [dbo].[k] SET [v] = [v] + 1 WHERE [id] = 2', kind := 'update', target_schema := 'dbo', target_table := 'k');
+----
+update conflict
+
+statement ok con1
+ROLLBACK;
+
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT * FROM mssql_dml('dv_snap', 'UPDATE [dbo].[k] SET [v] = [v] + 1 WHERE [id] = 2', kind := 'update', target_schema := 'dbo', target_table := 'k');
+----
+1
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT v FROM dv_snap.dbo.k WHERE id = 2;
+----
+100
+
+statement ok
+DETACH dv_snap;
+
+statement ok
+DETACH dv_setup;
+
+statement ok
+SELECT mssql_exec('dv_master', 'ALTER DATABASE i080v SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE i080v');
+
+statement ok
+DETACH dv_master;
+
+# --- cleanup -----------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('dv', 'DROP TABLE dbo.dv_t; DROP TABLE dbo.dv_log');
+
+statement ok
+DETACH dv;

@@ -6,6 +6,7 @@
 #include "connection/mssql_diagnostic.hpp"
 #include "connection/mssql_settings.hpp"
 #include "copy/copy_function.hpp"
+#include "dml/mssql_dml_function.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -161,6 +162,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// The catalog scan, by name (a plan copy looks it up)
 	mssql::RegisterCatalogScanFunction(loader);
+
+	// The vehicle of a pushed UPDATE / DELETE (spec 080 D1)
+	RegisterMSSQLDmlFunction(loader);
 
 	// 4. Register mssql_exec scalar function
 	RegisterMSSQLExecFunction(loader);

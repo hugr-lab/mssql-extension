@@ -29,8 +29,10 @@
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/type_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
+#include "duckdb/parser/query_node/delete_query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
@@ -223,9 +225,22 @@ public:
 	//! A SELECT, or a set operation (PR E1: nested in a subquery; the one at
 	//! a statement's top stays with DuckDB, see MSSQLCatalog::RemoteExecute).
 	bool WriteQueryNode(const QueryNode &node);
+	//! Spec 080 D1: a pushed UPDATE / DELETE (mssql_node_writer_dml.cpp).
+	bool WriteUpdate(const UpdateQueryNode &node);
+	bool WriteDelete(const DeleteQueryNode &node);
 
 private:
 	bool WriteSetOperation(const SetOperationNode &node);
+	//! The target and the FROM / USING tables of an UPDATE / DELETE: the
+	//! target is relation 0. False with a veto on anything but base tables,
+	//! a view target, or a source the platform's form cannot take.
+	bool CollectDmlRelations(const TableRef &target, const std::vector<const TableRef *> &sources);
+	//! The FROM of the SQL Server form: the target as [r1], then the sources.
+	bool WriteDmlFrom(const TableRef &target, const std::vector<const TableRef *> &sources, std::string &sql);
+	//! A SET value: computed and typed as DuckDB writes it into the column.
+	bool WriteSetValue(const ParsedExpression &expr, idx_t column, std::string &sql);
+	//! The WHERE of an UPDATE / DELETE; empty when it has none.
+	bool WriteDmlWhere(const ParsedExpression *condition, std::string &sql);
 	//! A CTE of a WITH clause, inlined where it is referenced (PR E1): T-SQL's
 	//! WITH stands only at a statement's top, and the server inlines its own
 	//! CTEs anyway. DuckDB evaluates one once, so a body that is not the same

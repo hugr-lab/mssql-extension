@@ -242,7 +242,11 @@ SELECT count(*) FROM pf76.dbo.pf76 WHERE v = 'ab' AND n LIKE 'x%' AND id > 0 AND
 statement ok
 SET mssql_scan_parameterize_filters = true;
 
-# --- DML through the rowid scan (UPDATE/DELETE find their rows through a parameterised scan)
+# --- DML through the rowid scan (UPDATE/DELETE find their rows through a parameterised scan;
+# the shipped path -- a pushed statement, spec 080 D1, scans nothing)
+statement ok
+SET mssql_dml_pushdown = false;
+
 statement ok
 UPDATE pf76.dbo.pf76 SET v = 'upd' WHERE id = 2;
 
@@ -258,6 +262,9 @@ query I
 SELECT count(*) FROM pf76.dbo.pf76;
 ----
 2
+
+statement ok
+RESET mssql_dml_pushdown;
 
 statement ok
 SELECT mssql_exec('pf76', 'DROP TABLE dbo.pf76');

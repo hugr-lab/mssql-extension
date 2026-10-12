@@ -450,6 +450,17 @@ public:
 	//! Spec 079: the writer's run over `node` -- the dry run and the kept one.
 	bool WritePushdown(const QueryNode &node, mssql::WrittenQuery &out, string &why,
 					   optional_ptr<ClientContext> context = nullptr);
+	//! The writer over `node` with every base table it names resolved: a
+	//! SELECT's (SQLWriter::Write) or, `dml`, an UPDATE / DELETE's (WriteDml).
+	bool WriteResolved(const QueryNode &node, mssql::WrittenQuery &out, string &why,
+					   optional_ptr<ClientContext> context, bool dml);
+	//! Spec 080 D1: an UPDATE / DELETE written whole for the server, or false
+	//! -- read-only, Synapse, mssql_dml_pushdown off, or no exact form. The dry
+	//! run and RemoteExecute's run; RemoteExecute cannot hand a DML back.
+	bool WriteDmlPushdown(const QueryNode &node, mssql::WrittenQuery &out, string &why,
+						  optional_ptr<ClientContext> context = nullptr);
+	//! Spec 080 D1: `mssql_dml(…)` for a written UPDATE / DELETE.
+	unique_ptr<TableRef> DmlVehicleFor(mssql::WrittenQuery &written);
 	//! D3: the node as a call of mssql_scan_params / mssql_scan; lazy.
 	unique_ptr<TableRef> RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) override;
 	//! PR E1: the vehicle (`mssql_scan_params(…)`, a cast projection over it

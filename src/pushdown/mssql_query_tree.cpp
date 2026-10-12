@@ -9,8 +9,11 @@
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/query_node/delete_query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
@@ -148,6 +151,40 @@ void VisitNode(QueryNode &node, const NestedNodeVisitor &on_node, const BaseTabl
 				VisitExpression(**clause, on_node);
 			}
 		}
+	} else if (node.type == QueryNodeType::UPDATE_QUERY_NODE) {
+		// Spec 080 D1: a pushed UPDATE's tables -- its target, its FROM's, a
+		// subquery expression's -- are resolved like a SELECT's.
+		auto &update = node.Cast<UpdateQueryNode>();
+		for (auto *ref : {&update.table, &update.from_table}) {
+			if (*ref) {
+				VisitTableRef(**ref, on_node, on_table);
+			}
+		}
+		if (update.set_info) {
+			if (update.set_info->condition) {
+				VisitExpression(*update.set_info->condition, on_node);
+			}
+			for (auto &value : update.set_info->expressions) {
+				VisitExpression(*value, on_node);
+			}
+		}
+		for (auto &item : update.returning_list) {
+			VisitExpression(*item, on_node);
+		}
+	} else if (node.type == QueryNodeType::DELETE_QUERY_NODE) {
+		auto &del = node.Cast<DeleteQueryNode>();
+		if (del.table) {
+			VisitTableRef(*del.table, on_node, on_table);
+		}
+		for (auto &ref : del.using_clauses) {
+			VisitTableRef(*ref, on_node, on_table);
+		}
+		if (del.condition) {
+			VisitExpression(*del.condition, on_node);
+		}
+		for (auto &item : del.returning_list) {
+			VisitExpression(*item, on_node);
+		}
 	}
 	for (auto &modifier : node.modifiers) {
 		switch (modifier->type) {
@@ -174,6 +211,20 @@ void VisitNode(QueryNode &node, const NestedNodeVisitor &on_node, const BaseTabl
 			break;
 		}
 	}
+}
+
+static bool IsDmlNode(const QueryNode &node) {
+	return node.type == QueryNodeType::UPDATE_QUERY_NODE || node.type == QueryNodeType::DELETE_QUERY_NODE ||
+		   node.type == QueryNodeType::INSERT_QUERY_NODE || node.type == QueryNodeType::MERGE_QUERY_NODE;
+}
+
+bool HoldsDmlCte(const QueryNode &node) {
+	bool found = false;
+	VisitNode(
+		const_cast<QueryNode &>(node),
+		[&](unique_ptr<QueryNode> &slot) { found = found || IsDmlNode(*slot) || HoldsDmlCte(*slot); },
+		[](BaseTableRef &) {});
+	return found;
 }
 
 // Whether the query wrote `ref` with no catalog and no schema, from the name

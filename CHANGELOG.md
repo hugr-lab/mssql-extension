@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **UPDATE and DELETE run on SQL Server as one statement** (spec 080 PR 3c),
+  when their WHERE and SET can be written in T-SQL. No rows cross the wire and
+  no key is needed: a table the row path refuses (no usable key, an `xml`
+  column, a `TIME(7)` key) is written by the server, and a SET of a key column
+  goes. `UPDATE … FROM` goes when the WHERE equates the source's key with the
+  target's columns; `DELETE … USING` tables of the same database goes.
+  Stays on the row paths: RETURNING, a function with no T-SQL form, a SET value
+  DuckDB would convert (it rounds `SET int_col = 1.5`; the server truncates), a
+  view, a statement inside a WITH, and on Fabric any FROM / USING / subquery.
+  The statement's type is SELECT to a client (`SELECT * FROM mssql_dml(…)`)
+  and its errors are the server's. `SET mssql_dml_pushdown = false` (new,
+  default true) keeps every UPDATE / DELETE on the row paths. Checked by an
+  agreement suite that runs each shape through a pushing alias and a
+  `remote_pushdown false` one and compares rows and counts.
+
+- **`mssql_dml()`, the vehicle of a pushed UPDATE / DELETE** (spec 080 PR
+  3b), internal: the remote-pushdown rewriter is to send such a statement to
+  SQL Server whole through `SELECT * FROM mssql_dml(...)` (PR 3c). It runs the
+  statement once, when the query executes (never at `EXPLAIN` / `PREPARE`, once
+  per `EXECUTE`), to the end even when the client never reads the result -- a
+  native DML's `ResultEagerness::FORCED`, checked by `make test-dml-vehicle` --
+  atomically in autocommit and on the transaction's connection inside one, and
+  under DuckDB's read-only and one-writable-database rules. Its `Count` is the
+  server's: measured, an AFTER trigger's counts arrive before the statement's.
+  `MSSQL_COUNTERS=1` now also prints which way each UPDATE / DELETE went
+  (`dml: pushed / staged / values_join`).
+
 - **UPDATE and DELETE on Fabric Warehouse** (spec 080). Fabric has no
   `UPDATE / DELETE … FROM … JOIN`, which the VALUES-join statements are, so a
   keyed UPDATE / DELETE there failed on the server. Every UPDATE / DELETE on

@@ -79,6 +79,8 @@ int64_t LoadTestFailMetadataAfterRows(ClientContext &context);
 int64_t LoadTestFailParseAfterTokens(ClientContext &context);
 //! Spec 080 D3: mssql_test_force_intersect_join_form (test only).
 bool LoadTestForceIntersectJoinForm(ClientContext &context);
+//! Spec 080 D5: mssql_dml_pushdown (default true).
+bool LoadDmlPushdown(ClientContext &context);
 
 //! Spec 076: pushed filter constants as sp_executesql parameters (default true).
 bool LoadScanParameterizeFilters(ClientContext &context);

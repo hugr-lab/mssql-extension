@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test help
+.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -1108,6 +1108,20 @@ test-transaction-pin: $(PIN_TEST_BUILD)
 	@echo ""
 	@echo "Running issue #356 transaction-pin contention test..."
 	$(PIN_TEST_RPATH) build/test/test_transaction_pin
+
+# Spec 080 PR 3b: the at-least-once gate of a pushed DML -- mssql_dml opened
+# as a stream and dropped unread still writes. Built like the transaction-pin
+# test (the extension linked statically); sqllogictest cannot ask for a stream.
+test-dml-vehicle: $(PIN_TEST_BUILD)
+	@echo "Building the mssql_dml at-least-once test (spec 080)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) -I src/include $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_dml_vehicle.cpp \
+	    $(PIN_TEST_LIBS) \
+	    -o build/test/test_dml_vehicle
+	@echo ""
+	@echo "Running the mssql_dml at-least-once test..."
+	$(PIN_TEST_RPATH) build/test/test_dml_vehicle
 
 # Issue #369: the rowid files that create their own tables, run through the
 # sqllogictest driver of the DEBUG tree — the one build in which the scan's

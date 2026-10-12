@@ -10,6 +10,7 @@
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "mssql_counters.hpp"
 #include "query/mssql_identifier.hpp"
 #include "query/mssql_result_stream.hpp"
 #include "query/mssql_simple_query.hpp"
@@ -581,6 +582,7 @@ idx_t MSSQLStagedDml::Finalize(ClientContext &context) {
 	connection_.reset();
 	const bool pinned = stmt_conn_.IsPinned();
 	stmt_conn_.Commit(context, catalog_);
+	mssql::CountDml(mssql::DmlPath::STAGED);
 	if (target_.kind == MSSQLStagedDmlKind::DELETE_ROWS && !pinned && target_.table_entry) {
 		target_.table_entry->NoteRowsDeleted(rows);
 	}

@@ -130,6 +130,20 @@ SELECT mssql_exec_params('sqlserver',
 FROM pending_changes;
 ```
 
+### mssql_dml() (internal)
+
+The function a pushed `UPDATE` / `DELETE` will run through (spec 080): the remote-pushdown rewriter is to replace such a statement with `SELECT * FROM mssql_dml(...)`. It is the rewriter's target, not an API: its arguments carry no compatibility promise, and for a statement of your own `mssql_exec()` is the function to use.
+
+**Signature:** `mssql_dml(context VARCHAR, statement VARCHAR [, params STRUCT [, declarations VARCHAR]], kind := 'update' | 'delete', target_schema := VARCHAR, target_table := VARCHAR) -> TABLE(Count BIGINT)`
+
+It behaves as the native DML it stands for:
+
+- It runs the statement once, when the query executes. `EXPLAIN`, `DESCRIBE` and `PREPARE` run nothing, and each `EXECUTE` of a prepared statement runs it once.
+- It runs to the end even when the client never reads the result, as a native `UPDATE` does.
+- In autocommit the statement is atomic. Inside a transaction it runs on the transaction's connection and is undone by `ROLLBACK`.
+- A read-only catalog or database refuses it, and so does a transaction that already wrote to another attached database.
+- `Count` is the server's row count. An `AFTER` trigger's own counts do not replace it.
+
 ### mssql_pool_stats()
 
 Get connection pool statistics.

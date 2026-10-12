@@ -18,6 +18,13 @@ require mssql
 
 require-env MSSQL_TESTDB_DSN
 
+# This file is about the shipped UPDATE / DELETE path -- the rowid key, the
+# VALUES join, #stage, their refusals -- which a statement the remote-pushdown
+# rewriter can render no longer takes (spec 080 D1). The pushed path is
+# test/sql/pushdown/remote_pushdown_dml*.test.
+statement ok
+SET mssql_dml_pushdown = false;
+
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS mssql (TYPE mssql);
 
