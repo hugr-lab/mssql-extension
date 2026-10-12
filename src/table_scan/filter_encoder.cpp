@@ -8,6 +8,7 @@
 #include "table_scan/filter_encoder.hpp"
 #include <cstdlib>
 #include "catalog/mssql_column_info.hpp"
+#include "codec/datetime_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
@@ -399,7 +400,7 @@ ExpressionEncodeResult FilterEncoder::EncodeConstantComparison(const LegacyConst
 															   const std::string &column_name,
 															   const LogicalType &column_type) {
 	std::string op;
-	if (!GetComparisonOperator(filter.comparison_type, op)) {
+	if (!GetComparisonOperator(filter.comparison_type, op) || !codec::datetime::ServerHoldsTemporal(filter.constant)) {
 		return {"", false};
 	}
 
@@ -417,6 +418,11 @@ ExpressionEncodeResult FilterEncoder::EncodeIsNotNull(const std::string &column_
 
 ExpressionEncodeResult FilterEncoder::EncodeInFilter(const LegacyInFilter &filter, const std::string &column_name,
 													 const LogicalType &column_type) {
+	for (auto &value : filter.values) {
+		if (!codec::datetime::ServerHoldsTemporal(value)) {
+			return {"", false};
+		}
+	}
 	std::string sql = column_name + " IN (";
 	for (idx_t i = 0; i < filter.values.size(); i++) {
 		if (i > 0) {
@@ -979,6 +985,12 @@ ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpres
 
 ExpressionEncodeResult FilterEncoder::EncodeConstant(const BoundConstantExpression &expr,
 													 const ExpressionEncodeContext &ctx) {
+	if (!codec::datetime::ServerHoldsTemporal(expr.GetValue())) {
+		// Issue #447: 'infinity', a year past 9999 -- no server value equals or
+		// bounds it as DuckDB's does, and as a parameter it would be refused.
+		// The filter stays with DuckDB, whose answer it is.
+		return {"", false};
+	}
 	std::string sql = EncodeConstantValue(expr.GetValue(), expr.GetReturnType(), ctx, ctx.constant_peer);
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeConstant: value=%s, type=%s -> %s", expr.GetValue().ToString().c_str(),
 						   expr.GetReturnType().ToString().c_str(), sql.c_str());
@@ -1110,6 +1122,18 @@ ExpressionEncodeResult FilterEncoder::EncodeRowidEquality(const Expression &valu
 		return {"", false};
 	}
 	auto &const_expr = value_expr.Cast<BoundConstantExpression>();
+	// Issue #447: a key value SQL Server cannot hold matches no row; the filter
+	// stays with DuckDB, as any other comparison with one does.
+	if (!codec::datetime::ServerHoldsTemporal(const_expr.GetValue())) {
+		return {"", false};
+	}
+	if (const_expr.GetValue().type().id() == LogicalTypeId::STRUCT && !const_expr.GetValue().IsNull()) {
+		for (auto &child : StructValue::GetChildren(const_expr.GetValue())) {
+			if (!codec::datetime::ServerHoldsTemporal(child)) {
+				return {"", false};
+			}
+		}
+	}
 
 	if (ctx.pk_is_composite) {
 		// Composite PK: rowid = {'col1': val1, 'col2': val2}

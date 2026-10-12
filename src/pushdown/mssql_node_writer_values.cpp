@@ -1,3 +1,4 @@
+#include "codec/datetime_codec.hpp"
 #include "pushdown/mssql_node_writer.hpp"
 #include "pushdown/mssql_sql_writer.hpp"
 
@@ -59,6 +60,11 @@ bool NodeWriter::ConstantFor(ComparableKind kind, const LogicalType &target, con
 		if (!cast_value) {
 			return Veto("constant " + expr.ToString() + " does not cast to " + target.ToString());
 		}
+		if (!codec::datetime::ServerHoldsTemporal(*cast_value)) {
+			// Issue #447: 'infinity' / a year past 9999 -- no server value
+			// compares with it as DuckDB's do; the statement stays with DuckDB.
+			return Veto("constant " + expr.ToString() + " is outside SQL Server's date range");
+		}
 		out = std::move(*cast_value);
 		return true;
 	}
@@ -77,6 +83,9 @@ bool NodeWriter::ConstantFor(ComparableKind kind, const LogicalType &target, con
 		auto cast_value = Value(literal.text).DefaultTryCastAs(target, nullptr, true);
 		if (!cast_value) {
 			return Veto("constant '" + literal.text + "' does not cast to " + target.ToString());
+		}
+		if (!codec::datetime::ServerHoldsTemporal(*cast_value)) {
+			return Veto("constant '" + literal.text + "' is outside SQL Server's date range");
 		}
 		out = std::move(*cast_value);
 		return true;
