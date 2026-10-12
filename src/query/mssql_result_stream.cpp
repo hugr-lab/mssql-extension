@@ -837,6 +837,16 @@ void MSSQLResultStream::DrainAfterCancel() {
 
 		// Try to read with short timeout (poll for data)
 		if (!ReadMoreData(cancel_read_timeout_ms_)) {
+			// A dead connection will not answer: stop now rather than read it
+			// again at once until the overall timeout (issue #456).
+			auto *socket = connection_->GetSocket();
+			if (!socket || !socket->IsConnected()) {
+				MSSQL_DEBUG_LOG(1, "DrainAfterCancel: connection lost (reads=%d, tokens=%d), closing", read_count,
+								token_count);
+				connection_->Close();
+				state_ = MSSQLResultStreamState::Error;
+				return;
+			}
 			// No data available, keep trying until overall timeout
 			continue;
 		}

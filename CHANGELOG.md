@@ -446,6 +446,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A pushed DML whose connection died spun at 100% CPU until Ctrl-C** (#456,
+  a regression from #450). A pushed UPDATE / DELETE / INSERT … SELECT waits
+  with no deadline, in 1-second read slices, and keeps going while the socket
+  says it is connected.
+  - Under TLS (the default) a closed peer came back as a timeout, and a TLS
+    read error left the socket "connected". A server restart, a `KILL`, a
+    failover, a network cut or a keepalive expiry during such a statement left
+    it reading again at once, forever.
+  - It was worse than a stale code: recv() returning 0 at end of stream does
+    not set errno, so the EAGAIN of the previous timed-out slice made the EOF
+    read as one more timeout.
+  - Every TLS read error and a closed peer now mark the connection dead, and
+    so does a TDS frame shorter than its header. The statement fails in about
+    a second and names the cause.
+  - A cancelled stream draining a dead connection stops at once instead of
+    retrying for its 5 s.
+
 - **An INSERT that cannot use the bulk path counted its last batch as 0
   rows.** This is an INSERT naming the identity column, with a geometry, CLR
   or `sql_variant` column, into a view, or under `mssql_insert_use_bcp =

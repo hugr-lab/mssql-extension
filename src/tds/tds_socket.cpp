@@ -698,10 +698,20 @@ ssize_t TdsSocket::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 	if (tls_context_) {
 		ssize_t received = tls_context_->Receive(buffer, max_length, timeout_ms);
 		if (received < 0) {
+			// Every TLS read error is fatal: after SSL_ERROR_SYSCALL / SSL_ERROR_SSL
+			// OpenSSL allows no further I/O on the connection. Left "connected", a
+			// caller that waits in slices (ExecuteInterruptible: a pushed DML has
+			// no deadline) read again at once, forever (issue #456).
 			last_error_ = "TLS receive failed: " + tls_context_->GetLastError();
-			if (tls_context_->GetLastErrorCode() == TlsErrorCode::PEER_CLOSED) {
-				connected_ = false;
-			}
+			connected_ = false;
+			return -1;
+		}
+		if (received == 0 && tls_context_->GetLastErrorCode() == TlsErrorCode::PEER_CLOSED) {
+			// TlsImpl::Receive answers 0 for a closed peer as it does for a
+			// timeout; only the code tells them apart. Closed is an error, as
+			// recv() == 0 is on the plain TCP path below.
+			last_error_ = "Connection closed by server: " + tls_context_->GetLastError();
+			connected_ = false;
 			return -1;
 		}
 		return received;
@@ -781,6 +791,10 @@ const uint8_t *TdsSocket::NextPacket(size_t &packet_length, int timeout_ms) {
 				// forever, reporting a timeout instead of a malformed stream.
 				last_error_ = "Invalid TDS packet length: " + std::to_string(expected_length) +
 							  " is shorter than the 8-byte header";
+				// The stream cannot be resynchronised: the connection is done. Left
+				// "connected", a caller reading in slices came straight back to
+				// these same bytes, forever (issue #456).
+				connected_ = false;
 				return nullptr;
 			}
 			if (buffered >= expected_length) {

@@ -86,6 +86,12 @@ struct TlsImplContext {
 	TlsSendCallback send_callback;
 	TlsRecvCallback recv_callback;
 	int current_timeout_ms;	 // Timeout for current operation
+	//! The direct socket read saw end-of-stream (recv() == 0): the peer is gone.
+	//! Recorded by the BIO itself because errno says nothing about it -- recv()
+	//! returning 0 does not set errno, and a 1 s read slice that timed out just
+	//! before leaves EAGAIN there, which Receive read as one more timeout and
+	//! the caller waited forever (issue #456).
+	bool peer_eof = false;
 
 	// Spec 074: the certificate policy Initialize() was given, and the name the
 	// certificate is matched against (resolved in WrapSocket, kept for messages).
@@ -214,6 +220,9 @@ static int CustomBioRead(BIO *bio, char *buf, int len) {
 		return -1;
 	}
 #endif
+	if (ret == 0 && len > 0) {
+		impl->peer_eof = true;
+	}
 
 	return static_cast<int>(ret);
 }
@@ -664,6 +673,10 @@ ssize_t TlsImpl::Send(const uint8_t *data, size_t length) {
 }
 
 ssize_t TlsImpl::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
+	// The code is how a caller tells a closed peer (0, PEER_CLOSED) from a
+	// timeout (0, no code): a code left over from an earlier call must not make
+	// a timeout read as a close (issue #456).
+	ctx_->last_error_code = 0;
 	if (!ctx_->handshake_complete) {
 		ctx_->last_error_code = 6;	// NOT_INITIALIZED
 		ctx_->last_error = "Handshake not complete";
@@ -688,10 +701,27 @@ ssize_t TlsImpl::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 	}
 
 	ClearOpenSSLErrors();
+	// errno / WSAGetLastError describe THIS read only if cleared first: recv()
+	// == 0 sets neither, and the EAGAIN of an earlier timed-out slice would
+	// otherwise read as a timeout (issue #456).
+#ifdef _WIN32
+	WSASetLastError(0);
+#else
+	errno = 0;
+#endif
 	int ret = SSL_read(ctx_->ssl, buffer, static_cast<int>(max_length));
 
 	if (ret > 0) {
 		return ret;
+	}
+
+	if (ctx_->peer_eof) {
+		// The socket said end-of-stream. OpenSSL reports it as SSL_ERROR_SYSCALL
+		// (CustomBioCtrl does not answer BIO_CTRL_EOF), with errno saying
+		// nothing about it.
+		ctx_->last_error_code = 7;	// PEER_CLOSED
+		ctx_->last_error = "Connection closed by peer (end of stream during TLS read)";
+		return 0;
 	}
 
 	int ssl_error = SSL_get_error(ctx_->ssl, ret);
@@ -764,6 +794,7 @@ void TlsImpl::Close() {
 	ctx_->initialized = false;
 	ctx_->handshake_complete = false;
 	ctx_->socket_fd = -1;
+	ctx_->peer_eof = false;
 	ctx_->last_error.clear();
 	ctx_->last_error_code = 0;
 }
