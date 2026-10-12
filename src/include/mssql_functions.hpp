@@ -191,7 +191,7 @@ struct MSSQLCatalogScanBindData : public FunctionData {
 	// RowId Support (Spec 001-pk-rowid-semantics)
 	//===----------------------------------------------------------------------===//
 
-	// Pointer to the table entry (for GetTable() / get_bind_info)
+	// Pointer to the table entry (for GetTable() / get_table_entry)
 	// This allows DuckDB to discover virtual columns like rowid.
 	// Spec 052 (Option D): lifetime of the underlying entry is guaranteed by
 	// MSSQLBindAnchors (per ClientContext, released at QueryEnd) which is

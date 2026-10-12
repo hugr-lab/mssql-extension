@@ -1268,27 +1268,18 @@ static virtual_column_map_t GetVirtualColumns(ClientContext &context, optional_p
 }
 
 //------------------------------------------------------------------------------
-// Bind Info (for GetTable() support)
+// Table entry (for GetTable() support)
 //------------------------------------------------------------------------------
 
-// Callback to return table entry for GetTable() support
-// This allows DuckDB to use the table entry's GetVirtualColumns() override
-static BindInfo GetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
+// The table a catalog scan reads, for LogicalGet::GetTable(): the binder finds
+// the table entry's GetVirtualColumns() (rowid) and an UPDATE / DELETE target
+// through it. A callback of its own since DuckDB cb8eeaefed9 (it used to ride
+// in BindInfo).
+static optional_ptr<TableCatalogEntry> GetTableEntry(optional_ptr<const FunctionData> bind_data_p) {
 	if (!bind_data_p) {
-		return BindInfo(ScanType::EXTERNAL);
+		return nullptr;
 	}
-
-	auto &bind_data = bind_data_p->Cast<MSSQLCatalogScanBindData>();
-
-	if (bind_data.table_entry) {
-		// Return BindInfo with table entry - this enables GetTable() to work
-		// and allows DuckDB to call the table entry's GetVirtualColumns()
-		// The BindInfo constructor takes a non-const reference
-		auto &table_ref = const_cast<TableCatalogEntry &>(*bind_data.table_entry);
-		return BindInfo(table_ref);
-	}
-
-	return BindInfo(ScanType::EXTERNAL);
+	return bind_data_p->Cast<MSSQLCatalogScanBindData>().table_entry;
 }
 
 //------------------------------------------------------------------------------
@@ -1455,9 +1446,10 @@ TableFunction GetCatalogScanFunction() {
 	// This is called during binding to determine what virtual columns are available
 	func.get_virtual_columns = GetVirtualColumns;
 
-	// Return table entry for GetTable() support - enables DuckDB to discover
-	// virtual columns like rowid from the table entry's GetVirtualColumns()
-	func.get_bind_info = GetBindInfo;
+	// The table entry for LogicalGet::GetTable() - the binder reads the rowid
+	// columns and the UPDATE / DELETE target from it (the scan's own virtual
+	// columns come from get_virtual_columns above)
+	func.get_table_entry = GetTableEntry;
 
 	// Note: We don't set filter_prune = true because that can cause issues with
 	// the DataChunk column count when filter-only columns are excluded
