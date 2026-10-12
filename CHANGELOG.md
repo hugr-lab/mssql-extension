@@ -58,8 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3b), internal: the remote-pushdown rewriter is to send such a statement to
   SQL Server whole through `SELECT * FROM mssql_dml(...)` (PR 3c). It runs the
   statement once, when the query executes (never at `EXPLAIN` / `PREPARE`, once
-  per `EXECUTE`), to the end even when the client never reads the result -- a
-  native DML's `ResultEagerness::FORCED`, checked by `make test-dml-vehicle` --
+  per `EXECUTE`), consumed exactly as the native DML it replaces (since DuckDB
+  #26880 a submitted write, native or this, runs and waits at its count until
+  its consumer settles it; checked by `make test-dml-vehicle`) --
   atomically in autocommit and on the transaction's connection inside one, and
   under DuckDB's read-only and one-writable-database rules. Its `Count` is the
   server's: measured, an AFTER trigger's counts arrive before the statement's.

@@ -330,6 +330,21 @@ threads and changes its rows once. Against a bind without `FORCED` the
 eagerness, stream and `FINISHED` checks fail (the handle sits at `READY`).
 The gate passes; the pushed half stands.
 
+**Superseded by DuckDB #26880 (pin `bba7360bc2b`).** The planner no longer
+decides how a result is consumed: `ResultEagerness` and `FORCED` are gone, and
+`Submit` leaves every result to its consumer -- a submitted write, native or
+the vehicle, runs and waits at its count until `Complete` / `Materialize` / a
+stream settles it, and a result dropped before its query ended is rolled back
+(DuckDB ef5b57f94ad; the server side follows since #451 for a joined write --
+UPDATE / DELETE, and an INSERT under `mssql_insert_use_bcp = false`; by default
+an INSERT commits on its own). A stream can now be opened on either handle,
+and closing it early is a drop. So "at least once"
+is no longer a property a native DML has, and the gate became parity: in each
+sequence a client can drive -- submitted and dropped, completed, dropped soon
+after submission, inside an explicit transaction -- the vehicle ends as a
+native UPDATE does. Its handle still reads as one: `CHANGED_ROWS`, and
+`StreamsByDefault` (what DuckDB's own readers ask) answers no for both.
+
 **Read-only** is refused at two points (#421, corrected in the review of #422):
 - in the dry run, by a plain `IsReadOnly()` test that answers **false**, so
   the statement takes the shipped path and its hook refuses it with the
@@ -1159,8 +1174,9 @@ merge, which is why they come first.
   `time(7)`, `datetimeoffset(7)`) has no rung 3 and is refused by name. That
   is a real table shape this spec does not make writable; the fix for the
   user is a unique index (#421).
-- **At least once** depends on the vehicle setting `FORCED` from its bind.
-  W8's assertion proves it, and it gates PR 3 (#421).
+- **At least once** depended on the vehicle setting `FORCED` from its bind
+  (W8, #421) -- until DuckDB #26880 removed eagerness altogether; the gate is
+  parity with a native UPDATE since (see W8's note).
 
 ## Open, decided later
 

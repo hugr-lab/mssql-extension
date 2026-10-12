@@ -11,13 +11,16 @@
 //                           target_schema := ..., target_table := ...)
 //
 // What it owes the statement it replaces:
-// - at least once: the binder of a SELECT leaves the result streamable
-//   (ResultEagerness::AUTO, bind_select.cpp): its producers wait for the
-//   client to decide how to take the result, and whether the source has been
-//   initialised by then is a race (with no spare engine thread nothing runs).
-//   The bind sets FORCED, which the planner copies from the global binder
-//   state after binding, so the statement runs whole whatever the client
-//   reads, as a native DML does;
+// - a native DML's handle: CHANGED_ROWS (the registration's call_return_type)
+//   and a write (RegisterDBModify), so DuckDB's readers treat it as they do an
+//   UPDATE -- StreamsByDefault answers no. Since DuckDB #26880 the planner
+//   decides no consumption mode for anything (ResultEagerness, and the FORCED
+//   this bind used to set, are gone): a submitted write waits at its count
+//   until Complete / Materialize / a stream settles it, a native one and this
+//   alike; Query / Execute still retain at submission. A result dropped before
+//   its query ended rolls the write back when it joined the statement's
+//   transaction (issue #451: UPDATE / DELETE, an INSERT under
+//   mssql_insert_use_bcp = false); by default an INSERT commits on its own;
 // - exactly once: one InitGlobal, guarded by a latch; a source initialised
 //   again (a recursive CTE's iteration) is refused rather than written twice.
 //   Each EXECUTE of a PREPARE binds again (SupportStatementCache() false), so
@@ -215,17 +218,15 @@ unique_ptr<FunctionData> MSSQLDmlBind(ClientContext &context, TableFunctionBindI
 
 	auto &catalog = DmlCatalog(context, bind_data->context_name);
 	catalog.CheckWriteAccess(VerbOf(bind_data->kind));
-	// Without the binder there is no way to make the statement run whole or to
-	// register the write with DuckDB: refused rather than run streamable and
-	// past the read-only and one-writable-database rules. A plan copy rebinds
-	// with no binder (LogicalGet::Deserialize); NotImplementedException is what
-	// CTE inlining takes as "keep the CTE materialised" (cte_inlining.cpp), so
-	// the statement then runs once.
+	// Without the binder there is no way to register the write with DuckDB:
+	// refused rather than run past the read-only and one-writable-database
+	// rules. A plan copy rebinds with no binder (LogicalGet::Deserialize);
+	// NotImplementedException is what CTE inlining takes as "keep the CTE
+	// materialised" (cte_inlining.cpp), so the statement then runs once.
 	if (!input.binder) {
 		throw NotImplementedException("mssql_dml: cannot be bound here (no binder to register the write with)");
 	}
 	auto &properties = input.binder->GetStatementProperties();
-	properties.result_eagerness = ResultEagerness::FORCED;
 	properties.RegisterDBModify(catalog, context,
 								bind_data->kind == DmlKind::UPDATE	 ? DatabaseModificationType::UPDATE_DATA
 								: bind_data->kind == DmlKind::DELETE ? DatabaseModificationType::DELETE_DATA

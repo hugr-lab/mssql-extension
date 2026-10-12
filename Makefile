@@ -1109,18 +1109,20 @@ test-transaction-pin: $(PIN_TEST_BUILD)
 	@echo "Running issue #356 transaction-pin contention test..."
 	$(PIN_TEST_RPATH) build/test/test_transaction_pin
 
-# Spec 080 PR 3b: the at-least-once gate of a pushed DML -- mssql_dml opened
-# as a stream and dropped unread still writes. Built like the transaction-pin
-# test (the extension linked statically); sqllogictest cannot ask for a stream.
+# Spec 080 PR 3b: a pushed DML's vehicle (mssql_dml) is consumed as the native
+# DML it replaces -- submitted, dropped, completed (DuckDB #26880 left every
+# result to its consumer) -- and issue #451's rollback of a dropped write. Built
+# like the transaction-pin test (the extension linked statically);
+# sqllogictest cannot submit without reading.
 test-dml-vehicle: $(PIN_TEST_BUILD)
-	@echo "Building the mssql_dml at-least-once test (spec 080)..."
+	@echo "Building the mssql_dml vehicle test (spec 080)..."
 	@mkdir -p build/test
 	$(CXX) $(SPEC047_TEST_FLAGS) -I src/include $(SPEC047_TEST_INCLUDES) \
 	    test/cpp/test_dml_vehicle.cpp \
 	    $(PIN_TEST_LIBS) \
 	    -o build/test/test_dml_vehicle
 	@echo ""
-	@echo "Running the mssql_dml at-least-once test..."
+	@echo "Running the mssql_dml vehicle test..."
 	$(PIN_TEST_RPATH) build/test/test_dml_vehicle
 
 # Issue #456: a pushed DML whose connection dies mid-statement fails within
