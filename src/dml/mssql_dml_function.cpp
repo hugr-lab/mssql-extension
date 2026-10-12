@@ -291,7 +291,8 @@ unique_ptr<GlobalTableFunctionState> MSSQLDmlInitGlobal(ClientContext &context, 
 		// pushed INSERT ... SELECT copying millions of rows takes as long as it
 		// takes -- the shipped path streams and never hit mssql_query_timeout
 		// for it. Ctrl-C cancels it (ATTENTION; the server rolls the statement
-		// back); a dead connection ends the wait through TCP keepalive.
+		// back); a dead connection ends the wait through TCP keepalive (over TLS too: a read error or a closed peer
+		// marks the socket dead, #456).
 		const MSSQLSimpleQuery::InterruptProbe interrupted = [&context]() { return context.IsInterrupted(); };
 		auto result = MSSQLSimpleQuery::ExecuteInterruptible(*connection, bind_data.request, interrupted);
 		for (const auto &info : result.info_messages) {
