@@ -55,6 +55,10 @@ struct WriterTable {
 	//! none), so its size is unknown, never small.
 	bool size_known = true;
 	std::vector<std::string> unique_key;
+	//! A view: never the target of a pushed UPDATE / DELETE (spec 080 D1 -- the
+	//! shipped path refuses one, a pushed statement through an updatable view
+	//! would succeed).
+	bool is_view = false;
 };
 
 //! One `@pN` of the statement: its declaration (from the column it is
@@ -105,6 +109,12 @@ struct WrittenQuery {
 	//! A LIMIT / OFFSET somewhere in the node: which rows it gives can differ
 	//! between two evaluations (ties), where DuckDB evaluates a CTE once.
 	bool picks_rows = false;
+	//! Spec 080 D1, a pushed UPDATE / DELETE: "update" or "delete", and the
+	//! table it writes (the vehicle's kind := / target_schema := /
+	//! target_table :=). Empty for a SELECT.
+	std::string dml_kind;
+	std::string target_schema;
+	std::string target_table;
 
 	//! "@p1 int, @p2 varchar(50)" -- empty without parameters.
 	std::string Declarations() const;
@@ -126,6 +136,10 @@ struct SQLWriterOptions {
 	//! scalar subquery of several rows, as SQL Server does (512); false returns
 	//! an arbitrary row, and a scalar subquery is then not pushed.
 	bool scalar_subquery_errors = true;
+	//! Spec 080 D0: the platform has `UPDATE / DELETE … FROM …` (SQL Server,
+	//! Azure SQL); without it (Fabric) a pushed UPDATE / DELETE takes the
+	//! single-table form, and one with FROM / USING is not pushed.
+	bool dml_from_join = true;
 	//! The session's default_order / default_null_order, resolved.
 	OrderType default_order = OrderType::ASCENDING;
 	OrderByNullType default_null_order_asc = OrderByNullType::NULLS_LAST;
@@ -154,6 +168,11 @@ public:
 	//! Render `node`. False, with the reason in `why`, when any part of it has
 	//! no exact T-SQL form -- then `out` is unspecified.
 	bool Write(const QueryNode &node, WrittenQuery &out, std::string &why);
+
+	//! Spec 080 D1: render an UPDATE / DELETE node as ONE T-SQL statement,
+	//! its SET values and WHERE exactly as DuckDB would compute and select
+	//! them; false, with the reason in `why`, when any part has no exact form.
+	bool WriteDml(const QueryNode &node, WrittenQuery &out, std::string &why);
 
 	//! Whether pushing `node` sends the server more than the catalog scan
 	//! would. The scan already pushes projections and filters, and unlike a

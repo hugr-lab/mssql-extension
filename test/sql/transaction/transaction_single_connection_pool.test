@@ -46,6 +46,13 @@ SET threads = 4;
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS one380 (TYPE mssql);
 
+# The UPDATE / DELETE blocks below are about the shipped path on one
+# connection -- the stage, the VALUES batches fed by a streaming scan -- which a
+# statement the remote-pushdown rewriter can render no longer takes (spec 080
+# D1). The pushed path on a pool of one: test/sql/pushdown/remote_pushdown_dml.test.
+statement ok
+SET mssql_dml_pushdown = false;
+
 #------------------------------------------------------------------------------
 # A table with no key (spec 080 D3, rung 3): the stage is filled and joined on
 # the statement's one connection, after the source scan gave it back.

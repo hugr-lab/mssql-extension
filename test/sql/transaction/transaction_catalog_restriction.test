@@ -88,7 +88,8 @@ SELECT COUNT(*) FROM txtest.dbo.tx_scan_test;
 statement ok
 BEGIN;
 
-# UPDATE requires scanning to find matching rows (for rowid)
+# The UPDATE runs on the transaction's pinned connection (pushed whole, spec
+# 080 D1, or through its rowids on the shipped path)
 statement ok
 UPDATE txtest.dbo.tx_scan_test SET name = 'Updated' WHERE id = 1;
 
@@ -118,7 +119,7 @@ INSERT INTO txtest.dbo.tx_scan_test (id, name) VALUES (3, 'To Delete');
 statement ok
 BEGIN;
 
-# DELETE requires scanning to find matching rows (for rowid)
+# The DELETE runs on the transaction's pinned connection, as the UPDATE above
 statement ok
 DELETE FROM txtest.dbo.tx_scan_test WHERE id = 3;
 

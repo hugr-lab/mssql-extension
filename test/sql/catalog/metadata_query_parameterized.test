@@ -76,6 +76,10 @@ SELECT count(*) FROM mq75."o'br]ack"."t'b]l";
 3
 
 # DML through the rowid path, which needs the primary key the parameterised query found
+# (the shipped path: a pushed UPDATE, spec 080 D1, needs no key)
+statement ok
+SET mssql_dml_pushdown = false;
+
 statement ok
 UPDATE mq75."o'br]ack"."t'b]l" SET name = 'c' WHERE id = 3;
 
@@ -83,6 +87,9 @@ query I
 SELECT name FROM mq75."o'br]ack"."t'b]l" WHERE id = 3;
 ----
 c
+
+statement ok
+RESET mssql_dml_pushdown;
 
 statement ok
 SELECT mssql_exec('mq75', 'DROP TABLE [o''br]]ack].[t''b]]l]; DROP SCHEMA [o''br]]ack]');

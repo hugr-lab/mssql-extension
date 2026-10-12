@@ -22,6 +22,7 @@ namespace duckdb {
 
 using mssql::CollectPushdownTables;
 using mssql::ExtendScope;
+using mssql::HoldsDmlCte;
 using mssql::IsSetOperationChild;
 using mssql::KeepsChildSelectLists;
 using mssql::MayRepeatOutputNames;
@@ -184,6 +185,33 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 		why = "not a SELECT";
 		return false;
 	}
+	return WriteResolved(node, out, why, context, false);
+}
+
+// Spec 080 D1: everything that decides whether an UPDATE / DELETE goes to the
+// server whole is decided here, in the dry run -- RemoteExecute cannot hand a
+// DML node back.
+bool MSSQLCatalog::WriteDmlPushdown(const QueryNode &node, mssql::WrittenQuery &out, string &why,
+									optional_ptr<ClientContext> context) {
+	if (node.type != QueryNodeType::UPDATE_QUERY_NODE && node.type != QueryNodeType::DELETE_QUERY_NODE) {
+		why = "not an UPDATE / DELETE";
+		return false;
+	}
+	if (IsReadOnly()) {
+		// Declined, not thrown (CheckWriteAccess throws): the shipped path then
+		// refuses the statement with its own message.
+		why = "the catalog is read-only";
+		return false;
+	}
+	if (GetDmlCapabilities().IsSynapse()) {
+		why = "Synapse: UPDATE / DELETE are refused there";
+		return false;
+	}
+	return WriteResolved(node, out, why, context, true);
+}
+
+bool MSSQLCatalog::WriteResolved(const QueryNode &node, mssql::WrittenQuery &out, string &why,
+								 optional_ptr<ClientContext> context, bool dml) {
 	// Every base table the node names -- its FROM's, a derived table's, a
 	// subquery expression's (PR E1) -- resolved before the writer runs and
 	// held until it is done. What the writer has no form for it refuses.
@@ -214,6 +242,16 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 	// The session's settings are the context's: RemoteExecute's own, or, for
 	// the context-free hooks, the one that resolved the tables.
 	auto options = mssql::SQLWriterOptions::FromContext(*resolved[0].context);
+	if (dml) {
+		// Read per rewrite (D5; GLOBAL scope), in the dry run only: the kept run
+		// cannot hand a DML back, so a SET between the two must not turn an
+		// approved statement into an error.
+		if (!context && !LoadDmlPushdown(*resolved[0].context)) {
+			why = "mssql_dml_pushdown is off";
+			return false;
+		}
+		options.dml_from_join = GetDmlCapabilities().update_from_join;
+	}
 	mssql::SQLWriter writer(options, [&](const BaseTableRef &ref, mssql::WriterTable &table) {
 		for (idx_t i = 0; i < refs.size(); i++) {
 			if (refs[i] != &ref) {
@@ -234,6 +272,7 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 									? cached
 									: entry.GetApproxRowCount();
 			table.size_known = entry.GetObjectType() != MSSQLObjectType::VIEW;
+			table.is_view = entry.GetObjectType() == MSSQLObjectType::VIEW;
 			auto key = entry.LoadedPrimaryKeyInfo();
 			if (key && key->exists) {
 				for (auto &column : key->columns) {
@@ -245,7 +284,7 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 		return false;
 	});
 	writer.SetWrittenUnqualified(WrittenUnqualified);
-	return writer.Write(node, out, why);
+	return dml ? writer.WriteDml(node, out, why) : writer.Write(node, out, why);
 }
 
 // The dry run (D1): renderability only. Whether the node gains anything over
@@ -256,6 +295,20 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 bool MSSQLCatalog::SupportsPushdown(const QueryNode &node) {
 	mssql::WrittenQuery written;
 	string why;
+	if (node.type == QueryNodeType::UPDATE_QUERY_NODE || node.type == QueryNodeType::DELETE_QUERY_NODE) {
+		// Spec 080 D1: whole, or the shipped path -- never in parts.
+		const bool pushed = WriteDmlPushdown(node, written, why);
+		MSSQL_CATALOG_DEBUG_LOG(1, "SupportsPushdown(DML node %s): %s", node.ToString().c_str(),
+								pushed ? written.statement.c_str() : ("no: " + why).c_str());
+		return pushed;
+	}
+	if (mssql::HoldsDmlCte(node)) {
+		// `WITH c AS (UPDATE …) SELECT …`: the writer cannot render the body,
+		// and the node handed back would put the DML in a subquery (D1).
+		MSSQL_CATALOG_DEBUG_LOG(1, "SupportsPushdown(query node %s): no: it holds a DML CTE body",
+								node.ToString().c_str());
+		return false;
+	}
 	if (WritePushdown(node, written, why)) {
 		MSSQL_CATALOG_DEBUG_LOG(1, "SupportsPushdown(query node %s): %s", node.ToString().c_str(),
 								written.statement.c_str());
@@ -369,6 +422,18 @@ void MSSQLCatalog::PushNestedParts(ClientContext &context, QueryNode &node, cons
 
 unique_ptr<TableRef> MSSQLCatalog::RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) {
 	mssql::WrittenQuery written;
+	if (node->type == QueryNodeType::UPDATE_QUERY_NODE || node->type == QueryNodeType::DELETE_QUERY_NODE) {
+		string why;
+		if (!WriteDmlPushdown(*node, written, why, context)) {
+			// The dry run said yes and a DML node cannot be handed back.
+			throw BinderException(
+				"mssql: the remote-pushdown rewriter took this %s for the server, and it cannot be "
+				"written now (%s); SET mssql_dml_pushdown = false to run it on the shipped path, and "
+				"please report it",
+				node->type == QueryNodeType::UPDATE_QUERY_NODE ? "UPDATE" : "DELETE", why);
+		}
+		return DmlVehicleFor(written);
+	}
 	if (WritePushablePart(*node, written, context, {}, false)) {
 		return VehicleFor(written);
 	}
@@ -462,6 +527,38 @@ unique_ptr<TableRef> MSSQLCatalog::VehicleFor(mssql::WrittenQuery &written) {
 	auto statement = make_uniq<SelectStatement>();
 	statement->node = std::move(select);
 	return make_uniq<SubqueryRef>(std::move(statement));
+}
+
+// Spec 080 D1: `mssql_dml(context, statement [, params, declarations], kind :=,
+// target_schema :=, target_table :=)`. Nothing touches the server here; the
+// vehicle binds with no connection and runs the statement once at init.
+unique_ptr<TableRef> MSSQLCatalog::DmlVehicleFor(mssql::WrittenQuery &written) {
+	vector<unique_ptr<ParsedExpression>> arguments;
+	arguments.push_back(ConstantExpression::String(GetName().GetIdentifierName()));
+	arguments.push_back(ConstantExpression::String(written.statement));
+	if (!written.params.empty()) {
+		child_list_t<Value> values;
+		for (auto &param : written.params) {
+			values.emplace_back(Identifier(param.name), param.value);
+		}
+		arguments.push_back(ConstantExpression::FromValue(Value::STRUCT(std::move(values))));
+		arguments.push_back(ConstantExpression::String(written.Declarations()));
+	}
+	// Named parameters are read from the argument's alias (`name => value`).
+	for (auto &named :
+		 {std::make_pair("kind", written.dml_kind), std::make_pair("target_schema", written.target_schema),
+		  std::make_pair("target_table", written.target_table)}) {
+		auto argument = ConstantExpression::String(named.second);
+		argument->SetAlias(Identifier(named.first));
+		arguments.push_back(std::move(argument));
+	}
+	auto ref = make_uniq<TableFunctionRef>();
+	ref->function = make_uniq<FunctionExpression>(
+		QualifiedName(Identifier(SYSTEM_CATALOG), Identifier(DEFAULT_SCHEMA), Identifier("mssql_dml")),
+		std::move(arguments));
+	mssql::CountRemotePushdown();
+	MSSQL_CATALOG_DEBUG_LOG(1, "RemoteExecute: %s", written.statement.c_str());
+	return std::move(ref);
 }
 
 // No statement-level pushdown in spec 079: DDL and DML are spec 080's.

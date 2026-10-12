@@ -380,7 +380,8 @@ EXPLAIN SELECT id, (SELECT max(w) FROM rs_on.dbo.rs_u u WHERE u.g = t.g) FROM rs
 ----
 physical_plan	<!REGEX>:.*SELECT MAX.*
 
-# An UPDATE with a correlated subquery while pushdown is on: not rewritten.
+# An UPDATE with a correlated subquery while pushdown is on: sent whole as one
+# statement since spec 080 PR 3c (mssql_dml); the values below are the server's.
 statement ok
 UPDATE rs_on.dbo.rs_t SET n = n + 1 WHERE EXISTS (SELECT 1 FROM rs_on.dbo.rs_u u WHERE u.g = rs_t.g);
 

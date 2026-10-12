@@ -55,7 +55,11 @@ SELECT "c]1" FROM tq.dbo."q]t'x" ORDER BY "c]1" DESC LIMIT 2;
 1501
 1500
 
-# rowid UPDATE and DELETE.
+# rowid UPDATE and DELETE (the shipped path; the pushed one renders names
+# through the same mssql::QuoteIdentifier).
+statement ok
+SET mssql_dml_pushdown = false;
+
 query I
 UPDATE tq.dbo."q]t'x" SET "v'" = 'z' WHERE "c]1" <= 10;
 ----
@@ -70,6 +74,9 @@ query II
 SELECT count(*), count(*) FILTER (WHERE "v'" = 'z') FROM tq.dbo."q]t'x";
 ----
 1000	10
+
+statement ok
+RESET mssql_dml_pushdown;
 
 # CTAS into a quoted name with a quoted column (DDL + bulk load).
 query I

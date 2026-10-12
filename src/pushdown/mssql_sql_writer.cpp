@@ -94,6 +94,29 @@ bool SQLWriter::Write(const QueryNode &node, WrittenQuery &out, std::string &why
 	return true;
 }
 
+bool SQLWriter::WriteDml(const QueryNode &node, WrittenQuery &out, std::string &why) {
+	out = WrittenQuery();
+	NodeWriter writer(options_, resolver_, out, why);
+	writer.SetWrittenUnqualified(&written_unqualified_);
+	bool written;
+	switch (node.type) {
+	case QueryNodeType::UPDATE_QUERY_NODE:
+		written = writer.WriteUpdate(node.Cast<UpdateQueryNode>());
+		break;
+	case QueryNodeType::DELETE_QUERY_NODE:
+		written = writer.WriteDelete(node.Cast<DeleteQueryNode>());
+		break;
+	default:
+		why = "not an UPDATE / DELETE";
+		return false;
+	}
+	if (!written) {
+		return false;
+	}
+	writer.TakeParams(out.params);
+	return true;
+}
+
 std::string ColumnTypeName(const LogicalType &type) {
 	if (type.id() == LogicalTypeId::INVALID) {
 		// A computed column: '' leaves the vehicle the type the server describes.

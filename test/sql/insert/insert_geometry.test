@@ -76,7 +76,11 @@ SELECT count(*) FROM mssql_scan('geoi', 'SELECT id FROM dbo.GeoInsDst WHERE g IS
 ----
 1
 
-# --- UPDATE takes the same wrapper, inside the VALUES-derived table it builds.
+# --- UPDATE takes the same wrapper, inside the VALUES-derived table it builds
+# (the shipped path: pushed whole, spec 080 D1, the server copies the value).
+statement ok
+SET mssql_dml_pushdown = false;
+
 statement ok
 UPDATE geoi.dbo.GeoInsDst SET g = (SELECT g FROM geoi.dbo.GeoInsSrc WHERE id = 2) WHERE id = 1;
 
@@ -84,6 +88,9 @@ query I
 SELECT * FROM mssql_scan('geoi', 'SELECT g.STAsText() AS geom FROM dbo.GeoInsDst WHERE id = 1');
 ----
 LINESTRING (0 0, 5 5)
+
+statement ok
+RESET mssql_dml_pushdown;
 
 statement ok
 SELECT mssql_exec('geoi', 'TRUNCATE TABLE dbo.GeoInsDst');
