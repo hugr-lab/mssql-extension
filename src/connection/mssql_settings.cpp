@@ -381,6 +381,15 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  LogicalType::BIGINT, Value::BIGINT(MSSQL_DEFAULT_DML_STAGE_THRESHOLD),
 							  ValidateNonNegative, SetScope::GLOBAL);
 
+	// Spec 080 D5: whether the remote-pushdown rewriter sends an UPDATE / DELETE
+	// it can render to the server as one statement (mssql_dml). Read per
+	// rewrite, unlike mssql_remote_pushdown (read at ATTACH): the switch for the
+	// DML half alone. Off, every UPDATE / DELETE takes the shipped path.
+	config.AddExtensionOption("mssql_dml_pushdown",
+							  "Send an UPDATE / DELETE the remote-pushdown rewriter can render to SQL Server as one "
+							  "statement (default: true)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+
 	// mssql_dml_max_parameters - Maximum parameters per DML statement
 	// SQL Server limit is approximately 2100, we use 2000 for safety margin
 	config.AddExtensionOption(
@@ -682,6 +691,14 @@ int64_t LoadPushdownMinRows(ClientContext &context) {
 bool LoadScanParameterizeFilters(ClientContext &context) {
 	Value val;
 	if (context.TryGetCurrentSetting("mssql_scan_parameterize_filters", val)) {
+		return val.GetValue<bool>();
+	}
+	return true;
+}
+
+bool LoadDmlPushdown(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("mssql_dml_pushdown", val) && !val.IsNull()) {
 		return val.GetValue<bool>();
 	}
 	return true;

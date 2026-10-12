@@ -330,6 +330,11 @@ SELECT count(*) FROM tm380.dbo.tm380_nokey;
 ----
 2
 
+# The DELETEs below ask for the rowid key, which a pushed DELETE (spec 080
+# D1) does not need: the shipped path, for the key it learned.
+statement ok
+SET mssql_dml_pushdown = false;
+
 statement ok
 BEGIN;
 
@@ -349,6 +354,9 @@ statement error
 DELETE FROM tm380.dbo.tm380_nokey WHERE id = 1;
 ----
 tm380_nokey
+
+statement ok
+RESET mssql_dml_pushdown;
 
 query I
 SELECT count(*) FROM tm380.dbo.tm380_nokey;

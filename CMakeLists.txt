@@ -204,6 +204,7 @@ set(EXTENSION_SOURCES
     src/pushdown/mssql_expression_vocabulary.cpp
     src/pushdown/mssql_node_writer.cpp
     src/pushdown/mssql_node_writer_from.cpp
+    src/pushdown/mssql_node_writer_dml.cpp
     src/pushdown/mssql_node_writer_select.cpp
     src/pushdown/mssql_node_writer_subqueries.cpp
     src/pushdown/mssql_node_writer_values.cpp

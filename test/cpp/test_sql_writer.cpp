@@ -13,7 +13,11 @@
 
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/query_node/delete_query_node.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
+#include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "pushdown/mssql_sql_writer.hpp"
 
@@ -128,7 +132,110 @@ static void ExpectGain(const std::string &sql, bool expected) {
 	}
 }
 
+//! Spec 080 D1: an UPDATE / DELETE through SQLWriter::WriteDml. `v` is a view
+//! (a target never pushed); `from_join` false is Fabric's single-table form.
+static bool WriteDml(const std::string &sql, WrittenQuery &out, std::string &why, bool from_join = true) {
+	static const auto columns = Columns();
+	static const auto other = OtherColumns();
+	auto parser = Parser::GetBuiltinParser();
+	parser.ParseQuery(sql);
+	auto &statement = *parser.statements[0];
+	const QueryNode &node = statement.type == StatementType::UPDATE_STATEMENT
+								? static_cast<const QueryNode &>(*statement.Cast<UpdateStatement>().node)
+								: static_cast<const QueryNode &>(*statement.Cast<DeleteStatement>().node);
+	SQLWriterOptions options;
+	options.dml_from_join = from_join;
+	SQLWriter writer(options, [](const BaseTableRef &ref, WriterTable &table) {
+		const auto &name = ref.Table().GetIdentifierName();
+		if (name != "t" && name != "u" && name != "v") {
+			return false;
+		}
+		table.schema = "dbo";
+		table.name = name;
+		table.columns = name == "u" ? &other : &columns;
+		table.unique_key = {"id"};
+		table.is_view = name == "v";
+		return true;
+	});
+	return writer.WriteDml(node, out, why);
+}
+
+static void ExpectDml(const std::string &sql, const std::string &expected, bool from_join = true) {
+	WrittenQuery out;
+	std::string why;
+	if (!WriteDml(sql, out, why, from_join)) {
+		std::cerr << "FAIL: " << sql << "\n  refused: " << why << "\n";
+		failures++;
+		return;
+	}
+	if (out.statement != expected) {
+		std::cerr << "FAIL: " << sql << "\n  expected: " << expected << "\n  actual:   " << out.statement << "\n";
+		failures++;
+	}
+}
+
+static void ExpectDmlVeto(const std::string &sql, bool from_join = true) {
+	WrittenQuery out;
+	std::string why;
+	if (WriteDml(sql, out, why, from_join)) {
+		std::cerr << "FAIL: expected a veto for " << sql << "\n  wrote: " << out.statement << "\n";
+		failures++;
+	}
+}
+
 int main() {
+	// Spec 080 D1: UPDATE / DELETE, whole. The SQL Server form names the target
+	// by its alias; Fabric's has no FROM.
+	ExpectDml("UPDATE t SET id = id + 1, name = 'x' WHERE id <= 3",
+			  "UPDATE [r1] SET [id] = ([r1].[id] + @p0), [name] = @p1 FROM [dbo].[t] AS [r1] WHERE ([r1].[id] <= @p2)");
+	ExpectDml("UPDATE t SET name = NULL", "UPDATE [r1] SET [name] = NULL FROM [dbo].[t] AS [r1]");
+	ExpectDml("UPDATE t SET id = u.t_id FROM u WHERE t.id = u.id",
+			  "UPDATE [r1] SET [id] = [r2].[t_id] FROM [dbo].[t] AS [r1] CROSS JOIN [dbo].[u] AS [r2] WHERE ([r1].[id] "
+			  "= [r2].[id])");
+	ExpectDml("DELETE FROM t WHERE flag = true", "DELETE [r1] FROM [dbo].[t] AS [r1] WHERE ([r1].[flag] = @p0)");
+	ExpectDml("DELETE FROM t USING u WHERE t.id = u.t_id",
+			  "DELETE [r1] FROM [dbo].[t] AS [r1] CROSS JOIN [dbo].[u] AS [r2] WHERE ([r1].[id] = [r2].[t_id])");
+	ExpectDml("DELETE FROM t", "DELETE [r1] FROM [dbo].[t] AS [r1]");
+	ExpectDml("UPDATE t SET id = id + 1 WHERE id = 3", "UPDATE [dbo].[t] SET [id] = ([id] + @p0) WHERE ([id] = @p1)",
+			  false);
+	ExpectDml("DELETE FROM t WHERE id = 3", "DELETE FROM [dbo].[t] WHERE ([id] = @p0)", false);
+	// The SET value has the column's type, or it is not pushed.
+	ExpectDmlVeto("UPDATE t SET id = 1.5");								// DuckDB rounds, T-SQL truncates
+	ExpectDmlVeto("UPDATE t SET id = u.big FROM u WHERE t.id = u.id");	// BIGINT into INTEGER
+	ExpectDmlVeto("UPDATE t SET tiny = id");							// INTEGER into UTINYINT
+	ExpectDmlVeto(
+		"UPDATE t SET name = "
+		"'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz'");
+	ExpectDmlVeto("UPDATE t SET name = u.label FROM u WHERE t.id = u.id");	// strings declared apart
+	ExpectDmlVeto("UPDATE t SET ratio = ratio / 2");						// a division
+	ExpectDmlVeto("UPDATE t SET id = 1 WHERE id = 1 RETURNING id");
+	ExpectDmlVeto("UPDATE t SET id = DEFAULT");
+	ExpectDmlVeto("UPDATE t SET id = 1, id = 2");
+	ExpectDmlVeto("UPDATE v SET id = 1");										// a view
+	ExpectDmlVeto("UPDATE t SET id = u.id FROM u WHERE t.id = u.t_id");			// u.t_id is no key of u
+	ExpectDmlVeto("UPDATE t SET id = u.t_id FROM u WHERE t.id = u.id", false);	// Fabric: no FROM
+	ExpectDmlVeto("DELETE FROM t USING u WHERE t.id = u.id", false);
+	ExpectDmlVeto("DELETE FROM t WHERE id IN (SELECT t_id FROM u)", false);	 // the single-table form names columns bare
+	ExpectDmlVeto("WITH c AS (SELECT id FROM u) DELETE FROM t WHERE id IN (SELECT id FROM c)");
+	ExpectDmlVeto("DELETE FROM t WHERE lower(name) = 'x'");	 // a function the writer has no T-SQL for
+	// A DATE SQL Server's date cannot hold: the RPC encoder would wrap it
+	// ('infinity' lands on 1969-12-31).
+	ExpectDml("UPDATE t SET day = '2024-01-31' WHERE id = 1",
+			  "UPDATE [r1] SET [day] = @p0 FROM [dbo].[t] AS [r1] WHERE ([r1].[id] = @p1)");
+	ExpectDmlVeto("UPDATE t SET day = 'infinity' WHERE id = 1");
+	ExpectDmlVeto("DELETE FROM t WHERE day = '-infinity'");
+	ExpectDmlVeto("DELETE FROM t WHERE day < '50000-06-15'");
+	ExpectVeto("SELECT id FROM t WHERE day = 'infinity' LIMIT 1");
+	// Beyond numerics, bit and date, a column is copied only from one declared
+	// alike: the server converts between declarations its own way.
+	ExpectDml("UPDATE t SET ts = ts", "UPDATE [r1] SET [ts] = [r1].[ts] FROM [dbo].[t] AS [r1]");
+	ExpectDmlVeto("UPDATE t SET ts = CASE WHEN id = 1 THEN ts ELSE ts END");
+	ExpectDmlVeto("UPDATE t SET legacy = code");
+	// DuckDB's binder refuses these; the server's error must not replace it.
+	ExpectDmlVeto("UPDATE t SET id = max(id)");
+	ExpectDmlVeto("UPDATE t SET id = row_number() OVER ()");
+	ExpectDmlVeto("DELETE FROM t WHERE id = max(id)");
+
 	// Projections go through BuildReadExpression: a non-UTF-8 varchar is read
 	// through its NVARCHAR cast, as the catalog scan reads it.
 	ExpectSql("SELECT id, name FROM t LIMIT 5", "SELECT TOP (5) [id], [name] FROM [dbo].[t]");

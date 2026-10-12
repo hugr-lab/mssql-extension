@@ -78,6 +78,8 @@ int64_t LoadTestFailMetadataAfterRows(ClientContext &context);
 //! put into Error, as a desync would. 0 = off.
 int64_t LoadTestFailParseAfterTokens(ClientContext &context);
 //! Spec 080 D3: mssql_test_force_intersect_join_form (test only).
+//! Spec 080 D5: mssql_dml_pushdown (default true).
+bool LoadDmlPushdown(ClientContext &context);
 bool LoadTestForceIntersectJoinForm(ClientContext &context);
 
 //! Spec 076: pushed filter constants as sp_executesql parameters (default true).

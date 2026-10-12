@@ -149,7 +149,7 @@ check.
 
 ## UPDATE
 
-UPDATE runs on any table: keyed by its primary key or a usable unique index when it has one, and by all of its columns when it has neither (see [How UPDATE and DELETE reach the server](#how-update-and-delete-reach-the-server)).
+UPDATE runs on any table. When the whole statement can be written in T-SQL, SQL Server runs it as one statement; otherwise DuckDB selects the rows and the extension writes them back by the table's primary key, a usable unique index, or all of its columns (see [How UPDATE and DELETE reach the server](#how-update-and-delete-reach-the-server)).
 
 ### Basic UPDATE
 
@@ -175,7 +175,7 @@ WHERE id = 42;
 ### Limitations
 
 - **RETURNING** returns the rows as written (see [RETURNING](#update-and-delete--returning))
-- A SET of a rowid key column is refused (on a table with no key, any column may be SET)
+- A SET of a rowid key column goes when the statement is sent whole; when it is not, it is refused (on a table with no key, any column may be SET)
 - On Azure Synapse every UPDATE through the catalog is refused: its primary keys and unique constraints are `NOT ENFORCED`, so a key could match rows the statement did not select. Use `mssql_exec()`
 
 ## String comparisons and collation {#collation}
@@ -302,6 +302,67 @@ bulk-loaded (`geometry`, `geography`). A RETURNING statement costs a few round
 trips more than the same statement without it, even for one row.
 
 ## How UPDATE and DELETE reach the server
+
+### The whole statement on the server
+
+An UPDATE or DELETE whose WHERE and SET the extension can write in T-SQL is
+sent to SQL Server as **one statement**. The server selects the rows itself:
+no row crosses the wire, and no key is needed.
+
+```sql
+EXPLAIN UPDATE sqlserver.dbo.products SET price = price + 1 WHERE id <= 3;
+-- Mssql Dml
+--   Statement: UPDATE [r1] SET [price] = ([r1].[price] + @p0)
+--              FROM [dbo].[products] AS [r1] WHERE ([r1].[id] <= @p1)
+```
+
+What goes whole:
+
+- the WHERE, written as it is for a pushed SELECT. Comparisons, `IN`,
+  `BETWEEN`, `LIKE`, `IS NULL`, arithmetic, `CASE`, `COALESCE` and subqueries
+  all go. A condition is never sent in part: if any piece of it has no T-SQL
+  form, none of the statement does;
+- `UPDATE … FROM` another table of the same database, when the WHERE equates
+  that table's primary key (or unique index) with the target's columns. T-SQL
+  would otherwise update from an arbitrary one of several matching rows;
+- `DELETE … USING` tables of the same database;
+- a SET value that already has the column's type. For a number, a `bit` or a
+  `date` column that is another column of that type, arithmetic over such
+  columns, or a constant. For any other column -- strings, the date-time
+  types, binary -- it is a constant (a string must fit) or a column declared
+  exactly alike: SQL Server converts between, say, `datetime` and
+  `datetime2(6)` by rounding where DuckDB truncates.
+
+What stays with DuckDB, on the paths below:
+
+- `RETURNING`;
+- a function the extension has no T-SQL for, such as `lower`;
+- a SET value that DuckDB would convert. DuckDB rounds `SET int_col = 1.5`
+  to 2, where SQL Server would truncate it to 1;
+- a source table of another database, or a local one;
+- a statement inside a `WITH` (`WITH c AS (UPDATE …) SELECT …`);
+- a view as the target;
+- on Fabric Warehouse, any `FROM` / `USING` and any subquery. Fabric has no
+  `UPDATE … FROM`.
+
+A string comparison in the WHERE follows the column's collation, as a pushed
+SELECT's does (see [collation](#collation)).
+
+**What changes for a client.** The statement reaches DuckDB's executor as
+`SELECT * FROM mssql_dml(…)`:
+
+- its result is the same `Count` column;
+- it runs once and to the end, even when the client never reads the result;
+- `EXPLAIN` and `PREPARE` run nothing;
+- its statement *type* is SELECT, so a driver that branches on the statement
+  type rather than on the result sees a query;
+- an error is SQL Server's own.
+
+`SET mssql_dml_pushdown = false` sends every UPDATE / DELETE down the paths
+below. `mssql_remote_pushdown` / the ATTACH option `remote_pushdown false`
+turns this off together with SELECT pushdown.
+
+### When the statement is not sent whole
 
 DuckDB selects the rows (its WHERE, its joins); the extension sends what to
 change. How it says which rows depends on the table's key and the row count.

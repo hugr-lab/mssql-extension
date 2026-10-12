@@ -41,6 +41,12 @@ bool NamesScopeTable(QueryNode &node, const vector<string> &scope);
 bool MayRepeatOutputNames(const QueryNode &node);
 bool KeepsChildSelectLists(const QueryNode &node);
 bool IsSetOperationChild(const QueryNode &node, const unique_ptr<QueryNode> &slot);
+//! Spec 080 D1: whether a node (its CTEs and nested nodes, at any depth)
+//! holds a DML body -- `WITH c AS (UPDATE …) SELECT …`. The rewriter reaches
+//! such a body only inside the node around it, which the writer cannot render
+//! and which handed back as a subquery would put the DML in a subquery (a
+//! binder error): the node is neither pushed nor handed back.
+bool HoldsDmlCte(const QueryNode &node);
 
 }  // namespace mssql
 }  // namespace duckdb

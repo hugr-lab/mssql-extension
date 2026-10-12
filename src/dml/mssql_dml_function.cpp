@@ -298,6 +298,16 @@ void MSSQLDmlFunction(ClientContext &, TableFunctionInput &input, DataChunk &out
 	output.SetChildCardinality(1);
 }
 
+InsertionOrderPreservingMap<string> MSSQLDmlToString(TableFunctionToStringInput &input) {
+	InsertionOrderPreservingMap<string> result;
+	if (input.bind_data) {
+		auto &bind_data = input.bind_data->Cast<MSSQLDmlBindData>();
+		result["Database"] = bind_data.context_name;
+		result["Statement"] = bind_data.statement;
+	}
+	return result;
+}
+
 unique_ptr<NodeStatistics> MSSQLDmlCardinality(ClientContext &, const FunctionData *) {
 	return make_uniq<NodeStatistics>(1, 1);
 }
@@ -319,6 +329,7 @@ void RegisterMSSQLDmlFunction(ExtensionLoader &loader) {
 		f.GetSignature().AddKeywordOnly("target_schema", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 		f.GetSignature().AddKeywordOnly("target_table", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 		f.cardinality = MSSQLDmlCardinality;
+		f.to_string = MSSQLDmlToString;
 		// `SELECT * FROM mssql_dml(...)` reports a changed-row count, as the
 		// native DML it replaces does (bind_select.cpp's passthrough rule).
 		f.call_return_type = StatementReturnType::CHANGED_ROWS;

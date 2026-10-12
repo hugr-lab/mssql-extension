@@ -151,7 +151,11 @@ DML node back). It answers yes only when all of these hold:
     statement must be at the top level", `bind_cte_node.cpp:46`). So the
     dry run answers no for a SELECT / set operation / DML node whose CTEs (at
     any depth) hold a DML body, and the statement plans as today, its CTE's
-    DML on D3.
+    DML on D3. Measured in PR 3c, and worse than the hand-back: once a DML
+    node answers yes, a CTE body becomes a single remote, and a SELECT that
+    never reads it (`WITH c AS (UPDATE …) SELECT w FROM db.u …`) was written
+    without it -- the UPDATE silently never ran. `HoldsDmlCte` is what stops
+    it (the test disables it and the row keeps its value).
 
   An `EXPLAIN` wraps the statement and the DML inside is
   still pushed: `EXPLAIN` binds the vehicle without running it, and `EXPLAIN
@@ -209,6 +213,45 @@ No gain threshold applies. A DML either goes whole or plans as today.
 | `MERGE INTO t USING s ON … WHEN …` (both remote) | `MERGE [s].[t] AS [r1] USING … ON … WHEN …;` (D4) | same (GA) |
 | `MERGE INTO t USING <anything else> …` | not the rewriter's: `MSSQLOptimizer` stages the source in `#src` and sends `MERGE … USING #src` (D4) | same |
 | CTAS from remote to remote | our CREATE, then the pushed `INSERT … SELECT` (D6, the last PR) | same |
+
+**As built in PR 3c.**
+- **SQL Server.** A source joins the target as `CROSS JOIN`, with the
+  condition in WHERE: DuckDB's `FROM u WHERE …` is that.
+- **Fabric.** The single-table forms only. `DELETE … USING` through `WHERE
+  EXISTS`, and any subquery, are left to the staged path for now. The
+  single-table form names the target's columns bare, which a subquery's
+  tables could shadow.
+- **SET values.** A value must already have the column's DuckDB type, or be
+  a constant typed as the binder types it, or vetoed.
+  - That type names the server type only for numerics, `bit` and `date`.
+    Everywhere else -- strings, the datetime / time family, binary, geometry,
+    xml -- several server types share one DuckDB type and the server converts
+    between them its own way, so the value must be a constant or a column
+    declared alike (review: `datetime2(6) <- datetime` rounds `.007` to
+    `.006667` where DuckDB reads `.006666`).
+  - An aggregate or a window function in SET or WHERE is vetoed, so DuckDB's
+    binder error, not the server's, answers it.
+- **Dates.** A DATE constant SQL Server's `date` cannot hold (`'infinity'`,
+  years past 9999) is vetoed in the writer: the RPC parameter encoder wraps
+  it (`'infinity'` lands on 1969-12-31). The same encoder serves the scan's
+  filters and INSERT BULK, so `DELETE … WHERE d = 'infinity'` on the shipped
+  path deleted a 1969-12-31 row (measured): a pre-existing defect, outside
+  this PR, filed on its own.
+- **DELETE … USING.** Pushed whatever the USING tables' keys: a target row
+  several of their rows match is deleted once, by DuckDB and by the server
+  (the agreement suite's duplicate-USING shape). D1's "unless each target row
+  can match at most one source row" holds for UPDATE … FROM only.
+- **Agreement.** `test/sql/pushdown/remote_pushdown_dml_agreement.test` runs
+  21 shapes, Fabric's forms among them, through a pushing alias and a
+  `remote_pushdown false` one (generated from one list). Rows and counts
+  agree.
+- **Shipped-path tests.** The files and blocks about the shipped path set
+  `mssql_dml_pushdown = false`; otherwise they would quietly test the pushed
+  path, as the 2500-row "staged" UPDATE of `keyed_staged_dml.test` did. That
+  is 18 files, plus blocks of `transaction_single_connection_pool`,
+  `transaction_metadata_pinned`, `metadata_query_parameterized`,
+  `first_touch_round_trips` and `identifier_quoting`. DML that is incidental
+  to a test (transactions, visibility) keeps the default and runs pushed.
 
 ### The vehicles
 
