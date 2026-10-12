@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "tds/auth/krb5_test_function.hpp"
+#include "connection/mssql_settings.hpp"
 #include "mssql_function_docs.hpp"
 #include "tds/auth/auth_strategy_factory.hpp"
 
@@ -121,7 +122,9 @@ static std::string RunKrb5Test(tds::Krb5Config config) {
 //===----------------------------------------------------------------------===//
 // Krb5TestHost - mssql_kerberos_auth_test(host VARCHAR) -> VARCHAR
 //===----------------------------------------------------------------------===//
-static void Krb5TestHost(DataChunk &args, ExpressionState & /*state*/, Vector &result) {
+static void Krb5TestHost(DataChunk &args, ExpressionState &state, Vector &result) {
+	MSSQLRequireExternalAccess(state.GetContext(), "mssql_kerberos_auth_test",
+							   "asks the Kerberos KDC for a service ticket");
 	auto &host_vec = args.data[0];
 	UnaryExecutor::Execute<string_t, string_t>(host_vec, result, args.size(), [&](string_t host) {
 		std::string h = host.GetString();
@@ -137,7 +140,9 @@ static void Krb5TestHost(DataChunk &args, ExpressionState & /*state*/, Vector &r
 //===----------------------------------------------------------------------===//
 // Krb5TestHostPort - mssql_kerberos_auth_test(host VARCHAR, port INTEGER) -> VARCHAR
 //===----------------------------------------------------------------------===//
-static void Krb5TestHostPort(DataChunk &args, ExpressionState & /*state*/, Vector &result) {
+static void Krb5TestHostPort(DataChunk &args, ExpressionState &state, Vector &result) {
+	MSSQLRequireExternalAccess(state.GetContext(), "mssql_kerberos_auth_test",
+							   "asks the Kerberos KDC for a service ticket");
 	auto &host_vec = args.data[0];
 	auto &port_vec = args.data[1];
 	BinaryExecutor::Execute<string_t, int32_t, string_t>(
@@ -159,6 +164,8 @@ static void Krb5TestHostPort(DataChunk &args, ExpressionState & /*state*/, Vecto
 // the MSSQL secret. Exercises the same Krb5Config that ATTACH would build.
 //===----------------------------------------------------------------------===//
 static void Krb5TestSecret(DataChunk &args, ExpressionState &state, Vector &result) {
+	MSSQLRequireExternalAccess(state.GetContext(), "mssql_kerberos_auth_test_secret",
+							   "asks the Kerberos KDC for a service ticket");
 	auto &secret_vec = args.data[0];
 	UnaryExecutor::Execute<string_t, string_t>(secret_vec, result, args.size(), [&](string_t secret_name) {
 		auto &context = state.GetContext();

@@ -28,6 +28,12 @@ on:
       # Spec 080 PR 3b: the at-least-once gate of mssql_dml runs here, the one
       # job with a build tree to link a live C++ test against.
       - 'test/cpp/test_dml_vehicle.cpp'
+      # Issue #456: the dead-connection test runs the TDS / TLS read path.
+      - 'test/cpp/test_dead_connection.cpp'
+      - 'src/tds/**'
+      - 'src/include/tds/**'
+      - 'src/query/mssql_simple_query.cpp'
+      - 'src/query/mssql_result_stream.cpp'
       - 'src/dml/**'
       - 'src/include/dml/**'
       # The gate checks DuckDB's behaviour: a pin bump runs it too.
@@ -255,6 +261,11 @@ jobs:
       # runs (ResultEagerness::FORCED), as a native UPDATE does.
       - name: Run the mssql_dml at-least-once test (spec 080)
         run: make test-dml-vehicle
+
+      # Issue #456: a pushed DML whose connection dies mid-statement fails in
+      # seconds, over TLS and plain TCP (a loopback proxy cut mid-WAITFOR).
+      - name: Run the dead-connection test (issue #456)
+        run: make test-dead-connection
 
       # The self-contained rowid files under the DEBUG build (issue #369): the
       # scan's copy of a projected key column into the rowid slot asserted on

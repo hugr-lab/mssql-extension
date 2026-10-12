@@ -148,4 +148,16 @@ bool LoadCTASUseBCP(ClientContext &context);
 // Load whether mssql_exec() DDL auto-invalidates the catalog cache (issue #151)
 bool LoadExecInvalidateCache(ClientContext &context);
 
+//===----------------------------------------------------------------------===//
+// External access (issue #452)
+//===----------------------------------------------------------------------===//
+
+// Refuse `what`, naming what it `reaches`, while DuckDB's enable_external_access
+// is false: ATTACH opens a connection to SQL Server, the *_auth_test functions
+// ask Azure AD or a KDC for a token. A catalog attached while access was
+// allowed keeps working -- its scans, mssql_exec, pool refills -- as DuckDB
+// keeps a database attached before access was disabled
+// (EnableExternalAccessSetting::OnSet adds its path to allowed_paths).
+void MSSQLRequireExternalAccess(ClientContext &context, const string &what, const string &reaches);
+
 }  // namespace duckdb

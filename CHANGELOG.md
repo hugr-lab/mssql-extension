@@ -387,6 +387,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - COPY TO always commits on its own. `mssql_exec()` does too, unless it is
     called inside a statement that has joined its catalog.
 
+- **Breaking: `enable_external_access = false` is honoured** (#452). A new
+  `ATTACH … (TYPE mssql)` is refused by name, `lazy_validation` included, and
+  so are `mssql_azure_auth_test`, `mssql_kerberos_auth_test(_secret)` and
+  `mssql_winsspi_auth_test(_spn)`. Until now all of them reached SQL Server,
+  Azure AD or a KDC with the setting off. A session that disables external
+  access and then attaches must attach first. An MSSQL database attached before
+  external access was disabled keeps working: scans, `mssql_exec`, DML, CTAS
+  and new pool connections. DuckDB keeps its own attached databases the same
+  way. COPY TO into it is refused by DuckDB's own check on the COPY target (a
+  path); `INSERT … SELECT` takes the same bulk wire.
+
 - **UPDATE and DELETE through the catalog are refused on Azure Synapse**
   (spec 080): its primary keys and unique constraints are `NOT ENFORCED`, so a
   key could match rows the statement did not select. `mssql_exec()` still
@@ -479,6 +490,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     or whether the outcome is unknown (no answer).
   - The `COMMIT` round trip no longer holds the lock every statement on the
     catalog takes to start its transaction.
+
+- **A pushed DML whose connection died spun at 100% CPU until Ctrl-C** (#456,
+  a regression from #450). A pushed UPDATE / DELETE / INSERT … SELECT waits
+  with no deadline, in 1-second read slices, and keeps going while the socket
+  says it is connected.
+  - Under TLS (the default) a closed peer came back as a timeout, and a TLS
+    read error left the socket "connected". A server restart, a `KILL`, a
+    failover, a network cut or a keepalive expiry during such a statement left
+    it reading again at once, forever.
+  - It was worse than a stale code: recv() returning 0 at end of stream does
+    not set errno, so the EAGAIN of the previous timed-out slice made the EOF
+    read as one more timeout.
+  - Every TLS read error and a closed peer now mark the connection dead, and
+    so does a TDS frame shorter than its header. The statement fails in about
+    a second and names the cause.
+  - A cancelled stream draining a dead connection stops at once instead of
+    retrying for its 5 s.
 
 - **An INSERT that cannot use the bulk path counted its last batch as 0
   rows.** This is an INSERT naming the identity column, with a geometry, CLR

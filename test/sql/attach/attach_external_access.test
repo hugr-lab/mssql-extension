@@ -1,0 +1,94 @@
+# name: test/sql/attach/attach_external_access.test
+# description: Issue #452 -- with enable_external_access = false a catalog
+#              attached BEFORE the SET keeps working and keeps opening
+#              connections, as DuckDB keeps a database attached before
+#              (EnableExternalAccessSetting::OnSet), while a new ATTACH of the
+#              same reachable server is refused. The refusals without a
+#              server: attach_external_access_refused.test. The setting cannot
+#              be turned back on, so everything after the SET runs with it off.
+# group: [attach]
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# No pooling: every statement below dials, so the catalog attached before the
+# SET is seen opening NEW connections after it, not only reusing one.
+statement ok
+SET mssql_connection_cache = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS eabefore (TYPE mssql);
+
+statement ok
+CREATE TABLE created_before AS SELECT connections_created AS n FROM mssql_pool_stats('eabefore');
+
+statement ok
+SET enable_external_access = false;
+
+statement error
+ATTACH '{MSSQL_TESTDB_DSN}' AS eaafter (TYPE mssql);
+----
+<REGEX>:.*Permission Error: MSSQL: ATTACH of 'eaafter' \(TYPE mssql\) is refused: it connects to SQL Server, and external access is disabled \(enable_external_access = false\).*
+
+# The catalog attached before the SET: a raw scan, mssql_exec, a catalog read
+# and an UPDATE.
+query I
+SELECT one FROM mssql_scan('eabefore', 'SELECT 1 AS one');
+----
+1
+
+statement ok
+SELECT mssql_exec('eabefore', 'DROP TABLE IF EXISTS dbo.AttachExternalAccess; DROP TABLE IF EXISTS dbo.AttachExternalAccessCtas; CREATE TABLE dbo.AttachExternalAccess (id int PRIMARY KEY, v int); INSERT INTO dbo.AttachExternalAccess VALUES (1, 10), (2, 20)');
+
+query II
+SELECT id, v FROM eabefore.dbo.AttachExternalAccess ORDER BY id;
+----
+1	10
+2	20
+
+statement ok
+UPDATE eabefore.dbo.AttachExternalAccess SET v = v + 1;
+
+query I
+SELECT sum(v) FROM eabefore.dbo.AttachExternalAccess;
+----
+32
+
+# COPY TO is refused by DuckDB itself, before the bcp copy function runs: its
+# target is a path, and DuckDB checks every COPY target against the file
+# system's access rules (USE_TMP_FILE false does not avoid it). INSERT ...
+# SELECT takes the same INSERT BULK past mssql_insert_bcp_threshold, and a
+# CTAS loads the same way.
+statement error
+COPY (SELECT range::INT AS id, 1 AS v FROM range(3, 6)) TO 'eabefore.dbo.AttachExternalAccess' (FORMAT 'bcp');
+----
+<REGEX>:.*Permission Error: Cannot access file "eabefore.dbo.AttachExternalAccess" - file system operations are disabled by configuration.*
+
+statement error
+COPY (SELECT range::INT AS id, 1 AS v FROM range(3, 6)) TO 'mssql://eabefore/dbo/AttachExternalAccess' (FORMAT 'bcp');
+----
+<REGEX>:.*Permission Error: Cannot access file.*disabled by configuration.*
+
+statement ok
+INSERT INTO eabefore.dbo.AttachExternalAccess SELECT range::INT, 1 FROM range(3, 5003);
+
+statement ok
+CREATE TABLE eabefore.dbo.AttachExternalAccessCtas AS SELECT * FROM eabefore.dbo.AttachExternalAccess;
+
+query II
+SELECT count(*), sum(v) FROM eabefore.dbo.AttachExternalAccessCtas;
+----
+5002	5032
+
+# Every statement above dialled a new connection (no pooling).
+query I
+SELECT p.connections_created > b.n FROM mssql_pool_stats('eabefore') p, created_before b;
+----
+true
+
+statement ok
+SELECT mssql_exec('eabefore', 'DROP TABLE dbo.AttachExternalAccess; DROP TABLE dbo.AttachExternalAccessCtas');
+
+statement ok
+DETACH eabefore;

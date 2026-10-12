@@ -313,6 +313,25 @@ ATTACH 'Server=...' AS db (TYPE mssql, lazy_validation true);
 
 With `lazy_validation true`, ATTACH succeeds without the TCP+LOGIN7 round trip; the first query then pays the connection-establishment cost (pre-spec-047 behaviour). The eager-validation ceiling is bounded by `mssql_attach_validation_timeout` (default `0` inherits `mssql_connection_timeout`).
 
+### External access (`enable_external_access`)
+
+An MSSQL database is attached the way DuckDB attaches any database it reaches over the network. After `SET enable_external_access = false`, a new `ATTACH ... (TYPE mssql)` is refused by name, `lazy_validation` included. So are `mssql_azure_auth_test`, and `mssql_kerberos_auth_test(_secret)` / `mssql_winsspi_auth_test(_spn)` in builds with Kerberos / SSPI support; they ask Azure AD or a KDC for a token. (With external access disabled at startup, DuckDB does not load a loadable extension at all.)
+
+```sql
+SET enable_external_access = false;
+ATTACH 'Server=...' AS db (TYPE mssql);
+-- Permission Error: MSSQL: ATTACH of 'db' (TYPE mssql) is refused: it connects to SQL Server,
+-- and external access is disabled (enable_external_access = false). ...
+```
+
+A database attached **before** external access was disabled stays usable. Its catalog, `mssql_scan`, `mssql_exec`, DML and CTAS keep working, and its pool keeps opening connections. For an Azure AD catalog that includes new tokens, acquired through the secret the ATTACH named and read again by that name, so replacing that secret changes how they are acquired. This is the same rule DuckDB applies to its own attached databases. The exception is `COPY … TO 'db.schema.table' (FORMAT 'bcp')`: DuckDB itself refuses it ("Cannot access file … disabled by configuration") before the extension sees it, because a COPY target is a path. `INSERT INTO db.schema.table SELECT …` takes the same `INSERT BULK` wire past `mssql_insert_bcp_threshold` rows. So the lock-down pattern is to attach what the session needs, then disable external access:
+
+```sql
+ATTACH 'Server=...' AS db (TYPE mssql);
+SET enable_external_access = false;
+SET lock_configuration = true;
+```
+
 ### ATTACH Options Reference
 
 In addition to options propagated from the secret / connection string, the following ATTACH options are accepted directly:
