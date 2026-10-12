@@ -13,9 +13,12 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <mstcpip.h>  // SIO_KEEPALIVE_VALS
 #include <winsock2.h>
 #include <ws2tcpip.h>
+// After winsock2.h, which defines the types it uses -- its own block, so the
+// formatter's include sorting cannot move it first (it did: MinGW then knew no
+// u_long, MSVC no SOCKET_DEFAULT2_QM_POLICY).
+#include <mstcpip.h>  // SIO_KEEPALIVE_VALS
 #pragma comment(lib, "ws2_32.lib")
 #define CLOSE_SOCKET closesocket
 #define SOCKET_ERROR_CODE WSAGetLastError()
