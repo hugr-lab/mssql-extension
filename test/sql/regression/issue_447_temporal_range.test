@@ -1,0 +1,213 @@
+# name: test/sql/regression/issue_447_temporal_range.test
+# description: Issue #447 -- a DATE / TIMESTAMP outside SQL Server's 0001-01-01..9999-12-31 ('infinity', a year past 9999) is never wrapped into another date: a filter with one runs in DuckDB, a load refuses it by name
+# group: [mssql]
+# issue: 447
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The wire's three-byte day count kept the low bytes of whatever it was given:
+# 'infinity' became 1969-12-31, '-infinity' 1970-01-02, a year near 50000 a year
+# near 4066. Measured before the fix: DELETE ... WHERE d = 'infinity' deleted
+# the 1969-12-31 row.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS i447 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('i447', 'DROP TABLE IF EXISTS dbo.i447_t; CREATE TABLE dbo.i447_t (id int PRIMARY KEY, d date NULL, ts datetime2(7) NULL, tz datetimeoffset(7) NULL, ts4 datetime2(4) NULL, t6 time(6) NULL, tt tinyint NULL); INSERT INTO dbo.i447_t (id, d, ts, tz, t6) VALUES (1, ''1969-12-31'', ''1969-12-31 00:00:00'', ''1969-12-31 00:00:00 +00:00'', ''23:59:59.999999''), (2, ''1970-01-02'', ''1970-01-02 00:00:00'', ''1970-01-02 00:00:00 +00:00'', ''12:00:00''), (3, ''4066-01-01'', ''2262-04-11 23:47:16.8547758'', NULL, NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('i447');
+
+# --- a filter with such a constant is DuckDB's: no stored date equals it, and
+# every stored date is before / after it -----------------------------------
+
+query I
+SELECT count(*) FROM i447.dbo.i447_t WHERE d = 'infinity';
+----
+0
+
+query I
+SELECT count(*) FROM i447.dbo.i447_t WHERE d < 'infinity';
+----
+3
+
+query I
+SELECT count(*) FROM i447.dbo.i447_t WHERE d > '-infinity';
+----
+3
+
+query I
+SELECT count(*) FROM i447.dbo.i447_t WHERE d = '-infinity';
+----
+0
+
+query I
+SELECT count(*) FROM i447.dbo.i447_t WHERE d < '50000-06-15';
+----
+3
+
+# 'infinity' wrapped to 1969-12-31: the IN would have matched two rows
+query I
+SELECT count(*) FROM i447.dbo.i447_t WHERE d IN (DATE 'infinity', DATE '1970-01-02');
+----
+1
+
+# datetime2(7) reads as TIMESTAMP_NS, where 'infinity' was sent as
+# 2262-04-11 23:47:16.8547758 -- row 3's value
+query I
+SELECT count(*) FROM i447.dbo.i447_t WHERE ts = TIMESTAMP 'infinity';
+----
+0
+
+query I
+SELECT count(*) FROM i447.dbo.i447_t WHERE ts > TIMESTAMP '-infinity';
+----
+3
+
+query I
+SELECT count(*) FROM i447.dbo.i447_t WHERE ts < TIMESTAMP 'infinity';
+----
+3
+
+query I
+SELECT count(*) FROM i447.dbo.i447_t WHERE tz = TIMESTAMPTZ 'infinity';
+----
+0
+
+# TIME '24:00:00' is DuckDB's, not SQL Server's: it was sent as 23:59:59.999999
+query I
+SELECT count(*) FROM i447.dbo.i447_t WHERE t6 = TIME '24:00:00';
+----
+0
+
+query I
+SELECT count(*) FROM i447.dbo.i447_t WHERE t6 < TIME '24:00:00';
+----
+2
+
+# a rowid equality on a date key: no row, DuckDB's answer (it used to fail
+# at init, the encoder refusing the parameter)
+statement ok
+SELECT mssql_exec('i447', 'DROP TABLE IF EXISTS dbo.i447_k; CREATE TABLE dbo.i447_k (k date PRIMARY KEY, v int NULL); INSERT INTO dbo.i447_k VALUES (''1969-12-31'', 1)');
+
+statement ok
+SELECT mssql_invalidate_cache('i447');
+
+query I
+SELECT count(*) FROM i447.dbo.i447_k WHERE rowid = DATE 'infinity';
+----
+0
+
+query I
+SELECT count(*) FROM i447.dbo.i447_k WHERE rowid = DATE '1969-12-31';
+----
+1
+
+statement ok
+SELECT mssql_exec('i447', 'DROP TABLE dbo.i447_k');
+
+# the measured defect: nothing is deleted
+query I
+DELETE FROM i447.dbo.i447_t WHERE d = 'infinity';
+----
+0
+
+query I
+SELECT count(*) FROM i447.dbo.i447_t;
+----
+3
+
+# --- a load refuses such a value by name: INSERT BULK (past
+# mssql_insert_bcp_threshold), atomically --------------------------------------
+
+statement error
+INSERT INTO i447.dbo.i447_t (id, d) SELECT 1000 + i, CASE WHEN i = 1500 THEN DATE 'infinity' ELSE DATE '2024-01-01' END FROM range(2000) r(i);
+----
+dated infinity is outside SQL Server's range (0001-01-01 to 9999-12-31) and cannot be sent: the wire would turn it into another date (column d)
+
+statement error
+INSERT INTO i447.dbo.i447_t (id, ts) SELECT 1000 + i, CASE WHEN i = 1500 THEN TIMESTAMP '-infinity' ELSE TIMESTAMP '2024-01-01' END FROM range(2000) r(i);
+----
+outside SQL Server's range
+
+statement error
+INSERT INTO i447.dbo.i447_t (id, d) SELECT 1000 + i, CASE WHEN i = 7 THEN DATE '50000-06-15' ELSE DATE '2024-01-01' END FROM range(2000) r(i);
+----
+outside SQL Server's range
+
+# the row path (a tinyint column keeps the chunk off the columnar kernels),
+# the datetimeoffset kernel, a value that rounds past 9999-12-31 at the
+# column's scale, and TIME '24:00:00'
+statement error
+INSERT INTO i447.dbo.i447_t (id, tt, d) SELECT 1000 + i, 7::TINYINT, CASE WHEN i = 1500 THEN DATE 'infinity' ELSE DATE '2024-01-01' END FROM range(2000) r(i);
+----
+outside SQL Server's range
+
+statement error
+INSERT INTO i447.dbo.i447_t (id, tz) SELECT 1000 + i, CASE WHEN i = 1500 THEN TIMESTAMPTZ 'infinity' ELSE TIMESTAMPTZ '2024-01-01 00:00:00+00' END FROM range(2000) r(i);
+----
+outside SQL Server's range
+
+statement error
+INSERT INTO i447.dbo.i447_t (id, ts4) SELECT 1000 + i, CASE WHEN i = 3 THEN TIMESTAMP '9999-12-31 23:59:59.99999' ELSE TIMESTAMP '2024-01-01' END FROM range(2000) r(i);
+----
+rounds past 9999-12-31
+
+statement error
+INSERT INTO i447.dbo.i447_t (id, t6) SELECT 1000 + i, CASE WHEN i = 3 THEN TIME '24:00:00' ELSE TIME '10:00:00' END FROM range(2000) r(i);
+----
+TIME '24:00:00'
+
+query I
+SELECT count(*) FROM i447.dbo.i447_t;
+----
+3
+
+# as statements (under the threshold) the value is a literal: refused by name
+# too, not left to the server's error 241
+statement error
+INSERT INTO i447.dbo.i447_t (id, d) VALUES (900, DATE 'infinity');
+----
+outside SQL Server's range
+
+statement error
+INSERT INTO i447.dbo.i447_t (id, t6) VALUES (902, TIME '24:00:00');
+----
+TIME '24:00:00'
+
+# a TIMESTAMP literal is rendered through the same day split: it was the
+# datetime2(7) literal '2262-04-11T23:47:16.8547758', which the server took
+statement error
+INSERT INTO i447.dbo.i447_t (id, ts) VALUES (901, TIMESTAMP 'infinity');
+----
+outside SQL Server's range
+
+query I
+SELECT count(*) FROM i447.dbo.i447_t;
+----
+3
+
+# a date that fits still loads
+query I
+INSERT INTO i447.dbo.i447_t (id, d) SELECT 1000 + i, DATE '9999-12-31' FROM range(2000) r(i);
+----
+2000
+
+# --- a parameter of one is refused the same way --------------------------------
+
+statement error
+SELECT * FROM mssql_scan_params('i447', 'SELECT count(*) AS c FROM dbo.i447_t WHERE d = @d', {'d': DATE 'infinity'});
+----
+outside SQL Server's range
+
+statement ok
+SELECT mssql_exec('i447', 'DROP TABLE dbo.i447_t');
+
+statement ok
+DETACH i447;

@@ -51,6 +51,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "codec/datetime_codec.hpp"
+#include "duckdb/common/error_data.hpp"
 
 #include "codec/scatter_position.hpp"
 
@@ -194,14 +195,16 @@ void ComputeDatetime2Components(int64_t raw_ticks, LogicalTypeId source_type, ui
 	int64_t source_per_sec = TicksPerSecondFor(source_type);
 	int64_t source_per_day = source_per_sec * SECONDS_PER_DAY;
 
-	int64_t days, sub_day_ticks;
-	if (raw_ticks >= 0) {
-		days = raw_ticks / source_per_day;
-		sub_day_ticks = raw_ticks % source_per_day;
-	} else {
-		days = (raw_ticks - source_per_day + 1) / source_per_day;
-		sub_day_ticks = raw_ticks - days * source_per_day;
+	// Floor division that cannot overflow: `raw - per_day + 1` wrapped for
+	// -infinity (-INT64_MAX) in TIMESTAMP_NS into a day of 2262 (issue #447).
+	tds::encoding::BCPRowEncoder::RequireFiniteTimestamp(raw_ticks);
+	int64_t days = raw_ticks / source_per_day;
+	int64_t sub_day_ticks = raw_ticks % source_per_day;
+	if (sub_day_ticks < 0) {
+		sub_day_ticks += source_per_day;
+		days -= 1;
 	}
+	tds::encoding::BCPRowEncoder::RequireServerDay(days);
 	date_value = static_cast<uint32_t>(days + DAYS_FROM_0001_TO_EPOCH);
 
 	int64_t target_per_sec = Pow10(target_scale);
@@ -235,6 +238,10 @@ void ComputeDatetime2Components(int64_t raw_ticks, LogicalTypeId source_type, ui
 	int64_t scaled = (sub_day_ticks + divisor / 2) / divisor;
 	const int64_t target_per_day = target_per_sec * SECONDS_PER_DAY;
 	if (scaled >= target_per_day) {
+		// 9999-12-31 rounded past its last tick: no next day to carry into.
+		if (days + 1 > tds::encoding::BCPRowEncoder::SERVER_MAX_EPOCH_DAY) {
+			tds::encoding::BCPRowEncoder::ThrowRoundsPastServerRange();
+		}
 		scaled = 0;
 		date_value += 1;
 	}
@@ -276,15 +283,15 @@ void ScatterDt2(POS pos, bool all_valid, idx_t row_begin, idx_t rows, const Unif
 			continue;
 		}
 		const int64_t raw = src[idx];
-		int64_t days;
-		int64_t sub;
-		if (raw >= 0) {
-			days = raw / per_day;
-			sub = raw % per_day;
-		} else {
-			days = (raw - per_day + 1) / per_day;
-			sub = raw - days * per_day;
+		tds::encoding::BCPRowEncoder::RequireFiniteTimestamp(raw);
+		// Floor division that cannot overflow (see ComputeDatetime2Components).
+		int64_t days = raw / per_day;
+		int64_t sub = raw % per_day;
+		if (sub < 0) {
+			sub += per_day;
+			days -= 1;
 		}
+		tds::encoding::BCPRowEncoder::RequireServerDay(days);
 		uint32_t date_value = static_cast<uint32_t>(days + DAYS_FROM_0001_TO_EPOCH);
 		// Narrowing ROUNDS, matching SQL Server, and a round that reaches the end
 		// of the day carries into the date — see ComputeDatetime2Components for
@@ -297,6 +304,9 @@ void ScatterDt2(POS pos, bool all_valid, idx_t row_begin, idx_t rows, const Unif
 		} else {
 			int64_t scaled = (sub + half) / factor;
 			if (scaled >= per_day_target) {
+				if (days + 1 > tds::encoding::BCPRowEncoder::SERVER_MAX_EPOCH_DAY) {
+					tds::encoding::BCPRowEncoder::ThrowRoundsPastServerRange();
+				}
 				scaled = 0;
 				date_value += 1;
 			}
@@ -339,6 +349,7 @@ void ScatterTime(POS pos, bool all_valid, idx_t row_begin, idx_t rows, const Uni
 			continue;
 		}
 		const int64_t micros = src[idx];
+		tds::encoding::BCPRowEncoder::RequireServerTime(micros);
 		uint64_t ticks =
 			UPSCALE ? static_cast<uint64_t>(micros * factor) : static_cast<uint64_t>((micros + half) / factor);
 		// Rounding at the last tick of the day has nowhere to carry — a TIME has
@@ -378,15 +389,15 @@ void ScatterDtOffset(POS pos, bool all_valid, idx_t row_begin, idx_t rows, const
 			continue;
 		}
 		const int64_t raw = src[idx];
-		int64_t days;
-		int64_t sub;
-		if (raw >= 0) {
-			days = raw / per_day;
-			sub = raw % per_day;
-		} else {
-			days = (raw - per_day + 1) / per_day;
-			sub = raw - days * per_day;
+		tds::encoding::BCPRowEncoder::RequireFiniteTimestamp(raw);
+		// Floor division that cannot overflow (see ComputeDatetime2Components).
+		int64_t days = raw / per_day;
+		int64_t sub = raw % per_day;
+		if (sub < 0) {
+			sub += per_day;
+			days -= 1;
 		}
+		tds::encoding::BCPRowEncoder::RequireServerDay(days);
 		uint32_t date_value = static_cast<uint32_t>(days + DAYS_FROM_0001_TO_EPOCH);
 		uint64_t time_value;
 		if (UPSCALE) {
@@ -394,6 +405,9 @@ void ScatterDtOffset(POS pos, bool all_valid, idx_t row_begin, idx_t rows, const
 		} else {
 			int64_t scaled = (sub + half) / factor;
 			if (scaled >= per_day_target) {
+				if (days + 1 > tds::encoding::BCPRowEncoder::SERVER_MAX_EPOCH_DAY) {
+					tds::encoding::BCPRowEncoder::ThrowRoundsPastServerRange();
+				}
 				scaled = 0;
 				date_value += 1;
 			}
@@ -420,6 +434,7 @@ void ScatterDate(POS pos, bool all_valid, idx_t row_begin, idx_t rows, const Uni
 			pos.Advance(r, 1);
 			continue;
 		}
+		tds::encoding::BCPRowEncoder::RequireServerDay(src[idx]);
 		const uint32_t days = static_cast<uint32_t>(src[idx] + DAYS_FROM_0001_TO_EPOCH);
 		out[0] = 3;
 		std::memcpy(out + 1, &days, 3);
@@ -449,6 +464,7 @@ void ScatterDateAsDt2(POS pos, bool all_valid, idx_t row_begin, idx_t rows, cons
 			pos.Advance(r, 1);
 			continue;
 		}
+		tds::encoding::BCPRowEncoder::RequireServerDay(src[idx]);
 		const uint32_t days = static_cast<uint32_t>(src[idx] + DAYS_FROM_0001_TO_EPOCH);
 		out[0] = TIMESIZE + 3;
 		std::memset(out + 1, 0, TIMESIZE);
@@ -620,15 +636,35 @@ static void ScatterChunkPos(POS pos, bool all_valid, idx_t row_begin, idx_t rows
 #undef MSSQL_DT2_ARM
 }
 
+// Issue #447: a value the server cannot hold is refused by the encoders,
+// which know the value but not the column; the column (or parameter) is
+// named here, where a wide COPY needs it.
+[[noreturn]] static void ThrowNamingColumn(const InvalidInputException &ex, const mssql::BCPColumnMetadata &col) {
+	ErrorData error(ex);
+	if (col.name.empty()) {
+		throw InvalidInputException(error.RawMessage());
+	}
+	throw InvalidInputException("%s (%s %s)", error.RawMessage(), col.name[0] == '@' ? "parameter" : "column",
+								col.name);
+}
+
 void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector &in,
 						 const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col) {
 	// Strided implies all-valid: a NULL would have made the rows differ in length.
-	ScatterChunkPos(StridePos{dst, stride}, /*all_valid=*/true, row_begin, rows, in, fmt, col);
+	try {
+		ScatterChunkPos(StridePos{dst, stride}, /*all_valid=*/true, row_begin, rows, in, fmt, col);
+	} catch (const InvalidInputException &ex) {
+		ThrowNamingColumn(ex, col);
+	}
 }
 
 void ScatterChunkCursor(uint8_t *dst, size_t *cursor, idx_t row_begin, idx_t rows, Vector &in,
 						const UnifiedVectorFormat &fmt, const mssql::BCPColumnMetadata &col, bool all_valid) {
-	ScatterChunkPos(CursorPos{dst, cursor, row_begin}, all_valid, row_begin, rows, in, fmt, col);
+	try {
+		ScatterChunkPos(CursorPos{dst, cursor, row_begin}, all_valid, row_begin, rows, in, fmt, col);
+	} catch (const InvalidInputException &ex) {
+		ThrowNamingColumn(ex, col);
+	}
 }
 
 //===----------------------------------------------------------------------===//
@@ -896,8 +932,8 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 // EncodeToBcp — Vector overload
 //===----------------------------------------------------------------------===//
 
-void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
-				 duckdb::vector<uint8_t> &buf) {
+static void EncodeToBcpUnnamed(Vector &in, const UnifiedVectorFormat &fmt, idx_t row,
+							   const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
 	// The raw int64 in the vector is counted in the SOURCE type's unit; the wire
 	// form and its scale come from the target column. Those are two different
 	// types and only coincide when the column metadata was built from the source
@@ -924,7 +960,9 @@ void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const ms
 			// nothing for ComputeDatetime2Components to do (it would also throw,
 			// having no ticks-per-second for a DATE).
 			time_value = 0;
-			date_value = static_cast<uint32_t>(FormatValue<date_t>(fmt, row).days + DAYS_FROM_0001_TO_EPOCH);
+			const auto day = FormatValue<date_t>(fmt, row).days;
+			tds::encoding::BCPRowEncoder::RequireServerDay(day);
+			date_value = static_cast<uint32_t>(day + DAYS_FROM_0001_TO_EPOCH);
 			tds::encoding::BCPRowEncoder::EncodeDatetime2Raw(buf, time_value, date_value, col.scale);
 			return;
 		}
@@ -948,6 +986,48 @@ void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const ms
 	}
 }
 
+bool ServerHoldsTemporal(const Value &value) {
+	if (value.IsNull()) {
+		return true;
+	}
+	using tds::encoding::BCPRowEncoder;
+	int64_t day;
+	switch (value.type().id()) {
+	case LogicalTypeId::DATE:
+		day = DateValue::Get(value).days;
+		break;
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		const int64_t raw = TimestampValue::Get(value).value;
+		if (raw == NumericLimits<int64_t>::Maximum() || raw == -NumericLimits<int64_t>::Maximum()) {
+			return false;
+		}
+		const int64_t per_day = TicksPerSecondFor(value.type().id()) * SECONDS_PER_DAY;
+		day = raw / per_day - (raw % per_day < 0 ? 1 : 0);
+		break;
+	}
+	case LogicalTypeId::TIME: {
+		const int64_t micros = TimeValue::Get(value).value;
+		return micros >= 0 && micros < BCPRowEncoder::MICROS_PER_SERVER_DAY;
+	}
+	default:
+		return true;
+	}
+	return day >= BCPRowEncoder::SERVER_MIN_EPOCH_DAY && day <= BCPRowEncoder::SERVER_MAX_EPOCH_DAY;
+}
+
+void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const mssql::BCPColumnMetadata &col,
+				 duckdb::vector<uint8_t> &buf) {
+	try {
+		EncodeToBcpUnnamed(in, fmt, row, col, buf);
+	} catch (const InvalidInputException &ex) {
+		ThrowNamingColumn(ex, col);
+	}
+}
+
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
 	EncodeToBcpViaFormat(EncodeToBcp, in, row, col, buf);
 }
@@ -956,7 +1036,19 @@ void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duc
 // EncodeToBcp — Value overload
 //===----------------------------------------------------------------------===//
 
+static void EncodeValueToBcpUnnamed(const Value &value, const mssql::BCPColumnMetadata &col,
+									duckdb::vector<uint8_t> &buf);
+
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf) {
+	try {
+		EncodeValueToBcpUnnamed(value, col, buf);
+	} catch (const InvalidInputException &ex) {
+		ThrowNamingColumn(ex, col);
+	}
+}
+
+static void EncodeValueToBcpUnnamed(const Value &value, const mssql::BCPColumnMetadata &col,
+									duckdb::vector<uint8_t> &buf) {
 	// Use the *Value::Get extractors instead of Value::GetValue<T>() —
 	// the latter invokes DuckDB cast operators that fail for TIMESTAMP_TZ
 	// (no TIMESTAMP_TZ→TIMESTAMP cast is registered in some builds). The
@@ -1032,8 +1124,12 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 	}
 	switch (type.id()) {
 	case LogicalTypeId::DATE:
+		// Issue #447: refused by name here too, not left to the server's 241
+		// (and a non-finite date_t never reaches Date::Convert).
+		tds::encoding::BCPRowEncoder::RequireServerDay(DateValue::Get(v).days);
 		return "'" + FormatDateText(DateValue::Get(v)) + "'";
 	case LogicalTypeId::TIME:
+		tds::encoding::BCPRowEncoder::RequireServerTime(TimeValue::Get(v).value);
 		return "'" + FormatTimeText(TimeValue::Get(v)) + "'";
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_MS:

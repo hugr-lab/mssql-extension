@@ -1180,9 +1180,37 @@ void BCPRowEncoder::EncodeGUID(vector<uint8_t> &buffer, const hugeint_t &uuid) {
 // Date/Time Types
 //===----------------------------------------------------------------------===//
 
+void BCPRowEncoder::ThrowOutsideServerRange(int64_t epoch_day) {
+	// A day count past date_t's range (a timestamp's 'infinity' divided into
+	// days) is still rendered as a year here, which is what the user needs.
+	const string date = epoch_day == date_t::infinity().days			? "infinity"
+						: epoch_day == date_t::ninfinity().days			? "-infinity"
+						: epoch_day > NumericLimits<int32_t>::Maximum() ? "after 9999-12-31"
+						: epoch_day < NumericLimits<int32_t>::Minimum()
+							? "before 0001-01-01"
+							: Date::ToString(date_t(static_cast<int32_t>(epoch_day)));
+	throw InvalidInputException(
+		"MSSQL: a date / timestamp value dated %s is outside SQL Server's range (0001-01-01 to "
+		"9999-12-31) and cannot be sent: the wire would turn it into another date",
+		date);
+}
+
+void BCPRowEncoder::ThrowRoundsPastServerRange() {
+	throw InvalidInputException(
+		"MSSQL: a timestamp late on 9999-12-31 rounds past 9999-12-31 at the column's scale, "
+		"outside SQL Server's range, and cannot be sent");
+}
+
+void BCPRowEncoder::ThrowTimeOutsideServerRange() {
+	throw InvalidInputException(
+		"MSSQL: TIME '24:00:00' is outside SQL Server's time range (00:00:00 to "
+		"23:59:59.9999999) and cannot be sent");
+}
+
 void BCPRowEncoder::EncodeDate(vector<uint8_t> &buffer, date_t value) {
 	// DATE: 3 bytes unsigned little-endian, days since 0001-01-01
 	// Convert from DuckDB date_t (days since 1970-01-01)
+	RequireServerDay(value.days);
 	int32_t days = value.days + DAYS_FROM_0001_TO_EPOCH;
 
 	// Write length
@@ -1198,6 +1226,7 @@ void BCPRowEncoder::EncodeTime(vector<uint8_t> &buffer, dtime_t value, uint8_t s
 	// TIME: 3-5 bytes depending on scale, stored as 10^(-scale) seconds since midnight
 	// DuckDB dtime_t is microseconds since midnight
 
+	RequireServerTime(value.value);
 	// Convert microseconds to the appropriate scale
 	int64_t scaled_value;
 	if (scale <= 6) {
@@ -1353,19 +1382,18 @@ void BCPRowEncoder::TimestampToDatetime2Components(timestamp_t ts, uint8_t scale
 	int64_t total_micros = ts.value;
 
 	// Split into days and time-of-day
-	int32_t days;
-	int64_t time_micros;
-
-	if (total_micros >= 0) {
-		days = static_cast<int32_t>(total_micros / MICROS_PER_DAY);
-		time_micros = total_micros % MICROS_PER_DAY;
-	} else {
-		// Handle negative timestamps (before 1970)
-		days = static_cast<int32_t>((total_micros - MICROS_PER_DAY + 1) / MICROS_PER_DAY);
-		time_micros = total_micros - (static_cast<int64_t>(days) * MICROS_PER_DAY);
+	// Floor division that cannot overflow: `total - per_day + 1` wrapped for
+	// -infinity (-INT64_MAX) (issue #447).
+	RequireFiniteTimestamp(total_micros);
+	int64_t days = total_micros / MICROS_PER_DAY;
+	int64_t time_micros = total_micros % MICROS_PER_DAY;
+	if (time_micros < 0) {
+		time_micros += MICROS_PER_DAY;
+		days -= 1;
 	}
 
 	// Convert days to SQL Server format (days since 0001-01-01)
+	RequireServerDay(days);
 	date_value = static_cast<uint32_t>(days + DAYS_FROM_0001_TO_EPOCH);
 
 	// Convert time to the appropriate scale
