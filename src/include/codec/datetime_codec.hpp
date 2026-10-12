@@ -97,6 +97,12 @@ void EncodeToBcp(Vector &in, const UnifiedVectorFormat &fmt, idx_t row, const ms
 void EncodeToBcp(Vector &in, idx_t row, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf);
 // Single-Value overload for the BCPRowEncoder::EncodeValue public path.
 void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb::vector<uint8_t> &buf);
+//! Issue #447: whether a DATE / TIMESTAMP* value is one SQL Server's date /
+//! datetime2 / datetimeoffset can hold -- finite, dated 0001-01-01 to
+//! 9999-12-31. True for any other type and for NULL. The encoders refuse
+//! such a value (BCPRowEncoder::RequireServerDay); a pushed filter with one
+//! stays with DuckDB instead.
+bool ServerHoldsTemporal(const Value &value);
 std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralContext ctx);
 std::string FormatDdlTypeName(const LogicalType &type, const mssql::CTASConfig &cfg, DdlContext ctx);
 size_t EstimateLiteralSize(const LogicalType &type);

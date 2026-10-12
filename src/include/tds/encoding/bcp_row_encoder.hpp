@@ -126,6 +126,42 @@ public:
 	// Days since 0001-01-01
 	static void EncodeDate(vector<uint8_t> &buffer, date_t value);
 
+	//! Issue #447: the date of a date / datetime2 / datetimeoffset value, as
+	//! days since 1970-01-01, must lie in SQL Server's 0001-01-01..9999-12-31.
+	//! The wire's three-byte day count wraps anything else into a different,
+	//! valid date -- DuckDB's 'infinity' became 1969-12-31 -- so the value is
+	//! refused instead, by name. One compare per value, on the temporal arms
+	//! only.
+	static constexpr int64_t SERVER_MIN_EPOCH_DAY = -719162;  // 0001-01-01
+	static constexpr int64_t SERVER_MAX_EPOCH_DAY = 2932896;  // 9999-12-31
+	static inline void RequireServerDay(int64_t epoch_day) {
+		if (epoch_day < SERVER_MIN_EPOCH_DAY || epoch_day > SERVER_MAX_EPOCH_DAY) {
+			ThrowOutsideServerRange(epoch_day);
+		}
+	}
+	[[noreturn]] static void ThrowOutsideServerRange(int64_t epoch_day);
+	//! A timestamp of 9999-12-31 that rounds into the next day at the column's
+	//! scale (datetime2(3) <- 23:59:59.9999995): no such day to carry into.
+	[[noreturn]] static void ThrowRoundsPastServerRange();
+	//! DuckDB's TIME '24:00:00': SQL Server's time ends at 23:59:59.9999999.
+	//! The encoders used to store it as 23:59:59.999999 (or, at scale 7, send
+	//! ticks outside the type), and a filter matched that instant's rows.
+	static constexpr int64_t MICROS_PER_SERVER_DAY = 86400000000LL;
+	static inline void RequireServerTime(int64_t micros) {
+		if (micros < 0 || micros >= MICROS_PER_SERVER_DAY) {
+			ThrowTimeOutsideServerRange();
+		}
+	}
+	[[noreturn]] static void ThrowTimeOutsideServerRange();
+	//! A TIMESTAMP's ±infinity: in TIMESTAMP_NS its raw value divides into a
+	//! day of 1677 / 2262, inside the server's range, so the day check alone
+	//! would send it as that day.
+	static inline void RequireFiniteTimestamp(int64_t raw) {
+		if (raw == NumericLimits<int64_t>::Maximum() || raw == -NumericLimits<int64_t>::Maximum()) {
+			ThrowOutsideServerRange(raw > 0 ? date_t::infinity().days : date_t::ninfinity().days);
+		}
+	}
+
 	// Time (TIMENTYPE 0x29)
 	// Wire format: [length:1] [value:3/4/5 LE]
 	// Value is 10^(-scale) seconds since midnight

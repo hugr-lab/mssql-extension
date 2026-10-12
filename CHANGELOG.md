@@ -405,6 +405,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A date / time SQL Server cannot hold was sent as another value** (#447).
+  The wire's three-byte day count kept the low bytes of what it was given:
+  - DuckDB's `DATE 'infinity'` became 1969-12-31 and `-infinity` 1970-01-02;
+  - a year near 50000 became a year near 4066;
+  - a datetime2(7) column's (TIMESTAMP_NS) `±infinity` became
+    2262-04-11 23:47:16.8547758;
+  - `TIME '24:00:00'` became 23:59:59.999999.
+
+  It happened wherever such a value went to the server:
+  - a pushed filter: `DELETE … WHERE d = 'infinity'` deleted the 1969-12-31
+    rows (measured);
+  - a parameter;
+  - a statement literal (an INSERT / UPDATE under the bulk threshold);
+  - a bulk load (INSERT, COPY, CTAS, the `#stage` of a large UPDATE / DELETE).
+
+  Now:
+  - A filter with such a constant runs in DuckDB, `rowid =` included:
+    `d = 'infinity'` matches nothing, `d < 'infinity'` everything. A keyless
+    UPDATE / DELETE with one is refused by name: part of its WHERE runs in
+    DuckDB.
+  - A load, a parameter or a literal carrying one fails, naming the value
+    and the column.
+  - A timestamp that rounds past 9999-12-31 at the column's scale fails too:
+    `datetime2(4)` ← `23:59:59.99999` would carry into a day that does not
+    exist.
+
 - **UPDATE / DELETE through a `DATETIME` key** (#358). A key value with a
   1/300 s fraction (`.003`, `.007`, …) matched no literal, so the statement
   reported success and changed nothing; since spec 077 such a key was refused.

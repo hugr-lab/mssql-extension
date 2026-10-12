@@ -1,3 +1,4 @@
+#include "codec/datetime_codec.hpp"
 #include "pushdown/mssql_node_writer.hpp"
 #include "pushdown/mssql_sql_writer.hpp"
 
@@ -11,7 +12,6 @@
 #include <deque>
 
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/parser/expression/between_expression.hpp"
 #include "duckdb/parser/expression/case_expression.hpp"
@@ -38,22 +38,6 @@ namespace duckdb {
 namespace mssql {
 namespace node_writer {
 
-//! A DATE SQL Server's `date` can hold: finite, years 1 to 9999. DuckDB's
-//! 'infinity' and years past 9999 cast fine here, and the RPC encoder keeps the
-//! low three bytes of the day count -- 'infinity' lands on 1969-12-31 (review
-//! of spec 080 PR 3c).
-static bool ServerHoldsDate(const Value &value) {
-	if (value.IsNull() || value.type().id() != LogicalTypeId::DATE) {
-		return true;
-	}
-	const auto date = value.GetValue<date_t>();
-	if (!date.IsFinite()) {
-		return false;
-	}
-	const auto year = Date::ExtractYear(date);
-	return year >= 1 && year <= 9999;
-}
-
 bool NodeWriter::ConstantFor(ComparableKind kind, const LogicalType &target, const std::string &peer_name,
 							 const ParsedExpression &expr, Value &out) {
 	if (kind == ComparableKind::None || target.id() == LogicalTypeId::INVALID) {
@@ -76,7 +60,9 @@ bool NodeWriter::ConstantFor(ComparableKind kind, const LogicalType &target, con
 		if (!cast_value) {
 			return Veto("constant " + expr.ToString() + " does not cast to " + target.ToString());
 		}
-		if (!ServerHoldsDate(*cast_value)) {
+		if (!codec::datetime::ServerHoldsTemporal(*cast_value)) {
+			// Issue #447: 'infinity' / a year past 9999 -- no server value
+			// compares with it as DuckDB's do; the statement stays with DuckDB.
 			return Veto("constant " + expr.ToString() + " is outside SQL Server's date range");
 		}
 		out = std::move(*cast_value);
@@ -98,7 +84,7 @@ bool NodeWriter::ConstantFor(ComparableKind kind, const LogicalType &target, con
 		if (!cast_value) {
 			return Veto("constant '" + literal.text + "' does not cast to " + target.ToString());
 		}
-		if (!ServerHoldsDate(*cast_value)) {
+		if (!codec::datetime::ServerHoldsTemporal(*cast_value)) {
 			return Veto("constant '" + literal.text + "' is outside SQL Server's date range");
 		}
 		out = std::move(*cast_value);

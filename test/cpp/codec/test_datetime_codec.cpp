@@ -339,6 +339,56 @@ void TestEncodeDateVector() {
 	CHECK_EQ(recovered, days_from_0001);
 }
 
+//===----------------------------------------------------------------------===//
+// Issue #447: a value SQL Server cannot hold is refused, never wrapped
+//===----------------------------------------------------------------------===//
+
+bool EncodeThrows(const Value &value, const BCPColumnMetadata &col) {
+	duckdb::vector<uint8_t> buf;
+	try {
+		duckdb::mssql::codec::datetime::EncodeToBcp(value, col, buf);
+	} catch (const duckdb::InvalidInputException &) {
+		return true;
+	}
+	return false;
+}
+
+void TestServerRange() {
+	std::cout << "Test: issue #447 -- dates past 0001..9999 and infinities are refused\n";
+	using duckdb::mssql::codec::datetime::ServerHoldsTemporal;
+	CHECK_TRUE(ServerHoldsTemporal(Value::DATE(duckdb::Date::FromDate(1, 1, 1))));
+	CHECK_TRUE(ServerHoldsTemporal(Value::DATE(duckdb::Date::FromDate(9999, 12, 31))));
+	CHECK_TRUE(!ServerHoldsTemporal(Value::DATE(duckdb::Date::FromDate(10000, 1, 1))));
+	CHECK_TRUE(!ServerHoldsTemporal(Value::DATE(duckdb::date_t::infinity())));
+	CHECK_TRUE(!ServerHoldsTemporal(Value::DATE(duckdb::date_t::ninfinity())));
+	CHECK_TRUE(ServerHoldsTemporal(Value::TIMESTAMP(
+		duckdb::Timestamp::FromDatetime(duckdb::Date::FromDate(9999, 12, 31), duckdb::Time::FromTime(23, 59, 59, 0)))));
+	CHECK_TRUE(!ServerHoldsTemporal(Value::TIMESTAMP(duckdb::timestamp_t::infinity())));
+	// TIMESTAMP_NS's -infinity divides into a day of 1677: refused all the same.
+	CHECK_TRUE(
+		!ServerHoldsTemporal(Value::TIMESTAMPNS(duckdb::timestamp_ns_t(-duckdb::NumericLimits<int64_t>::Maximum()))));
+	CHECK_TRUE(ServerHoldsTemporal(Value::TIME(duckdb::Time::FromTime(23, 59, 59, 999999))));
+	CHECK_TRUE(!ServerHoldsTemporal(Value::TIME(duckdb::dtime_t(86400000000LL))));	// TIME '24:00:00'
+	CHECK_TRUE(ServerHoldsTemporal(Value::INTEGER(5)));
+	CHECK_TRUE(ServerHoldsTemporal(Value(LogicalType::DATE)));
+
+	CHECK_TRUE(EncodeThrows(Value::DATE(duckdb::date_t::infinity()), MakeBCPColumn(LogicalType::DATE, 0)));
+	CHECK_TRUE(EncodeThrows(Value::DATE(duckdb::Date::FromDate(50000, 6, 15)), MakeBCPColumn(LogicalType::DATE, 0)));
+	CHECK_TRUE(EncodeThrows(Value::TIMESTAMPNS(duckdb::timestamp_ns_t(-duckdb::NumericLimits<int64_t>::Maximum())),
+							MakeBCPColumn(LogicalType::TIMESTAMP_NS, 7)));
+	CHECK_TRUE(EncodeThrows(Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(duckdb::timestamp_t::infinity())),
+							MakeBCPColumn(LogicalType::TIMESTAMP_TZ, 7)));
+	// 9999-12-31 23:59:59.999999 rounded into datetime2(3) carries into a day
+	// that does not exist.
+	const auto last = duckdb::Timestamp::FromDatetime(duckdb::Date::FromDate(9999, 12, 31),
+													  duckdb::Time::FromTime(23, 59, 59, 999999));
+	CHECK_TRUE(EncodeThrows(Value::TIMESTAMP(last), MakeBCPColumn(LogicalType::TIMESTAMP, 3)));
+	CHECK_TRUE(!EncodeThrows(Value::TIMESTAMP(last), MakeBCPColumn(LogicalType::TIMESTAMP, 7)));
+	CHECK_TRUE(!EncodeThrows(Value::DATE(duckdb::Date::FromDate(9999, 12, 31)), MakeBCPColumn(LogicalType::DATE, 0)));
+	CHECK_TRUE(EncodeThrows(Value::TIME(duckdb::dtime_t(86400000000LL)), MakeBCPColumn(LogicalType::TIME, 6)));
+	CHECK_TRUE(EncodeThrows(Value::TIME(duckdb::dtime_t(86400000000LL)), MakeBCPColumn(LogicalType::TIME, 7)));
+}
+
 void TestEncodeDateValue() {
 	std::cout << "Test: EncodeToBcp(Value) DATE — round-trip via Value\n";
 	auto target = duckdb::Date::FromDate(2024, 1, 15);
@@ -402,15 +452,18 @@ void TestEncodeTimestampMSandSEC() {
 	auto target_date = duckdb::Date::FromDate(2024, 1, 15);
 	auto ts = duckdb::Timestamp::FromDatetime(target_date, duckdb::Time::FromTime(14, 30, 0, 0));
 
+	// Each in its own unit: µs ticks read as milliseconds are a date in the
+	// year 56009 (as seconds, millions of years later), which the encoder now
+	// refuses (issue #447) rather than wrapping into some valid date.
 	duckdb::Vector vec_ms(LogicalType::TIMESTAMP_MS, 1);
-	duckdb::FlatVector::GetDataMutable<timestamp_t>(vec_ms)[0] = ts;
+	duckdb::FlatVector::GetDataMutable<timestamp_t>(vec_ms)[0] = timestamp_t(ts.value / 1000);
 	auto col_ms = MakeBCPColumn(LogicalType::TIMESTAMP_MS, 3);
 	duckdb::vector<uint8_t> buf_ms;
 	duckdb::mssql::codec::datetime::EncodeToBcp(vec_ms, 0, col_ms, buf_ms);
 	CHECK_EQ(static_cast<int>(buf_ms[0]), 7);  // 4 time @ scale 3 + 3 date
 
 	duckdb::Vector vec_sec(LogicalType::TIMESTAMP_S, 1);
-	duckdb::FlatVector::GetDataMutable<timestamp_t>(vec_sec)[0] = ts;
+	duckdb::FlatVector::GetDataMutable<timestamp_t>(vec_sec)[0] = timestamp_t(ts.value / 1000000);
 	auto col_sec = MakeBCPColumn(LogicalType::TIMESTAMP_S, 0);
 	duckdb::vector<uint8_t> buf_sec;
 	duckdb::mssql::codec::datetime::EncodeToBcp(vec_sec, 0, col_sec, buf_sec);
@@ -654,6 +707,7 @@ int main() {
 
 	TestEncodeDateVector();
 	TestEncodeDateValue();
+	TestServerRange();
 	TestEncodeTimeScale7Vector();
 	TestEncodeTimestampVector();
 	TestEncodeTimestampTZValue();
