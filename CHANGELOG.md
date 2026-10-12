@@ -362,6 +362,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `enable_external_access = false` is honoured** (#452). A new
+  `ATTACH … (TYPE mssql)` is refused by name, `lazy_validation` included, and
+  so are `mssql_azure_auth_test`, `mssql_kerberos_auth_test(_secret)` and
+  `mssql_winsspi_auth_test(_spn)`. Until now all of them reached SQL Server,
+  Azure AD or a KDC with the setting off. A session that disables external
+  access and then attaches must attach first. An MSSQL database attached before
+  external access was disabled keeps working: scans, `mssql_exec`, DML, CTAS
+  and new pool connections. DuckDB keeps its own attached databases the same
+  way. COPY TO into it is refused by DuckDB's own check on the COPY target (a
+  path); `INSERT … SELECT` takes the same bulk wire.
+
 - **UPDATE and DELETE through the catalog are refused on Azure Synapse**
   (spec 080): its primary keys and unique constraints are `NOT ENFORCED`, so a
   key could match rows the statement did not select. `mssql_exec()` still
