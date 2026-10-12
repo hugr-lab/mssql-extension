@@ -52,10 +52,19 @@ public:
 	//! call. Throws IOException when none can be had.
 	std::shared_ptr<tds::TdsConnection> Acquire(ClientContext &context, MSSQLCatalog &catalog);
 
-	//! Does the statement run inside a DuckDB transaction (on its pinned
-	//! connection)? Meaningful after Acquire.
+	//! Does the statement run on a pinned connection -- inside a DuckDB
+	//! transaction, or an autocommit statement that joined (issue #451)? It
+	//! then sends no BEGIN / COMMIT of its own. Meaningful after Acquire.
 	bool IsPinned() const {
 		return transaction_pinned_;
+	}
+
+	//! Inside an explicit DuckDB transaction, whose ROLLBACK is the user's: what
+	//! an error message tells them to do. An autocommit statement on a pinned
+	//! connection is rolled back by DuckDB itself when it fails. Meaningful
+	//! after Acquire.
+	bool InOpenTransaction() const {
+		return in_open_transaction_;
 	}
 
 	//! Spec 080 PR 1: one batch at a time on the pinned connection. The sinks
@@ -133,6 +142,7 @@ private:
 	std::shared_ptr<tds::TdsConnection> connection_;
 	mssql::LoadTransaction transaction_;
 	bool transaction_pinned_ = false;
+	bool in_open_transaction_ = false;
 	bool identity_insert_on_ = false;
 	string identity_schema_;
 	string identity_table_;

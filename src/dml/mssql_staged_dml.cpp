@@ -242,9 +242,10 @@ MSSQLStagedDml::~MSSQLStagedDml() = default;
 
 void MSSQLStagedDml::FailAndThrow(ClientContext &context, const string &message) {
 	// One statement over the whole stage: the server ran it whole or not at
-	// all. In autocommit its own transaction is rolled back here; inside a
-	// DuckDB transaction the stage and the statement sit in the open one.
-	const bool pinned = stmt_conn_.IsPinned();
+	// all. In autocommit its transaction is rolled back -- by DuckDB, which
+	// rolls back the statement's own (issue #451); inside an explicit DuckDB
+	// transaction the stage and the statement sit in the open one.
+	const bool pinned = stmt_conn_.InOpenTransaction();
 	session_.Abandon();
 	stmt_conn_.Fail(context, catalog_);
 	connection_.reset();
@@ -580,7 +581,7 @@ idx_t MSSQLStagedDml::Finalize(ClientContext &context) {
 		}
 	}
 	connection_.reset();
-	const bool pinned = stmt_conn_.IsPinned();
+	const bool pinned = stmt_conn_.InOpenTransaction();
 	stmt_conn_.Commit(context, catalog_);
 	mssql::CountDml(mssql::DmlPath::STAGED);
 	if (target_.kind == MSSQLStagedDmlKind::DELETE_ROWS && !pinned && target_.table_entry) {

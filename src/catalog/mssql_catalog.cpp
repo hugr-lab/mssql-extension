@@ -1275,7 +1275,7 @@ void MSSQLCatalog::CheckWriteAccess(const char *operation_name) const {
 // DDL Execution
 //===----------------------------------------------------------------------===//
 
-void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql) {
+void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql, bool on_transaction_connection) {
 	if (!connection_pool_) {
 		throw IOException("MSSQL connection pool not initialized - cannot execute DDL");
 	}
@@ -1286,8 +1286,9 @@ void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql) {
 	// pinned it), and a second Acquire waited out mssql_acquire_timeout. There
 	// it runs on the pinned connection, inside the transaction, and rolls back
 	// with it; COMMIT / ROLLBACK forget the names it changed
-	// (ForgetTransactionChanges), as for any change the transaction made.
-	if (!context.transaction.IsAutoCommit() && GetConnectionLimit() <= 1) {
+	// (ForgetTransactionChanges), as for any change the transaction made. And a
+	// CTAS that runs whole in the transaction asks for it (issue #451).
+	if (on_transaction_connection || (!context.transaction.IsAutoCommit() && GetConnectionLimit() <= 1)) {
 		auto connection = ConnectionProvider::GetConnection(context, *this);
 		if (!connection) {
 			throw IOException("Failed to get the transaction's connection for DDL execution");

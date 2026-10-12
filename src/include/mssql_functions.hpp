@@ -115,6 +115,9 @@ struct MSSQLScanBindData : public FunctionData {
 	// temp table, a procedure, dynamic SQL) and Bind executed as it always had;
 	// result_stream_id / materialized are then set exactly as before.
 	bool executed_at_bind = false;
+	//! Issue #451: see MSSQLCatalogScanBindData::joins_statement. Set by
+	//! MSSQLOptimizer.
+	mutable bool joins_statement = false;
 	//! Spec 081: the function that took the caller's shape (`mssql_scan_unsafe`,
 	//! `mssql_scan_params_unsafe`, from `columns :=`) without asking the server;
 	//! the stream is checked against it at init. Empty for a described scan.
@@ -187,11 +190,17 @@ struct MSSQLCatalogScanBindData : public FunctionData {
 	// Set by MSSQLOptimizer, hence mutable — same as order_by_clause above.
 	mutable bool requires_materialization = false;
 
+	//! Issue #451: the statement writes to this scan's catalog and joins its own
+	//! DuckDB transaction there (ConnectionProvider::JoinStatementTransaction).
+	//! The scan joins first thing at InitGlobal: DuckDB may initialise it before
+	//! the sink (a join's build side, a MERGE's source). Set by MSSQLOptimizer.
+	mutable bool joins_statement = false;
+
 	//===----------------------------------------------------------------------===//
 	// RowId Support (Spec 001-pk-rowid-semantics)
 	//===----------------------------------------------------------------------===//
 
-	// Pointer to the table entry (for GetTable() / get_bind_info)
+	// Pointer to the table entry (for GetTable() / get_table_entry)
 	// This allows DuckDB to discover virtual columns like rowid.
 	// Spec 052 (Option D): lifetime of the underlying entry is guaranteed by
 	// MSSQLBindAnchors (per ClientContext, released at QueryEnd) which is

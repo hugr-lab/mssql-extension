@@ -201,7 +201,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 			error.sql_error_number = 0;
 			error.sql_error_message = connection->GetLastError();
 			error.rows_applied_before = statistics_.total_rows_inserted;
-			error.in_open_transaction = stmt_conn_.IsPinned();
+			error.in_open_transaction = stmt_conn_.InOpenTransaction();
 
 			FailStatement(mssql_catalog);
 			throw MSSQLInsertException(error);
@@ -341,7 +341,7 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 			error.sql_error_number = error_number;
 			error.sql_error_message = error_message;
 			error.rows_applied_before = statistics_.total_rows_inserted;
-			error.in_open_transaction = stmt_conn_.IsPinned();
+			error.in_open_transaction = stmt_conn_.InOpenTransaction();
 			// A parse error is a client-side framing failure: the server ran this
 			// statement (issue #344). The message says so; a SQL error says the
 			// server rejected it.
@@ -402,7 +402,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 			error.sql_error_number = 0;
 			error.sql_error_message = connection->GetLastError();
 			error.rows_applied_before = statistics_.total_rows_inserted;
-			error.in_open_transaction = stmt_conn_.IsPinned();
+			error.in_open_transaction = stmt_conn_.InOpenTransaction();
 
 			FailStatement(mssql_catalog);
 			throw MSSQLInsertException(error);
@@ -421,7 +421,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 			error.sql_error_number = parser.GetErrorNumber();
 			error.sql_error_message = parser.GetErrorMessage();
 			error.rows_applied_before = statistics_.total_rows_inserted;
-			error.in_open_transaction = stmt_conn_.IsPinned();
+			error.in_open_transaction = stmt_conn_.InOpenTransaction();
 			error.statement_executed = parser.IsParseError();
 
 			FailStatement(mssql_catalog);

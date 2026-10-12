@@ -72,6 +72,7 @@ unique_ptr<FunctionData> MSSQLScanBindData::Copy() const {
 	result->prepared = prepared;
 	result->prepared_session = prepared_session;
 	result->executed_at_bind = executed_at_bind;
+	result->joins_statement = joins_statement;
 	result->described_datetime2 = described_datetime2;
 	result->wants_column_types = wants_column_types;
 	result->describe_cache_key = describe_cache_key;
@@ -1191,13 +1192,19 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 		// Spec 075 W2: the query runs here, on the shape Bind described.
 		auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name));
 		auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
+		// Issue #451: join before deciding anything -- see TableScanInitGlobal.
+		if (bind_data.joins_statement) {
+			ConnectionProvider::JoinStatementTransaction(context, mssql_catalog);
+		}
 		// Inside a transaction the stream is on the ONE pinned connection: take the
 		// connection's materialize lock (MaterializeMutexFor) BEFORE sending the
 		// batch, so a catalog scan materialising on another thread has drained
 		// (or has not started) -- the same order table_scan.cpp keeps. Held
 		// through the drain below.
 		std::unique_lock<std::mutex> materialize_lock;
-		const bool in_transaction = !context.transaction.IsAutoCommit();
+		// Pinned: an explicit transaction, or an autocommit statement that writes
+		// to this catalog and joined (issue #451).
+		const bool in_transaction = ConnectionProvider::IsInTransaction(context, mssql_catalog);
 		// On a pool of one the scans and the sink take turns at the pool exactly
 		// as they take turns on a pinned connection, so this scan materialises
 		// there too. The optimizer sets requires_materialization on that same
@@ -1515,6 +1522,7 @@ unique_ptr<FunctionData> MSSQLCatalogScanBindData::Copy() const {
 	result->order_by_clause = order_by_clause;
 	result->top_n = top_n;
 	result->requires_materialization = requires_materialization;
+	result->joins_statement = joins_statement;
 	// RowId support fields
 	result->rowid_requested = rowid_requested;
 	result->pk_column_names = pk_column_names;

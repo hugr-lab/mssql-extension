@@ -197,6 +197,10 @@ public:
 	tds::ConnectionPool *pool = nullptr;
 	weak_ptr<tds::ConnectionPool> pool_handle;
 	bool transaction_pinned = false;
+	//! Inside an explicit DuckDB transaction, whose ROLLBACK is the user's: what
+	//! a failure message tells them. An autocommit statement on a pinned
+	//! connection (issue #451) is rolled back by DuckDB itself.
+	bool in_open_transaction = false;
 	bool reset_on_release = tds::DEFAULT_RESET_CONNECTION;
 
 	//! Writers this INSERT may open, the shared one included; resolved by

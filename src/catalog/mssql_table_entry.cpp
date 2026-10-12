@@ -124,7 +124,7 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 	catalog_bind_data->schema_name = mssql_schema.name.GetIdentifierName();
 	catalog_bind_data->table_name = name.GetIdentifierName();
 
-	// Store pointer to this table entry for get_bind_info callback.
+	// Store pointer to this table entry for the get_table_entry callback.
 	// Spec 052 (Option D): lifetime guaranteed by MSSQLBindAnchors set in
 	// MSSQLTableSet::GetEntry (per-ClientContext, released at QueryEnd) —
 	// no per-bind-data anchor needed here.

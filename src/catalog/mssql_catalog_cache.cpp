@@ -103,7 +103,10 @@ unique_ptr<MSSQLMetadataCache> MSSQLCatalog::CreateTransactionMetadataCache(Clie
 }
 
 std::mutex &MSSQLCatalog::MaterializeMutexFor(ClientContext &context) {
-	if (context.transaction.IsAutoCommit()) {
+	// The transaction's own whenever its connection is pinned -- an explicit
+	// transaction, or an autocommit statement that joined (issue #451) -- so
+	// other DuckDB connections' statements run in parallel (issue #409).
+	if (!ConnectionProvider::IsInTransaction(context, *this)) {
 		return materialize_mutex_;
 	}
 	return MSSQLTransaction::Get(context, *this).MaterializeMutex();

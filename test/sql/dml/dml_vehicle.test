@@ -350,8 +350,9 @@ use mssql_exec()
 
 # a source initialised again (a recursive CTE's iteration) is refused, not
 # written twice -- and not an internal error, which would end the database.
-# The first initialisation has run the statement by then, and in autocommit
-# committed it: the shape no rewrite produces fails after writing once.
+# The first initialisation has run the statement by then, inside the
+# statement's own transaction (issue #451), which DuckDB rolls back with the
+# failed statement: nothing is written.
 statement error
 WITH RECURSIVE r(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM r, mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = [v] + 1 WHERE [id] = 6', kind := 'update', target_schema := 'dbo', target_table := 'dv_t') WHERE n < 3) SELECT count(*) FROM r;
 ----
@@ -360,7 +361,7 @@ initialised a second time
 query I
 SELECT v FROM dv.dbo.dv_t WHERE id = 6;
 ----
-1
+0
 
 # --- a pool of one: the statement takes the one connection and gives it back,
 # in autocommit and in a transaction beside a read --------------------------

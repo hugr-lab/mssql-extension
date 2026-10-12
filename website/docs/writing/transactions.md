@@ -20,7 +20,7 @@ All statements within a transaction execute on the same SQL Server connection. I
 
 ### Transaction Behavior
 
-- **Autocommit (default)**: Each statement is independent with its own implicit transaction
+- **Autocommit (default)**: each statement is independent, with its own implicit transaction. An `UPDATE`, `DELETE` or `MERGE` on an attached catalog runs on it as a **transaction of one statement**: one pinned connection, committed or rolled back when DuckDB commits or rolls back the statement, as postgres_scanner and mysql_scanner do for every DuckDB transaction (issue #451). An error anywhere in the statement, Ctrl-C, or a result dropped before its query ended (DuckDB aborts it) undoes the write. See [Autocommit writes follow DuckDB](#autocommit-writes-follow-duckdb)
 - **Explicit transactions**: `BEGIN` pins a connection; all subsequent operations reuse it until `COMMIT` or `ROLLBACK`
 - **Isolation level**: SQL Server default (READ COMMITTED). Use `mssql_exec()` to change if needed
 - **Connection reset**: After commit/rollback, the connection's session state is reset via TDS RESET_CONNECTION flag before pool reuse
@@ -40,6 +40,34 @@ All statements within a transaction execute on the same SQL Server connection. I
   freed before anything else runs. See
   [Reading a catalog inside a transaction](#reading-a-catalog-inside-a-transaction)
   below.
+
+### Autocommit writes follow DuckDB
+
+Outside `BEGIN … COMMIT` every statement still runs in a transaction of its own
+-- DuckDB's autocommit transaction -- and a statement that writes to an attached
+catalog makes the SQL Server side part of it:
+
+| Statement | In autocommit |
+|---|---|
+| `UPDATE`, `DELETE`, `MERGE` (pushed whole or not) | Joins: one pinned connection, `COMMIT` / `ROLLBACK` with DuckDB |
+| `INSERT` (statements, bulk, or pushed `INSERT … SELECT`) | Commits on its own when it finishes, with the bulk path's parallel writers -- unless `mssql_insert_use_bcp = false`, which makes it join, or the same statement has joined the catalog through another write (a DML CTE): then it runs on that connection too |
+| `CREATE TABLE … AS SELECT` | Commits as it loads (DDL and rows), with parallel writers -- unless `mssql_ctas_use_bcp = false`, which makes it run whole in the transaction, here and inside `BEGIN … COMMIT` |
+| `COPY … TO` (`FORMAT 'bcp'`) | Always commits as it loads: an export, like `COPY` to a file |
+| `mssql_exec()` | Autocommits what it runs -- except when called inside a statement that joined its catalog, where it runs on that statement's connection |
+
+So a statement such as
+
+```sql
+WITH u AS (UPDATE sqlserver.dbo.t SET v = v + 1 RETURNING id) SELECT error('boom') FROM u;
+```
+
+leaves the table unchanged, as it would a DuckDB table. A joined statement behaves
+on its catalog as a transaction does: the scans of that catalog it reads are
+materialized (read to completion at their start, see below), and it holds its
+connection -- and the server's locks -- until DuckDB ends the query. An `INSERT`
+that joins loads with one writer.
+
+The two settings are `SET` per DuckDB connection or `SET GLOBAL` for all of them.
 
 ### Reading a catalog inside a transaction
 

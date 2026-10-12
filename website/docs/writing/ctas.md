@@ -115,9 +115,9 @@ SET mssql_ctas_drop_on_failure = true;
 - **BCP mode (default)**: Uses TDS BulkLoadBCP protocol for 2-10x faster data transfer
 - **Two-phase execution**: CREATE TABLE DDL, then data transfer via BCP or INSERT
 - **Streaming**: Large result sets are streamed without full buffering
-- **Not atomic, and not covered by a transaction**: see [What a failed load leaves behind](#what-a-failed-load-leaves-behind)
+- **Not atomic, and not covered by a transaction** (BCP mode): see [What a failed load leaves behind](#what-a-failed-load-leaves-behind)
 - **Schema validation**: Target schema must exist before CTAS
-- **Legacy INSERT mode**: Set `mssql_ctas_use_bcp = false` to use batched INSERT statements
+- **INSERT mode, transactional**: Set `mssql_ctas_use_bcp = false` to use batched INSERT statements. The CTAS then runs whole inside the DuckDB transaction -- in autocommit the statement's own -- and a `ROLLBACK` or an error in the statement leaves no table (issue #451)
 
 ### What a failed load leaves behind
 

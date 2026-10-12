@@ -27,7 +27,9 @@ class ConnectionPool;
 //
 // Key behaviors:
 // - GetConnection() in transaction: Returns pinned connection (lazy-pins on first call)
-// - GetConnection() in autocommit: Acquires from pool
+// - GetConnection() in autocommit: Acquires from pool -- unless the statement
+//   writes to the catalog and has joined (JoinStatementTransaction, issue #451):
+//   then it is a transaction of one statement, pinned like the above
 // - ReleaseConnection() in transaction: No-op (connection stays pinned)
 // - ReleaseConnection() in autocommit: Returns to pool
 // - IsInTransaction(): Checks if context has an active DuckDB transaction
@@ -69,10 +71,42 @@ public:
 	//! to ask whether a transaction has already touched MSSQL: use
 	//! HasUsedAnyMSSQLCatalogInTransaction for that, which is deliberately NOT
 	//! per-catalog (review of 7f13a0a).
+	//! Issue #451: also true in autocommit once the statement has joined
+	//! (JoinStatementTransaction) -- the statement then runs on the catalog's
+	//! pinned connection exactly as inside BEGIN ... COMMIT. So this answers
+	//! "is the connection pinned", which is what every caller asks.
 	//! @param context The DuckDB client context
 	//! @param catalog The MSSQL catalog
-	//! @return true if in an explicit DuckDB transaction
+	//! @return true in an explicit DuckDB transaction, or in a joined statement
 	static bool IsInTransaction(ClientContext &context, MSSQLCatalog &catalog);
+
+	//! Issue #451: an autocommit statement that writes to `catalog` runs on it as
+	//! a transaction of one statement, as postgres_scanner and mysql_scanner run
+	//! every DuckDB transaction: one pinned connection, BEGIN at its first use,
+	//! COMMIT / ROLLBACK when DuckDB commits or rolls back the statement's own
+	//! transaction (MSSQLTransactionManager). Called where a write starts -- the
+	//! sinks' global state, mssql_dml's InitGlobal, a joining CTAS -- AND at the
+	//! top of the InitGlobal of every scan the optimizer marked
+	//! (`joins_statement`: a scan of a catalog the statement writes to and
+	//! joins, also materialised): DuckDB may initialise a join's build side or a
+	//! MERGE's source before the sink (every pipeline's initialise event is
+	//! dependency-free), so whichever of them comes first pins and the rest find
+	//! it pinned. A scan the optimizer did not mark (optimizer off, a plan copy)
+	//! may still take a pool connection first; IsPinnedConnection classifies it
+	//! by identity, so it goes back to the pool. Idempotent; a no-op inside an
+	//! explicit transaction, which is pinned already.
+	static void JoinStatementTransaction(ClientContext &context, MSSQLCatalog &catalog);
+	//! The same, for the catalog a DML target names.
+	static void JoinStatementTransaction(ClientContext &context, const string &catalog_name);
+
+	//! Is `conn` the transaction's pinned connection? Asked of a connection in
+	//! hand, by identity -- not "is the context pinned now": an autocommit
+	//! statement can join (another thread's sink) between a scan's
+	//! GetConnection taking a POOL connection and the scan labelling it, and a
+	//! pool connection labelled pinned never went back to the pool (review of
+	//! #451). Use this wherever a connection is classified after GetConnection.
+	static bool IsPinnedConnection(ClientContext &context, MSSQLCatalog &catalog,
+								   const std::shared_ptr<tds::TdsConnection> &conn);
 
 	//! Has an explicit transaction ALREADY touched ANY attached MSSQL catalog?
 	//! Asks without creating anything, so a transaction that has only done

@@ -77,6 +77,11 @@ MSSQLPhysicalInsert::MSSQLPhysicalInsert(PhysicalPlan &plan, vector<LogicalType>
 //===----------------------------------------------------------------------===//
 
 unique_ptr<GlobalSinkState> MSSQLPhysicalInsert::GetGlobalSinkState(ClientContext &context) const {
+	// Issue #451: before the executor asks whether the connection is pinned, and
+	// before DuckDB initialises the scans of this pipeline (ResetSink first).
+	if (config_.join_statement_transaction) {
+		ConnectionProvider::JoinStatementTransaction(context, target_.catalog_name);
+	}
 	return make_uniq<MSSQLInsertGlobalSinkState>(context, target_, config_, return_chunk_, bulk_);
 }
 
@@ -110,7 +115,7 @@ string BulkFailureMessage(const MSSQLInsertGlobalSinkState &gstate, idx_t batch_
 						  const string &what) {
 	return StringUtil::Format("INSERT via BCP failed at batch %llu of a writer (%llu row(s) in it): %s; %s",
 							  (unsigned long long)batch_no, (unsigned long long)rows_in_batch, what,
-							  MSSQLRowsBeforeOutcome(gstate.transaction_pinned, gstate.rows_confirmed.load()));
+							  MSSQLRowsBeforeOutcome(gstate.in_open_transaction, gstate.rows_confirmed.load()));
 }
 
 // The batch a session is on, read BEFORE the call that may fail: CloseStream
@@ -156,6 +161,7 @@ void OpenSharedStream(ClientContext &context, MSSQLInsertGlobalSinkState &gstate
 					  const MSSQLInsertBulkPlan &bulk) {
 	auto &catalog = Catalog::GetCatalog(context, Identifier(target.catalog_name)).Cast<MSSQLCatalog>();
 	gstate.transaction_pinned = ConnectionProvider::IsInTransaction(context, catalog);
+	gstate.in_open_transaction = !context.transaction.IsAutoCommit();
 	gstate.pool = &catalog.GetConnectionPool();
 	gstate.pool_handle = catalog.GetConnectionPoolHandle();
 	gstate.reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
@@ -544,7 +550,7 @@ SinkFinalizeType MSSQLPhysicalInsert::Finalize(Pipeline &pipeline, Event &event,
 		const idx_t committed = gstate.rows_confirmed.load();
 		string outcome;
 		if (committed_writers == 0) {
-			outcome = MSSQLRowsBeforeOutcome(gstate.transaction_pinned, 0);
+			outcome = MSSQLRowsBeforeOutcome(gstate.in_open_transaction, 0);
 		} else {
 			outcome = StringUtil::Format(
 				"%llu writer(s) had already committed, so up to %llu row(s) are in the table and were NOT rolled "

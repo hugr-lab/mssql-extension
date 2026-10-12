@@ -82,6 +82,32 @@ public:
 	//! Generate next savepoint name (for future savepoint support)
 	string GetNextSavepointName();
 
+	//! Issue #451: an autocommit statement that writes to this catalog runs on
+	//! it as a transaction of one statement -- one pinned connection, BEGIN at
+	//! its first use, COMMIT / ROLLBACK when DuckDB commits or rolls back the
+	//! statement's own transaction -- as postgres_scanner and mysql_scanner do
+	//! for every DuckDB transaction. Without it the server COMMIT came at the
+	//! write's Finalize, and a result DuckDB then aborted (a dropped handle,
+	//! QueryResult::Close since DuckDB ef5b57f94ad) left an MSSQL table changed
+	//! and a DuckDB one not. Set by ConnectionProvider::JoinStatementTransaction
+	//! when the write's sink is initialised -- before the scans of its pipeline,
+	//! which then take the pinned connection -- and never cleared: the
+	//! transaction lives exactly as long as the statement.
+	void JoinStatement();
+	bool IsStatementJoined() const;
+
+	//! Whether GetConnection sent `transaction_isolation`'s SET before BEGIN
+	//! (issue #331), so COMMIT / ROLLBACK put the level back only then. A
+	//! statement-joined transaction sends none: autocommit keeps its level.
+	void SetIsolationSent();
+	bool IsolationSent() const;
+
+	//! The pinned connection carries session state that must not reach the next
+	//! user -- an IDENTITY_INSERT that could not be turned off (spec 077 W2) --
+	//! so COMMIT / ROLLBACK close it instead of pooling it.
+	void DiscardConnectionAtEnd();
+	bool ShouldDiscardConnection() const;
+
 	//! The catalog metadata this transaction loaded or changed (issue #380).
 	//! Created on first use; dies with the transaction, so nothing of it
 	//! outlives COMMIT or ROLLBACK.
@@ -138,6 +164,11 @@ private:
 
 	//! Counter for generating unique savepoint names
 	uint32_t savepoint_counter_ = 0;
+
+	//! See JoinStatement() / SetIsolationSent(), under connection_mutex_.
+	bool statement_joined_ = false;
+	bool isolation_sent_ = false;
+	bool discard_connection_ = false;
 
 	mutable mutex metadata_mutex_;
 	unique_ptr<MSSQLTransactionMetadata> metadata_;

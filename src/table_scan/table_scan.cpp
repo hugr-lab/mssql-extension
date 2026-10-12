@@ -11,6 +11,7 @@
 #include "catalog/mssql_keyless_key.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "catalog/mssql_table_entry.hpp"
+#include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -55,6 +56,7 @@ namespace mssql {
 // Forward declarations for internal functions
 static void TableScanExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output);
 static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, idx_t row_count);
+static void BindRowIdTargetVectors(MSSQLScanGlobalState &global_state, DataChunk &output);
 
 // Execute the filters the encoder refused to push (see ClientTableFilter) over
 // a filled output chunk. Each filter's expression sees its column as
@@ -128,6 +130,15 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	auto &bind_data = input.bind_data->Cast<MSSQLCatalogScanBindData>();
 	auto result = make_uniq<MSSQLScanGlobalState>();
 	result->context_name = bind_data.context_name;
+
+	// Issue #451: the statement writes to this catalog and joins its own DuckDB
+	// transaction there. Join before taking any connection -- this scan may be
+	// initialised before the sink is (a join's build side, a MERGE's source),
+	// and a scan that took a pool connection while the sink joined would read
+	// on the wrong one. Whichever comes first pins; the rest find it pinned.
+	if (bind_data.joins_statement) {
+		ConnectionProvider::JoinStatementTransaction(context, bind_data.context_name);
+	}
 
 	// Build column list based on projection pushdown (column_ids)
 	// column_ids contains the indices of columns needed from the table
@@ -617,14 +628,27 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		result->materialized = make_uniq<ColumnDataCollection>(context, chunk_types);
 		DataChunk chunk;
 		chunk.Initialize(Allocator::Get(context), chunk_types);
+		// What Execute's first call does for its own output chunk.
+		BindRowIdTargetVectors(*result, chunk);
 		idx_t total = 0;
 		for (;;) {
 			chunk.Reset();
-			const idx_t rows = result->result_stream->FillChunk(chunk);
+			idx_t rows = result->result_stream->FillChunk(chunk);
 			if (rows == 0) {
 				break;
 			}
 			PopulateRowIdVector(*result, chunk, rows);
+			// The filters the encoder did not push run here, as in Execute: the
+			// collection is served as it stands, and DuckDB does not re-check a
+			// filter it handed to the scan (issue #451 -- a materialized scan
+			// returned rows such a filter rejects, so an UPDATE in a transaction
+			// changed them).
+			if (!result->client_filters.empty()) {
+				rows = ApplyClientFilters(context, *result, chunk, rows);
+				if (rows == 0) {
+					continue;
+				}
+			}
 			result->materialized->Append(chunk);
 			total += rows;
 		}
@@ -747,6 +771,69 @@ static void PopulateRowIdVector(MSSQLScanGlobalState &state, DataChunk &output, 
 	}
 }
 
+// Composite-key rowid: the stream writes the key columns the projection lacks
+// straight into the rowid STRUCT's children of `chunk` (SetTargetVectors).
+// Bound to the chunk the stream fills -- the Execute output chunk, or the
+// materializing drain's own chunk (issue #451 found the drain filling a chunk
+// whose STRUCT children nothing wrote: an UPDATE in a transaction on a
+// composite key it did not project crashed copying their garbage). The
+// pointers survive DataChunk::Reset: they point into the cache-owned struct
+// storage Reset re-references.
+static void BindRowIdTargetVectors(MSSQLScanGlobalState &global_state, DataChunk &output) {
+	if (!global_state.composite_pk_direct_to_struct || !global_state.result_stream) {
+		return;
+	}
+	auto &rowid_vector = output.data[global_state.rowid_output_idx];
+	auto &entries = StructVector::GetEntries(rowid_vector);
+
+	if (global_state.pk_columns_added) {
+		// Composite PK with other columns, some PK columns may be in user projection
+		// SQL: [user_cols..., added_pk_cols...]
+		// - User cols go to their output positions
+		// - Added PK cols (not in projection) go to STRUCT children
+		// - PK cols already in projection need to be copied to STRUCT children after fill
+		vector<Vector *> target_vectors;
+
+		// First, add targets for user columns (based on column_ids order)
+		for (idx_t out_col = 0; out_col < output.ColumnCount(); out_col++) {
+			// Skip rowid position - PK columns go to STRUCT children
+			if (out_col == global_state.rowid_output_idx) {
+				continue;
+			}
+			target_vectors.push_back(&output.data[out_col]);
+		}
+
+		// Then add STRUCT children ONLY for PK columns that were ADDED (not in projection)
+		// pk_result_indices[i] == UINT64_MAX means the column was added for rowid
+		idx_t added_pk_count = 0;
+		for (idx_t pk_idx = 0; pk_idx < global_state.pk_result_indices.size(); pk_idx++) {
+			if (global_state.pk_result_indices[pk_idx] == UINT64_MAX) {
+				// This PK column was added - SQL will write to STRUCT child
+				target_vectors.push_back(&entries[pk_idx]);
+				added_pk_count++;
+			}
+			// PK columns already in projection will be copied after FillChunk
+		}
+
+		idx_t total_cols = target_vectors.size();
+		global_state.result_stream->SetTargetVectors(std::move(target_vectors));
+		global_state.result_stream->SetColumnsToFill(total_cols);
+
+		MSSQL_SCAN_DEBUG_LOG(1, "Execute: pk_columns_added composite mode - %llu user cols + %llu added PK cols",
+							 (unsigned long long)(total_cols - added_pk_count), (unsigned long long)added_pk_count);
+	} else {
+		// Composite PK rowid-only: write directly to STRUCT children
+		vector<Vector *> target_vectors;
+		for (auto &entry : entries) {
+			target_vectors.push_back(&entry);
+		}
+		global_state.result_stream->SetTargetVectors(std::move(target_vectors));
+		global_state.result_stream->SetColumnsToFill(entries.size());
+
+		MSSQL_SCAN_DEBUG_LOG(1, "Execute: composite rowid-only - %zu STRUCT children", entries.size());
+	}
+}
+
 static void TableScanExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &global_state = data.global_state->Cast<MSSQLScanGlobalState>();
 
@@ -769,59 +856,7 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 		global_state.timing_started = true;
 		MSSQL_SCAN_DEBUG_LOG(1, "Execute: FIRST CALL - scan started");
 
-		// Set up target vectors for composite PK cases
-		if (global_state.composite_pk_direct_to_struct && global_state.result_stream) {
-			auto &rowid_vector = output.data[global_state.rowid_output_idx];
-			auto &entries = StructVector::GetEntries(rowid_vector);
-
-			if (global_state.pk_columns_added) {
-				// Composite PK with other columns, some PK columns may be in user projection
-				// SQL: [user_cols..., added_pk_cols...]
-				// - User cols go to their output positions
-				// - Added PK cols (not in projection) go to STRUCT children
-				// - PK cols already in projection need to be copied to STRUCT children after fill
-				vector<Vector *> target_vectors;
-
-				// First, add targets for user columns (based on column_ids order)
-				for (idx_t out_col = 0; out_col < output.ColumnCount(); out_col++) {
-					// Skip rowid position - PK columns go to STRUCT children
-					if (out_col == global_state.rowid_output_idx) {
-						continue;
-					}
-					target_vectors.push_back(&output.data[out_col]);
-				}
-
-				// Then add STRUCT children ONLY for PK columns that were ADDED (not in projection)
-				// pk_result_indices[i] == UINT64_MAX means the column was added for rowid
-				idx_t added_pk_count = 0;
-				for (idx_t pk_idx = 0; pk_idx < global_state.pk_result_indices.size(); pk_idx++) {
-					if (global_state.pk_result_indices[pk_idx] == UINT64_MAX) {
-						// This PK column was added - SQL will write to STRUCT child
-						target_vectors.push_back(&entries[pk_idx]);
-						added_pk_count++;
-					}
-					// PK columns already in projection will be copied after FillChunk
-				}
-
-				idx_t total_cols = target_vectors.size();
-				global_state.result_stream->SetTargetVectors(std::move(target_vectors));
-				global_state.result_stream->SetColumnsToFill(total_cols);
-
-				MSSQL_SCAN_DEBUG_LOG(
-					1, "Execute: pk_columns_added composite mode - %llu user cols + %llu added PK cols",
-					(unsigned long long)(total_cols - added_pk_count), (unsigned long long)added_pk_count);
-			} else {
-				// Composite PK rowid-only: write directly to STRUCT children
-				vector<Vector *> target_vectors;
-				for (auto &entry : entries) {
-					target_vectors.push_back(&entry);
-				}
-				global_state.result_stream->SetTargetVectors(std::move(target_vectors));
-				global_state.result_stream->SetColumnsToFill(entries.size());
-
-				MSSQL_SCAN_DEBUG_LOG(1, "Execute: composite rowid-only - %zu STRUCT children", entries.size());
-			}
-		}
+		BindRowIdTargetVectors(global_state, output);
 	}
 
 	// Check if we're done
@@ -1268,27 +1303,18 @@ static virtual_column_map_t GetVirtualColumns(ClientContext &context, optional_p
 }
 
 //------------------------------------------------------------------------------
-// Bind Info (for GetTable() support)
+// Table entry (for GetTable() support)
 //------------------------------------------------------------------------------
 
-// Callback to return table entry for GetTable() support
-// This allows DuckDB to use the table entry's GetVirtualColumns() override
-static BindInfo GetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
+// The table a catalog scan reads, for LogicalGet::GetTable(): the binder finds
+// the table entry's GetVirtualColumns() (rowid) and an UPDATE / DELETE target
+// through it. A callback of its own since DuckDB cb8eeaefed9 (it used to ride
+// in BindInfo).
+static optional_ptr<TableCatalogEntry> GetTableEntry(optional_ptr<const FunctionData> bind_data_p) {
 	if (!bind_data_p) {
-		return BindInfo(ScanType::EXTERNAL);
+		return nullptr;
 	}
-
-	auto &bind_data = bind_data_p->Cast<MSSQLCatalogScanBindData>();
-
-	if (bind_data.table_entry) {
-		// Return BindInfo with table entry - this enables GetTable() to work
-		// and allows DuckDB to call the table entry's GetVirtualColumns()
-		// The BindInfo constructor takes a non-const reference
-		auto &table_ref = const_cast<TableCatalogEntry &>(*bind_data.table_entry);
-		return BindInfo(table_ref);
-	}
-
-	return BindInfo(ScanType::EXTERNAL);
+	return bind_data_p->Cast<MSSQLCatalogScanBindData>().table_entry;
 }
 
 //------------------------------------------------------------------------------
@@ -1361,6 +1387,7 @@ static void CatalogScanSerialize(Serializer &serializer, const optional_ptr<Func
 	serializer.WriteProperty(107, "complex_filter_param_declarations", param_declarations);
 	serializer.WriteProperty(108, "complex_filter_param_literals", param_literals);
 	serializer.WritePropertyWithDefault(109, "complex_filter_param_values", param_values);
+	serializer.WritePropertyWithDefault(110, "joins_statement", bind_data.joins_statement, false);
 }
 
 // DuckDB round-trips a logical plan to copy it: CTE inlining copies a CTE
@@ -1379,6 +1406,7 @@ static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserialize
 	auto param_declarations = deserializer.ReadProperty<vector<string>>(107, "complex_filter_param_declarations");
 	auto param_literals = deserializer.ReadProperty<vector<string>>(108, "complex_filter_param_literals");
 	auto param_values = deserializer.ReadPropertyWithDefault<vector<Value>>(109, "complex_filter_param_values");
+	auto joins_statement = deserializer.ReadPropertyWithDefault<bool>(110, "joins_statement");
 
 	auto &context = deserializer.Get<ClientContext &>();
 
@@ -1404,6 +1432,7 @@ static unique_ptr<FunctionData> CatalogScanDeserialize(Deserializer &deserialize
 
 	auto &result = bind_data->Cast<MSSQLCatalogScanBindData>();
 	result.requires_materialization = requires_materialization;
+	result.joins_statement = joins_statement;
 	result.complex_filter_where_clause = complex_filter_where_clause;
 	if (param_declarations.size() != param_literals.size()) {
 		throw SerializationException("MSSQL: catalog scan parameter lists differ in length");
@@ -1455,9 +1484,10 @@ TableFunction GetCatalogScanFunction() {
 	// This is called during binding to determine what virtual columns are available
 	func.get_virtual_columns = GetVirtualColumns;
 
-	// Return table entry for GetTable() support - enables DuckDB to discover
-	// virtual columns like rowid from the table entry's GetVirtualColumns()
-	func.get_bind_info = GetBindInfo;
+	// The table entry for LogicalGet::GetTable() - the binder reads the rowid
+	// columns and the UPDATE / DELETE target from it (the scan's own virtual
+	// columns come from get_virtual_columns above)
+	func.get_table_entry = GetTableEntry;
 
 	// Note: We don't set filter_prune = true because that can cause issues with
 	// the DataChunk column count when filter-only columns are excluded

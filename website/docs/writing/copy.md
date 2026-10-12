@@ -211,6 +211,13 @@ SELECT mssql_exec('sqlserver', 'DROP TABLE dbo.Dst');
 SELECT mssql_invalidate_cache('sqlserver');   -- the catalog cache does not see it go
 ```
 
+Or opt in: with `SET mssql_ctas_use_bcp = false` a CTAS runs **whole inside the
+transaction** -- the checks, the `CREATE` and the rows (as INSERT statements, one
+connection) -- and `ROLLBACK` drops the table (issue #451). In autocommit the
+statement's own transaction takes that role: the CTAS commits when the
+statement does, and an error in it leaves no table. The price is the bulk load's
+speed.
+
 ### Performance Characteristics
 
 - **Protocol**: Uses TDS BulkLoadBCP (packet type 0x07) for maximum throughput

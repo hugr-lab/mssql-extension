@@ -198,6 +198,7 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	// refuse it without IDENTITY_INSERT -- W4 is what makes this decidable),
 	// and the setting itself. Whether the rows are FEW enough to stay on the
 	// statement path is not known here; the sink decides that at the threshold.
+	config.join_statement_transaction = planning_merge_actions || !config.use_bcp;
 	MSSQLInsertBulkPlan bulk;
 	bulk.threshold = config.bcp_threshold;
 	if (op.return_chunk) {
@@ -433,10 +434,11 @@ static string KeylessPlanRefusal(ClientContext &context, PhysicalOperator &plan,
 }
 
 //! Review of #423: a DML's batches go down the connection its feeding scans
-//! read from when that connection is shared -- the transaction's pinned one, or
-//! a pool of one -- so MSSQLOptimizer materialises those scans
-//! (MaterializeSharedConnectionScans, the same test). DuckDB skips the
-//! extension's optimizer under `SET enable_optimizer = false`; such a scan
+//! read from -- the pinned one, of the explicit transaction or (issue #451) of
+//! the autocommit statement, which every DML joins
+//! (ConnectionProvider::JoinStatementTransaction) -- so MSSQLOptimizer
+//! materialises those scans (MaterializeSharedConnectionScans). DuckDB skips
+//! the extension's optimizer under `SET enable_optimizer = false`; such a scan
 //! still streams when the first batch would go, and RequireIdle refuses it.
 //! Then the statement holds its rows until Finalize, after the scan drained,
 //! as every DML did before spec 080 PR 1.
@@ -457,10 +459,6 @@ static bool FeedsFromStreamingScan(ClientContext &context, MSSQLCatalog &catalog
 		}
 	}
 	return false;
-}
-
-static bool ConnectionShared(ClientContext &context, MSSQLCatalog &catalog) {
-	return !context.transaction.IsAutoCommit() || catalog.GetConnectionLimit() <= 1;
 }
 
 //! Whether INSERT BULK can carry every column into the stage. A geometry /
@@ -674,7 +672,7 @@ static PhysicalOperator &PlanKeylessDml(ClientContext &context, PhysicalPlanGene
 	target.flush_rows = mssql::LoadBCPCopyConfig(context).flush_rows;
 	target.query_timeout_seconds = LoadQueryTimeout(context);
 	target.table_entry = &table_entry;
-	target.hold_until_finalize = ConnectionShared(context, catalog) && FeedsFromStreamingScan(context, catalog, plan);
+	target.hold_until_finalize = FeedsFromStreamingScan(context, catalog, plan);
 	vector<LogicalType> result_types{LogicalType::BIGINT};
 	if (returning_types) {
 		PrepareReturning(context, table_entry, target, *returning_types);
@@ -741,18 +739,15 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 
 	// Load DML configuration from settings
 	MSSQLDMLConfig config = LoadDMLConfig(context);
-	// Always for a MERGE action, not only where the actions share a connection.
-	// In autocommit on a larger pool each action has its own connection and
-	// its own server transaction, committed at its Finalize; streaming, an
-	// UPDATE action would hold its locks while an INSERT action's bulk load (BU
-	// lock under TABLOCK on a heap) waits on them, the INSERT pipeline would
-	// stall, DuckDB's exchange would block the MERGE, and the UPDATE action
-	// would never reach the Finalize that commits -- a cycle through the
-	// client that SQL Server's deadlock detector cannot see. Deferred, every
-	// action writes after every sink has finished. The cost is the rows held
-	// in memory; spec 080 PR 4 gives the actions one connection instead.
-	config.defer_to_finalize =
-		planning_merge_actions || (ConnectionShared(context, *this) && FeedsFromStreamingScan(context, *this, plan));
+	// Always for a MERGE action. Its actions share the statement's one pinned
+	// connection (in autocommit too since issue #451) and are fed from several
+	// threads; deferred, every action writes after every sink has finished.
+	// Before #451 each action had its own connection and server transaction in
+	// autocommit, and a streaming UPDATE action held its locks while an INSERT
+	// action's bulk load waited on them -- a cycle through the client SQL
+	// Server's deadlock detector cannot see. The cost is the rows held in
+	// memory; spec 080 PR 4 moves MERGE to the server.
+	config.defer_to_finalize = planning_merge_actions || FeedsFromStreamingScan(context, *this, plan);
 
 	// Result type is BIGINT (row count)
 	vector<LogicalType> result_types;
@@ -769,7 +764,7 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	const bool always_stage = op.return_chunk || !caps.update_from_join;
 	if (always_stage) {
 		RefuseUnstageable(caps, "DELETE", table_entry, can_stage, op.return_chunk);
-		staged.hold_until_finalize = ConnectionShared(context, *this) && FeedsFromStreamingScan(context, *this, plan);
+		staged.hold_until_finalize = FeedsFromStreamingScan(context, *this, plan);
 		vector<LogicalType> types{LogicalType::BIGINT};
 		if (op.return_chunk) {
 			PrepareReturning(context, table_entry, staged, op.types);
@@ -886,18 +881,15 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 
 	// Load DML configuration from settings
 	MSSQLDMLConfig config = LoadDMLConfig(context);
-	// Always for a MERGE action, not only where the actions share a connection.
-	// In autocommit on a larger pool each action has its own connection and
-	// its own server transaction, committed at its Finalize; streaming, an
-	// UPDATE action would hold its locks while an INSERT action's bulk load (BU
-	// lock under TABLOCK on a heap) waits on them, the INSERT pipeline would
-	// stall, DuckDB's exchange would block the MERGE, and the UPDATE action
-	// would never reach the Finalize that commits -- a cycle through the
-	// client that SQL Server's deadlock detector cannot see. Deferred, every
-	// action writes after every sink has finished. The cost is the rows held
-	// in memory; spec 080 PR 4 gives the actions one connection instead.
-	config.defer_to_finalize =
-		planning_merge_actions || (ConnectionShared(context, *this) && FeedsFromStreamingScan(context, *this, plan));
+	// Always for a MERGE action. Its actions share the statement's one pinned
+	// connection (in autocommit too since issue #451) and are fed from several
+	// threads; deferred, every action writes after every sink has finished.
+	// Before #451 each action had its own connection and server transaction in
+	// autocommit, and a streaming UPDATE action held its locks while an INSERT
+	// action's bulk load waited on them -- a cycle through the client SQL
+	// Server's deadlock detector cannot see. The cost is the rows held in
+	// memory; spec 080 PR 4 moves MERGE to the server.
+	config.defer_to_finalize = planning_merge_actions || FeedsFromStreamingScan(context, *this, plan);
 
 	// Result type is BIGINT (row count)
 	vector<LogicalType> result_types;
@@ -919,7 +911,7 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 	const bool always_stage = op.return_chunk || !caps.update_from_join;
 	if (always_stage) {
 		RefuseUnstageable(caps, "UPDATE", table_entry, stage_update, op.return_chunk);
-		staged.hold_until_finalize = ConnectionShared(context, *this) && FeedsFromStreamingScan(context, *this, plan);
+		staged.hold_until_finalize = FeedsFromStreamingScan(context, *this, plan);
 		vector<LogicalType> types{LogicalType::BIGINT};
 		if (op.return_chunk) {
 			PrepareReturning(context, table_entry, staged, op.types);
