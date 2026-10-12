@@ -24,6 +24,37 @@ INSERT INTO sqlserver.dbo.target_table (name, value)
 SELECT name, value FROM local_source_table;
 ```
 
+When the source is in the same SQL Server database, the INSERT is sent to the
+server as **one statement**, and no row crosses the wire:
+
+```sql
+EXPLAIN INSERT INTO sqlserver.dbo.archive (id, total) SELECT id, total FROM sqlserver.dbo.orders WHERE year = 2020;
+-- Mssql Dml
+--   Statement: INSERT INTO [dbo].[archive] ([id], [total])
+--              SELECT [id], [total] FROM [dbo].[orders] WHERE ([year] = @p0)
+```
+
+It goes when every value is one the server can copy without a conversion of
+its own:
+- for a number, a `bit` or a `date` column, a value of the column's type, or
+  an integer widened into a wider one;
+- for any other column (strings, the date-time types, binary, geometry), a
+  column declared exactly alike. The server copies it exactly, which the row
+  path cannot always do, because it reads the value through DuckDB: there a
+  `datetimeoffset` loses its offset, a `time(7)` its 100 ns digit, a
+  `datetime2(7)` past 2262 becomes NULL and a geometry gets SRID 0;
+- a column the statement does not name gets the server's DEFAULT on both paths;
+- naming the identity column runs the statement between `SET IDENTITY_INSERT`
+  ON and OFF, as the row path does.
+
+The rows go through DuckDB, as below, for:
+- `VALUES`;
+- a source from DuckDB or another database;
+- RETURNING, `ON CONFLICT`, `BY NAME`;
+- a string constant or a value DuckDB would convert.
+
+`SET mssql_dml_pushdown = false` keeps every INSERT on the row paths.
+
 ### INSERT with RETURNING
 
 Get inserted values back (uses SQL Server's OUTPUT INSERTED):
@@ -354,6 +385,10 @@ SELECT's does (see [collation](#collation)).
 - its result is the same `Count` column;
 - it runs once and to the end, even when the client never reads the result;
 - `EXPLAIN` and `PREPARE` run nothing;
+- it waits as long as the statement takes, so `mssql_query_timeout` does not
+  cut a large copy short. Cancelling the query (Ctrl-C) cancels the statement,
+  and the server rolls it back. A connection that dies is noticed through TCP
+  keepalive within about 90 seconds;
 - its statement *type* is SELECT, so a driver that branches on the statement
   type rather than on the result sees a query;
 - an error is SQL Server's own.

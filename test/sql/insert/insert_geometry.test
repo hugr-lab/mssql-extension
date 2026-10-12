@@ -47,9 +47,16 @@ SELECT mssql_invalidate_cache('geoi');
 
 # --- the round trip: read from one table, write into another. Every shape
 # below is a different branch of the WKB reader, so a wrapper that only works
-# for points would fail here.
+# for points would fail here. (The shipped path: within one catalog the INSERT
+# would go to the server whole since spec 080 PR 3d, the WKB never read.)
+statement ok
+SET mssql_dml_pushdown = false;
+
 statement ok
 INSERT INTO geoi.dbo.GeoInsDst (id, g, gg) SELECT id, g, gg FROM geoi.dbo.GeoInsSrc;
+
+statement ok
+RESET mssql_dml_pushdown;
 
 query III
 SELECT * FROM mssql_scan('geoi', 'SELECT id, g.STAsText() AS geom, ISNULL(gg.STAsText(), ''(null)'') AS geog FROM dbo.GeoInsDst ORDER BY id');

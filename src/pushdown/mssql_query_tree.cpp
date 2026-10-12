@@ -10,9 +10,11 @@
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/delete_query_node.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
@@ -169,6 +171,16 @@ void VisitNode(QueryNode &node, const NestedNodeVisitor &on_node, const BaseTabl
 			}
 		}
 		for (auto &item : update.returning_list) {
+			VisitExpression(*item, on_node);
+		}
+	} else if (node.type == QueryNodeType::INSERT_QUERY_NODE) {
+		// Spec 080 PR 3d: an INSERT's SELECT is its nested node; the target is a
+		// name (qualified_name), resolved by the catalog on its own.
+		auto &insert = node.Cast<InsertQueryNode>();
+		if (insert.select_statement && insert.select_statement->node) {
+			on_node(insert.select_statement->node);
+		}
+		for (auto &item : insert.returning_list) {
 			VisitExpression(*item, on_node);
 		}
 	} else if (node.type == QueryNodeType::DELETE_QUERY_NODE) {

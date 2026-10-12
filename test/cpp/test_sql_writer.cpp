@@ -14,8 +14,10 @@
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/delete_query_node.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
@@ -140,7 +142,13 @@ static bool WriteDml(const std::string &sql, WrittenQuery &out, std::string &why
 	auto parser = Parser::GetBuiltinParser();
 	parser.ParseQuery(sql);
 	auto &statement = *parser.statements[0];
-	const QueryNode &node = statement.type == StatementType::UPDATE_STATEMENT
+	const bool insert = statement.type == StatementType::INSERT_STATEMENT;
+	BaseTableRef target;
+	if (insert) {
+		target.SetQualifiedName(statement.Cast<InsertStatement>().node->qualified_name);
+	}
+	const QueryNode &node = insert ? static_cast<const QueryNode &>(*statement.Cast<InsertStatement>().node)
+							: statement.type == StatementType::UPDATE_STATEMENT
 								? static_cast<const QueryNode &>(*statement.Cast<UpdateStatement>().node)
 								: static_cast<const QueryNode &>(*statement.Cast<DeleteStatement>().node);
 	SQLWriterOptions options;
@@ -157,7 +165,7 @@ static bool WriteDml(const std::string &sql, WrittenQuery &out, std::string &why
 		table.is_view = name == "v";
 		return true;
 	});
-	return writer.WriteDml(node, out, why);
+	return insert ? writer.WriteInsert(node, target, out, why) : writer.WriteDml(node, out, why);
 }
 
 static void ExpectDml(const std::string &sql, const std::string &expected, bool from_join = true) {
@@ -218,6 +226,24 @@ int main() {
 	ExpectDmlVeto("DELETE FROM t WHERE id IN (SELECT t_id FROM u)", false);	 // the single-table form names columns bare
 	ExpectDmlVeto("WITH c AS (SELECT id FROM u) DELETE FROM t WHERE id IN (SELECT id FROM c)");
 	ExpectDmlVeto("DELETE FROM t WHERE lower(name) = 'x'");	 // a function the writer has no T-SQL for
+	// Spec 080 PR 3d: INSERT ... SELECT. The SELECT's columns are written as
+	// themselves (no read cast: the value stays on the server).
+	ExpectDml("INSERT INTO u (id) SELECT id FROM t WHERE flag = true",
+			  "INSERT INTO [dbo].[u] ([id]) SELECT [id] FROM [dbo].[t] WHERE ([flag] = @p0)");
+	ExpectDml("INSERT INTO t (legacy) SELECT legacy FROM t",
+			  "INSERT INTO [dbo].[t] ([legacy]) SELECT [legacy] FROM [dbo].[t]");
+	ExpectDml("INSERT INTO u (big) SELECT id FROM t",
+			  "INSERT INTO [dbo].[u] ([big]) SELECT [id] FROM [dbo].[t]");	// widened
+	ExpectDmlVeto("INSERT INTO t (tiny) SELECT id FROM t");					// narrowed: DuckDB casts, may fail
+	ExpectDmlVeto("INSERT INTO u (label) SELECT name FROM t");				// strings declared apart
+	ExpectDmlVeto("INSERT INTO u (id, t_id) SELECT id FROM t");				// one value for two columns
+	ExpectDmlVeto("INSERT INTO u (id, label) SELECT id, 'x' FROM t");		// the server types the constant
+	ExpectDmlVeto("INSERT INTO u (id) VALUES (1)");
+	ExpectDmlVeto("INSERT INTO u (id) SELECT id FROM t RETURNING id");
+	ExpectDmlVeto("INSERT OR REPLACE INTO u (id) SELECT id FROM t");
+	ExpectDmlVeto("INSERT INTO u BY NAME SELECT id FROM t");
+	ExpectDmlVeto("INSERT INTO u (id) SELECT id FROM t UNION ALL SELECT id FROM t");
+
 	// A DATE SQL Server's date cannot hold: the RPC encoder would wrap it
 	// ('infinity' lands on 1969-12-31).
 	ExpectDml("UPDATE t SET day = '2024-01-31' WHERE id = 1",

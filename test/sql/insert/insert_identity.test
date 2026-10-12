@@ -61,12 +61,19 @@ SELECT id, v FROM idt.dbo.IdBasic ORDER BY id;
 # With it: the values land verbatim.
 # =============================================================================
 
-statement ok
+# The count is the rows inserted: these went in one batch, sent at Finalize,
+# and the count used to miss it -- Count 0 for every row inserted (found by
+# spec 080 PR 3d's agreement suite).
+query I
 INSERT INTO idt.dbo.IdBasic (id, v) VALUES (100, 12), (200, 13);
+----
+2
 
 # positional with every column is the same statement once bound
-statement ok
+query I
 INSERT INTO idt.dbo.IdBasic VALUES (300, 14);
+----
+1
 
 query II
 SELECT id, v FROM idt.dbo.IdBasic WHERE id >= 100 ORDER BY id;

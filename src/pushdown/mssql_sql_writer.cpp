@@ -117,6 +117,21 @@ bool SQLWriter::WriteDml(const QueryNode &node, WrittenQuery &out, std::string &
 	return true;
 }
 
+bool SQLWriter::WriteInsert(const QueryNode &node, const BaseTableRef &target, WrittenQuery &out, std::string &why) {
+	out = WrittenQuery();
+	if (node.type != QueryNodeType::INSERT_QUERY_NODE) {
+		why = "not an INSERT";
+		return false;
+	}
+	NodeWriter writer(options_, resolver_, out, why);
+	writer.SetWrittenUnqualified(&written_unqualified_);
+	if (!writer.WriteInsert(node.Cast<InsertQueryNode>(), target)) {
+		return false;
+	}
+	writer.TakeParams(out.params);
+	return true;
+}
+
 std::string ColumnTypeName(const LogicalType &type) {
 	if (type.id() == LogicalTypeId::INVALID) {
 		// A computed column: '' leaves the vehicle the type the server describes.

@@ -114,6 +114,21 @@ SELECT v FROM dv.dbo.dv_t WHERE id = 1;
 statement ok
 RESET threads;
 
+# --- no deadline: the statement answers nothing until its DONE, and a pushed
+# copy of millions of rows takes as long as it takes -- mssql_query_timeout is
+# not a limit on it (Ctrl-C is: test/cpp/test_dml_vehicle.cpp) --------------
+
+statement ok
+SET mssql_query_timeout = 1;
+
+query I
+SELECT * FROM mssql_dml('dv', 'WAITFOR DELAY ''00:00:03''; UPDATE [dbo].[dv_t] SET [v] = [v] WHERE [id] = 1', kind := 'update', target_schema := 'dbo', target_table := 'dv_t');
+----
+1
+
+statement ok
+RESET mssql_query_timeout;
+
 # --- an AFTER trigger's own counts arrive before the statement's: the count is
 # the statement's (the trigger updates 7 rows) --------------------------------
 
@@ -314,7 +329,7 @@ DETACH dv2;
 statement error
 SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 0', kind := 'merge', target_schema := 'dbo', target_table := 'dv_t');
 ----
-kind := must be 'update' or 'delete'
+kind := must be 'update', 'delete' or 'insert'
 
 statement error
 SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 0', kind := 'update');

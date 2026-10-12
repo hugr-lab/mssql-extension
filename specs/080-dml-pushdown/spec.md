@@ -245,6 +245,34 @@ No gain threshold applies. A DML either goes whole or plans as today.
   21 shapes, Fabric's forms among them, through a pushing alias and a
   `remote_pushdown false` one (generated from one list). Rows and counts
   agree.
+- **INSERT … SELECT (PR 3d).**
+  - The SELECT is the SELECT writer's, with `raw_columns_`: a column is
+    written as itself, not through the read expression a client needs. The
+    value stays on the server, so a code-page varchar and a geometry copy as
+    they are.
+  - Each value must be one the server copies with no conversion of its own:
+    the SET rule, plus an integer widened into a wider one (exact on both
+    sides; the SET rule takes it too since this PR).
+  - A same-declaration copy is EXACT on the server, which the row path is
+    not for every type. It reads the value through DuckDB, so it drops a
+    datetimeoffset's offset and time(7)'s 100 ns digit, turns datetime2(7)
+    past 2262 into NULL, gives geometry SRID 0, and loses sql_variant's base
+    type. For those types the two paths store different values; the pushed
+    one is the faithful one (review of 3d; PR 3c's `SET a = b` too).
+  - The has_default veto stays withdrawn: an omitted column gets the server's
+    DEFAULT on both paths.
+  - A named identity column makes the vehicle bracket the statement with
+    IDENTITY_INSERT.
+  - A refused INSERT keeps the rewriter's own fallback, its SELECT pushed
+    alone. A set-operation source is refused on the first ask; once the
+    fallback wrapped it as `SELECT * FROM (…)`, the rewriter's second ask
+    pushes the INSERT with it as a derived table.
+  - The agreement suite gained six INSERT shapes (27 in all), the target
+    compared without its identity column (its values follow arrival order).
+    One of them found a shipped-path bug: an INSERT that cannot use BCP
+    (identity named, geometry, a view, a CLR / sql_variant column, BCP off)
+    counted its last batch, sent at Finalize, as 0 rows -- Count 0 when it
+    fitted one batch. Fixed in the same PR.
 - **Shipped-path tests.** The files and blocks about the shipped path set
   `mssql_dml_pushdown = false`; otherwise they would quietly test the pushed
   path, as the 2500-row "staged" UPDATE of `keyed_staged_dml.test` did. That
@@ -1063,7 +1091,7 @@ risk", and this spec is no smaller. Each PR merges before the next opens
 | **2b** | RETURNING on the fallback (`OUTPUT … INTO #out`), split from PR 2 (owner, 2026-10-09); the capability is `output_into_table` (it was named after `@t`) | UPDATE / DELETE … RETURNING return rows instead of a named refusal |
 | **3b** | W1's vehicle: `mssql_dml` (`FORCED`, `CHANGED_ROWS`, `RegisterDBModify`, the run-once latch, the count from the last DONE), the at-least-once gate, the `dml_*` counters; the spec corrected by what PR 3's planning measured (`exact_count`, `has_default` and the INSTEAD OF veto withdrawn, the DML-CTE rule). PR 3 was split in four, and 3a (RETURNVALUE, `has_default`, INSTEAD OF) dissolved under those measurements (owner, 2026-10-11) | callable on its own; the gate decides before the writer exists |
 | **3c** | W2 for UPDATE / DELETE: the writer's nodes, the catalog's hooks, D1's vetoes, `mssql_dml_pushdown`; the agreement harness | pushed UPDATE / DELETE end to end, PR 2's path under every veto |
-| **3d** | W2 for `INSERT … SELECT` (the identity bracket, the column type rule), the docs' final pass for PR 3 | its own shape and cases |
+| **3d** | W2 for `INSERT … SELECT` (the identity bracket, the column type rule, the SELECT's columns written as themselves), the docs' final pass for PR 3; the statement-path INSERT count fix the agreement suite found | its own shape and cases |
 | **later** | `ExecuteDmlBatch` (the four DML token loops folded into one, acceptance 7) | a refactor of the hot INSERT path, kept apart from new behaviour (owner, 2026-10-11) |
 | **4** | W7: MERGE on the server -- pushed when the source is on the same server, through `#src` otherwise, refused by name when not writable in T-SQL; the native path retired for the catalog | MERGE on top of PRs 2–3 (PR 1 made the native MERGE run in a transaction and on a pool of one, #423; it stays until this PR) |
 | **5** | D6 (pushed CTAS) and its docs; W9's final pass | droppable without touching PRs 1–4: every earlier PR carries its own docs |

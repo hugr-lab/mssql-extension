@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **INSERT … SELECT within one database runs on SQL Server as one statement**
+  (spec 080 PR 3d), through the same `mssql_dml` vehicle as a pushed UPDATE /
+  DELETE. No row crosses the wire, and a value is copied by the server as it
+  is.
+  - A number, `bit` or `date` must have the column's type or be an integer
+    widened into a wider one. Anything else must be a column declared alike.
+  - Such a copy is exact, which the row path is not for every type: it reads
+    the value through DuckDB. It drops a `datetimeoffset`'s offset and a
+    `time(7)`'s 100 ns digit, turns a `datetime2(7)` past 2262 into NULL,
+    gives a geometry SRID 0, and loses a `sql_variant`'s base type. So with
+    `mssql_dml_pushdown` on or off such a copy stores different values. The
+    pushed one is the faithful one. A pushed `UPDATE … SET a = b` (PR 3c) is
+    the same.
+  - A column the statement does not name gets the server's DEFAULT, as on the
+    row path. Naming the identity column brackets the statement with `SET
+    IDENTITY_INSERT`.
+  - These stay on the row paths: VALUES, a DuckDB or other-database source,
+    RETURNING, `ON CONFLICT`, `BY NAME`, a string constant.
+  - `mssql_dml_pushdown = false` keeps them all there.
+  - The SET rule of PR 3c now also takes an integer widened into a wider
+    column (`SET big = small`).
+  - A pushed UPDATE / DELETE / INSERT … SELECT has no deadline. The server
+    answers nothing until the statement is done, and `mssql_query_timeout`
+    (30 s) used to roll back a large copy that the row path finished.
+    Cancelling the query (Ctrl-C) cancels the statement (ATTENTION).
+  - Every connection now sets TCP keepalive (probes after 30 s idle, every
+    10 s, 6 unanswered), so a dead peer ends such a wait with an error in
+    about 90 s. It also keeps an idle pooled connection alive through a NAT
+    or load-balancer idle timeout.
+
 - **UPDATE and DELETE run on SQL Server as one statement** (spec 080 PR 3c),
   when their WHERE and SET can be written in T-SQL. No rows cross the wire and
   no key is needed: a table the row path refuses (no usable key, an `xml`
@@ -404,6 +434,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which used to be reserved up front.
 
 ### Fixed
+
+- **An INSERT that cannot use the bulk path counted its last batch as 0
+  rows.** This is an INSERT naming the identity column, with a geometry, CLR
+  or `sql_variant` column, into a view, or under `mssql_insert_use_bcp =
+  false`. One that fitted a single batch reported `Count` 0; a larger one was
+  short by its last batch. The rows were inserted; only the count was wrong.
+  Found by the agreement suite of spec 080 PR 3d.
 
 - **A date / time SQL Server cannot hold was sent as another value** (#447).
   The wire's three-byte day count kept the low bytes of what it was given:

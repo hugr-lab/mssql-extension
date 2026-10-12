@@ -132,9 +132,9 @@ FROM pending_changes;
 
 ### mssql_dml() (internal)
 
-The function a pushed `UPDATE` / `DELETE` will run through (spec 080): the remote-pushdown rewriter is to replace such a statement with `SELECT * FROM mssql_dml(...)`. It is the rewriter's target, not an API: its arguments carry no compatibility promise, and for a statement of your own `mssql_exec()` is the function to use.
+The function a pushed `UPDATE` / `DELETE` / `INSERT … SELECT` runs through (spec 080): the remote-pushdown rewriter replaces such a statement with `SELECT * FROM mssql_dml(...)`. It is the rewriter's target, not an API: its arguments carry no compatibility promise, and for a statement of your own `mssql_exec()` is the function to use.
 
-**Signature:** `mssql_dml(context VARCHAR, statement VARCHAR [, params STRUCT [, declarations VARCHAR]], kind := 'update' | 'delete', target_schema := VARCHAR, target_table := VARCHAR) -> TABLE(Count BIGINT)`
+**Signature:** `mssql_dml(context VARCHAR, statement VARCHAR [, params STRUCT [, declarations VARCHAR]], kind := 'update' | 'delete' | 'insert', target_schema := VARCHAR, target_table := VARCHAR [, identity_insert := BOOLEAN]) -> TABLE(Count BIGINT)`
 
 It behaves as the native DML it stands for:
 

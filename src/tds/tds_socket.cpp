@@ -13,6 +13,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <mstcpip.h>  // SIO_KEEPALIVE_VALS
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -255,6 +256,37 @@ bool TdsSocket::Connect(const std::string &host, uint16_t port, int timeout_seco
 	// Set TCP_NODELAY for low latency
 	int flag = 1;
 	setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, SOCK_OPT_CONST_CAST(&flag), sizeof(flag));
+
+	// TCP keepalive (spec 080 PR 3d): a statement may wait as long as it takes
+	// for its answer (a pushed INSERT ... SELECT has no deadline), so a peer
+	// that is gone -- a dropped network, a restarted server -- must end the
+	// wait with an error rather than leave it hanging. Probes after 30 s idle,
+	// every 10 s, 6 unanswered: about 90 s to notice. Also keeps an idle pooled
+	// connection alive through a NAT / load balancer idle timeout. Best effort:
+	// a platform refusing an option keeps its defaults.
+	setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, SOCK_OPT_CONST_CAST(&flag), sizeof(flag));
+	{
+#ifdef _WIN32
+		struct tcp_keepalive keepalive_values;
+		keepalive_values.onoff = 1;
+		keepalive_values.keepalivetime = 30000;		 // ms
+		keepalive_values.keepaliveinterval = 10000;	 // ms; Windows sends 10 probes
+		DWORD returned = 0;
+		WSAIoctl(fd_, SIO_KEEPALIVE_VALS, &keepalive_values, sizeof(keepalive_values), nullptr, 0, &returned, nullptr,
+				 nullptr);
+#else
+		int idle = 30;
+		int interval = 10;
+		int count = 6;
+#ifdef __APPLE__
+		setsockopt(fd_, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+#else
+		setsockopt(fd_, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+#endif
+		setsockopt(fd_, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+		setsockopt(fd_, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+#endif
+	}
 
 #ifdef __APPLE__
 	// On macOS, set SO_NOSIGPIPE to prevent SIGPIPE on write to closed socket
