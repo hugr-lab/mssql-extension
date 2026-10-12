@@ -31,44 +31,6 @@ static int GetTxnDebugLevel() {
 namespace {
 
 //===----------------------------------------------------------------------===//
-// Helper: Execute a simple SQL batch and receive complete response
-//===----------------------------------------------------------------------===//
-
-bool ExecuteAndDrain(duckdb::tds::TdsConnection &conn, const std::string &sql, int timeout_ms = 5000) {
-	if (!conn.ExecuteBatch(sql)) {
-		return false;
-	}
-
-	// Receive the complete TDS response via socket
-	auto *socket = conn.GetSocket();
-	if (!socket) {
-		return false;
-	}
-
-	std::vector<uint8_t> response;
-	if (!socket->ReceiveMessage(response, timeout_ms)) {
-		return false;
-	}
-
-	// Transition connection back to Idle (ExecuteBatch left it in Executing state)
-	conn.TransitionState(duckdb::tds::ConnectionState::Executing, duckdb::tds::ConnectionState::Idle);
-
-	return true;
-}
-
-//===----------------------------------------------------------------------===//
-// Helper: Verify clean transaction state (@@TRANCOUNT = 0)
-//===----------------------------------------------------------------------===//
-
-bool VerifyCleanTransactionState(duckdb::tds::TdsConnection &conn) {
-	// We could query @@TRANCOUNT here, but for simplicity we just assume
-	// the COMMIT/ROLLBACK succeeded if ExecuteBatch returned true.
-	// In a production implementation, you might want to actually check
-	// @@TRANCOUNT to ensure the transaction is fully closed.
-	return true;
-}
-
-//===----------------------------------------------------------------------===//
 // Helper: put back an isolation level the transaction's BEGIN set (issue #331)
 //===----------------------------------------------------------------------===//
 
@@ -258,6 +220,36 @@ string MSSQLTransaction::GetNextSavepointName() {
 	return "sp_" + std::to_string(++savepoint_counter_);
 }
 
+void MSSQLTransaction::JoinStatement() {
+	lock_guard<mutex> lock(connection_mutex_);
+	statement_joined_ = true;
+}
+
+bool MSSQLTransaction::IsStatementJoined() const {
+	lock_guard<mutex> lock(connection_mutex_);
+	return statement_joined_;
+}
+
+void MSSQLTransaction::SetIsolationSent() {
+	lock_guard<mutex> lock(connection_mutex_);
+	isolation_sent_ = true;
+}
+
+bool MSSQLTransaction::IsolationSent() const {
+	lock_guard<mutex> lock(connection_mutex_);
+	return isolation_sent_;
+}
+
+void MSSQLTransaction::DiscardConnectionAtEnd() {
+	lock_guard<mutex> lock(connection_mutex_);
+	discard_connection_ = true;
+}
+
+bool MSSQLTransaction::ShouldDiscardConnection() const {
+	lock_guard<mutex> lock(connection_mutex_);
+	return discard_connection_;
+}
+
 //===----------------------------------------------------------------------===//
 // MSSQLTransactionManager Implementation
 //===----------------------------------------------------------------------===//
@@ -280,130 +272,174 @@ Transaction &MSSQLTransactionManager::StartTransaction(ClientContext &context) {
 	return result;
 }
 
-ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
-	lock_guard<mutex> lock(transaction_lock_);
+//! Ends the transaction's server transaction on its pinned connection -- COMMIT
+//! or ROLLBACK -- and gives the connection back. Returns the server's refusal of
+//! a COMMIT, empty otherwise.
+//!
+//! The answer is read (MSSQLSimpleQuery, as mssql::LoadTransaction does), not
+//! drained: a refused COMMIT used to count as done. Since issue #451 every
+//! autocommit write commits here, so it matters. A COMMIT the server refused is
+//! followed by a ROLLBACK; a ROLLBACK it did not confirm -- refused, timed out,
+//! the connection mid-response -- closes the connection, which ends the session
+//! and with it the transaction, rather than pooling one in an unknown state.
+//! The connection goes back to the pool on every path (a failed COMMIT used to
+//! keep it out of the pool for good).
+//!
+//! No transaction_lock_ here: StartTransaction takes it for every statement on
+//! the catalog, and holding it across a round trip queued them all behind this
+//! COMMIT.
+static string EndServerTransaction(MSSQLCatalog &catalog, MSSQLTransaction &txn, bool commit) {
+	auto pinned_conn = txn.GetPinnedConnection();
+	if (!pinned_conn || !txn.IsSqlServerTransactionActive()) {
+		MSSQL_TXN_LOG("%s: No active SQL Server transaction (no-op)",
+					  commit ? "CommitTransaction" : "RollbackTransaction");
+		return string();
+	}
+	string commit_error;
+	bool rolled_back = !commit;
+	bool confirmed = false;
+	if (commit) {
+		MSSQL_TXN_LOG("CommitTransaction: Committing SQL Server transaction");
+		bool server_refused = false;
+		bool sent = false;
+		if (pinned_conn->GetState() == tds::ConnectionState::Idle) {
+			sent = true;
+			try {
+				auto result = MSSQLSimpleQuery::Execute(*pinned_conn, "COMMIT TRANSACTION");
+				confirmed = result.success;
+				if (!result.success) {
+					commit_error = result.DescribeError();
+					server_refused = result.error_number != 0;
+				}
+			} catch (std::exception &ex) {
+				commit_error = ex.what();
+			}
+		} else {
+			commit_error = string("the connection is ") + tds::ConnectionStateToString(pinned_conn->GetState());
+		}
+		if (!confirmed) {
+			// A refusal leaves nothing committed, and so does a COMMIT never sent
+			// (the server rolls back a session that ends). No answer at all -- a
+			// timeout, a dropped connection -- does not say whether the COMMIT
+			// reached the server before the connection went.
+			if (!sent) {
+				commit_error = "the COMMIT could not be sent (" + commit_error + "), nothing was written";
+			} else if (server_refused) {
+				commit_error = "the server refused the COMMIT, nothing was written: " + commit_error;
+			} else {
+				commit_error = "no answer to the COMMIT (" + commit_error +
+							   "): the server may or may not have committed; check the data";
+			}
+		}
+		if (!confirmed) {
+			MSSQL_TXN_LOG("CommitTransaction: COMMIT TRANSACTION failed: %s", commit_error.c_str());
+			rolled_back = true;
+		}
+	}
+	if (rolled_back) {
+		MSSQL_TXN_LOG("%s: Rolling back SQL Server transaction", commit ? "CommitTransaction" : "RollbackTransaction");
+		confirmed = false;
+		bool server_answered = false;
+		if (pinned_conn->GetState() == tds::ConnectionState::Idle) {
+			try {
+				auto result = MSSQLSimpleQuery::Execute(*pinned_conn, "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION");
+				confirmed = result.success;
+				server_answered = result.error_number != 0;
+			} catch (...) {
+				confirmed = false;
+			}
+		}
+		if (!confirmed && server_answered && pinned_conn->GetState() == tds::ConnectionState::Idle) {
+			// The server refused it -- typically because it had aborted the
+			// transaction already (an update conflict, 3960) and the descriptor is
+			// stale. Without the descriptor, ask whether anything is still open;
+			// a clean session keeps its place in the pool (issue #331's restore
+			// below runs on it).
+			pinned_conn->ClearTransactionDescriptor();
+			try {
+				auto open = MSSQLSimpleQuery::Execute(*pinned_conn, "SELECT @@TRANCOUNT");
+				confirmed = open.success && open.rows.size() == 1 && !open.rows[0].empty() && open.rows[0][0] == "0";
+			} catch (...) {
+				confirmed = false;
+			}
+		}
+		if (!confirmed || txn.ShouldDiscardConnection()) {
+			MSSQL_TXN_LOG(
+				"WARNING: ROLLBACK not confirmed, or the session must not be reused -- closing the connection");
+			try {
+				pinned_conn->Close();
+			} catch (...) {
+				// The shared_ptr destructor closes the socket regardless.
+			}
+		}
+	}
 
+	if (confirmed && !rolled_back && txn.ShouldDiscardConnection()) {
+		// IDENTITY_INSERT left on (spec 077 W2): the session goes, not back to the pool.
+		MSSQL_TXN_LOG("CommitTransaction: the session must not be reused -- closing the connection");
+		try {
+			pinned_conn->Close();
+		} catch (...) {
+		}
+	}
+	txn.SetSqlServerTransactionActive(false);
+	pinned_conn->ClearTransactionDescriptor();
+	if (confirmed && txn.IsolationSent() && pinned_conn->GetState() == tds::ConnectionState::Idle) {
+		RestoreIsolationLevel(catalog, *pinned_conn);
+	}
+
+	// Flag connection for reset — RESET_CONNECTION will be set on next SQL_BATCH TDS header.
+	//
+	// Honours `mssql_reset_connection` like every other release path
+	// (issue #189). A setting that meant "I own this session's state"
+	// everywhere EXCEPT after COMMIT would leave a user watching their
+	// temp objects survive in autocommit and vanish here, with nothing
+	// to read that explains it. The transaction itself is already
+	// resolved at this point — COMMIT or ROLLBACK ran, and the descriptor is
+	// cleared above — so what the reset drops here is session state,
+	// which is exactly what the setting is about.
+	const bool reset_on_release = txn.ShouldResetOnRelease();
+	MSSQL_TXN_LOG("%s: reset=%d, returning connection to pool", commit ? "CommitTransaction" : "RollbackTransaction",
+				  reset_on_release ? 1 : 0);
+	pinned_conn->SetNeedsReset(reset_on_release);
+	catalog.GetConnectionPool().Release(pinned_conn);
+	txn.SetPinnedConnection(nullptr);
+	return commit_error;
+}
+
+ErrorData MSSQLTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
 	auto &mssql_txn = transaction.Cast<MSSQLTransaction>();
 
-	MSSQL_TXN_LOG("CommitTransaction: context=%p, txn=%p, has_pinned=%d, sql_txn_active=%d", (void *)&context,
-				  (void *)&mssql_txn, mssql_txn.HasPinnedConnection(), mssql_txn.IsSqlServerTransactionActive());
+	MSSQL_TXN_LOG("CommitTransaction: context=%p, txn=%p, has_pinned=%d, sql_txn_active=%d, statement=%d",
+				  (void *)&context, (void *)&mssql_txn, mssql_txn.HasPinnedConnection(),
+				  mssql_txn.IsSqlServerTransactionActive(), mssql_txn.IsStatementJoined());
 
-	// Check if we have a pinned connection with an active SQL Server transaction
-	auto pinned_conn = mssql_txn.GetPinnedConnection();
-	if (pinned_conn && mssql_txn.IsSqlServerTransactionActive()) {
-		MSSQL_TXN_LOG("CommitTransaction: Committing SQL Server transaction");
-
-		// Execute COMMIT TRANSACTION
-		if (!ExecuteAndDrain(*pinned_conn, "COMMIT TRANSACTION")) {
-			// Commit failed - keep connection pinned and return error
-			// The user will need to rollback or retry
-			MSSQL_TXN_LOG("CommitTransaction: COMMIT TRANSACTION failed: %s", pinned_conn->GetLastError().c_str());
-			string error_msg = "MSSQL: Failed to commit transaction: " + pinned_conn->GetLastError();
-			ForgetTransactionMetadata(catalog_, mssql_txn);
-			transactions_.erase(context);
-			return ErrorData(ExceptionType::IO, error_msg);
-		}
-
-		// Verify clean state
-		if (!VerifyCleanTransactionState(*pinned_conn)) {
-			MSSQL_TXN_LOG("WARNING: CommitTransaction: Transaction state not clean after COMMIT");
-		}
-
-		// Mark transaction as no longer active
-		mssql_txn.SetSqlServerTransactionActive(false);
-
-		// Clear transaction descriptor on the connection
-		pinned_conn->ClearTransactionDescriptor();
-		RestoreIsolationLevel(catalog_, *pinned_conn);
-
-		// Flag connection for reset — RESET_CONNECTION will be set on next SQL_BATCH TDS header.
-		//
-		// Honours `mssql_reset_connection` like every other release path
-		// (issue #189). A setting that meant "I own this session's state"
-		// everywhere EXCEPT after COMMIT would leave a user watching their
-		// temp objects survive in autocommit and vanish here, with nothing
-		// to read that explains it. The transaction itself is already
-		// resolved at this point — Commit ran, and the descriptor is
-		// cleared above — so what the reset drops here is session state,
-		// which is exactly what the setting is about.
-		const bool reset_on_release = mssql_txn.ShouldResetOnRelease();
-		MSSQL_TXN_LOG("CommitTransaction: reset=%d", reset_on_release ? 1 : 0);
-		pinned_conn->SetNeedsReset(reset_on_release);
-
-		// Return connection to pool
-		MSSQL_TXN_LOG("CommitTransaction: Returning connection to pool");
-		auto &pool = catalog_.GetConnectionPool();
-		pool.Release(pinned_conn);
-
-		// Clear pinned connection
-		mssql_txn.SetPinnedConnection(nullptr);
-	} else {
-		MSSQL_TXN_LOG("CommitTransaction: No active SQL Server transaction (no-op)");
+	auto commit_error = EndServerTransaction(catalog_, mssql_txn, true);
+	if (!commit_error.empty()) {
+		// DuckDB marks this transaction rolled back and does not call
+		// RollbackTransaction for it (MetaTransaction::Commit), so everything
+		// is cleaned up above and here.
+		ForgetTransactionMetadata(catalog_, mssql_txn);
+		lock_guard<mutex> lock(transaction_lock_);
+		transactions_.erase(context);
+		return ErrorData(ExceptionType::IO, "MSSQL: Failed to commit transaction: " + commit_error);
 	}
 
 	PublishTransactionMetadata(catalog_, mssql_txn);
 	ForgetTransactionMetadata(catalog_, mssql_txn);
+	lock_guard<mutex> lock(transaction_lock_);
 	transactions_.erase(context);
 	return ErrorData();
 }
 
 void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
-	lock_guard<mutex> lock(transaction_lock_);
-
 	auto &mssql_txn = transaction.Cast<MSSQLTransaction>();
 
-	MSSQL_TXN_LOG("RollbackTransaction: txn=%p, has_pinned=%d, sql_txn_active=%d", (void *)&mssql_txn,
-				  mssql_txn.HasPinnedConnection(), mssql_txn.IsSqlServerTransactionActive());
+	MSSQL_TXN_LOG("RollbackTransaction: txn=%p, has_pinned=%d, sql_txn_active=%d, statement=%d", (void *)&mssql_txn,
+				  mssql_txn.HasPinnedConnection(), mssql_txn.IsSqlServerTransactionActive(),
+				  mssql_txn.IsStatementJoined());
 
-	// Check if we have a pinned connection with an active SQL Server transaction
-	auto pinned_conn = mssql_txn.GetPinnedConnection();
-
-	if (pinned_conn && mssql_txn.IsSqlServerTransactionActive()) {
-		MSSQL_TXN_LOG("RollbackTransaction: Rolling back SQL Server transaction");
-
-		// Execute ROLLBACK TRANSACTION
-		if (!ExecuteAndDrain(*pinned_conn, "ROLLBACK TRANSACTION")) {
-			// Rollback failed - log error but continue cleanup
-			MSSQL_TXN_LOG("WARNING: RollbackTransaction: ROLLBACK TRANSACTION failed: %s",
-						  pinned_conn->GetLastError().c_str());
-		}
-
-		// Verify clean state
-		if (!VerifyCleanTransactionState(*pinned_conn)) {
-			MSSQL_TXN_LOG("WARNING: RollbackTransaction: Transaction state not clean after ROLLBACK");
-		}
-
-		// Mark transaction as no longer active
-		mssql_txn.SetSqlServerTransactionActive(false);
-
-		// Clear transaction descriptor on the connection
-		pinned_conn->ClearTransactionDescriptor();
-		RestoreIsolationLevel(catalog_, *pinned_conn);
-
-		// Flag connection for reset — RESET_CONNECTION will be set on next SQL_BATCH TDS header.
-		//
-		// Honours `mssql_reset_connection` like every other release path
-		// (issue #189). A setting that meant "I own this session's state"
-		// everywhere EXCEPT after COMMIT would leave a user watching their
-		// temp objects survive in autocommit and vanish here, with nothing
-		// to read that explains it. The transaction itself is already
-		// resolved at this point — Rollback ran, and the descriptor is
-		// cleared above — so what the reset drops here is session state,
-		// which is exactly what the setting is about.
-		const bool reset_on_release = mssql_txn.ShouldResetOnRelease();
-		MSSQL_TXN_LOG("RollbackTransaction: reset=%d", reset_on_release ? 1 : 0);
-		pinned_conn->SetNeedsReset(reset_on_release);
-
-		// Return connection to pool
-		MSSQL_TXN_LOG("RollbackTransaction: Returning connection to pool");
-		auto &pool = catalog_.GetConnectionPool();
-		pool.Release(pinned_conn);
-
-		// Clear pinned connection
-		mssql_txn.SetPinnedConnection(nullptr);
-	} else {
-		MSSQL_TXN_LOG("RollbackTransaction: No active SQL Server transaction (no-op)");
-	}
+	EndServerTransaction(catalog_, mssql_txn, false);
 
 	PublishTransactionMetadata(catalog_, mssql_txn);
 	ForgetTransactionMetadata(catalog_, mssql_txn);
@@ -413,6 +449,7 @@ void MSSQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 	// lock() returns an empty shared_ptr
 	auto context_ptr = transaction.context.lock();
 	if (context_ptr) {
+		lock_guard<mutex> lock(transaction_lock_);
 		transactions_.erase(*context_ptr);
 	}
 	// If context is gone, the transaction map entry will be cleaned up when

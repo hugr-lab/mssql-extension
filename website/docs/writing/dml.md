@@ -87,7 +87,9 @@ estimate, so an `INSERT … SELECT` behind a filter goes the right way too.
 **Every INSERT is atomic**, on either path. In autocommit the statement runs
 on one connection inside one server transaction — `BEGIN TRANSACTION` before
 its first batch, `COMMIT` after the last — so a failure anywhere leaves the
-table exactly as it was, and the error says so:
+table exactly as it was, and the error says so. That COMMIT comes when the
+INSERT finishes; with `mssql_insert_use_bcp = false` it comes when DuckDB
+commits the statement instead, as for an UPDATE (issue #451):
 
 ```text
 INSERT via BCP failed at batch 5 of a writer (1808 row(s) in it): MSSQL: BCP failed:
@@ -434,6 +436,11 @@ SET mssql_dml_stage_threshold = 100000; -- VALUES statements up to 100k rows
 ```
 
 Either way a statement is atomic: a failure rolls back everything it wrote.
+In autocommit an UPDATE / DELETE / MERGE runs in the statement's own DuckDB
+transaction (issue #451): it is committed when DuckDB commits the statement, so
+an error later in the same statement, Ctrl-C, or a result dropped before its
+query ended rolls it back too, as it would a DuckDB table. See
+[Autocommit writes follow DuckDB](./transactions.md#autocommit-writes-follow-duckdb).
 
 On **Fabric Warehouse** every UPDATE / DELETE takes the `#stage` path (Fabric
 has no `UPDATE … FROM … JOIN`, which the VALUES statements are) and finds its

@@ -110,7 +110,10 @@ unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::Execute(ClientContext &context
 	// the client thread — the stream destructor may run on a worker thread and
 	// must not touch the ClientContext (TSan: MetaTransaction::Get raced
 	// TransactionContext::Commit).
-	const bool transaction_pinned = ConnectionProvider::IsInTransaction(context, mssql_catalog);
+	// By identity (review of #451): an autocommit statement may join between
+	// GetConnection and here, and a pool connection labelled pinned is never
+	// given back.
+	const bool transaction_pinned = ConnectionProvider::IsPinnedConnection(context, mssql_catalog, connection);
 	const bool reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
 	auto result_stream = make_uniq<MSSQLResultStream>(std::move(connection), request, context_name_,
 													  mssql_catalog.GetConnectionPoolHandle(), transaction_pinned,

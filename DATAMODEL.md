@@ -909,7 +909,7 @@ This is the part that has changed most, and the two operators deliberately diffe
 | | connection for the DDL | connection(s) for the rows | inside an explicit transaction |
 |---|---|---|---|
 | `COPY … TO` | the load's own connection (`TargetResolver::CreateTable`): a pool one in autocommit, the pinned one in a transaction | pool, one per writer | **pinned**, and exactly one writer — a second would sit outside the transaction, and COPY may be loading into a table it cannot undo |
-| CTAS | pool (`ExecuteDDL`, autocommits) | pool, one per writer | **unchanged** — never pinned, still N writers; **except on a pool of ONE connection** (issue #380): the existence checks, the CREATE and the rows all go on the pinned connection, the rows as INSERT statements, and ROLLBACK undoes the table |
+| CTAS | pool (`ExecuteDDL`, autocommits) | pool, one per writer | **unchanged** — never pinned, still N writers; **except on a pool of ONE connection** (issue #380), or under `mssql_ctas_use_bcp = false` (issue #451, in autocommit too): the existence checks, the CREATE and the rows all go on the pinned connection, the rows as INSERT statements, and ROLLBACK undoes the table |
 
 On a pool of ONE connection in a transaction, `ExecuteDDL` itself runs on the
 pinned connection (issue #419): CTAS's DDL and every catalog DDL (`CREATE` /
@@ -1083,6 +1083,46 @@ on one connection: `BEGIN TRANSACTION` with the ENVCHANGE descriptor captured
 no-op on a pinned connection. The three statement executors hold one through
 `MSSQLStatementConnection` (W1c) — one connection per statement, so an
 autocommit INSERT, UPDATE or DELETE is atomic too.
+
+Since issue #451 an autocommit UPDATE / DELETE / MERGE does not take that
+path: it **joins the statement's own DuckDB transaction** on its catalog, and
+so does an INSERT under `mssql_insert_use_bcp = false` (and as a MERGE action)
+and a CTAS under `mssql_ctas_use_bcp = false`. The sink's `GetGlobalSinkState`
+-- `mssql_dml`'s InitGlobal for a pushed statement -- calls
+`ConnectionProvider::JoinStatementTransaction`, which marks the catalog's
+`MSSQLTransaction` joined, and so does every scan of that catalog at the top of
+its InitGlobal (`joins_statement`, set by `MSSQLOptimizer`): DuckDB can
+initialise a join's build side or a MERGE's source before the sink, so whichever
+comes first pins. A connection is classified as pinned by identity
+(`ConnectionProvider::IsPinnedConnection`), so a scan the optimizer did not mark
+gives its pool connection back like any other. From then on the
+statement is pinned exactly as inside `BEGIN … COMMIT`: `IsInTransaction`,
+`GetConnection`, `MaterializeMutexFor` answer as in a transaction, the
+optimizer materialises the scans of a catalog the statement joins (it reads the
+same settings at planning), and `MSSQLTransactionManager` COMMITs or ROLLs BACK
+when DuckDB ends the statement -- so an error later in the statement, Ctrl-C,
+or a result DuckDB aborts (`QueryResult::Close` before the query ended, DuckDB
+ef5b57f94ad) undoes the write, as it does a DuckDB table's. This is what
+postgres_scanner and mysql_scanner do for every DuckDB transaction.
+
+```mermaid
+sequenceDiagram
+    participant D as DuckDB (autocommit statement)
+    participant S as DML sink
+    participant P as ConnectionProvider
+    participant T as MSSQLTransaction
+    participant M as SQL Server
+    D->>S: GetGlobalSinkState (or a marked scan's InitGlobal, whichever first)
+    S->>P: JoinStatementTransaction
+    P->>T: JoinStatement()
+    D->>P: scan InitGlobal -> JoinStatementTransaction, GetConnection
+    P->>M: BEGIN TRANSACTION (pinned)
+    Note over D,M: scans materialise, batches go on the pinned connection
+    D->>T: CommitTransaction (query ended)
+    T->>M: COMMIT
+    D-->>T: RollbackTransaction (error, abort)
+    T-->>M: ROLLBACK
+```
 
 A writer is claimed by a **thread**, never allocated up front — because
 `GetLocalSinkState` cannot see the global state, and the `INSERT BULK` text and

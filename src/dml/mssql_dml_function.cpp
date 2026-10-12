@@ -44,6 +44,7 @@
 #include "catalog/mssql_table_entry.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
+#include "dml/insert/mssql_insert_config.hpp"
 #include "dml/mssql_statement_connection.hpp"
 #include "duckdb/common/enums/database_modification_type.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -102,6 +103,11 @@ struct MSSQLDmlBindData : public TableFunctionData {
 	//! PR 3d: an INSERT ... SELECT naming the identity column runs between SET
 	//! IDENTITY_INSERT ON and OFF (spec 077 W2's bracket).
 	bool identity_insert = false;
+	//! Issue #451: the write joins the statement's own DuckDB transaction --
+	//! committed or rolled back with it. Always for an UPDATE / DELETE; for an
+	//! INSERT only under mssql_insert_use_bcp = false, as the shipped INSERT
+	//! (PlanInsert): with it true an INSERT commits on its own. Read at bind.
+	bool join_statement_transaction = true;
 	//! Shared by the copies of this bind data (FunctionData::Copy), so a copy
 	//! cannot reset it.
 	shared_ptr<std::atomic<bool>> executed = make_shared_ptr<std::atomic<bool>>(false);
@@ -115,6 +121,7 @@ struct MSSQLDmlBindData : public TableFunctionData {
 		copy->schema_name = schema_name;
 		copy->table_name = table_name;
 		copy->identity_insert = identity_insert;
+		copy->join_statement_transaction = join_statement_transaction;
 		copy->executed = executed;
 		return std::move(copy);
 	}
@@ -187,6 +194,7 @@ unique_ptr<FunctionData> MSSQLDmlBind(ClientContext &context, TableFunctionBindI
 		bind_data->kind = DmlKind::DELETE;
 	} else if (kind == "insert") {
 		bind_data->kind = DmlKind::INSERT;
+		bind_data->join_statement_transaction = !LoadInsertConfig(context).use_bcp;
 	} else {
 		throw InvalidInputException("mssql_dml: kind := must be 'update', 'delete' or 'insert', got '%s'", kind);
 	}
@@ -259,7 +267,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLDmlInitGlobal(ClientContext &context, 
 	// that already excludes the deleted rows, and a failed lookup would report
 	// a committed DELETE as failed. Best effort -- the estimate is a hint.
 	optional_ptr<MSSQLTableEntry> deleted_from;
-	if (bind_data.kind == DmlKind::DELETE && !ConnectionProvider::IsInTransaction(context, catalog)) {
+	if (bind_data.kind == DmlKind::DELETE && context.transaction.IsAutoCommit()) {
 		try {
 			auto entry = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, Identifier(bind_data.schema_name),
 										  Identifier(bind_data.table_name), OnEntryNotFound::RETURN_NULL);
@@ -271,6 +279,11 @@ unique_ptr<GlobalTableFunctionState> MSSQLDmlInitGlobal(ClientContext &context, 
 		}
 	}
 
+	// Issue #451: the write commits when DuckDB commits the statement's own
+	// transaction, and a result DuckDB aborts rolls it back.
+	if (bind_data.join_statement_transaction) {
+		ConnectionProvider::JoinStatementTransaction(context, catalog);
+	}
 	MSSQLStatementConnection statement;
 	auto connection = statement.Acquire(context, catalog);
 	if (bind_data.identity_insert) {
@@ -303,7 +316,7 @@ unique_ptr<GlobalTableFunctionState> MSSQLDmlInitGlobal(ClientContext &context, 
 			throw InterruptException();
 		}
 		if (!result.success) {
-			const bool pinned = statement.IsPinned();
+			const bool pinned = statement.InOpenTransaction();
 			connection.reset();
 			statement.Fail(context, catalog);
 			throw IOException("MSSQL %s on '%s.%s' failed: %s %s", verb, bind_data.schema_name, bind_data.table_name,

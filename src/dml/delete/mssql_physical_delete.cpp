@@ -65,7 +65,7 @@ SinkFinalizeType MSSQLPhysicalDelete::Finalize(Pipeline &pipeline, Event &event,
 		}
 		// Spec 080 W3: the planner's estimate follows an autocommit DELETE (the
 		// staged path does the same in MSSQLStagedDml::Finalize).
-		if (table_entry_ && !ConnectionProvider::IsInTransaction(context, table_entry_->GetMSSQLCatalog())) {
+		if (table_entry_ && context.transaction.IsAutoCommit()) {
 			table_entry_->NoteRowsDeleted(gstate.total_rows_deleted);
 		}
 	}
@@ -74,6 +74,8 @@ SinkFinalizeType MSSQLPhysicalDelete::Finalize(Pipeline &pipeline, Event &event,
 }
 
 unique_ptr<GlobalSinkState> MSSQLPhysicalDelete::GetGlobalSinkState(ClientContext &context) const {
+	// Issue #451: the statement runs on the catalog as a transaction of one.
+	ConnectionProvider::JoinStatementTransaction(context, target_.catalog_name);
 	auto gstate = make_uniq<MSSQLDeleteGlobalSinkState>(context, target_, config_);
 	if (staged_target_ && !config_.defer_to_finalize) {
 		gstate->stage_switch = make_uniq<MSSQLStageSwitch>(*staged_target_, config_.stage_threshold);

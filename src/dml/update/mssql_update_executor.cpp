@@ -365,7 +365,7 @@ idx_t MSSQLUpdateExecutor::ExecuteBatch(const string &sql) {
 			// transaction (issue #344, spec 062 W1c). A parse error is a
 			// client-side framing failure -- the server ran this batch -- and
 			// says so.
-			const string outcome = MSSQLRowsBeforeOutcome(stmt_conn_.IsPinned(), total_rows_updated_);
+			const string outcome = MSSQLRowsBeforeOutcome(stmt_conn_.InOpenTransaction(), total_rows_updated_);
 			if (error_number == 0) {
 				throw IOException("UPDATE failed: %s; the server executed this batch (batch %llu); %s", error_message,
 								  (unsigned long long)batch_count_, outcome);

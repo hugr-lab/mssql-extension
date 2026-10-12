@@ -330,7 +330,7 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 			stmt_conn_.Fail(context_, mssql_catalog);
 			// What happened to the rows (issue #344, spec 062 W1c) -- see the
 			// UPDATE executor.
-			const string outcome = MSSQLRowsBeforeOutcome(stmt_conn_.IsPinned(), total_rows_deleted_);
+			const string outcome = MSSQLRowsBeforeOutcome(stmt_conn_.InOpenTransaction(), total_rows_deleted_);
 			if (error_number == 0) {
 				return MSSQLDMLResult::Failure(
 					StringUtil::Format("DELETE failed: %s; the server executed this batch (batch %llu); %s",

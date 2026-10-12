@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_transaction.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "dml/mssql_identity_insert.hpp"
 #include "duckdb/common/exception.hpp"
@@ -22,7 +23,9 @@ std::shared_ptr<tds::TdsConnection> MSSQLStatementConnection::Acquire(ClientCont
 	if (!connection) {
 		throw IOException("Failed to acquire a connection for the statement");
 	}
-	transaction_pinned_ = ConnectionProvider::IsInTransaction(context, catalog);
+	// By identity: see ConnectionProvider::IsPinnedConnection.
+	transaction_pinned_ = ConnectionProvider::IsPinnedConnection(context, catalog, connection);
+	in_open_transaction_ = !context.transaction.IsAutoCommit();
 	pool_handle_ = catalog.GetConnectionPoolHandle();
 	reset_on_release_ = ConnectionProvider::ShouldResetOnRelease(context);
 	try {
@@ -161,12 +164,13 @@ void MSSQLStatementConnection::Commit(ClientContext &context, MSSQLCatalog &cata
 		// what Fail actually did, and on a pinned connection it neither rolls
 		// back (the DuckDB transaction owns that) nor closes.
 		const bool pinned = transaction_pinned_;
+		const bool open_transaction = in_open_transaction_;
 		Fail(context, catalog);
-		if (pinned) {
+		if (pinned && open_transaction) {
 			throw IOException(
 				"MSSQL: could not turn IDENTITY_INSERT off for %s.%s after the INSERT. The "
-				"transaction's connection cannot be discarded, so the setting may still be on "
-				"until the transaction ends: ROLLBACK it.",
+				"transaction's connection is discarded when the transaction ends; until then the "
+				"setting may still be on: ROLLBACK it.",
 				identity_schema_, identity_table_);
 		}
 		throw IOException(
@@ -192,10 +196,9 @@ void MSSQLStatementConnection::Fail(ClientContext &context, MSSQLCatalog &catalo
 	// A leaked ON would make the next statement on this connection accept
 	// identity values in silence. Not confirmed off → the connection is closed
 	// below rather than pooled; a PINNED one cannot be closed (it is the
-	// DuckDB transaction's), so there the attempt is all there is, and the
-	// transaction's end resets the session under the default
-	// mssql_reset_connection — with it off, the rest of that transaction runs
-	// with IDENTITY_INSERT on, which is why it is logged.
+	// DuckDB transaction's), so the transaction is told to close it at its end
+	// instead of pooling it -- until then the rest of that transaction runs with
+	// IDENTITY_INSERT on, which is why it is logged.
 	// Under the pinned connection's batch lock unless this thread already holds
 	// it (Fail is called from inside a batch too). Locking cannot fail in a way
 	// this noexcept path could report; an exception from it is swallowed and
@@ -209,11 +212,20 @@ void MSSQLStatementConnection::Fail(ClientContext &context, MSSQLCatalog &catalo
 			identity_cleared = false;
 		}
 	}
-	if (!identity_cleared && transaction_pinned_ && GetDmlDebugLevel() >= 1) {
-		fprintf(stderr,
-				"[MSSQL DML] IDENTITY_INSERT for %s.%s could not be turned off on the transaction's pinned "
-				"connection; it stays on until the transaction ends\n",
-				identity_schema_.c_str(), identity_table_.c_str());
+	if (!identity_cleared && transaction_pinned_) {
+		// The pinned connection cannot be closed here (it is the DuckDB
+		// transaction's): the transaction closes it at its end instead of pooling
+		// it (issue #451 -- an autocommit statement is pinned too now).
+		try {
+			MSSQLTransaction::Get(context, catalog).DiscardConnectionAtEnd();
+		} catch (...) {
+		}
+		if (GetDmlDebugLevel() >= 1) {
+			fprintf(stderr,
+					"[MSSQL DML] IDENTITY_INSERT for %s.%s could not be turned off on the transaction's pinned "
+					"connection; it stays on until the transaction ends, which discards the connection\n",
+					identity_schema_.c_str(), identity_table_.c_str());
+		}
 	}
 	try {
 		if (!transaction_pinned_ &&
