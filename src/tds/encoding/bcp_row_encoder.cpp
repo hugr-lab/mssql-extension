@@ -329,7 +329,7 @@ void ThrowIntRange(const SRC *src, const SelectionVector *sel, idx_t row_begin, 
 		if (v < lo || v > hi) {
 			throw InvalidInputException(
 				"MSSQL: integer value %lld in column \"%s\" is out of range for the target column (accepts %lld..%lld)",
-				(long long)v, col.name, (long long)lo, (long long)hi);
+				(long long)v, col.ReportedName(), (long long)lo, (long long)hi);
 		}
 	}
 	throw InternalException("BCPRowEncoder: integer range check disagreed with the rescan");

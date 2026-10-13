@@ -472,6 +472,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A DELETE could remove the wrong rows, without an error, when its WHERE
+  held a correlated subquery with a range** (#337). DuckLake's snapshot
+  expiry is one: `DELETE … WHERE end_snapshot IS NOT NULL AND NOT EXISTS
+  (SELECT … WHERE snapshot_id >= begin_snapshot AND snapshot_id <
+  end_snapshot)`.
+  - The row-by-row path read the rowid from the last column of its input. A
+    DELETE, unlike an UPDATE, has no projection of its own, and DuckDB plans
+    such a subquery as a mark join whose column follows the rowid. That
+    BOOLEAN was taken as the key.
+  - On a single-column key it was sent as the key value: every row the
+    `NOT EXISTS` kept has mark false, i.e. `0`. The DELETE removed the row
+    keyed `0` (or nothing) instead of its own rows, and reported that count
+    (measured: 1 row, the wrong one, instead of 2). On a composite key it
+    failed with `Expected STRUCT rowid for composite PK, got BOOLEAN`.
+  - It now takes the column DuckDB's row-id expression names, as DuckDB's own
+    DELETE does and as the staged path already did.
+  - Affected: a DELETE on the row-by-row path. That is one not pushed whole
+    to the server (`mssql_dml_pushdown = false`, an ATTACH with
+    `remote_pushdown false` such as DuckLake's metadata catalog, or a
+    statement the rewriter declines), of up to `mssql_dml_stage_threshold`
+    rows, keyed by the primary key or a unique index.
+  - On v0.2.5 the same statement failed intermittently with `Invalid
+    unicode` instead. That was the materialized scan's unbound rowid members,
+    fixed by #453. The new test fails on either cause.
+
 - **A `char(n)` column kept its padding on two read paths, and joins and
   `GROUP BY` disagreed with SQL Server** (#405). SQL Server compares strings
   ignoring trailing spaces, so `'AB  '` (char(4)) equals `'AB    '` (char(6));
@@ -558,7 +583,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     UPDATE / DELETE with one is refused by name: part of its WHERE runs in
     DuckDB.
   - A load, a parameter or a literal carrying one fails, naming the value
-    and the column.
+    and where it was going: `(column d)`, `(parameter @d)`. The statement
+    literals, the parameters and the `#stage` (which named its own `n0`) got
+    the name in #460.
   - A timestamp that rounds past 9999-12-31 at the column's scale fails too:
     `datetime2(4)` ← `23:59:59.99999` would carry into a day that does not
     exist.

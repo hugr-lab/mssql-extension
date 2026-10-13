@@ -51,6 +51,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "codec/datetime_codec.hpp"
+#include "codec/literal_format.hpp"
 #include "duckdb/common/error_data.hpp"
 
 #include "codec/scatter_position.hpp"
@@ -640,12 +641,7 @@ static void ScatterChunkPos(POS pos, bool all_valid, idx_t row_begin, idx_t rows
 // which know the value but not the column; the column (or parameter) is
 // named here, where a wide COPY needs it.
 [[noreturn]] static void ThrowNamingColumn(const InvalidInputException &ex, const mssql::BCPColumnMetadata &col) {
-	ErrorData error(ex);
-	if (col.name.empty()) {
-		throw InvalidInputException(error.RawMessage());
-	}
-	throw InvalidInputException("%s (%s %s)", error.RawMessage(), col.name[0] == '@' ? "parameter" : "column",
-								col.name);
+	mssql::codec::ThrowNamingColumn(ex, col.ReportedName());
 }
 
 void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, Vector &in,
