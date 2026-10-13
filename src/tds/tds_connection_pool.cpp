@@ -27,6 +27,56 @@ static int GetPoolDebugLevel() {
 			fprintf(stderr, "[MSSQL POOL] " fmt "\n", ##__VA_ARGS__); \
 	} while (0)
 
+namespace {
+
+// The pool slot a login holds from before it starts (issue #461), taken under
+// the pool's lock. It goes back, waking a caller that waited on it, on every way
+// out that does not leave the connection in the pool -- an exception too: a
+// bad_alloc, or ErrorData failing to parse what a factory threw -- unless Keep()
+// says the connection is in. A guard rather than a call each exit must remember
+// (review of #463): one forgotten would leave a pool of one reading full until
+// DETACH.
+class SlotReservation {
+public:
+	SlotReservation(std::unique_lock<std::mutex> &lock, size_t &total_connections, std::condition_variable &available)
+		: lock_(lock), total_connections_(total_connections), available_(available) {
+		D_ASSERT(lock_.owns_lock());
+		total_connections_++;
+	}
+	~SlotReservation() {
+		if (held_) {
+			// An exception out of the login unwinds with the lock released.
+			if (!lock_.owns_lock()) {
+				lock_.lock();
+			}
+			GiveBack();
+		}
+	}
+	SlotReservation(const SlotReservation &) = delete;
+	SlotReservation &operator=(const SlotReservation &) = delete;
+
+	//! The connection is in the pool and the slot is its own. Lock held.
+	void Keep() {
+		D_ASSERT(held_ && lock_.owns_lock());
+		held_ = false;
+	}
+	//! The login failed: the slot goes back now. Lock held.
+	void GiveBack() {
+		D_ASSERT(held_ && lock_.owns_lock());
+		held_ = false;
+		total_connections_--;
+		available_.notify_all();
+	}
+
+private:
+	std::unique_lock<std::mutex> &lock_;
+	size_t &total_connections_;
+	std::condition_variable &available_;
+	bool held_ = true;
+};
+
+}  // namespace
+
 ConnectionPool::ConnectionPool(const std::string &context_name, PoolConfiguration config, ConnectionFactory factory)
 	: context_name_(context_name),
 	  config_(std::move(config)),
@@ -233,25 +283,10 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 			// grow only after it, so every caller arriving meanwhile passed the
 			// same test and dialled too: 21 connections on a limit of 8,
 			// measured. Prewarm reserves its slots the same way.
-			stats_.total_connections++;
-			// The slot goes back, waking a caller that waited on it, on every way
-			// out that does not leave the connection in the pool -- an exception
-			// too: a bad_alloc, or ErrorData failing to parse what a factory threw
-			// (review of #461). Otherwise one OOM on a pool of one reads full until
-			// DETACH.
-			const auto give_back = [&]() {
-				stats_.total_connections--;
-				available_cv_.notify_all();
-			};
+			SlotReservation slot(lock, stats_.total_connections, available_cv_);
 			std::string error;
 			lock.unlock();
-			try {
-				conn = CreateNewConnection(error);
-			} catch (...) {
-				lock.lock();
-				give_back();
-				throw;
-			}
+			conn = CreateNewConnection(error);
 			lock.lock();
 
 			if (conn) {
@@ -262,12 +297,8 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 				// that stale creation failure (review 1538).
 				RecordCreateSuccessLocked();
 				uint64_t id = next_connection_id_++;
-				try {
-					active_connections_[id] = conn;
-				} catch (...) {
-					give_back();
-					throw;
-				}
+				active_connections_[id] = conn;
+				slot.Keep();
 				stats_.active_connections++;
 				stats_.connections_created++;
 
@@ -283,7 +314,7 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 
 			// Creation failed: the slot goes back, and a caller waiting on a pool
 			// that read full only because of it may now dial.
-			give_back();
+			slot.GiveBack();
 			// Issue #302: this used to fall through to the same
 			// wait an exhausted pool does -- for a Release that, with nothing
 			// active, cannot come -- and report "(timeout)" after the full
