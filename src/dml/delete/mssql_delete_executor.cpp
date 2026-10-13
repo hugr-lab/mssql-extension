@@ -64,14 +64,15 @@ idx_t MSSQLDeleteExecutor::Execute(DataChunk &chunk) {
 		throw InternalException("MSSQLDeleteExecutor::Execute called after Finalize");
 	}
 
-	// DuckDB DELETE chunk layout:
-	// - Columns 0 to N-1: filter columns (from WHERE clause)
-	// - Column N: rowid (added by BindRowIdColumns at the END of projection)
-	// This is the same pattern as UPDATE uses
-	idx_t rowid_col_idx = chunk.ColumnCount() - 1;
+	// Where DuckDB's row-id expression put the rowid (PlanDelete). Not the last
+	// column, as this assumed: a DELETE has no projection of its own, so its
+	// child's columns come through, and a NOT EXISTS leaves its mark column
+	// after the rowid -- DuckLake's snapshot expiry read that BOOLEAN as the key
+	// (issue #337).
+	const idx_t rowid_col_idx = target_.rowid_chunk_index;
 	DELETE_DEBUG(1, "Execute: rowid at column %llu", (unsigned long long)rowid_col_idx);
 
-	// Extract PK values from the rowid column (last column) using target's pk_info
+	// Extract PK values from the rowid column using target's pk_info
 	auto pk_values = ExtractPKFromRowid(chunk.data[rowid_col_idx], chunk.size(), target_.pk_info);
 
 	// Accumulate into pending batch
