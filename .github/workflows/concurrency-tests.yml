@@ -25,8 +25,8 @@ on:
       - 'Makefile'
       - 'test/cpp/test_concurrent_reads.cpp'
       - 'test/cpp/test_transaction_pin.cpp'
-      # Spec 080 PR 3b: the at-least-once gate of mssql_dml runs here, the one
-      # job with a build tree to link a live C++ test against.
+      # Spec 080 PR 3b: the mssql_dml vehicle test runs here, the one job with a
+      # build tree to link a live C++ test against.
       - 'test/cpp/test_dml_vehicle.cpp'
       # Issue #456: the dead-connection test runs the TDS / TLS read path.
       - 'test/cpp/test_dead_connection.cpp'
@@ -257,9 +257,10 @@ jobs:
       - name: Run transaction-pin contention test (issue #356)
         run: make test-transaction-pin
 
-      # Spec 080 PR 3b: a pushed DML's vehicle submitted and never read still
-      # runs (ResultEagerness::FORCED), as a native UPDATE does.
-      - name: Run the mssql_dml at-least-once test (spec 080)
+      # Spec 080 PR 3b: a pushed DML's vehicle is consumed as a native UPDATE
+      # is (submitted, dropped, completed), and a dropped joined write rolls back
+      # (#451).
+      - name: Run the mssql_dml vehicle test (spec 080)
         run: make test-dml-vehicle
 
       # Issue #456: a pushed DML whose connection dies mid-statement fails in

@@ -50,7 +50,7 @@ catalog makes the SQL Server side part of it:
 | Statement | In autocommit |
 |---|---|
 | `UPDATE`, `DELETE`, `MERGE` (pushed whole or not) | Joins: one pinned connection, `COMMIT` / `ROLLBACK` with DuckDB |
-| `INSERT` (statements, bulk, or pushed `INSERT … SELECT`) | Commits on its own when it finishes, with the bulk path's parallel writers -- unless `mssql_insert_use_bcp = false`, which makes it join, or the same statement has joined the catalog through another write (a DML CTE): then it runs on that connection too |
+| `INSERT` (statements, bulk, or pushed `INSERT … SELECT`) | Commits on its own when it finishes -- and stays, whatever then happens to its result (a dropped handle, a stream closed early) -- with the bulk path's parallel writers -- unless `mssql_insert_use_bcp = false`, which makes it join, or the same statement has joined the catalog through another write (a DML CTE): then it runs on that connection too |
 | `CREATE TABLE … AS SELECT` | Commits as it loads (DDL and rows), with parallel writers -- unless `mssql_ctas_use_bcp = false`, which makes it run whole in the transaction, here and inside `BEGIN … COMMIT` |
 | `COPY … TO` (`FORMAT 'bcp'`) | Always commits as it loads: an export, like `COPY` to a file |
 | `mssql_exec()` | Autocommits what it runs -- except when called inside a statement that joined its catalog, where it runs on that statement's connection |

@@ -5,10 +5,12 @@
 # Environment variables required:
 #   MSSQL_TEST_DSN, MSSQL_TESTDB_DSN, MSSQL_TEST_HOST / _PORT / _USER / _PASS
 #
-# The rewriter does not call it yet (PR 3c); here it is called directly, as the
-# rewriter will: `SELECT * FROM mssql_dml(...)`. The at-least-once gate -- a
-# submitted statement that is never read still runs -- is C++
-# (test/cpp/test_dml_vehicle.cpp): sqllogictest always reads.
+# Called directly here, as the rewriter calls it: `SELECT * FROM mssql_dml(...)`.
+# How a submitted vehicle is consumed -- as a native UPDATE is since DuckDB
+# #26880: it runs and waits at its count until its consumer settles it, and a
+# dropped one is rolled back when it joined the statement's transaction (#451)
+# -- is checked in C++ (test/cpp/test_dml_vehicle.cpp): sqllogictest always
+# reads.
 
 require mssql
 
