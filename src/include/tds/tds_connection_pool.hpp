@@ -34,6 +34,9 @@ struct ConnectionMetadata {
 
 // Pool statistics for monitoring
 struct PoolStatistics {
+	// Idle + active + logins in flight: a login holds its slot from before it
+	// starts, so concurrent callers cannot take the pool past its limit
+	// (Acquire and Prewarm alike, issue #461).
 	size_t total_connections = 0;
 	size_t idle_connections = 0;
 	size_t active_connections = 0;

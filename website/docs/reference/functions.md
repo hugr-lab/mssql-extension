@@ -159,7 +159,7 @@ SELECT * FROM mssql_pool_stats('sqlserver');
 | Column                  | Type   | Description                        |
 | ----------------------- | ------ | ---------------------------------- |
 | `db`                    | VARCHAR | Attached database context name     |
-| `total_connections`     | BIGINT | Current pool size                  |
+| `total_connections`     | BIGINT | Idle + active + logins in flight; never above the limit |
 | `idle_connections`      | BIGINT | Available connections              |
 | `active_connections`    | BIGINT | Currently in use                   |
 | `connections_created`   | BIGINT | Lifetime connections created       |

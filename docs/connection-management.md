@@ -99,7 +99,7 @@ Runs every 1 second:
 
 ```cpp
 struct PoolStatistics {
-    size_t total_connections;       // Created - Closed
+    size_t total_connections;       // Idle + active + logins in flight (a login holds its slot)
     size_t idle_connections;
     size_t active_connections;
     size_t connections_created;

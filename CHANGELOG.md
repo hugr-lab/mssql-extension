@@ -472,6 +472,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The pool opened more connections than `mssql_connection_limit`** (#461).
+  A login runs without the pool's lock, and the count of connections grew
+  only after it, so every caller arriving during a login dialled too:
+  measured, 21 connections on a limit of 8 and 79 on 64.
+  - A login now holds its slot from before it starts. It gives the slot back
+    if it fails or anything throws, and wakes a caller that was waiting on
+    it.
+  - An extra bulk-load writer (`TryAcquire`) no longer dials over a slot
+    another login holds.
+  - At `mssql_connection_limit = 1`, two DuckDB connections starting
+    statements at once could both log in.
+  - `mssql_pool_stats.total_connections` now counts logins in flight. An
+    exhaustion timeout says how many there were (`…, 2 logging in`).
+  - A statement that needs more connections at once than the limit now waits
+    for one to be released (`mssql_acquire_timeout`) instead of opening more.
+
 - **A materialized scan crashed on a composite rowid key it did not project,
   and ignored the filters DuckDB applies itself** (found by #451). A scan is
   materialized inside an explicit transaction, on a pool of one connection,
