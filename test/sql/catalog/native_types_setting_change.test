@@ -1,0 +1,100 @@
+# name: test/sql/catalog/native_types_setting_change.test
+# description: Issue #415 -- after SET mssql_catalog_native_types the cached table entry, its scan and its INSERT agree on the column types until the entry is invalidated
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# A table entry fixes its column types when it is built: MSSQL_NVARCHAR(n) with
+# mssql_catalog_native_types on. The scan's types and the INSERT's column types
+# used to read the setting again on every bind, so after a SET they said plain
+# VARCHAR while the entry -- which the binder resolved the statement against --
+# still said MSSQL_NVARCHAR(n): the extension-type disagreement behind #369,
+# an assertion in a debug build. Both now take the entry's own types; a setting
+# change applies through mssql_invalidate_cache(), as documented. In the debug
+# lane (make test-rowid-debug).
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS ntsc (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('ntsc', 'DROP TABLE IF EXISTS dbo.NativeTypesSet415; CREATE TABLE dbo.NativeTypesSet415 (id int IDENTITY PRIMARY KEY, name nvarchar(20) NOT NULL, code varchar(10) COLLATE Latin1_General_100_BIN2_UTF8 NULL); INSERT INTO dbo.NativeTypesSet415 (name, code) VALUES (N''first'', ''a1'')');
+
+statement ok
+SELECT mssql_invalidate_cache('ntsc');
+
+# Built with native types on (the default).
+query TT
+SELECT typeof(name), typeof(code) FROM ntsc.dbo.NativeTypesSet415;
+----
+MSSQL_NVARCHAR(20)	MSSQL_VARCHAR(10)
+
+statement ok
+SET GLOBAL mssql_catalog_native_types = false;
+
+# The cached entry keeps its types, and the scan reads into them -- also a
+# scan materialised in a transaction, whose collection is typed from the
+# scan's own types. (The debug build's assertion is the INSERT's below: a
+# scan typed from the setting passes it, the INSERT does not.)
+query TTTT
+SELECT typeof(name), typeof(code), name, code FROM ntsc.dbo.NativeTypesSet415;
+----
+MSSQL_NVARCHAR(20)	MSSQL_VARCHAR(10)	first	a1
+
+statement ok
+BEGIN TRANSACTION;
+
+query TT
+SELECT name, code FROM ntsc.dbo.NativeTypesSet415;
+----
+first	a1
+
+statement ok
+COMMIT;
+
+query TT
+INSERT INTO ntsc.dbo.NativeTypesSet415 (name, code) VALUES ('second', 'b2') RETURNING name, code;
+----
+second	b2
+
+query TT
+UPDATE ntsc.dbo.NativeTypesSet415 SET code = 'c3' WHERE name = 'second' RETURNING name, code;
+----
+second	c3
+
+query T
+SELECT list(name || '/' || code ORDER BY id) FROM ntsc.dbo.NativeTypesSet415;
+----
+[first/a1, second/c3]
+
+# The change applies through invalidation.
+statement ok
+SELECT mssql_invalidate_cache('ntsc');
+
+query TT
+SELECT typeof(name), typeof(code) FROM ntsc.dbo.NativeTypesSet415 LIMIT 1;
+----
+VARCHAR	VARCHAR
+
+query T
+INSERT INTO ntsc.dbo.NativeTypesSet415 (name, code) VALUES ('third', 'd4') RETURNING name;
+----
+third
+
+statement ok
+RESET GLOBAL mssql_catalog_native_types;
+
+statement ok
+SELECT mssql_invalidate_cache('ntsc');
+
+query T
+SELECT typeof(name) FROM ntsc.dbo.NativeTypesSet415 LIMIT 1;
+----
+MSSQL_NVARCHAR(20)
+
+statement ok
+SELECT mssql_exec('ntsc', 'DROP TABLE dbo.NativeTypesSet415');

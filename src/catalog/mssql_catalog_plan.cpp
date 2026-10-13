@@ -127,14 +127,16 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	// Spec 060: must match what the catalog told DuckDB about these columns —
 	// the binder resolved RETURNING against those types, and MSSQLPhysicalInsert
 	// references the parser's chunk straight into DuckDB's, which requires the
-	// types to be equal down to the extension info.
-	const bool native_types = MSSQLReportsNativeTypes(*this);
+	// types to be equal down to the extension info. So they are the entry's own
+	// (issue #415), not mssql_catalog_native_types read again: after a SET the
+	// cached entry keeps the types it was built with until it is invalidated.
+	const auto &entry_columns = table_entry.GetColumns();
 
 	for (idx_t i = 0; i < mssql_columns.size(); i++) {
 		auto &col = mssql_columns[i];
 		MSSQLInsertColumn insert_col;
 		insert_col.name = col.name;
-		insert_col.duckdb_type = native_types ? col.NativeDuckDBType() : col.duckdb_type;
+		insert_col.duckdb_type = entry_columns.GetColumn(LogicalIndex(i)).Type();
 		insert_col.mssql_type = col.sql_type_name;
 		insert_col.max_length = col.max_length;
 		insert_col.is_identity = col.is_identity;  // spec 062 W4: from sys.columns, via the cache

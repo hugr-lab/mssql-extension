@@ -185,5 +185,6 @@ declared lengths and collations with no explicit casts. The columns of an
 `typeof()` over one says `MSSQL_VARCHAR(20)`, not `VARCHAR`), except a `char` /
 `varchar` under a code-page collation: a raw scan hands its bytes over
 untranscoded, and it stays plain `VARCHAR`. Set the option to `false` to
-restore plain `VARCHAR` reporting everywhere.
+restore plain `VARCHAR` reporting everywhere -- for tables already read, after
+`mssql_invalidate_cache()`: a loaded table keeps the types it was read with.
 
