@@ -222,7 +222,7 @@ speed.
 
 - **Protocol**: Uses TDS BulkLoadBCP (packet type 0x07) for maximum throughput
 - **Streaming**: Bounded memory usage regardless of dataset size
-- **Throughput**: 1M+ rows/s on simple rows; a 44-column × 1M-row load measured 3.24 s with 4 parallel writers (10.55 s single-writer) — the write path encodes column-major and fans out across bulk-load sessions (`mssql_copy_parallel_writers`)
+- **Throughput**: 1M+ rows/s on simple rows; a 44-column × 1M-row load measured 3.24 s with 4 parallel writers (10.55 s single-writer) — the write path encodes column-major and fans out across bulk-load sessions (`mssql_copy_parallel_writers`). In autocommit each batch (`mssql_copy_flush_rows` rows) commits as it is sent, so a concurrent reader can see the load grow; inside `BEGIN … COMMIT` it commits with the transaction. See [Parallel writers and readers that do not wait](transactions.md#parallel-writers-visibility)
 - **TABLOCK**: decided from the target's shape by default (`mssql_copy_tablock = auto`): ON for heaps (concurrent BU locks compose), OFF for anything clustered — against a clustered index the hint *serialises* parallel loaders (measured 8.9 s vs 5.2 s on a 2M-row columnstore load)
 - **UTF-8 targets**: a `varchar` column under a UTF-8 collation receives UTF-8 bytes as they are, rather than being transcoded to UTF-16 for the server to transcode back. Measured at half the wire bytes for ASCII-ish data (35 → 19 bytes for a 16-character value) and −51% client CPU on long strings. An `nvarchar` target is unaffected. This is the whole of the string path on Microsoft Fabric, where every string column is a UTF-8 `varchar`
 

@@ -372,7 +372,11 @@ SqlParamSet BuildSqlParams(const Value &params, const std::string &declarations_
 		} else {
 			p.declaration = DeclarationForValue(name, type, value);
 		}
-		p.literal = codec::FormatSqlLiteral(value, type, codec::LiteralContext::InsertValues);
+		try {
+			p.literal = codec::FormatSqlLiteral(value, type, codec::LiteralContext::InsertValues);
+		} catch (const InvalidInputException &ex) {
+			codec::ThrowNamingColumn(ex, "@" + name);
+		}
 		p.value = value;
 		p.has_value = true;
 		set.params.push_back(std::move(p));

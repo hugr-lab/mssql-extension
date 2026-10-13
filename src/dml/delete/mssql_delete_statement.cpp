@@ -67,7 +67,8 @@ MSSQLDMLBatch MSSQLDeleteStatement::Build(const vector<vector<Value>> &pk_values
 				values_clause += ", ";
 			}
 			// Serialize the value as a SQL literal
-			values_clause += MSSQLValueSerializer::Serialize(row_pk[col], pk_columns[col].duckdb_type);
+			values_clause +=
+				MSSQLValueSerializer::Serialize(row_pk[col], pk_columns[col].duckdb_type, pk_columns[col].name);
 		}
 		values_clause += ")";
 	}

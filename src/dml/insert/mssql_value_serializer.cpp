@@ -72,15 +72,20 @@ string MSSQLValueSerializer::SerializeDecimal(const hugeint_t &value, uint8_t wi
 // Main Entry Points
 //===----------------------------------------------------------------------===//
 
-string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &target_type) {
+string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &target_type, const string &column) {
 	// All supported families route through the canonical codec dispatcher
 	// (handles NULL + 9-arm family switch internally; FR-022 guarantees
 	// byte-identity for LiteralContext::InsertValues vs Filter).
 	auto &type = value.type();
 	try {
-		return mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues);
-	} catch (const NotImplementedException &) {
-		throw InvalidInputException("Cannot serialize DuckDB type '%s' for SQL Server INSERT", type.ToString());
+		try {
+			return mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues);
+		} catch (const NotImplementedException &) {
+			throw InvalidInputException("Cannot serialize DuckDB type '%s' for SQL Server INSERT", type.ToString());
+		}
+	} catch (const InvalidInputException &ex) {
+		// Named as the bulk-load path names it (issue #460).
+		mssql::codec::ThrowNamingColumn(ex, column);
 	}
 }
 
@@ -106,11 +111,12 @@ string MSSQLValueSerializer::WrapSpatialLiteral(const string &literal, const str
 	return "geometry::STGeomFromWKB(" + literal + ", 0)";
 }
 
-string MSSQLValueSerializer::SerializeFromVector(Vector &vector, idx_t index, const LogicalType &target_type) {
+string MSSQLValueSerializer::SerializeFromVector(Vector &vector, idx_t index, const LogicalType &target_type,
+												 const string &column) {
 	// For simplicity, extract the value and serialize
 	// This could be optimized for bulk operations
 	auto value = vector.GetValue(index);
-	return Serialize(value, target_type);
+	return Serialize(value, target_type, column);
 }
 
 idx_t MSSQLValueSerializer::EstimateSerializedSize(const Value &value, const LogicalType &type) {
