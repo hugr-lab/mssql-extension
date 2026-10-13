@@ -1,0 +1,217 @@
+# name: test/sql/dml/delete_composite_varchar_key.test
+# description: Issue #337 -- DuckLake's snapshot expiry: a DELETE whose WHERE holds a NOT EXISTS, on a composite key with a VARCHAR member and on a single-column key
+# group: [dml]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# DuckLake's snapshot expiry, through the attached catalog, failed
+# intermittently on linux_amd64 with "Invalid unicode (byte sequence mismatch)
+# detected in value construction". The table's rowid is the composite primary
+# key STRUCT(object_id, begin_snapshot, key); the DELETE projects only the
+# columns its WHERE reads, so the scan fills the key members itself. Inside a
+# transaction -- DuckLake's metadata always runs in one -- and, since #451, in
+# an autocommit DML statement the scan is materialised, and the drain wrote
+# the rowid STRUCT's members only into the streaming chunk: the VARCHAR
+# member carried whatever bytes the vector held (garbage on Linux, SIGBUS on
+# macOS). Fixed by #453 (BindRowIdTargetVectors in the drain); this is the
+# issue's own shape. The keys are longer than a string_t's inline 12 bytes,
+# and one is not ASCII, so stale bytes cannot pass for the right value.
+#
+# The same statement then failed on the 2.0 line for a second reason: the
+# row-by-row path read the rowid from the LAST column of its input, and a
+# DELETE has no projection of its own, so the NOT EXISTS left its mark column
+# after the rowid. On the composite key that BOOLEAN failed loudly ("Expected
+# STRUCT rowid"); on a single-column key it was sent as the key -- every row
+# the NOT EXISTS kept has mark false, i.e. 0 -- and the DELETE removed the row
+# keyed 0 instead of its own rows, with no error (the last section).
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dck (TYPE mssql);
+
+# The row path: a pushed DELETE would send the statement whole, with no rowid.
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+SELECT mssql_exec('dck', 'DROP TABLE IF EXISTS dbo.DuckTag337; DROP TABLE IF EXISTS dbo.DuckSnap337; CREATE TABLE dbo.DuckSnap337 (snapshot_id BIGINT PRIMARY KEY); CREATE TABLE dbo.DuckTag337 (object_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT NULL, [key] VARCHAR(200) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL, value VARCHAR(MAX) COLLATE Latin1_General_100_BIN2_UTF8 NULL, CONSTRAINT pk_DuckTag337 PRIMARY KEY (object_id, begin_snapshot, [key]))');
+
+statement ok
+SELECT mssql_invalidate_cache('dck');
+
+# The rows: snapshots 0, 18, 19, 25 and 50 exist. A tag whose [begin, end)
+# holds no snapshot is expired: (2, 20), (3, 10) and (4, 30).
+statement ok
+CREATE MACRO seed337() AS (mssql_exec('dck', 'DELETE FROM dbo.DuckSnap337; DELETE FROM dbo.DuckTag337; INSERT INTO dbo.DuckSnap337 VALUES (0), (18), (19), (25), (50); INSERT INTO dbo.DuckTag337 VALUES (5, 0, 1, N''zero-snapshot-tag-key'', N''the first snapshot''), (2, 18, 20, N''comment-long-tag-key'', N''a table comment''), (2, 20, 25, N''comment-long-tag-key'', N''a table comment, again''), (2, 25, NULL, N''comment-long-tag-key'', N''the current comment''), (3, 10, 15, N''описание-длинного-ключа'', N''старое''), (3, 15, 19, N''описание-длинного-ключа'', N''новое''), (4, 30, 40, N''k'', NULL)'));
+
+# =============================================================================
+# DuckLake's DELETE, in an explicit transaction
+# =============================================================================
+
+statement ok
+SELECT seed337();
+
+statement ok
+BEGIN TRANSACTION;
+
+query I
+DELETE FROM dck.dbo.DuckTag337 WHERE end_snapshot IS NOT NULL AND NOT EXISTS (SELECT snapshot_id FROM dck.dbo.DuckSnap337 WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot);
+----
+3
+
+statement ok
+COMMIT;
+
+query IIT
+SELECT object_id, begin_snapshot, key FROM dck.dbo.DuckTag337 ORDER BY object_id, begin_snapshot;
+----
+2	18	comment-long-tag-key
+2	25	comment-long-tag-key
+3	15	описание-длинного-ключа
+5	0	zero-snapshot-tag-key
+
+# =============================================================================
+# The same DELETE in autocommit (a statement transaction since #451)
+# =============================================================================
+
+statement ok
+SELECT seed337();
+
+query I
+DELETE FROM dck.dbo.DuckTag337 WHERE end_snapshot IS NOT NULL AND NOT EXISTS (SELECT snapshot_id FROM dck.dbo.DuckSnap337 WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot);
+----
+3
+
+query IIT
+SELECT object_id, begin_snapshot, key FROM dck.dbo.DuckTag337 ORDER BY object_id, begin_snapshot;
+----
+2	18	comment-long-tag-key
+2	25	comment-long-tag-key
+3	15	описание-длинного-ключа
+5	0	zero-snapshot-tag-key
+
+# =============================================================================
+# An UPDATE of the expired tags instead, in a transaction: the key members
+# must reach the server intact for the right rows to change
+# =============================================================================
+
+statement ok
+SELECT seed337();
+
+statement ok
+BEGIN TRANSACTION;
+
+query I
+UPDATE dck.dbo.DuckTag337 SET value = 'expired' WHERE end_snapshot IS NOT NULL AND NOT EXISTS (SELECT snapshot_id FROM dck.dbo.DuckSnap337 WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot);
+----
+3
+
+statement ok
+COMMIT;
+
+query IIT
+SELECT object_id, begin_snapshot, key FROM dck.dbo.DuckTag337 WHERE value = 'expired' ORDER BY object_id, begin_snapshot;
+----
+2	20	comment-long-tag-key
+3	10	описание-длинного-ключа
+4	30	k
+
+# =============================================================================
+# The staged path (#stage + one DELETE ... JOIN) for the same DELETE
+# =============================================================================
+
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+statement ok
+SELECT seed337();
+
+statement ok
+BEGIN TRANSACTION;
+
+query I
+DELETE FROM dck.dbo.DuckTag337 WHERE end_snapshot IS NOT NULL AND NOT EXISTS (SELECT snapshot_id FROM dck.dbo.DuckSnap337 WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot);
+----
+3
+
+statement ok
+COMMIT;
+
+query IIT
+SELECT object_id, begin_snapshot, key FROM dck.dbo.DuckTag337 ORDER BY object_id, begin_snapshot;
+----
+2	18	comment-long-tag-key
+2	25	comment-long-tag-key
+3	15	описание-длинного-ключа
+5	0	zero-snapshot-tag-key
+
+statement ok
+RESET mssql_dml_stage_threshold;
+
+# =============================================================================
+# And pushed whole to the server (the default)
+# =============================================================================
+
+statement ok
+RESET mssql_dml_pushdown;
+
+statement ok
+SELECT seed337();
+
+query II
+EXPLAIN DELETE FROM dck.dbo.DuckTag337 WHERE end_snapshot IS NOT NULL AND NOT EXISTS (SELECT snapshot_id FROM dck.dbo.DuckSnap337 WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot);
+----
+physical_plan	<REGEX>:.*Mssql Dml.*NOT EXISTS.*
+
+query I
+DELETE FROM dck.dbo.DuckTag337 WHERE end_snapshot IS NOT NULL AND NOT EXISTS (SELECT snapshot_id FROM dck.dbo.DuckSnap337 WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot);
+----
+3
+
+query IIT
+SELECT object_id, begin_snapshot, key FROM dck.dbo.DuckTag337 ORDER BY object_id, begin_snapshot;
+----
+2	18	comment-long-tag-key
+2	25	comment-long-tag-key
+3	15	описание-длинного-ключа
+5	0	zero-snapshot-tag-key
+
+# =============================================================================
+# A single-column key: the snapshots no tag's [begin, end) holds are 25 and
+# 50. The range makes DuckDB plan the NOT EXISTS as a mark join (an equality
+# would be an anti join, with no mark column). Read from the mark column, the
+# key was 0 for both rows, and the DELETE removed snapshot 0 -- which tag
+# (5, 0, 1) holds -- and left 25 and 50, with no error.
+# =============================================================================
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+SELECT seed337();
+
+statement ok
+BEGIN TRANSACTION;
+
+query I
+DELETE FROM dck.dbo.DuckSnap337 WHERE NOT EXISTS (SELECT 1 FROM dck.dbo.DuckTag337 WHERE begin_snapshot <= snapshot_id AND snapshot_id < end_snapshot);
+----
+2
+
+statement ok
+COMMIT;
+
+query I
+SELECT list(snapshot_id ORDER BY snapshot_id) FROM dck.dbo.DuckSnap337;
+----
+[0, 18, 19]
+
+statement ok
+RESET mssql_dml_pushdown;
+
+statement ok
+SELECT mssql_exec('dck', 'DROP TABLE dbo.DuckTag337; DROP TABLE dbo.DuckSnap337');
