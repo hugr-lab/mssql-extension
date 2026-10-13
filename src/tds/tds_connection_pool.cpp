@@ -27,6 +27,56 @@ static int GetPoolDebugLevel() {
 			fprintf(stderr, "[MSSQL POOL] " fmt "\n", ##__VA_ARGS__); \
 	} while (0)
 
+namespace {
+
+// The pool slot a login holds from before it starts (issue #461), taken under
+// the pool's lock. It goes back, waking a caller that waited on it, on every way
+// out that does not leave the connection in the pool -- an exception too: a
+// bad_alloc, or ErrorData failing to parse what a factory threw -- unless Keep()
+// says the connection is in. A guard rather than a call each exit must remember
+// (review of #463): one forgotten would leave a pool of one reading full until
+// DETACH.
+class SlotReservation {
+public:
+	SlotReservation(std::unique_lock<std::mutex> &lock, size_t &total_connections, std::condition_variable &available)
+		: lock_(lock), total_connections_(total_connections), available_(available) {
+		D_ASSERT(lock_.owns_lock());
+		total_connections_++;
+	}
+	~SlotReservation() {
+		if (held_) {
+			// An exception out of the login unwinds with the lock released.
+			if (!lock_.owns_lock()) {
+				lock_.lock();
+			}
+			GiveBack();
+		}
+	}
+	SlotReservation(const SlotReservation &) = delete;
+	SlotReservation &operator=(const SlotReservation &) = delete;
+
+	//! The connection is in the pool and the slot is its own. Lock held.
+	void Keep() {
+		D_ASSERT(held_ && lock_.owns_lock());
+		held_ = false;
+	}
+	//! The login failed: the slot goes back now. Lock held.
+	void GiveBack() {
+		D_ASSERT(held_ && lock_.owns_lock());
+		held_ = false;
+		total_connections_--;
+		available_.notify_all();
+	}
+
+private:
+	std::unique_lock<std::mutex> &lock_;
+	size_t &total_connections_;
+	std::condition_variable &available_;
+	bool held_ = true;
+};
+
+}  // namespace
+
 ConnectionPool::ConnectionPool(const std::string &context_name, PoolConfiguration config, ConnectionFactory factory)
 	: context_name_(context_name),
 	  config_(std::move(config)),
@@ -228,6 +278,12 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 		// (issue #302, review 1538).
 		if (stats_.total_connections < config_.connection_limit &&
 			(stats_.active_connections == 0 || std::chrono::steady_clock::now() >= next_create_allowed_)) {
+			// Issue #461: the slot is taken before the login and given back if
+			// it fails. The login runs without the mutex, and the count used to
+			// grow only after it, so every caller arriving meanwhile passed the
+			// same test and dialled too: 21 connections on a limit of 8,
+			// measured. Prewarm reserves its slots the same way.
+			SlotReservation slot(lock, stats_.total_connections, available_cv_);
 			std::string error;
 			lock.unlock();
 			conn = CreateNewConnection(error);
@@ -242,7 +298,7 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 				RecordCreateSuccessLocked();
 				uint64_t id = next_connection_id_++;
 				active_connections_[id] = conn;
-				stats_.total_connections++;
+				slot.Keep();
 				stats_.active_connections++;
 				stats_.connections_created++;
 
@@ -256,7 +312,10 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 				return conn;
 			}
 
-			// Creation failed. Issue #302: this used to fall through to the same
+			// Creation failed: the slot goes back, and a caller waiting on a pool
+			// that read full only because of it may now dial.
+			slot.GiveBack();
+			// Issue #302: this used to fall through to the same
 			// wait an exhausted pool does -- for a Release that, with nothing
 			// active, cannot come -- and report "(timeout)" after the full
 			// acquire_timeout, with the reason discarded. Measured: an expired
@@ -439,17 +498,17 @@ size_t ConnectionPool::Prewarm(size_t target, std::string *failure) {
 		return 0;
 	}
 
-	// Never throws: a factory that throws something CreateNewConnection does not
-	// catch -- or a bad_alloc from its handler -- is a failed login here, not
-	// an exception unwinding past running threads (std::terminate) and the
-	// reservation above (review of #386).
+	// Never throws: a bad_alloc out of CreateNewConnection's handlers (it
+	// catches whatever the factory throws since issue #461) is a failed login
+	// here, not an exception unwinding past running threads (std::terminate)
+	// and the reservation above (review of #386).
 	auto dial = [this, &created, &errors](size_t i) noexcept {
 		try {
 			created[i] = CreateNewConnection(errors[i]);
 		} catch (...) {
 			created[i].reset();
 			try {
-				errors[i] = "connection factory threw a non-standard exception";
+				errors[i] = "connection factory failed";
 			} catch (...) {
 			}
 		}
@@ -615,6 +674,10 @@ std::shared_ptr<TdsConnection> ConnectionPool::CreateNewConnection(std::string &
 		// version of this pasted `{"exception_type":"Connection",...}` into the
 		// user's error.
 		error = ErrorData(e).RawMessage();
+	} catch (...) {
+		// Not a std::exception: still a failed login, and the slot reserved
+		// for it must go back (issue #461), not unwind past the caller.
+		error = "connection factory threw a non-standard exception";
 	}
 	if (!error.empty()) {
 		MSSQL_POOL_DEBUG_LOG(1, "CreateNewConnection failed on pool '%s': %s", context_name_.c_str(), error.c_str());
@@ -645,9 +708,15 @@ std::string ConnectionPool::DescribeTimeoutLocked(const std::string &own_create_
 	// when the caller also tried to create on the way and failed, that reason
 	// rides along, because with others active it is the one that explains why
 	// the pool did not simply grow.
+	// Logins in flight hold their slots (issue #461): said, or a pool full of
+	// them reads as "0 active of 8" with nothing to explain it.
+	const size_t logging_in = stats_.total_connections > stats_.active_connections + stats_.idle_connections
+								  ? stats_.total_connections - stats_.active_connections - stats_.idle_connections
+								  : 0;
 	std::string message = "pool '" + context_name_ + "' timed out (" + std::to_string(stats_.active_connections) +
 						  " active of " + std::to_string(stats_.total_connections) + ", limit " +
-						  std::to_string(config_.connection_limit) + ")";
+						  std::to_string(config_.connection_limit) +
+						  (logging_in ? ", " + std::to_string(logging_in) + " logging in" : std::string()) + ")";
 	if (!own_create_error.empty()) {
 		message += "; this call's own attempt to create a connection failed: " + own_create_error;
 	}
