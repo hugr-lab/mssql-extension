@@ -24,6 +24,7 @@
 #include "codec/string_codec.hpp"
 #include "codec/type_family.hpp"
 #include "codec/uuid_codec.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 
 namespace duckdb {
@@ -95,6 +96,14 @@ size_t EstimateLiteralSize(const LogicalType &type) {
 		return uuid::EstimateLiteralSize(type);
 	}
 	throw InternalException("codec::EstimateLiteralSize: unreachable (TypeFamily enum exhausted)");
+}
+
+void ThrowNamingColumn(const InvalidInputException &ex, const std::string &name) {
+	ErrorData error(ex);
+	if (name.empty()) {
+		throw InvalidInputException(error.RawMessage());
+	}
+	throw InvalidInputException("%s (%s %s)", error.RawMessage(), name[0] == '@' ? "parameter" : "column", name);
 }
 
 }  // namespace codec

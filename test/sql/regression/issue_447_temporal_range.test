@@ -134,12 +134,12 @@ dated infinity is outside SQL Server's range (0001-01-01 to 9999-12-31) and cann
 statement error
 INSERT INTO i447.dbo.i447_t (id, ts) SELECT 1000 + i, CASE WHEN i = 1500 THEN TIMESTAMP '-infinity' ELSE TIMESTAMP '2024-01-01' END FROM range(2000) r(i);
 ----
-outside SQL Server's range
+outside SQL Server's range (0001-01-01 to 9999-12-31) and cannot be sent: the wire would turn it into another date (column ts)
 
 statement error
 INSERT INTO i447.dbo.i447_t (id, d) SELECT 1000 + i, CASE WHEN i = 7 THEN DATE '50000-06-15' ELSE DATE '2024-01-01' END FROM range(2000) r(i);
 ----
-outside SQL Server's range
+(column d)
 
 # the row path (a tinyint column keeps the chunk off the columnar kernels),
 # the datetimeoffset kernel, a value that rounds past 9999-12-31 at the
@@ -147,22 +147,22 @@ outside SQL Server's range
 statement error
 INSERT INTO i447.dbo.i447_t (id, tt, d) SELECT 1000 + i, 7::TINYINT, CASE WHEN i = 1500 THEN DATE 'infinity' ELSE DATE '2024-01-01' END FROM range(2000) r(i);
 ----
-outside SQL Server's range
+(column d)
 
 statement error
 INSERT INTO i447.dbo.i447_t (id, tz) SELECT 1000 + i, CASE WHEN i = 1500 THEN TIMESTAMPTZ 'infinity' ELSE TIMESTAMPTZ '2024-01-01 00:00:00+00' END FROM range(2000) r(i);
 ----
-outside SQL Server's range
+(column tz)
 
 statement error
 INSERT INTO i447.dbo.i447_t (id, ts4) SELECT 1000 + i, CASE WHEN i = 3 THEN TIMESTAMP '9999-12-31 23:59:59.99999' ELSE TIMESTAMP '2024-01-01' END FROM range(2000) r(i);
 ----
-rounds past 9999-12-31
+outside SQL Server's range, and cannot be sent (column ts4)
 
 statement error
 INSERT INTO i447.dbo.i447_t (id, t6) SELECT 1000 + i, CASE WHEN i = 3 THEN TIME '24:00:00' ELSE TIME '10:00:00' END FROM range(2000) r(i);
 ----
-TIME '24:00:00'
+and cannot be sent (column t6)
 
 query I
 SELECT count(*) FROM i447.dbo.i447_t;
@@ -170,28 +170,53 @@ SELECT count(*) FROM i447.dbo.i447_t;
 3
 
 # as statements (under the threshold) the value is a literal: refused by name
-# too, not left to the server's error 241
+# too, not left to the server's error 241 -- and naming the column, as the bulk
+# path does (issue #460)
 statement error
 INSERT INTO i447.dbo.i447_t (id, d) VALUES (900, DATE 'infinity');
 ----
-outside SQL Server's range
+the wire would turn it into another date (column d)
 
 statement error
 INSERT INTO i447.dbo.i447_t (id, t6) VALUES (902, TIME '24:00:00');
 ----
-TIME '24:00:00'
+and cannot be sent (column t6)
 
 # a TIMESTAMP literal is rendered through the same day split: it was the
 # datetime2(7) literal '2262-04-11T23:47:16.8547758', which the server took
 statement error
 INSERT INTO i447.dbo.i447_t (id, ts) VALUES (901, TIMESTAMP 'infinity');
 ----
-outside SQL Server's range
+the wire would turn it into another date (column ts)
 
 query I
 SELECT count(*) FROM i447.dbo.i447_t;
 ----
 3
+
+# an UPDATE's VALUES join carries the new value as a literal too
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement error
+UPDATE i447.dbo.i447_t SET d = DATE 'infinity' WHERE id = (SELECT min(id) FROM i447.dbo.i447_t);
+----
+the wire would turn it into another date (column d)
+
+# and through the #stage, whose own columns are k0 / n0: named as the target's
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+statement error
+UPDATE i447.dbo.i447_t SET d = DATE 'infinity' WHERE id = (SELECT min(id) FROM i447.dbo.i447_t);
+----
+the wire would turn it into another date (column d)
+
+statement ok
+RESET mssql_dml_stage_threshold;
+
+statement ok
+RESET mssql_dml_pushdown;
 
 # a date that fits still loads
 query I
@@ -204,7 +229,7 @@ INSERT INTO i447.dbo.i447_t (id, d) SELECT 1000 + i, DATE '9999-12-31' FROM rang
 statement error
 SELECT * FROM mssql_scan_params('i447', 'SELECT count(*) AS c FROM dbo.i447_t WHERE d = @d', {'d': DATE 'infinity'});
 ----
-outside SQL Server's range
+the wire would turn it into another date (parameter @d)
 
 statement ok
 SELECT mssql_exec('i447', 'DROP TABLE dbo.i447_t');

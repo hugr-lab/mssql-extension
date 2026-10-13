@@ -102,6 +102,17 @@ whole in the transaction. With those settings true (the default) INSERT and CTAS
 keep the per-statement bracket above and their parallel writers. COPY and
 `mssql_exec()` never join.
 
+A bulk-path INSERT's parallel writers are separate server transactions
+(`BulkLoadSession` with `own_transaction`), committed one after another at
+`MSSQLPhysicalInsert::Finalize`: "together" only in that a failure before then
+rolls all of them back. A reader that does not wait on locks --
+READ_COMMITTED_SNAPSHOT, SNAPSHOT, NOLOCK -- sees each writer's rows at its own
+COMMIT, so it can count part of one INSERT (measured by duckdb-acl's door e2e
+under RCSI). One writer (`mssql_copy_parallel_writers = 1`, or the INSERT inside
+a transaction) makes it one commit. A COPY's or a CTAS's sessions own no
+transaction in autocommit: every INSERT BULK batch (`mssql_copy_flush_rows`)
+commits as it is sent, visible to any reader whatever the writer count.
+
 ### Explicit Transaction Mode
 
 After `BEGIN` is issued:
