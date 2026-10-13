@@ -29,6 +29,15 @@ Supported filter operations for pushdown:
 - NULL checks: `IS NULL`, `IS NOT NULL`
 - Conjunctions: `AND`, `OR`; `CASE`, `BETWEEN`
 - Date/timestamp comparisons: `date_col >= '2024-01-01'`
+  - a `datetime` column stores 1/300 s ticks and is read to the microsecond
+    (`.003` reads as `.003333`). A constant compared with it is sent as the
+    tick that decides the comparison, in the column's own type, so a value
+    read back finds its row (`WHERE dt = <a value read from dt>`) and `>`,
+    `<=`, `IN` and the rest give DuckDB's answer over the values it reads.
+    Compared with anything else but another `datetime` column — a
+    `datetime2` column, a `CASE` over it — the predicate is evaluated by
+    DuckDB: the server would compare the column's exact tick, not the value
+    DuckDB reads
 - Boolean comparisons: `is_active = true` (converted to `= 1`)
 - **Mapped functions** inside predicates:
   - dates: `year`, `month`, `day`, `hour`, `minute`, `second` — not over a

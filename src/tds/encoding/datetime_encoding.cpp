@@ -18,6 +18,12 @@ constexpr int64_t MICROS_PER_DAY = 86400000000LL;
 // Microseconds per second
 constexpr int64_t MICROS_PER_SECOND = 1000000LL;
 
+// The microsecond a DATETIME tick (1/300 s since midnight) is read as:
+// ticks * 1000000 / 300, truncated. DatetimeTickBound inverts it.
+static inline int64_t DatetimeTickMicros(int64_t ticks) {
+	return ticks * 10000 / 3;
+}
+
 date_t DateTimeEncoding::ConvertDate(const uint8_t *data) {
 	// DATE: 3 bytes unsigned little-endian, days since 0001-01-01
 	int32_t days =
@@ -73,8 +79,7 @@ timestamp_t DateTimeEncoding::ConvertDatetime(const uint8_t *data) {
 	const int64_t unix_days = static_cast<int64_t>(days) - DAYS_FROM_1900_TO_EPOCH;
 
 	// Convert ticks to microseconds (1 tick = 1/300 second)
-	// microseconds = ticks * 1000000 / 300 = ticks * 10000 / 3
-	int64_t microseconds = (static_cast<int64_t>(ticks) * 10000) / 3;
+	int64_t microseconds = DatetimeTickMicros(static_cast<int64_t>(ticks));
 
 	// Assembled through an unsigned type, like ConvertMoney and for the same
 	// reason. This is the ONE temporal conversion whose day field is a full signed
@@ -94,6 +99,22 @@ timestamp_t DateTimeEncoding::ConvertDatetime(const uint8_t *data) {
 	int64_t value = 0;
 	std::memcpy(&value, &bits, sizeof(value));
 	return timestamp_t(value);
+}
+
+timestamp_t DateTimeEncoding::DatetimeTickBound(timestamp_t value, bool up) {
+	int64_t day = value.value / MICROS_PER_DAY;
+	int64_t micros = value.value % MICROS_PER_DAY;
+	if (micros < 0) {
+		micros += MICROS_PER_DAY;
+		day -= 1;
+	}
+	// A tick t reads as floor(t * 10000 / 3). The largest read at or below
+	// `micros`: t * 10000 < 3 * (micros + 1), so floor((3 * micros + 2) / 10000).
+	// The smallest read at or above it: t * 10000 >= 3 * micros, so
+	// ceil(3 * micros / 10000) -- 25920000, the next midnight, past the day's
+	// last read (23:59:59.996666, the server's .997).
+	const int64_t tick = up ? (3 * micros + 9999) / 10000 : (3 * micros + 2) / 10000;
+	return timestamp_t(day * MICROS_PER_DAY + DatetimeTickMicros(tick));
 }
 
 timestamp_t DateTimeEncoding::ConvertDatetime2(const uint8_t *data, uint8_t scale) {

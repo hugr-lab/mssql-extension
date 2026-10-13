@@ -31,6 +31,7 @@
 #include "codec/type_family.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
+#include "tds/encoding/datetime_encoding.hpp"
 #include "tds/tds_column_metadata.hpp"
 #include "tds/tds_types.hpp"
 
@@ -45,6 +46,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -186,6 +188,69 @@ void TestDecodeDatetime() {
 	duckdb::mssql::codec::datetime::DecodeFromTds(wire, col, vec, 0);
 	auto expected = duckdb::Timestamp::FromDatetime(target_date, duckdb::Time::FromTime(14, 30, 0, 0));
 	CHECK_EQ(duckdb::FlatVector::GetDataMutable<timestamp_t>(vec)[0].value, expected.value);
+}
+
+// Issue #426: DatetimeTickBound inverts the read. Every tick of a day read
+// back is its own bound both ways; a microsecond past (or short of) a read
+// that is not a neighbour's read lies between the two ticks. Checked
+// against ConvertDatetime itself (the scan's decoder), for every tick of one
+// day and the first and last 3000 ticks of the days at the edges of the
+// datetime range and on either side of the epoch (negative timestamps).
+duckdb::timestamp_t ReadDatetime(int32_t days_from_1900, int32_t ticks) {
+	uint8_t wire[8];
+	std::memcpy(&wire[0], &days_from_1900, 4);
+	std::memcpy(&wire[4], &ticks, 4);
+	return duckdb::tds::encoding::DateTimeEncoding::ConvertDatetime(wire);
+}
+
+void TestDatetimeTickBound() {
+	std::cout << "Test: DatetimeTickBound -- the tick a comparison with a datetime column decides by (#426)\n";
+	using duckdb::tds::encoding::DateTimeEncoding;
+	constexpr int32_t TICKS_PER_DAY = 300 * 86400;
+	int64_t mismatches = 0;
+	const auto check_day = [&](int32_t days_from_1900, int32_t from, int32_t to) {
+		for (int32_t t = from; t < to; t++) {
+			const auto read = ReadDatetime(days_from_1900, t);
+			const auto next =
+				t + 1 < TICKS_PER_DAY ? ReadDatetime(days_from_1900, t + 1) : ReadDatetime(days_from_1900 + 1, 0);
+			if (DateTimeEncoding::DatetimeTickBound(read, false) != read ||
+				DateTimeEncoding::DatetimeTickBound(read, true) != read) {
+				mismatches++;
+			}
+			// Just below a read: the tick below it and this one. Below a whole
+			// 10 ms read (m = ...9999) is where a floor off by one goes wrong.
+			const auto previous =
+				t > 0 ? ReadDatetime(days_from_1900, t - 1) : ReadDatetime(days_from_1900 - 1, TICKS_PER_DAY - 1);
+			const timestamp_t below(read.value - 1);
+			if (below != previous && (DateTimeEncoding::DatetimeTickBound(below, false) != previous ||
+									  DateTimeEncoding::DatetimeTickBound(below, true) != read)) {
+				mismatches++;
+			}
+			const timestamp_t between(read.value + 1);
+			if (between != next && (DateTimeEncoding::DatetimeTickBound(between, false) != read ||
+									DateTimeEncoding::DatetimeTickBound(between, true) != next)) {
+				mismatches++;
+			}
+		}
+	};
+	const auto day = [](int32_t y, int32_t m, int32_t d) {
+		return duckdb::Date::FromDate(y, m, d).days + DAYS_1900_TO_EPOCH;
+	};
+	check_day(day(2026, 1, 1), 0, TICKS_PER_DAY);
+	for (auto d : {day(1753, 1, 1), day(1969, 12, 31), day(1970, 1, 1), day(9999, 12, 31)}) {
+		check_day(d, 0, 3000);
+		check_day(d, TICKS_PER_DAY - 3000, TICKS_PER_DAY);
+	}
+	CHECK_EQ(mismatches, int64_t(0));
+	// The three reads of a 10 ms step, and the microseconds between them.
+	const auto at = [](int32_t us) {
+		return duckdb::Timestamp::FromDatetime(duckdb::Date::FromDate(2026, 1, 1),
+											   duckdb::Time::FromTime(10, 0, 0, us));
+	};
+	CHECK_EQ(DateTimeEncoding::DatetimeTickBound(at(3333), false).value, at(3333).value);
+	CHECK_EQ(DateTimeEncoding::DatetimeTickBound(at(5000), false).value, at(3333).value);
+	CHECK_EQ(DateTimeEncoding::DatetimeTickBound(at(5000), true).value, at(6666).value);
+	CHECK_EQ(DateTimeEncoding::DatetimeTickBound(at(6667), true).value, at(10000).value);
 }
 
 void TestDecodeSmallDatetime() {
@@ -697,6 +762,7 @@ int main() {
 	TestDecodeTimeScale7();
 	TestDecodeTimeScale0();
 	TestDecodeDatetime();
+	TestDatetimeTickBound();
 	TestDecodeSmallDatetime();
 	TestDecodeDatetimen8();
 	TestDecodeDatetimen4();

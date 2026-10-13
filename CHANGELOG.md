@@ -472,6 +472,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A filter on a `datetime` column missed rows read from it** (#426). A
+  `datetime` stores 1/300 s ticks; the scan reads each to the microsecond,
+  truncated (`.003` is `.00333…` on the server and `.003333` in DuckDB). The
+  pushed filter compared the column with its constant as `datetime2`,
+  exactly.
+  - `WHERE dt = <a value read from dt>` matched only on a whole 10 ms: 200 of
+    603 values found their own row. `>` and `<=` disagreed with DuckDB on
+    such a value in the same way.
+  - A constant compared with the column is now the tick that decides the
+    comparison, sent as `datetime`. For `=`, `<>` and `IN` it is the tick
+    read as the constant. For `>` and `<=` it is the tick read at or below
+    it, and for `>=` and `<` the one at or above it. Such a comparison gives
+    DuckDB's answer over the values it reads, parameterised or as a literal.
+  - Where no tick decides it (`=` between two reads, `<` past the last
+    `datetime`), the constant goes as a `datetime2` value that gives the same
+    answer at every database compatibility level. Below 130 the server
+    converts a `datetime` to `datetime2` at the millisecond, so `dt =
+    '….003'` matched the `.003` row there, where DuckDB reads `.003333`.
+  - A `rowid` of a `datetime` primary key used to round a constant between
+    two reads onto a tick and match that row; it now matches nothing.
+  - A `datetime` column compared with anything but constants and other
+    `datetime` columns -- a `datetime2(6)` column of the same table, a `CASE`
+    over it, a constant with it in its `IN` list -- is no longer pushed:
+    `dt = dt2` found nothing where DuckDB, reading both, finds the row.
+
 - **A materialized scan crashed on a composite rowid key it did not project,
   and ignored the filters DuckDB applies itself** (found by #451). A scan is
   materialized inside an explicit transaction, on a pool of one connection,
@@ -549,8 +574,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CAST(CAST(<literal> AS datetime2(7)) AS datetime)`, or a `datetime` stage
   column — and lands on the stored tick: 603 of 603 values measured either
   way, against 200 of 603 before. A `WHERE rowid = …` on such a table compares the same
-  way. (A plain `WHERE dt = …` filter on a `datetime` column still compares as
-  `datetime2`; #426.)
+  way. (A plain `WHERE dt = …` filter on a `datetime` column compares in the
+  column's type as well since #426, above.)
 
 - **The planner's row estimate follows a DELETE** (spec 080). After an
   autocommit DELETE through the catalog the table's estimate drops by the rows
