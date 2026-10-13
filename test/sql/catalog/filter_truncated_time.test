@@ -1,0 +1,270 @@
+# name: test/sql/catalog/filter_truncated_time.test
+# description: Issue #426 -- a pushed filter on a time(7) / datetimeoffset(7) column decides as DuckDB does over the values the scan reads
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# time(7) and datetimeoffset(7) -- the default scales -- count 100 ns ticks;
+# the scan reads them as microseconds with the seventh digit dropped
+# (.1234569 reads as .123456). The pushed filter compared the stored value
+# with the constant, so `t7 = TIME '...123456'` found only the row whose
+# seventh digit is 0, and `>` / `<=` disagreed the same way. Now the read
+# equals c for every stored value in [c, c + 1 us): `=` is that range, `<>`
+# its complement, `>` starts at c + 1 us, `<=` ends before it, `>=` / `<`
+# are unchanged. At the last microsecond c + 1 us does not exist and is never
+# sent (the server would raise an overflow). Such a column against anything
+# but constants -- another time(7), a datetimeoffset(6) -- stays with DuckDB:
+# two values 100 ns apart are two there and one here.
+# Each expected list is DuckDB's answer over the values read: t7 of rows 1-6 is
+# .1234560 .1234561 .1234569 .1234570 23:59:59.9999999 00:00:00; o7 of rows
+# 1-6 (UTC) 2026 .1234560, .1234569, .1234570, 9999-12-31 .9999999 and .9999990,
+# 0001-01-01; row 7 is NULL.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dtq (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('dtq', 'DROP TABLE IF EXISTS dbo.TruncTime; CREATE TABLE dbo.TruncTime (id int PRIMARY KEY, t7 time(7) NULL, t7b time(7) NULL, o7 datetimeoffset(7) NULL, o6 datetimeoffset(6) NULL); INSERT INTO dbo.TruncTime VALUES (1, ''10:00:00.1234560'', ''10:00:00.1234561'', ''2026-01-01 10:00:00.1234560 +00:00'', ''2026-01-01 10:00:00.123456 +00:00''), (2, ''10:00:00.1234561'', ''10:00:00.1234569'', ''2026-01-01 13:00:00.1234569 +03:00'', ''2026-01-01 10:00:00.123456 +00:00''), (3, ''10:00:00.1234569'', ''10:00:00.1234570'', ''2026-01-01 10:00:00.1234570 +00:00'', ''2026-01-01 10:00:00.123457 +00:00''), (4, ''10:00:00.1234570'', ''23:59:59.9999999'', ''9999-12-31 23:59:59.9999999 +00:00'', ''9999-12-31 23:59:59.999999 +00:00''), (5, ''23:59:59.9999999'', ''00:00:00'', ''9999-12-31 23:59:59.9999990 +00:00'', ''9999-12-31 23:59:59.999999 +00:00''), (6, ''00:00:00'', ''10:00:00.1234560'', ''0001-01-01 00:00:00 +00:00'', ''0001-01-01 00:00:00 +00:00''), (7, NULL, NULL, NULL, NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('dtq');
+
+# =============================================================================
+# Parameterised (the default)
+# =============================================================================
+
+# time(7), the read of .1234560, .1234561 and .1234569: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 = TIME '10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <> TIME '10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 < TIME '10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <= TIME '10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 > TIME '10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 >= TIME '10:00:00.123456');
+----
+[1, 2, 3]	[4, 5, 6]	[6]	[1, 2, 3, 6]	[4, 5]	[1, 2, 3, 4, 5]
+
+# the constant on the left
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIME '10:00:00.123456' = t7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIME '10:00:00.123456' <> t7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIME '10:00:00.123456' < t7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIME '10:00:00.123456' <= t7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIME '10:00:00.123456' > t7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIME '10:00:00.123456' >= t7);
+----
+[1, 2, 3]	[4, 5, 6]	[4, 5]	[1, 2, 3, 4, 5]	[6]	[1, 2, 3, 6]
+
+# time(7), the read of .1234570: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 = TIME '10:00:00.123457'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <> TIME '10:00:00.123457'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 < TIME '10:00:00.123457'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <= TIME '10:00:00.123457'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 > TIME '10:00:00.123457'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 >= TIME '10:00:00.123457');
+----
+[4]	[1, 2, 3, 5, 6]	[1, 2, 3, 6]	[1, 2, 3, 4, 6]	[5]	[4, 5]
+
+# time(7), the last microsecond: no c + 1 us to send: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 = TIME '23:59:59.999999'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <> TIME '23:59:59.999999'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 < TIME '23:59:59.999999'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <= TIME '23:59:59.999999'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 > TIME '23:59:59.999999'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 >= TIME '23:59:59.999999');
+----
+[5]	[1, 2, 3, 4, 6]	[1, 2, 3, 4, 6]	[1, 2, 3, 4, 5, 6]	NULL	[5]
+
+# time(7), no row: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 = TIME '12:00:00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <> TIME '12:00:00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 < TIME '12:00:00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <= TIME '12:00:00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 > TIME '12:00:00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 >= TIME '12:00:00');
+----
+NULL	[1, 2, 3, 4, 5, 6]	[1, 2, 3, 4, 6]	[1, 2, 3, 4, 6]	[5]	[5]
+
+# IN, NOT IN, BETWEEN, a two-sided range
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 IN (TIME '10:00:00.123456', TIME '12:00:00');
+----
+[1, 2, 3]
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 NOT IN (TIME '10:00:00.123456', TIME '10:00:00.123457');
+----
+[5, 6]
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 BETWEEN TIME '10:00:00.123456' AND TIME '10:00:00.123457';
+----
+[1, 2, 3, 4]
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 > TIME '00:00:00' AND t7 < TIME '10:00:00.123457';
+----
+[1, 2, 3]
+
+# datetimeoffset(7), the read of .1234560 and of 13:00:00.1234569 +03:00: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 = TIMESTAMPTZ '2026-01-01 10:00:00.123456+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <> TIMESTAMPTZ '2026-01-01 10:00:00.123456+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 < TIMESTAMPTZ '2026-01-01 10:00:00.123456+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <= TIMESTAMPTZ '2026-01-01 10:00:00.123456+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 > TIMESTAMPTZ '2026-01-01 10:00:00.123456+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 >= TIMESTAMPTZ '2026-01-01 10:00:00.123456+00');
+----
+[1, 2]	[3, 4, 5, 6]	[6]	[1, 2, 6]	[3, 4, 5]	[1, 2, 3, 4, 5]
+
+# the constant on the left
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' = o7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' <> o7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' < o7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' <= o7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' > o7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' >= o7);
+----
+[1, 2]	[3, 4, 5, 6]	[3, 4, 5]	[1, 2, 3, 4, 5]	[6]	[1, 2, 6]
+
+# datetimeoffset(7), the read of .1234570: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 = TIMESTAMPTZ '2026-01-01 10:00:00.123457+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <> TIMESTAMPTZ '2026-01-01 10:00:00.123457+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 < TIMESTAMPTZ '2026-01-01 10:00:00.123457+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <= TIMESTAMPTZ '2026-01-01 10:00:00.123457+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 > TIMESTAMPTZ '2026-01-01 10:00:00.123457+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 >= TIMESTAMPTZ '2026-01-01 10:00:00.123457+00');
+----
+[3]	[1, 2, 4, 5, 6]	[1, 2, 6]	[1, 2, 3, 6]	[4, 5]	[3, 4, 5]
+
+# datetimeoffset(7), the last microsecond: no c + 1 us to send: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 = TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <> TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 < TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <= TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 > TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 >= TIMESTAMPTZ '9999-12-31 23:59:59.999999+00');
+----
+[4, 5]	[1, 2, 3, 6]	[1, 2, 3, 6]	[1, 2, 3, 4, 5, 6]	NULL	[4, 5]
+
+# datetimeoffset(7), the first datetimeoffset: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 = TIMESTAMPTZ '0001-01-01 00:00:00+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <> TIMESTAMPTZ '0001-01-01 00:00:00+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 < TIMESTAMPTZ '0001-01-01 00:00:00+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <= TIMESTAMPTZ '0001-01-01 00:00:00+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 > TIMESTAMPTZ '0001-01-01 00:00:00+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 >= TIMESTAMPTZ '0001-01-01 00:00:00+00');
+----
+[6]	[1, 2, 3, 4, 5]	NULL	[6]	[1, 2, 3, 4, 5]	[1, 2, 3, 4, 5, 6]
+
+# IN, NOT IN, BETWEEN
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 IN (TIMESTAMPTZ '2026-01-01 10:00:00.123456+00', TIMESTAMPTZ '2026-01-01 10:00:00.123457+00');
+----
+[1, 2, 3]
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 NOT IN (TIMESTAMPTZ '2026-01-01 10:00:00.123456+00', TIMESTAMPTZ '2026-01-01 10:00:00.123457+00');
+----
+[4, 5, 6]
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 BETWEEN TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' AND TIMESTAMPTZ '2026-01-01 10:00:00.123457+00';
+----
+[1, 2, 3]
+
+# =============================================================================
+# Literals (mssql_scan_parameterize_filters = false)
+# =============================================================================
+
+statement ok
+SET mssql_scan_parameterize_filters = false;
+
+# time(7), the read of .1234560, .1234561 and .1234569: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 = TIME '10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <> TIME '10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 < TIME '10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <= TIME '10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 > TIME '10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 >= TIME '10:00:00.123456');
+----
+[1, 2, 3]	[4, 5, 6]	[6]	[1, 2, 3, 6]	[4, 5]	[1, 2, 3, 4, 5]
+
+# time(7), the read of .1234570: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 = TIME '10:00:00.123457'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <> TIME '10:00:00.123457'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 < TIME '10:00:00.123457'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <= TIME '10:00:00.123457'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 > TIME '10:00:00.123457'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 >= TIME '10:00:00.123457');
+----
+[4]	[1, 2, 3, 5, 6]	[1, 2, 3, 6]	[1, 2, 3, 4, 6]	[5]	[4, 5]
+
+# time(7), the last microsecond: no c + 1 us to send: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 = TIME '23:59:59.999999'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <> TIME '23:59:59.999999'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 < TIME '23:59:59.999999'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <= TIME '23:59:59.999999'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 > TIME '23:59:59.999999'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 >= TIME '23:59:59.999999');
+----
+[5]	[1, 2, 3, 4, 6]	[1, 2, 3, 4, 6]	[1, 2, 3, 4, 5, 6]	NULL	[5]
+
+# time(7), no row: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 = TIME '12:00:00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <> TIME '12:00:00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 < TIME '12:00:00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 <= TIME '12:00:00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 > TIME '12:00:00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 >= TIME '12:00:00');
+----
+NULL	[1, 2, 3, 4, 5, 6]	[1, 2, 3, 4, 6]	[1, 2, 3, 4, 6]	[5]	[5]
+
+# IN, NOT IN, BETWEEN, a two-sided range
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 IN (TIME '10:00:00.123456', TIME '12:00:00');
+----
+[1, 2, 3]
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 NOT IN (TIME '10:00:00.123456', TIME '10:00:00.123457');
+----
+[5, 6]
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 BETWEEN TIME '10:00:00.123456' AND TIME '10:00:00.123457';
+----
+[1, 2, 3, 4]
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 > TIME '00:00:00' AND t7 < TIME '10:00:00.123457';
+----
+[1, 2, 3]
+
+# datetimeoffset(7), the read of .1234560 and of 13:00:00.1234569 +03:00: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 = TIMESTAMPTZ '2026-01-01 10:00:00.123456+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <> TIMESTAMPTZ '2026-01-01 10:00:00.123456+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 < TIMESTAMPTZ '2026-01-01 10:00:00.123456+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <= TIMESTAMPTZ '2026-01-01 10:00:00.123456+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 > TIMESTAMPTZ '2026-01-01 10:00:00.123456+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 >= TIMESTAMPTZ '2026-01-01 10:00:00.123456+00');
+----
+[1, 2]	[3, 4, 5, 6]	[6]	[1, 2, 6]	[3, 4, 5]	[1, 2, 3, 4, 5]
+
+# the constant on the left
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' = o7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' <> o7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' < o7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' <= o7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' > o7), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' >= o7);
+----
+[1, 2]	[3, 4, 5, 6]	[3, 4, 5]	[1, 2, 3, 4, 5]	[6]	[1, 2, 6]
+
+# datetimeoffset(7), the read of .1234570: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 = TIMESTAMPTZ '2026-01-01 10:00:00.123457+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <> TIMESTAMPTZ '2026-01-01 10:00:00.123457+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 < TIMESTAMPTZ '2026-01-01 10:00:00.123457+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <= TIMESTAMPTZ '2026-01-01 10:00:00.123457+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 > TIMESTAMPTZ '2026-01-01 10:00:00.123457+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 >= TIMESTAMPTZ '2026-01-01 10:00:00.123457+00');
+----
+[3]	[1, 2, 4, 5, 6]	[1, 2, 6]	[1, 2, 3, 6]	[4, 5]	[3, 4, 5]
+
+# datetimeoffset(7), the last microsecond: no c + 1 us to send: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 = TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <> TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 < TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <= TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 > TIMESTAMPTZ '9999-12-31 23:59:59.999999+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 >= TIMESTAMPTZ '9999-12-31 23:59:59.999999+00');
+----
+[4, 5]	[1, 2, 3, 6]	[1, 2, 3, 6]	[1, 2, 3, 4, 5, 6]	NULL	[4, 5]
+
+# datetimeoffset(7), the first datetimeoffset: = <> < <= > >=
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 = TIMESTAMPTZ '0001-01-01 00:00:00+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <> TIMESTAMPTZ '0001-01-01 00:00:00+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 < TIMESTAMPTZ '0001-01-01 00:00:00+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 <= TIMESTAMPTZ '0001-01-01 00:00:00+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 > TIMESTAMPTZ '0001-01-01 00:00:00+00'), (SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 >= TIMESTAMPTZ '0001-01-01 00:00:00+00');
+----
+[6]	[1, 2, 3, 4, 5]	NULL	[6]	[1, 2, 3, 4, 5]	[1, 2, 3, 4, 5, 6]
+
+# IN, NOT IN, BETWEEN
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 IN (TIMESTAMPTZ '2026-01-01 10:00:00.123456+00', TIMESTAMPTZ '2026-01-01 10:00:00.123457+00');
+----
+[1, 2, 3]
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 NOT IN (TIMESTAMPTZ '2026-01-01 10:00:00.123456+00', TIMESTAMPTZ '2026-01-01 10:00:00.123457+00');
+----
+[4, 5, 6]
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 BETWEEN TIMESTAMPTZ '2026-01-01 10:00:00.123456+00' AND TIMESTAMPTZ '2026-01-01 10:00:00.123457+00';
+----
+[1, 2, 3]
+
+statement ok
+RESET mssql_scan_parameterize_filters;
+
+# =============================================================================
+# Against another column of the family: evaluated by DuckDB. t7b holds other
+# time(7) values, o6 the datetimeoffset(6) of what DuckDB reads from o7.
+# =============================================================================
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 = t7b;
+----
+[1, 2]
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE t7 < t7b;
+----
+[3, 4, 6]
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 = o6;
+----
+[1, 2, 3, 4, 5, 6]
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE o7 > o6;
+----
+NULL
+
+query I
+SELECT list(id ORDER BY id) FROM dtq.dbo.TruncTime WHERE TIME '10:00:00.123456' IN (t7, t7b);
+----
+[1, 2, 3, 6]
+
+statement ok
+SELECT mssql_exec('dtq', 'DROP TABLE dbo.TruncTime');

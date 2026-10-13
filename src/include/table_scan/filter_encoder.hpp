@@ -91,6 +91,11 @@ struct ExpressionEncodeContext {
 	const std::vector<MSSQLColumnInfo> *mssql_columns = nullptr;
 	const MSSQLColumnInfo *filter_column_info = nullptr;
 	const MSSQLColumnInfo *constant_peer = nullptr;
+	// Issue #426: the comparison that constant takes part in, as seen from the
+	// column (`5 < k` is COMPARE_GREATERTHAN; an IN item COMPARE_EQUAL), set
+	// with `constant_peer` and not inherited either. A DATETIME peer moves the
+	// constant onto the tick it decides by (FilterEncoder::EncodeConstantValue).
+	ExpressionType constant_comparison = ExpressionType::INVALID;
 
 	// DuckDB's error_on_division_by_zero as the asking session has it. False
 	// makes `x % 0` NULL in DuckDB and error 8134 on the server, so `%` must
@@ -188,7 +193,9 @@ public:
 	 * registered in the sink and declared from `peer` (the column it is
 	 * compared with) or, with no peer, from the constant's own type. A NULL, a
 	 * type with no SQL Server declaration, and a set at MAX_PARAMS stay
-	 * literal. Public for the unit test.
+	 * literal. Against a DATETIME peer, in a comparison ctx names
+	 * (`constant_comparison`), the constant is the tick that decides it, in
+	 * the column's own type (issue #426). Public for the unit test.
 	 */
 	static std::string EncodeConstantValue(const Value &value, const LogicalType &type,
 										   const ExpressionEncodeContext &ctx, const MSSQLColumnInfo *peer);
@@ -286,7 +293,7 @@ private:
 	 * Encode IN_FILTER (col IN (values)).
 	 */
 	static ExpressionEncodeResult EncodeInFilter(const LegacyInFilter &filter, const std::string &column_name,
-												 const LogicalType &column_type);
+												 const LogicalType &column_type, const ExpressionEncodeContext &ctx);
 
 	/**
 	 * Encode CONJUNCTION_AND filter.

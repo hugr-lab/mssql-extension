@@ -8,6 +8,7 @@
 #include "table_scan/filter_encoder.hpp"
 #include <cstdlib>
 #include "catalog/mssql_column_info.hpp"
+#include "catalog/mssql_rowid_key_choice.hpp"
 #include "codec/datetime_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -21,6 +22,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
@@ -28,6 +30,7 @@
 #include "query/mssql_identifier.hpp"
 #include "query/mssql_sql_params.hpp"
 #include "table_scan/function_mapping.hpp"
+#include "tds/encoding/datetime_encoding.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetDebugLevel() {
@@ -134,35 +137,112 @@ std::string FilterEncoder::DeclarationForColumn(const MSSQLColumnInfo &column, c
 	return ExpressionVocabulary::DeclarationForColumn(column, value, type);
 }
 
-//! #358: a rowid key value against a DATETIME key column, compared in the
-//! column's own type. A datetime holds 1/300 s ticks; compared with a
-//! datetime2 it is converted more precisely than any value read back can
-//! match (200 of 603 matched), while converted to datetime the value lands on
-//! its tick (603 of 603) -- the UPDATE / DELETE key join's rule
-//! (PKColumnInfo::KeyComparand). Equality only: a range against a constant
-//! between two ticks would round it and move the boundary, so the general
-//! filter path keeps comparing as datetime2.
-static std::string DatetimeKeyEquality(const Value &value, const LogicalType &type, const ExpressionEncodeContext &ctx,
-									   const MSSQLColumnInfo &peer) {
-	auto literal = ExpressionVocabulary::ValueToSQLLiteral(value, type);
-	if (ctx.params && !value.IsNull() && ctx.params->params.size() < SqlParamSet::MAX_PARAMS) {
-		return "@" + ctx.params->Add("datetime", literal, value);
+//! Issue #426 (#358 for a rowid key): a constant compared with a DATETIME
+//! column, as the tick the comparison is decided by. DuckDB compares the
+//! values ConvertDatetime READ -- a 1/300 s tick truncated to the microsecond,
+//! .003333 for the server's .00333... -- while the server compared the column
+//! with the constant as datetime2, exactly: a value read back matched only on
+//! a whole 10 ms (200 of 603), and `>` / `<=` disagreed on it the same way.
+//! So `>` / `<=` take the tick read at or below the constant, `>=` / `<` the
+//! one read at or above it, and `=` / `<>` / an IN item the one read AS it.
+//! Sent as datetime (`as_datetime`), the bound lands on its tick (it is within
+//! a microsecond of it), and the server's comparison in the column's own type
+//! is DuckDB's.
+//! Where no tick decides it the answer is the same for every row, and `out`
+//! is a datetime2 value that gives it at any compatibility level -- below 130
+//! the server converts a datetime to datetime2 at the millisecond (.003 is
+//! .0030000), at 130 and above exactly (.0033333...):
+//! - `=` / `<>` between two reads: no read equals the constant. A whole
+//!   millisecond plus one microsecond equals no datetime either way (`= '.003'`
+//!   matched the .003 row below 130).
+//! - `>=` / `<` past the last read (9999-12-31 23:59:59.996666): every read is
+//!   below it; so is every datetime below 9999-12-31 23:59:59.999999.
+//! False -- the constant as it is, as datetime2 -- for a bound before the
+//! first datetime (1753-01-01, exact either way: every value is above it), and
+//! for any type but TIMESTAMP, which a constant compared with the column
+//! itself always has.
+static bool DatetimeComparand(const Value &value, const LogicalType &type, ExpressionType comparison, Value &out,
+							  bool &as_datetime) {
+	using tds::encoding::DateTimeEncoding;
+	if (value.IsNull() || type.id() != LogicalTypeId::TIMESTAMP) {
+		return false;
 	}
-	return "CAST(CAST(" + literal + " AS datetime2(7)) AS datetime)";
+	const auto constant = value.GetValue<timestamp_t>();
+	const auto first = Timestamp::FromDatetime(Date::FromDate(1753, 1, 1), dtime_t(0));
+	const auto end_of_range = Timestamp::FromDatetime(Date::FromDate(9999, 12, 31), Time::FromTime(23, 59, 59, 999999));
+	const auto last = DateTimeEncoding::DatetimeTickBound(end_of_range, false);
+	timestamp_t bound;
+	switch (comparison) {
+	case ExpressionType::COMPARE_EQUAL:
+	case ExpressionType::COMPARE_NOTEQUAL:
+		bound = DateTimeEncoding::DatetimeTickBound(constant, false);
+		if (bound != constant || bound < first) {
+			int64_t within_ms = constant.value % Interval::MICROS_PER_MSEC;
+			if (within_ms < 0) {
+				within_ms += Interval::MICROS_PER_MSEC;
+			}
+			out = Value::TIMESTAMP(timestamp_t(constant.value - within_ms + 1));
+			as_datetime = false;
+			return true;
+		}
+		break;
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		bound = DateTimeEncoding::DatetimeTickBound(constant, false);
+		break;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+	case ExpressionType::COMPARE_LESSTHAN:
+		bound = DateTimeEncoding::DatetimeTickBound(constant, true);
+		if (bound > last) {
+			out = Value::TIMESTAMP(end_of_range);
+			as_datetime = false;
+			return true;
+		}
+		break;
+	default:
+		return false;
+	}
+	if (bound < first) {
+		return false;
+	}
+	out = Value::TIMESTAMP(bound);
+	as_datetime = true;
+	return true;
 }
 
-//! A rowid key component's constant: a DATETIME key in its own type, any
-//! other through EncodeConstantValue.
+static bool IsDatetimeColumn(const MSSQLColumnInfo *column) {
+	return column && StringUtil::Lower(column->sql_type_name) == "datetime";
+}
+
+//! A rowid key component's constant: equality with its key column.
 static std::string EncodeKeyConstant(const Value &value, const LogicalType &type, const ExpressionEncodeContext &ctx,
 									 const MSSQLColumnInfo *peer) {
-	if (peer && StringUtil::Lower(peer->sql_type_name) == "datetime") {
-		return DatetimeKeyEquality(value, type, ctx, *peer);
-	}
-	return FilterEncoder::EncodeConstantValue(value, type, ctx, peer);
+	auto key_ctx = ctx;
+	key_ctx.constant_comparison = ExpressionType::COMPARE_EQUAL;
+	return FilterEncoder::EncodeConstantValue(value, type, key_ctx, peer);
 }
 
 std::string FilterEncoder::EncodeConstantValue(const Value &value, const LogicalType &type,
 											   const ExpressionEncodeContext &ctx, const MSSQLColumnInfo *peer) {
+	Value tick;
+	bool as_datetime = false;
+	if (IsDatetimeColumn(peer) && DatetimeComparand(value, type, ctx.constant_comparison, tick, as_datetime)) {
+		if (!as_datetime) {
+			// On the right side of every datetime: declared from itself.
+			return EncodeConstantValue(tick, type, ctx, nullptr);
+		}
+		// The bound, in the column's type: a datetime parameter (sent as
+		// datetime2(7), converted by the server as the literal is), or that
+		// conversion written out.
+		auto literal = ExpressionVocabulary::ValueToSQLLiteral(tick, LogicalType::TIMESTAMP);
+		if (ctx.params && ctx.params->params.size() < SqlParamSet::MAX_PARAMS) {
+			const auto name = ctx.params->Add("datetime", literal, tick);
+			MSSQL_FILTER_DEBUG_LOG(2, "EncodeConstantValue: @%s datetime = %s (#426, %s)", name.c_str(),
+								   literal.c_str(), value.ToString().c_str());
+			return "@" + name;
+		}
+		return "CAST(" + literal + " AS datetime)";
+	}
 	const size_t before = ctx.params ? ctx.params->params.size() : 0;
 	std::string sql = ExpressionVocabulary::Constant(value, type, ctx.params, peer);
 	if (ctx.params && ctx.params->params.size() > before) {
@@ -234,6 +314,149 @@ static const MSSQLColumnInfo *ColumnInfoByName(const std::string &name, const Ex
 		}
 	}
 	return nullptr;
+}
+
+//! time(7) / datetimeoffset(7): read as microseconds, their 100 ns digit
+//! TRUNCATED (ConvertTime / ConvertDatetimeOffset). Unlike a datetime's read,
+//! not one-to-one: .1234567 and .1234561 are two values there and one here.
+//! The rowid key choice's question too (read, but not round-trip exact), so
+//! the two cannot disagree on which columns these are.
+static bool IsTruncatedReadColumn(const MSSQLColumnInfo *column) {
+	return column && IsRoundTripExactForKey(column->sql_type_name, column->scale, column->is_cast_required) ==
+						 KeyFidelity::NotRoundTrip;
+}
+
+//! A column whose value DuckDB reads is not the server's (issue #426).
+static bool IsLossyReadColumn(const MSSQLColumnInfo *column) {
+	return IsDatetimeColumn(column) || IsTruncatedReadColumn(column);
+}
+
+// A plain reference to a column (a scalar rowid over one counts): its info.
+static const MSSQLColumnInfo *ColumnRefInfo(const Expression &expr, const ExpressionEncodeContext &ctx) {
+	const auto cls = expr.GetExpressionClass();
+	if (cls != ExpressionClass::BOUND_COLUMN_REF && cls != ExpressionClass::BOUND_REF) {
+		return nullptr;
+	}
+	return ColumnInfoOf(expr, ctx);
+}
+
+static bool ReadsLossyColumn(const Expression &expr, const ExpressionEncodeContext &ctx) {
+	if (IsLossyReadColumn(ColumnRefInfo(expr, ctx))) {
+		return true;
+	}
+	bool reads = false;
+	ExpressionIterator::EnumerateChildren(
+		expr, [&](const Expression &child) { reads = reads || ReadsLossyColumn(child, ctx); });
+	return reads;
+}
+
+//! Issue #426: a column DuckDB does not read exactly is compared on the server
+//! only as itself against constants -- each made to decide as DuckDB's
+//! comparison of the read value does -- and a DATETIME column also against
+//! another DATETIME column (its read is one-to-one, so ticks against ticks
+//! is DuckDB's answer; a truncated read is not: two time(7) values 100 ns
+//! apart are equal here). Anything else reading one -- a datetime2 column
+//! beside it, a CASE over it, a constant with it in its IN list -- the server
+//! compares at the stored value and DuckDB at the value it reads (measured:
+//! `dt = dt2` against a datetime2(6) copy of the read value found nothing),
+//! so the predicate stays with DuckDB. Only a comparison of the column's own
+//! types: a date part of it (`year(dt)`) is the same on both sides.
+static bool LossyOperandsPushable(const Expression &subject, const vector<const Expression *> &others,
+								  const ExpressionEncodeContext &ctx) {
+	const auto id = subject.GetReturnType().id();
+	if (id != LogicalTypeId::TIMESTAMP && id != LogicalTypeId::TIME && id != LogicalTypeId::TIMESTAMP_TZ) {
+		return true;
+	}
+	bool reads = ReadsLossyColumn(subject, ctx);
+	for (auto other : others) {
+		reads = reads || ReadsLossyColumn(*other, ctx);
+	}
+	if (!reads) {
+		return true;
+	}
+	const auto column = ColumnRefInfo(subject, ctx);
+	if (!IsLossyReadColumn(column)) {
+		return false;
+	}
+	for (auto other : others) {
+		if (other->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+			continue;
+		}
+		if (!IsDatetimeColumn(column) || !IsDatetimeColumn(ColumnRefInfo(*other, ctx))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! Issue #426: `column OP c` for a time(7) / datetimeoffset(7) column, as
+//! DuckDB decides it over the read value -- the stored value with its 100 ns
+//! digit dropped, so the read equals c for every stored value in
+//! [c, c + 1 us). `=` is that range, `<>` its complement, `>` starts at
+//! c + 1 us, `<=` ends before it; `>=` and `<` are the stored values' own.
+//! Constants declared from the column (time(7) / datetimeoffset(7)). At the
+//! top of the type's range c + 1 us does not exist (24:00:00,
+//! 10000-01-01) and is never sent: what lies beyond it is nothing, so `>`
+//! is false and `<=` true for every row -- written `k <> k` / `k = k`, NULL
+//! for a NULL as the comparison is. False -- not pushed -- for a constant
+//! the server cannot hold (ServerHoldsTemporal) or of another type.
+static bool TruncatedReadComparison(const std::string &column_sql, ExpressionType comparison, const Value &constant,
+									const ExpressionEncodeContext &ctx, const MSSQLColumnInfo &column,
+									std::string &out) {
+	const auto id = constant.type().id();
+	if (constant.IsNull() || (id != LogicalTypeId::TIME && id != LogicalTypeId::TIMESTAMP_TZ) ||
+		!codec::datetime::ServerHoldsTemporal(constant)) {
+		return false;
+	}
+	Value next;
+	bool next_exists;
+	if (id == LogicalTypeId::TIME) {
+		const auto micros = TimeValue::Get(constant).value + 1;
+		next_exists = micros < Interval::MICROS_PER_DAY;
+		next = Value::TIME(dtime_t(micros));
+	} else {
+		const auto micros = TimestampValue::Get(constant).value + 1;
+		next = Value::TIMESTAMPTZ(timestamp_tz_t(micros));
+		next_exists = codec::datetime::ServerHoldsTemporal(next);
+	}
+	auto constant_ctx = ctx.child();
+	const auto at = [&](const Value &v) {
+		return FilterEncoder::EncodeConstantValue(v, v.type(), constant_ctx, &column);
+	};
+	const std::string always_false = "(" + column_sql + " <> " + column_sql + ")";
+	const std::string always_true = "(" + column_sql + " = " + column_sql + ")";
+	switch (comparison) {
+	case ExpressionType::COMPARE_EQUAL:
+	case ExpressionType::COMPARE_NOTEQUAL: {
+		// One statement per constant: each registers a parameter, and the
+		// operands of one `+` chain are evaluated in no fixed order (GCC and
+		// Clang number them differently).
+		const std::string low = at(constant);
+		const bool equal = comparison == ExpressionType::COMPARE_EQUAL;
+		if (!next_exists) {
+			out = "(" + column_sql + (equal ? " >= " : " < ") + low + ")";
+			return true;
+		}
+		const std::string high = at(next);
+		out = equal ? "(" + column_sql + " >= " + low + " AND " + column_sql + " < " + high + ")"
+					: "(" + column_sql + " < " + low + " OR " + column_sql + " >= " + high + ")";
+		return true;
+	}
+	case ExpressionType::COMPARE_GREATERTHAN:
+		out = next_exists ? "(" + column_sql + " >= " + at(next) + ")" : always_false;
+		return true;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		out = next_exists ? "(" + column_sql + " < " + at(next) + ")" : always_true;
+		return true;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		out = "(" + column_sql + " >= " + at(constant) + ")";
+		return true;
+	case ExpressionType::COMPARE_LESSTHAN:
+		out = "(" + column_sql + " < " + at(constant) + ")";
+		return true;
+	default:
+		return false;
+	}
 }
 
 //------------------------------------------------------------------------------
@@ -367,7 +590,7 @@ ExpressionEncodeResult FilterEncoder::EncodeFilter(const TableFilter &filter, co
 		return EncodeIsNotNull(column_name);
 
 	case TableFilterType::LEGACY_IN_FILTER:
-		return EncodeInFilter(filter.Cast<LegacyInFilter>(), column_name, column_type);
+		return EncodeInFilter(filter.Cast<LegacyInFilter>(), column_name, column_type, ctx);
 
 	case TableFilterType::LEGACY_CONJUNCTION_OR:
 		return EncodeConjunctionOr(filter.Cast<LegacyConjunctionOrFilter>(), column_name, column_type, ctx);
@@ -404,7 +627,18 @@ ExpressionEncodeResult FilterEncoder::EncodeConstantComparison(const LegacyConst
 		return {"", false};
 	}
 
-	std::string sql = column_name + op + EncodeConstantValue(filter.constant, column_type, ctx, ctx.filter_column_info);
+	if (IsTruncatedReadColumn(ctx.filter_column_info)) {
+		std::string sql;
+		if (!TruncatedReadComparison(column_name, filter.comparison_type, filter.constant, ctx, *ctx.filter_column_info,
+									 sql)) {
+			return {"", false};
+		}
+		return {sql, true};
+	}
+	auto constant_ctx = ctx;
+	constant_ctx.constant_comparison = filter.comparison_type;
+	std::string sql =
+		column_name + op + EncodeConstantValue(filter.constant, column_type, constant_ctx, ctx.filter_column_info);
 	return {sql, true};
 }
 
@@ -417,18 +651,41 @@ ExpressionEncodeResult FilterEncoder::EncodeIsNotNull(const std::string &column_
 }
 
 ExpressionEncodeResult FilterEncoder::EncodeInFilter(const LegacyInFilter &filter, const std::string &column_name,
-													 const LogicalType &column_type) {
+													 const LogicalType &column_type,
+													 const ExpressionEncodeContext &ctx) {
 	for (auto &value : filter.values) {
 		if (!codec::datetime::ServerHoldsTemporal(value)) {
 			return {"", false};
 		}
+	}
+	// Literals, as this list always was; against a DATETIME column each item
+	// is the tick it equals (issue #426). The LEGACY_* filters reach a scan
+	// only from a deserialised plan (TableFilterSet fills its map directly
+	// there; PushFilter takes ExpressionFilters only), and go through the same
+	// EncodeConstantValue as the expression filters.
+	auto item_ctx = ctx;
+	item_ctx.params = nullptr;
+	item_ctx.constant_comparison = ExpressionType::COMPARE_EQUAL;
+	if (IsTruncatedReadColumn(ctx.filter_column_info)) {
+		std::vector<std::string> ranges;
+		for (auto &value : filter.values) {
+			std::string range;
+			if (!TruncatedReadComparison(column_name, ExpressionType::COMPARE_EQUAL, value, item_ctx,
+										 *ctx.filter_column_info, range)) {
+				return {"", false};
+			}
+			ranges.push_back(range);
+		}
+		return {ExpressionVocabulary::Conjunction(ranges, false), true};
 	}
 	std::string sql = column_name + " IN (";
 	for (idx_t i = 0; i < filter.values.size(); i++) {
 		if (i > 0) {
 			sql += ", ";
 		}
-		sql += ValueToSQLLiteral(filter.values[i], column_type);
+		sql += IsDatetimeColumn(ctx.filter_column_info)
+				   ? EncodeConstantValue(filter.values[i], column_type, item_ctx, ctx.filter_column_info)
+				   : ValueToSQLLiteral(filter.values[i], column_type);
 	}
 	sql += ")";
 	return {sql, true};
@@ -707,12 +964,42 @@ ExpressionEncodeResult FilterEncoder::EncodeComparisonExpression(const BoundFunc
 		return {"", false};
 	}
 
+	if (!LossyOperandsPushable(left, {&right}, ctx) && !LossyOperandsPushable(right, {&left}, ctx)) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: a lossy-read column against another value");
+		return {"", false};
+	}
+
+	// #426: a time(7) / datetimeoffset(7) column against a constant, as DuckDB
+	// compares the value it reads.
+	for (int side = 0; side < 2; side++) {
+		const auto &column_expr = side == 0 ? left : right;
+		const auto &constant_expr = side == 0 ? right : left;
+		const auto column = ColumnRefInfo(column_expr, ctx);
+		if (!IsTruncatedReadColumn(column) || constant_expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			continue;
+		}
+		auto column_ctx = ctx.child();
+		auto column_result = EncodeValueExpression(column_expr, column_ctx);
+		std::string sql;
+		if (!column_result.supported ||
+			!TruncatedReadComparison(
+				column_result.sql,
+				side == 0 ? expr.GetExpressionType() : FlipComparisonExpression(expr.GetExpressionType()),
+				constant_expr.Cast<BoundConstantExpression>().GetValue(), ctx, *column, sql)) {
+			return {"", false};
+		}
+		return {sql, true};
+	}
+
 	// Encode left and right sides
 	// Spec 076: a constant on one side is declared from the column on the other.
 	auto left_ctx = ctx.child();
 	left_ctx.constant_peer = ColumnInfoOf(right, ctx);
+	// #426: as seen from the column -- `5 < k` is `k > 5`.
+	left_ctx.constant_comparison = FlipComparisonExpression(expr.GetExpressionType());
 	auto right_ctx = ctx.child();
 	right_ctx.constant_peer = ColumnInfoOf(left, ctx);
+	right_ctx.constant_comparison = expr.GetExpressionType();
 	auto left_result = EncodeValueExpression(left, left_ctx);
 	if (!left_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeComparisonExpression: left side encoding failed");
@@ -809,14 +1096,45 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 								   (unsigned long long)ExpressionVocabulary::MAX_IN_ITEMS);
 			return {"", false};
 		}
+		vector<const Expression *> list;
+		for (idx_t i = 1; i < children.size(); i++) {
+			list.push_back(children[i].get());
+		}
+		if (!LossyOperandsPushable(*children[0], list, ctx)) {
+			MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN over a lossy-read column and another value");
+			return {"", false};
+		}
 		auto operand_ctx = ctx.child();
 		auto operand_result = EncodeValueExpression(*children[0], operand_ctx);
+		const auto truncated = ColumnRefInfo(*children[0], ctx);
+		if (operand_result.supported && IsTruncatedReadColumn(truncated)) {
+			// #426: each item is the range of stored values read as it (the gate
+			// above left only constants).
+			std::vector<std::string> ranges;
+			for (idx_t i = 1; i < children.size(); i++) {
+				const auto &item = children[i]->Cast<BoundConstantExpression>().GetValue();
+				std::string range;
+				if (item.IsNull()) {
+					range = "(" + operand_result.sql + " = NULL)";
+				} else if (!TruncatedReadComparison(operand_result.sql, ExpressionType::COMPARE_EQUAL, item, ctx,
+													*truncated, range)) {
+					return {"", false};
+				}
+				ranges.push_back(range);
+			}
+			auto sql = ExpressionVocabulary::Conjunction(ranges, false);
+			if (expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) {
+				sql = ExpressionVocabulary::Not(sql);
+			}
+			return {sql, true};
+		}
 		if (!operand_result.supported) {
 			MSSQL_FILTER_DEBUG_LOG(1, "EncodeOperatorExpression: IN operand encoding failed");
 			return {"", false};
 		}
 		auto item_ctx = ctx.child();
 		item_ctx.constant_peer = ColumnInfoOf(*children[0], ctx);
+		item_ctx.constant_comparison = ExpressionType::COMPARE_EQUAL;
 		const bool negated = expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN;
 		std::vector<std::string> items;
 		for (idx_t i = 1; i < children.size(); i++) {
@@ -893,6 +1211,37 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundFunctio
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeBetweenExpression: lower_inclusive=%s, upper_inclusive=%s",
 						   lower_inclusive ? "true" : "false", upper_inclusive ? "true" : "false");
 
+	if (!LossyOperandsPushable(BoundBetweenExpression::Input(expr),
+							   {&BoundBetweenExpression::LowerBound(expr), &BoundBetweenExpression::UpperBound(expr)},
+							   ctx)) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: a lossy-read column against another value");
+		return {"", false};
+	}
+
+	const auto truncated = ColumnRefInfo(BoundBetweenExpression::Input(expr), ctx);
+	if (IsTruncatedReadColumn(truncated)) {
+		// #426: both bounds as comparisons of the read value (the gate above
+		// left only constants).
+		auto input_ctx = ctx.child();
+		auto input = EncodeValueExpression(BoundBetweenExpression::Input(expr), input_ctx);
+		std::string lower;
+		std::string upper;
+		if (!input.supported ||
+			!TruncatedReadComparison(
+				input.sql,
+				lower_inclusive ? ExpressionType::COMPARE_GREATERTHANOREQUALTO : ExpressionType::COMPARE_GREATERTHAN,
+				BoundBetweenExpression::LowerBound(expr).Cast<BoundConstantExpression>().GetValue(), ctx, *truncated,
+				lower) ||
+			!TruncatedReadComparison(
+				input.sql,
+				upper_inclusive ? ExpressionType::COMPARE_LESSTHANOREQUALTO : ExpressionType::COMPARE_LESSTHAN,
+				BoundBetweenExpression::UpperBound(expr).Cast<BoundConstantExpression>().GetValue(), ctx, *truncated,
+				upper)) {
+			return {"", false};
+		}
+		return {ExpressionVocabulary::Conjunction({lower, upper}, true), true};
+	}
+
 	auto child_ctx = ctx.child();
 
 	// Encode the input expression (the column or expression being checked)
@@ -905,6 +1254,8 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundFunctio
 	// Encode the lower bound
 	// Spec 076: the bounds are compared with the input column.
 	child_ctx.constant_peer = ColumnInfoOf(BoundBetweenExpression::Input(expr), ctx);
+	child_ctx.constant_comparison =
+		lower_inclusive ? ExpressionType::COMPARE_GREATERTHANOREQUALTO : ExpressionType::COMPARE_GREATERTHAN;
 	auto lower_result = EncodeValueExpression(BoundBetweenExpression::LowerBound(expr), child_ctx);
 	if (!lower_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: lower bound encoding failed");
@@ -912,6 +1263,8 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundFunctio
 	}
 
 	// Encode the upper bound
+	child_ctx.constant_comparison =
+		upper_inclusive ? ExpressionType::COMPARE_LESSTHANOREQUALTO : ExpressionType::COMPARE_LESSTHAN;
 	auto upper_result = EncodeValueExpression(BoundBetweenExpression::UpperBound(expr), child_ctx);
 	if (!upper_result.supported) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeBetweenExpression: upper bound encoding failed");

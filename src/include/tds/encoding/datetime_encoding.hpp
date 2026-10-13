@@ -28,6 +28,15 @@ public:
 	// TDS format: 4 bytes days since 1900-01-01 + 4 bytes ticks (1/300 sec)
 	static timestamp_t ConvertDatetime(const uint8_t *data);
 
+	// Issue #426: the value ConvertDatetime reads for the DATETIME tick at or
+	// below `value` (`up` false), or at or above it (`up` true). A tick reads as
+	// its microsecond, truncated (.003333 for the server's .00333...), so a
+	// value read back is its own tick's bound both ways, and a value between
+	// two reads has a different tick each way. The tick a comparison with a
+	// DATETIME column is decided by; past the day's last read (23:59:59.996666),
+	// `up` is the next day's midnight.
+	static timestamp_t DatetimeTickBound(timestamp_t value, bool up);
+
 	// Convert SQL Server DATETIME2 to DuckDB timestamp_t
 	// TDS format: time (3-5 bytes) + date (3 bytes)
 	static timestamp_t ConvertDatetime2(const uint8_t *data, uint8_t scale);

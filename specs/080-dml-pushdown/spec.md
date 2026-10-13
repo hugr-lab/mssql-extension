@@ -653,11 +653,20 @@ refuses these columns on both rungs, as rung 2 does today):
 - **Measured and closed (PR 2, #425):** 603 of 603 on both paths; the key path
   (UPDATE / DELETE, `#stage`, `rowid =`) compares a `datetime` key as
   `datetime`. **A non-goal of W3** (#438, folded into #426): the general filter
-  path keeps comparing a `datetime` column as `datetime2`. Rounding is sound for
+  path kept comparing a `datetime` column as `datetime2`. Rounding is sound for
   equality only -- a range against a constant between two ticks would move its
   boundary (`k > '….005'` became `k > '….007'` and dropped the `.007` row,
-  measured) -- so whoever fixes #426 keeps the two apart: equality in the
-  column's type, ranges as `datetime2`.
+  measured). **#426 closed it without rounding:** a constant compared with a
+  `datetime` column goes in the column's type, moved to the tick that decides
+  it -- for `>` / `<=` the tick read at or below it, for `>=` / `<` the one at
+  or above, for `=` / `<>` / IN the one read as it (where no tick decides it,
+  a `datetime2` value with the same answer at every compatibility level). The
+  ranges were wrong as `datetime2` too, on the values read back
+  (`k > <read of .003>` returned that row). `rowid =` follows the same rule
+  and no longer rounds a constant between two reads onto a tick. A
+  `datetime` column against any other non-constant operand (a `datetime2`
+  column, a CASE over it) is not pushed by the scan; the writer already
+  vetoed every `datetime` comparison (`KindOf` -> `None`).
 
 | step | SQL Server / Azure | Fabric |
 |---|---|---|
