@@ -537,7 +537,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     UPDATE / DELETE with one is refused by name: part of its WHERE runs in
     DuckDB.
   - A load, a parameter or a literal carrying one fails, naming the value
-    and the column.
+    and where it was going: `(column d)`, `(parameter @d)`. The statement
+    literals, the parameters and the `#stage` (which named its own `n0`) got
+    the name in #460.
   - A timestamp that rounds past 9999-12-31 at the column's scale fails too:
     `datetime2(4)` ← `23:59:59.99999` would carry into a day that does not
     exist.

@@ -70,7 +70,7 @@ vector<string> MSSQLBatchBuilder::SerializeRow(DataChunk &chunk, idx_t row_index
 		// table column IS its ordinal — including when insert_column_indices
 		// skips unnamed columns.
 		auto &vector = chunk.data[col_idx];
-		auto literal = MSSQLValueSerializer::SerializeFromVector(vector, row_index, col.duckdb_type);
+		auto literal = MSSQLValueSerializer::SerializeFromVector(vector, row_index, col.duckdb_type, col.name);
 
 		// A spatial target needs the server's WKB reader around the literal:
 		// a bare 0x value is read as SQL Server's own Spatial Type Binary

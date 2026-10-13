@@ -48,15 +48,16 @@ MSSQLDMLBatch MSSQLUpdateStatement::Build(const vector<vector<Value>> &pk_values
 			if (pk_idx > 0) {
 				sql += ", ";
 			}
-			const auto &pk_type = target_.pk_info.columns[pk_idx].duckdb_type;
-			sql += MSSQLValueSerializer::Serialize(pk_values[row_idx][pk_idx], pk_type);
+			const auto &pk_column = target_.pk_info.columns[pk_idx];
+			sql += MSSQLValueSerializer::Serialize(pk_values[row_idx][pk_idx], pk_column.duckdb_type, pk_column.name);
 		}
 
 		// Add update values (serialized as literals)
 		for (idx_t col_idx = 0; col_idx < update_values[row_idx].size(); col_idx++) {
 			sql += ", ";
-			const auto &col_type = target_.update_columns[col_idx].duckdb_type;
-			auto literal = MSSQLValueSerializer::Serialize(update_values[row_idx][col_idx], col_type);
+			const auto &update_column = target_.update_columns[col_idx];
+			auto literal = MSSQLValueSerializer::Serialize(update_values[row_idx][col_idx], update_column.duckdb_type,
+														   update_column.name);
 
 			// Same spatial wrapper as the INSERT path: the call sits inside the
 			// VALUES-derived table, which SQL Server accepts, so the SET clause

@@ -88,6 +88,13 @@ struct BCPColumnMetadata {
 	// Column name (will be UTF-16LE encoded in wire format)
 	string name;
 
+	// The column a refused value is reported under when it is not `name`: a
+	// #stage's k0 / n0 stand for the target table's columns (issue #460).
+	string reported_name;
+	const string &ReportedName() const {
+		return reported_name.empty() ? name : reported_name;
+	}
+
 	// Source DuckDB type
 	LogicalType duckdb_type;
 

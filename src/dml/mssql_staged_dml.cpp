@@ -278,6 +278,8 @@ void MSSQLStagedDml::Start(ClientContext &context) {
 																			  col.precision, col.scale, col.is_nullable,
 																			  col.collation_name));
 		}
+		// A refused value names the target's column, not the stage's (#460).
+		bcp_columns_.back().reported_name = col.name;
 	};
 	for (idx_t i = 0; i < target_.key_columns.size(); i++) {
 		add_column(target_.key_columns[i], KeyName(i));
