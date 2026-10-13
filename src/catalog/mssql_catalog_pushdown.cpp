@@ -250,6 +250,7 @@ bool MSSQLCatalog::WriteResolved(const QueryNode &node, mssql::WrittenQuery &out
 	// The session's settings are the context's: RemoteExecute's own, or, for
 	// the context-free hooks, the one that resolved the tables.
 	auto options = mssql::SQLWriterOptions::FromContext(*resolved[0].context);
+	options.utf8_on_wire = UTF8SupportObserved() == Utf8Support::Granted;
 	if (dml) {
 		// Read per rewrite (D5; GLOBAL scope), in the dry run only: the kept run
 		// cannot hand a DML back, so a SET between the two must not turn an

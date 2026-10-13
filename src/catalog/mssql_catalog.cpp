@@ -1055,6 +1055,17 @@ void MSSQLCatalog::EnsureServerProperties(ClientContext &context, const char *ve
 		verb, GetName().GetIdentifierName(), error);
 }
 
+MSSQLCatalog::Utf8Support MSSQLCatalog::UTF8SupportObserved() const {
+	int8_t observed = utf8_support_acked_.load(std::memory_order_relaxed);
+	if (observed < 0 && connection_info_) {
+		observed = connection_info_->utf8_support_acked;
+	}
+	if (observed < 0) {
+		return Utf8Support::Unknown;
+	}
+	return observed == 1 ? Utf8Support::Granted : Utf8Support::Declined;
+}
+
 MSSQLCatalog::Utf8Support MSSQLCatalog::UTF8SupportState() {
 	const int8_t cached = utf8_support_acked_.load(std::memory_order_relaxed);
 	if (cached >= 0) {

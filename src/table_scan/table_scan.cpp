@@ -92,9 +92,9 @@ static idx_t ApplyClientFilters(ClientContext &context, MSSQLScanGlobalState &gl
 // missing one (the legacy LOBs) meant a `text` value failed an
 // `INSERT … RETURNING` that never mentioned the column.
 static std::string BuildColumnExpression(const MSSQLColumnInfo &col, const std::string &col_name,
-										 bool convert_varchar_max) {
-	std::string expr = MSSQLColumnInfo::BuildReadExpression(col_name, col.sql_type_name, col.max_length,
-															col.collation_name, convert_varchar_max);
+										 bool convert_varchar_max, bool utf8_on_wire) {
+	std::string expr = MSSQLColumnInfo::BuildReadExpression(
+		col_name, col.sql_type_name, col.max_length, col.collation_name, convert_varchar_max, "", "", utf8_on_wire);
 	// Logged unconditionally at level 2 rather than only when it differs from the
 	// bare name: deciding that meant rebuilding the escaped name for every column
 	// on the scan path, and re-encoding a spelling BuildReadExpression now owns —
@@ -192,6 +192,12 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	// Load VARCHAR(MAX) conversion setting (Spec 026)
 	bool convert_varchar_max = LoadConvertVarcharMax(context);
 	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: convert_varchar_max=%s", convert_varchar_max ? "true" : "false");
+	// Issue #405: a UTF-8 char(n) is read as itself only when the logins were
+	// granted UTF8SUPPORT; otherwise -- or before any login answered -- as
+	// NCHAR(n), so its padding never reaches DuckDB.
+	const bool utf8_on_wire =
+		Catalog::GetCatalog(context, Identifier(bind_data.context_name)).Cast<MSSQLCatalog>().UTF8SupportObserved() ==
+		MSSQLCatalog::Utf8Support::Granted;
 
 	// Filter out special column identifiers and collect valid column indices
 	vector<column_t> valid_column_ids;
@@ -228,7 +234,7 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 			}
 			// Use BuildColumnExpression for VARCHAR→NVARCHAR conversion (Spec 026)
 			const auto &col_info = bind_data.mssql_columns[col_idx];
-			column_list += BuildColumnExpression(col_info, col_name, convert_varchar_max);
+			column_list += BuildColumnExpression(col_info, col_name, convert_varchar_max, utf8_on_wire);
 			sql_column_names.push_back(col_name);
 		}
 
@@ -253,7 +259,7 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 					}
 				}
 				const auto &col_info = bind_data.mssql_columns[pk_col_idx];
-				column_list += BuildColumnExpression(col_info, pk_col, convert_varchar_max);
+				column_list += BuildColumnExpression(col_info, pk_col, convert_varchar_max, utf8_on_wire);
 				sql_column_names.push_back(pk_col);
 				pk_columns_added = true;
 				MSSQL_SCAN_DEBUG_LOG(2, "  added PK column for rowid: %s at SQL index %zu", pk_col.c_str(),
@@ -304,7 +310,8 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 			column_t col_idx = valid_column_ids[i];
 			// Use BuildColumnExpression for VARCHAR→NVARCHAR conversion (Spec 026)
 			const auto &col_info = bind_data.mssql_columns[col_idx];
-			column_list += BuildColumnExpression(col_info, bind_data.all_column_names[col_idx], convert_varchar_max);
+			column_list +=
+				BuildColumnExpression(col_info, bind_data.all_column_names[col_idx], convert_varchar_max, utf8_on_wire);
 			MSSQL_SCAN_DEBUG_LOG(2, "  column[%llu] = %s", (unsigned long long)i,
 								 bind_data.all_column_names[col_idx].c_str());
 		}

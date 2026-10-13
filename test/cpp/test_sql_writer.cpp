@@ -191,7 +191,35 @@ static void ExpectDmlVeto(const std::string &sql, bool from_join = true) {
 	}
 }
 
+// Issue #405: a char(n) is read so the codec trims its padding -- as NCHAR(n)
+// unless it is a UTF-8 char on a connection granted UTF8SUPPORT (a BIGCHAR on
+// the wire), and trimmed by the server past NCHAR's 4000.
+static void ExpectRead(const std::string &type, int16_t length, const std::string &collation, bool utf8_on_wire,
+					   const std::string &expected) {
+	const auto got = MSSQLColumnInfo::BuildReadExpression("c", type, length, collation, true, "", "", utf8_on_wire);
+	if (got != expected) {
+		std::cerr << "FAIL read " << type << "(" << length << ") " << collation << ": " << got
+				  << "\n  expected: " << expected << std::endl;
+		failures++;
+	}
+}
+
+static void TestCharReadExpressions() {
+	const std::string cp = "SQL_Latin1_General_CP1_CI_AS";
+	const std::string u8 = "Latin1_General_100_BIN2_UTF8";
+	ExpectRead("char", 4, cp, true, "CAST([c] AS NCHAR(4)) AS [c]");
+	ExpectRead("char", 4, u8, false, "CAST([c] AS NCHAR(4)) AS [c]");
+	ExpectRead("char", 4, u8, true, "[c]");
+	ExpectRead("char", 5000, cp, true, "RTRIM(CAST([c] AS NVARCHAR(MAX))) AS [c]");
+	ExpectRead("CHAR", 10, cp, true, "CAST([c] AS NCHAR(10)) AS [c]");
+	// unchanged: varchar keeps its NVARCHAR cast, nchar needs none
+	ExpectRead("varchar", 30, cp, true, "CAST([c] AS NVARCHAR(30)) AS [c]");
+	ExpectRead("varchar", 30, u8, false, "[c]");
+	ExpectRead("nchar", 8, "", true, "[c]");
+}
+
 int main() {
+	TestCharReadExpressions();
 	// Spec 080 D1: UPDATE / DELETE, whole. The SQL Server form names the target
 	// by its alias; Fabric's has no FROM.
 	ExpectDml("UPDATE t SET id = id + 1, name = 'x' WHERE id <= 3",

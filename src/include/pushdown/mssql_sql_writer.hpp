@@ -126,6 +126,9 @@ struct WrittenQuery {
 struct SQLWriterOptions {
 	//! mssql_convert_varchar_max, as the catalog scan reads it.
 	bool convert_varchar_max = true;
+	//! The catalog's logins were granted UTF8SUPPORT: a UTF-8 char(n) is read
+	//! as itself, else as NCHAR(n) (issue #405; set by the catalog).
+	bool utf8_on_wire = false;
 	//! mssql_scan_parameterize_filters: constants as @pN, or literals.
 	bool parameterize = true;
 	//! DuckDB's (deprecated) error_on_division_by_zero: false makes `x % 0`

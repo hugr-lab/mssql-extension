@@ -520,7 +520,11 @@ silently disable pushdown for the first statement against every table.
   `SQL_Latin1_General_CP1_CI_AS`, so a veto on case-insensitive keys would
   leave the rewriter dead on most databases. One documentation paragraph,
   with § 8.5's `char(n)` note (values arrive padded; a local comparison with
-  a shorter constant misses what the pushed one finds).
+  a shorter constant misses what the pushed one finds). Since #405 a
+  `char(n)` arrives trimmed on every read path -- read as `NCHAR(n)` where
+  its wire type would keep the padding -- so a local comparison finds what
+  the pushed one does, and a value the writer would compute from one
+  (`COALESCE`, `CASE`, `LAG` …, varchar on the server) is vetoed.
 - **Orders are DuckDB's.** ORDER BY, `MIN` / `MAX` on strings, window ORDER
   BY push only when the key's collation is **binary AND UTF-8-coded** (#362:
   `varchar` under `_BIN2_UTF8`); otherwise the node is vetoed and the query

@@ -77,11 +77,12 @@ SELECT col_smallmoney, col_money, col_decimal FROM nbc_all.dbo.TestNbcAllTypes W
 ----
 214748.3647	922337203685477.5807	123456.789012
 
-# String types
+# String types. A char(n) arrives without its padding, as an nchar(n) always
+# did (issue #405: a code-page char was read through NVARCHAR and kept it).
 query IIII
 SELECT col_char, col_varchar, col_nchar, col_nvarchar FROM nbc_all.dbo.TestNbcAllTypes WHERE id = 1;
 ----
-CHAR_VAL  	varchar val	NCHAR	nvarchar val
+CHAR_VAL	varchar val	NCHAR	nvarchar val
 
 # Date/Time types
 query IIIII

@@ -391,6 +391,16 @@ bool NodeWriter::Unify(std::vector<Operand> &operands, Operand &result, bool con
 		if (operand.kind == ComparableKind::String && !operand.column->is_unicode && !operand.column->is_utf8) {
 			return Veto("a code-page varchar in a computed value");
 		}
+		// Issue #405: a char(n) / nchar(n) reaches DuckDB without its padding
+		// (a fixed-length wire type the codec trims, or the scan's NCHAR read).
+		// A value computed from it has the type the server's precedence gives --
+		// varchar / nvarchar beside a constant, nvarchar when transcoded without
+		// UTF8SUPPORT -- and keeps the blanks: COALESCE(code, 'x') was 'AB  '
+		// where the scan reads 'AB'.
+		const auto string_type = StringUtil::Lower(operand.column ? operand.column->sql_type_name : string());
+		if (operand.kind == ComparableKind::String && (string_type == "char" || string_type == "nchar")) {
+			return Veto("a char(n) / nchar(n) in a computed value");
+		}
 	}
 	const Operand typed_peer = *peer;
 	bool typed_constant = false;
