@@ -362,6 +362,18 @@ public:
 	//! transient pool timeout would become table corruption.
 	enum class Utf8Support : uint8_t { Unknown, Declined, Granted };
 	Utf8Support UTF8SupportState();
+	//! The answer a login has already given, or Unknown -- never borrows a
+	//! connection (a scan on a pool of one in a transaction would wait out
+	//! the acquire timeout for it). For a choice whose safe side is "not
+	//! granted": how a char(n) column is read (issue #405).
+	Utf8Support UTF8SupportObserved() const;
+	//! Records a logged-in connection's answer when none is cached yet -- a
+	//! lazily validated ATTACH learns it from its first connection (#405).
+	void NoteUtf8Support(bool acked) {
+		if (utf8_support_acked_.load(std::memory_order_relaxed) < 0) {
+			utf8_support_acked_.store(acked ? 1 : 0, std::memory_order_relaxed);
+		}
+	}
 
 	//! Spec 060: the collation to give varchar columns a statement is about to
 	//! create, or empty for "emit no COLLATE clause". Every path that creates a

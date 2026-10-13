@@ -200,6 +200,7 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 		if (!conn) {
 			throw IOException("MSSQL: Failed to acquire connection: " + why);
 		}
+		catalog.NoteUtf8Support(conn->UTF8SupportAcked());
 		auto stats_after = pool.GetStats();
 		MSSQL_CONN_LOG("GetConnection: Pool connection acquired, tds_conn=%p, spid=%d, has_txn_desc=%d",
 					   (void *)conn.get(), conn->GetSpid(), conn->HasTransactionDescriptor());
@@ -239,6 +240,7 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	if (!conn) {
 		throw IOException("MSSQL: Failed to acquire connection for transaction: " + why);
 	}
+	catalog.NoteUtf8Support(conn->UTF8SupportAcked());
 	MSSQL_CONN_LOG("GetConnection: Acquired tds_conn=%p, spid=%d for pinning", (void *)conn.get(), conn->GetSpid());
 
 	// NOT pinned yet: publishing here would expose a connection that BEGIN has

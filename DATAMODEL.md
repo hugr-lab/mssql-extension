@@ -653,6 +653,15 @@ non-Unicode string columns to `NVARCHAR` server-side — **except** a declared
 `NeedsNVarcharConversion` deliberately opts out of. That configuration reaches
 the decoder through the catalog, and the warning fires there too.
 
+A `CHAR(n)` is the exception to that `NVARCHAR` cast (issue #405): the decoder
+trims trailing spaces only off a fixed-length wire type (`BIGCHAR`, `NCHAR`),
+and SQL Server compares strings ignoring them, so a padded value would make a
+join or `GROUP BY` in DuckDB disagree with the server. `BuildReadExpression`
+reads a code-page `CHAR(n)` -- and a UTF-8 one unless the catalog's logins were
+granted UTF8SUPPORT (`MSSQLCatalog::UTF8SupportObserved`, which never borrows a
+connection: unknown reads as not granted) -- as `CAST(col AS NCHAR(n))`, and past
+4000 as `RTRIM(CAST(col AS NVARCHAR(MAX)))`.
+
 ### Reading a column's collation
 
 `ColumnMetadata` carries all five wire bytes of the TDS collation

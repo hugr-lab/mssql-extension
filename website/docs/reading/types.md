@@ -34,7 +34,7 @@ sidebar_position: 3
 `CHAR`, `VARCHAR` and `TEXT` hold bytes in the *column's* code page —
 `Latin1_General_CI_AS` is CP1252, `Cyrillic_General_CI_AS` is CP1251 — while
 DuckDB `VARCHAR` is UTF-8 by contract. A **catalog scan** rewrites those columns
-to `CAST(col AS NVARCHAR(...))` server-side, so three-part-name queries (and the
+to `CAST(col AS NVARCHAR(...))` server-side (a `CHAR(n)` to `NCHAR(n)`, below), so three-part-name queries (and the
 `COPY` / `CREATE TABLE AS` that read through them) always get UTF-8. A raw
 `mssql_scan()` has no such rewrite: the bytes arrive unchanged, and for anything
 outside ASCII the result is **not valid UTF-8** — it is not rejected, it is
@@ -53,6 +53,27 @@ with a UTF-8 collation (`..._UTF8`, SQL Server 2019+) need nothing — they are
 already UTF-8 — but note that the default collation of a SQL Server
 installation is *not* one of those. See
 [Troubleshooting](../reference/troubleshooting.md#raw-mssql_scan-does-not-transcode-code-pages).
+
+**`CHAR(n)` arrives without its padding, whatever the collation.** SQL Server
+stores `CHAR(n)` / `NCHAR(n)` padded with spaces and compares strings ignoring
+trailing spaces, so `'AB'` in a `char(4)` equals `'AB'` in a `char(6)`. DuckDB
+compares bytes; the catalog scan therefore reads a fixed-length string without
+the padding, so a join, `GROUP BY` or `DISTINCT` computed in DuckDB agrees with
+the server. A code-page `CHAR(n)` is read as `CAST(col AS NCHAR(n))` (past 4000,
+`RTRIM(CAST(col AS NVARCHAR(MAX)))`), and so is a UTF-8 one on a connection the
+server did not grant UTF8SUPPORT (`mssql_utf8_support = false`, or a server that
+does not acknowledge it); with UTF8SUPPORT a UTF-8 `CHAR(n)` arrives as itself
+and is trimmed on read. Until #405 the first two kept their padding (`'AB  '`),
+and a `char(4)` joined with a `char(6)` found no rows. A raw `mssql_scan()` reads
+whatever its own T-SQL returns.
+
+**Prefer a UTF-8 collation (`*_UTF8`) for character columns read through the
+extension.** The data then needs no conversion on the way, and with UTF8SUPPORT
+it travels as UTF-8 bytes. What stays different whatever the collation: on the
+table-scan path DuckDB compares strings byte for byte (case, and trailing
+spaces in a `varchar`), while SQL Server compares them under the column's
+collation; a statement the remote-pushdown rewriter sends whole is compared by
+the server.
 
 ### Binary Types
 

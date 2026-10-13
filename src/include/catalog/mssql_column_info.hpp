@@ -155,9 +155,14 @@ struct MSSQLColumnInfo {
 	//!                  back under the column's own name.
 	//! @param alias    the name the column comes back under; empty = its own.
 	//!                  Spec 079's writer passes a SELECT-list alias.
+	//! @param utf8_on_wire the connection was granted UTF8SUPPORT, so a UTF-8
+	//!                  char(n) arrives as itself (BIGCHAR) and is trimmed by
+	//!                  the codec. False -- the default, right on any
+	//!                  connection -- reads it as NCHAR(n) (issue #405).
 	static string BuildReadExpression(const string &col_name, const string &sql_type_name, int16_t max_length,
 									  const string &collation_name, bool convert_varchar_max,
-									  const string &qualifier = "", const string &alias = "");
+									  const string &qualifier = "", const string &alias = "",
+									  bool utf8_on_wire = false);
 };
 
 }  // namespace duckdb

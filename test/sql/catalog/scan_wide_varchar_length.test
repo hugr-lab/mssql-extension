@@ -41,7 +41,8 @@ SELECT mssql_exec('db', 'INSERT INTO dbo.scan_wide_varchar_test VALUES (
 
 # Every length must match what the server actually stores. Before the fix this returned
 # 4000 / 4000 / 4000 for the wide columns and 16 for TEXT.
-# CHAR(5000) is blank-padded on the server, so its full width is 5000.
+# CHAR(5000) holds 5000 non-blank characters here, so its trimmed read (RTRIM,
+# issue #405) is still 5000 long.
 query IIIIII
 SELECT length(v4000), length(v4001), length(v8000), length(c5000), length(vmax), length(t)
 FROM db.dbo.scan_wide_varchar_test;

@@ -1,0 +1,178 @@
+# name: test/sql/catalog/char_padding.test
+# description: Issue #405 -- a char(n) column reaches DuckDB without its padding on every read path, so joins and GROUP BY agree with SQL Server
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# SQL Server stores char(n) padded with spaces and compares strings ignoring
+# trailing spaces: 'AB  ' (char(4)) equals 'AB    ' (char(6)). DuckDB compares
+# bytes, so the scan reads fixed-length strings without their padding -- the
+# codec trims a BIGCHAR / NCHAR wire value. Two paths put a char(n) on a
+# variable-length wire type and kept the padding: a code-page char (cast to
+# NVARCHAR(n)) and a UTF-8 char on a connection without UTF8SUPPORT (the
+# server transcodes it). A join of a char(4) with a char(6) found 0 rows
+# where the server finds 2. Such a column is now read as NCHAR(n), or past
+# 4000 as RTRIM(... NVARCHAR(MAX)); a UTF-8 char on a connection granted
+# UTF8SUPPORT is read as itself (a BIGCHAR, trimmed by the codec).
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# The scan path: a join of two tables of one catalog would otherwise go to the
+# server whole, which compares ignoring the padding either way.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cpad (TYPE mssql, remote_pushdown false);
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cpadp (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('cpad', 'DROP TABLE IF EXISTS dbo.CharPad4; DROP TABLE IF EXISTS dbo.CharPad6; CREATE TABLE dbo.CharPad4 (id int PRIMARY KEY, cp char(4) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL, u8 char(4) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL, nc nchar(4) NOT NULL, wide char(5000) COLLATE SQL_Latin1_General_CP1_CI_AS NULL, v int NULL); CREATE TABLE dbo.CharPad6 (id int PRIMARY KEY, cp char(6) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL, u8 char(6) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL, nc nchar(6) NOT NULL); INSERT INTO dbo.CharPad4 VALUES (1, ''AB'', ''AB'', N''AB'', ''AB'', 0), (2, ''ABCD'', ''ABCD'', N''ABCD'', ''ABCD'', 0); INSERT INTO dbo.CharPad6 VALUES (1, ''AB'', ''AB'', N''AB''), (2, ''ABCD'', ''ABCD'', N''ABCD'')');
+
+statement ok
+SELECT mssql_invalidate_cache('cpad');
+
+# =============================================================================
+# UTF8SUPPORT granted (the default)
+# =============================================================================
+
+query I
+SELECT '[' || cp || '][' || u8 || '][' || nc || '][' || wide || ']' FROM cpad.dbo.CharPad4 ORDER BY id;
+----
+[AB][AB][AB][AB]
+[ABCD][ABCD][ABCD][ABCD]
+
+query III
+SELECT (SELECT count(*) FROM cpad.dbo.CharPad4 a JOIN cpad.dbo.CharPad6 b ON a.cp = b.cp), (SELECT count(*) FROM cpad.dbo.CharPad4 a JOIN cpad.dbo.CharPad6 b ON a.u8 = b.u8), (SELECT count(*) FROM cpad.dbo.CharPad4 a JOIN cpad.dbo.CharPad6 b ON a.nc = b.nc);
+----
+2	2	2
+
+query TI
+SELECT cp, count(*) FROM (SELECT cp FROM cpad.dbo.CharPad4 UNION ALL SELECT cp FROM cpad.dbo.CharPad6) GROUP BY cp ORDER BY cp;
+----
+AB	2
+ABCD	2
+
+# A statement pushed whole to the server reads its columns the same way, and
+# leaves a value computed from a char(n) to DuckDB: COALESCE(u8, 'x') there is
+# varchar and keeps the blanks.
+query II
+EXPLAIN SELECT list(length(cp) ORDER BY length(cp)) FROM (SELECT cp FROM cpadp.dbo.CharPad6 ORDER BY id LIMIT 2);
+----
+physical_plan	<REGEX>:.*SELECT TOP \(2\) CAST\(\[cp\] AS NCHAR\(6\)\).*
+
+query I
+SELECT list(length(cp) ORDER BY length(cp)) FROM (SELECT cp FROM cpadp.dbo.CharPad6 ORDER BY id LIMIT 2);
+----
+[2, 4]
+
+query I
+SELECT list('[' || c || ']' ORDER BY c) FROM (SELECT COALESCE(u8, 'x') AS c FROM cpadp.dbo.CharPad6 ORDER BY id LIMIT 2);
+----
+['[AB]', '[ABCD]']
+
+query I
+SELECT list('[' || c || ']' ORDER BY c) FROM (SELECT COALESCE(nc, 'x') AS c FROM cpadp.dbo.CharPad6 ORDER BY id LIMIT 2);
+----
+['[AB]', '[ABCD]']
+
+# =============================================================================
+# UTF8SUPPORT not requested: the server transcodes a UTF-8 char
+# =============================================================================
+
+statement ok
+SET mssql_utf8_support = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cpadn (TYPE mssql, remote_pushdown false);
+
+statement ok
+RESET mssql_utf8_support;
+
+query I
+SELECT '[' || cp || '][' || u8 || '][' || nc || ']' FROM cpadn.dbo.CharPad4 ORDER BY id;
+----
+[AB][AB][AB]
+[ABCD][ABCD][ABCD]
+
+query III
+SELECT (SELECT count(*) FROM cpadn.dbo.CharPad4 a JOIN cpadn.dbo.CharPad6 b ON a.cp = b.cp), (SELECT count(*) FROM cpadn.dbo.CharPad4 a JOIN cpadn.dbo.CharPad6 b ON a.u8 = b.u8), (SELECT count(*) FROM cpadn.dbo.CharPad4 a JOIN cpadn.dbo.CharPad6 b ON a.nc = b.nc);
+----
+2	2	2
+
+query TI
+SELECT u8, count(*) FROM (SELECT u8 FROM cpadn.dbo.CharPad4 UNION ALL SELECT u8 FROM cpadn.dbo.CharPad6) GROUP BY u8 ORDER BY u8;
+----
+AB	2
+ABCD	2
+
+# =============================================================================
+# A char(n) key: the rowid is read trimmed too, and still finds its rows --
+# the server compares char padding-insensitively, and the #stage column is the
+# key's own char(n)
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('cpad', 'DROP TABLE IF EXISTS dbo.CharPadKey; CREATE TABLE dbo.CharPadKey (k char(6) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL PRIMARY KEY, u char(6) COLLATE Latin1_General_100_BIN2_UTF8 NOT NULL, v int NOT NULL); INSERT INTO dbo.CharPadKey VALUES (''AB'', ''AB'', 0), (''ABCD'', ''ABCD'', 0), (''X'', ''X'', 0)');
+
+statement ok
+SELECT mssql_invalidate_cache('cpad');
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+query I
+UPDATE cpad.dbo.CharPadKey SET v = 1 WHERE k <> 'X';
+----
+2
+
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+query I
+UPDATE cpad.dbo.CharPadKey SET v = v + 1 WHERE k <> 'X';
+----
+2
+
+query I
+DELETE FROM cpad.dbo.CharPadKey WHERE u = 'AB';
+----
+1
+
+statement ok
+RESET mssql_dml_stage_threshold;
+
+query I
+DELETE FROM cpad.dbo.CharPadKey WHERE k = 'ABCD';
+----
+1
+
+# RETURNING reads through the same expressions: OUTPUT INSERTED / DELETED
+# (staged into #out) and INSERT ... OUTPUT INSERTED.
+query TTI
+UPDATE cpad.dbo.CharPadKey SET v = 5 WHERE k = 'X' RETURNING '[' || k || ']', '[' || u || ']', v;
+----
+[X]	[X]	5
+
+query TT
+INSERT INTO cpad.dbo.CharPadKey VALUES ('YY', 'YY', 6) RETURNING '[' || k || ']', '[' || u || ']';
+----
+[YY]	[YY]
+
+query TT
+DELETE FROM cpad.dbo.CharPadKey WHERE k = 'YY' RETURNING '[' || k || ']', '[' || u || ']';
+----
+[YY]	[YY]
+
+statement ok
+RESET mssql_dml_pushdown;
+
+query TTI
+SELECT '[' || k || ']', '[' || u || ']', v FROM cpad.dbo.CharPadKey;
+----
+[X]	[X]	5
+
+statement ok
+SELECT mssql_exec('cpad', 'DROP TABLE dbo.CharPad4; DROP TABLE dbo.CharPad6; DROP TABLE dbo.CharPadKey');

@@ -43,7 +43,7 @@ sidebar_position: 1
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `mssql_tds_packet_size` | BIGINT | 16384 | TDS frame size requested at login, clamped to [512, 32767]. Bounds `recv()` count on reads and `send()` count on bulk loads; raised from 4096 in v0.2.3 (−28% client CPU / −43% wall on read). Costs the server ~16 KB per pooled connection; set 4096 to restore the old footprint |
-| `mssql_utf8_support` | BOOLEAN | true | Advertise TDS UTF8SUPPORT at login. A granting server sends UTF-8-collated columns without UTF-16 transcoding (measured half the wire bytes). Safe to request everywhere; exists to turn the request off |
+| `mssql_utf8_support` | BOOLEAN | true | Advertise TDS UTF8SUPPORT at login. A granting server sends UTF-8-collated columns without UTF-16 transcoding (measured half the wire bytes). Safe to request everywhere; exists to turn the request off. Without it a UTF-8 `char(n)` is read through `CAST(… AS NCHAR(n))`, so its padding is still trimmed |
 | `mssql_named_instance_resolution` | BOOLEAN | true | Resolve `Server=host\instance` to the instance's dynamic port via SQL Server Browser (UDP 1434) at ATTACH. Set `false` where outbound UDP 1434 is stripped — a named instance then errors instead of silently using 1433 |
 | `mssql_browser_timeout_seconds` | BIGINT | 3 | Browser UDP query timeout (ATTACH critical path; one retry) |
 

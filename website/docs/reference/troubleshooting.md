@@ -155,7 +155,8 @@ VARCHAR and CHAR columns with non-UTF8 collations (e.g., `Latin1_General_CI_AS`)
 |----------------|--------------|-------|
 | VARCHAR(n) where n ≤ 4000 | NVARCHAR(n) | Full data preserved |
 | VARCHAR(n) where n > 4000 | NVARCHAR(MAX) | Full data preserved. NVARCHAR has no inline length above 4000 characters, so these columns are sent as PLP. |
-| CHAR(n) | same as VARCHAR(n) | Full data preserved (blank-padded to `n` by SQL Server) |
+| CHAR(n) where n ≤ 4000 | NCHAR(n) | Full data preserved, read without its blank padding (as SQL Server compares it); also a UTF-8 `CHAR(n)` on a connection without UTF8SUPPORT (issue #405) |
+| CHAR(n) where n > 4000 | `RTRIM(… NVARCHAR(MAX))` | Full data preserved, without its padding |
 | TEXT | NVARCHAR(MAX) | Full data preserved. Always converted — TEXT has no decodable unconverted wire form, so `mssql_convert_varchar_max` does not apply to it. |
 | VARCHAR(MAX) | NVARCHAR(MAX) | Converted by default; disable with `mssql_convert_varchar_max = false` |
 

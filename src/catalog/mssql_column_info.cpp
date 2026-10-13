@@ -502,7 +502,7 @@ string NVarcharLength(const string &sql_type_name, int16_t max_length) {
 
 string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string &sql_type_name, int16_t max_length,
 											const string &collation_name, bool convert_varchar_max,
-											const string &qualifier, const string &alias) {
+											const string &qualifier, const string &alias, bool utf8_on_wire) {
 	const string escaped_name = mssql::QuoteIdentifier(alias.empty() ? col_name : alias);
 	const string reference = qualifier + mssql::QuoteIdentifier(col_name);
 
@@ -523,6 +523,22 @@ string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string
 	// form nothing decodes.
 	if (!IsKnownSQLServerType(sql_type_name)) {
 		return "CAST(" + reference + " AS NVARCHAR(MAX)) AS " + escaped_name;
+	}
+
+	// Issue #405: a char(n) is stored padded with spaces, which SQL Server
+	// ignores in a comparison and the codec trims off a fixed-length wire type
+	// (BIGCHAR, NCHAR). On a variable-length one -- the NVARCHAR cast of a
+	// code-page char, or a UTF-8 char the server transcodes for a connection
+	// without UTF8SUPPORT -- the padding reached DuckDB, and a join, GROUP BY or
+	// DISTINCT there no longer agreed with the server ('AB  ' of a char(4)
+	// against 'AB    ' of a char(6): 0 rows joined, 2 on the server). So it is
+	// read as NCHAR(n), whose n characters hold the column's n bytes in any code
+	// page or in UTF-8, or, past NCHAR's 4000, trimmed by the server.
+	if (StringUtil::Lower(sql_type_name) == "char" && (!IsUTF8Collation(collation_name) || !utf8_on_wire)) {
+		if (max_length > 0 && max_length <= 4000) {
+			return "CAST(" + reference + " AS NCHAR(" + std::to_string(max_length) + ")) AS " + escaped_name;
+		}
+		return "RTRIM(CAST(" + reference + " AS NVARCHAR(MAX))) AS " + escaped_name;
 	}
 
 	if (NeedsNVarcharConversion(sql_type_name, max_length, collation_name, convert_varchar_max)) {

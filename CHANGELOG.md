@@ -472,6 +472,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `char(n)` column kept its padding on two read paths, and joins and
+  `GROUP BY` disagreed with SQL Server** (#405). SQL Server compares strings
+  ignoring trailing spaces, so `'AB  '` (char(4)) equals `'AB    '` (char(6));
+  DuckDB compares bytes, and the codec trims only a fixed-length wire value.
+  - A code-page `char(n)` (the installation default
+    `SQL_Latin1_General_CP1_CI_AS` included) was read through
+    `CAST(… AS NVARCHAR(n))`, and a UTF-8 one on a connection without
+    UTF8SUPPORT arrived as the server's NVARCHAR. Both kept the padding:
+    a `char(4)` joined with a `char(6)` found 0 rows where the server finds 2,
+    and a `char(5000)` came back 5000 characters long.
+  - Such a column is now read as `CAST(… AS NCHAR(n))`, or past 4000 as
+    `RTRIM(CAST(… AS NVARCHAR(MAX)))`. A UTF-8 `char(n)` on a connection
+    granted UTF8SUPPORT is still read as itself, as UTF-8 bytes. The catalog
+    scan, a statement pushed whole and the `RETURNING` / `OUTPUT` lists read it
+    the same way. A lazily validated ATTACH learns whether UTF8SUPPORT was
+    granted from its first connection.
+  - A statement pushed whole leaves a value computed from a `char(n)` or
+    `nchar(n)` -- `COALESCE`, `CASE`, `LAG` / `LEAD` / `FIRST_VALUE` /
+    `LAST_VALUE` -- to DuckDB: on the server it is `varchar` / `nvarchar` and
+    kept the blanks (`COALESCE(code, 'x')` was `'AB    '`).
+
 - **A materialized scan crashed on a composite rowid key it did not project,
   and ignored the filters DuckDB applies itself** (found by #451). A scan is
   materialized inside an explicit transaction, on a pool of one connection,
