@@ -114,7 +114,10 @@ describe the load rather than the statement that started it:
 compressed rowgroups on a columnstore) and `mssql_copy_parallel_writers`.
 Parallel writers apply only where their loads cannot block each other —
 each writer holds its own server transaction until the INSERT commits them
-all, so two writers whose locks conflict would wait on each other with
+all (one after another: a reader under READ_COMMITTED_SNAPSHOT or SNAPSHOT can
+see part of the load between two commits, see
+[Parallel writers and readers that do not wait](transactions.md#parallel-writers-visibility)),
+so two writers whose locks conflict would wait on each other with
 nothing to time out. That is a target with **no nonclustered index** on it:
 a heap under TABLOCK, or a clustered columnstore without it. Under
 `mssql_copy_tablock = auto` (heap on, clustered off) bare heaps and bare
