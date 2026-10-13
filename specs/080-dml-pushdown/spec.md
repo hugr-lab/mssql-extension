@@ -1039,8 +1039,10 @@ From #421:
 - `mssql_dml_pushdown = false`;
 - the read-only refusals: a read-only catalog and a database opened
   read-only, both guards, one message;
-- **at least once**: a pushed UPDATE opened as a stream and closed unconsumed
-  changed its rows (PR 3's gate);
+- ~~**at least once**: a pushed UPDATE opened as a stream and closed unconsumed
+  changed its rows (PR 3's gate)~~ -- superseded by DuckDB #26880 and #451: a
+  result closed before its query ended is a drop, which rolls a joined write
+  back, as for a native UPDATE; the gate is parity (see W8's note);
 - a rolled-back pushed DML leaves the shared cache as it was;
 - keyless tables with an `xml`, a `geometry`, a `text`, a `time(7)` and a
   `datetime` column: each refused by name with its reason, never 0 rows;
@@ -1104,7 +1106,7 @@ risk", and this spec is no smaller. Each PR merges before the next opens
 | **1** | W4 (the 066 remainder: sinks, defer removed, pool of one); RETURNING on UPDATE / DELETE **refused by name** at plan time (the InternalException fix); W6 | fixes UPDATE / DELETE on a pool of one and the crash, behind no setting |
 | **2** | W3 (the ladder, rung 3, `#stage`, `mssql_dml_stage_threshold`, #358) and W5's capability read (`EngineEdition` / `ProductMajorVersion`); the `fabric-probe/` run if the warehouse answers by then (the rows it settles flip, one line each) | closes #140 and #358 with no rewriter involved |
 | **2b** | RETURNING on the fallback (`OUTPUT … INTO #out`), split from PR 2 (owner, 2026-10-09); the capability is `output_into_table` (it was named after `@t`) | UPDATE / DELETE … RETURNING return rows instead of a named refusal |
-| **3b** | W1's vehicle: `mssql_dml` (`FORCED`, `CHANGED_ROWS`, `RegisterDBModify`, the run-once latch, the count from the last DONE), the at-least-once gate, the `dml_*` counters; the spec corrected by what PR 3's planning measured (`exact_count`, `has_default` and the INSTEAD OF veto withdrawn, the DML-CTE rule). PR 3 was split in four, and 3a (RETURNVALUE, `has_default`, INSTEAD OF) dissolved under those measurements (owner, 2026-10-11) | callable on its own; the gate decides before the writer exists |
+| **3b** | W1's vehicle: `mssql_dml` (`FORCED` -- removed with DuckDB #26880, the gate now parity with a native UPDATE --, `CHANGED_ROWS`, `RegisterDBModify`, the run-once latch, the count from the last DONE), the at-least-once gate (since: parity), the `dml_*` counters; the spec corrected by what PR 3's planning measured (`exact_count`, `has_default` and the INSTEAD OF veto withdrawn, the DML-CTE rule). PR 3 was split in four, and 3a (RETURNVALUE, `has_default`, INSTEAD OF) dissolved under those measurements (owner, 2026-10-11) | callable on its own; the gate decides before the writer exists |
 | **3c** | W2 for UPDATE / DELETE: the writer's nodes, the catalog's hooks, D1's vetoes, `mssql_dml_pushdown`; the agreement harness | pushed UPDATE / DELETE end to end, PR 2's path under every veto |
 | **3d** | W2 for `INSERT … SELECT` (the identity bracket, the column type rule, the SELECT's columns written as themselves), the docs' final pass for PR 3; the statement-path INSERT count fix the agreement suite found | its own shape and cases |
 | **later** | `ExecuteDmlBatch` (the four DML token loops folded into one, acceptance 7) | a refactor of the hot INSERT path, kept apart from new behaviour (owner, 2026-10-11) |
