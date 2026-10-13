@@ -738,6 +738,12 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	target.schema_name = table_entry.ParentSchema().name.GetIdentifierName();
 	target.table_name = table_entry.name.GetIdentifierName();
 	target.pk_info = pk_info;
+	const auto rowid_indexes = RowIdChunkIndexes(op);
+	if (rowid_indexes.size() != 1) {
+		throw InternalException("MSSQL DELETE: %llu row-id expressions for a keyed table, expected one",
+								(unsigned long long)rowid_indexes.size());
+	}
+	target.rowid_chunk_index = rowid_indexes[0];
 
 	// Load DML configuration from settings
 	MSSQLDMLConfig config = LoadDMLConfig(context);
@@ -758,7 +764,7 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 	// Create the physical operator using planner.Make<T>()
 	MSSQLStagedDmlTarget staged;
 	staged.kind = MSSQLStagedDmlKind::DELETE_ROWS;
-	staged.key_chunk_index = RowIdChunkIndexes(op);
+	staged.key_chunk_index = rowid_indexes;
 	const bool can_stage = KeyedStagedTarget(context, *this, table_entry, pk_info, staged);
 	// RETURNING, and a platform with no VALUES join (Fabric, D0): the staged
 	// operator, whatever the row count.

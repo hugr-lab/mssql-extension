@@ -33,7 +33,9 @@ public:
 	// @param target_type Target column's logical type (used for casting decisions)
 	// @return T-SQL literal string (e.g., "N'hello'", "123", "NULL")
 	// @throws InvalidInputException for unsupported values (NaN, Inf)
-	static string Serialize(const Value &value, const LogicalType &target_type);
+	// @param column the target column, named in a refusal (issue #460: a date
+	//        past 9999-12-31 said which value but not where it was going)
+	static string Serialize(const Value &value, const LogicalType &target_type, const string &column = string());
 
 	// Serialize a value from a Vector at given index
 	// More efficient than extracting Value first for bulk operations
@@ -41,7 +43,8 @@ public:
 	// @param index Row index in the vector
 	// @param target_type Target column's logical type
 	// @return T-SQL literal string
-	static string SerializeFromVector(Vector &vector, idx_t index, const LogicalType &target_type);
+	static string SerializeFromVector(Vector &vector, idx_t index, const LogicalType &target_type,
+									  const string &column = string());
 
 	// Estimate serialized size for batch sizing decisions
 	// @param value The value to estimate

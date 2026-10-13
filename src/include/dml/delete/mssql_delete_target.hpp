@@ -47,6 +47,11 @@ struct MSSQLDeleteTarget {
 	//! PK metadata from MSSQLTableEntry
 	RowIdKeyInfo pk_info;
 
+	//! Where the rowid sits in the DELETE's input chunk: DuckDB's row-id
+	//! expression, as DuckCatalog::PlanDelete reads it. Not always last -- a
+	//! NOT EXISTS leaves its mark column after it (issue #337).
+	idx_t rowid_chunk_index = DConstants::INVALID_INDEX;
+
 	//===----------------------------------------------------------------------===//
 	// Helper Methods
 	//===----------------------------------------------------------------------===//

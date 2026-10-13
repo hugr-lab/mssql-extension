@@ -22,6 +22,7 @@
 #pragma once
 
 #include "codec/literal_context.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 
@@ -41,6 +42,11 @@ std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralCon
 // callers that pre-size their output buffers. Dispatches to per-family
 // codec::<family>::EstimateLiteralSize.
 size_t EstimateLiteralSize(const LogicalType &type);
+
+// Rethrow a value's refusal with the column it was headed for -- "(column
+// name)", or "(parameter @name)" for a name starting with '@' -- the form
+// every write path's error takes (issue #460); an empty name adds nothing.
+[[noreturn]] void ThrowNamingColumn(const InvalidInputException &ex, const std::string &name);
 
 }  // namespace codec
 }  // namespace mssql
