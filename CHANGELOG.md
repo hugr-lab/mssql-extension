@@ -472,7 +472,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A filter on a `datetime` column missed rows read from it** (#426). A
+- **A filter on a `datetime`, `time(7)` or `datetimeoffset(7)` column missed
+  rows read from it** (#426). A
   `datetime` stores 1/300 s ticks; the scan reads each to the microsecond,
   truncated (`.003` is `.00333…` on the server and `.003333` in DuckDB). The
   pushed filter compared the column with its constant as `datetime2`,
@@ -496,6 +497,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `datetime` columns -- a `datetime2(6)` column of the same table, a `CASE`
     over it, a constant with it in its `IN` list -- is no longer pushed:
     `dt = dt2` found nothing where DuckDB, reading both, finds the row.
+  - `time(7)` and `datetimeoffset(7)` -- the default scales -- are read as
+    microseconds with the 100 ns digit dropped (`.1234569` reads as
+    `.123456`), so `t = TIME '….123456'` found only the row whose seventh
+    digit is 0. The read equals `c` for every stored value in `[c, c + 1 µs)`:
+    `=` is now that range, `<>` its complement, `>` starts at `c + 1 µs`,
+    `<=` ends before it, and `>=` / `<` are unchanged. At the last
+    microsecond (`23:59:59.999999`, `9999-12-31 23:59:59.999999`) `c + 1 µs`
+    is never sent, where the server would raise an overflow. Such a column
+    against anything but constants -- even another `time(7)`, whose values
+    100 ns apart DuckDB reads as equal -- is no longer pushed.
+  - The read itself is unchanged. DuckDB 2.0's `TIME_NS` would keep the digit,
+    but it does not yet compare with `TIME` or take an interval, `strftime`
+    or `date_trunc`, so reading the default `time` as `TIME_NS` would break
+    ordinary queries.
 
 - **A materialized scan crashed on a composite rowid key it did not project,
   and ignored the filters DuckDB applies itself** (found by #451). A scan is

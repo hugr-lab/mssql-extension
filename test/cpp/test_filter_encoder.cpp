@@ -630,6 +630,104 @@ static void TestDatetimeAgainstOtherValuesRefused() {
 		"([d] > CAST('2026-01-01T10:00:00.0033330' AS DATETIME2(7)))");
 }
 
+// Issue #426: time(7) / datetimeoffset(7) are read with their 100 ns digit
+// dropped, so the read equals c for every stored value in [c, c + 1 us): `=`
+// is that range, `>` starts at c + 1 us, `<=` ends before it, `>=` / `<` stay.
+// At the last microsecond c + 1 us is never sent (an overflow on the server).
+static void TestTruncatedReadComparisons() {
+	std::cout << "  TestTruncatedReadComparisons..." << std::endl;
+	Fixture fx;
+	fx.column_types[COL_DT] = LogicalType::TIME;
+	fx.column_types[COL_D] = LogicalType::TIMESTAMP_TZ;
+	std::vector<MSSQLColumnInfo> cols = {Col("id", 1, "int", 4, 10, 0), Col("dt", 2, "time", 5, 16, 7),
+										 Col("flag", 3, "bit", 1, 1, 0), Col("name", 4, "varchar", 20, 0, 0),
+										 Col("d", 5, "datetimeoffset", 10, 34, 7)};
+	const auto t = [](int32_t h, int32_t m, int32_t sec, int32_t us) {
+		return Value::TIME(Time::FromTime(h, m, sec, us));
+	};
+	const auto cmp = [&](ExpressionType type, idx_t col, Value c, bool constant_left = false) {
+		return constant_left ? BoundComparisonExpression::Create(type, Const(std::move(c)), ColRef(fx, col))
+							 : BoundComparisonExpression::Create(type, ColRef(fx, col), Const(std::move(c)));
+	};
+
+	SqlParamSet params;
+	auto ctx = fx.Context();
+	ctx.mssql_columns = &cols;
+	ctx.params = &params;
+	ASSERT_SQL(
+		FilterEncoder::EncodeSearchCondition(*cmp(ExpressionType::COMPARE_EQUAL, COL_DT, t(10, 0, 0, 123456)), ctx),
+		"([dt] >= @p0 AND [dt] < @p1)");
+	ASSERT_TRUE(params.params[0].declaration == "time(7)");
+	ASSERT_TRUE(Value::NotDistinctFrom(params.params[0].value, t(10, 0, 0, 123456)));
+	ASSERT_TRUE(Value::NotDistinctFrom(params.params[1].value, t(10, 0, 0, 123457)));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(
+				   *cmp(ExpressionType::COMPARE_GREATERTHAN, COL_DT, t(10, 0, 0, 123456)), ctx),
+			   "([dt] >= @p2)");
+	ASSERT_TRUE(Value::NotDistinctFrom(params.params[2].value, t(10, 0, 0, 123457)));
+	// the constant on the left: `c >= dt` is `dt <= c`
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(
+				   *cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, COL_DT, t(10, 0, 0, 123456), true), ctx),
+			   "([dt] < @p3)");
+	ASSERT_TRUE(Value::NotDistinctFrom(params.params[3].value, t(10, 0, 0, 123457)));
+	// `<` and `>=` are the stored values' own
+	ASSERT_SQL(
+		FilterEncoder::EncodeSearchCondition(*cmp(ExpressionType::COMPARE_LESSTHAN, COL_DT, t(10, 0, 0, 123456)), ctx),
+		"([dt] < @p4)");
+	ASSERT_TRUE(Value::NotDistinctFrom(params.params[4].value, t(10, 0, 0, 123456)));
+	// the last microsecond: nothing lies past it, and 24:00:00 is never sent
+	const auto last = t(23, 59, 59, 999999);
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*cmp(ExpressionType::COMPARE_GREATERTHAN, COL_DT, last), ctx),
+			   "([dt] <> [dt])");
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*cmp(ExpressionType::COMPARE_LESSTHANOREQUALTO, COL_DT, last), ctx),
+			   "([dt] = [dt])");
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*cmp(ExpressionType::COMPARE_EQUAL, COL_DT, last), ctx),
+			   "([dt] >= @p5)");
+	// IN: one range per item; BETWEEN: both bounds
+	{
+		auto in = make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN, LogicalType::BOOLEAN);
+		in->GetChildrenMutable().push_back(ColRef(fx, COL_DT));
+		in->GetChildrenMutable().push_back(Const(t(1, 0, 0, 0)));
+		in->GetChildrenMutable().push_back(Const(t(2, 0, 0, 0)));
+		ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*in, ctx),
+				   "(([dt] >= @p6 AND [dt] < @p7) OR ([dt] >= @p8 AND [dt] < @p9))");
+		auto between =
+			BoundBetweenExpression::Create(ColRef(fx, COL_DT), Const(t(1, 0, 0, 0)), Const(t(2, 0, 0, 0)), true, true);
+		ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*between, ctx), "(([dt] >= @p10) AND ([dt] < @p11))");
+		// a NULL item is three-valued on both sides: `k = NULL`
+		auto with_null = make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_NOT_IN, LogicalType::BOOLEAN);
+		with_null->GetChildrenMutable().push_back(ColRef(fx, COL_DT));
+		with_null->GetChildrenMutable().push_back(Const(t(1, 0, 0, 0)));
+		with_null->GetChildrenMutable().push_back(Const(Value(LogicalType::TIME)));
+		ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*with_null, ctx),
+				   "(NOT (([dt] >= @p12 AND [dt] < @p13) OR ([dt] = NULL)))");
+	}
+	// datetimeoffset(7), as a literal: declared datetimeoffset(7) by the column
+	auto literal_ctx = fx.Context();
+	literal_ctx.mssql_columns = &cols;
+	const auto tz = Value::TIMESTAMPTZ(
+		timestamp_tz_t(Timestamp::FromDatetime(Date::FromDate(2026, 1, 1), Time::FromTime(10, 0, 0, 123456)).value));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*cmp(ExpressionType::COMPARE_EQUAL, COL_D, tz), literal_ctx),
+			   "([d] >= CAST('2026-01-01T10:00:00.1234560+00:00' AS DATETIMEOFFSET(7)) AND [d] < "
+			   "CAST('2026-01-01T10:00:00.1234570+00:00' AS DATETIMEOFFSET(7)))");
+	// against another column of the family: refused, DuckDB evaluates it
+	auto both = cols;
+	both[COL_D] = Col("d", 5, "time", 5, 16, 7);
+	fx.column_types[COL_D] = LogicalType::TIME;
+	auto both_ctx = fx.Context();
+	both_ctx.mssql_columns = &both;
+	ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(
+		*BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, ColRef(fx, COL_DT), ColRef(fx, COL_D)),
+		both_ctx));
+	// time(6) is read exactly: compared as it always was
+	auto exact = cols;
+	exact[COL_DT] = Col("dt", 2, "time", 5, 15, 6);
+	auto exact_ctx = fx.Context();
+	exact_ctx.mssql_columns = &exact;
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*cmp(ExpressionType::COMPARE_EQUAL, COL_DT, t(10, 0, 0, 123456)),
+													exact_ctx),
+			   "([dt] = '10:00:00.1234560')");
+}
+
 //==============================================================================
 // Test: IN / NOT IN as operator expressions (#366, #367 review). The combiner
 // builds a table filter only for a bare-column IN; NOT IN — which DuckDB binds
@@ -905,6 +1003,7 @@ int main() {
 	TestParameterSinkDeclaresFromColumn();
 	TestDatetimeConstantOnTick();
 	TestDatetimeAgainstOtherValuesRefused();
+	TestTruncatedReadComparisons();
 	TestInListOperatorExpressions();
 	TestDeclarationForColumn();
 

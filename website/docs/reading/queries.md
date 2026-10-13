@@ -38,6 +38,13 @@ Supported filter operations for pushdown:
     `datetime2` column, a `CASE` over it — the predicate is evaluated by
     DuckDB: the server would compare the column's exact tick, not the value
     DuckDB reads
+  - `time(7)` and `datetimeoffset(7)` (the default scales) are read with the
+    100 ns digit dropped (`.1234569` reads as `.123456`). A comparison with a
+    constant is sent as the range of stored values that read as it
+    (`t = TIME '10:00:00.123456'` is `t >= '….1234560' AND t < '….1234570'`),
+    so it gives DuckDB's answer. Against another column, even of the same
+    type, the predicate is evaluated by DuckDB: two values 100 ns apart are
+    two on the server and one in DuckDB
 - Boolean comparisons: `is_active = true` (converted to `= 1`)
 - **Mapped functions** inside predicates:
   - dates: `year`, `month`, `day`, `hour`, `minute`, `second` — not over a

@@ -2,6 +2,7 @@
 #include "pushdown/mssql_sql_writer.hpp"
 
 #include "catalog/mssql_column_info.hpp"
+#include "catalog/mssql_rowid_key_choice.hpp"
 #include "codec/target_string_type.hpp"
 #include "pushdown/mssql_expression_vocabulary.hpp"
 #include "pushdown/mssql_order_term.hpp"
@@ -146,10 +147,11 @@ bool HasSubqueryExpression(const SelectNode &node) {
 }
 
 bool IsGroupable(const MSSQLColumnInfo &column) {
-	const auto type = StringUtil::Lower(column.sql_type_name);
-	if ((type == "time" || type == "datetimeoffset") && column.scale >= 7) {
-		// Read as microseconds: two values 100 ns apart are two groups there and
-		// one value here -- harmless for an order, not for a set.
+	if (IsRoundTripExactForKey(column.sql_type_name, column.scale, column.is_cast_required) ==
+		KeyFidelity::NotRoundTrip) {
+		// time(7) / datetimeoffset(7), read as microseconds: two values 100 ns
+		// apart are two groups there and one value here -- harmless for an
+		// order, not for a set (the filter encoder's IsTruncatedReadColumn).
 		return false;
 	}
 	return KindOf(column) != ComparableKind::None || column.OrdersLikeDuckDB();
