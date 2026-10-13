@@ -69,6 +69,39 @@ that joins loads with one writer.
 
 The two settings are `SET` per DuckDB connection or `SET GLOBAL` for all of them.
 
+### Parallel writers and readers that do not wait {#parallel-writers-visibility}
+
+A bulk-path `INSERT` (past `mssql_insert_bcp_threshold`) may load on several
+connections at once (`mssql_copy_parallel_writers`). Each connection holds its own
+server transaction until the load finishes, and then they are committed **one after
+another**. "Together" means only that a failure before that point rolls all of them
+back. It is not one atomic commit.
+
+- **A reader under locking READ COMMITTED** (the SQL Server default) waits on the
+  locks of the writers not yet committed. It sees all of the `INSERT` or none of it.
+- **A reader that does not wait** sees each writer's rows as soon as that writer has
+  committed. That is a database with `READ_COMMITTED_SNAPSHOT` on, a `SNAPSHOT`
+  transaction, or `NOLOCK`. Between two commits it can see part of one `INSERT`.
+  Measured: a reader counting rows under RCSI saw part of a 20 000-row `INSERT`.
+
+Where such a reader must see each `INSERT` all or nothing, use one writer. Any of
+these does it:
+
+- `SET mssql_copy_parallel_writers = 1` — one connection, one commit. Parallel
+  writers pay off only on loads of hundreds of thousands of rows.
+- Run the `INSERT` inside `BEGIN … COMMIT`. It then runs on the transaction's one
+  connection and commits with it.
+- `SET mssql_insert_use_bcp = false` — statements instead of a bulk load, joined to
+  the statement's DuckDB transaction.
+
+A `COPY` or a `CREATE TABLE … AS SELECT` in autocommit holds no transaction for its
+rows at all. Each batch (`mssql_copy_flush_rows` rows) commits as it is sent, so
+**every** reader can see the load grow, whatever the number of writers. That is the
+"commits as it loads" in the table above. For an all-or-nothing load:
+
+- run the `COPY` inside `BEGIN … COMMIT`;
+- or `SET mssql_ctas_use_bcp = false` for a CTAS.
+
 ### Reading a catalog inside a transaction
 
 Reading an attached catalog behaves differently inside a transaction than outside
