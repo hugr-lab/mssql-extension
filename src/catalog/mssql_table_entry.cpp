@@ -133,10 +133,13 @@ TableFunction MSSQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 	// Store ALL column information - the query will use only projected columns.
 	// Spec 060: these must be the same types the entry declared above, or the
 	// scan's output disagrees with the column list DuckDB resolved names against.
-	const bool native_types = MSSQLReportsNativeTypes(catalog);
-	for (const auto &col : mssql_columns_) {
-		catalog_bind_data->all_column_names.push_back(col.name);
-		catalog_bind_data->all_types.push_back(native_types ? col.NativeDuckDBType() : col.duckdb_type);
+	// So they ARE the entry's (issue #415): re-reading mssql_catalog_native_types
+	// here gave plain VARCHAR after a SET while the cached entry still said
+	// MSSQL_NVARCHAR(n) -- a setting change applies through invalidation, as
+	// its documentation says.
+	for (idx_t i = 0; i < mssql_columns_.size(); i++) {
+		catalog_bind_data->all_column_names.push_back(mssql_columns_[i].name);
+		catalog_bind_data->all_types.push_back(columns_.GetColumn(LogicalIndex(i)).Type());
 	}
 
 	// Store extended column metadata for VARCHAR→NVARCHAR conversion (Spec 026)

@@ -569,6 +569,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the streaming path. A materialized scan returned the rows they reject, so
     an `UPDATE … WHERE lower(name) = 'x'` in a transaction changed rows it
     should not have.
+- **After `SET mssql_catalog_native_types` a cached table, its scan and its
+  INSERT disagreed on column types** (#415).
+  - A table entry fixes its types when it is built (`MSSQL_NVARCHAR(n)` with
+    native types on). The scan's types and an INSERT's column types read the
+    setting again on every statement, so after a `SET` they disagreed with the
+    entry the statement was bound against: plain `VARCHAR` beside its
+    `MSSQL_NVARCHAR(n)`, or the reverse.
+  - This is the extension-type disagreement behind #369, which fails an
+    assertion in a debug build.
+  - Both now take the entry's own types. A setting change applies through
+    `mssql_invalidate_cache()`, as documented.
+
 - **A `COMMIT` the server refused counted as done, and a failed `COMMIT` kept
   its connection out of the pool for good.** The transaction manager now reads
   the answer to `COMMIT` / `ROLLBACK` and closes a connection whose state it

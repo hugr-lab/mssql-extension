@@ -1145,11 +1145,13 @@ test-dead-connection: $(PIN_TEST_BUILD)
 # sqllogictest driver of the DEBUG tree — the one build in which the scan's
 # typed copy of a projected key column into the rowid slot asserts
 # (MSSQL_VARCHAR(n) against VARCHAR); a release build copies the same bytes
-# and says nothing. Explicit files, not the directory: the concurrency job's
+# and says nothing. Issue #415 joins them for the same class of assertion: a
+# scan's or an INSERT's types against the cached entry's after a SET. Explicit files, not the directory: the concurrency job's
 # TestDB is created empty, and the other rowid files read init.sql's tables.
 # MSSQL_TESTDB_DSN is the exported one above, as for every other target.
 ROWID_DEBUG_TESTS := test/sql/rowid/rowid_native_types.test test/sql/rowid/rowid_unique_index.test \
-    test/sql/rowid/rowid_key_types.test test/sql/catalog/bulk_load_keys.test
+    test/sql/rowid/rowid_key_types.test test/sql/catalog/bulk_load_keys.test \
+    test/sql/catalog/native_types_setting_change.test
 
 test-rowid-debug: debug
 	@echo "Running the self-contained rowid tests against the debug build (issue #369)..."

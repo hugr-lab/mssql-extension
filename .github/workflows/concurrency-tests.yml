@@ -47,6 +47,9 @@ on:
       - 'src/table_scan/**'
       - 'src/include/table_scan/**'
       - 'test/sql/rowid/**'
+      # The debug lane's catalog files (ROWID_DEBUG_TESTS in the Makefile).
+      - 'test/sql/catalog/bulk_load_keys.test'
+      - 'test/sql/catalog/native_types_setting_change.test'
   workflow_dispatch:
 
 concurrency:
