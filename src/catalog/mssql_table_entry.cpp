@@ -273,9 +273,9 @@ void MSSQLTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, Log
 	//
 	MSSQL_TE_DEBUG("BindUpdateConstraints: ensuring PK loaded for %s.%s", schema.name.c_str(), name.c_str());
 
-	if (!pk_info_.exists && !UsesKeylessKey()) {
-		throw BinderException(NoKeyRefusal("UPDATE/DELETE"));
-	}
+	// A table with no usable key, not keyable by every column, binds: an
+	// UPDATE is refused by name when it is planned (PlanKeylessDml), and a
+	// MERGE needs no key -- it runs on the server through #src (spec 080 D4).
 
 	MSSQL_TE_DEBUG("BindUpdateConstraints: PK loaded, %zu columns, type=%s", pk_info_.columns.size(),
 				   pk_info_.rowid_type.ToString().c_str());
@@ -419,8 +419,8 @@ vector<column_t> MSSQLTableEntry::GetRowIdColumns() const {
 	// pk_info_ was published by the constructor (spec 084 D5). Read pk_loaded_
 	// with acquire ordering, matching GetVirtualColumns().
 	if (object_type_ == MSSQLObjectType::VIEW) {
-		throw BinderException("MSSQL: UPDATE/DELETE is not supported on views. '%s.%s' is a view.", schema.name.c_str(),
-							  name.c_str());
+		throw BinderException("MSSQL: UPDATE/DELETE/MERGE is not supported on views. '%s.%s' is a view.",
+							  schema.name.c_str(), name.c_str());
 	}
 
 	// pk_info_ is read only once pk_loaded_ is observed true (spec 052); the
@@ -432,7 +432,10 @@ vector<column_t> MSSQLTableEntry::GetRowIdColumns() const {
 	}
 	if (!pk_info_.exists) {
 		if (!UsesKeylessKey()) {
-			throw BinderException(NoKeyRefusal("UPDATE/DELETE"));
+			// No row id: an UPDATE / DELETE is refused by name when it is planned
+			// (PlanKeylessDml, the same words this used to throw at bind), and a
+			// MERGE needs none -- it runs on the server through #src (spec 080 D4).
+			return {};
 		}
 		// Rung 3: every column, in table order, as hidden virtual columns
 		// (catalog/mssql_keyless_key.hpp); the operator finds them as the last

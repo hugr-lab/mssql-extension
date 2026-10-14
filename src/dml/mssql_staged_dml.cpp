@@ -4,7 +4,6 @@
 
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_table_entry.hpp"
-#include "connection/mssql_connection_provider.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -225,9 +224,14 @@ string MSSQLStagedDml::JoinStatementSql(const MSSQLStagedDmlTarget &target, cons
 	return "UPDATE t SET " + set + output + join;
 }
 
+static const char *VerbOf(const MSSQLStagedDmlTarget &target) {
+	return target.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "UPDATE" : "DELETE";
+}
+
 MSSQLStagedDml::MSSQLStagedDml(ClientContext &context, MSSQLStagedDmlTarget target)
 	: target_(std::move(target)),
-	  catalog_(Catalog::GetCatalog(context, Identifier(target_.catalog_name)).Cast<MSSQLCatalog>()) {
+	  stage_(Catalog::GetCatalog(context, Identifier(target_.catalog_name)).Cast<MSSQLCatalog>(),
+			 StringUtil::Format("MSSQL %s on '%s.%s'", VerbOf(target_), target_.schema_name, target_.table_name)) {
 	auto uuid = UUID::ToString(UUID::GenerateRandomUUID());
 	uuid.erase(std::remove(uuid.begin(), uuid.end(), '-'), uuid.end());
 	stage_name_ = "#stage_" + uuid;
@@ -236,46 +240,20 @@ MSSQLStagedDml::MSSQLStagedDml(ClientContext &context, MSSQLStagedDmlTarget targ
 
 MSSQLStagedDml::~MSSQLStagedDml() = default;
 
-void MSSQLStagedDml::FailAndThrow(ClientContext &context, const string &message) {
-	// One statement over the whole stage: the server ran it whole or not at
-	// all. In autocommit its transaction is rolled back -- by DuckDB, which
-	// rolls back the statement's own (issue #451); inside an explicit DuckDB
-	// transaction the stage and the statement sit in the open one.
-	const bool pinned = stmt_conn_.InOpenTransaction();
-	session_.Abandon();
-	stmt_conn_.Fail(context, catalog_);
-	connection_.reset();
-	throw IOException("%s %s", message,
-					  pinned ? "(the open transaction must be rolled back)"
-							 : "(nothing was written: the statement's server transaction was rolled back)");
-}
-
 void MSSQLStagedDml::Start(ClientContext &context) {
-	const char *verb = target_.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "UPDATE" : "DELETE";
-	connection_ = stmt_conn_.Acquire(context, catalog_);
-	{
-		auto pinned_lock = stmt_conn_.LockPinned(context, catalog_);
-		MSSQLStatementConnection::RequireIdle(*connection_, verb);
-		const auto create = CreateStageSql(target_, stage_name_);
-		auto result = MSSQLSimpleQuery::Execute(*connection_, create, QueryTimeoutMs(target_));
-		if (!result.success) {
-			FailAndThrow(context, StringUtil::Format("MSSQL %s on '%s.%s': creating the stage failed: %s", verb,
-													 target_.schema_name, target_.table_name, result.error_message));
-		}
-	}
-
 	// The stage's columns, in the order BuildFillChunk lays them out: the key,
 	// then the new values.
+	vector<mssql::BCPColumnMetadata> columns;
 	auto add_column = [&](const MSSQLColumnInfo &col, const string &name) {
 		if (IsRowVersion(col)) {
-			bcp_columns_.push_back(mssql::BCPColumnMetadata::FromServerColumn(name, "binary", 8, 0, 0, true, string()));
+			columns.push_back(mssql::BCPColumnMetadata::FromServerColumn(name, "binary", 8, 0, 0, true, string()));
 		} else {
-			bcp_columns_.push_back(mssql::BCPColumnMetadata::FromServerColumn(name, col.sql_type_name, col.max_length,
-																			  col.precision, col.scale, col.is_nullable,
-																			  col.collation_name));
+			columns.push_back(mssql::BCPColumnMetadata::FromServerColumn(name, col.sql_type_name, col.max_length,
+																		 col.precision, col.scale, col.is_nullable,
+																		 col.collation_name));
 		}
 		// A refused value names the target's column, not the stage's (#460).
-		bcp_columns_.back().reported_name = col.name;
+		columns.back().reported_name = col.name;
 	};
 	for (idx_t i = 0; i < target_.key_columns.size(); i++) {
 		add_column(target_.key_columns[i], KeyName(i));
@@ -283,26 +261,8 @@ void MSSQLStagedDml::Start(ClientContext &context) {
 	for (idx_t i = 0; i < target_.set_columns.size(); i++) {
 		add_column(target_.set_columns[i], NewValueName(i));
 	}
-	bcp_target_ = mssql::BCPCopyTarget(target_.catalog_name, string(), stage_name_);
-	// KEEP_NULLS: a NULL is a value of the key, not a request for a default.
-	insert_bulk_sql_ = mssql::BuildInsertBulkSql(bcp_target_, bcp_columns_, false, target_.flush_rows,
-												 mssql::InsertBulkHints::StatementSemantics());
-
-	session_params_.pool = &catalog_.GetConnectionPool();
-	session_params_.pool_handle = catalog_.GetConnectionPoolHandle();
-	session_params_.insert_bulk_sql = &insert_bulk_sql_;
-	session_params_.target = &bcp_target_;
-	session_params_.columns = &bcp_columns_;
-	session_params_.column_mapping = nullptr;  // positional: the fill chunk is in stage order
-	session_params_.flush_rows = target_.flush_rows;
-	session_params_.reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
-	// The statement's server transaction already brackets the fill.
-	session_params_.own_transaction = false;
-	// The connection is the statement's (MSSQLStatementConnection), not the
-	// session's: adopted as "pinned", the session never releases it -- Finish /
-	// the error paths drop the reference, closing it on an error -- and the
-	// statement's Commit / Fail decide what happens to it.
-	session_.Adopt(connection_, session_params_, true);
+	stage_.Open(context, VerbOf(target_), CreateStageSql(target_, stage_name_), stage_name_, std::move(columns),
+				target_.flush_rows, QueryTimeoutMs(target_));
 }
 
 void MSSQLStagedDml::BuildFillChunk(DataChunk &chunk) {
@@ -391,21 +351,11 @@ void MSSQLStagedDml::Execute(ClientContext &context, DataChunk &chunk) {
 	if (chunk.size() == 0) {
 		return;
 	}
-	if (!connection_) {
+	if (!stage_.IsOpen()) {
 		Start(context);
 	}
 	BuildFillChunk(chunk);
-	auto pinned_lock = stmt_conn_.LockPinned(context, catalog_);
-	try {
-		session_.Write(fill_);
-	} catch (std::exception &ex) {
-		ErrorData error(ex);
-		FailAndThrow(context, StringUtil::Format("MSSQL %s on '%s.%s': filling the stage failed after %llu rows: %s",
-												 target_.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "UPDATE" : "DELETE",
-												 target_.schema_name, target_.table_name,
-												 (unsigned long long)rows_staged_, error.RawMessage()));
-	}
-	rows_staged_ += chunk.size();
+	stage_.Write(context, fill_);
 }
 
 void MSSQLStagedDml::CheckMatchedEverything(ClientContext &context, idx_t matched) {
@@ -415,20 +365,20 @@ void MSSQLStagedDml::CheckMatchedEverything(ClientContext &context, idx_t matche
 	// read for a reason that table does not name, or another session changed
 	// or removed the row since the scan -- either way the count would be
 	// silently short. Checked before the commit, so nothing is written.
-	const char *verb = target_.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "UPDATE" : "DELETE";
+	const char *verb = VerbOf(target_);
 	idx_t expected = 0;
 	if (target_.key_source == MSSQLStagedKeySource::ROWID) {
 		// A unique key: every distinct staged key is one row. DuckDB may hand
 		// a rowid over twice (UPDATE ... FROM with two matching source rows),
 		// so the distinct count is asked only when the plain one falls short.
-		if (matched >= rows_staged_) {
+		if (matched >= stage_.RowsStaged()) {
 			return;
 		}
 		string keys;
 		for (idx_t i = 0; i < target_.key_columns.size(); i++) {
 			keys += (i ? ", " : "") + mssql::QuoteIdentifier(KeyName(i));
 		}
-		auto distinct = MSSQLSimpleQuery::ExecuteScalar(*connection_,
+		auto distinct = MSSQLSimpleQuery::ExecuteScalar(stage_.GetConnection(),
 														"SELECT COUNT_BIG(*) FROM (SELECT DISTINCT " + keys + " FROM " +
 															mssql::QuoteIdentifier(stage_name_) + ") AS d",
 														QueryTimeoutMs(target_));
@@ -439,13 +389,13 @@ void MSSQLStagedDml::CheckMatchedEverything(ClientContext &context, idx_t matche
 	} else {
 		// Every column: rows identical in all of them are one match, so the
 		// count can be below the staged rows legitimately; none at all cannot.
-		if (rows_staged_ == 0 || matched > 0) {
+		if (stage_.RowsStaged() == 0 || matched > 0) {
 			return;
 		}
 		expected = 1;
 	}
-	FailAndThrow(context,
-				 StringUtil::Format("MSSQL %s on '%s.%s': %llu row(s) were selected, but the server found only %llu of "
+	stage_.FailAndThrow(
+		context, StringUtil::Format("MSSQL %s on '%s.%s': %llu row(s) were selected, but the server found only %llu of "
 									"them. Another session changed or removed them since they were read, or a key "
 									"value did not come back exactly as it was read (please report the column types)",
 									verb, target_.schema_name, target_.table_name, (unsigned long long)expected,
@@ -469,7 +419,7 @@ static void ReferenceAs(Vector &dst, Vector &src) {
 }
 
 void MSSQLStagedDml::ReadReturned(ClientContext &context) {
-	const char *verb = target_.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "UPDATE" : "DELETE";
+	const char *verb = VerbOf(target_);
 	// Read #out as the scan reads the table (the same expressions, so the
 	// same types): BuildReadExpression is what the INSERT ... RETURNING
 	// OUTPUT list uses too.
@@ -483,8 +433,8 @@ void MSSQLStagedDml::ReadReturned(ClientContext &context) {
 	try {
 		// The statement's own connection, held by it: "pinned" to the stream so
 		// the stream never releases it.
-		MSSQLResultStream stream(connection_, sql, target_.catalog_name, weak_ptr<tds::ConnectionPool>(), true,
-								 target_.query_timeout_seconds);
+		MSSQLResultStream stream(stage_.GetConnectionPtr(), sql, target_.catalog_name, weak_ptr<tds::ConnectionPool>(),
+								 true, target_.query_timeout_seconds);
 		if (!stream.Initialize()) {
 			throw IOException("reading the RETURNING rows failed");
 		}
@@ -524,8 +474,9 @@ void MSSQLStagedDml::ReadReturned(ClientContext &context) {
 		}
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
-		FailAndThrow(context, StringUtil::Format("MSSQL %s ... RETURNING on '%s.%s': reading the rows failed: %s", verb,
-												 target_.schema_name, target_.table_name, error.RawMessage()));
+		stage_.FailAndThrow(context,
+							StringUtil::Format("MSSQL %s ... RETURNING on '%s.%s': reading the rows failed: %s", verb,
+											   target_.schema_name, target_.table_name, error.RawMessage()));
 	}
 }
 
@@ -534,36 +485,30 @@ idx_t MSSQLStagedDml::Finalize(ClientContext &context) {
 		return 0;
 	}
 	finalized_ = true;
-	if (!connection_) {
+	if (!stage_.IsOpen()) {
 		// Nothing selected: no connection was taken, nothing to send.
 		return 0;
 	}
-	const char *verb = target_.kind == MSSQLStagedDmlKind::UPDATE_ROWS ? "UPDATE" : "DELETE";
+	const char *verb = VerbOf(target_);
+	auto &connection = stage_.GetConnection();
 	idx_t rows = 0;
 	{
-		auto pinned_lock = stmt_conn_.LockPinned(context, catalog_);
-		try {
-			session_.CloseStream();
-		} catch (std::exception &ex) {
-			ErrorData error(ex);
-			FailAndThrow(context, StringUtil::Format("MSSQL %s on '%s.%s': filling the stage failed: %s", verb,
-													 target_.schema_name, target_.table_name, error.RawMessage()));
-		}
-		session_.Release();
+		auto pinned_lock = stage_.LockPinned(context);
+		stage_.CloseFill(context);
 		if (target_.returning) {
 			auto created =
-				MSSQLSimpleQuery::Execute(*connection_, CreateOutSql(target_, out_name_), QueryTimeoutMs(target_));
+				MSSQLSimpleQuery::Execute(connection, CreateOutSql(target_, out_name_), QueryTimeoutMs(target_));
 			if (!created.success) {
-				FailAndThrow(context,
-							 StringUtil::Format("MSSQL %s on '%s.%s': creating the RETURNING table failed: %s", verb,
+				stage_.FailAndThrow(
+					context, StringUtil::Format("MSSQL %s on '%s.%s': creating the RETURNING table failed: %s", verb,
 												target_.schema_name, target_.table_name, created.error_message));
 			}
 		}
 		const auto sql = JoinStatementSql(target_, stage_name_, target_.returning ? out_name_ : string());
-		auto result = MSSQLSimpleQuery::Execute(*connection_, sql, QueryTimeoutMs(target_));
+		auto result = MSSQLSimpleQuery::Execute(connection, sql, QueryTimeoutMs(target_));
 		if (!result.success) {
-			FailAndThrow(context, StringUtil::Format("MSSQL %s on '%s.%s' failed: %s", verb, target_.schema_name,
-													 target_.table_name, result.error_message));
+			stage_.FailAndThrow(context, StringUtil::Format("MSSQL %s on '%s.%s' failed: %s", verb, target_.schema_name,
+															target_.table_name, result.error_message));
 		}
 		rows = static_cast<idx_t>(result.rows_affected);
 		CheckMatchedEverything(context, rows);
@@ -572,15 +517,15 @@ idx_t MSSQLStagedDml::Finalize(ClientContext &context) {
 			ReadReturned(context);
 			drop += "; DROP TABLE " + mssql::QuoteIdentifier(out_name_);
 		}
-		auto dropped = MSSQLSimpleQuery::Execute(*connection_, drop, QueryTimeoutMs(target_));
+		auto dropped = MSSQLSimpleQuery::Execute(connection, drop, QueryTimeoutMs(target_));
 		if (!dropped.success) {
-			FailAndThrow(context, StringUtil::Format("MSSQL %s on '%s.%s': dropping the stage failed: %s", verb,
-													 target_.schema_name, target_.table_name, dropped.error_message));
+			stage_.FailAndThrow(context,
+								StringUtil::Format("MSSQL %s on '%s.%s': dropping the stage failed: %s", verb,
+												   target_.schema_name, target_.table_name, dropped.error_message));
 		}
 	}
-	connection_.reset();
-	const bool pinned = stmt_conn_.InOpenTransaction();
-	stmt_conn_.Commit(context, catalog_);
+	const bool pinned = stage_.InOpenTransaction();
+	stage_.Commit(context);
 	mssql::CountDml(mssql::DmlPath::STAGED);
 	if (target_.kind == MSSQLStagedDmlKind::DELETE_ROWS && !pinned && target_.table_entry) {
 		target_.table_entry->NoteRowsDeleted(rows);

@@ -102,7 +102,8 @@ public:
 										const MSSQLDMLConfig &config);
 
 	//! Spec 080 D3: holds the rows until the threshold decides; null when the
-	//! statement cannot stage (a MERGE action, a platform with no stage).
+	//! statement cannot stage (it holds its rows until Finalize, or the
+	//! platform has no stage).
 	unique_ptr<MSSQLStageSwitch> stage_switch;
 
 	//! The executor that handles batch accumulation and execution

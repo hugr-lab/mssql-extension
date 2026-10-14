@@ -21,6 +21,11 @@ public:
 	//! Registered entry point. Runs Optimize over the tree, then the whole-plan
 	//! pass that materializes catalog scans sharing a pinned connection (#239).
 	static void OptimizeRoot(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan);
+
+	//! Registered as the pre-optimize hook (spec 080 D4, PR 4b): every MERGE
+	//! into a catalog table becomes a staged MERGE (mssql::RewriteMerge) or is
+	//! refused by name, before DuckDB's optimizers take the binder's join apart.
+	static void PreOptimizeRoot(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan);
 };
 
 }  // namespace duckdb

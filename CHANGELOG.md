@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MERGE INTO from any source runs on SQL Server as one statement** (spec 080
+  PR 4b). A MERGE whose source is not in the same database — a DuckDB table, a
+  VALUES list, a file, another database — or any MERGE with
+  `mssql_dml_pushdown = false` is staged: DuckDB computes the source and every
+  expression over the source alone (any DuckDB function), the rows go into a
+  session `#src_<uuid>` by INSERT BULK on the statement's connection, and ONE
+  `MERGE [s].[t] AS [t] USING [#src] AS [s] ON … WHEN …;` does the match, the
+  conditions and the writes on the server, then `#src` is dropped. EXPLAIN shows
+  it as `Mssql Staged Merge` with the T-SQL.
+  - One statement, one server transaction: a failing row rolls back every
+    other, and in autocommit it commits with DuckDB's statement (#451).
+  - No key is needed: a table with no usable key, which DuckDB's own MERGE
+    refused, is merged by the server.
+  - What touches the target — the ON condition, each WHEN condition, a SET /
+    INSERT value that reads the target — is written in T-SQL with the scan's
+    filter rules and the column collations (D4). A source value compared
+    directly with a target column is staged in that column's own type and
+    collation, so a `datetime` read back matches its row (#358, #426); strings
+    and binaries are widened to MAX so no value is cut into a false match, and
+    a code-page `char` / `varchar` is compared in Unicode (`'Łukasz'` is not
+    `'Lukasz'`). Any other source value is staged in its CTAS type.
+  - As the server compares: a source value between two of a temporal column's
+    steps (a `datetime` tick, a `smalldatetime` minute, the digits of a
+    `datetime2(n)` / `time(n)` / `datetimeoffset(n)` below 7) is rounded onto
+    the column's precision first, as the column would store it.
+  - A column ON compares with the source must survive the round trip through
+    DuckDB: `time(7)` / `datetimeoffset(7)`, `xml`, spatial and CLR columns
+    are refused there, since an unmatched row would make a WHEN NOT MATCHED
+    INSERT duplicate it.
+  - Refused by name, nothing sent: a shape T-SQL does not have (see PR 4a's
+    list), `ERROR`, `RETURNING`, an INSERT naming the identity column (a MERGE
+    runs without IDENTITY_INSERT), a subquery, an expression over the target
+    T-SQL cannot write, a value DuckDB computes per row (`random()`, a
+    parameter) in a WHEN NOT MATCHED BY SOURCE clause, Azure Synapse, and any
+    MERGE with DuckDB's optimizer off (`enable_optimizer = false`), where the
+    extension cannot rewrite it.
+  - **Changed** from DuckDB's own MERGE, which ran each action through the row
+    paths and is gone for MSSQL tables: more than two WHEN MATCHED clauses and
+    an identity column in the INSERT are now refused; `INSERT DEFAULT VALUES`
+    is sent as such; `UPDATE` with no SET list is written as a SET of every
+    column; `SET x = DEFAULT` writes NULL, as before.
+
 - **MERGE INTO within one database runs on SQL Server as one statement**
   (spec 080 PR 4a). The remote-pushdown rewriter hands over a MERGE whose
   source is in the same catalog whole: `MERGE [s].[t] AS [r1] USING … ON … WHEN
@@ -20,9 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     DELETE, the first conditional), one WHEN NOT MATCHED INSERT, two WHEN
     NOT MATCHED BY SOURCE (UPDATE and DELETE, the first conditional). A last
     DO NOTHING is dropped.
-  - Anything else keeps DuckDB's native MERGE: more clauses, ERROR,
-    `UPDATE SET *` / `INSERT *`, an identity column in the INSERT,
-    RETURNING, or a source elsewhere.
+  - A MERGE whose source is elsewhere runs through `#src` (PR 4b, below);
+    one T-SQL has no form for is refused by name.
 
 - **INSERT … SELECT within one database runs on SQL Server as one statement**
   (spec 080 PR 3d), through the same `mssql_dml` vehicle as a pushed UPDATE /

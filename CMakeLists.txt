@@ -240,6 +240,11 @@ set(EXTENSION_SOURCES
     src/dml/delete/mssql_physical_delete.cpp
     # DML staged UPDATE/DELETE through #stage (spec 080 D3)
     src/dml/mssql_staged_dml.cpp
+    src/dml/mssql_session_stage.cpp
+    src/dml/merge/mssql_merge_rewrite.cpp
+    src/dml/merge/mssql_logical_staged_merge.cpp
+    src/dml/merge/mssql_physical_staged_merge.cpp
+    src/dml/merge/mssql_staged_merge.cpp
     src/dml/mssql_physical_staged_dml.cpp
     # The vehicle of a pushed DML (spec 080 D1)
     src/dml/mssql_dml_function.cpp

@@ -15,24 +15,16 @@
 // column, the stage carries their old values (the match) and, for an UPDATE,
 // the new values of the SET columns.
 //
-// The stage is created inside the statement's server transaction -- the
-// LoadTransaction in autocommit, the DuckDB transaction's when pinned -- and a
-// `#temp` created in a transaction is dropped by its ROLLBACK. So a failure
-// needs no cleanup statement of its own: Fail() rolls back (autocommit) or the
-// transaction's end does (pinned), and a connection left mid-response is
-// closed, which ends the session. On success the stage is dropped before the
-// commit. A fill that fails mid-stream leaves the connection mid-response, and
-// it is closed even when it is the transaction's pinned one -- as a failed COPY
-// or INSERT BULK in a transaction does: DuckDB aborts the transaction anyway.
+// The stage's connection, transaction and failure handling are
+// MSSQLSessionStage's (dml/mssql_session_stage.hpp), shared with the staged
+// MERGE's #src.
 //===----------------------------------------------------------------------===//
 
 #pragma once
 
 #include "catalog/mssql_column_info.hpp"
-#include "copy/bulk_load_session.hpp"
-#include "copy/target_resolver.hpp"
 #include "dml/mssql_dml_config.hpp"
-#include "dml/mssql_statement_connection.hpp"
+#include "dml/mssql_session_stage.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 
@@ -145,7 +137,6 @@ private:
 	void Start(ClientContext &context);
 	//! The staged columns of `chunk`, in stage order, as references.
 	void BuildFillChunk(DataChunk &chunk);
-	void FailAndThrow(ClientContext &context, const string &message);
 	//! The JOIN found every staged row (rungs 1-2: every distinct key; rung 3:
 	//! at least one row), or the statement fails before its commit.
 	void CheckMatchedEverything(ClientContext &context, idx_t matched);
@@ -153,19 +144,10 @@ private:
 	void ReadReturned(ClientContext &context);
 
 	MSSQLStagedDmlTarget target_;
-	MSSQLCatalog &catalog_;
-	MSSQLStatementConnection stmt_conn_;
-	std::shared_ptr<tds::TdsConnection> connection_;
+	MSSQLSessionStage stage_;
 	string stage_name_;
-
-	// The stage fill: INSERT BULK into the stage, on the statement's connection.
-	mssql::BCPCopyTarget bcp_target_;
-	vector<mssql::BCPColumnMetadata> bcp_columns_;
+	//! The stage's columns of the chunk being staged, as references.
 	DataChunk fill_;
-	string insert_bulk_sql_;
-	mssql::BulkLoadSessionParams session_params_;
-	mssql::BulkLoadSession session_;
-	idx_t rows_staged_ = 0;
 	string out_name_;
 	unique_ptr<ColumnDataCollection> returned_;
 	bool finalized_ = false;

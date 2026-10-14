@@ -238,7 +238,7 @@ MSSQLPhysicalUpdate (PhysicalOperator)
 
 ### In a transaction
 
-Batches are sent as the rows arrive, in a transaction too. The optimizer counts an UPDATE (and a DELETE or MERGE) as a sink of its catalog, so the scan feeding it is materialised at init and the pinned connection is idle when the first batch goes out. Each batch on the pinned connection holds the transaction's materialize lock from its send to the end of its response, because a MERGE's actions are fed from several threads (spec 080 PR 1). Until then the executor deferred every batch to `Finalize()` with all rows buffered.
+Batches are sent as the rows arrive, in a transaction too. The optimizer counts an UPDATE (and a DELETE or a staged MERGE) as a sink of its catalog, so the scan feeding it is materialised at init and the pinned connection is idle when the first batch goes out. Each batch on the pinned connection holds the transaction's materialize lock from its send to the end of its response (spec 080 PR 1). Until then the executor deferred every batch to `Finalize()` with all rows buffered.
 
 ### Batch Size Calculation
 

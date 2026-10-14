@@ -101,8 +101,8 @@ MSSQLDMLResult MSSQLUpdateExecutor::Finalize() {
 
 	finalized_ = true;
 
-	// Flush the remaining rows: less than one batch, or every row of a MERGE
-	// action (MSSQLDMLConfig::defer_to_finalize)
+	// Flush the remaining rows: less than one batch, or every row of a
+	// statement that holds them until Finalize (MSSQLDMLConfig::defer_to_finalize)
 	while (!pending_pk_values_.empty()) {
 		UPDATE_DEBUG(1, "Finalize: flushing batch, pending=%llu", (unsigned long long)pending_pk_values_.size());
 		auto result = FlushBatch();

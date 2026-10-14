@@ -382,20 +382,72 @@ What goes whole:
 - A last `DO NOTHING` is dropped, since no later clause could take its rows.
 
 A target row that two source rows match is an error when the MERGE updates or
-deletes it (8672 on the server, DuckDB's own error natively). The count is the
-MERGE's.
+deletes it (8672). The count is the MERGE's.
 
-What stays with DuckDB's own MERGE (which needs a key on the target):
+### Any other source: through `#src`
 
-- more WHEN clauses than that (DuckDB applies the first whose condition holds);
+A MERGE whose source is not in the same database — a DuckDB table, a VALUES
+list, a file, another database — also runs on SQL Server as one MERGE
+statement. DuckDB computes the source rows and every expression over the
+source alone (any DuckDB function); the rows go into a session table
+`#src_<uuid>` by bulk load on the statement's own connection; one
+`MERGE … USING #src` does the match, the conditions and the writes on the
+server; the table is dropped.
+
+```sql
+MERGE INTO sqlserver.dbo.products AS t
+USING read_parquet('prices.parquet') AS s ON t.id = s.id
+WHEN MATCHED AND s.price IS NULL THEN DELETE
+WHEN MATCHED THEN UPDATE SET price = s.price
+WHEN NOT MATCHED THEN INSERT (id, price) VALUES (s.id, s.price);
+-- EXPLAIN: Mssql Staged Merge
+--   Statement: MERGE [dbo].[products] AS [t] USING [#src_…] AS [s]
+--              ON ([s].[c0] = [t].[id]) WHEN MATCHED AND ([s].[c1] = 1) THEN DELETE …
+```
+
+- It is one statement in one server transaction: a failing row rolls back
+  every other row, and in autocommit it commits with DuckDB's statement.
+- No key is needed on the target.
+- What reads the target — the ON condition, the WHEN conditions, a SET or
+  INSERT value such as `t.qty + s.delta` — is written in T-SQL. It follows the
+  same rules as the filters of a scan, and comparisons follow the column's
+  collation.
+- A source value compared directly with a target column is staged in that
+  column's own type and collation. A `datetime` read back therefore finds its
+  row. A value between two of a temporal column's steps (a `datetime` tick, a
+  `smalldatetime` minute, `datetime2(n)` / `time(n)` / `datetimeoffset(n)`
+  below 7 digits) is rounded onto the column's precision first, as the column
+  would store it. A `char` / `varchar` under a code-page collation is compared
+  in Unicode, so a character the code page lacks never matches its best-fit
+  letter.
+- ON cannot compare a column whose value does not come back from DuckDB as
+  stored: `time(7)`, `datetimeoffset(7)`, `xml`, spatial and CLR types. Such
+  a row would not match, and a WHEN NOT MATCHED INSERT would duplicate it.
+- With `mssql_dml_pushdown = false` every MERGE takes this path, a
+  same-database source included.
+
+### Refused by name
+
+There is no client-side MERGE for an MSSQL table: one the server cannot run is
+refused, and nothing is sent.
+
+- more WHEN clauses than T-SQL's shape above (DuckDB would apply the first
+  whose condition holds);
 - `DO NOTHING` before another clause of its kind, `ERROR`;
-- `UPDATE SET *`, `INSERT *` and `INSERT BY NAME`;
-- an INSERT naming the identity column;
+- an INSERT naming the identity column (a MERGE runs without
+  IDENTITY_INSERT);
 - `RETURNING`;
-- a source of another database, a local table or a file (a session-table form
-  for these is planned);
-- a source that is a join, a view as the target, a subquery in a condition;
-- Azure Synapse.
+- a subquery in a condition or a value;
+- an expression over the target that T-SQL cannot write (a string function
+  such as `upper(t.name)`, whose case mapping the server does not share);
+- a volatile function or a parameter in a `WHEN NOT MATCHED BY SOURCE`
+  clause, which has no source row to compute it for;
+- a view as the target, and Azure Synapse;
+- DuckDB's optimizer turned off (`SET enable_optimizer = false`): the MERGE is
+  rewritten for the server there.
+
+`SET x = DEFAULT` writes NULL. DuckDB hands the extension the same thing for
+both.
 
 ## How UPDATE and DELETE reach the server
 
@@ -528,9 +580,9 @@ it in every column (NULL equal to NULL, strings byte for byte). So:
   DuckDB (a string function such as `lower()`, a subquery — `IN (SELECT …)`,
   `EXISTS (…)` — or any condition the scan cannot send), when it computes a
   volatile function (`random()`, `gen_random_uuid()`), for `UPDATE … FROM` /
-  `DELETE … USING`, and for a `MERGE INTO` that does not go to the server whole
-  (one that does needs no key, see [MERGE INTO](#merge-into)). The way out is a
-  key: a primary key or a unique index makes all of these work.
+  `DELETE … USING`. (A `MERGE INTO` needs no key: it always runs on the server,
+  see [MERGE INTO](#merge-into).) The way out is a key: a primary key or a
+  unique index makes all of these work.
 - **No concurrent writer is assumed.** The rows are read, then found again by
   value in a second step. In autocommit another session can insert an equal row
   between the two (it is then updated too) or change a selected one (it is then

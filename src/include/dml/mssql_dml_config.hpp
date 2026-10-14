@@ -39,11 +39,10 @@ struct MSSQLDMLConfig {
 	// Maximum parameters per SQL statement (SQL Server limit ~2100)
 	idx_t max_parameters = MSSQL_DEFAULT_DML_MAX_PARAMETERS;
 
-	//! Spec 080 PR 1: an action of a native MERGE. Its rows are sent only at the
-	//! action's Finalize, after every action's sink has run: a MERGE's actions
-	//! are fed from several threads, and on a pool of one connection an action
-	//! holding the connection mid-sink would starve the others. Set by
-	//! MSSQLCatalog::PlanMergeInto; a plain UPDATE / DELETE sends as it goes.
+	//! The rows are sent only at Finalize: the scan feeding the statement shares
+	//! its connection and still streams, because DuckDB skipped the extension's
+	//! optimizer that materialises it (review of #423). Otherwise an UPDATE /
+	//! DELETE sends as it goes.
 	bool defer_to_finalize = false;
 
 	//! Spec 080 D3: mssql_dml_stage_threshold. Rows are counted as they arrive,
