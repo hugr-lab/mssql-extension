@@ -54,10 +54,6 @@ struct SimpleQueryResult {
 	//! sends no INFO tokens at all, so an untouched empty vector costs nothing.
 	std::vector<tds::TdsInfo> info_messages;
 
-	//! The request was cancelled because the caller's interrupt probe said so
-	//! (ExecuteInterruptible); `success` is false.
-	bool interrupted = false;
-
 	bool HasError() const {
 		return !success;
 	}
@@ -101,21 +97,8 @@ public:
 	//! read off this: rows are routed by which statement produced them, never
 	//! by their width (spec 076 W2, review of #345).
 	using RowSetCallback = std::function<bool(size_t result_set, const std::vector<std::string> &values)>;
-	//! `interrupted`, when given, is asked about once a second while the server
-	//! has not answered; when it says yes the request is cancelled (ATTENTION)
-	//! and the result is a failure with `interrupted` set.
-	using InterruptProbe = std::function<bool()>;
 	static SimpleQueryResult ExecuteWithSetCallback(tds::TdsConnection &connection, const tds::Request &sql,
-													RowSetCallback callback, int timeout_ms = 30000,
-													const InterruptProbe *interrupted = nullptr);
-
-	//! Spec 080 PR 3d: a statement that takes as long as it takes -- a pushed
-	//! INSERT ... SELECT copying millions of rows answers nothing until its
-	//! DONE -- with no deadline, cancelled by `interrupted` (the query's
-	//! interrupt, Ctrl-C). A dead connection ends the wait through TCP
-	//! keepalive (TdsSocket::Connect).
-	static SimpleQueryResult ExecuteInterruptible(tds::TdsConnection &connection, const tds::Request &sql,
-												  const InterruptProbe &interrupted);
+													RowSetCallback callback, int timeout_ms = 30000);
 
 	// Execute a query and return single scalar value
 	static std::string ExecuteScalar(tds::TdsConnection &connection, const tds::Request &sql, int timeout_ms = 30000);

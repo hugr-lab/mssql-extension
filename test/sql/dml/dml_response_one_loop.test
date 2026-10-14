@@ -1,0 +1,233 @@
+# name: test/sql/dml/dml_response_one_loop.test
+# description: one function reads every DML statement's response (spec 080 acceptance 7) -- mssql_query_timeout bounds a shipped batch, a pushed DML has no deadline, a pushed DML's desync is reported, and a DML's INFO messages reach the log
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Before mssql::ExecuteDmlBatch the token loop had five copies:
+#   - the INSERT, UPDATE and DELETE batch loops;
+#   - INSERT ... RETURNING's parser;
+#   - MSSQLSimpleQuery, which a pushed DML went through.
+# Each DML copy hard-coded a 30 s timeout. The pushed DML's copy had no
+# mssql_test_fail_parse_after_tokens lever, so its desync handling could not
+# be tested. The batch loops threw INFO tokens away.
+#
+# An AFTER trigger that waits makes the server slow to answer on demand.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS edb (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('edb', 'IF OBJECT_ID(''dbo.edb_slow'') IS NOT NULL DROP TABLE dbo.edb_slow; CREATE TABLE dbo.edb_slow (id INT NOT NULL PRIMARY KEY, v INT NULL); INSERT INTO dbo.edb_slow VALUES (1, 0), (2, 0)');
+
+statement ok
+SELECT mssql_exec('edb', 'CREATE TRIGGER dbo.edb_slow_wait ON dbo.edb_slow AFTER INSERT, UPDATE, DELETE AS WAITFOR DELAY ''00:00:03''');
+
+statement ok
+SELECT mssql_invalidate_cache('edb');
+
+# =============================================================================
+# The shipped paths: mssql_query_timeout bounds each batch (it was 30 s, hard
+# coded, whatever the setting said). The server is cancelled with ATTENTION
+# and the statement's transaction rolled back.
+# =============================================================================
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+SET mssql_query_timeout = 1;
+
+statement error
+UPDATE edb.dbo.edb_slow SET v = 1 WHERE id = 1;
+----
+UPDATE failed: no response within mssql_query_timeout (1 s); the statement was cancelled; rolled back
+
+statement error
+DELETE FROM edb.dbo.edb_slow WHERE id = 2;
+----
+DELETE failed: no response within mssql_query_timeout (1 s); the statement was cancelled; rolled back
+
+# One row is under mssql_insert_bcp_threshold: the statement path.
+statement error
+INSERT INTO edb.dbo.edb_slow VALUES (3, 0);
+----
+INSERT failed at statement 0 (rows 0-0): no response within mssql_query_timeout (1 s); the statement was cancelled; rolled back
+
+query II
+SELECT id, v FROM edb.dbo.edb_slow ORDER BY id;
+----
+1	0
+2	0
+
+# =============================================================================
+# A pushed DML has no deadline: it answers nothing until its DONE (spec 080
+# PR 3d). The trigger's 3 s pass the 1 s timeout, and the UPDATE succeeds.
+# =============================================================================
+
+statement ok
+SET mssql_dml_pushdown = true;
+
+query II
+EXPLAIN UPDATE edb.dbo.edb_slow SET v = 2 WHERE id = 2;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*
+
+query I
+UPDATE edb.dbo.edb_slow SET v = 2 WHERE id = 2;
+----
+1
+
+statement ok
+SET mssql_query_timeout = 30;
+
+statement ok
+SELECT mssql_exec('edb', 'DROP TRIGGER dbo.edb_slow_wait');
+
+# =============================================================================
+# A pushed DML's desync: the server ran the statement, the client lost its
+# answer. The message says so, and the statement's transaction is rolled back.
+# =============================================================================
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 1;
+
+statement error
+UPDATE edb.dbo.edb_slow SET v = 5 WHERE id = 1;
+----
+TDS parse error: injected parse error (mssql_test_fail_parse_after_tokens); the server executed the statement (nothing was written
+
+statement ok
+BEGIN;
+
+statement error
+DELETE FROM edb.dbo.edb_slow WHERE id = 1;
+----
+the server executed the statement (the open transaction must be rolled back)
+
+statement ok
+ROLLBACK;
+
+statement ok
+SET mssql_test_fail_parse_after_tokens = 0;
+
+query II
+SELECT id, v FROM edb.dbo.edb_slow ORDER BY id;
+----
+1	0
+2	2
+
+# =============================================================================
+# INSERT ... RETURNING has its own reader of the OUTPUT rows, and the same
+# deadline. A trigger cannot slow it down: SQL Server refuses OUTPUT without
+# INTO on a table with an enabled trigger (error 334). A lock does it instead.
+# A second DuckDB connection holds row 1 in an open transaction, and the
+# INSERT of key 1 waits on that row.
+# =============================================================================
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+UPDATE edb.dbo.edb_slow SET v = 9 WHERE id = 1;
+
+statement ok
+SET mssql_query_timeout = 1;
+
+statement error
+INSERT INTO edb.dbo.edb_slow VALUES (1, 0) RETURNING id;
+----
+INSERT failed at statement 0 (rows 0-0): no response within mssql_query_timeout (1 s); the statement was cancelled
+
+statement ok con1
+ROLLBACK;
+
+statement ok
+SET mssql_query_timeout = 30;
+
+query II
+SELECT id, v FROM edb.dbo.edb_slow ORDER BY id;
+----
+1	0
+2	2
+
+# =============================================================================
+# A DML's INFO messages (PRINT in a trigger) reach DuckDB's log, as mssql_exec's
+# always have. The batch loops dropped them.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('edb', 'CREATE TRIGGER dbo.edb_slow_print ON dbo.edb_slow AFTER UPDATE AS PRINT ''edb trigger ran''');
+
+statement ok
+SET logging_storage = 'memory';
+
+statement ok
+SET enable_logging = true;
+
+statement ok
+SET logging_level = 'INFO';
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+UPDATE edb.dbo.edb_slow SET v = 7 WHERE id = 1;
+
+statement ok
+SET mssql_dml_pushdown = true;
+
+statement ok
+UPDATE edb.dbo.edb_slow SET v = 8 WHERE id = 2;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'INFO' AND message LIKE 'mssql: [%' AND message LIKE '%edb trigger ran%';
+----
+2
+
+query II
+SELECT id, v FROM edb.dbo.edb_slow ORDER BY id;
+----
+1	7
+2	8
+
+# =============================================================================
+# The first error the server sends is the one reported: it is the cause. The
+# batch loops reported the last.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('edb', 'DROP TRIGGER dbo.edb_slow_print');
+
+statement ok
+SELECT mssql_exec('edb', 'CREATE TRIGGER dbo.edb_slow_errors ON dbo.edb_slow AFTER UPDATE AS BEGIN RAISERROR(''edb first error'', 16, 1); RAISERROR(''edb second error'', 16, 1); END');
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement error
+UPDATE edb.dbo.edb_slow SET v = 9 WHERE id = 1;
+----
+UPDATE failed: edb first error; rolled back
+
+statement ok
+SET mssql_dml_pushdown = true;
+
+statement error
+UPDATE edb.dbo.edb_slow SET v = 9 WHERE id = 1;
+----
+SQL Server error 50000: edb first error
+
+query II
+SELECT id, v FROM edb.dbo.edb_slow ORDER BY id;
+----
+1	7
+2	8
+
+statement ok
+SELECT mssql_exec('edb', 'DROP TABLE dbo.edb_slow');

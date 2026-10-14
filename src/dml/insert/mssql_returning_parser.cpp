@@ -1,8 +1,6 @@
 #include "dml/insert/mssql_returning_parser.hpp"
-#include <chrono>
 #include "duckdb/common/exception.hpp"
 #include "tds/encoding/type_converter.hpp"
-#include "tds/tds_packet.hpp"
 
 namespace duckdb {
 
@@ -16,188 +14,39 @@ MSSQLReturningParser::MSSQLReturningParser(const MSSQLInsertTarget &target, cons
 	}
 }
 
-//===----------------------------------------------------------------------===//
-// Result Chunk Initialization
-//===----------------------------------------------------------------------===//
-
-unique_ptr<DataChunk> MSSQLReturningParser::InitializeResultChunk() {
-	auto chunk = make_uniq<DataChunk>();
-	chunk->Initialize(Allocator::DefaultAllocator(), result_types_);
-	return chunk;
+void MSSQLReturningParser::Attach(mssql::DmlBatchOptions &options) {
+	options.on_row = [this](const tds::RowData &row, const std::vector<tds::ColumnMetadata> &columns) {
+		ProcessRow(row, columns);
+	};
 }
 
-//===----------------------------------------------------------------------===//
-// Row Processing
-//===----------------------------------------------------------------------===//
-
-void MSSQLReturningParser::ProcessRow(const tds::RowData &row, const std::vector<tds::ColumnMetadata> &columns,
-									  DataChunk &chunk, idx_t row_idx) {
-	// The OUTPUT INSERTED columns should match our returning_column_ids in order
-	// Process each column from the TDS response
+void MSSQLReturningParser::ProcessRow(const tds::RowData &row, const std::vector<tds::ColumnMetadata> &columns) {
+	if (!chunk_) {
+		chunk_ = make_uniq<DataChunk>();
+		chunk_->Initialize(Allocator::DefaultAllocator(), result_types_);
+	}
+	// One INSERT statement carries at most 1000 rows (the 1000-constant cap,
+	// spec 062 W1b), so its OUTPUT fits one chunk. The old reader returned a
+	// full chunk early and left the rest of the response unread.
+	if (row_count_ >= STANDARD_VECTOR_SIZE) {
+		throw IOException("INSERT ... RETURNING: one statement returned more than %llu rows",
+						  (unsigned long long)STANDARD_VECTOR_SIZE);
+	}
+	// The OUTPUT INSERTED columns come in the order of returning_column_ids
 	for (idx_t i = 0; i < columns.size() && i < result_types_.size(); i++) {
 		bool is_null = (i < row.null_mask.size()) ? row.null_mask[i] : false;
 		const auto &value = (i < row.values.size()) ? row.values[i] : std::vector<uint8_t>{};
-
-		// Use TypeConverter to convert TDS value to DuckDB format
-		tds::encoding::TypeConverter::ConvertValue(value, is_null, columns[i], chunk.data[i], row_idx);
+		tds::encoding::TypeConverter::ConvertValue(value, is_null, columns[i], chunk_->data[i], row_count_);
 	}
+	row_count_++;
 }
 
-//===----------------------------------------------------------------------===//
-// Main Parse Method (with existing parser)
-//===----------------------------------------------------------------------===//
-
-unique_ptr<DataChunk> MSSQLReturningParser::Parse(tds::TdsConnection &connection, tds::TokenParser &parser,
-												  tds::TdsSocket &socket, int timeout_ms, int64_t fail_after_tokens) {
-	// Initialize result chunk
-	auto chunk = InitializeResultChunk();
-	row_count_ = 0;
-	error_message_.clear();
-	error_number_ = 0;
-	is_parse_error_ = false;
-
-	// Calculate deadline
-	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-
-	std::vector<tds::ColumnMetadata> columns;
-	bool done = false;
-	bool last_packet_eom = false;
-	int64_t tokens_seen = 0;
-
-	while (!done) {
-		// Check timeout
-		auto now = std::chrono::steady_clock::now();
-		if (now >= deadline) {
-			error_message_ = "Timeout waiting for OUTPUT INSERTED results";
-			connection.SendAttention();
-			connection.WaitForAttentionAck(5000);
-			return nullptr;
-		}
-
-		auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-		int recv_timeout = static_cast<int>(std::min<long long>(remaining_ms, timeout_ms));
-
-		// Try to parse tokens from existing buffer
-		tds::ParsedTokenType token;
-		while ((token = parser.TryParseNext()) != tds::ParsedTokenType::NeedMoreData) {
-			if (fail_after_tokens > 0 && ++tokens_seen >= fail_after_tokens) {
-				parser.InjectParseError("injected parse error (mssql_test_fail_parse_after_tokens)");
-				break;
-			}
-			switch (token) {
-			case tds::ParsedTokenType::ColMetadata:
-				columns = parser.GetColumnMetadata();
-				break;
-
-			case tds::ParsedTokenType::Row: {
-				const tds::RowData &row = parser.GetRow();
-
-				// Ensure we have space in the chunk
-				if (row_count_ >= STANDARD_VECTOR_SIZE) {
-					// Chunk is full - this shouldn't happen for typical INSERT batches
-					// but handle gracefully
-					chunk->SetChildCardinality(row_count_);
-					return chunk;
-				}
-
-				// Process the row
-				ProcessRow(row, columns, *chunk, row_count_);
-				row_count_++;
-				break;
-			}
-
-			case tds::ParsedTokenType::Done: {
-				const tds::DoneToken &done_token = parser.GetDone();
-				if (done_token.IsFinal()) {
-					done = true;
-					connection.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-				}
-				break;
-			}
-
-			case tds::ParsedTokenType::Error: {
-				const tds::TdsError &tds_error = parser.GetError();
-				error_number_ = tds_error.number;
-				error_message_ = tds_error.message;
-				// Continue reading to drain response
-				break;
-			}
-
-			default:
-				// Skip other tokens (Info, EnvChange, etc.)
-				break;
-			}
-		}
-
-		// A parser in Error never yields the DONE-final that ends this loop:
-		// name the desync (a SQL error already captured keeps precedence) and
-		// leave at EOM, which the drain below still reads to. Before this the
-		// loop went on to the next ReceivePacket, blocked for the whole
-		// timeout, and reported the socket rather than the parse error --
-		// with the connection left Executing (issue #344).
-		if (parser.GetState() == tds::ParserState::Error) {
-			if (error_message_.empty()) {
-				error_number_ = 0;
-				error_message_ = "TDS parse error: " + parser.GetParseError();
-				is_parse_error_ = true;
-			}
-			if (last_packet_eom) {
-				connection.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-				return nullptr;
-			}
-		}
-
-		// If we need more data and not done, read from socket
-		if (!done) {
-			tds::TdsPacket packet;
-			if (!socket.ReceivePacket(packet, recv_timeout)) {
-				error_message_ = "Failed to receive TDS packet: " + socket.GetLastError();
-				return nullptr;
-			}
-
-			last_packet_eom = packet.IsEndOfMessage();
-			// Not into a parser already in Error -- see the DML executors: from
-			// there nothing consumes, so buffer_ grows by the whole remaining
-			// response (issue #323).
-			const auto &payload = packet.GetPayload();
-			if (!payload.empty() && parser.GetState() != tds::ParserState::Error) {
-				parser.Feed(payload);
-			}
-
-			// Note: Don't call TryParseNext() here - it would consume tokens!
-			// The inner while loop at the top of the outer loop will handle parsing.
-			// EOM handling is done when we see the DONE token with final flag.
-		}
-	}
-
-	// Set final cardinality and return
-	chunk->SetChildCardinality(row_count_);
-
-	// Return nullptr if no rows (shouldn't happen for INSERT but be safe)
+unique_ptr<DataChunk> MSSQLReturningParser::TakeResult() {
 	if (row_count_ == 0) {
 		return nullptr;
 	}
-
-	return chunk;
-}
-
-//===----------------------------------------------------------------------===//
-// Parse from Fresh Connection
-//===----------------------------------------------------------------------===//
-
-unique_ptr<DataChunk> MSSQLReturningParser::ParseResponse(tds::TdsConnection &connection, int timeout_ms,
-														  int64_t fail_after_tokens) {
-	auto *socket = connection.GetSocket();
-	if (!socket) {
-		error_message_ = "Connection socket is null";
-		return nullptr;
-	}
-
-	// Create fresh parser
-	tds::TokenParser parser;
-
-	// Parse the response
-	return Parse(connection, parser, *socket, timeout_ms, fail_after_tokens);
+	chunk_->SetChildCardinality(row_count_);
+	return std::move(chunk_);
 }
 
 }  // namespace duckdb

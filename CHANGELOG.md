@@ -399,6 +399,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way. COPY TO into it is refused by DuckDB's own check on the COPY target (a
   path); `INSERT … SELECT` takes the same bulk wire.
 
+- **One function reads every DML statement's response** (spec 080
+  acceptance 7). Five paths had their own copy of the token loop: the INSERT,
+  UPDATE and DELETE batches, INSERT … RETURNING's parser, and a pushed DML
+  (through `MSSQLSimpleQuery`). They now share `mssql::ExecuteDmlBatch`. What
+  changes for a user:
+  - `mssql_query_timeout` bounds each INSERT / UPDATE / DELETE statement the
+    extension sends row by row. Until now those batches waited a fixed 30 s,
+    whatever the setting said, and `0` now means no deadline for them too.
+    - On a timeout the statement is cancelled (ATTENTION) and fails like any
+      failed statement.
+    - The error names the setting, and for an INSERT also the statement and
+      its rows.
+    - A pushed DML still has no deadline.
+  - Ctrl-C cancels such a statement within a second. Before, a batch could
+    not be interrupted while it waited for the server.
+  - A read that runs out of time is reported as a timeout, not as `Failed to
+    receive TDS packet`. A read cut short by a signal is retried, not taken
+    for a timeout.
+  - When the server sends several errors, the first is reported, because it
+    is the cause. The batches used to report the last.
+  - The INFO messages of a row-by-row INSERT, UPDATE or DELETE and of a
+    pushed DML now reach DuckDB's log, as `mssql_exec`'s already do. These
+    are PRINT, or RAISERROR of severity 10 or less, from a trigger for
+    instance. The staged and bulk paths still do not log them.
+  - A pushed DML's TDS desync says the server executed the statement.
+    `mssql_test_fail_parse_after_tokens` now reaches that path, so it can be
+    tested.
+
 - **UPDATE and DELETE through the catalog are refused on Azure Synapse**
   (spec 080): its primary keys and unique constraints are `NOT ENFORCED`, so a
   key could match rows the statement did not select. `mssql_exec()` still

@@ -5,6 +5,7 @@
 #include "dml/insert/mssql_insert_config.hpp"
 #include "dml/insert/mssql_insert_error.hpp"
 #include "dml/insert/mssql_insert_target.hpp"
+#include "dml/mssql_dml_execute.hpp"
 #include "dml/mssql_statement_connection.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -138,6 +139,12 @@ private:
 	// Execute a batch and parse OUTPUT results
 	unique_ptr<DataChunk> ExecuteBatchWithOutput(const MSSQLInsertBatch &batch,
 												 const vector<idx_t> &returning_column_ids);
+
+	// Send one batch through mssql::ExecuteDmlBatch. A failure of any kind fails
+	// the statement and throws MSSQLInsertException, naming the batch's statement
+	// index and rows. Returns the statement's row count.
+	idx_t SendBatch(tds::TdsConnection &connection, const MSSQLInsertBatch &batch,
+					const mssql::DmlBatchOptions &options, MSSQLCatalog &catalog);
 
 	// Get connection pool from catalog
 	tds::ConnectionPool &GetConnectionPool();

@@ -134,30 +134,8 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithCallback(tds::TdsConnection &conn
 		timeout_ms);
 }
 
-SimpleQueryResult MSSQLSimpleQuery::ExecuteInterruptible(tds::TdsConnection &connection, const tds::Request &sql,
-														 const InterruptProbe &interrupted) {
-	SimpleQueryResult result;
-	auto collect_result = ExecuteWithSetCallback(
-		connection, sql,
-		[&result](size_t, const std::vector<std::string> &row) {
-			result.rows.push_back(row);
-			return true;
-		},
-		0, &interrupted);
-	result.success = collect_result.success;
-	result.error_message = collect_result.error_message;
-	result.error_number = collect_result.error_number;
-	result.column_names = collect_result.column_names;
-	result.result_sets = std::move(collect_result.result_sets);
-	result.rows_affected = collect_result.rows_affected;
-	result.info_messages = std::move(collect_result.info_messages);
-	result.interrupted = collect_result.interrupted;
-	return result;
-}
-
 SimpleQueryResult MSSQLSimpleQuery::ExecuteWithSetCallback(tds::TdsConnection &connection, const tds::Request &sql,
-														   RowSetCallback callback, int timeout_ms,
-														   const InterruptProbe *interrupted) {
+														   RowSetCallback callback, int timeout_ms) {
 	SimpleQueryResult result;
 
 	SIMPLE_QUERY_DEBUG(2, "ExecuteWithCallback: starting, timeout=%dms", timeout_ms);
@@ -230,11 +208,6 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithSetCallback(tds::TdsConnection &c
 			// server-side queries issued via mssql_exec (#90/#145).
 			recv_timeout = INT_MAX;
 		}
-		if (interrupted) {
-			// Wait in slices, asking between them: a packet half-read when a
-			// slice ends stays in the socket's assembly buffer (NextPacket).
-			recv_timeout = std::min(recv_timeout, 1000);
-		}
 
 		// Read TDS packet (properly framed with 8-byte header)
 		tds::TdsPacket packet;
@@ -248,23 +221,6 @@ SimpleQueryResult MSSQLSimpleQuery::ExecuteWithSetCallback(tds::TdsConnection &c
 			// the server-side statement with ATTENTION and keep the connection reusable,
 			// instead of reporting a hard "Failed to receive TDS packet" and dropping the
 			// connection (#90/#145).
-			if (interrupted && socket->IsConnected()) {
-				if ((*interrupted)()) {
-					result.success = false;
-					result.interrupted = true;
-					result.error_message = "Interrupted";
-					SIMPLE_QUERY_DEBUG(1, "ExecuteWithCallback: interrupted, cancelling");
-					connection.SendAttention();
-					connection.WaitForAttentionAck(5000);
-					if (connection.GetState() == tds::ConnectionState::Executing) {
-						connection.TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Disconnected);
-					}
-					return result;
-				}
-				if (!has_timeout || std::chrono::steady_clock::now() < deadline) {
-					continue;  // a slice ended, not the deadline
-				}
-			}
 			if (has_timeout && socket->IsConnected()) {
 				result.success = false;
 				result.error_message = "Query timeout";

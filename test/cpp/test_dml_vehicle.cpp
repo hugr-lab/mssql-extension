@@ -37,6 +37,10 @@
 //      "nothing written" cannot pass because nothing ran yet;
 //   6. the vehicle dropped soon after submission changes nothing;
 //   7. Ctrl-C cancels a statement that has no deadline;
+//   8. Ctrl-C cancels a shipped UPDATE batch too, under mssql_query_timeout = 0
+//      (spec 080 acceptance 7: every DML response is read by
+//      mssql::ExecuteDmlBatch, in 1 s slices that ask; a batch used to wait in
+//      one poll() and could not be cancelled);
 // and after every drop the pool holds no checked-out connection.
 // sqllogictest cannot submit without reading, which is why this is C++.
 //
@@ -307,6 +311,35 @@ int main() {
 		interrupter.join();
 		Check(result->HasError() && result->GetErrorType() == ExceptionType::INTERRUPT, "the statement is interrupted");
 		Check(seconds < 15, "within seconds, not the 30 of the WAITFOR");
+	}
+	Check(RowsAt(conn, 1) == 10, "no row changed");
+	Check(Scalar(conn, "SELECT count(*) FROM mssql.dbo.dml_vehicle_gate") == 10, "the next statement runs");
+
+	std::cout << "=== Ctrl-C cancels a shipped UPDATE batch with no timeout ===" << std::endl;
+	{
+		// The server is slowed by an AFTER trigger. With mssql_query_timeout = 0
+		// the batch has no deadline, so only the interrupt can end it.
+		Check(Run(conn,
+				  "SELECT mssql_exec('mssql', 'CREATE TRIGGER dbo.dml_vehicle_gate_wait ON dbo.dml_vehicle_gate "
+				  "AFTER UPDATE AS WAITFOR DELAY ''00:00:30''')"),
+			  "trigger created");
+		Run(conn, "SET mssql_dml_pushdown = false");
+		Run(conn, "SET mssql_query_timeout = 0");
+		std::thread interrupter([&conn]() {
+			std::this_thread::sleep_for(std::chrono::seconds(2));
+			conn.Interrupt();
+		});
+		const auto started = std::chrono::steady_clock::now();
+		auto result = conn.Query("UPDATE mssql.dbo.dml_vehicle_gate SET v = v + 100");
+		const auto seconds =
+			std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count();
+		interrupter.join();
+		Check(result->HasError() && result->GetErrorType() == ExceptionType::INTERRUPT,
+			  "the batch is interrupted: " + (result->HasError() ? result->GetError() : std::string("no error")));
+		Check(seconds < 15, "within seconds, not the 30 of the trigger");
+		Run(conn, "SET mssql_query_timeout = 30");
+		Run(conn, "SET mssql_dml_pushdown = true");
+		Run(conn, "SELECT mssql_exec('mssql', 'DROP TRIGGER dbo.dml_vehicle_gate_wait')");
 	}
 	Check(RowsAt(conn, 1) == 10, "no row changed");
 	Check(Scalar(conn, "SELECT count(*) FROM mssql.dbo.dml_vehicle_gate") == 10, "the next statement runs");

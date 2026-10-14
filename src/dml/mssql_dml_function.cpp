@@ -48,6 +48,7 @@
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
 #include "dml/insert/mssql_insert_config.hpp"
+#include "dml/mssql_dml_execute.hpp"
 #include "dml/mssql_statement_connection.hpp"
 #include "duckdb/common/enums/database_modification_type.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -56,9 +57,7 @@
 #include "mssql_counters.hpp"
 #include "mssql_function_docs.hpp"
 #include "query/mssql_ddl_detect.hpp"
-#include "query/mssql_simple_query.hpp"
 #include "query/mssql_sql_params.hpp"
-#include "query/tds_info_log.hpp"
 
 namespace duckdb {
 
@@ -306,27 +305,31 @@ unique_ptr<GlobalTableFunctionState> MSSQLDmlInitGlobal(ClientContext &context, 
 		// takes -- the shipped path streams and never hit mssql_query_timeout
 		// for it. Ctrl-C cancels it (ATTENTION; the server rolls the statement
 		// back); a dead connection ends the wait through TCP keepalive (over TLS too: a read error or a closed peer
-		// marks the socket dead, #456).
-		const MSSQLSimpleQuery::InterruptProbe interrupted = [&context]() { return context.IsInterrupted(); };
-		auto result = MSSQLSimpleQuery::ExecuteInterruptible(*connection, bind_data.request, interrupted);
-		for (const auto &info : result.info_messages) {
-			LogTdsInfo(context, info);
-		}
-		if (result.interrupted) {
+		// marks the socket dead, #456). INFO tokens go to the log.
+		mssql::DmlBatchOptions options;
+		options.label = "pushed DML";
+		options.no_deadline = true;
+		const auto response = mssql::ExecuteDmlBatch(context, *connection, bind_data.request, options);
+		if (response.status == mssql::DmlBatchResponse::Status::INTERRUPTED) {
 			connection.reset();
 			statement.Fail(context, catalog);
 			throw InterruptException();
 		}
-		if (!result.success) {
+		if (!response.Succeeded()) {
 			const bool pinned = statement.InOpenTransaction();
 			connection.reset();
 			statement.Fail(context, catalog);
-			throw IOException("MSSQL %s on '%s.%s' failed: %s %s", verb, bind_data.schema_name, bind_data.table_name,
-							  result.DescribeError(),
+			// A desync is the client's: the server ran the statement, and the
+			// failure is in reading its answer (#323).
+			const char *executed = response.status == mssql::DmlBatchResponse::Status::PARSE_ERROR
+									   ? "; the server executed the statement"
+									   : "";
+			throw IOException("MSSQL %s on '%s.%s' failed: %s%s %s", verb, bind_data.schema_name, bind_data.table_name,
+							  response.DescribeError(), executed,
 							  pinned ? "(the open transaction must be rolled back)"
 									 : "(nothing was written: the statement's server transaction was rolled back)");
 		}
-		state->count = result.rows_affected;
+		state->count = static_cast<int64_t>(response.rows_affected);
 	}
 	connection.reset();
 	statement.Commit(context, catalog);

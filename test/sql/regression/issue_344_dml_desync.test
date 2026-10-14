@@ -7,9 +7,11 @@
 #   MSSQL_TESTDB_DSN - Connection string to test database
 #
 # The four DML response loops -- the INSERT batch, INSERT ... RETURNING, UPDATE,
-# DELETE -- are copies of one loop, and the fifth copy (MSSQLSimpleQuery) got
-# the #323 fixes alone. A parser that desynced mid-response was fed the whole
-# remaining response for nothing, and then reported SUCCESS: the EOM branch
+# DELETE -- were copies of one loop, and the fifth copy (MSSQLSimpleQuery) got
+# the #323 fixes alone. (Since spec 080 acceptance 7 they are one function,
+# mssql::ExecuteDmlBatch; this file still covers each path through it.) A
+# parser that desynced mid-response was fed the whole remaining response for
+# nothing, and then reported SUCCESS: the EOM branch
 # forced `done` and nothing checked the parser's state. The RETURNING copy did
 # worse: its loop has no EOM exit at all, so it blocked on the next packet for
 # the full 30 s and then blamed the socket.

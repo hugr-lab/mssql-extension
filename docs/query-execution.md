@@ -184,7 +184,7 @@ MSSQLPhysicalInsert (PhysicalOperator)
   │     │     │   OUTPUT INSERTED.[col1], ...  -- if RETURNING
   │     │     │   VALUES (lit1, lit2), (lit3, lit4);
   │     │     └─ ExecuteBatch(sql) via TDS layer
-  │     └─ With RETURNING: MSSQLReturningParser parses OUTPUT results
+  │     └─ With RETURNING: mssql::ExecuteDmlBatch hands OUTPUT rows to MSSQLReturningParser
   ├─ Finalize() → Flush remaining batch
   └─ GetData() → Return row count or RETURNING chunks
 ```
@@ -197,7 +197,7 @@ MSSQLPhysicalInsert (PhysicalOperator)
 
 ### INSERT with RETURNING (OUTPUT INSERTED)
 
-When `INSERT ... RETURNING` is used, the generated SQL includes an `OUTPUT INSERTED` clause. The response is parsed by `MSSQLReturningParser` which extracts the returned rows using `TypeConverter`.
+When `INSERT ... RETURNING` is used, the generated SQL includes an `OUTPUT INSERTED` clause. The response is read by `mssql::ExecuteDmlBatch` (`dml/mssql_dml_execute.hpp`), the one function the row-by-row DML batches and the pushed DML read their response through (spec 080 acceptance 7); it hands each ROW token to `MSSQLReturningParser`, which converts the values with `TypeConverter`.
 
 ### INSERT Configuration
 

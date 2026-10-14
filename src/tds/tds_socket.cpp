@@ -700,8 +700,8 @@ ssize_t TdsSocket::Receive(uint8_t *buffer, size_t max_length, int timeout_ms) {
 		if (received < 0) {
 			// Every TLS read error is fatal: after SSL_ERROR_SYSCALL / SSL_ERROR_SSL
 			// OpenSSL allows no further I/O on the connection. Left "connected", a
-			// caller that waits in slices (ExecuteInterruptible: a pushed DML has
-			// no deadline) read again at once, forever (issue #456).
+			// caller that waits in slices (mssql::ExecuteDmlBatch: a pushed DML
+			// has no deadline) read again at once, forever (issue #456).
 			last_error_ = "TLS receive failed: " + tls_context_->GetLastError();
 			connected_ = false;
 			return -1;

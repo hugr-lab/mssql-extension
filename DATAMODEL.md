@@ -1239,6 +1239,34 @@ Two lifetime rules that are easy to get wrong:
   not `catalog`, which may already be gone (issue #178) — guarded by `table_created`
   and `cleanup_attempted`.
 
+### Reading a DML statement's response (spec 080, acceptance 7)
+
+One function, `mssql::ExecuteDmlBatch` (`src/dml/mssql_dml_execute.cpp`), reads the
+response to every statement a write sends row by row: an INSERT, UPDATE or DELETE
+batch, and an INSERT … OUTPUT. The pushed DML (`mssql_dml`) goes through it too.
+Before it, the token loop was copied into each of those paths, and a fix reached
+one copy at a time. Its invariants:
+
+- **It reads to the end of the message** after a server error, a desync, or a
+  timeout or interrupt once ATTENTION has been sent. The connection is then Idle
+  for the next statement, or Disconnected when the ATTENTION was not
+  acknowledged. A connection that broke is Disconnected, with nothing left to
+  read.
+- **A failed statement is a status, not an exception.** The status says what
+  failed: a server error, a desync (the server ran the statement), the send, the
+  read, the timeout or an interrupt. The caller fails its statement's connection
+  and words the message. It throws only for a fault on the client side, such as
+  an OUTPUT value that does not convert or a malformed packet header, and then the
+  caller's Fail closes the connection it leaves Executing.
+- **The deadline is `mssql_query_timeout`, per statement.** The pushed DML has
+  none. Every wait goes in 1 s slices that ask `ClientContext::IsInterrupted`, so
+  Ctrl-C cancels any of these statements. A read that a signal cuts short is
+  retried, not taken for the deadline.
+- **The first ERROR token is the cause**, and INFO tokens go to DuckDB's log.
+
+The staged path's JOIN statement and the metadata and DDL statements still go
+through `MSSQLSimpleQuery`.
+
 ---
 
 ## Per-spec map
