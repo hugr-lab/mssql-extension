@@ -65,7 +65,8 @@ struct FilterEncoderResult {
  * whose references are to the target table and to the staged source. Set on
  * ExpressionEncodeContext::resolver, it answers every BoundColumnRefExpression
  * in place of column_ids / column_names / mssql_columns. Such a context
- * leaves column_ids empty and sets no PK info, so no reference is a rowid.
+ * leaves column_ids empty and sets no PK info, so no reference is a rowid
+ * (asserted in FilterEncoder::EncodeExpression).
  *
  * Resolve is asked several times for one reference (the peer of a constant,
  * the #426 checks, the rendering) and for references in expressions that end
