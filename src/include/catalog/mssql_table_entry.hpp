@@ -21,17 +21,21 @@ class MSSQLSchemaEntry;
 class MSSQLCatalog;
 
 //! Spec 060: does this catalog report MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) for
-//! its string columns, or a bare VARCHAR? Read from the global setting rather
-//! than threaded through the metadata cache. Entries are cached, so a change
-//! applies to entries built afterwards — mssql_invalidate_cache() to apply it
-//! to the ones already loaded.
+//! its string columns, or a bare VARCHAR? The catalog's `native_types` ATTACH
+//! option if it has one, else the global `mssql_catalog_native_types` setting
+//! -- read when asked, not threaded through the metadata cache. Entries are
+//! cached, so a change applies to entries built afterwards:
+//! mssql_invalidate_cache() applies it to the ones already loaded.
 //!
-//! Every place that hands DuckDB a type for a table column must agree with
-//! this, or the two disagree behind DuckDB's back: the binder resolves
-//! RETURNING against the ColumnDefinition types built here, so an INSERT whose
-//! physical operator declared the plain type would hand a VARCHAR chunk to a
-//! plan expecting MSSQL_NVARCHAR. That is why MSSQLCatalog::PlanInsert calls
-//! this too, and not only MakeTableInfo / GetScanFunction.
+//! For BUILDING a table entry (its constructor, through MakeColumnList) and for
+//! a raw mssql_scan, which has no entry -- nothing else. A table entry fixes its
+//! column types when it is built, and every consumer of a cached entry's column
+//! types -- its scan's types, an INSERT's, the remote-pushdown vehicle's -- takes
+//! them from the entry (GetColumns()), never from this. Re-reading the setting
+//! there is issue #415: after a SET, the plan's types and the entry's disagree
+//! behind DuckDB's back (an INSERT ... RETURNING then fails DuckDB's own
+//! `other.GetType() == GetType()` on a debug build), which #467 fixed by
+//! removing exactly those calls.
 bool MSSQLReportsNativeTypes(Catalog &catalog);
 
 //===----------------------------------------------------------------------===//
