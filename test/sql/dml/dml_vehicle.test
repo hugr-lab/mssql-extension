@@ -329,9 +329,9 @@ DETACH dv2;
 
 # the arguments the rewriter always passes
 statement error
-SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 0', kind := 'merge', target_schema := 'dbo', target_table := 'dv_t');
+SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 0', kind := 'upsert', target_schema := 'dbo', target_table := 'dv_t');
 ----
-kind := must be 'update', 'delete' or 'insert'
+kind := must be 'update', 'delete', 'insert' or 'merge'
 
 statement error
 SELECT * FROM mssql_dml('dv', 'UPDATE [dbo].[dv_t] SET [v] = 0', kind := 'update');

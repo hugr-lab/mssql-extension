@@ -6,7 +6,7 @@
 #   mssql_insert_batch_size - Maximum rows per INSERT statement (default: 2000)
 #   mssql_insert_max_rows_per_statement - Hard cap on rows per statement (default: 2000)
 #   mssql_insert_max_sql_bytes - Maximum SQL statement size (default: 8MB)
-#   mssql_insert_use_returning_output - Use OUTPUT INSERTED for RETURNING (default: true)
+#   mssql_insert_use_returning_output - deprecated, no effect (review of #471); still SET-able
 
 require mssql
 

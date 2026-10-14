@@ -16,7 +16,7 @@ sidebar_position: 1
 | `mssql_idle_timeout`       | BIGINT  | 300     | ≥0    | Idle connection timeout (seconds, 0=none)|
 | `mssql_min_connections`    | BIGINT  | 0       | ≥0    | Connections opened at ATTACH — their logins in parallel, so N cost about one — and kept open while idle. Also the `min_connections` ATTACH option. Not opened under `lazy_validation`. |
 | `mssql_acquire_timeout`    | BIGINT  | 30      | ≥0    | How long a query waits for a pooled connection to be **released** when the pool is at its limit. Not how long a failed connection takes to report: a connection the pool cannot create — wrong password, expired Azure AD token, refused dial — fails at once with the reason (`could not create a connection: Login failed for user 'sa'.`) when nothing is active, and with others active the pool keeps waiting for a release but retries creation on a backoff. |
-| `mssql_query_timeout`      | BIGINT  | 30      | ≥0    | Query execution timeout (seconds, 0=infinite). Not applied to an UPDATE / DELETE / INSERT … SELECT sent to the server whole: it waits as long as the statement takes and is cancelled with the query (Ctrl-C) |
+| `mssql_query_timeout`      | BIGINT  | 30      | ≥0    | Query execution timeout (seconds, 0=infinite): a scan, `mssql_exec`, and each INSERT / UPDATE / DELETE statement the extension sends row by row (until spec 080 those waited a fixed 30 s whatever this said, and a timed-out one is cancelled and fails like any failed statement). Not applied to an UPDATE / DELETE / INSERT … SELECT sent to the server whole: it waits as long as the statement takes and is cancelled with the query (Ctrl-C) |
 | `mssql_metadata_timeout`   | BIGINT  | 300     | ≥0    | Metadata query timeout (seconds, 0=no timeout) |
 | `mssql_catalog_cache_ttl`  | BIGINT  | 0       | ≥0    | Metadata cache TTL (seconds, 0=manual)   |
 | `mssql_exec_invalidate_cache` | BOOLEAN | false | true/false | Auto-invalidate the catalog cache after DDL run via `mssql_exec()`. Default `false` (like the Postgres extension's `postgres_execute`): invalidate manually with `mssql_invalidate_cache()` after schema-changing DDL. Set `true` to auto-invalidate. |
@@ -95,7 +95,7 @@ The `order_pushdown` ATTACH option provides per-database control. See [ORDER BY 
 | `mssql_insert_batch_size`          | BIGINT  | 1000     | ≥1     | Rows per INSERT statement. Under it a cap of 1000 constants per statement always applies (`1000 / columns` rows), so SQL Server auto-parameterises every statement into one cached plan per shape |
 | `mssql_insert_max_rows_per_statement` | BIGINT | 1000   | ≥1     | Hard cap on rows per INSERT           |
 | `mssql_insert_max_sql_bytes`       | BIGINT  | 8388608  | ≥1024  | Max SQL statement size (8MB)          |
-| `mssql_insert_use_returning_output`| BOOLEAN | true     | -      | Use OUTPUT INSERTED for RETURNING     |
+| `mssql_insert_use_returning_output`| BOOLEAN | true     | -      | Deprecated, no effect; removed in the next release (an `INSERT … RETURNING` always uses OUTPUT INSERTED, see [INSERT with RETURNING](../writing/dml.md#insert-with-returning)) |
 | `mssql_insert_use_bcp`             | BOOLEAN | true     | -      | Load an INSERT through the BCP protocol above `mssql_insert_bcp_threshold` rows, with parallel writers; in autocommit the INSERT commits on its own when it finishes. `RETURNING` and an explicit identity column always use statements. `false`: statements only, and in autocommit the INSERT joins the statement's DuckDB transaction -- committed or rolled back with it (issue #451) |
 | `mssql_insert_bcp_threshold`       | BIGINT  | 1000     | ≥1     | Rows up to which an INSERT is sent as statements; above it the bulk path. Counted as the rows arrive, not estimated |
 
@@ -109,7 +109,7 @@ started it. See [INSERT](../writing/dml.md#two-paths-statements-and-bcp).
 | ---------------------------------- | ------- | -------- | ------ | ------------------------------------- |
 | `mssql_dml_batch_size`             | BIGINT  | 500      | ≥1     | Rows per UPDATE/DELETE batch          |
 | `mssql_dml_max_parameters`         | BIGINT  | 2000     | ≥1     | Max parameters per statement (~2100 limit) |
-| `mssql_dml_pushdown`               | BOOLEAN | true     | —      | Send an UPDATE/DELETE the remote-pushdown rewriter can write in T-SQL to SQL Server as one statement; `false` keeps every UPDATE/DELETE on the row paths. Read per statement |
+| `mssql_dml_pushdown`               | BOOLEAN | true     | —      | Send an UPDATE / DELETE / INSERT … SELECT / MERGE the remote-pushdown rewriter can write in T-SQL to SQL Server as one statement; `false` keeps every UPDATE / DELETE / INSERT … SELECT on the row paths and every MERGE on DuckDB's native one. Read per statement |
 | `mssql_dml_stage_threshold`        | BIGINT  | 1000     | ≥0     | Rows up to which an UPDATE/DELETE on a keyed table goes as VALUES statements; past it, through a `#stage` table and one statement (0 = always stage) |
 | `mssql_dml_use_prepared`           | BOOLEAN | true     | -      | Deprecated, no effect; removed in the next release |
 

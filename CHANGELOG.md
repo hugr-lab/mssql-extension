@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MERGE INTO within one database runs on SQL Server as one statement**
+  (spec 080 PR 4a). The remote-pushdown rewriter hands over a MERGE whose
+  source is in the same catalog whole: `MERGE [s].[t] AS [r1] USING … ON … WHEN
+  …;` through `mssql_dml` (`kind := 'merge'`). The server matches the rows,
+  and no key is needed.
+  - The source can be a table, `USING (columns)`, or a query over the
+    database's tables.
+  - The WHEN clauses must fit T-SQL's shape: two WHEN MATCHED (UPDATE and
+    DELETE, the first conditional), one WHEN NOT MATCHED INSERT, two WHEN
+    NOT MATCHED BY SOURCE (UPDATE and DELETE, the first conditional). A last
+    DO NOTHING is dropped.
+  - Anything else keeps DuckDB's native MERGE: more clauses, ERROR,
+    `UPDATE SET *` / `INSERT *`, an identity column in the INSERT,
+    RETURNING, or a source elsewhere.
+
 - **INSERT … SELECT within one database runs on SQL Server as one statement**
   (spec 080 PR 3d), through the same `mssql_dml` vehicle as a pushed UPDATE /
   DELETE. No row crosses the wire, and a value is copied by the server as it
@@ -399,6 +414,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way. COPY TO into it is refused by DuckDB's own check on the COPY target (a
   path); `INSERT … SELECT` takes the same bulk wire.
 
+- **One function reads every DML statement's response** (spec 080
+  acceptance 7). Five paths had their own copy of the token loop: the INSERT,
+  UPDATE and DELETE batches, INSERT … RETURNING's parser, and a pushed DML
+  (through `MSSQLSimpleQuery`). They now share `mssql::ExecuteDmlBatch`. What
+  changes for a user:
+  - `mssql_query_timeout` bounds each INSERT / UPDATE / DELETE statement the
+    extension sends row by row. Until now those batches waited a fixed 30 s,
+    whatever the setting said, and `0` now means no deadline for them too.
+    - On a timeout the statement is cancelled (ATTENTION) and fails like any
+      failed statement.
+    - The error names the setting, and for an INSERT also the statement and
+      its rows.
+    - A pushed DML still has no deadline.
+  - Ctrl-C cancels such a statement within a second. Before, a batch could
+    not be interrupted while it waited for the server.
+  - A read that runs out of time is reported as a timeout, not as `Failed to
+    receive TDS packet`. A read cut short by a signal is retried, not taken
+    for a timeout.
+  - When the server sends several errors, the first is reported, because it
+    is the cause. The batches used to report the last.
+  - The INFO messages of a row-by-row INSERT, UPDATE or DELETE and of a
+    pushed DML now reach DuckDB's log, as `mssql_exec`'s already do. These
+    are PRINT, or RAISERROR of severity 10 or less, from a trigger for
+    instance. The staged and bulk paths still do not log them.
+  - A pushed DML's TDS desync says the server executed the statement.
+    `mssql_test_fail_parse_after_tokens` now reaches that path, so it can be
+    tested.
+
 - **UPDATE and DELETE through the catalog are refused on Azure Synapse**
   (spec 080): its primary keys and unique constraints are `NOT ENFORCED`, so a
   key could match rows the statement did not select. `mssql_exec()` still
@@ -413,6 +456,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing. It stays registered, as a documented no-op, for one more release,
   so a `SET` of it in a `.duckdbrc` does not throw; it is removed in the
   release after.
+
+- **`mssql_insert_use_returning_output` is deprecated** (review of #471), for
+  the same reason: nothing read it, and an `INSERT … RETURNING` always uses
+  OUTPUT. It stays a documented no-op for one more release.
 
 - **Metadata queries compute a table's row count once, not once per column**
   (spec 084). Every query that returned columns carried
@@ -471,6 +518,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which used to be reserved up front.
 
 ### Fixed
+
+- **`INSERT … RETURNING` failed on a table with an enabled trigger** (#471),
+  including through a view over one, with SQL Server error 334: "cannot have
+  any enabled triggers if the statement contains an OUTPUT clause without
+  INTO clause". The statement path sends a bare `OUTPUT INSERTED.…`.
+  - It still does: on a table with no trigger that is the cheaper form
+    (measured on 10000 rows: 0.09 s, against 1.2 s with a session table per
+    batch).
+  - When SQL Server refuses it with 334, a compile error that ran nothing,
+    the batch is rebuilt and sent again: it creates `#mssql_returning_<uuid>`,
+    fills it with `OUTPUT … INTO`, reads it and drops it, in one request. The
+    rest of the statement's batches go the same way.
+  - The table is typed by the same expressions as UPDATE / DELETE …
+    RETURNING's. `rowversion` keeps its 8 bytes. A `char(n)` is held as a
+    trimmed NVARCHAR, so wide `char` columns stay under the 8060-byte row.
+    The IDENTITY property is not copied.
+  - A result set the trigger returns of its own is not taken for RETURNING
+    rows.
+  - RETURNING shows each row as the INSERT wrote it, before an AFTER trigger
+    changed it.
+  - Fabric and Synapse keep the bare OUTPUT, so the 334 still reaches the
+    user there.
 
 - **A filter on a `datetime`, `time(7)` or `datetimeoffset(7)` column missed
   rows read from it** (#426). A

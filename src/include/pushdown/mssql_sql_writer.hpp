@@ -146,6 +146,9 @@ struct SQLWriterOptions {
 	//! Azure SQL); without it (Fabric) a pushed UPDATE / DELETE takes the
 	//! single-table form, and one with FROM / USING is not pushed.
 	bool dml_from_join = true;
+	//! Spec 080 D0 / PR 4a: the platform has T-SQL MERGE (DmlCapabilities::merge);
+	//! without it a MERGE is not pushed and keeps DuckDB's native path.
+	bool merge = true;
 	//! The session's default_order / default_null_order, resolved.
 	OrderType default_order = OrderType::ASCENDING;
 	OrderByNullType default_null_order_asc = OrderByNullType::NULLS_LAST;

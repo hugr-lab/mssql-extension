@@ -223,6 +223,7 @@ set(EXTENSION_SOURCES
     src/dml/insert/mssql_insert_statement.cpp
     src/dml/insert/mssql_batch_builder.cpp
     src/dml/mssql_statement_connection.cpp
+    src/dml/mssql_dml_execute.cpp
     src/dml/insert/mssql_insert_executor.cpp
     src/dml/insert/mssql_physical_insert.cpp
     src/dml/insert/mssql_returning_parser.cpp

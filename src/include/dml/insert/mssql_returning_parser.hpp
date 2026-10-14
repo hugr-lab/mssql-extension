@@ -1,91 +1,57 @@
 #pragma once
 
-#include <memory>
 #include <vector>
 #include "dml/insert/mssql_insert_target.hpp"
+#include "dml/mssql_dml_execute.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "tds/tds_column_metadata.hpp"
-#include "tds/tds_connection.hpp"
 #include "tds/tds_token_parser.hpp"
 
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
-// MSSQLReturningParser - Parses OUTPUT INSERTED results into DuckDB DataChunk
+// MSSQLReturningParser - Collects the RETURNING rows of an INSERT batch into a
+// DuckDB DataChunk
 //
-// This class handles the TDS response from an INSERT ... OUTPUT INSERTED query
-// and converts the result rows into a DuckDB DataChunk for the RETURNING clause.
-//
-// The parser:
-// 1. Reads TDS packets from the connection
-// 2. Parses COLMETADATA and ROW tokens
-// 3. Converts values using TypeConverter
-// 4. Fills a DataChunk with the results
+// mssql::ExecuteDmlBatch reads the response and hands this the result sets
+// (spec 080 acceptance 7: it used to read the socket itself, with a copy of
+// the DML token loop of its own). Only the batch's LAST result set holds the
+// RETURNING rows:
+// - the read of the OUTPUT ... INTO table on SQL Server (issue #471), which
+//   comes after the INSERT; the DROP after it sends no rows;
+// - the bare OUTPUT elsewhere, the only set there, since an enabled trigger
+//   refuses that form (334).
+// A trigger may send result sets of its own before it ('disallow results from
+// triggers' defaults to 0). So the rows are kept as they arrive and decoded
+// only when the response is complete.
 //
 // Usage:
-//   MSSQLReturningParser parser(target, returning_column_ids);
-//   auto chunk = parser.Parse(connection, socket);
+//   MSSQLReturningParser output(target, returning_column_ids);
+//   mssql::DmlBatchOptions options;
+//   output.Attach(options);
+//   ... mssql::ExecuteDmlBatch(context, connection, sql, options) ...
+//   auto chunk = output.TakeResult();
 //===----------------------------------------------------------------------===//
 
 class MSSQLReturningParser {
 public:
-	// Constructor
 	// @param target Insert target with column metadata
 	// @param returning_column_ids Column indices to return (maps to OUTPUT INSERTED columns)
 	MSSQLReturningParser(const MSSQLInsertTarget &target, const vector<idx_t> &returning_column_ids);
 
-	//===----------------------------------------------------------------------===//
-	// Parsing
-	//===----------------------------------------------------------------------===//
+	//! Route the result sets of the statement `options` runs into this parser.
+	//! The parser must outlive that call.
+	void Attach(mssql::DmlBatchOptions &options);
 
-	// Parse TDS response stream into DataChunk
-	// @param connection TDS connection (for state management)
-	// @param parser TokenParser with buffered data (may have partial data)
-	// @param socket TDS socket for reading more data
-	// @param timeout_ms Read timeout in milliseconds
-	// @return DataChunk containing OUTPUT INSERTED results, or nullptr if empty
-	// @param fail_after_tokens TEST ONLY (mssql_test_fail_parse_after_tokens): desync after this many tokens
-	unique_ptr<DataChunk> Parse(tds::TdsConnection &connection, tds::TokenParser &parser, tds::TdsSocket &socket,
-								int timeout_ms = 30000, int64_t fail_after_tokens = 0);
-
-	// Parse from a fresh connection (sends no query, just reads response)
-	// Use this after ExecuteBatch() has been called
-	// @param connection TDS connection with pending response
-	// @param timeout_ms Read timeout in milliseconds
-	// @return DataChunk containing OUTPUT INSERTED results, or nullptr if empty
-	unique_ptr<DataChunk> ParseResponse(tds::TdsConnection &connection, int timeout_ms = 30000,
-										int64_t fail_after_tokens = 0);
-
-	//===----------------------------------------------------------------------===//
-	// Result Information
-	//===----------------------------------------------------------------------===//
-
-	// Get number of rows parsed
+	//! Rows in the last result set received
 	idx_t GetRowCount() const {
-		return row_count_;
+		return rows_.size();
 	}
 
-	// Check if parsing encountered errors
-	bool HasError() const {
-		return !error_message_.empty();
-	}
-
-	// Get error message (if any)
-	const string &GetErrorMessage() const {
-		return error_message_;
-	}
-
-	// Get SQL Server error number (if any)
-	uint32_t GetErrorNumber() const {
-		return error_number_;
-	}
-	//! The error is a TDS desync (issue #344): the server ran the statement and
-	//! the failure is in reading its answer. False for a SQL error, a timeout
-	//! or a dropped socket, where that cannot be claimed.
-	bool IsParseError() const {
-		return is_parse_error_;
-	}
+	//! The rows of the last result set, decoded, or nullptr when there were
+	//! none. Throws when that set is not the RETURNING list's shape.
+	unique_ptr<DataChunk> TakeResult();
 
 	// Get the DuckDB types for the result columns
 	const vector<LogicalType> &GetResultTypes() const {
@@ -93,13 +59,6 @@ public:
 	}
 
 private:
-	// Initialize result chunk with proper types
-	unique_ptr<DataChunk> InitializeResultChunk();
-
-	// Process a single row from parser into the chunk
-	void ProcessRow(const tds::RowData &row, const std::vector<tds::ColumnMetadata> &columns, DataChunk &chunk,
-					idx_t row_idx);
-
 	// Target metadata
 	const MSSQLInsertTarget &target_;
 
@@ -109,11 +68,9 @@ private:
 	// Result types (derived from returning columns)
 	vector<LogicalType> result_types_;
 
-	// Parsing state
-	idx_t row_count_ = 0;
-	string error_message_;
-	uint32_t error_number_ = 0;
-	bool is_parse_error_ = false;
+	// The last result set received: its columns and its rows, undecoded
+	std::vector<tds::ColumnMetadata> columns_;
+	std::vector<tds::RowData> rows_;
 };
 
 }  // namespace duckdb

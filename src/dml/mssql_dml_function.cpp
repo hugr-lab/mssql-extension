@@ -48,6 +48,7 @@
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
 #include "dml/insert/mssql_insert_config.hpp"
+#include "dml/mssql_dml_execute.hpp"
 #include "dml/mssql_statement_connection.hpp"
 #include "duckdb/common/enums/database_modification_type.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -56,9 +57,7 @@
 #include "mssql_counters.hpp"
 #include "mssql_function_docs.hpp"
 #include "query/mssql_ddl_detect.hpp"
-#include "query/mssql_simple_query.hpp"
 #include "query/mssql_sql_params.hpp"
-#include "query/tds_info_log.hpp"
 
 namespace duckdb {
 
@@ -94,7 +93,7 @@ void CountDml(DmlPath path) {
 
 namespace {
 
-enum class DmlKind : uint8_t { UPDATE, DELETE, INSERT };
+enum class DmlKind : uint8_t { UPDATE, DELETE, INSERT, MERGE };
 
 struct MSSQLDmlBindData : public TableFunctionData {
 	string context_name;
@@ -152,6 +151,8 @@ const char *VerbOf(DmlKind kind) {
 		return "UPDATE";
 	case DmlKind::DELETE:
 		return "DELETE";
+	case DmlKind::MERGE:
+		return "MERGE";
 	default:
 		return "INSERT";
 	}
@@ -198,8 +199,12 @@ unique_ptr<FunctionData> MSSQLDmlBind(ClientContext &context, TableFunctionBindI
 	} else if (kind == "insert") {
 		bind_data->kind = DmlKind::INSERT;
 		bind_data->join_statement_transaction = !LoadInsertConfig(context).use_bcp;
+	} else if (kind == "merge") {
+		// Spec 080 PR 4a. Joins the statement's DuckDB transaction, as an UPDATE.
+		bind_data->kind = DmlKind::MERGE;
 	} else {
-		throw InvalidInputException("mssql_dml: kind := must be 'update', 'delete' or 'insert', got '%s'", kind);
+		throw InvalidInputException("mssql_dml: kind := must be 'update', 'delete', 'insert' or 'merge', got '%s'",
+									kind);
 	}
 	auto identity = input.named_parameters.find("identity_insert");
 	bind_data->identity_insert =
@@ -212,7 +217,7 @@ unique_ptr<FunctionData> MSSQLDmlBind(ClientContext &context, TableFunctionBindI
 
 	if (mssql::SqlMayChangeSchema(bind_data->statement)) {
 		throw InvalidInputException(
-			"mssql_dml runs an UPDATE, DELETE or INSERT; use mssql_exec() for a statement that may "
+			"mssql_dml runs an UPDATE, DELETE, INSERT or MERGE; use mssql_exec() for a statement that may "
 			"change the schema");
 	}
 
@@ -227,10 +232,15 @@ unique_ptr<FunctionData> MSSQLDmlBind(ClientContext &context, TableFunctionBindI
 		throw NotImplementedException("mssql_dml: cannot be bound here (no binder to register the write with)");
 	}
 	auto &properties = input.binder->GetStatementProperties();
-	properties.RegisterDBModify(catalog, context,
-								bind_data->kind == DmlKind::UPDATE	 ? DatabaseModificationType::UPDATE_DATA
-								: bind_data->kind == DmlKind::DELETE ? DatabaseModificationType::DELETE_DATA
-																	 : DatabaseModificationType::INSERT_DATA);
+	// A MERGE's actions are not known here: it may insert, update and delete.
+	properties.RegisterDBModify(
+		catalog, context,
+		bind_data->kind == DmlKind::UPDATE	 ? DatabaseModificationType(DatabaseModificationType::UPDATE_DATA)
+		: bind_data->kind == DmlKind::DELETE ? DatabaseModificationType(DatabaseModificationType::DELETE_DATA)
+		: bind_data->kind == DmlKind::INSERT
+			? DatabaseModificationType(DatabaseModificationType::INSERT_DATA)
+			: DatabaseModificationType(DatabaseModificationType::INSERT_DATA | DatabaseModificationType::UPDATE_DATA |
+									   DatabaseModificationType::DELETE_DATA));
 
 	if (input.inputs.size() >= 3) {
 		string declarations_override;
@@ -306,31 +316,41 @@ unique_ptr<GlobalTableFunctionState> MSSQLDmlInitGlobal(ClientContext &context, 
 		// takes -- the shipped path streams and never hit mssql_query_timeout
 		// for it. Ctrl-C cancels it (ATTENTION; the server rolls the statement
 		// back); a dead connection ends the wait through TCP keepalive (over TLS too: a read error or a closed peer
-		// marks the socket dead, #456).
-		const MSSQLSimpleQuery::InterruptProbe interrupted = [&context]() { return context.IsInterrupted(); };
-		auto result = MSSQLSimpleQuery::ExecuteInterruptible(*connection, bind_data.request, interrupted);
-		for (const auto &info : result.info_messages) {
-			LogTdsInfo(context, info);
-		}
-		if (result.interrupted) {
+		// marks the socket dead, #456). INFO tokens go to the log.
+		mssql::DmlBatchOptions options;
+		options.label = "pushed DML";
+		options.no_deadline = true;
+		const auto response = mssql::ExecuteDmlBatch(context, *connection, bind_data.request, options);
+		if (response.status == mssql::DmlBatchResponse::Status::INTERRUPTED) {
 			connection.reset();
 			statement.Fail(context, catalog);
 			throw InterruptException();
 		}
-		if (!result.success) {
+		if (!response.Succeeded()) {
 			const bool pinned = statement.InOpenTransaction();
 			connection.reset();
 			statement.Fail(context, catalog);
-			throw IOException("MSSQL %s on '%s.%s' failed: %s %s", verb, bind_data.schema_name, bind_data.table_name,
-							  result.DescribeError(),
+			// A desync is the client's: the server ran the statement, and the
+			// failure is in reading its answer (#323).
+			const char *executed = response.status == mssql::DmlBatchResponse::Status::PARSE_ERROR
+									   ? "; the server executed the statement"
+									   : "";
+			throw IOException("MSSQL %s on '%s.%s' failed: %s%s %s", verb, bind_data.schema_name, bind_data.table_name,
+							  response.DescribeError(), executed,
 							  pinned ? "(the open transaction must be rolled back)"
 									 : "(nothing was written: the statement's server transaction was rolled back)");
 		}
-		state->count = result.rows_affected;
+		state->count = static_cast<int64_t>(response.rows_affected);
 	}
 	connection.reset();
 	statement.Commit(context, catalog);
 	mssql::CountDml(mssql::DmlPath::PUSHED);
+	if (bind_data.kind == DmlKind::MERGE && context.transaction.IsAutoCommit() && state->count > 0) {
+		// A MERGE's count mixes its inserted, updated and deleted rows, so the
+		// cached row count cannot be adjusted by it: it is dropped, and the
+		// planner's next lookup reads a fresh one.
+		catalog.GetStatisticsProvider().InvalidateTable(bind_data.schema_name, bind_data.table_name);
+	}
 	if (deleted_from) {
 		deleted_from->NoteRowsDeleted(static_cast<idx_t>(state->count));
 	}
@@ -395,9 +415,9 @@ void RegisterMSSQLDmlFunction(ExtensionLoader &loader) {
 	mssql::RegisterDocumentedFunction(
 		loader, std::move(set),
 		{{},
-		 "Internal: the vehicle a pushed UPDATE / DELETE / INSERT ... SELECT runs through (spec 080). Runs the T-SQL "
-		 "statement once on "
-		 "the attached database -- atomically in autocommit, on the transaction's connection inside one -- and "
+		 "Internal: the vehicle a pushed UPDATE / DELETE / INSERT ... SELECT / MERGE runs through (spec 080). Runs the "
+		 "T-SQL statement once on the attached database -- atomically in autocommit, on the transaction's connection "
+		 "inside one -- and "
 		 "returns its row count as Count. The remote-pushdown rewriter's target, not an API: its arguments carry no "
 		 "compatibility promise.",
 		 {"SELECT * FROM mssql_dml('db', 'UPDATE [dbo].[t] SET [v] = 1 WHERE [id] = @p1', {'p1': 5}, '@p1 int', "

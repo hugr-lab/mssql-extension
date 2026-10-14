@@ -2,8 +2,9 @@
 // seconds -- it does not spin.
 //
 // A pushed statement (mssql_dml, spec 080 PR 3b-3d) waits with no deadline:
-// MSSQLSimpleQuery::ExecuteInterruptible reads in 1 s slices and goes round
-// again after a read that ended while the socket still says it is connected.
+// it reads in 1 s slices (mssql::ExecuteDmlBatch since spec 080 acceptance 7,
+// MSSQLSimpleQuery::ExecuteInterruptible before) and goes round again after a
+// read that ended while the socket still says it is connected.
 // Under TLS (the default) a closed peer came back from TlsImpl::Receive as 0,
 // like a timeout, and a TLS read error left the socket "connected", so a
 // connection that died -- a server restart, a KILL, a failover, a network cut

@@ -40,6 +40,11 @@ struct MSSQLInsertBatch {
 	// Generated SQL statement
 	string sql_statement;
 
+	// The rows' literals, kept for a RETURNING batch in the bare OUTPUT form on
+	// a server with OUTPUT ... INTO: refused there (334) beside an enabled
+	// trigger, the batch is rebuilt in that form (issue #471).
+	vector<vector<string>> row_literals;
+
 	// Size of SQL statement in bytes
 	idx_t sql_bytes;
 

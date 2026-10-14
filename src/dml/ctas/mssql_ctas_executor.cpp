@@ -209,7 +209,6 @@ void CTASExecutionState::ExecuteDDL(ClientContext &context) {
 			insert_config.batch_size = config.batch_size;
 			insert_config.max_rows_per_statement = config.max_rows_per_statement;
 			insert_config.max_sql_bytes = config.max_sql_bytes;
-			insert_config.use_returning_output = false;	 // CTAS never uses RETURNING
 
 			insert_executor = make_uniq<MSSQLInsertExecutor>(context, insert_target, insert_config);
 

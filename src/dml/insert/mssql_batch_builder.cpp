@@ -30,7 +30,7 @@ MSSQLBatchBuilder::MSSQLBatchBuilder(const MSSQLInsertTarget &target, const MSSQ
 
 void MSSQLBatchBuilder::CalculateBaseSQLSize() {
 	// Build a dummy statement to measure the prefix size
-	MSSQLInsertStatement stmt(target_, include_output_clause_);
+	MSSQLInsertStatement stmt(target_, include_output_clause_, output_into_);
 
 	// "INSERT INTO [schema].[table] ([col1], [col2])"
 	base_sql_size_ = 12;  // "INSERT INTO "
@@ -44,6 +44,7 @@ void MSSQLBatchBuilder::CalculateBaseSQLSize() {
 	if (!output_clause.empty()) {
 		base_sql_size_ += 1;  // "\n"
 		base_sql_size_ += output_clause.size();
+		base_sql_size_ += stmt.GetOutputFramingSize();
 	}
 
 	// "\nVALUES"
@@ -157,6 +158,14 @@ idx_t MSSQLBatchBuilder::GetPendingRowCount() const {
 // Batch Flushing
 //===----------------------------------------------------------------------===//
 
+void MSSQLBatchBuilder::UseOutputInto() {
+	output_into_ = true;
+	// The table's creation, read and DROP travel with every batch from here on.
+	const idx_t pending = current_sql_bytes_ - base_sql_size_;
+	CalculateBaseSQLSize();
+	current_sql_bytes_ = base_sql_size_ + pending;
+}
+
 MSSQLInsertBatch MSSQLBatchBuilder::FlushBatch() {
 	MSSQLInsertBatch batch;
 
@@ -166,7 +175,7 @@ MSSQLInsertBatch MSSQLBatchBuilder::FlushBatch() {
 	batch.row_count = pending_row_count_;
 
 	// Generate SQL
-	MSSQLInsertStatement stmt(target_, include_output_clause_);
+	MSSQLInsertStatement stmt(target_, include_output_clause_, output_into_);
 	batch.sql_statement = stmt.Build(row_literals_);
 	batch.sql_bytes = batch.sql_statement.size();
 	batch.state = MSSQLInsertBatch::State::READY;
@@ -174,8 +183,14 @@ MSSQLInsertBatch MSSQLBatchBuilder::FlushBatch() {
 	// Update tracking
 	batch_count_++;
 
-	// Reset for next batch
-	row_literals_.clear();
+	// Reset for next batch. A bare-OUTPUT batch that may yet need the
+	// OUTPUT ... INTO form keeps its literals (#471).
+	if (include_output_clause_ && !output_into_ && target_.output_into_table) {
+		batch.row_literals = std::move(row_literals_);
+		row_literals_ = vector<vector<string>>();
+	} else {
+		row_literals_.clear();
+	}
 	row_literals_.reserve(rows_per_statement_);
 	current_sql_bytes_ = base_sql_size_;
 	pending_row_count_ = 0;

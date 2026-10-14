@@ -1,5 +1,4 @@
 #include "dml/delete/mssql_delete_executor.hpp"
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
@@ -7,6 +6,7 @@
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
 #include "dml/delete/mssql_delete_statement.hpp"
+#include "dml/mssql_dml_execute.hpp"
 #include "dml/mssql_dml_outcome.hpp"
 #include "dml/mssql_rowid_extractor.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -14,8 +14,6 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "tds/tds_connection_pool.hpp"
-#include "tds/tds_packet.hpp"
-#include "tds/tds_token_parser.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetDeleteDebugLevel() {
@@ -184,172 +182,40 @@ MSSQLDMLResult MSSQLDeleteExecutor::ExecuteBatch(const MSSQLDMLBatch &batch) {
 	auto pinned_lock = stmt_conn_.LockPinned(context_, mssql_catalog);
 	MSSQLStatementConnection::RequireIdle(*connection, "DELETE");
 
-	DELETE_DEBUG(2, "ExecuteBatch: connection acquired");
-
-	idx_t rows_affected = 0;
-
+	mssql::DmlBatchOptions options;
+	options.label = "delete statement batch";
+	mssql::DmlBatchResponse response;
 	try {
-		// Get socket for packet-based reading
-		auto *socket = connection->GetSocket();
-		if (!socket) {
-			DELETE_DEBUG(1, "ExecuteBatch: socket is null");
-			stmt_conn_.Fail(context_, mssql_catalog);
-			return MSSQLDMLResult::Failure("Connection socket is null", 0, batch_count_);
-		}
-
-		// Clear any leftover data before starting
-		socket->ClearReceiveBuffer();
-
-		// Send the SQL batch
-		DELETE_DEBUG(1, "ExecuteBatch: sending SQL batch...");
-		if (!connection->ExecuteBatch(batch.sql)) {
-			string error = connection->GetLastError();
-			DELETE_DEBUG(1, "ExecuteBatch: ExecuteBatch failed, error=%s", error.c_str());
-			stmt_conn_.Fail(context_, mssql_catalog);
-			return MSSQLDMLResult::Failure("DELETE execution failed: " + error, 0, batch_count_);
-		}
-
-		DELETE_DEBUG(1, "ExecuteBatch: SQL sent successfully, waiting for response...");
-
-		// Parse the TDS response to get error info and row counts
-		tds::TokenParser parser;
-		const int64_t fail_after_tokens = LoadTestFailParseAfterTokens(context_);
-		int64_t tokens_seen = 0;
-		bool done = false;
-		int timeout_ms = 30000;	 // 30 second timeout
-		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-		string error_message;
-		uint32_t error_number = 0;
-		int packet_count = 0;
-
-		while (!done) {
-			// Check timeout
-			auto now = std::chrono::steady_clock::now();
-			if (now >= deadline) {
-				DELETE_DEBUG(1, "ExecuteBatch: TIMEOUT after 30s, packets_received=%d", packet_count);
-				connection->SendAttention();
-				connection->WaitForAttentionAck(5000);
-				stmt_conn_.Fail(context_, mssql_catalog);
-				return MSSQLDMLResult::Failure("DELETE execution timeout", 0, batch_count_);
-			}
-
-			auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-			int recv_timeout = static_cast<int>(std::min<long long>(remaining_ms, timeout_ms));
-
-			// Read TDS packet
-			tds::TdsPacket packet;
-			if (!socket->ReceivePacket(packet, recv_timeout)) {
-				string socket_error = socket->GetLastError();
-				DELETE_DEBUG(1, "ExecuteBatch: ReceivePacket FAILED, error='%s'", socket_error.c_str());
-				stmt_conn_.Fail(context_, mssql_catalog);
-				return MSSQLDMLResult::Failure("Failed to receive TDS packet: " + socket_error, 0, batch_count_);
-			}
-
-			packet_count++;
-			DELETE_DEBUG(2, "ExecuteBatch: packet %d received, size=%zu, eom=%d", packet_count,
-						 packet.GetPayload().size(), packet.IsEndOfMessage());
-
-			bool is_eom = packet.IsEndOfMessage();
-
-			// Feed packet payload to parser -- but not into a parser already in
-			// Error. From there TryParseNext returns at once, so ConsumeBytes and
-			// with it CompactBuffer never run, and every fed byte is retained;
-			// a desync early in a batched response buffers the whole tail for
-			// nothing. The drain to EOM below still runs: that is what leaves the
-			// socket clean for the next statement. MSSQLSimpleQuery already does
-			// this (issue #323); these four loops are copies of the same loop.
-			const auto &payload = packet.GetPayload();
-			if (!payload.empty() && parser.GetState() != tds::ParserState::Error) {
-				parser.Feed(payload);
-			}
-
-			// Parse tokens
-			tds::ParsedTokenType token;
-			while ((token = parser.TryParseNext()) != tds::ParsedTokenType::NeedMoreData) {
-				if (fail_after_tokens > 0 && ++tokens_seen >= fail_after_tokens) {
-					// Test lever (mssql_test_fail_parse_after_tokens): drop this token
-					// and desync, as a framing error would.
-					parser.InjectParseError("injected parse error (mssql_test_fail_parse_after_tokens)");
-					break;
-				}
-				DELETE_DEBUG(2, "ExecuteBatch: parsed token type=%d", (int)token);
-				switch (token) {
-				case tds::ParsedTokenType::Done: {
-					const tds::DoneToken &done_token = parser.GetDone();
-					DELETE_DEBUG(1, "ExecuteBatch: DONE token - status=0x%04x, row_count=%llu, has_row_count=%d",
-								 done_token.status, (unsigned long long)done_token.row_count, done_token.HasRowCount());
-					if (done_token.HasRowCount()) {
-						rows_affected = done_token.row_count;
-					}
-					if (done_token.IsFinal()) {
-						done = true;
-						// Transition connection back to Idle
-						connection->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-					}
-					break;
-				}
-				case tds::ParsedTokenType::Error: {
-					const tds::TdsError &tds_error = parser.GetError();
-					error_number = tds_error.number;
-					error_message = tds_error.message;
-					DELETE_DEBUG(1, "ExecuteBatch: ERROR token - number=%u, message='%s'", error_number,
-								 error_message.c_str());
-					// Continue reading to drain the response
-					break;
-				}
-				default:
-					// Skip other tokens
-					break;
-				}
-			}
-
-			// A parser stuck in Error answers NeedMoreData forever, so the token
-			// loop above has already exited and the EOM branch below forces done
-			// and reports SUCCESS -- dropping every token after the desync,
-			// including a SQL Server ERROR token following a stored-procedure
-			// call, which is the one a caller most needs. Record it as the
-			// failure it is. A SQL error already captured keeps precedence.
-			if (parser.GetState() == tds::ParserState::Error && error_message.empty()) {
-				error_number = 0;
-				error_message = "TDS parse error: " + parser.GetParseError();
-				DELETE_DEBUG(1, "ExecuteBatch: %s", error_message.c_str());
-			}
-
-			// Handle EOM without done token
-			if (is_eom && !done) {
-				DELETE_DEBUG(1, "ExecuteBatch: EOM without DONE final, marking done");
-				done = true;
-				connection->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-			}
-		}
-
-		DELETE_DEBUG(1, "ExecuteBatch: response parsed, rows_affected=%llu, error='%s'",
-					 (unsigned long long)rows_affected, error_message.c_str());
-
-		// Check for errors
-		if (!error_message.empty()) {
-			stmt_conn_.Fail(context_, mssql_catalog);
-			// What happened to the rows (issue #344, spec 062 W1c) -- see the
-			// UPDATE executor.
-			const string outcome = MSSQLRowsBeforeOutcome(stmt_conn_.InOpenTransaction(), total_rows_deleted_);
-			if (error_number == 0) {
-				return MSSQLDMLResult::Failure(
-					StringUtil::Format("DELETE failed: %s; the server executed this batch (batch %llu); %s",
-									   error_message, (unsigned long long)batch_count_, outcome),
-					0, batch_count_);
-			}
-			return MSSQLDMLResult::Failure(StringUtil::Format("DELETE failed: %s; %s", error_message, outcome), 0,
-										   batch_count_);
-		}
-
-		// The connection stays with the statement until Finalize commits.
-		total_rows_deleted_ += rows_affected;
-		return MSSQLDMLResult::Success(rows_affected, batch_count_);
-
+		response = mssql::ExecuteDmlBatch(context_, *connection, batch.sql, options);
 	} catch (const std::exception &e) {
 		stmt_conn_.Fail(context_, mssql_catalog);
-		return MSSQLDMLResult::Failure(string("DELETE execution failed: ") + e.what(), 0, batch_count_);
+		return MSSQLDMLResult::Failure(string("DELETE execution failed: ") + MSSQLRawMessage(e), 0, batch_count_);
 	}
+	DELETE_DEBUG(1, "ExecuteBatch: rows_affected=%llu, error='%s'", (unsigned long long)response.rows_affected,
+				 response.error_message.c_str());
+
+	if (response.status == mssql::DmlBatchResponse::Status::INTERRUPTED) {
+		stmt_conn_.Fail(context_, mssql_catalog);
+		throw InterruptException();
+	}
+	if (!response.Succeeded()) {
+		stmt_conn_.Fail(context_, mssql_catalog);
+		// What happened to the rows (issue #344, spec 062 W1c) -- see the
+		// UPDATE executor.
+		const string outcome = MSSQLRowsBeforeOutcome(stmt_conn_.InOpenTransaction(), total_rows_deleted_);
+		if (response.status == mssql::DmlBatchResponse::Status::PARSE_ERROR) {
+			return MSSQLDMLResult::Failure(
+				StringUtil::Format("DELETE failed: %s; the server executed this batch (batch %llu); %s",
+								   response.error_message, (unsigned long long)batch_count_, outcome),
+				0, batch_count_);
+		}
+		return MSSQLDMLResult::Failure(StringUtil::Format("DELETE failed: %s; %s", response.error_message, outcome), 0,
+									   batch_count_);
+	}
+
+	// The connection stays with the statement until Finalize commits.
+	total_rows_deleted_ += response.rows_affected;
+	return MSSQLDMLResult::Success(response.rows_affected, batch_count_);
 }
 
 }  // namespace duckdb

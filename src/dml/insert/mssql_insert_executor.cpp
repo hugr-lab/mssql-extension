@@ -6,16 +6,14 @@
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
 #include "dml/insert/mssql_batch_builder.hpp"
+#include "dml/insert/mssql_insert_statement.hpp"
 #include "dml/insert/mssql_returning_parser.hpp"
 #include "dml/mssql_dml_outcome.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
-#include "tds/encoding/type_converter.hpp"
 #include "tds/tds_connection.hpp"
 #include "tds/tds_connection_pool.hpp"
-#include "tds/tds_packet.hpp"
-#include "tds/tds_token_parser.hpp"
 
 // Debug logging controlled by MSSQL_DEBUG environment variable
 static int GetInsertDebugLevel() {
@@ -171,208 +169,25 @@ idx_t MSSQLInsertExecutor::ExecuteBatch(const MSSQLInsertBatch &batch) {
 	MSSQLStatementConnection::RequireIdle(*connection, "INSERT");
 	EnsureIdentityInsert();
 
-	INSERT_DEBUG(2, "ExecuteBatch: connection acquired, state=%d", (int)connection->GetState());
-
-	idx_t rows_affected = 0;
 	auto start_time = std::chrono::steady_clock::now();
-
-	try {
-		// Get socket for packet-based reading
-		auto *socket = connection->GetSocket();
-		if (!socket) {
-			INSERT_DEBUG(1, "ExecuteBatch: socket is null");
-			FailStatement(mssql_catalog);
-			throw IOException("Connection socket is null");
-		}
-
-		INSERT_DEBUG(2, "ExecuteBatch: socket obtained, connected=%d", socket->IsConnected());
-
-		// Clear any leftover data before starting
-		socket->ClearReceiveBuffer();
-
-		// Send the SQL batch
-		INSERT_DEBUG(1, "ExecuteBatch: sending SQL batch...");
-		if (!connection->ExecuteBatch(sql, "insert statement batch")) {
-			INSERT_DEBUG(1, "ExecuteBatch: ExecuteBatch failed, error=%s", connection->GetLastError().c_str());
-			MSSQLInsertError error;
-			error.statement_index = batch_builder_->GetBatchCount() - 1;
-			error.row_offset_start = batch.row_offset_start;
-			error.row_offset_end = batch.row_offset_end;
-			error.sql_error_number = 0;
-			error.sql_error_message = connection->GetLastError();
-			error.rows_applied_before = statistics_.total_rows_inserted;
-			error.in_open_transaction = stmt_conn_.InOpenTransaction();
-
-			FailStatement(mssql_catalog);
-			throw MSSQLInsertException(error);
-		}
-
-		INSERT_DEBUG(1, "ExecuteBatch: SQL sent successfully, waiting for response...");
-
-		// Parse the TDS response to get error info and row counts
-		tds::TokenParser parser;
-		const int64_t fail_after_tokens = LoadTestFailParseAfterTokens(context_);
-		int64_t tokens_seen = 0;
-		bool done = false;
-		int timeout_ms = 30000;	 // 30 second timeout
-		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-		string error_message;
-		uint32_t error_number = 0;
-		int packet_count = 0;
-
-		while (!done) {
-			// Check timeout
-			auto now = std::chrono::steady_clock::now();
-			if (now >= deadline) {
-				INSERT_DEBUG(1, "ExecuteBatch: TIMEOUT after 30s, packets_received=%d", packet_count);
-				connection->SendAttention();
-				connection->WaitForAttentionAck(5000);
-				FailStatement(mssql_catalog);
-				throw IOException("INSERT execution timeout");
-			}
-
-			auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-			int recv_timeout = static_cast<int>(std::min<long long>(remaining_ms, timeout_ms));
-
-			INSERT_DEBUG(2, "ExecuteBatch: calling ReceivePacket, timeout=%d, packets_so_far=%d", recv_timeout,
-						 packet_count);
-
-			// Read TDS packet
-			tds::TdsPacket packet;
-			if (!socket->ReceivePacket(packet, recv_timeout)) {
-				// Capture error message BEFORE releasing connection
-				string socket_error = socket->GetLastError();
-				bool still_connected = socket->IsConnected();
-				INSERT_DEBUG(1, "ExecuteBatch: ReceivePacket FAILED, error='%s', connected=%d", socket_error.c_str(),
-							 still_connected);
-				FailStatement(mssql_catalog);
-				throw IOException("Failed to receive TDS packet: %s", socket_error);
-			}
-
-			packet_count++;
-			INSERT_DEBUG(2, "ExecuteBatch: packet %d received, size=%zu, eom=%d", packet_count,
-						 packet.GetPayload().size(), packet.IsEndOfMessage());
-
-			bool is_eom = packet.IsEndOfMessage();
-
-			// Feed packet payload to parser -- but not into a parser already in
-			// Error. From there TryParseNext returns at once, so ConsumeBytes and
-			// with it CompactBuffer never run, and every fed byte is retained;
-			// a desync early in a batched response buffers the whole tail for
-			// nothing. The drain to EOM below still runs: that is what leaves the
-			// socket clean for the next statement. MSSQLSimpleQuery already does
-			// this (issue #323); these four loops are copies of the same loop.
-			const auto &payload = packet.GetPayload();
-			if (!payload.empty() && parser.GetState() != tds::ParserState::Error) {
-				parser.Feed(payload);
-			}
-
-			// Parse tokens
-			tds::ParsedTokenType token;
-			while ((token = parser.TryParseNext()) != tds::ParsedTokenType::NeedMoreData) {
-				if (fail_after_tokens > 0 && ++tokens_seen >= fail_after_tokens) {
-					// Test lever (mssql_test_fail_parse_after_tokens): drop this token
-					// and desync, as a framing error would.
-					parser.InjectParseError("injected parse error (mssql_test_fail_parse_after_tokens)");
-					break;
-				}
-				INSERT_DEBUG(2, "ExecuteBatch: parsed token type=%d", (int)token);
-				switch (token) {
-				case tds::ParsedTokenType::Done: {
-					const tds::DoneToken &done_token = parser.GetDone();
-					INSERT_DEBUG(
-						1, "ExecuteBatch: DONE token - status=0x%04x, row_count=%llu, has_row_count=%d, is_final=%d",
-						done_token.status, (unsigned long long)done_token.row_count, done_token.HasRowCount(),
-						done_token.IsFinal());
-					if (done_token.HasRowCount()) {
-						rows_affected = done_token.row_count;
-					}
-					if (done_token.IsFinal()) {
-						done = true;
-						// Transition connection back to Idle
-						connection->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-					}
-					break;
-				}
-				case tds::ParsedTokenType::Error: {
-					const tds::TdsError &tds_error = parser.GetError();
-					error_number = tds_error.number;
-					error_message = tds_error.message;
-					INSERT_DEBUG(1, "ExecuteBatch: ERROR token - number=%u, message='%s'", error_number,
-								 error_message.c_str());
-					// Continue reading to drain the response
-					break;
-				}
-				default:
-					// Skip other tokens
-					break;
-				}
-			}
-
-			// A parser stuck in Error answers NeedMoreData forever, so the token
-			// loop above has already exited and the EOM branch below forces done
-			// and reports SUCCESS -- dropping every token after the desync,
-			// including a SQL Server ERROR token following a stored-procedure
-			// call, which is the one a caller most needs. Record it as the
-			// failure it is. A SQL error already captured keeps precedence.
-			if (parser.GetState() == tds::ParserState::Error && error_message.empty()) {
-				error_number = 0;
-				error_message = "TDS parse error: " + parser.GetParseError();
-				INSERT_DEBUG(1, "ExecuteBatch: %s", error_message.c_str());
-			}
-
-			// Handle EOM without done token
-			if (is_eom && !done) {
-				INSERT_DEBUG(1, "ExecuteBatch: EOM without DONE final, marking done");
-				done = true;
-				connection->TransitionState(tds::ConnectionState::Executing, tds::ConnectionState::Idle);
-			}
-		}
-
-		INSERT_DEBUG(1, "ExecuteBatch: response parsed, rows_affected=%llu, error='%s'",
-					 (unsigned long long)rows_affected, error_message.c_str());
-
-		// Check for errors
-		if (!error_message.empty()) {
-			MSSQLInsertError error;
-			error.statement_index = batch_builder_->GetBatchCount() - 1;
-			error.row_offset_start = batch.row_offset_start;
-			error.row_offset_end = batch.row_offset_end;
-			error.sql_error_number = error_number;
-			error.sql_error_message = error_message;
-			error.rows_applied_before = statistics_.total_rows_inserted;
-			error.in_open_transaction = stmt_conn_.InOpenTransaction();
-			// A parse error is a client-side framing failure: the server ran this
-			// statement (issue #344). The message says so; a SQL error says the
-			// server rejected it.
-			error.statement_executed = (error_number == 0);
-
-			FailStatement(mssql_catalog);
-			throw MSSQLInsertException(error);
-		}
-
-	} catch (const MSSQLInsertException &) {
-		throw;	// Re-throw insert exceptions
-	} catch (const IOException &) {
-		throw;	// Already failed and worded above (timeout, socket)
-	} catch (const std::exception &e) {
-		FailStatement(mssql_catalog);
-		throw IOException("INSERT execution failed: %s", e.what());
+	mssql::DmlBatchOptions options;
+	options.label = "insert statement batch";
+	const auto response = RunBatch(*connection, batch, sql, options, mssql_catalog);
+	if (!response.Succeeded()) {
+		ThrowBatchFailure(batch, response, mssql_catalog);
 	}
+	const idx_t rows_affected = response.rows_affected;
+	INSERT_DEBUG(1, "ExecuteBatch: rows_affected=%llu", (unsigned long long)rows_affected);
 
 	// The connection stays with the statement until CommitStatement.
-
-	// Record timing
 	auto end_time = std::chrono::steady_clock::now();
 	auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
 	statistics_.RecordBatch(rows_affected, sql.size(), duration_us);
-
 	return rows_affected;
 }
 
 unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLInsertBatch &batch,
 																  const vector<idx_t> &returning_column_ids) {
-	const string &sql = batch.sql_statement;
 	auto &mssql_catalog = GetMSSQLCatalog();
 	auto connection = stmt_conn_.Acquire(context_, mssql_catalog);
 	auto pinned_lock = stmt_conn_.LockPinned(context_, mssql_catalog);
@@ -380,70 +195,91 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 	EnsureIdentityInsert();
 
 	auto start_time = std::chrono::steady_clock::now();
-	unique_ptr<DataChunk> result_chunk;
-
-	try {
-		// Get socket for packet-based reading
-		auto *socket = connection->GetSocket();
-		if (!socket) {
-			FailStatement(mssql_catalog);
-			throw IOException("Connection socket is null");
-		}
-
-		// Clear any leftover data before starting
-		socket->ClearReceiveBuffer();
-
-		// Send the SQL batch (with OUTPUT clause)
-		if (!connection->ExecuteBatch(sql, "insert statement batch")) {
-			MSSQLInsertError error;
-			error.statement_index = batch_builder_->GetBatchCount() - 1;
-			error.row_offset_start = batch.row_offset_start;
-			error.row_offset_end = batch.row_offset_end;
-			error.sql_error_number = 0;
-			error.sql_error_message = connection->GetLastError();
-			error.rows_applied_before = statistics_.total_rows_inserted;
-			error.in_open_transaction = stmt_conn_.InOpenTransaction();
-
-			FailStatement(mssql_catalog);
-			throw MSSQLInsertException(error);
-		}
-
-		// Parse the OUTPUT INSERTED results using MSSQLReturningParser
-		MSSQLReturningParser parser(target_, returning_column_ids);
-		result_chunk = parser.ParseResponse(*connection, 30000, LoadTestFailParseAfterTokens(context_));
-
-		// Check for errors from parser
-		if (parser.HasError()) {
-			MSSQLInsertError error;
-			error.statement_index = batch_builder_->GetBatchCount() - 1;
-			error.row_offset_start = batch.row_offset_start;
-			error.row_offset_end = batch.row_offset_end;
-			error.sql_error_number = parser.GetErrorNumber();
-			error.sql_error_message = parser.GetErrorMessage();
-			error.rows_applied_before = statistics_.total_rows_inserted;
-			error.in_open_transaction = stmt_conn_.InOpenTransaction();
-			error.statement_executed = parser.IsParseError();
-
-			FailStatement(mssql_catalog);
-			throw MSSQLInsertException(error);
-		}
-
-		// Record statistics based on parsed rows
-		idx_t rows_inserted = parser.GetRowCount();
-		auto end_time = std::chrono::steady_clock::now();
-		auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-		statistics_.RecordBatch(rows_inserted, sql.size(), duration_us);
-
-	} catch (const MSSQLInsertException &) {
-		throw;	// Re-throw insert exceptions
-	} catch (const IOException &) {
-		throw;	// Already failed and worded above
-	} catch (const std::exception &e) {
-		FailStatement(mssql_catalog);
-		throw IOException("INSERT with RETURNING execution failed: %s", e.what());
+	MSSQLReturningParser output(target_, returning_column_ids);
+	mssql::DmlBatchOptions options;
+	options.label = "insert statement batch";
+	output.Attach(options);
+	auto response = RunBatch(*connection, batch, batch.sql_statement, options, mssql_catalog);
+	idx_t sent_bytes = batch.sql_statement.size();
+	if (response.status == mssql::DmlBatchResponse::Status::SERVER_ERROR && response.error_number == 334 &&
+		target_.output_into_table && !batch_builder_->UsesOutputInto()) {
+		// Issue #471: the target has an enabled trigger, beside which a bare
+		// OUTPUT is refused. That is a compile error: nothing ran, and the
+		// statement's server transaction is as it was. This batch and the rest
+		// of the statement go through OUTPUT ... INTO a session table, which
+		// costs a table created and dropped per batch -- measured 1.2 s for
+		// 10000 rows where the bare form takes 0.09 s, so it is not the default.
+		batch_builder_->UseOutputInto();
+		const auto into = MSSQLInsertStatement(target_, true, true).Build(batch.row_literals);
+		response = RunBatch(*connection, batch, into, options, mssql_catalog);
+		sent_bytes = into.size();
+	}
+	if (!response.Succeeded()) {
+		ThrowBatchFailure(batch, response, mssql_catalog);
 	}
 
-	return result_chunk;
+	// The rows are decoded here, after the response: an OUTPUT value that does
+	// not convert fails the statement like any client-side fault (review of
+	// #472: it used to escape past FailStatement and the batch's name).
+	const idx_t rows = output.GetRowCount();
+	unique_ptr<DataChunk> result;
+	try {
+		result = output.TakeResult();
+	} catch (const std::exception &e) {
+		ThrowClientFault(batch, e, mssql_catalog);
+	}
+	auto end_time = std::chrono::steady_clock::now();
+	auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+	statistics_.RecordBatch(rows, sent_bytes, duration_us);
+	return result;
+}
+
+mssql::DmlBatchResponse MSSQLInsertExecutor::RunBatch(tds::TdsConnection &connection, const MSSQLInsertBatch &batch,
+													  const string &sql, const mssql::DmlBatchOptions &options,
+													  MSSQLCatalog &catalog) {
+	try {
+		return mssql::ExecuteDmlBatch(context_, connection, sql, options);
+	} catch (const std::exception &e) {
+		ThrowClientFault(batch, e, catalog);
+	}
+}
+
+void MSSQLInsertExecutor::ThrowClientFault(const MSSQLInsertBatch &batch, const std::exception &e,
+										   MSSQLCatalog &catalog) {
+	// A fault of the client's own while reading or decoding the response: an
+	// OUTPUT value that does not convert, a malformed packet header.
+	MSSQLInsertError error;
+	error.statement_index = batch_builder_->GetBatchCount() - 1;
+	error.row_offset_start = batch.row_offset_start;
+	error.row_offset_end = batch.row_offset_end;
+	error.sql_error_number = 0;
+	error.sql_error_message = MSSQLRawMessage(e);
+	error.rows_applied_before = statistics_.total_rows_inserted;
+	error.in_open_transaction = stmt_conn_.InOpenTransaction();
+	FailStatement(catalog);
+	throw MSSQLInsertException(error);
+}
+
+void MSSQLInsertExecutor::ThrowBatchFailure(const MSSQLInsertBatch &batch, const mssql::DmlBatchResponse &response,
+											MSSQLCatalog &catalog) {
+	MSSQLInsertError error;
+	error.statement_index = batch_builder_->GetBatchCount() - 1;
+	error.row_offset_start = batch.row_offset_start;
+	error.row_offset_end = batch.row_offset_end;
+	error.rows_applied_before = statistics_.total_rows_inserted;
+	error.in_open_transaction = stmt_conn_.InOpenTransaction();
+	FailStatement(catalog);
+	if (response.status == mssql::DmlBatchResponse::Status::INTERRUPTED) {
+		throw InterruptException();
+	}
+	error.sql_error_number =
+		response.status == mssql::DmlBatchResponse::Status::SERVER_ERROR ? response.error_number : 0;
+	error.sql_error_message = response.error_message;
+	// A parse error is a client-side framing failure: the server ran this
+	// statement (issue #344). The message says so; a SQL error says the server
+	// rejected it.
+	error.statement_executed = response.status == mssql::DmlBatchResponse::Status::PARSE_ERROR;
+	throw MSSQLInsertException(error);
 }
 
 //===----------------------------------------------------------------------===//

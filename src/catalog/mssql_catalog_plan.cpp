@@ -187,6 +187,7 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 		for (idx_t i = 0; i < mssql_columns.size(); i++) {
 			target.returning_column_indices.push_back(i);
 		}
+		target.output_into_table = GetDmlCapabilities().output_into_table;
 	}
 
 	// Load insert configuration from settings
