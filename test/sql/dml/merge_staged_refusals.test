@@ -1,0 +1,185 @@
+# name: test/sql/dml/merge_staged_refusals.test
+# description: a MERGE into an MSSQL table the server cannot run is refused by name, and nothing is sent (spec 080 D4, PR 4b)
+# group: [dml]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# A MERGE into a catalog table runs on the server, always, or is refused by
+# name: there is no client-side path to fall back on. Every refusal below
+# leaves the table as it was.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS mgr (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('mgr', 'DROP TABLE IF EXISTS dbo.mgr_t; CREATE TABLE dbo.mgr_t (id int PRIMARY KEY, v int NOT NULL, t7 time(7) NULL, x xml NULL, name nvarchar(20) NULL); INSERT INTO dbo.mgr_t VALUES (1, 10, ''10:00:00.1234567'', N''<a/>'', N''a''), (2, 20, NULL, NULL, N''b'')');
+
+# --- shapes T-SQL has no form for ---------------------------------------------
+
+statement error
+MERGE INTO mgr.dbo.mgr_t AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN ERROR;
+----
+an ERROR action in a MERGE
+
+statement error
+MERGE INTO mgr.dbo.mgr_t AS t USING (SELECT 1 AS id) AS s ON t.id = s.id
+WHEN MATCHED AND s.id > 0 THEN UPDATE SET v = 1
+WHEN MATCHED THEN UPDATE SET v = 2;
+----
+two WHEN MATCHED clauses of one action
+
+statement error
+MERGE INTO mgr.dbo.mgr_t AS t USING (SELECT 3 AS id) AS s ON t.id = s.id
+WHEN NOT MATCHED AND s.id > 2 THEN INSERT (id, v) VALUES (s.id, 1)
+WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, 2);
+----
+more than one WHEN NOT MATCHED BY TARGET clause
+
+statement error
+MERGE INTO mgr.dbo.mgr_t AS t USING (SELECT 1 AS id) AS s ON t.id = s.id
+WHEN MATCHED AND s.id = 1 THEN DO NOTHING
+WHEN MATCHED THEN DELETE;
+----
+DO NOTHING before another WHEN MATCHED clause
+
+statement error
+MERGE INTO mgr.dbo.mgr_t AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN DELETE RETURNING *;
+----
+RETURNING
+
+# --- what the server cannot be given -----------------------------------------
+
+# A WHEN NOT MATCHED BY SOURCE clause has no source row: a value DuckDB computes
+# per row has nowhere to come from.
+statement error
+MERGE INTO mgr.dbo.mgr_t AS t USING (SELECT 1 AS id) AS s ON t.id = s.id
+WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v = (random() * 10)::INTEGER;
+----
+has no source row
+
+# ON compares a column whose value does not come back as stored: the row would
+# not match, and a WHEN NOT MATCHED INSERT would duplicate it.
+statement error
+MERGE INTO mgr.dbo.mgr_t AS t USING (SELECT * FROM mgr.dbo.mgr_t) AS s ON t.t7 = s.t7
+WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id + 10, s.v);
+----
+of type time(7), whose value does not survive the round trip through DuckDB
+
+statement error
+MERGE INTO mgr.dbo.mgr_t AS t USING (SELECT '<a/>' AS x) AS s ON t.x = s.x WHEN MATCHED THEN DELETE;
+----
+which the catalog does not read as the server stores it
+
+# An expression over the target the T-SQL vocabulary has no form for (the
+# server's case mapping is not DuckDB's).
+statement error
+MERGE INTO mgr.dbo.mgr_t AS t USING (SELECT 1 AS id) AS s ON t.id = s.id
+WHEN MATCHED AND upper(t.name) = 'A' THEN DELETE;
+----
+the condition of a WHEN MATCHED clause cannot be written in T-SQL
+
+statement error
+MERGE INTO mgr.dbo.mgr_t AS t USING (SELECT 1 AS id) AS s ON t.id = s.id
+WHEN MATCHED AND s.id IN (SELECT 1) THEN DELETE;
+----
+a subquery in the MERGE
+
+statement error
+MERGE INTO mgr.dbo.mgr_t AS t USING (SELECT 1 AS id) AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = (SELECT 5);
+----
+a subquery in the MERGE
+
+# A view as the target.
+statement ok
+SELECT mssql_exec('mgr', 'IF OBJECT_ID(''dbo.mgr_v'') IS NOT NULL DROP VIEW dbo.mgr_v; EXEC(''CREATE VIEW dbo.mgr_v AS SELECT id, v FROM dbo.mgr_t'')');
+
+statement ok
+SELECT mssql_invalidate_cache('mgr');
+
+statement error
+MERGE INTO mgr.dbo.mgr_v AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN DELETE;
+----
+UPDATE/DELETE/MERGE is not supported on views
+
+query IIT
+SELECT id, v, name FROM mgr.dbo.mgr_t ORDER BY id;
+----
+1	10	a
+2	20	b
+
+# --- where the extension cannot plan it --------------------------------------
+
+# DuckDB's optimizer off: the extension rewrites a MERGE for the server there,
+# so without it the MERGE is refused rather than run row by row.
+statement ok
+SET enable_optimizer = false;
+
+statement error
+MERGE INTO mgr.dbo.mgr_t AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN DELETE;
+----
+with DuckDB's optimizer off
+
+statement ok
+RESET enable_optimizer;
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement error
+MERGE INTO mgr.dbo.mgr_t AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN DELETE;
+----
+with DuckDB's optimizer off
+
+statement ok
+RESET disabled_optimizers;
+
+# A read-only ATTACH.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS mgr_ro (TYPE mssql, READ_ONLY);
+
+statement error
+MERGE INTO mgr_ro.dbo.mgr_t AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN DELETE;
+----
+read-only
+
+statement ok
+DETACH mgr_ro;
+
+# Synapse (emulated): MERGE is in preview there.
+statement ok
+SET mssql_test_dml_platform = 'synapse';
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS mgr_syn (TYPE mssql);
+
+statement ok
+RESET mssql_test_dml_platform;
+
+statement error
+MERGE INTO mgr_syn.dbo.mgr_t AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN DELETE;
+----
+Synapse
+
+statement ok
+DETACH mgr_syn;
+
+query IIT
+SELECT id, v, name FROM mgr.dbo.mgr_t ORDER BY id;
+----
+1	10	a
+2	20	b
+
+statement ok
+SELECT mssql_exec('mgr', 'DROP VIEW dbo.mgr_v; DROP TABLE dbo.mgr_t');
+
+statement ok
+DETACH mgr;

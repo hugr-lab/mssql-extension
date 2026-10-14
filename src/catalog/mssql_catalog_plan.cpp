@@ -30,20 +30,6 @@
 
 namespace duckdb {
 
-//! Set while DuckDB plans a MERGE's actions through PlanUpdate / PlanDelete /
-//! PlanInsert below (planning is single-threaded per statement).
-static thread_local bool planning_merge_actions = false;
-
-//! For each INSERT action of the MERGE being planned, in the order DuckDB plans
-//! them, which table columns (storage order) the action did NOT name. DuckDB
-//! binds a MERGE's INSERT action full width -- an unnamed column carries a copy
-//! of its bound default -- and copies every bound default into the synthesized
-//! LogicalInsert, so the null-slot tell PlanInsert uses for a plain INSERT does
-//! not exist there (review of #423). Filled by PlanMergeInto, consumed by
-//! PlanInsert.
-static thread_local vector<vector<bool>> merge_insert_unnamed;
-static thread_local idx_t merge_insert_next = 0;
-
 //===----------------------------------------------------------------------===//
 // Write Operations (all throw - read-only catalog)
 //===----------------------------------------------------------------------===//
@@ -68,20 +54,7 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	// Determine which columns are being inserted
 	// If no column map is specified, use all non-identity columns
 	vector<idx_t> insert_col_indices;
-	if (planning_merge_actions) {
-		// A MERGE's INSERT action: the columns it did not name stay out of the
-		// list, so the server applies their identity / DEFAULT / computed value,
-		// as for a plain INSERT (see merge_insert_unnamed).
-		if (merge_insert_next >= merge_insert_unnamed.size()) {
-			throw InternalException("MSSQL: MERGE INSERT action planned without its column set");
-		}
-		const auto &unnamed = merge_insert_unnamed[merge_insert_next++];
-		for (idx_t i = 0; i < mssql_columns.size(); i++) {
-			if (i >= unnamed.size() || !unnamed[i]) {
-				insert_col_indices.push_back(i);
-			}
-		}
-	} else if (op.column_index_map.empty()) {
+	if (op.column_index_map.empty()) {
 		// 2.0 no longer populates column_index_map: the binder expands the
 		// child plan to every physical column and fills the ones the INSERT
 		// did not name with their bound default. The tell is the move in
@@ -168,9 +141,9 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 		}
 	}
 
-	// Every column left to the server is `INSERT … DEFAULT VALUES` (or a MERGE
-	// action's `INSERT DEFAULT VALUES`), which the statement builder has no
-	// form for: it sent an empty column list, refused with error 102.
+	// Every column left to the server is `INSERT … DEFAULT VALUES`, which the
+	// statement builder has no form for: it sent an empty column list, refused
+	// with error 102.
 	if (insert_col_indices.empty()) {
 		throw NotImplementedException(
 			"MSSQL: INSERT ... DEFAULT VALUES is not supported yet on '%s.%s'; name "
@@ -201,7 +174,7 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	// refuse it without IDENTITY_INSERT -- W4 is what makes this decidable),
 	// and the setting itself. Whether the rows are FEW enough to stay on the
 	// statement path is not known here; the sink decides that at the threshold.
-	config.join_statement_transaction = planning_merge_actions || !config.use_bcp;
+	config.join_statement_transaction = !config.use_bcp;
 	MSSQLInsertBulkPlan bulk;
 	bulk.threshold = config.bcp_threshold;
 	if (op.return_chunk) {
@@ -234,13 +207,6 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	}
 	if (bulk.statement_path_reason.empty()) {
 		bulk.enabled = true;
-		if (planning_merge_actions) {
-			// A MERGE's INSERT action: its rows stay staged until the action's
-			// Finalize and go as statements then (MSSQLDMLConfig::
-			// defer_to_finalize). A bulk stream kept open across the sink would
-			// hold the pinned connection while the other actions send.
-			bulk.threshold = NumericLimits<idx_t>::Maximum();
-		}
 		bulk.target.catalog_name = target.catalog_name;
 		bulk.target.schema_name = target.schema_name;
 		bulk.target.table_name = target.table_name;
@@ -309,77 +275,16 @@ PhysicalOperator &MSSQLCatalog::PlanCreateTableAs(ClientContext &context, Physic
 
 PhysicalOperator &MSSQLCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
 											  LogicalMergeInto &op, PhysicalOperator &plan) {
-	// Spec 080 D3: a table with no usable key is keyed by every column for an
-	// UPDATE / DELETE, but DuckDB's MERGE tells matched from not matched by the
-	// first row-id column -- here the value of the table's first column, NULL in
-	// a matched row whenever that column is -- so a WHEN NOT MATCHED INSERT or
-	// an ERROR action would misfire. MERGE keeps its key requirement.
-	auto &merge_target = op.table.Cast<MSSQLTableEntry>();
-	if (merge_target.UsesKeylessKey()) {
-		const auto schema_name = merge_target.schema.name.GetIdentifierName();
-		const auto table_name = merge_target.name.GetIdentifierName();
-		throw NotImplementedException(
-			"%s MERGE INTO a table without one is not supported: its rows are selected by MERGE's join on the client.",
-			merge_target.GetPrimaryKeyInfo(context).RowIdRefusal(schema_name, table_name, "MERGE",
-																 GetName().GetIdentifierName()));
-	}
-
-	// Which columns each INSERT action did not name, in DuckDB's planning order
-	// (the actions map, then each vector -- Catalog::PlanMergeInto's loop). An
-	// unnamed column's expression is a copy of its bound default; a named one's
-	// refers to the action's projection, never a copy of the default.
-	vector<vector<bool>> unnamed_sets;
-	for (auto &entry : op.actions) {
-		for (auto &action : entry.second) {
-			if (action->action_type != MergeActionType::MERGE_INSERT) {
-				continue;
-			}
-			vector<bool> unnamed(op.bound_defaults.size(), false);
-			if (!action->column_index_map.empty()) {
-				// The deprecated form (a deserialized plan): the map says which
-				// physical column each expression fills.
-				for (auto &col : op.table.GetColumns().Physical()) {
-					const auto storage_idx = col.StorageOid();
-					if (storage_idx < unnamed.size()) {
-						unnamed[storage_idx] = action->column_index_map[col.Physical()] == DConstants::INVALID_INDEX;
-					}
-				}
-				unnamed_sets.push_back(std::move(unnamed));
-				continue;
-			}
-			idx_t expr_idx = 0;
-			for (auto &col : op.table.GetColumns().Physical()) {
-				const auto storage_idx = col.StorageOid();
-				if (expr_idx < action->expressions.size() && storage_idx < op.bound_defaults.size() &&
-					op.bound_defaults[storage_idx]) {
-					auto &expr = *action->expressions[expr_idx];
-					unnamed[storage_idx] = expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF &&
-										   expr.Equals(*op.bound_defaults[storage_idx]);
-				}
-				expr_idx++;
-			}
-			unnamed_sets.push_back(std::move(unnamed));
-		}
-	}
-	struct MergePlanningScope {
-		bool previous;
-		vector<vector<bool>> previous_sets;
-		idx_t previous_next;
-		MergePlanningScope(vector<vector<bool>> sets)
-			: previous(planning_merge_actions),
-			  previous_sets(std::move(merge_insert_unnamed)),
-			  previous_next(merge_insert_next) {
-			planning_merge_actions = true;
-			merge_insert_unnamed = std::move(sets);
-			merge_insert_next = 0;
-		}
-		~MergePlanningScope() {
-			planning_merge_actions = previous;
-			merge_insert_unnamed = std::move(previous_sets);
-			merge_insert_next = previous_next;
-		}
-	} scope(std::move(unnamed_sets));
-	return Catalog::PlanMergeInto(context, planner, op, plan);
+	// Spec 080 D4: a MERGE into a catalog table runs on the server or not at
+	// all. MSSQLOptimizer's pre-optimize hook turns every one it sees into a
+	// staged MERGE (or pushes it whole, PR 4a), so this is reached only when
+	// DuckDB skipped the extension's optimizer.
+	auto &table = op.table.Cast<MSSQLTableEntry>();
+	throw NotImplementedException(
+		"MSSQL: MERGE INTO '%s.%s' is not supported with DuckDB's optimizer off (SET enable_optimizer = false, or "
+		"'extension' in disabled_optimizers): a MERGE into an MSSQL table runs on the server, and the extension "
+		"rewrites it for the server in the optimizer. Nothing was sent.",
+		table.ParentSchema().name.GetIdentifierName(), table.name.GetIdentifierName());
 }
 
 // Spec 080 D3, rung 3: a keyless table's selected rows are matched on the
@@ -537,20 +442,11 @@ static const char *DmlPlatformLabel(const mssql::DmlCapabilities &caps) {
 }
 
 //! The staged operator is the only way this statement can run (RETURNING, or
-//! a platform without the VALUES join) and it cannot: refuse by name. A
-//! native MERGE's actions are refused on a platform without the VALUES join
-//! -- they defer to Finalize on that path (spec 080 PR 4 moves MERGE to the
-//! server). Only there: DuckDB plans a catalog's MERGE actions with no
-//! return_chunk, so on SQL Server an action never reaches here (#443).
+//! a platform without the VALUES join) and it cannot: refuse by name.
 static void RefuseUnstageable(const mssql::DmlCapabilities &caps, const char *verb, MSSQLTableEntry &table_entry,
 							  bool can_stage, bool returning) {
 	const auto schema = table_entry.schema.name.GetIdentifierName();
 	const auto table = table_entry.name.GetIdentifierName();
-	if (planning_merge_actions && !caps.update_from_join) {
-		throw NotImplementedException(
-			"MSSQL: MERGE INTO '%s.%s' with an UPDATE or DELETE action is not supported on %s yet (spec 080 PR 4)",
-			schema, table, DmlPlatformLabel(caps));
-	}
 	if (!can_stage) {
 		throw NotImplementedException(
 			"MSSQL: %s%s on '%s.%s' is not supported: a key or SET column cannot be bulk-loaded into the #stage "
@@ -748,15 +644,9 @@ PhysicalOperator &MSSQLCatalog::PlanDelete(ClientContext &context, PhysicalPlanG
 
 	// Load DML configuration from settings
 	MSSQLDMLConfig config = LoadDMLConfig(context);
-	// Always for a MERGE action. Its actions share the statement's one pinned
-	// connection (in autocommit too since issue #451) and are fed from several
-	// threads; deferred, every action writes after every sink has finished.
-	// Before #451 each action had its own connection and server transaction in
-	// autocommit, and a streaming UPDATE action held its locks while an INSERT
-	// action's bulk load waited on them -- a cycle through the client SQL
-	// Server's deadlock detector cannot see. The cost is the rows held in
-	// memory; spec 080 PR 4 moves MERGE to the server.
-	config.defer_to_finalize = planning_merge_actions || FeedsFromStreamingScan(context, *this, plan);
+	// The scan feeding the statement shares its connection and still streams
+	// (the extension's optimizer did not run): send at Finalize (review of #423).
+	config.defer_to_finalize = FeedsFromStreamingScan(context, *this, plan);
 
 	// Result type is BIGINT (row count)
 	vector<LogicalType> result_types;
@@ -890,15 +780,9 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 
 	// Load DML configuration from settings
 	MSSQLDMLConfig config = LoadDMLConfig(context);
-	// Always for a MERGE action. Its actions share the statement's one pinned
-	// connection (in autocommit too since issue #451) and are fed from several
-	// threads; deferred, every action writes after every sink has finished.
-	// Before #451 each action had its own connection and server transaction in
-	// autocommit, and a streaming UPDATE action held its locks while an INSERT
-	// action's bulk load waited on them -- a cycle through the client SQL
-	// Server's deadlock detector cannot see. The cost is the rows held in
-	// memory; spec 080 PR 4 moves MERGE to the server.
-	config.defer_to_finalize = planning_merge_actions || FeedsFromStreamingScan(context, *this, plan);
+	// The scan feeding the statement shares its connection and still streams
+	// (the extension's optimizer did not run): send at Finalize (review of #423).
+	config.defer_to_finalize = FeedsFromStreamingScan(context, *this, plan);
 
 	// Result type is BIGINT (row count)
 	vector<LogicalType> result_types;

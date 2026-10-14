@@ -345,6 +345,102 @@ static const MSSQLColumnInfo *ColumnRefInfo(const Expression &expr, const Expres
 	return ColumnInfoOf(expr, ctx);
 }
 
+//! The bits and signedness of an integer type; false for any other type.
+static bool IntegerShape(const LogicalType &type, idx_t &bits, bool &is_signed) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+		bits = 8, is_signed = true;
+		return true;
+	case LogicalTypeId::SMALLINT:
+		bits = 16, is_signed = true;
+		return true;
+	case LogicalTypeId::INTEGER:
+		bits = 32, is_signed = true;
+		return true;
+	case LogicalTypeId::BIGINT:
+		bits = 64, is_signed = true;
+		return true;
+	case LogicalTypeId::HUGEINT:
+		bits = 128, is_signed = true;
+		return true;
+	case LogicalTypeId::UTINYINT:
+		bits = 8, is_signed = false;
+		return true;
+	case LogicalTypeId::USMALLINT:
+		bits = 16, is_signed = false;
+		return true;
+	case LogicalTypeId::UINTEGER:
+		bits = 32, is_signed = false;
+		return true;
+	case LogicalTypeId::UBIGINT:
+		bits = 64, is_signed = false;
+		return true;
+	default:
+		return false;
+	}
+}
+
+//! Spec 080 PR 4b (ExpressionEncodeContext::widening_casts): the T-SQL type an
+//! exact numeric widening cast from `source` to `target` is written as, or
+//! empty when the cast is not one. Every value of `source` is a value of
+//! `target`, so the server's CAST computes what DuckDB's does.
+static std::string WideningCastType(const LogicalType &source, const LogicalType &target) {
+	idx_t source_bits = 0;
+	bool source_signed = false;
+	const bool source_integer = IntegerShape(source, source_bits, source_signed);
+	// The decimal digits a source integer can need.
+	const idx_t source_digits = source_bits == 8 ? 3 : source_bits == 16 ? 5 : source_bits == 32 ? 10 : 20;
+	idx_t target_bits = 0;
+	bool target_signed = false;
+	if (IntegerShape(target, target_bits, target_signed)) {
+		if (!source_integer) {
+			return std::string();
+		}
+		const bool holds = source_signed == target_signed
+							   ? target_bits >= source_bits
+							   : (!source_signed && target_signed && target_bits > source_bits);
+		if (!holds) {
+			return std::string();
+		}
+		switch (target.id()) {
+		case LogicalTypeId::TINYINT:
+		case LogicalTypeId::SMALLINT:
+			return "smallint";
+		case LogicalTypeId::UTINYINT:
+			return "tinyint";
+		case LogicalTypeId::INTEGER:
+		case LogicalTypeId::USMALLINT:
+			return "int";
+		case LogicalTypeId::BIGINT:
+		case LogicalTypeId::UINTEGER:
+			return "bigint";
+		case LogicalTypeId::UBIGINT:
+			return "decimal(20,0)";
+		default:
+			return "decimal(38,0)";
+		}
+	}
+	if (target.id() != LogicalTypeId::DECIMAL) {
+		return std::string();
+	}
+	const auto width = DecimalType::GetWidth(target);
+	const auto scale = DecimalType::GetScale(target);
+	if (source_integer) {
+		if (source_bits > 64 || source_digits > idx_t(width - scale)) {
+			return std::string();
+		}
+	} else if (source.id() == LogicalTypeId::DECIMAL) {
+		const auto source_width = DecimalType::GetWidth(source);
+		const auto source_scale = DecimalType::GetScale(source);
+		if (scale < source_scale || width - scale < source_width - source_scale) {
+			return std::string();
+		}
+	} else {
+		return std::string();
+	}
+	return "decimal(" + std::to_string(width) + "," + std::to_string(scale) + ")";
+}
+
 static bool ReadsLossyColumn(const Expression &expr, const ExpressionEncodeContext &ctx) {
 	if (IsLossyReadColumn(ColumnRefInfo(expr, ctx))) {
 		return true;
@@ -844,6 +940,16 @@ ExpressionEncodeResult FilterEncoder::EncodeExpressionImpl(const Expression &exp
 			const auto &cast_child = BoundCastExpression::Child(func_expr);
 			if (ExpressionVocabulary::IsTransparentCast(cast_child.GetReturnType(), target_type)) {
 				return EncodeExpression(cast_child, ctx);
+			}
+			if (ctx.widening_casts) {
+				const auto tsql_type = WideningCastType(cast_child.GetReturnType(), target_type);
+				if (!tsql_type.empty()) {
+					auto child_result = EncodeExpression(cast_child, ctx.child());
+					if (!child_result.supported) {
+						return child_result;
+					}
+					return {"CAST(" + child_result.sql + " AS " + tsql_type + ")", true};
+				}
 			}
 			// A temporal cast is NOT stripped here. It is a free view only when the
 			// surrounding operation is precision-insensitive (a date-part

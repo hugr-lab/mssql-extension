@@ -17,6 +17,8 @@
 #include "connection/mssql_settings.hpp"
 #include "copy/copy_function.hpp"
 #include "dml/insert/mssql_insert_config.hpp"
+#include "dml/merge/mssql_logical_staged_merge.hpp"
+#include "dml/merge/mssql_merge_rewrite.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/main/database.hpp"
@@ -28,6 +30,7 @@
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
@@ -884,21 +887,19 @@ static void CollectSinkCatalogs(LogicalOperator &op, case_insensitive_set_t &cat
 				joining.insert(catalog.GetName().GetIdentifierName());
 			}
 		}
-	} else if (op.type == LogicalOperatorType::LOGICAL_UPDATE || op.type == LogicalOperatorType::LOGICAL_DELETE ||
-			   op.type == LogicalOperatorType::LOGICAL_MERGE_INTO) {
-		// Spec 080 PR 1: an UPDATE / DELETE / MERGE sends its batches down the
-		// same connection as the scan that feeds it -- the pinned one in a
+	} else if (op.type == LogicalOperatorType::LOGICAL_UPDATE || op.type == LogicalOperatorType::LOGICAL_DELETE) {
+		// Spec 080 PR 1: an UPDATE / DELETE sends its batches down the same
+		// connection as the scan that feeds it -- the pinned one in a
 		// transaction, the pool's only one on a pool of one. The scan is
 		// materialised first, so the executors send as rows arrive; they used
 		// to defer every batch to Finalize in a transaction, and on a pool of
-		// one in autocommit they waited out mssql_acquire_timeout.
+		// one in autocommit they waited out mssql_acquire_timeout. (A MERGE
+		// into the catalog is a staged MERGE by now, below.)
 		TableCatalogEntry *table = nullptr;
 		if (op.type == LogicalOperatorType::LOGICAL_UPDATE) {
 			table = &op.Cast<LogicalUpdate>().table;
-		} else if (op.type == LogicalOperatorType::LOGICAL_DELETE) {
-			table = &op.Cast<LogicalDelete>().table;
 		} else {
-			table = &op.Cast<LogicalMergeInto>().table;
+			table = &op.Cast<LogicalDelete>().table;
 		}
 		auto &catalog = table->ParentCatalog();
 		if (catalog.GetCatalogType() == "mssql") {
@@ -906,6 +907,18 @@ static void CollectSinkCatalogs(LogicalOperator &op, case_insensitive_set_t &cat
 			catalogs.insert(catalog.GetName().GetIdentifierName());
 			joining.insert(catalog.GetName().GetIdentifierName());
 		}
+	} else if (op.type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR &&
+			   dynamic_cast<MSSQLLogicalStagedMerge *>(&op)) {
+		// Spec 080 D4: a staged MERGE writes #src and runs its statement on
+		// the statement's pinned connection, so a scan of its catalog feeding
+		// the source is materialised and joins, as for UPDATE / DELETE. Told
+		// by its class, not GetExtensionName(): another extension's operator
+		// need not implement that serialization hook, and the base one throws
+		// (review of #478).
+		auto &catalog = dynamic_cast<MSSQLLogicalStagedMerge &>(op).table.ParentCatalog();
+		MSSQL_OPT_DEBUG(1, "sink: staged MERGE into catalog '%s'", catalog.GetName().GetIdentifierName().c_str());
+		catalogs.insert(catalog.GetName().GetIdentifierName());
+		joining.insert(catalog.GetName().GetIdentifierName());
 	} else if (op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE) {
 		// Issue #380: a CTAS into this catalog. On a pool of one its rows go as
 		// statements on the one connection -- pinned in a transaction, the pool's
@@ -1008,6 +1021,25 @@ void MSSQLOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<Logical
 	for (auto &child : plan->children) {
 		Optimize(input, child);
 	}
+}
+
+//! Spec 080 D4: replace each MERGE into a catalog table, wherever it sits
+//! (under EXPLAIN, PREPARE, ...).
+static void RewriteMerges(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op) {
+	if (op->type == LogicalOperatorType::LOGICAL_MERGE_INTO &&
+		op->Cast<LogicalMergeInto>().table.ParentCatalog().GetCatalogType() == "mssql") {
+		mssql::RewriteMerge(input.context, input.optimizer, op);
+		// The source under it may hold another MERGE no more than the binder's
+		// tree did: nothing below a MERGE is a MERGE.
+		return;
+	}
+	for (auto &child : op->children) {
+		RewriteMerges(input, child);
+	}
+}
+
+void MSSQLOptimizer::PreOptimizeRoot(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	RewriteMerges(input, plan);
 }
 
 void MSSQLOptimizer::OptimizeRoot(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {

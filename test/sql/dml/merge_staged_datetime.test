@@ -1,0 +1,74 @@
+# name: test/sql/dml/merge_staged_datetime.test
+# description: a staged MERGE compares a datetime column with the source in its own type, so every value read back matches (spec 080 D4, PR 4b; #358, #426)
+# group: [dml]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# DuckDB reads a datetime as microseconds, truncated from the 1/300 s tick. A
+# #src column compared with the datetime column directly is declared datetime,
+# the target's own type, so the value read comes back onto its tick; declared
+# datetime2 (the CTAS mapping of TIMESTAMP), 200 of these 603 ticks would not
+# match (#426) and the WHEN NOT MATCHED INSERT would duplicate them.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS mgd (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('mgd', 'DROP TABLE IF EXISTS dbo.mgd_t; CREATE TABLE dbo.mgd_t (id int IDENTITY(1, 1) PRIMARY KEY, ts datetime NOT NULL, hit int NOT NULL DEFAULT 0); INSERT INTO dbo.mgd_t (ts) SELECT TOP (603) DATEADD(ms, (ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1) * 10 / 3, CAST(''2024-01-01T10:00:00'' AS datetime)) FROM sys.all_objects');
+
+query I
+SELECT count(DISTINCT ts) FROM mgd.dbo.mgd_t;
+----
+603
+
+statement ok
+CREATE TABLE mgd_read AS SELECT id, ts FROM mgd.dbo.mgd_t;
+
+query I
+MERGE INTO mgd.dbo.mgd_t AS t USING mgd_read AS s ON t.ts = s.ts
+WHEN MATCHED THEN UPDATE SET hit = 1
+WHEN NOT MATCHED THEN INSERT (ts) VALUES (s.ts);
+----
+603
+
+query II
+SELECT count(*), sum(hit) FROM mgd.dbo.mgd_t;
+----
+603	603
+
+# In a WHEN condition too: the value read back equals the stored one.
+query I
+MERGE INTO mgd.dbo.mgd_t AS t USING mgd_read AS s ON t.id = s.id
+WHEN MATCHED AND t.ts <> s.ts THEN UPDATE SET hit = 2;
+----
+0
+
+query I
+SELECT count(*) FROM mgd.dbo.mgd_t WHERE hit = 2;
+----
+0
+
+# A source value between two ticks is compared as the column would store it:
+# rounded onto the nearest tick, the server's datetime semantics (D4) -- .004
+# matches the row at .00333, which DuckDB comparing microseconds would not.
+query I
+MERGE INTO mgd.dbo.mgd_t AS t USING (SELECT TIMESTAMP '2024-01-01 10:00:00.004' AS ts) AS s ON t.ts = s.ts
+WHEN MATCHED THEN UPDATE SET hit = 5;
+----
+1
+
+query I
+SELECT count(*) FROM mgd.dbo.mgd_t WHERE hit = 5 AND ts > TIMESTAMP '2024-01-01 10:00:00.003' AND ts < TIMESTAMP '2024-01-01 10:00:00.004';
+----
+1
+
+statement ok
+SELECT mssql_exec('mgd', 'DROP TABLE dbo.mgd_t');
+
+statement ok
+DETACH mgd;

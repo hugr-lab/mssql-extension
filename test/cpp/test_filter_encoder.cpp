@@ -714,6 +714,50 @@ static void TestColumnResolver() {
 	ASSERT_TRUE(params.params.size() == before);
 }
 
+// Spec 080 PR 4b: with widening_casts, an exact numeric widening cast is
+// written as CAST(... AS ...); without it, and for any cast that is not one,
+// the expression is refused as before.
+static unique_ptr<Expression> CastTo(unique_ptr<Expression> child, const LogicalType &type) {
+	return BoundCastExpression::AddDefaultCastToType(std::move(child), type);
+}
+
+static void TestWideningCasts() {
+	std::cout << "  TestWideningCasts..." << std::endl;
+	Fixture fx;
+	auto ctx = fx.Context();
+	auto plus = [&](unique_ptr<Expression> lhs, const LogicalType &type) {
+		return Call2("+", type, type, type, std::move(lhs), Const(Value::BIGINT(5).DefaultCastAs(type)));
+	};
+	// off: refused
+	ASSERT_REFUSED(FilterEncoder::EncodeExpression(
+		*plus(CastTo(ColRef(fx, COL_ID), LogicalType::BIGINT), LogicalType::BIGINT), ctx));
+	ctx.widening_casts = true;
+	ASSERT_SQL(FilterEncoder::EncodeExpression(
+				   *plus(CastTo(ColRef(fx, COL_ID), LogicalType::BIGINT), LogicalType::BIGINT), ctx),
+			   "(CAST([id] AS bigint) + 5)");
+	ASSERT_SQL(FilterEncoder::EncodeExpression(*CastTo(ColRef(fx, COL_ID), LogicalType::HUGEINT), ctx),
+			   "CAST([id] AS decimal(38,0))");
+	ASSERT_SQL(FilterEncoder::EncodeExpression(*CastTo(ColRef(fx, COL_ID), LogicalType::DECIMAL(12, 2)), ctx),
+			   "CAST([id] AS decimal(12,2))");
+	// not widening: narrower, a decimal that cannot hold every int, a float
+	ASSERT_REFUSED(FilterEncoder::EncodeExpression(*CastTo(ColRef(fx, COL_ID), LogicalType::SMALLINT), ctx));
+	ASSERT_REFUSED(FilterEncoder::EncodeExpression(*CastTo(ColRef(fx, COL_ID), LogicalType::DECIMAL(9, 0)), ctx));
+	ASSERT_REFUSED(FilterEncoder::EncodeExpression(*CastTo(ColRef(fx, COL_ID), LogicalType::DOUBLE), ctx));
+	ASSERT_REFUSED(FilterEncoder::EncodeExpression(*CastTo(ColRef(fx, COL_D), LogicalType::DECIMAL(38, 2)), ctx));
+	// unsigned: into a wider signed integer, or a decimal for UBIGINT
+	auto uref = make_uniq<BoundColumnRefExpression>(LogicalType::UINTEGER,
+													ColumnBinding(TableIndex(0), ProjectionIndex(COL_ID)));
+	ASSERT_SQL(FilterEncoder::EncodeExpression(*CastTo(uref->Copy(), LogicalType::BIGINT), ctx),
+			   "CAST([id] AS bigint)");
+	ASSERT_SQL(FilterEncoder::EncodeExpression(*CastTo(uref->Copy(), LogicalType::UBIGINT), ctx),
+			   "CAST([id] AS decimal(20,0))");
+	ASSERT_REFUSED(FilterEncoder::EncodeExpression(*CastTo(uref->Copy(), LogicalType::INTEGER), ctx));
+	// children inherit it
+	auto child = ctx.child();
+	ASSERT_SQL(FilterEncoder::EncodeExpression(*CastTo(ColRef(fx, COL_ID), LogicalType::BIGINT), child),
+			   "CAST([id] AS bigint)");
+}
+
 // Issue #426: time(7) / datetimeoffset(7) are read with their 100 ns digit
 // dropped, so the read equals c for every stored value in [c, c + 1 us): `=`
 // is that range, `>` starts at c + 1 us, `<=` ends before it, `>=` / `<` stay.
@@ -1091,6 +1135,7 @@ int main() {
 	TestInListOperatorExpressions();
 	TestDeclarationForColumn();
 	TestColumnResolver();
+	TestWideningCasts();
 
 	std::cout << "All FilterEncoder tests PASSED!" << std::endl;
 	return 0;

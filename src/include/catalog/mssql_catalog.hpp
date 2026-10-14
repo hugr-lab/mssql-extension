@@ -267,10 +267,10 @@ public:
 	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
 								 PhysicalOperator &plan) override;
 
-	//! DuckDB's own MERGE planning, with the actions marked so their rows go out
-	//! at each action's Finalize (MSSQLDMLConfig::defer_to_finalize; spec 080
-	//! PR 1). A MERGE pushed whole, and one statement connection for all its
-	//! actions, are spec 080 PR 4.
+	//! A refusal by name (spec 080 D4): a MERGE into a catalog table is pushed
+	//! whole (PR 4a) or staged through #src by MSSQLOptimizer's pre-optimize
+	//! hook (PR 4b, dml/merge/), so a LogicalMergeInto reaches planning only
+	//! when DuckDB skipped the extension's optimizer.
 	PhysicalOperator &PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner, LogicalMergeInto &op,
 									PhysicalOperator &plan) override;
 

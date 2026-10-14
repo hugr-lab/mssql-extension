@@ -141,7 +141,7 @@ SELECT count(*) FROM fe.fe_s.stg__;
 ----
 2
 
-# --- a MERGE with only an INSERT action is unchanged --------------------------
+# --- a MERGE with only an INSERT action: through #src, as every MERGE -------
 
 query I
 MERGE INTO fe.dbo.fe_k AS t USING (SELECT 9100 AS id) AS s ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, 0, NULL);
@@ -197,10 +197,20 @@ UPDATE fe.dbo.fe_k SET v = 1 WHERE id = 1 RETURNING id;
 ----
 is not supported on Fabric Warehouse yet
 
-statement error
+# --- MERGE runs on the server through #src (spec 080 D4, PR 4b) ---------------
+
+query I
 MERGE INTO fe.dbo.fe_k AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = 7;
 ----
-is not supported on Fabric Warehouse yet (spec 080 PR 4)
+1
+
+query I
+SELECT v FROM fe.dbo.fe_k WHERE id = 1;
+----
+7
+
+statement ok
+SELECT mssql_exec('fe', 'UPDATE dbo.fe_k SET v = 1 WHERE id = 1');
 
 # a legacy text SET column cannot be the subquery's value (error 279): Fabric
 # has none, SQL Server under the emulation does -- refused by name (#444)

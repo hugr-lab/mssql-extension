@@ -134,6 +134,14 @@ struct ExpressionEncodeContext {
 	// consulted for one. Inherited by children.
 	const ColumnResolver *resolver = nullptr;
 
+	// Spec 080 PR 4b: write an exact numeric widening cast -- an integer to a
+	// wider integer or to a decimal that holds it, a decimal to a wider one --
+	// as CAST(... AS ...) instead of refusing it. The staged MERGE sets it: its
+	// values mix the target's columns with the source's wider types
+	// (`t.v + len(...)` is `CAST(v AS BIGINT) + ...`). The scan path leaves it
+	// off. Inherited by children.
+	bool widening_casts = false;
+
 	ExpressionEncodeContext(const std::vector<column_t> &col_ids, const std::vector<std::string> &col_names,
 							const std::vector<LogicalType> &col_types)
 		: column_ids(col_ids), column_names(col_names), column_types(col_types), depth(0) {}
@@ -163,6 +171,7 @@ struct ExpressionEncodeContext {
 		ctx.filter_column_info = filter_column_info;
 		ctx.division_by_zero_errors = division_by_zero_errors;
 		ctx.resolver = resolver;
+		ctx.widening_casts = widening_casts;
 		return ctx;
 	}
 

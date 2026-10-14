@@ -97,7 +97,7 @@ marks the catalog's transaction, and from then on `GetConnection` pins (BEGIN
 on first use, no `transaction_isolation` SET -- autocommit keeps its level),
 the scans of that catalog materialise, and `MSSQLTransactionManager` ends the
 server transaction. An INSERT joins the same way under `mssql_insert_use_bcp =
-false` (and as a MERGE action); a CTAS under `mssql_ctas_use_bcp = false` runs
+false`; a CTAS under `mssql_ctas_use_bcp = false` runs
 whole in the transaction. With those settings true (the default) INSERT and CTAS
 keep the per-statement bracket above and their parallel writers. COPY and
 `mssql_exec()` never join.

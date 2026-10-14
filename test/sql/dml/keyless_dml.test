@@ -119,17 +119,30 @@ DELETE FROM kl.dbo.kl_shift USING kl.dbo.kl_str WHERE kl_shift.b = kl_str.v;
 ----
 selected on the client
 
-statement error
+# A MERGE needs no key: it runs on the server through #src (spec 080 D4,
+# PR 4b), whatever selects the rows.
+statement ok
+BEGIN;
+
+query I
 MERGE INTO kl.dbo.kl_shift AS t USING (SELECT 2 AS b) AS s ON t.b = s.b WHEN MATCHED THEN UPDATE SET a = 0;
 ----
-MERGE's join
+1
 
-# INSERT only: DuckDB would tell matched from not matched by the first key
-# column, which is a value here, so MERGE keeps its key requirement.
-statement error
+query I
 MERGE INTO kl.dbo.kl_shift AS t USING (SELECT 9 AS b) AS s ON t.b = s.b WHEN NOT MATCHED THEN INSERT VALUES (9, 9);
 ----
-MERGE INTO a table without one is not supported
+1
+
+query II
+SELECT a, b FROM kl.dbo.kl_shift ORDER BY b;
+----
+2	1
+0	2
+9	9
+
+statement ok
+ROLLBACK;
 
 query II
 SELECT a, b FROM kl.dbo.kl_shift ORDER BY b;

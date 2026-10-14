@@ -68,7 +68,7 @@ struct MSSQLInsertConfig {
 	//! Issue #451: an autocommit INSERT joins the DuckDB statement's own
 	//! transaction (ConnectionProvider::JoinStatementTransaction) -- one pinned
 	//! connection, committed or rolled back with DuckDB -- when
-	//! mssql_insert_use_bcp is false, and always as a MERGE action. With it true
+	//! mssql_insert_use_bcp is false. With it true
 	//! (the default) an INSERT commits on its own at Finalize, so the bulk path
 	//! keeps its parallel writers. Decided at planning, with use_bcp, so the
 	//! optimizer's materialisation and the sink agree.
