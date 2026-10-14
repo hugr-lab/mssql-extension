@@ -28,6 +28,7 @@
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "pushdown/mssql_expression_vocabulary.hpp"
+#include "pushdown/mssql_merge_shape.hpp"
 
 namespace duckdb {
 namespace mssql {
@@ -492,29 +493,15 @@ bool NodeWriter::WriteInsert(const InsertQueryNode &node, const BaseTableRef &ta
 //   WHEN NOT MATCHED [BY TARGET] [AND c] THEN INSERT ([col], …) VALUES (v, …)
 //   WHEN NOT MATCHED BY SOURCE [AND c] THEN UPDATE SET … | DELETE;
 //
-// DuckDB takes any number of WHEN clauses of each kind and applies the first
-// whose condition holds. T-SQL takes at most two WHEN MATCHED (one UPDATE, one
-// DELETE, the first conditional), one WHEN NOT MATCHED BY TARGET (an INSERT)
-// and two WHEN NOT MATCHED BY SOURCE -- the same first-match rule within that
-// shape. Anything beyond it is refused by name, nothing sent: the statement
-// keeps the native path (until PR 4b). A trailing DO NOTHING is dropped (no
-// later clause it could take rows from); one before another clause is
-// refused. A target row matched by several source rows is an error on both
-// sides (8672; DuckDB's own), and the count is the MERGE's DONE count.
+// The WHEN clauses T-SQL has a form for are mssql::CheckMergeShape's
+// (pushdown/mssql_merge_shape.hpp, shared with the staged MERGE); anything
+// beyond them is refused by name, nothing sent: the statement keeps the
+// native path (until PR 4b). A target row matched by several source rows is
+// an error on both sides (8672; DuckDB's own), and the count is the MERGE's
+// DONE count.
 //===----------------------------------------------------------------------===//
 
 namespace {
-
-const char *WhenSql(MergeActionCondition when) {
-	switch (when) {
-	case MergeActionCondition::WHEN_MATCHED:
-		return "WHEN MATCHED";
-	case MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET:
-		return "WHEN NOT MATCHED BY TARGET";
-	default:
-		return "WHEN NOT MATCHED BY SOURCE";
-	}
-}
 
 bool HoldsSubquery(const MergeIntoAction &action) {
 	if (action.condition && action.condition->HasSubquery()) {
@@ -634,7 +621,7 @@ bool NodeWriter::WriteMergeAction(const MergeIntoAction &action, MergeActionCond
 	if (HoldsSubquery(action)) {
 		return Veto("a subquery in a MERGE action");
 	}
-	sql = WhenSql(when);
+	sql = MergeWhenSql(when);
 	if (action.condition) {
 		if (HoldsAggregateOrWindow(*action.condition)) {
 			return Veto("an aggregate or a window function in a MERGE condition");
@@ -684,8 +671,6 @@ bool NodeWriter::WriteMergeAction(const MergeIntoAction &action, MergeActionCond
 		sql += "UPDATE SET " + set_sql;
 		return true;
 	}
-	case MergeActionType::MERGE_ERROR:
-		return Veto("an ERROR action in a MERGE");
 	default:
 		return Veto("a MERGE action T-SQL has no form for");
 	}
@@ -780,63 +765,37 @@ bool NodeWriter::WriteMerge(const MergeQueryNode &node) {
 	merge_has_by_source_ = node.actions.count(MergeActionCondition::WHEN_NOT_MATCHED_BY_SOURCE) > 0;
 	merge_has_by_target_ = node.actions.count(MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET) > 0;
 
-	// T-SQL's shape, after a trailing DO NOTHING is dropped.
+	// T-SQL's shape (CheckMergeShape, shared with the staged MERGE), a last DO
+	// NOTHING dropped; the clauses in T-SQL's order.
+	std::map<MergeActionCondition, std::vector<MergeActionType>> shape;
+	for (auto &entry : node.actions) {
+		auto &list = shape[entry.first];
+		for (auto &action : entry.second) {
+			list.push_back(action->action_type);
+		}
+	}
+	std::map<MergeActionCondition, std::vector<idx_t>> kept;
+	std::string shape_why;
+	if (!CheckMergeShape(shape, kept, shape_why)) {
+		return Veto(shape_why);
+	}
 	std::string clauses;
 	const MergeActionCondition order[] = {MergeActionCondition::WHEN_MATCHED,
 										  MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET,
 										  MergeActionCondition::WHEN_NOT_MATCHED_BY_SOURCE};
 	for (auto when : order) {
-		auto entry = node.actions.find(when);
-		if (entry == node.actions.end()) {
+		auto entry = kept.find(when);
+		if (entry == kept.end()) {
 			continue;
 		}
-		std::vector<const MergeIntoAction *> actions;
-		for (idx_t i = 0; i < entry->second.size(); i++) {
-			const auto &action = *entry->second[i];
-			if (action.action_type == MergeActionType::MERGE_DO_NOTHING) {
-				if (i + 1 != entry->second.size()) {
-					// Rows it holds back would reach a later clause on the server.
-					return Veto(std::string("DO NOTHING before another ") + WhenSql(when) + " clause");
-				}
-				continue;
-			}
-			actions.push_back(&action);
-		}
-		if (when == MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET) {
-			if (actions.size() > 1) {
-				return Veto("more than one WHEN NOT MATCHED BY TARGET clause");
-			}
-			if (!actions.empty() && actions[0]->action_type != MergeActionType::MERGE_INSERT) {
-				return Veto("WHEN NOT MATCHED BY TARGET without INSERT");
-			}
-		} else {
-			if (actions.size() > 2) {
-				return Veto(std::string("more than two ") + WhenSql(when) + " clauses");
-			}
-			// T-SQL wants the first of two clauses conditional. DuckDB's parser
-			// already refuses a clause after an unconditional one of its kind
-			// ("would be unreachable"), DO NOTHING included.
-			if (actions.size() == 2) {
-				if (actions[0]->action_type == actions[1]->action_type) {
-					return Veto(std::string("two ") + WhenSql(when) + " clauses of one action");
-				}
-			}
-			for (auto *action : actions) {
-				if (action->action_type == MergeActionType::MERGE_INSERT) {
-					return Veto(std::string("INSERT in ") + WhenSql(when));
-				}
-			}
-		}
-		for (auto *action : actions) {
+		const auto &actions = node.actions.find(when)->second;
+		for (auto i : entry->second) {
 			std::string clause;
-			if (!WriteMergeAction(*action, when, clause)) {
+			if (!WriteMergeAction(*actions[i], when, clause)) {
 				return false;
 			}
 			clauses += " " + clause;
 		}
-	}
-	if (clauses.empty()) {
-		return Veto("a MERGE with no action");
 	}
 
 	auto &target = relations_[0].table;

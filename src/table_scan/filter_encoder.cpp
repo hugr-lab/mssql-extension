@@ -258,7 +258,7 @@ std::string FilterEncoder::EncodeConstantValue(const Value &value, const Logical
 // The SQL Server column an expression IS, when it is a plain reference to
 // one: the peer a constant compared with it is declared from.
 static const MSSQLColumnInfo *ColumnInfoOf(const Expression &expr_in, const ExpressionEncodeContext &ctx) {
-	if (!ctx.mssql_columns) {
+	if (!ctx.mssql_columns && !ctx.resolver) {
 		return nullptr;
 	}
 	// Spec 060 reports MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) for string columns
@@ -275,6 +275,11 @@ static const MSSQLColumnInfo *ColumnInfoOf(const Expression &expr_in, const Expr
 	}
 	if (expr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 		return nullptr;
+	}
+	if (ctx.resolver) {
+		std::string sql;
+		const MSSQLColumnInfo *column = nullptr;
+		return ctx.resolver->Resolve(expr->Cast<BoundColumnRefExpression>(), sql, column) ? column : nullptr;
 	}
 	const auto &binding = expr->Cast<BoundColumnRefExpression>().Binding();
 	column_t table_col_idx;
@@ -775,6 +780,10 @@ ExpressionEncodeResult FilterEncoder::EncodeSearchCondition(const Expression &ex
 //------------------------------------------------------------------------------
 
 ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, const ExpressionEncodeContext &ctx) {
+	// ColumnResolver's contract: with a resolver the scan's projection and PK
+	// are unset, or the rowid paths would resolve a name behind it (review of
+	// #477).
+	D_ASSERT(!ctx.resolver || (ctx.column_ids.empty() && !ctx.HasPKInfo()));
 	// Spec 076: constants register themselves in the sink as they are met, so
 	// an expression refused halfway (a comparison whose other side does not
 	// encode) would leave its parameters in the DECLARE line -- unused, and a
@@ -1279,6 +1288,15 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundFunctio
 
 ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpression &expr,
 													  const ExpressionEncodeContext &ctx) {
+	if (ctx.resolver) {
+		std::string sql;
+		const MSSQLColumnInfo *column = nullptr;
+		if (!ctx.resolver->Resolve(expr, sql, column)) {
+			return {"", false};
+		}
+		return {sql, true};
+	}
+
 	// Get the column binding - this contains the table index and column index
 	const auto &binding = expr.Binding();
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeColumnRef: table_idx=%llu, column_idx=%llu",
