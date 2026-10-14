@@ -93,7 +93,7 @@ void CountDml(DmlPath path) {
 
 namespace {
 
-enum class DmlKind : uint8_t { UPDATE, DELETE, INSERT };
+enum class DmlKind : uint8_t { UPDATE, DELETE, INSERT, MERGE };
 
 struct MSSQLDmlBindData : public TableFunctionData {
 	string context_name;
@@ -151,6 +151,8 @@ const char *VerbOf(DmlKind kind) {
 		return "UPDATE";
 	case DmlKind::DELETE:
 		return "DELETE";
+	case DmlKind::MERGE:
+		return "MERGE";
 	default:
 		return "INSERT";
 	}
@@ -197,8 +199,12 @@ unique_ptr<FunctionData> MSSQLDmlBind(ClientContext &context, TableFunctionBindI
 	} else if (kind == "insert") {
 		bind_data->kind = DmlKind::INSERT;
 		bind_data->join_statement_transaction = !LoadInsertConfig(context).use_bcp;
+	} else if (kind == "merge") {
+		// Spec 080 PR 4a. Joins the statement's DuckDB transaction, as an UPDATE.
+		bind_data->kind = DmlKind::MERGE;
 	} else {
-		throw InvalidInputException("mssql_dml: kind := must be 'update', 'delete' or 'insert', got '%s'", kind);
+		throw InvalidInputException("mssql_dml: kind := must be 'update', 'delete', 'insert' or 'merge', got '%s'",
+									kind);
 	}
 	auto identity = input.named_parameters.find("identity_insert");
 	bind_data->identity_insert =
@@ -211,7 +217,7 @@ unique_ptr<FunctionData> MSSQLDmlBind(ClientContext &context, TableFunctionBindI
 
 	if (mssql::SqlMayChangeSchema(bind_data->statement)) {
 		throw InvalidInputException(
-			"mssql_dml runs an UPDATE, DELETE or INSERT; use mssql_exec() for a statement that may "
+			"mssql_dml runs an UPDATE, DELETE, INSERT or MERGE; use mssql_exec() for a statement that may "
 			"change the schema");
 	}
 
@@ -226,10 +232,15 @@ unique_ptr<FunctionData> MSSQLDmlBind(ClientContext &context, TableFunctionBindI
 		throw NotImplementedException("mssql_dml: cannot be bound here (no binder to register the write with)");
 	}
 	auto &properties = input.binder->GetStatementProperties();
-	properties.RegisterDBModify(catalog, context,
-								bind_data->kind == DmlKind::UPDATE	 ? DatabaseModificationType::UPDATE_DATA
-								: bind_data->kind == DmlKind::DELETE ? DatabaseModificationType::DELETE_DATA
-																	 : DatabaseModificationType::INSERT_DATA);
+	// A MERGE's actions are not known here: it may insert, update and delete.
+	properties.RegisterDBModify(
+		catalog, context,
+		bind_data->kind == DmlKind::UPDATE	 ? DatabaseModificationType(DatabaseModificationType::UPDATE_DATA)
+		: bind_data->kind == DmlKind::DELETE ? DatabaseModificationType(DatabaseModificationType::DELETE_DATA)
+		: bind_data->kind == DmlKind::INSERT
+			? DatabaseModificationType(DatabaseModificationType::INSERT_DATA)
+			: DatabaseModificationType(DatabaseModificationType::INSERT_DATA | DatabaseModificationType::UPDATE_DATA |
+									   DatabaseModificationType::DELETE_DATA));
 
 	if (input.inputs.size() >= 3) {
 		string declarations_override;
@@ -334,6 +345,12 @@ unique_ptr<GlobalTableFunctionState> MSSQLDmlInitGlobal(ClientContext &context, 
 	connection.reset();
 	statement.Commit(context, catalog);
 	mssql::CountDml(mssql::DmlPath::PUSHED);
+	if (bind_data.kind == DmlKind::MERGE && context.transaction.IsAutoCommit() && state->count > 0) {
+		// A MERGE's count mixes its inserted, updated and deleted rows, so the
+		// cached row count cannot be adjusted by it: it is dropped, and the
+		// planner's next lookup reads a fresh one.
+		catalog.GetStatisticsProvider().InvalidateTable(bind_data.schema_name, bind_data.table_name);
+	}
 	if (deleted_from) {
 		deleted_from->NoteRowsDeleted(static_cast<idx_t>(state->count));
 	}
@@ -398,9 +415,9 @@ void RegisterMSSQLDmlFunction(ExtensionLoader &loader) {
 	mssql::RegisterDocumentedFunction(
 		loader, std::move(set),
 		{{},
-		 "Internal: the vehicle a pushed UPDATE / DELETE / INSERT ... SELECT runs through (spec 080). Runs the T-SQL "
-		 "statement once on "
-		 "the attached database -- atomically in autocommit, on the transaction's connection inside one -- and "
+		 "Internal: the vehicle a pushed UPDATE / DELETE / INSERT ... SELECT / MERGE runs through (spec 080). Runs the "
+		 "T-SQL statement once on the attached database -- atomically in autocommit, on the transaction's connection "
+		 "inside one -- and "
 		 "returns its row count as Count. The remote-pushdown rewriter's target, not an API: its arguments carry no "
 		 "compatibility promise.",
 		 {"SELECT * FROM mssql_dml('db', 'UPDATE [dbo].[t] SET [v] = 1 WHERE [id] = @p1', {'p1': 5}, '@p1 int', "

@@ -79,12 +79,8 @@ static string OutName(idx_t i) {
 //! cannot write a rowversion column.
 static string ReturningExpression(const MSSQLStagedDmlTarget &target, idx_t i, const string &qualifier) {
 	const auto &col = target.table_columns[i];
-	if (IsRowVersion(col)) {
-		return "CAST(" + qualifier + mssql::QuoteIdentifier(col.name) + " AS binary(8)) AS " +
-			   mssql::QuoteIdentifier(OutName(i));
-	}
-	return MSSQLColumnInfo::BuildReadExpression(col.name, col.sql_type_name, col.max_length, col.collation_name,
-												target.convert_varchar_max, qualifier, OutName(i));
+	return MSSQLColumnInfo::BuildReturningExpression(col.name, col.sql_type_name, col.max_length, col.collation_name,
+													 target.convert_varchar_max, qualifier, OutName(i));
 }
 
 string MSSQLStagedDml::CreateOutSql(const MSSQLStagedDmlTarget &target, const string &out_name) {

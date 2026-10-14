@@ -84,8 +84,11 @@ struct DmlBatchOptions {
 	//! wait goes in 1 s slices that ask ClientContext::IsInterrupted, and a
 	//! dead peer ends it through the socket's TCP keepalive.
 	bool no_deadline = false;
-	//! INSERT ... OUTPUT: called for each ROW token, with the columns of the
-	//! COLMETADATA before it. Rows are skipped when this is unset.
+	//! INSERT ... OUTPUT: called for each COLMETADATA token, i.e. at the start
+	//! of each result set (a trigger can send its own before the OUTPUT rows),
+	//! and then for each ROW token with the columns of the COLMETADATA before
+	//! it. Rows are skipped when on_row is unset.
+	std::function<void(const std::vector<tds::ColumnMetadata> &)> on_metadata;
 	std::function<void(const tds::RowData &, const std::vector<tds::ColumnMetadata> &)> on_row;
 };
 

@@ -500,6 +500,29 @@ string NVarcharLength(const string &sql_type_name, int16_t max_length) {
 
 }  // namespace
 
+string MSSQLColumnInfo::BuildReturningExpression(const string &col_name, const string &sql_type_name,
+												 int16_t max_length, const string &collation_name,
+												 bool convert_varchar_max, const string &qualifier,
+												 const string &alias) {
+	const auto type = StringUtil::Lower(sql_type_name);
+	const auto reference = qualifier + mssql::QuoteIdentifier(col_name);
+	const auto as = " AS " + mssql::QuoteIdentifier(alias.empty() ? col_name : alias);
+	if (type == "timestamp" || type == "rowversion") {
+		return "CAST(" + reference + " AS binary(8))" + as;
+	}
+	if (type == "char") {
+		// The read expression is NCHAR(n) (#405), which doubles a char's fixed
+		// width in the table this types: two char(2100) columns came to 8400
+		// bytes, past the 8060-byte row (1701), where the source table and a
+		// bare OUTPUT had no trouble. A trimmed NVARCHAR is variable-length and
+		// arrives without the padding, as the NCHAR read would (review of #471).
+		return "RTRIM(CAST(" + reference + " AS NVARCHAR(" +
+			   (max_length > 0 && max_length <= 4000 ? std::to_string(max_length) : string("MAX")) + ")))" + as;
+	}
+	return BuildReadExpression(col_name, sql_type_name, max_length, collation_name, convert_varchar_max, qualifier,
+							   alias);
+}
+
 string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string &sql_type_name, int16_t max_length,
 											const string &collation_name, bool convert_varchar_max,
 											const string &qualifier, const string &alias, bool utf8_on_wire) {

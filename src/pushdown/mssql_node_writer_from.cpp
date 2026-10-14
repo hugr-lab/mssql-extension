@@ -75,6 +75,10 @@ int NodeWriter::FindColumn(const ColumnRefExpression &ref, idx_t &out) const {
 		if ((visible_ != DConstants::INVALID_INDEX && relation_of_[i] >= visible_) ||
 			(relations_[relation_of_[i]].semi && relation_of_[i] != semi_scope_) ||
 			(relation != DConstants::INVALID_INDEX && relation_of_[i] != relation) ||
+			// An unqualified name in a MERGE action is looked up on the side its
+			// rows have, as DuckDB binds it (spec 080 PR 4a).
+			(relation == DConstants::INVALID_INDEX && merge_forbidden_first_ != DConstants::INVALID_INDEX &&
+			 relation_of_[i] >= merge_forbidden_first_ && relation_of_[i] < merge_forbidden_last_) ||
 			!StringUtil::CIEquals(columns_[i].name, name)) {
 			continue;
 		}
@@ -101,6 +105,13 @@ bool NodeWriter::ResolveColumn(const ColumnRefExpression &ref, idx_t &out) {
 	}
 	switch (found) {
 	case 1:
+		if (merge_forbidden_first_ != DConstants::INVALID_INDEX && relation_of_[out] >= merge_forbidden_first_ &&
+			relation_of_[out] < merge_forbidden_last_) {
+			// A MERGE action naming the side its rows do not have.
+			return Veto("column " + ref.ToString() + " of the " +
+						(merge_forbidden_first_ == 0 ? "target in WHEN NOT MATCHED BY TARGET"
+													 : "source in WHEN NOT MATCHED BY SOURCE"));
+		}
 		return true;
 	case 0:
 		return Veto("column " + names.back().GetIdentifierName() + " is not a column of the query's tables");

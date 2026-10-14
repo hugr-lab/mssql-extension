@@ -285,7 +285,7 @@ gate widening this further (spec 061).
 |---|---|---|
 | `mssql_insert_batch_size` | 1000 | Rows per INSERT statement |
 | `mssql_insert_max_sql_bytes` | 8MB | Max SQL statement size |
-| `mssql_insert_use_returning_output` | true | Use OUTPUT INSERTED for RETURNING |
+| `mssql_insert_use_returning_output` | true | Deprecated, no effect: an INSERT … RETURNING always uses OUTPUT (removed in the next release) |
 
 ### UPDATE/DELETE Tuning
 | Setting | Default | Description |

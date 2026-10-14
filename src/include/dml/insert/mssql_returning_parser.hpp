@@ -1,6 +1,5 @@
 #pragma once
 
-#include <memory>
 #include <vector>
 #include "dml/insert/mssql_insert_target.hpp"
 #include "dml/mssql_dml_execute.hpp"
@@ -12,12 +11,20 @@
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
-// MSSQLReturningParser - Collects OUTPUT INSERTED rows into a DuckDB DataChunk
+// MSSQLReturningParser - Collects the RETURNING rows of an INSERT batch into a
+// DuckDB DataChunk
 //
-// The rows of an INSERT ... OUTPUT INSERTED batch, for the RETURNING clause.
-// mssql::ExecuteDmlBatch reads the response; this receives its ROW tokens
-// (spec 080 acceptance 7: it used to read the socket with a copy of the DML
-// token loop of its own).
+// mssql::ExecuteDmlBatch reads the response and hands this the result sets
+// (spec 080 acceptance 7: it used to read the socket itself, with a copy of
+// the DML token loop of its own). Only the batch's LAST result set holds the
+// RETURNING rows:
+// - the read of the OUTPUT ... INTO table on SQL Server (issue #471), which
+//   comes after the INSERT; the DROP after it sends no rows;
+// - the bare OUTPUT elsewhere, the only set there, since an enabled trigger
+//   refuses that form (334).
+// A trigger may send result sets of its own before it ('disallow results from
+// triggers' defaults to 0). So the rows are kept as they arrive and decoded
+// only when the response is complete.
 //
 // Usage:
 //   MSSQLReturningParser output(target, returning_column_ids);
@@ -33,16 +40,17 @@ public:
 	// @param returning_column_ids Column indices to return (maps to OUTPUT INSERTED columns)
 	MSSQLReturningParser(const MSSQLInsertTarget &target, const vector<idx_t> &returning_column_ids);
 
-	//! Route the ROW tokens of the statement `options` runs into this parser.
+	//! Route the result sets of the statement `options` runs into this parser.
 	//! The parser must outlive that call.
 	void Attach(mssql::DmlBatchOptions &options);
 
-	//! Rows received so far
+	//! Rows in the last result set received
 	idx_t GetRowCount() const {
-		return row_count_;
+		return rows_.size();
 	}
 
-	//! The rows received, or nullptr when there were none.
+	//! The rows of the last result set, decoded, or nullptr when there were
+	//! none. Throws when that set is not the RETURNING list's shape.
 	unique_ptr<DataChunk> TakeResult();
 
 	// Get the DuckDB types for the result columns
@@ -51,9 +59,6 @@ public:
 	}
 
 private:
-	// Convert one OUTPUT row into the chunk
-	void ProcessRow(const tds::RowData &row, const std::vector<tds::ColumnMetadata> &columns);
-
 	// Target metadata
 	const MSSQLInsertTarget &target_;
 
@@ -63,8 +68,9 @@ private:
 	// Result types (derived from returning columns)
 	vector<LogicalType> result_types_;
 
-	unique_ptr<DataChunk> chunk_;
-	idx_t row_count_ = 0;
+	// The last result set received: its columns and its rows, undecoded
+	std::vector<tds::ColumnMetadata> columns_;
+	std::vector<tds::RowData> rows_;
 };
 
 }  // namespace duckdb

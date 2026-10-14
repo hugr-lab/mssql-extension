@@ -1,0 +1,244 @@
+# name: test/sql/insert/insert_returning_trigger.test
+# description: INSERT ... RETURNING works on a table with an enabled trigger -- the rows go through OUTPUT ... INTO a session table (issue #471)
+# group: [insert]
+# issue: 471
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The statement path sent `INSERT ... OUTPUT INSERTED.<every column> VALUES`.
+# SQL Server refuses a bare OUTPUT while the target has any enabled trigger:
+#   [334] The target table '...' of the DML statement cannot have any enabled
+#   triggers if the statement contains an OUTPUT clause without INTO clause.
+# The bare OUTPUT is still sent first: on a table with no trigger it is the
+# cheaper form. Refused with 334 (a compile error, nothing ran), the batch is
+# rebuilt on SQL Server to create #mssql_returning_<uuid>, fill it with
+# OUTPUT ... INTO, read it and drop it, all in one request. The rest of the
+# statement goes that way too. Fabric and Synapse keep the bare OUTPUT
+# (DmlCapabilities::output_into_table).
+#
+# The table carries the columns a table built by SELECT INTO would get wrong:
+# - IDENTITY: the UNION ALL drops the property;
+# - rowversion: an OUTPUT cannot write into a timestamp column, so it is cast
+#   to binary(8);
+# - a computed column;
+# - a code-page varchar, read through the read expression.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS irt (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('irt', 'IF OBJECT_ID(''dbo.irt_t'') IS NOT NULL DROP TABLE dbo.irt_t; IF OBJECT_ID(''dbo.irt_audit'') IS NOT NULL DROP TABLE dbo.irt_audit; CREATE TABLE dbo.irt_t (id INT IDENTITY(1, 1) PRIMARY KEY, n INT NOT NULL, s VARCHAR(20) COLLATE SQL_Latin1_General_CP1_CI_AS NULL, rv ROWVERSION, twice AS (n * 2)); CREATE TABLE dbo.irt_audit (id INT NOT NULL, n INT NOT NULL)');
+
+statement ok
+SELECT mssql_exec('irt', 'CREATE TRIGGER dbo.irt_t_audit ON dbo.irt_t AFTER INSERT AS INSERT INTO dbo.irt_audit (id, n) SELECT id, n FROM inserted');
+
+statement ok
+SELECT mssql_invalidate_cache('irt');
+
+query IITII rowsort
+INSERT INTO irt.dbo.irt_t (n, s) VALUES (10, 'a'), (20, 'b') RETURNING id, n, s, octet_length(rv), twice;
+----
+1	10	a	8	20
+2	20	b	8	40
+
+# The trigger ran for the same rows.
+query II
+SELECT id, n FROM irt.dbo.irt_audit ORDER BY id;
+----
+1	10
+2	20
+
+# Several batches: 5 rows at 2 a statement.
+statement ok
+SET mssql_insert_batch_size = 2;
+
+query II rowsort
+INSERT INTO irt.dbo.irt_t (n, s) SELECT i * 100, 'r' || i FROM range(1, 6) t(i) RETURNING id, twice;
+----
+3	200
+4	400
+5	600
+6	800
+7	1000
+
+statement ok
+RESET mssql_insert_batch_size;
+
+query I
+SELECT count(*) FROM irt.dbo.irt_audit;
+----
+7
+
+# Inside a transaction, then rolled back: the rows and the trigger's go, and
+# no session table is left behind for the next RETURNING on the connection.
+statement ok
+BEGIN;
+
+query I
+INSERT INTO irt.dbo.irt_t (n) VALUES (99) RETURNING n;
+----
+99
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), max(id) FROM irt.dbo.irt_t;
+----
+7	7
+
+query I
+SELECT count(*) FROM irt.dbo.irt_audit;
+----
+7
+
+statement ok
+BEGIN;
+
+query I
+INSERT INTO irt.dbo.irt_t (n) VALUES (1) RETURNING n;
+----
+1
+
+query I
+INSERT INTO irt.dbo.irt_t (n) VALUES (2) RETURNING n;
+----
+2
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM irt.dbo.irt_audit;
+----
+9
+
+# A refused row fails the statement as before, and the next one runs.
+statement error
+INSERT INTO irt.dbo.irt_t (n) VALUES (NULL) RETURNING id;
+----
+Cannot insert the value NULL into column 'n'
+
+query I
+INSERT INTO irt.dbo.irt_t (n) VALUES (3) RETURNING n;
+----
+3
+
+# Through a view over the table: the base table's trigger refused the bare
+# OUTPUT there too.
+statement ok
+SELECT mssql_exec('irt', 'IF OBJECT_ID(''dbo.irt_v'') IS NOT NULL DROP VIEW dbo.irt_v');
+
+statement ok
+SELECT mssql_exec('irt', 'CREATE VIEW dbo.irt_v AS SELECT id, n FROM dbo.irt_t');
+
+statement ok
+SELECT mssql_invalidate_cache('irt');
+
+query I
+INSERT INTO irt.dbo.irt_v (n) VALUES (4) RETURNING n;
+----
+4
+
+# A trigger that returns a result set of its own ('disallow results from
+# triggers' is 0 by default). Its rows come before the RETURNING table's read
+# and are not RETURNING rows: only the batch's last result set is.
+statement ok
+SELECT mssql_exec('irt', 'CREATE TRIGGER dbo.irt_t_noise ON dbo.irt_t AFTER INSERT AS SELECT ''noise'' AS x');
+
+query II rowsort
+INSERT INTO irt.dbo.irt_t (n) VALUES (5), (6) RETURNING n, twice;
+----
+5	10
+6	12
+
+statement ok
+SELECT mssql_exec('irt', 'DROP TRIGGER dbo.irt_t_noise');
+
+# Two char(2100) columns: the RETURNING table holds them as trimmed NVARCHAR.
+# Read as NCHAR(2100) they made 8400 fixed bytes, past the 8060-byte row
+# (1701), on the INSERT's table and on the staged UPDATE's alike.
+statement ok
+SELECT mssql_exec('irt', 'IF OBJECT_ID(''dbo.irt_wide'') IS NOT NULL DROP TABLE dbo.irt_wide; CREATE TABLE dbo.irt_wide (id INT NOT NULL PRIMARY KEY, a CHAR(2100) NULL, b CHAR(2100) NULL)');
+
+statement ok
+SELECT mssql_exec('irt', 'CREATE TRIGGER dbo.irt_wide_t ON dbo.irt_wide AFTER INSERT, UPDATE AS SET NOCOUNT ON');
+
+statement ok
+SELECT mssql_invalidate_cache('irt');
+
+query ITI
+INSERT INTO irt.dbo.irt_wide VALUES (1, 'x', 'y') RETURNING id, a, length(b);
+----
+1	x	1
+
+query IT
+UPDATE irt.dbo.irt_wide SET a = 'z' WHERE id = 1 RETURNING id, a;
+----
+1	z
+
+# A batch the trigger aborts (THROW) after the RETURNING table was created: the
+# statement's transaction takes the table with it, and the next RETURNING on
+# the same session -- a pool of one, the session never reset -- runs.
+statement ok
+SELECT mssql_exec('irt', 'CREATE TRIGGER dbo.irt_t_throw ON dbo.irt_t AFTER INSERT AS IF EXISTS (SELECT 1 FROM inserted WHERE n < 0) THROW 50001, ''irt negative'', 1');
+
+statement ok
+SET mssql_connection_limit = 1;
+
+statement ok
+SET mssql_reset_connection = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS irt_one (TYPE mssql);
+
+statement error
+INSERT INTO irt_one.dbo.irt_t (n) VALUES (-1) RETURNING n;
+----
+irt negative
+
+query I
+INSERT INTO irt_one.dbo.irt_t (n) VALUES (8) RETURNING n;
+----
+8
+
+query I
+SELECT count(*) FROM mssql_scan('irt_one', 'SELECT name FROM tempdb.sys.tables WHERE name LIKE ''#mssql[_]returning[_]%''');
+----
+0
+
+statement ok
+DETACH irt_one;
+
+statement ok
+RESET mssql_connection_limit;
+
+statement ok
+RESET mssql_reset_connection;
+
+statement ok
+SELECT mssql_exec('irt', 'DROP TRIGGER dbo.irt_t_throw');
+
+# Fabric keeps the bare OUTPUT (emulated: it has no OUTPUT ... INTO), so on
+# SQL Server the trigger's 334 is what it gets.
+statement ok
+SET mssql_test_dml_platform = 'fabric';
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS irt_fabric (TYPE mssql);
+
+statement ok
+RESET mssql_test_dml_platform;
+
+statement error
+INSERT INTO irt_fabric.dbo.irt_t (n) VALUES (4) RETURNING n;
+----
+[334]
+
+statement ok
+SELECT mssql_exec('irt', 'DROP VIEW dbo.irt_v; DROP TABLE dbo.irt_t; DROP TABLE dbo.irt_audit; DROP TABLE dbo.irt_wide');

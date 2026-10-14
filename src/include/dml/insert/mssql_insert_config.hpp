@@ -61,9 +61,6 @@ struct MSSQLInsertConfig {
 	// Maximum SQL statement size in bytes
 	idx_t max_sql_bytes = MSSQL_DEFAULT_INSERT_MAX_SQL_BYTES;
 
-	// Use OUTPUT INSERTED for RETURNING clause
-	bool use_returning_output = MSSQL_DEFAULT_INSERT_USE_RETURNING_OUTPUT;
-
 	//! Spec 062 W1: the bulk path and its row threshold.
 	bool use_bcp = MSSQL_DEFAULT_INSERT_USE_BCP;
 	idx_t bcp_threshold = MSSQL_DEFAULT_INSERT_BCP_THRESHOLD;

@@ -341,10 +341,16 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	config.AddExtensionOption("mssql_insert_max_sql_bytes", "Maximum SQL statement size in bytes", LogicalType::BIGINT,
 							  Value::BIGINT(MSSQL_DEFAULT_INSERT_MAX_SQL_BYTES), ValidatePositive, SetScope::GLOBAL);
 
-	// mssql_insert_use_returning_output - Use OUTPUT INSERTED for RETURNING clause
-	config.AddExtensionOption("mssql_insert_use_returning_output", "Use OUTPUT INSERTED for RETURNING clause",
-							  LogicalType::BOOLEAN, Value::BOOLEAN(MSSQL_DEFAULT_INSERT_USE_RETURNING_OUTPUT), nullptr,
-							  SetScope::GLOBAL);
+	// mssql_insert_use_returning_output - DEPRECATED (review of #471): read by
+	// nothing -- an INSERT ... RETURNING always uses OUTPUT, and the
+	// MSSQLInsertConfig field it filled was consulted by no code and is gone.
+	// Hidden from duckdb_settings() unless asked with deprecated := true; kept
+	// registered for one release so a SET of it in a .duckdbrc does not throw,
+	// as mssql_dml_use_prepared; removed in the release after.
+	config.AddExtensionOption("mssql_insert_use_returning_output",
+							  "Deprecated, has no effect; removed in the next release", LogicalType::BOOLEAN,
+							  Value::BOOLEAN(MSSQL_DEFAULT_INSERT_USE_RETURNING_OUTPUT), nullptr, SetScope::GLOBAL,
+							  false, true);
 
 	// mssql_insert_use_bcp - INSERT loads through INSERT BULK (spec 062 W1);
 	// the escape hatch mssql_ctas_use_bcp is for CTAS. RETURNING and an
@@ -808,10 +814,6 @@ MSSQLInsertConfig LoadInsertConfig(ClientContext &context) {
 
 	if (context.TryGetCurrentSetting("mssql_insert_max_sql_bytes", val)) {
 		config.max_sql_bytes = static_cast<idx_t>(val.GetValue<int64_t>());
-	}
-
-	if (context.TryGetCurrentSetting("mssql_insert_use_returning_output", val)) {
-		config.use_returning_output = val.GetValue<bool>();
 	}
 
 	if (context.TryGetCurrentSetting("mssql_insert_use_bcp", val)) {

@@ -23,6 +23,7 @@
 
 #include "dml/insert/mssql_batch_builder.hpp"
 #include "dml/insert/mssql_insert_config.hpp"
+#include "dml/insert/mssql_insert_statement.hpp"
 #include "dml/insert/mssql_insert_target.hpp"
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/types.hpp"
@@ -128,7 +129,6 @@ MSSQLInsertConfig CreateTestConfig(idx_t batch_size = 10, idx_t max_sql_bytes = 
 	config.batch_size = batch_size;
 	config.max_rows_per_statement = batch_size;
 	config.max_sql_bytes = max_sql_bytes;
-	config.use_returning_output = false;
 	return config;
 }
 
@@ -338,6 +338,101 @@ void test_output_clause() {
 }
 
 //==============================================================================
+// Test: OUTPUT ... INTO a session table (issue #471)
+//==============================================================================
+void test_output_into_table() {
+	std::cout << "\n=== Test: OUTPUT INTO the RETURNING table (#471) ===" << std::endl;
+
+	auto target = CreateTestTarget();
+	MSSQLInsertColumn rv;
+	rv.name = "rv";
+	rv.duckdb_type = LogicalType::BLOB;
+	rv.mssql_type = "timestamp";
+	rv.is_identity = false;
+	rv.is_nullable = false;
+	target.columns.push_back(rv);
+	MSSQLInsertColumn code;
+	code.name = "code";
+	code.duckdb_type = LogicalType::VARCHAR;
+	code.mssql_type = "char";
+	code.max_length = 2100;
+	code.is_identity = false;
+	code.is_nullable = true;
+	target.columns.push_back(code);
+	target.returning_column_indices = {0, 1, 2, 3};
+	target.output_into_table = true;
+
+	auto config = CreateTestConfig(10);
+	MSSQLBatchBuilder builder(target, config, true);
+	auto chunk_ptr = CreateTestChunk(2);
+	auto &chunk = *chunk_ptr;
+
+	// The bare OUTPUT first, its literals kept for a rebuild.
+	builder.AddRow(chunk, 0);
+	builder.AddRow(chunk, 1);
+	auto first = builder.FlushBatch();
+	ASSERT_EQ(first.sql_statement.find("INSERT INTO "), 0u);
+	ASSERT_FALSE(first.sql_statement.find("#mssql_returning_") != std::string::npos);
+	ASSERT_EQ(first.row_literals.size(), 2u);
+	// Rebuilt from them in the INTO form: the same rows.
+	const auto rebuilt = MSSQLInsertStatement(target, true, true).Build(first.row_literals);
+	ASSERT_CONTAINS(rebuilt, "(1, N'name_1'),\n  (2, N'name_2');");
+
+	// After a 334 the builder builds the INTO form itself, and keeps no literals.
+	builder.UseOutputInto();
+	ASSERT_TRUE(builder.UsesOutputInto());
+	builder.AddRow(chunk, 0);
+	builder.AddRow(chunk, 1);
+	auto batch = builder.FlushBatch();
+	ASSERT_EQ(batch.row_literals.size(), 0u);
+	const string &sql = batch.sql_statement;
+	std::cout << "  Generated SQL:\n" << sql << std::endl;
+
+	// One request: create, fill, read, drop -- one table name, the batch's own.
+	ASSERT_EQ(sql.find("SELECT "), 0u);
+	const auto name_at = sql.find(" INTO [#mssql_returning_");
+	ASSERT_TRUE(name_at != std::string::npos);
+	const auto name = sql.substr(name_at + 6, sql.find(']', name_at) - name_at - 5);
+	idx_t uses = 0;
+	for (auto at = sql.find(name); at != std::string::npos; at = sql.find(name, at + 1)) {
+		uses++;
+	}
+	ASSERT_EQ(uses, 4u);
+	ASSERT_CONTAINS(sql, name + " FROM [dbo].[test_table] AS t WHERE 1 = 0 UNION ALL SELECT ");
+	ASSERT_CONTAINS(sql, " INTO " + name + "\nVALUES");
+	const string tail = "\nSELECT * FROM " + name + ";\nDROP TABLE " + name + ";";
+	ASSERT_EQ(sql.substr(sql.size() - tail.size()), tail);
+	// Positional aliases, the same list on both sides.
+	ASSERT_CONTAINS(sql, "t.[id] AS [c0]");
+	ASSERT_CONTAINS(sql, "INSERTED.[id] AS [c0]");
+	// A rowversion goes as binary(8): OUTPUT cannot write into a timestamp
+	// column, and SELECT INTO would make one.
+	ASSERT_CONTAINS(sql, "CAST(t.[rv] AS binary(8)) AS [c2]");
+	ASSERT_CONTAINS(sql, "CAST(INSERTED.[rv] AS binary(8)) AS [c2]");
+	// A char(n) as a trimmed NVARCHAR: the read's NCHAR(n) doubles its fixed
+	// width, past the 8060-byte row.
+	ASSERT_CONTAINS(sql, "RTRIM(CAST(t.[code] AS NVARCHAR(2100))) AS [c3]");
+	ASSERT_CONTAINS(sql, "RTRIM(CAST(INSERTED.[code] AS NVARCHAR(2100))) AS [c3]");
+
+	// The next batch gets a table of its own.
+	builder.AddRow(chunk, 0);
+	auto next = builder.FlushBatch();
+	ASSERT_CONTAINS(next.sql_statement, "INTO [#mssql_returning_");
+	ASSERT_FALSE(next.sql_statement.find(name) != std::string::npos);
+
+	// Without the capability (Fabric, Synapse): the bare OUTPUT, no literals kept.
+	target.output_into_table = false;
+	MSSQLBatchBuilder bare(target, config, true);
+	bare.AddRow(chunk, 0);
+	auto bare_batch = bare.FlushBatch();
+	ASSERT_EQ(bare_batch.sql_statement.find("INSERT INTO "), 0u);
+	ASSERT_CONTAINS(bare_batch.sql_statement, "OUTPUT INSERTED.");
+	ASSERT_EQ(bare_batch.row_literals.size(), 0u);
+
+	std::cout << "PASSED!" << std::endl;
+}
+
+//==============================================================================
 // Test: Empty batch handling
 //==============================================================================
 void test_empty_batch() {
@@ -399,6 +494,7 @@ int main() {
 		test_row_count_limit();
 		test_progress_tracking();
 		test_output_clause();
+		test_output_into_table();
 		test_empty_batch();
 		test_large_batch();
 

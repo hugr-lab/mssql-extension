@@ -11,9 +11,11 @@
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/delete_query_node.hpp"
 #include "duckdb/parser/query_node/insert_query_node.hpp"
+#include "duckdb/parser/query_node/merge_query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
+#include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
@@ -195,6 +197,40 @@ void VisitNode(QueryNode &node, const NestedNodeVisitor &on_node, const BaseTabl
 			VisitExpression(*del.condition, on_node);
 		}
 		for (auto &item : del.returning_list) {
+			VisitExpression(*item, on_node);
+		}
+	} else if (node.type == QueryNodeType::MERGE_QUERY_NODE) {
+		// Spec 080 PR 4a: a pushed MERGE's tables -- its target, its source
+		// (a table, a join, a derived table) -- and every expression of its ON
+		// and its actions.
+		auto &merge = node.Cast<MergeQueryNode>();
+		for (auto *ref : {&merge.target, &merge.source}) {
+			if (*ref) {
+				VisitTableRef(**ref, on_node, on_table);
+			}
+		}
+		if (merge.join_condition) {
+			VisitExpression(*merge.join_condition, on_node);
+		}
+		for (auto &entry : merge.actions) {
+			for (auto &action : entry.second) {
+				if (action->condition) {
+					VisitExpression(*action->condition, on_node);
+				}
+				if (action->update_info) {
+					if (action->update_info->condition) {
+						VisitExpression(*action->update_info->condition, on_node);
+					}
+					for (auto &value : action->update_info->expressions) {
+						VisitExpression(*value, on_node);
+					}
+				}
+				for (auto &value : action->expressions) {
+					VisitExpression(*value, on_node);
+				}
+			}
+		}
+		for (auto &item : merge.returning_list) {
 			VisitExpression(*item, on_node);
 		}
 	}

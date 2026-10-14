@@ -82,7 +82,7 @@ progress):
 | **Direct UPDATE/DELETE** | When the whole `WHERE` pushes down, emit one `UPDATE/DELETE ... WHERE` statement — no scan, no rowid round trip. Also lifts the primary-key requirement for pushable statements (#140) | Spec drafted |
 | **INSERT over BCP** | `INSERT INTO ... SELECT` switches from batched VALUES text to the bulk-load protocol (2–10×) | Spec drafted |
 | **UPDATE/DELETE via staging** | Affected rows bulk-load into a session `#temp`, one server-side `UPDATE ... JOIN #stage` replaces per-batch VALUES joins | Spec drafted |
-| **MERGE INTO + upsert** | `MERGE INTO` planning (DuckDB lowers `INSERT ... ON CONFLICT` to MERGE, so both arrive together); full T-SQL MERGE pushdown for same-catalog sources | Recon complete |
+| **MERGE INTO + upsert** | `MERGE INTO` planning (DuckDB lowers `INSERT ... ON CONFLICT` to MERGE, so both arrive together); full T-SQL MERGE pushdown for same-catalog sources | Same-catalog sources done (spec 080 PR 4a); other sources next (PR 4b) |
 | **Same-catalog read-then-write in transactions** | Materialize the extension's own scans before a bulk-load sink starts (the duckdb-postgres pattern), removing a documented limitation (#239) | Recon complete |
 | **JOIN / aggregate pushdown** | Semi-join reduction (always-safe), shipping small local tables to the server via BCP for server-side joins, and pushed GROUP BY / aggregates with exact type mapping | Recon complete |
 | **ORDER BY pushdown by default** | Collation-aware safety predicate; native server semantics as the default contract | Spec drafted |

@@ -32,7 +32,9 @@ public:
 	// Constructor
 	// @param target Insert target metadata
 	// @param include_output Whether to include OUTPUT clause for RETURNING
-	MSSQLInsertStatement(const MSSQLInsertTarget &target, bool include_output);
+	// @param output_into OUTPUT ... INTO a session table the statement creates,
+	//        reads and drops (#471); else the bare OUTPUT
+	MSSQLInsertStatement(const MSSQLInsertTarget &target, bool include_output, bool output_into = false);
 
 	//===----------------------------------------------------------------------===//
 	// SQL Generation
@@ -48,8 +50,13 @@ public:
 	string GetColumnList() const;
 
 	// Get OUTPUT clause for RETURNING support
-	// Returns: "OUTPUT INSERTED.[col1], INSERTED.[col2]" or empty if not enabled
+	// Returns: "OUTPUT INSERTED.[col1], INSERTED.[col2]" or empty if not enabled;
+	// on SQL Server: "OUTPUT <exprs> INTO [#mssql_returning_<uuid>]" (#471)
 	string GetOutputClause() const;
+
+	// Bytes the statement carries around the INSERT when its OUTPUT goes into a
+	// table: the table's creation before it, its read and DROP after it (#471)
+	idx_t GetOutputFramingSize() const;
 
 	// Get fully qualified table name
 	// Returns: "[schema].[table]"
@@ -67,10 +74,13 @@ public:
 private:
 	const MSSQLInsertTarget &target_;
 	bool include_output_;
+	bool output_into_;
 
 	// Cached strings for efficiency
 	mutable string cached_column_list_;
 	mutable string cached_output_clause_;
+	mutable string cached_output_prefix_;
+	mutable string cached_output_suffix_;
 	mutable string cached_table_name_;
 	mutable bool cache_initialized_ = false;
 

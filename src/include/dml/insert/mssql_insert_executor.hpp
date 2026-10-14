@@ -140,11 +140,21 @@ private:
 	unique_ptr<DataChunk> ExecuteBatchWithOutput(const MSSQLInsertBatch &batch,
 												 const vector<idx_t> &returning_column_ids);
 
-	// Send one batch through mssql::ExecuteDmlBatch. A failure of any kind fails
-	// the statement and throws MSSQLInsertException, naming the batch's statement
-	// index and rows. Returns the statement's row count.
-	idx_t SendBatch(tds::TdsConnection &connection, const MSSQLInsertBatch &batch,
-					const mssql::DmlBatchOptions &options, MSSQLCatalog &catalog);
+	// Send `sql`, one batch's statement, through mssql::ExecuteDmlBatch. A
+	// failed statement comes back in the response; a fault of the client's own
+	// fails the statement and throws MSSQLInsertException naming the batch.
+	mssql::DmlBatchResponse RunBatch(tds::TdsConnection &connection, const MSSQLInsertBatch &batch, const string &sql,
+									 const mssql::DmlBatchOptions &options, MSSQLCatalog &catalog);
+
+	// A fault of the client's own (a value that does not convert, a malformed
+	// packet header): fail the statement and throw MSSQLInsertException naming
+	// the batch.
+	[[noreturn]] void ThrowClientFault(const MSSQLInsertBatch &batch, const std::exception &e, MSSQLCatalog &catalog);
+
+	// The batch failed: fail the statement and throw MSSQLInsertException naming
+	// the batch's statement index and rows (InterruptException on Ctrl-C).
+	[[noreturn]] void ThrowBatchFailure(const MSSQLInsertBatch &batch, const mssql::DmlBatchResponse &response,
+										MSSQLCatalog &catalog);
 
 	// Get connection pool from catalog
 	tds::ConnectionPool &GetConnectionPool();

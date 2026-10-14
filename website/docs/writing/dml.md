@@ -71,6 +71,20 @@ VALUES ('a', 1), ('b', 2)
 RETURNING *;
 ```
 
+The rows come back through `OUTPUT INSERTED`.
+- **Triggers.** SQL Server refuses that form on a table with an enabled
+  trigger, or a view over one (error 334). On SQL Server and Azure SQL the
+  statement is then sent again through `OUTPUT … INTO` a session table that
+  each batch creates, reads and drops in its one request, and the rest of
+  the INSERT goes that way too (issue #471). That form costs more, so a table
+  with no trigger never pays for it.
+- **What RETURNING shows.** RETURNING shows each row as the INSERT wrote it,
+  before an AFTER trigger changed it. Under an INSTEAD OF trigger it shows
+  the values the INSERT was given, which may not be what the trigger stored.
+- **Results from a trigger.** A result set the trigger sends of its own is
+  not taken for RETURNING rows.
+- **Fabric Warehouse and Azure Synapse** keep the bare `OUTPUT`.
+
 ### Two paths: statements and BCP
 
 An INSERT reaches SQL Server one of two ways, and the extension picks per
@@ -337,6 +351,52 @@ Warehouse and Azure Synapse yet, nor when a key or SET column cannot be
 bulk-loaded (`geometry`, `geography`). A RETURNING statement costs a few round
 trips more than the same statement without it, even for one row.
 
+## MERGE INTO
+
+A MERGE whose source is in the same database runs on SQL Server as **one
+MERGE statement**: the server matches the rows, and no row crosses the wire.
+
+```sql
+MERGE INTO sqlserver.dbo.products AS t
+USING sqlserver.dbo.price_updates AS s ON t.id = s.id
+WHEN MATCHED AND s.price IS NULL THEN DELETE
+WHEN MATCHED THEN UPDATE SET price = s.price
+WHEN NOT MATCHED THEN INSERT (id, price) VALUES (s.id, s.price);
+-- EXPLAIN: Mssql Dml
+--   Statement: MERGE [dbo].[products] AS [r1] USING [dbo].[price_updates] AS [r2]
+--              ON ([r1].[id] = [r2].[id]) WHEN MATCHED AND ([r2].[price] IS NULL) THEN DELETE …
+```
+
+What goes whole:
+
+- a source that is a table, `USING (column, …)`, or a query over the
+  database's tables (`USING (SELECT …) AS s`);
+- the ON condition and every WHEN condition, written as the WHERE of a pushed
+  UPDATE is, and SET / INSERT values under the UPDATE's SET rule;
+- the WHEN clauses T-SQL has:
+  - up to two `WHEN MATCHED` (one UPDATE and one DELETE, the first with a
+    condition);
+  - one `WHEN NOT MATCHED [BY TARGET]` INSERT, or `INSERT DEFAULT VALUES`;
+  - up to two `WHEN NOT MATCHED BY SOURCE` (one UPDATE and one DELETE, the
+    first with a condition).
+- A last `DO NOTHING` is dropped, since no later clause could take its rows.
+
+A target row that two source rows match is an error when the MERGE updates or
+deletes it (8672 on the server, DuckDB's own error natively). The count is the
+MERGE's.
+
+What stays with DuckDB's own MERGE (which needs a key on the target):
+
+- more WHEN clauses than that (DuckDB applies the first whose condition holds);
+- `DO NOTHING` before another clause of its kind, `ERROR`;
+- `UPDATE SET *`, `INSERT *` and `INSERT BY NAME`;
+- an INSERT naming the identity column;
+- `RETURNING`;
+- a source of another database, a local table or a file (a session-table form
+  for these is planned);
+- a source that is a join, a view as the target, a subquery in a condition;
+- Azure Synapse.
+
 ## How UPDATE and DELETE reach the server
 
 ### The whole statement on the server
@@ -468,8 +528,9 @@ it in every column (NULL equal to NULL, strings byte for byte). So:
   DuckDB (a string function such as `lower()`, a subquery — `IN (SELECT …)`,
   `EXISTS (…)` — or any condition the scan cannot send), when it computes a
   volatile function (`random()`, `gen_random_uuid()`), for `UPDATE … FROM` /
-  `DELETE … USING`, and for `MERGE INTO`. The way out is a key: a primary key or
-  a unique index makes all of these work.
+  `DELETE … USING`, and for a `MERGE INTO` that does not go to the server whole
+  (one that does needs no key, see [MERGE INTO](#merge-into)). The way out is a
+  key: a primary key or a unique index makes all of these work.
 - **No concurrent writer is assumed.** The rows are read, then found again by
   value in a second step. In autocommit another session can insert an equal row
   between the two (it is then updated too) or change a selected one (it is then

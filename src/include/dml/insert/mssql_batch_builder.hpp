@@ -70,10 +70,18 @@ public:
 	// Get number of batches flushed so far
 	idx_t GetBatchCount() const;
 
+	// Build the OUTPUT through a session table from here on (issue #471): the
+	// server refused the bare OUTPUT beside an enabled trigger (334).
+	void UseOutputInto();
+	bool UsesOutputInto() const {
+		return output_into_;
+	}
+
 private:
 	const MSSQLInsertTarget &target_;
 	const MSSQLInsertConfig &config_;
 	bool include_output_clause_;
+	bool output_into_ = false;
 
 	// Current batch state
 	vector<vector<string>> row_literals_;  // Serialized values per row

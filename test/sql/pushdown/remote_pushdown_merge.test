@@ -1,0 +1,390 @@
+# name: test/sql/pushdown/remote_pushdown_merge.test
+# description: a MERGE whose source is in the same catalog runs on the server as one T-SQL MERGE (spec 080 PR 4a, D4)
+# group: [pushdown]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The remote-pushdown rewriter hands a MERGE over whole when every table it
+# names is in one catalog. NodeWriter::WriteMerge writes it as
+#   MERGE [s].[t] AS [r1] USING <source> AS [r2] ON … WHEN …;
+# and mssql_dml (kind := 'merge') runs it: one statement, one count. A MERGE
+# whose shape T-SQL does not have, or whose source is elsewhere, keeps the
+# native path (until PR 4b), which the cases below compare it with.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pm (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('pm', 'IF OBJECT_ID(''dbo.pm_tgt'') IS NOT NULL DROP TABLE dbo.pm_tgt; IF OBJECT_ID(''dbo.pm_src'') IS NOT NULL DROP TABLE dbo.pm_src; CREATE TABLE dbo.pm_tgt (id INT NOT NULL PRIMARY KEY, v INT NULL, s NVARCHAR(20) NULL); CREATE TABLE dbo.pm_src (id INT NOT NULL PRIMARY KEY, v INT NULL, s NVARCHAR(20) NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('pm');
+
+# =============================================================================
+# The upsert: WHEN MATCHED UPDATE, WHEN NOT MATCHED INSERT.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('pm', 'DELETE FROM dbo.pm_tgt; DELETE FROM dbo.pm_src; INSERT INTO dbo.pm_tgt VALUES (1, 10, ''a''), (2, 20, ''b''), (3, 30, ''c''); INSERT INTO dbo.pm_src VALUES (2, 200, ''B''), (3, 300, ''C''), (4, 400, ''D'')');
+
+query II
+EXPLAIN MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src ON pm_tgt.id = pm_src.id WHEN MATCHED THEN UPDATE SET v = pm_src.v, s = pm_src.s WHEN NOT MATCHED THEN INSERT (id, v, s) VALUES (pm_src.id, pm_src.v, pm_src.s);
+----
+physical_plan	<REGEX>:.*Mssql Dml.*MERGE \[dbo\]\.\[pm_tgt\] AS \[r1\] USING \[dbo\]\.\[pm_src\] AS \[r2\] ON \(\[r1\]\.\[id\] = \[r2\]\.\[id\]\) WHEN MATCHED THEN UPDATE SET \[v\] = \[r2\]\.\[v\], \[s\] = \[r2\]\.\[s\] WHEN NOT MATCHED BY TARGET THEN INSERT \(\[id\], \[v\], \[s\]\) VALUES \(\[r2\]\.\[id\], \[r2\]\.\[v\], \[r2\]\.\[s\]\);.*
+
+query I
+MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src ON pm_tgt.id = pm_src.id WHEN MATCHED THEN UPDATE SET v = pm_src.v, s = pm_src.s WHEN NOT MATCHED THEN INSERT (id, v, s) VALUES (pm_src.id, pm_src.v, pm_src.s);
+----
+3
+
+query IIT
+SELECT * FROM pm.dbo.pm_tgt ORDER BY id;
+----
+1	10	a
+2	200	B
+3	300	C
+4	400	D
+
+# =============================================================================
+# Every kind of WHEN, two WHEN MATCHED (the first conditional), against the
+# native path on the same rows.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('pm', 'DELETE FROM dbo.pm_tgt; DELETE FROM dbo.pm_src; INSERT INTO dbo.pm_tgt VALUES (1, 10, ''a''), (2, 20, ''b''), (3, 30, ''c''); INSERT INTO dbo.pm_src VALUES (2, 200, ''B''), (3, 300, ''C''), (4, 400, ''D'')');
+
+query II
+EXPLAIN MERGE INTO pm.dbo.pm_tgt AS t USING pm.dbo.pm_src AS s ON t.id = s.id WHEN MATCHED AND s.v > 250 THEN DELETE WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v) WHEN NOT MATCHED BY SOURCE THEN DELETE;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*WHEN MATCHED AND \(\[r2\]\.\[v\] > @p0\) THEN DELETE WHEN MATCHED THEN UPDATE SET \[v\] = \[r2\]\.\[v\] WHEN NOT MATCHED BY TARGET THEN INSERT \(\[id\], \[v\]\) VALUES \(\[r2\]\.\[id\], \[r2\]\.\[v\]\) WHEN NOT MATCHED BY SOURCE THEN DELETE;.*
+
+query I
+MERGE INTO pm.dbo.pm_tgt AS t USING pm.dbo.pm_src AS s ON t.id = s.id WHEN MATCHED AND s.v > 250 THEN DELETE WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v) WHEN NOT MATCHED BY SOURCE THEN DELETE;
+----
+4
+
+query IIT
+SELECT * FROM pm.dbo.pm_tgt ORDER BY id;
+----
+2	200	b
+4	400	NULL
+
+statement ok
+SELECT mssql_exec('pm', 'DELETE FROM dbo.pm_tgt; INSERT INTO dbo.pm_tgt VALUES (1, 10, ''a''), (2, 20, ''b''), (3, 30, ''c'')');
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+query II
+EXPLAIN MERGE INTO pm.dbo.pm_tgt AS t USING pm.dbo.pm_src AS s ON t.id = s.id WHEN MATCHED AND s.v > 250 THEN DELETE WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v) WHEN NOT MATCHED BY SOURCE THEN DELETE;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query I
+MERGE INTO pm.dbo.pm_tgt AS t USING pm.dbo.pm_src AS s ON t.id = s.id WHEN MATCHED AND s.v > 250 THEN DELETE WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v) WHEN NOT MATCHED BY SOURCE THEN DELETE;
+----
+4
+
+query IIT
+SELECT * FROM pm.dbo.pm_tgt ORDER BY id;
+----
+2	200	b
+4	400	NULL
+
+statement ok
+SET mssql_dml_pushdown = true;
+
+# =============================================================================
+# USING (id), and a source that is a query.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('pm', 'DELETE FROM dbo.pm_tgt; INSERT INTO dbo.pm_tgt VALUES (1, 10, ''a''), (2, 20, ''b''), (3, 30, ''c'')');
+
+query II
+EXPLAIN MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src USING (id) WHEN MATCHED THEN UPDATE SET v = pm_src.v;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*ON \(\[r1\]\.\[id\] = \[r2\]\.\[id\]\) WHEN MATCHED THEN UPDATE SET \[v\] = \[r2\]\.\[v\];.*
+
+query I
+MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src USING (id) WHEN MATCHED THEN UPDATE SET v = pm_src.v;
+----
+2
+
+query II
+EXPLAIN MERGE INTO pm.dbo.pm_tgt USING (SELECT id, v * 2 AS v FROM pm.dbo.pm_src WHERE id > 2) AS q ON pm_tgt.id = q.id WHEN MATCHED THEN UPDATE SET v = q.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (q.id, q.v);
+----
+physical_plan	<REGEX>:.*Mssql Dml.*MERGE \[dbo\]\.\[pm_tgt\] AS \[r1\] USING \(SELECT.*\) AS \[r2\] ON.*
+
+query I
+MERGE INTO pm.dbo.pm_tgt USING (SELECT id, v * 2 AS v FROM pm.dbo.pm_src WHERE id > 2) AS q ON pm_tgt.id = q.id WHEN MATCHED THEN UPDATE SET v = q.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (q.id, q.v);
+----
+2
+
+query II
+SELECT id, v FROM pm.dbo.pm_tgt ORDER BY id;
+----
+1	10
+2	200
+3	600
+4	800
+
+# Unqualified names in the NOT MATCHED clauses are the side the rows have, as
+# DuckDB binds them; two WHEN NOT MATCHED BY SOURCE (DELETE, then UPDATE).
+statement ok
+SELECT mssql_exec('pm', 'DELETE FROM dbo.pm_tgt; INSERT INTO dbo.pm_tgt VALUES (1, 10, ''a''), (2, 20, ''b''), (5, 500, ''e'')');
+
+query II
+EXPLAIN MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src ON pm_tgt.id = pm_src.id WHEN NOT MATCHED THEN INSERT VALUES (id, v, s) WHEN NOT MATCHED BY SOURCE AND v > 100 THEN DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v = v + 1;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*WHEN NOT MATCHED BY TARGET THEN INSERT \(\[id\], \[v\], \[s\]\) VALUES \(\[r2\]\.\[id\], \[r2\]\.\[v\], \[r2\]\.\[s\]\) WHEN NOT MATCHED BY SOURCE AND \(\[r1\]\.\[v\] > @p0\) THEN DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET \[v\] = \(\[r1\]\.\[v\] \+ @p1\);.*
+
+query I
+MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src ON pm_tgt.id = pm_src.id WHEN NOT MATCHED THEN INSERT VALUES (id, v, s) WHEN NOT MATCHED BY SOURCE AND v > 100 THEN DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v = v + 1;
+----
+4
+
+query IIT
+SELECT * FROM pm.dbo.pm_tgt ORDER BY id;
+----
+1	11	a
+2	20	b
+3	300	C
+4	400	D
+
+# USING (id) with an unqualified id in WHEN MATCHED: with no BY SOURCE clause
+# DuckDB's join is INNER / LEFT, and the merged id is the source's.
+query II
+EXPLAIN MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src USING (id) WHEN MATCHED AND id > 3 THEN DELETE;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*WHEN MATCHED AND \(\[r2\]\.\[id\] > @p0\) THEN DELETE;.*
+
+query I
+MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src USING (id) WHEN MATCHED AND id > 3 THEN DELETE;
+----
+1
+
+statement ok
+SELECT mssql_exec('pm', 'DELETE FROM dbo.pm_tgt; INSERT INTO dbo.pm_tgt VALUES (1, 10, ''a''), (2, 200, ''B''), (3, 600, ''C''), (4, 800, ''D'')');
+
+# The side matters: under a case-insensitive collation the two sides match while
+# their bytes differ, and a SET of the USING column writes the source's spelling,
+# as DuckDB's binding means it (review of #473).
+statement ok
+SELECT mssql_exec('pm', 'IF OBJECT_ID(''dbo.pm_ci_t'') IS NOT NULL DROP TABLE dbo.pm_ci_t; IF OBJECT_ID(''dbo.pm_ci_s'') IS NOT NULL DROP TABLE dbo.pm_ci_s; CREATE TABLE dbo.pm_ci_t (id INT NOT NULL PRIMARY KEY, code NVARCHAR(10) COLLATE Latin1_General_CI_AS NOT NULL, label NVARCHAR(10) COLLATE Latin1_General_CI_AS NULL); CREATE TABLE dbo.pm_ci_s (code NVARCHAR(10) COLLATE Latin1_General_CI_AS NOT NULL); INSERT INTO dbo.pm_ci_t VALUES (1, N''ABC'', NULL); INSERT INTO dbo.pm_ci_s VALUES (N''abc'')');
+
+statement ok
+SELECT mssql_invalidate_cache('pm');
+
+query I
+MERGE INTO pm.dbo.pm_ci_t USING pm.dbo.pm_ci_s USING (code) WHEN MATCHED THEN UPDATE SET label = code;
+----
+1
+
+query TT
+SELECT code, label FROM pm.dbo.pm_ci_t;
+----
+ABC	abc
+
+statement ok
+SELECT mssql_exec('pm', 'DROP TABLE dbo.pm_ci_t; DROP TABLE dbo.pm_ci_s');
+
+# =============================================================================
+# A trailing DO NOTHING is dropped; a WHEN kind left with no action is not
+# written at all.
+# =============================================================================
+
+query II
+EXPLAIN MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src ON pm_tgt.id = pm_src.id WHEN MATCHED AND pm_src.v > 300 THEN UPDATE SET v = 0 WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED THEN DO NOTHING;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*WHEN MATCHED AND \(\[r2\]\.\[v\] > @p0\) THEN UPDATE SET \[v\] = @p1;.*
+
+query I
+MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src ON pm_tgt.id = pm_src.id WHEN MATCHED AND pm_src.v > 300 THEN UPDATE SET v = 0 WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED THEN DO NOTHING;
+----
+1
+
+query II
+SELECT id, v FROM pm.dbo.pm_tgt ORDER BY id;
+----
+1	10
+2	200
+3	600
+4	0
+
+# =============================================================================
+# Shapes T-SQL does not have stay on the native path, with DuckDB's
+# first-match semantics.
+# =============================================================================
+
+# Three WHEN MATCHED clauses.
+query II
+EXPLAIN MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src ON pm_tgt.id = pm_src.id WHEN MATCHED AND pm_src.id = 2 THEN UPDATE SET v = 1 WHEN MATCHED AND pm_src.id = 3 THEN UPDATE SET v = 2 WHEN MATCHED THEN DELETE;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query I
+MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src ON pm_tgt.id = pm_src.id WHEN MATCHED AND pm_src.id = 2 THEN UPDATE SET v = 1 WHEN MATCHED AND pm_src.id = 3 THEN UPDATE SET v = 2 WHEN MATCHED THEN DELETE;
+----
+3
+
+query II
+SELECT id, v FROM pm.dbo.pm_tgt ORDER BY id;
+----
+1	10
+2	1
+3	2
+
+# DO NOTHING before another clause of its kind.
+query II
+EXPLAIN MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src ON pm_tgt.id = pm_src.id WHEN MATCHED AND pm_src.id = 2 THEN DO NOTHING WHEN MATCHED THEN UPDATE SET v = 7;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+# A source that is not in the catalog.
+statement ok
+CREATE TABLE pm_local AS SELECT 1 AS id, 11 AS v;
+
+query II
+EXPLAIN MERGE INTO pm.dbo.pm_tgt USING pm_local ON pm_tgt.id = pm_local.id WHEN MATCHED THEN UPDATE SET v = pm_local.v;
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query I
+MERGE INTO pm.dbo.pm_tgt USING pm_local ON pm_tgt.id = pm_local.id WHEN MATCHED THEN UPDATE SET v = pm_local.v;
+----
+1
+
+# =============================================================================
+# Rolled back with the transaction; two source rows for one target row are an
+# error, as in DuckDB.
+# =============================================================================
+
+statement ok
+BEGIN;
+
+query I
+MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src ON pm_tgt.id = pm_src.id WHEN MATCHED THEN DELETE;
+----
+2
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM pm.dbo.pm_tgt;
+----
+3
+
+statement error
+MERGE INTO pm.dbo.pm_tgt USING (SELECT id, v FROM pm.dbo.pm_src UNION ALL SELECT id, v FROM pm.dbo.pm_src) AS q ON pm_tgt.id = q.id WHEN MATCHED THEN UPDATE SET v = q.v;
+----
+8672
+
+query II
+SELECT id, v FROM pm.dbo.pm_tgt ORDER BY id;
+----
+1	11
+2	1
+3	2
+
+# =============================================================================
+# An INSERT naming the identity column stays native (no IDENTITY_INSERT inside
+# a MERGE).
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('pm', 'IF OBJECT_ID(''dbo.pm_ident'') IS NOT NULL DROP TABLE dbo.pm_ident; CREATE TABLE dbo.pm_ident (id INT IDENTITY(1, 1) PRIMARY KEY, k INT NOT NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('pm');
+
+query II
+EXPLAIN MERGE INTO pm.dbo.pm_ident USING pm.dbo.pm_src ON pm_ident.k = pm_src.id WHEN NOT MATCHED THEN INSERT (id, k) VALUES (pm_src.id, pm_src.id);
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
+query II
+EXPLAIN MERGE INTO pm.dbo.pm_ident USING pm.dbo.pm_src ON pm_ident.k = pm_src.id WHEN NOT MATCHED THEN INSERT (k) VALUES (pm_src.id);
+----
+physical_plan	<REGEX>:.*Mssql Dml.*
+
+query I
+MERGE INTO pm.dbo.pm_ident USING pm.dbo.pm_src ON pm_ident.k = pm_src.id WHEN NOT MATCHED THEN INSERT (k) VALUES (pm_src.id);
+----
+3
+
+# INSERT DEFAULT VALUES: the server's defaults, as the shipped INSERT naming no
+# column gets them.
+statement ok
+SELECT mssql_exec('pm', 'IF OBJECT_ID(''dbo.pm_def'') IS NOT NULL DROP TABLE dbo.pm_def; CREATE TABLE dbo.pm_def (id INT IDENTITY(1, 1) PRIMARY KEY, v INT NOT NULL DEFAULT 7)');
+
+statement ok
+SELECT mssql_invalidate_cache('pm');
+
+query I
+MERGE INTO pm.dbo.pm_def USING pm.dbo.pm_src ON pm_def.id = pm_src.id + 100 WHEN NOT MATCHED THEN INSERT DEFAULT VALUES;
+----
+3
+
+query II
+SELECT id, v FROM pm.dbo.pm_def ORDER BY id;
+----
+1	7
+2	7
+3	7
+
+# A table with no key: DuckDB's native MERGE refuses it, the server needs none.
+statement ok
+SELECT mssql_exec('pm', 'IF OBJECT_ID(''dbo.pm_nokey'') IS NOT NULL DROP TABLE dbo.pm_nokey; CREATE TABLE dbo.pm_nokey (k INT NULL, v INT NULL); INSERT INTO dbo.pm_nokey VALUES (2, 0), (2, 0), (9, 0)');
+
+statement ok
+SELECT mssql_invalidate_cache('pm');
+
+query I
+MERGE INTO pm.dbo.pm_nokey USING pm.dbo.pm_src ON pm_nokey.k = pm_src.id WHEN MATCHED THEN UPDATE SET v = pm_src.v WHEN NOT MATCHED BY SOURCE THEN DELETE;
+----
+3
+
+query II
+SELECT k, v FROM pm.dbo.pm_nokey ORDER BY k;
+----
+2	200
+2	200
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement error
+MERGE INTO pm.dbo.pm_nokey USING pm.dbo.pm_src ON pm_nokey.k = pm_src.id WHEN MATCHED THEN UPDATE SET v = pm_src.v;
+----
+MERGE INTO a table without one is not supported
+
+statement ok
+SET mssql_dml_pushdown = true;
+
+# =============================================================================
+# Fabric (emulated): MERGE is there, so it is pushed too.
+# =============================================================================
+
+statement ok
+SET mssql_test_dml_platform = 'fabric';
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS pm_fabric (TYPE mssql);
+
+statement ok
+RESET mssql_test_dml_platform;
+
+query II
+EXPLAIN MERGE INTO pm_fabric.dbo.pm_tgt USING pm_fabric.dbo.pm_src ON pm_tgt.id = pm_src.id WHEN MATCHED THEN UPDATE SET v = pm_src.v;
+----
+physical_plan	<REGEX>:.*Mssql Dml.*MERGE.*
+
+statement ok
+SELECT mssql_exec('pm', 'DROP TABLE dbo.pm_tgt; DROP TABLE dbo.pm_src; DROP TABLE dbo.pm_ident; DROP TABLE dbo.pm_def; DROP TABLE dbo.pm_nokey');

@@ -106,8 +106,11 @@ bool SQLWriter::WriteDml(const QueryNode &node, WrittenQuery &out, std::string &
 	case QueryNodeType::DELETE_QUERY_NODE:
 		written = writer.WriteDelete(node.Cast<DeleteQueryNode>());
 		break;
+	case QueryNodeType::MERGE_QUERY_NODE:
+		written = writer.WriteMerge(node.Cast<MergeQueryNode>());
+		break;
 	default:
-		why = "not an UPDATE / DELETE";
+		why = "not an UPDATE / DELETE / MERGE";
 		return false;
 	}
 	if (!written) {

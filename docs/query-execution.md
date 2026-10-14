@@ -181,7 +181,7 @@ MSSQLPhysicalInsert (PhysicalOperator)
   │     ├─ Batch full? → FlushBatch()
   │     │     ├─ MSSQLInsertStatement::Build() → SQL
   │     │     │   INSERT INTO [schema].[table] ([col1], [col2])
-  │     │     │   OUTPUT INSERTED.[col1], ...  -- if RETURNING
+  │     │     │   OUTPUT INSERTED.[col1], ...  -- if RETURNING (… INTO a session table after a 334, #471)
   │     │     │   VALUES (lit1, lit2), (lit3, lit4);
   │     │     └─ ExecuteBatch(sql) via TDS layer
   │     └─ With RETURNING: mssql::ExecuteDmlBatch hands OUTPUT rows to MSSQLReturningParser
@@ -205,7 +205,6 @@ When `INSERT ... RETURNING` is used, the generated SQL includes an `OUTPUT INSER
 SET mssql_insert_batch_size = 1000;
 SET mssql_insert_max_rows_per_statement = 1000;
 SET mssql_insert_max_sql_bytes = 8388608;
-SET mssql_insert_use_returning_output = true;
 ```
 
 ## UPDATE Workflow
@@ -348,7 +347,7 @@ FROM changes;
 | `mssql_insert_batch_size` | 1000 | INSERT row batching |
 | `mssql_insert_max_rows_per_statement` | 1000 | INSERT VALUES clause limit |
 | `mssql_insert_max_sql_bytes` | 8MB | INSERT SQL size limit |
-| `mssql_insert_use_returning_output` | true | INSERT RETURNING via OUTPUT |
+| `mssql_insert_use_returning_output` | true | Deprecated, no effect: an INSERT … RETURNING always uses OUTPUT (removed in the next release) |
 | `mssql_dml_batch_size` | 500 | UPDATE/DELETE row batching |
 | `mssql_dml_max_parameters` | 2000 | UPDATE/DELETE parameter limit |
 
