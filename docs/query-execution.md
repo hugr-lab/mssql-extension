@@ -181,7 +181,7 @@ MSSQLPhysicalInsert (PhysicalOperator)
   │     ├─ Batch full? → FlushBatch()
   │     │     ├─ MSSQLInsertStatement::Build() → SQL
   │     │     │   INSERT INTO [schema].[table] ([col1], [col2])
-  │     │     │   OUTPUT INSERTED.[col1], ...  -- if RETURNING
+  │     │     │   OUTPUT INSERTED.[col1], ...  -- if RETURNING (… INTO a session table after a 334, #471)
   │     │     │   VALUES (lit1, lit2), (lit3, lit4);
   │     │     └─ ExecuteBatch(sql) via TDS layer
   │     └─ With RETURNING: mssql::ExecuteDmlBatch hands OUTPUT rows to MSSQLReturningParser

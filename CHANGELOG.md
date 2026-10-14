@@ -500,6 +500,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`INSERT … RETURNING` failed on a table with an enabled trigger** (#471),
+  including through a view over one, with SQL Server error 334: "cannot have
+  any enabled triggers if the statement contains an OUTPUT clause without
+  INTO clause". The statement path sends a bare `OUTPUT INSERTED.…`.
+  - It still does: on a table with no trigger that is the cheaper form
+    (measured on 10000 rows: 0.09 s, against 1.2 s with a session table per
+    batch).
+  - When SQL Server refuses it with 334, a compile error that ran nothing,
+    the batch is rebuilt and sent again: it creates `#mssql_returning_<uuid>`,
+    fills it with `OUTPUT … INTO`, reads it and drops it, in one request. The
+    rest of the statement's batches go the same way.
+  - The table is typed by the same expressions as UPDATE / DELETE …
+    RETURNING's. `rowversion` keeps its 8 bytes. A `char(n)` is held as a
+    trimmed NVARCHAR, so wide `char` columns stay under the 8060-byte row.
+    The IDENTITY property is not copied.
+  - A result set the trigger returns of its own is not taken for RETURNING
+    rows.
+  - RETURNING shows each row as the INSERT wrote it, before an AFTER trigger
+    changed it.
+  - Fabric and Synapse keep the bare OUTPUT, so the 334 still reaches the
+    user there.
+
 - **A filter on a `datetime`, `time(7)` or `datetimeoffset(7)` column missed
   rows read from it** (#426). A
   `datetime` stores 1/300 s ticks; the scan reads each to the microsecond,

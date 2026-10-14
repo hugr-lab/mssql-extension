@@ -34,6 +34,12 @@ struct MSSQLInsertTarget {
 	// (populated when RETURNING clause is used)
 	vector<idx_t> returning_column_indices;
 
+	// The server has `OUTPUT … INTO <table>` (DmlCapabilities::output_into_table:
+	// SQL Server, not Fabric or Synapse). A RETURNING batch goes as a bare
+	// OUTPUT; refused for an enabled trigger (334), it and the rest of the
+	// statement are rebuilt in the INTO form (issue #471).
+	bool output_into_table = false;
+
 	// `mssql_convert_varchar_max`, resolved where the target is built. The OUTPUT
 	// list is built by the same function as the scan's SELECT list, and that
 	// function takes the setting — so a varchar(max) column is cast, or not,

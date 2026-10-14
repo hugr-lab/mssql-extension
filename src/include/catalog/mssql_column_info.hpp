@@ -163,6 +163,19 @@ struct MSSQLColumnInfo {
 									  const string &collation_name, bool convert_varchar_max,
 									  const string &qualifier = "", const string &alias = "",
 									  bool utf8_on_wire = false);
+
+	//! A RETURNING column, as `OUTPUT … INTO <table>` writes it and as the
+	//! `SELECT … INTO` that creates that table types it. It is the read
+	//! expression, with two exceptions:
+	//! - a `rowversion` is cast to `binary(8)`: an OUTPUT cannot write into a
+	//!   `timestamp` column, and SELECT INTO would make one;
+	//! - a `char(n)` is a trimmed NVARCHAR, not the read's NCHAR(n), which
+	//!   doubles its fixed width past the 8060-byte row.
+	//! Shared by INSERT … RETURNING (#471) and the staged UPDATE / DELETE …
+	//! RETURNING (spec 080 PR 2b).
+	static string BuildReturningExpression(const string &col_name, const string &sql_type_name, int16_t max_length,
+										   const string &collation_name, bool convert_varchar_max,
+										   const string &qualifier, const string &alias = "");
 };
 
 }  // namespace duckdb

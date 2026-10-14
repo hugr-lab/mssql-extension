@@ -133,6 +133,9 @@ DmlBatchResponse Execute(ClientContext &context, tds::TdsConnection &connection,
 			switch (token) {
 			case tds::ParsedTokenType::ColMetadata:
 				columns = parser.GetColumnMetadata();
+				if (options.on_metadata) {
+					options.on_metadata(columns);
+				}
 				break;
 			case tds::ParsedTokenType::Row:
 				if (options.on_row) {

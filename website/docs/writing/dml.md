@@ -71,6 +71,20 @@ VALUES ('a', 1), ('b', 2)
 RETURNING *;
 ```
 
+The rows come back through `OUTPUT INSERTED`.
+- **Triggers.** SQL Server refuses that form on a table with an enabled
+  trigger, or a view over one (error 334). On SQL Server and Azure SQL the
+  statement is then sent again through `OUTPUT … INTO` a session table that
+  each batch creates, reads and drops in its one request, and the rest of
+  the INSERT goes that way too (issue #471). That form costs more, so a table
+  with no trigger never pays for it.
+- **What RETURNING shows.** RETURNING shows each row as the INSERT wrote it,
+  before an AFTER trigger changed it. Under an INSTEAD OF trigger it shows
+  the values the INSERT was given, which may not be what the trigger stored.
+- **Results from a trigger.** A result set the trigger sends of its own is
+  not taken for RETURNING rows.
+- **Fabric Warehouse and Azure Synapse** keep the bare `OUTPUT`.
+
 ### Two paths: statements and BCP
 
 An INSERT reaches SQL Server one of two ways, and the extension picks per

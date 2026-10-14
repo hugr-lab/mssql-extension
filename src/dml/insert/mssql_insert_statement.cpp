@@ -2,12 +2,13 @@
 #include "catalog/mssql_column_info.hpp"
 #include "dml/insert/mssql_value_serializer.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "query/mssql_identifier.hpp"
 
 namespace duckdb {
 
-MSSQLInsertStatement::MSSQLInsertStatement(const MSSQLInsertTarget &target, bool include_output)
-	: target_(target), include_output_(include_output) {}
+MSSQLInsertStatement::MSSQLInsertStatement(const MSSQLInsertTarget &target, bool include_output, bool output_into)
+	: target_(target), include_output_(include_output), output_into_(output_into) {}
 
 //===----------------------------------------------------------------------===//
 // Cache Initialization
@@ -57,7 +58,41 @@ void MSSQLInsertStatement::InitializeCache() const {
 			output_cols += MSSQLColumnInfo::BuildReadExpression(col.name, col.mssql_type, col.max_length, col.collation,
 																target_.convert_varchar_max, "INSERTED.");
 		}
-		cached_output_clause_ = "OUTPUT " + output_cols;
+		if (!output_into_) {
+			cached_output_clause_ = "OUTPUT " + output_cols;
+		} else {
+			// Issue #471: a bare OUTPUT is refused (334) while the target has an
+			// enabled trigger; OUTPUT ... INTO is not. The executor switches to
+			// this form when the server answers 334. Each batch creates the
+			// table, fills it, reads it and drops it, all in its one request, so
+			// nothing outlives the batch. A batch that fails partway is rolled
+			// back with the statement's server transaction, and so is the
+			// table: every INSERT on the statement path runs inside one. The
+			// name is the batch's own, so a session kept unreset can hold no
+			// table it collides with. SELECT INTO types the table from the same
+			// expressions (BuildReturningExpression), and the UNION ALL drops the
+			// IDENTITY property a bare column would carry. The aliases are by
+			// position (c0, c1, ...): tempdb checks their uniqueness under its own
+			// collation, which may fold names the database keeps apart.
+			const string out = mssql::QuoteIdentifier("#mssql_returning_" + UUID::ToString(UUID::GenerateRandomUUID()));
+			string create_cols;
+			string into_cols;
+			for (idx_t i = 0; i < target_.returning_column_indices.size(); i++) {
+				const auto &col = target_.columns[target_.returning_column_indices[i]];
+				const auto alias = "c" + std::to_string(i);
+				create_cols += (i ? ", " : "") + MSSQLColumnInfo::BuildReturningExpression(
+													 col.name, col.mssql_type, col.max_length, col.collation,
+													 target_.convert_varchar_max, "t.", alias);
+				into_cols += (i ? ", " : "") + MSSQLColumnInfo::BuildReturningExpression(
+												   col.name, col.mssql_type, col.max_length, col.collation,
+												   target_.convert_varchar_max, "INSERTED.", alias);
+			}
+			const string from = " FROM " + cached_table_name_ + " AS t WHERE 1 = 0";
+			cached_output_prefix_ =
+				"SELECT " + create_cols + " INTO " + out + from + " UNION ALL SELECT " + create_cols + from + ";\n";
+			cached_output_clause_ = "OUTPUT " + into_cols + " INTO " + out;
+			cached_output_suffix_ = "\nSELECT * FROM " + out + ";\nDROP TABLE " + out + ";";
+		}
 	}
 
 	cache_initialized_ = true;
@@ -82,6 +117,11 @@ string MSSQLInsertStatement::GetOutputClause() const {
 	return cached_output_clause_;
 }
 
+idx_t MSSQLInsertStatement::GetOutputFramingSize() const {
+	InitializeCache();
+	return cached_output_prefix_.size() + cached_output_suffix_.size();
+}
+
 //===----------------------------------------------------------------------===//
 // SQL Generation
 //===----------------------------------------------------------------------===//
@@ -94,6 +134,7 @@ string MSSQLInsertStatement::Build(const vector<vector<string>> &row_literals) c
 	estimated_size += cached_table_name_.size();
 	estimated_size += cached_column_list_.size();
 	estimated_size += cached_output_clause_.size();
+	estimated_size += cached_output_prefix_.size() + cached_output_suffix_.size();
 
 	for (const auto &row : row_literals) {
 		estimated_size += 4;  // "(", ")", ",\n"
@@ -105,6 +146,9 @@ string MSSQLInsertStatement::Build(const vector<vector<string>> &row_literals) c
 	// Build statement
 	string sql;
 	sql.reserve(estimated_size);
+
+	// The RETURNING table's creation (#471), when OUTPUT goes INTO one
+	sql += cached_output_prefix_;
 
 	// INSERT INTO [schema].[table]
 	sql += "INSERT INTO ";
@@ -143,6 +187,9 @@ string MSSQLInsertStatement::Build(const vector<vector<string>> &row_literals) c
 	}
 
 	sql += ";";
+
+	// Read and drop the RETURNING table (#471)
+	sql += cached_output_suffix_;
 
 	return sql;
 }
