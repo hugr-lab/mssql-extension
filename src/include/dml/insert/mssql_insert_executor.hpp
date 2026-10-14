@@ -146,6 +146,11 @@ private:
 	mssql::DmlBatchResponse RunBatch(tds::TdsConnection &connection, const MSSQLInsertBatch &batch, const string &sql,
 									 const mssql::DmlBatchOptions &options, MSSQLCatalog &catalog);
 
+	// A fault of the client's own (a value that does not convert, a malformed
+	// packet header): fail the statement and throw MSSQLInsertException naming
+	// the batch.
+	[[noreturn]] void ThrowClientFault(const MSSQLInsertBatch &batch, const std::exception &e, MSSQLCatalog &catalog);
+
 	// The batch failed: fail the statement and throw MSSQLInsertException naming
 	// the batch's statement index and rows (InterruptException on Ctrl-C).
 	[[noreturn]] void ThrowBatchFailure(const MSSQLInsertBatch &batch, const mssql::DmlBatchResponse &response,
