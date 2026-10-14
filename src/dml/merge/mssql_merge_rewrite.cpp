@@ -165,6 +165,7 @@ public:
 	unique_ptr<LogicalOperator> Rewrite();
 
 private:
+	unique_ptr<LogicalOperator> BuildOperator(MSSQLStagedMergeTarget target);
 	[[noreturn]] void Refuse(const string &why) const {
 		throw NotImplementedException("MSSQL: MERGE INTO '%s.%s' is not supported: %s. Nothing was sent.", schema_name_,
 									  table_name_, why);
@@ -708,6 +709,27 @@ unique_ptr<LogicalOperator> MergeRewriter::Rewrite() {
 	TakeJoinApart(on);
 	src_index_ = optimizer_.binder.GenerateTableIndex();
 
+	MSSQLStagedMergeTarget target;
+	target.catalog_name = catalog_.GetName().GetIdentifierName();
+	target.schema_name = schema_name_;
+	target.table_name = table_name_;
+
+	// Every action DO NOTHING: a no-op, as DuckDB's own MERGE ran it; the source
+	// is still evaluated, nothing is sent (review of #478).
+	bool no_action = true;
+	for (auto &entry : merge_.actions) {
+		for (auto &action : entry.second) {
+			no_action = no_action && action->action_type == MergeActionType::MERGE_DO_NOTHING;
+		}
+	}
+	if (no_action) {
+		unique_ptr<Expression> marker = make_uniq<BoundConstantExpression>(duckdb::Value::BOOLEAN(true));
+		Stage(marker, optional_idx());
+		target.no_action = true;
+		target.merge_sql = "(every action is DO NOTHING: nothing is sent)";
+		return BuildOperator(std::move(target));
+	}
+
 	resolver_ = make_uniq<MergeColumnResolver>(target_index_, target_ids_, columns_, src_index_, src_);
 	ctx_.resolver = resolver_.get();
 	ctx_.params = &params_;
@@ -771,10 +793,6 @@ unique_ptr<LogicalOperator> MergeRewriter::Rewrite() {
 		Stage(marker, optional_idx());
 	}
 
-	MSSQLStagedMergeTarget target;
-	target.catalog_name = catalog_.GetName().GetIdentifierName();
-	target.schema_name = schema_name_;
-	target.table_name = table_name_;
 	auto uuid = UUID::ToString(UUID::GenerateRandomUUID());
 	uuid.erase(std::remove(uuid.begin(), uuid.end(), '-'), uuid.end());
 	target.src_name = "#src_" + uuid;
@@ -796,8 +814,12 @@ unique_ptr<LogicalOperator> MergeRewriter::Rewrite() {
 	target.runs_on_empty_source = kept.count(MergeActionCondition::WHEN_NOT_MATCHED_BY_SOURCE) > 0;
 	target.flush_rows = LoadBCPCopyConfig(context_).flush_rows;
 	target.query_timeout_seconds = LoadQueryTimeout(context_);
+	return BuildOperator(std::move(target));
+}
 
-	// The source, untouched, under a projection that computes the #src columns.
+//! The source, untouched, under a projection that computes the #src columns,
+//! under the staged MERGE.
+unique_ptr<LogicalOperator> MergeRewriter::BuildOperator(MSSQLStagedMergeTarget target) {
 	vector<unique_ptr<Expression>> computed;
 	vector<unique_ptr<Expression>> references;
 	for (idx_t n = 0; n < src_.size(); n++) {

@@ -32,7 +32,7 @@ void MSSQLStagedMerge::Execute(ClientContext &context, DataChunk &fill) {
 	if (finalized_) {
 		throw InternalException("MSSQLStagedMerge::Execute called after Finalize");
 	}
-	if (fill.size() == 0) {
+	if (fill.size() == 0 || target_.no_action) {
 		return;
 	}
 	if (!stage_.IsOpen()) {

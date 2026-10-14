@@ -310,6 +310,27 @@ SELECT id, v FROM mgn.dbo.mgn_x ORDER BY id;
 2	5
 3	32
 
+# Every action DO NOTHING: a no-op, as DuckDB's own MERGE ran it -- nothing is
+# sent, the count is 0 (review of #478).
+query I
+MERGE INTO mgn.dbo.mgn_x AS t USING (SELECT * FROM (VALUES (1), (5)) AS x(id)) AS s ON t.id = s.id
+WHEN MATCHED THEN DO NOTHING
+WHEN NOT MATCHED THEN DO NOTHING;
+----
+0
+
+query II
+EXPLAIN MERGE INTO mgn.dbo.mgn_x AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN DO NOTHING;
+----
+physical_plan	<REGEX>:.*Mssql Staged Merge.*every action is DO NOTHING.*
+
+query II
+SELECT id, v FROM mgn.dbo.mgn_x ORDER BY id;
+----
+1	5
+2	5
+3	32
+
 # UPDATE with no SET list (every column, by position): T-SQL has no such form,
 # but bound it is a SET of each column and is written so.
 query I

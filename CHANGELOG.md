@@ -49,7 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     paths and is gone for MSSQL tables: more than two WHEN MATCHED clauses and
     an identity column in the INSERT are now refused; `INSERT DEFAULT VALUES`
     is sent as such; `UPDATE` with no SET list is written as a SET of every
-    column; `SET x = DEFAULT` writes NULL, as before.
+    column; `SET x = DEFAULT` writes NULL, as before; a MERGE whose every
+    action is `DO NOTHING` stays a no-op (count 0, nothing sent).
 
 - **MERGE INTO within one database runs on SQL Server as one statement**
   (spec 080 PR 4a). The remote-pushdown rewriter hands over a MERGE whose

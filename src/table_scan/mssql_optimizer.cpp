@@ -908,11 +908,14 @@ static void CollectSinkCatalogs(LogicalOperator &op, case_insensitive_set_t &cat
 			joining.insert(catalog.GetName().GetIdentifierName());
 		}
 	} else if (op.type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR &&
-			   op.Cast<LogicalExtensionOperator>().GetExtensionName() == "mssql_staged_merge") {
+			   dynamic_cast<MSSQLLogicalStagedMerge *>(&op)) {
 		// Spec 080 D4: a staged MERGE writes #src and runs its statement on
 		// the statement's pinned connection, so a scan of its catalog feeding
-		// the source is materialised and joins, as for UPDATE / DELETE.
-		auto &catalog = op.Cast<MSSQLLogicalStagedMerge>().table.ParentCatalog();
+		// the source is materialised and joins, as for UPDATE / DELETE. Told
+		// by its class, not GetExtensionName(): another extension's operator
+		// need not implement that serialization hook, and the base one throws
+		// (review of #478).
+		auto &catalog = dynamic_cast<MSSQLLogicalStagedMerge &>(op).table.ParentCatalog();
 		MSSQL_OPT_DEBUG(1, "sink: staged MERGE into catalog '%s'", catalog.GetName().GetIdentifierName().c_str());
 		catalogs.insert(catalog.GetName().GetIdentifierName());
 		joining.insert(catalog.GetName().GetIdentifierName());

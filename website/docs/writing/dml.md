@@ -447,7 +447,8 @@ refused, and nothing is sent.
   rewritten for the server there.
 
 `SET x = DEFAULT` writes NULL. DuckDB hands the extension the same thing for
-both.
+both. A MERGE whose every action is `DO NOTHING` changes nothing and sends
+nothing; its count is 0.
 
 ## How UPDATE and DELETE reach the server
 

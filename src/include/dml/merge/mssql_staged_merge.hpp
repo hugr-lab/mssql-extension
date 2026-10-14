@@ -40,6 +40,10 @@ struct MSSQLStagedMergeTarget {
 	//! too (every target row is then unmatched). Without one, an empty source
 	//! sends nothing.
 	bool runs_on_empty_source = false;
+	//! Every action is DO NOTHING: nothing is sent and the count is 0, as
+	//! DuckDB's own MERGE ran such a statement (review of #478). The source is
+	//! still evaluated.
+	bool no_action = false;
 	//! mssql_copy_flush_rows: the fill's batch boundary.
 	idx_t flush_rows = 0;
 	//! mssql_query_timeout in seconds (0 = none), for the CREATE and the DROP.
