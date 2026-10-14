@@ -197,8 +197,8 @@ int main() {
 		Check(!properties.IsReadOnly(), label + ": a write (RegisterDBModify)");
 		// The statement as written: UPDATE for the native one, SELECT for the
 		// vehicle -- whose CHANGED_ROWS is what makes DuckDB's readers say no.
-		Check(!StreamsByDefault(handle->GetStatementType(), properties, true) &&
-				  !StreamsByDefault(handle->GetStatementType(), properties, false),
+		Check(!StreamsByDefault(handle->GetStatementType(), *handle, true) &&
+				  !StreamsByDefault(handle->GetStatementType(), *handle, false),
 			  label + ": StreamsByDefault answers no, read to the end or not");
 		handle->Complete();
 		Check(!handle->HasError(), label + ": completed");
