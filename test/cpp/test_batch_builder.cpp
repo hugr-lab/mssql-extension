@@ -129,7 +129,6 @@ MSSQLInsertConfig CreateTestConfig(idx_t batch_size = 10, idx_t max_sql_bytes = 
 	config.batch_size = batch_size;
 	config.max_rows_per_statement = batch_size;
 	config.max_sql_bytes = max_sql_bytes;
-	config.use_returning_output = false;
 	return config;
 }
 

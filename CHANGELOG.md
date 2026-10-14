@@ -442,6 +442,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a `SET` of it in a `.duckdbrc` does not throw; it is removed in the
   release after.
 
+- **`mssql_insert_use_returning_output` is deprecated** (review of #471), for
+  the same reason: nothing read it, and an `INSERT … RETURNING` always uses
+  OUTPUT. It stays a documented no-op for one more release.
+
 - **Metadata queries compute a table's row count once, not once per column**
   (spec 084). Every query that returned columns carried
   `OBJECTPROPERTYEX(..., 'Cardinality')` in the same SELECT list, and the
