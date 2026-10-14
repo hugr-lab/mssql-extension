@@ -238,6 +238,12 @@ public:
 
 private:
 	bool WriteSetOperation(const SetOperationNode &node);
+	//! The column of `columns` (the first `count`) a SET (`role` "SET") or an
+	//! INSERT column list ("INSERT") names, by case-insensitive name, and not in
+	//! `taken`, which it joins. A veto otherwise: no such column, two of them
+	//! (a case-sensitive database), or named twice.
+	bool TargetColumn(const std::vector<MSSQLColumnInfo> &columns, idx_t count, const std::string &name,
+					  const char *role, std::vector<idx_t> &taken, idx_t &index);
 	//! The target and the FROM / USING tables of an UPDATE / DELETE: the
 	//! target is relation 0. False with a veto on anything but base tables,
 	//! a view target, or a source the platform's form cannot take.
@@ -423,6 +429,10 @@ private:
 		idx_t source;
 	};
 	std::vector<MergeUsing> merge_using_;
+	//! Which NOT MATCHED kinds the MERGE has: they set DuckDB's join type, and
+	//! with it the side a USING column means in WHEN MATCHED.
+	bool merge_has_by_source_ = false;
+	bool merge_has_by_target_ = false;
 	//! It names a column of a node around it (set on every writer between).
 	bool correlated_ = false;
 	//! The node's LIMIT, -1 without one.

@@ -79,6 +79,32 @@ bool HoldsAggregateOrWindow(const ParsedExpression &expr) {
 
 }  // namespace
 
+bool NodeWriter::TargetColumn(const std::vector<MSSQLColumnInfo> &columns, idx_t count, const std::string &name,
+							  const char *role, std::vector<idx_t> &taken, idx_t &index) {
+	index = DConstants::INVALID_INDEX;
+	for (idx_t c = 0; c < count; c++) {
+		if (!StringUtil::CIEquals(columns[c].name, name)) {
+			continue;
+		}
+		if (index != DConstants::INVALID_INDEX) {
+			// A case-sensitive database holding `a` and `A`.
+			return Veto(std::string(role) + " column " + name + " matches more than one column");
+		}
+		index = c;
+	}
+	if (index == DConstants::INVALID_INDEX) {
+		return Veto(std::string(role) + " column " + name + " is not a column of the target");
+	}
+	for (auto done : taken) {
+		if (done == index) {
+			return Veto(std::string(role) + " column " + name +
+						(std::string(role) == "SET" ? " assigned twice" : " named twice"));
+		}
+	}
+	taken.push_back(index);
+	return true;
+}
+
 bool NodeWriter::CollectDmlRelations(const TableRef &target, const std::vector<const TableRef *> &sources) {
 	if (target.type != TableReferenceType::BASE_TABLE) {
 		return Veto("the target is not a table");
@@ -250,26 +276,10 @@ bool NodeWriter::WriteUpdate(const UpdateQueryNode &node) {
 	std::string set_sql;
 	for (idx_t i = 0; i < set.columns.size(); i++) {
 		const auto &name = set.columns[i].GetIdentifierName();
-		idx_t index = DConstants::INVALID_INDEX;
-		for (idx_t c = 0; c < target_columns; c++) {
-			if (!StringUtil::CIEquals(columns_[c].name, name)) {
-				continue;
-			}
-			if (index != DConstants::INVALID_INDEX) {
-				// A case-sensitive database holding `a` and `A`.
-				return Veto("SET column " + name + " matches more than one column");
-			}
-			index = c;
+		idx_t index;
+		if (!TargetColumn(columns_, target_columns, name, "SET", assigned, index)) {
+			return false;
 		}
-		if (index == DConstants::INVALID_INDEX) {
-			return Veto("SET column " + name + " is not a column of the target");
-		}
-		for (auto done : assigned) {
-			if (done == index) {
-				return Veto("SET column " + name + " assigned twice");
-			}
-		}
-		assigned.push_back(index);
 		if (!options_.dml_from_join && set.expressions[i]->HasSubquery()) {
 			return Veto("a subquery in SET in the single-table form (Fabric)");
 		}
@@ -413,25 +423,10 @@ bool NodeWriter::WriteInsert(const InsertQueryNode &node, const BaseTableRef &ta
 		}
 	} else {
 		for (auto &name : node.columns) {
-			idx_t index = DConstants::INVALID_INDEX;
-			for (idx_t c = 0; c < target_columns.size(); c++) {
-				if (!StringUtil::CIEquals(target_columns[c].name, name.GetIdentifierName())) {
-					continue;
-				}
-				if (index != DConstants::INVALID_INDEX) {
-					return Veto("INSERT column " + name.GetIdentifierName() + " matches more than one column");
-				}
-				index = c;
+			idx_t index;
+			if (!TargetColumn(target_columns, target_columns.size(), name.GetIdentifierName(), "INSERT", into, index)) {
+				return false;
 			}
-			if (index == DConstants::INVALID_INDEX) {
-				return Veto("INSERT column " + name.GetIdentifierName() + " is not a column of the target");
-			}
-			for (auto done : into) {
-				if (done == index) {
-					return Veto("INSERT column " + name.GetIdentifierName() + " named twice");
-				}
-			}
-			into.push_back(index);
 		}
 	}
 
@@ -565,25 +560,10 @@ bool NodeWriter::WriteMergeInsert(const MergeIntoAction &action, std::string &sq
 		}
 	} else {
 		for (auto &name : action.insert_columns) {
-			idx_t index = DConstants::INVALID_INDEX;
-			for (idx_t c = 0; c < target_columns; c++) {
-				if (!StringUtil::CIEquals(columns_[c].name, name.GetIdentifierName())) {
-					continue;
-				}
-				if (index != DConstants::INVALID_INDEX) {
-					return Veto("INSERT column " + name.GetIdentifierName() + " matches more than one column");
-				}
-				index = c;
+			idx_t index;
+			if (!TargetColumn(columns_, target_columns, name.GetIdentifierName(), "INSERT", into, index)) {
+				return false;
 			}
-			if (index == DConstants::INVALID_INDEX) {
-				return Veto("INSERT column " + name.GetIdentifierName() + " is not a column of the target");
-			}
-			for (auto done : into) {
-				if (done == index) {
-					return Veto("INSERT column " + name.GetIdentifierName() + " named twice");
-				}
-			}
-			into.push_back(index);
 		}
 	}
 	if (into.size() != action.expressions.size()) {
@@ -619,11 +599,28 @@ bool NodeWriter::WriteMergeAction(const MergeIntoAction &action, MergeActionCond
 		merge_forbidden_first_ = 1;
 		merge_forbidden_last_ = relations_.size();
 	}
-	// USING (c): an unqualified c is the merged column DuckDB's binder makes --
-	// the source's where the action has no target row, else the target's.
+	// USING (c): an unqualified c is the merged column DuckDB's binder makes.
+	// Its join puts the source on the left and the target on the right
+	// (bind_merge_into.cpp), and the merged column is the left one for an INNER
+	// or LEFT join, the right one for a RIGHT join, and has no single side for
+	// a FULL one (SetPrimaryBinding, bind_joinref.cpp). So: the source in WHEN
+	// NOT MATCHED BY TARGET and in WHEN MATCHED without a BY SOURCE clause, the
+	// target in BY SOURCE and in WHEN MATCHED beside a BY SOURCE clause alone;
+	// beside both (FULL) it is not mapped, and an unqualified c is vetoed as
+	// ambiguous. The two sides are only collation-equal, so the side matters
+	// (review of #473).
+	const bool by_source = merge_has_by_source_;
+	const bool by_target = merge_has_by_target_;
 	for (auto &merged : merge_using_) {
-		using_columns_.emplace_back(
-			merged.name, when == MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET ? merged.source : merged.target);
+		if (when == MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET) {
+			using_columns_.emplace_back(merged.name, merged.source);
+		} else if (when == MergeActionCondition::WHEN_NOT_MATCHED_BY_SOURCE) {
+			using_columns_.emplace_back(merged.name, merged.target);
+		} else if (!by_source) {
+			using_columns_.emplace_back(merged.name, merged.source);
+		} else if (!by_target) {
+			using_columns_.emplace_back(merged.name, merged.target);
+		}
 	}
 	struct Reset {
 		NodeWriter &writer;
@@ -674,25 +671,10 @@ bool NodeWriter::WriteMergeAction(const MergeIntoAction &action, MergeActionCond
 		std::string set_sql;
 		for (idx_t i = 0; i < set.columns.size(); i++) {
 			const auto &name = set.columns[i].GetIdentifierName();
-			idx_t index = DConstants::INVALID_INDEX;
-			for (idx_t c = 0; c < target_columns; c++) {
-				if (!StringUtil::CIEquals(columns_[c].name, name)) {
-					continue;
-				}
-				if (index != DConstants::INVALID_INDEX) {
-					return Veto("SET column " + name + " matches more than one column");
-				}
-				index = c;
+			idx_t index;
+			if (!TargetColumn(columns_, target_columns, name, "SET", assigned, index)) {
+				return false;
 			}
-			if (index == DConstants::INVALID_INDEX) {
-				return Veto("SET column " + name + " is not a column of the target");
-			}
-			for (auto done : assigned) {
-				if (done == index) {
-					return Veto("SET column " + name + " assigned twice");
-				}
-			}
-			assigned.push_back(index);
 			std::string value;
 			if (!WriteSetValue(*set.expressions[i], index, value)) {
 				return false;
@@ -710,6 +692,9 @@ bool NodeWriter::WriteMergeAction(const MergeIntoAction &action, MergeActionCond
 }
 
 bool NodeWriter::WriteMerge(const MergeQueryNode &node) {
+	if (!options_.merge) {
+		return Veto("MERGE on a platform without it");
+	}
 	if (!node.returning_list.empty()) {
 		return Veto("RETURNING");
 	}
@@ -791,6 +776,9 @@ bool NodeWriter::WriteMerge(const MergeQueryNode &node) {
 	} else {
 		return Veto("a MERGE without an ON condition");
 	}
+
+	merge_has_by_source_ = node.actions.count(MergeActionCondition::WHEN_NOT_MATCHED_BY_SOURCE) > 0;
+	merge_has_by_target_ = node.actions.count(MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET) > 0;
 
 	// T-SQL's shape, after a trailing DO NOTHING is dropped.
 	std::string clauses;

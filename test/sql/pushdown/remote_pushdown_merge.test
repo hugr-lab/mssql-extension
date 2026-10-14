@@ -157,11 +157,12 @@ SELECT * FROM pm.dbo.pm_tgt ORDER BY id;
 3	300	C
 4	400	D
 
-# USING (id) with an unqualified id in WHEN MATCHED.
+# USING (id) with an unqualified id in WHEN MATCHED: with no BY SOURCE clause
+# DuckDB's join is INNER / LEFT, and the merged id is the source's.
 query II
 EXPLAIN MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src USING (id) WHEN MATCHED AND id > 3 THEN DELETE;
 ----
-physical_plan	<REGEX>:.*Mssql Dml.*WHEN MATCHED AND \(\[r1\]\.\[id\] > @p0\) THEN DELETE;.*
+physical_plan	<REGEX>:.*Mssql Dml.*WHEN MATCHED AND \(\[r2\]\.\[id\] > @p0\) THEN DELETE;.*
 
 query I
 MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src USING (id) WHEN MATCHED AND id > 3 THEN DELETE;
@@ -170,6 +171,28 @@ MERGE INTO pm.dbo.pm_tgt USING pm.dbo.pm_src USING (id) WHEN MATCHED AND id > 3 
 
 statement ok
 SELECT mssql_exec('pm', 'DELETE FROM dbo.pm_tgt; INSERT INTO dbo.pm_tgt VALUES (1, 10, ''a''), (2, 200, ''B''), (3, 600, ''C''), (4, 800, ''D'')');
+
+# The side matters: under a case-insensitive collation the two sides match while
+# their bytes differ, and a SET of the USING column writes the source's spelling,
+# as DuckDB's binding means it (review of #473).
+statement ok
+SELECT mssql_exec('pm', 'IF OBJECT_ID(''dbo.pm_ci_t'') IS NOT NULL DROP TABLE dbo.pm_ci_t; IF OBJECT_ID(''dbo.pm_ci_s'') IS NOT NULL DROP TABLE dbo.pm_ci_s; CREATE TABLE dbo.pm_ci_t (id INT NOT NULL PRIMARY KEY, code NVARCHAR(10) COLLATE Latin1_General_CI_AS NOT NULL, label NVARCHAR(10) COLLATE Latin1_General_CI_AS NULL); CREATE TABLE dbo.pm_ci_s (code NVARCHAR(10) COLLATE Latin1_General_CI_AS NOT NULL); INSERT INTO dbo.pm_ci_t VALUES (1, N''ABC'', NULL); INSERT INTO dbo.pm_ci_s VALUES (N''abc'')');
+
+statement ok
+SELECT mssql_invalidate_cache('pm');
+
+query I
+MERGE INTO pm.dbo.pm_ci_t USING pm.dbo.pm_ci_s USING (code) WHEN MATCHED THEN UPDATE SET label = code;
+----
+1
+
+query TT
+SELECT code, label FROM pm.dbo.pm_ci_t;
+----
+ABC	abc
+
+statement ok
+SELECT mssql_exec('pm', 'DROP TABLE dbo.pm_ci_t; DROP TABLE dbo.pm_ci_s');
 
 # =============================================================================
 # A trailing DO NOTHING is dropped; a WHEN kind left with no action is not

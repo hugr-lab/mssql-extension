@@ -138,7 +138,8 @@ static void ExpectGain(const std::string &sql, bool expected) {
 
 //! Spec 080 D1: an UPDATE / DELETE through SQLWriter::WriteDml. `v` is a view
 //! (a target never pushed); `from_join` false is Fabric's single-table form.
-static bool WriteDml(const std::string &sql, WrittenQuery &out, std::string &why, bool from_join = true) {
+static bool WriteDml(const std::string &sql, WrittenQuery &out, std::string &why, bool from_join = true,
+					 bool merge = true) {
 	static const auto columns = Columns();
 	static const auto other = OtherColumns();
 	auto parser = Parser::GetBuiltinParser();
@@ -157,6 +158,7 @@ static bool WriteDml(const std::string &sql, WrittenQuery &out, std::string &why
 								: static_cast<const QueryNode &>(*statement.Cast<DeleteStatement>().node);
 	SQLWriterOptions options;
 	options.dml_from_join = from_join;
+	options.merge = merge;
 	SQLWriter writer(options, [](const BaseTableRef &ref, WriterTable &table) {
 		const auto &name = ref.Table().GetIdentifierName();
 		if (name != "t" && name != "u" && name != "v") {
@@ -186,10 +188,11 @@ static void ExpectDml(const std::string &sql, const std::string &expected, bool 
 	}
 }
 
-static void ExpectDmlVeto(const std::string &sql, bool from_join = true, const std::string &reason = "") {
+static void ExpectDmlVeto(const std::string &sql, bool from_join = true, const std::string &reason = "",
+						  bool merge = true) {
 	WrittenQuery out;
 	std::string why;
-	if (WriteDml(sql, out, why, from_join)) {
+	if (WriteDml(sql, out, why, from_join, merge)) {
 		std::cerr << "FAIL: expected a veto for " << sql << "\n  wrote: " << out.statement << "\n";
 		failures++;
 	} else if (!reason.empty() && why.find(reason) == std::string::npos) {
@@ -294,13 +297,25 @@ int main() {
 		"MERGE [dbo].[t] AS [r1] USING [dbo].[u] AS [r2] ON ([r1].[id] = [r2].[t_id]) WHEN NOT MATCHED BY TARGET "
 		"THEN INSERT ([id]) VALUES ([r2].[id]) WHEN NOT MATCHED BY SOURCE THEN UPDATE SET [id] = ([r1].[id] + "
 		"@p0);");
-	// USING (id): `id` is the merged column -- the source's where there is no
-	// target row.
+	// USING (id): `id` is the merged column DuckDB's join makes -- source on
+	// the left, target on the right: the source for an INNER / LEFT join (no BY
+	// SOURCE clause), the target for a RIGHT one (BY SOURCE alone), neither for
+	// a FULL one (both), where an unqualified id is refused.
 	ExpectDml(
 		"MERGE INTO t USING u USING (id) WHEN MATCHED AND id > 1 THEN DELETE WHEN NOT MATCHED THEN INSERT (id) "
 		"VALUES (id)",
-		"MERGE [dbo].[t] AS [r1] USING [dbo].[u] AS [r2] ON ([r1].[id] = [r2].[id]) WHEN MATCHED AND ([r1].[id] > "
+		"MERGE [dbo].[t] AS [r1] USING [dbo].[u] AS [r2] ON ([r1].[id] = [r2].[id]) WHEN MATCHED AND ([r2].[id] > "
 		"@p0) THEN DELETE WHEN NOT MATCHED BY TARGET THEN INSERT ([id]) VALUES ([r2].[id]);");
+	ExpectDml(
+		"MERGE INTO t USING u USING (id) WHEN MATCHED AND id > 1 THEN DELETE WHEN NOT MATCHED BY SOURCE THEN "
+		"DELETE",
+		"MERGE [dbo].[t] AS [r1] USING [dbo].[u] AS [r2] ON ([r1].[id] = [r2].[id]) WHEN MATCHED AND ([r1].[id] > "
+		"@p0) THEN DELETE WHEN NOT MATCHED BY SOURCE THEN DELETE;");
+	ExpectDmlVeto(
+		"MERGE INTO t USING u USING (id) WHEN MATCHED AND id > 1 THEN DELETE WHEN NOT MATCHED THEN INSERT "
+		"(id) VALUES (id) WHEN NOT MATCHED BY SOURCE THEN DELETE");
+	// A platform without MERGE keeps the native path.
+	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED THEN DELETE", true, "without it", false);
 	// An unqualified name both sides have is ambiguous where both are bound.
 	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED AND id > 1 THEN DELETE");
 	// Shapes T-SQL has no form for.

@@ -260,6 +260,7 @@ bool MSSQLCatalog::WriteResolved(const QueryNode &node, mssql::WrittenQuery &out
 			return false;
 		}
 		options.dml_from_join = GetDmlCapabilities().update_from_join;
+		options.merge = GetDmlCapabilities().merge;
 	}
 	mssql::SQLWriter writer(options, [&](const BaseTableRef &ref, mssql::WriterTable &table) {
 		for (idx_t i = 0; i < refs.size(); i++) {

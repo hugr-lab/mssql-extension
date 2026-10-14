@@ -200,6 +200,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 	options.label = "insert statement batch";
 	output.Attach(options);
 	auto response = RunBatch(*connection, batch, batch.sql_statement, options, mssql_catalog);
+	idx_t sent_bytes = batch.sql_statement.size();
 	if (response.status == mssql::DmlBatchResponse::Status::SERVER_ERROR && response.error_number == 334 &&
 		target_.output_into_table && !batch_builder_->UsesOutputInto()) {
 		// Issue #471: the target has an enabled trigger, beside which a bare
@@ -211,16 +212,26 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 		batch_builder_->UseOutputInto();
 		const auto into = MSSQLInsertStatement(target_, true, true).Build(batch.row_literals);
 		response = RunBatch(*connection, batch, into, options, mssql_catalog);
+		sent_bytes = into.size();
 	}
 	if (!response.Succeeded()) {
 		ThrowBatchFailure(batch, response, mssql_catalog);
 	}
 
-	// Record statistics based on the rows the OUTPUT clause returned
+	// The rows are decoded here, after the response: an OUTPUT value that does
+	// not convert fails the statement like any client-side fault (review of
+	// #472: it used to escape past FailStatement and the batch's name).
+	const idx_t rows = output.GetRowCount();
+	unique_ptr<DataChunk> result;
+	try {
+		result = output.TakeResult();
+	} catch (const std::exception &e) {
+		ThrowClientFault(batch, e, mssql_catalog);
+	}
 	auto end_time = std::chrono::steady_clock::now();
 	auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-	statistics_.RecordBatch(output.GetRowCount(), batch.sql_statement.size(), duration_us);
-	return output.TakeResult();
+	statistics_.RecordBatch(rows, sent_bytes, duration_us);
+	return result;
 }
 
 mssql::DmlBatchResponse MSSQLInsertExecutor::RunBatch(tds::TdsConnection &connection, const MSSQLInsertBatch &batch,
@@ -229,19 +240,24 @@ mssql::DmlBatchResponse MSSQLInsertExecutor::RunBatch(tds::TdsConnection &connec
 	try {
 		return mssql::ExecuteDmlBatch(context_, connection, sql, options);
 	} catch (const std::exception &e) {
-		// A fault of the client's own while reading the response: an OUTPUT
-		// value that does not convert, a malformed packet header.
-		MSSQLInsertError error;
-		error.statement_index = batch_builder_->GetBatchCount() - 1;
-		error.row_offset_start = batch.row_offset_start;
-		error.row_offset_end = batch.row_offset_end;
-		error.sql_error_number = 0;
-		error.sql_error_message = MSSQLRawMessage(e);
-		error.rows_applied_before = statistics_.total_rows_inserted;
-		error.in_open_transaction = stmt_conn_.InOpenTransaction();
-		FailStatement(catalog);
-		throw MSSQLInsertException(error);
+		ThrowClientFault(batch, e, catalog);
 	}
+}
+
+void MSSQLInsertExecutor::ThrowClientFault(const MSSQLInsertBatch &batch, const std::exception &e,
+										   MSSQLCatalog &catalog) {
+	// A fault of the client's own while reading or decoding the response: an
+	// OUTPUT value that does not convert, a malformed packet header.
+	MSSQLInsertError error;
+	error.statement_index = batch_builder_->GetBatchCount() - 1;
+	error.row_offset_start = batch.row_offset_start;
+	error.row_offset_end = batch.row_offset_end;
+	error.sql_error_number = 0;
+	error.sql_error_message = MSSQLRawMessage(e);
+	error.rows_applied_before = statistics_.total_rows_inserted;
+	error.in_open_transaction = stmt_conn_.InOpenTransaction();
+	FailStatement(catalog);
+	throw MSSQLInsertException(error);
 }
 
 void MSSQLInsertExecutor::ThrowBatchFailure(const MSSQLInsertBatch &batch, const mssql::DmlBatchResponse &response,
