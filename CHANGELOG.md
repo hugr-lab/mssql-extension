@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MERGE INTO within one database runs on SQL Server as one statement**
+  (spec 080 PR 4a). The remote-pushdown rewriter hands over a MERGE whose
+  source is in the same catalog whole: `MERGE [s].[t] AS [r1] USING … ON … WHEN
+  …;` through `mssql_dml` (`kind := 'merge'`). The server matches the rows,
+  and no key is needed.
+  - The source can be a table, `USING (columns)`, or a query over the
+    database's tables.
+  - The WHEN clauses must fit T-SQL's shape: two WHEN MATCHED (UPDATE and
+    DELETE, the first conditional), one WHEN NOT MATCHED INSERT, two WHEN
+    NOT MATCHED BY SOURCE (UPDATE and DELETE, the first conditional). A last
+    DO NOTHING is dropped.
+  - Anything else keeps DuckDB's native MERGE: more clauses, ERROR,
+    `UPDATE SET *` / `INSERT *`, an identity column in the INSERT,
+    RETURNING, or a source elsewhere.
+
 - **INSERT … SELECT within one database runs on SQL Server as one statement**
   (spec 080 PR 3d), through the same `mssql_dml` vehicle as a pushed UPDATE /
   DELETE. No row crosses the wire, and a value is copied by the server as it

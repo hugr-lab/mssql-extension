@@ -195,8 +195,8 @@ bool MSSQLCatalog::WritePushdown(const QueryNode &node, mssql::WrittenQuery &out
 bool MSSQLCatalog::WriteDmlPushdown(const QueryNode &node, mssql::WrittenQuery &out, string &why,
 									optional_ptr<ClientContext> context) {
 	if (node.type != QueryNodeType::UPDATE_QUERY_NODE && node.type != QueryNodeType::DELETE_QUERY_NODE &&
-		node.type != QueryNodeType::INSERT_QUERY_NODE) {
-		why = "not an UPDATE / DELETE / INSERT";
+		node.type != QueryNodeType::INSERT_QUERY_NODE && node.type != QueryNodeType::MERGE_QUERY_NODE) {
+		why = "not an UPDATE / DELETE / INSERT / MERGE";
 		return false;
 	}
 	if (IsReadOnly()) {
@@ -308,10 +308,11 @@ bool MSSQLCatalog::SupportsPushdown(const QueryNode &node) {
 	mssql::WrittenQuery written;
 	string why;
 	if (node.type == QueryNodeType::UPDATE_QUERY_NODE || node.type == QueryNodeType::DELETE_QUERY_NODE ||
-		node.type == QueryNodeType::INSERT_QUERY_NODE) {
+		node.type == QueryNodeType::INSERT_QUERY_NODE || node.type == QueryNodeType::MERGE_QUERY_NODE) {
 		// Spec 080 D1: whole, or the shipped path -- never in parts (a refused
 		// INSERT keeps the rewriter's own fallback: its SELECT pushed alone).
-		if (node.type == QueryNodeType::INSERT_QUERY_NODE && HoldsDmlCte(node)) {
+		if ((node.type == QueryNodeType::INSERT_QUERY_NODE || node.type == QueryNodeType::MERGE_QUERY_NODE) &&
+			HoldsDmlCte(node)) {
 			return false;
 		}
 		const bool pushed = WriteDmlPushdown(node, written, why);
@@ -440,7 +441,7 @@ void MSSQLCatalog::PushNestedParts(ClientContext &context, QueryNode &node, cons
 unique_ptr<TableRef> MSSQLCatalog::RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) {
 	mssql::WrittenQuery written;
 	if (node->type == QueryNodeType::UPDATE_QUERY_NODE || node->type == QueryNodeType::DELETE_QUERY_NODE ||
-		node->type == QueryNodeType::INSERT_QUERY_NODE) {
+		node->type == QueryNodeType::INSERT_QUERY_NODE || node->type == QueryNodeType::MERGE_QUERY_NODE) {
 		string why;
 		if (!WriteDmlPushdown(*node, written, why, context)) {
 			// The dry run said yes and a DML node cannot be handed back.
@@ -450,6 +451,7 @@ unique_ptr<TableRef> MSSQLCatalog::RemoteExecute(ClientContext &context, unique_
 				"please report it",
 				node->type == QueryNodeType::UPDATE_QUERY_NODE	 ? "UPDATE"
 				: node->type == QueryNodeType::DELETE_QUERY_NODE ? "DELETE"
+				: node->type == QueryNodeType::MERGE_QUERY_NODE	 ? "MERGE"
 																 : "INSERT",
 				why);
 		}

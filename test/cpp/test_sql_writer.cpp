@@ -15,9 +15,11 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/delete_query_node.hpp"
 #include "duckdb/parser/query_node/insert_query_node.hpp"
+#include "duckdb/parser/query_node/merge_query_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
@@ -150,6 +152,8 @@ static bool WriteDml(const std::string &sql, WrittenQuery &out, std::string &why
 	const QueryNode &node = insert ? static_cast<const QueryNode &>(*statement.Cast<InsertStatement>().node)
 							: statement.type == StatementType::UPDATE_STATEMENT
 								? static_cast<const QueryNode &>(*statement.Cast<UpdateStatement>().node)
+							: statement.type == StatementType::MERGE_INTO_STATEMENT
+								? static_cast<const QueryNode &>(*statement.Cast<MergeIntoStatement>().node)
 								: static_cast<const QueryNode &>(*statement.Cast<DeleteStatement>().node);
 	SQLWriterOptions options;
 	options.dml_from_join = from_join;
@@ -182,11 +186,14 @@ static void ExpectDml(const std::string &sql, const std::string &expected, bool 
 	}
 }
 
-static void ExpectDmlVeto(const std::string &sql, bool from_join = true) {
+static void ExpectDmlVeto(const std::string &sql, bool from_join = true, const std::string &reason = "") {
 	WrittenQuery out;
 	std::string why;
 	if (WriteDml(sql, out, why, from_join)) {
 		std::cerr << "FAIL: expected a veto for " << sql << "\n  wrote: " << out.statement << "\n";
+		failures++;
+	} else if (!reason.empty() && why.find(reason) == std::string::npos) {
+		std::cerr << "FAIL: " << sql << "\n  vetoed for: " << why << "\n  expected: " << reason << "\n";
 		failures++;
 	}
 }
@@ -254,6 +261,66 @@ int main() {
 	ExpectDmlVeto("DELETE FROM t WHERE id IN (SELECT t_id FROM u)", false);	 // the single-table form names columns bare
 	ExpectDmlVeto("WITH c AS (SELECT id FROM u) DELETE FROM t WHERE id IN (SELECT id FROM c)");
 	ExpectDmlVeto("DELETE FROM t WHERE lower(name) = 'x'");	 // a function the writer has no T-SQL for
+	// Spec 080 PR 4a: a MERGE with its source in the catalog, as one T-SQL MERGE.
+	ExpectDml("MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED THEN DELETE",
+			  "MERGE [dbo].[t] AS [r1] USING [dbo].[u] AS [r2] ON ([r1].[id] = [r2].[t_id]) WHEN MATCHED THEN DELETE;");
+	ExpectDml("MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED THEN DELETE",
+			  "MERGE [dbo].[t] AS [r1] USING [dbo].[u] AS [r2] ON ([r1].[id] = [r2].[t_id]) WHEN MATCHED THEN DELETE;",
+			  false);  // Fabric has MERGE
+	ExpectDml("MERGE INTO t USING u USING (id) WHEN MATCHED THEN DELETE",
+			  "MERGE [dbo].[t] AS [r1] USING [dbo].[u] AS [r2] ON ([r1].[id] = [r2].[id]) WHEN MATCHED THEN DELETE;");
+	ExpectDml(
+		"MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED AND u.big > 5 THEN DELETE WHEN MATCHED THEN UPDATE "
+		"SET flag = true WHEN NOT MATCHED THEN INSERT (id, flag) VALUES (u.id, false) WHEN NOT MATCHED BY SOURCE "
+		"AND t.flag = true THEN DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET flag = false",
+		"MERGE [dbo].[t] AS [r1] USING [dbo].[u] AS [r2] ON ([r1].[id] = [r2].[t_id]) WHEN MATCHED AND "
+		"([r2].[big] > @p0) THEN DELETE WHEN MATCHED THEN UPDATE SET [flag] = @p1 WHEN NOT MATCHED BY TARGET THEN "
+		"INSERT ([id], [flag]) VALUES ([r2].[id], @p2) WHEN NOT MATCHED BY SOURCE AND ([r1].[flag] = @p3) THEN "
+		"DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET [flag] = @p4;");
+	// A trailing DO NOTHING is dropped, with the WHEN kind it leaves empty.
+	ExpectDml("MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN DO NOTHING",
+			  "MERGE [dbo].[t] AS [r1] USING [dbo].[u] AS [r2] ON ([r1].[id] = [r2].[t_id]) WHEN MATCHED THEN DELETE;");
+	// A row the clause has no side for: the target in WHEN NOT MATCHED BY
+	// TARGET, the source in WHEN NOT MATCHED BY SOURCE.
+	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN NOT MATCHED THEN INSERT (id) VALUES (t.id)", true,
+				  "target in WHEN NOT MATCHED BY TARGET");
+	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN NOT MATCHED BY SOURCE THEN UPDATE SET id = u.t_id", true,
+				  "source in WHEN NOT MATCHED BY SOURCE");
+	// ... where an unqualified name is looked up on the side the rows have, as
+	// DuckDB binds it: `id` is u's in NOT MATCHED BY TARGET, t's BY SOURCE.
+	ExpectDml(
+		"MERGE INTO t USING u ON t.id = u.t_id WHEN NOT MATCHED THEN INSERT (id) VALUES (id) WHEN NOT MATCHED BY "
+		"SOURCE THEN UPDATE SET id = id + 1",
+		"MERGE [dbo].[t] AS [r1] USING [dbo].[u] AS [r2] ON ([r1].[id] = [r2].[t_id]) WHEN NOT MATCHED BY TARGET "
+		"THEN INSERT ([id]) VALUES ([r2].[id]) WHEN NOT MATCHED BY SOURCE THEN UPDATE SET [id] = ([r1].[id] + "
+		"@p0);");
+	// USING (id): `id` is the merged column -- the source's where there is no
+	// target row.
+	ExpectDml(
+		"MERGE INTO t USING u USING (id) WHEN MATCHED AND id > 1 THEN DELETE WHEN NOT MATCHED THEN INSERT (id) "
+		"VALUES (id)",
+		"MERGE [dbo].[t] AS [r1] USING [dbo].[u] AS [r2] ON ([r1].[id] = [r2].[id]) WHEN MATCHED AND ([r1].[id] > "
+		"@p0) THEN DELETE WHEN NOT MATCHED BY TARGET THEN INSERT ([id]) VALUES ([r2].[id]);");
+	// An unqualified name both sides have is ambiguous where both are bound.
+	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED AND id > 1 THEN DELETE");
+	// Shapes T-SQL has no form for.
+	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED THEN ERROR");
+	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED THEN UPDATE");	  // SET *
+	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN NOT MATCHED THEN INSERT");  // INSERT *
+	ExpectDmlVeto(
+		"MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED AND u.id > 1 THEN UPDATE SET flag = true "
+		"WHEN MATCHED THEN UPDATE SET flag = false");  // two UPDATEs
+	ExpectDmlVeto(
+		"MERGE INTO t USING u ON t.id = u.t_id WHEN NOT MATCHED AND u.id > 1 THEN INSERT (id) VALUES "
+		"(u.id) WHEN NOT MATCHED THEN INSERT (id) VALUES (u.id)");	// two INSERTs
+	ExpectDmlVeto(
+		"MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED AND u.id = 2 THEN DO NOTHING WHEN MATCHED "
+		"THEN DELETE");	 // DO NOTHING before another clause
+	ExpectDmlVeto("MERGE INTO t USING u ON t.id IN (SELECT t_id FROM u) WHEN MATCHED THEN DELETE");	 // a subquery
+	ExpectDmlVeto("MERGE INTO v USING u ON v.id = u.t_id WHEN MATCHED THEN DELETE");				 // a view target
+	ExpectDmlVeto(
+		"MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED THEN UPDATE SET name = u.label");  // declared apart
+	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED THEN DELETE RETURNING *");
 	// Spec 080 PR 3d: INSERT ... SELECT. The SELECT's columns are written as
 	// themselves (no read cast: the value stays on the server).
 	ExpectDml("INSERT INTO u (id) SELECT id FROM t WHERE flag = true",
