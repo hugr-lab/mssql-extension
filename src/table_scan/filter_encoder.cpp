@@ -281,9 +281,6 @@ static const MSSQLColumnInfo *ColumnInfoOf(const Expression &expr_in, const Expr
 		const MSSQLColumnInfo *column = nullptr;
 		return ctx.resolver->Resolve(expr->Cast<BoundColumnRefExpression>(), sql, column) ? column : nullptr;
 	}
-	if (!ctx.mssql_columns) {
-		return nullptr;
-	}
 	const auto &binding = expr->Cast<BoundColumnRefExpression>().Binding();
 	column_t table_col_idx;
 	if (ctx.column_ids.empty()) {
@@ -879,6 +876,10 @@ ExpressionEncodeResult FilterEncoder::EncodeSearchCondition(const Expression &ex
 //------------------------------------------------------------------------------
 
 ExpressionEncodeResult FilterEncoder::EncodeExpression(const Expression &expr, const ExpressionEncodeContext &ctx) {
+	// ColumnResolver's contract: with a resolver the scan's projection and PK
+	// are unset, or the rowid paths would resolve a name behind it (review of
+	// #477).
+	D_ASSERT(!ctx.resolver || (ctx.column_ids.empty() && !ctx.HasPKInfo()));
 	// Spec 076: constants register themselves in the sink as they are met, so
 	// an expression refused halfway (a comparison whose other side does not
 	// encode) would leave its parameters in the DECLARE line -- unused, and a
