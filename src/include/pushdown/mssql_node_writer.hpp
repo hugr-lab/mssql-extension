@@ -31,10 +31,12 @@
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/query_node/delete_query_node.hpp"
 #include "duckdb/parser/query_node/insert_query_node.hpp"
+#include "duckdb/parser/query_node/merge_query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
+#include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 
@@ -230,9 +232,18 @@ public:
 	bool WriteUpdate(const UpdateQueryNode &node);
 	bool WriteDelete(const DeleteQueryNode &node);
 	bool WriteInsert(const InsertQueryNode &node, const BaseTableRef &target);
+	//! Spec 080 PR 4a: a MERGE whose source is in the same catalog, as one
+	//! T-SQL MERGE (mssql_node_writer_dml.cpp).
+	bool WriteMerge(const MergeQueryNode &node);
 
 private:
 	bool WriteSetOperation(const SetOperationNode &node);
+	//! The column of `columns` (the first `count`) a SET (`role` "SET") or an
+	//! INSERT column list ("INSERT") names, by case-insensitive name, and not in
+	//! `taken`, which it joins. A veto otherwise: no such column, two of them
+	//! (a case-sensitive database), or named twice.
+	bool TargetColumn(const std::vector<MSSQLColumnInfo> &columns, idx_t count, const std::string &name,
+					  const char *role, std::vector<idx_t> &taken, idx_t &index);
 	//! The target and the FROM / USING tables of an UPDATE / DELETE: the
 	//! target is relation 0. False with a veto on anything but base tables,
 	//! a view target, or a source the platform's form cannot take.
@@ -243,6 +254,11 @@ private:
 	bool WriteSetValue(const ParsedExpression &expr, idx_t column, std::string &sql);
 	//! The WHERE of an UPDATE / DELETE; empty when it has none.
 	bool WriteDmlWhere(const ParsedExpression *condition, std::string &sql);
+	//! One WHEN clause of a MERGE, `WHEN <when> [AND c] THEN <action>`.
+	bool WriteMergeAction(const MergeIntoAction &action, MergeActionCondition when, std::string &sql);
+	//! The `INSERT (…) VALUES (…)` / `INSERT DEFAULT VALUES` of a WHEN NOT
+	//! MATCHED [BY TARGET] clause.
+	bool WriteMergeInsert(const MergeIntoAction &action, std::string &sql);
 	//! A CTE of a WITH clause, inlined where it is referenced (PR E1): T-SQL's
 	//! WITH stands only at a statement's top, and the server inlines its own
 	//! CTEs anyway. DuckDB evaluates one once, so a body that is not the same
@@ -397,6 +413,26 @@ private:
 	//! Relations are aliased [r<alias_base_ + 1>], ...: a correlated subquery's
 	//! aliases must not shadow the outer node's.
 	idx_t alias_base_ = 0;
+	//! Spec 080 PR 4a: the relations [first, last) a MERGE action's
+	//! expressions may not name -- the target in WHEN NOT MATCHED BY TARGET,
+	//! the source in WHEN NOT MATCHED BY SOURCE. DuckDB binds such an action
+	//! against the other side alone (bind_merge_into.cpp): an unqualified name
+	//! is looked up there only (FindColumn), a qualified one naming the
+	//! forbidden side is refused (ResolveColumn).
+	idx_t merge_forbidden_first_ = DConstants::INVALID_INDEX;
+	idx_t merge_forbidden_last_ = DConstants::INVALID_INDEX;
+	//! A MERGE's USING (c, …): each name with its column on the target and on
+	//! the source. An action's unqualified c is the side its rows have.
+	struct MergeUsing {
+		std::string name;
+		idx_t target;
+		idx_t source;
+	};
+	std::vector<MergeUsing> merge_using_;
+	//! Which NOT MATCHED kinds the MERGE has: they set DuckDB's join type, and
+	//! with it the side a USING column means in WHEN MATCHED.
+	bool merge_has_by_source_ = false;
+	bool merge_has_by_target_ = false;
 	//! It names a column of a node around it (set on every writer between).
 	bool correlated_ = false;
 	//! The node's LIMIT, -1 without one.

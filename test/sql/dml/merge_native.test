@@ -9,6 +9,13 @@ require mssql
 
 require-env MSSQL_TESTDB_DSN
 
+# This file is about DuckDB's native MERGE. A MERGE whose source is in the same
+# catalog goes to the server whole since spec 080 PR 4a
+# (test/sql/pushdown/remote_pushdown_merge.test); off here, every MERGE below
+# takes the native path it was written for.
+statement ok
+SET mssql_dml_pushdown = false;
+
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS mgn (TYPE mssql);
 
