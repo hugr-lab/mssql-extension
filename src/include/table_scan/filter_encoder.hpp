@@ -60,6 +60,30 @@ struct FilterEncoderResult {
 //------------------------------------------------------------------------------
 
 /**
+ * What a column reference stands for, when the expression is not over one
+ * scan's projection: spec 080 PR 4b renders a MERGE's conditions and values,
+ * whose references are to the target table and to the staged source. Set on
+ * ExpressionEncodeContext::resolver, it answers every BoundColumnRefExpression
+ * in place of column_ids / column_names / mssql_columns. Such a context
+ * leaves column_ids empty and sets no PK info, so no reference is a rowid.
+ *
+ * Resolve is asked several times for one reference (the peer of a constant,
+ * the #426 checks, the rendering) and for references in expressions that end
+ * up refused, so it must have no side effects; the column it returns is held
+ * while the expression is encoded and must outlive the encode.
+ */
+class ColumnResolver {
+public:
+	virtual ~ColumnResolver() = default;
+	//! The reference's T-SQL in `sql` and the SQL Server column it is in
+	//! `column` (nullptr when none: a constant compared with it is then
+	//! declared from its own type). False: the reference cannot be rendered,
+	//! and neither can the expression holding it.
+	virtual bool Resolve(const BoundColumnRefExpression &expr, std::string &sql,
+						 const MSSQLColumnInfo *&column) const = 0;
+};
+
+/**
  * Context for expression encoding, passed through recursive calls.
  */
 struct ExpressionEncodeContext {
@@ -104,6 +128,11 @@ struct ExpressionEncodeContext {
 	// ClientContext; set by BuildEncodeContext and inherited by children.
 	bool division_by_zero_errors = true;
 
+	// Spec 080 PR 4b: when set, what every column reference stands for (see
+	// ColumnResolver); column_ids / column_names / mssql_columns are not
+	// consulted for one. Inherited by children.
+	const ColumnResolver *resolver = nullptr;
+
 	ExpressionEncodeContext(const std::vector<column_t> &col_ids, const std::vector<std::string> &col_names,
 							const std::vector<LogicalType> &col_types)
 		: column_ids(col_ids), column_names(col_names), column_types(col_types), depth(0) {}
@@ -132,6 +161,7 @@ struct ExpressionEncodeContext {
 		ctx.mssql_columns = mssql_columns;
 		ctx.filter_column_info = filter_column_info;
 		ctx.division_by_zero_errors = division_by_zero_errors;
+		ctx.resolver = resolver;
 		return ctx;
 	}
 

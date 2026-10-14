@@ -319,18 +319,21 @@ int main() {
 	// An unqualified name both sides have is ambiguous where both are bound.
 	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED AND id > 1 THEN DELETE");
 	// Shapes T-SQL has no form for.
-	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED THEN ERROR");
+	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED THEN ERROR", true, "an ERROR action in a MERGE");
 	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED THEN UPDATE");	  // SET *
 	ExpectDmlVeto("MERGE INTO t USING u ON t.id = u.t_id WHEN NOT MATCHED THEN INSERT");  // INSERT *
 	ExpectDmlVeto(
 		"MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED AND u.id > 1 THEN UPDATE SET flag = true "
-		"WHEN MATCHED THEN UPDATE SET flag = false");  // two UPDATEs
+		"WHEN MATCHED THEN UPDATE SET flag = false",
+		true, "two WHEN MATCHED clauses of one action");
 	ExpectDmlVeto(
 		"MERGE INTO t USING u ON t.id = u.t_id WHEN NOT MATCHED AND u.id > 1 THEN INSERT (id) VALUES "
-		"(u.id) WHEN NOT MATCHED THEN INSERT (id) VALUES (u.id)");	// two INSERTs
+		"(u.id) WHEN NOT MATCHED THEN INSERT (id) VALUES (u.id)",
+		true, "more than one WHEN NOT MATCHED BY TARGET clause");
 	ExpectDmlVeto(
 		"MERGE INTO t USING u ON t.id = u.t_id WHEN MATCHED AND u.id = 2 THEN DO NOTHING WHEN MATCHED "
-		"THEN DELETE");	 // DO NOTHING before another clause
+		"THEN DELETE",
+		true, "DO NOTHING before another WHEN MATCHED clause");
 	ExpectDmlVeto("MERGE INTO t USING u ON t.id IN (SELECT t_id FROM u) WHEN MATCHED THEN DELETE");	 // a subquery
 	ExpectDmlVeto("MERGE INTO v USING u ON v.id = u.t_id WHEN MATCHED THEN DELETE");				 // a view target
 	ExpectDmlVeto(

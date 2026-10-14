@@ -258,7 +258,7 @@ std::string FilterEncoder::EncodeConstantValue(const Value &value, const Logical
 // The SQL Server column an expression IS, when it is a plain reference to
 // one: the peer a constant compared with it is declared from.
 static const MSSQLColumnInfo *ColumnInfoOf(const Expression &expr_in, const ExpressionEncodeContext &ctx) {
-	if (!ctx.mssql_columns) {
+	if (!ctx.mssql_columns && !ctx.resolver) {
 		return nullptr;
 	}
 	// Spec 060 reports MSSQL_VARCHAR(n) / MSSQL_NVARCHAR(n) for string columns
@@ -274,6 +274,14 @@ static const MSSQLColumnInfo *ColumnInfoOf(const Expression &expr_in, const Expr
 		return ctx.filter_column_info;
 	}
 	if (expr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return nullptr;
+	}
+	if (ctx.resolver) {
+		std::string sql;
+		const MSSQLColumnInfo *column = nullptr;
+		return ctx.resolver->Resolve(expr->Cast<BoundColumnRefExpression>(), sql, column) ? column : nullptr;
+	}
+	if (!ctx.mssql_columns) {
 		return nullptr;
 	}
 	const auto &binding = expr->Cast<BoundColumnRefExpression>().Binding();
@@ -1279,6 +1287,15 @@ ExpressionEncodeResult FilterEncoder::EncodeBetweenExpression(const BoundFunctio
 
 ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpression &expr,
 													  const ExpressionEncodeContext &ctx) {
+	if (ctx.resolver) {
+		std::string sql;
+		const MSSQLColumnInfo *column = nullptr;
+		if (!ctx.resolver->Resolve(expr, sql, column)) {
+			return {"", false};
+		}
+		return {sql, true};
+	}
+
 	// Get the column binding - this contains the table index and column index
 	const auto &binding = expr.Binding();
 	MSSQL_FILTER_DEBUG_LOG(2, "EncodeColumnRef: table_idx=%llu, column_idx=%llu",

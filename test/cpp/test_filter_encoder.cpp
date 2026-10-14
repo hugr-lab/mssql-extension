@@ -28,6 +28,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "pushdown/mssql_expression_vocabulary.hpp"
+#include "query/mssql_identifier.hpp"
 #include "query/mssql_sql_params.hpp"
 #include "table_scan/filter_encoder.hpp"
 #include "table_scan/function_mapping.hpp"
@@ -630,6 +631,89 @@ static void TestDatetimeAgainstOtherValuesRefused() {
 		"([d] > CAST('2026-01-01T10:00:00.0033330' AS DATETIME2(7)))");
 }
 
+// Spec 080 PR 4b: a ColumnResolver answers for every column reference -- two
+// relations here, table 1 as [t] and table 2 as [s] -- in place of the scan's
+// projection, and its column is the peer a constant is declared from and the
+// one #426's datetime rules look at.
+namespace {
+struct TwoRelationResolver : public ColumnResolver {
+	std::vector<MSSQLColumnInfo> target;
+	std::vector<MSSQLColumnInfo> source;
+	bool Resolve(const BoundColumnRefExpression &expr, std::string &sql,
+				 const MSSQLColumnInfo *&column) const override {
+		const auto &binding = expr.Binding();
+		const bool is_target = binding.table_index.index == 1;
+		const auto &cols = is_target ? target : source;
+		if (binding.column_index >= cols.size()) {
+			return false;
+		}
+		column = &cols[binding.column_index];
+		sql = is_target ? "[t]." + mssql::QuoteIdentifier(column->name)
+						: "[s].[c" + std::to_string(binding.column_index) + "]";
+		return true;
+	}
+};
+
+unique_ptr<Expression> RelRef(idx_t table, idx_t col, const LogicalType &type) {
+	return make_uniq<BoundColumnRefExpression>(type, ColumnBinding(TableIndex(table), ProjectionIndex(col)));
+}
+}  // namespace
+
+static void TestColumnResolver() {
+	std::cout << "  TestColumnResolver..." << std::endl;
+	TwoRelationResolver resolver;
+	resolver.target = {Col("id", 1, "int", 4, 10, 0), Col("name", 2, "varchar", 20, 0, 0),
+					   Col("dt", 3, "datetime", 8, 23, 3)};
+	resolver.source = {Col("c0", 1, "int", 4, 10, 0), Col("c1", 2, "datetime2", 8, 26, 6)};
+	// The scan's own fields are empty: nothing may be read through them.
+	std::vector<column_t> no_ids;
+	std::vector<std::string> no_names;
+	std::vector<LogicalType> no_types;
+	SqlParamSet params;
+	ExpressionEncodeContext ctx(no_ids, no_names, no_types);
+	ctx.resolver = &resolver;
+	ctx.params = &params;
+
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(
+				   *BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, RelRef(1, 0, LogicalType::INTEGER),
+													  RelRef(2, 0, LogicalType::INTEGER)),
+				   ctx),
+			   "([t].[id] = [s].[c0])");
+
+	// the peer comes from the resolver: varchar(20), not the constant's nvarchar
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(
+				   *BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, RelRef(1, 1, LogicalType::VARCHAR),
+													  Const(Value("ab"))),
+				   ctx),
+			   "([t].[name] = @p0)");
+	ASSERT_TRUE(params.params.size() == 1);
+	ASSERT_TRUE(params.params[0].declaration == "varchar(20)");
+
+	// children inherit it: a reference under a function
+	auto year = Call1("year", LogicalType::TIMESTAMP, LogicalType::BIGINT, RelRef(1, 2, LogicalType::TIMESTAMP));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(
+				   *BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, std::move(year),
+													  Const(Value::BIGINT(2026))),
+				   ctx),
+			   "(YEAR([t].[dt]) = @p1)");
+
+	// #426: a datetime column against a datetime2 one is refused, whichever
+	// relation each comes from
+	ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(
+		*BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, RelRef(1, 2, LogicalType::TIMESTAMP),
+										   RelRef(2, 1, LogicalType::TIMESTAMP)),
+		ctx));
+
+	// a reference the resolver refuses refuses the expression and leaves no
+	// parameter behind: the constant on the left registers one first
+	const size_t before = params.params.size();
+	ASSERT_REFUSED(FilterEncoder::EncodeSearchCondition(
+		*BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, Const(Value::INTEGER(1)),
+										   RelRef(2, 7, LogicalType::INTEGER)),
+		ctx));
+	ASSERT_TRUE(params.params.size() == before);
+}
+
 // Issue #426: time(7) / datetimeoffset(7) are read with their 100 ns digit
 // dropped, so the read equals c for every stored value in [c, c + 1 us): `=`
 // is that range, `>` starts at c + 1 us, `<=` ends before it, `>=` / `<` stay.
@@ -1006,6 +1090,7 @@ int main() {
 	TestTruncatedReadComparisons();
 	TestInListOperatorExpressions();
 	TestDeclarationForColumn();
+	TestColumnResolver();
 
 	std::cout << "All FilterEncoder tests PASSED!" << std::endl;
 	return 0;
