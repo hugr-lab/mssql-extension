@@ -1324,12 +1324,13 @@ jobs:
   # ============================================================================
   # The one Windows scenario that needs a server: a statement that runs for
   # seconds over TLS, its response read in 1 s slices that each time out on
-  # the socket (issue #457 -- a Winsock read timeout used to reach OpenSSL as
-  # a hard error). SQL Server is installed on the runner (Developer, default
-  # instance, TCP 1433, mixed auth) by potatoqualitee/mssqlsuite, and the
-  # scenario runs through the MSVC CLI: the Windows lane builds no
-  # sqllogictest runner. The same scenario runs on Linux as
-  # test/sql/integration/tls_slow_statement.test.
+  # the socket (issue #457: a Winsock read timeout reaches OpenSSL as
+  # SSL_ERROR_SYSCALL, read as a timeout; measured to leave the connection
+  # usable, run 38688186396). SQL Server is installed on the runner
+  # (Developer, default instance, TCP 1433, mixed auth) by
+  # potatoqualitee/mssqlsuite, and the scenario runs through the MSVC CLI:
+  # the Windows lane builds no sqllogictest runner. The same scenario runs on
+  # Linux as test/sql/integration/tls_slow_statement.test.
   integration-windows:
     name: Integration Windows (MSVC)
     runs-on: windows-latest

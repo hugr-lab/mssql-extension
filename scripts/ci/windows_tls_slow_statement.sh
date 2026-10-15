@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Issue #457 on Windows: a statement that runs for seconds over TLS, its
-# response read in 1 s slices that each time out on the socket, must succeed
-# with its count and leave the connection usable. The same scenario as
-# test/sql/integration/tls_slow_statement.test, through the CLI: the Windows
-# lane builds no sqllogictest runner.
+# response read in 1 s slices that each time out on the socket (WSAETIMEDOUT
+# inside SSL_read, SSL_ERROR_SYSCALL to OpenSSL), must succeed with its count
+# and leave the connection usable -- measured to hold (CI run 38688186396).
+# The same scenario as test/sql/integration/tls_slow_statement.test, through
+# the CLI: the Windows lane builds no sqllogictest runner.
 #
 # The CLI at the 2.0 pin does not fail on a runtime error (it prints nothing
 # and exits 0), so the output is compared line by line with what the

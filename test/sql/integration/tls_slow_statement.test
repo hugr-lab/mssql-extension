@@ -6,10 +6,14 @@
 # The DML response loop waits in 1 s slices (mssql::ExecuteDmlBatch, #450), so
 # a statement that takes three seconds meets the socket's read timeout inside
 # SSL_read two or three times before its answer arrives. On POSIX that is
-# EAGAIN, a retryable read; on Windows a socket read timeout used to be
-# WSAETIMEDOUT, a hard error to OpenSSL (SSL_ERROR_SYSCALL), after which the
-# TLS stream must not be read again (#457). The slow part is an AFTER trigger
-# that waits three seconds.
+# EAGAIN, a retryable BIO read. On Windows it is WSAETIMEDOUT, which reaches
+# OpenSSL as SSL_ERROR_SYSCALL -- after which OpenSSL documents no further
+# I/O, and Microsoft the socket as indeterminate -- and TlsImpl::Receive reads
+# it as a timeout (#457). Measured on a Windows runner (SQL Server 2022, TLS,
+# CI run 38688186396): every statement returned its result and the connection
+# served the next one. This test, and its Windows twin
+# scripts/ci/windows_tls_slow_statement.sh, keep it so. The slow part is an
+# AFTER trigger that waits three seconds.
 
 require mssql
 
