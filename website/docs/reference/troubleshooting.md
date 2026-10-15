@@ -137,13 +137,15 @@ types, so the same query runs there. Tracked as
 
 ### Unsupported Features
 
-- **RETURNING for UPDATE/DELETE**: Only INSERT supports RETURNING clause; UPDATE/DELETE do not
-- **UPDATE/DELETE without PK**: Tables must have primary keys for UPDATE/DELETE operations
-- **Updating primary key columns**: UPDATE cannot modify primary key columns (used for row identification)
+- **UPDATE / DELETE … RETURNING on Fabric Warehouse and Azure Synapse**: refused by name; both lack the `OUTPUT … INTO` the rows are read back through. On SQL Server and Azure SQL they work. See [DML](../writing/dml.md).
+- **UPDATE / DELETE on a table with no usable key**, when the statement cannot go to the server whole: such a table is keyed by every column, which needs the server to select the same rows as DuckDB, and is refused by name when it cannot (a WHERE that runs in DuckDB, a volatile function, `UPDATE … FROM`). A primary key or a unique index lifts it. See [DML](../writing/dml.md).
+- **A SET of a key column** goes only when the UPDATE goes to the server whole (`mssql_dml_pushdown`); the row paths select rows by that key.
+- **MERGE INTO an MSSQL table runs on the server or is refused**: more WHEN clauses than T-SQL takes, `ERROR`, an INSERT naming the identity column, `RETURNING`, a subquery, an expression over the target T-SQL cannot write (a string function, unary minus), and any MERGE with DuckDB's optimizer off are refused by name. `SET x = DEFAULT` writes NULL. A source value compared with a temporal column of the target is rounded to that column's precision first, as the server compares. See [MERGE INTO](../writing/dml.md#merge-into).
+- **UPDATE / DELETE / MERGE on Azure Synapse**: refused; its keys are NOT ENFORCED and its MERGE is in preview.
 - **Keytab / raw Kerberos credentials on macOS**: macOS's `GSS.framework` lacks MIT extensions for `gss_acquire_cred_from` keytab and raw-password paths. macOS supports credential-cache mode only (via `kinit`); keytab and raw-credentials modes are Linux-only. See [Kerberos.md](../connection/kerberos.md) for the WSL2 / Docker testing path.
 - **Multiple result sets**: Only one result-producing statement per `mssql_scan()` batch is allowed
 - **Stored Procedures with Output Parameters**: Use `mssql_scan()` for stored procedures
-- **rowid for views/tables without PK**: Only tables with primary keys expose `rowid`
+- **rowid for views and tables without a usable key**: `rowid` is the primary key, else a usable unique index (not filtered, not disabled, NOT NULL columns that a literal matches); a view or a table with neither has no `rowid`
 
 ### VARCHAR Encoding
 
@@ -290,6 +292,21 @@ The codec validates the input first and falls back to a slower scalar implementa
 ### Known Issues
 
 - Catalog scans auto-CAST server-specific types (`SQL_VARIANT`, `hierarchyid`, CLR UDTs) to `NVARCHAR(MAX)`, so three-part-name queries succeed; raw `mssql_scan()` needs an explicit CAST for such columns
+- **A `SQL_VARIANT` column loses data when read, without a warning** ([#354](https://github.com/hugr-lab/mssql-extension/issues/354)). The auto-CAST to `NVARCHAR(MAX)` uses conversion style 0: a `datetime2` / `datetime` / `date` / `time` value loses its seconds and fractions (`Sep 16 2026 10:11AM`), and a `varbinary` value arrives as its bytes read as UTF-16. No single style serves every base type a variant column can hold. Read such a column through `mssql_scan()` with a conversion per base type:
+
+  ```sql
+  SELECT * FROM mssql_scan('db', 'SELECT id,
+      CASE WHEN CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS sysname)
+                IN (''datetime2'', ''datetime'', ''smalldatetime'', ''date'', ''time'', ''datetimeoffset'')
+           THEN CONVERT(nvarchar(max), v, 126)
+           WHEN CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS sysname) IN (''binary'', ''varbinary'')
+           THEN CONVERT(nvarchar(max), CAST(v AS varbinary(max)), 1)
+           ELSE CAST(v AS nvarchar(max)) END AS v
+    FROM dbo.t');
+  ```
+
+  It returns `2026-09-16T10:11:12.1234567`, `10:11:12`, `0x0102`, `2026-09-16` where the auto-CAST lost them. Reading the column as DuckDB's own `VARIANT` is planned after 0.3.0.
+- **A serverless Azure SQL database that is resuming** answers a login with error 40613 ("not available yet ... retry shortly") until it is up, typically 20 to 60 s. The extension names it but does not retry yet ([#481](https://github.com/hugr-lab/mssql-extension/issues/481)): retry the ATTACH or the statement.
 - Raw `mssql_scan()` returns non-Unicode `CHAR`/`VARCHAR`/`TEXT` bytes in the column's code page without transcoding them, so a non-ASCII value is not valid UTF-8 and string functions mangle it silently — add `CAST(col AS NVARCHAR(MAX))`, or read through the catalog. See [Raw `mssql_scan()` does not transcode code pages](#raw-mssql_scan-does-not-transcode-code-pages)
 - The DuckDB UI cannot render a result with an `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` column (`Expected field id 65535 but got 103`) — set `mssql_catalog_native_types = false` and invalidate the cache. See [DuckDB UI](#duckdb-ui-expected-field-id-65535-but-got-103)
 - XML columns in INSERT/UPDATE are limited to 4096 bytes per value — use COPY TO with BCP protocol for larger documents
