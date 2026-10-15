@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The first release for **DuckDB 2.0**. DuckDB 1.5.x stays on the 0.2.x line
+(v0.2.5).
+
+### Highlights
+
+- **Whole queries run on SQL Server** (spec 079, `mssql_remote_pushdown`, on
+  by default). A SELECT the extension can write in T-SQL — joins of one
+  database's tables, aggregates, GROUP BY / HAVING, DISTINCT, window functions,
+  QUALIFY, ORDER BY / LIMIT, subqueries, CTEs, set operations — goes to the
+  server as one statement, and `EXPLAIN` shows it.
+- **UPDATE, DELETE, INSERT … SELECT and MERGE run on SQL Server as one
+  statement** (spec 080), when they can be written in T-SQL: no row crosses the
+  wire and no key is needed.
+- **MERGE INTO from any source** (spec 080 PR 4b): a DuckDB table, a file, a
+  VALUES list or another database is staged into a session `#src` and merged
+  by one server-side MERGE. A MERGE into an MSSQL table always runs on the
+  server, atomically.
+- **UPDATE and DELETE need no primary key and can return rows** (spec 077,
+  spec 080): a usable unique index serves as the row key, a table with none is
+  keyed by every column, and `UPDATE / DELETE … RETURNING` work. Past
+  `mssql_dml_stage_threshold` rows they go through a session `#stage` and one
+  JOIN statement instead of VALUES batches.
+- **INSERT loads through BCP** (spec 062): an INSERT of 1M rows went from
+  74.7 s to 0.51 s, with CHECK constraints and triggers still applied.
+- **An autocommit UPDATE / DELETE / MERGE commits and rolls back with DuckDB**
+  (#451): an error later in the statement, Ctrl-C or a dropped result undoes
+  the write.
+- **Parameterized statements** (specs 075, 076, 083): pushed filter constants
+  travel as typed RPC parameters, one server plan per statement shape;
+  `mssql_scan_params` / `mssql_exec_params` take parameters from DuckDB, and
+  `prepared := true` compiles once.
+- **`mssql_scan` describes instead of executing at bind** (spec 075):
+  `DESCRIBE` / `EXPLAIN` no longer run the query.
+- **A faster, transaction-aware catalog** (specs 076, 084, #380, #383): a
+  table's first touch is one round trip, metadata inside a transaction is the
+  transaction's own, and new ATTACH options (`preload`, `min_connections`,
+  `default_schema`, `transaction_isolation`, `native_types`,
+  `remote_pushdown`) reach DuckLake's `METADATA_PARAMETERS`.
+- **TLS certificates are verified by default** (spec 074), with
+  `HostNameInCertificate` for a name that differs from the address dialled.
+- **Microsoft Fabric Warehouse**: UPDATE, DELETE and MERGE.
+- **Correctness**: comparisons with `datetime` ticks (#426), `char(n)` padding
+  (#405), dates SQL Server cannot hold (#447), a DELETE that removed the wrong
+  rows (#337), the pool overshooting its limit (#461) — the full list is below.
+
+### Upgrade notes
+
+- **DuckDB 2.0 is required.** On DuckDB 1.5.x install v0.2.5.
+- **The server certificate is verified by default** (spec 074). A server on a
+  self-signed certificate — the docker image, many on-premises instances — now
+  fails the handshake with `certificate verification failed for <host>`. Add
+  `TrustServerCertificate=yes` to the connection string,
+  `trustservercertificate=true` to the URI, or `trust_server_certificate true`
+  to the secret, or install the certificate's CA.
+- **An autocommit UPDATE / DELETE / MERGE joins DuckDB's statement
+  transaction** (#451): it commits when DuckDB commits the statement, and it
+  holds its connection until the query ends.
+- **`enable_external_access = false` is honoured** (#452): ATTACH and the
+  authentication test functions are refused.
+- **Remote pushdown is on by default** (spec 079). In a pushed statement,
+  GROUP BY, DISTINCT, joins and set operations compare strings under the
+  column's SQL Server collation — a `_CI_` collation groups `'a'` with `'A'`.
+  `SET mssql_remote_pushdown = false`, or `remote_pushdown false` on the
+  ATTACH, keeps every statement on the scan path.
+- **A MERGE into an MSSQL table runs on the server or is refused by name**
+  (spec 080 D4). DuckDB's own client-side MERGE no longer runs for it, so these
+  are refused: more WHEN clauses than T-SQL takes, `ERROR`, an INSERT naming
+  the identity column, `RETURNING`, and any MERGE with DuckDB's optimizer
+  turned off.
+- **An INSERT of more than `mssql_insert_bcp_threshold` (1000) rows uses
+  INSERT BULK** (spec 062). On a heap it takes a TABLOCK (`mssql_copy_tablock
+  auto`), so readers under READ COMMITTED wait for the load.
+  `mssql_insert_use_bcp = false` keeps INSERT statements.
+- **Removed**: `mssql_open()`, `mssql_close()`, `mssql_ping()` and
+  `mssql_close_all()`; ATTACH a catalog instead.
+- **Deprecated, no effect**: `mssql_dml_use_prepared` and
+  `mssql_insert_use_returning_output`. A `SET` of either still parses; both
+  go in a later release.
+
 ### Added
 
 - **MERGE INTO from any source runs on SQL Server as one statement** (spec 080
