@@ -1,0 +1,85 @@
+# name: test/sql/integration/tls_slow_statement.test
+# description: a statement that runs for seconds over TLS -- its response read in 1 s slices, each one timing out on the socket -- succeeds with its count and leaves the connection usable (#457)
+# group: [integration]
+# issue: 457
+#
+# The DML response loop waits in 1 s slices (mssql::ExecuteDmlBatch, #450), so
+# a statement that takes three seconds meets the socket's read timeout inside
+# SSL_read two or three times before its answer arrives. On POSIX that is
+# EAGAIN, a retryable read; on Windows a socket read timeout used to be
+# WSAETIMEDOUT, a hard error to OpenSSL (SSL_ERROR_SYSCALL), after which the
+# TLS stream must not be read again (#457). The slow part is an AFTER trigger
+# that waits three seconds.
+
+require mssql
+
+require-env MSSQL_TEST_DSN_TLS
+
+statement ok
+ATTACH '{MSSQL_TEST_DSN_TLS}' AS tls457 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('tls457', 'IF OBJECT_ID(''dbo.tls_slow_457'') IS NOT NULL DROP TABLE dbo.tls_slow_457; CREATE TABLE dbo.tls_slow_457 (id int PRIMARY KEY, v int NOT NULL); INSERT INTO dbo.tls_slow_457 VALUES (1, 0), (2, 0), (3, 0)');
+
+statement ok
+SELECT mssql_exec('tls457', 'CREATE TRIGGER dbo.tls_slow_457_wait ON dbo.tls_slow_457 AFTER UPDATE AS WAITFOR DELAY ''00:00:03''');
+
+statement ok
+SELECT mssql_invalidate_cache('tls457');
+
+# A pushed UPDATE (mssql_dml: no deadline, 1 s slices).
+query I
+UPDATE tls457.dbo.tls_slow_457 SET v = v + 1 WHERE id <= 2;
+----
+2
+
+query II
+SELECT id, v FROM tls457.dbo.tls_slow_457 ORDER BY id;
+----
+1	1
+2	1
+3	0
+
+# A staged MERGE: #src filled, then the MERGE waits in its trigger.
+query I
+MERGE INTO tls457.dbo.tls_slow_457 AS t USING (SELECT * FROM (VALUES (3, 5)) AS x(id, w)) AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET v = s.w;
+----
+1
+
+# In a transaction: the pinned connection reads through the slices and serves
+# the next statement.
+statement ok
+BEGIN;
+
+query I
+UPDATE tls457.dbo.tls_slow_457 SET v = 9 WHERE id = 1;
+----
+1
+
+query I
+SELECT v FROM tls457.dbo.tls_slow_457 WHERE id = 1;
+----
+9
+
+statement ok
+COMMIT;
+
+# A scan whose rows come after a wait.
+query I
+SELECT x FROM mssql_scan('tls457', 'WAITFOR DELAY ''00:00:03''; SELECT 42 AS x');
+----
+42
+
+query II
+SELECT id, v FROM tls457.dbo.tls_slow_457 ORDER BY id;
+----
+1	9
+2	1
+3	5
+
+statement ok
+SELECT mssql_exec('tls457', 'DROP TABLE dbo.tls_slow_457');
+
+statement ok
+DETACH tls457;

@@ -1320,6 +1320,50 @@ jobs:
           echo "Smoke test passed!"
 
   # ============================================================================
+  # Windows integration (MSVC) -- dispatch-only, beside the Windows builds
+  # ============================================================================
+  # The one Windows scenario that needs a server: a statement that runs for
+  # seconds over TLS, its response read in 1 s slices that each time out on
+  # the socket (issue #457 -- a Winsock read timeout used to reach OpenSSL as
+  # a hard error). SQL Server is installed on the runner (Developer, default
+  # instance, TCP 1433, mixed auth) by potatoqualitee/mssqlsuite, and the
+  # scenario runs through the MSVC CLI: the Windows lane builds no
+  # sqllogictest runner. The same scenario runs on Linux as
+  # test/sql/integration/tls_slow_statement.test.
+  integration-windows:
+    name: Integration Windows (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    needs: [build-windows-msvc]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_build }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download extension artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: mssql-extension-windows_amd64_msvc
+          path: extension
+
+      - name: Download DuckDB CLI artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: duckdb-cli-windows_amd64_msvc
+          path: cli
+
+      - name: Install SQL Server
+        uses: potatoqualitee/mssqlsuite@v2
+        with:
+          install: sqlengine
+          version: '2022'
+          sa-password: ${{ env.MSSQL_TEST_PASS }}
+
+      - name: A slow statement over TLS (issue #457)
+        shell: bash
+        run: scripts/ci/windows_tls_slow_statement.sh ./cli/duckdb.exe extension/mssql.duckdb_extension
+
+  # ============================================================================
   # Azure Test Job - Azure SQL Database and Fabric tests
   # Uses 'test' environment for secrets (AZURE_APP_ID, AZURE_APP_SECRET, etc.)
   # Runs DuckDB unittest with [azure] test group
