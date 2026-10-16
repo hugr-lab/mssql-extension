@@ -29,6 +29,17 @@ parsing code. Then read the report:
 open joern/out/report-tds.md        # or: less joern/out/report-tds.md
 ```
 
+To review the hits rather than just read them, group them first:
+
+```bash
+joern/review.py                     # -> joern/out/review-tds.md
+```
+
+That collapses the report into one checkbox per **question** — hits with the
+same expression shape in the same file become one item listing every location
+(400+ hits -> 89 items on the current tree). `joern/README.md` has the verdict
+vocabulary and what the first pass over it found.
+
 ## Narrower, wider
 
 ```bash

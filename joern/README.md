@@ -37,6 +37,7 @@ joern/scan.sh all q6    # the credential query, which needs the whole extension
 
 joern/shell.sh          # REPL with the CPG loaded and helpers defined
 joern/graph.sh ParseError   # render one method's CFG as an SVG (needs graphviz)
+joern/review.py         # turn the report into a review worklist (see below)
 ```
 
 Or `make joern-cpg`, `make joern-scan` (`JOERN_QUERY=q3`), `make joern-shell`,
@@ -106,6 +107,38 @@ the entries themselves:
 - **q9 = 152** is mostly honest: the BCP encoders and the row stager's append
   side never see wire bytes. What to look for is a *read*-path method in that
   list.
+
+## Reviewing the results
+
+A report is a few hundred `file:line` lines, which is not something a person
+sits down and reviews. `joern/review.py` groups it by query, then by file, then
+by the **shape** of the expression, and writes a worklist of checkboxes:
+
+```bash
+joern/review.py                        # report-tds.md  -> review-tds.md
+joern/review.py joern/out/report-all.md  #             -> review-all.md
+```
+
+Twenty `1 + data_length` hits in one row reader become **one item with twenty
+locations** — one question asked twenty times, not twenty questions. On the
+current tree that turns 400+ hits into 89 items for the `tds` scope and 130 for
+`all`. Each item carries a `verdict:` line to fill in; q1 and q9 are inventories
+by design, so they are summarised per file instead of itemised.
+
+The first pass over that worklist is what found the two bugs the lane has paid
+for so far:
+
+| | |
+|---|---|
+| **q2** | `codec::datetime::RenderAsString` used its `size` argument in one branch only, so a server-declared 1-byte DATE reached a decoder that reads three bytes unconditionally — and an empty value read through a null pointer. Guarded path (`DecodeFromTds`) was fine; the issue-#89 string fallback was not. |
+| **q4** | `RowReader::ReadPLPType` reserved the server's declared PLP length: an 8-byte response declaring 0x7FFFFFFE bought a 2147483646-byte allocation before any payload arrived. |
+
+Verdict vocabulary that worked, worth reusing: **OK-by-construction** (the guard
+or the C++ type rules make it safe), **OK-deliberate** (correct on purpose, and
+the source says so), **LOOK** (needs an argument from someone who knows the
+protocol), **BUG**. Most items land in the first two — q3's `tds_protocol.cpp`
+sums are all LOGIN7/FEDAUTH *builders* whose operands are lengths this client
+already holds, and q7's hits are teardown paths that are `noexcept` by spec 047.
 
 ## What this can and cannot see
 
