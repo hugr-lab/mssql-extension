@@ -1,0 +1,167 @@
+# name: test/sql/rowid/rowid_struct_cardinality.test
+# description: the rowid STRUCT's child vectors carry their own size (spec 069 cluster G1)
+# group: [rowid]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# A composite rowid key is handed to DuckDB as a STRUCT. Its child vectors are
+# NOT in `chunk.data` -- `DataChunk::SetChildCardinality` iterates `data` and
+# sizes the STRUCT itself, never its children -- so when the scan writes the key
+# columns straight into those children (table_scan.cpp BindRowIdTargetVectors)
+# query/mssql_result_stream.cpp has to size them one by one
+# (`FlatVector::SetSize(*tv, row_count)`).
+#
+# What this file covers: the composite rowid struct read END TO END through the
+# operators that key on a vector's size -- the client-side filter net, a hash
+# aggregate, a hash join, a sort, and a rowid-driven UPDATE and DELETE -- over
+# 2500 rows, so the answer spans more than one vector (STANDARD_VECTOR_SIZE is
+# 2048) and a chunk after the first has to be sized too. Before this file the
+# struct was read two ways only: printed, and through struct_extract
+# (`rowid.tenant_id`).
+#
+# What it does NOT do, measured rather than assumed: deleting that
+# `FlatVector::SetSize` line does not make any assertion here fail in a RELEASE
+# build -- and it does not fail dml/update_composite_pk.test,
+# dml/delete_composite_pk.test or rowid/composite_pk_rowid.test either, so the
+# line is currently unguarded by the suite at this optimisation level. Where its
+# violation does surface is the debug build's vector verification, which is what
+# `make test-rowid-debug` (ROWID_DEBUG_TESTS, issue #369) exists for. Adding
+# this file to that list is a one-line change and is deliberately NOT made here,
+# because it has not been run against a debug build.
+#
+# `rowid` has no T-SQL spelling, so FilterEncoder routes every predicate on it
+# to `unhandled` and the scan applies it client-side (filter_client_net.test).
+# That makes `WHERE rowid IS NOT NULL` below a test of the net AND of the
+# struct's sizes at once: the net evaluates an expression over the very vectors
+# in question.
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rsc (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('rsc', 'IF OBJECT_ID(''dbo.RowidStructCard'',''U'') IS NOT NULL DROP TABLE dbo.RowidStructCard');
+
+# A two-column primary key: the rowid is a STRUCT(part INTEGER, seq INTEGER).
+statement ok
+SELECT mssql_exec('rsc', 'CREATE TABLE dbo.RowidStructCard (part INT NOT NULL, seq INT NOT NULL, payload NVARCHAR(16) NOT NULL, CONSTRAINT PK_RowidStructCard PRIMARY KEY (part, seq))');
+
+statement ok
+INSERT INTO rsc.dbo.RowidStructCard SELECT i % 5, i, 'v' || i FROM range(2500) t(i);
+
+query I
+SELECT count(*) FROM rsc.dbo.RowidStructCard;
+----
+2500
+
+# The rowid is a struct of the two key columns.
+query I
+SELECT rowid FROM rsc.dbo.RowidStructCard WHERE seq = 7;
+----
+{'part': 2, 'seq': 7}
+
+# -----------------------------------------------------------------------------
+# The client-side filter net over the struct, across 2500 rows / two vectors.
+# Without the child sizes this is 0.
+# -----------------------------------------------------------------------------
+query I
+SELECT count(*) FROM rsc.dbo.RowidStructCard WHERE rowid IS NOT NULL;
+----
+2500
+
+# The complement, so neither number can be an accident of an empty vector.
+query I
+SELECT count(*) FROM rsc.dbo.RowidStructCard WHERE rowid IS NULL;
+----
+0
+
+# -----------------------------------------------------------------------------
+# A hash aggregate keyed on the struct: every row has a distinct (part, seq),
+# so a correct struct gives 2500 groups. An unsized child makes every struct
+# look alike.
+# -----------------------------------------------------------------------------
+query I
+SELECT count(DISTINCT rowid) FROM rsc.dbo.RowidStructCard;
+----
+2500
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM rsc.dbo.RowidStructCard GROUP BY rowid);
+----
+2500
+
+# -----------------------------------------------------------------------------
+# A hash join on the struct, both sides the same scan: the struct has to hash
+# and compare equal to itself.
+# -----------------------------------------------------------------------------
+query I
+SELECT count(*) FROM rsc.dbo.RowidStructCard a JOIN rsc.dbo.RowidStructCard b ON a.rowid = b.rowid;
+----
+2500
+
+# -----------------------------------------------------------------------------
+# A sort on the struct, which DuckDB performs client-side (a struct key is
+# never pushed as an ORDER BY term). A struct sorts field by field, so the
+# order is by `part` first and `seq` only within it: part = seq % 5, hence
+# 2499, 2494, 2489 at part 4.
+# -----------------------------------------------------------------------------
+query II
+SELECT rowid.part, rowid.seq FROM rsc.dbo.RowidStructCard ORDER BY rowid DESC LIMIT 3;
+----
+4	2499
+4	2494
+4	2489
+
+# struct_extract combined with the net: the predicate is on the struct, the
+# projection on its fields.
+query I
+SELECT count(*) FROM rsc.dbo.RowidStructCard WHERE rowid IS NOT NULL AND rowid.part = 3;
+----
+500
+
+# -----------------------------------------------------------------------------
+# A rowid-driven UPDATE and DELETE over the composite key: the DML operators
+# read the rowid STRUCT out of the scan and render its children into the
+# statement's VALUES JOIN, so they consume exactly the vectors this file is
+# about -- and they do it for a row set the scan filtered, not for whole chunks.
+# -----------------------------------------------------------------------------
+statement ok
+UPDATE rsc.dbo.RowidStructCard SET payload = 'updated' WHERE seq IN (10, 11, 12);
+
+query II
+SELECT count(*), min(seq) FROM rsc.dbo.RowidStructCard WHERE payload = 'updated';
+----
+3	10
+
+statement ok
+DELETE FROM rsc.dbo.RowidStructCard WHERE seq IN (20, 21);
+
+query II
+SELECT count(*), count(DISTINCT rowid) FROM rsc.dbo.RowidStructCard;
+----
+2498	2498
+
+# -----------------------------------------------------------------------------
+# The scalar rowid of a single-column key, for contrast: a BIGINT rowid lives
+# in `chunk.data` and is sized by SetChildCardinality like any other column.
+# The same consumers must agree there too.
+# -----------------------------------------------------------------------------
+query III
+SELECT count(*), count(DISTINCT rowid), max(rowid) FROM rsc.dbo.TestSimplePK WHERE rowid IS NOT NULL;
+----
+5	5	5
+
+statement ok
+SELECT mssql_exec('rsc', 'DROP TABLE dbo.RowidStructCard');
+
+statement ok
+DETACH rsc;

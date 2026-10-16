@@ -1,0 +1,556 @@
+# name: test/sql/catalog/filter_shapes_both_paths.test
+# description: every filter shape agrees with the same predicate run client-side (spec 069 cluster G2)
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# Filter pushdown is best-effort, and DuckDB 2.0 changed what a refusal costs.
+#
+# On 1.5.x DuckDB re-checked every TableFilter above a filter_pushdown scan, so
+# a filter FilterEncoder declined to translate was a performance problem and nothing
+# more. 2.0 does NOT re-check: a filter the scan neither pushes nor applies is
+# simply never applied and the query returns a SUPERSET -- a wrong answer. The
+# scan therefore arms refused filters as client-side expressions
+# (`unhandled` -> ClientTableFilter -> ExpressionExecutor::SelectExpression).
+#
+# filter_client_net.test pins that net through `rowid`, the one shape that
+# reaches it unconditionally. This file is the other half: a DIFFERENTIAL over
+# the whole filter vocabulary, with no knowledge of which shapes are pushed and
+# which are refused.
+#
+#   fs_target  -- the catalog scan: `filter_pushdown = true`, so DuckDB hands it
+#                 the predicate and trusts the answer.
+#   fs_oracle  -- the same rows through mssql_scan(), which declares no
+#                 pushdown at all, so DuckDB evaluates the predicate itself.
+#
+# Both must return the same rows for every predicate. Each shape asserts three
+# numbers: the oracle count, the target count, and the size of the symmetric
+# difference between the two row sets. The counts are pinned as literals (and
+# none is 0 or the whole table) so that two paths agreeing on the WRONG rows --
+# or on no rows -- still fails; the difference catches value-level divergence
+# the counts would miss.
+#
+# The point of the differential form is that it extends itself: a filter class
+# a later duckdb pin introduces (2.0's filter combiner already emits
+# ExpressionFilter with BoundReference(0)) arrives in these predicates without
+# anyone adding a case, and if the encoder refuses it without netting it, the
+# difference stops being 0.
+#
+# Deliberately NOT covered here:
+#   - the remote-pushdown writer. The catalog is attached with
+#     `remote_pushdown false`, because a pushed SELECT is a different layer with
+#     its own files (test/sql/pushdown/*) -- and because the EXCEPT ALL below is
+#     exactly the set operation whose children the rewriter would push, which
+#     would quietly replace the thing under test. A bare filtered SELECT is not
+#     pushed by the writer anyway (SQLWriter::PushesMoreThanScan).
+#   - case, accent and trailing-space variants of the string values. A pushed
+#     string predicate is evaluated by the SERVER, under the column's collation
+#     (CI_AS here), and a client-side one by DuckDB, which is case- and
+#     accent-sensitive and does not pad. The two paths legitimately disagree
+#     there; that divergence is pinned on its own at the end of this file
+#     rather than smeared over every string shape.
+#   - native type annotations: `mssql_catalog_native_types = false` keeps both
+#     sides at plain VARCHAR, so a set operation compares rows and not type
+#     aliases.
+# =============================================================================
+
+statement ok
+SET mssql_catalog_native_types = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS fsa (TYPE mssql, remote_pushdown false);
+
+statement ok
+SELECT mssql_exec('fsa', 'IF OBJECT_ID(''dbo.FilterShapeAgree'',''U'') IS NOT NULL DROP TABLE dbo.FilterShapeAgree');
+
+statement ok
+SELECT mssql_exec('fsa', 'CREATE TABLE dbo.FilterShapeAgree (id INT NOT NULL PRIMARY KEY, i INT NULL, n DECIMAL(10,2) NULL, s VARCHAR(32) NULL, ns NVARCHAR(32) NULL, d DATE NULL, dt DATETIME2(3) NULL, b BIT NULL)');
+
+# NULLs in every nullable column (row 3), a negative value, a zero, a literal
+# `%` and `_` inside the string values (so a LIKE wildcard and an escaped
+# wildcard differ), non-ASCII in the nvarchar column, a leap day, and
+# millisecond-precision timestamps on both sides of a second boundary.
+statement ok
+INSERT INTO fsa.dbo.FilterShapeAgree VALUES
+  (1,     7,  10.50, 'alpha',  'naïve', DATE '2024-03-01', TIMESTAMP '2024-03-01 12:00:00.123', true),
+  (2,    13,   3.25, 'beta',   'bêta',  DATE '2024-01-15', TIMESTAMP '2024-01-15 00:00:00.000', false),
+  (3,  NULL,   NULL, NULL,     NULL,    NULL,              NULL,                                NULL),
+  (4,     7,  10.50, 'alpaca', 'nano',  DATE '2024-03-01', TIMESTAMP '2024-03-01 12:00:00.123', true),
+  (5,    -5,  -1.75, 'a_pha',  'na%ve', DATE '2023-12-31', TIMESTAMP '2023-12-31 23:59:59.999', false),
+  (6,    20, 100.00, '50%off', 'fifty', DATE '2024-06-01', TIMESTAMP '2024-06-01 00:00:00.000', true),
+  (7,    21,   0.00, 'omega',  'omega', DATE '2024-05-31', TIMESTAMP '2024-05-31 11:59:59.999', NULL),
+  (8,     6,  99.99, 'gamma',  'gämma', DATE '2024-02-29', TIMESTAMP '2024-02-29 06:30:00.500', false),
+  (9,  NULL,  55.55, 'delta',  NULL,    DATE '2024-04-01', TIMESTAMP '2024-04-01 00:00:00.001', true),
+  (10,   13,   3.25, 'bota',   'bota',  DATE '2024-01-16', TIMESTAMP '2024-01-16 00:00:00.000', false);
+
+statement ok
+CREATE VIEW fs_target AS SELECT id, i, n, s, ns, d, dt, b FROM fsa.dbo.FilterShapeAgree;
+
+statement ok
+CREATE VIEW fs_oracle AS SELECT * FROM mssql_scan('fsa', 'SELECT id, i, n, s, ns, d, dt, b FROM dbo.FilterShapeAgree');
+
+# The two views agree with no predicate at all. This is the confound check: a
+# type, collation or encoding difference between the paths would fail here, so
+# every failure below is about the FILTER and not about the rows.
+query III
+SELECT (SELECT count(*) FROM fs_oracle),
+       (SELECT count(*) FROM fs_target),
+       (SELECT count(*) FROM ((SELECT * FROM fs_target EXCEPT ALL SELECT * FROM fs_oracle)
+                              UNION ALL
+                              (SELECT * FROM fs_oracle EXCEPT ALL SELECT * FROM fs_target)));
+----
+10	10	0
+
+# equality on a nullable integer: i = 7
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE i = 7),
+       (SELECT count(*) FROM fs_target WHERE i = 7),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE i = 7) EXCEPT ALL (SELECT * FROM fs_oracle WHERE i = 7))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE i = 7) EXCEPT ALL (SELECT * FROM fs_target WHERE i = 7))));
+----
+2	2	0
+
+# inequality: i <> 7
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE i <> 7),
+       (SELECT count(*) FROM fs_target WHERE i <> 7),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE i <> 7) EXCEPT ALL (SELECT * FROM fs_oracle WHERE i <> 7))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE i <> 7) EXCEPT ALL (SELECT * FROM fs_target WHERE i <> 7))));
+----
+6	6	0
+
+# two-sided range: i > 5 AND i <= 20
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE i > 5 AND i <= 20),
+       (SELECT count(*) FROM fs_target WHERE i > 5 AND i <= 20),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE i > 5 AND i <= 20) EXCEPT ALL (SELECT * FROM fs_oracle WHERE i > 5 AND i <= 20))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE i > 5 AND i <= 20) EXCEPT ALL (SELECT * FROM fs_target WHERE i > 5 AND i <= 20))));
+----
+6	6	0
+
+# BETWEEN: i BETWEEN 5 AND 20
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE i BETWEEN 5 AND 20),
+       (SELECT count(*) FROM fs_target WHERE i BETWEEN 5 AND 20),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE i BETWEEN 5 AND 20) EXCEPT ALL (SELECT * FROM fs_oracle WHERE i BETWEEN 5 AND 20))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE i BETWEEN 5 AND 20) EXCEPT ALL (SELECT * FROM fs_target WHERE i BETWEEN 5 AND 20))));
+----
+6	6	0
+
+# IS NULL: i IS NULL
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE i IS NULL),
+       (SELECT count(*) FROM fs_target WHERE i IS NULL),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE i IS NULL) EXCEPT ALL (SELECT * FROM fs_oracle WHERE i IS NULL))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE i IS NULL) EXCEPT ALL (SELECT * FROM fs_target WHERE i IS NULL))));
+----
+2	2	0
+
+# IS NOT NULL: i IS NOT NULL
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE i IS NOT NULL),
+       (SELECT count(*) FROM fs_target WHERE i IS NOT NULL),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE i IS NOT NULL) EXCEPT ALL (SELECT * FROM fs_oracle WHERE i IS NOT NULL))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE i IS NOT NULL) EXCEPT ALL (SELECT * FROM fs_target WHERE i IS NOT NULL))));
+----
+8	8	0
+
+# IN list: i IN (7, 13, 99)
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE i IN (7, 13, 99)),
+       (SELECT count(*) FROM fs_target WHERE i IN (7, 13, 99)),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE i IN (7, 13, 99)) EXCEPT ALL (SELECT * FROM fs_oracle WHERE i IN (7, 13, 99)))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE i IN (7, 13, 99)) EXCEPT ALL (SELECT * FROM fs_target WHERE i IN (7, 13, 99)))));
+----
+4	4	0
+
+# NOT IN list: i NOT IN (7, 13)
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE i NOT IN (7, 13)),
+       (SELECT count(*) FROM fs_target WHERE i NOT IN (7, 13)),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE i NOT IN (7, 13)) EXCEPT ALL (SELECT * FROM fs_oracle WHERE i NOT IN (7, 13)))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE i NOT IN (7, 13)) EXCEPT ALL (SELECT * FROM fs_target WHERE i NOT IN (7, 13)))));
+----
+4	4	0
+
+# OR across columns: id IN (1, 2, 3) OR i = 13
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE id IN (1, 2, 3) OR i = 13),
+       (SELECT count(*) FROM fs_target WHERE id IN (1, 2, 3) OR i = 13),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE id IN (1, 2, 3) OR i = 13) EXCEPT ALL (SELECT * FROM fs_oracle WHERE id IN (1, 2, 3) OR i = 13))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE id IN (1, 2, 3) OR i = 13) EXCEPT ALL (SELECT * FROM fs_target WHERE id IN (1, 2, 3) OR i = 13))));
+----
+4	4	0
+
+# arithmetic on the column: i + 1 > 8
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE i + 1 > 8),
+       (SELECT count(*) FROM fs_target WHERE i + 1 > 8),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE i + 1 > 8) EXCEPT ALL (SELECT * FROM fs_oracle WHERE i + 1 > 8))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE i + 1 > 8) EXCEPT ALL (SELECT * FROM fs_target WHERE i + 1 > 8))));
+----
+4	4	0
+
+# multiplication on the column: i * 2 = 26
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE i * 2 = 26),
+       (SELECT count(*) FROM fs_target WHERE i * 2 = 26),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE i * 2 = 26) EXCEPT ALL (SELECT * FROM fs_oracle WHERE i * 2 = 26))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE i * 2 = 26) EXCEPT ALL (SELECT * FROM fs_target WHERE i * 2 = 26))));
+----
+2	2	0
+
+# negation of the column: -i < -5
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE -i < -5),
+       (SELECT count(*) FROM fs_target WHERE -i < -5),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE -i < -5) EXCEPT ALL (SELECT * FROM fs_oracle WHERE -i < -5))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE -i < -5) EXCEPT ALL (SELECT * FROM fs_target WHERE -i < -5))));
+----
+7	7	0
+
+# negative constant: i > -6
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE i > -6),
+       (SELECT count(*) FROM fs_target WHERE i > -6),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE i > -6) EXCEPT ALL (SELECT * FROM fs_oracle WHERE i > -6))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE i > -6) EXCEPT ALL (SELECT * FROM fs_target WHERE i > -6))));
+----
+8	8	0
+
+# decimal equality: n = 10.50
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE n = 10.50),
+       (SELECT count(*) FROM fs_target WHERE n = 10.50),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE n = 10.50) EXCEPT ALL (SELECT * FROM fs_oracle WHERE n = 10.50))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE n = 10.50) EXCEPT ALL (SELECT * FROM fs_target WHERE n = 10.50))));
+----
+2	2	0
+
+# decimal range: n > 3.25 AND n < 100.00
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE n > 3.25 AND n < 100.00),
+       (SELECT count(*) FROM fs_target WHERE n > 3.25 AND n < 100.00),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE n > 3.25 AND n < 100.00) EXCEPT ALL (SELECT * FROM fs_oracle WHERE n > 3.25 AND n < 100.00))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE n > 3.25 AND n < 100.00) EXCEPT ALL (SELECT * FROM fs_target WHERE n > 3.25 AND n < 100.00))));
+----
+4	4	0
+
+# varchar equality: s = 'alpha'
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE s = 'alpha'),
+       (SELECT count(*) FROM fs_target WHERE s = 'alpha'),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE s = 'alpha') EXCEPT ALL (SELECT * FROM fs_oracle WHERE s = 'alpha'))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE s = 'alpha') EXCEPT ALL (SELECT * FROM fs_target WHERE s = 'alpha'))));
+----
+1	1	0
+
+# LIKE prefix: s LIKE 'al%'
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE s LIKE 'al%'),
+       (SELECT count(*) FROM fs_target WHERE s LIKE 'al%'),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE s LIKE 'al%') EXCEPT ALL (SELECT * FROM fs_oracle WHERE s LIKE 'al%'))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE s LIKE 'al%') EXCEPT ALL (SELECT * FROM fs_target WHERE s LIKE 'al%'))));
+----
+2	2	0
+
+# LIKE suffix: s LIKE '%ta'
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE s LIKE '%ta'),
+       (SELECT count(*) FROM fs_target WHERE s LIKE '%ta'),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE s LIKE '%ta') EXCEPT ALL (SELECT * FROM fs_oracle WHERE s LIKE '%ta'))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE s LIKE '%ta') EXCEPT ALL (SELECT * FROM fs_target WHERE s LIKE '%ta'))));
+----
+3	3	0
+
+# LIKE contains: s LIKE '%ph%'
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE s LIKE '%ph%'),
+       (SELECT count(*) FROM fs_target WHERE s LIKE '%ph%'),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE s LIKE '%ph%') EXCEPT ALL (SELECT * FROM fs_oracle WHERE s LIKE '%ph%'))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE s LIKE '%ph%') EXCEPT ALL (SELECT * FROM fs_target WHERE s LIKE '%ph%'))));
+----
+2	2	0
+
+# LIKE single-character wildcard: s LIKE 'a_pha'
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE s LIKE 'a_pha'),
+       (SELECT count(*) FROM fs_target WHERE s LIKE 'a_pha'),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE s LIKE 'a_pha') EXCEPT ALL (SELECT * FROM fs_oracle WHERE s LIKE 'a_pha'))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE s LIKE 'a_pha') EXCEPT ALL (SELECT * FROM fs_target WHERE s LIKE 'a_pha'))));
+----
+2	2	0
+
+# LIKE with an escaped wildcard: s LIKE '50\%%' ESCAPE '\'
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE s LIKE '50\%%' ESCAPE '\'),
+       (SELECT count(*) FROM fs_target WHERE s LIKE '50\%%' ESCAPE '\'),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE s LIKE '50\%%' ESCAPE '\') EXCEPT ALL (SELECT * FROM fs_oracle WHERE s LIKE '50\%%' ESCAPE '\'))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE s LIKE '50\%%' ESCAPE '\') EXCEPT ALL (SELECT * FROM fs_target WHERE s LIKE '50\%%' ESCAPE '\'))));
+----
+1	1	0
+
+# nvarchar equality, non-ASCII: ns = 'naïve'
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE ns = 'naïve'),
+       (SELECT count(*) FROM fs_target WHERE ns = 'naïve'),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE ns = 'naïve') EXCEPT ALL (SELECT * FROM fs_oracle WHERE ns = 'naïve'))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE ns = 'naïve') EXCEPT ALL (SELECT * FROM fs_target WHERE ns = 'naïve'))));
+----
+1	1	0
+
+# nvarchar LIKE: ns LIKE 'na%'
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE ns LIKE 'na%'),
+       (SELECT count(*) FROM fs_target WHERE ns LIKE 'na%'),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE ns LIKE 'na%') EXCEPT ALL (SELECT * FROM fs_oracle WHERE ns LIKE 'na%'))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE ns LIKE 'na%') EXCEPT ALL (SELECT * FROM fs_target WHERE ns LIKE 'na%'))));
+----
+3	3	0
+
+# lower() on the column: lower(s) = 'alpha'
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE lower(s) = 'alpha'),
+       (SELECT count(*) FROM fs_target WHERE lower(s) = 'alpha'),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE lower(s) = 'alpha') EXCEPT ALL (SELECT * FROM fs_oracle WHERE lower(s) = 'alpha'))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE lower(s) = 'alpha') EXCEPT ALL (SELECT * FROM fs_target WHERE lower(s) = 'alpha'))));
+----
+1	1	0
+
+# length() on the column: length(s) = 5
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE length(s) = 5),
+       (SELECT count(*) FROM fs_target WHERE length(s) = 5),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE length(s) = 5) EXCEPT ALL (SELECT * FROM fs_oracle WHERE length(s) = 5))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE length(s) = 5) EXCEPT ALL (SELECT * FROM fs_target WHERE length(s) = 5))));
+----
+5	5	0
+
+# starts_with(): starts_with(s, 'al')
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE starts_with(s, 'al')),
+       (SELECT count(*) FROM fs_target WHERE starts_with(s, 'al')),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE starts_with(s, 'al')) EXCEPT ALL (SELECT * FROM fs_oracle WHERE starts_with(s, 'al')))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE starts_with(s, 'al')) EXCEPT ALL (SELECT * FROM fs_target WHERE starts_with(s, 'al')))));
+----
+2	2	0
+
+# date equality: d = DATE '2024-03-01'
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE d = DATE '2024-03-01'),
+       (SELECT count(*) FROM fs_target WHERE d = DATE '2024-03-01'),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE d = DATE '2024-03-01') EXCEPT ALL (SELECT * FROM fs_oracle WHERE d = DATE '2024-03-01'))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE d = DATE '2024-03-01') EXCEPT ALL (SELECT * FROM fs_target WHERE d = DATE '2024-03-01'))));
+----
+2	2	0
+
+# date half-open range: d >= DATE '2024-01-01' AND d < DATE '2024-06-01'
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE d >= DATE '2024-01-01' AND d < DATE '2024-06-01'),
+       (SELECT count(*) FROM fs_target WHERE d >= DATE '2024-01-01' AND d < DATE '2024-06-01'),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE d >= DATE '2024-01-01' AND d < DATE '2024-06-01') EXCEPT ALL (SELECT * FROM fs_oracle WHERE d >= DATE '2024-01-01' AND d < DATE '2024-06-01'))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE d >= DATE '2024-01-01' AND d < DATE '2024-06-01') EXCEPT ALL (SELECT * FROM fs_target WHERE d >= DATE '2024-01-01' AND d < DATE '2024-06-01'))));
+----
+7	7	0
+
+# year() on a date: year(d) = 2024
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE year(d) = 2024),
+       (SELECT count(*) FROM fs_target WHERE year(d) = 2024),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE year(d) = 2024) EXCEPT ALL (SELECT * FROM fs_oracle WHERE year(d) = 2024))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE year(d) = 2024) EXCEPT ALL (SELECT * FROM fs_target WHERE year(d) = 2024))));
+----
+8	8	0
+
+# timestamp comparison: dt > TIMESTAMP '2024-03-01 12:00:00'
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE dt > TIMESTAMP '2024-03-01 12:00:00'),
+       (SELECT count(*) FROM fs_target WHERE dt > TIMESTAMP '2024-03-01 12:00:00'),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE dt > TIMESTAMP '2024-03-01 12:00:00') EXCEPT ALL (SELECT * FROM fs_oracle WHERE dt > TIMESTAMP '2024-03-01 12:00:00'))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE dt > TIMESTAMP '2024-03-01 12:00:00') EXCEPT ALL (SELECT * FROM fs_target WHERE dt > TIMESTAMP '2024-03-01 12:00:00'))));
+----
+5	5	0
+
+# bare boolean column: b
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE b),
+       (SELECT count(*) FROM fs_target WHERE b),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE b) EXCEPT ALL (SELECT * FROM fs_oracle WHERE b))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE b) EXCEPT ALL (SELECT * FROM fs_target WHERE b))));
+----
+4	4	0
+
+# NOT on a boolean column: NOT b
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE NOT b),
+       (SELECT count(*) FROM fs_target WHERE NOT b),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE NOT b) EXCEPT ALL (SELECT * FROM fs_oracle WHERE NOT b))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE NOT b) EXCEPT ALL (SELECT * FROM fs_target WHERE NOT b))));
+----
+4	4	0
+
+# boolean IS NULL: b IS NULL
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE b IS NULL),
+       (SELECT count(*) FROM fs_target WHERE b IS NULL),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE b IS NULL) EXCEPT ALL (SELECT * FROM fs_oracle WHERE b IS NULL))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE b IS NULL) EXCEPT ALL (SELECT * FROM fs_target WHERE b IS NULL))));
+----
+2	2	0
+
+# NOT around a comparison: NOT (i = 7)
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE NOT (i = 7)),
+       (SELECT count(*) FROM fs_target WHERE NOT (i = 7)),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE NOT (i = 7)) EXCEPT ALL (SELECT * FROM fs_oracle WHERE NOT (i = 7)))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE NOT (i = 7)) EXCEPT ALL (SELECT * FROM fs_target WHERE NOT (i = 7)))));
+----
+6	6	0
+
+# comparison OR IS NULL: i <> 7 OR i IS NULL
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE i <> 7 OR i IS NULL),
+       (SELECT count(*) FROM fs_target WHERE i <> 7 OR i IS NULL),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE i <> 7 OR i IS NULL) EXCEPT ALL (SELECT * FROM fs_oracle WHERE i <> 7 OR i IS NULL))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE i <> 7 OR i IS NULL) EXCEPT ALL (SELECT * FROM fs_target WHERE i <> 7 OR i IS NULL))));
+----
+8	8	0
+
+# IS DISTINCT FROM: i IS DISTINCT FROM 7
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE i IS DISTINCT FROM 7),
+       (SELECT count(*) FROM fs_target WHERE i IS DISTINCT FROM 7),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE i IS DISTINCT FROM 7) EXCEPT ALL (SELECT * FROM fs_oracle WHERE i IS DISTINCT FROM 7))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE i IS DISTINCT FROM 7) EXCEPT ALL (SELECT * FROM fs_target WHERE i IS DISTINCT FROM 7))));
+----
+8	8	0
+
+# conjunction of three columns: s IS NOT NULL AND s <> 'alpha' AND d IS NOT NULL
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE s IS NOT NULL AND s <> 'alpha' AND d IS NOT NULL),
+       (SELECT count(*) FROM fs_target WHERE s IS NOT NULL AND s <> 'alpha' AND d IS NOT NULL),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE s IS NOT NULL AND s <> 'alpha' AND d IS NOT NULL) EXCEPT ALL (SELECT * FROM fs_oracle WHERE s IS NOT NULL AND s <> 'alpha' AND d IS NOT NULL))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE s IS NOT NULL AND s <> 'alpha' AND d IS NOT NULL) EXCEPT ALL (SELECT * FROM fs_target WHERE s IS NOT NULL AND s <> 'alpha' AND d IS NOT NULL))));
+----
+8	8	0
+
+# parenthesised mixed predicate: id > 2 AND (i = 13 OR n IS NULL)
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE id > 2 AND (i = 13 OR n IS NULL)),
+       (SELECT count(*) FROM fs_target WHERE id > 2 AND (i = 13 OR n IS NULL)),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE id > 2 AND (i = 13 OR n IS NULL)) EXCEPT ALL (SELECT * FROM fs_oracle WHERE id > 2 AND (i = 13 OR n IS NULL)))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE id > 2 AND (i = 13 OR n IS NULL)) EXCEPT ALL (SELECT * FROM fs_target WHERE id > 2 AND (i = 13 OR n IS NULL)))));
+----
+2	2	0
+
+# decimal threshold: n > 50
+query III
+SELECT (SELECT count(*) FROM fs_oracle WHERE n > 50),
+       (SELECT count(*) FROM fs_target WHERE n > 50),
+       (SELECT count(*) FROM (((SELECT * FROM fs_target WHERE n > 50) EXCEPT ALL (SELECT * FROM fs_oracle WHERE n > 50))
+                              UNION ALL
+                              ((SELECT * FROM fs_oracle WHERE n > 50) EXCEPT ALL (SELECT * FROM fs_target WHERE n > 50))));
+----
+3	3	0
+
+# =============================================================================
+# The known divergence, pinned rather than hidden.
+#
+# A pushed string predicate is evaluated by SQL Server under the COLUMN's
+# collation. TestDB's is SQL_Latin1_General_CP1_CI_AS -- case-insensitive,
+# accent-sensitive, and it pads the shorter operand of a comparison. DuckDB is
+# case-sensitive and pads nothing. So for a value that differs from the
+# constant only in case, or only in trailing spaces, the catalog scan and the
+# same predicate run client-side return DIFFERENT rows, and the counts below
+# differ on purpose.
+#
+# This is the same reason CLAUDE.md gives for pushing no string FUNCTION
+# (`upper(x) = 'ẞ'` lost rows); plain `=` and LIKE are pushed, so the
+# collation reaches the answer. Measured on this server: `s = 'alpha'` -> 2 rows
+# pushed vs 1 client-side, `s LIKE 'al%'` -> 3 vs 2, `s = 'alpha  '` -> 2 vs 0.
+#
+# Nothing here asserts that the divergence is CORRECT. It is recorded so that a
+# change in it is deliberate: if pushdown of string comparisons is ever made
+# collation-aware, these four numbers move and this is the file that says so.
+# =============================================================================
+
+statement ok
+INSERT INTO fsa.dbo.FilterShapeAgree VALUES
+  (11, 99, 1.00, 'ALPHA', 'ALPHA', DATE '2024-07-01', TIMESTAMP '2024-07-01 00:00:00.000', true);
+
+# Case: the server matches 'ALPHA' as well, DuckDB does not.
+query II
+SELECT (SELECT count(*) FROM fs_target WHERE s = 'alpha'),
+       (SELECT count(*) FROM fs_oracle WHERE s = 'alpha');
+----
+2	1
+
+query II
+SELECT (SELECT count(*) FROM fs_target WHERE s LIKE 'al%'),
+       (SELECT count(*) FROM fs_oracle WHERE s LIKE 'al%');
+----
+3	2
+
+# Trailing spaces: the server pads the constant to the column width, DuckDB
+# compares the bytes.
+query II
+SELECT (SELECT count(*) FROM fs_target WHERE s = 'alpha  '),
+       (SELECT count(*) FROM fs_oracle WHERE s = 'alpha  ');
+----
+2	0
+
+statement ok
+DROP VIEW fs_oracle;
+
+statement ok
+DROP VIEW fs_target;
+
+statement ok
+SELECT mssql_exec('fsa', 'DROP TABLE dbo.FilterShapeAgree');
+
+statement ok
+DETACH fsa;
