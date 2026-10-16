@@ -36,6 +36,7 @@ joern/build.sh all      # CPG of all of src/                  (~36 s)
 joern/scan.sh all q6    # the credential query, which needs the whole extension
 
 joern/shell.sh          # REPL with the CPG loaded and helpers defined
+joern/graph.sh ParseError   # render one method's CFG as an SVG (needs graphviz)
 ```
 
 Or `make joern-cpg`, `make joern-scan` (`JOERN_QUERY=q3`), `make joern-shell`,
