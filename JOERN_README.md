@@ -119,7 +119,7 @@ executes arbitrary Scala, so keep it on loopback.
 | `q4` | Allocation or append sized by a declared length | 40 | 58 |
 | `q5` | *(dataflow)* fuzz entry-point parameter → copy size or index | 14 | 16 |
 | `q6` | Credential inside a log, exception or format expression | 0 | 2 |
-| `q7` | Socket/TLS call whose return value is discarded | 12 | 12 |
+| `q7` | Socket/TLS call whose return value is discarded | 16 | 17 |
 | `q8` | Type-punning cast to a multi-byte pointer | 8 | 14 |
 | `q9` | Parsing method not reachable from any fuzz entry point | 152 | 164 |
 

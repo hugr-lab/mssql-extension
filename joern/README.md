@@ -71,7 +71,7 @@ are the **baseline**, not a target.
 | `q4` | Allocation or append sized by a declared length | A server-declared 4 GB length reaching `resize`/`reserve`/`assign` is a remote OOM even when nothing is written out of bounds. | 40 | 58 |
 | `q5` | *(dataflow)* fuzz entry-point parameter → copy size or index | Taint from the harness entry points to a `memcpy` size or an array index. Candidate fuzz seeds, not bugs. | 14 | 16 |
 | `q6` | Credential inside a log, exception or format expression | Spec 047 T028a ("the ATTACH error path must never echo a password") and the `mssql_pool_stats` redaction gate, as a query. Needs the `all` scope. | 0 | 2 |
-| `q7` | Socket/TLS call with a discarded return value | `recv`/`poll`/`SSL_*` return a count or an error that has to be read. | 12 | 12 |
+| `q7` | Socket/TLS call with a discarded return value | `recv`/`poll`/`SSL_*` return a count or an error that has to be read. | 16 | 17 |
 | `q8` | Type-punning cast to a multi-byte pointer | Reading wire bytes through a `uint32_t*`/`char16_t*` is unaligned-access UB that UBSan only reports if an input reaches the site. | 8 | 14 |
 | `q9` | Parsing method not reachable from any fuzz entry point | The call-graph answer to "what does `fuzz/` not cover". | 152 | 164 |
 
@@ -95,10 +95,14 @@ the entries themselves:
   `codec/string_codec.cpp` read `fmt.data` / a staging buffer — DuckDB vector
   memory, which the allocator aligns. An entry beyond these, especially one in a
   parser reading `data[...]`, is the find.
-- **q7 = 12**, mostly `close()` / `SSL_shutdown()` on teardown paths that are
+- **q7 = 16**, mostly `close()` / `SSL_shutdown()` on teardown paths that are
   `noexcept` by spec 047 and best-effort by design. The discarded
-  `poll(&pfd, 1, remaining_ms)` at `tls_impl.cpp:592` and the two `setsockopt`
-  calls are the ones worth an argument.
+  `poll(&pfd, 1, remaining_ms)` in `tls_impl.cpp` and the `setsockopt` calls are
+  the ones worth an argument — five of the latter are the TCP keepalive tuning
+  in `tds_socket.cpp` (`SO_KEEPALIVE`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`,
+  `TCP_KEEPCNT`), which is plausibly deliberate best-effort but is the whole
+  point of the lane: they appeared as four new lines when this branch was rebased
+  onto a newer `main`, which is what a report diff is supposed to show.
 - **q9 = 152** is mostly honest: the BCP encoders and the row stager's append
   side never see wire bytes. What to look for is a *read*-path method in that
   list.
