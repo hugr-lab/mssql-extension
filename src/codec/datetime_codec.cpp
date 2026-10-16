@@ -751,16 +751,31 @@ static size_t FixedTemporalReadLen(const tds::ColumnMetadata &col) {
 	}
 }
 
-void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row) {
-	// The fixed-width kernels read a type-fixed number of bytes without bounds
-	// checking; reject a value the stream truncated before it reaches them.
+// Reject a value the stream truncated before it reaches a fixed-width kernel.
+//
+// Shared because there are TWO entry points into those kernels and only one of
+// them checked: DecodeFromTds on the vector path did, and RenderAsString -- the
+// issue-#89 string fallback -- did not, using `size` solely to tell DATETIMEN's
+// 4 bytes from its 8. A server-declared 1-byte DATE therefore reached
+// ConvertDate, which reads three bytes whatever it is handed, for a read a few
+// bytes past the value buffer. RowReader::ReadDateType does not catch it either:
+// it checks that the declared length is BUFFERED, not that it is the type's
+// width. Found by the q2 query in joern/ ("byte-buffer method that indexes
+// without comparing anything"), which flagged every one of these kernels; the
+// siblings in the same fallback already validated (uuid on != 16, money and
+// float on != 4/8, DATETIMEN here), so datetime was the outlier.
+static void RequireTemporalWidth(size_t size, const tds::ColumnMetadata &col) {
 	const size_t need = FixedTemporalReadLen(col);
-	if (need != 0 && bytes.size() < need) {
+	if (need != 0 && size < need) {
 		throw InvalidInputException(
 			"MSSQL: temporal column arrived with %zu bytes where %zu were required (TDS type "
 			"0x%02X). The TDS stream is malformed.",
-			bytes.size(), need, col.type_id);
+			size, need, col.type_id);
 	}
+}
+
+void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row) {
+	RequireTemporalWidth(bytes.size(), col);
 	switch (col.type_id) {
 	case TDS_TYPE_DATE: {
 		date_t d = tds::encoding::DateTimeEncoding::ConvertDate(bytes.data());
@@ -1195,6 +1210,7 @@ size_t EstimateLiteralSize(const LogicalType &type) {
 //===----------------------------------------------------------------------===//
 
 std::string RenderAsString(const uint8_t *bytes, size_t size, const tds::ColumnMetadata &col) {
+	RequireTemporalWidth(size, col);
 	switch (col.type_id) {
 	case TDS_TYPE_DATE: {
 		date_t d = tds::encoding::DateTimeEncoding::ConvertDate(bytes);
