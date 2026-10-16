@@ -1,0 +1,157 @@
+# name: test/sql/insert/insert_returning_cardinality.test
+# description: an INSERT ... RETURNING chunk read by an operator keyed on Vector::size() (spec 069 cluster G1)
+# group: [insert]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+# =============================================================================
+# In DuckDB 2.0 a vector carries its own size, taken from its buffer, and every
+# consumer keyed on `Vector::size()` -- VectorOperations::IsNull, filter
+# execution, the hash join, the aggregate -- sees an EMPTY vector unless the
+# producer set it. The deprecated `DataChunk::SetCardinality` sets only the
+# chunk's logical count, which is why spec 069 moved all 15 producer sites to
+# `SetChildCardinality`.
+#
+# One of those sites is in the RETURNING parser
+# (dml/insert/mssql_returning_parser.cpp:55) -- the OUTPUT INSERTED rows of an
+# INSERT ... RETURNING, built into a fresh DataChunk per statement. Every existing RETURNING test
+# (insert_returning.test, insert_returning_batches.test,
+# insert_returning_udt_columns.test, insert_geometry.test) consumes that chunk
+# as a bare result set: the client fetches the rows and compares them. That is
+# the ONE path that does not read Vector::size(), so that call could be dropped
+# tomorrow and the whole suite would stay green.
+#
+# So read the RETURNING output the way an operator does: through a filter, an
+# aggregate, a sort and a join, and through expressions evaluated over it.
+# Without the child cardinality these return 0 rows, NULL sums, or empty joins
+# while the plain `query` form above them still prints every row.
+#
+# DuckDB accepts an INSERT ... RETURNING as a CTE body, which is what puts a
+# real operator on top of the returned chunk.
+#
+# MEASURED, so nobody trims the wrong assertion: with
+# `chunk->SetChildCardinality(rows_.size())` replaced by the deprecated
+# `SetCardinality`, the failing assertion is the `RETURNING id IS NOT NULL`
+# projection near the end of this file -- it reports `0` where `true` belongs,
+# because VectorOperations::IsNull reads the vector's own size. The CTE forms
+# above it still pass (their chunk is copied into the CTE's own storage first),
+# and `upper(name)` / `qty * 2` also still pass. So the expression form is the
+# detector and the CTE forms are coverage of the consumers; keep both.
+# =============================================================================
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS irc (TYPE mssql);
+
+statement ok
+SET mssql_exec_invalidate_cache = true;
+
+statement ok
+SELECT mssql_exec('irc', 'IF OBJECT_ID(''dbo.ReturningCard'',''U'') IS NOT NULL DROP TABLE dbo.ReturningCard');
+
+statement ok
+SELECT mssql_exec('irc', 'CREATE TABLE dbo.ReturningCard (id INT IDENTITY(1,1) PRIMARY KEY, name NVARCHAR(32) NOT NULL, qty INT NOT NULL)');
+
+# -----------------------------------------------------------------------------
+# A filter over the returned chunk. `IS NOT NULL` goes through
+# VectorOperations::IsNull, the first consumer the migration broke.
+# -----------------------------------------------------------------------------
+query I
+WITH r AS (INSERT INTO irc.dbo.ReturningCard (name, qty) VALUES ('a', 1), ('b', 2) RETURNING id)
+SELECT count(*) FROM r WHERE id IS NOT NULL;
+----
+2
+
+# The complement: a filter that matches NOTHING must not be confused with an
+# empty vector. Both answer 0, so this pins the pair above as meaningful.
+query I
+WITH r AS (INSERT INTO irc.dbo.ReturningCard (name, qty) VALUES ('c', 3) RETURNING id)
+SELECT count(*) FROM r WHERE id IS NULL;
+----
+0
+
+# -----------------------------------------------------------------------------
+# An aggregate over the returned values, not just over the row count: a sum
+# reads the data vector, so an unsized vector gives NULL rather than a number.
+# -----------------------------------------------------------------------------
+query III
+WITH r AS (INSERT INTO irc.dbo.ReturningCard (name, qty) VALUES ('d', 10), ('e', 20), ('f', 30) RETURNING qty)
+SELECT count(*), sum(qty), max(qty) FROM r;
+----
+3	60	30
+
+# A string column through an aggregate: string_t values live in a separate
+# child buffer from the fixed-width ones.
+query II
+WITH r AS (INSERT INTO irc.dbo.ReturningCard (name, qty) VALUES ('gamma', 4), ('delta', 5) RETURNING name)
+SELECT count(*), min(name) FROM r;
+----
+2	delta
+
+# -----------------------------------------------------------------------------
+# A sort and a LIMIT over the returned chunk.
+# -----------------------------------------------------------------------------
+query I
+WITH r AS (INSERT INTO irc.dbo.ReturningCard (name, qty) VALUES ('h', 7), ('i', 9), ('j', 8) RETURNING qty)
+SELECT qty FROM r ORDER BY qty DESC LIMIT 2;
+----
+9
+8
+
+# -----------------------------------------------------------------------------
+# A hash join between the returned chunk and a local table. The join builds its
+# hash table from the vector, so an unsized build side joins nothing.
+# -----------------------------------------------------------------------------
+statement ok
+CREATE TABLE local_names (name VARCHAR, label VARCHAR);
+
+statement ok
+INSERT INTO local_names VALUES ('k', 'keep'), ('l', 'lose');
+
+query II
+WITH r AS (INSERT INTO irc.dbo.ReturningCard (name, qty) VALUES ('k', 11), ('l', 12) RETURNING name, qty)
+SELECT ln.label, r.qty FROM r JOIN local_names ln ON ln.name = r.name ORDER BY r.qty;
+----
+keep	11
+lose	12
+
+# -----------------------------------------------------------------------------
+# Expressions evaluated over the returned chunk by the RETURNING projection
+# itself -- no CTE involved, so this form holds even if DML-in-CTE support
+# changes. ExpressionExecutor reads the input vector's size.
+# -----------------------------------------------------------------------------
+query III
+INSERT INTO irc.dbo.ReturningCard (name, qty) VALUES ('m', 13)
+RETURNING id IS NOT NULL AS have_id, upper(name) AS up, qty * 2 AS twice;
+----
+true	M	26
+
+# Several rows through the projection at once.
+query II
+INSERT INTO irc.dbo.ReturningCard (name, qty) VALUES ('n', 14), ('o', 15)
+RETURNING upper(name) AS up, qty + 1 AS next;
+----
+N	15
+O	16
+
+# -----------------------------------------------------------------------------
+# Everything landed: 16 rows inserted above, and the server-assigned identity
+# values are the ones RETURNING reported.
+# -----------------------------------------------------------------------------
+query II
+SELECT count(*), max(id) FROM irc.dbo.ReturningCard;
+----
+16	16
+
+statement ok
+DROP TABLE local_names;
+
+statement ok
+SELECT mssql_exec('irc', 'DROP TABLE dbo.ReturningCard');
+
+statement ok
+DETACH irc;
