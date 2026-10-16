@@ -690,9 +690,25 @@ size_t RowReader::ReadPLPType(const uint8_t *data, size_t length, std::vector<ui
 	is_null = false;
 
 	// For PLP_UNKNOWN or known length, read chunks
-	// Pre-allocate if we know the total length
+	//
+	// Pre-allocate if we know the total length -- but never more than the buffer
+	// in hand. A parse only SUCCEEDS with the whole value buffered (every chunk
+	// below returns 0, "need more data", unless `offset + chunk_length <=
+	// length`), so a reserve beyond `length` can never be the allocation this
+	// call ends up needing: either the value fits and `length` covers it, or the
+	// caller comes back with more bytes and reserves again.
+	//
+	// Without the cap, `total_length` is the SERVER's declaration bounded only by
+	// the 0x7FFFFFFF below: one small response declaring ~2 GB and then sending
+	// the terminator chunk immediately buys a 2 GB allocation before a single
+	// payload byte arrives. Nothing is written out of bounds and the memory is
+	// released, so this was remote memory amplification rather than corruption --
+	// but the LOB path next door already caps (MAX_LOB_VALUE_BYTES, "declares N
+	// bytes, past the N-byte maximum"), and the inconsistency was the bug. Found
+	// by the q4 query in joern/ ("allocation sized by a declared length").
 	if (total_length != PLP_UNKNOWN_MARKER && total_length < 0x7FFFFFFF) {
-		value.reserve(static_cast<size_t>(total_length));
+		const size_t declared = static_cast<size_t>(total_length);
+		value.reserve(declared < length ? declared : length);
 	}
 	value.clear();
 
