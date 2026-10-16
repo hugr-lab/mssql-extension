@@ -46,6 +46,9 @@ make test
 | `make docker-down`       | Stop SQL Server test container                    |
 | `make docker-status`     | Check SQL Server container status                 |
 | `make vcpkg-setup`       | Bootstrap vcpkg (required for TLS support)        |
+| `make joern-cpg`         | Build a Joern CPG of the parsing surface (`joern/README.md`) |
+| `make joern-scan`        | Run the Joern query suite over that CPG           |
+| `make joern-shell`       | Open the Joern REPL on that CPG                   |
 | `make help`              | Show all available targets                        |
 
 ### Build Outputs
@@ -137,6 +140,25 @@ make test-all
 
 # Load extension dynamically (with TLS)
 duckdb --unsigned -c "LOAD 'build/release/extension/mssql/mssql.duckdb_extension';"
+```
+
+## Static Analysis and Fuzzing
+
+Two self-contained lanes, each documented in its own directory and neither wired
+into per-PR CI except where noted:
+
+- **`fuzz/`** — libFuzzer/AFL++ harnesses over the TDS parsers under ASan+UBSan,
+  plus the ClusterFuzzLite regression gate that *does* run per PR. See
+  [`fuzz/README.md`](fuzz/README.md).
+- **`joern/`** — [Joern](https://joern.io) CPG queries over the same parsing
+  surface: length arithmetic that can wrap or truncate, byte-buffer reads with no
+  bounds guard, allocations sized by a declared length, credentials in log
+  messages, and which parsing methods no fuzz harness can reach. Needs only
+  `brew install joern` — it compiles nothing. See
+  [`joern/README.md`](joern/README.md).
+
+```bash
+make joern-cpg && make joern-scan      # report in joern/out/report-tds.md
 ```
 
 ## Linux CI Build (Docker)
