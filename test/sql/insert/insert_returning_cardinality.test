@@ -19,7 +19,8 @@ require-env MSSQL_TESTDB_DSN
 #
 # One of those sites is in the RETURNING parser
 # (dml/insert/mssql_returning_parser.cpp:55) -- the OUTPUT INSERTED rows of an
-# INSERT ... RETURNING, built into a fresh DataChunk per statement. Every existing RETURNING test
+# INSERT ... RETURNING, built into a fresh DataChunk per statement. Every
+# existing RETURNING test
 # (insert_returning.test, insert_returning_batches.test,
 # insert_returning_udt_columns.test, insert_geometry.test) consumes that chunk
 # as a bare result set: the client fetches the rows and compares them. That is
@@ -27,9 +28,9 @@ require-env MSSQL_TESTDB_DSN
 # tomorrow and the whole suite would stay green.
 #
 # So read the RETURNING output the way an operator does: through a filter, an
-# aggregate, a sort and a join, and through expressions evaluated over it.
-# Without the child cardinality these return 0 rows, NULL sums, or empty joins
-# while the plain `query` form above them still prints every row.
+# aggregate, a sort and a join, and through expressions evaluated over it --
+# these are the consumers that key on the vector's own size, where the bare
+# result set the other files use does not.
 #
 # DuckDB accepts an INSERT ... RETURNING as a CTE body, which is what puts a
 # real operator on top of the returned chunk.
