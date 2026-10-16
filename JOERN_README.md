@@ -37,7 +37,7 @@ joern/review.py                     # -> joern/out/review-tds.md
 
 That collapses the report into one checkbox per **question** — hits with the
 same expression shape in the same file become one item listing every location
-(400+ hits -> 89 items on the current tree). `joern/README.md` has the verdict
+(400+ hits -> 88 items on the current tree). `joern/README.md` has the verdict
 vocabulary and what the first pass over it found.
 
 ## Narrower, wider
@@ -126,11 +126,11 @@ executes arbitrary Scala, so keep it on loopback.
 |---|---|---|---|
 | `q1` | Wire-parsing surface inventory | 170 | 182 |
 | `q2` | Byte-buffer method that indexes without comparing anything | 15 | 17 |
-| `q3` | Length arithmetic that can wrap (#185) or truncate (#181) | 29 | 47 |
+| `q3` | Length arithmetic that can wrap (#185) or truncate (#181) | 28 | 39 |
 | `q4` | Allocation or append sized by a declared length | 40 | 58 |
 | `q5` | *(dataflow)* fuzz entry-point parameter → copy size or index | 14 | 16 |
 | `q6` | Credential inside a log, exception or format expression | 0 | 2 |
-| `q7` | Socket/TLS call whose return value is discarded | 16 | 17 |
+| `q7` | Socket/TLS call whose return value is discarded | 16 | 16 |
 | `q8` | Type-punning cast to a multi-byte pointer | 8 | 14 |
 | `q9` | Parsing method not reachable from any fuzz entry point | 152 | 164 |
 
