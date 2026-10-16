@@ -679,6 +679,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_sql_writer.cpp \
     test/cpp/test_merge_shape.cpp \
     test/cpp/test_describe_cache.cpp \
+    test/cpp/test_plp_reserve.cpp \
     test/cpp/test_function_fallibility.cpp \
     test/cpp/codec/test_binary_codec.cpp \
     test/cpp/codec/test_boolean_codec.cpp \

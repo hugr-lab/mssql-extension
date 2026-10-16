@@ -755,6 +755,88 @@ void TestRenderAsStringAllWireFormats() {
 	}
 }
 
+//===----------------------------------------------------------------------===//
+// RenderAsString refuses a value shorter than the type's wire width.
+//
+// The fixed-width kernels read 3, 4, 5, 8 or 10 bytes without consulting the
+// size they were handed, and this fallback used `size` for one thing only:
+// telling DATETIMEN's 4 bytes from its 8. So a stream declaring a 1-byte DATE
+// reached ConvertDate, which reads three bytes regardless -- a read past the
+// value buffer. DecodeFromTds on the vector path has always checked; both now
+// share RequireTemporalWidth.
+//
+// Found by the q2 query in joern/ (a byte-buffer method that indexes without
+// comparing anything), which flagged every one of these kernels. The main
+// decode path was guarded, so only this fallback -- reached when a view CAST
+// sends a temporal type into a VARCHAR destination (issue #89) -- was exposed,
+// and it needs DuckDB Vectors, which is why no fuzz harness could reach it.
+//===----------------------------------------------------------------------===//
+
+// Refused BY THE WIDTH GUARD specifically -- the message has to be the one
+// RequireTemporalWidth produces. A plain "did it throw" check passed against the
+// unguarded code for most of these inputs: garbage bytes make FormatTimestampText
+// and friends throw on their own, so the assertion would have been satisfied for
+// the wrong reason while the out-of-bounds read still happened.
+bool RenderRefusedForWidth(const std::vector<uint8_t> &wire, const duckdb::tds::ColumnMetadata &col) {
+	try {
+		duckdb::mssql::codec::datetime::RenderAsString(wire, col);
+	} catch (const duckdb::InvalidInputException &e) {
+		return std::string(e.what()).find("were required") != std::string::npos;
+	}
+	return false;
+}
+
+bool RenderThrows(const std::vector<uint8_t> &wire, const duckdb::tds::ColumnMetadata &col) {
+	try {
+		duckdb::mssql::codec::datetime::RenderAsString(wire, col);
+	} catch (const duckdb::InvalidInputException &) {
+		return true;
+	}
+	return false;
+}
+
+void TestRenderAsStringShortValueRefused() {
+	std::cout << "Test: RenderAsString refuses a value shorter than the type's wire width\n";
+
+	// (type id, scale, bytes the kernel reads)
+	const struct {
+		uint8_t type_id;
+		uint8_t scale;
+		size_t width;
+	} fixed[] = {
+		{duckdb::tds::TDS_TYPE_DATE, 0, 3},
+		{duckdb::tds::TDS_TYPE_TIME, 7, 5},
+		{duckdb::tds::TDS_TYPE_TIME, 0, 3},
+		{duckdb::tds::TDS_TYPE_DATETIME, 0, 8},
+		{duckdb::tds::TDS_TYPE_SMALLDATETIME, 0, 4},
+		{duckdb::tds::TDS_TYPE_DATETIME2, 7, 8},
+		{duckdb::tds::TDS_TYPE_DATETIMEOFFSET, 7, 10},
+	};
+
+	for (const auto &f : fixed) {
+		auto col = MakeTdsColumn(f.type_id, f.scale);
+		// One byte short, and the degenerate single byte the row reader would
+		// hand over for a declared length of 1.
+		CHECK_TRUE(RenderRefusedForWidth(std::vector<uint8_t>(f.width - 1, 0), col));
+		CHECK_TRUE(RenderRefusedForWidth(std::vector<uint8_t>(1, 0), col));
+		// Empty is refused too -- the kernels would read from bytes.data() of a
+		// vector that owns nothing.
+		CHECK_TRUE(RenderRefusedForWidth(std::vector<uint8_t>(), col));
+		// The exact width still renders (TestRenderAsStringAllWireFormats
+		// checks the values; this checks the guard lets them through).
+		CHECK_TRUE(!RenderThrows(std::vector<uint8_t>(f.width, 0), col));
+	}
+
+	// DATETIMEN validated itself before this change and still does: 4 and 8 are
+	// the only legal widths, and the guard above must not have changed that
+	// (FixedTemporalReadLen returns 0 for it).
+	auto datetimen = MakeTdsColumn(duckdb::tds::TDS_TYPE_DATETIMEN, 0);
+	CHECK_TRUE(!RenderThrows(std::vector<uint8_t>(4, 0), datetimen));
+	CHECK_TRUE(!RenderThrows(std::vector<uint8_t>(8, 0), datetimen));
+	CHECK_TRUE(RenderThrows(std::vector<uint8_t>(5, 0), datetimen));
+	CHECK_TRUE(RenderThrows(std::vector<uint8_t>(), datetimen));
+}
+
 }  // namespace
 
 int main() {
@@ -785,6 +867,7 @@ int main() {
 	TestEstimateLiteralSize();
 	TestDispatcherRouting();
 	TestRenderAsStringAllWireFormats();
+	TestRenderAsStringShortValueRefused();
 
 	if (failures == 0) {
 		std::cout << "\nAll codec::datetime tests passed.\n";
