@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test help
+.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -1237,6 +1237,30 @@ test-spec047-us-sec: test-token-cache-isolation
 	@echo ""
 	@echo "Spec 047 US-SEC TokenCache isolation test PASSED (SC-011)"
 
+# Joern static analysis (see joern/README.md).
+#
+# Joern builds a Code Property Graph with Eclipse CDT and compiles nothing, so
+# these targets need neither a build nor vcpkg -- only `brew install joern`.
+# They are the structural complement to fuzz/: the fuzzers prove one input
+# crashes one parser, the query suite finds the places that look like it.
+#
+# Deliberately NOT wired into CI: a 1.6 GB tool producing hints does not belong
+# in a per-PR gate (ClusterFuzzLite already runs there). The workflow is to keep
+# a report from a known-good tree and diff a new one against it.
+#
+# JOERN_SCOPE=tds (default) is the untrusted-input surface; JOERN_SCOPE=all is
+# every file under src/ (needed for the credential-to-log query q6).
+JOERN_SCOPE ?= tds
+
+joern-cpg:
+	$(PROJ_DIR)joern/build.sh $(JOERN_SCOPE)
+
+joern-scan:
+	$(PROJ_DIR)joern/scan.sh $(JOERN_SCOPE) $(JOERN_QUERY)
+
+joern-shell:
+	$(PROJ_DIR)joern/shell.sh $(JOERN_SCOPE)
+
 # Show help
 help:
 	@echo "DuckDB MSSQL Extension Build System"
@@ -1252,6 +1276,9 @@ help:
 	@echo "  make integration-test     - Run integration tests (requires SQL Server)"
 	@echo "  make azure-test           - Run Azure/Fabric tests (build first; needs cloud creds + azure ext)"
 	@echo "  make counters-test        - Run the SQL suite with MSSQL_COUNTERS=1 (exercises the counter path)"
+	@echo "  make joern-cpg            - Build a Joern CPG of the TDS parsing surface (JOERN_SCOPE=all for src/)"
+	@echo "  make joern-scan           - Run the Joern query suite (JOERN_QUERY=q3 for one query)"
+	@echo "  make joern-shell          - Open the Joern REPL on the CPG"
 	@echo "  make test-all             - Run all tests"
 	@echo "  make test-debug           - Run tests with debug build"
 	@echo "  make test-simple-query    - Run C++ simple query test"
