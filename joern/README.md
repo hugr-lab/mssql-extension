@@ -68,11 +68,11 @@ are the **baseline**, not a target.
 |---|---|---|---|---|
 | `q1` | Wire-parsing surface inventory | Every method taking a `uint8_t*` buffer or touching the `TokenParser` receive buffer. The set that must never trust a declared length. | 170 | 182 |
 | `q2` | Byte-buffer method that indexes without comparing anything | The convention here is that the parsing method checks `Available()` / its own length parameter itself (`TokenParser::ParseError` is the model). A hit is an exception to that convention — mostly the write path, where the caller sized the buffer. | 15 | 17 |
-| `q3` | Length arithmetic that can lose information | `[wrap]` 32-bit length arithmetic — the **issue #185** class, where `5 + token_length` wrapped and the wrapped sum passed a bounds check it should have failed (PoC `EE FB FF FF FF`). `[trunc]` a length narrowed by a cast to `uint8_t`/`uint16_t`/`uint32_t` — the **issue #181** class. | 29 | 47 |
+| `q3` | Length arithmetic that can lose information | `[wrap]` 32-bit length arithmetic — the **issue #185** class, where `5 + token_length` wrapped and the wrapped sum passed a bounds check it should have failed (PoC `EE FB FF FF FF`). `[trunc]` a length narrowed by a cast to `uint8_t`/`uint16_t`/`uint32_t` — the **issue #181** class. | 28 | 39 |
 | `q4` | Allocation or append sized by a declared length | A server-declared 4 GB length reaching `resize`/`reserve`/`assign` is a remote OOM even when nothing is written out of bounds. | 40 | 58 |
 | `q5` | *(dataflow)* fuzz entry-point parameter → copy size or index | Taint from the harness entry points to a `memcpy` size or an array index. Candidate fuzz seeds, not bugs. | 14 | 16 |
 | `q6` | Credential inside a log, exception or format expression | Spec 047 T028a ("the ATTACH error path must never echo a password") and the `mssql_pool_stats` redaction gate, as a query. Needs the `all` scope. | 0 | 2 |
-| `q7` | Socket/TLS call with a discarded return value | `recv`/`poll`/`SSL_*` return a count or an error that has to be read. | 16 | 17 |
+| `q7` | Socket/TLS call with a discarded return value | `recv`/`poll`/`SSL_*` return a count or an error that has to be read. | 16 | 16 |
 | `q8` | Type-punning cast to a multi-byte pointer | Reading wire bytes through a `uint32_t*`/`char16_t*` is unaligned-access UB that UBSan only reports if an input reaches the site. | 8 | 14 |
 | `q9` | Parsing method not reachable from any fuzz entry point | The call-graph answer to "what does `fuzz/` not cover". | 152 | 164 |
 
@@ -121,7 +121,7 @@ joern/review.py joern/out/report-all.md  #             -> review-all.md
 
 Twenty `1 + data_length` hits in one row reader become **one item with twenty
 locations** — one question asked twenty times, not twenty questions. On the
-current tree that turns 400+ hits into 89 items for the `tds` scope and 130 for
+current tree that turns 400+ hits into 88 items for the `tds` scope and 121 for
 `all`. Each item carries a `verdict:` line to fill in; q1 and q9 are inventories
 by design, so they are summarised per file instead of itemised.
 
@@ -175,6 +175,18 @@ direction, CDT leaves some callees unresolved and an unresolved callee silently
 **truncates** a flow, so q5 finding nothing would not be evidence of absence.
 Building the extension first (so `build/release/vcpkg_installed/` exists for
 `build.sh` to pass as include paths) makes the graph better.
+
+**Two filters exist because the first run was wrong about them.** `q7` skips a
+call whose name is also a parameter or local of the enclosing method: that is a
+callable object being invoked, not the syscall, and
+`MSSQLStageSwitch::Replay(const std::function<void(DataChunk &)> &send)` calling
+`send(held_chunk)` was reported as a discarded `send()` return. Nothing else
+separates the two — an unresolved `std::function` call and a real `send()` both
+present as external with `<unresolvedNamespace>.send:<unresolvedSignature>`.
+`q3` skips a `[trunc]` cast whose value is masked or right-shifted, because
+`static_cast<uint8_t>(v & 0xFF)` is little-endian serialisation: the narrowing
+is the point and the sequence loses nothing. Together they removed one q7 and
+eight q3 hits, all verified false by hand first.
 
 **The report is a baseline, not a gate.** The intended workflow is to diff a
 report against one taken from a tree you trust — a new line in q2, q3, q7, q8 or

@@ -239,11 +239,19 @@ import io.shiftleft.codepropertygraph.generated.nodes.{AstNode, Expression, Meth
 				val readsAByte = value.exists(v =>
 					v.ast.isCall.nameExact(Operators.indirectIndexAccess, Operators.indexAccess).nonEmpty
 				)
+				// `static_cast<uint8_t>(v & 0xFF)` and `static_cast<uint8_t>((v >> 8)
+				// & 0xFF)` are little-endian serialisation: the narrowing is the
+				// POINT, one byte at a time, and no information is lost across the
+				// sequence. Six of fourteen [trunc] hits in the `all` scope were
+				// this, all in the wire-framing helpers.
+				val maskedOrShifted = value.exists(v =>
+					v.ast.isCall.name(".*(\\.and|[sS]hiftRight)$").nonEmpty
+				)
 				val widened = value
 					.flatMap(v => typedOperands(v))
 					.filter { case (n, t) => n.matches(lengthName) && t.matches(wide) }
 					.distinct
-				if (readsAByte || widened.isEmpty) None
+				if (readsAByte || maskedOrShifted || widened.isEmpty) None
 				else
 					Some(
 						(loc(c), s"[trunc] ${oneLine(c.code, 42)}   [${widened.map { case (n, t) => s"$n:$t" }.mkString(", ")}]")
@@ -364,7 +372,23 @@ import io.shiftleft.codepropertygraph.generated.nodes.{AstNode, Expression, Meth
 		)
 
 		val sockFns = "recv|recvfrom|send|sendto|read|write|poll|select|SSL_read|SSL_write|SSL_shutdown|SSL_do_handshake|close|closesocket|setsockopt|getsockopt|shutdown|fcntl|ioctlsocket"
-		val discarded = cpg.call.name(sockFns).filter(_.astParent.label == "BLOCK").l
+
+		// A call whose name is also a PARAMETER or LOCAL of the enclosing method
+		// is invoking a callable object, not the syscall: `MSSQLStageSwitch::Replay
+		// (const std::function<void(DataChunk &)> &send)` calls `send(held_chunk)`,
+		// which returns void and has nothing to check. Neither `isExternal` nor
+		// `methodFullName` separates the two -- an unresolved std::function call
+		// and a real `send()` both come out as external with
+		// `<unresolvedNamespace>.send:<unresolvedSignature>` -- but the name
+		// shadowing does, exactly.
+		def invokesACallableObject(c: io.shiftleft.codepropertygraph.generated.nodes.Call): Boolean =
+			c.method.parameter.name.l.contains(c.name) || c.method.local.name.l.contains(c.name)
+
+		val discarded = cpg.call
+			.name(sockFns)
+			.filter(_.astParent.label == "BLOCK")
+			.filterNot(invokesACallableObject)
+			.l
 		report(byLocation(discarded).map(c => (loc(c), oneLine(c.code))), 60)
 	}
 
