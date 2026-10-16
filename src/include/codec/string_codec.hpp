@@ -134,6 +134,26 @@ size_t Utf16ByteLength(const std::string &utf8);
 // String-family text logic.
 std::string EscapeSqlSingleQuotes(const std::string &str);
 
+//! The most wire bytes a MAX-typed value may carry (issue #489).
+//!
+//! SQL Server stores at most 2^31-1 bytes in a varchar(max) / nvarchar(max) /
+//! varbinary(max) column, and the PLP chunk length on the wire is FOUR bytes —
+//! so this bound is both the server's limit and what keeps the length field
+//! from wrapping. A value past it used to be framed with `length mod 2^32`
+//! while every byte was still written, which desynced the session (the #323
+//! class: "Unknown token type", or a hang) instead of failing.
+//!
+//! Only the nvarchar path can actually reach it: a DuckDB `string_t` length is
+//! uint32, so UTF-8 bytes cannot pass 2^32, but UTF-16 doubles ASCII.
+static const size_t MAX_PLP_WIRE_BYTES = 2147483647ULL;
+
+//! Throw unless `wire_bytes` fits MAX_PLP_WIRE_BYTES. `what` names the wire
+//! type for the message ("nvarchar(max)", "varchar(max)").
+//!
+//! Exposed so the bound is testable without building a 2 GiB value: the
+//! regression test drives this predicate with plain numbers.
+void RequirePlpWireBytes(size_t wire_bytes, const char *what);
+
 //! Per-column measurement for the columnar scatter (spec 057 step 3).
 //!
 //! `lengths[r]` is the PAYLOAD byte count row r will occupy on the wire — UTF-16

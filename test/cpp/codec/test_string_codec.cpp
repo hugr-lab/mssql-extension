@@ -54,6 +54,14 @@ int failures = 0;
 		}                                                                                                \
 	} while (0)
 
+#define CHECK_TRUE(expr)                                             \
+	do {                                                             \
+		if (!(expr)) {                                               \
+			++failures;                                              \
+			std::cerr << "FAIL [" << __LINE__ << "] " #expr << "\n"; \
+		}                                                            \
+	} while (0)
+
 void TestFormatSqlLiteralByteIdentity() {
 	std::cout << "Test: FormatSqlLiteral Filter == InsertValues byte-identity (VARCHAR)\n";
 
@@ -188,6 +196,67 @@ void TestNullLiteral() {
 
 }  // namespace
 
+//===----------------------------------------------------------------------===//
+// Issue #489: a MAX-typed value past SQL Server's 2^31-1 bytes is refused
+// rather than framed with a truncated PLP chunk length.
+//
+// The bug needed a single value over 2 GiB, which no unit test can build — so
+// the bound is exposed as a predicate (RequirePlpWireBytes) and driven here with
+// plain numbers. That tests the arithmetic and the boundary, which is where the
+// bug lived: the chunk length is a four-byte wire field and the payload was
+// sized in size_t, so a value of 2^32 + k bytes declared k and the server read
+// the rest of it as the next tokens.
+//
+// What this does NOT cover: that the three framing paths actually call the
+// predicate. Those calls are one line each at the point the length is written
+// (string_codec.cpp:197, :252, :898) and are visible in the diff.
+//===----------------------------------------------------------------------===//
+
+bool PlpRefuses(size_t wire_bytes) {
+	try {
+		duckdb::mssql::codec::string::RequirePlpWireBytes(wire_bytes, "nvarchar(max)");
+	} catch (const duckdb::InvalidInputException &) {
+		return true;
+	}
+	return false;
+}
+
+void TestPlpWireByteBound() {
+	std::cout << "Test: issue #489 -- a MAX value past 2^31-1 wire bytes is refused\n";
+
+	const size_t limit = duckdb::mssql::codec::string::MAX_PLP_WIRE_BYTES;
+	CHECK_EQ(limit, static_cast<size_t>(2147483647));
+
+	// Accepted: everything up to and including the limit.
+	CHECK_TRUE(!PlpRefuses(0));
+	CHECK_TRUE(!PlpRefuses(1));
+	CHECK_TRUE(!PlpRefuses(8000));
+	CHECK_TRUE(!PlpRefuses(limit - 1));
+	CHECK_TRUE(!PlpRefuses(limit));
+
+	// Refused: one past the limit, and the two sizes that used to truncate --
+	// 2^32 declared 0, and 2^32 + 8000 declared 8000.
+	CHECK_TRUE(PlpRefuses(limit + 1));
+	CHECK_TRUE(PlpRefuses(static_cast<size_t>(1) << 31));
+	CHECK_TRUE(PlpRefuses(static_cast<size_t>(1) << 32));
+	CHECK_TRUE(PlpRefuses((static_cast<size_t>(1) << 32) + 8000));
+	// The worst case the nvarchar path can reach: a uint32-length string_t of
+	// ASCII, doubled by the UTF-16 encode.
+	CHECK_TRUE(PlpRefuses(static_cast<size_t>(4294967295ULL) * 2));
+
+	// The message names the size and the limit, so a user can tell this from a
+	// server-side rejection.
+	try {
+		duckdb::mssql::codec::string::RequirePlpWireBytes((static_cast<size_t>(1) << 32) + 8000, "nvarchar(max)");
+		CHECK_TRUE(false);
+	} catch (const duckdb::InvalidInputException &e) {
+		const std::string msg = e.what();
+		CHECK_TRUE(msg.find("4294975296") != std::string::npos);
+		CHECK_TRUE(msg.find("2147483647") != std::string::npos);
+		CHECK_TRUE(msg.find("nvarchar(max)") != std::string::npos);
+	}
+}
+
 int main() {
 	TestFormatSqlLiteralByteIdentity();
 	TestFormatSqlLiteralEscapeContract();
@@ -196,6 +265,7 @@ int main() {
 	TestFormatDdlTypeNameInterval();
 	TestEstimateLiteralSizeUpperBound();
 	TestNullLiteral();
+	TestPlpWireByteBound();
 
 	if (failures > 0) {
 		std::cerr << "\n" << failures << " assertion(s) failed.\n";

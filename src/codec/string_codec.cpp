@@ -191,6 +191,10 @@ void AppendNVarcharPlp(duckdb::vector<uint8_t> &buf, const char *input, size_t i
 	WritePlpHeader(out);
 	uint8_t *chunk_len_ptr = out + 8;
 	size_t utf16_len = tds::encoding::Utf16LEEncodeDirect(input, input_len, chunk_len_ptr + 4);
+	// Issue #489. The cold path learns the real length only from the encode, so
+	// the buffer above is already sized -- but the declaration is what desyncs
+	// the session, and this is the last point before it is written.
+	RequirePlpWireBytes(utf16_len, "nvarchar(max)");
 	WriteLe32(chunk_len_ptr, static_cast<uint32_t>(utf16_len));
 	WriteLe32(chunk_len_ptr + 4 + utf16_len, 0);
 
@@ -243,6 +247,9 @@ void EncodeNVarcharFromUtf8(const char *utf8_data, size_t utf8_len, const mssql:
 			AppendNVarcharPlp(buf, utf8_data, utf8_len);
 			return;
 		}
+		// Issue #489. Measured before the resize on this path, so an over-large
+		// value costs no allocation at all.
+		RequirePlpWireBytes(utf16_byte_len, "nvarchar(max)");
 		const size_t start = buf.size();
 		buf.resize(start + 8 + 4 + utf16_byte_len + 4);
 		uint8_t *out = buf.data() + start;
@@ -540,6 +547,16 @@ void DecodeChunkImpl(const staging::ColumnStaging &st, idx_t count, Vector &out)
 }
 
 }  // namespace
+
+void RequirePlpWireBytes(size_t wire_bytes, const char *what) {
+	if (wire_bytes > MAX_PLP_WIRE_BYTES) {
+		throw InvalidInputException(
+			"MSSQL: a %s value of %llu bytes is past SQL Server's %llu-byte maximum for a MAX-typed "
+			"column. SQL Server could not store it, and the PLP chunk length on the wire is four bytes, "
+			"so sending it would declare a truncated length and desync the session.",
+			what, static_cast<unsigned long long>(wire_bytes), static_cast<unsigned long long>(MAX_PLP_WIRE_BYTES));
+	}
+}
 
 //===--------------------------------------------------------------------===//
 // Column plan for the columnar scatter (spec 057 step 3)
@@ -873,6 +890,11 @@ void EncodeVarcharUtf8(const char *utf8_data, size_t utf8_len, const mssql::BCPC
 	}
 
 	if (col.IsPLPType()) {
+		// Issue #489. This path cannot truncate -- a DuckDB string_t length is
+		// uint32, so utf8_len never reaches 2^32 -- but a value past 2^31-1 is
+		// still more than SQL Server stores, and refusing here names the size
+		// instead of leaving the server to reject the batch.
+		RequirePlpWireBytes(utf8_len, "varchar(max)");
 		const size_t start = buf.size();
 		buf.resize(start + 8 + (utf8_len > 0 ? 4 + utf8_len : 0) + 4);
 		uint8_t *out = buf.data() + start;
