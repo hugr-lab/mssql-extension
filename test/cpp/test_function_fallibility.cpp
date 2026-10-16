@@ -13,10 +13,10 @@
 // The contract is invisible to the compiler. Spec 069 names
 // `test/sql/tds_connection/ping.test` as the one test that caught it during the
 // migration -- that test and the mssql_open / mssql_close / mssql_ping
-// functions it exercised no longer exist in the tree. Of the registrations that
+// functions it exercised no longer exist in the tree. Of the overloads that
 // remain, the azure (2), kerberos (3) and winsspi (3) test functions all sit
-// behind `require azure` / `require-env` skips, so in CI eight of thirteen are
-// never executed at all and a missing SetFallible() on one of them ships.
+// behind `require azure` / `require-env` skips, so eight of them are never
+// executed in CI at all and a missing SetFallible() on one of them ships.
 //
 // So check it structurally instead of by execution: walk the catalog, take
 // every scalar function the extension registered, and read GetErrorMode() off
@@ -64,9 +64,9 @@ const std::set<std::string> INFALLIBLE = {"mssql_version"};
 
 // A floor on what the walk must find, so a build whose extension did not
 // register (or a catalog walk that silently visits nothing) fails here instead
-// of passing with zero checks. 13 scalar functions carry SetFallible() today
-// plus mssql_version; the floor is deliberately below that so adding a function
-// never requires touching this number.
+// of passing with zero checks. Deliberately a floor and not the exact count:
+// the test prints what it found, and adding or removing a function must never
+// require touching this number.
 constexpr size_t MIN_FUNCTIONS = 10;
 
 }  // namespace
