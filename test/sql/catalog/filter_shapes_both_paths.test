@@ -515,7 +515,7 @@ SELECT (SELECT count(*) FROM fs_oracle WHERE n > 50),
 #
 # Nothing here asserts that the divergence is CORRECT. It is recorded so that a
 # change in it is deliberate: if pushdown of string comparisons is ever made
-# collation-aware, these four numbers move and this is the file that says so.
+# collation-aware, these three pairs move and this is the file that says so.
 # =============================================================================
 
 statement ok

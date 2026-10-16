@@ -71,7 +71,6 @@ SELECT rowid FROM rsc.dbo.RowidStructCard WHERE seq = 7;
 
 # -----------------------------------------------------------------------------
 # The client-side filter net over the struct, across 2500 rows / two vectors.
-# Without the child sizes this is 0.
 # -----------------------------------------------------------------------------
 query I
 SELECT count(*) FROM rsc.dbo.RowidStructCard WHERE rowid IS NOT NULL;
@@ -133,7 +132,18 @@ SELECT count(*) FROM rsc.dbo.RowidStructCard WHERE rowid IS NOT NULL AND rowid.p
 # read the rowid STRUCT out of the scan and render its children into the
 # statement's VALUES JOIN, so they consume exactly the vectors this file is
 # about -- and they do it for a row set the scan filtered, not for whole chunks.
+# With mssql_dml_pushdown on (the default) both statements go to the server
+# whole through mssql_dml and read no rowid at all, so it is turned off here and
+# the plan is pinned to the shipped path.
 # -----------------------------------------------------------------------------
+statement ok
+SET mssql_dml_pushdown = false;
+
+query II
+EXPLAIN UPDATE rsc.dbo.RowidStructCard SET payload = 'updated' WHERE seq IN (10, 11, 12);
+----
+physical_plan	<!REGEX>:.*Mssql Dml.*
+
 statement ok
 UPDATE rsc.dbo.RowidStructCard SET payload = 'updated' WHERE seq IN (10, 11, 12);
 
