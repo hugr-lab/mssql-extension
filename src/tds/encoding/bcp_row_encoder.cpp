@@ -1113,6 +1113,13 @@ void BCPRowEncoder::EncodeBinaryPLP(vector<uint8_t> &buffer, const string_t &val
 		buffer.push_back(static_cast<uint8_t>((UNKNOWN_PLP_LEN >> (i * 8)) & 0xFF));
 	}
 
+	// A varbinary(max) value cannot WRAP the chunk length -- a string_t size is
+	// uint32 -- but it can still be past what SQL Server stores in a MAX column,
+	// and the header names varbinary(max) under MAX_PLP_WIRE_BYTES. Refusing
+	// here names the size instead of leaving the server to reject the batch
+	// (review of PR #490; the columnar twin is PlanColumn's `past_max`).
+	mssql::codec::string::RequirePlpWireBytes(value.GetSize(), "varbinary(max)");
+
 	// Handle empty binary: PLP with no chunks, just terminator
 	// PLP chunks must have length > 0, so empty binary = no chunks
 	uint32_t chunk_len = static_cast<uint32_t>(value.GetSize());

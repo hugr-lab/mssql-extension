@@ -54,6 +54,14 @@ int failures = 0;
 		}                                                                                                \
 	} while (0)
 
+#define CHECK_TRUE(expr)                                             \
+	do {                                                             \
+		if (!(expr)) {                                               \
+			++failures;                                              \
+			std::cerr << "FAIL [" << __LINE__ << "] " #expr << "\n"; \
+		}                                                            \
+	} while (0)
+
 void TestFormatSqlLiteralByteIdentity() {
 	std::cout << "Test: FormatSqlLiteral Filter == InsertValues byte-identity (VARCHAR)\n";
 
@@ -188,6 +196,164 @@ void TestNullLiteral() {
 
 }  // namespace
 
+//===----------------------------------------------------------------------===//
+// Issue #489: a MAX-typed value past SQL Server's 2^31-1 bytes is refused
+// rather than framed with a truncated PLP chunk length.
+//
+// The bug needed a single value over 2 GiB, which no unit test can build — so
+// the bound is exposed as a predicate (RequirePlpWireBytes) and driven here with
+// plain numbers. That tests the arithmetic and the boundary, which is where the
+// bug lived: the chunk length is a four-byte wire field and the payload was
+// sized in size_t, so a value of 2^32 + k bytes declared k and the server read
+// the rest of it as the next tokens.
+//
+// What this does NOT cover: that the three framing paths actually call the
+// predicate. Those calls are one line each at the point the length is written
+// (string_codec.cpp:197, :252, :898) and are visible in the diff.
+//===----------------------------------------------------------------------===//
+
+bool PlpRefuses(size_t wire_bytes) {
+	try {
+		duckdb::mssql::codec::string::RequirePlpWireBytes(wire_bytes, "nvarchar(max)");
+	} catch (const duckdb::InvalidInputException &) {
+		return true;
+	}
+	return false;
+}
+
+void TestPlpWireByteBound() {
+	std::cout << "Test: issue #489 -- a MAX value past 2^31-1 wire bytes is refused\n";
+
+	const size_t limit = duckdb::mssql::codec::string::MAX_PLP_WIRE_BYTES;
+	CHECK_EQ(limit, static_cast<size_t>(2147483647));
+
+	// Accepted: everything up to and including the limit.
+	CHECK_TRUE(!PlpRefuses(0));
+	CHECK_TRUE(!PlpRefuses(1));
+	CHECK_TRUE(!PlpRefuses(8000));
+	CHECK_TRUE(!PlpRefuses(limit - 1));
+	CHECK_TRUE(!PlpRefuses(limit));
+
+	// Refused: one past the limit, and the two sizes that used to truncate --
+	// 2^32 declared 0, and 2^32 + 8000 declared 8000.
+	CHECK_TRUE(PlpRefuses(limit + 1));
+	CHECK_TRUE(PlpRefuses(static_cast<size_t>(1) << 31));
+	CHECK_TRUE(PlpRefuses(static_cast<size_t>(1) << 32));
+	CHECK_TRUE(PlpRefuses((static_cast<size_t>(1) << 32) + 8000));
+	// The worst case the nvarchar path can reach: a uint32-length string_t of
+	// ASCII, doubled by the UTF-16 encode.
+	CHECK_TRUE(PlpRefuses(static_cast<size_t>(4294967295ULL) * 2));
+
+	// The message names the size and the limit, so a user can tell this from a
+	// server-side rejection.
+	try {
+		duckdb::mssql::codec::string::RequirePlpWireBytes((static_cast<size_t>(1) << 32) + 8000, "nvarchar(max)");
+		CHECK_TRUE(false);
+	} catch (const duckdb::InvalidInputException &e) {
+		const std::string msg = e.what();
+		CHECK_TRUE(msg.find("4294975296") != std::string::npos);
+		CHECK_TRUE(msg.find("2147483647") != std::string::npos);
+		CHECK_TRUE(msg.find("nvarchar(max)") != std::string::npos);
+	}
+}
+
+//===----------------------------------------------------------------------===//
+// Review of PR #490: the COLUMNAR path's planning arithmetic.
+//
+// PlanColumn computes a payload length per value and the chunk buffer is sized
+// from it. The length used to be narrowed to uint32 BEFORE the UTF-16 multiply,
+// so a 2 GiB source wrapped, and the wrapped value drove three things at once:
+// the bound comparison that triggers the clamp, the stored payload length, and
+// the wire size. On the non-ASCII arm that meant the encoder wrote the full
+// UTF-16 payload into a buffer sized from the wrapped length -- a client-side
+// heap overflow, not the desync #489 was about.
+//
+// This is the path COPY / CTAS / INSERT-via-BCP take for a valid nvarchar(max)
+// value; the row path #489 guarded is reached only when PlanColumn returns
+// false, i.e. for invalid UTF-8. A 2 GiB string cannot be built in a unit test,
+// so the decision is driven here with numbers through PlanOneLength.
+//===----------------------------------------------------------------------===//
+
+void TestPlanOneLength() {
+	std::cout << "Test: columnar planning refuses or clamps on the TRUE length (review of #490)\n";
+
+	using duckdb::mssql::codec::string::MAX_PLP_WIRE_BYTES;
+	using duckdb::mssql::codec::string::PlanOneLength;
+	const uint32_t no_bound = 0xFFFFFFFFu;	// what PlanColumn passes for a MAX column
+
+	// --- a MAX (PLP) column: refuse past the ceiling, never clamp ---
+	{
+		auto ok = PlanOneLength(8000, no_bound, true);
+		CHECK_TRUE(!ok.past_max);
+		CHECK_TRUE(!ok.over_bound);
+		CHECK_EQ(ok.stored, static_cast<uint32_t>(8000));
+
+		auto edge = PlanOneLength(MAX_PLP_WIRE_BYTES, no_bound, true);
+		CHECK_TRUE(!edge.past_max);
+
+		auto past = PlanOneLength(MAX_PLP_WIRE_BYTES + 1, no_bound, true);
+		CHECK_TRUE(past.past_max);
+
+		// The ASCII arm's worst case: a uint32-length string_t, doubled. This is
+		// the value that used to wrap to something small.
+		const size_t ascii_worst = static_cast<size_t>(4294967295ULL) * 2;
+		auto worst = PlanOneLength(ascii_worst, no_bound, true);
+		CHECK_TRUE(worst.past_max);
+		// Saturated, not wrapped: 2^33-2 must not present as a small number.
+		CHECK_EQ(worst.stored, static_cast<uint32_t>(0xFFFFFFFFu));
+
+		// 2^32 exactly: the non-ASCII arm's wrap point, which used to store 0.
+		auto wrap = PlanOneLength(static_cast<size_t>(1) << 32, no_bound, true);
+		CHECK_TRUE(wrap.past_max);
+		CHECK_EQ(wrap.stored, static_cast<uint32_t>(0xFFFFFFFFu));
+	}
+
+	// --- a BOUNDED column: the clamp must see the true length ---
+	{
+		const uint32_t bound = 200;	 // nvarchar(100) bounds 200 UTF-16 bytes
+
+		auto fits = PlanOneLength(200, bound, false);
+		CHECK_TRUE(!fits.over_bound);
+		CHECK_TRUE(!fits.past_max);
+
+		auto over = PlanOneLength(201, bound, false);
+		CHECK_TRUE(over.over_bound);
+
+		// The review's third bullet: an ASCII value of exactly 2^31 bytes into
+		// nvarchar(100) planned as length 0 under the old arithmetic -- 2^31 * 2
+		// is 2^32, which wrapped to zero -- so it was never clamped and went as
+		// an empty string. The true length is over the bound, so it clamps.
+		const size_t two_gib_ascii = (static_cast<size_t>(1) << 31) * 2;
+		auto wrapped_to_zero = PlanOneLength(two_gib_ascii, bound, false);
+		CHECK_TRUE(wrapped_to_zero.over_bound);
+		CHECK_TRUE(wrapped_to_zero.stored != 0);
+		// A bounded column is never a MAX column, so the ceiling does not apply:
+		// the clamp is the mechanism, not a refusal.
+		CHECK_TRUE(!wrapped_to_zero.past_max);
+	}
+
+	// --- the arithmetic itself: 2 GiB of ASCII is 4 GiB of UTF-16, not zero ---
+	{
+		using duckdb::mssql::codec::string::PlannedNVarcharBytes;
+		CHECK_EQ(PlannedNVarcharBytes(0), static_cast<size_t>(0));
+		CHECK_EQ(PlannedNVarcharBytes(8), static_cast<size_t>(16));
+		// The wrap point. `static_cast<uint32_t>(size) * 2` gives 0 here, which
+		// is the bug; in size_t it is 2^32.
+		CHECK_EQ(PlannedNVarcharBytes(static_cast<size_t>(1) << 31), static_cast<size_t>(1) << 32);
+		// And the largest string_t there is: 2^33 - 2, not 2^32 - 2.
+		CHECK_EQ(PlannedNVarcharBytes(4294967295ULL), static_cast<size_t>(8589934590ULL));
+	}
+
+	// --- the names that reach the message ---
+	{
+		using duckdb::mssql::codec::string::MaxTypeName;
+		using duckdb::mssql::codec::string::VarKind;
+		CHECK_EQ(std::string(MaxTypeName(VarKind::NVarchar)), std::string("nvarchar(max)"));
+		CHECK_EQ(std::string(MaxTypeName(VarKind::Utf8Varchar)), std::string("varchar(max)"));
+		CHECK_EQ(std::string(MaxTypeName(VarKind::Binary)), std::string("varbinary(max)"));
+	}
+}
+
 int main() {
 	TestFormatSqlLiteralByteIdentity();
 	TestFormatSqlLiteralEscapeContract();
@@ -196,6 +362,8 @@ int main() {
 	TestFormatDdlTypeNameInterval();
 	TestEstimateLiteralSizeUpperBound();
 	TestNullLiteral();
+	TestPlpWireByteBound();
+	TestPlanOneLength();
 
 	if (failures > 0) {
 		std::cerr << "\n" << failures << " assertion(s) failed.\n";

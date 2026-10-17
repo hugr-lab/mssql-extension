@@ -191,6 +191,10 @@ void AppendNVarcharPlp(duckdb::vector<uint8_t> &buf, const char *input, size_t i
 	WritePlpHeader(out);
 	uint8_t *chunk_len_ptr = out + 8;
 	size_t utf16_len = tds::encoding::Utf16LEEncodeDirect(input, input_len, chunk_len_ptr + 4);
+	// Issue #489. The cold path learns the real length only from the encode, so
+	// the buffer above is already sized -- but the declaration is what desyncs
+	// the session, and this is the last point before it is written.
+	RequirePlpWireBytes(utf16_len, "nvarchar(max)");
 	WriteLe32(chunk_len_ptr, static_cast<uint32_t>(utf16_len));
 	WriteLe32(chunk_len_ptr + 4 + utf16_len, 0);
 
@@ -243,6 +247,9 @@ void EncodeNVarcharFromUtf8(const char *utf8_data, size_t utf8_len, const mssql:
 			AppendNVarcharPlp(buf, utf8_data, utf8_len);
 			return;
 		}
+		// Issue #489. Measured before the resize on this path, so an over-large
+		// value costs no allocation at all.
+		RequirePlpWireBytes(utf16_byte_len, "nvarchar(max)");
 		const size_t start = buf.size();
 		buf.resize(start + 8 + 4 + utf16_byte_len + 4);
 		uint8_t *out = buf.data() + start;
@@ -541,6 +548,27 @@ void DecodeChunkImpl(const staging::ColumnStaging &st, idx_t count, Vector &out)
 
 }  // namespace
 
+const char *MaxTypeName(VarKind kind) {
+	switch (kind) {
+	case VarKind::NVarchar:
+		return "nvarchar(max)";
+	case VarKind::Utf8Varchar:
+		return "varchar(max)";
+	default:
+		return "varbinary(max)";
+	}
+}
+
+void RequirePlpWireBytes(size_t wire_bytes, const char *what) {
+	if (wire_bytes > MAX_PLP_WIRE_BYTES) {
+		throw InvalidInputException(
+			"MSSQL: a %s value of %llu bytes is past SQL Server's %llu-byte maximum for a MAX-typed "
+			"column. SQL Server could not store it, and the PLP chunk length on the wire is four bytes, "
+			"so sending it would declare a truncated length and desync the session.",
+			what, static_cast<unsigned long long>(wire_bytes), static_cast<unsigned long long>(MAX_PLP_WIRE_BYTES));
+	}
+}
+
 //===--------------------------------------------------------------------===//
 // Column plan for the columnar scatter (spec 057 step 3)
 //
@@ -643,6 +671,10 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 	// with no bound by definition — fail as an overflow.
 	const uint32_t bound = plan.plp ? 0xFFFFFFFFu : col.max_length;
 	bool over = false;
+	// A MAX column has no bound to clamp to, so an over-large value there has to
+	// be REFUSED rather than fitted; `worst` names it in the message.
+	bool past_max = false;
+	size_t worst = 0;
 	// A COLUMN property, so the scatter decides once which encoder to run rather
 	// than testing per value. A mixed column still skips the measuring call on
 	// its ASCII values here; only the scatter falls back wholesale.
@@ -657,9 +689,12 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 			continue;
 		}
 		const auto &sv = strings[idx];
-		uint32_t len;
+		// The TRUE payload length, in 64 bits. Every narrowing below happens
+		// AFTER the comparisons that matter -- see PlanOneLength in the header
+		// for what the pre-#490-review arithmetic did instead.
+		size_t wide;
 		if (plan.kind != VarKind::NVarchar) {
-			len = static_cast<uint32_t>(sv.GetSize());
+			wide = sv.GetSize();
 		} else if (ascii && IsAsciiRun(sv.GetData(), sv.GetSize())) {
 			// ASCII is valid UTF-8 by definition and encodes to exactly two bytes
 			// per character, so the length is KNOWN rather than measured and this
@@ -669,7 +704,10 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 			// answer the test never runs again. Without it a fully non-ASCII
 			// column paid the scan on every value for a question already
 			// answered, measured at +10% there; with it, +2%.
-			len = static_cast<uint32_t>(sv.GetSize()) * 2;
+			// Widened BEFORE the multiply: `static_cast<uint32_t>(size) * 2`
+			// multiplies in uint32 and wraps at a 2 GiB source. The one-line
+			// helper is what the test can pin.
+			wide = PlannedNVarcharBytes(sv.GetSize());
 		} else {
 			ascii = false;
 			bool valid = false;
@@ -679,13 +717,19 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 				// reproduces pre-spec-043 bytes exactly. Not worth planning around.
 				return false;
 			}
-			len = static_cast<uint32_t>(u16);
+			wide = u16;
 		}
+		const PlannedLength planned = PlanOneLength(wide, bound, plan.plp);
+		const uint32_t len = planned.stored;
 		plan.lengths[r] = len;
-		// An OR reduction, not a branch: the loop stays vectorisable and only the
-		// accumulated answer is examined, once, after it. Same shape as the
-		// integer range check on the conversion arm.
-		over |= (len > bound);
+		// OR reductions, not branches: the loop stays vectorisable and only the
+		// accumulated answers are examined, once, after it. Same shape as the
+		// integer range check on the conversion arm. `over` now sees the TRUE
+		// length, so a value that wrapped to something small can no longer skip
+		// the clamp, and `past_max` carries the MAX-column ceiling.
+		over |= planned.over_bound;
+		past_max |= planned.past_max;
+		worst = worst > wide ? worst : wide;
 		if (!plan.plp) {
 			plan.wire[r] = 2 + len;
 		} else if (len == 0) {
@@ -696,6 +740,14 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 		}
 	}
 	plan.all_ascii = ascii && plan.kind == VarKind::NVarchar;
+	// Before the clamp and before any caller sizes a buffer from `plan.wire`:
+	// this is the columnar twin of the row path's guard, and the path COPY,
+	// CTAS and INSERT-via-BCP actually take for a valid nvarchar(max) value
+	// (the row path is reached only when PlanColumn returns false, i.e. for
+	// invalid UTF-8). Review of PR #490.
+	if (past_max) {
+		RequirePlpWireBytes(worst, MaxTypeName(plan.kind));
+	}
 	if (over) {
 		ClampToBound(fmt, row_begin, rows, bound, plan, strings);
 	}
@@ -873,6 +925,11 @@ void EncodeVarcharUtf8(const char *utf8_data, size_t utf8_len, const mssql::BCPC
 	}
 
 	if (col.IsPLPType()) {
+		// Issue #489. This path cannot truncate -- a DuckDB string_t length is
+		// uint32, so utf8_len never reaches 2^32 -- but a value past 2^31-1 is
+		// still more than SQL Server stores, and refusing here names the size
+		// instead of leaving the server to reject the batch.
+		RequirePlpWireBytes(utf8_len, "varchar(max)");
 		const size_t start = buf.size();
 		buf.resize(start + 8 + (utf8_len > 0 ? 4 + utf8_len : 0) + 4);
 		uint8_t *out = buf.data() + start;

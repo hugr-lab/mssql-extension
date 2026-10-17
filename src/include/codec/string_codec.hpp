@@ -134,6 +134,26 @@ size_t Utf16ByteLength(const std::string &utf8);
 // String-family text logic.
 std::string EscapeSqlSingleQuotes(const std::string &str);
 
+//! The most wire bytes a MAX-typed value may carry (issue #489).
+//!
+//! SQL Server stores at most 2^31-1 bytes in a varchar(max) / nvarchar(max) /
+//! varbinary(max) column, and the PLP chunk length on the wire is FOUR bytes —
+//! so this bound is both the server's limit and what keeps the length field
+//! from wrapping. A value past it used to be framed with `length mod 2^32`
+//! while every byte was still written, which desynced the session (the #323
+//! class: "Unknown token type", or a hang) instead of failing.
+//!
+//! Only the nvarchar path can actually reach it: a DuckDB `string_t` length is
+//! uint32, so UTF-8 bytes cannot pass 2^32, but UTF-16 doubles ASCII.
+static const size_t MAX_PLP_WIRE_BYTES = 2147483647ULL;
+
+//! Throw unless `wire_bytes` fits MAX_PLP_WIRE_BYTES. `what` names the wire
+//! type for the message ("nvarchar(max)", "varchar(max)").
+//!
+//! Exposed so the bound is testable without building a 2 GiB value: the
+//! regression test drives this predicate with plain numbers.
+void RequirePlpWireBytes(size_t wire_bytes, const char *what);
+
 //! Per-column measurement for the columnar scatter (spec 057 step 3).
 //!
 //! `lengths[r]` is the PAYLOAD byte count row r will occupy on the wire — UTF-16
@@ -145,6 +165,57 @@ std::string EscapeSqlSingleQuotes(const std::string &str);
 //! nvarchar bounds UTF-16 code units, a UTF-8 varchar bounds bytes, and binary
 //! bounds bytes with no character boundary to respect.
 enum class VarKind : uint8_t { NVarchar, Utf8Varchar, Binary };
+
+//! The name a MAX-typed column of this kind carries in a refusal message.
+const char *MaxTypeName(VarKind kind);
+
+//! What planning decides about ONE value, in 64-bit arithmetic.
+//!
+//! Extracted from PlanColumn's loop so the arithmetic is testable with numbers:
+//! the loop cannot be driven with a 2 GiB string, which is exactly how the
+//! narrowing below went unnoticed (review of PR #490).
+//!
+//! `wide` is the TRUE payload length -- UTF-16 bytes for an nvarchar target,
+//! source bytes otherwise. It used to be computed as
+//! `static_cast<uint32_t>(sv.GetSize()) * 2`, narrowing BEFORE the multiply, so
+//! it wrapped at a 2 GiB source; the wrapped value then drove all three of the
+//! bound comparison that triggers the clamp, the stored payload length, and the
+//! wire size the chunk buffer is built from. On the non-ASCII arm that was a
+//! client-side heap overflow, not merely a truncated value.
+struct PlannedLength {
+	//! PLP only: past MAX_PLP_WIRE_BYTES, so the value must be refused before
+	//! anything downstream sizes a buffer from it.
+	bool past_max;
+	//! Bounded column: the clamp has to run. Decided on the TRUE length, so a
+	//! value that wrapped to something small is no longer waved through.
+	bool over_bound;
+	//! What goes into `StringColumnPlan::lengths` -- saturated, never wrapped.
+	//! Provisional for an over-bound value: ClampToBound rewrites both
+	//! `lengths` and `wire` before either is read.
+	uint32_t stored;
+};
+
+//! UTF-16 payload bytes for an ASCII source of `source_bytes` bytes.
+//!
+//! One line, and it exists to be TESTABLE: the bug the review of PR #490 found
+//! was `static_cast<uint32_t>(sv.GetSize()) * 2` -- the narrowing applied to the
+//! operand, so the multiply happened in uint32 and wrapped at a 2 GiB source.
+//! Writing it here means a test can assert that 2^31 bytes gives 2^32 and not 0,
+//! which no test driving PlanColumn could do: that needs a 2 GiB string.
+inline size_t PlannedNVarcharBytes(size_t source_bytes) {
+	return source_bytes * 2;
+}
+
+//! `bound` is the column's declared payload bound, or 0xFFFFFFFF for a MAX
+//! column (which has none); `plp` selects the MAX_PLP_WIRE_BYTES ceiling.
+inline PlannedLength PlanOneLength(size_t wide, uint32_t bound, bool plp) {
+	PlannedLength out;
+	out.past_max = plp && wide > MAX_PLP_WIRE_BYTES;
+	out.over_bound = wide > static_cast<size_t>(bound);
+	const size_t saturated = wide > 0xFFFFFFFFULL ? 0xFFFFFFFFULL : wide;
+	out.stored = static_cast<uint32_t>(saturated);
+	return out;
+}
 
 struct StringColumnPlan {
 	//! Payload bytes per row — UTF-16 for nvarchar, source bytes otherwise, 0 for
