@@ -548,6 +548,17 @@ void DecodeChunkImpl(const staging::ColumnStaging &st, idx_t count, Vector &out)
 
 }  // namespace
 
+const char *MaxTypeName(VarKind kind) {
+	switch (kind) {
+	case VarKind::NVarchar:
+		return "nvarchar(max)";
+	case VarKind::Utf8Varchar:
+		return "varchar(max)";
+	default:
+		return "varbinary(max)";
+	}
+}
+
 void RequirePlpWireBytes(size_t wire_bytes, const char *what) {
 	if (wire_bytes > MAX_PLP_WIRE_BYTES) {
 		throw InvalidInputException(
@@ -660,6 +671,10 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 	// with no bound by definition — fail as an overflow.
 	const uint32_t bound = plan.plp ? 0xFFFFFFFFu : col.max_length;
 	bool over = false;
+	// A MAX column has no bound to clamp to, so an over-large value there has to
+	// be REFUSED rather than fitted; `worst` names it in the message.
+	bool past_max = false;
+	size_t worst = 0;
 	// A COLUMN property, so the scatter decides once which encoder to run rather
 	// than testing per value. A mixed column still skips the measuring call on
 	// its ASCII values here; only the scatter falls back wholesale.
@@ -674,9 +689,12 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 			continue;
 		}
 		const auto &sv = strings[idx];
-		uint32_t len;
+		// The TRUE payload length, in 64 bits. Every narrowing below happens
+		// AFTER the comparisons that matter -- see PlanOneLength in the header
+		// for what the pre-#490-review arithmetic did instead.
+		size_t wide;
 		if (plan.kind != VarKind::NVarchar) {
-			len = static_cast<uint32_t>(sv.GetSize());
+			wide = sv.GetSize();
 		} else if (ascii && IsAsciiRun(sv.GetData(), sv.GetSize())) {
 			// ASCII is valid UTF-8 by definition and encodes to exactly two bytes
 			// per character, so the length is KNOWN rather than measured and this
@@ -686,7 +704,10 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 			// answer the test never runs again. Without it a fully non-ASCII
 			// column paid the scan on every value for a question already
 			// answered, measured at +10% there; with it, +2%.
-			len = static_cast<uint32_t>(sv.GetSize()) * 2;
+			// Widened BEFORE the multiply: `static_cast<uint32_t>(size) * 2`
+			// multiplies in uint32 and wraps at a 2 GiB source. The one-line
+			// helper is what the test can pin.
+			wide = PlannedNVarcharBytes(sv.GetSize());
 		} else {
 			ascii = false;
 			bool valid = false;
@@ -696,13 +717,19 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 				// reproduces pre-spec-043 bytes exactly. Not worth planning around.
 				return false;
 			}
-			len = static_cast<uint32_t>(u16);
+			wide = u16;
 		}
+		const PlannedLength planned = PlanOneLength(wide, bound, plan.plp);
+		const uint32_t len = planned.stored;
 		plan.lengths[r] = len;
-		// An OR reduction, not a branch: the loop stays vectorisable and only the
-		// accumulated answer is examined, once, after it. Same shape as the
-		// integer range check on the conversion arm.
-		over |= (len > bound);
+		// OR reductions, not branches: the loop stays vectorisable and only the
+		// accumulated answers are examined, once, after it. Same shape as the
+		// integer range check on the conversion arm. `over` now sees the TRUE
+		// length, so a value that wrapped to something small can no longer skip
+		// the clamp, and `past_max` carries the MAX-column ceiling.
+		over |= planned.over_bound;
+		past_max |= planned.past_max;
+		worst = worst > wide ? worst : wide;
 		if (!plan.plp) {
 			plan.wire[r] = 2 + len;
 		} else if (len == 0) {
@@ -713,6 +740,14 @@ bool PlanColumn(Vector &in, const UnifiedVectorFormat &fmt, idx_t row_begin, idx
 		}
 	}
 	plan.all_ascii = ascii && plan.kind == VarKind::NVarchar;
+	// Before the clamp and before any caller sizes a buffer from `plan.wire`:
+	// this is the columnar twin of the row path's guard, and the path COPY,
+	// CTAS and INSERT-via-BCP actually take for a valid nvarchar(max) value
+	// (the row path is reached only when PlanColumn returns false, i.e. for
+	// invalid UTF-8). Review of PR #490.
+	if (past_max) {
+		RequirePlpWireBytes(worst, MaxTypeName(plan.kind));
+	}
 	if (over) {
 		ClampToBound(fmt, row_begin, rows, bound, plan, strings);
 	}
