@@ -22,16 +22,35 @@ namespace azure {
 //===----------------------------------------------------------------------===//
 // TruncateToken - Format token for display
 //
-// Returns: first 10 chars + "..." + last 3 chars + " [N chars]"
-// Example: "eyJ0eXAi...xyz [1847 chars]"
+// Returns: first 10 chars + "... [N chars]"
+// Example: "eyJ0eXAiOi... [1847 chars]"
+//
+// The prefix and the length, and nothing else (issue #492). Every Azure AD JWT
+// begins "eyJ0eXAiOi" -- base64 of `{"typ":"` -- so the prefix only confirms
+// the shape, and the LENGTH is the diagnostic that distinguishes a real token
+// from a truncated or empty one.
+//
+// This used to append the last three characters as well, and to return a token
+// of 16 characters or fewer verbatim. Three characters are not a practical
+// attack on the signature, but they were the only part of the output derived
+// from the secret, they bought nothing diagnostically, and this value goes into
+// a QUERY RESULT: terminal scrollback, CI logs, screenshots, shared notebooks.
+// The short-token branch could not be a real JWT at all.
 //===----------------------------------------------------------------------===//
 static std::string TruncateToken(const std::string &token) {
-	if (token.length() <= 16) {
-		return token;
+	if (token.empty()) {
+		return "[empty]";
+	}
+	// The prefix is only safe to show BECAUSE it is boilerplate, so show it only
+	// when it actually is: a JWT begins "eyJ" (base64 of `{"`). An opaque token
+	// gets its length and nothing else -- ten characters of a 17-character
+	// secret is a real fraction of it, which the JWT argument does not cover.
+	const bool looks_like_a_jwt = token.rfind("eyJ", 0) == 0;
+	if (!looks_like_a_jwt || token.length() <= 16) {
+		return "[" + std::to_string(token.length()) + " chars]";
 	}
 
-	return token.substr(0, 10) + "..." + token.substr(token.length() - 3) + " [" + std::to_string(token.length()) +
-		   " chars]";
+	return token.substr(0, 10) + "... [" + std::to_string(token.length()) + " chars]";
 }
 
 //===----------------------------------------------------------------------===//
