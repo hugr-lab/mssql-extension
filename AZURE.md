@@ -352,7 +352,7 @@ Test your Azure credentials without connecting to a database:
 
 ```sql
 SELECT mssql_azure_auth_test('my_azure_secret');
--- Returns: eyJ0eXAiOi...gJw [1634 chars]
+-- Returns: eyJ0eXAiOi... [1634 chars]
 
 -- For interactive auth, pass tenant_id:
 SELECT mssql_azure_auth_test('azure_interactive', 'your-tenant-id');

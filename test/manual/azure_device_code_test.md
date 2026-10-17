@@ -90,7 +90,7 @@ SELECT mssql_azure_auth_test('my_interactive_azure');
    ┌───────────────────────────────────────────┐
    │ mssql_azure_auth_test('my_interactive_azure') │
    ├───────────────────────────────────────────┤
-   │ eyJ0eXAi...xyz [1847 chars]               │
+   │ eyJ0eXAiOi... [1847 chars]                │
    └───────────────────────────────────────────┘
    ```
 
