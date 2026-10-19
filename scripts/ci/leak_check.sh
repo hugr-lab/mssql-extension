@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# LeakSanitizer over the DuckDB-FREE fuzz harnesses' stored corpora.
+# LeakSanitizer over the DuckDB-FREE fuzz harnesses: their stored seed corpora
+# plus a deterministic generated corpus, replayed cumulatively in one process.
 #
 # WHY THIS SET, AND WHY IT NEEDS NO SUPPRESSIONS
 #
@@ -30,9 +31,11 @@
 # ASAN_OPTIONS, and finding no leak looks identical either way). Two reasons to
 # have this regardless:
 #
-#   1. It is CUMULATIVE. A corpus replay checks once, at exit, over thousands of
-#      inputs in one process -- which catches the slow drip that a per-input
-#      check resets away. Different question, different answer.
+#   1. It is CUMULATIVE. One process, ~4000 inputs per harness, and the leak
+#      verdict taken once at exit -- which catches the slow drip that a
+#      per-input check resets away. Different question, different answer.
+#      (The stored seeds alone are only ~30 inputs in total, which is why
+#      this lane generates its own corpus; see GEN_PER_TARGET below.)
 #   2. It is VISIBLE. Whether leak detection runs stops depending on a third
 #      party's defaults and becomes something this repo states and can be read
 #      off a job name.
@@ -81,6 +84,78 @@ echo "== Building the DuckDB-free harnesses as replay executables (ASan + UBSan 
 # what makes the leak check cumulative.
 REPLAY=1 TARGETS="${TARGETS[*]}" OUT="$LEAK_OUT" WORK="$LEAK_WORK" bash fuzz/build.sh
 
+# How many generated inputs to replay per harness, on top of the stored corpus.
+#
+# WHY GENERATE AT ALL: the whole argument for this lane over ClusterFuzzLite's
+# per-input leak check is that it is CUMULATIVE -- one process, many inputs, so a
+# slow drip shows up where a per-input check resets it away. But the repo tracks
+# only SEED corpora: 4 to 9 files per harness, 30 in total. At thirty inputs
+# "cumulative" is not a meaningful claim, it is a smoke test. ClusterFuzzLite's
+# own accumulated corpus for fuzz_tds_tokens alone is ~15k elements, but that
+# lives in CFLite storage and is not retrievable here without reimplementing its
+# corpus plumbing.
+#
+# So the lane generates its own. These are byte-stream parsers whose entire
+# contract is to survive arbitrary bytes from a hostile server, so pseudo-random
+# input is not a toy here -- it is the threat model. A FIXED SEED keeps a failure
+# reproducible, which is the one property a generated corpus must have to be
+# worth anything in CI.
+GEN_PER_TARGET="${GEN_PER_TARGET:-4000}"
+GEN_SEED="${GEN_SEED:-20261019}"
+
+echo
+echo "== Generating ${GEN_PER_TARGET} deterministic inputs per harness (seed ${GEN_SEED}) =="
+python3 - "$LEAK_WORK" "$GEN_PER_TARGET" "$GEN_SEED" "${TARGETS[@]}" <<'PY'
+import os
+import random
+import sys
+
+work, n, seed = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+targets = sys.argv[4:]
+
+for t in targets:
+    rnd = random.Random(f"{seed}:{t}")
+    outdir = os.path.join(work, "gen", t)
+    os.makedirs(outdir, exist_ok=True)
+    # Start from the stored seeds so generated inputs include MUTATIONS of
+    # structurally valid ones, not only noise. A token stream that parses far
+    # enough to allocate is where a leak would live; pure noise mostly dies at
+    # the first length check.
+    seeds = []
+    src = os.path.join("fuzz", "corpus", t)
+    if os.path.isdir(src):
+        for fn in sorted(os.listdir(src)):
+            p = os.path.join(src, fn)
+            if os.path.isfile(p):
+                with open(p, "rb") as fh:
+                    seeds.append(bytearray(fh.read()))
+    for i in range(n):
+        if seeds and rnd.random() < 0.7:
+            b = bytearray(rnd.choice(seeds))
+            for _ in range(rnd.randint(1, 8)):
+                if not b:
+                    break
+                op = rnd.randrange(4)
+                if op == 0:
+                    b[rnd.randrange(len(b))] = rnd.randrange(256)
+                elif op == 1 and len(b) > 1:
+                    del b[rnd.randrange(len(b))]
+                elif op == 2:
+                    b.insert(rnd.randrange(len(b) + 1), rnd.randrange(256))
+                else:
+                    # Declared lengths are where the bugs have been (#183 ERROR
+                    # token MsgText, #185 FEDAUTHINFO overflow), so bias toward
+                    # writing 0xFF runs over them.
+                    at = rnd.randrange(len(b))
+                    for k in range(min(4, len(b) - at)):
+                        b[at + k] = 0xFF
+        else:
+            b = bytearray(rnd.randrange(256) for _ in range(rnd.randrange(1, 4096)))
+        with open(os.path.join(outdir, f"g{i:05d}"), "wb") as fh:
+            fh.write(bytes(b))
+    print(f"  {t}: {n} generated")
+PY
+
 echo
 echo "== Replaying each corpus with detect_leaks=1 =="
 failed=()
@@ -97,15 +172,28 @@ for t in "${TARGETS[@]}"; do
 		echo "  SKIP  fuzz_${t}: no stored corpus at ${corpus}/"
 		continue
 	fi
-	n=$(find "$corpus" -maxdepth 1 -type f | wc -l | tr -d ' ')
-	printf '  %-24s %4s input(s) ... ' "fuzz_${t}" "$n"
+	gen="${LEAK_WORK}/gen/${t}"
+	stored=$(find "$corpus" -maxdepth 1 -type f | wc -l | tr -d ' ')
+	generated=0
+	gen_arg=()
+	if [ -d "$gen" ]; then
+		generated=$(find "$gen" -maxdepth 1 -type f | wc -l | tr -d ' ')
+		# Guard on the COUNT, not on the string: `${generated:+...}` expands for
+		# the string "0" too, which would hand the replay an empty directory and
+		# make it exit 2 ("nothing to replay") on a clean run.
+		[ "$generated" -gt 0 ] && gen_arg=("$gen")
+	fi
+	printf '  %-24s %5s stored + %5s generated ... ' "fuzz_${t}" "$stored" "$generated"
+	# BOTH sets in ONE process, which is what makes the check cumulative: the
+	# leak verdict is taken once, at exit, after every input has run.
+	#
 	# detect_leaks=1 is the point. The harnesses swallow std::exception by
 	# design (malformed input is expected), so a non-zero exit here is a
 	# sanitizer verdict -- a leak, an overflow or a UB report -- never a
 	# rejected input.
 	if ASAN_OPTIONS=detect_leaks=1:abort_on_error=0 \
 		UBSAN_OPTIONS=print_stacktrace=1 \
-		"./$bin" "$corpus" >"${LEAK_WORK}/leak_${t}.log" 2>&1; then
+		"./$bin" "$corpus" ${gen_arg[@]+"${gen_arg[@]}"} >"${LEAK_WORK}/leak_${t}.log" 2>&1; then
 		echo "clean"
 	else
 		echo "FAILED"
