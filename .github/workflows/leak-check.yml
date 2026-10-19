@@ -16,24 +16,40 @@ name: Leak check (LeakSanitizer)
 #     one process, which is a different question from libFuzzer's per-input leak
 #     check and catches the slow drip that resets away.
 #
-# WHY workflow_dispatch AND schedule, NOT pull_request (yet)
+# SCOPE OF THE PR TRIGGER
 #
-# This lane has never run on this codebase. Whether src/tds/ is leak-free under
-# a cumulative check is unknown until it runs once, and `utf16.cpp`'s retained
-# per-thread scratch buffer is a plausible benign report that would need a
-# reviewed suppression rather than a code change. Gating every PR on an
-# unvalidated check would redden other people's work to answer our question.
+# `paths` mirrors cflite-pr.yml's: this lane can only say something about the
+# parsing layer the harnesses link, so it runs when that layer, the harnesses or
+# this lane itself change -- and stays out of the way of every other PR. A
+# change to the catalog or the DML paths cannot move its result, so gating it
+# there would only add wall-clock and a chance to be flaky at someone else's
+# expense.
 #
-# So: dispatch it, read the result, triage anything it finds, and only then add
-# `pull_request` to these triggers. The weekly cron keeps it honest in the
-# meantime -- src/tds/ changes rarely, and a leak introduced there would be
-# caught within the week rather than never.
+# This lane had never run on this codebase when it was written, and it could not
+# be validated locally: Apple's toolchain ships no LSan, and the Linux container
+# attempts were killed for host memory. The PR trigger IS the validation -- on
+# the PR that introduces it, which is the right place for an unproven check to
+# be red. `utf16.cpp`'s retained per-thread scratch buffer is a plausible BENIGN
+# report, and if it fires it wants a reviewed suppression rather than a code
+# change.
+#
+# The weekly cron covers the rest: src/tds/ changes rarely, so a leak introduced
+# by something outside `paths` still surfaces within the week rather than never.
 
 on:
+  pull_request:
+    paths:
+      - 'src/tds/**'
+      - 'src/include/tds/**'
+      - 'src/connection/instance_resolver.cpp'
+      - 'fuzz/**'
+      - 'scripts/ci/leak_check.sh'
+      - '.github/workflows/leak-check.yml'
   workflow_dispatch:
   schedule:
     # Weekly, offset from the other security crons (security-scan 05:17 Mon,
-    # codeql 04:32 Mon) so they do not contend for runners.
+    # codeql 04:32 Mon, cflite ubsan 03:47 Mon) so they do not contend for
+    # runners.
     - cron: '41 6 * * 1'
 
 permissions:
