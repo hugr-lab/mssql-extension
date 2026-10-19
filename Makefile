@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell help
+.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -1263,6 +1263,33 @@ joern-scan:
 joern-shell:
 	$(PROJ_DIR)joern/shell.sh $(JOERN_SCOPE)
 
+# fuzz/fuzz_bcp_encode in REPLAY mode: the BCP/PLP WRITE path, replayed over its
+# stored corpus under ASan + UBSan. Seconds, and no fuzzing engine needed — which
+# is what makes it runnable here at all (Apple's toolchain ships no libFuzzer
+# runtime) and on any CI box that has already built DuckDB.
+#
+# Three oracles beyond the sanitizers: the frame must account for itself, the row
+# and columnar paths must agree byte for byte, and the payload must decode back
+# to a prefix of the source. See fuzz/README.md. This is a REGRESSION run over
+# what a campaign already found; discovery still belongs in fuzz/run.sh's AFL++
+# container. Needs a built libduckdb, so it depends on `release`.
+#
+# FUZZ_REPLAY_SANITIZE=0 drops ASan/UBSan, for a host whose ASan cannot start a
+# process at all (the same escape hatch STAGING_TEST_SANITIZE carries above).
+FUZZ_REPLAY_SANITIZE ?= 1
+FUZZ_DUCKDB_LIB := build/release/src
+
+fuzz-encode-replay: release
+	@echo "Building fuzz_bcp_encode (replay mode, ASan+UBSan=$(FUZZ_REPLAY_SANITIZE))..."
+	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) \
+	    MSSQL_DUCKDB_INC=duckdb/src/include \
+	    MSSQL_DUCKDB_LIB=$(FUZZ_DUCKDB_LIB) \
+	    TARGETS=bcp_encode $(PROJ_DIR)fuzz/build.sh
+	@echo ""
+	@echo "Replaying the BCP/PLP encode corpus..."
+	DYLD_LIBRARY_PATH=$(FUZZ_DUCKDB_LIB) LD_LIBRARY_PATH=$(FUZZ_DUCKDB_LIB) \
+	    $(PROJ_DIR)fuzz/out/fuzz_bcp_encode $(PROJ_DIR)fuzz/corpus/bcp_encode
+
 # Show help
 help:
 	@echo "DuckDB MSSQL Extension Build System"
@@ -1281,6 +1308,7 @@ help:
 	@echo "  make joern-cpg            - Build a Joern CPG of the TDS parsing surface (JOERN_SCOPE=all for src/)"
 	@echo "  make joern-scan           - Run the Joern query suite (JOERN_QUERY=q3 for one query)"
 	@echo "  make joern-shell          - Open the Joern REPL on the CPG"
+	@echo "  make fuzz-encode-replay   - Replay the BCP/PLP encode corpus under ASan+UBSan (fuzz/README.md)"
 	@echo "  make test-all             - Run all tests"
 	@echo "  make test-debug           - Run tests with debug build"
 	@echo "  make test-simple-query    - Run C++ simple query test"
