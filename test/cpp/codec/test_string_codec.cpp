@@ -22,10 +22,15 @@
 #include "codec/literal_context.hpp"
 #include "codec/string_codec.hpp"
 #include "codec/type_family.hpp"
+#include "copy/target_resolver.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
+#include "tds/tds_types.hpp"
 
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -354,6 +359,142 @@ void TestPlanOneLength() {
 	}
 }
 
+//===----------------------------------------------------------------------===//
+// A PLP value carrying no payload frames in TWELVE bytes, not sixteen.
+//
+// Found by fuzz/fuzz_bcp_encode (oracle A, "the frame must account for itself")
+// on its first campaign, from a one-byte input.
+//
+// A PLP value is an 8-byte UNKNOWN-length header, then chunks, then a 4-byte
+// terminator -- and a chunk length of ZERO *is* the terminator. So there is no
+// such thing as a zero-length chunk: writing one and a terminator after it
+// emits 16 bytes for a value that ends at 12, and the four stray bytes are read
+// by the server as the next column or the next token (a desync, the #323
+// class: "Unknown token type", or a hang).
+//
+// AppendNVarcharPlp's zero-guard tested the INPUT length, but only the encode
+// knows the PAYLOAD length -- and the legacy fallback that path exists for
+// emits nothing at all for an invalid or truncated lead byte. So a non-empty
+// value could reach the frame with no payload. Its two siblings always keyed on
+// the encoded length and were never wrong (EncodeBinaryPLP's
+// `if (chunk_len > 0)`, AppendNVarcharNonPlp's `resize(2 + utf16_len)`).
+//
+// The assertions below are on the WIRE BYTES, because that is what the bug was:
+// nothing about the value, the length or the type was observably wrong on the
+// client side.
+//===----------------------------------------------------------------------===//
+
+//! The bytes `value` occupies on the wire against an nvarchar(max) column.
+//!
+//! Driven through the VECTOR overload, not the Value one, and that is the whole
+//! point: `duckdb::Value(std::string)` VALIDATES, throwing "Invalid unicode
+//! (byte sequence mismatch) detected in value construction", so a Value can
+//! never carry the invalid UTF-8 this bug needs. A Vector can -- and does:
+//! `StringVector::AddString` performs no validation, and per issue #224 this
+//! extension's own read path hands a non-UTF-8-collation column's bytes to a
+//! DuckDB VARCHAR verbatim (documented rather than enforced, because validating
+//! would cost the scan's hot path). That is what makes the cold path in
+//! EncodeNVarcharFromUtf8 reachable at all, and it is the path COPY / INSERT
+//! take.
+duckdb::vector<uint8_t> EncodeNVarcharMax(const std::string &value) {
+	duckdb::Vector vec(LogicalType::VARCHAR, 1);
+	auto *slots = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vec);
+	slots[0] = duckdb::StringVector::AddString(vec, value.data(), value.size());
+	duckdb::UnifiedVectorFormat fmt;
+	vec.ToUnifiedFormat(fmt);
+
+	duckdb::mssql::BCPColumnMetadata col;
+	col.name = "c0";
+	col.tds_type_token = duckdb::tds::TDS_TYPE_NVARCHAR;
+	col.max_length = 0xFFFF;  // the PLP sentinel: nvarchar(max)
+	col.duckdb_type = LogicalType::VARCHAR;
+	duckdb::vector<uint8_t> buf;
+	duckdb::mssql::codec::string::EncodeToBcp(vec, fmt, 0, col, buf);
+	return buf;
+}
+
+uint32_t ChunkLengthAt8(const duckdb::vector<uint8_t> &buf) {
+	return static_cast<uint32_t>(buf[8]) | (static_cast<uint32_t>(buf[9]) << 8) |
+		   (static_cast<uint32_t>(buf[10]) << 16) | (static_cast<uint32_t>(buf[11]) << 24);
+}
+
+//! The 8-byte UNKNOWN-length header every PLP value opens with.
+bool HasPlpHeader(const duckdb::vector<uint8_t> &buf) {
+	if (buf.size() < 8) {
+		return false;
+	}
+	if (buf[0] != 0xFE) {
+		return false;
+	}
+	for (int i = 1; i < 8; i++) {
+		if (buf[i] != 0xFF) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void TestPlpEmptyFrameIsTwelveBytes() {
+	std::cout << "Test: a PLP value with no payload frames in 12 bytes, not 16\n";
+
+	// The reference points: an empty value, and a value that really does carry
+	// a payload. Neither changed.
+	{
+		const auto empty = EncodeNVarcharMax(std::string());
+		CHECK_TRUE(HasPlpHeader(empty));
+		CHECK_EQ(empty.size(), static_cast<size_t>(12));
+		CHECK_EQ(ChunkLengthAt8(empty), static_cast<uint32_t>(0));
+	}
+	{
+		const auto ab = EncodeNVarcharMax("ab");
+		CHECK_TRUE(HasPlpHeader(ab));
+		// header(8) + chunk length(4) + 'a\0b\0'(4) + terminator(4)
+		CHECK_EQ(ab.size(), static_cast<size_t>(20));
+		CHECK_EQ(ChunkLengthAt8(ab), static_cast<uint32_t>(4));
+	}
+
+	// The regression. Each of these is NON-empty UTF-8 that the legacy encoder
+	// turns into zero UTF-16 bytes:
+	//   "\xFF"      an invalid lead byte      -> the loop's `else` arm, i += 1
+	//   "\xE0"      a 3-byte lead, truncated  -> `i + 2 >= input_len`, break
+	//   "\xE0\x28"  the same, still truncated -> break
+	// Before the fix every one of them produced a 16-byte frame declaring a
+	// zero-length chunk: four stray bytes on the wire.
+	const char *const names[] = {"single invalid lead 0xFF", "truncated 3-byte lead 0xE0", "0xE0 0x28"};
+	const std::string encodes_to_nothing[] = {std::string("\xFF", 1), std::string("\xE0", 1),
+											  std::string("\xE0\x28", 2)};
+	for (int i = 0; i < 3; i++) {
+		const auto buf = EncodeNVarcharMax(encodes_to_nothing[i]);
+		std::cout << "    " << names[i] << ": " << buf.size() << " bytes\n";
+		CHECK_TRUE(HasPlpHeader(buf));
+		// THE assertion. 16 before the fix.
+		CHECK_EQ(buf.size(), static_cast<size_t>(12));
+		CHECK_EQ(ChunkLengthAt8(buf), static_cast<uint32_t>(0));
+	}
+
+	// And the invariant behind all of it, stated once: a frame whose chunk
+	// length is zero is a frame of exactly 12 bytes. This is what oracle A in
+	// fuzz_bcp_encode checks on every value it generates.
+	const std::string every[] = {std::string(),
+								 std::string("a"),
+								 std::string("ab"),
+								 std::string("\xFF", 1),
+								 std::string("\xE0", 1),
+								 std::string("\xE0\x28", 2),
+								 std::string("\xC3\xA9", 2),
+								 std::string("\xF0\x9D\x84\x9E", 4)};
+	for (const auto &v : every) {
+		const auto buf = EncodeNVarcharMax(v);
+		CHECK_TRUE(buf.size() >= 12);
+		if (ChunkLengthAt8(buf) == 0) {
+			CHECK_EQ(buf.size(), static_cast<size_t>(12));
+		} else {
+			// Otherwise: header + length + payload + terminator, exactly.
+			CHECK_EQ(buf.size(), static_cast<size_t>(16) + ChunkLengthAt8(buf));
+		}
+	}
+}
+
 int main() {
 	TestFormatSqlLiteralByteIdentity();
 	TestFormatSqlLiteralEscapeContract();
@@ -364,6 +505,7 @@ int main() {
 	TestNullLiteral();
 	TestPlpWireByteBound();
 	TestPlanOneLength();
+	TestPlpEmptyFrameIsTwelveBytes();
 
 	if (failures > 0) {
 		std::cerr << "\n" << failures << " assertion(s) failed.\n";

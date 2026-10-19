@@ -171,15 +171,27 @@ void WritePlpHeader(uint8_t *out) {
 	}
 }
 
+// The frame for a PLP value carrying NO payload: the 8-byte UNKNOWN-length
+// header and the 4-byte terminator, nothing between.
+//
+// There is no such thing as a zero-length PLP chunk: a chunk length of zero IS
+// the terminator. So writing a zero chunk length AND a terminator after it
+// leaves four stray bytes past the end of the value, which the server reads as
+// the next column or the next token -- a session desync, the #323 class. Both
+// callers below route through here rather than laying the bytes out themselves,
+// for the same reason WriteLe32/WritePlpHeader exist: one place, no drift.
+void AppendEmptyPlp(duckdb::vector<uint8_t> &buf) {
+	const size_t start_pos = buf.size();
+	buf.resize(start_pos + 8 + 4);
+	WritePlpHeader(buf.data() + start_pos);
+	WriteLe32(buf.data() + start_pos + 8, 0);
+}
+
 // Append a PLP-framed nvarchar(max) payload to `buf`. Mirrors
 // BCPRowEncoder::EncodeNVarcharPLP bit-for-bit.
 void AppendNVarcharPlp(duckdb::vector<uint8_t> &buf, const char *input, size_t input_len) {
 	if (input_len == 0) {
-		// Empty value: header + zero terminator, no data chunk.
-		const size_t start_pos = buf.size();
-		buf.resize(start_pos + 8 + 4);
-		WritePlpHeader(buf.data() + start_pos);
-		WriteLe32(buf.data() + start_pos + 8, 0);
+		AppendEmptyPlp(buf);
 		return;
 	}
 
@@ -195,6 +207,27 @@ void AppendNVarcharPlp(duckdb::vector<uint8_t> &buf, const char *input, size_t i
 	// the buffer above is already sized -- but the declaration is what desyncs
 	// the session, and this is the last point before it is written.
 	RequirePlpWireBytes(utf16_len, "nvarchar(max)");
+	if (utf16_len == 0) {
+		// A NON-EMPTY input that encoded to nothing. The legacy fallback this
+		// path exists for emits no code unit at all for an invalid or truncated
+		// lead byte -- a lone `\xFF` takes its `else` arm, a bare `\xE0` breaks
+		// out of the loop for want of continuation bytes -- so `input_len != 0`
+		// does not imply a payload.
+		//
+		// The guard above tested the INPUT length; only the encode knows the
+		// PAYLOAD length, and the payload is what the frame has to describe.
+		// Writing a zero chunk length here and a terminator after it emitted
+		// SIXTEEN bytes where the value ends at twelve (a zero chunk length is
+		// itself the terminator), leaving four stray bytes for the server to
+		// read as the next column or the next token.
+		//
+		// The two siblings already keyed on the encoded length and were never
+		// wrong: EncodeBinaryPLP writes its chunk under `if (chunk_len > 0)`,
+		// AppendNVarcharNonPlp resizes to `2 + utf16_len`.
+		buf.resize(start_pos);
+		AppendEmptyPlp(buf);
+		return;
+	}
 	WriteLe32(chunk_len_ptr, static_cast<uint32_t>(utf16_len));
 	WriteLe32(chunk_len_ptr + 4 + utf16_len, 0);
 
