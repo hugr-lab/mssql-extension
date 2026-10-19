@@ -24,6 +24,12 @@ const site = ionos
   ? {url: 'https://hugr-lab.com', baseUrl: '/docs/mssql-extension/', home: 'https://hugr-lab.com/', impressum: 'https://hugr-lab.com/impressum/', datenschutz: 'https://hugr-lab.com/datenschutz/'}
   : {url: 'https://hugr-lab.github.io', baseUrl: '/mssql-extension/', home: 'https://hugr-lab.github.io/', impressum: 'https://hugr-lab.github.io/impressum/', datenschutz: 'https://hugr-lab.github.io/datenschutz/'};
 
+// While the hugr-lab.com copy exists (DOCS_IONOS on), pages.yml sets DOCS_CANONICAL for
+// the GitHub Pages build: its pages then name the hugr-lab.com copy as canonical
+// (src/theme/SiteMetadata) and it has no sitemap of its own. Search engines index
+// hugr-lab.com; the github.io links keep working (owner's decision, 2026-10-19).
+const canonicalBase = ionos ? '' : process.env.DOCS_CANONICAL ?? '';
+
 const config: Config = {
   title: 'DuckDB MSSQL Extension',
   tagline: 'SQL Server and Azure SQL from DuckDB — native TDS, no ODBC, built for speed.',
@@ -35,7 +41,7 @@ const config: Config = {
   // The banner is an inline script that guesses at a misconfigured baseUrl;
   // both baseUrls here are deliberate.
   baseUrlIssueBanner: false,
-  customFields: {docsTarget: ionos ? 'ionos' : 'github'},
+  customFields: {docsTarget: ionos ? 'ionos' : 'github', canonicalBase},
 
   organizationName: 'hugr-lab',
   projectName: 'mssql-extension',
@@ -74,6 +80,9 @@ const config: Config = {
           showLastUpdateTime: true,
         },
         blog: false,
+        // The canonical copy (hugr-lab.com) carries the sitemap; a copy that names
+        // another as canonical has none.
+        sitemap: canonicalBase ? false : undefined,
         theme: {
           customCss: './src/css/custom.css',
         },
