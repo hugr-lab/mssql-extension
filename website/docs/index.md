@@ -30,7 +30,7 @@ SELECT * FROM mssql.dbo.SalesOrderHeader LIMIT 10;
 
 ## Community Extension Downloads
 
-[![Weekly downloads of the mssql DuckDB community extension](https://hugr-lab.github.io/mssql-extension/download-metrics.svg)](https://duckdb.org/community_extensions/download_metrics)
+[![Weekly downloads of the mssql DuckDB community extension](/download-metrics.svg)](https://duckdb.org/community_extensions/download_metrics)
 
 📊 **[Interactive chart](https://hugr-lab.github.io/mssql-extension/metrics/)** — queried live in your browser with DuckDB-Wasm. Regenerated weekly; counts are a Cloudflare estimate of `INSTALL mssql FROM community` events across DuckDB versions and platforms.
 

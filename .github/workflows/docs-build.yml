@@ -25,6 +25,7 @@ on:
     paths:
       - "website/**"
       - "scripts/ci/check_docs_links.py"
+      - "scripts/ci/check_docs_no_third_party.py"
       - ".github/workflows/docs-build.yml"
   workflow_dispatch:
 
@@ -61,3 +62,16 @@ jobs:
         run: |
           npm ci
           npx docusaurus build
+
+      # The second copy pages.yml uploads to hugr-lab.com. Built here so a PR
+      # cannot break it unseen, and checked: hugr-lab.com serves /docs/ under a
+      # CSP that admits nothing from another host, so the copy must load no
+      # image, stylesheet, font or script from one. Links (<a href>) are fine.
+      - name: docusaurus build for hugr-lab.com (DOCS_TARGET=ionos)
+        working-directory: website
+        env:
+          DOCS_TARGET: ionos
+        run: npx docusaurus build --out-dir build-ionos
+
+      - name: The hugr-lab.com copy loads nothing from another host
+        run: python3 scripts/ci/check_docs_no_third_party.py website/build-ionos
