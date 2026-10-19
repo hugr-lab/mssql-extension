@@ -8,14 +8,34 @@ import type * as Preset from '@docusaurus/preset-classic';
 // download-metrics chart (served under /metrics/, SVG kept at its stable
 // root path because the README embeds it).
 
+// The same docs are built twice: for GitHub Pages (default) and for
+// hugr-lab.com on IONOS (DOCS_TARGET=ionos, uploaded by pages.yml). The IONOS
+// copy is served under a Content-Security-Policy that admits nothing from
+// another host, and the site's Datenschutz says so: no image, font, script or
+// fetch may leave hugr-lab.com. A plain <a href> to elsewhere is fine. So that
+// copy drops every markdown image with an absolute URL (markdown.preprocessor
+// below: the shields.io badges, in released versions too), the download-metrics
+// chart is the build's own copy (static/download-metrics.svg) in both, and the
+// /metrics/ page -- DuckDB-Wasm and Plot from a CDN -- is added to the GitHub
+// Pages copy only; both copies link to that one.
+// scripts/ci/check_docs_no_third_party.py checks the result.
+const ionos = process.env.DOCS_TARGET === 'ionos';
+const site = ionos
+  ? {url: 'https://hugr-lab.com', baseUrl: '/docs/mssql-extension/', home: 'https://hugr-lab.com/', impressum: 'https://hugr-lab.com/impressum/', datenschutz: 'https://hugr-lab.com/datenschutz/'}
+  : {url: 'https://hugr-lab.github.io', baseUrl: '/mssql-extension/', home: 'https://hugr-lab.github.io/', impressum: 'https://hugr-lab.github.io/impressum/', datenschutz: 'https://hugr-lab.github.io/datenschutz/'};
+
 const config: Config = {
   title: 'DuckDB MSSQL Extension',
   tagline: 'SQL Server and Azure SQL from DuckDB — native TDS, no ODBC, built for speed.',
   favicon: 'img/favicon.ico',
 
-  url: 'https://hugr-lab.github.io',
-  baseUrl: '/mssql-extension/',
+  url: site.url,
+  baseUrl: site.baseUrl,
   trailingSlash: true,
+  // The banner is an inline script that guesses at a misconfigured baseUrl;
+  // both baseUrls here are deliberate.
+  baseUrlIssueBanner: false,
+  customFields: {docsTarget: ionos ? 'ionos' : 'github'},
 
   organizationName: 'hugr-lab',
   projectName: 'mssql-extension',
@@ -68,6 +88,9 @@ const config: Config = {
     hooks: {
       onBrokenMarkdownLinks: 'throw',
     },
+    // The hugr-lab.com copy shows no image from another server: badges in released versions included.
+    preprocessor: ({fileContent}) =>
+      ionos ? fileContent.replace(/\[!\[[^\]]*\]\(https?:\/\/[^)]*\)\]\([^)]*\)|!\[[^\]]*\]\(https?:\/\/[^)]*\)/g, '') : fileContent,
   },
 
   themeConfig: {
@@ -99,7 +122,7 @@ const config: Config = {
           position: 'left',
         },
         {
-          href: 'https://hugr-lab.github.io/',
+          href: site.home,
           label: 'Hugr Lab',
           position: 'right',
         },
@@ -137,8 +160,15 @@ const config: Config = {
         {
           title: 'Hugr Lab',
           items: [
-            {label: 'Main site', href: 'https://hugr-lab.github.io/'},
+            {label: 'Main site', href: site.home},
             {label: 'Articles', to: '/articles/'},
+          ],
+        },
+        {
+          title: 'Legal',
+          items: [
+            {label: 'Impressum', href: site.impressum},
+            {label: 'Datenschutz', href: site.datenschutz},
           ],
         },
       ],

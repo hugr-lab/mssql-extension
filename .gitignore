@@ -65,6 +65,8 @@ docs/assets/download-metrics.svg
 # Docusaurus docs site
 website/node_modules/
 website/build/
+# The hugr-lab.com (IONOS) copy of the docs: DOCS_TARGET=ionos, pages.yml
+website/build-ionos/
 website/.docusaurus/
 
 # Python bytecode (e.g. test/kerberos/gateway helpers imported locally)

@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="280" viewBox="0 0 760 280" role="img" aria-label="Weekly downloads of the DuckDB mssql community extension">
+  <defs>
+    <linearGradient id="area" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f6c344" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#f6c344" stop-opacity="0.02"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="760" height="280" rx="10" fill="#ffffff" stroke="#e3e8ee"/>
+  <text x="56" y="26" font-size="15" font-weight="700" fill="#2b3a4a">DuckDB mssql extension &#8212; weekly downloads</text>
+  <text x="736" y="26" font-size="12" fill="#8a94a6" text-anchor="end">35,610/wk total</text>
+  <line x1="56.0" y1="232.0" x2="736.0" y2="232.0" stroke="#e3e8ee" stroke-width="1"/>
+  <line x1="56.0" y1="185.0" x2="736.0" y2="185.0" stroke="#e3e8ee" stroke-width="1"/>
+  <line x1="56.0" y1="138.0" x2="736.0" y2="138.0" stroke="#e3e8ee" stroke-width="1"/>
+  <line x1="56.0" y1="91.0" x2="736.0" y2="91.0" stroke="#e3e8ee" stroke-width="1"/>
+  <line x1="56.0" y1="44.0" x2="736.0" y2="44.0" stroke="#e3e8ee" stroke-width="1"/>
+  <text x="48.0" y="232.0" font-size="11" fill="#8a94a6" text-anchor="end" dominant-baseline="middle">0</text>
+  <text x="48.0" y="185.0" font-size="11" fill="#8a94a6" text-anchor="end" dominant-baseline="middle">25k</text>
+  <text x="48.0" y="138.0" font-size="11" fill="#8a94a6" text-anchor="end" dominant-baseline="middle">50k</text>
+  <text x="48.0" y="91.0" font-size="11" fill="#8a94a6" text-anchor="end" dominant-baseline="middle">75k</text>
+  <text x="48.0" y="44.0" font-size="11" fill="#8a94a6" text-anchor="end" dominant-baseline="middle">100k</text>
+  <polygon points="56.0,232.0 56.0,231.4 73.4,230.6 90.9,230.6 108.3,230.3 125.7,229.7 143.2,229.3 160.6,224.9 178.1,221.5 195.5,221.8 212.9,208.5 230.4,218.4 247.8,227.3 265.2,227.4 282.7,227.4 300.1,226.9 317.5,226.9 335.0,225.9 352.4,225.0 369.8,223.8 387.3,224.3 404.7,221.4 422.2,218.4 439.6,221.1 457.0,218.9 474.5,217.0 491.9,218.6 509.3,205.6 526.8,198.7 544.2,141.6 561.6,128.8 579.1,122.4 596.5,120.6 613.9,133.5 631.4,123.3 648.8,113.4 666.3,182.9 683.7,186.6 701.1,185.1 718.6,167.6 736.0,165.1 736.0,232.0" fill="url(#area)"/>
+  <polyline points="56.0,231.4 73.4,230.6 90.9,230.6 108.3,230.3 125.7,229.7 143.2,229.3 160.6,224.9 178.1,221.5 195.5,221.8 212.9,208.5 230.4,218.4 247.8,227.3 265.2,227.4 282.7,227.4 300.1,226.9 317.5,226.9 335.0,225.9 352.4,225.0 369.8,223.8 387.3,224.3 404.7,221.4 422.2,218.4 439.6,221.1 457.0,218.9 474.5,217.0 491.9,218.6 509.3,205.6 526.8,198.7 544.2,141.6 561.6,128.8 579.1,122.4 596.5,120.6 613.9,133.5 631.4,123.3 648.8,113.4 666.3,182.9 683.7,186.6 701.1,185.1 718.6,167.6 736.0,165.1" fill="none" stroke="#f6c344" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+  <circle cx="56.0" cy="231.4" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="73.4" cy="230.6" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="90.9" cy="230.6" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="108.3" cy="230.3" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="125.7" cy="229.7" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="143.2" cy="229.3" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="160.6" cy="224.9" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="178.1" cy="221.5" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="195.5" cy="221.8" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="212.9" cy="208.5" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="230.4" cy="218.4" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="247.8" cy="227.3" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="265.2" cy="227.4" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="282.7" cy="227.4" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="300.1" cy="226.9" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="317.5" cy="226.9" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="335.0" cy="225.9" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="352.4" cy="225.0" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="369.8" cy="223.8" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="387.3" cy="224.3" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="404.7" cy="221.4" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="422.2" cy="218.4" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="439.6" cy="221.1" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="457.0" cy="218.9" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="474.5" cy="217.0" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="491.9" cy="218.6" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="509.3" cy="205.6" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="526.8" cy="198.7" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="544.2" cy="141.6" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="561.6" cy="128.8" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="579.1" cy="122.4" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="596.5" cy="120.6" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="613.9" cy="133.5" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="631.4" cy="123.3" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="648.8" cy="113.4" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="666.3" cy="182.9" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="683.7" cy="186.6" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="701.1" cy="185.1" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="718.6" cy="167.6" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="736.0" cy="165.1" r="2.6" fill="#fff" stroke="#f6c344" stroke-width="2"/>
+  <circle cx="736.0" cy="165.1" r="4.5" fill="#f6c344"/><text x="736.0" y="153.1" font-size="13" font-weight="700" fill="#d4960b" text-anchor="end">35,610</text>
+  <text x="56.0" y="250.0" font-size="10" fill="#8a94a6" text-anchor="middle">01-25</text>
+  <text x="143.2" y="250.0" font-size="10" fill="#8a94a6" text-anchor="middle">03-01</text>
+  <text x="230.4" y="250.0" font-size="10" fill="#8a94a6" text-anchor="middle">04-05</text>
+  <text x="317.5" y="250.0" font-size="10" fill="#8a94a6" text-anchor="middle">05-10</text>
+  <text x="404.7" y="250.0" font-size="10" fill="#8a94a6" text-anchor="middle">06-14</text>
+  <text x="491.9" y="250.0" font-size="10" fill="#8a94a6" text-anchor="middle">07-19</text>
+  <text x="579.1" y="250.0" font-size="10" fill="#8a94a6" text-anchor="middle">08-23</text>
+  <text x="666.3" y="250.0" font-size="10" fill="#8a94a6" text-anchor="middle">09-27</text>
+  <text x="736.0" y="250.0" font-size="10" fill="#8a94a6" text-anchor="middle">10-19</text>
+  <text x="56" y="270" font-size="10" fill="#aab2c0">Source: duckdb.org/community_extensions/download_metrics &#183; downloads in the trailing 7 days, sampled weekly</text>
+</svg>
