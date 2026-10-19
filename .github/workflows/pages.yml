@@ -108,6 +108,10 @@ jobs:
           retention-days: 1
 
       - name: Build the docs site
+        env:
+          # While the hugr-lab.com copy exists (DOCS_IONOS on), this copy names it
+          # as canonical and carries no sitemap (website/src/theme/SiteMetadata).
+          DOCS_CANONICAL: ${{ vars.DOCS_IONOS == 'true' && 'https://hugr-lab.com/docs/mssql-extension/' || '' }}
         run: |
           cd website
           npm ci
