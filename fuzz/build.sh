@@ -35,9 +35,22 @@ CC="${CC:-clang}"
 # ASan + UBSan are mandatory (the integer over/underflow shapes need UBSan), and
 # we never let UBSan recover so a violation aborts the run.
 DEFAULT_FLAGS="-g -O1 -fno-omit-frame-pointer -fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=all"
+# REPLAY=1 builds an ordinary executable that replays a corpus instead of a
+# fuzzing target: fuzz/replay_main.cc supplies main(), no coverage
+# instrumentation and no fuzzing engine. It is how the libduckdb-linked
+# harnesses (row_stager, bcp_encode) run as a regression test rather than a
+# campaign, and the only way to build any of them with Apple's toolchain, which
+# ships no libFuzzer runtime. Sanitizers stay on — they are still the oracle.
+if [[ "${REPLAY:-0}" == "1" ]]; then
+	DEFAULT_FLAGS="-g -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all"
+	# SANITIZE=0 drops them, for a host whose ASan cannot start a process at all
+	# (Darwin 25.5+ hangs at init; the Makefile carries the same escape hatch).
+	[[ "${SANITIZE:-1}" == "0" ]] && DEFAULT_FLAGS="-g -O1 -fno-omit-frame-pointer"
+fi
 CXXFLAGS="${CXXFLAGS:-${DEFAULT_FLAGS}} -std=c++17"
 # LIB_FUZZING_ENGINE: OSS-Fuzz sets this; standalone we link libFuzzer directly.
 FUZZ_ENGINE="${LIB_FUZZING_ENGINE:--fsanitize=fuzzer}"
+[[ "${REPLAY:-0}" == "1" ]] && FUZZ_ENGINE="${HERE}/replay_main.cc"
 
 INC="-I${REPO}/src/include"
 
@@ -146,11 +159,32 @@ fi
 #      TARGETS=row_stager fuzz/build.sh
 #
 #    Then run it like any other libFuzzer target; see fuzz/README.md.
-if want row_stager; then
+# The two libduckdb-linked harnesses share this setup. Appends the DuckDB
+# include paths to INC exactly once, so asking for both targets in one
+# invocation does not duplicate them.
+DUCKDB_INC_READY=""
+ensure_duckdb_inc() {  # $1 = target name, for the error message
+	[[ -n "${DUCKDB_INC_READY}" ]] && return 0
 	if [[ -z "${MSSQL_DUCKDB_INC:-}" || -z "${MSSQL_DUCKDB_LIB:-}" ]]; then
-		echo "ERROR: row_stager needs MSSQL_DUCKDB_INC and MSSQL_DUCKDB_LIB (a built libduckdb)." >&2
+		echo "ERROR: $1 needs MSSQL_DUCKDB_INC and MSSQL_DUCKDB_LIB (a built libduckdb)." >&2
 		exit 1
 	fi
+	# DuckDB 2.0's function.hpp includes "fmt/core.h", which lives outside
+	# src/include. Every standalone compile recipe carries the same extra -I;
+	# derive it from MSSQL_DUCKDB_INC (<duckdb>/src/include) so the documented
+	# invocation keeps working, and allow an override for unusual layouts.
+	MSSQL_DUCKDB_FMT_INC="${MSSQL_DUCKDB_FMT_INC:-${MSSQL_DUCKDB_INC}/../../third_party/fmt/include}"
+	if [[ ! -f "${MSSQL_DUCKDB_FMT_INC}/fmt/core.h" ]]; then
+		echo "ERROR: cannot find fmt/core.h under ${MSSQL_DUCKDB_FMT_INC}." >&2
+		echo "       Set MSSQL_DUCKDB_FMT_INC to <duckdb>/third_party/fmt/include." >&2
+		exit 1
+	fi
+	INC="${INC} -I${MSSQL_DUCKDB_INC} -I${MSSQL_DUCKDB_FMT_INC}"
+	DUCKDB_INC_READY=1
+}
+
+if want row_stager; then
+	ensure_duckdb_inc row_stager
 	ensure_simdutf
 	STAGER_SRCS=(
 		"${REPO}/src/codec/staging/row_stager.cpp"
@@ -172,17 +206,6 @@ if want row_stager; then
 	for f in "${REPO}"/src/codec/*.cpp; do
 		STAGER_SRCS+=("${f}")
 	done
-	# DuckDB 2.0's function.hpp includes "fmt/core.h", which lives outside
-	# src/include. Every standalone compile recipe carries the same extra -I;
-	# derive it from MSSQL_DUCKDB_INC (<duckdb>/src/include) so the documented
-	# invocation keeps working, and allow an override for unusual layouts.
-	MSSQL_DUCKDB_FMT_INC="${MSSQL_DUCKDB_FMT_INC:-${MSSQL_DUCKDB_INC}/../../third_party/fmt/include}"
-	if [[ ! -f "${MSSQL_DUCKDB_FMT_INC}/fmt/core.h" ]]; then
-		echo "ERROR: cannot find fmt/core.h under ${MSSQL_DUCKDB_FMT_INC}." >&2
-		echo "       Set MSSQL_DUCKDB_FMT_INC to <duckdb>/third_party/fmt/include." >&2
-		exit 1
-	fi
-	INC="${INC} -I${MSSQL_DUCKDB_INC} -I${MSSQL_DUCKDB_FMT_INC}"
 	STAGER_OBJS="$(compile_objs stager "${STAGER_SRCS[@]}")"
 	echo ">> linking fuzz_row_stager"
 	"${CXX}" ${CXXFLAGS} ${INC} ${SIMDUTF_INC} \
@@ -190,8 +213,49 @@ if want row_stager; then
 		-L"${MSSQL_DUCKDB_LIB}" -lduckdb ${FUZZ_ENGINE} -o "${OUT}/fuzz_row_stager"
 fi
 
+# 7. The BCP/PLP WRITE path — the first harness here pointed outbound. Drives
+#    codec::string::PlanColumn + ScatterVarBlock (the columnar path COPY / CTAS /
+#    INSERT-via-BCP take) against the per-row EncodeToBcp / EncodeToBcpUtf8, with
+#    three oracles of its own: the frame must account for itself, the two paths
+#    must agree byte for byte, and the payload must decode back to a prefix of
+#    the source. See the header of fuzz_bcp_encode.cc for why ASan alone is not
+#    an oracle on this side.
+#
+#    Links libduckdb for the same reason row_stager does (the encoders read
+#    duckdb::Vector), so it is likewise NOT in the default TARGETS:
+#
+#      MSSQL_DUCKDB_INC=duckdb/src/include MSSQL_DUCKDB_LIB=build/release/src \
+#      TARGETS=bcp_encode fuzz/build.sh
+if want bcp_encode; then
+	ensure_duckdb_inc bcp_encode
+	ensure_simdutf
+	ENCODE_SRCS=(
+		"${TDS}/encoding/utf16.cpp"
+		"${TDS}/encoding/datetime_encoding.cpp"
+		"${TDS}/encoding/decimal_encoding.cpp"
+		"${TDS}/encoding/guid_encoding.cpp"
+		"${TDS}/encoding/bcp_row_encoder.cpp"
+		"${TDS}/encoding/type_converter.cpp"
+		"${TDS}/tds_types.cpp"
+		"${TDS}/tds_column_metadata.cpp"
+		"${REPO}/src/codec/staging/column_staging.cpp"
+		"${REPO}/src/codec/staging/column_ops.cpp"
+		"${REPO}/src/dml/insert/mssql_value_serializer.cpp"
+	)
+	# The family codecs: string_codec.cpp is the target, and the dispatchers
+	# beside it (literal_format, type_family) are what it links against.
+	for f in "${REPO}"/src/codec/*.cpp; do
+		ENCODE_SRCS+=("${f}")
+	done
+	ENCODE_OBJS="$(compile_objs encode "${ENCODE_SRCS[@]}")"
+	echo ">> linking fuzz_bcp_encode"
+	"${CXX}" ${CXXFLAGS} ${INC} ${SIMDUTF_INC} \
+		"${HERE}/fuzz_bcp_encode.cc" ${ENCODE_OBJS} "${SIMDUTF_OBJ}" \
+		-L"${MSSQL_DUCKDB_LIB}" -lduckdb ${FUZZ_ENGINE} -o "${OUT}/fuzz_bcp_encode"
+fi
+
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---
-for t in browser_response tds_tokens utf16 envchange_txn login_response; do
+for t in browser_response tds_tokens utf16 envchange_txn login_response bcp_encode; do
 	if [[ -d "${HERE}/corpus/${t}" ]]; then
 		( cd "${HERE}/corpus/${t}" && zip -qr "${OUT}/fuzz_${t}_seed_corpus.zip" . ) || true
 	fi

@@ -1,18 +1,38 @@
-# Fuzzing the mssql-extension TDS parsers
+# Fuzzing the mssql-extension TDS wire layer
 
-This extension speaks the Microsoft **TDS wire protocol natively** and parses
-**untrusted, attacker-controllable bytes**: a malicious or MITM'd SQL Server
-feeds the client binary token streams, result-set tokens and type/length fields;
-a rogue **SQL Browser** (UDP/1434) feeds datagrams; BCP carries data. That
-parsing surface is the bug target. These harnesses drive those decoders directly
-(in-process, **no network, no real SQL Server**) under **ASan + UBSan**.
+This extension speaks the Microsoft **TDS wire protocol natively**, in both
+directions, and both directions are fuzzed here.
 
-Two modes:
+**Inbound** it parses **untrusted, attacker-controllable bytes**: a malicious or
+MITM'd SQL Server feeds the client binary token streams, result-set tokens and
+type/length fields; a rogue **SQL Browser** (UDP/1434) feeds datagrams. That
+parsing surface is the classic bug target, and ASan is the whole oracle for it —
+feed it garbage, see whether it reads out of bounds.
+
+**Outbound** it *frames* values for the server, and that half needs a different
+oracle. The inputs there are our own values, so ASan catches only the subset of
+bugs that overrun a buffer. A declared length that disagrees with the bytes
+written is memory-safe and silent: the client exits cleanly and the **server**
+desyncs, or stores something truncated. Every framing bug this codebase has had
+was of that shape — #489, the review of #490, #181, #91 — and all four were
+found by reading code, because nothing automated could see them. So
+`fuzz_bcp_encode` carries three explicit oracles of its own (below).
+
+These harnesses drive the codecs directly (in-process, **no network, no real SQL
+Server**) under **ASan + UBSan**.
+
+Three modes:
 
 - **Discovery (local, deep):** AFL++ with CmpLog/RedQueen + dictionary + parallel
   cores, in Docker on Linux. Finds new bugs.
 - **Regression (CI, short):** ClusterFuzzLite per-PR — fuzz the changed code,
   replay the corpus, **fail on any new crash**.
+- **Replay (anywhere, seconds):** `REPLAY=1` links `replay_main.cc` instead of a
+  fuzzing engine, so a harness becomes an ordinary executable that replays a
+  corpus and fails on the first crash. This is how the two libduckdb-linked
+  harnesses run at all — ClusterFuzzLite cannot afford a sanitizer build of
+  DuckDB and the AFL++ container has no libduckdb — and it is the only way to
+  build any harness with **Apple's toolchain, which ships no libFuzzer runtime**.
 
 ## Targets
 
@@ -23,6 +43,67 @@ Two modes:
 | `fuzz_utf16` | `tds::encoding::Utf16LEDecode` / `LegacyUtf16LEDecode` | `src/tds/encoding/utf16.cpp` | ✅ (uses simdutf) |
 | `fuzz_envchange_txn` | `tds::FindBeginTxnDescriptor` | `src/tds/tds_token_parser.cpp` | ✅ |
 | `fuzz_login_response` | `tds::TdsProtocol::ParseLoginResponse` | `src/tds/tds_protocol.cpp` (+ packet, types, utf16) | ✅ |
+| `fuzz_row_stager` | `codec::staging::RowStager::StageRow` / `StageNBCRow` | `src/codec/staging/row_stager.cpp` | ❌ links libduckdb |
+| `fuzz_bcp_encode` | `codec::string::PlanColumn` + `ScatterVarBlock` vs `EncodeToBcp` | `src/codec/string_codec.cpp` | ❌ links libduckdb |
+
+The last two are **not in the default `TARGETS`** and do not run in the per-PR
+ClusterFuzzLite job: they read and write `duckdb::Vector`, and a sanitizer build
+of DuckDB is far too heavy for a time-boxed lane. Build them against a libduckdb
+that already exists, and run them in replay mode:
+
+```bash
+REPLAY=1 MSSQL_DUCKDB_INC=duckdb/src/include MSSQL_DUCKDB_LIB=build/release/src \
+  TARGETS=bcp_encode fuzz/build.sh
+DYLD_LIBRARY_PATH=build/release/src fuzz/out/fuzz_bcp_encode fuzz/corpus/bcp_encode
+# Linux: LD_LIBRARY_PATH instead of DYLD_LIBRARY_PATH
+```
+
+`make fuzz-encode-replay` wraps exactly that.
+
+### `fuzz_bcp_encode`'s three oracles
+
+ASan alone is not an oracle on the write path, so this harness checks the wire
+format itself. Each oracle has been shown to fire by planting a canary in the
+production code (and each canary reverted):
+
+| Oracle | What it requires | The bug class it catches |
+|---|---|---|
+| **A. Framing** | the frame accounts for itself: a PLP value is an 8-byte UNKNOWN-length header, a 4-byte chunk length, that many payload bytes, a 4-byte terminator; the declared length equals `plan.lengths[r]` and the frame consumes exactly `plan.wire[r]` | **#489** — a declared length that disagrees with the bytes written. Needs no 2 GiB value to express |
+| **B. Differential** | the row path and the columnar path produce **byte-identical** frames for every non-NULL row — which `string_codec.cpp` states as an invariant: *"the columnar path clamps during planning; this keeps the two producing the same bytes"* | **review of #490** — guards added to one path and not the other. The oracle does not care which path is wrong, which is the point |
+| **C. Round trip** | the payload decodes back to a **prefix** of the source (a prefix, not equal: clamping to a bounded column is documented truncation, spec 057 §3g) | silent truncation where declaration and payload agree with each other and both are wrong; `Utf8PrefixForUtf16Limit` at a bound that falls inside a surrogate pair (**#91**) |
+
+B and C are complements, not duplicates: a bug in a function **both** paths call
+produces the same wrong bytes twice, so B passes and only C sees it. Verified —
+the canary for C had to be placed in `Utf16LEEncodeValidDirect` and run against a
+*non-ASCII* value, because for ASCII the columnar path takes `WidenAscii` instead
+and B catches it first.
+
+**What it found on its first campaign** (issue #496): a PLP value whose UTF-16
+encode produced no payload was framed in **16 bytes** where the value ends at
+**12**, leaving four stray bytes for the server to read as the next column or
+the next token. Reduced from 6000 structured-random inputs to a **single `0xFF`
+byte** into `nvarchar(max)`:
+
+```
+empty value     input=0 ->  12 bytes:  FE FF FF FF FF FF FF FF | 00 00 00 00
+valid 'ab'      input=2 ->  20 bytes:  FE FF FF FF FF FF FF FF | 04 00 00 00 | 61 00 62 00 00 00 00 00
+single 0xFF     input=1 ->  16 bytes:  FE FF FF FF FF FF FF FF | 00 00 00 00 | 00 00 00 00   <-- before
+single 0xFF     input=1 ->  12 bytes:  FE FF FF FF FF FF FF FF | 00 00 00 00                 <-- after
+```
+
+`AppendNVarcharPlp`'s zero-guard tested the *input* length; only the encode
+knows the *payload* length, and the legacy fallback that path exists for emits
+nothing at all for an invalid or truncated lead byte. Oracle A caught it because
+a zero chunk length **is** the PLP terminator, so a 16-byte frame cannot account
+for itself. Pinned by `TestPlpEmptyFrameIsTwelveBytes` in
+`test/cpp/codec/test_string_codec.cpp` and by three seeds named
+`nvarchar_plp_encodes_to_zero_*`.
+
+**What it cannot do, stated plainly:** it cannot build the >2 GiB value #489 and
+#490 needed, so it will not rediscover those two instances — it fuzzes their
+class at reachable sizes. The 2 GiB arithmetic itself stays covered by the unit
+tests on `PlanOneLength` / `PlannedNVarcharBytes` / `RequirePlpWireBytes`, which
+drive it with plain numbers precisely because no test can allocate the value.
 
 **Isolation finding:** the whole `src/tds/` parsing layer and
 `instance_resolver.cpp` have **zero DuckDB includes** (`grep -L duckdb/`), so the
