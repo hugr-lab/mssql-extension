@@ -1,0 +1,93 @@
+name: Leak check (LeakSanitizer)
+
+# LeakSanitizer over the DuckDB-FREE fuzz harnesses' stored corpora.
+# scripts/ci/leak_check.sh carries the full rationale; the short version:
+#
+#   * LSan ships inside ASan and is ON BY DEFAULT on Linux, so this repo has had
+#     it available all along -- and switched off in the one lane that would run
+#     it (test/cpp/codec/run_staging_test.sh passes detect_leaks=0, because
+#     libduckdb is not instrumented and its static initialisers hold allocations
+#     for process lifetime).
+#   * Five of the seven harnesses link NO libduckdb. On those LSan is clean by
+#     construction, so this lane costs no suppression file -- and it covers the
+#     code that allocates per token, per row and per login response on lengths a
+#     hostile server chose.
+#   * A corpus REPLAY checks cumulatively at exit, over thousands of inputs in
+#     one process, which is a different question from libFuzzer's per-input leak
+#     check and catches the slow drip that resets away.
+#
+# WHY workflow_dispatch AND schedule, NOT pull_request (yet)
+#
+# This lane has never run on this codebase. Whether src/tds/ is leak-free under
+# a cumulative check is unknown until it runs once, and `utf16.cpp`'s retained
+# per-thread scratch buffer is a plausible benign report that would need a
+# reviewed suppression rather than a code change. Gating every PR on an
+# unvalidated check would redden other people's work to answer our question.
+#
+# So: dispatch it, read the result, triage anything it finds, and only then add
+# `pull_request` to these triggers. The weekly cron keeps it honest in the
+# meantime -- src/tds/ changes rarely, and a leak introduced there would be
+# caught within the week rather than never.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, offset from the other security crons (security-scan 05:17 Mon,
+    # codeql 04:32 Mon) so they do not contend for runners.
+    - cron: '41 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: leak-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  leak-check:
+    name: LeakSanitizer (DuckDB-free harnesses)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # clang for -fsanitize=address; curl/unzip for the pinned simdutf
+      # single-header amalgamation fuzz/build.sh fetches. No AFL++ and no
+      # libFuzzer runtime: REPLAY=1 links fuzz/replay_main.cc for main().
+      - name: Install clang + archive tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang curl unzip zip
+
+      # Prove the oracle before trusting a green result. A lane that reports no
+      # leaks because detection is silently off is worse than no lane -- the
+      # same failure mode the credential gate's --self-test exists for.
+      - name: Verify LeakSanitizer is actually active
+        run: |
+          cat > /tmp/lsan_probe.cc <<'EOF'
+          #include <cstdlib>
+          int main() { void *p = malloc(1024); (void)p; return 0; }
+          EOF
+          clang++ -fsanitize=address -g -O0 /tmp/lsan_probe.cc -o /tmp/lsan_probe
+          if ASAN_OPTIONS=detect_leaks=1 /tmp/lsan_probe 2>&1 | tee /tmp/probe.log \
+             | grep -q "LeakSanitizer: detected memory leaks"; then
+            echo "LeakSanitizer is live (planted 1024-byte leak was reported)."
+          else
+            echo "::error::LeakSanitizer did not report a planted leak — a green"
+            echo "::error::result from this lane would be meaningless. Output:"
+            cat /tmp/probe.log
+            exit 1
+          fi
+
+      - name: Replay corpora under detect_leaks=1
+        run: scripts/ci/leak_check.sh
+
+      - name: Upload sanitizer logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leak-check-logs
+          path: fuzz/work/leak/*.log
+          if-no-files-found: ignore
+          retention-days: 14
