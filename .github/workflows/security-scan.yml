@@ -55,3 +55,34 @@ jobs:
           # them, so the full-history scan fails on blobs we can't amend.
           # We don't use Lob (lob.com print/mail API).
           extra_args: --only-verified --exclude-detectors=lob
+
+  # TruffleHog above answers "is a secret committed in the repo?". This answers
+  # the different question "can a secret ESCAPE at runtime?" — a credential
+  # value reaching a log line, an exception message or a format call.
+  #
+  # Joern's q6 already expresses this check, but it needs Joern installed and a
+  # CPG built, so it lives in `make joern-scan` as an exploratory tool that runs
+  # when someone remembers. Credential disclosure is a regression class — issue
+  # #492 (mssql_azure_auth_test showed a token's last 3 characters, and a short
+  # token in full) is exactly what comes back when a new error message is
+  # written next to a credential — so it gets a gate that cannot rot.
+  #
+  # Pure Python, no dependencies, ~1 second. Runs on the same events as the
+  # secret scan above.
+  credential-logging:
+    name: Credential-in-log gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The detector's own fixtures. A silently-broken gate is worse than no
+      # gate: the first cut of this script counted braces as nesting depth, so
+      # every file collapsed into one statement and every finding reported at
+      # line 1 — while still exiting plausibly. These fixtures catch that.
+      - name: Self-test the detector
+        run: scripts/ci/check_credential_logging.py --self-test
+
+      - name: Scan src/ for credentials reaching a message sink
+        run: scripts/ci/check_credential_logging.py --root src
