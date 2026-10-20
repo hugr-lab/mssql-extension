@@ -1,0 +1,131 @@
+---
+title: Settings
+sidebar_position: 1
+---
+
+# Configuration Reference
+
+### Connection Pool Settings
+
+| Setting                    | Type    | Default | Range | Description                              |
+| -------------------------- | ------- | ------- | ----- | ---------------------------------------- |
+| `mssql_connection_limit`   | BIGINT  | 64      | ≥1    | Max connections per attached database    |
+| `mssql_connection_cache`   | BOOLEAN | true    | -     | Enable connection pooling and reuse      |
+| `mssql_reset_connection`   | BOOLEAN | true    | -     | Reset session state when a connection returns to the pool ([details](../performance.md#owning-the-session-mssql_reset_connection)) |
+| `mssql_connection_timeout` | BIGINT  | 30      | ≥0    | Connection timeout (seconds): the TCP dial **and** every login-phase read after it (PRELOGIN, TLS, LOGIN7 / FEDAUTH), for ATTACH validation and for every pool refill. `0` means the 30 s default, **not** "no timeout": a dial or a login read that never completes must not hang a pool refill. |
+| `mssql_idle_timeout`       | BIGINT  | 300     | ≥0    | Idle connection timeout (seconds, 0=none)|
+| `mssql_min_connections`    | BIGINT  | 0       | ≥0    | Connections opened at ATTACH — their logins in parallel, so N cost about one — and kept open while idle. Also the `min_connections` ATTACH option. Not opened under `lazy_validation`. |
+| `mssql_acquire_timeout`    | BIGINT  | 30      | ≥0    | How long a query waits for a pooled connection to be **released** when the pool is at its limit. Not how long a failed connection takes to report: a connection the pool cannot create — wrong password, expired Azure AD token, refused dial — fails at once with the reason (`could not create a connection: Login failed for user 'sa'.`) when nothing is active, and with others active the pool keeps waiting for a release but retries creation on a backoff. |
+| `mssql_query_timeout`      | BIGINT  | 30      | ≥0    | Query execution timeout (seconds, 0=infinite): a scan, `mssql_exec`, and each INSERT / UPDATE / DELETE statement the extension sends row by row (until spec 080 those waited a fixed 30 s whatever this said, and a timed-out one is cancelled and fails like any failed statement). Not applied to an UPDATE / DELETE / INSERT … SELECT sent to the server whole: it waits as long as the statement takes and is cancelled with the query (Ctrl-C) |
+| `mssql_metadata_timeout`   | BIGINT  | 300     | ≥0    | Metadata query timeout (seconds, 0=no timeout) |
+| `mssql_catalog_cache_ttl`  | BIGINT  | 0       | ≥0    | Metadata cache TTL (seconds, 0=manual)   |
+| `mssql_exec_invalidate_cache` | BOOLEAN | false | true/false | Auto-invalidate the catalog cache after DDL run via `mssql_exec()`. Default `false` (like the Postgres extension's `postgres_execute`): invalidate manually with `mssql_invalidate_cache()` after schema-changing DDL. Set `true` to auto-invalidate. |
+| `mssql_attach_validation_timeout` | BIGINT | 0 | ≥0 | ATTACH-time eager-validation timeout (seconds). `0` inherits `mssql_connection_timeout`. Spec 047 FR-011. |
+
+### Filter Pushdown Settings
+
+| Setting | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `mssql_scan_parameterize_filters` | BOOLEAN | true | - | Send the constants of a pushed filter as `sp_executesql` parameters (an RPC call with typed values), declared from the column's SQL Server type, so SQL Server keeps one plan per filter shape instead of one per distinct value set. `false` restores literal SQL (the escape hatch for parameter sniffing). |
+
+### Statistics Settings
+
+| Setting                            | Type    | Default | Range | Description                           |
+| ---------------------------------- | ------- | ------- | ----- | ------------------------------------- |
+| `mssql_enable_statistics`          | BOOLEAN | true    | -     | Enable statistics collection          |
+| `mssql_statistics_level`           | BIGINT  | 0       | ≥0    | Detail: 0=rowcount, 1=+histogram, 2=+NDV |
+| `mssql_statistics_use_dbcc`        | BOOLEAN | false   | -     | Use DBCC SHOW_STATISTICS (requires permissions) |
+| `mssql_statistics_cache_ttl_seconds` | BIGINT | 300    | ≥0    | Statistics cache TTL (seconds)        |
+
+
+### Wire Protocol Settings
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `mssql_tds_packet_size` | BIGINT | 16384 | TDS frame size requested at login, clamped to [512, 32767]. Bounds `recv()` count on reads and `send()` count on bulk loads; raised from 4096 in v0.2.3 (−28% client CPU / −43% wall on read). Costs the server ~16 KB per pooled connection; set 4096 to restore the old footprint |
+| `mssql_utf8_support` | BOOLEAN | true | Advertise TDS UTF8SUPPORT at login. A granting server sends UTF-8-collated columns without UTF-16 transcoding (measured half the wire bytes). Safe to request everywhere; exists to turn the request off. Without it a UTF-8 `char(n)` is read through `CAST(… AS NCHAR(n))`, so its padding is still trimmed |
+| `mssql_named_instance_resolution` | BOOLEAN | true | Resolve `Server=host\instance` to the instance's dynamic port via SQL Server Browser (UDP 1434) at ATTACH. Set `false` where outbound UDP 1434 is stripped — a named instance then errors instead of silently using 1433 |
+| `mssql_browser_timeout_seconds` | BIGINT | 3 | Browser UDP query timeout (ATTACH critical path; one retry) |
+
+### Bulk Load (COPY / CTAS) Settings
+
+Details: [COPY TO](../writing/copy.md) and [CTAS](../writing/ctas.md).
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `mssql_copy_flush_rows` | BIGINT | 102400 | Rows per bulk-load batch — the batch boundary the **server** sees, for COPY, CTAS and a bulk-path INSERT alike. 102 400 is SQL Server's own threshold for writing compressed columnstore rowgroups directly; smaller batches land in the delta store and never compress |
+| `mssql_copy_parallel_writers` | BIGINT | 0 | Concurrent bulk-load connections one COPY, CTAS or bulk-path INSERT may open. `0` derives from DuckDB threads (cap 8); `1` disables. Ignored inside explicit transactions (the load pins one connection). An INSERT fans out only on a target with **no nonclustered index** on it — a heap under TABLOCK, or a clustered columnstore without it. Its writers hold transactions, and conflicting locks would deadlock them: a heap carrying a nonclustered index takes a Sch-M lock under TABLOCK rather than the compatible BU lock, and a columnstore carrying one fails the load An INSERT's writers commit one after another: a reader under READ_COMMITTED_SNAPSHOT or SNAPSHOT can see part of one INSERT — `1` when it must not; a COPY / CTAS commits batch by batch whatever this says ([details](../writing/transactions.md#parallel-writers-visibility)) |
+| `mssql_copy_tablock` | VARCHAR | `auto` | `auto` \| `true` \| `false`. `auto` decides from the target's shape: heap ON, anything clustered OFF (the hint serialises parallel loaders against a clustered index). Applies to a bulk-path INSERT too |
+| `mssql_ctas_use_bcp` | BOOLEAN | true | CTAS transfers data over the bulk-load protocol (2–10× the text INSERT path) and commits as it loads, DDL and rows. `false`: the CTAS runs whole inside the DuckDB transaction -- in autocommit the statement's own -- checks, `CREATE` and rows as INSERT statements on its one connection, and is committed or rolled back with it (issue #451) |
+| `mssql_ctas_text_type` | VARCHAR | `NVARCHAR` | What an unannotated DuckDB `VARCHAR` becomes in created tables (`NVARCHAR`/`VARCHAR`); drives CTAS and COPY alike |
+| `mssql_ctas_drop_on_failure` | BOOLEAN | false | Drop the created table when the load phase fails |
+
+### Target Type Settings
+
+Details: [Target Column Types and Table Shape](../writing/table-options.md).
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `mssql_utf8_collation` | VARCHAR | `Latin1_General_100_BIN2_UTF8` | Collation for created `varchar` columns when the server granted UTF8SUPPORT. BIN2 = binary comparison, case-/accent-**sensitive**; matches Fabric's default. Empty inherits the database default |
+| `mssql_default_string_length` | BIGINT | 0 | Length for unannotated `VARCHAR` columns created by CTAS/COPY (`0` = MAX) |
+| `mssql_default_table_kind` | VARCHAR | `HEAP` | Shape of created tables: `HEAP` or `COLUMNSTORE` (clustered columnstore index created before the load) |
+| `mssql_catalog_native_types` | BOOLEAN | true | Report `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` for bounded string columns of attached tables **and of `mssql_scan` / `mssql_scan_params` results** (a `varchar` there only under a UTF-8 collation), so targets inherit declared lengths. Per catalog: the `native_types` ATTACH option. |
+| `mssql_convert_varchar_max` | BOOLEAN | true | Convert `VARCHAR(MAX)` to `NVARCHAR(MAX)` in catalog scan SQL for UTF-8 safety on non-UTF-8 collations |
+
+### ORDER BY Pushdown Settings (Experimental)
+
+| Setting                            | Type    | Default | Range | Description                           |
+| ---------------------------------- | ------- | ------- | ----- | ------------------------------------- |
+| `mssql_order_pushdown`             | BOOLEAN | false   | -     | Enable ORDER BY pushdown to SQL Server |
+
+The `order_pushdown` ATTACH option provides per-database control. See [ORDER BY Pushdown](../reading/queries.md#order-by-pushdown-experimental) for details.
+
+### Remote Pushdown Settings
+
+| Setting                              | Type    | Default | Range | Description |
+| ------------------------------------ | ------- | ------- | ----- | ----------- |
+| `mssql_remote_pushdown`              | BOOLEAN | true    | -     | Send whole SELECT statements over one attached database to SQL Server as one T-SQL statement. **Read at ATTACH** and fixed for that database's life: set it before `ATTACH`, or give the database its own with the ATTACH option `remote_pushdown true/false`. Global (no per-session switch). While on, GROUP BY / DISTINCT / join keys / PARTITION BY compare strings under the column's collation — see [Remote Pushdown](../reading/queries.md#remote-pushdown-whole-statements). Also while on: the database's schema `main` answers as its default schema for reads **and writes** (`db.main.t` reads `dbo.t`; `CREATE` / `DROP TABLE db.main.x` act on `dbo.x`, where without it `main` is not found), DuckDB skips its catalog-or-schema ambiguity check for it, and DuckDB's pushdown rewriter runs on every statement of the instance |
+| `mssql_pushdown_join_rows_threshold` | BIGINT  | 1000000 | ≥0    | A join whose gain is not certain (many-to-many, CROSS) is pushed only while every table it joins has fewer rows than this (cached counts, no round trip); else the table scans keep it; a view (no row count of its own) never counts as small. 0 = always push. Not checked inside a transaction or on a pool of one connection |
+| `mssql_pushdown_min_rows`            | BIGINT  | 0       | ≥0    | A statement whose tables hold fewer rows than this **together** (cached counts) is left to the table scans. The counts are the cached, approximate ones, and a table read twice (a self-join) counts twice. 0 = no floor. Not applied inside a transaction, on a pool of one connection, or when a view is read |
+
+### INSERT Settings
+
+| Setting                            | Type    | Default  | Range  | Description                           |
+| ---------------------------------- | ------- | -------- | ------ | ------------------------------------- |
+| `mssql_insert_batch_size`          | BIGINT  | 1000     | ≥1     | Rows per INSERT statement. Under it a cap of 1000 constants per statement always applies (`1000 / columns` rows), so SQL Server auto-parameterises every statement into one cached plan per shape |
+| `mssql_insert_max_rows_per_statement` | BIGINT | 1000   | ≥1     | Hard cap on rows per INSERT           |
+| `mssql_insert_max_sql_bytes`       | BIGINT  | 8388608  | ≥1024  | Max SQL statement size (8MB)          |
+| `mssql_insert_use_returning_output`| BOOLEAN | true     | -      | Deprecated, no effect; removed in the next release (an `INSERT … RETURNING` always uses OUTPUT INSERTED, see [INSERT with RETURNING](../writing/dml.md#insert-with-returning)) |
+| `mssql_insert_use_bcp`             | BOOLEAN | true     | -      | Load an INSERT through the BCP protocol above `mssql_insert_bcp_threshold` rows, with parallel writers; in autocommit the INSERT commits on its own when it finishes. `RETURNING` and an explicit identity column always use statements. `false`: statements only, and in autocommit the INSERT joins the statement's DuckDB transaction -- committed or rolled back with it (issue #451) |
+| `mssql_insert_bcp_threshold`       | BIGINT  | 1000     | ≥1     | Rows up to which an INSERT is sent as statements; above it the bulk path. Counted as the rows arrive, not estimated |
+
+The bulk path takes its batch size, writer count and TABLOCK policy from the
+`mssql_copy_*` settings above, which describe a bulk load whatever statement
+started it. See [INSERT](../writing/dml.md#two-paths-statements-and-bcp).
+
+### UPDATE/DELETE Settings
+
+| Setting                            | Type    | Default  | Range  | Description                           |
+| ---------------------------------- | ------- | -------- | ------ | ------------------------------------- |
+| `mssql_dml_batch_size`             | BIGINT  | 500      | ≥1     | Rows per UPDATE/DELETE batch          |
+| `mssql_dml_max_parameters`         | BIGINT  | 2000     | ≥1     | Max parameters per statement (~2100 limit) |
+| `mssql_dml_pushdown`               | BOOLEAN | true     | —      | Send an UPDATE / DELETE / INSERT … SELECT / MERGE the remote-pushdown rewriter can write in T-SQL to SQL Server as one statement; `false` keeps every UPDATE / DELETE / INSERT … SELECT on the row paths and stages every MERGE through `#src` (it still runs on the server, or is refused by name). Read per statement |
+| `mssql_dml_stage_threshold`        | BIGINT  | 1000     | ≥0     | Rows up to which an UPDATE/DELETE on a keyed table goes as VALUES statements; past it, through a `#stage` table and one statement (0 = always stage) |
+| `mssql_dml_use_prepared`           | BOOLEAN | true     | -      | Deprecated, no effect; removed in the next release |
+
+### Usage Examples
+
+```sql
+-- Increase connection pool for high-concurrency workloads
+SET mssql_connection_limit = 20;
+
+-- Reduce batch size for tables with large rows
+SET mssql_insert_batch_size = 100;
+
+-- Enable detailed statistics for query optimization
+SET mssql_statistics_level = 2;
+
+-- Disable connection caching for debugging
+SET mssql_connection_cache = false;
+```
+

@@ -1,0 +1,594 @@
+---
+title: INSERT / UPDATE / DELETE
+sidebar_position: 4
+---
+
+# INSERT
+
+### Basic INSERT
+
+```sql
+-- Single row
+INSERT INTO sqlserver.dbo.my_table (name, value)
+VALUES ('test', 42);
+
+-- Multiple rows
+INSERT INTO sqlserver.dbo.my_table (name, value)
+VALUES ('first', 1), ('second', 2), ('third', 3);
+```
+
+### INSERT from SELECT
+
+```sql
+INSERT INTO sqlserver.dbo.target_table (name, value)
+SELECT name, value FROM local_source_table;
+```
+
+When the source is in the same SQL Server database, the INSERT is sent to the
+server as **one statement**, and no row crosses the wire:
+
+```sql
+EXPLAIN INSERT INTO sqlserver.dbo.archive (id, total) SELECT id, total FROM sqlserver.dbo.orders WHERE year = 2020;
+-- Mssql Dml
+--   Statement: INSERT INTO [dbo].[archive] ([id], [total])
+--              SELECT [id], [total] FROM [dbo].[orders] WHERE ([year] = @p0)
+```
+
+It goes when every value is one the server can copy without a conversion of
+its own:
+- for a number, a `bit` or a `date` column, a value of the column's type, or
+  an integer widened into a wider one;
+- for any other column (strings, the date-time types, binary, geometry), a
+  column declared exactly alike. The server copies it exactly, which the row
+  path cannot always do, because it reads the value through DuckDB: there a
+  `datetimeoffset` loses its offset, a `time(7)` its 100 ns digit, a
+  `datetime2(7)` past 2262 becomes NULL and a geometry gets SRID 0;
+- a column the statement does not name gets the server's DEFAULT on both paths;
+- naming the identity column runs the statement between `SET IDENTITY_INSERT`
+  ON and OFF, as the row path does.
+
+The rows go through DuckDB, as below, for:
+- `VALUES`;
+- a source from DuckDB or another database;
+- RETURNING, `ON CONFLICT`, `BY NAME`;
+- a string constant or a value DuckDB would convert.
+
+`SET mssql_dml_pushdown = false` keeps every INSERT on the row paths.
+
+### INSERT with RETURNING
+
+Get inserted values back (uses SQL Server's OUTPUT INSERTED):
+
+```sql
+INSERT INTO sqlserver.dbo.my_table (name)
+VALUES ('test')
+RETURNING id, name;
+```
+
+```sql
+INSERT INTO sqlserver.dbo.my_table (name, value)
+VALUES ('a', 1), ('b', 2)
+RETURNING *;
+```
+
+The rows come back through `OUTPUT INSERTED`.
+- **Triggers.** SQL Server refuses that form on a table with an enabled
+  trigger, or a view over one (error 334). On SQL Server and Azure SQL the
+  statement is then sent again through `OUTPUT … INTO` a session table that
+  each batch creates, reads and drops in its one request, and the rest of
+  the INSERT goes that way too (issue #471). That form costs more, so a table
+  with no trigger never pays for it.
+- **What RETURNING shows.** RETURNING shows each row as the INSERT wrote it,
+  before an AFTER trigger changed it. Under an INSTEAD OF trigger it shows
+  the values the INSERT was given, which may not be what the trigger stored.
+- **Results from a trigger.** A result set the trigger sends of its own is
+  not taken for RETURNING rows.
+- **Fabric Warehouse and Azure Synapse** keep the bare `OUTPUT`.
+
+### Two paths: statements and BCP
+
+An INSERT reaches SQL Server one of two ways, and the extension picks per
+statement:
+
+| the INSERT | how it is sent |
+| --- | --- |
+| more rows than `mssql_insert_bcp_threshold` (default 1000), no `RETURNING`, no explicit identity column | the BCP protocol (`INSERT BULK`), the same wire COPY and CTAS use — measured 1M rows in 1.8 s where the statements took 74 s |
+| anything else — `RETURNING`, a named identity column, `mssql_insert_use_bcp = false`, or up to the threshold rows | batched `INSERT … VALUES` statements |
+
+The threshold is decided by counting the rows as they arrive, not by a plan
+estimate, so an `INSERT … SELECT` behind a filter goes the right way too.
+
+**Every INSERT is atomic**, on either path. In autocommit the statement runs
+on one connection inside one server transaction — `BEGIN TRANSACTION` before
+its first batch, `COMMIT` after the last — so a failure anywhere leaves the
+table exactly as it was, and the error says so. That COMMIT comes when the
+INSERT finishes; with `mssql_insert_use_bcp = false` it comes when DuckDB
+commits the statement instead, as for an UPDATE (issue #451):
+
+```text
+INSERT via BCP failed at batch 5 of a writer (1808 row(s) in it): MSSQL: BCP failed:
+The INSERT statement conflicted with the CHECK constraint ...; rolled back, the
+8192 row(s) from the batches before it included
+```
+
+Inside a `BEGIN … COMMIT` block the rows sit in the open transaction until
+its `COMMIT` or `ROLLBACK`, and the message says that instead. The same
+holds for `UPDATE` and `DELETE`.
+
+**The bulk path behaves like an INSERT statement.** A raw bulk load ignores
+CHECK constraints, does not fire triggers and writes a column's DEFAULT
+where the data says NULL — that is `COPY`'s contract. An INSERT that goes
+through BCP sends `INSERT BULK` with `CHECK_CONSTRAINTS`, `FIRE_TRIGGERS` and
+`KEEP_NULLS`, so constraints are checked, triggers fire and an explicit NULL
+stays NULL.
+
+**Batch size and parallel writers** come from the bulk-load settings, which
+describe the load rather than the statement that started it:
+`mssql_copy_flush_rows` (the batch boundary the server sees; 102 400 lands
+compressed rowgroups on a columnstore) and `mssql_copy_parallel_writers`.
+Parallel writers apply only where their loads cannot block each other —
+each writer holds its own server transaction until the INSERT commits them
+all (one after another: a reader under READ_COMMITTED_SNAPSHOT or SNAPSHOT can
+see part of the load between two commits, see
+[Parallel writers and readers that do not wait](transactions.md#parallel-writers-visibility)),
+so two writers whose locks conflict would wait on each other with
+nothing to time out. That is a target with **no nonclustered index** on it:
+a heap under TABLOCK, or a clustered columnstore without it. Under
+`mssql_copy_tablock = auto` (heap on, clustered off) bare heaps and bare
+columnstores fan out, while a table with a clustered rowstore index — or one
+carrying so much as a single nonclustered index, which costs a heap a `Sch-M`
+lock instead of the compatible `BU` one and costs a columnstore the load
+itself — loads on one writer.
+Inside a transaction it is always one writer, the transaction's own
+connection. With several writers there is a
+window between the first and the last `COMMIT` in which a failed commit
+leaves the earlier writers' rows in place; one writer has none.
+
+### Batch Configuration
+
+Statements carry at most 1000 constants each — SQL Server auto-parameterises
+a multi-row `VALUES` INSERT up to that line, so distinct inserts of one shape
+share a single cached plan; past it every statement compiles its own — and
+`mssql_insert_batch_size` caps the rows on top of that:
+
+```sql
+-- Rows per INSERT statement (default 1000; 1000 / columns applies first)
+SET mssql_insert_batch_size = 500;
+
+-- Maximum SQL statement size (default: 8MB)
+SET mssql_insert_max_sql_bytes = 4194304;
+
+-- Rows up to which an INSERT is sent as statements (default 1000)
+SET mssql_insert_bcp_threshold = 5000;
+
+-- Statements only, whatever the size
+SET mssql_insert_use_bcp = false;
+```
+
+### Identity Columns
+
+A column the INSERT does not name is left out of the statement or the bulk
+column list, so the server generates its identity value or applies its
+DEFAULT. The generated values are returned via the RETURNING clause.
+
+**Naming the identity column works too.** An INSERT that supplies a value for
+it — explicitly, or positionally with a value for every column — is bracketed
+for you with `SET IDENTITY_INSERT … ON` / `OFF` on the statement's own
+connection, so the values land verbatim and the session is clean afterwards.
+Two things to know:
+
+- **It stays on the statement path**, whatever `mssql_insert_bcp_threshold`
+  says: tens of rows, not millions. Loading many rows *with* their identity
+  values is `COPY`'s job — it takes its column list from the source by name,
+  keeps a supplied identity value and lets the server assign when the column is
+  omitted, and it is the fast path (1M rows in 0.51 s against 74.71 s through
+  statements).
+- `SET IDENTITY_INSERT` needs **ALTER** permission on the table, which INSERT
+  does not; without it the statement fails with a message that says so (the
+  server's own text for error 1088 claims the table may not exist). A NULL —
+  or `DEFAULT`, which reaches the extension as the same NULL — in a named
+  identity column is refused before anything is sent: leave the column out of
+  the list to let the server assign, or supply a value for every row; a
+  statement mixing the two has to be split.
+
+An INSERT with **no column list** against a table with an identity column is
+refused by DuckDB's binder (`has N columns but N-1 values were supplied`) before
+the extension sees it; name the columns, as SQL Server's own error 8101 asks
+for the same statement. Issue #327 records why the extension cannot widen that
+check.
+
+## UPDATE
+
+UPDATE runs on any table. When the whole statement can be written in T-SQL, SQL Server runs it as one statement; otherwise DuckDB selects the rows and the extension writes them back by the table's primary key, a usable unique index, or all of its columns (see [How UPDATE and DELETE reach the server](#how-update-and-delete-reach-the-server)).
+
+### Basic UPDATE
+
+```sql
+-- Update single row
+UPDATE sqlserver.dbo.products SET price = 19.99 WHERE id = 1;
+
+-- Update multiple rows
+UPDATE sqlserver.dbo.products SET status = 'discontinued' WHERE category = 'legacy';
+
+-- Update with expressions
+UPDATE sqlserver.dbo.products SET price = price * 1.10 WHERE category = 'premium';
+```
+
+### UPDATE with Multiple Columns
+
+```sql
+UPDATE sqlserver.dbo.customers
+SET name = 'John Doe', email = 'john@example.com', updated_at = NOW()
+WHERE id = 42;
+```
+
+### Limitations
+
+- **RETURNING** returns the rows as written (see [RETURNING](#update-and-delete--returning))
+- A SET of a rowid key column goes when the statement is sent whole; when it is not, it is refused (on a table with no key, any column may be SET)
+- On Azure Synapse every UPDATE through the catalog is refused: its primary keys and unique constraints are `NOT ENFORCED`, so a key could match rows the statement did not select. Use `mssql_exec()`
+
+## String comparisons and collation {#collation}
+
+:::warning A `DELETE` can remove more rows than a DuckDB user expects
+
+`UPDATE` and `DELETE` choose their rows the same way a `SELECT` does: the
+`WHERE` clause is pushed to SQL Server, and **SQL Server's collation decides
+what matches** — not DuckDB's byte comparison.
+
+On a case-insensitive collation (`_CI_AS`, the default for most installations)
+that means:
+
+```sql
+-- table dbo.T contains 'abc' and 'ABC'
+SELECT count(*) FROM mssql.dbo.T WHERE name = 'abc';   -- 2
+DELETE FROM mssql.dbo.T WHERE name = 'abc';            -- deletes BOTH
+```
+
+The same statement against a native DuckDB table deletes one row. This is
+consistent — the `DELETE` removes exactly the rows the equivalent `SELECT`
+returns, and exactly what SSMS would do — but it is not what a reader who
+thinks in DuckDB semantics will predict, and on a destructive statement the
+difference is not recoverable.
+:::
+
+### Why it works this way
+
+Pushing the predicate is what makes the operation fast, and the pushed
+predicate is evaluated by the server. `UPDATE`/`DELETE` then target rows by
+their rowid key (see the rowid note in Limitations above), so the rows acted on are
+precisely the rows the scan returned — with the server's comparison rules
+already applied.
+
+The consequences worth knowing:
+
+| collation | `WHERE name = 'abc'` also matches | so `DELETE` also removes |
+|---|---|---|
+| `_CI_AS` (case-insensitive) | `'ABC'`, `'Abc'` | those rows |
+| `_CI_AI` (accent-insensitive too) | `'ábc'` | those rows |
+| `_BIN2` / `_BIN` | nothing extra | nothing extra |
+
+Trailing spaces are their own case: SQL Server pads on comparison, so
+`name = 'abc'` matches `'abc '` under **every** collation including `_BIN2`.
+
+### Making a statement collation-exact
+
+**Look before you delete.** The matching statement is the cheapest check there
+is, and it is exact — the `SELECT` returns precisely the rows the `DELETE`
+will take:
+
+```sql
+SELECT * FROM mssql.dbo.T WHERE name = 'abc';   -- these rows, exactly
+DELETE FROM mssql.dbo.T WHERE name = 'abc';
+```
+
+**To force exact-byte comparison**, write the T-SQL yourself with an explicit
+`COLLATE`, via [`mssql_exec()`](../reference/functions.md):
+
+```sql
+SELECT mssql_exec('mssql',
+  'DELETE FROM dbo.T WHERE name = N''abc'' COLLATE Latin1_General_BIN2');
+```
+
+That is case- and accent-sensitive whatever the column's collation says. Note
+it still will not distinguish a trailing space, because SQL Server pads on
+comparison under every collation — for that, add a sentinel:
+`WHERE name + N'~' = N'abc~'`.
+
+### Planned change
+
+Spec 061 proposes making server-side `UPDATE`/`DELETE` **collation-exact by
+default** — emitting the native predicate *and* a forced `COLLATE …_BIN2`
+comparison, so the rows modified are the rows DuckDB's own predicate selects.
+That is a deliberate divergence from `SELECT`, which keeps native server
+semantics: a destructive statement should be the conservative one. Until that
+lands, the behaviour on this page is what applies.
+
+## DELETE
+
+DELETE runs on any table, keyed as for [UPDATE](#update).
+
+### Basic DELETE
+
+```sql
+-- Delete single row
+DELETE FROM sqlserver.dbo.products WHERE id = 1;
+
+-- Delete multiple rows
+DELETE FROM sqlserver.dbo.products WHERE status = 'discontinued';
+
+-- Delete all rows (use with caution)
+DELETE FROM sqlserver.dbo.products;
+```
+
+### DELETE with Complex Conditions
+
+```sql
+DELETE FROM sqlserver.dbo.order_items
+WHERE order_id IN (SELECT id FROM sqlserver.dbo.orders WHERE status = 'cancelled');
+```
+
+### Limitations
+
+- **RETURNING** returns the rows as they were, with the `rowid`
+- On Azure Synapse every DELETE through the catalog is refused, as for UPDATE
+
+## UPDATE and DELETE … RETURNING
+
+```sql
+UPDATE sqlserver.dbo.products SET price = price * 1.1 WHERE category = 'premium'
+RETURNING id, price;
+
+DELETE FROM sqlserver.dbo.orders WHERE status = 'cancelled' RETURNING *;
+```
+
+An UPDATE returns each row as the server wrote it — computed and `rowversion`
+columns included — and a DELETE each row as it was before. Such a statement
+always goes through the `#stage` path below, whatever its size, with
+`OUTPUT … INTO` a session table that is then read back; that form works on a
+table with triggers, where a bare `OUTPUT` is refused. Not available on Fabric
+Warehouse and Azure Synapse yet, nor when a key or SET column cannot be
+bulk-loaded (`geometry`, `geography`). A RETURNING statement costs a few round
+trips more than the same statement without it, even for one row.
+
+## MERGE INTO
+
+A MERGE whose source is in the same database runs on SQL Server as **one
+MERGE statement**: the server matches the rows, and no row crosses the wire.
+
+```sql
+MERGE INTO sqlserver.dbo.products AS t
+USING sqlserver.dbo.price_updates AS s ON t.id = s.id
+WHEN MATCHED AND s.price IS NULL THEN DELETE
+WHEN MATCHED THEN UPDATE SET price = s.price
+WHEN NOT MATCHED THEN INSERT (id, price) VALUES (s.id, s.price);
+-- EXPLAIN: Mssql Dml
+--   Statement: MERGE [dbo].[products] AS [r1] USING [dbo].[price_updates] AS [r2]
+--              ON ([r1].[id] = [r2].[id]) WHEN MATCHED AND ([r2].[price] IS NULL) THEN DELETE …
+```
+
+What goes whole:
+
+- a source that is a table, `USING (column, …)`, or a query over the
+  database's tables (`USING (SELECT …) AS s`);
+- the ON condition and every WHEN condition, written as the WHERE of a pushed
+  UPDATE is, and SET / INSERT values under the UPDATE's SET rule;
+- the WHEN clauses T-SQL has:
+  - up to two `WHEN MATCHED` (one UPDATE and one DELETE, the first with a
+    condition);
+  - one `WHEN NOT MATCHED [BY TARGET]` INSERT, or `INSERT DEFAULT VALUES`;
+  - up to two `WHEN NOT MATCHED BY SOURCE` (one UPDATE and one DELETE, the
+    first with a condition).
+- A last `DO NOTHING` is dropped, since no later clause could take its rows.
+
+A target row that two source rows match is an error when the MERGE updates or
+deletes it (8672). The count is the MERGE's.
+
+### Any other source: through `#src`
+
+A MERGE whose source is not in the same database — a DuckDB table, a VALUES
+list, a file, another database — also runs on SQL Server as one MERGE
+statement. DuckDB computes the source rows and every expression over the
+source alone (any DuckDB function); the rows go into a session table
+`#src_<uuid>` by bulk load on the statement's own connection; one
+`MERGE … USING #src` does the match, the conditions and the writes on the
+server; the table is dropped.
+
+```sql
+MERGE INTO sqlserver.dbo.products AS t
+USING read_parquet('prices.parquet') AS s ON t.id = s.id
+WHEN MATCHED AND s.price IS NULL THEN DELETE
+WHEN MATCHED THEN UPDATE SET price = s.price
+WHEN NOT MATCHED THEN INSERT (id, price) VALUES (s.id, s.price);
+-- EXPLAIN: Mssql Staged Merge
+--   Statement: MERGE [dbo].[products] AS [t] USING [#src_…] AS [s]
+--              ON ([s].[c0] = [t].[id]) WHEN MATCHED AND ([s].[c1] = 1) THEN DELETE …
+```
+
+- It is one statement in one server transaction: a failing row rolls back
+  every other row, and in autocommit it commits with DuckDB's statement.
+- No key is needed on the target.
+- What reads the target — the ON condition, the WHEN conditions, a SET or
+  INSERT value such as `t.qty + s.delta` — is written in T-SQL. It follows the
+  same rules as the filters of a scan, and comparisons follow the column's
+  collation.
+- A source value compared directly with a target column is staged in that
+  column's own type and collation. A `datetime` read back therefore finds its
+  row. A value between two of a temporal column's steps (a `datetime` tick, a
+  `smalldatetime` minute, `datetime2(n)` / `time(n)` / `datetimeoffset(n)`
+  below 7 digits) is rounded onto the column's precision first, as the column
+  would store it. A `char` / `varchar` under a code-page collation is compared
+  in Unicode, so a character the code page lacks never matches its best-fit
+  letter.
+- ON cannot compare a column whose value does not come back from DuckDB as
+  stored: `time(7)`, `datetimeoffset(7)`, `xml`, spatial and CLR types. Such
+  a row would not match, and a WHEN NOT MATCHED INSERT would duplicate it.
+- With `mssql_dml_pushdown = false` every MERGE takes this path, a
+  same-database source included.
+
+### Refused by name
+
+There is no client-side MERGE for an MSSQL table: one the server cannot run is
+refused, and nothing is sent.
+
+- more WHEN clauses than T-SQL's shape above (DuckDB would apply the first
+  whose condition holds);
+- `DO NOTHING` before another clause of its kind, `ERROR`;
+- an INSERT naming the identity column (a MERGE runs without
+  IDENTITY_INSERT);
+- `RETURNING`;
+- a subquery in a condition or a value;
+- an expression over the target that T-SQL cannot write (a string function
+  such as `upper(t.name)`, whose case mapping the server does not share);
+- a volatile function or a parameter in a `WHEN NOT MATCHED BY SOURCE`
+  clause, which has no source row to compute it for;
+- a view as the target, and Azure Synapse;
+- DuckDB's optimizer turned off (`SET enable_optimizer = false`): the MERGE is
+  rewritten for the server there.
+
+`SET x = DEFAULT` writes NULL. DuckDB hands the extension the same thing for
+both. A MERGE whose every action is `DO NOTHING` changes nothing and sends
+nothing; its count is 0.
+
+## How UPDATE and DELETE reach the server
+
+### The whole statement on the server
+
+An UPDATE or DELETE whose WHERE and SET the extension can write in T-SQL is
+sent to SQL Server as **one statement**. The server selects the rows itself:
+no row crosses the wire, and no key is needed.
+
+```sql
+EXPLAIN UPDATE sqlserver.dbo.products SET price = price + 1 WHERE id <= 3;
+-- Mssql Dml
+--   Statement: UPDATE [r1] SET [price] = ([r1].[price] + @p0)
+--              FROM [dbo].[products] AS [r1] WHERE ([r1].[id] <= @p1)
+```
+
+What goes whole:
+
+- the WHERE, written as it is for a pushed SELECT. Comparisons, `IN`,
+  `BETWEEN`, `LIKE`, `IS NULL`, arithmetic, `CASE`, `COALESCE` and subqueries
+  all go. A condition is never sent in part: if any piece of it has no T-SQL
+  form, none of the statement does;
+- `UPDATE … FROM` another table of the same database, when the WHERE equates
+  that table's primary key (or unique index) with the target's columns. T-SQL
+  would otherwise update from an arbitrary one of several matching rows;
+- `DELETE … USING` tables of the same database;
+- a SET value that already has the column's type. For a number, a `bit` or a
+  `date` column that is another column of that type, arithmetic over such
+  columns, or a constant. For any other column -- strings, the date-time
+  types, binary -- it is a constant (a string must fit) or a column declared
+  exactly alike: SQL Server converts between, say, `datetime` and
+  `datetime2(6)` by rounding where DuckDB truncates.
+
+What stays with DuckDB, on the paths below:
+
+- `RETURNING`;
+- a function the extension has no T-SQL for, such as `lower`;
+- a SET value that DuckDB would convert. DuckDB rounds `SET int_col = 1.5`
+  to 2, where SQL Server would truncate it to 1;
+- a source table of another database, or a local one;
+- a statement inside a `WITH` (`WITH c AS (UPDATE …) SELECT …`);
+- a view as the target;
+- on Fabric Warehouse, any `FROM` / `USING` and any subquery. Fabric has no
+  `UPDATE … FROM`.
+
+A string comparison in the WHERE follows the column's collation, as a pushed
+SELECT's does (see [collation](#collation)).
+
+**What changes for a client.** The statement reaches DuckDB's executor as
+`SELECT * FROM mssql_dml(…)`:
+
+- its result is the same `Count` column;
+- it runs once and to the end, even when the client never reads the result;
+- `EXPLAIN` and `PREPARE` run nothing;
+- it waits as long as the statement takes, so `mssql_query_timeout` does not
+  cut a large copy short. Cancelling the query (Ctrl-C) cancels the statement,
+  and the server rolls it back. A connection that dies is noticed through TCP
+  keepalive within about 90 seconds;
+- its statement *type* is SELECT, so a driver that branches on the statement
+  type rather than on the result sees a query;
+- an error is SQL Server's own.
+
+`SET mssql_dml_pushdown = false` sends every UPDATE / DELETE down the paths
+below. `mssql_remote_pushdown` / the ATTACH option `remote_pushdown false`
+turns this off together with SELECT pushdown.
+
+### When the statement is not sent whole
+
+DuckDB selects the rows (its WHERE, its joins); the extension sends what to
+change. How it says which rows depends on the table's key and the row count.
+
+**The key** is chosen per table:
+
+1. the **primary key**;
+2. else a **usable unique index**: not filtered, not disabled, every key column
+   NOT NULL;
+3. else **every column of the table** (a table with no key).
+
+A key column must read back exactly. `TIME(7)` and `DATETIMEOFFSET(7)` lose
+their 100 ns digit on read, and `SQL_VARIANT`, `HIERARCHYID`, CLR types,
+`XML`, `IMAGE`, `TEXT` / `NTEXT`, `GEOMETRY` / `GEOGRAPHY` are not read in a
+form that identifies a row. A primary key with such a column falls through to
+a unique index; a table with no usable key and such a column is refused by
+name, never with a statement that changes nothing. `DATETIME` keys are fine:
+they are compared in their own type.
+
+**The delivery:**
+
+- A table with a key, up to `mssql_dml_stage_threshold` rows (default 1000,
+  counted as they arrive): `UPDATE … FROM t JOIN (VALUES …)` statements, up to
+  `mssql_dml_batch_size` rows each, all in one server transaction.
+- Past the threshold, and always for a table with no key: the rows go into a
+  session temp table `#stage_<id>` by bulk load, and **one** statement joins
+  it to the table — `UPDATE t SET … FROM t JOIN #stage` / `DELETE t FROM t
+  JOIN #stage`. It is never split into batches: how much one statement writes
+  is up to the statement.
+
+```sql
+SET mssql_dml_stage_threshold = 0;      -- stage every UPDATE / DELETE
+SET mssql_dml_stage_threshold = 100000; -- VALUES statements up to 100k rows
+```
+
+Either way a statement is atomic: a failure rolls back everything it wrote.
+In autocommit an UPDATE / DELETE / MERGE runs in the statement's own DuckDB
+transaction (issue #451): it is committed when DuckDB commits the statement, so
+an error later in the same statement, Ctrl-C, or a result dropped before its
+query ended rolls it back too, as it would a DuckDB table. See
+[Autocommit writes follow DuckDB](./transactions.md#autocommit-writes-follow-duckdb).
+
+On **Fabric Warehouse** every UPDATE / DELETE takes the `#stage` path (Fabric
+has no `UPDATE … FROM … JOIN`, which the VALUES statements are) and finds its
+rows through `WHERE EXISTS`. RETURNING is not available there yet. On
+**Azure Synapse** UPDATE / DELETE through the catalog are refused.
+A staged statement also checks that the server found every row it staged, and
+fails before its commit if not, rather than reporting fewer rows. The stage
+lives in `tempdb` for the statement's length and holds the selected rows'
+key (and new) values.
+
+### A table with no key
+
+Every column is the key: a selected row is found again by being equal to
+it in every column (NULL equal to NULL, strings byte for byte). So:
+
+- **Rows identical in every column move together.** If a table holds two
+  identical rows and the statement selects one, both are updated or deleted,
+  and the count says 2. A key is the fix.
+- **The server must select the same rows as DuckDB.** The statement runs only
+  when its rows come from the table's own scan with every condition sent to the
+  server. It is refused by name otherwise: when part of its WHERE runs in
+  DuckDB (a string function such as `lower()`, a subquery — `IN (SELECT …)`,
+  `EXISTS (…)` — or any condition the scan cannot send), when it computes a
+  volatile function (`random()`, `gen_random_uuid()`), for `UPDATE … FROM` /
+  `DELETE … USING`. (A `MERGE INTO` needs no key: it always runs on the server,
+  see [MERGE INTO](#merge-into).) The way out is a key: a primary key or a
+  unique index makes all of these work.
+- **No concurrent writer is assumed.** The rows are read, then found again by
+  value in a second step. In autocommit another session can insert an equal row
+  between the two (it is then updated too) or change a selected one (it is then
+  not found, and the statement fails rather than report fewer rows). Run the
+  statement in a transaction with `transaction_isolation 'snapshot'` (or
+  `'repeatable_read'`) on the ATTACH when other sessions write the table.
+- `rowid` stays unavailable: there is no key to expose.
+

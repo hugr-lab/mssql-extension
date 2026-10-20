@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-20
+
 The first release for **DuckDB 2.0**. DuckDB 1.5.x stays on the 0.2.x line
 (v0.2.5).
 
@@ -499,6 +501,9 @@ The first release for **DuckDB 2.0**. DuckDB 1.5.x stays on the 0.2.x line
 
 ### Changed
 
+- **The documentation lives at https://hugr-lab.com/docs/mssql-extension/** (#495,
+  #499). https://hugr-lab.github.io/mssql-extension/ keeps serving the same
+  pages and names hugr-lab.com as canonical.
 - **Breaking: an autocommit UPDATE / DELETE / MERGE commits and rolls back
   with DuckDB** (#451). Such a statement now runs on its catalog as a
   transaction of one statement, as postgres_scanner and mysql_scanner run every
@@ -640,6 +645,28 @@ The first release for **DuckDB 2.0**. DuckDB 1.5.x stays on the 0.2.x line
 
 ### Fixed
 
+- **The write path could desync the session, truncate silently or overflow its
+  own buffer on an over-large or empty-encoding value** (#489, #496). Both were
+  found by static analysis and an encode-side fuzz harness.
+  - A MAX-typed value past SQL Server's 2^31-1-byte limit is refused, with its
+    size named. Before, on the columnar BCP path that COPY / CTAS / INSERT
+    take, a value over 2 GiB had its 32-bit length wrap. An ASCII value then
+    went in silently truncated, a non-ASCII one overflowed the client's chunk
+    buffer, and an over-long value into a bounded column skipped its clamp.
+  - An `nvarchar(max)` value whose UTF-8 encodes to nothing (a lone invalid
+    byte, reachable from a raw scan of a code-page varchar, #224) was framed in
+    16 bytes where the value ends at 12. The four stray bytes desynced the
+    session.
+- **A malformed server response could read past a buffer or force a large
+  allocation** (#485, #486).
+  - A temporal value shorter than its type is refused on the string fallback
+    too (#89's path read past it).
+  - A PLP value's declared length no longer sizes an allocation before its bytes
+    arrive: one 8-byte response used to reserve 2 GiB.
+- **`mssql_azure_auth_test` showed the token's last three characters, and a
+  token of up to 16 characters in full** (#492). It now shows a JWT's 10-character
+  prefix and its length, `eyJ0eXAiOi... [1642 chars]`, and an opaque token's
+  length alone.
 - **`INSERT … RETURNING` failed on a table with an enabled trigger** (#471),
   including through a view over one, with SQL Server error 334: "cannot have
   any enabled triggers if the statement contains an OUTPUT clause without
