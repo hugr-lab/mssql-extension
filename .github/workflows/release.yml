@@ -132,7 +132,11 @@ jobs:
             brew install ninja ccache
           else
             sudo apt-get update
-            sudo apt-get install -y ninja-build ccache
+            # libkrb5-dev enables the integrated-auth (Kerberos) build path, as in
+            # ci.yml. Without it CMake only warns and the Linux assets shipped with
+            # no Kerberos at all (issue #502); the guard after the build fails on
+            # that now.
+            sudo apt-get install -y ninja-build ccache libkrb5-dev
           fi
 
       # Cache ccache to speed up compilation
@@ -228,6 +232,25 @@ jobs:
       - name: Show ccache stats
         shell: bash
         run: ccache -s
+
+      # Issue #502. CMake turns integrated auth off with only a warning when it
+      # cannot find the krb5 headers, so the Linux release assets went out
+      # without Kerberos and nothing noticed. The GSSAPI shim (spec 053) names
+      # the library it dlopens; a Linux build without that string has no
+      # Kerberos, and is not released.
+      - name: Verify the Linux build carries integrated authentication
+        if: matrix.platform.os == 'linux'
+        shell: bash
+        run: |
+          ext=build/release/extension/mssql/mssql.duckdb_extension
+          # grep -a on the file itself, not `strings | grep -q`: under the runner's
+          # pipefail an early grep exit makes strings die of SIGPIPE and the
+          # pipeline fail on the very binary that passes.
+          if ! grep -aq 'libgssapi_krb5.so.2' "$ext"; then
+            echo "::error::$ext was built without Kerberos (the GSSAPI shim is missing) -- is libkrb5-dev installed?"
+            exit 1
+          fi
+          echo "OK: $ext carries the GSSAPI shim (integrated authentication)"
 
       - name: Rename artifact
         shell: bash
