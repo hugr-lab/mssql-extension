@@ -752,6 +752,8 @@ jobs:
           EXT_VERSION="${TAG#v}"
           echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
           echo "tag=$TAG" >> $GITHUB_OUTPUT
+          # The DuckDB commit the binaries were built against: the submodule pin.
+          echo "duckdb=$(git ls-tree HEAD duckdb | awk '{print substr($3, 1, 11)}')" >> $GITHUB_OUTPUT
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -785,7 +787,7 @@ jobs:
           body: |
             ## MSSQL Extension ${{ steps.version.outputs.tag }}
 
-            Built against DuckDB v1.5 (variegata).
+            Built against DuckDB 2.0: `v2.0-cyanoptera` at `${{ steps.version.outputs.duckdb }}`, the commit in the duckdb submodule. A loadable extension loads only in the DuckDB build it was compiled for, so on a released DuckDB install it from the community repository instead: `INSTALL mssql FROM community`. DuckDB 1.5.x stays on v0.2.5.
 
             ### Downloads
 

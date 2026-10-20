@@ -115,7 +115,8 @@ CREATE SECRET my_sqlserver (
     port 1433,
     database 'master',
     user 'sa',
-    password 'YourPassword123'
+    password 'YourPassword123',
+    trust_server_certificate true  -- a self-signed certificate (the docker image); drop it for a trusted one
 );
 
 ATTACH '' AS sqlserver (TYPE mssql, SECRET my_sqlserver);
@@ -124,7 +125,7 @@ ATTACH '' AS sqlserver (TYPE mssql, SECRET my_sqlserver);
 #### Option B: Using Connection String
 
 ```sql
-ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=YourPassword123'
+ATTACH 'Server=localhost,1433;Database=master;User Id=sa;Password=YourPassword123;TrustServerCertificate=yes'
     AS sqlserver (TYPE mssql);
 ```
 
