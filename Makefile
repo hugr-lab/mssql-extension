@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay leak-check help
+.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -1310,6 +1310,21 @@ fuzz-encode-replay: release
 leak-check:
 	$(PROJ_DIR)scripts/ci/leak_check.sh
 
+# The credential-in-log gate (scripts/ci/check_credential_logging.py): no
+# credential VALUE may reach a log line, an exception message or a format call.
+# The structural form of Joern's q6, as a gate that needs no Joern and no CPG --
+# because credential disclosure is a regression class (issue #492), not a
+# discovery class. Self-tests the detector first, since a silently-broken gate
+# is worse than none.
+#
+# Scope, stated plainly: logs, exceptions and format calls. NOT a function's
+# return value, which is what #492 itself was -- mssql_azure_auth_test returned
+# a string holding the token's last three characters. Catching that class in a
+# grep gate would flag every getter, so it stays a review question.
+check-credential-logging:
+	$(PROJ_DIR)scripts/ci/check_credential_logging.py --self-test
+	$(PROJ_DIR)scripts/ci/check_credential_logging.py --root src
+
 # Show help
 help:
 	@echo "DuckDB MSSQL Extension Build System"
@@ -1330,6 +1345,7 @@ help:
 	@echo "  make joern-shell          - Open the Joern REPL on the CPG"
 	@echo "  make fuzz-encode-replay   - Replay the BCP/PLP encode corpus under ASan+UBSan (fuzz/README.md)"
 	@echo "  make leak-check           - LeakSanitizer over the DuckDB-free fuzz corpora (Linux only)"
+	@echo "  make check-credential-logging - Gate: no credential value reaches a log, exception or format call"
 	@echo "  make test-all             - Run all tests"
 	@echo "  make test-debug           - Run tests with debug build"
 	@echo "  make test-simple-query    - Run C++ simple query test"
