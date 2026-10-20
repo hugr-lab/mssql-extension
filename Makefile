@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging help
+.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -1289,6 +1289,27 @@ fuzz-encode-replay: release
 	@echo "Replaying the BCP/PLP encode corpus..."
 	DYLD_LIBRARY_PATH=$(FUZZ_DUCKDB_LIB) LD_LIBRARY_PATH=$(FUZZ_DUCKDB_LIB) \
 	    $(PROJ_DIR)fuzz/out/fuzz_bcp_encode $(PROJ_DIR)fuzz/corpus/bcp_encode
+# LeakSanitizer over the DuckDB-free fuzz harnesses' stored corpora
+# (scripts/ci/leak_check.sh). LSan ships inside ASan and is ON BY DEFAULT on
+# Linux; the one lane that would run it passes detect_leaks=0, because libduckdb
+# is uninstrumented and its static initialisers hold allocations for process
+# lifetime. Five of the seven harnesses link NO libduckdb, so there LSan is
+# clean by construction and needs no suppression file.
+#
+# A corpus REPLAY checks cumulatively at exit, which is a different question
+# from libFuzzer's per-input leak check.
+#
+# Linux only -- Apple's toolchain ships no LSan (measured: "detect_leaks is not
+# supported on this platform"), so this SKIPS on macOS rather than passing
+# vacuously. The script prints the container command to run it there.
+#
+# Note the corpus it replays is whatever is on disk: the repo tracks a handful
+# of seeds per harness, while a machine that has run a campaign may hold
+# hundreds. The script prints the per-harness input count so a local run and a
+# CI run are never confused for the same coverage.
+leak-check:
+	$(PROJ_DIR)scripts/ci/leak_check.sh
+
 # The credential-in-log gate (scripts/ci/check_credential_logging.py): no
 # credential VALUE may reach a log line, an exception message or a format call.
 # The structural form of Joern's q6, as a gate that needs no Joern and no CPG --
@@ -1323,6 +1344,7 @@ help:
 	@echo "  make joern-scan           - Run the Joern query suite (JOERN_QUERY=q3 for one query)"
 	@echo "  make joern-shell          - Open the Joern REPL on the CPG"
 	@echo "  make fuzz-encode-replay   - Replay the BCP/PLP encode corpus under ASan+UBSan (fuzz/README.md)"
+	@echo "  make leak-check           - LeakSanitizer over the DuckDB-free fuzz corpora (Linux only)"
 	@echo "  make check-credential-logging - Gate: no credential value reaches a log, exception or format call"
 	@echo "  make test-all             - Run all tests"
 	@echo "  make test-debug           - Run tests with debug build"
