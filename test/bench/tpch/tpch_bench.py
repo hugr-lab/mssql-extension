@@ -219,9 +219,45 @@ def cmd_load(args):
 
 # --------------------------------------------------------------------------- sessions
 
-def query_text(client, q):
-    kind = CLIENTS[client]["queries"]
+#: q11's FRACTION is the one TPC-H constant that scales with the scale factor:
+#: 0.0001/SF. Both query texts carry the SF1 value, inherited from DuckDB
+#: upstream, whose shipped answers stop at SF1.
+#:
+#: Left unscaled, the threshold stays put while the per-part values grow, so
+#: from about SF2 upward the HAVING passes NOTHING and q11 measures an empty
+#: result set. It was still published as a four-client comparison with a
+#: conclusion drawn from it, and `compare()` called it `ok` because 0 == 0
+#: (issue #505): at SF10 client C returned 0 rows while A streamed 8,004,050
+#: and B 16,008,100 rows to DuckDB to compute nothing.
+#:
+#: Every other TPC-H constant (dates, quantities, brands) is fixed by the spec
+#: and does not scale, so this is the only substitution needed.
+Q11_SF1_FRACTION = "0.0001000000"
+
+
+def read_query(kind, q, sf):
+    """The query text from `queries/<kind>/<q>.sql`, scale-factor substituted.
+
+    Fails loudly when a substitution it expects to make has nothing to match:
+    a silently-skipped scaling is what put an empty result set into the
+    published numbers, and a check that quietly stops checking is worse than
+    no check.
+    """
     sql = (HERE / "queries" / kind / f"{q}.sql").read_text().strip().rstrip(";").strip()
+    if q == "q11":
+        if Q11_SF1_FRACTION not in sql:
+            sys.exit(f"{kind}/{q}.sql no longer contains the SF1 FRACTION {Q11_SF1_FRACTION}, so the "
+                     f"0.0001/SF scaling cannot be applied. Fix the substitution rather than running "
+                     f"q11 unscaled -- unscaled it returns no rows above about SF2 (issue #505).")
+        # 12 decimals covers the README's planned range: SF1 -> 0.000100000000,
+        # SF1000 -> 0.000000100000.
+        sql = sql.replace(Q11_SF1_FRACTION, f"{0.0001 / sf:.12f}")
+    return sql
+
+
+def query_text(client, q, sf):
+    kind = CLIENTS[client]["queries"]
+    sql = read_query(kind, q, sf)
     if kind == "tsql":
         return f"SELECT * FROM mssql_scan('tpch', '{esc(sql)}');"
     return sql + ";"
@@ -269,7 +305,7 @@ def timed_session(client, cfg, args, queries):
     s.append(".timer on")
     for tag in (["W"] * args.warmup) + ["T"]:
         for q in queries:
-            s += [".output", f".print @@{tag} {q}@@", ".output /dev/null", query_text(client, q)]
+            s += [".output", f".print @@{tag} {q}@@", ".output /dev/null", query_text(client, q, args.sf)]
     s += [".output", ".print @@END end@@"]
     rc, text = run_cli(binary(CLIENTS[client]["bin"]), "\n".join(s) + "\n", cfg, timeout=args.timeout)
     return parse_marked(text, "T"), text
@@ -358,7 +394,7 @@ def cmd_verify(args):
     # The oracle: DuckDB 1.5.6 over the same parquet the server was loaded from.
     s = [f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{data / (t + '.parquet')}');" for t in TABLES]
     for q in queries:
-        sql = (HERE / "queries/duckdb" / f"{q}.sql").read_text().strip().rstrip(";")
+        sql = read_query("duckdb", q, args.sf)
         s.append(f"COPY ({sql}) TO '{out / ('oracle-' + q + '.csv')}' (HEADER false);")
     rc, text = run_cli(binary("A"), "\n".join(s) + "\n", cfg)
     if rc != 0:
@@ -366,7 +402,7 @@ def cmd_verify(args):
     for client in clients:
         s = session_head(client, cfg, args)
         for q in queries:
-            body = query_text(client, q).rstrip(";")
+            body = query_text(client, q, args.sf).rstrip(";")
             s.append(f"COPY ({body}) TO '{out / (client + '-' + q + '.csv')}' (HEADER false);")
         rc, text = run_cli(binary(CLIENTS[client]["bin"]), "\n".join(s) + "\n", cfg, timeout=args.timeout)
         if text.strip():
@@ -416,7 +452,7 @@ def cmd_explain(args):
     _, queries = selected(args)
     s = session_head("B", cfg, args) + ["PRAGMA explain_output = 'physical_only';"]
     for q in queries:
-        s += [f".print @@X {q}@@", "EXPLAIN " + query_text("B", q)]
+        s += [f".print @@X {q}@@", "EXPLAIN " + query_text("B", q, args.sf)]
     rc, text = run_cli(binary("B"), "\n".join(s) + "\n", cfg)
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -480,7 +516,7 @@ def cmd_trace(args):
         s.append(f"ATTACH '{esc(dsn(cfg, 'master', args.encrypt))}' AS adm (TYPE mssql{opts});")
         s.append(".mode csv")
         for q in queries:
-            qt = query_text(client, q)
+            qt = query_text(client, q, args.sf)
             s += [".output /dev/null", qt,
                   "SELECT mssql_exec('adm', 'DBCC FREEPROCCACHE WITH NO_INFOMSGS');",
                   ".output", f".print @@Q {q}@@", ".output /dev/null", ".timer on", qt, ".timer off", ".output",
