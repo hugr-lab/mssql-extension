@@ -118,3 +118,47 @@ order of priority yet.
   ALL` / `INTERSECT ALL` (no T-SQL form; a ROW_NUMBER rewrite), `float`
   `+ - *` (inf in DuckDB, an error there), `min` / `max` of a string (an
   order under D4), mixed-type set operation columns with an explicit cast.
+
+## Measured on TPC-H (test/bench/tpch, 2026-10-20)
+
+TPC-H SF1 in a local SQL Server, with clustered columnstore and string columns typed as the specification says (`CHAR(n)` / `VARCHAR(n)`). Client B is DuckDB 2.0 + 0.3.0.
+- **Pushed whole:** only q18. That one query ran 35× faster than 0.2.5: 0.057 s against 2.03 s, close to native SQL Server's 0.084 s.
+- **Pushed partly:** q13. Only its inner `customer LEFT JOIN orders … GROUP BY c_custkey` goes: 150000 rows come back, and the server spends 1024 ms CPU on that half against 618 ms for the whole query natively. Why the outer GROUP BY / ORDER BY was handed back is not yet known; look at the gain check.
+- **Not pushed:** the other 20.
+
+Over the 22 queries: 0.2.5 took 20.7 s, 0.3.0 16.6 s, and native SQL Server 1.55 s. That gap is the size of what follows. Each query reports only its first veto (from `MSSQL_DEBUG=1` on an EXPLAIN), so removing one may uncover the next.
+
+- **Decimal arithmetic over different types** stops about half of TPC-H. The cases:
+
+  | operation | queries | DuckDB's type |
+  |---|---|---|
+  | `DECIMAL(15,2)` with `DECIMAL(16,2)`, from `l_extendedprice * (1 - l_discount)` | q01, q03, q05, q10, q14, q15, q19 | `1 - l_discount` widens to (16,2) |
+  | `DECIMAL(15,2) * BIGINT` | q11 | |
+  | a product | q06 | `DECIMAL(18)`, the veto taking DuckDB's int64 overflow into account |
+  | a `DECIMAL(38,2)` product | q20 | |
+
+  For `+ - *`, while the result stays within 38 digits, the result type is the same on both sides: precision p1 + p2 (+1), scale s1 + s2 for a product; max scale for a sum or difference. Both sides are then exact, and both raise an error on overflow. Allow these, and keep division and anything past 38 digits vetoed.
+- **`date_part('year', DATE)`**, i.e. `extract(year …)`, stops q07, q08 and q09. `YEAR(x)` is exact for DATE and datetime2. Those three then meet the decimal veto above.
+- **ORDER BY a string** stops q02, q04, q16 and q21, because the server orders by collation (D4). Two ways to remove it:
+  1. **Order by the UTF-8 bytes** for `nvarchar(n)`, `char(n)` (after `RTRIM`) and code-page `varchar(n)`, not only for a UTF-8 `varchar` under a LIMIT, the `OrdersLikeDuckDBAsBytes` rule of today:
+     ```sql
+     ORDER BY CAST(CAST(col AS varchar(3*n) COLLATE Latin1_General_100_BIN2_UTF8) AS varbinary(3*n))
+     ```
+     - Comparing varbinary does not consult a collation. UTF-8 byte order is code point order, which is how DuckDB orders strings; the UTF-8 collation only serves to get the UTF-8 encoding.
+     - One UTF-16 unit is at most 3 UTF-8 bytes, so `varchar(3n)` is enough, MAX past 8000.
+     - UTF-8 collations need SQL Server 2019+.
+     - `varbinary` of the nvarchar itself would be UTF-16LE, whose byte order is not code point order.
+     - In the writer, unlike `mssql_order_pushdown`, the stake is the whole statement, so the LIMIT-only rule need not apply.
+     - **Owner's caveat (2026-10-20):** not sure this is right where the database's collation orders strings its own way. Verify on CI, BIN2, UTF-8 and `SQL_` collations against DuckDB's order before relying on it.
+  2. **Push everything but the top-level ORDER BY** and let DuckDB sort the (small) result. This is exact for every type, CHAR padding included, and independent of collation.
+
+  Either leaves D4 for GROUP BY / DISTINCT / join keys as it is.
+- **A BIN2 column orders like DuckDB.**
+  - `…_BIN2` / `…_BIN2_UTF8` compare and order by code point, as DuckDB does, so an ORDER BY / GROUP BY / DISTINCT on such a column could be pushed as is, without the varbinary form and without D4's caveat.
+  - Measured on the same TPC-H data with four string schemas (`test/bench/tpch/RESULTS-local.md`):
+    - UTF-8 `varchar` already sends q02 and q21 whole, through the bytes order under their LIMIT 100 (q21: 20.7 s → 0.47 s);
+    - BIN2 also makes LIKE cheap on the server: q13 costs 20 s of server CPU, against 56–63 s under NVARCHAR or a CI UTF-8 collation.
+- **The rest:**
+  - q12, "an expression of constants only": not understood yet.
+  - q17, `DOUBLE` arithmetic (`0.2 * avg(…)`): the known float veto.
+  - q22, `substring`: no string function is pushed, by design.
