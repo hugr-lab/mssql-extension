@@ -139,8 +139,26 @@ Over the 22 queries: 0.2.5 took 20.7 s, 0.3.0 16.6 s, and native SQL Server 1.55
 
   For `+ - *`, while the result stays within 38 digits, the result type is the same on both sides: precision p1 + p2 (+1), scale s1 + s2 for a product; max scale for a sum or difference. Both sides are then exact, and both raise an error on overflow. Allow these, and keep division and anything past 38 digits vetoed.
 - **`date_part('year', DATE)`**, i.e. `extract(year …)`, stops q07, q08 and q09. `YEAR(x)` is exact for DATE and datetime2. Those three then meet the decimal veto above.
-- **ORDER BY a string** stops q02, q04, q16 and q21, because the server orders by collation (D4). Two ways to remove it:
-  1. **Order by the UTF-8 bytes** for `nvarchar(n)`, `char(n)` (after `RTRIM`) and code-page `varchar(n)`, not only for a UTF-8 `varchar` under a LIMIT, the `OrdersLikeDuckDBAsBytes` rule of today:
+- **ORDER BY: send it whenever the server orders the same way, sort in DuckDB otherwise (owner's decision, 2026-10-21).**
+  - **The keys order on the server as in DuckDB** (numbers, dates, UTF-8 `varchar` by its bytes, a BIN2 column, `OrdersLikeDuckDB`): the ORDER BY goes to the server always, at the top and in a subquery or CTE alike.
+    - The query asked for that order, and it is not the extension's call whether the order matters: the SQL Server optimizer decides.
+    - In a derived table or CTE, T-SQL takes an ORDER BY only with TOP / OFFSET, so it is written `ORDER BY … OFFSET 0 ROWS`. Without one the server refuses it with error 1033, "The ORDER BY clause is invalid in views, inline functions, derived tables, subqueries, and common table expressions, unless TOP, OFFSET or FOR XML is also specified" (checked on SQL Server 2022). At the top level an ORDER BY needs neither.
+  - **The server would order differently** (a string under a collation, D4): DuckDB sorts it afterwards.
+    - At the top level, everything else goes to the server and DuckDB sorts the pushed result. The order is DuckDB's whatever the collation; no varbinary form is needed.
+    - In a subquery or CTE, the subquery goes to the server without that ORDER BY. DuckDB sorts its result, and the enclosing query stays in DuckDB and is not rewritten further.
+  - Today an ORDER BY the writer cannot render vetoes the whole statement, and a renderable one inside a derived table is not written whole. Measured on TestDB:
+
+    | statement | what goes to the server today |
+    |---|---|
+    | `SELECT count(*), sum(k) FROM (SELECT id, k FROM t ORDER BY k) s` | only the inner SELECT (with its `ORDER BY [k]`); every row travels and DuckDB aggregates. Under the rule: the whole statement, with `ORDER BY [k] OFFSET 0 ROWS` inside |
+    | the same with `ORDER BY name` (nvarchar) | nothing; D4's "the server does not order nvarchar as DuckDB does" vetoes the whole statement. Under the rule: the subquery without its ORDER BY, the sort and the aggregate in DuckDB |
+    | `WITH c AS (SELECT … ORDER BY name) SELECT name, count(*) FROM c GROUP BY name` | nothing, the same veto |
+    | `SELECT k, count(*) FROM t GROUP BY k` (no ORDER BY) | the whole statement |
+
+    Subqueries and CTEs with an ORDER BY are common in generated SQL (BI tools, dbt, ORMs).
+  - Under a LIMIT / OFFSET (TOP N) the server must order before it cuts, so a key it orders differently cannot be sorted afterwards by DuckDB. The next item widens which string keys the server orders like DuckDB.
+- **More string keys the server orders like DuckDB** (q02 and q21 here, under their LIMIT; q04 and q16, which have none, are covered by the rule above). Two ways to widen it:
+  1. **Order by the UTF-8 bytes** for `nvarchar(n)`, `char(n)` (after `RTRIM`) and code-page `varchar(n)`, not only for a UTF-8 `varchar`, the `OrdersLikeDuckDBAsBytes` rule of today:
      ```sql
      ORDER BY CAST(CAST(col AS varchar(3*n) COLLATE Latin1_General_100_BIN2_UTF8) AS varbinary(3*n))
      ```
@@ -148,9 +166,8 @@ Over the 22 queries: 0.2.5 took 20.7 s, 0.3.0 16.6 s, and native SQL Server 1.55
      - One UTF-16 unit is at most 3 UTF-8 bytes, so `varchar(3n)` is enough, MAX past 8000.
      - UTF-8 collations need SQL Server 2019+.
      - `varbinary` of the nvarchar itself would be UTF-16LE, whose byte order is not code point order.
-     - In the writer, unlike `mssql_order_pushdown`, the stake is the whole statement, so the LIMIT-only rule need not apply.
      - **Owner's caveat (2026-10-20):** not sure this is right where the database's collation orders strings its own way. Verify on CI, BIN2, UTF-8 and `SQL_` collations against DuckDB's order before relying on it.
-  2. **Push everything but the top-level ORDER BY** and let DuckDB sort the (small) result. This is exact for every type, CHAR padding included, and independent of collation.
+  2. **A BIN2 column**: the next item.
 
   Either leaves D4 for GROUP BY / DISTINCT / join keys as it is.
 - **A BIN2 column orders like DuckDB.**
