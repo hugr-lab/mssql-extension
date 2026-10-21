@@ -95,10 +95,60 @@ order of priority yet.
   join guard). A FROM subquery or a CTE body in a statement that also reads a
   local table is not finished by DuckDB's rewriter on its own --
   duckdb/duckdb#26280; nothing to change here when DuckDB does.
-- **A user's own `mssql_scan` inside a pushed statement.** A raw scan on the
-  same catalog inside a CTE or a subquery could be inlined as a derived table
-  (its describe gives the types, its parameters merge with ours; refuse T-SQL
-  that cannot nest: ORDER BY without TOP, several statements, DECLARE).
+- **A query over a user's own `mssql_scan` / `mssql_scan_params` (owner,
+  2026-10-21).** Today nothing over a raw scan goes to the server.
+  `mssql_scan` has neither `filter_pushdown` nor `projection_pushdown` (only
+  the catalog scan has them), and the remote-pushdown rewriter sees catalog
+  tables only. So `SELECT a FROM mssql_scan(db, '<T-SQL>') WHERE b > 5 ORDER
+  BY a LIMIT 10` brings every row of the T-SQL over and DuckDB filters,
+  projects, sorts and cuts. The T-SQL already runs on the server, so it can be
+  the inside of a derived table.
+  - **Step 1, the operators over the scan.** Wrap the text as `SELECT … FROM
+    (<T-SQL>) AS [r1]([c1], [c2], …)` and push the enclosing projection,
+    filters, aggregates, ORDER BY and LIMIT into it. The column alias list
+    names every column, so an unnamed one (`SELECT count(*) …`) or a
+    duplicate does not fail the derived table (error 8155 / 8156). The
+    types come from the scan's describe (spec 075), or from `columns` for
+    `mssql_scan_unsafe` (spec 081). A filter alone could go through
+    `filter_pushdown` on the raw scan with the same FilterEncoder as the
+    catalog scan. The wider shapes (aggregates, ORDER BY, LIMIT) need the
+    writer, through `MSSQLOptimizer`, which already knows the raw scans
+    (`IsRawScanName`).
+  - **Step 2, inlined with the same catalog's tables.** When the enclosing
+    statement also reads tables of the same catalog (a join, IN / EXISTS, a
+    CTE), the scan is inlined into the pushed statement as a derived table
+    and the whole statement goes as one. Another catalog's scan, or a local
+    table, keeps the scan as it is.
+  - **Text that cannot nest:** several statements, DECLARE / SET, a `#temp`
+    the batch creates, EXEC, `SELECT … INTO`, `OPTION (…)`, `FOR XML` /
+    `FOR JSON`. A leading `WITH` cannot sit inside a derived table either
+    (T-SQL has no CTE there); it would have to be hoisted to the top of the
+    pushed statement, renamed against ours. Telling these apart needs a
+    lexer over the user's text (literals, comments, `[…]` skipped, as
+    `SqlMayChangeSchema` does). Whatever it does not recognise as a single
+    SELECT keeps the scan as it is. `mssql_scan_params` parameters merge
+    with the writer's, renamed where they clash.
+  - **Sorting (the open part):**
+    - *An outer ORDER BY* follows the ORDER BY rule below, keyed on the
+      described type and collation of the scan's column
+      (`sp_describe_first_result_set` returns `collation_name`). A string
+      under a collation is sorted by DuckDB; a number, a date, a UTF-8 or
+      BIN2 string goes with the rest. A computed column whose collation the
+      describe reports from an expression should be checked before it is
+      trusted.
+    - *An ORDER BY inside the user's text.* At the top level of their batch
+      it is legal; inside a derived table the server refuses it (1033)
+      unless TOP / OFFSET / FOR XML is there. The written order must not be
+      dropped (owner's rule), and the extension does not rewrite the user's
+      T-SQL. So such a text is not wrapped: the scan stays as it is.
+    - *Order the user relies on today.* A raw scan is one stream, so
+      `SELECT * FROM mssql_scan(db, '… ORDER BY x') LIMIT 10` returns the
+      first ten by `x`. Wrapped as `SELECT TOP (10) … FROM (… ORDER BY x
+      OFFSET 0 ROWS) r`, the server guarantees no order through the derived
+      table, so the result would be any ten rows. The same holds for any
+      operator over the scan that DuckDB runs in order of arrival. This is
+      one more reason not to wrap a text with an ORDER BY. A text without
+      one carries no order to keep.
 - **`IGNORE NULLS` in a window (`last_value(x IGNORE NULLS)`, the
   forward-fill idiom).** The server takes it from SQL Server 2022 and refuses
   it as a syntax error before; the extension keeps only the TDS version, which

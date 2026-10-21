@@ -66,6 +66,18 @@ The same data in four schemas, set with `--strings` / `--collation`:
 - **UTF-8 `varchar` is ordered by its bytes under a LIMIT**, which is how DuckDB orders strings. So q02 and q21 (`ORDER BY … LIMIT 100`) go to the server whole: q21 20.7 s → 0.47 s.
 - **BIN2 makes string comparison cheap on the server.** q13's `NOT LIKE '%special%requests%'` costs 20 s of server CPU under BIN2 (and the code page) against 56–63 s under NVARCHAR or the CI UTF-8 collation. BIN2 is also the collation whose comparisons and order are DuckDB's own; `mssql_utf8_collation` defaults to it for CTAS.
 
+## The raw output
+
+[`measured/2026-10-20-local/`](measured/2026-10-20-local/) holds the files these tables come from, as `tpch_bench.py` wrote them under `results/`:
+
+| directory | what is in it |
+|---|---|
+| `sf1/`, `sf10/` | the timed runs: `report.md` (medians and ratios) and `timings.csv` (every rep); `sf10/` is the SF10 table above. SF1 was the harness's first pass |
+| `*/trace/` | `trace-<client>.md`: per query, the statements the client sent, rows, server elapsed / CPU / reads. `sf10/trace` is the code-page `CHAR`/`VARCHAR` schema; `sf10-nvarchar`, `sf10-utf8-ci` and `sf10-utf8-bin2` are the other three rows of the string table |
+| `sf10-utf8-bin2/explain-B.txt` | `EXPLAIN` of all 22 queries under B on the BIN2 UTF-8 schema: the vehicles and the DuckDB operators left above them |
+
+Left out: the `verify` CSVs (each client's result per query against the DuckDB oracle, 6 MB), which `tpch_bench.py verify` writes again, and the `.log` files the repository ignores, which hold the same numbers as `timings.csv` and `trace-*.md`.
+
 ## Not yet measured
 
 - The rowstore layout.
