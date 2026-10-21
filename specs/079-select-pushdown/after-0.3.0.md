@@ -95,10 +95,60 @@ order of priority yet.
   join guard). A FROM subquery or a CTE body in a statement that also reads a
   local table is not finished by DuckDB's rewriter on its own --
   duckdb/duckdb#26280; nothing to change here when DuckDB does.
-- **A user's own `mssql_scan` inside a pushed statement.** A raw scan on the
-  same catalog inside a CTE or a subquery could be inlined as a derived table
-  (its describe gives the types, its parameters merge with ours; refuse T-SQL
-  that cannot nest: ORDER BY without TOP, several statements, DECLARE).
+- **A query over a user's own `mssql_scan` / `mssql_scan_params` (owner,
+  2026-10-21).** Today nothing over a raw scan goes to the server.
+  `mssql_scan` has neither `filter_pushdown` nor `projection_pushdown` (only
+  the catalog scan has them), and the remote-pushdown rewriter sees catalog
+  tables only. So `SELECT a FROM mssql_scan(db, '<T-SQL>') WHERE b > 5 ORDER
+  BY a LIMIT 10` brings every row of the T-SQL over and DuckDB filters,
+  projects, sorts and cuts. The T-SQL already runs on the server, so it can be
+  the inside of a derived table.
+  - **Step 1, the operators over the scan.** Wrap the text as `SELECT … FROM
+    (<T-SQL>) AS [r1]([c1], [c2], …)` and push the enclosing projection,
+    filters, aggregates, ORDER BY and LIMIT into it. The column alias list
+    names every column, so an unnamed one (`SELECT count(*) …`) or a
+    duplicate does not fail the derived table (error 8155 / 8156). The
+    types come from the scan's describe (spec 075), or from `columns` for
+    `mssql_scan_unsafe` (spec 081). A filter alone could go through
+    `filter_pushdown` on the raw scan with the same FilterEncoder as the
+    catalog scan. The wider shapes (aggregates, ORDER BY, LIMIT) need the
+    writer, through `MSSQLOptimizer`, which already knows the raw scans
+    (`IsRawScanName`).
+  - **Step 2, inlined with the same catalog's tables.** When the enclosing
+    statement also reads tables of the same catalog (a join, IN / EXISTS, a
+    CTE), the scan is inlined into the pushed statement as a derived table
+    and the whole statement goes as one. Another catalog's scan, or a local
+    table, keeps the scan as it is.
+  - **Text that cannot nest:** several statements, DECLARE / SET, a `#temp`
+    the batch creates, EXEC, `SELECT … INTO`, `OPTION (…)`, `FOR XML` /
+    `FOR JSON`. A leading `WITH` cannot sit inside a derived table either
+    (T-SQL has no CTE there); it would have to be hoisted to the top of the
+    pushed statement, renamed against ours. Telling these apart needs a
+    lexer over the user's text (literals, comments, `[…]` skipped, as
+    `SqlMayChangeSchema` does). Whatever it does not recognise as a single
+    SELECT keeps the scan as it is. `mssql_scan_params` parameters merge
+    with the writer's, renamed where they clash.
+  - **Sorting (the open part):**
+    - *An outer ORDER BY* follows the ORDER BY rule below, keyed on the
+      described type and collation of the scan's column
+      (`sp_describe_first_result_set` returns `collation_name`). A string
+      under a collation is sorted by DuckDB; a number, a date, a UTF-8 or
+      BIN2 string goes with the rest. A computed column whose collation the
+      describe reports from an expression should be checked before it is
+      trusted.
+    - *An ORDER BY inside the user's text.* At the top level of their batch
+      it is legal; inside a derived table the server refuses it (1033)
+      unless TOP / OFFSET / FOR XML is there. The written order must not be
+      dropped (owner's rule), and the extension does not rewrite the user's
+      T-SQL. So such a text is not wrapped: the scan stays as it is.
+    - *Order the user relies on today.* A raw scan is one stream, so
+      `SELECT * FROM mssql_scan(db, '… ORDER BY x') LIMIT 10` returns the
+      first ten by `x`. Wrapped as `SELECT TOP (10) … FROM (… ORDER BY x
+      OFFSET 0 ROWS) r`, the server guarantees no order through the derived
+      table, so the result would be any ten rows. The same holds for any
+      operator over the scan that DuckDB runs in order of arrival. This is
+      one more reason not to wrap a text with an ORDER BY. A text without
+      one carries no order to keep.
 - **`IGNORE NULLS` in a window (`last_value(x IGNORE NULLS)`, the
   forward-fill idiom).** The server takes it from SQL Server 2022 and refuses
   it as a syntax error before; the extension keeps only the TDS version, which
@@ -118,3 +168,64 @@ order of priority yet.
   ALL` / `INTERSECT ALL` (no T-SQL form; a ROW_NUMBER rewrite), `float`
   `+ - *` (inf in DuckDB, an error there), `min` / `max` of a string (an
   order under D4), mixed-type set operation columns with an explicit cast.
+
+## Measured on TPC-H (test/bench/tpch, 2026-10-20)
+
+TPC-H SF1 in a local SQL Server, with clustered columnstore and string columns typed as the specification says (`CHAR(n)` / `VARCHAR(n)`). Client B is DuckDB 2.0 + 0.3.0.
+- **Pushed whole:** only q18. That one query ran 35× faster than 0.2.5: 0.057 s against 2.03 s, close to native SQL Server's 0.084 s.
+- **Pushed partly:** q13. Only its inner `customer LEFT JOIN orders … GROUP BY c_custkey` goes: 150000 rows come back, and the server spends 1024 ms CPU on that half against 618 ms for the whole query natively. Why the outer GROUP BY / ORDER BY was handed back is not yet known; look at the gain check.
+- **Not pushed:** the other 20.
+
+Over the 22 queries: 0.2.5 took 20.7 s, 0.3.0 16.6 s, and native SQL Server 1.55 s. That gap is the size of what follows. Each query reports only its first veto (from `MSSQL_DEBUG=1` on an EXPLAIN), so removing one may uncover the next.
+
+- **Decimal arithmetic over different types** stops about half of TPC-H. The cases:
+
+  | operation | queries | DuckDB's type |
+  |---|---|---|
+  | `DECIMAL(15,2)` with `DECIMAL(16,2)`, from `l_extendedprice * (1 - l_discount)` | q01, q03, q05, q10, q14, q15, q19 | `1 - l_discount` widens to (16,2) |
+  | `DECIMAL(15,2) * BIGINT` | q11 | |
+  | a product | q06 | `DECIMAL(18)`, the veto taking DuckDB's int64 overflow into account |
+  | a `DECIMAL(38,2)` product | q20 | |
+
+  For `+ - *`, while the result stays within 38 digits, the result type is the same on both sides: precision p1 + p2 (+1), scale s1 + s2 for a product; max scale for a sum or difference. Both sides are then exact, and both raise an error on overflow. Allow these, and keep division and anything past 38 digits vetoed.
+- **`date_part('year', DATE)`**, i.e. `extract(year …)`, stops q07, q08 and q09. `YEAR(x)` is exact for DATE and datetime2. Those three then meet the decimal veto above.
+- **ORDER BY: send it whenever the server orders the same way, sort in DuckDB otherwise (owner's decision, 2026-10-21).**
+  - **The keys order on the server as in DuckDB** (numbers, dates, UTF-8 `varchar` by its bytes, a BIN2 column, `OrdersLikeDuckDB`): the ORDER BY goes to the server always, at the top and in a subquery or CTE alike.
+    - The query asked for that order, and it is not the extension's call whether the order matters: the SQL Server optimizer decides.
+    - In a derived table or CTE, T-SQL takes an ORDER BY only with TOP / OFFSET, so it is written `ORDER BY … OFFSET 0 ROWS`. Without one the server refuses it with error 1033, "The ORDER BY clause is invalid in views, inline functions, derived tables, subqueries, and common table expressions, unless TOP, OFFSET or FOR XML is also specified" (checked on SQL Server 2022). At the top level an ORDER BY needs neither.
+  - **The server would order differently** (a string under a collation, D4): DuckDB sorts it afterwards.
+    - At the top level, everything else goes to the server and DuckDB sorts the pushed result. The order is DuckDB's whatever the collation; no varbinary form is needed.
+    - In a subquery or CTE, the subquery goes to the server without that ORDER BY. DuckDB sorts its result, and the enclosing query stays in DuckDB and is not rewritten further.
+  - Today an ORDER BY the writer cannot render vetoes the whole statement, and a renderable one inside a derived table is not written whole. Measured on TestDB:
+
+    | statement | what goes to the server today |
+    |---|---|
+    | `SELECT count(*), sum(k) FROM (SELECT id, k FROM t ORDER BY k) s` | only the inner SELECT (with its `ORDER BY [k]`); every row travels and DuckDB aggregates. Under the rule: the whole statement, with `ORDER BY [k] OFFSET 0 ROWS` inside |
+    | the same with `ORDER BY name` (nvarchar) | nothing; D4's "the server does not order nvarchar as DuckDB does" vetoes the whole statement. Under the rule: the subquery without its ORDER BY, the sort and the aggregate in DuckDB |
+    | `WITH c AS (SELECT … ORDER BY name) SELECT name, count(*) FROM c GROUP BY name` | nothing, the same veto |
+    | `SELECT k, count(*) FROM t GROUP BY k` (no ORDER BY) | the whole statement |
+
+    Subqueries and CTEs with an ORDER BY are common in generated SQL (BI tools, dbt, ORMs).
+  - Under a LIMIT / OFFSET (TOP N) the server must order before it cuts, so a key it orders differently cannot be sorted afterwards by DuckDB. The next item widens which string keys the server orders like DuckDB.
+- **More string keys the server orders like DuckDB** (q02 and q21 here, under their LIMIT; q04 and q16, which have none, are covered by the rule above). Two ways to widen it:
+  1. **Order by the UTF-8 bytes** for `nvarchar(n)`, `char(n)` (after `RTRIM`) and code-page `varchar(n)`, not only for a UTF-8 `varchar`, the `OrdersLikeDuckDBAsBytes` rule of today:
+     ```sql
+     ORDER BY CAST(CAST(col AS varchar(3*n) COLLATE Latin1_General_100_BIN2_UTF8) AS varbinary(3*n))
+     ```
+     - Comparing varbinary does not consult a collation. UTF-8 byte order is code point order, which is how DuckDB orders strings; the UTF-8 collation only serves to get the UTF-8 encoding.
+     - One UTF-16 unit is at most 3 UTF-8 bytes, so `varchar(3n)` is enough, MAX past 8000.
+     - UTF-8 collations need SQL Server 2019+.
+     - `varbinary` of the nvarchar itself would be UTF-16LE, whose byte order is not code point order.
+     - **Owner's caveat (2026-10-20):** not sure this is right where the database's collation orders strings its own way. Verify on CI, BIN2, UTF-8 and `SQL_` collations against DuckDB's order before relying on it.
+  2. **A BIN2 column**: the next item.
+
+  Either leaves D4 for GROUP BY / DISTINCT / join keys as it is.
+- **A BIN2 column orders like DuckDB.**
+  - `…_BIN2` / `…_BIN2_UTF8` compare and order by code point, as DuckDB does, so an ORDER BY / GROUP BY / DISTINCT on such a column could be pushed as is, without the varbinary form and without D4's caveat.
+  - Measured on the same TPC-H data with four string schemas (`test/bench/tpch/RESULTS-local.md`):
+    - UTF-8 `varchar` already sends q02 and q21 whole, through the bytes order under their LIMIT 100 (q21: 20.7 s → 0.47 s);
+    - BIN2 also makes LIKE cheap on the server: q13 costs 20 s of server CPU, against 56–63 s under NVARCHAR or a CI UTF-8 collation.
+- **The rest:**
+  - q12, "an expression of constants only": not understood yet.
+  - q17, `DOUBLE` arithmetic (`0.2 * avg(…)`): the known float veto.
+  - q22, `substring`: no string function is pushed, by design.
