@@ -122,6 +122,7 @@ jobs:
           echo "============================================"
           echo "Extension Version: ${{ steps.version.outputs.ext_version }}"
           echo "DuckDB Commit: $DUCKDB_COMMIT"
+          echo "DuckDB Label: ${OVERRIDE_GIT_DESCRIBE:-development build (-dev)}"
           echo "Platform: ${{ matrix.platform.id }}"
           echo "Runner: ${{ matrix.platform.runner }}"
           echo "============================================"
@@ -321,6 +322,7 @@ jobs:
           echo "============================================"
           echo "Extension Version: ${{ steps.version.outputs.ext_version }}"
           echo "DuckDB Commit: $DUCKDB_COMMIT"
+          echo "DuckDB Label: ${OVERRIDE_GIT_DESCRIBE:-development build (-dev)}"
           echo "Platform: windows_amd64 (MSVC)"
           echo "vcpkg Triplet: x64-windows-static-release"
           echo "============================================"
@@ -463,6 +465,7 @@ jobs:
           echo "============================================"
           echo "Extension Version: ${{ steps.version.outputs.ext_version }}"
           echo "DuckDB Commit: $DUCKDB_COMMIT"
+          echo "DuckDB Label: ${OVERRIDE_GIT_DESCRIBE:-development build (-dev)}"
           echo "Platform: windows_amd64_mingw (MinGW)"
           echo "vcpkg Triplet: x64-mingw-static"
           echo "============================================"
@@ -632,6 +635,10 @@ jobs:
           mv "$VERSIONED_FILE" extension/mssql.duckdb_extension
           ls -la extension/
 
+      - name: Check the DuckDB label
+        shell: bash
+        run: scripts/ci/check_duckdb_label.sh ./cli/duckdb extension/mssql.duckdb_extension
+
       - name: Run load-only smoke test
         run: |
           chmod +x scripts/ci/smoke_test.sh
@@ -682,6 +689,10 @@ jobs:
           VERSIONED_FILE="extension/mssql-${{ steps.version.outputs.ext_version }}-${{ matrix.config.artifact_suffix }}.duckdb_extension"
           mv "$VERSIONED_FILE" extension/mssql.duckdb_extension
           ls -la extension/
+
+      - name: Check the DuckDB label
+        shell: bash
+        run: scripts/ci/check_duckdb_label.sh ./cli/duckdb.exe extension/mssql.duckdb_extension
 
       - name: Run load-only smoke test
         shell: pwsh
@@ -776,7 +787,20 @@ jobs:
           echo "ext_version=$EXT_VERSION" >> $GITHUB_OUTPUT
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           # The DuckDB commit the binaries were built against: the submodule pin.
-          echo "duckdb=$(git ls-tree HEAD duckdb | awk '{print substr($3, 1, 11)}')" >> $GITHUB_OUTPUT
+          DUCKDB_SHA=$(git ls-tree HEAD duckdb | awk '{print $3}')
+          DUCKDB_SHORT=${DUCKDB_SHA:0:11}
+          echo "duckdb=$DUCKDB_SHORT" >> $GITHUB_OUTPUT
+          # A pin on a DuckDB release tag was built AS that release
+          # (checkout_duckdb.sh exports OVERRIDE_GIT_DESCRIBE), so the
+          # binaries load into a stock DuckDB of that version; a -dev pin's
+          # load only into the build they came from.
+          DUCKDB_TAG=$(scripts/ci/duckdb_release_tag.sh --remote "$DUCKDB_SHA")
+          if [ -n "$DUCKDB_TAG" ]; then
+            BUILT="Built against DuckDB $DUCKDB_TAG (\`$DUCKDB_SHORT\`, the commit in the duckdb submodule) and labelled $DUCKDB_TAG, so the binaries below load into a stock DuckDB $DUCKDB_TAG. They are not signed: start DuckDB with \`-unsigned\` (\`allow_unsigned_extensions\` in a client's configuration), or install the signed build from the community repository: \`INSTALL mssql FROM community\`."
+          else
+            BUILT="Built against a DuckDB development commit, \`$DUCKDB_SHORT\` (the commit in the duckdb submodule). A loadable extension built there loads only in that DuckDB build, so on a released DuckDB install it from the community repository instead: \`INSTALL mssql FROM community\`."
+          fi
+          echo "built=$BUILT" >> $GITHUB_OUTPUT
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -810,7 +834,7 @@ jobs:
           body: |
             ## MSSQL Extension ${{ steps.version.outputs.tag }}
 
-            Built against DuckDB 2.0: `v2.0-cyanoptera` at `${{ steps.version.outputs.duckdb }}`, the commit in the duckdb submodule. A loadable extension loads only in the DuckDB build it was compiled for, so on a released DuckDB install it from the community repository instead: `INSTALL mssql FROM community`. DuckDB 1.5.x stays on v0.2.5.
+            ${{ steps.version.outputs.built }} DuckDB 1.5.x stays on v0.2.5.
 
             ### Downloads
 

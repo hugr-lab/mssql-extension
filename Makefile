@@ -16,6 +16,18 @@ ifneq ($(wildcard $(VCPKG_TOOLCHAIN)),)
     EXT_FLAGS := -DCMAKE_TOOLCHAIN_FILE="$(VCPKG_TOOLCHAIN)" -DVCPKG_MANIFEST_DIR="$(PROJ_DIR)"
 endif
 
+# Build a DuckDB release pin AS that release. DuckDB 2.0's CMake labels every
+# build v<X.Y>.0-dev<N> unless told otherwise, the release tag's commit
+# included. A -dev build looks for extensions under its source id, where DuckDB
+# publishes nothing for a release (INSTALL azure fails), and our loadable then
+# carries a label no released DuckDB accepts. extension-ci-tools passes this
+# variable to cmake. Local tags only: after a bump onto a new tag run
+# `git -C duckdb fetch --tags`. CI exports the value from checkout_duckdb.sh,
+# and a value from the environment or the command line wins.
+ifeq ($(origin OVERRIDE_GIT_DESCRIBE),undefined)
+    OVERRIDE_GIT_DESCRIBE := $(shell cd "$(PROJ_DIR)" && scripts/ci/duckdb_release_tag.sh 2>/dev/null)
+endif
+
 # Include DuckDB extension CI tools (provides: set_duckdb_version, release, debug, test, etc.)
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
@@ -294,9 +306,9 @@ azure-test:
 	@echo ""
 # The version directory is the release tag only for a RELEASE build.
 # GetVersionDirectoryName() returns DuckDB::SourceID() -- a commit hash, never
-# 'v'-prefixed -- for anything carrying '-dev', which is every build of the
-# 'main'-branch submodule that is not exactly on a tag. A shallow clone stamps
-# v0.0.1 and hides this; a full one does not.
+# 'v'-prefixed -- for anything carrying '-dev', which is every build unless
+# OVERRIDE_GIT_DESCRIBE names a release (set above when the pin is a release
+# tag that `git -C duckdb tag` can see).
 #
 # So ASK THE BINARY rather than globbing. `ls */*/ | head -1` takes the
 # lexicographically first of however many directories exist, and

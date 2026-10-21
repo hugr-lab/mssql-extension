@@ -19,10 +19,12 @@
 #    not in base macOS, and this script runs on the macOS leg too.
 #
 # 2. THE CLONE IS NOT SHALLOW, ON PURPOSE. `--depth 1` is the reflex here and
-#    it breaks the build in a way that shows up much later. The Makefile
-#    records why: "A shallow clone stamps v0.0.1 and hides this; a full one
-#    does not" -- and an extension stamped v0.0.1 will not LOAD into a
-#    versioned CLI. Slow-and-correct beats fast-and-unloadable.
+#    it breaks the build in a way that shows up much later. DuckDB 2.0 labels
+#    a build from the commit count unless told otherwise, and what tells it is
+#    the release tag the pin sits on (duckdb_release_tag.sh, below), read from
+#    the clone's tags -- which a shallow clone does not have. A release pin
+#    built without its label makes an extension no released DuckDB will LOAD.
+#    Slow-and-correct beats fast-and-unloadable.
 #
 # 3. A RETRY MUST NOT INHERIT THE WRECKAGE. A transfer killed mid-flight can
 #    leave duckdb/ half-populated or an index.lock behind in the submodule's
@@ -169,6 +171,21 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
     # could never fire. It has to be read inside the else.
     if run_attempt; then
         echo "DuckDB submodule checked out on attempt ${attempt}"
+        # A pin on a DuckDB release tag is built AS that release (see
+        # duckdb_release_tag.sh): every later step of the job, cmake included,
+        # sees OVERRIDE_GIT_DESCRIBE. Local tags only: the clone above is full
+        # and fresh, so it holds every tag, and a network call here would sit
+        # outside the watchdog. The release smoke test checks that the label
+        # reached the binaries.
+        tag="$(scripts/ci/duckdb_release_tag.sh)"
+        if [ -n "$tag" ]; then
+            echo "DuckDB pin is the release ${tag}: building it as ${tag}"
+            if [ -n "${GITHUB_ENV:-}" ]; then
+                echo "OVERRIDE_GIT_DESCRIBE=${tag}" >> "$GITHUB_ENV"
+            fi
+        else
+            echo "DuckDB pin is not a release tag: a -dev build"
+        fi
         exit 0
     else
         status=$?
