@@ -56,6 +56,7 @@ docker/                 # SQL Server container and Linux CI build
 - The extension version is defined in `CMakeLists.txt` as `MSSQL_EXTENSION_VERSION` (e.g., `set(MSSQL_EXTENSION_VERSION "0.1.10")`)
 - This is passed to C++ code via the `MSSQL_VERSION` compile definition and returned by `mssql_version()`
 - **When releasing a new version**: update `MSSQL_EXTENSION_VERSION` in `CMakeLists.txt` and `version` in `vcpkg.json`
+- **DuckDB's own label**: DuckDB 2.0's CMake calls every build `v<X.Y>.0-dev<N>` unless `OVERRIDE_GIT_DESCRIBE` is set, even on a release tag's commit. A `-dev` build looks for extensions under its source id, where DuckDB publishes nothing for a release, and its loadable loads into no released DuckDB. So when the duckdb pin IS a release tag (`scripts/ci/duckdb_release_tag.sh`), the build is labelled with it: `checkout_duckdb.sh` exports it in CI and release, and the Makefile sets it locally from the submodule's local tags (`git -C duckdb fetch --tags` after a bump). The release notes then say that the binaries load into a stock DuckDB of that version.
 
 ## Commands
 
