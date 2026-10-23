@@ -37,10 +37,14 @@ Reconnaissance against duckdb `d7a4366603`:
   what `FilterEncoder::EncodeExpression` already encodes.
 - New filter kinds exist beyond expressions (`LEGACY_PREFIX_RANGE_FILTER`
   wrapping a `PrefixRangeFilter` — LIKE-prefix ranges; `DynamicTableFilterSet`
-  on `LogicalGet` — join-produced runtime filters). Dynamic filters cannot
-  reach our SQL: the WHERE clause is built at InitGlobal, before a hash
-  join's build side materializes them. Out of scope here; noted for a
-  future delayed-init design.
+  on `LogicalGet` — join-produced runtime filters). Dynamic join filters DO
+  reach InitGlobal (corrected 2026-10-23): the probe scan is initialised
+  after the hash join's build finalizes, with the filters merged into
+  `input.filters` (`physical_table_scan.cpp`). They arrive wrapped in
+  `__internal_tablefilter_optional` / `_selectivity_optional`, which
+  FilterEncoder does not map yet, so only an unwrapped single-value `k = v`
+  reaches the SQL today. Out of scope here; see "Runtime join filters" in
+  `specs/079-select-pushdown/after-0.3.0.md`.
 
 ### The work
 

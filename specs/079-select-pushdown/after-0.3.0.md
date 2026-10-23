@@ -5,6 +5,12 @@ one place to plan from once v0.3.0 is out. Each names where it was found and
 why it was not done in the PR that found it. Not a commitment, and not in any
 order of priority yet.
 
+**Checked against main `6df11bc` on 2026-10-23.** Every item below was
+re-read against the code; what had shipped is removed, what was wrong is
+corrected (the TPC-H section after #508). v0.3.0 is out, so "not before
+v0.3.0" no longer holds anywhere here. The umbrella issue #515
+tracks this file together with the type work (sql_variant, geometry, vector).
+
 ## Correctness edges (recorded, not vetoed)
 
 - **Division in a set operation's child that DuckDB sends on its own.** A set
@@ -14,14 +20,20 @@ order of priority yet.
   DuckDB says inf, before DuckDB deduplicates or filters it: `SELECT n / 0 ...
   UNION SELECT NULL::DOUBLE FROM loc` gives {NULL} pushed, {inf, NULL}
   locally. Vetoing it would take division from every statement's top (E1
-  full review). The way forward is the next item.
+  full review). The way forward is the next item. Since E1 a child that
+  sends no more than the scan would (`PushesMoreThanScan`) goes back to the
+  scan path, so it takes an ORDER BY, a LIMIT or an aggregate in the child;
+  a floating-point aggregate's last bits have the same exposure.
 - **A divisor that cannot be zero.** Division is rendered as
-  `CAST(a AS float) / NULLIF(CAST(b AS float), 0)` and vetoed in conditions
-  because of the zero divisor alone. A divisor the writer can prove non-zero
-  -- a non-zero constant, `CASE WHEN b = 0 THEN ... ELSE a / b END`, a
-  `WHERE b <> 0` on the same node, a column with a CHECK constraint -- needs
-  neither the NULLIF nor the veto, and could be compared, ordered and kept in
-  a set operation's child (owner's suggestion, E1).
+  `CAST(a AS float) / NULLIF(CAST(b AS float), 0)`, and because of the zero
+  divisor alone it is refused or flagged in many places: in a condition,
+  under an aggregate, under COALESCE / NULLIF, in DISTINCT, in a set
+  operation that compares rows, in ORDER BY and in a DML SET. A divisor the
+  writer can prove non-zero -- a non-zero constant, `CASE WHEN b = 0 THEN ...
+  ELSE a / b END`, a `WHERE b <> 0` on the same node, a column with a CHECK
+  constraint (the catalog loads no CHECK constraints today) -- needs neither
+  the NULLIF nor the veto, and could be compared, ordered and kept in a set
+  operation's child (owner's suggestion, E1). A non-zero constant first.
 - **A CTE body inlined twice is read twice.** DuckDB evaluates a CTE once; the
   server reads an inlined body at each reference, which under concurrent
   writes can see different committed rows. A body that picks rows (a LIMIT)
@@ -43,18 +55,23 @@ order of priority yet.
 - **A plan-based estimate.** The join gain check compares the largest input
   table with `mssql_pushdown_join_rows_threshold`, from cached counts: it
   bounds the inputs, not the output -- two 900k-row tables joined
-  many-to-many pass at the default and the server may produce ~10^11 rows
+  many-to-many pass at the default and the server may produce ~8×10^11 rows
   where the scans would ship 1.8M (raised on #399). For large statements
   the answer is the server's own estimate: a SHOWPLAN on a separate
   connection (or an `mssql_estimate` function) read before deciding (owner's
   plan, E1). Owner's call on #399: not before v0.3.0 unless the rest is done
-  first -- no interim heuristic. A cheaper step on the way, if wanted: a
+  first -- no interim heuristic (v0.3.0 is out). A cheaper step on the way, if wanted: a
   product bound (largest x second-largest input against an output-row
   threshold of its own), from the same cached counts, no round trip.
 - **Keys through a wrapper.** A derived table's key is its GROUP BY / DISTINCT
-  columns only; a plain join of keyed tables inside it carries no key up, so
-  a GROUP BY over the wrapper's columns is treated as not reducing (E1 full
-  review, conservative).
+  columns only: not even a single keyed table's key carries up through a
+  plain projection, let alone a join's. Two effects, not all of them
+  conservative: a join onto the wrapper's would-be key counts as unbounded,
+  and the wrapper's own uncertain join counts as reduced only by a LIMIT or
+  an aggregate without GROUP BY; but in the outer node a keyless relation
+  makes a GROUP BY count as reducing (`CoversEveryKey` is false), which is
+  optimistic. Carrying unique keys up (a keyed table's projection,
+  key-preserving joins) fixes both.
 - **Derived table size.** A derived table is sized by its largest input, not
   by what it returns (an aggregate's group count).
 
@@ -84,17 +101,22 @@ order of priority yet.
   every column the writer types. Left: a cast-back column (the integer `sum`
   as decimal(38,0) is exact; decimal arithmetic over cast-back operands is
   widened by the server in ways the writer does not model) and lossless
-  widenings at the check.
+  widenings at the check (`ColumnTypeFits` takes equal types only, so a
+  smallint sent for a declared int fails loudly; allowing it needs a
+  widening decode at read, not only a looser check). Also left from 081: the
+  rewriter's dry run costs 0.63 s of CPU against 0.016 s on 1000 `LIMIT 0`
+  branches (spec 081, "Not done").
 
 ## Shapes not pushed yet
 
-- **E2** (planned): windows and QUALIFY, FILTER as CASE, `string_agg`, the
-  default flip with the D4-for-sets documentation.
 - **Decomposition of a window over `*`, and of a join with a local table.** A
   window over named columns decomposes; over `*` it does not (the `*` over a
   join guard). A FROM subquery or a CTE body in a statement that also reads a
   local table is not finished by DuckDB's rewriter on its own --
-  duckdb/duckdb#26280; nothing to change here when DuckDB does.
+  duckdb/duckdb#26280 (still open); nothing to change here when DuckDB does.
+  The guard (`MayRepeatOutputNames`) is wider than "a `*` over a join": a
+  `*` beside any other select item refuses too. Expanding `*` to the names
+  DuckDB binds (`n`, `n_1`) would let such a node be handed back.
 - **A query over a user's own `mssql_scan` / `mssql_scan_params` (owner,
   2026-10-21).** Today nothing over a raw scan goes to the server.
   `mssql_scan` has neither `filter_pushdown` nor `projection_pushdown` (only
@@ -132,10 +154,15 @@ order of priority yet.
     - *An outer ORDER BY* follows the ORDER BY rule below, keyed on the
       described type and collation of the scan's column
       (`sp_describe_first_result_set` returns `collation_name`). A string
-      under a collation is sorted by DuckDB; a number, a date, a UTF-8 or
-      BIN2 string goes with the rest. A computed column whose collation the
-      describe reports from an expression should be checked before it is
-      trusted.
+      under a collation is sorted by DuckDB; a number or a date goes with
+      the rest, a bounded UTF-8 varchar through its bytes. A computed column
+      whose collation the describe reports from an expression should be
+      checked before it is trusted. `mssql_scan_unsafe`'s `columns` carry no
+      collation, so its string keys are always sorted by DuckDB.
+    - *Filters on the raw scan* (step 1): on 2.0 a `filter_pushdown` scan must
+      apply every TableFilter it is given, so the raw scan needs the same
+      client-side net as the catalog scan (`table_scan.cpp`, the refused
+      filters armed client-side).
     - *An ORDER BY inside the user's text.* At the top level of their batch
       it is legal; inside a derived table the server refuses it (1033)
       unless TOP / OFFSET / FOR XML is there. The written order must not be
@@ -150,11 +177,12 @@ order of priority yet.
       one more reason not to wrap a text with an ORDER BY. A text without
       one carries no order to keep.
 - **`IGNORE NULLS` in a window (`last_value(x IGNORE NULLS)`, the
-  forward-fill idiom).** The server takes it from SQL Server 2022 and refuses
-  it as a syntax error before; the extension keeps only the TDS version, which
-  is the same from 2012 on. Vetoed in E2; the product version LOGINACK already
-  carries, kept on the connection, would let a 2022+ server take it (owner,
-  E2).
+  forward-fill idiom).** The server takes it from SQL Server 2022 (and Azure
+  SQL Database / Managed Instance) and refuses it as a syntax error before.
+  Vetoed in E2. No LOGINACK work is needed: since spec 080 D0 the catalog
+  reads `SERVERPROPERTY('ProductMajorVersion')` and `EngineEdition` at ATTACH
+  (`product_major_version_`, used by `DmlCapabilities`), so the writer can
+  take it when the major version is 16+ or the engine is Azure SQL.
 - **A correlated scalar subquery on a string key against an outer column.**
   Vetoed unless the key meets a constant (an outer varchar against an
   nvarchar compares under other rules); a same-type, same-collation outer
@@ -164,35 +192,45 @@ order of priority yet.
   `INTERSECT` would move the deduplication to the server.
 - **Vetoed constructs with a possible T-SQL form**: EXCLUDE / REPLACE /
   COLUMNS (the explicit list could be expanded once the columns are known),
-  `> ANY` / `ALL` quantified comparisons, CTE column alias lists, `EXCEPT
+  `> ANY` / `ALL` quantified comparisons, CTE and subquery column alias
+  lists (both a derived column list), `EXCEPT
   ALL` / `INTERSECT ALL` (no T-SQL form; a ROW_NUMBER rewrite), `float`
   `+ - *` (inf in DuckDB, an error there), `min` / `max` of a string (an
   order under D4), mixed-type set operation columns with an explicit cast.
 
 ## Measured on TPC-H (test/bench/tpch, 2026-10-20)
 
-TPC-H SF1 in a local SQL Server, with clustered columnstore and string columns typed as the specification says (`CHAR(n)` / `VARCHAR(n)`). Client B is DuckDB 2.0 + 0.3.0.
-- **Pushed whole:** only q18. That one query ran 35× faster than 0.2.5: 0.057 s against 2.03 s, close to native SQL Server's 0.084 s.
-- **Pushed partly:** q13. Only its inner `customer LEFT JOIN orders … GROUP BY c_custkey` goes: 150000 rows come back, and the server spends 1024 ms CPU on that half against 618 ms for the whole query natively. Why the outer GROUP BY / ORDER BY was handed back is not yet known; look at the gain check.
+TPC-H SF1 in a local SQL Server, with clustered columnstore and string columns typed as the specification says (`CHAR(n)` / `VARCHAR(n)`). Client B is DuckDB 2.0 + 0.3.0. Column C ("native") is SQL Server 2022 in docker under x86 emulation on a Mac, so it compares clients with one another and is not native throughput on real hardware (`test/bench/tpch/RESULTS-local.md`).
+- **Pushed whole:** only q18. That one query ran 35× faster than 0.2.5: 0.057 s against 2.03 s, close to column C's 0.084 s.
+- **Pushed partly:** q13. Only its inner `customer LEFT JOIN orders … GROUP BY c_custkey` goes: 150000 rows come back, and the server spends 1024 ms CPU on that half against 618 ms for the whole query in column C. Why the outer GROUP BY / ORDER BY was handed back is not yet known; look at the gain check.
 - **Not pushed:** the other 20.
 
-Over the 22 queries: 0.2.5 took 20.7 s, 0.3.0 16.6 s, and native SQL Server 1.55 s. That gap is the size of what follows. Each query reports only its first veto (from `MSSQL_DEBUG=1` on an EXPLAIN), so removing one may uncover the next.
+Over the 22 queries: 0.2.5 took 20.7 s, 0.3.0 16.6 s, and column C 1.55 s. That gap is the size of what follows. Each query reports only its first veto (from `MSSQL_DEBUG=1` on an EXPLAIN), so removing one may uncover the next.
 
 - **Decimal arithmetic over different types** stops about half of TPC-H. The cases:
 
   | operation | queries | DuckDB's type |
   |---|---|---|
-  | `DECIMAL(15,2)` with `DECIMAL(16,2)`, from `l_extendedprice * (1 - l_discount)` | q01, q03, q05, q10, q14, q15, q19 | `1 - l_discount` widens to (16,2) |
-  | `DECIMAL(15,2) * BIGINT` | q11 | |
-  | a product | q06 | `DECIMAL(18)`, the veto taking DuckDB's int64 overflow into account |
-  | a `DECIMAL(38,2)` product | q20 | |
+  | `DECIMAL(15,2)` with `DECIMAL(16,2)`, from `l_extendedprice * (1 - l_discount)` | q01, q03, q05, q10, q14, q15, q19 | the product is capped at `DECIMAL(18,4)` |
+  | `DECIMAL(15,2) * BIGINT` | q11 | `DECIMAL(34,2)`, not capped |
+  | a product | q06 | `DECIMAL(18)` (capped) |
+  | a `DECIMAL(38,2)` product | q20 | past 38 digits |
 
-  For `+ - *`, while the result stays within 38 digits, the result type is the same on both sides: precision p1 + p2 (+1), scale s1 + s2 for a product; max scale for a sum or difference. Both sides are then exact, and both raise an error on overflow. Allow these, and keep division and anything past 38 digits vetoed.
-- **`date_part('year', DATE)`**, i.e. `extract(year …)`, stops q07, q08 and q09. `YEAR(x)` is exact for DATE and datetime2. Those three then meet the decimal veto above.
+  Corrected after #508. Two vetoes stand in the way, and lifting the first alone unblocks nothing:
+  - the type-equality veto in `mssql_node_writer_values.cpp` (operands of different types are refused before `FunctionFor` is asked);
+  - DuckDB's cap: a product of two decimals that both fit 18 digits is typed `DECIMAL(18, s1+s2)`, not `(w1+w2, s1+s2)`, when `w1+w2 > 18` and `s1+s2 < 18`, and it raises an overflow past ±(10^18−1) where the server's wider type holds the value (`mssql_expression_vocabulary.cpp` vetoes it for that reason).
+
+  The prescription:
+  - `+` / `−`: DuckDB's result type equals the server's below 38 digits, even for operands of different types; relax the equality veto for decimal and integer operands, compute DuckDB's type by DuckDB's own formulas, and cast back wherever the server's type differs.
+  - A capped product: render `CAST(a * b AS decimal(18, s1+s2))`. Values match, and both sides raise an overflow at the same bound (8115 needs ANSI_WARNINGS, which LOGIN7's fODBC sets). One difference stays: the server may raise it on a row DuckDB never computes; the owner's call.
+  - q11's `DECIMAL(15,2) * BIGINT` is exact as `DECIMAL(34,2)`; its HAVING (`sum(…) * 0.0001000000`) goes past 38 digits and stays vetoed, as does q20.
+- **`date_part('year', DATE)`**, i.e. `extract(year …)`, stops q07, q08 and q09. `YEAR(x)` is exact for DATE and datetime2, but the writer renders no scalar function but arithmetic: it sees DuckDB's parsed `date_part('year', x)`, and the scan path's `year → YEAR` mapping never reaches it. The prescription: map `date_part` / `extract` with a constant `year` / `month` / `day`, and `year()` and its siblings, to `CAST(YEAR(x) AS bigint)` (DuckDB returns BIGINT); refuse datetime2(7) (read as TIMESTAMP_NS) and datetimeoffset. Those three queries then meet the decimal veto above.
 - **ORDER BY: send it whenever the server orders the same way, sort in DuckDB otherwise (owner's decision, 2026-10-21).**
-  - **The keys order on the server as in DuckDB** (numbers, dates, UTF-8 `varchar` by its bytes, a BIN2 column, `OrdersLikeDuckDB`): the ORDER BY goes to the server always, at the top and in a subquery or CTE alike.
+  - **The keys order on the server as in DuckDB** (`OrdersLikeDuckDB`: numbers, dates; a bounded UTF-8 `varchar` only through its bytes, `OrdersLikeDuckDBAsBytes`): the ORDER BY goes to the server always, at the top and in a subquery or CTE alike.
     - The query asked for that order, and it is not the extension's call whether the order matters: the SQL Server optimizer decides.
-    - In a derived table or CTE, T-SQL takes an ORDER BY only with TOP / OFFSET, so it is written `ORDER BY … OFFSET 0 ROWS`. Without one the server refuses it with error 1033, "The ORDER BY clause is invalid in views, inline functions, derived tables, subqueries, and common table expressions, unless TOP, OFFSET or FOR XML is also specified" (checked on SQL Server 2022). At the top level an ORDER BY needs neither.
+    - In a derived table or CTE, T-SQL takes an ORDER BY only with TOP / OFFSET, so it is written `ORDER BY … OFFSET 0 ROWS`. Without one the server refuses it with error 1033, "The ORDER BY clause is invalid in views, inline functions, derived tables, subqueries, and common table expressions, unless TOP, OFFSET or FOR XML is also specified" (checked on SQL Server 2022). At the top level an ORDER BY needs neither. Measure whether the server pays for a sort it does not need there.
+    - Today the bytes form and the emulated NULL placement are allowed only under a LIMIT (and the bytes form not under DISTINCT); the rule drops the LIMIT condition for both, outside DISTINCT.
+    - A nullable key: DuckDB puts NULLs last on an ascending key, the server first. Today such a key is vetoed without a LIMIT, which covers every nullable ascending key; the emulated placement (a leading `CASE WHEN k IS NULL …` key) is what lets it go.
   - **The server would order differently** (a string under a collation, D4): DuckDB sorts it afterwards.
     - At the top level, everything else goes to the server and DuckDB sorts the pushed result. The order is DuckDB's whatever the collation; no varbinary form is needed.
     - In a subquery or CTE, the subquery goes to the server without that ORDER BY. DuckDB sorts its result, and the enclosing query stays in DuckDB and is not rewritten further.
@@ -206,26 +244,45 @@ Over the 22 queries: 0.2.5 took 20.7 s, 0.3.0 16.6 s, and native SQL Server 1.55
     | `SELECT k, count(*) FROM t GROUP BY k` (no ORDER BY) | the whole statement |
 
     Subqueries and CTEs with an ORDER BY are common in generated SQL (BI tools, dbt, ORMs).
-  - Under a LIMIT / OFFSET (TOP N) the server must order before it cuts, so a key it orders differently cannot be sorted afterwards by DuckDB. The next item widens which string keys the server orders like DuckDB.
-- **More string keys the server orders like DuckDB** (q02 and q21 here, under their LIMIT; q04 and q16, which have none, are covered by the rule above). Two ways to widen it:
-  1. **Order by the UTF-8 bytes** for `nvarchar(n)`, `char(n)` (after `RTRIM`) and code-page `varchar(n)`, not only for a UTF-8 `varchar`, the `OrdersLikeDuckDBAsBytes` rule of today:
-     ```sql
-     ORDER BY CAST(CAST(col AS varchar(3*n) COLLATE Latin1_General_100_BIN2_UTF8) AS varbinary(3*n))
-     ```
-     - Comparing varbinary does not consult a collation. UTF-8 byte order is code point order, which is how DuckDB orders strings; the UTF-8 collation only serves to get the UTF-8 encoding.
-     - One UTF-16 unit is at most 3 UTF-8 bytes, so `varchar(3n)` is enough, MAX past 8000.
-     - UTF-8 collations need SQL Server 2019+.
-     - `varbinary` of the nvarchar itself would be UTF-16LE, whose byte order is not code point order.
-     - **Owner's caveat (2026-10-20):** not sure this is right where the database's collation orders strings its own way. Verify on CI, BIN2, UTF-8 and `SQL_` collations against DuckDB's order before relying on it.
-  2. **A BIN2 column**: the next item.
-
-  Either leaves D4 for GROUP BY / DISTINCT / join keys as it is.
-- **A BIN2 column orders like DuckDB.**
-  - `…_BIN2` / `…_BIN2_UTF8` compare and order by code point, as DuckDB does, so an ORDER BY / GROUP BY / DISTINCT on such a column could be pushed as is, without the varbinary form and without D4's caveat.
-  - Measured on the same TPC-H data with four string schemas (`test/bench/tpch/RESULTS-local.md`):
-    - UTF-8 `varchar` already sends q02 and q21 whole, through the bytes order under their LIMIT 100 (q21: 20.7 s → 0.47 s);
-    - BIN2 also makes LIKE cheap on the server: q13 costs 20 s of server CPU, against 56–63 s under NVARCHAR or a CI UTF-8 collation.
+  - Under a LIMIT / OFFSET (TOP N) the server must order before it cuts if the LIMIT is to go with the statement. A key it orders differently can still be sorted and cut by DuckDB, but then the LIMIT stays in DuckDB and every row travels. The next item widens which string keys the server orders like DuckDB.
+- **More string keys the server orders like DuckDB** (q02 and q21 here, under their LIMIT; q04 and q16, which have none, are covered by the rule above): **order by the UTF-8 bytes** for `nvarchar(n)`, `char(n)` / `nchar(n)` and code-page `varchar(n)`, not only for a UTF-8 `varchar`, the `OrdersLikeDuckDBAsBytes` rule of today. Corrected T-SQL (`COLLATE` is not part of `CAST`'s type: `CAST(nvarchar AS varchar)` converts in the column's code page first, turning what it cannot hold into `?`):
+  - `nvarchar(n)`: `CAST(CAST(col COLLATE Latin1_General_100_BIN2_UTF8 AS varchar(3*n)) AS varbinary(3*n))`;
+  - code-page `varchar(n)`: through `CAST(col AS nvarchar(n))` first, then as above;
+  - `char(n)` / `nchar(n)`: `RTRIM` first (stored padded, read trimmed).
+  - Comparing varbinary does not consult a collation, and UTF-8 byte order is code point order, which is how DuckDB orders strings. One UTF-16 unit is at most 3 UTF-8 bytes, so `varchar(3n)` is enough, MAX past 8000. UTF-8 collations need SQL Server 2019+.
+  - Residual differences: a trailing NUL ties with no NUL; unpaired surrogates may convert differently.
+  - The owner's caveat (2026-10-20, "not sure where the database's collation orders strings its own way") is answered for the comparison, which ignores collation; what needs testing on CI, BIN2 and `SQL_` sources is the conversion step.
+  - It leaves D4 for GROUP BY / DISTINCT / join keys as it is.
+- **BIN2 does NOT order like DuckDB (withdrawn after #508).** The server pads trailing spaces under every collation, BIN2 included (`'ab'` = `'ab '`, `ab` + TAB before `ab`); a code-page `_BIN2` column orders by code-page bytes and an nvarchar `_BIN2` one by UTF-16 code units. `order_pushdown_collation.test` pins all three as not pushed, and `IsBinary2Collation` has no callers. Pushing a GROUP BY on such a column already follows D4 and folds `'ab'` and `'ab '` into one group; BIN2 does not change that. What stays from the measurement is the cost: BIN2 makes LIKE cheap on the server (q13: 20 s of server CPU against 56–63 s under NVARCHAR or a CI UTF-8 collation).
 - **The rest:**
-  - q12, "an expression of constants only": not understood yet.
-  - q17, `DOUBLE` arithmetic (`0.2 * avg(…)`): the known float veto.
-  - q22, `substring`: no string function is pushed, by design.
+  - q12, "an expression of constants only": `Unify` (`mssql_node_writer_values.cpp`) finds no non-constant branch to type the constants from, reached from `WriteCase`: q12's `sum(CASE … THEN 1 ELSE 0 END)` has only literal branches. Type an all-integer-literal CASE / COALESCE as INTEGER (`CAST(1 AS int)`); the integer SUM path does the rest. q12's next veto is its `ORDER BY l_shipmode` (the ORDER BY rule).
+  - q17, `DOUBLE` arithmetic (`0.2 * avg(…)`): the known float veto, and behind it a floating-point aggregate in a condition is vetoed too, so lifting the product alone does nothing. Low priority.
+  - q22, `substring`: no string function is pushed, by design. q22 also meets the avg-in-a-condition veto.
+
+## Runtime join filters (checked 2026-10-23)
+
+A join of a DuckDB table (local, Parquet, DuckLake) with an SQL Server table is not pushed whole -- the rewriter takes only statements that read one catalog -- so the SQL Server side goes through the catalog scan. DuckDB already hands that scan the join's keys; the extension drops them. Found by the `duckdb-4d` session, checked against DuckDB v2.0.0 (`d54cbbe3df1`) and on a live server.
+
+- **What DuckDB sends** (`physical_hash_join.cpp`, `JoinFilterPushdownInfo`). After the build side finalizes, per equality key, into the probe Get's `DynamicTableFilterSet` -- only for a Get with `filter_pushdown` (`join_filter_pushdown_optimizer.cpp`; a LIMIT / TOP N above the scan blocks it):
+  - min == max: a plain, unwrapped `k = v`;
+  - an IN list when 1 < build rows ≤ `dynamic_or_filter_threshold` (default 50), not dense and without NULL, wrapped `__internal_tablefilter_optional`;
+  - a prefix-range filter for small-span keys (when registered, no min/max and no bloom follow);
+  - min/max only when no IN list was pushed, as `k >= min AND k <= max`, each wrapped `__internal_tablefilter_optional` (equality joins) or `__internal_tablefilter_selectivity_optional`, ANDed with the scan's static filter on that column;
+  - a bloom filter, deferred, inside the selectivity-optional wrapper.
+
+  The wrapper is an `ExpressionFilter` holding a `BoundFunctionExpression` over `BoundReference(0)`; the real predicate is in its bind data (`OptionalFilterFunctionData::child_filter_expr`). They are merged into `TableFunctionInitInput.filters` when the probe pipeline's source is initialised, after the build (`physical_table_scan.cpp`): they DO reach `TableScanInitGlobal`. (Spec 070 said otherwise; corrected there.)
+- **What the extension does with them.** FilterEncoder has no mapping for the wrapper, so the column's filter is refused and armed client-side -- a no-op, since DuckDB evaluates the optional wrapper as all-true -- and under the AND the static part is re-run client-side as well. Measured on SQL Server 2025, a local table ⋈ `dbo.LargeTable` (150k rows) `USING (id)`:
+
+  | build keys | sent | rows from the server |
+  |---|---|---|
+  | 1 | `SELECT [id] FROM [dbo].[LargeTable] WHERE ([id] = @p0)` | 1 |
+  | 3 | `SELECT [id] FROM [dbo].[LargeTable]` | 150000 |
+  | 40 | `SELECT [id] FROM [dbo].[LargeTable]` | 150000 |
+- **Level 0** (the first tier of `specs/065-dml-pushdown-recon/join-agg-pushdown.md`):
+  1. FilterEncoder recognises the two optional wrappers at the top level or as an AND child and renders their bind-data child through the existing encoder, so the per-type rules (datetime ticks, the time(7) / datetimeoffset(7) truncated read, parameters typed from the column, spec 076) apply as they do to a written filter.
+  2. An IN list is rendered on any type the encoder takes: it can only widen the result, and the join re-checks every match. A `>=` / `<=` bound only where `MSSQLColumnInfo::OrdersLikeDuckDB()` holds: a range on a string under a non-binary collation can EXCLUDE matching rows (build `{'B','a'}` gives `'B'..'a'`, empty under `_CI_AS`). This is not D4, which is about filters the user writes; a join filter must stay a superset.
+  3. Any other wrapped filter (bloom, prefix-range, a string range, anything the encoder refuses) is dropped, not armed client-side. The unwrapped min == max comparison keeps today's path.
+  4. Caveats: IN lists are literals today, so each distinct key set compiles its own plan (parameters would fix that); a registered prefix-range filter leaves nothing to render (small-span integer keys past 50 build rows).
+- **The vehicles get none.** `mssql_scan` / `mssql_scan_params` (and `_unsafe`) set no `filter_pushdown`, so DuckDB never offers them join filters. Once the rewriter sends a nested FROM subquery or CTE inside a mixed statement (after duckdb/duckdb#26280), the join becomes `local ⋈ <vehicle>`; the vehicle could take filters on its output columns and wrap the pushed SQL at init (`SELECT * FROM (<pushed>) AS v WHERE …`), IN only, since a derived column's collation is unknown. Same net as the raw-scan item above.
+- **More than 50 keys (tiers 1 / 2a).** DuckDB enumerates keys only as the IN list, and the threshold is one global setting; a bloom filter cannot be enumerated or hashed in T-SQL (a home-made bloom over `HASHBYTES` is not sargable -- not recommended). The way that needs no DuckDB patch: `MSSQLOptimizer` rewrites `HashJoin(build X, probe mssql Get)` with a small estimated build into `X ⋈ mssql_keyed_scan(DISTINCT keys of X)`, an in-out table function that collects the keys, loads them by INSERT BULK into `#keys` (the stage of spec 080) and runs `… WHERE k IN (SELECT k FROM #keys)`; the join stays in DuckDB, so the server returns a superset. Its own spec, after level 0 is measured. Raising `dynamic_or_filter_threshold` per session would hit every scan; an upstream per-scan threshold is out (no DuckDB patches).
+- **The other direction already works:** with SQL Server as the build side, DuckDB pushes its bloom / prefix-range / IN filters into the local probe scan, given the MSSQL scan's cardinality estimate (statistics).

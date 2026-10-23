@@ -64,7 +64,7 @@ The same data in four schemas, set with `--strings` / `--collation`:
 
 - **A code-page `char` / `varchar` costs the server a CAST on every row.** The read sends it as `NCHAR` / `NVARCHAR`. NVARCHAR or UTF-8 columns avoid that, cutting 12–23 % from the scan path; per row, the server's CPU drops by 25–50 % on the string-heavy scans (q01, q07, q08, q10, q12).
 - **UTF-8 `varchar` is ordered by its bytes under a LIMIT**, which is how DuckDB orders strings. So q02 and q21 (`ORDER BY … LIMIT 100`) go to the server whole: q21 20.7 s → 0.47 s.
-- **BIN2 makes string comparison cheap on the server.** q13's `NOT LIKE '%special%requests%'` costs 20 s of server CPU under BIN2 (and the code page) against 56–63 s under NVARCHAR or the CI UTF-8 collation. BIN2 is also the collation whose comparisons and order are DuckDB's own; `mssql_utf8_collation` defaults to it for CTAS.
+- **BIN2 makes string comparison cheap on the server.** q13's `NOT LIKE '%special%requests%'` costs 20 s of server CPU under BIN2 (and the code page) against 56–63 s under NVARCHAR or the CI UTF-8 collation. BIN2 compares by code point, but it still pads trailing spaces like every SQL Server collation, so it does not order or group exactly as DuckDB does (#508); `mssql_utf8_collation` defaults to it for CTAS.
 
 ## The raw output
 
