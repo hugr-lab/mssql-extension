@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import {themes as prismThemes} from 'prism-react-renderer';
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
@@ -29,6 +31,18 @@ const site = ionos
 // (src/theme/SiteMetadata) and it has no sitemap of its own. Search engines index
 // hugr-lab.com; the github.io links keep working (owner's decision, 2026-10-19).
 const canonicalBase = ionos ? '' : process.env.DOCS_CANONICAL ?? '';
+
+// Only the latest release -- the version at the docs root, versions.json's first
+// entry -- is indexed. `next` (current) and the older releases are near-copies of
+// it, each naming itself canonical, and Search Console reported them as
+// duplicates whose canonical Google disagreed with (owner's decision,
+// 2026-10-26). They get `noindex, nofollow` and drop out of the sitemap
+// (plugin-sitemap skips no-index routes); the version dropdown keeps them.
+const versionsFile = path.join(__dirname, 'versions.json');
+const released: string[] = fs.existsSync(versionsFile) ? JSON.parse(fs.readFileSync(versionsFile, 'utf8')) : [];
+const noIndexVersions = Object.fromEntries(
+  released.length ? ['current', ...released.slice(1)].map((v) => [v, {noIndex: true}]) : [],
+);
 
 const config: Config = {
   title: 'DuckDB MSSQL Extension',
@@ -78,6 +92,7 @@ const config: Config = {
           // current docs serve at the root with no dropdown entry to switch.
           editUrl: 'https://github.com/hugr-lab/mssql-extension/tree/main/website/',
           showLastUpdateTime: true,
+          versions: noIndexVersions,
         },
         blog: false,
         // The canonical copy (hugr-lab.com) carries the sitemap; a copy that names
