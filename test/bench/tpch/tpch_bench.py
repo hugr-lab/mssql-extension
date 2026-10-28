@@ -137,12 +137,34 @@ def binary(which):
 
 def run_cli(bin_path, script, cfg, database=":memory:", timeout=None):
     """Run a DuckDB CLI with the script on stdin (so the DSN never sits in argv or a file)."""
-    # The 2.0 CLI switches to an "agent mode" (other table and error formats) when it
-    # sees an AI agent's variables; both clients must print the same way.
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("AI_AGENT", "CLAUDECODE") and not k.startswith("CLAUDE_CODE")}
+    env = dict(os.environ)
+    # Agent mode (issue #505 item 4). The 2.0 CLI switches to other table and
+    # error formats, and does an extra ExtractPlan before every SELECT, when it
+    # sees any of eleven markers -- AI_AGENT, AGENT, CLAUDECODE, CODEX_*,
+    # CURSOR_AGENT, GEMINI_CLI, COPILOT_*. That extra bind+optimize pass lands
+    # INSIDE the CLI's own BEGIN_TIMER/END_TIMER region, and for this extension
+    # it is a second remote-pushdown dry run, so it inflates client B only --
+    # 1.5.6 has no agent mode at all. One-sided inflation on exactly the
+    # comparison this harness exists to make.
+    #
+    # The first version stripped two of those eleven and `CLAUDE_CODE*`, which
+    # matches none of them, and missed DUCKDB_AGENT_MODE=1, which forces the
+    # mode on regardless. Setting the variable to 0 is complete and
+    # version-portable instead of chasing the list: measured, it overrides even
+    # an unstripped marker (CURSOR_AGENT), and 1.5.6 ignores a variable it does
+    # not know.
+    env["DUCKDB_AGENT_MODE"] = "0"
+    # -no-init (issue #505 item 3): without it the operator's ~/.duckdbrc runs
+    # inside every measured session. A `SET mssql_remote_pushdown=false` there
+    # would make client B measure as Bscan while the report still labels it
+    # "(pushdown)", and session_head never re-asserts it; threads, memory_limit
+    # and .mode likewise, none of them recorded. Measured: threads came out 3
+    # with an rc file present and 18 with the flag. The flag exists in 1.5.6
+    # (shell_command_line_option.cpp: {"no-init", 0, "", SkipInit, ...}), so it
+    # is safe for client A.
+    argv = [bin_path, "-no-init", database]
     # stderr joins stdout so an error lands next to the marker of its query.
-    proc = subprocess.run([bin_path, database], input=script, text=True, stdout=subprocess.PIPE,
+    proc = subprocess.run(argv, input=script, text=True, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, env=env, timeout=timeout)
     return proc.returncode, mask(proc.stdout, cfg)
 
@@ -276,26 +298,65 @@ RUN_TIME = re.compile(r"Run Time \(s\): real ([0-9.]+)")
 
 
 def parse_marked(text, tag):
-    """Map each `@@<tag> <q>@@` marker to (seconds, error) from the lines after it."""
+    """Map each `@@<tag> <q>@@` marker to (seconds, error) from the lines after it.
+
+    A query's result rows go to /dev/null (timed_session redirects before every
+    statement), so between one marker and the next the ONLY expected line is the
+    CLI's `Run Time`. Anything else means the statement did not run cleanly.
+
+    "No `Run Time` means it failed" is NOT true, which is what the first version
+    keyed on (issue #505 item 2). The CLI prints a failure's text and THEN a
+    `Run Time` line for it, because END_TIMER fires before the error check.
+    Measured:
+
+        @@T q01@@
+        Run Time (s): real 0.001 user 0.000230 sys 0.001059
+        @@T q02@@
+        Catalog Error: Table with name no_such_table does not exist!
+        Did you mean "pg_tables"?
+
+        LINE 1: SELECT * FROM no_such_table;
+                              ^^^^^^^^^^^^^
+        Run Time (s): real 0.004 user 0.003579 sys 0.000725
+
+    So the old code collected those error lines and then threw them away because
+    `seconds` had been set -- publishing a Catalog Error as a 4 ms timing, and
+    making the whole error branch dead code. A session whose LOAD or ATTACH
+    failed produced 22 sub-millisecond "timings".
+
+    Judging on "was there unexpected output" rather than on a list of error
+    prefixes is deliberate. A prefix list cannot be complete, and the first
+    thing it misses is published as a fast success. This way, output that is
+    unexpected but harmless is reported as an error instead -- the direction a
+    measurement tool should fail in.
+    """
     out = {}
-    current, seconds, err = None, None, []
+    current, seconds, extra = None, None, []
+
     def close():
-        if current is not None:
-            # No `Run Time` line means the statement failed: the CLI times only what ran.
-            out[current] = (seconds, (" ".join(err)[:300] or "failed (see the session log)") if seconds is None else None)
+        if current is None:
+            return
+        if extra:
+            out[current] = (None, " ".join(extra)[:300])
+        elif seconds is None:
+            out[current] = (None, "no `Run Time` line (see the session log)")
+        else:
+            out[current] = (seconds, None)
+
     for line in text.splitlines():
         m = re.match(r"@@(\S+) (\S+)@@", line.strip())
         if m:
             close()
-            current, seconds, err = (m.group(2), None, []) if m.group(1) == tag else (None, None, [])
+            current, seconds, extra = (m.group(2), None, []) if m.group(1) == tag else (None, None, [])
             continue
         if current is None:
             continue
-        r = RUN_TIME.search(line)
-        if r and seconds is None:
-            seconds = float(r.group(1))
-        elif line.strip() and seconds is None:
-            err.append(line.strip())
+        if RUN_TIME.search(line):
+            if seconds is None:
+                seconds = float(RUN_TIME.search(line).group(1))
+            continue
+        if line.strip():
+            extra.append(line.strip())
     close()
     return out
 
@@ -325,22 +386,44 @@ def cmd_run(args):
     run_id = args.run_id or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = pathlib.Path(args.out) / run_id
     out.mkdir(parents=True, exist_ok=True)
-    rows = []
-    for rep in range(args.reps):
-        order = clients[rep % len(clients):] + clients[:rep % len(clients)]  # rotate: no client always first
-        for client in order:
-            res, text = timed_session(client, cfg, args, queries)
-            (out / f"session-{rep + 1}-{client}.log").write_text(text)
-            for q in queries:
-                sec, err = res.get(q, (None, "no marker in output"))
-                rows.append({"run": run_id, "db": args.db, "client": client, "rep": rep + 1, "query": q,
-                             "seconds": "" if sec is None else f"{sec:.4f}", "error": err or ""})
-                print(f"rep {rep + 1} {client:6s} {q} {'ERROR ' + err if err else f'{sec:9.3f} s'}", flush=True)
-    with open(out / "timings.csv", "w", newline="") as f:
+    # Written and flushed per SESSION rather than once after both loops (issue
+    # #505 item 7). At SF10 a rep is ~23 minutes, so --reps 3 across four
+    # clients is ~70 minutes and 264 rows; a stall in the last session used to
+    # mean a two-hour wait and then NO file at all, because the rows lived in a
+    # local list and subprocess.TimeoutExpired was uncaught -- the only `except`
+    # in this file was a ValueError in same(). The harness also sets
+    # mssql_query_timeout = 0, so --timeout per session is the only ceiling.
+    path = out / "timings.csv"
+    with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["run", "db", "client", "rep", "query", "seconds", "error"])
         w.writeheader()
-        w.writerows(rows)
-    print(f"timings: {out / 'timings.csv'}")
+        f.flush()
+        for rep in range(args.reps):
+            order = clients[rep % len(clients):] + clients[:rep % len(clients)]  # rotate: no client always first
+            for client in order:
+                try:
+                    res, text = timed_session(client, cfg, args, queries)
+                except subprocess.TimeoutExpired as exc:
+                    # The exception still carries the stdout of every query that
+                    # DID finish, Run Time lines included, so parse it rather
+                    # than discarding the session. mask() it: this path never
+                    # went through run_cli's masking, and an ATTACH failure can
+                    # quote the connection string back.
+                    text = mask(exc.output or "", cfg)
+                    res = parse_marked(text, "T")
+                    for q in queries:
+                        res.setdefault(q, (None, f"session timed out after {args.timeout}s"))
+                    print(f"rep {rep + 1} {client:6s} -- SESSION TIMEOUT after {args.timeout}s, "
+                          f"keeping {sum(1 for v in res.values() if v[0] is not None)} completed query(s)",
+                          flush=True)
+                (out / f"session-{rep + 1}-{client}.log").write_text(text)
+                for q in queries:
+                    sec, err = res.get(q, (None, "no marker in output"))
+                    w.writerow({"run": run_id, "db": args.db, "client": client, "rep": rep + 1, "query": q,
+                                "seconds": "" if sec is None else f"{sec:.4f}", "error": err or ""})
+                    print(f"rep {rep + 1} {client:6s} {q} {'ERROR ' + err if err else f'{sec:9.3f} s'}", flush=True)
+                f.flush()
+    print(f"timings: {path}")
 
 
 def cmd_report(args):
@@ -355,28 +438,51 @@ def cmd_report(args):
             errs = [r["error"] for r in rows if r["client"] == c and r["query"] == q and r["error"]]
             med[c, q] = (statistics.median(vals) if vals else None, len(vals), errs[0] if errs else "")
     base = "A" if "A" in clients else clients[0]
-    lines = [f"Median wall time per query, seconds (n = timed reps). Ratios are against {base}: below 1 is faster.", ""]
-    head = "| query | " + " | ".join(f"{c} ({CLIENTS[c]['label']})" for c in clients) + " | " + \
-        " | ".join(f"{c}/{base}" for c in clients if c != base) + " |"
-    lines += [head, "|" + "---|" * (1 + 2 * len(clients) - 1)]
-    totals = {c: 0.0 for c in clients}
+    # The sum must cover the SAME work for every client (issue #505 item 5).
+    # Accumulating whatever each client happened to complete published a client
+    # that errored on an expensive query as several times faster, with nothing
+    # in the bolded row marking it partial -- and that row is the one
+    # RESULTS-local.md quotes as its headline.
+    common = [q for q in queries if all(med[c, q][0] is not None for c in clients)]
+    missing = [q for q in queries if q not in common]
+    totals = {c: sum(med[c, q][0] for q in common) for c in clients}
+    # The rep count was stored in every cell and never read, though the header
+    # promised "n = timed reps" -- so a median over one surviving rep looked
+    # identical to one over three. Annotate any cell that is short.
+    reps_max = max((n for _, n, _ in med.values()), default=0)
+
+    lines = [f"Median wall time per query, seconds. Ratios are against {base}: below 1 is faster."]
+    if reps_max > 1:
+        lines.append(f"A cell shows `(n=N)` when fewer than {reps_max} timed reps survived for it.")
+    lines.append("")
+    ratio_cols = [c for c in clients if c != base]
+    cols = ["query"] + [f"{c} ({CLIENTS[c]['label']})" for c in clients] + [f"{c}/{base}" for c in ratio_cols]
+    # Built from one list so the header and the separator cannot disagree: with
+    # a single --clients the old form emitted three header cells against two
+    # separators and rendered as a broken table.
+    lines += ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
     for q in queries:
-        cells, ratios = [], []
+        cells = []
         for c in clients:
             v, n, e = med[c, q]
-            cells.append(f"{v:.3f}" if v is not None else f"error: {e[:40]}")
-            if v is not None:
-                totals[c] += v
+            if v is None:
+                cells.append(f"error: {e[:40]}")
+            else:
+                cells.append(f"{v:.3f}" + (f" (n={n})" if n < reps_max else ""))
         b = med[base, q][0]
-        for c in clients:
-            if c == base:
-                continue
+        for c in ratio_cols:
             v = med[c, q][0]
-            ratios.append(f"{v / b:.2f}" if v is not None and b else "")
-        lines.append(f"| {q} | " + " | ".join(cells) + " | " + " | ".join(ratios) + " |")
+            cells.append(f"{v / b:.2f}" if v is not None and b else "")
+        lines.append(f"| {q} | " + " | ".join(cells) + " |")
     tb = totals[base]
-    lines.append("| **sum** | " + " | ".join(f"**{totals[c]:.2f}**" for c in clients) + " | " +
-                 " | ".join(f"**{totals[c] / tb:.2f}**" if tb else "" for c in clients if c != base) + " |")
+    sum_cells = [f"**{totals[c]:.2f}**" for c in clients] + \
+                [f"**{totals[c] / tb:.2f}**" if tb else "" for c in ratio_cols]
+    lines.append(f"| **sum** ({len(common)}/{len(queries)} queries) | " + " | ".join(sum_cells) + " |")
+    if missing:
+        noun = "query" if len(common) == 1 else "queries"
+        lines += ["", f"The sum covers only the {len(common)} {noun} every client completed, so the totals and "
+                      f"ratios compare like with like. Excluded because at least one client has no median: "
+                      f"{', '.join(missing)}."]
     text = "\n".join(lines) + "\n"
     print(text)
     if args.report:
