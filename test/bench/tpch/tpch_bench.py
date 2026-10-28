@@ -495,8 +495,24 @@ def cmd_verify(args):
     cfg = server()
     clients, queries = selected(args)
     data = pathlib.Path(args.data_dir) / f"sf{args.sf:g}"
-    out = pathlib.Path(args.out) / "verify"
+    # Per DATABASE, not one shared directory (issue #506 item 3). The old path
+    # had no --sf, --db or --strings component and nothing ever removed a CSV
+    # from it, so a four-schema sweep compared against whatever the previous
+    # schema left behind.
+    out = pathlib.Path(args.out) / "verify" / args.db
     out.mkdir(parents=True, exist_ok=True)
+    # And clear this run's files anyway, so a query that fails at BIND -- where
+    # the COPY never opens its output file at all -- cannot be compared against
+    # the previous run's result and reported `ok`. Bind-time failure is client
+    # C's own failure mode, since its mssql_scan bind calls
+    # sp_describe_first_result_set.
+    for q in queries:
+        (out / f"oracle-{q}.csv").unlink(missing_ok=True)
+        for client in clients:
+            (out / f"{client}-{q}.csv").unlink(missing_ok=True)
+    # Per-client session failures, so a broken session is reported as such for
+    # every one of its queries instead of being compared at all.
+    failed = {}
     # The oracle: DuckDB 1.5.6 over the same parquet the server was loaded from.
     s = [f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{data / (t + '.parquet')}');" for t in TABLES]
     for q in queries:
@@ -513,15 +529,81 @@ def cmd_verify(args):
         rc, text = run_cli(binary(CLIENTS[client]["bin"]), "\n".join(s) + "\n", cfg, timeout=args.timeout)
         if text.strip():
             (out / f"{client}.log").write_text(text)
+        # The client session's return code was bound and never read, while the
+        # oracle's was checked (issue #506 item 3). The CLI does not bail on
+        # error for piped stdin, so this is the only signal that the session as
+        # a whole went wrong, and dropping it is how a failure became an `ok`.
+        if rc != 0:
+            failed[client] = f"client session exited {rc} (see {out / (client + '.log')})"
     bad = 0
     for client in clients:
         for q in queries:
-            verdict = compare(out / f"oracle-{q}.csv", out / f"{client}-{q}.csv")
-            if verdict != "ok":
+            # `verdict != "ok"` rejected compare()'s OWN accepting verdict for
+            # a reordered result, so a tie emitted in the other order failed the
+            # run while every per-query line still read `ok` -- teaching the
+            # operator to disregard the exit code, which is the channel a real
+            # wrong answer travels (issue #506 item 4).
+            verdict = failed.get(client) or compare(out / f"oracle-{q}.csv", out / f"{client}-{q}.csv")
+            if not verdict.startswith("ok"):
                 bad += 1
             print(f"{client:6s} {q} {verdict}")
     print(f"{bad} mismatch(es)")
     sys.exit(1 if bad else 0)
+
+
+def as_int(s):
+    """The value as an int when it is written as one, else None."""
+    t = s.strip()
+    try:
+        return int(t)
+    except ValueError:
+        return None
+
+
+def same(x, y):
+    """Is the client's value `y` the oracle's `x`?
+
+    Issue #506 items 1 and 2. The first version was
+    `x.strip() == y.strip()` then
+    `abs(fx-fy) <= max(1e-6 * max(|fx|,|fy|), 0.011)`, which failed twice over:
+
+    * The 0.011 ABSOLUTE floor was wider than whole answers. q08's entire
+      result is two rows, mkt_share 0.03443589 and 0.04148552 -- 0.00705
+      apart, inside the floor -- so swapping the two years printed `ok`.
+      q01's avg_disc groups are ~1e-4 apart and so were not checked at all.
+    * The 1e-6 RELATIVE term tolerated off-by-N on counts: q01's count_order
+      is 1,478,493 at SF1, so +-1.48 rows, +-14.8 at SF10, +-148 at SF100 --
+      a row-dropping pushdown bug on exactly the aggregates TPC-H is made of
+      passed the gate.
+    * `.strip()` made CHAR(n) trailing-blank padding invisible, which is the
+      very defect (#405) this harness's headline correctness result is about.
+      It was caught then only because the padding also broke comparisons and
+      changed row counts; a regression that padded only the OUTPUT -- q16
+      groups by p_brand CHAR(10), q12 by l_shipmode CHAR(10) -- would have
+      compared equal on every row.
+
+    So: integers must match EXACTLY, strings must match EXACTLY, and only a
+    real-valued pair gets a tolerance, sized to what the two engines can
+    legitimately disagree by rather than to a round number. The server returns
+    these as decimal(38,6) against the oracle's DOUBLE, a half-digit of 5e-7,
+    and a large sum carries double's own relative error; 1e-6 absolute or 1e-9
+    relative covers both and still leaves q08's 0.00705 spread four orders of
+    magnitude outside it.
+    """
+    if x == y:
+        return True
+    xi, yi = as_int(x), as_int(y)
+    if xi is not None and yi is not None:
+        return xi == yi
+    try:
+        fx, fy = float(x), float(y)
+    except ValueError:
+        return False
+    return abs(fx - fy) <= max(1e-6, 1e-9 * max(abs(fx), abs(fy)))
+
+
+def rows_equal(ra, rb):
+    return len(ra) == len(rb) and all(same(x, y) for x, y in zip(ra, rb))
 
 
 def compare(oracle, got):
@@ -531,20 +613,18 @@ def compare(oracle, got):
     b = list(csv.reader(open(got)))
     if len(a) != len(b):
         return f"ROWS {len(b)} != {len(a)}"
-    def same(x, y):
-        if x.strip() == y.strip():
-            return True
-        try:
-            fx, fy = float(x), float(y)
-        except ValueError:
-            return False
-        return abs(fx - fy) <= max(1e-6 * max(abs(fx), abs(fy)), 0.011)
-    def rows_equal(ra, rb):
-        return len(ra) == len(rb) and all(same(x, y) for x, y in zip(ra, rb))
     if all(rows_equal(ra, rb) for ra, rb in zip(a, b)):
         return "ok"
+    # Same rows, different order. The old wording was "row order of ties
+    # differs", which it has no evidence for: an inverted ORDER BY with no ties
+    # at all reaches here too. Say what is actually established.
     if all(rows_equal(ra, rb) for ra, rb in zip(sorted(a), sorted(b))):
-        return "ok (row order of ties differs)"
+        return "ok (same rows, different order)"
+    # Name trailing-blank padding specifically, since it is the #405 class and
+    # an exact comparison is the only thing that can see it.
+    if all(len(ra) == len(rb) and all(x.strip() == y.strip() for x, y in zip(ra, rb))
+           for ra, rb in zip(a, b)):
+        return "PADDING (values differ only in surrounding blanks -- the #405 class)"
     for i, (ra, rb) in enumerate(zip(a, b)):
         if not rows_equal(ra, rb):
             return f"DIFF at row {i + 1}: {rb[:6]} vs {ra[:6]}"
