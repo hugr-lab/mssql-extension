@@ -2,16 +2,16 @@
 #
 # Fail when a macOS binary requires a newer macOS than the release supports.
 #
-# Usage: check_macos_minos.sh <expected minos, e.g. 14.0> <binary>...
+# Usage: check_macos_minos.sh <expected minos, e.g. 15.0> <binary>...
 #
 # The runner's SDK decides a binary's minimum macOS (LC_BUILD_VERSION minos)
-# unless MACOSX_DEPLOYMENT_TARGET pins it. When GitHub moved us from macos-14 to
-# macos-15 runners, an unpinned build would have quietly required macOS 15, and
-# the asset would have refused to load on macOS 14 -- which v0.3.0 supported.
+# unless MACOSX_DEPLOYMENT_TARGET pins it. The release supports macOS 15.0 and
+# later; a build that quietly followed a newer runner SDK (15.5, say) would
+# refuse to load on the earlier 15.x releases.
 
 set -euo pipefail
 
-expected="${1:?expected minos, e.g. 14.0}"
+expected="${1:?expected minos, e.g. 15.0}"
 shift
 [ "$#" -gt 0 ] || { echo "usage: $0 <expected minos> <binary>..." >&2; exit 2; }
 

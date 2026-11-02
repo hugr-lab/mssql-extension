@@ -477,13 +477,14 @@ jobs:
       # nothing caches -- so every run rebuilt OpenSSL from source.
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
       # GitHub retired the macOS 14 runner images on 2026-11-02
-      # (actions/runner-images#13518), so the macOS legs run on macos-15. A
-      # binary built there would require macOS 15 by default (its LC_BUILD_VERSION
-      # minos follows the SDK); pinning the deployment target keeps what v0.3.0
-      # shipped, minos 14.0. clang and CMake read the variable, and vcpkg does not
+      # (actions/runner-images#13518), so the macOS legs run on macos-15, and the
+      # release binaries support macOS 15 and later (owner's decision, 2026-11-02;
+      # v0.3.0's said 14.0). Pinned to 15.0 rather than left to the SDK: unpinned,
+      # LC_BUILD_VERSION minos follows the runner's SDK (15.5 locally) and would
+      # shut out 15.0-15.4. clang and CMake read the variable, and vcpkg does not
       # clean the environment off Windows, so OpenSSL and simdutf follow it too.
       # Ignored on Linux.
-      MACOSX_DEPLOYMENT_TARGET: '14.0'
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
 
     steps:
       - uses: actions/checkout@v7
