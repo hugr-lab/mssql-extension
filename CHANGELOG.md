@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The macOS release binaries need macOS 15 or later** (v0.3.0's needed 14). GitHub retired its macOS 14 runner images on 2026-11-02, so the macOS builds moved to macos-15; the binaries are built for macOS 15.0 (`MACOSX_DEPLOYMENT_TARGET`), and the release fails a macOS build that requires anything else (`scripts/ci/check_macos_minos.sh`). `INSTALL mssql FROM community` is unaffected.
 - **The release binaries load into a stock DuckDB when the DuckDB pin is a release tag.** DuckDB 2.0 labels every build `-dev` unless told otherwise, the release tag's commit included. So the v0.3.0 binaries attached to the GitHub release say `2ec7e8401c` and load only into that build: a stock DuckDB 2.0.0 refuses them ("built specifically for DuckDB version '2ec7e8401c'"). With the pin on a tag, the build is labelled with the tag: CI, the release workflow and `make` set `OVERRIDE_GIT_DESCRIBE` (`scripts/ci/duckdb_release_tag.sh`). The binaries then load into that DuckDB, unsigned (`-unsigned`), and `INSTALL azure` works in a local or CI build, since DuckDB publishes its extensions for a release only under the tag. The release smoke test fails a release pin whose CLI or extension does not carry the tag (`scripts/ci/check_duckdb_label.sh`). `INSTALL mssql FROM community` is unchanged.
 
 ## [0.3.0] - 2026-10-20

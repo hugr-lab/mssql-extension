@@ -65,6 +65,8 @@ SELECT * FROM mssql.dbo.SalesOrderHeader LIMIT 10;
 | Linux ARM64 | CI-validated | Automated builds and tests in CI |
 | Windows x64 | CI-validated | Automated builds and tests in CI |
 
+The macOS binaries attached to [GitHub releases](https://github.com/hugr-lab/mssql-extension/releases) need **macOS 15 (Sequoia) or later**. `INSTALL mssql FROM community` installs the build DuckDB's community repository makes for your DuckDB version and platform.
+
 
 ## Roadmap
 

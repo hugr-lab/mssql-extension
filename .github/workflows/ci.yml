@@ -188,7 +188,7 @@ jobs:
           - id: linux
             runner: ubuntu-latest
           - id: macos
-            runner: macos-14
+            runner: macos-15
     steps:
       - uses: actions/checkout@v7
 
@@ -417,7 +417,7 @@ jobs:
           # The single source of truth for both entries.
           ALL: >-
             [{"id":"linux_amd64","os":"linux","arch":"amd64","runner":"ubuntu-22.04","docker_available":true,"vcpkg_triplet":"x64-linux"},
-             {"id":"osx_arm64","os":"osx","arch":"arm64","runner":"macos-14","docker_available":false,"vcpkg_triplet":"arm64-osx"}]
+             {"id":"osx_arm64","os":"osx","arch":"arm64","runner":"macos-15","docker_available":false,"vcpkg_triplet":"arm64-osx"}]
           EVENT: ${{ github.event_name }}
         run: |
           # A pull request builds Linux only: it is the platform the integration
@@ -476,6 +476,15 @@ jobs:
       # to its default files provider under $HOME/.cache/vcpkg/archives, which
       # nothing caches -- so every run rebuilt OpenSSL from source.
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
+      # GitHub retired the macOS 14 runner images on 2026-11-02
+      # (actions/runner-images#13518), so the macOS legs run on macos-15, and the
+      # release binaries support macOS 15 and later (owner's decision, 2026-11-02;
+      # v0.3.0's said 14.0). Pinned to 15.0 rather than left to the SDK: unpinned,
+      # LC_BUILD_VERSION minos follows the runner's SDK (15.5 locally) and would
+      # shut out 15.0-15.4. clang and CMake read the variable, and vcpkg does not
+      # clean the environment off Windows, so OpenSSL and simdutf follow it too.
+      # Ignored on Linux.
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
 
     steps:
       - uses: actions/checkout@v7
@@ -831,7 +840,7 @@ jobs:
 
           - id: osx_arm64
             os: osx
-            runner: macos-14
+            runner: macos-15
             docker_available: false
 
     steps:
