@@ -78,7 +78,7 @@ jobs:
           - id: osx_arm64
             os: osx
             arch: arm64
-            runner: macos-14
+            runner: macos-15
             docker_available: false
             vcpkg_triplet: arm64-osx
 
@@ -86,6 +86,14 @@ jobs:
       # Point vcpkg's binary cache at a directory actions/cache persists.
       # The default is $HOME/.cache/vcpkg/archives, which nothing caches.
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
+      # GitHub retired the macOS 14 runner images on 2026-11-02
+      # (actions/runner-images#13518), so the macOS legs run on macos-15. A
+      # binary built there would require macOS 15 by default (its LC_BUILD_VERSION
+      # minos follows the SDK); pinning the deployment target keeps what v0.3.0
+      # shipped, minos 14.0. clang and CMake read the variable, and vcpkg does not
+      # clean the environment off Windows, so OpenSSL and simdutf follow it too.
+      # Ignored on Linux.
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
 
     steps:
       - uses: actions/checkout@v7
@@ -252,6 +260,13 @@ jobs:
             exit 1
           fi
           echo "OK: $ext carries the GSSAPI shim (integrated authentication)"
+
+      # The macOS asset must load on the macOS it claims to support: the
+      # runner's SDK would otherwise raise minos to 15 (see MACOSX_DEPLOYMENT_TARGET).
+      - name: Verify the macOS build's minimum macOS version
+        if: matrix.platform.os == 'osx'
+        shell: bash
+        run: scripts/ci/check_macos_minos.sh "$MACOSX_DEPLOYMENT_TARGET" build/release/extension/mssql/mssql.duckdb_extension build/release/duckdb
 
       - name: Rename artifact
         shell: bash
@@ -598,7 +613,7 @@ jobs:
           - id: osx_arm64
             os: osx
             arch: arm64
-            runner: macos-14
+            runner: macos-15
             docker_available: false
 
     steps:
