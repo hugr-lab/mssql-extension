@@ -66,7 +66,7 @@ flowchart LR
 
 **Track A (the lake's critical path): 085 → 089 PR 1 → 090.** After 089 PR 1, mssql-ducklake can import
 quiet backups and differentials exactly, refusing a file in which any imported table is not
-`consistent` (the owner's "no dirt" holds by refusal, 021 D11). After 090, it imports busy backups
+`consistent` (the owner's "no dirt" holds by refusal, 022 D11). After 090, it imports busy backups
 exactly.
 
 **Track B (coverage): 086 PR 1–2 (ROW, PAGE) → 087 → 088 → 086 PR 3–6 → 089 PR 2.** ROW and PAGE first
@@ -86,7 +86,7 @@ Each PR merges before the next opens (no stacked PRs).
 | 1: ROW / PAGE, sparse, `sql_variant`, xml, spatial, vector; overlay; locators; parallel scan | 5–6 wk, med | 7–8 wk + json spike | 086 | overlay / locators / parallel moved to 085; `hierarchyid` and double-byte code pages added; one oracle test per type |
 | 1b: encryption and TDE | 1–2 wk, low–med (E4) | 3–3.5 wk + E10 | 087 | the secret type, the selection rule, CI fixtures; the TDE log tail found open |
 | 1c: tail recovery | 9–12 wk, med (E3, E6) | 10–12 wk | 090 | about a week of it (the log reader) is in 085; guard extensions listed separately (ROW and PAGE 2–3, ADR / RCSI 3–4, DDL 1–2 wk) |
-| 2: mssql-ducklake import | 3–4 wk, med | not in this series (mssql-ducklake 021–023: 20–26 wk) | — | the reader side of it is 089 (8 wk), which §8 did not cost |
+| 2: mssql-ducklake import | 3–4 wk, med | not in this series (mssql-ducklake 022–024: 20–26 wk) | — | the reader side of it is 089 (8 wk), which §8 did not cost |
 | 3: columnstore | 5–8 wk, med (E5) | 6–9 wk | 088 | E11 (columnstore in differentials) added, NCCI dropped |
 | 4: log backups | 3–6 mo, high | not in this series | — | — |
 | 5: QAT_DEFLATE, 2025 `json` | open | `json`: 086's spike; QAT: none | 086 | QAT_DEFLATE is refused by name |
@@ -178,7 +178,7 @@ open-pass and memory bounds.
 
 | id | question | spec | timebox | state |
 |---|---|---|---|---|
-| E7 | partitioning in a backup | 085 (the partition model), 089 (ownership rule, maintenance evidence), mssql-ducklake 021 / 022 | — | **done** (`../../experiments/E7-partitioning.md`), integrated |
+| E7 | partitioning in a backup | 085 (the partition model), 089 (ownership rule, maintenance evidence), mssql-ducklake 022 / 023 | — | **done** (`../../experiments/E7-partitioning.md`), integrated |
 | E9 | the 2025 `json` binary, decoded and gated against `CAST(j AS nvarchar(max))` | 086 | 1–2 wk | planned |
 | E10 | the log tail of a TDE backup | 087, 090 | 3–5 d | planned |
 | E11 | columnstore in differentials (incl. a partitioned CCI's SPLIT / MERGE), and the tuple mover during a backup | 088, 089 | 3 d | planned |

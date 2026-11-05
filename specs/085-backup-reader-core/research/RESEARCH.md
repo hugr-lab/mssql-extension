@@ -1,10 +1,10 @@
 # 001 — Reading SQL Server backups without SQL Server
 
-Status: research, 2026-11-05 — the research record behind specs 085–090 (this repo) and 021–023 (mssql-ducklake). Built on three reports in this folder:
+Status: research, 2026-11-05 — the research record behind specs 085–090 (this repo) and 022–024 (mssql-ducklake). Built on three reports in this folder:
 `research-web.md` (formats, prior art, licences), `research-experiment.md` (real backups from SQL
 Server 2025, decoded by the scripts in `tools/`), `research-architecture.md` (how it fits mssql and
 mssql-ducklake). Start here; follow the links for evidence. The specs built on it are 085–090 here
-([series overview](../series.md)) and 021–023 in mssql-ducklake; the owner's decisions are in
+([series overview](../series.md)) and 022–024 in mssql-ducklake; the owner's decisions are in
 [decisions.md](../decisions.md).
 
 ## 1. What we want
@@ -595,7 +595,7 @@ our own measurements, and MIT sources.
 
 The research-time phases, with the draft spec that now carries each (2026-11-05). The specs re-cost them
 with the hardening, fuzz harnesses, CI oracle lanes and docs of §9; the per-spec breakdown and the
-differences are in the [series overview](../series.md) (phase map) and mssql-ducklake's [import series](https://github.com/hugr-lab/mssql-ducklake/blob/main/specs/021-import-full-backup/series.md).
+differences are in the [series overview](../series.md) (phase map) and mssql-ducklake's [import series](https://github.com/hugr-lab/mssql-ducklake/blob/main/specs/022-import-full-backup/series.md).
 
 | phase | scope | research estimate | risk | spec (draft) and its estimate |
 |---|---|---|---|---|
@@ -603,13 +603,13 @@ differences are in the [series overview](../series.md) (phase map) and mssql-duc
 | 1 | ROW/PAGE compression, sparse, sql_variant, xml, spatial (SSCLRT→WKB), vector; differential overlay; virtual row locators; parallel scan | 5–6 wk | med | mssql 086, 7–8 wk + the `json` spike E9 |
 | 1b | encryption and TDE with a `mssql_backup_key` secret (certificate + PVK/PFX + password), selected by scope first, then by the thumbprint stored in plaintext in the backup / boot page (owner, §6.1) — format established by E4 | 1–2 wk | low–med | mssql 087, 3–3.5 wk + the TDE log-tail spike E10 |
 | 1c | tail recovery (owner: no dirt in the lake): redo of every tail transaction + undo of open ones, pending pages with allocation check, stale-page tracking, CheckpointLSN ordering — established by E3 + E6 | 9–12 wk | medium | mssql 090, 10–12 wk (+ guard extensions) |
-| 2 | mssql-ducklake: full import (one snapshot), provenance, diff import by locators, table-replace fallbacks, views as text | 3–4 wk | med | reader side: mssql 089, 8 wk; importer: mssql-ducklake 021–023, 20–26 wk |
+| 2 | mssql-ducklake: full import (one snapshot), provenance, diff import by locators, table-replace fallbacks, views as text | 3–4 wk | med | reader side: mssql 089, 8 wk; importer: mssql-ducklake 022–024, 20–26 wk |
 | 3 | columnstore (required): segments, dictionaries, RLE/bit-packing, delta stores, delete bitmaps, archive — format established by E5 | 5–8 wk | medium | mssql 088, 6–9 wk + E11 |
 | 4 | log backups: redo of row operations → consistent full backups and CDC-style incremental import; sector parity | 3–6 mo | high | not in the series |
 | 5 | QAT_DEFLATE, 2025 `json` — research first | open | high | `json`: 086's E9; QAT_DEFLATE refused by name |
 
 Totals of the drafts: mssql 085–090 ≈ 255 working days (≈ 51 weeks for one developer, ≈ 34 with two);
-mssql-ducklake 021–023 ≈ 20–26 weeks, gated on the reader. The order of 088 against 090 and the other
+mssql-ducklake 022–024 ≈ 20–26 weeks, gated on the reader. The order of 088 against 090 and the other
 open questions are in [decisions.md](../decisions.md).
 
 ## 9. Hardening and tests

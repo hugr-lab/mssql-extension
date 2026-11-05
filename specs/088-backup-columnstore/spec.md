@@ -295,7 +295,7 @@ phase 3 gave 5–8 weeks at medium risk after E5.
 - **The differential and fuzzy behaviour** of columnstore is unmeasured (D6, D7); E11 comes before
   089's columnstore path.
 - Open for the owner: the order of 088 relative to 090 (R§10.4; DQ-03, accepted: 090 first); refusing or marking stale a columnstore table whose tail the
-  recovery cannot cover (D6 here, 090 D7 against 022 Q4; DQ-07).
+  recovery cannot cover (D6 here, 090 D7 against 023 Q4; DQ-07).
 
 ## References
 

@@ -65,7 +65,7 @@ log backups (R§8 phase 4 stays out).
 - **D4 — variant 1 for loaded differentials (owner).** `loaded_diff := 'skip'` (default) or
   `'partial'` (E6's main variant: fewer stale keys, but rows twice and torn LOBs until the next file;
   whether to offer it at all is DQ-17). mssql-ducklake's import option of the same name passes it
-  through (022 D1).
+  through (023 D1).
   Keeping raw record bytes per row to make a loaded differential exact on its own is not done (owner:
   it roughly doubles storage).
 
@@ -78,7 +78,7 @@ log backups (R§8 phase 4 stays out).
   exact (restore mode, a lake-mode full) or dirt-free (a loaded differential), or the table is
   `unrecoverable` with the reason, and the importer refuses the file, naming the table (one snapshot
   per file leaves no way to apply the rest without it). Never dirt with a warning. For a columnstore
-  table 022 Q4 drafted "mark it stale" instead; that disagreement is DQ-07.
+  table 023 Q4 drafted "mark it stale" instead; that disagreement is DQ-07.
 
 - **D8 — the page-state model is the reader's.** A page under recovery is its 96-byte header plus a
   slot list of record bytes (E6 `PageState`); its serialisation (versioned, checksummed) is the pending
@@ -162,8 +162,8 @@ it is ignored, FORMAT_PAGE included (rebuilding such a page lost 3 rows for good
   any other unresolved LOB is 089's named refusal.
 - **Invariant**: the next file carries every stale page or frees it (62 / 62, 125 / 125; with skip 551
   / 551, 1,419 / 1,419). The stale set is lake state, not a reader input (089 D10), so the importer
-  checks it at that file against `mssql_backup_changed_pages` (022 D7). This draft makes a page the
-  file neither carries nor frees a named error; 022 drafted "report it, keep it stale and proceed".
+  checks it at that file against `mssql_backup_changed_pages` (023 D7). This draft makes a page the
+  file neither carries nor frees a named error; 023 drafted "report it, keep it stale and proceed".
   That disagreement is DQ-06.
 
 **The changed set in lake mode** (089 D3) adds the applied pending images, the pages formatted in the

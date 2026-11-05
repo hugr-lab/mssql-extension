@@ -243,7 +243,7 @@ Common named parameters of every function, and ATTACH options of the same names:
 | `first_lsn`, `last_lsn`, `checkpoint_lsn`, `database_backup_lsn` | `DECIMAL(25,0)` | trailer SCIN (MSLS / MQCI) +32 / +42 / +52 / +62, 10 bytes each (E1§3) |
 | `differential_base_lsn`, `differential_base_guid` | `DECIMAL(25,0)`, `UUID` | SCIN +830 / +842; in a full: its own checkpoint LSN and GUID, the base it establishes (E1§3) |
 | `database_name`, `database_version`, `compatibility_level`, `collation`, `family_guid` | | boot page: `dbi_dbname` +52, `dbi_version` +4, `dbi_cmptlevel` +314, `dbi_collation` +392 (name from the collation table), `dbi_familyGUID` +408 (record offsets, X§4) |
-| `recovery_fork_id`, `binding_id` | `UUID` | **to locate** (task 3), HEADERONLY `RecoveryForkID` / `BindingID`; `NULL` until matched. The importer's chain check needs the fork id (089 rule 1, 022 C1) |
+| `recovery_fork_id`, `binding_id` | `UUID` | **to locate** (task 3), HEADERONLY `RecoveryForkID` / `BindingID`; `NULL` until matched. The importer's chain check needs the fork id (089 rule 1, 023 C1) |
 | `backup_name`, `description`, `user_name`, `machine_name`, `software_version` | `VARCHAR` | SSET strings, VOLB machine name, SSET software major / minor (X§3) |
 | `backup_start_date`, `backup_finish_date` | `TIMESTAMP` | **to locate** (task 3): candidates SSET +88 and ESET +80 MTF dates; `NULL` until matched with HEADERONLY |
 | `media_set_guid`, `family_count`, `family_sequence_number` | | TAPE's RAID stream +0 / +20 / +24 (E2 layouts) |
@@ -272,7 +272,7 @@ when partitions differ, E7: `cmprlevel` is per partition), `partition_count`, `r
   for a table on a filegroup (E7§2, § Rules, catalog). Boundaries are listed in their current order;
   their ids are positional and renumbered by SPLIT / MERGE, so a consumer compares value lists, never
   ids (E7§6). The base index's data space only: a non-aligned nonclustered index is not reported (the
-  scan never reads it). Deriving a DuckLake spec from it is mssql-ducklake's (021 D5).
+  scan never reads it). Deriving a DuckLake spec from it is mssql-ducklake's (022 D5).
 
 `mssql_backup_views(path)`: `schema_name`, `view_name`, `object_id`, `definition` (`VARCHAR`, the
 T-SQL text from `sysobjvalues`, X§4), `is_encrypted`, `created`, `modified`. A `WITH ENCRYPTION` view
@@ -284,7 +284,7 @@ its clustering key by `ordkey`; checked against E1's keys: `sysallocunits(auid)`
 `sysrowsets(rowsetid)`, `sysschobjs(id)`, `syscolpars(id, number, colid)`, `sysrscols(rsid,
 rscolid)`, `sysseobjvalues(valclass, id, subid, valnum)`, `sysclsobjs(class, id)`). Without
 `base_table` it lists the allow-listed base tables (`base_table`, `object_id`, `row_count`,
-`columns`), which is the set an importer mirrors (021 D3); the list is the reader's, per version.
+`columns`), which is the set an importer mirrors (022 D3); the list is the reader's, per version.
 
 `mssql_backup_scan(path, schema, table)`: the table's columns plus the D8 virtual columns.
 Projection pushdown; LOBs read only when their column is projected. **No filter pushdown in this

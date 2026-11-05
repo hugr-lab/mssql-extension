@@ -3,7 +3,7 @@
 Status: **draft**, 2026-11-05. Not started. Depends on spec 085; uses 086–088 where a table needs
 them. Series overview: `../README.md`. Markers and source abbreviations as in 085; owner questions as
 DQ-nn ([decisions.md](../085-backup-reader-core/decisions.md)). This spec is the authority on the names and shapes mssql-ducklake
-consumes (its README says so); 021 §D4 and 022 §D2 were reconciled with it.
+consumes (its README says so); 022 §D4 and 023 §D2 were reconciled with it.
 
 ## Problem
 
@@ -88,7 +88,7 @@ tail, and the pending and stale pages it produces, are spec 090; this spec leave
      recovery marks stale, and reports that page `stale` with reason `lob` (E6§6.8: dropping the map
      lost 3 values for good); there is no parameter for it.
 
-  **Where the old value's bytes come from is an open disagreement (DQ-01, blocking 021's lake format
+  **Where the old value's bytes come from is an open disagreement (DQ-01, blocking 022's lake format
   and this PR).** The splice in step 2 copies byte ranges of the old **stored** form, so the old bytes
   must be reproduced exactly. Three designs are on the table:
   - **(A) store the bytes** — E1 rule 8: "Store LOB bytes (or a lossless mapping), not decoded text:
@@ -106,7 +106,7 @@ tail, and the pending and stale pages it produces, are spec 090; this spec leave
     mapping or a best-fit mapping that is not one-to-one, invalid UTF-8 under a UTF-8 collation —
     block that table's incremental import at their next partial update; a re-encoder bug would be a
     silent wrong splice, which the guard reduces to the values it checked.
-  - **(C) re-encode, bytes for the exceptions** — 021 D3's `raw BLOB`: the bytes are stored only when
+  - **(C) re-encode, bytes for the exceptions** — 022 D3's `raw BLOB`: the bytes are stored only when
     `text_exact` would be false, and always for `xml` / `json` / CLR off-row values. Never refuses;
     storage grows with the exceptions (plus every off-row `xml` / `json` value); two code paths.
 
@@ -137,7 +137,7 @@ tail, and the pending and stale pages it produces, are spec 090; this spec leave
   the lake (owner, R§6.2; research-ducklake-import §4.3 rejects that option).
 
 - **D10 — side inputs are Parquet files under one `base` prefix, read on a side connection.**
-  `base := '<lake data path>/__mssql_backup/runs/<BackupSetGUID>/<run>/base/'` (021 D9's run
+  `base := '<lake data path>/__mssql_backup/runs/<BackupSetGUID>/<run>/base/'` (022 D9's run
   directory; any FileSystem path works) holds, by fixed names (each may be a set `name-*.parquet`):
 
   | file | content | needed for |
@@ -148,7 +148,7 @@ tail, and the pending and stale pages it produces, are spec 090; this spec leave
   | `pending.parquet` | spec 090: `mssql_backup_pending_pages`'s rows from the previous file | 090 |
 
   The stale page set is **not** an input: it stays lake state, and the importer checks its healing
-  against `mssql_backup_changed_pages` (022 D7). The reader opens a `Connection` on the same database
+  against `mssql_backup_changed_pages` (023 D7). The reader opens a `Connection` on the same database
   instance and reads them with `read_parquet` (the worker-connection precedent:
   research-ducklake-import §8). Rejected: a SQL string run on a side connection (it reads committed
   lake state, not the caller's transaction, and ties the reader to what the string names); a session
@@ -189,7 +189,7 @@ SELECT * FROM mssql_backup_export('s3://bak/d5.bak', out := 's3://lake/data/',
 ```
 
 `base` (D10) is accepted by every function of 085 too (`mssql_backup_tables`, `_views`, `_catalog`,
-`_scan`), so a lone differential is listed and browsed with the catalog the scan uses (D5); 022 asks
+`_scan`), so a lone differential is listed and browsed with the catalog the scan uses (D5); 023 asks
 `mssql_backup_tables(diff, base := …)` for the file's table list. Spec 090 adds `recovery`,
 `loaded_diff` and `reflected_lsn` to the scan, `changed_pages`, `export_plan` and `export`.
 
@@ -199,11 +199,11 @@ last_checkpoint_lsn, family_guid, recovery_fork_id)`**: the lake's base full and
 that file's CheckpointLSN, and the database. With NULL arguments it answers for a fresh import (a full
 only). Rules, in order:
 1. A data backup (full or differential) of the database whose `dbi_familyGUID` = `family_guid`
-   (R§3), on the recovery fork `recovery_fork_id` (022 C1). Until 085 locates the fork id (its task 3)
+   (R§3), on the recovery fork `recovery_fork_id` (023 C1). Until 085 locates the fork id (its task 3)
    the fork is not checked, and the result says so in `reason`.
 2. `backup_set_guid = last_backup_set_guid` → `ok`, `already_applied` (a retry after a commit that
    succeeded unseen, research-ducklake-import §9). This function sees only the last import; older
-   ones are the importer's check (022 C2).
+   ones are the importer's check (023 C2).
 3. `checkpoint_lsn > last_checkpoint_lsn`, else refused ("not later than the last applied file").
    CheckpointLSN, not FirstLSN: a transaction open across two files gives both the same FirstLSN
    (E6§3.4).
@@ -224,7 +224,7 @@ for the importer to record.
 | `dead_au` | AUs of type 0 or owner 0 in the file's catalog: a deferred drop, or a big `TRUNCATE`, of a table or of a partition (E7 s10) | need 4 |
 | `gone_au` | AUs in the base mirror and absent from the file's catalog (needs `base`): a dropped table, a merged-away or rebuilt partition, a deferred drop completed (E7 s08, s10b, s11) | need 4 |
 | `au_moved` | (needs `base`) an AU, or for a columnstore a rowset, whose rowset's `(idmajor, idminor)` in the file's catalog differs from the base mirror's; AU and rowset ids are unchanged by a SWITCH. **Not reported when only `numpart` changed**: that is SPLIT / MERGE renumbering (E7 s06: 670 rows renumbered with no page change), and the partition number is never stored with a row | need 12, E7§5 |
-| `dead_rowgroup` | (needs `base`; shape fixed after 088's E11) a columnstore rowgroup of the base mirror that is TOMBSTONE or gone in the file, and a TOMBSTONE's delta store that still owns pages | 088 D7, 022 D9 |
+| `dead_rowgroup` | (needs `base`; shape fixed after 088's E11) a columnstore rowgroup of the base mirror that is TOMBSTONE or gone in the file, and a TOMBSTONE's delta store that still owns pages | 088 D7, 023 D9 |
 
 Columns: `kind`, `file_id`, `first_page`, `page_count`, `page` (`_mssql_page` form of the first
 page), `au_id`, `rowset_id`, `rowgroup_id`, `object_id`, `index_id`, `partition_number`,
@@ -269,7 +269,7 @@ one writer per thread.
 - `target_file_size`, `parquet_options` (compression, row group size, Parquet version): the lake's own
   settings, passed by the importer; files rotate at the size.
 - `naming`: the file-name pattern; default `mssql-{backup_set_guid}-o{object_id}-p{partition}-u{unit}-{seq}.parquet`
-  (research-ducklake-import §4.3); 021 D4 passes its own, with a run id.
+  (research-ducklake-import §4.3); 022 D4 passes its own, with a run id.
 - `field_ids`: write Parquet field ids (DQ-24).
 
 It returns one row per written file: `path`, `object_id`, `schema_name`, `table_name`,
@@ -331,7 +331,7 @@ it. The general rules plus the ownership rule replay all 15 of E7's differential
 Recognising an operation by name is needed only for messages and logs, never for correctness (E7§5).
 The partition metadata (functions, schemes, boundaries) is 085's `partitioning` column; mssql-ducklake
 proposes a DuckLake spec from it once, when it creates the lake table, and nothing after that follows
-SQL Server (owner, 2026-11-05; 021 D5).
+SQL Server (owner, 2026-11-05; 022 D5).
 
 Not covered by E7, so fixture-gated before it is trusted (E7§7): RANGE LEFT SPLIT / MERGE (which side
 gets the new or dropped rowset), an `ALL TO` scheme after a SPLIT, SWITCH … WITH TRUNCATE_TARGET, a
