@@ -302,8 +302,9 @@ So check allocation (PFS is enough with uniform extents) and always overlay pass
 4. **Default: warn.** Read the rows, attach the status, and log a warning naming the tables. An option
    `fuzzy := 'error'` refuses non-consistent tables. A third option, `'redo'`, belongs to a later phase.
 5. **For the lake import (§6.2, E1).**
-   - Record `CheckpointLSN` as the point a no-replay full import reflects, not `LastLSN`; better, store each
-     page's LSN with `_mssql_page`.
+   - Record `CheckpointLSN` as the point a no-replay full import reflects, not `LastLSN`. Which pages the next
+     file must re-read is then decided by that file (its DCM and `m_lsn > since_lsn`), with no page LSN kept
+     in the lake (089 D3).
    - The stale pages carry old LSNs, and their newer versions in the next differential lie *below* the full's
      `LastLSN`. An importer that skips pages with LSN ≤ `LastLSN` would therefore keep them stale forever.
    - The next diff does contain them: the full resets the DCM at its start, and the extents changed during it are

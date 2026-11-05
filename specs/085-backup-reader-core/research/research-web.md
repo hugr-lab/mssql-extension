@@ -201,7 +201,7 @@ Date: 2026-11-05. This is research only. "RE" means reverse-engineered; "IV" mea
 
 | Component | Status | Prior art | Risk | Effort |
 |---|---|---|---|---|
-| MTF walk + page map | Spec documented; SQL use RE | DbReader, IV | Low–Med | 2–3 wk |
+| MTF walk + page index | Spec documented; SQL use RE | DbReader, IV | Low–Med | 2–3 wk |
 | Backup header (LSNs, GUIDs) | RE (HEADERONLY is the oracle) | IV | Med | 1–2 wk |
 | MS_XPRESS / ZSTD | Codec documented; framing RE | IV, pyxca | Low–Med | 1–2 wk |
 | QAT_DEFLATE | Unknown framing | none | Med | 1 wk after samples |
@@ -220,7 +220,7 @@ A realistic v1 covers full and differential backups, uncompressed or MS_XPRESS/Z
 
 ## Biggest unknowns and the experiment for each
 
-1. **Page placement under load and with multiple files** (DbReader's positional model against IV's header model). Back up under an OLTP load, RESTORE and take the database OFFLINE, then byte-compare the page maps.
+1. **Page placement under load and with multiple files** (DbReader's positional model against IV's header model). Back up under an OLTP load, RESTORE and take the database OFFLINE, then byte-compare where each model places every page.
 2. **Header byte layout.** Take backups with known HEADERONLY values; search for the LSN triples and GUIDs on 2016, 2019, 2022 and 2025.
 3. **MS_XPRESS across versions** (Redgate hints that 2008 R2 differs). Decompress each version's backups; the result must parse as MTF and equal an uncompressed backup.
 4. **QAT_DEFLATE.** In a Windows VM with ISA-L in software mode, back up, then try raw/zlib/gzip inflate on a chunk.

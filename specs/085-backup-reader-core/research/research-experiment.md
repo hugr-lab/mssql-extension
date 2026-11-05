@@ -179,7 +179,8 @@ An MQDA stream holds whole extents, in increasing extent order, and nothing else
   pad units in the full backup contain full copies of the `t_heap` / `t_pk` page bodies. A reader must skip
   them, and they leak deleted data.
 - In pass 1, units 0..1231 are real pages (= `BackupSizeInBytes` / 8192) and units 1232..1279 are type 101.
-- No per-page map exists. Each page names itself in its header: `m_pageId` at offset 32, `m_fileId` at 36.
+- The backup carries no table of page locations. Each page names itself in its header: `m_pageId` at offset 32,
+  `m_fileId` at 36.
 
 ## 4. Pages (`tools/pages.py`, uncompressed full)
 

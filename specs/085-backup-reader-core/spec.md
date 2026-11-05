@@ -117,16 +117,18 @@ Out, each refused by name until its spec lands:
 
   | column | type | meaning |
   |---|---|---|
-  | `_mssql_rid` | `BLOB` | stable row identity. Heap: 8 bytes `u32 page ‖ u16 file ‖ u16 slot` of the row's **original** location (the forwarded record's back pointer when it moved), equal to `%%physloc%%` (E1§3). Clustered rowstore: `0x01`, then per key column in `ordkey` order `u16 length ‖` its uncompressed storage bytes (`0xFFFF` for NULL), then `u32` uniquifier for a non-unique index (0 when absent). Columnstore: spec 088 |
-  | `_mssql_page` | `BLOB` | the page the row lives on now (E1§2): `u16 file ‖ u32 page`, big-endian, so byte order is page order |
-  | `_mssql_page_lsn` | `DECIMAL(25,0)` | that page's `m_lsn`, in `RESTORE HEADERONLY`'s numeric form (E3§7.5: store the page LSN with the page) |
+  | `_mssql_rid` | `BLOB` | stable row identity. Heap: `0x00 ‖ u32 page ‖ u16 file ‖ u16 slot` of the row's **original** location (the forwarded record's back pointer when it moved); after the shape byte, equal to `%%physloc%%` (E1§3). Clustered rowstore: `0x01`, then per key column in `ordkey` order `u16 length ‖` its uncompressed storage bytes (`0xFFFF` for NULL), then `u32` uniquifier for a non-unique index (0 when absent). Columnstore: spec 088 |
+  | `_mssql_page` | `BLOB` | the page the row lives on now (E1§2): `0x01 ‖ u16 file ‖ u32 page`, big-endian, so within shape 0x01 byte order is page order. A compressed columnstore row has no page: its rowgroup key `0x02 ‖ u64 rowset_id ‖ u32 rowgroup` (spec 088 D3); a delta-store row has its delta page in the 0x01 form |
+  | `_mssql_page_lsn` | `DECIMAL(25,0)` | that page's `m_lsn`, in `RESTORE HEADERONLY`'s numeric form; a scan column only (below) |
 
   The clustered encoding uses the uncompressed bytes so that a rebuild with another
   `DATA_COMPRESSION` keeps every identity (E1§3: key + uniquifier survived REBUILD for 3,188 of 3,188
   rows). Spec 089 adds `_mssql_lob`. Every service column is an opaque `BLOB` serialized by
   this code, with a leading format/shape byte (DQ-02, decided by the owner 2026-11-05): only the
-  importer reads them, and a lake materialises them, so their format is versioned rather than typed. `_mssql_page_lsn` is a scan column only; the lake keeps the page LSN
-  in its page map, not per row (R§6.2 point 4, E2 R5).
+  importer reads them, and a lake materialises them, so their format is versioned rather than typed.
+  `_mssql_page_lsn` is a scan column only: no lake stores a page LSN, because which pages changed is
+  decided by the file (the DCM and `m_lsn > since_lsn`, spec 089 D3; R§6.2 point 4). The lake deletes
+  by `_mssql_page` with DuckLake's own `DELETE` (R§6.2).
 
 - **D9 — the opened-file cache (owner, R§6.1).** An import calls the functions once per table on the
   same file, and a cold open costs a pass over the whole file. The opened backup is kept in DuckDB's
@@ -610,7 +612,7 @@ A backup file is untrusted input (R§9). Every parser:
   the committed samples: `fuzz_backup_mtf` (walker), `fuzz_backup_container` (MSSQLBAK chain),
   `fuzz_backup_xpress` (raw codec, with a differential oracle against a reference decode of the seed),
   `fuzz_backup_page` (header, slot array, record split), `fuzz_backup_record` (row decode against a
-  synthetic layout), `fuzz_backup_lob` (tree walk over a synthetic page map), `fuzz_backup_catalog`
+  synthetic layout), `fuzz_backup_lob` (tree walk over a synthetic page set), `fuzz_backup_catalog`
   (bootstrap over synthetic pages), `fuzz_backup_log` (blocks, parity, records). `src/backup/**` joins
   `cflite-pr.yml`'s paths.
 - **Memory**: the page index and the block index live in buffer-managed blocks; a LOB value is capped
@@ -625,7 +627,8 @@ server-free lane and the fuzz seeds, and backups generated in CI for the oracle 
 the comparison runs inside DuckDB: the restored database is attached as `TYPE mssql`, so both sides
 are typed by the same map (D6), and each table is compared as a multiset in both directions
 (`EXCEPT ALL` plus counts). LOBs are compared by SHA-256 and length. Locators against the server:
-heap `_mssql_rid` = `%%physloc%%`, clustered `_mssql_page` = the physloc page (E1§3).
+heap `_mssql_rid` after its shape byte = `%%physloc%%`, clustered `_mssql_page` = the physloc page
+(E1§3).
 
 **Fixtures** (generator T-SQL under `test/backup/gen/`):
 - X§1's probe database: every common type, `nvarchar` with Cyrillic, a UTF-8 `varchar`, heap and

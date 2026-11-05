@@ -151,16 +151,21 @@ A CCI on 2025 accepts `json`, `vector` and every `(max)` type, and refuses `sql_
   dictionary (E5§7: "dictionary vectors for 2/3"), so a string column of 1 M rows and 50 k distinct
   values is decoded 50 k times, not 1 M. Encoding 1 / 4 values are an affine map over the data ids.
 
-- **D3 — locators.** A compressed row has no page. `_mssql_rid` = `0x02 ‖ u32 rowgroup ‖ u32 tuple`; a
-  delta-store row `0x03 ‖ u32 rowgroup ‖` its hidden key (`rscolid 0`). No separate rowgroup column (DQ-02, decided 2026-11-05: service
-  columns are opaque bytes; the rowgroup is inside `_mssql_rid`, and the page map's runs carry it);
-  `_mssql_page` is the delta page for delta rows and NULL for compressed rows. Reason: R§5's
-  "(rowgroup, tuple), only within a rowgroup — the tuple mover renumbers; handle per rowgroup", and the
-  lake's page map (research-ducklake-import §5). The scan drops bitmap-deleted tuples, so a rowgroup's
-  surviving tuples are written in tuple order as runs `(rowgroup, first_tuple, first_pos, count)`, one
-  per contiguous range of survivors; a later delete-bitmap entry for tuple t maps to `first_pos + (t −
-  first_tuple)` of the run that holds t (089's export writes these runs; a tuple in no run was deleted
-  before the export and needs nothing). Service-column types: decided (DQ-02, owner 2026-11-05) — opaque BLOBs, no `_mssql_rowgroup`.
+- **D3 — locators (owner, 2026-11-05).** A compressed row has no page. Its `_mssql_page` holds its
+  **rowgroup key**, `0x02 ‖ u64 rowset_id ‖ u32 rowgroup` (big-endian; a page is shape 0x01, 085 D8),
+  and its `_mssql_rid` is `0x02 ‖ u64 rowset_id ‖ u32 rowgroup ‖ u32 tuple`. A delta-store row has
+  `_mssql_page` = its delta page in the 0x01 form, `0x01 ‖ u16 file ‖ u32 page`, and `_mssql_rid` =
+  `0x03 ‖ u64 rowset_id ‖ u32 rowgroup ‖` its hidden key (`rscolid 0`). `rowset_id` is
+  the columnstore rowset's id; it is in both because rowgroup ids are numbered per partition and one
+  lake table holds every partition. A SWITCH keeps rowset ids (E7 s12), so the keys stay valid. The
+  keys assume a rowgroup id is never reused within a rowset: **to verify** in E11 (task 9). Reason:
+  R§5's "(rowgroup, tuple), only within a rowgroup — the tuple mover renumbers; handle per rowgroup",
+  and DuckLake's own `DELETE` by `_mssql_page` (research-ducklake-import §5): a removed, merged or
+  rebuilt rowgroup is deleted by `_mssql_page` like a page; a delete-bitmap entry for tuple t deletes
+  `WHERE _mssql_page = <rowgroup key> AND _mssql_rid IN (…)`, the rowgroup key pruning the files. The
+  scan drops bitmap-deleted tuples; a tuple deleted before the import is not in the lake and needs
+  nothing. No separate rowgroup column: service-column types are decided (DQ-02, owner 2026-11-05) —
+  opaque BLOBs, no `_mssql_rowgroup`.
 
 - **D4 — units are rowgroups.** One unit per COMPRESSED rowgroup and one per delta store, in
   `segment_id` order; projection reads only the projected columns' segments and dictionaries, which is
@@ -184,8 +189,9 @@ A CCI on 2025 accepts `json`, `vector` and every `(max)` type, and refuses `sql_
 - **D7 — the differential evidence is measured before 089 uses it.** The expected shape (R§6.2):
   new rowgroups are new segment LOBs, in the file; deletes are new delete-bitmap entries on changed
   pages; the tuple mover appears as a delta store's pages freed plus a new COMPRESSED rowgroup; a
-  REBUILD or REORGANIZE tombstones rowgroups and adds new ones. None of it is observed. Spike E11
-  (task 9) observes it, and 089's columnstore path is built on what it finds.
+  REBUILD or REORGANIZE tombstones rowgroups and adds new ones; a SWITCH of a partition with an OPEN
+  delta store moves the delta-store rowset as an AU. None of it is observed. Spike E11 (task 9)
+  observes it, and 089's columnstore path is built on what it finds.
 
 ## Design
 
@@ -204,13 +210,17 @@ src/backup/columnstore/        namespace duckdb::mssql::backup::columnstore; Duc
 The columnstore path plugs into 085's scan as another unit kind; `mssql_backup_tables` reports
 `shape = 'columnstore'`, `compression` = COLUMNSTORE / COLUMNSTORE_ARCHIVE, and per partition the
 rowgroups (state, row count, deleted count from the bitmap). Ordered CCI keys (2022+) are reported
-for the sort order the importer proposes at table creation (R§6.2 "Partitioning ownership"). The
-partition metadata is 085's `partitioning` column (E7). A partitioned CCI has, per partition, its own
-columnstore (ownertype 1), delete-bitmap (2) and delta-store (3) rowsets with one `numpart`; its rows
+for information; the importer does not propose them as a sort order (DQ-25, accepted: only the
+clustered rowstore key, since VertiPaq reorders a rowgroup's tuples). The partition metadata is
+085's `partitioning` column (E7). A partitioned CCI has, per partition, its own columnstore
+(ownertype 1), delete-bitmap (2) and delta-store (3) rowsets with one `numpart`; its compressed rows
 are keyed by **rowset**, not by page: `syscsrowgroups` and the segments are keyed by hobt id, and a
 SWITCH leaves them unchanged while the columnstore and delete-bitmap rowsets swap `idmajor` /
-`numpart` (E7 s12, catalog-only). 089's ownership rule resolves a columnstore row through its
-rowset.
+`numpart` (E7 s12, catalog-only). 089's ownership rule moves a compressed row by the rowset its
+rowgroup key names (`0x02`, D3). The delta-store and delete-bitmap rowsets move as allocation units:
+`au_moved` rows with their base IAM pages, and a delta-store row is found by its `_mssql_page` in
+the `0x01` form (no lake row is on a delete-bitmap page). E7 s12 had no OPEN delta store, so a
+SWITCH of a partition that has one is **unmeasured**; E11 adds it (task 9).
 
 Invariants:
 1. Every decoded segment satisfies `48 + 8(B + R + U) = on_disk_size` (unwrapped), and its RLE plus
@@ -255,7 +265,8 @@ Acceptance:
    form and the `TYPE mssql` comparison).
 2. Invariants 1–4 hold on every segment of every fixture.
 3. Projection reads only the projected columns' blobs (counted).
-4. `_mssql_rid` is unique per table and stable across two backups with no change between them.
+4. `_mssql_rid` is unique per table, across its partitions, and stable across two backups with no
+   change between them; a compressed row's `_mssql_page` is its rowgroup key.
 5. E11's report states the differential evidence of every case in D7.
 6. Fuzz harnesses replay clean under ASan and UBSan.
 
@@ -275,11 +286,13 @@ Costs follow E5§7, without its NCCI share.
 8. Oracle matrix (E5's scripts) and the five fuzz harnesses — 6 d
 9. **E11 spike**: columnstore in differentials (inserts, deletes, updates, the tuple mover, REORGANIZE,
    REBUILD, TRUNCATE, SPLIT / MERGE of a partitioned CCI — E7 covered only its SWITCH, s12, which is
-   catalog-only) and the tuple mover running during a full backup; report
-   `experiments/E11-columnstore-diff.md` — 3 d
+   catalog-only and had no OPEN delta store), a SWITCH of a partition that has an OPEN delta store
+   (unmeasured: which rowsets swap, and whether the delta-store rows move by their `0x01` pages),
+   whether a rowgroup id is ever reused within a rowset (D3), and the tuple mover running during a
+   full backup; report `experiments/E11-columnstore-diff.md` — 3.5 d
 10. Docs (README, `DATAMODEL.md` columnstore layer, CLAUDE.md, CHANGELOG) — 1 d
 
-**Total ≈ 37 days, 6–9 weeks** (E5§7: ≈ 34 days, 5–8 weeks; plus E11, minus the NCCI work). R§8
+**Total ≈ 37.5 days, 6–9 weeks** (E5§7: ≈ 34 days, 5–8 weeks; plus E11, minus the NCCI work). R§8
 phase 3 gave 5–8 weeks at medium risk after E5.
 
 ## Risks and open questions
@@ -303,5 +316,6 @@ phase 3 gave 5–8 weeks at medium risk after E5.
   diff), §8 phase 3, §10.4.
 - E5 §1 (result), §3 (format), §4 (verification), §5 (coverage), §6 (unknowns), §7 (effort), §8
   (provenance); `experiments/E5/cs_decode.py`, `csbak.py`, `truth_rows.py`, `sql/`, `blobs/`.
-- research-ducklake-import.md §5 (columnstore page runs and delete bitmaps as positions).
+- research-ducklake-import.md §5 (columnstore rowgroup keys; delete-bitmap entries deleted by
+  `_mssql_page` and `_mssql_rid`).
 - 085 (LOB reader, MS-XCA decoder, scan units), 086 (CD records), 089 (incremental), 090 (recovery).

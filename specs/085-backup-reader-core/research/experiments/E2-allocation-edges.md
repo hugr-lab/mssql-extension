@@ -19,7 +19,7 @@ says "live", it was compared with `sys.dm_db_database_page_allocations`, `%%phys
 | R2 | **The DCM is "pages written since the base", not "allocation changed".** DROP, TRUNCATE and deferred drop free extents *without* setting their DCM bits. The diff carries the evidence of freed space only through GAM, PFS, IAM and the catalog pages. | §1.2 |
 | R3 | A page in a backup is live only if it is below the file's `Size` (file header 1:0), its extent is GAM-allocated, and its PFS byte has 0x40. Otherwise its header and rows are stale. This applies to full backups too. | §1.3, §2.3 |
 | R4 | Every allocated page carries the correct allocation unit id, after SHRINKFILE and REBUILD too: 10,473 pages checked, 0 mismatches. Stale AU ids exist only on unallocated pages, and on pages of a dead (deferred-drop) AU. | §2 |
-| R5 | Keep a lake **page map** (file, page → AU, LSN) for every page that holds rows, plus the latest image of every allocation page (file header, GAM/SGAM/PFS/DCM, IAM pages; a few pages per 64 MB). Per diff, delete the rows of every page that R3 now rejects, that names another AU, or whose AU is gone or has type 0 / owner 0. | §1, §2, §3 |
+| R5 | Keep in the lake the latest image of every allocation page (file header, GAM/SGAM/PFS/DCM, IAM pages; a few pages per 64 MB). Its IAM images name the AU that owned each page in the previous state. Per diff, delete the rows of every page that R3 now rejects, that names another AU, or whose AU is gone or has type 0 / owner 0, from the table of that previous AU. | §1, §2, §3 |
 | R6 | REBUILD (heap or clustered) gives a new rowset id and new IN_ROW and ROW_OVERFLOW AUs. **The LOB_DATA AU id is kept and its pages are not rewritten**, so they are not in the diff. In-row LOB roots are byte-identical, so match LOB values by root bytes, not by RID. Heap RIDs all change. | §3 |
 | R7 | Decode rows with `sysrscols` per rowset. Skip status 0x02 (dropped) columns; they still occupy their bytes. A column whose null-bitmap ordinal exceeds the record's column count is missing from the record: its value is the `sysseobjvalues` default (valclass 1, id = rowset id, subid = rscolid) when status has 0x200, else NULL. | §4 |
 | R8 | LOB in-row roots carry an update counter (`ts`, +4): byte-identical root = unchanged value, so copy it from the lake. A changed root with every reachable fragment page in the diff is read from the diff. A `.WRITE` partial update leaves most fragments out of the diff. **With a per-value fragment map stored in the lake it applies exactly** (all six cases); without it, refuse. | §5 |
@@ -328,7 +328,7 @@ heap, `SELECT INTO`, CREATE INDEX. The last three are minimally logged outside F
 2. §6.2 point 4, "the allocation maps are re-copied into every backup, so pages freed since the last import
    are known": pass 2 re-copies only extents 0 (and 8) of each file. Later PFS pages and IAM pages arrive
    only when they changed. DROP / TRUNCATE / deferred drop free extents **without** a DCM bit. The lake
-   must keep the allocation pages and a page map (R5).
+   must keep the allocation pages (R5); their IAM images name each page's previous owner.
 3. §3 "Map pages to objects through IAM chains, not the header's object id (stale after shrink)": the
    header AU is **correct on every allocated page**, after shrink and rebuild too. It is stale only on
    unallocated pages and dead AUs. In a diff the IAMs of unchanged AUs are absent, so the header AU gated

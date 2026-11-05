@@ -274,13 +274,13 @@ W = min(FirstLSN, CheckpointLSN) of the full; "changed" means m_lsn > W.
   after, with `object_id` changed from `m_ci` to `stg_feb`.
 - The page headers name the AU, and the AU names the rowset. Only the rowset's `idmajor` changes, and that sits on a
   `sysrowsets` page, which is in the diff.
-- An importer whose page map records the **AU id** per page (as `__mssql_sys.page_map.au_id` does) finds every
-  affected row without reading a page:
+- An importer that knows each page's **AU id** from the base IAM images (the allocation images the lake keeps,
+  E2 R5; a SWITCH leaves the IAMs unchanged) finds every affected row without reading a page:
   1. after updating the mirror, resolve AU → `sysallocunits.ownerid` → `sysrowsets.(idmajor, idminor, numpart)`;
   2. compare with the table the lake holds the rows in.
 
-  A page map of page → table alone is not enough, because the table is exactly what changes. Keep page → AU, or
-  file → rowset id.
+  Knowing page → table alone is not enough, because the table is exactly what changes. The key is the AU, which
+  the base IAM image gives per page.
 - Columnstore rows have no data pages; key them by rowset (hobt) id.
 
 Also seen (noise, but the same rules handle it):
@@ -290,9 +290,9 @@ Also seen (noise, but the same rules handle it):
 
 ## 5. The general rule against each operation (Q4)
 
-`e7lake.py` is a page-map importer. It holds:
+`e7lake.py` is an importer keyed by page and AU. It holds:
 - **rows**: table, rowset id = file key, AU, page, slot, canonical text;
-- **page → AU**;
+- **page → AU** (what the base IAM images give an importer);
 - a **mirror** of catalog and allocation page images;
 - **LOB roots**.
 
@@ -303,7 +303,9 @@ no server (`out/run_lake.txt`).
 
 - **general** (E1 rule 5 with E2 R5):
   1. Rows on every changed page, every freed page (R3: PFS / GAM / size) and every page whose AU vanished or is
-     type 0 / owner 0 are deleted in every table.
+     type 0 / owner 0 are deleted in every table. Reasoned from E2 R4, not measured here: every lake row of a page
+     sits in the table of the page's AU in the previous state, so this deletes the same rows as deleting from the
+     table the base IAM image names.
   2. Then the changed live pages' rows are inserted under the owner the NEW catalog gives their header AU.
   3. LOBs absent from the file are taken from the lake by identical root (E2 R6): 12 values in s03, 24 in s11.
 - **owner** = general plus the ownership rule below.
@@ -331,10 +333,10 @@ allocated and absent from the diff, so only the AU row tells.
 
 **Ownership rule.** After the catalog mirror has been updated from the file, and after the page rule's deletes and
 inserts:
-- **for every lake row (equivalently, every lake file)**, resolve its recorded allocation unit through the new catalog
-  (`sysallocunits.ownerid` → `sysrowsets`); a columnstore row resolves through its recorded rowset id;
+- **for every lake row**, resolve the AU of its page in the base IAM image (columnstore: the rowset in its rowgroup
+  key) through the new catalog (`sysallocunits.ownerid` → `sysrowsets`);
 - **if the rowset's (idmajor, idminor) differs from the table the row is in, move the row to that table**, keeping its
-  values, LOB bytes, fragment map, page and AU;
+  values, LOB bytes, fragment map and page;
 - **if only `numpart` differs, do nothing.** That is SPLIT/MERGE renumbering: 670 rows were renumbered in s06 with no
   page change. The partition number is never stored with a row; it is derived from the rowset when needed.
 - A rowset or AU that vanished is already covered by the page rule (freed / AU gone).
@@ -342,26 +344,27 @@ inserts:
 Order: catalog first, then the page rule, then ownership. The rows inserted from changed pages already carry their new
 owner, so the order of the last two is free.
 
-**In DuckLake:**
-- Files are per rowset, and SWITCH keeps the rowset id, so a SWITCH moves **whole files**, positions unchanged.
-- DuckLake cannot move a file between tables (research-ducklake-import.md §7.4). So:
-  1. object-store copy the rowset's files into the target table;
-  2. register them with the **same cumulative delete positions** (re-register its delete file for the copy, or write
-     a new one);
-  3. `DropFile` the sources;
-  4. rewrite those `page_map` rows (table and file path; page and position unchanged).
-- Alternative: `INSERT … SELECT` the rows and delete them.
+**In DuckLake** (DQ-10: files follow DuckLake's layout, and a SWITCH is a lake-side copy):
+- DuckLake cannot move a file between tables (research-ducklake-import.md §7.4).
+- A lake row's AU is its page's AU in the base IAM image, which a SWITCH leaves unchanged; a columnstore row's
+  rowset id is in its rowgroup key (088 D3). Nothing is stored per row for it.
+- In the import's transaction, before the new files: `INSERT INTO target SELECT … FROM source WHERE _mssql_page IN
+  (the moved AU's pages minus the changed pages)`, then `DELETE FROM source WHERE _mssql_page IN (the moved AU's
+  pages)`. The changed pages' rows come from the file through the page rule.
+- Not by partition boundary values: a range predicate evaluated in DuckDB would compare a string key by DuckDB's
+  order, not the column's collation. The pages are exact for every key type.
 - A SWITCH out and back within one differential's interval (s01 then s02 against the same base) nets to no change,
   because only the final owner is compared.
 
-**What each other operation means in a lake with per-rowset files:**
+**What each other operation means in the lake** (DuckLake's own `DELETE … WHERE _mssql_page IN …`; DuckLake drops a
+file whose rows all go):
 
 | operation | in the lake |
 |---|---|
-| SPLIT populated | positional deletes in the old rowset's files; new files for the new rowset |
-| MERGE populated | the dropped rowset's files become whole-file drops (every page freed); new files for the moved rows in the survivor |
-| TRUNCATE partitions | whole-file drops |
-| REBUILD PARTITION | the rowset's files replaced; LOB bytes from the lake by root |
+| SPLIT populated | the old rowset's freed and changed pages deleted; the moved rows inserted from the new rowset's pages |
+| MERGE populated | the dropped rowset's pages (every one freed) deleted; the moved rows inserted in the survivor |
+| TRUNCATE partitions | the freed or dead-AU pages deleted, taken from the base IAM image |
+| REBUILD PARTITION | the old rowset's pages deleted, the new ones inserted; LOB bytes from the lake by root |
 | NEXT USED, empty SPLIT / MERGE | mirror rows only |
 
 Recognising the operation by name is needed only for the commit message and the log, never for correctness. The rules
@@ -385,8 +388,8 @@ above are mechanical.
 - the DuckDB rounding of TIMESTAMP_NS (datetime2(7));
 - the TimeZone dependence of TIMESTAMPTZ transforms.
 
-**§7.4 SWITCH** "swaps rowset ownership; data pages untouched; only catalog pages in the diff; MOVE rows by
-`page_map.au_id`" is **confirmed**, in 5 variants and in the replay. Refinements:
+**§7.4 SWITCH** "swaps rowset ownership; data pages untouched; only catalog pages in the diff; MOVE the AU's
+rows" is **confirmed**, in 5 variants and in the replay. Refinements:
 - compare (object, index); a `numpart` change alone is a relabel;
 - columnstore rows are keyed by rowset.
 

@@ -77,8 +77,9 @@ log backups (R§8 phase 4 stays out).
 - **D7 — refuse what the engine does not cover, by name, per table.** Recovery either makes a table
   exact (restore mode, a lake-mode full) or dirt-free (a loaded differential), or the table is
   `unrecoverable` with the reason, and the importer refuses the file, naming the table (one snapshot
-  per file leaves no way to apply the rest without it). Never dirt with a warning. For a columnstore
-  table 023 Q4 drafted "mark it stale" instead; that disagreement is DQ-07.
+  per file leaves no way to apply the rest without it). Never dirt with a warning. A columnstore
+  table whose loaded tail recovery cannot cover is refused the same way, until this spec's
+  columnstore extension and E11 exist (DQ-07, accepted).
 
 - **D8 — the page-state model is the reader's.** A page under recovery is its 96-byte header plus a
   slot list of record bytes (E6 `PageState`); its serialisation (versioned, checksummed) is the pending
@@ -162,28 +163,67 @@ it is ignored, FORMAT_PAGE included (rebuilding such a page lost 3 rows for good
   any other unresolved LOB is 089's named refusal.
 - **Invariant**: the next file carries every stale page or frees it (62 / 62, 125 / 125; with skip 551
   / 551, 1,419 / 1,419). The stale set is lake state, not a reader input (089 D10), so the importer
-  checks it at that file against `mssql_backup_changed_pages` (023 D7). This draft makes a page the
-  file neither carries nor frees a named error; 023 drafted "report it, keep it stale and proceed".
-  That disagreement is DQ-06.
+  checks it at that file against `mssql_backup_changed_pages` (023 D7). A page the file neither
+  carries nor frees is a named error at that file (DQ-06, accepted); the way out is the next full
+  with `mode := 'rebase'` (DQ-14).
 
-**The changed set in lake mode** (089 D3) adds the applied pending images, the pages formatted in the
-tail, and every page recovery rebuilt (E6§3.1 step 5).
+**The changed set in lake mode** (089 D3) adds the applied pending images, reported as kind
+`pending_applied` (one row per page, with 089's owner columns, not also as `changed`), and the pages
+formatted in the tail and every page recovery rebuilt, reported as `changed` with reason
+`formatted_in_tail` / `rebuilt` (E6§3.1 step 5). All of them are in the delete set (089 § Surface)
+and in the export.
+
+**Allocation images in lake mode.** The next file finds the table a page's lake rows are in through
+the base IAM images (089 need 6, rule 10: only the chain from each AU's first IAM counts, and only a
+page live in the base GAM / PFS gets an owner), so the images the importer keeps after a recovered
+file must put every page the lake holds rows of, live, on the IAM chain of the AU whose table holds
+them; else a stale page is later deleted from the wrong table and its old rows stay. Redo sets PFS
+bytes but replays no IAM, GAM or SGAM record (D2), so the file's copies can lag the recovered pages.
+`mssql_backup_allocation` with `recovery`, `loaded_diff`, `reflected_lsn` and `base` returns, in lake
+mode, the images of the recovered state, which the importer stores in `alloc_pages` (replacing and
+dropping images as 089 says) and passes back as the next `base/allocation.parquet`:
+- the file's allocation pages, and every base image the recovered state changes, with redo's PFS
+  bytes and the GAM and SGAM bits of the extents the tail allocated. Those bits come from the tail's
+  own allocation records: the GAM / SGAM / IAM SET_BITS records of the transactions redo applies are
+  replayed into the images only (the data path still ignores them, D2). Every extent that holds a page
+  the tail formats and that the file's GAM shows free must come out allocated, which checks them;
+- every page the lake gets rows of from this file (the rows the scan and the export return),
+  whatever its kind (`changed`, with or without reason `formatted_in_tail` / `rebuilt`, or
+  `pending_applied`), on the IAM chain of its header AU and on no other (089 rule 10 refuses a double
+  claim), as an extent bit or a mixed extent's single-page slot; the attribution check (089:
+  `mssql_backup_allocation` itself, and the export again on the pages it writes) runs against these
+  images and refuses by name a page they leave off its chain;
+- every stale page, live, on the IAM chain of the AU whose rows the lake still holds on it: the base
+  image's owner for a baseless page, its copy's header AU for a page a skipped transaction touched,
+  both usually the extent's owner already;
+- a page whose owner the images cannot express (its extent is another AU's in the recovered images,
+  and it is not in a mixed extent) makes its table `unrecoverable` (D7), naming the page and both AUs,
+  so the importer refuses the file.
+
+E6 never met the last case, and E6's lake (E1's) deleted every page from every table, so none of this
+was measured. **To verify** (tasks 7 and 10): a loaded differential whose skipped transactions free and
+reallocate extents, then the next file, which must delete every page from the table that holds its
+rows.
 
 ## Surface
 
 - `mssql_backup_scan(…, recovery := true, loaded_diff := 'skip', reflected_lsn := …)`, and the same
-  three parameters on `mssql_backup_changed_pages`, `mssql_backup_export_plan` and
-  `mssql_backup_export` (089), so the importer's export, delete evidence and pending set come from
-  one recovery. The recovered page state is kept in the `OpenedBackup` (085 D9), keyed by
-  (`since_lsn`, `base`, `reflected_lsn`, `loaded_diff`), so the functions an import calls on one file
-  recover once. In lake mode `base` also carries `pending.parquet`, the previous file's
-  `mssql_backup_pending_pages` rows `(file_id, page_id, page, xids LIST(UBIGINT), lsn, image BLOB)`.
+  three parameters on `mssql_backup_changed_pages`, `mssql_backup_allocation`,
+  `mssql_backup_export_plan` and `mssql_backup_export` (089), so the importer's export, delete
+  evidence, allocation images and pending set come from one recovery. The recovered page state is
+  kept in the `OpenedBackup` (085 D9), keyed by (`since_lsn`, `base`, `reflected_lsn`,
+  `loaded_diff`), so the functions an import calls on one file recover once. In lake mode `base` also
+  carries `pending.parquet`, the previous file's `mssql_backup_pending_pages` rows `(file_id, page_id,
+  page, xids LIST(UBIGINT), lsn, image BLOB)`.
 - `mssql_backup_tables`: `fuzzy_status` after recovery is `recovered`, `stale` (with
   `stale_pages`, `skipped_transactions`), or `unrecoverable` (with `reason`); `raw_status` keeps 085's
   pre-recovery status.
-- `mssql_backup_changed_pages` gains kinds `pending_applied`, `pending_discarded`, `pending_kept`,
+- `mssql_backup_changed_pages` gains kinds `pending_applied` (an applied image, one row per page:
+  in the delete set and the export, never also `changed`), `pending_discarded`, `pending_kept`,
   `stale` (with `reason`: `baseless` / `skipped_transaction` / `lob`, and the skipped transaction ids),
-  and `changed` rows with reason `formatted_in_tail` / `rebuilt`.
+  and `changed` rows with reason `formatted_in_tail` / `rebuilt`. Only `pending_applied` of these
+  kinds joins the delete set (089 § Surface); a discarded image's page is `freed`, and a kept or stale
+  page keeps its lake rows.
 - `mssql_backup_pending_pages(path, since_lsn, base, reflected_lsn)`: `(file_id, page_id, page, xids,
   lsn, image)`, the pending pages this file leaves, which the importer stores and passes back as
   `base/pending.parquet` with the next file.
@@ -204,7 +244,7 @@ DQ-09.
 | ADR, RCSI, snapshot isolation | in-row version tags change record lengths; ADR reverts logically from the version store | version tags (statusA 0x40) in records the tail touches; a boot-page flag to locate | 3–4 wk |
 | DDL in the tail | catalog pages would need redo | row operations on catalog base tables beyond the counters plain DML writes (which ones it writes is measured first, task 9) | 1–2 wk |
 | TDE | the log tail is encrypted (087 D9) | 087 | after E10 |
-| columnstore delta stores and delete bitmaps | rowstore records (the bitmap is CD) | 088's rowset roles | 1 wk, after 086 PR 1 and 088 (refuse or mark stale until then: DQ-07) |
+| columnstore delta stores and delete bitmaps | rowstore records (the bitmap is CD) | 088's rowset roles | 1 wk, after 086 PR 1 and 088 (the file is refused until then: DQ-07, accepted) |
 | the tuple mover or a compression in the tail | new segments and rowgroup rows | 088 D6 | open |
 | an operation outside the seven and the ignored list, on a data or LOB context | unknown effect | opcode | — |
 | a record that cannot apply (slot out of range, modify past the record) | the state is not what the log assumes | the engine | — (E6: 0 in every run) |
@@ -241,7 +281,9 @@ Acceptance:
 2. **Restore mode, full + differential**: equals RESTORE of the pair (verifies the inference above).
 3. **Lake mode**: E6's three cycles reproduce: after every full and every file that follows a fuzzy
    one, exact; after a loaded differential, 0 dirty and the stale set healed by the next file; a lake
-   built by F2 applied incrementally equals F2 imported fresh, mirror and service columns included.
+   built by F2 applied incrementally equals F2 imported fresh, mirror and service columns included;
+   the allocation images returned after every file put each page the lake holds rows of on the IAM
+   chain of its table's AU, and give it as live (R3: `Size`, GAM, PFS).
 4. **Counterfactuals** fail as E6§5 measured, each rule switched off in a test build: no repeat
    history, no undo, `len(before)` for MODIFY_ROW, no LOB length rewrite, no allocation-first pending
    rule, no reflected-LSN rule, FirstLSN ordering.
@@ -263,16 +305,18 @@ Acceptance:
 6. Lake mode: pending images, the four-step resolution before redo, `mssql_backup_pending_pages`,
    `base/pending.parquet` — 6 d
 7. Stale pages, the `skip` planner (fixed point), `partial`, LOB keep-old on stale pages, the
-   next-file invariant — 3 d
+   next-file invariant; the allocation images of the recovered state (GAM and SGAM bits of the
+   extents the tail allocated, owners of written and stale pages, the refusal) — 4.5 d
 8. Surfaces: `recovery`, the status columns, the new `changed_pages` kinds — 2 d
 9. Guards, and the measurement of which catalog row operations plain DML writes — 2 d
 10. Oracle harness: E6 / E3 workloads in CI, RESTORE truth, the three cycles, restore-mode checks,
-    counterfactual builds, the new key shapes, the version matrix — 12 d
+    counterfactual builds, the new key shapes, the version matrix; a loaded differential whose skipped
+    transactions free and reallocate extents, then the next file — 13 d
 11. Fuzz harnesses log_contents / redo / pending_image — 2 d
 12. Docs (README: what "recovered" means; `DATAMODEL.md`: the recovery layer and the lake-mode
     flow with a diagram; CLAUDE.md; CHANGELOG) — 1 d
 
-**Total ≈ 55 days, 10–12 weeks.** E6§5 estimated 9–12 weeks (~3,000 lines) including the log-tail
+**Total ≈ 57.5 days, 10–12 weeks.** E6§5 estimated 9–12 weeks (~3,000 lines) including the log-tail
 reader, of which 085 carries about a week. R§8 phase 1c: 9–12 weeks. The guard extensions are on top.
 
 ## Risks and open questions
@@ -301,4 +345,4 @@ reader, of which 085 carries about a week. R§8 phase 1c: 9–12 weeks. The guar
   mattered, effort), §6 (changes to the design), §7 (caveats); `experiments/E6/wal.py`, `lake6.py`,
   `gen.py`.
 - research-web.md §9 (consistency of a full backup), §11 (log format).
-- 085 (log-tail reader, page store), 087 D9 (TDE), 088 D6, 089 D3, D4, D10.
+- 085 (log-tail reader, page store), 087 D9 (TDE), 088 D6, 089 need 6, D3, D4, D10.

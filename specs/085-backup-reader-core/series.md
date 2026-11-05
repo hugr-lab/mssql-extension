@@ -1,14 +1,13 @@
 # Backup reader: the spec series (drafts)
 
-Status: **drafts**, 2026-11-05, for review. Not in the repository's `specs/` folder and not committed;
-when a draft is accepted it moves to `specs/<number>-<name>/spec.md`. Numbers start at 085 (082 is
-reserved; 083 and 084 exist).
+Status: **drafts**, 2026-11-05, for review. Numbers start at 085 (082 is reserved; 083 and 084
+exist).
 
 The design and every owner decision are in `research/RESEARCH.md` (R§n). The evidence is in
-`../../research-*.md` and the experiments `../../experiments/E1`–`E7` (E7, partitioning, finished after
+`research/research-*.md` and the experiments `research/experiments/E1`–`E7` (E7, partitioning, finished after
 the first draft and is integrated: 085's partition model, 089's ownership rule and maintenance
-evidence). The importer that consumes this work is mssql-ducklake; its draft specs are in
-`../mssql-ducklake/`. The owner's open questions of both series are merged into one list,
+evidence). The importer that consumes this work is mssql-ducklake; its draft specs are 022–024 in
+[hugr-lab/mssql-ducklake](https://github.com/hugr-lab/mssql-ducklake/tree/main/specs). The owner's open questions of both series are merged into one list,
 [decisions.md](decisions.md) (DQ-nn).
 
 Markers used in every spec: **(2025)** = verified on SQL Server 2025 RTM-CU8 only, the one build every
@@ -21,13 +20,13 @@ experiment ran on; **(unverified)** = inferred or never observed.
 | [085](spec.md) | the core | MTF, `MSSQLBAK` (MS_XPRESS, ZSTD), stripes, several data files, page store with liveness, catalog with E7's partition model, FixedVar rows, LOBs and row-overflow, common types, the file functions with the opened-file cache, read-only ATTACH, DuckDB FileSystem I/O, `mssql_backup_info`, the fuzzy status, a differential overlay for browsing | — | 68.5 d, 12.5–14 wk | low–medium (version drift) |
 | [086](../086-backup-row-formats-and-types/spec.md) | row formats and types | ROW and PAGE compression, sparse, `sql_variant` → `VARIANT`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector`, double-byte code pages, the 2025 `json` spike | 085 | 37.5 d, 7–8 wk + `json` spike 1–2 wk | medium (ROW / PAGE known only through DbReader's facts); high for `json` |
 | [087](../087-backup-encryption/spec.md) | encryption and TDE | the `mssql_backup_key` secret, selection by scope then thumbprint, encrypted containers, TDE pages | 085 | 16.5 d, 3–3.5 wk + E10 spike | low–medium; the TDE log tail is open |
-| [088](../088-backup-columnstore/spec.md) | columnstore | E5's decoder in C++: segments, dictionaries, VLD, rowgroups, delete bitmaps, delta stores, archive | 085 (+ CD integers from 086 PR 1) | 37 d, 6–9 wk | medium (version drift) |
-| [089](../089-backup-incremental-api/spec.md) | the incremental API | the chain check, changed and freed pages, dead / gone / moved AUs (E7's ownership rule), allocation images, the catalog mirror, LOB fragment maps, lake-mode decoding of a lone differential, the Parquet export with page runs in DuckLake's layout | 085 | 40 d, 8 wk | medium |
-| [090](../090-backup-tail-recovery/spec.md) | tail recovery | redo and undo of a backup's own log tail, restore mode and lake mode, pending pages with the allocation-first rule, stale pages with variant 1 | 085, 089 | 55 d, 10–12 wk | medium |
+| [088](../088-backup-columnstore/spec.md) | columnstore | E5's decoder in C++: segments, dictionaries, VLD, rowgroups, delete bitmaps, delta stores, archive | 085 (+ CD integers from 086 PR 1) | 37.5 d, 6–9 wk | medium (version drift) |
+| [089](../089-backup-incremental-api/spec.md) | the incremental API | the chain check, changed and freed pages with each page's previous owner from the base IAM images, dead / gone / moved AUs (E7's ownership rule), allocation images, the catalog mirror, LOB fragment maps, lake-mode decoding of a lone differential, the Parquet export in DuckLake's layout | 085 | 41.5 d, 8.5 wk | medium |
+| [090](../090-backup-tail-recovery/spec.md) | tail recovery | redo and undo of a backup's own log tail, restore mode and lake mode, pending pages with the allocation-first rule, stale pages with variant 1, the allocation images of the recovered state | 085, 089 | 57.5 d, 10–12 wk | medium |
 
-**Total ≈ 255 working days, about 51 weeks for one developer; about 34 weeks with two** (085's 68.5
-days, then track A's 84 days beside track B's 101; see below). The `json` decoder (086 PR 6, ~3 d,
-only if E9 passes) and the spikes E9–E11 are outside the total.
+**Total ≈ 259 working days, about 52 weeks for one developer; about 34 weeks with two** (085's 68.5
+days, then track A's 88.5 days beside track B's 101; see below). The `json` decoder (086 PR 6, ~3 d,
+only if E9 passes) and the spikes E9 and E10 are outside the total; E11 is 088 task 9, inside it.
 
 ### Why this split (and where it departs from the suggested one)
 
@@ -43,7 +42,8 @@ The suggested split was kept, with these placements made explicit:
   together with the base state a lone differential needs (089 D4, D5), and 085 stays the restore-a-file
   reader.
 - **The Parquet export is in 089**, as its second PR. The owner's "Parquet first" (R§6.2) needs a
-  writer that controls page contiguity, which only the reader can do; the plain-SQL path works before
+  parallel writer that keeps physical order, so that a page's rows sit in few files and DuckLake's
+  `DELETE` by `_mssql_page` reads few; only the reader can do that. The plain-SQL path works before
   it, so the importer is not blocked.
 - **NCCI reading is dropped from 088**: the scan reads a table's base rowset, which an NCCI duplicates.
 
@@ -86,7 +86,7 @@ Each PR merges before the next opens (no stacked PRs).
 | 1: ROW / PAGE, sparse, `sql_variant`, xml, spatial, vector; overlay; locators; parallel scan | 5–6 wk, med | 7–8 wk + json spike | 086 | overlay / locators / parallel moved to 085; `hierarchyid` and double-byte code pages added; one oracle test per type |
 | 1b: encryption and TDE | 1–2 wk, low–med (E4) | 3–3.5 wk + E10 | 087 | the secret type, the selection rule, CI fixtures; the TDE log tail found open |
 | 1c: tail recovery | 9–12 wk, med (E3, E6) | 10–12 wk | 090 | about a week of it (the log reader) is in 085; guard extensions listed separately (ROW and PAGE 2–3, ADR / RCSI 3–4, DDL 1–2 wk) |
-| 2: mssql-ducklake import | 3–4 wk, med | not in this series (mssql-ducklake 022–024: 20–26 wk) | — | the reader side of it is 089 (8 wk), which §8 did not cost |
+| 2: mssql-ducklake import | 3–4 wk, med | not in this series (mssql-ducklake 022–024: 18–23 wk) | — | the reader side of it is 089 (8.5 wk), which §8 did not cost |
 | 3: columnstore | 5–8 wk, med (E5) | 6–9 wk | 088 | E11 (columnstore in differentials) added, NCCI dropped |
 | 4: log backups | 3–6 mo, high | not in this series | — | — |
 | 5: QAT_DEFLATE, 2025 `json` | open | `json`: 086's spike; QAT: none | 086 | QAT_DEFLATE is refused by name |
@@ -95,12 +95,12 @@ Each PR merges before the next opens (no stacked PRs).
 
 | spec | functions and columns | what the importer does with them |
 |---|---|---|
-| 085 | `mssql_backup_info` (GUIDs, LSNs, dates, database, family and recovery-fork ids, compression, `consistent`); `mssql_backup_tables` (schemas, tables, columns with DuckDB types, AUs, partition counts, `partitioning` from E7, `fuzzy_status`); `mssql_backup_views`; `mssql_backup_scan` with `_mssql_rid`, `_mssql_page`, `_mssql_page_lsn`; `mssql_backup_catalog` (and its no-argument list of the allow-listed base tables) | the DDL of a full import, the proposed partition and sort specs, the provenance tags and snapshot `extra_info`, views as text in `__mssql_backup.views`, the rows of a full import (v1, Parquet first in plain SQL: `COPY` of the scan to Parquet plus `ducklake_add_data_files`; the export of 089 PR 2 later), refusal of non-consistent tables until 090 |
+| 085 | `mssql_backup_info` (GUIDs, LSNs, dates, database, family and recovery-fork ids, compression, `consistent`); `mssql_backup_tables` (schemas, tables, columns with DuckDB types, AUs, partition counts, `partitioning` from E7, `fuzzy_status`); `mssql_backup_views`; `mssql_backup_scan` with `_mssql_rid`, `_mssql_page`; `mssql_backup_catalog` (and its no-argument list of the allow-listed base tables) | the DDL of a full import, the proposed partition and sort specs, the provenance tags and snapshot `extra_info`, views as text in `__mssql_backup.views`, the rows of a full import (v1, Parquet first in plain SQL: `COPY` of the scan to Parquet plus `ducklake_add_data_files`; the export of 089 PR 2 later), refusal of non-consistent tables until 090 |
 | 086 | the same functions on compressed tables and the remaining types | real-world tables; `VARIANT` columns (not inlined); `FLOAT[n]` cast to `FLOAT[]` (DuckLake has no `ARRAY`) |
 | 087 | the `mssql_backup_key` secret; `needs_key`, thumbprints in `mssql_backup_info` | nothing of its own: secrets apply to the file functions; a TDE backup's status is `unknown` until E10, so the importer refuses it until then (no dirt) |
-| 088 | columnstore tables in the scan; rowgroups in `mssql_backup_tables`; ordered-CCI keys | columnstore tables, sort orders; page runs per rowgroup; delete bitmaps as positions (after E11) |
-| 089 | `mssql_backup_chain_check`; `mssql_backup_changed_pages` (`changed`, `freed`, `dead_au`, `gone_au`, `au_moved`, `dead_rowgroup`); `mssql_backup_allocation`; `mssql_backup_catalog(…, since_lsn)`; `base` on every 085 function; `mssql_backup_scan(…, since_lsn, base)`; `_mssql_lob`; `mssql_backup_export_plan` / `mssql_backup_export` (with `partition_by`, `order_by`, `target_file_size`, `parquet_options` from the lake) and page-run files `(page, page_lsn, first_pos, row_count)` | chain validation and the stored watermarks; deletes by page in every table and by AU; SWITCH moves by E7's ownership rule; the `__mssql_sys` mirror and the allocation images; the `base/` side files it writes before each apply; Parquet files registered in one commit; the page map |
-| 090 | `recovery`, `loaded_diff`, `reflected_lsn` on the scan, the export and `changed_pages`; `fuzzy_status` after recovery; `mssql_backup_pending_pages`; `changed_pages` kinds `pending_*`, `stale` (reasons `baseless`, `skipped_transaction`, `lob`); `base/pending.parquet` | exact full imports of busy databases; the pending images and stale page set kept between files; healing by the next file, checked by the importer |
+| 088 | columnstore tables in the scan, a compressed row's rowgroup key in `_mssql_page`; rowgroups in `mssql_backup_tables`; ordered-CCI keys, for information | columnstore tables (no sort is proposed for an ordered CCI, DQ-25); rowgroups deleted by `_mssql_page`, delete-bitmap entries by `_mssql_page` and `_mssql_rid` (after E11) |
+| 089 | `mssql_backup_chain_check`; `mssql_backup_changed_pages` (`changed`, `freed`, `dead_au`, `gone_au`, `au_moved`, `dead_rowgroup`, each page with its `base_au_id`, base owner and `holds_rows`); `mssql_backup_allocation` (IAM images with their `au_id`); `mssql_backup_catalog(…, since_lsn)`; `base` on every 085 function; `mssql_backup_scan(…, since_lsn, base)`; `_mssql_lob`; `mssql_backup_export_plan` / `mssql_backup_export` (with `partition_by`, `order_by`, `target_file_size`, `parquet_options` from the lake) | chain validation and the stored watermarks; DuckLake's own `DELETE … WHERE _mssql_page IN …` over 089's delete set (its kinds, `holds_rows`), each page in the table its base AU names, and by AU; SWITCH moves by E7's ownership rule, as a lake-side copy of the moved AU's base pages; the `__mssql_sys` mirror and the allocation images; the `base/` side files it writes before each apply; Parquet files registered in one commit |
+| 090 | `recovery`, `loaded_diff`, `reflected_lsn` on the scan, the export, `changed_pages` and `mssql_backup_allocation` (the recovered state's allocation images); `fuzzy_status` after recovery; `mssql_backup_pending_pages`; `changed_pages` kinds `pending_*`, `stale` (reasons `baseless`, `skipped_transaction`, `lob`); `base/pending.parquet` | exact full imports of busy databases; the pending images and stale page set kept between files; healing by the next file, checked by the importer |
 
 ## Test corpus strategy
 
@@ -178,10 +178,10 @@ open-pass and memory bounds.
 
 | id | question | spec | timebox | state |
 |---|---|---|---|---|
-| E7 | partitioning in a backup | 085 (the partition model), 089 (ownership rule, maintenance evidence), mssql-ducklake 022 / 023 | — | **done** (`../../experiments/E7-partitioning.md`), integrated |
+| E7 | partitioning in a backup | 085 (the partition model), 089 (ownership rule, maintenance evidence), mssql-ducklake 022 / 023 | — | **done** (`research/experiments/E7-partitioning.md`), integrated |
 | E9 | the 2025 `json` binary, decoded and gated against `CAST(j AS nvarchar(max))` | 086 | 1–2 wk | planned |
 | E10 | the log tail of a TDE backup | 087, 090 | 3–5 d | planned |
-| E11 | columnstore in differentials (incl. a partitioned CCI's SPLIT / MERGE), and the tuple mover during a backup | 088, 089 | 3 d | planned |
+| E11 | columnstore in differentials (incl. a partitioned CCI's SPLIT / MERGE, a SWITCH with an OPEN delta store, rowgroup id reuse), and the tuple mover during a backup | 088, 089 | 3.5 d | planned |
 
 (E8, the import commit cost, was not run, R§12.) R§12 lists E9–E11 as planned.
 

@@ -314,30 +314,47 @@ Layers (bottom up):
   mssql's file functions (§6.1) — `mssql_backup_info`, `mssql_backup_tables`, `mssql_backup_scan`,
   `mssql_backup_changed_pages` — so the import logic lives in mssql-ducklake and the format logic in
   mssql, the split mssql-ducklake already has with `mssql_exec` / `mssql_scan`. The PRAGMA resolves
-  `since_lsn` from the lake's provenance table when it expands. Sketch of a diff import:
+  `since_lsn` from the lake's provenance table when it expands. Sketch of a diff import, export
+  first, then register (022 D1, 023 D3):
   ```sql
   PRAGMA ducklake_import_mssql_diff_backup('lake', 's3://bak/sales_diff_2026-11-05.bak');
-  -- expands, per changed table, into one transaction (one snapshot):
-  --   DELETE FROM lake.s.t WHERE _mssql_page IN
-  --       (SELECT page FROM mssql_backup_changed_pages('s3://…', 's', 't', since_lsn := '<last LSN>'));
-  --   INSERT INTO lake.s.t
-  --       SELECT *, _mssql_rid, _mssql_page
-  --       FROM mssql_backup_scan('s3://…', 's', 't', since_lsn := '<last LSN>');   -- changed pages only
-  --   + catalog DDL, provenance, commit message
+  -- the callback plans at S0; W = the since_lsn the last import recorded (089 D3). Each table's
+  -- delete set is 089's evidence, written to the run directory as delete_pages.parquet:
+  --   SELECT page, from_object_id        -- the previous file's owner, mapped to its lake table
+  --   FROM mssql_backup_changed_pages('s3://…', since_lsn := W, base := …, expand := true)
+  --   WHERE kind IN ('changed', 'freed', 'dead_au', 'gone_au', 'dead_rowgroup', 'pending_applied')
+  --     AND holds_rows;      -- au_moved rows feed a SWITCH's lake-side copy instead (089 need 12)
+  -- then it expands into:
+  --   the export, outside any lake transaction: the changed pages' rows as Parquet
+  --   CREATE TEMP TABLE manifest AS
+  --       SELECT * FROM ducklake_mssql_backup_export('lake', 's3://…', plan := …);
+  --       -- mssql_backup_export('s3://…', out := …, units := …, since_lsn := W, base := …)
+  --   then one transaction (one snapshot):
+  --   SELECT * FROM ducklake_mssql_backup_validate('lake', 's3://…', plan := …);  -- first, at S1
+  --   + catalog DDL
+  --   DELETE FROM lake.s.t WHERE _mssql_page IN                 -- per affected table, before the
+  --       (SELECT page FROM read_parquet('<run>/delete_pages.parquet')  -- new files are registered
+  --        WHERE lake_table = 's.t');
+  --   SELECT * FROM ducklake_mssql_backup_apply('lake', 's3://…', manifest := …, plan := …);
+  --       -- registers the files (phase A: CALL ducklake_add_data_files(…)), the mirrors and
+  --       -- allocation images, provenance, commit message
   ```
 - **Owner's direction for the import (2026-11-05):**
   - **Parquet first, not MERGE/INSERT.** The INSERT/MERGE path pays DuckLake's metadata updates and
-    snapshot-id allocation statement by statement. Instead, parallel workers write Parquet files —
-    data AND delete files — and ONE metadata transaction registers everything: atomic, fast, one
-    snapshot per backup file. Model: duckdb-iceberg's Iceberg → DuckLake function
-    (`src/function/ducklake/*`), which writes DuckLake metadata for existing files. Research:
+    snapshot-id allocation statement by statement. Instead, parallel workers write the data Parquet
+    files, and ONE metadata transaction deletes (DuckLake's own `DELETE`, which writes its delete
+    files) and registers everything: atomic, fast, one snapshot per backup file. Model:
+    duckdb-iceberg's Iceberg → DuckLake function (`src/function/ducklake/*`), which writes DuckLake
+    metadata for existing files. Research:
     `research-ducklake-import.md` (in progress).
   - **Parallel across tables** (and within a table, over extents).
-  - **Positional deletes from a page map**, with no data scan: the reader emits rows page by page, so
-    a page's rows are contiguous in the Parquet it writes; the lake keeps page → (data file, first
-    row, row count), and "delete the rows of page P" becomes positional delete ranges written as
-    DuckLake delete files directly. Physical read order gives key order and page contiguity at once
-    (clustered index in leaf-chain order; heap in IAM order; columnstore by rowgroup).
+  - **Deletes are DuckLake's own `DELETE` by value.** Every imported row carries `_mssql_page` and
+    `_mssql_rid` (opaque BLOBs, DQ-02); "delete the rows of page P" is `DELETE … WHERE _mssql_page IN
+    (…)` on the table P's allocation unit belonged to in the previous file, run before the file's new
+    files are registered, and DuckLake finds the positions. The reader emits rows page by page, in
+    physical read order, which gives key order and page contiguity at once (clustered index in
+    leaf-chain order; heap in IAM order; columnstore by rowgroup), so a page's rows sit in few files
+    and the files' min/max on `_mssql_page` are expected to prune the delete (to verify).
   - **Schema evolution** must be handled inside the per-file commit: tables added, dropped, renamed,
     transferred between schemas; columns added, dropped, renamed, retyped — mapped to DuckLake schema
     evolution with stable field ids, or to a table rewrite where DuckLake cannot express the change.
@@ -350,32 +367,37 @@ Layers (bottom up):
     rowset changes owner, no page rewrite), `SPLIT` / `MERGE RANGE`, `TRUNCATE … WITH (PARTITIONS)` —
     must be recognised in the catalog diff and applied in the same commit (a SWITCH possibly as a
     metadata-only move of data files, if DuckLake allows it). *(Refined by the owner's principle
-    below: SQL Server partitions are work units only, and a SWITCH is a lake-side copy.)*
+    below: SQL Server partitions are work units only, and a SWITCH is a lake-side copy; the sort
+    order narrowed by DQ-25: only the clustered rowstore key.)*
 - **The import pipeline (research-ducklake-import.md, 2026-11-05) — recommended:**
   - **Write first, commit once.** Parallel workers (threads, other processes, other machines — no lake
-    transaction) write the data files plus a per-file record of which rows each page occupies; then
-    ONE short transaction does DDL, file registration, positional deletes, the `__mssql_sys` mirrors,
-    the commit message and provenance — the file's one snapshot. Not one long INSERT transaction: the
-    lake transaction would last the whole import, a rollback deletes every file written so far, and
-    DuckLake's parallel copy appends row groups to shared files, so a page's rows have no known place.
+    transaction) write the data files; then ONE transaction does DDL, the deletes (DuckLake's `DELETE`
+    scans), a SWITCH's lake-side copy, file registration, the `__mssql_sys` mirrors, the commit message
+    and provenance — the file's one snapshot. Its length is the delete scans' and the copy's, not the
+    export's. Not one long INSERT transaction: the lake transaction would last the whole import, a
+    rollback deletes every file written so far, and DuckLake's parallel copy appends row groups to
+    shared files, so physical order is lost and a page's rows scatter.
   - **Register through DuckLake's own transaction, not its metadata rows.** mssql-ducklake compiles
-    DuckLake in, so it can call `AppendFiles` / `AddDeletes` / `DropFile` / the delete-file writer
-    directly; DuckLake still assigns ids and row ids, merges stats and checks conflicts, and
-    mssql-ducklake's commit batch carries it to SQL Server. v1 can be plain SQL
-    (`ducklake_add_data_files` + a native DELETE). Writing metadata rows directly like
+    DuckLake in, so it can call `AppendFiles` directly; DuckLake still assigns ids and row ids, merges
+    stats and checks conflicts, and mssql-ducklake's commit batch carries it to SQL Server. v1 can be
+    plain SQL (`ducklake_add_data_files` + a native DELETE). Writing metadata rows directly like
     iceberg_to_ducklake is rejected: that function takes format 0.4 and an empty catalog only, leaves
     `row_id_start` NULL, skips conflict checks, and would mean hand-written T-SQL per DuckLake bump.
   - **`ducklake_add_data_files`:** maps columns by name, reads stats from footers, appends to the
     caller's transaction (several tables + DDL = one snapshot), cannot register delete files, is not
     rolled back on failure (good for retries) and owned by DuckLake after commit (compaction / cleanup
     apply; no "external" flag).
-  - **Deletes from the page map** (`__mssql_sys.page_map`: page → file, first position, count): a
-    diff's changed / freed / dead pages become position sets per file, merged with existing deletes
-    and written by DuckLake's delete writer; a file with every row gone is dropped. Cost ∝ changed
-    rows. The native `DELETE … WHERE _mssql_page IN (…)` is the oracle and the v1 fallback. A
-    columnstore delete bitmap maps straight to positions. **Catch: compaction** rewrites files and
-    moves positions (`auto_compact` defaults to true): the importer turns it off and owns compaction,
-    rebuilding the page map entries it moves.
+  - **Deletes:** DuckLake's own `DELETE … WHERE _mssql_page IN (…)` per affected table, before the
+    new files; DuckLake merges the positions with existing deletes and drops a file with every row
+    gone. A page is deleted from the table of the allocation unit that owned it in the previous file,
+    which the lake's base IAM images name (point 4 below). A compressed columnstore row's
+    `_mssql_page` is its rowgroup key (088 D3), so a rowgroup is deleted like a page and a
+    delete-bitmap entry by `_mssql_page` and `_mssql_rid`. **Cost:** the delete reads the
+    `_mssql_page` column of the table's files, expected to be pruned by their min/max on it (to
+    verify, 089 § Risks); physical order keeps a page's rows in few files, and a lake sort order
+    scatters them (a cost, never a wrong row).
+    **Compaction is DuckLake's own:** nothing refers to file positions, so a compaction or
+    `CHECKPOINT` that moves rows between files changes nothing for the importer.
   - **Commit cost:** imports take mssql-ducklake's client commit loop (the server-side apply covers
     add-files-only commits); ~80k metadata rows for 2,000 files × 40 columns — seconds, not measured.
   - **Schema evolution:** without rewrite, field ids kept — new / dropped tables, table rename, ADD
@@ -389,37 +411,41 @@ Layers (bottom up):
     epoch_year/month/day/hour — no truncate; `SET PARTITIONED BY` applies to new files only. ~~Files are
     always split per SQL Server partition;~~ a DuckLake transform is declared only when the RANGE
     boundaries align (finest transform with one value per partition: monthly → epoch_month,
-    quarterly → epoch_year), else no spec and min/max stats prune. Clustered key / ordered CCI
-    `ORDER (col)` → sort order, not partition. Avoid `bucket` (scatters a page's rows). Per-table
+    quarterly → epoch_year), else no spec and min/max stats prune. The clustered rowstore key →
+    sort order, not partition, when every key column orders in DuckDB as on disk; an ordered CCI's
+    `ORDER (col)` proposes nothing (DQ-25). Avoid `bucket` (scatters a page's rows). Per-table
     specs as an import parameter override the derived default. (Files follow DuckLake's layout: see
     the owner's principle below.)
   - **Partition maintenance:** SPLIT / MERGE / TRUNCATE PARTITIONS move or free pages — handled by the
     general delete-then-insert by page. SWITCH cannot be a metadata-only file move (DuckLake has no
     move, and cleanup deletes files by path without reference counts): ~~object-store copy +
-    re-registration, or~~ INSERT … SELECT from the lake (a lake-side copy plus positional deletes:
-    the owner's choice, below).
-- **Principle (owner, 2026-11-05): DuckLake's rules govern placement; SQL Server's do not.** Once data
-  has left SQL Server, its physical layout is DuckLake's business. SQL Server's partitioning and
-  clustered key only PROPOSE the initial spec / sort order when a table is created. Partition values
-  are computed with DuckLake's own `DuckLakePartitionUtils::ApplyPartitionTransform` bound in the
-  importing session, like any DuckLake writer (the session TimeZone for TIMESTAMPTZ, DuckLake's
-  TIMESTAMP_NS rounding) — no forced UTC. Files are laid out by DuckLake partition values and
-  settings, not per SQL Server partition (SQL Server partitions may still be work units for parallel
-  writers). SWITCH is a lake-side copy of the rows (resolved by E7's AU / rowset rule) plus positional
-  deletes — not a file move; the page map still records the AU / rowset per page, because that rule
-  needs it. Sort order and file sizes follow DuckLake's settings; SQL Server-derived defaults (the
-  clustered key as the sort order) are proposals at creation only. This closes E7's datetimeoffset
-  question ([decisions.md](../decisions.md) DQ-10). Statements below that say otherwise are superseded by this one.
+    re-registration, or~~ INSERT … SELECT from the lake (a lake-side copy plus a `DELETE` by
+    `_mssql_page` in the source: the owner's choice, below).
+- **Principle (owner, 2026-11-05): DuckLake's rules govern placement; SQL Server's do not.** Once
+  data has left SQL Server, its physical layout is DuckLake's business. SQL Server's partitioning
+  and clustered key only PROPOSE the initial spec / sort order when a table is created. Partition
+  values are computed with DuckLake's own `DuckLakePartitionUtils::ApplyPartitionTransform` bound
+  in the importing session, like any DuckLake writer (the session TimeZone for TIMESTAMPTZ,
+  DuckLake's TIMESTAMP_NS rounding) — no forced UTC. Files are laid out by DuckLake partition
+  values and settings, not per SQL Server partition (SQL Server partitions may still be work units
+  for parallel writers). SWITCH is a lake-side copy of the rows (resolved by E7's AU / rowset
+  rule) plus a `DELETE` by `_mssql_page` in the source — not a file move; the moved rows are those
+  on the moved AU's pages in the base IAM image (columnstore: whose rowgroup key carries the moved
+  rowset id), and not rows matched by partition boundary values, which DuckDB would compare by its
+  own string order, not the column's collation. Sort order and file sizes follow DuckLake's
+  settings; SQL Server-derived defaults (the clustered key as the sort order) are proposals at
+  creation only. This closes E7's datetimeoffset question ([decisions.md](../decisions.md) DQ-10).
+  Statements below that say otherwise are superseded by this one.
 - **Partitioning ownership (owner, 2026-11-05).** The importer sets a table's partitioning and sort
   order ONLY when it creates the lake table — at the first full import, or when a table first
   appears in a later file — mirroring SQL Server (its partition scheme → partitions as above; the
-  clustered key / ordered CCI → sort order), unless the import call names a spec for that table.
-  Incremental imports NEVER change partitioning or sort order, even when SQL Server repartitions
-  (the rewritten rows land under the lake's current spec). **Manual changes made with DuckLake take
-  priority and are never reverted**: the importer records in `__mssql_backup.tables` what it set at
-  creation and does not touch the spec afterwards; a table dropped and re-created in SQL Server under
-  the same name keeps the lake table's current spec. A page split across partition files simply has
-  several page-map entries.
+  clustered key / ordered CCI → sort order) *(narrowed by DQ-25: only the clustered rowstore key)*,
+  unless the import call names a spec for that table. Incremental imports NEVER change partitioning or
+  sort order, even when SQL Server repartitions (the rewritten rows land under the lake's current spec).
+  **Manual changes made with DuckLake take priority and are never reverted**: the importer records in
+  `__mssql_backup.tables` what it set at creation and does not touch the spec afterwards; a table dropped
+  and re-created in SQL Server under the same name keeps the lake table's current spec. A page split
+  across partition files simply has rows in several files; the delete by `_mssql_page` finds them all.
 - **SQL Server partitioning in a backup — VERIFIED (E7, `experiments/E7-partitioning.md`).**
   - Where it lives: function = `sysclsobjs` class 30 (`intprop` = fanout, `status & 1` = RIGHT);
     parameter type = `systypedsubobjs` class 30; boundaries = `sysobjvalues` valclass 30 as
@@ -442,13 +468,15 @@ Layers (bottom up):
     rowset (pages in the diff); populated MERGE moves the right rowset's rows left and frees its AUs;
     TRUNCATE PARTITIONS frees pages (small: AU kept; big: AU type 0 / owner 0, new empty AU) with no
     pages in the diff; REBUILD PARTITION gives new rowsets / in-row AUs, LOB AU kept and re-owned.
-  - **Rule for SWITCH (E7):** after updating the mirror, resolve every lake row's recorded AU (for
+  - **Rule for SWITCH (E7):** after updating the mirror, resolve every lake row's AU (for
     columnstore, its rowset) through `sysallocunits.ownerid` → `sysrowsets`; if the (object, index)
     changed, move the row; if only `numpart` changed, do nothing. With it all 15 differentials replay
-    exactly (plain SWITCH otherwise leaves rows in the old table). So the **page map records the AU /
-    rowset, not the table**. ~~In DuckLake a SWITCH moves whole per-rowset files (copy, re-register
-    under the target with the same delete positions, drop the sources).~~ Per the owner's decision
-    above, the moved rows are copied lake-side into the target and deleted by position in the source.
+    exactly (plain SWITCH otherwise leaves rows in the old table). So the key is **the AU / rowset,
+    not the table**, and nothing is stored per row for it: a row's AU is its page's AU in the base IAM
+    image (a SWITCH leaves IAMs unchanged), a columnstore row's rowset is in its rowgroup key.
+    ~~In DuckLake a SWITCH moves whole per-rowset files (copy, re-register under the target, drop the
+    sources).~~ Per the owner's decision above, the moved rows are copied lake-side into the target and
+    deleted by `_mssql_page` in the source.
     The dead-AU clause is needed too (a deferred TRUNCATE otherwise leaves 9,000 rows). A spec set at
     creation stays valid after SPLIT / MERGE, since each row's value is computed from the row itself.
 - **Snapshot retention (owner, 2026-11-05).** Every import snapshot is tagged (snapshot `extra_info`
@@ -463,9 +491,11 @@ Layers (bottom up):
     `ducklake_expire_snapshots(lake, versions := […])`, then `ducklake_cleanup_old_files` (files
     referenced only by expired snapshots, after a grace period). It can also run automatically after
     each successful import when the policy is stored in `__mssql_backup.config`.
-  - Only import snapshots are counted and expired; snapshots made by users or by compaction are left
-    alone unless an option includes them. DuckLake never expires the current snapshot.
-  - Expiring also frees the files our own compaction replaced (page-map rebuild, §6.2 deletes).
+  - Only import snapshots are counted and expired; snapshots of other writers — users' commits,
+    DuckLake's compaction — are left by default (`include_other`). DuckLake never expires the current
+    snapshot.
+  - Expiring also frees the files no kept snapshot references: data files whose rows an import
+    deleted, superseded delete files, files DuckLake's compaction replaced.
 - **Provenance.** `BackupSetGUID`, FirstLSN/LastLSN, `DifferentialBaseGUID/LSN`, database name,
   file names — in the snapshot's `extra_info` and in a versioned side table
   `__mssql_backup.imports` (snapshots can expire). Each import validates the chain against it.
@@ -485,14 +515,17 @@ Layers (bottom up):
   4. **Freed space is NOT in the DCM** (E2, R1–R5): a diff copies the extents with DCM = 1 AND still
      GAM-allocated; DROP / TRUNCATE / deferred drop free extents without setting a DCM bit, and a freed
      extent is never copied. Only GAM, SGAM, DCM, BCM and the first PFS page are always in a diff; later
-     PFS pages and IAM pages only when they changed. So **the lake keeps a page map** (file, page →
-     allocation unit, LSN) for every page holding rows **plus the latest image of every allocation
-     page** (file header, GAM/SGAM/PFS/DCM, IAMs — a few pages per 64 MB), and per file it deletes the
-     rows of every page that is no longer live (R3: below the file's `Size`, extent GAM-allocated, PFS
-     byte 0x40), that now names another allocation unit, or whose allocation unit is gone or dead
-     (type 0 / owner 0 = deferred drop). The page header's allocation unit id is correct on every
-     allocated page, after SHRINKFILE and REBUILD too (10,473 pages, 0 mismatches) — gated by R3 it is
-     the practical page → table map, since the IAMs of unchanged allocation units are absent.
+     PFS pages and IAM pages only when they changed. So **the lake keeps the latest image of every
+     allocation page** (file header, GAM/SGAM/PFS/DCM, IAMs — a few pages per 64 MB). Its IAM images
+     name the allocation unit that owned each page in the previous file (per extent, or per
+     mixed-extent single-page slot), and the mirror maps that unit to its table. Per file the lake
+     deletes, from the table of the page's old allocation unit, the rows of every page that changed,
+     that is no longer live (R3: below the file's `Size`, extent GAM-allocated, PFS byte 0x40) or that
+     now names another allocation unit, and the pages of every allocation unit that is gone or dead
+     (type 0 / owner 0 = deferred drop). No page LSN is stored: which pages changed is the file's
+     (DCM, `m_lsn > since_lsn`). The page header's allocation unit id is correct on every allocated
+     page, after SHRINKFILE and REBUILD too (10,473 pages, 0 mismatches) — gated by R3 it names a
+     changed page's new owner, since the IAMs of unchanged allocation units are absent from a diff.
   5. The schema comes from the lake too: the SQL Server base tables (sysschobjs, syscolpars,
      sysrowsets, sysallocunits, sysrscols, sysidxstats, sysiscols, sysobjvalues) are imported into
      a hidden schema (`__mssql_sys`) with their own locators and updated by the same mechanism. A
@@ -555,9 +588,9 @@ Layers (bottom up):
      absent PFS page means nothing in its interval was freed since the base.
   4. Rows only from PFS-allocated data pages whose header names a table's in-row allocation unit; skip
      ghost and stub record types (2, 5, 6, 7) and freed slots.
-  5. **Delete by page in EVERY table, then insert** — pages move between tables (a page went from a
-     truncated table to another; deleting only from the new owner left a row behind). One
-     transaction per file.
+  5. **Delete by page in the table the base IAM image names, then insert** — pages move between
+     tables (a page went from a truncated table to another; deleting only from the new owner left a
+     row behind), so a page is deleted from its owner in the previous file. One transaction per file.
   6. Catalog first: update `__mssql_sys` (it needs `sysseobjvalues` — ADD COLUMN defaults keyed by
      hbcolid — and `sysclsobjs` — schema names), diff it against the registry by object id and column
      id; key order is `ordkey` (+36).
@@ -603,13 +636,13 @@ differences are in the [series overview](../series.md) (phase map) and mssql-duc
 | 1 | ROW/PAGE compression, sparse, sql_variant, xml, spatial (SSCLRT→WKB), vector; differential overlay; virtual row locators; parallel scan | 5–6 wk | med | mssql 086, 7–8 wk + the `json` spike E9 |
 | 1b | encryption and TDE with a `mssql_backup_key` secret (certificate + PVK/PFX + password), selected by scope first, then by the thumbprint stored in plaintext in the backup / boot page (owner, §6.1) — format established by E4 | 1–2 wk | low–med | mssql 087, 3–3.5 wk + the TDE log-tail spike E10 |
 | 1c | tail recovery (owner: no dirt in the lake): redo of every tail transaction + undo of open ones, pending pages with allocation check, stale-page tracking, CheckpointLSN ordering — established by E3 + E6 | 9–12 wk | medium | mssql 090, 10–12 wk (+ guard extensions) |
-| 2 | mssql-ducklake: full import (one snapshot), provenance, diff import by locators, table-replace fallbacks, views as text | 3–4 wk | med | reader side: mssql 089, 8 wk; importer: mssql-ducklake 022–024, 20–26 wk |
+| 2 | mssql-ducklake: full import (one snapshot), provenance, diff import by locators, table-replace fallbacks, views as text | 3–4 wk | med | reader side: mssql 089, 8.5 wk; importer: mssql-ducklake 022–024, 18–23 wk |
 | 3 | columnstore (required): segments, dictionaries, RLE/bit-packing, delta stores, delete bitmaps, archive — format established by E5 | 5–8 wk | medium | mssql 088, 6–9 wk + E11 |
 | 4 | log backups: redo of row operations → consistent full backups and CDC-style incremental import; sector parity | 3–6 mo | high | not in the series |
 | 5 | QAT_DEFLATE, 2025 `json` — research first | open | high | `json`: 086's E9; QAT_DEFLATE refused by name |
 
-Totals of the drafts: mssql 085–090 ≈ 255 working days (≈ 51 weeks for one developer, ≈ 34 with two);
-mssql-ducklake 022–024 ≈ 20–26 weeks, gated on the reader. The order of 088 against 090 and the other
+Totals of the drafts: mssql 085–090 ≈ 259 working days (≈ 52 weeks for one developer, ≈ 34 with two);
+mssql-ducklake 022–024 ≈ 18–23 weeks, gated on the reader. The order of 088 against 090 and the other
 open questions are in [decisions.md](../decisions.md).
 
 ## 9. Hardening and tests

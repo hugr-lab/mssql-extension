@@ -16,9 +16,10 @@ rules.
 
 The importer is mssql-ducklake. The reader must give it everything those rules need while knowing
 nothing about the lake (research-ducklake-import §8: "mssql knows no lake"). This spec defines that
-contract: chain metadata, the changed and freed pages, allocation-page state, the catalog mirror, the
-LOB fragment maps, per-row page positions, and a Parquet export. The recovery of a loaded file's log
-tail, and the pending and stale pages it produces, are spec 090; this spec leaves the hooks.
+contract: chain metadata, the changed and freed pages with each page's previous owner,
+allocation-page state, the catalog mirror, the LOB fragment maps, and a Parquet export. The recovery
+of a loaded file's log tail, and the pending and stale pages it produces, are spec 090; this spec
+leaves the hooks.
 
 ## What the importer needs (the rules, with their evidence)
 
@@ -29,13 +30,13 @@ tail, and the pending and stale pages it produces, are spec 090; this spec leave
 | 3 | the freed pages | from PFS, GAM and `Size`, never from the DCM; a freed extent is never copied | E1 rule 3, §4.2 (TRUNCATE left 800 rows behind without it); E2 R1, R2 |
 | 4 | pages of dead allocation units | an AU of type 0 / owner 0 (deferred drop), or gone from the catalog | E2§1.2, R5; E7 s10: without this clause a deferred `TRUNCATE … WITH (PARTITIONS)` leaves all 9,000 rows in the lake (its pages are allocated and absent from the diff; only the AU row tells) |
 | 5 | rows from the right pages only | live (R3), level-0 data pages whose header AU is a table's IN_ROW AU; ghosts, stubs and freed slots skipped | E1 rule 4, §4.4; E2 R3, R4 |
-| 6 | delete by page in every table, then insert | pages move between tables | E1 rule 5, §4.3 |
+| 6 | delete by page in the table the base IAM image names, then insert | pages move between tables, so a page is deleted from the table of the AU that owned it in the previous file: freed or reallocated to another AU → its OLD AU's table only; changed inside its AU → that AU's table | E1 rule 5, §4.3; E2 R5 |
 | 7 | the catalog first, from a mirror | base tables with their own locators, updated by the same delete / insert; a differential lacks every unchanged catalog page | E1 rule 6, §4.8; R§6.2 point 5 |
 | 8 | LOBs | the in-row root and a fragment map with each value; a value not wholly in the file rebuilt from its nodes in the file plus the lake's old bytes by node RID; root byte-identical = unchanged; refuse when a node is in neither | E1§5 rule 8 (R§6.2 numbers it 7), §4.5 (reuse by `_mssql_rid` failed 10 of 21 steps); E2 R6, R8 |
-| 9 | allocation-page state | the lake keeps the latest image of every allocation page | E2 R5 |
-| 10 | per-row page positions | each page's rows recorded as runs of positions in the data file; deletes become positions with no data scan | owner (R§6.2 "Parquet first", "positional deletes from a page map"); research-ducklake-import §5 |
+| 9 | allocation-page state | the lake keeps the latest image of every allocation page; its IAM images name the AU that owned each page in the previous file (need 6) | E2 R5 |
+| 10 | deletes by value | every row carries `_mssql_page`; the importer deletes with DuckLake's own `DELETE … WHERE _mssql_page IN (<the table's delete set>)` before the file's new files are registered, and keeps no page LSN or file position anywhere; the export writes in physical order, so a page's rows sit in few files and a delete is expected to read few (§ Risks) | owner, 2026-11-05 (R§6.2 "Parquet first", "deletes by value"); research-ducklake-import §5 |
 | 11 | row identity | `_mssql_rid`, `_mssql_page` (085 D8) | R§5, E1§3 |
-| 12 | ownership after a SWITCH | after the mirror update, a lake row whose recorded AU (columnstore: rowset) now resolves through `sysallocunits.ownerid` → `sysrowsets` to another (object, index) moves to that owner; a change of `numpart` alone means nothing. So the lake records the AU / rowset per page, not the table | E7§5: with it all 15 differentials of E7 replay exactly; without it the 5 SWITCH variants leave the rows in the old table (after SWITCH + a one-row UPDATE only the 37 rows of the touched page move, 263 stay) |
+| 12 | ownership after a SWITCH | after the mirror update, a lake row whose AU (columnstore: rowset) now resolves through `sysallocunits.ownerid` → `sysrowsets` to another (object, index) moves to that owner; a change of `numpart` alone means nothing. The key is the AU / rowset, not the table, and nothing is stored per row for it: a row's AU is its page's AU in the base IAM image (a SWITCH leaves IAMs unchanged; a delta-store row's too), a compressed columnstore row's rowset is in its rowgroup key (088 D3) | E7§5: with it all 15 differentials of E7 replay exactly; without it the 5 SWITCH variants leave the rows in the old table (after SWITCH + a one-row UPDATE only the 37 rows of the touched page move, 263 stay) |
 
 ## Decisions
 
@@ -49,7 +50,8 @@ tail, and the pending and stale pages it produces, are spec 090; this spec leave
 
 - **D3 — the changed set is `m_lsn > since_lsn` on live pages**, where the importer passes W (need 2).
   Re-processing a page is idempotent (E1 rule 2). Spec 090 adds to it the pending images it applies
-  and the pages formatted in the tail (E6§3.1 step 5).
+  (kind `pending_applied`) and the pages formatted in the tail or rebuilt (`changed` rows with a
+  reason) (E6§3.1 step 5).
 
 - **D4 — liveness of a lone differential needs the lake's allocation images.** A differential carries
   an allocation page only when it was written since the base full (R1; pass 2 always re-copies the
@@ -117,12 +119,15 @@ tail, and the pending and stale pages it produces, are spec 090; this spec leave
   answers from the file's header fields alone.
 
 - **D8 — the evidence of deletes is one function.** `mssql_backup_changed_pages` returns the changed
-  pages, the freed runs, and the dead and gone allocation units in one result, so the importer deletes
-  by page in every table (need 6) and by AU, with no format knowledge of its own.
+  pages, the freed runs, and the dead, gone and moved allocation units in one result, each page with
+  the AU that owned it in the previous file (`base_au_id`, from the base IAM images), that AU's
+  owner in the base mirror, and whether lake rows can be on it (`holds_rows`), and each dead, gone or
+  moved AU with its pages in the base IAM image. The importer deletes each page from the table the
+  base mirror names (need 6) and finds a SWITCH's rows (need 12), with no format knowledge of its own.
 
 - **D9 — Parquet first: an export function in mssql, the commit in mssql-ducklake** (owner, R§6.2;
   research-ducklake-import §4, §8). `mssql_backup_export` writes the data Parquet itself, in
-  parallel, and records each page's positions; it registers nothing. mssql-ducklake turns the
+  parallel and in physical order unless a sort is passed; it registers nothing. mssql-ducklake turns the
   returned rows into DuckLake files in one transaction. **The layout is DuckLake's (owner,
   2026-11-05: follow DuckLake's rules, do not replicate SQL Server):** the files are split by the lake
   table's DuckLake partition values and written in its DuckLake sort order and file size, all passed in
@@ -132,8 +137,8 @@ tail, and the pending and stale pages it produces, are spec 090; this spec leave
   DuckLake writer: its `TimeZone` decides a `TIMESTAMPTZ` value, and DuckLake's own TIMESTAMP_NS → µs
   rounding applies (E7§3). The export never derives a partition value of its own. Before the export exists, the v1 is still Parquet first, in plain SQL
   (R§6.2: "v1 can be plain SQL"): `COPY (SELECT … FROM mssql_backup_scan(…)) TO '….parquet'`,
-  registered with `ducklake_add_data_files`, and a native `DELETE … WHERE _mssql_page IN …` for the
-  deletes, which is also the oracle of the export's positional deletes. Not `INSERT` / `MERGE` into
+  registered with `ducklake_add_data_files`, and DuckLake's own `DELETE … WHERE _mssql_page IN …` for
+  the deletes, as with the export (need 10). Not `INSERT` / `MERGE` into
   the lake (owner, R§6.2; research-ducklake-import §4.3 rejects that option).
 
 - **D10 — side inputs are Parquet files under one `base` prefix, read on a side connection.**
@@ -142,8 +147,8 @@ tail, and the pending and stale pages it produces, are spec 090; this spec leave
 
   | file | content | needed for |
   |---|---|---|
-  | `catalog/<base_table>.parquet` | the mirror rows, as `mssql_backup_catalog` returns them, with `_mssql_page` and `_mssql_rid` | D5, gone AUs, `au_moved` |
-  | `allocation.parquet` | `(file_id, page_id, page_type, page_lsn, image)`, the latest image of every allocation page | D4, exact freed runs |
+  | `catalog/<base_table>.parquet` | the mirror rows, as `mssql_backup_catalog` returns them, with `_mssql_page` and `_mssql_rid` | D5, gone AUs, `au_moved`, each base AU's owner (D8) |
+  | `allocation.parquet` | `(file_id, page_id, page_type, page_lsn, au_id, image)`, the latest image of every allocation page; `au_id` is the AU an IAM page tracks | D4, exact freed runs, each page's base AU (D8) |
   | `lob.parquet` | `(object_id, _mssql_rid, column_id, root, nodes, text_exact, value)` for every off-row value of every lake row the apply deletes (rows on changed, freed or dead-AU pages: R§6.2's "rows before"; this includes a REBUILD's old rows, whose pages are freed); `value` in the form DQ-01 chooses (with `raw` under design C) | D6 |
   | `pending.parquet` | spec 090: `mssql_backup_pending_pages`'s rows from the previous file | 090 |
 
@@ -173,10 +178,10 @@ SELECT * FROM mssql_backup_changed_pages('s3://bak/d5.bak', since_lsn := 5200000
 -- 3. the mirror (D5) and the allocation images (need 9)
 SELECT *, _mssql_page, _mssql_rid FROM mssql_backup_catalog('s3://bak/d5.bak', 'syscolpars',
                                      since_lsn := …, base := …);
-SELECT * FROM mssql_backup_allocation('s3://bak/d5.bak');
+SELECT * FROM mssql_backup_allocation('s3://bak/d5.bak', since_lsn := …, base := …);
 
 -- 4a. rows, v1: through the scan
-SELECT *, _mssql_rid, _mssql_page, _mssql_page_lsn, _mssql_lob
+SELECT *, _mssql_rid, _mssql_page, _mssql_lob
 FROM mssql_backup_scan('s3://bak/d5.bak', 'dbo', 'orders', since_lsn := …, base := …);
 
 -- 4b. rows, Parquet first: plan the units, export them (any process, any machine)
@@ -190,8 +195,9 @@ SELECT * FROM mssql_backup_export('s3://bak/d5.bak', out := 's3://lake/data/',
 
 `base` (D10) is accepted by every function of 085 too (`mssql_backup_tables`, `_views`, `_catalog`,
 `_scan`), so a lone differential is listed and browsed with the catalog the scan uses (D5); 023 asks
-`mssql_backup_tables(diff, base := …)` for the file's table list. Spec 090 adds `recovery`,
-`loaded_diff` and `reflected_lsn` to the scan, `changed_pages`, `export_plan` and `export`.
+`mssql_backup_tables(diff, base := …)` for the file's table list. Spec 090 adds the recovery
+parameters `recovery`, `loaded_diff` and `reflected_lsn`, which recover with `base` (its
+`pending.parquet`), to the scan, `changed_pages`, `allocation`, `export_plan` and `export`.
 
 **`mssql_backup_chain_check(path, base_backup_set_guid, base_lsn, last_backup_set_guid,
 last_checkpoint_lsn, family_guid, recovery_fork_id)`**: the lake's base full and its LSN (the
@@ -215,27 +221,72 @@ only). Rules, in order:
 It returns `since_lsn = min(first_lsn, checkpoint_lsn)` and `reflected_lsn = last_lsn` of the file
 for the importer to record.
 
-**`mssql_backup_changed_pages(path [, schema, table], since_lsn, base)`**, one row per kind:
+**`mssql_backup_changed_pages(path [, schema, table], since_lsn, base [, expand])`**, one row per kind:
 
 | `kind` | rows | rule |
 |---|---|---|
 | `changed` | one per live page of the file with `m_lsn > since_lsn`, every page type (data, index, LOB, catalog, allocation, IAM) | D3 |
-| `freed` | runs `(file_id, first_page, page_count)`: with `base`, pages live by the base images and not live now (exact); without it, pages not live by the allocation pages the file carries (a superset, harmless for deletes) | need 3 |
-| `dead_au` | AUs of type 0 or owner 0 in the file's catalog: a deferred drop, or a big `TRUNCATE`, of a table or of a partition (E7 s10) | need 4 |
-| `gone_au` | AUs in the base mirror and absent from the file's catalog (needs `base`): a dropped table, a merged-away or rebuilt partition, a deferred drop completed (E7 s08, s10b, s11) | need 4 |
-| `au_moved` | (needs `base`) an AU, or for a columnstore a rowset, whose rowset's `(idmajor, idminor)` in the file's catalog differs from the base mirror's; AU and rowset ids are unchanged by a SWITCH. **Not reported when only `numpart` changed**: that is SPLIT / MERGE renumbering (E7 s06: 670 rows renumbered with no page change), and the partition number is never stored with a row | need 12, E7§5 |
-| `dead_rowgroup` | (needs `base`; shape fixed after 088's E11) a columnstore rowgroup of the base mirror that is TOMBSTONE or gone in the file, and a TOMBSTONE's delta store that still owns pages | 088 D7, 023 D9 |
+| `freed` | runs `(file_id, first_page, page_count)`, each within one base AU: with `base`, pages live by the base images and not live now (exact); without it, pages not live by the allocation pages the file carries (a superset, harmless for deletes) | need 3 |
+| `dead_au` | AUs of type 0 or owner 0 in the file's catalog: a deferred drop, or a big `TRUNCATE`, of a table or of a partition (E7 s10). With `base`, one row per run of the AU's pages in its base IAM image (its IAM is not in the file) | need 4 |
+| `gone_au` | AUs in the base mirror and absent from the file's catalog (needs `base`): a dropped table, a merged-away or rebuilt partition, a deferred drop completed (E7 s08, s10b, s11). One row per run of the AU's pages in its base IAM image | need 4 |
+| `au_moved` | (needs `base`) an AU, or for a columnstore a rowset, whose rowset's `(idmajor, idminor)` in the file's catalog differs from the base mirror's; AU and rowset ids are unchanged by a SWITCH. Its owner in the base mirror (`from_*`) and in the file (`object_id`, `index_id`, `partition_number`); one row per run of the AU's pages in its base IAM image (the moved rows are the lake rows on them). A columnstore's columnstore rowset: one row per COMPRESSED rowgroup of the base mirror, `page` = its `0x02` rowgroup key carrying the moved rowset id (088 D3); its delta-store and delete-bitmap rowsets move as AUs, one row per run of their base IAM pages in the `0x01` form (a delta-store row's `_mssql_page`; no lake row is on a delete-bitmap page). A SWITCH of a partition with an OPEN delta store is unmeasured (088 E11). **Not reported when only `numpart` changed**: that is SPLIT / MERGE renumbering (E7 s06: 670 rows renumbered with no page change), and the partition number is never stored with a row | need 12, E7§5 |
+| `dead_rowgroup` | (needs `base`; shape fixed after 088's E11) a columnstore rowgroup of the base mirror that is TOMBSTONE (merged, rebuilt or moved by the tuple mover) or gone in the file, with its `rowset_id`: a compressed rowgroup is one row, `page` = its `0x02` rowgroup key; a TOMBSTONE's delta store that still owns pages is one row per run of the delta-store AU's pages in its base IAM image, `page` in the `0x01` form | 088 D3, D7, 023 D9 |
 
 Columns: `kind`, `file_id`, `first_page`, `page_count`, `page` (`_mssql_page` form of the first
-page), `au_id`, `rowset_id`, `rowgroup_id`, `object_id`, `index_id`, `partition_number`,
-`from_object_id`, `from_index_id` (for `au_moved`: the owner in the base mirror), `schema_name`,
-`table_name`, `page_type`, `page_lsn`, `reason` (`past_size` / `extent_free` / `page_free` for
-`freed`). The optional `schema`, `table` filter the `changed` rows; `freed` and the AU kinds are never
-filtered, because pages move between tables (need 6).
+page; a rowgroup key for a columnstore rowgroup), `au_id`, `rowset_id`, `rowgroup_id`, `object_id`,
+`index_id`, `partition_number` (the file's owner), `base_au_id` (needs `base`: the AU whose base IAM
+image holds the page — an extent bit, or a mixed-extent single-page slot —, i.e. its owner in the
+previous file, by rule 10: only IAM pages on the AU's chain from its first IAM in the base mirror,
+only pages live in the base GAM / PFS, and a page two chains claim is a named error; NULL when no
+such chain holds it, so no lake row is on it; for the AU kinds, the AU itself), `holds_rows BOOLEAN`
+(NULL without `base`: true when lake rows can carry the page as `_mssql_page`, because its base AU is
+an `IN_ROW_DATA` AU of a heap or clustered index or a delta store's, or `page` is a rowgroup key;
+false for LOB, row-overflow, nonclustered-index and allocation pages), `from_object_id`, `from_index_id`,
+`from_partition_number` (the owner of `base_au_id` in the base mirror: the table a page is deleted
+from, need 6, which the importer maps to its lake table through its registry; for `au_moved`, the
+table the rows move from; `base_au_id` itself serves diagnostics and the SWITCH page lists),
+`schema_name`, `table_name`, `page_type`, `page_lsn`, `reason` (`past_size` / `extent_free` /
+`page_free` for `freed`). The optional `schema`, `table` keep a `changed` row when its current owner
+or its base owner (`from_*`) passes them, so a page reused out of an imported table into a
+filtered-out one still deletes its old rows; `freed` and the AU kinds are never filtered, because
+pages move between tables (need 6).
 
-**`mssql_backup_allocation(path)`**: `(file_id, page_id, page_type, page_lsn, image BLOB)` for every
-allocation page the file carries (file header, PFS, GAM, SGAM, DCM, BCM, IAM). A few pages per 64 MB
-(E2 R5).
+`expand := true` returns one row per page instead of runs (`page_count` 1, `page` set). The delete
+set of a lake table is
+
+```sql
+SELECT page FROM mssql_backup_changed_pages(…, expand := true)
+WHERE kind IN ('changed', 'freed', 'dead_au', 'gone_au', 'dead_rowgroup', 'pending_applied')
+  AND holds_rows AND from_object_id = <its object id>
+```
+
+`pending_applied` is spec 090's kind for an applied pending image: one row per page with the same
+owner columns, not also reported as `changed`. The set holds data pages only (`holds_rows`): pages
+of an `IN_ROW_DATA` AU of a heap or clustered index, delta-store pages and rowgroup keys. LOB and
+row-overflow pages reach their rows through the LOB map (D6), and index and allocation pages hold no
+lake rows. A SWITCH's moved pages are the `au_moved` rows with `holds_rows`; they go to the SWITCH
+copy (need 12), not to the delete set.
+
+**`mssql_backup_allocation(path [, since_lsn, base])`**:
+`(file_id, page_id, page_type, page_lsn, au_id, image BLOB)` for every allocation page the file carries
+(file header, PFS, GAM, SGAM, DCM, BCM, IAM); `au_id` is the AU an IAM page tracks (its header), NULL
+for the other types. A few pages per 64 MB (E2 R5). Its lake-mode output (`since_lsn`, `base`) is the
+images the importer keeps, over the base's, as the next file's `base/allocation.parquet` (D10): an
+image it returns replaces the stored one; the stored image of a page the file shows freed, or carries
+as a non-allocation page, is dropped; a full replaces the whole set. Rule 10 does not rely on that: an
+image no AU's chain reaches attributes no page. After a recovered file (spec 090) it takes 090's
+parameters and returns the images of the recovered state, so that every page the lake holds rows of
+stays in the IAM chain of the AU whose table holds them.
+
+It runs the **attribution check**, because it builds the images and knows which pages give the lake
+rows: every page whose rows `mssql_backup_scan` and `mssql_backup_export` return with the same
+arguments (the changed data pages; with 090 also those formatted in the tail or rebuilt, and the
+`pending_applied` ones; not a rowgroup key) must lie, live, on its header AU's IAM chain and on no
+other, in the images it returns over the base's (rule 10; a differential needs `base` for it, as for
+its rows, D4). Otherwise it refuses by name (table, page, AU), and the import then refuses the file:
+the next file could not attribute that page. So a missed delete is never silent on either path, rows
+from the scan (phase A) or from the export. A full's own images always pass; the check guards the
+recovered images (090).
 
 **`mssql_backup_scan(…, since_lsn, base)`** returns the rows of the changed pages only (need 5) and,
 with `base`, decodes a differential alone (D4, D5, D6). Without `since_lsn` on a differential with
@@ -257,15 +308,22 @@ target_file_size, parquet_options, naming, field_ids])`**: writes each unit's ro
 DuckDB's `parquet` copy function, as DuckLake writes its delete files (`ducklake_delete.cpp:54-135`),
 one writer per thread.
 - Columns: the table's columns plus `_mssql_rid`, `_mssql_page` and, for a table with off-row-capable
-  columns, `_mssql_lob` (all opaque BLOBs, DQ-02 decided). The page LSN goes into the
-  page-run file, not into the rows: the lake keeps it in its page map (R§6.2 point 4, E2 R5).
+  columns, `_mssql_lob` (all opaque BLOBs, DQ-02 decided). No page LSN is written, in the rows or
+  beside them: which pages changed is decided by the file (D3; R§6.2 point 4).
+- Attribution check: the export repeats `mssql_backup_allocation`'s check on the pages it writes
+  rows from (not a rowgroup key): each must lie, live, on its header AU's IAM chain and on no other,
+  in the images `mssql_backup_allocation` returns for the same file and arguments, which the next
+  file's `base` will hold (rule 10). Otherwise the export refuses by name (table, page, AU), and the
+  import then refuses the file: the next file could not attribute that page, and a missed delete is
+  never silent.
 - `partition_by`: per table (`'schema.table'`), the SQL text of the expression DuckLake builds for the
   lake table's current spec (`ApplyPartitionTransform`, D9), bound and evaluated in the calling
   session. One open file per (unit, partition value). Absent: the table has no spec.
 - `order_by`: per table, the lake table's current DuckLake sort expressions. When they are the
   clustered key in key order and every key column orders in DuckDB as on disk (`OrdersLikeDuckDB`),
   the physical read order already satisfies them and nothing is sorted; otherwise each unit is sorted
-  (DuckDB's sort, spilling) before it is written. Absent: physical order.
+  (DuckDB's sort, spilling) before it is written, which scatters a page's rows over files (§ Risks).
+  Absent: physical order.
 - `target_file_size`, `parquet_options` (compression, row group size, Parquet version): the lake's own
   settings, passed by the importer; files rotate at the size.
 - `naming`: the file-name pattern; default `mssql-{backup_set_guid}-o{object_id}-p{partition}-u{unit}-{seq}.parquet`
@@ -275,15 +333,11 @@ one writer per thread.
 It returns one row per written file: `path`, `object_id`, `schema_name`, `table_name`,
 `partition_number` (the unit's SQL Server partition, informational), `partition_value`, `unit`,
 `au_id`, `rowset_id`, `row_count`, `file_size`, `column_statistics` (the shape of DuckLake's
-`WRITTEN_FILE_STATISTICS`), `page_runs_path`: a side Parquet of `(page BIGINT, page_lsn DECIMAL(25,0),
-first_pos BIGINT, row_count INTEGER)` runs (columnstore: `(rowgroup, first_tuple, first_pos, count)`
-over surviving tuples, 088 D3). Positions are 0-based row numbers within the file, as DuckLake's
-positional deletes and `file_row_number` count them.
+`WRITTEN_FILE_STATISTICS`, with min/max of `_mssql_page`, which a delete is expected to prune by,
+§ Risks).
 
-Export guarantees: every row is in exactly one run, and a file's runs do not overlap and sum to its
-row count; output in physical order emits a page's rows together, so a page is split only at a
-rotation or a partition-value change; sorted output may scatter a page's rows over many runs (more
-page-map rows, never a wrong position); nothing is registered anywhere; a retry with the same `units`
+Export guarantees: output in physical order emits a page's rows together, so a page is split only at
+a rotation or a partition-value change; nothing is registered anywhere; a retry with the same `units`
 and arguments rewrites the same files.
 
 ## Rules the reader applies in lake mode
@@ -302,15 +356,27 @@ and arguments rewrites the same files.
    pages freed); a big TRUNCATE (a new IN_ROW AU under the same rowset, the old one `dead_au`), per
    table or per partition; SPLIT and MERGE of populated ranges (rows physically moved: changed and
    freed pages); SHRINKFILE (`Size` shrinks; pages past it freed; a shrink renumbers every heap RID, a
-   clustered index keeps its slots, E2§2); a page reused by another table (changed, and deleted by
-   page in every table).
+   clustered index keeps its slots, E2§2); a page reused by another table (changed; deleted from its
+   `base_au_id`'s table, inserted under its header AU's).
 8. **Heap RIDs** change on a heap REBUILD and a shrink (E1 rule 9): a consumer that tracks
    `_mssql_rid` sees a delete and an insert. Documented; the lake does not care, it is page-based.
 9. **Ownership** (need 12, E7§5): `au_moved` compares, for every AU of the base mirror (every rowset
    of a columnstore), its owning `(idmajor, idminor)` through `sysallocunits.ownerid` → `sysrowsets`
    in the base mirror and in the file's catalog. The importer applies it after the page rule; rows
    inserted from changed pages already carry their new owner (E7: catalog, then the page rule, then
-   ownership).
+   ownership). The moved rows are the source table's rows on the AU's pages in the base IAM image
+   (columnstore: on the columnstore rowset's rowgroup keys, and on its delta stores' base IAM pages),
+   minus the changed pages, which the page rule handles.
+10. **Old owner**: a page's `base_au_id` is the AU whose base IAM image holds it, through the extent
+    bitmap of the IAM page covering its GAM interval or one of the IAM's single-page slots (E2 §
+    Layouts: IAM header record at 96, slots at +46, bitmap at 194). Only IAM pages on the AU's chain
+    count: from its first IAM (`sysallocunits.pgfirstiam` in the base mirror) through each image's
+    next pointer; an image no chain reaches (an IAM page since freed or reused, kept by mistake) is
+    ignored. Only pages live in the base GAM / PFS get an owner. A page two chains claim is a named
+    error. It names the owner of every page that held lake rows: on every allocated page the header AU
+    equals the AU the DMV reports from the IAMs (E2 R4: 10,473 pages, 0 mismatches), and the
+    attribution check (`mssql_backup_allocation`, repeated by the export) keeps every page the lake
+    gets rows of on its header AU's chain, and on no other, in the images the lake keeps.
 
 ## Partitioning (E7)
 
@@ -344,8 +410,9 @@ composes, E1; the ownership rule compares final owners only, E7§5).
   `format` key-value in the Parquet metadata written by the reader's own outputs and checked on
   input); node maps must be well-formed trees (depths consistent, offsets and lengths cover the
   parent's range, no cycles); allocation images must be 8 KB pages of an allocation type whose
-  header names the claimed page; a mirror row on a page the file also carries is ignored for that
-  page (the file wins).
+  header names the claimed page, and an IAM image's `au_id` the AU its header names; an IAM chain
+  that loops is a named error (rule 10); a mirror row on
+  a page the file also carries is ignored for that page (the file wins).
 - A base value larger than its map's total length, or a map whose leaves do not tile the value, is a
   named error.
 - The export writes only under `out`, with names it generates; `units` out of range are refused.
@@ -357,9 +424,10 @@ composes, E1; the ownership rule compares final owners only, E7§5).
 ## Testing and acceptance
 
 **A reference importer for the tests** (`test/backup/ref_importer.sql`, not a product): plain SQL over
-this API into a DuckDB database standing in for the lake — the chain check, delete by page in every
-table, insert from the scan, the mirror, the allocation images, the LOB base — exactly E1's
-`lake.py` algorithm. It is the oracle of the contract; mssql-ducklake owns the real importer.
+this API into a DuckDB database standing in for the lake — the chain check, delete by page in the
+table the base IAM image names (`base_au_id`), insert from the scan, the mirror, the allocation
+images, the LOB base — E1's `lake.py` algorithm with need 6's delete. It is the oracle of the
+contract; mssql-ducklake owns the real importer.
 
 **Chains** (oracle lane, generated from E1's scripts `experiments/E1/sql/`): chain A F0 → D1 → D2 → F1
 (incremental) → D3 → D4 → D5 → F2 (incremental) → D6 → D7; A' with a no-change diff; B with D1
@@ -375,13 +443,17 @@ applies the ownership rule (need 12) and every table equals RESTORE as a multise
 from the rowset's current `numpart`, row), as E7's `e7lake.py` checked.
 
 **Counterfactuals become assertions on the reader's outputs** (E1§4): the TRUNCATE'd pages of D2 are
-in `freed`; a page that changed owner is `changed` in D2 and its old rows go through delete by page;
-`since_lsn` = LastLSN misses the stale pages of a fuzzy full (E3§7.5, a fixture from E3's workload);
+in `freed`; a page that changed owner is `changed` in D2 with the truncated table's AU as
+`base_au_id`, and its old rows go through delete by page in that table; deleting every page from the
+table its `base_au_id` names gives the same lake as deleting it from every table, which E1 and E7
+replayed; `since_lsn` = LastLSN misses the stale pages of a fuzzy full (E3§7.5, a fixture from E3's workload);
 a `.WRITE` value resolved through D6 step 2 equals the server's, and reuse by `_mssql_rid` would not;
 the five SWITCH variants report `au_moved` for exactly the switched AUs (columnstore: rowsets), and
 the reference importer without the ownership rule fails them as E7§5 measured (560 rows left in
 `m_ci`; after SWITCH + one UPDATE, 263 rows behind); without `dead_au`, s10 keeps 9,000 truncated rows;
-SPLIT / MERGE renumbering reports no `au_moved`.
+SPLIT / MERGE renumbering reports no `au_moved`; a base image of an IAM page the file freed, left in
+`base`, attributes no page; `mssql_backup_allocation` over images that leave a page the lake gets
+rows of off its header AU's chain refuses by name, and so does an export over them.
 
 **D4's edge case**: a fixture that frees a page before a full while another page of its extent keeps
 changing, with a long transaction open across the full, then a differential whose PFS page for that
@@ -394,8 +466,11 @@ Acceptance:
 2. `mssql_backup_chain_check` refuses the wrong-base and out-of-order files of E1§3 and accepts E6's
    overlapping D5 (same FirstLSN as F3, later CheckpointLSN).
 2a. E7's fifteen differentials replay exactly through the reference importer, ownership rule included.
-3. The export's page runs, applied as positional deletes to the exported files, delete exactly the
-   rows the native `DELETE … WHERE _mssql_page IN (…)` deletes, on every chain step.
+3. `DELETE … WHERE _mssql_page IN (…)` with each table's delete set (the `changed`, `freed`,
+   `dead_au`, `gone_au`, `dead_rowgroup` and, with 090, `pending_applied` pages with `holds_rows`
+   whose `from_object_id` is that table) removes exactly the lake rows the file no longer has there,
+   on every chain step, and the `au_moved` pages name exactly the rows a SWITCH moves (E7's five
+   variants).
 4. A differential alone without `base` is refused by name; with `base`, it decodes.
 5. Every D6 refusal names table, row, column and node.
 6. An export retried with the same units produces identical files (bytes, given the same writer
@@ -411,8 +486,11 @@ Acceptance:
 2. Base inputs: side connection, `read_parquet`, schemas, validators — 3 d
 3. Lake-mode liveness with base allocation images; the catalog from mirror ⊕ file — 4 d
 4. `mssql_backup_changed_pages`: changed, freed runs, dead and gone AUs, `au_moved` (E7's
-   ownership comparison) — 4 d
-5. `mssql_backup_allocation` — 1 d
+   ownership comparison); each page's `base_au_id` from the base IAM chains (the walk from each AU's
+   first IAM, liveness in the base images, the double-claim refusal), `holds_rows`, the base pages of
+   every dead, gone and moved AU, `expand` — 6 d
+5. `mssql_backup_allocation`: lake mode, the attribution check (task 4's chain walk over the
+   returned images) — 1.5 d
 6. `_mssql_rid` of base tables; `mssql_backup_catalog` with `since_lsn` — 1 d
 7. `_mssql_lob`, the hybrid walk, root identity, `text_exact`, refusals — 5 d
 8. `mssql_backup_chain_check` — 1.5 d
@@ -424,16 +502,17 @@ Acceptance:
 
 11. `mssql_backup_export_plan`: heap ranges, clustered key ranges from level-1 pages, partitions,
     changed sets — 3 d
-12. `mssql_backup_export`: parallel Parquet writers, rotation, naming, page-run files, statistics
-    rows, retry determinism; `partition_by` and `order_by` (the sort when physical order does not
-    satisfy it), `parquet_options` — 7 d
+12. `mssql_backup_export`: parallel Parquet writers, rotation, naming, statistics rows, retry
+    determinism; `partition_by` and `order_by` (the sort when physical order does not satisfy it),
+    `parquet_options`; the attribution check repeated on the written pages — 6 d
 
 **Across PRs**
 
 13. Docs (README, `DATAMODEL.md`: the incremental flow and its diagram, CLAUDE.md, CHANGELOG) — 1 d
 
-**Total ≈ 40 days, 8 weeks** (PR 1 ≈ 29 days; PR 2 ≈ 10 days; 37 before E7's ownership rule and the
-DuckLake layout parameters joined tasks 4, 9 and 12). R§8 did not cost the reader's incremental API
+**Total ≈ 41.5 days, 8.5 weeks** (PR 1 ≈ 31.5 days; PR 2 ≈ 9 days; 37 before E7's ownership rule
+and the DuckLake layout parameters joined tasks 4, 9 and 12, 40 before the IAM chain walk and the
+attribution check joined tasks 4, 5 and 12). R§8 did not cost the reader's incremental API
 separately (phase 2's 3–4 weeks are mssql-ducklake's import).
 
 ## Risks and open questions
@@ -443,28 +522,43 @@ separately (phase 2's 3–4 weeks are mssql-ducklake's import).
   because it uses the base image only when the file has none.
 - **Where a splice's old bytes come from** (D6) is undecided between three designs; until DQ-01 is
   answered, task 7 cannot fix `_mssql_lob`'s shape or `lob.parquet`'s `value`.
-- **Sorted export** (`order_by` not satisfied by physical order) makes the page map grow towards one
-  run per row, and a sorted columnstore unit loses the tuple runs 088 D3 relies on. Whether the
-  importer proposes such a sort at all is DQ-25.
+- **Delete pruning is expected, not measured.** A `DELETE` by `_mssql_page` should read only the
+  `_mssql_page` column of the files its min/max statistics cannot exclude. `_mssql_page` is
+  `0x01 ‖ u16 file ‖ u32 page`, big-endian (file id, page id), so within that shape byte order is page
+  order; files written in physical order (the default) hold contiguous pages, so a changed page should
+  touch few files. A lake sort order (022 D5 / DuckLake `SET SORTED BY`; `order_by` not satisfied by
+  physical order) scatters a page's rows over many files and makes a delete scan more of them — a
+  cost, never a wrong row; the importer proposes no such sort (DQ-25, accepted), but a user may
+  declare one. Two checks, mssql-ducklake's (022 task 11, 023 D4 / task 6), measured after N
+  differentials and after a `merge_adjacent_files`:
+  - DuckLake keeps min/max for a BLOB column (if not, the delete scans every file of the table;
+    still correct);
+  - a `DELETE … WHERE _mssql_page IN (SELECT …)` prunes files at all (if not, the expansion runs one
+    `DELETE` per contiguous page range with constant bounds, `_mssql_page BETWEEN x AND y` plus the
+    `IN`).
+
+  `skip_stats_columns` must not include `_mssql_page`.
 - **The side connection** inside a running query is a precedent in DuckLake and duckdb-iceberg, not
   yet in this extension: prototype it first (task 2).
 - **Base files can be large** after a heavy LOB change (they carry every deleted row's LOB values).
 - **Second GAM interval** (files over 4 GB) and **SHRINKFILE … EMPTYFILE** were not exercised
   (E2§10).
-- **Columnstore** under a differential is unmeasured (088 E11); its units and `_mssql_rowgroup` runs
-  wait for it.
-- **DuckLake compaction** moves positions (research-ducklake-import §5): mssql-ducklake's concern, but
-  the export's page runs are only valid until then.
+- **Columnstore** under a differential is unmeasured (088 E11); its units, the delete-bitmap
+  output (newly deleted tuples by rowgroup key and `_mssql_rid`) and the SWITCH of a partition with
+  an OPEN delta store wait for it.
+- **DuckLake compaction** and `CHECKPOINT` move rows between files; that changes nothing for the
+  importer, which refers to no file position, only the delete cost above when a compaction re-sorts.
 - Open for the owner ([decisions.md](../085-backup-reader-core/decisions.md)): D6's source of old LOB bytes (DQ-01) and the
   `_mssql_lob` shape (DQ-02), D10's side-input mechanism (DQ-12), the export living in mssql (D9;
   DQ-18).
 
 ## References
 
-- RESEARCH.md §5 (row identity), §6.2 (the import: one snapshot per file, Parquet first, positional
-  deletes, the operating model, why a differential needs nothing but itself and the lake, what still
+- RESEARCH.md §5 (row identity), §6.2 (the import: one snapshot per file, Parquet first, deletes by
+  `_mssql_page`, the operating model, why a differential needs nothing but itself and the lake, what still
   needs older bytes, prototype rules 1–8).
-- research-ducklake-import.md §4 (export then one commit), §5 (page map, physical order), §7
+- research-ducklake-import.md §4 (export then one commit), §5 (deletes by `_mssql_page`, the delete
+  set, physical order, the cost of a delete), §7
   (partitioning), §8 (where things live, worker connections), §9 (pipelines, side state).
 - E1 short answer, §2 (lake layout), §3, §4.2–§4.5, §4.8, §5 rules 1–11.
 - E2 §0 R1–R11, §1–§5, §9.
