@@ -35,7 +35,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test code-pages-generate code-pages-tables test-code-page test-code-page-portable bench-code-page bench-code-page-tiers test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check help
+.PHONY: azure-test code-pages-generate code-pages-tables test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -898,6 +898,21 @@ bench-code-page: release
 	$(CXX) $(BENCH_UTF16_FLAGS) $(BENCH_UTF16_INCLUDES) test/cpp/bench_code_page.cpp $(CODE_PAGE_SOURCES) \
 	    $(BENCH_UTF16_LIBS) -o build/test/bench_code_page
 	build/test/bench_code_page
+
+# Spec 091 / 092 D12: one column of a 2048-row chunk, staging to finished vector: today's
+# NVARCHAR path (the production codec::string::DecodeChunkFromStaging) against
+# code_page::DecodeColumn and DecodeValues + a string_t loop. Manual target, not in CI.
+# Links the release libduckdb like bench-materialize (defined below); needs a release build.
+bench-code-page-column:
+	@mkdir -p build/test
+	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ] || ! ls build/release/src/libduckdb* >/dev/null 2>&1; then \
+		echo "ERROR: no release build found; run 'make release' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(BENCH_MAT_FLAGS) -DNDEBUG $(BENCH_UTF16_INCLUDES) test/cpp/bench_code_page_column.cpp \
+	    $(BENCH_MAT_SOURCES) src/codec/staging/column_staging.cpp $(CODE_PAGE_SOURCES) \
+	    $(BENCH_UTF16_LIBS) -L build/release/src -lduckdb -o build/test/bench_code_page_column
+	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/bench_code_page_column
 
 # Spec 054 D1: materialization microbenchmark (string decode / fixed decode /
 # bcp encode groups). Manual target; NOT part of `make test` or CI.

@@ -803,7 +803,12 @@ path) is spec 091's follow-up.
   an all-ASCII chunk first. Every decode writes at most `STORE_SLACK` (16) bytes
   past the length it returns; `DecodeToUtf16` nothing past n units. The NEON
   planes are built once per page, found by `CodePageTable::index`, so a table is
-  always one `FindCodePage` returned. Pages 1251, 1252 and 874 run kernels
+  always one `FindCodePage` returned. `DecodeColumn` takes a chunk's column
+  whole (spec 092 D12): the UTF-8 into the vector's heap and each row's
+  `string_t` (`StringView16`) in the same pass, from the masks the kernel
+  records for each 16 input bytes that are not all ASCII (an ASCII step stores
+  nothing: on Apple M4 a second store stream beside the output costs the core
+  its whole-line writes). Pages 1251, 1252 and 874 run kernels
   specialised to the page (the column's code page is always known): the run's
   arithmetic with literal constants, the exceptions in the smallest window (80–9F
   for 1252, 80–BF for 1251), and Thai written by one `vst3q_u8` per block (spec 091

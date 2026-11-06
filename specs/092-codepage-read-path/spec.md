@@ -343,9 +343,18 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
        the zeros, with a second pass when a value holds a U+0000 of its own
        (`src/codec/string_codec.cpp:546-579`). Code-page bytes hold 0x00 as freely, which the masks
        never see as a boundary.
-     - This is one new entry of 091's module, `DecodeValues`' contract for values staged back to
-       back, made in this spec's PR with its unit test, fuzz oracle (equal to `DecodeValues` value
-       by value) and benchmark row. Its x86-64 form is the scalar loop until 091's follow-up.
+     - This is `code_page::DecodeColumn`, made in 091's x86 PR (#528) ahead of this spec: two
+       blocks in (the staged bytes, offsets / lengths and validity), two out (the UTF-8, decoded
+       straight into the vector's heap, and each row's `string_t`, written as `StringView16` into
+       the vector's data -- no loop over the values after it). The kernel records the masks of
+       each 16 input bytes that are not all ASCII (an ASCII step stores nothing), per 16 KB block;
+       the granules' output positions come from a prefix over the masks. Measured on Apple M4
+       against the production `DecodeChunkFromStaging` (`make bench-code-page-column`, one
+       column of 2048 rows, staging to finished vector): 1.1-2.4x faster in every cell but long
+       1251 text with dense typography (0.9-1.35x, by the text: the kernel's own branches). Its
+       x86-64 form takes the AVX2 / AVX-512 kernels value by value until they record steps.
+       The unit test checks it against the server's answers; the fuzz oracle (equal to
+       `DecodeValues` value by value) is to add.
   - A double-byte page (raw scans only, D10) takes `DecodeValues`: a pair must not cross two values,
     and its kernel has no masks.
 

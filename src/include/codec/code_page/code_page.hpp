@@ -133,6 +133,37 @@ size_t DecodeToUtf16(const CodePageTable &page, const uint8_t *src, size_t n, ch
 size_t DecodeValues(const CodePageTable &page, const uint8_t *src, size_t src_size, const uint32_t *offsets,
 					const uint32_t *lengths, size_t count, char *dst, uint64_t *out_offsets, uint32_t *out_lengths);
 
+//! A string view of 16 bytes in DuckDB's string_t layout (the Umbra form), which
+//! DecodeColumn writes so a chunk's vector needs no loop of its own over the
+//! values. Little-endian words:
+//!   lo: the length in its low 32 bits, then the value's first 4 bytes;
+//!   hi: for a length up to the inline length, the value's bytes 4-11; past
+//!       it, the address of the value's first byte.
+//! An inlined view is zero past the length (string_t compares the words). With
+//! an inline length of 0 (DuckDB's DUCKDB_DEBUG_NO_INLINE) lo carries no
+//! prefix. Spec 092's wrapper checks the layout against duckdb::string_t.
+struct StringView16 {
+	uint64_t lo;
+	uint64_t hi;
+};
+
+//! Decode one column of a chunk (spec 092 D12): `count` rows, row r valid when
+//! bit r of `validity` is set (DuckDB's ValidityMask words; nullptr: all valid)
+//! with its value at src[offsets[r], offsets[r] + lengths[r]). The valid rows'
+//! values lie back to back in row order and end at src_size, as the read
+//! path's binary staging lays them out; a NULL row's offset and length are not
+//! read. Writes their UTF-8 back to back into dst (Utf8Bound(src_size) bytes)
+//! and row r's view into views[r] -- a NULL row's is empty --, pointing into
+//! dst and inline up to `inline_length` bytes (string_t::INLINE_LENGTH: 12, or 0
+//! under DUCKDB_DEBUG_NO_INLINE; no other value). On a
+//! single-byte page with SIMD the views come from what the kernel records as
+//! it decodes (each 16 input bytes' output position and masks), one pass over
+//! the bytes and none over the output; otherwise value by value (a double-byte
+//! pair must not cross two values). Returns the bytes written to dst.
+size_t DecodeColumn(const CodePageTable &page, const uint8_t *src, size_t src_size, const uint32_t *offsets,
+					const uint32_t *lengths, const uint64_t *validity, size_t count, char *dst, StringView16 *views,
+					size_t inline_length);
+
 //! The exact UTF-8 length of n code-page bytes, for an output too large to
 //! size at 3 bytes per input byte (a chunk past ~1.4 GB of payload). A decode
 //! into it still needs STORE_SLACK bytes after that length.
