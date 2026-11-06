@@ -675,9 +675,18 @@ SPLITTER_TESTS = [
     # really still inside: a macro body that closes a paren it never opened
     # would otherwise unwind the enclosing brace block, and every `;` after it
     # would stop splitting -- the brace bug again, one statement per file.
+    #
+    # The closer sits inside a LAMBDA BODY within a call's parens, which is
+    # what makes the fixture able to fail. My first version put it in a plain
+    # function body, where the stack at the stray `)` is just [brace]: a
+    # version that popped whatever was on top would leave the stack EMPTY, and
+    # an empty stack splits on `;` too, so the finding still landed on line 3
+    # and the test passed on the broken code (roborev on 5850652). Here the
+    # stack is [paren, brace], so a wrong pop leaves [paren] -- the `;` after
+    # `a)` then does not split, and the finding moves to line 2.
     (
         "an unmatched closer does not unwind the enclosing brace context",
-        'void f() {\n\tint x = a);\n\tfprintf(stderr, "%s", password);\n}',
+        'auto ok = Run([&]() {\n\tint x = a);\n\tfprintf(stderr, "%s", password);\n\treturn x;\n});',
         3,
     ),
 ]
