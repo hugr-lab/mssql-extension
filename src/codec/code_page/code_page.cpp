@@ -1054,28 +1054,63 @@ inline void StartsFromMasks(const uint32_t *masks, size_t granules, uint16_t *st
 #endif
 }
 
+//! A row's view into `view`, string_t's layout (StringView16), from the `length` UTF-8 bytes
+//! at `data`, or zero for a NULL row: no branch. Reads 16 bytes at data (dst has STORE_SLACK
+//! past its end): [length][bytes 0-11] by one byte shift, cut at the length for the inline
+//! form; its first 8 bytes and the address for the pointer form.
+inline void WriteView(StringView16 *view, const char *data, uint32_t length, size_t inline_length, bool valid) {
+	static const uint8_t IOTA[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+	const unsigned kept = 4 + (length < 12 ? length : 12);	// the inline form's bytes: length + value
+	const bool inlined = length <= inline_length;
+#if defined(MSSQL_CODE_PAGE_NEON)
+	const uint8x16_t bytes = vld1q_u8(reinterpret_cast<const uint8_t *>(data));
+	const uint8x16_t shifted = vextq_u8(vreinterpretq_u8_u32(vdupq_n_u32(length)), bytes, 12);
+	const uint8x16_t inline_form = vandq_u8(shifted, vcltq_u8(vld1q_u8(IOTA), vdupq_n_u8(static_cast<uint8_t>(kept))));
+	// DUCKDB_DEBUG_NO_INLINE (inline length 0) keeps the prefix zero.
+	const uint64_t lo = inline_length != 0 ? vgetq_lane_u64(vreinterpretq_u64_u8(shifted), 0) : length;
+	const uint8x16_t pointer_form = vreinterpretq_u8_u64(
+		vcombine_u64(vcreate_u64(lo), vcreate_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data)))));
+	const uint8x16_t form = vbslq_u8(vdupq_n_u8(inlined ? 0xFF : 0), inline_form, pointer_form);
+	vst1q_u8(reinterpret_cast<uint8_t *>(view), vandq_u8(form, vdupq_n_u8(valid ? 0xFF : 0)));
+#else
+	const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data));
+	const __m128i shifted = _mm_or_si128(_mm_slli_si128(bytes, 4), _mm_cvtsi32_si128(static_cast<int>(length)));
+	const __m128i inline_form =
+		_mm_and_si128(shifted, _mm_cmplt_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(IOTA)),
+											  _mm_set1_epi8(static_cast<char>(kept))));
+	const __m128i lo = inline_length != 0 ? shifted : _mm_cvtsi32_si128(static_cast<int>(length));
+	const __m128i pointer_form =
+		_mm_unpacklo_epi64(lo, _mm_cvtsi64_si128(static_cast<long long>(reinterpret_cast<uintptr_t>(data))));
+	const __m128i pick = _mm_set1_epi32(inlined ? -1 : 0);
+	const __m128i form = _mm_or_si128(_mm_and_si128(pick, inline_form), _mm_andnot_si128(pick, pointer_form));
+	_mm_storeu_si128(reinterpret_cast<__m128i *>(view), _mm_and_si128(form, _mm_set1_epi32(valid ? -1 : 0)));
+#endif
+}
+
 //! DecodeColumn on a single-byte page through a recording kernel, COLUMN_BLOCK input bytes
 //! at a time: the kernel decodes them and records the masks of each 16 that are not all
 //! ASCII (an ASCII step stores nothing: the masks start zeroed, and are zeroed again only
 //! after a block that was not all ASCII); each 16's output position is then 16 per granule
-//! before it plus the mask bits before it, and each value that starts in the block takes its
-//! output offset from those (its view is written once the next value's offset ends it).
-//! Nothing reads the input or the output again. `decode(p, end, d, recorder)` is the kernel.
-//!
-//! Why the masks and not the positions: a second stream of stores in the kernel's loop, beside
-//! its output, costs about four cycles a 32-byte step on Apple M4 (a copy loop measured 4-6x
-//! slower with one 8-byte store a step to another array), so the ASCII step, the common one,
-//! stores nothing.
-template <class Decode>
-size_t DecodeColumnRecorded(const uint8_t *src, size_t src_size, const uint32_t *offsets, const uint64_t *validity,
-							size_t count, char *dst, StringView16 *views, size_t inline_length, Decode decode) {
+//! before it plus the mask bits before it. Per block, two tight loops:
+//!   A: every row whose bytes start in the block gets its output offset, kept in its view
+//!      until B -- a NULL row the offset where the next value starts, so a row's length is
+//!      the next row's offset minus its own (offsets / lengths loaded for every row, so the
+//!      validity is a select, not a branch);
+//!   B: the views of the rows A's offsets now end (WriteView, a NULL row's zero), while the
+//!      block's output is still in cache; the last rows after the last block.
+//! Nothing reads the input again. `decode(p, end, d, recorder)` is the kernel. ALL_VALID:
+//! validity is nullptr -- a caller with no NULL in the chunk passes nullptr (no bit tests).
+template <bool ALL_VALID, class Decode>
+size_t DecodeColumnRecorded(const uint8_t *src, size_t src_size, const uint32_t *offsets, const uint32_t *lengths,
+							const uint64_t *validity, size_t count, char *dst, StringView16 *views,
+							size_t inline_length, Decode decode) {
 	// Room for StartsFromMasks' last 8 (it reads and writes whole groups of 8).
 	uint32_t masks[COLUMN_BLOCK / BLOCK + 8] = {};
 	uint16_t starts[COLUMN_BLOCK / BLOCK + 8];
 	char *d = dst;
 	size_t row = 0;
-	size_t prev_row = 0, prev_out = 0;
-	bool have_prev = false;
+	size_t next_in = 0;	 // where the next valid value starts: a NULL row's input offset
+	size_t done = 0;	 // rows whose views are written
 	size_t b0 = 0;
 	for (;;) {
 		const size_t b1 = src_size - b0 > COLUMN_BLOCK ? b0 + COLUMN_BLOCK : src_size;
@@ -1086,25 +1121,27 @@ size_t DecodeColumnRecorded(const uint8_t *src, size_t src_size, const uint32_t 
 		recorder.masks = masks;
 		recorder.in = src + b0;
 		d = decode(src + b0, src + b1, d, recorder);
+		const size_t end_out = static_cast<size_t>(d - dst);
 		// A block whose output is as long as its input was all ASCII: a value's output offset
 		// is its input offset, and no granule positions are needed.
-		const bool ascii = static_cast<size_t>(d - dst) - block_out == b1 - b0;
+		const bool ascii = end_out - block_out == b1 - b0;
 		if (!ascii) {
 			StartsFromMasks(masks, granules, starts);
 		}
 		for (; row < count; row++) {
-			if (!RowValid(validity, row)) {
-				views[row].lo = 0;
-				views[row].hi = 0;
-				continue;
-			}
-			const size_t x = offsets[row];
+			const bool valid = ALL_VALID || RowValid(validity, row);
+			// Loaded whatever the row (a NULL row's slots are allocated, their values unused),
+			// so the choice is a select, not a branch on the validity bit.
+			const size_t offset = offsets[row];
+			const size_t length = lengths[row];
+			const size_t x = valid ? offset : next_in;
 			if (x >= b1 && !last) {
 				break;
 			}
+			next_in = valid ? offset + length : next_in;
 			size_t out;
 			if (x == b1) {
-				out = static_cast<size_t>(d - dst);	 // a value that starts where the input ends: empty
+				out = end_out;	// a value (or NULL) where the input ends: empty
 			} else if (ascii) {
 				out = block_out + (x - b0);
 			} else {
@@ -1114,12 +1151,13 @@ size_t DecodeColumnRecorded(const uint8_t *src, size_t src_size, const uint32_t 
 				// The multi-byte and the 3-byte bytes before the value's first, in one count.
 				out = block_out + starts[k] + r + PopCount(masks[k] & (below | (below << 16)));
 			}
-			if (have_prev) {
-				views[prev_row] = MakeView(dst + prev_out, static_cast<uint32_t>(out - prev_out), inline_length);
-			}
-			prev_row = row;
-			prev_out = out;
-			have_prev = true;
+			views[row].lo = out;
+		}
+		// The views of the rows the next row's offset now ends, while their output is in cache.
+		for (; done + 1 < row; done++) {
+			const size_t start = views[done].lo;
+			WriteView(views + done, dst + start, static_cast<uint32_t>(views[done + 1].lo - start), inline_length,
+					  ALL_VALID || RowValid(validity, done));
 		}
 		if (last) {
 			break;
@@ -1129,11 +1167,14 @@ size_t DecodeColumnRecorded(const uint8_t *src, size_t src_size, const uint32_t 
 		}
 		b0 = b1;
 	}
-	if (have_prev) {
-		views[prev_row] =
-			MakeView(dst + prev_out, static_cast<uint32_t>(static_cast<size_t>(d - dst) - prev_out), inline_length);
+	const size_t total = static_cast<size_t>(d - dst);
+	for (size_t r = done; r < count; r++) {
+		const size_t start = views[r].lo;
+		const size_t next = r + 1 < count ? views[r + 1].lo : total;
+		WriteView(views + r, dst + start, static_cast<uint32_t>(next - start), inline_length,
+				  ALL_VALID || RowValid(validity, r));
 	}
-	return static_cast<size_t>(d - dst);
+	return total;
 }
 
 #endif
@@ -1357,8 +1398,9 @@ size_t DecodeColumn(const CodePageTable &page, const uint8_t *src, size_t src_si
 					size_t inline_length) {
 	assert(inline_length == 0 || inline_length == 12);
 #ifndef NDEBUG
-	// The recorded path ends a value where the next valid one starts and never reads lengths:
-	// the values must lie back to back, ending at src_size, or it and the by-value path differ.
+	// The recorded path ends a value where the next valid one starts (it reads lengths only to
+	// place the NULL rows): the values must lie back to back, ending at src_size, or it and the
+	// by-value path differ.
 	{
 		size_t next = 0;
 		for (size_t row = 0; row < count; row++) {
@@ -1379,25 +1421,34 @@ size_t DecodeColumn(const CodePageTable &page, const uint8_t *src, size_t src_si
 		// The kernel is built inside the call, once a block: a local whose address does not
 		// escape keeps its constants in registers (a captured one is reloaded after every
 		// store through the output, which a char store may alias).
-		return DecodeColumnRecorded(src, src_size, offsets, validity, count, dst, views, inline_length,
-									[&page](const uint8_t *p, const uint8_t *end, char *d, StepRecorder recorder) {
-										const NeonKernel kernel(page);
-										return DecodeNeonFor(kernel, page.code_page, p, end, d, recorder);
-									});
+		const auto decode = [&page](const uint8_t *p, const uint8_t *end, char *d, StepRecorder recorder) {
+			const NeonKernel kernel(page);
+			return DecodeNeonFor(kernel, page.code_page, p, end, d, recorder);
+		};
+		return validity == nullptr ? DecodeColumnRecorded<true>(src, src_size, offsets, lengths, validity, count, dst,
+																views, inline_length, decode)
+								   : DecodeColumnRecorded<false>(src, src_size, offsets, lengths, validity, count, dst,
+																 views, inline_length, decode);
 	}
 #elif defined(MSSQL_CODE_PAGE_RECORDS)
 	const detail::Isa isa = detail::ActiveIsa();
 	if (isa == detail::Isa::Avx512) {
-		return DecodeColumnRecorded(src, src_size, offsets, validity, count, dst, views, inline_length,
-									[&page](const uint8_t *p, const uint8_t *end, char *d, StepRecorder recorder) {
-										return detail::DecodeSingleByteAvx512(page, p, end, d, recorder);
-									});
+		const auto decode = [&page](const uint8_t *p, const uint8_t *end, char *d, StepRecorder recorder) {
+			return detail::DecodeSingleByteAvx512(page, p, end, d, recorder);
+		};
+		return validity == nullptr ? DecodeColumnRecorded<true>(src, src_size, offsets, lengths, validity, count, dst,
+																views, inline_length, decode)
+								   : DecodeColumnRecorded<false>(src, src_size, offsets, lengths, validity, count, dst,
+																 views, inline_length, decode);
 	}
 	if (isa == detail::Isa::Avx2) {
-		return DecodeColumnRecorded(src, src_size, offsets, validity, count, dst, views, inline_length,
-									[&page](const uint8_t *p, const uint8_t *end, char *d, StepRecorder recorder) {
-										return detail::DecodeSingleByteAvx2(page, p, end, d, recorder);
-									});
+		const auto decode = [&page](const uint8_t *p, const uint8_t *end, char *d, StepRecorder recorder) {
+			return detail::DecodeSingleByteAvx2(page, p, end, d, recorder);
+		};
+		return validity == nullptr ? DecodeColumnRecorded<true>(src, src_size, offsets, lengths, validity, count, dst,
+																views, inline_length, decode)
+								   : DecodeColumnRecorded<false>(src, src_size, offsets, lengths, validity, count, dst,
+																 views, inline_length, decode);
 	}
 #endif
 	return DecodeColumnByValue<false>(page, src, src_size, offsets, lengths, validity, count, dst, views,

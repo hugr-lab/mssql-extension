@@ -20,8 +20,14 @@
 //   auto       validate_ascii + memcpy when ASCII, else 2-stage.
 //   direct     DecodeToUtf8 over the whole payload as one string (the NEON kernel on arm64
 //              for a single-byte page).
-//   utf16      simdutf::convert_utf16le_to_utf8 over the same text as UTF-16LE: what the
-//              read path runs today, after the server's CAST to NVARCHAR.
+//   utf16      simdutf::convert_utf16le_to_utf8 over the same text as UTF-16LE: the
+//              conversion the read path runs today, after the server's CAST to NVARCHAR.
+//   today      the whole of that path, as codec::string::DecodeChunkImpl does it (copied
+//              here so this bench needs no DuckDB): the UTF-16 staged with a U+0000 after
+//              each value, one simdutf call, then the walk for the delimiters (the SWAR
+//              sweep, or memchr past 256 output bytes a value) and each string_t -- against
+//              column, which makes the same views. make bench-code-page-column runs the
+//              production function itself.
 // Reported per value, with the bytes each form puts on the wire.
 
 #include "codec/code_page/code_page.hpp"
@@ -52,6 +58,10 @@ struct Chunk {
 	std::vector<uint8_t> payload;
 	std::vector<uint32_t> offsets, lengths;
 	std::vector<char16_t> utf16;
+	//! The same values as the read path stages them today: UTF-16LE, a U+0000 after each;
+	//! offsets / lengths in bytes, without the delimiter.
+	std::vector<char16_t> delimited;
+	std::vector<uint32_t> u16_offsets, u16_lengths;
 	size_t utf8_bytes = 0;
 };
 
@@ -183,7 +193,101 @@ Chunk Make(const char *name, int code_page, Gen gen, std::mt19937 &rng) {
 	c.utf16.resize(c.utf8_bytes + 1);
 	const size_t units = simdutf::convert_utf8_to_utf16le(utf8.data(), c.utf8_bytes, c.utf16.data());
 	c.utf16.resize(units);
+	std::vector<char> value_utf8;
+	std::vector<char16_t> value_utf16;
+	for (size_t i = 0; i < VALUES; i++) {
+		value_utf8.resize(Utf8Bound(c.lengths[i]));
+		const size_t n = DecodeToUtf8(*c.page, c.payload.data() + c.offsets[i], c.lengths[i], value_utf8.data());
+		value_utf16.resize(n + 1);
+		const size_t u = simdutf::convert_utf8_to_utf16le(value_utf8.data(), n, value_utf16.data());
+		c.u16_offsets.push_back(static_cast<uint32_t>(c.delimited.size() * 2));
+		c.u16_lengths.push_back(static_cast<uint32_t>(u * 2));
+		c.delimited.insert(c.delimited.end(), value_utf16.begin(), value_utf16.begin() + u);
+		c.delimited.push_back(0);
+	}
 	return c;
+}
+
+//! string_t's constructor: inline up to 12 bytes (zero past them), else prefix + pointer.
+inline void StringT(StringView16 *view, const char *data, uint32_t length) {
+	unsigned char bytes[12] = {0};
+	if (length <= 12) {
+		memcpy(bytes, data, length);
+		uint32_t prefix;
+		memcpy(&prefix, bytes, 4);
+		view->lo = length | (static_cast<uint64_t>(prefix) << 32);
+		memcpy(&view->hi, bytes + 4, 8);
+	} else {
+		uint32_t prefix;
+		memcpy(&prefix, data, 4);
+		view->lo = length | (static_cast<uint64_t>(prefix) << 32);
+		view->hi = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data));
+	}
+}
+
+//! codec::string::FindDelimiter: memchr, or a SWAR sweep 8 bytes a step.
+template <bool MEMCHR>
+inline size_t FindDelimiter(const char *data, size_t from, size_t limit) {
+	if (MEMCHR) {
+		const void *hit = std::memchr(data + from, 0, limit - from);
+		return hit ? static_cast<size_t>(static_cast<const char *>(hit) - data) : limit;
+	}
+	size_t i = from;
+	while (i + 8 <= limit) {
+		uint64_t word;
+		std::memcpy(&word, data + i, 8);
+		if (((word - 0x0101010101010101ULL) & ~word & 0x8080808080808080ULL) != 0) {
+			for (size_t k = i; k < i + 8; k++) {
+				if (data[k] == 0) {
+					return k;
+				}
+			}
+		}
+		i += 8;
+	}
+	while (i < limit && data[i] != 0) {
+		i++;
+	}
+	return i;
+}
+
+//! codec::string::DecodeChunkImpl, all rows valid: one conversion, then the ASCII shortcut
+//! (offsets halved) or the walk for the delimiters, each value's string_t.
+size_t Today(const Chunk &c, char *blob, StringView16 *views) {
+	const size_t units = c.delimited.size();
+	const size_t written = simdutf::convert_utf16le_to_utf8(c.delimited.data(), units, blob);
+	if (written == units) {
+		for (size_t row = 0; row < VALUES; row++) {
+			StringT(views + row, blob + c.u16_offsets[row] / 2, c.u16_lengths[row] / 2);
+		}
+		return written;
+	}
+	size_t offset = 0;
+	const bool use_memchr = written / VALUES >= 256;
+	for (size_t row = 0; row < VALUES; row++) {
+		const size_t delimiter =
+			use_memchr ? FindDelimiter<true>(blob, offset, written) : FindDelimiter<false>(blob, offset, written);
+		StringT(views + row, blob + offset, static_cast<uint32_t>(delimiter - offset));
+		offset = delimiter + 1;
+	}
+	return written;
+}
+
+//! The views' strings, for comparing two ways that make views.
+std::vector<std::string> ViewStrings(const std::vector<StringView16> &views) {
+	std::vector<std::string> out;
+	for (const StringView16 &v : views) {
+		const uint32_t length = static_cast<uint32_t>(v.lo);
+		if (length <= 12) {
+			char bytes[12];
+			memcpy(bytes, reinterpret_cast<const char *>(&v.lo) + 4, 4);
+			memcpy(bytes + 4, &v.hi, 8);
+			out.emplace_back(bytes, length);
+		} else {
+			out.emplace_back(reinterpret_cast<const char *>(static_cast<uintptr_t>(v.hi)), length);
+		}
+	}
+	return out;
 }
 
 volatile size_t sink;
@@ -234,7 +338,8 @@ int main() {
 	chunks.push_back(Make("thai 874", 874, Thai874, rng));
 	chunks.push_back(Make("japanese 932", 932, Japanese932, rng));
 
-	static const char *const NAMES[] = {"fused", "column", "2-pass", "2-stage", "ascii64", "auto", "direct", "utf16"};
+	static const char *const NAMES[] = {"fused", "column", "2-pass", "2-stage", "ascii64",
+										"auto",	 "direct", "utf16",	 "today"};
 	const size_t ways = sizeof(NAMES) / sizeof(NAMES[0]);
 	std::printf("ns per value, median of %d interleaved rounds; 2048 values per chunk\n", ROUNDS);
 	std::printf("%-26s %7s %7s |", "workload", "cp KB", "u16 KB");
@@ -248,7 +353,8 @@ int main() {
 		std::vector<uint64_t> out_offsets(VALUES);
 		std::vector<uint32_t> out_lengths(VALUES);
 		std::vector<char16_t> scratch(c.payload.size() + 1);
-		std::vector<StringView16> views(VALUES);
+		std::vector<StringView16> views(VALUES), today_views(VALUES);
+		std::vector<char> today_blob(c.delimited.size() * 3 + 64);
 		const int reps = static_cast<int>(std::max<size_t>(50, 40000000 / (c.payload.size() + 1)));
 
 		auto fused = [&]() {
@@ -291,10 +397,12 @@ int main() {
 		};
 		auto direct = [&]() { return DecodeToUtf8(*c.page, c.payload.data(), c.payload.size(), dst.data()); };
 		auto utf16 = [&]() { return simdutf::convert_utf16le_to_utf8(c.utf16.data(), c.utf16.size(), dst16.data()); };
-		const std::vector<std::function<size_t()>> run = {fused,   column,	two_pass, twostage,
-														  ascii64, autosel, direct,	  utf16};
-		const std::vector<const char *> output = {dst.data(), dst.data(), dst.data(), dst.data(),
-												  dst.data(), dst.data(), dst.data(), dst16.data()};
+		auto today = [&]() { return Today(c, today_blob.data(), today_views.data()); };
+		const std::vector<std::function<size_t()>> run = {fused,   column, two_pass, twostage, ascii64,
+														  autosel, direct, utf16,	 today};
+		// today writes its delimiters into its output: it is checked by its views instead.
+		const std::vector<const char *> output = {dst.data(), dst.data(), dst.data(),	dst.data(), dst.data(),
+												  dst.data(), dst.data(), dst16.data(), nullptr};
 
 		// Every way against direct, once, before anything is timed.
 		const size_t want_length = direct();
@@ -303,11 +411,22 @@ int main() {
 			memset(dst.data(), 0, dst.size());
 			memset(dst16.data(), 0, dst16.size());
 			const size_t length = run[w]();
+			if (!output[w]) {
+				continue;
+			}
 			if (length != want_length || memcmp(output[w], want.data(), want_length) != 0) {
 				std::fprintf(stderr, "%s: %s gives %zu bytes, direct %zu%s\n", c.name.c_str(), NAMES[w], length,
 							 want_length, length == want_length ? " (different bytes)" : "");
 				return 1;
 			}
+		}
+
+		// today's views against column's: the same strings, value by value.
+		column();
+		today();
+		if (ViewStrings(views) != ViewStrings(today_views)) {
+			std::fprintf(stderr, "%s: today's views differ from column's\n", c.name.c_str());
+			return 1;
 		}
 
 		std::vector<std::vector<double>> times(ways);

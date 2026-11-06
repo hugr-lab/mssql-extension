@@ -151,16 +151,15 @@ struct StringView16 {
 //! bit r of `validity` is set (DuckDB's ValidityMask words; nullptr: all valid)
 //! with its value at src[offsets[r], offsets[r] + lengths[r]). The valid rows'
 //! values lie back to back in row order and end at src_size, as the read
-//! path's binary staging lays them out; a NULL row's offset and length are not
-//! read. Writes their UTF-8 back to back into dst (Utf8Bound(src_size) bytes)
-//! and row r's view into views[r] -- a NULL row's is empty --, pointing into
-//! dst and inline up to `inline_length` bytes (string_t::INLINE_LENGTH: 12, or 0
-//! under DUCKDB_DEBUG_NO_INLINE; no other value). On a single-byte page with
-//! NEON, AVX2 or AVX-512 the views come from what the kernel records as it
-//! decodes (which of each 16 input bytes read as 2 or 3 UTF-8 bytes), one pass
-//! over the bytes and none over the output; otherwise (a double-byte page, whose
-//! pair must not cross two values; an x86 with neither; the portable build)
-//! value by value. Returns the bytes written to dst.
+//! path's binary staging lays them out; offsets / lengths hold `count` entries,
+//! a NULL row's read but unused (undefined, as the staging leaves them). A caller
+//! with no NULL in the chunk passes nullptr (it skips the bit tests). Writes their UTF-8 back to back into dst
+//! (Utf8Bound(src_size) bytes) and row r's view into views[r] -- a NULL row's is empty --, pointing into dst and inline
+//! up to `inline_length` bytes (string_t::INLINE_LENGTH: 12, or 0 under DUCKDB_DEBUG_NO_INLINE; no other value). On a
+//! single-byte page with NEON, AVX2 or AVX-512 the views come from what the kernel records as it decodes (which of each
+//! 16 input bytes read as 2 or 3 UTF-8 bytes), one pass over the bytes and none over the output; otherwise (a
+//! double-byte page, whose pair must not cross two values; an x86 with neither; the portable build) value by value.
+//! Returns the bytes written to dst.
 size_t DecodeColumn(const CodePageTable &page, const uint8_t *src, size_t src_size, const uint32_t *offsets,
 					const uint32_t *lengths, const uint64_t *validity, size_t count, char *dst, StringView16 *views,
 					size_t inline_length);

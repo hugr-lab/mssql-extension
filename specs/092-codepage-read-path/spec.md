@@ -353,7 +353,8 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
        column of 2048 rows, staging to finished vector): 1.1-2.4x faster in every cell but long
        1251 text with dense typography (0.9-1.35x, by the text: the kernel's own branches). On
        x86-64 the AVX2 and AVX-512 kernels record the same masks (AVX-512: its 64-bit masks
-       spread by pdep); an x86 with neither goes value by value.
+       spread by pdep); an x86 with neither goes value by value. The wrapper passes
+       `validity = nullptr` when the staging's `null_count` is 0 (no bit tests per row).
        The unit test checks it against the server's answers; the fuzz oracle (equal to
        `DecodeValues` value by value) is to add.
   - A double-byte page (raw scans only, D10) takes `DecodeValues`: a pair must not cross two values,
