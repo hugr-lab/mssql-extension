@@ -895,7 +895,7 @@ bench-code-page-tiers:
 
 bench-code-page: release
 	@mkdir -p build/test
-	$(CXX) $(BENCH_UTF16_FLAGS) $(BENCH_UTF16_INCLUDES) test/cpp/bench_code_page.cpp $(CODE_PAGE_SOURCES) \
+	$(CXX) $(BENCH_UTF16_FLAGS) -DNDEBUG $(BENCH_UTF16_INCLUDES) test/cpp/bench_code_page.cpp $(CODE_PAGE_SOURCES) \
 	    $(BENCH_UTF16_LIBS) -o build/test/bench_code_page
 	build/test/bench_code_page
 

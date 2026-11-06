@@ -117,11 +117,20 @@ const char *IsaName(Isa isa);
 //! under 32 bytes through the table a byte at a time. Return the new output end; write at
 //! most STORE_SLACK bytes past it. Defined in code_page_avx2.cpp.
 char *DecodeSingleByteAvx2(const CodePageTable &page, const uint8_t *p, const uint8_t *end, char *d);
+//! The same, recording each 32 bytes' masks for DecodeColumn (an ASCII step records nothing).
+char *DecodeSingleByteAvx2(const CodePageTable &page, const uint8_t *p, const uint8_t *end, char *d,
+						   StepRecorder recorder);
+//! DecodeColumn's granule output positions from the masks (POPCNT; defined in the AVX2 file,
+//! reached under AVX2 or AVX-512).
+void StartsFromMasksX86(const uint32_t *masks, size_t granules, uint16_t *starts);
 //! The AVX-512 VBMI2 kernel, one for every single-byte page: 64 bytes a step, the three UTF-8
 //! byte planes by vpermi2b over the page's whole high half, packed by vpcompressb, the last
 //! step loaded and stored under a mask. Same contract, and nothing is written past the
 //! returned end. Defined in code_page_avx512.cpp.
 char *DecodeSingleByteAvx512(const CodePageTable &page, const uint8_t *p, const uint8_t *end, char *d);
+//! The same, recording each 64 bytes' masks for DecodeColumn.
+char *DecodeSingleByteAvx512(const CodePageTable &page, const uint8_t *p, const uint8_t *end, char *d,
+							 StepRecorder recorder);
 //! DecodeValues for a single-byte page through it, every value whatever its length (the
 //! masked last step reads nothing past a value), the page prepared once.
 size_t DecodeValuesSingleByteAvx512(const CodePageTable &page, const uint8_t *src, const uint32_t *offsets,

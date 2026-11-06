@@ -52,10 +52,19 @@ constexpr size_t BLOCK = 16;
 constexpr uint64_t HIGH_BITS = 0x8080808080808080ull;
 #endif
 
-#if defined(MSSQL_CODE_PAGE_NEON)
-//! Set bits of a 32-bit word (DecodeColumn's recorded path, NEON only so far).
+#if defined(MSSQL_CODE_PAGE_NEON) || ((defined(__x86_64__) || defined(_M_X64)) && \
+									  !defined(MSSQL_CODE_PAGE_PORTABLE) && !defined(MSSQL_CODE_PAGE_NO_X86_KERNELS))
+#define MSSQL_CODE_PAGE_RECORDS 1
+//! Set bits of a 32-bit word (DecodeColumn's row offsets): CNT on aarch64; on x86-64 this file
+//! is built for the baseline, without POPCNT, so SWAR (once a row, not once a byte).
 inline unsigned PopCount(uint32_t v) {
-	return static_cast<unsigned>(__builtin_popcount(v));  // CNT on aarch64
+#if defined(MSSQL_CODE_PAGE_NEON)
+	return static_cast<unsigned>(__builtin_popcount(v));
+#else
+	v = v - ((v >> 1) & 0x55555555u);
+	v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+	return (((v + (v >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24;
+#endif
 }
 #endif
 
@@ -1000,9 +1009,6 @@ size_t DecodeColumnByValue(const CodePageTable &page, const uint8_t *src, size_t
 						   const uint32_t *lengths, const uint64_t *validity, size_t count, char *dst,
 						   StringView16 *views, size_t inline_length) {
 	const uint8_t *readable = src + src_size;
-#if defined(__x86_64__) || defined(_M_X64)
-	const detail::Isa isa = detail::ActiveIsa();
-#endif
 	char *d = dst;
 	for (size_t row = 0; row < count; row++) {
 		if (!RowValid(validity, row)) {
@@ -1013,29 +1019,21 @@ size_t DecodeColumnByValue(const CodePageTable &page, const uint8_t *src, size_t
 		const uint8_t *p = src + offsets[row];
 		const uint8_t *end = p + lengths[row];
 		char *start = d;
-#if defined(__x86_64__) || defined(_M_X64)
-		// Until the x86 kernels record steps: each value through them, as DecodeValues.
-		if (!DOUBLE_BYTE && isa == detail::Isa::Avx512) {
-			d = detail::DecodeSingleByteAvx512(page, p, end, d);
-		} else if (!DOUBLE_BYTE && isa == detail::Isa::Avx2 && lengths[row] >= 32) {
-			d = detail::DecodeSingleByteAvx2(page, p, end, d);
-		} else {
-			d = DecodeRun<DOUBLE_BYTE>(page, p, end, readable, d);
-		}
-#else
 		d = DecodeRun<DOUBLE_BYTE>(page, p, end, readable, d);
-#endif
 		views[row] = MakeView(start, static_cast<uint32_t>(d - start), inline_length);
 	}
 	return static_cast<size_t>(d - dst);
 }
 
-// Only the NEON kernel records steps so far; the x86 kernels take DecodeColumnByValue.
-#if defined(MSSQL_CODE_PAGE_NEON)
+// The kernels that record steps: NEON, and on x86-64 AVX2 / AVX-512 (chosen at run time).
+#if defined(MSSQL_CODE_PAGE_RECORDS)
 //! Each 16 input bytes' output position from the block's: 16 a granule before it and one per
-//! mask bit (a 2- or 3-byte character's second byte, a 3-byte one's third). Groups of 8, so
-//! it reads masks and writes starts up to 7 past `granules`.
+//! mask bit (a 2- or 3-byte character's second byte, a 3-byte one's third). On NEON in groups
+//! of 8, reading masks and writing starts up to 7 past `granules`; on x86 one by one, POPCNT.
 inline void StartsFromMasks(const uint32_t *masks, size_t granules, uint16_t *starts) {
+#if !defined(MSSQL_CODE_PAGE_NEON)
+	detail::StartsFromMasksX86(masks, granules, starts);
+#else
 	static const uint16_t LANE_STARTS[8] = {0, 16, 32, 48, 64, 80, 96, 112};
 	const uint16x8_t lane_starts = vld1q_u16(LANE_STARTS);
 	const uint16x8_t zero = vdupq_n_u16(0);
@@ -1053,6 +1051,7 @@ inline void StartsFromMasks(const uint32_t *masks, size_t granules, uint16_t *st
 		vst1q_u16(starts + g, vaddq_u16(vaddq_u16(before, lane_starts), vdupq_n_u16(static_cast<uint16_t>(base))));
 		base += 8 * BLOCK + vgetq_lane_u16(scan, 7);
 	}
+#endif
 }
 
 //! DecodeColumn on a single-byte page through a recording kernel, COLUMN_BLOCK input bytes
@@ -1213,7 +1212,7 @@ Isa DetectIsa() {
 	if (avx2 && avx512f && avx512bw && vbmi && vbmi2 && bmi2 && popcnt && (xcr0 & 0xE6) == 0xE6) {
 		return Isa::Avx512;
 	}
-	return avx2 && bmi2 ? Isa::Avx2 : Isa::Scalar;
+	return avx2 && bmi2 && popcnt ? Isa::Avx2 : Isa::Scalar;
 #else
 	__builtin_cpu_init();
 	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
@@ -1221,7 +1220,9 @@ Isa DetectIsa() {
 		__builtin_cpu_supports("bmi2") && __builtin_cpu_supports("popcnt")) {
 		return Isa::Avx512;
 	}
-	return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("bmi2") ? Isa::Avx2 : Isa::Scalar;
+	return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("bmi2") && __builtin_cpu_supports("popcnt")
+			   ? Isa::Avx2
+			   : Isa::Scalar;
 #endif
 #else
 	return Isa::Scalar;
@@ -1382,6 +1383,20 @@ size_t DecodeColumn(const CodePageTable &page, const uint8_t *src, size_t src_si
 									[&page](const uint8_t *p, const uint8_t *end, char *d, StepRecorder recorder) {
 										const NeonKernel kernel(page);
 										return DecodeNeonFor(kernel, page.code_page, p, end, d, recorder);
+									});
+	}
+#elif defined(MSSQL_CODE_PAGE_RECORDS)
+	const detail::Isa isa = detail::ActiveIsa();
+	if (isa == detail::Isa::Avx512) {
+		return DecodeColumnRecorded(src, src_size, offsets, validity, count, dst, views, inline_length,
+									[&page](const uint8_t *p, const uint8_t *end, char *d, StepRecorder recorder) {
+										return detail::DecodeSingleByteAvx512(page, p, end, d, recorder);
+									});
+	}
+	if (isa == detail::Isa::Avx2) {
+		return DecodeColumnRecorded(src, src_size, offsets, validity, count, dst, views, inline_length,
+									[&page](const uint8_t *p, const uint8_t *end, char *d, StepRecorder recorder) {
+										return detail::DecodeSingleByteAvx2(page, p, end, d, recorder);
 									});
 	}
 #endif

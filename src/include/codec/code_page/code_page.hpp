@@ -155,11 +155,12 @@ struct StringView16 {
 //! read. Writes their UTF-8 back to back into dst (Utf8Bound(src_size) bytes)
 //! and row r's view into views[r] -- a NULL row's is empty --, pointing into
 //! dst and inline up to `inline_length` bytes (string_t::INLINE_LENGTH: 12, or 0
-//! under DUCKDB_DEBUG_NO_INLINE; no other value). On a
-//! single-byte page with SIMD the views come from what the kernel records as
-//! it decodes (each 16 input bytes' output position and masks), one pass over
-//! the bytes and none over the output; otherwise value by value (a double-byte
-//! pair must not cross two values). Returns the bytes written to dst.
+//! under DUCKDB_DEBUG_NO_INLINE; no other value). On a single-byte page with
+//! NEON, AVX2 or AVX-512 the views come from what the kernel records as it
+//! decodes (which of each 16 input bytes read as 2 or 3 UTF-8 bytes), one pass
+//! over the bytes and none over the output; otherwise (a double-byte page, whose
+//! pair must not cross two values; an x86 with neither; the portable build)
+//! value by value. Returns the bytes written to dst.
 size_t DecodeColumn(const CodePageTable &page, const uint8_t *src, size_t src_size, const uint32_t *offsets,
 					const uint32_t *lengths, const uint64_t *validity, size_t count, char *dst, StringView16 *views,
 					size_t inline_length);

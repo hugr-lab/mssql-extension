@@ -8,6 +8,9 @@
 //   fused      codec::code_page::DecodeValues, value by value: on arm64 a single-byte value
 //              of 32 bytes or more takes the NEON kernel, a shorter one (and every
 //              double-byte value) the 16-byte ASCII loop with table stores.
+//   column     codec::code_page::DecodeColumn: the chunk's column in one pass, each value's
+//              string_t view (StringView16) written beside its UTF-8 (spec 092 D12) -- the
+//              form the read path takes; fused and direct write no views.
 //   2-pass     simdutf::validate_ascii over the whole payload first; when ASCII, one memcpy
 //              and the staged offsets reused; otherwise fused.
 //   2-stage    DecodeToUtf16 (SIMD table lookup on NEON) into a scratch buffer, then
@@ -231,7 +234,7 @@ int main() {
 	chunks.push_back(Make("thai 874", 874, Thai874, rng));
 	chunks.push_back(Make("japanese 932", 932, Japanese932, rng));
 
-	static const char *const NAMES[] = {"fused", "2-pass", "2-stage", "ascii64", "auto", "direct", "utf16"};
+	static const char *const NAMES[] = {"fused", "column", "2-pass", "2-stage", "ascii64", "auto", "direct", "utf16"};
 	const size_t ways = sizeof(NAMES) / sizeof(NAMES[0]);
 	std::printf("ns per value, median of %d interleaved rounds; 2048 values per chunk\n", ROUNDS);
 	std::printf("%-26s %7s %7s |", "workload", "cp KB", "u16 KB");
@@ -245,11 +248,16 @@ int main() {
 		std::vector<uint64_t> out_offsets(VALUES);
 		std::vector<uint32_t> out_lengths(VALUES);
 		std::vector<char16_t> scratch(c.payload.size() + 1);
+		std::vector<StringView16> views(VALUES);
 		const int reps = static_cast<int>(std::max<size_t>(50, 40000000 / (c.payload.size() + 1)));
 
 		auto fused = [&]() {
 			return DecodeValues(*c.page, c.payload.data(), c.payload.size(), c.offsets.data(), c.lengths.data(), VALUES,
 								dst.data(), out_offsets.data(), out_lengths.data());
+		};
+		auto column = [&]() {
+			return DecodeColumn(*c.page, c.payload.data(), c.payload.size(), c.offsets.data(), c.lengths.data(),
+								nullptr, VALUES, dst.data(), views.data(), 12);
 		};
 		auto two_pass = [&]() -> size_t {
 			if (simdutf::validate_ascii(reinterpret_cast<const char *>(c.payload.data()), c.payload.size())) {
@@ -283,9 +291,10 @@ int main() {
 		};
 		auto direct = [&]() { return DecodeToUtf8(*c.page, c.payload.data(), c.payload.size(), dst.data()); };
 		auto utf16 = [&]() { return simdutf::convert_utf16le_to_utf8(c.utf16.data(), c.utf16.size(), dst16.data()); };
-		const std::vector<std::function<size_t()>> run = {fused, two_pass, twostage, ascii64, autosel, direct, utf16};
-		const std::vector<const char *> output = {dst.data(), dst.data(), dst.data(),  dst.data(),
-												  dst.data(), dst.data(), dst16.data()};
+		const std::vector<std::function<size_t()>> run = {fused,   column,	two_pass, twostage,
+														  ascii64, autosel, direct,	  utf16};
+		const std::vector<const char *> output = {dst.data(), dst.data(), dst.data(), dst.data(),
+												  dst.data(), dst.data(), dst.data(), dst16.data()};
 
 		// Every way against direct, once, before anything is timed.
 		const size_t want_length = direct();
@@ -314,6 +323,8 @@ int main() {
 		}
 		std::printf("\n");
 	}
-	std::printf("\nutf16 leaves out the server's CAST and the doubled wire bytes (u16 KB against cp KB).\n");
+	std::printf(
+		"\nutf16 leaves out the server's CAST and the doubled wire bytes (u16 KB against cp KB), and the\n"
+		"delimiter walk and string_t the read path adds to it (bench-code-page-column measures those).\n");
 	return 0;
 }

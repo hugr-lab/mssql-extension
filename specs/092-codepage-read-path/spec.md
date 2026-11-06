@@ -351,8 +351,9 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
        the granules' output positions come from a prefix over the masks. Measured on Apple M4
        against the production `DecodeChunkFromStaging` (`make bench-code-page-column`, one
        column of 2048 rows, staging to finished vector): 1.1-2.4x faster in every cell but long
-       1251 text with dense typography (0.9-1.35x, by the text: the kernel's own branches). Its
-       x86-64 form takes the AVX2 / AVX-512 kernels value by value until they record steps.
+       1251 text with dense typography (0.9-1.35x, by the text: the kernel's own branches). On
+       x86-64 the AVX2 and AVX-512 kernels record the same masks (AVX-512: its 64-bit masks
+       spread by pdep); an x86 with neither goes value by value.
        The unit test checks it against the server's answers; the fuzz oracle (equal to
        `DecodeValues` value by value) is to add.
   - A double-byte page (raw scans only, D10) takes `DecodeValues`: a pair must not cross two values,

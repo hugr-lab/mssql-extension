@@ -26,6 +26,7 @@
 
 #include <immintrin.h>
 
+#include <cstring>
 #include <vector>
 
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -139,10 +140,21 @@ MSSQL_AVX512_INLINE char *StoreN(char *d, __m512i v, uint64_t n) {
 	return d + n;
 }
 
+//! DecodeColumn's record of the 64 bytes at `at`: their multi-byte and 3-byte masks as the
+//! four 16-byte entries StepRecorder documents (each entry: 16 bits of each), two stores.
+MSSQL_AVX512_INLINE void Record64(const StepRecorder &rec, const uint8_t *at, uint64_t multi, uint64_t three) {
+	const uint64_t MULTI_SLOTS = 0x0000FFFF0000FFFFull, THREE_SLOTS = 0xFFFF0000FFFF0000ull;
+	const uint64_t entries[2] = {_pdep_u64(multi, MULTI_SLOTS) | _pdep_u64(three, THREE_SLOTS),
+								 _pdep_u64(multi >> 32, MULTI_SLOTS) | _pdep_u64(three >> 32, THREE_SLOTS)};
+	memcpy(rec.masks + rec.Index(at), entries, sizeof(entries));
+}
+
 //! One step: the bytes of v under `valid` (every byte of a full step, the leading ones of
-//! the last), written at d. FULL folds the masks of a full step to constants.
-template <bool FULL>
-MSSQL_AVX512_INLINE char *Step(const Kernel512 &k, __m512i v, uint64_t valid, char *d) {
+//! the last), read at `at`, written at d. FULL folds the masks of a full step to constants;
+//! REC records the step's masks for DecodeColumn (an ASCII step records nothing).
+template <bool FULL, bool REC>
+MSSQL_AVX512_INLINE char *Step(const Kernel512 &k, __m512i v, uint64_t valid, char *d, const StepRecorder &rec,
+							   const uint8_t *at) {
 	// Byte positions: every pair's first / second byte, every triplet's first / second / third.
 	const uint64_t PAIR_FIRST = 0x5555555555555555ull, PAIR_SECOND = 0xAAAAAAAAAAAAAAAAull;
 	const uint64_t TRIPLE_FIRST = 0x0000249249249249ull, TRIPLE_SECOND = 0x0000492492492492ull,
@@ -162,6 +174,9 @@ MSSQL_AVX512_INLINE char *Step(const Kernel512 &k, __m512i v, uint64_t valid, ch
 	const __m512i first = _mm512_mask2_permutex2var_epi8(k.first_lo, v, multi_mask, k.first_hi);
 	const __m512i second = _mm512_permutex2var_epi8(k.second_lo, v, k.second_hi);
 	const uint64_t three = _cvtmask64_u64(_mm512_cmpge_epu8_mask(first, _mm512_set1_epi8(static_cast<char>(0xE0))));
+	if (REC) {
+		Record64(rec, at, multi, three);
+	}
 	__m512i third = _mm512_setzero_si512();
 	if (three != 0) {
 		third = _mm512_permutex2var_epi8(k.third_lo, v, k.third_hi);
@@ -192,13 +207,15 @@ MSSQL_AVX512_INLINE char *Step(const Kernel512 &k, __m512i v, uint64_t valid, ch
 	return d;
 }
 
-MSSQL_AVX512_INLINE char *Run(const Kernel512 &k, const uint8_t *p, const uint8_t *end, char *d) {
+template <bool REC>
+MSSQL_AVX512_INLINE char *Run(const Kernel512 &k, const uint8_t *p, const uint8_t *end, char *d,
+							  const StepRecorder &rec) {
 	for (; static_cast<size_t>(end - p) >= STEP; p += STEP) {
-		d = Step<true>(k, _mm512_loadu_si512(p), ~0ull, d);
+		d = Step<true, REC>(k, _mm512_loadu_si512(p), ~0ull, d, rec, p);
 	}
 	if (p < end) {
 		const uint64_t valid = _bzhi_u64(~0ull, static_cast<unsigned>(end - p));
-		d = Step<false>(k, _mm512_maskz_loadu_epi8(_cvtu64_mask64(valid), p), valid, d);
+		d = Step<false, REC>(k, _mm512_maskz_loadu_epi8(_cvtu64_mask64(valid), p), valid, d, rec, p);
 	}
 	return d;
 }
@@ -207,18 +224,26 @@ MSSQL_AVX512_INLINE char *Run(const Kernel512 &k, const uint8_t *p, const uint8_
 
 MSSQL_AVX512 char *DecodeSingleByteAvx512(const CodePageTable &page, const uint8_t *p, const uint8_t *end, char *d) {
 	const Kernel512 k = Prepare(page);
-	return Run(k, p, end, d);
+	const StepRecorder none = {nullptr, nullptr};
+	return Run<false>(k, p, end, d, none);
+}
+
+MSSQL_AVX512 char *DecodeSingleByteAvx512(const CodePageTable &page, const uint8_t *p, const uint8_t *end, char *d,
+										  StepRecorder recorder) {
+	const Kernel512 k = Prepare(page);
+	return Run<true>(k, p, end, d, recorder);
 }
 
 MSSQL_AVX512 size_t DecodeValuesSingleByteAvx512(const CodePageTable &page, const uint8_t *src, const uint32_t *offsets,
 												 const uint32_t *lengths, size_t count, char *dst,
 												 uint64_t *out_offsets, uint32_t *out_lengths) {
 	const Kernel512 k = Prepare(page);
+	const StepRecorder none = {nullptr, nullptr};
 	char *d = dst;
 	for (size_t i = 0; i < count; i++) {
 		const uint8_t *p = src + offsets[i];
 		char *start = d;
-		d = Run(k, p, p + lengths[i], d);
+		d = Run<false>(k, p, p + lengths[i], d, none);
 		out_offsets[i] = static_cast<uint64_t>(start - dst);
 		out_lengths[i] = static_cast<uint32_t>(d - start);
 	}

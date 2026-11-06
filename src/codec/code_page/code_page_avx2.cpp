@@ -1,5 +1,5 @@
 // SQL Server code pages (spec 091): the AVX2 kernel for single-byte pages. Every function
-// here is compiled for AVX2 + BMI2 by its own target attribute, so nothing in this file is
+// here is compiled for AVX2 + BMI2 + POPCNT by its own target attribute, so nothing in this file is
 // reached on a CPU without them: code_page.cpp calls in only when detail::ActiveIsa() says
 // AVX2. See codec/code_page/code_page.hpp for the contract.
 //
@@ -24,7 +24,7 @@
 #if defined(_MSC_VER) && !defined(__clang__)
 #define MSSQL_AVX2
 #else
-#define MSSQL_AVX2 __attribute__((target("avx2,bmi2")))
+#define MSSQL_AVX2 __attribute__((target("avx2,bmi2,popcnt")))
 #endif
 
 namespace duckdb {
@@ -44,6 +44,33 @@ inline char *Tail(const uint32_t *single, const uint8_t *p, const uint8_t *end, 
 		memcpy(d, &packed, sizeof(packed));
 		d += packed >> 24;
 	}
+	return d;
+}
+
+//! DecodeColumn's record of 32 bytes at `at`: which read as 2+ UTF-8 bytes (bit i for byte
+//! i) and which as 3, as the two 16-byte entries StepRecorder documents, one 64-bit store.
+inline void Record32(StepRecorder rec, const uint8_t *at, uint32_t multi, uint32_t three) {
+	const uint64_t pair = static_cast<uint64_t>((multi & 0xFFFFu) | (three << 16)) |
+						  (static_cast<uint64_t>((multi >> 16) | (three & 0xFFFF0000u)) << 32);
+	memcpy(rec.masks + rec.Index(at), &pair, sizeof(pair));
+}
+
+//! The tail under 32 bytes, recorded (DecodeColumn): its masks from the packed table.
+inline char *TailRecorded(const uint32_t *single, const uint8_t *p, const uint8_t *end, char *d, StepRecorder rec) {
+	if (p == end) {
+		return d;
+	}
+	const uint8_t *from = p;
+	uint32_t multi = 0, three = 0;
+	for (unsigned i = 0; p < end; ++p, ++i) {
+		const uint32_t packed = single[*p];
+		memcpy(d, &packed, sizeof(packed));
+		const unsigned length = packed >> 24;
+		multi |= static_cast<uint32_t>(length > 1) << i;
+		three |= static_cast<uint32_t>(length > 2) << i;
+		d += length;
+	}
+	Record32(rec, from, multi, three);
 	return d;
 }
 
@@ -113,12 +140,20 @@ MSSQL_AVX2 inline char *Pack3(const Compaction3 &c, __m256i first, __m256i secon
 //! Tier C: 32 bytes through the packed table by gathers. Each gathered dword is a byte's
 //! [b0 b1 b2 length], so a 128-bit lane already holds 4 characters as Compaction3 wants
 //! them; the length code is length - 1.
-MSSQL_AVX2 inline char *Gathered(const Compaction3 &c, const uint32_t *single, const uint8_t *p, char *d) {
+template <bool REC>
+MSSQL_AVX2 inline char *Gathered(const Compaction3 &c, const uint32_t *single, const uint8_t *p, char *d,
+								 uint32_t *three) {
 	const __m256i shifts = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
 	const __m256i one = _mm256_set1_epi32(1);
+	uint32_t three_bits = 0;
 	for (unsigned k = 0; k < 4; k++) {
 		const __m256i bytes = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(p + 8 * k)));
 		const __m256i packed = _mm256_i32gather_epi32(reinterpret_cast<const int *>(single), bytes, 4);
+		if (REC) {
+			three_bits |= static_cast<uint32_t>(_mm256_movemask_ps(_mm256_castsi256_ps(
+							  _mm256_cmpeq_epi32(_mm256_srli_epi32(packed, 24), _mm256_set1_epi32(3)))))
+						  << (8 * k);
+		}
 		const __m256i code = _mm256_sub_epi32(_mm256_srli_epi32(packed, 24), one);
 		const __m256i weighted = _mm256_sllv_epi32(code, shifts);
 		const __m256i sum2 = _mm256_hadd_epi32(weighted, weighted);
@@ -131,13 +166,16 @@ MSSQL_AVX2 inline char *Gathered(const Compaction3 &c, const uint32_t *single, c
 		Store16(d, _mm256_extracti128_si256(out, 1));
 		d += c.length[hi];
 	}
+	*three = three_bits;
 	return d;
 }
 
 enum class Page { Generic, Cp1252, Cp1251, Cp874 };
 
-template <Page PAGE>
-MSSQL_AVX2 char *Kernel(const CodePageTable &page, const uint8_t *p, const uint8_t *end, char *d) {
+//! REC: record each 32 bytes' masks for DecodeColumn. Every byte >= 0x80 reads as 2 or 3
+//! UTF-8 bytes (test_code_page checks the tables), so the multi-byte mask is the high bits.
+template <Page PAGE, bool REC>
+MSSQL_AVX2 char *Kernel(const CodePageTable &page, const uint8_t *p, const uint8_t *end, char *d, StepRecorder rec) {
 	const Compaction &c2 = GetCompaction();
 	const Compaction3 &c3 = GetCompaction3();
 	const uint32_t *single = page.single;
@@ -161,6 +199,9 @@ MSSQL_AVX2 char *Kernel(const CodePageTable &page, const uint8_t *p, const uint8
 													 _mm256_and_si256(_mm256_srli_epi16(v, 6), _mm256_set1_epi8(1)));
 				const __m256i first = _mm256_blendv_epi8(v, lead, v);  // the sign bit marks non-ASCII
 				const __m256i second = _mm256_or_si256(_mm256_and_si256(v, k3f), sign);
+				if (REC) {
+					Record32(rec, p, high, 0);
+				}
 				d = Pack2(c2, first, second, high, d);
 				p += STEP;
 				continue;
@@ -175,6 +216,9 @@ MSSQL_AVX2 char *Kernel(const CodePageTable &page, const uint8_t *p, const uint8
 				const __m256i first = _mm256_blendv_epi8(v, lead, v);
 				const __m256i second =
 					_mm256_or_si256(_mm256_and_si256(_mm256_add_epi8(v, _mm256_set1_epi8(0x10)), k3f), sign);
+				if (REC) {
+					Record32(rec, p, high, 0);
+				}
 				d = Pack2(c2, first, second, high, d);
 				p += STEP;
 				continue;
@@ -193,29 +237,55 @@ MSSQL_AVX2 char *Kernel(const CodePageTable &page, const uint8_t *p, const uint8
 				const __m256i second = _mm256_sub_epi8(_mm256_set1_epi8(static_cast<char>(0xB8)), upper);
 				const __m256i third =
 					_mm256_or_si256(_mm256_and_si256(_mm256_add_epi8(v, _mm256_set1_epi8(0x20)), k3f), sign);
+				if (REC) {
+					Record32(rec, p, high, high);  // Thai: every non-ASCII byte 3 bytes
+				}
 				d = Pack3(c3, first, second, third, d);
 				p += STEP;
 				continue;
 			}
 		}
-		d = Gathered(c3, single, p, d);
+		uint32_t three = 0;
+		d = Gathered<REC>(c3, single, p, d, &three);
+		if (REC) {
+			Record32(rec, p, high, three);
+		}
 		p += STEP;
 	}
-	return Tail(single, p, end, d);
+	return REC ? TailRecorded(single, p, end, d, rec) : Tail(single, p, end, d);
+}
+
+template <bool REC>
+MSSQL_AVX2 char *KernelFor(const CodePageTable &page, const uint8_t *p, const uint8_t *end, char *d, StepRecorder rec) {
+	switch (page.code_page) {
+	case 1252:
+		return Kernel<Page::Cp1252, REC>(page, p, end, d, rec);
+	case 1251:
+		return Kernel<Page::Cp1251, REC>(page, p, end, d, rec);
+	case 874:
+		return Kernel<Page::Cp874, REC>(page, p, end, d, rec);
+	default:
+		return Kernel<Page::Generic, REC>(page, p, end, d, rec);
+	}
 }
 
 }  // namespace
 
 MSSQL_AVX2 char *DecodeSingleByteAvx2(const CodePageTable &page, const uint8_t *p, const uint8_t *end, char *d) {
-	switch (page.code_page) {
-	case 1252:
-		return Kernel<Page::Cp1252>(page, p, end, d);
-	case 1251:
-		return Kernel<Page::Cp1251>(page, p, end, d);
-	case 874:
-		return Kernel<Page::Cp874>(page, p, end, d);
-	default:
-		return Kernel<Page::Generic>(page, p, end, d);
+	const StepRecorder none = {nullptr, nullptr};
+	return KernelFor<false>(page, p, end, d, none);
+}
+
+MSSQL_AVX2 char *DecodeSingleByteAvx2(const CodePageTable &page, const uint8_t *p, const uint8_t *end, char *d,
+									  StepRecorder recorder) {
+	return KernelFor<true>(page, p, end, d, recorder);
+}
+
+MSSQL_AVX2 void StartsFromMasksX86(const uint32_t *masks, size_t granules, uint16_t *starts) {
+	unsigned extra = 0;
+	for (size_t g = 0; g < granules; g++) {
+		starts[g] = static_cast<uint16_t>(16 * g + extra);
+		extra += static_cast<unsigned>(_mm_popcnt_u32(masks[g]));
 	}
 }
 
