@@ -115,13 +115,13 @@ Out, each refused by name until its spec lands:
   work is the record walk, which is inherent.
 
   The code-page transcode of a `char` / `varchar` column under a non-UTF-8 collation is a vectorized
-  kernel, one call per column per chunk, never per value: an ASCII fast path over the whole chunk
-  buffer (simdutf `validate_ascii`, then `memcpy`), then a table pass for the rest. A single-byte table
-  has 128 entries of up to 3 UTF-8 bytes; a double-byte one is indexed by lead byte (086 D9). The tables
-  come from SQL Server itself: a generator in `tools/` CASTs every byte, and every DBCS lead / trail
-  pair, to `nvarchar` under a collation of each code page; its output is committed and sampled by a CI
-  oracle check, and an invalid sequence comes out as the server's CAST makes it. Not iconv, ICU or
-  Python's codecs: they differ from Windows in places, and are platform-dependent or heavy. The same
+  kernel, one pass, one call per column per chunk, never per value: ASCII stored a block at a time,
+  the rest by arithmetic on the page's run or by table, with kernels specialised to the frequent pages
+  (spec 091 D5 / D5a, PR #527). The tables come from SQL Server itself: spec 091's generator reads
+  every byte, and every DBCS lead / trail pair, in a scratch database whose default collation has the
+  page (a `COLLATE` would convert the characters instead), and checks a second collation per page;
+  an invalid sequence comes out as the server makes it. Not iconv, ICU or Python's codecs: they
+  differ from the server in places, and are platform-dependent or heavy. The same
   generator writes the collation → code page table (`tools/code_pages/data/collations.psv`, § Rules,
   catalog). Spec 091 (SQL Server code pages, generated tables and vectorized kernels) builds it all,
   as the module `src/codec/code_page/`; 085 and 086 reuse it. 085 maps the on-disk CollationId onto

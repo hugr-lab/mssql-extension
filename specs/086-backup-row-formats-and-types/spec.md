@@ -97,11 +97,12 @@ and page-dictionary records (090's follow-up).
   No raw-bytes escape hatch: nobody downstream could read an undocumented binary.
 
 - **D9 — the double-byte code pages** (932, 936, 949, 950: 206 + 172 + 86 + 274 collations of 5,540)
-  go through spec 091's vectorized kernel, one call per column per chunk: the ASCII fast path over
-  the chunk buffer, then a table pass indexed by lead byte. The tables come from SQL Server itself:
-  spec 091 (SQL Server code pages, generated tables and vectorized kernels) CASTs every lead / trail
-  pair to `nvarchar` under a collation of each code page, commits the output and samples it in a CI
-  oracle check, so an unmapped or invalid sequence comes out as the server's CAST makes it. Spec 091
+  go through spec 091's kernel, one call per column per chunk: ASCII a block at a time, then a pass
+  indexed by lead byte. The tables come from SQL Server itself: spec 091 (SQL Server code pages,
+  generated tables and vectorized kernels, PR #527) reads every lead / trail pair in a scratch
+  database whose default collation has the page, checks 400 random strings per page and a second
+  collation, and commits the output, so an unmapped or invalid sequence comes out as the server
+  makes it. Spec 091
   builds the tables and kernels; 086 reuses them and adds the backup-specific oracle fixtures: the
   restored column's `CAST(c AS nvarchar(max))` against the reader's text, per code page (task 11).
 
