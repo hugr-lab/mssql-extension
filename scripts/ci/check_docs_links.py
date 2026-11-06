@@ -151,17 +151,26 @@ def _check_rule(root, page):
 
 
 def _check_suggestion(root, page):
-    """The suggested link must actually resolve.
+    """The suggested link must resolve to THE LINKED PAGE.
 
     A wrong suggestion is worse than none: it sends the author to a second
-    broken link while telling them it is the fix.
+    broken link while telling them it is the fix. The first cut of this check
+    only asked whether the suggested path EXISTS, which a regression pointing
+    at the page itself (`./start.md`) or at any other real file would have
+    satisfied -- so it could not fail, and its label was a claim it did not
+    test (roborev on 4785932).
     """
-    _write(page, "see [copy](/writing/copy/) for more\n")
-    found = links_in_file(root, page)
-    rel = found[0][3][2:-1] if found else ""
-    target = os.path.normpath(os.path.join(os.path.dirname(page), rel))
-    return _line(bool(found) and os.path.exists(target),
-                 "the suggested relative link resolves to the page", rel or "NOTHING")
+    failures = 0
+    for link, want in (("/writing/copy/", os.path.join(root, "writing", "copy.md")),
+                       ("/connection/", os.path.join(root, "connection", "index.md"))):
+        _write(page, "see [x](%s) for more\n" % link)
+        found = links_in_file(root, page)
+        rel = found[0][3][2:-1] if found else ""
+        target = os.path.normpath(os.path.join(os.path.dirname(page), rel))
+        failures += _line(bool(found) and target == os.path.normpath(want),
+                          "%s is suggested as the page itself, not merely a real file" % link,
+                          rel or "NOTHING")
+    return failures
 
 
 def _check_clean(root, page):
