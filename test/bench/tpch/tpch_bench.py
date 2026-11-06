@@ -207,26 +207,22 @@ def cmd_gen(args):
 
 # --------------------------------------------------------------------------- load
 
-def cmd_load(args):
-    cfg = server()
-    data = pathlib.Path(args.data_dir) / f"sf{args.sf:g}"
-    missing = [t for t in TABLES if not (data / f"{t}.parquet").exists()]
-    if missing:
-        sys.exit(f"error: no parquet for {missing} under {data} -- run `gen` first")
+def recreate_database_statements(cfg, args):
+    """Drop and recreate the benchmark database, on a `master` attachment."""
     db = args.db
-    if args.strings == "utf8" and not args.collation:
-        args.collation = UTF8_COLLATION
-    # No statement timeout: REORGANIZE and FULLSCAN statistics on a large lineitem
-    # run for minutes.
-    s = ["LOAD mssql;", "SET mssql_query_timeout = 0;", f"ATTACH '{esc(dsn(cfg, 'master', args.encrypt))}' AS m (TYPE mssql);"]
-    s.append(
+    return [
+        f"ATTACH '{esc(dsn(cfg, 'master', args.encrypt))}' AS m (TYPE mssql);",
         "SELECT mssql_exec('m', '" + esc(
             f"IF DB_ID(N'{db}') IS NOT NULL BEGIN ALTER DATABASE [{db}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; "
             f"DROP DATABASE [{db}]; END; CREATE DATABASE [{db}]"
             + (f" COLLATE {args.collation}" if args.collation else "")
-            + f"; ALTER DATABASE [{db}] SET RECOVERY SIMPLE; ALTER DATABASE [{db}] SET QUERY_STORE = OFF;") + "');")
-    s.append("DETACH m;")
-    s.append(f"ATTACH '{esc(dsn(cfg, db, args.encrypt))}' AS t (TYPE mssql, remote_pushdown false);")
+            + f"; ALTER DATABASE [{db}] SET RECOVERY SIMPLE; ALTER DATABASE [{db}] SET QUERY_STORE = OFF;") + "');",
+        "DETACH m;",
+    ]
+
+
+def create_table_statements(args):
+    out = []
     for tb in TABLES:
         ddl = f"CREATE TABLE dbo.{tb} ({columns(tb, args.strings)}"
         if args.layout == "rowstore":
@@ -234,20 +230,49 @@ def cmd_load(args):
         ddl += ")"
         if args.layout == "columnstore":
             ddl += f"; CREATE CLUSTERED COLUMNSTORE INDEX cci_{tb} ON dbo.{tb}"
-        s.append(f"SELECT mssql_exec('t', '{esc(ddl)}');")
-    s.append("SELECT mssql_invalidate_cache('t');")
-    s.append(".timer on")
+        out.append(f"SELECT mssql_exec('t', '{esc(ddl)}');")
+    return out
+
+
+def load_statements(data):
+    """One marked, timed INSERT per table."""
+    out = [".timer on"]
     for tb in TABLES:
-        s.append(f".print @@LOAD {tb}@@")
-        s.append(f"INSERT INTO t.dbo.{tb} SELECT * FROM read_parquet('{data / (tb + '.parquet')}');")
-    s.append(".timer off")
+        out.append(f".print @@LOAD {tb}@@")
+        out.append(f"INSERT INTO t.dbo.{tb} SELECT * FROM read_parquet('{data / (tb + '.parquet')}');")
+    out.append(".timer off")
+    return out
+
+
+def post_load_statements(args):
+    """Statistics, and for a columnstore the rowgroup compression first."""
+    out = []
     for tb in TABLES:
         post = f"UPDATE STATISTICS dbo.{tb} WITH FULLSCAN"
         if args.layout == "columnstore":
             post = f"ALTER INDEX ALL ON dbo.{tb} REORGANIZE WITH (COMPRESS_ALL_ROW_GROUPS = ON); " + post
-        s.append(f"SELECT mssql_exec('t', '{esc(post)}');")
-    for tb in TABLES:
-        s.append(f"SELECT '{tb}' AS t, count(*) AS n FROM t.dbo.{tb};")
+        out.append(f"SELECT mssql_exec('t', '{esc(post)}');")
+    return out
+
+
+def cmd_load(args):
+    cfg = server()
+    data = pathlib.Path(args.data_dir) / f"sf{args.sf:g}"
+    missing = [t for t in TABLES if not (data / f"{t}.parquet").exists()]
+    if missing:
+        sys.exit(f"error: no parquet for {missing} under {data} -- run `gen` first")
+    if args.strings == "utf8" and not args.collation:
+        args.collation = UTF8_COLLATION
+    # No statement timeout: REORGANIZE and FULLSCAN statistics on a large lineitem
+    # run for minutes.
+    s = ["LOAD mssql;", "SET mssql_query_timeout = 0;"]
+    s += recreate_database_statements(cfg, args)
+    s.append(f"ATTACH '{esc(dsn(cfg, args.db, args.encrypt))}' AS t (TYPE mssql, remote_pushdown false);")
+    s += create_table_statements(args)
+    s.append("SELECT mssql_invalidate_cache('t');")
+    s += load_statements(data)
+    s += post_load_statements(args)
+    s += [f"SELECT '{tb}' AS t, count(*) AS n FROM t.dbo.{tb};" for tb in TABLES]
     rc, text = run_cli(binary("B"), "\n".join(s) + "\n", cfg)
     print(text)
     if rc != 0:
@@ -320,6 +345,53 @@ NO_RUN_TIME = "no `Run Time` line (see the session log)"
 COUNTERS = "[MSSQL COUNTERS]"
 
 
+def _marker(line, tag):
+    """(is this a marker, the query it opens).
+
+    The query is None for a marker of ANOTHER tag -- a warmup pass's `@@W q01@@`
+    while reading the timed `T` ones -- which closes the current section and
+    starts no new one, so the warmup's output is attributed to nothing.
+    """
+    m = MARKER.match(line.strip())
+    if not m:
+        return False, None
+    return True, m.group(2) if m.group(1) == tag else None
+
+
+def _absorb(line, seconds, extra):
+    """Fold one line of a query's section in. -> the section's seconds.
+
+    Appends to `extra` -- the unexpected output that makes the query an error
+    rather than a timing. A `[MSSQL COUNTERS]` line is neither: it is expected
+    output from a variable CLAUDE.md tells the operator to set.
+    """
+    if line.lstrip().startswith(COUNTERS):
+        return seconds
+    timing = RUN_TIME.search(line)
+    if timing:
+        # A SECOND Run Time inside one section is consumed rather than counted
+        # as unexpected output: the CLI prints one for a failed statement too,
+        # after its error text.
+        return float(timing.group(1)) if seconds is None else seconds
+    if line.strip():
+        extra.append(line.strip())
+    return seconds
+
+
+def _verdict(seconds, extra):
+    """One query's (seconds, error), from what followed its marker.
+
+    Unexpected output wins over a timing: the CLI prints a failure's text and
+    THEN a `Run Time` for it, because END_TIMER fires before the error check
+    (issue #505 item 2).
+    """
+    if extra:
+        return None, " ".join(extra)[:300]
+    if seconds is None:
+        return None, NO_RUN_TIME
+    return seconds, None
+
+
 def parse_marked(text, tag):
     """Map each `@@<tag> <q>@@` marker to (seconds, error) from the lines after it.
 
@@ -356,33 +428,16 @@ def parse_marked(text, tag):
     out = {}
     current, seconds, extra = None, None, []
 
-    def close():
-        if current is None:
-            return
-        if extra:
-            out[current] = (None, " ".join(extra)[:300])
-        elif seconds is None:
-            out[current] = (None, NO_RUN_TIME)
-        else:
-            out[current] = (seconds, None)
-
     for line in text.splitlines():
-        m = MARKER.match(line.strip())
-        if m:
-            close()
-            current, seconds, extra = (m.group(2), None, []) if m.group(1) == tag else (None, None, [])
-            continue
-        if current is None:
-            continue
-        if line.lstrip().startswith(COUNTERS):
-            continue
-        if RUN_TIME.search(line):
-            if seconds is None:
-                seconds = float(RUN_TIME.search(line).group(1))
-            continue
-        if line.strip():
-            extra.append(line.strip())
-    close()
+        is_marker, query = _marker(line, tag)
+        if is_marker:
+            if current is not None:
+                out[current] = _verdict(seconds, extra)
+            current, seconds, extra = query, None, []
+        elif current is not None:
+            seconds = _absorb(line, seconds, extra)
+    if current is not None:
+        out[current] = _verdict(seconds, extra)
     return out
 
 
@@ -452,6 +507,49 @@ def selected(args):
     return clients, queries
 
 
+def session_results(client, cfg, args, queries, rep):
+    """One client's timed session. -> (results, session text).
+
+    A timeout is not a lost session: the exception still carries the stdout of
+    every query that DID finish, Run Time lines included, so it is parsed
+    rather than discarded.
+    """
+    try:
+        return timed_session(client, cfg, args, queries)
+    except subprocess.TimeoutExpired as exc:
+        # mask() it: this path never went through run_cli's masking, and an
+        # ATTACH failure can quote the connection string back.
+        text = mask(decode_output(exc.output), cfg)
+        res = parse_marked(text, "T")
+        note = f"session timed out after {args.timeout}s"
+        hung = name_hung_query(res, note)
+        for q in queries:
+            res.setdefault(q, (None, note))
+        print(f"rep {rep + 1} {client:6s} -- SESSION TIMEOUT after {args.timeout}s"
+              + (f", {hung} was still running" if hung else "")
+              + f", keeping {sum(1 for v in res.values() if v[0] is not None)} completed query(s)",
+              flush=True)
+        return res, text
+
+
+def write_results(writer, args, run_id, rep, client, queries, res):
+    """One session's rows into timings.csv. -> how many errored."""
+    errored = 0
+    for q in queries:
+        sec, err = res.get(q, (None, "no marker in output"))
+        writer.writerow({"run": run_id, "db": args.db, "client": client, "rep": rep + 1, "query": q,
+                         "seconds": "" if sec is None else f"{sec:.4f}", "error": err or ""})
+        errored += 1 if err else 0
+        print(f"rep {rep + 1} {client:6s} {q} {'ERROR ' + err if err else f'{sec:9.3f} s'}", flush=True)
+    return errored
+
+
+def rotated(clients, rep):
+    """The client order for this rep: rotated, so no client is always first."""
+    k = rep % len(clients)
+    return clients[k:] + clients[:k]
+
+
 def cmd_run(args):
     cfg = server()
     clients, queries = selected(args)
@@ -472,46 +570,14 @@ def cmd_run(args):
         w.writeheader()
         f.flush()
         for rep in range(args.reps):
-            order = clients[rep % len(clients):] + clients[:rep % len(clients)]  # rotate: no client always first
-            for client in order:
-                try:
-                    res, text = timed_session(client, cfg, args, queries)
-                except subprocess.TimeoutExpired as exc:
-                    # The exception still carries the stdout of every query that
-                    # DID finish, Run Time lines included, so parse it rather
-                    # than discarding the session. mask() it: this path never
-                    # went through run_cli's masking, and an ATTACH failure can
-                    # quote the connection string back.
-                    #
-                    # `exc.output` is BYTES even though run_cli passes
-                    # text=True -- documented, and it reproduces: `bytes
-                    # b'partial\n'`. Calling mask() on it raised TypeError
-                    # inside str.replace, so the FIRST hung session aborted the
-                    # whole run and none of the per-session flushing below
-                    # happened (review of #518 item 1). Decode defensively
-                    # rather than asserting the type: a future Python that
-                    # honours text=True here would hand back str.
-                    text = mask(decode_output(exc.output), cfg)
-                    res = parse_marked(text, "T")
-                    note = f"session timed out after {args.timeout}s"
-                    hung = name_hung_query(res, note)
-                    for q in queries:
-                        res.setdefault(q, (None, note))
-                    print(f"rep {rep + 1} {client:6s} -- SESSION TIMEOUT after {args.timeout}s"
-                          + (f", {hung} was still running" if hung else "")
-                          + f", keeping {sum(1 for v in res.values() if v[0] is not None)} completed query(s)",
-                          flush=True)
+            for client in rotated(clients, rep):
+                res, text = session_results(client, cfg, args, queries, rep)
                 (out / f"session-{rep + 1}-{client}.log").write_text(text)
                 cause = session_preamble(text)
                 if cause:
                     print(f"rep {rep + 1} {client:6s} -- SESSION ERROR (before the first query): {cause}",
                           flush=True)
-                for q in queries:
-                    sec, err = res.get(q, (None, "no marker in output"))
-                    w.writerow({"run": run_id, "db": args.db, "client": client, "rep": rep + 1, "query": q,
-                                "seconds": "" if sec is None else f"{sec:.4f}", "error": err or ""})
-                    errored += 1 if err else 0
-                    print(f"rep {rep + 1} {client:6s} {q} {'ERROR ' + err if err else f'{sec:9.3f} s'}", flush=True)
+                errored += write_results(w, args, run_id, rep, client, queries, res)
                 f.flush()
     print(f"timings: {path}")
     # A run in which every query errored used to exit 0, so a scripted
@@ -524,31 +590,84 @@ def cmd_run(args):
     return 0
 
 
-def cmd_report(args):
-    path = pathlib.Path(args.timings)
-    rows = list(csv.DictReader(open(path)))
-    clients = [c for c in CLIENTS if any(r["client"] == c for r in rows)]
-    queries = sorted({r["query"] for r in rows})
+def samples(rows, client, query):
+    """(the timings that survived, the first error) for one client and query."""
+    vals, errs = [], []
+    for r in rows:
+        if r["client"] != client or r["query"] != query:
+            continue
+        if r["seconds"]:
+            vals.append(float(r["seconds"]))
+        if r["error"]:
+            errs.append(r["error"])
+    return vals, errs[0] if errs else ""
+
+
+def medians(rows, clients, queries):
+    """{(client, query): (median seconds or None, surviving reps, first error)}."""
     med = {}
     for c in clients:
         for q in queries:
-            vals = [float(r["seconds"]) for r in rows if r["client"] == c and r["query"] == q and r["seconds"]]
-            errs = [r["error"] for r in rows if r["client"] == c and r["query"] == q and r["error"]]
-            med[c, q] = (statistics.median(vals) if vals else None, len(vals), errs[0] if errs else "")
-    base = "A" if "A" in clients else clients[0]
-    # The sum must cover the SAME work for every client (issue #505 item 5).
-    # Accumulating whatever each client happened to complete published a client
-    # that errored on an expensive query as several times faster, with nothing
-    # in the bolded row marking it partial -- and that row is the one
-    # RESULTS-local.md quotes as its headline.
+            vals, err = samples(rows, c, q)
+            med[c, q] = (statistics.median(vals) if vals else None, len(vals), err)
+    return med
+
+
+def comparable(med, clients, queries):
+    """(queries every client completed, the rest, per-client totals over the first).
+
+    The sum must cover the SAME work for every client (issue #505 item 5).
+    Accumulating whatever each client happened to complete published a client
+    that errored on an expensive query as several times faster, with nothing
+    in the bolded row marking it partial -- and that row is the one
+    RESULTS-local.md quotes as its headline.
+    """
     common = [q for q in queries if all(med[c, q][0] is not None for c in clients)]
     missing = [q for q in queries if q not in common]
     totals = {c: sum(med[c, q][0] for q in common) for c in clients}
+    return common, missing, totals
+
+
+def cell(value, reps, error, reps_max):
+    """One client's cell for one query."""
+    if value is None:
+        return f"error: {error[:40]}"
     # The rep count was stored in every cell and never read, though the header
     # promised "n = timed reps" -- so a median over one surviving rep looked
     # identical to one over three. Annotate any cell that is short.
-    reps_max = max((n for _, n, _ in med.values()), default=0)
+    return f"{value:.3f}" + (f" (n={reps})" if reps < reps_max else "")
 
+
+def query_row(q, clients, ratio_cols, med, base, reps_max):
+    cells = [cell(*med[c, q], reps_max=reps_max) for c in clients]
+    b = med[base, q][0]
+    for c in ratio_cols:
+        v = med[c, q][0]
+        cells.append(f"{v / b:.2f}" if v is not None and b else "")
+    return f"| {q} | " + " | ".join(cells) + " |"
+
+
+def sum_row(clients, ratio_cols, totals, base, common, queries):
+    tb = totals[base]
+    # With no query completed in every client the totals are all 0, and a bold
+    # **0.00** in the row RESULTS-local.md quotes reads like a measured result
+    # (review of #518 item 7). An em dash cannot be mistaken for one.
+    cells = ([f"**{totals[c]:.2f}**" for c in clients] if common else ["--" for _ in clients]) + \
+            [f"**{totals[c] / tb:.2f}**" if common and tb else "--" for c in ratio_cols]
+    return f"| **sum** ({len(common)}/{len(queries)} queries) | " + " | ".join(cells) + " |"
+
+
+def exclusion_note(common, missing):
+    if not missing:
+        return []
+    noun = "query" if len(common) == 1 else "queries"
+    return ["", f"The sum covers only the {len(common)} {noun} every client completed, so the totals and "
+                f"ratios compare like with like. Excluded because at least one client has no median: "
+                f"{', '.join(missing)}."]
+
+
+def report_lines(clients, queries, med, base, reps_max):
+    common, missing, totals = comparable(med, clients, queries)
     lines = [f"Median wall time per query, seconds. Ratios are against {base}: below 1 is faster."]
     if reps_max > 1:
         lines.append(f"A cell shows `(n=N)` when fewer than {reps_max} timed reps survived for it.")
@@ -559,32 +678,21 @@ def cmd_report(args):
     # a single --clients the old form emitted three header cells against two
     # separators and rendered as a broken table.
     lines += ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
-    for q in queries:
-        cells = []
-        for c in clients:
-            v, n, e = med[c, q]
-            if v is None:
-                cells.append(f"error: {e[:40]}")
-            else:
-                cells.append(f"{v:.3f}" + (f" (n={n})" if n < reps_max else ""))
-        b = med[base, q][0]
-        for c in ratio_cols:
-            v = med[c, q][0]
-            cells.append(f"{v / b:.2f}" if v is not None and b else "")
-        lines.append(f"| {q} | " + " | ".join(cells) + " |")
-    tb = totals[base]
-    # With no query completed in every client the totals are all 0, and a bold
-    # **0.00** in the row RESULTS-local.md quotes reads like a measured result
-    # (review of #518 item 7). An em dash cannot be mistaken for one.
-    sum_cells = ([f"**{totals[c]:.2f}**" for c in clients] if common else ["--" for _ in clients]) + \
-                [f"**{totals[c] / tb:.2f}**" if common and tb else "--" for c in ratio_cols]
-    lines.append(f"| **sum** ({len(common)}/{len(queries)} queries) | " + " | ".join(sum_cells) + " |")
-    if missing:
-        noun = "query" if len(common) == 1 else "queries"
-        lines += ["", f"The sum covers only the {len(common)} {noun} every client completed, so the totals and "
-                      f"ratios compare like with like. Excluded because at least one client has no median: "
-                      f"{', '.join(missing)}."]
-    text = "\n".join(lines) + "\n"
+    lines += [query_row(q, clients, ratio_cols, med, base, reps_max) for q in queries]
+    lines.append(sum_row(clients, ratio_cols, totals, base, common, queries))
+    lines += exclusion_note(common, missing)
+    return lines
+
+
+def cmd_report(args):
+    rows = list(csv.DictReader(open(pathlib.Path(args.timings))))
+    clients = [c for c in CLIENTS if any(r["client"] == c for r in rows)]
+    queries = sorted({r["query"] for r in rows})
+    med = medians(rows, clients, queries)
+    base = "A" if "A" in clients else clients[0]
+    reps_max = max((n for _, n, _ in med.values()), default=0)
+
+    text = "\n".join(report_lines(clients, queries, med, base, reps_max)) + "\n"
     print(text)
     if args.report:
         pathlib.Path(args.report).write_text(text)
@@ -592,33 +700,22 @@ def cmd_report(args):
 
 # --------------------------------------------------------------------------- verify
 
-def cmd_verify(args):
-    cfg = server()
-    clients, queries = selected(args)
-    data = pathlib.Path(args.data_dir) / f"sf{args.sf:g}"
-    # Per DATABASE, not one shared directory (issue #506 item 3). The old path
-    # had no --sf, --db or --strings component and nothing ever removed a CSV
-    # from it, so a four-schema sweep compared against whatever the previous
-    # schema left behind.
-    out = pathlib.Path(args.out) / "verify" / args.db
-    out.mkdir(parents=True, exist_ok=True)
-    # And clear this run's files anyway, so a query that fails at BIND -- where
-    # the COPY never opens its output file at all -- cannot be compared against
-    # the previous run's result and reported `ok`. Bind-time failure is client
-    # C's own failure mode, since its mssql_scan bind calls
-    # sp_describe_first_result_set.
+def clear_outputs(out, clients, queries):
+    """Remove this run's CSVs before anything writes them.
+
+    Issue #506 item 3. A query that fails at BIND never opens its output file
+    at all, so a stale file from the previous run would be compared and
+    reported `ok`. Bind-time failure is client C's own failure mode, since its
+    mssql_scan bind calls sp_describe_first_result_set.
+    """
     for q in queries:
         (out / f"oracle-{q}.csv").unlink(missing_ok=True)
         for client in clients:
             (out / f"{client}-{q}.csv").unlink(missing_ok=True)
-    # A non-zero session exit, reported ONCE for the client (review of #518
-    # item 3). It used to replace all 22 of that client's verdicts: both CLIs
-    # exit 1 if any statement failed, so one bind failure hid the other 21
-    # comparisons, never named the query that failed, and still printed a count
-    # of 22. The per-query comparisons run regardless -- the file clearing above
-    # turns the query that actually failed into MISSING, which names it.
-    sessions = {}
-    # The oracle: DuckDB 1.5.6 over the same parquet the server was loaded from.
+
+
+def write_oracle(cfg, args, data, out, queries):
+    """DuckDB 1.5.6 over the same parquet the server was loaded from."""
     s = [f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{data / (t + '.parquet')}');" for t in TABLES]
     for q in queries:
         sql = read_query("duckdb", q, args.sf)
@@ -626,20 +723,33 @@ def cmd_verify(args):
     rc, text = run_cli(binary("A"), "\n".join(s) + "\n", cfg)
     if rc != 0:
         sys.exit(text)
-    for client in clients:
-        s = session_head(client, cfg, args)
-        for q in queries:
-            body = query_text(client, q, args.sf).rstrip(";")
-            s.append(f"COPY ({body}) TO '{out / (client + '-' + q + '.csv')}' (HEADER false);")
-        rc, text = run_cli(binary(CLIENTS[client]["bin"]), "\n".join(s) + "\n", cfg, timeout=args.timeout)
-        if text.strip():
-            (out / f"{client}.log").write_text(text)
-        # The client session's return code was bound and never read, while the
-        # oracle's was checked (issue #506 item 3). The CLI does not bail on
-        # error for piped stdin, so this is the only signal that the session as
-        # a whole went wrong, and dropping it is how a failure became an `ok`.
-        if rc != 0:
-            sessions[client] = f"client session exited {rc} (see {out / (client + '.log')})"
+
+
+def write_client(cfg, args, out, client, queries):
+    """One client's answers. -> a session-level error line, or None.
+
+    The client session's return code was bound and never read, while the
+    oracle's was checked (issue #506 item 3). The CLI does not bail on error
+    for piped stdin, so this is the only signal that the session as a whole
+    went wrong, and dropping it is how a failure became an `ok`. It is reported
+    ONCE rather than replacing all 22 of that client's verdicts (review of #518
+    item 3): the clearing above turns the query that actually failed into
+    MISSING, which names it.
+    """
+    s = session_head(client, cfg, args)
+    for q in queries:
+        body = query_text(client, q, args.sf).rstrip(";")
+        s.append(f"COPY ({body}) TO '{out / (client + '-' + q + '.csv')}' (HEADER false);")
+    rc, text = run_cli(binary(CLIENTS[client]["bin"]), "\n".join(s) + "\n", cfg, timeout=args.timeout)
+    if text.strip():
+        (out / f"{client}.log").write_text(text)
+    if rc != 0:
+        return f"client session exited {rc} (see {out / (client + '.log')})"
+    return None
+
+
+def print_verdicts(out, clients, queries, sessions):
+    """-> how many queries did not compare equal."""
     bad = 0
     for client in clients:
         if client in sessions:
@@ -654,6 +764,29 @@ def cmd_verify(args):
             if not verdict.startswith("ok"):
                 bad += 1
             print(f"{client:6s} {q} {verdict}")
+    return bad
+
+
+def cmd_verify(args):
+    cfg = server()
+    clients, queries = selected(args)
+    data = pathlib.Path(args.data_dir) / f"sf{args.sf:g}"
+    # Per DATABASE, not one shared directory (issue #506 item 3). The old path
+    # had no --sf, --db or --strings component and nothing ever removed a CSV
+    # from it, so a four-schema sweep compared against whatever the previous
+    # schema left behind.
+    out = pathlib.Path(args.out) / "verify" / args.db
+    out.mkdir(parents=True, exist_ok=True)
+    clear_outputs(out, clients, queries)
+
+    write_oracle(cfg, args, data, out, queries)
+    sessions = {}
+    for client in clients:
+        failure = write_client(cfg, args, out, client, queries)
+        if failure:
+            sessions[client] = failure
+
+    bad = print_verdicts(out, clients, queries, sessions)
     print(f"{bad} mismatch(es)" + (f", {len(sessions)} failed session(s)" if sessions else ""))
     sys.exit(1 if bad or sessions else 0)
 
@@ -978,6 +1111,57 @@ def _check_report(tmp):
     return failures
 
 
+def _check_extracted():
+    """The helpers the CC split made independently reachable.
+
+    Each was buried inside a 15-30 branch command before, so none of these
+    invariants had ever been checked on its own.
+    """
+    print("\nthe pieces the split exposed:")
+    failures = 0
+
+    # The rotation rule, documented since #505 and never tested: no client is
+    # always first, and every rep is a permutation of the same clients.
+    clients = ["A", "B", "Bscan", "C"]
+    orders = [rotated(clients, rep) for rep in range(8)]
+    failures += _check("every rep runs the same clients", all(sorted(o) == sorted(clients) for o in orders),
+                       "4 clients x 8 reps")
+    failures += _check("every client leads at least once in 4 reps",
+                       {o[0] for o in orders[:4]} == set(clients),
+                       ", ".join(o[0] for o in orders[:4]))
+    failures += _check("the rotation repeats with the client count",
+                       orders[0] == orders[4] and orders[1] == orders[5], "period 4")
+    failures += _check("one client needs no rotation", rotated(["A"], 7) == ["A"], "['A']")
+
+    # comparable(): the sum must cover identical work, which is #505 item 5.
+    med = {("A", "q01"): (1.0, 1, ""), ("A", "q06"): (None, 0, "boom"),
+           ("B", "q01"): (2.0, 1, ""), ("B", "q06"): (4.0, 1, "")}
+    common, missing, totals = comparable(med, ["A", "B"], ["q01", "q06"])
+    failures += _check("a query one client failed is excluded from the sum",
+                       common == ["q01"] and missing == ["q06"], "common=%s" % common)
+    failures += _check("the totals cover only the common queries",
+                       totals == {"A": 1.0, "B": 2.0}, str(totals))
+
+    # samples(): the first error is kept even when later reps succeeded, so a
+    # flaky query is still visible in the report.
+    rows = [{"client": "A", "query": "q01", "seconds": "", "error": "first"},
+            {"client": "A", "query": "q01", "seconds": "2.0", "error": ""},
+            {"client": "A", "query": "q01", "seconds": "", "error": "second"},
+            {"client": "B", "query": "q01", "seconds": "9.0", "error": ""}]
+    vals, err = samples(rows, "A", "q01")
+    failures += _check("samples() takes only its own client and query",
+                       vals == [2.0] and err == "first", "%s / %r" % (vals, err))
+
+    # cell(): the (n=N) annotation, which was stored and never read until #518.
+    failures += _check("a short cell is annotated with its rep count",
+                       cell(1.5, 1, "", 3) == "1.500 (n=1)", cell(1.5, 1, "", 3))
+    failures += _check("a full cell is not annotated",
+                       cell(1.5, 3, "", 3) == "1.500", cell(1.5, 3, "", 3))
+    failures += _check("a failed cell shows its error", cell(None, 0, "boom", 3) == "error: boom",
+                       cell(None, 0, "boom", 3))
+    return failures
+
+
 def cmd_selftest(args):
     failures = _check_same()
     with tempfile.TemporaryDirectory() as d:
@@ -987,6 +1171,7 @@ def cmd_selftest(args):
         failures += _check_timeout_path()
         failures += _check_preamble()
         failures += _check_report(tmp)
+    failures += _check_extracted()
     print(f"\n{'FAIL' if failures else 'PASS'}: self-test, {failures} failure(s)")
     return 1 if failures else 0
 
@@ -1043,6 +1228,55 @@ WHERE pa.attribute = 'dbid' AND CAST(pa.value AS int) = DB_ID(N'{db}')
 ORDER BY qs.total_elapsed_time DESC"""
 
 
+def trace_script(client, cfg, args, queries, dmv):
+    """Per query: run it once warm, FREEPROCCACHE, run it timed, read the DMV."""
+    opts = "" if CLIENTS[client]["bin"] == "A" else ", remote_pushdown false"
+    s = session_head(client, cfg, args)
+    s.append(f"ATTACH '{esc(dsn(cfg, 'master', args.encrypt))}' AS adm (TYPE mssql{opts});")
+    s.append(".mode csv")
+    for q in queries:
+        qt = query_text(client, q, args.sf)
+        s += [".output /dev/null", qt,
+              "SELECT mssql_exec('adm', 'DBCC FREEPROCCACHE WITH NO_INFOMSGS');",
+              ".output", f".print @@Q {q}@@", ".output /dev/null", ".timer on", qt, ".timer off", ".output",
+              f"SELECT * FROM mssql_scan('adm', '{dmv}');"]
+    return s + [".print @@Q end@@"]
+
+
+def trace_statements(body):
+    """The DMV rows of one query's section: 6 CSV fields, the first a count."""
+    return [row for row in csv.reader(body.splitlines()) if len(row) == 6 and row[0].isdigit()]
+
+
+def trace_query_section(client, q, body):
+    """-> (summary tuple, markdown lines) for one traced query."""
+    timing = RUN_TIME.search(body)
+    wall = float(timing.group(1)) if timing else None
+    rows = trace_statements(body)
+    n_rows = sum(int(x[1]) for x in rows)
+    el = sum(float(x[2]) for x in rows)
+    cpu = sum(float(x[3]) for x in rows)
+    md = [f"## {q}: client {wall if wall is not None else 'ERROR'} s, {len(rows)} statement(s), "
+          f"{n_rows} rows to the client, server {el:.0f} ms elapsed / {cpu:.0f} ms CPU", ""]
+    md += [f"- {x[0]} exec, {x[1]} rows, {x[2]} ms elapsed, {x[3]} ms CPU, {x[4]} reads: `{x[5][:600]}`"
+           for x in rows]
+    md.append("")
+    return (client, q, wall, len(rows), n_rows, el, cpu), md
+
+
+def trace_report(client, args, text):
+    """-> (summary rows, markdown lines) for one client's whole session."""
+    parts = re.split(r"@@Q (\S+)@@", text)
+    summary, md = [], [f"# {client}: {CLIENTS[client]['label']} -- {args.db}", ""]
+    for q, body in zip(parts[1::2], parts[2::2]):
+        if q == "end":
+            continue
+        row, lines = trace_query_section(client, q, body)
+        summary.append(row)
+        md += lines
+    return summary, md
+
+
 def cmd_trace(args):
     """What each client sends to SQL Server for each query: statements, rows returned, server time.
 
@@ -1058,37 +1292,12 @@ def cmd_trace(args):
     dmv = esc(DMV.format(db=args.db))
     summary = []
     for client in clients:
-        opts = "" if CLIENTS[client]["bin"] == "A" else ", remote_pushdown false"
-        s = session_head(client, cfg, args)
-        s.append(f"ATTACH '{esc(dsn(cfg, 'master', args.encrypt))}' AS adm (TYPE mssql{opts});")
-        s.append(".mode csv")
-        for q in queries:
-            qt = query_text(client, q, args.sf)
-            s += [".output /dev/null", qt,
-                  "SELECT mssql_exec('adm', 'DBCC FREEPROCCACHE WITH NO_INFOMSGS');",
-                  ".output", f".print @@Q {q}@@", ".output /dev/null", ".timer on", qt, ".timer off", ".output",
-                  f"SELECT * FROM mssql_scan('adm', '{dmv}');"]
-        s += [".print @@Q end@@"]
-        rc, text = run_cli(binary(CLIENTS[client]["bin"]), "\n".join(s) + "\n", cfg, timeout=args.timeout)
+        script = trace_script(client, cfg, args, queries, dmv)
+        rc, text = run_cli(binary(CLIENTS[client]["bin"]), "\n".join(script) + "\n", cfg,
+                           timeout=args.timeout)
         (out / f"trace-{client}.log").write_text(text)
-        parts = re.split(r"@@Q (\S+)@@", text)
-        md = [f"# {client}: {CLIENTS[client]['label']} -- {args.db}", ""]
-        for q, body in zip(parts[1::2], parts[2::2]):
-            if q == "end":
-                continue
-            r = RUN_TIME.search(body)
-            wall = float(r.group(1)) if r else None
-            rows = [row for row in csv.reader(body.splitlines()) if len(row) == 6 and row[0].isdigit()]
-            n_rows = sum(int(x[1]) for x in rows)
-            el = sum(float(x[2]) for x in rows)
-            cpu = sum(float(x[3]) for x in rows)
-            summary.append((client, q, wall, len(rows), n_rows, el, cpu))
-            md.append(f"## {q}: client {wall if wall is not None else 'ERROR'} s, {len(rows)} statement(s), "
-                      f"{n_rows} rows to the client, server {el:.0f} ms elapsed / {cpu:.0f} ms CPU")
-            md.append("")
-            for x in rows:
-                md.append(f"- {x[0]} exec, {x[1]} rows, {x[2]} ms elapsed, {x[3]} ms CPU, {x[4]} reads: `{x[5][:600]}`")
-            md.append("")
+        rows, md = trace_report(client, args, text)
+        summary += rows
         (out / f"trace-{client}.md").write_text("\n".join(md) + "\n")
     print("client query  wall_s  stmts  rows_to_client  server_elapsed_ms  server_cpu_ms")
     for c, q, wall, n, rows, el, cpu in summary:
