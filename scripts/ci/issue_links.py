@@ -29,6 +29,8 @@ Modes:
 Offline by design: it never asks GitHub whether an issue exists or is closed,
 so it is safe on any runner and in any sandbox.
 """
+import contextlib
+import io
 import os
 import re
 import sys
@@ -287,6 +289,18 @@ def _check_collect(tmp):
                           "a prose-only mention lands in the backlog", str(len(backlog)))
         failures += _line(mode_summary({181: ["x"]}, [], []) == 0,
                           "a clean summary exits 0", "0")
+        # The PRINTED figure, not just the status. `declaring` counts DISTINCT
+        # files, so a file declaring two issues must read "2 issue(s) guarded
+        # by 1 declared test(s)" -- the roborev-1431 fix, which the first cut
+        # of these fixtures claimed to pin and did not (roborev on 840952c).
+        _write(os.path.join(root, "two.test"), "# issue: 90, 91\n")
+        two_index, _, _ = collect()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            mode_summary({n: p for n, p in two_index.items() if n in (90, 91)}, [], [])
+        printed = buffer.getvalue().strip()
+        failures += _line(printed == "2 issue(s) guarded by 1 declared test(s)",
+                          "a file declaring two issues counts as ONE test", printed)
         failures += _line(mode_summary({}, [], [("f", "why")]) == 1,
                           "a bad declaration fails the summary", "1")
         failures += _line(mode_issue({181: ["x"]}, ["--issue", "999"]) == 3,
@@ -323,9 +337,18 @@ def self_test():
     return failures
 
 
-#: The modes that ANSWER a question rather than report a verdict. A bad
-#: declaration makes the index incomplete, so these refuse to answer from it.
-QUERY_MODES = ("--index", "--issue", "--backlog")
+def _answerers(index, backlog, argv):
+    """flag -> handler, in the old if-chain's PRECEDENCE order.
+
+    ONE source of truth. Listing the flags in a QUERY_MODES tuple and again as
+    the dispatch dict's keys meant a mode added to one and not the other either
+    raised KeyError or was silently never dispatched (roborev on 840952c).
+    `dict` preserves insertion order, so `next(iter(...))` still picks
+    `--index` over `--backlog` exactly as the if-chain did.
+    """
+    return {"--index": lambda: mode_index(index),
+            "--issue": lambda: mode_issue(index, argv),
+            "--backlog": lambda: mode_backlog(backlog)}
 
 
 def require_roots():
@@ -402,10 +425,8 @@ def main(argv):
     index, backlog, bad = collect()
     report_errors(bad)
 
-    answer = {"--index": lambda: mode_index(index),
-              "--issue": lambda: mode_issue(index, argv),
-              "--backlog": lambda: mode_backlog(backlog)}
-    asked = next((mode for mode in QUERY_MODES if mode in argv), None)
+    answer = _answerers(index, backlog, argv)
+    asked = next((mode for mode in answer if mode in argv), None)
     if asked:
         # A bad declaration makes the index incomplete, so a mode that ANSWERS
         # from it refuses rather than answering wrongly. Reporting the errors
