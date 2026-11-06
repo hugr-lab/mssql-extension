@@ -56,6 +56,7 @@ import argparse
 import os
 import re
 import sys
+import time
 
 # ---------------------------------------------------------------------------
 # Sinks: anything whose argument becomes human-readable text.
@@ -265,57 +266,122 @@ SAFE_ACCESSOR = re.compile(
 )
 
 
+def _blanked(body):
+    """`body` with every character replaced by a space, newlines kept.
+
+    Line structure has to survive so a finding's reported line stays true to the
+    file.
+    """
+    return "".join("\n" if ch == "\n" else " " for ch in body)
+
+
+def _skip_raw_string(text, i, n, out):
+    """`R"delim( ... )delim"`, blanked whole. Index after it, or None.
+
+    This is the trap the first cut got wrong: a raw string may hold an ODD
+    number of quotes (`R"(he said " hi)"`), which flipped the in-literal state
+    for the rest of the file and silently stopped the scan there.
+
+    The guard accepts `r` as well as `R` while the regex requires `R`, so a
+    lowercase `r"..."` falls through to the ordinary-string handler. That is the
+    behaviour this replaced and it is kept deliberately: `r"..."` is not a C++
+    raw string, so treating it as an identifier followed by a string is right.
+    """
+    if text[i] not in "Rr" or i + 1 >= n or text[i + 1] != '"':
+        return None
+    m = re.match(r'R"([^(\s\\]{0,16})\(', text[i:])
+    if not m:
+        return None
+    close = ")" + m.group(1) + '"'
+    end = text.find(close, i + m.end())
+    if end == -1:
+        out.append(_blanked(text[i:]))
+        return n
+    out.append(_blanked(text[i:end + len(close)]))
+    return end + len(close)
+
+
+def _skip_line_comment(text, i, n, out):
+    """`// ...` to the newline, which is left for the caller to count."""
+    if not text.startswith("//", i):
+        return None
+    while i < n and text[i] != "\n":
+        i += 1
+    return i
+
+
+def _skip_block_comment(text, i, n, out):
+    """`/* ... */`, blanked. An unterminated one runs to the end."""
+    if not text.startswith("/*", i):
+        return None
+    i += 2
+    while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+        out.append("\n" if text[i] == "\n" else " ")
+        i += 1
+    return min(i + 2, n)
+
+
+def _skip_digit_separator(text, i, n, out):
+    """`1'000`, `0xFF'FF`: an apostrophe between alphanumerics is not a literal.
+
+    The second lexer trap: read as a char literal it swallowed the rest of the
+    line and beyond.
+    """
+    if text[i] != "'" or i == 0 or not text[i - 1].isalnum():
+        return None
+    if i + 1 >= n or not text[i + 1].isalnum():
+        return None
+    out.append(" ")
+    return i + 1
+
+
+def _skip_quoted(text, i, n, out):
+    """A string or char literal, blanked, honouring backslash escapes."""
+    quote = text[i]
+    if quote not in ('"', "'"):
+        return None
+    i += 1
+    while i < n and text[i] != quote:
+        if text[i] == "\\":
+            i += 1
+        if i < n:
+            out.append("\n" if text[i] == "\n" else " ")
+        i += 1
+    return i + 1
+
+
+#: Tried in order, and the order matters: a raw string before the comment forms
+#: (its body may hold `//`), and the digit separator before the quote forms.
+_SKIPPERS = (
+    _skip_raw_string,
+    _skip_line_comment,
+    _skip_block_comment,
+    _skip_digit_separator,
+    _skip_quoted,
+)
+
+
 def strip_comments_and_literals(text):
     """Blank comments and string/char literals, preserving line structure.
 
     Literals go because a message's TEXT discloses nothing -- only an
-    interpolated value does. Handles two lexer traps the first cut got wrong:
+    interpolated value does.
 
-      * RAW strings. `R"(... " ...)"` holds an odd number of quotes, which flips
-        the in-literal state for the rest of the file.
-      * DIGIT SEPARATORS. `1'000` is not the start of a char literal.
+    One handler per literal form (`_SKIPPERS`), each independently testable:
+    this was a single 32-branch loop, and the two bugs it shipped with were both
+    in forms that had no way to be tested on their own.
     """
     out = []
     i = 0
     n = len(text)
     while i < n:
-        c = text[i]
-        # Raw string: R"delim( ... )delim", optionally prefixed L/u8/u/U.
-        if c in "Rr" and i + 1 < n and text[i + 1] == '"':
-            m = re.match(r'R"([^(\s\\]{0,16})\(', text[i:])
-            if m:
-                delim = m.group(1)
-                close = ')' + delim + '"'
-                end = text.find(close, i + m.end())
-                body = text[i:end + len(close)] if end != -1 else text[i:]
-                out.append("".join("\n" if ch == "\n" else " " for ch in body))
-                i = (end + len(close)) if end != -1 else n
-                continue
-        if c == "/" and i + 1 < n and text[i + 1] == "/":
-            while i < n and text[i] != "\n":
-                i += 1
-        elif c == "/" and i + 1 < n and text[i + 1] == "*":
-            i += 2
-            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
-                out.append("\n" if text[i] == "\n" else " ")
-                i += 1
-            i = min(i + 2, n)
-        elif c == "'" and i > 0 and text[i - 1].isalnum() and i + 1 < n and text[i + 1].isalnum():
-            # Digit separator (1'000, 0xFF'FF), not a char literal.
-            out.append(" ")
-            i += 1
-        elif c in ('"', "'"):
-            quote = c
-            i += 1
-            while i < n and text[i] != quote:
-                if text[i] == "\\":
-                    i += 1
-                if i < n:
-                    out.append("\n" if text[i] == "\n" else " ")
-                i += 1
-            i += 1
+        for skip in _SKIPPERS:
+            nxt = skip(text, i, n, out)
+            if nxt is not None:
+                i = nxt
+                break
         else:
-            out.append(c)
+            out.append(text[i])
             i += 1
     return "".join(out)
 
@@ -349,6 +415,39 @@ def strip_preprocessor(text):
     return "\n".join(out)
 
 
+#: Which context each bracket opens and closes. A table rather than a branch
+#: per bracket: the four-way if/elif chain this replaced scored CC 10, the
+#: ub-mode gate's own limit, for logic that is really one lookup.
+_OPENS = {"(": "paren", "[": "paren", "{": "brace"}
+_CLOSES = {")": "paren", "]": "paren", "}": "brace"}
+
+
+def _track_nesting(ch, stack):
+    """Push or pop the context stack for one character; True if now inside parens.
+
+    Counting braces as a plain DEPTH was the first cut's bug: a function body
+    kept depth >= 1, so no `;` inside one ever closed a statement and each file
+    came back as a single blob with every finding reported at line 1.
+
+    A plain paren-depth counter is not enough either: `Run([&]() { ...140
+    lines... });` keeps paren depth >= 1 for the whole lambda, so nothing split
+    inside the body and a sink in one part paired with a credential in another.
+
+    Hence a STACK. A `;` ends a statement when the innermost context is a brace
+    block (a lambda body, a function body) or nothing at all -- but not inside
+    parens, where `for (a; b; c)` lives.
+    """
+    opened = _OPENS.get(ch)
+    if opened:
+        stack.append(opened)
+    elif stack and _CLOSES.get(ch) == stack[-1]:
+        # A closer that does not match the innermost context is IGNORED rather
+        # than popping it: unbalanced text (a macro that opens a brace it never
+        # closes) must not unwind a context the file is really still inside.
+        stack.pop()
+    return bool(stack) and stack[-1] == "paren"
+
+
 def statements(text):
     """Yield (start_line, statement_text).
 
@@ -368,32 +467,49 @@ def statements(text):
     nothing at all -- but not inside parens, where `for (a; b; c)` lives.
     """
     buf = []
+    blank = True  # is everything buffered so far whitespace?
     start_line = 1
     line = 1
     stack = []
     for ch in text:
         if ch == "\n":
             line += 1
-        if not buf or "".join(buf).isspace():
+        if blank:
             start_line = line
         buf.append(ch)
-        if ch in "([":
-            stack.append("paren")
-        elif ch == "{":
-            stack.append("brace")
-        elif ch in ")]":
-            if stack and stack[-1] == "paren":
-                stack.pop()
-        elif ch == "}":
-            if stack and stack[-1] == "brace":
-                stack.pop()
-        in_paren = bool(stack) and stack[-1] == "paren"
-        if not in_paren and ch in ";{}":
+        if not ch.isspace():
+            blank = False
+        if not _track_nesting(ch, stack) and ch in ";{}":
             yield start_line, "".join(buf)
             buf = []
+            blank = True
             start_line = line
-    if buf and not "".join(buf).isspace():
+    if buf and not blank:
         yield start_line, "".join(buf)
+
+
+def names_a_credential_value(ident):
+    """Does this identifier name a credential VALUE (not a key, type or getter)?
+
+    The order matters and is not arbitrary:
+
+      * ALLOWLIST and `NAME_OF_SECRET` / `CONSTANT` come first -- a name that is
+        safe everywhere, the NAME of a secret rather than its value, and a
+        compile-time constant are excuses no later rule can override.
+      * `CREDENTIAL_ACCESSOR` (Get/Fetch/Take/Reveal/Expose) comes BEFORE the
+        type-name and plumbing excuses deliberately: `GetPassword()` matches
+        `TYPE_NAME`'s PascalCase shape, and letting that excuse win is exactly
+        how the planted leak in the review of #498 got through.
+    """
+    if not is_credential_name(ident):
+        return False
+    if ident in ALLOWLIST or ident.lower() in ALLOWLIST:
+        return False
+    if NAME_OF_SECRET.match(ident) or CONSTANT.match(ident):
+        return False
+    if CREDENTIAL_ACCESSOR.match(ident):
+        return True
+    return not (TYPE_NAME.match(ident) or PLUMBING_CALL.match(ident))
 
 
 def offending(stmt_code, stmt_raw):
@@ -408,21 +524,7 @@ def offending(stmt_code, stmt_raw):
     if KEY_READ.search(stmt_raw):
         hits.append('a credential read by key (e.g. TryGetValue("password"))')
     cleaned = SAFE_ACCESSOR.sub(" ", stmt_code)
-    for ident in sorted(set(IDENT.findall(cleaned))):
-        if not is_credential_name(ident):
-            continue
-        if ident in ALLOWLIST or ident.lower() in ALLOWLIST:
-            continue
-        if NAME_OF_SECRET.match(ident):
-            continue
-        if CONSTANT.match(ident):
-            continue
-        if CREDENTIAL_ACCESSOR.match(ident):
-            hits.append(ident)
-            continue
-        if TYPE_NAME.match(ident) or PLUMBING_CALL.match(ident):
-            continue
-        hits.append(ident)
+    hits.extend(i for i in sorted(set(IDENT.findall(cleaned))) if names_a_credential_value(i))
     return hits
 
 
@@ -588,6 +690,15 @@ SPLITTER_TESTS = [
         'auto ok = Run([&]() {\n\tint a = 1;\n\tfprintf(stderr, "%s", password);\n\treturn a;\n});',
         3,
     ),
+    # An unmatched closer must be IGNORED, not pop the context the file is
+    # really still inside: a macro body that closes a paren it never opened
+    # would otherwise unwind the enclosing brace block, and every `;` after it
+    # would stop splitting -- the brace bug again, one statement per file.
+    (
+        "an unmatched closer does not unwind the enclosing brace context",
+        'void f() {\n\tint x = a);\n\tfprintf(stderr, "%s", password);\n}',
+        3,
+    ),
 ]
 
 
@@ -595,26 +706,55 @@ def findings_for(src):
     return scan_text(src)
 
 
-def self_test():
+#: The two lexer traps that silently disabled the rest of a file. Data, like the
+#: groups above, rather than inline in the runner.
+LEXER_TESTS = [
+    ("a raw string holding an odd quote does not flip the lexer",
+     'auto q = R"(he said " hi)";\nfprintf(stderr, "%s", password);', True),
+    ("a digit separator is not a char literal",
+     'int n = 1\'000;\nfprintf(stderr, "%s", password);', True),
+]
+
+#: Each literal-form handler on its own, which the single 32-branch loop these
+#: replaced could not be. Every case is one the loop handled only incidentally:
+#: an unterminated form, a form whose body holds another form's opener, and the
+#: lowercase `r"` that must NOT be read as a raw string.
+HANDLER_TESTS = [
+    ("an unterminated block comment swallows the rest of the file",
+     '/* nothing closes this\nfprintf(stderr, "%s", password);', False),
+    ("an unterminated raw string does not hide the lines before it",
+     'fprintf(stderr, "%s", password);\nauto q = R"(never closed', True),
+    ("a raw string body holding // does not start a comment",
+     'auto q = R"(// not a comment)";\nfprintf(stderr, "%s", password);', True),
+    ("a block comment body holding a quote does not open a literal",
+     '/* " */ fprintf(stderr, "%s", password);', True),
+    ("an escaped quote does not end the literal early",
+     'fprintf(stderr, "a\\"b", password);', True),
+    ("lowercase r\" is an identifier and a string, not a raw string",
+     'auto r = r"x"; fprintf(stderr, "%s", password);', True),
+    ("an apostrophe not between alphanumerics is a char literal",
+     "char c = ';'; fprintf(stderr, \"%s\", password);", True),
+]
+
+
+def _check_group(heading, fixtures, want_flag, width=52):
+    """One flag / must-not-flag group. Returns the failure count."""
+    print(heading)
     failures = 0
-
-    print("must FLAG:")
-    for label, src in MUST_FLAG:
+    for label, src in fixtures:
         got = findings_for(src)
-        ok = bool(got)
+        ok = bool(got) == want_flag
         failures += 0 if ok else 1
-        detail = ", ".join(sorted({h for _, hs, _ in got for h in hs})) if got else "NOTHING"
-        print(f"  [{'ok' if ok else 'FAIL'}] {label:52s} -> {detail}")
+        hits = ", ".join(sorted({h for _, hs, _ in got for h in hs}))
+        detail = (hits or "NOTHING") if want_flag else ("clean" if ok else hits)
+        print(f"  [{'ok' if ok else 'FAIL'}] {label:{width}s} -> {detail}")
+    return failures
 
-    print("\nmust NOT flag:")
-    for label, src in MUST_NOT_FLAG:
-        got = findings_for(src)
-        ok = not got
-        failures += 0 if ok else 1
-        detail = "clean" if ok else ", ".join(sorted({h for _, hs, _ in got for h in hs}))
-        print(f"  [{'ok' if ok else 'FAIL'}] {label:52s} -> {detail}")
 
+def _check_splitter():
+    """Fixtures that can only pass when statements are genuinely split."""
     print("\nstatement splitting (these FAIL if the splitter breaks):")
+    failures = 0
     for label, src, want_line in SPLITTER_TESTS:
         got = findings_for(src)
         if want_line is None:
@@ -627,22 +767,105 @@ def self_test():
                 detail = f"{len(got)} findings"
         failures += 0 if ok else 1
         print(f"  [{'ok' if ok else 'FAIL'}] {label:62s} -> {detail}")
+    return failures
 
-    # The lexer traps that silently disabled the rest of a file.
+
+def _check_lexer():
     print("\nlexer:")
-    for label, src, should_flag in [
-        ("a raw string holding an odd quote does not flip the lexer",
-         'auto q = R"(he said " hi)";\nfprintf(stderr, "%s", password);', True),
-        ("a digit separator is not a char literal",
-         'int n = 1\'000;\nfprintf(stderr, "%s", password);', True),
-    ]:
+    failures = 0
+    for label, src, should_flag in LEXER_TESTS + HANDLER_TESTS:
         got = findings_for(src)
         ok = bool(got) == should_flag
         failures += 0 if ok else 1
         print(f"  [{'ok' if ok else 'FAIL'}] {label:62s} -> {'flagged' if got else 'clean'}")
+    return failures
 
+
+def _check_statements_linear():
+    """statements() must stay LINEAR in a statement's length.
+
+    It was quadratic: `"".join(buf).isspace()` ran per character over the whole
+    buffered statement. One 33,000-element array initialiser -- an ordinary
+    shape for a generated table -- took 64 s, which pushed the scan of src/ past
+    the CI job's five minutes and forced such a file to be excluded by name.
+
+    Measured after the fix: 0.023 s for the same input, 2,806x faster, with
+    identical output. The bound below is ~90x that, so it holds on a slow box
+    while the quadratic form (a minute) cannot pass it.
+    """
+    print("\nstatements() stays linear:")
+    text = "static const unsigned short T[] = {" + ",".join(str(i % 65536) for i in range(33000)) + "};"
+    begin = time.perf_counter()
+    pieces = [body for _, body in statements(text)]
+    elapsed = time.perf_counter() - begin
+    # The braces are statement boundaries, so a table initialiser comes out in
+    # three pieces. What matters is that the pieces still spell the input
+    # exactly -- a "fast" version that dropped characters would be worthless.
+    intact = "".join(pieces) == text
+    ok = elapsed < 2.0 and intact
+    print(f"  [{'ok' if ok else 'FAIL'}] {'33,000-element initialiser, nothing lost':62s} "
+          f"-> {len(pieces)} piece(s), {'intact' if intact else 'CORRUPT'}, {elapsed:.3f}s")
+    return 0 if ok else 1
+
+
+def self_test():
+    failures = _check_group("must FLAG:", MUST_FLAG, True)
+    failures += _check_group("\nmust NOT flag:", MUST_NOT_FLAG, False)
+    failures += _check_splitter()
+    failures += _check_lexer()
+    failures += _check_statements_linear()
     print(f"\n{'FAIL' if failures else 'PASS'}: self-test, {failures} failure(s)")
     return failures
+
+
+def _print_allowlist():
+    print(f"{len(ALLOWLIST)} allowlisted identifiers:\n")
+    for ident, why in sorted(ALLOWLIST.items()):
+        print(f"  {ident:34s} {why}")
+    print("\nPer-line alternative, preferred for a one-off:")
+    print("  fprintf(...);  // credential-log-ok: <reason>")
+    return 0
+
+
+def _scan_tree(root):
+    """Scan root, printing every finding as it is found. -> (files, findings)."""
+    total = 0
+    files = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for fn in sorted(filenames):
+            if not fn.endswith(SOURCE_SUFFIXES):
+                continue
+            path = os.path.join(dirpath, fn)
+            files += 1
+            for line, hits, stmt in scan_file(path):
+                total += 1
+                print(f"{path}:{line}: credential-looking {', '.join(hits)} in a message sink")
+                print(f"    {stmt}")
+    return files, total
+
+
+def _report(root, files, total):
+    """Print the verdict for a finished scan. -> the process exit status."""
+    # A root with no source files used to exit 0 with PASS, which is the worst
+    # kind of green: it looks like coverage.
+    if files == 0:
+        print(f"\nFAIL: no source files found under {root}/ — nothing was checked.")
+        return 1
+
+    print(f"\nscanned {files} file(s) under {root}/")
+    if total:
+        print(
+            f"FAIL: {total} statement(s) pass a credential-looking value to a log,\n"
+            f"      exception or format call.\n\n"
+            f"If one is safe, prefer a per-line marker carrying the reason:\n"
+            f"      // credential-log-ok: <why this cannot disclose>\n"
+            f"Use ALLOWLIST in this script only for a name that is safe EVERYWHERE.\n"
+            f"Do not widen the credential vocabulary to silence a finding."
+        )
+        return 1
+    print("PASS: no credential-looking value reaches a message sink.")
+    return 0
 
 
 def main():
@@ -658,50 +881,13 @@ def main():
         return 1 if self_test() else 0
 
     if args.list_allowlisted:
-        print(f"{len(ALLOWLIST)} allowlisted identifiers:\n")
-        for ident, why in sorted(ALLOWLIST.items()):
-            print(f"  {ident:34s} {why}")
-        print("\nPer-line alternative, preferred for a one-off:")
-        print("  fprintf(...);  // credential-log-ok: <reason>")
-        return 0
+        return _print_allowlist()
 
     if not os.path.isdir(args.root):
         print(f"ERROR: {args.root} is not a directory", file=sys.stderr)
         return 2
 
-    total = 0
-    files = 0
-    for dirpath, dirnames, filenames in os.walk(args.root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for fn in sorted(filenames):
-            if not fn.endswith(SOURCE_SUFFIXES):
-                continue
-            path = os.path.join(dirpath, fn)
-            files += 1
-            for line, hits, stmt in scan_file(path):
-                total += 1
-                print(f"{path}:{line}: credential-looking {', '.join(hits)} in a message sink")
-                print(f"    {stmt}")
-
-    # A root with no source files used to exit 0 with PASS, which is the worst
-    # kind of green: it looks like coverage.
-    if files == 0:
-        print(f"\nFAIL: no source files found under {args.root}/ — nothing was checked.")
-        return 1
-
-    print(f"\nscanned {files} file(s) under {args.root}/")
-    if total:
-        print(
-            f"FAIL: {total} statement(s) pass a credential-looking value to a log,\n"
-            f"      exception or format call.\n\n"
-            f"If one is safe, prefer a per-line marker carrying the reason:\n"
-            f"      // credential-log-ok: <why this cannot disclose>\n"
-            f"Use ALLOWLIST in this script only for a name that is safe EVERYWHERE.\n"
-            f"Do not widen the credential vocabulary to silence a finding."
-        )
-        return 1
-    print("PASS: no credential-looking value reaches a message sink.")
-    return 0
+    return _report(args.root, *_scan_tree(args.root))
 
 
 if __name__ == "__main__":
