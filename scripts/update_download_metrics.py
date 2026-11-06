@@ -502,6 +502,55 @@ def _line(ok, label, detail):
     return 0 if ok else 1
 
 
+#: Which axis each coordinate attribute belongs to. The first cut of the
+#: bounds check compared EVERY value against max(W, H) = 760, so a y of 300-760
+#: -- geometry drawn well below a 280-tall canvas -- passed; and it read only
+#: cx/cy/x1/y1/x2/y2, so the <text> x/y (the callout's `ly - 12` among them) and
+#: the polyline/polygon `points` were never looked at (roborev on 35e6ed3).
+X_ATTRS = ("cx", "x1", "x2", "x")
+Y_ATTRS = ("cy", "y1", "y2", "y")
+#: The lookbehind matters: without it the bare `x` alternative matches the `x`
+#: inside `viewBox="0 0 760 280"` and `rx="10"`, which is how the first attempt
+#: at this check reported every chart as unparseable.
+NUMBER = re.compile(r'(?<![A-Za-z-])(' + "|".join(X_ATTRS + Y_ATTRS) + r')="([^"]*)"')
+POINTS = re.compile(r'points="([^"]*)"')
+
+
+def svg_coordinates(svg):
+    """(x values, y values, values that are not finite numbers).
+
+    `points` pairs are split and attributed by position, so the series and the
+    area polygon are checked like every other coordinate. A value that does not
+    parse as a finite float is RETURNED rather than skipped: `nan` and `inf`
+    are exactly what a division gone wrong emits, and dropping them is how such
+    a chart would pass.
+    """
+    xs, ys, bad = [], [], []
+
+    def take(axis, raw):
+        try:
+            value = float(raw)
+        except ValueError:
+            bad.append(raw)
+            return
+        if value != value or value in (float("inf"), float("-inf")):
+            bad.append(raw)
+            return
+        axis.append(value)
+
+    for match in NUMBER.finditer(svg):
+        take(xs if match.group(1) in X_ATTRS else ys, match.group(2))
+    for match in POINTS.finditer(svg):
+        for pair in match.group(1).split():
+            parts = pair.split(",")
+            if len(parts) != 2:
+                bad.append(pair)
+                continue
+            take(xs, parts[0])
+            take(ys, parts[1])
+    return xs, ys, bad
+
+
 def _check_renders():
     """Every series shape must produce well-formed XML inside its own box.
 
@@ -521,12 +570,50 @@ def _check_renders():
         except ET.ParseError as exc:
             detail = "XML ERROR: %s" % exc
         else:
+            xs, ys, bad = svg_coordinates(svg)
             plot = Plot(points)
-            coords = [float(v) for v in re.findall(r'(?:cx|cy|x1|y1|x2|y2)="([-\d.]+)"', svg)]
-            inside = all(-1 <= c <= max(plot.W, plot.H) + 1 for c in coords)
-            detail = "%d bytes, %d coords%s" % (len(svg), len(coords),
-                                                "" if inside else ", OUT OF BOUNDS")
+            over = ([v for v in xs if not -1 <= v <= plot.W + 1]
+                    + [v for v in ys if not -1 <= v <= plot.H + 1])
+            inside = not over and not bad
+            detail = "%d bytes, %d x / %d y" % (len(svg), len(xs), len(ys))
+            if bad:
+                detail += ", UNPARSEABLE: %s" % bad[:3]
+            if over:
+                detail += ", OUT OF BOUNDS: %s" % over[:3]
         failures += _line(inside, label, detail)
+    return failures
+
+
+def _check_coordinate_reader():
+    """svg_coordinates() itself, since the render checks lean on it.
+
+    Each case is something the first cut of the bounds check got wrong: it
+    compared y against max(W, H), never read <text> or `points`, and its
+    `[-\d.]+` pattern silently DROPPED nan/inf rather than failing on them
+    (roborev on 35e6ed3).
+    """
+    print("\nsvg_coordinates():")
+    failures = 0
+    xs, ys, bad = svg_coordinates(
+        '<svg viewBox="0 0 760 280" width="760">'
+        '<rect rx="10" x="5" y="7"/>'
+        '<line x1="1" y1="2" x2="3" y2="4"/>'
+        '<circle cx="11" cy="13"/>'
+        '<text x="17" y="19">x</text>'
+        '<polyline points="21,23 29,31"/></svg>')
+    failures += _line(sorted(xs) == [1.0, 3.0, 5.0, 11.0, 17.0, 21.0, 29.0],
+                      "every x attribute and the points' x halves", str(sorted(xs)))
+    failures += _line(sorted(ys) == [2.0, 4.0, 7.0, 13.0, 19.0, 23.0, 31.0],
+                      "every y attribute and the points' y halves", str(sorted(ys)))
+    failures += _line(bad == [],
+                      "viewBox and rx are NOT read as x coordinates", "none")
+
+    _, _, bad = svg_coordinates('<circle cx="nan" cy="inf"/><text x="-inf" y="q"/>')
+    failures += _line(sorted(bad) == ["-inf", "inf", "nan", "q"],
+                      "nan / inf / junk are reported, never dropped", str(sorted(bad)))
+
+    _, _, bad = svg_coordinates('<polyline points="1,2 3"/>')
+    failures += _line(bad == ["3"], "a half point pair is reported", str(bad))
     return failures
 
 
@@ -589,6 +676,7 @@ def _check_scales():
 
 def self_test():
     failures = _check_renders()
+    failures += _check_coordinate_reader()
     failures += _check_geometry()
     failures += _check_labels()
     failures += _check_scales()
