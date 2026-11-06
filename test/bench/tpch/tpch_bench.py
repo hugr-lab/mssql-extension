@@ -681,12 +681,24 @@ def as_float(s):
 #: The widest decimal scale this harness sees: SQL Server returns TPC-H's
 #: aggregates as decimal(38,6).
 MAX_DECIMAL_SCALE = 6
-#: A DOUBLE's shortest round-trip form needs up to 17 significant digits. An
-#: exact decimal of these magnitudes needs far fewer, so a value carrying this
-#: many digits is a double however few decimal places it happens to print --
-#: which is what rules out the large-magnitude case (a double near 1e12 prints
-#: only four decimals).
-MAX_EXACT_DIGITS = 15
+def double_form(s):
+    """Is `s` the shortest round-trip form of a DOUBLE?
+
+    This replaced a significant-digit count, which was the wrong
+    discriminator and wrong in the dangerous direction (roborev on 423f5db).
+    q01's own `sum_charge` is `decimal(38,6)` and at SF1 prints 18 significant
+    digits -- so a 15-digit ceiling sent an EXACT sum to the tolerance branch,
+    where a dropped `lineitem` passed from SF10 up. Even after the relative
+    term dropped to 1e-13 a one-cent rounding difference still passed there
+    (bound 0.0235 at 2.3e11 against a 0.01 difference).
+
+    The printed form is the real evidence. A DOUBLE round-trips through repr()
+    unchanged. An exact decimal normally does not: both engines pad to the
+    declared scale, so a decimal(38,6) carries trailing zeros repr() drops
+    (`234603658237.282580` -> `234603658237.2826`) and an integer prints
+    without the `.0` repr() adds.
+    """
+    return repr(float(s)) == s
 
 
 #: The relative term, sized to what the two engines' DOUBLES can actually
@@ -714,7 +726,7 @@ def tolerance(magnitude):
     return max(ABS_TOLERANCE, REL_TOLERANCE * magnitude)
 
 
-def exact_pair(dx, dy):
+def exact_pair(x, y, dx, dy):
     """Are these two both printed as an EXACT decimal of ONE scale?
 
     An equal scale ALONE is not evidence of that, which is the defect roborev
@@ -738,14 +750,19 @@ def exact_pair(dx, dy):
     B on exactly the queries this harness exists to judge.
 
     Hence two further conditions: the scale must be one a decimal column could
-    actually have, and neither value may carry a double's full precision.
+    actually have, and the pair must not look like two doubles.
+
+    When BOTH sides are a double's shortest form the pair is ambiguous -- it
+    could be two doubles, or two decimals that happen to print that way -- so
+    it takes the tolerance, with the 1e-13 relative term as the backstop. When
+    either side is not, the pair cannot be two doubles and is compared exactly.
     """
     exponent = dx.as_tuple().exponent
     if exponent != dy.as_tuple().exponent:
         return False
     if -exponent > MAX_DECIMAL_SCALE:
         return False
-    return max(len(dx.as_tuple().digits), len(dy.as_tuple().digits)) <= MAX_EXACT_DIGITS
+    return not (double_form(x) and double_form(y))
 
 
 def as_decimal(s):
@@ -806,7 +823,7 @@ def same(x, y):
         return True
     dx, dy = as_decimal(x), as_decimal(y)
     if dx is not None and dy is not None:
-        if exact_pair(dx, dy):
+        if exact_pair(x, y, dx, dy):
             return dx == dy
         return abs(dx - dy) <= tolerance(max(abs(dx), abs(dy)))
     fx, fy = as_float(x), as_float(y)
@@ -887,8 +904,27 @@ SAME_TESTS = [
      "25.522005853257337", "25.522005853257333", True),
     ("two DOUBLEs one ulp apart (q08 mkt_share)",
      "0.034435890263343130", "0.034435890263343136", True),
-    ("two DOUBLEs one ulp apart at a large magnitude (q06 revenue)",
-     "123141078.2283", "123141078.22830002", True),
+    # Genuinely ADJACENT doubles printed at the same scale. The first version
+    # of this fixture paired "123141078.2283" with "123141078.22830002", whose
+    # scales differ (4 vs 8), so it took the tolerance at exact_pair's first
+    # check and never reached the guards it was meant to exercise (roborev on
+    # 423f5db).
+    ("two adjacent DOUBLEs, same scale (q06 revenue magnitude)",
+     "123141078.22830002", "123141078.22830003", True),
+    # Scale <= 6 AND more than 15 significant digits: the shape a digit-count
+    # guard claimed to cover. These are genuinely adjacent doubles.
+    ("adjacent DOUBLEs at scale 4 with 17 digits",
+     "1234500000000.0002", "1234500000000.0005", True),
+    ("adjacent DOUBLEs at scale 2 with 16 digits",
+     "56000000000000.02", "56000000000000.03", True),
+    # ... and the EXACT decimal of the same shape must still be compared
+    # exactly. q01's sum_charge is decimal(38,6) and prints 18 significant
+    # digits at SF1, so the old 15-digit ceiling sent it to the tolerance
+    # branch, where a dropped lineitem passed from SF10 up and -- even after
+    # the relative term dropped to 1e-13 -- a one-cent rounding difference
+    # still passed (bound 0.0235 against a 0.01 difference).
+    ("q01's decimal(38,6) sum_charge, ONE CENT apart",
+     "234603658237.282580", "234603658237.292580", False),
     # ... and the guard must not swallow a real difference at double precision.
     ("two DOUBLEs a whole percent apart", "25.522005853257337", "25.777005853257337", False),
     # The hole the digit guard opened, and the reason the relative term is
