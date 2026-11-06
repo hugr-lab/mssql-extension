@@ -768,11 +768,13 @@ path) is spec 091's follow-up.
   the kernel relies on and writes `code_page_tables.cpp`. A byte is read in a
   database whose default collation has the page: `COLLATE` would convert the
   characters instead of reinterpreting the bytes. Python's codecs differ from the
-  server in 110 single bytes and every invalid double-byte sequence. Each page is
-  probed under a second collation of another kind or version (`cpNNN.alt.psv`,
-  which must read identically), and each double-byte page also reads ~400 seeded
-  random 3–12-byte strings whole (`cpNNN.strings.psv`), which the emitter checks
-  against its pair rules and the unit test against the kernel.
+  server in 110 single bytes, every invalid double-byte sequence and 249 cp950
+  pairs. Each page is probed under a second collation of another kind or version
+  (`cpNNN.alt.psv`, which must read identically; not committed, so
+  `provenance.txt` records the comparison beside the server build, the date, the
+  generator's commit and each page's collations), and each double-byte page also
+  reads ~400 seeded random 3–12-byte strings whole (`cpNNN.strings.psv`), which
+  the emitter checks against its pair rules and the unit test against the kernel.
 - **Double-byte rules**, all from the data: a lead byte alone reads as nothing
   (the server drops it), a lead byte and any trail byte 0x01–0xFF as one code
   point (`?`, or `・` in 932, when invalid), a lead byte and 0x00 as the

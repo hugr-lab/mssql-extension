@@ -23,20 +23,24 @@ not to the collation the tables are later looked up by. The scratch databases ar
 dropped when the run ends, failed or not (KEEP_DATABASES=1 keeps them).
 
 Output in tools/code_pages/data/, sorted and without timestamps, so a rerun against the
-same server build gives an empty diff. The run writes into a temporary directory and
-moves the files into place only when every one has the rows it should, so a failed run
-leaves the committed data as it was:
+same server build gives an empty diff in every data file; provenance.txt alone records
+the run. The run writes into a temporary directory and moves the files into place only
+when every one has the rows it should, so a failed run leaves the committed data as it was:
   cp<NNN>.psv          in_hex|out_utf16le_hex: every single byte and, for the double-byte
                        pages, every pair whose first byte is >= 0x80
   cp<NNN>.alt.psv      the same under the page's second collation (evidence: the emitter
-                       compares it with cp<NNN>.psv and emits nothing from it)
+                       compares it with cp<NNN>.psv and emits nothing from it; not
+                       committed, so provenance.txt records the comparison)
   cp<NNN>.strings.psv  double-byte pages: ~400 pseudo-random strings of 3-12 bytes
                        (seeded, the same on every run), so the unit test checks the kernel
                        against whole strings the server read, not only against the model
                        of pairs the emitter derives
   collations.psv       name|collation_id|lcid|code_page|version, from sys.fn_helpcollations()
-  provenance.txt       the server build the data came from, kept out of the tables
+  provenance.txt       the run, kept out of the tables: the server build, the date, the
+                       generator's commit, how many pages' second collation read alike,
+                       and each page's two collations
 """
+import datetime
 import os
 import pathlib
 import re
@@ -92,6 +96,8 @@ COLLATIONS = ("SELECT name, CONVERT(int, COLLATIONPROPERTY(name, 'CollationId'))
               "FROM sys.fn_helpcollations()")
 PROVENANCE = ("SELECT CONVERT(nvarchar(64), SERVERPROPERTY('ProductVersion')) AS version, "
               "CONVERT(nvarchar(128), SERVERPROPERTY('Edition')) AS edition")
+# The script writes the server's row here; it goes into provenance.txt, not into data/.
+SERVER_ROW = "server.psv"
 
 
 def splitmix64(seed):
@@ -189,9 +195,9 @@ def build_script(dsn, out):
     lines.append(f"COPY (SELECT * FROM mssql_scan('m', '{q(COLLATIONS)}') ORDER BY name) "
                  f"TO '{q(str(out / 'collations.psv'))}' (HEADER false, DELIMITER '|', QUOTE '');")
     lines.append(f"COPY (SELECT * FROM mssql_scan('m', '{q(PROVENANCE)}')) "
-                 f"TO '{q(str(out / 'provenance.txt'))}' (HEADER false, DELIMITER '|', QUOTE '');")
+                 f"TO '{q(str(out / SERVER_ROW))}' (HEADER false, DELIMITER '|', QUOTE '');")
     expect["collations.psv"] = None
-    expect["provenance.txt"] = 1
+    expect[SERVER_ROW] = 1
     return "\n".join(lines) + "\n", expect
 
 
@@ -226,6 +232,40 @@ def run_duckdb(duckdb, script, bail=True):
     return subprocess.run(argv, input=script, text=True, capture_output=True)
 
 
+def generator_commit():
+    """The commit this ran from, `+modified` when the generator or emitter differs from it."""
+    def git(*args):
+        return subprocess.run(["git", "-C", str(REPO)] + list(args), capture_output=True, text=True)
+
+    # Runs after the server's answers are in: no git must not throw them away.
+    try:
+        head = git("rev-parse", "HEAD")
+        if head.returncode != 0:
+            return "unknown"
+        tools = ("tools/code_pages/generate.py", "tools/code_pages/emit_tables.py")
+        modified = git("diff", "--quiet", "HEAD", "--", *tools).returncode != 0
+    except OSError:
+        return "unknown"
+    return head.stdout.strip() + ("+modified" if modified else "")
+
+
+def provenance(staging):
+    """provenance.txt: the record of this run. The .alt.psv probes are not committed, so
+    this is the only trace their check leaves in the repository (review of #527)."""
+    alike = [cp for cp in PAGES
+             if (staging / f"cp{cp}.alt.psv").read_bytes() == (staging / f"cp{cp}.psv").read_bytes()]
+    differ = " ".join(str(cp) for cp in PAGES if cp not in alike)
+    lines = [
+        "server|" + (staging / SERVER_ROW).read_text().strip(),
+        "date|" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
+        "generator|" + generator_commit(),
+        f"second_collation|{len(alike)} of {len(PAGES)} pages: cp<NNN>.alt.psv byte-identical "
+        "to cp<NNN>.psv" + (f"; differ: {differ}" if differ else ""),
+    ]
+    lines += [f"page|{cp}|{first}|{second}" for cp, (first, second) in PAGES.items()]
+    return "\n".join(lines) + "\n"
+
+
 def main():
     dsn = os.environ.get("MSSQL_TEST_DSN")
     if not dsn:
@@ -257,9 +297,11 @@ def main():
                 if clean.returncode != 0 or clean.stderr.strip():
                     print("dropping the mssql_cpgen_* databases failed; drop them by hand:\n"
                           + redact(clean.stderr or clean.stdout, dsn), file=sys.stderr)
-        for name in expect:
+        (staging / "provenance.txt").write_text(provenance(staging))
+        written = [name for name in expect if name != SERVER_ROW] + ["provenance.txt"]
+        for name in written:
             shutil.move(str(staging / name), str(out / name))
-    for name, rows in expect.items():
+    for name in written:
         with open(out / name) as fh:
             print(f"{name:<20} {sum(1 for _ in fh):>7} rows")
 

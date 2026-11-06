@@ -88,6 +88,9 @@ this PR. It serves two paths with different needs:
 - **F4. Python is not the server.** Python's codecs leave 110 bytes of 874 / 1250-1258 undefined,
   and the server maps every one of them (F13). These are exactly the gaps in #361's tables:
   `CP1252_HIGH` holds 123 = 128 - 5 code points (`mssql_code_page.cpp:60`), `CP874_HIGH` 97 (`:25`).
+  On the double-byte pages Python refuses 9,896 to 19,144 of a page's 33,024 inputs, all of which
+  the server reads, and it reads 249 pairs of 950 as other characters than the server does (F14).
+  That is the measured case for generating the tables from the server (D1).
 - **F5. The server best-fits on the way into a code page.** The staged MERGE stages a code-page
   column as `nvarchar(max)` because, as `varchar`, "'Łukasz' would match 'Lukasz'"
   (`src/dml/merge/mssql_merge_rewrite.cpp:71-75`).
@@ -128,8 +131,8 @@ of the committed `tools/code_pages/data/` (D3), recounted from the files.
 - **F12. What works: one database per code page.** In a database whose default collation is of the
   page (`CREATE DATABASE <db> COLLATE <collation>`), a probe run in its context
   (`EXEC <db>.sys.sp_executesql N'...'`) reads bytes under that page:
-  `CONVERT(nvarchar(n), CONVERT(varchar(n), <binary>))` (`generate.py:76-80`). The collations, two a
-  page, of different kinds or versions (`generate.py:52-69`):
+  `CONVERT(nvarchar(n), CONVERT(varchar(n), <binary>))` (`generate.py:80-84`). The collations, two a
+  page, of different kinds or versions (`generate.py:56-73`):
 
   | page | first | second |
   |---|---|---|
@@ -165,7 +168,7 @@ of the committed `tools/code_pages/data/` (D3), recounted from the files.
     replacement (`?` on 936 / 949 / 950, U+30FB `・` on 932: 932 `81 01` and `81 20` -> U+30FB).
   - A lead byte and 0x00 read as the replacement, then U+0000: the 0x00 is not consumed.
   - A pair whose first byte is not a lead byte reads as the two bytes read alone; when its second
-    byte is a lead byte, that one reads as nothing (`emit_tables.py:102-106`).
+    byte is a lead byte, that one reads as nothing (`emit_tables.py:104-108`).
   - 932's single bytes: 0x5C -> U+005C, 0x80 -> U+0080, 0xA0 -> U+F8F0, 0xA1-0xDF -> U+FF61-U+FF9F,
     0xFD-0xFF -> U+F8F1-U+F8F3. Pairs: 0x82A0 -> U+3042, 0x8140 -> U+3000.
   - Against Python: of each page's 33,024 probed inputs Python refuses 9,896 (932), 11,105 (936),
@@ -177,7 +180,7 @@ of the committed `tools/code_pages/data/` (D3), recounted from the files.
   - Many to one: on 932, 396 characters are each read from two or more sequences, 794 in all (NEC /
     IBM duplicates); on 950, 10 characters from 20. Counted without the replacement.
 - **F15. The output bound is 3 UTF-8 bytes per input byte, on every page.** No answer holds a
-  surrogate (`emit_tables.py:51-60` refuses one), so every code point is in the BMP (at most 3
+  surrogate (`emit_tables.py:53-62` refuses one), so every code point is in the BMP (at most 3
   UTF-8 bytes). Single bytes reach 3: 437 0x9E -> U+20A7, 1252 0x80 -> U+20AC, 932 0xA0 -> U+F8F0
   and its half-width katakana, 936 0x80 -> U+20AC, 949 / 950 0xFF -> U+F8F7 / U+F8F8. A pair reads
   as at most 3 bytes for 2; lead + 0x00 consumes the lead alone and writes at most 3 for it; a lone
@@ -192,11 +195,13 @@ of the committed `tools/code_pages/data/` (D3), recounted from the files.
   - `_UTF8` in the name and page 65001 coincide on every row. The 5,540 `CollationId`s are distinct.
 - **F17. The reading belongs to the code page, not the collation.** On all 16 pages the second
   collation (F12) reads every byte and pair exactly as the first: the 16 `cpNNN.alt.psv` files are
-  byte-identical to their `cpNNN.psv`. The 1,600 seeded strings (400 a double-byte page, 3-12
-  bytes) read whole by the server agree with F14's rules applied left to right. In 98 / 275 / 267
-  / 290 of them (932 / 936 / 949 / 950) a pair whose trail is itself a lead byte is followed by
-  more bytes: the case a pair's answer alone cannot settle (consumed as one pair, or the lead read
-  alone and the trail dropped), which the first draft meant to ask with triples.
+  byte-identical to their `cpNNN.psv`. The probes are not committed (D3), so `provenance.txt`
+  records that comparison (`second_collation|16 of 16 pages`). The 1,600 seeded strings (400 a
+  double-byte page, 3-12 bytes) read whole by the server agree with F14's rules applied left to
+  right. In 98 / 275 / 267 / 290 of them (932 / 936 / 949 / 950) a pair whose trail is itself a
+  lead byte is followed by more bytes: the case a pair's answer alone cannot settle (consumed as
+  one pair, or the lead read alone and the trail dropped), which the first draft meant to ask with
+  triples.
 
 ## Decisions
 
@@ -218,90 +223,105 @@ of the committed `tools/code_pages/data/` (D3), recounted from the files.
 - **D2: the generator, as built.**
   - **Method (F11, F12).** Two scratch databases per code page, `mssql_cpgen_<cp>` and
     `mssql_cpgen_<cp>_alt`, created `COLLATE` the page's first and second collation
-    (`generate.py:156-157`, `:181`), and every probe run in one through
-    `EXEC <db>.sys.sp_executesql N'...'` (`:182`). Never a `COLLATE` or a collated column to read
+    (`generate.py:162-163`, `:187`), and every probe run in one through
+    `EXEC <db>.sys.sp_executesql N'...'` (`:188`). Never a `COLLATE` or a collated column to read
     bytes: both convert (F11).
   - **Tools: Python over the extension's own CLI; no C++ tool.**
     - `tools/code_pages/generate.py` writes the whole run as one DuckDB script (ATTACH,
       `mssql_exec` for the databases, `COPY (SELECT i, o FROM mssql_scan(...) ORDER BY i) TO ...`
-      for the answers; `:160-195`) and runs it on the release build's CLI (`:222-226`, `:233-235`).
+      for the answers; `:166-201`) and runs it on the release build's CLI (`:228-232`, `:273-275`).
       F12 showed `mssql_scan` suffices; the tables need no TDS access of their own.
     - `tools/code_pages/emit_tables.py` checks the answers (below) and writes the C++ tables.
     - The draft's `wire_keys.cpp`, which was to read every collation's 5 wire bytes, is not built
       (Follow-ups).
-  - **Asked per page** (`generate.py:83-87`, `:109-138`):
+  - **Asked per page** (`generate.py:87-91`, `:115-144`):
     - every byte 0x00-0xFF and, on a double-byte page, every pair whose first byte is >= 0x80,
       under both collations (F12);
     - on a double-byte page, 400 distinct seeded strings of 3-12 bytes, as `varchar(16)` read into
-      `nvarchar(16)` (`:136-138`). The PRNG is splitmix64, seeded per page (`:97-113`), so the set
+      `nvarchar(16)` (`:142-144`). The PRNG is splitmix64, seeded per page (`:103-119`), so the set
       is the same on every Python version. The bytes are weighted toward what a double-byte page
       reads specially: 40 % lead range 0x81-0xFE, 20 % trails 0x40-0x7E, 10 % 0x00, 10 % the
-      edges 0x80 / 0xA0 / 0xFD-0xFF, 20 % any (`:114-132`).
+      edges 0x80 / 0xA0 / 0xFD-0xFF, 20 % any (`:120-138`).
   - **Asked once:** every `sys.fn_helpcollations()` row with `COLLATIONPROPERTY` `CollationId`,
-    `LCID`, `CodePage` and `Version` (`:88-92`), and the server's `ProductVersion` and edition
-    (`:93-94`).
+    `LCID`, `CodePage` and `Version` (`:92-96`), and the server's `ProductVersion` and edition
+    (`:97-98`).
   - **Transport.** Every answer travels as hex text (`CONVERT(varchar(n), <varbinary>, 2)`,
-    `:76-80`), so no decode on the client touches the data.
+    `:80-84`), so no decode on the client touches the data.
   - **Guards.** The generator's own SQL is not trusted, and neither is the CLI:
     - the CLI can exit 0 on a runtime error, so every output file must hold its row count (256 /
-      33,024 / 400 / at least one collation / one provenance row), or the run fails naming the
-      file (`:246-252`, expected counts at `:183`, `:188`, `:193-194`);
+      33,024 / 400 / at least one collation / one server row), or the run fails naming the
+      file (`:286-292`, expected counts at `:189`, `:194`, `:199-200`);
     - the run writes into a temporary directory and moves the files into `data/` only when every
-      one is complete (`:239-241`, `:260-261`), so a failed run leaves the committed data as it was;
+      one is complete (`:279-281`, `:300-303`), so a failed run leaves the committed data as it was;
     - the scratch databases are dropped in a `finally`, failed run or not, by a cleanup script
-      without `-bail`, so every `DROP` is tried (`:198-204`, `:253-259`; `KEEP_DATABASES=1` keeps
+      without `-bail`, so every `DROP` is tried (`:204-210`, `:293-299`; `KEEP_DATABASES=1` keeps
       them);
-    - the DSN goes to the CLI on stdin only, never in argv or a file (`:222-226`; the Makefile
-      passes it through the environment, `Makefile:867-871`), and every error is printed through
+    - the DSN goes to the CLI on stdin only, never in argv or a file (`:228-232`; the Makefile
+      passes it through the environment, `Makefile:869-873`), and every error is printed through
       `redact()`: the DSN as given and as quoted into the script, `password=` / `pwd=` values, a
-      URL's password (`generate.py:146-153`);
+      URL's password (`generate.py:152-159`);
     - a collation `PAGES` names that the committed `collations.psv` does not give that page stops
-      the run before it starts (`:207-219`, `:237`).
+      the run before it starts (`:213-225`, `:277`).
   - **Assertions** (the emitter's, `emit_tables.py:7-23`; a failure stops it and names the case):
-    - bytes 0x00-0x7F read as themselves on every page (`:87-88`). The ASCII steps (D5) rely on it;
-    - no answer holds a surrogate (`:51-60`); a single-byte page reads every byte as one code point
-      (`:89-92`; a lead byte is a byte 0x80-0xFF that reads as nothing);
-    - a double-byte page follows F14's rules, pair by pair (`:93-115`), and its strings read as
-      the rules applied left to right (`:118-133`, `:149-165`). Together that is the 3x bound (F15);
-    - each second collation reads every byte and pair as the first (`:136-146`, F17);
+    - bytes 0x00-0x7F read as themselves on every page (`:89-90`). The ASCII steps (D5) rely on it;
+    - no answer holds a surrogate (`:53-62`); a single-byte page reads every byte as one code point
+      (`:91-94`; a lead byte is a byte 0x80-0xFF that reads as nothing);
+    - a double-byte page follows F14's rules, pair by pair (`:95-117`), and its strings read as
+      the rules applied left to right (`:120-135`, `:151-167`). Together that is the 3x bound (F15);
+    - each second collation reads every byte and pair as the first (`:138-148`, F17);
     - the collations: names are plain identifiers, versions fit a byte, `CollationId`s distinct,
       no two names that differ only in case, a SortId names one page and so does (LCID, `_UTF8`)
-      (`:168-194`, F16); the pages the collations name, but 0 and 65001, are exactly the pages
-      probed (`:215-218`).
-    - A missing `.alt.psv` or `.strings.psv` is reported, not fatal (`:219-231`): the tables can be
-      emitted from the primary data of an older run. All 20 are committed.
+      (`:181-207`, F16); the pages the collations name, but 0 and 65001, are exactly the pages
+      probed (`:228-231`).
+    - A missing `.alt.psv` or `.strings.psv` is reported, not fatal (`:232-248`): the tables can be
+      emitted from the primary data of an older run. The 4 `.strings.psv` are committed. The 16
+      `.alt.psv` are not (`.gitignore`), so a fresh checkout has none to compare and the note quotes
+      what `provenance.txt` recorded of the run's own comparison (`:170-178`, `:242-245`).
   - **Not asked**, against the first draft: the triples (F17's strings settle their question);
     an `EXCEPT` over every other collation of a page (one second collation of another kind or
     version instead, F17); representability (D8); the wire bytes; runs on 2022 and 2019 (D10).
 - **D3: the committed outputs.** All under `tools/code_pages/data/`, sorted (`ORDER BY i`,
-  `generate.py:169`; collations by name, `:189`), with no date and no server version in any data
-  file:
+  `generate.py:175`; collations by name, `:195`), with no date and no server version in any data
+  file but `provenance.txt`:
   - `cp<NNN>.psv`: `in_hex|out_utf16le_hex`, every byte and, on a double-byte page, every pair
     (F12): 135,168 rows;
-  - `cp<NNN>.alt.psv`: the same under the page's second collation, evidence only (F17): 135,168;
+  - `cp<NNN>.alt.psv`: the same under the page's second collation, evidence only (F17): 135,168
+    rows, not committed (`.gitignore`). The generator compares each with its `cp<NNN>.psv` byte for
+    byte and `provenance.txt` records the result;
   - `cp<NNN>.strings.psv` (double-byte pages): the strings, same columns: 4 x 400;
   - `collations.psv`: `name|collation_id|lcid|code_page|version`, 5,540 rows. It replaces the
     research's `tools/collations.psv` (F1); 085 names this file (`spec.md:125`, `:570`), 086 none;
-  - `provenance.txt`: `17.0.4075.5|Enterprise Developer Edition (64-bit)`, the one place the
-    server is named.
+  - `provenance.txt`: the record of the run, and the one place the server is named
+    (`generate.py:235-266`, review of #527):
+    - `server|17.0.4075.5|Enterprise Developer Edition (64-bit)`;
+    - `date|`, the UTC day of the run;
+    - `generator|`, the commit it ran from, `+modified` when `generate.py` or `emit_tables.py`
+      differs from it;
+    - `second_collation|16 of 16 pages: …`, the comparison above;
+    - a `page|<cp>|<first>|<second>` row per page (F12's table).
 
-  277,476 rows, about 3 MB. Emitted from them: `src/codec/code_page/code_page_tables.cpp` (16,543
-  lines), plain integer arrays (MSVC limits string literals, not array initializers) between
-  `clang-format off` / `on`. `make code-pages-generate` (needs a server, builds the release CLI
-  first) asks again and re-emits; `make code-pages-tables` (no server) re-emits from `data/`
-  (`Makefile:869-874`). The PR diff of `data/` is what a reviewer reads. There is no separate
-  fixture: the unit test replays `data/` (Tests 1). A rerun on the same build should leave an
-  empty diff, `provenance.txt` included; that a second run does is not shown yet (Acceptance).
+    It is the one file a rerun changes.
+
+  142,308 rows committed, 1.7 MB (the 135,168 `.alt.psv` rows, 1.4 MB, are not). Emitted from them:
+  `src/codec/code_page/code_page_tables.cpp` (16,543 lines), plain integer arrays (MSVC limits
+  string literals, not array initializers) between `clang-format off` / `on`.
+  `make code-pages-generate` (needs a server, builds the release CLI first) asks again and
+  re-emits; `make code-pages-tables` (no server) re-emits from `data/` (`Makefile:871-876`). The PR
+  diff of `data/` is what a reviewer reads. There is no separate fixture: the unit test replays
+  `data/` (Tests 1). A rerun on the same build leaves every data file byte-identical, `.alt.psv`
+  included: shown on 17.0.4075.5 on 2026-11-06 (Acceptance). `provenance.txt` records the run, so
+  its `date` and `generator` lines can change.
 - **D4: one module, DuckDB-free.** `src/codec/code_page/code_page.cpp` (kernels and lookups) and
   the emitted `code_page_tables.cpp`, headers `src/include/codec/code_page/code_page.hpp` and
   `code_page_tables.hpp`. Namespace `duckdb::mssql::codec::code_page`, as the family modules
   (`src/codec/binary_codec.cpp:44-47`), the generated data in a nested `tables`
   (`code_page_tables.hpp:21-25`).
   - It includes nothing from DuckDB and does not link simdutf (`code_page.hpp:42-43`,
-    `code_page_tables.hpp:11-13`), and builds as C++11 (`Makefile:865`), the standard the extension
-    builds at (CLAUDE.md, *ODR*). So the unit test links the module alone (`Makefile:876-886`) and
-    the fuzz harness runs in the per-PR ClusterFuzzLite lane (Tests 2).
-  - Both sources are in the extension's source list (`CMakeLists.txt:143-145`).
+    `code_page_tables.hpp:11-13`), and builds as C++17 (`Makefile:867`), the standard the
+    extension builds at (CLAUDE.md, *Technology*). So the unit test links the module alone
+    (`Makefile:878-888`) and the fuzz harness runs in the per-PR ClusterFuzzLite lane (Tests 2).
+  - Its sources, the two x86 kernel files included, are in the extension's source list
+    (`CMakeLists.txt:143-147`).
   - The DuckDB wrapper (a staging-shaped chunk entry and a per-value entry publishing `string_t`)
     is spec 092's (its D2), where its first caller is.
   - `src/catalog/mssql_code_page.cpp` stays, and `CodePageCanEncode` answers from #361's tables
@@ -438,7 +458,7 @@ of the committed `tools/code_pages/data/` (D3), recounted from the files.
   - `FindCollationByName(name, length)`: a binary search through `COLLATION_BY_NAME`, the indices
     sorted by the ASCII-lowercased name, compared ASCII case-insensitively as the server compares
     collation names (`code_page.cpp:864-903`). The emitter refuses two names that differ only in
-    case (`emit_tables.py:180-181`), so the draft's question of `sys.columns.collation_name`'s case
+    case (`emit_tables.py:193-194`), so the draft's question of `sys.columns.collation_name`'s case
     is moot.
   - `CodePageForWireCollation(lcid, utf8, sort_id)`: COLMETADATA's five bytes. A non-zero SortId
     decides alone (`SORT_ID_CODE_PAGE[256]`); otherwise (LCID, fUTF8) over the 161 sorted keys
@@ -593,8 +613,8 @@ This PR makes none of their changes. Each one is listed with what it needs from 
    - `CopyAscii` (`:438-463`); the lookups (52 / 106, case, a prefix and a longer name, an unknown
      LCID -> `CODE_PAGE_NOT_FOUND`, no table for 0 / 65001 / 1200; `:465-489`); every collation by
      id, by name, by its upper-cased name and by its wire key (`:491-514`).
-   - Built `-std=c++11 -O2 -Wall -Wextra` in two forms, the platform's SIMD and the SWAR one
-     (`make test-code-page`, `make test-code-page-portable`, `Makefile:876-886`); both pass on arm64
+   - Built `-std=c++17 -O2 -Wall -Wextra` in two forms, the platform's SIMD and the SWAR one
+     (`make test-code-page`, `make test-code-page-portable`, `Makefile:878-888`); both pass on arm64
      macOS (1.2 s). CI runs both on Linux and macOS (D10).
 2. **Fuzz.** `fuzz/fuzz_code_page.cc`: the first byte picks a page, the rest is the varchar. Each
    entry is checked against the others (`fuzz_code_page.cc:1-16`): `DecodeToUtf8` writes valid UTF-8
@@ -615,8 +635,9 @@ Acceptance:
 - met: the data generated on 2025, every emitter assertion holding (D2), the 16 second collations
   identical and the 1,600 strings consistent (F17); the unit test passing in both forms; the fuzz
   harness building in the default targets;
-- not yet shown: a second generator run on the same build leaving an empty diff; the live sample on
-  2022 (D10);
+- met: a second generator run on the same build (17.0.4075.5, 2026-11-06) left all 37 data files
+  byte-identical, the 16 `.alt.psv` included;
+- not yet shown: the live sample on 2022 (D10);
 - the micro-benchmark gate "a single-byte page at most the UTF-16 kernel's cost per character" is
   met on ASCII, Latin 1252 (typography included), Cyrillic 1251 and Thai 874, and missed by 7 % on
   Cyrillic with typography (Benchmark). The end-to-end gate, where the halved wire counts, is spec
@@ -646,8 +667,8 @@ their letters and stay on the generic tables.
 ## Benchmark
 
 `make bench-code-page` (`test/cpp/bench_code_page.cpp`, against the release simdutf,
-`Makefile:894-898`) and `make bench-code-page-tiers` (`test/cpp/bench_code_page_tiers.cpp`, the
-module alone, `Makefile:888-892`). Manual, not in CI. Both interleave every way within each round,
+`Makefile:896-900`) and `make bench-code-page-tiers` (`test/cpp/bench_code_page_tiers.cpp`, the
+module alone, `Makefile:890-894`). Manual, not in CI. Both interleave every way within each round,
 the house rule, and report the median of 9 rounds; `bench-code-page` first compares every way's
 output with `direct`'s, byte for byte, and aborts on a difference (`bench_code_page.cpp:237-249`).
 
@@ -756,7 +777,7 @@ follow-ups re-estimated.
 9. CI oracle check, its workflow step and `paths:` [1 d]: follow-up 4, with task 2 -- 1.5 d.
 10. Fuzz harness and seed corpus [1 d]: **harness done**; the corpus -- 0.25 d.
 11. Micro-benchmark [1 d]: **done**, two benchmarks, results above.
-12. Docs [0.5 d]: **`DATAMODEL.md` (`:756-803`) and CLAUDE.md done**; the CHANGELOG entry with the
+12. Docs [0.5 d]: **`DATAMODEL.md` (`:756-823`) and CLAUDE.md done**; the CHANGELOG entry with the
     first consumer, the #361 rows with task 7 -- 0.25 d.
 13. New: x86-64 SIMD for single-byte pages, follow-up 1 -- 3 d.
 14. New: double-byte SIMD boundaries and the branchless stage 1, follow-up 2 -- 2.5 d.
