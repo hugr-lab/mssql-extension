@@ -1,0 +1,78 @@
+### zen4: c3d-standard-4 in us-central1-a
+== machine
+Architecture:                            x86_64
+CPU(s):                                  4
+Vendor ID:                               AuthenticAMD
+Model name:                              AMD EPYC 9B14
+Thread(s) per core:                      2
+L1d cache:                               64 KiB (2 instances)
+L2 cache:                                2 MiB (2 instances)
+L3 cache:                                32 MiB (1 instance)
+flags: avx2 avx512_vbmi2 avx512bw avx512f avx512vbmi bmi2 popcnt 
+compiler: g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+== unit test
+kernels: avx512
+kernels: avx2
+kernels: scalar
+test_code_page: all assertions passed
+== bench
+kernels: avx512; payload 0 bytes past a 64-byte boundary
+ns per value, median of 9 interleaved rounds; 2048 values per chunk
+workload                     cp KB  u16 KB |    fused   column   2-pass  2-stage  ascii64     auto   direct    utf16    today
+ascii short (4-20 B)          24.2    48.4 |     3.02     3.15     0.60     0.97     0.26     0.36     0.26     0.42     5.10
+ascii long (200 B)           400.0   800.0 |     7.76     8.65     7.94    17.99     4.38     7.59     5.39     8.51    10.07
+latin 1252, ~4% accents       87.0   174.0 |     5.70     9.74     6.10    11.05    11.09    11.40     2.61     3.96    12.51
+cyrillic 1251                 86.6   173.2 |     6.55    10.13     6.96    20.12    20.12    20.53     2.80     5.23    18.63
+cyrillic 1251 + typography    87.1   174.1 |     9.31    12.14     9.69    25.03    25.05    25.43     4.70    10.22    24.16
+latin 1252 + typography       87.9   175.7 |    10.02    11.76    10.40    19.11    19.06    19.48     4.38     9.25    18.36
+thai 874                     107.9   215.8 |    15.15    15.87    15.65    36.61    36.58    37.12     7.91    18.24    48.41
+japanese 932                  66.7    70.3 |    72.60    55.62    72.71    40.04    42.03    42.27    44.95     5.91    15.19
+
+utf16 leaves out the server's CAST and the doubled wire bytes (u16 KB against cp KB), and the
+delimiter walk and string_t the read path adds to it (bench-code-page-column measures those).
+
+kernels: avx512; payload 1 bytes past a 64-byte boundary
+ns per value, median of 9 interleaved rounds; 2048 values per chunk
+workload                     cp KB  u16 KB |    fused   column   2-pass  2-stage  ascii64     auto   direct    utf16    today
+ascii short (4-20 B)          24.2    48.4 |     2.96     3.16     0.65     0.97     0.26     0.37     0.27     0.42     4.71
+ascii long (200 B)           400.0   800.0 |     8.75     9.98     7.22    17.85     5.36     6.94     6.58     8.79    10.38
+latin 1252, ~4% accents       87.0   174.0 |     5.40     9.85     5.87    11.07    11.08    11.42     2.59     3.96    12.63
+cyrillic 1251                 86.6   173.2 |     6.93    10.17     7.36    20.36    20.38    20.82     2.89     5.23    18.65
+cyrillic 1251 + typography    87.1   174.1 |    10.32    12.15    10.71    25.03    24.99    25.43     4.69    10.16    24.06
+latin 1252 + typography       87.9   175.7 |     8.14    11.81     8.52    18.99    19.10    19.41     4.46     9.26    18.34
+thai 874                     107.9   215.8 |    14.43    15.90    14.94    36.36    36.38    36.97     7.94    18.21    49.52
+japanese 932                  66.7    70.3 |    72.60    55.46    72.92    40.97    42.23    40.76    47.95     5.89    15.20
+
+utf16 leaves out the server's CAST and the doubled wire bytes (u16 KB against cp KB), and the
+delimiter walk and string_t the read path adds to it (bench-code-page-column measures those).
+
+
+kernels: avx2; payload 0 bytes past a 64-byte boundary
+ns per value, median of 9 interleaved rounds; 2048 values per chunk
+workload                     cp KB  u16 KB |    fused   column   2-pass  2-stage  ascii64     auto   direct    utf16    today
+ascii short (4-20 B)          24.2    48.4 |     2.39     3.19     0.56     0.97     0.25     0.31     0.26     0.42     5.16
+ascii long (200 B)           400.0   800.0 |    16.84     8.08     6.36    17.96     4.48     6.11     4.40     8.34    10.04
+latin 1252, ~4% accents       87.0   174.0 |    15.76    10.48    16.09    10.98    10.98    11.31     3.15     3.91    12.49
+cyrillic 1251                 86.6   173.2 |    24.20    12.41    24.60    20.10    20.12    20.51     4.70     5.22    18.75
+cyrillic 1251 + typography    87.1   174.1 |    27.79    17.84    28.21    25.03    24.96    25.41    10.52    10.30    24.27
+latin 1252 + typography       87.9   175.7 |    20.11    15.90    20.48    19.13    19.09    19.65     8.58     9.32    18.59
+thai 874                     107.9   215.8 |    28.81    21.82    29.00    36.88    36.94    37.39    13.82    18.29    49.24
+japanese 932                  66.7    70.3 |    73.35    57.07    74.97    42.20    42.54    42.29    45.64     6.13    15.37
+
+utf16 leaves out the server's CAST and the doubled wire bytes (u16 KB against cp KB), and the
+delimiter walk and string_t the read path adds to it (bench-code-page-column measures those).
+
+kernels: scalar; payload 0 bytes past a 64-byte boundary
+ns per value, median of 9 interleaved rounds; 2048 values per chunk
+workload                     cp KB  u16 KB |    fused   column   2-pass  2-stage  ascii64     auto   direct    utf16    today
+ascii short (4-20 B)          24.2    48.4 |     2.48     4.29     0.54     0.97     0.26     0.31     0.55     0.44     4.81
+ascii long (200 B)           400.0   800.0 |    13.79    15.35     7.03    18.64     4.04     6.68     9.05     8.94    10.56
+latin 1252, ~4% accents       87.0   174.0 |     7.85    11.25     8.17    11.07    11.10    11.29     7.28     3.99    12.59
+cyrillic 1251                 86.6   173.2 |    70.20    70.92    71.10    20.35    20.23    20.66    66.58     5.27    19.06
+cyrillic 1251 + typography    87.1   174.1 |    71.94    71.54    72.26    25.14    25.15    25.59    66.37    10.34    24.22
+latin 1252 + typography       87.9   175.7 |    10.06    13.84    10.39    18.72    18.80    19.08    10.65     9.40    18.47
+thai 874                     107.9   215.8 |    51.89    55.38    53.31    36.54    36.52    36.99    47.67    18.19    48.73
+japanese 932                  66.7    70.3 |    70.23    55.27    72.58    40.51    40.54    39.59    44.68     5.82    15.23
+
+utf16 leaves out the server's CAST and the doubled wire bytes (u16 KB against cp KB), and the
+delimiter walk and string_t the read path adds to it (bench-code-page-column measures those).

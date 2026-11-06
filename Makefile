@@ -35,7 +35,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check help
+.PHONY: azure-test code-pages-generate code-pages-tables test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -701,7 +701,8 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/codec/test_integer_codec.cpp \
     test/cpp/codec/test_money_codec.cpp \
     test/cpp/codec/test_string_codec.cpp \
-    test/cpp/codec/test_uuid_codec.cpp
+    test/cpp/codec/test_uuid_codec.cpp \
+    test/cpp/codec/test_code_page.cpp
 
 STANDALONE_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
 STANDALONE_TEST_INCLUDES := -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include
@@ -848,6 +849,70 @@ bench-utf16: release
 	@echo ""
 	@echo "Running UTF-16 codec microbenchmark..."
 	build/test/bench_utf16
+
+# Spec 091: SQL Server code pages. The tables are the server's own answers, generated once
+# and committed (tools/code_pages/data/ -> src/codec/code_page/code_page_tables.cpp):
+#   make code-pages-generate       ask the test server again (needs `make docker-up`)
+#   make code-pages-tables         re-emit the C++ from the committed data
+#   make test-code-page            the kernel against the data; no server, no DuckDB, no
+#                                  simdutf: the platform's SIMD form (NEON / SSE2)
+#   make test-code-page-portable   the same, built with the 8-byte SWAR form
+#   make bench-code-page           the kernel against today's UTF-16 path; manual, not in CI
+#   make bench-code-page-tiers     the single-byte kernel's time per tier (ns per 32 bytes)
+# Both tests compile -std=c++17, the standard the extension builds at (DuckDB requires it), and run in CI's
+# cpp-unit-tests job on Linux and macOS.
+CODE_PAGE_SOURCES := src/codec/code_page/code_page.cpp src/codec/code_page/code_page_avx2.cpp \
+    src/codec/code_page/code_page_avx512.cpp \
+    src/codec/code_page/code_page_tables.cpp
+CODE_PAGE_TEST_FLAGS := -std=c++17 -O2 -Wall -Wextra -I src/include
+
+# The DSN reaches generate.py through the environment (MSSQL_TEST_DSN is exported above),
+# never through argv, where it would show in `ps`.
+code-pages-generate: release
+	@python3 tools/code_pages/generate.py
+	@python3 tools/code_pages/emit_tables.py
+
+code-pages-tables:
+	@python3 tools/code_pages/emit_tables.py
+
+test-code-page:
+	@mkdir -p build/test
+	$(CXX) $(CODE_PAGE_TEST_FLAGS) test/cpp/codec/test_code_page.cpp $(CODE_PAGE_SOURCES) \
+	    -o build/test/test_code_page
+	build/test/test_code_page
+
+test-code-page-portable:
+	@mkdir -p build/test
+	$(CXX) $(CODE_PAGE_TEST_FLAGS) -DMSSQL_CODE_PAGE_PORTABLE test/cpp/codec/test_code_page.cpp $(CODE_PAGE_SOURCES) \
+	    -o build/test/test_code_page_portable
+	build/test/test_code_page_portable
+
+bench-code-page-tiers:
+	@mkdir -p build/test
+	$(CXX) -std=c++17 -O3 -DNDEBUG -I src/include test/cpp/bench_code_page_tiers.cpp $(CODE_PAGE_SOURCES) \
+	    -o build/test/bench_code_page_tiers
+	build/test/bench_code_page_tiers
+
+bench-code-page: release
+	@mkdir -p build/test
+	$(CXX) $(BENCH_UTF16_FLAGS) -DNDEBUG $(BENCH_UTF16_INCLUDES) test/cpp/bench_code_page.cpp $(CODE_PAGE_SOURCES) \
+	    $(BENCH_UTF16_LIBS) -o build/test/bench_code_page
+	build/test/bench_code_page
+
+# Spec 091 / 092 D12: one column of a 2048-row chunk, staging to finished vector: today's
+# NVARCHAR path (the production codec::string::DecodeChunkFromStaging) against
+# code_page::DecodeColumn and DecodeValues + a string_t loop. Manual target, not in CI.
+# Links the release libduckdb like bench-materialize (defined below); needs a release build.
+bench-code-page-column:
+	@mkdir -p build/test
+	@if [ -z "$(BENCH_UTF16_VCPKG_TRIPLET)" ] || ! ls build/release/src/libduckdb* >/dev/null 2>&1; then \
+		echo "ERROR: no release build found; run 'make release' first." >&2; \
+		exit 1; \
+	fi
+	$(CXX) $(BENCH_MAT_FLAGS) -DNDEBUG $(BENCH_UTF16_INCLUDES) test/cpp/bench_code_page_column.cpp \
+	    $(BENCH_MAT_SOURCES) src/codec/staging/column_staging.cpp $(CODE_PAGE_SOURCES) \
+	    $(BENCH_UTF16_LIBS) -L build/release/src -lduckdb -o build/test/bench_code_page_column
+	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/bench_code_page_column
 
 # Spec 054 D1: materialization microbenchmark (string decode / fixed decode /
 # bcp encode groups). Manual target; NOT part of `make test` or CI.
