@@ -151,10 +151,11 @@ A CCI on 2025 accepts `json`, `vector` and every `(max)` type, and refuses `sql_
   dictionary (E5§7: "dictionary vectors for 2/3"), so a string column of 1 M rows and 50 k distinct
   values is decoded 50 k times, not 1 M. Encoding 1 / 4 values are an affine map over the data ids.
 
-- **D3 — locators (owner, 2026-11-05).** A compressed row has no page. Its `_mssql_page` holds its
-  **rowgroup key**, `0x02 ‖ u64 rowset_id ‖ u32 rowgroup` (big-endian; a page is shape 0x01, 085 D8),
-  and its `_mssql_rid` is `0x02 ‖ u64 rowset_id ‖ u32 rowgroup ‖ u32 tuple`. A delta-store row has
-  `_mssql_page` = its delta page in the 0x01 form, `0x01 ‖ u16 file ‖ u32 page`, and `_mssql_rid` =
+- **D3 — locators (owner, 2026-11-05; `_mssql_page`'s form 2026-11-06).** A compressed row has no
+  page. Its `_mssql_page` holds its **rowgroup key**, in 085 D8's hex `VARCHAR` form: `02` + 16 hex
+  digits of rowset id + 8 of rowgroup, 26 characters (a page is `01` + file + page, 14 characters).
+  Its `_mssql_rid` is the `BLOB` `0x02 ‖ u64 rowset_id ‖ u32 rowgroup ‖ u32 tuple`. A delta-store row
+  has `_mssql_page` = its delta page in the `01` form, and `_mssql_rid` =
   `0x03 ‖ u64 rowset_id ‖ u32 rowgroup ‖` its hidden key (`rscolid 0`). `rowset_id` is
   the columnstore rowset's id; it is in both because rowgroup ids are numbered per partition and one
   lake table holds every partition. A SWITCH keeps rowset ids (E7 s12), so the keys stay valid. The
@@ -164,14 +165,22 @@ A CCI on 2025 accepts `json`, `vector` and every `(max)` type, and refuses `sql_
   rebuilt rowgroup is deleted by `_mssql_page` like a page; a delete-bitmap entry for tuple t deletes
   `WHERE _mssql_page = <rowgroup key> AND _mssql_rid IN (…)`, the rowgroup key pruning the files. The
   scan drops bitmap-deleted tuples; a tuple deleted before the import is not in the lake and needs
-  nothing. No separate rowgroup column: service-column types are decided (DQ-02, owner 2026-11-05) —
-  opaque BLOBs, no `_mssql_rowgroup`.
+  nothing. No separate rowgroup column: service-column types are decided (DQ-02) — opaque values,
+  `_mssql_page` hex `VARCHAR` and the others `BLOB`, no `_mssql_rowgroup`.
 
 - **D4 — units are rowgroups.** One unit per COMPRESSED rowgroup and one per delta store, in
   `segment_id` order; projection reads only the projected columns' segments and dictionaries, which is
   most of a columnstore's I/O saving. Rowgroup elimination from `min_data_id` / `max_data_id` needs
   filter pushdown, which 085 defers; it is task 7's measured decision, because a columnstore is where
   it pays most.
+
+  Resources (085 D17): a unit holds the segment and dictionary buffers of its own rowgroup's projected
+  columns only, reserved before they are read (a segment is at most its `on_disk_size`, a dictionary
+  up to ~10 MB seen) and freed when the unit ends; a global dictionary that several rowgroups share is
+  kept in buffer-managed blocks, pinned while a unit decodes against it. So at most `MaxThreads()`
+  (≤ `max_threads`) rowgroups' buffers are held at once, and a unit whose reservation would pass the
+  reservations' half of `max_memory` waits; one that cannot fit alone is refused by name (085 D17's
+  rule). A delta store is a rowstore unit (085 § Resources).
 
 - **D5 — catalog drift is absorbed by name.** The three `syscs*` tables are decoded generically
   through their own `syscolpars` (085 D5), and fields are read by name: `collation_id` and
@@ -217,9 +226,9 @@ clustered rowstore key, since VertiPaq reorders a rowgroup's tuples). The partit
 are keyed by **rowset**, not by page: `syscsrowgroups` and the segments are keyed by hobt id, and a
 SWITCH leaves them unchanged while the columnstore and delete-bitmap rowsets swap `idmajor` /
 `numpart` (E7 s12, catalog-only). 089's ownership rule moves a compressed row by the rowset its
-rowgroup key names (`0x02`, D3). The delta-store and delete-bitmap rowsets move as allocation units:
+rowgroup key names (`02`, D3). The delta-store and delete-bitmap rowsets move as allocation units:
 `au_moved` rows with their base IAM pages, and a delta-store row is found by its `_mssql_page` in
-the `0x01` form (no lake row is on a delete-bitmap page). E7 s12 had no OPEN delta store, so a
+the `01` form (no lake row is on a delete-bitmap page). E7 s12 had no OPEN delta store, so a
 SWITCH of a partition that has one is **unmeasured**; E11 adds it (task 9).
 
 Invariants:
@@ -287,7 +296,7 @@ Costs follow E5§7, without its NCCI share.
 9. **E11 spike**: columnstore in differentials (inserts, deletes, updates, the tuple mover, REORGANIZE,
    REBUILD, TRUNCATE, SPLIT / MERGE of a partitioned CCI — E7 covered only its SWITCH, s12, which is
    catalog-only and had no OPEN delta store), a SWITCH of a partition that has an OPEN delta store
-   (unmeasured: which rowsets swap, and whether the delta-store rows move by their `0x01` pages),
+   (unmeasured: which rowsets swap, and whether the delta-store rows move by their `01` pages),
    whether a rowgroup id is ever reused within a rowset (D3), and the tuple mover running during a
    full backup; report `experiments/E11-columnstore-diff.md` — 3.5 d
 10. Docs (README, `DATAMODEL.md` columnstore layer, CLAUDE.md, CHANGELOG) — 1 d
@@ -295,7 +304,7 @@ Costs follow E5§7, without its NCCI share.
 **Total ≈ 37.5 days, 6–9 weeks** (E5§7: ≈ 34 days, 5–8 weeks; plus E11, minus the NCCI work). R§8
 phase 3 gave 5–8 weeks at medium risk after E5.
 
-## Risks and open questions
+## Risks
 
 - **Version drift** (E5§6.1): only 2025 was decoded; older builds may lack the Huffman pages or use
   other header constants. The matrix is the gate; D5 refuses an unknown segment version by name.
@@ -307,8 +316,9 @@ phase 3 gave 5–8 weeks at medium risk after E5.
   differ, so a format change is loud.
 - **The differential and fuzzy behaviour** of columnstore is unmeasured (D6, D7); E11 comes before
   089's columnstore path.
-- Open for the owner: the order of 088 relative to 090 (R§10.4; DQ-03, accepted: 090 first); refusing or marking stale a columnstore table whose tail the
-  recovery cannot cover (D6 here, 090 D7 against 023 Q4; DQ-07).
+- Decided ([decisions.md](../085-backup-reader-core/decisions.md)): 090 comes before 088 (R§10.4;
+  DQ-03, accepted); a columnstore table whose tail the recovery cannot cover refuses the file until
+  090's columnstore extension and E11 exist (D6 here, 090 D7; DQ-07, accepted).
 
 ## References
 

@@ -1,8 +1,9 @@
 # Research behind specs 085–090
 
 The research record for reading SQL Server backups without SQL Server and importing them into DuckLake.
-Start with [RESEARCH.md](RESEARCH.md): it is the design synthesis and carries every owner decision (marked
-"owner, 2026-11-05"). The specs distil it: [series overview](../series.md), [decisions](../decisions.md).
+Start with [RESEARCH.md](RESEARCH.md): it is the design synthesis and carries every owner decision
+(marked "owner, 2026-11-05" / "2026-11-06"). The specs distil it: [series overview](../series.md),
+[decisions](../decisions.md).
 
 | file | what |
 |---|---|
@@ -13,7 +14,8 @@ Start with [RESEARCH.md](RESEARCH.md): it is the design synthesis and carries ev
 | [research-ducklake-import.md](research-ducklake-import.md) | the DuckLake import pipeline (Parquet first, one commit) |
 | [experiments/](experiments/) | E1–E7: lake as base, allocation edges, fuzzy backups, encryption / TDE, columnstore, exact healing, partitioning |
 
-The probe scripts and sample backups these reports cite (`tools/…`, `experiments/E<n>/…`, `samples/`) stay in
-the project's local research folder (`design/001-mssql-backup-reader/`, git-ignored): the backups run to
-gigabytes, and their pad pages hold stale server memory. Everything here was produced clean-room from our own
-experiments, public specifications (MTF, MS-XCA, MS-SSCLRT, MS-BINXML) and MIT-licensed sources.
+The probe scripts and sample backups these reports cite (`tools/…`, `experiments/E<n>/…`, `samples/`)
+stay in the project's local research folder (`design/001-mssql-backup-reader/`, git-ignored): the backups
+run to gigabytes, and their pad pages hold stale server memory. Everything here was produced clean-room
+from our own experiments, public specifications (MTF, MS-XCA, MS-SSCLRT, MS-BINXML) and MIT-licensed
+sources.

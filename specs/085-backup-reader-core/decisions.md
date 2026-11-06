@@ -1,7 +1,8 @@
 # Decisions for the owner: the backup reader and its DuckLake import
 
-**Status (owner, 2026-11-05): DQ-02, DQ-10 and DQ-33 decided as stated in their sections; every
-other item is ACCEPTED AS RECOMMENDED.** The recommendations below are therefore the decisions.
+**Status (owner, 2026-11-05; DQ-02 restated 2026-11-06): DQ-02, DQ-10 and DQ-33 decided as stated in
+their sections, DQ-02 with `_mssql_page` a hex `VARCHAR` since 2026-11-06; every other item is
+ACCEPTED AS RECOMMENDED.** The recommendations below are therefore the decisions.
 
 2026-11-05. One deduplicated list of the questions raised by the two draft series:
 - mssql 085–090 (`mssql/README.md` and the specs);
@@ -29,7 +30,7 @@ the specs it affects. **Blocking** means the named PR cannot open until the ques
 | id | question | recommendation | blocks |
 |---|---|---|---|
 | DQ-01 | where a LOB splice's old bytes come from | re-encode the lake value; keep raw bytes only for values that do not round-trip (022's hybrid) | 022 phase A, 089 PR 1 |
-| DQ-02 | physical types of the service columns | **decided** (owner, 2026-11-05): all opaque `BLOB`s serialized by the C++ code | — |
+| DQ-02 | physical types of the service columns | **decided** (owner, 2026-11-05 / 2026-11-06): opaque values serialized by the C++ code; `_mssql_page` hex `VARCHAR`, so file statistics prune deletes, the others `BLOB` | — |
 | DQ-03 | order of 088 and 090; order of 090's guard extensions | 090 before 088 for one developer; ROW / PAGE guards first | planning |
 | DQ-04 | minimum SQL Server version | 2017 | 085 PR 1 |
 | DQ-05 | phase-A lakes have no LOB maps | move the plain `_mssql_lob` output into 085 PR 3 | 022 phase A |
@@ -93,21 +94,33 @@ unusual character into a forced rebase.
 
 ### DQ-02 — What are the service columns' physical types?
 
-**DECIDED (owner, 2026-11-05): every service column is opaque bytes (`BLOB`), serialized and read only by
-the C++ code that writes and applies backups — nothing else uses them.** Each value starts with a
-format/shape byte so the encoding can evolve. `_mssql_rid` BLOB (heap `0x00 ‖ u32 page ‖ u16 file ‖ u16
-slot`, clustered `0x01 ‖` key, columnstore `0x02` / `0x03`; 085 D8, 088 D3);
-`_mssql_page` BLOB, a page as `0x01 ‖ u16 file ‖ u32 page` and a compressed columnstore row's
-rowgroup key as `0x02 ‖ u64 rowset_id ‖ u32 rowgroup` (088 D3; a delta-store row carries its delta
-page in the 0x01 form), both big-endian, so within shape 0x01 byte order is page order and the
-files' min/max on it can prune DuckLake's `DELETE … WHERE _mssql_page IN …` (owner, 2026-11-05;
-the pruning is to verify, 089 § Risks); `_mssql_lob` BLOB (the serialized list of off-row entries:
-column id, root bytes, fragment nodes with their page in the `0x01` form of `_mssql_page`, and the
-raw old bytes where DQ-01's hybrid keeps them); no `_mssql_rowgroup` (the rowgroup is inside
-`_mssql_page` and `_mssql_rid`).
-Internal `__mssql_sys` tables use the same byte encodings wherever they are compared with these
-columns.
+**DECIDED (owner, 2026-11-05; `_mssql_page`'s type 2026-11-06): every service column is an opaque
+value, serialized and read only by the C++ code that writes and applies backups — nothing else uses
+them — and each value starts with a shape, so the encoding can evolve. `_mssql_page` is hex `VARCHAR`
+so that DuckLake's file statistics prune deletes (owner, 2026-11-06); the others are `BLOB`.**
+- `_mssql_rid` `BLOB`: heap `0x00 ‖ u32 page ‖ u16 file ‖ u16 slot`, clustered `0x01 ‖` key,
+  columnstore `0x02` / `0x03` (085 D8, 088 D3).
+- `_mssql_page` `VARCHAR`: the uppercase hex of the shape-byte encoding, fixed width per shape. A page
+  is `01` + 4 hex digits of file id + 8 of page id (14 characters); a compressed columnstore row's
+  rowgroup key is `02` + 16 hex digits of rowset id + 8 of rowgroup (26 characters, 088 D3); a
+  delta-store row carries its delta page in the `01` form. Hex digit order is byte order, so within a
+  shape string order is page order, and a file's min/max on it prunes DuckLake's
+  `DELETE … WHERE _mssql_page IN …`. Not `BLOB`: DuckLake builds no file filter for a `BLOB` column
+  (`DL/storage/ducklake_metadata_manager.cpp:1764-1765`; measured by mssql-ducklake: a BLOB delete
+  read 5 of 5 files, the same values as BIGINT 1 of 5). Not `BIGINT`: a rowgroup key is 96 bits, and
+  a second column was refused (no `_mssql_rowgroup`, below). One check is left (089 § Risks): that
+  `IN (SELECT …)` prunes through DuckDB's dynamic join filter. Hex orders as bytes on a SQL Server
+  metadata catalog: mssql-ducklake stores every `VARCHAR` column there, the min/max statistics
+  included, under `Latin1_General_100_BIN2_UTF8` (its `src/mssql_catalog_shape.cpp:833-847`), and a
+  test keeps it so.
+- `_mssql_lob` `BLOB`: the serialized list of off-row entries: column id, root bytes, fragment nodes
+  with a binary page (file id, page id; the C++ code compares the decoded page with the changed
+  pages, 089 D6), and the raw old bytes where DQ-01's design C keeps them.
+- No `_mssql_rowgroup`: the rowgroup is inside `_mssql_page` and `_mssql_rid`.
 
+Everything that carries a page uses `_mssql_page`'s `VARCHAR` form: `mssql_backup_changed_pages.page`,
+`delete_pages.parquet`, the moved-page lists, `__mssql_sys` wherever it is compared with these
+columns; `alloc_pages` keeps `file_id` / `page_id` (089's schema).
 
 **Blocks** 085 PR 2 (D8) and 022 phase A. Affects 085 D8, 088 D3, 089 D6, 022 D3.
 
@@ -117,16 +130,17 @@ These columns are materialised in every lake table, so they are fixed once lakes
 - **`_mssql_lob`**: one `MAP(INTEGER, STRUCT(root, nodes, …))` keyed by column id (022), one
   `LIST(STRUCT(column_id, root, nodes, …))` (089), or one service column per LOB column (022 Q3).
   The node's page was drafted as `page BIGINT` (022), or as `file_id USMALLINT, page_id UINTEGER`
-  (089); decided: the `0x01`-tagged BLOB form of `_mssql_page`. The last field depends on DQ-01.
+  (089); decided: a binary page inside the `BLOB`, read only by the C++ code. The last field follows
+  DQ-01 (design C).
 - **`_mssql_rowgroup INTEGER`** for columnstore rows (088 D3), or none.
 
 **Recommendation**:
 - `_mssql_rid`: `BLOB`. A table can change shape between files (heap → clustered → columnstore), so a
   per-shape STRUCT would need a lake ALTER, while the BLOB compares byte-wise whatever the shape.
-- `_mssql_lob`: one `MAP` keyed by column id, so a lookup by column is direct, keys are unique, and a
-  column rename changes nothing. Nodes carry their page in the `0x01`-tagged BLOB form of
-  `_mssql_page`, one page encoding with `_mssql_page` and `changed_pages`. One column per LOB column
-  would add DDL whenever a LOB column is added or dropped. DuckLake's support for `MAP` is to verify (`ducklake_types.cpp`).
+- `_mssql_lob`: one opaque `BLOB`, its entries keyed by column id inside, so a lookup by column is
+  direct and a column rename changes nothing; the drafts' typed `MAP` / `LIST` would have fixed a
+  shape in every lake. Nodes keep a binary page, which only the C++ code reads. One column per LOB
+  column would add DDL whenever a LOB column is added or dropped.
 - No `_mssql_rowgroup`. The rowgroup is already in `_mssql_rid`, and a compressed row's `_mssql_page`
   is its rowgroup key (088 D3), by which a DELETE prunes the files.
 
@@ -249,21 +263,29 @@ replicate SQL Server.**
    transform to declare). Nothing beyond that mirrors SQL Server.
 2. Partition values are computed exactly as DuckLake computes them, with DuckLake's own
    `DuckLakePartitionUtils::ApplyPartitionTransform` bound in the importing session, like any DuckLake
-   writer:
-   - the session `TimeZone` for TIMESTAMPTZ. DuckLake does not normalise to UTC: the same instant is
-     month 672 in UTC and 673 in Europe/Berlin (E7 §3);
-   - DuckLake's own TIMESTAMP_NS → µs rounding.
+   writer. At the pin (`dcf71031`) that means:
+   - `epoch_*` transforms are computed on a TIMESTAMPTZ's UTC instant, and TIMESTAMP_NS /
+     TIMESTAMP_TZ_NS are floored to µs (`FloorNanosToMicros`), not rounded
+     (`DL/storage/ducklake_partition_data.cpp:224-255`; tests `DL/../test/sql/partitioning/`
+     `epoch_timestamptz.test`, `epoch_transforms.test:192`), so no session setting changes them;
+   - the calendar transforms `year` / `month` / `day` / `hour` are DuckDB's own functions (`:263-267`):
+     on a TIMESTAMPTZ they are ICU's, bound with the session `TimeZone` (2026-01-31 23:30Z is
+     `month` 1 under UTC and 2 under Europe/Berlin, checked on the pin), and on TIMESTAMP_NS they round
+     to µs (E7 §3).
 
-   UTC is not forced. The docs say the values depend on the importing session's TimeZone.
+   UTC is not forced. The importer proposes only identity or `epoch_*` (022 D5), which do not depend
+   on the TimeZone; the docs say that a calendar transform a user declares on a TIMESTAMPTZ column
+   takes the importing session's TimeZone. E7 §3's "TIMESTAMPTZ transforms follow the session
+   TimeZone" was measured with DuckDB's own `date_diff` / `month()`, not with DuckLake's `epoch_*`.
 3. Files are laid out by DuckLake partition values, sort order and file size, not per SQL Server
    partition or rowset. SQL Server partitions may still serve as work units of the parallel writers.
 4. A SWITCH is done with DuckLake means: a lake-side copy of the affected rows into the target, plus a
    `DELETE … WHERE _mssql_page IN (…)` in the source, in the import's transaction, before the new
    files. The rows are found by E7's AU / rowset rule: 089's `au_moved` names the AU, and the moved
    rows are those on its pages in the base IAM image, minus the changed pages, which the delete set
-   handles. In a columnstore, compressed rows move by their `0x02` rowgroup key carrying the moved
+   handles. In a columnstore, compressed rows move by their `02` rowgroup key carrying the moved
    rowset id, and the delta-store and delete-bitmap rowsets move as AUs: their base IAM pages, with
-   delta-store rows found by `_mssql_page` in the `0x01` form (a SWITCH with an OPEN delta store is
+   delta-store rows found by `_mssql_page` in the `01` form (a SWITCH with an OPEN delta store is
    unmeasured, 088 E11). It is not a file move, and not a match on partition boundary values: a range
    predicate evaluated in DuckDB would compare a string key by DuckDB's order, not the column's
    collation; the pages are exact for every key type (owner, 2026-11-05).
@@ -272,8 +294,8 @@ replicate SQL Server.**
 
 Applied in: RESEARCH §6.2; 089 D9 and § Surface (`partition_by`, `order_by`); 022 D1, D2, D4, D5; 023
 D3, D8; the mssql-ducklake README. The `datetimeoffset` proposal is still derived from the boundaries'
-UTC instants, as SQL Server defines its partitions; it is a proposal only. Open follow-ups: DQ-25 and
-DQ-26.
+UTC instants, as SQL Server defines its partitions and as DuckLake computes `epoch_*`; it is a proposal
+only. Its follow-ups, DQ-25 and DQ-26, are accepted.
 
 ### DQ-11 — Which base tables and rows leave the backup?
 
@@ -287,8 +309,8 @@ The reader's `mssql_backup_catalog` serves an allow-list:
 - E7's `systypedsubobjs` and `syssingleobjrefs`.
 
 It refuses the rest by name, such as `sysowners` (contained users' password hashes) and the key and
-certificate tables. 022 mirrors `sysobjvalues` only for view text and partition boundaries, without
-module source.
+certificate tables. Of `sysobjvalues`, 022 mirrors only the value classes the recommendation names,
+without module source.
 
 Options:
 - the reader serves `sysobjvalues` whole and the importer filters it;
@@ -517,7 +539,12 @@ Affects 024 D4 / D5.
 
 **DECIDED (owner, 2026-11-05): no; expiry only.** Compaction is DuckLake's standard maintenance
 (`CHECKPOINT`, `ducklake_merge_adjacent_files`) on the lake's own schedule. Nothing the importer keeps
-refers to file positions, so a compaction changes nothing for it.
+refers to file positions, so a compaction changes nothing for it. One committed during an import can make
+the import's commit conflict. In autocommit `ducklake_mssql_backup_commit` runs validate, DDL, DELETEs,
+the SWITCH copy and apply in one transaction on a side connection and retries them up to N times (N =
+`import.conflict_retries`, 3 by default; N+1 attempts); inside an explicit transaction the COMMIT fails
+and a re-run resumes from the export (022 D1, 023 D11). The docs recommend running maintenance between
+imports.
 
 ### DQ-34 — The run id in file names?
 
@@ -563,8 +590,12 @@ RESEARCH or an experiment already answers these, and the drafts were aligned to 
   reason `lob`. Otherwise the value is refused by name (E1 rule 7). 023 D6 said "keep" in every case, and
   089 mentioned a `lob_unresolved` parameter that 090 never defined. Both are fixed.
 - **Database identity** is the FamilyGUID (R§3) plus the RecoveryForkID (023 C1). 089's chain check also
-  takes the base LSN (R§3 "DifferentialBaseGUID, base LSN, FamilyGUID"). 085 reports the fork id, still
-  to locate.
+  takes the base LSN (R§3 "DifferentialBaseGUID, base LSN, FamilyGUID"). 085 reports the fork id once
+  its task 3 locates it. The check fails closed (089 D7): while the file's fork id cannot be read,
+  every apply by LSN, a differential or a full applied incrementally, is refused, and the way out is a
+  full imported as a new base (rebase), which takes no LSN from the lake's chain; a rebase lets fulls
+  in, but differentials stay refused until 085 reads the fork id. When the lake has no fork recorded
+  but the file's can be read, the apply is refused, and a rebase on a full records it.
 - **No page LSN is stored** (owner, 2026-11-05; R§6.2 point 4). Which pages changed is decided by the
   file (the DCM and `m_lsn > since_lsn`, 089 D3) plus `pending_pages` / `stale_pages`; lake tables do
   not get `_mssql_page_lsn`, and 089's export writes the data files only.
@@ -574,9 +605,24 @@ RESEARCH or an experiment already answers these, and the drafts were aligned to 
   `pending_applied` rows with `holds_rows` (data pages and rowgroup keys only); `au_moved` rows feed
   a SWITCH's copy.
 - **Columnstore locators** (owner, 2026-11-05; 088 D3): a compressed row's `_mssql_page` is its
-  rowgroup key `0x02 ‖ u64 rowset_id ‖ u32 rowgroup`, and its `_mssql_rid` adds `u32 tuple`; the
-  rowset id is in both because rowgroup ids are numbered per partition and one lake table holds every
-  partition. A delete-bitmap entry deletes `WHERE _mssql_page = <rowgroup key> AND _mssql_rid IN (…)`.
+  rowgroup key, `02` + 16 hex digits of rowset id + 8 of rowgroup, and its `_mssql_rid` is the `BLOB`
+  `0x02 ‖ u64 rowset_id ‖ u32 rowgroup ‖ u32 tuple`; the rowset id is in both because rowgroup ids
+  are numbered per partition and one lake table holds every partition. A delete-bitmap entry deletes
+  `WHERE _mssql_page = <rowgroup key> AND _mssql_rid IN (…)`.
+- **Resources** (owner, 2026-11-06; 085 D17, 022 D12): DuckDB's `memory_limit` and `threads`, both
+  global, are the ceiling; whatever grows with the input is buffer-managed and spills; parallelism is
+  `threads`, throttled by memory, and out of temp space a file is refused by name. A call's
+  `max_memory` / `max_threads` (the reader's scan, export and recovering functions, the importer's
+  export and commit; DuckDB's limits by default, clamped to them) bound the reader's and the
+  importer's own allocations and concurrency, not the DuckDB statements an import runs, which only
+  `operator_memory_limit` on the importer's side connections narrows. `max_memory` is the whole
+  budget: the side connections get `operator_memory_limit = max_memory / 2`, the reader's and the
+  importer's own reservations stay under the other half, and the export's writers take half of that
+  (F from `max_memory` / 4). A reservation that does not fit waits for other units, and one that
+  cannot fit alone is refused by name, naming `max_memory` and `temp_directory`.
+- **Code pages** (owner, 2026-11-06): the transcode is a vectorized kernel over tables generated from
+  SQL Server's own CAST. Spec 091 (SQL Server code pages, generated tables and vectorized kernels)
+  builds them; 085 and 086 reuse them (085 D7, 086 D9).
 - **E7 integrated**:
   - where the partitioning lives (085);
   - the ownership rule, `au_moved`, the dead-AU clause and the maintenance evidence (089);
@@ -592,7 +638,7 @@ RESEARCH or an experiment already answers these, and the drafts were aligned to 
   - `mssql_backup_catalog(path)` with no table lists the allow-listed base tables;
   - pending pages come from `mssql_backup_pending_pages`, not from the export.
 - **The stale set** is lake state, not a reader input. The importer checks healing (089 D10, 023 D7);
-  whether a failed check is an error is DQ-06.
+  a failed check is a named error at that file, the way out a rebase (DQ-06, accepted).
 - **Experiments**: E8 (the commit cost) was not run; E9 (`json`), E10 (the TDE log tail) and E11
   (columnstore in differentials) are planned, and R§12 lists them.
 

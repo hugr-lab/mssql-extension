@@ -18,7 +18,11 @@ Builds on RESEARCH.md §5 and §6.
    per backup file holds everything else: DDL, the deletes (DuckLake's `DELETE` scans), a SWITCH's
    lake-side copy, then file registration, `__mssql_sys`, the commit message and provenance. That
    transaction is the file's one snapshot; its length is the delete scans' and the copy's, not the
-   export's.
+   export's. In autocommit `ducklake_mssql_backup_commit` runs it on a side connection and retries
+   it on a DuckLake conflict, bounded (N+1 attempts, N = `import.conflict_retries`, default 3), with
+   the same files; inside an explicit transaction the COMMIT fails and a re-run resumes from the
+   export (§5).
+   The data files are written in `DATA_PATH`; the run's scratch lives outside it (§9).
 2. **Register through DuckLake's own transaction, not by writing metadata rows.** mssql-ducklake
    compiles DuckLake in (its CLAUDE.md), so it can call `AppendFiles` without editing DuckLake.
    DuckLake keeps ids, row ids, stats and conflict checks, and mssql-ducklake's commit batch carries
@@ -186,9 +190,9 @@ The caches would learn of it only by reloading, and the metadata volume is ident
 |---|---|---|---|
 | Snapshots | 1 | **1** | 1 per source snapshot |
 | Parallelism | within a table; big tables sequential (§3) | all units (partition × key or extent range) at once, any machine | n/a |
-| Memory | threads × row group, plus sort spill | 1 row group per writer | small |
+| Memory | threads × row group, plus sort spill | 1 row group per open file, open files capped by `max_memory` (§8) | small |
 | Lake txn length | the WHOLE import (hours); a conflict at commit loses all | **the deletes, a SWITCH's copy and registration** | short |
-| Failure | rollback deletes all files | per-unit retry; names `mssql-<BackupSetGUID>-<objid>-p<part>-u<unit>-<seq>.parquet`; orphans → `ducklake_delete_orphaned_files` | manual |
+| Failure | rollback deletes all files | per-unit retry; in autocommit a commit conflict re-runs the commit part on the same files (§5); names `mssql-<BackupSetGUID>-<objid>-p<part>-u<unit>-<seq>.parquet`; orphans → `ducklake_delete_orphaned_files`, which every `CHECKPOINT` runs (§9) | manual |
 | Stats / ids | native | writer stats or footer; name map, or `FIELD_IDS` (`DD/extension/parquet/parquet_extension.cpp:149,210`) | hand-made |
 | Order | unknown | **writer controls it**: physical order, a page's rows together (§5) | n/a |
 | Commit path | client loop | client loop (server-side later) | bypasses DuckLake |
@@ -199,14 +203,15 @@ SWITCH's `INSERT … SELECT`) land as files beside the data files, not as rows i
 
 ## 5. Deletes by `_mssql_page`
 
-**The delete.** Every imported row carries `_mssql_page` and `_mssql_rid` (opaque BLOBs serialized by
-the C++ code, DQ-02). Per affected lake table the import runs DuckLake's own
+**The delete.** Every imported row carries `_mssql_page` and `_mssql_rid`, opaque values serialized by
+the C++ code (DQ-02): `_mssql_page` a fixed-width hex `VARCHAR`, `_mssql_rid` a `BLOB`. Per affected
+lake table the import runs DuckLake's own
 `DELETE FROM lake.s.t WHERE _mssql_page IN (SELECT page FROM <the delete set of t>)`. DuckLake's scan
 finds the positions and its delete path writes the delete files (§3): cumulative against files of any
 earlier import, a file dropped when every row goes. In the import's single transaction the DELETEs run
 **before** the new files are registered (`ducklake_add_data_files` / `AppendFiles`), so a page's new
-rows are never hit by the delete of that page. To verify: DELETE + `ducklake_add_data_files` in one
-transaction give one snapshot.
+rows are never hit by the delete of that page. Confirmed (mssql-ducklake, 2026-11-06): DELETE +
+`ducklake_add_data_files` in one transaction give one snapshot (§10).
 
 **The delete set of a table**, from 089's `mssql_backup_changed_pages` (each page with its
 `base_au_id` and that AU's owner in the base mirror, so the importer needs no IAM format knowledge):
@@ -228,9 +233,10 @@ transaction give one snapshot.
   LOB map, and index and allocation pages hold no lake rows.
 
 **Columnstore** (088 D3). A compressed row has no page: its `_mssql_page` is its rowgroup key,
-`0x02 ‖ u64 rowset_id ‖ u32 rowgroup`, and its `_mssql_rid` adds `u32 tuple`; a delta-store row has
-its delta page in the 0x01 form. The rowset id is in both because rowgroup ids are numbered per
-partition and one lake table holds every partition. A removed, merged or rebuilt rowgroup is deleted
+`02` + 16 hex digits of rowset id + 8 of rowgroup, and its `_mssql_rid` is the `BLOB`
+`0x02 ‖ u64 rowset_id ‖ u32 rowgroup ‖ u32 tuple`; a delta-store row has its delta page in the `01`
+form. The rowset id is in both because rowgroup ids are numbered per partition and one lake table
+holds every partition. A removed, merged or rebuilt rowgroup is deleted
 by `_mssql_page` like a page; a delete-bitmap entry for tuple t deletes `WHERE _mssql_page =
 <rowgroup key> AND _mssql_rid IN (…)`, the rowgroup key pruning the files. The tuple mover shows up
 as delta pages freed plus a new rowgroup.
@@ -243,26 +249,52 @@ as delta pages freed plus a new rowgroup.
 - **heap: IAM order**, ascending page ids;
 - **columnstore: rowgroup order.**
 
-**The cost of a delete (expected, to verify).** A `DELETE` by `_mssql_page` should read only the
-`_mssql_page` column of the files its min/max statistics cannot exclude. `_mssql_page` is
-`0x01 ‖ u16 file ‖ u32 page`, big-endian, so within that shape byte order is page order; files
-written in physical order hold contiguous pages, so a changed page should touch few files. A heap's
+**The cost of a delete.** A `DELETE` by `_mssql_page` reads the `_mssql_page` column of the files
+its min/max statistics cannot exclude. That is why `_mssql_page` is hex `VARCHAR` (owner, 2026-11-06):
+DuckLake builds no file filter for a `BLOB` column
+(`DL/storage/ducklake_metadata_manager.cpp:1764-1765`), and mssql-ducklake measured it on 5 files,
+each holding a distinct page range: a BLOB `=` / `IN` / `IN (SELECT …)` / `BETWEEN` read 5 of 5
+files, the same values as BIGINT 1 of 5, as hex VARCHAR 1 of 3; HUGEINT is not pruned at all. Its
+form is `01` + file + page (14 characters) or a rowgroup key
+`02` + rowset + rowgroup (26), the hex in byte order, so within a shape string order is page order;
+files written in physical order hold contiguous pages, so a changed page touches few files. A heap's
 units are ascending page ranges, so its files cover disjoint ranges; a clustered index's leaf chain
 follows the key, so a fragmented index gives files with overlapping page ranges, and a delete reads
 more of them. A lake sort order (022 D5, DuckLake `SET SORTED BY`) scatters a page's rows over many
 files and makes a delete scan more of them: a cost, never a wrong row. `skip_stats_columns` must not
-include `_mssql_page`. Two checks, measured after N differentials and after a
-`merge_adjacent_files`:
-- DuckLake keeps min/max for a BLOB column (if not, the delete scans every file of the table; still
-  correct);
-- a `DELETE … WHERE _mssql_page IN (SELECT …)` prunes files at all (if not, the import runs one
-  `DELETE` per contiguous page range with constant bounds, `_mssql_page BETWEEN x AND y` plus the
-  `IN`).
+include `_mssql_page`, and 26 characters stay under mssql-ducklake's `stats_length` (1024 by
+default, its spec 018). One check is left (022 task 11, 023 D4 / task 6): that a
+`DELETE … WHERE _mssql_page IN (SELECT …)` prunes the VARCHAR column through DuckDB's dynamic join
+filter, as mssql-ducklake measured for BIGINT, after N differentials and after a
+`merge_adjacent_files` (if not, the import passes the delete set as constants: an `IN` list cut into
+chunks, with `BETWEEN` bounds per contiguous range). The file filter's order is answered: on a SQL
+Server catalog mssql-ducklake stores every VARCHAR column, the min/max statistics included, under
+`Latin1_General_100_BIN2_UTF8`, so fixed-width uppercase hex orders as bytes
+(`MD/mssql_catalog_shape.cpp:833-847`; §10).
 
 **Compaction is DuckLake's.** Imported tables keep DuckLake's defaults. A compaction or a `CHECKPOINT`
-that moves rows between files changes nothing for the importer, because nothing refers to file positions.
-Compaction runs in a transaction of its own (`DL/storage/ducklake_transaction_state.cpp:421-423`), so a
-concurrent one is another writer's snapshot, handled by DuckLake's own conflict rules.
+that moves rows between files changes nothing the importer keeps, because nothing refers to file
+positions. Compaction runs in a transaction of its own
+(`DL/storage/ducklake_transaction_state.cpp:421-423`), so a concurrent one is another writer's
+snapshot, handled by DuckLake's own conflict rules (same file):
+- a delete conflicts with a compaction committed meanwhile that merged or rewrote a file it deletes
+  from (`:2479-2569`; the merged-file check `:2540-2551`), and with any concurrent insert into the
+  table (`:295-305`);
+- the import's new files conflict with a concurrent delete from the table (`:281-287`);
+- a table the import only appends to conflicts with neither a merge nor a rewrite (`:281-294`,
+  `:329-334`).
+
+DuckLake's commit loop retries any attempt that fails after the conflict check with a retryable
+error (`can_retry`, `:2665-2707`; `RetryOnError`, `DL/storage/ducklake_transaction.cpp:1395-1409`); a
+conflict the check finds never is. So in autocommit `ducklake_mssql_backup_commit` runs the part after
+the export (validate, DDL, DELETEs, SWITCH copy, apply) in one transaction on a side connection and,
+on a conflict, retries it up to N = `import.conflict_retries` times (3 by default), N+1 attempts,
+then reports; inside an explicit transaction the COMMIT fails and a re-run resumes from the
+export (022 D1, 023 D11). Each retry repeats the DELETE scans and the copy. The export is reused: the
+importer's files are `created_by_ducklake = false`, which DuckLake's `CleanupFiles` leaves in place
+(`DL/storage/ducklake_transaction.cpp:76-81`, `:101-115`). A `CHECKPOINT` of an imported table during an
+import is the likeliest collision, because it merges the small files earlier differentials left, which
+are the next import's delete targets; the docs recommend running maintenance between imports.
 
 ## 6. Schema evolution, all inside the one commit
 
@@ -277,7 +309,7 @@ so renames do not affect them.
 | `ALTER SCHEMA … TRANSFER` | no SET SCHEMA in DuckDB (`DD/src/include/duckdb/parser/parsed_data/alter_table_info.hpp:72-92`): CREATE in the target, `INSERT … SELECT`, DROP | yes |
 | ADD COLUMN NULL | `ADD COLUMN` (`:823-855`) | no |
 | ADD COLUMN NOT NULL DEFAULT k (metadata-only; k in `sysseobjvalues`) | `ADD COLUMN … DEFAULT k`: old files read k (`DL/storage/ducklake_field_data.cpp:80-90,115`); literal only (`:88`), so pass the stored constant | no |
-| DROP COLUMN | `DROP COLUMN`; reset the partition or sort spec on it first (`:864-900`) | no |
+| DROP COLUMN | `DROP COLUMN`, which DuckLake refuses on a partition or sort column (`DL/storage/ducklake_table_entry.cpp:876-900`): the importer first removes that field only, the rest of the spec kept (022 D5) | no |
 | `sp_rename` column | `RENAME COLUMN`, field id kept (`:785-810`) | no |
 | int → bigint (size-of-data) | `ALTER … TYPE`, allowed when DuckDB's max type is the target (`:956-967,1106-1130`) | rows in diff anyway |
 | varchar(n) widening (metadata-only) | nothing: no length in the lake; n kept in the mirror | no |
@@ -346,7 +378,9 @@ an ordered CCI's `ORDER (col)` proposes nothing (DQ-25: VertiPaq reorders a rowg
 export would sort them and spread them over files); segment min/max needs nothing.
 
 **Writers:** one writer per (partition × range) unit rotates at the target size and holds one open
-file per partition value.
+file per partition value; the export caps the open files, and so the units it runs at once, by
+`max_memory` and `max_threads`, DuckDB's `memory_limit` and `threads` by default (089 § Surface,
+`mssql_backup_export`; 085 D17).
 
 ### 7.4 Maintenance between backups (confirm in E7)
 
@@ -383,6 +417,9 @@ a file whose rows all go.
   - Each thread writes its own files through the Parquet `CopyFunction` API, as DuckLake writes its
     delete files (`ducklake_delete.cpp:54-135`).
   - It returns one `WRITTEN_FILE_STATISTICS`-shaped row per file, plus (object, partition, unit).
+  - Its memory is capped by the reader: each open file buffers one row group, sized in bytes, and
+    the open files stay within a quarter of `max_memory` (the writers' share of 085 D17's split),
+    running units within `max_threads` (089).
   - It writes data files only. The changed and freed pages come from `mssql_backup_changed_pages`,
     the pending pages from `mssql_backup_pending_pages` (090), and the `base/` side inputs,
     `lob.parquet` included, are written by the importer from the lake (089 D10).
@@ -399,7 +436,11 @@ a file whose rows all go.
 **Worker connections are legal.** Precedents: `IB/iceberg_to_ducklake.cpp:941-967`,
 `DL/storage/ducklake_checkpoint.cpp:15`, `DL/storage/ducklake_transaction.cpp:858`,
 `DD/src/function/table/system/create_external_resource.cpp:177`.
-- The rule: a side connection writes files only. Its lake writes would be another snapshot.
+- The rule: within an import a side connection writes files only, since its lake writes would be
+  another snapshot, with exactly one exception: in autocommit, `ducklake_mssql_backup_commit`'s
+  transaction on its side connection is the import's single snapshot, and the caller's transaction
+  then writes nothing to the lake (022 D1). `CHECKPOINT` is the precedent for such a connection
+  (`DL/storage/ducklake_checkpoint.cpp:15`).
 - Temp-table writes are exempt from the one-database rule (`DD/src/transaction/meta_transaction.cpp:259-284`).
 
 ## 9. Pipelines
@@ -419,7 +460,7 @@ SELECT * FROM ducklake_mssql_backup_validate('lake', 's3://bak/sales_full.bak', 
 CREATE SCHEMA lake.__mssql_sys;
 CREATE SCHEMA lake.__mssql_backup;
 CREATE SCHEMA lake.dbo;
-CREATE TABLE lake.dbo.orders (id BIGINT, order_date TIMESTAMP, …, _mssql_rid BLOB, _mssql_page BLOB)
+CREATE TABLE lake.dbo.orders (id BIGINT, order_date TIMESTAMP, …, _mssql_rid BLOB, _mssql_page VARCHAR)
        PARTITIONED BY (epoch_month(order_date)) SORTED BY (id)
        WITH (data_inlining_row_limit = 0, skip_stats_columns = ['_mssql_rid']);
 --   … every table, the __mssql_sys mirrors, alloc_pages, pending_pages, stale_pages, the registry
@@ -452,8 +493,24 @@ PRAGMA ducklake_import_mssql_diff_backup('lake', 's3://bak/sales_diff_2026-11-05
 
 **Snapshot guarantee:**
 - Nothing is visible before the commit.
-- A failed commit leaves only orphans, and the retry reuses the manifests.
+- In autocommit a conflict at the commit re-runs the part after the export (validate, DDL, DELETEs,
+  SWITCH copy, apply) on a side connection, bounded (N+1 attempts, N = `import.conflict_retries`);
+  inside an explicit transaction the COMMIT fails and a re-run resumes from the export (§5). A
+  failed commit leaves only orphans, and the retry reuses the manifests.
 - A commit that succeeded unseen is caught by `BackupSetGUID` in `imports`.
+
+**Where the files live.** `CHECKPOINT` runs `ducklake_delete_orphaned_files`
+(`DL/storage/ducklake_checkpoint.cpp:21-24`), which deletes every `.parquet` / `.puffin` under
+`DATA_PATH` that the catalog does not list and no open transaction of the same instance has written
+(`DL/storage/ducklake_metadata_manager.cpp:5263-5314`), once its last modification is older than
+`delete_older_than`, 2 days by default (`DL/functions/ducklake_cleanup_files.cpp:23-24, 56`).
+- The run's scratch (the plan, the manifests, `base/*.parquet`, `delete_pages.parquet`) lives
+  **outside** `DATA_PATH`, under `run_path`: by default `DATA_PATH`'s parent +
+  `mssql_backup_runs/<lake id>/`, so two lakes never share it, overridden by a parameter or a config
+  key, and set explicitly when `DATA_PATH` is a bucket root, whose parent is undefined (022 D9).
+- The exported data files must live in `DATA_PATH` (registration is zero-copy) and are unregistered
+  until the commit, so the importer warns when an export may outlive `delete_older_than`, and refuses
+  to register when a file its manifest names is gone.
 
 **Time travel:**
 - `AT (VERSION => n)` is the database at that backup, as of CheckpointLSN, or LastLSN with redo.
@@ -466,10 +523,20 @@ PRAGMA ducklake_import_mssql_diff_backup('lake', 's3://bak/sales_diff_2026-11-05
 
 - **E7:** the base tables behind `sys.partition_*`; SWITCH, SPLIT, MERGE and TRUNCATE PARTITIONS as
   seen in a diff.
-- **Deletes:** DuckLake keeps min/max for a BLOB column (`_mssql_page`), and a DELETE whose page set
-  arrives as a subquery prunes files by it (else one DELETE per contiguous page range, with constant
-  bounds `_mssql_page BETWEEN x AND y` plus the `IN`); measured after N differentials and after a
-  `merge_adjacent_files`; DELETE + `ducklake_add_data_files` in one transaction give one snapshot.
+- **Deletes**, one check: that a DELETE whose page set arrives as a subquery prunes files by the hex
+  `VARCHAR` `_mssql_page` through DuckDB's dynamic join filter, as mssql-ducklake measured for BIGINT
+  (else the set passes as constants: an `IN` list cut into chunks, with `BETWEEN` bounds per
+  contiguous range); measured after N differentials and after a `merge_adjacent_files`. The file
+  filter's order is answered. DuckLake renders it as string comparisons run in the metadata database
+  (`DL/storage/ducklake_metadata_manager.cpp:1693-1745`), and on a SQL Server catalog they follow the
+  columns' collation: mssql-ducklake stores every VARCHAR column, the min/max statistics columns
+  included, as `COLLATE Latin1_General_100_BIN2_UTF8`, and its comment says this is what makes
+  DuckLake's pushed min/max prune correctly (`MD/include/mssql_metadata_manager.hpp:165-168`,
+  `MD/mssql_metadata_manager.cpp:161`, `MD/mssql_catalog_shape.cpp:833-847`). BIN2 compares by code
+  point, so fixed-width uppercase hex orders as bytes; a test keeps it (022 task 11). DELETE then
+  `ducklake_add_data_files` in one transaction gives one snapshot, and the new rows of a deleted page
+  survive (confirmed by mssql-ducklake, 2026-11-06).
 - **Commit cost:** measure the client-loop commit for 10k files and 1k tables.
-- **Field ids:** write them and drop name maps; DuckLake's new-table ids are 1..n depth-first
-  (`ducklake_field_data.cpp:93-121`).
+- **Field ids** (DQ-24): name maps in v1; field ids come later, only if 022 task 12's commit
+  measurement asks for them (DuckLake's new-table ids are 1..n depth-first,
+  `DL/storage/ducklake_field_data.cpp:93-121`).

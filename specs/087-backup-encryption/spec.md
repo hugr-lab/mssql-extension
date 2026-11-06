@@ -90,7 +90,9 @@ never be read offline (documented).
   `Container`, per block, before decompression: the block index records each block's IV, so random
   access survives. TDE decrypts in the `PageStore`, per page, at read time, below the allocation map:
   PFS, GAM and IAM pages are encrypted too (E4§3), while the page index reads only the plaintext
-  headers. Nothing above the page store knows about encryption.
+  headers. Nothing above the page store knows about encryption. Resources (085 D17): a block or a page
+  is decrypted in the buffer its read already holds, one at a time per thread, so decryption adds
+  nothing that grows with the file.
 
 - **D6 — crypto through the statically linked OpenSSL**, except RC4: RSA-OAEP (`EVP_PKEY_decrypt` with
   OAEP / SHA-256 / MGF1-SHA-256), AES-CBC with padding off, SHA-1, PKCS#12, PEM. RC4 (for PVK) is
@@ -231,7 +233,7 @@ Acceptance:
 **Total ≈ 16.5 days, 3–3.5 weeks**, plus E10. R§8 phase 1b gave 1–2 weeks for the decryption itself;
 the secret type, the selection rule, the CI fixtures and the docs are the rest.
 
-## Risks and open questions
+## Risks
 
 - **The TDE log tail (D9)** is the one gap that touches the owner's "no dirt" rule: until E10, a TDE
   backup cannot be shown consistent or recovered.
@@ -243,8 +245,8 @@ the secret type, the selection rule, the CI fixtures and the docs are the rest.
 - **PFX** could not be produced on this build (E4§2); its support rests on OpenSSL's PKCS#12 and a
   locally synthesised file.
 - **Persistent secrets** store the key container and its password unencrypted (DuckDB's design).
-- Open for the owner: whether an explicit `key_secret := 'name'` override should exist beside D3
-  (this draft has none, to keep D3 the only rule; DQ-29 in [decisions.md](../085-backup-reader-core/decisions.md)).
+- Decided: no explicit `key_secret := 'name'` override in v1, so D3 stays the only rule (DQ-29,
+  accepted, [decisions.md](../085-backup-reader-core/decisions.md)).
 
 ## References
 

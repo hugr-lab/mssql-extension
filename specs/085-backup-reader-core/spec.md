@@ -3,8 +3,10 @@
 Status: **draft**, 2026-11-05. Not started. Part of the backup-reader series (see `../README.md`).
 Design and every owner decision: `design/001-mssql-backup-reader/RESEARCH.md` (cited as R§n).
 Evidence: `research-experiment.md` (X§n), `research-web.md` (W§n), `research-architecture.md`
-(A§n), experiments E1–E7 (`experiments/E<n>-*.md`, cited as E<n>§m). Open questions for the owner:
-[decisions.md](decisions.md) (cited as DQ-nn).
+(A§n), experiments E1–E7 (`experiments/E<n>-*.md`, cited as E<n>§m). The owner's decisions:
+[decisions.md](decisions.md) (cited as DQ-nn; each one decided or accepted). DuckLake source is cited
+as `DL/` = mssql-ducklake's `ducklake/src/` at `dcf71031`, DuckDB source as `DD/` = this repository's
+`duckdb/` submodule at `d54cbbe3df1` (the pin).
 
 Markers used below: **(2025)** = verified on SQL Server 2025 RTM-CU8 (17.0.4075.5, Linux) only, the one
 build every experiment ran on; **(unverified)** = inferred, not observed. E7 (partitioning) finished
@@ -108,9 +110,22 @@ Out, each refused by name until its spec lands:
   column at a time with the family's `DecodeChunkFromStaging` where the on-disk bytes equal TDS's
   (integers, float, decimal, uniqueidentifier, date, time, datetime2, datetimeoffset, nvarchar, UTF-8
   varchar; W§7, A§1). Own kernels, in the same shape, for the bytes that differ: `datetime` and
-  `smalldatetime` (time first on disk), `money` / `smallmoney` (a plain little-endian integer), `bit`
-  (packed), and the code-page transcode. No per-value type dispatch (the repository's rule: one batch
-  call per column). The per-row work is the record walk, which is inherent.
+  `smalldatetime` (time first on disk), `money` / `smallmoney` (a plain little-endian integer) and `bit`
+  (packed). No per-value type dispatch (the repository's rule: one batch call per column). The per-row
+  work is the record walk, which is inherent.
+
+  The code-page transcode of a `char` / `varchar` column under a non-UTF-8 collation is a vectorized
+  kernel, one call per column per chunk, never per value: an ASCII fast path over the whole chunk
+  buffer (simdutf `validate_ascii`, then `memcpy`), then a table pass for the rest. A single-byte table
+  has 128 entries of up to 3 UTF-8 bytes; a double-byte one is indexed by lead byte (086 D9). The tables
+  come from SQL Server itself: a generator in `tools/` CASTs every byte, and every DBCS lead / trail
+  pair, to `nvarchar` under a collation of each code page; its output is committed and sampled by a CI
+  oracle check, and an invalid sequence comes out as the server's CAST makes it. Not iconv, ICU or
+  Python's codecs: they differ from Windows in places, and are platform-dependent or heavy. The same
+  generator writes the collation → code page table (`tools/code_pages/data/collations.psv`, § Rules,
+  catalog). Spec 091 (SQL Server code pages, generated tables and vectorized kernels) builds it all,
+  as the module `src/codec/code_page/`; 085 and 086 reuse it. 085 maps the on-disk CollationId onto
+  091's table and reuses its single-byte tables (task 13).
 
 - **D8 — service columns are virtual columns with a `_mssql_` prefix (owner, R§5, R§10.2).** The
   scan and the catalog's table entries expose:
@@ -118,17 +133,22 @@ Out, each refused by name until its spec lands:
   | column | type | meaning |
   |---|---|---|
   | `_mssql_rid` | `BLOB` | stable row identity. Heap: `0x00 ‖ u32 page ‖ u16 file ‖ u16 slot` of the row's **original** location (the forwarded record's back pointer when it moved); after the shape byte, equal to `%%physloc%%` (E1§3). Clustered rowstore: `0x01`, then per key column in `ordkey` order `u16 length ‖` its uncompressed storage bytes (`0xFFFF` for NULL), then `u32` uniquifier for a non-unique index (0 when absent). Columnstore: spec 088 |
-  | `_mssql_page` | `BLOB` | the page the row lives on now (E1§2): `0x01 ‖ u16 file ‖ u32 page`, big-endian, so within shape 0x01 byte order is page order. A compressed columnstore row has no page: its rowgroup key `0x02 ‖ u64 rowset_id ‖ u32 rowgroup` (spec 088 D3); a delta-store row has its delta page in the 0x01 form |
+  | `_mssql_page` | `VARCHAR` | the page the row lives on now (E1§2), as the uppercase hex of a shape-byte encoding, fixed width per shape: a page is `01` + 4 hex digits of file id + 8 of page id, 14 characters (file 1, page 0x1A2 = `010001000001A2`). A compressed columnstore row has no page: its rowgroup key is `02` + 16 hex digits of rowset id + 8 of rowgroup, 26 characters (spec 088 D3); a delta-store row has its delta page in the `01` form. Hex digit order is byte order, so within a shape string order is page order |
   | `_mssql_page_lsn` | `DECIMAL(25,0)` | that page's `m_lsn`, in `RESTORE HEADERONLY`'s numeric form; a scan column only (below) |
 
-  The clustered encoding uses the uncompressed bytes so that a rebuild with another
-  `DATA_COMPRESSION` keeps every identity (E1§3: key + uniquifier survived REBUILD for 3,188 of 3,188
-  rows). Spec 089 adds `_mssql_lob`. Every service column is an opaque `BLOB` serialized by
-  this code, with a leading format/shape byte (DQ-02, decided by the owner 2026-11-05): only the
-  importer reads them, and a lake materialises them, so their format is versioned rather than typed.
-  `_mssql_page_lsn` is a scan column only: no lake stores a page LSN, because which pages changed is
-  decided by the file (the DCM and `m_lsn > since_lsn`, spec 089 D3; R§6.2 point 4). The lake deletes
-  by `_mssql_page` with DuckLake's own `DELETE` (R§6.2).
+  The clustered encoding uses the uncompressed bytes so that a rebuild with another `DATA_COMPRESSION`
+  keeps every identity (E1§3: key + uniquifier survived REBUILD for 3,188 of 3,188 rows). `_mssql_lob`
+  comes with PR 3 in its plain form (DQ-05, task 20), so a phase-A lake has its LOB maps from the first
+  import; 089 uses them for differentials. Every lake service column is an opaque value serialized and
+  read only by this code, each starting with a shape (DQ-02): only the importer reads them, and a lake
+  materialises them, so their format is versioned rather than typed. `_mssql_rid` and `_mssql_lob` are
+  `BLOB`s. `_mssql_page` is hex `VARCHAR` so that DuckLake's file statistics prune its deletes (owner,
+  2026-11-06): DuckLake builds no file filter for a `BLOB` column
+  (`DL/storage/ducklake_metadata_manager.cpp:1764-1765`), and a 26-character value keeps its min/max
+  under mssql-ducklake's `stats_length` (1024 by default, its spec 018). `_mssql_page_lsn` is a scan
+  column only: no lake stores a page LSN, because which pages changed is decided by the file (the DCM and
+  `m_lsn > since_lsn`, spec 089 D3; R§6.2 point 4). The lake deletes by `_mssql_page` with DuckLake's own
+  `DELETE` (R§6.2).
 
 - **D9 — the opened-file cache (owner, R§6.1).** An import calls the functions once per table on the
   same file, and a cold open costs a pass over the whole file. The opened backup is kept in DuckDB's
@@ -159,9 +179,9 @@ Out, each refused by name until its spec lands:
   `consistent` iff no open transaction and no committed row operation after `CheckpointLSN` (E3§4).
   The `fuzzy` parameter: `'warn'` (default; rows returned, one `WARNING` per affected table in
   `duckdb_logs`), `'error'` (affected tables refused by name), `'ignore'`. R§10.3 is settled for the
-  lake by the owner's no-dirt decision (R§4): the importer always passes `'error'`. The default for
-  browsing is **for the owner to confirm** (DQ-13, together with 090's `recovery` default). The log-tail
-  reader is built here and extended by 090.
+  lake by the owner's no-dirt decision (R§4): the importer always passes `'error'`. For browsing the
+  default is `'warn'`, with 090's `recovery := true` (DQ-13, accepted). The log-tail reader is built
+  here and extended by 090.
 
 - **D12 — a differential overlay for browsing.** `diff :=` names one differential backup (a path, a
   glob or a list of its stripes). The chain is checked first: the diff's `DifferentialBaseGUID`
@@ -180,8 +200,7 @@ Out, each refused by name until its spec lands:
 - **D14 — versions.** `dbi_version` 998 (2025) is verified. 869 / 904 / 957 (2017 / 2019 / 2022,
   expected values, unverified) are accepted once the CI version matrix passes on their images;
   any other value is refused by name unless `unsupported_version := true`. The minimum supported
-  version is **for the owner to confirm** (R§10.5, DQ-04); this draft proposes 2017, the oldest Linux
-  image the CI can run.
+  version is 2017, the oldest Linux image the CI can run (DQ-04, accepted; R§10.5).
 
 - **D15 — parsers are DuckDB-free.** Everything under `src/backup/` below the function layer takes
   byte spans and returns plain structs, with no DuckDB headers, so its fuzz harnesses run in the
@@ -192,8 +211,70 @@ Out, each refused by name until its spec lands:
   `src/catalog/backup/` (owner, 2026-11-05, given with this series; R§6.1 had listed the layout as a
   proposal). Internals in `duckdb::mssql::backup` with no prefix; catalog classes
   in `duckdb` with the `MSSQL` prefix (CLAUDE.md's namespace rule). Source files
-  `backup_<component>.cpp`, the peer of `tds_<component>.cpp` (proposal, DQ-37; the CLAUDE.md file rule
-  names only `mssql_` and `tds_`).
+  `backup_<component>.cpp`, the peer of `tds_<component>.cpp` (DQ-37, accepted; CLAUDE.md's file rule,
+  which names only `mssql_` and `tds_`, is extended to name it).
+
+- **D17 — resources: no OOM, every core, DuckDB's limits (owner, 2026-11-06).** Do not load
+  everything into memory, use the machine to the full for parallelism, never fail with OOM, respect
+  DuckDB's memory and thread limits, and offer limits on the import itself. 086–090 cite this rule, and
+  so do mssql-ducklake's 022 D12 and its 023 / 024; § Resources lists each component with its home or
+  its bound.
+  - **DuckDB's limits are the ceiling.** `memory_limit` (an alias of DuckDB's `max_memory` setting,
+    `DD/src/main/config.cpp:275`) and `threads` are GLOBAL settings, for the whole instance
+    (`DD/src/common/settings.json:1201-1210`, `:1534-1543`). Spilling goes to `temp_directory`, up to
+    `max_temp_directory_size`, global too (`:1517-1523`, `:1221-1227`). The `max_memory` parameter
+    below is per call, unlike DuckDB's `max_memory` setting.
+  - **Whatever grows with the input lives in DuckDB's buffer manager**, so it is counted against
+    `memory_limit` and spills: buffer-managed blocks, a `ColumnDataCollection` built with the
+    `ClientContext` and its default `BUFFER_MANAGER_ALLOCATOR`
+    (`DD/src/include/duckdb/common/types/column/column_data_collection.hpp:37-41`), DuckDB's sort.
+    The `Allocator&` constructors build an in-memory collection that cannot spill (`:29-32`); none is
+    used to accumulate. The rest is bounded by a stated budget, and that working
+    memory (a chunk's staging, a LOB value being assembled, a writer's row group) is reserved before it
+    is allocated, with `BufferManager::ReserveMemory`
+    (`DD/src/include/duckdb/storage/buffer_manager.hpp:100-103`). So it is counted too, under the tag
+    `EXTENSION` of `duckdb_memory()`.
+  - **One rule for a failed reservation.** `ReserveMemory` evicts blocks or throws
+    `OutOfMemoryException` through `EvictBlocksOrThrow`
+    (`DD/src/storage/standard_buffer_manager.cpp:775-783`, `:127-138`). Every reservation, the
+    reader's and mssql-ducklake's importer's (022 D12), follows one rule: one that does not fit, in its
+    budget or in DuckDB's, first waits for other units to release memory; one that still cannot fit
+    when its unit is alone is refused by name, naming the object, the size, `max_memory` and
+    `temp_directory`. With no `temp_directory` nothing spills (`InMemoryWarning`, `:765-773`), so the
+    limits are hard. An in-memory DuckDB has one, `.tmp`, unless `temp_directory` is set to `''`
+    (`DD/src/main/config.cpp:651-659`).
+  - **Parallelism is `threads`, throttled by memory, never the other way round.** The table functions
+    report `MaxThreads()` from their units, and DuckDB runs at most that many tasks of a pipeline on its
+    own threads (`DD/src/parallel/pipeline.cpp:127-166`).
+  - **Backpressure.** When the budget is reached, a unit waits, or a writer flushes and closes a file.
+    Nothing allocates past the budget, and no stage decodes everything before anything is written.
+  - **Out of temp space.** DuckDB throws from `TemporaryFileManager::IncreaseSizeOnDisk`
+    (`DD/src/storage/temporary_file_manager.cpp:647-659`); the reader refuses the file by name, naming
+    `max_temp_directory_size`. Nothing it allocates escapes DuckDB's accounting, so nothing is killed
+    for memory.
+  - **Limits on one call.** `memory_limit` and `threads` are instance-wide, so a narrower limit for one
+    import cannot be a `SET` without changing every other session. The reader's own components enforce
+    it: `max_memory := <bytes or '2GB'>` and `max_threads := <n>` on `mssql_backup_scan`, which decodes
+    in parallel, and on `mssql_backup_export` (089); 090 adds them to every function that recovers
+    (090 D9), and mssql-ducklake's export and commit take the same names (022 D12). The default is
+    DuckDB's own limit; a value above it is clamped to it, with a WARNING. They bound the reader's own
+    allocations, by the split below (the decode staging, LOB values, 090's recovery structures, 089's
+    writers: F comes from `max_memory` / 4), and its concurrency (`MaxThreads()` ≤ `max_threads`).
+  - **The split of `max_memory`.** A call's `max_memory` is its whole budget. Half of it is left to
+    DuckDB's operators around the reader, its sorts and hash tables: mssql-ducklake gives its side
+    connections `operator_memory_limit = max_memory / 2` (022 D12). The reader's and the importer's
+    own reservations (decode staging, LOB values, writers, recovery structures) stay under the other
+    half, and the export's writers take at most half of that: F comes from `max_memory` / 4 (089).
+  - **What they cannot bound**: the DuckDB statements around the reader (an importer's `DELETE` scans,
+    a SWITCH's copy, a sort) obey the instance's limits. DuckDB has one per-connection memory knob at
+    the pin, `operator_memory_limit` (scope local, `DD/src/common/settings.json:1260-1266`): it caps a
+    connection's sorts and hash tables at the smaller of it and the instance's limit
+    (`DD/src/main/client_data.cpp:126-133`; read by `TemporaryMemoryManager`,
+    `DD/src/storage/temporary_memory_manager.cpp:106`). The importer sets it to `max_memory` / 2 on its
+    own side connections (the split above, 022 D12); the reader never sets a caller's. There is no
+    per-connection thread knob: `threads`, `external_threads`, `async_threads` and `pin_threads`
+    (which pins threads to cores) are all global (`settings.json:1534-1543`, `:958-967`, `:174-180`,
+    `:1315-1321`).
 
 ## Design
 
@@ -245,7 +326,7 @@ Common named parameters of every function, and ATTACH options of the same names:
 | `first_lsn`, `last_lsn`, `checkpoint_lsn`, `database_backup_lsn` | `DECIMAL(25,0)` | trailer SCIN (MSLS / MQCI) +32 / +42 / +52 / +62, 10 bytes each (E1§3) |
 | `differential_base_lsn`, `differential_base_guid` | `DECIMAL(25,0)`, `UUID` | SCIN +830 / +842; in a full: its own checkpoint LSN and GUID, the base it establishes (E1§3) |
 | `database_name`, `database_version`, `compatibility_level`, `collation`, `family_guid` | | boot page: `dbi_dbname` +52, `dbi_version` +4, `dbi_cmptlevel` +314, `dbi_collation` +392 (name from the collation table), `dbi_familyGUID` +408 (record offsets, X§4) |
-| `recovery_fork_id`, `binding_id` | `UUID` | **to locate** (task 3), HEADERONLY `RecoveryForkID` / `BindingID`; `NULL` until matched. The importer's chain check needs the fork id (089 rule 1, 023 C1) |
+| `recovery_fork_id`, `first_recovery_fork_id`, `fork_point_lsn`, `binding_id` | `UUID`, `UUID`, `DECIMAL(25,0)`, `UUID` | **to locate** (task 3), HEADERONLY `RecoveryForkID` / `FirstRecoveryForkID` / `ForkPointLSN` / `BindingID`; `NULL` until matched. The chain check compares the file's fork with the lake's and fails closed: until the fork id is read every apply by LSN, a differential or a full applied incrementally, is refused (089 D7, 023 C1) |
 | `backup_name`, `description`, `user_name`, `machine_name`, `software_version` | `VARCHAR` | SSET strings, VOLB machine name, SSET software major / minor (X§3) |
 | `backup_start_date`, `backup_finish_date` | `TIMESTAMP` | **to locate** (task 3): candidates SSET +88 and ESET +80 MTF dates; `NULL` until matched with HEADERONLY |
 | `media_set_guid`, `family_count`, `family_sequence_number` | | TAPE's RAID stream +0 / +20 / +24 (E2 layouts) |
@@ -293,7 +374,9 @@ Projection pushdown; LOBs read only when their column is projected. **No filter 
 spec**: DuckDB applies filters above the scan, which avoids the 2.0 rule that a scan must apply every
 filter it accepts (CLAUDE.md) until filter pushdown with late materialisation is measured (task 25).
 `cardinality` from `rcrows`. Parallel over units of live pages (§ Scan). Order: page order within a
-unit; no key order (spec 089's export gives one).
+unit; no key order (spec 089's export gives one). `max_memory` and `max_threads` (D17; default
+DuckDB's `memory_limit` and `threads`, clamped to them with a WARNING) bound the call's own memory
+and its units in flight (§ Resources).
 
 The ATTACH catalog: one schema entry per `sysclsobjs` class-50 row, one table entry per user table
 (`sysschobjs.type = 'U '`); views are **not** catalog entries (T-SQL is not DuckDB SQL;
@@ -318,8 +401,7 @@ src/backup/                         namespace duckdb::mssql::backup (no prefix);
   backup_page_store.cpp             PageStore: page bytes by (file, page); differential overlay
   backup_catalog_reader.cpp         boot page, the five bootstrap layouts, generic base-table decoder
   backup_catalog_model.cpp          CatalogModel: schemas, objects, rowsets, AUs, columns, TableLayout
-  backup_collation.cpp              collation id → code page, name (generated from tools/collations.psv)
-  backup_code_page.cpp              single-byte code page → Unicode tables (generated)
+  backup_collation.cpp              on-disk collation id → spec 091's collation table (code page, name)
   backup_record.cpp                 RecordView: FixedVar split, record types, forwarding, uniquifier
   backup_lob.cpp                    LobReader: in-row roots, LOB trees, row-overflow, text pointers
   backup_value_kernels.cpp          on-disk bytes → codec staging → DuckDB vectors                    [DuckDB]
@@ -334,6 +416,7 @@ src/catalog/backup/                 namespace duckdb, MSSQL prefix              
   mssql_backup_table_entry.cpp      MSSQLBackupTableEntry
   mssql_backup_transaction.cpp      MSSQLBackupTransactionManager, MSSQLBackupTransaction (read-only, no state)
 src/include/backup/, src/include/catalog/backup/   headers, mirroring the sources
+src/codec/code_page/                spec 091: code-page tables and kernels, reused here (D7)
 ```
 
 ```mermaid
@@ -483,10 +566,13 @@ Byte offsets are from the experiments; each is **(2025)** unless marked otherwis
   `idminor` ∈ {0 heap, 1 clustered}, one per partition (`numpart`); allocation units by `ownerid` =
   rowset id, type 1 IN_ROW_DATA, 2 LOB_DATA, 3 ROW_OVERFLOW_DATA. A rowset whose IN_ROW AU has type 0
   or owner 0 is a deferred drop: dead (E2§1.2).
-- Collations: id → code page and name from an embedded table generated from `tools/collations.psv`
-  (5,540 rows **(2025)**). A collation is UTF-8 iff `id >> 24 == 0` and `id & 0x80` (exact over all
-  5,540, X§4). Code pages used: 65001, 1250–1258, 874, 437, 850 (single byte, decoded here) and 932,
-  936, 949, 950 (double byte, spec 086); 0 = Unicode-only collations, which no `varchar` can carry.
+- Collations: 085 maps the on-disk CollationId (`dbi_collation`, `sysrscols.collation`,
+  `syscolpars.collationid`) onto spec 091's table, `tools/code_pages/data/collations.psv` (5,540
+  rows **(2025)**), for its code page and name (D7). The on-disk id is encoded differently from the
+  5 bytes of a TDS COLMETADATA collation, and its low byte is not the LCID. A collation is UTF-8 iff
+  `id >> 24 == 0` and `id & 0x80` (exact over all 5,540, X§4). Code pages used: 65001, 1250–1258,
+  874, 437, 850 (single byte: 091's tables, here) and 932, 936, 949, 950 (double byte: 091's tables,
+  spec 086); 0 = Unicode-only collations, which no `varchar` can carry.
 
 **Records** (X§4, E1§4.1, E1§5 rule 7, E2 R7):
 - Slot array at the page end, u16 per slot, `m_slotCnt` @22; a slot offset below 96 is a freed slot
@@ -567,6 +653,25 @@ Byte offsets are from the experiments; each is **(2025)** unless marked otherwis
   scans); producers call `DataChunk::SetChildCardinality`; writes go through
   `FlatVector::GetDataMutable` (CLAUDE.md, 2.0 contracts).
 
+### Resources (D17)
+
+Each component of 085, with its home or its bound:
+
+| component | grows with | home or bound |
+|---|---|---|
+| page index, block index (stage 2) | the file's pages and blocks (~0.2 % of the backup) | buffer-managed blocks, pinned while read; they spill |
+| opened-file cache (D9) | files opened | DuckDB's `ObjectCache`: an entry reports `GetEstimatedCacheMemory` (`DD/src/include/duckdb/storage/object_cache.hpp:48`), so the buffer pool evicts it under pressure (`DD/src/storage/buffer/buffer_pool.cpp:348`); an attached catalog pins its entry; an evicted entry costs a reopen |
+| catalog (stage 4) | objects × columns | the decoded base tables in `ColumnDataCollection`s built with the `ClientContext`, spillable; the model over them indexes them by id, and a `TableLayout` is built only for a table a call binds |
+| log tail (stage 5) | the tail's records | read block by block; the transaction table and the per-AU flags of D11 are buffer-managed (090 D9 extends them) |
+| decode staging | the rows of a chunk | one chunk per running unit, closed at the codec's staging byte budget or a full vector, whichever comes first; reserved (D17) |
+| a compressed block being read | ≤ 64 KB | one per thread (§ Scan) |
+| a LOB value | its length | not streamed: DuckDB has no streamed value, so a value is assembled whole in its vector, fragment by fragment, capped at 2^31 − 1 bytes. Its length, known from its root before a fragment is read, is reserved first, by D17's rule: a unit that cannot reserve it waits for the others, and a value that still cannot fit while its unit runs alone is refused by name (table, `_mssql_rid`, column, length, `max_memory`, `temp_directory`) |
+
+So a scan holds at most `MaxThreads()` (≤ `max_threads`) chunks and LOB values at once, under the
+reservations' half of `max_memory` (D17); the rest is buffer-managed and spills. 088 (rowgroup
+buffers), 089 (changed pages, base inputs, the export's writers) and 090 (recovery state, its D9)
+list their own; mssql-ducklake 022 D12 lists the importer's.
+
 ### Invariants
 
 1. A row is returned only from a live page (R3) of the table's base rowset, from a record of type 0
@@ -605,9 +710,10 @@ A backup file is untrusted input (R§9). Every parser:
   E1§4.8 — `sysallocunits`, `sysrowsets`, `sysschobjs`, `syscolpars`, `sysrscols`, `sysseobjvalues`,
   `sysclsobjs` — plus `sysobjvalues`, `sysidxstats`, `sysiscols`, the columnstore tables of 088 and the
   partitioning tables of E7: `systypedsubobjs`, `syssingleobjrefs`). Others, such as `sysowners`
-  (contained users' password hashes) or the certificate and key tables, are refused by name. Whether
-  `sysobjvalues` is served whole (it holds module source) or only its view-text and boundary rows is
-  part of the same proposal, **for the owner to confirm** (DQ-11).
+  (contained users' password hashes) or the certificate and key tables, are refused by name.
+  `sysobjvalues` is served by value class only: view definitions, partition boundaries (valclass 30),
+  and the computed-column and default definitions, the classes pinned by task 11; module source never
+  leaves (DQ-11, accepted).
 - **Fuzzing** (ClusterFuzzLite, `fuzz/`, D15): one harness per parser, each with a seed corpus cut from
   the committed samples: `fuzz_backup_mtf` (walker), `fuzz_backup_container` (MSSQLBAK chain),
   `fuzz_backup_xpress` (raw codec, with a differential oracle against a reference decode of the seed),
@@ -615,8 +721,8 @@ A backup file is untrusted input (R§9). Every parser:
   synthetic layout), `fuzz_backup_lob` (tree walk over a synthetic page set), `fuzz_backup_catalog`
   (bootstrap over synthetic pages), `fuzz_backup_log` (blocks, parity, records). `src/backup/**` joins
   `cflite-pr.yml`'s paths.
-- **Memory**: the page index and the block index live in buffer-managed blocks; a LOB value is capped
-  at 2^31 − 1 bytes; a chunk closes at the staging budget.
+- **Memory** (D17, § Resources): whatever grows with the file is buffer-managed; a LOB value is capped
+  at 2^31 − 1 bytes and reserved before it is read; a chunk closes at the staging budget.
 
 ## Testing and acceptance
 
@@ -669,6 +775,12 @@ committed samples only.
 11. The fuzz harnesses replay their corpora clean under ASan and UBSan.
 12. Opening a 100 GB backup (generated in a manual lane) holds under 300 MB resident and reads the
     file once.
+13. A backup much larger than memory (a generated 20 GB full, the manual lane), every table scanned
+    with `memory_limit = '1GB'` and every thread, completes: the peak memory DuckDB accounts
+    (`duckdb_memory()`, the buffer manager's used bytes) stays under the limit, and every table equals
+    the oracle. With `max_memory := '512MB', max_threads := 2` likewise: the memory the scan reserves
+    (`duckdb_memory()`'s `EXTENSION` tag) stays under its half, 256 MB (D17), at most two tasks at a
+    time. 089 acceptance 9 runs the import of the same file (D17).
 
 ## Tasks
 
@@ -679,7 +791,10 @@ merges before the next opens (never stacked).
 1. Skeleton: folders, CMake, namespaces, `ByteReader`, the error type — 1 d
 2. `ByteSource`: FileSystem handles for every family, positional reads, globs and lists — 1.5 d
 3. MTF walker, checksums, SQL Server DBLKs; SSET / VOLB / MSCI / SCIN / SFIN / MSLS fields; locate
-   `backup_start_date` / `backup_finish_date` / `recovery_model` against HEADERONLY — 3 d
+   `backup_start_date` / `backup_finish_date` / `recovery_model` and the recovery fork
+   (`RecoveryForkID`, `FirstRecoveryForkID`, `ForkPointLSN`) against HEADERONLY. The fork is on the
+   path to every apply by LSN: until it is read, 089's chain check refuses every differential and
+   every full applied incrementally (089 D7) — 3 d
 4. MSSQLBAK header, block chain, block index — 1.5 d
 5. XPRESS decoder, table-driven — 2 d
 6. ZSTD: link DuckDB's bundled `duckdb_zstd` if every platform's host exports it, else vcpkg `zstd`
@@ -690,20 +805,24 @@ merges before the next opens (never stacked).
 9. `mssql_backup_info`, registered through `RegisterDocumentedFunction` — 1 d
 10. Fuzz harnesses mtf / container / xpress / page; committed seed samples — 2 d
 
-**PR 2 — catalog and rows (`mssql_backup_tables`, `_views`, `_catalog`, `_scan`)**
+**PR 2 — catalog and rows (`mssql_backup_tables`, `_views`, `_catalog`, `_scan`)**, after spec 091's
+module `src/codec/code_page/` has merged (D7)
 
-11. Boot page, bootstrap layouts table, generic base-table decoder; pin the view-definition valclass
-    in `sysobjvalues` — 4 d
+11. Boot page, bootstrap layouts table, generic base-table decoder; pin the `sysobjvalues` value
+    classes DQ-11 serves (view, computed-column and default definitions; boundaries are valclass 30)
+    — 4 d
 12. Catalog model: schemas, objects, rowsets, partitions, AUs, columns, defaults, views; the
     partitioning model of E7 (functions, typed boundaries through the catalog's sql_variant reader,
     schemes, destinations, index data spaces, the partition column), the `partitioning` column and
     E7's verify as a test — 5 d
-13. Collation table and single-byte code-page tables, generated — 1.5 d
+13. 085 maps the on-disk CollationId onto spec 091's table; 091's single-byte code-page tables and
+    kernel reused (D7) — 0.5 d
 14. FixedVar records: types, forwarding, uniquifier, dropped and added columns, version tag — 3 d
-15. Value kernels over the codec staging; own kernels for datetime, smalldatetime, money, bit, code
-    pages — 4 d
+15. Value kernels over the codec staging; own kernels for datetime, smalldatetime, money, bit (the
+    code-page kernel is spec 091's, D7) — 4 d
 16. `mssql_backup_scan`: bind, projection, units, parallelism, cardinality, virtual columns,
-    serialisation — 5 d
+    serialisation; the D17 budget (`max_memory`, `max_threads`, the clamp's WARNING, the reservations
+    of § Resources and their wait-then-refuse rule) and acceptance 13 — 5.5 d
 17. `mssql_backup_tables`, `mssql_backup_views`, `mssql_backup_catalog` — 2 d
 18. Fuzz harnesses record / catalog — 1 d
 19. CI oracle lane: `docker run` of each image with a host volume at `/var/opt/mssql/backup`,
@@ -711,7 +830,8 @@ merges before the next opens (never stacked).
 
 **PR 3 — LOBs**
 
-20. LOB reader: roots, trees, row-overflow, text pointers, checks; lazy reads — 4 d
+20. LOB reader: roots, trees, row-overflow, text pointers, checks; lazy reads; the plain `_mssql_lob`
+    output, root bytes and node list (DQ-05) — 5 d
 21. Fuzz harness lob; LOB fixtures in the oracle lane — 1 d
 
 **PR 4 — cache, ATTACH, overlay, remote**
@@ -734,12 +854,15 @@ merges before the next opens (never stacked).
 29. Docs per PR: README (user-facing), `DATAMODEL.md` (a "Backup reader" layer section with the
     diagram above), CLAUDE.md (functions, settings, layout), CHANGELOG, website — 2 d
 
-**Total ≈ 68.5 days, 12.5–14 weeks** (66.5 before E7's partitioning model joined task 12). R§8 gave
-phase 0 6–8 weeks; this spec also carries the differential overlay, the locators and the parallel
-scan from phase 1 (~2 weeks), and costs the hardening, the eight fuzz harnesses, the CI oracle lane
-and the docs that R§9 lists but §8 did not cost.
+**Total ≈ 69 days, 12.5–14 weeks** (66.5 before E7's partitioning model joined task 12, 68.5
+before the plain `_mssql_lob` output joined task 20 from 089 task 7, DQ-05, 69.5 before spec 091
+took the code-page tables out of task 13, −1 d, and D17's budget joined task 16, +0.5 d). Spec 091's
+days are its own, outside this total. R§8 gave phase 0 6–8 weeks; this spec also carries the
+differential overlay, the locators and the parallel scan from phase 1 (~2 weeks), and costs the
+hardening, the eight fuzz harnesses, the CI oracle lane and the docs that R§9 lists but §8 did not
+cost.
 
-## Risks and open questions
+## Risks
 
 - **Version drift is the main risk.** Every offset above is **(2025)**. The catalog layouts (D5), the
   boot page, SCIN offsets and the MSSQLBAK header may differ on 2017–2022. The CI matrix is what turns
@@ -752,15 +875,18 @@ and the docs that R§9 lists but §8 did not cost.
 - **Legacy LOB types** (`text`, `ntext`, `image`) are unverified.
 - **RCSI / snapshot version tags** (statusA 0x40) are handled by length only; no experiment ran with
   row versioning (E2§10, E3§8). ADR's in-row versions are unknown.
-- **Unlocated header fields**: backup dates, recovery model. The importer tags snapshots with
-  `backup_finish_date` (R§6.2), so locating it is in PR 1.
+- **Unlocated header fields**: backup dates, recovery model, the recovery fork. The importer tags
+  snapshots with `backup_finish_date` (R§6.2) and refuses every apply by LSN until the fork id is
+  read (089 D7), so locating them is in PR 1.
 - **Appended backup sets** (`position`) were never produced.
 - **Partitioning not covered by E7** (E7§7): RANGE LEFT SPLIT / MERGE, an `ALL TO` scheme after a
   SPLIT, PAGE compression per partition, boundary types beyond those listed above, a computed
   partitioning column. Each gets a fixture before it is trusted.
-- Open for the owner ([decisions.md](decisions.md)): the browsing defaults (D11; DQ-13), the minimum version
-  (D14; DQ-04), the base-table allow-list (§ Security; DQ-11), the service-column types (D8; DQ-02),
-  the `backup_<component>.cpp` file names (D16; DQ-37), committed samples (DQ-36).
+- Decided ([decisions.md](decisions.md)): browsing with `fuzzy := 'warn'` and `recovery := true`
+  (D11; DQ-13); 2017 as the minimum version (D14; DQ-04); the allow-list of base tables and
+  `sysobjvalues` value classes (§ Security; DQ-11); the service-column types (D8; DQ-02); the
+  `backup_<component>.cpp` file names (D16; DQ-37); committed samples, ≤ 2 MB each and ≤ 16 MB in
+  all (DQ-36).
 
 ## References
 

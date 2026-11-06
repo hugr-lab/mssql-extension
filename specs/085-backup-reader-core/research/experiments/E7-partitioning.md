@@ -31,6 +31,9 @@ returns nothing. Local copies of all 30 backups are in `experiments/E7/bak/` (36
    - **TIMESTAMPTZ transforms follow the session `TimeZone`.**
 
    DuckDB itself, run on the server's values, agrees with the model on all 70 temporal partitions.
+   Both facts were measured with DuckDB's own functions; at the pin DuckLake's `epoch_*` transforms
+   floor TIMESTAMP_NS and take a TIMESTAMPTZ's UTC instant, so they hold for its calendar transforms
+   only (§3, note of 2026-11-06).
 4. **SWITCH is catalog-only.** The two rowsets exchange `sysrowsets.idmajor` (and `numpart`). Allocation units stay
    with their rowsets, and page headers and IAMs are unchanged.
    - **No data, LOB or index page of the switched partition is in the differential.** This held in 5 variants: out,
@@ -181,7 +184,9 @@ Results (`out/verify_*.txt`):
 - Non-temporal types: only identity (consecutive integers).
 - Strings: never.
 
-DuckLake's epoch transforms are `date_diff(part, DATE '1970-01-01', col)` (`DL/storage/ducklake_partition_data.cpp:238-254`).
+DuckLake's epoch transforms are `date_diff(part, DATE '1970-01-01', col)` after a normalisation this
+report first missed: TIMESTAMP_NS / TIMESTAMP_TZ_NS floored to µs, a TIMESTAMPTZ taken as its UTC
+instant (`DL/storage/ducklake_partition_data.cpp:224-255`; note below).
 
 | function | exact rule | DuckDB-evaluated | why |
 |---|---|---|---|
@@ -223,6 +228,17 @@ temporal partitions (`out/lakecounts_utc.txt`).
      673 under `Europe/Berlin`.
    - `t_dto_r` under Berlin: the first partition gets 2 years, p3 gets 3 months (`out/duck_check_berlin.csv`).
 
+**Note (2026-11-06).** Both facts were measured with DuckDB's own `date_diff` / `month()` / `CAST`,
+not through DuckLake's transform. At the pin (`dcf71031`), as since DuckLake added `epoch_*`
+(a56fafd4, 2026-08-12), `ApplyEpochTransform` floors TIMESTAMP_NS / TIMESTAMP_TZ_NS to µs
+(`FloorNanosToMicros`) and takes a TIMESTAMPTZ's UTC instant before `date_diff`
+(`DL/storage/ducklake_partition_data.cpp:224-255`; `DL/../test/sql/partitioning/`
+`epoch_timestamptz.test`, `epoch_transforms.test:192`). So neither fact holds for DuckLake's
+`epoch_*` values. Both hold for its calendar transforms `year` / `month` / `day` / `hour`, which are
+DuckDB's functions (`:263-267`): checked on the pin, 2026-01-31 23:30Z is `epoch_month` 672 under UTC
+and under Europe/Berlin, and `month` 1 and 2. This section is re-run through DuckLake's own transform
+on the pin in mssql-ducklake's 022 task 4.
+
 At this DuckLake pin, file pruning uses partition values only for `bucket`
 (`DL/storage/ducklake_metadata_manager.cpp:2183-2258`). A mismatched temporal value is therefore not a wrong-result
 bug today. It would still disagree with what DuckLake writes for its own INSERTs and with how it groups files in
@@ -233,11 +249,14 @@ compaction.
 - **Choose the spec by the exact rule** (it describes the data's partitioning). **Compute every row's partition value
   with DuckLake's own expression on the lake value**, and split files by that value.
   - For date, datetime and datetime2(≤ 6) the two coincide.
-  - For datetime2(7) the cost is one extra small file per SQL Server partition, only when rows exist in the last
-    500 ns of a period.
+  - For datetime2(7) under an `epoch_*` spec they coincide too, DuckLake flooring at the pin (§3
+    note); under a calendar transform the cost is one extra small file per SQL Server partition, only
+    when rows exist in the last 500 ns of a period.
   - Never declare a value for a file that DuckLake would compute differently.
-- **datetimeoffset:** derive in UTC (SQL Server orders by UTC). This is only valid while every writer runs with
-  `TimeZone='UTC'`. Unless the owner accepts that constraint, **derive no default** for datetimeoffset columns.
+- **datetimeoffset:** derive in UTC (SQL Server orders by UTC). That is how DuckLake's `epoch_*`
+  compute a TIMESTAMPTZ at the pin (§3 note), so the proposal holds whatever the writers' TimeZone.
+  (Drawn before that note: "only valid while every writer runs with `TimeZone='UTC'`; unless the owner
+  accepts that, derive no default"; decided by the owner as decisions.md DQ-10.)
 - **SPLIT/MERGE later do not invalidate a declared spec.** Files are split by each row's own value. After s08 (Jan + Feb
   merged), a fresh derivation would pick epoch_year, but the epoch_month spec set at creation keeps holding: the merged
   partition simply yields two values. This fits the owner's rule that incremental imports never change the spec.
@@ -387,6 +406,8 @@ above are mechanical.
 - "no inner partition gives no spec";
 - the DuckDB rounding of TIMESTAMP_NS (datetime2(7));
 - the TimeZone dependence of TIMESTAMPTZ transforms.
+
+Both are DuckDB's, and reach DuckLake's calendar transforms only, not its `epoch_*` (§3 note).
 
 **§7.4 SWITCH** "swaps rowset ownership; data pages untouched; only catalog pages in the diff; MOVE the AU's
 rows" is **confirmed**, in 5 variants and in the replay. Refinements:

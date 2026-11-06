@@ -319,7 +319,9 @@ Layers (bottom up):
   ```sql
   PRAGMA ducklake_import_mssql_diff_backup('lake', 's3://bak/sales_diff_2026-11-05.bak');
   -- the callback plans at S0; W = the since_lsn the last import recorded (089 D3). Each table's
-  -- delete set is 089's evidence, written to the run directory as delete_pages.parquet:
+  -- delete set is 089's evidence, written as delete_pages.parquet to the run directory, which lives
+  -- outside the lake's DATA_PATH (run_path, by default DATA_PATH's parent +
+  -- mssql_backup_runs/<lake id>/; set explicitly when DATA_PATH is a bucket root, which has no parent):
   --   SELECT page, from_object_id        -- the previous file's owner, mapped to its lake table
   --   FROM mssql_backup_changed_pages('s3://…', since_lsn := W, base := …, expand := true)
   --   WHERE kind IN ('changed', 'freed', 'dead_au', 'gone_au', 'dead_rowgroup', 'pending_applied')
@@ -329,7 +331,10 @@ Layers (bottom up):
   --   CREATE TEMP TABLE manifest AS
   --       SELECT * FROM ducklake_mssql_backup_export('lake', 's3://…', plan := …);
   --       -- mssql_backup_export('s3://…', out := …, units := …, since_lsn := W, base := …)
-  --   then one transaction (one snapshot):
+  --   then one transaction (one snapshot). In autocommit ducklake_mssql_backup_commit runs it on a
+  --   side connection and, on a DuckLake conflict, retries it with the same export up to
+  --   N = import.conflict_retries (3) times, N+1 attempts; inside an explicit transaction the COMMIT
+  --   fails and a re-run resumes from the export (022 D1, 023 D11):
   --   SELECT * FROM ducklake_mssql_backup_validate('lake', 's3://…', plan := …);  -- first, at S1
   --   + catalog DDL
   --   DELETE FROM lake.s.t WHERE _mssql_page IN                 -- per affected table, before the
@@ -349,12 +354,16 @@ Layers (bottom up):
     `research-ducklake-import.md` (in progress).
   - **Parallel across tables** (and within a table, over extents).
   - **Deletes are DuckLake's own `DELETE` by value.** Every imported row carries `_mssql_page` and
-    `_mssql_rid` (opaque BLOBs, DQ-02); "delete the rows of page P" is `DELETE … WHERE _mssql_page IN
-    (…)` on the table P's allocation unit belonged to in the previous file, run before the file's new
-    files are registered, and DuckLake finds the positions. The reader emits rows page by page, in
-    physical read order, which gives key order and page contiguity at once (clustered index in
-    leaf-chain order; heap in IAM order; columnstore by rowgroup), so a page's rows sit in few files
-    and the files' min/max on `_mssql_page` are expected to prune the delete (to verify).
+    `_mssql_rid` (opaque values, DQ-02: `_mssql_page` a fixed-width hex `VARCHAR` so that file
+    statistics prune, `_mssql_rid` a `BLOB`); "delete the rows of page P" is
+    `DELETE … WHERE _mssql_page IN (…)` on the table P's allocation unit belonged to in the previous
+    file, run before the file's new files are registered, and DuckLake finds the positions. The
+    reader emits rows page by page, in physical read order, which gives key order and page
+    contiguity at once (clustered index in leaf-chain order; heap in IAM order; columnstore by
+    rowgroup), so a page's rows sit in few files and the files' min/max on `_mssql_page` prune the
+    delete (DuckLake prunes no `BLOB` column; one check is left, `IN (SELECT …)` through DuckDB's
+    dynamic join filter, while hex orders as bytes under mssql-ducklake's BIN2 UTF-8 catalog
+    collation, 089 § Risks).
   - **Schema evolution** must be handled inside the per-file commit: tables added, dropped, renamed,
     transferred between schemas; columns added, dropped, renamed, retyped — mapped to DuckLake schema
     evolution with stable field ids, or to a table rewrite where DuckLake cannot express the change.
@@ -376,7 +385,20 @@ Layers (bottom up):
     and provenance — the file's one snapshot. Its length is the delete scans' and the copy's, not the
     export's. Not one long INSERT transaction: the lake transaction would last the whole import, a
     rollback deletes every file written so far, and DuckLake's parallel copy appends row groups to
-    shared files, so physical order is lost and a page's rows scatter.
+    shared files, so physical order is lost and a page's rows scatter. DuckLake's commit loop retries
+    any attempt that fails after the conflict check with a retryable error (`can_retry`,
+    `DL/storage/ducklake_transaction_state.cpp:2665-2707`; `RetryOnError`,
+    `DL/storage/ducklake_transaction.cpp:1395-1409`); a conflict the check finds never is.
+    So in autocommit `ducklake_mssql_backup_commit` runs the part after the export (validate, DDL,
+    DELETEs, SWITCH copy, apply) in one transaction on a side connection and, on a conflict, retries
+    it up to N = `import.conflict_retries` times (3 by default), N+1 attempts, then reports, each retry
+    repeating the DELETE scans and the copy; inside an explicit transaction the COMMIT fails and a
+    re-run resumes from the export (022 D1, 023 D11). The export is reused: its files are
+    `created_by_ducklake = false`, which DuckLake's `CleanupFiles` leaves in place
+    (`DL/storage/ducklake_transaction.cpp:76-81`). They are written in `DATA_PATH`; the run's scratch
+    (plan, manifests, `base/`, `delete_pages.parquet`) lives outside it, under `run_path`, by default
+    `DATA_PATH`'s parent + `mssql_backup_runs/<lake id>/` (022 D9; set explicitly when `DATA_PATH` is a
+    bucket root).
   - **Register through DuckLake's own transaction, not its metadata rows.** mssql-ducklake compiles
     DuckLake in, so it can call `AppendFiles` directly; DuckLake still assigns ids and row ids, merges
     stats and checks conflicts, and mssql-ducklake's commit batch carries it to SQL Server. v1 can be
@@ -393,20 +415,30 @@ Layers (bottom up):
     which the lake's base IAM images name (point 4 below). A compressed columnstore row's
     `_mssql_page` is its rowgroup key (088 D3), so a rowgroup is deleted like a page and a
     delete-bitmap entry by `_mssql_page` and `_mssql_rid`. **Cost:** the delete reads the
-    `_mssql_page` column of the table's files, expected to be pruned by their min/max on it (to
-    verify, 089 § Risks); physical order keeps a page's rows in few files, and a lake sort order
-    scatters them (a cost, never a wrong row).
+    `_mssql_page` column of the table's files, pruned by their min/max on its hex `VARCHAR` (DuckLake
+    builds no file filter for a `BLOB`, `DL/storage/ducklake_metadata_manager.cpp:1764-1765`; one
+    check remains, 089 § Risks); physical order keeps a page's rows in few files, and a lake sort
+    order scatters them (a cost, never a wrong row).
     **Compaction is DuckLake's own:** nothing refers to file positions, so a compaction or
-    `CHECKPOINT` that moves rows between files changes nothing for the importer.
+    `CHECKPOINT` that moves rows between files changes nothing the importer keeps. It can collide
+    with an import at commit (`DL/storage/ducklake_transaction_state.cpp`): a delete conflicts with a
+    compaction committed meanwhile that merged or rewrote a file it deletes from (`:2479-2569`, the
+    merged-file check `:2540-2551`) and with any concurrent insert into the table (`:295-305`); the
+    import's new files conflict with a concurrent delete from the table (`:281-287`); a table the
+    import only appends to conflicts with neither a merge nor a rewrite (`:281-294`, `:329-334`). A
+    `CHECKPOINT` of an imported table during an import is the likeliest collision, because it merges
+    the small files earlier differentials left, which are the next import's delete targets; the docs
+    recommend running maintenance between imports, and a collision is retried as above.
   - **Commit cost:** imports take mssql-ducklake's client commit loop (the server-side apply covers
     add-files-only commits); ~80k metadata rows for 2,000 files × 40 columns — seconds, not measured.
   - **Schema evolution:** without rewrite, field ids kept — new / dropped tables, table rename, ADD
-    COLUMN (NOT NULL DEFAULT k: old files read k as the initial default), DROP COLUMN (after resetting
-    a partition / sort spec on it), column rename, int→bigint and decimal-precision widening, varchar
-    widening (no-op: lake VARCHAR has no length), DROP NOT NULL. Rewrite inside the same commit —
-    `ALTER SCHEMA … TRANSFER` (DuckDB has no SET SCHEMA), scale changes and other non-widening type
-    changes, PK / clustered-index / partitioning rebuilds (SQL Server rewrites every page anyway);
-    non-persisted computed columns are kept as text in the mirror (DuckLake refuses them).
+    COLUMN (NOT NULL DEFAULT k: old files read k as the initial default), DROP COLUMN (after removing
+    the partition / sort field on it, that field only, 022 D5), column rename, int→bigint and
+    decimal-precision widening, varchar widening (no-op: lake VARCHAR has no length), DROP NOT NULL.
+    Rewrite inside the same commit — `ALTER SCHEMA … TRANSFER` (DuckDB has no SET SCHEMA), scale
+    changes and other non-widening type changes, PK / clustered-index / partitioning rebuilds (SQL
+    Server rewrites every page anyway); non-persisted computed columns are kept as text in the mirror
+    (DuckLake refuses them).
   - **Partitioning:** DuckLake has identity, bucket, year/month/day/hour and (format 1.1)
     epoch_year/month/day/hour — no truncate; `SET PARTITIONED BY` applies to new files only. ~~Files are
     always split per SQL Server partition;~~ a DuckLake transform is declared only when the RANGE
@@ -426,7 +458,9 @@ Layers (bottom up):
   and clustered key only PROPOSE the initial spec / sort order when a table is created. Partition
   values are computed with DuckLake's own `DuckLakePartitionUtils::ApplyPartitionTransform` bound
   in the importing session, like any DuckLake writer (the session TimeZone for TIMESTAMPTZ,
-  DuckLake's TIMESTAMP_NS rounding) — no forced UTC. Files are laid out by DuckLake partition
+  DuckLake's TIMESTAMP_NS rounding; at the pin, DuckLake computes epoch transforms on the UTC instant
+  and floors TIMESTAMP_NS, so the TimeZone and the rounding reach only its calendar transforms,
+  decisions.md DQ-10) — no forced UTC. Files are laid out by DuckLake partition
   values and settings, not per SQL Server partition (SQL Server partitions may still be work units
   for parallel writers). SWITCH is a lake-side copy of the rows (resolved by E7's AU / rowset
   rule) plus a `DELETE` by `_mssql_page` in the source — not a file move; the moved rows are those
@@ -442,10 +476,17 @@ Layers (bottom up):
   clustered key / ordered CCI → sort order) *(narrowed by DQ-25: only the clustered rowstore key)*,
   unless the import call names a spec for that table. Incremental imports NEVER change partitioning or
   sort order, even when SQL Server repartitions (the rewritten rows land under the lake's current spec).
+  (022 D5 states the one exception: when the backup's catalog removes a column a partition or sort
+  field uses, by a DROP COLUMN or by a type change done as ADD / DROP / RENAME, the table stays, so the
+  importer removes only the field the change hits; the rest of the spec, manual edits included,
+  stays. A SQL Server re-create (DROP + CREATE of a table) re-creates the lake table, and the new lake
+  table gets the creation-time proposal; the old table's manual spec edits go with the old table. A
+  WARNING and the commit message name a removal; a promotion in place keeps its fields.)
   **Manual changes made with DuckLake take priority and are never reverted**: the importer records in
-  `__mssql_backup.tables` what it set at creation and does not touch the spec afterwards; a table dropped
-  and re-created in SQL Server under the same name keeps the lake table's current spec. A page split
-  across partition files simply has rows in several files; the delete by `_mssql_page` finds them all.
+  `__mssql_backup.tables` what it set at creation and does not touch the spec afterwards; ~~a table
+  dropped and re-created in SQL Server under the same name keeps the lake table's current spec~~ (a
+  re-created table is a new lake table, above). A page split across partition files simply has rows
+  in several files; the delete by `_mssql_page` finds them all.
 - **SQL Server partitioning in a backup — VERIFIED (E7, `experiments/E7-partitioning.md`).**
   - Where it lives: function = `sysclsobjs` class 30 (`intprop` = fanout, `status & 1` = RIGHT);
     parameter type = `systypedsubobjs` class 30; boundaries = `sysobjvalues` valclass 30 as
@@ -455,13 +496,18 @@ Layers (bottom up):
     `sysiscols.tinyprop2`; partitions = `sysrowsets.numpart` (+ compression, `rcrows` exact);
     `sysallocunits.fgid` = filegroup. Decoder matched the catalog views in 16 states, 0 mismatches.
   - Transform rule (finest of identity / epoch_day / epoch_month / epoch_year with one value per inner
-    partition) verified on every row. **DuckDB 2.0 caveats:** TIMESTAMP_NS is rounded to µs before
-    `date_diff` / `month()` / `CAST AS DATE`, so a `datetime2(7)` value in a period's last 500 ns gets
-    the next period — compute each row's value with DuckLake's own expression when splitting files;
-    TIMESTAMPTZ transforms follow the session `TimeZone` (same instant = month 672 in UTC, 673 in
-    Europe/Berlin) — ~~owner decision needed: derive nothing for datetimeoffset unless writers run in
-    UTC?~~ decided: behave like a DuckLake writer, values in the importing session's TimeZone (above).
-    (At this DuckLake pin only `bucket` values prune files, so no wrong results today.)
+    partition) verified on every row. **DuckDB 2.0 caveats** (measured with DuckDB's own functions,
+    not through DuckLake): TIMESTAMP_NS is rounded to µs before `date_diff` / `month()` /
+    `CAST AS DATE`, so a `datetime2(7)` value in a period's last 500 ns gets the next period; a
+    TIMESTAMPTZ's calendar parts follow the session `TimeZone` (same instant = month 672 in UTC, 673
+    in Europe/Berlin). At the pin DuckLake's `epoch_*` transforms avoid both: they floor TIMESTAMP_NS
+    and take a TIMESTAMPTZ's UTC instant (`DL/storage/ducklake_partition_data.cpp:224-255`); its
+    calendar transforms keep both (`:263-267`). Either way, compute each row's value with DuckLake's
+    own expression when splitting files. ~~owner decision needed: derive nothing for datetimeoffset
+    unless writers run in UTC?~~ decided: behave like a DuckLake writer (above); the `epoch_*`
+    transforms the importer proposes do not depend on the TimeZone. E7 §3 is re-run through
+    DuckLake's own transform on the pin in 022 task 4. (At this DuckLake pin only `bucket` values
+    prune files, so no wrong results today.)
   - Maintenance in a differential: **SWITCH is catalog-only** (the two rowsets exchange
     `sysrowsets.idmajor` / `numpart`; no data, LOB or index page of the partition is in the diff);
     NEXT USED and empty SPLIT / MERGE are catalog-only; populated SPLIT (RIGHT) moves rows to a new
@@ -636,14 +682,15 @@ differences are in the [series overview](../series.md) (phase map) and mssql-duc
 | 1 | ROW/PAGE compression, sparse, sql_variant, xml, spatial (SSCLRT→WKB), vector; differential overlay; virtual row locators; parallel scan | 5–6 wk | med | mssql 086, 7–8 wk + the `json` spike E9 |
 | 1b | encryption and TDE with a `mssql_backup_key` secret (certificate + PVK/PFX + password), selected by scope first, then by the thumbprint stored in plaintext in the backup / boot page (owner, §6.1) — format established by E4 | 1–2 wk | low–med | mssql 087, 3–3.5 wk + the TDE log-tail spike E10 |
 | 1c | tail recovery (owner: no dirt in the lake): redo of every tail transaction + undo of open ones, pending pages with allocation check, stale-page tracking, CheckpointLSN ordering — established by E3 + E6 | 9–12 wk | medium | mssql 090, 10–12 wk (+ guard extensions) |
-| 2 | mssql-ducklake: full import (one snapshot), provenance, diff import by locators, table-replace fallbacks, views as text | 3–4 wk | med | reader side: mssql 089, 8.5 wk; importer: mssql-ducklake 022–024, 18–23 wk |
+| 2 | mssql-ducklake: full import (one snapshot), provenance, diff import by locators, table-replace fallbacks, views as text | 3–4 wk | med | reader side: mssql 089, 8 wk; importer: mssql-ducklake 022–024, 18.5–23.5 wk |
 | 3 | columnstore (required): segments, dictionaries, RLE/bit-packing, delta stores, delete bitmaps, archive — format established by E5 | 5–8 wk | medium | mssql 088, 6–9 wk + E11 |
 | 4 | log backups: redo of row operations → consistent full backups and CDC-style incremental import; sector parity | 3–6 mo | high | not in the series |
 | 5 | QAT_DEFLATE, 2025 `json` — research first | open | high | `json`: 086's E9; QAT_DEFLATE refused by name |
 
-Totals of the drafts: mssql 085–090 ≈ 259 working days (≈ 52 weeks for one developer, ≈ 34 with two);
-mssql-ducklake 022–024 ≈ 18–23 weeks, gated on the reader. The order of 088 against 090 and the other
-open questions are in [decisions.md](../decisions.md).
+Totals of the drafts: mssql 085–090 ≈ 259 working days (≈ 52 weeks for one developer, ≈ 34 with
+two), plus spec 091's code-page module, which 085 PR 2 needs and which is costed in its own spec;
+mssql-ducklake 022–024 ≈ 117 days, 18.5–23.5 weeks, gated on the reader. The order of 088
+against 090 (090 first, DQ-03) and the other decisions are in [decisions.md](../decisions.md).
 
 ## 9. Hardening and tests
 
@@ -660,19 +707,20 @@ open questions are in [decisions.md](../decisions.md).
 1. ~~Separate extension or inside mssql?~~ Decided (2026-11-05): inside mssql, a new catalog type
    (`mssql_backup`, working name) plus reading functions that mssql-ducklake builds on.
 2. ~~Locator columns or a side table?~~ Decided (2026-11-05): service columns with a prefix
-   (`_mssql_rid`, `_mssql_page`) in the lake tables. Their physical types are DQ-02.
+   (`_mssql_rid`, `_mssql_page`) in the lake tables. Their physical types are decided in DQ-02:
+   opaque values, `_mssql_page` a hex `VARCHAR` and `_mssql_rid` a `BLOB`.
 3. Fuzzy policy default: settled for the lake by the no-dirt decision (§4): the importer refuses. The
-   reader's default for browsing is DQ-13.
-4. Columnstore: **required** (owner, 2026-11-05), decoded by E5; its order relative to tail recovery is
-   DQ-03.
-5. Minimum SQL Server version for the reader: DQ-04 (the drafts propose 2017).
+   reader's default for browsing is `recovery := true`, `fuzzy := 'warn'` (DQ-13, accepted).
+4. Columnstore: **required** (owner, 2026-11-05), decoded by E5; for one developer it comes after
+   tail recovery (DQ-03, accepted).
+5. Minimum SQL Server version for the reader: 2017 (DQ-04, accepted).
 6. ~~WASM?~~ Moot with the reader inside mssql (the extension needs sockets/TLS and is not built
    for WASM).
 7. ~~Partition layout and datetimeoffset values?~~ Decided (2026-11-05): follow DuckLake's rules (§6.2),
    DQ-10.
 
-Every other open question of the two spec series, deduplicated, ordered by impact and marked where it
-blocks the start of implementation, is in [decisions.md](../decisions.md).
+Every other question of the two spec series, deduplicated and ordered by impact, is decided or
+accepted in [decisions.md](../decisions.md).
 
 ## 11. Unknowns to resolve by experiment
 

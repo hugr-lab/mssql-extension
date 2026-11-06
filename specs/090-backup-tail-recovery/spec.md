@@ -2,7 +2,7 @@
 
 Status: **draft**, 2026-11-05. Not started. Depends on 085 (page store, log-tail reader) and 089 (lake
 mode, `base`, the changed set). Series overview: `../README.md`. Markers and source abbreviations as
-in 085; owner questions as DQ-nn ([decisions.md](../085-backup-reader-core/decisions.md)).
+in 085; the owner's decisions as DQ-nn ([decisions.md](../085-backup-reader-core/decisions.md)).
 
 ## Problem
 
@@ -59,13 +59,13 @@ log backups (R§8 phase 4 stays out).
   returns; `recovery := false` returns 085's page state with its fuzzy status. A table recovery cannot
   cover (D7, the guards) falls back to 085's page state under the `fuzzy` policy: rows and a warning
   under `'warn'`, refused under `'error'` (the importer always passes `'error'`). Reason: the owner's
-  rule, and an oracle that is RESTORE. The default for browsing is **for the owner to confirm**
-  (DQ-13, with 085 D11's `fuzzy` default).
+  rule, and an oracle that is RESTORE. Browsing takes the same default, `recovery := true` with 085
+  D11's `fuzzy := 'warn'` (DQ-13, accepted).
 
 - **D4 — variant 1 for loaded differentials (owner).** `loaded_diff := 'skip'` (default) or
-  `'partial'` (E6's main variant: fewer stale keys, but rows twice and torn LOBs until the next file;
-  whether to offer it at all is DQ-17). mssql-ducklake's import option of the same name passes it
-  through (023 D1).
+  `'partial'` (E6's main variant: fewer stale keys, but rows twice and torn LOBs until the next file),
+  offered as a non-default option and documented (DQ-17, accepted). mssql-ducklake's import option
+  of the same name passes it through (023 D1).
   Keeping raw record bytes per row to make a loaded differential exact on its own is not done (owner:
   it roughly doubles storage).
 
@@ -85,6 +85,20 @@ log backups (R§8 phase 4 stays out).
   slot list of record bytes (E6 `PageState`); its serialisation (versioned, checksummed) is the pending
   image format. Rebuilt pages join the page store as page sources like any other; the decoders above
   do not know a page was rebuilt.
+
+- **D9 — the recovery state is buffer-managed (085 D17).** The page states of the tail's pages (D8),
+  the per-AU key index of undo, the transaction table and the pending images grow with the tail and
+  with what its open transactions touched (12 % of E6's small database). They live in buffer-managed
+  storage, so they are counted against `memory_limit` and spill to `temp_directory`. A page state is
+  pinned only while redo or undo applies a record to it, an AU's key index only while undo searches
+  that AU, and a pending image only until `mssql_backup_pending_pages` returns it. `max_memory` and
+  `max_threads` (085 D17) are accepted by every function that recovers (§ Surface), and the call that
+  recovers first bounds what recovery pins and its per-record buffers, within the reservations' half
+  of its `max_memory`, by 085 D17's rule (wait, then refuse by name). When the temp space runs out
+  (`max_temp_directory_size`), DuckDB throws (085 D17) and the file is refused by name, naming the
+  table under recovery, the pages it holds and the setting: never a crash. The recovered state kept in
+  the `OpenedBackup` (§ Surface) counts in that cache entry's estimated memory and is evicted with it;
+  an evicted state costs a second recovery, never a wrong answer.
 
 ## Rules
 
@@ -210,11 +224,14 @@ rows.
 - `mssql_backup_scan(…, recovery := true, loaded_diff := 'skip', reflected_lsn := …)`, and the same
   three parameters on `mssql_backup_changed_pages`, `mssql_backup_allocation`,
   `mssql_backup_export_plan` and `mssql_backup_export` (089), so the importer's export, delete
-  evidence, allocation images and pending set come from one recovery. The recovered page state is
-  kept in the `OpenedBackup` (085 D9), keyed by (`since_lsn`, `base`, `reflected_lsn`,
-  `loaded_diff`), so the functions an import calls on one file recover once. In lake mode `base` also
-  carries `pending.parquet`, the previous file's `mssql_backup_pending_pages` rows `(file_id, page_id,
-  page, xids LIST(UBIGINT), lsn, image BLOB)`.
+  evidence, allocation images and pending set come from one recovery. Each of them, and
+  `mssql_backup_pending_pages`, also takes `max_memory` and `max_threads` (085 D17, D9). The
+  recovered page state is kept in the `OpenedBackup` (085 D9), keyed by (`since_lsn`, `base`,
+  `reflected_lsn`, `loaded_diff`), so the functions an import calls on one file recover once
+  (evictable with it, D9).
+  In lake mode `base` also carries `pending.parquet`, the previous file's `mssql_backup_pending_pages`
+  rows `(file_id, page_id, page, xids LIST(UBIGINT), lsn, image BLOB)`, `page` in `_mssql_page`'s hex
+  `VARCHAR` form (085 D8).
 - `mssql_backup_tables`: `fuzzy_status` after recovery is `recovered`, `stale` (with
   `stale_pages`, `skipped_transactions`), or `unrecoverable` (with `reason`); `raw_status` keeps 085's
   pre-recovery status.
@@ -232,8 +249,8 @@ rows.
 What mssql-ducklake stores between files (its own tables; R§6.2, research-ducklake-import §9):
 pending images with their transaction ids (`__mssql_sys.pending_pages`, the rows above plus its
 import sequence), the stale page set (`__mssql_sys.stale_pages`), `reflected_lsn` per import
-(`__mssql_backup.imports.last_lsn`). Where the pending images, which hold uncommitted rows, are kept is
-DQ-09.
+(`__mssql_backup.imports.last_lsn`). The pending images, which hold uncommitted rows, are kept in the
+lake, in `__mssql_sys.pending_pages` (DQ-09, accepted).
 
 ## Guards: refused by name (D7), each with its extension estimate
 
@@ -291,13 +308,18 @@ Acceptance:
 6. Fuzz harnesses replay clean under ASan and UBSan.
 7. Recovery of a 1 GB loaded full stays within a measured bound (E6: 1.2 s of a 6.6 s Python import
    on 240 MB); the C++ target is set by the first measurement.
+8. A recovered file whose tail touches more pages than fit in `memory_limit` (E6's workload scaled up
+   in the manual lane, with a small `memory_limit`) spills and completes, equal to RESTORE; with a
+   `max_temp_directory_size` too small for the spill it is refused by name, naming the setting (D9).
 
 ## Tasks
 
 1. Log contents on 085's reader: elements, op-specific fields, the transaction table with outcomes —
    2 d
 2. Page-state model: header plus slot list, record lengths (FixedVar, blob fragment, stub, version
-   tag), the overlay into the page store, the pending-image serialisation — 5 d
+   tag), the overlay into the page store, the pending-image serialisation; D9's buffer-managed storage
+   for the page states, the key index, the transaction table and the pending images, the named
+   refusal when the temp space runs out, acceptance 8 — 6 d
 3. Redo: the seven row operations, PFS, compensation, ghost replace, LOB length, reflected records — 8 d
 4. Undo: physical; by key with a per-AU key index; uniquifier, variable-length and multi-column keys;
    transaction attribution — 10 d
@@ -316,24 +338,25 @@ Acceptance:
 12. Docs (README: what "recovered" means; `DATAMODEL.md`: the recovery layer and the lake-mode
     flow with a diagram; CLAUDE.md; CHANGELOG) — 1 d
 
-**Total ≈ 57.5 days, 10–12 weeks.** E6§5 estimated 9–12 weeks (~3,000 lines) including the log-tail
-reader, of which 085 carries about a week. R§8 phase 1c: 9–12 weeks. The guard extensions are on top.
+**Total ≈ 58.5 days, 10–12 weeks** (57.5 before D9's buffer-managed recovery state joined task 2).
+E6§5 estimated 9–12 weeks (~3,000 lines) including the log-tail reader, of which 085 carries about a
+week. R§8 phase 1c: 9–12 weeks. The guard extensions are on top.
 
-## Risks and open questions
+## Risks
 
 - **Only E6's shapes are measured**: one 2025 server, one data file, uncompressed rowstore, `int` /
   `bigint` clustered keys, no ADR / RCSI, no DDL during the backups, backups of 3–3.6 s (E6§7). Real
   backups have longer windows, so a loaded differential leaves more stale pages.
 - **Restore mode with a differential** is inferred (task 5 verifies it).
 - **The pending set** is proportional to what open transactions touched: 12 % of E6's small database,
-  about 8 KB per page in the lake (E6§7).
+  about 8 KB per page in the lake (E6§7); in the reader it is buffer-managed and spills (D9).
 - **Undo by key** for the key shapes E6 lacked.
-- **Guards will refuse real tables** (ROW / PAGE compression is common): the order of the guard
-  extensions, against 088 and the import, is for the owner (DQ-03).
-- Open for the owner ([decisions.md](../085-backup-reader-core/decisions.md)): the order of 090 relative to 088 (R§10.4; DQ-03);
-  `recovery := true` as the default for browsing too (D3; DQ-13); an unhealed stale page as an error
-  or a report (DQ-06); a columnstore table recovery cannot cover (DQ-07); `'partial'` offered at all
-  (DQ-17); where pending images live (DQ-09).
+- **Guards will refuse real tables** (ROW / PAGE compression is common). The guard extensions come
+  ROW / PAGE first, then DDL in the tail, then ADR / RCSI, then columnstore (DQ-03, accepted).
+- Decided ([decisions.md](../085-backup-reader-core/decisions.md)): 090 before 088 (R§10.4; DQ-03);
+  `recovery := true` as the browsing default too (D3; DQ-13); an unhealed stale page is a named error
+  (DQ-06); a columnstore table recovery cannot cover refuses the file (D7; DQ-07); `'partial'` is
+  offered as a non-default option (D4; DQ-17); pending images live in the lake (DQ-09).
 
 ## References
 
@@ -345,4 +368,4 @@ reader, of which 085 carries about a week. R§8 phase 1c: 9–12 weeks. The guar
   mattered, effort), §6 (changes to the design), §7 (caveats); `experiments/E6/wal.py`, `lake6.py`,
   `gen.py`.
 - research-web.md §9 (consistency of a full backup), §11 (log format).
-- 085 (log-tail reader, page store), 087 D9 (TDE), 088 D6, 089 need 6, D3, D4, D10.
+- 085 (log-tail reader, page store; D17, resources), 087 D9 (TDE), 088 D6, 089 need 6, D3, D4, D10.

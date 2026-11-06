@@ -1,9 +1,11 @@
 # Spec 089: what an incremental importer needs from the reader
 
 Status: **draft**, 2026-11-05. Not started. Depends on spec 085; uses 086–088 where a table needs
-them. Series overview: `../README.md`. Markers and source abbreviations as in 085; owner questions as
-DQ-nn ([decisions.md](../085-backup-reader-core/decisions.md)). This spec is the authority on the names and shapes mssql-ducklake
-consumes (its README says so); 022 §D4 and 023 §D2 were reconciled with it.
+them. Series overview: `../README.md`. Markers and source abbreviations as in 085 (DuckLake as
+`DL/`, DuckDB as `DD/`); the owner's decisions as DQ-nn
+([decisions.md](../085-backup-reader-core/decisions.md)).
+This spec is the authority on the names and shapes mssql-ducklake consumes (its README says so);
+022 §D4 and 023 §D2 were reconciled with it.
 
 ## Problem
 
@@ -34,7 +36,7 @@ leaves the hooks.
 | 7 | the catalog first, from a mirror | base tables with their own locators, updated by the same delete / insert; a differential lacks every unchanged catalog page | E1 rule 6, §4.8; R§6.2 point 5 |
 | 8 | LOBs | the in-row root and a fragment map with each value; a value not wholly in the file rebuilt from its nodes in the file plus the lake's old bytes by node RID; root byte-identical = unchanged; refuse when a node is in neither | E1§5 rule 8 (R§6.2 numbers it 7), §4.5 (reuse by `_mssql_rid` failed 10 of 21 steps); E2 R6, R8 |
 | 9 | allocation-page state | the lake keeps the latest image of every allocation page; its IAM images name the AU that owned each page in the previous file (need 6) | E2 R5 |
-| 10 | deletes by value | every row carries `_mssql_page`; the importer deletes with DuckLake's own `DELETE … WHERE _mssql_page IN (<the table's delete set>)` before the file's new files are registered, and keeps no page LSN or file position anywhere; the export writes in physical order, so a page's rows sit in few files and a delete is expected to read few (§ Risks) | owner, 2026-11-05 (R§6.2 "Parquet first", "deletes by value"); research-ducklake-import §5 |
+| 10 | deletes by value | every row carries `_mssql_page`; the importer deletes with DuckLake's own `DELETE … WHERE _mssql_page IN (<the table's delete set>)` before the file's new files are registered, and keeps no page LSN or file position anywhere; the export writes in physical order, so a page's rows sit in few files, and the files' min/max on the hex `_mssql_page` prune a delete to them (§ Risks) | owner, 2026-11-05 (R§6.2 "Parquet first", "deletes by value"); research-ducklake-import §5 |
 | 11 | row identity | `_mssql_rid`, `_mssql_page` (085 D8) | R§5, E1§3 |
 | 12 | ownership after a SWITCH | after the mirror update, a lake row whose AU (columnstore: rowset) now resolves through `sysallocunits.ownerid` → `sysrowsets` to another (object, index) moves to that owner; a change of `numpart` alone means nothing. The key is the AU / rowset, not the table, and nothing is stored per row for it: a row's AU is its page's AU in the base IAM image (a SWITCH leaves IAMs unchanged; a delta-store row's too), a compressed columnstore row's rowset is in its rowgroup key (088 D3) | E7§5: with it all 15 differentials of E7 replay exactly; without it the 5 SWITCH variants leave the rows in the old table (after SWITCH + a one-row UPDATE only the 37 rows of the touched page move, 263 stay) |
 
@@ -71,9 +73,11 @@ leaves the hooks.
   bootstrap tables, `sysseobjvalues`, `sysclsobjs`) plus `sysobjvalues`, `sysidxstats`, `sysiscols`,
   the columnstore tables (088) and E7's partitioning tables (`systypedsubobjs`, `syssingleobjrefs`;
   `sysclsobjs` classes 30 / 31 and `sysobjvalues` valclass 30 are already in): the allow-list of 085,
-  listed by `mssql_backup_catalog(path)`. Which rows of `sysobjvalues` and `syssingleobjrefs` an
-  importer keeps is DQ-11. E7 read the partition model of every maintenance state from full + diff
-  overlays this way (0 mismatches over 15 states).
+  listed by `mssql_backup_catalog(path)`. Of `sysobjvalues` it serves only view definitions,
+  partition boundaries (valclass 30), and computed-column and default definitions; no module source
+  leaves, and the mirror takes `syssingleobjrefs` classes 7, 8, 30 and 31 only (DQ-11, accepted).
+  E7 read the partition model of every maintenance state from full + diff overlays this way (0
+  mismatches over 15 states).
 
 - **D6 — LOBs travel with their map.** A virtual column `_mssql_lob BLOB` (opaque, serialized by this code with a leading format
   byte — DQ-02, decided) holds, per entry: column id, root bytes, the nodes (file, page, slot, offset,
@@ -82,23 +86,28 @@ leaves the hooks.
   file is resolved in this order:
   1. its root is byte-identical to a base entry's root → the base value (E2 R8.2; this also covers a
      REBUILD, whose LOB pages are not rewritten, E2 R6; E7 s11: REBUILD PARTITION too, 24 values);
-  2. otherwise the hybrid walk (E1§4.5): a node whose page is in the file is read from it; an absent
-     node is found **by node RID** in the base maps: a leaf yields its byte range of the old value,
-     an internal node is expanded through its old children, each again from the file when present;
+  2. otherwise the hybrid walk (E1§4.5): a node whose page is in the file is read from it (a node
+     keeps its page in binary inside the BLOB, and this code compares the decoded page with the
+     file's pages); an absent node is found **by node RID** in the base maps: a leaf yields its byte
+     range of the old value, an internal node is expanded through its old children, each again from
+     the file when present;
   3. a node in neither → refused by name (table, `_mssql_rid`, column, node RID). Spec 090 instead
      keeps the old value and its map when the missing node lies on a page its loaded-differential
      recovery marks stale, and reports that page `stale` with reason `lob` (E6§6.8: dropping the map
      lost 3 values for good); there is no parameter for it.
 
-  **Where the old value's bytes come from is an open disagreement (DQ-01, blocking 022's lake format
-  and this PR).** The splice in step 2 copies byte ranges of the old **stored** form, so the old bytes
-  must be reproduced exactly. Three designs are on the table:
+  **The old value's bytes come from design C (DQ-01, accepted).** The splice in step 2 copies byte
+  ranges of the old **stored** form, so the old bytes must be reproduced exactly. The lake keeps the
+  text, plus the stored bytes (`raw`) wherever `text_exact` is false. `raw` is kept for `xml` /
+  `json` / CLR off-row values only once a fixture shows that a partial update can leave their
+  fragments out of a differential; until then a splice over one is refused by name, as in B. The
+  three designs weighed:
   - **(A) store the bytes** — E1 rule 8: "Store LOB bytes (or a lossless mapping), not decoded text:
     the splice re-encodes the old value", which is exact for cp1252 ASCII in E1 and not for code-page
     bytes a decoder cannot map. Every off-row value is kept twice in the lake (text and bytes): roughly
     double LOB storage (more for ASCII `nvarchar(max)`, whose UTF-16 bytes are twice its UTF-8 text).
     Never refuses, covers `xml`, `json` and CLR values, and needs no re-encoder.
-  - **(B) re-encode, guarded per value** — this draft: the old bytes are re-encoded from the lake's
+  - **(B) re-encode, guarded per value** — the first draft: the old bytes are re-encoded from the lake's
     typed value (UTF-16LE, the column's code page, UTF-8, or the bytes of a binary); `text_exact`
     records at decode time whether that reproduces the stored bytes. A splice over a value whose
     `text_exact` is false, or of a type whose stored form is not its DuckDB value (`xml` stored as
@@ -108,15 +117,22 @@ leaves the hooks.
     mapping or a best-fit mapping that is not one-to-one, invalid UTF-8 under a UTF-8 collation —
     block that table's incremental import at their next partial update; a re-encoder bug would be a
     silent wrong splice, which the guard reduces to the values it checked.
-  - **(C) re-encode, bytes for the exceptions** — 022 D3's `raw BLOB`: the bytes are stored only when
-    `text_exact` would be false, and always for `xml` / `json` / CLR off-row values. Never refuses;
-    storage grows with the exceptions (plus every off-row `xml` / `json` value); two code paths.
+  - **(C) re-encode, bytes for the exceptions** — 022 D3's `raw BLOB`, chosen: the bytes are stored
+    only when `text_exact` would be false, and for `xml` / `json` / CLR off-row values as above.
+    Never refuses once those fixtures exist; storage grows with the exceptions; two code paths.
 
-  `lob.parquet` (D10) carries the value in the chosen form.
+  `lob.parquet` (D10) carries the value as C keeps it: the text, plus `raw` where kept.
 
 - **D7 — the chain check is a function, not importer code.** E1 showed a forced wrong-base apply
   silently corrupts tables; the rule should exist once. `mssql_backup_chain_check` (§ Surface)
-  answers from the file's header fields alone.
+  answers from the file's header fields alone. **The fork check fails closed**, in two cases (023 C1
+  cites this rule):
+  - (a) the file's fork id cannot be read (085 task 3 not done): every apply by LSN is refused, a
+    differential or a full applied incrementally alike. The way out is a full imported as a new base
+    (rebase, DQ-14), which takes no LSN from the lake's chain: a rebase lets fulls in, but
+    differentials stay refused until 085 reads the fork id;
+  - (b) the lake has no fork recorded but the file's can be read: the apply is refused, and a rebase
+    on a full records the fork.
 
 - **D8 — the evidence of deletes is one function.** `mssql_backup_changed_pages` returns the changed
   pages, the freed runs, and the dead, gone and moved allocation units in one result, each page with
@@ -134,22 +150,30 @@ leaves the hooks.
   by the importer (§ Surface: `partition_by`, `order_by`, `target_file_size`); SQL Server partitions
   are only work units. The partition value is computed with the expression DuckLake itself uses
   (`DuckLakePartitionUtils::ApplyPartitionTransform`), bound in the importing session as for any
-  DuckLake writer: its `TimeZone` decides a `TIMESTAMPTZ` value, and DuckLake's own TIMESTAMP_NS → µs
-  rounding applies (E7§3). The export never derives a partition value of its own. Before the export exists, the v1 is still Parquet first, in plain SQL
-  (R§6.2: "v1 can be plain SQL"): `COPY (SELECT … FROM mssql_backup_scan(…)) TO '….parquet'`,
-  registered with `ducklake_add_data_files`, and DuckLake's own `DELETE … WHERE _mssql_page IN …` for
-  the deletes, as with the export (need 10). Not `INSERT` / `MERGE` into
-  the lake (owner, R§6.2; research-ducklake-import §4.3 rejects that option).
+  DuckLake writer and rendered to SQL by the importer. At the pin that expression computes an
+  `epoch_*` transform on a TIMESTAMPTZ's UTC instant and floors TIMESTAMP_NS / TIMESTAMP_TZ_NS to µs
+  (`DL/storage/ducklake_partition_data.cpp:224-255`), so no session setting changes it. The calendar
+  transforms (`year` / `month` / `day` / `hour`) are DuckDB's own functions (`:263-267`): on a
+  TIMESTAMPTZ they are ICU's and follow the session `TimeZone`, and on TIMESTAMP_NS they round to µs
+  (E7§3, measured with DuckDB's functions). The export never derives a partition value of its own.
+  Before the export exists, the v1 is still Parquet first, in plain SQL (R§6.2: "v1 can be plain
+  SQL"): `COPY (SELECT … FROM mssql_backup_scan(…)) TO '….parquet'`, registered with
+  `ducklake_add_data_files`, and DuckLake's own `DELETE … WHERE _mssql_page IN …` for the deletes, as
+  with the export (need 10). That registration gets the importer's bounded retry on a conflict at
+  commit, as its apply does (mssql-ducklake 022 D2.4, 023 D4). Not `INSERT` / `MERGE` into the lake
+  (owner, R§6.2; research-ducklake-import §4.3 rejects that option).
 
 - **D10 — side inputs are Parquet files under one `base` prefix, read on a side connection.**
-  `base := '<lake data path>/__mssql_backup/runs/<BackupSetGUID>/<run>/base/'` (022 D9's run
-  directory; any FileSystem path works) holds, by fixed names (each may be a set `name-*.parquet`):
+  `base := '<run_path>/<BackupSetGUID>/<run>/base/'` (022 D9's run directory, outside the lake's
+  `DATA_PATH` so that DuckLake's orphan cleanup never sees it: by default its parent +
+  `mssql_backup_runs/<lake id>/`, set explicitly when `DATA_PATH` is a bucket root, whose parent is
+  undefined; any FileSystem path works) holds, by fixed names (each may be a set `name-*.parquet`):
 
   | file | content | needed for |
   |---|---|---|
   | `catalog/<base_table>.parquet` | the mirror rows, as `mssql_backup_catalog` returns them, with `_mssql_page` and `_mssql_rid` | D5, gone AUs, `au_moved`, each base AU's owner (D8) |
   | `allocation.parquet` | `(file_id, page_id, page_type, page_lsn, au_id, image)`, the latest image of every allocation page; `au_id` is the AU an IAM page tracks | D4, exact freed runs, each page's base AU (D8) |
-  | `lob.parquet` | `(object_id, _mssql_rid, column_id, root, nodes, text_exact, value)` for every off-row value of every lake row the apply deletes (rows on changed, freed or dead-AU pages: R§6.2's "rows before"; this includes a REBUILD's old rows, whose pages are freed); `value` in the form DQ-01 chooses (with `raw` under design C) | D6 |
+  | `lob.parquet` | `(object_id, _mssql_rid, column_id, root, nodes, text_exact, value, raw)` for every off-row value of every lake row the apply deletes (rows on changed, freed or dead-AU pages: R§6.2's "rows before"; this includes a REBUILD's old rows, whose pages are freed); `value` the text and `raw` the stored bytes where design C keeps them (DQ-01) | D6 |
   | `pending.parquet` | spec 090: `mssql_backup_pending_pages`'s rows from the previous file | 090 |
 
   The stale page set is **not** an input: it stays lake state, and the importer checks its healing
@@ -157,7 +181,8 @@ leaves the hooks.
   instance and reads them with `read_parquet` (the worker-connection precedent:
   research-ducklake-import §8). Rejected: a SQL string run on a side connection (it reads committed
   lake state, not the caller's transaction, and ties the reader to what the string names); a session
-  object filled by an aggregate (order-dependent, no precedent). **For the owner to confirm** (DQ-12).
+  object filled by an aggregate (order-dependent, no precedent). Accepted as drafted (DQ-12); the
+  side connection is prototyped first (task 2).
 
 ## Surface
 
@@ -188,7 +213,8 @@ FROM mssql_backup_scan('s3://bak/d5.bak', 'dbo', 'orders', since_lsn := …, bas
 SELECT * FROM mssql_backup_export_plan('s3://bak/d5.bak', since_lsn := …, base := …);
 SELECT * FROM mssql_backup_export('s3://bak/d5.bak', out := 's3://lake/data/',
     units := [3, 4, 5], since_lsn := …, base := …,
-    partition_by := MAP {'dbo.orders': 'date_diff(''month'', DATE ''1970-01-01'', order_date)'},
+    partition_by := MAP {'dbo.orders':  -- epoch_month(order_date) of a TIMESTAMP, rendered (D9)
+                         'date_diff(''month'', DATE ''1970-01-01'', order_date)'},
     order_by := MAP {'dbo.orders': 'id'},
     target_file_size := '512MB', parquet_options := MAP {'compression': 'zstd'});
 ```
@@ -205,8 +231,12 @@ last_checkpoint_lsn, family_guid, recovery_fork_id)`**: the lake's base full and
 that file's CheckpointLSN, and the database. With NULL arguments it answers for a fresh import (a full
 only). Rules, in order:
 1. A data backup (full or differential) of the database whose `dbi_familyGUID` = `family_guid`
-   (R§3), on the recovery fork `recovery_fork_id` (023 C1). Until 085 locates the fork id (its task 3)
-   the fork is not checked, and the result says so in `reason`.
+   (R§3), on the lake's recovery fork: the file's `recovery_fork_id` (HEADERONLY `RecoveryForkID`,
+   085) = the argument (023 C1), else refused naming both and the way out, a rebase on a new full
+   (DQ-14). The check fails closed (D7): for every apply by LSN, a differential or a full applied
+   incrementally, a file whose fork id cannot be read, or a lake that recorded none, is refused with
+   that reason, never applied unchecked. `first_recovery_fork_id` and `fork_point_lsn` go into the
+   refusal, to name the fork.
 2. `backup_set_guid = last_backup_set_guid` → `ok`, `already_applied` (a retry after a commit that
    succeeded unseen, research-ducklake-import §9). This function sees only the last import; older
    ones are the importer's check (023 C2).
@@ -229,12 +259,13 @@ for the importer to record.
 | `freed` | runs `(file_id, first_page, page_count)`, each within one base AU: with `base`, pages live by the base images and not live now (exact); without it, pages not live by the allocation pages the file carries (a superset, harmless for deletes) | need 3 |
 | `dead_au` | AUs of type 0 or owner 0 in the file's catalog: a deferred drop, or a big `TRUNCATE`, of a table or of a partition (E7 s10). With `base`, one row per run of the AU's pages in its base IAM image (its IAM is not in the file) | need 4 |
 | `gone_au` | AUs in the base mirror and absent from the file's catalog (needs `base`): a dropped table, a merged-away or rebuilt partition, a deferred drop completed (E7 s08, s10b, s11). One row per run of the AU's pages in its base IAM image | need 4 |
-| `au_moved` | (needs `base`) an AU, or for a columnstore a rowset, whose rowset's `(idmajor, idminor)` in the file's catalog differs from the base mirror's; AU and rowset ids are unchanged by a SWITCH. Its owner in the base mirror (`from_*`) and in the file (`object_id`, `index_id`, `partition_number`); one row per run of the AU's pages in its base IAM image (the moved rows are the lake rows on them). A columnstore's columnstore rowset: one row per COMPRESSED rowgroup of the base mirror, `page` = its `0x02` rowgroup key carrying the moved rowset id (088 D3); its delta-store and delete-bitmap rowsets move as AUs, one row per run of their base IAM pages in the `0x01` form (a delta-store row's `_mssql_page`; no lake row is on a delete-bitmap page). A SWITCH of a partition with an OPEN delta store is unmeasured (088 E11). **Not reported when only `numpart` changed**: that is SPLIT / MERGE renumbering (E7 s06: 670 rows renumbered with no page change), and the partition number is never stored with a row | need 12, E7§5 |
-| `dead_rowgroup` | (needs `base`; shape fixed after 088's E11) a columnstore rowgroup of the base mirror that is TOMBSTONE (merged, rebuilt or moved by the tuple mover) or gone in the file, with its `rowset_id`: a compressed rowgroup is one row, `page` = its `0x02` rowgroup key; a TOMBSTONE's delta store that still owns pages is one row per run of the delta-store AU's pages in its base IAM image, `page` in the `0x01` form | 088 D3, D7, 023 D9 |
+| `au_moved` | (needs `base`) an AU, or for a columnstore a rowset, whose rowset's `(idmajor, idminor)` in the file's catalog differs from the base mirror's; AU and rowset ids are unchanged by a SWITCH. Its owner in the base mirror (`from_*`) and in the file (`object_id`, `index_id`, `partition_number`); one row per run of the AU's pages in its base IAM image (the moved rows are the lake rows on them). A columnstore's columnstore rowset: one row per COMPRESSED rowgroup of the base mirror, `page` = its `02` rowgroup key carrying the moved rowset id (088 D3); its delta-store and delete-bitmap rowsets move as AUs, one row per run of their base IAM pages in the `01` form (a delta-store row's `_mssql_page`; no lake row is on a delete-bitmap page). A SWITCH of a partition with an OPEN delta store is unmeasured (088 E11). **Not reported when only `numpart` changed**: that is SPLIT / MERGE renumbering (E7 s06: 670 rows renumbered with no page change), and the partition number is never stored with a row | need 12, E7§5 |
+| `dead_rowgroup` | (needs `base`; shape fixed after 088's E11) a columnstore rowgroup of the base mirror that is TOMBSTONE (merged, rebuilt or moved by the tuple mover) or gone in the file, with its `rowset_id`: a compressed rowgroup is one row, `page` = its `02` rowgroup key; a TOMBSTONE's delta store that still owns pages is one row per run of the delta-store AU's pages in its base IAM image, `page` in the `01` form | 088 D3, D7, 023 D9 |
 
-Columns: `kind`, `file_id`, `first_page`, `page_count`, `page` (`_mssql_page` form of the first
-page; a rowgroup key for a columnstore rowgroup), `au_id`, `rowset_id`, `rowgroup_id`, `object_id`,
-`index_id`, `partition_number` (the file's owner), `base_au_id` (needs `base`: the AU whose base IAM
+Columns: `kind`, `file_id`, `first_page`, `page_count`, `page` (`VARCHAR`, the `_mssql_page` hex
+form of the first page, `01…`, or a columnstore rowgroup's `02…` key, 085 D8), `au_id`,
+`rowset_id`, `rowgroup_id`, `object_id`, `index_id`, `partition_number` (the file's owner),
+`base_au_id` (needs `base`: the AU whose base IAM
 image holds the page — an extent bit, or a mixed-extent single-page slot —, i.e. its owner in the
 previous file, by rule 10: only IAM pages on the AU's chain from its first IAM in the base mirror,
 only pages live in the base GAM / PFS, and a page two chains claim is a named error; NULL when no
@@ -304,21 +335,31 @@ follow the lake's layout, D9); columnstore units are rowgroups (088); with `sinc
 of changed pages of one rowset.
 
 **`mssql_backup_export(path, out, units [, since_lsn, base, partition_by, order_by,
-target_file_size, parquet_options, naming, field_ids])`**: writes each unit's rows as Parquet through
-DuckDB's `parquet` copy function, as DuckLake writes its delete files (`ducklake_delete.cpp:54-135`),
-one writer per thread.
+target_file_size, parquet_options, naming, field_ids, max_memory, max_threads])`**: writes each unit's
+rows as Parquet through DuckDB's `parquet` copy function, as DuckLake writes its delete files
+(`ducklake_delete.cpp:54-135`), one writer per thread.
 - Columns: the table's columns plus `_mssql_rid`, `_mssql_page` and, for a table with off-row-capable
-  columns, `_mssql_lob` (all opaque BLOBs, DQ-02 decided). No page LSN is written, in the rows or
-  beside them: which pages changed is decided by the file (D3; R§6.2 point 4).
+  columns, `_mssql_lob` (opaque values, DQ-02: `_mssql_page` hex `VARCHAR`, the others `BLOB`). No
+  page LSN is written, in the rows or beside them: which pages changed is decided by the file (D3;
+  R§6.2 point 4).
 - Attribution check: the export repeats `mssql_backup_allocation`'s check on the pages it writes
   rows from (not a rowgroup key): each must lie, live, on its header AU's IAM chain and on no other,
   in the images `mssql_backup_allocation` returns for the same file and arguments, which the next
   file's `base` will hold (rule 10). Otherwise the export refuses by name (table, page, AU), and the
   import then refuses the file: the next file could not attribute that page, and a missed delete is
   never silent.
-- `partition_by`: per table (`'schema.table'`), the SQL text of the expression DuckLake builds for the
-  lake table's current spec (`ApplyPartitionTransform`, D9), bound and evaluated in the calling
-  session. One open file per (unit, partition value). Absent: the table has no spec.
+- `partition_by`: per table (`'schema.table'`), the SQL text the importer renders from the
+  expression DuckLake binds for the lake table's current spec (`ApplyPartitionTransform`, D9),
+  evaluated in the calling session (its `TimeZone` and `Calendar` matter only to a calendar
+  transform of a TIMESTAMPTZ). The value is computed for every row, whatever the transform, and a
+  file holds one value: one open file per (unit, partition value). A written file's value can be
+  checked from its min/max of the source column only where the spec is monotone in that column:
+  identity, `year`, `epoch_*`, and `month` / `day` / `hour` only beside every coarser calendar field
+  of the same column (a `day` beside only `month` wraps every year). `bucket`, and a calendar part
+  alone (`month(ts)` puts every January in one value), are checked per row: by the export's own
+  computation, and again by the importer's apply, which evaluates the bound transform over each
+  manifest file's partition column, a one-column scan that refuses any disagreeing row, so files from
+  external workers are verified too (022 D2.3). Absent: the table has no spec.
 - `order_by`: per table, the lake table's current DuckLake sort expressions. When they are the
   clustered key in key order and every key column orders in DuckDB as on disk (`OrdersLikeDuckDB`),
   the physical read order already satisfies them and nothing is sorted; otherwise each unit is sorted
@@ -326,6 +367,26 @@ one writer per thread.
   Absent: physical order.
 - `target_file_size`, `parquet_options` (compression, row group size, Parquet version): the lake's own
   settings, passed by the importer; files rotate at the size.
+- Memory (the cap is the reader's; 085 D17's split gives the writers a quarter of `max_memory`):
+  each open file buffers one row group, sized in bytes, not rows. With B = the lake's row group in
+  bytes (`parquet_options`' `row_group_size_bytes`, else its `row_group_size` rows × the table's
+  estimated row width), the export keeps at most F = max(1, ⌊`max_memory` / (4 · B)⌋) files open,
+  runs at most min(`max_threads`, F) units at once, and gives each writer a Parquet
+  `ROW_GROUP_SIZE_BYTES` ≤ `max_memory` / (4 · F), less one chunk: DuckDB's writer flushes a row
+  group at either bound, checked after each chunk it takes
+  (`DD/extension/parquet/parquet_extension.cpp:446-454`), and a chunk closes at the staging budget
+  (085 § Resources). A row wider than the estimate makes a smaller row group, never more memory; a
+  row that cannot fit even alone (a LOB value of up to 2^31 − 1 bytes) is refused by name (table,
+  `_mssql_rid`, column, length; 085 D17's rule). A writer's row group is reserved when its file
+  opens; a unit holds one open file per partition value it meets. `max_memory` and `max_threads`
+  default to DuckDB's `memory_limit` and `threads`, and a value above them is clamped to them, with a
+  WARNING. A unit that needs a file while F are open first closes its own least recently written one
+  (more, smaller files, never more memory), and one that holds none itself waits until another unit
+  closes one. The bound: the writers' buffers stay under their share, a quarter of `max_memory`,
+  whatever the partition spec and the rows' widths (acceptance 8). A sort (`order_by`) is DuckDB's:
+  buffer-managed, it spills, and it obeys `memory_limit` and the calling connection's
+  `operator_memory_limit`, which mssql-ducklake sets to `max_memory` / 2 on its side connections
+  (085 D17), not the writers' share.
 - `naming`: the file-name pattern; default `mssql-{backup_set_guid}-o{object_id}-p{partition}-u{unit}-{seq}.parquet`
   (research-ducklake-import §4.3); 022 D4 passes its own, with a run id.
 - `field_ids`: write Parquet field ids (DQ-24).
@@ -333,8 +394,8 @@ one writer per thread.
 It returns one row per written file: `path`, `object_id`, `schema_name`, `table_name`,
 `partition_number` (the unit's SQL Server partition, informational), `partition_value`, `unit`,
 `au_id`, `rowset_id`, `row_count`, `file_size`, `column_statistics` (the shape of DuckLake's
-`WRITTEN_FILE_STATISTICS`, with min/max of `_mssql_page`, which a delete is expected to prune by,
-§ Risks).
+`WRITTEN_FILE_STATISTICS`, with min/max of `_mssql_page`, at most 26 characters, which a delete
+prunes by, § Risks).
 
 Export guarantees: output in physical order emits a page's rows together, so a page is split only at
 a rotation or a partition-value change; nothing is registered anywhere; a retry with the same `units`
@@ -377,6 +438,17 @@ and arguments rewrites the same files.
     equals the AU the DMV reports from the IAMs (E2 R4: 10,473 pages, 0 mismatches), and the
     attribution check (`mssql_backup_allocation`, repeated by the export) keeps every page the lake
     gets rows of on its header AU's chain, and on no other, in the images the lake keeps.
+
+## Resources (085 D17)
+
+Beyond the scan's (085 § Resources):
+
+| component | grows with | home or bound |
+|---|---|---|
+| `mssql_backup_changed_pages`' output, the delete sets, the moved-page lists | changed pages | streamed, AU by AU in page order; the function holds no set of pages. The sets exist only as the importer's Parquet files and DuckDB tables (mssql-ducklake 023 D4, `delete_pages.parquet`) |
+| the base inputs (D10): the mirror rows, the allocation images, the LOB maps | the database's objects, its size (images: ~0.02 %, E2 R5), the LOB rows on deleted pages | read with `read_parquet` on the side connection into buffer-managed storage, the LOB maps indexed by node RID there; a large `lob.parquet` after a heavy LOB change spills (§ Risks). Rule 10's chain walk and the attribution check work over these images |
+| the export's writers | units, partition values | F open files and min(`max_threads`, F) running units, from `max_memory` / 4, each row group capped in bytes (§ Surface, `mssql_backup_export`) |
+| a sort under `order_by` | a unit's rows | DuckDB's sort, which spills; DuckDB's limits and the connection's `operator_memory_limit` (`max_memory` / 2 on the importer's side connections), not the writers' share |
 
 ## Partitioning (E7)
 
@@ -477,7 +549,20 @@ Acceptance:
    settings).
 7. With `partition_by`, every file's `partition_value` equals DuckLake's own value for each of its rows
    (computed by the same expression in the same session); E7's `datetime2(7)` edge rows (b − 100 ns,
-   b − 500 ns) land in the file DuckLake would put them in.
+   b − 500 ns) land in the file DuckLake would put them in, under an `epoch_*` spec (floored) and a
+   calendar one (rounded) alike, and a `datetimeoffset` table gets the same `epoch_*` values under
+   two session TimeZones.
+8. An export of a wide table under a spec with many values per unit, with a small `memory_limit`
+   and several `threads`: the writers' buffers stay under their share, a quarter of that limit
+   (DuckDB's memory accounting), and every row is written; only the file count grows. With a
+   `max_memory` below the limit, under a quarter of `max_memory`; a table whose LOB values are far
+   wider than its estimated row width stays under it too, in smaller row groups.
+9. The 20 GB full of 085 acceptance 13, exported and imported by the reference importer with
+   `memory_limit = '1GB'` and every thread, completes: the peak memory DuckDB accounts
+   (`duckdb_memory()`, the buffer manager's used bytes) stays under the limit, and every table equals
+   RESTORE. With `max_memory := '512MB', max_threads := 2` on the export likewise: the memory it
+   reserves (`duckdb_memory()`'s `EXTENSION` tag) stays under its half, 256 MB (085 D17), at most two
+   units at a time.
 
 ## Tasks
 
@@ -492,7 +577,8 @@ Acceptance:
 5. `mssql_backup_allocation`: lake mode, the attribution check (task 4's chain walk over the
    returned images) — 1.5 d
 6. `_mssql_rid` of base tables; `mssql_backup_catalog` with `since_lsn` — 1 d
-7. `_mssql_lob`, the hybrid walk, root identity, `text_exact`, refusals — 5 d
+7. The hybrid walk over 085's plain `_mssql_lob` (085 task 20, DQ-05), root identity, `text_exact`,
+   refusals — 4 d
 8. `mssql_backup_chain_check` — 1.5 d
 9. Reference importer, E1 / E2 chains and E7's fifteen maintenance chains in the oracle lane,
    counterfactual assertions, D4's fixture, lake-vs-lake identity — 7 d
@@ -504,52 +590,78 @@ Acceptance:
     changed sets — 3 d
 12. `mssql_backup_export`: parallel Parquet writers, rotation, naming, statistics rows, retry
     determinism; `partition_by` and `order_by` (the sort when physical order does not satisfy it),
-    `parquet_options`; the attribution check repeated on the written pages — 6 d
+    `parquet_options`; the attribution check repeated on the written pages; the memory cap on open
+    files, running units and row-group bytes from `max_memory` / `max_threads` (085 D17's split), with
+    acceptance 8's and 9's tests — 7 d
 
 **Across PRs**
 
 13. Docs (README, `DATAMODEL.md`: the incremental flow and its diagram, CLAUDE.md, CHANGELOG) — 1 d
 
-**Total ≈ 41.5 days, 8.5 weeks** (PR 1 ≈ 31.5 days; PR 2 ≈ 9 days; 37 before E7's ownership rule
-and the DuckLake layout parameters joined tasks 4, 9 and 12, 40 before the IAM chain walk and the
-attribution check joined tasks 4, 5 and 12). R§8 did not cost the reader's incremental API
-separately (phase 2's 3–4 weeks are mssql-ducklake's import).
+**Total ≈ 41.5 days, 8 weeks** (PR 1 ≈ 30.5 days; PR 2 ≈ 10 days; docs 1 day; 37 before E7's
+ownership rule and the DuckLake layout parameters joined tasks 4, 9 and 12, 40 before the IAM chain
+walk and the attribution check joined tasks 4, 5 and 12, 41.5 before the export's memory cap joined
+task 12, 42 before a day of task 7, the plain `_mssql_lob` output, moved to 085 task 20, DQ-05, 41
+before `max_memory` / `max_threads` and acceptance 9 joined task 12).
+R§8 did not cost the reader's incremental API separately (phase 2's 3–4 weeks are mssql-ducklake's
+import).
 
-## Risks and open questions
+## Risks
 
 - **D4 rests on reasoning** about allocation pages absent from a differential; the fixture is the
   check. If R1's "copied iff written since the base" fails for an allocation page, D4 still holds
   because it uses the base image only when the file has none.
-- **Where a splice's old bytes come from** (D6) is undecided between three designs; until DQ-01 is
-  answered, task 7 cannot fix `_mssql_lob`'s shape or `lob.parquet`'s `value`.
-- **Delete pruning is expected, not measured.** A `DELETE` by `_mssql_page` should read only the
-  `_mssql_page` column of the files its min/max statistics cannot exclude. `_mssql_page` is
-  `0x01 ‖ u16 file ‖ u32 page`, big-endian (file id, page id), so within that shape byte order is page
-  order; files written in physical order (the default) hold contiguous pages, so a changed page should
-  touch few files. A lake sort order (022 D5 / DuckLake `SET SORTED BY`; `order_by` not satisfied by
-  physical order) scatters a page's rows over many files and makes a delete scan more of them — a
-  cost, never a wrong row; the importer proposes no such sort (DQ-25, accepted), but a user may
-  declare one. Two checks, mssql-ducklake's (022 task 11, 023 D4 / task 6), measured after N
-  differentials and after a `merge_adjacent_files`:
-  - DuckLake keeps min/max for a BLOB column (if not, the delete scans every file of the table;
-    still correct);
-  - a `DELETE … WHERE _mssql_page IN (SELECT …)` prunes files at all (if not, the expansion runs one
-    `DELETE` per contiguous page range with constant bounds, `_mssql_page BETWEEN x AND y` plus the
-    `IN`).
+- **Old LOB bytes** follow design C (D6; DQ-01, accepted). `raw` for `xml` / `json` / CLR off-row
+  values waits for a fixture that shows a partial update leaving their fragments out of a
+  differential; until then a splice over one is refused by name.
+- **Delete pruning: one check left.** DuckLake builds no file filter for a `BLOB` column
+  (`DL/storage/ducklake_metadata_manager.cpp:1764-1765`). mssql-ducklake measured it on 5 files, each
+  holding a distinct page range: a BLOB `=` / `IN` / `IN (SELECT …)` / `BETWEEN` read 5 of 5 files,
+  the same values as BIGINT 1 of 5, as hex VARCHAR 1 of 3; HUGEINT is not pruned at all. So
+  `_mssql_page` is hex `VARCHAR` (085 D8), and its min/max per file prunes a delete. Files written in
+  physical order (the default) hold contiguous pages, so a changed page touches few files. A lake
+  sort order (022 D5 / DuckLake `SET SORTED BY`; `order_by` not satisfied by physical order) scatters
+  a page's rows over many files and makes a delete scan more of them — a cost, never a wrong row;
+  the importer proposes no such sort (DQ-25, accepted), but a user may declare one. DuckLake runs the
+  file filter as string comparisons in the metadata database
+  (`DL/storage/ducklake_metadata_manager.cpp:1693-1745`). On a SQL Server catalog mssql-ducklake
+  stores every `VARCHAR` column, the min/max statistics columns included, under
+  `Latin1_General_100_BIN2_UTF8`, which compares by code point, so fixed-width uppercase hex orders
+  as bytes; its comment says this is what makes DuckLake's pushed min/max prune correctly (its
+  `src/include/mssql_metadata_manager.hpp:165-168`, `src/mssql_metadata_manager.cpp:161`,
+  `src/mssql_catalog_shape.cpp:833-847`), and a test keeps it. To verify (mssql-ducklake's 022 task
+  11, 023 D4 / task 6), after N differentials and after a `merge_adjacent_files`: a
+  `DELETE … WHERE _mssql_page IN (SELECT …)` prunes the VARCHAR column through DuckDB's dynamic join
+  filter, as measured for BIGINT (if not, the expansion passes the delete set as constants: an `IN`
+  list cut into chunks, with `BETWEEN` bounds per contiguous range).
 
-  `skip_stats_columns` must not include `_mssql_page`.
+  `_mssql_page` keeps its statistics: never in `skip_stats_columns`, and at 26 characters at most
+  under mssql-ducklake's `stats_length` (1024 by default, its spec 018).
 - **The side connection** inside a running query is a precedent in DuckLake and duckdb-iceberg, not
   yet in this extension: prototype it first (task 2).
-- **Base files can be large** after a heavy LOB change (they carry every deleted row's LOB values).
+- **Base files can be large** after a heavy LOB change (they carry every deleted row's LOB values);
+  they are read into buffer-managed storage and spill (§ Resources).
 - **Second GAM interval** (files over 4 GB) and **SHRINKFILE … EMPTYFILE** were not exercised
   (E2§10).
 - **Columnstore** under a differential is unmeasured (088 E11); its units, the delete-bitmap
   output (newly deleted tuples by rowgroup key and `_mssql_rid`) and the SWITCH of a partition with
   an OPEN delta store wait for it.
-- **DuckLake compaction** and `CHECKPOINT` move rows between files; that changes nothing for the
-  importer, which refers to no file position, only the delete cost above when a compaction re-sorts.
-- Open for the owner ([decisions.md](../085-backup-reader-core/decisions.md)): D6's source of old LOB bytes (DQ-01) and the
-  `_mssql_lob` shape (DQ-02), D10's side-input mechanism (DQ-12), the export living in mssql (D9;
+- **DuckLake compaction** and `CHECKPOINT` move rows between files; that changes nothing the
+  importer keeps, which refers to no file position, only the delete cost above when a compaction
+  re-sorts. A compaction committed during an import that merges or rewrites a file the import
+  deletes from makes the import's commit conflict. In autocommit `ducklake_mssql_backup_commit` runs
+  validate, DDL, DELETEs, the SWITCH copy and apply in one transaction on a side connection and, on a
+  conflict, retries them on the export's files up to N times (N = the importer's
+  `import.conflict_retries`, 3 by default; N+1 attempts); inside an explicit transaction the COMMIT
+  fails and a re-run resumes from the export (022 D1, 023 D11).
+- **The export's files wait unregistered** in the lake's `DATA_PATH` until the importer's commit.
+  DuckLake's orphan cleanup, which every `CHECKPOINT` runs (`DL/storage/ducklake_checkpoint.cpp:21-24`),
+  deletes unregistered files older than `delete_older_than` (2 days by default,
+  `DL/functions/ducklake_cleanup_files.cpp:56`). The importer warns when an export may outlive it and
+  refuses to register a file its manifest names that is gone (022 D9).
+- Decided ([decisions.md](../085-backup-reader-core/decisions.md)): old LOB bytes by design C (D6;
+  DQ-01); opaque service columns, `_mssql_lob` a `BLOB` and `_mssql_page` hex `VARCHAR` (DQ-02);
+  Parquet side files under `base`, read on a side connection (D10; DQ-12); the export in mssql (D9;
   DQ-18).
 
 ## References
@@ -563,6 +675,7 @@ separately (phase 2's 3–4 weeks are mssql-ducklake's import).
 - E1 short answer, §2 (lake layout), §3, §4.2–§4.5, §4.8, §5 rules 1–11.
 - E2 §0 R1–R11, §1–§5, §9.
 - E3 §7.5. E6 §3.1, §3.4, §6.5–§6.8.
-- E7 §3 (DuckDB's transform caveats), §4 (each maintenance operation in a differential), §5 (the
-  general rule, the ownership rule, the lake replay), §7 (not covered).
-- 085 D4, D8, D9; 088 D3, D7; 090 (pending pages, stale pages, recovery in lake mode).
+- E7 §3 (DuckDB's transform caveats, measured with DuckDB's own functions; DuckLake's `epoch_*`
+  differ, D9), §4 (each maintenance operation in a differential), §5 (the general rule, the
+  ownership rule, the lake replay), §7 (not covered).
+- 085 D4, D8, D9, D17; 088 D3, D7; 090 (pending pages, stale pages, recovery in lake mode).
