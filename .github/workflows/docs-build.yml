@@ -61,6 +61,17 @@ jobs:
       - name: No absolute internal doc links
         run: python3 scripts/ci/check_docs_links.py
 
+      # What "loads from another host" means is a judgement with two expensive
+      # failure modes: a false negative breaks the CSP and the Datenschutz
+      # promise silently, a false positive blocks every docs deploy. The
+      # fixtures pin both -- an <a href> and a rel=canonical to another site
+      # must pass, a foreign entry anywhere in a srcset must not. It needs no
+      # build, so it sits here, beside the other file-only check and ahead of
+      # setup-node: a broken rule reports in a second rather than after two
+      # docusaurus builds.
+      - name: Third-party-load rule judges correctly
+        run: python3 scripts/ci/check_docs_no_third_party.py --self-test
+
       - uses: actions/setup-node@v7
         with:
           node-version: 22
