@@ -158,6 +158,7 @@ fi
 if want code_page; then
 	ensure_simdutf
 	CP_OBJS="$(compile_objs cp "${REPO}/src/codec/code_page/code_page.cpp" "${REPO}/src/codec/code_page/code_page_avx2.cpp" \
+		"${REPO}/src/codec/code_page/code_page_avx512.cpp" \
 		"${REPO}/src/codec/code_page/code_page_tables.cpp")"
 	build_harness fuzz_code_page fuzz_code_page.cc ${CP_OBJS}
 fi

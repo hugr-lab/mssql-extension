@@ -514,6 +514,23 @@ void TestEveryCollation() {
 	CHECK(by_wire == 0, by_wire << " collations' wire keys give another code page");
 }
 
+//! What the single-byte kernels take for granted (the AVX-512 one tells a byte's length
+//! from its top bit and its first UTF-8 byte alone): 0x00-0x7F read as themselves, and
+//! 0x80-0xFF as 2 bytes (lead C2-DF) or 3 (lead E0-EF).
+void TestSingleByteShape(const CodePageTable &page) {
+	int bad = 0;
+	for (unsigned b = 0; b < 0x100; b++) {
+		const uint32_t packed = page.single[b];
+		const unsigned length = packed >> 24, lead = packed & 0xFF;
+		if (b < 0x80) {
+			bad += packed != ((1u << 24) | b);
+		} else {
+			bad += !((length == 2 && lead >= 0xC2 && lead <= 0xDF) || (length == 3 && lead >= 0xE0 && lead <= 0xEF));
+		}
+	}
+	CHECK(bad == 0, "cp" << page.code_page << ": " << bad << " bytes outside the single-byte kernels' shape");
+}
+
 }  // namespace
 
 //! Every page through the kernels of one instruction set.
@@ -529,6 +546,9 @@ int RunPages(std::mt19937 &rng) {
 			return 2;
 		}
 		CHECK(IsDoubleByte(page) == ref.double_byte, "cp" << cp << " double-byte flag");
+		if (!ref.double_byte) {
+			TestSingleByteShape(page);
+		}
 		TestEveryByteAndPair(ref, page);
 		TestBlocks(ref, page);
 		if (ref.double_byte) {

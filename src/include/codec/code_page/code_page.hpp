@@ -25,11 +25,19 @@
 //     planes, packed 8 characters a store by a shuffle table (simdutf's UTF-16
 //     -> UTF-8 compaction); one holding a 3-byte character by a third plane
 //     and simdutf's 1/2/3-byte packing (Compaction3), 4 characters a store.
-//   - Everything else (a double-byte page; a single-byte page on x86-64 or
-//     with no SIMD; a value shorter than 32 bytes in DecodeValues) alternates
-//     a 16-byte ASCII step (one load, one test of the high bits, one store:
-//     SSE2 on x86-64 and NEON on arm64, both baseline, so no runtime dispatch;
-//     two 8-byte SWAR words elsewhere) with a table step for the other bytes:
+//   - A single-byte page on x86-64 takes the best kernel the CPU has, chosen
+//     once at run time (cpuid; neither is the x86-64 baseline): AVX-512 VBMI2,
+//     64 bytes a step, the UTF-8 byte planes of the page's whole high half by
+//     vpermi2b and packed by vpcompressb, the last step loaded and stored under
+//     a mask (so DecodeValues takes every value through it); else AVX2, 32
+//     bytes a step, 1252 / 1251 / 874 by the page's arithmetic and the rest by
+//     vpgatherdd from the packed table, packed by pshufb (Compaction /
+//     Compaction3). code_page_internal.hpp has the dispatch.
+//   - Everything else (a double-byte page; a single-byte page with no SIMD; a
+//     value shorter than 32 bytes in DecodeValues on arm64 or under AVX2)
+//     alternates a 16-byte ASCII step (one load, one test of the high bits,
+//     one store: SSE2 on x86-64 and NEON on arm64, both baseline; two 8-byte
+//     SWAR words elsewhere) with a table step for the other bytes:
 //     their UTF-8 from a 1 KB table (16 cache lines), written four bytes at a
 //     time and advancing by the length, with no branch on it. A double-byte
 //     page adds a 256-byte lead table and a code-point table of 64 KB or less,

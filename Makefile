@@ -862,6 +862,7 @@ bench-utf16: release
 # Both tests compile -std=c++11, the standard the extension builds at, and run in CI's
 # cpp-unit-tests job on Linux and macOS.
 CODE_PAGE_SOURCES := src/codec/code_page/code_page.cpp src/codec/code_page/code_page_avx2.cpp \
+    src/codec/code_page/code_page_avx512.cpp \
     src/codec/code_page/code_page_tables.cpp
 CODE_PAGE_TEST_FLAGS := -std=c++11 -O2 -Wall -Wextra -I src/include
 

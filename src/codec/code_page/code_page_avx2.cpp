@@ -87,8 +87,8 @@ MSSQL_AVX2 inline char *Pack3(const Compaction3 &c, __m256i first, __m256i secon
 	const __m256i code = _mm256_sub_epi8(_mm256_setzero_si256(), _mm256_add_epi8(multi, three));
 	// c0 + 4 c1 + 16 c2 + 64 c3 per 4 characters: pairs by maddubs, then pairs of pairs.
 	const __m256i pairs = _mm256_maddubs_epi16(code, _mm256_set1_epi32(0x40100401));
-	alignas(32) uint32_t index[8];
-	_mm256_store_si256(reinterpret_cast<__m256i *>(index), _mm256_madd_epi16(pairs, _mm256_set1_epi16(1)));
+	uint32_t index[8];
+	_mm256_storeu_si256(reinterpret_cast<__m256i *>(index), _mm256_madd_epi16(pairs, _mm256_set1_epi16(1)));
 	const __m256i fs_lo = _mm256_unpacklo_epi8(first, second), fs_hi = _mm256_unpackhi_epi8(first, second);
 	const __m256i zero = _mm256_setzero_si256();
 	const __m256i t_lo = _mm256_unpacklo_epi8(third, zero), t_hi = _mm256_unpackhi_epi8(third, zero);

@@ -790,8 +790,13 @@ path) is spec 091's follow-up.
   (`vqtbx4q`) lookups, packed 8 characters a store by a 256-entry shuffle
   table; one holding a 3-byte character (the euro sign, the dashes and quotes of
   0x80–0x9F, Thai) adds a third plane and simdutf's 1/2/3-byte packing,
-  `Compaction3`, 4 characters a store. Everything else — a double-byte page, x86-64
-  (SSE2) and the SWAR fallback, and a value under 32 bytes in `DecodeValues` —
+  `Compaction3`, 4 characters a store. On x86-64 the kernel is chosen once at
+  run time (cpuid): **AVX-512 VBMI2**, 64 bytes a step, the byte planes of the
+  page's whole high half by `vpermi2b` and packed by `vpcompressb`, the last step
+  under a mask; else **AVX2**, 32 bytes a step, 1252 / 1251 / 874 by the page's
+  arithmetic and any other byte by `vpgatherdd` from the packed table, packed by
+  `pshufb`. Everything else — a double-byte page, a CPU with neither (SSE2) and
+  the SWAR fallback, and a value under 32 bytes in `DecodeValues` on arm64 or AVX2 —
   steps ASCII **16 bytes** at a time and reads other bytes from the packed table,
   one 4-byte store each. `DecodeToUtf8` and `DecodeValues` do not call
   `CopyAscii` (64 bytes a step): that is a separate entry for a caller that tries

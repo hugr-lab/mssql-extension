@@ -953,7 +953,8 @@ const Compaction3 &GetCompaction3() {
 Isa DetectIsa() {
 #if defined(MSSQL_CODE_PAGE_NEON)
 	return Isa::Neon;
-#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(MSSQL_CODE_PAGE_PORTABLE)
+#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(MSSQL_CODE_PAGE_PORTABLE) && \
+	!defined(MSSQL_CODE_PAGE_NO_X86_KERNELS)
 #if defined(_MSC_VER) && !defined(__clang__)
 	int info[4];
 	__cpuid(info, 0);
@@ -965,11 +966,25 @@ Isa DetectIsa() {
 	if (!osxsave || !avx || (_xgetbv(0) & 0x6) != 0x6) {
 		return Isa::Scalar;	 // the OS does not save the YMM state
 	}
+	const bool popcnt = (info[2] & (1 << 23)) != 0;
+	const unsigned long long xcr0 = _xgetbv(0);
 	__cpuidex(info, 7, 0);
 	const bool avx2 = (info[1] & (1 << 5)) != 0, bmi2 = (info[1] & (1 << 8)) != 0;
+	const bool avx512f = (info[1] & (1 << 16)) != 0, avx512bw = (info[1] & (1 << 30)) != 0;
+	const bool vbmi = (info[2] & (1 << 1)) != 0, vbmi2 = (info[2] & (1 << 6)) != 0;
+	// The OS must save the opmask and ZMM state too (XCR0 bits 5-7). AVX2 too: ForceIsa lets
+	// the AVX2 kernels run where AVX-512 was found.
+	if (avx2 && avx512f && avx512bw && vbmi && vbmi2 && bmi2 && popcnt && (xcr0 & 0xE6) == 0xE6) {
+		return Isa::Avx512;
+	}
 	return avx2 && bmi2 ? Isa::Avx2 : Isa::Scalar;
 #else
 	__builtin_cpu_init();
+	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+		__builtin_cpu_supports("avx512vbmi") && __builtin_cpu_supports("avx512vbmi2") &&
+		__builtin_cpu_supports("bmi2") && __builtin_cpu_supports("popcnt")) {
+		return Isa::Avx512;
+	}
 	return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("bmi2") ? Isa::Avx2 : Isa::Scalar;
 #endif
 #else
@@ -1037,6 +1052,9 @@ size_t DecodeToUtf8(const CodePageTable &page, const uint8_t *src, size_t n, cha
 		return static_cast<size_t>(DecodeNeonFor(kernel, page.code_page, src, src + n, dst) - dst);
 	}
 #elif defined(__x86_64__) || defined(_M_X64)
+	if (detail::ActiveIsa() == detail::Isa::Avx512) {
+		return static_cast<size_t>(detail::DecodeSingleByteAvx512(page, src, src + n, dst) - dst);
+	}
 	if (detail::ActiveIsa() == detail::Isa::Avx2) {
 		return static_cast<size_t>(detail::DecodeSingleByteAvx2(page, src, src + n, dst) - dst);
 	}
@@ -1075,6 +1093,9 @@ size_t DecodeValues(const CodePageTable &page, const uint8_t *src, size_t src_si
 		return DecodeValuesSingleByteNeon(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
 	}
 #elif defined(__x86_64__) || defined(_M_X64)
+	if (detail::ActiveIsa() == detail::Isa::Avx512) {
+		return detail::DecodeValuesSingleByteAvx512(page, src, offsets, lengths, count, dst, out_offsets, out_lengths);
+	}
 	if (detail::ActiveIsa() == detail::Isa::Avx2) {
 		const uint8_t *readable = src + src_size;
 		char *d = dst;
