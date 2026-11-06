@@ -48,6 +48,16 @@ jobs:
       # in seconds. Docusaurus cannot catch this class itself: an absolute
       # link resolves to a page that really exists in the released version,
       # so onBrokenLinks sees nothing wrong.
+      # The rule above is mechanical but easy to get subtly wrong in the
+      # direction that blocks every docs PR: an absolute path to an ASSET, a
+      # protocol-relative URL and a bare `/` must all pass, while a link to a
+      # page that exists in this version must not. The fixtures pin both
+      # directions, and that the SUGGESTED replacement actually resolves --
+      # a wrong suggestion sends the author to a second broken link while
+      # telling them it is the fix. No docs tree needed, so it runs first.
+      - name: Absolute-link rule judges correctly
+        run: python3 scripts/ci/check_docs_links.py --self-test
+
       - name: No absolute internal doc links
         run: python3 scripts/ci/check_docs_links.py
 
