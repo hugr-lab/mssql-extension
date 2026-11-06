@@ -202,75 +202,95 @@ def esc(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def build_svg(points, total_last_week):
+class Plot:
+    """The chart's box and its two scales. Pure geometry: emits no SVG.
+
+    Shared by the element builders below so the grid, the series, the dots and
+    the labels cannot drift apart -- they all ask the same x() and y().
+    """
+
     W, H = 760, 280
     ml, mr, mt, mb = 56, 24, 44, 48
-    pw, ph = W - ml - mr, H - mt - mb
 
-    values = [v for _, v in points] or [0]
-    vmax = max(values) or 1
-    vmax_nice = nice_ceil(vmax)
-    n = len(points)
+    def __init__(self, points):
+        self.pw = self.W - self.ml - self.mr
+        self.ph = self.H - self.mt - self.mb
+        self.n = len(points)
+        self.vmax_nice = nice_ceil(max([v for _, v in points] or [0]) or 1)
 
-    def x(i):
-        if n <= 1:
-            return ml + pw / 2
-        return ml + pw * i / (n - 1)
+    def x(self, i):
+        # One point has no span to spread over, so it sits in the middle
+        # rather than at the left edge (and never divides by n - 1 = 0).
+        if self.n <= 1:
+            return self.ml + self.pw / 2
+        return self.ml + self.pw * i / (self.n - 1)
 
-    def y(v):
-        return mt + ph * (1 - v / vmax_nice)
+    def y(self, v):
+        return self.mt + self.ph * (1 - v / self.vmax_nice)
 
-    grid = []
-    labels_y = []
-    for g in range(5):
-        gv = vmax_nice * g / 4
-        gy = y(gv)
-        grid.append(
-            '<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" '
-            'stroke="#e3e8ee" stroke-width="1"/>' % (ml, gy, ml + pw, gy)
-        )
-        labels_y.append(
-            '<text x="%.1f" y="%.1f" font-size="11" fill="#8a94a6" '
+    @property
+    def baseline(self):
+        return self.mt + self.ph
+
+
+def grid_lines(plot):
+    return ['<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" '
+            'stroke="#e3e8ee" stroke-width="1"/>'
+            % (plot.ml, plot.y(plot.vmax_nice * g / 4),
+               plot.ml + plot.pw, plot.y(plot.vmax_nice * g / 4))
+            for g in range(5)]
+
+
+def y_axis_labels(plot):
+    return ['<text x="%.1f" y="%.1f" font-size="11" fill="#8a94a6" '
             'text-anchor="end" dominant-baseline="middle">%s</text>'
-            % (ml - 8, gy, fmt_short(gv))
-        )
+            % (plot.ml - 8, plot.y(plot.vmax_nice * g / 4),
+               fmt_short(plot.vmax_nice * g / 4))
+            for g in range(5)]
 
-    line_pts = " ".join("%.1f,%.1f" % (x(i), y(v)) for i, (_, v) in enumerate(points))
+
+def series_points(plot, points):
+    """(polyline points, polygon points) -- the line and the filled area."""
+    line_pts = " ".join("%.1f,%.1f" % (plot.x(i), plot.y(v))
+                        for i, (_, v) in enumerate(points))
     area_pts = (
-        "%.1f,%.1f " % (x(0), mt + ph)
+        "%.1f,%.1f " % (plot.x(0), plot.baseline)
         + line_pts
-        + " %.1f,%.1f" % (x(n - 1), mt + ph)
-    ) if n else ""
+        + " %.1f,%.1f" % (plot.x(plot.n - 1), plot.baseline)
+    ) if plot.n else ""
+    return line_pts, area_pts
 
-    dots = []
-    for i, (_, v) in enumerate(points):
-        dots.append(
-            '<circle cx="%.1f" cy="%.1f" r="2.6" fill="#fff" '
-            'stroke="#f6c344" stroke-width="2"/>' % (x(i), y(v))
-        )
 
-    # x labels: thinned to ~8 ticks
-    labels_x = []
-    step = max(1, n // 8)
-    for i, (stamp, _) in enumerate(points):
-        if i % step == 0 or i == n - 1:
-            labels_x.append(
-                '<text x="%.1f" y="%.1f" font-size="10" fill="#8a94a6" '
-                'text-anchor="middle">%s</text>'
-                % (x(i), H - mb + 18, esc(stamp[5:]))  # MM-DD
-            )
+def dot_markers(plot, points):
+    return ['<circle cx="%.1f" cy="%.1f" r="2.6" fill="#fff" '
+            'stroke="#f6c344" stroke-width="2"/>' % (plot.x(i), plot.y(v))
+            for i, (_, v) in enumerate(points)]
 
-    # last value callout
-    callout = ""
-    if n:
-        lx, lv = x(n - 1), points[-1][1]
-        ly = y(lv)
-        callout = (
-            '<circle cx="%.1f" cy="%.1f" r="4.5" fill="#f6c344"/>'
+
+def x_axis_labels(plot, points):
+    """Thinned to ~8 ticks, and the last sample always labelled."""
+    step = max(1, plot.n // 8)
+    return ['<text x="%.1f" y="%.1f" font-size="10" fill="#8a94a6" '
+            'text-anchor="middle">%s</text>'
+            % (plot.x(i), plot.H - plot.mb + 18, esc(stamp[5:]))  # MM-DD
+            for i, (stamp, _) in enumerate(points)
+            if i % step == 0 or i == plot.n - 1]
+
+
+def last_value_callout(plot, points):
+    if not plot.n:
+        return ""
+    lx, lv = plot.x(plot.n - 1), points[-1][1]
+    ly = plot.y(lv)
+    return ('<circle cx="%.1f" cy="%.1f" r="4.5" fill="#f6c344"/>'
             '<text x="%.1f" y="%.1f" font-size="13" font-weight="700" '
             'fill="#d4960b" text-anchor="end">%s</text>'
-            % (lx, ly, lx, ly - 12, fmt_full(lv))
-        )
+            % (lx, ly, lx, ly - 12, fmt_full(lv)))
+
+
+def build_svg(points, total_last_week):
+    plot = Plot(points)
+    line_pts, area_pts = series_points(plot, points)
 
     svg = """<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" aria-label="Weekly downloads of the DuckDB mssql community extension">
   <defs>
@@ -292,20 +312,20 @@ def build_svg(points, total_last_week):
   <text x="{ml}" y="{H_minus}" font-size="10" fill="#aab2c0">Source: duckdb.org/community_extensions/download_metrics &#183; downloads in the trailing 7 days, sampled weekly</text>
 </svg>
 """.format(
-        W=W,
-        H=H,
-        ml=ml,
-        rightx=W - mr,
+        W=plot.W,
+        H=plot.H,
+        ml=plot.ml,
+        rightx=plot.W - plot.mr,
         title="DuckDB mssql extension &#8212; weekly downloads",
         total=fmt_full(total_last_week),
-        grid="\n  ".join(grid),
-        labels_y="\n  ".join(labels_y),
+        grid="\n  ".join(grid_lines(plot)),
+        labels_y="\n  ".join(y_axis_labels(plot)),
         area=('<polygon points="%s" fill="url(#area)"/>' % area_pts) if area_pts else "",
         line=line_pts,
-        dots="\n  ".join(dots),
-        callout=callout,
-        labels_x="\n  ".join(labels_x),
-        H_minus=H - 10,
+        dots="\n  ".join(dot_markers(plot, points)),
+        callout=last_value_callout(plot, points),
+        labels_x="\n  ".join(x_axis_labels(plot, points)),
+        H_minus=plot.H - 10,
     ).replace("#2b3banner", "#2b3a4a")
     return svg
 
@@ -435,19 +455,195 @@ def splice_chart(text, block):
 
 
 # --------------------------------------------------------------------------- #
-def main():
-    svg_out = SVG
-    readme = True
-    args = sys.argv[1:]
+# --------------------------------------------------------------------------- #
+# self-test
+# --------------------------------------------------------------------------- #
+# The chart is generated on every Pages deploy and nothing looks at it, so a
+# renderer that emitted malformed XML or drew outside its own box would publish
+# a broken image silently. These checks need no network and no DuckDB.
+
+#: (label, point count, value for sample i)
+SERIES_CASES = [
+    ("no samples at all", 0, lambda i: 0),
+    ("a single sample", 1, lambda i: 1234),
+    ("two samples, one zero", 2, lambda i: [0, 7][i]),
+    ("every sample zero", 10, lambda i: 0),
+    ("a flat series", 8, lambda i: 500),
+    ("a year of weekly samples", 52, lambda i: i * 137),
+    ("one spike among small values", 20, lambda i: 10 ** 6 if i == 7 else 3),
+    ("values in the millions", 12, lambda i: 10 ** 7 + i),
+    ("fractional values", 6, lambda i: i * 1.5),
+]
+
+#: (input, nice_ceil's answer) -- the axis top, so a wrong one mislabels
+#: every gridline.
+# `(2.5, 2)` pins a LATENT FLAW rather than the right answer: at mult=2.5 and
+# base=1 the `int(mult * base)` truncation returns 2 for an input of 2.5, an
+# axis top BELOW the maximum value, which would put y(2.5) above the plot. It
+# is unreachable from this script's data -- download counts are integers, and
+# no integer falls in (2, 2.5] -- so it is recorded, not changed: this PR is a
+# refactor and must not alter behaviour. Worth deciding separately.
+CEIL_CASES = [(0, 1), (-5, 1), (1, 1), (2, 2), (2.5, 2), (3, 5), (5, 5),
+              (6, 10), (10, 10), (11, 20), (999, 1000), (1001, 2000),
+              (24000, 25000), (250001, 500000)]
+
+#: (input, fmt_short's answer) -- the y-axis tick text.
+SHORT_CASES = [(0, "0"), (999, "999"), (1000, "1k"), (1500, "1.5k"),
+               (10000, "10k"), (12345, "12.3k")]
+
+
+def _series(n, gen):
+    d0 = datetime.date(2026, 1, 4)
+    return [((d0 + datetime.timedelta(weeks=i)).isoformat(), gen(i)) for i in range(n)]
+
+
+def _line(ok, label, detail):
+    print("  [%s] %-50s -> %s" % ("ok" if ok else "FAIL", label, detail))
+    return 0 if ok else 1
+
+
+def _check_renders():
+    """Every series shape must produce well-formed XML inside its own box.
+
+    Parsing is the real oracle here: a chart nobody opens is exactly where a
+    stray quote or an unclosed tag survives. The bounds check catches the
+    other silent failure -- geometry that divides wrong and draws off-canvas.
+    """
+    import xml.etree.ElementTree as ET
+    print("the chart renders, for every shape of series:")
+    failures = 0
+    for label, n, gen in SERIES_CASES:
+        points = _series(n, gen)
+        svg = build_svg(points, 4321)
+        inside = False
+        try:
+            ET.fromstring(svg)
+        except ET.ParseError as exc:
+            detail = "XML ERROR: %s" % exc
+        else:
+            plot = Plot(points)
+            coords = [float(v) for v in re.findall(r'(?:cx|cy|x1|y1|x2|y2)="([-\d.]+)"', svg)]
+            inside = all(-1 <= c <= max(plot.W, plot.H) + 1 for c in coords)
+            detail = "%d bytes, %d coords%s" % (len(svg), len(coords),
+                                                "" if inside else ", OUT OF BOUNDS")
+        failures += _line(inside, label, detail)
+    return failures
+
+
+def _check_geometry():
+    print("\nthe geometry:")
+    failures = 0
+    one = Plot(_series(1, lambda i: 5))
+    failures += _line(one.x(0) == one.ml + one.pw / 2,
+                      "a single sample sits in the middle, not at the edge",
+                      "%.1f" % one.x(0))
+    many = Plot(_series(5, lambda i: 5))
+    failures += _line(many.x(0) == many.ml and abs(many.x(4) - (many.ml + many.pw)) < 1e-9,
+                      "the first and last samples sit on the plot edges",
+                      "%.1f..%.1f" % (many.x(0), many.x(4)))
+    failures += _line(many.y(0) == many.baseline and many.y(many.vmax_nice) == many.mt,
+                      "zero is the baseline and the axis top is the top",
+                      "%.1f..%.1f" % (many.y(0), many.y(many.vmax_nice)))
+    zeros = Plot(_series(4, lambda i: 0))
+    failures += _line(zeros.vmax_nice >= 1 and zeros.y(0) == zeros.baseline,
+                      "an all-zero series still has a non-zero axis",
+                      "vmax=%s" % zeros.vmax_nice)
+    return failures
+
+
+def _check_labels():
+    print("\nthe labels and the callout:")
+    failures = 0
+    points = _series(52, lambda i: i * 137)
+    plot = Plot(points)
+    labels = x_axis_labels(plot, points)
+    # step = max(1, n // 8) gives 9 evenly spaced ticks for n = 52, and the
+    # last sample is labelled whether or not it lands on one -- so 10.
+    failures += _line(len(labels) == 10, "52 samples are thinned to 10 x labels",
+                      "%d label(s)" % len(labels))
+    failures += _line(points[-1][0][5:] in labels[-1],
+                      "the last sample is always labelled", points[-1][0][5:])
+    callout = last_value_callout(plot, points)
+    failures += _line(fmt_full(points[-1][1]) in callout,
+                      "the callout names the last value", fmt_full(points[-1][1]))
+    failures += _line(last_value_callout(Plot([]), []) == "",
+                      "an empty series has no callout", "''")
+    failures += _line(len(grid_lines(plot)) == 5 and len(y_axis_labels(plot)) == 5,
+                      "five gridlines, five y labels", "5 / 5")
+    return failures
+
+
+def _check_scales():
+    print("\nnice_ceil (the axis top) and fmt_short (the tick text):")
+    failures = 0
+    for value, want in CEIL_CASES:
+        got = nice_ceil(value)
+        failures += _line(got == want, "nice_ceil(%s)" % value, "%s (want %s)" % (got, want))
+    for value, want in SHORT_CASES:
+        got = fmt_short(value)
+        failures += _line(got == want, "fmt_short(%s)" % value, "%r (want %r)" % (got, want))
+    failures += _line(fmt_full(1234567) == "1,234,567", "fmt_full groups thousands",
+                      fmt_full(1234567))
+    return failures
+
+
+def self_test():
+    failures = _check_renders()
+    failures += _check_geometry()
+    failures += _check_labels()
+    failures += _check_scales()
+    print("\n%s: self-test, %d failure(s)" % ("FAIL" if failures else "PASS", failures))
+    return failures
+
+
+USAGE = "usage: update_download_metrics.py [--svg-only PATH | --self-test]"
+
+
+def parse_args(args):
+    """-> (svg path, update the README, exit status).
+
+    The status is None when the run should proceed.
+    """
     if args and args[0] == "--svg-only":
         if len(args) != 2:
-            print("usage: update_download_metrics.py [--svg-only PATH]", file=sys.stderr)
-            return 2
-        svg_out = args[1]
-        readme = False
-    elif args:
-        print("usage: update_download_metrics.py [--svg-only PATH]", file=sys.stderr)
-        return 2
+            print(USAGE, file=sys.stderr)
+            return None, False, 2
+        return args[1], False, None
+    if args:
+        print(USAGE, file=sys.stderr)
+        return None, False, 2
+    return SVG, True, None
+
+
+def write_svg(path, points, total_last_week):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(build_svg(points, total_last_week))
+    print("wrote %s" % path)
+
+
+def update_readme(version, total_last_week):
+    with open(README, encoding="utf-8") as fh:
+        text = fh.read()
+    # chart first (lead-paragraph logic runs before badges shift the top),
+    # then badges (prepended above the H1).
+    new_text = splice_chart(text, build_chart_block(version, total_last_week))
+    new_text = splice_badges(new_text, build_badges_block())
+    if new_text == text:
+        print("README.md unchanged")
+        return
+    with open(README, "w", encoding="utf-8") as fh:
+        fh.write(new_text)
+    print("README.md updated")
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "--self-test":
+        return 1 if self_test() else 0
+    svg_out, readme, status = parse_args(args)
+    if status is not None:
+        return status
 
     try:
         total_last_week = fetch_total_last_week()
@@ -459,28 +655,9 @@ def main():
     print("version=%s total_last_week=%s weekly_points=%d"
           % (version, total_last_week, len(points)))
 
-    # SVG
-    os.makedirs(os.path.dirname(os.path.abspath(svg_out)), exist_ok=True)
-    svg = build_svg(points, total_last_week)
-    with open(svg_out, "w", encoding="utf-8") as fh:
-        fh.write(svg)
-    print("wrote %s" % svg_out)
-    if not readme:
-        return 0
-
-    # README
-    with open(README, encoding="utf-8") as fh:
-        text = fh.read()
-    # chart first (lead-paragraph logic runs before badges shift the top),
-    # then badges (prepended above the H1).
-    new_text = splice_chart(text, build_chart_block(version, total_last_week))
-    new_text = splice_badges(new_text, build_badges_block())
-    if new_text != text:
-        with open(README, "w", encoding="utf-8") as fh:
-            fh.write(new_text)
-        print("README.md updated")
-    else:
-        print("README.md unchanged")
+    write_svg(svg_out, points, total_last_week)
+    if readme:
+        update_readme(version, total_last_week)
     return 0
 
 

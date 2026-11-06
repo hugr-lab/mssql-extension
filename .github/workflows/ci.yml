@@ -139,6 +139,17 @@ jobs:
       - name: Every require-env variable is actually set
         run: scripts/ci/check_require_env.sh
 
+      # The download chart is regenerated on every Pages deploy and nobody
+      # looks at it, so a renderer that emitted malformed XML or drew outside
+      # its own box would publish a broken image silently -- and pages.yml
+      # runs on main pushes only, so a PR never exercises it. These fixtures
+      # parse the SVG for every shape of series (none, one, all zeros, a
+      # spike, a year of samples) and check the coordinates stay in the
+      # viewBox, plus the axis scale and the label formatting. No network and
+      # no DuckDB.
+      - name: Download-metrics chart renders correctly
+        run: python3 scripts/update_download_metrics.py --self-test
+
       # The issue -> regression-test index. Validates the `# issue:` /
       # `// issue:` header declarations and prints the count; the backlog of
       # files that name an issue in prose without declaring one is reported,
