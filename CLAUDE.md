@@ -83,6 +83,8 @@ make test-debug         # Tests with debug build
 make test-code-page     # Code-page kernels vs the committed server data (spec 091; no
                         # SQL Server, no DuckDB); test-code-page-portable = SWAR form
 make bench-code-page    # Code-page kernel microbenchmark (manual, not in CI)
+make bench-code-page-column  # One 2048-row column, staging to vector: DecodeColumn vs today's
+                        # NVARCHAR path (needs a release build; CELL=thai filters cells)
 
 # Docker
 make docker-up          # Start SQL Server test container

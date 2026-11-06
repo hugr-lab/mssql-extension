@@ -24,6 +24,7 @@
 //   make test-code-page-portable    the 8-byte SWAR form
 
 #include "codec/code_page/code_page.hpp"
+#include "codec/code_page/code_page_internal.hpp"
 
 #include <cctype>
 #include <cstdint>
@@ -513,11 +514,159 @@ void TestEveryCollation() {
 	CHECK(by_wire == 0, by_wire << " collations' wire keys give another code page");
 }
 
+//! The view DecodeColumn must write for `want` at output offset `at`: string_t's layout.
+bool ViewMatches(const StringView16 &view, const std::string &want, const char *dst, size_t at, size_t inline_length) {
+	if ((view.lo & 0xFFFFFFFFu) != want.size()) {
+		return false;
+	}
+	if (want.size() <= inline_length) {
+		unsigned char bytes[12] = {0};
+		memcpy(bytes, want.data(), want.size());
+		uint64_t lo_bytes = 0, hi_bytes = 0;
+		memcpy(&lo_bytes, bytes, 4);
+		memcpy(&hi_bytes, bytes + 4, 8);
+		return (view.lo >> 32) == lo_bytes && view.hi == hi_bytes;
+	}
+	uint32_t prefix = 0;
+	if (inline_length != 0) {
+		memcpy(&prefix, want.data(), 4);
+	}
+	const char *pointer = reinterpret_cast<const char *>(static_cast<uintptr_t>(view.hi));
+	return (view.lo >> 32) == prefix && pointer == dst + at && memcmp(pointer, want.data(), want.size()) == 0;
+}
+
+//! A column payload of n bytes: long ASCII runs between runs of high bytes (whole 16 KB blocks
+//! all ASCII between others, granules alternating), ASCII with 1% high bytes, all ASCII, or the
+//! page's random text.
+std::vector<uint8_t> ColumnPayload(std::mt19937 &rng, const Reference &ref, size_t n, int mode) {
+	if (mode == 3) {
+		return RandomBytes(rng, ref, n);
+	}
+	std::vector<uint8_t> s;
+	s.reserve(n);
+	while (s.size() < n) {
+		if (mode == 0) {
+			const bool ascii = rng() % 2 == 0;
+			const size_t run = ascii ? rng() % 40000 : 1 + rng() % 3000;
+			for (size_t k = 0; k < run && s.size() < n; k++) {
+				s.push_back(static_cast<uint8_t>(ascii ? 0x20 + rng() % 0x5F : 0x80 + rng() % 128));
+			}
+		} else if (mode == 1) {
+			s.push_back(static_cast<uint8_t>(rng() % 100 == 0 ? 0x80 + rng() % 128 : 'a' + rng() % 26));
+		} else {
+			s.push_back(static_cast<uint8_t>(rng() % 128));
+		}
+	}
+	return s;
+}
+
+//! One DecodeColumn call checked against the server's answers, both inline lengths DuckDB
+//! builds with; NULL rows' offsets and lengths are garbage (never read).
+int CheckColumn(const Reference &ref, const CodePageTable &page, const std::vector<uint8_t> &buf,
+				const std::vector<uint32_t> &offsets, const std::vector<uint32_t> &lengths,
+				const std::vector<uint64_t> *validity, bool *overrun) {
+	const size_t count = offsets.size();
+	const uint8_t *src = buf.empty() ? reinterpret_cast<const uint8_t *>("") : buf.data();
+	int mismatches = 0;
+	for (size_t inline_length : {size_t(12), size_t(0)}) {
+		std::vector<char> out(Utf8Bound(buf.size()) + 64, static_cast<char>(CANARY));
+		std::vector<StringView16> views(count, StringView16{0x1111, 0x2222});
+		const size_t total =
+			DecodeColumn(page, src, buf.size(), offsets.data(), lengths.data(), validity ? validity->data() : nullptr,
+						 count, out.data(), views.data(), inline_length);
+		size_t at = 0;
+		for (size_t i = 0; i < count; i++) {
+			if (validity && (((*validity)[i / 64] >> (i % 64)) & 1) == 0) {
+				mismatches += views[i].lo != 0 || views[i].hi != 0;
+				continue;
+			}
+			const std::string want = ref.Decode(buf.data() + offsets[i], lengths[i]);
+			mismatches += !ViewMatches(views[i], want, out.data(), at, inline_length);
+			at += want.size();
+		}
+		mismatches += total != at;
+		if (!CanaryIntact(out, total + STORE_SLACK)) {
+			*overrun = true;
+		}
+	}
+	return mismatches;
+}
+
+//! DecodeColumn against the server's answers: chunks of up to 2048 rows, back to back as the
+//! staging lays them out. Values: empty, around the 12-byte inline length, short, ending
+//! exactly on the next 16 KB block or 16-byte granule, long, now and then across blocks;
+//! NULL rows (and a nullptr validity); the payloads of ColumnPayload; and one value of three
+//! blocks with empty values after it, a NULL between them.
+void TestDecodeColumn(const Reference &ref, const CodePageTable &page, std::mt19937 &rng) {
+	int mismatches = 0;
+	bool overrun = false;
+	for (int iter = 0; iter < 24; iter++) {
+		const size_t count = iter == 0 ? 0 : 1 + rng() % 2048;
+		const bool all_valid = iter % 7 == 1;
+		const unsigned null_percent = all_valid ? 0 : (iter % 5 == 0 ? 100 : (iter % 3 == 0 ? 0 : rng() % 40));
+		std::vector<uint32_t> offsets(count, 0xDEADBEEF), lengths(count, 0xDEADBEEF);
+		std::vector<uint64_t> validity((count + 63) / 64 + 1, ~uint64_t(0));
+		size_t total = 0;
+		for (size_t i = 0; i < count; i++) {
+			if (rng() % 100 < null_percent) {
+				validity[i / 64] &= ~(uint64_t(1) << (i % 64));
+				continue;
+			}
+			const unsigned kind = rng() % 400;
+			size_t n;
+			if (kind < 60) {
+				n = 0;
+			} else if (kind < 160) {
+				n = 10 + rng() % 5;
+			} else if (kind < 240) {
+				n = rng() % 64;
+			} else if (kind < 300) {
+				const size_t to_block = 16384 - total % 16384, to_granule = 16 - total % 16;
+				n = to_block <= 1024 ? to_block : to_granule;  // a block boundary when one is near
+			} else if (kind < 399) {
+				n = 100 + rng() % 500;
+			} else {
+				n = 16384 + rng() % 20000;
+			}
+			offsets[i] = static_cast<uint32_t>(total);
+			lengths[i] = static_cast<uint32_t>(n);
+			total += n;
+		}
+		const std::vector<uint8_t> buf = ColumnPayload(rng, ref, total, iter % 4);
+		mismatches += CheckColumn(ref, page, buf, offsets, lengths, all_valid ? nullptr : &validity, &overrun);
+	}
+	{
+		const uint32_t n = 3 * 16384 + 7;
+		const std::vector<uint8_t> buf = ColumnPayload(rng, ref, n, 0);
+		const std::vector<uint32_t> offsets = {0, n, n, 0xDEADBEEF, n}, lengths = {n, 0, 0, 0xDEADBEEF, 0};
+		const std::vector<uint64_t> validity = {~(uint64_t(1) << 3)};
+		mismatches += CheckColumn(ref, page, buf, offsets, lengths, &validity, &overrun);
+	}
+	CHECK(mismatches == 0, "cp" << ref.code_page << ": " << mismatches << " views differ in DecodeColumn");
+	CHECK(!overrun, "cp" << ref.code_page << ": DecodeColumn wrote past its returned length + STORE_SLACK");
+}
+
+//! What the single-byte kernels take for granted (the AVX-512 one tells a byte's length
+//! from its top bit and its first UTF-8 byte alone): 0x00-0x7F read as themselves, and
+//! 0x80-0xFF as 2 bytes (lead C2-DF) or 3 (lead E0-EF).
+void TestSingleByteShape(const CodePageTable &page) {
+	int bad = 0;
+	for (unsigned b = 0; b < 0x100; b++) {
+		const uint32_t packed = page.single[b];
+		const unsigned length = packed >> 24, lead = packed & 0xFF;
+		if (b < 0x80) {
+			bad += packed != ((1u << 24) | b);
+		} else {
+			bad += !((length == 2 && lead >= 0xC2 && lead <= 0xDF) || (length == 3 && lead >= 0xE0 && lead <= 0xEF));
+		}
+	}
+	CHECK(bad == 0, "cp" << page.code_page << ": " << bad << " bytes outside the single-byte kernels' shape");
+}
+
 }  // namespace
 
-int main() {
-	std::mt19937 rng(91);
-	CHECK(tables::CODE_PAGE_COUNT == 16, "16 code pages, not " << tables::CODE_PAGE_COUNT);
+//! Every page through the kernels of one instruction set.
+int RunPages(std::mt19937 &rng) {
 	for (size_t i = 0; i < tables::CODE_PAGE_COUNT; i++) {
 		const CodePageTable &page = tables::CODE_PAGES[i];
 		const int cp = page.code_page;
@@ -529,6 +678,9 @@ int main() {
 			return 2;
 		}
 		CHECK(IsDoubleByte(page) == ref.double_byte, "cp" << cp << " double-byte flag");
+		if (!ref.double_byte) {
+			TestSingleByteShape(page);
+		}
 		TestEveryByteAndPair(ref, page);
 		TestBlocks(ref, page);
 		if (ref.double_byte) {
@@ -536,7 +688,34 @@ int main() {
 		}
 		TestRandomStrings(ref, page, rng);
 		TestRandomValues(ref, page, rng);
+		TestDecodeColumn(ref, page, rng);
 	}
+	return 0;
+}
+
+int main() {
+	namespace detail = duckdb::mssql::codec::code_page::detail;
+	std::mt19937 rng(91);
+	CHECK(tables::CODE_PAGE_COUNT == 16, "16 code pages, not " << tables::CODE_PAGE_COUNT);
+	// The kernels of every instruction set this CPU runs: the best one, and the portable
+	// scalar path, which a CPU without the SIMD one takes.
+	const detail::Isa best = detail::DetectIsa();
+	std::vector<detail::Isa> isas = {best};
+	if (best == detail::Isa::Avx512) {
+		isas.push_back(detail::Isa::Avx2);
+	}
+	if (best != detail::Isa::Scalar) {
+		isas.push_back(detail::Isa::Scalar);
+	}
+	for (detail::Isa isa : isas) {
+		CHECK(detail::ForceIsa(isa), "cannot force " << detail::IsaName(isa));
+		std::cout << "kernels: " << detail::IsaName(isa) << "\n";
+		const int rc = RunPages(rng);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+	detail::ForceIsa(best);
 	TestCopyAscii(rng);
 	TestLookups();
 	TestEveryCollation();

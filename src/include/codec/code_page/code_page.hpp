@@ -25,11 +25,21 @@
 //     planes, packed 8 characters a store by a shuffle table (simdutf's UTF-16
 //     -> UTF-8 compaction); one holding a 3-byte character by a third plane
 //     and simdutf's 1/2/3-byte packing (Compaction3), 4 characters a store.
-//   - Everything else (a double-byte page; a single-byte page on x86-64 or
-//     with no SIMD; a value shorter than 32 bytes in DecodeValues) alternates
-//     a 16-byte ASCII step (one load, one test of the high bits, one store:
-//     SSE2 on x86-64 and NEON on arm64, both baseline, so no runtime dispatch;
-//     two 8-byte SWAR words elsewhere) with a table step for the other bytes:
+//   - A single-byte page on x86-64 takes the best kernel the CPU has, chosen
+//     once at run time (cpuid; neither is the x86-64 baseline): AVX-512 VBMI2,
+//     64 bytes a step, the UTF-8 byte planes of the page's whole high half by
+//     vpermi2b and packed by vpcompressb, the last step loaded and stored under
+//     a mask (so DecodeValues takes every value through it); else AVX2, 32
+//     bytes a step, 1252 / 1251 / 874 by the page's arithmetic, the bytes
+//     outside it (1252 80-9F, 1251 80-BF) from 2 / 4 vpshufb tables of the
+//     page's byte planes, any other page's from all 8 and a blend tree, packed
+//     by pshufb (Compaction / Compaction3). code_page_internal.hpp has the
+//     dispatch.
+//   - Everything else (a double-byte page; a single-byte page with no SIMD; a
+//     value shorter than 32 bytes in DecodeValues on arm64 or under AVX2)
+//     alternates a 16-byte ASCII step (one load, one test of the high bits,
+//     one store: SSE2 on x86-64 and NEON on arm64, both baseline; two 8-byte
+//     SWAR words elsewhere) with a table step for the other bytes:
 //     their UTF-8 from a 1 KB table (16 cache lines), written four bytes at a
 //     time and advancing by the length, with no branch on it. A double-byte
 //     page adds a 256-byte lead table and a code-point table of 64 KB or less,
@@ -124,6 +134,37 @@ size_t DecodeToUtf16(const CodePageTable &page, const uint8_t *src, size_t n, ch
 //! Returns the bytes written.
 size_t DecodeValues(const CodePageTable &page, const uint8_t *src, size_t src_size, const uint32_t *offsets,
 					const uint32_t *lengths, size_t count, char *dst, uint64_t *out_offsets, uint32_t *out_lengths);
+
+//! A string view of 16 bytes in DuckDB's string_t layout (the Umbra form), which
+//! DecodeColumn writes so a chunk's vector needs no loop of its own over the
+//! values. Little-endian words:
+//!   lo: the length in its low 32 bits, then the value's first 4 bytes;
+//!   hi: for a length up to the inline length, the value's bytes 4-11; past
+//!       it, the address of the value's first byte.
+//! An inlined view is zero past the length (string_t compares the words). With
+//! an inline length of 0 (DuckDB's DUCKDB_DEBUG_NO_INLINE) lo carries no
+//! prefix. Spec 092's wrapper checks the layout against duckdb::string_t.
+struct StringView16 {
+	uint64_t lo;
+	uint64_t hi;
+};
+
+//! Decode one column of a chunk (spec 092 D12): `count` rows, row r valid when
+//! bit r of `validity` is set (DuckDB's ValidityMask words; nullptr: all valid)
+//! with its value at src[offsets[r], offsets[r] + lengths[r]). The valid rows'
+//! values lie back to back in row order and end at src_size, as the read
+//! path's binary staging lays them out; offsets / lengths hold `count` entries,
+//! a NULL row's read but unused (undefined, as the staging leaves them). A caller
+//! with no NULL in the chunk passes nullptr (it skips the bit tests). Writes their UTF-8 back to back into dst
+//! (Utf8Bound(src_size) bytes) and row r's view into views[r] -- a NULL row's is empty --, pointing into dst and inline
+//! up to `inline_length` bytes (string_t::INLINE_LENGTH: 12, or 0 under DUCKDB_DEBUG_NO_INLINE; no other value). On a
+//! single-byte page with NEON, AVX2 or AVX-512 the views come from what the kernel records as it decodes (which of each
+//! 16 input bytes read as 2 or 3 UTF-8 bytes), one pass over the bytes and none over the output; otherwise (a
+//! double-byte page, whose pair must not cross two values; an x86 with neither; the portable build) value by value.
+//! Returns the bytes written to dst.
+size_t DecodeColumn(const CodePageTable &page, const uint8_t *src, size_t src_size, const uint32_t *offsets,
+					const uint32_t *lengths, const uint64_t *validity, size_t count, char *dst, StringView16 *views,
+					size_t inline_length);
 
 //! The exact UTF-8 length of n code-page bytes, for an output too large to
 //! size at 3 bytes per input byte (a chunk past ~1.4 GB of payload). A decode

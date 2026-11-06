@@ -1,0 +1,61 @@
+### ampere: t2a-standard-2 in us-central1-a
+== machine
+Architecture:                            aarch64
+CPU(s):                                  2
+Vendor ID:                               ARM
+Model name:                              Neoverse-N1
+Thread(s) per core:                      1
+L1d cache:                               128 KiB (2 instances)
+L2 cache:                                2 MiB (2 instances)
+L3 cache:                                32 MiB (1 instance)
+compiler: g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+== unit test
+kernels: neon
+kernels: scalar
+test_code_page: all assertions passed
+== bench
+kernels: neon; payload 0 bytes past a 64-byte boundary
+ns per value, median of 9 interleaved rounds; 2048 values per chunk
+workload                     cp KB  u16 KB |    fused   column   2-pass  2-stage  ascii64     auto   direct    utf16    today
+ascii short (4-20 B)          24.2    48.4 |     4.68     4.01     0.76     5.82     0.42     0.43     0.54     1.38     7.38
+ascii long (200 B)           400.0   800.0 |    19.18    14.14     9.50   108.04     7.66     9.17     9.71    33.71    44.60
+latin 1252, ~4% accents       87.0   174.0 |    25.23    20.38    25.81    30.06    31.97    30.65    12.64    13.33    37.45
+cyrillic 1251                 86.6   173.2 |    37.11    21.95    37.81    35.60    35.76    36.58    13.71    19.74    47.01
+cyrillic 1251 + typography    87.1   174.1 |    46.37    33.80    47.07    45.17    45.07    46.09    23.65    28.98    56.69
+latin 1252 + typography       87.9   175.7 |    35.14    28.06    35.64    44.13    46.12    45.24    20.25    27.24    53.15
+thai 874                     107.9   215.8 |    47.75    45.21    48.61    66.64    66.50    67.96    36.47    46.79    91.40
+japanese 932                  66.7    70.3 |    86.19    88.79    86.97    64.74    64.73    65.44    77.42    15.04    35.23
+
+utf16 leaves out the server's CAST and the doubled wire bytes (u16 KB against cp KB), and the
+delimiter walk and string_t the read path adds to it (bench-code-page-column measures those).
+
+kernels: neon; payload 1 bytes past a 64-byte boundary
+ns per value, median of 9 interleaved rounds; 2048 values per chunk
+workload                     cp KB  u16 KB |    fused   column   2-pass  2-stage  ascii64     auto   direct    utf16    today
+ascii short (4-20 B)          24.2    48.4 |     4.73     4.11     0.93     6.35     0.52     0.56     0.55     1.37     7.18
+ascii long (200 B)           400.0   800.0 |    19.78    15.54    14.19   119.25     9.99    13.30    10.58    33.52    45.23
+latin 1252, ~4% accents       87.0   174.0 |    25.36    20.86    26.61    32.04    32.01    33.24    13.21    13.28    37.38
+cyrillic 1251                 86.6   173.2 |    37.08    22.57    38.48    37.36    37.49    39.11    14.26    19.69    46.78
+cyrillic 1251 + typography    87.1   174.1 |    46.19    34.33    47.77    46.80    46.81    48.60    24.18    28.98    56.73
+latin 1252 + typography       87.9   175.7 |    35.15    28.43    36.41    45.82    46.08    47.82    20.88    27.19    52.99
+thai 874                     107.9   215.8 |    47.73    51.31    49.56    68.94    68.91    71.40    41.96    46.86    90.91
+japanese 932                  66.7    70.3 |    86.25    88.82    87.55    64.81    64.80    66.02    77.55    15.07    35.15
+
+utf16 leaves out the server's CAST and the doubled wire bytes (u16 KB against cp KB), and the
+delimiter walk and string_t the read path adds to it (bench-code-page-column measures those).
+
+
+kernels: scalar; payload 0 bytes past a 64-byte boundary
+ns per value, median of 9 interleaved rounds; 2048 values per chunk
+workload                     cp KB  u16 KB |    fused   column   2-pass  2-stage  ascii64     auto   direct    utf16    today
+ascii short (4-20 B)          24.2    48.4 |     4.70     8.16     0.73     5.83     0.42     0.44     1.28     1.37     7.34
+ascii long (200 B)           400.0   800.0 |    19.87    22.09     9.38   103.07     7.36     8.60    21.33    31.74    38.53
+latin 1252, ~4% accents       87.0   174.0 |    26.21    30.10    27.02    30.66    32.03    30.49    22.82    13.37    37.48
+cyrillic 1251                 86.6   173.2 |   103.79   106.85   104.87    35.53    35.64    36.44   101.28    19.71    47.85
+cyrillic 1251 + typography    87.1   174.1 |   104.03   107.10   105.26    44.96    44.93    45.81   101.60    29.02    57.54
+latin 1252 + typography       87.9   175.7 |    35.87    39.58    36.67    44.03    46.22    44.99    33.72    27.59    53.15
+thai 874                     107.9   215.8 |    75.29    75.97    76.35    66.58    66.56    67.85    69.83    46.67    91.08
+japanese 932                  66.7    70.3 |    86.19    88.84    86.88    64.86    64.84    65.53    77.53    15.07    35.23
+
+utf16 leaves out the server's CAST and the doubled wire bytes (u16 KB against cp KB), and the
+delimiter walk and string_t the read path adds to it (bench-code-page-column measures those).

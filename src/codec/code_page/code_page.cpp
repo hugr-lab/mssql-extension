@@ -2,6 +2,10 @@
 // generated tables. See codec/code_page/code_page.hpp for the contract.
 
 #include "codec/code_page/code_page.hpp"
+#include "codec/code_page/code_page_internal.hpp"
+
+#include <atomic>
+#include <cassert>
 
 #include <cstring>
 #include <vector>
@@ -20,6 +24,9 @@
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
+#if defined(_M_X64)
+#include <immintrin.h>	// _xgetbv
+#endif
 #define MSSQL_CODE_PAGE_ALWAYS_INLINE __forceinline
 #else
 #define MSSQL_CODE_PAGE_ALWAYS_INLINE inline __attribute__((always_inline))
@@ -43,6 +50,22 @@ constexpr size_t BLOCK = 16;
 #if !defined(MSSQL_CODE_PAGE_SSE2) && !defined(MSSQL_CODE_PAGE_NEON)
 //! The top bit of every byte of a 64-bit word: the SWAR test for a byte >= 0x80.
 constexpr uint64_t HIGH_BITS = 0x8080808080808080ull;
+#endif
+
+#if defined(MSSQL_CODE_PAGE_NEON) || ((defined(__x86_64__) || defined(_M_X64)) && \
+									  !defined(MSSQL_CODE_PAGE_PORTABLE) && !defined(MSSQL_CODE_PAGE_NO_X86_KERNELS))
+#define MSSQL_CODE_PAGE_RECORDS 1
+//! Set bits of a 32-bit word (DecodeColumn's row offsets): CNT on aarch64; on x86-64 this file
+//! is built for the baseline, without POPCNT, so SWAR (once a row, not once a byte).
+inline unsigned PopCount(uint32_t v) {
+#if defined(MSSQL_CODE_PAGE_NEON)
+	return static_cast<unsigned>(__builtin_popcount(v));
+#else
+	v = v - ((v >> 1) & 0x55555555u);
+	v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+	return (((v + (v >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24;
+#endif
+}
 #endif
 
 inline unsigned CountTrailingZeros(uint64_t v) {
@@ -207,13 +230,20 @@ size_t DecodeValuesImpl(const CodePageTable &page, const uint8_t *src, size_t sr
 	return static_cast<size_t>(d - dst);
 }
 
+using detail::Compaction;
+using detail::Compaction3;
+using detail::GetCompaction;
+using detail::GetCompaction3;
+using detail::NoRecord;
+using detail::StepRecorder;
+
 #if defined(MSSQL_CODE_PAGE_NEON)
 //! A page prepared for the NEON kernels. Each plane holds one byte of the entries of
 //! 0x80-0xFF as two 64-entry halves, 0x80-0xBF and 0xC0-0xFF, so one vqtbx4q covers a half:
 //!   first / second / third: the UTF-8 bytes a byte reads as (DecodeToUtf8, DecodeValues);
 //!   unit_low / unit_high: the bytes of its UTF-16 code unit (DecodeToUtf16).
 //! Built once per page, on first use (PlanesFor).
-struct NeonPlanes {
+struct alignas(128) NeonPlanes {
 	uint8x16x4_t first_lo, first_hi, second_lo, second_hi, third_lo, third_hi;
 	//! The first 32 entries (bytes 80-9F) of the three planes as two-register tables:
 	//! 1252's specialised kernel looks its exceptions up with vqtbx2q.
@@ -225,63 +255,6 @@ struct NeonPlanes {
 	//! UTF-8 is arithmetic on the bytes. run_span 0 = no usable run.
 	uint8_t run_lo = 0, run_span = 0, delta_low6 = 0, delta_high = 0;
 };
-
-//! simdutf's compaction for UTF-16 -> UTF-8 applied to code pages: 8 characters interleaved
-//! as (first, second) byte pairs, and a mask of which ones have a second byte; the shuffle
-//! keeps each first byte and the second bytes the mask names. 256 x 16 bytes, built once.
-struct Compaction {
-	uint8_t shuffle[256][16];
-	uint8_t length[256];
-	Compaction() {
-		for (unsigned m = 0; m < 256; m++) {
-			unsigned k = 0;
-			for (unsigned i = 0; i < 8; i++) {
-				shuffle[m][k++] = static_cast<uint8_t>(2 * i);
-				if (m & (1u << i)) {
-					shuffle[m][k++] = static_cast<uint8_t>(2 * i + 1);
-				}
-			}
-			length[m] = static_cast<uint8_t>(k);
-			for (; k < 16; k++) {
-				shuffle[m][k] = 0xFF;
-			}
-		}
-	}
-};
-
-const Compaction &GetCompaction() {
-	static const Compaction compaction;
-	return compaction;
-}
-
-//! simdutf's 1/2/3-byte compaction: 4 characters as 32-bit lanes [b0 b1 b2 0] and a 2-bit
-//! length code per character (0, 1, 2 = 1, 2, 3 bytes); the shuffle keeps each lane's
-//! first 1-3 bytes. 256 x 16 bytes, built once.
-struct Compaction3 {
-	uint8_t shuffle[256][16];
-	uint8_t length[256];
-	Compaction3() {
-		for (unsigned m = 0; m < 256; m++) {
-			unsigned k = 0;
-			for (unsigned lane = 0; lane < 4; lane++) {
-				const unsigned code = (m >> (2 * lane)) & 3u;
-				const unsigned bytes = code == 3 ? 3 : code + 1;
-				for (unsigned b = 0; b < bytes; b++) {
-					shuffle[m][k++] = static_cast<uint8_t>(4 * lane + b);
-				}
-			}
-			length[m] = static_cast<uint8_t>(k);
-			for (; k < 16; k++) {
-				shuffle[m][k] = 0xFF;
-			}
-		}
-	}
-};
-
-const Compaction3 &GetCompaction3() {
-	static const Compaction3 compaction;
-	return compaction;
-}
 
 NeonPlanes BuildPlanes(const CodePageTable &page) {
 	uint8_t first[128], second[128], third[128], unit_low[128], unit_high[128];
@@ -343,7 +316,8 @@ std::vector<NeonPlanes> BuildAllPlanes() {
 
 //! The planes of a page, found by its position in tables::CODE_PAGES (CodePageTable::index),
 //! so the page must be one FindCodePage returned. Built for every page on the first call; a
-//! function-local static, so two threads calling first build them once.
+//! function-local static, so two threads calling first build them once. NeonPlanes is
+//! alignas(128) (Apple's cache line), which the vector honours since C++17.
 const NeonPlanes &PlanesFor(const CodePageTable &page) {
 	static const std::vector<NeonPlanes> planes = BuildAllPlanes();
 	return planes[page.index];
@@ -436,9 +410,11 @@ inline void RunPlanes(const NeonKernel &k, uint8x16_t v, uint8x16_t ascii, uint8
 //! shuffle saves.) Writes at most 12 bytes past the returned end.
 //! Pack a block of 1/2-byte characters given its two byte planes: two halves of 8, each
 //! through Compaction by the mask of its 2-byte leads.
-inline char *Pack2(const NeonKernel &k, uint8x16_t first, uint8x16_t second, char *d) {
+template <class Rec>
+inline char *Pack2(const NeonKernel &k, uint8x16_t first, uint8x16_t second, char *d, Rec rec, const uint8_t *at) {
 	const uint8x16_t multi = vcgeq_u8(first, k.kc0);
 	const unsigned lo = Mask8(k, vget_low_u8(multi)), hi = Mask8(k, vget_high_u8(multi));
+	rec.Record16(at, d, lo | (hi << 8), 0);
 	vst1q_u8(reinterpret_cast<uint8_t *>(d), vqtbl1q_u8(vzip1q_u8(first, second), vld1q_u8(k.compaction.shuffle[lo])));
 	d += k.compaction.length[lo];
 	vst1q_u8(reinterpret_cast<uint8_t *>(d), vqtbl1q_u8(vzip2q_u8(first, second), vld1q_u8(k.compaction.shuffle[hi])));
@@ -448,11 +424,18 @@ inline char *Pack2(const NeonKernel &k, uint8x16_t first, uint8x16_t second, cha
 //! Pack a block of 1/2/3-byte characters given its three byte planes: a length code per
 //! character from its first byte, four 4-character groups of 32-bit lanes [b0 b1 b2 0],
 //! each through Compaction3. Writes at most 12 bytes past the returned end.
-inline char *Pack3(const NeonKernel &k, uint8x16_t first, uint8x16_t second, uint8x16_t third, char *d) {
+template <class Rec>
+inline char *Pack3(const NeonKernel &k, uint8x16_t first, uint8x16_t second, uint8x16_t third, char *d, Rec rec,
+				   const uint8_t *at) {
 	// Length code 0 / 1 / 2 (a 2- or 3-byte lead counts once, a 3-byte one twice), lane k of
 	// a group weighted 4^k, summed pairwise: one index byte per group, out in one lane move.
 	const uint8x16_t multi = vcgeq_u8(first, k.kc0);
 	const uint8x16_t three = vcgeq_u8(first, k.ke0);
+	if (Rec::ON) {
+		// Masks4's bytes: multi's lanes 0-7 and 8-15, then three's: the record word as it is.
+		const uint32_t masks = Masks4(k, multi, three);
+		rec.Record16(at, d, masks & 0xFFFF, masks >> 16);
+	}
 	const uint8x16_t code = vsubq_u8(k.zero, vaddq_u8(multi, three));  // each 0xFF counts 1
 	const uint8x16_t weighted = vmulq_u8(code, k.weights);
 	const uint8x16_t pair = vpaddq_u8(weighted, weighted);
@@ -472,11 +455,13 @@ inline char *Pack3(const NeonKernel &k, uint8x16_t first, uint8x16_t second, uin
 	return d;
 }
 
-inline char *Block3(const NeonKernel &k, uint8x16_t i0, uint8x16_t i1, uint8x16_t first, char *d) {
+template <class Rec>
+inline char *Block3(const NeonKernel &k, uint8x16_t i0, uint8x16_t i1, uint8x16_t first, char *d, Rec rec,
+					const uint8_t *at) {
 	const NeonPlanes &planes = k.planes;
 	const uint8x16_t second = vqtbx4q_u8(vqtbx4q_u8(k.zero, planes.second_lo, i0), planes.second_hi, i1);
 	const uint8x16_t third = vqtbx4q_u8(vqtbx4q_u8(k.zero, planes.third_lo, i0), planes.third_hi, i1);
-	return Pack3(k, first, second, third, d);
+	return Pack3(k, first, second, third, d, rec, at);
 }
 
 //! The NEON kernel for a single-byte page over [p, end): 32 bytes a step (two 16-byte
@@ -493,7 +478,9 @@ inline char *Block3(const NeonKernel &k, uint8x16_t i0, uint8x16_t i1, uint8x16_
 //! so its constants stay in registers across DecodeValues' loop instead of being reloaded
 //! after every store through `d` (a char store may alias anything). Measured 3-5% on
 //! DecodeValues over 20-60 byte values.
-MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon(const NeonKernel &k, const uint8_t *p, const uint8_t *end, char *d) {
+template <class Rec>
+MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon(const NeonKernel &k, const uint8_t *p, const uint8_t *end, char *d,
+											   Rec rec) {
 	const NeonPlanes &planes = k.planes;
 	const Compaction &compaction = k.compaction;
 	while (static_cast<size_t>(end - p) >= 2 * BLOCK) {
@@ -501,6 +488,7 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon(const NeonKernel &k, const uint8_
 		if (vmaxvq_u8(vorrq_u8(v0, v1)) < 0x80) {
 			vst1q_u8(reinterpret_cast<uint8_t *>(d), v0);
 			vst1q_u8(reinterpret_cast<uint8_t *>(d + BLOCK), v1);
+			rec.Ascii32(p);
 			p += 2 * BLOCK;
 			d += 2 * BLOCK;
 			continue;
@@ -534,10 +522,10 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon(const NeonKernel &k, const uint8_
 			s1 = vqtbx4q_u8(s1, planes.second_lo, w1);
 			if (vmaxvq_u8(vmaxq_u8(f0, f1)) >= 0xE0) {
 				// Only the block that holds a 3-byte character takes the 1/2/3-byte packing.
-				d = vmaxvq_u8(f0) >= 0xE0 ? Pack3(k, f0, s0, vqtbx4q_u8(k.zero, planes.third_lo, w0), d)
-										  : Pack2(k, f0, s0, d);
-				d = vmaxvq_u8(f1) >= 0xE0 ? Pack3(k, f1, s1, vqtbx4q_u8(k.zero, planes.third_lo, w1), d)
-										  : Pack2(k, f1, s1, d);
+				d = vmaxvq_u8(f0) >= 0xE0 ? Pack3(k, f0, s0, vqtbx4q_u8(k.zero, planes.third_lo, w0), d, rec, p)
+										  : Pack2(k, f0, s0, d, rec, p);
+				d = vmaxvq_u8(f1) >= 0xE0 ? Pack3(k, f1, s1, vqtbx4q_u8(k.zero, planes.third_lo, w1), d, rec, p + BLOCK)
+										  : Pack2(k, f1, s1, d, rec, p + BLOCK);
 				p += 2 * BLOCK;
 				continue;
 			}
@@ -548,8 +536,8 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon(const NeonKernel &k, const uint8_
 			f0 = vqtbx4q_u8(vqtbx4q_u8(v0, planes.first_lo, a0), planes.first_hi, a1);
 			f1 = vqtbx4q_u8(vqtbx4q_u8(v1, planes.first_lo, b0), planes.first_hi, b1);
 			if (vmaxvq_u8(vmaxq_u8(f0, f1)) >= 0xE0) {
-				d = Block3(k, a0, a1, f0, d);
-				d = Block3(k, b0, b1, f1, d);
+				d = Block3(k, a0, a1, f0, d, rec, p);
+				d = Block3(k, b0, b1, f1, d, rec, p + BLOCK);
 				p += 2 * BLOCK;
 				continue;
 			}
@@ -566,6 +554,7 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon(const NeonKernel &k, const uint8_
 				 vqtbl1q_u8(vzip1q_u8(f1, s1), vld1q_u8(compaction.shuffle[m2])));
 		vst1q_u8(reinterpret_cast<uint8_t *>(d + l0 + l1 + l2),
 				 vqtbl1q_u8(vzip2q_u8(f1, s1), vld1q_u8(compaction.shuffle[m3])));
+		rec.Record32(p, d, masks, 0);
 		d += l0 + l1 + l2 + compaction.length[m3];
 		p += 2 * BLOCK;
 	}
@@ -579,11 +568,12 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon(const NeonKernel &k, const uint8_
 			const uint8x16_t i0 = vsubq_u8(v, k.k80), i1 = vsubq_u8(v, k.kc0);
 			const uint8x16_t first = vqtbx4q_u8(vqtbx4q_u8(v, planes.first_lo, i0), planes.first_hi, i1);
 			if (vmaxvq_u8(first) >= 0xE0) {
-				d = Block3(k, i0, i1, first, d);
+				d = Block3(k, i0, i1, first, d, rec, p - BLOCK);
 			} else {
 				const uint8x16_t second = vqtbx4q_u8(vqtbx4q_u8(k.zero, planes.second_lo, i0), planes.second_hi, i1);
 				const uint8x16_t two = vcgeq_u8(first, k.kc0);	// a 2-byte lead
 				const unsigned m_lo = Mask8(k, vget_low_u8(two)), m_hi = Mask8(k, vget_high_u8(two));
+				rec.Record16(p - BLOCK, d, m_lo | (m_hi << 8), 0);
 				vst1q_u8(reinterpret_cast<uint8_t *>(d),
 						 vqtbl1q_u8(vzip1q_u8(first, second), vld1q_u8(compaction.shuffle[m_lo])));
 				d += compaction.length[m_lo];
@@ -592,6 +582,21 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon(const NeonKernel &k, const uint8_
 				d += compaction.length[m_hi];
 			}
 		}
+	}
+	if (Rec::ON && p < end) {
+		const uint8_t *from = p;
+		const char *start = d;
+		unsigned multi = 0, three = 0;
+		for (unsigned i = 0; p < end; ++p, ++i) {
+			const uint32_t packed = k.single[*p];
+			memcpy(d, &packed, sizeof(packed));
+			const unsigned length = packed >> 24;
+			multi |= static_cast<unsigned>(length > 1) << i;
+			three |= static_cast<unsigned>(length > 2) << i;
+			d += length;
+		}
+		rec.Record16(from, start, multi, three);
+		return d;
 	}
 	for (; p < end; ++p) {
 		const uint32_t packed = k.single[*p];
@@ -610,7 +615,9 @@ constexpr size_t NEON_MIN_VALUE = 2 * BLOCK;
 //! their UTF-8 is C2 / C3 then 0x80 | (byte & 0x3F); every other byte >= 0x80 lies in
 //! 80-9F (the euro sign, the quotes, dashes and ellipsis, Œ Š Ž ...) and is looked up in
 //! a 32-entry table (vqtbx2q, two registers). The generic kernel takes the rest (< 32 bytes).
-MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon1252(const NeonKernel &k, const uint8_t *p, const uint8_t *end, char *d) {
+template <class Rec>
+MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon1252(const NeonKernel &k, const uint8_t *p, const uint8_t *end, char *d,
+												   Rec rec) {
 	const NeonPlanes &planes = k.planes;
 	const uint8x16_t k20 = vdupq_n_u8(0x20);
 	while (static_cast<size_t>(end - p) >= 2 * BLOCK) {
@@ -618,6 +625,7 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon1252(const NeonKernel &k, const ui
 		if (vmaxvq_u8(vorrq_u8(v0, v1)) < 0x80) {
 			vst1q_u8(reinterpret_cast<uint8_t *>(d), v0);
 			vst1q_u8(reinterpret_cast<uint8_t *>(d + BLOCK), v1);
+			rec.Ascii32(p);
 			p += 2 * BLOCK;
 			d += 2 * BLOCK;
 			continue;
@@ -640,6 +648,7 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon1252(const NeonKernel &k, const ui
 			vst1q_u8(reinterpret_cast<uint8_t *>(d + l0 + l1), vqtbl1q_u8(vzip1q_u8(f1, s1), vld1q_u8(c.shuffle[m2])));
 			vst1q_u8(reinterpret_cast<uint8_t *>(d + l0 + l1 + l2),
 					 vqtbl1q_u8(vzip2q_u8(f1, s1), vld1q_u8(c.shuffle[m3])));
+			rec.Record32(p, d, masks, 0);
 			d += l0 + l1 + l2 + c.length[m3];
 			p += 2 * BLOCK;
 			continue;
@@ -650,18 +659,22 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon1252(const NeonKernel &k, const ui
 		f1 = vqtbx2q_u8(f1, planes.first_w32, w1);
 		s0 = vqtbx2q_u8(s0, planes.second_w32, w0);
 		s1 = vqtbx2q_u8(s1, planes.second_w32, w1);
-		d = vmaxvq_u8(f0) >= 0xE0 ? Pack3(k, f0, s0, vqtbx2q_u8(k.zero, planes.third_w32, w0), d) : Pack2(k, f0, s0, d);
-		d = vmaxvq_u8(f1) >= 0xE0 ? Pack3(k, f1, s1, vqtbx2q_u8(k.zero, planes.third_w32, w1), d) : Pack2(k, f1, s1, d);
+		d = vmaxvq_u8(f0) >= 0xE0 ? Pack3(k, f0, s0, vqtbx2q_u8(k.zero, planes.third_w32, w0), d, rec, p)
+								  : Pack2(k, f0, s0, d, rec, p);
+		d = vmaxvq_u8(f1) >= 0xE0 ? Pack3(k, f1, s1, vqtbx2q_u8(k.zero, planes.third_w32, w1), d, rec, p + BLOCK)
+								  : Pack2(k, f1, s1, d, rec, p + BLOCK);
 		p += 2 * BLOCK;
 	}
-	return DecodeNeon(k, p, end, d);
+	return DecodeNeon(k, p, end, d, rec);
 }
 
 //! Code page 1251, specialised: bytes C0-FF read as U+0410-U+044F (А-я), so their UTF-8 is
 //! D0 / D1 (from byte >= F0) then 0x80 | ((byte + 0x10) & 0x3F); every other byte >= 0x80
 //! lies in 80-BF (Ё ё Ђ ... № and the typography) and is looked up in the 64-entry half of
 //! the planes, the arithmetic as vqtbx's default. The generic kernel takes the rest.
-MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon1251(const NeonKernel &k, const uint8_t *p, const uint8_t *end, char *d) {
+template <class Rec>
+MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon1251(const NeonKernel &k, const uint8_t *p, const uint8_t *end, char *d,
+												   Rec rec) {
 	const NeonPlanes &planes = k.planes;
 	const uint8x16_t kd0 = vdupq_n_u8(0xD0), kf0 = vdupq_n_u8(0xF0), k10 = vdupq_n_u8(0x10);
 	const uint8x16_t kbf = vdupq_n_u8(0xBF);
@@ -670,6 +683,7 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon1251(const NeonKernel &k, const ui
 		if (vmaxvq_u8(vorrq_u8(v0, v1)) < 0x80) {
 			vst1q_u8(reinterpret_cast<uint8_t *>(d), v0);
 			vst1q_u8(reinterpret_cast<uint8_t *>(d + BLOCK), v1);
+			rec.Ascii32(p);
 			p += 2 * BLOCK;
 			d += 2 * BLOCK;
 			continue;
@@ -696,6 +710,7 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon1251(const NeonKernel &k, const ui
 			vst1q_u8(reinterpret_cast<uint8_t *>(d + l0 + l1), vqtbl1q_u8(vzip1q_u8(f1, s1), vld1q_u8(c.shuffle[m2])));
 			vst1q_u8(reinterpret_cast<uint8_t *>(d + l0 + l1 + l2),
 					 vqtbl1q_u8(vzip2q_u8(f1, s1), vld1q_u8(c.shuffle[m3])));
+			rec.Record32(p, d, masks, 0);
 			d += l0 + l1 + l2 + c.length[m3];
 			p += 2 * BLOCK;
 			continue;
@@ -704,11 +719,13 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon1251(const NeonKernel &k, const ui
 		f1 = vqtbx4q_u8(f1, planes.first_lo, w1);
 		s0 = vqtbx4q_u8(s0, planes.second_lo, w0);
 		s1 = vqtbx4q_u8(s1, planes.second_lo, w1);
-		d = vmaxvq_u8(f0) >= 0xE0 ? Pack3(k, f0, s0, vqtbx4q_u8(k.zero, planes.third_lo, w0), d) : Pack2(k, f0, s0, d);
-		d = vmaxvq_u8(f1) >= 0xE0 ? Pack3(k, f1, s1, vqtbx4q_u8(k.zero, planes.third_lo, w1), d) : Pack2(k, f1, s1, d);
+		d = vmaxvq_u8(f0) >= 0xE0 ? Pack3(k, f0, s0, vqtbx4q_u8(k.zero, planes.third_lo, w0), d, rec, p)
+								  : Pack2(k, f0, s0, d, rec, p);
+		d = vmaxvq_u8(f1) >= 0xE0 ? Pack3(k, f1, s1, vqtbx4q_u8(k.zero, planes.third_lo, w1), d, rec, p + BLOCK)
+								  : Pack2(k, f1, s1, d, rec, p + BLOCK);
 		p += 2 * BLOCK;
 	}
-	return DecodeNeon(k, p, end, d);
+	return DecodeNeon(k, p, end, d, rec);
 }
 
 //! Code page 874 (Thai), specialised: bytes A1-FB except DB-DE read as U+0E01-U+0E5B, three
@@ -717,7 +734,9 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon1251(const NeonKernel &k, const ui
 //! words) is three planes interleaved by one vst3q_u8, 48 bytes; Thai mixed with ASCII is
 //! packed 1 / 3 bytes a character by Pack3; anything else (the euro sign, quotes, the holes)
 //! takes the generic kernel's step for that block.
-MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon874(const NeonKernel &k, const uint8_t *p, const uint8_t *end, char *d) {
+template <class Rec>
+MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon874(const NeonKernel &k, const uint8_t *p, const uint8_t *end, char *d,
+												  Rec rec) {
 	const uint8x16_t ka1 = vdupq_n_u8(0xA1), k5a = vdupq_n_u8(0x5A), kdb = vdupq_n_u8(0xDB);
 	const uint8x16_t k03 = vdupq_n_u8(0x03), kb8 = vdupq_n_u8(0xB8), k20 = vdupq_n_u8(0x20);
 	while (static_cast<size_t>(end - p) >= BLOCK) {
@@ -732,7 +751,7 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon874(const NeonKernel &k, const uin
 		const uint8x16_t ascii = vcltq_u8(v, k.k80);
 		if (vminvq_u8(vorrq_u8(thai, ascii)) != 0xFF) {
 			// A byte outside Thai and ASCII: the generic kernel's step for this block.
-			d = DecodeNeon(k, p, p + BLOCK, d);
+			d = DecodeNeon(k, p, p + BLOCK, d, rec);
 			p += BLOCK;
 			continue;
 		}
@@ -744,27 +763,29 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon874(const NeonKernel &k, const uin
 			planes.val[1] = second;
 			planes.val[2] = third;
 			vst3q_u8(reinterpret_cast<uint8_t *>(d), planes);
+			rec.Record16(p, d, 0xFFFF, 0xFFFF);
 			d += 3 * BLOCK;
 		} else {
-			d = Pack3(k, vbslq_u8(ascii, v, k.ke0), second, third, d);
+			d = Pack3(k, vbslq_u8(ascii, v, k.ke0), second, third, d, rec, p);
 		}
 		p += BLOCK;
 	}
-	return DecodeNeon(k, p, end, d);
+	return DecodeNeon(k, p, end, d, rec);
 }
 
 //! The specialised kernel of a page, else the generic one.
+template <class Rec>
 MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeonFor(const NeonKernel &k, uint16_t code_page, const uint8_t *p,
-												  const uint8_t *end, char *d) {
+												  const uint8_t *end, char *d, Rec rec) {
 	switch (code_page) {
 	case 1251:
-		return DecodeNeon1251(k, p, end, d);
+		return DecodeNeon1251(k, p, end, d, rec);
 	case 1252:
-		return DecodeNeon1252(k, p, end, d);
+		return DecodeNeon1252(k, p, end, d, rec);
 	case 874:
-		return DecodeNeon874(k, p, end, d);
+		return DecodeNeon874(k, p, end, d, rec);
 	default:
-		return DecodeNeon(k, p, end, d);
+		return DecodeNeon(k, p, end, d, rec);
 	}
 }
 
@@ -772,13 +793,14 @@ size_t DecodeValuesSingleByteNeon(const CodePageTable &page, const uint8_t *src,
 								  const uint32_t *offsets, const uint32_t *lengths, size_t count, char *dst,
 								  uint64_t *out_offsets, uint32_t *out_lengths) {
 	const NeonKernel kernel(page);
+	NoRecord none;
 	const uint8_t *readable = src + src_size;
 	char *d = dst;
 	for (size_t i = 0; i < count; i++) {
 		const uint8_t *p = src + offsets[i];
 		const uint8_t *end = p + lengths[i];
 		char *start = d;
-		d = lengths[i] >= NEON_MIN_VALUE ? DecodeNeonFor(kernel, page.code_page, p, end, d)
+		d = lengths[i] >= NEON_MIN_VALUE ? DecodeNeonFor(kernel, page.code_page, p, end, d, none)
 										 : DecodeRun<false>(page, p, end, readable, d);
 		out_offsets[i] = static_cast<uint64_t>(start - dst);
 		out_lengths[i] = static_cast<uint32_t>(d - start);
@@ -949,7 +971,347 @@ size_t Utf8LengthImpl(const CodePageTable &page, const uint8_t *src, size_t n) {
 	return length;
 }
 
+//! Input bytes DecodeColumn decodes before it resolves the values that start in them: their
+//! step summaries (8 bytes per 16) sit on the stack, 8 KB, in L1 while they are read back.
+constexpr size_t COLUMN_BLOCK = 16 * 1024;
+// A block's output positions fit the recorder's 16 bits.
+static_assert(COLUMN_BLOCK * MAX_UTF8_PER_BYTE < 65536, "output position in 16 bits");
+
+//! Row r's validity in DuckDB's ValidityMask words (nullptr: all valid).
+inline bool RowValid(const uint64_t *validity, size_t row) {
+	return validity == nullptr || ((validity[row >> 6] >> (row & 63)) & 1) != 0;
+}
+
+//! The view of `length` UTF-8 bytes at `data`, in string_t's layout (StringView16). Reads 12
+//! bytes at data whatever the length -- dst has STORE_SLACK past its end -- and selects the
+//! inline or the pointer form without a branch.
+inline StringView16 MakeView(const char *data, uint32_t length, size_t inline_length) {
+	uint64_t head;
+	uint32_t tail;
+	memcpy(&head, data, sizeof(head));
+	memcpy(&tail, data + 8, sizeof(tail));
+	const uint64_t head_mask = length >= 8 ? ~uint64_t(0) : ~(~uint64_t(0) << (8 * length));
+	const unsigned tail_length = length > 8 ? (length < 12 ? length - 8 : 4) : 0;
+	const uint64_t tail_mask = ~(~uint64_t(0) << (8 * tail_length));
+	const uint64_t kept = head & head_mask;
+	StringView16 inlined, pointed;
+	inlined.lo = length | (kept << 32);
+	inlined.hi = (kept >> 32) | ((uint64_t(tail) & tail_mask) << 32);
+	// DUCKDB_DEBUG_NO_INLINE (inline length 0) keeps the prefix zero.
+	pointed.lo = length | (inline_length != 0 ? (head << 32) : 0);
+	pointed.hi = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data));
+	return length <= inline_length ? inlined : pointed;
+}
+
+//! DecodeColumn value by value: a double-byte page, and a single-byte page with no SIMD
+//! kernel to record steps.
+template <bool DOUBLE_BYTE>
+size_t DecodeColumnByValue(const CodePageTable &page, const uint8_t *src, size_t src_size, const uint32_t *offsets,
+						   const uint32_t *lengths, const uint64_t *validity, size_t count, char *dst,
+						   StringView16 *views, size_t inline_length) {
+	const uint8_t *readable = src + src_size;
+	char *d = dst;
+	for (size_t row = 0; row < count; row++) {
+		if (!RowValid(validity, row)) {
+			views[row].lo = 0;
+			views[row].hi = 0;
+			continue;
+		}
+		const uint8_t *p = src + offsets[row];
+		const uint8_t *end = p + lengths[row];
+		char *start = d;
+		d = DecodeRun<DOUBLE_BYTE>(page, p, end, readable, d);
+		views[row] = MakeView(start, static_cast<uint32_t>(d - start), inline_length);
+	}
+	return static_cast<size_t>(d - dst);
+}
+
+// The kernels that record steps: NEON, and on x86-64 AVX2 / AVX-512 (chosen at run time).
+#if defined(MSSQL_CODE_PAGE_RECORDS)
+//! Each 16 input bytes' output position from the block's: 16 a granule before it and one per
+//! mask bit (a 2- or 3-byte character's second byte, a 3-byte one's third). On NEON in groups
+//! of 8, reading masks and writing starts up to 7 past `granules`; on x86 one by one, POPCNT.
+inline void StartsFromMasks(const uint32_t *masks, size_t granules, uint16_t *starts) {
+#if !defined(MSSQL_CODE_PAGE_NEON)
+	detail::StartsFromMasksX86(masks, granules, starts);
+#else
+	static const uint16_t LANE_STARTS[8] = {0, 16, 32, 48, 64, 80, 96, 112};
+	const uint16x8_t lane_starts = vld1q_u16(LANE_STARTS);
+	const uint16x8_t zero = vdupq_n_u16(0);
+	unsigned base = 0;	// the output position of granule g's first byte
+	for (size_t g = 0; g < granules; g += 8) {
+		const uint8x16_t a = vld1q_u8(reinterpret_cast<const uint8_t *>(masks + g));
+		const uint8x16_t b = vld1q_u8(reinterpret_cast<const uint8_t *>(masks + g + 4));
+		// The bits of each mask, then an inclusive scan over the 8 granules.
+		const uint16x8_t bits = vcombine_u16(vmovn_u32(vpaddlq_u16(vpaddlq_u8(vcntq_u8(a)))),
+											 vmovn_u32(vpaddlq_u16(vpaddlq_u8(vcntq_u8(b)))));
+		uint16x8_t scan = vaddq_u16(bits, vextq_u16(zero, bits, 7));
+		scan = vaddq_u16(scan, vextq_u16(zero, scan, 6));
+		scan = vaddq_u16(scan, vextq_u16(zero, scan, 4));
+		const uint16x8_t before = vsubq_u16(scan, bits);
+		vst1q_u16(starts + g, vaddq_u16(vaddq_u16(before, lane_starts), vdupq_n_u16(static_cast<uint16_t>(base))));
+		base += 8 * BLOCK + vgetq_lane_u16(scan, 7);
+	}
+#endif
+}
+
+//! A row's view into `view`, string_t's layout (StringView16), from the `length` UTF-8 bytes
+//! at `data`: no branch. A NULL row's length is 0, so its view comes out zero, as DuckDB's. Reads 16 bytes at data (dst
+//! has STORE_SLACK past its end): [length][bytes 0-11] by one byte shift, cut at the length for the inline form; its
+//! first 8 bytes and the address for the pointer form.
+inline void WriteView(StringView16 *view, const char *data, uint32_t length, size_t inline_length) {
+	static const uint8_t IOTA[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+	const unsigned kept = 4 + (length < 12 ? length : 12);	// the inline form's bytes: length + value
+	const bool inlined = length <= inline_length;
+#if defined(MSSQL_CODE_PAGE_NEON)
+	const uint8x16_t bytes = vld1q_u8(reinterpret_cast<const uint8_t *>(data));
+	const uint8x16_t shifted = vextq_u8(vreinterpretq_u8_u32(vdupq_n_u32(length)), bytes, 12);
+	const uint8x16_t inline_form = vandq_u8(shifted, vcltq_u8(vld1q_u8(IOTA), vdupq_n_u8(static_cast<uint8_t>(kept))));
+	// DUCKDB_DEBUG_NO_INLINE (inline length 0) keeps the prefix zero.
+	const uint64_t lo = inline_length != 0 ? vgetq_lane_u64(vreinterpretq_u64_u8(shifted), 0) : length;
+	const uint8x16_t pointer_form = vreinterpretq_u8_u64(
+		vcombine_u64(vcreate_u64(lo), vcreate_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data)))));
+	const uint8x16_t form = vbslq_u8(vdupq_n_u8(inlined ? 0xFF : 0), inline_form, pointer_form);
+	vst1q_u8(reinterpret_cast<uint8_t *>(view), form);
+#else
+	const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data));
+	const __m128i shifted = _mm_or_si128(_mm_slli_si128(bytes, 4), _mm_cvtsi32_si128(static_cast<int>(length)));
+	const __m128i inline_form =
+		_mm_and_si128(shifted, _mm_cmplt_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(IOTA)),
+											  _mm_set1_epi8(static_cast<char>(kept))));
+	const __m128i lo = inline_length != 0 ? shifted : _mm_cvtsi32_si128(static_cast<int>(length));
+	const __m128i pointer_form =
+		_mm_unpacklo_epi64(lo, _mm_cvtsi64_si128(static_cast<long long>(reinterpret_cast<uintptr_t>(data))));
+	const __m128i pick = _mm_set1_epi32(inlined ? -1 : 0);
+	const __m128i form = _mm_or_si128(_mm_and_si128(pick, inline_form), _mm_andnot_si128(pick, pointer_form));
+	_mm_storeu_si128(reinterpret_cast<__m128i *>(view), form);
+#endif
+}
+
+//! DecodeColumn on a single-byte page through a recording kernel, COLUMN_BLOCK input bytes
+//! at a time: the kernel decodes them and records the masks of each 16 that are not all
+//! ASCII (an ASCII step stores nothing: the masks start zeroed, and are zeroed again only
+//! after a block that was not all ASCII); each 16's output position is then 16 per granule
+//! before it plus the mask bits before it. Per block, two tight loops:
+//!   A: every row whose bytes start in the block gets its output offset, kept in its view
+//!      until B -- a NULL row the offset where the next value starts, so a row's length is
+//!      the next row's offset minus its own (offsets / lengths loaded for every row, so the
+//!      validity is a select, not a branch);
+//!   B: the views of the rows A's offsets now end, while the block's output is in cache
+//!      (WriteView; a NULL row's length is 0, so its view is zero with no look at the
+//!      validity); the last rows after the last block.
+//! Nothing reads the input again. `decode(p, end, d, recorder)` is the kernel. ALL_VALID:
+//! validity is nullptr -- a caller with no NULL in the chunk passes nullptr (no bit tests).
+template <bool ALL_VALID, class Decode>
+size_t DecodeColumnRecorded(const uint8_t *src, size_t src_size, const uint32_t *offsets, const uint32_t *lengths,
+							const uint64_t *validity, size_t count, char *dst, StringView16 *views,
+							size_t inline_length, Decode decode) {
+	// Room for StartsFromMasks' last 8 (it reads and writes whole groups of 8).
+	uint32_t masks[COLUMN_BLOCK / BLOCK + 8] = {};
+	uint16_t starts[COLUMN_BLOCK / BLOCK + 8];
+	char *d = dst;
+	size_t row = 0;
+	size_t next_in = 0;	 // where the next valid value starts: a NULL row's input offset
+	size_t done = 0;	 // rows whose views are written
+	// The validity word of the row being placed (rows enter loop A in order, a block may end
+	// inside a word: loaded at each multiple of 64, row 0 included).
+	uint64_t word = 0;
+	size_t b0 = 0;
+	for (;;) {
+		const size_t b1 = src_size - b0 > COLUMN_BLOCK ? b0 + COLUMN_BLOCK : src_size;
+		const bool last = b1 == src_size;
+		const size_t block_out = static_cast<size_t>(d - dst);
+		const size_t granules = (b1 - b0 + BLOCK - 1) / BLOCK;
+		StepRecorder recorder;
+		recorder.masks = masks;
+		recorder.in = src + b0;
+		d = decode(src + b0, src + b1, d, recorder);
+		const size_t end_out = static_cast<size_t>(d - dst);
+		// A block whose output is as long as its input was all ASCII: a value's output offset
+		// is its input offset, and no granule positions are needed.
+		const bool ascii = end_out - block_out == b1 - b0;
+		if (!ascii) {
+			StartsFromMasks(masks, granules, starts);
+		}
+		for (; row < count; row++) {
+			if (!ALL_VALID && (row & 63) == 0) {
+				word = validity[row >> 6];	// the next 64 rows' validity, held while they are placed
+			}
+			const bool valid = ALL_VALID || ((word >> (row & 63)) & 1) != 0;
+			// Loaded whatever the row (a NULL row's slots are allocated, their values unused),
+			// so the choice is a select, not a branch on the validity bit.
+			const size_t offset = offsets[row];
+			const size_t length = lengths[row];
+			const size_t x = valid ? offset : next_in;
+			if (x >= b1 && !last) {
+				break;
+			}
+			next_in = valid ? offset + length : next_in;
+			size_t out;
+			if (x == b1) {
+				out = end_out;	// a value (or NULL) where the input ends: empty
+			} else if (ascii) {
+				out = block_out + (x - b0);
+			} else {
+				const size_t k = (x - b0) / BLOCK;
+				const unsigned r = static_cast<unsigned>((x - b0) % BLOCK);
+				const uint32_t below = (1u << r) - 1;
+				// The multi-byte and the 3-byte bytes before the value's first, in one count.
+				out = block_out + starts[k] + r + PopCount(masks[k] & (below | (below << 16)));
+			}
+			views[row].lo = out;
+		}
+		// The views of the rows the next row's offset now ends, while their output is in cache.
+		for (; done + 1 < row; done++) {
+			const size_t start = views[done].lo;
+			WriteView(views + done, dst + start, static_cast<uint32_t>(views[done + 1].lo - start), inline_length);
+		}
+		if (last) {
+			break;
+		}
+		if (!ascii) {
+			memset(masks, 0, granules * sizeof(masks[0]));	// for the next block: an ASCII one writes none
+		}
+		b0 = b1;
+	}
+	const size_t total = static_cast<size_t>(d - dst);
+	for (size_t r = done; r < count; r++) {
+		const size_t start = views[r].lo;
+		const size_t next = r + 1 < count ? views[r + 1].lo : total;
+		WriteView(views + r, dst + start, static_cast<uint32_t>(next - start), inline_length);
+	}
+	return total;
+}
+
+#endif
+
 }  // namespace
+
+namespace detail {
+
+Compaction::Compaction() {
+	for (unsigned m = 0; m < 256; m++) {
+		unsigned k = 0;
+		for (unsigned i = 0; i < 8; i++) {
+			shuffle[m][k++] = static_cast<uint8_t>(2 * i);
+			if (m & (1u << i)) {
+				shuffle[m][k++] = static_cast<uint8_t>(2 * i + 1);
+			}
+		}
+		length[m] = static_cast<uint8_t>(k);
+		for (; k < 16; k++) {
+			shuffle[m][k] = 0xFF;
+		}
+	}
+}
+
+Compaction3::Compaction3() {
+	for (unsigned m = 0; m < 256; m++) {
+		unsigned k = 0;
+		for (unsigned lane = 0; lane < 4; lane++) {
+			const unsigned code = (m >> (2 * lane)) & 3u;
+			const unsigned bytes = code == 3 ? 3 : code + 1;
+			for (unsigned b = 0; b < bytes; b++) {
+				shuffle[m][k++] = static_cast<uint8_t>(4 * lane + b);
+			}
+		}
+		length[m] = static_cast<uint8_t>(k);
+		for (; k < 16; k++) {
+			shuffle[m][k] = 0xFF;
+		}
+	}
+}
+
+const Compaction &GetCompaction() {
+	static const Compaction compaction;
+	return compaction;
+}
+
+const Compaction3 &GetCompaction3() {
+	static const Compaction3 compaction;
+	return compaction;
+}
+
+Isa DetectIsa() {
+#if defined(MSSQL_CODE_PAGE_NEON)
+	return Isa::Neon;
+#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(MSSQL_CODE_PAGE_PORTABLE) && \
+	!defined(MSSQL_CODE_PAGE_NO_X86_KERNELS)
+#if defined(_MSC_VER) && !defined(__clang__)
+	int info[4];
+	__cpuid(info, 0);
+	if (info[0] < 7) {
+		return Isa::Scalar;
+	}
+	__cpuid(info, 1);
+	const bool osxsave = (info[2] & (1 << 27)) != 0, avx = (info[2] & (1 << 28)) != 0;
+	if (!osxsave || !avx || (_xgetbv(0) & 0x6) != 0x6) {
+		return Isa::Scalar;	 // the OS does not save the YMM state
+	}
+	const bool popcnt = (info[2] & (1 << 23)) != 0;
+	const unsigned long long xcr0 = _xgetbv(0);
+	__cpuidex(info, 7, 0);
+	const bool avx2 = (info[1] & (1 << 5)) != 0, bmi2 = (info[1] & (1 << 8)) != 0;
+	const bool avx512f = (info[1] & (1 << 16)) != 0, avx512bw = (info[1] & (1 << 30)) != 0;
+	const bool vbmi = (info[2] & (1 << 1)) != 0, vbmi2 = (info[2] & (1 << 6)) != 0;
+	// The OS must save the opmask and ZMM state too (XCR0 bits 5-7). AVX2 too: ForceIsa lets
+	// the AVX2 kernels run where AVX-512 was found.
+	if (avx2 && avx512f && avx512bw && vbmi && vbmi2 && bmi2 && popcnt && (xcr0 & 0xE6) == 0xE6) {
+		return Isa::Avx512;
+	}
+	return avx2 && bmi2 && popcnt ? Isa::Avx2 : Isa::Scalar;
+#else
+	__builtin_cpu_init();
+	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+		__builtin_cpu_supports("avx512vbmi") && __builtin_cpu_supports("avx512vbmi2") &&
+		__builtin_cpu_supports("bmi2") && __builtin_cpu_supports("popcnt")) {
+		return Isa::Avx512;
+	}
+	return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("bmi2") && __builtin_cpu_supports("popcnt")
+			   ? Isa::Avx2
+			   : Isa::Scalar;
+#endif
+#else
+	return Isa::Scalar;
+#endif
+}
+
+namespace {
+std::atomic<uint8_t> &IsaState() {
+	static std::atomic<uint8_t> state(static_cast<uint8_t>(DetectIsa()));
+	return state;
+}
+}  // namespace
+
+Isa ActiveIsa() {
+	return static_cast<Isa>(IsaState().load(std::memory_order_relaxed));
+}
+
+bool ForceIsa(Isa isa) {
+	const Isa best = DetectIsa();
+	// An instruction set the CPU lacks is refused; Scalar always runs.
+	const bool supported = isa == Isa::Scalar || isa == best || (best == Isa::Avx512 && isa == Isa::Avx2);
+	if (supported) {
+		IsaState().store(static_cast<uint8_t>(isa), std::memory_order_relaxed);
+	}
+	return supported;
+}
+
+const char *IsaName(Isa isa) {
+	switch (isa) {
+	case Isa::Scalar:
+		return "scalar";
+	case Isa::Neon:
+		return "neon";
+	case Isa::Avx2:
+		return "avx2";
+	case Isa::Avx512:
+		return "avx512";
+	}
+	return "?";
+}
+
+}  // namespace detail
 
 const CodePageTable *FindCodePage(int32_t code_page) {
 	for (size_t i = 0; i < tables::CODE_PAGE_COUNT; i++) {
@@ -969,11 +1331,20 @@ size_t DecodeToUtf8(const CodePageTable &page, const uint8_t *src, size_t n, cha
 		return static_cast<size_t>(DecodeRun<true>(page, src, src + n, src + n, dst) - dst);
 	}
 #if defined(MSSQL_CODE_PAGE_NEON)
-	const NeonKernel kernel(page);
-	return static_cast<size_t>(DecodeNeonFor(kernel, page.code_page, src, src + n, dst) - dst);
-#else
-	return static_cast<size_t>(DecodeRun<false>(page, src, src + n, src + n, dst) - dst);
+	if (detail::ActiveIsa() == detail::Isa::Neon) {
+		const NeonKernel kernel(page);
+		NoRecord none;
+		return static_cast<size_t>(DecodeNeonFor(kernel, page.code_page, src, src + n, dst, none) - dst);
+	}
+#elif defined(__x86_64__) || defined(_M_X64)
+	if (detail::ActiveIsa() == detail::Isa::Avx512) {
+		return static_cast<size_t>(detail::DecodeSingleByteAvx512(page, src, src + n, dst) - dst);
+	}
+	if (detail::ActiveIsa() == detail::Isa::Avx2) {
+		return static_cast<size_t>(detail::DecodeSingleByteAvx2(page, src, src + n, dst) - dst);
+	}
 #endif
+	return static_cast<size_t>(DecodeRun<false>(page, src, src + n, src + n, dst) - dst);
 }
 
 size_t CopyAscii(const uint8_t *src, size_t n, char *dst) {
@@ -1003,10 +1374,91 @@ size_t DecodeValues(const CodePageTable &page, const uint8_t *src, size_t src_si
 		return DecodeValuesImpl<true>(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
 	}
 #if defined(MSSQL_CODE_PAGE_NEON)
-	return DecodeValuesSingleByteNeon(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
-#else
-	return DecodeValuesImpl<false>(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
+	if (detail::ActiveIsa() == detail::Isa::Neon) {
+		return DecodeValuesSingleByteNeon(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
+	}
+#elif defined(__x86_64__) || defined(_M_X64)
+	if (detail::ActiveIsa() == detail::Isa::Avx512) {
+		return detail::DecodeValuesSingleByteAvx512(page, src, offsets, lengths, count, dst, out_offsets, out_lengths);
+	}
+	if (detail::ActiveIsa() == detail::Isa::Avx2) {
+		const uint8_t *readable = src + src_size;
+		char *d = dst;
+		for (size_t i = 0; i < count; i++) {
+			const uint8_t *p = src + offsets[i];
+			const uint8_t *end = p + lengths[i];
+			char *start = d;
+			d = lengths[i] >= 32 ? detail::DecodeSingleByteAvx2(page, p, end, d)
+								 : DecodeRun<false>(page, p, end, readable, d);
+			out_offsets[i] = static_cast<uint64_t>(start - dst);
+			out_lengths[i] = static_cast<uint32_t>(d - start);
+		}
+		return static_cast<size_t>(d - dst);
+	}
 #endif
+	return DecodeValuesImpl<false>(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
+}
+
+size_t DecodeColumn(const CodePageTable &page, const uint8_t *src, size_t src_size, const uint32_t *offsets,
+					const uint32_t *lengths, const uint64_t *validity, size_t count, char *dst, StringView16 *views,
+					size_t inline_length) {
+	assert(inline_length == 0 || inline_length == 12);
+#ifndef NDEBUG
+	// The recorded path ends a value where the next valid one starts (it reads lengths only to
+	// place the NULL rows): the values must lie back to back, ending at src_size, or it and the
+	// by-value path differ.
+	{
+		size_t next = 0;
+		for (size_t row = 0; row < count; row++) {
+			if (RowValid(validity, row)) {
+				assert(offsets[row] == next);
+				next += lengths[row];
+			}
+		}
+		assert(next == src_size);
+	}
+#endif
+	if (IsDoubleByte(page)) {
+		return DecodeColumnByValue<true>(page, src, src_size, offsets, lengths, validity, count, dst, views,
+										 inline_length);
+	}
+#if defined(MSSQL_CODE_PAGE_NEON)
+	if (detail::ActiveIsa() == detail::Isa::Neon) {
+		// The kernel is built inside the call, once a block: a local whose address does not
+		// escape keeps its constants in registers (a captured one is reloaded after every
+		// store through the output, which a char store may alias).
+		const auto decode = [&page](const uint8_t *p, const uint8_t *end, char *d, StepRecorder recorder) {
+			const NeonKernel kernel(page);
+			return DecodeNeonFor(kernel, page.code_page, p, end, d, recorder);
+		};
+		return validity == nullptr ? DecodeColumnRecorded<true>(src, src_size, offsets, lengths, validity, count, dst,
+																views, inline_length, decode)
+								   : DecodeColumnRecorded<false>(src, src_size, offsets, lengths, validity, count, dst,
+																 views, inline_length, decode);
+	}
+#elif defined(MSSQL_CODE_PAGE_RECORDS)
+	const detail::Isa isa = detail::ActiveIsa();
+	if (isa == detail::Isa::Avx512) {
+		const auto decode = [&page](const uint8_t *p, const uint8_t *end, char *d, StepRecorder recorder) {
+			return detail::DecodeSingleByteAvx512(page, p, end, d, recorder);
+		};
+		return validity == nullptr ? DecodeColumnRecorded<true>(src, src_size, offsets, lengths, validity, count, dst,
+																views, inline_length, decode)
+								   : DecodeColumnRecorded<false>(src, src_size, offsets, lengths, validity, count, dst,
+																 views, inline_length, decode);
+	}
+	if (isa == detail::Isa::Avx2) {
+		const auto decode = [&page](const uint8_t *p, const uint8_t *end, char *d, StepRecorder recorder) {
+			return detail::DecodeSingleByteAvx2(page, p, end, d, recorder);
+		};
+		return validity == nullptr ? DecodeColumnRecorded<true>(src, src_size, offsets, lengths, validity, count, dst,
+																views, inline_length, decode)
+								   : DecodeColumnRecorded<false>(src, src_size, offsets, lengths, validity, count, dst,
+																 views, inline_length, decode);
+	}
+#endif
+	return DecodeColumnByValue<false>(page, src, src_size, offsets, lengths, validity, count, dst, views,
+									  inline_length);
 }
 
 size_t ExactUtf8Length(const CodePageTable &page, const uint8_t *src, size_t n) {

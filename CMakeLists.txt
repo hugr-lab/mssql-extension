@@ -142,6 +142,8 @@ set(EXTENSION_SOURCES
     src/codec/uuid_codec.cpp
     # SQL Server code pages (spec 091): the server-generated tables and the decode kernels.
     src/codec/code_page/code_page.cpp
+    src/codec/code_page/code_page_avx2.cpp
+    src/codec/code_page/code_page_avx512.cpp
     src/codec/code_page/code_page_tables.cpp
     # TDS protocol layer (pure C++, no DuckDB dependencies)
     src/tds/tds_types.cpp
@@ -286,6 +288,22 @@ if(MSSQL_SSPI_AVAILABLE)
 endif()
 
 # Build static extension (linked into DuckDB)
+# Spec 091: GCC for Win64 (MinGW) does not realign the stack past 16 bytes (GCC bug 54412),
+# so an aligned spill of a 32- or 64-byte vector in the x86 code-page kernels could fault.
+# They are assembled with every aligned vector move made unaligned; an assembler without
+# that option (binutils < 2.38) builds the kernels out, and x86 takes the scalar path.
+if(MINGW AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-Wa,-muse-unaligned-vector-move" MSSQL_HAS_UNALIGNED_VECTOR_MOVE)
+    if(MSSQL_HAS_UNALIGNED_VECTOR_MOVE)
+        set_source_files_properties(src/codec/code_page/code_page_avx2.cpp src/codec/code_page/code_page_avx512.cpp
+            PROPERTIES COMPILE_OPTIONS "-Wa,-muse-unaligned-vector-move")
+    else()
+        set_source_files_properties(src/codec/code_page/code_page.cpp
+            PROPERTIES COMPILE_DEFINITIONS MSSQL_CODE_PAGE_NO_X86_KERNELS)
+    endif()
+endif()
+
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 
 # Build loadable extension (.duckdb_extension file)

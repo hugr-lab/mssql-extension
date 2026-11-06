@@ -790,15 +790,26 @@ path) is spec 091's follow-up.
   (`vqtbx4q`) lookups, packed 8 characters a store by a 256-entry shuffle
   table; one holding a 3-byte character (the euro sign, the dashes and quotes of
   0x80–0x9F, Thai) adds a third plane and simdutf's 1/2/3-byte packing,
-  `Compaction3`, 4 characters a store. Everything else — a double-byte page, x86-64
-  (SSE2) and the SWAR fallback, and a value under 32 bytes in `DecodeValues` —
+  `Compaction3`, 4 characters a store. On x86-64 the kernel is chosen once at
+  run time (cpuid): **AVX-512 VBMI2**, 64 bytes a step, the byte planes of the
+  page's whole high half by `vpermi2b` and packed by `vpcompressb`, the last step
+  under a mask; else **AVX2**, 32 bytes a step, 1252 / 1251 / 874 by the page's
+  arithmetic, the other bytes from the page's byte planes as `vpshufb` tables (a
+  2- / 4-table window for 1252 / 1251, all 8 and a blend tree for any other page;
+  no `vpgatherdd`, 3x slower on AMD Zen 2/3), packed by `pshufb`. Everything else — a double-byte page, a CPU with neither (SSE2) and
+  the SWAR fallback, and a value under 32 bytes in `DecodeValues` on arm64 or AVX2 —
   steps ASCII **16 bytes** at a time and reads other bytes from the packed table,
   one 4-byte store each. `DecodeToUtf8` and `DecodeValues` do not call
   `CopyAscii` (64 bytes a step): that is a separate entry for a caller that tries
   an all-ASCII chunk first. Every decode writes at most `STORE_SLACK` (16) bytes
   past the length it returns; `DecodeToUtf16` nothing past n units. The NEON
   planes are built once per page, found by `CodePageTable::index`, so a table is
-  always one `FindCodePage` returned. Pages 1251, 1252 and 874 run kernels
+  always one `FindCodePage` returned. `DecodeColumn` takes a chunk's column
+  whole (spec 092 D12): the UTF-8 into the vector's heap and each row's
+  `string_t` (`StringView16`) in the same pass, from the masks the kernel
+  records for each 16 input bytes that are not all ASCII (an ASCII step stores
+  nothing: on Apple M4 a second store stream beside the output costs the core
+  its whole-line writes). Pages 1251, 1252 and 874 run kernels
   specialised to the page (the column's code page is always known): the run's
   arithmetic with literal constants, the exceptions in the smallest window (80–9F
   for 1252, 80–BF for 1251), and Thai written by one `vst3q_u8` per block (spec 091
