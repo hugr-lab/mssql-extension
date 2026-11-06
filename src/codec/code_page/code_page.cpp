@@ -230,7 +230,6 @@ size_t DecodeValuesImpl(const CodePageTable &page, const uint8_t *src, size_t sr
 	return static_cast<size_t>(d - dst);
 }
 
-using detail::CacheAlignedArray;
 using detail::Compaction;
 using detail::Compaction3;
 using detail::GetCompaction;
@@ -306,12 +305,21 @@ NeonPlanes BuildPlanes(const CodePageTable &page) {
 	return planes;
 }
 
+std::vector<NeonPlanes> BuildAllPlanes() {
+	std::vector<NeonPlanes> planes;
+	planes.reserve(tables::CODE_PAGE_COUNT);
+	for (size_t i = 0; i < tables::CODE_PAGE_COUNT; i++) {
+		planes.push_back(BuildPlanes(tables::CODE_PAGES[i]));
+	}
+	return planes;
+}
+
 //! The planes of a page, found by its position in tables::CODE_PAGES (CodePageTable::index),
 //! so the page must be one FindCodePage returned. Built for every page on the first call; a
-//! function-local static, so two threads calling first build them once.
+//! function-local static, so two threads calling first build them once. NeonPlanes is
+//! alignas(128) (Apple's cache line), which the vector honours since C++17.
 const NeonPlanes &PlanesFor(const CodePageTable &page) {
-	static const CacheAlignedArray<NeonPlanes> planes(
-		tables::CODE_PAGE_COUNT, [](NeonPlanes &all, size_t i) { all = BuildPlanes(tables::CODE_PAGES[i]); });
+	static const std::vector<NeonPlanes> planes = BuildAllPlanes();
 	return planes[page.index];
 }
 

@@ -18,7 +18,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <new>
 #include <vector>
 
 namespace duckdb {
@@ -95,33 +94,6 @@ struct NoRecord {
 	inline void Record16(const uint8_t *, const char *, unsigned, unsigned) const {}
 	inline void Record32(const uint8_t *, const char *, uint32_t, uint32_t) const {}
 	inline void Ascii32(const uint8_t *) const {}
-};
-
-//! `count` objects of T in one block aligned to 128 bytes (Apple's cache line; x86's and
-//! Neoverse's are 64), each filled once by fill(T &, i). A std::vector's elements are only
-//! 16-byte aligned, so a 32- or 64-byte table in one can straddle two cache lines and each
-//! load of it touch both. T: plain data (never destroyed), alignas a line so its own size
-//! keeps every element on a boundary.
-template <class T>
-class CacheAlignedArray {
-public:
-	template <class Fill>
-	CacheAlignedArray(size_t count, Fill fill) : storage_(count * sizeof(T) + LINE) {
-		items_ = reinterpret_cast<T *>((reinterpret_cast<uintptr_t>(storage_.data()) + LINE - 1) &
-									   ~static_cast<uintptr_t>(LINE - 1));
-		for (size_t i = 0; i < count; i++) {
-			new (items_ + i) T();
-			fill(items_[i], i);
-		}
-	}
-	const T &operator[](size_t i) const {
-		return items_[i];
-	}
-
-private:
-	static constexpr size_t LINE = 128;
-	std::vector<unsigned char> storage_;
-	T *items_;
 };
 
 const Compaction &GetCompaction();

@@ -859,12 +859,12 @@ bench-utf16: release
 #   make test-code-page-portable   the same, built with the 8-byte SWAR form
 #   make bench-code-page           the kernel against today's UTF-16 path; manual, not in CI
 #   make bench-code-page-tiers     the single-byte kernel's time per tier (ns per 32 bytes)
-# Both tests compile -std=c++11, the standard the extension builds at, and run in CI's
+# Both tests compile -std=c++17, the standard the extension builds at (DuckDB requires it), and run in CI's
 # cpp-unit-tests job on Linux and macOS.
 CODE_PAGE_SOURCES := src/codec/code_page/code_page.cpp src/codec/code_page/code_page_avx2.cpp \
     src/codec/code_page/code_page_avx512.cpp \
     src/codec/code_page/code_page_tables.cpp
-CODE_PAGE_TEST_FLAGS := -std=c++11 -O2 -Wall -Wextra -I src/include
+CODE_PAGE_TEST_FLAGS := -std=c++17 -O2 -Wall -Wextra -I src/include
 
 # The DSN reaches generate.py through the environment (MSSQL_TEST_DSN is exported above),
 # never through argv, where it would show in `ps`.

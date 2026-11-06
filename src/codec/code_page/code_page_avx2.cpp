@@ -151,17 +151,23 @@ struct alignas(64) Planes256 {
 	uint8_t third[8][32];
 };
 
+//! In a std::vector: since C++17 an over-aligned element (alignas(64)) is allocated through the
+//! aligned operator new, so no table straddles a cache line.
 const Planes256 &PlanesFor(const CodePageTable &page) {
-	static const CacheAlignedArray<Planes256> planes(tables::CODE_PAGE_COUNT, [](Planes256 &all, size_t i) {
-		for (unsigned b = 0; b < 128; b++) {
-			const uint32_t packed = tables::CODE_PAGES[i].single[0x80 + b];
-			for (unsigned lane = 0; lane < 2; lane++) {
-				all.first[b / 16][16 * lane + b % 16] = static_cast<uint8_t>(packed & 0xFF);
-				all.second[b / 16][16 * lane + b % 16] = static_cast<uint8_t>((packed >> 8) & 0xFF);
-				all.third[b / 16][16 * lane + b % 16] = static_cast<uint8_t>((packed >> 16) & 0xFF);
+	static const std::vector<Planes256> planes = [] {
+		std::vector<Planes256> all(tables::CODE_PAGE_COUNT);
+		for (size_t i = 0; i < tables::CODE_PAGE_COUNT; i++) {
+			for (unsigned b = 0; b < 128; b++) {
+				const uint32_t packed = tables::CODE_PAGES[i].single[0x80 + b];
+				for (unsigned lane = 0; lane < 2; lane++) {
+					all[i].first[b / 16][16 * lane + b % 16] = static_cast<uint8_t>(packed & 0xFF);
+					all[i].second[b / 16][16 * lane + b % 16] = static_cast<uint8_t>((packed >> 8) & 0xFF);
+					all[i].third[b / 16][16 * lane + b % 16] = static_cast<uint8_t>((packed >> 16) & 0xFF);
+				}
 			}
 		}
-	});
+		return all;
+	}();
 	return planes[page.index];
 }
 

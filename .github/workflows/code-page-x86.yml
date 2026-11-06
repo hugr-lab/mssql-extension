@@ -4,7 +4,7 @@ name: Code-page kernels (x86-64)
 # is on arm64, where only Rosetta runs x86 (AVX2 at best, and its timings mean
 # nothing), so this job is where the x86 kernels are tested on hardware and timed:
 #   - the unit test runs the kernels of every instruction set the runner has
-#     (AVX2, AVX-512 when present, and the scalar path), -std=c++11 -Werror;
+#     (AVX2, AVX-512 when present, and the scalar path), -std=c++17 (as the extension) -Werror;
 #   - the micro-benchmark compares them with today's UTF-16 path (simdutf 6.1.1,
 #     the vcpkg pin), once each with the AVX-512, AVX2 and scalar kernels the CPU runs.
 # The bench is not a gate: its numbers go to the job summary.
@@ -43,7 +43,7 @@ jobs:
 
       - name: Unit test, every instruction set the CPU has
         run: |
-          g++ -std=c++11 -O2 -Wall -Wextra -Werror -I src/include \
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -I src/include \
             test/cpp/codec/test_code_page.cpp \
             src/codec/code_page/code_page.cpp src/codec/code_page/code_page_avx2.cpp \
             src/codec/code_page/code_page_avx512.cpp \
@@ -59,6 +59,14 @@ jobs:
           for isa in $expect; do
             grep -q -x "kernels: $isa" test.txt || { echo "::error::the $isa kernels did not run"; exit 1; }
           done
+          # Which kernels this run covered, in the summary: the runner pool decides whether
+          # AVX-512 is among them, so a run without it says so instead of passing quietly.
+          covered="$(sed -n 's/^kernels: //p' test.txt | tr '\n' ' ')"
+          echo "covered ISAs: $covered ($(lscpu | sed -n 's/^Model name: *//p'))" >> "$GITHUB_STEP_SUMMARY"
+          case " $covered " in
+            *" avx512 "*) ;;
+            *) echo "::notice::AVX-512 kernels not covered on this runner (no VBMI2); tools/code_pages/bench_gcp.sh covers every CPU" ;;
+          esac
 
       - name: simdutf, the bench's baseline
         run: |

@@ -58,14 +58,18 @@ struct alignas(64) Planes512 {
 };
 
 const Planes512 &PlanesFor(const CodePageTable &page) {
-	static const CacheAlignedArray<Planes512> planes(tables::CODE_PAGE_COUNT, [](Planes512 &all, size_t i) {
-		for (size_t b = 0; b < 128; b++) {
-			const uint32_t packed = tables::CODE_PAGES[i].single[0x80 + b];
-			all.first[b] = static_cast<uint8_t>(packed & 0xFF);
-			all.second[b] = static_cast<uint8_t>((packed >> 8) & 0xFF);
-			all.third[b] = static_cast<uint8_t>((packed >> 16) & 0xFF);
+	static const std::vector<Planes512> planes = [] {
+		std::vector<Planes512> all(tables::CODE_PAGE_COUNT);
+		for (size_t i = 0; i < tables::CODE_PAGE_COUNT; i++) {
+			for (size_t b = 0; b < 128; b++) {
+				const uint32_t packed = tables::CODE_PAGES[i].single[0x80 + b];
+				all[i].first[b] = static_cast<uint8_t>(packed & 0xFF);
+				all[i].second[b] = static_cast<uint8_t>((packed >> 8) & 0xFF);
+				all[i].third[b] = static_cast<uint8_t>((packed >> 16) & 0xFF);
+			}
 		}
-	});
+		return all;
+	}();
 	return planes[page.index];
 }
 

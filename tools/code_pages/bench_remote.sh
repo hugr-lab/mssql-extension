@@ -35,7 +35,7 @@ SOURCES="src/codec/code_page/code_page.cpp src/codec/code_page/code_page_avx2.cp
 
 echo "== unit test"
 # shellcheck disable=SC2086
-g++ -std=c++11 -O2 -Wall -Wextra -Werror -I src/include test/cpp/codec/test_code_page.cpp $SOURCES \
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -I src/include test/cpp/codec/test_code_page.cpp $SOURCES \
 	-o "$WORK/test_code_page"
 "$WORK/test_code_page" | tee "$WORK/test.txt"
 best="$(sed -n 's/^kernels: //p' "$WORK/test.txt" | head -1)"
