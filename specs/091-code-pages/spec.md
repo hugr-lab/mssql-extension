@@ -618,8 +618,30 @@ Acceptance:
 - not yet shown: a second generator run on the same build leaving an empty diff; the live sample on
   2022 (D10);
 - the micro-benchmark gate "a single-byte page at most the UTF-16 kernel's cost per character" is
-  met on ASCII, Latin and Cyrillic and missed by 25 % on Cyrillic with typography (Benchmark). The
-  end-to-end gate, where the halved wire counts, is spec 092's (D10 there).
+  met on ASCII, Latin 1252 (typography included), Cyrillic 1251 and Thai 874, and missed by 7 % on
+  Cyrillic with typography (Benchmark). The end-to-end gate, where the halved wire counts, is spec
+  092's (D10 there).
+
+## D5a — kernels specialised to a code page
+
+The code page of every column is known exactly (COLMETADATA on the TDS path, the catalog in a
+backup), so the kernel is chosen once per call, by the page (`DecodeNeonFor`), and the frequent
+pages get their own: their run's arithmetic with literal constants, their exceptions in the
+smallest window that holds them, and no page flags in the loop.
+- **1252**: A0-FF read as Latin-1, so the UTF-8 is `C2` / `C3` (`vsraq_n_u8(0xC0, byte, 6)`)
+  then `0x80 | (byte & 0x3F)`; every exception (the euro sign, the quotes, dashes and ellipsis,
+  Œ Š Ž ...) lies in 80-9F: a 32-entry, two-register `vqtbx2q` per plane.
+- **1251**: C0-FF read as U+0410-U+044F, so `D0` / `D1` (byte >= F0) then
+  `0x80 | ((byte + 0x10) & 0x3F)`; every exception (Ё ё Ђ ... № and the typography) lies in 80-BF:
+  the 64-entry half of the planes.
+- **874**: A1-FB except DB-DE read as U+0E01-U+0E5B, three bytes each, all arithmetic (`E0`,
+  `B8` / `B9`, `0x80 | ((byte + 0x20) & 0x3F)`); a block of Thai letters alone (Thai puts no space
+  between words) is three planes interleaved by one `vst3q_u8`, 48 bytes, with no packing at all.
+- A block a specialised kernel does not cover, and the tail under 32 bytes, take the generic kernel.
+An analysis of the server's data (each page's dominant delta, its holes, where its exceptions
+fall) picked them and names the next candidates: 1253 (Greek, delta +0x2D0 over B4-FE, holes
+B5 B6 B7 BB BD D2) and 1254 / 1258 (Latin-1 with a few holes); 1250, 1257, 1256, 437 and 850 scatter
+their letters and stay on the generic tables.
 
 ## Benchmark
 
@@ -639,10 +661,16 @@ it (`bench_code_page.cpp:264`).
 |---|---:|---:|---:|
 | ASCII, 4-20 bytes | 0.15 | 0.59 | 0.25 |
 | ASCII, 200 bytes | 2.5 | 9.6 | 0.26 |
-| Latin 1252, ~4 % accents, 20-60 bytes | 2.84 | 3.31 | 0.86 |
-| Cyrillic 1251, words of 3-9 letters | 4.0-4.1 | 4.5-4.6 | 0.89 |
-| Cyrillic 1251, 1 character in 40 a dash, quote or ellipsis | 6.8-6.9 | 5.45-5.5 | 1.25 |
+| Latin 1252, ~4 % accents, 20-60 bytes | 2.44 | 3.3 | 0.74 |
+| Latin 1252 + typography (1 in 40 a quote, dash, ellipsis, euro) | 4.8 | 4.9 | 0.98 |
+| Cyrillic 1251, words of 3-9 letters | 3.47 | 4.6 | 0.75 |
+| Cyrillic 1251, 1 character in 40 a dash, quote or ellipsis | 5.84 | 5.45 | 1.07 |
+| Thai 874, letters, a space between phrases | 7.4-7.7 | 11.3 | 0.66 |
 | Japanese 932, kana / kanji, 10 % ASCII digits | ~43 | 3.7 | ~11.6 |
+
+Latin 1252, Cyrillic 1251 and Thai 874 run kernels specialised to the page (D5a); the other
+single-byte pages run the generic NEON kernel (before the specialisation: 1252 2.84 / 6.30,
+1251 4.0 / 6.8, 874 20.0).
 
 The Japanese chunk is 66 KB in 932 and 70 KB as UTF-16: a double-byte page saves almost nothing on
 the wire, and its scalar decode costs the client 11.6x simdutf's. The other columns the bench

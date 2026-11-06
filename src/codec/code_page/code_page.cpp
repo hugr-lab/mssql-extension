@@ -215,6 +215,9 @@ size_t DecodeValuesImpl(const CodePageTable &page, const uint8_t *src, size_t sr
 //! Built once per page, on first use (PlanesFor).
 struct NeonPlanes {
 	uint8x16x4_t first_lo, first_hi, second_lo, second_hi, third_lo, third_hi;
+	//! The first 32 entries (bytes 80-9F) of the three planes as two-register tables:
+	//! 1252's specialised kernel looks its exceptions up with vqtbx2q.
+	uint8x16x2_t first_w32, second_w32, third_w32;
 	uint8x16x4_t unit_low_lo, unit_low_hi, unit_high_lo, unit_high_hi;
 	//! The page's longest run of bytes [run_lo, run_lo + run_span] whose code points are
 	//! byte + delta, all below U+0800 (1251: C0-FF -> U+0410-U+044F; 1252: A0-FF ->
@@ -319,6 +322,9 @@ NeonPlanes BuildPlanes(const CodePageTable &page) {
 	planes.second_hi = vld1q_u8_x4(second + 64);
 	planes.third_lo = vld1q_u8_x4(third);
 	planes.third_hi = vld1q_u8_x4(third + 64);
+	planes.first_w32 = vld1q_u8_x2(first);
+	planes.second_w32 = vld1q_u8_x2(second);
+	planes.third_w32 = vld1q_u8_x2(third);
 	planes.unit_low_lo = vld1q_u8_x4(unit_low);
 	planes.unit_low_hi = vld1q_u8_x4(unit_low + 64);
 	planes.unit_high_lo = vld1q_u8_x4(unit_high);
@@ -600,6 +606,168 @@ MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon(const NeonKernel &k, const uint8_
 //! next value, where the NEON kernel would finish it byte by byte.
 constexpr size_t NEON_MIN_VALUE = 2 * BLOCK;
 
+//! Code page 1252, specialised (spec 091): bytes A0-FF read as U+00A0-U+00FF (Latin-1), so
+//! their UTF-8 is C2 / C3 then 0x80 | (byte & 0x3F); every other byte >= 0x80 lies in
+//! 80-9F (the euro sign, the quotes, dashes and ellipsis, Œ Š Ž ...) and is looked up in
+//! a 32-entry table (vqtbx2q, two registers). The generic kernel takes the rest (< 32 bytes).
+MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon1252(const NeonKernel &k, const uint8_t *p, const uint8_t *end, char *d) {
+	const NeonPlanes &planes = k.planes;
+	const uint8x16_t k20 = vdupq_n_u8(0x20);
+	while (static_cast<size_t>(end - p) >= 2 * BLOCK) {
+		const uint8x16_t v0 = vld1q_u8(p), v1 = vld1q_u8(p + BLOCK);
+		if (vmaxvq_u8(vorrq_u8(v0, v1)) < 0x80) {
+			vst1q_u8(reinterpret_cast<uint8_t *>(d), v0);
+			vst1q_u8(reinterpret_cast<uint8_t *>(d + BLOCK), v1);
+			p += 2 * BLOCK;
+			d += 2 * BLOCK;
+			continue;
+		}
+		const uint8x16_t ascii0 = vcltq_u8(v0, k.k80), ascii1 = vcltq_u8(v1, k.k80);
+		// Latin-1 arithmetic for every lane; ASCII lanes keep their byte as the first.
+		uint8x16_t f0 = vbslq_u8(ascii0, v0, vsraq_n_u8(k.kc0, v0, 6));
+		uint8x16_t f1 = vbslq_u8(ascii1, v1, vsraq_n_u8(k.kc0, v1, 6));
+		uint8x16_t s0 = vbslq_u8(k.k3f, v0, k.k80), s1 = vbslq_u8(k.k3f, v1, k.k80);
+		const uint8x16_t w0 = vsubq_u8(v0, k.k80), w1 = vsubq_u8(v1, k.k80);
+		if (vmaxvq_u8(vorrq_u8(vcltq_u8(w0, k20), vcltq_u8(w1, k20))) == 0) {
+			// No 80-9F byte: every non-ASCII lane is 2-byte.
+			const uint32_t masks = ~Masks4(k, ascii0, ascii1);
+			const unsigned m0 = masks & 0xFF, m1 = (masks >> 8) & 0xFF;
+			const unsigned m2 = (masks >> 16) & 0xFF, m3 = masks >> 24;
+			const Compaction &c = k.compaction;
+			const size_t l0 = c.length[m0], l1 = c.length[m1], l2 = c.length[m2];
+			vst1q_u8(reinterpret_cast<uint8_t *>(d), vqtbl1q_u8(vzip1q_u8(f0, s0), vld1q_u8(c.shuffle[m0])));
+			vst1q_u8(reinterpret_cast<uint8_t *>(d + l0), vqtbl1q_u8(vzip2q_u8(f0, s0), vld1q_u8(c.shuffle[m1])));
+			vst1q_u8(reinterpret_cast<uint8_t *>(d + l0 + l1), vqtbl1q_u8(vzip1q_u8(f1, s1), vld1q_u8(c.shuffle[m2])));
+			vst1q_u8(reinterpret_cast<uint8_t *>(d + l0 + l1 + l2),
+					 vqtbl1q_u8(vzip2q_u8(f1, s1), vld1q_u8(c.shuffle[m3])));
+			d += l0 + l1 + l2 + c.length[m3];
+			p += 2 * BLOCK;
+			continue;
+		}
+		// 80-9F bytes from the 32-entry tables; everything else keeps the arithmetic (an ASCII
+		// or A0-FF byte indexes past 32, so vqtbx keeps it).
+		f0 = vqtbx2q_u8(f0, planes.first_w32, w0);
+		f1 = vqtbx2q_u8(f1, planes.first_w32, w1);
+		s0 = vqtbx2q_u8(s0, planes.second_w32, w0);
+		s1 = vqtbx2q_u8(s1, planes.second_w32, w1);
+		d = vmaxvq_u8(f0) >= 0xE0 ? Pack3(k, f0, s0, vqtbx2q_u8(k.zero, planes.third_w32, w0), d) : Pack2(k, f0, s0, d);
+		d = vmaxvq_u8(f1) >= 0xE0 ? Pack3(k, f1, s1, vqtbx2q_u8(k.zero, planes.third_w32, w1), d) : Pack2(k, f1, s1, d);
+		p += 2 * BLOCK;
+	}
+	return DecodeNeon(k, p, end, d);
+}
+
+//! Code page 1251, specialised: bytes C0-FF read as U+0410-U+044F (А-я), so their UTF-8 is
+//! D0 / D1 (from byte >= F0) then 0x80 | ((byte + 0x10) & 0x3F); every other byte >= 0x80
+//! lies in 80-BF (Ё ё Ђ ... № and the typography) and is looked up in the 64-entry half of
+//! the planes, the arithmetic as vqtbx's default. The generic kernel takes the rest.
+MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon1251(const NeonKernel &k, const uint8_t *p, const uint8_t *end, char *d) {
+	const NeonPlanes &planes = k.planes;
+	const uint8x16_t kd0 = vdupq_n_u8(0xD0), kf0 = vdupq_n_u8(0xF0), k10 = vdupq_n_u8(0x10);
+	const uint8x16_t kbf = vdupq_n_u8(0xBF);
+	while (static_cast<size_t>(end - p) >= 2 * BLOCK) {
+		const uint8x16_t v0 = vld1q_u8(p), v1 = vld1q_u8(p + BLOCK);
+		if (vmaxvq_u8(vorrq_u8(v0, v1)) < 0x80) {
+			vst1q_u8(reinterpret_cast<uint8_t *>(d), v0);
+			vst1q_u8(reinterpret_cast<uint8_t *>(d + BLOCK), v1);
+			p += 2 * BLOCK;
+			d += 2 * BLOCK;
+			continue;
+		}
+		const uint8x16_t ascii0 = vcltq_u8(v0, k.k80), ascii1 = vcltq_u8(v1, k.k80);
+		// D0 + (byte >= F0): the compare's 0xFF counts as -1, so D0 - mask.
+		uint8x16_t f0 = vbslq_u8(ascii0, v0, vsubq_u8(kd0, vcgeq_u8(v0, kf0)));
+		uint8x16_t f1 = vbslq_u8(ascii1, v1, vsubq_u8(kd0, vcgeq_u8(v1, kf0)));
+		uint8x16_t s0 = vbslq_u8(k.k3f, vaddq_u8(v0, k10), k.k80);
+		uint8x16_t s1 = vbslq_u8(k.k3f, vaddq_u8(v1, k10), k.k80);
+		const uint8x16_t w0 = vsubq_u8(v0, k.k80), w1 = vsubq_u8(v1, k.k80);
+		// A byte in 80-BF is (byte - 0x80) <= 0x3F; ASCII wraps to >= 0x80, C0-FF to 0x40-0x7F.
+		const uint8x16_t in0 = vcleq_u8(vaddq_u8(w0, vdupq_n_u8(0xC0)), kbf);  // not 80-BF
+		const uint8x16_t in1 = vcleq_u8(vaddq_u8(w1, vdupq_n_u8(0xC0)), kbf);
+		if (vminvq_u8(vandq_u8(in0, in1)) == 0xFF) {
+			// No 80-BF byte: every non-ASCII lane is a letter, 2-byte.
+			const uint32_t masks = ~Masks4(k, ascii0, ascii1);
+			const unsigned m0 = masks & 0xFF, m1 = (masks >> 8) & 0xFF;
+			const unsigned m2 = (masks >> 16) & 0xFF, m3 = masks >> 24;
+			const Compaction &c = k.compaction;
+			const size_t l0 = c.length[m0], l1 = c.length[m1], l2 = c.length[m2];
+			vst1q_u8(reinterpret_cast<uint8_t *>(d), vqtbl1q_u8(vzip1q_u8(f0, s0), vld1q_u8(c.shuffle[m0])));
+			vst1q_u8(reinterpret_cast<uint8_t *>(d + l0), vqtbl1q_u8(vzip2q_u8(f0, s0), vld1q_u8(c.shuffle[m1])));
+			vst1q_u8(reinterpret_cast<uint8_t *>(d + l0 + l1), vqtbl1q_u8(vzip1q_u8(f1, s1), vld1q_u8(c.shuffle[m2])));
+			vst1q_u8(reinterpret_cast<uint8_t *>(d + l0 + l1 + l2),
+					 vqtbl1q_u8(vzip2q_u8(f1, s1), vld1q_u8(c.shuffle[m3])));
+			d += l0 + l1 + l2 + c.length[m3];
+			p += 2 * BLOCK;
+			continue;
+		}
+		f0 = vqtbx4q_u8(f0, planes.first_lo, w0);
+		f1 = vqtbx4q_u8(f1, planes.first_lo, w1);
+		s0 = vqtbx4q_u8(s0, planes.second_lo, w0);
+		s1 = vqtbx4q_u8(s1, planes.second_lo, w1);
+		d = vmaxvq_u8(f0) >= 0xE0 ? Pack3(k, f0, s0, vqtbx4q_u8(k.zero, planes.third_lo, w0), d) : Pack2(k, f0, s0, d);
+		d = vmaxvq_u8(f1) >= 0xE0 ? Pack3(k, f1, s1, vqtbx4q_u8(k.zero, planes.third_lo, w1), d) : Pack2(k, f1, s1, d);
+		p += 2 * BLOCK;
+	}
+	return DecodeNeon(k, p, end, d);
+}
+
+//! Code page 874 (Thai), specialised: bytes A1-FB except DB-DE read as U+0E01-U+0E5B, three
+//! UTF-8 bytes each, all arithmetic: E0, then B8 / B9 (from byte >= E0), then
+//! 0x80 | ((byte + 0x20) & 0x3F). A block of Thai letters alone (Thai puts no space between
+//! words) is three planes interleaved by one vst3q_u8, 48 bytes; Thai mixed with ASCII is
+//! packed 1 / 3 bytes a character by Pack3; anything else (the euro sign, quotes, the holes)
+//! takes the generic kernel's step for that block.
+MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon874(const NeonKernel &k, const uint8_t *p, const uint8_t *end, char *d) {
+	const uint8x16_t ka1 = vdupq_n_u8(0xA1), k5a = vdupq_n_u8(0x5A), kdb = vdupq_n_u8(0xDB);
+	const uint8x16_t k03 = vdupq_n_u8(0x03), kb8 = vdupq_n_u8(0xB8), k20 = vdupq_n_u8(0x20);
+	while (static_cast<size_t>(end - p) >= BLOCK) {
+		const uint8x16_t v = vld1q_u8(p);
+		if (vmaxvq_u8(v) < 0x80) {
+			vst1q_u8(reinterpret_cast<uint8_t *>(d), v);
+			p += BLOCK;
+			d += BLOCK;
+			continue;
+		}
+		const uint8x16_t thai = vandq_u8(vcleq_u8(vsubq_u8(v, ka1), k5a), vmvnq_u8(vcleq_u8(vsubq_u8(v, kdb), k03)));
+		const uint8x16_t ascii = vcltq_u8(v, k.k80);
+		if (vminvq_u8(vorrq_u8(thai, ascii)) != 0xFF) {
+			// A byte outside Thai and ASCII: the generic kernel's step for this block.
+			d = DecodeNeon(k, p, p + BLOCK, d);
+			p += BLOCK;
+			continue;
+		}
+		const uint8x16_t second = vsubq_u8(kb8, vcgeq_u8(v, k.ke0));  // 0xFF counts as -1: B9
+		const uint8x16_t third = vbslq_u8(k.k3f, vaddq_u8(v, k20), k.k80);
+		if (vmaxvq_u8(ascii) == 0) {
+			uint8x16x3_t planes;
+			planes.val[0] = k.ke0;
+			planes.val[1] = second;
+			planes.val[2] = third;
+			vst3q_u8(reinterpret_cast<uint8_t *>(d), planes);
+			d += 3 * BLOCK;
+		} else {
+			d = Pack3(k, vbslq_u8(ascii, v, k.ke0), second, third, d);
+		}
+		p += BLOCK;
+	}
+	return DecodeNeon(k, p, end, d);
+}
+
+//! The specialised kernel of a page, else the generic one.
+MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeonFor(const NeonKernel &k, uint16_t code_page, const uint8_t *p,
+												  const uint8_t *end, char *d) {
+	switch (code_page) {
+	case 1251:
+		return DecodeNeon1251(k, p, end, d);
+	case 1252:
+		return DecodeNeon1252(k, p, end, d);
+	case 874:
+		return DecodeNeon874(k, p, end, d);
+	default:
+		return DecodeNeon(k, p, end, d);
+	}
+}
+
 size_t DecodeValuesSingleByteNeon(const CodePageTable &page, const uint8_t *src, size_t src_size,
 								  const uint32_t *offsets, const uint32_t *lengths, size_t count, char *dst,
 								  uint64_t *out_offsets, uint32_t *out_lengths) {
@@ -610,7 +778,8 @@ size_t DecodeValuesSingleByteNeon(const CodePageTable &page, const uint8_t *src,
 		const uint8_t *p = src + offsets[i];
 		const uint8_t *end = p + lengths[i];
 		char *start = d;
-		d = lengths[i] >= NEON_MIN_VALUE ? DecodeNeon(kernel, p, end, d) : DecodeRun<false>(page, p, end, readable, d);
+		d = lengths[i] >= NEON_MIN_VALUE ? DecodeNeonFor(kernel, page.code_page, p, end, d)
+										 : DecodeRun<false>(page, p, end, readable, d);
 		out_offsets[i] = static_cast<uint64_t>(start - dst);
 		out_lengths[i] = static_cast<uint32_t>(d - start);
 	}
@@ -801,7 +970,7 @@ size_t DecodeToUtf8(const CodePageTable &page, const uint8_t *src, size_t n, cha
 	}
 #if defined(MSSQL_CODE_PAGE_NEON)
 	const NeonKernel kernel(page);
-	return static_cast<size_t>(DecodeNeon(kernel, src, src + n, dst) - dst);
+	return static_cast<size_t>(DecodeNeonFor(kernel, page.code_page, src, src + n, dst) - dst);
 #else
 	return static_cast<size_t>(DecodeRun<false>(page, src, src + n, src + n, dst) - dst);
 #endif

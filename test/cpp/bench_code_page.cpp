@@ -112,6 +112,38 @@ std::vector<uint8_t> Cyrillic1251Typo(std::mt19937 &rng) {
 	}
 	return v;
 }
+// French text with typography in 1252: accents (~4%) and, about 1 in 40 characters, a curly
+// quote, a dash, an ellipsis or the euro sign (0x80, 0x85, 0x93, 0x94, 0x96, 0x97: 3-byte).
+std::vector<uint8_t> Latin1252Typo(std::mt19937 &rng) {
+	static const uint8_t accents[] = {0xE9, 0xE8, 0xE0, 0xE7, 0xF4};
+	static const uint8_t typo[] = {0x80, 0x85, 0x93, 0x94, 0x96, 0x97};
+	std::vector<uint8_t> v;
+	const size_t n = 20 + rng() % 41;
+	while (v.size() < n) {
+		const size_t w = 2 + rng() % 9;
+		for (size_t i = 0; i < w; i++) {
+			const unsigned r = rng() % 40;
+			v.push_back(r == 0 ? typo[rng() % 6]
+							   : (rng() % 25 == 0 ? accents[rng() % 5] : static_cast<uint8_t>('a' + rng() % 26)));
+		}
+		v.push_back(' ');
+	}
+	return v;
+}
+// Thai text in 874: letters A1-DA (U+0E01-U+0E3A), no spaces between words, a space now and
+// then between phrases.
+std::vector<uint8_t> Thai874(std::mt19937 &rng) {
+	std::vector<uint8_t> v;
+	const size_t n = 20 + rng() % 41;
+	while (v.size() < n) {
+		const size_t w = 10 + rng() % 30;
+		for (size_t i = 0; i < w; i++) {
+			v.push_back(static_cast<uint8_t>(0xA1 + rng() % 0x3A));
+		}
+		v.push_back(' ');
+	}
+	return v;
+}
 // Japanese-like text in 932: hiragana and kanji pairs, now and then ASCII digits.
 std::vector<uint8_t> Japanese932(std::mt19937 &rng) {
 	std::vector<uint8_t> v;
@@ -176,6 +208,8 @@ int main() {
 	chunks.push_back(Make("latin 1252, ~4% accents", 1252, Latin1252, rng));
 	chunks.push_back(Make("cyrillic 1251", 1251, Cyrillic1251, rng));
 	chunks.push_back(Make("cyrillic 1251 + typography", 1251, Cyrillic1251Typo, rng));
+	chunks.push_back(Make("latin 1252 + typography", 1252, Latin1252Typo, rng));
+	chunks.push_back(Make("thai 874", 874, Thai874, rng));
 	chunks.push_back(Make("japanese 932", 932, Japanese932, rng));
 
 	static const char *const NAMES[] = {"fused", "2-pass", "2-stage", "ascii64", "auto", "direct", "utf16"};

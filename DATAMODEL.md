@@ -798,7 +798,11 @@ path) is spec 091's follow-up.
   an all-ASCII chunk first. Every decode writes at most `STORE_SLACK` (16) bytes
   past the length it returns; `DecodeToUtf16` nothing past n units. The NEON
   planes are built once per page, found by `CodePageTable::index`, so a table is
-  always one `FindCodePage` returned. `make bench-code-page` measures it against
+  always one `FindCodePage` returned. Pages 1251, 1252 and 874 run kernels
+  specialised to the page (the column's code page is always known): the run's
+  arithmetic with literal constants, the exceptions in the smallest window (80–9F
+  for 1252, 80–BF for 1251), and Thai written by one `vst3q_u8` per block (spec 091
+  D5a). `make bench-code-page` measures it against
   today's UTF-16 path; `make test-code-page` / `test-code-page-portable` run on
   every PR (NEON, SSE2, SWAR).
 
