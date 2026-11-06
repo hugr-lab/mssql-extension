@@ -811,6 +811,51 @@ def as_float(s):
     return float(s) if FLOATING.fullmatch(s) else None
 
 
+#: The widest decimal scale this harness sees: SQL Server returns TPC-H's
+#: aggregates as decimal(38,6).
+MAX_DECIMAL_SCALE = 6
+#: A DOUBLE's shortest round-trip form needs up to 17 significant digits. An
+#: exact decimal of these magnitudes needs far fewer, so a value carrying this
+#: many digits is a double however few decimal places it happens to print --
+#: which is what rules out the large-magnitude case (a double near 1e12 prints
+#: only four decimals).
+MAX_EXACT_DIGITS = 15
+
+
+def exact_pair(dx, dy):
+    """Are these two both printed as an EXACT decimal of ONE scale?
+
+    An equal scale ALONE is not evidence of that, which is the defect roborev
+    found in the first cut of this rule. A DOUBLE in shortest round-trip form
+    parses as a decimal too, and DuckDB returns `avg(decimal)` and
+    `decimal / decimal` as DOUBLE -- q01's avg_qty, avg_price and avg_disc and
+    q08's mkt_share. Meanwhile CLAUDE.md records that the extension's pushed
+    `CAST(SUM(x) AS float) / COUNT_BIG(x)` differs from DuckDB's avg in its
+    last bits BY DESIGN. So two doubles one ulp apart whose shortest forms
+    happen to print at the same scale were being required to be EQUAL.
+
+    Measured over 4000 ulp-apart pairs per magnitude, before this guard:
+
+        q01 avg_qty ~25        1148 of 4000 print at the same scale -- all 1148 rejected
+        q01 avg_price ~38000   1446 -- all rejected
+        q01 avg_disc ~0.05     1233 -- all rejected
+        q08 mkt_share ~0.034   1266 -- all rejected
+        q06 revenue ~1.2e8     2820 -- all rejected
+
+    Every one of those would have been published as a wrong answer for client
+    B on exactly the queries this harness exists to judge.
+
+    Hence two further conditions: the scale must be one a decimal column could
+    actually have, and neither value may carry a double's full precision.
+    """
+    exponent = dx.as_tuple().exponent
+    if exponent != dy.as_tuple().exponent:
+        return False
+    if -exponent > MAX_DECIMAL_SCALE:
+        return False
+    return max(len(dx.as_tuple().digits), len(dy.as_tuple().digits)) <= MAX_EXACT_DIGITS
+
+
 def as_decimal(s):
     """The value as a Decimal when it is written as a plain decimal, else None.
 
@@ -859,17 +904,17 @@ def same(x, y):
     against `123456789132.34`, which is item 1 of #506 (a dropped row in an
     aggregate passes) returning at exactly the scale the fix was for.
 
-    The SCALE decides which branch applies, because it is the evidence for what
-    the column is. Two values printed at the SAME scale are two exact decimals
-    of one type: required to be equal, whatever their magnitude. Different
-    scales mean a DOUBLE beside a decimal(38,6) -- the case the tolerance was
-    sized for -- and only that gets it.
+    What the pair LOOKS like decides which branch applies, because it is the
+    only evidence of what the columns are -- see `exact_pair`, which wants an
+    equal scale, a scale a decimal column could have, and digit counts below a
+    double's full precision. Anything else gets the tolerance, including two
+    doubles whose shortest forms happen to print alike.
     """
     if x == y:
         return True
     dx, dy = as_decimal(x), as_decimal(y)
     if dx is not None and dy is not None:
-        if dx.as_tuple().exponent == dy.as_tuple().exponent:
+        if exact_pair(dx, dy):
             return dx == dy
         bound = max(decimal.Decimal("1e-6"), decimal.Decimal("1e-9") * max(abs(dx), abs(dy)))
         return abs(dx - dy) <= bound
@@ -941,6 +986,24 @@ SAME_TESTS = [
     # Review of #518 nit 7: int() accepts both of these.
     ("a count with a leading blank", "13", " 13", False),
     ("a count written with an underscore", "1000", "1_000", False),
+    # DOUBLE against DOUBLE. The gap that let the first cut of the exact rule
+    # through: these parse as decimals and print at the SAME scale, so nothing
+    # in the fixture set distinguished them from two decimal(38,6) values, and
+    # every ulp-apart pair became a reported wrong answer. DuckDB returns
+    # avg(decimal) and decimal/decimal as DOUBLE, so these ARE q01's and q08's
+    # columns -- the queries the harness exists to judge.
+    ("two DOUBLEs one ulp apart, same printed scale (q01 avg_qty)",
+     "25.522005853257337", "25.522005853257333", True),
+    ("two DOUBLEs one ulp apart (q08 mkt_share)",
+     "0.034435890263343130", "0.034435890263343136", True),
+    ("two DOUBLEs one ulp apart at a large magnitude (q06 revenue)",
+     "123141078.2283", "123141078.22830002", True),
+    # ... and the guard must not swallow a real difference at double precision.
+    ("two DOUBLEs a whole percent apart", "25.522005853257337", "25.777005853257337", False),
+    # Seven decimals is past decimal(38,6), so the pair cannot be two exact
+    # decimals of one declared scale -- tolerance, not equality.
+    ("a scale wider than decimal(38,6) takes the tolerance",
+     "1.00000005", "1.00000004", True),
     # Not exact decimals: these fall to the float path rather than crashing.
     ("scientific notation, equal", "1e3", "1000.0", True),
     ("a NULL against an empty string", "", "", True),
