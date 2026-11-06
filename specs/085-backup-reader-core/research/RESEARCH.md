@@ -664,7 +664,8 @@ Layers (bottom up):
 | BusinessCentral.DbReader (C#) — full .bak, ROW/PAGE compression, LOB, overflow; every fact sourced in PROVENANCE.md | MIT | adapt with attribution |
 | pyxca (C), rust-lzxpress — Xpress codecs | MIT | adapt with attribution |
 | Internals Viewer (C#) — compressed backups, columnstore | GPL-3.0 | facts only, clean room |
-| OrcaMDF (C#), mdf-rs/mtf-rs (Rust), SQLServerForensics (Go) | GPL / AGPL | facts only |
+| OrcaMDF (C#) | GPL-3.0 (verified 2026-11-06: `License.txt` in improvedk/OrcaMDF; GitHub reports GPL-3.0) | facts only, no code read or ported |
+| mdf-rs/mtf-rs (Rust), SQLServerForensics (Go) | GPL / AGPL | facts only |
 | baktoany, MTF_Reader, mssql-backup-checker | no licence | read-only reference |
 
 We stay MIT: clean-room implementation from documented specs (MTF, MS-XCA, MS-SSCLRT, MS-BINXML),

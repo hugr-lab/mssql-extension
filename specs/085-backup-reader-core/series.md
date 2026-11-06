@@ -31,6 +31,12 @@ experiment ran on; **(unverified)** = inferred or never observed.
 code pages, generated tables and vectorized kernels), which 085 PR 2 needs, are outside the total;
 E11 is 088 task 9, inside it.
 
+**What approving the series approves** (the review of #526, 2026-11-06): the design, not the
+calendar. Building is decided per track: 085 with track A (085 → 089 PR 1 → 090; 69 + 89 working
+days) as one commitment, and 086, 087 and 088 each as its own call. After 089 PR 1 mssql-ducklake
+already imports quiet backups and refuses the rest by name, so stopping there leaves a working
+product.
+
 ### Why this split (and where it departs from the suggested one)
 
 The suggested split was kept, with these placements made explicit:

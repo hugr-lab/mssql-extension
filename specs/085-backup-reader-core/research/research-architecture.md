@@ -73,7 +73,7 @@
   - Smaller than mssql's 46 MB loadable; DuckDB's mbedtls and miniz (`duckdb/third_party/`) may cover crypto, if the host exports them.
   - Its own release cadence, outside the "ships with DuckDB 2.0" gate.
   - The format risk is isolated.
-  - It can stay MIT (clean-room; OrcaMDF is reportedly GPL, verify, so do not port it).
+  - It can stay MIT (clean-room; OrcaMDF is GPL-3.0 -- verified 2026-11-06, `License.txt` in improvedk/OrcaMDF -- so do not port it).
 - **Cons:**
   - Code is shared by source only, because hidden symbols prevent linking across extensions (mssql-ducklake `CLAUDE.md`, spec 002). Use a submodule for `tds/encoding`, the type map and code pages.
   - Two installs; type mappings can drift.

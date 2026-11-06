@@ -8,6 +8,11 @@ ACCEPTED AS RECOMMENDED.** The recommendations below are therefore the decisions
 - mssql 085–090 (`mssql/README.md` and the specs);
 - mssql-ducklake 022–024 (`mssql-ducklake/README.md` and the specs).
 
+Cross-checked 2026-11-06 against mssql-ducklake#56 (specs 022–024, head `7a1b80a`): the 29 DQ ids it
+cites are all defined here, none is cited that is not, and the three decided ones (DQ-02, DQ-10, DQ-33)
+read the same from both ends (`_mssql_page` a hex `VARCHAR`; DuckLake's partitioning rules; expiry
+only, compaction DuckLake's own).
+
 It also holds E7's datetimeoffset question, now decided (DQ-10), and the disagreements found when the two
 series were checked against each other and against `../RESEARCH.md` (R§n). Ids are `DQ-nn`; the specs
 cite them so, and their own question lists map to them (§ Where each question came from).
