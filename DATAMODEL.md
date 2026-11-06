@@ -753,6 +753,55 @@ classDiagram
   - **Two collations, not one.** The DDL collation may be empty, meaning "inherit the database's" — correct and cheap. The WIRE collation (`MSSQLCatalog::WireVarcharCollation`) may not: the server reads an `INSERT BULK` payload by the collation named in the statement text, and inherits nothing. A UTF-8 target with an empty DDL collation still needs its name on the wire, or the bytes are read in the database's code page.
 - **UTF-8 write path (spec 060 / issue #225)**: when the target column is a UTF-8 `varchar`/`char`, `BCPRowEncoder` resolves `codec::string::EncodeToBcpUtf8` for it — a separate entry point, not a branch, because the encoder is resolved once per column and the row loop must carry no test the column already answered. It declares `BIGVARCHAR` (0xA7) with the column's collation and copies the vector's bytes; every other char target keeps the UTF-16 transcode. Measured −51% client CPU and 35→19 wire bytes per 16-char value.
 
+### Code pages (spec 091)
+
+`src/codec/code_page/` reads code-page bytes the way the server does, for every
+consumer that meets them (the read path, a raw `mssql_scan`, the backup reader).
+Nothing reads it yet: the read path still casts code-page columns to NVARCHAR
+on the server (spec 092 switches it). Encoding into a code page (the write
+path) is spec 091's follow-up.
+
+- **The tables are the server's answers.** `tools/code_pages/generate.py` asks a
+  SQL Server for every byte of the 16 code pages it stores varchar in (437, 850,
+  874, 932, 936, 949, 950, 1250–1258), every double-byte pair, and every
+  collation's `CollationId` / LCID / code page; `emit_tables.py` checks the rules
+  the kernel relies on and writes `code_page_tables.cpp`. A byte is read in a
+  database whose default collation has the page: `COLLATE` would convert the
+  characters instead of reinterpreting the bytes. Python's codecs differ from the
+  server in 110 single bytes and every invalid double-byte sequence. Each page is
+  probed under a second collation of another kind or version (`cpNNN.alt.psv`,
+  which must read identically), and each double-byte page also reads ~400 seeded
+  random 3–12-byte strings whole (`cpNNN.strings.psv`), which the emitter checks
+  against its pair rules and the unit test against the kernel.
+- **Double-byte rules**, all from the data: a lead byte alone reads as nothing
+  (the server drops it), a lead byte and any trail byte 0x01–0xFF as one code
+  point (`?`, or `・` in 932, when invalid), a lead byte and 0x00 as the
+  replacement and then U+0000.
+- **Collation → code page**: a non-zero SortId (`CollationId >> 24`, the fifth
+  wire byte) decides alone; otherwise (LCID, fUTF8) does. No key is ambiguous
+  over the 5,540 collations of SQL Server 2025.
+- **The kernel** is one pass with no validation pass in front. A single-byte
+  page on arm64 takes a NEON kernel modelled on simdutf's UTF-16 → UTF-8
+  compaction, **32 bytes a step** (two 16-byte blocks, so their table lookups
+  overlap), in tiers: an all-ASCII step is stored as it is; one whose non-ASCII
+  bytes all lie in the page's run of byte + delta (1251 C0–FF → U+0410–U+044F,
+  1252 A0–FF → U+00A0–U+00FF) gets its UTF-8 bytes by **run arithmetic**; one of
+  1- and 2-byte characters gets first / second byte planes by **TBX**
+  (`vqtbx4q`) lookups, packed 8 characters a store by a 256-entry shuffle
+  table; one holding a 3-byte character (the euro sign, the dashes and quotes of
+  0x80–0x9F, Thai) adds a third plane and simdutf's 1/2/3-byte packing,
+  `Compaction3`, 4 characters a store. Everything else — a double-byte page, x86-64
+  (SSE2) and the SWAR fallback, and a value under 32 bytes in `DecodeValues` —
+  steps ASCII **16 bytes** at a time and reads other bytes from the packed table,
+  one 4-byte store each. `DecodeToUtf8` and `DecodeValues` do not call
+  `CopyAscii` (64 bytes a step): that is a separate entry for a caller that tries
+  an all-ASCII chunk first. Every decode writes at most `STORE_SLACK` (16) bytes
+  past the length it returns; `DecodeToUtf16` nothing past n units. The NEON
+  planes are built once per page, found by `CodePageTable::index`, so a table is
+  always one `FindCodePage` returned. `make bench-code-page` measures it against
+  today's UTF-16 path; `make test-code-page` / `test-code-page-portable` run on
+  every PR (NEON, SSE2, SWAR).
+
 ---
 
 ## End-to-end: `SELECT … FROM mssql.dbo.t WHERE id = 1`

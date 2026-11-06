@@ -1,0 +1,928 @@
+// SQL Server code pages (spec 091): the decode kernel and the lookups over the
+// generated tables. See codec/code_page/code_page.hpp for the contract.
+
+#include "codec/code_page/code_page.hpp"
+
+#include <cstring>
+#include <vector>
+
+// MSSQL_CODE_PAGE_PORTABLE forces the 8-byte SWAR form, so the tests can run it on a host
+// that would otherwise take SSE2 or NEON. NEON means AArch64's: the kernels use vqtbx4q,
+// vmaxvq and vld1q_u8_x4, which 32-bit ARM (where __ARM_NEON is defined too) does not have.
+#if defined(MSSQL_CODE_PAGE_PORTABLE)
+#elif defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>
+#define MSSQL_CODE_PAGE_SSE2 1
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#define MSSQL_CODE_PAGE_NEON 1
+#endif
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define MSSQL_CODE_PAGE_ALWAYS_INLINE __forceinline
+#else
+#define MSSQL_CODE_PAGE_ALWAYS_INLINE inline __attribute__((always_inline))
+#endif
+
+// The packed table entries are stored with a 4-byte memcpy that must lay the UTF-8 bytes
+// down first, which is a little-endian layout. Every platform the extension builds for is.
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "codec/code_page assumes a little-endian target"
+#endif
+
+namespace duckdb {
+namespace mssql {
+namespace codec {
+namespace code_page {
+
+namespace {
+
+constexpr size_t BLOCK = 16;
+
+#if !defined(MSSQL_CODE_PAGE_SSE2) && !defined(MSSQL_CODE_PAGE_NEON)
+//! The top bit of every byte of a 64-bit word: the SWAR test for a byte >= 0x80.
+constexpr uint64_t HIGH_BITS = 0x8080808080808080ull;
+#endif
+
+inline unsigned CountTrailingZeros(uint64_t v) {
+#if defined(_MSC_VER) && !defined(__clang__)
+	unsigned long index;
+	_BitScanForward64(&index, v);
+	return static_cast<unsigned>(index);
+#else
+	return static_cast<unsigned>(__builtin_ctzll(v));
+#endif
+}
+
+//! The index of the first byte >= 0x80 among the first `limit` (<= 16) bytes at p,
+//! or `limit` when there is none. Reads 16 bytes: the caller guarantees they exist.
+inline size_t FirstHighByte(const uint8_t *p, size_t limit) {
+#if defined(MSSQL_CODE_PAGE_SSE2)
+	uint32_t mask = static_cast<uint32_t>(_mm_movemask_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p))));
+	if (limit < BLOCK) {
+		mask &= (1u << limit) - 1u;
+	}
+	return mask ? CountTrailingZeros(mask) : limit;
+#elif defined(MSSQL_CODE_PAGE_NEON)
+	// 0xFF for every byte with its top bit set, then four bits per byte (the shrn trick).
+	const uint8x16_t high = vreinterpretq_u8_s8(vshrq_n_s8(vreinterpretq_s8_u8(vld1q_u8(p)), 7));
+	uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(high), 4)), 0);
+	if (limit < BLOCK) {
+		mask &= (uint64_t(1) << (limit * 4)) - 1u;
+	}
+	return mask ? CountTrailingZeros(mask) / 4 : limit;
+#else
+	uint64_t w0, w1;
+	memcpy(&w0, p, 8);
+	memcpy(&w1, p + 8, 8);
+	uint64_t m0 = w0 & HIGH_BITS, m1 = w1 & HIGH_BITS;
+	if (limit < 8) {
+		m0 &= (uint64_t(1) << (limit * 8)) - 1u;
+		m1 = 0;
+	} else if (limit < BLOCK) {
+		m1 &= (uint64_t(1) << ((limit - 8) * 8)) - 1u;
+	}
+	if (m0) {
+		return CountTrailingZeros(m0) / 8;
+	}
+	return m1 ? 8 + CountTrailingZeros(m1) / 8 : limit;
+#endif
+}
+
+//! The index of the first byte >= 0x80 among n bytes, or n.
+inline size_t FirstNonAscii(const uint8_t *p, size_t n) {
+	size_t i = 0;
+	for (; i + BLOCK <= n; i += BLOCK) {
+		const size_t k = FirstHighByte(p + i, BLOCK);
+		if (k < BLOCK) {
+			return i + k;
+		}
+	}
+	for (; i < n && p[i] < 0x80; i++) {
+	}
+	return i;
+}
+
+inline void Copy16(char *d, const uint8_t *s) {
+#if defined(MSSQL_CODE_PAGE_SSE2)
+	_mm_storeu_si128(reinterpret_cast<__m128i *>(d), _mm_loadu_si128(reinterpret_cast<const __m128i *>(s)));
+#elif defined(MSSQL_CODE_PAGE_NEON)
+	vst1q_u8(reinterpret_cast<uint8_t *>(d), vld1q_u8(s));
+#else
+	memcpy(d, s, BLOCK);
+#endif
+}
+
+//! UTF-8 of a BMP code point that is not a surrogate (the generator refuses those).
+inline size_t EncodeBmp(uint32_t cp, char *d) {
+	if (cp < 0x80) {
+		d[0] = static_cast<char>(cp);
+		return 1;
+	}
+	if (cp < 0x800) {
+		d[0] = static_cast<char>(0xC0 | (cp >> 6));
+		d[1] = static_cast<char>(0x80 | (cp & 0x3F));
+		return 2;
+	}
+	d[0] = static_cast<char>(0xE0 | (cp >> 12));
+	d[1] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+	d[2] = static_cast<char>(0x80 | (cp & 0x3F));
+	return 3;
+}
+
+inline size_t Utf8LengthBmp(uint32_t cp) {
+	return cp < 0x80 ? 1 : (cp < 0x800 ? 2 : 3);
+}
+
+//! Decode [p, end) into d; reads stay below `readable` (>= end), which lets a short value
+//! take the 16-byte path by reading into whatever follows it. Returns the new output end;
+//! writes at most STORE_SLACK bytes past it (16: a block copied whole before a lead byte
+//! that ends its value, which then reads as nothing).
+//!
+//! The loop alternates two modes. In the block mode an ASCII run moves 16 bytes per step
+//! (the store copies the whole block; only the ASCII prefix counts, the rest is
+//! overwritten). At the first byte >= 0x80 it drops into the table mode, which reads one
+//! byte (or a double-byte pair) per step and writes its UTF-8 with one 4-byte store, and
+//! returns to the block mode at the next ASCII byte.
+template <bool DOUBLE_BYTE>
+inline char *DecodeRun(const CodePageTable &page, const uint8_t *p, const uint8_t *end, const uint8_t *readable,
+					   char *d) {
+	const uint32_t *single = page.single;
+	while (p < end) {
+		if (static_cast<size_t>(readable - p) >= BLOCK) {
+			const size_t remaining = static_cast<size_t>(end - p);
+			const size_t limit = remaining < BLOCK ? remaining : BLOCK;
+			const size_t ascii = FirstHighByte(p, limit);
+			Copy16(d, p);
+			p += ascii;
+			d += ascii;
+			if (ascii == limit) {
+				continue;
+			}
+		} else if (*p < 0x80) {
+			*d++ = static_cast<char>(*p++);
+			continue;
+		}
+		// p is at a byte >= 0x80.
+		do {
+			const uint8_t b = *p;
+			if (DOUBLE_BYTE) {
+				const uint8_t row = page.lead_row[b];
+				if (row) {
+					if (p + 1 >= end) {
+						// A lead byte that ends its value: the server reads it as nothing.
+						return d;
+					}
+					const uint8_t trail = p[1];
+					const uint32_t cp = page.pairs[static_cast<size_t>(row - 1) * 256 + trail];
+					// A 0x00 after a lead byte is not consumed: it reads on its own next.
+					p += trail ? 2 : 1;
+					d += EncodeBmp(cp, d);
+					continue;
+				}
+			}
+			const uint32_t packed = single[b];
+			memcpy(d, &packed, sizeof(packed));
+			d += packed >> 24;
+			++p;
+		} while (p < end && *p >= 0x80);
+	}
+	return d;
+}
+
+template <bool DOUBLE_BYTE>
+size_t DecodeValuesImpl(const CodePageTable &page, const uint8_t *src, size_t src_size, const uint32_t *offsets,
+						const uint32_t *lengths, size_t count, char *dst, uint64_t *out_offsets,
+						uint32_t *out_lengths) {
+	const uint8_t *readable = src + src_size;
+	char *d = dst;
+	for (size_t i = 0; i < count; i++) {
+		const uint8_t *p = src + offsets[i];
+		char *start = d;
+		d = DecodeRun<DOUBLE_BYTE>(page, p, p + lengths[i], readable, d);
+		out_offsets[i] = static_cast<uint64_t>(start - dst);
+		out_lengths[i] = static_cast<uint32_t>(d - start);
+	}
+	return static_cast<size_t>(d - dst);
+}
+
+#if defined(MSSQL_CODE_PAGE_NEON)
+//! A page prepared for the NEON kernels. Each plane holds one byte of the entries of
+//! 0x80-0xFF as two 64-entry halves, 0x80-0xBF and 0xC0-0xFF, so one vqtbx4q covers a half:
+//!   first / second / third: the UTF-8 bytes a byte reads as (DecodeToUtf8, DecodeValues);
+//!   unit_low / unit_high: the bytes of its UTF-16 code unit (DecodeToUtf16).
+//! Built once per page, on first use (PlanesFor).
+struct NeonPlanes {
+	uint8x16x4_t first_lo, first_hi, second_lo, second_hi, third_lo, third_hi;
+	uint8x16x4_t unit_low_lo, unit_low_hi, unit_high_lo, unit_high_hi;
+	//! The page's longest run of bytes [run_lo, run_lo + run_span] whose code points are
+	//! byte + delta, all below U+0800 (1251: C0-FF -> U+0410-U+044F; 1252: A0-FF ->
+	//! U+00A0-U+00FF). A block whose non-ASCII bytes all lie in it needs no lookup: its
+	//! UTF-8 is arithmetic on the bytes. run_span 0 = no usable run.
+	uint8_t run_lo = 0, run_span = 0, delta_low6 = 0, delta_high = 0;
+};
+
+//! simdutf's compaction for UTF-16 -> UTF-8 applied to code pages: 8 characters interleaved
+//! as (first, second) byte pairs, and a mask of which ones have a second byte; the shuffle
+//! keeps each first byte and the second bytes the mask names. 256 x 16 bytes, built once.
+struct Compaction {
+	uint8_t shuffle[256][16];
+	uint8_t length[256];
+	Compaction() {
+		for (unsigned m = 0; m < 256; m++) {
+			unsigned k = 0;
+			for (unsigned i = 0; i < 8; i++) {
+				shuffle[m][k++] = static_cast<uint8_t>(2 * i);
+				if (m & (1u << i)) {
+					shuffle[m][k++] = static_cast<uint8_t>(2 * i + 1);
+				}
+			}
+			length[m] = static_cast<uint8_t>(k);
+			for (; k < 16; k++) {
+				shuffle[m][k] = 0xFF;
+			}
+		}
+	}
+};
+
+const Compaction &GetCompaction() {
+	static const Compaction compaction;
+	return compaction;
+}
+
+//! simdutf's 1/2/3-byte compaction: 4 characters as 32-bit lanes [b0 b1 b2 0] and a 2-bit
+//! length code per character (0, 1, 2 = 1, 2, 3 bytes); the shuffle keeps each lane's
+//! first 1-3 bytes. 256 x 16 bytes, built once.
+struct Compaction3 {
+	uint8_t shuffle[256][16];
+	uint8_t length[256];
+	Compaction3() {
+		for (unsigned m = 0; m < 256; m++) {
+			unsigned k = 0;
+			for (unsigned lane = 0; lane < 4; lane++) {
+				const unsigned code = (m >> (2 * lane)) & 3u;
+				const unsigned bytes = code == 3 ? 3 : code + 1;
+				for (unsigned b = 0; b < bytes; b++) {
+					shuffle[m][k++] = static_cast<uint8_t>(4 * lane + b);
+				}
+			}
+			length[m] = static_cast<uint8_t>(k);
+			for (; k < 16; k++) {
+				shuffle[m][k] = 0xFF;
+			}
+		}
+	}
+};
+
+const Compaction3 &GetCompaction3() {
+	static const Compaction3 compaction;
+	return compaction;
+}
+
+NeonPlanes BuildPlanes(const CodePageTable &page) {
+	uint8_t first[128], second[128], third[128], unit_low[128], unit_high[128];
+	for (size_t b = 0; b < 128; b++) {
+		const uint32_t packed = page.single[0x80 + b];
+		first[b] = static_cast<uint8_t>(packed & 0xFF);
+		second[b] = static_cast<uint8_t>((packed >> 8) & 0xFF);
+		third[b] = static_cast<uint8_t>((packed >> 16) & 0xFF);
+		unit_low[b] = static_cast<uint8_t>(page.single16[0x80 + b] & 0xFF);
+		unit_high[b] = static_cast<uint8_t>(page.single16[0x80 + b] >> 8);
+	}
+	NeonPlanes planes;
+	// The longest run with one delta >= 0 and every code point below U+0800 (2-byte UTF-8).
+	unsigned best_lo = 0, best_len = 0, best_delta = 0;
+	for (unsigned lo = 0x80; lo < 0x100;) {
+		const int delta = static_cast<int>(page.single16[lo]) - static_cast<int>(lo);
+		unsigned hi = lo;
+		while (hi + 1 < 0x100 && static_cast<int>(page.single16[hi + 1]) - static_cast<int>(hi + 1) == delta) {
+			hi++;
+		}
+		const unsigned len = hi - lo + 1;
+		if (delta >= 0 && page.single16[hi] < 0x800 && page.single16[lo] >= 0x80 && len > best_len) {
+			best_lo = lo;
+			best_len = len;
+			best_delta = static_cast<unsigned>(delta);
+		}
+		lo = hi + 1;
+	}
+	if (best_len >= 16) {
+		planes.run_lo = static_cast<uint8_t>(best_lo);
+		planes.run_span = static_cast<uint8_t>(best_len - 1);
+		planes.delta_low6 = static_cast<uint8_t>(best_delta & 0x3F);
+		planes.delta_high = static_cast<uint8_t>(best_delta >> 6);
+	}
+	planes.first_lo = vld1q_u8_x4(first);
+	planes.first_hi = vld1q_u8_x4(first + 64);
+	planes.second_lo = vld1q_u8_x4(second);
+	planes.second_hi = vld1q_u8_x4(second + 64);
+	planes.third_lo = vld1q_u8_x4(third);
+	planes.third_hi = vld1q_u8_x4(third + 64);
+	planes.unit_low_lo = vld1q_u8_x4(unit_low);
+	planes.unit_low_hi = vld1q_u8_x4(unit_low + 64);
+	planes.unit_high_lo = vld1q_u8_x4(unit_high);
+	planes.unit_high_hi = vld1q_u8_x4(unit_high + 64);
+	return planes;
+}
+
+std::vector<NeonPlanes> BuildAllPlanes() {
+	std::vector<NeonPlanes> planes;
+	planes.reserve(tables::CODE_PAGE_COUNT);
+	for (size_t i = 0; i < tables::CODE_PAGE_COUNT; i++) {
+		planes.push_back(BuildPlanes(tables::CODE_PAGES[i]));
+	}
+	return planes;
+}
+
+//! The planes of a page, found by its position in tables::CODE_PAGES (CodePageTable::index),
+//! so the page must be one FindCodePage returned. Built for every page on the first call; a
+//! function-local static, so two threads calling first build them once.
+const NeonPlanes &PlanesFor(const CodePageTable &page) {
+	static const std::vector<NeonPlanes> planes = BuildAllPlanes();
+	return planes[page.index];
+}
+
+const uint8_t LANE_BITS[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+//! Lane k of each 4-character group weighted 4^k: Block3's length codes summed per group.
+const uint8_t GROUP_WEIGHTS[16] = {1, 4, 16, 64, 1, 4, 16, 64, 1, 4, 16, 64, 1, 4, 16, 64};
+
+//! What the NEON single-byte kernel reads on every block, set up once per DecodeToUtf8 /
+//! DecodeValues call rather than per value: the page's planes, the two compaction tables
+//! and the vector constants.
+struct NeonKernel {
+	explicit NeonKernel(const CodePageTable &page)
+		: planes(PlanesFor(page)),
+		  compaction(GetCompaction()),
+		  compaction3(GetCompaction3()),
+		  single(page.single),
+		  has_run(planes.run_span != 0),
+		  k80(vdupq_n_u8(0x80)),
+		  kc0(vdupq_n_u8(0xC0)),
+		  ke0(vdupq_n_u8(0xE0)),
+		  k3f(vdupq_n_u8(0x3F)),
+		  zero(vdupq_n_u8(0)),
+		  run_lo(vdupq_n_u8(planes.run_lo)),
+		  run_span(vdupq_n_u8(planes.run_span)),
+		  run_low6(vdupq_n_u8(planes.delta_low6)),
+		  run_lead(vdupq_n_u8(static_cast<uint8_t>(0xC0 + planes.delta_high))),
+		  weights(vld1q_u8(GROUP_WEIGHTS)),
+		  lane_bits(vld1_u8(LANE_BITS)),
+		  lane_bits16(vcombine_u8(vld1_u8(LANE_BITS), vld1_u8(LANE_BITS))),
+		  run_wraps(has_run && static_cast<unsigned>(planes.run_lo) + planes.run_span == 0xFF),
+		  wrap_span(vdupq_n_u8(static_cast<uint8_t>(0x17F - planes.run_lo))),
+		  window(run_wraps && planes.run_lo <= 0xC0) {}
+	const NeonPlanes &planes;
+	const Compaction &compaction;
+	const Compaction3 &compaction3;
+	const uint32_t *single;
+	const bool has_run;
+	const uint8x16_t k80, kc0, ke0, k3f, zero;
+	//! The page's run (NeonPlanes::run_lo / run_span), and RunPlanes' addends.
+	const uint8x16_t run_lo, run_span, run_low6, run_lead;
+	const uint8x16_t weights;
+	const uint8x8_t lane_bits;
+	const uint8x16_t lane_bits16;
+	//! A run that ends at 0xFF (1251 C0-FF, 1252 A0-FF): with ASCII it is one cyclic
+	//! interval [run_lo, 0x7F], so "ASCII or in the run" is (byte - run_lo) <= 0x17F - run_lo.
+	const bool run_wraps;
+	const uint8x16_t wrap_span;
+	//! The run covers C0-FF too (1251, 1252), so every byte outside it lies in 80-BF: one
+	//! 64-entry lookup per plane, with the run's arithmetic as vqtbx's default, decodes any
+	//! block. No byte needs the C0-FF half of the tables.
+	const bool window;
+};
+
+//! The four 8-lane masks of two blocks (lanes 0x00 / 0xFF) at once: weights, then three
+//! pairwise adds, then one lane move. Mask k is byte k of the result.
+inline uint32_t Masks4(const NeonKernel &k, uint8x16_t t0, uint8x16_t t1) {
+	const uint8x16_t p = vpaddq_u8(vandq_u8(t0, k.lane_bits16), vandq_u8(t1, k.lane_bits16));
+	const uint8x16_t q = vpaddq_u8(p, p);
+	return vgetq_lane_u32(vreinterpretq_u32_u8(vpaddq_u8(q, q)), 0);
+}
+
+//! One bit per lane of 8 lanes that are each 0x00 or 0xFF.
+inline unsigned Mask8(const NeonKernel &k, uint8x8_t lanes) {
+	return vaddv_u8(vand_u8(lanes, k.lane_bits));
+}
+
+//! The UTF-8 first / second byte planes of a block whose non-ASCII bytes all lie in the
+//! page's run: code point = byte + delta < U+0800, so
+//!   second = 0x80 | ((byte + delta) & 0x3F)
+//!   first  = 0xC0 + (byte >> 6) + (delta >> 6) + carry, carry = ((byte & 0x3F) + (delta & 0x3F)) >> 6
+//! (byte arithmetic mod 256 is exact for the low six bits). ASCII bytes keep themselves as
+//! the first byte; their second byte is never stored.
+inline void RunPlanes(const NeonKernel &k, uint8x16_t v, uint8x16_t ascii, uint8x16_t &first, uint8x16_t &second) {
+	const uint8x16_t low = vaddq_u8(vandq_u8(v, k.k3f), k.run_low6);  // <= 126
+	// (low & 0x3F) | 0x80 in one bit select; run_lead + (byte >> 6) + (low >> 6) in two
+	// shift-right-and-accumulates.
+	second = vbslq_u8(k.k3f, low, k.k80);
+	const uint8x16_t high = vsraq_n_u8(vsraq_n_u8(k.run_lead, v, 6), low, 6);
+	first = vbslq_u8(ascii, v, high);
+}
+
+//! A block that holds a 3-byte character (U+0800-U+FFFF: the euro sign, the dashes, quotes
+//! and ellipsis of 0x80-0x9F, Thai): three byte planes, each character's length code from
+//! its first byte, and four 4-character groups of 32-bit lanes [b0 b1 b2 0] packed through
+//! Compaction3 (simdutf's 1/2/3-byte packing). `first` is the block's first-byte plane,
+//! already looked up with the table indices i0 / i1. (Packing a half with no 3-byte
+//! character the cheaper 1/2-byte way was measured: no faster, the branch costs what the
+//! shuffle saves.) Writes at most 12 bytes past the returned end.
+//! Pack a block of 1/2-byte characters given its two byte planes: two halves of 8, each
+//! through Compaction by the mask of its 2-byte leads.
+inline char *Pack2(const NeonKernel &k, uint8x16_t first, uint8x16_t second, char *d) {
+	const uint8x16_t multi = vcgeq_u8(first, k.kc0);
+	const unsigned lo = Mask8(k, vget_low_u8(multi)), hi = Mask8(k, vget_high_u8(multi));
+	vst1q_u8(reinterpret_cast<uint8_t *>(d), vqtbl1q_u8(vzip1q_u8(first, second), vld1q_u8(k.compaction.shuffle[lo])));
+	d += k.compaction.length[lo];
+	vst1q_u8(reinterpret_cast<uint8_t *>(d), vqtbl1q_u8(vzip2q_u8(first, second), vld1q_u8(k.compaction.shuffle[hi])));
+	return d + k.compaction.length[hi];
+}
+
+//! Pack a block of 1/2/3-byte characters given its three byte planes: a length code per
+//! character from its first byte, four 4-character groups of 32-bit lanes [b0 b1 b2 0],
+//! each through Compaction3. Writes at most 12 bytes past the returned end.
+inline char *Pack3(const NeonKernel &k, uint8x16_t first, uint8x16_t second, uint8x16_t third, char *d) {
+	// Length code 0 / 1 / 2 (a 2- or 3-byte lead counts once, a 3-byte one twice), lane k of
+	// a group weighted 4^k, summed pairwise: one index byte per group, out in one lane move.
+	const uint8x16_t multi = vcgeq_u8(first, k.kc0);
+	const uint8x16_t three = vcgeq_u8(first, k.ke0);
+	const uint8x16_t code = vsubq_u8(k.zero, vaddq_u8(multi, three));  // each 0xFF counts 1
+	const uint8x16_t weighted = vmulq_u8(code, k.weights);
+	const uint8x16_t pair = vpaddq_u8(weighted, weighted);
+	const uint32_t index = vgetq_lane_u32(vreinterpretq_u32_u8(vpaddq_u8(pair, pair)), 0);
+	const uint8x16_t fs_lo = vzip1q_u8(first, second), fs_hi = vzip2q_u8(first, second);
+	const uint8x16_t t_lo = vzip1q_u8(third, k.zero), t_hi = vzip2q_u8(third, k.zero);
+	const uint8x16_t groups[4] = {
+		vreinterpretq_u8_u16(vzip1q_u16(vreinterpretq_u16_u8(fs_lo), vreinterpretq_u16_u8(t_lo))),
+		vreinterpretq_u8_u16(vzip2q_u16(vreinterpretq_u16_u8(fs_lo), vreinterpretq_u16_u8(t_lo))),
+		vreinterpretq_u8_u16(vzip1q_u16(vreinterpretq_u16_u8(fs_hi), vreinterpretq_u16_u8(t_hi))),
+		vreinterpretq_u8_u16(vzip2q_u16(vreinterpretq_u16_u8(fs_hi), vreinterpretq_u16_u8(t_hi)))};
+	for (unsigned g = 0; g < 4; g++) {
+		const unsigned m = (index >> (8 * g)) & 0xFF;
+		vst1q_u8(reinterpret_cast<uint8_t *>(d), vqtbl1q_u8(groups[g], vld1q_u8(k.compaction3.shuffle[m])));
+		d += k.compaction3.length[m];
+	}
+	return d;
+}
+
+inline char *Block3(const NeonKernel &k, uint8x16_t i0, uint8x16_t i1, uint8x16_t first, char *d) {
+	const NeonPlanes &planes = k.planes;
+	const uint8x16_t second = vqtbx4q_u8(vqtbx4q_u8(k.zero, planes.second_lo, i0), planes.second_hi, i1);
+	const uint8x16_t third = vqtbx4q_u8(vqtbx4q_u8(k.zero, planes.third_lo, i0), planes.third_hi, i1);
+	return Pack3(k, first, second, third, d);
+}
+
+//! The NEON kernel for a single-byte page over [p, end): 32 bytes a step (two 16-byte
+//! blocks, two independent lookup chains, so the table lookups overlap), then one 16-byte
+//! block, then byte by byte from the table. A step takes the first tier that holds:
+//!   all ASCII                        -> the bytes are their UTF-8: stored as they are;
+//!   every non-ASCII byte in the run  -> first / second UTF-8 byte by arithmetic (RunPlanes);
+//!   every character <= 2 bytes       -> first / second byte planes by vqtbx4q;
+//!   a 3-byte character               -> Block3 for each block (Compaction3).
+//! The second and third tiers interleave the two planes and pack 8 characters a store by
+//! Compaction's shuffle. Returns the new output end; writes at most 12 bytes past it.
+//!
+//! Inlined into both callers: the NeonKernel is then a local whose address does not escape,
+//! so its constants stay in registers across DecodeValues' loop instead of being reloaded
+//! after every store through `d` (a char store may alias anything). Measured 3-5% on
+//! DecodeValues over 20-60 byte values.
+MSSQL_CODE_PAGE_ALWAYS_INLINE char *DecodeNeon(const NeonKernel &k, const uint8_t *p, const uint8_t *end, char *d) {
+	const NeonPlanes &planes = k.planes;
+	const Compaction &compaction = k.compaction;
+	while (static_cast<size_t>(end - p) >= 2 * BLOCK) {
+		const uint8x16_t v0 = vld1q_u8(p), v1 = vld1q_u8(p + BLOCK);
+		if (vmaxvq_u8(vorrq_u8(v0, v1)) < 0x80) {
+			vst1q_u8(reinterpret_cast<uint8_t *>(d), v0);
+			vst1q_u8(reinterpret_cast<uint8_t *>(d + BLOCK), v1);
+			p += 2 * BLOCK;
+			d += 2 * BLOCK;
+			continue;
+		}
+		uint8x16_t f0, f1, s0, s1;
+		uint32_t masks;
+		const uint8x16_t ascii0 = vcltq_u8(v0, k.k80), ascii1 = vcltq_u8(v1, k.k80);
+		uint8x16_t in0, in1;
+		if (k.run_wraps) {
+			in0 = vcleq_u8(vsubq_u8(v0, k.run_lo), k.wrap_span);
+			in1 = vcleq_u8(vsubq_u8(v1, k.run_lo), k.wrap_span);
+		} else {
+			in0 = vorrq_u8(ascii0, vcleq_u8(vsubq_u8(v0, k.run_lo), k.run_span));
+			in1 = vorrq_u8(ascii1, vcleq_u8(vsubq_u8(v1, k.run_lo), k.run_span));
+		}
+		if (k.has_run && vminvq_u8(vandq_u8(in0, in1)) == 0xFF) {
+			// Every non-ASCII byte is in the run: arithmetic, no lookup. Every non-ASCII lane
+			// is 2-byte, so the masks are the ASCII masks inverted, in the scalar register.
+			RunPlanes(k, v0, ascii0, f0, s0);
+			RunPlanes(k, v1, ascii1, f1, s1);
+			masks = ~Masks4(k, ascii0, ascii1);
+		} else if (k.window) {
+			// Bytes 80-BF from the 64-entry half of the tables, everything else keeps the
+			// run's arithmetic (an ASCII or run byte indexes past 64, so vqtbx keeps it).
+			RunPlanes(k, v0, ascii0, f0, s0);
+			RunPlanes(k, v1, ascii1, f1, s1);
+			const uint8x16_t w0 = vsubq_u8(v0, k.k80), w1 = vsubq_u8(v1, k.k80);
+			f0 = vqtbx4q_u8(f0, planes.first_lo, w0);
+			f1 = vqtbx4q_u8(f1, planes.first_lo, w1);
+			s0 = vqtbx4q_u8(s0, planes.second_lo, w0);
+			s1 = vqtbx4q_u8(s1, planes.second_lo, w1);
+			if (vmaxvq_u8(vmaxq_u8(f0, f1)) >= 0xE0) {
+				// Only the block that holds a 3-byte character takes the 1/2/3-byte packing.
+				d = vmaxvq_u8(f0) >= 0xE0 ? Pack3(k, f0, s0, vqtbx4q_u8(k.zero, planes.third_lo, w0), d)
+										  : Pack2(k, f0, s0, d);
+				d = vmaxvq_u8(f1) >= 0xE0 ? Pack3(k, f1, s1, vqtbx4q_u8(k.zero, planes.third_lo, w1), d)
+										  : Pack2(k, f1, s1, d);
+				p += 2 * BLOCK;
+				continue;
+			}
+			masks = Masks4(k, vcgeq_u8(f0, k.kc0), vcgeq_u8(f1, k.kc0));
+		} else {
+			const uint8x16_t a0 = vsubq_u8(v0, k.k80), a1 = vsubq_u8(v0, k.kc0);
+			const uint8x16_t b0 = vsubq_u8(v1, k.k80), b1 = vsubq_u8(v1, k.kc0);
+			f0 = vqtbx4q_u8(vqtbx4q_u8(v0, planes.first_lo, a0), planes.first_hi, a1);
+			f1 = vqtbx4q_u8(vqtbx4q_u8(v1, planes.first_lo, b0), planes.first_hi, b1);
+			if (vmaxvq_u8(vmaxq_u8(f0, f1)) >= 0xE0) {
+				d = Block3(k, a0, a1, f0, d);
+				d = Block3(k, b0, b1, f1, d);
+				p += 2 * BLOCK;
+				continue;
+			}
+			s0 = vqtbx4q_u8(vqtbx4q_u8(k.zero, planes.second_lo, a0), planes.second_hi, a1);
+			s1 = vqtbx4q_u8(vqtbx4q_u8(k.zero, planes.second_lo, b0), planes.second_hi, b1);
+			masks = Masks4(k, vcgeq_u8(f0, k.kc0), vcgeq_u8(f1, k.kc0));
+		}
+		const unsigned m0 = masks & 0xFF, m1 = (masks >> 8) & 0xFF;
+		const unsigned m2 = (masks >> 16) & 0xFF, m3 = masks >> 24;
+		const size_t l0 = compaction.length[m0], l1 = compaction.length[m1], l2 = compaction.length[m2];
+		vst1q_u8(reinterpret_cast<uint8_t *>(d), vqtbl1q_u8(vzip1q_u8(f0, s0), vld1q_u8(compaction.shuffle[m0])));
+		vst1q_u8(reinterpret_cast<uint8_t *>(d + l0), vqtbl1q_u8(vzip2q_u8(f0, s0), vld1q_u8(compaction.shuffle[m1])));
+		vst1q_u8(reinterpret_cast<uint8_t *>(d + l0 + l1),
+				 vqtbl1q_u8(vzip1q_u8(f1, s1), vld1q_u8(compaction.shuffle[m2])));
+		vst1q_u8(reinterpret_cast<uint8_t *>(d + l0 + l1 + l2),
+				 vqtbl1q_u8(vzip2q_u8(f1, s1), vld1q_u8(compaction.shuffle[m3])));
+		d += l0 + l1 + l2 + compaction.length[m3];
+		p += 2 * BLOCK;
+	}
+	if (static_cast<size_t>(end - p) >= BLOCK) {
+		const uint8x16_t v = vld1q_u8(p);
+		p += BLOCK;
+		if (vmaxvq_u8(v) < 0x80) {
+			vst1q_u8(reinterpret_cast<uint8_t *>(d), v);
+			d += BLOCK;
+		} else {
+			const uint8x16_t i0 = vsubq_u8(v, k.k80), i1 = vsubq_u8(v, k.kc0);
+			const uint8x16_t first = vqtbx4q_u8(vqtbx4q_u8(v, planes.first_lo, i0), planes.first_hi, i1);
+			if (vmaxvq_u8(first) >= 0xE0) {
+				d = Block3(k, i0, i1, first, d);
+			} else {
+				const uint8x16_t second = vqtbx4q_u8(vqtbx4q_u8(k.zero, planes.second_lo, i0), planes.second_hi, i1);
+				const uint8x16_t two = vcgeq_u8(first, k.kc0);	// a 2-byte lead
+				const unsigned m_lo = Mask8(k, vget_low_u8(two)), m_hi = Mask8(k, vget_high_u8(two));
+				vst1q_u8(reinterpret_cast<uint8_t *>(d),
+						 vqtbl1q_u8(vzip1q_u8(first, second), vld1q_u8(compaction.shuffle[m_lo])));
+				d += compaction.length[m_lo];
+				vst1q_u8(reinterpret_cast<uint8_t *>(d),
+						 vqtbl1q_u8(vzip2q_u8(first, second), vld1q_u8(compaction.shuffle[m_hi])));
+				d += compaction.length[m_hi];
+			}
+		}
+	}
+	for (; p < end; ++p) {
+		const uint32_t packed = k.single[*p];
+		memcpy(d, &packed, sizeof(packed));
+		d += packed >> 24;
+	}
+	return d;
+}
+
+//! A value this long goes through the NEON kernel in DecodeValues: one 32-byte step at
+//! least. A shorter one takes DecodeRun, whose 16-byte ASCII step may read ahead into the
+//! next value, where the NEON kernel would finish it byte by byte.
+constexpr size_t NEON_MIN_VALUE = 2 * BLOCK;
+
+size_t DecodeValuesSingleByteNeon(const CodePageTable &page, const uint8_t *src, size_t src_size,
+								  const uint32_t *offsets, const uint32_t *lengths, size_t count, char *dst,
+								  uint64_t *out_offsets, uint32_t *out_lengths) {
+	const NeonKernel kernel(page);
+	const uint8_t *readable = src + src_size;
+	char *d = dst;
+	for (size_t i = 0; i < count; i++) {
+		const uint8_t *p = src + offsets[i];
+		const uint8_t *end = p + lengths[i];
+		char *start = d;
+		d = lengths[i] >= NEON_MIN_VALUE ? DecodeNeon(kernel, p, end, d) : DecodeRun<false>(page, p, end, readable, d);
+		out_offsets[i] = static_cast<uint64_t>(start - dst);
+		out_lengths[i] = static_cast<uint32_t>(d - start);
+	}
+	return static_cast<size_t>(d - dst);
+}
+#endif
+
+//! True when none of the 64 bytes at p has its top bit set; copies them to d either way.
+inline bool CopyAscii64(char *d, const uint8_t *p) {
+#if defined(MSSQL_CODE_PAGE_SSE2)
+	const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p));
+	const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p + 16));
+	const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p + 32));
+	const __m128i e = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p + 48));
+	_mm_storeu_si128(reinterpret_cast<__m128i *>(d), a);
+	_mm_storeu_si128(reinterpret_cast<__m128i *>(d + 16), b);
+	_mm_storeu_si128(reinterpret_cast<__m128i *>(d + 32), c);
+	_mm_storeu_si128(reinterpret_cast<__m128i *>(d + 48), e);
+	return _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(a, b), _mm_or_si128(c, e))) == 0;
+#elif defined(MSSQL_CODE_PAGE_NEON)
+	const uint8x16x4_t v = vld1q_u8_x4(p);
+	vst1q_u8_x4(reinterpret_cast<uint8_t *>(d), v);
+	const uint8x16_t any = vorrq_u8(vorrq_u8(v.val[0], v.val[1]), vorrq_u8(v.val[2], v.val[3]));
+	return vmaxvq_u8(any) < 0x80;
+#else
+	uint64_t w[8];
+	memcpy(w, p, sizeof(w));
+	memcpy(d, w, sizeof(w));
+	return ((w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) & HIGH_BITS) == 0;
+#endif
+}
+
+//! Widen 16 ASCII bytes to 16 UTF-16 code units (32 bytes) at d.
+inline void Widen16(char16_t *d, const uint8_t *s) {
+#if defined(MSSQL_CODE_PAGE_SSE2)
+	const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s));
+	const __m128i zero = _mm_setzero_si128();
+	_mm_storeu_si128(reinterpret_cast<__m128i *>(d), _mm_unpacklo_epi8(v, zero));
+	_mm_storeu_si128(reinterpret_cast<__m128i *>(d + 8), _mm_unpackhi_epi8(v, zero));
+#elif defined(MSSQL_CODE_PAGE_NEON)
+	const uint8x16_t v = vld1q_u8(s);
+	const uint8x16_t zero = vdupq_n_u8(0);
+	vst1q_u8(reinterpret_cast<uint8_t *>(d), vzip1q_u8(v, zero));
+	vst1q_u8(reinterpret_cast<uint8_t *>(d + 8), vzip2q_u8(v, zero));
+#else
+	for (size_t i = 0; i < BLOCK; i++) {
+		d[i] = static_cast<char16_t>(s[i]);
+	}
+#endif
+}
+
+//! Stage 1 for a single-byte page: exactly one code unit per byte.
+size_t SingleByteToUtf16(const CodePageTable &page, const uint8_t *src, size_t n, char16_t *dst) {
+	const uint16_t *units = page.single16;
+	size_t i = 0;
+#if defined(MSSQL_CODE_PAGE_NEON)
+	// The code unit's low and high byte from the page's planes (built once per page), two
+	// 64-entry lookups per byte. A byte below 0x80 indexes past both (its offsets wrap to
+	// >= 64), so vqtbx keeps it as is: ASCII passes through with no branch.
+	const NeonPlanes &planes = PlanesFor(page);
+	const uint8x16_t k80 = vdupq_n_u8(0x80), kc0 = vdupq_n_u8(0xC0), zero = vdupq_n_u8(0);
+	for (; i + BLOCK <= n; i += BLOCK) {
+		const uint8x16_t v = vld1q_u8(src + i);
+		const uint8x16_t i0 = vsubq_u8(v, k80), i1 = vsubq_u8(v, kc0);
+		const uint8x16_t l = vqtbx4q_u8(vqtbx4q_u8(v, planes.unit_low_lo, i0), planes.unit_low_hi, i1);
+		const uint8x16_t h = vqtbx4q_u8(vqtbx4q_u8(zero, planes.unit_high_lo, i0), planes.unit_high_hi, i1);
+		vst1q_u8(reinterpret_cast<uint8_t *>(dst + i), vzip1q_u8(l, h));
+		vst1q_u8(reinterpret_cast<uint8_t *>(dst + i + 8), vzip2q_u8(l, h));
+	}
+#else
+	// No 128-entry byte shuffle in SSE2: ASCII blocks widen by SIMD, the rest by the table.
+	while (i + BLOCK <= n) {
+		const size_t ascii = FirstHighByte(src + i, BLOCK);
+		if (ascii == BLOCK) {
+			Widen16(dst + i, src + i);
+			i += BLOCK;
+			continue;
+		}
+		const size_t stop = i + BLOCK;
+		for (; i < stop; i++) {
+			dst[i] = static_cast<char16_t>(units[src[i]]);
+		}
+	}
+#endif
+	for (; i < n; i++) {
+		dst[i] = static_cast<char16_t>(units[src[i]]);
+	}
+	return n;
+}
+
+//! Stage 1 for a double-byte page: a pair reads as one code unit, a lead byte that ends the
+//! input as none, a 0x00 after a lead byte on its own. Every unit consumes at least one
+//! byte, so the 16-unit ASCII store at d never reaches past dst + n.
+size_t DoubleByteToUtf16(const CodePageTable &page, const uint8_t *src, size_t n, char16_t *dst) {
+	const uint8_t *p = src;
+	const uint8_t *end = src + n;
+	char16_t *d = dst;
+	while (p < end) {
+		if (static_cast<size_t>(end - p) >= BLOCK) {
+			const size_t ascii = FirstHighByte(p, BLOCK);
+			Widen16(d, p);
+			p += ascii;
+			d += ascii;
+			if (ascii == BLOCK) {
+				continue;
+			}
+		} else if (*p < 0x80) {
+			*d++ = static_cast<char16_t>(*p++);
+			continue;
+		}
+		do {
+			const uint8_t b = *p;
+			const uint8_t row = page.lead_row[b];
+			if (row) {
+				if (p + 1 >= end) {
+					return static_cast<size_t>(d - dst);
+				}
+				const uint8_t trail = p[1];
+				*d++ = static_cast<char16_t>(page.pairs[static_cast<size_t>(row - 1) * 256 + trail]);
+				p += trail ? 2 : 1;
+			} else {
+				*d++ = static_cast<char16_t>(page.single16[b]);
+				++p;
+			}
+		} while (p < end && *p >= 0x80);
+	}
+	return static_cast<size_t>(d - dst);
+}
+
+//! ExactUtf8Length's loop: DecodeRun's, counting instead of storing.
+template <bool DOUBLE_BYTE>
+size_t Utf8LengthImpl(const CodePageTable &page, const uint8_t *src, size_t n) {
+	const uint8_t *p = src;
+	const uint8_t *end = src + n;
+	size_t length = 0;
+	while (p < end) {
+		if (static_cast<size_t>(end - p) >= BLOCK) {
+			const size_t ascii = FirstHighByte(p, BLOCK);
+			p += ascii;
+			length += ascii;
+			if (ascii == BLOCK) {
+				continue;
+			}
+		} else if (*p < 0x80) {
+			++p;
+			++length;
+			continue;
+		}
+		do {
+			const uint8_t b = *p;
+			if (DOUBLE_BYTE) {
+				const uint8_t row = page.lead_row[b];
+				if (row) {
+					if (p + 1 >= end) {
+						return length;
+					}
+					const uint8_t trail = p[1];
+					length += Utf8LengthBmp(page.pairs[static_cast<size_t>(row - 1) * 256 + trail]);
+					p += trail ? 2 : 1;
+					continue;
+				}
+			}
+			length += page.single[b] >> 24;
+			++p;
+		} while (p < end && *p >= 0x80);
+	}
+	return length;
+}
+
+}  // namespace
+
+const CodePageTable *FindCodePage(int32_t code_page) {
+	for (size_t i = 0; i < tables::CODE_PAGE_COUNT; i++) {
+		if (tables::CODE_PAGES[i].code_page == code_page) {
+			return &tables::CODE_PAGES[i];
+		}
+	}
+	return nullptr;
+}
+
+bool IsDoubleByte(const CodePageTable &page) {
+	return page.lead_row != nullptr;
+}
+
+size_t DecodeToUtf8(const CodePageTable &page, const uint8_t *src, size_t n, char *dst) {
+	if (IsDoubleByte(page)) {
+		return static_cast<size_t>(DecodeRun<true>(page, src, src + n, src + n, dst) - dst);
+	}
+#if defined(MSSQL_CODE_PAGE_NEON)
+	const NeonKernel kernel(page);
+	return static_cast<size_t>(DecodeNeon(kernel, src, src + n, dst) - dst);
+#else
+	return static_cast<size_t>(DecodeRun<false>(page, src, src + n, src + n, dst) - dst);
+#endif
+}
+
+size_t CopyAscii(const uint8_t *src, size_t n, char *dst) {
+	size_t i = 0;
+	for (; i + 64 <= n; i += 64) {
+		if (!CopyAscii64(dst + i, src + i)) {
+			// The block was copied whole; report where its first non-ASCII byte is.
+			return i + FirstNonAscii(src + i, 64);
+		}
+	}
+	for (; i < n; i++) {
+		if (src[i] >= 0x80) {
+			return i;
+		}
+		dst[i] = static_cast<char>(src[i]);
+	}
+	return n;
+}
+
+size_t DecodeToUtf16(const CodePageTable &page, const uint8_t *src, size_t n, char16_t *dst) {
+	return IsDoubleByte(page) ? DoubleByteToUtf16(page, src, n, dst) : SingleByteToUtf16(page, src, n, dst);
+}
+
+size_t DecodeValues(const CodePageTable &page, const uint8_t *src, size_t src_size, const uint32_t *offsets,
+					const uint32_t *lengths, size_t count, char *dst, uint64_t *out_offsets, uint32_t *out_lengths) {
+	if (IsDoubleByte(page)) {
+		return DecodeValuesImpl<true>(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
+	}
+#if defined(MSSQL_CODE_PAGE_NEON)
+	return DecodeValuesSingleByteNeon(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
+#else
+	return DecodeValuesImpl<false>(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
+#endif
+}
+
+size_t ExactUtf8Length(const CodePageTable &page, const uint8_t *src, size_t n) {
+	return IsDoubleByte(page) ? Utf8LengthImpl<true>(page, src, n) : Utf8LengthImpl<false>(page, src, n);
+}
+
+const CollationRow *FindCollationById(int32_t collation_id) {
+	size_t lo = 0, hi = tables::COLLATION_COUNT;
+	while (lo < hi) {
+		const size_t mid = lo + (hi - lo) / 2;
+		const int32_t id = tables::COLLATIONS[mid].collation_id;
+		if (id == collation_id) {
+			return &tables::COLLATIONS[mid];
+		}
+		if (id < collation_id) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return nullptr;
+}
+
+namespace {
+
+inline char AsciiLower(char c) {
+	return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+//! <0, 0, >0 comparing a collation name with (name, length), ASCII case-insensitively.
+int CompareName(const char *table_name, const char *name, size_t length) {
+	size_t i = 0;
+	for (; i < length && table_name[i]; i++) {
+		const char a = AsciiLower(table_name[i]), b = AsciiLower(name[i]);
+		if (a != b) {
+			return static_cast<unsigned char>(a) < static_cast<unsigned char>(b) ? -1 : 1;
+		}
+	}
+	if (i == length) {
+		return table_name[i] ? 1 : 0;
+	}
+	return -1;
+}
+
+}  // namespace
+
+const CollationRow *FindCollationByName(const char *name, size_t length) {
+	size_t lo = 0, hi = tables::COLLATION_COUNT;
+	while (lo < hi) {
+		const size_t mid = lo + (hi - lo) / 2;
+		const CollationRow &row = tables::COLLATIONS[tables::COLLATION_BY_NAME[mid]];
+		const int c = CompareName(row.name, name, length);
+		if (c == 0) {
+			return &row;
+		}
+		if (c < 0) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return nullptr;
+}
+
+int32_t CodePageForWireCollation(uint32_t lcid, bool utf8, uint8_t sort_id) {
+	if (sort_id) {
+		return tables::SORT_ID_CODE_PAGE[sort_id];
+	}
+	size_t lo = 0, hi = tables::LCID_CODE_PAGE_COUNT;
+	while (lo < hi) {
+		const size_t mid = lo + (hi - lo) / 2;
+		const tables::LcidCodePage &e = tables::LCID_CODE_PAGES[mid];
+		if (e.lcid == lcid && e.utf8 == utf8) {
+			return static_cast<int32_t>(e.code_page);
+		}
+		if (e.lcid < lcid || (e.lcid == lcid && e.utf8 < utf8)) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return CODE_PAGE_NOT_FOUND;
+}
+
+}  // namespace code_page
+}  // namespace codec
+}  // namespace mssql
+}  // namespace duckdb

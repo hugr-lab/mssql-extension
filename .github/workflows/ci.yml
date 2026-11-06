@@ -342,6 +342,18 @@ jobs:
             test/cpp/test_identity_insert.cpp -o /tmp/test_identity_insert
           /tmp/test_identity_insert
 
+      # Spec 091: the code-page decode kernels against the server's own answers in
+      # tools/code_pages/data/. The module links nothing (no DuckDB, no simdutf), so
+      # it builds here, on every PR, twice: the platform's SIMD form (NEON on the
+      # macOS runner, SSE2 on Linux) and the 8-byte SWAR form, each -std=c++11 as
+      # the extension builds. The Makefile `include`s extension-ci-tools, hence the
+      # one shallow submodule (the build job's test-cpp-run step does the same).
+      - name: Build + run code-page kernel unit tests (spec 091)
+        run: |
+          git submodule update --init --depth 1 extension-ci-tools
+          make test-code-page
+          make test-code-page-portable
+
   # ============================================================================
   # Windows SSPI Unit Test - ungated, like cpp-unit-tests above.
   #

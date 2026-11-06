@@ -140,6 +140,9 @@ set(EXTENSION_SOURCES
     src/codec/binary_codec.cpp
     src/codec/datetime_codec.cpp
     src/codec/uuid_codec.cpp
+    # SQL Server code pages (spec 091): the server-generated tables and the decode kernels.
+    src/codec/code_page/code_page.cpp
+    src/codec/code_page/code_page_tables.cpp
     # TDS protocol layer (pure C++, no DuckDB dependencies)
     src/tds/tds_types.cpp
     src/tds/tds_packet.cpp
