@@ -354,7 +354,11 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
        1251 text with dense typography (0.9-1.35x, by the text: the kernel's own branches). On
        x86-64 the AVX2 and AVX-512 kernels record the same masks (AVX-512: its 64-bit masks
        spread by pdep); an x86 with neither goes value by value. The wrapper passes
-       `validity = nullptr` when the staging's `null_count` is 0 (no bit tests per row).
+       `validity = nullptr` when the staging's `null_count` is 0 (no bit tests per row). The
+       Var staging buffer is allocated 64-byte aligned: DecodeColumn walks the payload from its
+       start in blocks that are multiples of 64, so its wide loads are then aligned -- measured
+       on 7 CPUs, an input 1 byte off a 64-byte boundary costs 5-23% on long ASCII values
+       (`BENCH_ALIGN_OFFSET`), 0-3% elsewhere; a `std::vector` gives only 16.
        The unit test checks it against the server's answers; the fuzz oracle (equal to
        `DecodeValues` value by value) is to add.
   - A double-byte page (raw scans only, D10) takes `DecodeValues`: a pair must not cross two values,

@@ -145,27 +145,23 @@ MSSQL_AVX2 inline char *Pack3(const Compaction3 &c, __m256i first, __m256i secon
 
 //! A page's three UTF-8 byte planes of 0x80-0xFF as vpshufb tables: table h of a plane holds
 //! the bytes 0x80 + 16 h .. + 15, in both 128-bit lanes (vpshufb looks up within a lane).
-struct Planes256 {
+struct alignas(64) Planes256 {
 	uint8_t first[8][32];
 	uint8_t second[8][32];
 	uint8_t third[8][32];
 };
 
 const Planes256 &PlanesFor(const CodePageTable &page) {
-	static const std::vector<Planes256> planes = [] {
-		std::vector<Planes256> all(tables::CODE_PAGE_COUNT);
-		for (size_t i = 0; i < tables::CODE_PAGE_COUNT; i++) {
-			for (unsigned b = 0; b < 128; b++) {
-				const uint32_t packed = tables::CODE_PAGES[i].single[0x80 + b];
-				for (unsigned lane = 0; lane < 2; lane++) {
-					all[i].first[b / 16][16 * lane + b % 16] = static_cast<uint8_t>(packed & 0xFF);
-					all[i].second[b / 16][16 * lane + b % 16] = static_cast<uint8_t>((packed >> 8) & 0xFF);
-					all[i].third[b / 16][16 * lane + b % 16] = static_cast<uint8_t>((packed >> 16) & 0xFF);
-				}
+	static const CacheAlignedArray<Planes256> planes(tables::CODE_PAGE_COUNT, [](Planes256 &all, size_t i) {
+		for (unsigned b = 0; b < 128; b++) {
+			const uint32_t packed = tables::CODE_PAGES[i].single[0x80 + b];
+			for (unsigned lane = 0; lane < 2; lane++) {
+				all.first[b / 16][16 * lane + b % 16] = static_cast<uint8_t>(packed & 0xFF);
+				all.second[b / 16][16 * lane + b % 16] = static_cast<uint8_t>((packed >> 8) & 0xFF);
+				all.third[b / 16][16 * lane + b % 16] = static_cast<uint8_t>((packed >> 16) & 0xFF);
 			}
 		}
-		return all;
-	}();
+	});
 	return planes[page.index];
 }
 

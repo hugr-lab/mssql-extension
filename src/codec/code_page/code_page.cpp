@@ -230,6 +230,7 @@ size_t DecodeValuesImpl(const CodePageTable &page, const uint8_t *src, size_t sr
 	return static_cast<size_t>(d - dst);
 }
 
+using detail::CacheAlignedArray;
 using detail::Compaction;
 using detail::Compaction3;
 using detail::GetCompaction;
@@ -243,7 +244,7 @@ using detail::StepRecorder;
 //!   first / second / third: the UTF-8 bytes a byte reads as (DecodeToUtf8, DecodeValues);
 //!   unit_low / unit_high: the bytes of its UTF-16 code unit (DecodeToUtf16).
 //! Built once per page, on first use (PlanesFor).
-struct NeonPlanes {
+struct alignas(128) NeonPlanes {
 	uint8x16x4_t first_lo, first_hi, second_lo, second_hi, third_lo, third_hi;
 	//! The first 32 entries (bytes 80-9F) of the three planes as two-register tables:
 	//! 1252's specialised kernel looks its exceptions up with vqtbx2q.
@@ -305,20 +306,12 @@ NeonPlanes BuildPlanes(const CodePageTable &page) {
 	return planes;
 }
 
-std::vector<NeonPlanes> BuildAllPlanes() {
-	std::vector<NeonPlanes> planes;
-	planes.reserve(tables::CODE_PAGE_COUNT);
-	for (size_t i = 0; i < tables::CODE_PAGE_COUNT; i++) {
-		planes.push_back(BuildPlanes(tables::CODE_PAGES[i]));
-	}
-	return planes;
-}
-
 //! The planes of a page, found by its position in tables::CODE_PAGES (CodePageTable::index),
 //! so the page must be one FindCodePage returned. Built for every page on the first call; a
 //! function-local static, so two threads calling first build them once.
 const NeonPlanes &PlanesFor(const CodePageTable &page) {
-	static const std::vector<NeonPlanes> planes = BuildAllPlanes();
+	static const CacheAlignedArray<NeonPlanes> planes(
+		tables::CODE_PAGE_COUNT, [](NeonPlanes &all, size_t i) { all = BuildPlanes(tables::CODE_PAGES[i]); });
 	return planes[page.index];
 }
 
