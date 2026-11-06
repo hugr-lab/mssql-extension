@@ -1,1 +1,20 @@
-17.0.4075.5|Enterprise Developer Edition (64-bit)
+server|17.0.4075.5|Enterprise Developer Edition (64-bit)
+date|2026-11-06
+generator|453707fe1964db22d116b42dfb4fbe702b863c47
+second_collation|16 of 16 pages: cp<NNN>.alt.psv byte-identical to cp<NNN>.psv
+page|437|SQL_Latin1_General_CP437_CI_AS|SQL_Latin1_General_CP437_BIN
+page|850|SQL_Latin1_General_CP850_CI_AS|SQL_Scandinavian_CP850_CI_AS
+page|874|Thai_CI_AS|Thai_100_CI_AS
+page|932|Japanese_CI_AS|Japanese_XJIS_140_CI_AS
+page|936|Chinese_PRC_CI_AS|Chinese_PRC_90_CI_AS
+page|949|Korean_Wansung_CI_AS|Korean_90_CI_AS
+page|950|Chinese_Taiwan_Stroke_CI_AS|Chinese_Taiwan_Stroke_90_CI_AS
+page|1250|Czech_CI_AS|SQL_Czech_CP1250_CI_AS
+page|1251|Cyrillic_General_CI_AS|SQL_Latin1_General_CP1251_CI_AS
+page|1252|Danish_Norwegian_CI_AS|SQL_Latin1_General_CP1_CI_AS
+page|1253|Greek_CI_AS|SQL_Latin1_General_CP1253_CI_AS
+page|1254|SQL_Latin1_General_CP1254_CI_AS|Turkish_100_CI_AS
+page|1255|SQL_Latin1_General_CP1255_CI_AS|Hebrew_100_CI_AS
+page|1256|SQL_Latin1_General_CP1256_CI_AS|Arabic_100_CI_AS
+page|1257|SQL_Latin1_General_CP1257_CI_AS|Lithuanian_100_CI_AS
+page|1258|Vietnamese_CI_AS|Vietnamese_100_CI_AS
