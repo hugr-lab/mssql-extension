@@ -343,8 +343,11 @@ def _answerers(index, backlog, argv):
     ONE source of truth. Listing the flags in a QUERY_MODES tuple and again as
     the dispatch dict's keys meant a mode added to one and not the other either
     raised KeyError or was silently never dispatched (roborev on 840952c).
-    `dict` preserves insertion order, so `next(iter(...))` still picks
-    `--index` over `--backlog` exactly as the if-chain did.
+
+    `main` takes the first key, IN INSERTION ORDER, that also appears in argv,
+    so `--index` still wins over `--backlog` as it did in the if-chain. (Not
+    `next(iter(...))`, which this docstring said at first and which would
+    always answer `--index` whatever was passed -- roborev on 39dab25.)
     """
     return {"--index": lambda: mode_index(index),
             "--issue": lambda: mode_issue(index, argv),
