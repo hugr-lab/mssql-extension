@@ -145,6 +145,17 @@ jobs:
       # not enforced, because deciding whether a mention is a guard needs a
       # human. See docs/TESTING.md "Linking a test to the issue it guards".
       # No build needed -- it reads files.
+      # What counts as a DECLARATION is the whole point of this index -- a test
+      # may MENTION an issue without guarding it -- and every past defect was
+      # that distinction leaking: `# issue: 181 (see spec 057)` indexed 181 AND
+      # 57, `# issue: 123456` split into 12345 and 6, a mistyped field landed
+      # silently in the backlog, and the summary counted a two-issue file twice.
+      # The fixtures pin each of those plus what the prose matcher must NOT
+      # take (a PR reference, "reissue", a number on the next line). Reads no
+      # test tree, so it runs first.
+      - name: Issue-declaration rules judge correctly
+        run: python3 scripts/ci/issue_links.py --self-test
+
       - name: Issue -> test index is well-formed
         run: python3 scripts/ci/issue_links.py
 

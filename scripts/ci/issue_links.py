@@ -144,56 +144,244 @@ def collect():
     return index, backlog, bad
 
 
-def main(argv):
-    gone = missing_roots()
-    if gone:
-        for root in gone:
-            # ROOTS are RELATIVE, so the overwhelmingly likely cause is being
-            # invoked from somewhere other than the repo root -- which the old
-            # wording ("docs/test root") did not say, and there is no docs root
-            # in ROOTS to begin with (roborev 1431).
-            print("ERROR test root not found: %s (run from the repository root)" % root, file=sys.stderr)
-        return 1
+# ---------------------------------------------------------------- self-test
 
-    index, backlog, bad = collect()
-    # Printed in EVERY mode. Reporting them only in the default mode meant
-    # `--index` after a mistyped field showed a table quietly missing that file
-    # and exited 0.
+#: (label, the file's text, the numbers it DECLARES, how many errors)
+#
+# This file exists for one property -- "a declaration cannot be produced by
+# accident" -- and every past defect was that property leaking. So each case is
+# a leak that happened or could.
+DECLARE_TESTS = [
+    ("a plain declaration", "# name: x\n# issue: 181\n", [181], 0),
+    ("two issues, comma separated", "# issue: 90, 91\n", [90, 91], 0),
+    ("hash prefixes", "# issue: #90,#91\n", [90, 91], 0),
+    ("upper case field name", "# ISSUE: 181\n", [181], 0),
+    # The field is validated WHOLE, not scanned for digits. Scanning indexed
+    # 181 AND 57 here, registering a guard for an issue nobody wrote.
+    ("a trailing parenthetical", "# issue: 181 (see spec 057)\n", [], 1),
+    ("prose instead of a number", "# issue: nonsense\n", [], 1),
+    # Pins CURRENT behaviour, which is NOT what declared()'s docstring
+    # promises: `(.+?)` needs a character, so a bare `# issue:` matches no
+    # field at all and is treated as an ABSENT declaration rather than the
+    # "present but unparseable" ERROR the docstring describes. Left as it is
+    # because this PR must not change behaviour; worth deciding separately.
+    ("an empty field is (today) treated as no field", "# issue:\n", [], 0),
+    ("a field of only blanks, likewise", "# issue:   \n", [], 0),
+    ("a range rather than a list", "# issue: 90-91\n", [], 1),
+    # Not a declaration at all: no field, so nothing and no error.
+    ("a prose mention in the header", "# name: x\n# guards issue #181\n", [], 0),
+    ("no header at all", "SELECT 1;\n", [], 0),
+]
+
+#: (label, text, numbers PROSE finds)
+#
+# The prose matcher feeds the backlog, which is advisory -- but a false hit
+# there sends someone to annotate a file that guards nothing.
+PROSE_TESTS = [
+    ("issue #181", "-- see issue #181 for why\n", {181}),
+    # Only the number ADJACENT to the word is taken: "#91" has no "issue"
+    # before it. Enough for the backlog, whose job is to flag the FILE.
+    ("plural, the adjacent number only", "-- issues #90 and #91\n", {90}),
+    ("a hyphen separator", "-- issue-#89 again\n", {89}),
+    ("a colon separator", "-- issue: 224\n", {224}),
+    ("a PR reference is not an issue", "-- see PR #213\n", set()),
+    ("reissue is not issue", "-- reissue 1234 the token\n", set()),
+    ("tissue is not issue", "-- tissue 99 paper\n", set()),
+    # Without the [ \t] restriction the word could join the NEXT line's number.
+    ("the word at end of line does not reach the next line",
+     "-- closes the issue\n-- 226 rows\n", set()),
+    ("a one-digit number is not an issue reference", "-- issue 7\n", set()),
+]
+
+
+def _line(ok, label, detail):
+    print("  [%s] %-54s -> %s" % ("ok" if ok else "FAIL", label, detail))
+    return 0 if ok else 1
+
+
+def _write(path, text):
+    with open(path, "w") as fh:
+        fh.write(text)
+
+
+def _check_declarations(tmp):
+    print("what counts as a DECLARATION:")
+    failures = 0
+    for label, text, want_nums, want_errors in DECLARE_TESTS:
+        path = os.path.join(tmp, "a.test")
+        _write(path, text)
+        nums, errors = declared(path)
+        ok = nums == want_nums and len(errors) == want_errors
+        failures += _line(ok, label, "%s, %d error(s)" % (nums or "none", len(errors)))
+    return failures
+
+
+def _check_cpp(tmp):
+    """A .cpp test declares with `//`, and `#` must not work there."""
+    print("\nthe C++ comment form:")
+    failures = 0
+    path = os.path.join(tmp, "a.cpp")
+    _write(path, "// test_x.cpp\n// issue: 189\n")
+    failures += _line(declared(path)[0] == [189], "// issue: 189 in a .cpp", "189")
+    _write(path, "# issue: 189\n")
+    failures += _line(declared(path)[0] == [],
+                      "a # field in a .cpp is not a declaration", "none")
+    return failures
+
+
+def _check_header_block(tmp):
+    """The block ends at the first blank or non-comment line.
+
+    A field below that point is not a declaration, which is what stops a
+    reference buried in a test's body from registering as a guard.
+    """
+    print("\nwhere a declaration may live:")
+    failures = 0
+    path = os.path.join(tmp, "a.test")
+    _write(path, "# name: x\n#\n# prose on and on\n# issue: 181\n")
+    failures += _line(declared(path)[0] == [181],
+                      "a long header block reaches the field", "181")
+    _write(path, "# name: x\n\n# issue: 181\n")
+    failures += _line(declared(path)[0] == [],
+                      "a blank line ends the block", "none")
+    _write(path, "# name: x\nSELECT 1;\n# issue: 181\n")
+    failures += _line(declared(path)[0] == [],
+                      "a statement ends the block", "none")
+    return failures
+
+
+def _check_prose(tmp):
+    print("\nwhat the PROSE matcher finds (it feeds --backlog):")
+    failures = 0
+    path = os.path.join(tmp, "a.test")
+    for label, text, want in PROSE_TESTS:
+        _write(path, text)
+        got = mentioned(path)
+        failures += _line(got == want, label, str(sorted(got)) if got else "none")
+    return failures
+
+
+def _check_collect(tmp):
+    """collect()'s own layer: the range check and the backlog rule."""
+    print("\ncollect() over a tree:")
+    failures = 0
+    global ROOTS
+    keep = ROOTS
+    root = os.path.join(tmp, "tree")
+    os.makedirs(root, exist_ok=True)
+    ROOTS = (root,)
+    try:
+        _write(os.path.join(root, "guard.test"), "# issue: 181\n")
+        _write(os.path.join(root, "huge.test"), "# issue: 123456\n")
+        _write(os.path.join(root, "prose.test"), "# name: x\n-- see issue #224\n")
+        _write(os.path.join(root, "nothing.test"), "SELECT 1;\n")
+        index, backlog, bad = collect()
+        failures += _line(index == {181: [os.path.join(root, "guard.test")]},
+                          "only the declared issue is indexed", str(sorted(index)))
+        # 123456 passes FIELD_SHAPE, so the RANGE check is the layer that
+        # catches it -- and it must be an error, not a silent omission.
+        failures += _line(len(bad) == 1 and "out of range" in bad[0][1],
+                          "a number past 99999 is an error, not a silent drop",
+                          bad[0][1][:40] if bad else "NOTHING")
+        failures += _line(backlog == [os.path.join(root, "prose.test")],
+                          "a prose-only mention lands in the backlog", str(len(backlog)))
+        failures += _line(mode_summary({181: ["x"]}, [], []) == 0,
+                          "a clean summary exits 0", "0")
+        failures += _line(mode_summary({}, [], [("f", "why")]) == 1,
+                          "a bad declaration fails the summary", "1")
+        failures += _line(mode_issue({181: ["x"]}, ["--issue", "999"]) == 3,
+                          "an unguarded issue exits 3, not 1", "3")
+        failures += _line(mode_issue({}, ["--issue"]) == 2,
+                          "--issue without a number exits 2", "2")
+    finally:
+        ROOTS = keep
+    return failures
+
+
+def _check_missing_roots(tmp):
+    print("\nmissing roots (a moved test tree must not pass):")
+    global ROOTS
+    keep = ROOTS
+    ROOTS = (os.path.join(tmp, "not-there"),)
+    try:
+        return _line(require_roots() is True,
+                     "a missing root is reported and fails", "fails")
+    finally:
+        ROOTS = keep
+
+
+def self_test():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        failures = _check_declarations(tmp)
+        failures += _check_cpp(tmp)
+        failures += _check_header_block(tmp)
+        failures += _check_prose(tmp)
+        failures += _check_collect(tmp)
+        failures += _check_missing_roots(tmp)
+    print("\n%s: self-test, %d failure(s)" % ("FAIL" if failures else "PASS", failures))
+    return failures
+
+
+#: The modes that ANSWER a question rather than report a verdict. A bad
+#: declaration makes the index incomplete, so these refuse to answer from it.
+QUERY_MODES = ("--index", "--issue", "--backlog")
+
+
+def require_roots():
+    """Complain about missing roots. -> True when any is gone."""
+    gone = missing_roots()
+    for root in gone:
+        # ROOTS are RELATIVE, so the overwhelmingly likely cause is being
+        # invoked from somewhere other than the repo root -- which the old
+        # wording ("docs/test root") did not say, and there is no docs root
+        # in ROOTS to begin with (roborev 1431).
+        print("ERROR test root not found: %s (run from the repository root)" % root, file=sys.stderr)
+    return bool(gone)
+
+
+def report_errors(bad):
+    """Printed in EVERY mode.
+
+    Reporting them only in the default mode meant `--index` after a mistyped
+    field showed a table quietly missing that file and exited 0.
+    """
     for path, why in bad:
         print("ERROR %s: %s" % (path, why), file=sys.stderr)
 
-    if bad and ("--index" in argv or "--issue" in argv or "--backlog" in argv):
-        return 1
 
-    if "--index" in argv:
-        for n in sorted(index):
-            print("#%-6d %s" % (n, ", ".join(index[n])))
-        return 0
+def mode_index(index):
+    for n in sorted(index):
+        print("#%-6d %s" % (n, ", ".join(index[n])))
+    return 0
 
-    if "--issue" in argv:
-        try:
-            want = int(argv[argv.index("--issue") + 1])
-        except (IndexError, ValueError):
-            print("--issue needs a number", file=sys.stderr)
-            return 2
-        hits = index.get(want)
-        if not hits:
-            print("no test declares itself a guard for #%d" % want)
-            # 3, not 1: "no guard" is an answer, and a caller must be able to
-            # tell it from "the index is invalid", which returns 1.
-            return 3
-        for path in hits:
-            print(path)
-        return 0
 
-    if "--backlog" in argv:
-        for path in backlog:
-            print(path)
-        return 0
+def mode_issue(index, argv):
+    try:
+        want = int(argv[argv.index("--issue") + 1])
+    except (IndexError, ValueError):
+        print("--issue needs a number", file=sys.stderr)
+        return 2
+    hits = index.get(want)
+    if not hits:
+        print("no test declares itself a guard for #%d" % want)
+        # 3, not 1: "no guard" is an answer, and a caller must be able to
+        # tell it from "the index is invalid", which returns 1.
+        return 3
+    for path in hits:
+        print(path)
+    return 0
 
+
+def mode_backlog(backlog):
+    for path in backlog:
+        print(path)
+    return 0
+
+
+def mode_summary(index, backlog, bad):
     if bad:
         return 1
-
     # DISTINCT files, not pairs: `sum(len(v) for v in index.values())` counted a
     # file declaring two issues twice, so the figure overstated how many tests
     # carry a declaration (roborev 1431).
@@ -203,6 +391,28 @@ def main(argv):
         print("%d file(s) mention an issue without declaring one "
               "(see --backlog; not an error)" % len(backlog))
     return 0
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return 1 if self_test() else 0
+    if require_roots():
+        return 1
+
+    index, backlog, bad = collect()
+    report_errors(bad)
+
+    answer = {"--index": lambda: mode_index(index),
+              "--issue": lambda: mode_issue(index, argv),
+              "--backlog": lambda: mode_backlog(backlog)}
+    asked = next((mode for mode in QUERY_MODES if mode in argv), None)
+    if asked:
+        # A bad declaration makes the index incomplete, so a mode that ANSWERS
+        # from it refuses rather than answering wrongly. Reporting the errors
+        # only in the default mode meant `--index` after a mistyped field
+        # printed a table quietly missing that file and exited 0.
+        return 1 if bad else answer[asked]()
+    return mode_summary(index, backlog, bad)
 
 
 if __name__ == "__main__":
