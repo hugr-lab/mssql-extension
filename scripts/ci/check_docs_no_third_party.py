@@ -154,7 +154,12 @@ def _check_whole_build():
         (build / "index.html").write_text('<img src="https://cdn.example.com/x.png">\n')
         (build / "sub" / "a.css").write_text("body { background: url(//cdn.example.com/b.png); }\n")
         # Not a text suffix: never read, so a foreign URL inside is invisible.
-        (build / "sub" / "blob.bin").write_text('<img src="https://cdn.example.com/no.png">\n')
+        # The content has to be something css_loads WOULD flag, since that
+        # matcher runs on every text file: an <img src> here could not fail the
+        # check even if the suffix filter broke, because html_loads only runs
+        # on .html (roborev on 8bbfff4).
+        (build / "sub" / "blob.bin").write_text(
+            "body { background: url(https://cdn.example.com/no.png); }\n")
         found = scan(build)
         failures += _line(len(found) == 2, "one finding per file, the .bin skipped",
                           "%d finding(s)" % len(found))
