@@ -2,6 +2,9 @@
 // generated tables. See codec/code_page/code_page.hpp for the contract.
 
 #include "codec/code_page/code_page.hpp"
+#include "codec/code_page/code_page_internal.hpp"
+
+#include <atomic>
 
 #include <cstring>
 #include <vector>
@@ -20,6 +23,9 @@
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
+#if defined(_M_X64)
+#include <immintrin.h>	// _xgetbv
+#endif
 #define MSSQL_CODE_PAGE_ALWAYS_INLINE __forceinline
 #else
 #define MSSQL_CODE_PAGE_ALWAYS_INLINE inline __attribute__((always_inline))
@@ -207,6 +213,11 @@ size_t DecodeValuesImpl(const CodePageTable &page, const uint8_t *src, size_t sr
 	return static_cast<size_t>(d - dst);
 }
 
+using detail::Compaction;
+using detail::Compaction3;
+using detail::GetCompaction;
+using detail::GetCompaction3;
+
 #if defined(MSSQL_CODE_PAGE_NEON)
 //! A page prepared for the NEON kernels. Each plane holds one byte of the entries of
 //! 0x80-0xFF as two 64-entry halves, 0x80-0xBF and 0xC0-0xFF, so one vqtbx4q covers a half:
@@ -225,63 +236,6 @@ struct NeonPlanes {
 	//! UTF-8 is arithmetic on the bytes. run_span 0 = no usable run.
 	uint8_t run_lo = 0, run_span = 0, delta_low6 = 0, delta_high = 0;
 };
-
-//! simdutf's compaction for UTF-16 -> UTF-8 applied to code pages: 8 characters interleaved
-//! as (first, second) byte pairs, and a mask of which ones have a second byte; the shuffle
-//! keeps each first byte and the second bytes the mask names. 256 x 16 bytes, built once.
-struct Compaction {
-	uint8_t shuffle[256][16];
-	uint8_t length[256];
-	Compaction() {
-		for (unsigned m = 0; m < 256; m++) {
-			unsigned k = 0;
-			for (unsigned i = 0; i < 8; i++) {
-				shuffle[m][k++] = static_cast<uint8_t>(2 * i);
-				if (m & (1u << i)) {
-					shuffle[m][k++] = static_cast<uint8_t>(2 * i + 1);
-				}
-			}
-			length[m] = static_cast<uint8_t>(k);
-			for (; k < 16; k++) {
-				shuffle[m][k] = 0xFF;
-			}
-		}
-	}
-};
-
-const Compaction &GetCompaction() {
-	static const Compaction compaction;
-	return compaction;
-}
-
-//! simdutf's 1/2/3-byte compaction: 4 characters as 32-bit lanes [b0 b1 b2 0] and a 2-bit
-//! length code per character (0, 1, 2 = 1, 2, 3 bytes); the shuffle keeps each lane's
-//! first 1-3 bytes. 256 x 16 bytes, built once.
-struct Compaction3 {
-	uint8_t shuffle[256][16];
-	uint8_t length[256];
-	Compaction3() {
-		for (unsigned m = 0; m < 256; m++) {
-			unsigned k = 0;
-			for (unsigned lane = 0; lane < 4; lane++) {
-				const unsigned code = (m >> (2 * lane)) & 3u;
-				const unsigned bytes = code == 3 ? 3 : code + 1;
-				for (unsigned b = 0; b < bytes; b++) {
-					shuffle[m][k++] = static_cast<uint8_t>(4 * lane + b);
-				}
-			}
-			length[m] = static_cast<uint8_t>(k);
-			for (; k < 16; k++) {
-				shuffle[m][k] = 0xFF;
-			}
-		}
-	}
-};
-
-const Compaction3 &GetCompaction3() {
-	static const Compaction3 compaction;
-	return compaction;
-}
 
 NeonPlanes BuildPlanes(const CodePageTable &page) {
 	uint8_t first[128], second[128], third[128], unit_low[128], unit_high[128];
@@ -951,6 +905,115 @@ size_t Utf8LengthImpl(const CodePageTable &page, const uint8_t *src, size_t n) {
 
 }  // namespace
 
+namespace detail {
+
+Compaction::Compaction() {
+	for (unsigned m = 0; m < 256; m++) {
+		unsigned k = 0;
+		for (unsigned i = 0; i < 8; i++) {
+			shuffle[m][k++] = static_cast<uint8_t>(2 * i);
+			if (m & (1u << i)) {
+				shuffle[m][k++] = static_cast<uint8_t>(2 * i + 1);
+			}
+		}
+		length[m] = static_cast<uint8_t>(k);
+		for (; k < 16; k++) {
+			shuffle[m][k] = 0xFF;
+		}
+	}
+}
+
+Compaction3::Compaction3() {
+	for (unsigned m = 0; m < 256; m++) {
+		unsigned k = 0;
+		for (unsigned lane = 0; lane < 4; lane++) {
+			const unsigned code = (m >> (2 * lane)) & 3u;
+			const unsigned bytes = code == 3 ? 3 : code + 1;
+			for (unsigned b = 0; b < bytes; b++) {
+				shuffle[m][k++] = static_cast<uint8_t>(4 * lane + b);
+			}
+		}
+		length[m] = static_cast<uint8_t>(k);
+		for (; k < 16; k++) {
+			shuffle[m][k] = 0xFF;
+		}
+	}
+}
+
+const Compaction &GetCompaction() {
+	static const Compaction compaction;
+	return compaction;
+}
+
+const Compaction3 &GetCompaction3() {
+	static const Compaction3 compaction;
+	return compaction;
+}
+
+Isa DetectIsa() {
+#if defined(MSSQL_CODE_PAGE_NEON)
+	return Isa::Neon;
+#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(MSSQL_CODE_PAGE_PORTABLE)
+#if defined(_MSC_VER) && !defined(__clang__)
+	int info[4];
+	__cpuid(info, 0);
+	if (info[0] < 7) {
+		return Isa::Scalar;
+	}
+	__cpuid(info, 1);
+	const bool osxsave = (info[2] & (1 << 27)) != 0, avx = (info[2] & (1 << 28)) != 0;
+	if (!osxsave || !avx || (_xgetbv(0) & 0x6) != 0x6) {
+		return Isa::Scalar;	 // the OS does not save the YMM state
+	}
+	__cpuidex(info, 7, 0);
+	const bool avx2 = (info[1] & (1 << 5)) != 0, bmi2 = (info[1] & (1 << 8)) != 0;
+	return avx2 && bmi2 ? Isa::Avx2 : Isa::Scalar;
+#else
+	__builtin_cpu_init();
+	return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("bmi2") ? Isa::Avx2 : Isa::Scalar;
+#endif
+#else
+	return Isa::Scalar;
+#endif
+}
+
+namespace {
+std::atomic<uint8_t> &IsaState() {
+	static std::atomic<uint8_t> state(static_cast<uint8_t>(DetectIsa()));
+	return state;
+}
+}  // namespace
+
+Isa ActiveIsa() {
+	return static_cast<Isa>(IsaState().load(std::memory_order_relaxed));
+}
+
+bool ForceIsa(Isa isa) {
+	const Isa best = DetectIsa();
+	// An instruction set the CPU lacks is refused; Scalar always runs.
+	const bool supported = isa == Isa::Scalar || isa == best || (best == Isa::Avx512 && isa == Isa::Avx2);
+	if (supported) {
+		IsaState().store(static_cast<uint8_t>(isa), std::memory_order_relaxed);
+	}
+	return supported;
+}
+
+const char *IsaName(Isa isa) {
+	switch (isa) {
+	case Isa::Scalar:
+		return "scalar";
+	case Isa::Neon:
+		return "neon";
+	case Isa::Avx2:
+		return "avx2";
+	case Isa::Avx512:
+		return "avx512";
+	}
+	return "?";
+}
+
+}  // namespace detail
+
 const CodePageTable *FindCodePage(int32_t code_page) {
 	for (size_t i = 0; i < tables::CODE_PAGE_COUNT; i++) {
 		if (tables::CODE_PAGES[i].code_page == code_page) {
@@ -969,11 +1032,16 @@ size_t DecodeToUtf8(const CodePageTable &page, const uint8_t *src, size_t n, cha
 		return static_cast<size_t>(DecodeRun<true>(page, src, src + n, src + n, dst) - dst);
 	}
 #if defined(MSSQL_CODE_PAGE_NEON)
-	const NeonKernel kernel(page);
-	return static_cast<size_t>(DecodeNeonFor(kernel, page.code_page, src, src + n, dst) - dst);
-#else
-	return static_cast<size_t>(DecodeRun<false>(page, src, src + n, src + n, dst) - dst);
+	if (detail::ActiveIsa() == detail::Isa::Neon) {
+		const NeonKernel kernel(page);
+		return static_cast<size_t>(DecodeNeonFor(kernel, page.code_page, src, src + n, dst) - dst);
+	}
+#elif defined(__x86_64__) || defined(_M_X64)
+	if (detail::ActiveIsa() == detail::Isa::Avx2) {
+		return static_cast<size_t>(detail::DecodeSingleByteAvx2(page, src, src + n, dst) - dst);
+	}
 #endif
+	return static_cast<size_t>(DecodeRun<false>(page, src, src + n, src + n, dst) - dst);
 }
 
 size_t CopyAscii(const uint8_t *src, size_t n, char *dst) {
@@ -1003,10 +1071,26 @@ size_t DecodeValues(const CodePageTable &page, const uint8_t *src, size_t src_si
 		return DecodeValuesImpl<true>(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
 	}
 #if defined(MSSQL_CODE_PAGE_NEON)
-	return DecodeValuesSingleByteNeon(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
-#else
-	return DecodeValuesImpl<false>(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
+	if (detail::ActiveIsa() == detail::Isa::Neon) {
+		return DecodeValuesSingleByteNeon(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
+	}
+#elif defined(__x86_64__) || defined(_M_X64)
+	if (detail::ActiveIsa() == detail::Isa::Avx2) {
+		const uint8_t *readable = src + src_size;
+		char *d = dst;
+		for (size_t i = 0; i < count; i++) {
+			const uint8_t *p = src + offsets[i];
+			const uint8_t *end = p + lengths[i];
+			char *start = d;
+			d = lengths[i] >= 32 ? detail::DecodeSingleByteAvx2(page, p, end, d)
+								 : DecodeRun<false>(page, p, end, readable, d);
+			out_offsets[i] = static_cast<uint64_t>(start - dst);
+			out_lengths[i] = static_cast<uint32_t>(d - start);
+		}
+		return static_cast<size_t>(d - dst);
+	}
 #endif
+	return DecodeValuesImpl<false>(page, src, src_size, offsets, lengths, count, dst, out_offsets, out_lengths);
 }
 
 size_t ExactUtf8Length(const CodePageTable &page, const uint8_t *src, size_t n) {

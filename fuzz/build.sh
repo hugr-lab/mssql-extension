@@ -157,7 +157,7 @@ fi
 #     has no DuckDB include; simdutf only for the harness's UTF-8 validity and UTF-16 checks.
 if want code_page; then
 	ensure_simdutf
-	CP_OBJS="$(compile_objs cp "${REPO}/src/codec/code_page/code_page.cpp" \
+	CP_OBJS="$(compile_objs cp "${REPO}/src/codec/code_page/code_page.cpp" "${REPO}/src/codec/code_page/code_page_avx2.cpp" \
 		"${REPO}/src/codec/code_page/code_page_tables.cpp")"
 	build_harness fuzz_code_page fuzz_code_page.cc ${CP_OBJS}
 fi

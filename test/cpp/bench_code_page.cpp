@@ -22,12 +22,14 @@
 // Reported per value, with the bytes each form puts on the wire.
 
 #include "codec/code_page/code_page.hpp"
+#include "codec/code_page/code_page_internal.hpp"
 
 #include "simdutf.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <random>
@@ -201,6 +203,23 @@ double Median(std::vector<double> v) {
 }  // namespace
 
 int main() {
+	namespace detail = duckdb::mssql::codec::code_page::detail;
+	// CODE_PAGE_ISA=scalar|neon|avx2|avx512 runs the kernels of that instruction set (the CPU must
+	// have it); unset, the best one the CPU has.
+	if (const char *want = std::getenv("CODE_PAGE_ISA")) {
+		const detail::Isa isas[] = {detail::Isa::Scalar, detail::Isa::Neon, detail::Isa::Avx2, detail::Isa::Avx512};
+		bool forced = false;
+		for (detail::Isa isa : isas) {
+			if (std::string(want) == detail::IsaName(isa)) {
+				forced = detail::ForceIsa(isa);
+			}
+		}
+		if (!forced) {
+			std::fprintf(stderr, "CODE_PAGE_ISA=%s: not supported here\n", want);
+			return 2;
+		}
+	}
+	std::printf("kernels: %s\n", detail::IsaName(detail::ActiveIsa()));
 	std::mt19937 rng(91);
 	std::vector<Chunk> chunks;
 	chunks.push_back(Make("ascii short (4-20 B)", 1252, AsciiShort, rng));

@@ -24,6 +24,7 @@
 //   make test-code-page-portable    the 8-byte SWAR form
 
 #include "codec/code_page/code_page.hpp"
+#include "codec/code_page/code_page_internal.hpp"
 
 #include <cctype>
 #include <cstdint>
@@ -515,9 +516,8 @@ void TestEveryCollation() {
 
 }  // namespace
 
-int main() {
-	std::mt19937 rng(91);
-	CHECK(tables::CODE_PAGE_COUNT == 16, "16 code pages, not " << tables::CODE_PAGE_COUNT);
+//! Every page through the kernels of one instruction set.
+int RunPages(std::mt19937 &rng) {
 	for (size_t i = 0; i < tables::CODE_PAGE_COUNT; i++) {
 		const CodePageTable &page = tables::CODE_PAGES[i];
 		const int cp = page.code_page;
@@ -537,6 +537,32 @@ int main() {
 		TestRandomStrings(ref, page, rng);
 		TestRandomValues(ref, page, rng);
 	}
+	return 0;
+}
+
+int main() {
+	namespace detail = duckdb::mssql::codec::code_page::detail;
+	std::mt19937 rng(91);
+	CHECK(tables::CODE_PAGE_COUNT == 16, "16 code pages, not " << tables::CODE_PAGE_COUNT);
+	// The kernels of every instruction set this CPU runs: the best one, and the portable
+	// scalar path, which a CPU without the SIMD one takes.
+	const detail::Isa best = detail::DetectIsa();
+	std::vector<detail::Isa> isas = {best};
+	if (best == detail::Isa::Avx512) {
+		isas.push_back(detail::Isa::Avx2);
+	}
+	if (best != detail::Isa::Scalar) {
+		isas.push_back(detail::Isa::Scalar);
+	}
+	for (detail::Isa isa : isas) {
+		CHECK(detail::ForceIsa(isa), "cannot force " << detail::IsaName(isa));
+		std::cout << "kernels: " << detail::IsaName(isa) << "\n";
+		const int rc = RunPages(rng);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+	detail::ForceIsa(best);
 	TestCopyAscii(rng);
 	TestLookups();
 	TestEveryCollation();

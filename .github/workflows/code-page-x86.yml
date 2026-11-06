@@ -1,0 +1,75 @@
+name: Code-page kernels (x86-64)
+
+# Spec 091: the code-page decode kernels on a real x86-64 runner. Local development
+# is on arm64, where only Rosetta runs x86 (AVX2 at best, and its timings mean
+# nothing), so this job is where the x86 kernels are tested on hardware and timed:
+#   - the unit test runs the kernels of every instruction set the runner has
+#     (AVX2, AVX-512 when present, and the scalar path), -std=c++11 -Werror;
+#   - the micro-benchmark compares them with today's UTF-16 path (simdutf 6.1.1,
+#     the vcpkg pin), once with the best kernels and once scalar.
+# The bench is not a gate: its numbers go to the job summary.
+
+on:
+  pull_request:
+    paths:
+      - 'src/codec/code_page/**'
+      - 'src/include/codec/code_page/**'
+      - 'test/cpp/codec/test_code_page.cpp'
+      - 'test/cpp/bench_code_page*.cpp'
+      - 'tools/code_pages/**'
+      - '.github/workflows/code-page-x86.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-page-x86-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  x86:
+    name: Code-page kernels on x86-64
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: CPU
+        run: |
+          lscpu | grep -E 'Model name' || true
+          echo "flags: $(grep -o -w -E 'avx2|bmi2|avx512f|avx512bw|avx512vbmi|avx512vbmi2' /proc/cpuinfo | sort -u | tr '\n' ' ')"
+
+      - name: Unit test, every instruction set the CPU has
+        run: |
+          g++ -std=c++11 -O2 -Wall -Wextra -Werror -I src/include \
+            test/cpp/codec/test_code_page.cpp \
+            src/codec/code_page/code_page.cpp src/codec/code_page/code_page_avx2.cpp \
+            src/codec/code_page/code_page_tables.cpp -o test_code_page
+          ./test_code_page
+
+      - name: simdutf, the bench's baseline
+        run: |
+          mkdir -p simdutf
+          curl -fsSL https://github.com/simdutf/simdutf/releases/download/v6.1.1/singleheader.zip -o simdutf/s.zip
+          unzip -o -j simdutf/s.zip simdutf.h simdutf.cpp -d simdutf
+
+      - name: Bench
+        run: |
+          g++ -std=c++17 -O3 -DNDEBUG -I src/include -I simdutf test/cpp/bench_code_page.cpp \
+            src/codec/code_page/code_page.cpp src/codec/code_page/code_page_avx2.cpp \
+            src/codec/code_page/code_page_tables.cpp simdutf/simdutf.cpp -o bench_code_page
+          ./bench_code_page | tee bench.txt
+          CODE_PAGE_ISA=scalar ./bench_code_page | tee bench_scalar.txt
+          {
+            echo '### Code-page kernels, x86-64'
+            echo
+            echo "CPU: $(lscpu | sed -n 's/^Model name: *//p')"
+            echo
+            echo '```'
+            cat bench.txt
+            echo
+            cat bench_scalar.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
