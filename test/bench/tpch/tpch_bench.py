@@ -813,11 +813,29 @@ def same(x, y):
     against `123456789132.34`, which is item 1 of #506 (a dropped row in an
     aggregate passes) returning at exactly the scale the fix was for.
 
-    What the pair LOOKS like decides which branch applies, because it is the
-    only evidence of what the columns are -- see `exact_pair`, which wants an
-    equal scale, a scale a decimal column could have, and digit counts below a
-    double's full precision. Anything else gets the tolerance, including two
-    doubles whose shortest forms happen to print alike.
+    What the pair LOOKS like decides which branch applies -- see `exact_pair`,
+    which wants an equal scale, a scale a decimal column could have, and at
+    least one side that is NOT a double's shortest round-trip form. Anything
+    else gets the tolerance.
+
+    KNOWN GAP, and it is why this should become type-driven. The form is a
+    heuristic, not evidence, and it leaks in one direction: an exact
+    decimal(38,2) or decimal(38,4) sum whose printed form happens to round-trip
+    -- any value of 15 or fewer significant digits that does not end in a zero,
+    so 9 cases in 10 -- is read as a pair of doubles and gets the tolerance. At
+    q01's `sum_base_price` magnitude (~5.7e11 at SF10) the bound is then 0.056,
+    so a one-cent discrepancy passes. A dropped row (>= ~900) is still rejected
+    at every scale factor.
+
+    No relative bound can close that: at an SF1000 magnitude one ulp is 0.0078,
+    so a cent is 1.3 ulps -- there is no value that accepts a legitimate
+    last-bit difference between two doubles and rejects a cent of rounding
+    error in an exact decimal. Only the COLUMN TYPE separates them, which means
+    reading the oracle's types (`DESCRIBE` each query, confirmed to work in a
+    subquery) and requiring exact equality for every DECIMAL and integer
+    column. Tracked as its own change; it alters the verify contract and wants
+    a live run, because a DECIMAL column the client returns at a different
+    scale would then have to fall back rather than fail.
     """
     if x == y:
         return True
