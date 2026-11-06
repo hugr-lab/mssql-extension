@@ -7,7 +7,8 @@
 #
 # Prints the CPU (lscpu's model, the flags the kernels choose by), the unit test's verdict
 # for every instruction set the CPU has, and bench_code_page once per instruction set
-# (the best one, then each lower one), so one run shows them side by side.
+# (the best one, then each lower one), so one run shows them side by side;
+# BENCH_ALIGN_OFFSETS="0 1" also runs the best one with its input 1 byte past a 64-byte boundary.
 set -euo pipefail
 
 SRC="${1:-.}"
@@ -43,7 +44,12 @@ echo "== bench"
 # shellcheck disable=SC2086
 g++ -std=c++17 -O3 -DNDEBUG -I src/include -I "$WORK/simdutf" test/cpp/bench_code_page.cpp $SOURCES \
 	"$WORK/simdutf/simdutf.cpp" -o "$WORK/bench_code_page"
-"$WORK/bench_code_page"
+# The best instruction set at each payload offset from a 64-byte boundary asked for
+# (BENCH_ALIGN_OFFSETS, default "0"); the lower ones at the first.
+for offset in ${BENCH_ALIGN_OFFSETS:-0}; do
+	BENCH_ALIGN_OFFSET="$offset" "$WORK/bench_code_page"
+	echo
+done
 for isa in avx2 scalar; do
 	# A lower instruction set the CPU has; the bench refuses one it lacks (exit 2, no output).
 	if [ "$isa" != "$best" ] && out="$(CODE_PAGE_ISA="$isa" "$WORK/bench_code_page" 2>/dev/null)"; then

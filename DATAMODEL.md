@@ -794,8 +794,9 @@ path) is spec 091's follow-up.
   run time (cpuid): **AVX-512 VBMI2**, 64 bytes a step, the byte planes of the
   page's whole high half by `vpermi2b` and packed by `vpcompressb`, the last step
   under a mask; else **AVX2**, 32 bytes a step, 1252 / 1251 / 874 by the page's
-  arithmetic and any other byte by `vpgatherdd` from the packed table, packed by
-  `pshufb`. Everything else — a double-byte page, a CPU with neither (SSE2) and
+  arithmetic, the other bytes from the page's byte planes as `vpshufb` tables (a
+  2- / 4-table window for 1252 / 1251, all 8 and a blend tree for any other page;
+  no `vpgatherdd`, 3x slower on AMD Zen 2/3), packed by `pshufb`. Everything else — a double-byte page, a CPU with neither (SSE2) and
   the SWAR fallback, and a value under 32 bytes in `DecodeValues` on arm64 or AVX2 —
   steps ASCII **16 bytes** at a time and reads other bytes from the packed table,
   one 4-byte store each. `DecodeToUtf8` and `DecodeValues` do not call

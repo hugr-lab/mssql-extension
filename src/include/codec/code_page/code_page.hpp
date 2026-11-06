@@ -30,9 +30,11 @@
 //     64 bytes a step, the UTF-8 byte planes of the page's whole high half by
 //     vpermi2b and packed by vpcompressb, the last step loaded and stored under
 //     a mask (so DecodeValues takes every value through it); else AVX2, 32
-//     bytes a step, 1252 / 1251 / 874 by the page's arithmetic and the rest by
-//     vpgatherdd from the packed table, packed by pshufb (Compaction /
-//     Compaction3). code_page_internal.hpp has the dispatch.
+//     bytes a step, 1252 / 1251 / 874 by the page's arithmetic, the bytes
+//     outside it (1252 80-9F, 1251 80-BF) from 2 / 4 vpshufb tables of the
+//     page's byte planes, any other page's from all 8 and a blend tree, packed
+//     by pshufb (Compaction / Compaction3). code_page_internal.hpp has the
+//     dispatch.
 //   - Everything else (a double-byte page; a single-byte page with no SIMD; a
 //     value shorter than 32 bytes in DecodeValues on arm64 or under AVX2)
 //     alternates a 16-byte ASCII step (one load, one test of the high bits,

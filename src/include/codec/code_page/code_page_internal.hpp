@@ -113,7 +113,9 @@ const char *IsaName(Isa isa);
 #if defined(__x86_64__) || defined(_M_X64)
 //! AVX2 kernels for a single-byte page over [p, end), 32 bytes a step: ASCII stored as it
 //! is; 1252 / 1251 / 874 blocks whose non-ASCII bytes are the page's letters by arithmetic;
-//! any other block, any page, by vpgatherdd from the packed table and Compaction3. The tail
+//! 1252 / 1251 blocks with other bytes by the arithmetic plus a window of the page's byte
+//! planes (2 / 4 vpshufb tables); any other block, any page, by all 8 tables of each plane
+//! and a blend tree; packed by Compaction / Compaction3 (no gather). The tail
 //! under 32 bytes through the table a byte at a time. Return the new output end; write at
 //! most STORE_SLACK bytes past it. Defined in code_page_avx2.cpp.
 char *DecodeSingleByteAvx2(const CodePageTable &page, const uint8_t *p, const uint8_t *end, char *d);

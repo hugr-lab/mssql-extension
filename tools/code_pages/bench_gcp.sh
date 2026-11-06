@@ -95,7 +95,7 @@ run_one() {
 		done
 		gcloud compute scp "$TAR" "$vm:~/" --zone "$zone" --project "$PROJECT" --quiet >/dev/null
 		gcloud compute ssh "$vm" --zone "$zone" --project "$PROJECT" --quiet --command \
-			"mkdir -p src && tar -xzf code-page-bench.tar.gz -C src && bash src/tools/code_pages/bench_remote.sh src" 2>&1
+			"mkdir -p src && tar -xzf code-page-bench.tar.gz -C src && BENCH_ALIGN_OFFSETS='${BENCH_ALIGN_OFFSETS:-0}' bash src/tools/code_pages/bench_remote.sh src" 2>&1
 		gcloud compute instances delete "$vm" --zone "$zone" --project "$PROJECT" --quiet >/dev/null 2>&1 || true
 	} >"$log" 2>&1
 	echo "done: $name -> $log"

@@ -1055,10 +1055,10 @@ inline void StartsFromMasks(const uint32_t *masks, size_t granules, uint16_t *st
 }
 
 //! A row's view into `view`, string_t's layout (StringView16), from the `length` UTF-8 bytes
-//! at `data`, or zero for a NULL row: no branch. Reads 16 bytes at data (dst has STORE_SLACK
-//! past its end): [length][bytes 0-11] by one byte shift, cut at the length for the inline
-//! form; its first 8 bytes and the address for the pointer form.
-inline void WriteView(StringView16 *view, const char *data, uint32_t length, size_t inline_length, bool valid) {
+//! at `data`: no branch. A NULL row's length is 0, so its view comes out zero, as DuckDB's. Reads 16 bytes at data (dst
+//! has STORE_SLACK past its end): [length][bytes 0-11] by one byte shift, cut at the length for the inline form; its
+//! first 8 bytes and the address for the pointer form.
+inline void WriteView(StringView16 *view, const char *data, uint32_t length, size_t inline_length) {
 	static const uint8_t IOTA[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
 	const unsigned kept = 4 + (length < 12 ? length : 12);	// the inline form's bytes: length + value
 	const bool inlined = length <= inline_length;
@@ -1071,7 +1071,7 @@ inline void WriteView(StringView16 *view, const char *data, uint32_t length, siz
 	const uint8x16_t pointer_form = vreinterpretq_u8_u64(
 		vcombine_u64(vcreate_u64(lo), vcreate_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data)))));
 	const uint8x16_t form = vbslq_u8(vdupq_n_u8(inlined ? 0xFF : 0), inline_form, pointer_form);
-	vst1q_u8(reinterpret_cast<uint8_t *>(view), vandq_u8(form, vdupq_n_u8(valid ? 0xFF : 0)));
+	vst1q_u8(reinterpret_cast<uint8_t *>(view), form);
 #else
 	const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(data));
 	const __m128i shifted = _mm_or_si128(_mm_slli_si128(bytes, 4), _mm_cvtsi32_si128(static_cast<int>(length)));
@@ -1083,7 +1083,7 @@ inline void WriteView(StringView16 *view, const char *data, uint32_t length, siz
 		_mm_unpacklo_epi64(lo, _mm_cvtsi64_si128(static_cast<long long>(reinterpret_cast<uintptr_t>(data))));
 	const __m128i pick = _mm_set1_epi32(inlined ? -1 : 0);
 	const __m128i form = _mm_or_si128(_mm_and_si128(pick, inline_form), _mm_andnot_si128(pick, pointer_form));
-	_mm_storeu_si128(reinterpret_cast<__m128i *>(view), _mm_and_si128(form, _mm_set1_epi32(valid ? -1 : 0)));
+	_mm_storeu_si128(reinterpret_cast<__m128i *>(view), form);
 #endif
 }
 
@@ -1096,8 +1096,9 @@ inline void WriteView(StringView16 *view, const char *data, uint32_t length, siz
 //!      until B -- a NULL row the offset where the next value starts, so a row's length is
 //!      the next row's offset minus its own (offsets / lengths loaded for every row, so the
 //!      validity is a select, not a branch);
-//!   B: the views of the rows A's offsets now end (WriteView, a NULL row's zero), while the
-//!      block's output is still in cache; the last rows after the last block.
+//!   B: the views of the rows A's offsets now end, while the block's output is in cache
+//!      (WriteView; a NULL row's length is 0, so its view is zero with no look at the
+//!      validity); the last rows after the last block.
 //! Nothing reads the input again. `decode(p, end, d, recorder)` is the kernel. ALL_VALID:
 //! validity is nullptr -- a caller with no NULL in the chunk passes nullptr (no bit tests).
 template <bool ALL_VALID, class Decode>
@@ -1111,6 +1112,9 @@ size_t DecodeColumnRecorded(const uint8_t *src, size_t src_size, const uint32_t 
 	size_t row = 0;
 	size_t next_in = 0;	 // where the next valid value starts: a NULL row's input offset
 	size_t done = 0;	 // rows whose views are written
+	// The validity word of the row being placed (rows enter loop A in order, a block may end
+	// inside a word: loaded at each multiple of 64, row 0 included).
+	uint64_t word = 0;
 	size_t b0 = 0;
 	for (;;) {
 		const size_t b1 = src_size - b0 > COLUMN_BLOCK ? b0 + COLUMN_BLOCK : src_size;
@@ -1129,7 +1133,10 @@ size_t DecodeColumnRecorded(const uint8_t *src, size_t src_size, const uint32_t 
 			StartsFromMasks(masks, granules, starts);
 		}
 		for (; row < count; row++) {
-			const bool valid = ALL_VALID || RowValid(validity, row);
+			if (!ALL_VALID && (row & 63) == 0) {
+				word = validity[row >> 6];	// the next 64 rows' validity, held while they are placed
+			}
+			const bool valid = ALL_VALID || ((word >> (row & 63)) & 1) != 0;
 			// Loaded whatever the row (a NULL row's slots are allocated, their values unused),
 			// so the choice is a select, not a branch on the validity bit.
 			const size_t offset = offsets[row];
@@ -1156,8 +1163,7 @@ size_t DecodeColumnRecorded(const uint8_t *src, size_t src_size, const uint32_t 
 		// The views of the rows the next row's offset now ends, while their output is in cache.
 		for (; done + 1 < row; done++) {
 			const size_t start = views[done].lo;
-			WriteView(views + done, dst + start, static_cast<uint32_t>(views[done + 1].lo - start), inline_length,
-					  ALL_VALID || RowValid(validity, done));
+			WriteView(views + done, dst + start, static_cast<uint32_t>(views[done + 1].lo - start), inline_length);
 		}
 		if (last) {
 			break;
@@ -1171,8 +1177,7 @@ size_t DecodeColumnRecorded(const uint8_t *src, size_t src_size, const uint32_t 
 	for (size_t r = done; r < count; r++) {
 		const size_t start = views[r].lo;
 		const size_t next = r + 1 < count ? views[r + 1].lo : total;
-		WriteView(views + r, dst + start, static_cast<uint32_t>(next - start), inline_length,
-				  ALL_VALID || RowValid(validity, r));
+		WriteView(views + r, dst + start, static_cast<uint32_t>(next - start), inline_length);
 	}
 	return total;
 }

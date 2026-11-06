@@ -326,7 +326,10 @@ int main() {
 			return 2;
 		}
 	}
-	std::printf("kernels: %s\n", detail::IsaName(detail::ActiveIsa()));
+	const char *offset_env = std::getenv("BENCH_ALIGN_OFFSET");
+	const size_t align_offset = offset_env ? static_cast<size_t>(std::atoi(offset_env)) % 64 : 0;
+	std::printf("kernels: %s; payload %zu bytes past a 64-byte boundary\n", detail::IsaName(detail::ActiveIsa()),
+				align_offset);
 	std::mt19937 rng(91);
 	std::vector<Chunk> chunks;
 	chunks.push_back(Make("ascii short (4-20 B)", 1252, AsciiShort, rng));
@@ -348,6 +351,15 @@ int main() {
 	}
 	std::printf("\n");
 	for (const Chunk &c : chunks) {
+		// The payload where the kernels read it: BENCH_ALIGN_OFFSET bytes past a 64-byte boundary
+		// (default 0), to see what an unaligned staging buffer costs the wide loads.
+		std::vector<uint8_t> storage(c.payload.size() + 128);
+		uint8_t *const src = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(storage.data()) + 63) &
+														 ~static_cast<uintptr_t>(63)) +
+							 align_offset;
+		if (!c.payload.empty()) {
+			memcpy(src, c.payload.data(), c.payload.size());
+		}
 		std::vector<char> dst(Utf8Bound(c.payload.size()));
 		std::vector<char> dst16(c.utf16.size() * 3 + 64);
 		std::vector<uint64_t> out_offsets(VALUES);
@@ -358,16 +370,16 @@ int main() {
 		const int reps = static_cast<int>(std::max<size_t>(50, 40000000 / (c.payload.size() + 1)));
 
 		auto fused = [&]() {
-			return DecodeValues(*c.page, c.payload.data(), c.payload.size(), c.offsets.data(), c.lengths.data(), VALUES,
-								dst.data(), out_offsets.data(), out_lengths.data());
+			return DecodeValues(*c.page, src, c.payload.size(), c.offsets.data(), c.lengths.data(), VALUES, dst.data(),
+								out_offsets.data(), out_lengths.data());
 		};
 		auto column = [&]() {
-			return DecodeColumn(*c.page, c.payload.data(), c.payload.size(), c.offsets.data(), c.lengths.data(),
-								nullptr, VALUES, dst.data(), views.data(), 12);
+			return DecodeColumn(*c.page, src, c.payload.size(), c.offsets.data(), c.lengths.data(), nullptr, VALUES,
+								dst.data(), views.data(), 12);
 		};
 		auto two_pass = [&]() -> size_t {
-			if (simdutf::validate_ascii(reinterpret_cast<const char *>(c.payload.data()), c.payload.size())) {
-				memcpy(dst.data(), c.payload.data(), c.payload.size());
+			if (simdutf::validate_ascii(reinterpret_cast<const char *>(src), c.payload.size())) {
+				memcpy(dst.data(), src, c.payload.size());
 				for (size_t i = 0; i < VALUES; i++) {
 					out_offsets[i] = c.offsets[i];
 					out_lengths[i] = c.lengths[i];
@@ -379,23 +391,22 @@ int main() {
 		// Stage 1 then stage 2 over payload[from, end), written at dst + from: the bytes
 		// before `from` are ASCII, one output byte each.
 		auto stages = [&](size_t from) -> size_t {
-			const size_t units =
-				DecodeToUtf16(*c.page, c.payload.data() + from, c.payload.size() - from, scratch.data());
+			const size_t units = DecodeToUtf16(*c.page, src + from, c.payload.size() - from, scratch.data());
 			return simdutf::convert_valid_utf16le_to_utf8(scratch.data(), units, dst.data() + from);
 		};
 		auto twostage = [&]() -> size_t { return stages(0); };
 		auto ascii64 = [&]() -> size_t {
-			const size_t done = CopyAscii(c.payload.data(), c.payload.size(), dst.data());
+			const size_t done = CopyAscii(src, c.payload.size(), dst.data());
 			return done == c.payload.size() ? done : done + stages(done);
 		};
 		auto autosel = [&]() -> size_t {
-			if (simdutf::validate_ascii(reinterpret_cast<const char *>(c.payload.data()), c.payload.size())) {
-				memcpy(dst.data(), c.payload.data(), c.payload.size());
+			if (simdutf::validate_ascii(reinterpret_cast<const char *>(src), c.payload.size())) {
+				memcpy(dst.data(), src, c.payload.size());
 				return c.payload.size();
 			}
 			return twostage();
 		};
-		auto direct = [&]() { return DecodeToUtf8(*c.page, c.payload.data(), c.payload.size(), dst.data()); };
+		auto direct = [&]() { return DecodeToUtf8(*c.page, src, c.payload.size(), dst.data()); };
 		auto utf16 = [&]() { return simdutf::convert_utf16le_to_utf8(c.utf16.data(), c.utf16.size(), dst16.data()); };
 		auto today = [&]() { return Today(c, today_blob.data(), today_views.data()); };
 		const std::vector<std::function<size_t()>> run = {fused,   column, two_pass, twostage, ascii64,
