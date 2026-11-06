@@ -205,11 +205,15 @@ jobs:
         # than an allowlist (`-**/*` then `+src/**`). An allowlist would
         # silently discard findings in any future first-party directory; a
         # denylist fails loud -- new vendored noise shows up and we add it here.
+        #
+        # Also dropped: spec 091's generated code-page tables (tools/code_pages/emit_tables.py),
+        # array initialisers with no logic to analyse (owner's decision, 2026-11-06).
         uses: advanced-security/filter-sarif@v1
         with:
           patterns: |
             -duckdb/**
             -vcpkg/**
+            -src/codec/code_page/code_page_tables.cpp
           input: sarif-results/cpp.sarif
           output: sarif-results/cpp.sarif
 
