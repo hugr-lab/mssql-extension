@@ -73,5 +73,14 @@ jobs:
           DOCS_TARGET: ionos
         run: npx docusaurus build --out-dir build-ionos
 
+      # What "loads from another host" means is a judgement with two expensive
+      # failure modes: a false negative breaks the CSP and the Datenschutz
+      # promise silently, a false positive blocks every docs deploy. The
+      # fixtures pin both -- an <a href> and a rel=canonical to another site
+      # must pass, a foreign entry anywhere in a srcset must not. No build
+      # needed, so it runs before the one above would have to be waited for.
+      - name: Third-party-load rule judges correctly
+        run: python3 scripts/ci/check_docs_no_third_party.py --self-test
+
       - name: The hugr-lab.com copy loads nothing from another host
         run: python3 scripts/ci/check_docs_no_third_party.py website/build-ionos
