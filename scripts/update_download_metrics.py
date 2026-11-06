@@ -585,7 +585,7 @@ def _check_renders():
 
 
 def _check_coordinate_reader():
-    """svg_coordinates() itself, since the render checks lean on it.
+    r"""svg_coordinates() itself, since the render checks lean on it.
 
     Each case is something the first cut of the bounds check got wrong: it
     compared y against max(W, H), never read <text> or `points`, and its
