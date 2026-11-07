@@ -87,6 +87,180 @@ SELECT count(*) FROM (FROM cp_off.dbo.cp_oracle EXCEPT ALL FROM cp.dbo.cp_oracle
 ----
 0
 
+# Every raw-scan function, double-byte too: the values and, where a describe or
+# sp_prepare can name the collation, the annotation that keeps it.
+query II
+SELECT c, typeof(c) FROM mssql_scan('cp', 'SELECT c932 AS c FROM dbo.cp_oracle WHERE u = 12354');
+----
+あ	MSSQL_VARCHAR(4)
+
+query II
+SELECT c, typeof(c) FROM mssql_scan('cp', 'SELECT c932 AS c FROM dbo.cp_oracle WHERE u = 12354', prepared := true);
+----
+あ	MSSQL_VARCHAR(4)
+
+query II
+SELECT c, typeof(c) FROM mssql_scan_params('cp', 'SELECT c1251 AS c FROM dbo.cp_oracle WHERE u = @u', {'u': 1078});
+----
+ж	MSSQL_VARCHAR(4)
+
+query II
+SELECT c, typeof(c) FROM mssql_scan_params('cp', 'SELECT c1251 AS c FROM dbo.cp_oracle WHERE u = @u', {'u': 1078}, prepared := true);
+----
+ж	MSSQL_VARCHAR(4)
+
+query I
+SELECT c FROM mssql_scan_unsafe('cp', 'SELECT c1251 AS c FROM dbo.cp_oracle WHERE u = 1078', columns := {'c': 'VARCHAR'});
+----
+ж
+
+query I
+SELECT c FROM mssql_scan_params_unsafe('cp', 'SELECT c932 AS c FROM dbo.cp_oracle WHERE u = @u', {'u': 12354}, columns := {'c': 'VARCHAR'});
+----
+あ
+
+# A batch the server cannot describe runs at bind: its collation has no name there, so
+# it stays plain VARCHAR, and is transcoded all the same.
+query II
+SELECT c, typeof(c) FROM mssql_scan('cp', 'SELECT c1251 AS c INTO #t FROM dbo.cp_oracle WHERE u = 1078; SELECT c FROM #t');
+----
+ж	VARCHAR
+
+# A CTAS from a raw scan keeps the source's length and collation.
+statement ok
+SELECT mssql_exec('cp', 'DROP TABLE IF EXISTS dbo.cp_ctas, dbo.cp_ctas_b, dbo.cp_ctas_c, dbo.cp_ctas_s, dbo.cp_ctas_p, dbo.cp_ctas_u');
+
+statement ok
+CREATE TABLE cp.dbo.cp_ctas AS SELECT c FROM mssql_scan('cp', 'SELECT c1251 AS c FROM dbo.cp_oracle WHERE u = 1078');
+
+query III
+SELECT c, t, n FROM mssql_scan('cp', 'SELECT c.c, t.name + ''('' + CAST(k.max_length AS varchar(9)) + '')'' AS t, k.collation_name AS n FROM dbo.cp_ctas c CROSS JOIN sys.columns k JOIN sys.types t ON t.user_type_id = k.user_type_id WHERE k.object_id = OBJECT_ID(''dbo.cp_ctas'')');
+----
+ж	varchar(4)	Cyrillic_General_CI_AS
+
+statement ok
+SELECT mssql_exec('cp', 'DROP TABLE dbo.cp_ctas');
+
+# The rows travel as nvarchar to a code-page column: a declared UTF-8 BIGVARCHAR would be
+# stored as those bytes, read back as other characters. Both load paths, at the column's
+# full width, and on a double-byte page; and a catalog read as the source.
+statement ok
+CREATE TABLE cp.dbo.cp_ctas (id int, v MSSQL_VARCHAR(4, 'Cyrillic_General_CI_AS'), j MSSQL_VARCHAR(4, 'Japanese_CI_AS'));
+
+statement ok
+INSERT INTO cp.dbo.cp_ctas VALUES (1, 'жжжж', 'ああ');
+
+statement ok
+CREATE TABLE cp.dbo.cp_ctas_b AS SELECT * FROM cp.dbo.cp_ctas;
+
+statement ok
+CREATE TABLE cp.dbo.cp_ctas_c AS SELECT * FROM mssql_scan('cp', 'SELECT id, v, j FROM dbo.cp_ctas');
+
+statement ok
+SET mssql_ctas_use_bcp = false;
+
+statement ok
+CREATE TABLE cp.dbo.cp_ctas_s AS SELECT * FROM mssql_scan('cp', 'SELECT id, v, j FROM dbo.cp_ctas');
+
+statement ok
+RESET mssql_ctas_use_bcp;
+
+query III rowsort
+SELECT 'catalog', v, j FROM cp.dbo.cp_ctas_b UNION ALL SELECT 'raw', v, j FROM cp.dbo.cp_ctas_c UNION ALL SELECT 'statements', v, j FROM cp.dbo.cp_ctas_s;
+----
+catalog	жжжж	ああ
+raw	жжжж	ああ
+statements	жжжж	ああ
+
+# Each kept the declarations: the double-byte column's too.
+query IIII rowsort
+SELECT o, c, t, n FROM mssql_scan('cp', 'SELECT OBJECT_NAME(k.object_id) AS o, k.name AS c, t.name + ''('' + CAST(k.max_length AS varchar(9)) + '')'' AS t, k.collation_name AS n
+	FROM sys.columns k JOIN sys.types t ON t.user_type_id = k.user_type_id
+	WHERE k.object_id IN (OBJECT_ID(''dbo.cp_ctas_b''), OBJECT_ID(''dbo.cp_ctas_c''), OBJECT_ID(''dbo.cp_ctas_s'')) AND k.name IN (''v'', ''j'')');
+----
+cp_ctas_b	j	varchar(4)	Japanese_CI_AS
+cp_ctas_b	v	varchar(4)	Cyrillic_General_CI_AS
+cp_ctas_c	j	varchar(4)	Japanese_CI_AS
+cp_ctas_c	v	varchar(4)	Cyrillic_General_CI_AS
+cp_ctas_s	j	varchar(4)	Japanese_CI_AS
+cp_ctas_s	v	varchar(4)	Cyrillic_General_CI_AS
+
+# A pushed CTAS: its query goes whole, with the catalog's types.
+query II
+EXPLAIN CREATE TABLE cp.dbo.cp_ctas_p AS SELECT id, v, j FROM cp.dbo.cp_ctas ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:.*Mssql Scan.*TOP \(1\).*
+
+statement ok
+CREATE TABLE cp.dbo.cp_ctas_p AS SELECT id, v, j FROM cp.dbo.cp_ctas ORDER BY id LIMIT 1;
+
+query II
+SELECT v, j FROM cp.dbo.cp_ctas_p;
+----
+жжжж	ああ
+
+# COPY replacing a table builds its metadata the same way.
+statement ok
+COPY (SELECT * FROM mssql_scan('cp', 'SELECT id, v, j FROM dbo.cp_ctas')) TO 'mssql://cp/dbo/cp_ctas_p' (FORMAT 'bcp', REPLACE true);
+
+query II
+SELECT v, j FROM cp.dbo.cp_ctas_p;
+----
+жжжж	ああ
+
+# mssql_utf8_collation naming a code page: a plain column created under it is a code-page
+# column, and the rows go as nvarchar.
+statement ok
+SET mssql_ctas_text_type = 'VARCHAR';
+
+statement ok
+SET mssql_utf8_collation = 'Cyrillic_General_CI_AS';
+
+statement ok
+CREATE TABLE cp.dbo.cp_ctas_u AS SELECT 'жук'::VARCHAR AS v;
+
+query I
+SELECT v FROM cp.dbo.cp_ctas_u;
+----
+жук
+
+statement ok
+RESET mssql_utf8_collation;
+
+statement ok
+RESET mssql_ctas_text_type;
+
+# A statement's branches describe as the widest: a narrower one still fits the bound.
+statement ok
+SELECT mssql_exec('cp', 'DROP TABLE IF EXISTS dbo.cp_arm1, dbo.cp_arm2;
+CREATE TABLE dbo.cp_arm1 (b varchar(10) COLLATE Cyrillic_General_CI_AS);
+CREATE TABLE dbo.cp_arm2 (d varchar(20) COLLATE Cyrillic_General_CI_AS);
+INSERT dbo.cp_arm1 VALUES (N''ж''); INSERT dbo.cp_arm2 VALUES (N''я'');');
+
+query II
+SELECT b, typeof(b) FROM mssql_scan('cp', 'IF (1 = 1) SELECT b FROM dbo.cp_arm1 ELSE SELECT d AS b FROM dbo.cp_arm2');
+----
+ж	MSSQL_VARCHAR(20)
+
+query I
+SELECT b FROM mssql_scan('cp', 'IF (1 = 1) SELECT b FROM dbo.cp_arm1 ELSE SELECT d AS b FROM dbo.cp_arm2', prepared := true);
+----
+ж
+
+# A value outside ASCII from an annotated column goes as nvarchar: a varchar variable
+# would take the database's code page, and ж would be stored as `?`.
+statement ok
+SELECT mssql_exec_params('cp', 'INSERT dbo.cp_arm2 VALUES (@v)', {'v': b}) FROM mssql_scan('cp', 'SELECT b FROM dbo.cp_arm1');
+
+query I
+SELECT d FROM cp.dbo.cp_arm2 ORDER BY d;
+----
+ж
+я
+
+statement ok
+SELECT mssql_exec('cp', 'DROP TABLE dbo.cp_ctas, dbo.cp_ctas_b, dbo.cp_ctas_c, dbo.cp_ctas_s, dbo.cp_ctas_p, dbo.cp_ctas_u, dbo.cp_arm1, dbo.cp_arm2');
+
 # A short value inlined in its string_t, one past the inline length, a long one.
 statement ok
 SELECT mssql_exec('cp', 'IF OBJECT_ID(''dbo.cp_lengths'') IS NOT NULL DROP TABLE dbo.cp_lengths;

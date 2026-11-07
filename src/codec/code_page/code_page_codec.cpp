@@ -33,13 +33,16 @@ static_assert(string_t::INLINE_LENGTH == 12 || string_t::INLINE_LENGTH == 0,
 //! The low 20 bits of ColumnMetadata::collation: the wire's LCID.
 static constexpr uint32_t WIRE_LCID_MASK = 0xFFFFFu;
 
+const CodePageTable *WireCodePage(const tds::ColumnMetadata &col) {
+	if (!col.IsSingleByteTextColumn() || col.IsUtf8Collation()) {
+		return nullptr;
+	}
+	return FindCodePage(CodePageForWireCollation(col.collation & WIRE_LCID_MASK, false, col.collation_sort_id));
+}
+
 void ResolveWireCodePages(std::vector<tds::ColumnMetadata> &columns) {
 	for (auto &col : columns) {
-		if (!col.IsSingleByteTextColumn() || col.IsUtf8Collation()) {
-			continue;
-		}
-		col.code_page =
-			FindCodePage(CodePageForWireCollation(col.collation & WIRE_LCID_MASK, false, col.collation_sort_id));
+		col.code_page = WireCodePage(col);
 	}
 }
 

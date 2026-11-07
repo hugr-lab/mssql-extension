@@ -1,9 +1,9 @@
 # Spec 092: read code-page strings as bytes and transcode them on the client
 
 Status: in progress on branch `feat/092-codepage-read-path`, from main `0aa8a10` (spec 091's module
-merged, #527, #528). Built so far: D1-D6, D8, D9 and D12: a raw scan transcodes, and the catalog,
-pushed statements and RETURNING read a single-byte page bare. D7 (raw-scan types), the D10 gate and
-the docs remain. Line references below were taken at `4c65cfb` and are refreshed as each part lands.
+merged, #527, #528). Built so far: D1-D9 and D12: a raw scan transcodes and reports the column's type, and the
+catalog, pushed statements and RETURNING read a single-byte page bare. The D10 gate is measured
+(`specs/092-codepage-read-path/measured/`). The docs remain. Line references below were taken at `4c65cfb` and are refreshed as each part lands.
 
 This is 091's consumers (a), the catalog read path, and (b), raw `mssql_scan` correctness (#224).
 The write path stays as it is: `N'...'` literals, BCP as `nvarchar`, and the server replacing what a
@@ -229,8 +229,22 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
     collation flags carry no `_SC` bit (2.2.5.1.2), and 1,488 names exist both with and without
     `_SC` (`tools/code_pages/data/collations.psv`). Typing the COLMETADATA-only shapes from it, and
     dropping #387's describe for those columns, is a later change.
-  - `StreamMatchesBoundShape` (`:401-446`) needs no change. An annotated `varchar(n)` against a
-    `BIGVARCHAR(n)` stream compares equal on kind and length.
+  - **`StreamMatchesBoundShape` takes a stream no longer than the bound.** It compared lengths for
+    equality, which a plain VARCHAR never reached. But the describe answers for every branch of a
+    statement with the widest length (`IF` arms and a procedure's: `varchar(10)` and `varchar(20)`
+    describe as `varchar(20)`), so the annotation would have failed such a statement on every run.
+    `nvarchar` had the same defect. A longer stream, or MAX under a bound, is still refused.
+  - **What the annotation brings to a raw scan** is what a catalog read has already: a CTAS into
+    DuckLake refuses the type (`native_types false` or `c::VARCHAR`), into Fabric refuses a code-page
+    collation by name, and into another SQL Server names the collation in its DDL. Each is a
+    CHANGELOG line under *Changed*.
+  - **A CTAS or COPY into such a type takes the UTF-16 wire** (`GenerateColumnMetadata`): a BIGVARCHAR
+    declared UTF-8 is stored as those bytes, read back as other characters (ж as Р¶). That was the
+    state for a CTAS from a code-page catalog column before this spec; the annotation would have
+    brought it to raw scans.
+  - **A parameter from such a column goes as `nvarchar` when its value is outside ASCII**
+    (`StringDeclaration`): a varchar variable takes the database's code page (#321), so ж from a
+    Cyrillic column under a 1252 database was stored as `?`.
 - **D8: the 079 writer pushes more where the catalog transcodes.**
   - **The veto lifts only when the catalog transcodes and the column's page is single-byte with a
     table** (D1). "a code-page varchar in a computed value" exists because such a value "arrives
@@ -290,6 +304,10 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
     more is named in the PR for the owner. The micro-benchmark predicts a pass on ASCII, Latin and
     Cyrillic (the client faster and the wire halved) and a close call on Cyrillic with typography
     (the client 1.25x slower, the wire still halved); the gate, not the prediction, decides.
+  - **Passed on 2026-11-07,** arm64 (Apple M4 Max) against SQL Server 2025 under Rosetta: B / A 0.43
+    to 0.74 on every gated workload, the wire halved, the server's CPU down 26-57%
+    (`measured/2026-11-07-gate-arm64.md`, `test/bench/bench_code_page_gate.py`). The server runs
+    emulated here, about 1.8x slow, so the wall and CPU gains are likely overstated; the wire is not.
   - **The environment that decides it is local:** the SQL Server 2022 container of
     `make docker-up` (`docker/docker-compose.yml:15`) on the machine that runs DuckDB. It is the hard
     case for B, since the wire bytes B saves cost least there. A networked run, where one is at

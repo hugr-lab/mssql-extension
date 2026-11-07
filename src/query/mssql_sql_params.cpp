@@ -121,10 +121,25 @@ static std::string StringDeclaration(const LogicalType &type, const Value &value
 	// A spec 060 annotation says exactly what the column is; a variable cannot
 	// carry a COLLATE clause, so only the kind and the length travel -- the
 	// server converts the value to the column's collation where it is compared.
+	//
+	// But a varchar variable takes the DATABASE's code page, not the column's (#321),
+	// so a value outside ASCII would become `?` on the way in, with no error: ж from a
+	// Cyrillic column under a 1252 database. Such a value goes as nvarchar, n bytes of
+	// varchar being at most n characters.
 	codec::TargetStringType spec;
 	if (codec::TryGetTargetStringType(type, spec)) {
+		const bool max = codec::IsMaxLength(spec.length);
+		if (!spec.unicode && !value.IsNull()) {
+			const auto &text = StringValue::Get(value);
+			const bool ascii = std::all_of(text.begin(), text.end(), [](char c) { return (c & 0x80) == 0; });
+			if (!ascii) {
+				return max || spec.length > codec::MAX_NVARCHAR_LENGTH
+						   ? "nvarchar(max)"
+						   : "nvarchar(" + std::to_string(spec.length) + ")";
+			}
+		}
 		std::string decl = spec.unicode ? "nvarchar(" : "varchar(";
-		decl += codec::IsMaxLength(spec.length) ? std::string("max") : std::to_string(spec.length);
+		decl += max ? std::string("max") : std::to_string(spec.length);
 		return decl + ")";
 	}
 	// A plain VARCHAR: the two buckets Microsoft.Data.SqlClient uses, so a call

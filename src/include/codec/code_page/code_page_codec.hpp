@@ -30,6 +30,10 @@ namespace code_page {
 
 using tables::CodePageTable;
 
+//! The page a single-byte text column's wire collation names, or nullptr: not such a
+//! column, a UTF-8 collation, or one newer than the tables.
+const CodePageTable *WireCodePage(const tds::ColumnMetadata &col);
+
 //! Set ColumnMetadata::code_page on every single-byte text column whose wire
 //! collation names a page the module has a table for. Other columns keep nullptr,
 //! and a collation newer than the tables keeps today's verbatim bytes (and the
