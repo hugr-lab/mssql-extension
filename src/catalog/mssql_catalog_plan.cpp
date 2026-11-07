@@ -128,6 +128,7 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 	// The OUTPUT list of an INSERT … RETURNING is built by the same function as
 	// the scan's SELECT list, and that function takes this setting.
 	target.convert_varchar_max = LoadConvertVarcharMax(context);
+	target.client_transcode = table_entry.ParentCatalog().Cast<MSSQLCatalog>().ClientTranscode();
 
 	// Spec 077 W2: is the identity column among the columns being inserted?
 	// Only for a table — SET IDENTITY_INSERT takes a table, and an explicit
@@ -471,6 +472,7 @@ static void PrepareReturning(ClientContext &context, MSSQLTableEntry &table_entr
 		target.table_types.push_back(col.Type());
 	}
 	target.convert_varchar_max = LoadConvertVarcharMax(context);
+	target.client_transcode = table_entry.ParentCatalog().Cast<MSSQLCatalog>().ClientTranscode();
 	const idx_t ncols = target.table_types.size();
 	if (ncols != target.table_columns.size()) {
 		throw InternalException("MSSQL RETURNING: %llu DuckDB columns, %llu SQL Server columns",

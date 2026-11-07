@@ -119,7 +119,8 @@ struct MSSQLInsertColumn {
 
 	// Max length in bytes, -1 for the MAX forms. Carried from MSSQLColumnInfo
 	// because the OUTPUT list is built by MSSQLColumnInfo::BuildReadExpression,
-	// which needs it to size the NVARCHAR cast of a non-UTF-8 text column.
+	// which needs it to size the NVARCHAR cast of a text column the client does
+	// not transcode.
 	int16_t max_length;
 
 	// Column flags
@@ -140,7 +141,7 @@ struct MSSQLInsertColumn {
 
 	// Full constructor
 	// max_length has NO default on purpose: 0 is not a safe length. For a
-	// char/varchar column under a non-UTF-8 collation BuildReadExpression asks
+	// char/varchar column the client does not transcode BuildReadExpression asks
 	// NVarcharLength for the OUTPUT cast, and 0 renders `CAST([c] AS
 	// NVARCHAR(0))`, which SQL Server rejects with what reads like a syntax or
 	// collation error. sys.columns spells MAX as -1; a caller that has no

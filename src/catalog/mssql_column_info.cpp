@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include "codec/code_page/code_page.hpp"
 #include "codec/target_string_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/extension_type_info.hpp"
@@ -431,8 +432,9 @@ bool MSSQLColumnInfo::IsUnicodeType(const string &sql_type_name) {
 
 namespace {
 
-//! TEXT / NTEXT / IMAGE — the pre-2005 LOB types. Their wire tokens are not
-//! the varchar/nvarchar/varbinary ones and no codec decodes them.
+//! TEXT / NTEXT / IMAGE — the pre-2005 LOB types. Their wire tokens are not the
+//! varchar/nvarchar/varbinary ones: the staged path decodes them, the per-value one
+//! (TypeConverter::ConvertValue) does not.
 enum class LegacyLob { None, Text, NText, Image };
 
 LegacyLob LegacyLobKind(const string &sql_type_name) {
@@ -451,12 +453,21 @@ LegacyLob LegacyLobKind(const string &sql_type_name) {
 	return LegacyLob::None;
 }
 
+//! Which page family the client transcodes by default (spec 092 D10). A double-byte
+//! page keeps the server's cast: its wire bytes are nearly equal and the client's
+//! decode costs ~11.6x simdutf's (owner's decision, measured). A raw scan does not
+//! ask: it has no cast to keep.
+bool TranscodeOnClientByDefault(const mssql::codec::code_page::CodePageTable &page) {
+	return !mssql::codec::code_page::IsDoubleByte(page);
+}
+
 //! Does this column need the CHAR/VARCHAR/TEXT -> NVARCHAR rewrite?
 //!
-//! Only non-Unicode text under a non-UTF-8 collation: its bytes are in the
-//! column's code page, and a DuckDB VARCHAR is UTF-8 by contract.
+//! Only non-Unicode text under a non-UTF-8 collation that the client does not
+//! transcode: its bytes are in the column's code page, and a DuckDB VARCHAR is
+//! UTF-8 by contract.
 bool NeedsNVarcharConversion(const string &sql_type_name, int16_t max_length, const string &collation_name,
-							 bool convert_varchar_max) {
+							 bool convert_varchar_max, bool client_transcode) {
 	if (MSSQLColumnInfo::IsUnicodeType(sql_type_name)) {
 		return false;  // already Unicode
 	}
@@ -466,14 +477,17 @@ bool NeedsNVarcharConversion(const string &sql_type_name, int16_t max_length, co
 	if (MSSQLColumnInfo::IsUTF8Collation(collation_name)) {
 		return false;  // UTF-8 is safe to pass through
 	}
+	if (MSSQLColumnInfo::ClientTranscodedPage(sql_type_name, collation_name, client_transcode)) {
+		return false;  // read as bytes, transcoded on the client
+	}
 	// The setting governs *declared*-MAX columns only (max_length == -1), matching its name and
 	// documented purpose. A varchar(4001..8000) is not VARCHAR(MAX): the length helper promotes it
 	// to NVARCHAR(MAX) because no shorter NVARCHAR could hold it, not because the user asked for
 	// MAX, so the opt-out does not apply to it.
 	//
-	// TEXT is never opted out. Unlike varchar it has no decodable uncast wire form: it is a known
-	// type (so is_cast_required is false) and dropping the CAST would put TDS_TYPE_TEXT (0x23) on
-	// the wire, which no codec handles — the read would fail outright rather than degrade.
+	// TEXT is never opted out. The staged path decodes its wire form since #197, but the per-value
+	// one does not (TypeConverter::ConvertValue has no TEXT arm): dropping the CAST would fail a
+	// composite rowid's STRUCT and INSERT ... RETURNING outright rather than degrade.
 	if (LegacyLobKind(sql_type_name) == LegacyLob::None && max_length == -1 && !convert_varchar_max) {
 		return false;
 	}
@@ -500,17 +514,31 @@ string NVarcharLength(const string &sql_type_name, int16_t max_length) {
 
 }  // namespace
 
+const mssql::codec::code_page::tables::CodePageTable *MSSQLColumnInfo::ClientTranscodedPage(
+	const string &sql_type_name, const string &collation_name, bool client_transcode) {
+	if (!client_transcode) {
+		return nullptr;
+	}
+	const auto type = StringUtil::Lower(sql_type_name);
+	if (type != "char" && type != "varchar") {
+		return nullptr;
+	}
+	const auto *collation = mssql::codec::code_page::FindCollationByName(collation_name.c_str(), collation_name.size());
+	const auto *page = collation ? mssql::codec::code_page::FindCodePage(collation->code_page) : nullptr;
+	return page && TranscodeOnClientByDefault(*page) ? page : nullptr;
+}
+
 string MSSQLColumnInfo::BuildReturningExpression(const string &col_name, const string &sql_type_name,
 												 int16_t max_length, const string &collation_name,
-												 bool convert_varchar_max, const string &qualifier,
-												 const string &alias) {
+												 bool convert_varchar_max, bool client_transcode,
+												 const string &qualifier, const string &alias) {
 	const auto type = StringUtil::Lower(sql_type_name);
 	const auto reference = qualifier + mssql::QuoteIdentifier(col_name);
 	const auto as = " AS " + mssql::QuoteIdentifier(alias.empty() ? col_name : alias);
 	if (type == "timestamp" || type == "rowversion") {
 		return "CAST(" + reference + " AS binary(8))" + as;
 	}
-	if (type == "char") {
+	if (type == "char" && !ClientTranscodedPage(sql_type_name, collation_name, client_transcode)) {
 		// The read expression is NCHAR(n) (#405), which doubles a char's fixed
 		// width in the table this types: two char(2100) columns came to 8400
 		// bytes, past the 8060-byte row (1701), where the source table and a
@@ -519,13 +547,14 @@ string MSSQLColumnInfo::BuildReturningExpression(const string &col_name, const s
 		return "RTRIM(CAST(" + reference + " AS NVARCHAR(" +
 			   (max_length > 0 && max_length <= 4000 ? std::to_string(max_length) : string("MAX")) + ")))" + as;
 	}
-	return BuildReadExpression(col_name, sql_type_name, max_length, collation_name, convert_varchar_max, qualifier,
-							   alias);
+	return BuildReadExpression(col_name, sql_type_name, max_length, collation_name, convert_varchar_max,
+							   client_transcode, qualifier, alias);
 }
 
 string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string &sql_type_name, int16_t max_length,
 											const string &collation_name, bool convert_varchar_max,
-											const string &qualifier, const string &alias, bool utf8_on_wire) {
+											bool client_transcode, const string &qualifier, const string &alias,
+											bool utf8_on_wire) {
 	const string escaped_name = mssql::QuoteIdentifier(alias.empty() ? col_name : alias);
 	const string reference = qualifier + mssql::QuoteIdentifier(col_name);
 
@@ -556,15 +585,18 @@ string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string
 	// DISTINCT there no longer agreed with the server ('AB  ' of a char(4)
 	// against 'AB    ' of a char(6): 0 rows joined, 2 on the server). So it is
 	// read as NCHAR(n), whose n characters hold the column's n bytes in any code
-	// page or in UTF-8, or, past NCHAR's 4000, trimmed by the server.
-	if (StringUtil::Lower(sql_type_name) == "char" && (!IsUTF8Collation(collation_name) || !utf8_on_wire)) {
+	// page or in UTF-8, or, past NCHAR's 4000, trimmed by the server. One the client
+	// transcodes is read as itself, BIGCHAR, and the codec trims the output (spec
+	// 092 D3).
+	if (StringUtil::Lower(sql_type_name) == "char" && (!IsUTF8Collation(collation_name) || !utf8_on_wire) &&
+		!ClientTranscodedPage(sql_type_name, collation_name, client_transcode)) {
 		if (max_length > 0 && max_length <= 4000) {
 			return "CAST(" + reference + " AS NCHAR(" + std::to_string(max_length) + ")) AS " + escaped_name;
 		}
 		return "RTRIM(CAST(" + reference + " AS NVARCHAR(MAX))) AS " + escaped_name;
 	}
 
-	if (NeedsNVarcharConversion(sql_type_name, max_length, collation_name, convert_varchar_max)) {
+	if (NeedsNVarcharConversion(sql_type_name, max_length, collation_name, convert_varchar_max, client_transcode)) {
 		return "CAST(" + reference + " AS NVARCHAR(" + NVarcharLength(sql_type_name, max_length) + ")) AS " +
 			   escaped_name;
 	}

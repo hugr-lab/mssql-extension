@@ -129,17 +129,20 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 
 	// mssql_warn_non_utf8_collation - the off switch for the issue #224 warning.
-	// On by default because the whole point is that the behaviour is documented
-	// rather than enforced, and a documented behaviour nobody is told about is
-	// not much better than an undocumented one. But the trigger IS the majority
-	// configuration -- SQL_Latin1_General_CP1_CI_AS is the installation default --
-	// so a raw mssql_scan() over a legacy-collation server logs one line per
-	// varchar column per query, forever, including for data that is pure ASCII
-	// and therefore already valid UTF-8. Anyone who has read the warning once and
-	// decided their data is fine needs a way to stop hearing it.
+	// Narrowed by spec 092 D9 to the two cases in which code-page bytes still reach
+	// a DuckDB VARCHAR verbatim: a catalog with client_transcode false, and a
+	// collation newer than the tables. On by default because the behaviour is
+	// documented rather than enforced, and a documented behaviour nobody is told
+	// about is not much better than an undocumented one. Under client_transcode
+	// false the trigger is the majority configuration --
+	// SQL_Latin1_General_CP1_CI_AS is the installation default -- so a raw
+	// mssql_scan() logs one line per varchar column per query, including for pure
+	// ASCII, and anyone who has decided their data is fine needs a way to stop
+	// hearing it.
 	config.AddExtensionOption("mssql_warn_non_utf8_collation",
-							  "Log a warning when a CHAR/VARCHAR/TEXT column arrives with a non-UTF-8 collation, "
-							  "since its bytes are returned verbatim into a DuckDB VARCHAR (default: true)",
+							  "Log a warning when a CHAR/VARCHAR/TEXT column's code-page bytes are returned verbatim "
+							  "into a DuckDB VARCHAR: client_transcode off, or a collation newer than this build's "
+							  "tables (default: true)",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 
 	// mssql_test_fail_metadata_after_rows - TEST ONLY (issue #317).
@@ -594,7 +597,10 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 	// mssql_convert_varchar_max - Convert VARCHAR(MAX) to NVARCHAR(MAX) in table scans
 	// When true: VARCHAR(MAX) with non-UTF8 collation is wrapped in CAST(... AS NVARCHAR(MAX))
 	// When false: VARCHAR(MAX) is NOT converted (preserves 4096-byte TDS buffer capacity)
-	// Note: This only applies to catalog table scans, not mssql_scan() raw queries
+	// Note: This only applies to catalog table scans, not mssql_scan() raw queries, and
+	// only to a column the client does not transcode (spec 092 D9): a single-byte page's
+	// is read as itself either way. On a double-byte page false drops the cast, and the
+	// client transcodes it by the wire's page.
 	config.AddExtensionOption(
 		"mssql_convert_varchar_max",
 		"Convert VARCHAR(MAX) to NVARCHAR(MAX) in table scans for UTF-8 compatibility (default: true)",

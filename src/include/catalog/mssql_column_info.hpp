@@ -6,6 +6,16 @@
 
 namespace duckdb {
 
+namespace mssql {
+namespace codec {
+namespace code_page {
+namespace tables {
+struct CodePageTable;
+}  // namespace tables
+}  // namespace code_page
+}  // namespace codec
+}  // namespace mssql
+
 //===----------------------------------------------------------------------===//
 // MSSQLColumnInfo - Column metadata including SQL Server-specific information
 //===----------------------------------------------------------------------===//
@@ -138,18 +148,23 @@ struct MSSQLColumnInfo {
 	//!
 	//!   - spatial UDTs -> `.STAsBinary()`, so the wire carries OGC WKB rather
 	//!     than SQL Server's own Spatial Type Binary Format;
-	//!   - `ntext` -> `NVARCHAR(MAX)`, `image` -> `VARBINARY(MAX)`: no codec
-	//!     handles their wire tokens;
+	//!   - `ntext` -> `NVARCHAR(MAX)`, `image` -> `VARBINARY(MAX)`: the per-value
+	//!     decoders have no arm for their wire tokens;
 	//!   - a type with no decodable wire form at all (sql_variant, hierarchyid,
 	//!     a CLR UDT) -> `NVARCHAR(MAX)`;
 	//!   - a non-UTF-8 CHAR/VARCHAR/TEXT -> `NVARCHAR(n)`, because a DuckDB
-	//!     VARCHAR is UTF-8 by contract.
+	//!     VARCHAR is UTF-8 by contract, unless the client transcodes it
+	//!     (`client_transcode` below).
 	//!
 	//! Every flag it needs is a pure function of the type name and the
 	//! collation, which is why it takes those rather than an MSSQLColumnInfo:
 	//! the INSERT path holds an MSSQLInsertColumn and would otherwise have to
 	//! grow a copy of this logic, which is exactly what went wrong.
 	//!
+	//! @param client_transcode the catalog's mssql_client_transcode (spec 092 D4):
+	//!                  a char / varchar under a single-byte page is then read as
+	//!                  itself and transcoded on the client (ClientTranscodedPage).
+	//!                  No default: a caller must not keep the cast by forgetting it.
 	//! @param qualifier prefix for the column REFERENCE, e.g. `"INSERTED."`.
 	//!                  The alias is never qualified, so the result always comes
 	//!                  back under the column's own name.
@@ -160,22 +175,33 @@ struct MSSQLColumnInfo {
 	//!                  the codec. False -- the default, right on any
 	//!                  connection -- reads it as NCHAR(n) (issue #405).
 	static string BuildReadExpression(const string &col_name, const string &sql_type_name, int16_t max_length,
-									  const string &collation_name, bool convert_varchar_max,
+									  const string &collation_name, bool convert_varchar_max, bool client_transcode,
 									  const string &qualifier = "", const string &alias = "",
 									  bool utf8_on_wire = false);
+
+	//! The code page a column's bare read is transcoded from on the client, or
+	//! nullptr when the read expression keeps the server's cast (spec 092 D1, D10):
+	//! the catalog does not transcode, the type is not char / varchar (`text` keeps
+	//! its cast, D1), the collation names no table, or the page is double-byte. A
+	//! pure function of the type, the collation name and the flag, so a caller
+	//! holding an MSSQLInsertColumn needs no page of its own (D5).
+	static const mssql::codec::code_page::tables::CodePageTable *ClientTranscodedPage(const string &sql_type_name,
+																					  const string &collation_name,
+																					  bool client_transcode);
 
 	//! A RETURNING column, as `OUTPUT … INTO <table>` writes it and as the
 	//! `SELECT … INTO` that creates that table types it. It is the read
 	//! expression, with two exceptions:
 	//! - a `rowversion` is cast to `binary(8)`: an OUTPUT cannot write into a
 	//!   `timestamp` column, and SELECT INTO would make one;
-	//! - a `char(n)` is a trimmed NVARCHAR, not the read's NCHAR(n), which
-	//!   doubles its fixed width past the 8060-byte row.
+	//! - a `char(n)` read as NCHAR(n) is a trimmed NVARCHAR instead, because
+	//!   NCHAR(n) doubles its fixed width past the 8060-byte row. One read bare
+	//!   (spec 092) has the source's own width and comes through as it is.
 	//! Shared by INSERT … RETURNING (#471) and the staged UPDATE / DELETE …
 	//! RETURNING (spec 080 PR 2b).
 	static string BuildReturningExpression(const string &col_name, const string &sql_type_name, int16_t max_length,
 										   const string &collation_name, bool convert_varchar_max,
-										   const string &qualifier, const string &alias = "");
+										   bool client_transcode, const string &qualifier, const string &alias = "");
 };
 
 }  // namespace duckdb

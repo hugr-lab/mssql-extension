@@ -508,11 +508,33 @@ SELECT (SELECT count(*) FROM ((SELECT * FROM w_on EXCEPT ALL SELECT * FROM w_off
 # Vetoes: the catalog scan, DuckDB's rows.
 #
 
-# A code-page varchar value (arrives untranscoded).
+# A code-page varchar value: transcoded on the client (spec 092 D8), and untranscoded
+# under client_transcode false, so left to the scan there.
 query II
 EXPLAIN SELECT id, lag(c) OVER (ORDER BY id) FROM rw_on.dbo.rw_t ORDER BY id LIMIT 100;
 ----
+physical_plan	<REGEX>:.*LAG\(\[c\].*
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rw_cast (TYPE mssql, client_transcode false);
+
+query II
+EXPLAIN SELECT id, lag(c) OVER (ORDER BY id) FROM rw_cast.dbo.rw_t ORDER BY id LIMIT 100;
+----
 physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query I
+SELECT count(*) FROM (SELECT id, lag(c) OVER (ORDER BY id) FROM rw_on.dbo.rw_t EXCEPT ALL SELECT id, lag(c) OVER (ORDER BY id) FROM rw_cast.dbo.rw_t);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, lag(c) OVER (ORDER BY id) FROM rw_cast.dbo.rw_t EXCEPT ALL SELECT id, lag(c) OVER (ORDER BY id) FROM rw_on.dbo.rw_t);
+----
+0
+
+statement ok
+DETACH rw_cast;
 
 # A code-page varchar key (the collation's order).
 query II

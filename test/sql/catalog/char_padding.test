@@ -61,7 +61,7 @@ ABCD	2
 query II
 EXPLAIN SELECT list(length(cp) ORDER BY length(cp)) FROM (SELECT cp FROM cpadp.dbo.CharPad6 ORDER BY id LIMIT 2);
 ----
-physical_plan	<REGEX>:.*SELECT TOP \(2\) CAST\(\[cp\] AS NCHAR\(6\)\).*
+physical_plan	<REGEX>:.*SELECT TOP \(2\) \[cp\] FROM.*
 
 query I
 SELECT list(length(cp) ORDER BY length(cp)) FROM (SELECT cp FROM cpadp.dbo.CharPad6 ORDER BY id LIMIT 2);

@@ -74,6 +74,19 @@ SELECT c FROM mssql_scan('cp', 'SELECT c932 AS c FROM dbo.cp_oracle WHERE u = 12
 ----
 あ
 
+# The same 16 pages through the catalog: bare, with the page check, against the
+# server's cast, both ways round. (Double-byte pages are cast on both sides here: the
+# raw read above is what transcodes them.)
+query I
+SELECT count(*) FROM (FROM cp.dbo.cp_oracle EXCEPT ALL FROM cp_off.dbo.cp_oracle);
+----
+0
+
+query I
+SELECT count(*) FROM (FROM cp_off.dbo.cp_oracle EXCEPT ALL FROM cp.dbo.cp_oracle);
+----
+0
+
 # A short value inlined in its string_t, one past the inline length, a long one.
 statement ok
 SELECT mssql_exec('cp', 'IF OBJECT_ID(''dbo.cp_lengths'') IS NOT NULL DROP TABLE dbo.cp_lengths;

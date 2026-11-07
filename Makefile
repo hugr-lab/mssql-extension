@@ -35,7 +35,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test code-pages-generate code-pages-tables test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check help
+.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -854,6 +854,7 @@ bench-utf16: release
 # and committed (tools/code_pages/data/ -> src/codec/code_page/code_page_tables.cpp):
 #   make code-pages-generate       ask the test server again (needs `make docker-up`)
 #   make code-pages-tables         re-emit the C++ from the committed data
+#   make code-pages-check-wire     every collation's wire key against the test server
 #   make test-code-page            the kernel against the data; no server, no DuckDB, no
 #                                  simdutf: the platform's SIMD form (NEON / SSE2)
 #   make test-code-page-portable   the same, built with the 8-byte SWAR form
@@ -874,6 +875,10 @@ code-pages-generate: release
 
 code-pages-tables:
 	@python3 tools/code_pages/emit_tables.py
+
+# Spec 092 D1: every collation's wire key against a live server (needs `make docker-up`).
+code-pages-check-wire: release
+	@python3 tools/code_pages/check_wire_keys.py
 
 test-code-page:
 	@mkdir -p build/test

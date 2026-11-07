@@ -117,6 +117,21 @@ static void ExpectParams(const std::string &sql, const std::string &declarations
 	}
 }
 
+//! The same under client_transcode false (spec 092 D4): what a catalog with the
+//! escape hatch on sends, the server's cast and the vetoes that come with it.
+static void ExpectServerCast(const std::string &sql, const std::string &expected) {
+	SQLWriterOptions options;
+	options.client_transcode = false;
+	WrittenQuery out;
+	std::string why;
+	const bool wrote = WriteWith(options, sql, out, why);
+	if (expected.empty() ? wrote : !wrote || out.statement != expected) {
+		std::cerr << "FAIL under client_transcode false: " << sql << "\n  expected: " << expected
+				  << "\n  actual:   " << (wrote ? out.statement : "refused: " + why) << "\n";
+		failures++;
+	}
+}
+
 static void ExpectVeto(const std::string &sql) {
 	WrittenQuery out;
 	std::string why;
@@ -205,8 +220,9 @@ static void ExpectDmlVeto(const std::string &sql, bool from_join = true, const s
 // unless it is a UTF-8 char on a connection granted UTF8SUPPORT (a BIGCHAR on
 // the wire), and trimmed by the server past NCHAR's 4000.
 static void ExpectRead(const std::string &type, int16_t length, const std::string &collation, bool utf8_on_wire,
-					   const std::string &expected) {
-	const auto got = MSSQLColumnInfo::BuildReadExpression("c", type, length, collation, true, "", "", utf8_on_wire);
+					   const std::string &expected, bool client_transcode = false) {
+	const auto got = MSSQLColumnInfo::BuildReadExpression("c", type, length, collation, true, client_transcode, "", "",
+														  utf8_on_wire);
 	if (got != expected) {
 		std::cerr << "FAIL read " << type << "(" << length << ") " << collation << ": " << got
 				  << "\n  expected: " << expected << std::endl;
@@ -226,6 +242,36 @@ static void TestCharReadExpressions() {
 	ExpectRead("varchar", 30, cp, true, "CAST([c] AS NVARCHAR(30)) AS [c]");
 	ExpectRead("varchar", 30, u8, false, "[c]");
 	ExpectRead("nchar", 8, "", true, "[c]");
+	// Spec 092: under client_transcode a single-byte page is read as itself, any
+	// length, and the rest keeps what it had.
+	const std::string jp = "Japanese_CI_AS";
+	const auto transcoded = [](const std::string &type, int16_t length, const std::string &collation,
+							   const std::string &expected) {
+		ExpectRead(type, length, collation, true, expected, true);
+	};
+	transcoded("char", 4, cp, "[c]");
+	transcoded("CHAR", 5000, cp, "[c]");
+	transcoded("varchar", 30, cp, "[c]");
+	transcoded("varchar", 5000, cp, "[c]");
+	transcoded("varchar", -1, cp, "[c]");
+	transcoded("text", 16, cp, "CAST([c] AS NVARCHAR(MAX)) AS [c]");
+	transcoded("varchar", 30, jp, "CAST([c] AS NVARCHAR(30)) AS [c]");
+	transcoded("char", 4, jp, "CAST([c] AS NCHAR(4)) AS [c]");
+	transcoded("varchar", 30, u8, "[c]");
+	transcoded("varchar", 30, "No_Such_Collation_CI_AS", "CAST([c] AS NVARCHAR(30)) AS [c]");
+	// RETURNING: a bare char keeps the source's width; the NVARCHAR detour is only
+	// for the NCHAR(n) read.
+	const auto returning = [](const std::string &collation, bool client_transcode, const std::string &expected) {
+		const auto got =
+			MSSQLColumnInfo::BuildReturningExpression("c", "char", 2100, collation, true, client_transcode, "t.", "c1");
+		if (got != expected) {
+			std::cerr << "FAIL returning " << collation << ": " << got << "\n  expected: " << expected << std::endl;
+			failures++;
+		}
+	};
+	returning(cp, true, "t.[c] AS [c1]");
+	returning(cp, false, "RTRIM(CAST(t.[c] AS NVARCHAR(2100))) AS [c1]");
+	returning(jp, true, "RTRIM(CAST(t.[c] AS NVARCHAR(2100))) AS [c1]");
 }
 
 int main() {
@@ -375,16 +421,17 @@ int main() {
 	ExpectDmlVeto("UPDATE t SET id = row_number() OVER ()");
 	ExpectDmlVeto("DELETE FROM t WHERE id = max(id)");
 
-	// Projections go through BuildReadExpression: a non-UTF-8 varchar is read
-	// through its NVARCHAR cast, as the catalog scan reads it.
+	// Projections go through BuildReadExpression, as the catalog scan reads them: a
+	// single-byte code page bare, or its NVARCHAR cast under client_transcode false.
 	ExpectSql("SELECT id, name FROM t LIMIT 5", "SELECT TOP (5) [id], [name] FROM [dbo].[t]");
-	ExpectSql("SELECT legacy FROM t LIMIT 1",
-			  "SELECT TOP (1) CAST([legacy] AS NVARCHAR(30)) AS [legacy] FROM [dbo].[t]");
+	ExpectSql("SELECT legacy FROM t LIMIT 1", "SELECT TOP (1) [legacy] FROM [dbo].[t]");
+	ExpectServerCast("SELECT legacy FROM t LIMIT 1",
+					 "SELECT TOP (1) CAST([legacy] AS NVARCHAR(30)) AS [legacy] FROM [dbo].[t]");
 	ExpectSql("SELECT id AS x, t.name FROM t LIMIT 1", "SELECT TOP (1) [id] AS [x], [name] FROM [dbo].[t]");
 	ExpectSql("SELECT id AS id FROM t LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 	ExpectSql("SELECT * FROM t LIMIT 1",
-			  "SELECT TOP (1) [id], [name], [code], [amount], [day], [flag], [ts], CAST([legacy] AS NVARCHAR(30)) AS "
-			  "[legacy], [wide], [mid], [tiny], [ratio], [doc], [small] FROM [dbo].[t]");
+			  "SELECT TOP (1) [id], [name], [code], [amount], [day], [flag], [ts], [legacy], [wide], [mid], [tiny], "
+			  "[ratio], [doc], [small] FROM [dbo].[t]");
 	ExpectSql("SELECT q.id FROM t AS q LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t]");
 
 	// WHERE: constants are parameters declared from the column.
@@ -533,7 +580,11 @@ int main() {
 	ExpectVeto("SELECT id FROM t WHERE id LIMIT 1");				// an int is not a condition
 	ExpectVeto("SELECT CASE WHEN id > 1 THEN id ELSE amount END FROM t LIMIT 1");  // int and decimal
 	ExpectVeto("SELECT coalesce(name, code) FROM t LIMIT 1");					   // two collations
-	ExpectVeto("SELECT coalesce(legacy, 'x') FROM t LIMIT 1");	// a code-page varchar arrives untranscoded
+	// A code-page varchar in a computed value: transcoded by its wire collation (spec
+	// 092 D8); without that it would arrive as bytes.
+	ExpectSql("SELECT coalesce(legacy, 'x') FROM t LIMIT 1",
+			  "SELECT TOP (1) COALESCE([legacy], @p0) AS [COALESCE(legacy, 'x')] FROM [dbo].[t]");
+	ExpectServerCast("SELECT coalesce(legacy, 'x') FROM t LIMIT 1", "");
 	ExpectVeto("SELECT CASE WHEN id > 1 THEN id ELSE 2.0 END FROM t LIMIT 1");	// 2.0 widens DuckDB's type
 	ExpectVeto("SELECT id + 2.0 FROM t LIMIT 1");
 	ExpectSql("SELECT id FROM t WHERE id = 2.0 LIMIT 1", "SELECT TOP (1) [id] FROM [dbo].[t] WHERE ([id] = @p0)");
@@ -697,8 +748,8 @@ int main() {
 	ExpectVeto("SELECT sum(id) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t");
 	ExpectVeto("SELECT count(DISTINCT id) OVER () FROM t");
 	ExpectVeto("SELECT lag(id IGNORE NULLS) OVER (ORDER BY id) FROM t");
-	ExpectVeto("SELECT lag(legacy) OVER (ORDER BY id) FROM t");		  // a code-page varchar value
-	ExpectVeto("SELECT row_number() OVER (ORDER BY legacy) FROM t");  // its order is the collation's
+	ExpectServerCast("SELECT lag(legacy) OVER (ORDER BY id) FROM t", "");  // a code-page varchar value
+	ExpectVeto("SELECT row_number() OVER (ORDER BY legacy) FROM t");	   // its order is the collation's
 	ExpectSql("SELECT row_number() OVER (PARTITION BY ratio ORDER BY id) AS r FROM t",
 			  "SELECT ROW_NUMBER() OVER (PARTITION BY [ratio] ORDER BY [id] ASC) AS [r] FROM [dbo].[t]",
 			  false);															   // groupable as GROUP BY's keys are
@@ -783,9 +834,8 @@ int main() {
 	// GROUP BY columns -- by name, position or select alias -- and HAVING.
 	ExpectSql("SELECT id, count(*) AS c FROM t GROUP BY id",
 			  "SELECT [id], COUNT_BIG(*) AS [c] FROM [dbo].[t] GROUP BY [id]");
-	ExpectSql(
-		"SELECT legacy, count(*) AS c FROM t GROUP BY 1",
-		"SELECT CAST([legacy] AS NVARCHAR(30)) AS [legacy], COUNT_BIG(*) AS [c] FROM [dbo].[t] GROUP BY [legacy]");
+	ExpectSql("SELECT legacy, count(*) AS c FROM t GROUP BY 1",
+			  "SELECT [legacy], COUNT_BIG(*) AS [c] FROM [dbo].[t] GROUP BY [legacy]");
 	ExpectSql("SELECT day AS d, sum(amount) AS s FROM t WHERE id > 0 GROUP BY d HAVING count(*) > 1",
 			  "SELECT [day] AS [d], SUM([amount]) AS [s] FROM [dbo].[t] WHERE ([id] > @p0) GROUP BY [day] HAVING "
 			  "(COUNT_BIG(*) > @p1)");
@@ -817,7 +867,7 @@ int main() {
 	ExpectSql("SELECT DISTINCT id, name FROM t LIMIT 5", "SELECT DISTINCT TOP (5) [id], [name] FROM [dbo].[t]");
 	ExpectSql("SELECT DISTINCT id FROM t ORDER BY id LIMIT 5",
 			  "SELECT DISTINCT TOP (5) [id] FROM [dbo].[t] ORDER BY [t].[id] ASC");
-	ExpectVeto("SELECT DISTINCT legacy FROM t ORDER BY legacy LIMIT 5");  // read through a CAST: 145
+	ExpectVeto("SELECT DISTINCT legacy FROM t ORDER BY legacy LIMIT 5");  // its order is the collation's
 	ExpectVeto("SELECT DISTINCT day FROM t ORDER BY day LIMIT 5");		  // the NULL-placing CASE: 145
 	ExpectVeto("SELECT DISTINCT code FROM t ORDER BY code LIMIT 5");	  // the varbinary key: 145
 	ExpectVeto("SELECT DISTINCT doc FROM t");							  // xml: 421 there
@@ -881,7 +931,7 @@ int main() {
 	ExpectSql(
 		"SELECT * FROM t SEMI JOIN u USING (id) LIMIT 1",
 		"SELECT TOP (1) [r1].[id] AS [id], [r1].[name] AS [name], [r1].[code] AS [code], [r1].[amount] AS [amount], "
-		"[r1].[day] AS [day], [r1].[flag] AS [flag], [r1].[ts] AS [ts], CAST([r1].[legacy] AS NVARCHAR(30)) AS "
+		"[r1].[day] AS [day], [r1].[flag] AS [flag], [r1].[ts] AS [ts], [r1].[legacy] AS "
 		"[legacy], [r1].[wide] AS [wide], [r1].[mid] AS [mid], [r1].[tiny] AS [tiny], [r1].[ratio] AS [ratio], "
 		"[r1].[doc] AS [doc], "
 		"[r1].[small] AS [small] FROM "
@@ -971,7 +1021,7 @@ int main() {
 	ExpectVeto("SELECT ratio + amount FROM t LIMIT 1");
 
 	// Derived tables (PR E1): the inner node rendered in place, its columns
-	// already read (the NVARCHAR cast of a code-page varchar is not repeated),
+	// already read (a cast of the read expression is not repeated),
 	// one parameter set for the statement.
 	ExpectSql(
 		"SELECT s.g, s.c FROM (SELECT id AS g, count(*) AS c FROM t WHERE id > 3 GROUP BY id) s WHERE s.c > 1 "
@@ -979,7 +1029,7 @@ int main() {
 		"SELECT TOP (5) [r1].[g] AS [g], [r1].[c] AS [c] FROM (SELECT [id] AS [g], COUNT_BIG(*) AS [c] FROM "
 		"[dbo].[t] WHERE ([id] > @p0) GROUP BY [id]) AS [r1] WHERE ([r1].[c] > @p1) ORDER BY [r1].[g] ASC");
 	ExpectSql("SELECT s.legacy FROM (SELECT legacy FROM t ORDER BY id LIMIT 3) s",
-			  "SELECT [r1].[legacy] AS [legacy] FROM (SELECT TOP (3) CAST([legacy] AS NVARCHAR(30)) AS [legacy] FROM "
+			  "SELECT [r1].[legacy] AS [legacy] FROM (SELECT TOP (3) [legacy] FROM "
 			  "[dbo].[t] ORDER BY [t].[id] ASC) AS [r1]");
 	{
 		WrittenQuery out;
@@ -992,9 +1042,13 @@ int main() {
 		}
 	}
 	ExpectVeto("SELECT sum(s.total) FROM (SELECT id, sum(id) AS total FROM t GROUP BY id) s");	// HUGEINT here
-	ExpectVeto("SELECT s.id FROM (SELECT id FROM t ORDER BY id) s");				   // ORDER BY without TOP: 1033
-	ExpectVeto("SELECT s.a FROM (SELECT id FROM t) s(a)");							   // column aliases: not yet
-	ExpectVeto("SELECT s.legacy FROM (SELECT legacy FROM t) s WHERE s.legacy = 'x'");  // read through a CAST
+	ExpectVeto("SELECT s.id FROM (SELECT id FROM t ORDER BY id) s");  // ORDER BY without TOP: 1033
+	ExpectVeto("SELECT s.a FROM (SELECT id FROM t) s(a)");			  // column aliases: not yet
+	// A column read through a CAST cannot be keyed from outside; read bare it can.
+	ExpectSql(
+		"SELECT s.legacy FROM (SELECT legacy FROM t) s WHERE s.legacy = 'x'",
+		"SELECT [r1].[legacy] AS [legacy] FROM (SELECT [legacy] FROM [dbo].[t]) AS [r1] WHERE ([r1].[legacy] = @p0)");
+	ExpectServerCast("SELECT s.legacy FROM (SELECT legacy FROM t) s WHERE s.legacy = 'x'", "");
 	// A division or a floating-point aggregate stays a value outside its node.
 	ExpectVeto("SELECT s.id FROM (SELECT id, id / amount AS r FROM t) s WHERE s.r > 1");
 	ExpectVeto("SELECT s.id FROM (SELECT id, id / amount AS r FROM t) s ORDER BY s.r LIMIT 2");
@@ -1080,8 +1134,12 @@ int main() {
 	ExpectVeto("SELECT id FROM t WHERE id > ANY (SELECT t_id FROM u)");				// not = ANY
 	ExpectVeto("SELECT id FROM t WHERE 0 < (SELECT max(u.t_id + t.id) FROM u)");	// an outer aggregate
 	ExpectVeto("SELECT sum((SELECT max(t_id) FROM u)) FROM t");						// 130 there
-	ExpectVeto("SELECT id FROM u WHERE label IN (SELECT legacy FROM t)");			// read through a CAST
-	ExpectVeto("SELECT id FROM t WHERE (SELECT id / 0 FROM u LIMIT 1) > 1");		// a division compared
+	ExpectSql(
+		"SELECT id FROM u WHERE label IN (SELECT legacy FROM t)",
+		"SELECT [r1].[id] AS [id] FROM [dbo].[u] AS [r1] WHERE ([r1].[label] IN (SELECT [r2].[legacy] AS [legacy] "
+		"FROM [dbo].[t] AS [r2]))");
+	ExpectServerCast("SELECT id FROM u WHERE label IN (SELECT legacy FROM t)", "");	 // read through a CAST
+	ExpectVeto("SELECT id FROM t WHERE (SELECT id / 0 FROM u LIMIT 1) > 1");		 // a division compared
 	ExpectGain("SELECT id FROM t WHERE id IN (SELECT t_id FROM u)", true);
 	{
 		// A correlated subquery asked about on its own refers outside.

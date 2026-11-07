@@ -10,6 +10,7 @@
 
 #include "codec/code_page/code_page.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/string_vector.hpp"
@@ -40,6 +41,21 @@ void ResolveWireCodePages(std::vector<tds::ColumnMetadata> &columns) {
 		col.code_page =
 			FindCodePage(CodePageForWireCollation(col.collation & WIRE_LCID_MASK, false, col.collation_sort_id));
 	}
+}
+
+std::string NamedCodePageMismatch(const tds::ColumnMetadata &col, const CodePageTable &named,
+								  const std::string &collation_name) {
+	if (!col.IsSingleByteTextColumn() || col.IsUtf8Collation() || col.code_page == &named) {
+		return std::string();
+	}
+	const std::string wire = col.code_page ? "code page " + std::to_string(col.code_page->code_page)
+										   : "a collation this build has no table for";
+	return StringUtil::Format(
+		"mssql: column \"%s\" is in the catalog under collation %s (code page %d), but its wire "
+		"collation (LCID 0x%05X, SortId %u) names %s, which is what it is read by. The catalog is "
+		"stale: run mssql_invalidate_cache() (for a view, sp_refreshview first).",
+		col.name, collation_name, named.code_page, col.collation & WIRE_LCID_MASK,
+		static_cast<unsigned>(col.collation_sort_id), wire);
 }
 
 //! A DuckDB string holds at most MAX_STRING_SIZE bytes, and a chunk's output is

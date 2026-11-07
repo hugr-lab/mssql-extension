@@ -1137,6 +1137,27 @@ void TestCodePageKernel() {
 		CHECK_EQ(KernelValues(f, FinalizeKernel::CodePage), static_cast<uint64_t>(0), "no page: not the code-page one");
 	}
 
+	// The catalog scan's check (spec 092 D1): a function of the name's page and the wire's.
+	{
+		using duckdb::mssql::codec::code_page::FindCodePage;
+		using duckdb::mssql::codec::code_page::NamedCodePageMismatch;
+		const auto mismatch = [](const ColumnMetadata &col, int32_t named) {
+			return NamedCodePageMismatch(col, *FindCodePage(named), "Named_CI_AS");
+		};
+		CHECK_EQ(mismatch(CodePageMeta(TDS_TYPE_BIGVARCHAR, 8, 1251), 1251), std::string(), "the two agree");
+		const std::string differ = mismatch(CodePageMeta(TDS_TYPE_BIGVARCHAR, 8, 1252), 1251);
+		CHECK_EQ(
+			differ.find("code page 1251") != std::string::npos && differ.find("Named_CI_AS") != std::string::npos &&
+				differ.find("names code page 1252") != std::string::npos && differ.find("\"c\"") != std::string::npos,
+			true, "a disagreement names the column, the collation and both answers");
+		CHECK_EQ(mismatch(Meta(TDS_TYPE_BIGVARCHAR, 8), 1251).find("no table") != std::string::npos, true,
+				 "a wire collation the tables do not know");
+		ColumnMetadata utf8 = Meta(TDS_TYPE_BIGVARCHAR, 8);
+		utf8.collation = 0x24D00409;
+		CHECK_EQ(mismatch(utf8, 1251), std::string(), "UTF-8 on the wire is valid whatever the catalog remembers");
+		CHECK_EQ(mismatch(Meta(duckdb::tds::TDS_TYPE_NVARCHAR, 8), 1251), std::string(), "UTF-16 likewise");
+	}
+
 	// A CHAR's padding comes off the output, inlined value or not, and only at the end.
 	{
 		Fixture f;

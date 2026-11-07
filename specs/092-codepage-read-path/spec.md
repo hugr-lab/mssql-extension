@@ -1,9 +1,9 @@
 # Spec 092: read code-page strings as bytes and transcode them on the client
 
 Status: in progress on branch `feat/092-codepage-read-path`, from main `0aa8a10` (spec 091's module
-merged, #527, #528). Built so far: D2, D4, D9 and D12, so a raw scan transcodes; the catalog's read
-expressions still cast (D1, D3, D5). Line references below were taken at `4c65cfb` and are refreshed
-as each part lands.
+merged, #527, #528). Built so far: D1-D6, D8, D9 and D12: a raw scan transcodes, and the catalog,
+pushed statements and RETURNING read a single-byte page bare. D7 (raw-scan types), the D10 gate and
+the docs remain. Line references below were taken at `4c65cfb` and are refreshed as each part lands.
 
 This is 091's consumers (a), the catalog read path, and (b), raw `mssql_scan` correctness (#224).
 The write path stays as it is: `N'...'` literals, BCP as `nvarchar`, and the server replacing what a
@@ -70,15 +70,24 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
   is single-byte and has a table in 091 (`FindCodePage(page)` non-null and `!IsDoubleByte`), is read
   as itself in every read expression when its catalog transcodes (D4). The page comes from 091's
   `FindCollationByName(name, length)->code_page`. A double-byte page keeps its cast (D10).
-  - **On a catalog stream the page is the name's.** The stream is handed, per column, the page its
-    read expression assumed, and checks it once at COLMETADATA against the wire's
-    (`CodePageForWireCollation(lcid, utf8, sort_id)`). A wire lookup that misses
-    (`CODE_PAGE_NOT_FOUND`) or disagrees fails the statement with a named error (the column, its
-    collation name, both answers): the tables disagree with themselves, and verbatim bytes would be
-    a silent wrong answer. The wire key is derived from `COLLATIONPROPERTY`, not read from a wire
-    (091 D9, "still to verify"), so this check is also what makes a wrong derivation loud. Only a
-    raw scan, which has no name, takes the wire's answer alone; a miss there keeps today's bytes
-    and the warning (D9).
+  - **Every stream decodes by the wire's page; the catalog scan also checks it against the name's.**
+    `CodePageForWireCollation(lcid, utf8, sort_id)` decides what a column is decoded from, on every
+    path. The catalog scan knows each column's collation name, and a column whose wire says otherwise
+    or names no table logs a `WARNING` naming the column, its collation and both answers
+    (`NamedCodePageMismatch`). The first draft failed the statement; the owner's call (2026-11-07):
+    it is not an error. What reaches it is a stale catalog: a collation changed by another client,
+    cured by `mssql_invalidate_cache()`, or a non-schemabound view, whose `sys.columns` stays old
+    until `sp_refreshview` (measured). The wire's page reads such a column correctly, as the cast
+    form did. It goes on being labelled with the old collation until the catalog is refreshed.
+  - **The wire keys are verified, so the other paths need no check of their own.** 091's keys are
+    derived from `COLLATIONPROPERTY`, not read from a wire (091 D9).
+    `tools/code_pages/check_wire_keys.py` (`make code-pages-check-wire`) stores a text only each
+    page reads under every collation with a page, and reads it bare through the wire's key against
+    the server's cast: on SQL Server 2025 (17.0.4075.5), 2026-11-07, 3,445 collations on 16 pages,
+    0 differ and 0 miss (the same run with `client_transcode false`: 3,463). So a pushed statement,
+    RETURNING and `#out`, which decode by the wire with no name at hand, cannot miss on a known
+    collation; a name the tables do not have keeps its cast on the catalog's paths, and a raw scan
+    keeps the bytes and the warning (D9).
   - **`text` keeps its cast on the catalog path. That is this spec's scope, not a limit.** Two
     per-value paths decode the catalog's columns: the composite-key rowid scan, which fills the
     rowid STRUCT through `ProcessRow` (`src/table_scan/table_scan.cpp:781-842`,
@@ -102,9 +111,8 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
     `MSSQLResultStream` after COLMETADATA and before `RowStager::Configure`
     (`mssql_result_stream.cpp:306-307`), where the catalog's flag is known, and by
     `MSSQLReturningParser` in its metadata callback (`mssql_returning_parser.cpp:18-22`) from its
-    target's flag. It stays null unless the catalog transcodes (D4) and 091 has the page: on a catalog
-    stream it is the single-byte page a bare read expression assumed (D1), on a raw scan the wire's
-    page, double-byte included. No decoder looks a page up per value.
+    target's flag. It stays null unless the catalog transcodes (D4) and 091 has the wire's page,
+    double-byte included. No decoder looks a page up per value.
   - **The DuckDB wrapper is this spec's**, `src/codec/code_page/code_page_codec.cpp` and its header
     beside the module's (091 D4 kept the core DuckDB-free):
     - `DecodeChunkFromStaging(st, count, col, out)` for the staged kernel: `DecodeColumn` (D12), which
@@ -150,7 +158,7 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
     a bare `varchar(max)` read per value by the composite-rowid scan (with
     `mssql_convert_varchar_max` false) keeps today's verbatim bytes under `client_transcode false`.
   - **A miss** on a raw scan (a collation newer than the tables) keeps the binary kernel, today's
-    verbatim bytes, and the warning (D9). On a catalog stream it is D1's named error.
+    verbatim bytes, and the warning (D9). A catalog scan warns of it as of a disagreement (D1).
 - **D3: a single-byte page's `char(n)` is read bare as `BIGCHAR`.** The padded bytes are
   transcoded, then trailing U+0020 is trimmed off the output by the wrapper (D2; the module does no
   trim, 091 D5). A double-byte page's `char(n)` keeps `CAST(col AS NCHAR(n))` (D10).
@@ -259,8 +267,9 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
       `CAST` in the query, or "the collation is newer than this build's tables".
   - **`mssql_convert_varchar_max`** (`mssql_settings.cpp:585-593`; read at `table_scan.cpp:193`,
     `src/pushdown/mssql_sql_writer.cpp:62`, `src/catalog/mssql_catalog_plan.cpp:130`, `:473`).
-    - It keeps its meaning under `client_transcode false`, and for the double-byte pages, which
-      keep the server cast (D10).
+    - It keeps its meaning under `client_transcode false`. On a double-byte page, which keeps the
+      server cast (D10), `false` still drops the cast, and the column is then transcoded by the
+      wire's page, where it used to be verbatim bytes.
     - Otherwise it has no effect: a single-byte page's `varchar(max)` is read as itself and
       transcoded, which is what `false` was for, and it now arrives as valid UTF-8.
     - Its registration and default stay. It is reconsidered with the escape hatch.
@@ -437,10 +446,9 @@ Files: `ci` `src/catalog/mssql_column_info.cpp`, `rs` `src/codec/staging/row_sta
     `:118-121`, `:128-134`, and `mssql_scan_describe_types.test:44-45` (`c_char`, `c_varchar`; the
     MAX and `text` rows at `:46`, `:50` stay VARCHAR);
   - the raw-scan warning: `test/sql/query/collation_metadata_warnings.test` (D9);
-  - C++: `test/cpp/test_sql_writer.cpp:220-226`, `:381-387`, `:536`, `:700`, `:787-788`, `:820`,
-    `:884`, `:981-983`, the derived-table and subquery vetoes "read through a CAST" (`:997`,
-    `:1083`), and `test/cpp/test_batch_builder.cpp:414-415`, whose `code` column has an empty
-    collation and needs a single-byte one to pin the change (D1 takes the page from the name).
+  - C++: `test/cpp/test_sql_writer.cpp`, done: its fixture's `legacy` column pins both forms
+    (`ExpectServerCast`), and `BuildReturningExpression` directly. `test/cpp/test_batch_builder.cpp`
+    keeps an empty collation, so its cast still reads as it did.
   - Value tests over code-page columns that must pass unchanged, by 091's construction:
     `test/sql/rowid/rowid_unique_index.test`, `test/sql/catalog/varchar_declaration_seek.test`,
     `test/sql/catalog/legacy_lob_scan.test` (`text` keeps its cast), `test/sql/query/type_mapping.test`.
@@ -520,9 +528,9 @@ Files: `ci` `src/catalog/mssql_column_info.cpp`, `rs` `src/codec/staging/row_sta
   `SQL_Latin1_General_CP1_CI_AS`, on values its varchar and nvarchar rules group differently, with
   each form's rows pinned. The values are found on the server first (`'ß'` against `'ss'` is the
   candidate, **to verify**).
-- **The page check.** The catalog stream's check of the name's page against the wire's is a
-  function of the two, unit-tested in `test/cpp`: agreement, a miss, a disagreement, the named
-  error.
+- **The page check.** The catalog scan's check of the name's page against the wire's is a function
+  of the two, unit-tested in `test/cpp`: agreement, a miss, a disagreement, the warning's text; and
+  live, a collation changed behind a stale catalog.
 - **RETURNING.** INSERT with the bare `OUTPUT`; INSERT `OUTPUT ... INTO` beside a trigger (#471's
   334 path); staged UPDATE / DELETE RETURNING.
 - **MERGE** with a code-page source and target, pushed and staged.
@@ -583,8 +591,10 @@ Acceptance:
   correctness over speed where there is no cast to keep (D10). A `CAST(c AS nvarchar(n))` in the
   query restores the server's conversion.
 - **An x86 with neither AVX2 nor AVX-512** runs the scalar single-byte kernel, value by value.
-- **A wrong wire-key derivation** (091 D9) fails a catalog statement by name at the page check
-  (D1), and on a raw scan keeps today's bytes and the warning.
+- **A wire key the tables do not have**, on a server newer than the tables (D1's check covers 2025).
+  A catalog scan and a pushed statement keep the bytes and warn; RETURNING and `#out` keep them
+  without a warning. A new collation
+  normally brings a new name as well, and a name the tables lack keeps its cast on all of these.
 - **Users who relied on raw bytes** from a raw scan. Covered by the escape hatch and a CHANGELOG
   *Changed* entry.
 - **More pushdown (D8)** means the 079 suites decide it. Every new shape is checked against the
@@ -597,8 +607,8 @@ Acceptance:
 1. `mssql_client_transcode` and the `client_transcode` ATTACH option, read at ATTACH; the
    catalog's flag to the read expressions, the three stream construction sites, the RETURNING
    parser, `SQLWriterOptions` -- 1.5 d
-2. `ColumnMetadata::code_page` set by the stream; the catalog stream's page check and its named
-   error; `FinalizeKernel::CodePage` (`ResolveKernel`, the finalize switch, `DecodeFirstValue`,
+2. `ColumnMetadata::code_page` set by the stream; the catalog scan's page check and its
+   warning; `FinalizeKernel::CodePage` (`ResolveKernel`, the finalize switch, `DecodeFirstValue`,
    `FinalizeKernelName`, `FINALIZE_KERNEL_COUNT` and its `static_assert`); the per-value arm; the
    DuckDB wrapper (091's former task 6) with its sizing and the column's refusal; the two fuzz
    harnesses' source lists -- 3 d
