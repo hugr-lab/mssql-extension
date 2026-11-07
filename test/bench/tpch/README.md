@@ -25,6 +25,7 @@ The server credentials come from the environment and are never printed: `MSSQL_B
 
 ```sh
 B=test/bench/tpch/tpch_bench.py
+python3 $B selftest                           # check the harness's own verdicts; no server, no database, no CLI
 python3 $B --sf 1 gen                         # parquet into test/bench/tpch/data/sf1 (needs DuckDB with tpch: the A CLI)
 python3 $B --sf 1 --layout columnstore load   # CREATE DATABASE tpch_sf1_columnstore, DDL, INSERT via BCP, stats
 python3 $B --sf 1 verify                      # every client once, compared with DuckDB over the same parquet
@@ -48,13 +49,27 @@ python3 $B --timings test/bench/tpch/results/sf1/timings.csv --report report.md 
 - Times are the CLI's `.timer` wall times. `report` gives the median per query, the ratio against A, and the sum.
 - Each session's full output is kept beside `timings.csv`.
 
-**Correctness first.** `verify` compares each client with DuckDB over the very parquet the server was loaded from: numbers within 1e-6 relative or 0.01 absolute, rows in order (or as a multiset when ties reorder). A wrong answer makes that query's timing meaningless, and the report should say so.
+**Correctness first.** `verify` compares each client with DuckDB over the very parquet the server was loaded from. A wrong answer makes that query's timing meaningless, and the report should say so.
+
+How a value is compared depends on how it is written, because that is the only evidence of what the column is:
+
+| the pair | rule |
+|---|---|
+| anything byte-identical | equal |
+| two exact decimals printed at the **same** scale (`37734107.00` vs `37734107.00`), integers included | **exact equality** |
+| an exact decimal beside a value of another scale — a DOUBLE against the server's `decimal(38,6)` | 1e-6 absolute or 1e-9 relative, whichever is larger |
+| any other number (`1e3`) | the same tolerance |
+| anything else, strings included | **exact equality** |
+
+Nothing is stripped, so `CHAR(n)` trailing-blank padding is a mismatch and gets its own `PADDING` verdict — that is the #405 class, and an exact comparison is the only thing that can see it. Rows must be in order, or match as a multiset, which is reported as `ok (same rows, different order)`.
+
+**The harness checks its own judgements.** `selftest` runs every rule above against the cases that were once decided wrongly — q08's two `mkt_share` values 0.00705 apart passing inside a 0.011 absolute floor, a count off by one row passing inside 1e-6 relative, an aggregate 120 units out at SF1000 magnitude passing inside 1e-9 relative, a `Catalog Error` published as a 4 ms timing, a session timeout crashing the whole run — plus the verdicts, the timeout path and the report's sum row. It needs no server, no database and no DuckDB binary, so it runs anywhere and in CI. A benchmark harness that cannot be wrong is worth more than one that is fast.
 
 ## Results
 
 See `RESULTS-local.md` for the first local run: SF1 and SF10, four string schemas, and per-query server traces. In short:
 - 0.3.0 beats 0.2.5 by 20–28 %, and by orders of magnitude on the queries it sends to the server whole.
-- On TPC-H's own `CHAR(n)` schema, 0.2.5 returns wrong answers for 4 of the 22 queries (#405).
+- On TPC-H's own `CHAR(n)` schema, 0.2.5 fails 13 of the 22 queries: **4 wrong answers** (#405 — q07 and q12 return no rows at all, q08 and q19 differ) and **9 more whose values differ only in `CHAR(n)` padding**, which the old comparison stripped away before looking.
 - On the scan path the server's CPU per row handed over is the bottleneck.
 - Which queries go whole depends on the string types: UTF-8 `varchar` lets `ORDER BY … LIMIT` go, and BIN2 is the cheapest for the server.
 
