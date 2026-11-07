@@ -56,6 +56,12 @@ future-spec/
 future-specs/
 posts/
 
+# unclebob/crapper's report. `crapper` writes .metrics/crap.edn on every run,
+# and five CI gates under scripts/ now carry fixtures that invite running it,
+# so an accidental `git add -A` would otherwise commit a snapshot of one
+# machine's scores -- stale the next time anyone touches a function.
+.metrics/
+
 # The download-metrics chart is generated, not committed: it is published to
 # GitHub Pages by .github/workflows/pages.yml and embedded in the README from
 # there. A local run of scripts/update_download_metrics.py drops a copy here for
