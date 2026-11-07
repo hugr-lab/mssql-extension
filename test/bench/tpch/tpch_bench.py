@@ -1196,7 +1196,7 @@ def _check_timeout_path():
               "time.sleep(30)\n")
     try:
         subprocess.run([sys.executable, "-c", script], text=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=2)
+                       stderr=subprocess.STDOUT, timeout=5)
         return _check("a 2 s timeout on a 30 s child raises TimeoutExpired", False, "it did NOT time out")
     except subprocess.TimeoutExpired as exc:
         # This is the assertion that matters: the type Python really hands back.
@@ -1209,12 +1209,20 @@ def _check_timeout_path():
             return failures + _check("mask(decode_output(...)) does not raise", False,
                                      f"{type(e).__name__}: {e}")
         res = parse_marked(text, "T")
+        # Guarded with .get, and the child is given 5 s rather than 2. On a
+        # loaded runner the child may not be scheduled and flushed inside the
+        # window, leaving `exc.output` empty: parse_marked then returns {} and
+        # a bare res["q02"] raised KeyError, so an intermittent CI failure
+        # looked like a crash in the harness rather than a slow machine. Seen
+        # once locally while a crapper run and a differential were competing
+        # for the CPU.
         failures += _check("the queries that DID finish keep their timings",
                            res.get("q01", (None,))[0] == 0.5, str(res.get("q01")))
-        hung = name_hung_query(res, "session timed out after 2s")
+        hung = name_hung_query(res, "session timed out after 5s")
+        note = (res.get("q02") or (None, ""))[1] or ""
         failures += _check("the interrupted query is named as the timeout, not as `no Run Time`",
-                           hung == "q02" and "timed out" in (res["q02"][1] or ""),
-                           f"{hung}: {res['q02'][1]}")
+                           hung == "q02" and "timed out" in note,
+                           f"{hung}: {note or 'NO OUTPUT CAPTURED (the child never ran)'}")
     # A session that produced nothing at all must still be survivable.
     failures += _check("a timeout with no output at all decodes to empty",
                        decode_output(None) == "" and decode_output(b"") == "", "''")
