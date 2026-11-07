@@ -1182,7 +1182,12 @@ PIN_TEST_LIBS += -framework GSS -framework Security -framework CoreFoundation \
 else ifeq ($(PIN_TEST_BUILD),debug)
 PIN_TEST_LIBS += -fsanitize=address -fsanitize=undefined
 endif
-PIN_TEST_RPATH := DYLD_LIBRARY_PATH=build/$(PIN_TEST_BUILD)/src LD_LIBRARY_PATH=build/$(PIN_TEST_BUILD)/src
+# These binaries link the extension statically beside a libduckdb that already holds it,
+# so every external global exists twice by construction (spec 091's code-page tables, once
+# the read path uses them), and ASan aborts on the first with odr-violation. The loadable
+# extension is not built this way. Appended, because CI sets ASAN_OPTIONS for the job.
+PIN_TEST_RPATH := DYLD_LIBRARY_PATH=build/$(PIN_TEST_BUILD)/src LD_LIBRARY_PATH=build/$(PIN_TEST_BUILD)/src \
+    ASAN_OPTIONS="$$ASAN_OPTIONS:detect_odr_violation=0"
 
 test-transaction-pin: $(PIN_TEST_BUILD)
 	@echo "Building issue #356 transaction-pin contention test..."
