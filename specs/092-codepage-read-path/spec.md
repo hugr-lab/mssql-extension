@@ -119,8 +119,10 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
     - The fuzz harnesses that compile `src/codec/*.cpp` non-recursively, `fuzz_row_stager` and
       `fuzz_bcp_encode`, gain `src/codec/code_page/*.cpp`, as do `run_staging_test.sh` and the
       Makefile's codec lists. `fuzz_row_stager` resolves the wire's pages, so its bytes reach the kernel.
-    - The output is sized at the bound, as the string kernel's is: per character the same, and
-      untouched pages are not faulted (`string_codec.cpp`, "over-reserving costs address space").
+    - The output is sized at the bound, as the string kernel's is, in one pass. The bound is not
+      only address space: a chunk's string heap comes from `BufferAllocator`, so `memory_limit`
+      accounts all of it. So a code-page column counts twice against the chunk's payload budget
+      (`RowStager::Configure`): the same characters a chunk as a UTF-16 column, so the same heap.
   - **The TDS parser keeps no dependency on the codec module.** `tds_column_metadata.cpp` leaves the
     field 0. It is built without the module in `CPP_TEST_SOURCES` (`Makefile:407-418`) and in
     `fuzz_tds_tokens` (`fuzz/build.sh:89-95`, `:139`).

@@ -117,6 +117,27 @@ SELECT DISTINCT v, f, count(*) OVER () FROM mssql_scan('cp', 'SELECT v, f FROM d
 ----
 ж	ж	3000
 
+# The chunk's budget bounds the output, whose 3-bytes-a-character heap memory_limit
+# accounts: 40 MB of distinct values, past the 32 MB budget, under a limit that holds
+# the bound of a 16 MB chunk and not that of a 32 MB one. (Distinct, or the chunk is
+# one constant value and reserves nothing.)
+statement ok
+SELECT mssql_exec('cp', 'IF OBJECT_ID(''dbo.cp_large'') IS NOT NULL DROP TABLE dbo.cp_large;
+CREATE TABLE dbo.cp_large (v varchar(max) COLLATE Latin1_General_CI_AS);
+INSERT dbo.cp_large SELECT TOP 2000 REPLICATE(CAST(CAST(ABS(CHECKSUM(NEWID())) AS char(10)) AS varchar(max)), 2000)
+FROM sys.all_objects a CROSS JOIN sys.all_objects b;');
+
+statement ok
+SET memory_limit = '100MB';
+
+query I
+SELECT sum(length(v)) FROM mssql_scan('cp', 'SELECT v FROM dbo.cp_large');
+----
+40000000
+
+statement ok
+RESET memory_limit;
+
 # The escape hatch: a catalog with client_transcode false hands the bytes over as
 # they are, as before. Only the bytes can be compared: they are not valid UTF-8.
 query I
@@ -179,4 +200,4 @@ statement ok
 SET mssql_convert_varchar_max = true;
 
 statement ok
-SELECT mssql_exec('cp', 'DROP TABLE dbo.cp_oracle; DROP TABLE dbo.cp_lengths; DROP TABLE dbo.cp_repeat; DROP TABLE dbo.cp_returning;');
+SELECT mssql_exec('cp', 'DROP TABLE dbo.cp_oracle; DROP TABLE dbo.cp_lengths; DROP TABLE dbo.cp_repeat; DROP TABLE dbo.cp_returning; DROP TABLE dbo.cp_large;');

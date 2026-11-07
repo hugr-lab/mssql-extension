@@ -343,6 +343,15 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 		}
 		if (ops_[i].arm >= AppendArm::PlpStageString && ops_[i].arm <= AppendArm::LobStageBinary) {
 			unbounded_columns_.push_back(staging_[i]);
+			// Counted twice: what the budget has to bound is the output, whose heap
+			// memory_limit accounts at 3 bytes per character (the kernels' one pass
+			// sizes at the bound). A code-page byte is a character where a UTF-16
+			// column stages two, so counted once a chunk would hold twice the
+			// characters and reserve twice the heap: measured, a 400 MB scan failed
+			// at memory_limit = 100MB where the server's NVARCHAR cast passes.
+			if (ops_[i].kernel == FinalizeKernel::CodePage) {
+				unbounded_columns_.push_back(staging_[i]);
+			}
 		}
 	}
 	has_unbounded_column_ = !unbounded_columns_.empty();
