@@ -156,8 +156,32 @@ jobs:
       # not enforced, because deciding whether a mention is a guard needs a
       # human. See docs/TESTING.md "Linking a test to the issue it guards".
       # No build needed -- it reads files.
+      # What counts as a DECLARATION is the whole point of this index -- a test
+      # may MENTION an issue without guarding it -- and every past defect was
+      # that distinction leaking: `# issue: 181 (see spec 057)` indexed 181 AND
+      # 57, `# issue: 123456` split into 12345 and 6, a mistyped field landed
+      # silently in the backlog, and the summary counted a two-issue file twice.
+      # The fixtures pin each of those plus what the prose matcher must NOT
+      # take (a PR reference, "reissue", a number on the next line). Reads no
+      # test tree, so it runs first.
+      - name: Issue-declaration rules judge correctly
+        run: python3 scripts/ci/issue_links.py --self-test
+
       - name: Issue -> test index is well-formed
         run: python3 scripts/ci/issue_links.py
+
+      # The TPC-H harness judges every correctness and timing claim this repo
+      # quotes, and until the review of #518 nothing judged IT. That review
+      # found, by running it live, that a session timeout crashed the whole run
+      # on first use, that an exact decimal 120 units out still compared `ok`,
+      # and that one failed statement discarded a client's other 21 verdicts.
+      # None of those needed a server to find -- only something that checked
+      # the judge. `selftest` replays each of them plus the earlier #505 / #506
+      # defects against the pure comparison, parsing and reporting functions:
+      # no server, no database, no DuckDB binary, about a second, and it is the
+      # only thing standing between a wrong verdict and a published number.
+      - name: TPC-H bench harness judges correctly
+        run: python3 test/bench/tpch/tpch_bench.py selftest
 
       # Seven shell scripts across three directories sit on the CI critical
       # path, one of which does `rm -rf` against a path it derives. Their clean
