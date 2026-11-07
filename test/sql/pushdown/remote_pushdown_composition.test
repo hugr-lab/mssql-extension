@@ -34,9 +34,9 @@ statement ok
 SET mssql_remote_pushdown = false;
 
 statement ok
-SELECT mssql_exec('rc_off', 'DROP TABLE IF EXISTS dbo.rc_t;
-	CREATE TABLE dbo.rc_t (id int NOT NULL PRIMARY KEY, n int NULL, g int NOT NULL);
-	INSERT INTO dbo.rc_t VALUES (1, 10, 1), (2, 20, 1), (3, NULL, 2), (4, 40, 3)');
+SELECT mssql_exec('rc_off', 'DROP TABLE IF EXISTS dbo.rcp_t;
+	CREATE TABLE dbo.rcp_t (id int NOT NULL PRIMARY KEY, n int NULL, g int NOT NULL);
+	INSERT INTO dbo.rcp_t VALUES (1, 10, 1), (2, 20, 1), (3, NULL, 2), (4, 40, 3)');
 
 statement ok
 CREATE TABLE loc AS SELECT 1 AS g, 'one' AS name UNION ALL SELECT 2, 'two';
@@ -47,24 +47,24 @@ CREATE TABLE loc AS SELECT 1 AS g, 'one' AS name UNION ALL SELECT 2, 'two';
 
 # EXCLUDE over a subquery: the subquery's TOP goes, EXCLUDE stays in DuckDB.
 query II
-EXPLAIN SELECT * EXCLUDE (n) FROM (SELECT id, n, g FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2) s;
+EXPLAIN SELECT * EXCLUDE (n) FROM (SELECT id, n, g FROM rc_on.dbo.rcp_t ORDER BY id LIMIT 2) s;
 ----
-physical_plan	<REGEX>:.*SELECT TOP \(2\) \[id\], \[n\], \[g\] FROM \[dbo\]\.\[rc_t\] ORDER BY \[rc_t\]\.\[id\] ASC.*
+physical_plan	<REGEX>:.*SELECT TOP \(2\) \[id\], \[n\], \[g\] FROM \[dbo\]\.\[rcp_t\] ORDER BY \[rcp_t\]\.\[id\] ASC.*
 
 query II
-SELECT * EXCLUDE (n) FROM (SELECT id, n, g FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2) s;
+SELECT * EXCLUDE (n) FROM (SELECT id, n, g FROM rc_on.dbo.rcp_t ORDER BY id LIMIT 2) s;
 ----
 1	1
 2	1
 
 # A CTE body: the aggregate goes, integer sum cast back to HUGEINT.
 query II
-EXPLAIN WITH q AS (SELECT g, count(*) AS c, sum(n) AS s FROM rc_on.dbo.rc_t GROUP BY g) SELECT * EXCLUDE (c) FROM q ORDER BY g;
+EXPLAIN WITH q AS (SELECT g, count(*) AS c, sum(n) AS s FROM rc_on.dbo.rcp_t GROUP BY g) SELECT * EXCLUDE (c) FROM q ORDER BY g;
 ----
 physical_plan	<REGEX>:.*GROUP BY \[g\].*
 
 query IIT
-WITH q AS (SELECT g, count(*) AS c, sum(n) AS s FROM rc_on.dbo.rc_t GROUP BY g) SELECT * EXCLUDE (c), typeof(s) FROM q ORDER BY g;
+WITH q AS (SELECT g, count(*) AS c, sum(n) AS s FROM rc_on.dbo.rcp_t GROUP BY g) SELECT * EXCLUDE (c), typeof(s) FROM q ORDER BY g;
 ----
 1	30	HUGEINT
 2	NULL	HUGEINT
@@ -73,12 +73,12 @@ WITH q AS (SELECT g, count(*) AS c, sum(n) AS s FROM rc_on.dbo.rc_t GROUP BY g) 
 # Two grouped subqueries joined on their GROUP BY key: bounded (a derived
 # table's GROUP BY columns are its key), one statement.
 query II
-EXPLAIN SELECT a.g FROM (SELECT g FROM rc_on.dbo.rc_t GROUP BY g) a JOIN (SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g) b USING (g);
+EXPLAIN SELECT a.g FROM (SELECT g FROM rc_on.dbo.rcp_t GROUP BY g) a JOIN (SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t GROUP BY g) b USING (g);
 ----
 physical_plan	<REGEX>:.*GROUP BY \[g\]\) AS \[r1\] INNER JOIN \(SELECT .* GROUP BY \[g\]\) AS \[r2\].*
 
 query I rowsort
-SELECT a.g FROM (SELECT g FROM rc_on.dbo.rc_t GROUP BY g) a JOIN (SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g) b USING (g);
+SELECT a.g FROM (SELECT g FROM rc_on.dbo.rcp_t GROUP BY g) a JOIN (SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t GROUP BY g) b USING (g);
 ----
 1
 2
@@ -87,13 +87,13 @@ SELECT a.g FROM (SELECT g FROM rc_on.dbo.rc_t GROUP BY g) a JOIN (SELECT g, coun
 # A subquery in an expression: IN over a HAVING (the statement goes whole
 # since subquery expressions are rendered).
 query I
-SELECT id FROM rc_on.dbo.rc_t WHERE g IN (SELECT g FROM rc_on.dbo.rc_t GROUP BY g HAVING count(*) > 1) ORDER BY id;
+SELECT id FROM rc_on.dbo.rcp_t WHERE g IN (SELECT g FROM rc_on.dbo.rcp_t GROUP BY g HAVING count(*) > 1) ORDER BY id;
 ----
 1
 2
 
 query I
-SELECT id FROM rc_off.dbo.rc_t WHERE g IN (SELECT g FROM rc_off.dbo.rc_t GROUP BY g HAVING count(*) > 1) ORDER BY id;
+SELECT id FROM rc_off.dbo.rcp_t WHERE g IN (SELECT g FROM rc_off.dbo.rcp_t GROUP BY g HAVING count(*) > 1) ORDER BY id;
 ----
 1
 2
@@ -101,12 +101,12 @@ SELECT id FROM rc_off.dbo.rc_t WHERE g IN (SELECT g FROM rc_off.dbo.rc_t GROUP B
 # A set operation at a statement's top: never pushed whole (DuckDB combines
 # the parts), each child that gains goes.
 query II
-EXPLAIN SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g, count(*) AS c FROM rc_on.dbo.rc_t WHERE id > 1 GROUP BY g;
+EXPLAIN SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t GROUP BY g UNION ALL SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t WHERE id > 1 GROUP BY g;
 ----
 physical_plan	<REGEX>:.*Union.*Mssql Scan.*Mssql Scan Params.*GROUP BY \[g\].*WHERE \(\[id\] > @p0\) GROUP BY \[g\].*
 
 query II rowsort
-SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g, count(*) AS c FROM rc_on.dbo.rc_t WHERE id > 1 GROUP BY g;
+SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t GROUP BY g UNION ALL SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t WHERE id > 1 GROUP BY g;
 ----
 1	1
 1	2
@@ -116,7 +116,7 @@ SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g, count
 3	1
 
 query II rowsort
-SELECT g, count(*) AS c FROM rc_off.dbo.rc_t GROUP BY g UNION ALL SELECT g, count(*) AS c FROM rc_off.dbo.rc_t WHERE id > 1 GROUP BY g;
+SELECT g, count(*) AS c FROM rc_off.dbo.rcp_t GROUP BY g UNION ALL SELECT g, count(*) AS c FROM rc_off.dbo.rcp_t WHERE id > 1 GROUP BY g;
 ----
 1	1
 1	2
@@ -131,42 +131,42 @@ SELECT g, count(*) AS c FROM rc_off.dbo.rc_t GROUP BY g UNION ALL SELECT g, coun
 #
 
 query II
-EXPLAIN SELECT * FROM rc_on.dbo.rc_t WHERE id = 2;
+EXPLAIN SELECT * FROM rc_on.dbo.rcp_t WHERE id = 2;
 ----
 physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
 
 query III
-SELECT * FROM rc_on.dbo.rc_t WHERE id = 2;
+SELECT * FROM rc_on.dbo.rcp_t WHERE id = 2;
 ----
 2	20	1
 
 # A CTE reference is not a table: it is not re-qualified by the catalog.
 query I
-WITH q AS (SELECT g, n FROM rc_on.dbo.rc_t) SELECT * EXCLUDE (n) FROM q WHERE g = 3;
+WITH q AS (SELECT g, n FROM rc_on.dbo.rcp_t) SELECT * EXCLUDE (n) FROM q WHERE g = 3;
 ----
 3
 
 #
 # Names: a node handed back gets every table name back exactly as the query
-# wrote it -- the rewriter strips the catalog in place, and `rc_on.rc_t` loses
-# it to a bare `rc_t`. A LOCAL table of the same name makes a wrong bind visible
+# wrote it -- the rewriter strips the catalog in place, and `rc_on.rcp_t` loses
+# it to a bare `rcp_t`. A LOCAL table of the same name makes a wrong bind visible
 # (it holds one row, id 100).
 #
 
 statement ok
-CREATE TABLE rc_t AS SELECT 100 AS id, 0 AS n, 9 AS g;
+CREATE TABLE rcp_t AS SELECT 100 AS id, 0 AS n, 9 AS g;
 
 # A subquery in ORDER BY / LIMIT / GROUP BY of a handed-back node (review of
-# E1: those were not restored and bound to the local rc_t).
+# E1: those were not restored and bound to the local rcp_t).
 query I
-SELECT * EXCLUDE (n, g) FROM (SELECT id, n, g FROM rc_on.dbo.rc_t ORDER BY id LIMIT 3) s ORDER BY id * ((SELECT max(id) FROM rc_on.dbo.rc_t) - 50);
+SELECT * EXCLUDE (n, g) FROM (SELECT id, n, g FROM rc_on.dbo.rcp_t ORDER BY id LIMIT 3) s ORDER BY id * ((SELECT max(id) FROM rc_on.dbo.rcp_t) - 50);
 ----
 3
 2
 1
 
 query I
-SELECT * EXCLUDE (n, g) FROM (SELECT id, n, g FROM rc_on.dbo.rc_t ORDER BY id LIMIT 4) s ORDER BY id LIMIT (SELECT count(*) FROM rc_on.rc_t);
+SELECT * EXCLUDE (n, g) FROM (SELECT id, n, g FROM rc_on.dbo.rcp_t ORDER BY id LIMIT 4) s ORDER BY id LIMIT (SELECT count(*) FROM rc_on.rcp_t);
 ----
 1
 2
@@ -174,7 +174,7 @@ SELECT * EXCLUDE (n, g) FROM (SELECT id, n, g FROM rc_on.dbo.rc_t ORDER BY id LI
 4
 
 query II
-SELECT * EXCLUDE (c) FROM (SELECT g, count(*) AS c, (SELECT max(id) FROM rc_on.rc_t) AS m FROM rc_on.dbo.rc_t GROUP BY g) s ORDER BY g;
+SELECT * EXCLUDE (c) FROM (SELECT g, count(*) AS c, (SELECT max(id) FROM rc_on.rcp_t) AS m FROM rc_on.dbo.rcp_t GROUP BY g) s ORDER BY g;
 ----
 1	4
 2	4
@@ -182,7 +182,7 @@ SELECT * EXCLUDE (c) FROM (SELECT g, count(*) AS c, (SELECT max(id) FROM rc_on.r
 
 # A CTE named like a table: the 2-part table name must not bind to the CTE.
 query I
-WITH rc_t AS (SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g) SELECT x.* EXCLUDE (n, g) FROM rc_on.rc_t x ORDER BY id;
+WITH rcp_t AS (SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t GROUP BY g) SELECT x.* EXCLUDE (n, g) FROM rc_on.rcp_t x ORDER BY id;
 ----
 1
 2
@@ -191,7 +191,7 @@ WITH rc_t AS (SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g) SELECT x.*
 
 # A prepared statement's parameter in the outer node and in a pushed part.
 statement ok
-PREPARE rc_q AS SELECT * EXCLUDE (c) FROM (SELECT g, count(*) AS c FROM rc_on.dbo.rc_t WHERE id > $1 GROUP BY g) s WHERE g < $2 ORDER BY g;
+PREPARE rc_q AS SELECT * EXCLUDE (c) FROM (SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t WHERE id > $1 GROUP BY g) s WHERE g < $2 ORDER BY g;
 
 query I
 EXECUTE rc_q(1, 3);
@@ -206,7 +206,7 @@ DEALLOCATE rc_q;
 # the parts) inside a transaction, on the pinned connection -- and at a pool
 # of one connection in autocommit, where a vehicle materialises at init.
 query II
-EXPLAIN SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g, count(*) AS c FROM rc_on.dbo.rc_t WHERE id > 1 GROUP BY g;
+EXPLAIN SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t GROUP BY g UNION ALL SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t WHERE id > 1 GROUP BY g;
 ----
 physical_plan	<REGEX>:.*Mssql Scan.*Mssql Scan.*
 
@@ -214,7 +214,7 @@ statement ok
 BEGIN;
 
 query II rowsort
-SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g, count(*) AS c FROM rc_on.dbo.rc_t WHERE id > 1 GROUP BY g;
+SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t GROUP BY g UNION ALL SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t WHERE id > 1 GROUP BY g;
 ----
 1	1
 1	2
@@ -230,7 +230,7 @@ statement ok
 SET mssql_connection_limit = 1;
 
 query II rowsort
-SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g, count(*) AS c FROM rc_on.dbo.rc_t WHERE id > 1 GROUP BY g;
+SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t GROUP BY g UNION ALL SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t WHERE id > 1 GROUP BY g;
 ----
 1	1
 1	2
@@ -241,7 +241,7 @@ SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g, count
 
 # One part pushed, the other on the catalog scan, on the one connection.
 query II rowsort
-SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g, n FROM rc_on.dbo.rc_t WHERE id > 3;
+SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t GROUP BY g UNION ALL SELECT g, n FROM rc_on.dbo.rcp_t WHERE id > 3;
 ----
 1	2
 2	1
@@ -255,7 +255,7 @@ RESET mssql_connection_limit;
 # own select lists, so they are not replaced by vehicles (review of E1: a
 # binder error); a bare result name still lets them go.
 query I
-SELECT g + 1 AS x FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g + 1 FROM rc_on.dbo.rc_t GROUP BY g ORDER BY g + 1;
+SELECT g + 1 AS x FROM rc_on.dbo.rcp_t GROUP BY g UNION ALL SELECT g + 1 FROM rc_on.dbo.rcp_t GROUP BY g ORDER BY g + 1;
 ----
 2
 2
@@ -267,7 +267,7 @@ SELECT g + 1 AS x FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g + 1 FROM rc_
 # A bare name that is not a result name binds against the children too
 # (`g` under the aliases x / y), and through a nested set operation.
 query I
-SELECT g AS x FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g AS y FROM rc_on.dbo.rc_t GROUP BY g ORDER BY g;
+SELECT g AS x FROM rc_on.dbo.rcp_t GROUP BY g UNION ALL SELECT g AS y FROM rc_on.dbo.rcp_t GROUP BY g ORDER BY g;
 ----
 1
 1
@@ -277,7 +277,7 @@ SELECT g AS x FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g AS y FROM rc_on.
 3
 
 query I
-SELECT g AS x FROM rc_off.dbo.rc_t GROUP BY g UNION ALL SELECT g AS y FROM rc_off.dbo.rc_t GROUP BY g ORDER BY g;
+SELECT g AS x FROM rc_off.dbo.rcp_t GROUP BY g UNION ALL SELECT g AS y FROM rc_off.dbo.rcp_t GROUP BY g ORDER BY g;
 ----
 1
 1
@@ -287,19 +287,19 @@ SELECT g AS x FROM rc_off.dbo.rc_t GROUP BY g UNION ALL SELECT g AS y FROM rc_of
 3
 
 query I
-SELECT g + 1 AS x FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g + 1 FROM rc_on.dbo.rc_t GROUP BY g EXCEPT SELECT 100 ORDER BY g + 1;
+SELECT g + 1 AS x FROM rc_on.dbo.rcp_t GROUP BY g UNION ALL SELECT g + 1 FROM rc_on.dbo.rcp_t GROUP BY g EXCEPT SELECT 100 ORDER BY g + 1;
 ----
 2
 3
 4
 
 query II
-EXPLAIN SELECT g + 1 AS x FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g + 1 FROM rc_on.dbo.rc_t GROUP BY g ORDER BY x;
+EXPLAIN SELECT g + 1 AS x FROM rc_on.dbo.rcp_t GROUP BY g UNION ALL SELECT g + 1 FROM rc_on.dbo.rcp_t GROUP BY g ORDER BY x;
 ----
 physical_plan	<REGEX>:.*Mssql Scan.*Mssql Scan.*
 
 query I
-SELECT g + 1 AS x FROM rc_on.dbo.rc_t GROUP BY g UNION ALL SELECT g + 1 FROM rc_on.dbo.rc_t GROUP BY g ORDER BY x;
+SELECT g + 1 AS x FROM rc_on.dbo.rcp_t GROUP BY g UNION ALL SELECT g + 1 FROM rc_on.dbo.rcp_t GROUP BY g ORDER BY x;
 ----
 2
 2
@@ -316,7 +316,7 @@ statement ok
 CREATE TABLE rc_counts (g INTEGER, c BIGINT);
 
 statement ok
-WITH q AS (SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g) INSERT INTO rc_counts SELECT * FROM q;
+WITH q AS (SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t GROUP BY g) INSERT INTO rc_counts SELECT * FROM q;
 
 query II
 SELECT * FROM rc_counts ORDER BY g;
@@ -342,10 +342,10 @@ WITH rc_o AS (SELECT * FROM rc_on.dbo.rc_o WHERE st = 'open') SELECT * EXCLUDE (
 # and keeps DuckDB's names.
 # (Through a table: DESCRIBE is not rewritten by the rewriter at all.)
 statement ok
-CREATE TEMP TABLE rc_names AS SELECT * FROM (SELECT id, n FROM rc_on.dbo.rc_t ORDER BY id LIMIT 2) x JOIN (SELECT id, n FROM rc_on.dbo.rc_t ORDER BY id LIMIT 3) y USING (id);
+CREATE TEMP TABLE rc_names AS SELECT * FROM (SELECT id, n FROM rc_on.dbo.rcp_t ORDER BY id LIMIT 2) x JOIN (SELECT id, n FROM rc_on.dbo.rcp_t ORDER BY id LIMIT 3) y USING (id);
 
 statement ok
-CREATE TEMP TABLE rc_names_off AS SELECT * FROM (SELECT id, n FROM rc_off.dbo.rc_t ORDER BY id LIMIT 2) x JOIN (SELECT id, n FROM rc_off.dbo.rc_t ORDER BY id LIMIT 3) y USING (id);
+CREATE TEMP TABLE rc_names_off AS SELECT * FROM (SELECT id, n FROM rc_off.dbo.rcp_t ORDER BY id LIMIT 2) x JOIN (SELECT id, n FROM rc_off.dbo.rcp_t ORDER BY id LIMIT 3) y USING (id);
 
 query I
 SELECT count(*) FROM (SELECT column_index, column_name FROM duckdb_columns() WHERE table_name = 'rc_names' EXCEPT SELECT column_index, column_name FROM duckdb_columns() WHERE table_name = 'rc_names_off');
@@ -372,18 +372,18 @@ SELECT mssql_exec('rc_off', 'DROP TABLE dbo.rc_o');
 #
 
 query II
-EXPLAIN WITH a AS (SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g) SELECT l.name, a.c FROM loc l JOIN a USING (g);
+EXPLAIN WITH a AS (SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t GROUP BY g) SELECT l.name, a.c FROM loc l JOIN a USING (g);
 ----
 physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
 
 query TI
-WITH a AS (SELECT g, count(*) AS c FROM rc_on.dbo.rc_t GROUP BY g) SELECT l.name, a.c FROM loc l JOIN a USING (g) ORDER BY l.name;
+WITH a AS (SELECT g, count(*) AS c FROM rc_on.dbo.rcp_t GROUP BY g) SELECT l.name, a.c FROM loc l JOIN a USING (g) ORDER BY l.name;
 ----
 one	2
 two	1
 
 statement ok
-SELECT mssql_exec('rc_off', 'DROP TABLE dbo.rc_t');
+SELECT mssql_exec('rc_off', 'DROP TABLE dbo.rcp_t');
 
 statement ok
 DETACH rc_on;
