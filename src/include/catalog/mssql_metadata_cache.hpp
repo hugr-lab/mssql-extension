@@ -301,6 +301,11 @@ public:
 		row_count_pass_ = allowed;
 	}
 
+	//! Whether a load takes SET LOCK_TIMEOUT 0 (MetadataRequest). Not on Fabric Warehouse or Synapse.
+	void SetNoLockWait(bool allowed) {
+		no_lock_wait_ = allowed;
+	}
+
 	// Get database default collation.
 	// Returns by VALUE: a reference would outlive the internal lock and race
 	// with Refresh() overwriting the string (issue #178 D6 audit).
@@ -429,6 +434,7 @@ private:
 	bool IsColumnsFreshLocked(const MSSQLTableMetadata &table) const;
 	MSSQLCacheState state_;								  // Current cache state (backward compat)
 	bool row_count_pass_ = true;						  // SetRowCountPass; set once at catalog init
+	bool no_lock_wait_ = false;							  // SetNoLockWait; set once at catalog init
 	const MSSQLCatalogFilter *filter_ = nullptr;		  // Set once at catalog init, before any concurrency
 	unordered_map<string, MSSQLSchemaMetadata> schemas_;  // Cached schemas
 	std::chrono::steady_clock::time_point last_refresh_;  // Last refresh timestamp (backward compat)

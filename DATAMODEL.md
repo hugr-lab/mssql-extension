@@ -538,6 +538,28 @@ pool connection on B would then block on A's schema lock until
 `mssql_metadata_timeout` — the #380 hang itself.
 `mssql_invalidate_cache()` is allowed either way.
 
+**A load does not queue for a lock** (`MetadataRequest`, not on Fabric Warehouse
+or Synapse). It has to read on the pinned connection, the only one that sees the
+transaction's own uncommitted DDL and on a pool of one the only one there is; and
+a load that waited there held a key of a system table while it queued on a row
+another session's DDL holds, a deadlock cycle in which the load, having written
+nothing, was the victim and the user's whole transaction rolled back. So every
+load runs under `SET LOCK_TIMEOUT 0` inside `sp_executesql`, which ends with the
+call: a held row answers 1222, which ends the statement and leaves the transaction,
+the load holds nothing while it is away, and it reads again until
+`mssql_metadata_timeout`. The wait for another session's DDL is still there, spent
+outside the lock. It needs no permission, unlike the row-count DMV. READ UNCOMMITTED
+is no way out (measured): it shows another session's uncommitted table, hides a live
+one that session is dropping, and for a `db_datareader` login waits all the same. A
+bind's load reads one table's rows and almost never meets a held one (2 retries in
+2973 loads under 12 workers of DDL); a listing reads every object (172 of 288 loads
+retried, no slower on average). What it gives up: the deadlock monitor sees no cycle
+through a load, so two transactions with uncommitted DDL, each listing the catalog,
+both wait out the timeout, where one used to be rolled back in seconds. COPY's target
+check and a raw scan's describe also read the catalog on the pinned connection, and
+queue as before. A 1205 on a load (a platform without the SET) is reported in a
+transaction, not rerun, because the server has rolled the transaction back.
+
 **At the end of the transaction, what it loaded is published** (issue #383,
 `MSSQLCatalog::PublishTransactionMetadata`). On its own the rule above made a
 workload that runs everything in transactions (DuckLake) load each table's

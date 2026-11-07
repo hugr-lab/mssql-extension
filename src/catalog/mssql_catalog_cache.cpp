@@ -99,6 +99,7 @@ unique_ptr<MSSQLMetadataCache> MSSQLCatalog::CreateTransactionMetadataCache(Clie
 	// in the user's server transaction, and read sysrowsets, where a deadlock
 	// victim rolls that transaction back (spec 084 Risks).
 	cache->SetRowCountPass(false);
+	cache->SetNoLockWait(!connection_info_->IsFabricEndpoint() && !connection_info_->IsSynapseEndpoint());
 	return cache;
 }
 

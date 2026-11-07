@@ -103,6 +103,7 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 	// Spec 084 D1: the whole-catalog row counts from one DMV pass, except where
 	// the DMV and table variables are unverified.
 	metadata_cache_->SetRowCountPass(!connection_info_->IsFabricEndpoint() && !connection_info_->IsSynapseEndpoint());
+	metadata_cache_->SetNoLockWait(!connection_info_->IsFabricEndpoint() && !connection_info_->IsSynapseEndpoint());
 
 	// Create statistics provider with default TTL (will be configured from settings later)
 	statistics_provider_ = make_uniq<MSSQLStatisticsProvider>();

@@ -153,7 +153,8 @@ WHERE o.object_id = OBJECT_ID(QUOTENAME(@s) + N'.' + QUOTENAME(@t))
 // db_datareader-only login keeps its catalog. A view has no partition rows and takes that branch too; an
 // indexed view agrees either way (measured), a memory-optimized table has no
 // index 0/1 row and reads 0 from OBJECTPROPERTYEX as it always did. A deadlock
-// victim (1205) is rethrown, for RunMetadataQuerySets to rerun the batch.
+// victim (1205) and a held lock (1222, MetadataRequest) are rethrown, for
+// RunMetadataQuerySets to rerun the batch.
 static const char *BULK_SCHEMA_EXCLUSIONS = R"(s.schema_id NOT IN (3, 4)
   AND s.principal_id != 0
   AND s.name NOT IN ('guest', 'INFORMATION_SCHEMA', 'sys', 'db_owner', 'db_accessadmin',
@@ -177,7 +178,7 @@ BEGIN TRY
     GROUP BY ps.object_id;
 END TRY
 BEGIN CATCH
-    IF ERROR_NUMBER() = 1205 THROW;
+    IF ERROR_NUMBER() IN (1205, 1222) THROW;
 END CATCH;
 )";
 		row_count = "CASE WHEN rc.object_id IS NOT NULL THEN rc.rows_ ELSE " + row_count + " END";
@@ -345,6 +346,28 @@ using MetadataSetRowCallback = std::function<void(idx_t result_set, const vector
 static void RunMetadataQuerySets(tds::TdsConnection &connection, const tds::Request &sql,
 								 MetadataSetRowCallback callback, int timeout_ms, const std::function<void()> &reset);
 
+// What a metadata load sends: `SET LOCK_TIMEOUT 0` inside sp_executesql, where the SET ends with
+// the call (measured: 0 inside, -1 after, whichever way the load ends). A load that never queues
+// for a lock cannot be in a deadlock cycle, so it cannot be the victim that rolls back the user's
+// transaction, nor make another session's DROP one. On a row another session's uncommitted DDL
+// holds it gets 1222, which ends the statement and leaves the transaction (measured: XACT_STATE 1),
+// holds nothing while it is away, and RunMetadataQuerySets reads again. Measured over 3 interleaved
+// runs of the suite on 12 workers: 63 deadlocks waiting, 0 this way.
+//
+// The other way not to wait, READ UNCOMMITTED, is not one (measured): it shows a table another
+// session has not committed, hides a live one that session has not finished dropping, and for a
+// login with only db_datareader it waits all the same. LOCK_TIMEOUT needs no permission.
+//
+// Off on Fabric Warehouse and Synapse (`no_lock_wait`), unverified there.
+static tds::Request MetadataRequest(bool no_lock_wait, const string &statement, const string &declarations = string(),
+									const std::vector<std::pair<std::string, std::string>> &values = {}) {
+	if (no_lock_wait) {
+		return mssql::BuildExecuteSqlRequest("SET LOCK_TIMEOUT 0;\n" + statement, declarations, values);
+	}
+	return declarations.empty() ? tds::Request(statement)
+								: mssql::BuildExecuteSqlRequest(statement, declarations, values);
+}
+
 static void RunMetadataQuery(tds::TdsConnection &connection, const tds::Request &sql, MetadataRowCallback callback,
 							 int timeout_ms, const std::function<void()> &reset) {
 	RunMetadataQuerySets(
@@ -371,12 +394,27 @@ static void RunMetadataQuerySets(tds::TdsConnection &connection, const tds::Requ
 	// rows. `reset` closes that — the caller undoes its partial accumulation and
 	// the query is re-run from the top.
 	//
-	// Note what this is and is not. It does not stop the deadlock; the cycle is
-	// between our multi-table catalog join (holding a key in sys.sysschobjs,
-	// wanting sys.sysrowsets) and a concurrent DROP TABLE holding the reverse,
-	// and no client-side isolation setting reaches it — catalog reads ignore the
-	// session isolation level. This only makes losing the race recoverable.
+	// The cycle is between our multi-table catalog join (holding a key in
+	// sys.sysschobjs, wanting sys.sysrowsets) and a concurrent DROP TABLE holding
+	// the reverse. MetadataRequest keeps a load out of it, where the server takes
+	// LOCK_TIMEOUT; this makes losing the race recoverable where it does not.
+	//
+	// Not in a transaction: 1205 has rolled it back on the server, so a rerun
+	// carries a dead descriptor and answers "The server failed to resume the
+	// transaction", which names neither the deadlock nor the rollback.
+	//
+	// 1222 (MetadataRequest) is the same wait, spent outside the lock: read again
+	// until mssql_metadata_timeout, 0 meaning as long as it takes. The rerun is why
+	// every caller passes `reset`. What it gives up: the server's deadlock monitor
+	// sees no cycle through a load, so where the load's own transaction holds what
+	// the other session needs -- two transactions with uncommitted DDL, each listing
+	// the catalog -- neither gets a victim and both wait out the timeout. A cycle
+	// used to end in seconds, by rolling one of them back.
+	const bool in_transaction = connection.HasTransactionDescriptor();
 	constexpr int MAX_ATTEMPTS = 6;
+	constexpr int MIN_LOCK_RETRY_MS = 20;
+	constexpr int MAX_LOCK_RETRY_MS = 500;
+	int lock_retry_ms = MIN_LOCK_RETRY_MS;
 	auto start = std::chrono::steady_clock::now();
 	for (int attempt = 1;; attempt++) {
 		idx_t rows_delivered = 0;
@@ -401,6 +439,25 @@ static void RunMetadataQuerySets(tds::TdsConnection &connection, const tds::Requ
 		if (!result.HasError()) {
 			CACHE_DEBUG(1, "RunMetadataQuery: completed in %lldms", (long long)elapsed);
 			return;
+		}
+		if (result.error_number == 1222 && (rows_delivered == 0 || reset)) {
+			if (timeout_ms > 0 && elapsed >= timeout_ms) {
+				throw IOException(
+					"Metadata query failed: the catalog stayed locked by another session's uncommitted "
+					"schema change for %lld ms (mssql_metadata_timeout)",
+					(long long)elapsed);
+			}
+			if (rows_delivered > 0) {
+				reset();
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(lock_retry_ms));
+			lock_retry_ms = std::min(lock_retry_ms * 2, MAX_LOCK_RETRY_MS);
+			attempt--;	// MAX_ATTEMPTS counts deadlocks
+			continue;
+		}
+		if (result.error_number == 1205 && in_transaction) {
+			throw IOException("Metadata query failed: %s The server has rolled the open transaction back.",
+							  result.error_message);
 		}
 		if (result.error_number == 1205 && attempt < MAX_ATTEMPTS && (rows_delivered == 0 || reset)) {
 			CACHE_DEBUG(1, "RunMetadataQuery: deadlock victim (1205) after %llu row(s), attempt %d/%d — rerunning",
@@ -491,9 +548,10 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	// object row, its columns, its keys -- so the row count is computed once,
 	// not once per column.
 	const tds::Request query_request =
-		mssql::BuildExecuteSqlRequest(string(SINGLE_TABLE_OBJECT_SQL_TEMPLATE) + ";\n" + COLUMN_DISCOVERY_SQL_TEMPLATE +
-										  ";\n" + mssql::RowIdKeyInfo::DiscoverySqlTemplate(),
-									  "@s sysname, @t sysname", {{"s", schema_name}, {"t", table_name}});
+		MetadataRequest(no_lock_wait_,
+						string(SINGLE_TABLE_OBJECT_SQL_TEMPLATE) + ";\n" + COLUMN_DISCOVERY_SQL_TEMPLATE + ";\n" +
+							mssql::RowIdKeyInfo::DiscoverySqlTemplate(),
+						"@s sysname, @t sysname", {{"s", schema_name}, {"t", table_name}});
 
 	// Populate the cache slot in place so we never take the address of a stack
 	// local that gets moved out. GCC's -Wreturn-local-addr can't prove the
@@ -922,8 +980,8 @@ void MSSQLMetadataCache::LoadObjectsAndColumnsLocked(tds::TdsConnection &connect
 	}
 	const bool rc_pass = !one_schema && !narrowed && row_count_pass_;
 	const string batch = BuildBulkMetadataBatch(scope, rc_pass);
-	const tds::Request request =
-		one_schema ? mssql::BuildExecuteSqlRequest(batch, "@s sysname", {{"s", *one_schema}}) : tds::Request(batch);
+	const tds::Request request = one_schema ? MetadataRequest(no_lock_wait_, batch, "@s sysname", {{"s", *one_schema}})
+											: MetadataRequest(no_lock_wait_, batch);
 
 	// object_id -> the entry it owns, pointing into stage.tables. Valid across
 	// insertion because both containers are node-based unordered_maps.
@@ -1267,7 +1325,7 @@ void MSSQLMetadataCache::EnsureSchemasLoadedLocked(tds::TdsConnection &connectio
 
 		vector<string> names;
 		ExecuteMetadataQuery(
-			connection, schema_sql,
+			connection, MetadataRequest(no_lock_wait_, schema_sql),
 			[&names](const vector<string> &values) {
 				if (!values.empty()) {
 					names.push_back(values[0]);
@@ -1485,7 +1543,7 @@ void MSSQLMetadataCache::LoadSchemas(tds::TdsConnection &connection) {
 	sql += "\nORDER BY s.name";
 
 	ExecuteMetadataQuery(
-		connection, sql,
+		connection, MetadataRequest(no_lock_wait_, sql),
 		[this](const vector<string> &values) {
 			if (!values.empty()) {
 				string schema_name = values[0];
@@ -1527,7 +1585,7 @@ void MSSQLMetadataCache::LoadAllTableNames(tds::TdsConnection &connection) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	unordered_map<string, vector<string>> staged;
 	ExecuteMetadataQuery(
-		connection, TABLE_NAMES_SQL,
+		connection, MetadataRequest(no_lock_wait_, TABLE_NAMES_SQL),
 		[&](const vector<string> &values) {
 			if (values.size() < 2) {
 				return;
