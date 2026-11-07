@@ -903,6 +903,23 @@ def as_decimal(s):
     return decimal.Decimal(s) if DECIMAL.fullmatch(s) else None
 
 
+def within_tolerance(x, y, dx, dy):
+    """Two DOUBLE values, as close as the two engines may legitimately be.
+
+    By `Decimal` where both sides are plain decimals, and by float otherwise --
+    the forms a DOUBLE can print that an exact decimal cannot (`1e-05`). Both
+    paths are deliberately strict about shape: `FLOATING` rejects a leading
+    blank and a digit separator that `float()` would accept, so a formatting
+    difference is still a difference.
+    """
+    if dx is not None and dy is not None:
+        return abs(dx - dy) <= tolerance(max(abs(dx), abs(dy)))
+    fx, fy = as_float(x), as_float(y)
+    if fx is None or fy is None:
+        return False
+    return abs(fx - fy) <= float(tolerance(decimal.Decimal(max(abs(fx), abs(fy)))))
+
+
 def same(x, y, kind):
     """Is the client's value `y` the oracle's `x`, for a column of this kind?
 
@@ -946,17 +963,52 @@ def same(x, y, kind):
     dx, dy = as_decimal(x), as_decimal(y)
     if kind == NUMERIC:
         return dx is not None and dy is not None and dx == dy
-    if dx is not None and dy is not None:
-        return abs(dx - dy) <= tolerance(max(abs(dx), abs(dy)))
-    fx, fy = as_float(x), as_float(y)
-    if fx is None or fy is None:
-        return False
-    return abs(fx - fy) <= float(tolerance(decimal.Decimal(max(abs(fx), abs(fy)))))
+    return within_tolerance(x, y, dx, dy)
 
 
 def rows_equal(ra, rb, kinds):
     """`kinds` is the per-column answer from the oracle's types."""
     return len(ra) == len(rb) and all(same(x, y, k) for x, y, k in zip(ra, rb, kinds))
+
+
+def difference_verdict(a, b, kinds):
+    """What to call two results that did not compare equal."""
+    # Same rows, different order. The old wording was "row order of ties
+    # differs", which it has no evidence for: an inverted ORDER BY with no ties
+    # at all reaches here too. Say what is actually established.
+    if all(rows_equal(ra, rb, kinds) for ra, rb in zip(sorted(a), sorted(b))):
+        return "ok (same rows, different order)"
+    # Name trailing-blank padding specifically, since it is the #405 class and
+    # an exact comparison is the only thing that can see it.
+    if all(len(ra) == len(rb) and all(x.strip() == y.strip() for x, y in zip(ra, rb))
+           for ra, rb in zip(a, b)):
+        return "PADDING (values differ only in surrounding blanks -- the #405 class)"
+    for i, (ra, rb) in enumerate(zip(a, b)):
+        if not rows_equal(ra, rb, kinds):
+            return f"DIFF at row {i + 1}: {rb[:6]} vs {ra[:6]}"
+    return "DIFF"
+
+
+def types_refusal(types, rows):
+    """Why these types cannot be used, or "" when they can.
+
+    A refusal rather than a default: a comparison that cannot tell an exact
+    column from a double is what this replaced.
+
+    The width is only checked when the rows HAVE a width. `csv.reader` reads
+    the blank line COPY writes for a single-column NULL as `[]`, so a result
+    like q17's NULL `avg_yearly` at a small scale factor measured 0 columns and
+    was refused as "the oracle's types do not fit its rows" -- blaming the
+    oracle for a correct answer, and masking a client that returned a number
+    where the oracle had NULL behind the same misleading verdict (review of
+    #537 by VGSML, reproduced at SF 0.01).
+    """
+    if types is None:
+        return "NO TYPES (the oracle did not emit them; cannot compare)"
+    width = max((len(r) for r in rows), default=0)
+    if width and len(types) != width:
+        return f"TYPES {len(types)} for {width} column(s) (the oracle's types do not fit its rows)"
+    return ""
 
 
 def compare(oracle, got, types=None):
@@ -972,28 +1024,13 @@ def compare(oracle, got, types=None):
     b = list(csv.reader(open(got)))
     if len(a) != len(b):
         return f"ROWS {len(b)} != {len(a)}"
-    if types is None:
-        return "NO TYPES (the oracle did not emit them; cannot compare)"
-    width = max((len(r) for r in a), default=0)
-    if a and len(types) != width:
-        return f"TYPES {len(types)} for {width} column(s) (the oracle's types do not fit its rows)"
-    exact = [column_kind(t) for t in types]
-    if all(rows_equal(ra, rb, exact) for ra, rb in zip(a, b)):
+    refusal = types_refusal(types, a)
+    if refusal:
+        return refusal
+    kinds = [column_kind(t) for t in types]
+    if all(rows_equal(ra, rb, kinds) for ra, rb in zip(a, b)):
         return "ok"
-    # Same rows, different order. The old wording was "row order of ties
-    # differs", which it has no evidence for: an inverted ORDER BY with no ties
-    # at all reaches here too. Say what is actually established.
-    if all(rows_equal(ra, rb, exact) for ra, rb in zip(sorted(a), sorted(b))):
-        return "ok (same rows, different order)"
-    # Name trailing-blank padding specifically, since it is the #405 class and
-    # an exact comparison is the only thing that can see it.
-    if all(len(ra) == len(rb) and all(x.strip() == y.strip() for x, y in zip(ra, rb))
-           for ra, rb in zip(a, b)):
-        return "PADDING (values differ only in surrounding blanks -- the #405 class)"
-    for i, (ra, rb) in enumerate(zip(a, b)):
-        if not rows_equal(ra, rb, exact):
-            return f"DIFF at row {i + 1}: {rb[:6]} vs {ra[:6]}"
-    return "DIFF"
+    return difference_verdict(a, b, kinds)
 
 
 # --------------------------------------------------------------------------- selftest
@@ -1078,6 +1115,28 @@ SAME_TESTS = [
     # ... while the same four in a NUMERIC column ARE the same number.
     ("the same number written with a leading zero", "BIGINT", "07", "7", True),
     ("the same number at another scale", "DECIMAL(38,2)", "1.50", "1.5", True),
+    # Restored: the type rewrite dropped these three and took the coverage of
+    # DECIMAL's strictness, FLOATING's shape and the as_float path with them.
+    # VGSML mutated the code three ways and the self-test stayed green --
+    # removing the as_float branch, loosening DECIMAL to accept blanks and
+    # digit separators, and setting FLOATING to `.*` (review of #537).
+    #
+    # int() accepts both of these, which is why as_int was replaced by a
+    # regex with no strip in the first place.
+    ("a NUMERIC value with a leading blank", "BIGINT", "13", " 13", False),
+    ("a NUMERIC value written with a digit separator", "BIGINT", "1000", "1_000", False),
+    ("a NUMERIC value with a trailing blank", "DECIMAL(38,2)", "13.00", "13.00 ", False),
+    # The as_float path: the forms a DOUBLE can print that an exact decimal
+    # cannot. Only a DOUBLE column reaches it.
+    ("a DOUBLE in scientific notation, equal", "DOUBLE", "1e3", "1000.0", True),
+    ("a DOUBLE in scientific notation, small", "DOUBLE", "1e-05", "0.00001", True),
+    ("a DOUBLE in scientific notation, different", "DOUBLE", "1e3", "2000.0", False),
+    # FLOATING's own fixture: a leading blank is a formatting difference the
+    # gate must see, even in a DOUBLE column. float() would strip it, so this
+    # is what fails when FLOATING is loosened to `.*` -- the third mutation in
+    # the review of #537, which nothing else caught.
+    ("a DOUBLE value with a leading blank", "DOUBLE", "1000.0", " 1000.0", False),
+    ("a DOUBLE with a digit separator", "DOUBLE", "1000.0", "1_000.0", False),
     # An unrecognised type defaults to EXACT, so a new column kind fails loudly
     # rather than quietly taking a tolerance.
     ("an unknown type is treated as exact", "SOME_NEW_TYPE", "1.00", "1.01", False),
@@ -1120,6 +1179,14 @@ COMPARE_TESTS = [
     # And the refusals, which must never read as a pass.
     ("no types at all", None, [["a", "1"]], [["a", "1"]], "NO TYPES"),
     ("too few types for the rows", ["VARCHAR"], [["a", "1"]], [["a", "1"]], "TYPES 1 for 2"),
+    # A single-column NULL: COPY writes a blank line and csv.reader reads it as
+    # [], so the rows measure 0 columns. The width check must not fire, or a
+    # correct answer is refused as the oracle's fault -- q17's avg_yearly at a
+    # small scale factor (review of #537).
+    ("a one-column NULL on both sides", ["DOUBLE"], [[]], [[]], "ok"),
+    ("a one-column NULL the client filled in", ["DOUBLE"], [[]], [["5"]], "DIFF"),
+    ("a NULL among several columns", ["VARCHAR", "DOUBLE"],
+     [["a", ""]], [["a", ""]], "ok"),
 ]
 
 #: (label, session text, expected per-query result)
