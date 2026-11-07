@@ -43,8 +43,25 @@ Three modes:
 | `fuzz_utf16` | `tds::encoding::Utf16LEDecode` / `LegacyUtf16LEDecode` | `src/tds/encoding/utf16.cpp` | ✅ (uses simdutf) |
 | `fuzz_envchange_txn` | `tds::FindBeginTxnDescriptor` | `src/tds/tds_token_parser.cpp` | ✅ |
 | `fuzz_login_response` | `tds::TdsProtocol::ParseLoginResponse` | `src/tds/tds_protocol.cpp` (+ packet, types, utf16) | ✅ |
+| `fuzz_code_page` | `codec::code_page::DecodeToUtf8` / `DecodeToUtf16` / `DecodeValues` / `ExactUtf8Length` / `CopyAscii`, each against the others | `src/codec/code_page/code_page.cpp` (+ the generated tables) | ✅ (simdutf for its UTF-8 / UTF-16 oracles) |
 | `fuzz_row_stager` | `codec::staging::RowStager::StageRow` / `StageNBCRow` | `src/codec/staging/row_stager.cpp` | ❌ links libduckdb |
 | `fuzz_bcp_encode` | `codec::string::PlanColumn` + `ScatterVarBlock` vs `EncodeToBcp` | `src/codec/string_codec.cpp` | ❌ links libduckdb |
+
+`fuzz_code_page` (spec 091) is in the default `TARGETS`, so it shares the per-PR
+job's one fuzzing budget with the other default targets. Its oracles are the
+module's own entry points checked against each other: valid UTF-8, nothing written
+past the returned length + `STORE_SLACK` (a canary), stage 1 then UTF-16 → UTF-8
+equal to the direct decode, `ExactUtf8Length` equal to the decode's length, and
+`DecodeValues` over the input cut into 0–70-byte values (so both its NEON path and
+its 16-byte path run on arm64) equal, value by value, to `DecodeToUtf8` of each,
+laid out contiguously and summing to its return value. Replay locally:
+
+```bash
+c++ -std=c++17 -O1 -fsanitize=undefined -I src/include -I build/release/vcpkg_installed/arm64-osx/include \
+  fuzz/fuzz_code_page.cc fuzz/replay_main.cc src/codec/code_page/code_page.cpp \
+  src/codec/code_page/code_page_tables.cpp -L build/release/vcpkg_installed/arm64-osx/lib -lsimdutf \
+  -o /tmp/fuzz_code_page && /tmp/fuzz_code_page <corpus-dir>
+```
 
 The last two are **not in the default `TARGETS`** and do not run in the per-PR
 ClusterFuzzLite job: they read and write `duckdb::Vector`, and a sanitizer build
@@ -59,6 +76,12 @@ DYLD_LIBRARY_PATH=build/release/src fuzz/out/fuzz_bcp_encode fuzz/corpus/bcp_enc
 ```
 
 `make fuzz-encode-replay` wraps exactly that.
+
+Both pick up the family codecs with a **non-recursive** glob, `src/codec/*.cpp`,
+in `build.sh`, so `src/codec/code_page/*.cpp` is not in either today. Nothing they
+compile calls the code-page module yet; once `string_codec.cpp` does (spec 092
+switches the read path to it), add `src/codec/code_page/*.cpp` to both source
+lists or they stop linking.
 
 ### `fuzz_bcp_encode`'s three oracles
 
@@ -143,7 +166,7 @@ docker build -t mssql-fuzz -f fuzz/Dockerfile .
 
 # Run a campaign (CmpLog + dict + all cores). Findings persist on the host.
 docker run --rm -it -v "$PWD/fuzz/findings:/repo/fuzz/findings" mssql-fuzz \
-    fuzz/run.sh tds_tokens          # or: browser_response | utf16
+    fuzz/run.sh tds_tokens          # or: browser_response | utf16 | envchange_txn | login_response | code_page
 #   fuzz/run.sh tds_tokens 600 4    # 600s/core, 4 cores
 ```
 
@@ -196,7 +219,7 @@ sanitizer stack trace, the `file:line` source location, and a one-line root caus
 
 ```
 fuzz/
-  fuzz_browser_response.cc   fuzz_tds_tokens.cc   fuzz_utf16.cc
+  fuzz_browser_response.cc   fuzz_tds_tokens.cc   fuzz_utf16.cc   fuzz_code_page.cc   …
   build.sh        # single shared builder (libFuzzer / AFL++ / ClusterFuzzLite)
   run.sh          # local AFL++ CmpLog campaign
   Dockerfile      # local discovery image (AFL++)

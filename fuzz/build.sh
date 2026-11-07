@@ -117,7 +117,11 @@ build_harness() {  # $1=name $2=harness.cc ; remaining = library objects
 
 # TARGETS selects which harnesses to build (default: all). Lets CI / run.sh /
 # verification build a subset; e.g. TARGETS=browser_response builds offline.
-TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn login_response}"
+# Every default target is built for the per-PR ClusterFuzzLite job, whose ONE
+# fuzz-seconds budget (cflite-pr.yml) is split between the targets it runs:
+# code_page (spec 091) shares it with the TDS harnesses, so each default target
+# costs the others time.
+TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn login_response code_page}"
 want() { [[ " ${TARGETS} " == *" $1 "* ]]; }
 
 # 1. SQL Browser response parser — standalone: no simdutf, no TDS sources, no
@@ -147,6 +151,16 @@ if want login_response; then
 	LOGIN_OBJS="$(compile_objs login \
 		"${TDS}/tds_protocol.cpp" "${TDS}/tds_packet.cpp" "${TDS}/tds_types.cpp" "${TDS}/encoding/utf16.cpp")"
 	build_harness fuzz_login_response fuzz_login_response.cc ${LOGIN_OBJS}
+fi
+
+# 5b. SQL Server code-page decode kernels (spec 091): standalone, like utf16 — the module
+#     has no DuckDB include; simdutf only for the harness's UTF-8 validity and UTF-16 checks.
+if want code_page; then
+	ensure_simdutf
+	CP_OBJS="$(compile_objs cp "${REPO}/src/codec/code_page/code_page.cpp" "${REPO}/src/codec/code_page/code_page_avx2.cpp" \
+		"${REPO}/src/codec/code_page/code_page_avx512.cpp" \
+		"${REPO}/src/codec/code_page/code_page_tables.cpp")"
+	build_harness fuzz_code_page fuzz_code_page.cc ${CP_OBJS}
 fi
 
 # 6. The STAGED read path (spec 059 D4): parser in raw-row mode feeding
@@ -255,7 +269,7 @@ if want bcp_encode; then
 fi
 
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---
-for t in browser_response tds_tokens utf16 envchange_txn login_response bcp_encode; do
+for t in browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode; do
 	if [[ -d "${HERE}/corpus/${t}" ]]; then
 		( cd "${HERE}/corpus/${t}" && zip -qr "${OUT}/fuzz_${t}_seed_corpus.zip" . ) || true
 	fi

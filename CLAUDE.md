@@ -20,6 +20,10 @@ src/
                         # <family>_codec.cpp owns EncodeToBcp / DecodeFromTds /
                         # FormatSqlLiteral / FormatDdlTypeName for its types.
                         # literal_format.cpp + type_family.cpp are the dispatchers.
+                        # code_page/ (spec 091): server-generated code-page tables
+                        # (tools/code_pages/), the code-page -> UTF-8 kernels, the
+                        # UTF-16 stage 1 (DecodeToUtf16) and the collation lookups
+                        # (by CollationId, by name, by wire key -> code page).
   connection/           # Connection pooling, provider, settings
   dml/                  # DML operations
     insert/             # INSERT (batched VALUES, OUTPUT INSERTED for RETURNING)
@@ -49,6 +53,10 @@ test/
   cpp/                  # C++ unit tests (no SQL Server required)
 docs/                   # Architecture documentation (see docs/architecture.md)
 docker/                 # SQL Server container and Linux CI build
+tools/
+  code_pages/           # Spec 091: generate.py asks a SQL Server how it reads every
+                        # code-page byte (data/, committed); emit_tables.py checks the
+                        # answers and writes src/codec/code_page/code_page_tables.cpp
 ```
 
 ## Versioning
@@ -72,6 +80,11 @@ make docker-up          # Start SQL Server container (no .env needed; `cp .env.e
 make integration-test   # Integration tests (requires SQL Server)
 make test-all           # All tests
 make test-debug         # Tests with debug build
+make test-code-page     # Code-page kernels vs the committed server data (spec 091; no
+                        # SQL Server, no DuckDB); test-code-page-portable = SWAR form
+make bench-code-page    # Code-page kernel microbenchmark (manual, not in CI)
+make bench-code-page-column  # One 2048-row column, staging to vector: DecodeColumn vs today's
+                        # NVARCHAR path (needs a release build; CELL=thai filters cells)
 
 # Docker
 make docker-up          # Start SQL Server test container

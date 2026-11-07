@@ -100,7 +100,7 @@ jobs:
             vcpkg-bincache-x64-linux-
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4.38.2
+        uses: github/codeql-action/init@v4.39.1
         with:
           languages: cpp
           # security-extended adds queries beyond the default suite that are
@@ -169,7 +169,7 @@ jobs:
           echo "after:  $(du -sh vcpkg_bincache | cut -f1)"
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4.38.2
+        uses: github/codeql-action/analyze@v4.39.1
         with:
           category: cpp
           # Write SARIF to disk instead of uploading: the filter step below
@@ -205,16 +205,20 @@ jobs:
         # than an allowlist (`-**/*` then `+src/**`). An allowlist would
         # silently discard findings in any future first-party directory; a
         # denylist fails loud -- new vendored noise shows up and we add it here.
+        #
+        # Also dropped: spec 091's generated code-page tables (tools/code_pages/emit_tables.py),
+        # array initialisers with no logic to analyse (owner's decision, 2026-11-06).
         uses: advanced-security/filter-sarif@v1
         with:
           patterns: |
             -duckdb/**
             -vcpkg/**
+            -src/codec/code_page/code_page_tables.cpp
           input: sarif-results/cpp.sarif
           output: sarif-results/cpp.sarif
 
       - name: Upload filtered SARIF
-        uses: github/codeql-action/upload-sarif@v4.38.2
+        uses: github/codeql-action/upload-sarif@v4.39.1
         with:
           sarif_file: sarif-results/cpp.sarif
           # Must match the analyze category above, otherwise the upload is

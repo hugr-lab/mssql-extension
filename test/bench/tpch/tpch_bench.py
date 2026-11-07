@@ -825,11 +825,15 @@ def double_form(s):
     term dropped to 1e-13 a one-cent rounding difference still passed there
     (bound 0.0235 at 2.3e11 against a 0.01 difference).
 
-    The printed form is the real evidence. A DOUBLE round-trips through repr()
-    unchanged. An exact decimal normally does not: both engines pad to the
-    declared scale, so a decimal(38,6) carries trailing zeros repr() drops
-    (`234603658237.282580` -> `234603658237.2826`) and an integer prints
+    A DOUBLE round-trips through repr() unchanged. Some exact decimals do not:
+    a decimal(38,6) padded to its declared scale carries trailing zeros repr()
+    drops (`234603658237.282580` -> `234603658237.2826`), and an integer prints
     without the `.0` repr() adds.
+
+    But a scale-2 or scale-4 decimal of 15 or fewer significant digits usually
+    DOES round-trip, so this test reads such a pair as two doubles. That is a
+    heuristic rather than evidence, and the KNOWN GAP paragraph in `same()`
+    measures what it costs and says what would replace it.
     """
     return repr(float(s)) == s
 
@@ -845,9 +849,13 @@ def double_form(s):
 #: fixtures generate.
 #:
 #: It was 1e-9, which is #506 item 1 at the scale this harness is planned for
-#: (review of #518, VGSML, after the exact_pair fix): the digit guard moves a
-#: large EXACT sum onto this branch, and at 5.7e13 a 1e-9 bound is ~57 000
-#: units -- so a dropped `lineitem` row passed. At 1e-13 the bound is 5.7 units.
+#: (review of #518, VGSML, after the exact_pair fix): `exact_pair`'s
+#: double-form test moves an ambiguous pair onto this branch -- both values
+#: looking like doubles, which an exact decimal(38,2) sum usually does -- and
+#: at 5.7e13 a 1e-9 bound is ~57 000 units, so a dropped `lineitem` row passed.
+#: At 1e-13 the bound is 5.7 units. It is the backstop for every pair the form
+#: test cannot tell apart, which is why it is sized to ulps and not to a round
+#: number.
 REL_TOLERANCE = decimal.Decimal("1e-13")
 #: The absolute floor, which is what accepts a DOUBLE beside a decimal(38,6):
 #: a half digit of the server's scale is 5e-7.
@@ -946,11 +954,29 @@ def same(x, y):
     against `123456789132.34`, which is item 1 of #506 (a dropped row in an
     aggregate passes) returning at exactly the scale the fix was for.
 
-    What the pair LOOKS like decides which branch applies, because it is the
-    only evidence of what the columns are -- see `exact_pair`, which wants an
-    equal scale, a scale a decimal column could have, and digit counts below a
-    double's full precision. Anything else gets the tolerance, including two
-    doubles whose shortest forms happen to print alike.
+    What the pair LOOKS like decides which branch applies -- see `exact_pair`,
+    which wants an equal scale, a scale a decimal column could have, and at
+    least one side that is NOT a double's shortest round-trip form. Anything
+    else gets the tolerance.
+
+    KNOWN GAP, and it is why this should become type-driven. The form is a
+    heuristic, not evidence, and it leaks in one direction: an exact
+    decimal(38,2) or decimal(38,4) sum whose printed form happens to round-trip
+    -- any value of 15 or fewer significant digits that does not end in a zero,
+    so 9 cases in 10 -- is read as a pair of doubles and gets the tolerance. At
+    q01's `sum_base_price` magnitude (~5.7e11 at SF10) the bound is then 0.056,
+    so a one-cent discrepancy passes. A dropped row (>= ~900) is still rejected
+    at every scale factor.
+
+    No relative bound can close that: at an SF1000 magnitude one ulp is 0.0078,
+    so a cent is 1.3 ulps -- there is no value that accepts a legitimate
+    last-bit difference between two doubles and rejects a cent of rounding
+    error in an exact decimal. Only the COLUMN TYPE separates them, which means
+    reading the oracle's types (`DESCRIBE` each query, confirmed to work in a
+    subquery) and requiring exact equality for every DECIMAL and integer
+    column. Tracked as its own change; it alters the verify contract and wants
+    a live run, because a DECIMAL column the client returns at a different
+    scale would then have to fall back rather than fail.
     """
     if x == y:
         return True
@@ -1060,11 +1086,11 @@ SAME_TESTS = [
      "234603658237.282580", "234603658237.292580", False),
     # ... and the guard must not swallow a real difference at double precision.
     ("two DOUBLEs a whole percent apart", "25.522005853257337", "25.777005853257337", False),
-    # The hole the digit guard opened, and the reason the relative term is
-    # 1e-13 rather than 1e-9 (review of #518 by VGSML). A 16-digit exact sum
-    # cannot be told from a double by its digits, so it lands on the tolerance
-    # branch -- where a 1e-9 bound at 5.7e13 is ~57 000 units and a dropped
-    # `lineitem` row passed. These are SF1000-sized `sum_base_price` values.
+    # Why the relative term is 1e-13 rather than 1e-9 (review of #518 by
+    # VGSML). An exact sum this large looks like a double to `exact_pair`, so
+    # it lands on the tolerance branch -- where a 1e-9 bound at 5.7e13 is
+    # ~57 000 units and a dropped `lineitem` row passed. These are SF1000-sized
+    # `sum_base_price` values.
     ("an SF1000-sized sum 10 000 apart", "56586554400730.17", "56586554410730.17", False),
     ("an SF1000-sized sum 100 apart", "56586554400730.17", "56586554400830.17", False),
     ("an SF100-sized sum 100 apart", "5658655440073.17", "5658655440173.17", False),
