@@ -69,8 +69,9 @@ Details: [Target Column Types and Table Shape](../writing/table-options.md).
 | `mssql_utf8_collation` | VARCHAR | `Latin1_General_100_BIN2_UTF8` | Collation for created `varchar` columns when the server granted UTF8SUPPORT. BIN2 = binary comparison, case-/accent-**sensitive**; matches Fabric's default. Empty inherits the database default |
 | `mssql_default_string_length` | BIGINT | 0 | Length for unannotated `VARCHAR` columns created by CTAS/COPY (`0` = MAX) |
 | `mssql_default_table_kind` | VARCHAR | `HEAP` | Shape of created tables: `HEAP` or `COLUMNSTORE` (clustered columnstore index created before the load) |
-| `mssql_catalog_native_types` | BOOLEAN | true | Report `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` for bounded string columns of attached tables **and of `mssql_scan` / `mssql_scan_params` results** (a `varchar` there only under a UTF-8 collation), so targets inherit declared lengths. Per catalog: the `native_types` ATTACH option. |
-| `mssql_convert_varchar_max` | BOOLEAN | true | Convert `VARCHAR(MAX)` to `NVARCHAR(MAX)` in catalog scan SQL for UTF-8 safety on non-UTF-8 collations |
+| `mssql_catalog_native_types` | BOOLEAN | true | Report `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` for bounded string columns of attached tables **and of `mssql_scan` / `mssql_scan_params` results** (a code-page `varchar` there only under `mssql_client_transcode`, whose values are UTF-8), so targets inherit declared lengths. Per catalog: the `native_types` ATTACH option. |
+| `mssql_client_transcode` | BOOLEAN | true | Read code-page `CHAR` / `VARCHAR` as bytes and convert them to UTF-8 on the client; read at ATTACH. `false`: the server converts catalog columns, and a raw `mssql_scan` returns the bytes as they are |
+| `mssql_convert_varchar_max` | BOOLEAN | true | Convert `VARCHAR(MAX)` to `NVARCHAR(MAX)` in catalog scan SQL where the server converts: a double-byte page, or `mssql_client_transcode = false`. No effect on a single-byte page, which the client converts |
 
 ### ORDER BY Pushdown Settings (Experimental)
 

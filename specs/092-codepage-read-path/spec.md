@@ -3,7 +3,7 @@
 Status: in progress on branch `feat/092-codepage-read-path`, from main `0aa8a10` (spec 091's module
 merged, #527, #528). Built so far: D1-D9 and D12: a raw scan transcodes and reports the column's type, and the
 catalog, pushed statements and RETURNING read a single-byte page bare. The D10 gate is measured
-(`specs/092-codepage-read-path/measured/`). The docs remain. Line references below were taken at `4c65cfb` and are refreshed as each part lands.
+(`specs/092-codepage-read-path/measured/`). The docs are written. Line references below were taken at `4c65cfb` and are refreshed as each part lands.
 
 This is 091's consumers (a), the catalog read path, and (b), raw `mssql_scan` correctness (#224).
 The write path stays as it is: `N'...'` literals, BCP as `nvarchar`, and the server replacing what a

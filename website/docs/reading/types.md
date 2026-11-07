@@ -30,40 +30,32 @@ sidebar_position: 3
 | `NCHAR(n)`        | `VARCHAR`      | UTF-16LE decoded             |
 | `NVARCHAR(n)`     | `VARCHAR`      | UTF-16LE decoded             |
 
-**Non-Unicode `CHAR` / `VARCHAR` carry a code page, and only the catalog casts it away.**
-`CHAR`, `VARCHAR` and `TEXT` hold bytes in the *column's* code page —
-`Latin1_General_CI_AS` is CP1252, `Cyrillic_General_CI_AS` is CP1251 — while
-DuckDB `VARCHAR` is UTF-8 by contract. A **catalog scan** rewrites those columns
-to `CAST(col AS NVARCHAR(...))` server-side (a `CHAR(n)` to `NCHAR(n)`, below), so three-part-name queries (and the
-`COPY` / `CREATE TABLE AS` that read through them) always get UTF-8. A raw
-`mssql_scan()` has no such rewrite: the bytes arrive unchanged, and for anything
-outside ASCII the result is **not valid UTF-8** — it is not rejected, it is
-stored and then mangled by whatever touches it (`upper('naïve')` → `'NA'`).
+**Non-Unicode `CHAR` / `VARCHAR` carry a code page, and arrive as UTF-8.**
+`CHAR`, `VARCHAR` and `TEXT` hold bytes in the *column's* code page --
+`Latin1_General_CI_AS` is CP1252, `Cyrillic_General_CI_AS` is CP1251 -- while
+DuckDB `VARCHAR` is UTF-8 by contract. On a single-byte page the column is read as
+itself, one byte a character, and the client converts it. A catalog read of a
+double-byte page, and of any `TEXT`, is cast to `NVARCHAR` on the server, so the
+query's T-SQL (`EXPLAIN`) shows the cast there. A raw `mssql_scan()` has no cast to
+keep, and the client converts every page. The client reads a byte exactly as the
+server's `CAST` would: its tables come from a SQL Server.
 
-Add the cast yourself in the T-SQL:
-
-```sql
-SELECT * FROM mssql_scan('db',
-    'SELECT id, CAST(name AS NVARCHAR(MAX)) AS name FROM dbo.customers');
-```
-
-`NVARCHAR(MAX)` rather than a fixed width: SQL Server does not raise on a
-narrowing character `CAST`, so `NVARCHAR(50)` would silently truncate. Columns
-with a UTF-8 collation (`..._UTF8`, SQL Server 2019+) need nothing — they are
-already UTF-8 — but note that the default collation of a SQL Server
-installation is *not* one of those. See
-[Troubleshooting](../reference/troubleshooting.md#raw-mssql_scan-does-not-transcode-code-pages).
+`client_transcode false` on the ATTACH (or `mssql_client_transcode = false`) makes the
+server convert every catalog column instead, and a raw `mssql_scan()` then returns the
+bytes as they are: see
+[Troubleshooting](../reference/troubleshooting.md#when-code-page-bytes-reach-you-unconverted).
+Columns with a UTF-8 collation (`..._UTF8`, SQL Server 2019+) are UTF-8 already.
 
 **`CHAR(n)` arrives without its padding, whatever the collation.** SQL Server
 stores `CHAR(n)` / `NCHAR(n)` padded with spaces and compares strings ignoring
 trailing spaces, so `'AB'` in a `char(4)` equals `'AB'` in a `char(6)`. DuckDB
 compares bytes; the catalog scan therefore reads a fixed-length string without
 the padding, so a join, `GROUP BY` or `DISTINCT` computed in DuckDB agrees with
-the server. A code-page `CHAR(n)` is read as `CAST(col AS NCHAR(n))` (past 4000,
-`RTRIM(CAST(col AS NVARCHAR(MAX)))`), and so is a UTF-8 one on a connection the
-server did not grant UTF8SUPPORT (`mssql_utf8_support = false`, or a server that
-does not acknowledge it); with UTF8SUPPORT a UTF-8 `CHAR(n)` arrives as itself
-and is trimmed on read. Until #405 the first two kept their padding (`'AB  '`),
+the server. A `CHAR(n)` on a single-byte page arrives as itself and is trimmed on
+read, as a UTF-8 one is with UTF8SUPPORT. One on a double-byte page is read as
+`CAST(col AS NCHAR(n))` (past 4000, `RTRIM(CAST(col AS NVARCHAR(MAX)))`), and so is a
+UTF-8 one on a connection the server did not grant UTF8SUPPORT
+(`mssql_utf8_support = false`, or a server that does not acknowledge it). Until #405 the first two kept their padding (`'AB  '`),
 and a `char(4)` joined with a `char(6)` found no rows. A raw `mssql_scan()` reads
 whatever its own T-SQL returns.
 
@@ -203,9 +195,10 @@ string columns of attached tables report as `MSSQL_VARCHAR(n)` /
 `VARCHAR` — this is what lets a target created from an MSSQL source inherit
 declared lengths and collations with no explicit casts. The columns of an
 `mssql_scan()` / `mssql_scan_params()` result are reported the same way (so
-`typeof()` over one says `MSSQL_VARCHAR(20)`, not `VARCHAR`), except a `char` /
-`varchar` under a code-page collation: a raw scan hands its bytes over
-untranscoded, and it stays plain `VARCHAR`. Set the option to `false` to
+`typeof()` over one says `MSSQL_VARCHAR(20)`, not `VARCHAR`), except a `varchar(max)`, a
+`text`, a statement the server cannot describe, and a code-page `char` / `varchar` under
+`client_transcode false`, whose bytes arrive unconverted. A CTAS into DuckLake refuses these
+types: cast to `VARCHAR`, or attach the source with `native_types false`. Set the option to `false` to
 restore plain `VARCHAR` reporting everywhere -- for tables already read, after
 `mssql_invalidate_cache()`: a loaded table keeps the types it was read with.
 

@@ -56,6 +56,7 @@ architecture), [docs/](docs/) (internals), [docs/TESTING.md](docs/TESTING.md),
 - Stream query results directly into DuckDB without buffering
 - Full DuckDB catalog integration with three-part naming and lazy metadata loading
 - **Filter pushdown**: `WHERE` clauses are translated to T-SQL and evaluated by SQL Server, including mapped functions (`year`, `lower`, `LIKE` patterns, arithmetic). Anything the translator declines is applied locally instead — with the string-comparison caveat below
+- **Code-page text arrives as UTF-8, converted on the client**: a single-byte code page travels as one byte a character and costs the server no conversion, a raw `mssql_scan` is correct on every code page ([types](https://hugr-lab.github.io/mssql-extension/reading/types/))
 - **Remote pushdown** (on by default): a SELECT over one attached database with a join, an aggregate, `DISTINCT`, `ORDER BY` or `LIMIT` — joins, aggregates, `GROUP BY` / `HAVING`, window functions and `QUALIFY`, subqueries, CTEs, `ORDER BY` / `LIMIT` — runs on SQL Server as one T-SQL statement, so only its result crosses the wire; `EXPLAIN` shows the T-SQL. What has no exact T-SQL form stays in DuckDB. **String `GROUP BY` / `DISTINCT` / join keys then follow the column's collation** — see the note below
 - Row-count estimates reported to the DuckDB optimizer, so join order around an MSSQL scan is planned rather than guessed
 - Row identity (`rowid`) for tables with a primary key or a usable unique index, which is what `UPDATE`/`DELETE` target rows by
