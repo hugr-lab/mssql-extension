@@ -827,20 +827,40 @@ def as_float(s):
 #: therefore makes the gate stricter and loud, not looser and silent, which is
 #: the direction every defect in this comparison has gone the other way.
 INEXACT_TYPES = ("DOUBLE", "FLOAT", "REAL")
+#: Exact columns whose values are NUMBERS, so a client printing the same number
+#: at another scale is not a difference. Everything not here and not inexact is
+#: compared as TEXT.
+NUMERIC_TYPES = ("DECIMAL", "NUMERIC", "TINYINT", "SMALLINT", "INTEGER", "INT",
+                 "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER",
+                 "UBIGINT", "UHUGEINT")
+
+#: How a column must be compared.
+TOLERANCE, NUMERIC, TEXT = "tolerance", "numeric", "text"
 
 
-def column_is_exact(type_name):
-    """Must this column match exactly, or may the two engines differ?
+def column_kind(type_name):
+    """How must this column be compared: TOLERANCE, NUMERIC or TEXT?
 
     The ORACLE's type decides, because it is the only evidence of what the
-    values are. Three successive attempts to infer it from how a value PRINTS
-    each had a hole, and the last one could not be fixed at all: at an SF1000
+    values are. Four successive attempts to infer it from how a value PRINTS
+    each had a hole, and the last could not be fixed at all: at an SF1000
     magnitude one ulp of a double is 0.0078, so a cent of rounding error in an
-    exact decimal is 1.3 ulps -- no relative bound separates them. Only the
-    type does.
+    exact decimal is 1.3 ulps -- no relative bound separates them.
+
+    Three kinds rather than two (roborev on 6ea78d9). Comparing every exact
+    column by `Decimal` value loosened the gate for TEXT: `"07"` equalled
+    `"7"`, `"13"` equalled `"13.0"` and `"-0"` equalled `"0"`, so a client that
+    dropped a leading zero from a string key would have read `ok`. Only a
+    NUMERIC column wants value comparison -- that is what lets the server's
+    padded decimal(38,6) match the oracle's decimal(38,2).
+
+    An unknown type is TEXT, the strictest kind: a new column fails loudly
+    rather than quietly taking a tolerance or a looser equality.
     """
     head = type_name.split("(")[0].strip().upper()
-    return head not in INEXACT_TYPES
+    if head in INEXACT_TYPES:
+        return TOLERANCE
+    return NUMERIC if head in NUMERIC_TYPES else TEXT
 
 
 def read_types(path):
@@ -883,7 +903,7 @@ def as_decimal(s):
     return decimal.Decimal(s) if DECIMAL.fullmatch(s) else None
 
 
-def same(x, y, exact):
+def same(x, y, kind):
     """Is the client's value `y` the oracle's `x`, for a column of this kind?
 
     Issue #506 items 1 and 2, and three reviews of #518. The history is worth
@@ -911,19 +931,20 @@ def same(x, y, exact):
 
     So the form of a value is not evidence of its type, and the last of those
     cannot be fixed by tightening: at 5.7e13 one ulp is 0.0078, making a cent
-    1.3 ulps. The oracle's column TYPE is asked instead, and `exact` is its
+    1.3 ulps. The oracle's column TYPE is asked instead, and `kind` is its
     answer -- no inference, no magnitudes, no digit counts.
 
-    An exact column is compared BY VALUE rather than by text, so a padded
-    `decimal(38,6)` equals the oracle's `decimal(38,2)`
-    (`Decimal("1.50") == Decimal("1.5")`) while a cent of difference does not.
-    A non-numeric exact column falls to the identity check above it, so CHAR(n)
-    padding is still a mismatch.
+    A NUMERIC column is compared by VALUE, so a padded `decimal(38,6)` equals
+    the oracle's `decimal(38,2)` (`Decimal("1.50") == Decimal("1.5")`) while a
+    cent of difference does not. A TEXT column gets only the identity check
+    above, so CHAR(n) padding -- and a dropped leading zero -- is a mismatch.
     """
     if x == y:
         return True
+    if kind == TEXT:
+        return False
     dx, dy = as_decimal(x), as_decimal(y)
-    if exact:
+    if kind == NUMERIC:
         return dx is not None and dy is not None and dx == dy
     if dx is not None and dy is not None:
         return abs(dx - dy) <= tolerance(max(abs(dx), abs(dy)))
@@ -933,9 +954,9 @@ def same(x, y, exact):
     return abs(fx - fy) <= float(tolerance(decimal.Decimal(max(abs(fx), abs(fy)))))
 
 
-def rows_equal(ra, rb, exact):
-    """`exact` is the per-column answer from the oracle's types."""
-    return len(ra) == len(rb) and all(same(x, y, e) for x, y, e in zip(ra, rb, exact))
+def rows_equal(ra, rb, kinds):
+    """`kinds` is the per-column answer from the oracle's types."""
+    return len(ra) == len(rb) and all(same(x, y, k) for x, y, k in zip(ra, rb, kinds))
 
 
 def compare(oracle, got, types=None):
@@ -956,7 +977,7 @@ def compare(oracle, got, types=None):
     width = max((len(r) for r in a), default=0)
     if a and len(types) != width:
         return f"TYPES {len(types)} for {width} column(s) (the oracle's types do not fit its rows)"
-    exact = [column_is_exact(t) for t in types]
+    exact = [column_kind(t) for t in types]
     if all(rows_equal(ra, rb, exact) for ra, rb in zip(a, b)):
         return "ok"
     # Same rows, different order. The old wording was "row order of ties
@@ -1047,18 +1068,37 @@ SAME_TESTS = [
     ("the same date", "DATE", "1995-03-15", "1995-03-15", True),
     ("an empty value against an empty value", "VARCHAR", "", "", True),
     ("text against a number", "VARCHAR", "MACHINERY", "17", False),
+    # A TEXT column is identity only. Comparing every exact column by Decimal
+    # value made all four of these equal, so a client that dropped a leading
+    # zero from a string key read `ok` (roborev on 6ea78d9).
+    ("a VARCHAR with a leading zero dropped", "VARCHAR", "07", "7", False),
+    ("a VARCHAR printed as a number", "VARCHAR", "13", "13.0", False),
+    ("a VARCHAR signed zero", "VARCHAR", "-0", "0", False),
+    ("a VARCHAR trailing zero", "VARCHAR", "1.50", "1.5", False),
+    # ... while the same four in a NUMERIC column ARE the same number.
+    ("the same number written with a leading zero", "BIGINT", "07", "7", True),
+    ("the same number at another scale", "DECIMAL(38,2)", "1.50", "1.5", True),
     # An unrecognised type defaults to EXACT, so a new column kind fails loudly
     # rather than quietly taking a tolerance.
     ("an unknown type is treated as exact", "SOME_NEW_TYPE", "1.00", "1.01", False),
 ]
 
-#: (label, the type name, is that column exact)
+#: (the type name, its kind)
 TYPE_TESTS = [
-    ("DECIMAL(38,6)", True), ("DECIMAL(18,2)", True), ("decimal(38,2)", True),
-    ("BIGINT", True), ("INTEGER", True), ("HUGEINT", True), ("UBIGINT", True),
-    ("VARCHAR", True), ("DATE", True), ("BOOLEAN", True), ("TIMESTAMP", True),
-    ("DOUBLE", False), ("FLOAT", False), ("REAL", False), ("double", False),
-    ("SOME_NEW_TYPE", True),
+    # Compared by VALUE, so a client printing the same number at another scale
+    # matches.
+    ("DECIMAL(38,6)", NUMERIC), ("DECIMAL(18,2)", NUMERIC), ("decimal(38,2)", NUMERIC),
+    ("NUMERIC(10,2)", NUMERIC), ("BIGINT", NUMERIC), ("INTEGER", NUMERIC),
+    ("HUGEINT", NUMERIC), ("UBIGINT", NUMERIC), ("TINYINT", NUMERIC),
+    # Identity only, so a dropped leading zero or CHAR(n) padding is a
+    # mismatch.
+    ("VARCHAR", TEXT), ("DATE", TEXT), ("BOOLEAN", TEXT), ("TIMESTAMP", TEXT),
+    ("INTERVAL", TEXT), ("BLOB", TEXT),
+    # The only kind that may differ at all.
+    ("DOUBLE", TOLERANCE), ("FLOAT", TOLERANCE), ("REAL", TOLERANCE),
+    ("double", TOLERANCE),
+    # An unknown type gets the STRICTEST kind, not a tolerance.
+    ("SOME_NEW_TYPE", TEXT),
 ]
 
 #: (label, column types, oracle rows, client rows, expected verdict prefix)
@@ -1112,19 +1152,18 @@ def _check_same():
     print("same() -- the oracle's TYPE decides, not the value's shape:")
     failures = 0
     for label, type_name, x, y, want in SAME_TESTS:
-        got = same(x, y, column_is_exact(type_name))
+        got = same(x, y, column_kind(type_name))
         failures += _check("%s [%s]" % (label, type_name), got == want,
                            "accepted" if got else "rejected", width=72)
     return failures
 
 
 def _check_types():
-    print("\ncolumn_is_exact() -- which columns may differ at all:")
+    print("\ncolumn_kind() -- how each column must be compared:")
     failures = 0
     for type_name, want in TYPE_TESTS:
-        got = column_is_exact(type_name)
-        failures += _check("%-16s -> %s" % (type_name, "exact" if want else "tolerance"),
-                           got == want, "exact" if got else "tolerance")
+        got = column_kind(type_name)
+        failures += _check("%-18s -> %s" % (type_name, want), got == want, got)
     return failures
 
 
@@ -1138,8 +1177,8 @@ def _check_same_pair_both_ways():
     failures = 0
     for x, y, label in (("56586554400730.17", "56586554400730.18", "an SF1000 sum one cent apart"),
                         ("234603658237.28", "234603658237.29", "a mid-size sum one cent apart")):
-        as_dec = same(x, y, True)
-        as_dbl = same(x, y, False)
+        as_dec = same(x, y, NUMERIC)
+        as_dbl = same(x, y, TOLERANCE)
         failures += _check("%s: DECIMAL rejects, DOUBLE accepts" % label,
                            as_dec is False and as_dbl is True,
                            "DECIMAL=%s DOUBLE=%s" % (as_dec, as_dbl), width=72)

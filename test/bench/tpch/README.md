@@ -55,9 +55,10 @@ How a value is compared depends on **what the oracle says the column is**, not o
 
 | the oracle's column type | rule |
 |---|---|
-| `DECIMAL(p,s)`, the integer family, `VARCHAR`, `DATE`, `BOOLEAN`, `TIMESTAMP` | **exact** — compared by VALUE, so a client padding `1.5` to `1.500000` matches while a cent of difference does not |
+| `DECIMAL(p,s)` and the integer family | **exact, by value** — a client printing the same number at another scale matches (`1.5` = `1.500000`), a cent of difference does not |
+| `VARCHAR`, `DATE`, `BOOLEAN`, `TIMESTAMP`, `BLOB`, `INTERVAL` | **exact, by identity** — so `CHAR(n)` padding is a mismatch, and so is `07` against `7` |
 | `DOUBLE`, `FLOAT`, `REAL` | 1e-6 absolute or 1e-13 relative, whichever is larger |
-| anything unrecognised | **exact** — a new type fails loudly rather than quietly taking a tolerance |
+| anything unrecognised | **exact, by identity** — the strictest kind, so a new column fails loudly rather than quietly taking a tolerance |
 
 For q01, the query at the centre of every defect this comparison has had, `DESCRIBE` gives seven exact columns and three tolerance ones:
 
