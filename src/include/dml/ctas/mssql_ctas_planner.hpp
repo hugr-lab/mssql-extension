@@ -38,7 +38,7 @@ private:
 	static CTASTarget ExtractTarget(const LogicalCreateTable &op, MSSQLCatalog &catalog);
 
 	//! Map columns from child plan types to CTAS column definitions
-	static vector<CTASColumnDef> MapColumns(const LogicalCreateTable &op, PhysicalOperator &child_plan,
+	static vector<CTASColumnDef> MapColumns(const LogicalCreateTable &op, const vector<LogicalType> &child_types,
 											const CTASConfig &config);
 };
 

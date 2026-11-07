@@ -122,6 +122,26 @@ bool NeedsVarcharCollation(const LogicalType &type) {
 	return TryGetTargetStringType(type, spec) && !spec.unicode && spec.collation.empty();
 }
 
+LogicalType FabricStringType(const LogicalType &type) {
+	TargetStringType spec;
+	if (!TryGetTargetStringType(type, spec)) {
+		return type;
+	}
+	const std::string upper = StringUtil::Upper(spec.collation);
+	const bool utf8 = StringUtil::EndsWith(upper, "_UTF8");
+	if (!spec.unicode && (spec.collation.empty() || upper == FABRIC_BIN2_COLLATION || upper == FABRIC_CI_COLLATION)) {
+		return type;
+	}
+	// A UTF-8 varchar's n is bytes already; n of anything else can be 3n of them.
+	if ((spec.unicode || !utf8) && !IsMaxLength(spec.length)) {
+		const int64_t utf8_bytes = static_cast<int64_t>(spec.length) * 3;
+		spec.length = utf8_bytes > MAX_VARCHAR_LENGTH ? MAX_LENGTH : static_cast<int32_t>(utf8_bytes);
+	}
+	spec.unicode = false;
+	spec.collation.clear();
+	return MakeTargetStringType(spec);
+}
+
 bool IsMaxKeyword(const std::string &text) {
 	return StringUtil::CIEquals(text, MAX_MODIFIER);
 }

@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 
 #include "catalog/mssql_ddl_translator.hpp"
 #include "codec/target_string_type.hpp"
@@ -458,6 +459,41 @@ void test_ctas_ddl_special_names() {
 //==============================================================================
 // Main
 //==============================================================================
+// Spec 092: what a CTAS or a creating COPY makes on Fabric, which has no nvarchar and two
+// collations. Run here because the Fabric lane needs a warehouse.
+static void TestFabricStringType() {
+	using duckdb::mssql::codec::FabricStringType;
+	using duckdb::mssql::codec::MakeTargetStringType;
+	using duckdb::mssql::codec::TargetStringType;
+	using duckdb::mssql::codec::TryGetTargetStringType;
+	const auto expect = [](bool unicode, int32_t length, const std::string &collation, int32_t want_length,
+						   const std::string &want_collation) {
+		TargetStringType spec;
+		spec.unicode = unicode;
+		spec.length = length;
+		spec.collation = collation;
+		TargetStringType got;
+		const bool read = TryGetTargetStringType(FabricStringType(MakeTargetStringType(spec)), got);
+		if (!read || got.unicode || got.length != want_length || got.collation != want_collation) {
+			throw std::runtime_error("FabricStringType: unexpected type for " + collation);
+		}
+	};
+	expect(true, 50, "", 150, "");									  // nvarchar(50): no such type
+	expect(true, 4000, "", 0, "");									  // past 8000 bytes: MAX
+	expect(true, 0, "", 0, "");										  // nvarchar(max)
+	expect(false, 10, "Cyrillic_General_CI_AS", 30, "");			  // a code page: no such collation
+	expect(false, 0, "Cyrillic_General_CI_AS", 0, "");				  // varchar(max)
+	expect(false, 2700, "Japanese_CI_AS", 0, "");					  // 8100 bytes: MAX
+	expect(false, 10, "Cyrillic_General_100_CI_AS_SC_UTF8", 10, "");  // UTF-8 already: bytes stay
+	expect(false, 10, "Latin1_General_100_BIN2_UTF8", 10, "Latin1_General_100_BIN2_UTF8");
+	expect(false, 10, "latin1_general_100_ci_as_ks_ws_sc_utf8", 10, "latin1_general_100_ci_as_ks_ws_sc_utf8");
+	expect(false, 10, "", 10, "");	// no collation: the warehouse's already
+	const auto plain = FabricStringType(duckdb::LogicalType::VARCHAR);
+	if (plain != duckdb::LogicalType::VARCHAR || plain.HasAlias()) {
+		throw std::runtime_error("FabricStringType: a plain VARCHAR changed");
+	}
+}
+
 int main() {
 	std::cout << "========================================" << std::endl;
 	std::cout << "CTAS Type Mapping Unit Tests" << std::endl;
@@ -471,6 +507,7 @@ int main() {
 		test_ctas_strings_nvarchar();
 		test_ctas_strings_varchar();
 		test_ctas_annotated_strings();
+		TestFabricStringType();
 		test_tds_max_length_for_annotated();
 		test_bcp_metadata_for_annotated_max();
 		test_ctas_binary();

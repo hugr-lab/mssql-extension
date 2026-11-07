@@ -235,13 +235,24 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
     describe as `varchar(20)`), so the annotation would have failed such a statement on every run.
     `nvarchar` had the same defect. A longer stream, or MAX under a bound, is still refused.
   - **What the annotation brings to a raw scan** is what a catalog read has already: a CTAS into
-    DuckLake refuses the type (`native_types false` or `c::VARCHAR`), into Fabric refuses a code-page
-    collation by name, and into another SQL Server names the collation in its DDL. Each is a
-    CHANGELOG line under *Changed*.
-  - **A CTAS or COPY into such a type takes the UTF-16 wire** (`GenerateColumnMetadata`): a BIGVARCHAR
-    declared UTF-8 is stored as those bytes, read back as other characters (ж as Р¶). That was the
-    state for a CTAS from a code-page catalog column before this spec; the annotation would have
-    brought it to raw scans.
+    DuckLake refuses the type (`native_types false` or `c::VARCHAR`), and into SQL Server creates the
+    column in that collation. Each is a CHANGELOG line under *Changed*.
+  - **A CTAS or a creating COPY into a code-page type keeps it, and the server converts** (owner's
+    decision, 2026-11-07). A copy of a table has the source's length, collation and comparisons, and
+    a cast means what it says (`website/docs/writing/table-options.md`). The rows take the UTF-16 wire
+    (`GenerateColumnMetadata`): a BIGVARCHAR declared UTF-8 is stored as those bytes and reads back as
+    other characters (ж as Р¶), which is what a BCP CTAS from a code-page catalog column did before
+    this spec. Who wants UTF-8 casts to `MSSQL_VARCHAR(n)`, or attaches the source with
+    `native_types false`. The client encoding the bytes instead is a follow-up (091's consumer (d)).
+  - **Fabric has no code page and no nvarchar,** so a CTAS or a creating COPY there takes what a
+    warehouse can hold whatever the type says, cast or carried (`codec::FabricStringType`,
+    `MSSQLCatalog::CreatedColumnType`): `varchar(3n)` in the warehouse's collation, MAX past 8000.
+    `CREATE TABLE` states its types and keeps the named refusal.
+  - **Known limit: a cast of a constant loses its collation while remote pushdown is on.** DuckDB's
+    rewriter folds `'x'::MSSQL_VARCHAR(4, 'Cyrillic_General_CI_AS')` to a constant
+    (`RemotePushdownOptimizer::TryConstantFold`, measured with `remote_pushdown false`: kept), and the
+    collation, an extension-type property, does not survive it, so the column gets
+    `mssql_utf8_collation`. A cast of a column keeps it. Not patched in DuckDB (owner's rule).
   - **A parameter from such a column goes as `nvarchar` when its value is outside ASCII**
     (`StringDeclaration`): a varchar variable takes the database's code page (#321), so ж from a
     Cyrillic column under a 1252 database was stored as `?`.

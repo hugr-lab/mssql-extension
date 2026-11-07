@@ -421,6 +421,10 @@ public:
 	//! outside the two it supports — both UTF-8, and fixed when the warehouse was
 	//! created. Everywhere else this is a no-op.
 	void ValidateStringTargets(const vector<LogicalType> &types);
+	//! The type a CTAS or a creating COPY makes a column of, for its source's type. As it
+	//! is, but on Fabric, where it may name what a warehouse does not have
+	//! (codec::FabricStringType). CREATE TABLE states its types and is validated instead.
+	LogicalType CreatedColumnType(const LogicalType &type) const;
 
 	//! Spec 060: refuse table properties this server cannot apply. A Fabric
 	//! warehouse stores tables as Delta Parquet: it has no indexes of any kind

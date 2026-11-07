@@ -54,7 +54,12 @@ PhysicalOperator &CTASPlanner::Plan(ClientContext &context, PhysicalPlanGenerato
 	if (catalog.RequiresSingleByteText()) {
 		config.text_type = CTASTextType::VARCHAR;
 	}
-	catalog.ValidateStringTargets(child_plan.types);
+	// What the table is created with: on Fabric, what a warehouse can hold (spec 092).
+	vector<LogicalType> created_types;
+	for (const auto &type : child_plan.types) {
+		created_types.push_back(catalog.CreatedColumnType(type));
+	}
+	catalog.ValidateStringTargets(created_types);
 
 	// Spec 060 D5: the WITH clause of THIS statement, over the session defaults —
 	// the same order MSSQLSchemaEntry::CreateTable applies for a plain CREATE
@@ -69,7 +74,7 @@ PhysicalOperator &CTASPlanner::Plan(ClientContext &context, PhysicalPlanGenerato
 
 	bool wants_varchar = config.text_type == CTASTextType::VARCHAR;
 	if (!wants_varchar) {
-		for (const auto &type : child_plan.types) {
+		for (const auto &type : created_types) {
 			if (codec::NeedsVarcharCollation(type)) {
 				wants_varchar = true;
 				break;
@@ -88,7 +93,7 @@ PhysicalOperator &CTASPlanner::Plan(ClientContext &context, PhysicalPlanGenerato
 	CTASTarget target = ExtractTarget(op, catalog);
 
 	// Map columns from child plan to SQL Server types
-	vector<CTASColumnDef> columns = MapColumns(op, child_plan, config);
+	vector<CTASColumnDef> columns = MapColumns(op, created_types, config);
 
 	// Validate at least one column
 	if (columns.empty()) {
@@ -142,12 +147,11 @@ CTASTarget CTASPlanner::ExtractTarget(const LogicalCreateTable &op, MSSQLCatalog
 // CTASPlanner::MapColumns
 //===----------------------------------------------------------------------===//
 
-vector<CTASColumnDef> CTASPlanner::MapColumns(const LogicalCreateTable &op, PhysicalOperator &child_plan,
+vector<CTASColumnDef> CTASPlanner::MapColumns(const LogicalCreateTable &op, const vector<LogicalType> &child_types,
 											  const CTASConfig &config) {
 	vector<CTASColumnDef> columns;
 
 	// Get the output types from the child plan
-	const auto &child_types = child_plan.types;
 
 	// Get base CreateTableInfo for column information
 	auto &base_info = op.info->Base();
