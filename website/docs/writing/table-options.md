@@ -101,8 +101,7 @@ code point. Pick the one your data is actually compared with.
 A **non-UTF-8 collation is accepted**, and it means what it says: the column
 stores that collation's code page, and SQL Server replaces every character
 outside it with `?` on insert — no error, and nothing downstream can tell,
-because `?` is valid UTF-8. (The cast has to be of a column: DuckDB's remote-pushdown
-rewriter folds a cast of a constant and the collation does not survive it.) That is a real choice with a real cost, worth making
+because `?` is valid UTF-8. That is a real choice with a real cost, worth making
 when you are reproducing an existing schema or know the data is inside the page;
 it is the same thing SQL Server does for any client. What the extension will not
 do is make that choice *for* you, which is what issue #225 was about — omit the

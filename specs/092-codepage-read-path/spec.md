@@ -248,11 +248,14 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
     warehouse can hold whatever the type says, cast or carried (`codec::FabricStringType`,
     `MSSQLCatalog::CreatedColumnType`): `varchar(3n)` in the warehouse's collation, MAX past 8000.
     `CREATE TABLE` states its types and keeps the named refusal.
-  - **Known limit: a cast of a constant loses its collation while remote pushdown is on.** DuckDB's
-    rewriter folds `'x'::MSSQL_VARCHAR(4, 'Cyrillic_General_CI_AS')` to a constant
-    (`RemotePushdownOptimizer::TryConstantFold`, measured with `remote_pushdown false`: kept), and the
-    collation, an extension-type property, does not survive it, so the column gets
-    `mssql_utf8_collation`. A cast of a column keeps it. Not patched in DuckDB (owner's rule).
+  - **The collation lives in the length's modifier, under a label that prints the length alone**
+    (`MakeTargetStringType`: value `4,Cyrillic_General_CI_AS`, label `4`). DuckDB's rewriter folds
+    `'x'::MSSQL_VARCHAR(4, 'Cyrillic_General_CI_AS')` to a constant and respells the type from its
+    modifiers (`TryConstantFold`, `TypeExpression::FromLogicalType`), so as a property the collation
+    was lost and the column got `mssql_utf8_collation`. `DESCRIBE` prints what it did. Two types with
+    no collation and one are no longer equal: they compared equal while it was a property. A mixed
+    comparison, UNION or join still binds and a catalog filter still reaches the server (measured). A
+    DuckDB file v0.3.0 wrote holds the property, so `TryGetTargetStringType` still reads it.
   - **A parameter from such a column goes as `nvarchar` when its value is outside ASCII**
     (`StringDeclaration`): a varchar variable takes the database's code page (#321), so ж from a
     Cyrillic column under a 1252 database was stored as `?`.

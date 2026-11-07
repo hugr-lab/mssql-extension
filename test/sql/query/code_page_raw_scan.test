@@ -172,6 +172,45 @@ catalog	жжжж	ああ
 raw	жжжж	ああ
 statements	жжжж	ああ
 
+# A cast of a constant keeps its collation though the remote-pushdown rewriter folds it,
+# prints the length alone, and takes the catalog's own: a MAX one too.
+statement ok
+CREATE TABLE cp.dbo.cp_ctas_k AS SELECT 'жук'::MSSQL_VARCHAR(4, 'Cyrillic_General_CI_AS') AS v, 'x'::MSSQL_VARCHAR('MAX', 'Greek_CI_AS') AS m;
+
+query II
+SELECT typeof('x'::MSSQL_VARCHAR(4, 'Cyrillic_General_CI_AS')), typeof('x'::MSSQL_VARCHAR('MAX', 'Greek_CI_AS'));
+----
+MSSQL_VARCHAR(4)	MSSQL_VARCHAR(MAX)
+
+query III rowsort
+SELECT c, n, m FROM mssql_scan('cp', 'SELECT k.name AS c, k.collation_name AS n, k.max_length AS m FROM sys.columns k WHERE k.object_id = OBJECT_ID(''dbo.cp_ctas_k'')');
+----
+m	Greek_CI_AS	-1
+v	Cyrillic_General_CI_AS	4
+
+query I
+SELECT v FROM cp.dbo.cp_ctas_k;
+----
+жук
+
+statement error
+SELECT 'x'::MSSQL_VARCHAR('4,no such collation');
+----
+Invalid collation name
+
+statement error
+SELECT 'x'::MSSQL_VARCHAR('abc,Cyrillic_General_CI_AS');
+----
+a string modifier must be
+
+statement error
+SELECT 'x'::MSSQL_VARCHAR(4, 'Cyrillic_General_CI_AS')::MSSQL_NVARCHAR('4,Cyrillic_General_CI_AS');
+----
+a string modifier must be
+
+statement ok
+SELECT mssql_exec('cp', 'DROP TABLE dbo.cp_ctas_k');
+
 # Each kept the declarations: the double-byte column's too.
 query IIII rowsort
 SELECT o, c, t, n FROM mssql_scan('cp', 'SELECT OBJECT_NAME(k.object_id) AS o, k.name AS c, t.name + ''('' + CAST(k.max_length AS varchar(9)) + '')'' AS t, k.collation_name AS n

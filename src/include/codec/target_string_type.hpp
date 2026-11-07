@@ -77,6 +77,11 @@ static constexpr const char *FABRIC_CI_COLLATION = "LATIN1_GENERAL_100_CI_AS_KS_
 //! Case-insensitive, because the length modifier is written by hand.
 bool IsMaxKeyword(const std::string &text);
 
+//! A string length modifier, "<length>" or "<length>,<collation>", into its parts. The
+//! second form is what MakeTargetStringType stores, and the binder reads it back when a
+//! type is respelled from its modifiers.
+void SplitLengthModifier(const std::string &text, std::string &length, std::string &collation);
+
 //! Build the annotated VARCHAR. Used by the type binder and by the catalog.
 LogicalType MakeTargetStringType(const TargetStringType &spec);
 
