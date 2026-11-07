@@ -1229,6 +1229,13 @@ def _check_parse():
     return failures
 
 
+#: How long the fixture's child is given before the timeout fires. One
+#: constant, because the first version of this fix changed the call and the
+#: note but left the check's LABEL saying 2 s, so the self-test misreported
+#: what it had run (roborev on c59b50b).
+CHILD_TIMEOUT = 5
+
+
 def _check_timeout_path():
     """Item 1, proved against a REAL timeout rather than a constructed value."""
     print("\nthe session-timeout path (review of #518 item 1):")
@@ -1240,8 +1247,9 @@ def _check_timeout_path():
               "time.sleep(30)\n")
     try:
         subprocess.run([sys.executable, "-c", script], text=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=5)
-        return _check("a 2 s timeout on a 30 s child raises TimeoutExpired", False, "it did NOT time out")
+                       stderr=subprocess.STDOUT, timeout=CHILD_TIMEOUT)
+        return _check(f"a {CHILD_TIMEOUT} s timeout on a 30 s child raises TimeoutExpired",
+                      False, "it did NOT time out")
     except subprocess.TimeoutExpired as exc:
         # This is the assertion that matters: the type Python really hands back.
         failures += _check("exc.output is bytes even though the call passed text=True",
@@ -1253,7 +1261,8 @@ def _check_timeout_path():
             return failures + _check("mask(decode_output(...)) does not raise", False,
                                      f"{type(e).__name__}: {e}")
         res = parse_marked(text, "T")
-        # Guarded with .get, and the child is given 5 s rather than 2. On a
+        # Guarded with .get, and the child is given CHILD_TIMEOUT rather than
+        # the original 2 s. On a
         # loaded runner the child may not be scheduled and flushed inside the
         # window, leaving `exc.output` empty: parse_marked then returns {} and
         # a bare res["q02"] raised KeyError, so an intermittent CI failure
@@ -1262,7 +1271,7 @@ def _check_timeout_path():
         # for the CPU.
         failures += _check("the queries that DID finish keep their timings",
                            res.get("q01", (None,))[0] == 0.5, str(res.get("q01")))
-        hung = name_hung_query(res, "session timed out after 5s")
+        hung = name_hung_query(res, f"session timed out after {CHILD_TIMEOUT}s")
         note = (res.get("q02") or (None, ""))[1] or ""
         failures += _check("the interrupted query is named as the timeout, not as `no Run Time`",
                            hung == "q02" and "timed out" in note,
