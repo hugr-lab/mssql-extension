@@ -408,8 +408,9 @@ static void RunMetadataQuerySets(tds::TdsConnection &connection, const tds::Requ
 	// every caller passes `reset`. What it gives up: the server's deadlock monitor
 	// sees no cycle through a load, so where the load's own transaction holds what
 	// the other session needs -- two transactions with uncommitted DDL, each listing
-	// the catalog -- neither gets a victim and both wait out the timeout. A cycle
-	// used to end in seconds, by rolling one of them back.
+	// the catalog -- neither gets a victim, and both wait out the timeout and fail.
+	// A cycle used to end in seconds, by rolling one of them back. A CTAS, DDL or a
+	// table's first read needs no listing (concurrent_ctas_ddl_transactions.test).
 	const bool in_transaction = connection.HasTransactionDescriptor();
 	constexpr int MAX_ATTEMPTS = 6;
 	constexpr int MIN_LOCK_RETRY_MS = 20;

@@ -555,7 +555,9 @@ bind's load reads one table's rows and almost never meets a held one (2 retries 
 2973 loads under 12 workers of DDL); a listing reads every object (172 of 288 loads
 retried, no slower on average). What it gives up: the deadlock monitor sees no cycle
 through a load, so two transactions with uncommitted DDL, each listing the catalog,
-both wait out the timeout, where one used to be rolled back in seconds. COPY's target
+both wait out the timeout and both fail, where one used to be rolled back in seconds
+and the other went on. A CTAS, DDL or a table's first read needs no listing and does
+not wait for another transaction's uncommitted DDL. COPY's target
 check and a raw scan's describe also read the catalog on the pinned connection, and
 queue as before. A 1205 on a load (a platform without the SET) is reported in a
 transaction, not rerun, because the server has rolled the transaction back.
