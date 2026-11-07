@@ -12,7 +12,6 @@
 #include "catalog/mssql_statistics.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "codec/code_page/code_page_codec.hpp"
-#include "duckdb/logging/logger.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -23,6 +22,7 @@
 #include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/optimizer/relation_statistics/relation_statistics_helper.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
