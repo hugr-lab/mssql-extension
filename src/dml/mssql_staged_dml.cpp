@@ -433,8 +433,10 @@ void MSSQLStagedDml::ReadReturned(ClientContext &context) {
 	try {
 		// The statement's own connection, held by it: "pinned" to the stream so
 		// the stream never releases it.
-		MSSQLResultStream stream(stage_.GetConnectionPtr(), sql, target_.catalog_name, weak_ptr<tds::ConnectionPool>(),
-								 true, target_.query_timeout_seconds);
+		const bool client_transcode =
+			Catalog::GetCatalog(context, Identifier(target_.catalog_name)).Cast<MSSQLCatalog>().ClientTranscode();
+		MSSQLResultStream stream(stage_.GetConnectionPtr(), sql, target_.catalog_name, client_transcode,
+								 weak_ptr<tds::ConnectionPool>(), true, target_.query_timeout_seconds);
 		if (!stream.Initialize()) {
 			throw IOException("reading the RETURNING rows failed");
 		}

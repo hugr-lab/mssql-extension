@@ -1,9 +1,9 @@
 # Spec 092: read code-page strings as bytes and transcode them on the client
 
-Status: draft (2026-11-06; revised the same day after review, and again after the owner's direction
-below), on branch `feat/091-code-pages` beside spec 091's implementation, from main `4c65cfb`.
-Spec only: nothing here is built. Depends on spec 091's module (`src/codec/code_page/`, implemented
-on this branch).
+Status: in progress on branch `feat/092-codepage-read-path`, from main `0aa8a10` (spec 091's module
+merged, #527, #528). Built so far: D2, D4, D9 and D12, so a raw scan transcodes; the catalog's read
+expressions still cast (D1, D3, D5). Line references below were taken at `4c65cfb` and are refreshed
+as each part lands.
 
 This is 091's consumers (a), the catalog read path, and (b), raw `mssql_scan` correctness (#224).
 The write path stays as it is: `N'...'` literals, BCP as `nvarchar`, and the server replacing what a
@@ -97,31 +97,35 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
     (`mssql_column_info.cpp:560`). The server transcodes that one, and 091 is not involved.
 - **D2: the decoders.** `DATAMODEL.md:649-655` names three paths that publish single-byte text. All
   three learn the page, from one field.
-  - **The page is resolved once per column, at stream level.** A new `ColumnMetadata::code_page`
-    (0 = none) is set by `MSSQLResultStream` after COLMETADATA and before `RowStager::Configure`
+  - **The page is resolved once per column, at stream level.** A new `ColumnMetadata::code_page`, a
+    `const CodePageTable *` (nullptr = none, so no decoder looks a page up), is set by
+    `MSSQLResultStream` after COLMETADATA and before `RowStager::Configure`
     (`mssql_result_stream.cpp:306-307`), where the catalog's flag is known, and by
     `MSSQLReturningParser` in its metadata callback (`mssql_returning_parser.cpp:18-22`) from its
-    target's flag. It stays 0 unless the catalog transcodes (D4) and 091 has the page: on a catalog
+    target's flag. It stays null unless the catalog transcodes (D4) and 091 has the page: on a catalog
     stream it is the single-byte page a bare read expression assumed (D1), on a raw scan the wire's
     page, double-byte included. No decoder looks a page up per value.
   - **The DuckDB wrapper is this spec's**, `src/codec/code_page/code_page_codec.cpp` and its header
     beside the module's (091 D4 kept the core DuckDB-free):
-    - `DecodeChunkFromStaging(st, count, col, page, out)` for the staged kernel: D12's pipeline on a
-      single-byte page, `DecodeValues` on a double-byte one (a pair must not cross two values);
-    - `DecodeFromTds(bytes, col, page, out, row)` for the per-value arm and the constant column,
-      through `DecodeToUtf8`;
+    - `DecodeChunkFromStaging(st, count, col, out)` for the staged kernel: `DecodeColumn` (D12), which
+      goes value by value itself on a double-byte page (a pair must not cross two values);
+    - `DecodeFromTds(bytes, col, out, row)` for the per-value arm and the constant column, through
+      `DecodeToUtf8`;
+    - `ResolveWireCodePages(columns)`, the wire's answer, for a raw scan and the RETURNING parser;
     - both publish `string_t`, trim a `BIGCHAR`'s output (D3), and size the output at `Utf8Bound`
       while `3 * payload` fits a DuckDB string, else by `ExactUtf8Length`; a column whose exact
       output still exceeds `UINT32_MAX` holds a value no DuckDB string can hold and is refused,
       naming the column (091 F9, D5).
     - The fuzz harnesses that compile `src/codec/*.cpp` non-recursively, `fuzz_row_stager` and
-      `fuzz_bcp_encode`, gain `src/codec/code_page/*.cpp` once `string_codec.cpp` calls the module,
-      or they stop linking (`fuzz/README.md:80-84`).
+      `fuzz_bcp_encode`, gain `src/codec/code_page/*.cpp`, as do `run_staging_test.sh` and the
+      Makefile's codec lists. `fuzz_row_stager` resolves the wire's pages, so its bytes reach the kernel.
+    - The output is sized at the bound, as the string kernel's is: per character the same, and
+      untouched pages are not faulted (`string_codec.cpp`, "over-reserving costs address space").
   - **The TDS parser keeps no dependency on the codec module.** `tds_column_metadata.cpp` leaves the
     field 0. It is built without the module in `CPP_TEST_SOURCES` (`Makefile:407-418`) and in
     `fuzz_tds_tokens` (`fuzz/build.sh:89-95`, `:139`).
-  - **The flag reaches the stream as a constructor argument with no default** (D5's rule), at the
-    three construction sites: `MSSQLQueryExecutor`'s two (`src/query/mssql_query_executor.cpp:52`,
+  - **The flag reaches the stream and the RETURNING parser as a constructor argument with no
+    default** (D5's rule), at the stream's three construction sites: `MSSQLQueryExecutor`'s two (`src/query/mssql_query_executor.cpp:52`,
     `:118`) and the staged DML's `#out` read (`src/dml/mssql_staged_dml.cpp:436`).
   - **Staged.** A new `FinalizeKernel::CodePage` (`src/include/codec/staging/column_ops.hpp:103-117`).
     `ResolveKernel` chooses it for `P2StageBinary` / `PlpStageBinary` / `LobStageBinary`
@@ -279,11 +283,11 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
     `make docker-up` (`docker/docker-compose.yml:15`) on the machine that runs DuckDB. It is the hard
     case for B, since the wire bytes B saves cost least there. A networked run, where one is at
     hand, is reported and does not gate.
-  - **Per architecture.** The measured kernel is arm64's NEON one. On x86-64 a single-byte page
-    takes 091's scalar `DecodeRun` (the SSE2 ASCII step and a table step per other byte, about
-    1 GB/s on non-ASCII text) until 091's x86-64 follow-up. So x86-64 is gated on its own run; if it
-    fails there, `TranscodeOnClientByDefault` answers per build (NEON builds transcode, the others
-    keep the cast) until that follow-up, which is the **owner's call**.
+  - **Per architecture.** The kernels are NEON on arm64, AVX-512 VBMI2 or AVX2 on x86-64, chosen at
+    run time (#528); an x86 with neither goes value by value on the scalar `DecodeRun`. 091's
+    measurement (`specs/091-code-pages/measured/2026-11-06-gcp/`) has `DecodeColumn` ahead of today's
+    decode on 7 CPUs, 1.11-3.15x, the client alone. The gate is decided on arm64 (below); x86-64 is
+    reported where one is at hand with a server, and an x86 failing it is the **owner's call**.
   - **Raw scans transcode every page 091 has, double-byte included, for correctness.** A raw scan
     has no cast to keep: its alternative is today's verbatim bytes (#224). The cost of a double-byte
     raw scan is reported (W3), not gated; a user who wants the server's conversion writes
@@ -313,56 +317,33 @@ code page cannot hold with best fit or `?`. That is 091's consumer (d), a later 
     takes a string into a string either way (`src/mssql_functions.cpp:641-658`).
   - **`MSSQLSimpleQuery`'s verbatim copy** (`src/query/mssql_simple_query.cpp:47-50`). Its callers
     read `sysname` / `nvarchar` and ASCII codes such as `sys.objects.type`.
-- **D12: the chunk pipeline of a single-byte page.** `DecodeChunkFromStaging` (D2) takes one
-  column's chunk in three steps, each a measured choice against `DecodeValues` value by value (the
-  benchmark's `fused`, `test/cpp/bench_code_page.cpp:8-21`), kept only where it wins (task 9):
-  1. **An all-ASCII chunk is not copied.** The output equals the input, so the staged payload
-     becomes the vector's string buffer: the staging gives its buffer up and the vector holds it
-     as auxiliary data (`StringVector::AddAuxiliaryData`,
-     `duckdb/src/include/duckdb/common/vector/string_vector.hpp:107-108`; `AuxiliaryDataHolder`,
-     `duckdb/src/include/duckdb/common/types/vector_buffer.hpp:46-52`). Each value's `string_t`
-     points at its staged offset, as the binary kernel's do into its copy today
-     (`src/codec/binary_codec.cpp:114-135`). The verdict needs a pass over the bytes, and the
-     staging, which keeps its buffer across chunks and never shrinks it
-     (`src/include/codec/staging/column_staging.hpp:91-93`), grows a new one: that is the cost
-     against step 2's copy.
-  2. **Otherwise the ASCII prefix by `CopyAscii`** (091 D5), 64 bytes a step, test and copy in the
-     same loads: every value that ends before the first non-ASCII byte keeps its staged offset and
-     length (the benchmark's `ascii64` form).
-  3. **The rest through the NEON kernel as one string**, from that byte on. On a single-byte page a
-     byte reads the same wherever a value starts, and the binary staging holds the values back to
-     back with no delimiter (`src/include/codec/staging/column_staging.hpp:220-226`; no +2 in the
-     arm's bound, `src/codec/staging/column_ops.cpp:452-456`), so the decoded payload is the values'
-     decodings back to back. **Each value's output offset comes from the kernel's masks, not from a
-     delimiter walk:** the kernel records each 32-byte step's output position, and a value boundary
-     inside a step adds the lengths of the step's bytes before it, from the length codes the step
-     already computed (`Compaction` / `Compaction3`). Nothing is staged between values, and the
-     output is not walked.
-     - The UTF-16 kernel needs the walk: it stages a U+0000 after each value
-       (`column_staging.hpp:467-484`), converts the column in one call and searches the output for
-       the zeros, with a second pass when a value holds a U+0000 of its own
-       (`src/codec/string_codec.cpp:546-579`). Code-page bytes hold 0x00 as freely, which the masks
-       never see as a boundary.
-     - This is `code_page::DecodeColumn`, made in 091's x86 PR (#528) ahead of this spec: two
-       blocks in (the staged bytes, offsets / lengths and validity), two out (the UTF-8, decoded
-       straight into the vector's heap, and each row's `string_t`, written as `StringView16` into
-       the vector's data -- no loop over the values after it). The kernel records the masks of
-       each 16 input bytes that are not all ASCII (an ASCII step stores nothing), per 16 KB block;
-       the granules' output positions come from a prefix over the masks. Measured on Apple M4
-       against the production `DecodeChunkFromStaging` (`make bench-code-page-column`, one
-       column of 2048 rows, staging to finished vector): 1.1-2.4x faster in every cell but long
-       1251 text with dense typography (0.9-1.35x, by the text: the kernel's own branches). On
-       x86-64 the AVX2 and AVX-512 kernels record the same masks (AVX-512: its 64-bit masks
-       spread by pdep); an x86 with neither goes value by value. The wrapper passes
-       `validity = nullptr` when the staging's `null_count` is 0 (no bit tests per row). The
-       Var staging buffer is allocated 64-byte aligned: DecodeColumn walks the payload from its
-       start in blocks that are multiples of 64, so its wide loads are then aligned -- measured
-       on 7 CPUs, an input 1 byte off a 64-byte boundary costs 5-23% on long ASCII values
-       (`BENCH_ALIGN_OFFSET`), 0-3% elsewhere; a `std::vector` gives only 16.
-       The unit test checks it against the server's answers; the fuzz oracle (equal to
-       `DecodeValues` value by value) is to add.
-  - A double-byte page (raw scans only, D10) takes `DecodeValues`: a pair must not cross two values,
-    and its kernel has no masks.
+- **D12: the chunk pipeline is `code_page::DecodeColumn`** (made in 091's x86 PR, #528). One call per
+  column: two blocks in (the staged bytes, offsets / lengths and validity), two out (the UTF-8, decoded
+  straight into the vector's heap, and each row's `string_t`, written as `StringView16` into the
+  vector's data). There is no loop over the values after it but `char(n)`'s trim.
+  - **Nothing is staged between values and the output is not walked.** The binary staging holds the
+    values back to back with no delimiter (`column_staging.hpp`, `AppendVarSlot`; no +2 in the arm's
+    bound, `column_ops.cpp`). The kernel records which of each 16 input bytes read as 2 or 3 UTF-8
+    bytes (an ASCII step stores nothing), per 16 KB block, and the granules' output positions come
+    from a prefix over those masks. The UTF-16 kernel needs a walk: it stages a U+0000 after each
+    value and searches the output for the zeros, with a second pass when a value holds one of its
+    own (`string_codec.cpp`). Code-page bytes hold 0x00 as freely, which the masks never see as a
+    boundary.
+  - **Measured** on Apple M4 against the production `DecodeChunkFromStaging`
+    (`make bench-code-page-column`, one column of 2048 rows, staging to finished vector): 1.1-2.4x
+    faster in every cell but long 1251 text with dense typography (0.9-1.35x, by the text: the
+    kernel's own branches).
+  - **The wrapper passes `validity = nullptr`** when the staging's `null_count` is 0 (no bit tests
+    per row).
+  - **The Var staging buffer is allocated 64-byte aligned** (`PayloadBuffer`, `CacheLineAllocator`):
+    `DecodeColumn` walks the payload from its start in blocks that are multiples of 64, so its wide
+    loads are then aligned. Measured on 7 CPUs, an input 1 byte off a 64-byte boundary costs 5-23% on
+    long ASCII values (`BENCH_ALIGN_OFFSET`), 0-3% elsewhere; a `std::vector` gives only 16.
+  - **A double-byte page (raw scans only, D10) goes value by value inside `DecodeColumn`:** a pair
+    must not cross two values, and its kernel has no masks.
+  - **The first draft's zero-copy all-ASCII chunk and `CopyAscii` prefix are not built.** The kernel's
+    all-ASCII block is a shortcut already, and handing the staging's buffer to the vector means
+    allocating a new one for the next chunk. Reconsidered only if W1a misses the gate.
 
 ## Audit: every place that relies on the NVARCHAR read form
 
@@ -396,7 +377,7 @@ Files: `ci` `src/catalog/mssql_column_info.cpp`, `rs` `src/codec/staging/row_sta
 | stream, constant (`rs:777-808`) | `binary::DecodeFromTds` | `DecodeToUtf8` via the wrapper (D2) |
 | stream, per value (`sc:915-925`) | verbatim, input trim | code-page arm, output trim (D3) |
 | DuckDB wrapper (`codec/code_page/code_page_codec.cpp`) | - | new (D2) |
-| back-to-back decode entry (091's module) | - | new, mask boundaries (D12) |
+| back-to-back decode entry (091's module) | - | `DecodeColumn`, made in #528 (D12) |
 | fuzz `row_stager`, `bcp_encode` (`fuzz/README.md:80-84`) | `src/codec/*.cpp` | + `code_page/` (D2) |
 | kernel switches (`rs:600`, `rs:785`, `co:479`) | 8 kernels | + `CodePage`, `-Wswitch` (D2) |
 | `FINALIZE_KERNEL_COUNT` (`column_ops.hpp:120`) | literal 8 | 9 + `static_assert` (D2) |
@@ -523,11 +504,10 @@ Files: `ci` `src/catalog/mssql_column_info.cpp`, `rs` `src/codec/staging/row_sta
     932 (`NCHAR(n)` kept), and a `char(5000)` read bare under 1252.
   - A 1252 `varchar(5000)` arrives as `BIGVARCHAR`.
   - `text` is cast on the catalog path, and transcoded on a raw scan.
-- **The chunk pipeline (D12), without a server:** the new module entry against `DecodeValues` value
-  by value, in `test/cpp/codec/test_code_page.cpp`, and as a `fuzz_code_page` oracle: an all-ASCII
-  chunk, a first non-ASCII byte at every offset of a 32-byte step, a value boundary at every
-  position of a step, values of 0-31 and of 32 bytes and more, an embedded 0x00. The zero-copy
-  chunk through the wrapper: its strings outlive the staging's next chunk.
+- **The chunk pipeline (D12), without a server:** `DecodeColumn` against `DecodeToUtf8` value by value,
+  in `test/cpp/codec/test_code_page.cpp` and as a `fuzz_code_page` oracle (both from #528). The wrapper
+  in `make test-row-stager`: both sides of the inline length, NULLs, `char(n)`'s trim, a lone lead at a
+  value's end, the constant column, the per-value arm, the wire's page.
 - **Raw scans.** `mssql_scan`, `mssql_scan_params`, `mssql_scan_unsafe`,
   `mssql_scan_params_unsafe`, `prepared := true`: the values, and the types (D7), with the describe
   (`prepared := true` asking it for a code-page column) and without (a statement run at bind).
@@ -600,8 +580,7 @@ Acceptance:
 - **A double-byte raw scan costs more client CPU** (~11.6x the UTF-16 decode, 091 Benchmark):
   correctness over speed where there is no cast to keep (D10). A `CAST(c AS nvarchar(n))` in the
   query restores the server's conversion.
-- **x86-64 runs the scalar single-byte kernel** until 091's x86-64 follow-up; D10 gates it on its
-  own run.
+- **An x86 with neither AVX2 nor AVX-512** runs the scalar single-byte kernel, value by value.
 - **A wrong wire-key derivation** (091 D9) fails a catalog statement by name at the page check
   (D1), and on a raw scan keeps today's bytes and the warning.
 - **Users who relied on raw bytes** from a raw scan. Covered by the escape hatch and a CHANGELOG
@@ -638,15 +617,9 @@ Acceptance:
 7. Measurement: W1-W5 (W2a included) and W3 reported, three interleaved rounds, server CPU, on
    arm64 and, where at hand, x86-64; the D10 decision -- 2 d
 8. Docs -- 1.5 d
-9. The chunk pipeline (D12): the module's back-to-back entry with boundaries from the masks, the
-   zero-copy chunk, the `CopyAscii` prefix; its unit test, fuzz oracle and benchmark row, each step
-   kept only where it beats `DecodeValues` -- 2 d
+9. The chunk pipeline (D12): done in #528; the aligned staging buffer here.
 
-**Total: 20 days, about 4 weeks.** Spec 091's module is built on this branch, and none of its
-follow-ups (091 Tasks, 9.5 days) is needed here on arm64; on x86-64 the single-byte default waits
-for 091's x86-64 kernel or for D10's own run there. Against the first revision's 17.5: + 1 d for
-the DuckDB wrapper moved from 091, + 2 d for D12, - 0.5 d of measurement with the double-byte
-family decided.
+Spec 091's module is on main, and none of its follow-ups is needed here.
 
 **Still to verify:** a value pair that `SQL_Latin1_General_CP1_CI_AS` groups differently as varchar
 and as nvarchar (Tests); D10's x86-64 run and, if it fails, the owner's call on a per-build

@@ -582,6 +582,15 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "read at ATTACH (default: true)",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 
+	// mssql_client_transcode - Spec 092 D4: read code-page text as bytes and
+	// transcode it on the client, with the tables spec 091 generated from the server.
+	// Read once per catalog, at ATTACH: one catalog must not mix the two forms. Two
+	// ATTACHes of one DSN (the client_transcode option) measure both in one session.
+	config.AddExtensionOption("mssql_client_transcode",
+							  "Read code-page CHAR / VARCHAR as bytes and transcode them to UTF-8 on the client; "
+							  "read at ATTACH (default: true)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+
 	// mssql_convert_varchar_max - Convert VARCHAR(MAX) to NVARCHAR(MAX) in table scans
 	// When true: VARCHAR(MAX) with non-UTF8 collation is wrapped in CAST(... AS NVARCHAR(MAX))
 	// When false: VARCHAR(MAX) is NOT converted (preserves 4096-byte TDS buffer capacity)

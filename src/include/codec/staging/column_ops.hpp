@@ -100,6 +100,7 @@ enum class AppendArm : uint8_t {
 //! that family's `DecodeChunkFromStaging` in `src/codec/<family>_codec.cpp` —
 //! the same module that owns the family's per-value decode, its BCP encode and
 //! its literal rendering (spec 045). There is no second home for decode logic.
+//! (CodePage's is `src/codec/code_page/code_page_codec.cpp`, spec 092 D2.)
 enum class FinalizeKernel : uint8_t {
 	//! Nothing to do: the values were written straight into the output vector
 	//! (direct write), or the column is skipped, or no value of it can be read.
@@ -113,11 +114,15 @@ enum class FinalizeKernel : uint8_t {
 	Datetime,
 	//! The catalog type and the wire type diverge (issue #89): each value is
 	//! rendered as text. The one kernel that is not a family batch decode.
-	Text
+	Text,
+	//! Spec 092: a CHAR / VARCHAR / TEXT column transcoded from its code page.
+	CodePage
 };
 
 //! Number of FinalizeKernel values, for counter arrays.
-static const uint8_t FINALIZE_KERNEL_COUNT = 8;
+static const uint8_t FINALIZE_KERNEL_COUNT = 9;
+static_assert(FINALIZE_KERNEL_COUNT == static_cast<uint8_t>(FinalizeKernel::CodePage) + 1,
+			  "a new kernel must not index past the counter arrays");
 
 //! Short lowercase name, for the debug counters.
 const char *FinalizeKernelName(FinalizeKernel kernel);

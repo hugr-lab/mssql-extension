@@ -7,6 +7,7 @@
 #include "codec/staging/row_stager.hpp"
 
 #include "codec/binary_codec.hpp"
+#include "codec/code_page/code_page_codec.hpp"
 #include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/money_codec.hpp"
@@ -621,6 +622,9 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		case FinalizeKernel::Text:
 			FinalizeFallbackColumn(st, row_count, meta, *targets_[c]);
 			break;
+		case FinalizeKernel::CodePage:
+			code_page::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
+			break;
 		}
 		if (counters_enabled_) {
 			const auto elapsed = std::chrono::steady_clock::now() - started;
@@ -800,6 +804,9 @@ void RowStager::DecodeFirstValue(idx_t c, const ColumnStaging &st, const tds::Co
 		break;
 	case FinalizeKernel::Datetime:
 		datetime::DecodeFromTds(bytes, meta, out, 0);
+		break;
+	case FinalizeKernel::CodePage:
+		code_page::DecodeFromTds(bytes, meta, out, 0);
 		break;
 	case FinalizeKernel::None:
 	case FinalizeKernel::Text:

@@ -38,7 +38,9 @@ class MSSQLReturningParser {
 public:
 	// @param target Insert target with column metadata
 	// @param returning_column_ids Column indices to return (maps to OUTPUT INSERTED columns)
-	MSSQLReturningParser(const MSSQLInsertTarget &target, const vector<idx_t> &returning_column_ids);
+	// @param client_transcode The catalog's answer (spec 092 D4); no default, as on MSSQLResultStream
+	MSSQLReturningParser(const MSSQLInsertTarget &target, const vector<idx_t> &returning_column_ids,
+						 bool client_transcode);
 
 	//! Route the result sets of the statement `options` runs into this parser.
 	//! The parser must outlive that call.
@@ -64,6 +66,8 @@ private:
 
 	// Column indices to return
 	vector<idx_t> returning_column_ids_;
+
+	bool client_transcode_;
 
 	// Result types (derived from returning columns)
 	vector<LogicalType> result_types_;

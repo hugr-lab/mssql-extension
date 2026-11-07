@@ -69,6 +69,10 @@ struct MSSQLCatalogStartup {
 	//! Spec 079: mssql_remote_pushdown as it stood at ATTACH -- this catalog's
 	//! answer to Supports(IS_REMOTE / EXECUTE_QUERY_NODE) for its life.
 	bool remote_pushdown = false;
+	//! Spec 092 D4: mssql_client_transcode (or the client_transcode ATTACH option,
+	//! which wins) as it stood at ATTACH. One catalog must not mix the two forms:
+	//! the raw-scan types and the describe cache would disagree.
+	bool client_transcode = true;
 	//! The `native_types` ATTACH option: 1 / 0 over mssql_catalog_native_types
 	//! for this catalog's life, -1 = unset (the setting decides, read where it
 	//! always was). DuckLake's METADATA_PARAMETERS reaches ATTACH options, not
@@ -367,6 +371,11 @@ public:
 	//! the acquire timeout for it). For a choice whose safe side is "not
 	//! granted": how a char(n) column is read (issue #405).
 	Utf8Support UTF8SupportObserved() const;
+	//! Are this catalog's code-page columns read as bytes and transcoded on the
+	//! client (spec 092 D4)? Fixed at ATTACH.
+	bool ClientTranscode() const {
+		return startup_.client_transcode;
+	}
 	//! Records a logged-in connection's answer when none is cached yet -- a
 	//! lazily validated ATTACH learns it from its first connection (#405).
 	void NoteUtf8Support(bool acked) {

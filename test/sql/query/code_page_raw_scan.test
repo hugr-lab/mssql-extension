@@ -1,0 +1,182 @@
+# name: test/sql/query/code_page_raw_scan.test
+# description: A raw scan of code-page text returns what the server's own CAST returns, on every code page (spec 092)
+# group: [mssql]
+# issue: 224
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# The oracle is the server: every BMP character is stored under one collation of
+# each of the 16 code pages (whatever a page cannot hold, the server best-fits or
+# makes `?`, on the way in), then the bytes read bare through mssql_scan are compared
+# with CAST(c AS nvarchar) of the same row. Which bytes the server cannot be made to
+# store this way (a page's undefined ones) test_code_page checks against the
+# generated data, without a server.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cp (TYPE mssql);
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cp_off (TYPE mssql, client_transcode false);
+
+statement ok
+SELECT mssql_exec('cp', 'IF OBJECT_ID(''dbo.cp_oracle'') IS NOT NULL DROP TABLE dbo.cp_oracle;
+CREATE TABLE dbo.cp_oracle (id int IDENTITY PRIMARY KEY, u int,
+	c437 varchar(4) COLLATE SQL_Latin1_General_CP437_CI_AS, c850 varchar(4) COLLATE SQL_Latin1_General_CP850_CI_AS,
+	c874 varchar(4) COLLATE Thai_CI_AS, c932 varchar(4) COLLATE Japanese_CI_AS,
+	c936 varchar(4) COLLATE Chinese_PRC_CI_AS, c949 varchar(4) COLLATE Korean_Wansung_CI_AS,
+	c950 varchar(4) COLLATE Chinese_Taiwan_Stroke_CI_AS, c1250 varchar(4) COLLATE Czech_CI_AS,
+	c1251 varchar(4) COLLATE Cyrillic_General_CI_AS, c1252 varchar(4) COLLATE SQL_Latin1_General_CP1_CI_AS,
+	c1253 varchar(4) COLLATE Greek_CI_AS, c1254 varchar(4) COLLATE Turkish_CI_AS,
+	c1255 varchar(4) COLLATE Hebrew_CI_AS, c1256 varchar(4) COLLATE Arabic_CI_AS,
+	c1257 varchar(4) COLLATE Lithuanian_CI_AS, c1258 varchar(4) COLLATE Vietnamese_CI_AS);
+WITH d AS (SELECT TOP 256 ROW_NUMBER() OVER (ORDER BY (SELECT 1)) - 1 AS v FROM sys.all_objects),
+	u AS (SELECT a.v * 256 + b.v AS u FROM d a CROSS JOIN d b WHERE a.v * 256 + b.v > 0
+		AND a.v * 256 + b.v NOT BETWEEN 55296 AND 57343)
+INSERT dbo.cp_oracle (u, c437, c850, c874, c932, c936, c949, c950, c1250, c1251, c1252, c1253, c1254, c1255, c1256, c1257, c1258)
+SELECT u, NCHAR(u), NCHAR(u), NCHAR(u), NCHAR(u), NCHAR(u), NCHAR(u), NCHAR(u), NCHAR(u), NCHAR(u), NCHAR(u), NCHAR(u),
+	NCHAR(u), NCHAR(u), NCHAR(u), NCHAR(u), NCHAR(u) FROM u;');
+
+# Every page, a whole result (many chunks, ASCII and not) read bare against the cast.
+query I
+SELECT count(*) FROM mssql_scan('cp', 'SELECT id,
+	c437, CAST(c437 AS nvarchar(4)) n437, c850, CAST(c850 AS nvarchar(4)) n850, c874, CAST(c874 AS nvarchar(4)) n874,
+	c932, CAST(c932 AS nvarchar(4)) n932, c936, CAST(c936 AS nvarchar(4)) n936, c949, CAST(c949 AS nvarchar(4)) n949,
+	c950, CAST(c950 AS nvarchar(4)) n950, c1250, CAST(c1250 AS nvarchar(4)) n1250, c1251, CAST(c1251 AS nvarchar(4)) n1251,
+	c1252, CAST(c1252 AS nvarchar(4)) n1252, c1253, CAST(c1253 AS nvarchar(4)) n1253, c1254, CAST(c1254 AS nvarchar(4)) n1254,
+	c1255, CAST(c1255 AS nvarchar(4)) n1255, c1256, CAST(c1256 AS nvarchar(4)) n1256, c1257, CAST(c1257 AS nvarchar(4)) n1257,
+	c1258, CAST(c1258 AS nvarchar(4)) n1258 FROM dbo.cp_oracle')
+WHERE c437 IS DISTINCT FROM n437 OR c850 IS DISTINCT FROM n850 OR c874 IS DISTINCT FROM n874 OR c932 IS DISTINCT FROM n932
+	OR c936 IS DISTINCT FROM n936 OR c949 IS DISTINCT FROM n949 OR c950 IS DISTINCT FROM n950 OR c1250 IS DISTINCT FROM n1250
+	OR c1251 IS DISTINCT FROM n1251 OR c1252 IS DISTINCT FROM n1252 OR c1253 IS DISTINCT FROM n1253
+	OR c1254 IS DISTINCT FROM n1254 OR c1255 IS DISTINCT FROM n1255 OR c1256 IS DISTINCT FROM n1256
+	OR c1257 IS DISTINCT FROM n1257 OR c1258 IS DISTINCT FROM n1258;
+----
+0
+
+# The comparison above saw non-ASCII, or it proves nothing.
+query II
+SELECT count(*) > 60000, count(DISTINCT c1251) > 100 FROM mssql_scan('cp', 'SELECT c1251 FROM dbo.cp_oracle');
+----
+true	true
+
+query I
+SELECT c FROM mssql_scan('cp', 'SELECT c1251 AS c FROM dbo.cp_oracle WHERE u = 1078');
+----
+ж
+
+query I
+SELECT c FROM mssql_scan('cp', 'SELECT c932 AS c FROM dbo.cp_oracle WHERE u = 12354');
+----
+あ
+
+# A short value inlined in its string_t, one past the inline length, a long one.
+statement ok
+SELECT mssql_exec('cp', 'IF OBJECT_ID(''dbo.cp_lengths'') IS NOT NULL DROP TABLE dbo.cp_lengths;
+CREATE TABLE dbo.cp_lengths (id int PRIMARY KEY, v varchar(100) COLLATE Cyrillic_General_CI_AS, f char(8) COLLATE Cyrillic_General_CI_AS,
+	m varchar(max) COLLATE Cyrillic_General_CI_AS, t text COLLATE Cyrillic_General_CI_AS);
+INSERT dbo.cp_lengths VALUES
+	(1, N''''      , N''''    , N''''    , N''''),
+	(2, N''ж''     , N''ж''   , N''ж''   , N''ж''),
+	(3, NULL       , NULL     , NULL     , NULL),
+	(4, N''жжжжжж'', N''жж''  , REPLICATE(CAST(N''ж'' AS nvarchar(max)), 70000), N''жж''),
+	(5, N''жжжжжжж'', N''ж ж'', N''a'', N''a''),
+	(6, REPLICATE(N''я'', 100), N''abcdefgh'', REPLICATE(CAST(N''z'' AS nvarchar(max)), 70000), REPLICATE(CAST(N''я'' AS nvarchar(max)), 9000));');
+
+# Every length decodes to what the cast decodes, and a char(n)'s padding is gone.
+query I
+SELECT count(*) FROM mssql_scan('cp', 'SELECT id, v, CAST(v AS nvarchar(100)) nv, f, CAST(f AS nchar(8)) nf,
+	m, CAST(m AS nvarchar(max)) nm, t, CAST(t AS nvarchar(max)) nt FROM dbo.cp_lengths')
+WHERE v IS DISTINCT FROM nv OR f IS DISTINCT FROM nf OR m IS DISTINCT FROM nm OR t IS DISTINCT FROM nt;
+----
+0
+
+query IIIII rowsort
+SELECT id, v IS NULL, '[' || f || ']', strlen(m), strlen(t) FROM mssql_scan('cp', 'SELECT id, v, f, m, t FROM dbo.cp_lengths');
+----
+1	false	[]	0	0
+2	false	[ж]	2	2
+3	true	NULL	NULL	NULL
+4	false	[жж]	140000	4
+5	false	[ж ж]	1	1
+6	false	[abcdefgh]	70000	18000
+
+# A chunk of one repeated value takes the constant column's path.
+statement ok
+SELECT mssql_exec('cp', 'IF OBJECT_ID(''dbo.cp_repeat'') IS NOT NULL DROP TABLE dbo.cp_repeat;
+SELECT TOP 3000 CAST(N''ж'' AS varchar(4)) COLLATE Cyrillic_General_CI_AS AS v, CAST(N''ж'' AS char(4)) COLLATE Cyrillic_General_CI_AS AS f
+INTO dbo.cp_repeat FROM sys.all_objects a CROSS JOIN sys.all_objects b;
+UPDATE dbo.cp_repeat SET v = N''ж'', f = N''ж'';');
+
+query III
+SELECT DISTINCT v, f, count(*) OVER () FROM mssql_scan('cp', 'SELECT v, f FROM dbo.cp_repeat');
+----
+ж	ж	3000
+
+# The escape hatch: a catalog with client_transcode false hands the bytes over as
+# they are, as before. Only the bytes can be compared: they are not valid UTF-8.
+query I
+SELECT c FROM mssql_scan('cp_off', 'SELECT c1252 AS c FROM dbo.cp_oracle WHERE u = 65');
+----
+A
+
+query I
+SELECT encode(c) FROM mssql_scan('cp_off', 'SELECT c1252 AS c FROM dbo.cp_oracle WHERE u = 228');
+----
+\xE4
+
+# The option wins over the setting, in both directions.
+statement ok
+SET mssql_client_transcode = false;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cp_on (TYPE mssql, client_transcode 'true');
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cp_set_off (TYPE mssql);
+
+statement ok
+SET mssql_client_transcode = true;
+
+query I
+SELECT c FROM mssql_scan('cp_on', 'SELECT c1252 AS c FROM dbo.cp_oracle WHERE u = 228');
+----
+ä
+
+query I
+SELECT encode(c) FROM mssql_scan('cp_set_off', 'SELECT c1252 AS c FROM dbo.cp_oracle WHERE u = 228');
+----
+\xE4
+
+# A catalog table reaches the decoders with a bare varchar(max) when the server's
+# cast is opted out: the scan, and the RETURNING parser's per-value path.
+statement ok
+SET mssql_convert_varchar_max = false;
+
+statement ok
+SELECT mssql_exec('cp', 'IF OBJECT_ID(''dbo.cp_returning'') IS NOT NULL DROP TABLE dbo.cp_returning;
+CREATE TABLE dbo.cp_returning (a int NOT NULL, m varchar(max) COLLATE Cyrillic_General_CI_AS, PRIMARY KEY (a));
+INSERT dbo.cp_returning VALUES (1, N''ж'');');
+
+statement ok
+SELECT mssql_invalidate_cache('cp');
+
+query I
+SELECT m FROM cp.dbo.cp_returning;
+----
+ж
+
+query I
+INSERT INTO cp.dbo.cp_returning VALUES (2, 'я') RETURNING m;
+----
+я
+
+statement ok
+SET mssql_convert_varchar_max = true;
+
+statement ok
+SELECT mssql_exec('cp', 'DROP TABLE dbo.cp_oracle; DROP TABLE dbo.cp_lengths; DROP TABLE dbo.cp_repeat; DROP TABLE dbo.cp_returning;');

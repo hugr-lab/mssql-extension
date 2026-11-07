@@ -910,7 +910,7 @@ bench-code-page-column:
 		exit 1; \
 	fi
 	$(CXX) $(BENCH_MAT_FLAGS) -DNDEBUG $(BENCH_UTF16_INCLUDES) test/cpp/bench_code_page_column.cpp \
-	    $(BENCH_MAT_SOURCES) src/codec/staging/column_staging.cpp $(CODE_PAGE_SOURCES) \
+	    $(BENCH_MAT_SOURCES) src/codec/staging/column_staging.cpp \
 	    $(BENCH_UTF16_LIBS) -L build/release/src -lduckdb -o build/test/bench_code_page_column
 	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/bench_code_page_column
 
@@ -919,7 +919,7 @@ bench-code-page-column:
 # Links the RELEASE libduckdb (Vector/DataChunk symbols) + release simdutf,
 # compiles the codec sources at -O3 so the timed body matches shipped code.
 BENCH_MAT_FLAGS := -std=c++17 -O3 -pthread -Wno-deprecated-declarations -DMSSQL_BENCH_BUILD
-BENCH_MAT_SOURCES := $(wildcard src/codec/*.cpp) \
+BENCH_MAT_SOURCES := $(wildcard src/codec/*.cpp) $(wildcard src/codec/code_page/*.cpp) \
     src/tds/encoding/bcp_row_encoder.cpp \
     src/tds/encoding/utf16.cpp \
     src/tds/encoding/datetime_encoding.cpp \
@@ -1039,7 +1039,7 @@ CODEC_TEST_ENCODING_SOURCES := \
 # Without it `make test-codec-integer` / `test-codec-decimal` fail to link.
 # CODEC_TEST_FAMILY_SOURCES is appended by Phase 2 (T011) and each family
 # migration phase as $(wildcard src/codec/*.cpp) once stub files exist.
-CODEC_TEST_FAMILY_SOURCES := $(wildcard src/codec/*.cpp)
+CODEC_TEST_FAMILY_SOURCES := $(wildcard src/codec/*.cpp) $(wildcard src/codec/code_page/*.cpp)
 
 test-codec-%: debug
 	@echo "Building codec unit test for family: $*"

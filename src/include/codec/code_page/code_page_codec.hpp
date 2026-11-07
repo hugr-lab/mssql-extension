@@ -1,0 +1,48 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB MSSQL Extension
+//
+// codec/code_page/code_page_codec.hpp
+//
+// The read path's side of spec 091's code-page module (spec 092 D2): a CHAR /
+// VARCHAR / TEXT column under a code page, read as bytes, published into a
+// DuckDB VARCHAR vector as UTF-8. The module itself (code_page.hpp) stays
+// DuckDB-free; everything that knows a Vector or the staging lives here.
+//
+// Same shape as the family codecs: one batch kernel for a staged column, one
+// per-value entry for the paths that are per value for every type.
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "codec/code_page/code_page_tables.hpp"
+#include "codec/staging/column_staging.hpp"
+#include "duckdb/common/types/vector.hpp"
+#include "tds/tds_column_metadata.hpp"
+
+#include <cstdint>
+#include <vector>
+
+namespace duckdb {
+namespace mssql {
+namespace codec {
+namespace code_page {
+
+//! Set ColumnMetadata::code_page on every single-byte text column whose wire
+//! collation names a page the module has a table for. Other columns keep nullptr,
+//! and a collation newer than the tables keeps today's verbatim bytes (and the
+//! warning): that is a raw scan's only way out, since it has no name to check.
+void ResolveWireCodePages(std::vector<tds::ColumnMetadata> &columns);
+
+//! Publish a staged column whose ColumnMetadata::code_page is set: its UTF-8 in
+//! the vector's string heap and every row's string_t, in one call into the module
+//! (code_page::DecodeColumn). A BIGCHAR's padding is trimmed off the output.
+void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col, Vector &out);
+
+//! One value of such a column: the constant column, and the per-value paths (a
+//! composite rowid's STRUCT, INSERT ... RETURNING).
+void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
+
+}  // namespace code_page
+}  // namespace codec
+}  // namespace mssql
+}  // namespace duckdb
