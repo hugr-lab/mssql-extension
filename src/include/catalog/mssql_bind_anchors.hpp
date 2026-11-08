@@ -50,6 +50,12 @@ public:
 	void AnchorTable(shared_ptr<MSSQLTableEntry> entry);
 	void AnchorSchema(shared_ptr<MSSQLSchemaEntry> entry);
 
+	//! How many schemas this query's system-catalog scan asks for (MSSQLCatalog::GetSchemasForScan),
+	//! so a filtered lookup can budget across all of them (MSSQLSchemaEntry::Scan). Unset when no
+	//! such scan ran; cleared at QueryEnd.
+	void SetSchemasInScan(idx_t count);
+	optional_idx SchemasInScan() const;
+
 	// For diagnostics / tests only.
 	size_t TableAnchorCount() const;
 	size_t SchemaAnchorCount() const;
@@ -63,6 +69,7 @@ private:
 	mutable std::mutex mutex_;
 	std::vector<shared_ptr<MSSQLTableEntry>> table_anchors_;
 	std::vector<shared_ptr<MSSQLSchemaEntry>> schema_anchors_;
+	optional_idx schemas_in_scan_;
 };
 
 }  // namespace duckdb

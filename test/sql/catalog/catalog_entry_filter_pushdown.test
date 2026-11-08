@@ -1,0 +1,249 @@
+# name: test/sql/catalog/catalog_entry_filter_pushdown.test
+# description: duckdb_tables() / duckdb_columns() filtered by table_name or table_oid look the tables up instead of listing the schema
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# DuckDB hands a table_name / table_oid filter down to the schema (#27930). A name the filter
+# pins is looked up as a bind looks it up; an oid is answered from the entries already built.
+# What tells the two apart from a listing here: con1 holds an uncommitted CREATE TABLE in the
+# same schema, so a listing of it waits on con1's row until the short metadata timeout, while a
+# lookup reads only the rows of the tables it names. Each catalog is attached after the hold,
+# with nothing cached.
+#
+# The held name sorts before every name looked up. A lookup of a name that does not exist seeks
+# the name index and reads the key after it, as any client's would; that key must not be the
+# held one, or the lookup waits on it too. cef_nonf, committed, is the key after cef_none, so a
+# file running beside this one cannot put its own uncommitted table there.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cef_setup (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('cef_setup', 'DROP TABLE IF EXISTS dbo.cef_a, dbo.cef_b, dbo.cef_0held, dbo.cef_none, dbo.cef_nonf, dbo.cef_new; CREATE TABLE dbo.cef_a (id int, v nvarchar(10)); CREATE TABLE dbo.cef_b (id int); CREATE TABLE dbo.cef_nonf (id int)');
+
+statement ok
+SELECT mssql_exec('cef_setup', 'IF OBJECT_ID(''dbo.cef_tvf'') IS NOT NULL DROP FUNCTION dbo.cef_tvf');
+
+statement ok
+SELECT mssql_exec('cef_setup', 'CREATE FUNCTION dbo.cef_tvf() RETURNS TABLE AS RETURN (SELECT 1 AS id)');
+
+statement ok
+SELECT mssql_exec('cef_setup', 'IF OBJECT_ID(''cef_s.cef_c'') IS NOT NULL DROP TABLE cef_s.cef_c; IF SCHEMA_ID(''cef_s'') IS NOT NULL DROP SCHEMA cef_s');
+
+statement ok
+SELECT mssql_exec('cef_setup', 'CREATE SCHEMA cef_s');
+
+statement ok
+SELECT mssql_exec('cef_setup', 'CREATE TABLE cef_s.cef_c (id int)');
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+SELECT mssql_exec('cef_setup', 'CREATE TABLE dbo.cef_0held (id int)');
+
+statement ok
+SET mssql_metadata_timeout = 3;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cef (TYPE mssql);
+
+# The filter reaches the scan.
+query II
+EXPLAIN SELECT table_name FROM duckdb_tables() WHERE database_name = 'cef' AND table_name = 'cef_a';
+----
+physical_plan	<REGEX>:.*table_name = 'cef_a'.*
+
+# One name, a list of names, an OR of names: looked up, so con1's row is never read. One name is
+# looked up in every schema; a list takes a schema_name filter to stay inside the budget below.
+query II
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'cef' AND table_name = 'cef_a';
+----
+dbo	cef_a
+
+query I rowsort
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'cef' AND schema_name = 'dbo' AND table_name IN ('cef_a', 'cef_b', 'cef_none');
+----
+cef_a
+cef_b
+
+query I rowsort
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'cef' AND schema_name = 'dbo' AND (table_name = 'cef_b' OR table_name = 'cef_a');
+----
+cef_a
+cef_b
+
+# A name that is not there is no row, not an error.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'cef' AND table_name = 'cef_none';
+----
+0
+
+# OBJECT_ID resolves a table-valued function's name too; a listing shows no functions, nor
+# does a lookup.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'cef' AND table_name = 'cef_tvf';
+----
+0
+
+# DuckDB compares the name exactly; the lookup may find more, and DuckDB drops it.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'cef' AND table_name = 'CEF_A';
+----
+0
+
+# duckdb_columns() takes the same path.
+query II
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'cef' AND table_name = 'cef_a' ORDER BY column_index;
+----
+id	INTEGER
+v	MSSQL_NVARCHAR(10)
+
+# An oid is answered from the entries already built, with no lookup at all.
+statement ok
+SET VARIABLE cef_oid = (SELECT table_oid FROM duckdb_tables() WHERE database_name = 'cef' AND table_name = 'cef_b');
+
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'cef' AND table_oid = getvariable('cef_oid');
+----
+cef_b
+
+# In a transaction the lookup runs on its pinned connection, and still reads no one else's row.
+statement ok
+BEGIN;
+
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'cef' AND table_name = 'cef_a';
+----
+cef_a
+
+statement ok
+COMMIT;
+
+# The lookups are budgeted across the scan, names x schemas asked, at 16: four names in every
+# schema of the database are past it, and the scan lists.
+statement error
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'cef' AND table_name IN ('cef_a', 'cef_b', 'cef_none', 'cef_nonf');
+----
+Metadata query failed
+
+# What the filter does not pin is a listing, which con1's row stops.
+statement error
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'cef' AND table_name LIKE 'cef_%';
+----
+Metadata query failed
+
+statement ok con1
+ROLLBACK;
+
+statement ok
+SET mssql_metadata_timeout = 300;
+
+# Released, the listing and the lookups agree: the entries the lookups built are part of it, once.
+query I rowsort
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'cef' AND table_name LIKE 'cef_%';
+----
+cef_a
+cef_b
+cef_c
+cef_nonf
+
+# A schema_name filter (DuckDB #27291) lists that schema alone. Not under a hold: on the server
+# any read of sys.objects narrowed by schema reads every schema's rows (measured: 1222 on
+# another schema's uncommitted CREATE for sys.objects, sys.tables, sys.columns, sys.indexes;
+# only OBJECT_ID by name does not), so it is lighter, not lock-free.
+query II rowsort
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'cef' AND schema_name = 'cef_s';
+----
+cef_s	cef_c
+
+#------------------------------------------------------------------------------
+# The cache. A bind in another case builds an entry named as written; a listing never shows it,
+# and neither does a lookup.
+#------------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM cef.dbo.CEF_A;
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'cef' AND table_name ILIKE 'cef_a';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'cef' AND table_name IN ('cef_a', 'CEF_A');
+----
+1
+
+# Nor does a listing that finds the lookup's slot for CEF_A in the shared metadata: the catalog
+# preloaded first, the table set not listed yet, then the bind in another case.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cef_pre (TYPE mssql);
+
+statement ok
+SELECT mssql_preload_catalog('cef_pre');
+
+query I
+SELECT count(*) FROM cef_pre.dbo.CEF_A;
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'cef_pre' AND table_name ILIKE 'cef_a';
+----
+1
+
+statement ok
+DETACH cef_pre;
+
+# A name looked up and not found is remembered, as a bind's miss is: a table another session
+# then creates is seen after mssql_invalidate_cache(), the catalog's own CREATE at once.
+statement ok
+SELECT mssql_exec('cef_setup', 'CREATE TABLE dbo.cef_none (id int)');
+
+statement ok
+SELECT mssql_invalidate_cache('cef');
+
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'cef' AND table_name = 'cef_none';
+----
+cef_none
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'cef' AND table_name = 'cef_new';
+----
+0
+
+statement ok
+CREATE TABLE cef.dbo.cef_new (id int);
+
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'cef' AND table_name = 'cef_new';
+----
+cef_new
+
+# The catalog's DROP is gone from a lookup at once too.
+statement ok
+DROP TABLE cef.dbo.cef_new;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'cef' AND table_name = 'cef_new';
+----
+0
+
+statement ok
+SELECT mssql_exec('cef_setup', 'DROP TABLE IF EXISTS dbo.cef_a, dbo.cef_b, dbo.cef_0held, dbo.cef_none, dbo.cef_nonf, dbo.cef_new, cef_s.cef_c; DROP SCHEMA cef_s; DROP FUNCTION dbo.cef_tvf');
+
+statement ok
+DETACH cef;
+
+statement ok
+DETACH cef_setup;
