@@ -18,6 +18,15 @@ require-env MSSQL_TESTDB_DSN
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS ansi_test_db (TYPE mssql);
 
+# The ALTER DATABASE statements below go to a database of this file's own. On TestDB they
+# would change the recovery model every other file runs under and, measured, empty TestDB's
+# plan cache, which insert_statement_plans.test and others read.
+statement ok
+SELECT mssql_exec('ansi_test_db', 'IF DB_ID(''i_ansi_ddl'') IS NOT NULL BEGIN ALTER DATABASE i_ansi_ddl SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE i_ansi_ddl; END');
+
+statement ok
+SELECT mssql_exec('ansi_test_db', 'CREATE DATABASE i_ansi_ddl');
+
 # Test 1: Verify CONCAT_NULL_YIELDS_NULL behavior is ON
 # With CONCAT_NULL_YIELDS_NULL ON, 'test' + NULL = NULL
 query I
@@ -41,7 +50,7 @@ SELECT * FROM mssql_scan('ansi_test_db', 'SELECT CASE WHEN (@@OPTIONS & 32) = 32
 # Test 4: Execute a DDL command - ALTER DATABASE
 # This command requires proper ANSI settings to execute
 query I
-SELECT mssql_exec('ansi_test_db', 'ALTER DATABASE TestDB SET RECOVERY SIMPLE') >= 0 AS ddl_success;
+SELECT mssql_exec('ansi_test_db', 'ALTER DATABASE i_ansi_ddl SET RECOVERY SIMPLE') >= 0 AS ddl_success;
 ----
 true
 
@@ -66,7 +75,7 @@ SELECT * FROM mssql_scan('ansi_test_db', 'SELECT 2 AS seq2');
 
 # Verify DDL still works after pool reuse
 query I
-SELECT mssql_exec('ansi_test_db', 'ALTER DATABASE TestDB SET RECOVERY SIMPLE') >= 0 AS ddl_after_reuse;
+SELECT mssql_exec('ansi_test_db', 'ALTER DATABASE i_ansi_ddl SET RECOVERY SIMPLE') >= 0 AS ddl_after_reuse;
 ----
 true
 
@@ -99,9 +108,12 @@ SELECT * FROM mssql_scan('ansi_test_db', 'SELECT 7 AS q5');
 
 # Verify DDL works after multiple queries (pool stress)
 query I
-SELECT mssql_exec('ansi_test_db', 'ALTER DATABASE TestDB SET RECOVERY FULL') >= 0 AS ddl_after_stress;
+SELECT mssql_exec('ansi_test_db', 'ALTER DATABASE i_ansi_ddl SET RECOVERY FULL') >= 0 AS ddl_after_stress;
 ----
 true
+
+statement ok
+SELECT mssql_exec('ansi_test_db', 'DROP DATABASE i_ansi_ddl');
 
 # Test 8: Test pool statistics show activity
 query I

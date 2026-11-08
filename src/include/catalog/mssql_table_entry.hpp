@@ -79,6 +79,14 @@ public:
 	// Virtual Column Support (rowid)
 	//===----------------------------------------------------------------------===//
 
+	//! Whether a listing would show this entry (MSSQLTableMetadata::ShownInListing). An entry a
+	//! bind built for `dbo.T` under a case-insensitive collation is named `T` whatever the object
+	//! is called, and one for a table-valued function's name is no table at all; a filtered
+	//! lookup (MSSQLSchemaEntry::Scan) hands back neither.
+	bool ShownInListing() const {
+		return shown_in_listing_;
+	}
+
 	// Override to expose rowid virtual column with correct type based on PK
 	// The key came with the metadata the entry was built from (spec 084 D5).
 	virtual_column_map_t GetVirtualColumns() const override;
@@ -179,6 +187,7 @@ private:
 	//! while other sessions plan against it.
 	std::atomic<idx_t> approx_row_count_;
 	MSSQLIndexKind index_kind_;	 // Physical shape (spec 049)
+	bool shown_in_listing_;		 // ShownInListing
 
 	// The rowid key, set by the constructor from the metadata it is built from
 	// and never written again (spec 084 D5: every load that publishes a

@@ -11,7 +11,8 @@
 # row instead of 14) and leaves it in the cache. The default of 1000 rows per
 # statement put every table with two or more columns past the line; now no
 # statement carries more than 1000 constants. Asserted on the server's own plan
-# cache. Needs DBCC FREEPROCCACHE (ALTER SERVER STATE) -- the docker sa has it.
+# cache. Needs DBCC FREEPROCCACHE (ALTER SERVER STATE) -- the docker sa has it. Only this
+# table's plans are freed: the whole cache is shared with every file running beside this one.
 #
 # A HEAP target on purpose. Auto-parameterisation needs a trivial plan, and an
 # INSERT into a table with a clustered index stops being trivial past about
@@ -39,7 +40,7 @@ statement ok
 SET mssql_insert_use_bcp = false;
 
 statement ok
-SELECT mssql_exec('sp', 'DBCC FREEPROCCACHE');
+SELECT mssql_exec('sp', 'DECLARE @h varbinary(64); DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT cp.plan_handle FROM sys.dm_exec_cached_plans cp CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) t WHERE t.text LIKE ''%StmtPlans%'' AND t.text NOT LIKE ''%dm_exec%''; OPEN c; FETCH NEXT FROM c INTO @h; WHILE @@FETCH_STATUS = 0 BEGIN DBCC FREEPROCCACHE(@h) WITH NO_INFOMSGS; FETCH NEXT FROM c INTO @h; END; CLOSE c; DEALLOCATE c;');
 
 # 20 inserts of 900 rows each, fresh values every time: 3 columns -> 333 rows a
 # statement -> 3 statements each (333, 333, 234) -> 60 distinct statement texts,
@@ -68,7 +69,7 @@ Prepared	2
 # line they compile at the cheap end all the same; this pins the fact, not a
 # goal.
 statement ok
-SELECT mssql_exec('sp', 'DBCC FREEPROCCACHE');
+SELECT mssql_exec('sp', 'DECLARE @h varbinary(64); DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT cp.plan_handle FROM sys.dm_exec_cached_plans cp CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) t WHERE t.text LIKE ''%StmtPlans%'' AND t.text NOT LIKE ''%dm_exec%''; OPEN c; FETCH NEXT FROM c INTO @h; WHILE @@FETCH_STATUS = 0 BEGIN DBCC FREEPROCCACHE(@h) WITH NO_INFOMSGS; FETCH NEXT FROM c INTO @h; END; CLOSE c; DEALLOCATE c;');
 
 loop i 0 5
 

@@ -9,9 +9,12 @@
 #include "catalog/mssql_column_info.hpp"
 #include "catalog/mssql_index_kind.hpp"
 #include "catalog/mssql_primary_key.hpp"
+#include "duckdb/common/optional_ptr.hpp"
 #include "tds/tds_connection_pool.hpp"
 
 namespace duckdb {
+
+class ClientContext;
 
 //===----------------------------------------------------------------------===//
 // Forward declarations
@@ -44,7 +47,19 @@ enum class CacheLoadState : uint8_t {
 //===----------------------------------------------------------------------===//
 
 struct MSSQLTableMetadata {
-	string name;					  // Table/view name
+	string name;  // Table/view name
+	//! The object's own name, from the single-table load, which is looked up by the name asked
+	//! for (OBJECT_ID, the database's collation). Empty from a listing, whose names are the
+	//! server's spelling already.
+	string server_name;
+	//! False when the single-table load found an object a listing leaves out: OBJECT_ID resolves
+	//! any object, a table-valued function included, and the listing takes only user tables and
+	//! views (`o.type IN ('U', 'V') AND o.is_ms_shipped = 0`).
+	bool listed = true;
+	//! Whether a listing would show this table under this name (ShownInListing on the entry).
+	bool ShownInListing() const {
+		return listed && (server_name.empty() || server_name == name);
+	}
 	MSSQLObjectType object_type;	  // TABLE or VIEW
 	vector<MSSQLColumnInfo> columns;  // Column metadata
 	idx_t approx_row_count;			  // Cardinality estimate from sys.partitions
@@ -155,7 +170,7 @@ public:
 	//===----------------------------------------------------------------------===//
 
 	// Get all schema names (triggers lazy loading of schema list)
-	vector<string> GetSchemaNames(tds::TdsConnection &connection);
+	vector<string> GetSchemaNames(optional_ptr<ClientContext> context, tds::TdsConnection &connection);
 
 	// Get table metadata: loads schemas (fast) + the table's object row, columns and keys in one batch.
 	// Does NOT load all tables in the schema. Returns false if the table doesn't exist.
@@ -165,8 +180,8 @@ public:
 	// LoadSingleEntry while a concurrent Refresh / LoadAllTableMetadata /
 	// TTL-expired reload freed the map node — a residual use-after-free of the
 	// same class this cache's single-mutex rework eliminated.
-	bool GetTableMetadata(tds::TdsConnection &connection, const string &schema_name, const string &table_name,
-						  MSSQLTableMetadata &out_meta);
+	bool GetTableMetadata(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+						  const string &schema_name, const string &table_name, MSSQLTableMetadata &out_meta);
 
 	//! One table's metadata when the cache holds it -- columns loaded, not
 	//! expired -- without a round trip (issue #383). A miss says nothing about
@@ -208,7 +223,8 @@ public:
 	// Load all table metadata for a schema in one bulk query.
 	// If all tables already have columns loaded (e.g. from preload), returns from cache.
 	// Otherwise loads the whole catalog in one batch (LoadAllSchemasMetadataLocked).
-	void LoadAllTableMetadata(tds::TdsConnection &connection, const string &schema_name);
+	void LoadAllTableMetadata(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+							  const string &schema_name);
 
 	//! Load EVERY schema's tables and columns in one query (spec 071 W2).
 	//!
@@ -222,8 +238,8 @@ public:
 	//! millions of rows is what forced the per-schema loop this replaces.
 	//!
 	//! Caller must NOT hold mutex_; this takes it.
-	void LoadAllSchemasMetadata(tds::TdsConnection &connection, idx_t &schema_count, idx_t &table_count,
-								idx_t &column_count);
+	void LoadAllSchemasMetadata(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+								idx_t &schema_count, idx_t &table_count, idx_t &column_count);
 
 	// Check if schema exists (reads cached state only, no lazy loading)
 	bool HasSchema(const string &schema_name);
@@ -245,15 +261,15 @@ public:
 	// @param schema_count Output: number of schemas loaded
 	// @param table_count Output: number of tables loaded
 	// @param column_count Output: number of columns loaded
-	void BulkLoadAll(tds::TdsConnection &connection, const string &schema_name, idx_t &schema_count, idx_t &table_count,
-					 idx_t &column_count);
+	void BulkLoadAll(optional_ptr<ClientContext> context, tds::TdsConnection &connection, const string &schema_name,
+					 idx_t &schema_count, idx_t &table_count, idx_t &column_count);
 
 	//===----------------------------------------------------------------------===//
 	// Cache Management
 	//===----------------------------------------------------------------------===//
 
 	// Full cache refresh from SQL Server
-	void Refresh(tds::TdsConnection &connection, const string &database_collation);
+	void Refresh(optional_ptr<ClientContext> context, tds::TdsConnection &connection, const string &database_collation);
 
 	// Check if cache is expired (TTL > 0 and time exceeded)
 	bool IsExpired() const;
@@ -301,6 +317,11 @@ public:
 		row_count_pass_ = allowed;
 	}
 
+	//! Whether a load takes SET LOCK_TIMEOUT 0 (MetadataRequest). Not on Fabric Warehouse or Synapse.
+	void SetNoLockWait(bool allowed) {
+		no_lock_wait_ = allowed;
+	}
+
 	// Get database default collation.
 	// Returns by VALUE: a reference would outlive the internal lock and race
 	// with Refresh() overwriting the string (issue #178 D6 audit).
@@ -311,7 +332,7 @@ public:
 	//===----------------------------------------------------------------------===//
 
 	// Ensure schema list is loaded (lazy loading with double-checked locking)
-	void EnsureSchemasLoaded(tds::TdsConnection &connection);
+	void EnsureSchemasLoaded(optional_ptr<ClientContext> context, tds::TdsConnection &connection);
 
 	//===----------------------------------------------------------------------===//
 	// Point Invalidation
@@ -361,7 +382,7 @@ public:
 	//! -- what the hint needs, where a Scan loads every column of the catalog.
 	//! Kept apart from the table lists, which carry row counts and shapes this
 	//! query does not read.
-	void LoadAllTableNames(tds::TdsConnection &connection);
+	void LoadAllTableNames(optional_ptr<ClientContext> context, tds::TdsConnection &connection);
 
 private:
 	//! The bodies of EnsureSchemasLoaded and LoadAllSchemasMetadata, for a caller
@@ -370,20 +391,21 @@ private:
 	//! concurrent invalidation between the two could clear the list the load then
 	//! relies on, and bring back the #376 state -- tables published into a list
 	//! still marked NOT_LOADED, cleared and reloaded by the next access.
-	void EnsureSchemasLoadedLocked(tds::TdsConnection &connection);
+	void EnsureSchemasLoadedLocked(optional_ptr<ClientContext> context, tds::TdsConnection &connection);
 	// Spec 084 D1/D5: the objects, their columns and keys in one batch, three result sets,
 	// staged (nothing published): every schema, or the one named. Shared by
 	// LoadAllSchemasMetadataLocked and BulkLoadAll's per-schema path.
-	void LoadObjectsAndColumnsLocked(tds::TdsConnection &connection, const string *one_schema, BulkLoadStage &stage);
-	void LoadAllSchemasMetadataLocked(tds::TdsConnection &connection, idx_t &schema_count, idx_t &table_count,
-									  idx_t &column_count);
+	void LoadObjectsAndColumnsLocked(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+									 const string *one_schema, BulkLoadStage &stage);
+	void LoadAllSchemasMetadataLocked(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+									  idx_t &schema_count, idx_t &table_count, idx_t &column_count);
 
 	//===----------------------------------------------------------------------===//
 	// Internal Loading Methods
 	//===----------------------------------------------------------------------===//
 
 	// Load schemas from sys.schemas
-	void LoadSchemas(tds::TdsConnection &connection);
+	void LoadSchemas(optional_ptr<ClientContext> context, tds::TdsConnection &connection);
 
 	// Execute metadata query with configured timeout (metadata_timeout_ms_)
 	using MetadataRowCallback = std::function<void(const vector<string> &values)>;
@@ -398,14 +420,15 @@ private:
 	//! that it has thought about restartability. Every call site supplies one,
 	//! including the ones whose accumulation is already idempotent, which say so.
 	using MetadataResetCallback = std::function<void()>;
-	void ExecuteMetadataQuery(tds::TdsConnection &connection, const tds::Request &sql, MetadataRowCallback callback,
-							  MetadataResetCallback reset);
+	void ExecuteMetadataQuery(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+							  const tds::Request &sql, MetadataRowCallback callback, MetadataResetCallback reset);
 	//! The same for a batch of several statements: the callback gets the
 	//! ordinal of the result set a row came from (spec 076 W2 sends the table
 	//! metadata and the primary key as one batch; three result sets since spec 084).
 	using MetadataSetRowCallback = std::function<void(idx_t result_set, const vector<string> &values)>;
-	void ExecuteMetadataQuerySets(tds::TdsConnection &connection, const tds::Request &sql,
-								  MetadataSetRowCallback callback, MetadataResetCallback reset);
+	void ExecuteMetadataQuerySets(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+								  const tds::Request &sql, MetadataSetRowCallback callback,
+								  MetadataResetCallback reset);
 
 	//===----------------------------------------------------------------------===//
 	// Member Variables
@@ -429,6 +452,7 @@ private:
 	bool IsColumnsFreshLocked(const MSSQLTableMetadata &table) const;
 	MSSQLCacheState state_;								  // Current cache state (backward compat)
 	bool row_count_pass_ = true;						  // SetRowCountPass; set once at catalog init
+	bool no_lock_wait_ = false;							  // SetNoLockWait; set once at catalog init
 	const MSSQLCatalogFilter *filter_ = nullptr;		  // Set once at catalog init, before any concurrency
 	unordered_map<string, MSSQLSchemaMetadata> schemas_;  // Cached schemas
 	std::chrono::steady_clock::time_point last_refresh_;  // Last refresh timestamp (backward compat)
@@ -438,7 +462,14 @@ private:
 	// Atomics, NOT guarded by mutex_ (issue #178 D4): written by EnsureCacheLoaded
 	// on every catalog lookup while loaders concurrently read them mid-query
 	// (ExecuteMetadataQuery runs WITH mutex_ held, so these must be lock-free).
-	std::atomic<int64_t> ttl_seconds_;				// Cache TTL (0 = manual only)
+	std::atomic<int64_t> ttl_seconds_;	// Cache TTL (0 = manual only)
+
+public:
+	int64_t GetTTLSeconds() const {
+		return ttl_seconds_.load();
+	}
+
+private:
 	std::atomic<int> metadata_timeout_ms_;			// Metadata query timeout in ms (default 5 min)
 	std::atomic<int64_t> test_fail_after_rows_{0};	// TEST ONLY, issue #317
 

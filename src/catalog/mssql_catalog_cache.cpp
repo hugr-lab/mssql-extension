@@ -100,6 +100,7 @@ unique_ptr<MSSQLMetadataCache> MSSQLCatalog::CreateTransactionMetadataCache(Clie
 	// in the user's server transaction, and read sysrowsets, where a deadlock
 	// victim rolls that transaction back (spec 084 Risks).
 	cache->SetRowCountPass(false);
+	cache->SetNoLockWait(!connection_info_->IsFabricEndpoint() && !connection_info_->IsSynapseEndpoint());
 	return cache;
 }
 
@@ -202,7 +203,7 @@ void MSSQLCatalog::Preload(ClientContext &context, const string &schema_name, co
 		throw IOException("%s: failed to acquire connection: %s", caller, why);
 	}
 	try {
-		metadata_cache_->BulkLoadAll(*connection, schema_name, schema_count, table_count, column_count);
+		metadata_cache_->BulkLoadAll(context, *connection, schema_name, schema_count, table_count, column_count);
 	} catch (...) {
 		connection_pool_->Release(std::move(connection));
 		throw;
@@ -294,7 +295,7 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 	// ~ConnectionPool fires its debug-only D_ASSERT about checked-out
 	// connections during catalog teardown and the process aborts on Linux.
 	try {
-		metadata_cache_->Refresh(*connection, database_collation_);
+		metadata_cache_->Refresh(context, *connection, database_collation_);
 	} catch (...) {
 		connection_pool_->Release(std::move(connection));
 		throw;

@@ -1,6 +1,8 @@
 #include "catalog/mssql_schema_entry.hpp"
+#include "catalog/mssql_bind_anchors.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
+#include "catalog/mssql_entry_name_filter.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "catalog/mssql_table_options.hpp"
 #include "catalog/mssql_transaction.hpp"
@@ -9,6 +11,7 @@
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_login_retry.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/entry_scan_filters.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
@@ -79,6 +82,49 @@ void MSSQLSchemaEntry::Scan(ClientContext &context, CatalogType type,
 	tables_.Scan(context, callback);
 }
 
+void MSSQLSchemaEntry::Scan(ClientContext &context, SchemaScanInfo &info) {
+	if (info.type != CatalogType::TABLE_ENTRY || !info.filter) {
+		SchemaCatalogEntry::Scan(context, info);
+		return;
+	}
+	vector<string> names;
+	// Budgeted across the scan: DuckDB asks each schema it kept in turn.
+	const auto schemas_in_scan = MSSQLBindAnchors::For(context, GetMSSQLCatalog()).SchemasInScan();
+	const idx_t schema_count = schemas_in_scan.IsValid() ? MaxValue<idx_t>(schemas_in_scan.GetIndex(), 1) : 1;
+	if (mssql::EntryNameCandidates(info.filter->GetName(), LogicalType::VARCHAR, names) &&
+		names.size() * schema_count <= mssql::MAX_LOOKED_UP_NAMES) {
+		auto &stats_provider = GetMSSQLCatalog().GetStatisticsProvider();
+		const string schema_name = name.GetIdentifierName();
+		for (const auto &table_name : names) {
+			auto entry = tables_.GetEntry(context, table_name);
+			// Found by the name asked for, which the server compares under its collation: only
+			// an entry named as the server spells it is what a listing would have shown.
+			if (!entry || !entry->Cast<MSSQLTableEntry>().ShownInListing()) {
+				continue;
+			}
+			// The count loaded with the entry, as a listing preloads it: else duckdb_tables()'s
+			// storage info asks the server once per table (measured). Not in a transaction,
+			// which reads the entry's own count and must not write the shared statistics.
+			if (context.transaction.IsAutoCommit()) {
+				auto &table = entry->Cast<MSSQLTableEntry>();
+				stats_provider.PreloadRowCount(schema_name, table.name.GetIdentifierName(), table.GetApproxRowCount());
+			}
+			info.callback(*entry);
+		}
+		return;
+	}
+	// An oid is given to an entry when it is built and a rebuilt entry gets a new one, so an
+	// entry not built yet cannot carry the oid asked for: the built ones are the whole answer.
+	// Not in a transaction, whose entries come from its own metadata layer, nor under a cache TTL,
+	// past which a listing reloads what the built entries may no longer match.
+	if (!info.filter->GetName() && info.filter->GetOid() && context.transaction.IsAutoCommit() &&
+		GetMSSQLCatalog().GetMetadataCache().GetTTLSeconds() == 0) {
+		tables_.ScanBuilt(context, info.callback);
+		return;
+	}
+	SchemaCatalogEntry::Scan(context, info);
+}
+
 SimilarCatalogEntry MSSQLSchemaEntry::GetSimilarEntry(CatalogTransaction transaction,
 													  const EntryLookupInfo &lookup_info) {
 	SimilarCatalogEntry result;
@@ -125,7 +171,7 @@ SimilarCatalogEntry MSSQLSchemaEntry::GetSimilarEntry(CatalogTransaction transac
 				if (!cache.TryGetTableNames(schema_name, names)) {
 					auto connection = ConnectionProvider::GetConnection(context, catalog);
 					try {
-						cache.LoadAllTableNames(*connection);
+						cache.LoadAllTableNames(context, *connection);
 					} catch (...) {
 						ConnectionProvider::ReleaseConnection(context, catalog, std::move(connection));
 						throw;
@@ -143,7 +189,7 @@ SimilarCatalogEntry MSSQLSchemaEntry::GetSimilarEntry(CatalogTransaction transac
 				throw IOException("Failed to acquire connection for table names: " + why);
 			}
 			try {
-				shared.LoadAllTableNames(*connection);
+				shared.LoadAllTableNames(context, *connection);
 			} catch (...) {
 				catalog.GetConnectionPool().Release(std::move(connection));
 				throw;

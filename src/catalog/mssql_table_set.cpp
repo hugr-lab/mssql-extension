@@ -135,6 +135,30 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntry(ClientContext &context, const
 	return nullptr;
 }
 
+void MSSQLTableSet::ScanBuilt(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
+	vector<shared_ptr<MSSQLTableEntry>> snapshot;
+	{
+		std::lock_guard<std::mutex> lock(entry_mutex_);
+		for (const auto &pair : entries_) {
+			snapshot.push_back(pair.second);
+		}
+	}
+	// Anchored as Scan anchors them: the catalog walker reads them after this returns.
+	auto &bind_anchors = MSSQLBindAnchors::For(context, schema_.GetMSSQLCatalog());
+	auto &stats_provider = schema_.GetMSSQLCatalog().GetStatisticsProvider();
+	const string schema_name = schema_.name.GetIdentifierName();
+	for (auto &entry_ptr : snapshot) {
+		if (!entry_ptr->ShownInListing()) {
+			continue;  // a listing never shows it, so no oid filter has seen its oid
+		}
+		// As the listing does, so the storage info does not ask the server per table.
+		stats_provider.PreloadRowCount(schema_name, entry_ptr->name.GetIdentifierName(),
+									   entry_ptr->GetApproxRowCount());
+		bind_anchors.AnchorTable(entry_ptr);
+		callback(*entry_ptr);
+	}
+}
+
 void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
 	CATALOG_DEBUG(1, "Scan('%s') — bulk loading all table metadata", schema_.name.c_str());
 	if (!context.transaction.IsAutoCommit()) {
@@ -160,7 +184,7 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 
 	// Load all tables + columns for this schema in one bulk query (or from cache if already loaded)
 	try {
-		cache.LoadAllTableMetadata(*connection, schema_.name.GetIdentifierName());
+		cache.LoadAllTableMetadata(context, *connection, schema_.name.GetIdentifierName());
 	} catch (...) {
 		pool.Release(std::move(connection));
 		throw;
@@ -195,6 +219,11 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 	vector<MSSQLTableMetadata> to_create;
 	cache.ForEachTableInSchema(
 		schema_.name.GetIdentifierName(), [&](const string &table_name, const MSSQLTableMetadata &table_meta) {
+			// A slot a lookup by another spelling of the name, or of a function's name, left in
+			// the shared map: the listing's own slot for the object is there too, or will be.
+			if (!table_meta.ShownInListing()) {
+				return;
+			}
 			stats_provider.PreloadRowCount(schema_.name.GetIdentifierName(), table_name, table_meta.approx_row_count);
 			names_list.push_back(table_name);
 			if (have_entries.find(table_name) == have_entries.end()) {
@@ -344,7 +373,7 @@ bool MSSQLTableSet::LoadSingleEntry(ClientContext &context, const string &name,
 		MSSQLTableMetadata table_meta;
 		bool found = false;
 		try {
-			found = cache.GetTableMetadata(*connection, schema_.name.GetIdentifierName(), name, table_meta);
+			found = cache.GetTableMetadata(context, *connection, schema_.name.GetIdentifierName(), name, table_meta);
 		} catch (...) {
 			pool.Release(std::move(connection));
 			throw;
@@ -531,7 +560,7 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntryInTransaction(ClientContext &c
 	MSSQLTableMetadata table_meta;
 	bool found = false;
 	try {
-		found = metadata.Cache().GetTableMetadata(*connection, schema_name, name, table_meta);
+		found = metadata.Cache().GetTableMetadata(context, *connection, schema_name, name, table_meta);
 	} catch (...) {
 		ConnectionProvider::ReleaseConnection(context, catalog, std::move(connection));
 		throw;
@@ -580,7 +609,7 @@ void MSSQLTableSet::ScanInTransaction(ClientContext &context, const std::functio
 	if (!metadata.IsSchemaListed(schema_name)) {
 		auto connection = ConnectionProvider::GetConnection(context, catalog);
 		try {
-			metadata.Cache().LoadAllTableMetadata(*connection, schema_name);
+			metadata.Cache().LoadAllTableMetadata(context, *connection, schema_name);
 		} catch (...) {
 			ConnectionProvider::ReleaseConnection(context, catalog, std::move(connection));
 			throw;
@@ -589,8 +618,11 @@ void MSSQLTableSet::ScanInTransaction(ClientContext &context, const std::functio
 		metadata.MarkSchemaListed(schema_name);
 	}
 	vector<MSSQLTableMetadata> tables;
-	metadata.Cache().ForEachTableInSchema(
-		schema_name, [&](const string &, const MSSQLTableMetadata &table_meta) { tables.push_back(table_meta); });
+	metadata.Cache().ForEachTableInSchema(schema_name, [&](const string &, const MSSQLTableMetadata &table_meta) {
+		if (table_meta.ShownInListing()) {	// as MSSQLTableSet::Scan
+			tables.push_back(table_meta);
+		}
+	});
 	for (auto &table_meta : tables) {
 		auto entry = metadata.FindEntry(schema_name, table_meta.name);
 		if (!entry) {

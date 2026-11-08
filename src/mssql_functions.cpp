@@ -1772,25 +1772,24 @@ static int64_t RunExecBatch(ClientContext &client_context, const string &context
 // Execute function for mssql_exec
 static void MSSQLExecExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &bind_data = state.expr.Cast<BoundFunctionExpression>().BindInfo()->Cast<MSSQLExecBindData>();
-
-	auto &context_names = args.data[0];
-	auto &sql_statements = args.data[1];
-
-	UnaryExecutor::Execute<string_t, int64_t>(sql_statements, result, args.size(), [&](string_t sql_str) -> int64_t {
-		// Get the context name from bind data or first argument
-		string context_name = bind_data.context_name;
-		if (context_name.empty()) {
-			// Get from runtime argument
-			auto context_val = context_names.GetValue(0);
-			context_name = context_val.ToString();
+	// One run per row, as mssql_exec_params runs. UnaryExecutor ran a constant input once and
+	// broadcast the count, so `SELECT mssql_exec('db', 'INSERT …') FROM range(3)` inserted one
+	// row (measured); and the context name came from row 0 whatever the row.
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto out = FlatVector::GetDataMutable<int64_t>(result);
+	auto &validity = FlatVector::ValidityMutable(result);
+	for (idx_t i = 0; i < args.size(); i++) {
+		Value context_val = args.data[0].GetValue(i);
+		Value sql_val = args.data[1].GetValue(i);
+		if (sql_val.IsNull() || (bind_data.context_name.empty() && context_val.IsNull())) {
+			validity.SetInvalid(i);
+			continue;
 		}
-
-		string sql = sql_str.GetString();
-
+		const string context_name = bind_data.context_name.empty() ? context_val.ToString() : bind_data.context_name;
+		const string sql = sql_val.ToString();
 		MSSQL_FN_DEBUG_LOG(1, "mssql_exec: context=%s, sql=%s", context_name.c_str(), sql.c_str());
-
-		return RunExecBatch(state.GetContext(), context_name, sql, sql, "mssql_exec");
-	});
+		out[i] = RunExecBatch(state.GetContext(), context_name, sql, sql, "mssql_exec");
+	}
 }
 
 ScalarFunction MSSQLExecScalarFunction::GetFunction() {
@@ -1798,7 +1797,11 @@ ScalarFunction MSSQLExecScalarFunction::GetFunction() {
 						MSSQLExecBind);
 	func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	// Side-effecting (runs T-SQL on the server): VOLATILE stops the optimizer
-	// from constant-folding the call at plan time or caching it per row.
+	// from constant-folding the call at plan time or caching it per row. It does
+	// not keep an UNUSED call: DuckDB drops a projection nothing reads, volatile or
+	// not (remove_unused_columns.cpp checks volatility for windows only), so under
+	// `SELECT count(*) FROM (SELECT mssql_exec(…) …)` the statement never runs.
+	// Documented on the function; no DuckDB patch (owner's rule).
 	func.SetVolatile();
 	func.SetFallible();
 	return func;
@@ -1839,7 +1842,8 @@ void RegisterMSSQLExecFunction(ExtensionLoader &loader) {
 		loader, {MSSQLExecScalarFunction::GetFunction()},
 		{{"context", "sql"},
 		 "Runs a T-SQL statement or batch on an attached SQL Server database and returns the number of rows it "
-		 "affected.",
+		 "affected. It runs once per row of the query that calls it, and only when its result is used: DuckDB "
+		 "drops a column nothing reads, so `SELECT count(*) FROM (SELECT mssql_exec(…) …)` runs nothing.",
 		 {"mssql_exec('db', 'CREATE TABLE dbo.notes (id int PRIMARY KEY, body nvarchar(200))')"},
 		 {"query"}});
 

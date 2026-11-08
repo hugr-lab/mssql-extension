@@ -116,6 +116,8 @@ SELECT mssql_exec('sqlserver', 'UPDATE dbo.users SET status = 1 WHERE id = 5');
 -- Returns: number of affected rows
 ```
 
+It runs once per row of the query it is called in: `SELECT mssql_exec(...) FROM range(3)` runs the statement three times. It runs only when its result is used. DuckDB drops a column nothing reads, so `SELECT count(*) FROM (SELECT mssql_exec(...) FROM t)` runs nothing. Select the call itself, or sum its result.
+
 ### mssql_exec_params()
 
 `mssql_exec` with parameters — the same contract as `mssql_scan_params`. One round trip per row; the statement compiles once on the server and the plan serves every row and every session.
