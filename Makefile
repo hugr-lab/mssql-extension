@@ -35,7 +35,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test code-pages-generate code-pages-tables test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check help
+.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -854,6 +854,7 @@ bench-utf16: release
 # and committed (tools/code_pages/data/ -> src/codec/code_page/code_page_tables.cpp):
 #   make code-pages-generate       ask the test server again (needs `make docker-up`)
 #   make code-pages-tables         re-emit the C++ from the committed data
+#   make code-pages-check-wire     every collation's wire key against the test server
 #   make test-code-page            the kernel against the data; no server, no DuckDB, no
 #                                  simdutf: the platform's SIMD form (NEON / SSE2)
 #   make test-code-page-portable   the same, built with the 8-byte SWAR form
@@ -874,6 +875,10 @@ code-pages-generate: release
 
 code-pages-tables:
 	@python3 tools/code_pages/emit_tables.py
+
+# Spec 092 D1: every collation's wire key against a live server (needs `make docker-up`).
+code-pages-check-wire: release
+	@python3 tools/code_pages/check_wire_keys.py
 
 test-code-page:
 	@mkdir -p build/test
@@ -910,7 +915,7 @@ bench-code-page-column:
 		exit 1; \
 	fi
 	$(CXX) $(BENCH_MAT_FLAGS) -DNDEBUG $(BENCH_UTF16_INCLUDES) test/cpp/bench_code_page_column.cpp \
-	    $(BENCH_MAT_SOURCES) src/codec/staging/column_staging.cpp $(CODE_PAGE_SOURCES) \
+	    $(BENCH_MAT_SOURCES) src/codec/staging/column_staging.cpp \
 	    $(BENCH_UTF16_LIBS) -L build/release/src -lduckdb -o build/test/bench_code_page_column
 	DYLD_LIBRARY_PATH=build/release/src LD_LIBRARY_PATH=build/release/src build/test/bench_code_page_column
 
@@ -919,7 +924,7 @@ bench-code-page-column:
 # Links the RELEASE libduckdb (Vector/DataChunk symbols) + release simdutf,
 # compiles the codec sources at -O3 so the timed body matches shipped code.
 BENCH_MAT_FLAGS := -std=c++17 -O3 -pthread -Wno-deprecated-declarations -DMSSQL_BENCH_BUILD
-BENCH_MAT_SOURCES := $(wildcard src/codec/*.cpp) \
+BENCH_MAT_SOURCES := $(wildcard src/codec/*.cpp) $(wildcard src/codec/code_page/*.cpp) \
     src/tds/encoding/bcp_row_encoder.cpp \
     src/tds/encoding/utf16.cpp \
     src/tds/encoding/datetime_encoding.cpp \
@@ -1039,7 +1044,7 @@ CODEC_TEST_ENCODING_SOURCES := \
 # Without it `make test-codec-integer` / `test-codec-decimal` fail to link.
 # CODEC_TEST_FAMILY_SOURCES is appended by Phase 2 (T011) and each family
 # migration phase as $(wildcard src/codec/*.cpp) once stub files exist.
-CODEC_TEST_FAMILY_SOURCES := $(wildcard src/codec/*.cpp)
+CODEC_TEST_FAMILY_SOURCES := $(wildcard src/codec/*.cpp) $(wildcard src/codec/code_page/*.cpp)
 
 test-codec-%: debug
 	@echo "Building codec unit test for family: $*"
@@ -1177,7 +1182,12 @@ PIN_TEST_LIBS += -framework GSS -framework Security -framework CoreFoundation \
 else ifeq ($(PIN_TEST_BUILD),debug)
 PIN_TEST_LIBS += -fsanitize=address -fsanitize=undefined
 endif
-PIN_TEST_RPATH := DYLD_LIBRARY_PATH=build/$(PIN_TEST_BUILD)/src LD_LIBRARY_PATH=build/$(PIN_TEST_BUILD)/src
+# These binaries link the extension statically beside a libduckdb that already holds it,
+# so every external global exists twice by construction (spec 091's code-page tables, once
+# the read path uses them), and ASan aborts on the first with odr-violation. The loadable
+# extension is not built this way. Appended, because CI sets ASAN_OPTIONS for the job.
+PIN_TEST_RPATH := DYLD_LIBRARY_PATH=build/$(PIN_TEST_BUILD)/src LD_LIBRARY_PATH=build/$(PIN_TEST_BUILD)/src \
+    ASAN_OPTIONS="$$ASAN_OPTIONS:detect_odr_violation=0"
 
 test-transaction-pin: $(PIN_TEST_BUILD)
 	@echo "Building issue #356 transaction-pin contention test..."
@@ -1220,6 +1230,20 @@ test-dead-connection: $(PIN_TEST_BUILD)
 	@echo ""
 	@echo "Running the dead-connection test..."
 	$(PIN_TEST_RPATH) build/test/test_dead_connection
+
+# Review of #539: a metadata load retrying on another session's lock (1222) at
+# mssql_metadata_timeout = 0 ends when the statement is interrupted. Built like the
+# dead-connection test; needs SQL Server.
+test-metadata-interrupt: $(PIN_TEST_BUILD)
+	@echo "Building the metadata interrupt test (review of #539)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) -I src/include $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_metadata_interrupt.cpp \
+	    $(PIN_TEST_LIBS) \
+	    -o build/test/test_metadata_interrupt
+	@echo ""
+	@echo "Running the metadata interrupt test..."
+	$(PIN_TEST_RPATH) build/test/test_metadata_interrupt
 
 # Issue #369: the rowid files that create their own tables, run through the
 # sqllogictest driver of the DEBUG tree — the one build in which the scan's

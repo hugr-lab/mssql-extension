@@ -104,6 +104,7 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 	// Spec 084 D1: the whole-catalog row counts from one DMV pass, except where
 	// the DMV and table variables are unverified.
 	metadata_cache_->SetRowCountPass(!connection_info_->IsFabricEndpoint() && !connection_info_->IsSynapseEndpoint());
+	metadata_cache_->SetNoLockWait(!connection_info_->IsFabricEndpoint() && !connection_info_->IsSynapseEndpoint());
 
 	// Create statistics provider with default TTL (will be configured from settings later)
 	statistics_provider_ = make_uniq<MSSQLStatisticsProvider>();
@@ -729,7 +730,7 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 
 	// Trigger lazy loading of schema list (ensure connection released on exception)
 	try {
-		schema_list.EnsureSchemasLoaded(*connection);
+		schema_list.EnsureSchemasLoaded(transaction.context, *connection);
 	} catch (...) {
 		if (transaction.context) {
 			ConnectionProvider::ReleaseConnection(*transaction.context, *this, std::move(connection));
@@ -803,7 +804,7 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 	}
 
 	try {
-		schema_names = schema_list.GetSchemaNames(*connection);
+		schema_names = schema_list.GetSchemaNames(context, *connection);
 	} catch (...) {
 		ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
 		throw;
@@ -1172,6 +1173,10 @@ string MSSQLCatalog::WireVarcharCollation(const string &ddl_collation) const {
 	return string();
 }
 
+LogicalType MSSQLCatalog::CreatedColumnType(const LogicalType &type) const {
+	return RequiresSingleByteText() ? mssql::codec::FabricStringType(type) : type;
+}
+
 void MSSQLCatalog::ValidateStringTargets(const vector<LogicalType> &types) {
 	if (!RequiresSingleByteText()) {
 		return;
@@ -1181,8 +1186,8 @@ void MSSQLCatalog::ValidateStringTargets(const vector<LogicalType> &types) {
 	// is fixed when the warehouse is created. Anything else is rejected by the
 	// server with "...is not a valid collation", which is a worse place to find
 	// out than here.
-	static const char *const FABRIC_COLLATIONS[] = {"LATIN1_GENERAL_100_BIN2_UTF8",
-													"LATIN1_GENERAL_100_CI_AS_KS_WS_SC_UTF8"};
+	static const char *const FABRIC_COLLATIONS[] = {mssql::codec::FABRIC_BIN2_COLLATION,
+													mssql::codec::FABRIC_CI_COLLATION};
 
 	for (const auto &type : types) {
 		mssql::codec::TargetStringType spec;

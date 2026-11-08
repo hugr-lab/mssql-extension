@@ -9,6 +9,7 @@
 #include "dml/mssql_dml_function.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/extension_type_info.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/vector_operations/generic_executor.hpp"
 #include "duckdb/function/cast/default_casts.hpp"
@@ -94,7 +95,25 @@ static LogicalType BindMssqlStringType(BindLogicalTypeInput &input, bool unicode
 	// it before the extension is consulted -- "Parser Error: Expected a constant
 	// as type modifier" -- so `MSSQL_VARCHAR(MAX, 'c')` would need a change to
 	// DuckDB, not to this function.
-	auto &length_val = modifiers[0].GetValue();
+	//
+	// A type respelled from its modifiers arrives with the collation in the length's
+	// modifier, "<length>,<collation>" (MakeTargetStringType): DuckDB's remote-pushdown
+	// rewriter does that when it folds a cast of a constant.
+	Value length_val = modifiers[0].GetValue();
+	if (!unicode && modifiers.size() == 1 && !length_val.IsNull() && length_val.type().id() == LogicalTypeId::VARCHAR) {
+		string length_text;
+		mssql::codec::SplitLengthModifier(length_val.ToString(), length_text, spec.collation);
+		if (!spec.collation.empty()) {
+			if (!mssql::codec::IsValidCollationName(spec.collation)) {
+				throw BinderException("Invalid collation name '%s': expected letters, digits and underscores",
+									  spec.collation);
+			}
+			// What is not a number stays a string, for the check below to take or refuse.
+			int32_t parsed;
+			length_val = TryCast::Operation<string_t, int32_t>(string_t(length_text), parsed) ? Value::INTEGER(parsed)
+																							  : Value(length_text);
+		}
+	}
 	if (!length_val.IsNull() && length_val.type().id() == LogicalTypeId::VARCHAR) {
 		if (!mssql::codec::IsMaxKeyword(length_val.ToString())) {
 			throw BinderException("%s(n): a string modifier must be '%s'; got '%s'", name, mssql::codec::MAX_MODIFIER,

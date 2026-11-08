@@ -476,7 +476,9 @@ of the committed `tools/code_pages/data/` (D3), recounted from the files.
     page 0 on a varchar column cannot occur.
   - **Not built:** the row lookup by wire key, which needs the wire bytes (D10); spec 092 D7's
     follow-up depends on it.
-  - **Still to verify**, with the wire bytes (D10): that every collation's wire LCID, fUTF8 and
+  - **Verified through the read path** on 17.0.4075.5 (spec 092 D1, `make code-pages-check-wire`):
+    every collation's wire key leads to its page. **Still to verify**, with the wire bytes (D10):
+    that every collation's wire LCID, fUTF8 and
     SortId equal its `COLLATIONPROPERTY` LCID, `_UTF8` suffix and `CollationId >> 24` (measured for
     SortIds 52 and 106 only, F2 / F16; the unit test assumes it, Tests 1); that every on-disk id
     equals `CollationId` (the research maps the on-disk id through `collations.psv`'s

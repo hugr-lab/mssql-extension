@@ -7,6 +7,7 @@
 #include "codec/staging/row_stager.hpp"
 
 #include "codec/binary_codec.hpp"
+#include "codec/code_page/code_page_codec.hpp"
 #include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/money_codec.hpp"
@@ -342,6 +343,15 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 		}
 		if (ops_[i].arm >= AppendArm::PlpStageString && ops_[i].arm <= AppendArm::LobStageBinary) {
 			unbounded_columns_.push_back(staging_[i]);
+			// Counted twice: what the budget has to bound is the output, whose heap
+			// memory_limit accounts at 3 bytes per character (the kernels' one pass
+			// sizes at the bound). A code-page byte is a character where a UTF-16
+			// column stages two, so counted once a chunk would hold twice the
+			// characters and reserve twice the heap: measured, a 400 MB scan failed
+			// at memory_limit = 100MB where the server's NVARCHAR cast passes.
+			if (ops_[i].kernel == FinalizeKernel::CodePage) {
+				unbounded_columns_.push_back(staging_[i]);
+			}
 		}
 	}
 	has_unbounded_column_ = !unbounded_columns_.empty();
@@ -621,6 +631,9 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		case FinalizeKernel::Text:
 			FinalizeFallbackColumn(st, row_count, meta, *targets_[c]);
 			break;
+		case FinalizeKernel::CodePage:
+			code_page::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
+			break;
 		}
 		if (counters_enabled_) {
 			const auto elapsed = std::chrono::steady_clock::now() - started;
@@ -800,6 +813,9 @@ void RowStager::DecodeFirstValue(idx_t c, const ColumnStaging &st, const tds::Co
 		break;
 	case FinalizeKernel::Datetime:
 		datetime::DecodeFromTds(bytes, meta, out, 0);
+		break;
+	case FinalizeKernel::CodePage:
+		code_page::DecodeFromTds(bytes, meta, out, 0);
 		break;
 	case FinalizeKernel::None:
 	case FinalizeKernel::Text:

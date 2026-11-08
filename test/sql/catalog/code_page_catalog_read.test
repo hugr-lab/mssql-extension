@@ -1,0 +1,432 @@
+# name: test/sql/catalog/code_page_catalog_read.test
+# description: A catalog read of a single-byte code page goes bare and transcodes on the client; it equals the server's cast (spec 092)
+# group: [mssql]
+# issue: 224
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cr (TYPE mssql);
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cr_off (TYPE mssql, client_transcode false);
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cr_scan (TYPE mssql, remote_pushdown false);
+
+statement ok
+SELECT mssql_exec('cr', 'IF OBJECT_ID(''dbo.cr_t'') IS NOT NULL DROP TABLE dbo.cr_t;
+CREATE TABLE dbo.cr_t (id int PRIMARY KEY,
+	v1252 varchar(40) COLLATE SQL_Latin1_General_CP1_CI_AS,
+	v1251 varchar(40) COLLATE Cyrillic_General_CI_AS,
+	c1251 char(8) COLLATE Cyrillic_General_CI_AS,
+	wide varchar(5000) COLLATE Cyrillic_General_CI_AS,
+	wide_c char(5000) COLLATE Cyrillic_General_CI_AS,
+	m varchar(max) COLLATE Cyrillic_General_CI_AS,
+	t text COLLATE Cyrillic_General_CI_AS,
+	v932 varchar(40) COLLATE Japanese_CI_AS,
+	c932 char(8) COLLATE Japanese_CI_AS,
+	m932 varchar(max) COLLATE Japanese_CI_AS,
+	u8 varchar(40) COLLATE Latin1_General_100_CI_AS_SC_UTF8);
+INSERT dbo.cr_t VALUES
+	(1, N''café'', N''жук'', N''ж'', N''жук'', N''ж'', N''жук'', N''жук'', N''あい'', N''あ'', N''あい'', N''жあ''),
+	(2, N''€uro'', N''чай'', N''чай'', REPLICATE(CAST(N''ч'' AS nvarchar(max)), 4500), REPLICATE(CAST(N''я'' AS nvarchar(max)), 4500), REPLICATE(CAST(N''ш'' AS nvarchar(max)), 20000),
+		REPLICATE(CAST(N''щ'' AS nvarchar(max)), 9000), N''カタカナ'', N''ｶﾀ'', REPLICATE(CAST(N''漢'' AS nvarchar(max)), 9000), N''x''),
+	(3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+	(4, N'''', N'''', N'''', N'''', N'''', N'''', N'''', N'''', N'''', N'''', N'''');');
+
+# =============================================================================
+# The T-SQL. EXPLAIN of a pushed statement is where it can be read.
+# =============================================================================
+
+query II
+EXPLAIN SELECT id, v1252, v1251, c1251, wide, wide_c, m FROM cr.dbo.cr_t ORDER BY id LIMIT 4;
+----
+physical_plan	<REGEX>:.*SELECT TOP \(4\) \[id\], \[v1252\], \[v1251\], \[c1251\], \[wide\], \[wide_c\], \[m\] FROM.*
+
+# text keeps its cast (D1), and a double-byte page its (D10).
+query II
+EXPLAIN SELECT t, v932, c932, m932 FROM cr.dbo.cr_t ORDER BY id LIMIT 4;
+----
+physical_plan	<REGEX>:.*CAST\(\[t\] AS NVARCHAR\(MAX\)\) AS \[t\], CAST\(\[v932\] AS NVARCHAR\(40\)\) AS \[v932\], CAST\(\[c932\] AS NCHAR\(8\)\) AS \[c932\], CAST\(\[m932\] AS NVARCHAR\(MAX\)\) AS \[m932\].*
+
+# The escape hatch: today's text.
+query II
+EXPLAIN SELECT v1251, c1251, wide, m FROM cr_off.dbo.cr_t ORDER BY id LIMIT 4;
+----
+physical_plan	<REGEX>:.*CAST\(\[v1251\] AS NVARCHAR\(40\)\) AS \[v1251\], CAST\(\[c1251\] AS NCHAR\(8\)\) AS \[c1251\], CAST\(\[wide\] AS NVARCHAR\(MAX\)\) AS \[wide\], CAST\(\[m\] AS NVARCHAR\(MAX\)\) AS \[m\].*
+
+# =============================================================================
+# The values: every column, pushed and scanned, equals the server's cast.
+# =============================================================================
+
+query I
+SELECT count(*) FROM (FROM (SELECT * FROM cr.dbo.cr_t ORDER BY id LIMIT 4) EXCEPT ALL SELECT * FROM cr_off.dbo.cr_t);
+----
+0
+
+query I
+SELECT count(*) FROM (FROM cr_off.dbo.cr_t EXCEPT ALL (SELECT * FROM cr.dbo.cr_t ORDER BY id LIMIT 4));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM cr_scan.dbo.cr_t EXCEPT ALL SELECT * FROM cr_off.dbo.cr_t);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM cr_off.dbo.cr_t EXCEPT ALL SELECT * FROM cr_scan.dbo.cr_t);
+----
+0
+
+query IIIIIIII rowsort
+SELECT id, v1252, v1251, '[' || c1251 || ']', length(wide), length(wide_c), length(m), length(t) FROM cr_scan.dbo.cr_t;
+----
+1	café	жук	[ж]	3	1	3	3
+2	€uro	чай	[чай]	4500	4500	20000	9000
+3	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+4	(empty)	(empty)	[]	0	0	0	0
+
+# A raw scan returns what the catalog does, on each kind of page.
+query I
+SELECT count(*) FROM (SELECT id, v1252, v1251, c1251, wide, wide_c, m, t, v932, c932, m932, u8 FROM mssql_scan('cr', 'SELECT * FROM dbo.cr_t')
+	EXCEPT ALL SELECT id, v1252, v1251, c1251, wide, wide_c, m, t, v932, c932, m932, u8 FROM cr_scan.dbo.cr_t);
+----
+0
+
+# =============================================================================
+# #405: a char(n) compares without its padding, bare (1252) and through NCHAR(n) (932).
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('cr', 'IF OBJECT_ID(''dbo.cr_pad'') IS NOT NULL DROP TABLE dbo.cr_pad;
+CREATE TABLE dbo.cr_pad (c4 char(4) COLLATE Latin1_General_CI_AS, c6 char(6) COLLATE Latin1_General_CI_AS,
+	j4 char(4) COLLATE Japanese_CI_AS, j6 char(6) COLLATE Japanese_CI_AS);
+INSERT dbo.cr_pad VALUES (''AB'', ''AB'', ''AB'', ''AB''), (''AB'', ''AB'', ''AB'', ''AB''), (''é'', ''é'', ''é'', ''é'');');
+
+statement ok
+SELECT mssql_invalidate_cache('cr_scan');
+
+query I
+SELECT count(*) FROM cr_scan.dbo.cr_pad a JOIN cr_scan.dbo.cr_pad b ON a.c4 = b.c6;
+----
+5
+
+query I
+SELECT count(*) FROM cr_scan.dbo.cr_pad a JOIN cr_scan.dbo.cr_pad b ON a.j4 = b.j6;
+----
+5
+
+query I
+SELECT count(DISTINCT c4) FROM cr_scan.dbo.cr_pad;
+----
+2
+
+query II rowsort
+SELECT c6, count(*) FROM cr_scan.dbo.cr_pad GROUP BY c6;
+----
+AB	2
+é	1
+
+# =============================================================================
+# RETURNING and the DML that reads rows back.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('cr', 'IF OBJECT_ID(''dbo.cr_dml'') IS NOT NULL DROP TABLE dbo.cr_dml;
+CREATE TABLE dbo.cr_dml (id int PRIMARY KEY, v varchar(20) COLLATE Cyrillic_General_CI_AS, c char(2100) COLLATE Cyrillic_General_CI_AS, c2 char(2100) COLLATE Cyrillic_General_CI_AS, j varchar(20) COLLATE Japanese_CI_AS);');
+
+query IIIII
+INSERT INTO cr.dbo.cr_dml VALUES (1, 'жук', 'я', 'я', 'あ') RETURNING id, v, '[' || c || ']', c2, j;
+----
+1	жук	[я]	я	あ
+
+# Staged: OUTPUT ... INTO #out, read back through the kernel.
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+query IIII
+UPDATE cr.dbo.cr_dml SET v = 'щи' WHERE id = 1 RETURNING id, v, '[' || c || ']', j;
+----
+1	щи	[я]	あ
+
+query II
+DELETE FROM cr.dbo.cr_dml WHERE id = 1 RETURNING v, '[' || c || ']';
+----
+щи	[я]
+
+statement ok
+RESET mssql_dml_stage_threshold;
+
+statement ok
+RESET mssql_dml_pushdown;
+
+# Beside a trigger the OUTPUT goes INTO a session table (#471's 334 path), typed by the
+# read: a bare char(2100) twice stays within the row, as the source does.
+statement ok
+SELECT mssql_exec('cr', 'CREATE TRIGGER dbo.cr_dml_tr ON dbo.cr_dml AFTER INSERT AS BEGIN SET NOCOUNT ON; END;');
+
+query IIII
+INSERT INTO cr.dbo.cr_dml VALUES (2, 'жук', 'я', 'ю', 'あ') RETURNING v, '[' || c || ']', c2, j;
+----
+жук	[я]	ю	あ
+
+statement ok
+SELECT mssql_exec('cr', 'DROP TRIGGER dbo.cr_dml_tr;');
+
+# =============================================================================
+# A code-page key: VALUES and #stage, one column and a composite (the STRUCT, per value).
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('cr', 'IF OBJECT_ID(''dbo.cr_key'') IS NOT NULL DROP TABLE dbo.cr_key;
+CREATE TABLE dbo.cr_key (k varchar(20) COLLATE Cyrillic_General_CI_AS PRIMARY KEY, n int);
+INSERT dbo.cr_key VALUES (N''жук'', 1), (N''чай'', 2), (N''щи'', 3);
+IF OBJECT_ID(''dbo.cr_key2'') IS NOT NULL DROP TABLE dbo.cr_key2;
+CREATE TABLE dbo.cr_key2 (a varchar(20) COLLATE Cyrillic_General_CI_AS NOT NULL, b char(4) COLLATE Latin1_General_CI_AS NOT NULL, n int, PRIMARY KEY (a, b));
+INSERT dbo.cr_key2 VALUES (N''жук'', ''é'', 1), (N''чай'', ''é'', 2);');
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+query I
+SELECT rowid FROM cr.dbo.cr_key WHERE n = 1;
+----
+жук
+
+statement ok
+UPDATE cr.dbo.cr_key SET n = 10 WHERE n = 1;
+
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+statement ok
+UPDATE cr.dbo.cr_key SET n = 20 WHERE n = 2;
+
+statement ok
+DELETE FROM cr.dbo.cr_key WHERE n = 3;
+
+statement ok
+RESET mssql_dml_stage_threshold;
+
+query II
+SELECT k, n FROM cr.dbo.cr_key ORDER BY n;
+----
+жук	10
+чай	20
+
+query I
+SELECT rowid FROM cr.dbo.cr_key2 WHERE n = 1;
+----
+{'a': жук, 'b': é}
+
+statement ok
+UPDATE cr.dbo.cr_key2 SET n = 10 WHERE n = 1;
+
+query III
+SELECT a, b, n FROM cr.dbo.cr_key2 ORDER BY n;
+----
+чай	é	2
+жук	é	10
+
+statement ok
+RESET mssql_dml_pushdown;
+
+# =============================================================================
+# MERGE: a code-page source and target, pushed and staged.
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('cr', 'IF OBJECT_ID(''dbo.cr_mt'') IS NOT NULL DROP TABLE dbo.cr_mt;
+CREATE TABLE dbo.cr_mt (k varchar(20) COLLATE Cyrillic_General_CI_AS PRIMARY KEY, v varchar(20) COLLATE Cyrillic_General_CI_AS);
+INSERT dbo.cr_mt VALUES (N''жук'', N''старый'');
+IF OBJECT_ID(''dbo.cr_ms'') IS NOT NULL DROP TABLE dbo.cr_ms;
+CREATE TABLE dbo.cr_ms (k varchar(20) COLLATE Cyrillic_General_CI_AS PRIMARY KEY, v varchar(20) COLLATE Cyrillic_General_CI_AS);
+INSERT dbo.cr_ms VALUES (N''жук'', N''новый''), (N''чай'', N''чёрный'');');
+
+query II
+EXPLAIN MERGE INTO cr.dbo.cr_mt t USING cr.dbo.cr_ms s ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.v);
+----
+physical_plan	<REGEX>:.*MERGE.*cr_mt.*
+
+statement ok
+MERGE INTO cr.dbo.cr_mt t USING cr.dbo.cr_ms s ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.v);
+
+query II
+SELECT k, v FROM cr.dbo.cr_mt ORDER BY k;
+----
+жук	новый
+чай	чёрный
+
+# Staged: the source is DuckDB's, through a #src the server compares in Unicode.
+statement ok
+MERGE INTO cr.dbo.cr_mt t USING (SELECT k, upper(v) AS v FROM cr.dbo.cr_ms) s ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = s.v;
+
+query II
+SELECT k, v FROM cr.dbo.cr_mt ORDER BY k;
+----
+жук	НОВЫЙ
+чай	ЧЁРНЫЙ
+
+# =============================================================================
+# More pushes (D8), each equal to the scan's answer.
+# =============================================================================
+
+query II
+EXPLAIN SELECT id, coalesce(v1251, 'x') FROM cr.dbo.cr_t ORDER BY id LIMIT 4;
+----
+physical_plan	<REGEX>:.*COALESCE\(\[v1251\].*
+
+query IT
+SELECT id, coalesce(v1251, 'x') FROM cr.dbo.cr_t ORDER BY id LIMIT 4;
+----
+1	жук
+2	чай
+3	x
+4	(empty)
+
+query IT
+SELECT id, coalesce(v1251, 'x') FROM cr_off.dbo.cr_t ORDER BY id LIMIT 4;
+----
+1	жук
+2	чай
+3	x
+4	(empty)
+
+# A constant the database's page cannot hold is left to DuckDB: the server would make
+# it `?` on the way to the column's collation.
+query II
+EXPLAIN SELECT id, coalesce(v1251, 'нет') FROM cr.dbo.cr_t ORDER BY id LIMIT 4;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query IT
+SELECT id, coalesce(v1251, 'нет') FROM cr.dbo.cr_t ORDER BY id LIMIT 4;
+----
+1	жук
+2	чай
+3	нет
+4	(empty)
+
+# Not over a double-byte page, whose read keeps its cast.
+query II
+EXPLAIN SELECT id, coalesce(v932, 'x') FROM cr.dbo.cr_t ORDER BY id LIMIT 4;
+----
+physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+# A pushed DISTINCT compares the column itself now, not its NVARCHAR cast: on a SQL_
+# collation those are different rules ('ss' and 'ß' are two values as varchar, one as
+# nvarchar). Spec 079's D4 for sets, reaching a code-page column.
+statement ok
+SELECT mssql_exec('cr', 'IF OBJECT_ID(''dbo.cr_sets'') IS NOT NULL DROP TABLE dbo.cr_sets;
+CREATE TABLE dbo.cr_sets (id int, v varchar(10) COLLATE SQL_Latin1_General_CP1_CI_AS);
+INSERT dbo.cr_sets VALUES (1, N''ß''), (2, ''ss'');');
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT v FROM cr.dbo.cr_sets);
+----
+2
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT v FROM cr_off.dbo.cr_sets);
+----
+1
+
+# A nested UNION likewise (at a statement's top DuckDB combines the parts).
+query II
+EXPLAIN SELECT count(*) FROM (SELECT v FROM cr.dbo.cr_sets UNION SELECT v FROM cr.dbo.cr_sets) s LIMIT 5;
+----
+physical_plan	<REGEX>:.*UNION.*
+
+query I
+SELECT count(*) FROM (SELECT v FROM cr.dbo.cr_sets UNION SELECT v FROM cr.dbo.cr_sets) s LIMIT 5;
+----
+2
+
+# =============================================================================
+# mssql_convert_varchar_max (D9): no effect on a single-byte page, which is bare
+# either way; on a double-byte one `false` drops the cast, and the wire's collation
+# transcodes it.
+# =============================================================================
+
+statement ok
+SET mssql_convert_varchar_max = false;
+
+query II
+SELECT m, m932 FROM cr_scan.dbo.cr_t WHERE id = 1;
+----
+жук	あい
+
+statement ok
+RESET mssql_convert_varchar_max;
+
+# =============================================================================
+# The page check (D1): a collation changed behind a stale catalog. The column reads by
+# the wire's page, correctly, and a warning names what is stale.
+# =============================================================================
+
+statement ok
+SET logging_storage = 'memory';
+
+statement ok
+SET enable_logging = true;
+
+statement ok
+SET logging_level = 'WARNING';
+
+statement ok
+SELECT mssql_exec('cr', 'IF OBJECT_ID(''dbo.cr_stale'') IS NOT NULL DROP TABLE dbo.cr_stale;
+CREATE TABLE dbo.cr_stale (v varchar(20) COLLATE Cyrillic_General_CI_AS);
+INSERT dbo.cr_stale VALUES (N''ж'');');
+
+query I
+SELECT v FROM cr_scan.dbo.cr_stale;
+----
+ж
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%is in the catalog under collation%';
+----
+0
+
+statement ok
+SELECT mssql_exec('cr', 'DELETE dbo.cr_stale; ALTER TABLE dbo.cr_stale ALTER COLUMN v varchar(20) COLLATE Greek_CI_AS;
+INSERT dbo.cr_stale VALUES (N''Ω'');');
+
+query I
+SELECT v FROM cr_scan.dbo.cr_stale;
+----
+Ω
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%"v" is in the catalog under collation Cyrillic_General_CI_AS (code page 1251)%names code page 1253%';
+----
+1
+
+statement ok
+SELECT mssql_invalidate_cache('cr_scan', 'dbo', 'cr_stale');
+
+query I
+SELECT v FROM cr_scan.dbo.cr_stale;
+----
+Ω
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE '%is in the catalog under collation%';
+----
+1
+
+statement ok
+SET enable_logging = false;
+
+statement ok
+SELECT mssql_exec('cr', 'DROP TABLE dbo.cr_t; DROP TABLE dbo.cr_pad; DROP TABLE dbo.cr_dml; DROP TABLE dbo.cr_key; DROP TABLE dbo.cr_key2; DROP TABLE dbo.cr_mt; DROP TABLE dbo.cr_ms; DROP TABLE dbo.cr_stale; DROP TABLE dbo.cr_sets;');

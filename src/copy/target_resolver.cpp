@@ -1328,9 +1328,13 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 				// Empty means we cannot name a UTF-8 collation for this target, so
 				// the column stays on the transcoding path — which is the right
 				// answer for a code-page target, where sending UTF-8 bytes would
-				// be read in that code page and mangled.
+				// be read in that code page and mangled. So does a code-page
+				// collation by name: MSSQL_VARCHAR(n, 'Cyrillic_General_CI_AS'), what a
+				// CTAS from a code-page column inherits. Measured: the server stores
+				// the bytes of a BIGVARCHAR declared UTF-8 as they are, and ж came back
+				// as Р¶ under the column's own page.
 				const string &collation = spec.collation.empty() ? varchar_collation : spec.collation;
-				if (!collation.empty()) {
+				if (MSSQLColumnInfo::IsUTF8Collation(collation)) {
 					col.tds_type_token = tds::TDS_TYPE_BIGVARCHAR;
 					// Both sides count bytes now, so the length is not doubled the
 					// way an nvarchar declaration doubles it. An unannotated column
@@ -1491,8 +1495,9 @@ string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_typ
 		if (!single_byte_text) {
 			return "nvarchar(max)";
 		}
-		// A single-byte target is only correct with a UTF-8 collation; an empty
-		// one means the database default already is one (Fabric), which is the
+		// A single-byte target with a UTF-8 collation, or a code-page one (the rows
+		// then travel as nvarchar, GenerateColumnMetadata); an empty one means the
+		// database default is UTF-8 already (Fabric), which is the
 		// case that matters most here since Fabric has no nvarchar at all.
 		return varchar_collation.empty() ? "varchar(max)" : "varchar(max) COLLATE " + varchar_collation;
 	}
@@ -1606,8 +1611,8 @@ uint16_t TargetResolver::GetTDSMaxLength(const LogicalType &duckdb_type) {
 	// this path for every column; COPY reaches it when replacing a table.
 	//
 	// Every char type travels as NVARCHAR, so the unit here is UTF-16 BYTES.
-	// MSSQL_VARCHAR(n) counts n bytes of UTF-8 in the target column, and n UTF-8
-	// bytes never hold more than n characters, so 2n is an upper bound on the wire
+	// MSSQL_VARCHAR(n) counts n bytes in the target column, and n bytes of UTF-8 or
+	// of a code page never hold more than n characters, so 2n is an upper bound on the wire
 	// — permissive, never rejecting a value the column would have accepted.
 	codec::TargetStringType target_string;
 	if (codec::TryGetTargetStringType(duckdb_type, target_string)) {

@@ -266,7 +266,9 @@ FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &co
 	case AppendArm::P2StageBinary:
 	case AppendArm::PlpStageBinary:
 	case AppendArm::LobStageBinary:
-		return FinalizeKernel::Binary;
+		// The binary arms carry VARBINARY / IMAGE as well; code_page is set on
+		// single-byte text only, and only when its catalog transcodes.
+		return column.code_page != nullptr ? FinalizeKernel::CodePage : FinalizeKernel::Binary;
 	case AppendArm::P1StageDecimal:
 		return FinalizeKernel::Decimal;
 	case AppendArm::P1StageFixed:
@@ -404,8 +406,7 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 		return ops;
 	}
 	if (column.type_id == tds::TDS_TYPE_TEXT || column.type_id == tds::TDS_TYPE_IMAGE) {
-		// TEXT is single-byte like CHAR/VARCHAR: collation handling lives in the
-		// scan's SELECT list, not here.
+		// TEXT is single-byte like CHAR/VARCHAR: same bytes, same kernels.
 		ops.kind = StagingKind::Var;
 		ops.arm = AppendArm::LobStageBinary;
 		return ops;
@@ -438,9 +439,9 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 		return ops;
 	}
 
-	// Single-byte CHAR/VARCHAR: the wire bytes go into the VARCHAR vector as they
-	// are — collation handling lives in the scan's SELECT list (spec 026), not
-	// here — so this is the same one-allocation-one-copy shape as VARBINARY.
+	// Single-byte CHAR/VARCHAR: staged as they are, back to back with no delimiter,
+	// like VARBINARY. ResolveKernel decides what publishes them: the code-page
+	// kernel (spec 092), or one allocation and one copy of the bytes.
 	const bool single_byte_char = column.type_id == tds::TDS_TYPE_BIGCHAR || column.type_id == tds::TDS_TYPE_BIGVARCHAR;
 	if ((single_byte_char || binary) && column.IsPLPType()) {
 		// VARCHAR(MAX) and VARBINARY(MAX): raw bytes either way, so the same
@@ -493,6 +494,8 @@ const char *FinalizeKernelName(FinalizeKernel kernel) {
 		return "datetime";
 	case FinalizeKernel::Text:
 		return "text";
+	case FinalizeKernel::CodePage:
+		return "code_page";
 	}
 	return "?";
 }

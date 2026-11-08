@@ -710,6 +710,7 @@ def clear_outputs(out, clients, queries):
     """
     for q in queries:
         (out / f"oracle-{q}.csv").unlink(missing_ok=True)
+        (out / f"types-{q}.csv").unlink(missing_ok=True)
         for client in clients:
             (out / f"{client}-{q}.csv").unlink(missing_ok=True)
 
@@ -720,6 +721,12 @@ def write_oracle(cfg, args, data, out, queries):
     for q in queries:
         sql = read_query("duckdb", q, args.sf)
         s.append(f"COPY ({sql}) TO '{out / ('oracle-' + q + '.csv')}' (HEADER false);")
+        # The column TYPES, in order, beside the answers. This is what makes
+        # the comparison type-driven instead of guessing from how a value
+        # happens to print: `DESCRIBE` works as a subquery source, so one extra
+        # statement per query gets them with no second session.
+        s.append(f"COPY (SELECT column_type FROM (DESCRIBE {sql})) "
+                 f"TO '{out / ('types-' + q + '.csv')}' (HEADER false);")
     rc, text = run_cli(binary("A"), "\n".join(s) + "\n", cfg)
     if rc != 0:
         sys.exit(text)
@@ -760,7 +767,8 @@ def print_verdicts(out, clients, queries, sessions):
             # run while every per-query line still read `ok` -- teaching the
             # operator to disregard the exit code, which is the channel a real
             # wrong answer travels (issue #506 item 4).
-            verdict = compare(out / f"oracle-{q}.csv", out / f"{client}-{q}.csv")
+            verdict = compare(out / f"oracle-{q}.csv", out / f"{client}-{q}.csv",
+                              read_types(out / f"types-{q}.csv"))
             if not verdict.startswith("ok"):
                 bad += 1
             print(f"{client:6s} {q} {verdict}")
@@ -811,179 +819,100 @@ def as_float(s):
     return float(s) if FLOATING.fullmatch(s) else None
 
 
-#: The widest decimal scale this harness sees: SQL Server returns TPC-H's
-#: aggregates as decimal(38,6).
-MAX_DECIMAL_SCALE = 6
-def double_form(s):
-    """Is `s` the shortest round-trip form of a DOUBLE?
+#: DuckDB type names whose values can legitimately differ between the two
+#: engines. Everything else -- DECIMAL, the integer family, VARCHAR, DATE,
+#: BOOLEAN -- is exact on both sides and must match.
+#:
+#: An inclusion list, so an unrecognised type defaults to EXACT. A mistake here
+#: therefore makes the gate stricter and loud, not looser and silent, which is
+#: the direction every defect in this comparison has gone the other way.
+INEXACT_TYPES = ("DOUBLE", "FLOAT", "REAL")
+#: Exact columns whose values are NUMBERS, so a client printing the same number
+#: at another scale is not a difference. Everything not here and not inexact is
+#: compared as TEXT.
+NUMERIC_TYPES = ("DECIMAL", "NUMERIC", "TINYINT", "SMALLINT", "INTEGER", "INT",
+                 "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER",
+                 "UBIGINT", "UHUGEINT")
 
-    This replaced a significant-digit count, which was the wrong
-    discriminator and wrong in the dangerous direction (roborev on 423f5db).
-    q01's own `sum_charge` is `decimal(38,6)` and at SF1 prints 18 significant
-    digits -- so a 15-digit ceiling sent an EXACT sum to the tolerance branch,
-    where a dropped `lineitem` passed from SF10 up. Even after the relative
-    term dropped to 1e-13 a one-cent rounding difference still passed there
-    (bound 0.0235 at 2.3e11 against a 0.01 difference).
+#: How a column must be compared.
+TOLERANCE, NUMERIC, TEXT = "tolerance", "numeric", "text"
 
-    A DOUBLE round-trips through repr() unchanged. Some exact decimals do not:
-    a decimal(38,6) padded to its declared scale carries trailing zeros repr()
-    drops (`234603658237.282580` -> `234603658237.2826`), and an integer prints
-    without the `.0` repr() adds.
 
-    But a scale-2 or scale-4 decimal of 15 or fewer significant digits usually
-    DOES round-trip, so this test reads such a pair as two doubles. That is a
-    heuristic rather than evidence, and the KNOWN GAP paragraph in `same()`
-    measures what it costs and says what would replace it.
+def column_kind(type_name):
+    """How must this column be compared: TOLERANCE, NUMERIC or TEXT?
+
+    The ORACLE's type decides, because it is the only evidence of what the
+    values are. Four successive attempts to infer it from how a value PRINTS
+    each had a hole, and the last could not be fixed at all: at an SF1000
+    magnitude one ulp of a double is 0.0078, so a cent of rounding error in an
+    exact decimal is 1.3 ulps -- no relative bound separates them.
+
+    Three kinds rather than two (roborev on 6ea78d9). Comparing every exact
+    column by `Decimal` value loosened the gate for TEXT: `"07"` equalled
+    `"7"`, `"13"` equalled `"13.0"` and `"-0"` equalled `"0"`, so a client that
+    dropped a leading zero from a string key would have read `ok`. Only a
+    NUMERIC column wants value comparison -- that is what lets the server's
+    padded decimal(38,6) match the oracle's decimal(38,2).
+
+    An unknown type is TEXT, the strictest kind: a new column fails loudly
+    rather than quietly taking a tolerance or a looser equality.
     """
-    return repr(float(s)) == s
+    head = type_name.split("(")[0].strip().upper()
+    if head in INEXACT_TYPES:
+        return TOLERANCE
+    return NUMERIC if head in NUMERIC_TYPES else TEXT
 
 
-#: The relative term, sized to what the two engines' DOUBLES can actually
-#: disagree by rather than to a round number.
+def read_types(path):
+    """The oracle's column types, in order, or None when they are absent.
+
+    None is a REFUSAL, not a default: a comparison that cannot tell an exact
+    column from a double is the thing this replaced, so it reports rather than
+    guesses.
+    """
+    if not path.exists():
+        return None
+    with open(path) as fh:
+        types = [row[0] for row in csv.reader(fh) if row]
+    return types or None
+
+
+#: The relative term, for DOUBLE columns only now, sized to what the two
+#: engines' doubles can actually disagree by.
 #:
-#: Every DOUBLE TPC-H produces on either side is an exact decimal sum (or
-#: count) converted and divided ONCE -- `avg(decimal)`, `decimal / decimal`, or
-#: the extension's pushed `CAST(SUM(x) AS float) / COUNT_BIG(x)`. That puts the
-#: two sides within a few ulps, about 1e-15 relative, so 1e-13 leaves ~724 ulps
-#: of margin at an SF1000 magnitude and still accepts every ulp-apart pair the
-#: fixtures generate.
+#: Every DOUBLE TPC-H produces on either side is an exact decimal sum or count
+#: converted and divided ONCE -- `avg(decimal)`, `decimal / decimal`, or the
+#: extension's pushed `CAST(SUM(x) AS float) / COUNT_BIG(x)` -- which puts the
+#: two sides within a few ulps, about 1e-15 relative. 1e-13 leaves ~724 ulps of
+#: margin at an SF1000 magnitude.
 #:
-#: It was 1e-9, which is #506 item 1 at the scale this harness is planned for
-#: (review of #518, VGSML, after the exact_pair fix): `exact_pair`'s
-#: double-form test moves an ambiguous pair onto this branch -- both values
-#: looking like doubles, which an exact decimal(38,2) sum usually does -- and
-#: at 5.7e13 a 1e-9 bound is ~57 000 units, so a dropped `lineitem` row passed.
-#: At 1e-13 the bound is 5.7 units. It is the backstop for every pair the form
-#: test cannot tell apart, which is why it is sized to ulps and not to a round
-#: number.
+#: It is no longer a backstop for pairs a heuristic could not classify, because
+#: there is no heuristic left: an exact column never reaches it.
 REL_TOLERANCE = decimal.Decimal("1e-13")
-#: The absolute floor, which is what accepts a DOUBLE beside a decimal(38,6):
-#: a half digit of the server's scale is 5e-7.
+#: The absolute floor: a half digit of the server's decimal(38,6) is 5e-7.
 ABS_TOLERANCE = decimal.Decimal("1e-6")
 
 
 def tolerance(magnitude):
-    """How far apart two real-valued answers may legitimately be."""
+    """How far apart two DOUBLE answers may legitimately be."""
     return max(ABS_TOLERANCE, REL_TOLERANCE * magnitude)
 
 
-def exact_pair(x, y, dx, dy):
-    """Are these two both printed as an EXACT decimal of ONE scale?
-
-    An equal scale ALONE is not evidence of that, which is the defect roborev
-    found in the first cut of this rule. A DOUBLE in shortest round-trip form
-    parses as a decimal too, and DuckDB returns `avg(decimal)` and
-    `decimal / decimal` as DOUBLE -- q01's avg_qty, avg_price and avg_disc and
-    q08's mkt_share. Meanwhile CLAUDE.md records that the extension's pushed
-    `CAST(SUM(x) AS float) / COUNT_BIG(x)` differs from DuckDB's avg in its
-    last bits BY DESIGN. So two doubles one ulp apart whose shortest forms
-    happen to print at the same scale were being required to be EQUAL.
-
-    Measured over 4000 ulp-apart pairs per magnitude, before this guard:
-
-        q01 avg_qty ~25        1148 of 4000 print at the same scale -- all 1148 rejected
-        q01 avg_price ~38000   1446 -- all rejected
-        q01 avg_disc ~0.05     1233 -- all rejected
-        q08 mkt_share ~0.034   1266 -- all rejected
-        q06 revenue ~1.2e8     2820 -- all rejected
-
-    Every one of those would have been published as a wrong answer for client
-    B on exactly the queries this harness exists to judge.
-
-    Hence two further conditions: the scale must be one a decimal column could
-    actually have, and the pair must not look like two doubles.
-
-    When BOTH sides are a double's shortest form the pair is ambiguous -- it
-    could be two doubles, or two decimals that happen to print that way -- so
-    it takes the tolerance, with the 1e-13 relative term as the backstop. When
-    either side is not, the pair cannot be two doubles and is compared exactly.
-    """
-    exponent = dx.as_tuple().exponent
-    if exponent != dy.as_tuple().exponent:
-        return False
-    if -exponent > MAX_DECIMAL_SCALE:
-        return False
-    return not (double_form(x) and double_form(y))
-
-
 def as_decimal(s):
-    """The value as a Decimal when it is written as a plain decimal, else None.
-
-    The SCALE is the point: `decimal.Decimal` keeps the digits as printed, so
-    `"37734107.00"` and `"37734107.0"` are distinguishable, which is how same()
-    tells an exact-vs-exact comparison from an exact-vs-DOUBLE one.
-    """
+    """The value as a Decimal when it is written as a plain decimal, else None."""
     return decimal.Decimal(s) if DECIMAL.fullmatch(s) else None
 
 
-def same(x, y):
-    """Is the client's value `y` the oracle's `x`?
+def within_tolerance(x, y, dx, dy):
+    """Two DOUBLE values, as close as the two engines may legitimately be.
 
-    Issue #506 items 1 and 2. The first version was
-    `x.strip() == y.strip()` then
-    `abs(fx-fy) <= max(1e-6 * max(|fx|,|fy|), 0.011)`, which failed twice over:
-
-    * The 0.011 ABSOLUTE floor was wider than whole answers. q08's entire
-      result is two rows, mkt_share 0.03443589 and 0.04148552 -- 0.00705
-      apart, inside the floor -- so swapping the two years printed `ok`.
-      q01's avg_disc groups are ~1e-4 apart and so were not checked at all.
-    * The 1e-6 RELATIVE term tolerated off-by-N on counts: q01's count_order
-      is 1,478,493 at SF1, so +-1.48 rows, +-14.8 at SF10, +-148 at SF100 --
-      a row-dropping pushdown bug on exactly the aggregates TPC-H is made of
-      passed the gate.
-    * `.strip()` made CHAR(n) trailing-blank padding invisible, which is the
-      very defect (#405) this harness's headline correctness result is about.
-      It was caught then only because the padding also broke comparisons and
-      changed row counts; a regression that padded only the OUTPUT -- q16
-      groups by p_brand CHAR(10), q12 by l_shipmode CHAR(10) -- would have
-      compared equal on every row.
-
-    So: integers must match EXACTLY, strings must match EXACTLY, and only a
-    real-valued pair gets a tolerance, sized to what the two engines can
-    legitimately disagree by rather than to a round number. The server returns
-    these as decimal(38,6) against the oracle's DOUBLE, a half-digit of 5e-7,
-    and a large sum carries double's own relative error; see `tolerance`,
-    whose terms are 1e-6 absolute and 1e-13 relative, and which still leaves
-    q08's 0.00705 spread four orders of magnitude outside it.
-
-    Narrowing "integer" to "exact decimal" (review of #518 item 2): keying the
-    exact branch on int() let a value with a fractional part fall through to
-    the 1e-9 RELATIVE term even when both engines had printed the same exact
-    decimal. `"37734107.00"` is not an int, and at SF100-1000 magnitudes 1e-9
-    relative is tens to hundreds of units -- `123456789012.34` compared `ok`
-    against `123456789132.34`, which is item 1 of #506 (a dropped row in an
-    aggregate passes) returning at exactly the scale the fix was for.
-
-    What the pair LOOKS like decides which branch applies -- see `exact_pair`,
-    which wants an equal scale, a scale a decimal column could have, and at
-    least one side that is NOT a double's shortest round-trip form. Anything
-    else gets the tolerance.
-
-    KNOWN GAP, and it is why this should become type-driven. The form is a
-    heuristic, not evidence, and it leaks in one direction: an exact
-    decimal(38,2) or decimal(38,4) sum whose printed form happens to round-trip
-    -- any value of 15 or fewer significant digits that does not end in a zero,
-    so 9 cases in 10 -- is read as a pair of doubles and gets the tolerance. At
-    q01's `sum_base_price` magnitude (~5.7e11 at SF10) the bound is then 0.056,
-    so a one-cent discrepancy passes. A dropped row (>= ~900) is still rejected
-    at every scale factor.
-
-    No relative bound can close that: at an SF1000 magnitude one ulp is 0.0078,
-    so a cent is 1.3 ulps -- there is no value that accepts a legitimate
-    last-bit difference between two doubles and rejects a cent of rounding
-    error in an exact decimal. Only the COLUMN TYPE separates them, which means
-    reading the oracle's types (`DESCRIBE` each query, confirmed to work in a
-    subquery) and requiring exact equality for every DECIMAL and integer
-    column. Tracked as its own change; it alters the verify contract and wants
-    a live run, because a DECIMAL column the client returns at a different
-    scale would then have to fall back rather than fail.
+    By `Decimal` where both sides are plain decimals, and by float otherwise --
+    the forms a DOUBLE can print that an exact decimal cannot (`1e-05`). Both
+    paths are deliberately strict about shape: `FLOATING` rejects a leading
+    blank and a digit separator that `float()` would accept, so a formatting
+    difference is still a difference.
     """
-    if x == y:
-        return True
-    dx, dy = as_decimal(x), as_decimal(y)
     if dx is not None and dy is not None:
-        if exact_pair(x, y, dx, dy):
-            return dx == dy
         return abs(dx - dy) <= tolerance(max(abs(dx), abs(dy)))
     fx, fy = as_float(x), as_float(y)
     if fx is None or fy is None:
@@ -991,23 +920,63 @@ def same(x, y):
     return abs(fx - fy) <= float(tolerance(decimal.Decimal(max(abs(fx), abs(fy)))))
 
 
-def rows_equal(ra, rb):
-    return len(ra) == len(rb) and all(same(x, y) for x, y in zip(ra, rb))
+def same(x, y, kind):
+    """Is the client's value `y` the oracle's `x`, for a column of this kind?
+
+    Issue #506 items 1 and 2, and three reviews of #518. The history is worth
+    keeping because every version failed in the same direction -- accepting a
+    wrong answer -- and each fix was narrower than it looked:
+
+    * `x.strip() == y.strip()` then a 0.011 ABSOLUTE floor: wider than whole
+      answers. q08's entire result is two rows 0.00705 apart, so swapping the
+      two years printed `ok`. `.strip()` also hid CHAR(n) padding, which is the
+      #405 class this harness exists to catch.
+    * a 1e-6 RELATIVE term: tolerated off-by-N on counts. q01's count_order is
+      1,478,493 at SF1, so +-1.48 rows and +-148 at SF100 -- a row-dropping
+      pushdown bug on exactly the aggregates TPC-H is made of passed.
+    * exact when the two PRINTED SCALES agree: a DOUBLE in shortest
+      round-trip form parses as a decimal too, and DuckDB returns
+      `avg(decimal)` and `decimal / decimal` as DOUBLE, so ulp-apart pairs of
+      q01's avg_qty and q08's mkt_share became wrong answers -- 1148 of 4000
+      at one magnitude.
+    * ... and exact only below 15 significant digits: q01's own
+      `decimal(38,6)` sum_charge prints 18 at SF1, so an EXACT sum took the
+      tolerance branch where a dropped row passed from SF10 up.
+    * ... and exact unless both sides round-trip through `repr()`: a scale-2 or
+      scale-4 decimal of 16 or fewer digits usually does, so a one-cent
+      difference in q01's sum_base_price passed at SF10.
+
+    So the form of a value is not evidence of its type, and the last of those
+    cannot be fixed by tightening: at 5.7e13 one ulp is 0.0078, making a cent
+    1.3 ulps. The oracle's column TYPE is asked instead, and `kind` is its
+    answer -- no inference, no magnitudes, no digit counts.
+
+    A NUMERIC column is compared by VALUE, so a padded `decimal(38,6)` equals
+    the oracle's `decimal(38,2)` (`Decimal("1.50") == Decimal("1.5")`) while a
+    cent of difference does not. A TEXT column gets only the identity check
+    above, so CHAR(n) padding -- and a dropped leading zero -- is a mismatch.
+    """
+    if x == y:
+        return True
+    if kind == TEXT:
+        return False
+    dx, dy = as_decimal(x), as_decimal(y)
+    if kind == NUMERIC:
+        return dx is not None and dy is not None and dx == dy
+    return within_tolerance(x, y, dx, dy)
 
 
-def compare(oracle, got):
-    if not got.exists():
-        return "MISSING (the query failed; see the client log)"
-    a = list(csv.reader(open(oracle)))
-    b = list(csv.reader(open(got)))
-    if len(a) != len(b):
-        return f"ROWS {len(b)} != {len(a)}"
-    if all(rows_equal(ra, rb) for ra, rb in zip(a, b)):
-        return "ok"
+def rows_equal(ra, rb, kinds):
+    """`kinds` is the per-column answer from the oracle's types."""
+    return len(ra) == len(rb) and all(same(x, y, k) for x, y, k in zip(ra, rb, kinds))
+
+
+def difference_verdict(a, b, kinds):
+    """What to call two results that did not compare equal."""
     # Same rows, different order. The old wording was "row order of ties
     # differs", which it has no evidence for: an inverted ORDER BY with no ties
     # at all reaches here too. Say what is actually established.
-    if all(rows_equal(ra, rb) for ra, rb in zip(sorted(a), sorted(b))):
+    if all(rows_equal(ra, rb, kinds) for ra, rb in zip(sorted(a), sorted(b))):
         return "ok (same rows, different order)"
     # Name trailing-blank padding specifically, since it is the #405 class and
     # an exact comparison is the only thing that can see it.
@@ -1015,9 +984,53 @@ def compare(oracle, got):
            for ra, rb in zip(a, b)):
         return "PADDING (values differ only in surrounding blanks -- the #405 class)"
     for i, (ra, rb) in enumerate(zip(a, b)):
-        if not rows_equal(ra, rb):
+        if not rows_equal(ra, rb, kinds):
             return f"DIFF at row {i + 1}: {rb[:6]} vs {ra[:6]}"
     return "DIFF"
+
+
+def types_refusal(types, rows):
+    """Why these types cannot be used, or "" when they can.
+
+    A refusal rather than a default: a comparison that cannot tell an exact
+    column from a double is what this replaced.
+
+    The width is only checked when the rows HAVE a width. `csv.reader` reads
+    the blank line COPY writes for a single-column NULL as `[]`, so a result
+    like q17's NULL `avg_yearly` at a small scale factor measured 0 columns and
+    was refused as "the oracle's types do not fit its rows" -- blaming the
+    oracle for a correct answer, and masking a client that returned a number
+    where the oracle had NULL behind the same misleading verdict (review of
+    #537 by VGSML, reproduced at SF 0.01).
+    """
+    if types is None:
+        return "NO TYPES (the oracle did not emit them; cannot compare)"
+    width = max((len(r) for r in rows), default=0)
+    if width and len(types) != width:
+        return f"TYPES {len(types)} for {width} column(s) (the oracle's types do not fit its rows)"
+    return ""
+
+
+def compare(oracle, got, types=None):
+    """The verdict for one query. `types` is the oracle's column types.
+
+    Without them nothing is compared: a comparison that cannot tell an exact
+    column from a double is what this replaced, so a missing types file is
+    reported rather than guessed around.
+    """
+    if not got.exists():
+        return "MISSING (the query failed; see the client log)"
+    a = list(csv.reader(open(oracle)))
+    b = list(csv.reader(open(got)))
+    if len(a) != len(b):
+        return f"ROWS {len(b)} != {len(a)}"
+    refusal = types_refusal(types, a)
+    if refusal:
+        return refusal
+    kinds = [column_kind(t) for t in types]
+    if all(rows_equal(ra, rb, kinds) for ra, rb in zip(a, b)):
+        return "ok"
+    return difference_verdict(a, b, kinds)
 
 
 # --------------------------------------------------------------------------- selftest
@@ -1028,97 +1041,152 @@ def compare(oracle, got):
 # were all of one kind -- the harness reporting a verdict it had not earned --
 # and that kind is invisible until something checks the judge.
 
-#: (label, oracle value, client value, must same() accept it)
+#: (label, the oracle's column type, oracle value, client value, accepted?)
+#
+# Every fixture is a case this harness decided WRONGLY, and the TYPE column is
+# the point: the same two strings must be judged differently depending on what
+# the oracle says the column is. That is the whole change -- `234603658237.28`
+# against `...29` is a wrong answer in a DECIMAL column and noise in a DOUBLE.
 SAME_TESTS = [
-    # Review of #518 item 2: the exact branch used to key on int(), so a value
-    # with a fractional part fell through to 1e-9 RELATIVE. VGSML's own case.
-    ("two exact decimals of one scale, 120 apart", "123456789012.34", "123456789132.34", False),
-    ("the same exact decimal", "37734107.00", "37734107.00", True),
-    ("an exact decimal one unit out at SF1000 magnitude", "123456789012.34", "123456789013.34", False),
-    ("an exact decimal one hundredth out", "37734107.00", "37734107.01", False),
-    # Different scales ARE the DOUBLE-vs-decimal(38,6) case the tolerance exists
-    # for, and must still pass.
-    ("DOUBLE beside decimal(38,6), same value", "0.05", "0.050000", True),
-    ("DOUBLE beside decimal(38,6), within a half digit", "1.0000001", "1.000000", True),
-    ("DOUBLE beside decimal(38,6), plainly different", "0.05", "0.060000", False),
-    # Issue #506 item 2: 1e-6 relative tolerated off-by-N on counts.
-    ("a count one row short", "1478493", "1478492", False),
-    ("the same count", "1478493", "1478493", True),
-    # Issue #506 item 1: the 0.011 ABSOLUTE floor was wider than q08's answer.
-    ("q08's two mkt_share values", "0.03443589", "0.04148552", False),
-    # Issue #405: .strip() hid CHAR(n) padding, the defect this harness is about.
-    ("a CHAR(10) value padded", "MACHINERY", "MACHINERY ", False),
-    ("a CHAR(10) value padded on the left", "MACHINERY", " MACHINERY", False),
-    ("the same string", "MACHINERY", "MACHINERY", True),
-    # Review of #518 nit 7: int() accepts both of these.
-    ("a count with a leading blank", "13", " 13", False),
-    ("a count written with an underscore", "1000", "1_000", False),
-    # DOUBLE against DOUBLE. The gap that let the first cut of the exact rule
-    # through: these parse as decimals and print at the SAME scale, so nothing
-    # in the fixture set distinguished them from two decimal(38,6) values, and
-    # every ulp-apart pair became a reported wrong answer. DuckDB returns
-    # avg(decimal) and decimal/decimal as DOUBLE, so these ARE q01's and q08's
-    # columns -- the queries the harness exists to judge.
-    ("two DOUBLEs one ulp apart, same printed scale (q01 avg_qty)",
-     "25.522005853257337", "25.522005853257333", True),
-    ("two DOUBLEs one ulp apart (q08 mkt_share)",
-     "0.034435890263343130", "0.034435890263343136", True),
-    # Genuinely ADJACENT doubles printed at the same scale. The first version
-    # of this fixture paired "123141078.2283" with "123141078.22830002", whose
-    # scales differ (4 vs 8), so it took the tolerance at exact_pair's first
-    # check and never reached the guards it was meant to exercise (roborev on
-    # 423f5db).
-    ("two adjacent DOUBLEs, same scale (q06 revenue magnitude)",
-     "123141078.22830002", "123141078.22830003", True),
-    # Scale <= 6 AND more than 15 significant digits: the shape a digit-count
-    # guard claimed to cover. These are genuinely adjacent doubles.
-    ("adjacent DOUBLEs at scale 4 with 17 digits",
-     "1234500000000.0002", "1234500000000.0005", True),
-    ("adjacent DOUBLEs at scale 2 with 16 digits",
-     "56000000000000.02", "56000000000000.03", True),
-    # ... and the EXACT decimal of the same shape must still be compared
-    # exactly. q01's sum_charge is decimal(38,6) and prints 18 significant
-    # digits at SF1, so the old 15-digit ceiling sent it to the tolerance
-    # branch, where a dropped lineitem passed from SF10 up and -- even after
-    # the relative term dropped to 1e-13 -- a one-cent rounding difference
-    # still passed (bound 0.0235 against a 0.01 difference).
-    ("q01's decimal(38,6) sum_charge, ONE CENT apart",
+    # ---- DECIMAL and integer columns: exact, at every magnitude -------------
+    # #506 item 1 and the review of #518. A one-cent difference in an exact sum
+    # is a wrong answer whether the value is 11 digits or 18, and whether or
+    # not it happens to round-trip through repr() -- the two properties three
+    # earlier versions of this rule keyed on.
+    ("a decimal sum one cent apart", "DECIMAL(38,2)",
+     "566012345678.34", "566012345678.35", False),
+    ("an 18-digit decimal(38,6) sum one cent apart", "DECIMAL(38,6)",
      "234603658237.282580", "234603658237.292580", False),
-    # ... and the guard must not swallow a real difference at double precision.
-    ("two DOUBLEs a whole percent apart", "25.522005853257337", "25.777005853257337", False),
-    # Why the relative term is 1e-13 rather than 1e-9 (review of #518 by
-    # VGSML). An exact sum this large looks like a double to `exact_pair`, so
-    # it lands on the tolerance branch -- where a 1e-9 bound at 5.7e13 is
-    # ~57 000 units and a dropped `lineitem` row passed. These are SF1000-sized
-    # `sum_base_price` values.
-    ("an SF1000-sized sum 10 000 apart", "56586554400730.17", "56586554410730.17", False),
-    ("an SF1000-sized sum 100 apart", "56586554400730.17", "56586554400830.17", False),
-    ("an SF100-sized sum 100 apart", "5658655440073.17", "5658655440173.17", False),
-    # Same magnitude, one ulp apart: must still be accepted, so the tightening
-    # did not simply trade one false verdict for the other.
-    ("two SF1000-sized DOUBLEs one ulp apart",
+    ("an SF1000-sized decimal sum one cent apart", "DECIMAL(38,2)",
+     "56586554400730.17", "56586554400730.18", False),
+    ("an SF1000-sized decimal sum 10 000 apart", "DECIMAL(38,2)",
+     "56586554400730.17", "56586554410730.17", False),
+    ("a decimal sum a thousandth apart", "DECIMAL(38,4)",
+     "540012345678.1234", "540012345678.1235", False),
+    ("the same decimal", "DECIMAL(38,2)", "37734107.00", "37734107.00", True),
+    # Compared BY VALUE, so the client padding to a wider scale is not a
+    # difference. This is what VGSML pointed out makes a scale fallback
+    # unnecessary: Decimal("1.50") == Decimal("1.5").
+    ("a decimal the client padded to a wider scale", "DECIMAL(38,2)",
+     "234603658237.28", "234603658237.280000", True),
+    ("a decimal the client printed with fewer decimals", "DECIMAL(38,6)",
+     "1.500000", "1.5", True),
+    # #506 item 2: a 1e-6 relative term tolerated off-by-N on counts.
+    ("a count one row short", "BIGINT", "1478493", "1478492", False),
+    ("the same count", "BIGINT", "1478493", "1478493", True),
+    ("a count the client padded", "BIGINT", "1478493", "1478493.0", True),
+    # ---- DOUBLE columns: the tolerance, and only here -----------------------
+    # DuckDB returns avg(decimal) and decimal/decimal as DOUBLE -- q01's
+    # avg_qty / avg_price / avg_disc and q08's mkt_share -- and CLAUDE.md
+    # records that the extension's pushed CAST(SUM(x) AS float) / COUNT_BIG(x)
+    # differs in its last bits BY DESIGN.
+    ("two DOUBLEs one ulp apart (q01 avg_qty)", "DOUBLE",
+     "25.522005853257337", "25.522005853257333", True),
+    ("two DOUBLEs one ulp apart (q08 mkt_share)", "DOUBLE",
+     "0.034435890263343130", "0.034435890263343136", True),
+    ("adjacent DOUBLEs at an SF1000 magnitude", "DOUBLE",
      "56586554400730.17", "56586554400730.18", True),
-    # Different scales, 120 apart: the tolerance branch by scale rather than by
-    # digits, and it must reject too.
-    ("a decimal beside a wider-scale decimal, 120 apart",
-     "123456789012.34", "123456789132.340000", False),
-    # Seven decimals is past decimal(38,6), so the pair cannot be two exact
-    # decimals of one declared scale -- tolerance, not equality.
-    ("a scale wider than decimal(38,6) takes the tolerance",
-     "1.00000005", "1.00000004", True),
-    # Not exact decimals: these fall to the float path rather than crashing.
-    ("scientific notation, equal", "1e3", "1000.0", True),
-    ("a NULL against an empty string", "", "", True),
-    ("text against a number", "MACHINERY", "17", False),
+    ("a DOUBLE beside the server's decimal(38,6)", "DOUBLE", "0.05", "0.050000", True),
+    ("a DOUBLE within a half digit", "DOUBLE", "1.0000001", "1.000000", True),
+    # ... but the tolerance is not a licence: q08's whole result is two rows
+    # 0.00705 apart, which the old 0.011 ABSOLUTE floor swallowed.
+    ("q08's two mkt_share values", "DOUBLE", "0.03443589", "0.04148552", False),
+    ("two DOUBLEs a whole percent apart", "DOUBLE",
+     "25.522005853257337", "25.777005853257337", False),
+    ("a DOUBLE sum 10 000 apart at an SF1000 magnitude", "DOUBLE",
+     "56586554400730.17", "56586554410730.17", False),
+    # ---- strings and the rest: exact, so #405 padding is a mismatch ---------
+    ("a CHAR(10) value padded on the right", "VARCHAR",
+     "MACHINERY", "MACHINERY ", False),
+    ("a CHAR(10) value padded on the left", "VARCHAR",
+     "MACHINERY", " MACHINERY", False),
+    ("the same string", "VARCHAR", "MACHINERY", "MACHINERY", True),
+    ("a date one day out", "DATE", "1995-03-15", "1995-03-16", False),
+    ("the same date", "DATE", "1995-03-15", "1995-03-15", True),
+    ("an empty value against an empty value", "VARCHAR", "", "", True),
+    ("text against a number", "VARCHAR", "MACHINERY", "17", False),
+    # A TEXT column is identity only. Comparing every exact column by Decimal
+    # value made all four of these equal, so a client that dropped a leading
+    # zero from a string key read `ok` (roborev on 6ea78d9).
+    ("a VARCHAR with a leading zero dropped", "VARCHAR", "07", "7", False),
+    ("a VARCHAR printed as a number", "VARCHAR", "13", "13.0", False),
+    ("a VARCHAR signed zero", "VARCHAR", "-0", "0", False),
+    ("a VARCHAR trailing zero", "VARCHAR", "1.50", "1.5", False),
+    # ... while the same four in a NUMERIC column ARE the same number.
+    ("the same number written with a leading zero", "BIGINT", "07", "7", True),
+    ("the same number at another scale", "DECIMAL(38,2)", "1.50", "1.5", True),
+    # Restored: the type rewrite dropped these three and took the coverage of
+    # DECIMAL's strictness, FLOATING's shape and the as_float path with them.
+    # VGSML mutated the code three ways and the self-test stayed green --
+    # removing the as_float branch, loosening DECIMAL to accept blanks and
+    # digit separators, and setting FLOATING to `.*` (review of #537).
+    #
+    # int() accepts both of these, which is why as_int was replaced by a
+    # regex with no strip in the first place.
+    ("a NUMERIC value with a leading blank", "BIGINT", "13", " 13", False),
+    ("a NUMERIC value written with a digit separator", "BIGINT", "1000", "1_000", False),
+    ("a NUMERIC value with a trailing blank", "DECIMAL(38,2)", "13.00", "13.00 ", False),
+    # The as_float path: the forms a DOUBLE can print that an exact decimal
+    # cannot. Only a DOUBLE column reaches it.
+    ("a DOUBLE in scientific notation, equal", "DOUBLE", "1e3", "1000.0", True),
+    ("a DOUBLE in scientific notation, small", "DOUBLE", "1e-05", "0.00001", True),
+    ("a DOUBLE in scientific notation, different", "DOUBLE", "1e3", "2000.0", False),
+    # FLOATING's own fixture: a leading blank is a formatting difference the
+    # gate must see, even in a DOUBLE column. float() would strip it, so this
+    # is what fails when FLOATING is loosened to `.*` -- the third mutation in
+    # the review of #537, which nothing else caught.
+    ("a DOUBLE value with a leading blank", "DOUBLE", "1000.0", " 1000.0", False),
+    ("a DOUBLE with a digit separator", "DOUBLE", "1000.0", "1_000.0", False),
+    # An unrecognised type defaults to EXACT, so a new column kind fails loudly
+    # rather than quietly taking a tolerance.
+    ("an unknown type is treated as exact", "SOME_NEW_TYPE", "1.00", "1.01", False),
 ]
 
-#: (label, oracle rows, client rows, expected verdict prefix)
+#: (the type name, its kind)
+TYPE_TESTS = [
+    # Compared by VALUE, so a client printing the same number at another scale
+    # matches.
+    ("DECIMAL(38,6)", NUMERIC), ("DECIMAL(18,2)", NUMERIC), ("decimal(38,2)", NUMERIC),
+    ("NUMERIC(10,2)", NUMERIC), ("BIGINT", NUMERIC), ("INTEGER", NUMERIC),
+    ("HUGEINT", NUMERIC), ("UBIGINT", NUMERIC), ("TINYINT", NUMERIC),
+    # Identity only, so a dropped leading zero or CHAR(n) padding is a
+    # mismatch.
+    ("VARCHAR", TEXT), ("DATE", TEXT), ("BOOLEAN", TEXT), ("TIMESTAMP", TEXT),
+    ("INTERVAL", TEXT), ("BLOB", TEXT),
+    # The only kind that may differ at all.
+    ("DOUBLE", TOLERANCE), ("FLOAT", TOLERANCE), ("REAL", TOLERANCE),
+    ("double", TOLERANCE),
+    # An unknown type gets the STRICTEST kind, not a tolerance.
+    ("SOME_NEW_TYPE", TEXT),
+]
+
+#: (label, column types, oracle rows, client rows, expected verdict prefix)
 COMPARE_TESTS = [
-    ("identical", [["a", "1"]], [["a", "1"]], "ok"),
-    ("reordered rows", [["a", "1"], ["b", "2"]], [["b", "2"], ["a", "1"]], "ok (same rows"),
-    ("a dropped row", [["a", "1"], ["b", "2"]], [["a", "1"]], "ROWS"),
-    ("trailing-blank padding", [["MACHINERY", "1"]], [["MACHINERY ", "1"]], "PADDING"),
-    ("a wrong value", [["a", "1"]], [["a", "2"]], "DIFF"),
+    ("identical", ["VARCHAR", "BIGINT"], [["a", "1"]], [["a", "1"]], "ok"),
+    ("reordered rows", ["VARCHAR", "BIGINT"],
+     [["a", "1"], ["b", "2"]], [["b", "2"], ["a", "1"]], "ok (same rows"),
+    ("a dropped row", ["VARCHAR", "BIGINT"],
+     [["a", "1"], ["b", "2"]], [["a", "1"]], "ROWS"),
+    ("trailing-blank padding", ["VARCHAR", "BIGINT"],
+     [["MACHINERY", "1"]], [["MACHINERY ", "1"]], "PADDING"),
+    ("a wrong value", ["VARCHAR", "BIGINT"], [["a", "1"]], [["a", "2"]], "DIFF"),
+    # The types reach the whole-result level too: one cent in a DECIMAL column
+    # is a DIFF, and the same cent in a DOUBLE column is ok.
+    ("one cent in a DECIMAL column", ["DECIMAL(38,2)"],
+     [["566012345678.34"]], [["566012345678.35"]], "DIFF"),
+    ("the same cent in a DOUBLE column", ["DOUBLE"],
+     [["566012345678.34"]], [["566012345678.35"]], "ok"),
+    # And the refusals, which must never read as a pass.
+    ("no types at all", None, [["a", "1"]], [["a", "1"]], "NO TYPES"),
+    ("too few types for the rows", ["VARCHAR"], [["a", "1"]], [["a", "1"]], "TYPES 1 for 2"),
+    # A single-column NULL: COPY writes a blank line and csv.reader reads it as
+    # [], so the rows measure 0 columns. The width check must not fire, or a
+    # correct answer is refused as the oracle's fault -- q17's avg_yearly at a
+    # small scale factor (review of #537).
+    ("a one-column NULL on both sides", ["DOUBLE"], [[]], [[]], "ok"),
+    ("a one-column NULL the client filled in", ["DOUBLE"], [[]], [["5"]], "DIFF"),
+    ("a NULL among several columns", ["VARCHAR", "DOUBLE"],
+     [["a", ""]], [["a", ""]], "ok"),
 ]
 
 #: (label, session text, expected per-query result)
@@ -1148,27 +1216,70 @@ def _check(label, ok, detail, width=62):
 
 
 def _check_same():
-    print("same() -- what counts as the oracle's answer:")
+    print("same() -- the oracle's TYPE decides, not the value's shape:")
     failures = 0
-    for label, x, y, want in SAME_TESTS:
-        got = same(x, y)
-        failures += _check(label, got == want, "accepted" if got else "rejected")
+    for label, type_name, x, y, want in SAME_TESTS:
+        got = same(x, y, column_kind(type_name))
+        failures += _check("%s [%s]" % (label, type_name), got == want,
+                           "accepted" if got else "rejected", width=72)
+    return failures
+
+
+def _check_types():
+    print("\ncolumn_kind() -- how each column must be compared:")
+    failures = 0
+    for type_name, want in TYPE_TESTS:
+        got = column_kind(type_name)
+        failures += _check("%-18s -> %s" % (type_name, want), got == want, got)
+    return failures
+
+
+def _check_same_pair_both_ways():
+    """The same two strings, judged differently by type. The whole point.
+
+    If this ever passes with one verdict for both, the comparison has stopped
+    being type-driven and is inferring from the values again.
+    """
+    print("\none pair, two verdicts, decided only by the column type:")
+    failures = 0
+    for x, y, label in (("56586554400730.17", "56586554400730.18", "an SF1000 sum one cent apart"),
+                        ("234603658237.28", "234603658237.29", "a mid-size sum one cent apart")):
+        as_dec = same(x, y, NUMERIC)
+        as_dbl = same(x, y, TOLERANCE)
+        failures += _check("%s: DECIMAL rejects, DOUBLE accepts" % label,
+                           as_dec is False and as_dbl is True,
+                           "DECIMAL=%s DOUBLE=%s" % (as_dec, as_dbl), width=72)
     return failures
 
 
 def _check_compare(tmp):
     print("\ncompare() -- the verdict for a whole result:")
     failures = 0
-    for i, (label, a, b, want) in enumerate(COMPARE_TESTS):
+    for i, (label, types, a, b, want) in enumerate(COMPARE_TESTS):
         oracle, got_path = tmp / f"o{i}.csv", tmp / f"g{i}.csv"
         for path, rows in ((oracle, a), (got_path, b)):
             with open(path, "w", newline="") as f:
                 csv.writer(f).writerows(rows)
-        verdict = compare(oracle, got_path)
+        verdict = compare(oracle, got_path, types)
         failures += _check(label, verdict.startswith(want), verdict[:48])
     # A client whose query failed at BIND writes no file at all.
     failures += _check("a missing client file is MISSING, never ok",
-                       compare(tmp / "o0.csv", tmp / "absent.csv").startswith("MISSING"), "MISSING")
+                       compare(tmp / "o0.csv", tmp / "absent.csv", ["VARCHAR", "BIGINT"])
+                       .startswith("MISSING"), "MISSING")
+
+    # read_types(): the file the oracle writes, and its absence.
+    types_path = tmp / "types-q01.csv"
+    with open(types_path, "w", newline="") as f:
+        csv.writer(f).writerows([["DECIMAL(38,2)"], ["DOUBLE"], ["VARCHAR"]])
+    failures += _check("read_types() reads the oracle's file in order",
+                       read_types(types_path) == ["DECIMAL(38,2)", "DOUBLE", "VARCHAR"],
+                       str(read_types(types_path)))
+    failures += _check("a missing types file is None, so compare() refuses",
+                       read_types(tmp / "types-absent.csv") is None, "None")
+    with open(types_path, "w") as f:
+        f.write("")
+    failures += _check("an empty types file is None too",
+                       read_types(types_path) is None, "None")
     return failures
 
 
@@ -1346,6 +1457,8 @@ def _check_extracted():
 
 def cmd_selftest(args):
     failures = _check_same()
+    failures += _check_types()
+    failures += _check_same_pair_both_ways()
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         failures += _check_compare(tmp)

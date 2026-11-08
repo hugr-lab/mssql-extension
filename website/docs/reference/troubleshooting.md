@@ -149,128 +149,56 @@ types, so the same query runs there. Tracked as
 
 ### VARCHAR Encoding
 
-VARCHAR and CHAR columns with non-UTF8 collations (e.g., `Latin1_General_CI_AS`) are automatically converted to NVARCHAR in generated queries to ensure proper UTF-8 decoding in DuckDB. This allows extended ASCII characters (é, ñ, ü, etc.) to be correctly returned.
+A `CHAR` or `VARCHAR` column under a code-page collation (e.g. `Latin1_General_CI_AS`) holds bytes in that code page, while DuckDB `VARCHAR` is UTF-8. How it reaches DuckDB depends on the page:
 
-**Behavior:**
+| Column, read through the catalog | Sent as | Converted by |
+|---|---|---|
+| `CHAR`, `VARCHAR`, `VARCHAR(MAX)` on a single-byte page (1250-1258, 874, 437, 850) | itself: one byte a character | the client |
+| The same on a double-byte page (932, 936, 949, 950) | `NVARCHAR(n)`, `NCHAR(n)`, or `NVARCHAR(MAX)` past 4000 | the server |
+| `TEXT`, any page | `NVARCHAR(MAX)` | the server |
+| A collation with a UTF-8 code page (`..._UTF8`) | itself | nothing: it is UTF-8 |
 
-| VARCHAR Length | Converted To | Notes |
-|----------------|--------------|-------|
-| VARCHAR(n) where n ≤ 4000 | NVARCHAR(n) | Full data preserved |
-| VARCHAR(n) where n > 4000 | NVARCHAR(MAX) | Full data preserved. NVARCHAR has no inline length above 4000 characters, so these columns are sent as PLP. |
-| CHAR(n) where n ≤ 4000 | NCHAR(n) | Full data preserved, read without its blank padding (as SQL Server compares it); also a UTF-8 `CHAR(n)` on a connection without UTF8SUPPORT (issue #405) |
-| CHAR(n) where n > 4000 | `RTRIM(… NVARCHAR(MAX))` | Full data preserved, without its padding |
-| TEXT | NVARCHAR(MAX) | Full data preserved. Always converted — TEXT has no decodable unconverted wire form, so `mssql_convert_varchar_max` does not apply to it. |
-| VARCHAR(MAX) | NVARCHAR(MAX) | Converted by default; disable with `mssql_convert_varchar_max = false` |
+The client reads a byte exactly as the server's `CAST` would: the tables come from a SQL Server, and include the bytes a code page leaves undefined. A `CHAR(n)` arrives without its padding either way.
 
-`mssql_convert_varchar_max` governs *declared* `VARCHAR(MAX)` columns only. A `VARCHAR(4001..8000)` is converted to `NVARCHAR(MAX)` regardless of the setting, because no shorter NVARCHAR can hold it.
-
-> **Note**: Previously, `VARCHAR(n > 4000)` was converted to `NVARCHAR(4000)` and `TEXT` to `NVARCHAR(16)`, both of which silently truncated the value on read. Both now convert to `NVARCHAR(MAX)` and return the full value.
-
-**VARCHAR Encoding Setting:**
+**Settings:**
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `mssql_convert_varchar_max` | BOOLEAN | true | Convert VARCHAR(MAX) to NVARCHAR(MAX) in catalog queries |
+| `mssql_client_transcode` | BOOLEAN | true | Read code-page text as bytes and convert it on the client; read at ATTACH. `false` makes the server convert every column, and leaves a raw `mssql_scan` with the column's bytes (below) |
+| `mssql_convert_varchar_max` | BOOLEAN | true | Convert a declared `VARCHAR(MAX)` on the server, where the server converts. `false` on a double-byte page drops that cast, and the client converts the column. No effect on a single-byte page, read as itself either way |
 
+`ATTACH ... (TYPE mssql, client_transcode false)` sets it for one catalog.
 
-To preserve the full buffer capacity at the cost of potential encoding errors with extended ASCII:
+### When code-page bytes reach you unconverted
 
-```sql
-SET mssql_convert_varchar_max = false;
-```
+A raw `mssql_scan()` returns correct UTF-8 for every code page, and a catalog read for every column. Two cases hand a `CHAR` / `VARCHAR` / `TEXT` column's bytes over as they are:
 
-**Notes:**
+- **`client_transcode` is off** for the catalog (`mssql_client_transcode = false`, or the ATTACH option), on a raw `mssql_scan()`, or on a catalog read of a declared `VARCHAR(MAX)` with `mssql_convert_varchar_max = false`;
+- **the collation is newer than this build's tables**, on a raw `mssql_scan()`.
 
-1. **Catalog queries only**: This conversion applies only to catalog-based queries (three-part naming like `db.schema.table`). When using `mssql_scan()` with raw SQL, you must add the CAST yourself — see [Raw `mssql_scan()` does not transcode code pages](#raw-mssql_scan-does-not-transcode-code-pages) below for what happens if you do not.
-
-```sql
--- No CAST: the raw code-page bytes are returned as-is. For a non-UTF8
--- collation that is NOT valid UTF-8, and string functions will mangle it.
-FROM mssql_scan('db', 'SELECT name FROM dbo.customers');
-
--- With CAST: SQL Server transcodes to UTF-16 and the extension decodes it.
-FROM mssql_scan('db', 'SELECT CAST(name AS NVARCHAR(MAX)) AS name FROM dbo.customers');
-```
-
-### Raw `mssql_scan()` does not transcode code pages
-
-**Symptom.** A string read through `mssql_scan()` looks right in the output but
-behaves as if it were truncated. The classic shape is a string function
-returning less than it was given:
+**Symptom.** A string looks right in the output but behaves as if it were truncated:
 
 ```sql
 SELECT upper(name) FROM mssql_scan('db', 'SELECT name FROM dbo.t');
 -- 'naïve' comes back as 'NA'
 ```
 
-**Cause.** SQL Server's `CHAR` / `VARCHAR` / `TEXT` carry bytes in the
-**column's own code page** — `Latin1_General_CI_AS` is CP1252, `Cyrillic_General_CI_AS`
-is CP1251, and so on. DuckDB `VARCHAR` is UTF-8 by contract. The extension does
-not transcode legacy code pages: it hands those bytes to DuckDB unchanged, and
-for anything outside ASCII the result is not valid UTF-8. It is not rejected —
-it is stored, displayed, and then mangled by whatever touches it. `ï` in CP1252
-is the single byte `0xEF`, which UTF-8 reads as the start of a three-byte
-sequence, so `upper()` consumes the two bytes after it and returns `NA`.
+**Cause.** `ï` in CP1252 is the single byte `0xEF`, which UTF-8 reads as the start of a three-byte sequence, so `upper()` consumes the two bytes after it. DuckDB `VARCHAR` is UTF-8 by contract, and these values are not validated on the way in: that would cost every scan a second pass over bytes it has already copied.
 
-The transcoding SQL Server *will* do for you is a `CAST` to a Unicode type, and
-that is what the fix is.
+Both cases log one `WARNING` per column per query into `duckdb_logs` (`mssql_warn_non_utf8_collation` turns it off).
 
-**Fix — one of:**
+**Fix.** Attach with `client_transcode true`, the default. Or `CAST` in the query, to `NVARCHAR(MAX)` and not `NVARCHAR(n)`: SQL Server does not raise on a narrowing character `CAST`, so a fixed width silently truncates:
 
 ```sql
--- 1. CAST in the query. NVARCHAR(MAX), not NVARCHAR(n): SQL Server does not
---    raise on a narrowing character CAST, so a fixed width silently truncates.
 SELECT * FROM mssql_scan('db',
     'SELECT id, CAST(name AS NVARCHAR(MAX)) AS name FROM dbo.customers');
-
--- 2. Read through the attached catalog instead, which adds that CAST for you.
-SELECT id, name FROM db.dbo.customers;
 ```
 
-**When this cannot happen:**
+**To get the stored bytes on purpose,** `CAST(name AS VARBINARY(MAX))` in the T-SQL, on any setting.
 
-- **Catalog scans** (three-part names, and therefore `COPY`/`CREATE TABLE AS`
-  reading from them) — the generated `SELECT` casts every non-Unicode string
-  column server-side. The one exception is a declared `VARCHAR(MAX)` when
-  `mssql_convert_varchar_max = false`, which opts out of that cast on purpose.
-- **`NCHAR` / `NVARCHAR` / `NTEXT` / `XML`** — always UTF-16 on the wire,
-  always decoded.
-- **UTF-8 collations** (`..._UTF8`, SQL Server 2019 and later). Those columns
-  are already UTF-8, so the bytes are correct with or without a cast. Note that
-  the *default* collation of a SQL Server installation is not one of these —
-  `SQL_Latin1_General_CP1_CI_AS` is CP1252 — so a `varchar` column is in a
-  legacy code page unless somebody chose otherwise.
-- **ASCII-only data**, in any code page: every byte is already valid UTF-8.
+### A warning that a column "is in the catalog under collation"
 
-### Why this is not validated for you
-
-Tracked as [issue #224](https://github.com/hugr-lab/mssql-extension/issues/224),
-and deliberately answered with documentation rather than a runtime check.
-
-The obvious fix is to validate every value as it is decoded and raise on the
-first one that is not UTF-8. It was considered and rejected, because of where
-that check would have to live.
-
-**The string codec is built to avoid exactly that call.** Its ASCII fast path
-exists for one reason, recorded next to it in `codec/string_codec.hpp`: measured
-on 12-byte values, *a simdutf call costs ~3.1 ns of pure overhead* against *~3 ns
-of actual byte work* — the call is as expensive as the transcoding it performs.
-Adding validation to the read path puts one back, per value, and as a **second
-pass over bytes the decoder has already copied**. That is a real cost on every
-scan, paid in full by the UTF-8 and `NVARCHAR` columns that cannot be affected by
-this in the first place.
-
-**And it would be paid on the wrong path.** The catalog scan — three-part names,
-and the `COPY` / `CREATE TABLE AS` built on them — is the path that carries
-volume, and it is already safe here: it casts non-Unicode string columns
-server-side, so the bytes it decodes are Unicode by construction. `mssql_scan()`
-is the escape hatch for hand-written T-SQL. Slowing the main path to guard the
-escape hatch is the wrong trade.
-
-**What the escape hatch gets instead is this page.** Someone writing raw T-SQL is
-already choosing the exact columns and can add `CAST(col AS NVARCHAR(MAX))`; what
-they were missing was any statement that they had to. That is what changed.
-
+The column's collation changed on the server after the catalog loaded it. The values are read correctly, by the collation the server sent, but `DESCRIBE` shows the old one. Run `mssql_invalidate_cache()`. For a view, `sp_refreshview` first: its `sys.columns` row stays old until then.
 
 ### Unicode Transcoding (simdutf)
 
@@ -307,7 +235,7 @@ The codec validates the input first and falls back to a slower scalar implementa
 
   It returns `2026-09-16T10:11:12.1234567`, `10:11:12`, `0x0102`, `2026-09-16` where the auto-CAST lost them. Reading the column as DuckDB's own `VARIANT` is planned after 0.3.0.
 - **A serverless Azure SQL database that is resuming** answers a login with error 40613 ("not available yet ... retry shortly") until it is up, typically 20 to 60 s. The extension names it but does not retry yet ([#481](https://github.com/hugr-lab/mssql-extension/issues/481)): retry the ATTACH or the statement.
-- Raw `mssql_scan()` returns non-Unicode `CHAR`/`VARCHAR`/`TEXT` bytes in the column's code page without transcoding them, so a non-ASCII value is not valid UTF-8 and string functions mangle it silently — add `CAST(col AS NVARCHAR(MAX))`, or read through the catalog. See [Raw `mssql_scan()` does not transcode code pages](#raw-mssql_scan-does-not-transcode-code-pages)
+- Under `client_transcode false`, raw `mssql_scan()` returns non-Unicode `CHAR`/`VARCHAR`/`TEXT` bytes in the column's code page without transcoding them; see [When code-page bytes reach you unconverted](#when-code-page-bytes-reach-you-unconverted)
 - The DuckDB UI cannot render a result with an `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` column (`Expected field id 65535 but got 103`) — set `mssql_catalog_native_types = false` and invalidate the cache. See [DuckDB UI](#duckdb-ui-expected-field-id-65535-but-got-103)
 - XML columns in INSERT/UPDATE are limited to 4096 bytes per value — use COPY TO with BCP protocol for larger documents
 - Very large DECIMAL values may lose precision at extreme scales

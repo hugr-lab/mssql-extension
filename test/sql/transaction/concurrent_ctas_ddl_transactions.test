@@ -1,0 +1,327 @@
+# name: test/sql/transaction/concurrent_ctas_ddl_transactions.test
+# description: CTAS and DDL in concurrent transactions do not stop on each other's uncommitted schema changes
+# group: [transaction]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# A metadata load does not queue for a lock: on a row another session's uncommitted DDL holds
+# it reads again until mssql_metadata_timeout, and the server's deadlock monitor sees no cycle
+# through it. So two transactions that each hold uncommitted DDL and each need a load over
+# the other's row wait out that timeout. A LISTING does; the statements here must not need
+# one. The timeout is short so that a statement that starts to is a failure here, not a
+# five-minute wait. Each transaction holds its change for a second, so that they overlap.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cd (TYPE mssql);
+
+statement ok
+SET mssql_metadata_timeout = 20;
+
+# ---- concurrent CTAS, loaded by bulk copy (it commits as it loads, spec 057) ---------------
+
+concurrentloop i 0 4
+
+statement ok
+SELECT mssql_exec('cd', 'DROP TABLE IF EXISTS dbo.cc_a_${i}, dbo.cc_b_${i}, dbo.cc_c_${i}, dbo.cc_d_${i}, dbo.cc_e_${i}, dbo.cc_f_${i}, dbo.cc_g_${i}');
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE cd.dbo.cc_a_${i} AS SELECT range AS id FROM range(1000);
+
+query I
+SELECT count(*) FROM cd.dbo.cc_a_${i};
+----
+1000
+
+statement ok
+SELECT mssql_exec('cd', 'WAITFOR DELAY ''00:00:01''');
+
+statement ok
+COMMIT;
+
+endloop
+
+# ---- concurrent CTAS inside their transactions: the CREATE stays uncommitted ---------------
+
+statement ok
+SET mssql_ctas_use_bcp = false;
+
+concurrentloop i 0 4
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE cd.dbo.cc_b_${i} AS SELECT range AS id FROM range(1000);
+
+query I
+SELECT count(*) FROM cd.dbo.cc_b_${i};
+----
+1000
+
+statement ok
+SELECT mssql_exec('cd', 'WAITFOR DELAY ''00:00:01''');
+
+# A second one in the same transaction, over the others' uncommitted rows.
+statement ok
+CREATE TABLE cd.dbo.cc_c_${i} AS SELECT id FROM cd.dbo.cc_b_${i};
+
+query I
+SELECT count(*) FROM cd.dbo.cc_c_${i};
+----
+1000
+
+statement ok
+COMMIT;
+
+endloop
+
+# ---- a CTAS and DDL through mssql_exec, in each of the concurrent transactions -------------
+
+concurrentloop i 0 4
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE cd.dbo.cc_d_${i} AS SELECT range AS id FROM range(100);
+
+statement ok
+SELECT mssql_exec('cd', 'CREATE TABLE dbo.cc_e_${i} (id int); ALTER TABLE dbo.cc_d_${i} ADD c2 int NULL');
+
+query I
+SELECT count(*) FROM cd.dbo.cc_e_${i};
+----
+0
+
+query I
+SELECT count(*) FROM cd.dbo.cc_d_${i};
+----
+100
+
+statement ok
+SELECT mssql_exec('cd', 'WAITFOR DELAY ''00:00:01''');
+
+statement ok
+ROLLBACK;
+
+endloop
+
+# ---- every transaction holds DDL first; the CTAS comes over the others' held rows ----------
+
+concurrentloop i 0 4
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT mssql_exec('cd', 'CREATE TABLE dbo.cc_f_${i} (id int)');
+
+statement ok
+SELECT mssql_exec('cd', 'WAITFOR DELAY ''00:00:01''');
+
+statement ok
+CREATE TABLE cd.dbo.cc_g_${i} AS SELECT range AS id FROM range(100);
+
+query I
+SELECT count(*) FROM cd.dbo.cc_g_${i};
+----
+100
+
+statement ok
+ROLLBACK;
+
+endloop
+
+statement ok
+RESET mssql_ctas_use_bcp;
+
+# ---- the catalog's own DDL, in concurrent transactions --------------------------------------
+
+concurrentloop i 0 4
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE cd.dbo.cc_h_${i} (id int);
+
+statement ok
+INSERT INTO cd.dbo.cc_h_${i} VALUES (1);
+
+query I
+SELECT count(*) FROM cd.dbo.cc_h_${i};
+----
+1
+
+statement ok
+COMMIT;
+
+statement ok
+DROP TABLE cd.dbo.cc_h_${i};
+
+endloop
+
+# ---- a pool of one connection each: the CTAS runs whole on the pinned one -------------------
+
+statement ok
+SET mssql_connection_limit = 1;
+
+concurrentloop i 0 4
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cd_one_${i} (TYPE mssql);
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE cd_one_${i}.dbo.cc_i_${i} AS SELECT range AS id FROM range(100);
+
+query I
+SELECT count(*) FROM cd_one_${i}.dbo.cc_i_${i};
+----
+100
+
+statement ok
+SELECT mssql_exec('cd_one_${i}', 'WAITFOR DELAY ''00:00:01''');
+
+statement ok
+ROLLBACK;
+
+statement ok
+DETACH cd_one_${i};
+
+endloop
+
+statement ok
+RESET mssql_connection_limit;
+
+# ---- con1 holds uncommitted DDL all along: nothing below may wait for it --------------------
+# Each kind of hold in turn, with the timeout at 3 s and nothing releasing it meanwhile: a
+# statement that needed con1's rows would fail here rather than pass by luck of the timing.
+
+statement ok
+SET mssql_metadata_timeout = 3;
+
+statement ok
+SET mssql_query_timeout = 15;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cd_hold (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('cd_hold', 'DROP TABLE IF EXISTS dbo.cc_held, dbo.cc_held_ctas, dbo.cc_hold_alter, dbo.cc_j, dbo.cc_k, dbo.cc_l, dbo.cc_m; CREATE TABLE dbo.cc_hold_alter (id int)');
+
+foreach hold create alter index drop
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+SELECT mssql_exec('cd_hold', CASE '${hold}' WHEN 'create' THEN 'CREATE TABLE dbo.cc_held (id int)' WHEN 'alter' THEN 'ALTER TABLE dbo.cc_hold_alter ADD c2 int NULL' WHEN 'index' THEN 'CREATE TABLE dbo.cc_held (id int); CREATE CLUSTERED INDEX ci ON dbo.cc_held (id)' ELSE 'DROP TABLE dbo.cc_hold_alter' END);
+
+# A catalog of its own for each hold, so that its cache is cold and every load really runs.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS cd_cold (TYPE mssql);
+
+# A CTAS by bulk copy, committing as it loads.
+statement ok
+CREATE TABLE cd_cold.dbo.cc_j AS SELECT range AS id FROM range(1000);
+
+query I
+SELECT count(*) FROM cd_cold.dbo.cc_j;
+----
+1000
+
+# A CTAS inside a transaction, read back in it, and a second one from it.
+statement ok
+SET mssql_ctas_use_bcp = false;
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE cd_cold.dbo.cc_k AS SELECT range AS id FROM range(100);
+
+query I
+SELECT count(*) FROM cd_cold.dbo.cc_k;
+----
+100
+
+statement ok
+CREATE TABLE cd_cold.dbo.cc_l AS SELECT id FROM cd_cold.dbo.cc_k;
+
+statement ok
+ROLLBACK;
+
+statement ok
+RESET mssql_ctas_use_bcp;
+
+# The catalog's own DDL and DML.
+statement ok
+CREATE TABLE cd_cold.dbo.cc_m (id int);
+
+statement ok
+INSERT INTO cd_cold.dbo.cc_m VALUES (1);
+
+query I
+SELECT count(*) FROM cd_cold.dbo.cc_m;
+----
+1
+
+statement ok
+DROP TABLE cd_cold.dbo.cc_m;
+
+statement ok
+DROP TABLE cd_cold.dbo.cc_j;
+
+statement ok
+DETACH cd_cold;
+
+# The holder's change is its own to undo.
+statement ok con1
+ROLLBACK;
+
+endloop
+
+statement ok
+SELECT mssql_exec('cd_hold', 'DROP TABLE IF EXISTS dbo.cc_hold_alter');
+
+statement ok
+DETACH cd_hold;
+
+statement ok
+SET mssql_metadata_timeout = 20;
+
+statement ok
+RESET mssql_query_timeout;
+
+# ---- what is left: only what was committed --------------------------------------------------
+
+query I
+SELECT * FROM mssql_scan('cd', 'SELECT COUNT(*) FROM sys.objects WHERE name LIKE ''cc[_][abc][_]%''');
+----
+12
+
+query I
+SELECT * FROM mssql_scan('cd', 'SELECT COUNT(*) FROM sys.objects WHERE name LIKE ''cc[_][defghi][_]%''');
+----
+0
+
+concurrentloop i 0 4
+
+statement ok
+SELECT mssql_exec('cd', 'DROP TABLE IF EXISTS dbo.cc_a_${i}, dbo.cc_b_${i}, dbo.cc_c_${i}');
+
+endloop
+
+statement ok
+DETACH cd;

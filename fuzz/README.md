@@ -78,10 +78,8 @@ DYLD_LIBRARY_PATH=build/release/src fuzz/out/fuzz_bcp_encode fuzz/corpus/bcp_enc
 `make fuzz-encode-replay` wraps exactly that.
 
 Both pick up the family codecs with a **non-recursive** glob, `src/codec/*.cpp`,
-in `build.sh`, so `src/codec/code_page/*.cpp` is not in either today. Nothing they
-compile calls the code-page module yet; once `string_codec.cpp` does (spec 092
-switches the read path to it), add `src/codec/code_page/*.cpp` to both source
-lists or they stop linking.
+in `build.sh`, plus `src/codec/code_page/*.cpp`, which `string_codec.cpp` and the
+stager call (spec 092).
 
 ### `fuzz_bcp_encode`'s three oracles
 

@@ -11,6 +11,7 @@
 #include "catalog/mssql_keyless_key.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "catalog/mssql_table_entry.hpp"
+#include "codec/code_page/code_page_codec.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -21,6 +22,7 @@
 #include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/struct_vector.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/optimizer/relation_statistics/relation_statistics_helper.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -92,9 +94,10 @@ static idx_t ApplyClientFilters(ClientContext &context, MSSQLScanGlobalState &gl
 // missing one (the legacy LOBs) meant a `text` value failed an
 // `INSERT … RETURNING` that never mentioned the column.
 static std::string BuildColumnExpression(const MSSQLColumnInfo &col, const std::string &col_name,
-										 bool convert_varchar_max, bool utf8_on_wire) {
-	std::string expr = MSSQLColumnInfo::BuildReadExpression(
-		col_name, col.sql_type_name, col.max_length, col.collation_name, convert_varchar_max, "", "", utf8_on_wire);
+										 bool convert_varchar_max, bool client_transcode, bool utf8_on_wire) {
+	std::string expr =
+		MSSQLColumnInfo::BuildReadExpression(col_name, col.sql_type_name, col.max_length, col.collation_name,
+											 convert_varchar_max, client_transcode, "", "", utf8_on_wire);
 	// Logged unconditionally at level 2 rather than only when it differs from the
 	// bare name: deciding that meant rebuilding the escaped name for every column
 	// on the scan path, and re-encoding a spelling BuildReadExpression now owns —
@@ -195,9 +198,12 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	// Issue #405: a UTF-8 char(n) is read as itself only when the logins were
 	// granted UTF8SUPPORT; otherwise -- or before any login answered -- as
 	// NCHAR(n), so its padding never reaches DuckDB.
-	const bool utf8_on_wire =
-		Catalog::GetCatalog(context, Identifier(bind_data.context_name)).Cast<MSSQLCatalog>().UTF8SupportObserved() ==
-		MSSQLCatalog::Utf8Support::Granted;
+	auto &scan_catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name)).Cast<MSSQLCatalog>();
+	const bool utf8_on_wire = scan_catalog.UTF8SupportObserved() == MSSQLCatalog::Utf8Support::Granted;
+	const bool client_transcode = scan_catalog.ClientTranscode();
+	// The columns of the SELECT list, in its order: what the stream's COLMETADATA is
+	// checked against (spec 092 D1).
+	vector<const MSSQLColumnInfo *> read_columns;
 
 	// Filter out special column identifiers and collect valid column indices
 	vector<column_t> valid_column_ids;
@@ -232,9 +238,11 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 			if (!column_list.empty()) {
 				column_list += ", ";
 			}
-			// Use BuildColumnExpression for VARCHAR→NVARCHAR conversion (Spec 026)
+			// The read expression: bare, or the server's cast (spec 026, spec 092).
 			const auto &col_info = bind_data.mssql_columns[col_idx];
-			column_list += BuildColumnExpression(col_info, col_name, convert_varchar_max, utf8_on_wire);
+			column_list +=
+				BuildColumnExpression(col_info, col_name, convert_varchar_max, client_transcode, utf8_on_wire);
+			read_columns.push_back(&col_info);
 			sql_column_names.push_back(col_name);
 		}
 
@@ -259,7 +267,9 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 					}
 				}
 				const auto &col_info = bind_data.mssql_columns[pk_col_idx];
-				column_list += BuildColumnExpression(col_info, pk_col, convert_varchar_max, utf8_on_wire);
+				column_list +=
+					BuildColumnExpression(col_info, pk_col, convert_varchar_max, client_transcode, utf8_on_wire);
+				read_columns.push_back(&col_info);
 				sql_column_names.push_back(pk_col);
 				pk_columns_added = true;
 				MSSQL_SCAN_DEBUG_LOG(2, "  added PK column for rowid: %s at SQL index %zu", pk_col.c_str(),
@@ -308,10 +318,11 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 				column_list += ", ";
 			}
 			column_t col_idx = valid_column_ids[i];
-			// Use BuildColumnExpression for VARCHAR→NVARCHAR conversion (Spec 026)
+			// The read expression: bare, or the server's cast (spec 026, spec 092).
 			const auto &col_info = bind_data.mssql_columns[col_idx];
-			column_list +=
-				BuildColumnExpression(col_info, bind_data.all_column_names[col_idx], convert_varchar_max, utf8_on_wire);
+			column_list += BuildColumnExpression(col_info, bind_data.all_column_names[col_idx], convert_varchar_max,
+												 client_transcode, utf8_on_wire);
+			read_columns.push_back(&col_info);
 			MSSQL_SCAN_DEBUG_LOG(2, "  column[%llu] = %s", (unsigned long long)i,
 								 bind_data.all_column_names[col_idx].c_str());
 		}
@@ -472,6 +483,27 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	// that stops early -- any LIMIT (issue #224).
 	if (result->result_stream) {
 		result->result_stream->MarkCatalogScan();
+		// A bare read assumed its collation's page. The stream decodes by the wire's,
+		// so a disagreement reads correctly, but the catalog is stale: say so (spec 092
+		// D1), or nobody learns why a column is labelled with the wrong collation.
+		const auto &wire_columns = result->result_stream->GetColumnMetadata();
+		for (idx_t i = 0; i < read_columns.size() && i < wire_columns.size(); i++) {
+			const auto *page = MSSQLColumnInfo::ClientTranscodedPage(read_columns[i]->sql_type_name,
+																	 read_columns[i]->collation_name, client_transcode);
+			if (!page) {
+				continue;
+			}
+			const auto undecodable =
+				mssql::codec::code_page::UndecodableBareRead(wire_columns[i], read_columns[i]->collation_name);
+			if (!undecodable.empty()) {
+				throw InvalidInputException(undecodable);
+			}
+			const auto mismatch =
+				mssql::codec::code_page::NamedCodePageMismatch(wire_columns[i], *page, read_columns[i]->collation_name);
+			if (!mismatch.empty()) {
+				DUCKDB_LOG_WARNING(context, "%s", mismatch);
+			}
+		}
 		result->result_stream->SurfaceWarnings(context);
 	}
 

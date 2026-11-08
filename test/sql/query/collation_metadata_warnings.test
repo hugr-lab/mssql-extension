@@ -6,11 +6,13 @@
 # Environment variables required:
 #   MSSQL_TESTDB_DSN - Connection string to test database
 #
-# #224 is settled as documented-but-not-enforced: a CHAR/VARCHAR/TEXT column
-# whose collation is not a UTF-8 one is handed back as code-page bytes in a
-# DuckDB VARCHAR, and validating that per value would cost the scan's hot path
-# to make a hand-written query fail loudly. So it is said ONCE PER QUERY over
-# COLMETADATA instead, which costs nothing per row.
+# Since spec 092 a CHAR/VARCHAR/TEXT column under a code page is transcoded on the
+# client, and says nothing (the last section here). Under client_transcode false,
+# which is what this file attaches with, it is handed back as code-page bytes in a
+# DuckDB VARCHAR, and validating that per value would cost the scan's hot path to
+# make a hand-written query fail loudly (#224). So it is said ONCE PER QUERY over
+# COLMETADATA instead, which costs nothing per row. The other case that warns, a
+# collation newer than the tables, cannot be induced from SQL.
 #
 # The predicate is the fUTF8 flag, bit 0x40 of the collation flags byte, which
 # lands at 0x04000000 in the 4-byte word the extension stores. Verified against
@@ -21,7 +23,7 @@ require mssql
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS coll (TYPE mssql);
+ATTACH '${MSSQL_TESTDB_DSN}' AS coll (TYPE mssql, client_transcode false);
 
 statement ok
 SET logging_storage = 'memory';
@@ -234,6 +236,29 @@ query I
 SELECT count(*) FROM duckdb_logs WHERE message LIKE '%"audible"%' AND message LIKE '%non-UTF-8 collation%';
 ----
 1
+
+# =============================================================================
+# Transcoding on (the default): the same columns arrive as UTF-8, so there is
+# nothing to warn about.
+# =============================================================================
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS coll_on (TYPE mssql);
+
+query II
+SELECT tr_cp1251, tr_cp1252 FROM mssql_scan('coll_on', '
+    SELECT CAST(N''ж'' COLLATE Cyrillic_General_CI_AS AS VARCHAR(10)) AS tr_cp1251,
+           CAST(''b'' AS VARCHAR(10)) COLLATE Latin1_General_CI_AS    AS tr_cp1252');
+----
+ж	b
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%non-UTF-8 collation%' AND message LIKE '%tr_cp125%';
+----
+0
+
+statement ok
+DETACH coll_on;
 
 statement ok
 DETACH coll;

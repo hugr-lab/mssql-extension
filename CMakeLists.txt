@@ -144,6 +144,7 @@ set(EXTENSION_SOURCES
     src/codec/code_page/code_page.cpp
     src/codec/code_page/code_page_avx2.cpp
     src/codec/code_page/code_page_avx512.cpp
+    src/codec/code_page/code_page_codec.cpp
     src/codec/code_page/code_page_tables.cpp
     # TDS protocol layer (pure C++, no DuckDB dependencies)
     src/tds/tds_types.cpp

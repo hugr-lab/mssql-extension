@@ -76,7 +76,7 @@ SOURCES=(
 )
 # The per-family codec sources (non-recursive: staging/ is listed explicitly
 # above). row_stager.cpp calls every family's DecodeChunkFromStaging.
-for f in src/codec/*.cpp; do
+for f in src/codec/*.cpp src/codec/code_page/*.cpp; do
 	SOURCES+=("$f")
 done
 

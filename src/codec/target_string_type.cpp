@@ -1,6 +1,7 @@
 #include "codec/target_string_type.hpp"
 
 #include "duckdb/common/extension_type_info.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
@@ -13,11 +14,24 @@ namespace codec {
 static constexpr const char *NVARCHAR_ALIAS = "MSSQL_NVARCHAR";
 static constexpr const char *VARCHAR_ALIAS = "MSSQL_VARCHAR";
 
-//! The collation travels as a PROPERTY rather than a second modifier so that it
-//! stays out of the rendered type name: with the catalog reporting these types
-//! for every string column, `DESCRIBE` would otherwise print the collation of
-//! every varchar in the database.
-static constexpr const char *COLLATION_PROPERTY = "collation";
+//! A collation travels inside the length modifier, as "<length>,<collation>", with a
+//! label that prints the length alone. In the modifier, because a type is respelled from
+//! its modifiers when DuckDB's remote-pushdown rewriter folds a constant
+//! (TypeExpression::FromLogicalType), and a property would be lost there: `'x'::
+//! MSSQL_VARCHAR(4, 'Cyrillic_General_CI_AS')` came back without its collation. Printing
+//! the length alone, because with the catalog reporting these types for every string
+//! column `DESCRIBE` would otherwise print the collation of every varchar in the database.
+static constexpr char COLLATION_SEPARATOR = ',';
+
+//! Where v0.3.0 kept the collation. Only read: a DuckDB file it wrote holds such types, a
+//! catalog varchar copied into a local table among them.
+static constexpr const char *V030_COLLATION_PROPERTY = "collation";
+
+void SplitLengthModifier(const std::string &text, std::string &length, std::string &collation) {
+	const auto separator = text.find(COLLATION_SEPARATOR);
+	length = text.substr(0, separator);
+	collation = separator == std::string::npos ? std::string() : text.substr(separator + 1);
+}
 
 LogicalType MakeTargetStringType(const TargetStringType &spec) {
 	LogicalType type = LogicalType(LogicalTypeId::VARCHAR).WithAlias(spec.unicode ? NVARCHAR_ALIAS : VARCHAR_ALIAS);
@@ -34,13 +48,14 @@ LogicalType MakeTargetStringType(const TargetStringType &spec) {
 	// cast is refused by DuckDB's parser, before this extension is consulted.
 	// Documented in website/docs/writing/table-options.md, since the obvious
 	// thing to do with a type name is paste it back.
-	if (IsMaxLength(spec.length)) {
+	const std::string length = IsMaxLength(spec.length) ? std::string(MAX_MODIFIER) : std::to_string(spec.length);
+	if (!spec.unicode && !spec.collation.empty()) {
+		info->modifiers.emplace_back(Value(length + COLLATION_SEPARATOR + spec.collation));
+		info->modifiers.back().label = length;
+	} else if (IsMaxLength(spec.length)) {
 		info->modifiers.emplace_back(Value(MAX_MODIFIER));
 	} else {
 		info->modifiers.emplace_back(Value::INTEGER(spec.length));
-	}
-	if (!spec.unicode && !spec.collation.empty()) {
-		info->properties[COLLATION_PROPERTY] = Value(spec.collation);
 	}
 	return type.WithExtensionInfo(std::move(info));
 }
@@ -65,18 +80,29 @@ bool TryGetTargetStringType(const LogicalType &type, TargetStringType &result) {
 	}
 	const auto &length_modifier = info.modifiers[0].value;
 	if (length_modifier.type().id() == LogicalTypeId::VARCHAR) {
-		// The MAX form. Nothing else is stored as a string, and a stray one
-		// would be a type this codec did not build.
-		if (!IsMaxKeyword(length_modifier.ToString())) {
-			return false;
+		// The MAX form, a named collation, or both. Nothing else is stored as a string,
+		// and a stray one would be a type this codec did not build.
+		std::string length;
+		SplitLengthModifier(length_modifier.ToString(), length, result.collation);
+		if (IsMaxKeyword(length)) {
+			result.length = MAX_LENGTH;
+		} else {
+			int32_t parsed;
+			if (!TryCast::Operation<string_t, int32_t>(string_t(length), parsed)) {
+				return false;
+			}
+			result.length = parsed;
 		}
-		result.length = MAX_LENGTH;
 	} else {
+		result.collation.clear();
 		result.length = length_modifier.GetValue<int32_t>();
 	}
-
-	const auto entry = info.properties.find(COLLATION_PROPERTY);
-	result.collation = entry == info.properties.end() ? std::string() : entry->second.ToString();
+	if (result.collation.empty()) {
+		const auto entry = info.properties.find(V030_COLLATION_PROPERTY);
+		if (entry != info.properties.end()) {
+			result.collation = entry->second.ToString();
+		}
+	}
 	return true;
 }
 
@@ -120,6 +146,26 @@ LogicalType ApplyDefaultStringType(const LogicalType &type, bool unicode, int32_
 bool NeedsVarcharCollation(const LogicalType &type) {
 	TargetStringType spec;
 	return TryGetTargetStringType(type, spec) && !spec.unicode && spec.collation.empty();
+}
+
+LogicalType FabricStringType(const LogicalType &type) {
+	TargetStringType spec;
+	if (!TryGetTargetStringType(type, spec)) {
+		return type;
+	}
+	const std::string upper = StringUtil::Upper(spec.collation);
+	const bool utf8 = StringUtil::EndsWith(upper, "_UTF8");
+	if (!spec.unicode && (spec.collation.empty() || upper == FABRIC_BIN2_COLLATION || upper == FABRIC_CI_COLLATION)) {
+		return type;
+	}
+	// A UTF-8 varchar's n is bytes already; n of anything else can be 3n of them.
+	if ((spec.unicode || !utf8) && !IsMaxLength(spec.length)) {
+		const int64_t utf8_bytes = static_cast<int64_t>(spec.length) * 3;
+		spec.length = utf8_bytes > MAX_VARCHAR_LENGTH ? MAX_LENGTH : static_cast<int32_t>(utf8_bytes);
+	}
+	spec.unicode = false;
+	spec.collation.clear();
+	return MakeTargetStringType(spec);
 }
 
 bool IsMaxKeyword(const std::string &text) {

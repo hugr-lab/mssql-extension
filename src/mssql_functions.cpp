@@ -7,6 +7,8 @@
 #include "catalog/mssql_table_entry.hpp"
 #include "catalog/mssql_transaction.hpp"
 #include "catalog/mssql_transaction_metadata.hpp"
+#include "codec/code_page/code_page.hpp"
+#include "codec/code_page/code_page_codec.hpp"
 #include "codec/sql_server_type_text.hpp"
 #include "codec/target_string_type.hpp"
 #include "connection/mssql_connection_provider.hpp"
@@ -291,22 +293,27 @@ static bool DescribedTypeToTdsMetadata(const string &base, int16_t max_length, u
 // `max_length` in bytes as the server reports it (-1 = MAX). `collation` is the
 // describe's collation_name.
 //
-// A char / varchar column is annotated only when its collation is a UTF-8 one.
-// A raw scan hands a code-page varchar's bytes over as they are (issue #224 --
-// the catalog path casts such a column to nvarchar on the server, a raw scan
-// has no column to cast), so MSSQL_VARCHAR(n, 'SQL_Latin1_General_CP1_CI_AS')
-// would name a code page the values are not in, and a CTAS from it would
-// re-encode bytes that were never UTF-8. Nor without a collation at all: a
-// bare MSSQL_VARCHAR(n) takes mssql_utf8_collation at the target, a different
-// comparison semantics than the source's.
-static LogicalType NativeStringType(const LogicalType &stream_type, bool native_types, const string &base,
-									int16_t max_length, const string &collation) {
+// A char / varchar column is annotated when its values arrive as UTF-8: a UTF-8
+// collation, or a code page this catalog transcodes (client_transcode, any page
+// with a table: a raw scan has no cast to keep, spec 092 D7). Otherwise a raw scan
+// hands the bytes over as they are (issue #224), so
+// MSSQL_VARCHAR(n, 'SQL_Latin1_General_CP1_CI_AS') would name a code page the values
+// are not in, and a CTAS from it would re-encode bytes that were never UTF-8. Nor
+// without a collation at all: a bare MSSQL_VARCHAR(n) takes mssql_utf8_collation at
+// the target, a different comparison semantics than the source's.
+static LogicalType NativeStringType(const LogicalType &stream_type, bool native_types, bool client_transcode,
+									const string &base, int16_t max_length, const string &collation) {
 	if (!native_types || stream_type.id() != LogicalTypeId::VARCHAR) {
 		return stream_type;
 	}
 	if (base == "char" || base == "varchar") {
 		if (!MSSQLColumnInfo::IsUTF8Collation(collation)) {
-			return stream_type;
+			const auto *row = client_transcode
+								  ? mssql::codec::code_page::FindCollationByName(collation.c_str(), collation.size())
+								  : nullptr;
+			if (!row || !mssql::codec::code_page::FindCodePage(row->code_page)) {
+				return stream_type;
+			}
 		}
 	} else if (base != "nchar" && base != "nvarchar") {
 		return stream_type;
@@ -346,10 +353,15 @@ static int16_t StringMaxLengthOf(const tds::ColumnMetadata &col) {
 // bit before the base left those unannotated and paid a describe for them).
 // `utf8_acked` is the answer of the connection the COLMETADATA came on, not
 // the catalog's cached one: it is what that connection negotiated.
-static bool IsDeclaredTypeAmbiguous(const tds::ColumnMetadata &col, bool utf8_acked) {
+static bool IsDeclaredTypeAmbiguous(const tds::ColumnMetadata &col, bool utf8_acked, bool client_transcode) {
 	const string base = StringBaseOf(col);
-	if (base.empty() || !col.IsUtf8Collation()) {
+	if (base.empty()) {
 		return false;
+	}
+	if (!col.IsUtf8Collation()) {
+		// A code-page varchar the catalog transcodes: its annotation needs the
+		// collation's name, which COLMETADATA does not carry (spec 092 D7).
+		return client_transcode && mssql::codec::code_page::WireCodePage(col) != nullptr;
 	}
 	return base == "char" || base == "varchar" || !utf8_acked;
 }
@@ -358,13 +370,14 @@ static bool IsDeclaredTypeAmbiguous(const tds::ColumnMetadata &col, bool utf8_ac
 // sp_prepare's answer, or a statement run at bind: MSSQL_NVARCHAR(n) for an
 // nchar / nvarchar (the annotation needs no collation there), plain VARCHAR
 // for a code-page varchar and for anything IsDeclaredTypeAmbiguous.
-static LogicalType WireStringType(const tds::ColumnMetadata &col, bool native_types, bool utf8_acked) {
+static LogicalType WireStringType(const tds::ColumnMetadata &col, bool native_types, bool utf8_acked,
+								  bool client_transcode) {
 	const LogicalType stream_type = tds::encoding::TypeConverter::GetDuckDBType(col);
 	const string base = StringBaseOf(col);
-	if (base.empty() || IsDeclaredTypeAmbiguous(col, utf8_acked)) {
+	if (base.empty() || IsDeclaredTypeAmbiguous(col, utf8_acked, client_transcode)) {
 		return stream_type;
 	}
-	return NativeStringType(stream_type, native_types, base, StringMaxLengthOf(col), string());
+	return NativeStringType(stream_type, native_types, client_transcode, base, StringMaxLengthOf(col), string());
 }
 
 // The stream decodes a string column as plain VARCHAR; the bind may have
@@ -426,7 +439,11 @@ static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQ
 		const bool stream_max = max_length < 0;
 		const int32_t length = stream_max ? mssql::codec::MAX_LENGTH : (unicode ? max_length / 2 : max_length);
 		if (spec.unicode == unicode) {
-			if (spec.length != length) {
+			// The describe answers for every branch of a statement, with the widest
+			// length (IF arms, a procedure's: varchar(10) and varchar(20) describe as
+			// varchar(20)), so a stream no longer than the bound fits. A longer one,
+			// or MAX under a bound, is a shape the bound did not promise.
+			if (!mssql::codec::IsMaxLength(spec.length) && (stream_max || length > spec.length)) {
 				return false;
 			}
 			continue;
@@ -463,7 +480,8 @@ static bool StreamMatchesBoundShape(const vector<LogicalType> &bound, const MSSQ
 // carries the collation as an id, not a name, so its shape stays plain VARCHAR;
 // sp_prepare asks this function for its varchars' collations.
 static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection, const string &statement,
-												  const string &declarations, int timeout_ms, bool native_types) {
+												  const string &declarations, int timeout_ms, bool native_types,
+												  bool client_transcode) {
 	MSSQLDescribedShape shape;
 	string batch = "EXEC sp_describe_first_result_set " + mssql::NVarcharLiteral(statement) + ", " +
 				   (declarations.empty() ? string("NULL") : mssql::NVarcharLiteral(declarations)) + ", 0";
@@ -524,8 +542,8 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 		if (collation_idx >= 0) {
 			collation = row[collation_idx];
 		}
-		shape.types.push_back(NativeStringType(tds::encoding::TypeConverter::GetDuckDBType(column), native_types, base,
-											   max_length, collation));
+		shape.types.push_back(NativeStringType(tds::encoding::TypeConverter::GetDuckDBType(column), native_types,
+											   client_transcode, base, max_length, collation));
 		shape.names.push_back(column.name);
 		shape.datetime2.push_back(base == "datetime2");
 	}
@@ -542,7 +560,7 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 // off that token exactly as the stream reads them at execution.
 static MSSQLDescribedShape PrepareStatement(tds::TdsConnection &connection, const string &statement,
 											const string &declarations, int timeout_ms, int32_t &handle,
-											bool native_types) {
+											bool native_types, bool client_transcode) {
 	MSSQLDescribedShape shape;
 	string batch = "DECLARE @h int;\nEXEC sp_prepare @h OUTPUT, " +
 				   (declarations.empty() ? string("NULL") : mssql::NVarcharLiteral(declarations)) + ", " +
@@ -562,24 +580,23 @@ static MSSQLDescribedShape PrepareStatement(tds::TdsConnection &connection, cons
 		return shape;
 	}
 	// The columns whose annotation needs the describe: those whose declared type
-	// COLMETADATA cannot tell (IsDeclaredTypeAmbiguous) -- a UTF-8 varchar,
-	// whatever it travelled as. A code-page varchar is plain VARCHAR either way,
-	// and an nvarchar on a connection granted UTF8SUPPORT is an nvarchar, so
-	// neither costs a round trip.
+	// COLMETADATA cannot tell (IsDeclaredTypeAmbiguous) -- a UTF-8 varchar, whatever
+	// it travelled as, and a code-page one the catalog transcodes. An nvarchar on a
+	// connection granted UTF8SUPPORT is an nvarchar, and costs no round trip.
 	const bool utf8_acked = connection.UTF8SupportAcked();
 	vector<bool> needs_describe;
 	bool any_needs_describe = false;
 	for (const auto &col : result.result_sets.front()) {
-		const bool ambiguous = IsDeclaredTypeAmbiguous(col, utf8_acked);
+		const bool ambiguous = IsDeclaredTypeAmbiguous(col, utf8_acked, client_transcode);
 		needs_describe.push_back(ambiguous);
 		any_needs_describe = any_needs_describe || ambiguous;
-		shape.types.push_back(WireStringType(col, native_types, utf8_acked));
+		shape.types.push_back(WireStringType(col, native_types, utf8_acked, client_transcode));
 		shape.names.push_back(col.name);
 		shape.datetime2.push_back(col.type_id == tds::TDS_TYPE_DATETIME2);
 	}
 	shape.ok = true;
 	// COLMETADATA carries a collation as an id, not the name the annotation
-	// needs, so the describe is asked for the UTF-8 columns -- one round trip
+	// needs, so the describe is asked for those columns -- one round trip
 	// more at bind, only when there is one, for a statement compiled once. It
 	// names exactly the types the default (described) path would, so `prepared
 	// := true` does not change what a CTAS from the scan creates. Taken column by
@@ -591,7 +608,8 @@ static MSSQLDescribedShape PrepareStatement(tds::TdsConnection &connection, cons
 	// (`ok` false) changes nothing; an exception -- a cancel, a timeout, a lost
 	// connection -- is the bind's, as it would be for any query it runs.
 	if (native_types && any_needs_describe) {
-		auto described = DescribeFirstResultSet(connection, statement, declarations, timeout_ms, true);
+		auto described =
+			DescribeFirstResultSet(connection, statement, declarations, timeout_ms, true, client_transcode);
 		if (described.ok) {
 			for (idx_t i = 0; i < shape.types.size() && i < described.types.size(); i++) {
 				if (described.names[i] != shape.names[i]) {
@@ -865,6 +883,7 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	const int timeout_ms = QueryTimeoutMs(context);
 	const string declarations = params.Declarations();
 	const bool native_types = MSSQLReportsNativeTypes(mssql_catalog);
+	const bool client_transcode = mssql_catalog.ClientTranscode();
 
 	// Spec 079 PR E2, issue #410: a statement of a shape already described
 	// binds without the round trip -- or a connection. Inside an explicit transaction
@@ -946,7 +965,8 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	try {
 		if (wanted_prepared) {
 			int32_t handle = 0;
-			shape = PrepareStatement(*connection, bind_data.query, declarations, timeout_ms, handle, native_types);
+			shape = PrepareStatement(*connection, bind_data.query, declarations, timeout_ms, handle, native_types,
+									 client_transcode);
 			if (shape.ok) {
 				auto session = make_shared_ptr<MSSQLPreparedSession>();
 				session->handle = handle;
@@ -981,10 +1001,12 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 				MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: sp_prepare gave no shape (%s), describing instead",
 								   shape.reason.c_str());
 				bind_data.prepared = false;
-				shape = DescribeFirstResultSet(*connection, bind_data.query, declarations, timeout_ms, native_types);
+				shape = DescribeFirstResultSet(*connection, bind_data.query, declarations, timeout_ms, native_types,
+											   client_transcode);
 			}
 		} else {
-			shape = DescribeFirstResultSet(*connection, bind_data.query, declarations, timeout_ms, native_types);
+			shape = DescribeFirstResultSet(*connection, bind_data.query, declarations, timeout_ms, native_types,
+										   client_transcode);
 		}
 	} catch (...) {
 		ConnectionProvider::ReleaseConnection(context, mssql_catalog, std::move(connection));
@@ -1044,7 +1066,7 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	const bool utf8_acked = stream_connection && stream_connection->UTF8SupportAcked();
 	return_types.clear();
 	for (const auto &col : result_stream->GetColumnMetadata()) {
-		return_types.push_back(WireStringType(col, native_types, utf8_acked));
+		return_types.push_back(WireStringType(col, native_types, utf8_acked, client_transcode));
 	}
 	names.clear();
 	for (const auto &name : result_stream->GetColumnNames()) {

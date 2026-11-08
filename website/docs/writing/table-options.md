@@ -114,8 +114,11 @@ Only letters, digits and underscores are accepted; the name reaches T-SQL as a
 bare identifier, so anything else is rejected at bind time rather than
 concatenated into a `CREATE TABLE`.
 
-On Microsoft Fabric only two collations exist and both are UTF-8; naming any
-other is refused before the DDL is built. See [AZURE.md](../connection/azure.md#two-collations-both-utf-8).
+On Microsoft Fabric only two collations exist, both UTF-8, and there is no
+`nvarchar`. `CREATE TABLE` naming anything else is refused before the DDL is built. A
+CTAS or a creating `COPY` takes what the warehouse can hold: an `nvarchar(n)` or a code
+page's `varchar(n)`, carried from a SQL Server source or cast to, becomes `varchar(3n)`
+in the warehouse's collation. See [AZURE.md](../connection/azure.md#two-collations-both-utf-8).
 
 #### Using them with COPY
 

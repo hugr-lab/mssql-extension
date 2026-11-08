@@ -51,15 +51,29 @@ python3 $B --timings test/bench/tpch/results/sf1/timings.csv --report report.md 
 
 **Correctness first.** `verify` compares each client with DuckDB over the very parquet the server was loaded from. A wrong answer makes that query's timing meaningless, and the report should say so.
 
-How a value is compared depends on how it is written, because that is the only evidence of what the column is:
+How a value is compared depends on **what the oracle says the column is**, not on how the value happens to print. `verify` writes the column types beside each answer (`DESCRIBE` each query, one extra statement per query in the same session) and compares per column:
 
-| the pair | rule |
+| the oracle's column type | rule |
 |---|---|
-| anything byte-identical | equal |
-| two exact decimals printed at the **same** scale (`37734107.00` vs `37734107.00`), integers included | **exact equality** |
-| an exact decimal beside a value of another scale — a DOUBLE against the server's `decimal(38,6)` | 1e-6 absolute or 1e-9 relative, whichever is larger |
-| any other number (`1e3`) | the same tolerance |
-| anything else, strings included | **exact equality** |
+| `DECIMAL(p,s)` and the integer family | **exact, by value** — a client printing the same number at another scale matches (`1.5` = `1.500000`), a cent of difference does not |
+| `VARCHAR`, `DATE`, `BOOLEAN`, `TIMESTAMP`, `BLOB`, `INTERVAL` | **exact, by identity** — so `CHAR(n)` padding is a mismatch, and so is `07` against `7` |
+| `DOUBLE`, `FLOAT`, `REAL` | 1e-6 absolute or 1e-13 relative, whichever is larger |
+| anything unrecognised | **exact, by identity** — the strictest kind, so a new column fails loudly rather than quietly taking a tolerance |
+
+For q01, the query at the centre of every defect this comparison has had, `DESCRIBE` gives seven exact columns and three tolerance ones:
+
+```
+sum_qty = HUGEINT            avg_qty   = DOUBLE
+sum_base_price = DECIMAL(38,2)   avg_price = DOUBLE
+sum_disc_price = DECIMAL(38,4)   avg_disc  = DOUBLE
+sum_charge = DECIMAL(38,6)
+count_order = BIGINT
+l_returnflag, l_linestatus = VARCHAR
+```
+
+The tolerance exists only because DuckDB returns `avg(decimal)` and `decimal / decimal` as `DOUBLE` (q01's three averages, q08's `mkt_share`), and the extension's pushed `CAST(SUM(x) AS float) / COUNT_BIG(x)` differs from DuckDB's `avg` in its last bits by design. 1e-13 leaves about 724 ulps of margin at an SF1000 magnitude.
+
+If the types are missing the run reports `NO TYPES` rather than comparing: a comparison that cannot tell an exact column from a double is what this replaced.
 
 Nothing is stripped, so `CHAR(n)` trailing-blank padding is a mismatch and gets its own `PADDING` verdict — that is the #405 class, and an exact comparison is the only thing that can see it. Rows must be in order, or match as a multiset, which is reported as `ok (same rows, different order)`.
 

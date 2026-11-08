@@ -56,7 +56,8 @@ void MSSQLInsertStatement::InitializeCache() const {
 			// not by a copy of it. The copy is how the `text` case survived the
 			// first fix: it carried two of the four rewrites.
 			output_cols += MSSQLColumnInfo::BuildReadExpression(col.name, col.mssql_type, col.max_length, col.collation,
-																target_.convert_varchar_max, "INSERTED.");
+																target_.convert_varchar_max, target_.client_transcode,
+																"INSERTED.");
 		}
 		if (!output_into_) {
 			cached_output_clause_ = "OUTPUT " + output_cols;
@@ -80,12 +81,14 @@ void MSSQLInsertStatement::InitializeCache() const {
 			for (idx_t i = 0; i < target_.returning_column_indices.size(); i++) {
 				const auto &col = target_.columns[target_.returning_column_indices[i]];
 				const auto alias = "c" + std::to_string(i);
-				create_cols += (i ? ", " : "") + MSSQLColumnInfo::BuildReturningExpression(
-													 col.name, col.mssql_type, col.max_length, col.collation,
-													 target_.convert_varchar_max, "t.", alias);
-				into_cols += (i ? ", " : "") + MSSQLColumnInfo::BuildReturningExpression(
-												   col.name, col.mssql_type, col.max_length, col.collation,
-												   target_.convert_varchar_max, "INSERTED.", alias);
+				create_cols += (i ? ", " : "") +
+							   MSSQLColumnInfo::BuildReturningExpression(col.name, col.mssql_type, col.max_length,
+																		 col.collation, target_.convert_varchar_max,
+																		 target_.client_transcode, "t.", alias);
+				into_cols += (i ? ", " : "") +
+							 MSSQLColumnInfo::BuildReturningExpression(col.name, col.mssql_type, col.max_length,
+																	   col.collation, target_.convert_varchar_max,
+																	   target_.client_transcode, "INSERTED.", alias);
 			}
 			const string from = " FROM " + cached_table_name_ + " AS t WHERE 1 = 0";
 			cached_output_prefix_ =

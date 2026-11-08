@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include "catalog/mssql_catalog.hpp"
+#include "codec/code_page/code_page_codec.hpp"
 #include "codec/type_family.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -41,13 +42,15 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const tds::Request &request,
-									 const string &context_name, weak_ptr<tds::ConnectionPool> pool_handle,
-									 bool transaction_pinned, int query_timeout_seconds, bool reset_on_release)
+									 const string &context_name, bool client_transcode,
+									 weak_ptr<tds::ConnectionPool> pool_handle, bool transaction_pinned,
+									 int query_timeout_seconds, bool reset_on_release)
 	: connection_(std::move(connection)),
 	  context_name_(context_name),
 	  pool_handle_(std::move(pool_handle)),
 	  transaction_pinned_(transaction_pinned),
 	  reset_on_release_(reset_on_release),
+	  client_transcode_(client_transcode),
 	  sql_(request.sql),
 	  request_(request.IsRpc() ? request : tds::Request()),
 	  state_(MSSQLResultStreamState::Initializing),
@@ -168,6 +171,9 @@ bool MSSQLResultStream::Initialize() {
 				column_metadata_.reserve(parsed_columns.size());
 				for (const auto &col : parsed_columns) {
 					column_metadata_.push_back(col);
+				}
+				if (client_transcode_) {
+					mssql::codec::code_page::ResolveWireCodePages(column_metadata_);
 				}
 				column_names_.clear();
 				column_types_.clear();
@@ -941,20 +947,16 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 		LogTdsInfo(context, info_messages_[info_surfaced_]);
 	}
 
-	// Issue #224: a CHAR / VARCHAR / TEXT column whose collation is not a UTF-8
-	// one arrives as code-page bytes and is handed to a DuckDB VARCHAR, which
-	// is UTF-8 by contract. This is documented behaviour and deliberately NOT
-	// enforced -- validating would cost the scan's hot path in order to make a
-	// hand-written query fail loudly, and it would bill exactly the UTF-8
-	// configuration that #225 optimised hardest for, since a non-UTF8 varchar
-	// never reaches the binary kernel on the catalog path at all.
+	// Issue #224, narrowed by spec 092 D9: a CHAR / VARCHAR / TEXT column under a
+	// code page is transcoded on the client (ColumnMetadata::code_page), except on
+	// a catalog with client_transcode off and for a collation newer than the
+	// tables. There its bytes reach a DuckDB VARCHAR, which is UTF-8 by contract,
+	// verbatim. Documented and deliberately NOT enforced: validating would cost the
+	// scan's hot path to make a hand-written query fail loudly.
 	//
 	// So say it once per query instead of once per value. The check is over
 	// COLMETADATA, which is a handful of columns, and it fires only when such a
-	// column actually arrived: on the catalog path NeedsNVarcharConversion has
-	// usually already cast it to NVARCHAR server-side, and what is left is a
-	// raw mssql_scan(), or a declared VARCHAR(MAX) with
-	// mssql_convert_varchar_max off.
+	// column actually arrived.
 	// One shot per stream. COLMETADATA does not change under us, and this is
 	// reached from both the init-time and the drain-time call.
 	if (collations_warned_) {
@@ -972,15 +974,24 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 	}
 
 	for (const auto &col : column_metadata_) {
-		if (!col.IsSingleByteTextColumn() || col.IsUtf8Collation()) {
+		if (!col.IsSingleByteTextColumn() || col.IsUtf8Collation() || col.code_page != nullptr) {
 			continue;
 		}
-		// Two remediations, because the two paths give the caller different levers.
-		// A raw mssql_scan() caller wrote the T-SQL and can cast in it; a catalog
-		// scan's SQL is generated, and the only reason such a column reached here
-		// at all is that mssql_convert_varchar_max was turned off.
-		const char *fix = is_catalog_scan_ ? "Set mssql_convert_varchar_max=true so the server converts it."
-										   : "CAST it to NVARCHAR in the query to convert.";
+		// What the caller can do depends on why it was not transcoded and on the
+		// path. A raw mssql_scan() caller wrote the T-SQL and can cast in it; a
+		// catalog scan's SQL is generated, and under client_transcode off such a
+		// column reached here because mssql_convert_varchar_max was turned off too.
+		const char *fix;
+		if (client_transcode_) {
+			fix = is_catalog_scan_ ? "The collation is newer than this build's code-page tables; set "
+									 "mssql_convert_varchar_max=true so the server converts it."
+								   : "The collation is newer than this build's code-page tables; CAST it to NVARCHAR "
+									 "in the query to convert.";
+		} else if (is_catalog_scan_) {
+			fix = "Attach with client_transcode true, or set mssql_convert_varchar_max=true so the server converts it.";
+		} else {
+			fix = "Attach with client_transcode true, or CAST it to NVARCHAR in the query to convert.";
+		}
 		DUCKDB_LOG_WARNING(context,
 						   "mssql: column \"%s\" has a non-UTF-8 collation (LCID 0x%04X, SortId %u); its bytes are "
 						   "returned verbatim and may not be valid UTF-8. %s",
