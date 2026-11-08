@@ -124,7 +124,9 @@ int main() {
 	Connection conn(db);
 
 	if (!Run(hold, "ATTACH '" + Dsn() + "' AS mi_hold (TYPE mssql)") ||
-		!Run(hold, "SELECT mssql_exec('mi_hold', 'DROP TABLE IF EXISTS dbo.mi_held')") || !Run(hold, "BEGIN") ||
+		!Run(hold, "SELECT mssql_exec('mi_hold', 'DROP TABLE IF EXISTS dbo.mi_held, dbo.mi_seen')") ||
+		// The concurrency job's TestDB is created empty: the listing at the end looks for this one.
+		!Run(hold, "SELECT mssql_exec('mi_hold', 'CREATE TABLE dbo.mi_seen (id int)')") || !Run(hold, "BEGIN") ||
 		!Run(hold, "SELECT mssql_exec('mi_hold', 'CREATE TABLE dbo.mi_held (id int)')")) {
 		std::cout << "FAIL: could not set up the hold" << std::endl;
 		return 1;
@@ -145,10 +147,12 @@ int main() {
 
 	Run(hold, "ROLLBACK");
 	Run(conn, "RESET mssql_metadata_timeout");
-	Check(Scalar(conn, "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'mi_tx'") > 0,
+	Check(Scalar(conn,
+				 "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'mi_tx' AND table_name = 'mi_seen'") == 1,
 		  "the hold released, the listing loads");
 	Check(Scalar(conn, "SELECT active_connections FROM mssql_pool_stats('mi_tx')") == 0, "nothing is left checked out");
 	Run(conn, "DETACH mi_tx");
+	Run(hold, "SELECT mssql_exec('mi_hold', 'DROP TABLE IF EXISTS dbo.mi_seen')");
 
 	std::cout << (failures ? "FAILED: " + std::to_string(failures) + " check(s)" : "all checks passed") << std::endl;
 	return failures ? 1 : 0;
