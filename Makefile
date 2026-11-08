@@ -1221,6 +1221,20 @@ test-dead-connection: $(PIN_TEST_BUILD)
 	@echo "Running the dead-connection test..."
 	$(PIN_TEST_RPATH) build/test/test_dead_connection
 
+# Review of #539: a metadata load retrying on another session's lock (1222) at
+# mssql_metadata_timeout = 0 ends when the statement is interrupted. Built like the
+# dead-connection test; needs SQL Server.
+test-metadata-interrupt: $(PIN_TEST_BUILD)
+	@echo "Building the metadata interrupt test (review of #539)..."
+	@mkdir -p build/test
+	$(CXX) $(SPEC047_TEST_FLAGS) -I src/include $(SPEC047_TEST_INCLUDES) \
+	    test/cpp/test_metadata_interrupt.cpp \
+	    $(PIN_TEST_LIBS) \
+	    -o build/test/test_metadata_interrupt
+	@echo ""
+	@echo "Running the metadata interrupt test..."
+	$(PIN_TEST_RPATH) build/test/test_metadata_interrupt
+
 # Issue #369: the rowid files that create their own tables, run through the
 # sqllogictest driver of the DEBUG tree — the one build in which the scan's
 # typed copy of a projected key column into the rowid slot asserts

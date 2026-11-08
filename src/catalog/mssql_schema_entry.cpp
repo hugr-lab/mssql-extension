@@ -124,7 +124,7 @@ SimilarCatalogEntry MSSQLSchemaEntry::GetSimilarEntry(CatalogTransaction transac
 				if (!cache.TryGetTableNames(schema_name, names)) {
 					auto connection = ConnectionProvider::GetConnection(context, catalog);
 					try {
-						cache.LoadAllTableNames(*connection);
+						cache.LoadAllTableNames(context, *connection);
 					} catch (...) {
 						ConnectionProvider::ReleaseConnection(context, catalog, std::move(connection));
 						throw;
@@ -141,7 +141,7 @@ SimilarCatalogEntry MSSQLSchemaEntry::GetSimilarEntry(CatalogTransaction transac
 				throw IOException("Failed to acquire connection for table names: " + why);
 			}
 			try {
-				shared.LoadAllTableNames(*connection);
+				shared.LoadAllTableNames(context, *connection);
 			} catch (...) {
 				catalog.GetConnectionPool().Release(std::move(connection));
 				throw;

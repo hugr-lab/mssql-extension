@@ -556,7 +556,12 @@ bind's load reads one table's rows and almost never meets a held one (2 retries 
 retried, no slower on average). What it gives up: the deadlock monitor sees no cycle
 through a load, so two transactions with uncommitted DDL, each listing the catalog,
 both wait out the timeout and both fail, where one used to be rolled back in seconds
-and the other went on. A CTAS, DDL or a table's first read needs no listing and does
+and the other went on; at `mssql_metadata_timeout = 0`, which means no limit, they
+wait until the user interrupts one (the pauses ask `ClientContext::IsInterrupted` in
+50 ms slices, the context passed down every load; a schema lookup DuckDB makes with no
+context sleeps plainly). The retries run under the cache-wide `mutex_`, as the queued
+read did: while one load waits on another session's DDL, every other load of this
+catalog waits on the mutex, now for the whole retry window rather than one read. A CTAS, DDL or a table's first read needs no listing and does
 not wait for another transaction's uncommitted DDL. COPY's target
 check and a raw scan's describe also read the catalog on the pinned connection, and
 queue as before. A 1205 on a load (a platform without the SET) is reported in a

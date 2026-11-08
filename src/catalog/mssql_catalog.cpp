@@ -729,7 +729,7 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 
 	// Trigger lazy loading of schema list (ensure connection released on exception)
 	try {
-		schema_list.EnsureSchemasLoaded(*connection);
+		schema_list.EnsureSchemasLoaded(transaction.context, *connection);
 	} catch (...) {
 		if (transaction.context) {
 			ConnectionProvider::ReleaseConnection(*transaction.context, *this, std::move(connection));
@@ -796,7 +796,7 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 	}
 
 	try {
-		schema_names = schema_list.GetSchemaNames(*connection);
+		schema_names = schema_list.GetSchemaNames(context, *connection);
 	} catch (...) {
 		ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
 		throw;

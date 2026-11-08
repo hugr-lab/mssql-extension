@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "query/mssql_simple_query.hpp"
 #include "query/mssql_sql_params.hpp"
 
@@ -343,8 +344,9 @@ using MetadataRowCallback = std::function<void(const vector<string> &values)>;
 
 using MetadataSetRowCallback = std::function<void(idx_t result_set, const vector<string> &values)>;
 
-static void RunMetadataQuerySets(tds::TdsConnection &connection, const tds::Request &sql,
-								 MetadataSetRowCallback callback, int timeout_ms, const std::function<void()> &reset);
+static void RunMetadataQuerySets(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+								 const tds::Request &sql, MetadataSetRowCallback callback, int timeout_ms,
+								 const std::function<void()> &reset);
 
 // What a metadata load sends: `SET LOCK_TIMEOUT 0` inside sp_executesql, where the SET ends with
 // the call (measured: 0 inside, -1 after, whichever way the load ends). A load that never queues
@@ -359,6 +361,23 @@ static void RunMetadataQuerySets(tds::TdsConnection &connection, const tds::Requ
 // login with only db_datareader it waits all the same. LOCK_TIMEOUT needs no permission.
 //
 // Off on Fabric Warehouse and Synapse (`no_lock_wait`), unverified there.
+// A retry's pause, in slices that ask whether the statement was interrupted (Ctrl-C), as
+// ExecuteDmlBatch waits: at mssql_metadata_timeout = 0 the lock retry has no end of its own,
+// and only the user ends it (review of #539). Without a context -- a schema lookup DuckDB
+// makes with none -- it is a plain sleep.
+static void PauseUnlessInterrupted(optional_ptr<ClientContext> context, int ms) {
+	constexpr int SLICE_MS = 50;
+	for (int waited = 0; waited < ms; waited += SLICE_MS) {
+		if (context && context->IsInterrupted()) {
+			throw InterruptException();
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(std::min(SLICE_MS, ms - waited)));
+	}
+	if (context && context->IsInterrupted()) {
+		throw InterruptException();
+	}
+}
+
 static tds::Request MetadataRequest(bool no_lock_wait, const string &statement, const string &declarations = string(),
 									const std::vector<std::pair<std::string, std::string>> &values = {}) {
 	if (no_lock_wait) {
@@ -368,14 +387,17 @@ static tds::Request MetadataRequest(bool no_lock_wait, const string &statement, 
 								: mssql::BuildExecuteSqlRequest(statement, declarations, values);
 }
 
-static void RunMetadataQuery(tds::TdsConnection &connection, const tds::Request &sql, MetadataRowCallback callback,
-							 int timeout_ms, const std::function<void()> &reset) {
+static void RunMetadataQuery(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+							 const tds::Request &sql, MetadataRowCallback callback, int timeout_ms,
+							 const std::function<void()> &reset) {
 	RunMetadataQuerySets(
-		connection, sql, [&callback](idx_t, const vector<string> &values) { callback(values); }, timeout_ms, reset);
+		context, connection, sql, [&callback](idx_t, const vector<string> &values) { callback(values); }, timeout_ms,
+		reset);
 }
 
-static void RunMetadataQuerySets(tds::TdsConnection &connection, const tds::Request &sql,
-								 MetadataSetRowCallback callback, int timeout_ms, const std::function<void()> &reset) {
+static void RunMetadataQuerySets(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+								 const tds::Request &sql, MetadataSetRowCallback callback, int timeout_ms,
+								 const std::function<void()> &reset) {
 	// Log the query being executed (truncated for readability)
 	CACHE_DEBUG(1, "RunMetadataQuery: timeout=%dms, sql=%.120s%s", timeout_ms, sql.sql.c_str(),
 				sql.sql.size() > 120 ? "..." : "");
@@ -404,13 +426,12 @@ static void RunMetadataQuerySets(tds::TdsConnection &connection, const tds::Requ
 	// transaction", which names neither the deadlock nor the rollback.
 	//
 	// 1222 (MetadataRequest) is the same wait, spent outside the lock: read again
-	// until mssql_metadata_timeout, 0 meaning as long as it takes. The rerun is why
-	// every caller passes `reset`. What it gives up: the server's deadlock monitor
-	// sees no cycle through a load, so where the load's own transaction holds what
-	// the other session needs -- two transactions with uncommitted DDL, each listing
-	// the catalog -- neither gets a victim, and both wait out the timeout and fail.
-	// A cycle used to end in seconds, by rolling one of them back. A CTAS, DDL or a
-	// table's first read needs no listing (concurrent_ctas_ddl_transactions.test).
+	// until mssql_metadata_timeout, 0 meaning as long as it takes, which Ctrl-C ends
+	// (PauseUnlessInterrupted). The rerun is why every caller passes `reset`. What it gives up: the server's deadlock
+	// monitor sees no cycle through a load, so where the load's own transaction holds what the other session needs --
+	// two transactions with uncommitted DDL, each listing the catalog -- neither gets a victim, and both wait out the
+	// timeout and fail. A cycle used to end in seconds, by rolling one of them back. A CTAS, DDL or a table's first
+	// read needs no listing (concurrent_ctas_ddl_transactions.test).
 	const bool in_transaction = connection.HasTransactionDescriptor();
 	constexpr int MAX_ATTEMPTS = 6;
 	constexpr int MIN_LOCK_RETRY_MS = 20;
@@ -441,7 +462,12 @@ static void RunMetadataQuerySets(tds::TdsConnection &connection, const tds::Requ
 			CACHE_DEBUG(1, "RunMetadataQuery: completed in %lldms", (long long)elapsed);
 			return;
 		}
-		if (result.error_number == 1222 && (rows_delivered == 0 || reset)) {
+		if (result.error_number == 1222) {
+			if (rows_delivered > 0 && !reset) {
+				throw IOException(
+					"Metadata query failed: the catalog is locked by another session's uncommitted "
+					"schema change, and this load cannot be read again from the start");
+			}
 			if (timeout_ms > 0 && elapsed >= timeout_ms) {
 				throw IOException(
 					"Metadata query failed: the catalog stayed locked by another session's uncommitted "
@@ -451,7 +477,7 @@ static void RunMetadataQuerySets(tds::TdsConnection &connection, const tds::Requ
 			if (rows_delivered > 0) {
 				reset();
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(lock_retry_ms));
+			PauseUnlessInterrupted(context, lock_retry_ms);
 			lock_retry_ms = std::min(lock_retry_ms * 2, MAX_LOCK_RETRY_MS);
 			attempt--;	// MAX_ATTEMPTS counts deadlocks
 			continue;
@@ -466,7 +492,7 @@ static void RunMetadataQuerySets(tds::TdsConnection &connection, const tds::Requ
 			if (rows_delivered > 0) {
 				reset();
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
+			PauseUnlessInterrupted(context, 150 * attempt);
 			continue;
 		}
 		CACHE_DEBUG(1, "RunMetadataQuery: FAILED after %lldms — %s", (long long)elapsed, result.error_message.c_str());
@@ -497,9 +523,9 @@ const MSSQLCatalogFilter *MSSQLMetadataCache::GetFilter() const {
 	return filter_;
 }
 
-vector<string> MSSQLMetadataCache::GetSchemaNames(tds::TdsConnection &connection) {
+vector<string> MSSQLMetadataCache::GetSchemaNames(optional_ptr<ClientContext> context, tds::TdsConnection &connection) {
 	// Trigger lazy loading of schema list
-	EnsureSchemasLoaded(connection);
+	EnsureSchemasLoaded(context, connection);
 
 	std::lock_guard<std::mutex> lock(mutex_);
 	vector<string> names;
@@ -513,10 +539,11 @@ vector<string> MSSQLMetadataCache::GetSchemaNames(tds::TdsConnection &connection
 	return names;
 }
 
-bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const string &schema_name,
-										  const string &table_name, MSSQLTableMetadata &out_meta) {
+bool MSSQLMetadataCache::GetTableMetadata(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+										  const string &schema_name, const string &table_name,
+										  MSSQLTableMetadata &out_meta) {
 	// Only load schemas (fast — just schema names, no tables)
-	EnsureSchemasLoaded(connection);
+	EnsureSchemasLoaded(context, connection);
 
 	std::lock_guard<std::mutex> lock(mutex_);
 
@@ -587,7 +614,7 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 	// call's own, so erasing it is the whole undo.
 	try {
 		ExecuteMetadataQuerySets(
-			connection, query_request,
+			context, connection, query_request,
 			[this, &table_meta, &have_object](idx_t result_set, const vector<string> &values) {
 				// Routed by which statement of the batch produced the row, never by
 				// its width (review of #345 -- a column added to one query must not
@@ -703,8 +730,9 @@ bool MSSQLMetadataCache::TryGetCachedSchemaNames(vector<string> &out_names) {
 	return true;
 }
 
-void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, const string &schema_name) {
-	EnsureSchemasLoaded(connection);
+void MSSQLMetadataCache::LoadAllTableMetadata(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+											  const string &schema_name) {
+	EnsureSchemasLoaded(context, connection);
 
 	// Check if all tables in this schema already have columns loaded
 	{
@@ -754,7 +782,7 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 	// GetTableMetadata, one table, one seek — so ordinary queries stay lazy.
 	CACHE_DEBUG(1, "LoadAllTableMetadata('%s') — loading every schema in one query", schema_name.c_str());
 	idx_t all_schemas = 0, all_tables = 0, all_columns = 0;
-	LoadAllSchemasMetadata(connection, all_schemas, all_tables, all_columns);
+	LoadAllSchemasMetadata(context, connection, all_schemas, all_tables, all_columns);
 }
 
 //===----------------------------------------------------------------------===//
@@ -765,13 +793,14 @@ void MSSQLMetadataCache::LoadAllTableMetadata(tds::TdsConnection &connection, co
 // Whole-catalog metadata load (spec 071 W2)
 //===----------------------------------------------------------------------===//
 
-void MSSQLMetadataCache::LoadAllSchemasMetadata(tds::TdsConnection &connection, idx_t &schema_count, idx_t &table_count,
-												idx_t &column_count) {
+void MSSQLMetadataCache::LoadAllSchemasMetadata(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+												idx_t &schema_count, idx_t &table_count, idx_t &column_count) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	LoadAllSchemasMetadataLocked(connection, schema_count, table_count, column_count);
+	LoadAllSchemasMetadataLocked(context, connection, schema_count, table_count, column_count);
 }
 
-void MSSQLMetadataCache::LoadAllSchemasMetadataLocked(tds::TdsConnection &connection, idx_t &schema_count,
+void MSSQLMetadataCache::LoadAllSchemasMetadataLocked(optional_ptr<ClientContext> context,
+													  tds::TdsConnection &connection, idx_t &schema_count,
 													  idx_t &table_count, idx_t &column_count) {
 	schema_count = 0;
 	table_count = 0;
@@ -814,7 +843,7 @@ void MSSQLMetadataCache::LoadAllSchemasMetadataLocked(tds::TdsConnection &connec
 	// each schema's other fields (its name, and any state a future field adds)
 	// instead of rebuilding them from nothing.
 	BulkLoadStage stage;
-	LoadObjectsAndColumnsLocked(connection, nullptr, stage);
+	LoadObjectsAndColumnsLocked(context, connection, nullptr, stage);
 	auto &staged = stage.tables;
 	table_count = stage.table_count;
 	column_count = stage.column_count;
@@ -852,8 +881,9 @@ void MSSQLMetadataCache::LoadAllSchemasMetadataLocked(tds::TdsConnection &connec
 				(unsigned long long)staged.size(), (unsigned long long)table_count, (unsigned long long)column_count);
 }
 
-void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const string &schema_name, idx_t &schema_count,
-									 idx_t &table_count, idx_t &column_count) {
+void MSSQLMetadataCache::BulkLoadAll(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+									 const string &schema_name, idx_t &schema_count, idx_t &table_count,
+									 idx_t &column_count) {
 	schema_count = 0;
 	table_count = 0;
 	column_count = 0;
@@ -870,7 +900,7 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	// ONE lock across the list and the load (review of #377): released in
 	// between, an invalidation could clear the list the load then relies on.
 	std::lock_guard<std::mutex> lock(mutex_);
-	EnsureSchemasLoadedLocked(connection);
+	EnsureSchemasLoadedLocked(context, connection);
 
 	// With no schema named, ONE query covers the catalog (spec 071 W2).
 	//
@@ -882,7 +912,7 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	// which was also the reason mssql_preload_catalog() was O(schemas x objects)
 	// and could not rescue issue #86 however often it was recommended.
 	if (schema_name.empty()) {
-		LoadAllSchemasMetadataLocked(connection, schema_count, table_count, column_count);
+		LoadAllSchemasMetadataLocked(context, connection, schema_count, table_count, column_count);
 		return;
 	}
 
@@ -922,7 +952,7 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	// cache until the query has returned, so a failure mid-load leaves it as it
 	// was).
 	BulkLoadStage stage;
-	LoadObjectsAndColumnsLocked(connection, &target_schema, stage);
+	LoadObjectsAndColumnsLocked(context, connection, &target_schema, stage);
 
 	// Publish per table rather than wholesale: this query may not cover every
 	// table the schema legitimately holds -- one excluded by table_filter, or
@@ -950,7 +980,8 @@ void MSSQLMetadataCache::BulkLoadAll(tds::TdsConnection &connection, const strin
 	schema_count = 1;
 }
 
-void MSSQLMetadataCache::LoadObjectsAndColumnsLocked(tds::TdsConnection &connection, const string *one_schema,
+void MSSQLMetadataCache::LoadObjectsAndColumnsLocked(optional_ptr<ClientContext> context,
+													 tds::TdsConnection &connection, const string *one_schema,
 													 BulkLoadStage &stage) {
 	// Both filters push to the server where they convert to LIKE -- the schema
 	// one is the only thing that can make a whole-catalog load smaller than the
@@ -988,7 +1019,7 @@ void MSSQLMetadataCache::LoadObjectsAndColumnsLocked(tds::TdsConnection &connect
 	// insertion because both containers are node-based unordered_maps.
 	unordered_map<string, MSSQLTableMetadata *> by_object_id;
 	ExecuteMetadataQuerySets(
-		connection, request,
+		context, connection, request,
 		[&](idx_t result_set, const vector<string> &values) {
 			if (result_set == 0) {
 				// The objects: object_id, schema, name, type, approx_rows,
@@ -1108,7 +1139,8 @@ void MSSQLMetadataCache::ForEachTableInSchema(
 // Cache Management
 //===----------------------------------------------------------------------===//
 
-void MSSQLMetadataCache::Refresh(tds::TdsConnection &connection, const string &database_collation) {
+void MSSQLMetadataCache::Refresh(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+								 const string &database_collation) {
 	std::lock_guard<std::mutex> lock(mutex_);
 
 	// Mark as loading
@@ -1121,13 +1153,13 @@ void MSSQLMetadataCache::Refresh(tds::TdsConnection &connection, const string &d
 
 	try {
 		// Load schemas
-		LoadSchemas(connection);
+		LoadSchemas(context, connection);
 
 		// Spec 084 D6: the whole catalog in one batch -- objects, columns, keys --
 		// instead of one listing per schema and one columns query PER TABLE
 		// (200k round trips on a 200k-object catalog, and no keys).
 		idx_t schema_count = 0, table_count = 0, column_count = 0;
-		LoadAllSchemasMetadataLocked(connection, schema_count, table_count, column_count);
+		LoadAllSchemasMetadataLocked(context, connection, schema_count, table_count, column_count);
 
 		// Update state and timestamp (backward-compat)
 		state_ = MSSQLCacheState::LOADED;
@@ -1219,8 +1251,8 @@ void MSSQLMetadataCache::SetTestFailAfterRows(int64_t rows) {
 	test_fail_after_rows_ = rows;
 }
 
-void MSSQLMetadataCache::ExecuteMetadataQuery(tds::TdsConnection &connection, const tds::Request &sql,
-											  MSSQLMetadataCache::MetadataRowCallback callback,
+void MSSQLMetadataCache::ExecuteMetadataQuery(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+											  const tds::Request &sql, MSSQLMetadataCache::MetadataRowCallback callback,
 											  MSSQLMetadataCache::MetadataResetCallback reset) {
 	// Issue #317: the only deliberate way to a mid-query failure. Everything
 	// that causes one in the wild — a metadata timeout, a reset connection, a
@@ -1254,10 +1286,11 @@ void MSSQLMetadataCache::ExecuteMetadataQuery(tds::TdsConnection &connection, co
 			}
 		};
 	}
-	RunMetadataQuery(connection, sql, std::move(callback), metadata_timeout_ms_, reset);
+	RunMetadataQuery(context, connection, sql, std::move(callback), metadata_timeout_ms_, reset);
 }
 
-void MSSQLMetadataCache::ExecuteMetadataQuerySets(tds::TdsConnection &connection, const tds::Request &sql,
+void MSSQLMetadataCache::ExecuteMetadataQuerySets(optional_ptr<ClientContext> context, tds::TdsConnection &connection,
+												  const tds::Request &sql,
 												  MSSQLMetadataCache::MetadataSetRowCallback callback,
 												  MSSQLMetadataCache::MetadataResetCallback reset) {
 	// The #317 lever, as in ExecuteMetadataQuery: counts rows across every
@@ -1281,7 +1314,7 @@ void MSSQLMetadataCache::ExecuteMetadataQuerySets(tds::TdsConnection &connection
 			}
 		};
 	}
-	RunMetadataQuerySets(connection, sql, std::move(callback), metadata_timeout_ms_, reset);
+	RunMetadataQuerySets(context, connection, sql, std::move(callback), metadata_timeout_ms_, reset);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1289,16 +1322,17 @@ void MSSQLMetadataCache::ExecuteMetadataQuerySets(tds::TdsConnection &connection
 // Incremental Cache Loading - Lazy Loading (T010-T012)
 //===----------------------------------------------------------------------===//
 
-void MSSQLMetadataCache::EnsureSchemasLoaded(tds::TdsConnection &connection) {
+void MSSQLMetadataCache::EnsureSchemasLoaded(optional_ptr<ClientContext> context, tds::TdsConnection &connection) {
 	// Issue #178 (D4): no unlocked fast path — the old pre-lock check read
 	// schemas_load_state_ / schemas_last_refresh_ racily. The mutex is cheap
 	// next to everything around it (a catalog lookup already did a settings
 	// read and a pool interaction to get here).
 	std::lock_guard<std::mutex> lock(mutex_);
-	EnsureSchemasLoadedLocked(connection);
+	EnsureSchemasLoadedLocked(context, connection);
 }
 
-void MSSQLMetadataCache::EnsureSchemasLoadedLocked(tds::TdsConnection &connection) {
+void MSSQLMetadataCache::EnsureSchemasLoadedLocked(optional_ptr<ClientContext> context,
+												   tds::TdsConnection &connection) {
 	if (schemas_load_state_ == CacheLoadState::LOADED && !IsTTLExpired(schemas_last_refresh_, ttl_seconds_)) {
 		CACHE_DEBUG(2, "EnsureSchemasLoaded — already loaded (%zu schemas)", schemas_.size());
 		return;
@@ -1326,7 +1360,7 @@ void MSSQLMetadataCache::EnsureSchemasLoadedLocked(tds::TdsConnection &connectio
 
 		vector<string> names;
 		ExecuteMetadataQuery(
-			connection, MetadataRequest(no_lock_wait_, schema_sql),
+			context, connection, MetadataRequest(no_lock_wait_, schema_sql),
 			[&names](const vector<string> &values) {
 				if (!values.empty()) {
 					names.push_back(values[0]);
@@ -1532,7 +1566,7 @@ CacheLoadState MSSQLMetadataCache::GetColumnsState(const string &schema_name, co
 // Internal Loading Methods
 //===----------------------------------------------------------------------===//
 
-void MSSQLMetadataCache::LoadSchemas(tds::TdsConnection &connection) {
+void MSSQLMetadataCache::LoadSchemas(optional_ptr<ClientContext> context, tds::TdsConnection &connection) {
 	string sql = SCHEMA_DISCOVERY_SQL;
 	// Push schema filter to SQL Server if convertible to LIKE
 	if (filter_ && filter_->HasSchemaFilter()) {
@@ -1544,7 +1578,7 @@ void MSSQLMetadataCache::LoadSchemas(tds::TdsConnection &connection) {
 	sql += "\nORDER BY s.name";
 
 	ExecuteMetadataQuery(
-		connection, MetadataRequest(no_lock_wait_, sql),
+		context, connection, MetadataRequest(no_lock_wait_, sql),
 		[this](const vector<string> &values) {
 			if (!values.empty()) {
 				string schema_name = values[0];
@@ -1582,11 +1616,11 @@ bool MSSQLMetadataCache::TryGetTableNames(const string &schema_name, vector<stri
 	return true;
 }
 
-void MSSQLMetadataCache::LoadAllTableNames(tds::TdsConnection &connection) {
+void MSSQLMetadataCache::LoadAllTableNames(optional_ptr<ClientContext> context, tds::TdsConnection &connection) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	unordered_map<string, vector<string>> staged;
 	ExecuteMetadataQuery(
-		connection, MetadataRequest(no_lock_wait_, TABLE_NAMES_SQL),
+		context, connection, MetadataRequest(no_lock_wait_, TABLE_NAMES_SQL),
 		[&](const vector<string> &values) {
 			if (values.size() < 2) {
 				return;
