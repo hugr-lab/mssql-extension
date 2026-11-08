@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`mssql_scan` of a statement that returns no result set is refused by name** (#525). `PRINT`, `SET`, a procedure that only prints bound with no columns, and DuckDB answered with an internal error (`Table function must return at least one column`). It now says the statement returns no result set and points at `mssql_exec`; a batch run at bind to learn its shape gives its connection back first. `mssql_scan_params` too.
 - **A CTAS from a code-page column stored mangled text.** Over BCP, `CREATE TABLE ... AS SELECT` from a column under a code-page collation declared the rows UTF-8 and the server stored those bytes in the column's page: `ж` read back as `Р¶`, silently. Such a column now travels as nvarchar, and so does a plain one under an `mssql_utf8_collation` naming a code page. Tables already created this way hold the wrong bytes.
 - **A parameter from an annotated string column lost its non-ASCII characters.** It was declared `varchar(n)`, which takes the database's code page, not the column's: `ж` became `?`. Such a value goes as nvarchar.
 - **A statement whose branches return different string lengths** (`IF` arms, a procedure's) failed with "result shape changed between bind and execution". A stream no longer than the described length now fits.

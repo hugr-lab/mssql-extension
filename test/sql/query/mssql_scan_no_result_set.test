@@ -1,0 +1,58 @@
+# name: test/sql/query/mssql_scan_no_result_set.test
+# description: mssql_scan of a statement that returns no result set is refused by name
+# group: [query]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# Issue #525: PRINT, SET, a procedure that only prints -- the bind had no columns, and DuckDB
+# answered with an InternalException ("Table function must return at least one column"). Both
+# ways a shape is learned are covered: the describe, and running a batch the server cannot
+# describe (it creates a #temp table) at bind, whose connection must go back to the pool.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS nrs (TYPE mssql);
+
+statement error
+SELECT * FROM mssql_scan('nrs', 'PRINT ''hello''');
+----
+mssql_scan: the statement returns no result set
+
+statement error
+SELECT * FROM mssql_scan('nrs', 'SET NOCOUNT ON');
+----
+mssql_scan: the statement returns no result set
+
+statement error
+SELECT * FROM mssql_scan_params('nrs', 'PRINT @m', {'m': 'hello'});
+----
+mssql_scan_params: the statement returns no result set
+
+statement error
+SELECT * FROM mssql_scan('nrs', 'CREATE TABLE #nrs (i int); INSERT #nrs VALUES (1)');
+----
+mssql_scan: the statement returns no result set
+
+# Nothing is left checked out, and the catalog goes on working.
+query I
+SELECT active_connections FROM mssql_pool_stats('nrs');
+----
+0
+
+query I
+SELECT * FROM mssql_scan('nrs', 'SELECT 1 AS one');
+----
+1
+
+# A statement run for its effect has its function.
+query I
+SELECT mssql_exec('nrs', 'PRINT ''hello''') >= 0;
+----
+true
+
+statement ok
+DETACH nrs;
