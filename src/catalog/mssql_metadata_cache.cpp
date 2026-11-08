@@ -118,7 +118,9 @@ SELECT
     o.type AS object_type,
     CAST(ISNULL(OBJECTPROPERTYEX(o.object_id, 'Cardinality'), 0) AS BIGINT) AS approx_rows,
     ISNULL(i.type, 0) AS index_type,
-    CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END AS is_partitioned
+    CASE WHEN ps.data_space_id IS NULL THEN 0 ELSE 1 END AS is_partitioned,
+    o.name AS object_name,
+    o.is_ms_shipped
 FROM sys.objects o
 LEFT JOIN sys.indexes i ON i.object_id = o.object_id AND i.index_id IN (0, 1) AND i.is_hypothetical = 0
 LEFT JOIN sys.partition_schemes ps ON ps.data_space_id = i.data_space_id
@@ -554,6 +556,12 @@ bool MSSQLMetadataCache::GetTableMetadata(tds::TdsConnection &connection, const 
 					// on a partition scheme. Both drive the write path's TABLOCK and
 					// sort decisions.
 					ParseTableShape(values, 2, 3, table_meta);
+					if (values.size() >= 6) {
+						table_meta.server_name = values[4];
+						string type = values[0];
+						StringUtil::Trim(type);
+						table_meta.listed = (type == "U" || type == "V") && !FlagIsSet(values[5]);
+					}
 					CACHE_DEBUG(2, "table shape: %s kind=%d partitioned=%d", table_meta.name.c_str(),
 								(int)table_meta.index_kind, (int)table_meta.is_partitioned);
 					return;

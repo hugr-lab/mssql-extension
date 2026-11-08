@@ -92,7 +92,8 @@ MSSQLTableEntry::MSSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, c
 	  mssql_columns_(metadata.columns),
 	  object_type_(metadata.object_type),
 	  approx_row_count_(metadata.approx_row_count),
-	  index_kind_(metadata.index_kind) {
+	  index_kind_(metadata.index_kind),
+	  shown_in_listing_(metadata.ShownInListing()) {
 	// Spec 076 W2 / 084 D5: every load that publishes a table's columns carries
 	// its key, so the entry is born with it.
 	D_ASSERT(metadata.pk_loaded);

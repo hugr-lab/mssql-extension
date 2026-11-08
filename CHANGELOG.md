@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`duckdb_tables()` and `duckdb_columns()` filtered by `table_name` look the tables up instead of listing the catalog.** DuckDB now hands a `table_name` / `table_oid` filter to the catalog. Names a filter pins (`=`, `IN`, an `OR` of names; at most 64) are looked up one by one, as a query's first use of a table is, so `SELECT … FROM duckdb_columns() WHERE schema_name = 'dbo' AND table_name = 't'` costs a round trip per table rather than a metadata load of every table, and does not wait for another session's uncommitted DDL elsewhere in the database. An oid filter is answered from the tables already loaded. `LIKE`, `lower()` and the rest still list. A `schema_name` filter already kept the other schemas out, but on the server any read of the catalog narrowed by schema still reads every schema's rows, so only a lookup by name avoids another session's locks.
+
 ### Changed
+
+- **DuckDB pin: the head of the 2.0 branch** (`v2.0-cyanoptera`, 880 backported fixes past v2.0.0, among them the catalog filter pushdown above). The CLI now reports a failing statement and exits 1 (at v2.0.0 it printed nothing and exited 0).
 
 - **The macOS release binaries need macOS 15 or later** (v0.3.0's needed 14). GitHub retired its macOS 14 runner images on 2026-11-02, so the macOS builds moved to macos-15; the binaries are built for macOS 15.0 (`MACOSX_DEPLOYMENT_TARGET`), and the release fails a macOS build that requires anything else (`scripts/ci/check_macos_minos.sh`). `INSTALL mssql FROM community` is unaffected.
 - **The release binaries load into a stock DuckDB when the DuckDB pin is a release tag.** DuckDB 2.0 labels every build `-dev` unless told otherwise, the release tag's commit included. So the v0.3.0 binaries attached to the GitHub release say `2ec7e8401c` and load only into that build: a stock DuckDB 2.0.0 refuses them ("built specifically for DuckDB version '2ec7e8401c'"). With the pin on a tag, the build is labelled with the tag: CI, the release workflow and `make` set `OVERRIDE_GIT_DESCRIBE` (`scripts/ci/duckdb_release_tag.sh`). The binaries then load into that DuckDB, unsigned (`-unsigned`), and `INSTALL azure` works in a local or CI build, since DuckDB publishes its extensions for a release only under the tag. The release smoke test fails a release pin whose CLI or extension does not carry the tag (`scripts/ci/check_duckdb_label.sh`). `INSTALL mssql FROM community` is unchanged.

@@ -59,6 +59,11 @@ public:
 	void Alter(CatalogTransaction transaction, AlterInfo &info) override;
 
 	void Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
+	//! DuckDB #27930: duckdb_tables() / duckdb_columns() hand their table_name and table_oid
+	//! filters down. Names a filter pins (= / IN) are looked up one by one, as a bind would; an
+	//! oid can only belong to an entry already built, so it is answered from those. Anything else
+	//! lists the schema, as before. DuckDB re-checks every entry this hands back.
+	void Scan(ClientContext &context, SchemaScanInfo &info) override;
 	//! Issue #412: DuckDB's "did you mean" hint for a missing table reads entry
 	//! names only, and the default walks Scan, which loads every column of the
 	//! catalog. This one compares table names, from the cache or one

@@ -44,7 +44,19 @@ enum class CacheLoadState : uint8_t {
 //===----------------------------------------------------------------------===//
 
 struct MSSQLTableMetadata {
-	string name;					  // Table/view name
+	string name;  // Table/view name
+	//! The object's own name, from the single-table load, which is looked up by the name asked
+	//! for (OBJECT_ID, the database's collation). Empty from a listing, whose names are the
+	//! server's spelling already.
+	string server_name;
+	//! False when the single-table load found an object a listing leaves out: OBJECT_ID resolves
+	//! any object, a table-valued function included, and the listing takes only user tables and
+	//! views (`o.type IN ('U', 'V') AND o.is_ms_shipped = 0`).
+	bool listed = true;
+	//! Whether a listing would show this table under this name (ShownInListing on the entry).
+	bool ShownInListing() const {
+		return listed && (server_name.empty() || server_name == name);
+	}
 	MSSQLObjectType object_type;	  // TABLE or VIEW
 	vector<MSSQLColumnInfo> columns;  // Column metadata
 	idx_t approx_row_count;			  // Cardinality estimate from sys.partitions
@@ -438,7 +450,14 @@ private:
 	// Atomics, NOT guarded by mutex_ (issue #178 D4): written by EnsureCacheLoaded
 	// on every catalog lookup while loaders concurrently read them mid-query
 	// (ExecuteMetadataQuery runs WITH mutex_ held, so these must be lock-free).
-	std::atomic<int64_t> ttl_seconds_;				// Cache TTL (0 = manual only)
+	std::atomic<int64_t> ttl_seconds_;	// Cache TTL (0 = manual only)
+
+public:
+	int64_t GetTTLSeconds() const {
+		return ttl_seconds_.load();
+	}
+
+private:
 	std::atomic<int> metadata_timeout_ms_;			// Metadata query timeout in ms (default 5 min)
 	std::atomic<int64_t> test_fail_after_rows_{0};	// TEST ONLY, issue #317
 

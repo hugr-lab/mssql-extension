@@ -188,6 +188,7 @@ set(EXTENSION_SOURCES
     src/catalog/mssql_catalog_plan.cpp
     src/catalog/mssql_catalog_pushdown.cpp
     src/catalog/mssql_bind_anchors.cpp
+    src/catalog/mssql_entry_name_filter.cpp
     src/catalog/mssql_schema_entry.cpp
     src/catalog/mssql_table_entry.cpp
     src/catalog/mssql_table_set.cpp

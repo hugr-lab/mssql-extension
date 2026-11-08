@@ -50,6 +50,9 @@ public:
 	// Scan all entries (loads all tables if not already fully loaded)
 	void Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback);
 
+	// The entries already built, loading nothing (an oid filter's answer, MSSQLSchemaEntry::Scan)
+	void ScanBuilt(ClientContext &context, const std::function<void(CatalogEntry &)> &callback);
+
 	//===----------------------------------------------------------------------===//
 	// Entry Loading
 	//===----------------------------------------------------------------------===//

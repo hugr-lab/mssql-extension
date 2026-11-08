@@ -1,6 +1,7 @@
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
+#include "catalog/mssql_entry_name_filter.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "catalog/mssql_table_options.hpp"
 #include "catalog/mssql_transaction.hpp"
@@ -8,6 +9,7 @@
 #include "codec/target_string_type.hpp"
 #include "connection/mssql_connection_provider.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/entry_scan_filters.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
@@ -76,6 +78,45 @@ void MSSQLSchemaEntry::Scan(ClientContext &context, CatalogType type,
 
 	// Scan all tables
 	tables_.Scan(context, callback);
+}
+
+void MSSQLSchemaEntry::Scan(ClientContext &context, SchemaScanInfo &info) {
+	if (info.type != CatalogType::TABLE_ENTRY || !info.filter) {
+		SchemaCatalogEntry::Scan(context, info);
+		return;
+	}
+	vector<string> names;
+	if (mssql::EntryNameCandidates(info.filter->GetName(), LogicalType::VARCHAR, names)) {
+		auto &stats_provider = GetMSSQLCatalog().GetStatisticsProvider();
+		const string schema_name = name.GetIdentifierName();
+		for (const auto &table_name : names) {
+			auto entry = tables_.GetEntry(context, table_name);
+			// Found by the name asked for, which the server compares under its collation: only
+			// an entry named as the server spells it is what a listing would have shown.
+			if (!entry || !entry->Cast<MSSQLTableEntry>().ShownInListing()) {
+				continue;
+			}
+			// The count loaded with the entry, as a listing preloads it: else duckdb_tables()'s
+			// storage info asks the server once per table (measured). Not in a transaction,
+			// which reads the entry's own count and must not write the shared statistics.
+			if (context.transaction.IsAutoCommit()) {
+				auto &table = entry->Cast<MSSQLTableEntry>();
+				stats_provider.PreloadRowCount(schema_name, table.name.GetIdentifierName(), table.GetApproxRowCount());
+			}
+			info.callback(*entry);
+		}
+		return;
+	}
+	// An oid is given to an entry when it is built and a rebuilt entry gets a new one, so an
+	// entry not built yet cannot carry the oid asked for: the built ones are the whole answer.
+	// Not in a transaction, whose entries come from its own metadata layer, nor under a cache TTL,
+	// past which a listing reloads what the built entries may no longer match.
+	if (!info.filter->GetName() && info.filter->GetOid() && context.transaction.IsAutoCommit() &&
+		GetMSSQLCatalog().GetMetadataCache().GetTTLSeconds() == 0) {
+		tables_.ScanBuilt(context, info.callback);
+		return;
+	}
+	SchemaCatalogEntry::Scan(context, info);
 }
 
 SimilarCatalogEntry MSSQLSchemaEntry::GetSimilarEntry(CatalogTransaction transaction,
