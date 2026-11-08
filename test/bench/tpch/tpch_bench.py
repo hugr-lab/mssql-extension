@@ -207,26 +207,22 @@ def cmd_gen(args):
 
 # --------------------------------------------------------------------------- load
 
-def cmd_load(args):
-    cfg = server()
-    data = pathlib.Path(args.data_dir) / f"sf{args.sf:g}"
-    missing = [t for t in TABLES if not (data / f"{t}.parquet").exists()]
-    if missing:
-        sys.exit(f"error: no parquet for {missing} under {data} -- run `gen` first")
+def recreate_database_statements(cfg, args):
+    """Drop and recreate the benchmark database, on a `master` attachment."""
     db = args.db
-    if args.strings == "utf8" and not args.collation:
-        args.collation = UTF8_COLLATION
-    # No statement timeout: REORGANIZE and FULLSCAN statistics on a large lineitem
-    # run for minutes.
-    s = ["LOAD mssql;", "SET mssql_query_timeout = 0;", f"ATTACH '{esc(dsn(cfg, 'master', args.encrypt))}' AS m (TYPE mssql);"]
-    s.append(
+    return [
+        f"ATTACH '{esc(dsn(cfg, 'master', args.encrypt))}' AS m (TYPE mssql);",
         "SELECT mssql_exec('m', '" + esc(
             f"IF DB_ID(N'{db}') IS NOT NULL BEGIN ALTER DATABASE [{db}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; "
             f"DROP DATABASE [{db}]; END; CREATE DATABASE [{db}]"
             + (f" COLLATE {args.collation}" if args.collation else "")
-            + f"; ALTER DATABASE [{db}] SET RECOVERY SIMPLE; ALTER DATABASE [{db}] SET QUERY_STORE = OFF;") + "');")
-    s.append("DETACH m;")
-    s.append(f"ATTACH '{esc(dsn(cfg, db, args.encrypt))}' AS t (TYPE mssql, remote_pushdown false);")
+            + f"; ALTER DATABASE [{db}] SET RECOVERY SIMPLE; ALTER DATABASE [{db}] SET QUERY_STORE = OFF;") + "');",
+        "DETACH m;",
+    ]
+
+
+def create_table_statements(args):
+    out = []
     for tb in TABLES:
         ddl = f"CREATE TABLE dbo.{tb} ({columns(tb, args.strings)}"
         if args.layout == "rowstore":
@@ -234,20 +230,49 @@ def cmd_load(args):
         ddl += ")"
         if args.layout == "columnstore":
             ddl += f"; CREATE CLUSTERED COLUMNSTORE INDEX cci_{tb} ON dbo.{tb}"
-        s.append(f"SELECT mssql_exec('t', '{esc(ddl)}');")
-    s.append("SELECT mssql_invalidate_cache('t');")
-    s.append(".timer on")
+        out.append(f"SELECT mssql_exec('t', '{esc(ddl)}');")
+    return out
+
+
+def load_statements(data):
+    """One marked, timed INSERT per table."""
+    out = [".timer on"]
     for tb in TABLES:
-        s.append(f".print @@LOAD {tb}@@")
-        s.append(f"INSERT INTO t.dbo.{tb} SELECT * FROM read_parquet('{data / (tb + '.parquet')}');")
-    s.append(".timer off")
+        out.append(f".print @@LOAD {tb}@@")
+        out.append(f"INSERT INTO t.dbo.{tb} SELECT * FROM read_parquet('{data / (tb + '.parquet')}');")
+    out.append(".timer off")
+    return out
+
+
+def post_load_statements(args):
+    """Statistics, and for a columnstore the rowgroup compression first."""
+    out = []
     for tb in TABLES:
         post = f"UPDATE STATISTICS dbo.{tb} WITH FULLSCAN"
         if args.layout == "columnstore":
             post = f"ALTER INDEX ALL ON dbo.{tb} REORGANIZE WITH (COMPRESS_ALL_ROW_GROUPS = ON); " + post
-        s.append(f"SELECT mssql_exec('t', '{esc(post)}');")
-    for tb in TABLES:
-        s.append(f"SELECT '{tb}' AS t, count(*) AS n FROM t.dbo.{tb};")
+        out.append(f"SELECT mssql_exec('t', '{esc(post)}');")
+    return out
+
+
+def cmd_load(args):
+    cfg = server()
+    data = pathlib.Path(args.data_dir) / f"sf{args.sf:g}"
+    missing = [t for t in TABLES if not (data / f"{t}.parquet").exists()]
+    if missing:
+        sys.exit(f"error: no parquet for {missing} under {data} -- run `gen` first")
+    if args.strings == "utf8" and not args.collation:
+        args.collation = UTF8_COLLATION
+    # No statement timeout: REORGANIZE and FULLSCAN statistics on a large lineitem
+    # run for minutes.
+    s = ["LOAD mssql;", "SET mssql_query_timeout = 0;"]
+    s += recreate_database_statements(cfg, args)
+    s.append(f"ATTACH '{esc(dsn(cfg, args.db, args.encrypt))}' AS t (TYPE mssql, remote_pushdown false);")
+    s += create_table_statements(args)
+    s.append("SELECT mssql_invalidate_cache('t');")
+    s += load_statements(data)
+    s += post_load_statements(args)
+    s += [f"SELECT '{tb}' AS t, count(*) AS n FROM t.dbo.{tb};" for tb in TABLES]
     rc, text = run_cli(binary("B"), "\n".join(s) + "\n", cfg)
     print(text)
     if rc != 0:
@@ -320,6 +345,53 @@ NO_RUN_TIME = "no `Run Time` line (see the session log)"
 COUNTERS = "[MSSQL COUNTERS]"
 
 
+def _marker(line, tag):
+    """(is this a marker, the query it opens).
+
+    The query is None for a marker of ANOTHER tag -- a warmup pass's `@@W q01@@`
+    while reading the timed `T` ones -- which closes the current section and
+    starts no new one, so the warmup's output is attributed to nothing.
+    """
+    m = MARKER.match(line.strip())
+    if not m:
+        return False, None
+    return True, m.group(2) if m.group(1) == tag else None
+
+
+def _absorb(line, seconds, extra):
+    """Fold one line of a query's section in. -> the section's seconds.
+
+    Appends to `extra` -- the unexpected output that makes the query an error
+    rather than a timing. A `[MSSQL COUNTERS]` line is neither: it is expected
+    output from a variable CLAUDE.md tells the operator to set.
+    """
+    if line.lstrip().startswith(COUNTERS):
+        return seconds
+    timing = RUN_TIME.search(line)
+    if timing:
+        # A SECOND Run Time inside one section is consumed rather than counted
+        # as unexpected output: the CLI prints one for a failed statement too,
+        # after its error text.
+        return float(timing.group(1)) if seconds is None else seconds
+    if line.strip():
+        extra.append(line.strip())
+    return seconds
+
+
+def _verdict(seconds, extra):
+    """One query's (seconds, error), from what followed its marker.
+
+    Unexpected output wins over a timing: the CLI prints a failure's text and
+    THEN a `Run Time` for it, because END_TIMER fires before the error check
+    (issue #505 item 2).
+    """
+    if extra:
+        return None, " ".join(extra)[:300]
+    if seconds is None:
+        return None, NO_RUN_TIME
+    return seconds, None
+
+
 def parse_marked(text, tag):
     """Map each `@@<tag> <q>@@` marker to (seconds, error) from the lines after it.
 
@@ -356,33 +428,16 @@ def parse_marked(text, tag):
     out = {}
     current, seconds, extra = None, None, []
 
-    def close():
-        if current is None:
-            return
-        if extra:
-            out[current] = (None, " ".join(extra)[:300])
-        elif seconds is None:
-            out[current] = (None, NO_RUN_TIME)
-        else:
-            out[current] = (seconds, None)
-
     for line in text.splitlines():
-        m = MARKER.match(line.strip())
-        if m:
-            close()
-            current, seconds, extra = (m.group(2), None, []) if m.group(1) == tag else (None, None, [])
-            continue
-        if current is None:
-            continue
-        if line.lstrip().startswith(COUNTERS):
-            continue
-        if RUN_TIME.search(line):
-            if seconds is None:
-                seconds = float(RUN_TIME.search(line).group(1))
-            continue
-        if line.strip():
-            extra.append(line.strip())
-    close()
+        is_marker, query = _marker(line, tag)
+        if is_marker:
+            if current is not None:
+                out[current] = _verdict(seconds, extra)
+            current, seconds, extra = query, None, []
+        elif current is not None:
+            seconds = _absorb(line, seconds, extra)
+    if current is not None:
+        out[current] = _verdict(seconds, extra)
     return out
 
 
@@ -452,6 +507,49 @@ def selected(args):
     return clients, queries
 
 
+def session_results(client, cfg, args, queries, rep):
+    """One client's timed session. -> (results, session text).
+
+    A timeout is not a lost session: the exception still carries the stdout of
+    every query that DID finish, Run Time lines included, so it is parsed
+    rather than discarded.
+    """
+    try:
+        return timed_session(client, cfg, args, queries)
+    except subprocess.TimeoutExpired as exc:
+        # mask() it: this path never went through run_cli's masking, and an
+        # ATTACH failure can quote the connection string back.
+        text = mask(decode_output(exc.output), cfg)
+        res = parse_marked(text, "T")
+        note = f"session timed out after {args.timeout}s"
+        hung = name_hung_query(res, note)
+        for q in queries:
+            res.setdefault(q, (None, note))
+        print(f"rep {rep + 1} {client:6s} -- SESSION TIMEOUT after {args.timeout}s"
+              + (f", {hung} was still running" if hung else "")
+              + f", keeping {sum(1 for v in res.values() if v[0] is not None)} completed query(s)",
+              flush=True)
+        return res, text
+
+
+def write_results(writer, args, run_id, rep, client, queries, res):
+    """One session's rows into timings.csv. -> how many errored."""
+    errored = 0
+    for q in queries:
+        sec, err = res.get(q, (None, "no marker in output"))
+        writer.writerow({"run": run_id, "db": args.db, "client": client, "rep": rep + 1, "query": q,
+                         "seconds": "" if sec is None else f"{sec:.4f}", "error": err or ""})
+        errored += 1 if err else 0
+        print(f"rep {rep + 1} {client:6s} {q} {'ERROR ' + err if err else f'{sec:9.3f} s'}", flush=True)
+    return errored
+
+
+def rotated(clients, rep):
+    """The client order for this rep: rotated, so no client is always first."""
+    k = rep % len(clients)
+    return clients[k:] + clients[:k]
+
+
 def cmd_run(args):
     cfg = server()
     clients, queries = selected(args)
@@ -472,46 +570,14 @@ def cmd_run(args):
         w.writeheader()
         f.flush()
         for rep in range(args.reps):
-            order = clients[rep % len(clients):] + clients[:rep % len(clients)]  # rotate: no client always first
-            for client in order:
-                try:
-                    res, text = timed_session(client, cfg, args, queries)
-                except subprocess.TimeoutExpired as exc:
-                    # The exception still carries the stdout of every query that
-                    # DID finish, Run Time lines included, so parse it rather
-                    # than discarding the session. mask() it: this path never
-                    # went through run_cli's masking, and an ATTACH failure can
-                    # quote the connection string back.
-                    #
-                    # `exc.output` is BYTES even though run_cli passes
-                    # text=True -- documented, and it reproduces: `bytes
-                    # b'partial\n'`. Calling mask() on it raised TypeError
-                    # inside str.replace, so the FIRST hung session aborted the
-                    # whole run and none of the per-session flushing below
-                    # happened (review of #518 item 1). Decode defensively
-                    # rather than asserting the type: a future Python that
-                    # honours text=True here would hand back str.
-                    text = mask(decode_output(exc.output), cfg)
-                    res = parse_marked(text, "T")
-                    note = f"session timed out after {args.timeout}s"
-                    hung = name_hung_query(res, note)
-                    for q in queries:
-                        res.setdefault(q, (None, note))
-                    print(f"rep {rep + 1} {client:6s} -- SESSION TIMEOUT after {args.timeout}s"
-                          + (f", {hung} was still running" if hung else "")
-                          + f", keeping {sum(1 for v in res.values() if v[0] is not None)} completed query(s)",
-                          flush=True)
+            for client in rotated(clients, rep):
+                res, text = session_results(client, cfg, args, queries, rep)
                 (out / f"session-{rep + 1}-{client}.log").write_text(text)
                 cause = session_preamble(text)
                 if cause:
                     print(f"rep {rep + 1} {client:6s} -- SESSION ERROR (before the first query): {cause}",
                           flush=True)
-                for q in queries:
-                    sec, err = res.get(q, (None, "no marker in output"))
-                    w.writerow({"run": run_id, "db": args.db, "client": client, "rep": rep + 1, "query": q,
-                                "seconds": "" if sec is None else f"{sec:.4f}", "error": err or ""})
-                    errored += 1 if err else 0
-                    print(f"rep {rep + 1} {client:6s} {q} {'ERROR ' + err if err else f'{sec:9.3f} s'}", flush=True)
+                errored += write_results(w, args, run_id, rep, client, queries, res)
                 f.flush()
     print(f"timings: {path}")
     # A run in which every query errored used to exit 0, so a scripted
@@ -524,31 +590,84 @@ def cmd_run(args):
     return 0
 
 
-def cmd_report(args):
-    path = pathlib.Path(args.timings)
-    rows = list(csv.DictReader(open(path)))
-    clients = [c for c in CLIENTS if any(r["client"] == c for r in rows)]
-    queries = sorted({r["query"] for r in rows})
+def samples(rows, client, query):
+    """(the timings that survived, the first error) for one client and query."""
+    vals, errs = [], []
+    for r in rows:
+        if r["client"] != client or r["query"] != query:
+            continue
+        if r["seconds"]:
+            vals.append(float(r["seconds"]))
+        if r["error"]:
+            errs.append(r["error"])
+    return vals, errs[0] if errs else ""
+
+
+def medians(rows, clients, queries):
+    """{(client, query): (median seconds or None, surviving reps, first error)}."""
     med = {}
     for c in clients:
         for q in queries:
-            vals = [float(r["seconds"]) for r in rows if r["client"] == c and r["query"] == q and r["seconds"]]
-            errs = [r["error"] for r in rows if r["client"] == c and r["query"] == q and r["error"]]
-            med[c, q] = (statistics.median(vals) if vals else None, len(vals), errs[0] if errs else "")
-    base = "A" if "A" in clients else clients[0]
-    # The sum must cover the SAME work for every client (issue #505 item 5).
-    # Accumulating whatever each client happened to complete published a client
-    # that errored on an expensive query as several times faster, with nothing
-    # in the bolded row marking it partial -- and that row is the one
-    # RESULTS-local.md quotes as its headline.
+            vals, err = samples(rows, c, q)
+            med[c, q] = (statistics.median(vals) if vals else None, len(vals), err)
+    return med
+
+
+def comparable(med, clients, queries):
+    """(queries every client completed, the rest, per-client totals over the first).
+
+    The sum must cover the SAME work for every client (issue #505 item 5).
+    Accumulating whatever each client happened to complete published a client
+    that errored on an expensive query as several times faster, with nothing
+    in the bolded row marking it partial -- and that row is the one
+    RESULTS-local.md quotes as its headline.
+    """
     common = [q for q in queries if all(med[c, q][0] is not None for c in clients)]
     missing = [q for q in queries if q not in common]
     totals = {c: sum(med[c, q][0] for q in common) for c in clients}
+    return common, missing, totals
+
+
+def cell(value, reps, error, reps_max):
+    """One client's cell for one query."""
+    if value is None:
+        return f"error: {error[:40]}"
     # The rep count was stored in every cell and never read, though the header
     # promised "n = timed reps" -- so a median over one surviving rep looked
     # identical to one over three. Annotate any cell that is short.
-    reps_max = max((n for _, n, _ in med.values()), default=0)
+    return f"{value:.3f}" + (f" (n={reps})" if reps < reps_max else "")
 
+
+def query_row(q, clients, ratio_cols, med, base, reps_max):
+    cells = [cell(*med[c, q], reps_max=reps_max) for c in clients]
+    b = med[base, q][0]
+    for c in ratio_cols:
+        v = med[c, q][0]
+        cells.append(f"{v / b:.2f}" if v is not None and b else "")
+    return f"| {q} | " + " | ".join(cells) + " |"
+
+
+def sum_row(clients, ratio_cols, totals, base, common, queries):
+    tb = totals[base]
+    # With no query completed in every client the totals are all 0, and a bold
+    # **0.00** in the row RESULTS-local.md quotes reads like a measured result
+    # (review of #518 item 7). An em dash cannot be mistaken for one.
+    cells = ([f"**{totals[c]:.2f}**" for c in clients] if common else ["--" for _ in clients]) + \
+            [f"**{totals[c] / tb:.2f}**" if common and tb else "--" for c in ratio_cols]
+    return f"| **sum** ({len(common)}/{len(queries)} queries) | " + " | ".join(cells) + " |"
+
+
+def exclusion_note(common, missing):
+    if not missing:
+        return []
+    noun = "query" if len(common) == 1 else "queries"
+    return ["", f"The sum covers only the {len(common)} {noun} every client completed, so the totals and "
+                f"ratios compare like with like. Excluded because at least one client has no median: "
+                f"{', '.join(missing)}."]
+
+
+def report_lines(clients, queries, med, base, reps_max):
+    common, missing, totals = comparable(med, clients, queries)
     lines = [f"Median wall time per query, seconds. Ratios are against {base}: below 1 is faster."]
     if reps_max > 1:
         lines.append(f"A cell shows `(n=N)` when fewer than {reps_max} timed reps survived for it.")
@@ -559,38 +678,102 @@ def cmd_report(args):
     # a single --clients the old form emitted three header cells against two
     # separators and rendered as a broken table.
     lines += ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
-    for q in queries:
-        cells = []
-        for c in clients:
-            v, n, e = med[c, q]
-            if v is None:
-                cells.append(f"error: {e[:40]}")
-            else:
-                cells.append(f"{v:.3f}" + (f" (n={n})" if n < reps_max else ""))
-        b = med[base, q][0]
-        for c in ratio_cols:
-            v = med[c, q][0]
-            cells.append(f"{v / b:.2f}" if v is not None and b else "")
-        lines.append(f"| {q} | " + " | ".join(cells) + " |")
-    tb = totals[base]
-    # With no query completed in every client the totals are all 0, and a bold
-    # **0.00** in the row RESULTS-local.md quotes reads like a measured result
-    # (review of #518 item 7). An em dash cannot be mistaken for one.
-    sum_cells = ([f"**{totals[c]:.2f}**" for c in clients] if common else ["--" for _ in clients]) + \
-                [f"**{totals[c] / tb:.2f}**" if common and tb else "--" for c in ratio_cols]
-    lines.append(f"| **sum** ({len(common)}/{len(queries)} queries) | " + " | ".join(sum_cells) + " |")
-    if missing:
-        noun = "query" if len(common) == 1 else "queries"
-        lines += ["", f"The sum covers only the {len(common)} {noun} every client completed, so the totals and "
-                      f"ratios compare like with like. Excluded because at least one client has no median: "
-                      f"{', '.join(missing)}."]
-    text = "\n".join(lines) + "\n"
+    lines += [query_row(q, clients, ratio_cols, med, base, reps_max) for q in queries]
+    lines.append(sum_row(clients, ratio_cols, totals, base, common, queries))
+    lines += exclusion_note(common, missing)
+    return lines
+
+
+def cmd_report(args):
+    rows = list(csv.DictReader(open(pathlib.Path(args.timings))))
+    clients = [c for c in CLIENTS if any(r["client"] == c for r in rows)]
+    queries = sorted({r["query"] for r in rows})
+    med = medians(rows, clients, queries)
+    base = "A" if "A" in clients else clients[0]
+    reps_max = max((n for _, n, _ in med.values()), default=0)
+
+    text = "\n".join(report_lines(clients, queries, med, base, reps_max)) + "\n"
     print(text)
     if args.report:
         pathlib.Path(args.report).write_text(text)
 
 
 # --------------------------------------------------------------------------- verify
+
+def clear_outputs(out, clients, queries):
+    """Remove this run's CSVs before anything writes them.
+
+    Issue #506 item 3. A query that fails at BIND never opens its output file
+    at all, so a stale file from the previous run would be compared and
+    reported `ok`. Bind-time failure is client C's own failure mode, since its
+    mssql_scan bind calls sp_describe_first_result_set.
+    """
+    for q in queries:
+        (out / f"oracle-{q}.csv").unlink(missing_ok=True)
+        (out / f"types-{q}.csv").unlink(missing_ok=True)
+        for client in clients:
+            (out / f"{client}-{q}.csv").unlink(missing_ok=True)
+
+
+def write_oracle(cfg, args, data, out, queries):
+    """DuckDB 1.5.6 over the same parquet the server was loaded from."""
+    s = [f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{data / (t + '.parquet')}');" for t in TABLES]
+    for q in queries:
+        sql = read_query("duckdb", q, args.sf)
+        s.append(f"COPY ({sql}) TO '{out / ('oracle-' + q + '.csv')}' (HEADER false);")
+        # The column TYPES, in order, beside the answers. This is what makes
+        # the comparison type-driven instead of guessing from how a value
+        # happens to print: `DESCRIBE` works as a subquery source, so one extra
+        # statement per query gets them with no second session.
+        s.append(f"COPY (SELECT column_type FROM (DESCRIBE {sql})) "
+                 f"TO '{out / ('types-' + q + '.csv')}' (HEADER false);")
+    rc, text = run_cli(binary("A"), "\n".join(s) + "\n", cfg)
+    if rc != 0:
+        sys.exit(text)
+
+
+def write_client(cfg, args, out, client, queries):
+    """One client's answers. -> a session-level error line, or None.
+
+    The client session's return code was bound and never read, while the
+    oracle's was checked (issue #506 item 3). The CLI does not bail on error
+    for piped stdin, so this is the only signal that the session as a whole
+    went wrong, and dropping it is how a failure became an `ok`. It is reported
+    ONCE rather than replacing all 22 of that client's verdicts (review of #518
+    item 3): the clearing above turns the query that actually failed into
+    MISSING, which names it.
+    """
+    s = session_head(client, cfg, args)
+    for q in queries:
+        body = query_text(client, q, args.sf).rstrip(";")
+        s.append(f"COPY ({body}) TO '{out / (client + '-' + q + '.csv')}' (HEADER false);")
+    rc, text = run_cli(binary(CLIENTS[client]["bin"]), "\n".join(s) + "\n", cfg, timeout=args.timeout)
+    if text.strip():
+        (out / f"{client}.log").write_text(text)
+    if rc != 0:
+        return f"client session exited {rc} (see {out / (client + '.log')})"
+    return None
+
+
+def print_verdicts(out, clients, queries, sessions):
+    """-> how many queries did not compare equal."""
+    bad = 0
+    for client in clients:
+        if client in sessions:
+            print(f"{client:6s} --- {sessions[client]}")
+        for q in queries:
+            # `verdict != "ok"` rejected compare()'s OWN accepting verdict for
+            # a reordered result, so a tie emitted in the other order failed the
+            # run while every per-query line still read `ok` -- teaching the
+            # operator to disregard the exit code, which is the channel a real
+            # wrong answer travels (issue #506 item 4).
+            verdict = compare(out / f"oracle-{q}.csv", out / f"{client}-{q}.csv",
+                              read_types(out / f"types-{q}.csv"))
+            if not verdict.startswith("ok"):
+                bad += 1
+            print(f"{client:6s} {q} {verdict}")
+    return bad
+
 
 def cmd_verify(args):
     cfg = server()
@@ -602,58 +785,16 @@ def cmd_verify(args):
     # schema left behind.
     out = pathlib.Path(args.out) / "verify" / args.db
     out.mkdir(parents=True, exist_ok=True)
-    # And clear this run's files anyway, so a query that fails at BIND -- where
-    # the COPY never opens its output file at all -- cannot be compared against
-    # the previous run's result and reported `ok`. Bind-time failure is client
-    # C's own failure mode, since its mssql_scan bind calls
-    # sp_describe_first_result_set.
-    for q in queries:
-        (out / f"oracle-{q}.csv").unlink(missing_ok=True)
-        for client in clients:
-            (out / f"{client}-{q}.csv").unlink(missing_ok=True)
-    # A non-zero session exit, reported ONCE for the client (review of #518
-    # item 3). It used to replace all 22 of that client's verdicts: both CLIs
-    # exit 1 if any statement failed, so one bind failure hid the other 21
-    # comparisons, never named the query that failed, and still printed a count
-    # of 22. The per-query comparisons run regardless -- the file clearing above
-    # turns the query that actually failed into MISSING, which names it.
+    clear_outputs(out, clients, queries)
+
+    write_oracle(cfg, args, data, out, queries)
     sessions = {}
-    # The oracle: DuckDB 1.5.6 over the same parquet the server was loaded from.
-    s = [f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{data / (t + '.parquet')}');" for t in TABLES]
-    for q in queries:
-        sql = read_query("duckdb", q, args.sf)
-        s.append(f"COPY ({sql}) TO '{out / ('oracle-' + q + '.csv')}' (HEADER false);")
-    rc, text = run_cli(binary("A"), "\n".join(s) + "\n", cfg)
-    if rc != 0:
-        sys.exit(text)
     for client in clients:
-        s = session_head(client, cfg, args)
-        for q in queries:
-            body = query_text(client, q, args.sf).rstrip(";")
-            s.append(f"COPY ({body}) TO '{out / (client + '-' + q + '.csv')}' (HEADER false);")
-        rc, text = run_cli(binary(CLIENTS[client]["bin"]), "\n".join(s) + "\n", cfg, timeout=args.timeout)
-        if text.strip():
-            (out / f"{client}.log").write_text(text)
-        # The client session's return code was bound and never read, while the
-        # oracle's was checked (issue #506 item 3). The CLI does not bail on
-        # error for piped stdin, so this is the only signal that the session as
-        # a whole went wrong, and dropping it is how a failure became an `ok`.
-        if rc != 0:
-            sessions[client] = f"client session exited {rc} (see {out / (client + '.log')})"
-    bad = 0
-    for client in clients:
-        if client in sessions:
-            print(f"{client:6s} --- {sessions[client]}")
-        for q in queries:
-            # `verdict != "ok"` rejected compare()'s OWN accepting verdict for
-            # a reordered result, so a tie emitted in the other order failed the
-            # run while every per-query line still read `ok` -- teaching the
-            # operator to disregard the exit code, which is the channel a real
-            # wrong answer travels (issue #506 item 4).
-            verdict = compare(out / f"oracle-{q}.csv", out / f"{client}-{q}.csv")
-            if not verdict.startswith("ok"):
-                bad += 1
-            print(f"{client:6s} {q} {verdict}")
+        failure = write_client(cfg, args, out, client, queries)
+        if failure:
+            sessions[client] = failure
+
+    bad = print_verdicts(out, clients, queries, sessions)
     print(f"{bad} mismatch(es)" + (f", {len(sessions)} failed session(s)" if sessions else ""))
     sys.exit(1 if bad or sessions else 0)
 
@@ -678,179 +819,100 @@ def as_float(s):
     return float(s) if FLOATING.fullmatch(s) else None
 
 
-#: The widest decimal scale this harness sees: SQL Server returns TPC-H's
-#: aggregates as decimal(38,6).
-MAX_DECIMAL_SCALE = 6
-def double_form(s):
-    """Is `s` the shortest round-trip form of a DOUBLE?
+#: DuckDB type names whose values can legitimately differ between the two
+#: engines. Everything else -- DECIMAL, the integer family, VARCHAR, DATE,
+#: BOOLEAN -- is exact on both sides and must match.
+#:
+#: An inclusion list, so an unrecognised type defaults to EXACT. A mistake here
+#: therefore makes the gate stricter and loud, not looser and silent, which is
+#: the direction every defect in this comparison has gone the other way.
+INEXACT_TYPES = ("DOUBLE", "FLOAT", "REAL")
+#: Exact columns whose values are NUMBERS, so a client printing the same number
+#: at another scale is not a difference. Everything not here and not inexact is
+#: compared as TEXT.
+NUMERIC_TYPES = ("DECIMAL", "NUMERIC", "TINYINT", "SMALLINT", "INTEGER", "INT",
+                 "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER",
+                 "UBIGINT", "UHUGEINT")
 
-    This replaced a significant-digit count, which was the wrong
-    discriminator and wrong in the dangerous direction (roborev on 423f5db).
-    q01's own `sum_charge` is `decimal(38,6)` and at SF1 prints 18 significant
-    digits -- so a 15-digit ceiling sent an EXACT sum to the tolerance branch,
-    where a dropped `lineitem` passed from SF10 up. Even after the relative
-    term dropped to 1e-13 a one-cent rounding difference still passed there
-    (bound 0.0235 at 2.3e11 against a 0.01 difference).
+#: How a column must be compared.
+TOLERANCE, NUMERIC, TEXT = "tolerance", "numeric", "text"
 
-    A DOUBLE round-trips through repr() unchanged. Some exact decimals do not:
-    a decimal(38,6) padded to its declared scale carries trailing zeros repr()
-    drops (`234603658237.282580` -> `234603658237.2826`), and an integer prints
-    without the `.0` repr() adds.
 
-    But a scale-2 or scale-4 decimal of 15 or fewer significant digits usually
-    DOES round-trip, so this test reads such a pair as two doubles. That is a
-    heuristic rather than evidence, and the KNOWN GAP paragraph in `same()`
-    measures what it costs and says what would replace it.
+def column_kind(type_name):
+    """How must this column be compared: TOLERANCE, NUMERIC or TEXT?
+
+    The ORACLE's type decides, because it is the only evidence of what the
+    values are. Four successive attempts to infer it from how a value PRINTS
+    each had a hole, and the last could not be fixed at all: at an SF1000
+    magnitude one ulp of a double is 0.0078, so a cent of rounding error in an
+    exact decimal is 1.3 ulps -- no relative bound separates them.
+
+    Three kinds rather than two (roborev on 6ea78d9). Comparing every exact
+    column by `Decimal` value loosened the gate for TEXT: `"07"` equalled
+    `"7"`, `"13"` equalled `"13.0"` and `"-0"` equalled `"0"`, so a client that
+    dropped a leading zero from a string key would have read `ok`. Only a
+    NUMERIC column wants value comparison -- that is what lets the server's
+    padded decimal(38,6) match the oracle's decimal(38,2).
+
+    An unknown type is TEXT, the strictest kind: a new column fails loudly
+    rather than quietly taking a tolerance or a looser equality.
     """
-    return repr(float(s)) == s
+    head = type_name.split("(")[0].strip().upper()
+    if head in INEXACT_TYPES:
+        return TOLERANCE
+    return NUMERIC if head in NUMERIC_TYPES else TEXT
 
 
-#: The relative term, sized to what the two engines' DOUBLES can actually
-#: disagree by rather than to a round number.
+def read_types(path):
+    """The oracle's column types, in order, or None when they are absent.
+
+    None is a REFUSAL, not a default: a comparison that cannot tell an exact
+    column from a double is the thing this replaced, so it reports rather than
+    guesses.
+    """
+    if not path.exists():
+        return None
+    with open(path) as fh:
+        types = [row[0] for row in csv.reader(fh) if row]
+    return types or None
+
+
+#: The relative term, for DOUBLE columns only now, sized to what the two
+#: engines' doubles can actually disagree by.
 #:
-#: Every DOUBLE TPC-H produces on either side is an exact decimal sum (or
-#: count) converted and divided ONCE -- `avg(decimal)`, `decimal / decimal`, or
-#: the extension's pushed `CAST(SUM(x) AS float) / COUNT_BIG(x)`. That puts the
-#: two sides within a few ulps, about 1e-15 relative, so 1e-13 leaves ~724 ulps
-#: of margin at an SF1000 magnitude and still accepts every ulp-apart pair the
-#: fixtures generate.
+#: Every DOUBLE TPC-H produces on either side is an exact decimal sum or count
+#: converted and divided ONCE -- `avg(decimal)`, `decimal / decimal`, or the
+#: extension's pushed `CAST(SUM(x) AS float) / COUNT_BIG(x)` -- which puts the
+#: two sides within a few ulps, about 1e-15 relative. 1e-13 leaves ~724 ulps of
+#: margin at an SF1000 magnitude.
 #:
-#: It was 1e-9, which is #506 item 1 at the scale this harness is planned for
-#: (review of #518, VGSML, after the exact_pair fix): `exact_pair`'s
-#: double-form test moves an ambiguous pair onto this branch -- both values
-#: looking like doubles, which an exact decimal(38,2) sum usually does -- and
-#: at 5.7e13 a 1e-9 bound is ~57 000 units, so a dropped `lineitem` row passed.
-#: At 1e-13 the bound is 5.7 units. It is the backstop for every pair the form
-#: test cannot tell apart, which is why it is sized to ulps and not to a round
-#: number.
+#: It is no longer a backstop for pairs a heuristic could not classify, because
+#: there is no heuristic left: an exact column never reaches it.
 REL_TOLERANCE = decimal.Decimal("1e-13")
-#: The absolute floor, which is what accepts a DOUBLE beside a decimal(38,6):
-#: a half digit of the server's scale is 5e-7.
+#: The absolute floor: a half digit of the server's decimal(38,6) is 5e-7.
 ABS_TOLERANCE = decimal.Decimal("1e-6")
 
 
 def tolerance(magnitude):
-    """How far apart two real-valued answers may legitimately be."""
+    """How far apart two DOUBLE answers may legitimately be."""
     return max(ABS_TOLERANCE, REL_TOLERANCE * magnitude)
 
 
-def exact_pair(x, y, dx, dy):
-    """Are these two both printed as an EXACT decimal of ONE scale?
-
-    An equal scale ALONE is not evidence of that, which is the defect roborev
-    found in the first cut of this rule. A DOUBLE in shortest round-trip form
-    parses as a decimal too, and DuckDB returns `avg(decimal)` and
-    `decimal / decimal` as DOUBLE -- q01's avg_qty, avg_price and avg_disc and
-    q08's mkt_share. Meanwhile CLAUDE.md records that the extension's pushed
-    `CAST(SUM(x) AS float) / COUNT_BIG(x)` differs from DuckDB's avg in its
-    last bits BY DESIGN. So two doubles one ulp apart whose shortest forms
-    happen to print at the same scale were being required to be EQUAL.
-
-    Measured over 4000 ulp-apart pairs per magnitude, before this guard:
-
-        q01 avg_qty ~25        1148 of 4000 print at the same scale -- all 1148 rejected
-        q01 avg_price ~38000   1446 -- all rejected
-        q01 avg_disc ~0.05     1233 -- all rejected
-        q08 mkt_share ~0.034   1266 -- all rejected
-        q06 revenue ~1.2e8     2820 -- all rejected
-
-    Every one of those would have been published as a wrong answer for client
-    B on exactly the queries this harness exists to judge.
-
-    Hence two further conditions: the scale must be one a decimal column could
-    actually have, and the pair must not look like two doubles.
-
-    When BOTH sides are a double's shortest form the pair is ambiguous -- it
-    could be two doubles, or two decimals that happen to print that way -- so
-    it takes the tolerance, with the 1e-13 relative term as the backstop. When
-    either side is not, the pair cannot be two doubles and is compared exactly.
-    """
-    exponent = dx.as_tuple().exponent
-    if exponent != dy.as_tuple().exponent:
-        return False
-    if -exponent > MAX_DECIMAL_SCALE:
-        return False
-    return not (double_form(x) and double_form(y))
-
-
 def as_decimal(s):
-    """The value as a Decimal when it is written as a plain decimal, else None.
-
-    The SCALE is the point: `decimal.Decimal` keeps the digits as printed, so
-    `"37734107.00"` and `"37734107.0"` are distinguishable, which is how same()
-    tells an exact-vs-exact comparison from an exact-vs-DOUBLE one.
-    """
+    """The value as a Decimal when it is written as a plain decimal, else None."""
     return decimal.Decimal(s) if DECIMAL.fullmatch(s) else None
 
 
-def same(x, y):
-    """Is the client's value `y` the oracle's `x`?
+def within_tolerance(x, y, dx, dy):
+    """Two DOUBLE values, as close as the two engines may legitimately be.
 
-    Issue #506 items 1 and 2. The first version was
-    `x.strip() == y.strip()` then
-    `abs(fx-fy) <= max(1e-6 * max(|fx|,|fy|), 0.011)`, which failed twice over:
-
-    * The 0.011 ABSOLUTE floor was wider than whole answers. q08's entire
-      result is two rows, mkt_share 0.03443589 and 0.04148552 -- 0.00705
-      apart, inside the floor -- so swapping the two years printed `ok`.
-      q01's avg_disc groups are ~1e-4 apart and so were not checked at all.
-    * The 1e-6 RELATIVE term tolerated off-by-N on counts: q01's count_order
-      is 1,478,493 at SF1, so +-1.48 rows, +-14.8 at SF10, +-148 at SF100 --
-      a row-dropping pushdown bug on exactly the aggregates TPC-H is made of
-      passed the gate.
-    * `.strip()` made CHAR(n) trailing-blank padding invisible, which is the
-      very defect (#405) this harness's headline correctness result is about.
-      It was caught then only because the padding also broke comparisons and
-      changed row counts; a regression that padded only the OUTPUT -- q16
-      groups by p_brand CHAR(10), q12 by l_shipmode CHAR(10) -- would have
-      compared equal on every row.
-
-    So: integers must match EXACTLY, strings must match EXACTLY, and only a
-    real-valued pair gets a tolerance, sized to what the two engines can
-    legitimately disagree by rather than to a round number. The server returns
-    these as decimal(38,6) against the oracle's DOUBLE, a half-digit of 5e-7,
-    and a large sum carries double's own relative error; see `tolerance`,
-    whose terms are 1e-6 absolute and 1e-13 relative, and which still leaves
-    q08's 0.00705 spread four orders of magnitude outside it.
-
-    Narrowing "integer" to "exact decimal" (review of #518 item 2): keying the
-    exact branch on int() let a value with a fractional part fall through to
-    the 1e-9 RELATIVE term even when both engines had printed the same exact
-    decimal. `"37734107.00"` is not an int, and at SF100-1000 magnitudes 1e-9
-    relative is tens to hundreds of units -- `123456789012.34` compared `ok`
-    against `123456789132.34`, which is item 1 of #506 (a dropped row in an
-    aggregate passes) returning at exactly the scale the fix was for.
-
-    What the pair LOOKS like decides which branch applies -- see `exact_pair`,
-    which wants an equal scale, a scale a decimal column could have, and at
-    least one side that is NOT a double's shortest round-trip form. Anything
-    else gets the tolerance.
-
-    KNOWN GAP, and it is why this should become type-driven. The form is a
-    heuristic, not evidence, and it leaks in one direction: an exact
-    decimal(38,2) or decimal(38,4) sum whose printed form happens to round-trip
-    -- any value of 15 or fewer significant digits that does not end in a zero,
-    so 9 cases in 10 -- is read as a pair of doubles and gets the tolerance. At
-    q01's `sum_base_price` magnitude (~5.7e11 at SF10) the bound is then 0.056,
-    so a one-cent discrepancy passes. A dropped row (>= ~900) is still rejected
-    at every scale factor.
-
-    No relative bound can close that: at an SF1000 magnitude one ulp is 0.0078,
-    so a cent is 1.3 ulps -- there is no value that accepts a legitimate
-    last-bit difference between two doubles and rejects a cent of rounding
-    error in an exact decimal. Only the COLUMN TYPE separates them, which means
-    reading the oracle's types (`DESCRIBE` each query, confirmed to work in a
-    subquery) and requiring exact equality for every DECIMAL and integer
-    column. Tracked as its own change; it alters the verify contract and wants
-    a live run, because a DECIMAL column the client returns at a different
-    scale would then have to fall back rather than fail.
+    By `Decimal` where both sides are plain decimals, and by float otherwise --
+    the forms a DOUBLE can print that an exact decimal cannot (`1e-05`). Both
+    paths are deliberately strict about shape: `FLOATING` rejects a leading
+    blank and a digit separator that `float()` would accept, so a formatting
+    difference is still a difference.
     """
-    if x == y:
-        return True
-    dx, dy = as_decimal(x), as_decimal(y)
     if dx is not None and dy is not None:
-        if exact_pair(x, y, dx, dy):
-            return dx == dy
         return abs(dx - dy) <= tolerance(max(abs(dx), abs(dy)))
     fx, fy = as_float(x), as_float(y)
     if fx is None or fy is None:
@@ -858,23 +920,63 @@ def same(x, y):
     return abs(fx - fy) <= float(tolerance(decimal.Decimal(max(abs(fx), abs(fy)))))
 
 
-def rows_equal(ra, rb):
-    return len(ra) == len(rb) and all(same(x, y) for x, y in zip(ra, rb))
+def same(x, y, kind):
+    """Is the client's value `y` the oracle's `x`, for a column of this kind?
+
+    Issue #506 items 1 and 2, and three reviews of #518. The history is worth
+    keeping because every version failed in the same direction -- accepting a
+    wrong answer -- and each fix was narrower than it looked:
+
+    * `x.strip() == y.strip()` then a 0.011 ABSOLUTE floor: wider than whole
+      answers. q08's entire result is two rows 0.00705 apart, so swapping the
+      two years printed `ok`. `.strip()` also hid CHAR(n) padding, which is the
+      #405 class this harness exists to catch.
+    * a 1e-6 RELATIVE term: tolerated off-by-N on counts. q01's count_order is
+      1,478,493 at SF1, so +-1.48 rows and +-148 at SF100 -- a row-dropping
+      pushdown bug on exactly the aggregates TPC-H is made of passed.
+    * exact when the two PRINTED SCALES agree: a DOUBLE in shortest
+      round-trip form parses as a decimal too, and DuckDB returns
+      `avg(decimal)` and `decimal / decimal` as DOUBLE, so ulp-apart pairs of
+      q01's avg_qty and q08's mkt_share became wrong answers -- 1148 of 4000
+      at one magnitude.
+    * ... and exact only below 15 significant digits: q01's own
+      `decimal(38,6)` sum_charge prints 18 at SF1, so an EXACT sum took the
+      tolerance branch where a dropped row passed from SF10 up.
+    * ... and exact unless both sides round-trip through `repr()`: a scale-2 or
+      scale-4 decimal of 16 or fewer digits usually does, so a one-cent
+      difference in q01's sum_base_price passed at SF10.
+
+    So the form of a value is not evidence of its type, and the last of those
+    cannot be fixed by tightening: at 5.7e13 one ulp is 0.0078, making a cent
+    1.3 ulps. The oracle's column TYPE is asked instead, and `kind` is its
+    answer -- no inference, no magnitudes, no digit counts.
+
+    A NUMERIC column is compared by VALUE, so a padded `decimal(38,6)` equals
+    the oracle's `decimal(38,2)` (`Decimal("1.50") == Decimal("1.5")`) while a
+    cent of difference does not. A TEXT column gets only the identity check
+    above, so CHAR(n) padding -- and a dropped leading zero -- is a mismatch.
+    """
+    if x == y:
+        return True
+    if kind == TEXT:
+        return False
+    dx, dy = as_decimal(x), as_decimal(y)
+    if kind == NUMERIC:
+        return dx is not None and dy is not None and dx == dy
+    return within_tolerance(x, y, dx, dy)
 
 
-def compare(oracle, got):
-    if not got.exists():
-        return "MISSING (the query failed; see the client log)"
-    a = list(csv.reader(open(oracle)))
-    b = list(csv.reader(open(got)))
-    if len(a) != len(b):
-        return f"ROWS {len(b)} != {len(a)}"
-    if all(rows_equal(ra, rb) for ra, rb in zip(a, b)):
-        return "ok"
+def rows_equal(ra, rb, kinds):
+    """`kinds` is the per-column answer from the oracle's types."""
+    return len(ra) == len(rb) and all(same(x, y, k) for x, y, k in zip(ra, rb, kinds))
+
+
+def difference_verdict(a, b, kinds):
+    """What to call two results that did not compare equal."""
     # Same rows, different order. The old wording was "row order of ties
     # differs", which it has no evidence for: an inverted ORDER BY with no ties
     # at all reaches here too. Say what is actually established.
-    if all(rows_equal(ra, rb) for ra, rb in zip(sorted(a), sorted(b))):
+    if all(rows_equal(ra, rb, kinds) for ra, rb in zip(sorted(a), sorted(b))):
         return "ok (same rows, different order)"
     # Name trailing-blank padding specifically, since it is the #405 class and
     # an exact comparison is the only thing that can see it.
@@ -882,9 +984,53 @@ def compare(oracle, got):
            for ra, rb in zip(a, b)):
         return "PADDING (values differ only in surrounding blanks -- the #405 class)"
     for i, (ra, rb) in enumerate(zip(a, b)):
-        if not rows_equal(ra, rb):
+        if not rows_equal(ra, rb, kinds):
             return f"DIFF at row {i + 1}: {rb[:6]} vs {ra[:6]}"
     return "DIFF"
+
+
+def types_refusal(types, rows):
+    """Why these types cannot be used, or "" when they can.
+
+    A refusal rather than a default: a comparison that cannot tell an exact
+    column from a double is what this replaced.
+
+    The width is only checked when the rows HAVE a width. `csv.reader` reads
+    the blank line COPY writes for a single-column NULL as `[]`, so a result
+    like q17's NULL `avg_yearly` at a small scale factor measured 0 columns and
+    was refused as "the oracle's types do not fit its rows" -- blaming the
+    oracle for a correct answer, and masking a client that returned a number
+    where the oracle had NULL behind the same misleading verdict (review of
+    #537 by VGSML, reproduced at SF 0.01).
+    """
+    if types is None:
+        return "NO TYPES (the oracle did not emit them; cannot compare)"
+    width = max((len(r) for r in rows), default=0)
+    if width and len(types) != width:
+        return f"TYPES {len(types)} for {width} column(s) (the oracle's types do not fit its rows)"
+    return ""
+
+
+def compare(oracle, got, types=None):
+    """The verdict for one query. `types` is the oracle's column types.
+
+    Without them nothing is compared: a comparison that cannot tell an exact
+    column from a double is what this replaced, so a missing types file is
+    reported rather than guessed around.
+    """
+    if not got.exists():
+        return "MISSING (the query failed; see the client log)"
+    a = list(csv.reader(open(oracle)))
+    b = list(csv.reader(open(got)))
+    if len(a) != len(b):
+        return f"ROWS {len(b)} != {len(a)}"
+    refusal = types_refusal(types, a)
+    if refusal:
+        return refusal
+    kinds = [column_kind(t) for t in types]
+    if all(rows_equal(ra, rb, kinds) for ra, rb in zip(a, b)):
+        return "ok"
+    return difference_verdict(a, b, kinds)
 
 
 # --------------------------------------------------------------------------- selftest
@@ -895,97 +1041,152 @@ def compare(oracle, got):
 # were all of one kind -- the harness reporting a verdict it had not earned --
 # and that kind is invisible until something checks the judge.
 
-#: (label, oracle value, client value, must same() accept it)
+#: (label, the oracle's column type, oracle value, client value, accepted?)
+#
+# Every fixture is a case this harness decided WRONGLY, and the TYPE column is
+# the point: the same two strings must be judged differently depending on what
+# the oracle says the column is. That is the whole change -- `234603658237.28`
+# against `...29` is a wrong answer in a DECIMAL column and noise in a DOUBLE.
 SAME_TESTS = [
-    # Review of #518 item 2: the exact branch used to key on int(), so a value
-    # with a fractional part fell through to 1e-9 RELATIVE. VGSML's own case.
-    ("two exact decimals of one scale, 120 apart", "123456789012.34", "123456789132.34", False),
-    ("the same exact decimal", "37734107.00", "37734107.00", True),
-    ("an exact decimal one unit out at SF1000 magnitude", "123456789012.34", "123456789013.34", False),
-    ("an exact decimal one hundredth out", "37734107.00", "37734107.01", False),
-    # Different scales ARE the DOUBLE-vs-decimal(38,6) case the tolerance exists
-    # for, and must still pass.
-    ("DOUBLE beside decimal(38,6), same value", "0.05", "0.050000", True),
-    ("DOUBLE beside decimal(38,6), within a half digit", "1.0000001", "1.000000", True),
-    ("DOUBLE beside decimal(38,6), plainly different", "0.05", "0.060000", False),
-    # Issue #506 item 2: 1e-6 relative tolerated off-by-N on counts.
-    ("a count one row short", "1478493", "1478492", False),
-    ("the same count", "1478493", "1478493", True),
-    # Issue #506 item 1: the 0.011 ABSOLUTE floor was wider than q08's answer.
-    ("q08's two mkt_share values", "0.03443589", "0.04148552", False),
-    # Issue #405: .strip() hid CHAR(n) padding, the defect this harness is about.
-    ("a CHAR(10) value padded", "MACHINERY", "MACHINERY ", False),
-    ("a CHAR(10) value padded on the left", "MACHINERY", " MACHINERY", False),
-    ("the same string", "MACHINERY", "MACHINERY", True),
-    # Review of #518 nit 7: int() accepts both of these.
-    ("a count with a leading blank", "13", " 13", False),
-    ("a count written with an underscore", "1000", "1_000", False),
-    # DOUBLE against DOUBLE. The gap that let the first cut of the exact rule
-    # through: these parse as decimals and print at the SAME scale, so nothing
-    # in the fixture set distinguished them from two decimal(38,6) values, and
-    # every ulp-apart pair became a reported wrong answer. DuckDB returns
-    # avg(decimal) and decimal/decimal as DOUBLE, so these ARE q01's and q08's
-    # columns -- the queries the harness exists to judge.
-    ("two DOUBLEs one ulp apart, same printed scale (q01 avg_qty)",
-     "25.522005853257337", "25.522005853257333", True),
-    ("two DOUBLEs one ulp apart (q08 mkt_share)",
-     "0.034435890263343130", "0.034435890263343136", True),
-    # Genuinely ADJACENT doubles printed at the same scale. The first version
-    # of this fixture paired "123141078.2283" with "123141078.22830002", whose
-    # scales differ (4 vs 8), so it took the tolerance at exact_pair's first
-    # check and never reached the guards it was meant to exercise (roborev on
-    # 423f5db).
-    ("two adjacent DOUBLEs, same scale (q06 revenue magnitude)",
-     "123141078.22830002", "123141078.22830003", True),
-    # Scale <= 6 AND more than 15 significant digits: the shape a digit-count
-    # guard claimed to cover. These are genuinely adjacent doubles.
-    ("adjacent DOUBLEs at scale 4 with 17 digits",
-     "1234500000000.0002", "1234500000000.0005", True),
-    ("adjacent DOUBLEs at scale 2 with 16 digits",
-     "56000000000000.02", "56000000000000.03", True),
-    # ... and the EXACT decimal of the same shape must still be compared
-    # exactly. q01's sum_charge is decimal(38,6) and prints 18 significant
-    # digits at SF1, so the old 15-digit ceiling sent it to the tolerance
-    # branch, where a dropped lineitem passed from SF10 up and -- even after
-    # the relative term dropped to 1e-13 -- a one-cent rounding difference
-    # still passed (bound 0.0235 against a 0.01 difference).
-    ("q01's decimal(38,6) sum_charge, ONE CENT apart",
+    # ---- DECIMAL and integer columns: exact, at every magnitude -------------
+    # #506 item 1 and the review of #518. A one-cent difference in an exact sum
+    # is a wrong answer whether the value is 11 digits or 18, and whether or
+    # not it happens to round-trip through repr() -- the two properties three
+    # earlier versions of this rule keyed on.
+    ("a decimal sum one cent apart", "DECIMAL(38,2)",
+     "566012345678.34", "566012345678.35", False),
+    ("an 18-digit decimal(38,6) sum one cent apart", "DECIMAL(38,6)",
      "234603658237.282580", "234603658237.292580", False),
-    # ... and the guard must not swallow a real difference at double precision.
-    ("two DOUBLEs a whole percent apart", "25.522005853257337", "25.777005853257337", False),
-    # Why the relative term is 1e-13 rather than 1e-9 (review of #518 by
-    # VGSML). An exact sum this large looks like a double to `exact_pair`, so
-    # it lands on the tolerance branch -- where a 1e-9 bound at 5.7e13 is
-    # ~57 000 units and a dropped `lineitem` row passed. These are SF1000-sized
-    # `sum_base_price` values.
-    ("an SF1000-sized sum 10 000 apart", "56586554400730.17", "56586554410730.17", False),
-    ("an SF1000-sized sum 100 apart", "56586554400730.17", "56586554400830.17", False),
-    ("an SF100-sized sum 100 apart", "5658655440073.17", "5658655440173.17", False),
-    # Same magnitude, one ulp apart: must still be accepted, so the tightening
-    # did not simply trade one false verdict for the other.
-    ("two SF1000-sized DOUBLEs one ulp apart",
+    ("an SF1000-sized decimal sum one cent apart", "DECIMAL(38,2)",
+     "56586554400730.17", "56586554400730.18", False),
+    ("an SF1000-sized decimal sum 10 000 apart", "DECIMAL(38,2)",
+     "56586554400730.17", "56586554410730.17", False),
+    ("a decimal sum a thousandth apart", "DECIMAL(38,4)",
+     "540012345678.1234", "540012345678.1235", False),
+    ("the same decimal", "DECIMAL(38,2)", "37734107.00", "37734107.00", True),
+    # Compared BY VALUE, so the client padding to a wider scale is not a
+    # difference. This is what VGSML pointed out makes a scale fallback
+    # unnecessary: Decimal("1.50") == Decimal("1.5").
+    ("a decimal the client padded to a wider scale", "DECIMAL(38,2)",
+     "234603658237.28", "234603658237.280000", True),
+    ("a decimal the client printed with fewer decimals", "DECIMAL(38,6)",
+     "1.500000", "1.5", True),
+    # #506 item 2: a 1e-6 relative term tolerated off-by-N on counts.
+    ("a count one row short", "BIGINT", "1478493", "1478492", False),
+    ("the same count", "BIGINT", "1478493", "1478493", True),
+    ("a count the client padded", "BIGINT", "1478493", "1478493.0", True),
+    # ---- DOUBLE columns: the tolerance, and only here -----------------------
+    # DuckDB returns avg(decimal) and decimal/decimal as DOUBLE -- q01's
+    # avg_qty / avg_price / avg_disc and q08's mkt_share -- and CLAUDE.md
+    # records that the extension's pushed CAST(SUM(x) AS float) / COUNT_BIG(x)
+    # differs in its last bits BY DESIGN.
+    ("two DOUBLEs one ulp apart (q01 avg_qty)", "DOUBLE",
+     "25.522005853257337", "25.522005853257333", True),
+    ("two DOUBLEs one ulp apart (q08 mkt_share)", "DOUBLE",
+     "0.034435890263343130", "0.034435890263343136", True),
+    ("adjacent DOUBLEs at an SF1000 magnitude", "DOUBLE",
      "56586554400730.17", "56586554400730.18", True),
-    # Different scales, 120 apart: the tolerance branch by scale rather than by
-    # digits, and it must reject too.
-    ("a decimal beside a wider-scale decimal, 120 apart",
-     "123456789012.34", "123456789132.340000", False),
-    # Seven decimals is past decimal(38,6), so the pair cannot be two exact
-    # decimals of one declared scale -- tolerance, not equality.
-    ("a scale wider than decimal(38,6) takes the tolerance",
-     "1.00000005", "1.00000004", True),
-    # Not exact decimals: these fall to the float path rather than crashing.
-    ("scientific notation, equal", "1e3", "1000.0", True),
-    ("a NULL against an empty string", "", "", True),
-    ("text against a number", "MACHINERY", "17", False),
+    ("a DOUBLE beside the server's decimal(38,6)", "DOUBLE", "0.05", "0.050000", True),
+    ("a DOUBLE within a half digit", "DOUBLE", "1.0000001", "1.000000", True),
+    # ... but the tolerance is not a licence: q08's whole result is two rows
+    # 0.00705 apart, which the old 0.011 ABSOLUTE floor swallowed.
+    ("q08's two mkt_share values", "DOUBLE", "0.03443589", "0.04148552", False),
+    ("two DOUBLEs a whole percent apart", "DOUBLE",
+     "25.522005853257337", "25.777005853257337", False),
+    ("a DOUBLE sum 10 000 apart at an SF1000 magnitude", "DOUBLE",
+     "56586554400730.17", "56586554410730.17", False),
+    # ---- strings and the rest: exact, so #405 padding is a mismatch ---------
+    ("a CHAR(10) value padded on the right", "VARCHAR",
+     "MACHINERY", "MACHINERY ", False),
+    ("a CHAR(10) value padded on the left", "VARCHAR",
+     "MACHINERY", " MACHINERY", False),
+    ("the same string", "VARCHAR", "MACHINERY", "MACHINERY", True),
+    ("a date one day out", "DATE", "1995-03-15", "1995-03-16", False),
+    ("the same date", "DATE", "1995-03-15", "1995-03-15", True),
+    ("an empty value against an empty value", "VARCHAR", "", "", True),
+    ("text against a number", "VARCHAR", "MACHINERY", "17", False),
+    # A TEXT column is identity only. Comparing every exact column by Decimal
+    # value made all four of these equal, so a client that dropped a leading
+    # zero from a string key read `ok` (roborev on 6ea78d9).
+    ("a VARCHAR with a leading zero dropped", "VARCHAR", "07", "7", False),
+    ("a VARCHAR printed as a number", "VARCHAR", "13", "13.0", False),
+    ("a VARCHAR signed zero", "VARCHAR", "-0", "0", False),
+    ("a VARCHAR trailing zero", "VARCHAR", "1.50", "1.5", False),
+    # ... while the same four in a NUMERIC column ARE the same number.
+    ("the same number written with a leading zero", "BIGINT", "07", "7", True),
+    ("the same number at another scale", "DECIMAL(38,2)", "1.50", "1.5", True),
+    # Restored: the type rewrite dropped these three and took the coverage of
+    # DECIMAL's strictness, FLOATING's shape and the as_float path with them.
+    # VGSML mutated the code three ways and the self-test stayed green --
+    # removing the as_float branch, loosening DECIMAL to accept blanks and
+    # digit separators, and setting FLOATING to `.*` (review of #537).
+    #
+    # int() accepts both of these, which is why as_int was replaced by a
+    # regex with no strip in the first place.
+    ("a NUMERIC value with a leading blank", "BIGINT", "13", " 13", False),
+    ("a NUMERIC value written with a digit separator", "BIGINT", "1000", "1_000", False),
+    ("a NUMERIC value with a trailing blank", "DECIMAL(38,2)", "13.00", "13.00 ", False),
+    # The as_float path: the forms a DOUBLE can print that an exact decimal
+    # cannot. Only a DOUBLE column reaches it.
+    ("a DOUBLE in scientific notation, equal", "DOUBLE", "1e3", "1000.0", True),
+    ("a DOUBLE in scientific notation, small", "DOUBLE", "1e-05", "0.00001", True),
+    ("a DOUBLE in scientific notation, different", "DOUBLE", "1e3", "2000.0", False),
+    # FLOATING's own fixture: a leading blank is a formatting difference the
+    # gate must see, even in a DOUBLE column. float() would strip it, so this
+    # is what fails when FLOATING is loosened to `.*` -- the third mutation in
+    # the review of #537, which nothing else caught.
+    ("a DOUBLE value with a leading blank", "DOUBLE", "1000.0", " 1000.0", False),
+    ("a DOUBLE with a digit separator", "DOUBLE", "1000.0", "1_000.0", False),
+    # An unrecognised type defaults to EXACT, so a new column kind fails loudly
+    # rather than quietly taking a tolerance.
+    ("an unknown type is treated as exact", "SOME_NEW_TYPE", "1.00", "1.01", False),
 ]
 
-#: (label, oracle rows, client rows, expected verdict prefix)
+#: (the type name, its kind)
+TYPE_TESTS = [
+    # Compared by VALUE, so a client printing the same number at another scale
+    # matches.
+    ("DECIMAL(38,6)", NUMERIC), ("DECIMAL(18,2)", NUMERIC), ("decimal(38,2)", NUMERIC),
+    ("NUMERIC(10,2)", NUMERIC), ("BIGINT", NUMERIC), ("INTEGER", NUMERIC),
+    ("HUGEINT", NUMERIC), ("UBIGINT", NUMERIC), ("TINYINT", NUMERIC),
+    # Identity only, so a dropped leading zero or CHAR(n) padding is a
+    # mismatch.
+    ("VARCHAR", TEXT), ("DATE", TEXT), ("BOOLEAN", TEXT), ("TIMESTAMP", TEXT),
+    ("INTERVAL", TEXT), ("BLOB", TEXT),
+    # The only kind that may differ at all.
+    ("DOUBLE", TOLERANCE), ("FLOAT", TOLERANCE), ("REAL", TOLERANCE),
+    ("double", TOLERANCE),
+    # An unknown type gets the STRICTEST kind, not a tolerance.
+    ("SOME_NEW_TYPE", TEXT),
+]
+
+#: (label, column types, oracle rows, client rows, expected verdict prefix)
 COMPARE_TESTS = [
-    ("identical", [["a", "1"]], [["a", "1"]], "ok"),
-    ("reordered rows", [["a", "1"], ["b", "2"]], [["b", "2"], ["a", "1"]], "ok (same rows"),
-    ("a dropped row", [["a", "1"], ["b", "2"]], [["a", "1"]], "ROWS"),
-    ("trailing-blank padding", [["MACHINERY", "1"]], [["MACHINERY ", "1"]], "PADDING"),
-    ("a wrong value", [["a", "1"]], [["a", "2"]], "DIFF"),
+    ("identical", ["VARCHAR", "BIGINT"], [["a", "1"]], [["a", "1"]], "ok"),
+    ("reordered rows", ["VARCHAR", "BIGINT"],
+     [["a", "1"], ["b", "2"]], [["b", "2"], ["a", "1"]], "ok (same rows"),
+    ("a dropped row", ["VARCHAR", "BIGINT"],
+     [["a", "1"], ["b", "2"]], [["a", "1"]], "ROWS"),
+    ("trailing-blank padding", ["VARCHAR", "BIGINT"],
+     [["MACHINERY", "1"]], [["MACHINERY ", "1"]], "PADDING"),
+    ("a wrong value", ["VARCHAR", "BIGINT"], [["a", "1"]], [["a", "2"]], "DIFF"),
+    # The types reach the whole-result level too: one cent in a DECIMAL column
+    # is a DIFF, and the same cent in a DOUBLE column is ok.
+    ("one cent in a DECIMAL column", ["DECIMAL(38,2)"],
+     [["566012345678.34"]], [["566012345678.35"]], "DIFF"),
+    ("the same cent in a DOUBLE column", ["DOUBLE"],
+     [["566012345678.34"]], [["566012345678.35"]], "ok"),
+    # And the refusals, which must never read as a pass.
+    ("no types at all", None, [["a", "1"]], [["a", "1"]], "NO TYPES"),
+    ("too few types for the rows", ["VARCHAR"], [["a", "1"]], [["a", "1"]], "TYPES 1 for 2"),
+    # A single-column NULL: COPY writes a blank line and csv.reader reads it as
+    # [], so the rows measure 0 columns. The width check must not fire, or a
+    # correct answer is refused as the oracle's fault -- q17's avg_yearly at a
+    # small scale factor (review of #537).
+    ("a one-column NULL on both sides", ["DOUBLE"], [[]], [[]], "ok"),
+    ("a one-column NULL the client filled in", ["DOUBLE"], [[]], [["5"]], "DIFF"),
+    ("a NULL among several columns", ["VARCHAR", "DOUBLE"],
+     [["a", ""]], [["a", ""]], "ok"),
 ]
 
 #: (label, session text, expected per-query result)
@@ -1015,27 +1216,70 @@ def _check(label, ok, detail, width=62):
 
 
 def _check_same():
-    print("same() -- what counts as the oracle's answer:")
+    print("same() -- the oracle's TYPE decides, not the value's shape:")
     failures = 0
-    for label, x, y, want in SAME_TESTS:
-        got = same(x, y)
-        failures += _check(label, got == want, "accepted" if got else "rejected")
+    for label, type_name, x, y, want in SAME_TESTS:
+        got = same(x, y, column_kind(type_name))
+        failures += _check("%s [%s]" % (label, type_name), got == want,
+                           "accepted" if got else "rejected", width=72)
+    return failures
+
+
+def _check_types():
+    print("\ncolumn_kind() -- how each column must be compared:")
+    failures = 0
+    for type_name, want in TYPE_TESTS:
+        got = column_kind(type_name)
+        failures += _check("%-18s -> %s" % (type_name, want), got == want, got)
+    return failures
+
+
+def _check_same_pair_both_ways():
+    """The same two strings, judged differently by type. The whole point.
+
+    If this ever passes with one verdict for both, the comparison has stopped
+    being type-driven and is inferring from the values again.
+    """
+    print("\none pair, two verdicts, decided only by the column type:")
+    failures = 0
+    for x, y, label in (("56586554400730.17", "56586554400730.18", "an SF1000 sum one cent apart"),
+                        ("234603658237.28", "234603658237.29", "a mid-size sum one cent apart")):
+        as_dec = same(x, y, NUMERIC)
+        as_dbl = same(x, y, TOLERANCE)
+        failures += _check("%s: DECIMAL rejects, DOUBLE accepts" % label,
+                           as_dec is False and as_dbl is True,
+                           "DECIMAL=%s DOUBLE=%s" % (as_dec, as_dbl), width=72)
     return failures
 
 
 def _check_compare(tmp):
     print("\ncompare() -- the verdict for a whole result:")
     failures = 0
-    for i, (label, a, b, want) in enumerate(COMPARE_TESTS):
+    for i, (label, types, a, b, want) in enumerate(COMPARE_TESTS):
         oracle, got_path = tmp / f"o{i}.csv", tmp / f"g{i}.csv"
         for path, rows in ((oracle, a), (got_path, b)):
             with open(path, "w", newline="") as f:
                 csv.writer(f).writerows(rows)
-        verdict = compare(oracle, got_path)
+        verdict = compare(oracle, got_path, types)
         failures += _check(label, verdict.startswith(want), verdict[:48])
     # A client whose query failed at BIND writes no file at all.
     failures += _check("a missing client file is MISSING, never ok",
-                       compare(tmp / "o0.csv", tmp / "absent.csv").startswith("MISSING"), "MISSING")
+                       compare(tmp / "o0.csv", tmp / "absent.csv", ["VARCHAR", "BIGINT"])
+                       .startswith("MISSING"), "MISSING")
+
+    # read_types(): the file the oracle writes, and its absence.
+    types_path = tmp / "types-q01.csv"
+    with open(types_path, "w", newline="") as f:
+        csv.writer(f).writerows([["DECIMAL(38,2)"], ["DOUBLE"], ["VARCHAR"]])
+    failures += _check("read_types() reads the oracle's file in order",
+                       read_types(types_path) == ["DECIMAL(38,2)", "DOUBLE", "VARCHAR"],
+                       str(read_types(types_path)))
+    failures += _check("a missing types file is None, so compare() refuses",
+                       read_types(tmp / "types-absent.csv") is None, "None")
+    with open(types_path, "w") as f:
+        f.write("")
+    failures += _check("an empty types file is None too",
+                       read_types(types_path) is None, "None")
     return failures
 
 
@@ -1052,6 +1296,13 @@ def _check_parse():
     return failures
 
 
+#: How long the fixture's child is given before the timeout fires. One
+#: constant, because the first version of this fix changed the call and the
+#: note but left the check's LABEL saying 2 s, so the self-test misreported
+#: what it had run (roborev on c59b50b).
+CHILD_TIMEOUT = 5
+
+
 def _check_timeout_path():
     """Item 1, proved against a REAL timeout rather than a constructed value."""
     print("\nthe session-timeout path (review of #518 item 1):")
@@ -1063,8 +1314,9 @@ def _check_timeout_path():
               "time.sleep(30)\n")
     try:
         subprocess.run([sys.executable, "-c", script], text=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, timeout=2)
-        return _check("a 2 s timeout on a 30 s child raises TimeoutExpired", False, "it did NOT time out")
+                       stderr=subprocess.STDOUT, timeout=CHILD_TIMEOUT)
+        return _check(f"a {CHILD_TIMEOUT} s timeout on a 30 s child raises TimeoutExpired",
+                      False, "it did NOT time out")
     except subprocess.TimeoutExpired as exc:
         # This is the assertion that matters: the type Python really hands back.
         failures += _check("exc.output is bytes even though the call passed text=True",
@@ -1076,12 +1328,21 @@ def _check_timeout_path():
             return failures + _check("mask(decode_output(...)) does not raise", False,
                                      f"{type(e).__name__}: {e}")
         res = parse_marked(text, "T")
+        # Guarded with .get, and the child is given CHILD_TIMEOUT rather than
+        # the original 2 s. On a
+        # loaded runner the child may not be scheduled and flushed inside the
+        # window, leaving `exc.output` empty: parse_marked then returns {} and
+        # a bare res["q02"] raised KeyError, so an intermittent CI failure
+        # looked like a crash in the harness rather than a slow machine. Seen
+        # once locally while a crapper run and a differential were competing
+        # for the CPU.
         failures += _check("the queries that DID finish keep their timings",
                            res.get("q01", (None,))[0] == 0.5, str(res.get("q01")))
-        hung = name_hung_query(res, "session timed out after 2s")
+        hung = name_hung_query(res, f"session timed out after {CHILD_TIMEOUT}s")
+        note = (res.get("q02") or (None, ""))[1] or ""
         failures += _check("the interrupted query is named as the timeout, not as `no Run Time`",
-                           hung == "q02" and "timed out" in (res["q02"][1] or ""),
-                           f"{hung}: {res['q02'][1]}")
+                           hung == "q02" and "timed out" in note,
+                           f"{hung}: {note or 'NO OUTPUT CAPTURED (the child never ran)'}")
     # A session that produced nothing at all must still be survivable.
     failures += _check("a timeout with no output at all decodes to empty",
                        decode_output(None) == "" and decode_output(b"") == "", "''")
@@ -1143,8 +1404,61 @@ def _check_report(tmp):
     return failures
 
 
+def _check_extracted():
+    """The helpers the CC split made independently reachable.
+
+    Each was buried inside a 15-30 branch command before, so none of these
+    invariants had ever been checked on its own.
+    """
+    print("\nthe pieces the split exposed:")
+    failures = 0
+
+    # The rotation rule, documented since #505 and never tested: no client is
+    # always first, and every rep is a permutation of the same clients.
+    clients = ["A", "B", "Bscan", "C"]
+    orders = [rotated(clients, rep) for rep in range(8)]
+    failures += _check("every rep runs the same clients", all(sorted(o) == sorted(clients) for o in orders),
+                       "4 clients x 8 reps")
+    failures += _check("every client leads at least once in 4 reps",
+                       {o[0] for o in orders[:4]} == set(clients),
+                       ", ".join(o[0] for o in orders[:4]))
+    failures += _check("the rotation repeats with the client count",
+                       orders[0] == orders[4] and orders[1] == orders[5], "period 4")
+    failures += _check("one client needs no rotation", rotated(["A"], 7) == ["A"], "['A']")
+
+    # comparable(): the sum must cover identical work, which is #505 item 5.
+    med = {("A", "q01"): (1.0, 1, ""), ("A", "q06"): (None, 0, "boom"),
+           ("B", "q01"): (2.0, 1, ""), ("B", "q06"): (4.0, 1, "")}
+    common, missing, totals = comparable(med, ["A", "B"], ["q01", "q06"])
+    failures += _check("a query one client failed is excluded from the sum",
+                       common == ["q01"] and missing == ["q06"], "common=%s" % common)
+    failures += _check("the totals cover only the common queries",
+                       totals == {"A": 1.0, "B": 2.0}, str(totals))
+
+    # samples(): the first error is kept even when later reps succeeded, so a
+    # flaky query is still visible in the report.
+    rows = [{"client": "A", "query": "q01", "seconds": "", "error": "first"},
+            {"client": "A", "query": "q01", "seconds": "2.0", "error": ""},
+            {"client": "A", "query": "q01", "seconds": "", "error": "second"},
+            {"client": "B", "query": "q01", "seconds": "9.0", "error": ""}]
+    vals, err = samples(rows, "A", "q01")
+    failures += _check("samples() takes only its own client and query",
+                       vals == [2.0] and err == "first", "%s / %r" % (vals, err))
+
+    # cell(): the (n=N) annotation, which was stored and never read until #518.
+    failures += _check("a short cell is annotated with its rep count",
+                       cell(1.5, 1, "", 3) == "1.500 (n=1)", cell(1.5, 1, "", 3))
+    failures += _check("a full cell is not annotated",
+                       cell(1.5, 3, "", 3) == "1.500", cell(1.5, 3, "", 3))
+    failures += _check("a failed cell shows its error", cell(None, 0, "boom", 3) == "error: boom",
+                       cell(None, 0, "boom", 3))
+    return failures
+
+
 def cmd_selftest(args):
     failures = _check_same()
+    failures += _check_types()
+    failures += _check_same_pair_both_ways()
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         failures += _check_compare(tmp)
@@ -1152,6 +1466,7 @@ def cmd_selftest(args):
         failures += _check_timeout_path()
         failures += _check_preamble()
         failures += _check_report(tmp)
+    failures += _check_extracted()
     print(f"\n{'FAIL' if failures else 'PASS'}: self-test, {failures} failure(s)")
     return 1 if failures else 0
 
@@ -1208,6 +1523,55 @@ WHERE pa.attribute = 'dbid' AND CAST(pa.value AS int) = DB_ID(N'{db}')
 ORDER BY qs.total_elapsed_time DESC"""
 
 
+def trace_script(client, cfg, args, queries, dmv):
+    """Per query: run it once warm, FREEPROCCACHE, run it timed, read the DMV."""
+    opts = "" if CLIENTS[client]["bin"] == "A" else ", remote_pushdown false"
+    s = session_head(client, cfg, args)
+    s.append(f"ATTACH '{esc(dsn(cfg, 'master', args.encrypt))}' AS adm (TYPE mssql{opts});")
+    s.append(".mode csv")
+    for q in queries:
+        qt = query_text(client, q, args.sf)
+        s += [".output /dev/null", qt,
+              "SELECT mssql_exec('adm', 'DBCC FREEPROCCACHE WITH NO_INFOMSGS');",
+              ".output", f".print @@Q {q}@@", ".output /dev/null", ".timer on", qt, ".timer off", ".output",
+              f"SELECT * FROM mssql_scan('adm', '{dmv}');"]
+    return s + [".print @@Q end@@"]
+
+
+def trace_statements(body):
+    """The DMV rows of one query's section: 6 CSV fields, the first a count."""
+    return [row for row in csv.reader(body.splitlines()) if len(row) == 6 and row[0].isdigit()]
+
+
+def trace_query_section(client, q, body):
+    """-> (summary tuple, markdown lines) for one traced query."""
+    timing = RUN_TIME.search(body)
+    wall = float(timing.group(1)) if timing else None
+    rows = trace_statements(body)
+    n_rows = sum(int(x[1]) for x in rows)
+    el = sum(float(x[2]) for x in rows)
+    cpu = sum(float(x[3]) for x in rows)
+    md = [f"## {q}: client {wall if wall is not None else 'ERROR'} s, {len(rows)} statement(s), "
+          f"{n_rows} rows to the client, server {el:.0f} ms elapsed / {cpu:.0f} ms CPU", ""]
+    md += [f"- {x[0]} exec, {x[1]} rows, {x[2]} ms elapsed, {x[3]} ms CPU, {x[4]} reads: `{x[5][:600]}`"
+           for x in rows]
+    md.append("")
+    return (client, q, wall, len(rows), n_rows, el, cpu), md
+
+
+def trace_report(client, args, text):
+    """-> (summary rows, markdown lines) for one client's whole session."""
+    parts = re.split(r"@@Q (\S+)@@", text)
+    summary, md = [], [f"# {client}: {CLIENTS[client]['label']} -- {args.db}", ""]
+    for q, body in zip(parts[1::2], parts[2::2]):
+        if q == "end":
+            continue
+        row, lines = trace_query_section(client, q, body)
+        summary.append(row)
+        md += lines
+    return summary, md
+
+
 def cmd_trace(args):
     """What each client sends to SQL Server for each query: statements, rows returned, server time.
 
@@ -1223,37 +1587,12 @@ def cmd_trace(args):
     dmv = esc(DMV.format(db=args.db))
     summary = []
     for client in clients:
-        opts = "" if CLIENTS[client]["bin"] == "A" else ", remote_pushdown false"
-        s = session_head(client, cfg, args)
-        s.append(f"ATTACH '{esc(dsn(cfg, 'master', args.encrypt))}' AS adm (TYPE mssql{opts});")
-        s.append(".mode csv")
-        for q in queries:
-            qt = query_text(client, q, args.sf)
-            s += [".output /dev/null", qt,
-                  "SELECT mssql_exec('adm', 'DBCC FREEPROCCACHE WITH NO_INFOMSGS');",
-                  ".output", f".print @@Q {q}@@", ".output /dev/null", ".timer on", qt, ".timer off", ".output",
-                  f"SELECT * FROM mssql_scan('adm', '{dmv}');"]
-        s += [".print @@Q end@@"]
-        rc, text = run_cli(binary(CLIENTS[client]["bin"]), "\n".join(s) + "\n", cfg, timeout=args.timeout)
+        script = trace_script(client, cfg, args, queries, dmv)
+        rc, text = run_cli(binary(CLIENTS[client]["bin"]), "\n".join(script) + "\n", cfg,
+                           timeout=args.timeout)
         (out / f"trace-{client}.log").write_text(text)
-        parts = re.split(r"@@Q (\S+)@@", text)
-        md = [f"# {client}: {CLIENTS[client]['label']} -- {args.db}", ""]
-        for q, body in zip(parts[1::2], parts[2::2]):
-            if q == "end":
-                continue
-            r = RUN_TIME.search(body)
-            wall = float(r.group(1)) if r else None
-            rows = [row for row in csv.reader(body.splitlines()) if len(row) == 6 and row[0].isdigit()]
-            n_rows = sum(int(x[1]) for x in rows)
-            el = sum(float(x[2]) for x in rows)
-            cpu = sum(float(x[3]) for x in rows)
-            summary.append((client, q, wall, len(rows), n_rows, el, cpu))
-            md.append(f"## {q}: client {wall if wall is not None else 'ERROR'} s, {len(rows)} statement(s), "
-                      f"{n_rows} rows to the client, server {el:.0f} ms elapsed / {cpu:.0f} ms CPU")
-            md.append("")
-            for x in rows:
-                md.append(f"- {x[0]} exec, {x[1]} rows, {x[2]} ms elapsed, {x[3]} ms CPU, {x[4]} reads: `{x[5][:600]}`")
-            md.append("")
+        rows, md = trace_report(client, args, text)
+        summary += rows
         (out / f"trace-{client}.md").write_text("\n".join(md) + "\n")
     print("client query  wall_s  stmts  rows_to_client  server_elapsed_ms  server_cpu_ms")
     for c, q, wall, n, rows, el, cpu in summary:
