@@ -28,8 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A parameter from an annotated string column lost its non-ASCII characters.** It was declared `varchar(n)`, which takes the database's code page, not the column's: `ж` became `?`. Such a value goes as nvarchar.
 - **A statement whose branches return different string lengths** (`IF` arms, a procedure's) failed with "result shape changed between bind and execution". A stream no longer than the described length now fits.
 
-### Fixed
-
 - **A metadata load no longer deadlocks with another session's DDL.** A load (a table's first use, `SHOW TABLES`, `duckdb_tables()`) runs in the open transaction, and when it waited on a row another session's uncommitted DDL held, the two could deadlock, with the load as the victim: SQL Server rolled back the whole transaction, and the error said `The server failed to resume the transaction`. It could also make the other session's `DROP` the victim. A load now never queues for a lock (`LOCK_TIMEOUT 0`): it reads again until `mssql_metadata_timeout`. If that passes, the error names the cause and the statement has failed, so DuckDB asks for a `ROLLBACK` as usual. Two transactions that each hold uncommitted DDL and each list the catalog now both wait out that timeout and both fail, where a deadlock used to roll one of them back within seconds and let the other go on. A CTAS, DDL or a first read of a table needs no listing and does not wait for another transaction's uncommitted DDL. No permission is needed. Measured over 3 interleaved runs of the test suite on 12 workers: 63 deadlocks before, 0 after. Not on Fabric Warehouse or Synapse.
 
 ## [0.3.0] - 2026-10-20
