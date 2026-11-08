@@ -248,6 +248,10 @@ public:
 												  OnEntryNotFound if_not_found) override;
 
 	void ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) override;
+	//! DuckDB's own pruning, and the count of what survives kept for the query, so a lookup by
+	//! name budgets across every schema it will be asked about (MSSQLSchemaEntry::Scan).
+	vector<reference<SchemaCatalogEntry>> GetSchemasForScan(ClientContext &context,
+															const SchemaScanFilters &filters) override;
 
 	optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override;
 

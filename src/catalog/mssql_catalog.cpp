@@ -1,4 +1,5 @@
 #include "catalog/mssql_catalog.hpp"
+#include "duckdb/catalog/schema_scan_filters.hpp"
 
 #include <openssl/crypto.h>
 #include <cctype>
@@ -760,6 +761,13 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 		MSSQLBindAnchors::For(*transaction.context, *this).AnchorSchema(schema_sp);
 	}
 	return schema_sp.get();
+}
+
+vector<reference<SchemaCatalogEntry>> MSSQLCatalog::GetSchemasForScan(ClientContext &context,
+																	  const SchemaScanFilters &filters) {
+	auto schemas = Catalog::GetSchemasForScan(context, filters);
+	MSSQLBindAnchors::For(context, *this).SetSchemasInScan(schemas.size());
+	return schemas;
 }
 
 void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {

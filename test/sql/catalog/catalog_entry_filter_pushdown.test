@@ -60,20 +60,21 @@ EXPLAIN SELECT table_name FROM duckdb_tables() WHERE database_name = 'cef' AND t
 ----
 physical_plan	<REGEX>:.*table_name = 'cef_a'.*
 
-# One name, a list of names, an OR of names: looked up, so con1's row is never read.
+# One name, a list of names, an OR of names: looked up, so con1's row is never read. One name is
+# looked up in every schema; a list takes a schema_name filter to stay inside the budget below.
 query II
 SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'cef' AND table_name = 'cef_a';
 ----
 dbo	cef_a
 
 query I rowsort
-SELECT table_name FROM duckdb_tables() WHERE database_name = 'cef' AND table_name IN ('cef_a', 'cef_b', 'cef_none');
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'cef' AND schema_name = 'dbo' AND table_name IN ('cef_a', 'cef_b', 'cef_none');
 ----
 cef_a
 cef_b
 
 query I rowsort
-SELECT table_name FROM duckdb_tables() WHERE database_name = 'cef' AND (table_name = 'cef_b' OR table_name = 'cef_a');
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'cef' AND schema_name = 'dbo' AND (table_name = 'cef_b' OR table_name = 'cef_a');
 ----
 cef_a
 cef_b
@@ -124,6 +125,13 @@ cef_a
 
 statement ok
 COMMIT;
+
+# The lookups are budgeted across the scan, names x schemas asked, at 16: four names in every
+# schema of the database are past it, and the scan lists.
+statement error
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'cef' AND table_name IN ('cef_a', 'cef_b', 'cef_none', 'cef_nonf');
+----
+Metadata query failed
 
 # What the filter does not pin is a listing, which con1's row stops.
 statement error

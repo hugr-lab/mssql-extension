@@ -18,9 +18,10 @@ class LogicalType;
 
 namespace mssql {
 
-//! The most names a filter is answered by looking each one up, in each schema DuckDB asks about:
-//! with no schema_name filter that is every schema, so 16 names on 50 schemas are 800 single-table
-//! loads the first time (a miss is remembered after). Past it one listing of the schema costs less.
+//! The most single-table lookups one system-catalog scan makes: names x the schemas DuckDB asks
+//! about (MSSQLSchemaEntry::Scan; review of #541). Without a schema_name filter that is every
+//! schema, and 16 names on 50 schemas were 800 round trips against the 50 listings it replaced.
+//! Past it the scan lists, as before. A miss is remembered, so a repeat costs nothing.
 constexpr idx_t MAX_LOOKED_UP_NAMES = 16;
 
 //! The names `filter` can accept, when it is a set of equalities on the column -- `= c`, `IN (…)`,

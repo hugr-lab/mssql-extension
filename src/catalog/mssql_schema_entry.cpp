@@ -1,4 +1,5 @@
 #include "catalog/mssql_schema_entry.hpp"
+#include "catalog/mssql_bind_anchors.hpp"
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
 #include "catalog/mssql_entry_name_filter.hpp"
@@ -86,7 +87,11 @@ void MSSQLSchemaEntry::Scan(ClientContext &context, SchemaScanInfo &info) {
 		return;
 	}
 	vector<string> names;
-	if (mssql::EntryNameCandidates(info.filter->GetName(), LogicalType::VARCHAR, names)) {
+	// Budgeted across the scan: DuckDB asks each schema it kept in turn.
+	const auto schemas_in_scan = MSSQLBindAnchors::For(context, GetMSSQLCatalog()).SchemasInScan();
+	const idx_t schema_count = schemas_in_scan.IsValid() ? MaxValue<idx_t>(schemas_in_scan.GetIndex(), 1) : 1;
+	if (mssql::EntryNameCandidates(info.filter->GetName(), LogicalType::VARCHAR, names) &&
+		names.size() * schema_count <= mssql::MAX_LOOKED_UP_NAMES) {
 		auto &stats_provider = GetMSSQLCatalog().GetStatisticsProvider();
 		const string schema_name = name.GetIdentifierName();
 		for (const auto &table_name : names) {

@@ -21,6 +21,17 @@ void MSSQLBindAnchors::QueryEnd(ClientContext &context) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	table_anchors_.clear();
 	schema_anchors_.clear();
+	schemas_in_scan_ = optional_idx();
+}
+
+void MSSQLBindAnchors::SetSchemasInScan(idx_t count) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	schemas_in_scan_ = count;
+}
+
+optional_idx MSSQLBindAnchors::SchemasInScan() const {
+	std::lock_guard<std::mutex> lock(mutex_);
+	return schemas_in_scan_;
 }
 
 void MSSQLBindAnchors::AnchorTable(shared_ptr<MSSQLTableEntry> entry) {
