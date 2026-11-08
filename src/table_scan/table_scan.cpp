@@ -493,6 +493,11 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 			if (!page) {
 				continue;
 			}
+			const auto undecodable =
+				mssql::codec::code_page::UndecodableBareRead(wire_columns[i], read_columns[i]->collation_name);
+			if (!undecodable.empty()) {
+				throw InvalidInputException(undecodable);
+			}
 			const auto mismatch =
 				mssql::codec::code_page::NamedCodePageMismatch(wire_columns[i], *page, read_columns[i]->collation_name);
 			if (!mismatch.empty()) {

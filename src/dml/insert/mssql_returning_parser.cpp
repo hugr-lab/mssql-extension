@@ -34,6 +34,14 @@ unique_ptr<DataChunk> MSSQLReturningParser::TakeResult() {
 	if (rows_.empty()) {
 		return nullptr;
 	}
+	// A RETURNING column is read bare under the same rule as a scan's (BuildReturningExpression).
+	for (const auto &col : columns_) {
+		const auto undecodable =
+			client_transcode_ ? mssql::codec::code_page::UndecodableBareRead(col, std::string()) : std::string();
+		if (!undecodable.empty()) {
+			throw InvalidInputException(undecodable);
+		}
+	}
 	if (columns_.size() != result_types_.size()) {
 		throw IOException(
 			"INSERT ... RETURNING on '%s.%s': the statement's last result set has %llu columns, "

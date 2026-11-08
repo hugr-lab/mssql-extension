@@ -1253,6 +1253,17 @@ void TestCodePageKernel() {
 		CHECK_EQ(columns[1].code_page != nullptr && columns[1].code_page->code_page == 1252, true, "by the SortId");
 		CHECK_EQ(columns[2].code_page == nullptr, true, "UTF-8 is read as it is");
 		CHECK_EQ(columns[3].code_page == nullptr, true, "a collation newer than the tables");
+		// ... which a bare read cannot take: an error naming the column and the wire's collation.
+		using duckdb::mssql::codec::code_page::UndecodableBareRead;
+		const std::string undecodable = UndecodableBareRead(columns[3], "Cyrillic_General_CI_AS");
+		CHECK_EQ(undecodable.find("\"c\"") != std::string::npos &&
+					 undecodable.find("Cyrillic_General_CI_AS") != std::string::npos &&
+					 undecodable.find("0xFFFFF") != std::string::npos &&
+					 undecodable.find("mssql_invalidate_cache") != std::string::npos,
+				 true, "an undecodable bare read names the column, both collations and the fix");
+		CHECK_EQ(UndecodableBareRead(columns[0], "x") + UndecodableBareRead(columns[2], "x") +
+					 UndecodableBareRead(columns[4], "x") + UndecodableBareRead(columns[5], "x"),
+				 std::string(), "a known page, UTF-8, binary and UTF-16 all decode");
 		CHECK_EQ(columns[4].code_page == nullptr, true, "not text");
 		CHECK_EQ(columns[5].code_page == nullptr, true, "UTF-16 on the wire");
 	}

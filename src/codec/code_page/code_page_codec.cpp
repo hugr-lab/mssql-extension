@@ -61,6 +61,19 @@ std::string NamedCodePageMismatch(const tds::ColumnMetadata &col, const CodePage
 		static_cast<unsigned>(col.collation_sort_id), wire);
 }
 
+std::string UndecodableBareRead(const tds::ColumnMetadata &col, const std::string &collation_name) {
+	if (!col.IsSingleByteTextColumn() || col.IsUtf8Collation() || col.code_page) {
+		return std::string();
+	}
+	const std::string named = collation_name.empty() ? std::string() : " under collation " + collation_name;
+	return StringUtil::Format(
+		"MSSQL: column \"%s\" was read without the server's conversion, because the catalog has it%s, but it "
+		"arrives under a collation this build has no code-page table for (LCID 0x%05X, SortId %u), so its bytes "
+		"cannot be read as text. The catalog is stale: run mssql_invalidate_cache() (for a view, sp_refreshview "
+		"first), and the column is read through the server's conversion.",
+		col.name, named, col.collation & WIRE_LCID_MASK, static_cast<unsigned>(col.collation_sort_id));
+}
+
 //! A DuckDB string holds at most MAX_STRING_SIZE bytes, and a chunk's output is
 //! one allocation. 3 bytes per input byte is the bound while it fits.
 static size_t OutputCapacity(size_t input_bytes) {

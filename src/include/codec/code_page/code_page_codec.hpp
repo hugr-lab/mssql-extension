@@ -51,6 +51,13 @@ void ResolveWireCodePages(std::vector<tds::ColumnMetadata> &columns);
 std::string NamedCodePageMismatch(const tds::ColumnMetadata &col, const CodePageTable &named,
 								  const std::string &collation_name);
 
+//! A column the catalog had read bare, because the collation it names has a table, that arrives
+//! under a collation with none: a catalog staler than the column's collation, changed to one newer
+//! than the tables. Its bytes are not UTF-8, so it is an error, not a warning (review of #538):
+//! the server's cast that kept such bytes off the catalog path is the one bare reads dropped. Empty
+//! when the column decodes. `collation_name` is the catalog's, empty where it has none.
+std::string UndecodableBareRead(const tds::ColumnMetadata &col, const std::string &collation_name);
+
 //! Publish a staged column whose ColumnMetadata::code_page is set: its UTF-8 in
 //! the vector's string heap and every row's string_t, in one call into the module
 //! (code_page::DecodeColumn). A BIGCHAR's padding is trimmed off the output.

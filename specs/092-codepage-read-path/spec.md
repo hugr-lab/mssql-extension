@@ -624,15 +624,22 @@ Acceptance:
   query restores the server's conversion.
 - **An x86 with neither AVX2 nor AVX-512** runs the scalar single-byte kernel, value by value.
 - **A wire key the tables do not have**, on a server newer than the tables (D1's check covers 2025).
-  A catalog scan and a pushed statement keep the bytes and warn; RETURNING and `#out` keep them
-  without a warning. A new collation
-  normally brings a new name as well, and a name the tables lack keeps its cast on all of these.
+  A catalog scan and an INSERT … RETURNING refuse such a column by name and point at
+  `mssql_invalidate_cache()` (`UndecodableBareRead`; review of #538: its bytes are not UTF-8, and
+  the server's cast that kept them off the catalog path is the one a bare read drops). A pushed
+  statement keeps the bytes and warns, as a raw scan does; the staged UPDATE / DELETE … RETURNING
+  (`#out`) keeps them without a warning. A new collation normally brings a new name as well, and a
+  name the tables lack keeps its cast on all of these, so this takes a catalog staler than the
+  column's collation.
 - **Users who relied on raw bytes** from a raw scan. Covered by the escape hatch and a CHANGELOG
   *Changed* entry.
 - **More pushdown (D8)** means the 079 suites decide it. Every new shape is checked against the
   unpushed result there.
 - **Synapse** carries code-page collations through the same TDS but has no test lane here. Fabric
-  Warehouse uses UTF-8 collations and sees no change.
+  Warehouse uses UTF-8 collations and sees no change on read.
+- **The Fabric write mapping** (`codec::FabricStringType`) is tested against our model of a
+  warehouse (`test_ctas_type_mapping.cpp`), not against one: `test/sql/fabric/fabric_types.test`
+  was updated and needs a warehouse to run.
 
 ## Tasks
 

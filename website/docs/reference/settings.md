@@ -71,7 +71,7 @@ Details: [Target Column Types and Table Shape](../writing/table-options.md).
 | `mssql_default_table_kind` | VARCHAR | `HEAP` | Shape of created tables: `HEAP` or `COLUMNSTORE` (clustered columnstore index created before the load) |
 | `mssql_catalog_native_types` | BOOLEAN | true | Report `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` for bounded string columns of attached tables **and of `mssql_scan` / `mssql_scan_params` results** (a code-page `varchar` there only under `mssql_client_transcode`, whose values are UTF-8), so targets inherit declared lengths. Per catalog: the `native_types` ATTACH option. |
 | `mssql_client_transcode` | BOOLEAN | true | Read code-page `CHAR` / `VARCHAR` as bytes and convert them to UTF-8 on the client; read at ATTACH. `false`: the server converts catalog columns, and a raw `mssql_scan` returns the bytes as they are |
-| `mssql_convert_varchar_max` | BOOLEAN | true | Convert `VARCHAR(MAX)` to `NVARCHAR(MAX)` in catalog scan SQL where the server converts: a double-byte page, or `mssql_client_transcode = false`. No effect on a single-byte page, which the client converts |
+| `mssql_convert_varchar_max` | BOOLEAN | true | Convert `VARCHAR(MAX)` to `NVARCHAR(MAX)` in catalog scan SQL where the server converts: a double-byte page, or `mssql_client_transcode = false`. No effect on a single-byte page, which the client converts: there `mssql_client_transcode` decides, and `false` restores the server's conversion |
 
 ### ORDER BY Pushdown Settings (Experimental)
 
