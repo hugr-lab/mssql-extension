@@ -141,6 +141,10 @@ struct ExpressionEncodeContext {
 	// (`t.v + len(...)` is `CAST(v AS BIGINT) + ...`). The scan path leaves it
 	// off. Inherited by children.
 	bool widening_casts = false;
+	//! The column reference being encoded is the direct operand of IS [NOT] NULL, which a column
+	//! read through a cast answers the same on the server: the cast is NULL exactly when the column
+	//! is (issue #514). Not inherited by child(), so it reaches no deeper expression.
+	bool null_test_operand = false;
 
 	ExpressionEncodeContext(const std::vector<column_t> &col_ids, const std::vector<std::string> &col_names,
 							const std::vector<LogicalType> &col_types)
