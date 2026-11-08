@@ -1,0 +1,73 @@
+# name: test/sql/query/mssql_exec_per_row.test
+# description: mssql_exec runs once per row of the query that calls it, its context taken from that row
+# group: [query]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# A constant call used to run once per chunk: UnaryExecutor ran the constant input once and
+# broadcast the count, so FROM range(3) inserted one row. A context given per row was read from
+# row 0. What DuckDB does not run at all, it drops: a call nothing reads (the last block).
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS epr (TYPE mssql);
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS epr2 (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('epr', 'DROP TABLE IF EXISTS dbo.epr_t; CREATE TABLE dbo.epr_t (id int IDENTITY, x int)');
+
+# A constant statement, three rows: three runs, each counting its own row.
+query I
+SELECT sum(mssql_exec('epr', 'INSERT dbo.epr_t (x) VALUES (1)')) FROM range(3);
+----
+3
+
+query I
+SELECT * FROM mssql_scan('epr', 'SELECT COUNT(*) FROM dbo.epr_t');
+----
+3
+
+query I
+SELECT count(*) FROM (SELECT mssql_exec('epr', 'INSERT dbo.epr_t (x) VALUES (2)') AS n FROM range(4)) WHERE n = 1;
+----
+4
+
+query I
+SELECT * FROM mssql_scan('epr', 'SELECT COUNT(*) FROM dbo.epr_t WHERE x = 2');
+----
+4
+
+# The statement and the context per row.
+query I
+SELECT sum(mssql_exec(c, 'INSERT dbo.epr_t (x) VALUES (' || v || ')')) FROM (VALUES ('epr', 10), ('epr2', 11), ('epr', 12)) t(c, v);
+----
+3
+
+query I
+SELECT * FROM mssql_scan('epr', 'SELECT COUNT(*) FROM dbo.epr_t WHERE x IN (10, 11, 12)');
+----
+3
+
+# A NULL statement runs nothing and answers NULL.
+query I
+SELECT mssql_exec('epr', NULL::VARCHAR) IS NULL;
+----
+true
+
+# A call whose result nothing reads is dropped by DuckDB before it runs (documented).
+statement ok
+SELECT count(*) FROM (SELECT mssql_exec('epr', 'INSERT dbo.epr_t (x) VALUES (3)') AS n FROM range(2));
+
+query I
+SELECT * FROM mssql_scan('epr', 'SELECT COUNT(*) FROM dbo.epr_t WHERE x = 3');
+----
+0
+
+statement ok
+SELECT mssql_exec('epr', 'DROP TABLE dbo.epr_t');
