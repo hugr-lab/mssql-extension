@@ -5,7 +5,7 @@ DuckDB extension for SQL Server via a custom TDS protocol implementation (no Fre
 ## Technology
 
 - **Language**: C++17 (DuckDB extension standard)
-- **DuckDB**: `v2.0-cyanoptera`, DuckDB's v2.0 pre-release stabilisation branch (2.0 API track, spec 069). Tracked instead of `main` since the branch was cut on 2026-09-03: it is where the 2.0 line is being stabilised, and `main` has already diverged from it. The 1.5.x world lives on branch `duckdb-v1.5.5` for 0.2.x maintenance releases; main compiles against the pinned duckdb submodule SHA only (no dual-API shim since spec 069 retired `mssql_compat.hpp`)
+- **DuckDB**: `v2.0-cyanoptera`, DuckDB's 2.0 branch (2.0 API track, spec 069). Tracked instead of `main` since the branch was cut on 2026-09-03; since v2.0.0 (2026-10-20) it carries the backports of the 2.0.x line, and the pin follows its head between releases (2026-11-08: `4569c0a1eeb`, 880 commits past v2.0.0). A head that is not a release tag builds as `-dev` and loads into no released DuckDB, so a release waits for the 2.0.x tag (see Versioning). `main` (2.1-dev) is not tracked: measured 2026-11-08, it is mid-refactor (`ClientContext` giving way to `Context` / `ExecutionServices`, `registered_state` gone) and table functions default to `stability = CONSISTENT_WITHIN_QUERY`, which a side-effecting vehicle (`mssql_dml`) would have to opt out of. The 1.5.x world lives on branch `duckdb-v1.5.5` for 0.2.x maintenance releases; main compiles against the pinned duckdb submodule SHA only (no dual-API shim since spec 069 retired `mssql_compat.hpp`)
 - **TLS**: OpenSSL via vcpkg (statically linked, symbol visibility controlled)
 - **Platforms**: Linux (GCC), macOS (Clang), Windows (MSVC, MinGW/Rtools 4.2)
 
