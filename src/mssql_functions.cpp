@@ -153,6 +153,9 @@ struct MSSQLDescribedShape {
 	//! vector's TIMESTAMP unit (datetime / smalldatetime always decode to µs).
 	vector<bool> datetime2;
 	bool ok = false;
+	//! The describe answered cleanly that the statement returns no result set (issue #525):
+	//! refused before it would run at bind.
+	bool no_result_set = false;
 	string reason;	// why not, for the debug log and the prepared error
 };
 
@@ -504,6 +507,7 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 	}
 	if (result.rows.empty()) {
 		shape.reason = "the statement returns no result set";
+		shape.no_result_set = true;
 		return shape;
 	}
 	for (const auto &row : result.rows) {
@@ -1058,6 +1062,11 @@ static void BindDescribedScan(ClientContext &context, const char *function, MSSQ
 	// F1 fallback: the server would not describe it, so learn the shape the way
 	// this function always had -- by running it.
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: describe fell back to execution: %s", shape.reason.c_str());
+	if (shape.no_result_set) {
+		// The server said so: refused before the statement runs, so an INSERT handed to
+		// mssql_scan is not executed and then refused (issue #525).
+		RequireResultSet({}, function);
+	}
 	if (bind_data.wants_column_types) {
 		// Refused before the batch runs: its effects would otherwise already have
 		// happened, and a stream registered below would be left behind.

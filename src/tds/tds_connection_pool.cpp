@@ -4,6 +4,7 @@
 #include <thread>
 #include <vector>
 #include "duckdb/common/error_data.hpp"
+#include "duckdb/common/exception.hpp"
 
 #include "duckdb/common/assert.hpp"
 
@@ -28,6 +29,25 @@ static int GetPoolDebugLevel() {
 	} while (0)
 
 namespace {
+
+// Issue #481: set around a TryAcquire's own login (see InOptionalAcquire), by a guard so a
+// throw cannot leave it set on the thread.
+thread_local bool optional_acquire_in_progress = false;
+
+class OptionalAcquireFlag {
+public:
+	explicit OptionalAcquireFlag(bool optional) : previous_(optional_acquire_in_progress) {
+		optional_acquire_in_progress = optional;
+	}
+	~OptionalAcquireFlag() {
+		optional_acquire_in_progress = previous_;
+	}
+	OptionalAcquireFlag(const OptionalAcquireFlag &) = delete;
+	OptionalAcquireFlag &operator=(const OptionalAcquireFlag &) = delete;
+
+private:
+	bool previous_;
+};
 
 // The pool slot a login holds from before it starts (issue #461), taken under
 // the pool's lock. It goes back, waking a caller that waited on it, on every way
@@ -285,9 +305,19 @@ std::shared_ptr<TdsConnection> ConnectionPool::AcquireImpl(int timeout_ms, std::
 			// measured. Prewarm reserves its slots the same way.
 			SlotReservation slot(lock, stats_.total_connections, available_cv_);
 			std::string error;
+			bool interrupted = false;
 			lock.unlock();
-			conn = CreateNewConnection(error);
+			{
+				OptionalAcquireFlag flag(optional);
+				conn = CreateNewConnection(error, interrupted);
+			}
 			lock.lock();
+			if (interrupted) {
+				// The slot goes back; nothing is recorded as a creation failure,
+				// so the backoff and mssql_pool_stats' last error are untouched.
+				slot.GiveBack();
+				throw InterruptException();
+			}
 
 			if (conn) {
 				// A success resets the backoff so a transient failure does not
@@ -504,7 +534,9 @@ size_t ConnectionPool::Prewarm(size_t target, std::string *failure) {
 	// and the reservation above (review of #386).
 	auto dial = [this, &created, &errors](size_t i) noexcept {
 		try {
-			created[i] = CreateNewConnection(errors[i]);
+			// No context on a prewarm thread, so its login retry is never interrupted.
+			bool interrupted = false;
+			created[i] = CreateNewConnection(errors[i], interrupted);
 		} catch (...) {
 			created[i].reset();
 			try {
@@ -657,15 +689,25 @@ std::shared_ptr<TdsConnection> ConnectionPool::TryAcquireIdle() {
 	return nullptr;
 }
 
-std::shared_ptr<TdsConnection> ConnectionPool::CreateNewConnection(std::string &error) {
+bool ConnectionPool::InOptionalAcquire() {
+	return optional_acquire_in_progress;
+}
+
+std::shared_ptr<TdsConnection> ConnectionPool::CreateNewConnection(std::string &error, bool &interrupted) {
 	// pool_mutex_ must NOT be held (blocking I/O)
 	std::shared_ptr<TdsConnection> conn;
 	error.clear();
+	interrupted = false;
 	try {
 		conn = factory_();
 		if (!conn) {
 			error = "connection factory returned no connection and no reason";
 		}
+	} catch (const InterruptException &) {
+		// Ctrl-C while the factory waited to retry a login (issue #481): the
+		// statement's interrupt, not a reason this pool cannot create one.
+		interrupted = true;
+		error = "interrupted";
 	} catch (const std::exception &e) {
 		// The factory says why -- an expired token, the server's login error,
 		// a refused dial. Kept for the caller; the pool itself only needs the

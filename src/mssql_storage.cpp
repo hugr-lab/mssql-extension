@@ -6,6 +6,7 @@
 #include "catalog/mssql_transaction.hpp"
 #include "connection/instance_resolver.hpp"
 #include "connection/mssql_connection_provider.hpp"
+#include "connection/mssql_login_retry.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
@@ -1646,7 +1647,13 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	auto catalog =
 		make_uniq<MSSQLCatalog>(db, name, std::move(connection_info), std::move(tds_pool_config),
 								std::move(fedauth_token_utf16le), options.access_mode, catalog_enabled, startup);
-	catalog->Initialize(false);
+	{
+		// Issue #481: the ATTACH's own logins (the validation, the collation query) retry a
+		// refusal Azure SQL calls transient; Ctrl-C ends the wait, and each retry is logged
+		// under this context. The prewarm threads have none: they retry, uninterruptibly.
+		mssql::LoginContextScope login_scope(&context);
+		catalog->Initialize(false);
+	}
 	if (!catalog->GetPrewarmShortfall().empty()) {
 		DUCKDB_LOG_WARNING(context, "mssql ATTACH %s: min_connections not all opened: %s", name,
 						   catalog->GetPrewarmShortfall());

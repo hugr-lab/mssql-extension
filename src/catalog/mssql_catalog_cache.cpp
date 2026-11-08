@@ -1,4 +1,5 @@
 #include "catalog/mssql_catalog.hpp"
+#include "connection/mssql_login_retry.hpp"
 
 #include "catalog/mssql_catalog_debug.hpp"
 #include "catalog/mssql_schema_entry.hpp"
@@ -195,6 +196,7 @@ void MSSQLCatalog::Preload(ClientContext &context, const string &schema_name, co
 	// lever -- before the load, not the constructor's placeholders.
 	EnsureCacheLoaded(context);
 	std::string why;
+	mssql::LoginContextScope login_scope(&context);	 // issue #481
 	auto connection = connection_pool_->Acquire(-1, &why);
 	if (!connection) {
 		throw IOException("%s: failed to acquire connection: %s", caller, why);
@@ -279,6 +281,7 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 
 	// Acquire connection for full cache refresh
 	std::string why;
+	mssql::LoginContextScope login_scope(&context);	 // issue #481
 	auto connection = connection_pool_->Acquire(-1, &why);
 	if (!connection) {
 		throw IOException("Failed to acquire connection for cache refresh: " + why);

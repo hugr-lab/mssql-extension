@@ -111,6 +111,11 @@ public:
 	//! of #382). Neither form counts in acquire_count or acquire_timeout_count.
 	std::shared_ptr<TdsConnection> TryAcquire(std::string *failure = nullptr, bool *creation_failed = nullptr);
 
+	//! True while this thread is inside a TryAcquire's own login: the factory's retry of a
+	//! refusal Azure SQL calls transient (issue #481) does not wait there -- an extra writer
+	//! never waits -- and makes one attempt.
+	static bool InOptionalAcquire();
+
 	// Release a connection back to the pool
 	void Release(std::shared_ptr<TdsConnection> conn);
 
@@ -221,7 +226,9 @@ private:
 	void RecordCreateFailureLocked(const std::string &error);
 	// Runs the factory with pool_mutex_ RELEASED (blocking I/O). On failure
 	// returns nullptr and puts the reason in `error`; the caller records it.
-	std::shared_ptr<TdsConnection> CreateNewConnection(std::string &error);
+	// `interrupted` is set when the factory threw an interrupt (Ctrl-C during a
+	// login retry, issue #481): not a failed creation, and the caller rethrows it.
+	std::shared_ptr<TdsConnection> CreateNewConnection(std::string &error, bool &interrupted);
 
 	// "pool 'x' timed out (N active of M, limit L)", plus this call's own
 	// creation failure when it made one. pool_mutex_ must be held.

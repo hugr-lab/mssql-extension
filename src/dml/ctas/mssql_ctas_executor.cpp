@@ -2,6 +2,7 @@
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_ddl_translator.hpp"
 #include "connection/mssql_connection_provider.hpp"
+#include "connection/mssql_login_retry.hpp"
 #include "copy/bcp_config.hpp"
 #include "copy/bulk_load_session.hpp"
 #include "copy/target_resolver.hpp"
@@ -328,6 +329,7 @@ bool CTASExecutionState::ProbeExists(ClientContext &context, const tds::Request 
 	} else {
 		auto &pool = catalog->GetConnectionPool();
 		std::string why;
+		mssql::LoginContextScope login_scope(&context);	 // issue #481
 		auto conn = pool.Acquire(-1, &why);
 		if (!conn) {
 			throw IOException("Failed to acquire connection to check %s existence: %s", what, why);
@@ -437,6 +439,8 @@ void CTASExecutionState::AttemptCleanupNoContext() noexcept {
 	std::shared_ptr<tds::TdsConnection> conn;
 	try {
 		std::string why;
+		// A statement already failing: one login, no retry (issue #481).
+		mssql::LoginRetryOffScope one_login;
 		conn = pool->Acquire(-1, &why);
 		if (!conn) {
 			cleanup_error = "no connection available for cleanup DROP: " + why;
@@ -651,6 +655,7 @@ void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 	}
 	auto &pool = catalog->GetConnectionPool();
 	std::string why;
+	mssql::LoginContextScope login_scope(&context);	 // issue #481
 	auto connection = pool.Acquire(-1, &why);
 	if (!connection) {
 		throw IOException("CTAS BCP: Failed to acquire connection from pool: " + why);
@@ -662,6 +667,7 @@ void CTASExecutionState::ExecuteBCPInsert(ClientContext &context) {
 
 void CTASExecutionState::AddChunkBCP(ClientContext &context, DataChunk &chunk) {
 	if (bcp_session.IsDeferred()) {
+		mssql::LoginContextScope login_scope(&context);	 // issue #481
 		bcp_session.AdoptDeferred();
 	}
 	if (!bcp_session.IsOwned()) {
