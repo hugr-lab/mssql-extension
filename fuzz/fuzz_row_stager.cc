@@ -25,6 +25,7 @@
 // and the LOB length cap), so only a sanitizer report, a crash or a hang is a
 // finding.
 
+#include "codec/code_page/code_page_codec.hpp"
 #include "codec/staging/row_stager.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -96,6 +97,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
 		duckdb::mssql::codec::staging::RowStager stager;
 		Targets targets;
+		std::vector<duckdb::tds::ColumnMetadata> columns;
 		duckdb::idx_t row_in_chunk = 0;
 
 		for (int i = 0; i < 100000; ++i) {
@@ -108,8 +110,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 				// what the stream does too.
 				stager.Invalidate();
 				row_in_chunk = 0;
-				if (BuildTargets(parser.GetColumnMetadata(), targets)) {
-					stager.Configure(parser.GetColumnMetadata(), targets.pointers);
+				// As the stream does on a catalog that transcodes (spec 092), so the
+				// code-page kernel meets these bytes too.
+				columns = parser.GetColumnMetadata();
+				duckdb::mssql::codec::code_page::ResolveWireCodePages(columns);
+				if (BuildTargets(columns, targets)) {
+					stager.Configure(columns, targets.pointers);
 					stager.BeginChunk(targets.pointers);
 				}
 				continue;

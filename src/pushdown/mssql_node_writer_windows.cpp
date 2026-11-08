@@ -155,8 +155,8 @@ bool NodeWriter::WriteWindow(const WindowExpression &window, Operand &out) {
 			}
 		}
 		// The value, and LAG / LEAD's default typed from it as a CASE branch
-		// would be (one type, a string a column of one collation, no
-		// code-page varchar: it is read as it comes).
+		// would be (one type, a string a column of one collation, a code-page
+		// varchar only where the client transcodes it: it is read as it comes).
 		std::vector<Operand> operands(1);
 		if (!WriteValue(args[0].GetExpression(), operands[0])) {
 			return false;

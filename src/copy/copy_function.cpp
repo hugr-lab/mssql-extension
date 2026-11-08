@@ -274,7 +274,13 @@ unique_ptr<FunctionData> BCPCopyBind(ClientContext &context, CopyFunctionBindInp
 	// states its own type — from a cast or carried from an attached source by the
 	// catalog — is left alone. The collation is filled in later by
 	// ValidateTarget, which is where a connection exists to ask the server.
+	//
+	// On Fabric the column has to be what a warehouse can hold (spec 092). An existing
+	// table's own columns are read from the server instead, so a COPY into one is unaffected.
+	auto &copy_target_catalog =
+		Catalog::GetCatalog(context, Identifier(bind_data->target.catalog_name)).Cast<MSSQLCatalog>();
 	for (auto &type : bind_data->source_types) {
+		type = copy_target_catalog.CreatedColumnType(type);
 		type = mssql::codec::ApplyDefaultStringType(type, !bind_data->config.text_type_varchar,
 													bind_data->config.default_string_length, string());
 	}

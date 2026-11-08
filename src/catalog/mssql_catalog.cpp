@@ -1165,6 +1165,10 @@ string MSSQLCatalog::WireVarcharCollation(const string &ddl_collation) const {
 	return string();
 }
 
+LogicalType MSSQLCatalog::CreatedColumnType(const LogicalType &type) const {
+	return RequiresSingleByteText() ? mssql::codec::FabricStringType(type) : type;
+}
+
 void MSSQLCatalog::ValidateStringTargets(const vector<LogicalType> &types) {
 	if (!RequiresSingleByteText()) {
 		return;
@@ -1174,8 +1178,8 @@ void MSSQLCatalog::ValidateStringTargets(const vector<LogicalType> &types) {
 	// is fixed when the warehouse is created. Anything else is rejected by the
 	// server with "...is not a valid collation", which is a worse place to find
 	// out than here.
-	static const char *const FABRIC_COLLATIONS[] = {"LATIN1_GENERAL_100_BIN2_UTF8",
-													"LATIN1_GENERAL_100_CI_AS_KS_WS_SC_UTF8"};
+	static const char *const FABRIC_COLLATIONS[] = {mssql::codec::FABRIC_BIN2_COLLATION,
+													mssql::codec::FABRIC_CI_COLLATION};
 
 	for (const auto &type : types) {
 		mssql::codec::TargetStringType spec;

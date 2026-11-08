@@ -10,12 +10,14 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 
 #include "catalog/mssql_ddl_translator.hpp"
 #include "codec/target_string_type.hpp"
 #include "copy/target_resolver.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/ctas/mssql_ctas_types.hpp"
+#include "duckdb/common/extension_type_info.hpp"
 #include "duckdb/common/types.hpp"
 #include "tds/tds_types.hpp"
 
@@ -455,6 +457,97 @@ void test_ctas_ddl_special_names() {
 	std::cout << "PASSED!" << std::endl;
 }
 
+// Spec 092: the collation lives in the length's modifier, under a label that prints the
+// length alone, so it survives a type being respelled from its modifiers (DuckDB's
+// remote-pushdown rewriter does that when it folds a constant).
+static void TestCollationInTheModifier() {
+	using duckdb::LogicalType;
+	using duckdb::LogicalTypeId;
+	using duckdb::Value;
+	using duckdb::mssql::codec::MAX_LENGTH;
+	using duckdb::mssql::codec::TryGetTargetStringType;
+	const auto roundtrip = [](int32_t length, const std::string &collation, const std::string &printed,
+							  const std::string &spelled) {
+		const auto type = MakeTarget(false, length, collation);
+		duckdb::mssql::codec::TargetStringType got;
+		if (!TryGetTargetStringType(type, got) || got.length != length || got.collation != collation || got.unicode) {
+			throw std::runtime_error("read back wrongly: " + printed);
+		}
+		if (type.ToString() != printed) {
+			throw std::runtime_error("printed " + type.ToString() + ", not " + printed);
+		}
+		const auto &modifiers = type.GetExtensionInfo()->modifiers;
+		if (modifiers.size() != 1 || modifiers[0].value.ToString() != spelled) {
+			throw std::runtime_error("spelled wrongly: " + spelled);
+		}
+	};
+	roundtrip(50, "", "MSSQL_VARCHAR(50)", "50");
+	roundtrip(50, "Cyrillic_General_CI_AS", "MSSQL_VARCHAR(50)", "50,Cyrillic_General_CI_AS");
+	roundtrip(MAX_LENGTH, "", "MSSQL_VARCHAR(MAX)", "MAX");
+	roundtrip(MAX_LENGTH, "Cyrillic_General_CI_AS", "MSSQL_VARCHAR(MAX)", "MAX,Cyrillic_General_CI_AS");
+	if (MakeTarget(false, 50, "A_CI_AS") == MakeTarget(false, 50, "B_CI_AS")) {
+		throw std::runtime_error("two collations compare equal");
+	}
+	if (!(MakeTarget(false, 50, "A_CI_AS") == MakeTarget(false, 50, "A_CI_AS"))) {
+		throw std::runtime_error("one collation compares unequal");
+	}
+	if (MakeTarget(false, 50, "") == MakeTarget(false, 50, "A_CI_AS")) {
+		throw std::runtime_error("no collation compares equal to one");
+	}
+
+	// A DuckDB file v0.3.0 wrote holds the collation as a property, beside either length.
+	const auto v030 = [](Value length) {
+		auto info = duckdb::make_uniq<duckdb::ExtensionTypeInfo>();
+		info->modifiers.emplace_back(std::move(length));
+		info->properties["collation"] = Value("Cyrillic_General_CI_AS");
+		return LogicalType(LogicalTypeId::VARCHAR).WithAlias("MSSQL_VARCHAR").WithExtensionInfo(std::move(info));
+	};
+	duckdb::mssql::codec::TargetStringType got;
+	if (!TryGetTargetStringType(v030(Value::INTEGER(50)), got) || got.length != 50 ||
+		got.collation != "Cyrillic_General_CI_AS") {
+		throw std::runtime_error("a v0.3.0 type lost its collation");
+	}
+	if (!TryGetTargetStringType(v030(Value("MAX")), got) || got.length != MAX_LENGTH ||
+		got.collation != "Cyrillic_General_CI_AS") {
+		throw std::runtime_error("a v0.3.0 MAX type lost its collation");
+	}
+}
+
+// Spec 092: what a CTAS or a creating COPY makes on Fabric, which has no nvarchar and two
+// collations. Run here because the Fabric lane needs a warehouse.
+static void TestFabricStringType() {
+	using duckdb::mssql::codec::FabricStringType;
+	using duckdb::mssql::codec::MakeTargetStringType;
+	using duckdb::mssql::codec::TargetStringType;
+	using duckdb::mssql::codec::TryGetTargetStringType;
+	const auto expect = [](bool unicode, int32_t length, const std::string &collation, int32_t want_length,
+						   const std::string &want_collation) {
+		TargetStringType spec;
+		spec.unicode = unicode;
+		spec.length = length;
+		spec.collation = collation;
+		TargetStringType got;
+		const bool read = TryGetTargetStringType(FabricStringType(MakeTargetStringType(spec)), got);
+		if (!read || got.unicode || got.length != want_length || got.collation != want_collation) {
+			throw std::runtime_error("FabricStringType: unexpected type for " + collation);
+		}
+	};
+	expect(true, 50, "", 150, "");									  // nvarchar(50): no such type
+	expect(true, 4000, "", 0, "");									  // past 8000 bytes: MAX
+	expect(true, 0, "", 0, "");										  // nvarchar(max)
+	expect(false, 10, "Cyrillic_General_CI_AS", 30, "");			  // a code page: no such collation
+	expect(false, 0, "Cyrillic_General_CI_AS", 0, "");				  // varchar(max)
+	expect(false, 2700, "Japanese_CI_AS", 0, "");					  // 8100 bytes: MAX
+	expect(false, 10, "Cyrillic_General_100_CI_AS_SC_UTF8", 10, "");  // UTF-8 already: bytes stay
+	expect(false, 10, "Latin1_General_100_BIN2_UTF8", 10, "Latin1_General_100_BIN2_UTF8");
+	expect(false, 10, "latin1_general_100_ci_as_ks_ws_sc_utf8", 10, "latin1_general_100_ci_as_ks_ws_sc_utf8");
+	expect(false, 10, "", 10, "");	// no collation: the warehouse's already
+	const auto plain = FabricStringType(duckdb::LogicalType::VARCHAR);
+	if (plain != duckdb::LogicalType::VARCHAR || plain.HasAlias()) {
+		throw std::runtime_error("FabricStringType: a plain VARCHAR changed");
+	}
+}
+
 //==============================================================================
 // Main
 //==============================================================================
@@ -471,6 +564,8 @@ int main() {
 		test_ctas_strings_nvarchar();
 		test_ctas_strings_varchar();
 		test_ctas_annotated_strings();
+		TestCollationInTheModifier();
+		TestFabricStringType();
 		test_tds_max_length_for_annotated();
 		test_bcp_metadata_for_annotated_max();
 		test_ctas_binary();

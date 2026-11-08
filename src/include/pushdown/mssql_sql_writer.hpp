@@ -129,6 +129,9 @@ struct SQLWriterOptions {
 	//! The catalog's logins were granted UTF8SUPPORT: a UTF-8 char(n) is read
 	//! as itself, else as NCHAR(n) (issue #405; set by the catalog).
 	bool utf8_on_wire = false;
+	//! The catalog's mssql_client_transcode, fixed at ATTACH (spec 092 D4, D8; set by
+	//! the catalog: FromContext reads only the session's settings).
+	bool client_transcode = true;
 	//! mssql_scan_parameterize_filters: constants as @pN, or literals.
 	bool parameterize = true;
 	//! DuckDB's (deprecated) error_on_division_by_zero: false makes `x % 0`

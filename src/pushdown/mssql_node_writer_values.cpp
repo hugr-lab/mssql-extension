@@ -384,11 +384,14 @@ bool NodeWriter::Unify(std::vector<Operand> &operands, Operand &result, bool con
 			(!operand.column || !peer->column || operand.column->collation_name != peer->column->collation_name)) {
 			return Veto("string branches that are not columns of one collation");
 		}
-		// A value, not a comparison: it reaches DuckDB as bytes, and a varchar
-		// under a code-page collation arrives untranscoded (#224) -- the catalog
-		// scan reads it through its NVARCHAR cast (BuildReadExpression), a branch
-		// has none. Unicode and UTF-8 columns arrive as DuckDB's UTF-8.
-		if (operand.kind == ComparableKind::String && !operand.column->is_unicode && !operand.column->is_utf8) {
+		// A value, not a comparison: it reaches DuckDB as bytes. Unicode and UTF-8
+		// columns arrive as DuckDB's UTF-8, and a single-byte page the client
+		// transcodes by the value's own wire collation (spec 092 D8). Any other
+		// code-page varchar is read through an NVARCHAR cast (BuildReadExpression),
+		// which a branch does not have (#224).
+		if (operand.kind == ComparableKind::String && !operand.column->is_unicode && !operand.column->is_utf8 &&
+			!MSSQLColumnInfo::ClientTranscodedPage(operand.column->sql_type_name, operand.column->collation_name,
+												   options_.client_transcode)) {
 			return Veto("a code-page varchar in a computed value");
 		}
 		// Issue #405: a char(n) / nchar(n) reaches DuckDB without its padding

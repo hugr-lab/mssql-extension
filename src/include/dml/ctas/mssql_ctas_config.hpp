@@ -66,7 +66,7 @@ struct CTASConfig {
 	int32_t default_string_length = 0;
 
 	// Collation to NAME in the INSERT BULK column list for a single-byte column,
-	// or empty to keep it on the UTF-16 wire. Not the same as varchar_collation:
+	// or empty (or a code-page collation) to keep it on the UTF-16 wire. Not the same as varchar_collation:
 	// that one may be empty because the database's own collation is already
 	// right, and the wire inherits nothing.
 	string wire_varchar_collation;

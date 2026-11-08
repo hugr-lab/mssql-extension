@@ -48,8 +48,10 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/vector_size.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 
 namespace duckdb {
 namespace mssql {
@@ -191,6 +193,38 @@ const char *BoundaryStrategyName(BoundaryStrategy strategy);
 // ColumnStaging
 //===----------------------------------------------------------------------===//
 
+//! The staged payload starts on a cache line (spec 092 D12). The code-page kernels
+//! walk it from its start in blocks that are multiples of 64, so their wide loads
+//! are then aligned: an input 1 byte off a 64-byte boundary measured 5-23% slower
+//! on long ASCII values, on 7 CPUs. std::allocator gives only 16.
+template <class T>
+struct CacheLineAllocator {
+	using value_type = T;
+	static constexpr std::align_val_t ALIGNMENT{64};
+
+	CacheLineAllocator() = default;
+	template <class U>
+	CacheLineAllocator(const CacheLineAllocator<U> &) {	 // NOLINT: converting, as the allocator contract asks
+	}
+	T *allocate(std::size_t n) {
+		return static_cast<T *>(::operator new(n * sizeof(T), ALIGNMENT));
+	}
+	void deallocate(T *p, std::size_t) {
+		::operator delete(p, ALIGNMENT);
+	}
+	template <class U>
+	bool operator==(const CacheLineAllocator<U> &) const {
+		return true;
+	}
+	template <class U>
+	bool operator!=(const CacheLineAllocator<U> &) const {
+		return false;
+	}
+};
+
+//! `unsafe_vector`'s bounds checks off (see ColumnStaging::buffer), on a cache line.
+using PayloadBuffer = duckdb::vector<uint8_t, false, CacheLineAllocator<uint8_t>>;
+
 //! Per-column staging state for one chunk. Data + inlinable accessors only.
 struct ColumnStaging {
 	//===--------------------------------------------------------------------===//
@@ -218,7 +252,7 @@ struct ColumnStaging {
 	//! check — MemorySafety forces ENABLED on under DEBUG regardless of SAFE.
 	//!
 	//! Fixed: `count * stride` raw bytes. Var: the contiguous payload.
-	duckdb::unsafe_vector<uint8_t> buffer;
+	PayloadBuffer buffer;
 	//! Var only: byte offset and byte length of each value inside `buffer`.
 	//! Length is always in BYTES, never code units — a fixed contract, because
 	//! the two differ for UTF-16 and mixing them is a silent corruption.
@@ -600,7 +634,7 @@ public:
 			// again.
 			if (!col.payload_bounded && capacity > MIN_RETAINED_BYTES && capacity > peak * SHRINK_SLACK_FACTOR) {
 				const idx_t target = peak * 2 > MIN_RETAINED_BYTES ? peak * 2 : MIN_RETAINED_BYTES;
-				duckdb::unsafe_vector<uint8_t> shrunk(target);
+				PayloadBuffer shrunk(target);
 				col.buffer.swap(shrunk);
 				col.payload_used = 0;
 				shrink_events_++;

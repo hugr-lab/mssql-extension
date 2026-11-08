@@ -45,6 +45,8 @@ struct MSSQLInsertTarget {
 	// function takes the setting — so a varchar(max) column is cast, or not,
 	// identically on both paths.
 	bool convert_varchar_max = true;
+	// The catalog's mssql_client_transcode (spec 092), for the same function.
+	bool client_transcode = true;
 
 	// Identity column tracking
 	bool has_identity_column;	  // Table has an IDENTITY column

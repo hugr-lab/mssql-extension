@@ -9,6 +9,7 @@
 
 #include "codec/string_codec.hpp"
 
+#include "codec/code_page/code_page_codec.hpp"
 #include "codec/target_string_type.hpp"
 #include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
@@ -912,9 +913,14 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 		return;
 	}
 
-	// CHAR/VARCHAR are single-byte (collation-dependent in theory; in
-	// practice the test fixtures and the pre-spec-045 path treated the
-	// bytes as UTF-8 / CP1252 indistinguishably for ASCII).
+	// CHAR/VARCHAR: transcoded from the code page the stream resolved (spec 092
+	// D2). Without one the bytes are what a DuckDB VARCHAR holds as they are (a
+	// UTF-8 collation), or are handed over verbatim (client_transcode off; a
+	// collation newer than the tables), which the stream warns about.
+	if (col.code_page != nullptr) {
+		code_page::DecodeFromTds(bytes, col, out, row);
+		return;
+	}
 	size_t len = bytes.size();
 	if (trim_trailing_spaces) {
 		while (len > 0 && bytes[len - 1] == 0x20) {

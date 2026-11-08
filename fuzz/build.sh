@@ -216,8 +216,8 @@ if want row_stager; then
 		"${TDS}/encoding/type_converter.cpp"
 		"${REPO}/src/dml/insert/mssql_value_serializer.cpp"
 	)
-	# The family codecs supply the finalize kernels.
-	for f in "${REPO}"/src/codec/*.cpp; do
+	# The family codecs supply the finalize kernels, the code-page module one of them.
+	for f in "${REPO}"/src/codec/*.cpp "${REPO}"/src/codec/code_page/*.cpp; do
 		STAGER_SRCS+=("${f}")
 	done
 	STAGER_OBJS="$(compile_objs stager "${STAGER_SRCS[@]}")"
@@ -257,8 +257,9 @@ if want bcp_encode; then
 		"${REPO}/src/dml/insert/mssql_value_serializer.cpp"
 	)
 	# The family codecs: string_codec.cpp is the target, and the dispatchers
-	# beside it (literal_format, type_family) are what it links against.
-	for f in "${REPO}"/src/codec/*.cpp; do
+	# beside it (literal_format, type_family) are what it links against, and it
+	# calls the code-page module.
+	for f in "${REPO}"/src/codec/*.cpp "${REPO}"/src/codec/code_page/*.cpp; do
 		ENCODE_SRCS+=("${f}")
 	done
 	ENCODE_OBJS="$(compile_objs encode "${ENCODE_SRCS[@]}")"

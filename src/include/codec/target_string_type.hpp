@@ -70,11 +70,27 @@ inline bool IsMaxLength(int32_t length) {
 //! TryGetTargetStringType then refuses to read back.
 static constexpr const char *MAX_MODIFIER = "MAX";
 
+//! The two collations a Microsoft Fabric warehouse has, both UTF-8, upper-cased.
+static constexpr const char *FABRIC_BIN2_COLLATION = "LATIN1_GENERAL_100_BIN2_UTF8";
+static constexpr const char *FABRIC_CI_COLLATION = "LATIN1_GENERAL_100_CI_AS_KS_WS_SC_UTF8";
+
 //! Case-insensitive, because the length modifier is written by hand.
 bool IsMaxKeyword(const std::string &text);
 
+//! A string length modifier, "<length>" or "<length>,<collation>", into its parts. The
+//! second form is what MakeTargetStringType stores, and the binder reads it back when a
+//! type is respelled from its modifiers.
+void SplitLengthModifier(const std::string &text, std::string &length, std::string &collation);
+
 //! Build the annotated VARCHAR. Used by the type binder and by the catalog.
 LogicalType MakeTargetStringType(const TargetStringType &spec);
+
+//! What a CTAS or a creating COPY makes on Microsoft Fabric of a string column's type. A
+//! warehouse has no nvarchar and no collation but its two UTF-8 ones, so a type carried
+//! from a SQL Server source (or cast to) cannot be created as it is: nvarchar(n) or a
+//! code page's varchar(n) becomes varchar(3n), MAX past 8000 (n of either can be 3n bytes
+//! of UTF-8), and any other collation gives way to the warehouse's. Spec 092.
+LogicalType FabricStringType(const LogicalType &type);
 
 //! Read the annotation back. False for any type that does not carry one —
 //! including a plain VARCHAR, which is the overwhelmingly common case.

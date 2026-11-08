@@ -36,10 +36,13 @@
 
 #include "codec/staging/row_stager.hpp"
 
+#include "codec/code_page/code_page.hpp"
+#include "codec/code_page/code_page_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "tds/encoding/type_converter.hpp"
 #include "tds/tds_column_metadata.hpp"
 #include "tds/tds_types.hpp"
@@ -236,6 +239,7 @@ ColumnMetadata Meta(uint8_t type_id, uint16_t max_length, uint8_t precision = 0,
 	c.precision = precision;
 	c.scale = scale;
 	c.collation = 0;
+	c.collation_sort_id = 0;
 	c.flags = 0;
 	return c;
 }
@@ -410,6 +414,10 @@ public:
 
 	RowStager &stager() {
 		return stager_;
+	}
+
+	Vector &Target(size_t c) {
+		return chunk_.data[c];
 	}
 
 	//! The metadata the stager was configured with — so a test can build a SECOND,
@@ -1058,6 +1066,209 @@ void TestNcharTrim() {
 	CHECK_EQ(f.stager().Counters().replaced_units, static_cast<uint64_t>(1), "one code unit replaced");
 }
 
+//! A single-byte text column the stream resolved to `code_page`, and its wire type.
+ColumnMetadata CodePageMeta(uint8_t type_id, uint16_t max_length, int32_t code_page) {
+	ColumnMetadata col = Meta(type_id, max_length);
+	col.code_page = duckdb::mssql::codec::code_page::FindCodePage(code_page);
+	return col;
+}
+
+uint64_t KernelValues(Fixture &f, duckdb::mssql::codec::staging::FinalizeKernel kernel) {
+	return f.stager().Counters().kernel_values[static_cast<uint8_t>(kernel)];
+}
+
+void TestCodePageKernel() {
+	std::cout << "[11b] code-page kernel (spec 092)..." << std::endl;
+	using duckdb::mssql::codec::staging::FinalizeKernel;
+	using duckdb::tds::TDS_TYPE_BIGCHAR;
+	using duckdb::tds::TDS_TYPE_BIGVARCHAR;
+
+	// Every length on both sides of string_t's inline limit, read back through
+	// Value: if StringView16's fields disagreed with string_t's, these would not
+	// survive. 0xE6 is 1251's ж, two bytes of UTF-8, so 6 of them are 12 and 7 are 14.
+	{
+		Fixture f;
+		f.Add(CodePageMeta(TDS_TYPE_BIGVARCHAR, 100, 1251));
+		std::vector<Wire> values;
+		std::string expected_6, expected_7;
+		for (int n = 0; n < 7; n++) {
+			expected_7 += "\xD0\xB6";
+		}
+		expected_6 = expected_7.substr(0, 12);
+		values.push_back(Ascii(""));
+		values.push_back(Ascii("abcdefghijkl"));
+		values.push_back(Ascii("abcdefghijklm"));
+		values.push_back(Ascii(std::string(6, '\xE6')));
+		values.push_back(Ascii(std::string(7, '\xE6')));
+		values.push_back(Ascii(std::string(1, '\x00') + "a"));
+		f.Configure();
+		f.BeginChunk();
+		for (size_t i = 0; i < values.size(); i++) {
+			f.StageRow(P2(values[i]), static_cast<idx_t>(i));
+		}
+		f.StageRow(P2Null(), static_cast<idx_t>(values.size()));
+		f.StageRow(P2(Ascii("x")), static_cast<idx_t>(values.size() + 1));
+		f.FinalizeChunk(static_cast<idx_t>(values.size() + 2));
+		CHECK_EQ(f.ValueAt(0, 0), std::string(""), "empty");
+		CHECK_EQ(f.ValueAt(0, 1), std::string("abcdefghijkl"), "12 bytes: inlined");
+		CHECK_EQ(f.ValueAt(0, 2), std::string("abcdefghijklm"), "13 bytes: a pointer");
+		CHECK_EQ(f.ValueAt(0, 3), expected_6, "6 characters, 12 bytes of UTF-8: inlined");
+		CHECK_EQ(f.ValueAt(0, 4), expected_7, "7 characters, 14 bytes of UTF-8: a pointer");
+		CHECK_EQ(f.ValueAt(0, 5), std::string("\0a", 2), "an embedded 0x00 is no boundary");
+		CHECK_EQ(f.IsNull(0, 6), true, "a NULL between values");
+		CHECK_EQ(f.ValueAt(0, 7), std::string("x"), "the value after the NULL");
+		// Value reads the bytes, not a pointer-form value's prefix; this does.
+		const duckdb::string_t *const strings = duckdb::FlatVector::GetData<duckdb::string_t>(f.Target(0));
+		for (idx_t row = 0; row < 8; row++) {
+			if (row != 6) {
+				strings[row].ForceVerify();
+			}
+		}
+		CHECK_EQ(KernelValues(f, FinalizeKernel::CodePage), static_cast<uint64_t>(7), "the code-page kernel ran");
+		CHECK_EQ(KernelValues(f, FinalizeKernel::Binary), static_cast<uint64_t>(0), "the binary one did not");
+	}
+
+	// No code_page on the column: the bytes stay as they are, through the binary kernel.
+	{
+		Fixture f;
+		f.Add(Meta(TDS_TYPE_BIGVARCHAR, 100));
+		DecodeStrings(f, {Ascii("a"), Ascii("b")});
+		CHECK_EQ(KernelValues(f, FinalizeKernel::Binary), static_cast<uint64_t>(2), "no page: the binary kernel");
+		CHECK_EQ(KernelValues(f, FinalizeKernel::CodePage), static_cast<uint64_t>(0), "no page: not the code-page one");
+	}
+
+	// The catalog scan's check (spec 092 D1): a function of the name's page and the wire's.
+	{
+		using duckdb::mssql::codec::code_page::FindCodePage;
+		using duckdb::mssql::codec::code_page::NamedCodePageMismatch;
+		const auto mismatch = [](const ColumnMetadata &col, int32_t named) {
+			return NamedCodePageMismatch(col, *FindCodePage(named), "Named_CI_AS");
+		};
+		CHECK_EQ(mismatch(CodePageMeta(TDS_TYPE_BIGVARCHAR, 8, 1251), 1251), std::string(), "the two agree");
+		const std::string differ = mismatch(CodePageMeta(TDS_TYPE_BIGVARCHAR, 8, 1252), 1251);
+		CHECK_EQ(
+			differ.find("code page 1251") != std::string::npos && differ.find("Named_CI_AS") != std::string::npos &&
+				differ.find("names code page 1252") != std::string::npos && differ.find("\"c\"") != std::string::npos,
+			true, "a disagreement names the column, the collation and both answers");
+		CHECK_EQ(mismatch(Meta(TDS_TYPE_BIGVARCHAR, 8), 1251).find("no table") != std::string::npos, true,
+				 "a wire collation the tables do not know");
+		ColumnMetadata utf8 = Meta(TDS_TYPE_BIGVARCHAR, 8);
+		utf8.collation = 0x24D00409;
+		CHECK_EQ(mismatch(utf8, 1251), std::string(), "UTF-8 on the wire is valid whatever the catalog remembers");
+		CHECK_EQ(mismatch(Meta(duckdb::tds::TDS_TYPE_NVARCHAR, 8), 1251), std::string(), "UTF-16 likewise");
+	}
+
+	// A CHAR's padding comes off the output, inlined value or not, and only at the end.
+	{
+		Fixture f;
+		f.Add(CodePageMeta(TDS_TYPE_BIGCHAR, 16, 1251));
+		DecodeStrings(f, {Ascii(std::string(1, '\xE6') + std::string(15, ' ')), Ascii("a b" + std::string(13, ' ')),
+						  Ascii(std::string(16, ' ')), Ascii("abcdefghijklmn  "), Ascii(std::string(16, '\xE6'))});
+		std::string all;
+		for (int n = 0; n < 16; n++) {
+			all += "\xD0\xB6";
+		}
+		CHECK_EQ(f.ValueAt(0, 0), std::string("\xD0\xB6"), "padding trimmed, inlined");
+		CHECK_EQ(f.ValueAt(0, 1), std::string("a b"), "an inner space stays");
+		CHECK_EQ(f.ValueAt(0, 2), std::string(""), "all padding trims to empty");
+		CHECK_EQ(f.ValueAt(0, 3), std::string("abcdefghijklmn"), "a value past the inline length, trimmed");
+		CHECK_EQ(f.ValueAt(0, 4), all, "no padding at all");
+	}
+
+	// A double-byte page goes value by value: a lead byte at a value's end is
+	// dropped, not paired with the next value's first byte, and 932's 81 20 is one
+	// character whose 0x20 is not padding.
+	{
+		Fixture f;
+		f.Add(CodePageMeta(TDS_TYPE_BIGCHAR, 4, 932));
+		DecodeStrings(f, {Bare({0x82, 0xA0, 0x20, 0x20}), Bare({0x41, 0x20, 0x81, 0x20})});
+		CHECK_EQ(f.ValueAt(0, 0), std::string("\xE3\x81\x82"), "932's 82 A0 is U+3042, padding trimmed");
+		CHECK_EQ(f.ValueAt(0, 1), std::string("A \xE3\x83\xBB"), "932's 81 20 is U+30FB, nothing trimmed");
+	}
+	{
+		Fixture f;
+		f.Add(CodePageMeta(TDS_TYPE_BIGVARCHAR, 4, 932));
+		DecodeStrings(f, {Bare({0x41, 0x82}), Bare({0xA0, 0x42})});
+		CHECK_EQ(f.ValueAt(0, 0), std::string("A"), "a lone lead at a value's end reads as nothing");
+		// 932's A0 alone is U+F8F0: had the 0x82 paired across, this would be あ.
+		CHECK_EQ(f.ValueAt(0, 1),
+				 std::string("\xEF\xA3\xB0"
+							 "B"),
+				 "the next value starts afresh");
+	}
+
+	// All empty: nothing to allocate, and every view must read empty, NULL or not.
+	{
+		Fixture f;
+		f.Add(CodePageMeta(TDS_TYPE_BIGVARCHAR, 4, 1252));
+		f.Configure();
+		f.BeginChunk();
+		f.StageRow(P2(Ascii("")), 0);
+		f.StageRow(P2Null(), 1);
+		f.StageRow(P2(Ascii("")), 2);
+		f.FinalizeChunk(3);
+		CHECK_EQ(f.ValueAt(0, 0), std::string(""), "empty");
+		CHECK_EQ(f.IsNull(0, 1), true, "NULL");
+		CHECK_EQ(f.ValueAt(0, 2), std::string(""), "empty after a NULL");
+	}
+
+	// A chunk of one value: the constant column's path, through DecodeFromTds.
+	{
+		Fixture f;
+		f.Add(CodePageMeta(TDS_TYPE_BIGCHAR, 4, 1251));
+		const Wire value = Ascii(std::string(1, '\xE6') + "   ");
+		DecodeStrings(f, {value, value, value});
+		CHECK_EQ(f.IsConstant(0), true, "a repeated value is constant");
+		CHECK_EQ(f.ValueAt(0, 2), std::string("\xD0\xB6"), "decoded and trimmed");
+	}
+
+	// The per-value path, as the composite rowid and INSERT ... RETURNING reach it.
+	{
+		duckdb::Vector out(LogicalType::VARCHAR);
+		const ColumnMetadata col = CodePageMeta(TDS_TYPE_BIGCHAR, 4, 1251);
+		TypeConverter::ConvertValue(Bare({0xE6, 0x20, 0x20, 0x20}), false, col, out, 0);
+		CHECK_EQ(out.GetValue(0).ToString(), std::string("\xD0\xB6"), "per value: decoded and trimmed");
+	}
+
+	// The wire's collation decides on a raw scan: 1251's LCID, a SQL_ SortId
+	// alone (52 is SQL_Latin1_General_CP1_CI_AS), a UTF-8 collation and an LCID no
+	// table knows stay verbatim, and so does everything that is not single-byte text.
+	{
+		std::vector<ColumnMetadata> columns;
+		columns.push_back(Meta(TDS_TYPE_BIGVARCHAR, 8));
+		columns.back().collation = 0x00D00419;
+		columns.push_back(Meta(TDS_TYPE_BIGCHAR, 8));
+		columns.back().collation = 0x00D00409;
+		columns.back().collation_sort_id = 52;
+		columns.push_back(Meta(TDS_TYPE_BIGVARCHAR, 8));
+		columns.back().collation = 0x24D00409;
+		columns.push_back(Meta(TDS_TYPE_BIGVARCHAR, 8));
+		columns.back().collation = 0x000FFFFF;
+		columns.push_back(Meta(duckdb::tds::TDS_TYPE_BIGVARBINARY, 8));
+		columns.back().collation = 0x00D00419;
+		columns.push_back(Meta(duckdb::tds::TDS_TYPE_NVARCHAR, 8));
+		columns.back().collation = 0x00D00419;
+		duckdb::mssql::codec::code_page::ResolveWireCodePages(columns);
+		CHECK_EQ(columns[0].code_page != nullptr && columns[0].code_page->code_page == 1251, true, "by the LCID");
+		CHECK_EQ(columns[1].code_page != nullptr && columns[1].code_page->code_page == 1252, true, "by the SortId");
+		CHECK_EQ(columns[2].code_page == nullptr, true, "UTF-8 is read as it is");
+		CHECK_EQ(columns[3].code_page == nullptr, true, "a collation newer than the tables");
+		// ... which a bare read cannot take: an error naming the column and the wire's collation.
+		using duckdb::mssql::codec::code_page::UndecodableBareRead;
+		const std::string undecodable = UndecodableBareRead(columns[3], "Cyrillic_General_CI_AS");
+		CHECK_EQ(undecodable.find("\"c\"") != std::string::npos &&
+					 undecodable.find("Cyrillic_General_CI_AS") != std::string::npos &&
+					 undecodable.find("0xFFFFF") != std::string::npos &&
+					 undecodable.find("mssql_invalidate_cache") != std::string::npos,
+				 true, "an undecodable bare read names the column, both collations and the fix");
+		CHECK_EQ(UndecodableBareRead(columns[0], "x") + UndecodableBareRead(columns[2], "x") +
+					 UndecodableBareRead(columns[4], "x") + UndecodableBareRead(columns[5], "x"),
+				 std::string(), "a known page, UTF-8, binary and UTF-16 all decode");
+		CHECK_EQ(columns[4].code_page == nullptr, true, "not text");
+		CHECK_EQ(columns[5].code_page == nullptr, true, "UTF-16 on the wire");
+	}
+}
+
 void TestDivergingColumnRendersAsText() {
 	std::cout << "[12] issue #89: a column whose output type disagrees with the wire..." << std::endl;
 
@@ -1350,6 +1561,7 @@ int main() {
 	TestStringBoundaryStrategies();
 	TestStringEmbeddedNuls();
 	TestNcharTrim();
+	TestCodePageKernel();
 	TestDivergingColumnRendersAsText();
 	TestDatetimeDayRange();
 	TestImpossibleDeclaredWidth();
