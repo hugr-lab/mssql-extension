@@ -602,12 +602,30 @@ SELECT count(*) FROM (SELECT * FROM u8_off EXCEPT ALL SELECT * FROM u8_nu);
 statement ok
 DETACH rp_nu;
 
-# A code-page varchar in a computed value would arrive as its code-page bytes
-# (#224): left to the scan, which reads it through its NVARCHAR cast.
+# A code-page varchar in a computed value arrives as bytes, and the client transcodes
+# it by the value's wire collation (spec 092 D8).
 query II
 EXPLAIN SELECT id, coalesce(legacy, 'x') FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
 ----
+physical_plan	<REGEX>:.*COALESCE\(\[legacy\].*
+
+# Under client_transcode false it would be those bytes as they are (#224): left to the
+# scan, which reads it through its NVARCHAR cast.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS rp_cast (TYPE mssql, client_transcode false);
+
+query II
+EXPLAIN SELECT id, coalesce(legacy, 'x') FROM rp_cast.dbo.rp_t ORDER BY id LIMIT 1;
+----
 physical_plan	<REGEX>:.*MSSQL_CATALOG_SCAN.*
+
+query IT
+SELECT id, coalesce(legacy, 'x') FROM rp_cast.dbo.rp_t ORDER BY id LIMIT 1;
+----
+1	café
+
+statement ok
+DETACH rp_cast;
 
 query IT
 SELECT id, coalesce(legacy, 'x') FROM rp_on.dbo.rp_t ORDER BY id LIMIT 1;
@@ -829,7 +847,7 @@ CREATE TEMP TABLE via_off AS SELECT * FROM rp_off.dbo.rp_t ORDER BY id LIMIT 100
 query II
 EXPLAIN SELECT * FROM rp_on.dbo.rp_t ORDER BY id LIMIT 100;
 ----
-physical_plan	<REGEX>:.*CAST\(\[legacy\] AS NVARCHAR\(20\)\) AS \[legacy\].*\[g\]\.STAsBinary\(\) AS \[g\].*
+physical_plan	<REGEX>:.*\[legacy\], \[amount\].*\[g\]\.STAsBinary\(\) AS \[g\].*
 
 query I
 SELECT count(*) FROM (SELECT * FROM via_on EXCEPT ALL SELECT * FROM via_off);

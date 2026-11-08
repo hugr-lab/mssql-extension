@@ -105,6 +105,8 @@ struct MSSQLStagedDmlTarget {
 	vector<LogicalType> returning_types;
 	//! mssql_convert_varchar_max, for reading #out as the scan reads the table.
 	bool convert_varchar_max = true;
+	//! The catalog's mssql_client_transcode (spec 092), likewise.
+	bool client_transcode = true;
 };
 
 class MSSQLStagedDml {

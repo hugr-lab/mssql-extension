@@ -50,8 +50,11 @@ public:
 	// query_timeout_seconds: query execution timeout (0 = no timeout, default: 30)
 	// reset_on_release: `mssql_reset_connection`, resolved on the client thread
 	//                   for the same reason transaction_pinned is (issue #178).
+	// client_transcode: the catalog's answer (spec 092 D4), fixed at ATTACH. No
+	//                   default: a caller must not keep verbatim bytes by forgetting
+	//                   it, nor transcode a catalog that turned it off.
 	MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const tds::Request &request,
-					  const string &context_name,
+					  const string &context_name, bool client_transcode,
 					  weak_ptr<tds::ConnectionPool> pool_handle = weak_ptr<tds::ConnectionPool>(),
 					  bool transaction_pinned = false, int query_timeout_seconds = 30,
 					  bool reset_on_release = tds::DEFAULT_RESET_CONNECTION);
@@ -202,6 +205,8 @@ private:
 	//! `mssql_scan` and table scan — the one that decides whether a `##temp`
 	//! table created by one statement is still there for the next.
 	bool reset_on_release_;
+	// The catalog's mssql_client_transcode, fixed at ATTACH (spec 092 D4).
+	bool client_transcode_;
 
 	// Query
 	string sql_;

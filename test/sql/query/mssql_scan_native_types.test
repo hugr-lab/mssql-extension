@@ -16,10 +16,11 @@
 # pushdown vehicle (spec 079) is mssql_scan_params, so a pushed CTAS depends on
 # this.
 #
-# A char / varchar column is annotated only under a UTF-8 collation (review of
-# #387): a raw scan hands a code-page varchar's bytes over untranscoded (issue
-# #224), so an annotation naming the code page would describe values that are
-# not in it. Such a column stays plain VARCHAR.
+# A char / varchar column is annotated when its values arrive as UTF-8: a UTF-8
+# collation (review of #387), or a code page the catalog transcodes (spec 092 D7).
+# Under client_transcode false a raw scan hands a code-page varchar's bytes over
+# untranscoded (issue #224), so an annotation naming the code page would describe values
+# that are not in it, and such a column stays plain VARCHAR (the last section here).
 
 require mssql
 
@@ -44,7 +45,7 @@ query II
 SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'SELECT v, c, n, m, i FROM dbo.snt_src'));
 ----
 v	MSSQL_VARCHAR(20)
-c	VARCHAR
+c	MSSQL_VARCHAR(4)
 n	MSSQL_NVARCHAR(30)
 m	VARCHAR
 i	INTEGER
@@ -55,7 +56,7 @@ query II
 SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'SELECT v, c, n, m, i FROM dbo.snt_src', prepared := true));
 ----
 v	MSSQL_VARCHAR(20)
-c	VARCHAR
+c	MSSQL_VARCHAR(4)
 n	MSSQL_NVARCHAR(30)
 m	VARCHAR
 i	INTEGER
@@ -118,7 +119,7 @@ query II
 SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt16', 'SELECT v, c FROM dbo.snt_src'));
 ----
 v	MSSQL_VARCHAR(20)
-c	VARCHAR
+c	MSSQL_VARCHAR(4)
 
 query TT
 SELECT v, trim(c) FROM mssql_scan('snt16', 'SELECT v, c FROM dbo.snt_src');
@@ -126,11 +127,11 @@ SELECT v, trim(c) FROM mssql_scan('snt16', 'SELECT v, c FROM dbo.snt_src');
 abc	xy
 
 # prepared: the UTF-8 column is found by its collation bit although it arrives
-# as nvarchar, and a code-page column beside it keeps its own type.
+# as nvarchar, and a code-page column beside it has its annotation too.
 query II
 SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt16', 'SELECT c, v FROM dbo.snt_src', prepared := true));
 ----
-c	VARCHAR
+c	MSSQL_VARCHAR(4)
 v	MSSQL_VARCHAR(20)
 
 query TT
@@ -211,6 +212,46 @@ RESET mssql_catalog_native_types;
 
 statement ok
 SELECT mssql_exec('snt', 'DROP TABLE dbo.snt_src, dbo.snt_dst, dbo.snt_ci, dbo.snt_dst_p');
+
+# client_transcode false: the bytes arrive as they are, so a code-page column stays
+# plain VARCHAR, described and prepared.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS snt_off (TYPE mssql, client_transcode false);
+
+statement ok
+SELECT mssql_exec('snt_off', 'IF OBJECT_ID(''dbo.snt_cp'') IS NOT NULL DROP TABLE dbo.snt_cp;
+	CREATE TABLE dbo.snt_cp (c char(4) COLLATE SQL_Latin1_General_CP1_CI_AS, j varchar(8) COLLATE Japanese_CI_AS)');
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt_off', 'SELECT c, j FROM dbo.snt_cp'));
+----
+c	VARCHAR
+j	VARCHAR
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt_off', 'SELECT c, j FROM dbo.snt_cp', prepared := true));
+----
+c	VARCHAR
+j	VARCHAR
+
+# Transcoding on: every page a raw scan transcodes, double-byte included.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'SELECT c, j FROM dbo.snt_cp'));
+----
+c	MSSQL_VARCHAR(4)
+j	MSSQL_VARCHAR(8)
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('snt', 'SELECT c, j FROM dbo.snt_cp', prepared := true));
+----
+c	MSSQL_VARCHAR(4)
+j	MSSQL_VARCHAR(8)
+
+statement ok
+SELECT mssql_exec('snt', 'DROP TABLE dbo.snt_cp');
+
+statement ok
+DETACH snt_off;
 
 statement ok
 DETACH snt;

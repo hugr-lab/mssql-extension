@@ -606,25 +606,24 @@ for uses the row count loaded with the entry instead of a DMV query per table
 
 ## Layer 5 — Codec (spec 045)
 
-**Single-byte text is published verbatim, and is not guaranteed UTF-8 (issue #224).**
+**Single-byte text is transcoded on the client (spec 092), or else published verbatim (issue #224).**
 
 DuckDB `VARCHAR` is UTF-8 by contract. SQL Server's `CHAR` / `VARCHAR` / `TEXT`
 carry bytes in the column's own code page, and with `UTF8SUPPORT` negotiated a
 UTF-8-collated column and a CP1252 one arrive as the **same TDS type** — only
-the collation tells them apart. The extension copies those bytes through
-unchanged rather than validating them, which is a deliberate decision and not an
-oversight: validating costs the scan's hot path in order to make a hand-written
-`mssql_scan()` query fail loudly, and it would bill hardest exactly the
-configuration spec 069 / issue #225 optimised for. The caller writes the T-SQL
-and can write `CAST(col AS NVARCHAR(MAX))`.
+the collation tells them apart. `ColumnMetadata::code_page` says which: the stream
+sets it once per column, after COLMETADATA and only when its catalog transcodes
+(`mssql_client_transcode`, fixed at ATTACH), from the wire's collation
+(`code_page::ResolveWireCodePages`). The TDS parser leaves it null, so that layer
+does not link the codec module.
 
-Instead it is said **once per stream**, over COLMETADATA, in
-`MSSQLResultStream::SurfaceWarnings` — a handful of columns, never a per-row
-cost. It reaches `duckdb_logs` at `WARNING`.
-
-`mssql_warn_non_utf8_collation` turns it off, because the trigger is the
-majority configuration: `SQL_Latin1_General_CP1_CI_AS` is the installation
-default.
+With no page the bytes are copied through unchanged rather than validated:
+`client_transcode` off, or a collation newer than the tables. Validating would cost
+the scan's hot path to make a hand-written `mssql_scan()` fail loudly, and the caller
+writes the T-SQL and can write `CAST(col AS NVARCHAR(MAX))`. It is said **once per
+stream**, over COLMETADATA, in `MSSQLResultStream::SurfaceWarnings` — a handful of
+columns, never a per-row cost. It reaches `duckdb_logs` at `WARNING`, and
+`mssql_warn_non_utf8_collation` turns it off.
 
 Server INFO tokens — `PRINT`, `RAISERROR` at severity 10 or below, "Changed
 database context" — go through `LogTdsInfo` at **`INFO`**, deliberately not
@@ -646,34 +645,52 @@ a query that stops early never reaches the drain, so warning only there says
 nothing for any `LIMIT`, which is the shape a code-page column is most likely to
 be met by first.
 
-Three decoders publish these bytes:
+Four decoders publish these bytes:
 
 | path | decoder | when |
 |---|---|---|
-| staged batch | `binary::DecodeChunkFromStaging` | the ordinary scan |
-| constant | `binary::DecodeFromTds` via `TryEmitConstant` → `DecodeFirstValue` | a chunk whose values are uniform and non-NULL |
-| per value | `string::DecodeFromTds` | `TypeConverter::ConvertValue`, INSERT…RETURNING |
+| staged, with a page | `code_page::DecodeChunkFromStaging` (`FinalizeKernel::CodePage`) | the ordinary scan: one `DecodeColumn` call per column of a chunk, the UTF-8 and every `string_t` |
+| staged, without | `binary::DecodeChunkFromStaging` | one allocation and one copy, like `VARBINARY` |
+| constant | `DecodeFirstValue`, through `code_page::DecodeFromTds` or `binary::DecodeFromTds` | a chunk whose values are uniform (`TryEmitConstant`) |
+| per value | `string::DecodeFromTds`, which has a code-page arm | `TypeConverter::ConvertValue`: a composite rowid's STRUCT, INSERT…RETURNING |
 
-Single-byte text reaches the **binary** kernel because its bytes are copied
-verbatim, exactly like `VARBINARY` (`P2StageBinary` / `PlpStageBinary` /
-`LobStageBinary` → `FinalizeKernel::Binary`); only the destination vector
-differs. `IMAGE` shares the staging arm but lands in a `BLOB`, where arbitrary
-bytes are the point.
+They share the staging arms (`P2StageBinary` / `PlpStageBinary` / `LobStageBinary`), with
+`IMAGE` and `VARBINARY`, whose bytes land in a `BLOB`. The staged payload starts on a cache
+line (`PayloadBuffer`), because `DecodeColumn` walks it from its start in blocks that are
+multiples of 64.
 
-The catalog path is normally exempt because `BuildColumnExpression` casts
-non-Unicode string columns to `NVARCHAR` server-side — **except** a declared
-`VARCHAR(MAX)` when `mssql_convert_varchar_max` is off, which
-`NeedsNVarcharConversion` deliberately opts out of. That configuration reaches
-the decoder through the catalog, and the warning fires there too.
+**A chunk's string heap comes from `BufferAllocator`, so `memory_limit` accounts the output's
+whole reservation, touched or not.** The kernels' one pass sizes it at 3 bytes per character,
+so a code-page column counts twice against `STAGING_CHUNK_PAYLOAD_BUDGET_BYTES`
+(`RowStager::Configure`): a chunk holds the characters a UTF-16 one does, and reserves the same
+heap. The staging and TDS buffers are not accounted (issue #536).
 
-A `CHAR(n)` is the exception to that `NVARCHAR` cast (issue #405): the decoder
-trims trailing spaces only off a fixed-length wire type (`BIGCHAR`, `NCHAR`),
-and SQL Server compares strings ignoring them, so a padded value would make a
-join or `GROUP BY` in DuckDB disagree with the server. `BuildReadExpression`
-reads a code-page `CHAR(n)` -- and a UTF-8 one unless the catalog's logins were
-granted UTF8SUPPORT (`MSSQLCatalog::UTF8SupportObserved`, which never borrows a
-connection: unknown reads as not granted) -- as `CAST(col AS NCHAR(n))`, and past
-4000 as `RTRIM(CAST(col AS NVARCHAR(MAX)))`.
+**What the catalog sends** is decided by one predicate, `MSSQLColumnInfo::ClientTranscodedPage`
+(type, collation name, the catalog's flag), used by `BuildReadExpression`,
+`BuildReturningExpression` and the 079 writer alike:
+
+| column | read as |
+|---|---|
+| `char` / `varchar` / `varchar(max)`, single-byte page | itself |
+| the same, double-byte page (spec 092 D10: wire bytes nearly equal, a costlier client decode) | `CAST(… AS NVARCHAR(n))`, `NCHAR(n)` |
+| `text` (the per-value paths have no arm for its wire token) | `CAST(… AS NVARCHAR(MAX))` |
+| any of them under `client_transcode false` | as today: the same casts |
+
+A raw scan has no cast to keep, so it transcodes every page, double-byte included.
+
+A catalog scan compares each bare column's page by name with the wire's, and logs a `WARNING`
+when they differ (`NamedCodePageMismatch`): the column reads correctly by the wire's page, but the
+catalog is stale. `tools/code_pages/check_wire_keys.py` verifies the keys themselves against a
+server (3,445 collations on 2025, 0 differ).
+
+A `CHAR(n)` is why the trim lives in the decoders (issue #405): the decoder trims trailing
+spaces only off a fixed-length wire type (`BIGCHAR`, `NCHAR`), and SQL Server compares strings
+ignoring them, so a padded value would make a join or `GROUP BY` in DuckDB disagree with the
+server. A bare one is `BIGCHAR`, trimmed off the output (an input 0x20 can be a trail byte). One
+the client does not transcode, and a UTF-8 one unless the catalog's logins were granted
+UTF8SUPPORT (`MSSQLCatalog::UTF8SupportObserved`, which never borrows a connection: unknown reads
+as not granted), is read as `CAST(col AS NCHAR(n))`, and past 4000 as
+`RTRIM(CAST(col AS NVARCHAR(MAX)))`.
 
 ### Reading a column's collation
 
@@ -692,8 +709,8 @@ version, and `collation_sort_id` holds the SortId byte.
   differ only as SortId 52 vs 106.
 - The installation default is `SQL_Latin1_General_CP1_CI_AS`, so a legacy code
   page is the majority case rather than an edge case.
-- **The code page itself comes from the server**, not from the wire bytes or
-  the collation name: the column metadata queries carry
+- **For a filter parameter the code page comes from the server**, not from the wire bytes or
+  the collation name (the read path takes it from the wire, above): the column metadata queries carry
   `COLLATIONPROPERTY(c.collation_name, 'CodePage')` and the ATTACH-time
   database-collation query carries the same for the database
   (`MSSQLColumnInfo::code_page` / `database_code_page`, issue #361). The
@@ -757,9 +774,7 @@ classDiagram
 
 `src/codec/code_page/` reads code-page bytes the way the server does, for every
 consumer that meets them (the read path, a raw `mssql_scan`, the backup reader).
-Nothing reads it yet: the read path still casts code-page columns to NVARCHAR
-on the server (spec 092 switches it). Encoding into a code page (the write
-path) is spec 091's follow-up.
+Encoding into a code page (the write path) is spec 091's follow-up.
 
 - **The tables are the server's answers.** `tools/code_pages/generate.py` asks a
   SQL Server for every byte of the 16 code pages it stores varchar in (437, 850,

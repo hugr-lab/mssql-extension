@@ -68,7 +68,7 @@ SELECT * FROM d_on2;
 query II
 EXPLAIN SELECT s.id, s.legacy FROM (SELECT id, legacy FROM rd_on.dbo.rd_t ORDER BY id LIMIT 2) s ORDER BY s.id;
 ----
-physical_plan	<REGEX>:.*SELECT \[r1\]\.\[id\] AS \[id\], \[r1\]\.\[legacy\] AS \[legacy\] FROM \(SELECT TOP \(2\) \[id\], CAST\(\[legacy\] AS NVARCHAR\(20\)\) AS \[legacy\].*
+physical_plan	<REGEX>:.*SELECT \[r1\]\.\[id\] AS \[id\], \[r1\]\.\[legacy\] AS \[legacy\] FROM \(SELECT TOP \(2\) \[id\], \[legacy\] FROM.*
 
 query IT
 SELECT s.total, typeof(s.total) FROM (SELECT g, sum(n) AS total FROM rd_on.dbo.rd_t GROUP BY g) s WHERE s.total > 25 ORDER BY 1 LIMIT 5;

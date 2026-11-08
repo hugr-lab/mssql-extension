@@ -449,8 +449,10 @@ alternative.
 A warehouse accepts only `Latin1_General_100_BIN2_UTF8` (the default) and
 `Latin1_General_100_CI_AS_KS_WS_SC_UTF8`, and the choice is fixed when the
 warehouse is created. The extension emits no `COLLATE` clause for a permanent
-table — inheriting the warehouse's own is right — and refuses any other
-collation named in `MSSQL_VARCHAR(n, 'collation')` before the DDL is built.
+table — inheriting the warehouse's own is right. `CREATE TABLE` naming any other
+collation in `MSSQL_VARCHAR(n, 'collation')` is refused before the DDL is built. A CTAS or a
+creating `COPY` takes what the warehouse can hold: an `nvarchar(n)` or a code page's
+`varchar(n)` from a SQL Server source becomes `varchar(3n)` in its collation.
 
 Because every string column on a warehouse is a UTF-8 `varchar`, BCP sends UTF-8
 bytes there rather than transcoding to UTF-16, which halves the wire for

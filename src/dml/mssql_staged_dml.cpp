@@ -79,7 +79,8 @@ static string OutName(idx_t i) {
 static string ReturningExpression(const MSSQLStagedDmlTarget &target, idx_t i, const string &qualifier) {
 	const auto &col = target.table_columns[i];
 	return MSSQLColumnInfo::BuildReturningExpression(col.name, col.sql_type_name, col.max_length, col.collation_name,
-													 target.convert_varchar_max, qualifier, OutName(i));
+													 target.convert_varchar_max, target.client_transcode, qualifier,
+													 OutName(i));
 }
 
 string MSSQLStagedDml::CreateOutSql(const MSSQLStagedDmlTarget &target, const string &out_name) {
@@ -433,8 +434,8 @@ void MSSQLStagedDml::ReadReturned(ClientContext &context) {
 	try {
 		// The statement's own connection, held by it: "pinned" to the stream so
 		// the stream never releases it.
-		MSSQLResultStream stream(stage_.GetConnectionPtr(), sql, target_.catalog_name, weak_ptr<tds::ConnectionPool>(),
-								 true, target_.query_timeout_seconds);
+		MSSQLResultStream stream(stage_.GetConnectionPtr(), sql, target_.catalog_name, target_.client_transcode,
+								 weak_ptr<tds::ConnectionPool>(), true, target_.query_timeout_seconds);
 		if (!stream.Initialize()) {
 			throw IOException("reading the RETURNING rows failed");
 		}

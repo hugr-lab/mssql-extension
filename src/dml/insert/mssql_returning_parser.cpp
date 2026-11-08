@@ -1,11 +1,13 @@
 #include "dml/insert/mssql_returning_parser.hpp"
+#include "codec/code_page/code_page_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "tds/encoding/type_converter.hpp"
 
 namespace duckdb {
 
-MSSQLReturningParser::MSSQLReturningParser(const MSSQLInsertTarget &target, const vector<idx_t> &returning_column_ids)
-	: target_(target), returning_column_ids_(returning_column_ids) {
+MSSQLReturningParser::MSSQLReturningParser(const MSSQLInsertTarget &target, const vector<idx_t> &returning_column_ids,
+										   bool client_transcode)
+	: target_(target), returning_column_ids_(returning_column_ids), client_transcode_(client_transcode) {
 	// Build result types from returning column indices
 	for (auto col_idx : returning_column_ids_) {
 		if (col_idx < target_.columns.size()) {
@@ -18,6 +20,9 @@ void MSSQLReturningParser::Attach(mssql::DmlBatchOptions &options) {
 	options.on_metadata = [this](const std::vector<tds::ColumnMetadata> &columns) {
 		// A new result set: whatever came before it is not the RETURNING list.
 		columns_ = columns;
+		if (client_transcode_) {
+			mssql::codec::code_page::ResolveWireCodePages(columns_);
+		}
 		rows_.clear();
 	};
 	options.on_row = [this](const tds::RowData &row, const std::vector<tds::ColumnMetadata> &) {
@@ -28,6 +33,14 @@ void MSSQLReturningParser::Attach(mssql::DmlBatchOptions &options) {
 unique_ptr<DataChunk> MSSQLReturningParser::TakeResult() {
 	if (rows_.empty()) {
 		return nullptr;
+	}
+	// A RETURNING column is read bare under the same rule as a scan's (BuildReturningExpression).
+	for (const auto &col : columns_) {
+		const auto undecodable =
+			client_transcode_ ? mssql::codec::code_page::UndecodableBareRead(col, std::string()) : std::string();
+		if (!undecodable.empty()) {
+			throw InvalidInputException(undecodable);
+		}
 	}
 	if (columns_.size() != result_types_.size()) {
 		throw IOException(

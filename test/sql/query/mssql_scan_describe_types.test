@@ -41,8 +41,8 @@ c_decimal	DECIMAL(10,2)
 c_numeric	DECIMAL(5,0)
 c_money	DECIMAL(19,4)
 c_smallmoney	DECIMAL(10,4)
-c_char	VARCHAR
-c_varchar	VARCHAR
+c_char	MSSQL_VARCHAR(2)
+c_varchar	MSSQL_VARCHAR(10)
 c_varchar_max	VARCHAR
 c_nchar	MSSQL_NVARCHAR(2)
 c_nvarchar	MSSQL_NVARCHAR(10)

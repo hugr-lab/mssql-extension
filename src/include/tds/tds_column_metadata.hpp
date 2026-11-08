@@ -6,6 +6,16 @@
 #include "tds_types.hpp"
 
 namespace duckdb {
+namespace mssql {
+namespace codec {
+namespace code_page {
+namespace tables {
+struct CodePageTable;
+}  // namespace tables
+}  // namespace code_page
+}  // namespace codec
+}  // namespace mssql
+
 namespace tds {
 
 //===----------------------------------------------------------------------===//
@@ -25,6 +35,11 @@ struct ColumnMetadata {
 	// a collation cannot say which one it met (issue #224, from @oluies' #305).
 	uint8_t collation_sort_id;
 	uint16_t flags;	 // Column flags (nullable, identity, etc.)
+	// The code page this column's bytes are transcoded from (spec 092 D2), or
+	// nullptr: read them verbatim. Set once per column by the stream, after
+	// COLMETADATA and only when its catalog transcodes, so no decoder looks a page
+	// up. The parser leaves it null: the TDS layer does not link the codec module.
+	const mssql::codec::code_page::tables::CodePageTable *code_page = nullptr;
 
 	// Derived properties
 	bool IsNullable() const {
@@ -63,9 +78,9 @@ struct ColumnMetadata {
 	}
 
 	//! True for the single-byte text types: CHAR, VARCHAR and the deprecated
-	//! TEXT. Their bytes are copied to the client verbatim and land in a DuckDB
+	//! TEXT. Their bytes arrive in the column's code page and land in a DuckDB
 	//! VARCHAR, which is UTF-8 by contract -- so these are the columns whose
-	//! collation decides whether that contract holds. NCHAR / NVARCHAR / NTEXT
+	//! collation decides what has to happen to them. NCHAR / NVARCHAR / NTEXT
 	//! are UTF-16 on the wire and always transcoded; BINARY / VARBINARY / IMAGE
 	//! are copied verbatim too but land in a BLOB, where arbitrary bytes are
 	//! the point.

@@ -159,7 +159,7 @@ struct BCPCopyConfig {
 	string varchar_collation;
 
 	// Collation to NAME in the INSERT BULK column list for a single-byte column,
-	// or empty to keep it on the UTF-16 wire. See CTASConfig for why this is not
+	// or empty (or a code-page collation) to keep it on the UTF-16 wire. See CTASConfig for why this is not
 	// the same question as varchar_collation.
 	string wire_varchar_collation;
 

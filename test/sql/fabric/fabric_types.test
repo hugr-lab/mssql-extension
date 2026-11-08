@@ -129,14 +129,34 @@ SELECT txt FROM wh.dbo.FabricCopy;
 # =============================================================================
 
 statement error
-CREATE TABLE wh.dbo.FabricBad AS SELECT 'x'::MSSQL_NVARCHAR(50) AS v;
+CREATE TABLE wh.dbo.FabricBad (v MSSQL_NVARCHAR(50));
 ----
 MSSQL_NVARCHAR is not available on Microsoft Fabric
 
 statement error
-CREATE TABLE wh.dbo.FabricBad AS SELECT 'x'::MSSQL_VARCHAR(50, 'Cyrillic_General_100_CI_AS_SC_UTF8') AS v;
+CREATE TABLE wh.dbo.FabricBad (v MSSQL_VARCHAR(50, 'Cyrillic_General_100_CI_AS_SC_UTF8'));
 ----
 is not available on Microsoft Fabric
+
+# A CTAS takes what a warehouse can hold (spec 092): a source's nvarchar or code page, or a
+# cast to one, is a UTF-8 varchar in the warehouse's collation, three times the bytes.
+statement ok
+CREATE OR REPLACE TABLE wh.dbo.FabricFromSource AS
+SELECT s::MSSQL_NVARCHAR(50) AS n, s::MSSQL_VARCHAR(10, 'Cyrillic_General_CI_AS') AS c FROM (VALUES ('Привет')) t(s);
+
+query TT
+SELECT n, c FROM wh.dbo.FabricFromSource;
+----
+Привет	Привет
+
+query TII rowsort
+SELECT name, max_length, collation_name LIKE '%_UTF8' FROM mssql_scan('wh', 'SELECT name, max_length, collation_name FROM sys.columns WHERE object_id = OBJECT_ID(''dbo.FabricFromSource'')');
+----
+c	30	true
+n	150	true
+
+statement ok
+DROP TABLE wh.dbo.FabricFromSource;
 
 # The one Fabric also supports is accepted.
 statement ok

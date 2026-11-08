@@ -435,13 +435,13 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			list += ColumnSql(index) + (alias.empty() ? "" : " AS " + QuoteIdentifier(alias));
 			entry.plain_read = true;
 		} else {
-			const auto read = MSSQLColumnInfo::BuildReadExpression(column.name, column.sql_type_name, column.max_length,
-																   column.collation_name, options_.convert_varchar_max,
-																   "", "", options_.utf8_on_wire);
-			list += MSSQLColumnInfo::BuildReadExpression(column.name, column.sql_type_name, column.max_length,
-														 column.collation_name, options_.convert_varchar_max,
-														 relation.sql.empty() ? "" : relation.sql + ".", alias,
-														 options_.utf8_on_wire);
+			const auto read = MSSQLColumnInfo::BuildReadExpression(
+				column.name, column.sql_type_name, column.max_length, column.collation_name,
+				options_.convert_varchar_max, options_.client_transcode, "", "", options_.utf8_on_wire);
+			list += MSSQLColumnInfo::BuildReadExpression(
+				column.name, column.sql_type_name, column.max_length, column.collation_name,
+				options_.convert_varchar_max, options_.client_transcode, relation.sql.empty() ? "" : relation.sql + ".",
+				alias, options_.utf8_on_wire);
 			entry.plain_read = read == QuoteIdentifier(column.name);
 		}
 		outputs_.push_back(std::move(entry));

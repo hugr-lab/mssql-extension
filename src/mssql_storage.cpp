@@ -1253,6 +1253,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	int8_t order_pushdown_option = -1;	  // Spec 039: ORDER BY pushdown (-1=unset)
 	int8_t remote_pushdown_option = -1;	  // Spec 079 PR E2: mssql_remote_pushdown per catalog (-1=unset)
 	int8_t native_types_option = -1;	  // mssql_catalog_native_types per catalog (-1=unset)
+	int8_t client_transcode_option = -1;  // Spec 092: mssql_client_transcode per catalog (-1=unset)
 	bool lazy_validation = false;		  // Spec 047 (US2): opt out of eager creds check
 	bool preload_option = false;		  // Issue #324: preload the catalog at ATTACH
 	int64_t min_connections_option = -1;  // Issue #324: ATTACH-level mssql_min_connections (-1=unset)
@@ -1308,6 +1309,11 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			// mssql_catalog_native_types for this catalog only: the setting is
 			// GLOBAL, and DuckLake's METADATA_PARAMETERS reaches ATTACH options.
 			native_types_option = BooleanAttachOption(it->first, it->second) ? 1 : 0;
+			it = options.options.erase(it);
+		} else if (lower_name == "client_transcode") {
+			// Spec 092 D4: mssql_client_transcode for this catalog only. Two ATTACHes
+			// of one DSN are how one session measures both forms.
+			client_transcode_option = BooleanAttachOption(it->first, it->second) ? 1 : 0;
 			it = options.options.erase(it);
 		} else if (lower_name == "lazy_validation" || lower_name == "lazyvalidation") {
 			// Spec 047 (US2): suppress the eager TCP+LOGIN7 round trip below.
@@ -1626,6 +1632,13 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 								  !remote_pushdown.IsNull() && remote_pushdown.GetValue<bool>();
 	}
 	startup.native_types = native_types_option;
+	if (client_transcode_option >= 0) {
+		startup.client_transcode = client_transcode_option == 1;
+	} else {
+		Value client_transcode;
+		startup.client_transcode = !context.TryGetCurrentSetting("mssql_client_transcode", client_transcode) ||
+								   client_transcode.IsNull() || client_transcode.GetValue<bool>();
+	}
 	Value dml_platform;
 	if (context.TryGetCurrentSetting("mssql_test_dml_platform", dml_platform) && !dml_platform.IsNull()) {
 		startup.dml_platform = StringUtil::Lower(dml_platform.ToString());
