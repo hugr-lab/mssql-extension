@@ -158,7 +158,7 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 
 	// Load all tables + columns for this schema in one bulk query (or from cache if already loaded)
 	try {
-		cache.LoadAllTableMetadata(*connection, schema_.name.GetIdentifierName());
+		cache.LoadAllTableMetadata(context, *connection, schema_.name.GetIdentifierName());
 	} catch (...) {
 		pool.Release(std::move(connection));
 		throw;
@@ -341,7 +341,7 @@ bool MSSQLTableSet::LoadSingleEntry(ClientContext &context, const string &name,
 		MSSQLTableMetadata table_meta;
 		bool found = false;
 		try {
-			found = cache.GetTableMetadata(*connection, schema_.name.GetIdentifierName(), name, table_meta);
+			found = cache.GetTableMetadata(context, *connection, schema_.name.GetIdentifierName(), name, table_meta);
 		} catch (...) {
 			pool.Release(std::move(connection));
 			throw;
@@ -528,7 +528,7 @@ optional_ptr<CatalogEntry> MSSQLTableSet::GetEntryInTransaction(ClientContext &c
 	MSSQLTableMetadata table_meta;
 	bool found = false;
 	try {
-		found = metadata.Cache().GetTableMetadata(*connection, schema_name, name, table_meta);
+		found = metadata.Cache().GetTableMetadata(context, *connection, schema_name, name, table_meta);
 	} catch (...) {
 		ConnectionProvider::ReleaseConnection(context, catalog, std::move(connection));
 		throw;
@@ -577,7 +577,7 @@ void MSSQLTableSet::ScanInTransaction(ClientContext &context, const std::functio
 	if (!metadata.IsSchemaListed(schema_name)) {
 		auto connection = ConnectionProvider::GetConnection(context, catalog);
 		try {
-			metadata.Cache().LoadAllTableMetadata(*connection, schema_name);
+			metadata.Cache().LoadAllTableMetadata(context, *connection, schema_name);
 		} catch (...) {
 			ConnectionProvider::ReleaseConnection(context, catalog, std::move(connection));
 			throw;

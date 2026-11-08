@@ -16,17 +16,17 @@ ATTACH '{MSSQL_TESTDB_DSN}' AS txtest (TYPE mssql);
 
 # Setup: Create test table
 statement ok
-DROP TABLE IF EXISTS txtest.dbo.tx_scan_test;
+DROP TABLE IF EXISTS txtest.dbo.tx_restrict_scan_test;
 
 statement ok
-CREATE TABLE txtest.dbo.tx_scan_test (
+CREATE TABLE txtest.dbo.tx_restrict_scan_test (
     id INTEGER PRIMARY KEY,
     name VARCHAR(100)
 );
 
 # Insert initial data (outside transaction)
 statement ok
-INSERT INTO txtest.dbo.tx_scan_test (id, name) VALUES (1, 'Initial');
+INSERT INTO txtest.dbo.tx_restrict_scan_test (id, name) VALUES (1, 'Initial');
 
 # =============================================================================
 # Test 1: Catalog scan works OUTSIDE transaction (autocommit mode)
@@ -34,7 +34,7 @@ INSERT INTO txtest.dbo.tx_scan_test (id, name) VALUES (1, 'Initial');
 
 # This should work fine - no transaction active
 query IT
-SELECT id, name FROM txtest.dbo.tx_scan_test ORDER BY id;
+SELECT id, name FROM txtest.dbo.tx_restrict_scan_test ORDER BY id;
 ----
 1	Initial
 
@@ -47,7 +47,7 @@ BEGIN;
 
 # Catalog scan works before any DML - there are no uncommitted changes to miss
 query IT
-SELECT id, name FROM txtest.dbo.tx_scan_test ORDER BY id;
+SELECT id, name FROM txtest.dbo.tx_restrict_scan_test ORDER BY id;
 ----
 1	Initial
 
@@ -63,11 +63,11 @@ BEGIN;
 
 # Do INSERT first
 statement ok
-INSERT INTO txtest.dbo.tx_scan_test (id, name) VALUES (2, 'New Row');
+INSERT INTO txtest.dbo.tx_restrict_scan_test (id, name) VALUES (2, 'New Row');
 
 # Catalog scan should see the uncommitted INSERT
 query IT
-SELECT id, name FROM txtest.dbo.tx_scan_test ORDER BY id;
+SELECT id, name FROM txtest.dbo.tx_restrict_scan_test ORDER BY id;
 ----
 1	Initial
 2	New Row
@@ -77,7 +77,7 @@ ROLLBACK;
 
 # Verify the INSERT was rolled back
 query I
-SELECT COUNT(*) FROM txtest.dbo.tx_scan_test;
+SELECT COUNT(*) FROM txtest.dbo.tx_restrict_scan_test;
 ----
 1
 
@@ -91,11 +91,11 @@ BEGIN;
 # The UPDATE runs on the transaction's pinned connection (pushed whole, spec
 # 080 D1, or through its rowids on the shipped path)
 statement ok
-UPDATE txtest.dbo.tx_scan_test SET name = 'Updated' WHERE id = 1;
+UPDATE txtest.dbo.tx_restrict_scan_test SET name = 'Updated' WHERE id = 1;
 
 # Catalog scan should see the uncommitted UPDATE
 query IT
-SELECT id, name FROM txtest.dbo.tx_scan_test WHERE id = 1;
+SELECT id, name FROM txtest.dbo.tx_restrict_scan_test WHERE id = 1;
 ----
 1	Updated
 
@@ -104,7 +104,7 @@ ROLLBACK;
 
 # Verify the UPDATE was rolled back
 query T
-SELECT name FROM txtest.dbo.tx_scan_test WHERE id = 1;
+SELECT name FROM txtest.dbo.tx_restrict_scan_test WHERE id = 1;
 ----
 Initial
 
@@ -114,18 +114,18 @@ Initial
 
 # First add more data
 statement ok
-INSERT INTO txtest.dbo.tx_scan_test (id, name) VALUES (3, 'To Delete');
+INSERT INTO txtest.dbo.tx_restrict_scan_test (id, name) VALUES (3, 'To Delete');
 
 statement ok
 BEGIN;
 
 # The DELETE runs on the transaction's pinned connection, as the UPDATE above
 statement ok
-DELETE FROM txtest.dbo.tx_scan_test WHERE id = 3;
+DELETE FROM txtest.dbo.tx_restrict_scan_test WHERE id = 3;
 
 # Catalog scan should see the uncommitted DELETE
 query I
-SELECT COUNT(*) FROM txtest.dbo.tx_scan_test;
+SELECT COUNT(*) FROM txtest.dbo.tx_restrict_scan_test;
 ----
 1
 
@@ -134,7 +134,7 @@ ROLLBACK;
 
 # Verify the DELETE was rolled back
 query I
-SELECT COUNT(*) FROM txtest.dbo.tx_scan_test;
+SELECT COUNT(*) FROM txtest.dbo.tx_restrict_scan_test;
 ----
 2
 
@@ -147,31 +147,31 @@ BEGIN;
 
 # INSERT
 statement ok
-INSERT INTO txtest.dbo.tx_scan_test (id, name) VALUES (4, 'Fourth');
+INSERT INTO txtest.dbo.tx_restrict_scan_test (id, name) VALUES (4, 'Fourth');
 
 # Scan sees 3 rows
 query I
-SELECT COUNT(*) FROM txtest.dbo.tx_scan_test;
+SELECT COUNT(*) FROM txtest.dbo.tx_restrict_scan_test;
 ----
 3
 
 # UPDATE
 statement ok
-UPDATE txtest.dbo.tx_scan_test SET name = 'Modified' WHERE id = 1;
+UPDATE txtest.dbo.tx_restrict_scan_test SET name = 'Modified' WHERE id = 1;
 
 # Scan sees the update
 query T
-SELECT name FROM txtest.dbo.tx_scan_test WHERE id = 1;
+SELECT name FROM txtest.dbo.tx_restrict_scan_test WHERE id = 1;
 ----
 Modified
 
 # DELETE
 statement ok
-DELETE FROM txtest.dbo.tx_scan_test WHERE id = 3;
+DELETE FROM txtest.dbo.tx_restrict_scan_test WHERE id = 3;
 
 # Scan sees 2 rows now
 query I
-SELECT COUNT(*) FROM txtest.dbo.tx_scan_test;
+SELECT COUNT(*) FROM txtest.dbo.tx_restrict_scan_test;
 ----
 2
 
@@ -180,7 +180,7 @@ COMMIT;
 
 # Verify all changes persisted
 query IT
-SELECT id, name FROM txtest.dbo.tx_scan_test ORDER BY id;
+SELECT id, name FROM txtest.dbo.tx_restrict_scan_test ORDER BY id;
 ----
 1	Modified
 4	Fourth
@@ -190,7 +190,7 @@ SELECT id, name FROM txtest.dbo.tx_scan_test ORDER BY id;
 # =============================================================================
 
 statement ok
-DROP TABLE txtest.dbo.tx_scan_test;
+DROP TABLE txtest.dbo.tx_restrict_scan_test;
 
 statement ok
 DETACH txtest;

@@ -30,6 +30,7 @@ on:
       - 'test/cpp/test_dml_vehicle.cpp'
       # Issue #456: the dead-connection test runs the TDS / TLS read path.
       - 'test/cpp/test_dead_connection.cpp'
+      - 'test/cpp/test_metadata_interrupt.cpp'
       - 'src/tds/**'
       - 'src/include/tds/**'
       - 'src/query/mssql_simple_query.cpp'
@@ -270,6 +271,11 @@ jobs:
       # seconds, over TLS and plain TCP (a loopback proxy cut mid-WAITFOR).
       - name: Run the dead-connection test (issue #456)
         run: make test-dead-connection
+
+      # Review of #539: a metadata load waiting on another session's lock at
+      # mssql_metadata_timeout = 0 ends when the statement is interrupted.
+      - name: Run the metadata interrupt test (review of #539)
+        run: make test-metadata-interrupt
 
       # The self-contained rowid files under the DEBUG build (issue #369): the
       # scan's copy of a projected key column into the rowid slot asserted on

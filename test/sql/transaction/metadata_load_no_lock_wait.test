@@ -1,0 +1,214 @@
+# name: test/sql/transaction/metadata_load_no_lock_wait.test
+# description: a metadata load does not queue for a lock, so another session's DDL cannot roll back the transaction it runs in
+# group: [transaction]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN, MSSQL_TEST_HOST / _PORT
+#
+# A load reads the catalog with LOCK_TIMEOUT 0 and reads again on 1222. It used to queue on
+# the row another session's uncommitted DDL holds, keeping its own key lock meanwhile: a
+# deadlock cycle with that DDL, where the load, having written nothing, was the victim. In a
+# transaction that rolled the whole transaction back, and the rerun answered "The server
+# failed to resume the transaction". A deadlock cannot be induced on demand, so this pins
+# what prevents one: with a row held, a load neither waits nor kills its transaction.
+#
+# The holder is con1, the load the default connection. A listing reads every object, so it
+# meets con1's row. The timeout is short where the row is held for as long as the test says
+# and the error is what is asserted.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+require-env MSSQL_TEST_HOST
+
+require-env MSSQL_TEST_PORT
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS nw_hold (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('nw_hold', 'DROP TABLE IF EXISTS dbo.nw_held, dbo.nw_own, dbo.nw_ro_read, dbo.nw_x_0, dbo.nw_x_1, dbo.nw_altered; CREATE TABLE dbo.nw_ro_read (id int); CREATE TABLE dbo.nw_altered (id int); INSERT dbo.nw_altered VALUES (1)');
+
+statement ok
+SELECT mssql_exec('nw_hold', 'IF SUSER_ID(''nw_ro_login'') IS NULL CREATE LOGIN nw_ro_login WITH PASSWORD = N''NwRo_Test_1!'', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;');
+
+statement ok
+SELECT mssql_exec('nw_hold', 'IF USER_ID(''nw_ro_user'') IS NULL CREATE USER nw_ro_user FOR LOGIN nw_ro_login; ALTER ROLE db_datareader ADD MEMBER nw_ro_user;');
+
+# duckdb_tables() reads every attached catalog: this one's listing is in the shared cache
+# before con1 holds anything, so it reports only what the load under test does.
+statement ok
+SELECT mssql_preload_catalog('nw_hold');
+
+# Short from here to con1's ROLLBACK, not before: other files' DDL may be running beside this
+# one, and a preload under it can take longer than this.
+statement ok
+SET mssql_metadata_timeout = 3;
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+SELECT mssql_exec('nw_hold', 'CREATE TABLE dbo.nw_held (id int); ALTER TABLE dbo.nw_altered ADD c2 int NULL');
+
+#------------------------------------------------------------------------------
+# Autocommit: the listing stops at mssql_metadata_timeout and says why.
+#------------------------------------------------------------------------------
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS nw_auto (TYPE mssql);
+
+statement error
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'nw_auto';
+----
+another session's uncommitted schema change
+
+statement ok
+DETACH nw_auto;
+
+# A table whose own row is held is not reported missing, and its bind says why it stopped.
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS nw_bind (TYPE mssql);
+
+statement error
+SELECT * FROM nw_bind.dbo.nw_altered;
+----
+another session's uncommitted schema change
+
+statement ok
+DETACH nw_bind;
+
+#------------------------------------------------------------------------------
+# A transaction: a bind's load reads its table's rows only, so con1's row does not stop it,
+# and a load's SET ends with its call. A listing stops as above, naming the cause. DuckDB
+# then asks for a ROLLBACK, as for any statement that fails in a transaction.
+#------------------------------------------------------------------------------
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS nw_tx (TYPE mssql);
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT mssql_exec('nw_tx', 'CREATE TABLE dbo.nw_own (id int)');
+
+query I
+SELECT count(*) FROM nw_tx.dbo.nw_own;
+----
+0
+
+query I
+SELECT * FROM mssql_scan('nw_tx', 'SELECT @@LOCK_TIMEOUT');
+----
+-1
+
+statement error
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'nw_tx';
+----
+another session's uncommitted schema change
+
+statement ok
+ROLLBACK;
+
+statement ok
+DETACH nw_tx;
+
+#------------------------------------------------------------------------------
+# A login with only db_datareader, on which READ UNCOMMITTED would wait all the same.
+#------------------------------------------------------------------------------
+
+statement ok
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=TestDB;User Id=nw_ro_login;Password=NwRo_Test_1!;TrustServerCertificate=yes' AS nw_ro (TYPE mssql);
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT * FROM mssql_scan('nw_ro', 'SELECT 1 AS one');
+
+statement error
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'nw_ro';
+----
+another session's uncommitted schema change
+
+statement ok
+ROLLBACK;
+
+statement ok con1
+ROLLBACK;
+
+# With the row free the listing loads, the rolled-back table in it nowhere, for this login
+# too. Not the short timeout: other files' DDL may be running beside this one.
+statement ok
+SET mssql_metadata_timeout = 300;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'nw_ro' AND table_name = 'nw_ro_read';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'nw_ro' AND table_name IN ('nw_held', 'nw_own');
+----
+0
+
+statement ok
+DETACH nw_ro;
+
+#------------------------------------------------------------------------------
+# The wait itself, within the timeout: thread 0's uncommitted CREATE holds its row for 3 s,
+# thread 1 starts its listing at 1 s, in a transaction with an uncommitted CREATE of its own.
+# The listing returns once thread 0 rolls back, with thread 1's own table in it and thread
+# 0's not, and thread 1's transaction is still there. Before, a deadlock with other DDL here
+# rolled it back. Each thread runs every statement; `${i} = 1` makes one a no-op on thread 0.
+#------------------------------------------------------------------------------
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS nw_wait (TYPE mssql);
+
+concurrentloop i 0 2
+
+statement ok
+BEGIN;
+
+statement ok
+SELECT mssql_exec('nw_wait', 'CREATE TABLE dbo.nw_x_${i} (id int)');
+
+statement ok
+SELECT mssql_exec('nw_wait', 'WAITFOR DELAY ''00:00:0' || (3 - 2 * ${i}) || '''');
+
+query I
+SELECT ${i} = 0 OR count(*) = 1 FROM duckdb_tables() WHERE ${i} = 1 AND database_name = 'nw_wait' AND table_name = 'nw_x_1';
+----
+true
+
+query I
+SELECT ${i} = 0 OR count(*) = 0 FROM duckdb_tables() WHERE ${i} = 1 AND database_name = 'nw_wait' AND table_name = 'nw_x_0';
+----
+true
+
+query I
+SELECT * FROM mssql_scan('nw_wait', 'SELECT @@TRANCOUNT');
+----
+1
+
+statement ok
+ROLLBACK;
+
+endloop
+
+query I
+SELECT * FROM mssql_scan('nw_wait', 'SELECT COUNT(*) FROM sys.objects WHERE name IN (''nw_x_0'', ''nw_x_1'')');
+----
+0
+
+statement ok
+DETACH nw_wait;
+
+statement ok
+SELECT mssql_exec('nw_hold', 'DROP TABLE IF EXISTS dbo.nw_ro_read, dbo.nw_altered; DROP USER nw_ro_user; DROP LOGIN nw_ro_login;');
+
+statement ok
+DETACH nw_hold;

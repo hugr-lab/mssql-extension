@@ -15,15 +15,16 @@
 # a transaction -- else a ROLLBACK leaves a phantom behind and another
 # connection finds the uncommitted table in the cache.
 #
-# The metadata timeout is short so that a regression fails in seconds rather
-# than hanging the suite for the default five minutes.
+# The metadata timeout is short so that a regression fails in a minute rather
+# than hanging the suite for the default five minutes. Not shorter: the listing
+# below waits on every other session's DDL, and `make test` runs files in parallel.
 
 require mssql
 
 require-env MSSQL_TESTDB_DSN
 
 statement ok
-SET mssql_metadata_timeout = 10;
+SET mssql_metadata_timeout = 60;
 
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS tm380 (TYPE mssql);

@@ -103,6 +103,7 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 	// Spec 084 D1: the whole-catalog row counts from one DMV pass, except where
 	// the DMV and table variables are unverified.
 	metadata_cache_->SetRowCountPass(!connection_info_->IsFabricEndpoint() && !connection_info_->IsSynapseEndpoint());
+	metadata_cache_->SetNoLockWait(!connection_info_->IsFabricEndpoint() && !connection_info_->IsSynapseEndpoint());
 
 	// Create statistics provider with default TTL (will be configured from settings later)
 	statistics_provider_ = make_uniq<MSSQLStatisticsProvider>();
@@ -728,7 +729,7 @@ optional_ptr<SchemaCatalogEntry> MSSQLCatalog::LookupSchema(CatalogTransaction t
 
 	// Trigger lazy loading of schema list (ensure connection released on exception)
 	try {
-		schema_list.EnsureSchemasLoaded(*connection);
+		schema_list.EnsureSchemasLoaded(transaction.context, *connection);
 	} catch (...) {
 		if (transaction.context) {
 			ConnectionProvider::ReleaseConnection(*transaction.context, *this, std::move(connection));
@@ -795,7 +796,7 @@ void MSSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(Schema
 	}
 
 	try {
-		schema_names = schema_list.GetSchemaNames(*connection);
+		schema_names = schema_list.GetSchemaNames(context, *connection);
 	} catch (...) {
 		ConnectionProvider::ReleaseConnection(context, *this, std::move(connection));
 		throw;
