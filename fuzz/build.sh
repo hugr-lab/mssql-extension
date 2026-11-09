@@ -112,7 +112,7 @@ build_harness() {  # $1=name $2=harness.cc ; remaining = library objects
 	[[ -n "${SIMDUTF_INC}" ]] && simd=("${SIMDUTF_OBJ}")
 	echo ">> linking ${name}"
 	"${CXX}" ${CXXFLAGS} ${INC} ${SIMDUTF_INC} \
-		"${HERE}/${hcc}" "$@" "${simd[@]}" ${FUZZ_ENGINE} -o "${OUT}/${name}"
+		"${HERE}/${hcc}" "$@" ${simd[@]+"${simd[@]}"} ${FUZZ_ENGINE} -o "${OUT}/${name}"
 }
 
 # TARGETS selects which harnesses to build (default: all). Lets CI / run.sh /
@@ -162,6 +162,32 @@ if want code_page; then
 		"${REPO}/src/codec/code_page/code_page_tables.cpp")"
 	build_harness fuzz_code_page fuzz_code_page.cc ${CP_OBJS}
 fi
+
+# 5c. The backup reader (spec 085): the MTF walk and header fields, the MSSQLBAK container (chain,
+#     tail, media label, data set, resync search), the MS_XPRESS decoder, and the page index with the
+#     allocation map. DuckDB-free like the TDS layer (D15), and without zstd (fuzzed upstream: the
+#     container harness hands ZSTD blocks to a copying decoder). Not in the default TARGETS, so the
+#     per-PR fuzzing budget stays the TDS layer's: `make fuzz-backup-replay` replays their corpora
+#     and scripts/ci/leak_check.sh runs them in the Linux leak-check lane.
+BACKUP="${REPO}/src/backup"
+BACKUP_SRCS=(
+	"${BACKUP}/backup_bytes.cpp"
+	"${BACKUP}/backup_mtf.cpp"
+	"${BACKUP}/backup_set.cpp"
+	"${BACKUP}/backup_container.cpp"
+	"${BACKUP}/backup_xpress.cpp"
+	"${BACKUP}/backup_page_index.cpp"
+	"${BACKUP}/backup_pass_search.cpp"
+	"${BACKUP}/backup_allocation.cpp"
+)
+BACKUP_OBJS=""
+if want backup_mtf || want backup_container || want backup_xpress || want backup_page; then
+	BACKUP_OBJS="$(compile_objs backup "${BACKUP_SRCS[@]}")"
+fi
+want backup_mtf && build_harness fuzz_backup_mtf fuzz_backup_mtf.cc ${BACKUP_OBJS}
+want backup_container && build_harness fuzz_backup_container fuzz_backup_container.cc ${BACKUP_OBJS}
+want backup_xpress && build_harness fuzz_backup_xpress fuzz_backup_xpress.cc ${BACKUP_OBJS}
+want backup_page && build_harness fuzz_backup_page fuzz_backup_page.cc ${BACKUP_OBJS}
 
 # 6. The STAGED read path (spec 059 D4): parser in raw-row mode feeding
 #    codec::staging::RowStager. Deliberately NOT in the default TARGETS — it is

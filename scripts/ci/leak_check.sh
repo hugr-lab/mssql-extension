@@ -57,9 +57,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$HERE"
 
-# The DuckDB-free five. Deliberately NOT row_stager or bcp_encode: both link
-# libduckdb and need the suppression file that does not exist yet.
-TARGETS=(browser_response tds_tokens utf16 envchange_txn login_response)
+# The DuckDB-free nine: the TDS layer's five and the backup reader's four (spec 085 task 10).
+# Deliberately NOT row_stager or bcp_encode: both link libduckdb and need the suppression file that
+# does not exist yet.
+TARGETS=(browser_response tds_tokens utf16 envchange_txn login_response backup_mtf backup_container backup_xpress backup_page)
 
 if [ "$(uname -s)" != "Linux" ]; then
 	echo "SKIP: LeakSanitizer is not supported on $(uname -s) — Apple's toolchain ships no LSan."

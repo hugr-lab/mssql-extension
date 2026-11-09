@@ -35,7 +35,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check help
+.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay fuzz-backup-replay check-credential-logging leak-check help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -1404,6 +1404,16 @@ fuzz-encode-replay: release
 	@echo "Replaying the BCP/PLP encode corpus..."
 	DYLD_LIBRARY_PATH=$(FUZZ_DUCKDB_LIB) LD_LIBRARY_PATH=$(FUZZ_DUCKDB_LIB) \
 	    $(PROJ_DIR)fuzz/out/fuzz_bcp_encode $(PROJ_DIR)fuzz/corpus/bcp_encode
+# The backup reader's harnesses (spec 085 task 10) replayed over their stored corpora: DuckDB-free,
+# so no release build is needed. Discovery is fuzz/run.sh's; this is the regression run, and the
+# Linux leak-check lane replays the same corpora under ASan + LSan. The corpora are synthetic
+# (fuzz/gen_backup_seeds.cc): no backup of a server whose data is not ours (spec 085 T4).
+fuzz-backup-replay:
+	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page" \
+	    $(PROJ_DIR)fuzz/build.sh
+	@for t in backup_mtf backup_container backup_xpress backup_page; do \
+	    $(PROJ_DIR)fuzz/out/fuzz_$$t $(PROJ_DIR)fuzz/corpus/$$t || exit 1; \
+	done
 # LeakSanitizer over the DuckDB-free fuzz harnesses' stored corpora
 # (scripts/ci/leak_check.sh). LSan ships inside ASan and is ON BY DEFAULT on
 # Linux; the one lane that would run it passes detect_leaks=0, because libduckdb
@@ -1459,6 +1469,7 @@ help:
 	@echo "  make joern-scan           - Run the Joern query suite (JOERN_QUERY=q3 for one query)"
 	@echo "  make joern-shell          - Open the Joern REPL on the CPG"
 	@echo "  make fuzz-encode-replay   - Replay the BCP/PLP encode corpus under ASan+UBSan (fuzz/README.md)"
+	@echo "  make fuzz-backup-replay   - Replay the backup reader's corpora (mtf, container, xpress, page)"
 	@echo "  make leak-check           - LeakSanitizer over the DuckDB-free fuzz corpora (Linux only)"
 	@echo "  make check-credential-logging - Gate: no credential value reaches a log, exception or format call"
 	@echo "  make test-all             - Run all tests"

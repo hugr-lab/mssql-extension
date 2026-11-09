@@ -46,6 +46,10 @@ Three modes:
 | `fuzz_code_page` | `codec::code_page::DecodeToUtf8` / `DecodeToUtf16` / `DecodeValues` / `ExactUtf8Length` / `CopyAscii`, each against the others | `src/codec/code_page/code_page.cpp` (+ the generated tables) | ✅ (simdutf for its UTF-8 / UTF-16 oracles) |
 | `fuzz_row_stager` | `codec::staging::RowStager::StageRow` / `StageNBCRow` | `src/codec/staging/row_stager.cpp` | ❌ links libduckdb |
 | `fuzz_bcp_encode` | `codec::string::PlanColumn` + `ScatterVarBlock` vs `EncodeToBcp` | `src/codec/string_codec.cpp` | ❌ links libduckdb |
+| `fuzz_backup_mtf` | `backup::WalkMtf` + `ReadBackupSet`, `WalkMtfTape` + `ReadMediaFields`, `WalkMtfDataSet` | `src/backup/` (spec 085) | ✅ |
+| `fuzz_backup_container` | the MSSQLBAK container: header, `WalkChain` / `OpenChainFromTail`, `ReadSeekIndex`, `ReadContainerTape`, `ContainerStream`, and its page index both ways (`BuildPageIndex`: the gallop through the walked chain and trust_layout's resync search), `ReadPage`, `AllocationMap` | `src/backup/` | ✅ (ZSTD blocks to a copying decoder: zstd is fuzzed upstream) |
+| `fuzz_backup_xpress` | `backup::XpressHuffmanDecode` (output size from the first two bytes) | `src/backup/backup_xpress.cpp` | ✅ |
+| `fuzz_backup_page` | `BuildPassMap`, `BuildRankedPassMap`, `BuildPageIndex` (`Locate` / `ReadPage`, searches and their fallback), `AllocationMap`, a galloping `PassSearch`, over a pass expanded from 64-byte chunks tiled into units | `src/backup/` | ✅ |
 
 `fuzz_code_page` (spec 091) is in the default `TARGETS`, so it shares the per-PR
 job's one fuzzing budget with the other default targets. Its oracles are the
@@ -80,6 +84,13 @@ DYLD_LIBRARY_PATH=build/release/src fuzz/out/fuzz_bcp_encode fuzz/corpus/bcp_enc
 Both pick up the family codecs with a **non-recursive** glob, `src/codec/*.cpp`,
 in `build.sh`, plus `src/codec/code_page/*.cpp`, which `string_codec.cpp` and the
 stager call (spec 092).
+
+The four backup harnesses (spec 085 task 10) are **not in the default `TARGETS`**, so the per-PR
+ClusterFuzzLite budget stays the TDS layer's. Their corpora are synthetic, written by
+`fuzz/gen_backup_seeds.cc` from the unit tests' builders (never a backup of a server whose data is
+not ours to publish, spec 085 T4). `make fuzz-backup-replay` replays them; the Linux leak-check lane
+(`scripts/ci/leak_check.sh`) replays them under ASan + LSan; discovery is `fuzz/run.sh` with
+`TARGETS="backup_mtf backup_container backup_xpress backup_page"`.
 
 ### `fuzz_bcp_encode`'s three oracles
 

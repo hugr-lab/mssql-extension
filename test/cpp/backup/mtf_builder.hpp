@@ -138,6 +138,11 @@ struct Options {
 	uint32_t sfin_type = 1;
 	//! This file's FamilySequenceNumber in the RAID stream (the media set has two families).
 	uint16_t family_sequence = 1;
+	//! The MSDA block's header bytes (52 common + its specific part): a larger header moves the MQDA
+	//! data, which is how a seed puts the pass's units on a block boundary of a container.
+	size_t msda_header = 60;
+	//! The MQDA stream's bytes, when not empty (else mqda_bytes of 0x5A).
+	Bytes mqda_content;
 };
 
 inline Bytes BuildImage(const Options &o) {
@@ -178,7 +183,8 @@ inline Bytes BuildImage(const Options &o) {
 	put_string(volb, 64, "host-1");
 	AppendBlock(image, "VOLB", volb, {}, 1024);
 	if (o.with_msda) {
-		AppendBlock(image, "MSDA", Bytes(60, 0), {{"MQDA", Bytes(o.mqda_bytes, 0x5A), 0x2}}, o.align_blocks ? 1 : 0);
+		const Bytes mqda = o.mqda_content.empty() ? Bytes(o.mqda_bytes, 0x5A) : o.mqda_content;
+		AppendBlock(image, "MSDA", Bytes(o.msda_header, 0), {{"MQDA", mqda, 0x2}}, o.align_blocks ? 1 : 0);
 	}
 	if (o.with_log) {
 		AppendBlock(image, "MSTL", Bytes(596, 0), {{"MQTL", Bytes(4098, 0x11), 0}}, o.align_blocks ? 1 : 0);

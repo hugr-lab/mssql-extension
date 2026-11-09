@@ -42,6 +42,8 @@ on:
       - 'src/tds/**'
       - 'src/include/tds/**'
       - 'src/connection/instance_resolver.cpp'
+      - 'src/backup/**'
+      - 'src/include/backup/**'
       - 'fuzz/**'
       - 'scripts/ci/leak_check.sh'
       - '.github/workflows/leak-check.yml'
