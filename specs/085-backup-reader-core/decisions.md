@@ -71,7 +71,8 @@ the specs it affects. **Blocking** means the named PR cannot open until the ques
 | DQ-35 | the helper naming family | keep as drafted | 022–024 |
 | DQ-36 | committed samples or a release asset | committed, ≤ 2 MB each, ≤ 16 MB in all | 085 PR 1 |
 | DQ-37 | `backup_<component>.cpp` source names | yes | 085 PR 1 |
-| DQ-39 | what an opened backup keeps in memory | **decided** (owner, 2026-11-09): at most 0.4 MB resident per GB of backup (4 GB for 10 TB); extent bitmaps with ranks, block checkpoints, the catalog model resident; the AU index buffer-managed; page bytes not kept; a slow open is acceptable; a saved index later, as an option (085 D4a) | — |
+| DQ-40 | which pages are a table's | **decided** (owner, 2026-11-09): its AU's IAM chain, walked at the table's first scan through the page store; the page header checked at read; a differential's own pages by their header AU; an ATTACH reads the headers, allocation and catalog pages only (085 D4, D4a) | — |
+| DQ-39 | what an opened backup keeps in memory | **decided** (owner, 2026-11-09): at most 0.4 MB resident per GB of backup (4 GB for 10 TB); extent bitmaps with ranks, block checkpoints, the catalog model resident; the AU index buffer-managed (replaced by DQ-40's IAM chain); page bytes not kept; a slow open is acceptable; a saved index later, as an option (085 D4a) | — |
 | DQ-38 | how the reader does I/O | **decided** (owner, 2026-11-09): coalesced ranges, fetched asynchronously and in parallel through DuckDB's I/O pool and `CachingFileSystem`, as the Parquet reader does (085 D3a) | — |
 
 ## The questions
@@ -605,8 +606,8 @@ backup on object storage (085 § Risks). The parsers are unchanged: they stay Du
 be slow; a bind and a read must be fast.** Recorded as 085 D4a:
 - resident while open: the headers, per pass an extent bitmap with ranks (a page's place in O(1)),
   compressed-media checkpoints every 64 blocks, the catalog model, the fuzzy status;
-- buffer-managed: the AU index (runs of live extents per allocation unit, sorted at open), liveness
-  applied once and GAM / PFS dropped;
+- buffer-managed: the AU index (runs of live extents per allocation unit, sorted at open; replaced
+  by DQ-40's per-table IAM chain), liveness applied once and GAM / PFS dropped;
 - not kept: page bytes, decoded pages, LOB values, log records;
 - E12 decides whether the open reads every page;
 - a saved index is a later option at a path the user names (`temp_directory` does not outlive the
@@ -614,6 +615,30 @@ be slow; a bind and a read must be fast.** Recorded as 085 D4a:
 
 The draft (stage 2) kept 16 bytes per page, about 0.2 % of the backup: 20 GB for 10 TB, buffer-managed
 but far past the budget. +2.5 d on 085 PR 1 (task 7 and E12).
+
+### DQ-40 — Which pages are a table's? — **DECIDED** (owner, 2026-11-09)
+
+**DECIDED: the allocation unit's IAM chain, read through the page store, walked lazily at the table's
+first scan; the page header is the check at read, not the map; a differential's own pages are read
+by their header AU.** Recorded as 085 D4 / D4a; tasks 7a −1 d, 11a +2 d, 24 +0.5 d.
+
+D4 took the page header as the map (E2: right on 10,473 of 10,473 allocated pages), so the AU index
+needed every page's header: a 10 TB backup read whole at open, which E12's rank path had just made
+unnecessary for the extents. E2 chose the header for differentials, which lack the IAM pages of
+unchanged AUs; it did not find the IAM wrong on a live page. Through the page store a differential's
+overlay takes the full's IAM pages where its own did not change, and its own pages, indexed from
+their headers anyway, keep the header path.
+
+So an ATTACH reads the MTF headers, the allocation pages and the catalog (enough to list the schemas,
+tables and views and to bind them with `rcrows` as cardinality), and a table's first scan reads its
+IAM pages (one per 4 GB the AU spans) and then its pages. The per-AU runs are buffer-managed and kept
+for later scans; D4a's sorted AU index and the resident PFS bitmap (168 MB for 10 TB) are gone.
+A striped set is still indexed from its page headers (E12: extents split between families at run
+time), and a compressed backup still walks its block chain at open.
+
+**Affects** 085 D4 / D4a, stages 2–4a, § Resources, acceptance 12, tasks 7a / 8 / 11a / 24, § Risks;
+089's previous-owner rule already reads the base IAM images (E7); its changed-set pass over the
+page headers (089 D3) is unchanged.
 
 ## Settled during the consistency pass (no question)
 
