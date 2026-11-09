@@ -670,6 +670,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_bytes.cpp \
     test/cpp/backup/test_backup_container.cpp \
     test/cpp/backup/test_backup_mtf.cpp \
+    test/cpp/backup/test_backup_open_pass.cpp \
     test/cpp/backup/test_backup_page_index.cpp \
     test/cpp/backup/test_backup_ranges.cpp \
     test/cpp/backup/test_backup_source.cpp \

@@ -154,8 +154,12 @@ size_t PassMap::MemoryBytes() const {
 	return bytes;
 }
 
+static std::string WhereName(const std::string &name, uint64_t offset) {
+	return "backup file \"" + name + "\" at offset " + std::to_string(offset);
+}
+
 static std::string Where(const RandomAccess &stream, uint64_t offset) {
-	return "backup file \"" + stream.Name() + "\" at offset " + std::to_string(offset);
+	return WhereName(stream.Name(), offset);
 }
 
 // The ranked form's bitmaps may hold at most this many bytes, or 8 runs' worth per extent run,
@@ -201,7 +205,7 @@ public:
 		have_previous_ = true;
 	}
 
-	void Finish(const RandomAccess &stream, uint64_t offset) {
+	void Finish(const std::string &name, uint64_t offset) {
 		if (ranked_) {
 			map_.ranked_ = true;
 			map_.files_ = std::move(files_);
@@ -217,7 +221,7 @@ public:
 			const auto &a = runs_[i - 1];
 			const auto &b = runs_[i];
 			if (a.first.file == b.first.file && a.first.extent + a.count > b.first.extent) {
-				throw FormatError("backup file \"" + stream.Name() + "\" at offset " + std::to_string(offset) +
+				throw FormatError("backup file \"" + name + "\" at offset " + std::to_string(offset) +
 								  ": a data pass that carries extent " + std::to_string(b.first.file) + ":" +
 								  std::to_string(b.first.extent) + " twice");
 			}
@@ -280,79 +284,146 @@ private:
 	std::vector<ExtentRun> runs_;
 };
 
-PassMap BuildPassMap(const RandomAccess &stream, uint64_t offset, uint64_t length, uint32_t number) {
-	if (length < 2 || offset > stream.Size() || length > stream.Size() - offset) {
-		throw FormatError(Where(stream, offset) + ": a data stream that does not fit the file");
-	}
-	if ((length - 2) % PAGE_SIZE != 0) {
-		throw FormatError(Where(stream, offset) + ": a data stream of " + std::to_string(length) +
-						  " bytes, not a 2-byte lead-in and whole 8 KB units");
-	}
-	PassMap map;
-	map.number = number;
-	map.units_offset = offset + 2;
-	const uint64_t units = (length - 2) / PAGE_SIZE;
-	if (units % PAGES_PER_EXTENT != 0) {
-		throw FormatError(Where(stream, offset) + ": a data pass of " + std::to_string(units) +
-						  " units, not whole 8-unit extent groups");
-	}
-	map.groups_ = units / PAGES_PER_EXTENT;
-	PassMapBuilder builder(map);
-	// One read per group (64 KB), not one per header: the reader under it may be a container whose
-	// every read decodes, or a remote file.
-	std::vector<uint8_t> group_bytes(GROUP_BYTES);
-	for (uint64_t g = 0; g < map.groups_; g++) {
-		const uint64_t group_at = map.units_offset + g * GROUP_BYTES;
-		stream.ReadAt(group_at, group_bytes.data(), group_bytes.size());
-		bool found = false;
-		ExtentId extent;
-		for (uint32_t k = 0; k < PAGES_PER_EXTENT; k++) {
-			const uint8_t *unit = group_bytes.data() + static_cast<size_t>(k) * PAGE_SIZE;
-			const uint64_t at = group_at + static_cast<uint64_t>(k) * PAGE_SIZE;
-			if (unit[0] == 0) {
-				// A zero unit (an unallocated page of a copied extent) is all zeros: 13449 of 13451 seen.
-				// The other two (a busy backup's second pass, E6 F2) carry a page id and little else: a
-				// page caught while it was formatted. That unit is the page's latest copy, an
-				// unformatted page the record reader returns no row from; it names its extent like a page.
-				bool zeros = true;
-				for (size_t i = 1; i < PAGE_SIZE && zeros; i++) {
-					zeros = unit[i] == 0;
-				}
-				if (zeros) {
-					continue;
-				}
-			} else if (unit[0] != PAGE_HEADER_VERSION) {
-				throw FormatError(Where(stream, at) + ": a unit with header version " + std::to_string(unit[0]) +
-								  ", neither a page (1) nor a zero unit (0)");
+// The extent a group's units name, checked unit by unit: a page sits at its own position of its
+// extent's group, every page of a group names one extent, a unit is a page (header version 1), a
+// pad page, or a zero unit.
+static void ScanGroup(const std::string &name, uint64_t group_at, const uint8_t *group_bytes, GroupHeader &out) {
+	out.found = false;
+	for (uint32_t k = 0; k < PAGES_PER_EXTENT; k++) {
+		const uint8_t *unit = group_bytes + static_cast<size_t>(k) * PAGE_SIZE;
+		const uint64_t at = group_at + static_cast<uint64_t>(k) * PAGE_SIZE;
+		if (unit[0] == 0) {
+			// A zero unit (an unallocated page of a copied extent) is all zeros: 13449 of 13451 seen.
+			// The other two (a busy backup's second pass, E6 F2) carry a page id and little else: a
+			// page caught while it was formatted. That unit is the page's latest copy, an
+			// unformatted page the record reader returns no row from; it names its extent like a page.
+			bool zeros = true;
+			for (size_t i = 1; i < PAGE_SIZE && zeros; i++) {
+				zeros = unit[i] == 0;
 			}
-			if (unit[0] == PAGE_HEADER_VERSION && unit[1] == PAGE_TYPE_PAD) {
+			if (zeros) {
 				continue;
 			}
-			ByteReader r(unit, HEADER_READ, "a page header", at);
-			const uint32_t page = r.U32(32);
-			const uint16_t file = r.U16(36);
-			if (page % PAGES_PER_EXTENT != k) {
-				throw FormatError(Where(stream, at) + ": page " + std::to_string(file) + ":" + std::to_string(page) +
-								  " at position " + std::to_string(k) + " of its extent group");
-			}
-			ExtentId e;
-			e.file = file;
-			e.extent = page / PAGES_PER_EXTENT;
-			if (found && !(e == extent)) {
-				throw FormatError(Where(stream, at) + ": an extent group holding pages of two extents");
-			}
-			extent = e;
-			found = true;
+		} else if (unit[0] != PAGE_HEADER_VERSION) {
+			throw FormatError(WhereName(name, at) + ": a unit with header version " + std::to_string(unit[0]) +
+							  ", neither a page (1) nor a zero unit (0)");
 		}
-		if (!found) {
-			builder.Empty();
+		if (unit[0] == PAGE_HEADER_VERSION && unit[1] == PAGE_TYPE_PAD) {
 			continue;
 		}
-		builder.Extent(extent, g);
-		map.extents_++;
+		ByteReader r(unit, HEADER_READ, "a page header", at);
+		const uint32_t page = r.U32(32);
+		const uint16_t file = r.U16(36);
+		if (page % PAGES_PER_EXTENT != k) {
+			throw FormatError(WhereName(name, at) + ": page " + std::to_string(file) + ":" + std::to_string(page) +
+							  " at position " + std::to_string(k) + " of its extent group");
+		}
+		ExtentId e;
+		e.file = file;
+		e.extent = page / PAGES_PER_EXTENT;
+		if (out.found && !(e == out.extent)) {
+			throw FormatError(WhereName(name, at) + ": an extent group holding pages of two extents");
+		}
+		out.extent = e;
+		out.found = true;
 	}
-	builder.Finish(stream, offset);
-	return map;
+}
+
+PassHeaderScan::PassHeaderScan(std::string name, uint64_t stream_size, uint64_t offset, uint64_t length,
+							   uint32_t number)
+	: name_(std::move(name)), offset_(offset) {
+	if (length < 2 || offset > stream_size || length > stream_size - offset) {
+		throw FormatError(WhereName(name_, offset) + ": a data stream that does not fit the file");
+	}
+	if ((length - 2) % PAGE_SIZE != 0) {
+		throw FormatError(WhereName(name_, offset) + ": a data stream of " + std::to_string(length) +
+						  " bytes, not a 2-byte lead-in and whole 8 KB units");
+	}
+	map_.number = number;
+	map_.units_offset = offset + 2;
+	const uint64_t units = (length - 2) / PAGE_SIZE;
+	if (units % PAGES_PER_EXTENT != 0) {
+		throw FormatError(WhereName(name_, offset) + ": a data pass of " + std::to_string(units) +
+						  " units, not whole 8-unit extent groups");
+	}
+	map_.groups_ = units / PAGES_PER_EXTENT;
+	builder_.reset(new PassMapBuilder(map_));
+}
+
+PassHeaderScan::~PassHeaderScan() {}
+
+uint64_t PassHeaderScan::GroupOffset(uint64_t group) const {
+	return map_.units_offset + group * GROUP_BYTES;
+}
+
+void PassHeaderScan::ScanGroups(const std::string &name, uint64_t at, const uint8_t *bytes, uint64_t groups,
+								std::vector<GroupHeader> &out) {
+	out.resize(static_cast<size_t>(groups));
+	for (uint64_t g = 0; g < groups; g++) {
+		ScanGroup(name, at + g * GROUP_BYTES, bytes + g * GROUP_BYTES, out[static_cast<size_t>(g)]);
+	}
+}
+
+void PassHeaderScan::Add(uint64_t first_group, const std::vector<GroupHeader> &groups) {
+	if (!builder_) {
+		throw FormatError(WhereName(name_, offset_) + ": a pass scan fed after it finished");
+	}
+	if (first_group != next_group_) {
+		throw FormatError(WhereName(name_, offset_) + ": groups fed out of order (" + std::to_string(first_group) +
+						  " after " + std::to_string(next_group_) + ")");
+	}
+	if (groups.size() > map_.groups_ - next_group_) {
+		throw FormatError(WhereName(name_, offset_) + ": " + std::to_string(groups.size()) +
+						  " groups fed past the pass's " + std::to_string(map_.groups_));
+	}
+	for (size_t i = 0; i < groups.size(); i++) {
+		if (!groups[i].found) {
+			builder_->Empty();
+			continue;
+		}
+		builder_->Extent(groups[i].extent, next_group_ + i);
+		map_.extents_++;
+	}
+	next_group_ += groups.size();
+}
+
+void PassHeaderScan::Feed(uint64_t first_group, const uint8_t *bytes, uint64_t groups) {
+	if (first_group != next_group_) {
+		throw FormatError(WhereName(name_, offset_) + ": groups fed out of order (" + std::to_string(first_group) +
+						  " after " + std::to_string(next_group_) + ")");
+	}
+	if (groups > map_.groups_ - next_group_) {
+		throw FormatError(WhereName(name_, offset_) + ": " + std::to_string(groups) + " groups fed past the pass's " +
+						  std::to_string(map_.groups_));
+	}
+	ScanGroups(name_, GroupOffset(first_group), bytes, groups, scratch_);
+	Add(first_group, scratch_);
+}
+
+PassMap PassHeaderScan::Finish() {
+	if (!builder_ || next_group_ != map_.groups_) {
+		throw FormatError(WhereName(name_, offset_) + ": a pass scan finished at group " + std::to_string(next_group_) +
+						  " of " + std::to_string(map_.groups_));
+	}
+	builder_->Finish(name_, offset_);
+	builder_.reset();
+	return std::move(map_);
+}
+
+PassMap BuildPassMap(const RandomAccess &stream, uint64_t offset, uint64_t length, uint32_t number) {
+	PassHeaderScan scan(stream.Name(), stream.Size(), offset, length, number);
+	// Reads of up to 16 groups (1 MiB), not one per header: the reader under it may be a container
+	// whose every read decodes, or a remote file. The DuckDB layer feeds the same scan from
+	// parallel ranges (D3a).
+	static constexpr uint64_t GROUPS_PER_READ = 16;
+	std::vector<uint8_t> bytes;
+	for (uint64_t g = 0; g < scan.GroupCount(); g += GROUPS_PER_READ) {
+		const uint64_t n = std::min(GROUPS_PER_READ, scan.GroupCount() - g);
+		bytes.resize(static_cast<size_t>(n * GROUP_BYTES));
+		stream.ReadAt(scan.GroupOffset(g), bytes.data(), bytes.size());
+		scan.Feed(g, bytes.data(), n);
+	}
+	return scan.Finish();
 }
 
 // Allocation-page layout (spec 085 § Rules, allocation): PFS pages at 1 and every 8,088 pages;
@@ -616,7 +687,7 @@ size_t PageIndex::MemoryBytes() const {
 
 //! One family's passes, appended to `passes` with their family and pass numbers.
 static void AddFamilyPasses(const RandomAccess &stream, const MtfLayout &layout, uint32_t family, bool rank_first_pass,
-							std::vector<PassMap> &passes) {
+							const PassMapper &mapper, std::vector<PassMap> &passes) {
 	uint32_t number = 0;
 	if (layout.FindAll("SSET").size() > 1) {
 		throw FormatError("backup file \"" + stream.Name() +
@@ -649,7 +720,8 @@ static void AddFamilyPasses(const RandomAccess &stream, const MtfLayout &layout,
 		PassMap map;
 		if (!(this_number == 0 && rank_first_pass &&
 			  BuildRankedPassMap(stream, data->data_offset, data->length, map))) {
-			map = BuildPassMap(stream, data->data_offset, data->length, this_number);
+			map = mapper ? mapper(stream, data->data_offset, data->length, this_number)
+						 : BuildPassMap(stream, data->data_offset, data->length, this_number);
 		}
 		map.number = this_number;
 		map.family = family;
@@ -657,10 +729,10 @@ static void AddFamilyPasses(const RandomAccess &stream, const MtfLayout &layout,
 	}
 }
 
-PageIndex BuildPageIndex(const std::vector<FamilyStream> &families, bool rank_first_pass) {
+PageIndex BuildPageIndex(const std::vector<FamilyStream> &families, bool rank_first_pass, const PassMapper &mapper) {
 	PageIndex index;
 	for (uint32_t f = 0; f < families.size(); f++) {
-		AddFamilyPasses(*families[f].stream, *families[f].layout, f, rank_first_pass && families.size() == 1,
+		AddFamilyPasses(*families[f].stream, *families[f].layout, f, rank_first_pass && families.size() == 1, mapper,
 						index.passes_);
 	}
 	// By pass number, so Locate meets the later pass first going backwards.

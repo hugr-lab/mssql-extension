@@ -22,6 +22,8 @@
 #include "backup/backup_mtf.hpp"
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <vector>
 
 namespace duckdb {
@@ -129,6 +131,7 @@ private:
 	friend bool BuildRankedPassMap(const RandomAccess &, uint64_t, uint64_t, PassMap &, uint64_t *);
 	friend class PassMapBuilder;
 	friend class RankedPassBuilder;
+	friend class PassHeaderScan;
 
 	bool ranked_ = false;
 	uint64_t groups_ = 0;
@@ -139,6 +142,54 @@ private:
 	std::vector<uint64_t> file_first_group_;
 	// Runs form.
 	std::vector<ExtentRun> runs_;
+};
+
+//! Maps a pass from its page headers: BuildPassMap's signature. The DuckDB layer gives one that
+//! reads a family file as parallel ranges (backup_open_pass, D3a).
+class PassMap;
+using PassMapper = std::function<PassMap(const RandomAccess &, uint64_t, uint64_t, uint32_t)>;
+
+//! What one 8-unit group's headers name: an extent, or nothing (zero units and pads only).
+struct GroupHeader {
+	bool found = false;
+	ExtentId extent;
+};
+
+class PassMapBuilder;
+
+//! A pass mapped from its page headers in pieces, so the DuckDB layer can fetch the pieces as
+//! parallel ranges (D3a) and parse them on any thread: ScanGroups is a pure function over the
+//! bytes of whole groups; Add takes its results strictly in group order (the map is built in
+//! order); Feed is both. Finish checks every group was fed. The rules are BuildPassMap's.
+class PassHeaderScan {
+public:
+	//! The pass whose MQDA data is `length` bytes at `offset` of a stream of `stream_size` bytes
+	//! named `name`; the bounds and the unit arithmetic are checked here.
+	PassHeaderScan(std::string name, uint64_t stream_size, uint64_t offset, uint64_t length, uint32_t number);
+	~PassHeaderScan();
+	PassHeaderScan(const PassHeaderScan &) = delete;
+	PassHeaderScan &operator=(const PassHeaderScan &) = delete;
+
+	uint64_t GroupCount() const {
+		return map_.groups_;
+	}
+	//! Where group `group` starts in the stream.
+	uint64_t GroupOffset(uint64_t group) const;
+	//! The groups whose bytes (`groups` × 64 KB) start at stream offset `at`; `name` for errors.
+	static void ScanGroups(const std::string &name, uint64_t at, const uint8_t *bytes, uint64_t groups,
+						   std::vector<GroupHeader> &out);
+	//! Groups `first_group` … in order; anything else is a FormatError.
+	void Add(uint64_t first_group, const std::vector<GroupHeader> &groups);
+	void Feed(uint64_t first_group, const uint8_t *bytes, uint64_t groups);
+	PassMap Finish();
+
+private:
+	std::string name_;
+	uint64_t offset_ = 0;
+	PassMap map_;
+	std::unique_ptr<PassMapBuilder> builder_;
+	uint64_t next_group_ = 0;
+	std::vector<GroupHeader> scratch_;
 };
 
 //! The pass whose MQDA data is `length` bytes at `offset` of `stream`, mapped from its pages'
@@ -183,15 +234,17 @@ public:
 	size_t MemoryBytes() const;
 
 private:
-	friend PageIndex BuildPageIndex(const std::vector<FamilyStream> &, bool);
+	friend PageIndex BuildPageIndex(const std::vector<FamilyStream> &, bool, const PassMapper &);
 	std::vector<PassMap> passes_;
 };
 
 //! Every data pass of every family (each MSDA block's MQDA stream), mapped by BuildPassMap,
 //! ordered by pass number. With `rank_first_pass` (a full backup, the caller's to say) and one
 //! family, pass 1 is tried by BuildRankedPassMap first; a striped set splits its extents between
-//! families at run time (E12), so its passes are always mapped by their headers.
-PageIndex BuildPageIndex(const std::vector<FamilyStream> &families, bool rank_first_pass = false);
+//! families at run time (E12), so its passes are always mapped by their headers: by `mapper` when
+//! given, else BuildPassMap.
+PageIndex BuildPageIndex(const std::vector<FamilyStream> &families, bool rank_first_pass = false,
+						 const PassMapper &mapper = PassMapper());
 //! One family's index.
 PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout, bool rank_first_pass = false);
 
