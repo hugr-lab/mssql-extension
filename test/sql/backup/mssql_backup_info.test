@@ -1,0 +1,77 @@
+# name: test/sql/backup/mssql_backup_info.test
+# description: mssql_backup_info over the committed samples, against their golden RESTORE HEADERONLY / LABELONLY / FILELISTONLY (spec 085 task 10)
+# group: [mssql]
+#
+# The samples are synthetic, made on a clean instance by test/data/backup/generate.sh; the expected
+# values are the golden output beside them (test/data/backup/*.headeronly.txt, *.labelonly.txt,
+# *.filelistonly.txt). No SQL Server is needed.
+
+require mssql
+
+# A full backup WITH CHECKSUM: its LSNs, sizes and names as HEADERONLY prints them.
+query TTTIIIIIITTI
+SELECT backup_type, is_copy_only, has_backup_checksums, backup_size, compressed_size, first_lsn, last_lsn,
+       checkpoint_lsn, database_backup_lsn, database_name, recovery_model, family_count
+FROM mssql_backup_info('test/data/backup/full.bak');
+----
+full	false	true	4415488	4415488	44000000207200001	44000000209600001	44000000207200001	0	bak_sample	FULL	1
+
+# Its files, as FILELISTONLY lists them.
+query TTII
+SELECT f.logical_name, f.type, f.file_id, f.size_bytes
+FROM (SELECT unnest(files) AS f FROM mssql_backup_info('test/data/backup/full.bak'));
+----
+bak_sample	data	1	8388608
+bak_sample_log	log	2	8388608
+
+# Compressed copy-only fulls: the algorithm, BackupSize and CompressedBackupSize.
+query TTIII
+SELECT compression_algorithm, is_copy_only, backup_size, compressed_size, family_count
+FROM mssql_backup_info('test/data/backup/full_xpress.bak');
+----
+MS_XPRESS	true	4415488	628175	1
+
+query TTIII
+SELECT compression_algorithm, is_copy_only, backup_size, compressed_size, family_count
+FROM mssql_backup_info('test/data/backup/full_zstd.bak');
+----
+ZSTD	true	4415488	589489	1
+
+# A differential's base is its full's checkpoint LSN and backup set GUID.
+query TIT
+SELECT backup_type, differential_base_lsn, differential_base_guid::VARCHAR
+FROM mssql_backup_info('test/data/backup/diff.bak');
+----
+differential	44000000207200001	71111bc0-b06c-4d1a-9655-20fffb61d2ea
+
+query TIII
+SELECT backup_type, first_lsn, last_lsn, database_backup_lsn
+FROM mssql_backup_info('test/data/backup/log.trn');
+----
+log	44000000207200001	44000000303200001	44000000207200001
+
+# A striped set, given in either order: LABELONLY's media set and family count, the summed sizes.
+query IIIT
+SELECT family_count, backup_size, compressed_size, media_set_guid::VARCHAR
+FROM mssql_backup_info(['test/data/backup/stripe_2.bak', 'test/data/backup/stripe_1.bak']);
+----
+2	4436992	4436992	956ff4f0-cd28-4605-b359-40e4e7f74bde
+
+# A compressed striped set: the media label in each container's header, and CompressedBackupSize.
+query IIIT
+SELECT family_count, backup_size, compressed_size, media_set_guid::VARCHAR
+FROM mssql_backup_info('test/data/backup/stripe_zstd_*.bak');
+----
+2	4436992	599991	1f0bd120-c657-48f8-b5ed-d48e912a01de
+
+# One family of a striped set alone is refused, naming the missing one.
+statement error
+SELECT * FROM mssql_backup_info('test/data/backup/stripe_1.bak');
+----
+FamilySequenceNumber 2 are missing
+
+# The same compressed family twice is two families 1.
+statement error
+SELECT * FROM mssql_backup_info(['test/data/backup/full_zstd.bak', 'test/data/backup/./full_zstd.bak']);
+----
+are both family 1

@@ -69,7 +69,7 @@ the specs it affects. **Blocking** means the named PR cannot open until the ques
 | DQ-33 | whether the automatic policy also compacts | **decided** (owner, 2026-11-05): no, expiry only; compaction is DuckLake's own | — |
 | DQ-34 | the run id in file names | keep it | 022 |
 | DQ-35 | the helper naming family | keep as drafted | 022–024 |
-| DQ-36 | committed samples or a release asset | committed, ≤ 2 MB each, ≤ 16 MB in all | 085 PR 1 |
+| DQ-36 | committed samples or a release asset | committed, ≤ 16 MB in all; **decided** (owner, 2026-11-10): three samples over 2 MB accepted (a plain full 4.4 MB, a plain stripe 2 × 2.2 MB: a database's system tables alone are ~3 MB), 12.9 MB in all, ~3 MB in git | — |
 | DQ-37 | `backup_<component>.cpp` source names | yes | 085 PR 1 |
 | DQ-41 | how a striped or compressed pass is indexed | **decided** (owner, 2026-11-09): searched, not read (E13: every pass ascending, a container's block = one extent group); samples kept; the header scan only for pass 2, a differential's pass and a pass whose order breaks; a container is walked from known blocks by default (rows can forge a resync), resync search under `trust_layout := true` (085 D4a, task 7a) | — |
 | DQ-40 | which pages are a table's | **decided** (owner, 2026-11-09): its AU's IAM chain, walked at the table's first scan through the page store; the page header checked at read; a differential's own pages by their header AU; an ATTACH reads the headers, allocation and catalog pages only (085 D4, D4a) | — |
@@ -576,6 +576,11 @@ Affects 022–024. It is the mssql-ducklake README's question 2.
 **Recommendation: committed samples**, at most 2 MB each and 16 MB in all, each with its generator, its
 HEADERONLY output and golden results. Reason: `make test` and the fuzz seeds then work offline on every
 platform. Only synthetic data made on a clean instance is ever committed (T4).
+
+**Decided (owner, 2026-11-10):** the samples of `test/data/backup/` (made on a throwaway clean
+instance by its `generate.sh`) are committed as they came: 12.9 MB in all, three of them over 2 MB (a
+plain full of the smallest database is ~4.4 MB, its system tables ~3 MB), about 3 MB once git
+compresses them.
 
 ### DQ-37 — `backup_<component>.cpp` source names?
 

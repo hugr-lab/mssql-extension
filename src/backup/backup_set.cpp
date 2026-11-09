@@ -14,6 +14,8 @@ static constexpr size_t MAX_HEADER_STREAM = 1 << 20;
 static constexpr size_t MAX_RAID_STREAM = 4096;
 // The SCIN fields read below end at +270.
 static constexpr size_t SCIN_MIN = 270;
+// CompressedBackupSize, a u64 past the fixed part (444-byte SCIN records in 2025; a shorter one has none).
+static constexpr size_t SCIN_COMPRESSED_SIZE_AT = 344;
 // An SFIN's fixed part ends at +202 (UniqueId).
 static constexpr size_t SFIN_MIN = 202;
 // A compressed container's soft filemark (spec 085 § Rules, MSSQLBAK).
@@ -210,6 +212,10 @@ static void ReadTrailer(const RandomAccess &file, const MtfBlock &msls, BackupSe
 		if (tag == "SCIN") {
 			if (length < SCIN_MIN) {
 				mqci.Fail(at, "a SCIN record of " + std::to_string(length) + " bytes, shorter than its fixed part");
+			}
+			if (length >= SCIN_COMPRESSED_SIZE_AT + 8) {
+				set.compressed_backup_size = record.U64(SCIN_COMPRESSED_SIZE_AT);
+				set.has_compressed_backup_size = true;
 			}
 			set.database_name = ReadRecordString(record, 104);
 			set.server_name = ReadRecordString(record, 108);

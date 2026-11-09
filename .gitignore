@@ -43,6 +43,9 @@ Thumbs.db
 *.tmp
 *.log
 *.bak
+# The committed backup samples (spec 085 task 10): synthetic, made on a clean instance by
+# test/data/backup/generate.sh. No other .bak is ever committed (spec 085 T4).
+!test/data/backup/*.bak
 
 # Environment
 .env

@@ -1,0 +1,3 @@
+MediaName|MediaSetId|FamilyCount|FamilySequenceNumber|MediaFamilyId|MediaSequenceNumber|MediaLabelPresent|MediaDescription|SoftwareName|SoftwareVendorId|MediaDate|MirrorCount|IsCompressed
+---------|----------|-----------|--------------------|-------------|-------------------|-----------------|----------------|------------|----------------|---------|-----------|------------
+NULL|1F0BD120-C657-48F8-B5ED-D48E912A01DE|2|1|011DEADB-0000-0000-0000-000000000000|1|0|NULL|Microsoft SQL Server|4608|2026-11-09 22:35:30.000|1|1

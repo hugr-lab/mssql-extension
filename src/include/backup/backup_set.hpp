@@ -138,6 +138,11 @@ struct BackupSetHeader {
 	uint64_t backup_size = 0;
 	//! The bytes of the log tail (the MQTL streams' data).
 	uint64_t log_tail_bytes = 0;
+	//! HEADERONLY's CompressedBackupSize: a u64 at trailer SCIN +344 (task 9: on every truth,
+	//! compressed and plain, striped included), the whole set's value in every family; for a plain
+	//! backup it equals the BackupSize. Unknown on a SCIN too short to hold it.
+	uint64_t compressed_backup_size = 0;
+	bool has_compressed_backup_size = false;
 
 	//! HEADERONLY's FirstRecoveryForkID: the parent fork for a log backup that spans the fork point,
 	//! else the current fork.

@@ -201,10 +201,10 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 	row.push_back(Value(LogicalType::BLOB));
 	row.push_back(Value::BOOLEAN(checksums));
 	row.push_back(Value::BIGINT(static_cast<int64_t>(backup_size)));
-	// HEADERONLY's CompressedBackupSize is the BackupSize for a plain backup. For a compressed one it is
-	// not located: four truths match neither the file's size, the blocks' payloads (with or without
-	// their headers) nor the chain's end, so it is NULL rather than a number that looks right.
-	row.push_back(opened.Compressed() ? Value(LogicalType::BIGINT) : Value::BIGINT(static_cast<int64_t>(backup_size)));
+	// HEADERONLY's CompressedBackupSize, as the trailer records it (SCIN +344): the set's value, alike in
+	// every family (checked when the families were opened); NULL on a SCIN too short to hold it.
+	row.push_back(set.has_compressed_backup_size ? Value::BIGINT(static_cast<int64_t>(set.compressed_backup_size))
+												 : Value(LogicalType::BIGINT));
 	row.push_back(Value(LogicalType::BIGINT));	// page_count: the allocation pages (PR 2)
 	row.push_back(Value::BIGINT(static_cast<int64_t>(log_tail)));
 	row.push_back(Value(LogicalType::BOOLEAN));	 // consistent: D11 (PR 5)
