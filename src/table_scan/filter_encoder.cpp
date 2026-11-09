@@ -331,6 +331,25 @@ static bool IsTruncatedReadColumn(const MSSQLColumnInfo *column) {
 						 KeyFidelity::NotRoundTrip;
 }
 
+//! IS [NOT] NULL on the filter's own column: what a column read through a cast may still push
+//! (issue #514), since the cast is NULL exactly when the column is.
+static bool IsNullTestFilter(const TableFilter &filter) {
+	if (filter.filter_type == TableFilterType::LEGACY_IS_NULL ||
+		filter.filter_type == TableFilterType::LEGACY_IS_NOT_NULL) {
+		return true;
+	}
+	if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
+		return false;
+	}
+	const auto &expr = filter.Cast<ExpressionFilter>().expr;
+	if (!expr || (expr->GetExpressionType() != ExpressionType::OPERATOR_IS_NULL &&
+				  expr->GetExpressionType() != ExpressionType::OPERATOR_IS_NOT_NULL)) {
+		return false;
+	}
+	const auto &children = expr->Cast<BoundOperatorExpression>().GetChildren();
+	return children.size() == 1 && children[0]->GetExpressionClass() == ExpressionClass::BOUND_REF;
+}
+
 //! A column whose value DuckDB reads is not the server's (issue #426).
 static bool IsLossyReadColumn(const MSSQLColumnInfo *column) {
 	return IsDatetimeColumn(column) || IsTruncatedReadColumn(column);
@@ -640,6 +659,18 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 		std::string escaped_col = mssql::QuoteIdentifier(col_name);
 		ctx.filter_column_info =
 			(mssql_columns && table_col_idx < mssql_columns->size()) ? &(*mssql_columns)[table_col_idx] : nullptr;
+
+		// Issue #514: a column read through a cast (sql_variant, hierarchyid, a CLR type) is
+		// compared in DuckDB as the text the cast gave, and on the server as itself, by its own
+		// rules: an int 5 in a sql_variant is not N'5' there. The filter runs in DuckDB, over
+		// what DuckDB read.
+		if (ctx.filter_column_info && ctx.filter_column_info->is_cast_required &&
+			!IsNullTestFilter(filter_entry.Filter())) {
+			MSSQL_FILTER_DEBUG_LOG(2, "  %s is read through a cast: filtered in DuckDB", col_name.c_str());
+			result.needs_duckdb_filter = true;
+			result.unhandled.emplace_back(projected_col_idx, &filter_entry.Filter());
+			continue;
+		}
 
 		MSSQL_FILTER_DEBUG_LOG(2, "  encoding filter for column: projected_idx=%llu -> table_idx=%llu -> %s",
 							   (unsigned long long)projected_col_idx, (unsigned long long)table_col_idx,
@@ -1158,6 +1189,7 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 			return {"", false};
 		}
 		auto child_ctx = ctx.child();
+		child_ctx.null_test_operand = true;
 		auto child_result = EncodeValueExpression(*expr.GetChildren()[0], child_ctx);
 		if (!child_result.supported) {
 			return {"", false};
@@ -1170,6 +1202,7 @@ ExpressionEncodeResult FilterEncoder::EncodeOperatorExpression(const BoundOperat
 			return {"", false};
 		}
 		auto child_ctx = ctx.child();
+		child_ctx.null_test_operand = true;
 		auto child_result = EncodeValueExpression(*expr.GetChildren()[0], child_ctx);
 		if (!child_result.supported) {
 			return {"", false};
@@ -1400,6 +1433,9 @@ ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpres
 		if (!ctx.resolver->Resolve(expr, sql, column)) {
 			return {"", false};
 		}
+		if (column && column->is_cast_required && !ctx.null_test_operand) {
+			return {"", false};	 // issue #514: compared as itself on the server, as text here
+		}
 		return {sql, true};
 	}
 
@@ -1451,6 +1487,14 @@ ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpres
 	if (table_col_idx >= ctx.column_names.size()) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeColumnRef: table column index %llu out of range (table has %zu)",
 							   (unsigned long long)table_col_idx, ctx.column_names.size());
+		return {"", false};
+	}
+
+	// Issue #514, as in Encode: a column read through a cast is not compared on the server.
+	if (ctx.mssql_columns && table_col_idx < ctx.mssql_columns->size() &&
+		(*ctx.mssql_columns)[table_col_idx].is_cast_required && !ctx.null_test_operand) {
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeColumnRef: column %llu is read through a cast, not pushed",
+							   (unsigned long long)table_col_idx);
 		return {"", false};
 	}
 
