@@ -142,6 +142,8 @@ set(EXTENSION_SOURCES
     src/codec/uuid_codec.cpp
     # Backup reader (spec 085): the parsers over byte spans, DuckDB-free (D15).
     src/backup/backup_bytes.cpp
+    src/backup/backup_ranges.cpp
+    src/backup/backup_source.cpp
     # SQL Server code pages (spec 091): the server-generated tables and the decode kernels.
     src/codec/code_page/code_page.cpp
     src/codec/code_page/code_page_avx2.cpp
