@@ -205,7 +205,7 @@ open-pass and memory bounds.
 | E7 | partitioning in a backup | 085 (the partition model), 089 (ownership rule, maintenance evidence), mssql-ducklake 022 / 023 | — | **done** (`research/experiments/E7-partitioning.md`), integrated |
 | E9 | the 2025 `json` binary, decoded and gated against `CAST(j AS nvarchar(max))` | 086 | 1–2 wk | planned |
 | E10 | the log tail of a TDE backup | 087, 090 | 3–5 d | planned |
-| E12 | does a full backup's first pass carry exactly the GAM-allocated extents, in order (so the open reads the allocation pages, not every page) | 085 (D4a, task 7) | 1.5 d | planned, inside 085's total |
+| E12 | does a full backup's first pass carry exactly the GAM-allocated extents, in order (so the open reads the allocation pages, not every page) | 085 (D4a, task 7) | 1.5 d | **done** (`research/experiments/E12-gam-rank.md`): yes for one media family, 56 of 56 fulls; not per family on a striped set |
 | E11 | columnstore in differentials (incl. a partitioned CCI's SPLIT / MERGE, a SWITCH with an OPEN delta store, rowgroup id reuse), and the tuple mover during a backup | 088, 089 | 3.5 d | planned |
 
 (E8, the import commit cost, was not run, R§12.) R§12 lists E9–E11 as planned; E12 joined with 085 D4a (2026-11-09).

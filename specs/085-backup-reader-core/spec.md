@@ -166,10 +166,14 @@ Out, each refused by name until its spec lands:
     anyway (and skips the index pages there); D11's check (iv) reads the few pages the log tail names.
     Spec 089's changed set (`m_lsn > since_lsn` on every live page, 089 D3) is computed by 089's own
     pass over the page headers when `since_lsn` is given, not stored in this index.
-  - **E12 (planned, before task 7)**: whether a full backup's first pass carries exactly the
-    GAM-allocated extents, in order. If it does, the open pass reads the allocation pages and the
-    MTF headers instead of every page (the open of a 10 TB backup without reading 10 TB); if not, the
-    pass reads every page header, as above.
+  - **E12 (done, `research/experiments/E12-gam-rank.md`)**: a single-family full backup's first pass
+    is one 8-unit group per extent of (GAM-allocated extents ∪ allocation-page extents), in ascending
+    (file, extent) order, then pad groups only (56 of 56 fulls, compressed and under load included
+    **(2025)**). So the open of such a backup reads the allocation pages (the file headers, the GAMs,
+    the PFS pages, at ranks the GAMs give: about 1.3 GB for 10 TB) and the MTF headers, not every
+    page; the extent bitmap is the GAM's. Pass 2, a differential's pass and a striped set (whose
+    extents are split between families at run time) are indexed from their page headers, one per
+    8-unit group. The rule is checked where the reader reads a group, never trusted blindly.
   - **A saved index is a later option**, not part of 085: written to a path the user names
     (`temp_directory` does not outlive the process), keyed by `BackupSetGUID`, the families' sizes and
     version tags.
@@ -566,7 +570,8 @@ Byte offsets are from the experiments; each is **(2025)** unless marked otherwis
   MAXTRANSFERSIZE 64 KB / 4 MB, stripes, logs, task 3) **(2025)**: a DBLK that does not validate where
   the previous one ended is a named error.
 - SQL Server's sequence: `TAPE SFMB SSET VOLB MSCI MSDA MSDA MSTL… MSLS SFMB ESET ESET SFMB` (X§3).
-  MQDA = a 2-byte lead-in (`length mod 8192`) then 8 KB units, page-aligned in the file; an MQDA of
+  MQDA = a 2-byte lead-in (`length mod 8192`) then 8 KB units, right after the lead-in and **not**
+  8 KB-aligned in the file (E12: two files start their units at offset 20,480); an MQDA of
   0 bytes with media attribute 0x6 marks the end of data. The first MSDA is pass 1, the second pass 2.
   All data files share one MSDA per pass, in `file_id` order (E2 R9). MQTL = a 2-byte lead-in then log
   blocks. The trailer SCIN in MSLS carries the LSNs; the copy in MSCI does not (E1§3).
