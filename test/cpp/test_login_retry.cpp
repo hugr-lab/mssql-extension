@@ -1,6 +1,6 @@
 // Issue #481: RetryTransientLogin, driven by a fake clock with no server.
 //
-// A login Azure SQL refuses with 40613 / 40197 / 40501 / 49918 is tried again, the pause 1 s
+// A login Azure SQL refuses with 40613 / 40197 / 40143 / 40501 / 49918 / 42109 is tried again, the pause 1 s
 // doubling to 10 s, until the caller's login timeout would run out before the next try; any
 // other refusal (18456) fails at once; Ctrl-C ends the wait.
 
@@ -50,11 +50,12 @@ struct FakeClock {
 int main() {
 	std::cout << "RetryTransientLogin (issue #481)" << std::endl;
 
-	Check(IsTransientLoginError(40613) && IsTransientLoginError(40197) && IsTransientLoginError(40501) &&
-			  IsTransientLoginError(49918),
+	Check(IsTransientLoginError(40613) && IsTransientLoginError(40197) && IsTransientLoginError(40143) &&
+			  IsTransientLoginError(40501) && IsTransientLoginError(49918) && IsTransientLoginError(42109),
 		  "the transient numbers");
-	Check(!IsTransientLoginError(18456) && !IsTransientLoginError(0) && !IsTransientLoginError(4060),
-		  "not a login failure, a socket error (0) or a missing database");
+	Check(!IsTransientLoginError(18456) && !IsTransientLoginError(0) && !IsTransientLoginError(4060) &&
+			  !IsTransientLoginError(42108),
+		  "not a login failure, a socket error (0), a missing database or a paused pool (42108)");
 
 	{
 		FakeClock clock;
@@ -124,6 +125,22 @@ int main() {
 			interrupted = true;
 		}
 		Check(interrupted && attempts == 1 && clock.slept == 50, "Ctrl-C ends the pause within one 50 ms slice");
+	}
+
+	{
+		// Review of #543: the pause stops doubling at 10 s.
+		FakeClock clock;
+		int attempts = 0;
+		std::function<int()> attempt = [&]() -> int {
+			attempts++;
+			if (attempts < 7) {
+				ThrowLoginRefused(40613, "Database 'db' is not currently available");
+			}
+			return 1;
+		};
+		RetryTransientLogin<int>(attempt, 120000, clock.Hooks());
+		const std::vector<int> expected = {1000, 2000, 4000, 8000, 10000, 10000};
+		Check(attempts == 7 && clock.waits == expected, "pauses of 1, 2, 4, 8 s, then 10 s and no longer");
 	}
 
 	std::cout << (failures ? "FAILED: " + std::to_string(failures) + " check(s)" : "all checks passed") << std::endl;

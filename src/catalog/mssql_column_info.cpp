@@ -577,6 +577,15 @@ string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string
 	// or a real its 17 digits, 2 a money its four decimals, 126 the date/time family ISO 8601
 	// with every fraction digit, 1 a binary its 0x hex; the rest are exact under style 0. One
 	// style cannot serve a column whose type lives in each value (126 refuses a varbinary, 9809).
+	// The styles hold on SQL Server 2025 (local), 2022 (the CI lane) and 2019 (15.0.4500,
+	// sql_variant_read.test run against it; time(0/3/7) and datetimeoffset by 126 alike).
+	// Cost (review of #542, 1M rows of int / float / datetime2 / nvarchar, server under Rosetta):
+	// 7.7 s of server CPU against 0.87 s for the plain cast. Each comparison of the base type
+	// calls SQL_VARIANT_PROPERTY again (an IN of n names is n calls, and the server does not
+	// share them), so a value of a type no WHEN names pays twelve. Six other forms were measured
+	// (no cast, a BIN2 compare, a derived table, a CHARINDEX position, a two-level tree, a single
+	// guard): none was cheaper than 5%. Decoding sql_variant on the wire (#515) removes the
+	// CASE; until then the cost is a sql_variant column's only, and the plain cast lost data.
 	if (StringUtil::Lower(sql_type_name) == "sql_variant") {
 		const string base_type = "CAST(SQL_VARIANT_PROPERTY(" + reference + ", 'BaseType') AS NVARCHAR(128))";
 		const auto styled = [&](const char *style) {
