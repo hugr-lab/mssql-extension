@@ -59,6 +59,8 @@ public:
 	bool Contains(uint32_t extent) const;
 	//! Extents of the set below `extent`. Valid after Seal().
 	uint64_t Rank(uint32_t extent) const;
+	//! The extent of rank `rank` (0-based) in the set, or false past its count. Valid after Seal().
+	bool Select(uint64_t rank, uint32_t &extent) const;
 	//! Builds the rank directory; no Add after it.
 	void Seal();
 	uint64_t Count() const {
@@ -91,7 +93,7 @@ public:
 			while (bits) {
 				unsigned b = 0;
 				while (!((bits >> b) & 1)) {
-					b++;  // portable; this walk runs only when a ranked map turns into runs
+					b++;  // portable; the conversion to runs is the only caller
 				}
 				f(static_cast<uint32_t>(w * 64 + b));
 				bits &= bits - 1;
@@ -122,7 +124,9 @@ public:
 
 private:
 	friend PassMap BuildPassMap(const RandomAccess &, uint64_t, uint64_t, uint32_t);
+	friend bool BuildRankedPassMap(const RandomAccess &, uint64_t, uint64_t, PassMap &, uint64_t *);
 	friend class PassMapBuilder;
+	friend class RankedPassBuilder;
 
 	bool ranked_ = false;
 	uint64_t groups_ = 0;
@@ -139,6 +143,18 @@ private:
 //! headers: each group's extent from its first page (every page of a group must name that extent
 //! at its own position, else a FormatError). Ranked when the order allows, runs otherwise.
 PassMap BuildPassMap(const RandomAccess &stream, uint64_t offset, uint64_t length, uint32_t number);
+
+//! Pass 1 of a full backup on one media family, mapped from its allocation pages alone (E12): the
+//! pass is one group per extent of (GAM-allocated extents below the file's Size, plus the extents
+//! of the allocation pages), ascending by (file, extent), then pad groups. Reads each file's
+//! group 0 (file header, GAM), the group of every later GAM, and a few groups more to check the
+//! rule, not every group. False when anything read disagrees with the rule, or a read fails: the
+//! caller then maps the pass by its headers (BuildPassMap). `groups_read`, when given, counts the
+//! groups it read. One difference from the header scan, harmless: a GAM-allocated extent whose
+//! pages are all unallocated is a group of zero units, which this path counts as carried (Locate
+//! then returns zero units, which hold no row) and the header scan as empty.
+bool BuildRankedPassMap(const RandomAccess &stream, uint64_t offset, uint64_t length, PassMap &map,
+						uint64_t *groups_read = nullptr);
 
 //! Where a page's latest copy lies.
 struct PageLocation {
@@ -157,12 +173,14 @@ public:
 	size_t MemoryBytes() const;
 
 private:
-	friend PageIndex BuildPageIndex(const RandomAccess &, const MtfLayout &);
+	friend PageIndex BuildPageIndex(const RandomAccess &, const MtfLayout &, bool);
 	std::vector<PassMap> passes_;
 };
 
-//! Every data pass of `layout` (each MSDA block's MQDA streams), mapped by BuildPassMap.
-PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout);
+//! Every data pass of `layout` (each MSDA block's MQDA streams), mapped by BuildPassMap; with
+//! `rank_first_pass` (a full backup on one media family, the caller's to say) pass 1 is tried
+//! by BuildRankedPassMap first.
+PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout, bool rank_first_pass = false);
 
 }  // namespace backup
 }  // namespace mssql

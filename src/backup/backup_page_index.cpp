@@ -81,6 +81,43 @@ uint64_t ExtentBitmap::Rank(uint32_t extent) const {
 	return rank;
 }
 
+bool ExtentBitmap::Select(uint64_t rank, uint32_t &extent) const {
+	if (!sealed_ || rank >= count_) {
+		return false;
+	}
+	// The last directory block whose count is <= rank, then word by word, then bit by bit.
+	size_t lo = 0;
+	size_t hi = directory_.size() - 1;	// the last entry is the total
+	while (hi - lo > 1) {
+		const size_t mid = lo + (hi - lo) / 2;
+		if (directory_[mid] <= rank) {
+			lo = mid;
+		} else {
+			hi = mid;
+		}
+	}
+	uint64_t seen = directory_[lo];
+	for (size_t w = lo * DIRECTORY_WORDS; w < words_.size(); w++) {
+		const uint64_t bits = words_[w];
+		const uint64_t in_word = static_cast<uint64_t>(PopCount(bits));
+		if (seen + in_word <= rank) {
+			seen += in_word;
+			continue;
+		}
+		uint64_t rest = bits;
+		for (unsigned b = 0; b < 64; b++) {
+			if ((rest >> b) & 1) {
+				if (seen == rank) {
+					extent = static_cast<uint32_t>(w * 64 + b);
+					return true;
+				}
+				seen++;
+			}
+		}
+	}
+	return false;
+}
+
 bool PassMap::Find(const ExtentId &extent, uint64_t &group) const {
 	if (ranked_) {
 		auto at = std::lower_bound(files_.begin(), files_.end(), extent.file);
@@ -318,6 +355,228 @@ PassMap BuildPassMap(const RandomAccess &stream, uint64_t offset, uint64_t lengt
 	return map;
 }
 
+// Allocation-page layout (spec 085 § Rules, allocation): PFS pages at 1 and every 8,088 pages;
+// GAM / SGAM / DCM / BCM at +2 / +3 / +6 / +7 of every 511,232-page interval, whose GAM covers
+// 63,904 extents with a 7,988-byte bitmap at page offset 194 (bit set = free); the boot page at 9.
+static constexpr uint32_t PFS_INTERVAL = 8088;
+static constexpr uint32_t GAM_INTERVAL_PAGES = 511232;
+static constexpr uint32_t GAM_INTERVAL_EXTENTS = GAM_INTERVAL_PAGES / PAGES_PER_EXTENT;
+static constexpr size_t GAM_BITMAP_AT = 194;
+static constexpr size_t GAM_BITMAP_BYTES = 7988;
+static constexpr uint8_t PAGE_TYPE_FILE_HEADER = 15;
+static constexpr uint8_t PAGE_TYPE_GAM = 8;
+// The file header page (page 0): its slot 0 record holds u16 file id +167, u32 Size (pages) +171.
+static constexpr size_t FILE_HEADER_ID_AT = 167;
+static constexpr size_t FILE_HEADER_SIZE_AT = 171;
+// Groups checked beside the ones the rule needs, spread over each file; a checked group of zero
+// units only (an allocated extent with no allocated page) names nothing, so the next one is read,
+// at most this many times.
+static constexpr uint32_t RANK_CHECKS_PER_FILE = 16;
+static constexpr uint32_t RANK_CHECK_STEPS = 8;
+
+namespace {
+
+//! One group read from the pass: its 8 units, and the extent its pages name (if any).
+struct ReadGroup {
+	std::vector<uint8_t> bytes;
+	bool has_extent = false;
+	bool is_pad = true;	 // every unit a pad
+	ExtentId extent;
+};
+
+//! Reads group `g` of a pass of `groups` groups: false when `g` is past the pass or its units are
+//! not pages, pads and zero units at their positions.
+bool ReadPassGroup(const RandomAccess &stream, uint64_t units_offset, uint64_t groups, uint64_t g, ReadGroup &out) {
+	if (g >= groups) {
+		return false;
+	}
+	out.bytes.resize(GROUP_BYTES);
+	stream.ReadAt(units_offset + g * GROUP_BYTES, out.bytes.data(), GROUP_BYTES);
+	out.has_extent = false;
+	out.is_pad = true;
+	for (uint32_t k = 0; k < PAGES_PER_EXTENT; k++) {
+		const uint8_t *unit = out.bytes.data() + static_cast<size_t>(k) * PAGE_SIZE;
+		if (unit[0] == PAGE_HEADER_VERSION && unit[1] == PAGE_TYPE_PAD) {
+			continue;
+		}
+		out.is_pad = false;
+		if (unit[0] == 0) {
+			continue;  // a zero unit (BuildPassMap checks its bytes; this path checks the shape)
+		}
+		if (unit[0] != PAGE_HEADER_VERSION) {
+			return false;
+		}
+		ByteReader r(unit, HEADER_READ, "a page header", units_offset + g * GROUP_BYTES + k * PAGE_SIZE);
+		const uint32_t page = r.U32(32);
+		ExtentId e;
+		e.file = r.U16(36);
+		e.extent = page / PAGES_PER_EXTENT;
+		if (page % PAGES_PER_EXTENT != k || (out.has_extent && !(e == out.extent))) {
+			return false;
+		}
+		out.extent = e;
+		out.has_extent = true;
+	}
+	return true;
+}
+
+//! Page `page_in_extent` of a read group when it is a page of type `type`, else null.
+const uint8_t *GroupPage(const ReadGroup &g, uint32_t page_in_extent, uint8_t type) {
+	const uint8_t *unit = g.bytes.data() + static_cast<size_t>(page_in_extent) * PAGE_SIZE;
+	return unit[0] == PAGE_HEADER_VERSION && unit[1] == type ? unit : nullptr;
+}
+
+//! Adds interval `interval`'s extents of a file of `size` pages, in order: its allocation pages'
+//! extents (the PFS pages in it, its own first extent, the boot page's in interval 0) and the
+//! extents its GAM marks allocated. Every extent added is below the next interval's first.
+void AddInterval(uint32_t size, uint32_t interval, const uint8_t *gam_bits, ExtentBitmap &bitmap) {
+	const uint64_t first_page = static_cast<uint64_t>(interval) * GAM_INTERVAL_PAGES;
+	const uint64_t end_page = std::min<uint64_t>(first_page + GAM_INTERVAL_PAGES, size);
+	std::vector<uint32_t> extents;
+	extents.push_back(static_cast<uint32_t>(first_page / PAGES_PER_EXTENT));  // pages 0..7: header, PFS, GAM, ...
+	if (interval == 0 && size > 9) {
+		extents.push_back(9 / PAGES_PER_EXTENT);  // the boot page's extent
+	}
+	// PFS pages: page 1, then every multiple of 8088.
+	for (uint64_t p = (first_page / PFS_INTERVAL + 1) * PFS_INTERVAL; p < end_page; p += PFS_INTERVAL) {
+		extents.push_back(static_cast<uint32_t>(p / PAGES_PER_EXTENT));
+	}
+	const uint32_t first_extent = interval * GAM_INTERVAL_EXTENTS;
+	for (uint32_t i = 0; i < GAM_INTERVAL_EXTENTS; i++) {
+		// An extent that starts at or past Size is not copied (E12).
+		if (static_cast<uint64_t>(first_extent + i) * PAGES_PER_EXTENT >= size) {
+			break;
+		}
+		if (!((gam_bits[i / 8] >> (i % 8)) & 1)) {
+			extents.push_back(first_extent + i);
+		}
+	}
+	std::sort(extents.begin(), extents.end());
+	for (uint32_t e : extents) {
+		bitmap.Add(e);
+	}
+}
+
+}  // namespace
+
+//! The rank path's body (a friend of PassMap): false when the rule does not hold.
+class RankedPassBuilder {
+public:
+	static bool Build(const RandomAccess &stream, PassMap &result, uint64_t &reads);
+};
+
+bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint64_t &reads) {
+	ReadGroup g;
+	uint64_t file_group = 0;  // the group of the current file's extent 0
+	uint16_t last_file = 0;
+	while (file_group < result.groups_) {
+		if (!ReadPassGroup(stream, result.units_offset, result.groups_, file_group, g)) {
+			return false;
+		}
+		reads++;
+		if (g.is_pad) {
+			break;	// the pass's trailing pads: every file is mapped
+		}
+		// Group 0 of a file: its extent 0, the file header (page 0) and the first GAM (page 2).
+		const uint8_t *header = GroupPage(g, 0, PAGE_TYPE_FILE_HEADER);
+		const uint8_t *gam = GroupPage(g, 2, PAGE_TYPE_GAM);
+		if (!g.has_extent || g.extent.extent != 0 || !header || !gam ||
+			(!result.files_.empty() && g.extent.file <= last_file)) {
+			return false;
+		}
+		const uint16_t file = g.extent.file;
+		ByteReader h(header, PAGE_SIZE, "a file header page", 0);
+		const uint16_t slot0 = h.U16(PAGE_SIZE - 2);
+		if (slot0 < 96 || slot0 + FILE_HEADER_SIZE_AT + 4 > PAGE_SIZE || h.U16(slot0 + FILE_HEADER_ID_AT) != file) {
+			return false;
+		}
+		const uint32_t size = h.U32(slot0 + FILE_HEADER_SIZE_AT);
+		// Every PFS page's extent is copied, so a file has at least size / 8088 extents: one whose
+		// Size the rest of the pass cannot hold is refused before anything is allocated for it.
+		if (size == 0 || size / PFS_INTERVAL + 1 > result.groups_ - file_group) {
+			return false;
+		}
+		ExtentBitmap bitmap;
+		std::vector<uint8_t> gam_copy(gam, gam + PAGE_SIZE);
+		for (uint32_t interval = 0;; interval++) {
+			ByteReader bm(gam_copy.data(), PAGE_SIZE, "a GAM page", 0);
+			AddInterval(size, interval, bm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES), bitmap);
+			if (bitmap.Count() > result.groups_ - file_group) {
+				return false;
+			}
+			const uint64_t next_base = static_cast<uint64_t>(interval + 1) * GAM_INTERVAL_PAGES;
+			if (next_base >= size) {
+				break;
+			}
+			// The next GAM's extent comes after every extent added so far: its rank is their count.
+			const uint32_t next_extent = static_cast<uint32_t>(next_base / PAGES_PER_EXTENT);
+			if (!ReadPassGroup(stream, result.units_offset, result.groups_, file_group + bitmap.Count(), g)) {
+				return false;
+			}
+			reads++;
+			const uint8_t *next_gam = GroupPage(g, 2, PAGE_TYPE_GAM);
+			if (!g.has_extent || g.extent.file != file || g.extent.extent != next_extent || !next_gam) {
+				return false;
+			}
+			gam_copy.assign(next_gam, next_gam + PAGE_SIZE);
+		}
+		bitmap.Seal();
+		const uint64_t count = bitmap.Count();
+		// Check groups spread over the file: each names the extent its rank gives.
+		for (uint32_t c = 1; c <= RANK_CHECKS_PER_FILE && c < count; c++) {
+			uint64_t rank = (count - 1) * c / RANK_CHECKS_PER_FILE;
+			bool verified = false;
+			for (uint32_t step = 0; step < RANK_CHECK_STEPS && rank < count && !verified; step++, rank++) {
+				uint32_t expected = 0;
+				if (!bitmap.Select(rank, expected) ||
+					!ReadPassGroup(stream, result.units_offset, result.groups_, file_group + rank, g)) {
+					return false;
+				}
+				reads++;
+				if (g.is_pad || (g.has_extent && (g.extent.file != file || g.extent.extent != expected))) {
+					return false;
+				}
+				verified = g.has_extent;
+			}
+		}
+		result.files_.push_back(file);
+		result.file_first_group_.push_back(file_group);
+		result.bitmaps_.push_back(std::move(bitmap));
+		result.extents_ += count;
+		last_file = file;
+		file_group += count;
+	}
+	return !result.files_.empty();
+}
+
+bool BuildRankedPassMap(const RandomAccess &stream, uint64_t offset, uint64_t length, PassMap &map,
+						uint64_t *groups_read) {
+	if (length < 2 || offset > stream.Size() || length > stream.Size() - offset || (length - 2) % GROUP_BYTES != 0) {
+		return false;
+	}
+	PassMap result;
+	result.number = 0;
+	result.units_offset = offset + 2;
+	result.groups_ = (length - 2) / GROUP_BYTES;
+	uint64_t reads = 0;
+	bool ok = false;
+	try {
+		ok = RankedPassBuilder::Build(stream, result, reads);
+	} catch (FormatError &) {
+		// Something read did not parse: the rule does not hold here; the header scan decides.
+		ok = false;
+	}
+	if (groups_read) {
+		*groups_read = reads;
+	}
+	if (!ok) {
+		return false;
+	}
+	result.ranked_ = true;
+	map = std::move(result);
+	return true;
+}
+
 bool PageIndex::Locate(uint16_t file, uint32_t page, PageLocation &location) const {
 	ExtentId extent;
 	extent.file = file;
@@ -342,7 +601,7 @@ size_t PageIndex::MemoryBytes() const {
 	return bytes;
 }
 
-PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout) {
+PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout, bool rank_first_pass) {
 	PageIndex index;
 	uint32_t number = 0;
 	if (layout.FindAll("SSET").size() > 1) {
@@ -368,6 +627,12 @@ PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout) {
 			}
 		}
 		if (!data) {
+			continue;
+		}
+		PassMap ranked;
+		if (number == 0 && rank_first_pass && BuildRankedPassMap(stream, data->data_offset, data->length, ranked)) {
+			index.passes_.push_back(std::move(ranked));
+			number++;
 			continue;
 		}
 		index.passes_.push_back(BuildPassMap(stream, data->data_offset, data->length, number++));
