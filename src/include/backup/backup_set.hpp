@@ -111,6 +111,10 @@ struct BackupSetHeader {
 	std::string machine_name;
 
 	// The trailer SCIN (MSLS's MQCI).
+	//! HEADERONLY's DatabaseName and ServerName: string descriptors at SCIN +104 / +108 (task 9; 8
+	//! of 8 against HEADERONLY, and in every sample).
+	std::string database_name;
+	std::string server_name;
 	Lsn first_lsn;
 	Lsn last_lsn;
 	Lsn checkpoint_lsn;
@@ -145,6 +149,9 @@ struct BackupSetHeader {
 //! The backup set described by one family file's blocks. Refuses by name a file whose blocks or
 //! records are not where the format puts them (no SSET, no trailer MQCI, a SCIN too short).
 BackupSetHeader ReadBackupSet(const RandomAccess &file, const MtfLayout &layout);
+//! The media fields (TAPE and its RAID stream) of `layout`'s TAPE block into `set`: a plain
+//! family's own, or a compressed container's from its header (WalkMtfTape over ReadContainerTape).
+void ReadMediaFields(const RandomAccess &file, const MtfLayout &layout, BackupSetHeader &set);
 
 }  // namespace backup
 }  // namespace mssql

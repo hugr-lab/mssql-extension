@@ -113,7 +113,7 @@ static MtfStream ReadStreamHeader(const RandomAccess &file, uint64_t offset, con
 	return stream;
 }
 
-static MtfLayout Walk(const RandomAccess &file, bool data_set) {
+static MtfLayout Walk(const RandomAccess &file, bool data_set, bool tape_only = false) {
 	MtfLayout layout;
 	layout.has_tape = !data_set;
 	const uint64_t size = file.Size();
@@ -199,6 +199,9 @@ static MtfLayout Walk(const RandomAccess &file, bool data_set) {
 		}
 		offset = block.end;
 		layout.blocks.push_back(std::move(block));
+		if (tape_only) {
+			break;
+		}
 		if (layout.blocks.size() > MAX_BLOCKS) {
 			throw FormatError(Where(file, offset) + ": more than " + std::to_string(MAX_BLOCKS) +
 							  " descriptor blocks: not a backup SQL Server wrote");
@@ -212,6 +215,10 @@ static MtfLayout Walk(const RandomAccess &file, bool data_set) {
 
 MtfLayout WalkMtf(const RandomAccess &file) {
 	return Walk(file, false);
+}
+
+MtfLayout WalkMtfTape(const RandomAccess &tape) {
+	return Walk(tape, false, true);
 }
 
 MtfLayout WalkMtfDataSet(const RandomAccess &stream) {

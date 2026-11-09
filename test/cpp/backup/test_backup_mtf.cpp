@@ -70,6 +70,9 @@ int main() {
 		Check(set.backup_name == "nightly" && set.description == "a description" && set.user_name == "sa" &&
 				  set.machine_name == "host-1",
 			  "the SSET and VOLB strings");
+		Check(set.database_name == "salesdb" && set.server_name == "srv1",
+			  "the database and server names from the trailer SCIN (+104 / +108)");
+		Check(set.log_tail_bytes == 4096, "the log tail: the MQTL stream's 4098 bytes less its 2-byte lead-in");
 		Check(set.family_count == 2 && set.family_sequence_number == 1 && set.media_family_id == 0xA010F2F3u,
 			  "the RAID stream: family 1 of 2");
 		Check(set.backup_set_guid.ToString() == "23222120-2524-2726-2829-2a2b2c2d2e2f",

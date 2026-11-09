@@ -254,6 +254,32 @@ std::vector<SeekEntry> ReadSeekIndex(const RandomAccess &file, const BlockChain 
 	return entries;
 }
 
+// The container's own TAPE block (E13 follow-up, 16 of 16 containers, 2025): a chain block at 0x1E0
+// of its header, 4 KB of output, whose bytes are the TAPE DBLK an uncompressed family starts with.
+static constexpr uint64_t HEADER_TAPE_AT = 0x1E0;
+
+std::vector<uint8_t> ReadContainerTape(const RandomAccess &file, const BlockDecoder &decoder) {
+	ChainBlock block;
+	if (!ReadBlockHeader(file, HEADER_TAPE_AT, 0, block) ||
+		block.payload > CONTAINER_HEADER - HEADER_TAPE_AT - BLOCK_HEADER) {
+		throw FormatError(Where(file, HEADER_TAPE_AT) +
+						  ": no block holding the media label where every compressed backup keeps it");
+	}
+	auto payload = Read(file, HEADER_TAPE_AT + BLOCK_HEADER, block.payload, "the media label block");
+	std::vector<uint8_t> out(block.output);
+	if (block.Stored()) {
+		std::memcpy(out.data(), payload.data(), block.output);
+	} else if (!decoder) {
+		throw FormatError(Where(file, HEADER_TAPE_AT) + ": a compressed media label, and no decoder for it");
+	} else {
+		decoder(payload.data(), payload.size(), out.data(), block.output);
+	}
+	if (out.size() < 4 || std::memcmp(out.data(), "TAPE", 4) != 0) {
+		throw FormatError(Where(file, HEADER_TAPE_AT) + ": the media label block does not hold a TAPE block");
+	}
+	return out;
+}
+
 bool OpenChainFromTail(const RandomAccess &file, BlockChain &chain, std::vector<SeekEntry> &seek) {
 	const uint64_t size = file.Size();
 	if (size % 4096 != 0 || size < CHAIN_START + TAIL_RECORD_FROM_END) {

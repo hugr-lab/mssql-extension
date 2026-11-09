@@ -211,6 +211,8 @@ static void ReadTrailer(const RandomAccess &file, const MtfBlock &msls, BackupSe
 			if (length < SCIN_MIN) {
 				mqci.Fail(at, "a SCIN record of " + std::to_string(length) + " bytes, shorter than its fixed part");
 			}
+			set.database_name = ReadRecordString(record, 104);
+			set.server_name = ReadRecordString(record, 108);
 			set.first_lsn = ReadLsn(record, 32);
 			set.last_lsn = ReadLsn(record, 42);
 			set.checkpoint_lsn = ReadLsn(record, 52);
@@ -269,26 +271,30 @@ static void ReadTrailer(const RandomAccess &file, const MtfBlock &msls, BackupSe
 	}
 }
 
+void ReadMediaFields(const RandomAccess &file, const MtfLayout &layout, BackupSetHeader &set) {
+	const auto &tape = Require(file, layout, "TAPE");
+	set.media_known = true;
+	ByteReader tape_header(tape.header.data(), tape.header.size(), "the TAPE block", tape.offset);
+	set.media_family_id = tape_header.U32(52);
+	if (auto raid = tape.Stream("RAID")) {
+		auto data = ReadStreamData(file, *raid, MAX_RAID_STREAM);
+		ByteReader r(data.data(), data.size(), "the TAPE block's RAID stream", raid->data_offset);
+		set.media_set_guid = ReadGuid(r, 0);
+		// u16, as E2 checked against LABELONLY: the u16 after it is 1 in every sample; read
+		// as one u32 the two said 65537 for a single family.
+		set.family_count = r.U16(20);
+		set.family_sequence_number = r.U16(24);
+	}
+}
+
 BackupSetHeader ReadBackupSet(const RandomAccess &file, const MtfLayout &layout) {
 	BackupSetHeader set;
 	set.soft_filemark_bytes = layout.soft_filemark_bytes;
 
-	// A compressed container's data set has no TAPE: its media fields stay unknown (media_known).
-	const MtfBlock *tape_block = layout.has_tape ? &Require(file, layout, "TAPE") : nullptr;
-	set.media_known = tape_block != nullptr;
-	if (tape_block) {
-		const auto &tape = *tape_block;
-		ByteReader tape_header(tape.header.data(), tape.header.size(), "the TAPE block", tape.offset);
-		set.media_family_id = tape_header.U32(52);
-		if (auto raid = tape.Stream("RAID")) {
-			auto data = ReadStreamData(file, *raid, MAX_RAID_STREAM);
-			ByteReader r(data.data(), data.size(), "the TAPE block's RAID stream", raid->data_offset);
-			set.media_set_guid = ReadGuid(r, 0);
-			// u16, as E2 checked against LABELONLY: the u16 after it is 1 in every sample; read
-			// as one u32 the two said 65537 for a single family.
-			set.family_count = r.U16(20);
-			set.family_sequence_number = r.U16(24);
-		}
+	// A compressed container's data set has no TAPE: its media fields are read from the
+	// container's header (ReadContainerTape, ReadMediaFields) by the caller.
+	if (layout.has_tape) {
+		ReadMediaFields(file, layout, set);
 	}
 
 	const auto &sset = Require(file, layout, "SSET");
@@ -343,8 +349,9 @@ BackupSetHeader ReadBackupSet(const RandomAccess &file, const MtfLayout &layout)
 
 	for (const auto &block : layout.blocks) {
 		for (const auto &stream : block.streams) {
-			if (stream.id == "MQTL") {
-				set.log_tail_bytes += stream.length;
+			if (stream.id == "MQTL" && stream.length > 2) {
+				// The log's bytes: a stream's 2-byte lead-in is not log (§ Rules, MTF).
+				set.log_tail_bytes += stream.length - 2;
 			}
 		}
 	}

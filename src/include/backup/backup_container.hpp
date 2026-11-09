@@ -108,6 +108,11 @@ std::vector<SeekEntry> ReadSeekIndex(const RandomAccess &file, const BlockChain 
 using BlockDecoder =
 	std::function<void(const uint8_t *payload, size_t payload_size, uint8_t *output, size_t output_size)>;
 
+//! The container's media label: the TAPE block (with its RAID stream: the media set, its family
+//! count and this file's number) that a compressed backup keeps in its header, as a chain block at
+//! 0x1E0 (E13 follow-up, 16 of 16 containers), decoded. Throws when it is not there.
+std::vector<uint8_t> ReadContainerTape(const RandomAccess &file, const BlockDecoder &decoder);
+
 //! The data set as a RandomAccess over the container: a read finds its blocks through the chain
 //! and decodes them (stored blocks are copied; compressed ones go to `decoder`, which may be
 //! empty until tasks 5 / 6, then refused by name). Keeps the last decoded block per instance and

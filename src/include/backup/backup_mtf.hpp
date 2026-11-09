@@ -105,6 +105,9 @@ MtfLayout WalkMtf(const RandomAccess &file);
 //! The blocks of a compressed container's logical stream: the MTF data set, SSET first and no
 //! TAPE or SFMB in it (an SFMB in it is refused). The same strict rules otherwise.
 MtfLayout WalkMtfDataSet(const RandomAccess &stream);
+//! The TAPE block alone at the start of `tape`, its streams to its SPAD: a compressed container
+//! keeps it in its header, outside its data set (E13 follow-up, task 9).
+MtfLayout WalkMtfTape(const RandomAccess &tape);
 
 //! A stream's data, at most `max_bytes` of it (a FormatError when it is longer: a header stream
 //! the format keeps small, read whole).

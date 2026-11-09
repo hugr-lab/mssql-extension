@@ -7,6 +7,7 @@
 // of the data set and its BackupSize, and the refusals (a compressed block with no decoder, an
 // unknown version or flag word, a payload past the end). XPRESS / ZSTD blocks are tasks 5 / 6.
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -370,6 +371,39 @@ int main() {
 		MemoryAccess be("bad_entry.bak", bad_entry.data(), bad_entry.size());
 		Check(ErrorOf([&]() { OpenChainFromTail(be, located, seek); }).find("names no block") != std::string::npos,
 			  "a seek entry that names no block header is refused");
+	}
+
+	{
+		// The media label: a compressed backup keeps its TAPE block in its header, a chain block at
+		// 0x1E0 with 4 KB of output (task 9). Here the "compression" is a copy padded with zeros.
+		Options o;
+		auto image = BuildImage(o);
+		MemoryAccess plain("image", image.data(), image.size());
+		// The TAPE block's bytes up to its SPAD stream's header: the rest is padding, zeros once decoded.
+		const auto plain_layout = WalkMtf(plain);
+		const auto &tape_block = plain_layout.blocks.front();
+		const uint64_t tape_end = tape_block.streams.back().header_offset + 22;
+		auto labelled = packed.file;
+		Bytes header(28, 0);
+		header[0] = 0x21;
+		header[1] = 8;
+		Put16(header, 2, static_cast<uint16_t>(tape_end));
+		std::memcpy(&labelled[0x1E0], header.data(), header.size());
+		std::memcpy(&labelled[0x1E0 + 28], image.data(), static_cast<size_t>(tape_end));
+		MemoryAccess lf("labelled.bak", labelled.data(), labelled.size());
+		BlockDecoder pad = [](const uint8_t *in, size_t n, uint8_t *out, size_t m) {
+			std::memset(out, 0, m);
+			std::memcpy(out, in, std::min(n, m));
+		};
+		auto tape = ReadContainerTape(lf, pad);
+		MemoryAccess label("label", tape.data(), tape.size());
+		auto layout = WalkMtfTape(label);
+		BackupSetHeader set;
+		ReadMediaFields(label, layout, set);
+		Check(tape.size() == 4096 && set.media_known && set.family_count == 2 && set.family_sequence_number == 1,
+			  "the media label in the container's header: its TAPE block and RAID stream (family 1 of 2)");
+		Check(ErrorOf([&]() { ReadContainerTape(file, pad); }).find("media label") != std::string::npos,
+			  "a container header without the media label block is refused by name");
 	}
 
 	std::cout << (failures ? "FAILED: " + std::to_string(failures) + " check(s)" : "all checks passed") << std::endl;

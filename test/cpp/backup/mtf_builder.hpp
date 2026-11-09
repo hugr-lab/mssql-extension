@@ -136,6 +136,8 @@ struct Options {
 	size_t msls_pad_to = 0;
 	bool forked = false;
 	uint32_t sfin_type = 1;
+	//! This file's FamilySequenceNumber in the RAID stream (the media set has two families).
+	uint16_t family_sequence = 1;
 };
 
 inline Bytes BuildImage(const Options &o) {
@@ -148,7 +150,7 @@ inline Bytes BuildImage(const Options &o) {
 	PutGuid(raid, 0, 0x10);
 	Put16(raid, 20, 2);
 	Put16(raid, 22, 1);	 // as every sample has it: a u32 read of +20 would say 65538
-	Put32(raid, 24, 1);
+	Put16(raid, 24, o.family_sequence);
 	const size_t soft_filemark = static_cast<size_t>(o.soft_filemark_units) * 512;
 	AppendBlock(image, "TAPE", tape, {{"RAID", raid}}, soft_filemark);
 	AppendSfmb(image, soft_filemark);
@@ -203,6 +205,17 @@ inline Bytes BuildImage(const Options &o) {
 	PutGuid(scin, 224, 0x70);
 	scin[244] = 0x08;
 	PutLsn(scin, 260, 46, 100, 1);
+	{
+		// DatabaseName and ServerName: descriptors at +104 / +108, the strings past the fixed part.
+		Bytes db = Utf16("salesdb");
+		Bytes server = Utf16("srv1");
+		Put16(scin, 104, static_cast<uint16_t>(db.size()));
+		Put16(scin, 106, 272);
+		std::memcpy(&scin[272], db.data(), db.size());
+		Put16(scin, 108, static_cast<uint16_t>(server.size()));
+		Put16(scin, 110, static_cast<uint16_t>(272 + db.size()));
+		std::memcpy(&scin[272 + db.size()], server.data(), server.size());
+	}
 	scin.resize(o.scin_size);
 	Put32(scin, 4, static_cast<uint32_t>(scin.size()));
 	Bytes sfgi(240, 0);

@@ -448,6 +448,7 @@ Common named parameters of every function, and ATTACH options of the same names:
 | `fuzzy` | setting `mssql_backup_fuzzy` = `'warn'` | D11 |
 | `unsupported_version` | false | D14 |
 | `verify` | false | also cross-check every table's pages against its IAM chain and the positional rule (§ Rules, page index) |
+| `reread` | false | a prepared statement reads the file again on every EXECUTE (the default keeps what its PREPARE read: a backup is opened to be read, and a file being rewritten is invalid while it is) |
 | `trust_layout` | false | DQ-41: in a compressed backup, find blocks by resync from any offset (E13), so the open and a first scan read little of the file; only for a backup whose row data is trusted (§ Security: rows can forge a block chain). Off, a container's blocks are reached only by walking its chain from its start or a seek index entry |
 
 `mssql_backup_info(path)` returns one row per backup set:
@@ -460,17 +461,19 @@ Common named parameters of every function, and ATTACH options of the same names:
 | `backup_set_guid` | `UUID` | SSET +100 (E1§3) |
 | `first_lsn`, `last_lsn`, `checkpoint_lsn`, `database_backup_lsn` | `DECIMAL(25,0)` | trailer SCIN (MSLS / MQCI) +32 / +42 / +52 / +62, 10 bytes each (E1§3) |
 | `differential_base_lsn`, `differential_base_guid` | `DECIMAL(25,0)`, `UUID` | a differential's base: trailer SCIN +260 / +200 (task 3; E1's "+830 / +842" were offsets in the MQCI stream, which move with the SCIN's length, 41 of 41 differentials); NULL for any other backup, as HEADERONLY (a full establishes the base its own `checkpoint_lsn` and `backup_set_guid` name) |
-| `database_name`, `database_version`, `compatibility_level`, `collation`, `family_guid` | | boot page: `dbi_dbname` +52, `dbi_version` +4, `dbi_cmptlevel` +314, `dbi_collation` +392 (name from the collation table), `dbi_familyGUID` +408 (record offsets, X§4) |
+| `database_name`, `server_name` | `VARCHAR` | trailer SCIN string descriptors (u16 byte length, u16 offset) at +104 / +108 (task 9: HEADERONLY's DatabaseName / ServerName on 8 of 8 truths, present in every sample); the boot page's `dbi_dbname` cross-checks the first (task 11) |
+| `database_version`, `compatibility_level`, `collation` | `INTEGER`, `INTEGER`, `VARCHAR` | boot page: `dbi_version` +4, `dbi_cmptlevel` +314, `dbi_collation` +392 (name from the collation table) (record offsets, X§4); NULL until task 11 reads the boot page |
+| `family_guid` | `UUID` | trailer SCIN +224 (task 3); the boot page's `dbi_familyGUID` +408 cross-checks it |
 | `recovery_fork_id`, `first_recovery_fork_id`, `fork_point_lsn`, `binding_id` | `UUID`, `UUID`, `DECIMAL(25,0)`, `UUID` | located (task 3, § Rules, header fields): trailer SCIN +156 `RecoveryForkID`, +124 `BindingID`; +172 (10-byte LSN) and +184 (GUID) the fork point and the parent fork, set once the database was restored with recovery; HEADERONLY's `FirstRecoveryForkID` / `ForkPointLSN` are derived from them. The chain check compares the file's fork with the lake's and fails closed: until the fork id is read every apply by LSN, a differential or a full applied incrementally, is refused (089 D7, 023 C1) |
 | `backup_name`, `description`, `user_name`, `machine_name`, `software_version` | `VARCHAR` | SSET strings, VOLB machine name, SSET software major / minor (X§3) |
 | `database_creation_date`, `backup_start_date`, `backup_finish_date` | `TIMESTAMP` | located (task 3): trailer SCIN +72 / +77 / +82, MTF dates (5 bytes, big-endian bit fields), as HEADERONLY prints them (server local time) |
-| `media_set_guid`, `family_count`, `family_sequence_number` | | TAPE's RAID stream +0 / u16 +20 / u16 +24 (E2 layouts, checked against LABELONLY; the u16 at +22 is 1 in every sample, perhaps its MirrorCount) |
+| `media_set_guid`, `family_count`, `family_sequence_number` | `UUID`, `INTEGER`, `INTEGER` | TAPE's RAID stream +0 / u16 +20 / u16 +24 (E2 layouts, checked against LABELONLY; the u16 at +22 is 1 in every sample, perhaps its MirrorCount); the sequence number only when one family is given (a whole set has none). A compressed container's data set has no TAPE: the container keeps it in its header, a chain block at 0x1E0 (4 KB of output) holding the same TAPE DBLK and RAID stream (task 9, 16 of 16 containers; family count 1 in every sample, no compressed striped set yet), so its families are checked as a plain set's |
 | `compressed`, `compression_algorithm` | | `MSSQLBAK` header word @0x0C (§ Rules, container) |
 | `encrypted`, `encryptor_thumbprint` | | `MSSQLBAK` @0x0C bit 0x4, thumbprint @0x18 (E4§1); decryption is spec 087 |
 | `has_backup_checksums` | `BOOLEAN` | MQDA / MQTL media-format attribute 0x100 and the `CSUM` streams (E2§7) |
-| `backup_size`, `compressed_size` | `BIGINT` | `BackupSize` = the sum over the families of (the MSLS block's offset − the soft-filemark size, TAPE's `soft_filemark_block_size` × 512): task 3, on every truth, a 64 KB `BLOCKSIZE` and a striped set included **(2025)**; the files' size |
-| `page_count`, `log_tail_bytes` | `BIGINT` | live pages; MQTL bytes |
-| `consistent`, `open_transactions`, `committed_after_checkpoint` | | D11, database level (data backups only) |
+| `backup_size`, `compressed_size` | `BIGINT` | `BackupSize` = the sum over the families of (the MSLS block's offset − the soft-filemark size, TAPE's `soft_filemark_block_size` × 512): task 3, on every truth, a 64 KB `BLOCKSIZE` and a striped set included **(2025)**; `compressed_size` is the `BackupSize` for a plain backup (HEADERONLY prints it so); for a compressed one it is not located (four truths match neither the file's size, the blocks' payloads with or without their headers, nor the chain's end), NULL until it is |
+| `page_count`, `log_tail_bytes` | `BIGINT` | live pages (NULL until PR 2 reads the allocation pages for it); the MQTL streams' log bytes (each stream's length less its 2-byte lead-in) |
+| `consistent`, `open_transactions`, `committed_after_checkpoint` | `BOOLEAN`, `INTEGER`, `INTEGER` | D11, database level (data backups only); NULL until PR 5 |
 | `recovery_model` | `VARCHAR` | located (task 3): trailer SCIN +244, `0x08` SIMPLE, else `0x04` BULK_LOGGED, else FULL (sysdatabases' "trunc. log on chkpt" and "select into/bulkcopy" bits) |
 | `files` | `LIST(STRUCT(logical_name, physical_name, type, file_id, filegroup_id, filegroup_name, size_bytes, max_size_bytes, create_lsn, unique_id, backup_size_bytes))` | the trailer MQCI's SFIN / SFGI records (§ Rules, header fields); `backup_size_bytes` from the page index (task 7), NULL before it |
 
