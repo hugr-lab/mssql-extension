@@ -176,6 +176,7 @@ set(EXTENSION_SOURCES
     # Connection management layer (DuckDB integration)
     src/connection/mssql_settings.cpp
     src/connection/mssql_diagnostic.cpp
+    src/connection/mssql_login_retry.cpp
     src/connection/mssql_connection_provider.cpp
     src/connection/instance_resolver.cpp
     # Catalog integration layer (DuckDB catalog API)

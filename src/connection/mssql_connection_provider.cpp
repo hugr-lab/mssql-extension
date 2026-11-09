@@ -1,4 +1,5 @@
 #include "connection/mssql_connection_provider.hpp"
+#include "connection/mssql_login_retry.hpp"
 
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_transaction.hpp"
@@ -196,6 +197,9 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 		MSSQL_CONN_LOG("GetConnection: Pool before acquire - total=%zu, active=%zu, idle=%zu",
 					   stats_before.total_connections, stats_before.active_connections, stats_before.idle_connections);
 		std::string why;
+		// Issue #481: a login this acquisition makes and the server refuses for a while is
+		// retried; this statement's Ctrl-C ends the wait, and the retries are logged under it.
+		mssql::LoginContextScope login_scope(&context);
 		auto conn = pool.Acquire(timeout_ms, &why);
 		if (!conn) {
 			throw IOException("MSSQL: Failed to acquire connection: " + why);
@@ -236,6 +240,7 @@ std::shared_ptr<tds::TdsConnection> ConnectionProvider::GetConnection(ClientCont
 	MSSQL_CONN_LOG("GetConnection: Pool before acquire - total=%zu, active=%zu, idle=%zu",
 				   stats_before.total_connections, stats_before.active_connections, stats_before.idle_connections);
 	std::string why;
+	mssql::LoginContextScope login_scope(&context);	 // issue #481, as above
 	auto conn = pool.Acquire(timeout_ms, &why);
 	if (!conn) {
 		throw IOException("MSSQL: Failed to acquire connection for transaction: " + why);

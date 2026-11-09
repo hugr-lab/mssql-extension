@@ -1,4 +1,5 @@
 #include "copy/copy_function.hpp"
+#include "connection/mssql_login_retry.hpp"
 
 #include <mutex>
 
@@ -820,6 +821,7 @@ void BCPCopySink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 		// session does both inside one call now, and the lock is around the call.
 		std::unique_lock<std::mutex> shared_lock(gdata.write_mutex);
 		if (gdata.shared.IsDeferred()) {
+			mssql::LoginContextScope login_scope(&context.client);	// issue #481
 			gdata.shared.AdoptDeferred();
 		}
 		const auto written = gdata.shared.Write(input);

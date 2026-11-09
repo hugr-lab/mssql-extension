@@ -7,6 +7,7 @@
 #include "catalog/mssql_schema_entry.hpp"
 #include "catalog/mssql_statistics.hpp"
 #include "connection/mssql_connection_provider.hpp"
+#include "connection/mssql_login_retry.hpp"
 #include "connection/mssql_settings.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/common.hpp"	 // For COLUMN_IDENTIFIER_ROW_ID
@@ -229,6 +230,8 @@ TableStorageInfo MSSQLTableEntry::GetStorageInfo(ClientContext &context) {
 	// Slow path: acquire connection and query DMV for fresh statistics
 	try {
 		auto &pool = mssql_catalog.GetConnectionPool();
+		// Best effort (the cached count is the fallback): a login is tried once (issue #481).
+		mssql::LoginRetryOffScope one_login;
 		auto connection = pool.Acquire();
 
 		if (connection) {

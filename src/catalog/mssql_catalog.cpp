@@ -1,4 +1,5 @@
 #include "catalog/mssql_catalog.hpp"
+#include "connection/mssql_login_retry.hpp"
 #include "duckdb/catalog/schema_scan_filters.hpp"
 
 #include <openssl/crypto.h>
@@ -221,10 +222,11 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 					"%s", MSSQLTranslateConnectionError(conn->GetLastError(), host, port, "", database));
 			}
 			if (!conn->AuthenticateWithFedAuth(database, fedauth.token_utf16le, encrypt, app_name)) {
-				throw ConnectionException(
-					"Azure AD authentication failed: %s",
-					MSSQLTranslateConnectionError(conn->GetLastError(), host, port, "", database,
-												  conn->GetLastErrorNumber(), conn->GetLastErrorState()));
+				mssql::ThrowLoginRefused(
+					conn->GetLastErrorNumber(),
+					"Azure AD authentication failed: " +
+						MSSQLTranslateConnectionError(conn->GetLastError(), host, port, "", database,
+													  conn->GetLastErrorNumber(), conn->GetLastErrorState()));
 			}
 			return conn;
 		};
@@ -269,10 +271,11 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 					"%s", MSSQLTranslateConnectionError(conn->GetLastError(), host, port, "", database));
 			}
 			if (!conn->AuthenticateWithFedAuth(database, token, encrypt, app_name)) {
-				throw ConnectionException(
-					"Azure AD authentication failed: %s",
-					MSSQLTranslateConnectionError(conn->GetLastError(), host, port, "", database,
-												  conn->GetLastErrorNumber(), conn->GetLastErrorState()));
+				mssql::ThrowLoginRefused(
+					conn->GetLastErrorNumber(),
+					"Azure AD authentication failed: " +
+						MSSQLTranslateConnectionError(conn->GetLastError(), host, port, "", database,
+													  conn->GetLastErrorNumber(), conn->GetLastErrorState()));
 			}
 			return conn;
 		};
@@ -342,7 +345,7 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 				if (!strategy_error.empty()) {
 					error += " (" + strategy_error + ")";
 				}
-				throw ConnectionException("integrated-auth: %s", error);
+				mssql::ThrowLoginRefused(conn->GetLastErrorNumber(), "integrated-auth: " + error);
 			}
 			return conn;
 		};
@@ -375,9 +378,10 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 					"%s", MSSQLTranslateConnectionError(conn->GetLastError(), host, port, username, database));
 			}
 			if (!conn->Authenticate(username, password, database, encrypt, app_name)) {
-				throw ConnectionException(
-					"%s", MSSQLTranslateConnectionError(conn->GetLastError(), host, port, username, database,
-														conn->GetLastErrorNumber(), conn->GetLastErrorState()));
+				mssql::ThrowLoginRefused(
+					conn->GetLastErrorNumber(),
+					MSSQLTranslateConnectionError(conn->GetLastError(), host, port, username, database,
+												  conn->GetLastErrorNumber(), conn->GetLastErrorState()));
 			}
 			return conn;
 		};
@@ -385,6 +389,27 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 	}
 	}
 
+	// Issue #481: a login refused with one of Azure SQL's transient numbers is tried again, within
+	// the login timeout the pool already gives it (mssql_connection_timeout, or the ATTACH
+	// validation's while it runs), so a serverless database that is resuming does not fail the
+	// ATTACH or the statement whose pool refill met it. Every factory above goes through it.
+	{
+		auto inner = std::make_shared<tds::ConnectionFactory>(std::move(factory));
+		auto timeout = connect_timeout_;
+		factory = [inner, timeout]() -> std::shared_ptr<tds::TdsConnection> {
+			if (tds::ConnectionPool::InOptionalAcquire() || mssql::LoginRetryOffScope::Active()) {
+				// An extra bulk-load writer never waits for a connection, nor does a
+				// best-effort acquisition: one attempt.
+				return (*inner)();
+			}
+			int seconds = timeout->load();
+			if (seconds <= 0) {
+				seconds = tds::DEFAULT_CONNECTION_TIMEOUT;
+			}
+			return mssql::RetryTransientLogin<std::shared_ptr<tds::TdsConnection>>(
+				*inner, static_cast<int64_t>(seconds) * 1000, mssql::DefaultLoginRetryHooks());
+		};
+	}
 	connection_pool_ = make_shared_ptr<tds::ConnectionPool>(context_name_, pool_config_, std::move(factory));
 
 	// Issue #324, review of #386: the ATTACH validates through the pool. Its
@@ -402,6 +427,10 @@ void MSSQLCatalog::Initialize(bool load_builtin) {
 	if (startup_.prewarm && pool_config_.min_connections > 0) {
 		std::string failure;
 		try {
+			// Issue #481: Prewarm dials one login on this thread and the rest on threads of
+			// its own; none of them sees the ATTACH's context, so an interrupt is not
+			// swallowed into the shortfall on one and missed on the others.
+			mssql::LoginContextScope no_context(nullptr);
 			const size_t opened = connection_pool_->Prewarm(pool_config_.min_connections, &failure);
 			(void)opened;
 		} catch (std::exception &e) {
@@ -425,9 +454,16 @@ void MSSQLCatalog::ValidateThroughPool() {
 	// under mssql_connection_timeout.
 	const int validation_timeout =
 		startup_.validation_timeout_seconds > 0 ? startup_.validation_timeout_seconds : pool_config_.connection_timeout;
-	connect_timeout_->store(validation_timeout);
 	std::string why;
-	auto connection = connection_pool_->Acquire(validation_timeout * 1000, &why);
+	std::shared_ptr<tds::TdsConnection> connection;
+	connect_timeout_->store(validation_timeout);
+	try {
+		connection = connection_pool_->Acquire(validation_timeout * 1000, &why);
+	} catch (...) {
+		// An interrupt during a login retry (issue #481): the timeout goes back too.
+		connect_timeout_->store(pool_config_.connection_timeout);
+		throw;
+	}
 	connect_timeout_->store(pool_config_.connection_timeout);
 	if (!connection) {
 		// The pool's own framing ("pool 'x' could not create a connection: ")
@@ -1332,6 +1368,7 @@ void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql, bool o
 	}
 
 	std::string why;
+	mssql::LoginContextScope login_scope(&context);	 // issue #481
 	auto connection = connection_pool_->Acquire(-1, &why);
 	if (!connection) {
 		throw IOException("Failed to acquire connection for DDL execution: " + why);

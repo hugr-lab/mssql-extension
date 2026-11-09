@@ -153,6 +153,9 @@ struct MSSQLDescribedShape {
 	//! vector's TIMESTAMP unit (datetime / smalldatetime always decode to µs).
 	vector<bool> datetime2;
 	bool ok = false;
+	//! The describe answered cleanly that the statement returns no result set (issue #525):
+	//! refused before it would run at bind.
+	bool no_result_set = false;
 	string reason;	// why not, for the debug log and the prepared error
 };
 
@@ -504,6 +507,7 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 	}
 	if (result.rows.empty()) {
 		shape.reason = "the statement returns no result set";
+		shape.no_result_set = true;
 		return shape;
 	}
 	for (const auto &row : result.rows) {
@@ -874,8 +878,21 @@ static void ApplyColumnTypes(ClientContext &context, const TableFunctionBindInpu
 // run it at Bind as this function always had (spec 075 F1). `bind_data` arrives
 // with context_name, query, execute_sql and prepared set; `params` is empty for
 // mssql_scan.
-static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_data, const mssql::SqlParamSet &params,
-							  vector<LogicalType> &return_types, vector<Identifier> &names) {
+//! Issue #525: a statement that returns no result set (PRINT, SET, a procedure that only prints)
+//! bound with no columns, and DuckDB answered with an InternalException ("Table function must
+//! return at least one column"). Refused by name, pointing at the function for such statements.
+static void RequireResultSet(const vector<LogicalType> &types, const char *function) {
+	if (types.empty()) {
+		throw BinderException(
+			"%s: the statement returns no result set, so there is nothing to scan. A statement "
+			"run for its effect goes through mssql_exec, which returns its row count",
+			function);
+	}
+}
+
+static void BindDescribedScan(ClientContext &context, const char *function, MSSQLScanBindData &bind_data,
+							  const mssql::SqlParamSet &params, vector<LogicalType> &return_types,
+							  vector<Identifier> &names) {
 	auto bind_start = std::chrono::steady_clock::now();
 	auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name));
 	auto &mssql_catalog = catalog.Cast<MSSQLCatalog>();
@@ -1045,6 +1062,11 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	// F1 fallback: the server would not describe it, so learn the shape the way
 	// this function always had -- by running it.
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: describe fell back to execution: %s", shape.reason.c_str());
+	if (shape.no_result_set) {
+		// The server said so: refused before the statement runs, so an INSERT handed to
+		// mssql_scan is not executed and then refused (issue #525).
+		RequireResultSet({}, function);
+	}
 	if (bind_data.wants_column_types) {
 		// Refused before the batch runs: its effects would otherwise already have
 		// happened, and a stream registered below would be left behind.
@@ -1068,6 +1090,8 @@ static void BindDescribedScan(ClientContext &context, MSSQLScanBindData &bind_da
 	for (const auto &col : result_stream->GetColumnMetadata()) {
 		return_types.push_back(WireStringType(col, native_types, utf8_acked, client_transcode));
 	}
+	// Before the stream is kept: thrown here, it closes and gives its connection back.
+	RequireResultSet(return_types, function);
 	names.clear();
 	for (const auto &name : result_stream->GetColumnNames()) {
 		names.push_back(Identifier(name));
@@ -1131,7 +1155,8 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 	ValidateScanContext(context, bind_data->context_name);
 	mssql::SqlParamSet no_params;
 	bind_data->wants_column_types = HasColumnTypes(input);
-	BindDescribedScan(context, *bind_data, no_params, return_types, names);
+	BindDescribedScan(context, "mssql_scan", *bind_data, no_params, return_types, names);
+	RequireResultSet(return_types, "mssql_scan");
 	ApplyColumnTypes(context, input, *bind_data, return_types);
 	return std::move(bind_data);
 }
@@ -1157,7 +1182,8 @@ unique_ptr<FunctionData> MSSQLScanParamsBind(ClientContext &context, TableFuncti
 	auto params = mssql::BuildSqlParams(input.inputs[2], declarations_override);
 	bind_data->execute_sql = params.ExecuteSqlRequest(bind_data->query);
 	bind_data->wants_column_types = HasColumnTypes(input);
-	BindDescribedScan(context, *bind_data, params, return_types, names);
+	BindDescribedScan(context, "mssql_scan_params", *bind_data, params, return_types, names);
+	RequireResultSet(return_types, "mssql_scan_params");
 	ApplyColumnTypes(context, input, *bind_data, return_types);
 	return std::move(bind_data);
 }

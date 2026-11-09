@@ -9,6 +9,7 @@
 #include "catalog/mssql_transaction_metadata.hpp"
 #include "codec/target_string_type.hpp"
 #include "connection/mssql_connection_provider.hpp"
+#include "connection/mssql_login_retry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/entry_scan_filters.hpp"
 #include "duckdb/common/enum_util.hpp"
@@ -182,6 +183,7 @@ SimilarCatalogEntry MSSQLSchemaEntry::GetSimilarEntry(CatalogTransaction transac
 		}
 		if (!own && !shared.TryGetTableNames(schema_name, names)) {
 			std::string why;
+			mssql::LoginContextScope login_scope(transaction.context);	// issue #481
 			auto connection = catalog.GetConnectionPool().Acquire(-1, &why);
 			if (!connection) {
 				throw IOException("Failed to acquire connection for table names: " + why);

@@ -9,6 +9,7 @@
 #include "catalog/mssql_table_entry.hpp"
 #include "catalog/mssql_transaction.hpp"
 #include "connection/mssql_connection_provider.hpp"
+#include "connection/mssql_login_retry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "pushdown/mssql_pushdown_resolution.hpp"
 
@@ -175,6 +176,7 @@ void MSSQLTableSet::Scan(ClientContext &context, const std::function<void(Catalo
 
 	catalog.EnsureCacheLoaded(context);
 	std::string why;
+	mssql::LoginContextScope login_scope(&context);	 // issue #481
 	auto connection = pool.Acquire(-1, &why);
 	if (!connection) {
 		throw IOException("Failed to acquire connection for table scan: " + why);
@@ -359,6 +361,7 @@ bool MSSQLTableSet::LoadSingleEntry(ClientContext &context, const string &name,
 
 	try {
 		std::string why;
+		mssql::LoginContextScope login_scope(&context);	 // issue #481
 		auto connection = pool.Acquire(-1, &why);
 		if (!connection) {
 			throw IOException("Failed to acquire connection for table loading: " + why);
