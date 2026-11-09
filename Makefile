@@ -667,6 +667,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_ctas_type_mapping.cpp \
     test/cpp/test_login_retry.cpp \
     test/cpp/backup/test_backup_bytes.cpp \
+    test/cpp/backup/test_backup_mtf.cpp \
     test/cpp/backup/test_backup_ranges.cpp \
     test/cpp/backup/test_backup_source.cpp \
     test/cpp/test_catalog_filter.cpp \

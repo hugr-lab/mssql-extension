@@ -404,24 +404,24 @@ Common named parameters of every function, and ATTACH options of the same names:
 | column | type | source |
 |---|---|---|
 | `position` | `INTEGER` | SSET data set number |
-| `backup_type` | `VARCHAR` | `'full'` / `'differential'` / `'log'`: SSET attributes 0x4 full, 0x8 differential (E1§3); a log backup has no MSDA and an MQTL (X§3; its attribute bit unverified) |
+| `backup_type` | `VARCHAR` | `'full'` / `'differential'` / `'log'`: SSET attribute 0x8 differential (E1§3); a full and a log backup both carry 0x4 (task 3), and a log backup is the one with no MSDA block (X§3) |
 | `is_copy_only` | `BOOLEAN` | SSET attribute 0x2 (E2: 0x6 = copy-only full, over 37 files) |
 | `backup_set_guid` | `UUID` | SSET +100 (E1§3) |
 | `first_lsn`, `last_lsn`, `checkpoint_lsn`, `database_backup_lsn` | `DECIMAL(25,0)` | trailer SCIN (MSLS / MQCI) +32 / +42 / +52 / +62, 10 bytes each (E1§3) |
-| `differential_base_lsn`, `differential_base_guid` | `DECIMAL(25,0)`, `UUID` | SCIN +830 / +842; in a full: its own checkpoint LSN and GUID, the base it establishes (E1§3) |
+| `differential_base_lsn`, `differential_base_guid` | `DECIMAL(25,0)`, `UUID` | a differential's base: trailer SCIN +260 / +200 (task 3; E1's "+830 / +842" were offsets in the MQCI stream, which move with the SCIN's length, 41 of 41 differentials); NULL for any other backup, as HEADERONLY (a full establishes the base its own `checkpoint_lsn` and `backup_set_guid` name) |
 | `database_name`, `database_version`, `compatibility_level`, `collation`, `family_guid` | | boot page: `dbi_dbname` +52, `dbi_version` +4, `dbi_cmptlevel` +314, `dbi_collation` +392 (name from the collation table), `dbi_familyGUID` +408 (record offsets, X§4) |
-| `recovery_fork_id`, `first_recovery_fork_id`, `fork_point_lsn`, `binding_id` | `UUID`, `UUID`, `DECIMAL(25,0)`, `UUID` | **to locate** (task 3), HEADERONLY `RecoveryForkID` / `FirstRecoveryForkID` / `ForkPointLSN` / `BindingID`; `NULL` until matched. The chain check compares the file's fork with the lake's and fails closed: until the fork id is read every apply by LSN, a differential or a full applied incrementally, is refused (089 D7, 023 C1) |
+| `recovery_fork_id`, `first_recovery_fork_id`, `fork_point_lsn`, `binding_id` | `UUID`, `UUID`, `DECIMAL(25,0)`, `UUID` | located (task 3, § Rules, header fields): trailer SCIN +156 `RecoveryForkID`, +124 `BindingID`; +172 (10-byte LSN) and +184 (GUID) the fork point and the parent fork, set once the database was restored with recovery; HEADERONLY's `FirstRecoveryForkID` / `ForkPointLSN` are derived from them. The chain check compares the file's fork with the lake's and fails closed: until the fork id is read every apply by LSN, a differential or a full applied incrementally, is refused (089 D7, 023 C1) |
 | `backup_name`, `description`, `user_name`, `machine_name`, `software_version` | `VARCHAR` | SSET strings, VOLB machine name, SSET software major / minor (X§3) |
-| `backup_start_date`, `backup_finish_date` | `TIMESTAMP` | **to locate** (task 3): candidates SSET +88 and ESET +80 MTF dates; `NULL` until matched with HEADERONLY |
+| `database_creation_date`, `backup_start_date`, `backup_finish_date` | `TIMESTAMP` | located (task 3): trailer SCIN +72 / +77 / +82, MTF dates (5 bytes, big-endian bit fields), as HEADERONLY prints them (server local time) |
 | `media_set_guid`, `family_count`, `family_sequence_number` | | TAPE's RAID stream +0 / +20 / +24 (E2 layouts) |
 | `compressed`, `compression_algorithm` | | `MSSQLBAK` header word @0x0C (§ Rules, container) |
 | `encrypted`, `encryptor_thumbprint` | | `MSSQLBAK` @0x0C bit 0x4, thumbprint @0x18 (E4§1); decryption is spec 087 |
 | `has_backup_checksums` | `BOOLEAN` | MQDA / MQTL media-format attribute 0x100 and the `CSUM` streams (E2§7) |
-| `backup_size`, `compressed_size` | `BIGINT` | the MTF data set's size (= `BackupSize`, X§5), the file's size |
+| `backup_size`, `compressed_size` | `BIGINT` | `BackupSize` = the sum over the families of (the MSLS block's offset − the soft-filemark size, TAPE's `soft_filemark_block_size` × 512): task 3, on every truth, a 64 KB `BLOCKSIZE` and a striped set included **(2025)**; the files' size |
 | `page_count`, `log_tail_bytes` | `BIGINT` | live pages; MQTL bytes |
 | `consistent`, `open_transactions`, `committed_after_checkpoint` | | D11, database level (data backups only) |
-| `recovery_model` | `VARCHAR` | **to locate**; `NULL` until then |
-| `files` | `LIST(STRUCT(logical_name, physical_name, type, file_id, filegroup_id, filegroup_name, size_pages, backup_size_bytes))` | MSCI's SFIN / SFGI records and each file header's `Size` (X§3, E2) |
+| `recovery_model` | `VARCHAR` | located (task 3): trailer SCIN +244, `0x08` SIMPLE, else `0x04` BULK_LOGGED, else FULL (sysdatabases' "trunc. log on chkpt" and "select into/bulkcopy" bits) |
+| `files` | `LIST(STRUCT(logical_name, physical_name, type, file_id, filegroup_id, filegroup_name, size_bytes, max_size_bytes, create_lsn, unique_id, backup_size_bytes))` | the trailer MQCI's SFIN / SFGI records (§ Rules, header fields); `backup_size_bytes` from the page index (task 7), NULL before it |
 
 `mssql_backup_tables(path)` returns one row per user table: `schema_name`, `table_name`, `object_id`,
 `shape` (`heap` / `clustered` / `columnstore`), `compression` (from `sysrowsets.cmprlevel`; `mixed`
@@ -557,7 +557,12 @@ Byte offsets are from the experiments; each is **(2025)** unless marked otherwis
   is padded to 4 bytes; `SPAD` ends a block's chain. **Both checksums are validated on every header**:
   the string `VOLB` occurs inside data and has looped another reader (W§2).
 - The walk follows header lengths only, never fixed offsets: BLOCKSIZE moves SFMB and SSET to 1× and
-  2× the block size and APAD absorbs the gap; MAXTRANSFERSIZE changes the padding (E2 R10, §7).
+  2× the block size and APAD absorbs the gap; MAXTRANSFERSIZE changes the padding (E2 R10, §7). A
+  block's streams end with `SPAD`, and the next DBLK starts where its data ends (4-aligned); an SFMB
+  is TAPE's `soft_filemark_block_size` × 512 bytes long. Walked strictly, with no resync, this ends
+  exactly at the end of all 95 uncompressed backups of the experiments (BLOCKSIZE 4 / 16 / 64 KB,
+  MAXTRANSFERSIZE 64 KB / 4 MB, stripes, logs, task 3) **(2025)**: a DBLK that does not validate where
+  the previous one ended is a named error.
 - SQL Server's sequence: `TAPE SFMB SSET VOLB MSCI MSDA MSDA MSTL… MSLS SFMB ESET ESET SFMB` (X§3).
   MQDA = a 2-byte lead-in (`length mod 8192`) then 8 KB units, page-aligned in the file; an MQDA of
   0 bytes with media attribute 0x6 marks the end of data. The first MSDA is pass 1, the second pass 2.
@@ -565,6 +570,39 @@ Byte offsets are from the experiments; each is **(2025)** unless marked otherwis
   blocks. The trailer SCIN in MSLS carries the LSNs; the copy in MSCI does not (E1§3).
 - A striped set is `FamilyCount` complete MTF files with one MediaSetId (TAPE RAID stream). Each
   extent is in exactly one family; the log tail is only in family 1 (E2§6).
+
+**Header fields of the trailer SCIN** (task 3, the trailer MQCI's first record, `SCIN`, u32 length
+@4; located against HEADERONLY on 39 backups of SQL Server 2025, 501 fields, 0 mismatches: E1's,
+E3's, the probe samples and a set made for it -- SIMPLE / BULK_LOGGED / FULL, a 300 MB full whose
+start and finish differ, a restore WITH RECOVERY, a log backup across the fork **(2025)**):
+
+| offset | field |
+|---|---|
+| +32 / +42 / +52 / +62 | FirstLSN, LastLSN, CheckpointLSN, DatabaseBackupLSN (10-byte LSNs: u32 VLF, u32 block, u16 slot) |
+| +72 / +77 / +82 | DatabaseCreationDate, BackupStartDate, BackupFinishDate (MTF dates) |
+| +124 | BindingID |
+| +156 | RecoveryForkID (the database's current fork) |
+| +172 / +184 | the fork point LSN and the parent fork's GUID; zero until a restore WITH RECOVERY |
+| +224 | FamilyGUID |
+| +244 | recovery model bits: 0x08 SIMPLE, 0x04 BULK_LOGGED, neither FULL |
+| +200 / +260 | a differential's base: its GUID and LSN (zero in a full) |
+
+The MQCI stream is a run of records, each `tag[4] ‖ u32 length` (the length includes the 8 bytes),
+covering the stream exactly: SCIN, one SFGI per filegroup, one SFIN per file. **SFIN** (task 3; 310
+fields of FILELISTONLY on 15 backups, a second filegroup and a bounded MAXSIZE included, 0 mismatches
+**(2025)**): u32 FileId +20, u32 type +28 (1 data `D`, 2 log `L`; any other value refused by name
+until seen), u32 FileGroupId +36 (0 for the log), u64 Size in bytes +40, two string descriptors
+(u16 byte length, u16 offset in the record, UTF-16LE) +48 LogicalName and +52 PhysicalName, u64
+MaxSize in bytes +86 (unaligned), CreateLSN +138, UniqueId +186. **SFGI**: u32 filegroup id +12 and a
+string descriptor +16 for its name. FILELISTONLY's `BackupSizeInBytes` is not in SFIN: it is the
+file's pages in the data stream.
+
+HEADERONLY's `FirstRecoveryForkID` and `ForkPointLSN` are derived: a log backup whose FirstLSN is not
+past the fork point spans the fork, and reports the parent fork and the fork point; every other
+backup reports `FirstRecoveryForkID` = `RecoveryForkID` and `ForkPointLSN` NULL (a full taken after a
+restore carries +172 / +184 and still reports NULL). One fork case backs the rule **(2025, one case)**.
+The record grows with its trailing strings (database and server names, 442–448 bytes seen); the
+offsets above are in its fixed part.
 
 **MSSQLBAK** (X§5, E4§1, `tools/bakz.py`):
 - `MSSQLBAK` @0, u32 2 @8, u32 flags @0x0C: 3 = MS_XPRESS, 0x83 = ZSTD, 5 = encrypted, 7 = encrypted
@@ -974,9 +1012,11 @@ cost.
 - **Legacy LOB types** (`text`, `ntext`, `image`) are unverified.
 - **RCSI / snapshot version tags** (statusA 0x40) are handled by length only; no experiment ran with
   row versioning (E2§10, E3§8). ADR's in-row versions are unknown.
-- **Unlocated header fields**: backup dates, recovery model, the recovery fork. The importer tags
+- **Header fields located on 2025 only**: the backup dates, the recovery model and the recovery
+  fork are in the trailer SCIN (§ Rules), and the fork rule rests on one case. The importer tags
   snapshots with `backup_finish_date` (R§6.2) and refuses every apply by LSN until the fork id is
-  read (089 D7), so locating them is in PR 1.
+  read (089 D7), so each version of the matrix re-checks them against HEADERONLY before it is
+  accepted (D14).
 - **Appended backup sets** (`position`) were never produced.
 - **Partitioning not covered by E7** (E7§7): RANGE LEFT SPLIT / MERGE, an `ALL TO` scheme after a
   SPLIT, PAGE compression per partition, boundary types beyond those listed above, a computed

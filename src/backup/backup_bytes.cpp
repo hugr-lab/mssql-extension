@@ -17,6 +17,46 @@ void ByteReader::ThrowOutOfBounds(size_t offset, size_t count) const {
 					 "-byte span");
 }
 
+static void AppendUtf8(std::string &out, uint32_t cp) {
+	if (cp < 0x80) {
+		out += static_cast<char>(cp);
+	} else if (cp < 0x800) {
+		out += static_cast<char>(0xC0 | (cp >> 6));
+		out += static_cast<char>(0x80 | (cp & 0x3F));
+	} else if (cp < 0x10000) {
+		out += static_cast<char>(0xE0 | (cp >> 12));
+		out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+		out += static_cast<char>(0x80 | (cp & 0x3F));
+	} else {
+		out += static_cast<char>(0xF0 | (cp >> 18));
+		out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+		out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+		out += static_cast<char>(0x80 | (cp & 0x3F));
+	}
+}
+
+std::string Utf16LeToUtf8(const uint8_t *data, size_t bytes) {
+	size_t units = bytes / 2;
+	while (units > 0 && data[2 * (units - 1)] == 0 && data[2 * (units - 1) + 1] == 0) {
+		units--;
+	}
+	std::string out;
+	out.reserve(units);
+	for (size_t i = 0; i < units; i++) {
+		uint32_t u = static_cast<uint32_t>(data[2 * i] | (data[2 * i + 1] << 8));
+		if (u >= 0xD800 && u <= 0xDBFF && i + 1 < units) {
+			uint32_t v = static_cast<uint32_t>(data[2 * i + 2] | (data[2 * i + 3] << 8));
+			if (v >= 0xDC00 && v <= 0xDFFF) {
+				AppendUtf8(out, 0x10000 + ((u - 0xD800) << 10) + (v - 0xDC00));
+				i++;
+				continue;
+			}
+		}
+		AppendUtf8(out, (u >= 0xD800 && u <= 0xDFFF) ? 0xFFFD : u);
+	}
+	return out;
+}
+
 }  // namespace backup
 }  // namespace mssql
 }  // namespace duckdb
