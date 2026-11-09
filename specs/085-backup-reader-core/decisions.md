@@ -71,7 +71,7 @@ the specs it affects. **Blocking** means the named PR cannot open until the ques
 | DQ-35 | the helper naming family | keep as drafted | 022–024 |
 | DQ-36 | committed samples or a release asset | committed, ≤ 2 MB each, ≤ 16 MB in all | 085 PR 1 |
 | DQ-37 | `backup_<component>.cpp` source names | yes | 085 PR 1 |
-| DQ-41 | how a striped or compressed pass is indexed | **decided** (owner, 2026-11-09): searched, not read (E13: every pass ascending, a container's block = one extent group, a block found from any offset); samples kept; the header scan only for pass 2, a differential's pass and a pass whose order breaks (085 D4a, task 7a) | — |
+| DQ-41 | how a striped or compressed pass is indexed | **decided** (owner, 2026-11-09): searched, not read (E13: every pass ascending, a container's block = one extent group); samples kept; the header scan only for pass 2, a differential's pass and a pass whose order breaks; a container is walked from known blocks by default (rows can forge a resync), resync search under `trust_layout := true` (085 D4a, task 7a) | — |
 | DQ-40 | which pages are a table's | **decided** (owner, 2026-11-09): its AU's IAM chain, walked at the table's first scan through the page store; the page header checked at read; a differential's own pages by their header AU; an ATTACH reads the headers, allocation and catalog pages only (085 D4, D4a) | — |
 | DQ-39 | what an opened backup keeps in memory | **decided** (owner, 2026-11-09): at most 0.4 MB resident per GB of backup (4 GB for 10 TB); extent bitmaps with ranks, block checkpoints, the catalog model resident; the AU index buffer-managed (replaced by DQ-40's IAM chain); page bytes not kept; a slow open is acceptable; a saved index later, as an option (085 D4a) | — |
 | DQ-38 | how the reader does I/O | **decided** (owner, 2026-11-09): coalesced ranges, fetched asynchronously and in parallel through DuckDB's I/O pool and `CachingFileSystem`, as the Parquet reader does (085 D3a) | — |
@@ -655,6 +655,16 @@ plausible headers (0 wrong in 3.6 M probes). So an extent is found by bisection 
 groups or a container's blocks, interpolating on the block index where the rank gives it, with the
 probes kept as samples: 6–8 requests a cold lookup on the samples, 0.4–1.9 warm; extrapolated, the
 open of a 10 TB compressed full reads about 1 GB instead of the whole file.
+
+**Amended the same day (owner, 2026-11-09), after the review of the search:** a block found by
+resync from an arbitrary offset can be forged by row data (a stored block carries row bytes
+verbatim, so four chained fake headers in a row take a probe; reproduced). By default a container
+is therefore not resynced: its groups are read at their data-set offsets through the chain walked
+lazily from its start or a seek index entry (checkpoints kept), the search gallops from the nearest
+walked sample, and the GAMs are read per interval when first needed, not at ATTACH; a first scan
+deep in the file walks the chain to it. The ATTACH option `trust_layout := true` turns E13's resync
+search on, for backups whose row data is trusted. A striped set of plain files is unaffected (its
+groups are at computed offsets).
 
 The order is checked by every probe; a pass whose order breaks falls back to its header scan.
 Pass 2 and a differential's pass stay header-scanned (small; a differential's yields DQ-40's

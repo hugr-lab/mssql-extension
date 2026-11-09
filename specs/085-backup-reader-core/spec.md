@@ -203,12 +203,21 @@ Out, each refused by name until its spec lands:
     in a container every block of a pass outputs exactly 64 KB from a unit boundary, so block *k* is
     the pass's extent group *k*, and the seek index names the pass boundaries. So an extent's group
     is found by searching the pass: in a family file group *g* is at a computed offset (bisection
-    over groups); in a container a probe at any offset finds a block by the next four plausible
-    headers (the fourth is always a true block, 3.6 M probes) and decodes it for its extent. On the
-    rank path the extent's rank gives its block index, so the search interpolates on it; elsewhere it
-    bisects. Probes are kept as samples. Measured on the samples: 6–8 requests a cold lookup, 0.4–1.9
-    warm. A probe that meets a key out of order refuses the search for that pass, which falls back
-    to its header scan (a loss of speed, never of correctness).
+    over groups). Probes are kept as samples; measured on the samples: 6–8 requests a cold lookup,
+    0.4–1.9 warm. A probe that meets a key out of order refuses the search for that pass, which falls
+    back to its header scan (a loss of speed, never of correctness).
+  - **A container is searched safely by default** (owner, 2026-11-09, DQ-41): a block found from an
+    arbitrary offset can be forged by row data (§ Security), so by default a container's group *g*
+    is read at its data-set offset through the chain walked from its start or a seek index entry,
+    lazily, checkpoints kept as it goes (the stream located from its tail, task 7a part 4a); the
+    search over such a pass gallops from the nearest walked sample (1, 2, 4 … groups, then bisects),
+    so it walks at most twice as far as the group it finds. Neither the rank path nor the GAMs run at
+    ATTACH for a container: the GAM of an interval is read when a page of it is first located
+    (D4a's allocation tier), and the catalog, at the start of pass 1, costs a short walk. A first
+    scan of a table deep in the file walks the chain to it (on object storage, reads the file up to
+    it). `trust_layout := true` uses E13's resync instead (a probe at any offset finds a block by the
+    next four plausible headers, the fourth always a true block in 3.6 M probes): the open and a
+    first scan then read little of the file, and the trust in the rows is the caller's.
   - **A saved index is a later option**, not part of 085: written to a path the user names
     (`temp_directory` does not outlive the process), keyed by `BackupSetGUID`, the families' sizes and
     version tags.
@@ -439,6 +448,7 @@ Common named parameters of every function, and ATTACH options of the same names:
 | `fuzzy` | setting `mssql_backup_fuzzy` = `'warn'` | D11 |
 | `unsupported_version` | false | D14 |
 | `verify` | false | also cross-check every table's pages against its IAM chain and the positional rule (§ Rules, page index) |
+| `trust_layout` | false | DQ-41: in a compressed backup, find blocks by resync from any offset (E13), so the open and a first scan read little of the file; only for a backup whose row data is trusted (§ Security: rows can forge a block chain). Off, a container's blocks are reached only by walking its chain from its start or a seek index entry |
 
 `mssql_backup_info(path)` returns one row per backup set:
 
@@ -906,6 +916,12 @@ A backup file is untrusted input (R§9). Every parser:
   Huffman table (lengths ≤ 15, a complete prefix code); a match before the block start or past its end
   is an error. ZSTD frames are decoded into a buffer of the declared size and refused if the frame
   claims more.
+- **Does not let row data steer the block chain** (DQ-41): a compressed backup's stored blocks
+  carry row bytes verbatim, so a database user can place forged block headers in a row, and a resync
+  from an arbitrary offset (E13) can take them for blocks whose "pages" name any page id and AU.
+  By default a container's blocks are reached only by walking the chain from a block known to be
+  one (its first block, a seek index entry, a block reached that way); the resync search runs only
+  under `trust_layout := true`.
 - **Treats pads as sensitive** (E2§7: in 26 of 35 files the pad bodies carried row data of the
   database, in three of them rows on no live page of that file). Pads are skipped by type at index
   time, and their bodies are never read further. The same holds for non-live pages and ghost records,
