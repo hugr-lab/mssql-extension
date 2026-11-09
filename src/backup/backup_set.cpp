@@ -284,8 +284,10 @@ BackupSetHeader ReadBackupSet(const RandomAccess &file, const MtfLayout &layout)
 			auto data = ReadStreamData(file, *raid, MAX_RAID_STREAM);
 			ByteReader r(data.data(), data.size(), "the TAPE block's RAID stream", raid->data_offset);
 			set.media_set_guid = ReadGuid(r, 0);
-			set.family_count = r.U32(20);
-			set.family_sequence_number = r.U32(24);
+			// u16, as E2 checked against LABELONLY: the u16 after it is 1 in every sample; read
+			// as one u32 the two said 65537 for a single family.
+			set.family_count = r.U16(20);
+			set.family_sequence_number = r.U16(24);
 		}
 	}
 

@@ -46,7 +46,7 @@ Corrections to `RESEARCH.md` are collected in §9.
 - **PFS** (1:1, then every 8,088 pages). One byte per page from offset 100: 0x40 allocated, 0x20 mixed, 0x10 IAM, 0x08 has ghosts, low 3 bits fullness.
 - **IAM.** Header record at 96: +4 u32 sequence, +40 start page (u32 page, u16 file), +46 eight 6-byte single-page slots. Extent bitmap at 194. IAM pages are single-page allocations in mixed extents even with `MIXED_PAGE_ALLOCATION OFF` (PFS 0x70).
 - **File header 1:0**, slot 0 record (its offset varies: 96 or 2494 seen): +151 BindingID, +167 u16 file id, +169 u16 filegroup id, +171 u32 **Size** (pages), +175 MaxSize, +179 Growth.
-- **TAPE's RAID stream** (32 bytes): +0 MediaSetId GUID, +20 u16 FamilyCount, +24 u16 FamilySequenceNumber. Checked against `RESTORE LABELONLY`.
+- **TAPE's RAID stream** (32 bytes): +0 MediaSetId GUID, +20 u16 FamilyCount, +22 u16 (1 in every sample), +24 u16 FamilySequenceNumber. Checked against `RESTORE LABELONLY`.
 - **SSET attributes**: 0x4 full, 0x2 COPY_ONLY (0x6 = copy-only full), 0x8 differential. Same over all 37 files.
 - **Page header of an empty / pad page**: `m_type 101`, freeCnt 8096, freeData 96, LSN 0:0:1, everything else 0.
 

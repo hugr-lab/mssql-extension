@@ -146,7 +146,8 @@ inline Bytes BuildImage(const Options &o) {
 	Put16(tape, 64, o.soft_filemark_units);
 	Bytes raid(32, 0);
 	PutGuid(raid, 0, 0x10);
-	Put32(raid, 20, 2);
+	Put16(raid, 20, 2);
+	Put16(raid, 22, 1);	 // as every sample has it: a u32 read of +20 would say 65538
 	Put32(raid, 24, 1);
 	const size_t soft_filemark = static_cast<size_t>(o.soft_filemark_units) * 512;
 	AppendBlock(image, "TAPE", tape, {{"RAID", raid}}, soft_filemark);
