@@ -113,8 +113,9 @@ static MtfStream ReadStreamHeader(const RandomAccess &file, uint64_t offset, con
 	return stream;
 }
 
-MtfLayout WalkMtf(const RandomAccess &file) {
+static MtfLayout Walk(const RandomAccess &file, bool data_set) {
 	MtfLayout layout;
+	layout.has_tape = !data_set;
 	const uint64_t size = file.Size();
 	uint64_t offset = 0;
 	while (offset < size) {
@@ -132,8 +133,13 @@ MtfLayout WalkMtf(const RandomAccess &file) {
 		block.attributes = r.U32(4);
 		block.first_event = r.U16(8);
 		block.string_type = r.U8(48);
-		if (layout.blocks.empty() && block.type != "TAPE") {
-			throw FormatError(Where(file, offset) + ": the first descriptor block is " + block.type + ", not TAPE");
+		const char *first = data_set ? "SSET" : "TAPE";
+		if (layout.blocks.empty() && block.type != first) {
+			throw FormatError(Where(file, offset) + ": the first descriptor block is " + block.type + ", not " + first);
+		}
+		if (data_set && (block.type == "TAPE" || block.type == "SFMB")) {
+			throw FormatError(Where(file, offset) + ": a " + block.type +
+							  " block inside a compressed backup's data set");
 		}
 		if (block.first_event != 0 && block.first_event < DBLK_HEADER) {
 			throw FormatError(Where(file, offset) + ": the " + block.type + " block's first stream (" +
@@ -202,6 +208,14 @@ MtfLayout WalkMtf(const RandomAccess &file) {
 		throw FormatError("backup file \"" + file.Name() + "\" is empty");
 	}
 	return layout;
+}
+
+MtfLayout WalkMtf(const RandomAccess &file) {
+	return Walk(file, false);
+}
+
+MtfLayout WalkMtfDataSet(const RandomAccess &stream) {
+	return Walk(stream, true);
 }
 
 std::vector<uint8_t> ReadStreamData(const RandomAccess &file, const MtfStream &stream, size_t max_bytes) {

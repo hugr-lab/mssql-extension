@@ -114,10 +114,12 @@ Out, each refused by name until its spec lands:
   - **The open pass in parallel.** Only the MTF headers are walked one after another (a few small
     reads). An uncompressed MSDA is one run of 8 KB units, each naming its own page (D4), so once its
     stream header gives its extent the page index is built from many ranges fetched at once. A
-    compressed chain (`MSSQLBAK`) is a run of headers each giving the next one's offset: when the seek
-    index after the chain (§ Rules, MSSQLBAK) lists the blocks' offsets, it is read first and the
-    chain is fetched in parallel too (task 4 finds out); otherwise the chain is read ahead in large
-    ranges and its blocks are decompressed on every thread (D10).
+    compressed chain (`MSSQLBAK`) is a run of headers each giving the next one's offset, and its seek
+    index (§ Rules, MSSQLBAK) names only the blocks that start each data pass and the trailer, not
+    every block (task 4, 16 of 16 containers). So the chain is fetched ahead in large ranges in
+    parallel, its headers walked in the fetched bytes (cheap, sequential), its blocks decompressed on
+    every thread (D10), and the passes the index separates walked side by side. `mssql_backup_info`
+    needs no walk: the first block holds SSET, VOLB and MSCI, and the last index entry the trailer.
   - **LOB trees** are fetched one level at a time: a node's children are known only once it is read,
     so the ranges of one level are coalesced and fetched together.
   - The parsers stay DuckDB-free (D15): they take spans the I/O layer has fetched.
@@ -615,7 +617,21 @@ offsets above are in its fixed part.
   stored by W§3's Internals Viewer and accepted by E4's script, was never observed here). The chain ends at the first header whose kind is none of these; after it come a seek
   index, an SFMB, one compressed block with ESET / OTCP / TSMP, and an SFMB (X§5).
 - The concatenated block outputs are the MTF data set, byte-identical in layout to an uncompressed
-  backup (1,403 of 1,419 units identical to one taken minutes earlier, X§5).
+  backup (1,403 of 1,419 units identical to one taken minutes earlier, X§5): it starts at SSET, with
+  no TAPE or SFMB in it, and HEADERONLY's `BackupSize` is its length (task 4: the two probe samples
+  and E3's backups).
+- **The seek index** follows the chain (task 4, on all 16 compressed containers of the experiments,
+  MS_XPRESS and ZSTD **(2025)**): u32 44 @0 and u32 0x00010001 @24 in every one (their meaning is
+  unknown; the record is 40 + 16 n bytes, so 44 is not its length), u32 entry count @28 (3 to 5
+  seen; more than 1024 is refused), then from @40 one `(u64 logical offset, u64 physical offset)`
+  per entry, each a
+  block of the chain whose output starts there: the end of each MSDA pass and the trailer's MSTL.
+  The reader checks every entry against the chain and refuses an index that names no block.
+- The chain index keeps one checkpoint per 64 blocks and at most one per MiB of the file (D4a; a
+  crafted chain of tiny blocks cannot grow it); a read walks the headers from its checkpoint to the
+  next. A compressed container's data set has no TAPE, so its media fields (family count and
+  sequence, media set GUID) are not located yet and reported NULL. A block header's checksum (u32 @24) is not validated: its algorithm is unknown (the
+  MTF headers inside the data set are, and a decompressor validates its own frame).
 - XPRESS: per block a 256-byte table of 512 4-bit code lengths, then the LZ77+Huffman stream;
   decoding stops at the output size; symbol 256 is not end-of-stream (W§3, X§5).
 

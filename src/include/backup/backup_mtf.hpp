@@ -85,6 +85,9 @@ struct MtfBlock {
 
 struct MtfLayout {
 	std::vector<MtfBlock> blocks;
+	//! True when the walk read a whole family file (TAPE first); false for a compressed container's
+	//! logical stream, the MTF data set, which starts at SSET (spec 085 § Rules, MSSQLBAK).
+	bool has_tape = true;
 	//! TAPE's soft_filemark_block_size × 512: an SFMB's length.
 	uint32_t soft_filemark_bytes = 0;
 
@@ -98,6 +101,10 @@ struct MtfLayout {
 //! the first block must be TAPE; any length that leaves the file, a block that does not advance,
 //! or a header that does not validate is a FormatError naming the file and the offset.
 MtfLayout WalkMtf(const RandomAccess &file);
+
+//! The blocks of a compressed container's logical stream: the MTF data set, SSET first and no
+//! TAPE or SFMB in it (an SFMB in it is refused). The same strict rules otherwise.
+MtfLayout WalkMtfDataSet(const RandomAccess &stream);
 
 //! A stream's data, at most `max_bytes` of it (a FormatError when it is longer: a header stream
 //! the format keeps small, read whole).

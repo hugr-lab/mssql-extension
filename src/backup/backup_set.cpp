@@ -271,15 +271,20 @@ BackupSetHeader ReadBackupSet(const RandomAccess &file, const MtfLayout &layout)
 	BackupSetHeader set;
 	set.soft_filemark_bytes = layout.soft_filemark_bytes;
 
-	const auto &tape = Require(file, layout, "TAPE");
-	ByteReader tape_header(tape.header.data(), tape.header.size(), "the TAPE block", tape.offset);
-	set.media_family_id = tape_header.U32(52);
-	if (auto raid = tape.Stream("RAID")) {
-		auto data = ReadStreamData(file, *raid, MAX_RAID_STREAM);
-		ByteReader r(data.data(), data.size(), "the TAPE block's RAID stream", raid->data_offset);
-		set.media_set_guid = ReadGuid(r, 0);
-		set.family_count = r.U32(20);
-		set.family_sequence_number = r.U32(24);
+	// A compressed container's data set has no TAPE: its media fields stay unknown (media_known).
+	const MtfBlock *tape_block = layout.has_tape ? &Require(file, layout, "TAPE") : nullptr;
+	set.media_known = tape_block != nullptr;
+	if (tape_block) {
+		const auto &tape = *tape_block;
+		ByteReader tape_header(tape.header.data(), tape.header.size(), "the TAPE block", tape.offset);
+		set.media_family_id = tape_header.U32(52);
+		if (auto raid = tape.Stream("RAID")) {
+			auto data = ReadStreamData(file, *raid, MAX_RAID_STREAM);
+			ByteReader r(data.data(), data.size(), "the TAPE block's RAID stream", raid->data_offset);
+			set.media_set_guid = ReadGuid(r, 0);
+			set.family_count = r.U32(20);
+			set.family_sequence_number = r.U32(24);
+		}
 	}
 
 	const auto &sset = Require(file, layout, "SSET");
@@ -318,10 +323,15 @@ BackupSetHeader ReadBackupSet(const RandomAccess &file, const MtfLayout &layout)
 	}
 
 	const auto &msls = Require(file, layout, "MSLS");
-	if (msls.offset < layout.soft_filemark_bytes) {
-		throw FormatError("backup file \"" + file.Name() + "\": its MSLS block lies inside the first filemark");
+	if (!layout.has_tape) {
+		// The data set is the logical stream: BackupSize is its length (both compressed samples).
+		set.backup_size = file.Size();
+	} else {
+		if (msls.offset < layout.soft_filemark_bytes) {
+			throw FormatError("backup file \"" + file.Name() + "\": its MSLS block lies inside the first filemark");
+		}
+		set.backup_size = msls.offset - layout.soft_filemark_bytes;
 	}
-	set.backup_size = msls.offset - layout.soft_filemark_bytes;
 	ReadTrailer(file, msls, set);
 
 	for (const auto &block : layout.blocks) {
