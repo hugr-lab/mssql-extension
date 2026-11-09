@@ -168,6 +168,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_bytes.cpp
     src/backup/backup_container.cpp
     src/backup/backup_mtf.cpp
+    src/backup/backup_page_index.cpp
     src/backup/backup_ranges.cpp
     src/backup/backup_set.cpp
     src/backup/backup_xpress.cpp
