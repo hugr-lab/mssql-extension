@@ -671,6 +671,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_mtf.cpp \
     test/cpp/backup/test_backup_ranges.cpp \
     test/cpp/backup/test_backup_source.cpp \
+    test/cpp/backup/test_backup_xpress.cpp \
     test/cpp/test_catalog_filter.cpp \
     test/cpp/test_filter_encoder.cpp \
     test/cpp/test_statistics_provider.cpp \

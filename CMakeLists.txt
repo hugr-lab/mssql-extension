@@ -146,6 +146,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_mtf.cpp
     src/backup/backup_ranges.cpp
     src/backup/backup_set.cpp
+    src/backup/backup_xpress.cpp
     src/backup/backup_source.cpp
     # SQL Server code pages (spec 091): the server-generated tables and the decode kernels.
     src/codec/code_page/code_page.cpp
