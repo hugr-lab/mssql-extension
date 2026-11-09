@@ -10,8 +10,10 @@ bool IsTransientLoginError(uint32_t number) {
 	switch (number) {
 	case 40613:
 	case 40197:
+	case 40143:
 	case 40501:
 	case 49918:
+	case 42109:
 		return true;
 	default:
 		return false;

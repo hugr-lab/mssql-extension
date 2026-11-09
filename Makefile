@@ -404,29 +404,15 @@ test-debug: debug
 	build/debug/test/unittest "*mssql*" --force-reload
 
 # C++ test sources (TDS layer + query layer - minimal, no DuckDB dependencies)
-CPP_TEST_SOURCES := \
-    src/tds/tds_connection.cpp \
-    src/tds/tds_packet.cpp \
-    src/tds/tds_socket.cpp \
-    src/tds/tds_types.cpp \
-    src/tds/tds_protocol.cpp \
-    src/tds/tds_token_parser.cpp \
-    src/tds/tds_column_metadata.cpp \
-    src/tds/tds_row_reader.cpp \
-    src/tds/encoding/utf16.cpp \
-    src/tds/tls/tds_tls_stub.cpp \
-    src/query/mssql_simple_query.cpp
-
-CPP_TEST_INCLUDES := -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include
-CPP_TEST_FLAGS := -std=c++17 -pthread -DMSSQL_TLS_STUB=1 -Wno-deprecated-declarations
-
-# Build and run C++ simple query test
-test-simple-query:
+# Build and run the C++ simple query test (needs SQL Server). Linked against the extension's
+# static library like test-transaction-pin: its hand-kept source list went stale (a TLS stub
+# file that no longer exists) and the target stopped building.
+test-simple-query: $(PIN_TEST_BUILD)
 	@echo "Building C++ simple query test..."
 	@mkdir -p build/test
-	$(CXX) $(CPP_TEST_FLAGS) $(CPP_TEST_INCLUDES) \
+	$(CXX) $(SPEC047_TEST_FLAGS) -I src/include $(SPEC047_TEST_INCLUDES) \
 	    test/cpp/test_simple_query.cpp \
-	    $(CPP_TEST_SOURCES) \
+	    $(PIN_TEST_LIBS) \
 	    -o build/test/test_simple_query
 	@echo ""
 	@echo "Running test..."
@@ -436,7 +422,7 @@ test-simple-query:
 	@echo "  MSSQL_TEST_USER=$(MSSQL_TEST_USER)"
 	@echo "  MSSQL_TEST_DB=$(MSSQL_TEST_DB)"
 	@echo ""
-	build/test/test_simple_query
+	$(PIN_TEST_RPATH) build/test/test_simple_query
 
 # Spec 043: LOGIN7 non-ASCII fix + simdutf wrapper unit tests
 # Pure in-memory test — does NOT need SQL Server or TLS. Uses the simdutf

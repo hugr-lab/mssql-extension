@@ -27,9 +27,12 @@ class ClientContext;
 namespace mssql {
 
 //! The server error numbers a login is retried on, and only these: 40613 a database not
-//! available yet (serverless resuming), 40197 a service error while processing, 40501 the
-//! service busy, 49918 not enough resources. Microsoft's guidance for them is to retry the
-//! connection. Never 18456 (credentials or state), never a socket, TLS or DNS failure.
+//! available yet (serverless resuming), 40197 a service error while processing, 40143 a
+//! service error asking for a retry, 40501 the service busy, 49918 not enough resources,
+//! 42109 a Synapse / Fabric SQL pool warming up. All are in SqlClient's baseline transient set
+//! (SqlConfigurableRetryFactory). Not its 42108, a PAUSED pool: nothing resumes it while a
+//! login waits, so a retry would only spend the timeout. Never 18456 (credentials or state),
+//! never a socket, TLS or DNS failure.
 bool IsTransientLoginError(uint32_t number);
 
 //! A refused login whose number IsTransientLoginError: what RetryTransientLogin tries again.
