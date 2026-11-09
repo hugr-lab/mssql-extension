@@ -1,8 +1,12 @@
 #include "backup/backup_page_index.hpp"
 
+#include "backup/backup_container.hpp"
+#include "backup/backup_pass_search.hpp"
+
 #include "backup/backup_bytes.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 
 namespace duckdb {
@@ -648,46 +652,213 @@ bool BuildRankedPassMap(const RandomAccess &stream, uint64_t offset, uint64_t le
 	return true;
 }
 
-bool PageIndex::Locate(uint16_t file, uint32_t page, PageLocation &location) const {
+IndexedPass::IndexedPass() = default;
+IndexedPass::IndexedPass(IndexedPass &&other) {
+	*this = std::move(other);
+}
+IndexedPass &IndexedPass::operator=(IndexedPass &&other) {
+	// Moved only while the index is built (the sort by pass number), before any reader.
+	number = other.number;
+	family = other.family;
+	data_offset = other.data_offset;
+	data_length = other.data_length;
+	units_offset = other.units_offset;
+	groups = other.groups;
+	map = std::move(other.map);
+	search = std::move(other.search);
+	by_block = other.by_block;
+	fell_back.store(other.fell_back.load());
+	return *this;
+}
+IndexedPass::~IndexedPass() = default;
+
+PageIndex::PageIndex() : fallback_lock_(new std::mutex()) {}
+PageIndex::PageIndex(PageIndex &&) = default;
+PageIndex &PageIndex::operator=(PageIndex &&) = default;
+PageIndex::~PageIndex() = default;
+
+bool PageIndex::FindIn(size_t i, const ExtentId &extent, uint64_t &position, bool &by_block) const {
+	auto &pass = passes_[i];
+	by_block = false;
+	if (pass.Searched()) {
+		try {
+			by_block = pass.by_block;
+			return pass.search->Find(extent, position);
+		} catch (OrderBroken &) {
+			// The search gave the pass up (its order broke where it looked, or a container block was
+			// not E13's): map it by its headers instead, once, and answer from the map (D4a).
+			by_block = false;
+			FallBack(i);
+		}
+	}
+	return pass.map.Find(extent, position);
+}
+
+void PageIndex::FallBack(size_t i) const {
+	auto &pass = passes_[i];
+	// The map is published by `fell_back` after it is built; the search object stays, for readers
+	// still in it. Sequential (BuildPassMap), under the index's lock: a fallback is the rare path.
+	std::lock_guard<std::mutex> guard(*fallback_lock_);
+	if (!pass.search || pass.fell_back.load(std::memory_order_acquire)) {
+		return;
+	}
+	const auto &stream = *families_[pass.family].stream;
+	PassMap map = BuildPassMap(stream, pass.data_offset, pass.data_length, pass.number);
+	map.number = pass.number;
+	map.family = pass.family;
+	pass.map = std::move(map);
+	pass.fell_back.store(true, std::memory_order_release);
+}
+
+bool PageIndex::Locate(uint16_t file, uint32_t page, PageLocation &location, bool expected) const {
+	if (LocateOnce(file, page, location)) {
+		return true;
+	}
+	if (!expected) {
+		return false;
+	}
+	// A page that must be there and is not: a searched pass's absence rests on an order it may not
+	// have, so map every searched pass by its headers and ask again (E12: a full's pass 1 carries
+	// every live page and every allocation page).
+	bool searched = false;
+	for (size_t i = 0; i < passes_.size(); i++) {
+		if (passes_[i].Searched()) {
+			FallBack(i);
+			searched = true;
+		}
+	}
+	return searched && LocateOnce(file, page, location);
+}
+
+bool PageIndex::LocateOnce(uint16_t file, uint32_t page, PageLocation &location) const {
 	ExtentId extent;
 	extent.file = file;
 	extent.extent = page / PAGES_PER_EXTENT;
 	for (size_t i = passes_.size(); i-- > 0;) {
 		uint64_t group;
-		if (passes_[i].Find(extent, group)) {
+		bool by_block = false;
+		if (FindIn(i, extent, group, by_block)) {
 			// Within one pass an extent is in one family (E12): the same pass of another family
 			// carrying it too is a crafted file, refused here rather than by an open-time pass
 			// over every extent.
 			for (size_t j = i; j-- > 0 && passes_[j].number == passes_[i].number;) {
 				uint64_t other;
-				if (passes_[j].Find(extent, other)) {
+				bool other_block = false;
+				if (FindIn(j, extent, other, other_block)) {
 					throw FormatError("backup: data pass " + std::to_string(passes_[i].number + 1) +
 									  " carries extent " + std::to_string(file) + ":" + std::to_string(extent.extent) +
 									  " in two media families (" + std::to_string(passes_[j].family + 1) + " and " +
 									  std::to_string(passes_[i].family + 1) + ")");
 				}
 			}
-			location.family = passes_[i].family;
-			location.pass = passes_[i].number;
-			location.offset = passes_[i].units_offset + group * GROUP_BYTES +
-							  static_cast<uint64_t>(page % PAGES_PER_EXTENT) * PAGE_SIZE;
+			const auto &pass = passes_[i];
+			location.family = pass.family;
+			location.pass = pass.number;
+			if (by_block) {
+				location.block = group;
+				location.offset = PageLocation::NO_BLOCK;
+			} else {
+				location.block = PageLocation::NO_BLOCK;
+				location.offset = pass.units_offset + group * GROUP_BYTES +
+								  static_cast<uint64_t>(page % PAGES_PER_EXTENT) * PAGE_SIZE;
+			}
 			return true;
 		}
 	}
 	return false;
 }
 
-size_t PageIndex::MemoryBytes() const {
-	size_t bytes = passes_.capacity() * sizeof(PassMap);
+bool PageIndex::ReadPage(uint16_t file, uint32_t page, std::vector<uint8_t> &out, bool expected) const {
+	PageLocation at;
+	if (!Locate(file, page, at, expected)) {
+		return false;
+	}
+	out.resize(PAGE_SIZE);
+	if (at.block == PageLocation::NO_BLOCK) {
+		families_[at.family].stream->ReadAt(at.offset, out.data(), PAGE_SIZE);
+		return true;
+	}
+	// A block a resync found (trust_layout): decode its group, take the page's unit.
+	const IndexedPass *pass = nullptr;
 	for (const auto &p : passes_) {
-		bytes += p.MemoryBytes();
+		if (p.number == at.pass && p.family == at.family) {
+			pass = &p;
+		}
+	}
+	if (!pass || !pass->search || !pass->by_block) {
+		throw FormatError("backup: page " + std::to_string(file) + ":" + std::to_string(page) +
+						  " located in a block of a pass that is not searched by block");
+	}
+	std::vector<uint8_t> group;
+	static_cast<const ContainerPassMedium &>(pass->search->Medium()).DecodeGroup(at.block, group);
+	std::memcpy(out.data(), group.data() + static_cast<size_t>(page % PAGES_PER_EXTENT) * PAGE_SIZE, PAGE_SIZE);
+	return true;
+}
+
+size_t PageIndex::MemoryBytes() const {
+	// Under the fallback lock: a fallback replaces a pass's map.
+	std::lock_guard<std::mutex> guard(*fallback_lock_);
+	size_t bytes = passes_.capacity() * sizeof(IndexedPass);
+	for (const auto &p : passes_) {
+		bytes += p.map.MemoryBytes();
+		if (p.search) {
+			bytes += p.search->MemoryBytes();
+		}
 	}
 	return bytes;
 }
 
+//! The search over a full backup's pass 1 of family `family` (DQ-41): a plain file's groups
+//! bisected; a container's groups through its chain walked from known blocks, galloping; under
+//! trust_layout, a container's blocks found by resync, bisected.
+static std::unique_ptr<PassSearch> SearchFor(const FamilyStream &family, const MtfStream &data,
+											 const PassHeaderScan &scan, bool trust_layout, bool &by_block) {
+	by_block = false;
+	const uint64_t units_offset = scan.GroupOffset(0);
+	if (!family.container) {
+		return std::unique_ptr<PassSearch>(new PassSearch(
+			std::unique_ptr<PassMedium>(new FilePassMedium(*family.stream, units_offset, scan.GroupCount()))));
+	}
+	const auto &c = *family.container;
+	if (!trust_layout || !c.file || !c.stream || !c.seek) {
+		return std::unique_ptr<PassSearch>(new PassSearch(
+			std::unique_ptr<PassMedium>(new FilePassMedium(*family.stream, units_offset, scan.GroupCount())),
+			PassSearch::Strategy::Gallop));
+	}
+	// The pass's blocks: from the block whose output starts its units to the seek index entry at its
+	// end (E13: every pass ends where an entry names a block).
+	const uint64_t end_logical = data.data_offset + data.length;
+	uint64_t end_physical = 0;
+	for (const auto &entry : *c.seek) {
+		if (entry.logical == end_logical) {
+			end_physical = entry.physical;
+		}
+	}
+	const auto first = c.stream->BlockOf(units_offset);
+	if (end_physical == 0 || first.logical != units_offset) {
+		// Not E13's layout: walk the chain instead.
+		return std::unique_ptr<PassSearch>(new PassSearch(
+			std::unique_ptr<PassMedium>(new FilePassMedium(*family.stream, units_offset, scan.GroupCount())),
+			PassSearch::Strategy::Gallop));
+	}
+	std::unique_ptr<PassMedium> medium;
+	try {
+		medium.reset(new ContainerPassMedium(*c.file, first.physical, end_physical, c.chain_end, c.decoder));
+	} catch (FormatError &) {
+		// A seek entry that does not bound the pass's blocks: not E13's layout, walk the chain.
+		return std::unique_ptr<PassSearch>(new PassSearch(
+			std::unique_ptr<PassMedium>(new FilePassMedium(*family.stream, units_offset, scan.GroupCount())),
+			PassSearch::Strategy::Gallop));
+	}
+	by_block = true;
+	return std::unique_ptr<PassSearch>(new PassSearch(std::move(medium)));
+}
+
 //! One family's passes, appended to `passes` with their family and pass numbers.
-static void AddFamilyPasses(const RandomAccess &stream, const MtfLayout &layout, uint32_t family, bool rank_first_pass,
-							const PassMapper &mapper, std::vector<PassMap> &passes) {
+static void AddFamilyPasses(const FamilyStream &family_stream, uint32_t family, bool single_family,
+							const PageIndexOptions &options, std::vector<IndexedPass> &passes) {
+	const RandomAccess &stream = *family_stream.stream;
+	const MtfLayout &layout = *family_stream.layout;
 	uint32_t number = 0;
 	if (layout.FindAll("SSET").size() > 1) {
 		throw FormatError("backup file \"" + stream.Name() +
@@ -717,35 +888,54 @@ static void AddFamilyPasses(const RandomAccess &stream, const MtfLayout &layout,
 		if (!data) {
 			continue;
 		}
-		PassMap map;
-		if (!(this_number == 0 && rank_first_pass &&
-			  BuildRankedPassMap(stream, data->data_offset, data->length, map))) {
-			map = mapper ? mapper(stream, data->data_offset, data->length, this_number)
-						 : BuildPassMap(stream, data->data_offset, data->length, this_number);
+		IndexedPass pass;
+		pass.number = this_number;
+		pass.family = family;
+		pass.data_offset = data->data_offset;
+		pass.data_length = data->length;
+		PassHeaderScan bounds(stream.Name(), stream.Size(), data->data_offset, data->length, this_number);
+		pass.units_offset = bounds.GroupOffset(0);
+		pass.groups = bounds.GroupCount();
+		const bool first_of_full = this_number == 0 && options.full_backup;
+		bool mapped = false;
+		if (first_of_full && single_family && !family_stream.container) {
+			// One plain family: its pass 1 from its allocation pages (E12); a rank that fails is
+			// searched instead.
+			mapped = BuildRankedPassMap(stream, data->data_offset, data->length, pass.map);
 		}
-		map.number = this_number;
-		map.family = family;
-		passes.push_back(std::move(map));
+		if (!mapped && first_of_full) {
+			pass.search = SearchFor(family_stream, *data, bounds, options.trust_layout, pass.by_block);
+			mapped = true;
+		}
+		if (!mapped) {
+			pass.map = options.mapper ? options.mapper(stream, data->data_offset, data->length, this_number)
+									  : BuildPassMap(stream, data->data_offset, data->length, this_number);
+		}
+		pass.map.number = this_number;
+		pass.map.family = family;
+		passes.push_back(std::move(pass));
 	}
 }
 
-PageIndex BuildPageIndex(const std::vector<FamilyStream> &families, bool rank_first_pass, const PassMapper &mapper) {
+PageIndex BuildPageIndex(const std::vector<FamilyStream> &families, const PageIndexOptions &options) {
 	PageIndex index;
+	index.families_ = families;
 	for (uint32_t f = 0; f < families.size(); f++) {
-		AddFamilyPasses(*families[f].stream, *families[f].layout, f, rank_first_pass && families.size() == 1, mapper,
-						index.passes_);
+		AddFamilyPasses(families[f], f, families.size() == 1, options, index.passes_);
 	}
 	// By pass number, so Locate meets the later pass first going backwards.
 	std::stable_sort(index.passes_.begin(), index.passes_.end(),
-					 [](const PassMap &a, const PassMap &b) { return a.number < b.number; });
+					 [](const IndexedPass &a, const IndexedPass &b) { return a.number < b.number; });
 	return index;
 }
 
-PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout, bool rank_first_pass) {
+PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout, bool full_backup) {
 	FamilyStream one;
 	one.stream = &stream;
 	one.layout = &layout;
-	return BuildPageIndex(std::vector<FamilyStream>{one}, rank_first_pass);
+	PageIndexOptions options;
+	options.full_backup = full_backup;
+	return BuildPageIndex(std::vector<FamilyStream>{one}, options);
 }
 
 }  // namespace backup

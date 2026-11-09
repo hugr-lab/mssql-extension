@@ -4,14 +4,19 @@
 // allocated; its GAM (page 2) allocates extents 0, 1 and 2. The pass also carries extent 4, which
 // the GAM marks free (a dead extent, as full backups carry, E2 §1.3). Checked: the allocation pages
 // are live; a page is live iff below Size, its extent allocated and its PFS byte 0x40; a page the
-// PFS frees, a page of a free extent and a page past Size are not; a missing GAM page and a header
-// naming another file are refused; page 9 is the boot page in file 1 only. Over a striped set (the
+// PFS frees, a page of a free extent and a page past Size are not; a header naming another file is
+// refused when the map is built, a missing GAM page when its interval is first asked about (the
+// GAMs are read on demand, DQ-41); page 9 is the boot page in file 1 only. Over a striped set (the
 // same pages split between two families) the index names each page's family and the map answers as
-// over one stream; passes are numbered by MSDA block, so a family's pass with no data does not
-// renumber the rest; an extent two families carry in one pass is refused. (Checked by hand, not
-// here: on the local samples every page of the probe full's allocation truth is live, and the
-// striped E2 / T3 sets locate every page in the right family.)
+// over one stream; a full's pass 1 is searched there (DQ-41) and locates every page where the
+// header-scanned index does, and a family out of order falls back to its header scan; passes are
+// numbered by MSDA block, so a family's pass with no data does not renumber the rest; an extent two
+// families carry in one pass is refused. (Checked by hand, not here: on the local samples every
+// page of the probe full's allocation truth is live; the default, trust_layout and header-scanned
+// indexes read the same bytes for every page of all 107 backups, striped and compressed included,
+// design/001-mssql-backup-reader/experiments/E13/e13_index.cpp.)
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -158,7 +163,7 @@ int main() {
 	auto fx = Build(1, header, pfs, &gam);
 	MemoryAccess stream("alloc.bak", fx.stream.data(), fx.stream.size());
 	auto index = BuildPageIndex(stream, fx.layout);
-	AllocationMap map(stream, index, {1});
+	AllocationMap map(index, {1});
 
 	Check(map.FileSize(1) == 40 && map.FileSize(2) == 0, "the file's Size from its header; an unknown file has none");
 	Check(map.IsLive(1, 0) && map.IsLive(1, 1) && map.IsLive(1, 2) && map.IsLive(1, 9),
@@ -178,23 +183,25 @@ int main() {
 		auto three = Build(3, Header(3, 40), freed, &gam);
 		MemoryAccess s("file3.bak", three.stream.data(), three.stream.size());
 		auto i = BuildPageIndex(s, three.layout);
-		AllocationMap m(s, i, {3});
+		AllocationMap m(i, {3});
 		Check(m.IsLive(3, 1) && m.IsLive(3, 12) && !m.IsLive(3, 9), "in file 3 page 9 follows the PFS");
 	}
 	{
 		auto no_gam = Build(1, header, pfs, nullptr);
 		MemoryAccess s("no_gam.bak", no_gam.stream.data(), no_gam.stream.size());
 		auto i = BuildPageIndex(s, no_gam.layout);
-		// Its extent is carried, but the GAM's unit is a zero unit: not that page.
-		Check(ErrorOf([&]() { AllocationMap m(s, i, {1}); }).find("a GAM page (page 1:2)") != std::string::npos,
-			  "a file whose GAM page the backup lacks is refused by name");
+		// Its extent is carried, but the GAM's unit is a zero unit: not that page. The GAM is read when
+		// its interval is first asked about (DQ-41), so the map builds and the question fails.
+		AllocationMap m(i, {1});
+		Check(ErrorOf([&]() { m.IsLive(1, 12); }).find("a GAM page (page 1:2)") != std::string::npos,
+			  "a file whose GAM page the backup lacks: the first question about its interval is refused by name");
 	}
 	{
 		const Bytes other = Header(7, 40);
 		auto wrong = Build(1, other, pfs, &gam);
 		MemoryAccess s("wrong_header.bak", wrong.stream.data(), wrong.stream.size());
 		auto i = BuildPageIndex(s, wrong.layout);
-		Check(ErrorOf([&]() { AllocationMap m(s, i, {1}); }).find("no record naming it") != std::string::npos,
+		Check(ErrorOf([&]() { AllocationMap m(i, {1}); }).find("no record naming it") != std::string::npos,
 			  "a file header whose record names another file is refused");
 	}
 
@@ -210,21 +217,78 @@ int main() {
 		families[0].layout = &a.layout;
 		families[1].stream = &sb;
 		families[1].layout = &b.layout;
-		auto i = BuildPageIndex(families, true);
+		PageIndexOptions full;
+		full.full_backup = true;
+		auto i = BuildPageIndex(families, full);
 		PageLocation at0, at12, at33;
 		Check(i.Locate(1, 0, at0) && at0.family == 1 && i.Locate(1, 12, at12) && at12.family == 0 &&
 				  i.Locate(1, 33, at33) && at33.family == 0,
 			  "a striped index names the family holding each page");
-		AllocationMap m(std::vector<const RandomAccess *>{&sa, &sb}, i, {1});
+		Check(i.Pass(0).Searched() && i.Pass(1).Searched(),
+			  "a striped full's pass 1 is searched in each family (DQ-41)");
+		AllocationMap m(i, {1});
 		bool same = true;
 		for (uint32_t p = 0; p < 48; p++) {
 			same = same && m.IsLive(1, p) == map.IsLive(1, p);
 		}
 		Check(m.FileSize(1) == 40 && same, "over two families the map answers as over one");
-		Check(ErrorOf([&]() {
-				  AllocationMap only_a(std::vector<const RandomAccess *>{&sa}, i, {1});
-			  }).find("a family the map was not given") != std::string::npos,
-			  "a page in a family the map lacks is refused by name");
+		auto scanned = BuildPageIndex(families, PageIndexOptions());
+		bool located_alike = true;
+		for (uint32_t p = 0; p < 48; p++) {
+			PageLocation x, y;
+			const bool fx = i.Locate(1, p, x), fy = scanned.Locate(1, p, y);
+			located_alike = located_alike && fx == fy && (!fx || (x.family == y.family && x.offset == y.offset));
+		}
+		Check(located_alike, "the searched index locates every page where the header-scanned one does");
+		// Family 0 out of order (extent 4 before extent 1): its search gives up, the pass is mapped by
+		// its headers on the spot, and every page is still located where it is.
+		auto disordered = Build(1, header, pfs, &gam, {4, 1});
+		MemoryAccess sd("disordered.bak", disordered.stream.data(), disordered.stream.size());
+		std::vector<FamilyStream> mixed(2);
+		mixed[0].stream = &sd;
+		mixed[0].layout = &disordered.layout;
+		mixed[1].stream = &sb;
+		mixed[1].layout = &b.layout;
+		auto searched = BuildPageIndex(mixed, full);
+		auto by_headers = BuildPageIndex(mixed, PageIndexOptions());
+		bool fallback_alike = true;
+		for (uint32_t p = 0; p < 48; p++) {
+			PageLocation x, y;
+			const bool fx = searched.Locate(1, p, x), fy = by_headers.Locate(1, p, y);
+			fallback_alike = fallback_alike && fx == fy && (!fx || (x.family == y.family && x.offset == y.offset));
+		}
+		Check(fallback_alike && !searched.Pass(0).Searched(),
+			  "a family out of order: its search gives up to a header scan, every page still where it is");
+		{
+			// The review's case: one plain family, extents 0..299 with 150 and 200 swapped; the rank
+			// fails, the pass is searched, and asked in order without `expected` a search that has not
+			// met the break calls some of 150..199 absent. Asked as `expected` (the page must be
+			// there), absence maps the pass by its headers and finds every one where it is.
+			std::vector<uint32_t> order;
+			for (uint32_t e = 0; e < 300; e++) {
+				order.push_back(e);
+			}
+			std::swap(order[150], order[200]);
+			auto swapped = Build(1, Header(1, 4000), pfs, &gam, order);
+			MemoryAccess sw("swapped.bak", swapped.stream.data(), swapped.stream.size());
+			auto group_of = [&](uint32_t e) {
+				return static_cast<uint64_t>(std::find(order.begin(), order.end(), e) - order.begin());
+			};
+			auto unsure = BuildPageIndex(sw, swapped.layout, true);
+			PageLocation at;
+			uint32_t hidden = 0;
+			for (uint32_t e = 0; e < 300; e++) {
+				hidden += unsure.Locate(1, e * 8 + 3, at) ? 0 : 1;
+			}
+			Check(hidden > 0, "  (without `expected`, the unseen break hides " + std::to_string(hidden) +
+								  " extents: the hazard is real)");
+			auto idx = BuildPageIndex(sw, swapped.layout, true);
+			bool all = true;
+			for (uint32_t e = 0; e < 300; e++) {
+				all = all && idx.Locate(1, e * 8 + 3, at, true) && at.offset == 2 + (group_of(e) * 8 + 3) * 8192;
+			}
+			Check(all, "a break the search did not see: every expected page is still found, where it is");
+		}
 	}
 
 	{

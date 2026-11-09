@@ -302,6 +302,15 @@ size_t PassSearch::SampleCount() const {
 	return by_position_.size();
 }
 
+size_t PassSearch::MemoryBytes() const {
+	std::lock_guard<std::mutex> guard(lock_);
+	// A std::map node: the value and about four pointers of tree bookkeeping.
+	const size_t node = 4 * sizeof(void *);
+	return by_position_.size() * (sizeof(PassSample) + sizeof(uint64_t) + node) +
+		   by_extent_.size() * (sizeof(ExtentId) + sizeof(uint64_t) + node) +
+		   empty_.size() * (2 * sizeof(uint64_t) + node);
+}
+
 uint64_t PassSearch::Reads() const {
 	std::lock_guard<std::mutex> guard(lock_);
 	return reads_;

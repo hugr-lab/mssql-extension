@@ -292,7 +292,7 @@ int main() {
 		PageLocation at;
 		const bool p2_page = index.Locate(1, 13, at) && at.pass == 1 && at.offset == p1.size() + 2 + 5 * 8192;
 		const bool p1_page = index.Locate(1, 900 * 8 + 3, at) && at.pass == 0 && at.offset == 2 + (5 * 8 + 3) * 8192;
-		Check(index.Passes().size() == 2 && p2_page && p1_page && !index.Locate(1, 3 * 8, at),
+		Check(index.PassCount() == 2 && p2_page && p1_page && !index.Locate(1, 3 * 8, at),
 			  "the later pass wins; an earlier pass serves the rest; a page in no pass is not found");
 		Check(index.MemoryBytes() < 4096, "the index of a small backup is a few KB");
 	}
@@ -489,8 +489,8 @@ int main() {
 		layout.blocks.push_back(block);
 		auto index = BuildPageIndex(fw, layout, true);
 		PageLocation at;
-		Check(index.Passes().size() == 1 && index.Locate(1, 4 * 8 + 1, at) && at.offset == 2 + (3 * 8 + 1) * 8192,
-			  "and the index falls back to the header scan, which locates the pages right");
+		Check(index.PassCount() == 1 && index.Locate(1, 4 * 8 + 1, at) && at.offset == 2 + (3 * 8 + 1) * 8192,
+			  "and the index searches the pass instead (DQ-41), which locates the pages right");
 	}
 	{
 		// Two GAM intervals: file 1 of 511232 + 64 pages. Interval 0's GAM allocates extents 0..20

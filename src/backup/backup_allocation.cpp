@@ -32,38 +32,21 @@ static std::string PageName(uint16_t file, uint32_t page) {
 }
 
 std::vector<uint8_t> AllocationMap::ReadPage(uint16_t file, uint32_t page, const char *what) const {
-	PageLocation at;
-	if (!index_.Locate(file, page, at)) {
+	std::vector<uint8_t> bytes;
+	// Every allocation page a map reads is one a full's pass 1 carries (E12): `expected`, so a
+	// searched pass cannot answer it absent on an order it does not have.
+	if (!index_.ReadPage(file, page, bytes, true)) {
 		throw FormatError("backup: " + std::string(what) + " (page " + PageName(file, page) +
 						  ") is in no data pass of the backup");
 	}
-	if (at.family >= streams_.size()) {
-		throw FormatError("backup: page " + PageName(file, page) + " is in a family the map was not given");
-	}
-	std::vector<uint8_t> bytes(PAGE_SIZE);
-	streams_[at.family]->ReadAt(at.offset, bytes.data(), bytes.size());
-	ByteReader r(bytes.data(), bytes.size(), what, at.offset);
+	ByteReader r(bytes.data(), bytes.size(), what, 0);
 	if (r.U8(0) != 1 || r.U32(32) != page || r.U16(36) != file) {
-		r.Fail(0, std::string(what) + " (page " + PageName(file, page) + ") is not that page");
+		throw FormatError("backup: " + std::string(what) + " (page " + PageName(file, page) + ") is not that page");
 	}
 	return bytes;
 }
 
-AllocationMap::AllocationMap(const RandomAccess &stream, const PageIndex &index, const std::vector<uint16_t> &files)
-	: streams_{&stream}, index_(index) {
-	Load(files);
-}
-
-AllocationMap::AllocationMap(const std::vector<const RandomAccess *> &streams, const PageIndex &index,
-							 const std::vector<uint16_t> &files)
-	: streams_(streams), index_(index) {
-	if (streams_.empty()) {
-		throw FormatError("backup: an allocation map over no stream");
-	}
-	Load(files);
-}
-
-void AllocationMap::Load(const std::vector<uint16_t> &files) {
+AllocationMap::AllocationMap(const PageIndex &index, const std::vector<uint16_t> &files) : index_(index) {
 	std::vector<uint16_t> ids = files;
 	std::sort(ids.begin(), ids.end());
 	ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
@@ -77,26 +60,30 @@ void AllocationMap::Load(const std::vector<uint16_t> &files) {
 			h.Fail(PAGE_SIZE - 2, "file " + std::to_string(id) + "'s header has no record naming it");
 		}
 		f.size = h.U32(slot0 + FILE_HEADER_SIZE_AT);
-		const uint64_t extents = (static_cast<uint64_t>(f.size) + PAGES_PER_EXTENT - 1) / PAGES_PER_EXTENT;
-		// Grown interval by interval as each GAM page is read: a crafted Size whose GAM pages the
-		// backup lacks is refused before the bitmap is allocated for it.
-		for (uint64_t base = 0; base < f.size; base += GAM_INTERVAL_PAGES) {
-			auto gam = ReadPage(id, static_cast<uint32_t>(base + 2), "a GAM page");
-			const uint64_t interval_end = std::min<uint64_t>(extents, base / PAGES_PER_EXTENT + GAM_INTERVAL_EXTENTS);
-			f.gam_free.resize(static_cast<size_t>((interval_end + 7) / 8), 0xFF);
-			ByteReader g(gam.data(), gam.size(), "a GAM page", 0);
-			const uint8_t *bits = g.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES);
-			const uint64_t first = base / PAGES_PER_EXTENT;
-			for (uint64_t i = 0; i < GAM_INTERVAL_EXTENTS && first + i < extents; i++) {
-				const uint64_t e = first + i;
-				const bool free = (bits[i / 8] >> (i % 8)) & 1;
-				if (!free) {
-					f.gam_free[e / 8] &= static_cast<uint8_t>(~(1u << (e % 8)));
-				}
-			}
-		}
+		// One slot per GAM interval (at most 8,402 for 2^32 pages); the bits are read on demand, so a
+		// crafted Size allocates no bitmap for intervals nobody asks about.
+		const size_t intervals =
+			static_cast<size_t>((static_cast<uint64_t>(f.size) + GAM_INTERVAL_PAGES - 1) / GAM_INTERVAL_PAGES);
+		f.gam_free.resize(intervals);
+		f.gam_loaded.assign(intervals, false);
 		files_.push_back(std::move(f));
 	}
+}
+
+bool AllocationMap::GamFree(const File &file, uint32_t extent) const {
+	const size_t interval = extent / GAM_INTERVAL_EXTENTS;
+	const uint32_t within = extent % GAM_INTERVAL_EXTENTS;
+	std::lock_guard<std::mutex> guard(lock_);
+	auto &f = const_cast<File &>(file);
+	if (!f.gam_loaded[interval]) {
+		const uint32_t gam_page = static_cast<uint32_t>(interval * GAM_INTERVAL_PAGES + 2);
+		auto gam = ReadPage(f.id, gam_page, "a GAM page");
+		ByteReader g(gam.data(), gam.size(), "a GAM page", 0);
+		const uint8_t *bits = g.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES);
+		f.gam_free[interval].assign(bits, bits + GAM_BITMAP_BYTES);
+		f.gam_loaded[interval] = true;
+	}
+	return (f.gam_free[interval][within / 8] >> (within % 8)) & 1;
 }
 
 const AllocationMap::File *AllocationMap::Find(uint16_t file) const {
@@ -126,8 +113,7 @@ bool AllocationMap::ExtentAllocated(uint16_t file, uint32_t page) const {
 	if (!f || page >= f->size) {
 		return false;
 	}
-	const uint32_t e = page / PAGES_PER_EXTENT;
-	return !((f->gam_free[e / 8] >> (e % 8)) & 1);
+	return !GamFree(*f, page / PAGES_PER_EXTENT);
 }
 
 uint8_t AllocationMap::PfsByte(const File &file, uint32_t page) const {
@@ -168,9 +154,13 @@ bool AllocationMap::IsLive(uint16_t file, uint32_t page) const {
 }
 
 size_t AllocationMap::MemoryBytes() const {
+	std::lock_guard<std::mutex> guard(lock_);
 	size_t bytes = files_.capacity() * sizeof(File);
 	for (const auto &f : files_) {
-		bytes += f.gam_free.capacity();
+		bytes += f.gam_free.capacity() * sizeof(std::vector<uint8_t>) + f.gam_loaded.capacity() / 8;
+		for (const auto &interval : f.gam_free) {
+			bytes += interval.capacity();
+		}
 	}
 	return bytes + pfs_cache_.capacity() * (sizeof(PfsPage) + PAGE_SIZE);
 }

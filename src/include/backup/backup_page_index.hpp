@@ -21,9 +21,11 @@
 
 #include "backup/backup_mtf.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace duckdb {
@@ -211,42 +213,130 @@ bool BuildRankedPassMap(const RandomAccess &stream, uint64_t offset, uint64_t le
 
 //! Where a page's latest copy lies.
 struct PageLocation {
+	static constexpr uint64_t NO_BLOCK = ~uint64_t(0);
 	uint32_t family = 0;  // the media family (stripe) whose stream holds the copy
 	uint32_t pass = 0;
-	uint64_t offset = 0;  // in that family's stream
+	uint64_t offset = 0;  // in that family's stream (a container's: its data set), when block is NO_BLOCK
+	//! Under trust_layout, a container's pass found by resync: the physical offset of the block
+	//! whose decoded group holds the page (unit page % 8); offset is then NO_BLOCK too, so a read
+	//! at it fails rather than reading the data set's start (ReadPage handles both).
+	uint64_t block = NO_BLOCK;
 };
 
-//! One media family's data: its stream (a family file, or a container's data set) and its walk.
+class ContainerStream;
+class PassSearch;
+struct SeekEntry;
+
+//! A container family's file and chain, for the search under trust_layout (DQ-41).
+struct ContainerFamily {
+	const RandomAccess *file = nullptr;
+	const ContainerStream *stream = nullptr;  // the family's data set
+	const std::vector<SeekEntry> *seek = nullptr;
+	uint64_t chain_end = 0;
+	std::function<void(const uint8_t *, size_t, uint8_t *, size_t)> decoder;
+};
+
+//! One media family's data: its stream (a family file, or a container's data set) and its walk;
+//! `container` when the stream is a container's data set.
 struct FamilyStream {
 	const RandomAccess *stream = nullptr;
 	const MtfLayout *layout = nullptr;
+	const ContainerFamily *container = nullptr;
+};
+
+//! How BuildPageIndex maps a full backup's pass 1 and every other pass (D4a, DQ-41).
+struct PageIndexOptions {
+	//! A full backup: its pass 1 is ranked (one plain family, E12) or searched (a striped set, a
+	//! container, a rank that failed), never read whole. Otherwise every pass is header-scanned.
+	bool full_backup = false;
+	//! A container's pass 1 searched by resync from any offset (DQ-41's trust_layout), not through
+	//! its chain walked from known blocks.
+	bool trust_layout = false;
+	//! The header scans' mapper (the DuckDB layer's reads them as parallel ranges); BuildPassMap
+	//! when empty.
+	PassMapper mapper;
+};
+
+//! One pass of the index: mapped (ranked or by headers) or searched.
+struct IndexedPass {
+	IndexedPass();
+	IndexedPass(IndexedPass &&);
+	IndexedPass &operator=(IndexedPass &&);
+	~IndexedPass();
+
+	uint32_t number = 0;
+	uint32_t family = 0;
+	uint64_t data_offset = 0;  // its MQDA stream, for a header scan when a search gives up
+	uint64_t data_length = 0;
+	uint64_t units_offset = 0;
+	uint64_t groups = 0;
+	PassMap map;  // when not searched, or once its search gave up (fell_back)
+	std::unique_ptr<PassSearch> search;
+	bool by_block = false;	// the search's positions are a container's block offsets
+	//! The search gave the pass up and `map` (its header scan) answers now. Set once, after the map
+	//! is built; the search stays alive for the readers still in it.
+	std::atomic<bool> fell_back{false};
+	bool Searched() const {
+		return search != nullptr && !fell_back.load(std::memory_order_acquire);
+	}
 };
 
 class PageIndex {
 public:
+	PageIndex();
+	PageIndex(PageIndex &&);
+	PageIndex &operator=(PageIndex &&);
+	~PageIndex();
+
 	//! The latest copy of page `page` of file `file`: the last pass that carries its extent (D4:
 	//! the later pass wins; within one pass an extent is in exactly one family, E12, and a pass
 	//! carrying it in two families is a FormatError). False when no pass of any family carries it.
-	bool Locate(uint16_t file, uint32_t page, PageLocation &location) const;
-	const std::vector<PassMap> &Passes() const {
-		return passes_;
+	//! A searched pass reads the file (DQ-41); one whose order breaks is mapped by its headers then.
+	//! A searched pass's "absent" rests on its order, which a search sees only where it looks: with
+	//! `expected` (the page is live, or an allocation page: a full's pass 1 carries every one, E12),
+	//! an answer of absent maps every searched pass by its headers and asks again, so a break the
+	//! search did not see cannot hide a page.
+	bool Locate(uint16_t file, uint32_t page, PageLocation &location, bool expected = false) const;
+	//! The 8 KB at `page`'s location into `out`: false when no pass carries it (`expected` as for
+	//! Locate). Its header is the caller's to check (a ranked pass may locate a zero unit, E12).
+	bool ReadPage(uint16_t file, uint32_t page, std::vector<uint8_t> &out, bool expected = false) const;
+
+	size_t PassCount() const {
+		return passes_.size();
+	}
+	//! Its `map` is the pass's only while it is not Searched(): a search that gives up replaces it.
+	const IndexedPass &Pass(size_t i) const {
+		return passes_[i];
+	}
+	const FamilyStream &Family(size_t f) const {
+		return families_[f];
+	}
+	size_t FamilyCount() const {
+		return families_.size();
 	}
 	size_t MemoryBytes() const;
 
 private:
-	friend PageIndex BuildPageIndex(const std::vector<FamilyStream> &, bool, const PassMapper &);
-	std::vector<PassMap> passes_;
+	friend PageIndex BuildPageIndex(const std::vector<FamilyStream> &, const PageIndexOptions &);
+	//! Pass `i`'s position of `extent` when it carries it: a group index, or under trust_layout a
+	//! container block's offset (`by_block`). A search that gives up maps the pass by its headers.
+	bool FindIn(size_t i, const ExtentId &extent, uint64_t &position, bool &by_block) const;
+	//! Pass `i` mapped by its headers, its search given up (under fallback_lock_ inside).
+	void FallBack(size_t i) const;
+	bool LocateOnce(uint16_t file, uint32_t page, PageLocation &location) const;
+
+	std::vector<FamilyStream> families_;
+	mutable std::vector<IndexedPass> passes_;
+	mutable std::unique_ptr<std::mutex> fallback_lock_;
 };
 
-//! Every data pass of every family (each MSDA block's MQDA stream), mapped by BuildPassMap,
-//! ordered by pass number. With `rank_first_pass` (a full backup, the caller's to say) and one
-//! family, pass 1 is tried by BuildRankedPassMap first; a striped set splits its extents between
-//! families at run time (E12), so its passes are always mapped by their headers: by `mapper` when
-//! given, else BuildPassMap.
-PageIndex BuildPageIndex(const std::vector<FamilyStream> &families, bool rank_first_pass = false,
-						 const PassMapper &mapper = PassMapper());
-//! One family's index.
-PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout, bool rank_first_pass = false);
+//! Every data pass of every family (each MSDA block's MQDA stream), ordered by pass number: a full
+//! backup's pass 1 ranked or searched, as `options` and the families say; every other pass by its
+//! headers.
+PageIndex BuildPageIndex(const std::vector<FamilyStream> &families,
+						 const PageIndexOptions &options = PageIndexOptions());
+//! One family's index; `full_backup` as PageIndexOptions says.
+PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout, bool full_backup = false);
 
 }  // namespace backup
 }  // namespace mssql

@@ -124,6 +124,11 @@ public:
 	const std::string &Name() const override {
 		return name_;
 	}
+	//! The block whose output holds data-set offset `logical`, the chain walked to it.
+	ChainBlock BlockOf(uint64_t logical) const {
+		std::lock_guard<std::mutex> guard(lock_);
+		return Locate(logical);
+	}
 	//! A copy: readers add checkpoints to the chain as they walk it.
 	BlockChain Chain() const {
 		std::lock_guard<std::mutex> guard(lock_);

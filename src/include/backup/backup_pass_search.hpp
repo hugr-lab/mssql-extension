@@ -174,6 +174,8 @@ public:
 		return *medium_;
 	}
 	size_t SampleCount() const;
+	//! The samples' and empty spans' memory, roughly (map nodes).
+	size_t MemoryBytes() const;
 	//! The medium calls made (probes and windows), for the counters and the tests.
 	uint64_t Reads() const;
 	uint64_t BytesRead() const {
