@@ -71,6 +71,7 @@ the specs it affects. **Blocking** means the named PR cannot open until the ques
 | DQ-35 | the helper naming family | keep as drafted | 022–024 |
 | DQ-36 | committed samples or a release asset | committed, ≤ 2 MB each, ≤ 16 MB in all | 085 PR 1 |
 | DQ-37 | `backup_<component>.cpp` source names | yes | 085 PR 1 |
+| DQ-41 | how a striped or compressed pass is indexed | **decided** (owner, 2026-11-09): searched, not read (E13: every pass ascending, a container's block = one extent group, a block found from any offset); samples kept; the header scan only for pass 2, a differential's pass and a pass whose order breaks (085 D4a, task 7a) | — |
 | DQ-40 | which pages are a table's | **decided** (owner, 2026-11-09): its AU's IAM chain, walked at the table's first scan through the page store; the page header checked at read; a differential's own pages by their header AU; an ATTACH reads the headers, allocation and catalog pages only (085 D4, D4a) | — |
 | DQ-39 | what an opened backup keeps in memory | **decided** (owner, 2026-11-09): at most 0.4 MB resident per GB of backup (4 GB for 10 TB); extent bitmaps with ranks, block checkpoints, the catalog model resident; the AU index buffer-managed (replaced by DQ-40's IAM chain); page bytes not kept; a slow open is acceptable; a saved index later, as an option (085 D4a) | — |
 | DQ-38 | how the reader does I/O | **decided** (owner, 2026-11-09): coalesced ranges, fetched asynchronously and in parallel through DuckDB's I/O pool and `CachingFileSystem`, as the Parquet reader does (085 D3a) | — |
@@ -639,6 +640,28 @@ time), and a compressed backup still walks its block chain at open.
 **Affects** 085 D4 / D4a, stages 2–4a, § Resources, acceptance 12, tasks 7a / 8 / 11a / 24, § Risks;
 089's previous-owner rule already reads the base IAM images (E7); its changed-set pass over the
 page headers (089 D3) is unchanged.
+
+### DQ-41 — How is a striped or compressed pass indexed? — **DECIDED** (owner, 2026-11-09)
+
+**DECIDED: by searching it, not by reading it.** Recorded as 085 D4a and E13; task 7a +2.5 d.
+
+D4a and DQ-40 left two backups read whole at open: a striped set (its passes indexed from their page
+headers, E12 found no rank per family) and a compressed one (its chain walked, a header per ≤ 64 KB
+block, which on object storage reads most of the file). E13 found every pass of the samples
+ascending by (file, extent), 210 of 210, each family of a striped set included; in a container
+every block of a pass outputs exactly 64 KB from a unit boundary (block *k* = extent group *k*), the
+seek index names the pass boundaries, and a block is found from any offset by its next four
+plausible headers (0 wrong in 3.6 M probes). So an extent is found by bisection over a family's
+groups or a container's blocks, interpolating on the block index where the rank gives it, with the
+probes kept as samples: 6–8 requests a cold lookup on the samples, 0.4–1.9 warm; extrapolated, the
+open of a 10 TB compressed full reads about 1 GB instead of the whole file.
+
+The order is checked by every probe; a pass whose order breaks falls back to its header scan.
+Pass 2 and a differential's pass stay header-scanned (small; a differential's yields DQ-40's
+`(AU, page)` pairs). The chain walk stays for that fallback and `verify`.
+
+**Affects** 085 D4a, stage 2, the block index (now samples), § Rules (MSSQLBAK), § Resources,
+acceptance 12, task 7a, § Risks.
 
 ## Settled during the consistency pass (no question)
 

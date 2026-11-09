@@ -157,9 +157,9 @@ Out, each refused by name until its spec lands:
     the headers (families, sets, data files, `mssql_backup_info`'s fields); per pass a bitmap of the
     extents it carries with a rank directory, so a page's place in the stream is the rank of its
     extent among the pass's extents, found in O(1) (≈ 21 MB per pass and 2.6 MB of ranks for 10 TB);
-    for compressed media one checkpoint per 64 blocks (physical offset, logical offset), the block
-    itself found by walking the ≤ 63 headers inside the range the read fetches anyway (≈ 40 MB for
-    10 TB, against ≈ 2.6 GB for an entry per block); the catalog model (schemas, tables, columns,
+    per pass the samples its searches have found (DQ-41, E13: a block's or group's offset and the
+    extent it names, tens of bytes each, one per probe made), so a striped or compressed pass is
+    searched, never walked whole; the catalog model (schemas, tables, columns,
     types, a table's AUs, its partitioning: grows with objects, not data); the per-table fuzzy status;
     per data file its `Size` and GAM bits (one bit per extent, ≈ 21 MB for 10 TB; PFS pages are read
     on demand, one per 8,088 pages, and the last few kept); per AU its catalog row (`pgfirstiam`,
@@ -172,10 +172,11 @@ Out, each refused by name until its spec lands:
     up to ≈ 2 GB for a 10 TB table whose extents interleave with another's. A differential's
     `(AU, page)` pairs from its header pass (D4). Also the raw base tables when
     `mssql_backup_catalog` asks for them.
-  - **What an ATTACH reads**: the MTF headers, the pass-1 allocation pages (E12, below), a header pass
-    over pass 2, a differential's pass and a striped set (below), and the catalog's base tables (read
-    through their own IAM chains). Enough to list the schemas, tables and views and to bind them;
-    no user table's pages and no IAM page of one.
+  - **What an ATTACH reads**: the MTF headers (a container's seek index: its pass boundaries), the
+    allocation pages (E12, below; found by search in a striped or compressed pass, DQ-41), a header
+    pass over pass 2 and a differential's pass, and the catalog's base tables (read through their
+    own IAM chains). Enough to list the schemas, tables and views and to bind them; no user table's
+    pages and no IAM page of one.
   - **Not kept**: page bytes (fetched as ranges, D3a; a remote file's in `ExternalFileCache`), decoded
     pages, LOB values (the scan's working memory, bounded by `max_memory`), log records (only D11's
     flags stay), the open pass's intermediate records (freed once the index is built).
@@ -193,9 +194,21 @@ Out, each refused by name until its spec lands:
     **(2025)**). So the open of such a backup reads the file headers and the GAMs (at ranks the GAMs
     give: 2,560 GAM pages for 10 TB, at most 160 MB as the 64 KB groups that hold them) and the MTF
     headers, not every page; the extent bitmap is the GAM's, and the PFS pages are read when a scan
-    needs them (D4a's allocation tier). Pass 2, a differential's pass and a striped set (whose
-    extents are split between families at run time) are indexed from their page headers, one per
-    8-unit group. The rule is checked where the reader reads a group, never trusted blindly.
+    needs them (D4a's allocation tier). Pass 2 and a differential's pass (small; a differential's for
+    its `(AU, page)` pairs, D4) are indexed from their page headers, one per 8-unit group. The rule
+    is checked where the reader reads a group, never trusted blindly.
+  - **E13 (done, `research/experiments/E13-ordered-passes-search.md`) and DQ-41: a striped or
+    compressed pass is searched, not read.** Every pass is ascending by (file, extent) (210 of 210:
+    pass 1 and 2, fulls and differentials, plain and compressed, each family of a striped set);
+    in a container every block of a pass outputs exactly 64 KB from a unit boundary, so block *k* is
+    the pass's extent group *k*, and the seek index names the pass boundaries. So an extent's group
+    is found by searching the pass: in a family file group *g* is at a computed offset (bisection
+    over groups); in a container a probe at any offset finds a block by the next four plausible
+    headers (the fourth is always a true block, 3.6 M probes) and decodes it for its extent. On the
+    rank path the extent's rank gives its block index, so the search interpolates on it; elsewhere it
+    bisects. Probes are kept as samples. Measured on the samples: 6–8 requests a cold lookup, 0.4–1.9
+    warm. A probe that meets a key out of order refuses the search for that pass, which falls back
+    to its header scan (a loss of speed, never of correctness).
   - **A saved index is a later option**, not part of 085: written to a path the user names
     (`temp_directory` does not outlive the process), keyed by `BackupSetGUID`, the families' sizes and
     version tags.
@@ -558,9 +571,11 @@ flowchart BT
   1. *headers*: per family the TAPE / SSET / VOLB / MSCI / MSLS fields, the container header, the
      data-stream boundaries. Enough for most of `mssql_backup_info`.
   2. *page index* (D4a): per pass the extent bitmap and its ranks (or explicit runs where the order
-     breaks): a single-family full's pass 1 from its GAMs (E12), every other pass from its page
-     headers, one read per 8-unit group, in parallel ranges (D3a; I/O plus decompression); a
-     differential's pass also yields its `(AU, page)` pairs (D4).
+     breaks): a single-family full's pass 1 from its GAMs (E12; in a container its GAMs found by
+     search, DQ-41); a striped set's passes searched (DQ-41), their samples growing as pages are
+     located; pass 2 and a differential's pass from their page headers, one read per 8-unit group,
+     in parallel ranges (D3a; I/O plus decompression); a differential's pass also yields its
+     `(AU, page)` pairs (D4).
   3. *allocation* (D4a): per data file `Size` and the GAM bits, kept; PFS pages on demand; the DCM /
      BCM bitmaps only for `verify` and spec 089.
   4. *catalog*: the decoded base tables (through their IAM chains) and the derived model. Stages 1–4
@@ -568,9 +583,10 @@ flowchart BT
   4a. *a table's pages* (DQ-40): at its first scan, its AUs' IAM chains walked into extent runs and
      single pages, kept per AU.
   5. *log tail*: the transaction table and the per-allocation-unit flags of D11.
-- **Block index** (compressed media, D4a): one checkpoint per 64 blocks (physical offset, logical
-  offset in the MTF data set); a block's own header (kind, payload length, output size `unit × 512`)
-  is read inside the fetched range. Built while walking the chain in stage 2.
+- **Block samples** (compressed media, DQ-41): per pass the blocks the searches have probed (physical
+  offset, the extent it names; its logical offset when the rank gives it). A read from a sample
+  walks the headers inside the range it fetches anyway; the chain is never walked whole at open
+  (`WalkChain` stays for a pass whose order broke and for `verify`).
 - **`TableLayout`**: per rowset of the table (one per partition) the physical columns from
   `sysrscols` (rscolid, hbcolid, ti, collation, ordkey, status, offset, nullbit, bitpos), the logical
   columns from `syscolpars`, the defaults from `sysseobjvalues`, the allocation units (IN_ROW_DATA,
@@ -668,9 +684,13 @@ offsets above are in its fixed part.
   catches it: the page header's own fields (D4) and, in a backup taken WITH CHECKSUM, the page
   checksum (task 7). zstd comes from vcpkg, linked statically: DuckDB's bundled `duckdb_zstd` is not
   DUCKDB_API, so a loadable extension cannot rely on the host exporting it.
-- The chain index keeps one checkpoint per 64 blocks and at most one per MiB of the file (D4a; a
-  crafted chain of tiny blocks cannot grow it); a read walks the headers from its checkpoint to the
-  next. A compressed container's data set has no TAPE, so its media fields (family count and
+- A block is found from any offset (E13, DQ-41): scan forward to the first offset whose header and
+  the three headers its chain leads to are plausible (kind 0x21 / 0x23, 1–128 units, a stored
+  block's length its output, inside the chain), and take the fourth. Inside a data pass every
+  block outputs exactly 64 KB from a unit boundary; the first block (8 KB) and the 4 KB ones at the
+  pass boundaries and the trailer are the only others, and the seek index names those boundaries.
+  The full chain walk (`WalkChain`, its checkpoint every 64 blocks and at most one per MiB) serves
+  the fallback and `verify`. A compressed container's data set has no TAPE, so its media fields (family count and
   sequence, media set GUID) are not located yet and reported NULL. A block header's checksum (u32 @24) is not validated: its algorithm is unknown (the
   MTF headers inside the data set are, and a decompressor validates its own frame).
 - XPRESS: per block a 256-byte table of 512 4-bit code lengths, then the LZ77+Huffman stream;
@@ -841,7 +861,7 @@ Each component of 085, with its home or its bound:
 
 | component | grows with | home or bound |
 |---|---|---|
-| extent bitmaps and ranks, block checkpoints (stage 2, D4a) | the file's extents and blocks (≈ 85 MB for 10 TB) | resident while the backup is open; within D4a's 0.4 MB per GB |
+| extent bitmaps and ranks, block samples (stage 2, D4a, DQ-41) | the file's extents (≈ 45 MB for 10 TB) and the probes made | resident while the backup is open; within D4a's 0.4 MB per GB |
 | a table's pages (stage 4a, DQ-40) | the runs of the scanned tables' extents (tens of MB typically, ≈ 2 GB worst case for a 10 TB table) | built from the IAM chain at a table's first scan; buffer-managed per AU in the opened backup, a scan pins its table's; they spill |
 | allocation (stage 3) | the files' extents (≈ 21 MB for 10 TB) | resident: `Size` and GAM bits; PFS pages read on demand, 64 kept |
 | opened-file cache (D9) | files opened | DuckDB's `ObjectCache`: an entry reports `GetEstimatedCacheMemory` (`DD/src/include/duckdb/storage/object_cache.hpp:48`), so the buffer pool evicts it under pressure (`DD/src/storage/buffer/buffer_pool.cpp:348`); an attached catalog pins its entry; an evicted entry costs a reopen |
@@ -965,7 +985,9 @@ committed samples only.
     IAM pages (counted), and leaves at most 40 MB resident (D4a's 0.4 MB per GB, `duckdb_memory()`'s
     `EXTENSION` tag after the open); a table's first scan reads its IAM pages and its own pages, a
     second reads no IAM page again; a synthetic database whose tables interleave extent by extent
-    (D4a's worst case) stays within the same bound for its resident tier.
+    (D4a's worst case) stays within the same bound for its resident tier. The same database backed
+    up `WITH COMPRESSION`, and striped in two, reads at most 1 % of its files at ATTACH (counted:
+    DQ-41's search, no chain walk, no header pass over pass 1).
 13. A backup much larger than memory (a generated 20 GB full, the manual lane), every table scanned
     with `memory_limit = '1GB'` and every thread, completes: the peak memory DuckDB accounts
     (`duckdb_memory()`, the buffer manager's used bytes) stays under the limit, and every table equals
@@ -996,8 +1018,11 @@ merges before the next opens (never stacked).
    fixture of E2, then the version matrix)? Decides whether the open pass reads every page (D4a) —
    1.5 d
 7a. Page index (D4a): units of every pass and family, latest copy, pads and zero units, positional
-   check; the extent bitmaps and ranks with the order check and explicit runs where it breaks, block
-   checkpoints; the header pass over parallel ranges (D3a) — 4 d (5 before DQ-40 moved the AU index
+   check; the extent bitmaps and ranks with the order check and explicit runs where it breaks; the
+   header pass over parallel ranges (D3a); the search (DQ-41, E13): block resync, samples, bisection
+   over a family's groups or a container's blocks, interpolation on the block index on the rank
+   path, a `Locate` that reads, the fallback to the header scan when the order breaks — 6.5 d (4
+   before DQ-41's search, +4 d less the chain checkpoints' 1.5 d; 5 before DQ-40 moved the AU index
    out, to task 11a)
 8. Allocation map and `IsLive`, several files and GAM intervals, PFS on demand — 2 d
 9. `mssql_backup_info`, registered through `RegisterDocumentedFunction` — 1 d
@@ -1057,7 +1082,7 @@ module `src/codec/code_page/` has merged (D7)
 29. Docs per PR: README (user-facing), `DATAMODEL.md` (a "Backup reader" layer section with the
     diagram above), CLAUDE.md (functions, settings, layout), CHANGELOG, website — 2 d
 
-**Total ≈ 76.5 days, 14–15.5 weeks** (75 before DQ-40's IAM chain took the AU index out of task 7a,
+**Total ≈ 79 days, 14.5–16 weeks** (76.5 before DQ-41's search joined task 7a, +2.5 d; 75 before DQ-40's IAM chain took the AU index out of task 7a,
 −1 d, into task 11a, +2 d, and the differential's header path joined task 24, +0.5 d; 72.5 before D4a's index and E12 joined task 7, +2.5 d; 69 before
 D3a's ranged, asynchronous I/O joined tasks 2, 4 and 7, +3.5 d, both owner 2026-11-09; 66.5 before E7's partitioning model joined task 12, 68.5
 before the plain `_mssql_lob` output joined task 20 from 089 task 7, DQ-05, 69.5 before spec 091
@@ -1072,10 +1097,11 @@ cost.
 - **Version drift is the main risk.** Every offset above is **(2025)**. The catalog layouts (D5), the
   boot page, SCIN offsets and the MSSQLBAK header may differ on 2017–2022. The CI matrix is what turns
   each into a verified row; until a version passes, it is refused (D14).
-- **The open pass**: a single-family uncompressed full opens from its allocation and catalog pages
-  (E12, DQ-40); a striped set's passes are indexed from their page headers, so a striped backup is
-  read whole at open, in parallel ranges (D3a); a compressed one walks its block chain, a header per
-  block of ≤ 64 KB, which on object storage reads most of the file. A saved index is a later option
+- **The open pass**: a backup opens from its allocation and catalog pages (E12, DQ-40), found in a
+  striped or compressed pass by search (DQ-41). What stays read whole is pass 2 and a
+  differential's pass (small in the samples; a pass 2 of terabytes was not seen), and any pass
+  whose order breaks (none in 210, E13), which falls back to its header scan; the order and the
+  64 KB block are 2025's until the version matrix checks them. A saved index is a later option
   (D4a).
 - **MS_XPRESS on older versions** may carry history across blocks (W§3; Redgate hints 2008 R2
   differs). D10 makes that a named error, not wrong data.
