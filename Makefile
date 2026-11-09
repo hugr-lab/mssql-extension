@@ -666,6 +666,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_ddl_translator.cpp \
     test/cpp/test_ctas_type_mapping.cpp \
     test/cpp/test_login_retry.cpp \
+    test/cpp/test_backup_bytes.cpp \
     test/cpp/test_catalog_filter.cpp \
     test/cpp/test_filter_encoder.cpp \
     test/cpp/test_statistics_provider.cpp \

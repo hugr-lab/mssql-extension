@@ -71,6 +71,8 @@ the specs it affects. **Blocking** means the named PR cannot open until the ques
 | DQ-35 | the helper naming family | keep as drafted | 022–024 |
 | DQ-36 | committed samples or a release asset | committed, ≤ 2 MB each, ≤ 16 MB in all | 085 PR 1 |
 | DQ-37 | `backup_<component>.cpp` source names | yes | 085 PR 1 |
+| DQ-39 | what an opened backup keeps in memory | **decided** (owner, 2026-11-09): at most 0.4 MB resident per GB of backup (4 GB for 10 TB); extent bitmaps with ranks, block checkpoints, the catalog model resident; the AU index buffer-managed; page bytes not kept; a slow open is acceptable; a saved index later, as an option (085 D4a) | — |
+| DQ-38 | how the reader does I/O | **decided** (owner, 2026-11-09): coalesced ranges, fetched asynchronously and in parallel through DuckDB's I/O pool and `CachingFileSystem`, as the Parquet reader does (085 D3a) | — |
 
 ## The questions
 
@@ -157,7 +159,7 @@ R§10.4 left it open.
 Options:
 - 090 first (track A: 085 → 089 PR 1 → 090), as the mssql README's single-developer interleave does;
 - 088 first;
-- two developers on both tracks (about 34 weeks instead of 52).
+- two developers on both tracks (about 35 weeks instead of 52.5).
 
 The guard extensions of 090, each refused by name until built: ROW / PAGE compression (2–3 wk), ADR /
 RCSI (3–4 wk), DDL in the tail (1–2 wk), columnstore delta stores and bitmaps (1 wk, after 088).
@@ -580,6 +582,38 @@ platform. Only synthetic data made on a clean instance is ever committed (T4).
 
 **Recommendation: yes.** `backup_<component>.cpp` is the peer of `tds_<component>.cpp`, and CLAUDE.md's
 rule is extended to name it.
+
+### DQ-38 — How does the reader do I/O? — **DECIDED** (owner, 2026-11-09)
+
+**DECIDED: as the Parquet reader does on DuckDB 2.0. Reads are byte ranges (HTTP range requests on
+httpfs), adjacent ones coalesced, fetched as `AsyncTask`s on DuckDB's ASYNC pool from a `BLOCKED`
+table-function result, through `CachingFileSystem` / `ExternalFileCache`; the open pass fetches the
+data stream in parallel ranges, and a compressed chain too where its seek index gives the blocks'
+offsets.** Recorded as 085 D3a; +3.5 d on 085 PR 1 (tasks 2, 4, 7).
+
+The draft (D3) read positionally through the FileSystem, which on httpfs is already a range request,
+but one at a time, and the open pass as one sequential read of the whole file, the main cost of a
+backup on object storage (085 § Risks). The parsers are unchanged: they stay DuckDB-free over spans
+(D15), and only the I/O layer is DuckDB's.
+
+**Affects** 085 D3 / D9 / D17 (the fetched ranges are buffer-managed), tasks 2, 4, 7 and acceptance 8;
+089's export and 090's recovery read through the same layer.
+
+### DQ-39 — What does an opened backup keep in memory? — **DECIDED** (owner, 2026-11-09)
+
+**DECIDED: at most 0.4 MB of resident memory per GB of backup, 4 GB for a 10 TB backup. The open may
+be slow; a bind and a read must be fast.** Recorded as 085 D4a:
+- resident while open: the headers, per pass an extent bitmap with ranks (a page's place in O(1)),
+  compressed-media checkpoints every 64 blocks, the catalog model, the fuzzy status;
+- buffer-managed: the AU index (runs of live extents per allocation unit, sorted at open), liveness
+  applied once and GAM / PFS dropped;
+- not kept: page bytes, decoded pages, LOB values, log records;
+- E12 decides whether the open reads every page;
+- a saved index is a later option at a path the user names (`temp_directory` does not outlive the
+  process).
+
+The draft (stage 2) kept 16 bytes per page, about 0.2 % of the backup: 20 GB for 10 TB, buffer-managed
+but far past the budget. +2.5 d on 085 PR 1 (task 7 and E12).
 
 ## Settled during the consistency pass (no question)
 

@@ -71,11 +71,56 @@ Out, each refused by name until its spec lands:
   (A§2: a DETACH inside an expanded PRAGMA is refused).
 
 - **D3 — I/O only through DuckDB's file system (owner, R§6.1 layer 1).** Files open through
-  `FileSystem::GetFileSystem(context).OpenFile(path, FILE_FLAGS_READ)`, the client-context file system
-  that carries the opener, so `s3://`, `gs://`, `r2://`, `https://` (httpfs) and `az://`,
+  `CachingFileSystem::Get(context).OpenFile(path, FILE_FLAGS_READ)` (D3a), which wraps the
+  client-context file system that carries the opener
+  (`DD/src/include/duckdb/storage/external_file_cache/caching_file_system.hpp:152-159`), so `s3://`,
+  `gs://`, `r2://`, `https://` (httpfs) and `az://`,
   `abfss://` (azure) work with the user's DuckDB secrets, and DuckDB autoloads the extension for the
-  scheme (`virtual_file_system.cpp:428`). Reads are positional (`Read(buffer, n, location)`), so
-  threads share one handle. No SDK, no own HTTP, no own credential handling.
+  scheme (`virtual_file_system.cpp:428`). Reads are positional, so threads share one
+  `shared_ptr<CachingFileHandle>`. No SDK, no own HTTP, no own credential handling.
+
+- **D3a — reads are ranges, coalesced, fetched asynchronously and in parallel, as the Parquet reader
+  does (owner, 2026-11-09; DQ-38).** On httpfs a positional read is an HTTP range request, so the
+  layer above the parsers works in ranges, never in a stream:
+  - **Ranges, coalesced.** A consumer asks for the byte ranges it needs (a unit's pages, a block, a
+    header); adjacent and nearly adjacent ranges are merged into one request, as Parquet merges its
+    read heads within a 16 KiB gap (`DD/extension/parquet/include/thrift_tools.hpp:61-79`,
+    `AddReadHead` `:107-130`), and the merged range is split again by the reader at a size that suits
+    the pins it can afford: one `CachingFileHandle::Read` pins its whole range. Below that, the
+    caching handle cuts a remote read into cache blocks of at most
+    `external_file_cache_remote_max_block_size` (2 MiB by default) and fetches them in parallel on the
+    ASYNC pool (`DD/src/storage/external_file_cache/caching_file_system.cpp:378-418`). A local file
+    reads the same way.
+  - **Asynchronous.** The fetches run as `AsyncTask`s on DuckDB's I/O pool:
+    `AsyncResult::FromTasks(…, TaskSchedulerType::ASYNC)` (`DD/src/include/duckdb/parallel/async_result.hpp`,
+    the pool `async_threads` sizes), returned as a `BLOCKED` result from the table function, so the
+    decode threads do not wait on the network. Any plain table function may do it: the table scan
+    runs in TASK_EXECUTOR mode by default (`DD/src/parallel/async_result.cpp:284-294`) and schedules
+    the tasks, or runs them with `ExecuteTasksSynchronously(context)` when it cannot block
+    (`DD/src/execution/operator/scan/physical_table_scan.cpp:171-206`;
+    `TableFunctionInput::HandleBlocked` runs them side by side, `DD/src/function/table_function.cpp:214-231`).
+    Its limits: a `BLOCKED` result comes with an empty chunk (`physical_table_scan.cpp:150-155`), only a
+    `function` may block (not an `in_out_function`), and the multi-file wrapper forces SYNCHRONOUS
+    (`DD/src/common/multi_file/table_function_multi_file.cpp:376`), so 085's functions do not use it.
+  - **Cached.** Reads go through DuckDB's `CachingFileSystem` / `ExternalFileCache`
+    (`DD/src/include/duckdb/storage/external_file_cache/`), whose buffers are the buffer manager's,
+    counted against `memory_limit` (D17). A **remote** file is cached when `enable_external_file_cache`
+    is on (the default) and the file has validation metadata (ETag or last-modified); its blocks are
+    evictable once unpinned, so an importer calling the functions once per table on one file, beside
+    D9's opened-file cache, usually fetches a range once (an evicted block is fetched again). A
+    **local** file is not cached by default (`cache_local_files` is off,
+    `DD/src/storage/external_file_cache/external_file_cache.cpp:103-110`): its reads are counted
+    buffers freed on release.
+  - **The open pass in parallel.** Only the MTF headers are walked one after another (a few small
+    reads). An uncompressed MSDA is one run of 8 KB units, each naming its own page (D4), so once its
+    stream header gives its extent the page index is built from many ranges fetched at once. A
+    compressed chain (`MSSQLBAK`) is a run of headers each giving the next one's offset: when the seek
+    index after the chain (§ Rules, MSSQLBAK) lists the blocks' offsets, it is read first and the
+    chain is fetched in parallel too (task 4 finds out); otherwise the chain is read ahead in large
+    ranges and its blocks are decompressed on every thread (D10).
+  - **LOB trees** are fetched one level at a time: a node's children are known only once it is read,
+    so the ranges of one level are coalesced and fetched together.
+  - The parsers stay DuckDB-free (D15): they take spans the I/O layer has fetched.
 
 - **D4 — the page store is an index by page id, gated by liveness.** A page names itself
   (`m_pageId` @32, `m_fileId` @36, X§3), so the store is `(file_id, page_id) → location of its latest
@@ -87,6 +132,45 @@ Out, each refused by name until its spec lands:
   IAM chains: the header AU was right on 10,473 of 10,473 allocated pages, after SHRINKFILE and REBUILD
   too (E2§2, R4), and stale only on pages the liveness rule already drops. This corrects R§3's "map
   through IAM chains". IAM pages remain an optional cross-check (`verify := true`).
+
+- **D4a — what an opened backup keeps, and the budget: at most 0.4 MB of resident memory per GB of
+  backup, 4 GB for 10 TB (owner, 2026-11-09).** The open pass may be slow (a backup is opened once per
+  instance, D9); what must be fast is a bind and a read. So the opened backup keeps three tiers:
+  - **Resident while the backup is open** (pinned; what every bind and every page read needs):
+    the headers (families, sets, data files, `mssql_backup_info`'s fields); per pass a bitmap of the
+    extents it carries with a rank directory, so a page's place in the stream is the rank of its
+    extent among the pass's extents, found in O(1) (≈ 21 MB per pass and 2.6 MB of ranks for 10 TB);
+    for compressed media one checkpoint per 64 blocks (physical offset, logical offset), the block
+    itself found by walking the ≤ 63 headers inside the range the read fetches anyway (≈ 40 MB for
+    10 TB, against ≈ 2.6 GB for an entry per block); the catalog model (schemas, tables, columns,
+    types, a table's AUs, its partitioning: grows with objects, not data); the per-table fuzzy status;
+    the directory of the AU index below. Typically 0.1–0.2 GB for 10 TB.
+  - **Buffer-managed, spilled under pressure** (counted against `memory_limit`, D17): the AU index,
+    `AU → runs (first extent, count)` of live pages, built at open by DuckDB's sort over the pass's
+    `(AU, extent)` records and cut into segments; a scan pins its table's segments only. Liveness is
+    applied once, at open: GAM, the PFS allocated bit (1 bit a page, ≈ 168 MB for 10 TB, read from the
+    allocation pages while the pass runs) and `Size` decide which pages enter a run, a partly
+    allocated or mixed extent (pages of several AUs, PFS 0x20) is listed by page; GAM and PFS are not
+    kept after it. Typically tens of MB; up to ≈ 2 GB when tables interleave extent by extent. Also
+    the raw base tables when `mssql_backup_catalog` asks for them.
+  - **Not kept**: page bytes (fetched as ranges, D3a; a remote file's in `ExternalFileCache`), decoded
+    pages, LOB values (the scan's working memory, bounded by `max_memory`), log records (only D11's
+    flags stay), the open pass's intermediate records (freed once the index is built).
+  - **The stream order is checked, not assumed.** A pass's extents must come in ascending (file, page)
+    order for the rank to give their place; the open pass checks it, and a pass or a stretch of one
+    that breaks it is recorded as explicit runs `(file, first extent, count, offset)`: a loss of
+    compactness, never of correctness.
+  - **A page's type, level and `m_lsn` are not indexed**: the scan reads them from the page it reads
+    anyway (and skips the index pages there); D11's check (iv) reads the few pages the log tail names.
+    Spec 089's changed set (`m_lsn > since_lsn` on every live page, 089 D3) is computed by 089's own
+    pass over the page headers when `since_lsn` is given, not stored in this index.
+  - **E12 (planned, before task 7)**: whether a full backup's first pass carries exactly the
+    GAM-allocated extents, in order. If it does, the open pass reads the allocation pages and the
+    MTF headers instead of every page (the open of a 10 TB backup without reading 10 TB); if not, the
+    pass reads every page header, as above.
+  - **A saved index is a later option**, not part of 085: written to a path the user names
+    (`temp_directory` does not outlive the process), keyed by `BackupSetGUID`, the families' sizes and
+    version tags.
 
 - **D5 — the catalog from the backup alone, data-driven per version.** The boot page gives the
   database name, version, collation and the first `sysallocunits` page (X§4). Five base tables have
@@ -444,16 +528,17 @@ flowchart BT
   stages, each cached when first needed:
   1. *headers*: per family the TAPE / SSET / VOLB / MSCI / MSLS fields, the container header, the
      data-stream boundaries. Enough for most of `mssql_backup_info`.
-  2. *page index*: one sequential pass over every family (I/O plus decompression), recording
-     per extent its location (family, pass, physical offset or block number and offset in block) and
-     per page a 16-byte summary (type, level, flags, allocation-unit ordinal, `m_lsn`). Kept in
-     buffer-managed blocks, so it spills under memory pressure; about 0.2 % of the backup's size.
-  3. *allocation*: per data file `Size`, the GAM / SGAM / DCM / BCM bitmaps, the PFS bytes, IAM
-     summaries.
+  2. *page index* (D4a): one pass over every family in parallel ranges (D3a; I/O plus
+     decompression), building per pass the extent bitmap and its ranks (or explicit runs where the
+     order breaks), and the `(AU, extent)` records the AU index is sorted from.
+  3. *allocation* (D4a): per data file `Size`, GAM and the PFS allocated bit, applied to the AU index
+     while it is built and then dropped; the DCM / BCM bitmaps and IAM summaries only for `verify`
+     and spec 089.
   4. *catalog*: the decoded base tables and the derived model.
   5. *log tail*: the transaction table and the per-allocation-unit flags of D11.
-- **Block index** (compressed media): per block its physical offset, payload length, kind, output
-  size (`unit × 512`) and logical offset in the MTF data set. Built while walking the chain in stage 2.
+- **Block index** (compressed media, D4a): one checkpoint per 64 blocks (physical offset, logical
+  offset in the MTF data set); a block's own header (kind, payload length, output size `unit × 512`)
+  is read inside the fetched range. Built while walking the chain in stage 2.
 - **`TableLayout`**: per rowset of the table (one per partition) the physical columns from
   `sysrscols` (rscolid, hbcolid, ti, collation, ordkey, status, offset, nullbit, bitpos), the logical
   columns from `syscolpars`, the defaults from `sysseobjvalues`, the allocation units (IN_ROW_DATA,
@@ -659,12 +744,14 @@ Each component of 085, with its home or its bound:
 
 | component | grows with | home or bound |
 |---|---|---|
-| page index, block index (stage 2) | the file's pages and blocks (~0.2 % of the backup) | buffer-managed blocks, pinned while read; they spill |
+| extent bitmaps and ranks, block checkpoints (stage 2, D4a) | the file's extents and blocks (≈ 85 MB for 10 TB) | resident while the backup is open; within D4a's 0.4 MB per GB |
+| AU index (stage 2, D4a) | the runs of the tables' extents (tens of MB typically, ≈ 2 GB worst case for 10 TB) | buffer-managed segments built by DuckDB's sort; a scan pins its table's; they spill |
 | opened-file cache (D9) | files opened | DuckDB's `ObjectCache`: an entry reports `GetEstimatedCacheMemory` (`DD/src/include/duckdb/storage/object_cache.hpp:48`), so the buffer pool evicts it under pressure (`DD/src/storage/buffer/buffer_pool.cpp:348`); an attached catalog pins its entry; an evicted entry costs a reopen |
 | catalog (stage 4) | objects × columns | the decoded base tables in `ColumnDataCollection`s built with the `ClientContext`, spillable; the model over them indexes them by id, and a `TableLayout` is built only for a table a call binds |
 | log tail (stage 5) | the tail's records | read block by block; the transaction table and the per-AU flags of D11 are buffer-managed (090 D9 extends them) |
 | decode staging | the rows of a chunk | one chunk per running unit, closed at the codec's staging byte budget or a full vector, whichever comes first; reserved (D17) |
 | a compressed block being read | ≤ 64 KB | one per thread (§ Scan) |
+| fetched ranges (D3a) | the ranges in flight and cached | the buffer manager's: a remote file's cached blocks are counted and evictable once unpinned; a local file's reads are counted and freed on release; the ranges in flight are bounded by the units in flight |
 | a LOB value | its length | not streamed: DuckDB has no streamed value, so a value is assembled whole in its vector, fragment by fragment, capped at 2^31 − 1 bytes. Its length, known from its root before a fragment is read, is reserved first, by D17's rule: a unit that cannot reserve it waits for the others, and a value that still cannot fit while its unit runs alone is refused by name (table, `_mssql_rid`, column, length, `max_memory`, `temp_directory`) |
 
 So a scan holds at most `MaxThreads()` (≤ `max_threads`) chunks and LOB values at once, under the
@@ -768,13 +855,17 @@ committed samples only.
 6. On E3's fuzzy runs the per-table status equals flag (v): every differing table flagged, no
    consistent table flagged.
 7. A second call on an opened file reads no file bytes (counted); a rewritten file is reopened.
-8. `s3://` (MinIO in the lane) and `https://` reads give the local result.
+8. `s3://` (MinIO in the lane) and `https://` reads give the local result. The open pass and a scan
+   are measured on MinIO in requests and in time, sequential against D3a's parallel ranges; a second
+   call on the same file, with nothing evicted in between, fetches no range again (D3a).
 9. ATTACH: `SELECT` works; `CREATE`, `INSERT`, `UPDATE`, `DELETE`, `COPY … TO`, `ALTER`, `DROP`
    are refused by DuckDB's read-only check.
 10. Every refusal of § Scope names its object and feature; no InternalException.
 11. The fuzz harnesses replay their corpora clean under ASan and UBSan.
-12. Opening a 100 GB backup (generated in a manual lane) holds under 300 MB resident and reads the
-    file once.
+12. Opening a 100 GB backup (generated in a manual lane) reads the file at most once and leaves at
+    most 40 MB resident (D4a's 0.4 MB per GB, `duckdb_memory()`'s `EXTENSION` tag after the open), the
+    AU index included when nothing spills; a synthetic database whose tables interleave extent by
+    extent (D4a's worst case) stays within the same bound for its resident tier.
 13. A backup much larger than memory (a generated 20 GB full, the manual lane), every table scanned
     with `memory_limit = '1GB'` and every thread, completes: the peak memory DuckDB accounts
     (`duckdb_memory()`, the buffer manager's used bytes) stays under the limit, and every table equals
@@ -789,18 +880,25 @@ merges before the next opens (never stacked).
 
 **PR 1 — container and pages (`mssql_backup_info`)**
 1. Skeleton: folders, CMake, namespaces, `ByteReader`, the error type — 1 d
-2. `ByteSource`: FileSystem handles for every family, positional reads, globs and lists — 1.5 d
+2. `ByteSource`: FileSystem handles for every family through `CachingFileSystem`, globs and lists;
+   range requests coalesced, fetched as `AsyncTask`s on the ASYNC pool (D3a) — 3 d
 3. MTF walker, checksums, SQL Server DBLKs; SSET / VOLB / MSCI / SCIN / SFIN / MSLS fields; locate
    `backup_start_date` / `backup_finish_date` / `recovery_model` and the recovery fork
    (`RecoveryForkID`, `FirstRecoveryForkID`, `ForkPointLSN`) against HEADERONLY. The fork is on the
    path to every apply by LSN: until it is read, 089's chain check refuses every differential and
    every full applied incrementally (089 D7) — 3 d
-4. MSSQLBAK header, block chain, block index — 1.5 d
+4. MSSQLBAK header, block chain, block index; whether the seek index after the chain gives the blocks'
+   offsets, so the chain is fetched in parallel (D3a) — 2.5 d
 5. XPRESS decoder, table-driven — 2 d
 6. ZSTD: link DuckDB's bundled `duckdb_zstd` if every platform's host exports it, else vcpkg `zstd`
    statically with hidden visibility (as OpenSSL) — 0.5 d
-7. Page index: units of every pass and family, latest copy, pads and zero units, positional check,
-   spillable storage — 3 d
+7. E12: does a full backup's first pass carry exactly the GAM-allocated extents, in order (on every
+   fixture of E2, then the version matrix)? Decides whether the open pass reads every page (D4a) —
+   1.5 d
+7a. Page index (D4a): units of every pass and family, latest copy, pads and zero units, positional
+   check; the extent bitmaps and ranks with the order check and explicit runs where it breaks, the
+   AU index sorted into buffer-managed segments, block checkpoints; the open pass over parallel
+   ranges (D3a) — 5 d
 8. Allocation map and `IsLive`, several files and GAM intervals — 2 d
 9. `mssql_backup_info`, registered through `RegisterDocumentedFunction` — 1 d
 10. Fuzz harnesses mtf / container / xpress / page; committed seed samples — 2 d
@@ -854,7 +952,8 @@ module `src/codec/code_page/` has merged (D7)
 29. Docs per PR: README (user-facing), `DATAMODEL.md` (a "Backup reader" layer section with the
     diagram above), CLAUDE.md (functions, settings, layout), CHANGELOG, website — 2 d
 
-**Total ≈ 69 days, 12.5–14 weeks** (66.5 before E7's partitioning model joined task 12, 68.5
+**Total ≈ 75 days, 13.5–15 weeks** (72.5 before D4a's index and E12 joined task 7, +2.5 d; 69 before
+D3a's ranged, asynchronous I/O joined tasks 2, 4 and 7, +3.5 d, both owner 2026-11-09; 66.5 before E7's partitioning model joined task 12, 68.5
 before the plain `_mssql_lob` output joined task 20 from 089 task 7, DQ-05, 69.5 before spec 091
 took the code-page tables out of task 13, −1 d, and D17's budget joined task 16, +0.5 d). Spec 091's
 days are its own, outside this total. R§8 gave phase 0 6–8 weeks; this spec also carries the
@@ -867,9 +966,9 @@ cost.
 - **Version drift is the main risk.** Every offset above is **(2025)**. The catalog layouts (D5), the
   boot page, SCIN offsets and the MSSQLBAK header may differ on 2017–2022. The CI matrix is what turns
   each into a verified row; until a version passes, it is refused (D14).
-- **The open pass** reads the whole file once, from S3 too. A 1 TB backup is one sequential read
-  before the first row. A persisted index (a side file next to the backup) is a possible later step;
-  not proposed.
+- **The open pass** reads the whole file once, from S3 too, in parallel ranges (D3a); a 10 TB backup
+  is read whole before the first row unless E12 shows the allocation pages suffice (D4a). A saved
+  index is a later option (D4a).
 - **MS_XPRESS on older versions** may carry history across blocks (W§3; Redgate hints 2008 R2
   differs). D10 makes that a named error, not wrong data.
 - **Legacy LOB types** (`text`, `ntext`, `image`) are unverified.
