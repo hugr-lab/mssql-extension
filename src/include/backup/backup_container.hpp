@@ -69,6 +69,7 @@ struct BlockChain {
 	static constexpr uint64_t CHECKPOINT_STRIDE = 64;
 	static constexpr uint64_t CHECKPOINT_BYTES = 1 << 20;
 	std::vector<ChainBlock> checkpoints;
+	//! Every block's count after WalkChain; 0 for a chain located from its tail.
 	uint64_t block_count = 0;
 	uint64_t logical_size = 0;
 	uint64_t end = 0;
@@ -79,14 +80,24 @@ struct BlockChain {
 //! the file and the 64 KB block limit.
 BlockChain WalkChain(const RandomAccess &file);
 
-//! The block holding logical offset `logical`, found from its checkpoint by walking headers.
-ChainBlock FindBlock(const RandomAccess &file, const BlockChain &chain, uint64_t logical);
-
 //! One entry of the seek index after the chain: a block that starts at `logical`.
 struct SeekEntry {
 	uint64_t logical = 0;
 	uint64_t physical = 0;
 };
+
+//! The chain located from the file's tail, no block walked but the trailer's (E13, DQ-41): the seek
+//! index found from the tail record, its entries and the first block as the checkpoints, the data
+//! set's size from the trailer's blocks. False when the tail is not the layout every sample has
+//! (the caller then walks the chain); a tail that has it but disagrees with its blocks throws.
+//! An entry's data-set offset is bounded by its physical one but not otherwise checked here: a
+//! read that walks up to an entry checks it lands there (ContainerStream), the MTF walk of the data
+//! set reads a DBLK at each entry (the pass boundaries) and checks it, and a page read checks the
+//! page's header names it (D4).
+bool OpenChainFromTail(const RandomAccess &file, BlockChain &chain, std::vector<SeekEntry> &seek);
+
+//! The block holding logical offset `logical`, found from its checkpoint by walking headers.
+ChainBlock FindBlock(const RandomAccess &file, const BlockChain &chain, uint64_t logical);
 
 //! The seek index at `chain.end`, or empty when what follows the chain is not one (its layout was
 //! inferred from two samples, MS_XPRESS and ZSTD, 2025). Every entry must name a block of the
@@ -113,15 +124,19 @@ public:
 	const std::string &Name() const override {
 		return name_;
 	}
-	const BlockChain &Chain() const {
+	//! A copy: readers add checkpoints to the chain as they walk it.
+	BlockChain Chain() const {
+		std::lock_guard<std::mutex> guard(lock_);
 		return chain_;
 	}
 
 private:
 	void Decode(const ChainBlock &block) const;
+	//! The block of `logical`: walked from its checkpoint, adding checkpoints as WalkChain would.
+	ChainBlock Locate(uint64_t logical) const;
 
 	const RandomAccess &file_;
-	BlockChain chain_;
+	mutable BlockChain chain_;
 	BlockDecoder decoder_;
 	std::string name_;
 	mutable std::mutex lock_;

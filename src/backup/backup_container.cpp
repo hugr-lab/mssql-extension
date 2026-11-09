@@ -23,6 +23,16 @@ static constexpr size_t SEEK_ENTRIES_AT = 40;
 static constexpr uint32_t MAX_SEEK_ENTRIES = 1024;		  // 3 to 5 seen
 static constexpr uint32_t SEEK_RECORD_TAG = 44;			  // u32 @0 (its meaning unknown; constant)
 static constexpr uint32_t SEEK_RECORD_KIND = 0x00010001;  // u32 @24 (constant)
+// The container's tail (E13, 16 of 16 containers, 2025): the file is whole 4 KB pages; a 16-byte
+// record at EOF - 12304 (u16 1, u16 1, u32 the seek index's entry count, u32 the distance back
+// from the record to the seek index, less 8, u32 unknown), then a plain SFMB at EOF - 12288, a
+// block at EOF - 8192 (the ESET), and a plain SFMB at EOF - 4096.
+static constexpr uint64_t TAIL_RECORD_FROM_END = 12304;
+static constexpr uint64_t TAIL_SFMB_FROM_END = 12288;
+static constexpr uint64_t TAIL_LAST_SFMB_FROM_END = 4096;
+// The blocks after the last seek entry (the trailer) that OpenChainFromTail walks to the chain's
+// end: the trailer is a few blocks (2 to 6 seen); a crafted tail must not make it a full walk.
+static constexpr uint32_t MAX_TRAILER_BLOCKS = 4096;
 
 const char *CompressionAlgorithmName(CompressionAlgorithm algorithm) {
 	switch (algorithm) {
@@ -192,42 +202,131 @@ ChainBlock FindBlock(const RandomAccess &file, const BlockChain &chain, uint64_t
 					  std::to_string(logical) + " (the file changed since it was opened?)");
 }
 
-std::vector<SeekEntry> ReadSeekIndex(const RandomAccess &file, const BlockChain &chain) {
+//! The seek index's entries at `at` (where the chain ends), or empty when no seek index record is
+//! there. Entries must ascend in both offsets and name a block header between the chain's start
+//! and `at`; whether each starts its logical offset is the caller's to check.
+static std::vector<SeekEntry> ParseSeekIndex(const RandomAccess &file, uint64_t at) {
 	std::vector<SeekEntry> entries;
-	if (chain.end > file.Size() || file.Size() - chain.end < SEEK_ENTRIES_AT) {
+	if (at > file.Size() || file.Size() - at < SEEK_ENTRIES_AT) {
 		return entries;
 	}
-	auto head = Read(file, chain.end, SEEK_ENTRIES_AT, "the seek index");
-	ByteReader r(head.data(), head.size(), "the seek index", chain.end);
+	auto head = Read(file, at, SEEK_ENTRIES_AT, "the seek index");
+	ByteReader r(head.data(), head.size(), "the seek index", at);
 	if (r.U32(0) != SEEK_RECORD_TAG || r.U32(24) != SEEK_RECORD_KIND) {
 		// Not the record seen after every chain: no index, not a corrupt one.
 		return entries;
 	}
 	const uint32_t count = r.U32(SEEK_COUNT_AT);
 	if (count == 0 || count > MAX_SEEK_ENTRIES ||
-		static_cast<uint64_t>(count) * 16 > file.Size() - chain.end - SEEK_ENTRIES_AT) {
+		static_cast<uint64_t>(count) * 16 > file.Size() - at - SEEK_ENTRIES_AT) {
 		return entries;
 	}
-	auto body = Read(file, chain.end + SEEK_ENTRIES_AT, static_cast<size_t>(count) * 16, "the seek index entries");
-	ByteReader e(body.data(), body.size(), "the seek index entries", chain.end + SEEK_ENTRIES_AT);
-	uint64_t previous = 0;
+	auto body = Read(file, at + SEEK_ENTRIES_AT, static_cast<size_t>(count) * 16, "the seek index entries");
+	ByteReader e(body.data(), body.size(), "the seek index entries", at + SEEK_ENTRIES_AT);
 	for (uint32_t i = 0; i < count; i++) {
 		SeekEntry entry;
 		entry.logical = e.U64(16 * i);
 		entry.physical = e.U64(16 * i + 8);
-		if ((i > 0 && entry.logical <= previous) || entry.logical >= chain.logical_size) {
-			e.Fail(16 * i, "a seek index entry out of order or past the data set");
+		if ((i > 0 && (entry.logical <= entries.back().logical || entry.physical <= entries.back().physical)) ||
+			entry.physical < CHAIN_START || entry.physical >= at) {
+			e.Fail(16 * i, "a seek index entry out of order or outside the chain");
+		}
+		entries.push_back(entry);
+	}
+	return entries;
+}
+
+std::vector<SeekEntry> ReadSeekIndex(const RandomAccess &file, const BlockChain &chain) {
+	auto entries = ParseSeekIndex(file, chain.end);
+	for (size_t i = 0; i < entries.size(); i++) {
+		const auto &entry = entries[i];
+		if (entry.logical >= chain.logical_size) {
+			throw FormatError(Where(file, chain.end) + ": a seek index entry past the data set");
 		}
 		// It must name a chain block whose output starts at its logical offset.
 		auto block = FindBlock(file, chain, entry.logical);
 		if (block.logical != entry.logical || block.physical != entry.physical) {
-			e.Fail(16 * i, "a seek index entry (logical " + std::to_string(entry.logical) + ", physical " +
-							   std::to_string(entry.physical) + ") that names no block of the chain");
+			throw FormatError(Where(file, chain.end) + ": a seek index entry (logical " +
+							  std::to_string(entry.logical) + ", physical " + std::to_string(entry.physical) +
+							  ") that names no block of the chain");
 		}
-		previous = entry.logical;
-		entries.push_back(entry);
 	}
 	return entries;
+}
+
+bool OpenChainFromTail(const RandomAccess &file, BlockChain &chain, std::vector<SeekEntry> &seek) {
+	const uint64_t size = file.Size();
+	if (size % 4096 != 0 || size < CHAIN_START + TAIL_RECORD_FROM_END) {
+		return false;
+	}
+	const uint64_t record_at = size - TAIL_RECORD_FROM_END;
+	auto record = Read(file, record_at, 16, "the container's tail record");
+	ByteReader r(record.data(), record.size(), "the container's tail record", record_at);
+	uint8_t magic[4];
+	file.ReadAt(size - TAIL_SFMB_FROM_END, magic, 4);
+	const bool sfmb = std::memcmp(magic, "SFMB", 4) == 0;
+	file.ReadAt(size - TAIL_LAST_SFMB_FROM_END, magic, 4);
+	if (!sfmb || std::memcmp(magic, "SFMB", 4) != 0 || r.U16(0) != 1 || r.U16(2) != 1) {
+		return false;
+	}
+	const uint64_t back = static_cast<uint64_t>(r.U32(8)) + 8;
+	if (back > record_at - CHAIN_START) {
+		return false;
+	}
+	const uint64_t end = record_at - back;
+	auto entries = ParseSeekIndex(file, end);
+	if (entries.empty() || entries.size() != r.U32(4)) {
+		return false;
+	}
+	// The checkpoints: the first block (logical 0) and each entry's block, whose headers must be
+	// blocks; the data set's size from walking the trailer, the blocks after the last entry.
+	BlockChain located;
+	ChainBlock block;
+	if (!ReadBlockHeader(file, CHAIN_START, 0, block)) {
+		return false;
+	}
+	located.checkpoints.push_back(block);
+	// A block takes at least a header and a byte of payload and outputs at most 64 KB, so the data
+	// set's offset at a physical offset is bounded: a crafted entry cannot claim more, or wrap.
+	auto max_logical = [](uint64_t physical) { return (physical - CHAIN_START) / (BLOCK_HEADER + 1) * MAX_BLOCK; };
+	for (const auto &entry : entries) {
+		if (entry.logical == 0) {
+			throw FormatError(Where(file, entry.physical) +
+							  ": a seek index entry at data-set offset 0, where the chain's first block is");
+		}
+		if (entry.logical > max_logical(entry.physical)) {
+			throw FormatError(Where(file, entry.physical) + ": a seek index entry at data-set offset " +
+							  std::to_string(entry.logical) + ", more than the blocks before it can hold");
+		}
+		if (!ReadBlockHeader(file, entry.physical, entry.logical, block)) {
+			throw FormatError(Where(file, entry.physical) + ": a seek index entry that names no block");
+		}
+		located.checkpoints.push_back(block);
+	}
+	uint64_t at = block.physical + BLOCK_HEADER + block.payload;
+	uint64_t logical = block.logical + block.output;
+	for (uint32_t n = 0; at < end; n++) {
+		if (n == MAX_TRAILER_BLOCKS) {
+			// Not the layout of the samples (2 to 6 blocks): walk the chain instead.
+			return false;
+		}
+		if (!ReadBlockHeader(file, at, logical, block)) {
+			throw FormatError(Where(file, at) + ": the chain's trailer does not end where its tail says");
+		}
+		logical += block.output;
+		at += BLOCK_HEADER + block.payload;
+	}
+	if (at != end) {
+		throw FormatError(Where(file, at) + ": the chain's last block runs past where its tail says it ends");
+	}
+	if (logical > max_logical(end)) {
+		throw FormatError(Where(file, end) + ": a data set larger than its chain's blocks can hold");
+	}
+	located.logical_size = logical;
+	located.end = end;
+	chain = std::move(located);
+	seek = std::move(entries);
+	return true;
 }
 
 ContainerStream::ContainerStream(const RandomAccess &file, BlockChain chain, BlockDecoder decoder)
@@ -249,6 +348,61 @@ void ContainerStream::Decode(const ChainBlock &block) const {
 	has_cached_ = true;
 }
 
+ChainBlock ContainerStream::Locate(uint64_t logical) const {
+	if (logical >= chain_.logical_size) {
+		throw FormatError("backup file \"" + file_.Name() + "\": data-set offset " + std::to_string(logical) +
+						  " is past its " + std::to_string(chain_.logical_size) + " bytes");
+	}
+	// From the last checkpoint at or before `logical`, walking headers; a checkpoint is added every
+	// CHECKPOINT_STRIDE blocks and CHECKPOINT_BYTES of the file walked, as WalkChain keeps them,
+	// so a chain located from its tail is walked once, piece by piece, and only where it is read.
+	auto it = std::upper_bound(chain_.checkpoints.begin(), chain_.checkpoints.end(), logical,
+							   [](uint64_t l, const ChainBlock &b) { return l < b.logical; });
+	if (it == chain_.checkpoints.begin()) {
+		throw FormatError("backup file \"" + file_.Name() + "\": a block chain with no checkpoint at or before " +
+						  std::to_string(logical));
+	}
+	--it;
+	ChainBlock block = *it;
+	const uint64_t stop = (it + 1) != chain_.checkpoints.end() ? (it + 1)->physical : chain_.end;
+	ChainBlock last_checkpoint = block;
+	uint64_t since = 0;
+	std::vector<ChainBlock> added;
+	while (block.physical < stop) {
+		if (logical < block.logical + block.output) {
+			if (!added.empty()) {
+				chain_.checkpoints.insert(it + 1, added.begin(), added.end());
+			}
+			return block;
+		}
+		ChainBlock next;
+		const uint64_t at = block.physical + BLOCK_HEADER + block.payload;
+		if (at >= stop && (it + 1) != chain_.checkpoints.end()) {
+			// The walk reached the next checkpoint: it must land on it, at its data-set offset, so
+			// any walk across a span confirms the checkpoints at its ends (a seek index entry's
+			// logical offset is otherwise trusted).
+			if (at != stop || block.logical + block.output != (it + 1)->logical) {
+				throw FormatError(Where(file_, at) + ": the chain's blocks do not reach the checkpoint at offset " +
+								  std::to_string(stop) + " (data-set offset " + std::to_string((it + 1)->logical) +
+								  ") where it says");
+			}
+			break;
+		}
+		if (!ReadBlockHeader(file_, at, block.logical + block.output, next)) {
+			break;
+		}
+		block = next;
+		if (++since >= BlockChain::CHECKPOINT_STRIDE &&
+			block.physical - last_checkpoint.physical >= BlockChain::CHECKPOINT_BYTES && block.physical < stop) {
+			added.push_back(block);
+			last_checkpoint = block;
+			since = 0;
+		}
+	}
+	throw FormatError(Where(file_, block.physical) + ": no block of the chain holds data-set offset " +
+					  std::to_string(logical) + " (the file changed since it was opened?)");
+}
+
 void ContainerStream::ReadAt(uint64_t offset, uint8_t *dest, size_t count) const {
 	if (offset > chain_.logical_size || count > chain_.logical_size - offset) {
 		throw FormatError("backup file \"" + file_.Name() + "\": a read past the end of its data set");
@@ -257,7 +411,7 @@ void ContainerStream::ReadAt(uint64_t offset, uint8_t *dest, size_t count) const
 	while (count > 0) {
 		if (!has_cached_ || offset < cached_.logical || offset >= cached_.logical + cached_.output) {
 			has_cached_ = false;
-			Decode(FindBlock(file_, chain_, offset));
+			Decode(Locate(offset));
 		}
 		const size_t within = static_cast<size_t>(offset - cached_.logical);
 		const size_t n = std::min(count, static_cast<size_t>(cached_.output) - within);

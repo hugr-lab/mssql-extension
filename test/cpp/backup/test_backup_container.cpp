@@ -65,7 +65,7 @@ struct Packed {
 //! The data set in a container of stored blocks of `units` × 512 bytes each (the last shorter),
 //! with a seek index naming `index_blocks`.
 Packed Pack(const Bytes &data, uint8_t units, const std::vector<size_t> &index_blocks, uint32_t flags = 0x3,
-			bool xor_compress = false) {
+			bool xor_compress = false, bool tail = false) {
 	Packed p;
 	p.file.assign(8192, 0);
 	std::memcpy(&p.file[0], "MSSQLBAK", 8);
@@ -105,8 +105,33 @@ Packed Pack(const Bytes &data, uint8_t units, const std::vector<size_t> &index_b
 		Put64(index, 40 + 16 * i, p.block_logical[index_blocks[i]]);
 		Put64(index, 48 + 16 * i, p.block_physical[index_blocks[i]]);
 	}
+	const uint64_t index_at = p.file.size();
 	p.file.insert(p.file.end(), index.begin(), index.end());
-	p.file.insert(p.file.end(), 4096, 0);
+	if (!tail) {
+		p.file.insert(p.file.end(), 4096, 0);
+		return p;
+	}
+	// The tail every sample has (E13): zeros to a record 16 bytes before a 4 KB boundary (u16 1,
+	// u16 1, u32 entry count, u32 the distance back to the seek index less 8), then SFMB, a block
+	// (the ESET), SFMB, a 4 KB page each, ending the file.
+	while ((p.file.size() + 16) % 4096 != 0) {
+		p.file.push_back(0);
+	}
+	Bytes record(16, 0);
+	Put16(record, 0, 1);
+	Put16(record, 2, 1);
+	Put32(record, 4, static_cast<uint32_t>(index_blocks.size()));
+	Put32(record, 8, static_cast<uint32_t>(p.file.size() - index_at - 8));
+	p.file.insert(p.file.end(), record.begin(), record.end());
+	Bytes page(4096, 0);
+	PutTag(page, 0, "SFMB");
+	p.file.insert(p.file.end(), page.begin(), page.end());
+	Bytes eset(4096, 0);
+	eset[0] = 0x23;
+	eset[1] = 1;
+	Put16(eset, 2, 512);
+	p.file.insert(p.file.end(), eset.begin(), eset.end());
+	p.file.insert(p.file.end(), page.begin(), page.end());
 	return p;
 }
 
@@ -271,6 +296,80 @@ int main() {
 		MemoryAccess f("cut.bak", cut.file.data(), cut.file.size());
 		Check(ErrorOf([&]() { WalkChain(f); }).find("runs past the end") != std::string::npos,
 			  "a block whose payload runs past the end of the file is refused");
+	}
+
+	{
+		// The chain located from its tail (E13, DQ-41): the same data set, its index entries as
+		// checkpoints, reads that walk only where they read and add checkpoints as they go.
+		const size_t blocks = packed.block_physical.size();
+		auto tailed = Pack(data, 1, {10, 70, blocks - 3}, 0x3, false, true);
+		MemoryAccess t("tailed.bak", tailed.file.data(), tailed.file.size());
+		auto walked = WalkChain(t);
+		BlockChain located;
+		std::vector<SeekEntry> seek;
+		const bool found = OpenChainFromTail(t, located, seek);
+		auto walked_seek = ReadSeekIndex(t, walked);
+		bool same_seek = found && seek.size() == walked_seek.size();
+		for (size_t i = 0; same_seek && i < seek.size(); i++) {
+			same_seek = seek[i].logical == walked_seek[i].logical && seek[i].physical == walked_seek[i].physical;
+		}
+		Check(found && located.logical_size == data.size() && located.end == walked.end && same_seek &&
+				  located.checkpoints.size() == 4 && located.block_count == 0,
+			  "a chain located from its tail: the data set's size and end, the seek entries, four checkpoints");
+		ContainerStream ts(t, located, BlockDecoder());
+		Bytes all(data.size());
+		ts.ReadAt(0, all.data(), all.size());
+		Check(all == data, "a stream on the located chain reads the whole data set");
+		const auto grown = ts.Chain().checkpoints.size();
+		Check(grown > 4 && grown <= walked.checkpoints.size() + 4,
+			  "the read added checkpoints as it walked, no more than a full walk keeps (" + std::to_string(grown) +
+				  " against " + std::to_string(walked.checkpoints.size()) + ")");
+		auto layout = WalkMtfDataSet(ts);
+		Check(layout.Find("SSET") && layout.Find("MSLS"), "the MTF walk of the data set runs on the located chain");
+
+		Check(!OpenChainFromTail(file, located, seek), "a container without the tail: not located (walk it)");
+		auto long_trailer = Pack(data, 1, {10, 70, 140}, 0x3, false, true);
+		MemoryAccess lt("long_trailer.bak", long_trailer.file.data(), long_trailer.file.size());
+		bool long_located = true;
+		const auto long_error = ErrorOf([&]() { long_located = OpenChainFromTail(lt, located, seek); });
+		Check(!long_located && long_error.empty(),
+			  "a last entry thousands of blocks before the end: not located (walk the chain), not an error");
+		{
+			// An entry's data-set offset a block too high: the blocks walked from the checkpoint before
+			// it do not land on it at that offset, and the read that crosses it says so. (One too low
+			// is the walk's to catch at open: in a real container the entries are the pass
+			// boundaries, where the MTF walk reads a DBLK and checks it; and every page read checks
+			// its header's page id, D4.)
+			auto shifted = tailed.file;
+			Put64(shifted, static_cast<size_t>(walked.end) + 40 + 16, tailed.block_logical[70] + 512);
+			MemoryAccess sh("shifted.bak", shifted.data(), shifted.size());
+			BlockChain sc;
+			std::vector<SeekEntry> ss;
+			Check(OpenChainFromTail(sh, sc, ss), "  (the shifted entry is not caught at open)");
+			ContainerStream shifted_stream(sh, sc, BlockDecoder());
+			Bytes byte(1);
+			Check(ErrorOf([&]() {
+					  shifted_stream.ReadAt(tailed.block_logical[70], byte.data(), 1);
+				  }).find("do not reach the checkpoint") != std::string::npos,
+				  "a seek entry at the wrong data-set offset: refused where a walk reaches it");
+			auto huge = tailed.file;
+			Put64(huge, static_cast<size_t>(walked.end) + 40 + 32, uint64_t(1) << 62);
+			MemoryAccess hu("huge.bak", huge.data(), huge.size());
+			Check(ErrorOf([&]() { OpenChainFromTail(hu, sc, ss); }).find("more than the blocks before it can hold") !=
+					  std::string::npos,
+				  "a seek entry claiming more data than its blocks can hold is refused");
+		}
+		auto miscount = tailed.file;
+		Put32(miscount, miscount.size() - 12304 + 4, 4);
+		MemoryAccess mc("miscount.bak", miscount.data(), miscount.size());
+		Check(!OpenChainFromTail(mc, located, seek),
+			  "a tail record whose count disagrees with the seek index: not located");
+		auto bad_entry = tailed.file;
+		const size_t index_at = static_cast<size_t>(walked.end);
+		Put64(bad_entry, index_at + 48 + 16, tailed.block_physical[70] + 1);  // entry 1: not a block's header
+		MemoryAccess be("bad_entry.bak", bad_entry.data(), bad_entry.size());
+		Check(ErrorOf([&]() { OpenChainFromTail(be, located, seek); }).find("names no block") != std::string::npos,
+			  "a seek entry that names no block header is refused");
 	}
 
 	std::cout << (failures ? "FAILED: " + std::to_string(failures) + " check(s)" : "all checks passed") << std::endl;
