@@ -570,9 +570,28 @@ string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string
 		return "CAST(" + reference + " AS VARBINARY(MAX)) AS " + escaped_name;
 	}
 
-	// Unsupported SQL Server types (hierarchyid, sql_variant, CLR UDTs) must be
-	// CAST to NVARCHAR(MAX) so the server sends text instead of a native wire
-	// form nothing decodes.
+	// Issue #354, until sql_variant is decoded on the wire: each value is converted by the style
+	// that keeps its base type whole. The plain cast is style 0, which kept the minute of a
+	// datetime2 (`Sep 16 2026 10:11AM`), six digits of a float, two decimals of a money, and read
+	// a varbinary's bytes as UTF-16. Measured per base type on SQL Server 2025: 3 gives a float
+	// or a real its 17 digits, 2 a money its four decimals, 126 the date/time family ISO 8601
+	// with every fraction digit, 1 a binary its 0x hex; the rest are exact under style 0. One
+	// style cannot serve a column whose type lives in each value (126 refuses a varbinary, 9809).
+	if (StringUtil::Lower(sql_type_name) == "sql_variant") {
+		const string base_type = "CAST(SQL_VARIANT_PROPERTY(" + reference + ", 'BaseType') AS NVARCHAR(128))";
+		const auto styled = [&](const char *style) {
+			return "CONVERT(NVARCHAR(MAX), " + reference + ", " + style + ")";
+		};
+		return "CASE WHEN " + base_type + " IN (N'float', N'real') THEN " + styled("3") + " WHEN " + base_type +
+			   " IN (N'money', N'smallmoney') THEN " + styled("2") + " WHEN " + base_type +
+			   " IN (N'date', N'time', N'datetime', N'datetime2', N'smalldatetime', N'datetimeoffset') THEN " +
+			   styled("126") + " WHEN " + base_type + " IN (N'binary', N'varbinary') THEN " + styled("1") +
+			   " ELSE CAST(" + reference + " AS NVARCHAR(MAX)) END AS " + escaped_name;
+	}
+
+	// Unsupported SQL Server types (hierarchyid, CLR UDTs) must be CAST to
+	// NVARCHAR(MAX) so the server sends text instead of a native wire form
+	// nothing decodes.
 	if (!IsKnownSQLServerType(sql_type_name)) {
 		return "CAST(" + reference + " AS NVARCHAR(MAX)) AS " + escaped_name;
 	}

@@ -947,6 +947,51 @@ static void TestInListOperatorExpressions() {
 	}
 }
 
+// Issue #514: a column read through a cast (sql_variant here) is compared on the server as
+// itself and in DuckDB as the text the cast gave, so no comparison of it is pushed.
+static void TestCastReadColumnNotPushed() {
+	std::cout << "  TestCastReadColumnNotPushed..." << std::endl;
+	Fixture fx;
+	std::vector<MSSQLColumnInfo> cols = {Col("id", 1, "int", 4, 10, 0), Col("dt", 2, "datetime2", 8, 27, 7),
+										 Col("flag", 3, "bit", 1, 1, 0), Col("name", 4, "sql_variant", 8016, 0, 0),
+										 Col("d", 5, "float", 8, 53, 0)};
+	ASSERT_TRUE(cols[3].is_cast_required);
+	auto ctx = fx.Context();
+	ctx.mssql_columns = &cols;
+	auto variant =
+		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, ColRef(fx, COL_NAME), Const(Value("5")));
+	ASSERT_TRUE(!FilterEncoder::EncodeSearchCondition(*variant, ctx).supported);
+	// The same shape on a column read as itself still goes.
+	auto id =
+		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, ColRef(fx, COL_ID), Const(Value::INTEGER(5)));
+	ASSERT_TRUE(FilterEncoder::EncodeSearchCondition(*id, ctx).supported);
+	// IS [NOT] NULL is exact on the server: the cast is NULL exactly when the column is.
+	auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
+	is_null->GetChildrenMutable().push_back(ColRef(fx, COL_NAME));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*is_null, ctx), "([name] IS NULL)");
+	// ... but not over an expression of it.
+	auto under = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
+	under->GetChildrenMutable().push_back(
+		BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, ColRef(fx, COL_NAME), Const(Value("5"))));
+	ASSERT_TRUE(!FilterEncoder::EncodeSearchCondition(*under, ctx).supported);
+
+	// Through a resolver (the staged MERGE's): refused the same way, IS NULL let through.
+	TwoRelationResolver resolver;
+	resolver.target = {Col("id", 1, "int", 4, 10, 0), Col("v", 2, "sql_variant", 8016, 0, 0)};
+	resolver.source = {Col("c0", 1, "int", 4, 10, 0)};
+	std::vector<column_t> no_ids;
+	std::vector<std::string> no_names;
+	std::vector<LogicalType> no_types;
+	ExpressionEncodeContext rctx(no_ids, no_names, no_types);
+	rctx.resolver = &resolver;
+	auto via_resolver = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL,
+														  RelRef(1, 1, LogicalType::VARCHAR), Const(Value("5")));
+	ASSERT_TRUE(!FilterEncoder::EncodeSearchCondition(*via_resolver, rctx).supported);
+	auto resolver_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
+	resolver_null->GetChildrenMutable().push_back(RelRef(1, 1, LogicalType::VARCHAR));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*resolver_null, rctx), "([t].[v] IS NULL)");
+}
+
 // The declaration table of spec 076 W1: the column's kind, never narrower
 // than the constant.
 static void TestDeclarationForColumn() {
@@ -1134,6 +1179,7 @@ int main() {
 	TestTruncatedReadComparisons();
 	TestInListOperatorExpressions();
 	TestDeclarationForColumn();
+	TestCastReadColumnNotPushed();
 	TestColumnResolver();
 	TestWideningCasts();
 

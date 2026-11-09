@@ -182,10 +182,20 @@ for spatial data until that is fixed.
 
 ### Other Server-Specific Types
 
-`SQL_VARIANT`, `hierarchyid` and CLR UDT columns are auto-CAST to
-`NVARCHAR(MAX)` by the catalog scan, so three-part-name queries return their
-text form. Raw `mssql_scan()` queries that select such columns without a CAST
-will fail — add an explicit `CAST(col AS NVARCHAR(MAX))` in the T-SQL.
+`SQL_VARIANT`, `hierarchyid` and CLR UDT columns are read as text by the catalog
+scan, so three-part-name queries return a `VARCHAR`. A `SQL_VARIANT` value is
+converted by its own base type, which the column does not fix: a `float` or `real`
+with all 17 digits (`1.0000000000000001e-001`), a `money` with its four decimals,
+the date and time types as ISO 8601 with every fraction digit
+(`2026-09-16T10:11:12.1234567`), a `binary` or `varbinary` as `0x` hex, the rest
+as their plain text. A filter on any of these columns runs in DuckDB, on that
+text: SQL Server would compare the value as its own type, so `WHERE v = '5'` there
+finds an `nvarchar` `'5'` and not an `int` 5, which both read as `5`. Raw
+`mssql_scan()` queries that select such columns without a conversion fail: convert
+them in the T-SQL. A plain `CAST(col AS NVARCHAR(MAX))` of a `SQL_VARIANT` is the
+lossy form above (style 0); `CONVERT(NVARCHAR(MAX), col, 126)` keeps a date or time
+whole and `CONVERT(NVARCHAR(MAX), col, 3)` a float, as the catalog read does for
+each value.
 
 ### Catalog-Reported String Types
 
