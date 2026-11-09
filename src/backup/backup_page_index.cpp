@@ -584,6 +584,19 @@ bool PageIndex::Locate(uint16_t file, uint32_t page, PageLocation &location) con
 	for (size_t i = passes_.size(); i-- > 0;) {
 		uint64_t group;
 		if (passes_[i].Find(extent, group)) {
+			// Within one pass an extent is in one family (E12): the same pass of another family
+			// carrying it too is a crafted file, refused here rather than by an open-time pass
+			// over every extent.
+			for (size_t j = i; j-- > 0 && passes_[j].number == passes_[i].number;) {
+				uint64_t other;
+				if (passes_[j].Find(extent, other)) {
+					throw FormatError("backup: data pass " + std::to_string(passes_[i].number + 1) +
+									  " carries extent " + std::to_string(file) + ":" + std::to_string(extent.extent) +
+									  " in two media families (" + std::to_string(passes_[j].family + 1) + " and " +
+									  std::to_string(passes_[i].family + 1) + ")");
+				}
+			}
+			location.family = passes_[i].family;
 			location.pass = passes_[i].number;
 			location.offset = passes_[i].units_offset + group * GROUP_BYTES +
 							  static_cast<uint64_t>(page % PAGES_PER_EXTENT) * PAGE_SIZE;
@@ -601,8 +614,9 @@ size_t PageIndex::MemoryBytes() const {
 	return bytes;
 }
 
-PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout, bool rank_first_pass) {
-	PageIndex index;
+//! One family's passes, appended to `passes` with their family and pass numbers.
+static void AddFamilyPasses(const RandomAccess &stream, const MtfLayout &layout, uint32_t family, bool rank_first_pass,
+							std::vector<PassMap> &passes) {
 	uint32_t number = 0;
 	if (layout.FindAll("SSET").size() > 1) {
 		throw FormatError("backup file \"" + stream.Name() +
@@ -626,18 +640,40 @@ PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout, bo
 				data = &s;
 			}
 		}
+		// Numbered by the MSDA block's position, not by the data streams met: a family whose pass
+		// has no data must not shift its later passes onto another family's earlier ones.
+		const uint32_t this_number = number++;
 		if (!data) {
 			continue;
 		}
-		PassMap ranked;
-		if (number == 0 && rank_first_pass && BuildRankedPassMap(stream, data->data_offset, data->length, ranked)) {
-			index.passes_.push_back(std::move(ranked));
-			number++;
-			continue;
+		PassMap map;
+		if (!(this_number == 0 && rank_first_pass &&
+			  BuildRankedPassMap(stream, data->data_offset, data->length, map))) {
+			map = BuildPassMap(stream, data->data_offset, data->length, this_number);
 		}
-		index.passes_.push_back(BuildPassMap(stream, data->data_offset, data->length, number++));
+		map.number = this_number;
+		map.family = family;
+		passes.push_back(std::move(map));
 	}
+}
+
+PageIndex BuildPageIndex(const std::vector<FamilyStream> &families, bool rank_first_pass) {
+	PageIndex index;
+	for (uint32_t f = 0; f < families.size(); f++) {
+		AddFamilyPasses(*families[f].stream, *families[f].layout, f, rank_first_pass && families.size() == 1,
+						index.passes_);
+	}
+	// By pass number, so Locate meets the later pass first going backwards.
+	std::stable_sort(index.passes_.begin(), index.passes_.end(),
+					 [](const PassMap &a, const PassMap &b) { return a.number < b.number; });
 	return index;
+}
+
+PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout, bool rank_first_pass) {
+	FamilyStream one;
+	one.stream = &stream;
+	one.layout = &layout;
+	return BuildPageIndex(std::vector<FamilyStream>{one}, rank_first_pass);
 }
 
 }  // namespace backup

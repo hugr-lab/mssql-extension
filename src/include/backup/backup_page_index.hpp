@@ -121,6 +121,8 @@ public:
 	uint64_t units_offset = 0;
 	//! The pass's position among the data set's passes (0 = pass 1).
 	uint32_t number = 0;
+	//! The media family (stripe) whose stream holds it.
+	uint32_t family = 0;
 
 private:
 	friend PassMap BuildPassMap(const RandomAccess &, uint64_t, uint64_t, uint32_t);
@@ -158,14 +160,22 @@ bool BuildRankedPassMap(const RandomAccess &stream, uint64_t offset, uint64_t le
 
 //! Where a page's latest copy lies.
 struct PageLocation {
+	uint32_t family = 0;  // the media family (stripe) whose stream holds the copy
 	uint32_t pass = 0;
-	uint64_t offset = 0;  // in the stream
+	uint64_t offset = 0;  // in that family's stream
+};
+
+//! One media family's data: its stream (a family file, or a container's data set) and its walk.
+struct FamilyStream {
+	const RandomAccess *stream = nullptr;
+	const MtfLayout *layout = nullptr;
 };
 
 class PageIndex {
 public:
 	//! The latest copy of page `page` of file `file`: the last pass that carries its extent (D4:
-	//! the later pass wins). False when no pass carries it.
+	//! the later pass wins; within one pass an extent is in exactly one family, E12, and a pass
+	//! carrying it in two families is a FormatError). False when no pass of any family carries it.
 	bool Locate(uint16_t file, uint32_t page, PageLocation &location) const;
 	const std::vector<PassMap> &Passes() const {
 		return passes_;
@@ -173,13 +183,16 @@ public:
 	size_t MemoryBytes() const;
 
 private:
-	friend PageIndex BuildPageIndex(const RandomAccess &, const MtfLayout &, bool);
+	friend PageIndex BuildPageIndex(const std::vector<FamilyStream> &, bool);
 	std::vector<PassMap> passes_;
 };
 
-//! Every data pass of `layout` (each MSDA block's MQDA streams), mapped by BuildPassMap; with
-//! `rank_first_pass` (a full backup on one media family, the caller's to say) pass 1 is tried
-//! by BuildRankedPassMap first.
+//! Every data pass of every family (each MSDA block's MQDA stream), mapped by BuildPassMap,
+//! ordered by pass number. With `rank_first_pass` (a full backup, the caller's to say) and one
+//! family, pass 1 is tried by BuildRankedPassMap first; a striped set splits its extents between
+//! families at run time (E12), so its passes are always mapped by their headers.
+PageIndex BuildPageIndex(const std::vector<FamilyStream> &families, bool rank_first_pass = false);
+//! One family's index.
 PageIndex BuildPageIndex(const RandomAccess &stream, const MtfLayout &layout, bool rank_first_pass = false);
 
 }  // namespace backup
