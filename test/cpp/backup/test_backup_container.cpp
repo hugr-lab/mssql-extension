@@ -43,9 +43,10 @@ std::string ErrorOf(F f) {
 }
 
 //! The data set of a synthetic backup: its bytes from SSET to the end of MSLS.
-Bytes DataSet() {
+Bytes DataSet(size_t msls_pad_to = 0) {
 	Options o;
 	o.align_blocks = true;
+	o.msls_pad_to = msls_pad_to;
 	o.mqda_bytes = 3000000;	 // ~6000 blocks of 512 bytes: three checkpoints by the 1 MiB rule
 	auto image = BuildImage(o);
 	MemoryAccess file("image", image.data(), image.size());
@@ -170,10 +171,23 @@ int main() {
 		Check(!layout.has_tape && layout.blocks.front().type == "SSET" && layout.blocks.back().type == "MSLS",
 			  "the data set walks from SSET to MSLS");
 		auto set = ReadBackupSet(stream, layout);
-		Check(set.backup_size == data.size() && set.backup_name == "nightly" && set.kind == BackupKind::Full,
-			  "its backup set: BackupSize is the data set's length");
+		Check(set.backup_size == layout.Find("MSLS")->offset + 4096 && set.backup_name == "nightly" &&
+				  set.kind == BackupKind::Full,
+			  "its backup set: BackupSize is the MSLS offset plus the container's 4 KB filemark");
 		Check(ErrorOf([&]() { WalkMtf(stream); }).find("not TAPE") != std::string::npos,
 			  "a data set is not a family file");
+	}
+	{
+		// A busy backup's MSLS is longer than the 4 KB filemark (E3 r1: 6 KB): BackupSize is not the
+		// data set's length, which runs 2 KB past it.
+		const Bytes busy = DataSet(6144);
+		auto bp = Pack(busy, 8, {});
+		MemoryAccess bf("busy.bak", bp.file.data(), bp.file.size());
+		ContainerStream bs(bf, WalkChain(bf), BlockDecoder());
+		auto bl = WalkMtfDataSet(bs);
+		auto bset = ReadBackupSet(bs, bl);
+		Check(bl.Find("MSLS")->end - bl.Find("MSLS")->offset == 6144 && bset.backup_size == busy.size() - 2048,
+			  "a 6 KB MSLS: BackupSize is 2 KB short of the data set's length, as HEADERONLY says of E3 r1");
 	}
 	{
 		auto compressed = packed;

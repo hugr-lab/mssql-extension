@@ -16,6 +16,8 @@ static constexpr size_t MAX_RAID_STREAM = 4096;
 static constexpr size_t SCIN_MIN = 270;
 // An SFIN's fixed part ends at +202 (UniqueId).
 static constexpr size_t SFIN_MIN = 202;
+// A compressed container's soft filemark (spec 085 § Rules, MSSQLBAK).
+static constexpr uint64_t CONTAINER_SOFT_FILEMARK = 4096;
 
 std::string Lsn::ToDecimal() const {
 	if (IsZero()) {
@@ -324,8 +326,11 @@ BackupSetHeader ReadBackupSet(const RandomAccess &file, const MtfLayout &layout)
 
 	const auto &msls = Require(file, layout, "MSLS");
 	if (!layout.has_tape) {
-		// The data set is the logical stream: BackupSize is its length (both compressed samples).
-		set.backup_size = file.Size();
+		// A compressed container's soft filemark is 4 KB (its plain SFMB at 0x1000, the chain at
+		// 0x2000): BackupSize is the MSLS offset in the data set plus it, the same rule as a
+		// family file's (MSLS - SSET + filemark, SSET at two filemarks). Not the data set's length:
+		// a busy backup's MSLS block is longer than 4 KB (E3 r1: 6 KB).
+		set.backup_size = msls.offset + CONTAINER_SOFT_FILEMARK;
 	} else {
 		if (msls.offset < layout.soft_filemark_bytes) {
 			throw FormatError("backup file \"" + file.Name() + "\": its MSLS block lies inside the first filemark");

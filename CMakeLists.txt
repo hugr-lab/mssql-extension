@@ -48,6 +48,30 @@ message(STATUS "  OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
 find_package(simdutf CONFIG REQUIRED)
 message(STATUS "simdutf: located via vcpkg (target simdutf::simdutf)")
 
+# zstd for the ZSTD blocks of compressed SQL Server backups (spec 085 task 6). Static, from vcpkg:
+# DuckDB's bundled duckdb_zstd is not exported by the host on every platform.
+find_package(zstd CONFIG REQUIRED)
+if(TARGET zstd::libzstd_static)
+    set(MSSQL_ZSTD_TARGET zstd::libzstd_static)
+else()
+    set(MSSQL_ZSTD_TARGET zstd::libzstd)
+endif()
+message(STATUS "zstd: located via vcpkg (target ${MSSQL_ZSTD_TARGET})")
+# DuckDB's own third_party/zstd/include/zstd.h (namespace duckdb_zstd) is on the include path
+# first, so the vcpkg header is named by its absolute path, for the one source that uses it.
+get_target_property(MSSQL_ZSTD_INCLUDES ${MSSQL_ZSTD_TARGET} INTERFACE_INCLUDE_DIRECTORIES)
+set(MSSQL_ZSTD_INCLUDE "")
+foreach(dir IN LISTS MSSQL_ZSTD_INCLUDES)
+    if(NOT MSSQL_ZSTD_INCLUDE AND EXISTS "${dir}/zstd.h")
+        set(MSSQL_ZSTD_INCLUDE "${dir}")
+    endif()
+endforeach()
+if(NOT MSSQL_ZSTD_INCLUDE)
+    message(FATAL_ERROR "zstd: no zstd.h in the include directories of ${MSSQL_ZSTD_TARGET}: ${MSSQL_ZSTD_INCLUDES}")
+endif()
+set_source_files_properties(src/backup/backup_zstd.cpp PROPERTIES
+    COMPILE_DEFINITIONS "MSSQL_ZSTD_HEADER=\"${MSSQL_ZSTD_INCLUDE}/zstd.h\"")
+
 # =============================================================================
 # Integrated Authentication (Kerberos / SSPI) — Spec 042
 #
@@ -147,6 +171,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_ranges.cpp
     src/backup/backup_set.cpp
     src/backup/backup_xpress.cpp
+    src/backup/backup_zstd.cpp
     src/backup/backup_source.cpp
     # SQL Server code pages (spec 091): the server-generated tables and the decode kernels.
     src/codec/code_page/code_page.cpp
@@ -330,7 +355,7 @@ target_include_directories(${EXTENSION_NAME} PRIVATE
 )
 target_compile_definitions(${EXTENSION_NAME} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
-target_link_libraries(${EXTENSION_NAME} simdutf::simdutf)
+target_link_libraries(${EXTENSION_NAME} simdutf::simdutf ${MSSQL_ZSTD_TARGET})
 if(WIN32)
     # Windows: static OpenSSL and httplib need Windows system libraries (both MSVC and MinGW)
     target_link_libraries(${EXTENSION_NAME} ws2_32 crypt32)
@@ -384,7 +409,7 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE
 )
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} simdutf::simdutf)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} simdutf::simdutf ${MSSQL_ZSTD_TARGET})
 if(WIN32)
     # Windows: static OpenSSL and httplib need Windows system libraries (both MSVC and MinGW)
     target_link_libraries(${LOADABLE_EXTENSION_NAME} ws2_32 crypt32)

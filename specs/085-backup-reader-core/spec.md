@@ -618,8 +618,11 @@ offsets above are in its fixed part.
   index, an SFMB, one compressed block with ESET / OTCP / TSMP, and an SFMB (X§5).
 - The concatenated block outputs are the MTF data set, byte-identical in layout to an uncompressed
   backup (1,403 of 1,419 units identical to one taken minutes earlier, X§5): it starts at SSET, with
-  no TAPE or SFMB in it, and HEADERONLY's `BackupSize` is its length (task 4: the two probe samples
-  and E3's backups).
+  no TAPE or SFMB in it. HEADERONLY's `BackupSize` is the MSLS block's offset in it plus 4 KB (the
+  container's soft filemark: its plain SFMB at 0x1000 runs to the chain at 0x2000), the family
+  file's rule (MSLS − SSET + filemark) again; not the data set's length, which a busy backup's
+  longer MSLS block exceeds (E3 r1: a 6 KB MSLS, 2,048 bytes more; task 6, on the probe samples and
+  E3's ZSTD backups).
 - **The seek index** follows the chain (task 4, on all 16 compressed containers of the experiments,
   MS_XPRESS and ZSTD **(2025)**): u32 44 @0 and u32 0x00010001 @24 in every one (their meaning is
   unknown; the record is 40 + 16 n bytes, so 44 is not its length), u32 entry count @28 (3 to 5
@@ -627,6 +630,13 @@ offsets above are in its fixed part.
   per entry, each a
   block of the chain whose output starts there: the end of each MSDA pass and the trailer's MSTL.
   The reader checks every entry against the chain and refuses an index that names no block.
+- **ZSTD blocks** are one frame each, single-segment, with the content size and **no content
+  checksum** (15,163 of 15,163 frames seen, task 6 **(2025)**): a frame is refused when it declares
+  another size than its block, holds trailing bytes or does not decode, but damage inside a frame
+  can decode to wrong bytes, as in an MS_XPRESS block, which has no checksum either. The page layer
+  catches it: the page header's own fields (D4) and, in a backup taken WITH CHECKSUM, the page
+  checksum (task 7). zstd comes from vcpkg, linked statically: DuckDB's bundled `duckdb_zstd` is not
+  DUCKDB_API, so a loadable extension cannot rely on the host exporting it.
 - The chain index keeps one checkpoint per 64 blocks and at most one per MiB of the file (D4a; a
   crafted chain of tiny blocks cannot grow it); a read walks the headers from its checkpoint to the
   next. A compressed container's data set has no TAPE, so its media fields (family count and

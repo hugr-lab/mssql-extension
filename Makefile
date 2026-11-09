@@ -672,6 +672,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_ranges.cpp \
     test/cpp/backup/test_backup_source.cpp \
     test/cpp/backup/test_backup_xpress.cpp \
+    test/cpp/backup/test_backup_zstd.cpp \
     test/cpp/test_catalog_filter.cpp \
     test/cpp/test_filter_encoder.cpp \
     test/cpp/test_statistics_provider.cpp \
@@ -715,7 +716,8 @@ STANDALONE_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
 STANDALONE_TEST_INCLUDES := -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include
 STANDALONE_TEST_VCPKG_LIB := $(firstword $(wildcard build/release/vcpkg_installed/*/lib))
 # The vcpkg include dir is for test_tls_verification.cpp (spec 074), whose
-# in-process server is written against OpenSSL directly. Appended here, after
+# in-process server is written against OpenSSL directly, and for the backup tests' zstd (spec 085;
+# DuckDB's own zstd.h is not on this path). Appended here, after
 # the lib dir it is derived from, because both are simply-expanded.
 STANDALONE_TEST_INCLUDES += -I $(STANDALONE_TEST_VCPKG_LIB)/../include
 STANDALONE_TEST_UNAME := $(shell uname -s)
@@ -755,7 +757,7 @@ test-cpp-run:
 	libs="build/release/extension/mssql/libmssql_extension.a build/release/src/libduckdb_static.a \
 	      $$(find build/release/extension build/release/third_party -name '*.a' 2>/dev/null | grep -v mssql | tr '\n' ' ') \
 	      build/release/src/libduckdb_static.a \
-	      $(STANDALONE_TEST_VCPKG_LIB)/libssl.a $(STANDALONE_TEST_VCPKG_LIB)/libcrypto.a $(STANDALONE_TEST_VCPKG_LIB)/libsimdutf.a"; \
+	      $(STANDALONE_TEST_VCPKG_LIB)/libssl.a $(STANDALONE_TEST_VCPKG_LIB)/libcrypto.a $(STANDALONE_TEST_VCPKG_LIB)/libsimdutf.a $(STANDALONE_TEST_VCPKG_LIB)/libzstd.a"; \
 	for f in $(STANDALONE_TEST_SOURCES); do \
 		n=$$(basename $$f .cpp); \
 		$(CXX) $(STANDALONE_TEST_FLAGS) $(STANDALONE_TEST_INCLUDES) $$f \
@@ -1181,7 +1183,7 @@ else
 PIN_TEST_VCPKG_LIB = $(PIN_TEST_VCPKG)/$(PIN_TEST_TRIPLET)/lib
 endif
 PIN_TEST_LIBS = build/$(PIN_TEST_BUILD)/extension/mssql/libmssql_extension.a \
-    $(PIN_TEST_VCPKG_LIB)/libssl.a $(PIN_TEST_VCPKG_LIB)/libcrypto.a $(PIN_TEST_VCPKG_LIB)/libsimdutf.a \
+    $(PIN_TEST_VCPKG_LIB)/libssl.a $(PIN_TEST_VCPKG_LIB)/libcrypto.a $(PIN_TEST_VCPKG_LIB)/libsimdutf.a $(PIN_TEST_VCPKG_LIB)/libzstd.a \
     -L build/$(PIN_TEST_BUILD)/src -lduckdb -ldl -pthread
 ifeq ($(shell uname -s),Darwin)
 PIN_TEST_LIBS += -framework GSS -framework Security -framework CoreFoundation \

@@ -131,6 +131,9 @@ struct Options {
 	bool align_blocks = false;
 	//! The MQDA stream's bytes (its 2-byte lead-in and the pages).
 	size_t mqda_bytes = 8194;
+	//! Pad the MSLS block to this many bytes (0: as align_blocks says); a busy backup's MSLS is
+	//! longer than 4 KB (E3 r1: 6 KB).
+	size_t msls_pad_to = 0;
 	bool forked = false;
 	uint32_t sfin_type = 1;
 };
@@ -237,7 +240,8 @@ inline Bytes BuildImage(const Options &o) {
 	mqci.insert(mqci.end(), scin.begin(), scin.end());
 	mqci.insert(mqci.end(), sfgi.begin(), sfgi.end());
 	mqci.insert(mqci.end(), sfin.begin(), sfin.end());
-	AppendBlock(image, "MSLS", Bytes(56, 0), {{"MQCI", mqci}}, o.align_blocks ? 1 : 0);
+	AppendBlock(image, "MSLS", Bytes(56, 0), {{"MQCI", mqci}},
+				o.msls_pad_to ? o.msls_pad_to : (o.align_blocks ? 1 : 0));
 	AppendSfmb(image, soft_filemark);
 	return image;
 }
