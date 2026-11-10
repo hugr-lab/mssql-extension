@@ -66,7 +66,10 @@ struct CatalogColumn {
 	std::string name;
 	uint8_t system_type_id = 0;
 	int32_t user_type_id = 0;
-	std::string type_name;	 // TYPE_NAME(user_type_id): an alias type's own name
+	std::string type_name;	// TYPE_NAME(user_type_id): an alias type's own name
+	//! The system type underneath: sysscalartypes' row of id system_type_id (a CLR type's by its
+	//! user type: hierarchyid, geometry, geography; "" for a user-defined CLR type).
+	std::string system_type_name;
 	int16_t max_length = 0;	 // bytes; -1 MAX
 	uint8_t precision = 0;
 	uint8_t scale = 0;

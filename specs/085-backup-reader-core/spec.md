@@ -497,7 +497,18 @@ when partitions differ, E7: `cmprlevel` is per partition), `partition_count`, `r
 
 `mssql_backup_views(path)`: `schema_name`, `view_name`, `object_id`, `definition` (`VARCHAR`, the
 T-SQL text from `sysobjvalues`, X§4), `is_encrypted`, `created`, `modified`. A `WITH ENCRYPTION` view
-reports `definition` NULL and `is_encrypted` true; the reader does not de-obfuscate.
+reports `definition` NULL and `is_encrypted` true; the reader does not de-obfuscate. A `reason` column (NULL otherwise) names why a
+definition could not be read (D13: the view is listed, its text refused by name, not guessed).
+
+Both open the catalog at init (stages 1–4, `OpenBackupCatalog`; DESCRIBE reads no file) and read the
+file on every execution until task 22's cache. In 2b, NULL until their PR: `fuzzy_status` /
+`open_transactions` / `stale_transactions` (PR 5), `allocation_units.live_pages` (a unit's IAM chain is
+walked at its table's first scan, DQ-40, not to list it), `partitioning` (PR 2c). A column's
+`decodable` / `reason` name 085's refusals (§ Scope; `text` / `ntext` / `image` too, until PR 3, and a
+non-persisted computed column, which is not stored); its `duckdb_type` is D6's map on the system type
+underneath an alias. Checked against `sys.tables` / `sys.columns` / `sys.sql_modules` by
+`test/backup/compare_catalog.py` (the oracle lane; 2022 locally: 771 fields of the catalog fixture, 0
+differences).
 
 `mssql_backup_catalog(path, base_table)`: the base table's rows with its own columns as typed by its
 `syscolpars` rows, plus the virtual `_mssql_page` / `_mssql_rid` (for a base table, `_mssql_rid` is

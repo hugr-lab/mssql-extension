@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Spec 085 PR 2b: mssql_backup_tables / mssql_backup_views against the server's own catalog.
+
+    python3 -I test/backup/compare_catalog.py --duckdb build/release/duckdb /tmp/bak/2022
+    python3 -I test/backup/compare_catalog.py --duckdb build/release/duckdb s3://bucket/oracle/<key>/2019
+
+DIR is compare_info.py's (a directory or an s3:// prefix, a DONE file naming the run's subdirectory
+in the lane's layout); the sets compared are those with a golden <set>.tables.txt / .columns.txt /
+.views.txt beside them (test/backup/gen/catalog_golden.sql, run by generate.sh right after the set's
+backup). Per table: schema, name, object id, shape, partitions, rows, created and modified (to the
+millisecond: the server rounds a datetime's 1/300 s ticks to it, TYPE mssql reads them truncated
+to the microsecond); per column: id, name, type name (sql_type's base, or an alias type's name),
+system type id, length, precision, scale, collation, nullable, identity, computed, sparse; per view:
+object id, encrypted, and the definition's length and SHA-256 over UTF-16LE (sys.sql_modules'
+nvarchar). Exits 1 on any difference, or when fewer than --min-fields fields were compared.
+"""
+import argparse
+import hashlib
+import importlib.util
+import os
+import re
+import sys
+from datetime import datetime, timedelta
+
+_spec = importlib.util.spec_from_file_location(
+    "compare_info", os.path.join(os.path.dirname(os.path.abspath(__file__)), "compare_info.py"))
+compare_info = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(compare_info)
+sql_string, DuckDB = compare_info.sql_string, compare_info.DuckDB
+
+
+def parse_golden(text):
+    """compare_info's, with sqlcmd's "(N rows affected)" lines dropped (a golden written without NOCOUNT)."""
+    return compare_info.parse_golden(
+        "\n".join(line for line in text.splitlines() if not re.fullmatch(r"\(\d+ rows? affected\)", line.strip())))
+
+
+class Comparison:
+    def __init__(self):
+        self.fields = 0
+        self.differences = []
+
+    def check(self, where, field, ours, theirs):
+        self.fields += 1
+        if ours != theirs:
+            self.differences.append(f"{where}: {field}: reader {ours!r}, server {theirs!r}")
+
+
+def millis(ts):
+    """A DuckDB TIMESTAMP's text rounded to the millisecond, as CONVERT(varchar(23), d, 121) prints it."""
+    if ts is None:
+        return None
+    t = datetime.strptime(ts if "." in ts else ts + ".0", "%Y-%m-%d %H:%M:%S.%f") + timedelta(microseconds=500)
+    return t.strftime("%Y-%m-%d %H:%M:%S.") + f"{t.microsecond // 1000:03d}"
+
+
+def flag(v):
+    return None if v is None else ("1" if v in ("true", "1") else "0")
+
+
+def keyed(rows, *names):
+    out = {}
+    for r in rows:
+        k = tuple(r[n] for n in names)
+        if k in out:
+            sys.exit(f"compare_catalog: {k} twice")
+        out[k] = r
+    return out
+
+
+def compare_keys(c, what, ours, theirs):
+    c.fields += 1
+    if set(ours) != set(theirs):
+        c.differences.append(f"{what}: reader only {sorted(set(ours) - set(theirs))}, "
+                             f"server only {sorted(set(theirs) - set(ours))}")
+
+
+def compare_set(c, db, name, arg, texts):
+    tables = db.query("SELECT schema_name, table_name, object_id::VARCHAR AS object_id, shape, "
+                      "partition_count::VARCHAR AS partition_count, row_count::VARCHAR AS row_count, "
+                      f"created::VARCHAR AS created, modified::VARCHAR AS modified FROM mssql_backup_tables({arg})")
+    columns = db.query("SELECT schema_name, table_name, c.column_id::VARCHAR AS column_id, c.name, c.sql_type, "
+                       "c.system_type_id::VARCHAR AS system_type_id, c.max_length::VARCHAR AS max_length, "
+                       "c.precision::VARCHAR AS precision, c.scale::VARCHAR AS scale, c.collation, "
+                       "c.is_nullable::VARCHAR AS is_nullable, c.is_identity::VARCHAR AS is_identity, "
+                       "c.is_computed::VARCHAR AS is_computed, c.is_sparse::VARCHAR AS is_sparse "
+                       f"FROM (SELECT schema_name, table_name, unnest(columns) AS c FROM mssql_backup_tables({arg}))")
+    views = db.query("SELECT schema_name, view_name, object_id::VARCHAR AS object_id, "
+                     f"is_encrypted::VARCHAR AS is_encrypted, definition, reason FROM mssql_backup_views({arg})")
+
+    ours = keyed(tables, "schema_name", "table_name")
+    theirs = keyed(parse_golden(texts[f"{name}.tables.txt"]), "schema_name", "table_name")
+    compare_keys(c, f"{name}: tables", ours, theirs)
+    for k in sorted(set(ours) & set(theirs)):
+        o, t = ours[k], theirs[k]
+        where = f"{name}: {'.'.join(k)}"
+        for field in ("object_id", "shape", "partition_count", "row_count"):
+            c.check(where, field, o[field], t[field])
+        for field in ("created", "modified"):
+            c.check(where, field, millis(o[field]), t[field])
+
+    ours = keyed(columns, "schema_name", "table_name", "column_id")
+    theirs = keyed(parse_golden(texts[f"{name}.columns.txt"]), "schema_name", "table_name", "column_id")
+    compare_keys(c, f"{name}: columns", ours, theirs)
+    for k in sorted(set(ours) & set(theirs), key=lambda k: (k[0], k[1], int(k[2]))):
+        o, t = ours[k], theirs[k]
+        where = f"{name}: {'.'.join(k)}"
+        c.check(where, "name", o["name"], t["column_name"])
+        c.check(where, "type_name", re.sub(r"\(.*\)$", "", o["sql_type"]), t["type_name"])
+        for field in ("system_type_id", "max_length", "precision", "scale"):
+            c.check(where, field, o[field], t[field])
+        c.check(where, "collation", o["collation"], t["collation_name"])
+        for field in ("is_nullable", "is_identity", "is_computed", "is_sparse"):
+            c.check(where, field, flag(o[field]), t[field])
+
+    ours = keyed(views, "schema_name", "view_name")
+    theirs = keyed(parse_golden(texts[f"{name}.views.txt"]), "schema_name", "view_name")
+    compare_keys(c, f"{name}: views", ours, theirs)
+    for k in sorted(set(ours) & set(theirs)):
+        o, t = ours[k], theirs[k]
+        where = f"{name}: view {'.'.join(k)}"
+        c.check(where, "object_id", o["object_id"], t["object_id"])
+        c.check(where, "is_encrypted", flag(o["is_encrypted"]), t["is_encrypted"])
+        c.check(where, "reason", o["reason"], None)
+        if o["definition"] is None:
+            c.check(where, "definition", (None, None), (t["definition_length"], t["definition_sha256"]))
+            continue
+        utf16 = o["definition"].encode("utf-16-le")
+        c.check(where, "definition length", str(len(utf16) // 2), t["definition_length"])
+        c.check(where, "definition SHA-256", hashlib.sha256(utf16).hexdigest().upper(), t["definition_sha256"])
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("dir", help="a directory or an s3:// prefix holding sets.txt")
+    parser.add_argument("--duckdb", default="build/release/duckdb")
+    parser.add_argument("--min-fields", type=int, default=300)
+    parser.add_argument("--require-done", action="store_true",
+                        help="the lane's layout: fail, naming DIR, when DIR/DONE is missing")
+    args = parser.parse_args()
+    base = args.dir.rstrip("/")
+    db = DuckDB(args.duckdb, base)
+
+    done = db.query(f"SELECT content FROM read_text({sql_string(base + '/DONE*')})")
+    if not done and args.require_done:
+        sys.exit(f"compare_catalog: not stored: no DONE under {base} (its generate leg failed or never ran)")
+    if done:
+        run_dir = done[0]["content"].strip()
+        if not run_dir or "/" in run_dir or run_dir.startswith("."):
+            sys.exit(f"compare_catalog: {base}/DONE names {run_dir!r}, not a subdirectory")
+        base = f"{base}/{run_dir}"
+    texts = {os.path.basename(r["filename"]): r["content"]
+             for r in db.query(f"SELECT filename, content FROM read_text({sql_string(base + '/*.txt')})")}
+    if "sets.txt" not in texts:
+        sys.exit(f"compare_catalog: no sets.txt in {base}")
+    sets = [line.split("|") for line in texts["sets.txt"].splitlines() if line.strip()]
+
+    c = Comparison()
+    compared = 0
+    for name, file_list in sets:
+        if f"{name}.tables.txt" not in texts:
+            continue
+        for kind in ("columns", "views"):
+            if f"{name}.{kind}.txt" not in texts:
+                sys.exit(f"compare_catalog: {name}.{kind}.txt missing in {base}")
+        files = [f"{base}/{f}" for f in file_list.split(",")]
+        compare_set(c, db, name, "[" + ", ".join(sql_string(f) for f in files) + "]", texts)
+        compared += 1
+
+    for d in c.differences:
+        print(d)
+    print(f"compare_catalog: {compared} backup sets, {c.fields} fields compared, "
+          f"{len(c.differences)} differences ({base})")
+    if c.differences:
+        sys.exit(1)
+    if c.fields < args.min_fields:
+        sys.exit(f"compare_catalog: only {c.fields} fields compared, fewer than --min-fields {args.min_fields}")
+
+
+if __name__ == "__main__":
+    main()

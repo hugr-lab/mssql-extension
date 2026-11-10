@@ -168,6 +168,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_allocation.cpp
     src/backup/backup_boot.cpp
     src/backup/backup_bytes.cpp
+    src/backup/backup_catalog_functions.cpp
     src/backup/backup_catalog_model.cpp
     src/backup/backup_collation.cpp
     src/backup/backup_container.cpp

@@ -393,6 +393,10 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 				t.reason =
 					"column " + c->name + "'s type " + std::to_string(c->user_type) + " is not in sysscalartypes";
 			}
+			// A CLR type (xtype 240) has no row of its xtype: the system ones are known by their user type.
+			const int32_t system_id = c->xtype == 240 ? (c->user_type < 256 ? c->user_type : -1) : c->xtype;
+			auto system = type_names.find(system_id);
+			col.system_type_name = system == type_names.end() ? std::string() : system->second;
 			col.max_length = c->length;
 			col.precision = c->precision;
 			col.scale = c->scale;

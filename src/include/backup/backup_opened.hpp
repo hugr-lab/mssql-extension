@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "backup/backup_catalog_model.hpp"
 #include "backup/backup_container.hpp"
 #include "backup/backup_mtf.hpp"
 #include "backup/backup_open_pass.hpp"
@@ -83,6 +84,21 @@ struct OpenPagesOptions {
 //! families as parallel ranges (D3a) through `context`, used only within this call.
 std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &context, const OpenedHeaders &headers,
 											 const OpenPagesOptions &options = OpenPagesOptions());
+
+//! Stages 1-4 of an opened backup (task 11b): the headers, the pages, the boot page (checked against
+//! the trailer), the bootstrap tables and the catalog model. Built for one call of a file function
+//! (the cache is task 22). The members depend on one another in this order.
+struct OpenedCatalog {
+	std::unique_ptr<OpenedHeaders> headers;
+	std::unique_ptr<OpenedPages> pages;
+	BootstrapTables tables;
+	CatalogModel model;
+};
+
+//! The catalog of the full backup on `paths`: OpenBackupHeaders, OpenBackupPages, the boot page read
+//! and checked (CheckBootAgainstSet), ReadBootstrapTables and BuildCatalogModel. FormatError naming
+//! the backup otherwise.
+std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths);
 
 //! The files of `paths` (paths or globs: the families of one media set) opened, walked and checked:
 //! one backup set per file (an appended set is refused), the same backup set GUID in every family,

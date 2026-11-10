@@ -1,5 +1,6 @@
 #include "backup/backup_opened.hpp"
 
+#include "backup/backup_boot.hpp"
 #include "backup/backup_xpress.hpp"
 #include "backup/backup_zstd.hpp"
 
@@ -238,6 +239,28 @@ std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &context, const Opene
 	}
 	pages->store.reset(new PageStore(pages->index, *pages->allocation));
 	return pages;
+}
+
+std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths) {
+	std::unique_ptr<OpenedCatalog> opened(new OpenedCatalog());
+	opened->headers = OpenBackupHeaders(context, paths);
+	opened->pages = OpenBackupPages(context, *opened->headers);
+	try {
+		Page boot_page;
+		opened->pages->store->ReadLive(1, 9, boot_page, "the boot page");
+		const BootPage boot = ReadBootPage(boot_page);
+		CheckBootAgainstSet(boot, opened->headers->Set());
+		opened->tables = ReadBootstrapTables(*opened->pages->store, boot);
+		opened->model = BuildCatalogModel(*opened->pages->store, opened->tables);
+	} catch (FormatError &e) {
+		// The readers' messages start "backup: "; under the file's name that is said already.
+		std::string why = e.what();
+		if (why.compare(0, 8, "backup: ") == 0) {
+			why = why.substr(8);
+		}
+		throw FormatError("backup file \"" + paths.front() + "\": " + why);
+	}
+	return opened;
 }
 
 }  // namespace backup

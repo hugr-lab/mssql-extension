@@ -29,6 +29,7 @@ SELECT s.name AS schema_name, v.name AS view_name, v.object_id,
 	   DATALENGTH(m.definition) / 2 AS definition_length,	-- UTF-16 units, trailing blanks included
 	   CONVERT(varchar(64), HASHBYTES('SHA2_256', CAST(m.definition AS nvarchar(max))), 2) AS definition_sha256
 FROM sys.views v JOIN sys.schemas s ON s.schema_id = v.schema_id LEFT JOIN sys.sql_modules m ON m.object_id = v.object_id
+WHERE v.is_ms_shipped = 0
 ORDER BY s.name, v.name;
 GO
 :OUT stdout

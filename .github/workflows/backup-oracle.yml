@@ -309,7 +309,7 @@ jobs:
     # were stored, or one version failing): a version with no DONE fails its own leg, by name.
     if: ${{ always() && needs.key.outputs.enabled == 'true' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -340,6 +340,16 @@ jobs:
           chmod +x cli/duckdb
           python3 -I test/backup/compare_info.py --duckdb cli/duckdb --require-done --expect-major "${major}" \
             "s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${VERSION}"
+      # Spec 085 PR 2b: the sets with the server's own catalog beside them (catalog_golden.sql).
+      - name: mssql_backup_tables / _views against the server's catalog, read through s3://
+        env:
+          MSSQL_R2_ACCESS_KEY: ${{ secrets.MSSQL_R2_ACCESS_KEY }}
+          MSSQL_R2_ACCESS_SECRET_KEY: ${{ secrets.MSSQL_R2_ACCESS_SECRET_KEY }}
+          MSSQL_R2_URL: ${{ secrets.MSSQL_R2_URL }}
+          MSSQL_R2_BUCKET_NAME: ${{ vars.MSSQL_R2_BUCKET_NAME || secrets.MSSQL_R2_BUCKET_NAME }}
+        run: |
+          python3 -I test/backup/compare_catalog.py --duckdb cli/duckdb --require-done \
+            "s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}"
 
   cleanup:
     name: Remove sets no run reads
