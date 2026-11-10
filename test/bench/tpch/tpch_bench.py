@@ -17,9 +17,11 @@ Subcommands, in the order a fresh machine runs them:
   run      the timed, interleaved runs; writes timings.csv
   report   medians per query and client, as markdown
 
-The server credentials come from the environment and are never printed --
-masked in every form they can take in the output, the escaped one included
-(issue #509):
+The server credentials come from the environment and are never printed: the
+masking redacts the VALUE of `Password` wherever the output carries a
+connection string, so every form it travels in is covered -- escaped, braced,
+both -- and nothing outside a `key=value` is rewritten (issue #509, review of
+#546):
 MSSQL_BENCH_HOST / _PORT / _USER / _PASSWORD, falling back to the test
 suite's MSSQL_TEST_HOST / _PORT / _USER / _PASS. See README.md.
 """
@@ -161,6 +163,16 @@ CLIENTS = {
 
 # --------------------------------------------------------------------------- server
 
+#: What a host may look like: a name, an IPv4 / bracketed IPv6 literal, or
+#: `host\instance`. It is operator-supplied (MSSQL_BENCH_HOST) and it CANNOT be
+#: brace-quoted, because the value of `Server` is `host,port` and the parser
+#: skips everything after a braced value up to the `;` -- `Server={h},1433`
+#: would silently lose the port. So it is checked instead (review of #546
+#: item 4: an unchecked host is #509 item 2 through another key).
+HOST = re.compile(r"[A-Za-z0-9._:%\[\]-]+(?:\\[A-Za-z0-9._$-]+)?")
+PORT = re.compile(r"[0-9]{1,5}")
+
+
 def server():
     env = os.environ
     def pick(*names, default=None):
@@ -176,6 +188,12 @@ def server():
     }
     if not cfg["password"]:
         sys.exit("error: set MSSQL_BENCH_PASSWORD (or MSSQL_TEST_PASS)")
+    if not HOST.fullmatch(cfg["host"]):
+        sys.exit(f"error: MSSQL_BENCH_HOST / MSSQL_TEST_HOST {cfg['host']!r} is not a host name, "
+                 "an address or host\\instance. It goes into the connection string, where a `;` "
+                 "or a brace would add a key of its own.")
+    if not PORT.fullmatch(cfg["port"]):
+        sys.exit(f"error: MSSQL_BENCH_PORT / MSSQL_TEST_PORT {cfg['port']!r} is not a port number.")
     return cfg
 
 
@@ -196,35 +214,50 @@ def dsn(cfg, database, encrypt):
     # Encrypt and TrustServerCertificate agree, so 0.2.5 (where the latter is an
     # alias of the former) and 0.3.0 read the same thing: TLS on or off for both.
     flag = "yes" if encrypt else "no"
-    # The password and the user name are brace-quoted: both are operator-supplied
-    # and a `;` in either would otherwise add a key (issue #509 item 2).
-    return (f"Server={cfg['host']},{cfg['port']};Database={database};"
+    # The password, the user name AND the database are brace-quoted: all three
+    # are operator-supplied and a `;` in any of them would otherwise add a key
+    # (issue #509 item 2; the database since the review of #546 item 3, where
+    # `--db 'tpch;Server=10.0.0.9,1433'` retargeted the connection through a
+    # key the harness never meant to send). The host cannot be braced -- see
+    # HOST -- so `server()` checks it.
+    return (f"Server={cfg['host']},{cfg['port']};Database={quote_dsn_value(database)};"
             f"User Id={quote_dsn_value(cfg['user'])};"
             f"Password={quote_dsn_value(cfg['password'])};"
             f"Encrypt={flag};TrustServerCertificate={flag}")
 
 
-def mask(text, cfg):
-    """Replace the password wherever it appears, in every form it takes.
+#: The connection-string keys whose value must never reach output, and the two
+#: shapes a value comes in: braced (with `}` doubled inside) or bare up to the
+#: `;` that ends it.
+#:
+#: Review of #546 items 1 and 2. Masking used to work on the SECRET's side: it
+#: replaced the password in the three forms it could think of -- as given,
+#: `esc()`'d, brace-quoted. The text carries a FOURTH, because the DSN is
+#: braced first and escaped into the `ATTACH '...'` literal second, so
+#: `a'}b` travelled as `{a''}}b}` and went out whole. And chasing forms is the
+#: wrong shape of fix anyway, because a blind substring replace also rewrites
+#: the output it is applied to: with password `5`, `real 11.500` came back
+#: `real 11.***00` -- #509's mirror defect, which corrupts measurements.
+#:
+#: So the masking works on the TEXT's side now. It redacts the VALUE of these
+#: keys wherever a connection string carries one, whatever that value is: no
+#: form of the secret has to be guessed, every form is covered by construction
+#: (escaped, braced, doubled -- it is just a value), and nothing outside a
+#: `key=value` is touched, so no timing can be rewritten. The password reaches
+#: output only inside a DSN -- `dsn()` is used in `ATTACH` statements and
+#: nowhere else -- which is what makes that complete.
+#: The bare branch takes a doubled quote as part of the value, so a value that
+#: was NOT brace-quoted -- a session log written before `dsn()` braced them --
+#: is still redacted whole rather than up to its first escaped quote.
+SECRET_KEYS = ("Password", "Pwd")
+SECRET_VALUE = re.compile(
+    r"(?P<key>\b(?:" + "|".join(k.replace(" ", r"\s*") for k in SECRET_KEYS) + r")\s*=\s*)"
+    r"(?:\{(?:\}\}|[^}])*\}|(?:''|[^;'])*)")
 
-    Issue #509 item 1. It used to search for the password AS GIVEN, but the DSN
-    reaches almost all output embedded in an `ATTACH '...'` statement, where it
-    has been through `esc()` -- so a password containing a single quote was
-    carried as `pw''X` and the masking missed it entirely:
 
-        password in cfg:    "pw'X"
-        in the SQL text:    Password=pw''X;Enc
-        after mask():       Password=pw''X;Enc     <- unmasked
-
-    while this module's docstring and README promise it is masked in all output.
-    Longest form first, so replacing one cannot leave a fragment of another.
-    """
-    password = cfg.get("password")
-    if not password:
-        return text
-    for form in sorted({password, esc(password), quote_dsn_value(password)}, key=len, reverse=True):
-        text = text.replace(form, "***")
-    return text
+def mask(text):
+    """Redact every connection-string secret the text carries. See SECRET_VALUE."""
+    return SECRET_VALUE.sub(lambda m: m.group("key") + "***", text)
 
 
 def binary(which):
@@ -277,7 +310,7 @@ def run_cli(bin_path, script, cfg, database=":memory:", timeout=None):
     # stderr joins stdout so an error lands next to the marker of its query.
     proc = subprocess.run(argv, input=script, text=True, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, env=env, timeout=timeout)
-    return proc.returncode, mask(proc.stdout, cfg)
+    return proc.returncode, mask(proc.stdout)
 
 
 #: A database or collation name the harness sends to the server. SQL Server
@@ -296,6 +329,30 @@ def safe_name(value, what):
         sys.exit(f"error: {what} {value!r} is not a bare name (letters, digits and _). "
                  f"It is sent to the server inside ALTER / DROP / CREATE DATABASE.")
     return value
+
+
+def check_names(args):
+    """Every name this harness sends to a server, checked once, for every command.
+
+    Review of #546 item 3. `safe_name` was called by `load` and `drop` only,
+    while `run`, `verify`, `explain` and `trace` took `--db` as given -- and
+    `README.md` already promised otherwise. Two ways that mattered:
+
+    * `trace` formats the name into T-SQL (`DB_ID(N'{db}')`) and then `esc()`s
+      the result for the DuckDB literal around it, which is not the same
+      escape: `--db "x') OR 1=1 --"` made `mssql_scan` run the batch whole.
+    * The DSN carried `Database={database}` unquoted, so a `;` in the name
+      added a key -- `--db 'tpch;Server=10.0.0.9,1433'` retargeted the
+      connection. That one is now brace-quoted as well (see `dsn`), so the two
+      guards are independent.
+
+    The per-command calls stay where a name is interpolated into a batch: this
+    is the gate, not the only check.
+    """
+    safe_name(args.db, "--db")
+    if getattr(args, "collation", None):
+        safe_name(args.collation, "--collation")
+    return args
 
 
 def esc(s):
@@ -753,7 +810,7 @@ def session_results(client, cfg, args, queries, rep):
     except subprocess.TimeoutExpired as exc:
         # mask() it: this path never went through run_cli's masking, and an
         # ATTACH failure can quote the connection string back.
-        text = mask(decode_output(exc.output), cfg)
+        text = mask(decode_output(exc.output))
         res = parse_marked(text, "T")
         note = f"session timed out after {args.timeout}s"
         hung = name_hung_query(res, note)
@@ -1684,7 +1741,7 @@ def _check_timeout_path():
         failures += _check("exc.output is bytes even though the call passed text=True",
                            isinstance(exc.output, bytes), type(exc.output).__name__)
         try:
-            text = mask(decode_output(exc.output), cfg)
+            text = mask(decode_output(exc.output))
             failures += _check("mask(decode_output(...)) does not raise", True, "returned text")
         except Exception as e:  # noqa: BLE001 -- the point is that nothing escapes
             return failures + _check("mask(decode_output(...)) does not raise", False,
@@ -1829,6 +1886,42 @@ MASK_TESTS = [
     ("a password with a brace", "pw}X"),
     ("a password with a semicolon", "pw;Database=master"),
     ("a password that looks like SQL", "'); DROP DATABASE x; --"),
+    # The review of #546's two cases. The first is carried as `{a''}}b}` --
+    # braced, then escaped -- which was none of the three forms the masking
+    # searched for. The last two are short enough, or shaped enough like the
+    # output, that SEARCHING for them at all rewrites the numbers they sit
+    # beside: that is why the masking redacts the DSN's keys instead.
+    ("a password with a quote and a brace", "a'}b"),
+    ("a one-character password", "5"),
+    ("a password that is a timing in the output", "11.500"),
+]
+
+#: Two lines of a timed session, the ones `parse_marked` reads. Masking must
+#: leave them exactly as they were: with password `5`, the old blind substring
+#: replace turned `real 11.500` into `real 11.***00`, so the harness reported
+#: `q02 -> 11.0` for a query the CLI timed at 11.5 s (#509 item 1's mirror,
+#: review of #546 item 2).
+TIMED_OUTPUT = "@@T q02@@\nRun Time (s): real 11.500 user 0.512 sys 0.015\n"
+
+#: (label, the value, accepted?) -- the host and port, which reach the
+#: connection string as `Server={host},{port}` and CANNOT be brace-quoted
+#: (see HOST). Review of #546 item 4.
+HOST_TESTS = [
+    ("a host name", "localhost", True),
+    ("a fully qualified name", "sql.example.com", True),
+    ("an IPv4 literal", "10.0.0.9", True),
+    ("a bracketed IPv6 literal", "[::1]", True),
+    ("a named instance", "host\\SQLEXPRESS", True),
+    ("a host carrying a second key", "h;Password=leak", False),
+    ("a host with a brace", "h{x}", False),
+    ("a host with a quote", "h'x", False),
+    ("empty", "", False),
+]
+PORT_TESTS = [
+    ("a port", "1433", True),
+    ("a port carrying a key", "1433;Encrypt=no", False),
+    ("a name", "mssql", False),
+    ("empty", "", False),
 ]
 
 #: (label, the name, is it accepted)
@@ -1887,16 +1980,32 @@ def _parse_connection_string(cs):
 
 def _check_credentials():
     """Issue #509: the password never reaches output, and no name injects."""
-    print("\nthe password is masked in the form the text carries (#509.1):")
+    print("\nthe password is redacted where it is carried, and nothing else is (#509.1, #546.1-2):")
     failures = 0
     for label, password in MASK_TESTS:
         cfg = {"host": "h", "port": "1433", "user": "sa", "password": password}
-        # Exactly how the harness emits it: the DSN inside an ATTACH literal.
-        text = "ATTACH '" + esc(dsn(cfg, "db", True)) + "' AS t;"
-        masked = mask(text, cfg)
-        leaked = [form for form in (password, esc(password), quote_dsn_value(password))
-                  if form and form in masked]
-        failures += _check(label, not leaked, "masked" if not leaked else "LEAKED %r" % leaked[0])
+        # Exactly how the harness emits it: the DSN inside an ATTACH literal,
+        # with a timed session's own lines after it.
+        text = "ATTACH '" + esc(dsn(cfg, "db", True)) + "' AS t;\n" + TIMED_OUTPUT
+        masked = mask(text)
+        attach, rest = masked.split("\n", 1)
+        # What the extension's parser would read out of the masked text.
+        inner = attach[attach.index("'") + 1:attach.rindex("'")].replace("''", "'")
+        value = _parse_connection_string(inner).get("Password")
+        failures += _check(label + ", as the parser reads it", value == "***",
+                           "Password=%r" % value, width=72)
+        # ... and no form of it is left in the connection string. Forms of one
+        # or two characters are not asserted: `1` cannot be told from the `1`
+        # of port 1433, which is the whole reason the masking stopped
+        # searching for the secret and started redacting the key.
+        forms = [f for f in {password, esc(password), quote_dsn_value(password),
+                             esc(quote_dsn_value(password))} if len(f) > 2]
+        leaked = [f for f in forms if f in attach]
+        failures += _check(label + ", no form of it carried", not leaked,
+                           "redacted" if not leaked else "LEAKED %r" % leaked[0], width=72)
+        failures += _check(label + ", the timing beside it untouched",
+                           rest == TIMED_OUTPUT and parse_marked(masked, "T") == {"q02": (11.5, None)},
+                           "real 11.500 -> 11.5", width=72)
 
     print("\nthe DSN keeps one Database key whatever the password (#509.2):")
     cfg = {"host": "h", "port": "1433", "user": "sa", "password": "pw;Database=master"}
@@ -1918,6 +2027,77 @@ def _check_credentials():
         except SystemExit:
             got = False
         failures += _check(label, got == want, "accepted" if got else "refused")
+    return failures + _check_dsn_keys()
+
+
+def _check_dsn_keys():
+    """Review of #546 items 3 and 4: the DSN's own keys, and the gate."""
+    print("\nthe DSN keeps its keys whatever the names hold (#546.3-4):")
+    cfg = {"host": "h", "port": "1433", "user": "sa", "password": "pw"}
+    parsed = _parse_connection_string(dsn(cfg, "tpch;Server=10.0.0.9,1433", True))
+    failures = _check("a `;` in the database name adds no key",
+                      parsed.get("Server") == "h,1433", "Server=%r" % parsed.get("Server"))
+    failures += _check("and the name itself arrives whole",
+                       parsed.get("Database") == "tpch;Server=10.0.0.9,1433", "intact")
+    parsed = _parse_connection_string(dsn(cfg, "db}x", True))
+    failures += _check("a `}` in the database name is doubled and read back",
+                       parsed.get("Database") == "db}x", "%r" % parsed.get("Database"))
+
+    print("\nthe name gate covers every command, not load and drop alone (#546.3):")
+
+    def gated(db, collation=None):
+        try:
+            check_names(argparse.Namespace(db=db, collation=collation))
+            return True
+        except SystemExit:
+            return False
+
+    failures += _check("the derived default passes", gated("tpch_sf1_columnstore"), "accepted")
+    # trace formats --db into T-SQL as DB_ID(N'{db}') and then esc()s the
+    # result for the DuckDB literal, which is not the same escape -- so this
+    # name ran a batch of its own through mssql_scan.
+    failures += _check("a name that breaks out of trace's DB_ID(N'...') is refused",
+                       not gated("x') OR 1=1 --"), "refused")
+    failures += _check("a name that would add a connection-string key is refused",
+                       not gated("tpch;Server=10.0.0.9,1433"), "refused")
+    failures += _check("a collation with a batch after it is refused",
+                       not gated("tpch_sf1", "Latin1_General_100_BIN2_UTF8; DROP DATABASE [master]"),
+                       "refused")
+
+    print("\nthe host and port are checked, since neither can be braced (#546.4):")
+    for label, host, want in HOST_TESTS:
+        failures += _check(label, bool(HOST.fullmatch(host)) == want,
+                           "accepted" if HOST.fullmatch(host) else "refused")
+    for label, port, want in PORT_TESTS:
+        failures += _check("port: " + label, bool(PORT.fullmatch(port)) == want,
+                           "accepted" if PORT.fullmatch(port) else "refused")
+
+    # A connection string that was never brace-quoted, as an older session log
+    # holds it: the value is redacted whole, not up to its first escaped quote.
+    legacy = mask("ATTACH 'Server=h,1433;Password=pw''X;Encrypt=yes' AS t;")
+    failures += _check("an unbraced, escaped value is redacted whole",
+                       "Password=***;" in legacy and "pw" not in legacy, legacy[36:60])
+
+    # The wiring: the check lives in server(), which reads the environment.
+    kept = {k: os.environ.get(k) for k in ("MSSQL_BENCH_HOST", "MSSQL_BENCH_PORT",
+                                           "MSSQL_BENCH_PASSWORD")}
+    try:
+        os.environ["MSSQL_BENCH_HOST"] = "h;Password=leak"
+        os.environ["MSSQL_BENCH_PORT"] = "1433"
+        os.environ["MSSQL_BENCH_PASSWORD"] = "pw"
+        try:
+            server()
+            why = "ACCEPTED"
+        except SystemExit as exc:
+            why = str(exc)
+    finally:
+        for name, value in kept.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    failures += _check("server() refuses it and names the variable",
+                       "MSSQL_BENCH_HOST" in why, why[:44])
     return failures
 
 
@@ -2451,7 +2631,10 @@ def main():
     ap.add_argument("command", choices=["gen", "load", "verify", "explain", "trace", "run", "report",
                                        "drop", "selftest"])
     args = ap.parse_args()
+    # The collation first, then the name derived from it (#507 item 1), then
+    # the gate every command goes through (review of #546 item 3).
     resolve_schema(args)
+    check_names(args)
     # `or 0`: only run and verify have a status to report, and verify exits on
     # its own. Every other command returns None, which is success.
     return {"gen": cmd_gen, "load": cmd_load, "verify": cmd_verify, "explain": cmd_explain,
