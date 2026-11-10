@@ -1,10 +1,12 @@
 # Backup samples (spec 085 task 10)
 
 Small SQL Server backups for the backup reader's tests, **synthetic and made on a clean instance**:
-`generate.sh` starts a throwaway SQL Server container of its own, runs `samples.sql` (a generated
-database, `bak_sample`), saves the golden `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY`
-output of every backup next to it (`<name>.headeronly.txt`, …), copies the backups out and removes
-the container. No backup of any other instance is ever committed here (spec 085 T4); the
+`generate.sh` runs `test/backup/gen/generate.sh` (SQL Server 2025), which starts a throwaway SQL
+Server container of its own, runs `test/backup/gen/samples.sql` (a generated database,
+`bak_sample`), saves the golden `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` output of every
+backup next to it (`<name>.headeronly.txt`, …) with `sets.txt` naming each set's files, copies the
+backups out and removes the container. The oracle lane runs the same generator on 2017–2025
+(spec 085 PR 2a). No backup of any other instance is ever committed here (spec 085 T4); the
 repository ignores every other `*.bak`.
 
 | file | what |
@@ -16,7 +18,11 @@ repository ignores every other `*.bak`.
 | `diff.bak` | a differential over `full.bak` |
 | `log.trn` | a log backup after it |
 
-Regenerate (needs Docker; SQL Server 2025 by default, `IMAGE=` for another):
+Regenerating also writes `server.txt` (the server's version, which the comparison checks against
+`software_version`); the committed samples predate it and have none.
+
+`make test-backup-golden` compares `mssql_backup_info` with the golden files, field by field
+(`test/backup/compare_info.py`). Regenerate (needs Docker; SQL Server 2025 by default):
 
 ```bash
 test/data/backup/generate.sh

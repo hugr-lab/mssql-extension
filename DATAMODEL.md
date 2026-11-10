@@ -1456,9 +1456,28 @@ flowchart BT
 - **Prepared statements** keep the row their bind read (`SupportStatementCache`); `reread := true`
   binds again on every `EXECUTE`. The opened-file cache shared across statements (D9) is task 22.
 
-Samples: `test/data/backup/` (synthetic, made by `generate.sh` on a throwaway container, with the
-golden `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` beside each), checked by
-`test/sql/backup/mssql_backup_info.test` with no SQL Server.
+Samples: `test/data/backup/` (synthetic, made by `test/backup/gen/generate.sh` on a throwaway
+container, with the golden `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` beside each), checked by
+`test/sql/backup/mssql_backup_info.test` and, every field, by `make test-backup-golden`
+(`test/backup/compare_info.py`), with no SQL Server.
+
+**The oracle lane** (`.github/workflows/backup-oracle.yml`, spec 085 PR 2a) makes the same backups on
+SQL Server 2017, 2019, 2022 and 2025 (each image pinned by digest in `test/backup/gen/images.txt`)
+and stores them in R2 under `oracle/<key>/<version>/<run>/`, `<key>` a hash of `test/backup/gen/`:
+they are made again only when the generator, the data or an image changes. `<version>/DONE`,
+written last, names the run whose upload is complete, so two runs generating one version never mix
+their files. The reader is compared with the server's answers reading them from R2 through `s3://`,
+in a build with httpfs linked in statically and curl from vcpkg (`make backup-oracle-build`,
+`test/backup/oracle_vcpkg_manifest.py`): the reader's own I/O path, not a copy.
+
+```mermaid
+flowchart LR
+  gen["test/backup/gen/<br/>generate.sh · samples.sql · images.txt"] --> key["key = hash(gen/)"]
+  key -->|"no DONE for a version"| make["generate: throwaway SQL Server<br/>backups + RESTORE …ONLY"]
+  make -->|"aws s3 cp, DONE last"| r2[("R2 oracle/&lt;key&gt;/&lt;version&gt;/&lt;run&gt;/")]
+  build["build: duckdb + mssql + httpfs (static)"] --> cmp["compare_info.py<br/>mssql_backup_info vs RESTORE"]
+  r2 -->|"s3:// through httpfs"| cmp
+```
 
 ---
 

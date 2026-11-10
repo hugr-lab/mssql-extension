@@ -58,6 +58,10 @@ test/
     tds_connection/     # TDS protocol tests
     transaction/        # Transaction management tests
   cpp/                  # C++ unit tests (no SQL Server required); cpp/backup/ for spec 085
+  backup/               # Spec 085 PR 2a: gen/ (generate.sh, samples.sql, images.txt pinning each
+                        # SQL Server image by digest), compare_info.py (mssql_backup_info vs RESTORE,
+                        # local dir or s3://), httpfs_extension_config.cmake + oracle_vcpkg_manifest.py
+                        # (the oracle build: httpfs static, curl from vcpkg)
   data/backup/          # Synthetic backup samples + golden RESTORE HEADERONLY/LABELONLY/FILELISTONLY,
                         # made by generate.sh on a throwaway container. Never commit a backup of
                         # any other instance (spec 085 T4); .gitignore admits only this directory's .bak
@@ -96,6 +100,9 @@ make bench-code-page    # Code-page kernel microbenchmark (manual, not in CI)
 make code-pages-check-wire   # Every collation's wire key against a live server (spec 092 D1)
 make bench-code-page-column  # One 2048-row column, staging to vector: DecodeColumn vs today's
                         # NVARCHAR path (needs a release build; CELL=thai filters cells)
+make test-backup-golden # mssql_backup_info vs the samples' golden RESTORE output, every field (spec 085)
+make backup-oracle-build # Release build with httpfs linked in statically, for the backup oracle lane
+                        # (.github/workflows/backup-oracle.yml: backups of 2017-2025 in R2, read via s3://)
 make fuzz-backup-replay # Replay the backup reader's fuzz corpora (mtf, container, xpress, page;
                         # spec 085), DuckDB-free, under sanitizers
 

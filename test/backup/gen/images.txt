@@ -1,0 +1,8 @@
+# Spec 085 PR 2a: the SQL Server images the oracle lane generates its backups on, pinned by digest.
+# The lane keys its stored backups by a hash of this directory, so a new digest here is what makes
+# it generate them again (a new cumulative update is a deliberate change, seen in the diff).
+# Refresh: docker buildx imagetools inspect mcr.microsoft.com/mssql/server:<version>-latest
+2017 mcr.microsoft.com/mssql/server:2017-latest@sha256:aeef07e21e24e51fdbf06d6f0c3c742b50c6cb59bb9c6209c53b27513d95f50b
+2019 mcr.microsoft.com/mssql/server:2019-latest@sha256:07d7dedecdbfcf6776035dc5eefb5bfd9aa1804b2f6b99f7dedb397d8a599069
+2022 mcr.microsoft.com/mssql/server:2022-latest@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718
+2025 mcr.microsoft.com/mssql/server:2025-latest@sha256:245f6b1c8903edae52cb20fa31419cefcde1a49938bb8c3447099011fc871ca3

@@ -1,0 +1,246 @@
+# Spec 085 PR 2a: the backup reader's oracle lane. Backups of a synthetic database
+# (test/backup/gen/samples.sql) are made by SQL Server itself on every version the reader supports,
+# with RESTORE HEADERONLY / LABELONLY / FILELISTONLY beside them, and stored in R2; the reader is
+# then compared with the server's answers, reading the backups from R2 through s3:// (httpfs linked
+# into the build).
+#
+# The backups are made only when what makes them changes: they are stored under
+# oracle/<key>/<version>/<run>/, where <key> hashes test/backup/gen/ (the generator, samples.sql and
+# images.txt, which pins each image by digest), and <version>/DONE, written last, names the <run>
+# whose upload is complete: a version with a DONE is not generated again, and two runs generating
+# one version never mix their files (each uploads under its own <run>; the last DONE wins whole).
+# A PR that changes the generator generates its own, before its test reads them.
+#
+# Uploads use the aws CLI; every read is DuckDB's. The R2 credentials are repository secrets, which
+# a pull request from a fork does not get: there the lane says so and runs nothing.
+name: Backup oracle
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/backup/**'
+      - 'src/include/backup/**'
+      - 'src/codec/code_page/**'
+      - 'src/include/codec/code_page/**'
+      - 'extension_config.cmake'
+      - 'Makefile'
+      - 'scripts/ci/checkout_duckdb.sh'
+      - 'test/backup/**'
+      - 'test/data/backup/**'
+      - 'CMakeLists.txt'
+      - 'vcpkg.json'
+      - 'duckdb'
+      - '.github/workflows/backup-oracle.yml'
+  pull_request:
+    paths:
+      - 'src/backup/**'
+      - 'src/include/backup/**'
+      - 'src/codec/code_page/**'
+      - 'src/include/codec/code_page/**'
+      - 'extension_config.cmake'
+      - 'Makefile'
+      - 'scripts/ci/checkout_duckdb.sh'
+      - 'test/backup/**'
+      - 'test/data/backup/**'
+      - 'CMakeLists.txt'
+      - 'vcpkg.json'
+      - 'duckdb'
+      - '.github/workflows/backup-oracle.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: backup-oracle-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  VERSIONS: '2017 2019 2022 2025'
+
+jobs:
+  key:
+    name: Which backups to generate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      enabled: ${{ steps.key.outputs.enabled }}
+      key: ${{ steps.key.outputs.key }}
+      missing: ${{ steps.key.outputs.missing }}
+      versions: ${{ steps.key.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: key
+        env:
+          MSSQL_R2_ACCESS_KEY: ${{ secrets.MSSQL_R2_ACCESS_KEY }}
+          MSSQL_R2_ACCESS_SECRET_KEY: ${{ secrets.MSSQL_R2_ACCESS_SECRET_KEY }}
+          MSSQL_R2_URL: ${{ secrets.MSSQL_R2_URL }}
+          MSSQL_R2_BUCKET_NAME: ${{ secrets.MSSQL_R2_BUCKET_NAME }}
+        run: |
+          versions=$(printf '%s\n' $VERSIONS | jq -R . | jq -cs .)
+          echo "versions=${versions}" >> "$GITHUB_OUTPUT"
+          if [ -z "${MSSQL_R2_ACCESS_KEY}" ]; then
+            echo "::notice::No R2 credentials (a pull request from a fork): the backup oracle lane is skipped."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"; echo "missing=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Every file of the generator, by path and content, in a stable order.
+          key=$(cd test/backup/gen && find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-16)
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+          export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
+                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
+          missing=()
+          for v in $VERSIONS; do
+            if aws s3 ls "s3://${MSSQL_R2_BUCKET_NAME}/oracle/${key}/${v}/DONE" >/dev/null 2>&1; then
+              echo "${v}: stored under oracle/${key}/${v}/"
+            else
+              echo "${v}: to generate"; missing+=("${v}")
+            fi
+          done
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "missing=$(printf '%s\n' "${missing[@]}" | jq -R . | jq -cs 'map(select(. != ""))')" >> "$GITHUB_OUTPUT"
+
+  generate:
+    name: Generate (SQL Server ${{ matrix.version }})
+    needs: key
+    if: needs.key.outputs.enabled == 'true' && needs.key.outputs.missing != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.key.outputs.missing) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Generate the backups and the server's answers
+        run: OUT="${RUNNER_TEMP}/oracle" VERSION=${{ matrix.version }} test/backup/gen/generate.sh
+      - name: Store them in R2 (DONE last)
+        env:
+          MSSQL_R2_ACCESS_KEY: ${{ secrets.MSSQL_R2_ACCESS_KEY }}
+          MSSQL_R2_ACCESS_SECRET_KEY: ${{ secrets.MSSQL_R2_ACCESS_SECRET_KEY }}
+          MSSQL_R2_URL: ${{ secrets.MSSQL_R2_URL }}
+          MSSQL_R2_BUCKET_NAME: ${{ secrets.MSSQL_R2_BUCKET_NAME }}
+        run: |
+          export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
+                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
+          prefix="s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}"
+          run="${{ github.run_id }}-${{ github.run_attempt }}"
+          aws s3 cp --recursive --only-show-errors "${RUNNER_TEMP}/oracle/" "${prefix}/${run}/"
+          echo "${run}" | aws s3 cp - "${prefix}/DONE"
+          echo "stored $(ls "${RUNNER_TEMP}/oracle" | wc -l) files under oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}/${run}/"
+
+  build:
+    name: Build (httpfs linked in)
+    needs: key
+    if: needs.key.outputs.enabled == 'true'
+    # ci.yml's Linux build runner, so the vcpkg archives it caches serve this build too.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Checkout DuckDB submodule
+        timeout-minutes: 40
+        run: scripts/ci/checkout_duckdb.sh
+      - id: duckdb
+        run: echo "commit=$(git -C duckdb rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Setup Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build ccache libkrb5-dev
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.ccache
+          key: ccache-backup-oracle-${{ steps.duckdb.outputs.commit }}-${{ github.sha }}
+          restore-keys: |
+            ccache-backup-oracle-${{ steps.duckdb.outputs.commit }}-
+            ccache-backup-oracle-
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=2G
+          ccache --set-config=compression=true
+          ccache -z
+      - name: Setup vcpkg
+        run: |
+          if [ ! -d "vcpkg" ]; then
+            git clone https://github.com/microsoft/vcpkg.git
+            BASELINE=$(grep -o '"builtin-baseline": *"[a-f0-9]*"' vcpkg.json | grep -oE '[a-f0-9]{40}')
+            git -C vcpkg checkout "$BASELINE"
+            ./vcpkg/bootstrap-vcpkg.sh
+          fi
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v6
+        with:
+          path: vcpkg_bincache
+          key: vcpkg-bincache-backup-oracle-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-bincache-backup-oracle-
+            vcpkg-bincache-x64-linux-
+      - name: Build
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: |
+          # As ci.yml's build, with httpfs's test-only config beside ours and curl in the vcpkg
+          # manifest (make backup-oracle-build), so nothing links the system's libcurl or OpenSSL.
+          python3 -I test/backup/oracle_vcpkg_manifest.py build/backup-oracle-vcpkg
+          mkdir -p build/release vcpkg_bincache
+          cd build/release
+          cmake -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_TOOLCHAIN_FILE="$(pwd)/../../vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_MANIFEST_DIR="$(pwd)/../backup-oracle-vcpkg" \
+            -DDUCKDB_EXTENSION_CONFIGS="$(pwd)/../../test/backup/httpfs_extension_config.cmake;$(pwd)/../../extension_config.cmake" \
+            -DENABLE_UNITTEST_CPP_TESTS=FALSE \
+            ../../duckdb
+          cmake --build . --config Release --target duckdb
+          ccache -s
+          # Both linked in, and no dynamic curl or OpenSSL beside the static ones.
+          linked=$(./duckdb -noheader -list -c "SELECT count(*) FROM duckdb_extensions() WHERE extension_name IN ('httpfs', 'mssql') AND install_mode = 'STATICALLY_LINKED'")
+          if [ "${linked}" != 2 ]; then echo "::error::httpfs and mssql are not both statically linked (${linked})"; exit 1; fi
+          if ldd ./duckdb | grep -E 'libcurl|libssl|libcrypto'; then echo "::error::the build links a system curl / OpenSSL"; exit 1; fi
+      - name: Prune stale vcpkg binary archives
+        if: always()
+        run: |
+          [ -d vcpkg_bincache ] || exit 0
+          find vcpkg_bincache -type f -mtime +14 -delete
+          find vcpkg_bincache -mindepth 1 -type d -empty -delete
+      - name: The committed samples against their golden files
+        run: python3 -I test/backup/compare_info.py --duckdb build/release/duckdb test/data/backup
+      - uses: actions/upload-artifact@v7
+        with:
+          name: backup-oracle-duckdb
+          path: build/release/duckdb
+          retention-days: 3
+
+  test:
+    name: Compare (SQL Server ${{ matrix.version }})
+    needs: [key, generate, build]
+    # Every version is compared whatever happened to the others' generate legs (skipped when all
+    # were stored, or one version failing): a version with no DONE fails its own leg, by name.
+    if: ${{ always() && needs.key.outputs.enabled == 'true' && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.key.outputs.versions) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: backup-oracle-duckdb
+          path: cli
+      - name: mssql_backup_info against RESTORE, read through s3://
+        env:
+          MSSQL_R2_ACCESS_KEY: ${{ secrets.MSSQL_R2_ACCESS_KEY }}
+          MSSQL_R2_ACCESS_SECRET_KEY: ${{ secrets.MSSQL_R2_ACCESS_SECRET_KEY }}
+          MSSQL_R2_URL: ${{ secrets.MSSQL_R2_URL }}
+          MSSQL_R2_BUCKET_NAME: ${{ secrets.MSSQL_R2_BUCKET_NAME }}
+        run: |
+          chmod +x cli/duckdb
+          python3 -I test/backup/compare_info.py --duckdb cli/duckdb --require-done \
+            "s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}"

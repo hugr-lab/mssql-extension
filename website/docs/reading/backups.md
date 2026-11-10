@@ -44,9 +44,9 @@ SELECT f.logical_name, f.type, f.filegroup_name, f.size_bytes
 FROM (SELECT unnest(files) AS f FROM mssql_backup_info('/backups/sales_full.bak'));
 ```
 
-The reader has been checked against SQL Server 2025 backups, against what `RESTORE HEADERONLY` /
-`LABELONLY` / `FILELISTONLY` print for them. Backups of SQL Server 2017, 2019 and 2022 are to be
-checked by a test matrix in a later release.
+The reader is checked against backups made by SQL Server 2019, 2022 and 2025, against what
+`RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` print for them, field by field. SQL Server 2017
+joins the same test matrix.
 
 ## What is refused
 
