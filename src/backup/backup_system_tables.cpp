@@ -184,27 +184,77 @@ void RequireSize(const RowsetLayout &layout, size_t column, const SystemValue &v
 }  // namespace
 
 uint16_t PhysicalColumn::FixedLength(const std::string &table) const {
+	// A time part's bytes by its scale (fractional digits 0-7), the server's storage sizes.
+	auto time_bytes = [&]() -> uint16_t {
+		if (scale > 7) {
+			throw FormatError("backup: " + table + "." + name + " is a " + XtypeName(xtype) + " of scale " +
+							  std::to_string(scale) + ", past 7");
+		}
+		return scale <= 2 ? 3 : scale <= 4 ? 4 : 5;
+	};
 	switch (xtype) {
 	case XTYPE_TINYINT:
 	case XTYPE_BIT:
 		return 1;
 	case XTYPE_SMALLINT:
 		return 2;
+	case XTYPE_DATE:
+		return 3;
 	case XTYPE_INT:
 	case XTYPE_SMALLDATETIME:
+	case XTYPE_REAL:
+	case XTYPE_SMALLMONEY:
 		return 4;
 	case XTYPE_BIGINT:
 	case XTYPE_DATETIME:
+	case XTYPE_FLOAT:
+	case XTYPE_MONEY:
+	case XTYPE_TIMESTAMP:
 		return 8;
 	case XTYPE_UNIQUEIDENTIFIER:
 		return 16;
+	case XTYPE_TIME:
+		return time_bytes();
+	case XTYPE_DATETIME2:
+		return static_cast<uint16_t>(time_bytes() + 3);
+	case XTYPE_DATETIMEOFFSET:
+		return static_cast<uint16_t>(time_bytes() + 5);
+	case XTYPE_DECIMAL:
+	case XTYPE_NUMERIC:
+		// A sign byte, then the mantissa in 4, 8, 12 or 16 bytes by precision.
+		if (precision < 1 || precision > 38 || scale > precision) {
+			throw FormatError("backup: " + table + "." + name + " is a " + XtypeName(xtype) + " of precision " +
+							  std::to_string(precision) + " and scale " + std::to_string(scale));
+		}
+		return precision <= 9 ? 5 : precision <= 19 ? 9 : precision <= 28 ? 13 : 17;
 	case XTYPE_BINARY:
 	case XTYPE_CHAR:
 	case XTYPE_NCHAR:
 		return length;
 	default:
 		throw FormatError("backup: " + table + "." + name + " is a fixed column of " + XtypeName(xtype) +
-						  ", a type the system-table reader does not read");
+						  ", a type the record decoder does not read");
+	}
+}
+
+void SetTypeInfo(PhysicalColumn &column, uint32_t ti) {
+	column.xtype = static_cast<uint8_t>(ti & 0xFF);
+	column.length = 0;
+	column.precision = 0;
+	column.scale = 0;
+	switch (column.xtype) {
+	case XTYPE_DECIMAL:
+	case XTYPE_NUMERIC:
+		column.precision = static_cast<uint8_t>((ti >> 8) & 0xFF);
+		column.scale = static_cast<uint8_t>((ti >> 16) & 0xFF);
+		break;
+	case XTYPE_TIME:
+	case XTYPE_DATETIME2:
+	case XTYPE_DATETIMEOFFSET:
+		column.scale = static_cast<uint8_t>((ti >> 8) & 0xFF);
+		break;
+	default:
+		column.length = static_cast<uint16_t>((ti >> 8) & 0xFFFF);
 	}
 }
 
@@ -226,76 +276,115 @@ size_t RowsetLayout::IndexOf(const std::string &name) const {
 	throw FormatError("backup: " + table + " has no column " + name);
 }
 
+size_t RowVarCount(const RecordView &record, const std::string &table) {
+	const size_t var_count = record.HasVariableColumns() ? record.var_count : 0;
+	if (record.Type() != RECORD_FORWARDED) {
+		return var_count;
+	}
+	// A forwarded record: its last variable column is the back pointer (spec 085 § Rules, records).
+	const size_t last = var_count - 1;
+	if (var_count == 0 || !record.VarComplex(last) ||
+		record.VarEnd(last) - record.VarStart(last) != BACK_POINTER_BYTES ||
+		record.Var(last, "a back pointer").U16(0) != BACK_POINTER_TAG) {
+		throw FormatError("backup: a forwarded record of " + table + " at offset " + std::to_string(record.offset) +
+						  " has no back pointer as its last variable column");
+	}
+	return last;
+}
+
+RowLocation ForwardedFrom(const RecordView &record, const std::string &table) {
+	const size_t last = RowVarCount(record, table);	 // checks the back pointer
+	if (record.Type() != RECORD_FORWARDED) {
+		throw FormatError("backup: the record of " + table + " at offset " + std::to_string(record.offset) +
+						  " is of type " + std::to_string(record.Type()) + ", not a forwarded record");
+	}
+	const ByteReader b = record.Var(last, "a back pointer");
+	RowLocation at;
+	at.page.page = b.U32(2);
+	at.page.file = b.U16(6);
+	at.slot = b.U16(8);
+	return at;
+}
+
+ValueRef LocateValue(const RecordView &record, size_t var_count, const RowsetLayout &layout, size_t k) {
+	const PhysicalColumn &c = layout.columns[k];
+	ValueRef v;
+	if (c.Dropped()) {
+		return v;
+	}
+	if (record.HasNullBitmap() && c.null_bit > record.column_count) {
+		// Added after the record was written (a metadata-only ADD COLUMN): its default, else NULL.
+		if (c.has_default) {
+			v.state = ValueState::Default;
+			v.data = reinterpret_cast<const uint8_t *>(c.default_bytes.data());
+			v.size = static_cast<uint32_t>(c.default_bytes.size());
+		} else if (c.HasDefaultStatus()) {
+			throw FormatError("backup: " + layout.table + "." + c.name +
+							  " was added after a record was written, with a default the reader was not given");
+		}
+		return v;
+	}
+	if (record.HasNullBitmap() && c.null_bit >= 1 && record.IsNull(c.null_bit - 1)) {
+		return v;
+	}
+	if (c.offset > 0) {
+		const uint16_t length = c.FixedLength(layout.table);
+		if (c.offset < 4) {
+			throw FormatError("backup: " + layout.table + "." + c.name + " is described at offset " +
+							  std::to_string(c.offset) + ", inside the record's 4-byte header");
+		}
+		if (c.offset + length > record.fixed_end) {
+			throw FormatError("backup: " + layout.table + "." + c.name + " (" + std::to_string(length) +
+							  " bytes at offset " + std::to_string(c.offset) +
+							  ") lies past the fixed part of the record at offset " + std::to_string(record.offset) +
+							  ", which ends at " + std::to_string(record.fixed_end));
+		}
+		if (c.xtype == XTYPE_BIT && c.bit_position > 7) {
+			throw FormatError("backup: " + layout.table + "." + c.name + " has bit position " +
+							  std::to_string(c.bit_position));
+		}
+		v.state = ValueState::Inline;
+		v.data = record.data + c.offset;
+		v.size = length;
+		return v;
+	}
+	if (c.offset < 0) {
+		const size_t i = static_cast<size_t>(-static_cast<int32_t>(c.offset)) - 1;
+		v.state = ValueState::Inline;
+		if (i >= var_count) {
+			v.data = record.data;  // past the record's variable count: empty (spec 085 § Rules, records)
+			return v;
+		}
+		const ByteReader bytes = record.Var(i, c.name.c_str());
+		v.data = bytes.Data();
+		v.size = static_cast<uint32_t>(bytes.Size());
+		if (record.VarComplex(i)) {
+			v.state = ValueState::OffRow;
+		}
+		return v;
+	}
+	throw FormatError("backup: " + layout.table + "." + c.name + " has neither a fixed offset nor a variable index");
+}
+
 std::vector<SystemValue> DecodeRecord(const RecordView &record, const RowsetLayout &layout) {
 	std::vector<SystemValue> values(layout.columns.size());
-	const bool bitmap = record.HasNullBitmap();
-	size_t var_count = record.HasVariableColumns() ? record.var_count : 0;
-	if (record.Type() == 1) {
-		// A forwarded record: its last variable column is the back pointer (spec 085 § Rules, records).
-		const size_t last = var_count - 1;
-		if (var_count == 0 || !record.VarComplex(last) ||
-			record.VarEnd(last) - record.VarStart(last) != BACK_POINTER_BYTES ||
-			record.Var(last, "a back pointer").U16(0) != BACK_POINTER_TAG) {
-			throw FormatError("backup: a forwarded record of " + layout.table + " at offset " +
-							  std::to_string(record.offset) + " has no back pointer as its last variable column");
-		}
-		var_count--;
-	}
+	const size_t var_count = RowVarCount(record, layout.table);
 	for (size_t k = 0; k < layout.columns.size(); k++) {
 		const PhysicalColumn &c = layout.columns[k];
+		if (c.Uniquifier()) {
+			continue;
+		}
+		const ValueRef ref = LocateValue(record, var_count, layout, k);
 		SystemValue &v = values[k];
-		if (c.Dropped() || c.Uniquifier()) {
+		if (ref.state == ValueState::Null) {
 			continue;
 		}
-		if (bitmap && c.null_bit > record.column_count) {
-			// Added after the record was written (a metadata-only ADD COLUMN): its default, else NULL.
-			if (c.has_default) {
-				v.is_null = false;
-				v.bytes = c.default_bytes;
-			} else if (c.HasDefaultStatus()) {
-				throw FormatError("backup: " + layout.table + "." + c.name +
-								  " was added after a record was written, with a default the reader was not given");
-			}
-			continue;
-		}
-		if (bitmap && c.null_bit >= 1 && record.IsNull(c.null_bit - 1)) {
-			continue;
-		}
-		if (c.offset > 0) {
-			const uint16_t length = c.FixedLength(layout.table);
-			if (c.offset < 4) {
-				throw FormatError("backup: " + layout.table + "." + c.name + " is described at offset " +
-								  std::to_string(c.offset) + ", inside the record's 4-byte header");
-			}
-			if (c.offset + length > record.fixed_end) {
-				throw FormatError(
-					"backup: " + layout.table + "." + c.name + " (" + std::to_string(length) + " bytes at offset " +
-					std::to_string(c.offset) + ") lies past the fixed part of the record at offset " +
-					std::to_string(record.offset) + ", which ends at " + std::to_string(record.fixed_end));
-			}
-			const uint8_t *at = record.data + c.offset;
-			v.is_null = false;
-			if (c.xtype == XTYPE_BIT) {
-				if (c.bit_position > 7) {
-					throw FormatError("backup: " + layout.table + "." + c.name + " has bit position " +
-									  std::to_string(c.bit_position));
-				}
-				v.bytes.assign(1, static_cast<char>((at[0] >> c.bit_position) & 1));
-			} else {
-				v.bytes.assign(reinterpret_cast<const char *>(at), length);
-			}
-		} else if (c.offset < 0) {
-			const size_t i = static_cast<size_t>(-static_cast<int32_t>(c.offset)) - 1;
-			v.is_null = false;
-			if (i >= var_count) {
-				continue;  // past the record's variable count: empty (spec 085 § Rules, records)
-			}
-			const ByteReader bytes = record.Var(i, c.name.c_str());
-			v.bytes.assign(reinterpret_cast<const char *>(bytes.Data()), bytes.Size());
-			v.off_row = record.VarComplex(i);
+		v.is_null = false;
+		v.off_row = ref.state == ValueState::OffRow;
+		if (c.xtype == XTYPE_BIT && c.offset > 0 && ref.state == ValueState::Inline) {
+			v.bytes.assign(1, static_cast<char>((ref.data[0] >> c.bit_position) & 1));
 		} else {
-			throw FormatError("backup: " + layout.table + "." + c.name +
-							  " has neither a fixed offset nor a variable index");
+			v.bytes.assign(reinterpret_cast<const char *>(ref.data), ref.size);
 		}
 	}
 	return values;
@@ -543,10 +632,7 @@ RowsetLayout BootstrapTables::LayoutOf(int32_t object_id, const SysRowset &base)
 		PhysicalColumn c;
 		c.rscolid = r.rscolid;
 		c.hbcolid = r.hbcolid;
-		c.xtype = static_cast<uint8_t>(r.ti & 0xFF);
-		// The length bytes of the length-carrying types; a decimal's or a time type's precision and scale
-		// share these bits, which PR 2d pins.
-		c.length = static_cast<uint16_t>((r.ti >> 8) & 0xFFFF);
+		SetTypeInfo(c, static_cast<uint32_t>(r.ti));
 		c.collation = r.collation;
 		c.status = r.status;
 		c.offset = r.offset;

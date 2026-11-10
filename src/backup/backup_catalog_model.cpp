@@ -240,6 +240,49 @@ bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &default
 		why = std::string("its physical layout: ") + e.what();
 		return false;
 	}
+	// What sysrscols.ti says of each live column, checked against syscolpars' row of it (E20 pinned
+	// ti's fields): a disagreement, or a fixed column whose width is unknown, refuses the table here,
+	// by name, rather than mid-scan.
+	for (const auto &physical : layout.columns) {
+		if (physical.Dropped() || physical.Uniquifier()) {
+			continue;
+		}
+		auto column = by_id.find(physical.rscolid);
+		if (column == by_id.end()) {
+			continue;  // named below when it matters (an added column), as before
+		}
+		const CatalogColumn &c = *column->second;
+		const bool decimal = physical.xtype == XTYPE_DECIMAL || physical.xtype == XTYPE_NUMERIC;
+		const bool scaled =
+			physical.xtype == XTYPE_TIME || physical.xtype == XTYPE_DATETIME2 || physical.xtype == XTYPE_DATETIMEOFFSET;
+		if (physical.xtype != c.system_type_id || (decimal && physical.precision != c.precision) ||
+			((decimal || scaled) && physical.scale != c.scale)) {
+			why = "column " + c.name + " is stored as xtype " + std::to_string(physical.xtype) + " (precision " +
+				  std::to_string(physical.precision) + ", scale " + std::to_string(physical.scale) +
+				  "), which its declaration does not say";
+			return false;
+		}
+		// A fixed type stored as a variable column is the vardecimal storage format (or a layout the
+		// reader does not know); a variable type at a fixed offset is not one either.
+		const bool variable_type =
+			physical.xtype == XTYPE_VARCHAR || physical.xtype == XTYPE_NVARCHAR || physical.xtype == XTYPE_VARBINARY ||
+			physical.xtype == XTYPE_SQL_VARIANT || physical.xtype == XTYPE_CLR || physical.xtype == XTYPE_XML ||
+			physical.xtype == XTYPE_IMAGE || physical.xtype == XTYPE_TEXT || physical.xtype == XTYPE_NTEXT;
+		if ((!variable_type && physical.offset < 0) || (variable_type && physical.offset > 0)) {
+			why = "column " + c.name + " (xtype " + std::to_string(physical.xtype) + ") is stored as a " +
+				  (physical.offset < 0 ? "variable" : "fixed") +
+				  " column, which its type is not (the vardecimal storage format is not read)";
+			return false;
+		}
+		if (physical.offset > 0) {
+			try {
+				(void)physical.FixedLength(t.name);
+			} catch (FormatError &e) {
+				why = e.what();
+				return false;
+			}
+		}
+	}
 	for (auto &physical : layout.columns) {
 		if (physical.Dropped() || physical.Uniquifier() || !physical.HasDefaultStatus()) {
 			continue;
