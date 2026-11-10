@@ -18,7 +18,9 @@ src/
                         # backup_source (DuckDB FileSystem, ranges), backup_mtf, backup_container
                         # (MSSQLBAK) + backup_xpress / backup_zstd, backup_set (TAPE/SSET/SCIN/SFIN),
                         # backup_opened (OpenedHeaders), backup_page_index / _pass_search /
-                        # _allocation (pages, PR 2), backup_info_function. DuckDB-free except
+                        # _allocation (pages, PR 2), backup_page / _record / _boot / _iam /
+                        # _system_tables (PageStore, records, IAM chains, the base tables; PR 2b),
+                        # backup_info_function. DuckDB-free except
                         # the files whose header says [DuckDB] (D15)
   catalog/              # DuckDB catalog integration + transaction manager
   codec/                # Per-type-family codec layer (spec 045): boolean/integer/

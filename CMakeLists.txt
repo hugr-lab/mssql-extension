@@ -181,6 +181,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_ranges.cpp
     src/backup/backup_record.cpp
     src/backup/backup_set.cpp
+    src/backup/backup_system_tables.cpp
     src/backup/backup_xpress.cpp
     src/backup/backup_zstd.cpp
     src/backup/backup_source.cpp

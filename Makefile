@@ -666,6 +666,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_ranges.cpp \
     test/cpp/backup/test_backup_record.cpp \
     test/cpp/backup/test_backup_source.cpp \
+    test/cpp/backup/test_backup_system_tables.cpp \
     test/cpp/backup/test_backup_xpress.cpp \
     test/cpp/backup/test_backup_zstd.cpp \
     test/cpp/test_catalog_filter.cpp \

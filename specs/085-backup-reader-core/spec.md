@@ -808,9 +808,23 @@ offsets above are in its fixed part.
   (6-byte page pointer, = 1:20, the first `sysallocunits` page). Checked against the trailer's name,
   version, level, family GUID and collation (`CheckBootAgainstSet`; the CollationId's row must be one
   the TDS form names: 13 collations of E15 / E16, `_SC` and KS / WS included).
-- Bootstrap tables, found by the page header's `(m_objId, m_indexId)` on live level-0 data pages:
+- Bootstrap tables, by the allocation unit their pages' headers name, `(m_objId, m_indexId)`:
   `sysallocunits` (7, 0), `sysrowsets` (5, 0), `sysschobjs` (34, 1), `syscolpars` (41, 1), `sysrscols`
-  (3, 0). Fixed-part offsets (record offsets):
+  (3, 0). The AU is not the rowset's (object, index): every one of the five is a clustered index
+  (`sysrowsets.idminor` 1), its AU owned by its rowset (`ownerid` = `rowsetid`). `sysallocunits` is read
+  along its leaf chain (next-page pointers) from `dbi_firstSysIndexes`; its own row (the first page's
+  AU) names that page as `pgfirst`, and its IAM chain (`pgfirstiam`) lists exactly the chain's pages.
+  The other four through their IAM chains (DQ-40). The reader's layouts of the five are literals, the
+  table below, decoded by the generic decoder; once read, each literal (name, type, fixed offset or
+  variable index, null bit, a fixed type's length) is checked against the five's own description
+  (`sysrscols` of their base rowsets, named by `syscolpars`: a system table's columns are listed like
+  a user table's), and a field described elsewhere is refused by name. Measured on the lane's
+  2017–2025 backups (2026-11-10): every literal holds on all four; `sysrscols` gained a trailing
+  `ordlock` (int, offset 54) on 2022, which the literals do not take. Every database's `sysschobjs` also
+  lists two MS-shipped user tables with no rowset (`trace_xe_action_map`, `trace_xe_event_map`, type
+  `'U '`, status bit 0x1): their data is the resource database's; the catalog model (task 12) is to leave them
+  out. Record
+  offsets:
 
   | table | fields |
   |---|---|
@@ -878,7 +892,14 @@ offsets above are in its fixed part.
   variable column −offset−1. When that index is beyond the record's variable count and the column
   passed the two tests above, the value is empty: that is E1's prototype (`pages_ext.py`, 0 failures
   over its chains). E2 R7 states the beyond-the-count case as "the default, else NULL", which is the
-  added-column case the `nullbit` test already catches. The oracle fixtures include trailing empty
+  added-column case the `nullbit` test already catches. **The order is load-bearing** (catalog
+  fixture, 2022): after `DROP COLUMN drop_me` (int, offset 8) and `ADD added_default int NOT NULL DEFAULT
+  42`, the dropped column is renumbered (rscolid `0x04000001`, status 0x2) and the added one takes its
+  offset 8: a record written before holds `drop_me`'s value there, and only the `nullbit` test reading
+  first gives it 42. A physical column is named by the `syscolpars` column whose colid is its rscolid
+  (held on every table of the fixture); a non-persisted computed column has a `syscolpars` row and no
+  physical column, and a clustered columnstore has three live base rowsets (`cmprlevel` 3, 2 and 0),
+  refused by name until its PR. The oracle fixtures include trailing empty
   strings and binaries to settle it (trailing NULL variable columns are omitted, and are caught by the
   bitmap).
 - Forwarding stub (type 2): 9 bytes, a pointer to the new location; skipped (the row is read where it

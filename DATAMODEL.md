@@ -1412,6 +1412,9 @@ flowchart BT
   opened --> info["mssql_backup_info"]
   src --> idx["PageIndex (built, used from PR 2)<br/>pass maps: ranked / runs;<br/>PassSearch over ordered passes;<br/>open pass over parallel ranges"]
   idx --> alloc["AllocationMap<br/>file Size, GAM (lazy), PFS → live"]
+  alloc --> store["PageStore<br/>a live page's latest copy, checked<br/>(Present / Pending)"]
+  store --> iam["IAM chains<br/>an AU's pages"]
+  iam --> sys["system base tables<br/>bootstrap five by literal layouts,<br/>checked against sysrscols;<br/>any other by its own description"]
 ```
 
 - **The file is untrusted input.** Every parser reads through `ByteReader` (`backup_bytes`), which
@@ -1451,8 +1454,18 @@ flowchart BT
   from its GAMs (one plain family) or searched by bisection rather than read (`PassSearch`: a
   striped set, a container, or a rank that failed), its order checked at every probe
   (`OrderBroken` → mapped by headers); every other pass is mapped by its page headers. `AllocationMap` decides which pages are live
-  (below the file's Size, GAM allocated, PFS 0x40). A table's pages are to come from its IAM chain
-  (DQ-40), the page header's AU only a check.
+  (GAM allocated, PFS 0x40; the file's Size is a lower bound). `PageStore` hands out a live page's
+  latest copy with its header checked, or `Pending` for a page that became live while the backup ran
+  (its content in the log tail). A table's pages come from its allocation unit's IAM chain (DQ-40,
+  `backup_iam`), the page header's AU only a check.
+- **The catalog's base tables** (`backup_system_tables`, PR 2b): one FixedVar decoder through a
+  rowset's physical layout (sysrscols, named by syscolpars). The five bootstrap tables cannot be
+  described before they are read, so their layouts are literals decoded by the same decoder:
+  sysallocunits along its leaf chain from the boot page's `dbi_firstSysIndexes` (and its own IAM
+  chain must list the same pages), the other four through their IAM chains by their fixed AU ids.
+  Every literal is then checked against the tables' own description of themselves, so a version
+  that moves a field is refused by name, not misread. Any other system table is read through its
+  own description (`ReadSystemTable`).
 - **Prepared statements** keep the row their bind read (`SupportStatementCache`); `reread := true`
   binds again on every `EXECUTE`. The opened-file cache shared across statements (D9) is task 22.
 
