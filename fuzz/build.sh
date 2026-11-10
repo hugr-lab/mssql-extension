@@ -122,6 +122,10 @@ build_harness() {  # $1=name $2=harness.cc ; remaining = library objects
 # code_page (spec 091) shares it with the TDS harnesses, so each default target
 # costs the others time.
 TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn login_response code_page}"
+# TARGETS_EXTRA adds harnesses beside TARGETS without restating it: the weekly ClusterFuzzLite run
+# (cflite-pr.yml's ubsan-weekly, through .clusterfuzzlite/extra_targets) adds the backup reader's,
+# which the per-PR budget leaves out.
+TARGETS="${TARGETS} ${TARGETS_EXTRA:-}"
 want() { [[ " ${TARGETS} " == *" $1 "* ]]; }
 
 # 1. SQL Browser response parser — standalone: no simdutf, no TDS sources, no
@@ -167,8 +171,9 @@ fi
 #     tail, media label, data set, resync search), the MS_XPRESS decoder, and the page index with the
 #     allocation map. DuckDB-free like the TDS layer (D15), and without zstd (fuzzed upstream: the
 #     container harness hands ZSTD blocks to a copying decoder). Not in the default TARGETS, so the
-#     per-PR fuzzing budget stays the TDS layer's: `make fuzz-backup-replay` replays their corpora
-#     and scripts/ci/leak_check.sh runs them in the Linux leak-check lane.
+#     per-PR fuzzing budget stays the TDS layer's: `make fuzz-backup-replay` replays their corpora,
+#     scripts/ci/leak_check.sh runs them in the Linux leak-check lane, and the weekly UBSan
+#     ClusterFuzzLite run fuzzes them (TARGETS_EXTRA, from .clusterfuzzlite/extra_targets).
 BACKUP="${REPO}/src/backup"
 BACKUP_SRCS=(
 	"${BACKUP}/backup_bytes.cpp"
@@ -296,7 +301,10 @@ if want bcp_encode; then
 fi
 
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---
-for t in browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode; do
+for t in browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode \
+	backup_mtf backup_container backup_xpress backup_page; do
+	# Only the corpora of the targets this build makes: OSS-Fuzz pairs a zip with its binary.
+	want "${t}" || continue
 	if [[ -d "${HERE}/corpus/${t}" ]]; then
 		( cd "${HERE}/corpus/${t}" && zip -qr "${OUT}/fuzz_${t}_seed_corpus.zip" . ) || true
 	fi

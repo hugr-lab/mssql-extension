@@ -89,8 +89,10 @@ The four backup harnesses (spec 085 task 10) are **not in the default `TARGETS`*
 ClusterFuzzLite budget stays the TDS layer's. Their corpora are synthetic, written by
 `fuzz/gen_backup_seeds.cc` from the unit tests' builders (never a backup of a server whose data is
 not ours to publish, spec 085 T4). `make fuzz-backup-replay` replays them; the Linux leak-check lane
-(`scripts/ci/leak_check.sh`) replays them under ASan + LSan; discovery is `fuzz/run.sh` with
-`TARGETS="backup_mtf backup_container backup_xpress backup_page"`.
+(`scripts/ci/leak_check.sh`) replays them under ASan + LSan; the weekly ClusterFuzzLite UBSan run
+(`ubsan-weekly` in `cflite-pr.yml`) fuzzes them beside the default targets, which it adds through
+`.clusterfuzzlite/extra_targets` (read by `.clusterfuzzlite/build.sh` as `TARGETS_EXTRA`); local
+discovery is `fuzz/run.sh` with `TARGETS="backup_mtf backup_container backup_xpress backup_page"`.
 
 ### `fuzz_bcp_encode`'s three oracles
 
