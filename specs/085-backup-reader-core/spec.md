@@ -776,9 +776,14 @@ offsets above are in its fixed part.
   into the next interval past the `Size` when that interval's GAM is the pass's next group.
 
 **Catalog** (X§4, E1§4.8, E2§4, `experiments/E1/pages_ext.py`):
-- Boot page 1:9, one record at 96: `dbi_version` u16 +4, `dbi_dbname` nvarchar(128) +52,
-  `dbi_cmptlevel` +314, `dbi_collation` u32 +392, `dbi_familyGUID` +408, `dbi_firstSysIndexes` +516
-  (6-byte page pointer, = 1:20, the first `sysallocunits` page).
+- Boot page 1:9 (type 13), one primary record of fixed columns only (statusA 0x00), its fixed part
+  1644 bytes on 2017, 1768 on 2019, 1786 on 2022, 1832 on 2025, the fields read here at one place on
+  all four (measured 2026-11-10 on the lane's backups): `dbi_version` u16 +4 (869 / 904 / 957 / 998),
+  `dbi_dbname` UTF-16 +52 (128 units, padded) with its length in bytes u16 +308, `dbi_cmptlevel` u8
+  +314, `dbi_collation` u32 +392 (a CollationId), `dbi_familyGUID` +408, `dbi_firstSysIndexes` +516
+  (6-byte page pointer, = 1:20, the first `sysallocunits` page). Checked against the trailer's name,
+  version, level, family GUID and collation (`CheckBootAgainstSet`; the CollationId's row must be one
+  the TDS form names: 13 collations of E15 / E16, `_SC` and KS / WS included).
 - Bootstrap tables, found by the page header's `(m_objId, m_indexId)` on live level-0 data pages:
   `sysallocunits` (7, 0), `sysrowsets` (5, 0), `sysschobjs` (34, 1), `syscolpars` (41, 1), `sysrscols`
   (3, 0). Fixed-part offsets (record offsets):

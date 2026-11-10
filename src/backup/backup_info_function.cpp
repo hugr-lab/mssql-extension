@@ -9,8 +9,8 @@
 #include "backup/backup_info_function.hpp"
 
 #include "backup/backup_bytes.hpp"
+#include "backup/backup_collation.hpp"
 #include "backup/backup_opened.hpp"
-#include "codec/code_page/code_page_tables.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/hugeint.hpp"
@@ -121,58 +121,10 @@ Value DateValue(const MtfDate &d, const char *what) {
 	return Value::TIMESTAMP(d.year, d.month, d.day, d.hour, d.minute, d.second, 0);
 }
 
-//! The TDS collation flags a collation's name implies: _CI 0x01, _AI 0x02, kana (0x04) and width (0x08)
-//! ignored unless _KS / _WS, _BIN 0x10, _BIN2 0x20, _UTF8 0x40 (spec 085 § Rules, SCIN +216).
-//! Kana before width, as measured (E16: _CI_AS_KS records 0x09, _CI_AS_WS 0x05, Latin1_General_100
-//! and Japanese alike); MS-TDS's COLLATION lists the two bits in both orders.
-uint32_t FlagsOfName(const std::string &name) {
-	const std::string padded = "_" + name + "_";
-	auto has = [&](const char *token) { return padded.find(std::string("_") + token + "_") != std::string::npos; };
-	const uint32_t utf8 = has("UTF8") ? 0x40 : 0;
-	if (has("BIN2")) {
-		return 0x20 | utf8;
-	}
-	if (has("BIN")) {
-		return 0x10;
-	}
-	return (has("CI") ? 0x01 : 0) | (has("AI") ? 0x02 : 0) | (has("KS") ? 0 : 0x04) | (has("WS") ? 0 : 0x08) | utf8;
-}
-
-//! The collation the trailer's TDS form names (spec 085 § Rules): a SQL_ collation by its SortId, any
-//! other by its LCID, version and flags; of two names differing only by _SC (no flag carries it), the
-//! one without, as HEADERONLY prints it. NULL when none or still more than one.
+//! The collation the trailer's TDS form names (backup_collation), NULL when none or ambiguous.
 Value CollationValue(uint32_t info, uint8_t sort_id) {
-	if (info == 0 && sort_id == 0) {
-		return Value(LogicalType::VARCHAR);
-	}
-	using codec::code_page::tables::COLLATION_COUNT;
-	using codec::code_page::tables::COLLATIONS;
-	const uint32_t lcid = info & 0xFFFFF;
-	const uint32_t flags = (info >> 20) & 0xFF;
-	const uint32_t version = info >> 28;
-	std::vector<std::string> names;
-	for (size_t i = 0; i < COLLATION_COUNT; i++) {
-		const auto &row = COLLATIONS[i];
-		const std::string name = row.name;
-		const bool sql = name.compare(0, 4, "SQL_") == 0;
-		if (sort_id != 0) {
-			if (sql && (static_cast<uint32_t>(row.collation_id) >> 24) == sort_id) {
-				names.push_back(name);
-			}
-		} else if (!sql && row.lcid == lcid && row.version == version && FlagsOfName(name) == flags) {
-			names.push_back(name);
-		}
-	}
-	if (names.size() > 1) {
-		std::vector<std::string> without_sc;
-		for (const auto &n : names) {
-			if (("_" + n + "_").find("_SC_") == std::string::npos) {
-				without_sc.push_back(n);
-			}
-		}
-		names = without_sc;
-	}
-	return names.size() == 1 ? Value(names.front()) : Value(LogicalType::VARCHAR);
+	const std::string name = CollationNameOfTds(info, sort_id);
+	return name.empty() ? Value(LogicalType::VARCHAR) : Value(name);
 }
 
 Value Text(const std::string &s) {
