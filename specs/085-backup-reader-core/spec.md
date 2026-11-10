@@ -761,10 +761,18 @@ offsets above are in its fixed part.
   so its data starts 13 bytes apart (+167 / +171 hold on 2025 only; found 2026-11-10, checked on the
   lane's 2017-2025 backups). A later interval whose first page is also a PFS page (an interval number
   that is a multiple of 1011: a file of about 3.9 TB) is open: which of the two the page is, unknown.
-- IAM: header record at 96, u32 sequence +4, start page +40, eight single-page slots +46; extent
-  bitmap at 194 relative to the start page. The chain follows the page header's next-page pointer
-  (u32 page @16, u16 file @20, as on every page; to be pinned on the samples in task 11a); the
-  sequence must ascend and each start page must open a GAM interval, else a named error.
+- IAM (type 10), two records: slot 0 the header (a primary record, fixed only: u32 sequence +4,
+  start page +40, eight 6-byte single-page slots +46), slot 1 the extent bitmap (its fixed part 7,988
+  bytes: bit i = extent i of the interval the start page opens). Read through the slots: slot 1
+  lies at 190 or 192 on the samples, not at 194. The chain follows the page header's next-page
+  pointer (u32 page @16, u16 file @20), and `prev` points back; the sequence numbers ascend along the
+  chain, not from 0 nor without gaps (E19: after `SHRINKFILE … EMPTYFILE` + `REMOVE FILE` five chains
+  start at 1); single-page slots on the chain's first page only; each start page opens a GAM
+  interval, no interval twice, each page names the chain's AU, no page comes twice (a single page
+  neither repeated nor inside the AU's extents), else a named error. Pinned 2026-11-10
+  (`ReadIamChain`): on the lane's 2017-2025 backups, the catalog fixture and E19 (a table across two
+  files: a two-page chain, its second page mapping file 3) every live data, index, LOB and IAM page
+  lies in exactly one chain, under the AU of its own header.
 - `IsLive(file, page)`: the allocation pages themselves (0, 1, 9, the PFS pages, GAM / SGAM / DCM / BCM)
   are live below the recorded `Size`, and past it where the backup carries them; any other page is live
   iff its extent's GAM bit is 0 and its PFS byte has 0x40. **The recorded `Size` is a lower bound, not the

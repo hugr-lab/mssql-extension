@@ -656,6 +656,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_boot.cpp \
     test/cpp/backup/test_backup_bytes.cpp \
     test/cpp/backup/test_backup_container.cpp \
+    test/cpp/backup/test_backup_iam.cpp \
     test/cpp/backup/test_backup_info.cpp \
     test/cpp/backup/test_backup_mtf.cpp \
     test/cpp/backup/test_backup_open_pass.cpp \
