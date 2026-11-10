@@ -13,7 +13,12 @@ SET NOCOUNT ON;
 GO
 IF DB_ID('bak_catalog') IS NOT NULL DROP DATABASE bak_catalog;
 GO
-CREATE DATABASE bak_catalog COLLATE SQL_Latin1_General_CP1_CI_AS;
+-- A data file past one GAM interval (511,232 pages, E17): 4100 MB is 524,800 pages, so opening the
+-- backup reads the second interval's GAM (at 511232) and SGAM; the backup copies only the allocated
+-- extents, so it stays small.
+CREATE DATABASE bak_catalog ON (NAME = bak_catalog, FILENAME = '/var/opt/mssql/data/bak_catalog.mdf', SIZE = 4100MB)
+	LOG ON (NAME = bak_catalog_log, FILENAME = '/var/opt/mssql/data/bak_catalog_log.ldf', SIZE = 64MB)
+	COLLATE SQL_Latin1_General_CP1_CI_AS;
 ALTER DATABASE bak_catalog SET RECOVERY FULL;
 GO
 USE bak_catalog;
