@@ -221,6 +221,16 @@ std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &context, const Opene
 	}
 	try {
 		pages->index = BuildPageIndex(pages->streams, index_options);
+		// A removed file (SFIN flag 0x20) has no page in the backup (files fixture, 2022). One that has
+		// would mean the flag says something else here, and its pages would silently read as not live.
+		for (uint32_t removed : set.removed_file_ids) {
+			PageLocation at;
+			if (removed >= 1 && removed <= 32767 && pages->index.Locate(static_cast<uint16_t>(removed), 0, at)) {
+				throw FormatError("file " + std::to_string(removed) +
+								  " is marked removed (SFIN flag 0x20), and the backup carries its pages: a file "
+								  "state the reader does not know");
+			}
+		}
 		pages->allocation.reset(new AllocationMap(pages->index, data_files));
 	} catch (FormatError &e) {
 		// Name the backup, as the headers' stage does (a page or file id alone does not say which).

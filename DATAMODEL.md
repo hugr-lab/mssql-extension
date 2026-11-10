@@ -1464,8 +1464,9 @@ Server. Every column `mssql_backup_info` returns is compared or listed with its 
 `NOT_COMPARED`), and `--expect-major` asserts the version and the set list it makes.
 
 **The oracle lane** (`.github/workflows/backup-oracle.yml`, spec 085 PR 2a), when it runs (it needs
-the repository's R2 credentials), makes each version's backups on SQL Server 2017, 2019, 2022 and
-2025 (each image pinned by digest in `test/backup/gen/images.txt`): what that version can make --
+the repository's R2 credentials), makes the fixtures' backups -- the samples' database, the catalog
+fixture, two data files and a file removed, backups taken under a running workload, and data past
+one GAM interval (`test/backup/gen/*.sql`) -- on SQL Server 2017, 2019, 2022 and 2025 (each image pinned by digest in `test/backup/gen/images.txt`): what that version can make --
 ZSTD on 2025 only, `MS_XPRESS` named from 2022 and plain `WITH COMPRESSION` before -- and stores them in R2 under `oracle/<key>/<version>/<run>/`, `<key>` a hash of `test/backup/gen/`:
 they are made again only when the generator, the data or an image changes, or when a `DONE` names
 a run that is no longer stored. `<version>/DONE`, written last, names the run whose upload is

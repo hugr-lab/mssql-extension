@@ -7,9 +7,13 @@
 #   OUT=/tmp/bak IMAGE=mcr.microsoft.com/mssql/server:2022-latest test/backup/gen/generate.sh
 #   OUT=/tmp/bak FIXTURES=samples test/backup/gen/generate.sh  # samples.sql only (the committed set)
 #
-# FIXTURES (default "samples catalog"): samples.sql, the database of the committed samples, and
-# catalog.sql, the catalog fixture (spec 085 PR 2b), whose backup comes with the server's own catalog
-# of it (<set>.tables.txt / .columns.txt / .views.txt, written by sqlcmd's :OUT).
+# FIXTURES (default "samples catalog files load large"): samples.sql, the database of the committed
+# samples; catalog.sql, the catalog fixture (spec 085 PR 2b); files.sql, two data files and a second
+# filegroup, then a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
+# while load_workload.sql commits in the background (a live database: pass 2, a fuzzy tail, the file
+# outgrowing its recorded Size); large.sql, data past one GAM interval (LARGE_ROWS rows of a page each,
+# 530000 by default). A fixture's backups come with the server's own catalog of them where it holds
+# still (<set>.tables.txt / .columns.txt / .views.txt, catalog_golden.sql through sqlcmd's :r / :OUT).
 #
 # Writes into OUT: the backups, <set>.headeronly.txt / .labelonly.txt / .filelistonly.txt, sets.txt
 # (one line per backup set: name|file[,file] -- what test/backup/compare_info.py reads) and
@@ -24,7 +28,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
-FIXTURES="${FIXTURES:-samples catalog}"
+FIXTURES="${FIXTURES:-samples catalog files load large}"
+LARGE_ROWS="${LARGE_ROWS:-530000}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
 	[ -n "${IMAGE}" ] || { echo "ERROR: no image for VERSION=${VERSION} in images.txt" >&2; exit 1; }
@@ -118,12 +123,27 @@ docker exec -u 0 "${CONTAINER}" mkdir -p "${DIR}"
 # The server runs as mssql from the 2019 image on; the 2017 image runs it as root and has no such
 # user, so there the directory is the server's already.
 docker exec -u 0 "${CONTAINER}" sh -c "if id mssql >/dev/null 2>&1; then chown mssql '${DIR}'; fi"
+docker exec -u 0 "${CONTAINER}" mkdir -p /tmp/gen
+for f in "${HERE}"/*.sql; do
+	docker cp "${f}" "${CONTAINER}:/tmp/gen/$(basename "${f}")"
+done
+run_sql() {	# $1 = a script of /tmp/gen
+	sql -v DIR="${DIR}" GEN=/tmp/gen LARGE_ROWS="${LARGE_ROWS}" -s '|' -W -i "/tmp/gen/$1"
+}
+scalar() {	# $1 = a query answering one value
+	sql -h -1 -W -Q "SET NOCOUNT ON; $1" | head -1 | tr -d ' \r'
+}
 sets=()
 extras=()
 for fixture in ${FIXTURES}; do
-	docker cp "${HERE}/${fixture}.sql" "${CONTAINER}:/tmp/${fixture}.sql"
+	if [ "${fixture}" = large ]; then
+		# Its 4.4 GB data file beside the others' databases and backups is close to a runner's disk:
+		# the databases whose backups are made go first (the backups stay).
+		sql -Q "IF DB_ID('bak_load') IS NOT NULL DROP DATABASE bak_load; IF DB_ID('bak_files') IS NOT NULL DROP DATABASE bak_files" >/dev/null
+		df -h / || true
+	fi
 	echo ">> running ${fixture}.sql"
-	sql -v DIR="${DIR}" -s '|' -W -i "/tmp/${fixture}.sql"
+	run_sql "${fixture}.sql"
 	case "${fixture}" in
 	samples)
 		# The sets samples.sql made on this version, in its order. test/backup/compare_info.py's
@@ -137,6 +157,47 @@ for fixture in ${FIXTURES}; do
 	catalog)
 		sets+=("catalog_full|catalog_full.bak")
 		extras+=(catalog_full.tables.txt catalog_full.columns.txt catalog_full.views.txt)
+		;;
+	files)
+		sets+=("files_full|files_full.bak" "files_removed|files_removed.bak")
+		for s in files_full files_removed; do extras+=("${s}.tables.txt" "${s}.columns.txt" "${s}.views.txt"); done
+		;;
+	load)
+		# The workload in the background, the backups once it is committing, then it is stopped and
+		# waited for (its session gone). Its output goes to a log, shown when it did not run.
+		docker exec -d -e SQLCMDPASSWORD "${CONTAINER}" sh -c '"$@" >/tmp/gen/workload.log 2>&1' sh \
+			"${SQLCMD[@]}" -S localhost -U sa -b -i /tmp/gen/load_workload.sql
+		ticks() { scalar "SELECT ticks FROM bak_load.dbo.control"; }
+		workload_failed() {	# $1 = what went wrong
+			echo "ERROR: the load fixture's workload $1; its log:" >&2
+			docker exec "${CONTAINER}" cat /tmp/gen/workload.log >&2 || true
+			exit 1
+		}
+		for _ in $(seq 1 60); do
+			[ "$(ticks)" -ge 20 ] 2>/dev/null && break
+			sleep 1
+		done
+		before="$(ticks)"
+		[ "${before}" -ge 20 ] 2>/dev/null || workload_failed "did not commit 20 transactions in 60 s (at '${before}')"
+		echo ">> workload at ${before} transactions; backing up under it"
+		run_sql load_backup.sql
+		after="$(ticks)"
+		echo ">> backups done at ${after} transactions"
+		# The backups overlapped the workload only if it went on committing through them.
+		[ "${after}" -gt "${before}" ] 2>/dev/null || workload_failed "stopped before the backups ended (${before} -> ${after})"
+		sql -Q "UPDATE bak_load.dbo.control SET stop_requested = 1" >/dev/null
+		left=""
+		for _ in $(seq 1 60); do
+			left="$(scalar "SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE database_id = DB_ID('bak_load') AND session_id <> @@SPID")"
+			[ "${left}" = 0 ] && break
+			sleep 1
+		done
+		[ "${left}" = 0 ] || workload_failed "did not end 60 s after it was asked to stop (${left} session(s) left)"
+		sets+=("load_base|load_base.bak" "load_full|load_full.bak" "load_xpress|load_xpress.bak" "load_diff|load_diff.bak" "load_log|load_log.trn")
+		;;
+	large)
+		sets+=("large_xpress|large_xpress.bak")
+		extras+=(large_xpress.tables.txt large_xpress.columns.txt large_xpress.views.txt)
 		;;
 	*)
 		echo "ERROR: unknown fixture ${fixture}" >&2

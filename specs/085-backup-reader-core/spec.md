@@ -687,7 +687,13 @@ until seen), u32 FileGroupId +36 (0 for the log), u64 Size in bytes +40, two str
 (u16 byte length, u16 offset in the record, UTF-16LE) +48 LogicalName and +52 PhysicalName, u64
 MaxSize in bytes +86 (unaligned), CreateLSN +138, UniqueId +186. **SFGI**: u32 filegroup id +12 and a
 string descriptor +16 for its name. FILELISTONLY's `BackupSizeInBytes` is not in SFIN: it is the
-file's pages in the data stream.
+file's pages in the data stream. Two MQCI streams carry the file list: the MSCI block's, before the
+data, and the trailer's (MSLS). FILELISTONLY lists the MSCI one -- its sizes are the start's, the
+trailer's the end's, larger once a file grew while the backup ran (the load fixture: 46080 pages at
+the start, 47104 at the end, FILELISTONLY 46080) -- so the reader takes the MSCI list (the trailer's
+when there is no MSCI). SFIN flags u32 +8: 0x20 on a file emptied and removed (`REMOVE FILE`), which
+FILELISTONLY leaves out and the data stream carries no page of; 0x04 / 0x84 on the others (the
+files fixture, 2022): a removed file is skipped.
 
 HEADERONLY's `FirstRecoveryForkID` and `ForkPointLSN` are derived: a log backup whose FirstLSN is not
 past the fork point spans the fork, and reports the parent fork and the fork point; every other
@@ -740,7 +746,8 @@ offsets above are in its fixed part.
   decoding stops at the output size; symbol 256 is not end-of-stream (W§3, X§5).
 
 **Page index**:
-- Unit kinds: header version byte (offset 0) ≠ 1 → a never-formatted zero unit, skipped; `m_type`
+- Unit kinds: header version byte (offset 0) 0 → a never-formatted zero unit, skipped (any other value but 1 is
+  a named error); `m_type`
   101 → a pad, skipped by type and never read further (§ Security); otherwise a page.
 - Later pass wins over earlier; within one pass a page id twice is a named error (never observed).
 - Positional cross-check (`verify`): a unit at position k of its 8-unit group carries a page id ≡ k
@@ -773,6 +780,15 @@ offsets above are in its fixed part.
   (`ReadIamChain`): on the lane's 2017-2025 backups, the catalog fixture and E19 (a table across two
   files: a two-page chain, its second page mapping file 3) every live data, index, LOB and IAM page
   lies in exactly one chain, under the AU of its own header.
+- A live page whose latest copy is a zero unit became live while the backup ran: its content is in
+  the log tail only (RESTORE writes the frame whole and redoes the page from the log; DbReader alike).
+  The page store answers it `Pending` (the load fixture's full: one page of pass 2 of 45,603 live), and
+  a reader that needs it refuses by name until spec 090 replays the tail. Only in a backup with a later
+  pass (one that ran under changes), and only for a copy that is all zeros or names the page; in a one-pass
+  backup, or for a unit naming another page, it is the named error a misplaced copy is.
+- A file whose SFIN record carries flag 0x20 was emptied and removed (`ALTER DATABASE … REMOVE FILE`):
+  FILELISTONLY leaves it out and so does the reader. The backup carries no page of it (files fixture);
+  one that does is refused, so that another meaning of the flag cannot silently hide a file's pages.
 - `IsLive(file, page)`: the allocation pages themselves (0, 1, 9, the PFS pages, GAM / SGAM / DCM / BCM)
   are live below the recorded `Size`, and past it where the backup carries them; any other page is live
   iff its extent's GAM bit is 0 and its PFS byte has 0x40. **The recorded `Size` is a lower bound, not the

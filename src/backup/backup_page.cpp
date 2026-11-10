@@ -1,5 +1,7 @@
 #include "backup/backup_page.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 namespace mssql {
 namespace backup {
@@ -43,8 +45,38 @@ PageStore::PageStore(const PageIndex &index, const AllocationMap &allocation)
 	: index_(index), allocation_(allocation) {}
 
 bool PageStore::Read(uint16_t file, uint32_t page, Page &out) const {
-	if (!allocation_.IsLive(file, page)) {
+	const PageState state = Fetch(file, page, out);
+	if (state == PageState::Pending) {
+		PagePointer p;
+		p.file = file;
+		p.page = page;
+		throw FormatError("backup: page " + p.ToString() +
+						  " became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
+						  "backup), which is not replayed yet");
+	}
+	return state == PageState::Present;
+}
+
+bool PageStore::IsPendingCopy(const PagePointer &want, const Page &copy) const {
+	// Only a backup that ran under changes: a second pass is the server copying what changed during the
+	// first (load fixture, 2022). In a quiet backup -- one pass -- a live page whose copy is a zero
+	// unit is a locator's or a short backup's fault, refused below as not a page.
+	bool later_pass = false;
+	for (size_t i = 0; i < index_.PassCount(); i++) {
+		later_pass = later_pass || index_.Pass(i).number > 0;
+	}
+	if (!later_pass) {
 		return false;
+	}
+	// A unit with bytes in it that names another page (E6's F2 units carry a page id) is a misplaced
+	// copy, not a pending one: the id check below refuses it.
+	const bool zero = std::all_of(copy.bytes.begin(), copy.bytes.end(), [](uint8_t b) { return b == 0; });
+	return zero || copy.header.page_id == want;
+}
+
+PageState PageStore::Fetch(uint16_t file, uint32_t page, Page &out) const {
+	if (!allocation_.IsLive(file, page)) {
+		return PageState::NotLive;
 	}
 	PagePointer want;
 	want.file = file;
@@ -59,8 +91,11 @@ bool PageStore::Read(uint16_t file, uint32_t page, Page &out) const {
 						  " bytes");
 	}
 	out.header = ReadPageHeader(out.bytes.data());
+	if (out.header.version == 0 && IsPendingCopy(want, out)) {
+		// A zero unit where a live page is: it became live while the backup ran (PageState::Pending).
+		return PageState::Pending;
+	}
 	if (out.header.version != PAGE_HEADER_VERSION) {
-		// A zero unit (a ranked pass locates one for an allocated extent's unallocated page, E12).
 		throw FormatError("backup: page " + want.ToString() + " is live, and its copy is not a page (header version " +
 						  std::to_string(out.header.version) + ")");
 	}
@@ -72,7 +107,7 @@ bool PageStore::Read(uint16_t file, uint32_t page, Page &out) const {
 		throw FormatError("backup: the copy of page " + want.ToString() + " says it is page " +
 						  out.header.page_id.ToString());
 	}
-	return true;
+	return PageState::Present;
 }
 
 void PageStore::ReadLive(uint16_t file, uint32_t page, Page &out, const char *what) const {

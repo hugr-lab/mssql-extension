@@ -183,7 +183,9 @@ jobs:
     needs: key
     if: needs.key.outputs.enabled == 'true' && needs.key.outputs.missing != '[]'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The large fixture loads about 4.1 GB (a data file past one GAM interval) and the load fixture
+    # backs up under a running workload: minutes each, run only when the generator changes.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

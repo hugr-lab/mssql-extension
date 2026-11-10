@@ -141,6 +141,10 @@ struct BackupSetHeader {
 	Lsn differential_base_lsn;
 	Guid differential_base_guid;
 	std::vector<DatabaseFile> files;
+	//! Files the set's SFIN records mark removed (flag 0x20: emptied and removed by ALTER DATABASE ...
+	//! REMOVE FILE), left out of `files` as FILELISTONLY leaves them out. Kept so that a backup
+	//! carrying a page of one is refused rather than read as a file with no live page.
+	std::vector<uint32_t> removed_file_ids;
 
 	//! This file's share of HEADERONLY's BackupSize: the MSLS block's offset less one soft filemark.
 	uint64_t backup_size = 0;

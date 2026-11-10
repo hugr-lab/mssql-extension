@@ -92,6 +92,18 @@ struct Page {
 	PageHeader header;
 };
 
+//! What the backup holds of a page.
+enum class PageState : uint8_t {
+	NotLive,  // the database does not use it (E2 R3)
+	Present,  // live, its latest copy read and checked
+	//! Live, and its latest copy is a zero unit in a backup with a later pass (one that ran under
+	//! changes; in a one-pass backup such a copy is refused, not Pending): the page became live while the backup ran,
+	//! and its content is in the backup's log tail only (RESTORE writes the whole frame and redoes it from the log).
+	//! Measured on the load fixture's full, a page of its pass 2; BusinessCentral.DbReader's PROVENANCE ("MQDA region
+	//! 2") alike. Readable once spec 090 replays the tail.
+	Pending,
+};
+
 class PageStore {
 public:
 	//! Pages located by `index`, alive as `allocation` says; both are kept by reference.
@@ -101,9 +113,11 @@ public:
 
 	//! Page `page` of file `file` when it is live (E2 R3; an allocation page always is): its latest
 	//! copy, its header read and checked -- version 1, not a pad, and the page's own id. False
-	//! when the page is not live. A live page whose copy the backup lacks, a zero unit in its place,
-	//! or a header naming another page is a FormatError naming the page.
+	//! when the page is not live. A live page whose copy the backup lacks, a Pending one (a zero unit in
+	//! its place), or a header naming another page is a FormatError naming the page.
 	bool Read(uint16_t file, uint32_t page, Page &out) const;
+	//! Read, with a Pending page (live, its copy a zero unit) answered as such instead of refused.
+	PageState Fetch(uint16_t file, uint32_t page, Page &out) const;
 	//! Read, with a page that is not live a FormatError too, naming `what` (the reader that needed it).
 	void ReadLive(uint16_t file, uint32_t page, Page &out, const char *what) const;
 
@@ -112,6 +126,10 @@ public:
 	}
 
 private:
+	//! A version-0 copy of live page `want` that is Pending: the backup has a pass after the first,
+	//! and the copy is all zeros or names `want`.
+	bool IsPendingCopy(const PagePointer &want, const Page &copy) const;
+
 	const PageIndex &index_;
 	const AllocationMap &allocation_;
 };

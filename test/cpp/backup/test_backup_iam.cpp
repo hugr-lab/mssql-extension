@@ -49,6 +49,7 @@ struct Coverage {
 	size_t uncovered = 0;
 	size_t twice = 0;
 	size_t wrong_au = 0;
+	size_t pending = 0;	 // live, copied as a zero unit (became live while the backup ran)
 	size_t longest = 0;	 // IAM pages in the longest chain
 };
 
@@ -69,7 +70,8 @@ Coverage Cover(const OpenedHeaders &headers, const OpenedPages &pages) {
 	for (uint16_t file : files) {
 		for (uint32_t p = 0; p < pages.allocation->FileSize(file); p++) {
 			// A chain's first page has no previous page; its number need not be 0 (E19).
-			if (store.Read(file, p, page) && page.header.type == 10 && page.header.prev.IsNull()) {
+			if (store.Fetch(file, p, page) == PageState::Present && page.header.type == 10 &&
+				page.header.prev.IsNull()) {
 				heads.emplace_back(Key(file, p), page.header.AllocationUnit());
 			}
 		}
@@ -101,7 +103,16 @@ Coverage Cover(const OpenedHeaders &headers, const OpenedPages &pages) {
 	}
 	for (uint16_t file : files) {
 		for (uint32_t p = 0; p < pages.allocation->FileSize(file); p++) {
-			if (!store.Read(file, p, page)) {
+			const PageState state = store.Fetch(file, p, page);
+			if (state == PageState::Pending) {
+				// Its header is in the log tail: its AU is not checkable here, but a chain must list it.
+				c.pending++;
+				if (listed.count(Key(file, p)) == 0) {
+					c.uncovered++;
+				}
+				continue;
+			}
+			if (state != PageState::Present) {
 				continue;
 			}
 			const uint8_t t = page.header.type;
@@ -146,10 +157,13 @@ int main() {
 		auto pages = OpenBackupPages(context, *headers);
 		Coverage c;
 		const std::string error = ErrorOf([&]() { c = Cover(*headers, *pages); });
-		Check(error.empty() && c.chains > 10 && c.pages > 200 && c.covered_once == c.pages,
+		// A quiet backup (one pass): no page is Pending.
+		Check(error.empty() && c.chains > 10 && c.pages > 200 && c.covered_once == c.pages && c.pending == 0 &&
+				  c.uncovered == 0,
 			  form.front() + ": " + std::to_string(c.chains) +
 				  " chains list every live data / index / LOB / IAM page (" + std::to_string(c.pages) +
-				  ") once, under its own AU" + (error.empty() ? "" : " -- " + error) +
+				  ") once, under its own AU, none pending" + (error.empty() ? "" : " -- " + error) +
+				  (c.pending ? " -- pending " + std::to_string(c.pending) : "") +
 				  (c.uncovered || c.twice || c.wrong_au
 					   ? " -- uncovered " + std::to_string(c.uncovered) + ", twice " + std::to_string(c.twice) +
 							 ", other AU " + std::to_string(c.wrong_au)

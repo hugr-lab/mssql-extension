@@ -58,7 +58,9 @@ test/
     tds_connection/     # TDS protocol tests
     transaction/        # Transaction management tests
   cpp/                  # C++ unit tests (no SQL Server required); cpp/backup/ for spec 085
-  backup/               # Spec 085 PR 2a: gen/ (generate.sh, samples.sql, images.txt pinning each
+  backup/               # Spec 085 PR 2a/2b: gen/ (generate.sh; fixtures samples / catalog / files (two
+                        # files, a file removed) / load (backups under a workload) / large (data past
+                        # a GAM interval), catalog_golden.sql; images.txt pinning each
                         # SQL Server image by digest), compare_info.py (mssql_backup_info vs RESTORE,
                         # local dir or s3://), httpfs_extension_config.cmake + oracle_vcpkg_manifest.py
                         # (the oracle build: httpfs static, curl from vcpkg)
