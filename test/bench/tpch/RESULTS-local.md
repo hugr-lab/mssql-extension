@@ -78,6 +78,21 @@ The same data in four schemas, set with `--strings` / `--collation`:
 
 Left out: the `verify` CSVs (each client's result per query against the DuckDB oracle, 6 MB), which `tpch_bench.py verify` writes again, and the `.log` files the repository ignores, which hold the same numbers as `timings.csv` and `trace-*.md`.
 
+## What a re-run will not match
+
+These numbers were taken before the harness fixes of issues #505-#509, and three of those change what `load` and `run` do. A repeat of these commands today measures something slightly different — deliberately:
+
+- **The tables now carry TPC-H's primary keys** on the columnstore layout too (#507). Every number above was measured on tables with no key at all, so with no rowid key: the remote-pushdown join-gain check fell back on `mssql_pushdown_join_rows_threshold` where it can now use the unique-key rung. "What B sends whole" is the column most likely to grow.
+- **The warmup is per query, not per pass** (#507), which removes a bias along the query order: q01 was the coldest query of the timed pass and q22 the hottest.
+- **`.mode csv` is pinned** inside the timed session (#507), so the duckbox renderer — different code in 1.5.6 and 2.0 — is no longer inside the measured wall time.
+- **The BIN2 row's database name was hand-passed.** `--collation` was not part of the derived name then, so `tpch_sf10_columnstore_utf8bin2` is a name no documented command produced, and the two UTF-8 rows above would have collided on one database. Today the same row is
+
+  ```sh
+  python3 tpch_bench.py --sf 10 --strings utf8 --collation Latin1_General_100_BIN2_UTF8 load
+  ```
+
+  which loads `tpch_sf10_columnstore_utf8_latin1general100bin2utf8`, and `verify`, `run` and `trace` take the same two flags to find it.
+
 ## Not yet measured
 
 - The rowstore layout.
