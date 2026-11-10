@@ -21,7 +21,11 @@ Other commands:
 
 ## Running it
 
-The server credentials come from the environment and are never printed: `MSSQL_BENCH_HOST`, `_PORT`, `_USER`, `_PASSWORD`, falling back to the test suite's `MSSQL_TEST_*`.
+The server credentials come from the environment and are never printed: `MSSQL_BENCH_HOST`, `_PORT`, `_USER`, `_PASSWORD`, falling back to the test suite's `MSSQL_TEST_*`. The DSN goes to the CLI on **stdin**, never in `argv` or a file, so it reaches neither `ps` nor shell history.
+
+The masking works on the output's side, not the secret's: it redacts the **value** of `Password` wherever the text carries a connection string. So every form the password travels in is covered by construction — brace-quoted, `esc()`'d into a SQL literal, or both — and nothing outside a `key=value` is rewritten, which is what keeps a short password from rewriting the timings beside it (`real 11.500` once came back `real 11.***00`). The password, the user name and the database are brace-quoted in the DSN, so a `;` in any of them cannot add a key; the host and port cannot be brace-quoted (the value of `Server` is `host,port`), so they are checked instead, and a host carrying a `;` or a brace is refused naming the variable it came from (issue #509, review of #546).
+
+`--db` and `--collation` must be bare names (letters, digits and `_`), checked once for **every** command before it runs: both reach the server inside `ALTER` / `DROP` / `CREATE DATABASE`, where the name travels through `QUOTENAME`, and `trace` also formats `--db` into T-SQL (`DB_ID(N'…')`), where escaping for the DuckDB literal around it is not the same escape. Anything but a bare name is refused by name rather than quoted.
 
 ```sh
 B=test/bench/tpch/tpch_bench.py
