@@ -8,7 +8,7 @@
 // user's DuckDB secrets. Reads are byte ranges through CachingFileSystem (a remote file's ranges
 // are cached in buffer-managed blocks, D17), coalesced (backup_ranges) and fetched either
 // synchronously or as AsyncTasks for DuckDB's ASYNC I/O pool. The parsers above take the
-// fetched bytes as ByteReader spans and never see DuckDB (D15).
+// fetched bytes as ByteReader spans and never see DuckDB (D15). [DuckDB]
 //===----------------------------------------------------------------------===//
 
 #pragma once

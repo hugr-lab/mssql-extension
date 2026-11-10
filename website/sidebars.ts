@@ -13,7 +13,7 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Reading Data',
-      items: ['reading/catalog', 'reading/queries', 'reading/types'],
+      items: ['reading/catalog', 'reading/queries', 'reading/types', 'reading/backups'],
     },
     {
       type: 'category',

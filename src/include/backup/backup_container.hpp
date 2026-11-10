@@ -10,8 +10,10 @@
 // an uncompressed backup. After the chain a seek index names the blocks that start a few MTF
 // positions (the end of each data pass, the trailer): spec 085 § Rules (MSSQLBAK), task 4.
 //
-// The chain index keeps one checkpoint every 64 blocks (D4a); a read walks the <= 63 headers
-// from its checkpoint. Decompression is the caller's (XPRESS task 5, ZSTD task 6). DuckDB-free.
+// The chain index keeps a checkpoint every 64 blocks and at most one per 1 MiB of file (D4a); a
+// read walks the headers from the nearest checkpoint before it, adding checkpoints as it goes (a
+// chain located from its tail starts with block 0 and the seek index's entries). Decompression
+// is the caller's (XPRESS task 5, ZSTD task 6). DuckDB-free.
 //===----------------------------------------------------------------------===//
 
 #pragma once
