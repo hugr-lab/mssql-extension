@@ -17,10 +17,10 @@
 # DONEs has moved for a week -- an open PR's next run then generates its own again.
 #
 # Uploads use the aws CLI; every read is DuckDB's. The R2 credentials are repository secrets, which
-# a pull request from a fork does not get. And the lane runs on a pull request only when its author
-# is the repository's owner, a member of hugr-lab or a collaborator (author_association): anyone
-# else's PR gets a notice and nothing runs, until a maintainer, having read it, runs the lane on it
-# by hand (workflow_dispatch with `pr`, which only users with write access can start). The bucket's
+# a pull request from a fork does not get: there the lane says so and runs nothing (and the
+# repository requires a maintainer's approval before any workflow of an outside contributor's PR
+# runs). A maintainer who has read such a PR runs the lane on it by hand: workflow_dispatch with
+# `pr`, which only users with write access can start. The bucket's
 # name is a repository variable (a secret named mssql would mask every "mssql" in the logs).
 name: Backup oracle
 
@@ -96,8 +96,6 @@ jobs:
           MSSQL_R2_ACCESS_SECRET_KEY: ${{ secrets.MSSQL_R2_ACCESS_SECRET_KEY }}
           MSSQL_R2_URL: ${{ secrets.MSSQL_R2_URL }}
           MSSQL_R2_BUCKET_NAME: ${{ vars.MSSQL_R2_BUCKET_NAME || secrets.MSSQL_R2_BUCKET_NAME }}
-          EVENT: ${{ github.event_name }}
-          AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
           PR_INPUT: ${{ inputs.pr }}
         run: |
           versions=$(printf '%s\n' $VERSIONS | jq -R . | jq -cs .)
@@ -105,18 +103,8 @@ jobs:
           if [ -n "${PR_INPUT}" ] && ! printf '%s' "${PR_INPUT}" | grep -qE '^[0-9]+$'; then
             echo "::error::pr must be a pull request number, got '${PR_INPUT}'"; exit 1
           fi
-          # Who may reach R2 from a pull request: the owner, hugr-lab's members, collaborators.
-          if [ "${EVENT}" = pull_request ]; then
-            case "${AUTHOR_ASSOCIATION}" in
-              OWNER|MEMBER|COLLABORATOR) ;;
-              *)
-                echo "::notice::The backup oracle lane does not run for this pull request's author (${AUTHOR_ASSOCIATION}). A maintainer runs it after reading the PR: Actions -> Backup oracle -> Run workflow, pr = its number."
-                echo "enabled=false" >> "$GITHUB_OUTPUT"; echo "missing=[]" >> "$GITHUB_OUTPUT"
-                exit 0 ;;
-            esac
-          fi
           if [ -z "${MSSQL_R2_ACCESS_KEY}" ]; then
-            echo "::notice::No R2 credentials (a pull request from a fork): the backup oracle lane is skipped."
+            echo "::notice::No R2 credentials (a pull request from a fork): the backup oracle lane is skipped. A maintainer runs it after reading the PR: Actions -> Backup oracle -> Run workflow, pr = its number."
             echo "enabled=false" >> "$GITHUB_OUTPUT"; echo "missing=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
