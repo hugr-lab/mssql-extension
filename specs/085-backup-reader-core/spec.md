@@ -1077,8 +1077,24 @@ merges before the next opens (never stacked).
 9. `mssql_backup_info`, registered through `RegisterDocumentedFunction` — 1 d
 10. Fuzz harnesses mtf / container / xpress / page; committed seed samples — 2 d
 
-**PR 2 — catalog and rows (`mssql_backup_tables`, `_views`, `_catalog`, `_scan`)**, after spec 091's
-module `src/codec/code_page/` has merged (D7)
+**PR 2 — catalog and rows, in five PRs** (`mssql_backup_tables`, `_views`, `_catalog`, `_scan`),
+after spec 091's module `src/codec/code_page/` has merged (D7). Split for review (owner,
+2026-11-10): one 31-day PR is not reviewable, and the oracle lane, which tests the series' first
+risk (version drift: PR 1 is checked against 2025 only), goes first instead of last. Each merges
+before the next opens.
+
+*PR 2a — the oracle lane*
+
+19. CI oracle lane: `docker run` of each image (2017, 2019, 2022, 2025) with a host volume at
+    `/var/opt/mssql/backup`, generator scripts under `test/backup/gen/`, RESTORE. This PR compares
+    `mssql_backup_info` with `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` on every version
+    (acceptance 2); 2b adds the catalog's comparison, 2d the rows' (the `TYPE mssql` comparison),
+    PR 3 the LOBs' — 3 d
+19a. A test that reads the committed golden files (`test/data/backup/*.headeronly.txt`, …) and
+    compares every field `mssql_backup_info` reports (PR 1 compared them by hand) — 0.5 d
+19b. The version drift the lane finds, fixed (SCIN, MSSQLBAK and MTF offsets on 2017–2022) — 1–3 d
+
+*PR 2b — the catalog*
 
 11a. IAM chain (DQ-40): an AU's IAM pages through the page store, extent bitmaps and single-page
     slots, sequence and interval checks; the per-AU runs built at a table's first scan, buffer-managed
@@ -1087,22 +1103,40 @@ module `src/codec/code_page/` has merged (D7)
 11. Boot page, bootstrap layouts table, generic base-table decoder; pin the `sysobjvalues` value
     classes DQ-11 serves (view, computed-column and default definitions; boundaries are valclass 30)
     — 4 d
-12. Catalog model: schemas, objects, rowsets, partitions, AUs, columns, defaults, views; the
-    partitioning model of E7 (functions, typed boundaries through the catalog's sql_variant reader,
-    schemes, destinations, index data spaces, the partition column), the `partitioning` column and
-    E7's verify as a test — 5 d
+11b. `OpenedBackup`'s stages 2–4 (page index, allocation, catalog) built for a file function's call,
+    with no cache yet (task 22 caches them) — 1 d
+12. Catalog model: schemas, objects, rowsets, partitions, AUs, columns, defaults, views — 3 d
 13. 085 maps the on-disk CollationId onto spec 091's table; 091's single-byte code-page tables and
     kernel reused (D7) — 0.5 d
+17. `mssql_backup_tables`, `mssql_backup_views`, `mssql_backup_catalog`; in the lane, compared with
+    the restored database's catalog views — 2.5 d
+18. Fuzz harness catalog — 0.5 d
+
+*PR 2c — partitioning*
+
+12b. The partitioning model of E7 (functions, typed boundaries through the catalog's sql_variant
+    reader, schemes, destinations, index data spaces, the partition column), the `partitioning`
+    column and E7's verify as a test — 2 d
+
+*PR 2d — rows*
+
 14. FixedVar records: types, forwarding, uniquifier, dropped and added columns, version tag — 3 d
 15. Value kernels over the codec staging; own kernels for datetime, smalldatetime, money, bit (the
     code-page kernel is spec 091's, D7) — 4 d
-16. `mssql_backup_scan`: bind, projection, units, parallelism, cardinality, virtual columns,
-    serialisation; the D17 budget (`max_memory`, `max_threads`, the clamp's WARNING, the reservations
-    of § Resources and their wait-then-refuse rule) and acceptance 13 — 5.5 d
-17. `mssql_backup_tables`, `mssql_backup_views`, `mssql_backup_catalog` — 2 d
-18. Fuzz harnesses record / catalog — 1 d
-19. CI oracle lane: `docker run` of each image with a host volume at `/var/opt/mssql/backup`,
-    generator scripts, RESTORE, the `TYPE mssql` comparison — 4 d
+16. `mssql_backup_scan`: bind, projection, cardinality, virtual columns, serialisation, one unit at
+    a time; in the lane, every fixture table compared with RESTORE + SELECT through `TYPE mssql`
+    (acceptance 1 without LOBs) — 3.5 d
+18b. Fuzz harness record — 0.5 d
+
+*PR 2e — parallel scan and memory*
+
+16b. Units of 64 pages and parallelism; the D17 budget (`max_memory`, `max_threads`, the clamp's
+    WARNING, the reservations of § Resources and their wait-then-refuse rule) and acceptance 13 —
+    2.5 d
+16c. PR 1's review findings on the paths a scan takes: `PageIndex::FallBack` through the ranged
+    mapper (D3a) rather than sequentially; `WalkChain` on a tail of an unknown layout reading block
+    headers in windows, not one 28-byte read each; `LocateOnce`'s probe of the other families' pass
+    only where a crafted file could carry an extent twice — 1.5 d
 
 **PR 3 — LOBs**
 
@@ -1131,7 +1165,7 @@ module `src/codec/code_page/` has merged (D7)
 29. Docs per PR: README (user-facing), `DATAMODEL.md` (a "Backup reader" layer section with the
     diagram above), CLAUDE.md (functions, settings, layout), CHANGELOG, website — 2 d
 
-**Total ≈ 79 days, 14.5–16 weeks** (76.5 before DQ-41's search joined task 7a, +2.5 d; 75 before DQ-40's IAM chain took the AU index out of task 7a,
+**Total ≈ 84.5–86.5 days, 15.5–17.5 weeks** (79 before PR 2 was split in five, +5.5–7.5 d (owner, 2026-11-10): the golden-file test 19a, +0.5 d; PR 1's review findings 16c, +1.5 d; the stages 11b, +1 d; four more PRs' docs and review rounds, +1.5 d; the version drift 19b, +1–3 d; 76.5 before DQ-41's search joined task 7a, +2.5 d; 75 before DQ-40's IAM chain took the AU index out of task 7a,
 −1 d, into task 11a, +2 d, and the differential's header path joined task 24, +0.5 d; 72.5 before D4a's index and E12 joined task 7, +2.5 d; 69 before
 D3a's ranged, asynchronous I/O joined tasks 2, 4 and 7, +3.5 d, both owner 2026-11-09; 66.5 before E7's partitioning model joined task 12, 68.5
 before the plain `_mssql_lob` output joined task 20 from 089 task 7, DQ-05, 69.5 before spec 091
