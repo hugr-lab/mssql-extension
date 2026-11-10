@@ -285,7 +285,6 @@ static void ReadTrailer(const RandomAccess &file, const MtfBlock &msls, BackupSe
 
 void ReadMediaFields(const RandomAccess &file, const MtfLayout &layout, BackupSetHeader &set) {
 	const auto &tape = Require(file, layout, "TAPE");
-	set.media_known = true;
 	ByteReader tape_header(tape.header.data(), tape.header.size(), "the TAPE block", tape.offset);
 	set.media_family_id = tape_header.U32(52);
 	if (auto raid = tape.Stream("RAID")) {

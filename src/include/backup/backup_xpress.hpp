@@ -22,6 +22,7 @@ namespace mssql {
 namespace backup {
 
 //! Decodes `input` into exactly `output_size` bytes at `output`, or throws FormatError.
+//! `output_size` is at least 1: a chain block's output is checked to be 1..65536 bytes.
 void XpressHuffmanDecode(const uint8_t *input, size_t input_size, uint8_t *output, size_t output_size);
 
 }  // namespace backup

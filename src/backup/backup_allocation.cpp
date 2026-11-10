@@ -73,13 +73,22 @@ AllocationMap::AllocationMap(const PageIndex &index, const std::vector<uint16_t>
 bool AllocationMap::GamFree(const File &file, uint32_t extent) const {
 	const size_t interval = extent / GAM_INTERVAL_EXTENTS;
 	const uint32_t within = extent % GAM_INTERVAL_EXTENTS;
-	std::lock_guard<std::mutex> guard(lock_);
 	auto &f = const_cast<File &>(file);
+	{
+		std::lock_guard<std::mutex> guard(lock_);
+		if (f.gam_loaded[interval]) {
+			return (f.gam_free[interval][within / 8] >> (within % 8)) & 1;
+		}
+	}
+	// Read outside the lock, as PfsByte does: the read may search a pass or map one by its headers
+	// (PageIndex::ReadPage, expected), and the other threads' hits must not wait for it. Two threads
+	// missing one interval both read it; the first to finish keeps its bits.
+	const uint32_t gam_page = static_cast<uint32_t>(interval * GAM_INTERVAL_PAGES + 2);
+	auto gam = ReadPage(f.id, gam_page, "a GAM page");
+	ByteReader g(gam.data(), gam.size(), "a GAM page", 0);
+	const uint8_t *bits = g.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES);
+	std::lock_guard<std::mutex> guard(lock_);
 	if (!f.gam_loaded[interval]) {
-		const uint32_t gam_page = static_cast<uint32_t>(interval * GAM_INTERVAL_PAGES + 2);
-		auto gam = ReadPage(f.id, gam_page, "a GAM page");
-		ByteReader g(gam.data(), gam.size(), "a GAM page", 0);
-		const uint8_t *bits = g.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES);
 		f.gam_free[interval].assign(bits, bits + GAM_BITMAP_BYTES);
 		f.gam_loaded[interval] = true;
 	}

@@ -93,6 +93,9 @@ private:
 	CoalescePlan plan_;
 	vector<FetchedRange> fetched_;
 	vector<ErrorData> errors_;
+	//! A task's FormatError, kept as one: ErrorData would rethrow it as a DuckDB Exception, past
+	//! every catch (FormatError &) above (a fallback, a file named).
+	vector<std::string> format_errors_;
 	vector<bool> done_;
 	vector<size_t> request_of_;
 	bool scheduled_ = false;

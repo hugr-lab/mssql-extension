@@ -400,7 +400,7 @@ int main() {
 		auto layout = WalkMtfTape(label);
 		BackupSetHeader set;
 		ReadMediaFields(label, layout, set);
-		Check(tape.size() == 4096 && set.media_known && set.family_count == 2 && set.family_sequence_number == 1,
+		Check(tape.size() == 4096 && set.family_count == 2 && set.family_sequence_number == 1,
 			  "the media label in the container's header: its TAPE block and RAID stream (family 1 of 2)");
 		Check(ErrorOf([&]() { ReadContainerTape(file, pad); }).find("media label") != std::string::npos,
 			  "a container header without the media label block is refused by name");

@@ -123,6 +123,8 @@ Value DateValue(const MtfDate &d, const char *what) {
 
 //! The TDS collation flags a collation's name implies: _CI 0x01, _AI 0x02, kana (0x04) and width (0x08)
 //! ignored unless _KS / _WS, _BIN 0x10, _BIN2 0x20, _UTF8 0x40 (spec 085 § Rules, SCIN +216).
+//! Kana before width, as measured (E16: _CI_AS_KS records 0x09, _CI_AS_WS 0x05, Latin1_General_100
+//! and Japanese alike); MS-TDS's COLLATION lists the two bits in both orders.
 uint32_t FlagsOfName(const std::string &name) {
 	const std::string padded = "_" + name + "_";
 	auto has = [&](const char *token) { return padded.find(std::string("_") + token + "_") != std::string::npos; };
@@ -249,11 +251,10 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 	row.push_back(DateValue(set.backup_start_date, "backup_start_date"));
 	row.push_back(DateValue(set.backup_finish_date, "backup_finish_date"));
 	// A compressed family's media fields come from its container's header (task 9).
-	row.push_back(set.media_known ? GuidValue(set.media_set_guid) : Value(LogicalType::UUID));
-	row.push_back(set.media_known ? Value::INTEGER(static_cast<int32_t>(set.family_count)) : no_int);
+	row.push_back(GuidValue(set.media_set_guid));
+	row.push_back(Value::INTEGER(static_cast<int32_t>(set.family_count)));
 	// One family's number when one family was given; a whole set has no one number.
-	row.push_back(set.media_known && single ? Value::INTEGER(static_cast<int32_t>(set.family_sequence_number))
-											: no_int);
+	row.push_back(single ? Value::INTEGER(static_cast<int32_t>(set.family_sequence_number)) : no_int);
 	row.push_back(Value::BOOLEAN(opened.Compressed()));
 	row.push_back(opened.Compressed() ? Value(CompressionAlgorithmName(first.container_header.algorithm))
 									  : Value(LogicalType::VARCHAR));

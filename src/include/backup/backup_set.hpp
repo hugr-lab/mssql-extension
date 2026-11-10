@@ -85,10 +85,8 @@ struct DatabaseFile {
 };
 
 struct BackupSetHeader {
-	// TAPE and its RAID stream: the media set and this file's place in it. A compressed
-	// container's data set has no TAPE: then media_known is false and these are not read (where
-	// a container keeps them is not located yet).
-	bool media_known = false;
+	// TAPE and its RAID stream: the media set and this file's place in it (ReadMediaFields). A
+	// compressed container's data set has no TAPE: its header keeps one (ReadContainerTape).
 	uint32_t media_family_id = 0;
 	Guid media_set_guid;
 	uint32_t family_count = 0;

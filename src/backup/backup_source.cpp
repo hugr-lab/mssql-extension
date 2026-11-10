@@ -26,6 +26,7 @@ FetchBatch::FetchBatch(CoalescePlan plan_p) : plan_(std::move(plan_p)) {
 	const size_t n = plan_.requests.size();
 	fetched_.resize(n);
 	errors_.resize(n);
+	format_errors_.resize(n);
 	done_.assign(n, false);
 	size_t wanted = plan_.empty.size();
 	for (const auto &request : plan_.requests) {
@@ -47,6 +48,9 @@ const FetchedRange &FetchBatch::Request(size_t i) const {
 	if (i >= fetched_.size()) {
 		throw InternalException("backup: fetch request %llu of %llu", (unsigned long long)i,
 								(unsigned long long)fetched_.size());
+	}
+	if (!format_errors_[i].empty()) {
+		throw FormatError(format_errors_[i]);
 	}
 	if (errors_[i].HasError()) {
 		errors_[i].Throw();
@@ -200,14 +204,18 @@ vector<unique_ptr<AsyncTask>> ByteSource::FetchTasks(const shared_ptr<FetchBatch
 			[batch, i, range, handle, path]() {
 				FetchedRange fetched;
 				ErrorData error;
+				std::string format_error;
 				try {
 					fetched = Fetch(*handle, path, range);
+				} catch (FormatError &e) {
+					format_error = e.what();
 				} catch (std::exception &e) {
 					error = ErrorData(e);
 				}
 				lock_guard<mutex> guard(batch->lock_);
 				batch->fetched_[i] = std::move(fetched);
 				batch->errors_[i] = std::move(error);
+				batch->format_errors_[i] = std::move(format_error);
 				batch->done_[i] = true;
 			},
 			range.length));

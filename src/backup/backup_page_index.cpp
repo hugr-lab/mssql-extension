@@ -432,7 +432,7 @@ PassMap BuildPassMap(const RandomAccess &stream, uint64_t offset, uint64_t lengt
 
 // Allocation-page layout (spec 085 § Rules, allocation): PFS pages at 1 and every 8,088 pages;
 // GAM / SGAM / DCM / BCM at +2 / +3 / +6 / +7 of every 511,232-page interval, whose GAM covers
-// 63,904 extents with a 7,988-byte bitmap at page offset 194 (bit set = free); the boot page at 9.
+// 63,904 extents with a 7,988-byte bitmap at page offset 194 (bit set = free); the boot page at 9 of file 1.
 static constexpr uint32_t PFS_INTERVAL = 8088;
 static constexpr uint32_t GAM_INTERVAL_PAGES = 511232;
 static constexpr uint32_t GAM_INTERVAL_EXTENTS = GAM_INTERVAL_PAGES / PAGES_PER_EXTENT;
@@ -443,6 +443,9 @@ static constexpr uint8_t PAGE_TYPE_GAM = 8;
 // The file header page (page 0): its slot 0 record holds u16 file id +167, u32 Size (pages) +171.
 static constexpr size_t FILE_HEADER_ID_AT = 167;
 static constexpr size_t FILE_HEADER_SIZE_AT = 171;
+// The boot page: page 9 of file 1 only (as AllocationMap's).
+static constexpr uint16_t BOOT_FILE = 1;
+static constexpr uint32_t BOOT_PAGE = 9;
 // Groups checked beside the ones the rule needs, spread over each file; a checked group of zero
 // units only (an allocated extent with no allocated page) names nothing, so the next one is read,
 // at most this many times.
@@ -502,15 +505,17 @@ const uint8_t *GroupPage(const ReadGroup &g, uint32_t page_in_extent, uint8_t ty
 }
 
 //! Adds interval `interval`'s extents of a file of `size` pages, in order: its allocation pages'
-//! extents (the PFS pages in it, its own first extent, the boot page's in interval 0) and the
-//! extents its GAM marks allocated. Every extent added is below the next interval's first.
-void AddInterval(uint32_t size, uint32_t interval, const uint8_t *gam_bits, ExtentBitmap &bitmap) {
+//! extents (the PFS pages in it, its own first extent, in file 1 the boot page's in interval 0)
+//! and the extents its GAM marks allocated. Every extent added is below the next interval's first.
+void AddInterval(uint16_t file, uint32_t size, uint32_t interval, const uint8_t *gam_bits, ExtentBitmap &bitmap) {
 	const uint64_t first_page = static_cast<uint64_t>(interval) * GAM_INTERVAL_PAGES;
 	const uint64_t end_page = std::min<uint64_t>(first_page + GAM_INTERVAL_PAGES, size);
 	std::vector<uint32_t> extents;
 	extents.push_back(static_cast<uint32_t>(first_page / PAGES_PER_EXTENT));  // pages 0..7: header, PFS, GAM, ...
-	if (interval == 0 && size > 9) {
-		extents.push_back(9 / PAGES_PER_EXTENT);  // the boot page's extent
+	if (file == BOOT_FILE && interval == 0 && size > BOOT_PAGE) {
+		// The boot page's extent (only file 1 has one; another file's extent 1 is copied when its
+		// GAM says allocated, like any other).
+		extents.push_back(BOOT_PAGE / PAGES_PER_EXTENT);
 	}
 	// PFS pages: page 1, then every multiple of 8088.
 	for (uint64_t p = (first_page / PFS_INTERVAL + 1) * PFS_INTERVAL; p < end_page; p += PFS_INTERVAL) {
@@ -575,7 +580,7 @@ bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint6
 		std::vector<uint8_t> gam_copy(gam, gam + PAGE_SIZE);
 		for (uint32_t interval = 0;; interval++) {
 			ByteReader bm(gam_copy.data(), PAGE_SIZE, "a GAM page", 0);
-			AddInterval(size, interval, bm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES), bitmap);
+			AddInterval(file, size, interval, bm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES), bitmap);
 			if (bitmap.Count() > result.groups_ - file_group) {
 				return false;
 			}
@@ -600,6 +605,11 @@ bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint6
 		// Check groups spread over the file: each names the extent its rank gives.
 		for (uint32_t c = 1; c <= RANK_CHECKS_PER_FILE && c < count; c++) {
 			uint64_t rank = (count - 1) * c / RANK_CHECKS_PER_FILE;
+			// The last checkpoints start early enough to have all their steps: a file's last
+			// extent being one of zero units must not refuse the rule.
+			if (count > RANK_CHECK_STEPS) {
+				rank = std::min<uint64_t>(rank, count - RANK_CHECK_STEPS);
+			}
 			bool verified = false;
 			for (uint32_t step = 0; step < RANK_CHECK_STEPS && rank < count && !verified; step++, rank++) {
 				uint32_t expected = 0;
@@ -612,6 +622,11 @@ bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint6
 					return false;
 				}
 				verified = g.has_extent;
+			}
+			// A check that read only zero-unit groups proved nothing: the rule is not trusted
+			// (the pass is searched or mapped by its headers instead).
+			if (!verified) {
+				return false;
 			}
 		}
 		result.files_.push_back(file);

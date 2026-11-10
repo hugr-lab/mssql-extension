@@ -47,7 +47,7 @@ struct OpenedFamily {
 	const RandomAccess &Stream() const;
 };
 
-//! A media set's families, ordered by family sequence number (a container's by the order given).
+//! A media set's families, ordered by family sequence number (a container's from its media label).
 struct OpenedHeaders {
 	std::unique_ptr<ByteSource> source;
 	std::vector<std::unique_ptr<OpenedFamily>> families;
