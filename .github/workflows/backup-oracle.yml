@@ -11,6 +11,11 @@
 # one version never mix their files (each uploads under its own <run>; the last DONE wins whole).
 # A PR that changes the generator generates its own, before its test reads them.
 #
+# Nothing here deletes: the bucket's lifecycle rule removes oracle/ objects 30 days after their
+# upload (old keys, runs no DONE names). So that it never removes a set a run is reading, a DONE
+# older than REFRESH_DAYS counts as missing and the version is generated again, under a new <run>:
+# a set read is always younger than REFRESH_DAYS, far below the rule's 30.
+#
 # Uploads use the aws CLI; every read is DuckDB's. The R2 credentials are repository secrets, which
 # a pull request from a fork does not get: there the lane says so and runs nothing. The bucket's
 # name is a repository variable (a secret named mssql would mask every "mssql" in the logs).
@@ -59,6 +64,8 @@ permissions:
 
 env:
   VERSIONS: '2017 2019 2022 2025'
+  # Below the R2 lifecycle rule's 30 days on oracle/ (see above).
+  REFRESH_DAYS: '21'
 
 jobs:
   key:
@@ -92,11 +99,19 @@ jobs:
           export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
                  AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
           missing=()
+          now=$(date -u +%s)
           for v in $VERSIONS; do
-            if aws s3 ls "s3://${MSSQL_R2_BUCKET_NAME}/oracle/${key}/${v}/DONE" >/dev/null 2>&1; then
-              echo "${v}: stored under oracle/${key}/${v}/"
-            else
+            stored=$(aws s3api head-object --bucket "${MSSQL_R2_BUCKET_NAME}" --key "oracle/${key}/${v}/DONE" \
+                       --query LastModified --output text 2>/dev/null || true)
+            if [ -z "${stored}" ] || [ "${stored}" = None ]; then
               echo "${v}: to generate"; missing+=("${v}")
+              continue
+            fi
+            age=$(( (now - $(date -u -d "${stored}" +%s)) / 86400 ))
+            if [ "${age}" -ge "${REFRESH_DAYS}" ]; then
+              echo "${v}: stored ${age} days ago, generated again (the lifecycle rule removes it at 30)"; missing+=("${v}")
+            else
+              echo "${v}: stored under oracle/${key}/${v}/ (${age} days ago)"
             fi
           done
           echo "enabled=true" >> "$GITHUB_OUTPUT"
