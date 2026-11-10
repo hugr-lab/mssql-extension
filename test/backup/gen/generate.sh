@@ -79,7 +79,9 @@ major="$(cut -d. -f1 "${OUT}/server.txt")"
 echo ">> server $(cat "${OUT}/server.txt")"
 
 docker exec -u 0 "${CONTAINER}" mkdir -p "${DIR}"
-docker exec -u 0 "${CONTAINER}" chown mssql "${DIR}"
+# The server runs as mssql from the 2019 image on; the 2017 image runs it as root and has no such
+# user, so there the directory is the server's already.
+docker exec -u 0 "${CONTAINER}" sh -c "if id mssql >/dev/null 2>&1; then chown mssql '${DIR}'; fi"
 docker cp "${HERE}/samples.sql" "${CONTAINER}:/tmp/samples.sql"
 echo ">> running samples.sql"
 sql -v DIR="${DIR}" -i /tmp/samples.sql
