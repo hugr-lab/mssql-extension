@@ -2,13 +2,18 @@
 -- samples are samples.sql's and stay as they are). A database of the shapes the catalog reader must
 -- name: several schemas, the common types under several collations, a heap with a nonclustered index,
 -- a clustered primary key, a clustered columnstore, an empty table, a dropped column, columns added
--- after rows were written (one NOT NULL with a default: a metadata-only add), an identity, a computed
--- column, a rowversion, and two views, one WITH ENCRYPTION. Every row is generated; nothing comes from
+-- after rows were written (one NOT NULL with a default: a metadata-only add), a column whose type was
+-- altered, identities, computed columns (one persisted), a rowversion, a ROWGUIDCOL, an alias type,
+-- sparse columns and a column set, a non-unique clustered index, defaults and a check, and views: two
+-- WITH ENCRYPTION, one SCHEMABINDING, one with non-ASCII text, two whose definitions pass 8000 bytes
+-- (single-byte and Cyrillic). Every row is generated; nothing comes from
 -- anyone's database (spec 085 T4). Run by generate.sh with the sqlcmd variable DIR.
 --
--- After the backup, the server's own catalog of the database is written beside it
+-- After the backup, generate.sh writes the server's own catalog of the database beside it
 -- (catalog_golden.sql: catalog_full.tables.txt, .columns.txt, .views.txt).
 SET NOCOUNT ON;
+-- sqlcmd starts with QUOTED_IDENTIFIER off (-I turns it on); an index over a computed column needs it on.
+SET QUOTED_IDENTIFIER ON;
 GO
 IF DB_ID('bak_catalog') IS NOT NULL DROP DATABASE bak_catalog;
 GO
@@ -96,16 +101,70 @@ GO
 ALTER TABLE dbo.evolved DROP COLUMN drop_me;
 ALTER TABLE dbo.evolved ADD added_default int NOT NULL CONSTRAINT df_evolved_added DEFAULT 42;
 ALTER TABLE dbo.evolved ADD added_null nvarchar(10) NULL;
+-- More metadata-only adds: their defaults are sql_variant values of each form (sysseobjvalues).
+ALTER TABLE dbo.evolved ADD added_text varchar(10) NOT NULL CONSTRAINT df_evolved_text DEFAULT 'abc';
+ALTER TABLE dbo.evolved ADD added_ntext nvarchar(10) NOT NULL CONSTRAINT df_evolved_ntext DEFAULT N'жж';
+ALTER TABLE dbo.evolved ADD added_dec decimal(9, 2) NOT NULL CONSTRAINT df_evolved_dec DEFAULT 1.25;
+ALTER TABLE dbo.evolved ADD added_dt2 datetime2(3) NOT NULL CONSTRAINT df_evolved_dt2 DEFAULT '2026-01-02T03:04:05.678';
+ALTER TABLE dbo.evolved ADD added_bin varbinary(8) NOT NULL CONSTRAINT df_evolved_bin DEFAULT 0x0102;
 GO
 IF OBJECT_ID('dbo.utf8_text') IS NOT NULL
 	EXEC ('INSERT INTO dbo.utf8_text (id, txt) SELECT TOP (50) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), N''текст'' FROM sys.all_objects');
+GO
+-- More column shapes: an alias type, an identity of another seed and step, a ROWGUIDCOL, a named
+-- default and a check, a persisted computed column, sparse columns; a non-unique clustered index
+-- (a uniquifier) whose key does not start at the first column.
+CREATE TYPE dbo.code_t FROM varchar(12) NOT NULL;
+GO
+CREATE TABLE dbo.shapes (
+	id bigint NOT NULL IDENTITY(100, 5),
+	guid uniqueidentifier ROWGUIDCOL NOT NULL CONSTRAINT df_shapes_guid DEFAULT NEWSEQUENTIALID(),
+	code dbo.code_t,
+	qty int NOT NULL CONSTRAINT df_shapes_qty DEFAULT 1 CONSTRAINT ck_shapes_qty CHECK (qty >= 0),
+	price decimal(10, 2) NOT NULL,
+	total AS (qty * price) PERSISTED,
+	sp1 int SPARSE NULL,
+	sp2 nvarchar(20) SPARSE NULL
+);
+CREATE CLUSTERED INDEX cx_shapes ON dbo.shapes (qty, code);
+-- Sparse columns behind a column set.
+CREATE TABLE dbo.colset (id int NOT NULL PRIMARY KEY, a int SPARSE NULL, b varchar(10) SPARSE NULL,
+						 cs xml COLUMN_SET FOR ALL_SPARSE_COLUMNS);
+-- A column whose type is changed after rows were written (a new physical column), then one added.
+CREATE TABLE dbo.altered (id int NOT NULL PRIMARY KEY, v int NOT NULL);
+GO
+WITH n AS (SELECT TOP (100) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects)
+INSERT INTO dbo.shapes (code, qty, price, sp1, sp2)
+SELECT CONCAT('S', i % 7), i % 5, i * 2.5, CASE WHEN i % 3 = 0 THEN i END, CASE WHEN i % 4 = 0 THEN CONCAT(N'с', i) END FROM n;
+WITH n AS (SELECT TOP (40) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects)
+INSERT INTO dbo.colset (id, a, b) SELECT i, CASE WHEN i % 2 = 0 THEN i END, CASE WHEN i % 3 = 0 THEN CONCAT('b', i) END FROM n;
+WITH n AS (SELECT TOP (60) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects)
+INSERT INTO dbo.altered (id, v) SELECT i, i * 10 FROM n;
+GO
+ALTER TABLE dbo.altered ALTER COLUMN v bigint NOT NULL;
+ALTER TABLE dbo.altered ADD w int NULL;
 GO
 CREATE VIEW sales.v_big_orders AS SELECT order_id, customer, amount FROM sales.orders WHERE amount > 100;
 GO
 CREATE VIEW dbo.v_hidden WITH ENCRYPTION AS SELECT id FROM dbo.empty_table;
 GO
+CREATE VIEW dbo.v_hidden2 WITH ENCRYPTION AS SELECT id, qty FROM dbo.shapes;
+GO
+CREATE VIEW dbo.v_bound WITH SCHEMABINDING AS SELECT id, qty FROM dbo.shapes;
+GO
+CREATE VIEW dbo.v_unicode AS SELECT N'Клиент 字 ü' AS label, id FROM dbo.shapes;
+GO
+-- Text in Latin-1's range only, and with a character code page 1252 has and Latin-1 has not: which
+-- single-byte form a definition is stored in (sysobjvalues.value 0x2), if any.
+CREATE VIEW dbo.v_latin1 AS SELECT N'café ü' AS label, id FROM dbo.shapes;
+GO
+CREATE VIEW dbo.v_cp1252 AS SELECT N'price €' AS label, id FROM dbo.shapes;
+GO
+-- Definitions past 8000 bytes: one of single-byte characters, one of Cyrillic.
+DECLARE @x nvarchar(max) = REPLICATE(CAST(N'x' AS nvarchar(max)), 9000);
+EXEC (N'CREATE VIEW dbo.v_long AS SELECT id /* ' + @x + N' */ FROM dbo.shapes');
+DECLARE @y nvarchar(max) = REPLICATE(CAST(N'ж' AS nvarchar(max)), 5000);
+EXEC (N'CREATE VIEW dbo.v_long_unicode AS SELECT id /* ' + @y + N' */ FROM dbo.shapes');
+GO
 BACKUP DATABASE bak_catalog TO DISK = '$(DIR)/catalog_full.bak' WITH FORMAT, INIT, CHECKSUM, NAME = 'catalog_full';
 GO
--- The server's catalog of the database, as the backup holds it (nothing changed since).
-:setvar SET catalog_full
-:r $(GEN)/catalog_golden.sql

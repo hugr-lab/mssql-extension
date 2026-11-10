@@ -380,11 +380,13 @@ void BootstrapTables::BuildIndexes() {
 	column_index_.clear();
 	rscol_order_.clear();
 	in_row_index_.clear();
+	units_by_owner_.clear();
 	for (size_t i = 0; i < allocation_units.size(); i++) {
 		const SysAllocUnit &a = allocation_units[i];
 		if (!au_index_.emplace(a.auid, i).second) {
 			throw FormatError("backup: sysallocunits lists allocation unit " + std::to_string(a.auid) + " twice");
 		}
+		units_by_owner_[a.owner_id].push_back(i);
 		if (a.type == 1 && !in_row_index_.emplace(a.owner_id, i).second) {
 			throw FormatError("backup: sysallocunits gives rowset " + std::to_string(a.owner_id) +
 							  " two in-row allocation units");
@@ -445,6 +447,41 @@ const SysAllocUnit *BootstrapTables::FindInRowUnit(uint64_t rowset_id) const {
 	return it == in_row_index_.end() ? nullptr : &allocation_units[it->second];
 }
 
+const SysAllocUnit *BootstrapTables::FindLobUnit(uint64_t rowset_id) const {
+	auto it = units_by_owner_.find(rowset_id);
+	if (it == units_by_owner_.end()) {
+		return nullptr;
+	}
+	for (size_t i : it->second) {
+		if (allocation_units[i].type == 2) {
+			return &allocation_units[i];
+		}
+	}
+	return nullptr;
+}
+
+std::vector<const SysRowset *> BootstrapTables::RowsetsOf(int32_t object_id) const {
+	std::vector<const SysRowset *> out;
+	auto it = rowsets_by_object_.find(object_id);
+	if (it != rowsets_by_object_.end()) {
+		for (size_t i : it->second) {
+			out.push_back(&rowsets[i]);
+		}
+	}
+	return out;
+}
+
+std::vector<const SysAllocUnit *> BootstrapTables::UnitsOf(uint64_t rowset_id) const {
+	std::vector<const SysAllocUnit *> out;
+	auto it = units_by_owner_.find(rowset_id);
+	if (it != units_by_owner_.end()) {
+		for (size_t i : it->second) {
+			out.push_back(&allocation_units[i]);
+		}
+	}
+	return out;
+}
+
 const SysAllocUnit &BootstrapTables::InRowUnit(uint64_t rowset_id, const std::string &table) const {
 	const SysAllocUnit *unit = FindInRowUnit(rowset_id);
 	if (!unit) {
@@ -482,7 +519,12 @@ RowsetLayout BootstrapTables::BaseLayout(int32_t object_id) const {
 			"backup: " + name + " has " + std::to_string(live.size()) +
 			" live base rowsets (a partitioned table or a columnstore, which the reader does not read yet)");
 	}
-	const SysRowset &base = *live[0];
+	return LayoutOf(object_id, *live[0]);
+}
+
+RowsetLayout BootstrapTables::LayoutOf(int32_t object_id, const SysRowset &base) const {
+	const SysObject *object = Object(object_id);
+	const std::string name = object ? object->name : "object " + std::to_string(object_id);
 	RowsetLayout layout;
 	layout.table = name;
 	layout.rowset_id = base.rowset_id;

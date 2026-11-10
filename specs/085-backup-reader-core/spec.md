@@ -538,11 +538,13 @@ src/backup/                         namespace duckdb::mssql::backup (no prefix);
   backup_allocation.cpp             AllocationMap: file header Size, GAM, PFS on demand; IsLive (R3)
   backup_iam.cpp                    IamChain: an AU's IAM pages → its extent runs and single pages (DQ-40)
   backup_page_store.cpp             PageStore: page bytes by (file, page); differential overlay
-  backup_catalog_reader.cpp         boot page, the five bootstrap layouts, generic base-table decoder
-  backup_catalog_model.cpp          CatalogModel: schemas, objects, rowsets, AUs, columns, TableLayout
+  backup_boot.cpp                   the boot page (1:9), checked against the trailer
+  backup_system_tables.cpp          the five bootstrap layouts (literals, checked), generic base-table decoder
+  backup_sql_variant.cpp            sql_variant values of the base tables (defaults, flags, boundaries)
+  backup_catalog_model.cpp          CatalogModel: schemas, tables, columns, rowsets, AUs, layouts, views
   backup_collation.cpp              on-disk collation id → spec 091's collation table (code page, name)
   backup_record.cpp                 RecordView: FixedVar split, record types, forwarding, uniquifier
-  backup_lob.cpp                    LobReader: in-row roots, LOB trees, row-overflow, text pointers
+  backup_lob.cpp                    LobReader: in-row roots, LOB trees (the catalog's, PR 2b), row-overflow, text pointers
   backup_value_kernels.cpp          on-disk bytes → codec staging → DuckDB vectors                    [DuckDB]
   backup_log_tail.cpp               LogTail: MQTL blocks, sector parity, record headers, transactions
   backup_fuzzy.cpp                  FuzzyStatus: E3 flag (v) per table
@@ -822,9 +824,8 @@ offsets above are in its fixed part.
   2017–2025 backups (2026-11-10): every literal holds on all four; `sysrscols` gained a trailing
   `ordlock` (int, offset 54) on 2022, which the literals do not take. Every database's `sysschobjs` also
   lists two MS-shipped user tables with no rowset (`trace_xe_action_map`, `trace_xe_event_map`, type
-  `'U '`, status bit 0x1): their data is the resource database's; the catalog model (task 12) is to leave them
-  out. Record
-  offsets:
+  `'U '`, status bit 0x1): their data is the resource database's; the catalog model leaves out every
+  object with that bit. Record offsets:
 
   | table | fields |
   |---|---|
@@ -837,8 +838,46 @@ offsets above are in its fixed part.
 - Generic tables needed by 085: `sysclsobjs` (class 50 = schemas; schema 1 = `dbo`), `sysseobjvalues`
   (defaults of metadata-only ADD COLUMN: valclass 1, `id` = rowset id, **`subid` = hbcolid**, valnum 0,
   value sql_variant; E1§4.8 — E2§4 says rscolid, which equals hbcolid only without a uniquifier),
-  `sysobjvalues` (module text; valclass of a view definition to pin, task 11), and the partitioning
-  tables below.
+  `sysobjvalues` (module text: valclass 1 by object -- a view's definition, a default's, a check's --,
+  valclass 2 by (table, column id) a computed column's; `value` a sql_variant int of flags, `imageval`
+  the text, off-row past 8000 bytes), `sysscalartypes` (every type by its utype, the system types
+  included: `TYPE_NAME`), and the partitioning tables below.
+- **The catalog model** (task 12, `backup_catalog_model`; pinned on the catalog fixture, 2022, and
+  compared field by field with its `.tables` / `.columns` / `.views` files by a local script: 1102
+  fields, 0 differences -- the lane's comparison is task 17's `compare_catalog.py`, which reads the
+  file functions):
+  - a user table is a `sysschobjs` row of type `'U '`, a view one of type `'V '`, each without status bit
+    0x1; a view has bit 0x10000 when `WITH ENCRYPTION` (its `imageval` is then obfuscated, not read);
+  - `syscolpars.status`: 0x1 NOT NULL, 0x2 ANSI padding, 0x4 identity, 0x8 ROWGUIDCOL, 0x10 computed
+    (0x80 beside it on both computed columns, meaning unpinned), 0x40 persisted, 0x1000000 sparse,
+    0x2000000 a column set. A sparse column has no fixed offset or variable index (offset 0, null bit 0,
+    sysrscols status 0x100), nor does a column set any physical column;
+  - a module's text is Latin-1 bytes when the `value` flags have 0x2 -- every character in U+0000–U+00FF:
+    `N'café ü'` is stored so, `N'price €'` is not, though code page 1252 has the euro sign -- and UTF-16LE
+    otherwise (the flags 0 on an encrypted view too). A definition past 8000 bytes is an in-row LOB root
+    (kind 4, a 12-byte header and 12-byte links) over DATA fragments: 9058 bytes as two of 8040 and 1018
+    (`backup_lob`, the catalog's own reader; the scan's LOBs, row-overflow and text pointers are PR 3's).
+    The model keeps such a definition's root and reads it on demand (`ReadModuleDefinition`, at most
+    64 MiB), so listing a catalog reads no long definition. The reader refuses by name a child that
+    claims more bytes than its parent (before reading it), a fragment referenced twice, a slot count past
+    the page, a page of another unit;
+  - a sql_variant is u8 xtype, u8 version 1, the properties and the value in its record form, measured
+    for int, varchar and nvarchar (u16 maximum length, u32 CollationId), decimal (u8 precision, u8 scale),
+    datetime2 (u8 scale) and varbinary (u16 maximum length) (`backup_sql_variant`). A metadata-only ADD
+    COLUMN's default is taken into the layout only when its xtype, precision / scale and collation are
+    the column's, else the table is not decodable, naming the column;
+  - shape: a heap when a base rowset has index 0, a columnstore when one has `cmprlevel` 3 or more, else
+    clustered. A base rowset of `ownertype` 1 is a partition's; a clustered columnstore also has rowsets of
+    owner types 2 and 3, the delta store's `rcrows` holding the rows not yet compressed (1000 rows, none
+    compressed: 0 / 0 / 1000), so `row_count` sums owner types 1 and 3 (to be checked on compressed
+    rowgroups and deleted rows in spec 088);
+  - what one object's rows get wrong is named on that object (D13): a table the scan cannot read is
+    listed with `decodable` false and its reason -- a clustered columnstore (088), ROW / PAGE compression
+    or sparse columns (086), more than one partition (PR 2c), its schema or a column's type not in the
+    catalog, a layout the reader cannot build, an added column's default missing, listed twice, malformed
+    or not of the column's type and size -- and a definition that cannot be read is Unreadable with its
+    reason. Coarser than D13 for now: a sparse column or an unusable default refuses the table, not the
+    column (column-level refusal is the scan's, PR 2d).
 - **Partitioning** (E7§2, decoded generically and verified against the catalog views in 16 states,
   0 mismatches **(2025)**):
 

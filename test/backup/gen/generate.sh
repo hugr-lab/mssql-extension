@@ -9,11 +9,11 @@
 #
 # FIXTURES (default "samples catalog files load large"): samples.sql, the database of the committed
 # samples; catalog.sql, the catalog fixture (spec 085 PR 2b); files.sql, two data files and a second
-# filegroup, then a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
+# filegroup, then (files_remove.sql) a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
 # while load_workload.sql commits in the background (a live database: pass 2, a fuzzy tail, the file
 # outgrowing its recorded Size); large.sql, data past one GAM interval (LARGE_ROWS rows of a page each,
 # 530000 by default). A fixture's backups come with the server's own catalog of them where it holds
-# still (<set>.tables.txt / .columns.txt / .views.txt, catalog_golden.sql through sqlcmd's :r / :OUT).
+# still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).
 #
 # Writes into OUT: the backups, <set>.headeronly.txt / .labelonly.txt / .filelistonly.txt, sets.txt
 # (one line per backup set: name|file[,file] -- what test/backup/compare_info.py reads) and
@@ -130,6 +130,15 @@ done
 run_sql() {	# $1 = a script of /tmp/gen
 	sql -v DIR="${DIR}" GEN=/tmp/gen LARGE_ROWS="${LARGE_ROWS}" -s '|' -W -i "/tmp/gen/$1"
 }
+# The server's own catalog of database $1 as set $2's backup holds it (run right after that backup,
+# nothing changed since): $2.tables.txt / .columns.txt / .views.txt, through catalog_golden.sql's
+# :OUT. The path goes in whole, as ONE -v variable: in an :OUT path sqlcmd substitutes no variable
+# :setvar defines, and of -v variables only the first ("$(DIR)/$(SET).x" kept "$(SET)" literally;
+# measured, mssql-tools18 on 2022).
+golden() {	# $1 = database, $2 = set
+	sql -d "$1" -v OUTPREFIX="${DIR}/$2" -s '|' -W -i /tmp/gen/catalog_golden.sql
+	extras+=("$2.tables.txt" "$2.columns.txt" "$2.views.txt")
+}
 scalar() {	# $1 = a query answering one value
 	sql -h -1 -W -Q "SET NOCOUNT ON; $1" | head -1 | tr -d ' \r'
 }
@@ -155,12 +164,15 @@ for fixture in ${FIXTURES}; do
 		sets+=("diff|diff.bak" "log|log.trn")
 		;;
 	catalog)
+		golden bak_catalog catalog_full
 		sets+=("catalog_full|catalog_full.bak")
-		extras+=(catalog_full.tables.txt catalog_full.columns.txt catalog_full.views.txt)
 		;;
 	files)
+		# Two states of one database: the golden of each is taken right after its backup.
+		golden bak_files files_full
+		run_sql files_remove.sql
+		golden bak_files files_removed
 		sets+=("files_full|files_full.bak" "files_removed|files_removed.bak")
-		for s in files_full files_removed; do extras+=("${s}.tables.txt" "${s}.columns.txt" "${s}.views.txt"); done
 		;;
 	load)
 		# The workload in the background, the backups once it is committing, then it is stopped and
@@ -196,8 +208,8 @@ for fixture in ${FIXTURES}; do
 		sets+=("load_base|load_base.bak" "load_full|load_full.bak" "load_xpress|load_xpress.bak" "load_diff|load_diff.bak" "load_log|load_log.trn")
 		;;
 	large)
+		golden bak_large large_xpress
 		sets+=("large_xpress|large_xpress.bak")
-		extras+=(large_xpress.tables.txt large_xpress.columns.txt large_xpress.views.txt)
 		;;
 	*)
 		echo "ERROR: unknown fixture ${fixture}" >&2

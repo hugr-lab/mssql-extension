@@ -28,15 +28,3 @@ INSERT INTO dbo.heap_both SELECT i, REPLICATE('h', 150) FROM n;
 GO
 BACKUP DATABASE bak_files TO DISK = '$(DIR)/files_full.bak' WITH FORMAT, INIT, CHECKSUM, NAME = 'files_full';
 GO
-:setvar SET files_full
-:r $(GEN)/catalog_golden.sql
-GO
-DBCC SHRINKFILE (bak_files_2, EMPTYFILE) WITH NO_INFOMSGS;
-GO
-ALTER DATABASE bak_files REMOVE FILE bak_files_2;
-GO
-BACKUP DATABASE bak_files TO DISK = '$(DIR)/files_removed.bak' WITH FORMAT, INIT, CHECKSUM, NAME = 'files_removed';
-GO
-:setvar SET files_removed
-:r $(GEN)/catalog_golden.sql
-GO

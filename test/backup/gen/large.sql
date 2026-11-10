@@ -24,6 +24,3 @@ INSERT INTO dbo.tail SELECT TOP (1000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)
 GO
 BACKUP DATABASE bak_large TO DISK = '$(DIR)/large_xpress.bak' WITH FORMAT, INIT, CHECKSUM, COMPRESSION, NAME = 'large_xpress';
 GO
-:setvar SET large_xpress
-:r $(GEN)/catalog_golden.sql
-GO

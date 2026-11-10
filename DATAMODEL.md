@@ -1415,6 +1415,7 @@ flowchart BT
   alloc --> store["PageStore<br/>a live page's latest copy, checked<br/>(Present / Pending)"]
   store --> iam["IAM chains<br/>an AU's pages"]
   iam --> sys["system base tables<br/>bootstrap five by literal layouts,<br/>checked against sysrscols;<br/>any other by its own description"]
+  sys --> model["CatalogModel<br/>schemas, tables, columns,<br/>layouts + defaults, views"]
 ```
 
 - **The file is untrusted input.** Every parser reads through `ByteReader` (`backup_bytes`), which
@@ -1466,6 +1467,11 @@ flowchart BT
   Every literal is then checked against the tables' own description of themselves, so a version
   that moves a field is refused by name, not misread. Any other system table is read through its
   own description (`ReadSystemTable`).
+- **The catalog model** (`backup_catalog_model`, PR 2b): schemas, user tables (columns with their
+  type names from `sysscalartypes`, rowsets, allocation units, shape, rows, the base rowset's layout
+  with the defaults of columns added after rows were written) and views (definitions, Latin-1 or
+  UTF-16, an off-row one read by `backup_lob`). A table the scan cannot read is listed, `decodable`
+  false, with its reason (spec 085 D13).
 - **Prepared statements** keep the row their bind read (`SupportStatementCache`); `reread := true`
   binds again on every `EXECUTE`. The opened-file cache shared across statements (D9) is task 22.
 

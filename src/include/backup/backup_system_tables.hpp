@@ -244,8 +244,16 @@ struct BootstrapTables {
 	//! or a columnstore), a physical column syscolpars does not name, or more physical columns than a
 	//! null bit can number.
 	RowsetLayout BaseLayout(int32_t object_id) const;
+	//! The layout of rowset `rowset` of object `object_id` (BaseLayout's, for any rowset of it).
+	RowsetLayout LayoutOf(int32_t object_id, const SysRowset &rowset) const;
+	//! Every sysrowsets row of object `object_id`, in sysrowsets' order.
+	std::vector<const SysRowset *> RowsetsOf(int32_t object_id) const;
+	//! Every allocation unit rowset `rowset_id` owns, in sysallocunits' order.
+	std::vector<const SysAllocUnit *> UnitsOf(uint64_t rowset_id) const;
 	//! The in-row allocation unit (type 1) of rowset `rowset_id`, or null.
 	const SysAllocUnit *FindInRowUnit(uint64_t rowset_id) const;
+	//! The LOB_DATA allocation unit (type 2) of rowset `rowset_id`, or null.
+	const SysAllocUnit *FindLobUnit(uint64_t rowset_id) const;
 	//! FindInRowUnit, with none a FormatError naming `table`.
 	const SysAllocUnit &InRowUnit(uint64_t rowset_id, const std::string &table) const;
 
@@ -257,6 +265,7 @@ private:
 	std::map<std::pair<int32_t, int32_t>, size_t> column_index_;  // (object, colid), number 0
 	std::vector<size_t> rscol_order_;							  // by (rowset, rscolid)
 	std::unordered_map<uint64_t, size_t> in_row_index_;			  // rowset -> its in-row unit
+	std::unordered_map<uint64_t, std::vector<size_t>> units_by_owner_;
 };
 
 //! The bootstrap tables of the database whose boot page is `boot`, every page through `store`.

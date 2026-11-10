@@ -168,9 +168,11 @@ set(EXTENSION_SOURCES
     src/backup/backup_allocation.cpp
     src/backup/backup_boot.cpp
     src/backup/backup_bytes.cpp
+    src/backup/backup_catalog_model.cpp
     src/backup/backup_collation.cpp
     src/backup/backup_container.cpp
     src/backup/backup_iam.cpp
+    src/backup/backup_lob.cpp
     src/backup/backup_info_function.cpp
     src/backup/backup_mtf.cpp
     src/backup/backup_open_pass.cpp
@@ -181,6 +183,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_ranges.cpp
     src/backup/backup_record.cpp
     src/backup/backup_set.cpp
+    src/backup/backup_sql_variant.cpp
     src/backup/backup_system_tables.cpp
     src/backup/backup_xpress.cpp
     src/backup/backup_zstd.cpp
