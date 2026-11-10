@@ -93,6 +93,17 @@ These numbers were taken before the harness fixes of issues #505-#509, and three
 
   which loads `tpch_sf10_columnstore_utf8_latin1general100bin2utf8`, and `verify`, `run` and `trace` take the same two flags to find it.
 
+## When the two oracle engines disagree
+
+`verify` computes the oracle on both DuckDB engines over the same parquet (#507). A query they do not agree about is **not** a client's fault and is reported as `ORACLE DISAGREEMENT`, counted once; every client is still graded, against the oracle of the engine it runs on, with `[split oracle: A]` / `[split oracle: B]` on the line.
+
+That split is meant to be read, not lived with. A disagreement is one of two things:
+
+- a **transient** difference, from a version pair that will move on — fix it by updating a client, or by noting it here with the engine versions it appeared on;
+- a **permanent** one, where 1.5.6 and 2.0 give a TPC-H query different types or different last bits by design (the type of q17's `0.2*avg(...)` is the candidate). Those belong in this file by name, with the two answers quoted, so the split is a documented fact about the comparison rather than a surprise in the output.
+
+As of this run no disagreement is recorded: the SF1 and SF10 verifications were taken with the single-engine oracle, before #507, so the list starts empty and the first entry will come from a re-run.
+
 ## Not yet measured
 
 - The rowstore layout.

@@ -401,17 +401,36 @@ def recreate_database_statements(cfg, args):
     # before CREATE, SET RECOVERY SIMPLE and SET QUERY_STORE = OFF, leaving the
     # old database in SINGLE_USER with no connection holding it. Unusable until
     # someone issued SET MULTI_USER by hand, and a re-run hit the same pair.
-    # Now the CATCH puts it back and re-raises, so the failure is reported and
-    # the database is left as it was found.
-    batch = ("DECLARE @n sysname = N'" + db + "'; DECLARE @sql nvarchar(max); "
+    #
+    # The restore has a TRY of its OWN (review of #548 item 2): the window this
+    # fix is for is another session taking the database's only connection, and
+    # that same session makes `SET MULTI_USER` fail with 5064 -- raised INSIDE
+    # the CATCH, where it escapes and replaces the DROP's own error with the
+    # restore's. Measured on the 2019 engine with a session holding the single
+    # connection: `WITH ROLLBACK IMMEDIATE` does NOT get past it either (5064,
+    # then 5069 `ALTER DATABASE statement failed`) -- in single-user mode the
+    # ALTER cannot get in at all, so there is nothing for the termination
+    # clause to terminate. It is sent anyway, for the windows where the
+    # blocker is work inside the database rather than the connection; what
+    # makes the failure legible is the nested TRY, which keeps the DROP's
+    # reason, says the database is left in SINGLE_USER, and names the
+    # statement that puts it back.
+    batch = ("DECLARE @n sysname = N'" + db + "'; DECLARE @sql nvarchar(max), @why nvarchar(2048); "
              "IF DB_ID(@n) IS NOT NULL BEGIN "
              "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET SINGLE_USER WITH ROLLBACK IMMEDIATE'; "
              "EXEC (@sql); "
              "BEGIN TRY SET @sql = N'DROP DATABASE ' + QUOTENAME(@n); EXEC (@sql); END TRY "
              "BEGIN CATCH "
+             "SET @why = N'could not drop ' + QUOTENAME(@n) + N': ' + ERROR_MESSAGE(); "
+             "BEGIN TRY "
              "IF DB_ID(@n) IS NOT NULL BEGIN "
-             "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET MULTI_USER'; EXEC (@sql); END; "
-             "THROW; END CATCH; END; "
+             "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) "
+             "+ N' SET MULTI_USER WITH ROLLBACK IMMEDIATE'; EXEC (@sql); END; "
+             "END TRY BEGIN CATCH "
+             "SET @why = LEFT(@why + N' -- and it is LEFT IN SINGLE_USER (' + ERROR_MESSAGE() "
+             "+ N') -- run: ALTER DATABASE ' + QUOTENAME(@n) + N' SET MULTI_USER', 2048); "
+             "END CATCH; "
+             "THROW 50000, @why, 1; END CATCH; END; "
              "SET @sql = N'CREATE DATABASE ' + QUOTENAME(@n)" + collate + "; EXEC (@sql); "
              "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET RECOVERY SIMPLE'; EXEC (@sql); "
              "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET QUERY_STORE = OFF'; EXEC (@sql);")
@@ -841,7 +860,7 @@ def rotated(clients, rep):
     return clients[k:] + clients[:k]
 
 
-def preserved_rows(path, clients):
+def preserved_rows(path, clients, db):
     """The rows of an existing timings.csv this invocation must not lose.
 
     Issue #507 item 4. `run` opened timings.csv in "w" and wrote only the
@@ -853,11 +872,25 @@ def preserved_rows(path, clients):
 
     The rows of the clients this invocation measures ARE replaced; every other
     client's are kept.
+
+    A kept row of ANOTHER database refuses the whole run (review of #548 item
+    3). Keeping by client alone put two schemas in one file -- re-run
+    `--run-id sf10 --clients B run` against a second schema and A, Bscan and C
+    keep the old database's rows while B gets the new one's -- and `report`
+    groups by client and query only, so it would compare medians across two
+    databases with nothing saying so. Refusing is better than dropping them:
+    the rows may be the only copy of a published measurement.
     """
     if not path.exists():
         return []
     with open(path, newline="") as f:
-        return [r for r in csv.DictReader(f) if r.get("client") not in clients]
+        kept = [r for r in csv.DictReader(f) if r.get("client") not in clients]
+    foreign = sorted({r.get("db", "") for r in kept if r.get("db") and r.get("db") != db})
+    if foreign:
+        sys.exit(f"error: {path} holds rows of {', '.join(foreign)} and this run measures {db}. "
+                 f"A report over both would compare medians across databases. Use another "
+                 f"--run-id for {db}, or move that file aside.")
+    return kept
 
 
 def cmd_run(args):
@@ -874,7 +907,7 @@ def cmd_run(args):
     # in this file was a ValueError in same(). The harness also sets
     # mssql_query_timeout = 0, so --timeout per session is the only ceiling.
     path = out / "timings.csv"
-    kept = preserved_rows(path, clients)
+    kept = preserved_rows(path, clients, args.db)
     errored = 0
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["run", "db", "client", "rep", "query", "seconds", "error"])
@@ -1158,13 +1191,30 @@ def write_client(cfg, args, out, client, queries):
     return None
 
 
+#: Which oracle grades a client when the two engines disagree about a query.
+#:
+#: Review of #548's question. A disagreement is reported as itself and counted
+#: once, but leaving every client UNGRADED on that query means a permanent
+#: 1.5.6-vs-2.0 difference -- the type of q17's `0.2*avg(...)`, say -- takes
+#: that query out of the comparison for good, for every client, and a real
+#: wrong answer inside it would never be seen again.
+#:
+#: So each client is still graded, against the oracle of the engine IT runs on,
+#: and the verdict says `split oracle` so the weaker guarantee is visible in
+#: the line itself: client A's answers are then checked against 1.5.6 (its own
+#: engine, which is what #507 item 2 is about) and B / Bscan / C against 2.0.
+#: The disagreement above it is the thing to fix; until it is, this is coverage
+#: with its own name on it rather than a silent hole.
+SPLIT_ORACLE = {"A": "A", "B": "B", "Bscan": "B", "C": "B"}
+
+
 def print_verdicts(out, clients, queries, sessions, agreed, disputed):
     """-> how many verdicts were not an `ok`.
 
     A query the oracle engines disagree about is counted ONCE, as its own
-    failure, and no client is graded on it: grading it would publish an engine
-    difference as a wrong answer by whichever client sat on the other side
-    (issue #507 item 2).
+    failure, so a disagreement cannot be mistaken for a clean run (issue #507
+    item 2). Each client is still graded on it, against its own engine's
+    oracle and labelled `split oracle` (see SPLIT_ORACLE).
     """
     bad = len(disputed)
     for q in queries:
@@ -1174,10 +1224,17 @@ def print_verdicts(out, clients, queries, sessions, agreed, disputed):
         if client in sessions:
             print(f"{client:6s} --- {sessions[client]}")
         for q in queries:
+            split = ""
             if q in disputed:
-                print(f"{client:6s} {q} not graded (the oracle engines disagree)")
-                continue
-            oracle_path, types = agreed[q]
+                which = SPLIT_ORACLE.get(client, ORACLES[0])
+                oracle_path = out / f"oracle-{which}-{q}.csv"
+                types = read_types(out / f"types-{which}-{q}.csv")
+                split = f" [split oracle: {which}]"
+                if not oracle_path.exists():
+                    print(f"{client:6s} {q} not graded (oracle {which} produced no answer)")
+                    continue
+            else:
+                oracle_path, types = agreed[q]
             # `verdict != "ok"` rejected compare()'s OWN accepting verdict for
             # a reordered result, so a tie emitted in the other order failed the
             # run while every per-query line still read `ok` -- teaching the
@@ -1186,7 +1243,7 @@ def print_verdicts(out, clients, queries, sessions, agreed, disputed):
             verdict = compare(oracle_path, out / f"{client}-{q}.csv", types)
             if not verdict.startswith("ok"):
                 bad += 1
-            print(f"{client:6s} {q} {verdict}")
+            print(f"{client:6s} {q} {verdict}{split}")
     return bad
 
 
@@ -2184,6 +2241,7 @@ def _check_schema_sql():
 
     cfg = {"host": "h", "port": "1433", "user": "sa", "password": "p"}
     recreate = " ".join(recreate_database_statements(cfg, cs))
+    recreate_batch = recreate
     failures += _check("the DROP sits in a TRY whose CATCH restores MULTI_USER",
                        "BEGIN TRY" in recreate and "SET MULTI_USER" in recreate
                        and recreate.index("DROP DATABASE") < recreate.index("SET MULTI_USER"),
@@ -2198,6 +2256,25 @@ def _check_schema_sql():
                        and batch.index("SET MULTI_USER") < batch.rindex("FETCH NEXT"),
                        "the loop continues")
     failures += _check("and counts what it could not drop", "@failed" in batch, "@failed")
+
+    # Review of #548 items 1 and 2, in both batches that drop a database.
+    for what, batch in (("recreate", recreate_batch), ("drop", drop_batch(
+            "SELECT name FROM sys.databases WHERE name LIKE N'tpch[_]sf%'"))):
+        failures += _check(f"{what}: the reason is THROWN, since a PRINT never reaches the CLI",
+                           "THROW 50000" in batch and "PRINT" not in batch,
+                           "THROW 50000")
+        failures += _check(f"{what}: the restore has a TRY of its own, so a 5064 cannot escape",
+                           batch.count("BEGIN TRY") == 2 and batch.count("BEGIN CATCH") == 2,
+                           f"{batch.count('BEGIN TRY')} TRY / {batch.count('BEGIN CATCH')} CATCH")
+        failures += _check(f"{what}: a failed restore says so and names the way back",
+                           "LEFT IN SINGLE_USER" in batch and "SET MULTI_USER'" in batch,
+                           "run: ALTER DATABASE ... SET MULTI_USER")
+    failures += _check("drop reports every failure, not only the last",
+                       "@msgs = LEFT(@msgs" in drop_batch("SELECT name FROM sys.databases"),
+                       "collected into @msgs")
+    failures += _check("and it still drops the databases after the one that failed",
+                       drop_batch("x").index("END CATCH") < drop_batch("x").rindex("FETCH NEXT"),
+                       "the loop continues")
 
     counts = row_count_statement()
     failures += _check("the eight row counts are one statement the server answers",
@@ -2251,22 +2328,47 @@ def _check_oracle(tmp):
     failures += _check("so is an engine that produced no answer",
                        "q04" in disputed, disputed.get("q04", "ACCEPTED")[:44])
 
-    # And the verdicts: a disputed query is counted once, whatever the client
-    # answered, and the client is not graded on it.
+    # And the verdicts. A disagreement is counted ONCE, however many clients
+    # read that query; each client is still graded, against the oracle of the
+    # engine it runs on, and the line says so (review of #548's question).
+    # Here the two clients answer q02 differently and BOTH are right: A agrees
+    # with 1.5.6, B with 2.0, which is what the disagreement means.
+    _write_rows(out / "A-q01.csv", [["a", "1.00"]])
     _write_rows(out / "B-q01.csv", [["a", "1.00"]])
-    _write_rows(out / "B-q02.csv", [["566012345678.34"]])
+    _write_rows(out / "A-q02.csv", [["566012345678.34"]])
+    _write_rows(out / "B-q02.csv", [["566012345678.35"]])
+    _write_rows(out / "A-q03.csv", [["1.00"]])
+    _write_rows(out / "B-q03.csv", [["1.00"]])
+    _write_rows(out / "A-q04.csv", [["1.00"]])
+    _write_rows(out / "B-q04.csv", [["1.00"]])
     text = io.StringIO()
     with contextlib.redirect_stdout(text):
-        bad = print_verdicts(out, ["B"], queries, {}, agreed, disputed)
+        bad = print_verdicts(out, ["A", "B"], queries, {}, agreed, disputed)
     lines = text.getvalue().splitlines()
     failures += _check("each disagreement is counted once, not once per client",
-                       bad == len(disputed), f"{bad} of {len(queries)} queries")
-    failures += _check("and the client's own answer to it is not judged",
-                       sum(1 for l in lines if "not graded" in l) == len(disputed),
-                       "3 not graded")
-    failures += _check("the query both engines agreed on is still judged",
+                       bad == len(disputed), f"{bad} bad for {len(disputed)} disagreement(s)")
+    # A is graded on all three disputed queries (its own engine answered every
+    # one); B on the two its engine answered, q04 being the one it did not.
+    failures += _check("every client is still graded against its own engine's oracle",
+                       sum(1 for l in lines if "[split oracle: A]" in l) == 3
+                       and sum(1 for l in lines if "[split oracle: B]" in l) == 2,
+                       "A on q02-q04, B on q02-q03")
+    failures += _check("and both answers to the disputed query pass, each against its own",
+                       all(" ok [split oracle" in l for l in lines if "q02" in l and "oracle" not in l[:7]),
+                       "A ok, B ok")
+    failures += _check("a client whose own engine answered nothing is not graded",
+                       sum(1 for l in lines if "not graded (oracle B produced no answer)" in l) == 1,
+                       "B q04 not graded")
+    failures += _check("the query both engines agreed on carries no label",
                        any(l.startswith("B") and "q01" in l and l.endswith("ok") for l in lines),
                        "B q01 ok")
+    # A wrong answer on a disputed query is still a mismatch: the split oracle
+    # is coverage, not an exemption.
+    _write_rows(out / "B-q02.csv", [["999.99"]])
+    with contextlib.redirect_stdout(io.StringIO()):
+        worse = print_verdicts(out, ["A", "B"], queries, {}, agreed, disputed)
+    failures += _check("a wrong answer under a split oracle still counts",
+                       worse == bad + 1, f"{worse} vs {bad}")
     return failures
 
 
@@ -2280,7 +2382,7 @@ def _check_run_files(tmp):
         w = csv.DictWriter(fh, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
-    kept = preserved_rows(path, ["B"])
+    kept = preserved_rows(path, ["B"], "d")
     held = sorted({r["client"] for r in kept})
     failures = _check("the clients this run does not measure keep their rows",
                       held == ["A", "Bscan", "C"], f"{len(kept)} row(s) of {', '.join(held)}")
@@ -2289,9 +2391,21 @@ def _check_run_files(tmp):
     failures += _check("the re-measured client's rows are replaced, not doubled",
                        all(r["client"] != "B" for r in kept), "no B rows kept")
     failures += _check("a four-client re-run keeps nothing, having measured it all",
-                       preserved_rows(path, ["A", "B", "Bscan", "C"]) == [], "[]")
+                       preserved_rows(path, ["A", "B", "Bscan", "C"], "d") == [], "[]")
     failures += _check("and a first run starts from nothing",
-                       preserved_rows(tmp / "absent.csv", ["B"]) == [], "[]")
+                       preserved_rows(tmp / "absent.csv", ["B"], "d") == [], "[]")
+
+    # Review of #548 item 3: the kept rows must be of the SAME database, or
+    # `report` compares medians across two schemas with nothing saying so.
+    try:
+        preserved_rows(path, ["B"], "tpch_sf10_columnstore_utf8")
+        why = "ACCEPTED"
+    except SystemExit as exc:
+        why = str(exc)
+    failures += _check("a kept row of another database refuses the run, naming both",
+                       "d" in why and "tpch_sf10_columnstore_utf8" in why, why[:52])
+    failures += _check("and it refuses rather than dropping the rows",
+                       "--run-id" in why and path.exists(), "the file is untouched")
     return failures
 
 
@@ -2551,7 +2665,20 @@ def drop_batch(target):
     database was abandoned. Now a failure puts its own database back, says
     why, and the loop goes on to the next.
     """
-    return ("DECLARE @n sysname, @sql nvarchar(max), @failed int = 0; "
+    # Each failure is COLLECTED and the batch ends by throwing them (review of
+    # #548 item 1). They used to go to `PRINT`, and `mssql_exec` does not hand
+    # a server's PRINT / RAISERROR <= 10 to the CLI at all -- it logs them into
+    # `duckdb_logs` at INFO (`src/mssql_functions.cpp`, `LogTdsInfo`), and this
+    # session enables no logging. So the operator was told `FAIL: 1
+    # database(s) not dropped` and never which one or why. An ERROR does reach
+    # the CLI: `mssql_exec` throws on it, and the `@@LEFT` query after this one
+    # still runs, because the CLI does not bail on error for piped stdin.
+    #
+    # The restore has a TRY of its own, as in `recreate_database_statements`
+    # and for the same reason (item 2): a 5064 raised inside the CATCH used to
+    # escape it and abort the cursor loop -- abandoning every later database,
+    # which is the second half of what issue #507 item 5 fixes.
+    return ("DECLARE @n sysname, @sql nvarchar(max), @failed int = 0, @msgs nvarchar(2048) = N''; "
             f"DECLARE c CURSOR LOCAL FAST_FORWARD FOR {target}; OPEN c; FETCH NEXT FROM c INTO @n; "
             "WHILE @@FETCH_STATUS = 0 BEGIN "
             "BEGIN TRY "
@@ -2559,12 +2686,19 @@ def drop_batch(target):
             "DROP DATABASE ' + QUOTENAME(@n); EXEC (@sql); "
             "END TRY BEGIN CATCH "
             "SET @failed = @failed + 1; "
+            "SET @msgs = LEFT(@msgs + N'could not drop ' + QUOTENAME(@n) + N': ' + ERROR_MESSAGE(), 2048); "
+            "BEGIN TRY "
             "IF DB_ID(@n) IS NOT NULL BEGIN "
-            "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET MULTI_USER'; EXEC (@sql); END; "
-            "PRINT N'could not drop ' + QUOTENAME(@n) + N': ' + ERROR_MESSAGE(); "
+            "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) "
+            "+ N' SET MULTI_USER WITH ROLLBACK IMMEDIATE'; EXEC (@sql); END; "
+            "END TRY BEGIN CATCH "
+            "SET @msgs = LEFT(@msgs + N' -- and it is LEFT IN SINGLE_USER (' + ERROR_MESSAGE() "
+            "+ N') -- run: ALTER DATABASE ' + QUOTENAME(@n) + N' SET MULTI_USER', 2048); "
+            "END CATCH; "
+            "SET @msgs = LEFT(@msgs + N'; ', 2048); "
             "END CATCH; "
             "FETCH NEXT FROM c INTO @n; END; CLOSE c; DEALLOCATE c; "
-            "IF @failed > 0 PRINT N'left ' + CAST(@failed AS nvarchar(10)) + N' database(s) in place';")
+            "IF @failed > 0 THROW 50000, @msgs, 1;")
 
 
 def cmd_drop(args):
@@ -2595,7 +2729,9 @@ def cmd_drop(args):
     if found is None:
         sys.exit("error: could not read how many databases are left (see the output above)")
     if int(found.group(1)):
-        sys.exit(f"FAIL: {found.group(1)} database(s) not dropped; the PRINT lines above say why")
+        # The reasons are in the output above as an ERROR, thrown by the batch:
+        # `mssql_exec` logs a PRINT and prints nothing (review of #548 item 1).
+        sys.exit(f"FAIL: {found.group(1)} database(s) not dropped; the error above says why")
     print(f"dropped: {what}")
     sys.exit(0)
 
