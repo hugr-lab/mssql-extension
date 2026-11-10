@@ -14,8 +14,10 @@
 
 #include "backup/backup_catalog_model.hpp"
 #include "backup/backup_collation.hpp"
+#include "backup/backup_function_common.hpp"
 #include "backup/backup_opened.hpp"
 #include "backup/backup_sql_variant.hpp"
+#include "codec/code_page/code_page.hpp"
 #include "duckdb.hpp"
 
 using namespace duckdb;
@@ -209,6 +211,69 @@ int main() {
 			  "DQ-11 keeps back: an encrypted view, a procedure, a trigger, a function and its return table's "
 			  "computed column, an MS-shipped view, a plain column, another object's boundaries, another class, "
 			  "another subobjid or valnum");
+	}
+
+	// A sql_variant's value as TYPE mssql reads its base type (D6): the partition boundaries of the
+	// partitioning fixture (2022), byte for byte.
+	{
+		auto text = [](const std::vector<int> &bytes) {
+			return SqlVariantValue(ParseSqlVariant(Bytes(bytes), "v"), "v");
+		};
+		auto show = [](const Value &v) { return v.type().ToString() + " " + v.ToString(); };
+		const Value dt2 = text({0x2a, 0x01, 0x07, 0xff, 0xbf, 0x69, 0x2a, 0xc9, 0x3e, 0x49, 0x0b});
+		const Value dto = text({0x2b, 0x01, 0x00, 0x60, 0x35, 0x01, 0x3e, 0x49, 0x0b, 0x78, 0x00});
+		const Value dt = text({0x3d, 0x01, 0xff, 0x81, 0x8b, 0x01, 0xe3, 0xb3, 0x00, 0x00});
+		const Value sdt = text({0x3a, 0x01, 0x9f, 0x05, 0xe3, 0xb3});
+		const Value tm = text({0x29, 0x01, 0x03, 0xf4, 0x2f, 0x93, 0x02});
+		const Value dec = text({0x6a, 0x01, 0x0a, 0x02, 0x00, 0x0d, 0x02, 0, 0, 0, 0, 0, 0});
+		const Value guid = text({0x24, 0x01, 0xff, 0x19, 0x96, 0x6f, 0x86, 0x8b, 0x11, 0xd0, 0xb4, 0x2d, 0x00, 0xc0,
+								 0x4f, 0xc9, 0x64, 0xff});
+		const Value bin = text({0xa5, 0x01, 0x08, 0x00, 0xff, 0x00, 0xff});
+		const Value vc = text({0xa7, 0x01, 0x0a, 0x00, 0x08, 0xd0, 0x00, 0x34, 0x47});
+		const Value nvc = text({0xe7, 0x01, 0x28, 0x00, 0x08, 0xd0, 0x00, 0x34, 0x16, 0x04, 0x43, 0x04, 0x3a, 0x04});
+		const Value tiny = text({0x30, 0x01, 0xff});
+		Check(show(dt2) == "TIMESTAMP_NS 2026-01-31 23:59:59.9999999" &&
+				  dto.type().id() == LogicalTypeId::TIMESTAMP_TZ &&
+				  dto.GetValue<timestamp_tz_t>().value ==
+					  Timestamp::FromDatetime(Date::FromDate(2026, 1, 31), dtime_t(22LL * 3600 * 1000000)).value &&
+				  show(dt) == "TIMESTAMP 2026-01-31 23:59:59.996666" && show(sdt) == "TIMESTAMP 2026-01-31 23:59:00" &&
+				  show(tm) == "TIME 12:00:00.5" && show(dec) == "DECIMAL(10,2) -5.25" &&
+				  show(guid) == "UUID 6f9619ff-8b86-d011-b42d-00c04fc964ff" && bin.type().id() == LogicalTypeId::BLOB &&
+				  bin.GetValueUnsafe<string_t>().GetString() == std::string("\xff\x00\xff", 3) &&
+				  show(vc) == "VARCHAR G" && show(nvc) == "VARCHAR \xd0\x96\xd1\x83\xd0\xba" &&
+				  show(tiny) == "UTINYINT 255",
+			  "sql_variant values as D6 types: datetime2(7) to the 100 ns, datetimeoffset at its UTC instant, "
+			  "datetime and smalldatetime in record form, time(3), a negative decimal, a GUID in SQL Server's "
+			  "order, varbinary, a code-page varchar, a Cyrillic nvarchar, tinyint (" +
+				  show(dt2) + ", " + show(tm) + ")");
+		// Refused by name, never a wrong or NULL value (D13): a datetime2(7) past TIMESTAMP_NS's 1677-2262
+		// (9999-12-31, a common sentinel; 0001-01-01), a decimal with more digits than its precision.
+		Check(ErrorOf([&]() {
+				  text({0x2a, 0x01, 0x07, 0, 0, 0, 0, 0, 0xda, 0xb9, 0x37});
+			  }).find("1677-2262") != std::string::npos &&
+				  ErrorOf([&]() {
+					  text({0x2a, 0x01, 0x07, 0, 0, 0, 0, 0, 0, 0, 0});
+				  }).find("1677-2262") != std::string::npos &&
+				  ErrorOf([&]() {
+					  text({0x6a, 0x01, 0x02, 0x00, 0x01, 0x64, 0, 0, 0});
+				  }).find("more than 2 digits") != std::string::npos &&
+				  text({0x6a, 0x01, 0x02, 0x00, 0x01, 0x63, 0, 0, 0}).ToString() == "99",
+			  "a datetime2(7) at 9999-12-31 or 0001-01-01 and a decimal(2, 0) of 100 are refused; 99 is not");
+		Check(ErrorOf([&]() {
+				  text({0xa7, 0x01, 0x01, 0x00, 0x05, 0x00, 0x00, 0x7f, 0x47});
+			  }).find("does not know") != std::string::npos,
+			  "a varchar of an unknown collation is refused by name");
+		const CollationRow *japanese = mssql::codec::code_page::FindCollationByName("Japanese_CI_AS", 14);
+		std::string error = "no Japanese_CI_AS";
+		if (japanese) {
+			const uint32_t id = static_cast<uint32_t>(japanese->collation_id);
+			error = ErrorOf([&]() {
+				text({0xa7, 0x01, 0x01, 0x00, static_cast<int>(id & 0xff), static_cast<int>((id >> 8) & 0xff),
+					  static_cast<int>((id >> 16) & 0xff), static_cast<int>(id >> 24), 0x47});
+			});
+		}
+		Check(error.find("code page 932") != std::string::npos && error.find("086") != std::string::npos,
+			  "a varchar of a double-byte code page is refused, naming spec 086: " + error);
 	}
 
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;

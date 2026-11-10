@@ -6,7 +6,7 @@
 // execution reads the file anew; the opened-file cache shared across statements is task 22. Columns
 // whose source is a later PR are NULL until it lands: fuzzy_status / open_transactions /
 // stale_transactions (D11, PR 5), allocation_units.live_pages (a unit's IAM chain is walked at its
-// table's first scan, DQ-40, not to list it), partitioning (PR 2c). A column's DuckDB type is D6's:
+// table's first scan, DQ-40, not to list it). A column's DuckDB type is D6's:
 // MSSQLColumnInfo::MapSQLServerTypeToDuckDB, TYPE mssql's map with native types off (a plain VARCHAR
 // where mssql_catalog_native_types reports MSSQL_NVARCHAR(n)).
 
@@ -16,6 +16,7 @@
 #include "backup/backup_collation.hpp"
 #include "backup/backup_function_common.hpp"
 #include "backup/backup_opened.hpp"
+#include "backup/backup_sql_variant.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -86,6 +87,16 @@ LogicalType PartitioningType() {
 	f.emplace_back("boundaries", LogicalType::LIST(LogicalType::VARIANT()));
 	f.emplace_back("destinations", LogicalType::LIST(LogicalType::VARCHAR));
 	f.emplace_back("next_used", LogicalType::VARCHAR);
+	f.emplace_back("reason", LogicalType::VARCHAR);
+	return LogicalType::STRUCT(std::move(f));
+}
+
+LogicalType PartitionStructType() {
+	child_list_t<LogicalType> f;
+	f.emplace_back("partition_number", LogicalType::INTEGER);
+	f.emplace_back("rows", LogicalType::BIGINT);
+	f.emplace_back("compression", LogicalType::VARCHAR);
+	f.emplace_back("filegroup", LogicalType::VARCHAR);
 	return LogicalType::STRUCT(std::move(f));
 }
 
@@ -106,7 +117,8 @@ std::vector<Column> TableColumns() {
 			{"stale_transactions", LogicalType::INTEGER},
 			{"columns", LogicalType::LIST(ColumnStructType())},
 			{"allocation_units", LogicalType::LIST(UnitStructType())},
-			{"partitioning", PartitioningType()}};
+			{"partitioning", PartitioningType()},
+			{"partitions", LogicalType::LIST(PartitionStructType())}};
 }
 
 std::vector<Column> ViewColumns() {
@@ -169,33 +181,6 @@ std::string UnitTypeName(uint8_t type) {
 
 Value PointerValue(const PagePointer &p) {
 	return p.IsNull() ? Value(LogicalType::VARCHAR) : Value(p.ToString());
-}
-
-//! The type as T-SQL declares it: a system type with its length, precision or scale; an alias or a
-//! CLR type by its own name.
-std::string SqlType(const CatalogColumn &c) {
-	if (c.system_type_name.empty() || c.type_name != c.system_type_name) {
-		return c.type_name;
-	}
-	switch (c.system_type_id) {
-	case 165:  // varbinary
-	case 167:  // varchar
-	case 173:  // binary
-	case 175:  // char
-		return c.type_name + "(" + (c.max_length < 0 ? std::string("max") : std::to_string(c.max_length)) + ")";
-	case 231:  // nvarchar
-	case 239:  // nchar
-		return c.type_name + "(" + (c.max_length < 0 ? std::string("max") : std::to_string(c.max_length / 2)) + ")";
-	case 106:  // decimal
-	case 108:  // numeric
-		return c.type_name + "(" + std::to_string(c.precision) + "," + std::to_string(c.scale) + ")";
-	case 41:  // time
-	case 42:  // datetime2
-	case 43:  // datetimeoffset
-		return c.type_name + "(" + std::to_string(c.scale) + ")";
-	default:
-		return c.type_name;
-	}
 }
 
 //! Why the scan cannot read column `c` (spec 085 § Scope's refusals), or "".
@@ -269,7 +254,8 @@ Value ColumnValue(const CatalogColumn &c) {
 	child_list_t<Value> f;
 	f.emplace_back("column_id", Value::INTEGER(c.column_id));
 	f.emplace_back("name", Text(c.name));
-	f.emplace_back("sql_type", Text(SqlType(c)));
+	f.emplace_back("sql_type", Text(SqlTypeText(c.type_name, c.system_type_name, c.system_type_id, c.max_length,
+												c.precision, c.scale)));
 	f.emplace_back("system_type_id", Value::INTEGER(c.system_type_id));
 	f.emplace_back("max_length", Value::INTEGER(c.max_length));
 	f.emplace_back("precision", Value::INTEGER(c.precision));
@@ -303,6 +289,59 @@ Value UnitValue(const CatalogUnit &u) {
 	return Value::STRUCT(std::move(f));
 }
 
+//! A partitioned table's partitioning (NULL on a filegroup): its boundaries as VARIANTs of the
+//! parameter's DuckDB type; with a reason, the boundaries NULL (D13: named, never guessed).
+Value PartitioningValue(const CatalogTable &t) {
+	if (!t.partitioned) {
+		return Value(PartitioningType());
+	}
+	const CatalogPartitioning &p = t.partitioning;
+	std::string reason = p.reason;
+	Value boundaries(LogicalType::LIST(LogicalType::VARIANT()));
+	if (reason.empty()) {
+		vector<Value> values;
+		try {
+			for (size_t i = 0; i < p.boundaries.size(); i++) {
+				const std::string what = "boundary " + std::to_string(i + 1) + " of " + p.function_name;
+				values.push_back(SqlVariantValue(ParseSqlVariant(p.boundaries[i], what), what)
+									 .DefaultCastAs(LogicalType::VARIANT()));
+			}
+			boundaries = Value::LIST(LogicalType::VARIANT(), std::move(values));
+		} catch (FormatError &e) {
+			reason = e.what();
+			if (reason.compare(0, 8, "backup: ") == 0) {
+				reason = reason.substr(8);
+			}
+		}
+	} else if (reason.compare(0, 8, "backup: ") == 0) {
+		reason = reason.substr(8);
+	}
+	// With a reason, no list is given: neither boundaries nor destinations (D13, never a partial one).
+	Value destinations(LogicalType::LIST(LogicalType::VARCHAR));
+	if (reason.empty()) {
+		vector<Value> names;
+		for (const auto &d : p.destinations) {
+			names.push_back(Value(d));
+		}
+		destinations = Value::LIST(LogicalType::VARCHAR, std::move(names));
+	}
+	child_list_t<Value> f;
+	f.emplace_back("function_name", OptionalText(p.function_name));
+	f.emplace_back("scheme_name", OptionalText(p.scheme_name));
+	f.emplace_back("column_name", OptionalText(p.column_name));
+	f.emplace_back("column_id", p.column_id ? Value::INTEGER(p.column_id) : Value(LogicalType::INTEGER));
+	f.emplace_back("parameter_type",
+				   OptionalText(SqlTypeText(p.parameter_type_name, p.parameter_system_type_name, p.parameter_xtype,
+											p.parameter_length, p.parameter_precision, p.parameter_scale)));
+	f.emplace_back("range_right",
+				   p.function_name.empty() ? Value(LogicalType::BOOLEAN) : Value::BOOLEAN(p.range_right));
+	f.emplace_back("boundaries", boundaries);
+	f.emplace_back("destinations", destinations);
+	f.emplace_back("next_used", OptionalText(p.next_used));
+	f.emplace_back("reason", OptionalText(reason));
+	return Value::STRUCT(std::move(f));
+}
+
 std::vector<Value> TableRow(const CatalogTable &t) {
 	std::string compression;
 	for (const auto &p : t.partitions) {
@@ -333,7 +372,17 @@ std::vector<Value> TableRow(const CatalogTable &t) {
 	row.push_back(Value(LogicalType::INTEGER));	 // stale_transactions
 	row.push_back(Value::LIST(ColumnStructType(), std::move(columns)));
 	row.push_back(Value::LIST(UnitStructType(), std::move(units)));
-	row.push_back(Value(PartitioningType()));  // PR 2c
+	row.push_back(PartitioningValue(t));
+	vector<Value> partitions;
+	for (const auto &p : t.partitions) {
+		child_list_t<Value> f;
+		f.emplace_back("partition_number", Value::INTEGER(p.partition_number));
+		f.emplace_back("rows", p.rows < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(p.rows));
+		f.emplace_back("compression", Text(CompressionName(p.compression)));
+		f.emplace_back("filegroup", OptionalText(p.filegroup));
+		partitions.push_back(Value::STRUCT(std::move(f)));
+	}
+	row.push_back(Value::LIST(PartitionStructType(), std::move(partitions)));
 	return row;
 }
 

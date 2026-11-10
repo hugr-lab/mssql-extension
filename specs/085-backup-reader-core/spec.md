@@ -490,11 +490,19 @@ int64 -- a statistic, so the table is read all the same), `created`, `modified`,
 - `allocation_units LIST(STRUCT(au_id, type, rowset_id, index_id, partition_number, compression,
   filegroup_id, first_page, root_page, first_iam_page, live_pages))`;
 - `partitioning STRUCT(function_name, scheme_name, column_name, column_id, parameter_type,
-  range_right BOOLEAN, boundaries LIST(VARIANT), destinations LIST(VARCHAR), next_used VARCHAR)`, NULL
-  for a table on a filegroup (E7§2, § Rules, catalog). Boundaries are listed in their current order;
+  range_right BOOLEAN, boundaries LIST(VARIANT), destinations LIST(VARCHAR), next_used VARCHAR,
+  reason VARCHAR)`, NULL for a table on a filegroup (E7§2, § Rules, catalog). Each boundary is a VARIANT
+  of the DuckDB type TYPE mssql reads the parameter's type as (D6: `datetime2(7)` a TIMESTAMP_NS to the
+  100 ns, `datetimeoffset` a TIMESTAMP_TZ at its UTC instant). `reason` names why the partitioning cannot
+  be given -- a boundary the reader cannot decode (a double-byte varchar: 086), a function whose
+  boundaries, destinations or partitions do not agree with its fanout -- and then the boundaries are NULL,
+  never a guessed or partial list (D13). Boundaries are listed in their current order;
   their ids are positional and renumbered by SPLIT / MERGE, so a consumer compares value lists, never
   ids (E7§6). The base index's data space only: a non-aligned nonclustered index is not reported (the
   scan never reads it). Deriving a DuckLake spec from it is mssql-ducklake's (022 D5).
+- `partitions LIST(STRUCT(partition_number, rows, compression, filegroup))` (PR 2c): every table's base
+  partitions, one for a table on a filegroup; `rows` sums a columnstore partition's compressed and delta
+  rowsets; `filegroup` is its in-row unit's (= the scheme's destination, E7).
 
 `mssql_backup_views(path)`: `schema_name`, `view_name`, `object_id`, `definition` (`VARCHAR`, the
 T-SQL text from `sysobjvalues`, X§4), `is_encrypted`, `created`, `modified`. A `WITH ENCRYPTION` view
@@ -920,8 +928,15 @@ offsets above are in its fixed part.
   datetime, …), 1-byte scale (time, datetime2, datetimeoffset), precision + scale (decimal), u16 maximum
   length (binary), u16 maximum length + u32 collation (strings). The catalog's own sql_variant reader
   (ADD COLUMN defaults, boundaries) decodes it; E7 exercised int, bigint, date, datetime,
-  datetime2(0/3/7), datetimeoffset(0), varchar and nvarchar; decimal, uniqueidentifier, binary and
-  time boundaries ship behind fixtures (E7§7). A boundary that cannot be decoded refuses the table's
+  datetime2(0/3/7), datetimeoffset(0), varchar and nvarchar; the partitioning fixture
+  (`test/backup/gen/partition.sql`, 2026-11-10) adds decimal, uniqueidentifier, varbinary, time,
+  smalldatetime and tinyint. Measured there: a datetime or smalldatetime value is in its record form (ticks
+  then days, minutes then days), a datetimeoffset its UTC time, date and offset in minutes, a GUID in SQL
+  Server's byte order, a time(3) four bytes -- each as a record or TDS stores it; and **a varbinary
+  boundary is stored without its trailing zero bytes** (`0x8000` is `0x80`, which is how
+  `sys.partition_range_values` prints it too; for an importer: DuckDB orders BLOBs with trailing zero bytes
+  as greater, SQL Server compares a varbinary without them, so a RANGE LEFT edge differs). A boundary
+  that cannot be decoded refuses the table's
   `partitioning` by name, never a NULL boundary (D13).
 - A table = `sysschobjs` type `'U '`; its base rowsets = `sysrowsets` with `idmajor` = object id and
   `idminor` ∈ {0 heap, 1 clustered}, one per partition (`numpart`); allocation units by `ownerid` =
@@ -1265,6 +1280,20 @@ is pushed.
 12b. The partitioning model of E7 (functions, typed boundaries through the catalog's sql_variant
     reader, schemes, destinations, index data spaces, the partition column), the `partitioning`
     column and E7's verify as a test — 2 d
+
+*PR 2c as landed (2026-11-10).* The model is `backup_catalog_model`'s (`CatalogPartitioning`, checked:
+fanout − 1 boundaries with ids 1..n each once, each of the parameter's own type, every destination of
+1..fanout, as many partitions as the fanout; else `reason`); the values are `SqlVariantValue`
+(`backup_function_common`, D6's types). A partitioned rowstore table is now decodable: each partition has
+its own layout, and an added column's default is looked up by the partition's own rowset (whether
+`sysseobjvalues` holds one row per partition rowset is unmeasured -- no fixture adds a column to a
+partitioned table; a miss refuses the table by name). Rows are decoded per rowset (2d). A datetime2(7)
+boundary outside TIMESTAMP_NS's 1677–2262 (a `9999-12-31` sentinel) is a `reason`, where TYPE mssql's
+read gives NULL; money is a plain little-endian i64 in a sql_variant (measured: 922337203685477.5807). E7's verify is the oracle
+lane's: `compare_catalog.py` against `catalog_golden.sql`'s `.partitioning` / `.boundaries` /
+`.partitions` (function, scheme, column, parameter type, side, fanout, NEXT USED, every boundary as the
+server prints it, every partition's filegroup, rows and compression), 1443 fields on the fixture locally
+(2022). The (partition, column value) multiset of E7's verify needs the rows: 2d's.
 
 *PR 2d — rows*
 

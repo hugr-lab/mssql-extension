@@ -7,8 +7,9 @@
 #   OUT=/tmp/bak IMAGE=mcr.microsoft.com/mssql/server:2022-latest test/backup/gen/generate.sh
 #   OUT=/tmp/bak FIXTURES=samples test/backup/gen/generate.sh  # samples.sql only (the committed set)
 #
-# FIXTURES (default "samples catalog files load large"): samples.sql, the database of the committed
-# samples; catalog.sql, the catalog fixture (spec 085 PR 2b); files.sql, two data files and a second
+# FIXTURES (default "samples catalog partition files load large"): samples.sql, the database of the
+# committed samples; catalog.sql, the catalog fixture (spec 085 PR 2b); partition.sql, E7's partitioning
+# database and more boundary types (PR 2c); files.sql, two data files and a second
 # filegroup, then (files_remove.sql) a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
 # while load_workload.sql commits in the background (a live database: pass 2, a fuzzy tail, the file
 # outgrowing its recorded Size); large.sql, data past one GAM interval (LARGE_ROWS rows of a page each,
@@ -28,7 +29,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
-FIXTURES="${FIXTURES:-samples catalog files load large}"
+FIXTURES="${FIXTURES:-samples catalog partition files load large}"
 LARGE_ROWS="${LARGE_ROWS:-530000}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
@@ -137,7 +138,8 @@ run_sql() {	# $1 = a script of /tmp/gen
 # measured, mssql-tools18 on 2022).
 golden() {	# $1 = database, $2 = set
 	sql -d "$1" -v OUTPREFIX="${DIR}/$2" -s '|' -W -i /tmp/gen/catalog_golden.sql
-	extras+=("$2.tables.txt" "$2.columns.txt" "$2.views.txt" "$2.modules.txt")
+	local kind
+	for kind in tables columns views modules partitioning boundaries partitions; do extras+=("$2.${kind}.txt"); done
 }
 scalar() {	# $1 = a query answering one value
 	sql -h -1 -W -Q "SET NOCOUNT ON; $1" | head -1 | tr -d ' \r'
@@ -166,6 +168,10 @@ for fixture in ${FIXTURES}; do
 	catalog)
 		golden bak_catalog catalog_full
 		sets+=("catalog_full|catalog_full.bak")
+		;;
+	partition)
+		golden bak_partition partition_full
+		sets+=("partition_full|partition_full.bak")
 		;;
 	files)
 		# Two states of one database: the golden of each is taken right after its backup.

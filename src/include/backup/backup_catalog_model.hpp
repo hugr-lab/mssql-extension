@@ -130,8 +130,42 @@ struct CatalogColumn {
 struct CatalogPartition {
 	uint64_t rowset_id = 0;
 	int32_t partition_number = 0;
-	int64_t rows = 0;
-	uint8_t compression = 0;  // sysrowsets.cmprlevel: 0 none, 1 row, 2 page, 3 columnstore, 4 archive
+	int64_t rows =
+		0;	// rcrows of the partition's rowsets of owner types 1 and 3 (a columnstore's delta store); -1 unknown
+	uint8_t compression = 0;   // sysrowsets.cmprlevel: 0 none, 1 row, 2 page, 3 columnstore, 4 archive
+	int16_t filegroup_id = 0;  // its in-row unit's (= the scheme's destination, E7)
+	std::string filegroup;	   // its name (sysclsobjs class 31), "" when not listed
+	//! The partition's own layout, its defaults filled in; only when the table is decodable. Rows are
+	//! decoded per rowset: partitions may differ (in compression, after a SWITCH).
+	RowsetLayout layout;
+};
+
+//! A partitioned table's partitioning (E7; spec 085 § Rules, catalog, partitioning).
+struct CatalogPartitioning {
+	int32_t function_id = 0;
+	std::string function_name;
+	int32_t scheme_id = 0;
+	std::string scheme_name;
+	int32_t column_id = 0;	// the partitioning column (sysiscols' partition ordinal 1)
+	std::string column_name;
+	//! The function's parameter (systypedsubobjs class 30): its type as a column's (TYPE_NAME by utype).
+	uint8_t parameter_xtype = 0;
+	std::string parameter_type_name;
+	std::string parameter_system_type_name;
+	int16_t parameter_length = 0;
+	uint8_t parameter_precision = 0;
+	uint8_t parameter_scale = 0;
+	uint32_t parameter_collation = 0;
+	bool range_right = false;
+	int32_t fanout = 0;	 // partitions; boundaries = fanout - 1
+	//! The boundaries, by boundary id 1..fanout-1 (positional: SPLIT / MERGE renumber them): each a
+	//! sql_variant in the parameter's own type (a varbinary one without its trailing zero bytes, as
+	//! the server stores and prints it).
+	std::vector<std::string> boundaries;
+	std::vector<std::string> destinations;	// filegroup names by destination (= partition number) 1..fanout
+	std::string next_used;					// the destination past the fanout, "" when none
+	//! Why the partitioning cannot be given (D13: named, never a guess); empty otherwise.
+	std::string reason;
 };
 
 //! An allocation unit of one of the table's rowsets (any index), with its rowset's fields.
@@ -153,14 +187,18 @@ struct CatalogTable {
 	std::string modified;
 	TableShape shape = TableShape::Heap;
 	std::vector<CatalogPartition> partitions;  // owner type 1, by partition number
-	int64_t row_count = 0;					   // rcrows of the base rowsets of owner types 1 and 3
-	bool row_count_known = true;			   // false: a count negative, or the sum past int64
-	std::vector<CatalogColumn> columns;		   // by column id
+	//! Its base index's data space is a partition scheme; `partitioning` then describes it.
+	bool partitioned = false;
+	CatalogPartitioning partitioning;
+	int64_t row_count = 0;				 // rcrows of the base rowsets of owner types 1 and 3
+	bool row_count_known = true;		 // false: a count negative, or the sum past int64
+	std::vector<CatalogColumn> columns;	 // by column id
 	std::vector<CatalogUnit> units;
 	//! Whether the scan can read the table; `reason` names what it cannot when not (spec 085 D13).
 	bool decodable = false;
 	std::string reason;
-	//! The base rowset's layout, its defaults filled in; only when decodable.
+	//! The first partition's layout (each partition has its own, CatalogPartition::layout); only when
+	//! decodable.
 	RowsetLayout layout;
 };
 
@@ -188,6 +226,11 @@ struct CatalogModel {
 	//! The schema `id`'s name, or "" when the catalog has none (a binary search).
 	std::string SchemaName(int32_t id) const;
 };
+
+//! A type as T-SQL declares it: a system type with its length, precision or scale (nchar / nvarchar
+//! counted in characters); an alias or a CLR type by its own name.
+std::string SqlTypeText(const std::string &type_name, const std::string &system_type_name, uint8_t system_type_id,
+						int16_t max_length, uint8_t precision, uint8_t scale);
 
 //! The most bytes of one module's text the catalog reads (a view's definition is nvarchar(max)).
 static constexpr uint64_t MAX_MODULE_TEXT_BYTES = 64ull << 20;

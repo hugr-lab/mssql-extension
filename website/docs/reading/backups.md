@@ -127,11 +127,12 @@ SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sale
 | `compression` | `VARCHAR` | `none`, `row`, `page`, `columnstore`, `columnstore_archive` (`level n` for a level the reader does not name); `mixed` when partitions differ |
 | `partition_count`, `row_count` | `INTEGER`, `BIGINT` | the row count the catalog keeps (`sys.partitions.rows`); NULL when a partition's count is negative (an upgraded database can hold one until `DBCC UPDATEUSAGE`) |
 | `created`, `modified` | `TIMESTAMP` | `sys.tables.create_date` / `modify_date` |
-| `decodable`, `reason` | `BOOLEAN`, `VARCHAR` | whether a later release's scan reads the table, and why not (a clustered columnstore, ROW / PAGE compression, sparse columns, a partitioned table, for now) |
+| `decodable`, `reason` | `BOOLEAN`, `VARCHAR` | whether a later release's scan reads the table, and why not (a clustered columnstore, ROW / PAGE compression or sparse columns, for now) |
 | `fuzzy_status`, `open_transactions`, `stale_transactions` | `VARCHAR`, `INTEGER`, `INTEGER` | NULL for now |
 | `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off: a plain `VARCHAR` for a string), `decodable`, `reason` |
 | `allocation_units` | `LIST(STRUCT(…))` | the table's allocation units: `au_id`, `type` (`IN_ROW_DATA`, `LOB_DATA`, `ROW_OVERFLOW_DATA`), `rowset_id`, `index_id`, `partition_number`, `compression`, `filegroup_id`, `first_page`, `root_page`, `first_iam_page`, `live_pages` (NULL for now) |
-| `partitioning` | `STRUCT(…)` | NULL for now |
+| `partitioning` | `STRUCT(…)` | for a partitioned table (NULL on a filegroup): `function_name`, `scheme_name`, `column_name`, `column_id`, `parameter_type`, `range_right`, `boundaries` (a list of `VARIANT`s in the parameter's type, in boundary order), `destinations` (the filegroup of each partition), `next_used`, and `reason` when the reader cannot give it (the boundaries are then NULL) |
+| `partitions` | `LIST(STRUCT(…))` | every partition: `partition_number`, `rows`, `compression`, `filegroup` |
 
 `mssql_backup_views` columns: `schema_name`, `view_name`, `object_id`, `definition` (the T-SQL text
 as stored; NULL for a view created `WITH ENCRYPTION`, which the reader does not de-obfuscate),

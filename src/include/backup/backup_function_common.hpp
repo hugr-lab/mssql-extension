@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "backup/backup_sql_variant.hpp"
 #include "duckdb/common/types/value.hpp"
 
 #include <string>
@@ -30,6 +31,17 @@ Value RecordDatetimeValue(const std::string &record_form);
 //! A smalldatetime as a record stores it (u16 minutes, then u16 days) through ConvertSmallDatetime.
 //! NULL TIMESTAMP unless 4 bytes.
 Value RecordSmallDatetimeValue(const std::string &record_form);
+
+//! A uniqueidentifier's 16 bytes in SQL Server's order (the first three groups little-endian) as a
+//! UUID; a FormatError naming `what` unless 16 bytes.
+Value GuidValue(const std::string &bytes, const std::string &what);
+
+//! The value a catalog's sql_variant holds (a partition boundary, an added column's default), typed as
+//! TYPE mssql reads its base type (D6: datetime2 by its scale TIMESTAMP_S / _MS / TIMESTAMP / _NS,
+//! datetimeoffset TIMESTAMP_TZ at the UTC instant, decimal exact, money DECIMAL(19, 4), a char /
+//! varchar through its collation's code page). A FormatError naming `what` for a value its type's
+//! size does not fit, a double-byte code page (spec 086) or a base type this does not read.
+Value SqlVariantValue(const SqlVariant &variant, const std::string &what);
 
 }  // namespace backup
 }  // namespace mssql

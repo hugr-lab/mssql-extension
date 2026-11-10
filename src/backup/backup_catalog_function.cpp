@@ -427,15 +427,8 @@ Value CellValue(const BaseTableBindData &data, size_t layout_index, const Logica
 	case XTYPE_SMALLDATETIME:
 		size(4, "smalldatetime");
 		return RecordSmallDatetimeValue(v.bytes);
-	case XTYPE_UNIQUEIDENTIFIER: {
-		size(16, "uniqueidentifier");
-		const uint8_t *b = reinterpret_cast<const uint8_t *>(v.bytes.data());
-		// SQL Server's GUID byte order: the first three groups little-endian.
-		char text[37];
-		snprintf(text, sizeof(text), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", b[3], b[2],
-				 b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
-		return Value(text).DefaultCastAs(LogicalType::UUID);
-	}
+	case XTYPE_UNIQUEIDENTIFIER:
+		return GuidValue(v.bytes, data.table + "." + c.name);
 	default:  // binary, varbinary, sql_variant
 		return Value::BLOB(reinterpret_cast<const_data_ptr_t>(v.bytes.data()), v.bytes.size());
 	}

@@ -51,13 +51,21 @@ SELECT bool_and(created <= modified AND created >= TIMESTAMP '2026-01-01') FROM 
 ----
 true
 
-# Not yet located: NULL, never guessed.
+# Not yet located: NULL, never guessed. The samples' tables are not partitioned: no partitioning, one
+# partition on PRIMARY.
 query TTTT
 SELECT bool_and(fuzzy_status IS NULL), bool_and(open_transactions IS NULL), bool_and(stale_transactions IS NULL),
        bool_and(partitioning IS NULL)
 FROM mssql_backup_tables('test/data/backup/full.bak');
 ----
 true	true	true	true
+
+query TITT
+SELECT table_name, p.partition_number, p.filegroup, p.compression
+FROM (SELECT table_name, unnest(partitions) AS p FROM mssql_backup_tables('test/data/backup/full.bak')) ORDER BY table_name;
+----
+events	1	PRIMARY	none
+items	1	PRIMARY	none
 
 query I
 SELECT count(*) FROM mssql_backup_views('test/data/backup/full.bak');

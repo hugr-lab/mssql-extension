@@ -239,9 +239,9 @@ struct BootstrapTables {
 	//! The layout of object `object_id`'s base rowset (index 0 heap or 1 clustered; one partition),
 	//! from sysrscols and syscolpars: rscolid names the column syscolpars lists as colid. A base
 	//! rowset with no in-row unit (a deferred drop, spec 085 § Rules) is not counted. A FormatError
-	//! naming the object when it has no live base rowset, more than one (a partitioned table, PR 2c,
-	//! or a columnstore), a physical column syscolpars does not name, or more physical columns than a
-	//! null bit can number.
+	//! naming the object when it has no live base rowset, more than one (a partitioned table or a
+	//! columnstore: the model takes each partition's rowset with LayoutOf), a physical column syscolpars does not name,
+	//! or more physical columns than a null bit can number.
 	RowsetLayout BaseLayout(int32_t object_id) const;
 	//! The layout of rowset `rowset` of object `object_id` (BaseLayout's, for any rowset of it).
 	RowsetLayout LayoutOf(int32_t object_id, const SysRowset &rowset) const;

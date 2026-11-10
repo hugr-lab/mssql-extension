@@ -1476,7 +1476,10 @@ flowchart BT
   type names from `sysscalartypes`, rowsets, allocation units, shape, rows, the base rowset's layout
   with the defaults of columns added after rows were written) and views (definitions, Latin-1 or
   UTF-16, an off-row one read by `backup_lob`). A table the scan cannot read is listed, `decodable`
-  false, with its reason (spec 085 D13).
+  false, with its reason (spec 085 D13). A partitioned table (PR 2c) carries its partitioning -- function,
+  parameter type, boundaries (sql_variants, as VARIANTs of D6's types in the function), scheme,
+  destinations, NEXT USED, column -- checked to agree with its fanout, and each partition its own layout (the
+  scan, PR 2d, decodes rows per rowset).
 - **Prepared statements** keep the row their bind read (`SupportStatementCache`); `reread := true`
   binds again on every `EXECUTE`. The opened-file cache shared across statements (D9) is task 22.
 
