@@ -42,6 +42,7 @@ Quick pointers:
 | [Getting Started](https://hugr-lab.github.io/mssql-extension/getting-started/) | install, ATTACH, first queries |
 | [Connections & Auth](https://hugr-lab.github.io/mssql-extension/connection/) | connection strings, secrets, Azure AD, Kerberos |
 | [Writing Data](https://hugr-lab.github.io/mssql-extension/writing/copy/) | COPY (bulk load), CTAS, INSERT/UPDATE/DELETE |
+| [Backup Files](https://hugr-lab.github.io/mssql-extension/reading/backups/) | describe a `.bak` without SQL Server |
 | [Settings Reference](https://hugr-lab.github.io/mssql-extension/reference/settings/) | every `mssql_*` setting with defaults |
 | [Troubleshooting](https://hugr-lab.github.io/mssql-extension/reference/troubleshooting/) | common errors and limitations |
 | [Articles](https://hugr-lab.github.io/mssql-extension/articles/) | Medium deep dives on design and performance |
@@ -72,6 +73,7 @@ architecture), [docs/](docs/) (internals), [docs/TESTING.md](docs/TESTING.md),
 - [Kerberos / Windows SSPI integrated authentication](Kerberos.md) — POSIX (`kinit` / keytab / raw credentials) and Windows (current logon session via `secur32.dll`)
 - Custom `Application Name` propagated to SQL Server `APP_NAME()` / `sys.dm_exec_sessions.program_name`
 - ATTACH-time credential validation (opt-out via `lazy_validation true`)
+- **SQL Server backup files without SQL Server**: `mssql_backup_info('/backups/db.bak')` reports what `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` do, read from the file alone through DuckDB's file system (local, `s3://`, `https://`) — full, differential and log backups, compressed (`MS_XPRESS`, `ZSTD`) and striped; checked on SQL Server 2025 backups ([backup files](https://hugr-lab.github.io/mssql-extension/reading/backups/)). Reading the tables inside a backup comes in later releases
 - **Experimental**: ORDER BY pushdown to SQL Server (opt-in via `mssql_order_pushdown` setting)
 
 > **A note on string comparisons.** A pushed predicate is evaluated by SQL
@@ -179,6 +181,11 @@ following third-party components:
   under the MIT License option of its dual Apache-2.0/MIT
   licensing. © Daniel Lemire and simdutf contributors.
   License text: [LICENSES/simdutf-LICENSE-MIT.txt](LICENSES/simdutf-LICENSE-MIT.txt)
+- **Zstandard (zstd)** (decompressing `ZSTD`-compressed SQL Server
+  backups), used under the BSD License option of its dual BSD/GPLv2
+  licensing. © Meta Platforms, Inc. and affiliates. Version pinned via
+  `vcpkg.json`.
+  License text: [LICENSES/zstd-LICENSE-BSD.txt](LICENSES/zstd-LICENSE-BSD.txt)
 
 ## License
 

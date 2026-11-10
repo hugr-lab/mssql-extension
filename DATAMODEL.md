@@ -1392,6 +1392,76 @@ through `MSSQLSimpleQuery`.
 
 ---
 
+## The backup reader (spec 085)
+
+`src/backup/` reads SQL Server backup files (`.bak`, `.trn`) with no SQL Server: none of layers 1–4
+takes part (no connection, no pool, no `MSSQLCatalog`), and the code-page / collation tables of
+layer 5 (spec 091) are its only shared state. It is a stack of its own, planned in
+`specs/085-backup-reader-core/spec.md`; this section describes what exists.
+
+```mermaid
+flowchart BT
+  fs["DuckDB FileSystem<br/>(CachingFileSystem: local, s3://, https://)"] --> src["ByteSource / SourceAccess<br/>every family of one media set;<br/>ranges coalesced (backup_ranges),<br/>fetched sync or on the ASYNC pool"]
+  src --> plain["plain family:<br/>MTF walk (WalkMtf)"]
+  src --> cont["MSSQLBAK container:<br/>header, chain located from the tail,<br/>seek index → ContainerStream<br/>(XPRESS / ZSTD per block)"]
+  cont --> ds["WalkMtfDataSet<br/>(the container's MTF data set)"]
+  plain --> set["BackupSetHeader<br/>TAPE / RAID, SSET, VOLB,<br/>trailer MQCI: SCIN, SFGI, SFIN"]
+  ds --> set
+  cont -. media label at 0x1E0 .-> set
+  set --> opened["OpenedHeaders<br/>families checked to be one complete set"]
+  opened --> info["mssql_backup_info"]
+  src --> idx["PageIndex (built, used from PR 2)<br/>pass maps: ranked / runs;<br/>PassSearch over ordered passes;<br/>open pass over parallel ranges"]
+  idx --> alloc["AllocationMap<br/>file Size, GAM (lazy), PFS → live"]
+```
+
+- **The file is untrusted input.** Every parser reads through `ByteReader` (`backup_bytes`), which
+  checks each length, offset and count against its span; a read past one is a named `FormatError`,
+  and the table function turns it into an `InvalidInputException` naming the file. Each MTF
+  descriptor and stream header's XOR checksum is validated; the walk follows header lengths only,
+  never a resync. `make fuzz-backup-replay` replays the four harnesses (`fuzz/fuzz_backup_*`) over
+  their corpora, which `fuzz/gen_backup_seeds.cc` builds from synthetic files only.
+- **DuckDB-free parsers.** Everything but `backup_source`, `backup_open_pass`, `backup_opened` and
+  the function (marked `[DuckDB]` in their headers) builds without libduckdb (spec 085 D15), so the
+  fuzz harnesses link no DuckDB. `test/cpp/backup/` runs in `make test-cpp`.
+- **I/O through DuckDB only** (D3 / D3a): a read is a byte range through `CachingFileSystem`, so
+  httpfs secrets apply and a remote file's ranges sit in buffer-managed blocks.
+  `mssql_backup_info` reads one range at a time. For the page index (PR 2) the open pass fetches
+  waves of 8 MiB ranges side by side on the ASYNC I/O pool, planned by `backup_ranges` (which can
+  coalesce adjacent ranges as the Parquet reader does; the open pass asks it not to, since its
+  ranges are already as large as a request should be).
+- **A compressed container is walked from known blocks** (DQ-41): its chain is located from the
+  tail record at EOF−12304, which names the seek index, so the chain starts with checkpoints at
+  block 0 and at the seek index's entries only. A read walks block headers from the nearest
+  checkpoint before it and adds a checkpoint every 64 blocks and 1 MiB as it goes, so the chain is
+  walked once, piece by piece, as it is read; opening reads the header, the tail and the blocks it
+  decodes. A tail of another layout makes the open walk the chain whole (`WalkChain`). A resync
+  from an arbitrary offset is never the default: row data can forge a block chain (spec 085
+  § Security; `trust_layout` is the opt-in, for the scan).
+- **The media set is checked whole** (`OpenBackupHeaders`): one backup set per file (an appended
+  set is refused), one backup set GUID and one media set in every family, every
+  `FamilySequenceNumber` of `FamilyCount` present once (a missing one is named), and the trailer's
+  `BackupSize` (SCIN +96, the set's) equal to the sum the families' layout gives. A container's
+  data set has no TAPE block: its media label is the chain block at 0x1E0 (`ReadContainerTape`).
+- **The trailer is the source of the database fields.** SCIN (in MSLS's MQCI) carries the LSNs,
+  dates, version, compatibility level, collation (its TDS form, named through spec 091's collation
+  table), fork ids, recovery model, `BackupSize` and `CompressedBackupSize` (+344); its offsets are
+  spec 085 § Rules. The boot page cross-checks them once the page store exists (task 11).
+- **Pages (built for PR 2).** `PageIndex` maps where each page's latest copy lies: a pass ranked
+  from its allocation pages, or as runs where the order breaks. A full backup's first pass is ranked
+  from its GAMs (one plain family) or searched by bisection rather than read (`PassSearch`: a
+  striped set, a container, or a rank that failed), its order checked at every probe
+  (`OrderBroken` → mapped by headers); every other pass is mapped by its page headers. `AllocationMap` decides which pages are live
+  (below the file's Size, GAM allocated, PFS 0x40). A table's pages are to come from its IAM chain
+  (DQ-40), the page header's AU only a check.
+- **Prepared statements** keep the row their bind read (`SupportStatementCache`); `reread := true`
+  binds again on every `EXECUTE`. The opened-file cache shared across statements (D9) is task 22.
+
+Samples: `test/data/backup/` (synthetic, made by `generate.sh` on a throwaway container, with the
+golden `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` beside each), checked by
+`test/sql/backup/mssql_backup_info.test` with no SQL Server.
+
+---
+
 ## Per-spec map
 
 | Spec | What it added at the data-model level |
@@ -1404,6 +1474,7 @@ through `MSSQLSimpleQuery`.
 | #178 | Single cache-wide mutex in `MSSQLMetadataCache` (was split across two, Refresh raced readers → UAF); atomic TTL/timeout config fields; `known_table_names_` consistently under `names_mutex_` (Scan was mutating it under `entry_mutex_`); thread-safe magic-static debug-level init everywhere |
 | 060 | `codec/target_string_type` — a string column's stated SQL Server type on the `LogicalType` (layer 5), read by both DDL translators and the BCP metadata builders. **Layer 3 now reports it**: `MSSQLTableEntry` hands DuckDB `MSSQLColumnInfo::NativeDuckDBType()` rather than a bare VARCHAR, gated by `mssql_catalog_native_types` — which is why the filter encoder had to learn to see through the no-op cast DuckDB inserts. `MSSQLCatalog` gains the collation rules (`ResolveVarcharCollation`, `WireVarcharCollation`) and the endpoint guarantees (`RequiresSingleByteText`, `ValidateStringTargets`, `ValidateTableOptions`) so CREATE TABLE, CTAS and COPY cannot drift apart on them |
 | 079 | The remote-pushdown path (above): `pushdown/` — the thread-local table resolution, the T-SQL writer (the one list of what pushes), `mssql::OrderTerm` / `OrderKeyFragment` shared with `MSSQLOptimizer`; `mssql_scan` / `mssql_scan_params` gain `column_types` and an EXPLAIN rendering |
+| 085 | The backup reader above (`src/backup/`, no TDS, no catalog): `ByteSource` over DuckDB's file system, the MTF walk, the MSSQLBAK container with XPRESS / ZSTD, the backup set's headers, `OpenedHeaders`, `PageIndex` / `PassSearch` / `AllocationMap`; `mssql_backup_info` |
 | 057 | The write path above. `codec::ResolveWriteColumnOps` resolves a `ScatterArm` per column so the encode loop carries no type test, and one `RowFallback` takes the whole chunk row-major. Both sinks become `ParallelSink`, with writers claimed per thread against a `parallel_writer_limit` (spec 070 W2 makes that claim a per-chunk retry behind a columnstore warm-up gate). CTAS stops using the transaction's pinned connection entirely — its DDL and its rows both go to pool connections, so `ROLLBACK` undoes neither and the compensation is `mssql_ctas_drop_on_failure`'s DROP, wired to `~CTASExecutionState` as well as to the sink's catch blocks. `LogicalTypeId::UTINYINT` becomes the resolved type of a SQL Server `tinyint` column (one unsigned byte), leaving `TINYINT` to mean a signed source that travels as a smallint |
 
 ## Where to read the code
