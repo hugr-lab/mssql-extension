@@ -131,13 +131,13 @@ run_sql() {	# $1 = a script of /tmp/gen
 	sql -v DIR="${DIR}" GEN=/tmp/gen LARGE_ROWS="${LARGE_ROWS}" -s '|' -W -i "/tmp/gen/$1"
 }
 # The server's own catalog of database $1 as set $2's backup holds it (run right after that backup,
-# nothing changed since): $2.tables.txt / .columns.txt / .views.txt, through catalog_golden.sql's
+# nothing changed since): $2.tables.txt / .columns.txt / .views.txt / .modules.txt, through catalog_golden.sql's
 # :OUT. The path goes in whole, as ONE -v variable: in an :OUT path sqlcmd substitutes no variable
 # :setvar defines, and of -v variables only the first ("$(DIR)/$(SET).x" kept "$(SET)" literally;
 # measured, mssql-tools18 on 2022).
 golden() {	# $1 = database, $2 = set
 	sql -d "$1" -v OUTPREFIX="${DIR}/$2" -s '|' -W -i /tmp/gen/catalog_golden.sql
-	extras+=("$2.tables.txt" "$2.columns.txt" "$2.views.txt")
+	extras+=("$2.tables.txt" "$2.columns.txt" "$2.views.txt" "$2.modules.txt")
 }
 scalar() {	# $1 = a query answering one value
 	sql -h -1 -W -Q "SET NOCOUNT ON; $1" | head -1 | tr -d ' \r'

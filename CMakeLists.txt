@@ -167,6 +167,7 @@ set(EXTENSION_SOURCES
     # Backup reader (spec 085): the parsers over byte spans, DuckDB-free (D15).
     src/backup/backup_allocation.cpp
     src/backup/backup_boot.cpp
+    src/backup/backup_base_table_function.cpp
     src/backup/backup_bytes.cpp
     src/backup/backup_catalog_functions.cpp
     src/backup/backup_catalog_model.cpp

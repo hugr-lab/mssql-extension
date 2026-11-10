@@ -6,7 +6,8 @@
 -- altered, identities, computed columns (one persisted), a rowversion, a ROWGUIDCOL, an alias type,
 -- sparse columns and a column set, a non-unique clustered index, defaults and a check, and views: two
 -- WITH ENCRYPTION, one SCHEMABINDING, one with non-ASCII text, two whose definitions pass 8000 bytes
--- (single-byte and Cyrillic). Every row is generated; nothing comes from
+-- (single-byte and Cyrillic); a procedure, functions and a trigger, and a partition function. Every
+-- row is generated; nothing comes from
 -- anyone's database (spec 085 T4). Run by generate.sh with the sqlcmd variable DIR.
 --
 -- After the backup, generate.sh writes the server's own catalog of the database beside it
@@ -165,6 +166,20 @@ DECLARE @x nvarchar(max) = REPLICATE(CAST(N'x' AS nvarchar(max)), 9000);
 EXEC (N'CREATE VIEW dbo.v_long AS SELECT id /* ' + @x + N' */ FROM dbo.shapes');
 DECLARE @y nvarchar(max) = REPLICATE(CAST(N'ж' AS nvarchar(max)), 5000);
 EXEC (N'CREATE VIEW dbo.v_long_unicode AS SELECT id /* ' + @y + N' */ FROM dbo.shapes');
+GO
+-- Modules whose source mssql_backup_catalog must never serve (DQ-11) -- a procedure, a function, an
+-- encrypted multi-statement function whose return table has a computed column, a trigger -- and a
+-- partition function, whose boundaries it serves.
+CREATE PROCEDURE dbo.p_secret AS SELECT 'procedure source' AS s;
+GO
+CREATE FUNCTION dbo.f_secret (@x int) RETURNS int AS BEGIN RETURN @x + 1; END;
+GO
+CREATE FUNCTION dbo.tvf_secret () RETURNS @t TABLE (a int, b AS a + 1) WITH ENCRYPTION
+AS BEGIN INSERT INTO @t (a) VALUES (1); RETURN; END;
+GO
+CREATE TRIGGER dbo.tr_secret ON dbo.empty_table AFTER INSERT AS BEGIN SET NOCOUNT ON; END;
+GO
+CREATE PARTITION FUNCTION pf_catalog (int) AS RANGE RIGHT FOR VALUES (10, 20, 30);
 GO
 BACKUP DATABASE bak_catalog TO DISK = '$(DIR)/catalog_full.bak' WITH FORMAT, INIT, CHECKSUM, NAME = 'catalog_full';
 GO

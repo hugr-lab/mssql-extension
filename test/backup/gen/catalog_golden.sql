@@ -1,6 +1,7 @@
 -- Spec 085 PR 2b: the server's catalog of the current database, written beside a backup of it
 -- through sqlcmd's :OUT, one batch per file (sqlcmd runs a batch at its GO): <set>.tables.txt
--- (shape, partitions, rows, dates), .columns.txt, .views.txt (definition length and SHA-256) --
+-- (shape, partitions, rows, dates), .columns.txt, .views.txt (definition length and SHA-256),
+-- .modules.txt (the sysobjvalues rows mssql_backup_catalog may serve) --
 -- what test/backup/compare_catalog.py compares mssql_backup_tables / _views with. Run by
 -- generate.sh's golden() with -d <the database the backup was taken of> -v OUTPREFIX=<dir>/<the set>
 -- -s '|' -W, right after that backup, nothing changed since.
@@ -31,5 +32,21 @@ SELECT s.name AS schema_name, v.name AS view_name, v.object_id,
 FROM sys.views v JOIN sys.schemas s ON s.schema_id = v.schema_id LEFT JOIN sys.sql_modules m ON m.object_id = v.object_id
 WHERE v.is_ms_shipped = 0
 ORDER BY s.name, v.name;
+GO
+:OUT $(OUTPREFIX).modules.txt
+-- The sysobjvalues rows mssql_backup_catalog may serve (DQ-11), by (valclass, objid, subobjid): the
+-- definitions of the views not WITH ENCRYPTION and of the defaults, the computed columns of user
+-- tables, the boundaries of the partition functions. Nothing else -- a procedure's, a function's, a
+-- trigger's or a check's source -- may appear.
+SELECT valclass, objid, subobjid FROM (
+	SELECT 1 AS valclass, o.object_id AS objid, 0 AS subobjid FROM sys.objects o
+	WHERE o.is_ms_shipped = 0 AND (o.type = 'D' OR (o.type = 'V' AND OBJECTPROPERTY(o.object_id, 'IsEncrypted') = 0))
+	UNION
+	SELECT 2, c.object_id, c.column_id FROM sys.computed_columns c JOIN sys.tables t ON t.object_id = c.object_id
+	WHERE t.is_ms_shipped = 0
+	UNION
+	SELECT 30, v.function_id, v.boundary_id FROM sys.partition_range_values v
+) m
+ORDER BY valclass, objid, subobjid;
 GO
 :OUT stdout

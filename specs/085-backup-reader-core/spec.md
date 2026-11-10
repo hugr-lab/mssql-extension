@@ -512,11 +512,20 @@ differences).
 
 `mssql_backup_catalog(path, base_table)`: the base table's rows with its own columns as typed by its
 `syscolpars` rows, plus the virtual `_mssql_page` / `_mssql_rid` (for a base table, `_mssql_rid` is
-its clustering key by `ordkey`; checked against E1's keys: `sysallocunits(auid)`,
-`sysrowsets(rowsetid)`, `sysschobjs(id)`, `syscolpars(id, number, colid)`, `sysrscols(rsid,
-rscolid)`, `sysseobjvalues(valclass, id, subid, valnum)`, `sysclsobjs(class, id)`). Without
-`base_table` it lists the allow-listed base tables (`base_table`, `object_id`, `row_count`,
-`columns`), which is the set an importer mirrors (022 D3); the list is the reader's, per version.
+its clustering key by `ordkey`: `0x01`, then per key column u16 length and its stored bytes,
+`0xFFFF` for NULL; checked against E1's keys: `sysallocunits(auid)`, `sysrowsets(rowsetid)`,
+`sysschobjs(id)`, `syscolpars(id, number, colid)`, `sysseobjvalues(valclass, id, subid, valnum)`,
+`sysclsobjs(class, id)` -- and `sysrscols(rsid, hbcolid)`, not E1's `(rsid, rscolid)`: its own
+`ordkey` says so on 2017–2025, and the two agree only without a uniquifier; `syssingleobjrefs` is
+`(depid, class, depsubid)`). The columns are typed through D6's map; a `sql_variant` (`value`) is its
+raw bytes, `BLOB` (a VARIANT is 086's). Without `base_table` it lists the allow-listed base tables
+(`base_table`, `object_id`, `row_count` -- the rowset's, NULL for the two served by value class --,
+`columns`: `name`, `duckdb_type`, `key_ordinal`), which is
+the set an importer mirrors (022 D3); the list is the reader's, per version (a table the version
+lacks is left out). The catalog is opened at bind, since a table's columns depend on the version
+(2022 added `sysrscols.ordlock`), and every EXECUTE binds again. Rows are produced a page at a time
+(the unit's IAM-listed pages and a cursor, never the table), an off-row value as its row is, within one
+value's bound and 1 GiB for the call.
 
 `mssql_backup_scan(path, schema, table)`: the table's columns plus the D8 virtual columns.
 Projection pushdown; LOBs read only when their column is projected. **No filter pushdown in this
@@ -1075,12 +1084,20 @@ A backup file is untrusted input (R§9). Every parser:
   forensic tool: it returns what RESTORE returns.
 - **Limits the base tables it exposes**: `mssql_backup_catalog` serves an allow-list (the mirror set of
   E1§4.8 — `sysallocunits`, `sysrowsets`, `sysschobjs`, `syscolpars`, `sysrscols`, `sysseobjvalues`,
-  `sysclsobjs` — plus `sysobjvalues`, `sysidxstats`, `sysiscols`, the columnstore tables of 088 and the
-  partitioning tables of E7: `systypedsubobjs`, `syssingleobjrefs`). Others, such as `sysowners`
+  `sysclsobjs` — plus `sysobjvalues`, `sysidxstats`, `sysiscols`, the columnstore tables of 088, the
+  partitioning tables of E7: `systypedsubobjs`, `syssingleobjrefs`, and `sysscalartypes`, the type
+  names an alias column needs). Others, such as `sysowners`
   (contained users' password hashes) or the certificate and key tables, are refused by name.
-  `sysobjvalues` is served by value class only: view definitions, partition boundaries (valclass 30),
-  and the computed-column and default definitions, the classes pinned by task 11; module source never
-  leaves (DQ-11, accepted).
+  `sysobjvalues` is served by value class only, each row checked against the object it belongs to:
+  valclass 1 of a view (not one `WITH ENCRYPTION`) or a default, with subobjid and valnum 0; valclass
+  2 of a computed column of a user table -- not by its class alone: a multi-statement function's
+  return table can have a computed column, and its definition is a valclass 2 row of the function
+  (measured, catalog fixture 2022: `([a]+(1))` of an encrypted TVF); valclass 30 of a partition
+  function. `sysseobjvalues` by its valclass 1 (an added column's default, the one class measured).
+  Module source -- a procedure's, a function's, a trigger's, a check's -- never leaves (DQ-11,
+  accepted); the oracle lane compares the served set with the one the server's catalog views give
+  (`catalog_golden.sql`'s `.modules.txt`, the fixture holding a procedure, functions, an encrypted TVF,
+  a trigger and a partition function).
 - **Fuzzing** (ClusterFuzzLite, `fuzz/`, D15): one harness per parser, each with a seed corpus cut from
   the committed samples: `fuzz_backup_mtf` (walker), `fuzz_backup_container` (MSSQLBAK chain),
   `fuzz_backup_xpress` (raw codec, with a differential oracle against a reference decode of the seed),

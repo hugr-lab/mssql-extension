@@ -75,6 +75,7 @@ struct PhysicalColumn {
 	int16_t offset = 0;		 // > 0 a fixed offset in the record, -n the n-th variable column
 	uint16_t null_bit = 0;	 // 1-based, in the null bitmap
 	uint8_t bit_position = 0;
+	int16_t ordkey = 0;	 // its place in the clustered index key, 1-based; 0 when not a key column
 	//! The value of a column added after a record was written (sysseobjvalues; the model's to give).
 	bool has_default = false;
 	std::string default_bytes;
@@ -298,6 +299,17 @@ static constexpr size_t MAX_SYSTEM_TABLE_COLUMNS = 1024;
 //! MAX_SYSTEM_TABLE_COLUMNS columns is refused.
 void ForEachRowsetRow(const PageStore &store, const SysAllocUnit &unit, const RowsetLayout &layout,
 					  const std::function<void(const SystemRow &)> &row);
+//! The pages the IAM chain of `unit` lists, in chain order (its single pages, then every page of its
+//! extents): each may hold none of the unit's rows (not live, an IAM page, an upper index level).
+std::vector<PagePointer> UnitPages(const PageStore &store, const SysAllocUnit &unit);
+//! Page `at` into `out` when it is a live level-0 data page (false otherwise); one naming another unit
+//! than `unit` is a FormatError naming `table`, as is a page the store refuses.
+bool ReadUnitDataPage(const PageStore &store, const SysAllocUnit &unit, const PagePointer &at, const std::string &table,
+					  Page &out);
+//! The records of types 0 and 1 of `page` through `layout`, each handed to `row` (ForEachRowsetRow's
+//! rules for one page: freed slots, ghosts, stubs and index records skipped; two slots at one record
+//! and a layout past MAX_SYSTEM_TABLE_COLUMNS refused).
+void ForEachPageRow(const Page &page, const RowsetLayout &layout, const std::function<void(const SystemRow &)> &row);
 //! ForEachRowsetRow's rows, kept.
 std::vector<SystemRow> ReadRowsetRows(const PageStore &store, const SysAllocUnit &unit, const RowsetLayout &layout);
 

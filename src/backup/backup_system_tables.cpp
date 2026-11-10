@@ -136,34 +136,10 @@ void PageRows(const Page &page, const RowsetLayout &layout, const std::function<
 // The live level-0 data pages of `unit`'s IAM chain, each handed to `page_fn`; `table` names it.
 void ForEachDataPage(const PageStore &store, const SysAllocUnit &unit, const std::string &table,
 					 const std::function<void(const Page &)> &page_fn) {
-	const AuPages pages = ReadIamChain(store, unit.first_iam, unit.auid);
 	Page page;
-	auto take = [&](uint16_t file, uint32_t number) {
-		try {
-			if (!store.Read(file, number, page)) {
-				return;	 // in one of the unit's extents, and not in use
-			}
-		} catch (FormatError &e) {
-			throw FormatError(std::string(e.what()) + " (reading " + table + ")");
-		}
-		if (page.header.type != static_cast<uint8_t>(PageType::Data) || page.header.level != 0) {
-			return;	 // its IAM pages, a clustered index's upper levels
-		}
-		if (page.header.AllocationUnit() != unit.auid) {
-			throw FormatError("backup: data page " + page.header.page_id.ToString() + ", listed by the IAM chain of " +
-							  table + "'s allocation unit " + std::to_string(unit.auid) + ", names allocation unit " +
-							  std::to_string(page.header.AllocationUnit()));
-		}
-		page_fn(page);
-	};
-	for (const auto &single : pages.single_pages) {
-		take(single.file, single.page);
-	}
-	for (const auto &run : pages.extents) {
-		for (uint64_t e = run.first; e < static_cast<uint64_t>(run.first) + run.count; e++) {
-			for (uint32_t k = 0; k < 8; k++) {
-				take(run.file, static_cast<uint32_t>(e * 8 + k));
-			}
+	for (const PagePointer &at : UnitPages(store, unit)) {
+		if (ReadUnitDataPage(store, unit, at, table, page)) {
+			page_fn(page);
 		}
 	}
 }
@@ -550,6 +526,7 @@ RowsetLayout BootstrapTables::LayoutOf(int32_t object_id, const SysRowset &base)
 		c.offset = r.offset;
 		c.null_bit = r.null_bit;
 		c.bit_position = r.bit_position;
+		c.ordkey = r.ordkey;
 		if (!c.Dropped() && !c.Uniquifier()) {
 			auto named = column_index_.find(std::make_pair(object_id, r.rscolid));
 			if (named == column_index_.end()) {
@@ -564,6 +541,51 @@ RowsetLayout BootstrapTables::LayoutOf(int32_t object_id, const SysRowset &base)
 		throw FormatError("backup: " + name + "'s base rowset has no column in sysrscols");
 	}
 	return layout;
+}
+
+std::vector<PagePointer> UnitPages(const PageStore &store, const SysAllocUnit &unit) {
+	const AuPages pages = ReadIamChain(store, unit.first_iam, unit.auid);
+	std::vector<PagePointer> out(pages.single_pages.begin(), pages.single_pages.end());
+	for (const auto &run : pages.extents) {
+		for (uint64_t e = run.first; e < static_cast<uint64_t>(run.first) + run.count; e++) {
+			for (uint32_t k = 0; k < 8; k++) {
+				PagePointer p;
+				p.file = run.file;
+				p.page = static_cast<uint32_t>(e * 8 + k);
+				out.push_back(p);
+			}
+		}
+	}
+	return out;
+}
+
+bool ReadUnitDataPage(const PageStore &store, const SysAllocUnit &unit, const PagePointer &at, const std::string &table,
+					  Page &out) {
+	try {
+		if (!store.Read(at.file, at.page, out)) {
+			return false;  // in one of the unit's extents, and not in use
+		}
+	} catch (FormatError &e) {
+		throw FormatError(std::string(e.what()) + " (reading " + table + ")");
+	}
+	if (out.header.type != static_cast<uint8_t>(PageType::Data) || out.header.level != 0) {
+		return false;  // its IAM pages, a clustered index's upper levels
+	}
+	if (out.header.AllocationUnit() != unit.auid) {
+		throw FormatError("backup: data page " + out.header.page_id.ToString() + ", listed by the IAM chain of " +
+						  table + "'s allocation unit " + std::to_string(unit.auid) + ", names allocation unit " +
+						  std::to_string(out.header.AllocationUnit()));
+	}
+	return true;
+}
+
+void ForEachPageRow(const Page &page, const RowsetLayout &layout, const std::function<void(const SystemRow &)> &row) {
+	if (layout.columns.size() > MAX_SYSTEM_TABLE_COLUMNS) {
+		throw FormatError("backup: " + layout.table + " is described with " + std::to_string(layout.columns.size()) +
+						  " physical columns, more than the system-table reader takes (" +
+						  std::to_string(MAX_SYSTEM_TABLE_COLUMNS) + ")");
+	}
+	PageRows(page, layout, row);
 }
 
 const RowsetLayout &BootstrapLayout(const std::string &name) {

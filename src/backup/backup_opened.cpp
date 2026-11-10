@@ -241,7 +241,8 @@ std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &context, const Opene
 	return pages;
 }
 
-std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths) {
+std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths,
+												 bool with_model) {
 	std::unique_ptr<OpenedCatalog> opened(new OpenedCatalog());
 	opened->headers = OpenBackupHeaders(context, paths);
 	opened->pages = OpenBackupPages(context, *opened->headers);
@@ -251,7 +252,9 @@ std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const s
 		const BootPage boot = ReadBootPage(boot_page);
 		CheckBootAgainstSet(boot, opened->headers->Set());
 		opened->tables = ReadBootstrapTables(*opened->pages->store, boot);
-		opened->model = BuildCatalogModel(*opened->pages->store, opened->tables);
+		if (with_model) {
+			opened->model = BuildCatalogModel(*opened->pages->store, opened->tables);
+		}
 	} catch (FormatError &e) {
 		// The readers' messages start "backup: "; under the file's name that is said already.
 		std::string why = e.what();

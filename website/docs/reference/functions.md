@@ -263,6 +263,19 @@ SELECT schema_name, table_name, row_count FROM mssql_backup_tables('/backups/sal
 SELECT view_name, definition FROM mssql_backup_views('/backups/sales_full.bak');
 ```
 
+### mssql_backup_catalog()
+
+A system base table of the database in a SQL Server full backup, as stored, with the virtual
+`_mssql_page` and `_mssql_rid`; with no table, the base tables it serves. See
+[Backup Files](../reading/backups.md#the-catalogs-base-tables).
+
+**Signature:** `mssql_backup_catalog(path VARCHAR | VARCHAR[] [, base_table VARCHAR]) -> TABLE(...)`
+
+```sql
+SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak');
+SELECT id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs');
+```
+
 ### Authentication Test Functions
 
 Connectivity diagnostics that exercise the auth path without a full query.

@@ -143,10 +143,30 @@ The oracle lane compares both with the server's own catalog of the same database
 its name, type, length, precision, scale, collation and flags, per view its definition (length and
 SHA-256), on backups made by SQL Server 2017 to 2025.
 
+### The catalog's base tables
+
+`mssql_backup_catalog(path, base_table)` returns a system base table of the database as stored,
+for a tool that mirrors the catalog: its rows, its columns typed by its own description (a
+`sql_variant` column as its raw bytes), and two virtual columns that `SELECT *` leaves out:
+`_mssql_page`, the row's page (`'01'`, then the file and page number in hex), and `_mssql_rid`, the
+row's clustered key. With no `base_table` it lists the tables it serves: `sysallocunits`,
+`sysrowsets`, `sysschobjs`, `syscolpars`, `sysrscols`, `sysseobjvalues`, `sysclsobjs`,
+`sysobjvalues`, `sysidxstats`, `sysiscols`, `systypedsubobjs`, `syssingleobjrefs` and
+`sysscalartypes`. Any other is refused by name. `sysobjvalues` gives only the definitions of views
+(not encrypted ones), defaults and the computed columns of tables, and partition boundaries -- never
+the source of a procedure, function or trigger -- and `sysseobjvalues` only the defaults of columns
+added after rows were written; the listing's `row_count` is NULL for these two.
+
+```sql
+SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak');
+SELECT _mssql_page, id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs');
+```
+
 ## Prepared statements
 
 `mssql_backup_info` reads the file when the statement binds, and a prepared statement keeps what
-its `PREPARE` read (`mssql_backup_tables` and `mssql_backup_views` read it on every execution). `reread := true` reads the file again on every `EXECUTE`, for a file that is overwritten
+its `PREPARE` read (`mssql_backup_tables`, `mssql_backup_views` and `mssql_backup_catalog` read it on
+every execution). `reread := true` reads the file again on every `EXECUTE`, for a file that is overwritten
 between runs (a nightly backup to the same path):
 
 ```sql

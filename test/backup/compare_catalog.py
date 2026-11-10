@@ -12,7 +12,9 @@ millisecond: the server rounds a datetime's 1/300 s ticks to it, TYPE mssql read
 to the microsecond); per column: id, name, type name (sql_type's base, or an alias type's name),
 system type id, length, precision, scale, collation, nullable, identity, computed, sparse; per view:
 object id, encrypted, and the definition's length and SHA-256 over UTF-16LE (sys.sql_modules'
-nvarchar). Exits 1 on any difference, or when fewer than --min-fields fields were compared.
+nvarchar). mssql_backup_catalog: every base table it lists read whole, its count the rowset's, and the
+sysobjvalues rows it serves exactly <set>.modules.txt's (DQ-11: no module source). Exits 1 on any
+difference, or when fewer than --min-fields fields were compared.
 """
 import argparse
 import hashlib
@@ -128,6 +130,23 @@ def compare_set(c, db, name, arg, texts):
         utf16 = o["definition"].encode("utf-16-le")
         c.check(where, "definition length", str(len(utf16) // 2), t["definition_length"])
         c.check(where, "definition SHA-256", hashlib.sha256(utf16).hexdigest().upper(), t["definition_sha256"])
+
+    # mssql_backup_catalog: every base table it lists reads whole (an xtype a version adds fails here),
+    # its count the rowset's; and sysobjvalues serves exactly the rows the server says it may (DQ-11).
+    listed = db.query(f"SELECT base_table, row_count::VARCHAR AS row_count FROM mssql_backup_catalog({arg})")
+    c.check(f"{name}: mssql_backup_catalog", "lists sysschobjs", any(r["base_table"] == "sysschobjs" for r in listed),
+            True)
+    for r in listed:
+        served = db.query(f"SELECT count(*)::VARCHAR AS n FROM mssql_backup_catalog({arg}, {sql_string(r['base_table'])})")
+        if r["row_count"] is not None:
+            c.check(f"{name}: mssql_backup_catalog {r['base_table']}", "rows", served[0]["n"], r["row_count"])
+    if f"{name}.modules.txt" in texts:
+        ours = {(r["valclass"], r["objid"], r["subobjid"]) for r in db.query(
+            "SELECT DISTINCT valclass::VARCHAR AS valclass, objid::VARCHAR AS objid, subobjid::VARCHAR AS subobjid "
+            f"FROM mssql_backup_catalog({arg}, 'sysobjvalues')")}
+        theirs = {(r["valclass"], r["objid"], r["subobjid"]) for r in parse_golden(texts[f"{name}.modules.txt"])}
+        c.check(f"{name}: mssql_backup_catalog sysobjvalues", "rows served (valclass, objid, subobjid)",
+                sorted(ours), sorted(theirs))
 
 
 def main():
