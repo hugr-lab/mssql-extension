@@ -172,6 +172,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_mtf.cpp
     src/backup/backup_open_pass.cpp
     src/backup/backup_opened.cpp
+    src/backup/backup_page.cpp
     src/backup/backup_page_index.cpp
     src/backup/backup_pass_search.cpp
     src/backup/backup_ranges.cpp

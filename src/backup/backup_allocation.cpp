@@ -26,12 +26,15 @@ static constexpr size_t FILE_HEADER_SIZE_AT = 171;
 static constexpr uint16_t BOOT_FILE = 1;
 static constexpr uint32_t BOOT_PAGE = 9;
 static constexpr size_t PFS_CACHE_PAGES = 64;
+static constexpr uint8_t PAGE_TYPE_GAM = 8;
+static constexpr uint8_t PAGE_TYPE_PFS = 11;
+static constexpr uint8_t PAGE_TYPE_FILE_HEADER = 15;
 
 static std::string PageName(uint16_t file, uint32_t page) {
 	return std::to_string(file) + ":" + std::to_string(page);
 }
 
-std::vector<uint8_t> AllocationMap::ReadPage(uint16_t file, uint32_t page, const char *what) const {
+std::vector<uint8_t> AllocationMap::ReadPage(uint16_t file, uint32_t page, uint8_t type, const char *what) const {
 	std::vector<uint8_t> bytes;
 	// Every allocation page a map reads is one a full's pass 1 carries (E12): `expected`, so a
 	// searched pass cannot answer it absent on an order it does not have.
@@ -43,6 +46,12 @@ std::vector<uint8_t> AllocationMap::ReadPage(uint16_t file, uint32_t page, const
 	if (r.U8(0) != 1 || r.U32(32) != page || r.U16(36) != file) {
 		throw FormatError("backup: " + std::string(what) + " (page " + PageName(file, page) + ") is not that page");
 	}
+	// The page is where the format puts this allocation page: if it is of another type, the format's
+	// arithmetic (a later GAM interval's, never exercised: spec 085 § Rules) does not hold here.
+	if (r.U8(1) != type) {
+		throw FormatError("backup: " + std::string(what) + " (page " + PageName(file, page) + ") is a page of type " +
+						  std::to_string(r.U8(1)) + ", not " + std::to_string(type));
+	}
 	return bytes;
 }
 
@@ -53,7 +62,7 @@ AllocationMap::AllocationMap(const PageIndex &index, const std::vector<uint16_t>
 	for (uint16_t id : ids) {
 		File f;
 		f.id = id;
-		auto header = ReadPage(id, 0, "the file header page");
+		auto header = ReadPage(id, 0, PAGE_TYPE_FILE_HEADER, "the file header page");
 		ByteReader h(header.data(), header.size(), "the file header page", 0);
 		const uint16_t slot0 = h.U16(PAGE_SIZE - 2);
 		if (slot0 < 96 || slot0 + FILE_HEADER_SIZE_AT + 4 > PAGE_SIZE || h.U16(slot0 + FILE_HEADER_ID_AT) != id) {
@@ -84,7 +93,7 @@ bool AllocationMap::GamFree(const File &file, uint32_t extent) const {
 	// (PageIndex::ReadPage, expected), and the other threads' hits must not wait for it. Two threads
 	// missing one interval both read it; the first to finish keeps its bits.
 	const uint32_t gam_page = static_cast<uint32_t>(interval * GAM_INTERVAL_PAGES + 2);
-	auto gam = ReadPage(f.id, gam_page, "a GAM page");
+	auto gam = ReadPage(f.id, gam_page, PAGE_TYPE_GAM, "a GAM page");
 	ByteReader g(gam.data(), gam.size(), "a GAM page", 0);
 	const uint8_t *bits = g.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES);
 	std::lock_guard<std::mutex> guard(lock_);
@@ -141,7 +150,7 @@ uint8_t AllocationMap::PfsByte(const File &file, uint32_t page) const {
 	PfsPage entry;
 	entry.file = file.id;
 	entry.page = pfs_page;
-	entry.bytes = ReadPage(file.id, pfs_page, "a PFS page");
+	entry.bytes = ReadPage(file.id, pfs_page, PAGE_TYPE_PFS, "a PFS page");
 	const uint8_t value = entry.bytes[PFS_BYTES_AT + page % PFS_INTERVAL];
 	std::lock_guard<std::mutex> guard(lock_);
 	if (pfs_cache_.size() >= PFS_CACHE_PAGES) {

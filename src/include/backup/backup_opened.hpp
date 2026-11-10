@@ -15,6 +15,7 @@
 #include "backup/backup_container.hpp"
 #include "backup/backup_mtf.hpp"
 #include "backup/backup_open_pass.hpp"
+#include "backup/backup_page.hpp"
 #include "backup/backup_set.hpp"
 #include "backup/backup_source.hpp"
 
@@ -59,6 +60,29 @@ struct OpenedHeaders {
 		return families.front()->container;
 	}
 };
+
+//! Stages 2 and 3 of an opened backup (spec 085 § Data structures, task 11b): where each page's
+//! latest copy lies (the page index, D4a, DQ-41) and which pages are live (the allocation map), and
+//! the PageStore over both. Built for one call of a file function; the opened-file cache that keeps
+//! them across calls is task 22. Keeps `headers` (its streams) by reference.
+struct OpenedPages {
+	std::vector<ContainerFamily> containers;  // one per family; a plain family's is empty
+	std::vector<FamilyStream> streams;
+	PageIndex index;
+	std::unique_ptr<AllocationMap> allocation;
+	std::unique_ptr<PageStore> store;
+};
+
+struct OpenPagesOptions {
+	//! DQ-41: a container's pass searched by resync from any offset (trusted row data only).
+	bool trust_layout = false;
+};
+
+//! The pages of the full backup `headers` holds. A log backup has no data pages and a differential
+//! is read over its full (task 24's overlay): both are refused by name. The header scans read the
+//! families as parallel ranges (D3a) through `context`, used only within this call.
+std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &context, const OpenedHeaders &headers,
+											 const OpenPagesOptions &options = OpenPagesOptions());
 
 //! The files of `paths` (paths or globs: the families of one media set) opened, walked and checked:
 //! one backup set per file (an appended set is refused), the same backup set GUID in every family,

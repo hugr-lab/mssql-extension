@@ -72,7 +72,8 @@ private:
 	uint8_t PfsByte(const File &file, uint32_t page) const;
 	//! Whether extent `extent` of `file` is GAM-free: its interval's GAM page read first if needed.
 	bool GamFree(const File &file, uint32_t extent) const;
-	std::vector<uint8_t> ReadPage(uint16_t file, uint32_t page, const char *what) const;
+	//! The allocation page (file, page), of m_type `type`; FormatError naming `what` otherwise.
+	std::vector<uint8_t> ReadPage(uint16_t file, uint32_t page, uint8_t type, const char *what) const;
 
 	const PageIndex &index_;
 	mutable std::vector<File> files_;  // the GAM intervals are filled in on demand, under lock_

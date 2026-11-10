@@ -169,6 +169,67 @@ std::unique_ptr<OpenedHeaders> OpenBackupHeaders(ClientContext &context, const s
 	return opened;
 }
 
+std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &context, const OpenedHeaders &headers,
+											 const OpenPagesOptions &options) {
+	const auto &set = headers.Set();
+	const std::string &first = headers.source->Path(headers.families.front()->file);
+	if (set.kind == BackupKind::Log) {
+		throw FormatError("backup file \"" + first + "\" is a log backup: it holds no data pages to read");
+	}
+	if (set.kind == BackupKind::Differential) {
+		throw FormatError("backup file \"" + first +
+						  "\" is a differential backup: its pages are read over its full backup, which is not "
+						  "supported yet");
+	}
+	std::unique_ptr<OpenedPages> pages(new OpenedPages());
+	const size_t n = headers.families.size();
+	pages->containers.resize(n);
+	for (size_t i = 0; i < n; i++) {
+		const auto &f = *headers.families[i];
+		FamilyStream s;
+		s.stream = &f.Stream();
+		s.layout = &f.layout;
+		if (f.container) {
+			auto &c = pages->containers[i];
+			c.file = f.access.get();
+			c.stream = f.data_set.get();
+			c.seek = &f.seek;
+			c.chain_end = f.chain.end;
+			c.decoder = f.decoder;
+			s.container = &c;
+		}
+		pages->streams.push_back(s);
+	}
+	PageIndexOptions index_options;
+	index_options.full_backup = true;
+	index_options.trust_layout = options.trust_layout;
+	index_options.mapper = RangedPassMapper(context);
+	std::vector<uint16_t> data_files;
+	for (const auto &file : set.files) {
+		if (file.type != 'D') {
+			continue;
+		}
+		// SQL Server's file ids are 1..32767; a page pointer carries one in 16 bits.
+		if (file.file_id == 0 || file.file_id > 32767) {
+			throw FormatError("backup file \"" + first + "\" lists data file \"" + file.logical_name + "\" with id " +
+							  std::to_string(file.file_id) + ", outside 1..32767");
+		}
+		data_files.push_back(static_cast<uint16_t>(file.file_id));
+	}
+	if (data_files.empty()) {
+		throw FormatError("backup file \"" + first + "\" lists no data file");
+	}
+	try {
+		pages->index = BuildPageIndex(pages->streams, index_options);
+		pages->allocation.reset(new AllocationMap(pages->index, data_files));
+	} catch (FormatError &e) {
+		// Name the backup, as the headers' stage does (a page or file id alone does not say which).
+		throw FormatError("backup file \"" + first + "\": " + e.what());
+	}
+	pages->store.reset(new PageStore(pages->index, *pages->allocation));
+	return pages;
+}
+
 }  // namespace backup
 }  // namespace mssql
 }  // namespace duckdb
