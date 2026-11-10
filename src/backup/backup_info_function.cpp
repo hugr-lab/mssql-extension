@@ -2,14 +2,15 @@
 // HEADERONLY + LABELONLY, with FILELISTONLY as a nested list (spec 085 § Functions). [DuckDB]
 //
 // PR 1 reads the headers only (stage 1): the columns whose source is a later stage are NULL until it
-// lands -- database_version / compatibility_level / collation (the boot page, task 11), page_count
-// (the allocation pages, PR 2), consistent / open_transactions / committed_after_checkpoint (D11's
-// log tail, PR 5), and each file's backup_size_bytes (the page index).
+// lands -- page_count (the allocation pages, PR 2), consistent / open_transactions /
+// committed_after_checkpoint (D11's log tail, PR 5), and each file's backup_size_bytes (the page
+// index). The database's version, level and collation come from the trailer SCIN.
 
 #include "backup/backup_info_function.hpp"
 
 #include "backup/backup_bytes.hpp"
 #include "backup/backup_opened.hpp"
+#include "codec/code_page/code_page_tables.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/hugeint.hpp"
@@ -60,7 +61,7 @@ std::vector<Column> Columns() {
 			{"server_name", LogicalType::VARCHAR},
 			{"database_version", LogicalType::INTEGER},
 			{"compatibility_level", LogicalType::INTEGER},
-			{"collation", LogicalType::VARCHAR},
+			{"collation_name", LogicalType::VARCHAR},
 			{"family_guid", LogicalType::UUID},
 			{"recovery_fork_id", LogicalType::UUID},
 			{"first_recovery_fork_id", LogicalType::UUID},
@@ -120,6 +121,58 @@ Value DateValue(const MtfDate &d, const char *what) {
 	return Value::TIMESTAMP(d.year, d.month, d.day, d.hour, d.minute, d.second, 0);
 }
 
+//! The TDS collation flags a collation's name implies: _CI 0x01, _AI 0x02, kana (0x04) and width (0x08)
+//! ignored unless _KS / _WS, _BIN 0x10, _BIN2 0x20, _UTF8 0x40 (spec 085 § Rules, SCIN +216).
+uint32_t FlagsOfName(const std::string &name) {
+	const std::string padded = "_" + name + "_";
+	auto has = [&](const char *token) { return padded.find(std::string("_") + token + "_") != std::string::npos; };
+	const uint32_t utf8 = has("UTF8") ? 0x40 : 0;
+	if (has("BIN2")) {
+		return 0x20 | utf8;
+	}
+	if (has("BIN")) {
+		return 0x10;
+	}
+	return (has("CI") ? 0x01 : 0) | (has("AI") ? 0x02 : 0) | (has("KS") ? 0 : 0x04) | (has("WS") ? 0 : 0x08) | utf8;
+}
+
+//! The collation the trailer's TDS form names (spec 085 § Rules): a SQL_ collation by its SortId, any
+//! other by its LCID, version and flags; of two names differing only by _SC (no flag carries it), the
+//! one without, as HEADERONLY prints it. NULL when none or still more than one.
+Value CollationValue(uint32_t info, uint8_t sort_id) {
+	if (info == 0 && sort_id == 0) {
+		return Value(LogicalType::VARCHAR);
+	}
+	using codec::code_page::tables::COLLATION_COUNT;
+	using codec::code_page::tables::COLLATIONS;
+	const uint32_t lcid = info & 0xFFFFF;
+	const uint32_t flags = (info >> 20) & 0xFF;
+	const uint32_t version = info >> 28;
+	std::vector<std::string> names;
+	for (size_t i = 0; i < COLLATION_COUNT; i++) {
+		const auto &row = COLLATIONS[i];
+		const std::string name = row.name;
+		const bool sql = name.compare(0, 4, "SQL_") == 0;
+		if (sort_id != 0) {
+			if (sql && (static_cast<uint32_t>(row.collation_id) >> 24) == sort_id) {
+				names.push_back(name);
+			}
+		} else if (!sql && row.lcid == lcid && row.version == version && FlagsOfName(name) == flags) {
+			names.push_back(name);
+		}
+	}
+	if (names.size() > 1) {
+		std::vector<std::string> without_sc;
+		for (const auto &n : names) {
+			if (("_" + n + "_").find("_SC_") == std::string::npos) {
+				without_sc.push_back(n);
+			}
+		}
+		names = without_sc;
+	}
+	return names.size() == 1 ? Value(names.front()) : Value(LogicalType::VARCHAR);
+}
+
 Value Text(const std::string &s) {
 	return s.empty() ? Value(LogicalType::VARCHAR) : Value(s);
 }
@@ -172,9 +225,11 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 	row.push_back(differential ? GuidValue(set.differential_base_guid) : Value(LogicalType::UUID));
 	row.push_back(Text(set.database_name));
 	row.push_back(Text(set.server_name));
-	row.push_back(no_int);						 // database_version: the boot page (task 11)
-	row.push_back(no_int);						 // compatibility_level: the boot page
-	row.push_back(Value(LogicalType::VARCHAR));	 // collation: the boot page
+	// The database's version, compatibility level and collation, from the trailer SCIN (the boot page
+	// cross-checks them in task 11); 0 there is no value.
+	row.push_back(set.database_version ? Value::INTEGER(set.database_version) : no_int);
+	row.push_back(set.compatibility_level ? Value::INTEGER(set.compatibility_level) : no_int);
+	row.push_back(CollationValue(set.collation_info, set.collation_sort_id));
 	row.push_back(GuidValue(set.family_guid));
 	row.push_back(GuidValue(set.recovery_fork_id));
 	row.push_back(GuidValue(set.FirstRecoveryForkId()));
@@ -184,7 +239,12 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 	row.push_back(Text(set.description));
 	row.push_back(Text(set.user_name));
 	row.push_back(Text(set.machine_name));
-	row.push_back(Value(std::to_string(set.software_major) + "." + std::to_string(set.software_minor)));
+	// The server's version as the trailer records it (17.0.4075), else the SSET's major.minor.
+	row.push_back(set.server_version
+					  ? Value(std::to_string(set.server_version >> 24) + "." +
+							  std::to_string((set.server_version >> 16) & 0xFF) + "." +
+							  std::to_string(set.server_version & 0xFFFF))
+					  : Value(std::to_string(set.software_major) + "." + std::to_string(set.software_minor)));
 	row.push_back(DateValue(set.database_creation_date, "database_creation_date"));
 	row.push_back(DateValue(set.backup_start_date, "backup_start_date"));
 	row.push_back(DateValue(set.backup_finish_date, "backup_finish_date"));
@@ -200,7 +260,9 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 	row.push_back(Value::BOOLEAN(false));  // an encrypted backup is refused when opened (spec 087)
 	row.push_back(Value(LogicalType::BLOB));
 	row.push_back(Value::BOOLEAN(checksums));
-	row.push_back(Value::BIGINT(static_cast<int64_t>(backup_size)));
+	// The BackupSize the trailer records (checked against the layout's when the files were opened).
+	row.push_back(
+		Value::BIGINT(static_cast<int64_t>(set.recorded_backup_size ? set.recorded_backup_size : backup_size)));
 	// HEADERONLY's CompressedBackupSize, as the trailer records it (SCIN +344): the set's value, alike in
 	// every family (checked when the families were opened); NULL on a SCIN too short to hold it.
 	row.push_back(set.has_compressed_backup_size ? Value::BIGINT(static_cast<int64_t>(set.compressed_backup_size))

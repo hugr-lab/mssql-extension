@@ -462,16 +462,16 @@ Common named parameters of every function, and ATTACH options of the same names:
 | `first_lsn`, `last_lsn`, `checkpoint_lsn`, `database_backup_lsn` | `DECIMAL(25,0)` | trailer SCIN (MSLS / MQCI) +32 / +42 / +52 / +62, 10 bytes each (E1§3) |
 | `differential_base_lsn`, `differential_base_guid` | `DECIMAL(25,0)`, `UUID` | a differential's base: trailer SCIN +260 / +200 (task 3; E1's "+830 / +842" were offsets in the MQCI stream, which move with the SCIN's length, 41 of 41 differentials); NULL for any other backup, as HEADERONLY (a full establishes the base its own `checkpoint_lsn` and `backup_set_guid` name) |
 | `database_name`, `server_name` | `VARCHAR` | trailer SCIN string descriptors (u16 byte length, u16 offset) at +104 / +108 (task 9: HEADERONLY's DatabaseName / ServerName on 8 of 8 truths, present in every sample); the boot page's `dbi_dbname` cross-checks the first (task 11) |
-| `database_version`, `compatibility_level`, `collation` | `INTEGER`, `INTEGER`, `VARCHAR` | boot page: `dbi_version` +4, `dbi_cmptlevel` +314, `dbi_collation` +392 (name from the collation table) (record offsets, X§4); NULL until task 11 reads the boot page |
+| `database_version`, `compatibility_level`, `collation_name` | `INTEGER`, `INTEGER`, `VARCHAR` | (`collation` is a DuckDB keyword) trailer SCIN (task 9, § Rules): u16 +94, u8 +91, and the collation's TDS form at +216 / +220, named through spec 091's collation table (a `SQL_` collation by its SortId; another by its LCID, version and the flags its name implies; of two names that differ only by `_SC`, the one without, as HEADERONLY prints it; NULL when still not one); the boot page's `dbi_version` / `dbi_cmptlevel` / `dbi_collation` (whose CollationId names an `_SC` collation exactly) cross-check them (task 11) |
 | `family_guid` | `UUID` | trailer SCIN +224 (task 3); the boot page's `dbi_familyGUID` +408 cross-checks it |
 | `recovery_fork_id`, `first_recovery_fork_id`, `fork_point_lsn`, `binding_id` | `UUID`, `UUID`, `DECIMAL(25,0)`, `UUID` | located (task 3, § Rules, header fields): trailer SCIN +156 `RecoveryForkID`, +124 `BindingID`; +172 (10-byte LSN) and +184 (GUID) the fork point and the parent fork, set once the database was restored with recovery; HEADERONLY's `FirstRecoveryForkID` / `ForkPointLSN` are derived from them. The chain check compares the file's fork with the lake's and fails closed: until the fork id is read every apply by LSN, a differential or a full applied incrementally, is refused (089 D7, 023 C1) |
-| `backup_name`, `description`, `user_name`, `machine_name`, `software_version` | `VARCHAR` | SSET strings, VOLB machine name, SSET software major / minor (X§3) |
+| `backup_name`, `description`, `user_name`, `machine_name`, `software_version` | `VARCHAR` | SSET strings, VOLB machine name; `software_version` the server version at trailer SCIN +24 (`17.0.4075`) |
 | `database_creation_date`, `backup_start_date`, `backup_finish_date` | `TIMESTAMP` | located (task 3): trailer SCIN +72 / +77 / +82, MTF dates (5 bytes, big-endian bit fields), as HEADERONLY prints them (server local time) |
 | `media_set_guid`, `family_count`, `family_sequence_number` | `UUID`, `INTEGER`, `INTEGER` | TAPE's RAID stream +0 / u16 +20 / u16 +24 (E2 layouts, checked against LABELONLY; the u16 at +22 is 1 in every sample, perhaps its MirrorCount); the sequence number only when one family is given (a whole set has none). A compressed container's data set has no TAPE: the container keeps it in its header, a chain block at 0x1E0 (4 KB of output) holding the same TAPE DBLK and RAID stream (task 9, 16 of 16 containers; family count 1 in every sample, no compressed striped set yet), so its families are checked as a plain set's |
 | `compressed`, `compression_algorithm` | | `MSSQLBAK` header word @0x0C (§ Rules, container) |
 | `encrypted`, `encryptor_thumbprint` | | `MSSQLBAK` @0x0C bit 0x4, thumbprint @0x18 (E4§1); decryption is spec 087 |
 | `has_backup_checksums` | `BOOLEAN` | MQDA / MQTL media-format attribute 0x100 and the `CSUM` streams (E2§7) |
-| `backup_size`, `compressed_size` | `BIGINT` | `BackupSize` = the sum over the families of (the MSLS block's offset − the soft-filemark size, TAPE's `soft_filemark_block_size` × 512): task 3, on every truth, a 64 KB `BLOCKSIZE` and a striped set included **(2025)**; `compressed_size` is HEADERONLY's CompressedBackupSize as the trailer records it: a u64 at SCIN +344 (task 9: on every truth, compressed and plain, striped and E3's included), the whole set's value in every family (they must agree), equal to `BackupSize` for a plain backup; NULL on a SCIN too short to hold it. Before it was found, a measured formula reproduced it on 29 compressed truths (E14's 24 included): the physical offset of the chain block holding MSLS + half of MSLS's offset in that block − 4096, i.e. the compressed stream's position when the trailer was written, each 1 KB MTF block before MSLS in that block counted as a 512-byte sector |
+| `backup_size`, `compressed_size` | `BIGINT` | `BackupSize` as the trailer records it, SCIN +96, the set's value in every family; checked against the sum over the families of (the MSLS block's offset − the soft-filemark size, TAPE's `soft_filemark_block_size` × 512), which task 3 found on every truth (a 64 KB `BLOCKSIZE` and a striped set included **(2025)**): a file whose two disagree is refused by name; `compressed_size` is HEADERONLY's CompressedBackupSize as the trailer records it: a u64 at SCIN +344 (task 9: on every truth, compressed and plain, striped and E3's included), the whole set's value in every family (they must agree), equal to `BackupSize` for a plain backup; NULL on a SCIN too short to hold it. Before it was found, a measured formula reproduced it on 29 compressed truths (E14's 24 included): the physical offset of the chain block holding MSLS + half of MSLS's offset in that block − 4096, i.e. the compressed stream's position when the trailer was written, each 1 KB MTF block before MSLS in that block counted as a 512-byte sector |
 | `page_count`, `log_tail_bytes` | `BIGINT` | live pages (NULL until PR 2 reads the allocation pages for it); the MQTL streams' log bytes (each stream's length less its 2-byte lead-in) |
 | `consistent`, `open_transactions`, `committed_after_checkpoint` | `BOOLEAN`, `INTEGER`, `INTEGER` | D11, database level (data backups only); NULL until PR 5 |
 | `recovery_model` | `VARCHAR` | located (task 3): trailer SCIN +244, `0x08` SIMPLE, else `0x04` BULK_LOGGED, else FULL (sysdatabases' "trunc. log on chkpt" and "select into/bulkcopy" bits) |
@@ -638,16 +638,46 @@ Byte offsets are from the experiments; each is **(2025)** unless marked otherwis
 E3's, the probe samples and a set made for it -- SIMPLE / BULK_LOGGED / FULL, a 300 MB full whose
 start and finish differ, a restore WITH RECOVERY, a log backup across the fork **(2025)**):
 
-| offset | field |
-|---|---|
-| +32 / +42 / +52 / +62 | FirstLSN, LastLSN, CheckpointLSN, DatabaseBackupLSN (10-byte LSNs: u32 VLF, u32 block, u16 slot) |
-| +72 / +77 / +82 | DatabaseCreationDate, BackupStartDate, BackupFinishDate (MTF dates) |
-| +124 | BindingID |
-| +156 | RecoveryForkID (the database's current fork) |
-| +172 / +184 | the fork point LSN and the parent fork's GUID; zero until a restore WITH RECOVERY |
-| +224 | FamilyGUID |
-| +244 | recovery model bits: 0x08 SIMPLE, 0x04 BULK_LOGGED, neither FULL |
-| +200 / +260 | a differential's base: its GUID and LSN (zero in a full) |
+The whole record (task 9; SQL Server 2025, 430-448 bytes: a 400-byte fixed part, then the UTF-16
+strings its descriptors point at). **Pinned** = equal to HEADERONLY / LABELONLY / msdb on every truth
+with more than one distinct value (41 backups of `test/data/backup/`, T3, E3, E14's 24 and E15's 8
+databases of 8 collations and 6 compatibility levels). The names in quotes are those of the 010 Editor
+template `tape.bt` (CaledoniaProject/public-src, no licence: facts only), the only prior source that
+names SCIN's fields; it describes the record as it was before backup compression and ends at +344.
+
+| offset | field | evidence |
+|---|---|---|
+| +0 / +4 | tag `SCIN`, u32 record length | pinned |
+| +8 | u32 Flags: 16 HasBackupChecksums, 1024 IsCopyOnly, 2048 seen on the differential, 512 on every backup | pinned (4 values); bits from the boolean columns |
+| +12 / +16 / +20 | u32 data file count, log file count, "next id" | `tape.bt`; 1 / 2 / 3 data files on E2 / its fg2 set |
+| +24 | u32 server version: major << 24, minor << 16, build (17.0.4075) | `tape.bt`; HEADERONLY's SoftwareVersion* (one server) |
+| +28 | u32 processor architecture (9 = AMD64) | `tape.bt` |
+| +32 / +42 / +52 / +62 | FirstLSN, LastLSN, CheckpointLSN, DatabaseBackupLSN (10-byte LSNs: u32 VLF, u32 block, u16 slot) | pinned |
+| +72 / +77 / +82 | DatabaseCreationDate, BackupStartDate, BackupFinishDate (MTF dates) | pinned |
+| +87 | u8 backup type: `D` full, `I` differential, `L` log (msdb `backupset.type`) | `tape.bt`; every sample |
+| +88 / +89 / +90 | u8 SortOrder, sort-order status, code page | +88 pinned against SortOrder (E15) |
+| +91 | u8 CompatibilityLevel | pinned (E15: 120 … 170) |
+| +92 | u16 database id | `tape.bt`; 5 / 11 / 20 / 25 / 26 |
+| +94 | u16 DatabaseVersion (998) | `tape.bt`; HEADERONLY (one server) |
+| +96 | u64 BackupSize, the set's | pinned (13 values; every family of a set holds it) |
+| +104 / +108 | DatabaseName, ServerName: (u16 byte length, u16 offset) descriptors | pinned |
+| +112 | "minimum restart page" | `tape.bt` |
+| +116 / +120 | u32 UnicodeLocaleId, u32 UnicodeComparisonStyle | pinned (E15) |
+| +124 | BindingID | pinned |
+| +140 | "file generation" | `tape.bt` |
+| +144 … +199 | the recovery fork name stack: two (10-byte LSN, u16, GUID) entries -- +144 / +156 the current fork (+156 RecoveryForkID), +172 / +184 the fork point and the parent fork, zero until a restore WITH RECOVERY | pinned / `tape.bt` |
+| +200 | "last full base GUID": a differential's base backup set | pinned |
+| +216 / +220 | Collation, TDS's five bytes: u32 LCID (20 bits), flags (8: 0x01 CI, 0x02 AI, 0x04 kana and 0x08 width ignored, 0x10 BIN, 0x20 BIN2, 0x40 UTF8), version (4); u8 SortId | pinned (E15's 8 collations). No flag marks `_SC`: HEADERONLY itself prints `Latin1_General_100_CI_AS` for `Latin1_General_100_CI_AS_SC` |
+| +224 | FamilyGUID | pinned |
+| +240 | u32 MAXTRANSFERSIZE of the backup | pinned (E14: 64 KB, 1 MB, 4 MB) |
+| +244 | database status: recovery model bits 0x08 SIMPLE, 0x04 BULK_LOGGED, neither FULL | pinned |
+| +248 | "log chain origin" LSN | `tape.bt`; LSN-shaped in every sample |
+| +260 / +272 | a single differential's base LSN and GUID (zero in a full) | pinned (+272 the GUID again) |
+| +288 | 16 unused bytes | `tape.bt`; zeros |
+| +304 / +316 | "restore path origin" LSN and GUID | `tape.bt` |
+| +332 | "oldest active backup" LSN | `tape.bt`; LSN-shaped |
+| +344 | u64 CompressedBackupSize, the set's (equal to BackupSize for a plain backup) | pinned (37 values); appended with backup compression, past `tape.bt`'s struct |
+| +352 … +399 | unknown: u32 1, 2, 3 at +380 … +388, and a value that varies (on a log backup, five bytes at +372) | -- |
 
 The MQCI stream is a run of records, each `tag[4] ‖ u32 length` (the length includes the 8 bytes),
 covering the stream exactly: SCIN, one SFGI per filegroup, one SFIN per file. **SFIN** (task 3; 310

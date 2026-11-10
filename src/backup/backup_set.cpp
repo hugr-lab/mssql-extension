@@ -217,6 +217,12 @@ static void ReadTrailer(const RandomAccess &file, const MtfBlock &msls, BackupSe
 				set.compressed_backup_size = record.U64(SCIN_COMPRESSED_SIZE_AT);
 				set.has_compressed_backup_size = true;
 			}
+			set.server_version = record.U32(24);
+			set.compatibility_level = record.U8(91);
+			set.database_version = record.U16(94);
+			set.recorded_backup_size = record.U64(96);
+			set.collation_info = record.U32(216);
+			set.collation_sort_id = record.U8(220);
 			set.database_name = ReadRecordString(record, 104);
 			set.server_name = ReadRecordString(record, 108);
 			set.first_lsn = ReadLsn(record, 32);

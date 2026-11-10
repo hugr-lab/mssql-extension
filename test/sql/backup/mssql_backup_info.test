@@ -16,6 +16,13 @@ FROM mssql_backup_info('test/data/backup/full.bak');
 ----
 full	false	true	4415488	4415488	44000000207200001	44000000209600001	44000000207200001	0	bak_sample	FULL	1
 
+# The database's version, compatibility level and collation, and the server's version, from the trailer SCIN.
+query IITT
+SELECT database_version, compatibility_level, collation_name, software_version
+FROM mssql_backup_info('test/data/backup/full.bak');
+----
+998	170	SQL_Latin1_General_CP1_CI_AS	17.0.4075
+
 # Its files, as FILELISTONLY lists them.
 query TTII
 SELECT f.logical_name, f.type, f.file_id, f.size_bytes

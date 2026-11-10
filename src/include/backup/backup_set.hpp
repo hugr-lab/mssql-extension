@@ -115,6 +115,16 @@ struct BackupSetHeader {
 	//! of 8 against HEADERONLY, and in every sample).
 	std::string database_name;
 	std::string server_name;
+	//! More of the trailer SCIN (task 9, spec 085 § Rules): the server's version (+24: major << 24,
+	//! minor << 16, build), the database's version (+94), its compatibility level (+91), its collation
+	//! in TDS's form (+216: LCID, flags, version; +220: SortId), and the BackupSize the trailer records
+	//! (+96, the set's; 0 when not recorded). 0 where a field is absent.
+	uint32_t server_version = 0;
+	uint16_t database_version = 0;
+	uint8_t compatibility_level = 0;
+	uint32_t collation_info = 0;
+	uint8_t collation_sort_id = 0;
+	uint64_t recorded_backup_size = 0;
 	Lsn first_lsn;
 	Lsn last_lsn;
 	Lsn checkpoint_lsn;

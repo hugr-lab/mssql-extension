@@ -149,6 +149,22 @@ std::unique_ptr<OpenedHeaders> OpenBackupHeaders(ClientContext &context, const s
 	for (auto &entry : by_sequence) {
 		ordered.push_back(std::move(families[entry.second]));
 	}
+	// The BackupSize the trailer records (the set's, alike in every family) against the one the files'
+	// layout gives (the families' MSLS offsets, task 3): two readings of one number.
+	uint64_t computed = 0;
+	for (const auto &f : ordered) {
+		computed += f->set.backup_size;
+		if (f->set.recorded_backup_size != ordered.front()->set.recorded_backup_size) {
+			throw FormatError("backup files \"" + source.Path(ordered.front()->file) + "\" and \"" +
+							  source.Path(f->file) + "\" record different sizes of their backup set (BackupSize)");
+		}
+	}
+	if (ordered.front()->set.recorded_backup_size != 0 && ordered.front()->set.recorded_backup_size != computed) {
+		throw FormatError("backup file \"" + source.Path(ordered.front()->file) +
+						  "\": its trailer records a BackupSize of " +
+						  std::to_string(ordered.front()->set.recorded_backup_size) + " bytes, its layout gives " +
+						  std::to_string(computed));
+	}
 	families = std::move(ordered);
 	return opened;
 }
