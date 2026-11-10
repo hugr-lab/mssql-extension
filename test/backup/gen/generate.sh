@@ -176,13 +176,14 @@ for fixture in ${FIXTURES}; do
 		;;
 	load)
 		# The workload in the background, the backups once it is committing, then it is stopped and
-		# waited for (its session gone). Its output goes to a log, shown when it did not run.
-		docker exec -d -e SQLCMDPASSWORD "${CONTAINER}" sh -c '"$@" >/tmp/gen/workload.log 2>&1' sh \
+		# waited for (its session gone). Its output goes to a log, shown when it did not run: in /tmp,
+		# which the server's user can write (from the 2019 image on it is mssql; /tmp/gen is root's).
+		docker exec -d -e SQLCMDPASSWORD "${CONTAINER}" sh -c '"$@" >/tmp/workload.log 2>&1' sh \
 			"${SQLCMD[@]}" -S localhost -U sa -b -i /tmp/gen/load_workload.sql
 		ticks() { scalar "SELECT ticks FROM bak_load.dbo.control"; }
 		workload_failed() {	# $1 = what went wrong
 			echo "ERROR: the load fixture's workload $1; its log:" >&2
-			docker exec "${CONTAINER}" cat /tmp/gen/workload.log >&2 || true
+			docker exec "${CONTAINER}" cat /tmp/workload.log >&2 || true
 			exit 1
 		}
 		for _ in $(seq 1 60); do
