@@ -121,10 +121,6 @@ public:
 	//! Read, with a page that is not live a FormatError too, naming `what` (the reader that needed it).
 	void ReadLive(uint16_t file, uint32_t page, Page &out, const char *what) const;
 
-	const AllocationMap &Allocation() const {
-		return allocation_;
-	}
-
 private:
 	//! A version-0 copy of live page `want` that is Pending: the backup has a pass after the first,
 	//! and the copy is all zeros or names `want`.

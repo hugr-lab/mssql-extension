@@ -6,8 +6,8 @@
 // Spec 085 task 11 (PR 2b step 2): the boot page, 1:9 -- one primary record of fixed columns only
 // (statusA 0x00), whose length grows with the version (1644 bytes on 2017, 1768 on 2019, 1786 on
 // 2022, 1832 on 2025) while the fields the reader takes keep their place, measured on the lane's
-// 2017-2025 backups (2026-11-10): dbi_version u16 +4, dbi_dbname UTF-16 at +52 (128 units, padded) with
-// its length in bytes, u16 +308, dbi_cmptlevel u8 +314, dbi_collation (a CollationId) u32 +392,
+// 2017-2025 sets of the samples' database in R2 (2026-11-10): dbi_version u16 +4, dbi_dbname UTF-16 at +52 (128 units,
+// padded) with its length in bytes, u16 +308, dbi_cmptlevel u8 +314, dbi_collation (a CollationId) u32 +392,
 // dbi_familyGUID +408, dbi_firstSysIndexes (the first sysallocunits page, a 6-byte pointer) +516.
 //
 // The trailer (SCIN) records the same database's name, version, level, collation and family GUID:

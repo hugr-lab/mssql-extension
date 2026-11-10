@@ -557,7 +557,7 @@ src/backup/                         namespace duckdb::mssql::backup (no prefix);
   backup_page_index.cpp             PageIndex: every unit of every MSDA pass of every family; latest copy
   backup_allocation.cpp             AllocationMap: file header Size, GAM, PFS on demand; IsLive (R3)
   backup_iam.cpp                    IamChain: an AU's IAM pages → its extent runs and single pages (DQ-40)
-  backup_page_store.cpp             PageStore: page bytes by (file, page); differential overlay
+  backup_page.cpp                   PageStore: a live page's latest copy by (file, page); differential overlay
   backup_boot.cpp                   the boot page (1:9), checked against the trailer
   backup_system_tables.cpp          the five bootstrap layouts (literals, checked), generic base-table decoder
   backup_sql_variant.cpp            sql_variant values of the base tables (defaults, flags, boundaries)
@@ -569,7 +569,7 @@ src/backup/                         namespace duckdb::mssql::backup (no prefix);
   backup_log_tail.cpp               LogTail: MQTL blocks, sector parity, record headers, transactions
   backup_fuzzy.cpp                  FuzzyStatus: E3 flag (v) per table
   backup_opened.cpp                 OpenedBackup: the cached object, staged build, cache key           [DuckDB]
-src/backup/functions/               mssql_backup_info / _tables / _views / _catalog / _scan            [DuckDB]
+src/backup/backup_*_function.cpp    mssql_backup_info / _tables / _views / _catalog / _scan            [DuckDB]
 src/catalog/backup/                 namespace duckdb, MSSQL prefix                                      [DuckDB]
   mssql_backup_storage.cpp          StorageExtension (attach, transaction manager)
   mssql_backup_catalog.cpp          MSSQLBackupCatalog
@@ -1065,7 +1065,8 @@ A backup file is untrusted input (R§9). Every parser:
   record ends against the slot's span; column counts against the layout; variable end offsets
   monotonic and within the record; null bitmap within the record.
 - **Terminates**: the MTF walk advances strictly; a block chain cannot loop (offsets increase); LOB
-  trees carry a visited set of node RIDs, a depth limit (32) and a total-length limit (2^31 − 1);
+  trees carry a visited set of node RIDs, a depth limit (32) and a total-length limit (2^31 − 1) -- the
+  scan's (PR 3); the catalog's own reader, `backup_lob`, takes 16 levels and 64 MiB a value;
   forwarding is one hop (a stub pointing at a stub is refused).
 - **Decompresses with declared sizes**: XPRESS never writes past `unit × 512` and validates the
   Huffman table (lengths ≤ 15, a complete prefix code); a match before the block start or past its end
@@ -1244,6 +1245,19 @@ before the next opens.
 17. `mssql_backup_tables`, `mssql_backup_views`, `mssql_backup_catalog`; in the lane, compared with
     the restored database's catalog views — 2.5 d
 18. Fuzz harness catalog — 0.5 d
+
+*PR 2b as landed (2026-11-10).* Tasks 11a, 11, 11b, 12, 13 (the collation mapping; the single-byte
+kernel is the scan's, 2d), 17 and 18. Moved: 11a's per-AU runs, buffer-managed and kept in the opened
+backup, are built at a table's first scan, so they come with the scan (2d); 2b walks a chain when it
+reads a base table. Pulled in: the part of task 20 the catalog needs -- an in-row LOB root over DATA /
+SMALL_ROOT / INTERNAL / LARGE_ROOT fragments, for a view's definition past 8,000 bytes
+(`backup_lob`; the scan's LOBs, row-overflow and text pointers stay PR 3's) -- and `fuzz_backup_catalog`
+walks it. Found by the new fixtures and fixed here: a later GAM interval's allocation pages (E17); the
+file header's Size read by column, and a lower bound; the file list as the backup began (MSCI), a
+removed file (SFIN 0x20) left out (E19); a page that became live while the backup ran (`Pending`);
+the golden catalog files the generator never wrote (sqlcmd's `:OUT` substitution). The comparisons
+with the server's catalog ran locally on 2022; the lane runs them on 2017–2025 once the PR's branch
+is pushed.
 
 *PR 2c — partitioning*
 

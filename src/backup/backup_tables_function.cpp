@@ -10,10 +10,11 @@
 // MSSQLColumnInfo::MapSQLServerTypeToDuckDB, TYPE mssql's map with native types off (a plain VARCHAR
 // where mssql_catalog_native_types reports MSSQL_NVARCHAR(n)).
 
-#include "backup/backup_catalog_functions.hpp"
+#include "backup/backup_tables_function.hpp"
 
 #include "backup/backup_bytes.hpp"
 #include "backup/backup_collation.hpp"
+#include "backup/backup_function_common.hpp"
 #include "backup/backup_opened.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/common/exception.hpp"
@@ -119,18 +120,6 @@ Value Text(const std::string &s) {
 
 Value OptionalText(const std::string &s) {
 	return s.empty() ? Value(LogicalType::VARCHAR) : Value(s);
-}
-
-//! A datetime as the catalog stores it (u32 ticks of 1/300 s, then i32 days since 1900-01-01), read as
-//! TYPE mssql reads one off the wire (days, then ticks): one conversion for both.
-Value DatetimeValue(const std::string &record_form) {
-	if (record_form.size() != 8) {
-		return Value(LogicalType::TIMESTAMP);
-	}
-	uint8_t wire[8];
-	std::memcpy(wire, record_form.data() + 4, 4);
-	std::memcpy(wire + 4, record_form.data(), 4);
-	return Value::TIMESTAMP(tds::encoding::DateTimeEncoding::ConvertDatetime(wire));
 }
 
 std::string CompressionName(uint8_t level) {
@@ -319,8 +308,8 @@ std::vector<Value> TableRow(const CatalogTable &t) {
 	row.push_back(OptionalText(compression));
 	row.push_back(Value::INTEGER(static_cast<int32_t>(t.partitions.size())));
 	row.push_back(Value::BIGINT(t.row_count));
-	row.push_back(DatetimeValue(t.created));
-	row.push_back(DatetimeValue(t.modified));
+	row.push_back(RecordDatetimeValue(t.created));
+	row.push_back(RecordDatetimeValue(t.modified));
 	row.push_back(Value::BOOLEAN(t.decodable));
 	row.push_back(OptionalText(t.reason));
 	row.push_back(Value(LogicalType::VARCHAR));	 // fuzzy_status: D11 (PR 5)
@@ -356,8 +345,8 @@ std::vector<Value> ViewRow(const PageStore &store, const CatalogView &v) {
 	row.push_back(Value::INTEGER(v.object_id));
 	row.push_back(definition);
 	row.push_back(Value::BOOLEAN(v.is_encrypted));
-	row.push_back(DatetimeValue(v.created));
-	row.push_back(DatetimeValue(v.modified));
+	row.push_back(RecordDatetimeValue(v.created));
+	row.push_back(RecordDatetimeValue(v.modified));
 	row.push_back(OptionalText(reason));
 	return row;
 }
@@ -387,27 +376,6 @@ struct CatalogListState : public GlobalTableFunctionState {
 
 const char *FunctionName(Listing listing) {
 	return listing == Listing::Tables ? "mssql_backup_tables" : "mssql_backup_views";
-}
-
-vector<std::string> PathsOf(const Value &value, const char *function) {
-	vector<std::string> paths;
-	if (value.IsNull()) {
-		throw InvalidInputException("%s: the path is NULL", function);
-	}
-	if (value.type().id() == LogicalTypeId::LIST) {
-		for (const auto &child : ListValue::GetChildren(value)) {
-			if (child.IsNull()) {
-				throw InvalidInputException("%s: a NULL in the list of paths", function);
-			}
-			paths.push_back(child.ToString());
-		}
-		if (paths.empty()) {
-			throw InvalidInputException("%s: an empty list of paths", function);
-		}
-	} else {
-		paths.push_back(value.ToString());
-	}
-	return paths;
 }
 
 template <Listing L>
@@ -465,7 +433,7 @@ void Register(ExtensionLoader &loader, const char *description, std::vector<std:
 
 }  // namespace
 
-void RegisterBackupCatalogFunctions(ExtensionLoader &loader) {
+void RegisterBackupTablesFunctions(ExtensionLoader &loader) {
 	Register<Listing::Tables>(
 		loader,
 		"Lists the user tables in a SQL Server full backup (.bak), read from the file alone: schema, name, "

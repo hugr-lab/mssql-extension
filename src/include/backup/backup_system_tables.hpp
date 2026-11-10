@@ -20,9 +20,9 @@
 // through their IAM chains (DQ-40), found by their fixed allocation unit ids. Once read, every
 // literal is checked against the tables' own description of themselves (sysrscols + syscolpars), so
 // a version that moves a field is refused by name rather than misread. Measured on the lane's
-// 2017-2025 backups (2026-11-10): the fields sit where the literals put them on all four; 2022 added
-// a trailing sysrscols column (ordlock), which the literals do not take. Any other system table is
-// read through its own description (ReadSystemTable). DuckDB-free (D15).
+// 2017-2025 sets of the samples' database in R2 (2026-11-10): the fields sit where the literals put them on all four;
+// 2022 added a trailing sysrscols column (ordlock), which the literals do not take. Any other system table is read
+// through its own description (ReadSystemTable). DuckDB-free (D15).
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -126,9 +126,9 @@ struct SystemRow {
 std::vector<SystemValue> DecodeRecord(const RecordView &record, const RowsetLayout &layout);
 
 //! Value `value` of column `column` of `layout` as an integer (tinyint / smallint / int / bigint /
-//! bit, sign-extended), a string (nvarchar / nchar as UTF-16, every unit kept; char / varchar bytes as
-//! they are), a binary(6) page pointer. NULL is `null_value`, "" and the null pointer. A value of
-//! another type, or of another size than its type's, is a FormatError naming the column.
+//! bit; tinyint and bit unsigned, the others sign-extended), a string (nvarchar / nchar as UTF-16, every unit kept;
+//! char / varchar bytes as they are), a binary(6) page pointer. NULL is `null_value`, "" and the null pointer. A value
+//! of another type, or of another size than its type's, is a FormatError naming the column.
 int64_t ValueInt(const RowsetLayout &layout, size_t column, const SystemValue &value, int64_t null_value = 0);
 std::string ValueText(const RowsetLayout &layout, size_t column, const SystemValue &value);
 PagePointer ValuePointer(const RowsetLayout &layout, size_t column, const SystemValue &value);

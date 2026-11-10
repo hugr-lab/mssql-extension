@@ -18,10 +18,11 @@ src/
                         # backup_source (DuckDB FileSystem, ranges), backup_mtf, backup_container
                         # (MSSQLBAK) + backup_xpress / backup_zstd, backup_set (TAPE/SSET/SCIN/SFIN),
                         # backup_opened (OpenedHeaders), backup_page_index / _pass_search /
-                        # _allocation (pages, PR 2), backup_page / _record / _boot / _iam /
-                        # _system_tables / _sql_variant / _lob / _catalog_model (PageStore, records,
-                        # IAM chains, the base tables, the catalog model; PR 2b),
-                        # backup_info_function. DuckDB-free except
+                        # _allocation (pages, PR 2), backup_page / _record / _boot / _collation /
+                        # _iam / _system_tables / _sql_variant / _lob / _catalog_model (PageStore,
+                        # records, the boot page, IAM chains, the base tables, the catalog model; PR 2b),
+                        # backup_info_function / _tables_function / _catalog_function (+ _function_common).
+                        # DuckDB-free except
                         # the files whose header says [DuckDB] (D15)
   catalog/              # DuckDB catalog integration + transaction manager
   codec/                # Per-type-family codec layer (spec 045): boolean/integer/
@@ -49,7 +50,7 @@ test/
   sql/                  # SQLLogicTest files (require SQL Server for most)
     attach/             # ATTACH/DETACH tests
     azure/              # Azure AD authentication tests (no SQL Server required)
-    backup/             # mssql_backup_info / _tables / _views over test/data/backup (no SQL Server required)
+    backup/             # mssql_backup_info / _tables / _views / _catalog over test/data/backup (no SQL Server required)
     catalog/            # Catalog, DDL, filter pushdown, statistics
     copy/               # COPY TO MSSQL (BulkLoadBCP) tests
     ctas/               # CREATE TABLE AS SELECT tests

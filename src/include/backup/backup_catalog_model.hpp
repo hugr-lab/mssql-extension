@@ -32,7 +32,9 @@
 #include "backup/backup_system_tables.hpp"
 
 #include <cstdint>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace duckdb {
@@ -43,6 +45,46 @@ struct CatalogSchema {
 	int32_t id = 0;
 	std::string name;
 };
+
+//! sysschobjs.status / syscolpars.status bits the catalog reads (pinned on the catalog fixture, 2022).
+static constexpr int32_t OBJECT_MS_SHIPPED = 0x1;
+static constexpr int32_t VIEW_ENCRYPTED = 0x10000;
+static constexpr int32_t COLUMN_NOT_NULL = 0x1;
+static constexpr int32_t COLUMN_IDENTITY = 0x4;
+static constexpr int32_t COLUMN_ROWGUIDCOL = 0x8;
+static constexpr int32_t COLUMN_COMPUTED = 0x10;
+static constexpr int32_t COLUMN_PERSISTED = 0x40;
+static constexpr int32_t COLUMN_SPARSE = 0x1000000;
+static constexpr int32_t COLUMN_SET = 0x2000000;
+
+//! A user table: type 'U ', not MS-shipped (the trace_xe_* tables every database lists are).
+bool IsUserTable(const SysObject &o);
+//! A view, not MS-shipped (encrypted or not: VIEW_ENCRYPTED tells).
+bool IsUserView(const SysObject &o);
+//! A view whose definition may be read: a user view not WITH ENCRYPTION.
+bool IsReadableView(const SysObject &o);
+//! A default constraint (type 'D '), not MS-shipped.
+bool IsUserDefault(const SysObject &o);
+
+//! The sysobjvalues rows that may leave the reader (DQ-11: module source never does), each checked
+//! against the object it belongs to: valclass 1 of a readable view or a default, with subobjid and
+//! valnum 0; valclass 2 (a computed column's definition) of a computed column of a user table -- not by
+//! the class alone, since a multi-statement function's return table can have a computed column and its
+//! definition is a valclass 2 row of the function (measured: an encrypted TVF's); valclass 30 of a
+//! partition function (sysclsobjs class 30). Any other row is kept back.
+class ObjectValueFilter {
+public:
+	ObjectValueFilter(const BootstrapTables &tables, std::set<int32_t> partition_functions);
+	bool Keep(int64_t valclass, int32_t object_id, int64_t sub_id, int64_t valnum) const;
+
+private:
+	std::set<int32_t> definitions_;
+	std::set<std::pair<int32_t, int32_t>> computed_;
+	std::set<int32_t> partition_functions_;
+};
+
+//! The partition functions of the database: sysclsobjs class 30, read through `store`.
+std::set<int32_t> ReadPartitionFunctions(const PageStore &store, const BootstrapTables &tables);
 
 //! A module's text (a view's definition, a computed column's): read when in row; an off-row one is
 //! kept as its LOB root and read on demand (ReadModuleDefinition), so listing a catalog never reads

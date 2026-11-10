@@ -14,15 +14,6 @@ namespace backup {
 
 namespace {
 
-constexpr int32_t OBJECT_MS_SHIPPED = 0x1;
-constexpr int32_t VIEW_ENCRYPTED = 0x10000;
-constexpr int32_t COLUMN_NOT_NULL = 0x1;
-constexpr int32_t COLUMN_IDENTITY = 0x4;
-constexpr int32_t COLUMN_ROWGUIDCOL = 0x8;
-constexpr int32_t COLUMN_COMPUTED = 0x10;
-constexpr int32_t COLUMN_PERSISTED = 0x40;
-constexpr int32_t COLUMN_SPARSE = 0x1000000;
-constexpr int32_t COLUMN_SET = 0x2000000;
 constexpr int64_t MODULE_TEXT_LATIN1 = 0x2;
 constexpr int64_t CLASS_SCHEMA = 50;
 constexpr uint8_t OWNER_PARTITION = 1;
@@ -273,6 +264,65 @@ bool ByName(const std::string &as, const std::string &an, const std::string &bs,
 
 }  // namespace
 
+bool IsUserTable(const SysObject &o) {
+	return o.type == "U " && !(o.status & OBJECT_MS_SHIPPED);
+}
+
+bool IsUserView(const SysObject &o) {
+	return o.type == "V " && !(o.status & OBJECT_MS_SHIPPED);
+}
+
+bool IsReadableView(const SysObject &o) {
+	return IsUserView(o) && !(o.status & VIEW_ENCRYPTED);
+}
+
+bool IsUserDefault(const SysObject &o) {
+	return o.type == "D " && !(o.status & OBJECT_MS_SHIPPED);
+}
+
+ObjectValueFilter::ObjectValueFilter(const BootstrapTables &tables, std::set<int32_t> partition_functions)
+	: partition_functions_(std::move(partition_functions)) {
+	std::set<int32_t> user_tables;
+	for (const auto &o : tables.objects) {
+		if (IsReadableView(o) || IsUserDefault(o)) {
+			definitions_.insert(o.id);
+		}
+		if (IsUserTable(o)) {
+			user_tables.insert(o.id);
+		}
+	}
+	for (const auto &c : tables.columns) {
+		if (c.number == 0 && (c.status & COLUMN_COMPUTED) && user_tables.count(c.object_id)) {
+			computed_.insert(std::make_pair(c.object_id, c.column_id));
+		}
+	}
+}
+
+bool ObjectValueFilter::Keep(int64_t valclass, int32_t object_id, int64_t sub_id, int64_t valnum) const {
+	switch (valclass) {
+	case 1:
+		return sub_id == 0 && valnum == 0 && definitions_.count(object_id) > 0;
+	case 2:
+		return valnum == 0 && computed_.count(std::make_pair(object_id, static_cast<int32_t>(sub_id))) > 0;
+	case 30:
+		return partition_functions_.count(object_id) > 0;
+	default:
+		return false;
+	}
+}
+
+std::set<int32_t> ReadPartitionFunctions(const PageStore &store, const BootstrapTables &tables) {
+	std::set<int32_t> out;
+	const SystemTable classes = ReadSystemTable(store, tables, "sysclsobjs");
+	const size_t cls = classes.Column("class"), id = classes.Column("id");
+	for (size_t r = 0; r < classes.rows.size(); r++) {
+		if (classes.Int(r, cls) == 30) {
+			out.insert(static_cast<int32_t>(classes.Int(r, id)));
+		}
+	}
+	return out;
+}
+
 std::string ModuleText(const std::string &bytes, int64_t flags, const std::string &what) {
 	if (flags & MODULE_TEXT_LATIN1) {
 		return Utf8OfLatin1(bytes);
@@ -344,15 +394,12 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 	std::set<int32_t> wanted;
 	std::vector<const SysObject *> user_tables, views;
 	for (const auto &o : tables.objects) {
-		if (o.status & OBJECT_MS_SHIPPED) {
-			continue;
-		}
-		if (o.type == "U ") {
+		if (IsUserTable(o)) {
 			user_tables.push_back(&o);
 			wanted.insert(o.id);
-		} else if (o.type == "V ") {
+		} else if (IsUserView(o)) {
 			views.push_back(&o);
-			if (!(o.status & VIEW_ENCRYPTED)) {
+			if (IsReadableView(o)) {
 				wanted.insert(o.id);  // an encrypted view's bytes are obfuscated, not text
 			}
 		}

@@ -207,9 +207,12 @@ open-pass and memory bounds.
 | E10 | the log tail of a TDE backup | 087, 090 | 3–5 d | planned |
 | E12 | does a full backup's first pass carry exactly the GAM-allocated extents, in order (so the open reads the allocation pages, not every page) | 085 (D4a, task 7) | 1.5 d | **done** (`research/experiments/E12-gam-rank.md`): yes for one media family, 56 of 56 fulls; not per family on a striped set |
 | E13 | are passes ordered, and can a compressed backup's block be found without walking its chain (so a striped or compressed backup opens by search) | 085 (D4a, DQ-41, task 7a) | 1 d | **done** (`research/experiments/E13-ordered-passes-search.md`): 210 of 210 passes ascending; a container's block = one extent group; resync from any offset, 0 wrong in 3.6 M probes |
+| E17 | where a later GAM interval puts its allocation pages | 085 (PR 2b, allocation) | — | **done** (`research/experiments/E17-gam-intervals.md`): GAM, SGAM, DCM, BCM at +0, +1, +6, +7 of the interval |
+| E18 | does the boot page follow a rename, a level change and a restore under another name | 085 (PR 2b, the boot page check) | — | **done** (`research/experiments/E18-boot-page.md`): it does; the check passes |
+| E19 | IAM chains across two files and after a file is removed | 085 (PR 2b, DQ-40) | — | **done** (`research/experiments/E19-iam-chains.md`): a page per (file, interval); not renumbered after a removal (chains start at 1); the removed file an SFIN record flagged 0x20 |
 | E11 | columnstore in differentials (incl. a partitioned CCI's SPLIT / MERGE, a SWITCH with an OPEN delta store, rowgroup id reuse), and the tuple mover during a backup | 088, 089 | 3.5 d | planned |
 
-(E8, the import commit cost, was not run, R§12.) R§12 lists E9–E11 as planned; E12 joined with 085 D4a, E13 with DQ-41 (2026-11-09).
+(E8, the import commit cost, was not run, R§12.) R§12 lists E9–E11 as planned; E12 joined with 085 D4a, E13 with DQ-41 (2026-11-09), E17-E19 with PR 2b (2026-11-10).
 
 ## Decisions for the owner
 

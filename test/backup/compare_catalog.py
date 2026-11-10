@@ -13,7 +13,8 @@ to the microsecond); per column: id, name, type name (sql_type's base, or an ali
 system type id, length, precision, scale, collation, nullable, identity, computed, sparse; per view:
 object id, encrypted, and the definition's length and SHA-256 over UTF-16LE (sys.sql_modules'
 nvarchar). mssql_backup_catalog: every base table it lists read whole, its count the rowset's, and the
-sysobjvalues rows it serves exactly <set>.modules.txt's (DQ-11: no module source). Exits 1 on any
+sysobjvalues rows it serves exactly <set>.modules.txt's (DQ-11: no module source). A full set with no
+golden (one taken under a workload) is opened too: mssql_backup_tables lists it or refuses by name. Exits 1 on any
 difference, or when fewer than --min-fields fields were compared.
 """
 import argparse
@@ -21,6 +22,7 @@ import hashlib
 import importlib.util
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timedelta
 
@@ -29,6 +31,16 @@ _spec = importlib.util.spec_from_file_location(
 compare_info = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(compare_info)
 sql_string, DuckDB = compare_info.sql_string, compare_info.DuckDB
+
+
+def try_query(self, statement):
+    """compare_info's DuckDB.query, but a failure is (False, its message) rather than an exit."""
+    script = self.preamble + ".mode json\n" + statement.rstrip().rstrip(";") + ";\n"
+    run = subprocess.run([self.binary, "-no-agent", "-bail"], input=script, capture_output=True, text=True)
+    return run.returncode == 0, (run.stdout if run.returncode == 0 else run.stderr + run.stdout)
+
+
+DuckDB.try_query = try_query
 
 
 def parse_golden(text):
@@ -140,13 +152,13 @@ def compare_set(c, db, name, arg, texts):
         served = db.query(f"SELECT count(*)::VARCHAR AS n FROM mssql_backup_catalog({arg}, {sql_string(r['base_table'])})")
         if r["row_count"] is not None:
             c.check(f"{name}: mssql_backup_catalog {r['base_table']}", "rows", served[0]["n"], r["row_count"])
-    if f"{name}.modules.txt" in texts:
-        ours = {(r["valclass"], r["objid"], r["subobjid"]) for r in db.query(
-            "SELECT DISTINCT valclass::VARCHAR AS valclass, objid::VARCHAR AS objid, subobjid::VARCHAR AS subobjid "
-            f"FROM mssql_backup_catalog({arg}, 'sysobjvalues')")}
-        theirs = {(r["valclass"], r["objid"], r["subobjid"]) for r in parse_golden(texts[f"{name}.modules.txt"])}
-        c.check(f"{name}: mssql_backup_catalog sysobjvalues", "rows served (valclass, objid, subobjid)",
-                sorted(ours), sorted(theirs))
+    # main() requires <set>.modules.txt beside .tables.txt.
+    ours = {(r["valclass"], r["objid"], r["subobjid"]) for r in db.query(
+        "SELECT DISTINCT valclass::VARCHAR AS valclass, objid::VARCHAR AS objid, subobjid::VARCHAR AS subobjid "
+        f"FROM mssql_backup_catalog({arg}, 'sysobjvalues')")}
+    theirs = {(r["valclass"], r["objid"], r["subobjid"]) for r in parse_golden(texts[f"{name}.modules.txt"])}
+    c.check(f"{name}: mssql_backup_catalog sysobjvalues", "rows served (valclass, objid, subobjid)",
+            sorted(ours), sorted(theirs))
 
 
 def main():
@@ -178,8 +190,17 @@ def main():
     compared = 0
     for name, file_list in sets:
         if f"{name}.tables.txt" not in texts:
+            # No golden (a backup taken under a workload, a differential, a log): a full's catalog is
+            # still opened -- it lists, or is refused by name for a page that became live while the
+            # backup ran (its content in the log tail) --, never a crash or an unnamed error.
+            arg = "[" + ", ".join(sql_string(f"{base}/{f}") for f in file_list.split(",")) + "]"
+            kind = db.query(f"SELECT backup_type FROM mssql_backup_info({arg})")[0]["backup_type"]
+            if kind == "full":
+                ok, out = db.try_query(f"SELECT count(*)::VARCHAR AS n FROM mssql_backup_tables({arg})")
+                c.check(f"{name}: mssql_backup_tables (no golden)", "lists or refuses by name",
+                        ok or "became live while the backup ran" in out, True)
             continue
-        for kind in ("columns", "views"):
+        for kind in ("columns", "views", "modules"):
             if f"{name}.{kind}.txt" not in texts:
                 sys.exit(f"compare_catalog: {name}.{kind}.txt missing in {base}")
         files = [f"{base}/{f}" for f in file_list.split(",")]

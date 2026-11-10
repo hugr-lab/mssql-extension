@@ -1416,6 +1416,8 @@ flowchart BT
   store --> iam["IAM chains<br/>an AU's pages"]
   iam --> sys["system base tables<br/>bootstrap five by literal layouts,<br/>checked against sysrscols;<br/>any other by its own description"]
   sys --> model["CatalogModel<br/>schemas, tables, columns,<br/>layouts + defaults, views"]
+  model --> tables["mssql_backup_tables<br/>mssql_backup_views"]
+  sys --> basetables["mssql_backup_catalog<br/>(allow-list; sysobjvalues by DQ-11)"]
 ```
 
 - **The file is untrusted input.** Every parser reads through `ByteReader` (`backup_bytes`), which
@@ -1424,8 +1426,9 @@ flowchart BT
   descriptor and stream header's XOR checksum is validated; the walk follows header lengths only,
   never a resync. `make fuzz-backup-replay` replays the five harnesses (`fuzz/fuzz_backup_*`) over
   their corpora, which `fuzz/gen_backup_seeds.cc` builds from synthetic files only.
-- **DuckDB-free parsers.** Everything but `backup_source`, `backup_open_pass`, `backup_opened` and
-  the function (marked `[DuckDB]` in their headers) builds without libduckdb (spec 085 D15), so the
+- **DuckDB-free parsers.** Everything but `backup_source`, `backup_open_pass`, `backup_opened`,
+  `backup_function_common` and the functions (`backup_info_function`, `backup_tables_function`,
+  `backup_catalog_function`; marked `[DuckDB]` in their headers) builds without libduckdb (spec 085 D15), so the
   fuzz harnesses link no DuckDB. `test/cpp/backup/` runs in `make test-cpp`.
 - **I/O through DuckDB only** (D3 / D3a): a read is a byte range through `CachingFileSystem`, so
   httpfs secrets apply and a remote file's ranges sit in buffer-managed blocks.

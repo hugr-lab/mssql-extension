@@ -10,6 +10,7 @@
 
 #include "backup/backup_bytes.hpp"
 #include "backup/backup_collation.hpp"
+#include "backup/backup_function_common.hpp"
 #include "backup/backup_opened.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/date.hpp"
@@ -257,31 +258,10 @@ struct BackupInfoState : public GlobalTableFunctionState {
 	bool done = false;
 };
 
-vector<std::string> PathsOf(const Value &value) {
-	vector<std::string> paths;
-	if (value.IsNull()) {
-		throw InvalidInputException("mssql_backup_info: the path is NULL");
-	}
-	if (value.type().id() == LogicalTypeId::LIST) {
-		for (const auto &child : ListValue::GetChildren(value)) {
-			if (child.IsNull()) {
-				throw InvalidInputException("mssql_backup_info: a NULL in the list of paths");
-			}
-			paths.push_back(child.ToString());
-		}
-		if (paths.empty()) {
-			throw InvalidInputException("mssql_backup_info: an empty list of paths");
-		}
-	} else {
-		paths.push_back(value.ToString());
-	}
-	return paths;
-}
-
 unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
 							  vector<Identifier> &names) {
 	auto data = make_uniq<BackupInfoBindData>();
-	data->paths = PathsOf(input.inputs[0]);
+	data->paths = PathsOf(input.inputs[0], "mssql_backup_info");
 	for (const auto &kv : input.named_parameters) {
 		if (kv.first == "reread") {
 			data->reread = !kv.second.IsNull() && kv.second.GetValue<bool>();

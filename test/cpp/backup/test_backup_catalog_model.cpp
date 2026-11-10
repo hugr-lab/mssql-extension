@@ -168,6 +168,49 @@ int main() {
 			  "a module's text stored as UTF-16 with an odd number of bytes is refused");
 	}
 
+	// The sysobjvalues rows that may leave (DQ-11), over a synthetic catalog: a view, an encrypted view,
+	// a default, a procedure, a trigger, a multi-statement function whose return table has a computed
+	// column, a user table with one, an MS-shipped view, and partition function 65536.
+	{
+		BootstrapTables t;
+		auto object = [&](int32_t id, const char *type, int32_t status) {
+			SysObject o;
+			o.id = id;
+			o.type = type;
+			o.status = status;
+			t.objects.push_back(o);
+		};
+		object(100, "V ", 0);
+		object(101, "V ", VIEW_ENCRYPTED);
+		object(102, "D ", 0);
+		object(103, "P ", 0);
+		object(104, "TR", 0);
+		object(105, "TF", VIEW_ENCRYPTED);
+		object(106, "U ", 0);
+		object(107, "V ", OBJECT_MS_SHIPPED);
+		auto column = [&](int32_t object_id, int32_t id, int32_t status) {
+			SysColumn c;
+			c.object_id = object_id;
+			c.column_id = id;
+			c.status = status;
+			t.columns.push_back(c);
+		};
+		column(105, 2, COLUMN_COMPUTED);
+		column(106, 2, COLUMN_COMPUTED);
+		column(106, 3, 0);
+		const ObjectValueFilter f(t, {65536});
+		Check(f.Keep(1, 100, 0, 0) && f.Keep(1, 102, 0, 0) && f.Keep(2, 106, 2, 0) && f.Keep(30, 65536, 1, 1) &&
+				  f.Keep(30, 65536, 3, 1),
+			  "DQ-11 serves: a view's and a default's definition, a user table's computed column, the boundaries "
+			  "of a partition function");
+		Check(!f.Keep(1, 101, 0, 0) && !f.Keep(1, 103, 0, 0) && !f.Keep(1, 104, 0, 0) && !f.Keep(1, 105, 0, 0) &&
+				  !f.Keep(1, 107, 0, 0) && !f.Keep(2, 105, 2, 0) && !f.Keep(2, 106, 3, 0) && !f.Keep(30, 999, 1, 1) &&
+				  !f.Keep(60, 106, 1, 0) && !f.Keep(1, 100, 1, 0) && !f.Keep(1, 100, 0, 1) && !f.Keep(2, 106, 2, 1),
+			  "DQ-11 keeps back: an encrypted view, a procedure, a trigger, a function and its return table's "
+			  "computed column, an MS-shipped view, a plain column, another object's boundaries, another class, "
+			  "another subobjid or valnum");
+	}
+
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;
 	return failures ? 1 : 0;
 }

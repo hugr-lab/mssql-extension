@@ -10,7 +10,8 @@
 // 7,988 bytes (bit i, LSB first: extent i of the interval belongs to the AU). Read through the
 // records, not page offsets: slot 1 lies at 190 or 192 on the samples, not 194. The chain follows the
 // page header's next pointer; each page's header names the AU it maps (m_objId / m_indexId).
-// Measured on the lane's 2017-2025 backups and the committed samples (2026-11-10). DuckDB-free (D15).
+// Measured on the lane's 2017-2025 sets of the samples' database (in R2), the committed samples and the
+// catalog and files fixtures on 2022 (2026-11-10). DuckDB-free (D15).
 //===----------------------------------------------------------------------===//
 
 #pragma once

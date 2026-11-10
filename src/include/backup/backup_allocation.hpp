@@ -53,7 +53,8 @@ public:
 	//! The liveness rule (E2 R3) for page `page` of file `file`.
 	bool IsLive(uint16_t file, uint32_t page) const;
 	//! The GAM's answer alone: the page's extent is allocated. Past the recorded Size too: GAM marks
-	//! nothing allocated past the end of the data (measured on the lane's 2017-2025 backups).
+	//! nothing allocated past the end of the data (measured on the lane's 2017-2025 sets of the samples' database, in
+	//! R2).
 	bool ExtentAllocated(uint16_t file, uint32_t page) const;
 
 	size_t MemoryBytes() const;

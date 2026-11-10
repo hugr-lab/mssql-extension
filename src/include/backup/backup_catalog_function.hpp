@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
 //                         DuckDB MSSQL Extension
 //
-// backup/backup_base_table_function.hpp
+// backup/backup_catalog_function.hpp
 //
 // Spec 085 PR 2b step 7b (task 17): mssql_backup_catalog(path [, base_table]). [DuckDB]
 //===----------------------------------------------------------------------===//
@@ -14,7 +14,7 @@ namespace duckdb {
 namespace mssql {
 namespace backup {
 
-void RegisterBackupBaseTableFunction(ExtensionLoader &loader);
+void RegisterBackupCatalogFunction(ExtensionLoader &loader);
 
 }  // namespace backup
 }  // namespace mssql

@@ -18,10 +18,12 @@
 // cursor, never the table; an off-row value is read as its row is produced, within one value's bound
 // and a bound for the call. The catalog (headers, pages, bootstrap tables -- not the model) is opened
 // at bind, since a table's columns depend on the version that wrote the file, and every EXECUTE binds
-// again.
+// again; a prepared statement's bind data keeps that catalog, and so its files open, until DEALLOCATE
+// (within its ClientContext, as backup_source allows).
 
-#include "backup/backup_base_table_function.hpp"
+#include "backup/backup_catalog_function.hpp"
 
+#include "backup/backup_function_common.hpp"
 #include "backup/backup_lob.hpp"
 #include "backup/backup_opened.hpp"
 #include "catalog/mssql_column_info.hpp"
@@ -30,7 +32,6 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "mssql_function_docs.hpp"
-#include "tds/encoding/datetime_encoding.hpp"
 #include "utf8proc_wrapper.hpp"
 
 #include <algorithm>
@@ -117,10 +118,6 @@ LogicalType TypeOf(const RowsetLayout &layout, const PhysicalColumn &c) {
 //! crafted file whose rows all point to one large LOB must not cost its size once per row.
 constexpr uint64_t MAX_CALL_OFF_ROW_BYTES = 1ull << 30;
 
-constexpr int32_t OBJECT_MS_SHIPPED = 0x1;
-constexpr int32_t VIEW_ENCRYPTED = 0x10000;
-constexpr int32_t COLUMN_COMPUTED = 0x10;
-
 std::string AllowedList() {
 	std::string out;
 	for (const char *a : ALLOWED) {
@@ -129,14 +126,12 @@ std::string AllowedList() {
 	return out;
 }
 
-//! The rows a base table may serve: every row, but sysobjvalues' and sysseobjvalues' by value class,
-//! each checked against the object it belongs to (DQ-11).
+//! The rows a base table may serve: every row, but sysobjvalues' by ObjectValueFilter (DQ-11) and
+//! sysseobjvalues' by its valclass 1.
 struct RowFilter {
 	enum class Kind : uint8_t { All, ObjectValues, AddedDefaults } kind = Kind::All;
 	size_t valclass = 0, objid = 0, subobjid = 0, valnum = 0;
-	std::set<int32_t> definitions;					 // views (not encrypted) and defaults
-	std::set<std::pair<int32_t, int32_t>> computed;	 // (user table, computed column)
-	std::set<int32_t> partition_functions;			 // sysclsobjs class 30
+	std::unique_ptr<ObjectValueFilter> object_values;
 
 	bool Keep(const RowsetLayout &layout, const SystemRow &row) const {
 		if (kind == Kind::All) {
@@ -146,19 +141,9 @@ struct RowFilter {
 		if (kind == Kind::AddedDefaults) {
 			return cls == 1;
 		}
-		const int32_t object = static_cast<int32_t>(ValueInt(layout, objid, row.values[objid], 0));
-		const int64_t sub = ValueInt(layout, subobjid, row.values[subobjid], -1);
-		const int64_t num = ValueInt(layout, valnum, row.values[valnum], -1);
-		switch (cls) {
-		case 1:
-			return sub == 0 && num == 0 && definitions.count(object);
-		case 2:
-			return num == 0 && computed.count(std::make_pair(object, static_cast<int32_t>(sub)));
-		case 30:
-			return partition_functions.count(object) > 0;
-		default:
-			return false;
-		}
+		return object_values->Keep(cls, static_cast<int32_t>(ValueInt(layout, objid, row.values[objid], 0)),
+								   ValueInt(layout, subobjid, row.values[subobjid], -1),
+								   ValueInt(layout, valnum, row.values[valnum], -1));
 	}
 };
 
@@ -178,30 +163,7 @@ RowFilter FilterFor(const PageStore &store, const BootstrapTables &tables, const
 	f.objid = layout.IndexOf("objid");
 	f.subobjid = layout.IndexOf("subobjid");
 	f.valnum = layout.IndexOf("valnum");
-	std::set<int32_t> user_tables;
-	for (const auto &o : tables.objects) {
-		if (o.status & OBJECT_MS_SHIPPED) {
-			continue;
-		}
-		if ((o.type == "V " && !(o.status & VIEW_ENCRYPTED)) || o.type == "D ") {
-			f.definitions.insert(o.id);
-		}
-		if (o.type == "U ") {
-			user_tables.insert(o.id);
-		}
-	}
-	for (const auto &c : tables.columns) {
-		if (c.number == 0 && (c.status & COLUMN_COMPUTED) && user_tables.count(c.object_id)) {
-			f.computed.insert(std::make_pair(c.object_id, c.column_id));
-		}
-	}
-	const SystemTable classes = ReadSystemTable(store, tables, "sysclsobjs");
-	const size_t cls = classes.Column("class"), id = classes.Column("id");
-	for (size_t r = 0; r < classes.rows.size(); r++) {
-		if (classes.Int(r, cls) == 30) {
-			f.partition_functions.insert(static_cast<int32_t>(classes.Int(r, id)));
-		}
-	}
+	f.object_values.reset(new ObjectValueFilter(tables, ReadPartitionFunctions(store, tables)));
 	return f;
 }
 
@@ -248,27 +210,6 @@ struct BaseTableState : public GlobalTableFunctionState {
 	size_t next_listed = 0;	 // the listing's cursor
 };
 
-vector<std::string> PathsOf(const Value &value) {
-	vector<std::string> paths;
-	if (value.IsNull()) {
-		throw InvalidInputException("%s: the path is NULL", FUNCTION);
-	}
-	if (value.type().id() == LogicalTypeId::LIST) {
-		for (const auto &child : ListValue::GetChildren(value)) {
-			if (child.IsNull()) {
-				throw InvalidInputException("%s: a NULL in the list of paths", FUNCTION);
-			}
-			paths.push_back(child.ToString());
-		}
-		if (paths.empty()) {
-			throw InvalidInputException("%s: an empty list of paths", FUNCTION);
-		}
-	} else {
-		paths.push_back(value.ToString());
-	}
-	return paths;
-}
-
 LogicalType ListingColumnType() {
 	child_list_t<LogicalType> f;
 	f.emplace_back("name", LogicalType::VARCHAR);
@@ -280,7 +221,7 @@ LogicalType ListingColumnType() {
 unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
 							  vector<Identifier> &names) {
 	auto data = make_uniq<BaseTableBindData>();
-	data->paths = PathsOf(input.inputs[0]);
+	data->paths = PathsOf(input.inputs[0], FUNCTION);
 	if (input.inputs.size() > 1) {
 		if (input.inputs[1].IsNull()) {
 			throw InvalidInputException("%s: the base table is NULL", FUNCTION);
@@ -477,20 +418,12 @@ Value CellValue(const BaseTableBindData &data, size_t layout_index, const Logica
 			throw FormatError("backup: " + data.table + "." + c.name + " holds bytes that are not UTF-8");
 		}
 		return Value(v.bytes);
-	case XTYPE_DATETIME: {
+	case XTYPE_DATETIME:
 		size(8, "datetime");
-		uint8_t wire[8];  // the record's ticks-then-days, in TDS's days-then-ticks
-		std::memcpy(wire, v.bytes.data() + 4, 4);
-		std::memcpy(wire + 4, v.bytes.data(), 4);
-		return Value::TIMESTAMP(tds::encoding::DateTimeEncoding::ConvertDatetime(wire));
-	}
-	case XTYPE_SMALLDATETIME: {
+		return RecordDatetimeValue(v.bytes);
+	case XTYPE_SMALLDATETIME:
 		size(4, "smalldatetime");
-		uint8_t wire[4];  // the record's minutes-then-days, in TDS's days-then-minutes
-		std::memcpy(wire, v.bytes.data() + 2, 2);
-		std::memcpy(wire + 2, v.bytes.data(), 2);
-		return Value::TIMESTAMP(tds::encoding::DateTimeEncoding::ConvertSmallDatetime(wire));
-	}
+		return RecordSmallDatetimeValue(v.bytes);
 	case XTYPE_UNIQUEIDENTIFIER: {
 		size(16, "uniqueidentifier");
 		const uint8_t *b = reinterpret_cast<const uint8_t *>(v.bytes.data());
@@ -587,7 +520,7 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 
 }  // namespace
 
-void RegisterBackupBaseTableFunction(ExtensionLoader &loader) {
+void RegisterBackupCatalogFunction(ExtensionLoader &loader) {
 	TableFunctionSet set(FUNCTION);
 	const vector<LogicalType> paths{LogicalType(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)};
 	for (const auto &path : paths) {

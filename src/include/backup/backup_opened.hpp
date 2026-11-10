@@ -6,8 +6,9 @@
 // Spec 085 task 9: stage 1 of an opened backup (§ Data structures, OpenedBackup): the files of one
 // media set opened through DuckDB's file system (ByteSource), each a plain MTF family or a
 // compressed container (located from its tail, DQ-41), walked for its headers and its backup set;
-// the families checked to be one complete set. Enough for mssql_backup_info; the page index and
-// the catalog are later stages. The opened-file cache (D9) is task 22. [DuckDB]
+// the families checked to be one complete set: enough for mssql_backup_info. Then the later stages,
+// built for one function call: the pages (OpenBackupPages) and the catalog (OpenBackupCatalog). The
+// opened-file cache (D9) is task 22. [DuckDB]
 //===----------------------------------------------------------------------===//
 
 #pragma once

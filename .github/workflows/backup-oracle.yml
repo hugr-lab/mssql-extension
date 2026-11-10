@@ -342,6 +342,8 @@ jobs:
             "s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${VERSION}"
       # Spec 085 PR 2b: the sets with the server's own catalog beside them (catalog_golden.sql).
       - name: mssql_backup_tables / _views against the server's catalog, read through s3://
+        # Reported whatever compare_info's answer was: the two compare different things.
+        if: ${{ !cancelled() }}
         env:
           MSSQL_R2_ACCESS_KEY: ${{ secrets.MSSQL_R2_ACCESS_KEY }}
           MSSQL_R2_ACCESS_SECRET_KEY: ${{ secrets.MSSQL_R2_ACCESS_SECRET_KEY }}
