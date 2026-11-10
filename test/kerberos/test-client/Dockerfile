@@ -47,6 +47,22 @@ RUN git clone --depth 1 --branch "${SIMDUTF_VERSION}" https://github.com/simdutf
     && cmake --build /tmp/simdutf/build --target install \
     && rm -rf /tmp/simdutf
 
+# zstd the same way, for the same reason: spec 085 made find_package(zstd CONFIG
+# REQUIRED) unconditional (the ZSTD blocks of compressed backups), and Ubuntu's
+# libzstd-dev is built without CMake, so it ships no zstdConfig.cmake. The tag
+# is the one vcpkg.json pins. Static only, so the extension links no libzstd.so.
+ARG ZSTD_VERSION=v1.5.7
+RUN git clone --depth 1 --branch "${ZSTD_VERSION}" https://github.com/facebook/zstd.git /tmp/zstd \
+    && cmake -S /tmp/zstd/build/cmake -B /tmp/zstd/out -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DZSTD_BUILD_STATIC=ON \
+        -DZSTD_BUILD_SHARED=OFF \
+        -DZSTD_BUILD_PROGRAMS=OFF \
+        -DZSTD_BUILD_TESTS=OFF \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    && cmake --build /tmp/zstd/out --target install \
+    && rm -rf /tmp/zstd
+
 WORKDIR /src
 
 # Copy the whole repo (build context = repo root). The .git directory is
