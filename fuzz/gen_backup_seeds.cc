@@ -56,8 +56,8 @@ static Bytes RealPage(uint32_t page, uint32_t size) {
 	Put16(p, 36, 1);
 	if (page == 0) {
 		Put16(p, 8190, 96);
-		Put16(p, 96 + 167, 1);
-		Put32(p, 96 + 171, size);
+		const Bytes record = FileHeaderRecordBytes(1, size);
+		std::memcpy(&p[96], record.data(), record.size());
 	} else if (page == 1) {
 		std::memset(&p[100], 0x40, size);
 	}
@@ -189,8 +189,9 @@ static Bytes Xpress(size_t literals) {
 
 //! fuzz_backup_page's format: flags, then a 64-byte chunk per unit, tiled across the unit (byte j at
 //! every offset j mod 64). Page 0's chunk puts the file header's slot (u16 at 8190, offsets 62..63) at
-//! 128, the record's file id (128 + 167 = 295: offsets 39..40) at 1 and its Size (299: 43..46) at
-//! `size`; page 1's (PFS) fills with 0x40, so its pages are allocated; page 2's (GAM) is zeros
+//! 131 and its record (FileHeaderRecordBytes with an empty first column: 27 bytes) at offsets 3..29,
+//! clear of the page header's bytes in the chunk (0, 1, 32..37); page 1's (PFS) fills with 0x40, so its
+//! pages are allocated; page 2's (GAM) is zeros
 //! beside its header, so its extents are allocated. `extents` in pass order; 0xFFFFFFFF a zero group.
 static Bytes Page(uint8_t flags, const std::vector<uint32_t> &extents) {
 	uint32_t size = 0;
@@ -211,9 +212,9 @@ static Bytes Page(uint8_t flags, const std::vector<uint32_t> &extents) {
 				Put32(chunk, 32, page);
 				Put16(chunk, 36, 1);
 				if (page == 0) {
-					Put16(chunk, 62, 128);
-					Put16(chunk, 39, 1);
-					Put32(chunk, 43, size);
+					Put16(chunk, 62, 131);
+					const Bytes record = FileHeaderRecordBytes(1, size, 0);
+					std::memcpy(&chunk[3], record.data(), record.size());
 				}
 			}
 			in.insert(in.end(), chunk.begin(), chunk.end());

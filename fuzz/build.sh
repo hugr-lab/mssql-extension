@@ -195,6 +195,7 @@ BACKUP_SRCS=(
 	"${BACKUP}/backup_page_index.cpp"
 	"${BACKUP}/backup_pass_search.cpp"
 	"${BACKUP}/backup_allocation.cpp"
+	"${BACKUP}/backup_record.cpp"
 )
 BACKUP_OBJS=""
 if want backup_mtf || want backup_container || want backup_xpress || want backup_page; then

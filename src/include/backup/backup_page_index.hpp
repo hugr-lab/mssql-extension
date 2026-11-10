@@ -200,8 +200,10 @@ private:
 PassMap BuildPassMap(const RandomAccess &stream, uint64_t offset, uint64_t length, uint32_t number);
 
 //! Pass 1 of a full backup on one media family, mapped from its allocation pages alone (E12): the
-//! pass is one group per extent of (GAM-allocated extents below the file's Size, plus the extents
-//! of the allocation pages), ascending by (file, extent), then pad groups. Reads each file's
+//! pass is one group per extent of (GAM-allocated extents, plus the extents of the allocation pages
+//! below the data's end: the recorded Size or the last allocated extent's, whichever is later),
+//! ascending by (file, extent), then pad groups; past the recorded Size the next interval is taken
+//! when its GAM is the pass's next group. Reads each file's
 //! group 0 (file header, GAM), the group of every later GAM, and a few groups more to check the
 //! rule, not every group. False when anything read disagrees with the rule, or a read fails: the
 //! caller then maps the pass by its headers (BuildPassMap). `groups_read`, when given, counts the

@@ -747,20 +747,33 @@ offsets above are in its fixed part.
   (mod 8). 0 mismatches over every file of E2.
 
 **Allocation and liveness** (E2 layouts, R3):
-- GAM page 2, SGAM 3, DCM 6, BCM 7, repeated every 511,232 pages; bitmap at page offset 194, 7,988
-  bytes, bit i (LSB first) = extent i; GAM 1 = free. The second GAM interval is decoded but was never
-  exercised (E2§10).
+- GAM page 2, SGAM 3, DCM 6, BCM 7 in the first 511,232-page interval (pages 0 and 1 are the file
+  header and the first PFS); in every later interval GAM, SGAM, DCM, BCM at +0, +1, +6, +7 of its
+  first page (E17, 2026-11-10, SQL Server 2022, `sys.dm_db_page_info` on a 5 GB file: 511232 GAM,
+  511233 SGAM, 511238 DIFF_MAP, 511239 ML_MAP; 511234-511237 ordinary). Bitmap at page offset 194,
+  7,988 bytes, bit i (LSB first) = extent i; GAM 1 = free. Each allocation page read is checked to
+  be of its type (8 GAM, 11 PFS, 15 file header).
 - PFS page 1, then every 8,088 pages; byte for page p at `100 + (p mod 8088)` (page 1 covers pages 0–8087):
   0x40 allocated, 0x20 mixed extent, 0x10 IAM, 0x08 has ghosts, low 3 bits fullness.
 - File header page 0, slot 0 record (its offset varies: 96 or 2,494 seen; read it through the slot
-  array): u16 file id +167, u16 filegroup id +169, u32 `Size` in pages +171.
+  array), a FixedVar record whose variable columns 2, 3 and 4 are the u16 file id, the u16 filegroup id
+  and the u32 `Size` in pages -- by column, not by offset: it has 66 columns on 2025 and 60 on 2022,
+  so its data starts 13 bytes apart (+167 / +171 hold on 2025 only; found 2026-11-10, checked on the
+  lane's 2017-2025 backups). A later interval whose first page is also a PFS page (an interval number
+  that is a multiple of 1011: a file of about 3.9 TB) is open: which of the two the page is, unknown.
 - IAM: header record at 96, u32 sequence +4, start page +40, eight single-page slots +46; extent
   bitmap at 194 relative to the start page. The chain follows the page header's next-page pointer
   (u32 page @16, u16 file @20, as on every page; to be pinned on the samples in task 11a); the
   sequence must ascend and each start page must open a GAM interval, else a named error.
 - `IsLive(file, page)`: the allocation pages themselves (0, 1, 9, the PFS pages, GAM / SGAM / DCM / BCM)
-  are live; any other page is live iff `page < Size` and its extent's GAM bit is 0 and its PFS byte has
-  0x40.
+  are live below the recorded `Size`, and past it where the backup carries them; any other page is live
+  iff its extent's GAM bit is 0 and its PFS byte has 0x40. **The recorded `Size` is a lower bound, not the
+  end of the data** (BusinessCentral.DbReader's PROVENANCE, MIT, "File size is a lower bound": on four
+  backups of a live database the copied, GAM-allocated extents ran 52 to 331 extents past it, always
+  less than the file's growth -- a file header image older than an autogrow during the backup). The GAM
+  marks nothing allocated past the end of the data (measured on the lane's 2017-2025 backups, and
+  DbReader's), so liveness and the rank path (D4a) follow the GAM, not the `Size`; the rank path goes on
+  into the next interval past the `Size` when that interval's GAM is the pass's next group.
 
 **Catalog** (X§4, E1§4.8, E2§4, `experiments/E1/pages_ext.py`):
 - Boot page 1:9, one record at 96: `dbi_version` u16 +4, `dbi_dbname` nvarchar(128) +52,
@@ -826,7 +839,7 @@ offsets above are in its fixed part.
   present; 0x40 a 14-byte version tag follows the record (RCSI / snapshot; unverified — no experiment
   ran with row versioning). Types: 0 primary, 1 forwarded, 2 forwarding stub, 3 index, 4 blob
   fragment, 5 ghost index, 6 ghost data, 7 ghost version. **Scan rows from types 0 and 1 only.**
-- Layout: u16 end of the fixed part @2, fixed data from 4, u16 column count, null bitmap of
+- Layout: u16 end of the fixed part @2, fixed data from 4, (0x10) u16 column count and null bitmap of
   `ceil(n / 8)` bytes, then (0x20) u16 variable count and that many u16 end offsets (bit 15 = complex
   column), then the data.
 - Column value, per physical column of the rowset, in this order: dropped (status 0x2) → skipped, its
@@ -1177,6 +1190,12 @@ cost.
 
 ## Risks
 
+- **Pass 2's page headers.** DbReader (PROVENANCE, "MQDA region 2") found a frame of live pages of one
+  extent whose header page ids point at a different page (an internal page type whose id field is a
+  reference), which RESTORE places positionally, whole frame; it picks each frame's extent by consensus
+  of the frame's headers, constrained to ascend and to the interval's final DCM image. The header scan
+  here (D4a) refuses a group whose headers disagree, so such a backup fails to open by name rather than
+  misplacing pages; matching RESTORE on it is for PR 2d (rows), with a fixture that reproduces it.
 - **Version drift is the main risk.** Every offset above is **(2025)**. The catalog layouts (D5), the
   boot page, SCIN offsets and the MSSQLBAK header may differ on 2017–2022. The CI matrix is what turns
   each into a verified row; until a version passes, it is refused (D14).

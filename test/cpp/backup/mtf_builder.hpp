@@ -22,6 +22,37 @@ inline void Put32(Bytes &b, size_t at, uint32_t v) {
 		b[at + i] = (v >> (8 * i)) & 0xFF;
 	}
 }
+//! A data file's header record (page 0's slot 0) as SQL Server lays it out: a primary FixedVar
+//! record (statusA 0x30) with no fixed columns, a null bitmap, and five variable columns -- a
+//! `first_var`-byte value (a GUID on a server: 16), an empty one, the file id (u16), its filegroup
+//! (u16) and its Size in pages (u32), the columns ReadFileHeaderRecord reads by number. Returns its
+//! bytes; place them at a slot's offset.
+inline Bytes FileHeaderRecordBytes(uint16_t file, uint32_t size, uint16_t first_var = 16) {
+	const uint16_t columns = 5;
+	const uint16_t data = 4 + 2 + 1 + 2 + 2 * columns;	// header, column count, bitmap, var count, ends
+	const uint16_t ends[columns] = {static_cast<uint16_t>(data + first_var), static_cast<uint16_t>(data + first_var),
+									static_cast<uint16_t>(data + first_var + 2),
+									static_cast<uint16_t>(data + first_var + 4),
+									static_cast<uint16_t>(data + first_var + 8)};
+	Bytes r(ends[columns - 1], 0);
+	r[0] = 0x30;
+	r[2] = 4;  // fixed part ends at 4: no fixed columns
+	r[4] = columns;
+	r[7] = columns;	 // variable column count (the null bitmap's one byte at 6 is zero)
+	for (uint16_t i = 0; i < columns; i++) {
+		r[9 + 2 * i] = static_cast<uint8_t>(ends[i] & 0xFF);
+		r[10 + 2 * i] = static_cast<uint8_t>(ends[i] >> 8);
+	}
+	const size_t at = ends[1];
+	r[at] = static_cast<uint8_t>(file & 0xFF);
+	r[at + 1] = static_cast<uint8_t>(file >> 8);
+	r[at + 2] = 1;	// PRIMARY
+	for (int i = 0; i < 4; i++) {
+		r[at + 4 + i] = static_cast<uint8_t>((size >> (8 * i)) & 0xFF);
+	}
+	return r;
+}
+
 inline void Put64(Bytes &b, size_t at, uint64_t v) {
 	for (int i = 0; i < 8; i++) {
 		b[at + i] = (v >> (8 * i)) & 0xFF;

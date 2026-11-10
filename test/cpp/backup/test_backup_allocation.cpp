@@ -26,6 +26,7 @@
 #include "backup/backup_bytes.hpp"
 #include "backup/backup_mtf.hpp"
 #include "backup/backup_page_index.hpp"
+#include "mtf_builder.hpp"
 
 using namespace duckdb::mssql::backup;
 
@@ -123,11 +124,8 @@ Fixture Build(uint16_t file, const Bytes &header, const Bytes &pfs, const Bytes 
 Bytes Header(uint16_t file, uint32_t size) {
 	Bytes b(8192, 0);
 	b[8190] = 96;
-	b[96 + 167] = file & 0xFF;
-	b[96 + 168] = file >> 8;
-	for (int i = 0; i < 4; i++) {
-		b[96 + 171 + i] = (size >> (8 * i)) & 0xFF;
-	}
+	const Bytes record = mtf_builder::FileHeaderRecordBytes(file, size);
+	std::memcpy(&b[96], record.data(), record.size());
 	return b;
 }
 
@@ -171,11 +169,21 @@ int main() {
 	Check(map.IsLive(1, 12) && map.IsLive(1, 20), "a page below Size, its extent allocated, PFS 0x40: live");
 	Check(!map.IsLive(1, 13), "a page the PFS marks free is dead, though its extent is allocated");
 	Check(!map.IsLive(1, 33) && !map.ExtentAllocated(1, 33), "a page of a GAM-free extent the pass carries is dead");
-	Check(!map.IsLive(1, 45) && !map.IsLive(2, 12), "a page past Size, or of a file the map lacks, is not live");
-	Check(AllocationMap::IsAllocationPage(3, 8088) && AllocationMap::IsAllocationPage(3, 511232 + 3) &&
-			  !AllocationMap::IsAllocationPage(1, 511232 + 9) && !AllocationMap::IsAllocationPage(1, 12) &&
-			  AllocationMap::IsAllocationPage(1, 9) && !AllocationMap::IsAllocationPage(3, 9),
-		  "allocation pages: PFS every 8088, GAM/SGAM/DCM/BCM per 511232 interval, the boot page 1:9 only");
+	Check(!map.IsLive(1, 45) && !map.IsLive(2, 12),
+		  "a page past Size in a GAM-free extent, or of a file the map lacks, is not live");
+	Check(AllocationMap::IsAllocationPage(3, 8088) && AllocationMap::IsAllocationPage(3, 2) &&
+			  AllocationMap::IsAllocationPage(3, 3) && AllocationMap::IsAllocationPage(3, 6) &&
+			  AllocationMap::IsAllocationPage(3, 7) && !AllocationMap::IsAllocationPage(1, 511232 + 9) &&
+			  !AllocationMap::IsAllocationPage(1, 12) && AllocationMap::IsAllocationPage(1, 9) &&
+			  !AllocationMap::IsAllocationPage(3, 9),
+		  "allocation pages: PFS every 8088, GAM/SGAM/DCM/BCM 2/3/6/7, the boot page 1:9 only");
+	// A later GAM interval opens with its GAM and SGAM (E17, SQL Server 2022: 511232 GAM, 511233 SGAM,
+	// 511238 DCM, 511239 BCM); 511234 / 511235 are ordinary pages there.
+	Check(AllocationMap::IsAllocationPage(3, 511232) && AllocationMap::IsAllocationPage(3, 511233) &&
+			  AllocationMap::IsAllocationPage(3, 511238) && AllocationMap::IsAllocationPage(3, 511239) &&
+			  !AllocationMap::IsAllocationPage(3, 511234) && !AllocationMap::IsAllocationPage(3, 511235) &&
+			  AllocationMap::IsAllocationPage(3, 2 * 511232) && !AllocationMap::IsAllocationPage(3, 2 * 511232 + 2),
+		  "a later interval: GAM/SGAM/DCM/BCM at +0/+1/+6/+7 (E17), not +2/+3");
 	{
 		// In file 3 page 9 is an ordinary page: freed by the PFS, it is dead (file 1's is live).
 		Bytes freed = pfs;
@@ -197,11 +205,28 @@ int main() {
 			  "a file whose GAM page the backup lacks: the first question about its interval is refused by name");
 	}
 	{
+		// The recorded Size is a lower bound (a header older than an autogrow, as on a live database):
+		// 40 pages recorded, extent 5 (pages 40..47) GAM-allocated, carried and marked by the PFS.
+		Bytes pfs_past = Pfs();
+		for (uint32_t p = 40; p < 48; p++) {
+			pfs_past[100 + p] = 0x40;
+		}
+		Bytes gam_past = Gam({0, 1, 2, 5});
+		auto past = Build(1, Header(1, 40), pfs_past, &gam_past, {0, 1, 2, 5});
+		MemoryAccess s("past_size.bak", past.stream.data(), past.stream.size());
+		auto i = BuildPageIndex(s, past.layout);
+		AllocationMap m(i, {1});
+		Check(m.FileSize(1) == 40 && m.ExtentAllocated(1, 42) && m.IsLive(1, 42) && !m.IsLive(1, 50) &&
+				  !m.IsLive(1, 511232),
+			  "a page past the recorded Size is live when its extent is allocated and the PFS marks it; the "
+			  "next interval's GAM page is not, when the backup carries none");
+	}
+	{
 		const Bytes other = Header(7, 40);
 		auto wrong = Build(1, other, pfs, &gam);
 		MemoryAccess s("wrong_header.bak", wrong.stream.data(), wrong.stream.size());
 		auto i = BuildPageIndex(s, wrong.layout);
-		Check(ErrorOf([&]() { AllocationMap m(i, {1}); }).find("no record naming it") != std::string::npos,
+		Check(ErrorOf([&]() { AllocationMap m(i, {1}); }).find("header record names file 7") != std::string::npos,
 			  "a file header whose record names another file is refused");
 	}
 
