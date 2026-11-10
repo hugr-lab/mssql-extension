@@ -21,7 +21,9 @@ Other commands:
 
 ## Running it
 
-The server credentials come from the environment and are never printed: `MSSQL_BENCH_HOST`, `_PORT`, `_USER`, `_PASSWORD`, falling back to the test suite's `MSSQL_TEST_*`.
+The server credentials come from the environment and are never printed: `MSSQL_BENCH_HOST`, `_PORT`, `_USER`, `_PASSWORD`, falling back to the test suite's `MSSQL_TEST_*`. The DSN goes to the CLI on **stdin**, never in `argv` or a file, so it reaches neither `ps` nor shell history; the password is masked in every form it can appear in the output, including the escaped one it carries inside a SQL literal, and the password and user name are brace-quoted in the DSN so a `;` in either cannot add a connection-string key (issue #509).
+
+`--db` and `--collation` must be bare names (letters, digits and `_`): both reach the server inside `ALTER` / `DROP` / `CREATE DATABASE`, where the name travels through `QUOTENAME`, and anything else is refused by name rather than quoted.
 
 ```sh
 B=test/bench/tpch/tpch_bench.py

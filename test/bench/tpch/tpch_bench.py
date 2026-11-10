@@ -17,7 +17,9 @@ Subcommands, in the order a fresh machine runs them:
   run      the timed, interleaved runs; writes timings.csv
   report   medians per query and client, as markdown
 
-The server credentials come from the environment and are never printed:
+The server credentials come from the environment and are never printed --
+masked in every form they can take in the output, the escaped one included
+(issue #509):
 MSSQL_BENCH_HOST / _PORT / _USER / _PASSWORD, falling back to the test
 suite's MSSQL_TEST_HOST / _PORT / _USER / _PASS. See README.md.
 """
@@ -119,16 +121,52 @@ def server():
     return cfg
 
 
+def quote_dsn_value(value):
+    """A connection-string value in braces, as the extension's parser reads them.
+
+    Issue #509 item 2. `Password={cfg['password']}` was unquoted, and the parser
+    (`src/mssql_storage.cpp`) splits an unquoted value at `;` -- so
+    `MSSQL_BENCH_PASSWORD='pw;Database=master'` built a SECOND `Database` key
+    and silently retargeted the connection, after which `load` created its
+    tables wherever that landed. Inside braces `}}` is a literal `}`, which is
+    what that parser accepts.
+    """
+    return "{" + value.replace("}", "}}") + "}"
+
+
 def dsn(cfg, database, encrypt):
     # Encrypt and TrustServerCertificate agree, so 0.2.5 (where the latter is an
     # alias of the former) and 0.3.0 read the same thing: TLS on or off for both.
     flag = "yes" if encrypt else "no"
-    return (f"Server={cfg['host']},{cfg['port']};Database={database};User Id={cfg['user']};"
-            f"Password={cfg['password']};Encrypt={flag};TrustServerCertificate={flag}")
+    # The password and the user name are brace-quoted: both are operator-supplied
+    # and a `;` in either would otherwise add a key (issue #509 item 2).
+    return (f"Server={cfg['host']},{cfg['port']};Database={database};"
+            f"User Id={quote_dsn_value(cfg['user'])};"
+            f"Password={quote_dsn_value(cfg['password'])};"
+            f"Encrypt={flag};TrustServerCertificate={flag}")
 
 
 def mask(text, cfg):
-    return text.replace(cfg["password"], "***") if cfg.get("password") else text
+    """Replace the password wherever it appears, in every form it takes.
+
+    Issue #509 item 1. It used to search for the password AS GIVEN, but the DSN
+    reaches almost all output embedded in an `ATTACH '...'` statement, where it
+    has been through `esc()` -- so a password containing a single quote was
+    carried as `pw''X` and the masking missed it entirely:
+
+        password in cfg:    "pw'X"
+        in the SQL text:    Password=pw''X;Enc
+        after mask():       Password=pw''X;Enc     <- unmasked
+
+    while this module's docstring and README promise it is masked in all output.
+    Longest form first, so replacing one cannot leave a fragment of another.
+    """
+    password = cfg.get("password")
+    if not password:
+        return text
+    for form in sorted({password, esc(password), quote_dsn_value(password)}, key=len, reverse=True):
+        text = text.replace(form, "***")
+    return text
 
 
 def binary(which):
@@ -184,6 +222,24 @@ def run_cli(bin_path, script, cfg, database=":memory:", timeout=None):
     return proc.returncode, mask(proc.stdout, cfg)
 
 
+#: A database or collation name the harness sends to the server. SQL Server
+#: identifiers allow far more, but every name this harness GENERATES is of this
+#: shape, and the alternative is interpolating an operator-supplied value into a
+#: batch that runs ALTER / DROP / CREATE DATABASE as `sa` (issue #509 item 3):
+#: `esc()` doubles single quotes and does not touch `]`, so
+#: `--db "x] ; CREATE LOGIN hax WITH PASSWORD='p'; --"` closed the bracket at
+#: `x]`, ran the injected statement and commented out the rest.
+SAFE_NAME = re.compile(r"[A-Za-z0-9_]+")
+
+
+def safe_name(value, what):
+    """`value` if it is a bare name, else exit saying why."""
+    if not SAFE_NAME.fullmatch(value or ""):
+        sys.exit(f"error: {what} {value!r} is not a bare name (letters, digits and _). "
+                 f"It is sent to the server inside ALTER / DROP / CREATE DATABASE.")
+    return value
+
+
 def esc(s):
     return s.replace("'", "''")
 
@@ -208,15 +264,28 @@ def cmd_gen(args):
 # --------------------------------------------------------------------------- load
 
 def recreate_database_statements(cfg, args):
-    """Drop and recreate the benchmark database, on a `master` attachment."""
-    db = args.db
+    """Drop and recreate the benchmark database, on a `master` attachment.
+
+    The name reaches the server through QUOTENAME over a `sysname` variable, as
+    `cmd_drop` already did and as the extension itself does
+    (`src/catalog/mssql_metadata_cache.cpp`) -- not hand-bracketed as `[{db}]`,
+    which `esc()` does not protect because it doubles single quotes and leaves
+    `]` alone (issue #509 item 3). `safe_name` has already refused anything but
+    a bare name, so this is the second of two guards rather than the only one.
+    """
+    db = safe_name(args.db, "--db")
+    collation = safe_name(args.collation, "--collation") if args.collation else None
+    collate = f" + N' COLLATE {collation}'" if collation else ""
+    batch = ("DECLARE @n sysname = N'" + db + "'; DECLARE @sql nvarchar(max); "
+             "IF DB_ID(@n) IS NOT NULL BEGIN "
+             "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET SINGLE_USER WITH ROLLBACK IMMEDIATE; "
+             "DROP DATABASE ' + QUOTENAME(@n); EXEC (@sql); END; "
+             "SET @sql = N'CREATE DATABASE ' + QUOTENAME(@n)" + collate + "; EXEC (@sql); "
+             "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET RECOVERY SIMPLE'; EXEC (@sql); "
+             "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET QUERY_STORE = OFF'; EXEC (@sql);")
     return [
         f"ATTACH '{esc(dsn(cfg, 'master', args.encrypt))}' AS m (TYPE mssql);",
-        "SELECT mssql_exec('m', '" + esc(
-            f"IF DB_ID(N'{db}') IS NOT NULL BEGIN ALTER DATABASE [{db}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; "
-            f"DROP DATABASE [{db}]; END; CREATE DATABASE [{db}]"
-            + (f" COLLATE {args.collation}" if args.collation else "")
-            + f"; ALTER DATABASE [{db}] SET RECOVERY SIMPLE; ALTER DATABASE [{db}] SET QUERY_STORE = OFF;") + "');",
+        f"SELECT mssql_exec('m', '{esc(batch)}');",
         "DETACH m;",
     ]
 
@@ -1455,6 +1524,110 @@ def _check_extracted():
     return failures
 
 
+#: (label, the password, must it be absent from the masked text)
+#
+# Issue #509 item 1. The DSN reaches almost all output embedded in an
+# `ATTACH '...'` statement, so the form that matters is the one `esc()` wrote,
+# not the one the operator set.
+MASK_TESTS = [
+    ("a plain password", "pw"),
+    ("a password with a single quote", "pw'X"),
+    ("a password with two", "a'b'c"),
+    ("a password with a brace", "pw}X"),
+    ("a password with a semicolon", "pw;Database=master"),
+    ("a password that looks like SQL", "'); DROP DATABASE x; --"),
+]
+
+#: (label, the name, is it accepted)
+#
+# Issue #509 item 3: these reach the server inside ALTER / DROP / CREATE
+# DATABASE as sa, and `esc()` does not touch `]`.
+NAME_TESTS = [
+    ("the generated default", "tpch_sf1_columnstore", True),
+    ("with a string schema suffix", "tpch_sf10_columnstore_utf8", True),
+    ("a bare collation", "Latin1_General_100_BIN2_UTF8", True),
+    ("a closing bracket and a statement", "x] ; CREATE LOGIN hax WITH PASSWORD='p'; --", False),
+    ("a collation with a trailing DROP", "Latin1_General_100_BIN2_UTF8; DROP DATABASE [master]", False),
+    ("a quote", "x'y", False),
+    ("a space", "my db", False),
+    ("empty", "", False),
+    ("a dot", "db.name", False),
+]
+
+
+def _parse_connection_string(cs):
+    """Brace-aware split, as src/mssql_storage.cpp reads one.
+
+    The point of the fixture is what the PARSER sees: a `;` inside the braces
+    must not become another key, and counting `Database=` in the text cannot
+    tell you that.
+    """
+    out, i, n = {}, 0, len(cs)
+    while i < n:
+        j = cs.index("=", i)
+        key = cs[i:j].strip()
+        i = j + 1
+        if i < n and cs[i] == "{":
+            i += 1
+            value = []
+            while i < n:
+                if cs[i] == "}":
+                    if i + 1 < n and cs[i + 1] == "}":
+                        value.append("}")
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                value.append(cs[i])
+                i += 1
+            out[key] = "".join(value)
+            while i < n and cs[i] != ";":
+                i += 1
+        else:
+            j = cs.find(";", i)
+            j = n if j < 0 else j
+            out[key] = cs[i:j]
+            i = j
+        i += 1
+    return out
+
+
+def _check_credentials():
+    """Issue #509: the password never reaches output, and no name injects."""
+    print("\nthe password is masked in the form the text carries (#509.1):")
+    failures = 0
+    for label, password in MASK_TESTS:
+        cfg = {"host": "h", "port": "1433", "user": "sa", "password": password}
+        # Exactly how the harness emits it: the DSN inside an ATTACH literal.
+        text = "ATTACH '" + esc(dsn(cfg, "db", True)) + "' AS t;"
+        masked = mask(text, cfg)
+        leaked = [form for form in (password, esc(password), quote_dsn_value(password))
+                  if form and form in masked]
+        failures += _check(label, not leaked, "masked" if not leaked else "LEAKED %r" % leaked[0])
+
+    print("\nthe DSN keeps one Database key whatever the password (#509.2):")
+    cfg = {"host": "h", "port": "1433", "user": "sa", "password": "pw;Database=master"}
+    parsed = _parse_connection_string(dsn(cfg, "tpch_sf1", True))
+    failures += _check("a `;` in the password adds no key",
+                       parsed.get("Database") == "tpch_sf1", "Database=%r" % parsed.get("Database"))
+    failures += _check("and the password arrives whole",
+                       parsed.get("Password") == "pw;Database=master", "intact")
+    braced = {"host": "h", "port": "1433", "user": "sa", "password": "pw}X"}
+    parsed = _parse_connection_string(dsn(braced, "db", True))
+    failures += _check("a `}` in the password is doubled and read back",
+                       parsed.get("Password") == "pw}X", "%r" % parsed.get("Password"))
+
+    print("\na database or collation name is a bare name or refused (#509.3):")
+    for label, name, want in NAME_TESTS:
+        try:
+            safe_name(name, "--db")
+            got = True
+        except SystemExit:
+            got = False
+        failures += _check(label, got == want, "accepted" if got else "refused")
+    return failures
+
+
 def cmd_selftest(args):
     failures = _check_same()
     failures += _check_types()
@@ -1467,6 +1640,7 @@ def cmd_selftest(args):
         failures += _check_preamble()
         failures += _check_report(tmp)
     failures += _check_extracted()
+    failures += _check_credentials()
     print(f"\n{'FAIL' if failures else 'PASS'}: self-test, {failures} failure(s)")
     return 1 if failures else 0
 
@@ -1610,7 +1784,8 @@ def cmd_drop(args):
     if args.all:
         target = "SELECT name FROM sys.databases WHERE name LIKE N'tpch[_]sf%'"
     else:
-        target = f"SELECT N'{args.db}' AS name WHERE DB_ID(N'{args.db}') IS NOT NULL"
+        db = safe_name(args.db, "--db")
+        target = f"SELECT N'{db}' AS name WHERE DB_ID(N'{db}') IS NOT NULL"
     batch = ("DECLARE @n sysname, @sql nvarchar(max); "
              f"DECLARE c CURSOR LOCAL FAST_FORWARD FOR {target}; OPEN c; FETCH NEXT FROM c INTO @n; "
              "WHILE @@FETCH_STATUS = 0 BEGIN "
