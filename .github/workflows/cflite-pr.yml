@@ -65,7 +65,7 @@ jobs:
       # The backup reader's harnesses (spec 085), beside the default targets:
       # read by .clusterfuzzlite/build.sh; the PR job above builds none of them.
       - name: Add the backup reader's harnesses
-        run: echo "backup_mtf backup_container backup_xpress backup_page" > .clusterfuzzlite/extra_targets
+        run: echo "backup_mtf backup_container backup_xpress backup_page backup_catalog" > .clusterfuzzlite/extra_targets
 
       - name: Build fuzzers (undefined)
         id: build

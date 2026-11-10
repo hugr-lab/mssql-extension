@@ -110,7 +110,7 @@ make bench-code-page-column  # One 2048-row column, staging to vector: DecodeCol
 make test-backup-golden # mssql_backup_info vs the samples' golden RESTORE output, every field (spec 085)
 make backup-oracle-build # Release build with httpfs linked in statically, for the backup oracle lane
                         # (.github/workflows/backup-oracle.yml: backups of 2017-2025 in R2, read via s3://)
-make fuzz-backup-replay # Replay the backup reader's fuzz corpora (mtf, container, xpress, page;
+make fuzz-backup-replay # Replay the backup reader's fuzz corpora (mtf, container, xpress, page, catalog;
                         # spec 085), DuckDB-free, under sanitizers
 
 # Docker

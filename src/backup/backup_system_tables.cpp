@@ -612,6 +612,99 @@ std::vector<SystemRow> ReadRowsetRows(const PageStore &store, const SysAllocUnit
 	return rows;
 }
 
+void AddBootstrapRow(BootstrapTables &out, const std::string &table, const SystemRow &r) {
+	if (r.values.size() != BootstrapLayout(table).columns.size()) {
+		throw FormatError("backup: a row of " + std::to_string(r.values.size()) + " values given as one of " + table +
+						  ", whose layout has " + std::to_string(BootstrapLayout(table).columns.size()));
+	}
+	if (table == "sysallocunits") {
+		static const RowsetLayout &l = BootstrapLayout("sysallocunits");
+		static const size_t auid = l.IndexOf("auid"), type = l.IndexOf("type"), owner = l.IndexOf("ownerid"),
+							status = l.IndexOf("status"), fgid = l.IndexOf("fgid"), first = l.IndexOf("pgfirst"),
+							root = l.IndexOf("pgroot"), iam = l.IndexOf("pgfirstiam");
+		SysAllocUnit a;
+		a.auid = static_cast<uint64_t>(RequiredInt(l, r, auid));
+		a.type = static_cast<uint8_t>(RequiredInt(l, r, type));
+		a.owner_id = static_cast<uint64_t>(RequiredInt(l, r, owner));
+		a.status = static_cast<int32_t>(RequiredInt(l, r, status));
+		a.filegroup_id = static_cast<int16_t>(RequiredInt(l, r, fgid));
+		a.first_page = ValuePointer(l, first, r.values[first]);
+		a.root_page = ValuePointer(l, root, r.values[root]);
+		a.first_iam = ValuePointer(l, iam, r.values[iam]);
+		out.allocation_units.push_back(a);
+	} else if (table == "sysrowsets") {
+		static const RowsetLayout &l = BootstrapLayout("sysrowsets");
+		static const size_t id = l.IndexOf("rowsetid"), owner = l.IndexOf("ownertype"), major = l.IndexOf("idmajor"),
+							minor = l.IndexOf("idminor"), part = l.IndexOf("numpart"), status = l.IndexOf("status"),
+							rows = l.IndexOf("rcrows"), cmpr = l.IndexOf("cmprlevel");
+		SysRowset s;
+		s.rowset_id = static_cast<uint64_t>(RequiredInt(l, r, id));
+		s.owner_type = static_cast<uint8_t>(RequiredInt(l, r, owner));
+		s.object_id = static_cast<int32_t>(RequiredInt(l, r, major));
+		s.index_id = static_cast<int32_t>(RequiredInt(l, r, minor));
+		s.partition_number = static_cast<int32_t>(RequiredInt(l, r, part));
+		s.status = static_cast<int32_t>(RequiredInt(l, r, status));
+		s.rows = RequiredInt(l, r, rows);
+		s.compression = static_cast<uint8_t>(RequiredInt(l, r, cmpr));
+		out.rowsets.push_back(s);
+	} else if (table == "sysschobjs") {
+		static const RowsetLayout &l = BootstrapLayout("sysschobjs");
+		static const size_t id = l.IndexOf("id"), name = l.IndexOf("name"), nsid = l.IndexOf("nsid"),
+							status = l.IndexOf("status"), type = l.IndexOf("type"), pid = l.IndexOf("pid"),
+							created = l.IndexOf("created"), modified = l.IndexOf("modified");
+		SysObject o;
+		o.id = static_cast<int32_t>(RequiredInt(l, r, id));
+		o.name = ValueText(l, name, Required(l, r, name));
+		o.schema_id = static_cast<int32_t>(RequiredInt(l, r, nsid));
+		o.status = static_cast<int32_t>(RequiredInt(l, r, status));
+		o.type = Required(l, r, type).bytes;
+		o.parent_id = static_cast<int32_t>(RequiredInt(l, r, pid));
+		o.created = Required(l, r, created).bytes;
+		o.modified = Required(l, r, modified).bytes;
+		out.objects.push_back(std::move(o));
+	} else if (table == "syscolpars") {
+		static const RowsetLayout &l = BootstrapLayout("syscolpars");
+		static const size_t id = l.IndexOf("id"), number = l.IndexOf("number"), colid = l.IndexOf("colid"),
+							name = l.IndexOf("name"), xtype = l.IndexOf("xtype"), utype = l.IndexOf("utype"),
+							length = l.IndexOf("length"), prec = l.IndexOf("prec"), scale = l.IndexOf("scale"),
+							coll = l.IndexOf("collationid"), status = l.IndexOf("status");
+		SysColumn c;
+		c.object_id = static_cast<int32_t>(RequiredInt(l, r, id));
+		c.number = static_cast<int16_t>(RequiredInt(l, r, number));
+		c.column_id = static_cast<int32_t>(RequiredInt(l, r, colid));
+		c.name = ValueText(l, name, r.values[name]);  // nullable: a parameter's return value has none
+		c.xtype = static_cast<uint8_t>(RequiredInt(l, r, xtype));
+		c.user_type = static_cast<int32_t>(RequiredInt(l, r, utype));
+		c.length = static_cast<int16_t>(RequiredInt(l, r, length));
+		c.precision = static_cast<uint8_t>(RequiredInt(l, r, prec));
+		c.scale = static_cast<uint8_t>(RequiredInt(l, r, scale));
+		c.collation_id = static_cast<uint32_t>(RequiredInt(l, r, coll));
+		c.status = static_cast<int32_t>(RequiredInt(l, r, status));
+		out.columns.push_back(std::move(c));
+	} else if (table == "sysrscols") {
+		static const RowsetLayout &l = BootstrapLayout("sysrscols");
+		static const size_t rsid = l.IndexOf("rsid"), rscolid = l.IndexOf("rscolid"), hbcolid = l.IndexOf("hbcolid"),
+							ti = l.IndexOf("ti"), cid = l.IndexOf("cid"), ordkey = l.IndexOf("ordkey"),
+							status = l.IndexOf("status"), offset = l.IndexOf("offset"), nullbit = l.IndexOf("nullbit"),
+							bitpos = l.IndexOf("bitpos");
+		SysRsCol c;
+		c.rowset_id = static_cast<uint64_t>(RequiredInt(l, r, rsid));
+		c.rscolid = static_cast<int32_t>(RequiredInt(l, r, rscolid));
+		c.hbcolid = static_cast<int32_t>(RequiredInt(l, r, hbcolid));
+		c.ti = static_cast<uint32_t>(RequiredInt(l, r, ti));
+		c.collation = static_cast<uint32_t>(RequiredInt(l, r, cid));
+		c.ordkey = static_cast<int16_t>(RequiredInt(l, r, ordkey));
+		c.status = static_cast<uint32_t>(RequiredInt(l, r, status));
+		// offset, nullbit and bitpos are the low 16 / 16 / 8 bits of their int columns.
+		c.offset = static_cast<int16_t>(static_cast<uint32_t>(RequiredInt(l, r, offset)) & 0xFFFF);
+		c.null_bit = static_cast<uint16_t>(static_cast<uint32_t>(RequiredInt(l, r, nullbit)) & 0xFFFF);
+		c.bit_position = static_cast<uint8_t>(RequiredInt(l, r, bitpos) & 0xFF);
+		out.rscols.push_back(c);
+	} else {
+		throw FormatError("backup: " + table + " is not a bootstrap table");
+	}
+}
+
 BootstrapTables ReadBootstrapTables(const PageStore &store, const BootPage &boot) {
 	BootstrapTables out;
 	// sysallocunits along its leaf chain from dbi_firstSysIndexes.
@@ -619,21 +712,8 @@ BootstrapTables ReadBootstrapTables(const PageStore &store, const BootPage &boot
 	std::set<std::pair<uint16_t, uint32_t>> chain;
 	{
 		const RowsetLayout &l = BootstrapLayout("sysallocunits");
-		const size_t auid = l.IndexOf("auid"), type = l.IndexOf("type"), owner = l.IndexOf("ownerid"),
-					 status = l.IndexOf("status"), fgid = l.IndexOf("fgid"), first = l.IndexOf("pgfirst"),
-					 root = l.IndexOf("pgroot"), iam = l.IndexOf("pgfirstiam");
-		auto add = [&](const SystemRow &r) {
-			SysAllocUnit a;
-			a.auid = static_cast<uint64_t>(RequiredInt(l, r, auid));
-			a.type = static_cast<uint8_t>(RequiredInt(l, r, type));
-			a.owner_id = static_cast<uint64_t>(RequiredInt(l, r, owner));
-			a.status = static_cast<int32_t>(RequiredInt(l, r, status));
-			a.filegroup_id = static_cast<int16_t>(RequiredInt(l, r, fgid));
-			a.first_page = ValuePointer(l, first, r.values[first]);
-			a.root_page = ValuePointer(l, root, r.values[root]);
-			a.first_iam = ValuePointer(l, iam, r.values[iam]);
-			out.allocation_units.push_back(a);
-		};
+		auto add = [&](const SystemRow &r) { AddBootstrapRow(out, "sysallocunits", r); };
+
 		PagePointer at = boot.first_sys_indexes;
 		Page page;
 		while (!at.IsNull()) {
@@ -683,96 +763,19 @@ BootstrapTables ReadBootstrapTables(const PageStore &store, const BootPage &boot
 		}
 	}
 	// The other four, decoded page by page straight into their structs.
-	auto read = [&](const char *name, uint64_t au,
-					const std::function<void(const RowsetLayout &, const SystemRow &)> &add) {
+	auto read = [&](const char *name, uint64_t au) {
 		const SysAllocUnit *unit = out.AllocationUnit(au);
 		if (!unit) {
 			throw FormatError(std::string("backup: sysallocunits has no row for ") + name + "'s allocation unit " +
 							  std::to_string(au));
 		}
-		const RowsetLayout &l = BootstrapLayout(name);
-		ForEachRowsetRow(store, *unit, l, [&](const SystemRow &r) { add(l, r); });
+		ForEachRowsetRow(store, *unit, BootstrapLayout(name),
+						 [&](const SystemRow &r) { AddBootstrapRow(out, name, r); });
 	};
-	{
-		const RowsetLayout &l = BootstrapLayout("sysrowsets");
-		const size_t id = l.IndexOf("rowsetid"), owner = l.IndexOf("ownertype"), major = l.IndexOf("idmajor"),
-					 minor = l.IndexOf("idminor"), part = l.IndexOf("numpart"), status = l.IndexOf("status"),
-					 rows = l.IndexOf("rcrows"), cmpr = l.IndexOf("cmprlevel");
-		read("sysrowsets", AU_SYSROWSETS, [&](const RowsetLayout &, const SystemRow &r) {
-			SysRowset s;
-			s.rowset_id = static_cast<uint64_t>(RequiredInt(l, r, id));
-			s.owner_type = static_cast<uint8_t>(RequiredInt(l, r, owner));
-			s.object_id = static_cast<int32_t>(RequiredInt(l, r, major));
-			s.index_id = static_cast<int32_t>(RequiredInt(l, r, minor));
-			s.partition_number = static_cast<int32_t>(RequiredInt(l, r, part));
-			s.status = static_cast<int32_t>(RequiredInt(l, r, status));
-			s.rows = RequiredInt(l, r, rows);
-			s.compression = static_cast<uint8_t>(RequiredInt(l, r, cmpr));
-			out.rowsets.push_back(s);
-		});
-	}
-	{
-		const RowsetLayout &l = BootstrapLayout("sysschobjs");
-		const size_t id = l.IndexOf("id"), name = l.IndexOf("name"), nsid = l.IndexOf("nsid"),
-					 status = l.IndexOf("status"), type = l.IndexOf("type"), pid = l.IndexOf("pid"),
-					 created = l.IndexOf("created"), modified = l.IndexOf("modified");
-		read("sysschobjs", AU_SYSSCHOBJS, [&](const RowsetLayout &, const SystemRow &r) {
-			SysObject o;
-			o.id = static_cast<int32_t>(RequiredInt(l, r, id));
-			o.name = ValueText(l, name, Required(l, r, name));
-			o.schema_id = static_cast<int32_t>(RequiredInt(l, r, nsid));
-			o.status = static_cast<int32_t>(RequiredInt(l, r, status));
-			o.type = Required(l, r, type).bytes;
-			o.parent_id = static_cast<int32_t>(RequiredInt(l, r, pid));
-			o.created = Required(l, r, created).bytes;
-			o.modified = Required(l, r, modified).bytes;
-			out.objects.push_back(std::move(o));
-		});
-	}
-	{
-		const RowsetLayout &l = BootstrapLayout("syscolpars");
-		const size_t id = l.IndexOf("id"), number = l.IndexOf("number"), colid = l.IndexOf("colid"),
-					 name = l.IndexOf("name"), xtype = l.IndexOf("xtype"), utype = l.IndexOf("utype"),
-					 length = l.IndexOf("length"), prec = l.IndexOf("prec"), scale = l.IndexOf("scale"),
-					 coll = l.IndexOf("collationid"), status = l.IndexOf("status");
-		read("syscolpars", AU_SYSCOLPARS, [&](const RowsetLayout &, const SystemRow &r) {
-			SysColumn c;
-			c.object_id = static_cast<int32_t>(RequiredInt(l, r, id));
-			c.number = static_cast<int16_t>(RequiredInt(l, r, number));
-			c.column_id = static_cast<int32_t>(RequiredInt(l, r, colid));
-			c.name = ValueText(l, name, r.values[name]);  // nullable: a parameter's return value has none
-			c.xtype = static_cast<uint8_t>(RequiredInt(l, r, xtype));
-			c.user_type = static_cast<int32_t>(RequiredInt(l, r, utype));
-			c.length = static_cast<int16_t>(RequiredInt(l, r, length));
-			c.precision = static_cast<uint8_t>(RequiredInt(l, r, prec));
-			c.scale = static_cast<uint8_t>(RequiredInt(l, r, scale));
-			c.collation_id = static_cast<uint32_t>(RequiredInt(l, r, coll));
-			c.status = static_cast<int32_t>(RequiredInt(l, r, status));
-			out.columns.push_back(std::move(c));
-		});
-	}
-	{
-		const RowsetLayout &l = BootstrapLayout("sysrscols");
-		const size_t rsid = l.IndexOf("rsid"), rscolid = l.IndexOf("rscolid"), hbcolid = l.IndexOf("hbcolid"),
-					 ti = l.IndexOf("ti"), cid = l.IndexOf("cid"), ordkey = l.IndexOf("ordkey"),
-					 status = l.IndexOf("status"), offset = l.IndexOf("offset"), nullbit = l.IndexOf("nullbit"),
-					 bitpos = l.IndexOf("bitpos");
-		read("sysrscols", AU_SYSRSCOLS, [&](const RowsetLayout &, const SystemRow &r) {
-			SysRsCol c;
-			c.rowset_id = static_cast<uint64_t>(RequiredInt(l, r, rsid));
-			c.rscolid = static_cast<int32_t>(RequiredInt(l, r, rscolid));
-			c.hbcolid = static_cast<int32_t>(RequiredInt(l, r, hbcolid));
-			c.ti = static_cast<uint32_t>(RequiredInt(l, r, ti));
-			c.collation = static_cast<uint32_t>(RequiredInt(l, r, cid));
-			c.ordkey = static_cast<int16_t>(RequiredInt(l, r, ordkey));
-			c.status = static_cast<uint32_t>(RequiredInt(l, r, status));
-			// offset, nullbit and bitpos are the low 16 / 16 / 8 bits of their int columns.
-			c.offset = static_cast<int16_t>(static_cast<uint32_t>(RequiredInt(l, r, offset)) & 0xFFFF);
-			c.null_bit = static_cast<uint16_t>(static_cast<uint32_t>(RequiredInt(l, r, nullbit)) & 0xFFFF);
-			c.bit_position = static_cast<uint8_t>(RequiredInt(l, r, bitpos) & 0xFF);
-			out.rscols.push_back(c);
-		});
-	}
+	read("sysrowsets", AU_SYSROWSETS);
+	read("sysschobjs", AU_SYSSCHOBJS);
+	read("syscolpars", AU_SYSCOLPARS);
+	read("sysrscols", AU_SYSRSCOLS);
 	out.BuildIndexes();
 	CheckBootstrapLayouts(out);
 	// The units the reader found the four by are their base rowsets' in-row units.

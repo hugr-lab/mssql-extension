@@ -275,6 +275,12 @@ private:
 //! is missing, or a literal layout disagrees with the tables' own description (CheckBootstrapLayouts).
 BootstrapTables ReadBootstrapTables(const PageStore &store, const BootPage &boot);
 
+//! One row of bootstrap table `table` (decoded through BootstrapLayout(table)) appended to `out`'s
+//! vector of it; a NOT NULL field that is NULL, or a value of the wrong size, is a FormatError naming
+//! it. ReadBootstrapTables' own conversion (the fuzz harness drives it over synthetic pages); call
+//! BuildIndexes after.
+void AddBootstrapRow(BootstrapTables &out, const std::string &table, const SystemRow &row);
+
 //! The reader's literal layouts of the five against their description in `tables`: per field the
 //! name, type, fixed offset or variable index, null bit, and a fixed type's length.
 void CheckBootstrapLayouts(const BootstrapTables &tables);

@@ -3,7 +3,10 @@
 // a SQL Server whose data is not ours to publish (spec 085 T4).
 //
 //   c++ -std=c++17 -I src/include -I test/cpp/backup fuzz/gen_backup_seeds.cc src/backup/backup_bytes.cpp \
-//       src/backup/backup_mtf.cpp -o /tmp/gen_backup_seeds && /tmp/gen_backup_seeds fuzz/corpus
+//       src/backup/backup_mtf.cpp src/backup/backup_page_index.cpp src/backup/backup_pass_search.cpp \
+//       src/backup/backup_allocation.cpp src/backup/backup_record.cpp src/backup/backup_page.cpp \
+//       src/backup/backup_container.cpp src/backup/backup_xpress.cpp src/backup/backup_system_tables.cpp \
+//       src/backup/backup_iam.cpp -o /tmp/gen_backup_seeds && /tmp/gen_backup_seeds fuzz/corpus   # from the root
 //
 // backup_mtf: the builder's image as a full, a log, a differential, a forked and an ANSI-string backup.
 // backup_container: a full backup whose pass is real pages, in an MSSQLBAK container laid out as E13
@@ -11,16 +14,25 @@
 // the harness's copying decoder pads, the seek index and the tail). No seed ends in .bak: the
 // repository ignores *.bak, so that no real backup is committed by accident. backup_xpress:
 // literal runs under a 9-bit code. backup_page: compact passes (fuzz_backup_page's format) in order, striped, and out
-// of order.
+// of order. backup_catalog (fuzz_backup_catalog's format: options, a LOB root, pages): pages of the committed
+// synthetic sample test/data/backup/full.bak (made by test/backup/gen/generate.sh on a throwaway instance) -- the
+// boot page and sysallocunits, the other bootstrap tables, a mix with an IAM page -- and a synthetic LOB tree.
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "backup/backup_bytes.hpp"
 #include "backup/backup_mtf.hpp"
+#include "backup/backup_page.hpp"
+#include "backup/backup_page_index.hpp"
+#include "backup/backup_system_tables.hpp"
 #include "mtf_builder.hpp"
 
 using namespace duckdb::mssql::backup;
@@ -193,7 +205,7 @@ static Bytes Xpress(size_t literals) {
 //! clear of the page header's bytes in the chunk (0, 1, 32..37); page 1's (PFS) fills with 0x40, so its
 //! pages are allocated; page 2's (GAM) is zeros
 //! beside its header, so its extents are allocated. `extents` in pass order; 0xFFFFFFFF a zero group.
-static Bytes Page(uint8_t flags, const std::vector<uint32_t> &extents) {
+static Bytes PassSeed(uint8_t flags, const std::vector<uint32_t> &extents) {
 	uint32_t size = 0;
 	for (uint32_t e : extents) {
 		size = e == 0xFFFFFFFFu ? size : std::max(size, (e + 1) * 8);
@@ -223,6 +235,142 @@ static Bytes Page(uint8_t flags, const std::vector<uint32_t> &extents) {
 	return in;
 }
 
+//! fuzz_backup_catalog's input: no option, `root`, then `pages`.
+static Bytes CatalogInput(const std::vector<Bytes> &pages, const Bytes &root = Bytes()) {
+	Bytes out = {0, static_cast<uint8_t>(root.size())};
+	out.insert(out.end(), root.begin(), root.end());
+	for (const auto &p : pages) {
+		out.insert(out.end(), p.begin(), p.end());
+	}
+	return out;
+}
+
+//! The pages of file 1 of the sample `path`, by the allocation unit their headers name; data pages of
+//! level 0 only, and the boot page and IAM pages beside them.
+struct SamplePages {
+	std::map<uint64_t, std::vector<Bytes>> data;  // by allocation unit
+	Bytes boot;
+	Bytes iam;
+};
+
+static SamplePages ReadSample(const std::string &path) {
+	std::ifstream in(path, std::ios::binary);
+	const std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+	if (file.empty()) {
+		std::fprintf(stderr, "cannot read %s\n", path.c_str());
+		std::exit(1);
+	}
+	MemoryAccess access(path, file.data(), file.size());
+	const MtfLayout layout = WalkMtf(access);
+	std::vector<FamilyStream> streams(1);
+	streams[0].stream = &access;
+	streams[0].layout = &layout;
+	PageIndexOptions options;
+	options.full_backup = true;
+	const PageIndex index = BuildPageIndex(streams, options);
+	SamplePages out;
+	std::vector<uint8_t> bytes;
+	for (uint32_t p = 0; p < 2048; p++) {
+		if (!index.ReadPage(1, p, bytes) || bytes.size() != 8192 || bytes[0] != 1) {
+			continue;
+		}
+		const PageHeader h = ReadPageHeader(bytes.data());
+		if (p == 9 && h.type == 13) {
+			out.boot = bytes;
+		} else if (h.type == 10 && out.iam.empty()) {
+			out.iam = bytes;
+		} else if (h.type == 1 && h.level == 0) {
+			out.data[h.AllocationUnit()].push_back(bytes);
+		}
+	}
+	return out;
+}
+
+//! The pages of `pages` (bootstrap table `table`'s) holding a row that describes one of the five
+//! bootstrap tables themselves: an object id among `objects` (sysschobjs, syscolpars), or a rowset
+//! among `rowsets` (sysallocunits' ownerid, sysrscols' rsid); sysrowsets' rows of those objects add
+//! their rowsets to `rowsets`. These are the rows the reader's self-description check needs.
+static std::vector<Bytes> Describing(const std::vector<Bytes> &pages, const std::string &table,
+									 const std::set<int64_t> &objects, std::set<int64_t> &rowsets) {
+	const RowsetLayout &layout = BootstrapLayout(table);
+	const char *key = table == "sysrowsets"		 ? "idmajor"
+					  : table == "sysallocunits" ? "ownerid"
+					  : table == "sysrscols"	 ? "rsid"
+												 : "id";
+	const size_t k = layout.IndexOf(key);
+	std::vector<Bytes> out;
+	for (const Bytes &bytes : pages) {
+		Page page;
+		page.bytes = bytes;
+		page.header = ReadPageHeader(bytes.data());
+		bool keep = false;
+		ForEachPageRow(page, layout, [&](const SystemRow &row) {
+			const int64_t v = ValueInt(layout, k, row.values[k]);
+			if (table == "sysrowsets" && objects.count(v)) {
+				rowsets.insert(ValueInt(layout, layout.IndexOf("rowsetid"), row.values[layout.IndexOf("rowsetid")]));
+				keep = true;
+			} else if ((table == "sysallocunits" || table == "sysrscols") ? rowsets.count(v) > 0
+																		  : objects.count(v) > 0) {
+				keep = keep || table != "sysrowsets";
+			}
+		});
+		if (keep) {
+			out.push_back(bytes);
+		}
+	}
+	return out;
+}
+
+static std::vector<Bytes> First(const std::vector<Bytes> &pages, size_t n) {
+	return std::vector<Bytes>(pages.begin(), pages.begin() + static_cast<long>(std::min(n, pages.size())));
+}
+
+//! A synthetic LOB tree: a text page of two DATA fragments and an INTERNAL node over them (file 1, pages
+//! 100 and 101, allocation unit 255 << 16: no bootstrap table's), and an in-row root over the node.
+static Bytes LobInput() {
+	auto page = [](uint32_t number, const std::vector<Bytes> &records) {
+		Bytes p(8192, 0);
+		p[0] = 1;
+		p[1] = 3;
+		Put16(p, 22, static_cast<uint16_t>(records.size()));
+		Put32(p, 24, 255);
+		Put32(p, 32, number);
+		Put16(p, 36, 1);
+		size_t at = 96;
+		for (size_t i = 0; i < records.size(); i++) {
+			std::memcpy(&p[at], records[i].data(), records[i].size());
+			Put16(p, 8190 - 2 * i, static_cast<uint16_t>(at));
+			at += records[i].size();
+		}
+		return p;
+	};
+	auto fragment = [](uint16_t type, const Bytes &body) {
+		Bytes r(14, 0);
+		r[0] = 0x08;
+		Put16(r, 2, static_cast<uint16_t>(14 + body.size()));
+		Put16(r, 12, type);
+		r.insert(r.end(), body.begin(), body.end());
+		return r;
+	};
+	const Bytes hello = {'h', 'e', 'l', 'l', 'o'}, abc = {'a', 'b', 'c'};
+	Bytes internal(6 + 32, 0);
+	Put16(internal, 0, 2);
+	Put16(internal, 2, 2);
+	Put32(internal, 6, 5);	// cumulative 5 (u64), page 100, file 1, slot 0
+	Put32(internal, 14, 100);
+	Put16(internal, 18, 1);
+	Put32(internal, 22, 8);	 // cumulative 8, page 100, file 1, slot 1
+	Put32(internal, 30, 100);
+	Put16(internal, 34, 1);
+	Put16(internal, 36, 1);
+	Bytes root(24, 0);
+	root[0] = 5;
+	Put32(root, 12, 8);	 // cumulative 8, page 101, file 1, slot 0
+	Put32(root, 16, 101);
+	Put16(root, 20, 1);
+	return CatalogInput({page(100, {fragment(3, hello), fragment(3, abc)}), page(101, {fragment(2, internal)})}, root);
+}
+
 int main(int argc, char **argv) {
 	out_dir = argc > 1 ? argv[1] : "fuzz/corpus";
 	Options full;
@@ -245,9 +393,60 @@ int main(int argc, char **argv) {
 	Write("backup_xpress", "literals_300", Xpress(300));
 	Write("backup_xpress", "literals_4096", Xpress(4096));
 
-	Write("backup_page", "ordered", Page(1, {0, 1, 2, 4, 5}));
-	Write("backup_page", "striped", Page(3, {0, 1, 2, 3, 6, 7}));
-	Write("backup_page", "out_of_order", Page(5, {0, 3, 1, 0xFFFFFFFFu, 2}));
-	Write("backup_page", "header_scan", Page(0, {0, 0xFFFFFFFFu, 1, 2}));
+	Write("backup_page", "ordered", PassSeed(1, {0, 1, 2, 4, 5}));
+	Write("backup_page", "striped", PassSeed(3, {0, 1, 2, 3, 6, 7}));
+	Write("backup_page", "out_of_order", PassSeed(5, {0, 3, 1, 0xFFFFFFFFu, 2}));
+	Write("backup_page", "header_scan", PassSeed(0, {0, 0xFFFFFFFFu, 1, 2}));
+
+	const SamplePages sample = ReadSample("test/data/backup/full.bak");
+	const uint64_t SAU = 7ull << 16, ROWSETS = 5ull << 16, OBJECTS = (1ull << 48) | (34ull << 16),
+				   COLUMNS = (1ull << 48) | (41ull << 16), RSCOLS = 3ull << 16;
+	auto pages_of = [&](uint64_t au) {
+		auto it = sample.data.find(au);
+		return it == sample.data.end() ? std::vector<Bytes>() : it->second;
+	};
+	std::vector<Bytes> boot_sau = {sample.boot};
+	for (const auto &p : First(pages_of(SAU), 3)) {
+		boot_sau.push_back(p);
+	}
+	Write("backup_catalog", "boot_sysallocunits", CatalogInput(boot_sau));
+	std::vector<Bytes> objects = First(pages_of(ROWSETS), 2);
+	for (const auto &p : First(pages_of(OBJECTS), 4)) {
+		objects.push_back(p);
+	}
+	Write("backup_catalog", "rowsets_objects", CatalogInput(objects));
+	std::vector<Bytes> columns = First(pages_of(COLUMNS), 4);
+	for (const auto &p : First(pages_of(RSCOLS), 4)) {
+		columns.push_back(p);
+	}
+	Write("backup_catalog", "columns_rscols", CatalogInput(columns));
+	// The pages that describe the five themselves: CheckBootstrapLayouts passes over them and their
+	// described layouts decode (measured 9 pages beside the boot page; the harness takes 16).
+	std::set<int64_t> five = {3, 5, 7, 34, 41}, rowsets;
+	std::vector<Bytes> describing = {sample.boot};
+	for (const char *table : {"sysrowsets", "sysschobjs", "syscolpars", "sysallocunits", "sysrscols"}) {
+		const uint64_t au = std::string(table) == "sysrowsets"		? ROWSETS
+							: std::string(table) == "sysschobjs"	? OBJECTS
+							: std::string(table) == "syscolpars"	? COLUMNS
+							: std::string(table) == "sysallocunits" ? SAU
+																	: RSCOLS;
+		for (const auto &p : Describing(pages_of(au), table, five, rowsets)) {
+			describing.push_back(p);
+		}
+	}
+	if (describing.size() < 6 || describing.size() > 16 || sample.boot.empty() || sample.iam.empty()) {
+		std::fprintf(stderr, "the sample gives %zu describing pages (boot %zu, IAM %zu bytes)\n", describing.size(),
+					 sample.boot.size(), sample.iam.size());
+		std::exit(1);
+	}
+	Write("backup_catalog", "self_described", CatalogInput(describing));
+	std::vector<Bytes> mix = {sample.boot, sample.iam};
+	for (uint64_t au : {SAU, ROWSETS, OBJECTS, COLUMNS, RSCOLS}) {
+		for (const auto &p : First(pages_of(au), 1)) {
+			mix.push_back(p);
+		}
+	}
+	Write("backup_catalog", "mix", CatalogInput(mix));
+	Write("backup_catalog", "lob_tree", LobInput());
 	return 0;
 }

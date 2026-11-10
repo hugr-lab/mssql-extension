@@ -1103,7 +1103,10 @@ A backup file is untrusted input (R§9). Every parser:
   `fuzz_backup_xpress` (raw codec, with a differential oracle against a reference decode of the seed),
   `fuzz_backup_page` (header, slot array, record split), `fuzz_backup_record` (row decode against a
   synthetic layout), `fuzz_backup_lob` (tree walk over a synthetic page set), `fuzz_backup_catalog`
-  (bootstrap over synthetic pages), `fuzz_backup_log` (blocks, parity, records). `src/backup/**` joins
+  (PR 2b: the boot and IAM pages, records through the bootstrap layouts and the described ones, the
+  bootstrap rows, indexes and self-description check, value accessors, sql_variant, module text, and
+  the catalog's LOB tree walk, over up to 16 pages; seeds: pages of the committed sample (one set chosen so the five describe themselves) and a built LOB
+  tree), `fuzz_backup_log` (blocks, parity, records). `src/backup/**` joins
   `cflite-pr.yml`'s paths.
 - **Memory** (D17, § Resources): whatever grows with the file is buffer-managed; a LOB value is capped
   at 2^31 − 1 bytes and reserved before it is read; a chunk closes at the staging budget.

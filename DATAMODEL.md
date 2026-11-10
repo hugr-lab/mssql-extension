@@ -1422,7 +1422,7 @@ flowchart BT
   checks each length, offset and count against its span; a read past one is a named `FormatError`,
   and the table function turns it into an `InvalidInputException` naming the file. Each MTF
   descriptor and stream header's XOR checksum is validated; the walk follows header lengths only,
-  never a resync. `make fuzz-backup-replay` replays the four harnesses (`fuzz/fuzz_backup_*`) over
+  never a resync. `make fuzz-backup-replay` replays the five harnesses (`fuzz/fuzz_backup_*`) over
   their corpora, which `fuzz/gen_backup_seeds.cc` builds from synthetic files only.
 - **DuckDB-free parsers.** Everything but `backup_source`, `backup_open_pass`, `backup_opened` and
   the function (marked `[DuckDB]` in their headers) builds without libduckdb (spec 085 D15), so the
