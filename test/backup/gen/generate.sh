@@ -5,6 +5,11 @@
 #
 #   OUT=/tmp/bak VERSION=2019 test/backup/gen/generate.sh     # an image of images.txt, by digest
 #   OUT=/tmp/bak IMAGE=mcr.microsoft.com/mssql/server:2022-latest test/backup/gen/generate.sh
+#   OUT=/tmp/bak FIXTURES=samples test/backup/gen/generate.sh  # samples.sql only (the committed set)
+#
+# FIXTURES (default "samples catalog"): samples.sql, the database of the committed samples, and
+# catalog.sql, the catalog fixture (spec 085 PR 2b), whose backup comes with the server's own catalog
+# of it (<set>.tables.txt / .columns.txt / .views.txt, written by sqlcmd's :OUT).
 #
 # Writes into OUT: the backups, <set>.headeronly.txt / .labelonly.txt / .filelistonly.txt, sets.txt
 # (one line per backup set: name|file[,file] -- what test/backup/compare_info.py reads) and
@@ -19,6 +24,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
+FIXTURES="${FIXTURES:-samples catalog}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
 	[ -n "${IMAGE}" ] || { echo "ERROR: no image for VERSION=${VERSION} in images.txt" >&2; exit 1; }
@@ -112,17 +118,32 @@ docker exec -u 0 "${CONTAINER}" mkdir -p "${DIR}"
 # The server runs as mssql from the 2019 image on; the 2017 image runs it as root and has no such
 # user, so there the directory is the server's already.
 docker exec -u 0 "${CONTAINER}" sh -c "if id mssql >/dev/null 2>&1; then chown mssql '${DIR}'; fi"
-docker cp "${HERE}/samples.sql" "${CONTAINER}:/tmp/samples.sql"
-echo ">> running samples.sql"
-sql -v DIR="${DIR}" -i /tmp/samples.sql
-
-# The sets samples.sql made on this version, in its order. test/backup/compare_info.py's
-# samples_sets() states the same list as what to expect of a version (--expect-major): change both.
-sets=("full|full.bak" "full_xpress|full_xpress.bak")
-if [ "${major}" -ge 17 ]; then sets+=("full_zstd|full_zstd.bak"); fi
-sets+=("stripe|stripe_1.bak,stripe_2.bak")
-if [ "${major}" -ge 17 ]; then sets+=("stripe_zstd|stripe_zstd_1.bak,stripe_zstd_2.bak"); fi
-sets+=("diff|diff.bak" "log|log.trn")
+sets=()
+extras=()
+for fixture in ${FIXTURES}; do
+	docker cp "${HERE}/${fixture}.sql" "${CONTAINER}:/tmp/${fixture}.sql"
+	echo ">> running ${fixture}.sql"
+	sql -v DIR="${DIR}" -s '|' -W -i "/tmp/${fixture}.sql"
+	case "${fixture}" in
+	samples)
+		# The sets samples.sql made on this version, in its order. test/backup/compare_info.py's
+		# samples_sets() states the same list as what to expect of a version (--expect-major): change both.
+		sets+=("full|full.bak" "full_xpress|full_xpress.bak")
+		if [ "${major}" -ge 17 ]; then sets+=("full_zstd|full_zstd.bak"); fi
+		sets+=("stripe|stripe_1.bak,stripe_2.bak")
+		if [ "${major}" -ge 17 ]; then sets+=("stripe_zstd|stripe_zstd_1.bak,stripe_zstd_2.bak"); fi
+		sets+=("diff|diff.bak" "log|log.trn")
+		;;
+	catalog)
+		sets+=("catalog_full|catalog_full.bak")
+		extras+=(catalog_full.tables.txt catalog_full.columns.txt catalog_full.views.txt)
+		;;
+	*)
+		echo "ERROR: unknown fixture ${fixture}" >&2
+		exit 1
+		;;
+	esac
+done
 
 : >"${OUT}/sets.txt"
 for entry in "${sets[@]}"; do
@@ -139,6 +160,9 @@ for entry in "${sets[@]}"; do
 			>"${OUT}/${name}.$(echo "${kind}" | tr '[:upper:]' '[:lower:]').txt"
 	done
 	echo "${entry}" >>"${OUT}/sets.txt"
+done
+for f in "${extras[@]+"${extras[@]}"}"; do
+	docker cp "${CONTAINER}:${DIR}/${f}" "${OUT}/${f}"
 done
 
 echo ">> done: $(wc -l <"${OUT}/sets.txt" | tr -d ' ') sets in ${OUT}"
