@@ -1466,7 +1466,9 @@ SQL Server 2017, 2019, 2022 and 2025 (each image pinned by digest in `test/backu
 and stores them in R2 under `oracle/<key>/<version>/<run>/`, `<key>` a hash of `test/backup/gen/`:
 they are made again only when the generator, the data or an image changes. `<version>/DONE`,
 written last, names the run whose upload is complete, so two runs generating one version never mix
-their files. The reader is compared with the server's answers reading them from R2 through `s3://`,
+their files. A push to main whose comparisons all passed removes what no run reads any more: in
+main's key the runs no `DONE` names (a day after the switch), and any other key once none of its
+`DONE`s has moved for a week. The reader is compared with the server's answers reading them from R2 through `s3://`,
 in a build with httpfs linked in statically and curl from vcpkg (`make backup-oracle-build`,
 `test/backup/oracle_vcpkg_manifest.py`): the reader's own I/O path, not a copy.
 
