@@ -26,9 +26,11 @@ MSSQL_BENCH_HOST / _PORT / _USER / _PASSWORD, falling back to the test
 suite's MSSQL_TEST_HOST / _PORT / _USER / _PASS. See README.md.
 """
 import argparse
+import contextlib
 import csv
 import datetime
 import decimal
+import io
 import os
 import pathlib
 import re
@@ -36,6 +38,14 @@ import statistics
 import subprocess
 import sys
 import tempfile
+
+#: Issue #507 item 6. `argparse.BooleanOptionalAction` (now gone, below) set
+#: an UNDECLARED 3.9 floor, so on the README's own Hetzner target -- Ubuntu
+#: 20.04, Python 3.8.10 -- the harness died at `--help` before it could say
+#: why. The floor is 3.8 (`unlink(missing_ok=True)`), and it is declared here
+#: rather than discovered there.
+if sys.version_info < (3, 8):
+    sys.exit("error: tpch_bench.py needs Python 3.8 or newer (found %d.%d)" % sys.version_info[:2])
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[2]
@@ -67,6 +77,10 @@ COLUMNS = {
     "l_comment VARCHAR(44) NOT NULL",
 }
 UTF8_COLLATION = "Latin1_General_100_CI_AS_SC_UTF8"
+#: The collation each string flavour takes when `--collation` is not given.
+#: `utf8` needs one -- a VARCHAR column in a code-page collation is not UTF-8
+#: at all -- and the others inherit the server's.
+DEFAULT_COLLATIONS = {"utf8": UTF8_COLLATION}
 
 
 def columns(table, strings):
@@ -94,6 +108,50 @@ PRIMARY_KEYS = {
     "orders": "o_orderkey",
     "lineitem": "l_orderkey, l_linenumber",
 }
+
+
+def collation_tag(collation):
+    """The database-name component for a collation: lowercase, no separators."""
+    return re.sub(r"[^A-Za-z0-9]", "", collation).lower()
+
+
+def derived_db_name(args):
+    """The default `--db`, which must name every schema choice it was loaded with.
+
+    Issue #507 item 1. The name carried --sf, --layout and --strings but NOT
+    --collation, which only `cmd_load` ever read -- so `--strings utf8`
+    resolved to `tpch_sf10_columnstore_utf8` WHICHEVER collation was passed.
+    The two UTF-8 rows of RESULTS-local.md therefore collide on one name, and
+    loading the second drops the first; the published BIN2 row came from a
+    hand-passed `--db` that no documented command produces.
+
+    The whole collation name goes into the component, not a family-less
+    fragment of it: `bin2` alone would collide again across collation families.
+    The component is appended only when the collation differs from the default
+    for the string flavour, so the three schemas that use their own default
+    keep the names they had.
+    """
+    name = f"tpch_sf{args.sf:g}_{args.layout}"
+    if args.strings != "spec":
+        name += f"_{args.strings}"
+    if args.collation and args.collation != DEFAULT_COLLATIONS.get(args.strings):
+        name += f"_{collation_tag(args.collation)}"
+    return name.replace(".", "_")
+
+
+def resolve_schema(args):
+    """Fill in the collation and the database name the schema flags imply.
+
+    Here rather than inside `cmd_load`, because every command needs the same
+    answer: `run`, `verify` and `trace` address the database by name, and a
+    name derived without the collation is the whole of item 1.
+    """
+    if args.strings == "utf8" and not args.collation:
+        args.collation = DEFAULT_COLLATIONS["utf8"]
+    if args.db is None:
+        args.db = derived_db_name(args)
+    return args
+
 
 CLIENTS = {
     "A": {"label": "DuckDB 1.5.6 + mssql 0.2.5", "bin": "A", "queries": "duckdb", "attach": ""},
@@ -309,12 +367,16 @@ def cmd_gen(args):
     dbfile = out / "tpch.duckdb"
     script = ["INSTALL tpch;", "LOAD tpch;", f"CALL dbgen(sf={args.sf});"]
     for t in TABLES:
-        script.append(f"COPY {t} TO '{out / (t + '.parquet')}' (FORMAT parquet);")
+        script.append(f"COPY {t} TO '{esc(str(out / (t + '.parquet')))}' (FORMAT parquet);")
     rc, text = run_cli(binary("A"), "\n".join(script) + "\n", {"password": ""}, database=str(dbfile))
     print(text)
+    # Removed whatever happened (issue #507 item 6). The exit used to come
+    # first, so a failed `gen` left a half-built tpch.duckdb behind that already
+    # held some of the tables -- and `CALL dbgen` into those fails, so every
+    # retry failed too until someone deleted the file by hand.
+    dbfile.unlink(missing_ok=True)
     if rc != 0:
         sys.exit(rc)
-    dbfile.unlink(missing_ok=True)
     print(f"generated SF{args.sf:g} into {out}")
 
 
@@ -333,10 +395,42 @@ def recreate_database_statements(cfg, args):
     db = safe_name(args.db, "--db")
     collation = safe_name(args.collation, "--collation") if args.collation else None
     collate = f" + N' COLLATE {collation}'" if collation else ""
-    batch = ("DECLARE @n sysname = N'" + db + "'; DECLARE @sql nvarchar(max); "
+    # The SINGLE_USER switch and the DROP are two statements, and the DROP is
+    # in a TRY (issue #507 item 5). They used to be one batch: a DROP that
+    # failed -- 5030 / 3702, any session connecting in the window -- aborted
+    # before CREATE, SET RECOVERY SIMPLE and SET QUERY_STORE = OFF, leaving the
+    # old database in SINGLE_USER with no connection holding it. Unusable until
+    # someone issued SET MULTI_USER by hand, and a re-run hit the same pair.
+    #
+    # The restore has a TRY of its OWN (review of #548 item 2): the window this
+    # fix is for is another session taking the database's only connection, and
+    # that same session makes `SET MULTI_USER` fail with 5064 -- raised INSIDE
+    # the CATCH, where it escapes and replaces the DROP's own error with the
+    # restore's. Measured on the 2019 engine with a session holding the single
+    # connection: `WITH ROLLBACK IMMEDIATE` does NOT get past it either (5064,
+    # then 5069 `ALTER DATABASE statement failed`) -- in single-user mode the
+    # ALTER cannot get in at all, so there is nothing for the termination
+    # clause to terminate. It is sent anyway, for the windows where the
+    # blocker is work inside the database rather than the connection; what
+    # makes the failure legible is the nested TRY, which keeps the DROP's
+    # reason, says the database is left in SINGLE_USER, and names the
+    # statement that puts it back.
+    batch = ("DECLARE @n sysname = N'" + db + "'; DECLARE @sql nvarchar(max), @why nvarchar(2048); "
              "IF DB_ID(@n) IS NOT NULL BEGIN "
-             "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET SINGLE_USER WITH ROLLBACK IMMEDIATE; "
-             "DROP DATABASE ' + QUOTENAME(@n); EXEC (@sql); END; "
+             "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET SINGLE_USER WITH ROLLBACK IMMEDIATE'; "
+             "EXEC (@sql); "
+             "BEGIN TRY SET @sql = N'DROP DATABASE ' + QUOTENAME(@n); EXEC (@sql); END TRY "
+             "BEGIN CATCH "
+             "SET @why = N'could not drop ' + QUOTENAME(@n) + N': ' + ERROR_MESSAGE(); "
+             "BEGIN TRY "
+             "IF DB_ID(@n) IS NOT NULL BEGIN "
+             "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) "
+             "+ N' SET MULTI_USER WITH ROLLBACK IMMEDIATE'; EXEC (@sql); END; "
+             "END TRY BEGIN CATCH "
+             "SET @why = LEFT(@why + N' -- and it is LEFT IN SINGLE_USER (' + ERROR_MESSAGE() "
+             "+ N') -- run: ALTER DATABASE ' + QUOTENAME(@n) + N' SET MULTI_USER', 2048); "
+             "END CATCH; "
+             "THROW 50000, @why, 1; END CATCH; END; "
              "SET @sql = N'CREATE DATABASE ' + QUOTENAME(@n)" + collate + "; EXEC (@sql); "
              "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET RECOVERY SIMPLE'; EXEC (@sql); "
              "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET QUERY_STORE = OFF'; EXEC (@sql);")
@@ -348,6 +442,11 @@ def recreate_database_statements(cfg, args):
 
 
 def create_table_statements(args):
+    """The eight CREATE TABLEs, and the clustered index each layout wants.
+
+    The columnstore layout's primary keys are NOT here: they are added after
+    the load, see `primary_key_statements`.
+    """
     out = []
     for tb in TABLES:
         ddl = f"CREATE TABLE dbo.{tb} ({columns(tb, args.strings)}"
@@ -365,9 +464,53 @@ def load_statements(data):
     out = [".timer on"]
     for tb in TABLES:
         out.append(f".print @@LOAD {tb}@@")
-        out.append(f"INSERT INTO t.dbo.{tb} SELECT * FROM read_parquet('{data / (tb + '.parquet')}');")
+        # esc() on the path too (issue #507 item 6): a --data-dir holding a
+        # quote -- `/Volumes/Team's data` -- was a parse error, with esc()
+        # sitting right there.
+        out.append(f"INSERT INTO t.dbo.{tb} SELECT * FROM read_parquet('{esc(str(data / (tb + '.parquet')))}');")
     out.append(".timer off")
     return out
+
+
+def primary_key_statements(args):
+    """TPC-H's primary keys on a columnstore layout, added AFTER the rows.
+
+    Issue #507 item 3. The columnstore layout -- the default, and the layout
+    behind every published number -- declared no key at all, so its tables had
+    no rowid key: `KeyCovered` is false on an empty unique key
+    (`src/pushdown/mssql_node_writer_from.cpp`), the remote-pushdown join-gain
+    check loses its unique-key rung and falls back on
+    `mssql_pushdown_join_rows_threshold` (1,000,000), and at SF10 `lineitem`,
+    `orders`, `partsupp`, `part` and `customer` are all above it. So `--layout`
+    silently changed pushdown DECISIONS, not just storage, while TPC-H's own
+    required keys were absent from every measurement.
+
+    NONCLUSTERED, because the clustered slot is the columnstore index. After
+    the load, because a clustered columnstore CARRYING a nonclustered index
+    refuses the parallel bulk writers the load depends on (CLAUDE.md, spec 062:
+    the extra writer times out mid-stream and the whole INSERT rolls back).
+    The rowstore layout keeps its clustered primary key from the CREATE, where
+    it costs the load nothing.
+    """
+    if args.layout != "columnstore":
+        return []
+    out = []
+    for tb in TABLES:
+        ddl = f"ALTER TABLE dbo.{tb} ADD CONSTRAINT pk_{tb} PRIMARY KEY NONCLUSTERED ({PRIMARY_KEYS[tb]})"
+        out.append(f"SELECT mssql_exec('t', '{esc(ddl)}');")
+    return out
+
+
+def row_count_statement():
+    """The eight row counts in ONE statement the server answers.
+
+    Issue #507 item 6. These were eight `count(*)` over the `remote_pushdown
+    false` attachment, so each streamed a whole column into DuckDB to print one
+    number: about 86.6M rows / 700 MB at SF10 to print eight numbers. COUNT_BIG
+    on the server costs one round trip and no rows.
+    """
+    counts = " UNION ALL ".join(f"SELECT '{tb}' AS t, COUNT_BIG(*) AS n FROM dbo.{tb}" for tb in TABLES)
+    return f"SELECT * FROM mssql_scan('t', '{esc(counts)}');"
 
 
 def post_load_statements(args):
@@ -387,8 +530,9 @@ def cmd_load(args):
     missing = [t for t in TABLES if not (data / f"{t}.parquet").exists()]
     if missing:
         sys.exit(f"error: no parquet for {missing} under {data} -- run `gen` first")
-    if args.strings == "utf8" and not args.collation:
-        args.collation = UTF8_COLLATION
+    # The collation and the database name were resolved by `resolve_schema`
+    # before any command ran (issue #507 item 1), so `load`, `run`, `verify`
+    # and `trace` all address the same database.
     # No statement timeout: REORGANIZE and FULLSCAN statistics on a large lineitem
     # run for minutes.
     s = ["LOAD mssql;", "SET mssql_query_timeout = 0;"]
@@ -397,8 +541,9 @@ def cmd_load(args):
     s += create_table_statements(args)
     s.append("SELECT mssql_invalidate_cache('t');")
     s += load_statements(data)
+    s += primary_key_statements(args)
     s += post_load_statements(args)
-    s += [f"SELECT '{tb}' AS t, count(*) AS n FROM t.dbo.{tb};" for tb in TABLES]
+    s.append(row_count_statement())
     rc, text = run_cli(binary("B"), "\n".join(s) + "\n", cfg)
     print(text)
     if rc != 0:
@@ -614,13 +759,35 @@ def session_preamble(text):
     return " ".join(lines)[:300]
 
 
-def timed_session(client, cfg, args, queries):
+def timed_script(client, cfg, args, queries):
+    """The session a timed run sends: per query, `--warmup` untimed passes then one timed.
+
+    Two things here are issue #507 item 6.
+
+    `.mode csv` pins the renderer, which runs INSIDE the timer: the rows go to
+    /dev/null, but the default duckbox formatter still measures every column's
+    width over every row, and its implementation differs between 1.5.6 and 2.0
+    -- a client-version difference inside the number being compared. csv is
+    the same trivial writer in both.
+
+    Each query is warmed immediately before it is timed, not once per pass.
+    With a full warmup pass first, by the time the timed pass reached q01 its
+    data had been untouched the longest while q22's was still hot: a systematic
+    bias along the query order, inside the warmup that exists to remove one.
+    """
     s = session_head(client, cfg, args)
+    s.append(".mode csv")
     s.append(".timer on")
-    for tag in (["W"] * args.warmup) + ["T"]:
-        for q in queries:
-            s += [".output", f".print @@{tag} {q}@@", ".output /dev/null", query_text(client, q, args.sf)]
-    s += [".output", ".print @@END end@@"]
+    for q in queries:
+        text = query_text(client, q, args.sf)
+        for _ in range(args.warmup):
+            s += [".output", f".print @@W {q}@@", ".output /dev/null", text]
+        s += [".output", f".print @@T {q}@@", ".output /dev/null", text]
+    return s + [".output", ".print @@END end@@"]
+
+
+def timed_session(client, cfg, args, queries):
+    s = timed_script(client, cfg, args, queries)
     rc, text = run_cli(binary(CLIENTS[client]["bin"]), "\n".join(s) + "\n", cfg, timeout=args.timeout)
     return parse_marked(text, "T"), text
 
@@ -628,8 +795,25 @@ def timed_session(client, cfg, args, queries):
 # --------------------------------------------------------------------------- run / report
 
 def selected(args):
+    """The clients and queries to work on, every name checked at the flag.
+
+    Issue #507 item 6: a stray comma used to reach the body of a command as an
+    empty name -- `--queries q01,` opened `queries/duckdb/.sql` and died with a
+    FileNotFoundError, `--clients ,` divided by a client count of zero -- and an
+    unknown name failed the same way, deep inside a session, long after the
+    flag that held it.
+    """
     clients = [c.strip() for c in args.clients.split(",") if c.strip()]
-    queries = [q.strip() for q in args.queries.split(",")] if args.queries else QUERIES
+    queries = [q.strip() for q in (args.queries or "").split(",") if q.strip()] or list(QUERIES)
+    unknown = [c for c in clients if c not in CLIENTS]
+    if unknown or not clients:
+        sys.exit(f"error: --clients {args.clients!r} names "
+                 + (f"no such client: {', '.join(unknown)}" if unknown else "no client")
+                 + f". Pick from {', '.join(CLIENTS)}.")
+    unknown = [q for q in queries if q not in QUERIES]
+    if unknown:
+        sys.exit(f"error: --queries {args.queries!r} names no such query: {', '.join(unknown)}. "
+                 f"Pick from {QUERIES[0]}..{QUERIES[-1]}.")
     return clients, queries
 
 
@@ -676,6 +860,39 @@ def rotated(clients, rep):
     return clients[k:] + clients[:k]
 
 
+def preserved_rows(path, clients, db):
+    """The rows of an existing timings.csv this invocation must not lose.
+
+    Issue #507 item 4. `run` opened timings.csv in "w" and wrote only the
+    current invocation's rows, while leaving the previous invocation's session
+    logs in place and `README.md` fixing the run id -- so re-running
+    `--run-id sf10 --clients B run` replaced a published 4-client, 176-row file
+    with a 22-row B-only one, beside `session-1-{A,Bscan,C}.log` that survived
+    and still claimed to document the medians now unrecoverable from it.
+
+    The rows of the clients this invocation measures ARE replaced; every other
+    client's are kept.
+
+    A kept row of ANOTHER database refuses the whole run (review of #548 item
+    3). Keeping by client alone put two schemas in one file -- re-run
+    `--run-id sf10 --clients B run` against a second schema and A, Bscan and C
+    keep the old database's rows while B gets the new one's -- and `report`
+    groups by client and query only, so it would compare medians across two
+    databases with nothing saying so. Refusing is better than dropping them:
+    the rows may be the only copy of a published measurement.
+    """
+    if not path.exists():
+        return []
+    with open(path, newline="") as f:
+        kept = [r for r in csv.DictReader(f) if r.get("client") not in clients]
+    foreign = sorted({r.get("db", "") for r in kept if r.get("db") and r.get("db") != db})
+    if foreign:
+        sys.exit(f"error: {path} holds rows of {', '.join(foreign)} and this run measures {db}. "
+                 f"A report over both would compare medians across databases. Use another "
+                 f"--run-id for {db}, or move that file aside.")
+    return kept
+
+
 def cmd_run(args):
     cfg = server()
     clients, queries = selected(args)
@@ -690,11 +907,22 @@ def cmd_run(args):
     # in this file was a ValueError in same(). The harness also sets
     # mssql_query_timeout = 0, so --timeout per session is the only ceiling.
     path = out / "timings.csv"
+    kept = preserved_rows(path, clients, args.db)
     errored = 0
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["run", "db", "client", "rep", "query", "seconds", "error"])
         w.writeheader()
+        for row in kept:
+            w.writerow({k: row.get(k, "") for k in w.fieldnames})
         f.flush()
+        if kept:
+            print(f"keeping {len(kept)} row(s) of {', '.join(sorted({r['client'] for r in kept}))} "
+                  f"already in {path}", flush=True)
+        # The session logs of the clients being measured again, so no stale log
+        # sits beside rows from another invocation (the other half of item 4).
+        for client in clients:
+            for stale in sorted(out.glob(f"session-*-{client}.log")):
+                stale.unlink()
         for rep in range(args.reps):
             for client in rotated(clients, rep):
                 res, text = session_results(client, cfg, args, queries, rep)
@@ -810,9 +1038,30 @@ def report_lines(clients, queries, med, base, reps_max):
     return lines
 
 
+def timings_path(args):
+    """The timings.csv `report` summarises.
+
+    Issue #507 item 6: without `--timings` this was `pathlib.Path(None)`, a
+    bare TypeError from inside the command. `--run-id` names the run's own
+    file, which is what a scripted `run && report` has at hand.
+    """
+    if args.timings:
+        return pathlib.Path(args.timings)
+    if getattr(args, "run_id", None):
+        return pathlib.Path(args.out) / args.run_id / "timings.csv"
+    sys.exit("error: report needs --timings <path to timings.csv>, "
+             "or --run-id (then --out/<run-id>/timings.csv)")
+
+
 def cmd_report(args):
-    rows = list(csv.DictReader(open(pathlib.Path(args.timings))))
+    path = timings_path(args)
+    if not path.exists():
+        sys.exit(f"error: no timings at {path}")
+    rows = list(csv.DictReader(open(path)))
     clients = [c for c in CLIENTS if any(r["client"] == c for r in rows)]
+    if not clients:
+        sys.exit(f"error: {path} holds no rows of a known client "
+                 f"({', '.join(CLIENTS)}); nothing to report")
     queries = sorted({r["query"] for r in rows})
     med = medians(rows, clients, queries)
     base = "A" if "A" in clients else clients[0]
@@ -826,6 +1075,26 @@ def cmd_report(args):
 
 # --------------------------------------------------------------------------- verify
 
+#: The engines the oracle is computed on, and they must agree.
+#:
+#: Issue #507 item 2. `cmd_verify` ran the oracle on `binary("A")` alone, so
+#: client A was graded against its OWN engine (and, through the parquet, the
+#: nearest thing to its own version of DuckDB) while B, Bscan and C were graded
+#: against a different one. Any wrong answer shared by DuckDB 1.5.6 and mssql
+#: 0.2.5 was invisible by construction -- which is exactly the configuration
+#: whose #405 CHAR-padding wrong answers RESULTS-local.md had to find and
+#: footnote by hand instead of reading off `verify`. In the other direction, a
+#: 1.5.6-versus-2.0 aggregation or typing difference surfaced as a diff for B
+#: and Bscan only, and read like an extension bug: q01's
+#: `sum(l_extendedprice*(1-l_discount))`, q17's `0.2*avg(...)`.
+#:
+#: Both engines now compute it over the same parquet and must produce the same
+#: answer; where they do not, the query is NOT graded and the disagreement is
+#: reported as itself. That is the one verdict neither client can be blamed
+#: for, and it belongs to the engines, not to the extension.
+ORACLES = ("A", "B")
+
+
 def clear_outputs(out, clients, queries):
     """Remove this run's CSVs before anything writes them.
 
@@ -835,27 +1104,68 @@ def clear_outputs(out, clients, queries):
     mssql_scan bind calls sp_describe_first_result_set.
     """
     for q in queries:
-        (out / f"oracle-{q}.csv").unlink(missing_ok=True)
-        (out / f"types-{q}.csv").unlink(missing_ok=True)
+        for which in ORACLES:
+            (out / f"oracle-{which}-{q}.csv").unlink(missing_ok=True)
+            (out / f"types-{which}-{q}.csv").unlink(missing_ok=True)
         for client in clients:
             (out / f"{client}-{q}.csv").unlink(missing_ok=True)
 
 
-def write_oracle(cfg, args, data, out, queries):
-    """DuckDB 1.5.6 over the same parquet the server was loaded from."""
-    s = [f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{data / (t + '.parquet')}');" for t in TABLES]
+def write_oracle(cfg, args, data, out, queries, which):
+    """One engine, over the same parquet the server was loaded from.
+
+    `which` is an entry of ORACLES, not a client: the oracle reads parquet, so
+    the extension is out of its path either way and only the ENGINE differs.
+    The paths go through esc() (issue #507 item 6): a --data-dir or --out
+    holding a quote was a parse error.
+    """
+    s = [f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{esc(str(data / (t + '.parquet')))}');"
+         for t in TABLES]
     for q in queries:
         sql = read_query("duckdb", q, args.sf)
-        s.append(f"COPY ({sql}) TO '{out / ('oracle-' + q + '.csv')}' (HEADER false);")
+        s.append(f"COPY ({sql}) TO '{esc(str(out / ('oracle-' + which + '-' + q + '.csv')))}' (HEADER false);")
         # The column TYPES, in order, beside the answers. This is what makes
         # the comparison type-driven instead of guessing from how a value
         # happens to print: `DESCRIBE` works as a subquery source, so one extra
         # statement per query gets them with no second session.
         s.append(f"COPY (SELECT column_type FROM (DESCRIBE {sql})) "
-                 f"TO '{out / ('types-' + q + '.csv')}' (HEADER false);")
-    rc, text = run_cli(binary("A"), "\n".join(s) + "\n", cfg)
+                 f"TO '{esc(str(out / ('types-' + which + '-' + q + '.csv')))}' (HEADER false);")
+    rc, text = run_cli(binary(which), "\n".join(s) + "\n", cfg)
     if rc != 0:
-        sys.exit(text)
+        sys.exit(f"oracle {which}: {text}")
+
+
+def oracle_agreement(out, queries):
+    """What the oracle engines say, per query.
+
+    -> ({query: (the answer both produced, its column types)},
+        {query: why they disagree})
+
+    The types are compared first and as strictly as the values: two engines
+    that call a column DOUBLE and DECIMAL(38,6) do not agree about it, and the
+    type is what decides how every client's value is then judged.
+    """
+    agreed, disputed = {}, {}
+    for q in queries:
+        answers = [(w, out / f"oracle-{w}-{q}.csv", read_types(out / f"types-{w}-{q}.csv"))
+                   for w in ORACLES]
+        missing = [w for w, path, _ in answers if not path.exists()]
+        if missing:
+            disputed[q] = f"oracle {', '.join(missing)} produced no answer (see the oracle log)"
+            continue
+        first, first_path, first_types = answers[0]
+        for which, path, types in answers[1:]:
+            if types != first_types:
+                disputed[q] = (f"{first} says the columns are {first_types} "
+                               f"and {which} says {types}")
+                break
+            verdict = compare(first_path, path, first_types)
+            if not verdict.startswith("ok"):
+                disputed[q] = f"{first} and {which} do not agree: {verdict}"
+                break
+        else:
+            agreed[q] = (first_path, first_types)
+    return agreed, disputed
 
 
 def write_client(cfg, args, out, client, queries):
@@ -881,23 +1191,59 @@ def write_client(cfg, args, out, client, queries):
     return None
 
 
-def print_verdicts(out, clients, queries, sessions):
-    """-> how many queries did not compare equal."""
-    bad = 0
+#: Which oracle grades a client when the two engines disagree about a query.
+#:
+#: Review of #548's question. A disagreement is reported as itself and counted
+#: once, but leaving every client UNGRADED on that query means a permanent
+#: 1.5.6-vs-2.0 difference -- the type of q17's `0.2*avg(...)`, say -- takes
+#: that query out of the comparison for good, for every client, and a real
+#: wrong answer inside it would never be seen again.
+#:
+#: So each client is still graded, against the oracle of the engine IT runs on,
+#: and the verdict says `split oracle` so the weaker guarantee is visible in
+#: the line itself: client A's answers are then checked against 1.5.6 (its own
+#: engine, which is what #507 item 2 is about) and B / Bscan / C against 2.0.
+#: The disagreement above it is the thing to fix; until it is, this is coverage
+#: with its own name on it rather than a silent hole.
+SPLIT_ORACLE = {"A": "A", "B": "B", "Bscan": "B", "C": "B"}
+
+
+def print_verdicts(out, clients, queries, sessions, agreed, disputed):
+    """-> how many verdicts were not an `ok`.
+
+    A query the oracle engines disagree about is counted ONCE, as its own
+    failure, so a disagreement cannot be mistaken for a clean run (issue #507
+    item 2). Each client is still graded on it, against its own engine's
+    oracle and labelled `split oracle` (see SPLIT_ORACLE).
+    """
+    bad = len(disputed)
+    for q in queries:
+        if q in disputed:
+            print(f"oracle {q} ORACLE DISAGREEMENT -- {disputed[q]}")
     for client in clients:
         if client in sessions:
             print(f"{client:6s} --- {sessions[client]}")
         for q in queries:
+            split = ""
+            if q in disputed:
+                which = SPLIT_ORACLE.get(client, ORACLES[0])
+                oracle_path = out / f"oracle-{which}-{q}.csv"
+                types = read_types(out / f"types-{which}-{q}.csv")
+                split = f" [split oracle: {which}]"
+                if not oracle_path.exists():
+                    print(f"{client:6s} {q} not graded (oracle {which} produced no answer)")
+                    continue
+            else:
+                oracle_path, types = agreed[q]
             # `verdict != "ok"` rejected compare()'s OWN accepting verdict for
             # a reordered result, so a tie emitted in the other order failed the
             # run while every per-query line still read `ok` -- teaching the
             # operator to disregard the exit code, which is the channel a real
             # wrong answer travels (issue #506 item 4).
-            verdict = compare(out / f"oracle-{q}.csv", out / f"{client}-{q}.csv",
-                              read_types(out / f"types-{q}.csv"))
+            verdict = compare(oracle_path, out / f"{client}-{q}.csv", types)
             if not verdict.startswith("ok"):
                 bad += 1
-            print(f"{client:6s} {q} {verdict}")
+            print(f"{client:6s} {q} {verdict}{split}")
     return bad
 
 
@@ -913,15 +1259,19 @@ def cmd_verify(args):
     out.mkdir(parents=True, exist_ok=True)
     clear_outputs(out, clients, queries)
 
-    write_oracle(cfg, args, data, out, queries)
+    for which in ORACLES:
+        write_oracle(cfg, args, data, out, queries, which)
+    agreed, disputed = oracle_agreement(out, queries)
     sessions = {}
     for client in clients:
         failure = write_client(cfg, args, out, client, queries)
         if failure:
             sessions[client] = failure
 
-    bad = print_verdicts(out, clients, queries, sessions)
-    print(f"{bad} mismatch(es)" + (f", {len(sessions)} failed session(s)" if sessions else ""))
+    bad = print_verdicts(out, clients, queries, sessions, agreed, disputed)
+    print(f"{bad} mismatch(es)"
+          + (f", {len(disputed)} of them a disagreement between the oracle engines" if disputed else "")
+          + (f", {len(sessions)} failed session(s)" if sessions else ""))
     sys.exit(1 if bad or sessions else 0)
 
 
@@ -1808,6 +2158,316 @@ def _check_dsn_keys():
     return failures
 
 
+#: (label, the schema flags, the database name they must derive)
+#
+# Issue #507 item 1. The last three lines are the decisive ones: before the
+# fix the UTF-8 CI and UTF-8 BIN2 schemas both derived
+# `tpch_sf10_columnstore_utf8`, so loading one DROPPED the other, and the
+# published BIN2 row can only have come from a hand-passed `--db` that no
+# documented command produces.
+NAME_DERIVATION_TESTS = [
+    ("the default", dict(sf=1, layout="columnstore", strings="spec", collation=None),
+     "tpch_sf1_columnstore"),
+    ("the rowstore layout", dict(sf=1, layout="rowstore", strings="spec", collation=None),
+     "tpch_sf1_rowstore"),
+    ("a fractional scale factor", dict(sf=0.1, layout="columnstore", strings="spec", collation=None),
+     "tpch_sf0_1_columnstore"),
+    ("the nvarchar schema", dict(sf=10, layout="columnstore", strings="nvarchar", collation=None),
+     "tpch_sf10_columnstore_nvarchar"),
+    ("utf8, whose collation is implied", dict(sf=10, layout="columnstore", strings="utf8", collation=None),
+     "tpch_sf10_columnstore_utf8"),
+    ("utf8 with that same collation spelled out",
+     dict(sf=10, layout="columnstore", strings="utf8", collation=UTF8_COLLATION),
+     "tpch_sf10_columnstore_utf8"),
+    ("utf8 BIN2 -- the published row",
+     dict(sf=10, layout="columnstore", strings="utf8", collation="Latin1_General_100_BIN2_UTF8"),
+     "tpch_sf10_columnstore_utf8_latin1general100bin2utf8"),
+    ("a collation on the spec schema",
+     dict(sf=1, layout="columnstore", strings="spec", collation="Latin1_General_100_BIN2_UTF8"),
+     "tpch_sf1_columnstore_latin1general100bin2utf8"),
+]
+
+
+def _check_names():
+    print("\nthe database name carries every schema choice (#507.1):")
+    failures, names = 0, []
+    for label, flags, want in NAME_DERIVATION_TESTS:
+        args = argparse.Namespace(db=None, **flags)
+        resolve_schema(args)
+        failures += _check(label, args.db == want, args.db, width=72)
+        names.append(args.db)
+
+    # The collision itself, as such: two schemas that differ only in their
+    # collation must not share a database.
+    ci = resolve_schema(argparse.Namespace(db=None, sf=10, layout="columnstore", strings="utf8",
+                                           collation=None))
+    bin2 = resolve_schema(argparse.Namespace(db=None, sf=10, layout="columnstore", strings="utf8",
+                                             collation="Latin1_General_100_BIN2_UTF8"))
+    failures += _check("the two UTF-8 schemas of RESULTS-local.md get two databases",
+                       ci.db != bin2.db, f"{ci.db} / {bin2.db}", width=72)
+    failures += _check("an explicit --db is still taken as given",
+                       resolve_schema(argparse.Namespace(db="mine", sf=1, layout="columnstore",
+                                                         strings="utf8", collation=None)).db == "mine",
+                       "mine", width=72)
+    failures += _check("every derived name is a bare name the server accepts",
+                       all(SAFE_NAME.fullmatch(n) for n in names), f"{len(names)} names", width=72)
+    return failures
+
+
+def _check_schema_sql():
+    """The statements the server is sent: items 3 and 5, and two of item 6."""
+    print("\nthe statements the server is sent (#507.3, #507.5, #507.6):")
+    failures = 0
+    cs = argparse.Namespace(sf=1, layout="columnstore", strings="spec", collation=None,
+                            db="tpch_sf1_columnstore", encrypt=True)
+    rs = argparse.Namespace(sf=1, layout="rowstore", strings="spec", collation=None,
+                            db="tpch_sf1_rowstore", encrypt=True)
+
+    create_cs = " ".join(create_table_statements(cs))
+    keys = primary_key_statements(cs)
+    failures += _check("a columnstore table is created without its key",
+                       "PRIMARY KEY" not in create_cs, "no PRIMARY KEY in the CREATE")
+    failures += _check("every columnstore table gets TPC-H's key after the load",
+                       len(keys) == len(TABLES)
+                       and all(f"ALTER TABLE dbo.{tb} " in keys[i] for i, tb in enumerate(TABLES))
+                       and all(f"({PRIMARY_KEYS[tb]})" in keys[i] for i, tb in enumerate(TABLES)),
+                       f"{len(keys)} ALTER TABLE statement(s)")
+    failures += _check("and it is NONCLUSTERED, beside the columnstore index",
+                       all("PRIMARY KEY NONCLUSTERED" in s for s in keys), "NONCLUSTERED")
+    create_rs = " ".join(create_table_statements(rs))
+    failures += _check("a rowstore table keeps its clustered key in the CREATE",
+                       create_rs.count("PRIMARY KEY CLUSTERED") == len(TABLES), "8 clustered keys")
+    failures += _check("and takes no second key after the load", primary_key_statements(rs) == [], "none")
+
+    cfg = {"host": "h", "port": "1433", "user": "sa", "password": "p"}
+    recreate = " ".join(recreate_database_statements(cfg, cs))
+    recreate_batch = recreate
+    failures += _check("the DROP sits in a TRY whose CATCH restores MULTI_USER",
+                       "BEGIN TRY" in recreate and "SET MULTI_USER" in recreate
+                       and recreate.index("DROP DATABASE") < recreate.index("SET MULTI_USER"),
+                       "TRY / CATCH")
+    failures += _check("and re-raises, so a failed DROP is not swallowed",
+                       "THROW" in recreate, "THROW")
+    failures += _check("the name travels through QUOTENAME, never bracketed by hand",
+                       "QUOTENAME(@n)" in recreate and "[tpch" not in recreate, "QUOTENAME(@n)")
+    batch = drop_batch("SELECT name FROM sys.databases WHERE name LIKE N'tpch[_]sf%'")
+    failures += _check("drop puts each database back and goes on to the next",
+                       "BEGIN CATCH" in batch and "SET MULTI_USER" in batch
+                       and batch.index("SET MULTI_USER") < batch.rindex("FETCH NEXT"),
+                       "the loop continues")
+    failures += _check("and counts what it could not drop", "@failed" in batch, "@failed")
+
+    # Review of #548 items 1 and 2, in both batches that drop a database.
+    for what, batch in (("recreate", recreate_batch), ("drop", drop_batch(
+            "SELECT name FROM sys.databases WHERE name LIKE N'tpch[_]sf%'"))):
+        failures += _check(f"{what}: the reason is THROWN, since a PRINT never reaches the CLI",
+                           "THROW 50000" in batch and "PRINT" not in batch,
+                           "THROW 50000")
+        failures += _check(f"{what}: the restore has a TRY of its own, so a 5064 cannot escape",
+                           batch.count("BEGIN TRY") == 2 and batch.count("BEGIN CATCH") == 2,
+                           f"{batch.count('BEGIN TRY')} TRY / {batch.count('BEGIN CATCH')} CATCH")
+        failures += _check(f"{what}: a failed restore says so and names the way back",
+                           "LEFT IN SINGLE_USER" in batch and "SET MULTI_USER'" in batch,
+                           "run: ALTER DATABASE ... SET MULTI_USER")
+    failures += _check("drop reports every failure, not only the last",
+                       "@msgs = LEFT(@msgs" in drop_batch("SELECT name FROM sys.databases"),
+                       "collected into @msgs")
+    failures += _check("and it still drops the databases after the one that failed",
+                       drop_batch("x").index("END CATCH") < drop_batch("x").rindex("FETCH NEXT"),
+                       "the loop continues")
+
+    counts = row_count_statement()
+    failures += _check("the eight row counts are one statement the server answers",
+                       counts.count("COUNT_BIG") == len(TABLES)
+                       and counts.startswith("SELECT * FROM mssql_scan"), "one mssql_scan")
+    quoted = " ".join(load_statements(pathlib.Path("/Volumes/Team's data/sf1")))
+    failures += _check("a data path holding a quote is escaped, not a parse error",
+                       "Team''s data" in quoted, "Team''s data")
+    return failures
+
+
+def _write_rows(path, rows):
+    with open(path, "w", newline="") as fh:
+        csv.writer(fh).writerows(rows)
+
+
+def _check_oracle(tmp):
+    """Item 2: the oracle is two engines that must agree, not one client's engine."""
+    print("\nthe oracle belongs to no client (#507.2):")
+    out = tmp / "verify-oracle"
+    out.mkdir(parents=True, exist_ok=True)
+    failures = _check("it is computed on more than one engine", len(set(ORACLES)) > 1,
+                      " and ".join(ORACLES))
+    failures += _check("so client A is not graded by its own engine alone",
+                       set(ORACLES) != {"A"}, ", ".join(ORACLES))
+
+    def put(which, q, rows, types):
+        _write_rows(out / f"oracle-{which}-{q}.csv", rows)
+        _write_rows(out / f"types-{which}-{q}.csv", [[name] for name in types])
+
+    # q01 the engines agree on. q02 they are a cent apart in a DECIMAL column,
+    # which in that column is a wrong answer -- so neither client may be
+    # graded on it. q03 they disagree about the TYPE, which is what decides
+    # how every client's value is judged. q04 one engine answered not at all.
+    put("A", "q01", [["a", "1.00"]], ["VARCHAR", "DECIMAL(38,2)"])
+    put("B", "q01", [["a", "1.00"]], ["VARCHAR", "DECIMAL(38,2)"])
+    put("A", "q02", [["566012345678.34"]], ["DECIMAL(38,2)"])
+    put("B", "q02", [["566012345678.35"]], ["DECIMAL(38,2)"])
+    put("A", "q03", [["1.00"]], ["DECIMAL(38,2)"])
+    put("B", "q03", [["1.00"]], ["DOUBLE"])
+    put("A", "q04", [["1.00"]], ["DECIMAL(38,2)"])
+
+    queries = ["q01", "q02", "q03", "q04"]
+    agreed, disputed = oracle_agreement(out, queries)
+    failures += _check("a query both engines answer alike is the one that is graded",
+                       list(agreed) == ["q01"], "agreed on " + (", ".join(agreed) or "nothing"))
+    failures += _check("a cent between the engines is a disagreement, not a client's fault",
+                       "q02" in disputed, disputed.get("q02", "ACCEPTED")[:44])
+    failures += _check("so is disagreeing about the column type",
+                       "q03" in disputed, disputed.get("q03", "ACCEPTED")[:44])
+    failures += _check("so is an engine that produced no answer",
+                       "q04" in disputed, disputed.get("q04", "ACCEPTED")[:44])
+
+    # And the verdicts. A disagreement is counted ONCE, however many clients
+    # read that query; each client is still graded, against the oracle of the
+    # engine it runs on, and the line says so (review of #548's question).
+    # Here the two clients answer q02 differently and BOTH are right: A agrees
+    # with 1.5.6, B with 2.0, which is what the disagreement means.
+    _write_rows(out / "A-q01.csv", [["a", "1.00"]])
+    _write_rows(out / "B-q01.csv", [["a", "1.00"]])
+    _write_rows(out / "A-q02.csv", [["566012345678.34"]])
+    _write_rows(out / "B-q02.csv", [["566012345678.35"]])
+    _write_rows(out / "A-q03.csv", [["1.00"]])
+    _write_rows(out / "B-q03.csv", [["1.00"]])
+    _write_rows(out / "A-q04.csv", [["1.00"]])
+    _write_rows(out / "B-q04.csv", [["1.00"]])
+    text = io.StringIO()
+    with contextlib.redirect_stdout(text):
+        bad = print_verdicts(out, ["A", "B"], queries, {}, agreed, disputed)
+    lines = text.getvalue().splitlines()
+    failures += _check("each disagreement is counted once, not once per client",
+                       bad == len(disputed), f"{bad} bad for {len(disputed)} disagreement(s)")
+    # A is graded on all three disputed queries (its own engine answered every
+    # one); B on the two its engine answered, q04 being the one it did not.
+    failures += _check("every client is still graded against its own engine's oracle",
+                       sum(1 for l in lines if "[split oracle: A]" in l) == 3
+                       and sum(1 for l in lines if "[split oracle: B]" in l) == 2,
+                       "A on q02-q04, B on q02-q03")
+    failures += _check("and both answers to the disputed query pass, each against its own",
+                       all(" ok [split oracle" in l for l in lines if "q02" in l and "oracle" not in l[:7]),
+                       "A ok, B ok")
+    failures += _check("a client whose own engine answered nothing is not graded",
+                       sum(1 for l in lines if "not graded (oracle B produced no answer)" in l) == 1,
+                       "B q04 not graded")
+    failures += _check("the query both engines agreed on carries no label",
+                       any(l.startswith("B") and "q01" in l and l.endswith("ok") for l in lines),
+                       "B q01 ok")
+    # A wrong answer on a disputed query is still a mismatch: the split oracle
+    # is coverage, not an exemption.
+    _write_rows(out / "B-q02.csv", [["999.99"]])
+    with contextlib.redirect_stdout(io.StringIO()):
+        worse = print_verdicts(out, ["A", "B"], queries, {}, agreed, disputed)
+    failures += _check("a wrong answer under a split oracle still counts",
+                       worse == bad + 1, f"{worse} vs {bad}")
+    return failures
+
+
+def _check_run_files(tmp):
+    """Item 4: re-running one client must not destroy the other clients' rows."""
+    print("\nre-running one client keeps the others' rows (#507.4):")
+    path = tmp / "timings-item4.csv"
+    rows = [{"run": "sf10", "db": "d", "client": c, "rep": 1, "query": q, "seconds": "1.0", "error": ""}
+            for c in ("A", "B", "Bscan", "C") for q in ("q01", "q06")]
+    with open(path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    kept = preserved_rows(path, ["B"], "d")
+    held = sorted({r["client"] for r in kept})
+    failures = _check("the clients this run does not measure keep their rows",
+                      held == ["A", "Bscan", "C"], f"{len(kept)} row(s) of {', '.join(held)}")
+    failures += _check("Bscan is not mistaken for B",
+                       sum(1 for r in kept if r["client"] == "Bscan") == 2, "2 Bscan rows")
+    failures += _check("the re-measured client's rows are replaced, not doubled",
+                       all(r["client"] != "B" for r in kept), "no B rows kept")
+    failures += _check("a four-client re-run keeps nothing, having measured it all",
+                       preserved_rows(path, ["A", "B", "Bscan", "C"], "d") == [], "[]")
+    failures += _check("and a first run starts from nothing",
+                       preserved_rows(tmp / "absent.csv", ["B"], "d") == [], "[]")
+
+    # Review of #548 item 3: the kept rows must be of the SAME database, or
+    # `report` compares medians across two schemas with nothing saying so.
+    try:
+        preserved_rows(path, ["B"], "tpch_sf10_columnstore_utf8")
+        why = "ACCEPTED"
+    except SystemExit as exc:
+        why = str(exc)
+    failures += _check("a kept row of another database refuses the run, naming both",
+                       "d" in why and "tpch_sf10_columnstore_utf8" in why, why[:52])
+    failures += _check("and it refuses rather than dropping the rows",
+                       "--run-id" in why and path.exists(), "the file is untouched")
+    return failures
+
+
+def _check_flags(tmp):
+    """Item 6: the flags that used to fail with a bare traceback."""
+    print("\nevery flag answers at the flag (#507.6):")
+    failures = 0
+
+    def sel(clients, queries):
+        try:
+            return selected(argparse.Namespace(clients=clients, queries=queries))
+        except SystemExit as exc:
+            return exc
+
+    got = sel("A,B", None)
+    failures += _check("no --queries means all 22",
+                       isinstance(got, tuple) and got[1] == list(QUERIES), f"{len(QUERIES)} queries")
+    got = sel("A,B", "q01,")
+    failures += _check("a trailing comma in --queries is not an empty query name",
+                       isinstance(got, tuple) and got[1] == ["q01"], str(got if isinstance(got, SystemExit) else got[1]))
+    failures += _check("--queries q01,qZZ names the one that does not exist",
+                       isinstance(sel("A", "q01,qZZ"), SystemExit), "refused")
+    failures += _check("--clients , is refused rather than dividing by zero",
+                       isinstance(sel(",", None), SystemExit), "refused")
+    failures += _check("--clients A,Z names the one that does not exist",
+                       isinstance(sel("A,Z", None), SystemExit), "refused")
+
+    try:
+        timings_path(argparse.Namespace(timings=None, run_id=None, out=str(tmp)))
+        why = "ACCEPTED"
+    except SystemExit as exc:
+        why = str(exc)
+    except Exception as exc:
+        # A bare `TypeError: argument should be a str...` from inside the
+        # command WAS the defect, so it must read as a failure here rather
+        # than take the whole self-test down with it.
+        why = f"{type(exc).__name__}: {exc}"
+    failures += _check("report without --timings says which flag it needs",
+                       "--timings" in why, why[:44])
+    failures += _check("report finds the run's own file from --run-id",
+                       timings_path(argparse.Namespace(timings=None, run_id="sf10", out=str(tmp)))
+                       == tmp / "sf10" / "timings.csv", "out/<run-id>/timings.csv")
+
+    args = argparse.Namespace(sf=1, db="d", encrypt=True, warmup=2, timeout=10)
+    script = timed_script("B", {"host": "h", "port": "1433", "user": "sa", "password": "p"},
+                          args, ["q01", "q02"])
+    markers = [f"{tag} {q}" for line in script for tag, q in MARKER.findall(line)]
+    failures += _check("each query is warmed immediately before it is timed",
+                       markers == ["W q01", "W q01", "T q01", "W q02", "W q02", "T q02", "END end"],
+                       ", ".join(markers))
+    failures += _check("the renderer is pinned, since it runs inside the timer",
+                       ".mode csv" in script, ".mode csv")
+
+    failures += _check("one client's plans cannot overwrite another's",
+                       explain_path(tmp, "B", "tpch_sf10_columnstore")
+                       != explain_path(tmp, "Bscan", "tpch_sf10_columnstore"), "one file per client")
+    failures += _check("and one schema's cannot overwrite another's",
+                       explain_path(tmp, "B", "tpch_sf10_columnstore")
+                       != explain_path(tmp, "B", "tpch_sf10_columnstore_utf8"), "one file per database")
+    return failures
+
+
 def cmd_selftest(args):
     failures = _check_same()
     failures += _check_types()
@@ -1819,8 +2479,13 @@ def cmd_selftest(args):
         failures += _check_timeout_path()
         failures += _check_preamble()
         failures += _check_report(tmp)
+        failures += _check_oracle(tmp)
+        failures += _check_run_files(tmp)
+        failures += _check_flags(tmp)
     failures += _check_extracted()
     failures += _check_credentials()
+    failures += _check_names()
+    failures += _check_schema_sql()
     print(f"\n{'FAIL' if failures else 'PASS'}: self-test, {failures} failure(s)")
     return 1 if failures else 0
 
@@ -1828,18 +2493,27 @@ def cmd_selftest(args):
 
 # --------------------------------------------------------------------------- explain
 
-def cmd_explain(args):
-    cfg = server()
-    _, queries = selected(args)
-    s = session_head("B", cfg, args) + ["PRAGMA explain_output = 'physical_only';"]
+def explain_path(out, client, db):
+    """Where one client's plans are kept.
+
+    Issue #507 item 6: the file was `explain-B.txt`, with no scale-factor,
+    layout or string-schema component -- so every sweep overwrote the last, and
+    `measured/.../sf10-utf8-bin2/explain-B.txt` is only distinguishable because
+    someone filed it by hand. `--db` names all four choices since item 1.
+    """
+    return out / f"explain-{client}-{db}.txt"
+
+
+def explain_client(cfg, args, out, client, queries):
+    """One client's plans: the file, and the per-query verdict on stdout."""
+    s = session_head(client, cfg, args) + ["PRAGMA explain_output = 'physical_only';"]
     for q in queries:
-        s += [f".print @@X {q}@@", "EXPLAIN " + query_text("B", q, args.sf)]
-    rc, text = run_cli(binary("B"), "\n".join(s) + "\n", cfg)
-    out = pathlib.Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "explain-B.txt").write_text(text)
+        s += [f".print @@X {q}@@", "EXPLAIN " + query_text(client, q, args.sf)]
+    rc, text = run_cli(binary(CLIENTS[client]["bin"]), "\n".join(s) + "\n", cfg)
+    explain_path(out, client, args.db).write_text(text)
     parts = re.split(r"@@X (q\d\d)@@", text)
     plans = dict(zip(parts[1::2], parts[2::2]))
+    print(f"\n{client} ({CLIENTS[client]['label']}) -- {explain_path(out, client, args.db)}")
     print("query  pushed  (vehicles / catalog scans)  DuckDB operators left above them")
     for q in queries:
         p = plans.get(q, "")
@@ -1857,6 +2531,24 @@ def cmd_explain(args):
         else:
             verdict = "no"
         print(f"{q}    {verdict:6s}  ({vehicles} / {scans})  {', '.join(work)}")
+    return rc
+
+
+def cmd_explain(args):
+    """Which queries each client sends to the server, from its own plan.
+
+    Issue #507 item 6: `--clients` was parsed and discarded here, and the
+    command always explained B. A client whose plans nobody can see is a client
+    whose pushdown nobody can check -- Bscan's `remote_pushdown false` is an
+    ATTACH option, and whether it holds is exactly the kind of thing this
+    command answers.
+    """
+    cfg = server()
+    clients, queries = selected(args)
+    out = pathlib.Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    for client in clients:
+        explain_client(cfg, args, out, client, queries)
 
 
 # --------------------------------------------------------------------------- trace
@@ -1956,6 +2648,59 @@ def cmd_trace(args):
 
 # --------------------------------------------------------------------------- drop
 
+#: `drop` reads the leftover count out of its own output: the CLI does not
+#: bail on error for piped stdin, so a rendered cell is the only channel, and
+#: a marker survives whatever the renderer does to the box around it.
+LEFT_MARKER = re.compile(r"@@LEFT (\d+)@@")
+
+
+def drop_batch(target):
+    """Drop every database `target` names, each in its own TRY/CATCH.
+
+    Issue #507 item 5. The ALTER ... SINGLE_USER and the DROP were one string
+    in one EXEC in a cursor loop, so a DROP that failed -- 5030 / 3702, any
+    session connecting in the window -- aborted the whole batch: that database
+    was left in SINGLE_USER with no connection holding it (unusable until
+    someone issued SET MULTI_USER by hand), AND every remaining tpch_sf*
+    database was abandoned. Now a failure puts its own database back, says
+    why, and the loop goes on to the next.
+    """
+    # Each failure is COLLECTED and the batch ends by throwing them (review of
+    # #548 item 1). They used to go to `PRINT`, and `mssql_exec` does not hand
+    # a server's PRINT / RAISERROR <= 10 to the CLI at all -- it logs them into
+    # `duckdb_logs` at INFO (`src/mssql_functions.cpp`, `LogTdsInfo`), and this
+    # session enables no logging. So the operator was told `FAIL: 1
+    # database(s) not dropped` and never which one or why. An ERROR does reach
+    # the CLI: `mssql_exec` throws on it, and the `@@LEFT` query after this one
+    # still runs, because the CLI does not bail on error for piped stdin.
+    #
+    # The restore has a TRY of its own, as in `recreate_database_statements`
+    # and for the same reason (item 2): a 5064 raised inside the CATCH used to
+    # escape it and abort the cursor loop -- abandoning every later database,
+    # which is the second half of what issue #507 item 5 fixes.
+    return ("DECLARE @n sysname, @sql nvarchar(max), @failed int = 0, @msgs nvarchar(2048) = N''; "
+            f"DECLARE c CURSOR LOCAL FAST_FORWARD FOR {target}; OPEN c; FETCH NEXT FROM c INTO @n; "
+            "WHILE @@FETCH_STATUS = 0 BEGIN "
+            "BEGIN TRY "
+            "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET SINGLE_USER WITH ROLLBACK IMMEDIATE; "
+            "DROP DATABASE ' + QUOTENAME(@n); EXEC (@sql); "
+            "END TRY BEGIN CATCH "
+            "SET @failed = @failed + 1; "
+            "SET @msgs = LEFT(@msgs + N'could not drop ' + QUOTENAME(@n) + N': ' + ERROR_MESSAGE(), 2048); "
+            "BEGIN TRY "
+            "IF DB_ID(@n) IS NOT NULL BEGIN "
+            "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) "
+            "+ N' SET MULTI_USER WITH ROLLBACK IMMEDIATE'; EXEC (@sql); END; "
+            "END TRY BEGIN CATCH "
+            "SET @msgs = LEFT(@msgs + N' -- and it is LEFT IN SINGLE_USER (' + ERROR_MESSAGE() "
+            "+ N') -- run: ALTER DATABASE ' + QUOTENAME(@n) + N' SET MULTI_USER', 2048); "
+            "END CATCH; "
+            "SET @msgs = LEFT(@msgs + N'; ', 2048); "
+            "END CATCH; "
+            "FETCH NEXT FROM c INTO @n; END; CLOSE c; DEALLOCATE c; "
+            "IF @failed > 0 THROW 50000, @msgs, 1;")
+
+
 def cmd_drop(args):
     """Drop the benchmark database: --db, or with --all every tpch_sf* database on the server."""
     cfg = server()
@@ -1963,20 +2708,32 @@ def cmd_drop(args):
          f"ATTACH '{esc(dsn(cfg, 'master', args.encrypt))}' AS m (TYPE mssql);"]
     if args.all:
         target = "SELECT name FROM sys.databases WHERE name LIKE N'tpch[_]sf%'"
+        left = "SELECT count(*) AS n FROM sys.databases WHERE name LIKE N'tpch[_]sf%'"
+        what = "every tpch_sf* database"
     else:
         db = safe_name(args.db, "--db")
         target = f"SELECT N'{db}' AS name WHERE DB_ID(N'{db}') IS NOT NULL"
-    batch = ("DECLARE @n sysname, @sql nvarchar(max); "
-             f"DECLARE c CURSOR LOCAL FAST_FORWARD FOR {target}; OPEN c; FETCH NEXT FROM c INTO @n; "
-             "WHILE @@FETCH_STATUS = 0 BEGIN "
-             "SET @sql = N'ALTER DATABASE ' + QUOTENAME(@n) + N' SET SINGLE_USER WITH ROLLBACK IMMEDIATE; "
-             "DROP DATABASE ' + QUOTENAME(@n); EXEC (@sql); FETCH NEXT FROM c INTO @n; END; CLOSE c; DEALLOCATE c;")
-    left = "SELECT name FROM sys.databases WHERE name LIKE N'tpch[_]sf%'"
-    s.append(f"SELECT mssql_exec('m', '{esc(batch)}');")
-    s.append(f"SELECT count(*) AS tpch_databases_left FROM mssql_scan('m', '{esc(left)}');")
+        left = f"SELECT count(*) AS n FROM sys.databases WHERE name = N'{db}'"
+        what = db
+    s.append(f"SELECT mssql_exec('m', '{esc(drop_batch(target))}');")
+    # What is left of the TARGET, in a marker. It used to be `count(*)` over
+    # every tpch_sf* database whatever --db said, printed and never read, so
+    # `drop` exited 0 with the database still there (issue #507 item 5).
+    s.append("SELECT '@@LEFT ' || CAST(n AS VARCHAR) || '@@' AS still_there "
+             f"FROM mssql_scan('m', '{esc(left)}');")
     rc, text = run_cli(binary("B"), "\n".join(s) + "\n", cfg)
     print(text)
-    sys.exit(rc)
+    if rc != 0:
+        sys.exit(rc)
+    found = LEFT_MARKER.search(text)
+    if found is None:
+        sys.exit("error: could not read how many databases are left (see the output above)")
+    if int(found.group(1)):
+        # The reasons are in the output above as an ERROR, thrown by the batch:
+        # `mssql_exec` logs a PRINT and prints nothing (review of #548 item 1).
+        sys.exit(f"FAIL: {found.group(1)} database(s) not dropped; the error above says why")
+    print(f"dropped: {what}")
+    sys.exit(0)
 
 
 # --------------------------------------------------------------------------- main
@@ -1989,7 +2746,13 @@ def main():
     ap.add_argument("--layout", choices=["columnstore", "rowstore"], default="columnstore")
     ap.add_argument("--strings", choices=["spec", "nvarchar", "utf8"], default="spec",
                     help="string column types: TPC-H's CHAR/VARCHAR, NVARCHAR(n), or VARCHAR(n) in a UTF-8 collation")
-    ap.add_argument("--encrypt", action=argparse.BooleanOptionalAction, default=True)
+    # Two flags rather than argparse.BooleanOptionalAction, which is Python
+    # 3.9 and killed `--help` itself on a 3.8 host (issue #507 item 6). The
+    # command-line surface is the same: --encrypt / --no-encrypt.
+    ap.add_argument("--encrypt", dest="encrypt", action="store_true", default=True,
+                    help="TLS on the connection (the default)")
+    ap.add_argument("--no-encrypt", dest="encrypt", action="store_false",
+                    help="turn TLS off")
     ap.add_argument("--collation", default=None, help="CREATE DATABASE ... COLLATE (default: the server's)")
     ap.add_argument("--clients", default="A,B,Bscan,C")
     ap.add_argument("--queries", default=None, help="comma list, e.g. q01,q06 (default: all 22)")
@@ -2004,8 +2767,9 @@ def main():
     ap.add_argument("command", choices=["gen", "load", "verify", "explain", "trace", "run", "report",
                                        "drop", "selftest"])
     args = ap.parse_args()
-    if args.db is None:
-        args.db = (f"tpch_sf{args.sf:g}_{args.layout}" + ("" if args.strings == "spec" else f"_{args.strings}")).replace(".", "_")
+    # The collation first, then the name derived from it (#507 item 1), then
+    # the gate every command goes through (review of #546 item 3).
+    resolve_schema(args)
     check_names(args)
     # `or 0`: only run and verify have a status to report, and verify exits on
     # its own. Every other command returns None, which is success.
