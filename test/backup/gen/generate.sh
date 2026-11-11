@@ -47,12 +47,24 @@ trap cleanup EXIT
 docker start "${id}" >/dev/null
 
 # The 2017 image ships the old tools (no -C: they do not check the certificate); later ones
-# mssql-tools18, which do unless told -C (the container's certificate is self-signed).
-if docker exec "${CONTAINER}" test -x /opt/mssql-tools18/bin/sqlcmd; then
-	SQLCMD=(/opt/mssql-tools18/bin/sqlcmd -C)
-else
-	SQLCMD=(/opt/mssql-tools/bin/sqlcmd)
-fi
+# mssql-tools18, which do unless told -C (the container's certificate is self-signed). Which one the
+# image has is asked inside the readiness loop, until one answers, as detect_sqlcmd in
+# test/compat/mssql_version_matrix.sh does: `docker start` returns before `docker exec` necessarily
+# sees the container's files, and a probe asked once, too early, finds neither and picks a path the
+# image does not have -- every later call then fails and the wait below reads as a server that never
+# started.
+SQLCMD=()
+find_sqlcmd() {
+	local p
+	for p in /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd; do
+		if docker exec "${CONTAINER}" test -x "${p}" 2>/dev/null; then
+			SQLCMD=("${p}")
+			if [[ "${p}" == *tools18* ]]; then SQLCMD+=(-C); fi
+			return 0
+		fi
+	done
+	return 1
+}
 sql() {	# $@ = sqlcmd arguments
 	docker exec -e SQLCMDPASSWORD "${CONTAINER}" "${SQLCMD[@]}" -S localhost -U sa -b "$@"
 }
@@ -60,23 +72,41 @@ sql() {	# $@ = sqlcmd arguments
 echo ">> waiting for the server"
 ready=0
 for _ in $(seq 1 90); do
-	if sql -Q "SELECT 1" >/dev/null 2>&1; then
-		ready=1
-		break
+	if [ "${#SQLCMD[@]}" -gt 0 ] || find_sqlcmd; then
+		if sql -Q "SELECT 1" >/dev/null 2>&1; then
+			ready=1
+			break
+		fi
 	fi
 	if [ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}")" != true ]; then
 		break
 	fi
 	sleep 2
 done
-if [ "${ready}" != 1 ]; then
-	echo "ERROR: the server in ${IMAGE} did not start; its log:" >&2
+if [ "${#SQLCMD[@]}" -eq 0 ]; then
+	echo "ERROR: no sqlcmd in ${IMAGE}: neither /opt/mssql-tools18/bin/sqlcmd nor /opt/mssql-tools/bin/sqlcmd (or the container stopped first); its log:" >&2
 	docker logs "${CONTAINER}" 2>&1 | tail -20 >&2
 	exit 1
 fi
-sql -h -1 -W -Q "SET NOCOUNT ON; SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar(32))" | head -1 >"${OUT}/server.txt"
-major="$(cut -d. -f1 "${OUT}/server.txt")"
-echo ">> server $(cat "${OUT}/server.txt")"
+if [ "${ready}" != 1 ]; then
+	echo "ERROR: the server in ${IMAGE} did not start (asked through ${SQLCMD[0]}); its log:" >&2
+	docker logs "${CONTAINER}" 2>&1 | tail -20 >&2
+	exit 1
+fi
+# A plain redirect, its first line read afterwards: `| head -1` under pipefail can kill sqlcmd with
+# SIGPIPE, and an empty or odd version would make the `-ge 17` tests below silently false (a failed
+# test inside an `if` does not trip set -e), dropping the ZSTD sets with nothing said.
+sql -h -1 -W -Q "SET NOCOUNT ON; SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar(32))" >"${OUT}/server.txt"
+version=""
+IFS= read -r version <"${OUT}/server.txt" || true
+version="${version//[[:space:]]/}"
+major="${version%%.*}"
+if ! [[ ${major} =~ ^[0-9]+$ ]]; then
+	echo "ERROR: the server's ProductVersion reads '${version}', not <major>.<minor>.<build>: no major version to choose the sets by" >&2
+	exit 1
+fi
+echo "${version}" >"${OUT}/server.txt"
+echo ">> server ${version}"
 
 docker exec -u 0 "${CONTAINER}" mkdir -p "${DIR}"
 # The server runs as mssql from the 2019 image on; the 2017 image runs it as root and has no such
@@ -86,7 +116,8 @@ docker cp "${HERE}/samples.sql" "${CONTAINER}:/tmp/samples.sql"
 echo ">> running samples.sql"
 sql -v DIR="${DIR}" -i /tmp/samples.sql
 
-# The sets samples.sql made on this version, in its order.
+# The sets samples.sql made on this version, in its order. test/backup/compare_info.py's
+# samples_sets() states the same list as what to expect of a version (--expect-major): change both.
 sets=("full|full.bak" "full_xpress|full_xpress.bak")
 if [ "${major}" -ge 17 ]; then sets+=("full_zstd|full_zstd.bak"); fi
 sets+=("stripe|stripe_1.bak,stripe_2.bak")

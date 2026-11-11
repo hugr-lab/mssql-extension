@@ -125,7 +125,18 @@ TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn login_respon
 # TARGETS_EXTRA adds harnesses beside TARGETS without restating it: the weekly ClusterFuzzLite run
 # (cflite-pr.yml's ubsan-weekly, through .clusterfuzzlite/extra_targets) adds the backup reader's,
 # which the per-PR budget leaves out.
-TARGETS="${TARGETS} ${TARGETS_EXTRA:-}"
+# Newlines, tabs and commas separate names as spaces do (a file of one name per line, a list
+# written with commas), and a name no harness answers to fails the build by name: want() matches
+# whole space-separated words, so a stray separator or a typo would otherwise build fewer harnesses
+# than asked, green.
+TARGETS="$(printf '%s %s' "${TARGETS}" "${TARGETS_EXTRA:-}" | tr ',\n\r\t' '    ')"
+KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page "
+for t in ${TARGETS}; do
+	if [[ "${KNOWN_TARGETS}" != *" ${t} "* ]]; then
+		echo "ERROR: unknown fuzz target '${t}' in TARGETS / TARGETS_EXTRA (known:${KNOWN_TARGETS})" >&2
+		exit 1
+	fi
+done
 want() { [[ " ${TARGETS} " == *" $1 "* ]]; }
 
 # 1. SQL Browser response parser — standalone: no simdutf, no TDS sources, no

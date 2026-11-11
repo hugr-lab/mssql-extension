@@ -44,8 +44,12 @@ SELECT f.logical_name, f.type, f.filegroup_name, f.size_bytes
 FROM (SELECT unnest(files) AS f FROM mssql_backup_info('/backups/sales_full.bak'));
 ```
 
-The reader is checked against backups made by SQL Server 2017, 2019, 2022 and 2025, against what
-`RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` print for them, field by field.
+The reader is compared, field by field, with what `RESTORE HEADERONLY` / `LABELONLY` /
+`FILELISTONLY` print: on synthetic backups made by SQL Server 2025, on every change, and, when the
+project's oracle lane runs (it needs the repository's storage credentials, so not for a pull request
+from a fork), on each version's backups made by SQL Server 2017, 2019, 2022 and 2025. Each version
+makes what it can: ZSTD compression on 2025 only, `MS_XPRESS` named from 2022 and plain
+`WITH COMPRESSION` (the same algorithm) before.
 
 ## What is refused
 

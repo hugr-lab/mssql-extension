@@ -7,14 +7,20 @@
 # The backups are made only when what makes them changes: they are stored under
 # oracle/<key>/<version>/<run>/, where <key> hashes test/backup/gen/ (the generator, samples.sql and
 # images.txt, which pins each image by digest), and <version>/DONE, written last, names the <run>
-# whose upload is complete: a version with a DONE is not generated again, and two runs generating
-# one version never mix their files (each uploads under its own <run>; the last DONE wins whole).
-# A PR that changes the generator generates its own, before its test reads them.
+# whose upload is complete: a version with a DONE naming a stored run (its sets.txt there) is not
+# generated again, and two runs generating one version never mix their files (each uploads under
+# its own <run>; the last DONE wins whole). A DONE whose run is gone is generated again. A PR that
+# changes the generator generates its own, before its test reads them; only main writes a DONE in
+# main's key, so a PR that left the generator alone and finds a version missing fails, naming it.
 #
 # Old sets are removed by the cleanup job, on a push to main whose comparisons all passed, and
-# never one a run may still read: in main's key, the runs no DONE names once that DONE is a day
-# old; any other key (main's before the generator changed, a PR's that changed it) once none of its
-# DONEs has moved for a week -- an open PR's next run then generates its own again.
+# never one a run may still read or is still writing: in main's key, a run DONE does not name
+# (an orphan of a cancelled upload included) once DONE has named another for a day and the run's
+# own newest file is a day old; any other key (main's before the generator changed, a PR's that
+# changed it) once nothing under it has been written for a week -- an open PR's next run then
+# generates its own again. DONE is read again right before each delete, a whole key or version
+# loses its DONEs before its files, and main's runs are never cancelled, so a delete cut short
+# leaves files no DONE names rather than a DONE whose files are gone.
 #
 # Uploads use the aws CLI; every read is DuckDB's. The R2 credentials are repository secrets, which
 # a pull request from a fork does not get: there the lane says so and runs nothing (and the
@@ -65,14 +71,17 @@ on:
 
 concurrency:
   group: backup-oracle-${{ inputs.pr || github.ref }}
-  cancel-in-progress: true
+  # A pull request's newer run replaces its older one. Main's runs queue instead: a cancelled run
+  # can stop a generate leg between its upload and its DONE, or the cleanup job mid-delete.
+  cancel-in-progress: ${{ inputs.pr != '' || github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
 
 env:
   VERSIONS: '2017 2019 2022 2025'
-  # cleanup: a run no DONE names goes a day after the switch; another key a week after its last DONE.
+  # cleanup: a run no DONE names goes a day after the switch and its own last write; another key a
+  # week after anything under it was last written.
   KEEP_SWITCHED_HOURS: '24'
   KEEP_KEY_DAYS: '7'
 
@@ -98,7 +107,8 @@ jobs:
           MSSQL_R2_BUCKET_NAME: ${{ vars.MSSQL_R2_BUCKET_NAME || secrets.MSSQL_R2_BUCKET_NAME }}
           PR_INPUT: ${{ inputs.pr }}
         run: |
-          versions=$(printf '%s\n' $VERSIONS | jq -R . | jq -cs .)
+          set -euo pipefail
+          versions=$(printf '%s\n' $VERSIONS | jq -R . | jq -cs 'map(select(. != ""))')
           echo "versions=${versions}" >> "$GITHUB_OUTPUT"
           if [ -n "${PR_INPUT}" ] && ! printf '%s' "${PR_INPUT}" | grep -qE '^[0-9]+$'; then
             echo "::error::pr must be a pull request number, got '${PR_INPUT}'"; exit 1
@@ -108,21 +118,65 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"; echo "missing=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # The other three name nothing here (the values are never printed): which one is unset.
+          for name in MSSQL_R2_ACCESS_SECRET_KEY MSSQL_R2_URL MSSQL_R2_BUCKET_NAME; do
+            if [ -z "${!name}" ]; then echo "::error::${name} is empty: the lane cannot reach R2"; exit 1; fi
+          done
           # Every file of the generator, by path and content, in a stable order.
           key=$(cd test/backup/gen && find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-16)
           echo "key=${key}" >> "$GITHUB_OUTPUT"
           export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
                  AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
+          # 0 when the object exists, 1 when it does not (404); any other failure -- a refused or
+          # expired token, a bucket the token cannot read, the endpoint unreachable -- fails the job
+          # with the CLI's reason (it names the operation and the error code, not the credentials),
+          # rather than reading as "not stored" and regenerating every version.
+          exists() {  # $1 = object key
+            local err
+            if err=$(aws s3api head-object --bucket "${MSSQL_R2_BUCKET_NAME}" --key "$1" 2>&1 >/dev/null); then
+              return 0
+            fi
+            case "${err}" in
+              *"(404)"*|*NoSuchKey*|*"Not Found"*) return 1 ;;
+            esac
+            echo "::error::looking up oracle object $1 failed: ${err}"
+            exit 1
+          }
           missing=()
           for v in $VERSIONS; do
-            if aws s3 ls "s3://${MSSQL_R2_BUCKET_NAME}/oracle/${key}/${v}/DONE" >/dev/null 2>&1; then
-              echo "${v}: stored under oracle/${key}/${v}/"
-            else
-              echo "${v}: to generate"; missing+=("${v}")
+            prefix="oracle/${key}/${v}"
+            if ! exists "${prefix}/DONE"; then
+              echo "${v}: to generate (no DONE)"; missing+=("${v}"); continue
             fi
+            run=$(aws s3 cp --only-show-errors "s3://${MSSQL_R2_BUCKET_NAME}/${prefix}/DONE" - | tr -d '[:space:]')
+            # A DONE whose run is gone (removed by hand, or a delete cut short) would otherwise name
+            # files no comparison finds, for good: the version is generated again, and the new DONE
+            # replaces it.
+            if [ -z "${run}" ] || [[ "${run}" == */* ]] || [[ "${run}" == .* ]] || ! exists "${prefix}/${run}/sets.txt"; then
+              echo "${v}: to generate (DONE names '${run}', whose sets.txt is not stored)"; missing+=("${v}"); continue
+            fi
+            echo "${v}: stored under ${prefix}/${run}/"
           done
+          # Only main writes a DONE in main's key (the key main's own generator hashes to): a pull
+          # request that left the generator as it is reads main's sets and generates none -- a version
+          # missing there is main's to make again (a push to main, or a dispatch on main). One that
+          # changed the generator has a key of its own and generates into it.
+          if [ "${GITHUB_EVENT_NAME}" != push ] && { [ -n "${PR_INPUT}" ] || [ "${GITHUB_REF}" != refs/heads/main ]; } \
+             && [ "${#missing[@]}" -gt 0 ]; then
+            git fetch --no-tags --depth=1 origin main
+            main_gen="$(mktemp -d)"
+            git archive FETCH_HEAD test/backup/gen | tar -x -C "${main_gen}" 2>/dev/null || true
+            main_key=""
+            if [ -d "${main_gen}/test/backup/gen" ]; then
+              main_key=$(cd "${main_gen}/test/backup/gen" && find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-16)
+            fi
+            if [ "${key}" = "${main_key}" ]; then
+              echo "::error::main's backups for ${missing[*]} are not stored under oracle/${key}/, and a pull request does not write main's key: run the lane on main (Actions -> Backup oracle -> Run workflow, branch main), then re-run this one"
+              exit 1
+            fi
+          fi
           echo "enabled=true" >> "$GITHUB_OUTPUT"
-          echo "missing=$(printf '%s\n' "${missing[@]}" | jq -R . | jq -cs 'map(select(. != ""))')" >> "$GITHUB_OUTPUT"
+          echo "missing=$(printf '%s\n' "${missing[@]+"${missing[@]}"}" | jq -R . | jq -cs 'map(select(. != ""))')" >> "$GITHUB_OUTPUT"
 
   generate:
     name: Generate (SQL Server ${{ matrix.version }})
@@ -147,6 +201,7 @@ jobs:
           MSSQL_R2_URL: ${{ secrets.MSSQL_R2_URL }}
           MSSQL_R2_BUCKET_NAME: ${{ vars.MSSQL_R2_BUCKET_NAME || secrets.MSSQL_R2_BUCKET_NAME }}
         run: |
+          set -euo pipefail
           export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
                  AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
           prefix="s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}"
@@ -237,8 +292,8 @@ jobs:
           [ -d vcpkg_bincache ] || exit 0
           find vcpkg_bincache -type f -mtime +14 -delete
           find vcpkg_bincache -mindepth 1 -type d -empty -delete
-      - name: The committed samples against their golden files
-        run: python3 -I test/backup/compare_info.py --duckdb build/release/duckdb test/data/backup
+      # The committed samples (test/data/backup) are compared in ci.yml's build job, on every pull
+      # request, a fork's included: they need no credentials, which this lane's jobs all hold.
       - uses: actions/upload-artifact@v7
         with:
           name: backup-oracle-duckdb
@@ -271,10 +326,18 @@ jobs:
           MSSQL_R2_ACCESS_SECRET_KEY: ${{ secrets.MSSQL_R2_ACCESS_SECRET_KEY }}
           MSSQL_R2_URL: ${{ secrets.MSSQL_R2_URL }}
           MSSQL_R2_BUCKET_NAME: ${{ vars.MSSQL_R2_BUCKET_NAME || secrets.MSSQL_R2_BUCKET_NAME }}
+          VERSION: ${{ matrix.version }}
         run: |
+          set -euo pipefail
+          # The major version each release reports (SERVERPROPERTY('ProductVersion')): the backups,
+          # server.txt and the sample sets must be that server's, not whatever images.txt started.
+          case "${VERSION}" in
+            2017) major=14 ;; 2019) major=15 ;; 2022) major=16 ;; 2025) major=17 ;;
+            *) echo "::error::no major version known for SQL Server ${VERSION}: add it here"; exit 1 ;;
+          esac
           chmod +x cli/duckdb
-          python3 -I test/backup/compare_info.py --duckdb cli/duckdb --require-done \
-            "s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}"
+          python3 -I test/backup/compare_info.py --duckdb cli/duckdb --require-done --expect-major "${major}" \
+            "s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${VERSION}"
 
   cleanup:
     name: Remove sets no run reads
@@ -282,6 +345,11 @@ jobs:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.test.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # One cleanup at a time, never cancelled by a newer one (the workflow's own group does not
+    # cancel on main either): a delete cut short is what the order below is for, not a routine.
+    concurrency:
+      group: backup-oracle-cleanup
+      cancel-in-progress: false
     steps:
       - env:
           MSSQL_R2_ACCESS_KEY: ${{ secrets.MSSQL_R2_ACCESS_KEY }}
@@ -291,45 +359,130 @@ jobs:
           KEY: ${{ needs.key.outputs.key }}
           ROOT: oracle
         run: |
+          set -euo pipefail
+          if [ -z "${MSSQL_R2_BUCKET_NAME}" ] || [ -z "${KEY}" ]; then
+            echo "::error::the bucket name or main's key is empty: nothing to clean up against"; exit 1
+          fi
           export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
                  AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
-          bucket="s3://${MSSQL_R2_BUCKET_NAME}"
+          B="${MSSQL_R2_BUCKET_NAME}"
           now=$(date -u +%s)
-          # The time an object was written, in seconds; empty when there is none.
-          written() {
-            local t
-            t=$(aws s3api head-object --bucket "${MSSQL_R2_BUCKET_NAME}" --key "$1" --query LastModified --output text 2>/dev/null || true)
-            if [ -n "${t}" ] && [ "${t}" != None ]; then date -u -d "${t}" +%s; fi
-          }
-          # Prefixes directly under $1 (a key ending in /), without the trailing slash.
-          children() { aws s3 ls "${bucket}/$1" | awk '$1 == "PRE" { sub("/$", "", $2); print $2 }'; }
+          run_grace=$(( KEEP_SWITCHED_HOURS * 3600 ))
+          key_grace=$(( KEEP_KEY_DAYS * 86400 ))
+          errf=$(mktemp)
+          # Every listing's or lookup's failure fails the job: an error must never read as "nothing
+          # there" (which deletes) or "nothing to do" (which hides it). Lists are captured into a
+          # variable before a loop walks them, so a failed listing stops the job under set -e.
 
-          # main's key: the runs DONE no longer names, a day after it switched.
-          for v in $(children "${ROOT}/${KEY}/"); do
-            current=$(aws s3 cp "${bucket}/${ROOT}/${KEY}/${v}/DONE" - 2>/dev/null | tr -d '[:space:]' || true)
-            switched=$(written "${ROOT}/${KEY}/${v}/DONE")
-            [ -n "${current}" ] && [ -n "${switched}" ] || continue
-            [ $(( now - switched )) -ge $(( KEEP_SWITCHED_HOURS * 3600 )) ] || continue
-            for run in $(children "${ROOT}/${KEY}/${v}/"); do
-              if [ "${run}" != "${current}" ]; then
-                echo "remove ${ROOT}/${KEY}/${v}/${run}/ (DONE names ${current})"
-                aws s3 rm --recursive --only-show-errors "${bucket}/${ROOT}/${KEY}/${v}/${run}/"
+          # Prefixes directly under $1 (ending in /), as names without the slash.
+          children() {
+            aws s3api list-objects-v2 --bucket "${B}" --prefix "$1" --delimiter / \
+                --query 'CommonPrefixes[].Prefix' --output text \
+              | tr '\t' '\n' \
+              | awk -v p="$1" 'index($0, p) == 1 { s = substr($0, length(p) + 1); sub("/$", "", s); if (s != "") print s }'
+          }
+          # Seconds since the epoch of the newest object under $1 (its uploads' last write); empty
+          # when there is none. An upload in progress is fresh by this measure, whatever DONE says.
+          # (Each step inside a function says `|| return 1`: set -e does not reach into the
+          # $(...) the callers read these through.)
+          newest() {
+            local t
+            t=$(aws s3api list-objects-v2 --bucket "${B}" --prefix "$1" --query 'Contents[].LastModified' --output text \
+              | tr '\t' '\n' | { grep -v -e '^None$' -e '^$' || true; } | LC_ALL=C sort | tail -n 1) || return 1
+            if [ -n "${t}" ]; then date -u -d "${t}" +%s || return 1; fi
+          }
+          # The DONE of version prefix $1 (ending in /) as "<etag>|<written>|<run>", empty when there
+          # is none: compared whole before each delete, so a DONE rewritten meanwhile stops it.
+          done_state() {
+            local meta run
+            if ! meta=$(aws s3api head-object --bucket "${B}" --key "${1}DONE" \
+                          --query '[ETag,LastModified]' --output text 2>"${errf}"); then
+              if grep -qE '\(404\)|NoSuchKey|Not Found' "${errf}"; then return 0; fi
+              echo "ERROR: looking up ${1}DONE failed: $(cat "${errf}")" >&2
+              return 1
+            fi
+            run=$(aws s3 cp --only-show-errors "s3://${B}/${1}DONE" - | tr -d '[:space:]') || return 1
+            printf '%s|%s\n' "$(printf '%s' "${meta}" | tr '\t' '|')" "${run}"
+          }
+          age() { echo $(( now - $1 )); }
+          # Removes a whole prefix: its DONEs first, so a delete cut short leaves files no DONE names
+          # (reaped by a later run, regenerated by the next run that needs them), never a DONE whose
+          # run is gone.
+          remove_all() {  # $1 = a key's or a version's prefix (ending in /); $2.. = its versions' prefixes
+            local target="$1" p
+            shift
+            for p in "$@"; do
+              aws s3 rm --only-show-errors "s3://${B}/${p}DONE" || return 1
+            done
+            aws s3 rm --recursive --only-show-errors "s3://${B}/${target}" || return 1
+          }
+
+          # main's key, version by version: a run DONE does not name goes once DONE has named
+          # another for run_grace (a run that read the old DONE may still be reading its files) and
+          # its own newest file is run_grace old (an upload in progress, or one whose DONE is about
+          # to be written, is fresh) -- the orphans of a cancelled or failed upload included, with
+          # no DONE at all. A version no longer in VERSIONS goes whole, key_grace after its last
+          # write.
+          versions=$(children "${ROOT}/${KEY}/")
+          for v in ${versions}; do
+            vp="${ROOT}/${KEY}/${v}/"
+            if [[ " ${VERSIONS} " != *" ${v} "* ]]; then
+              t=$(newest "${vp}")
+              if [ -n "${t}" ] && [ "$(age "${t}")" -ge "${key_grace}" ] && [ "$(newest "${vp}")" = "${t}" ]; then
+                echo "remove ${vp} (not in VERSIONS, nothing written for ${KEEP_KEY_DAYS} days)"
+                remove_all "${vp}" "${vp}"
               fi
+              continue
+            fi
+            state=$(done_state "${vp}")
+            current="" switched=""
+            if [ -n "${state}" ]; then
+              current="${state##*|}"
+              if [ -z "${current}" ]; then
+                echo "keep ${vp} whole (its DONE names no run: the next run generates the version again)"; continue
+              fi
+              switched=$(date -u -d "$(printf '%s' "${state}" | cut -d'|' -f2)" +%s)
+            fi
+            runs=$(children "${vp}")
+            for run in ${runs}; do
+              [ "${run}" != "${current}" ] || continue
+              if [ -n "${switched}" ] && [ "$(age "${switched}")" -lt "${run_grace}" ]; then
+                echo "keep ${vp}${run}/ (DONE moved to ${current} under ${KEEP_SWITCHED_HOURS} h ago)"; continue
+              fi
+              t=$(newest "${vp}${run}/")
+              if [ -z "${t}" ] || [ "$(age "${t}")" -lt "${run_grace}" ]; then
+                echo "keep ${vp}${run}/ (written under ${KEEP_SWITCHED_HOURS} h ago: an upload in progress?)"; continue
+              fi
+              # DONE again, right before the delete: a run that has just been named is left alone
+              # (read into a variable: a failed lookup stops the job rather than compare as "none").
+              again=$(done_state "${vp}")
+              if [ "${again}" != "${state}" ]; then
+                echo "keep ${vp}${run}/ (DONE changed while this ran)"; continue
+              fi
+              echo "remove ${vp}${run}/ (${current:+DONE names ${current}}${current:-no DONE})"
+              aws s3 rm --recursive --only-show-errors "s3://${B}/${vp}${run}/"
             done
           done
 
-          # Other keys: once none of their DONEs has moved for KEEP_KEY_DAYS.
-          for k in $(children "${ROOT}/"); do
+          # Other keys (main's before the generator changed, a PR's that changed it): whole, once
+          # nothing under them -- DONE or run file -- has been written for key_grace. A key whose
+          # upload is in progress has fresh files and stays, DONE or not.
+          keys=$(children "${ROOT}/")
+          for k in ${keys}; do
             [ "${k}" != "${KEY}" ] || continue
-            newest=0
-            for v in $(children "${ROOT}/${k}/"); do
-              t=$(written "${ROOT}/${k}/${v}/DONE")
-              if [ -n "${t}" ] && [ "${t}" -gt "${newest}" ]; then newest=${t}; fi
-            done
-            if [ $(( now - newest )) -ge $(( KEEP_KEY_DAYS * 86400 )) ]; then
-              echo "remove ${ROOT}/${k}/ (no DONE in ${KEEP_KEY_DAYS} days)"
-              aws s3 rm --recursive --only-show-errors "${bucket}/${ROOT}/${k}/"
-            else
-              echo "keep ${ROOT}/${k}/ (a DONE within ${KEEP_KEY_DAYS} days: a PR may be reading it)"
+            kp="${ROOT}/${k}/"
+            t=$(newest "${kp}")
+            if [ -z "${t}" ]; then continue; fi
+            if [ "$(age "${t}")" -lt "${key_grace}" ]; then
+              echo "keep ${kp} (written within ${KEEP_KEY_DAYS} days: a PR may be generating or reading it)"; continue
             fi
+            # Unchanged right before the delete: anything written since keeps the key.
+            if [ "$(newest "${kp}")" != "${t}" ]; then
+              echo "keep ${kp} (written to while this ran)"; continue
+            fi
+            kv=$(children "${kp}")
+            prefixes=()
+            for v in ${kv}; do prefixes+=("${kp}${v}/"); done
+            echo "remove ${kp} (nothing written for ${KEEP_KEY_DAYS} days)"
+            remove_all "${kp}" "${prefixes[@]+"${prefixes[@]}"}"
           done

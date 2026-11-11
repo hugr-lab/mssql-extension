@@ -73,7 +73,7 @@ architecture), [docs/](docs/) (internals), [docs/TESTING.md](docs/TESTING.md),
 - [Kerberos / Windows SSPI integrated authentication](Kerberos.md) — POSIX (`kinit` / keytab / raw credentials) and Windows (current logon session via `secur32.dll`)
 - Custom `Application Name` propagated to SQL Server `APP_NAME()` / `sys.dm_exec_sessions.program_name`
 - ATTACH-time credential validation (opt-out via `lazy_validation true`)
-- **SQL Server backup files without SQL Server**: `mssql_backup_info('/backups/db.bak')` reports what `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` do, read from the file alone through DuckDB's file system (local, `s3://`, `https://`) — full, differential and log backups, compressed (`MS_XPRESS`, `ZSTD`) and striped; checked on SQL Server 2017–2025 backups ([backup files](https://hugr-lab.github.io/mssql-extension/reading/backups/)). Reading the tables inside a backup comes in later releases
+- **SQL Server backup files without SQL Server**: `mssql_backup_info('/backups/db.bak')` reports what `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` do, read from the file alone through DuckDB's file system (local, `s3://`, `https://`) — full, differential and log backups, compressed (`MS_XPRESS`, `ZSTD`) and striped; compared with `RESTORE`'s own answers on SQL Server 2025 samples in CI, and on each version's backups from 2017 to 2025 when the oracle lane runs ([backup files](https://hugr-lab.github.io/mssql-extension/reading/backups/)). Reading the tables inside a backup comes in later releases
 - **Experimental**: ORDER BY pushdown to SQL Server (opt-in via `mssql_order_pushdown` setting)
 
 > **A note on string comparisons.** A pushed predicate is evaluated by SQL

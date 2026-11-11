@@ -1402,10 +1402,11 @@ fuzz-backup-replay:
 	done
 # Spec 085 acceptance 2 over the committed samples: mssql_backup_info against the golden RESTORE
 # HEADERONLY / LABELONLY / FILELISTONLY beside them, field by field (test/backup/compare_info.py).
-# Any release build; the oracle lane runs the same script over every version's backups in R2.
+# Any release build; ci.yml's build job runs it on every pull request, and the oracle lane runs the
+# same script over each version's backups in R2. The samples are SQL Server 2025's (major 17).
 test-backup-golden:
 	@if [ ! -x build/release/duckdb ]; then echo "test-backup-golden: run 'make' first." >&2; exit 1; fi
-	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb $(PROJ_DIR)test/data/backup
+	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --expect-major 17 $(PROJ_DIR)test/data/backup
 # Spec 085 PR 2a: the release build the backup oracle lane tests with -- httpfs linked in
 # statically (test/backup/httpfs_extension_config.cmake, at the duckdb pin's own httpfs commit), so
 # the lane reads its backups from R2 through s3://. Like bench-build, a later plain `make`

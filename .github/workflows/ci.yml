@@ -183,8 +183,9 @@ jobs:
       - name: TPC-H bench harness judges correctly
         run: python3 test/bench/tpch/tpch_bench.py selftest
 
-      # Seven shell scripts across three directories sit on the CI critical
-      # path, one of which does `rm -rf` against a path it derives. Their clean
+      # The shell scripts on the CI critical path -- scripts/ci/*.sh and the
+      # four named below, fourteen across five directories when this was last
+      # counted -- include one that does `rm -rf` against a path it derives. Their clean
       # state was established by hand once and nothing kept it that way -- an
       # unquoted expansion reintroduced later would be found by the next
       # incident, not by the PR. ~25 s in a 10-minute job.
@@ -833,6 +834,15 @@ jobs:
           # 'extension-ci-tools/makefiles/duckdb_extension.Makefile'".)
           git submodule update --init --depth 1 extension-ci-tools
           make test-cpp-run
+
+      # Spec 085 acceptance 2 over the COMMITTED samples (test/data/backup):
+      # mssql_backup_info against the server's golden RESTORE output, every
+      # column compared or listed with its reason, and the set list a 2025
+      # server makes. It needs no secret and no network, so it runs here, on
+      # every pull request -- a fork's included -- rather than in the backup
+      # oracle lane, whose jobs run only where the R2 credentials are.
+      - name: Backup reader against the committed samples' RESTORE output (make test-backup-golden)
+        run: make test-backup-golden
 
       - name: Upload Extension Artifact
         uses: actions/upload-artifact@v7

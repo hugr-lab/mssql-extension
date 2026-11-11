@@ -1459,16 +1459,23 @@ flowchart BT
 Samples: `test/data/backup/` (synthetic, made by `test/backup/gen/generate.sh` on a throwaway
 container, with the golden `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` beside each), checked by
 `test/sql/backup/mssql_backup_info.test` and, every field, by `make test-backup-golden`
-(`test/backup/compare_info.py`), with no SQL Server.
+(`test/backup/compare_info.py`, also in `ci.yml`'s build job on every pull request), with no SQL
+Server. Every column `mssql_backup_info` returns is compared or listed with its reason (`UNLOCATED`,
+`NOT_COMPARED`), and `--expect-major` asserts the version and the set list it makes.
 
-**The oracle lane** (`.github/workflows/backup-oracle.yml`, spec 085 PR 2a) makes the same backups on
-SQL Server 2017, 2019, 2022 and 2025 (each image pinned by digest in `test/backup/gen/images.txt`)
-and stores them in R2 under `oracle/<key>/<version>/<run>/`, `<key>` a hash of `test/backup/gen/`:
-they are made again only when the generator, the data or an image changes. `<version>/DONE`,
-written last, names the run whose upload is complete, so two runs generating one version never mix
-their files. A push to main whose comparisons all passed removes what no run reads any more: in
-main's key the runs no `DONE` names (a day after the switch), and any other key once none of its
-`DONE`s has moved for a week. The reader is compared with the server's answers reading them from R2 through `s3://`,
+**The oracle lane** (`.github/workflows/backup-oracle.yml`, spec 085 PR 2a), when it runs (it needs
+the repository's R2 credentials), makes each version's backups on SQL Server 2017, 2019, 2022 and
+2025 (each image pinned by digest in `test/backup/gen/images.txt`): what that version can make --
+ZSTD on 2025 only, `MS_XPRESS` named from 2022 and plain `WITH COMPRESSION` before -- and stores them in R2 under `oracle/<key>/<version>/<run>/`, `<key>` a hash of `test/backup/gen/`:
+they are made again only when the generator, the data or an image changes, or when a `DONE` names
+a run that is no longer stored. `<version>/DONE`, written last, names the run whose upload is
+complete, so two runs generating one version never mix their files. A push to main whose
+comparisons all passed removes what no run reads or writes any more: in main's key a run no `DONE`
+names once `DONE` has named another for a day and the run's own newest file is a day old (a
+cancelled upload's orphan included), and any other key once nothing under it has been written for
+a week. `DONE` is read again before each delete, a whole key loses its `DONE`s before its files,
+and main's runs are never cancelled, so a delete cut short cannot leave a `DONE` whose files are
+gone. The reader is compared with the server's answers reading them from R2 through `s3://`,
 in a build with httpfs linked in statically and curl from vcpkg (`make backup-oracle-build`,
 `test/backup/oracle_vcpkg_manifest.py`): the reader's own I/O path, not a copy.
 
