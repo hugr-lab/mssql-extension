@@ -36,7 +36,7 @@ tds::ColumnMetadata MetadataOf(const CatalogColumn &c) {
 	m.precision = c.precision;
 	m.scale = c.scale;
 	m.flags = tds::COL_FLAG_NULLABLE;
-	if (c.system_type_id == XTYPE_VARCHAR || c.system_type_id == XTYPE_CHAR) {
+	if (c.system_type_id == XTYPE_VARCHAR || c.system_type_id == XTYPE_CHAR || c.system_type_id == XTYPE_TEXT) {
 		// A UTF-8 collation's bytes are UTF-8 already (no table); every other page has one, double-byte
 		// ones included (spec 091), which the code-page kernel decodes on the client: a backup has no
 		// server to convert it, where the TDS path keeps the server's cast for them only for speed.
@@ -45,6 +45,17 @@ tds::ColumnMetadata MetadataOf(const CatalogColumn &c) {
 			m.code_page = codec::code_page::FindCodePage(static_cast<int32_t>(row->code_page));
 		}
 	}
+	return m;
+}
+
+// A column read as its stored bytes (ReadingOf's `raw`): a varbinary of its declared length, which the
+// binary kernel publishes as they are.
+tds::ColumnMetadata RawMetadataOf(const CatalogColumn &c) {
+	tds::ColumnMetadata m{};
+	m.name = c.name;
+	m.type_id = tds::TDS_TYPE_BIGVARBINARY;
+	m.max_length = c.max_length <= 0 ? 0xFFFF : static_cast<uint16_t>(c.max_length);
+	m.flags = tds::COL_FLAG_NULLABLE;
 	return m;
 }
 
@@ -122,12 +133,12 @@ RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t>
 		Column col;
 		col.column_id = id;
 		col.name = table_ + "." + c.name;
-		const std::string refusal = ColumnRefusal(c);
-		if (!refusal.empty()) {
-			throw InvalidInputException("backup: %s: %s", col.name, refusal);
+		const ColumnReading reading = ReadingOf(c);
+		if (!reading.readable) {
+			throw InvalidInputException("backup: %s: %s", col.name, reading.note);
 		}
-		const LogicalType type = ColumnDuckDBType(c);
-		col.meta = MetadataOf(c);
+		const LogicalType type = reading.type;
+		col.meta = reading.raw ? RawMetadataOf(c) : MetadataOf(c);
 		col.ops = codec::staging::ResolveColumnOps(col.meta, type);
 		if (col.ops.arm == AppendArm::Unsupported || col.ops.kernel == FinalizeKernel::Text) {
 			// The TDS map and D6's would disagree about the column (the text fallback), or the codec
@@ -149,7 +160,8 @@ RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t>
 				col.arm = StageArm::Direct;
 			} else if (col.ops.kind == StagingKind::Fixed) {
 				col.arm = StageArm::Fixed;
-			} else if (col.ops.arm == AppendArm::P2StageString || col.ops.arm == AppendArm::PlpStageString) {
+			} else if (col.ops.arm == AppendArm::P2StageString || col.ops.arm == AppendArm::PlpStageString ||
+					   col.ops.arm == AppendArm::LobStageString) {
 				col.arm = StageArm::Utf16;
 			} else {
 				col.arm = StageArm::Bytes;
@@ -166,6 +178,11 @@ RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t>
 			throw InvalidInputException("backup: %s (%s) is staged by the codec in a form this reader does not fill",
 										col.name, c.system_type_name);
 		}
+		// A text / ntext / image column holds a 16-byte text pointer in row, never its value (spec 085 §
+		// Rules, LOBs): a value is read through the pointer from PR 3 on, so until then a non-NULL one is
+		// the off-row error, whatever its complex bit says.
+		col.text_pointer =
+			c.system_type_id == XTYPE_TEXT || c.system_type_id == XTYPE_NTEXT || c.system_type_id == XTYPE_IMAGE;
 		// The live path's budget (RowStager::Configure): its MAX columns, a code-page one twice.
 		if (col.ops.arm >= AppendArm::PlpStageString && col.ops.arm <= AppendArm::LobStageBinary) {
 			col.budget_weight = col.ops.kernel == FinalizeKernel::CodePage ? 2 : 1;
@@ -295,11 +312,16 @@ void RecordStager::Append(const RecordView &record) {
 		case ValueState::Null:
 			st.AppendNull();
 			break;
+		case ValueState::Inline:
+			if (!c.text_pointer) {
+				AppendValue(c, st, v);
+				break;
+			}
+			DUCKDB_EXPLICIT_FALLTHROUGH;
 		case ValueState::OffRow:
 			throw FormatError("backup: " + c.name +
 							  " holds a value stored off row (row-overflow or a LOB), which the reader reads from spec "
 							  "085 PR 3; leave the column out of the projection to read the others");
-		case ValueState::Inline:
 		case ValueState::Default:
 			AppendValue(c, st, v);
 			break;

@@ -48,14 +48,23 @@ Value GuidValue(const std::string &bytes, const std::string &what);
 //! microsecond), a code page with no table or a base type this does not read.
 Value SqlVariantValue(const SqlVariant &variant, const std::string &what);
 
-//! Why the scan cannot read column `c` (spec 085 § Scope's refusals), or "". One predicate for
-//! mssql_backup_tables' `columns.reason` and the scan's refusal by name (D13).
-std::string ColumnRefusal(const CatalogColumn &c);
-
-//! The DuckDB type TYPE mssql reads `c` as with native types off (D6): MapSQLServerTypeToDuckDB on
-//! the system type underneath an alias. mssql_backup_tables' `columns.duckdb_type` and the scan's
-//! output type. Throws for a type with none.
-LogicalType ColumnDuckDBType(const CatalogColumn &c);
+//! How the scan reads column `c` (owner, 2026-11-11: no refusal by type). A type the reader converts
+//! takes the DuckDB type TYPE mssql reads it as with native types off (D6: MapSQLServerTypeToDuckDB on
+//! the system type underneath an alias); a type whose conversion is still to come -- sql_variant,
+//! xml, the CLR types (geometry, geography, hierarchyid, a user's), vector, json, a type the reader
+//! does not know, a text whose collation is newer than the code-page tables -- is its stored bytes as
+//! they are, a BLOB (`raw`), until its decoder (086, together with the TDS path's). What is not a
+//! type gap is not readable: a computed column that is not persisted (no stored value) and a sparse
+//! column (its value is in the row's sparse vector, a storage format: 086). One answer for
+//! mssql_backup_tables' `columns` and the scan (RecordStager).
+struct ColumnReading {
+	LogicalType type = LogicalType::BLOB;
+	bool readable = true;
+	bool raw = false;
+	//! Why the column is raw or not readable; empty for a converted one.
+	std::string note;
+};
+ColumnReading ReadingOf(const CatalogColumn &c);
 
 }  // namespace backup
 }  // namespace mssql

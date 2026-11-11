@@ -186,31 +186,7 @@ Value PointerValue(const PagePointer &p) {
 Value ColumnValue(const CatalogColumn &c) {
 	const CollationRow *collation = c.collation_id ? CollationById(static_cast<int32_t>(c.collation_id)) : nullptr;
 	const uint32_t code_page = collation ? collation->code_page : 0;
-	std::string reason = ColumnRefusal(c);
-	Value duckdb_type(LogicalType::VARCHAR);
-	// The precision and scale are the file's: LogicalType::DECIMAL asserts what they must be (an
-	// assertion, not an exception), so a declaration no server writes is named here instead. By the
-	// name too, which the type map dispatches on: the file's sysscalartypes names it, and a CLR column
-	// (xtype 240) takes its name from its user type.
-	std::string name = c.system_type_name;
-	std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
-	const bool decimal = c.system_type_id == 106 || c.system_type_id == 108 || name == "decimal" || name == "numeric";
-	const bool scaled = c.system_type_id == 41 || c.system_type_id == 42 || c.system_type_id == 43 || name == "time" ||
-						name == "datetime2" || name == "datetimeoffset";
-	if ((decimal && (c.precision < 1 || c.precision > 38 || c.scale > c.precision)) || (scaled && c.scale > 7)) {
-		if (reason.empty()) {
-			reason = c.system_type_name + " is declared with precision " + std::to_string(c.precision) + " and scale " +
-					 std::to_string(c.scale) + ", which no SQL Server type has";
-		}
-	} else if (!c.system_type_name.empty()) {
-		try {
-			duckdb_type = Value(ColumnDuckDBType(c).ToString());
-		} catch (std::exception &e) {
-			if (reason.empty()) {
-				reason = c.system_type_name + " has no DuckDB type: " + e.what();
-			}
-		}
-	}
+	const ColumnReading reading = ReadingOf(c);
 	child_list_t<Value> f;
 	f.emplace_back("column_id", Value::INTEGER(c.column_id));
 	f.emplace_back("name", Text(c.name));
@@ -227,9 +203,9 @@ Value ColumnValue(const CatalogColumn &c) {
 	f.emplace_back("is_identity", Value::BOOLEAN(c.is_identity));
 	f.emplace_back("is_computed", Value::BOOLEAN(c.is_computed));
 	f.emplace_back("is_sparse", Value::BOOLEAN(c.is_sparse));
-	f.emplace_back("duckdb_type", duckdb_type);
-	f.emplace_back("decodable", Value::BOOLEAN(reason.empty()));
-	f.emplace_back("reason", OptionalText(reason));
+	f.emplace_back("duckdb_type", Value(reading.type.ToString()));
+	f.emplace_back("decodable", Value::BOOLEAN(reading.readable));
+	f.emplace_back("reason", OptionalText(reading.note));
 	return Value::STRUCT(std::move(f));
 }
 

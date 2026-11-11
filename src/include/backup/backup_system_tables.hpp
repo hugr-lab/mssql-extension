@@ -107,9 +107,13 @@ struct PhysicalColumn {
 	bool HasDefaultStatus() const {
 		return (status & 0x200) != 0;
 	}
-	//! Bytes the column takes in the fixed part; a FormatError for a type this reader does not read.
+	//! Bytes the column takes in the fixed part: its type's width, or for a type the reader does not
+	//! know the length sysrscols gives it (read as its bytes); a FormatError when neither says.
 	uint16_t FixedLength(const std::string &table) const;
 };
+
+//! `xtype` is a fixed-width type the reader knows (FixedLength computes its width from the type).
+bool KnownFixedXtype(uint8_t xtype);
 
 //! The column's fields sysrscols.ti carries: the xtype in its low byte, then the length, or a decimal's
 //! precision and scale, or a time type's scale (E20: 0x0412 is decimal(18, 4), 0x07 datetime2(7)).

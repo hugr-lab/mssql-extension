@@ -43,8 +43,9 @@ enum class StageArm : uint8_t {
 
 class RecordStager {
 public:
-	//! The columns `column_ids` of `table`, in that order, typed by D6 (ColumnDuckDBType). A column the
-	//! scan does not read (ColumnRefusal), one not in the table, or one the codec would stage another
+	//! The columns `column_ids` of `table`, in that order, read as ReadingOf says: converted to D6's
+	//! type, or a type still to be converted as its stored bytes (BLOB). A column that is not readable
+	//! (no stored value, a sparse column), one not in the table, or one the codec would stage another
 	//! way than its type says is an InvalidInputException naming it.
 	RecordStager(const CatalogTable &table, const std::vector<int32_t> &column_ids);
 
@@ -86,6 +87,7 @@ private:
 		size_t layout_index = 0;  // in the current layout
 		uint8_t bit_position = 0;
 		uint8_t budget_weight = 0;	// how many times its staged bytes count toward Full(): 0, 1, 2
+		bool text_pointer = false;	// text / ntext / image: its in-row bytes are a pointer (PR 3)
 	};
 
 	void AppendValue(Column &c, codec::staging::ColumnStaging &st, const ValueRef &v);

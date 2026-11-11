@@ -39,12 +39,13 @@ per table. Making a busy full backup exact (redo and undo of its own log tail) i
 
 In: everything above.
 
-Out, each refused by name until its spec lands:
+Out, each refused by name until its spec lands -- storage formats, never a type (owner, 2026-11-11):
+a type whose conversion is still to come is read as its stored bytes (below).
 
 | feature | where | refusal scope |
 |---|---|---|
-| ROW / PAGE compressed rowsets, sparse columns | 086 | the table |
-| `sql_variant`, `xml`, `geometry`, `geography`, `hierarchyid`, other CLR types, `vector`, `json` (2025) | 086 | the column, when projected |
+| ROW / PAGE compressed rowsets | 086 | the table |
+| sparse columns (the sparse vector) and the column set | 086 | the column, when projected |
 | encrypted backups, TDE databases | 087 | the file |
 | clustered / nonclustered columnstore | 088 | the table (an NCCI is ignored: the scan reads the base rowset) |
 | `since_lsn`, changed / freed pages, the export, lake-mode state | 089 | — |
@@ -237,7 +238,8 @@ Out, each refused by name until its spec lands:
   backup then report the same types, which is what the oracle tests compare (§ Testing); DuckLake
   rejects alias and collated string types (A§1, `ducklake_types.cpp:158-163`). The reader needs a
   `system_type_id → name` table for it. The deliberate exceptions, where a backup can return what the
-  wire cannot, are spec 086's (`sql_variant` → `VARIANT`, `vector` → `FLOAT[n]`); 085 has none.
+  wire cannot, are spec 086's (`sql_variant` → `VARIANT`, `vector` → `FLOAT[n]`); 085 has none. A type
+  whose conversion is still to come is its stored bytes, a `BLOB`, until then (D13).
 
 - **D7 — values go through the codec layer's batch kernels.** The row engine copies each value's
   bytes into the codec's column-major staging (`codec/staging/column_staging.hpp`) and finalises one
@@ -329,9 +331,18 @@ Out, each refused by name until its spec lands:
   that did not change since its base (089 D5). Without spec 090 the overlay reflects the diff's
   `CheckpointLSN`; the fuzzy status is the diff's.
 
-- **D13 — refuse by name at the narrowest scope, never fill with NULL.** An undecodable column is
-  refused when projected (`SELECT` of the other columns works); an undecodable table when scanned; an
-  undecodable file at open. The message names the object, the feature and the SQL Server type.
+- **D13 — refuse by name at the narrowest scope, never fill with NULL; never refuse a type (owner,
+  2026-11-11).** A storage format the reader does not read yet is refused: a column when projected
+  (`SELECT` of the other columns works: a sparse column, a value stored off row until PR 3), a table
+  when scanned (ROW / PAGE compression, a clustered columnstore), a file at open; the message names
+  the object, the feature and the SQL Server type. A *type* is never refused: one the reader
+  converts takes D6's type, and one whose conversion is still to come -- `sql_variant`, `xml`, the
+  CLR types (`geometry`, `geography`, `hierarchyid`, a user's), `vector`, `json`, a type the reader
+  does not know, a text whose collation is newer than the code-page tables -- is its stored bytes as
+  they are, a `BLOB`, with `columns.reason` saying why (`ReadingOf`); the conversion is the reader's,
+  into DuckDB's types wherever one fits (owner, 2026-11-11: no flag for it). Their
+  conversions come with 086, together with the TDS path's (one decoder for both). A computed column
+  that is not persisted has no stored value: not readable, named.
 
 - **D14 — versions.** `dbi_version` 998 (2025) is verified. 869 / 904 / 957 (2017 / 2019 / 2022,
   expected values, unverified) are accepted once the CI version matrix passes on their images;
@@ -908,11 +919,10 @@ offsets above are in its fixed part.
     rowgroups and deleted rows in spec 088);
   - what one object's rows get wrong is named on that object (D13): a table the scan cannot read is
     listed with `decodable` false and its reason -- a clustered columnstore (088), ROW / PAGE compression
-    or sparse columns (086), more than one partition (PR 2c), its schema or a column's type not in the
-    catalog, a layout the reader cannot build, an added column's default missing, listed twice, malformed
-    or not of the column's type and size -- and a definition that cannot be read is Unreadable with its
-    reason. Coarser than D13 for now: a sparse column or an unusable default refuses the table, not the
-    column (column-level refusal is the scan's, PR 2d).
+    (086), its schema not in the catalog, a layout the reader cannot build, an added column's default
+    missing, listed twice, malformed or not of the column's type and size -- and a definition that cannot be read is Unreadable with its
+    reason. A sparse column is refused alone, when projected (PR 2d); an unusable default still refuses
+    the table.
 - **Partitioning** (E7§2, decoded generically and verified against the catalog views in 16 states,
   0 mismatches **(2025)**):
 
@@ -1320,6 +1330,11 @@ server prints it, every partition's filegroup, rows and compression), 1443 field
     mapper (D3a) rather than sequentially; `WalkChain` on a tail of an unknown layout reading block
     headers in windows, not one 28-byte read each; `LocateOnce`'s probe of the other families' pass
     only where a crafted file could carry an extent twice — 1.5 d
+16d. `mssql_backup_columns(path [, schema [, table]])`: one row per column -- schema, table, column
+    id, name, SQL type, DuckDB type, `state` (`converted`, `stored_bytes` for a type whose conversion is
+    still to come, `off_row_pending` until PR 3, `not_stored`, `storage_format`) and `reason` -- the
+    state of every column at a glance (owner, 2026-11-11: the next PR after 2d; no flag in
+    `mssql_backup_tables` instead) — 0.5 d
 
 **PR 3 — LOBs**
 

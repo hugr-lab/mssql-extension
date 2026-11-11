@@ -9,6 +9,8 @@
 #include "tds/encoding/datetime_encoding.hpp"
 #include "utf8proc_wrapper.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 
@@ -306,41 +308,76 @@ Value SqlVariantValue(const SqlVariant &v, const std::string &what) {
 	}
 }
 
-std::string ColumnRefusal(const CatalogColumn &c) {
+ColumnReading ReadingOf(const CatalogColumn &c) {
+	ColumnReading r;
+	const std::string type = c.system_type_name.empty()
+								 ? (c.type_name.empty() ? "type " + std::to_string(c.user_type_id) : c.type_name)
+								 : c.system_type_name;
+	// What is not readable still says the type it is declared as.
+	auto not_readable = [&](const std::string &why) {
+		// The type a readable column of its type would be read as (a raw one's BLOB included).
+		CatalogColumn readable_form = c;
+		readable_form.is_computed = readable_form.is_persisted = false;
+		readable_form.is_sparse = readable_form.is_column_set = false;
+		r.type = ReadingOf(readable_form).type;
+		r.readable = false;
+		r.note = why;
+		return r;
+	};
+	if (c.is_computed && !c.is_persisted) {
+		return not_readable("a computed column that is not persisted has no stored value");
+	}
+	if (c.is_sparse || c.is_column_set) {
+		return not_readable("a sparse column's value is in the row's sparse vector, read from spec 086");
+	}
+	auto raw = [&](const std::string &why) {
+		r.raw = true;
+		r.type = LogicalType::BLOB;
+		r.note = "its stored bytes, not converted: " + why;
+		return r;
+	};
 	switch (c.system_type_id) {
-	case 98:
-		return "sql_variant is not read (spec 086)";
-	case 241:
-		return "xml is not read (spec 086)";
-	case 240:
-		return (c.system_type_name.empty() ? "the CLR type " + c.type_name : c.system_type_name) +
-			   " is not read (spec 086)";
-	case 34:
-	case 35:
-	case 99:
-		return "text, ntext and image are not read yet";
+	case XTYPE_SQL_VARIANT:
+		return raw("sql_variant (its base type, properties and value) is converted later, with the TDS path's");
+	case XTYPE_XML:
+		return raw("xml (stored as binary XML) is converted to text later, with the TDS path's");
+	case XTYPE_CLR:
+		return raw(type + " (its CLR serialization) is converted later, with the TDS path's");
 	default:
 		break;
 	}
-	if (c.system_type_name.empty() || c.system_type_name == "json" || c.system_type_name == "vector") {
-		return (c.type_name.empty() ? "type " + std::to_string(c.user_type_id) : c.type_name) +
-			   " is not read (spec 086)";
+	if (c.system_type_name.empty()) {
+		return raw(type + " is a type the reader does not know");
 	}
-	const bool code_page_text = c.system_type_id == 167 || c.system_type_id == 175 || c.system_type_id == 35;
+	if (c.system_type_name == "json" || c.system_type_name == "vector") {
+		return raw(type + " is converted later, with the TDS path's");
+	}
+	const bool code_page_text =
+		c.system_type_id == XTYPE_VARCHAR || c.system_type_id == XTYPE_CHAR || c.system_type_id == XTYPE_TEXT;
 	if (code_page_text && c.collation_id != 0 && !CollationById(static_cast<int32_t>(c.collation_id))) {
-		return "its collation (CollationId " + std::to_string(c.collation_id) + ") is not one the reader knows";
+		return raw("its collation (CollationId " + std::to_string(c.collation_id) +
+				   ") is newer than the code-page tables");
 	}
-	if (c.is_computed && !c.is_persisted) {
-		return "a computed column that is not persisted is not stored";
+	// The precision and scale are the file's: LogicalType::DECIMAL asserts what they must be (an
+	// assertion, not an exception), so a declaration no server writes is caught here. By the name too,
+	// which the type map dispatches on and the file's own sysscalartypes supplies (review of #549).
+	std::string name = c.system_type_name;
+	std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
+	const bool decimal = c.system_type_id == XTYPE_DECIMAL || c.system_type_id == XTYPE_NUMERIC ||
+						 name == "decimal" || name == "numeric";
+	const bool scaled = c.system_type_id == XTYPE_TIME || c.system_type_id == XTYPE_DATETIME2 ||
+						c.system_type_id == XTYPE_DATETIMEOFFSET || name == "time" || name == "datetime2" ||
+						name == "datetimeoffset";
+	if ((decimal && (c.precision < 1 || c.precision > 38 || c.scale > c.precision)) || (scaled && c.scale > 7)) {
+		return raw(type + " is declared with precision " + std::to_string(c.precision) + " and scale " +
+				   std::to_string(c.scale) + ", which no SQL Server type has");
 	}
-	if (c.is_sparse || c.is_column_set) {
-		return "sparse columns are not read (spec 086)";
+	try {
+		r.type = MSSQLColumnInfo::MapSQLServerTypeToDuckDB(c.system_type_name, c.max_length, c.precision, c.scale);
+	} catch (std::exception &e) {
+		return raw(type + " has no DuckDB type here (" + std::string(e.what()) + ")");
 	}
-	return std::string();
-}
-
-LogicalType ColumnDuckDBType(const CatalogColumn &c) {
-	return MSSQLColumnInfo::MapSQLServerTypeToDuckDB(c.system_type_name, c.max_length, c.precision, c.scale);
+	return r;
 }
 
 }  // namespace backup

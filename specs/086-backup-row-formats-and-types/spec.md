@@ -92,8 +92,12 @@ and page-dictionary records (090's follow-up).
 - **D8 — `json` is a research task with a gate.** A spike (E9, below) decodes controlled values and
   compares them with `CAST(j AS nvarchar(max))`. The decoder ships only when every value of the
   corpus (every JSON type, nesting to the server's limit, Unicode, escapes, numbers at every edge,
-  large documents that go off-row) equals the server's text. Until then the column is refused by name.
-  No raw-bytes escape hatch: nobody downstream could read an undocumented binary.
+  large documents that go off-row) equals the server's text. Until then the column is its stored
+  bytes (085 D13, owner 2026-11-11: no refusal by type; the earlier "no raw-bytes escape hatch" is
+  overturned).
+- **D8a — one decoder for both paths (owner, 2026-11-11).** `sql_variant`, `vector`, `hierarchyid`,
+  `json`, `xml` and the spatial types are converted by codec kernels the TDS read path uses too, so
+  each lands for a backup and for TYPE mssql together; until then 085 returns their stored bytes.
 
 - **D9 — the double-byte code pages: moved to 085 PR 2d (owner, 2026-11-11).** A backup has no server
   to convert a varchar, so 085 decodes every page on the client; the TDS path keeps the server's cast

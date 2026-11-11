@@ -444,12 +444,52 @@ int main() {
 		narrow.FinalizeChunk(two);
 		Check(two.size() == 1 && two.GetValue(1, 0) == Value::UTINYINT(200), "a projection without it reads the row");
 
-		// Refusals at construction, by name.
+		// No refusal by type: a type still to be converted is its stored bytes; only what has no stored
+		// value (or keeps it in the sparse vector) is refused, by name.
 		CatalogTable refused = t;
-		refused.columns.push_back(Col(22, "v", 98, "sql_variant", 8016));
-		Check(ErrorOf([&]() { RecordStager(refused, {22}); }).find("dbo.synthetic.v: sql_variant is not read") !=
-				  std::string::npos,
-			  "a column ColumnRefusal names is refused by the stager too");
+		refused.columns.push_back(Col(22, "computed", XTYPE_INT, "int", 4));
+		refused.columns.back().is_computed = true;
+		refused.columns.push_back(Col(23, "sp", XTYPE_INT, "int", 4));
+		refused.columns.back().is_sparse = true;
+		Check(ErrorOf([&]() { RecordStager(refused, {22}); }).find("dbo.synthetic.computed: a computed column") !=
+					  std::string::npos &&
+				  ErrorOf([&]() { RecordStager(refused, {23}); }).find("sparse vector") != std::string::npos,
+			  "a computed column that is not persisted and a sparse column are not readable, by name");
+		const std::vector<std::pair<CatalogColumn, std::string>> raws = {
+			{Col(30, "variant", XTYPE_SQL_VARIANT, "sql_variant", 8016), "sql_variant"},
+			{Col(31, "doc", XTYPE_XML, "xml", -1), "binary XML"},
+			{Col(32, "shape", XTYPE_CLR, "geometry", -1), "geometry"},
+			{Col(33, "node", XTYPE_CLR, "hierarchyid", 892), "hierarchyid"},
+			{Col(34, "j", 244, "json", -1), "json"},
+			{Col(35, "mystery", 250, "", 16), "does not know"}};
+		bool all_raw = true;
+		for (const auto &rc : raws) {
+			const ColumnReading reading = ReadingOf(rc.first);
+			all_raw = all_raw && reading.readable && reading.raw && reading.type.id() == LogicalTypeId::BLOB &&
+					  reading.note.find(rc.second) != std::string::npos;
+		}
+		Check(all_raw, "sql_variant, xml, geometry, hierarchyid, json and an unknown type: their stored bytes, a BLOB");
+		CatalogColumn odd_collation = Col(36, "t", XTYPE_VARCHAR, "varchar", 10, 0, 0, 0x7fffffffu);
+		Check(ReadingOf(odd_collation).raw &&
+				  ReadingOf(odd_collation).note.find("newer than the code-page tables") != std::string::npos,
+			  "a varchar of a collation newer than the tables: its stored bytes");
+		// A raw column through the stager: a sql_variant's bytes as stored, a BLOB.
+		CatalogTable with_variant = t;
+		with_variant.columns.push_back(Col(37, "variant", XTYPE_SQL_VARIANT, "sql_variant", 8016));
+		RowsetLayout variant_layout = layout;
+		variant_layout.columns.push_back(Phys(37, XTYPE_SQL_VARIANT, -2, 19));
+		const std::vector<uint8_t> variant = {0x38, 0x01, 0x2a, 0x00, 0x00, 0x00};	// an int 42 in a sql_variant
+		const Page variant_page = PageOf({Record(fixed, 19, 0, {note, variant})});
+		RecordStager variant_stager(with_variant, {37});
+		variant_stager.UseLayout(variant_layout);
+		DataChunk variant_chunk;
+		variant_chunk.Initialize(Allocator::DefaultAllocator(), variant_stager.Types());
+		variant_stager.BeginChunk(variant_chunk);
+		variant_stager.Append(ReadSlot(variant_page.bytes.data(), PAGE_SIZE, 1, 0, "the test"));
+		variant_stager.FinalizeChunk(variant_chunk);
+		Check(variant_stager.Types()[0].id() == LogicalTypeId::BLOB &&
+				  variant_chunk.GetValue(0, 0).ToString() == "8\\x01*\\x00\\x00\\x00",
+			  "a sql_variant column reads as its stored bytes: " + variant_chunk.GetValue(0, 0).ToString());
 		Check(ErrorOf([&]() { RecordStager(t, {99}); }).find("has no column 99") != std::string::npos,
 			  "a column the table does not have");
 		RowsetLayout wrong = layout;
@@ -600,8 +640,9 @@ int main() {
 			t.name = "dbcs";
 			t.columns = {Col(1, "c", XTYPE_CHAR, "char", 8, 0, 0, id),
 						 Col(2, "v", XTYPE_VARCHAR, "varchar", 20, 0, 0, id)};
-			Check(ColumnRefusal(t.columns[0]).empty() && ColumnRefusal(t.columns[1]).empty(),
-				  std::string(pg.collation) + ": no refusal");
+			Check(!ReadingOf(t.columns[0]).raw && ReadingOf(t.columns[0]).note.empty() &&
+					  !ReadingOf(t.columns[1]).raw && ReadingOf(t.columns[1]).note.empty(),
+				  std::string(pg.collation) + ": converted, not raw");
 			RowsetLayout layout;
 			layout.table = "dbcs";
 			layout.columns = {Phys(1, XTYPE_CHAR, 4, 1, 8), Phys(2, XTYPE_VARCHAR, -1, 2, 20)};
@@ -657,6 +698,48 @@ int main() {
 		Check(chunk.GetValue(0, 0).ToString() == kanji, "932: 0x95 0x5C is one kanji, its trail byte not a backslash");
 		Check(chunk.GetValue(0, 1).ToString() == word + word + word, "932: a 21-byte value, past the 16-byte block");
 		Check(chunk.GetValue(0, 2).ToString() == "x", "932: a lead byte alone at the end reads as nothing");
+	}
+
+	// text / ntext / image: never refused for their type, but their in-row bytes are a text pointer, so
+	// a non-NULL value is the off-row error until PR 3 -- complex bit or not. And types still to be
+	// converted, read as their bytes: an unknown fixed-width type at its offset, an xml of max length.
+	{
+		const auto *latin = mssql::codec::code_page::FindCollationByName("Latin1_General_CI_AS", 20);
+		CatalogTable t;
+		t.schema_name = "dbo";
+		t.name = "legacy";
+		t.columns = {Col(1, "odd", 250, "", 6),
+					 Col(2, "notes", XTYPE_TEXT, "text", 16, 0, 0, static_cast<uint32_t>(latin->collation_id)),
+					 Col(3, "nnotes", XTYPE_NTEXT, "ntext", 16), Col(4, "doc", XTYPE_XML, "xml", -1)};
+		RowsetLayout layout;
+		layout.table = "legacy";
+		layout.columns = {Phys(1, 250, 4, 1, 6), Phys(2, XTYPE_TEXT, -1, 2), Phys(3, XTYPE_NTEXT, -2, 3),
+						  Phys(4, XTYPE_XML, -3, 4)};
+		const std::vector<uint8_t> odd = {1, 2, 3, 4, 5, 6};
+		const std::vector<uint8_t> pointer(16, 0x11), doc = {0xdf, 0xff, 0x01, 0xb0, 0x04};
+		// Row 0: the text columns NULL; row 1: a 16-byte pointer in `notes`, not flagged complex.
+		const Page page = PageOf({Record(odd, 4, 0x06, {{}, {}, doc}), Record(odd, 4, 0x04, {pointer, {}, doc})});
+		RecordStager stager(t, {1, 2, 3, 4});
+		stager.UseLayout(layout);
+		Check(stager.Types()[0].id() == LogicalTypeId::BLOB && stager.Types()[1].id() == LogicalTypeId::VARCHAR &&
+				  stager.Types()[2].id() == LogicalTypeId::VARCHAR && stager.Types()[3].id() == LogicalTypeId::BLOB,
+			  "an unknown type and xml as BLOB; text and ntext as VARCHAR, not refused");
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), stager.Types());
+		stager.BeginChunk(chunk);
+		stager.Append(ReadSlot(page.bytes.data(), PAGE_SIZE, 2, 0, "the test"));
+		stager.FinalizeChunk(chunk);
+		Check(chunk.GetValue(0, 0).ToString() == "\\x01\\x02\\x03\\x04\\x05\\x06" && chunk.GetValue(1, 0).IsNull() &&
+				  chunk.GetValue(2, 0).IsNull() && StringValue::Get(chunk.GetValue(3, 0)).size() == 5,
+			  "an unknown fixed type's 6 bytes at its offset, NULL text and ntext, xml's stored bytes");
+		stager.BeginChunk(chunk);
+		Check(ErrorOf([&]() {
+				  stager.Append(ReadSlot(page.bytes.data(), PAGE_SIZE, 2, 1, "the test"));
+			  }).find("dbo.legacy.notes holds a value stored off row") != std::string::npos,
+			  "a text value is its pointer: the off-row error until PR 3, though not flagged complex");
+		Check(ReadingOf(t.columns[0]).note.find("does not know") != std::string::npos &&
+				  SqlTypeText("", "int", XTYPE_INT, 4, 10, 0) == "int",
+			  "an unknown type says so; a type with no row of its own is named by its system type");
 	}
 
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;
