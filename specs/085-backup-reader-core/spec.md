@@ -1321,6 +1321,25 @@ server prints it, every partition's filegroup, rows and compression), 1443 field
     (acceptance 1 without LOBs) — 3.5 d
 18b. Fuzz harness record — 0.5 d
 
+*PR 2d as landed (2026-11-11).* Tasks 14, 15, 16, 18b, plus what the owner moved in: the double-byte
+code pages (from 086 D9: decoded on the client, a backup having no server) and no refusal by type
+(D13: a type still to be converted is its stored bytes). Measured first (E20, 2022): version tags
+(statusA 0x40, 14 bytes after the record, ignored), forwarded records and stubs, the uniquifier (the
+first variable column, empty for 0), ghosts of both kinds (a heap's under row versioning is a type-7
+version ghost, not FixedVar: skipped by type before parsing), row-overflow and LOB pointers, a
+default per partition rowset for a column added to a partitioned table (2c's open question), and
+`sysrscols.ti`'s fields (a decimal's precision low and scale high, a time type's scale, MAX as 0). Task
+15 needed no kernel of its own: page bytes are the TDS staged form for every type but datetime,
+smalldatetime, money (halves swapped while staging) and bit (its bit taken), so `RecordStager` feeds
+the live path's family kernels (`FinalizeStagedColumn`, extracted from `RowStager`). Task 16's
+`mssql_backup_scan` opens at bind (the columns are the file's), estimates rows from the catalog
+(never a maximum: a LIMIT would be dropped), and its `_mssql_rid` of a heap equals the server's
+`%%physloc%%` on every heap of the fixtures, forwarded rows included. The lane restores each quiet full
+set on its version's image (`test/backup/compare_rows.sh`) and compares every converted column both
+ways through `TYPE mssql`; locally on 2022, 10 sets, 89 tables, ~190k rows, 0 differences. New fixtures
+`rows.sql`, `dbcs.sql` and a heap with forwarded records and no versioning in `catalog.sql`. Moved on:
+per-AU runs and parallel units (2e), off-row values (PR 3), `mssql_backup_columns` (task 16d).
+
 *PR 2e — parallel scan and memory*
 
 16b. Units of 64 pages and parallelism; the D17 budget (`max_memory`, `max_threads`, the clamp's
