@@ -89,6 +89,14 @@ FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items');
 ----
 2000	true	\x01\x04\x00\x01\x00\x00\x00
 
+# Rows come in page order (file, then page), a page's rows together: the order DuckDB keeps.
+query I
+SELECT bool_and(_mssql_page >= previous) FROM (
+    SELECT _mssql_page, lag(_mssql_page) OVER () AS previous FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events'))
+WHERE previous IS NOT NULL;
+----
+true
+
 # Uncompressed, MS_XPRESS and striped backups of one database give identical rows (acceptance 3, 4).
 query II
 SELECT

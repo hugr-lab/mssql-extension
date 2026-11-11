@@ -7,9 +7,9 @@
 // reads them (D6's types; a type still to be converted as its stored bytes; a computed column that is
 // not persisted is not a column of the scan, having no stored value), plus the virtual _mssql_page,
 // _mssql_rid and _mssql_page_lsn (D8). Projection pushdown; no filter pushdown (§ SQL surface).
-// Cardinality from the catalog's row count. Rows in page order within each partition's in-row unit
-// (its IAM chain, DQ-40), one unit at a time on one thread (PR 2e makes units of 64 pages parallel).
-// The backup is opened at bind -- the columns are the file's -- and every EXECUTE binds again.
+// Cardinality from the catalog's row count. Rows in page order (file, then page) within each
+// partition's in-row unit (the pages its IAM chain lists, DQ-40), one unit at a time on one thread (PR 2e makes units
+// of 64 pages parallel). The backup is opened at bind -- the columns are the file's -- and every EXECUTE binds again.
 // [DuckDB]
 //===----------------------------------------------------------------------===//
 
@@ -315,7 +315,12 @@ bool NextPartition(const ScanBindData &data, ScanState &state) {
 		for (const auto &k : key) {
 			cursor.key.push_back(k.second);
 		}
+		// Page order (§ Scan): the IAM chain lists its single pages before its extents, so its order is
+		// not the pages'; a page's rows stay together either way.
 		cursor.pages = UnitPages(store, *cursor.unit);
+		std::sort(cursor.pages.begin(), cursor.pages.end(), [](const PagePointer &x, const PagePointer &y) {
+			return x.file != y.file ? x.file < y.file : x.page < y.page;
+		});
 		state.stager->UseLayout(p.layout);
 		state.cursor = std::move(cursor);
 		state.have_partition = true;
