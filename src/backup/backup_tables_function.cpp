@@ -183,48 +183,10 @@ Value PointerValue(const PagePointer &p) {
 	return p.IsNull() ? Value(LogicalType::VARCHAR) : Value(p.ToString());
 }
 
-//! Why the scan cannot read column `c` (spec 085 § Scope's refusals), or "".
-std::string ColumnRefusal(const CatalogColumn &c, uint32_t code_page) {
-	switch (c.system_type_id) {
-	case 98:
-		return "sql_variant is not read (spec 086)";
-	case 241:
-		return "xml is not read (spec 086)";
-	case 240:
-		return (c.system_type_name.empty() ? "the CLR type " + c.type_name : c.system_type_name) +
-			   " is not read (spec 086)";
-	case 34:
-	case 35:
-	case 99:
-		return "text, ntext and image are not read yet";
-	default:
-		break;
-	}
-	if (c.system_type_name.empty() || c.system_type_name == "json" || c.system_type_name == "vector") {
-		return (c.type_name.empty() ? "type " + std::to_string(c.user_type_id) : c.type_name) +
-			   " is not read (spec 086)";
-	}
-	const bool code_page_text = c.system_type_id == 167 || c.system_type_id == 175 || c.system_type_id == 35;
-	if (code_page_text && c.collation_id != 0 && !CollationById(static_cast<int32_t>(c.collation_id))) {
-		return "its collation (CollationId " + std::to_string(c.collation_id) + ") is not one the reader knows";
-	}
-	if ((c.system_type_id == 167 || c.system_type_id == 175) &&
-		(code_page == 932 || code_page == 936 || code_page == 949 || code_page == 950)) {
-		return "a varchar of double-byte code page " + std::to_string(code_page) + " is not read (spec 086)";
-	}
-	if (c.is_computed && !c.is_persisted) {
-		return "a computed column that is not persisted is not stored";
-	}
-	if (c.is_sparse || c.is_column_set) {
-		return "sparse columns are not read (spec 086)";
-	}
-	return std::string();
-}
-
 Value ColumnValue(const CatalogColumn &c) {
 	const CollationRow *collation = c.collation_id ? CollationById(static_cast<int32_t>(c.collation_id)) : nullptr;
 	const uint32_t code_page = collation ? collation->code_page : 0;
-	std::string reason = ColumnRefusal(c, code_page);
+	std::string reason = ColumnRefusal(c);
 	Value duckdb_type(LogicalType::VARCHAR);
 	// The precision and scale are the file's: LogicalType::DECIMAL asserts what they must be (an
 	// assertion, not an exception), so a declaration no server writes is named here instead. By the
@@ -242,9 +204,7 @@ Value ColumnValue(const CatalogColumn &c) {
 		}
 	} else if (!c.system_type_name.empty()) {
 		try {
-			duckdb_type =
-				Value(MSSQLColumnInfo::MapSQLServerTypeToDuckDB(c.system_type_name, c.max_length, c.precision, c.scale)
-						  .ToString());
+			duckdb_type = Value(ColumnDuckDBType(c).ToString());
 		} catch (std::exception &e) {
 			if (reason.empty()) {
 				reason = c.system_type_name + " has no DuckDB type: " + e.what();

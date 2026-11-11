@@ -4,13 +4,16 @@
 // backup/backup_function_common.hpp
 //
 // Spec 085: what the backup file functions share -- the path argument (one file, a glob, or a list of
-// every family of a media set) and the record form of a catalog's datetime values, converted the one
-// way TYPE mssql converts them. [DuckDB]
+// every family of a media set), the record form of a catalog's datetime values, converted the one
+// way TYPE mssql converts them, and a column's refusal and DuckDB type (the catalog's functions and
+// the scan's one answer). [DuckDB]
 //===----------------------------------------------------------------------===//
 
 #pragma once
 
+#include "backup/backup_catalog_model.hpp"
 #include "backup/backup_sql_variant.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 
 #include <string>
@@ -44,6 +47,15 @@ Value GuidValue(const std::string &bytes, const std::string &what);
 //! offset outside +-14:00), a time(7) / datetimeoffset(7) with a 100 ns digit (not cut to the
 //! microsecond), a double-byte code page (spec 086) or a base type this does not read.
 Value SqlVariantValue(const SqlVariant &variant, const std::string &what);
+
+//! Why the scan cannot read column `c` (spec 085 § Scope's refusals), or "". One predicate for
+//! mssql_backup_tables' `columns.reason` and the scan's refusal by name (D13).
+std::string ColumnRefusal(const CatalogColumn &c);
+
+//! The DuckDB type TYPE mssql reads `c` as with native types off (D6): MapSQLServerTypeToDuckDB on
+//! the system type underneath an alias. mssql_backup_tables' `columns.duckdb_type` and the scan's
+//! output type. Throws for a type with none.
+LogicalType ColumnDuckDBType(const CatalogColumn &c);
 
 }  // namespace backup
 }  // namespace mssql

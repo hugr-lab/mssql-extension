@@ -184,6 +184,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_pass_search.cpp
     src/backup/backup_ranges.cpp
     src/backup/backup_record.cpp
+    src/backup/backup_record_stager.cpp
     src/backup/backup_set.cpp
     src/backup/backup_sql_variant.cpp
     src/backup/backup_system_tables.cpp
