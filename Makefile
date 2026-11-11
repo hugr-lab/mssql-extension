@@ -35,7 +35,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay fuzz-backup-replay check-credential-logging leak-check crap-cpp crap-cpp-selftest help
+.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay fuzz-backup-replay check-credential-logging leak-check crap-cpp crap-cpp-selftest crap-cpp-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -872,6 +872,7 @@ bench-utf16: release
 #   make crap-cpp LCOV=x.lcov      the real score, from `llvm-cov export -format=lcov`
 #   make crap-cpp PATHS=src/tds    one subtree
 #   make crap-cpp-selftest         the tool's own joins and arithmetic; no lizard, no lcov
+#   make crap-cpp-test             the same through pytest (uvx), plus the CLI paths
 # Exits 2 when anything is at or above CRAP 10 (CRAP_THRESHOLD), so it can gate.
 CRAP_PATHS ?= src
 CRAP_THRESHOLD ?= 10
@@ -882,6 +883,9 @@ crap-cpp:
 
 crap-cpp-selftest:
 	@python3 tools/crap/crap_cpp.py --selftest
+
+crap-cpp-test:
+	@uvx --quiet pytest -q tools/crap
 
 CODE_PAGE_SOURCES := src/codec/code_page/code_page.cpp src/codec/code_page/code_page_avx2.cpp \
     src/codec/code_page/code_page_avx512.cpp \
