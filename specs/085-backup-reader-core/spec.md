@@ -71,22 +71,156 @@ Out, each refused by name until its spec lands:
   (A§2: a DETACH inside an expanded PRAGMA is refused).
 
 - **D3 — I/O only through DuckDB's file system (owner, R§6.1 layer 1).** Files open through
-  `FileSystem::GetFileSystem(context).OpenFile(path, FILE_FLAGS_READ)`, the client-context file system
-  that carries the opener, so `s3://`, `gs://`, `r2://`, `https://` (httpfs) and `az://`,
+  `CachingFileSystem::Get(context).OpenFile(path, FILE_FLAGS_READ)` (D3a), which wraps the
+  client-context file system that carries the opener
+  (`DD/src/include/duckdb/storage/external_file_cache/caching_file_system.hpp:152-159`), so `s3://`,
+  `gs://`, `r2://`, `https://` (httpfs) and `az://`,
   `abfss://` (azure) work with the user's DuckDB secrets, and DuckDB autoloads the extension for the
-  scheme (`virtual_file_system.cpp:428`). Reads are positional (`Read(buffer, n, location)`), so
-  threads share one handle. No SDK, no own HTTP, no own credential handling.
+  scheme (`virtual_file_system.cpp:428`). Reads are positional, so threads share one
+  `shared_ptr<CachingFileHandle>`. No SDK, no own HTTP, no own credential handling.
 
-- **D4 — the page store is an index by page id, gated by liveness.** A page names itself
+- **D3a — reads are ranges, coalesced, fetched asynchronously and in parallel, as the Parquet reader
+  does (owner, 2026-11-09; DQ-38).** On httpfs a positional read is an HTTP range request, so the
+  layer above the parsers works in ranges, never in a stream:
+  - **Ranges, coalesced.** A consumer asks for the byte ranges it needs (a unit's pages, a block, a
+    header); adjacent and nearly adjacent ranges are merged into one request, as Parquet merges its
+    read heads within a 16 KiB gap (`DD/extension/parquet/include/thrift_tools.hpp:61-79`,
+    `AddReadHead` `:107-130`), and the merged range is split again by the reader at a size that suits
+    the pins it can afford: one `CachingFileHandle::Read` pins its whole range. Below that, the
+    caching handle cuts a remote read into cache blocks of at most
+    `external_file_cache_remote_max_block_size` (2 MiB by default) and fetches them in parallel on the
+    ASYNC pool (`DD/src/storage/external_file_cache/caching_file_system.cpp:378-418`). A local file
+    reads the same way.
+  - **Asynchronous.** The fetches run as `AsyncTask`s on DuckDB's I/O pool:
+    `AsyncResult::FromTasks(…, TaskSchedulerType::ASYNC)` (`DD/src/include/duckdb/parallel/async_result.hpp`,
+    the pool `async_threads` sizes), returned as a `BLOCKED` result from the table function, so the
+    decode threads do not wait on the network. Any plain table function may do it: the table scan
+    runs in TASK_EXECUTOR mode by default (`DD/src/parallel/async_result.cpp:284-294`) and schedules
+    the tasks, or runs them with `ExecuteTasksSynchronously(context)` when it cannot block
+    (`DD/src/execution/operator/scan/physical_table_scan.cpp:171-206`;
+    `TableFunctionInput::HandleBlocked` runs them side by side, `DD/src/function/table_function.cpp:214-231`).
+    Its limits: a `BLOCKED` result comes with an empty chunk (`physical_table_scan.cpp:150-155`), only a
+    `function` may block (not an `in_out_function`), and the multi-file wrapper forces SYNCHRONOUS
+    (`DD/src/common/multi_file/table_function_multi_file.cpp:376`), so 085's functions do not use it.
+  - **Cached.** Reads go through DuckDB's `CachingFileSystem` / `ExternalFileCache`
+    (`DD/src/include/duckdb/storage/external_file_cache/`), whose buffers are the buffer manager's,
+    counted against `memory_limit` (D17). A **remote** file is cached when `enable_external_file_cache`
+    is on (the default) and the file has validation metadata (ETag or last-modified); its blocks are
+    evictable once unpinned, so an importer calling the functions once per table on one file, beside
+    D9's opened-file cache, usually fetches a range once (an evicted block is fetched again). A
+    **local** file is not cached by default (`cache_local_files` is off,
+    `DD/src/storage/external_file_cache/external_file_cache.cpp:103-110`): its reads are counted
+    buffers freed on release.
+  - **The open pass in parallel.** Only the MTF headers are walked one after another (a few small
+    reads). An uncompressed MSDA is one run of 8 KB units, each naming its own page (D4), so once its
+    stream header gives its extent the page index is built from many ranges fetched at once. A
+    compressed chain (`MSSQLBAK`) is a run of headers each giving the next one's offset, and its seek
+    index (§ Rules, MSSQLBAK) names only the blocks that start each data pass and the trailer, not
+    every block (task 4, 16 of 16 containers). So the chain is fetched ahead in large ranges in
+    parallel, its headers walked in the fetched bytes (cheap, sequential), its blocks decompressed on
+    every thread (D10), and the passes the index separates walked side by side. `mssql_backup_info`
+    needs no walk: the first block holds SSET, VOLB and MSCI, and the last index entry the trailer.
+  - **LOB trees** are fetched one level at a time: a node's children are known only once it is read,
+    so the ranges of one level are coalesced and fetched together.
+  - The parsers stay DuckDB-free (D15): they take spans the I/O layer has fetched.
+
+- **D4 — the page store is an index by page id, gated by liveness; a table's pages come from its IAM
+  chain (owner, 2026-11-09, DQ-40).** A page names itself
   (`m_pageId` @32, `m_fileId` @36, X§3), so the store is `(file_id, page_id) → location of its latest
   copy`. The later MSDA pass wins over the earlier (X§3, E3§2: reading only pass 1 doubled the error).
   A page's rows are read, and its header allocation-unit id is believed, **only if the page is live**
   (E2 R3): below its file's `Size`, its extent GAM-allocated, its PFS byte with 0x40. Full backups
   carry dead pages too (E2§1.3: 42 `BULK_OP_PREALLOC` pages in a full; 34 and 53 freed data pages with
-  live-looking records after a shrink). The page → allocation unit map is the **page header**, not the
-  IAM chains: the header AU was right on 10,473 of 10,473 allocated pages, after SHRINKFILE and REBUILD
-  too (E2§2, R4), and stale only on pages the liveness rule already drops. This corrects R§3's "map
-  through IAM chains". IAM pages remain an optional cross-check (`verify := true`).
+  live-looking records after a shrink).
+  - **Which pages are a table's: the allocation unit's IAM chain**, read through the page store (so
+    each IAM page's latest copy). The chain starts at `sysallocunits.pgfirstiam`; each IAM page covers
+    one GAM interval from its start page and lists the AU's uniform extents (a bitmap) and up to eight
+    single pages in mixed extents (§ Rules, allocation). A listed page enters a scan only if it is live
+    (R3). Walked at the table's first scan, not at open (D4a), so an open reads no table's pages.
+  - **The page header is the check, not the map.** The scan reads every page it uses whole, so the
+    header AU of each live page is compared with the AU being read, and a disagreement is a named
+    error: E2 found the header AU equal to the owner on 10,473 of 10,473 allocated pages, after
+    SHRINKFILE and REBUILD too (E2§2, R4), and stale only on pages R3 already drops or on dead AUs the
+    catalog does not scan. E2 preferred the header as the map for differentials, which lack the IAM
+    pages of unchanged AUs; through the page store those come from the full.
+  - **A differential's own pages are read the old way, by their header AU** (owner, 2026-11-09): its
+    pass is indexed from its page headers anyway (D4a), so its `(AU, page)` pairs cost no extra read.
+    Under an overlay a table's scan takes the diff's live pages whose header names its AU, and the
+    full's pages by the AU's IAM chain through the overlay (the diff's copy of an IAM page that
+    changed), both gated by R3 on the overlay's allocation pages, one copy per page id (task 24).
+    `verify := true` also checks that the two agree where both speak.
+
+- **D4a — what an opened backup keeps, and the budget: at most 0.4 MB of resident memory per GB of
+  backup, 4 GB for 10 TB (owner, 2026-11-09).** The open pass may be slow (a backup is opened once per
+  instance, D9); what must be fast is a bind and a read. So the opened backup keeps three tiers:
+  - **Resident while the backup is open** (pinned; what every bind and every page read needs):
+    the headers (families, sets, data files, `mssql_backup_info`'s fields); per pass a bitmap of the
+    extents it carries with a rank directory, so a page's place in the stream is the rank of its
+    extent among the pass's extents, found in O(1) (≈ 21 MB per pass and 2.6 MB of ranks for 10 TB);
+    per pass the samples its searches have found (DQ-41, E13: a block's or group's offset and the
+    extent it names, tens of bytes each, one per probe made), so a striped or compressed pass is
+    searched, never walked whole; the catalog model (schemas, tables, columns,
+    types, a table's AUs, its partitioning: grows with objects, not data); the per-table fuzzy status;
+    per data file its `Size` and GAM bits (one bit per extent, ≈ 21 MB for 10 TB; PFS pages are read
+    on demand, one per 8,088 pages, and the last few kept); per AU its catalog row (`pgfirstiam`,
+    `pgfirst`, `pgroot`) and per rowset `rcrows`, so a bind has its cardinality and a first scan its
+    IAM chain's first page with no lookup. Typically 0.1–0.2 GB for 10 TB.
+  - **Buffer-managed, spilled under pressure** (counted against `memory_limit`, D17): per AU the
+    extent runs and single pages of its IAM chain (DQ-40), built at the table's first scan from its
+    IAM pages (one 8 KB page per 4 GB of the file the AU spans, fetched as parallel ranges, D3a) and
+    kept in the opened backup for every later scan; a scan pins its table's. Typically tens of MB;
+    up to ≈ 2 GB for a 10 TB table whose extents interleave with another's. A differential's
+    `(AU, page)` pairs from its header pass (D4). Also the raw base tables when
+    `mssql_backup_catalog` asks for them.
+  - **What an ATTACH reads**: the MTF headers (a container's seek index: its pass boundaries), the
+    allocation pages (E12, below; found by search in a striped or compressed pass, DQ-41), a header
+    pass over pass 2 and a differential's pass, and the catalog's base tables (read through their
+    own IAM chains). Enough to list the schemas, tables and views and to bind them; no user table's
+    pages and no IAM page of one.
+  - **Not kept**: page bytes (fetched as ranges, D3a; a remote file's in `ExternalFileCache`), decoded
+    pages, LOB values (the scan's working memory, bounded by `max_memory`), log records (only D11's
+    flags stay), the open pass's intermediate records (freed once the index is built).
+  - **The stream order is checked, not assumed.** A pass's extents must come in ascending (file, page)
+    order for the rank to give their place; the open pass checks it, and a pass or a stretch of one
+    that breaks it is recorded as explicit runs `(file, first extent, count, offset)`: a loss of
+    compactness, never of correctness.
+  - **A page's type, level and `m_lsn` are not indexed**: the scan reads them from the page it reads
+    anyway (and skips the index pages there); D11's check (iv) reads the few pages the log tail names.
+    Spec 089's changed set (`m_lsn > since_lsn` on every live page, 089 D3) is computed by 089's own
+    pass over the page headers when `since_lsn` is given, not stored in this index.
+  - **E12 (done, `research/experiments/E12-gam-rank.md`)**: a single-family full backup's first pass
+    is one 8-unit group per extent of (GAM-allocated extents ∪ allocation-page extents), in ascending
+    (file, extent) order, then pad groups only (56 of 56 fulls, compressed and under load included
+    **(2025)**). So the open of such a backup reads the file headers and the GAMs (at ranks the GAMs
+    give: 2,560 GAM pages for 10 TB, at most 160 MB as the 64 KB groups that hold them) and the MTF
+    headers, not every page; the extent bitmap is the GAM's, and the PFS pages are read when a scan
+    needs them (D4a's allocation tier). Pass 2 and a differential's pass (small; a differential's for
+    its `(AU, page)` pairs, D4) are indexed from their page headers, one per 8-unit group. The rule
+    is checked where the reader reads a group, never trusted blindly.
+  - **E13 (done, `research/experiments/E13-ordered-passes-search.md`) and DQ-41: a striped or
+    compressed pass is searched, not read.** Every pass is ascending by (file, extent) (210 of 210:
+    pass 1 and 2, fulls and differentials, plain and compressed, each family of a striped set);
+    in a container every block of a pass outputs exactly 64 KB from a unit boundary, so block *k* is
+    the pass's extent group *k*, and the seek index names the pass boundaries. So an extent's group
+    is found by searching the pass: in a family file group *g* is at a computed offset (bisection
+    over groups). Probes are kept as samples; measured on the samples: 6–8 requests a cold lookup,
+    0.4–1.9 warm. A probe that meets a key out of order refuses the search for that pass, which falls
+    back to its header scan (a loss of speed, never of correctness).
+  - **A container is searched safely by default** (owner, 2026-11-09, DQ-41): a block found from an
+    arbitrary offset can be forged by row data (§ Security), so by default a container's group *g*
+    is read at its data-set offset through the chain walked from its start or a seek index entry,
+    lazily, checkpoints kept as it goes (the stream located from its tail, task 7a part 4a); the
+    search over such a pass gallops from the nearest walked sample (1, 2, 4 … groups, then bisects),
+    so it walks at most twice as far as the group it finds. Neither the rank path nor the GAMs run at
+    ATTACH for a container: the GAM of an interval is read when a page of it is first located
+    (D4a's allocation tier), and the catalog, at the start of pass 1, costs a short walk. A first
+    scan of a table deep in the file walks the chain to it (on object storage, reads the file up to
+    it). `trust_layout := true` uses E13's resync instead (a probe at any offset finds a block by the
+    next four plausible headers, the fourth always a true block in 3.6 M probes): the open and a
+    first scan then read little of the file, and the trust in the rows is the caller's.
+  - **A saved index is a later option**, not part of 085: written to a path the user names
+    (`temp_directory` does not outlive the process), keyed by `BackupSetGUID`, the families' sizes and
+    version tags.
 
 - **D5 — the catalog from the backup alone, data-driven per version.** The boot page gives the
   database name, version, collation and the first `sysallocunits` page (X§4). Five base tables have
@@ -314,30 +448,34 @@ Common named parameters of every function, and ATTACH options of the same names:
 | `fuzzy` | setting `mssql_backup_fuzzy` = `'warn'` | D11 |
 | `unsupported_version` | false | D14 |
 | `verify` | false | also cross-check every table's pages against its IAM chain and the positional rule (§ Rules, page index) |
+| `reread` | false | a prepared statement reads the file again on every EXECUTE (the default keeps what its PREPARE read: a backup is opened to be read, and a file being rewritten is invalid while it is) |
+| `trust_layout` | false | DQ-41: in a compressed backup, find blocks by resync from any offset (E13), so the open and a first scan read little of the file; only for a backup whose row data is trusted (§ Security: rows can forge a block chain). Off, a container's blocks are reached only by walking its chain from its start or a seek index entry |
 
 `mssql_backup_info(path)` returns one row per backup set:
 
 | column | type | source |
 |---|---|---|
 | `position` | `INTEGER` | SSET data set number |
-| `backup_type` | `VARCHAR` | `'full'` / `'differential'` / `'log'`: SSET attributes 0x4 full, 0x8 differential (E1§3); a log backup has no MSDA and an MQTL (X§3; its attribute bit unverified) |
+| `backup_type` | `VARCHAR` | `'full'` / `'differential'` / `'log'`: SSET attribute 0x8 differential (E1§3); a full and a log backup both carry 0x4 (task 3), and a log backup is the one with no MSDA block (X§3) |
 | `is_copy_only` | `BOOLEAN` | SSET attribute 0x2 (E2: 0x6 = copy-only full, over 37 files) |
 | `backup_set_guid` | `UUID` | SSET +100 (E1§3) |
 | `first_lsn`, `last_lsn`, `checkpoint_lsn`, `database_backup_lsn` | `DECIMAL(25,0)` | trailer SCIN (MSLS / MQCI) +32 / +42 / +52 / +62, 10 bytes each (E1§3) |
-| `differential_base_lsn`, `differential_base_guid` | `DECIMAL(25,0)`, `UUID` | SCIN +830 / +842; in a full: its own checkpoint LSN and GUID, the base it establishes (E1§3) |
-| `database_name`, `database_version`, `compatibility_level`, `collation`, `family_guid` | | boot page: `dbi_dbname` +52, `dbi_version` +4, `dbi_cmptlevel` +314, `dbi_collation` +392 (name from the collation table), `dbi_familyGUID` +408 (record offsets, X§4) |
-| `recovery_fork_id`, `first_recovery_fork_id`, `fork_point_lsn`, `binding_id` | `UUID`, `UUID`, `DECIMAL(25,0)`, `UUID` | **to locate** (task 3), HEADERONLY `RecoveryForkID` / `FirstRecoveryForkID` / `ForkPointLSN` / `BindingID`; `NULL` until matched. The chain check compares the file's fork with the lake's and fails closed: until the fork id is read every apply by LSN, a differential or a full applied incrementally, is refused (089 D7, 023 C1) |
-| `backup_name`, `description`, `user_name`, `machine_name`, `software_version` | `VARCHAR` | SSET strings, VOLB machine name, SSET software major / minor (X§3) |
-| `backup_start_date`, `backup_finish_date` | `TIMESTAMP` | **to locate** (task 3): candidates SSET +88 and ESET +80 MTF dates; `NULL` until matched with HEADERONLY |
-| `media_set_guid`, `family_count`, `family_sequence_number` | | TAPE's RAID stream +0 / +20 / +24 (E2 layouts) |
+| `differential_base_lsn`, `differential_base_guid` | `DECIMAL(25,0)`, `UUID` | a differential's base: trailer SCIN +260 / +200 (task 3; E1's "+830 / +842" were offsets in the MQCI stream, which move with the SCIN's length, 41 of 41 differentials); NULL for any other backup, as HEADERONLY (a full establishes the base its own `checkpoint_lsn` and `backup_set_guid` name) |
+| `database_name`, `server_name` | `VARCHAR` | trailer SCIN string descriptors (u16 byte length, u16 offset) at +104 / +108 (task 9: HEADERONLY's DatabaseName / ServerName on 8 of 8 truths, present in every sample); the boot page's `dbi_dbname` cross-checks the first (task 11) |
+| `database_version`, `compatibility_level`, `collation_name` | `INTEGER`, `INTEGER`, `VARCHAR` | (`collation` is a DuckDB keyword) trailer SCIN (task 9, § Rules): u16 +94, u8 +91, and the collation's TDS form at +216 / +220, named through spec 091's collation table (a `SQL_` collation by its SortId; another by its LCID, version and the flags its name implies; of two names that differ only by `_SC`, the one without, as HEADERONLY prints it; NULL when still not one); the boot page's `dbi_version` / `dbi_cmptlevel` / `dbi_collation` (whose CollationId names an `_SC` collation exactly) cross-check them (task 11) |
+| `family_guid` | `UUID` | trailer SCIN +224 (task 3); the boot page's `dbi_familyGUID` +408 cross-checks it |
+| `recovery_fork_id`, `first_recovery_fork_id`, `fork_point_lsn`, `binding_id` | `UUID`, `UUID`, `DECIMAL(25,0)`, `UUID` | located (task 3, § Rules, header fields): trailer SCIN +156 `RecoveryForkID`, +124 `BindingID`; +172 (10-byte LSN) and +184 (GUID) the fork point and the parent fork, set once the database was restored with recovery; HEADERONLY's `FirstRecoveryForkID` / `ForkPointLSN` are derived from them. The chain check compares the file's fork with the lake's and fails closed: until the fork id is read every apply by LSN, a differential or a full applied incrementally, is refused (089 D7, 023 C1) |
+| `backup_name`, `description`, `user_name`, `machine_name`, `software_version` | `VARCHAR` | SSET strings, VOLB machine name; `software_version` the server version at trailer SCIN +24 (`17.0.4075`) |
+| `database_creation_date`, `backup_start_date`, `backup_finish_date` | `TIMESTAMP` | located (task 3): trailer SCIN +72 / +77 / +82, MTF dates (5 bytes, big-endian bit fields), as HEADERONLY prints them (server local time) |
+| `media_set_guid`, `family_count`, `family_sequence_number` | `UUID`, `INTEGER`, `INTEGER` | TAPE's RAID stream +0 / u16 +20 / u16 +24 (E2 layouts, checked against LABELONLY; the u16 at +22 is 1 in every sample, perhaps its MirrorCount); the sequence number only when one family is given (a whole set has none). A compressed container's data set has no TAPE: the container keeps it in its header, a chain block at 0x1E0 (4 KB of output) holding the same TAPE DBLK and RAID stream (task 9, 16 of 16 containers; family count 1 in every sample, no compressed striped set yet), so its families are checked as a plain set's |
 | `compressed`, `compression_algorithm` | | `MSSQLBAK` header word @0x0C (§ Rules, container) |
 | `encrypted`, `encryptor_thumbprint` | | `MSSQLBAK` @0x0C bit 0x4, thumbprint @0x18 (E4§1); decryption is spec 087 |
 | `has_backup_checksums` | `BOOLEAN` | MQDA / MQTL media-format attribute 0x100 and the `CSUM` streams (E2§7) |
-| `backup_size`, `compressed_size` | `BIGINT` | the MTF data set's size (= `BackupSize`, X§5), the file's size |
-| `page_count`, `log_tail_bytes` | `BIGINT` | live pages; MQTL bytes |
-| `consistent`, `open_transactions`, `committed_after_checkpoint` | | D11, database level (data backups only) |
-| `recovery_model` | `VARCHAR` | **to locate**; `NULL` until then |
-| `files` | `LIST(STRUCT(logical_name, physical_name, type, file_id, filegroup_id, filegroup_name, size_pages, backup_size_bytes))` | MSCI's SFIN / SFGI records and each file header's `Size` (X§3, E2) |
+| `backup_size`, `compressed_size` | `BIGINT` | `BackupSize` as the trailer records it, SCIN +96, the set's value in every family; checked against the sum over the families of (the MSLS block's offset − the soft-filemark size, TAPE's `soft_filemark_block_size` × 512), which task 3 found on every truth (a 64 KB `BLOCKSIZE` and a striped set included **(2025)**): a file whose two disagree is refused by name; `compressed_size` is HEADERONLY's CompressedBackupSize as the trailer records it: a u64 at SCIN +344 (task 9: on every truth, compressed and plain, striped and E3's included), the whole set's value in every family (they must agree), equal to `BackupSize` for a plain backup; NULL on a SCIN too short to hold it. Before it was found, a measured formula reproduced it on 29 compressed truths (E14's 24 included): the physical offset of the chain block holding MSLS + half of MSLS's offset in that block − 4096, i.e. the compressed stream's position when the trailer was written, each 1 KB MTF block before MSLS in that block counted as a 512-byte sector |
+| `page_count`, `log_tail_bytes` | `BIGINT` | live pages (NULL until PR 2 reads the allocation pages for it); the MQTL streams' log bytes (each stream's length less its 2-byte lead-in) |
+| `consistent`, `open_transactions`, `committed_after_checkpoint` | `BOOLEAN`, `INTEGER`, `INTEGER` | D11, database level (data backups only); NULL until PR 5 |
+| `recovery_model` | `VARCHAR` | located (task 3): trailer SCIN +244, `0x08` SIMPLE, else `0x04` BULK_LOGGED, else FULL (sysdatabases' "trunc. log on chkpt" and "select into/bulkcopy" bits) |
+| `files` | `LIST(STRUCT(logical_name, physical_name, type, file_id, filegroup_id, filegroup_name, size_bytes, max_size_bytes, create_lsn, unique_id, backup_size_bytes))` | the trailer MQCI's SFIN / SFGI records (§ Rules, header fields); `backup_size_bytes` from the page index (task 7), NULL before it |
 
 `mssql_backup_tables(path)` returns one row per user table: `schema_name`, `table_name`, `object_id`,
 `shape` (`heap` / `clustered` / `columnstore`), `compression` (from `sysrowsets.cmprlevel`; `mixed`
@@ -397,7 +535,8 @@ src/backup/                         namespace duckdb::mssql::backup (no prefix);
   backup_xpress.cpp                 XpressHuffmanDecoder ([MS-XCA] 2.2), bounded by the declared output size
   backup_zstd.cpp                   ZSTD block decode
   backup_page_index.cpp             PageIndex: every unit of every MSDA pass of every family; latest copy
-  backup_allocation.cpp             AllocationMap: file header Size, GAM/SGAM/DCM/BCM, PFS, IAM; IsLive (R3)
+  backup_allocation.cpp             AllocationMap: file header Size, GAM, PFS on demand; IsLive (R3)
+  backup_iam.cpp                    IamChain: an AU's IAM pages → its extent runs and single pages (DQ-40)
   backup_page_store.cpp             PageStore: page bytes by (file, page); differential overlay
   backup_catalog_reader.cpp         boot page, the five bootstrap layouts, generic base-table decoder
   backup_catalog_model.cpp          CatalogModel: schemas, objects, rowsets, AUs, columns, TableLayout
@@ -444,16 +583,23 @@ flowchart BT
   stages, each cached when first needed:
   1. *headers*: per family the TAPE / SSET / VOLB / MSCI / MSLS fields, the container header, the
      data-stream boundaries. Enough for most of `mssql_backup_info`.
-  2. *page index*: one sequential pass over every family (I/O plus decompression), recording
-     per extent its location (family, pass, physical offset or block number and offset in block) and
-     per page a 16-byte summary (type, level, flags, allocation-unit ordinal, `m_lsn`). Kept in
-     buffer-managed blocks, so it spills under memory pressure; about 0.2 % of the backup's size.
-  3. *allocation*: per data file `Size`, the GAM / SGAM / DCM / BCM bitmaps, the PFS bytes, IAM
-     summaries.
-  4. *catalog*: the decoded base tables and the derived model.
+  2. *page index* (D4a): per pass the extent bitmap and its ranks (or explicit runs where the order
+     breaks): a single-family full's pass 1 from its GAMs (E12; in a container its GAMs found by
+     search, DQ-41); a striped set's passes searched (DQ-41), their samples growing as pages are
+     located; pass 2 and a differential's pass from their page headers, one read per 8-unit group,
+     in parallel ranges (D3a; I/O plus decompression); a differential's pass also yields its
+     `(AU, page)` pairs (D4).
+  3. *allocation* (D4a): per data file `Size` and the GAM bits, kept; PFS pages on demand; the DCM /
+     BCM bitmaps only for `verify` and spec 089.
+  4. *catalog*: the decoded base tables (through their IAM chains) and the derived model. Stages 1–4
+     are what an ATTACH builds.
+  4a. *a table's pages* (DQ-40): at its first scan, its AUs' IAM chains walked into extent runs and
+     single pages, kept per AU.
   5. *log tail*: the transaction table and the per-allocation-unit flags of D11.
-- **Block index** (compressed media): per block its physical offset, payload length, kind, output
-  size (`unit × 512`) and logical offset in the MTF data set. Built while walking the chain in stage 2.
+- **Block samples** (compressed media, DQ-41): per pass the blocks the searches have probed (physical
+  offset, the extent it names; its logical offset when the rank gives it). A read from a sample
+  walks the headers inside the range it fetches anyway; the chain is never walked whole at open
+  (`WalkChain` stays for a pass whose order broke and for `verify`).
 - **`TableLayout`**: per rowset of the table (one per partition) the physical columns from
   `sysrscols` (rscolid, hbcolid, ti, collation, ordkey, status, offset, nullbit, bitpos), the logical
   columns from `syscolpars`, the defaults from `sysseobjvalues`, the allocation units (IN_ROW_DATA,
@@ -472,14 +618,83 @@ Byte offsets are from the experiments; each is **(2025)** unless marked otherwis
   is padded to 4 bytes; `SPAD` ends a block's chain. **Both checksums are validated on every header**:
   the string `VOLB` occurs inside data and has looped another reader (W§2).
 - The walk follows header lengths only, never fixed offsets: BLOCKSIZE moves SFMB and SSET to 1× and
-  2× the block size and APAD absorbs the gap; MAXTRANSFERSIZE changes the padding (E2 R10, §7).
+  2× the block size and APAD absorbs the gap; MAXTRANSFERSIZE changes the padding (E2 R10, §7). A
+  block's streams end with `SPAD`, and the next DBLK starts where its data ends (4-aligned); an SFMB
+  is TAPE's `soft_filemark_block_size` × 512 bytes long. Walked strictly, with no resync, this ends
+  exactly at the end of all 95 uncompressed backups of the experiments (BLOCKSIZE 4 / 16 / 64 KB,
+  MAXTRANSFERSIZE 64 KB / 4 MB, stripes, logs, task 3) **(2025)**: a DBLK that does not validate where
+  the previous one ended is a named error.
 - SQL Server's sequence: `TAPE SFMB SSET VOLB MSCI MSDA MSDA MSTL… MSLS SFMB ESET ESET SFMB` (X§3).
-  MQDA = a 2-byte lead-in (`length mod 8192`) then 8 KB units, page-aligned in the file; an MQDA of
+  MQDA = a 2-byte lead-in (`length mod 8192`) then 8 KB units, right after the lead-in and **not**
+  8 KB-aligned in the file (E12: two files start their units at offset 20,480); an MQDA of
   0 bytes with media attribute 0x6 marks the end of data. The first MSDA is pass 1, the second pass 2.
   All data files share one MSDA per pass, in `file_id` order (E2 R9). MQTL = a 2-byte lead-in then log
   blocks. The trailer SCIN in MSLS carries the LSNs; the copy in MSCI does not (E1§3).
 - A striped set is `FamilyCount` complete MTF files with one MediaSetId (TAPE RAID stream). Each
   extent is in exactly one family; the log tail is only in family 1 (E2§6).
+
+**Header fields of the trailer SCIN** (task 3, the trailer MQCI's first record, `SCIN`, u32 length
+@4; located against HEADERONLY on 39 backups of SQL Server 2025, 501 fields, 0 mismatches: E1's,
+E3's, the probe samples and a set made for it -- SIMPLE / BULK_LOGGED / FULL, a 300 MB full whose
+start and finish differ, a restore WITH RECOVERY, a log backup across the fork **(2025)**):
+
+The whole record (task 9; SQL Server 2025, 430-448 bytes: a 400-byte fixed part, then the UTF-16
+strings its descriptors point at). **Pinned** = equal to HEADERONLY / LABELONLY / msdb on every truth
+with more than one distinct value (41 backups of `test/data/backup/`, T3, E3, E14's 24 and E15's 8
+databases of 8 collations and 6 compatibility levels). The names in quotes are those of the 010 Editor
+template `tape.bt` (CaledoniaProject/public-src, no licence: facts only), the only prior source that
+names SCIN's fields; it describes the record as it was before backup compression and ends at +344.
+
+| offset | field | evidence |
+|---|---|---|
+| +0 / +4 | tag `SCIN`, u32 record length | pinned |
+| +8 | u32 Flags: 16 HasBackupChecksums, 1024 IsCopyOnly, 2048 seen on the differential, 512 on every backup | pinned (4 values); bits from the boolean columns |
+| +12 / +16 / +20 | u32 data file count, log file count, "next id" | `tape.bt`; 1 / 2 / 3 data files on E2 / its fg2 set |
+| +24 | u32 server version: major << 24, minor << 16, build (17.0.4075) | `tape.bt`; HEADERONLY's SoftwareVersion* (one server) |
+| +28 | u32 processor architecture (9 = AMD64) | `tape.bt` |
+| +32 / +42 / +52 / +62 | FirstLSN, LastLSN, CheckpointLSN, DatabaseBackupLSN (10-byte LSNs: u32 VLF, u32 block, u16 slot) | pinned |
+| +72 / +77 / +82 | DatabaseCreationDate, BackupStartDate, BackupFinishDate (MTF dates) | pinned |
+| +87 | u8 backup type: `D` full, `I` differential, `L` log (msdb `backupset.type`) | `tape.bt`; every sample |
+| +88 / +89 / +90 | u8 SortOrder, sort-order status, code page | +88 pinned against SortOrder (E15) |
+| +91 | u8 CompatibilityLevel | pinned (E15: 120 … 170) |
+| +92 | u16 database id | `tape.bt`; 5 / 11 / 20 / 25 / 26 |
+| +94 | u16 DatabaseVersion (998) | `tape.bt`; HEADERONLY (one server) |
+| +96 | u64 BackupSize, the set's | pinned (13 values; every family of a set holds it) |
+| +104 / +108 | DatabaseName, ServerName: (u16 byte length, u16 offset) descriptors | pinned |
+| +112 | "minimum restart page" | `tape.bt` |
+| +116 / +120 | u32 UnicodeLocaleId, u32 UnicodeComparisonStyle | pinned (E15) |
+| +124 | BindingID | pinned |
+| +140 | "file generation" | `tape.bt` |
+| +144 … +199 | the recovery fork name stack: two (10-byte LSN, u16, GUID) entries -- +144 / +156 the current fork (+156 RecoveryForkID), +172 / +184 the fork point and the parent fork, zero until a restore WITH RECOVERY | pinned / `tape.bt` |
+| +200 | "last full base GUID": a differential's base backup set | pinned |
+| +216 / +220 | Collation, TDS's five bytes: u32 LCID (20 bits), flags (8: 0x01 CI, 0x02 AI, 0x04 kana and 0x08 width ignored, 0x10 BIN, 0x20 BIN2, 0x40 UTF8), version (4); u8 SortId | pinned (E15's 8 collations). No flag marks `_SC`: HEADERONLY itself prints `Latin1_General_100_CI_AS` for `Latin1_General_100_CI_AS_SC` |
+| +224 | FamilyGUID | pinned |
+| +240 | u32 MAXTRANSFERSIZE of the backup | pinned (E14: 64 KB, 1 MB, 4 MB) |
+| +244 | database status: recovery model bits 0x08 SIMPLE, 0x04 BULK_LOGGED, neither FULL | pinned |
+| +248 | "log chain origin" LSN | `tape.bt`; LSN-shaped in every sample |
+| +260 / +272 | a single differential's base LSN and GUID (zero in a full) | pinned (+272 the GUID again) |
+| +288 | 16 unused bytes | `tape.bt`; zeros |
+| +304 / +316 | "restore path origin" LSN and GUID | `tape.bt` |
+| +332 | "oldest active backup" LSN | `tape.bt`; LSN-shaped |
+| +344 | u64 CompressedBackupSize, the set's (equal to BackupSize for a plain backup) | pinned (37 values); appended with backup compression, past `tape.bt`'s struct |
+| +352 … +399 | unknown: u32 1, 2, 3 at +380 … +388, and a value that varies (on a log backup, five bytes at +372) | -- |
+
+The MQCI stream is a run of records, each `tag[4] ‖ u32 length` (the length includes the 8 bytes),
+covering the stream exactly: SCIN, one SFGI per filegroup, one SFIN per file. **SFIN** (task 3; 310
+fields of FILELISTONLY on 15 backups, a second filegroup and a bounded MAXSIZE included, 0 mismatches
+**(2025)**): u32 FileId +20, u32 type +28 (1 data `D`, 2 log `L`; any other value refused by name
+until seen), u32 FileGroupId +36 (0 for the log), u64 Size in bytes +40, two string descriptors
+(u16 byte length, u16 offset in the record, UTF-16LE) +48 LogicalName and +52 PhysicalName, u64
+MaxSize in bytes +86 (unaligned), CreateLSN +138, UniqueId +186. **SFGI**: u32 filegroup id +12 and a
+string descriptor +16 for its name. FILELISTONLY's `BackupSizeInBytes` is not in SFIN: it is the
+file's pages in the data stream.
+
+HEADERONLY's `FirstRecoveryForkID` and `ForkPointLSN` are derived: a log backup whose FirstLSN is not
+past the fork point spans the fork, and reports the parent fork and the fork point; every other
+backup reports `FirstRecoveryForkID` = `RecoveryForkID` and `ForkPointLSN` NULL (a full taken after a
+restore carries +172 / +184 and still reports NULL). One fork case backs the rule **(2025, one case)**.
+The record grows with its trailing strings (database and server names, 442–448 bytes seen); the
+offsets above are in its fixed part.
 
 **MSSQLBAK** (X§5, E4§1, `tools/bakz.py`):
 - `MSSQLBAK` @0, u32 2 @8, u32 flags @0x0C: 3 = MS_XPRESS, 0x83 = ZSTD, 5 = encrypted, 7 = encrypted
@@ -492,7 +707,35 @@ Byte offsets are from the experiments; each is **(2025)** unless marked otherwis
   stored by W§3's Internals Viewer and accepted by E4's script, was never observed here). The chain ends at the first header whose kind is none of these; after it come a seek
   index, an SFMB, one compressed block with ESET / OTCP / TSMP, and an SFMB (X§5).
 - The concatenated block outputs are the MTF data set, byte-identical in layout to an uncompressed
-  backup (1,403 of 1,419 units identical to one taken minutes earlier, X§5).
+  backup (1,403 of 1,419 units identical to one taken minutes earlier, X§5): it starts at SSET, with
+  no TAPE or SFMB in it. HEADERONLY's `BackupSize` is the MSLS block's offset in it plus 4 KB (the
+  container's soft filemark: its plain SFMB at 0x1000 runs to the chain at 0x2000), the family
+  file's rule (MSLS − SSET + filemark) again; not the data set's length, which a busy backup's
+  longer MSLS block exceeds (E3 r1: a 6 KB MSLS, 2,048 bytes more; task 6, on the probe samples and
+  E3's ZSTD backups).
+- **The seek index** follows the chain (task 4, on all 16 compressed containers of the experiments,
+  MS_XPRESS and ZSTD **(2025)**): u32 44 @0 and u32 0x00010001 @24 in every one (their meaning is
+  unknown; the record is 40 + 16 n bytes, so 44 is not its length), u32 entry count @28 (3 to 5
+  seen; more than 1024 is refused), then from @40 one `(u64 logical offset, u64 physical offset)`
+  per entry, each a
+  block of the chain whose output starts there: the end of each MSDA pass and the trailer's MSTL.
+  The reader checks every entry against the chain and refuses an index that names no block.
+- **ZSTD blocks** are one frame each, single-segment, with the content size and **no content
+  checksum** (15,163 of 15,163 frames seen, task 6 **(2025)**): a frame is refused when it declares
+  another size than its block, holds trailing bytes or does not decode, but damage inside a frame
+  can decode to wrong bytes, as in an MS_XPRESS block, which has no checksum either. The page layer
+  catches it: the page header's own fields (D4) and, in a backup taken WITH CHECKSUM, the page
+  checksum (task 7). zstd comes from vcpkg, linked statically: DuckDB's bundled `duckdb_zstd` is not
+  DUCKDB_API, so a loadable extension cannot rely on the host exporting it.
+- A block is found from any offset (E13, DQ-41): scan forward to the first offset whose header and
+  the three headers its chain leads to are plausible (kind 0x21 / 0x23, 1–128 units, a stored
+  block's length its output, inside the chain), and take the fourth. Inside a data pass every
+  block outputs exactly 64 KB from a unit boundary; the first block (8 KB) and the 4 KB ones at the
+  pass boundaries and the trailer are the only others, and the seek index names those boundaries.
+  The full chain walk (`WalkChain`, its checkpoint every 64 blocks and at most one per MiB) serves
+  the fallback and `verify`. A compressed container's data set has no TAPE, so its media fields (family count and
+  sequence, media set GUID) are not located yet and reported NULL. A block header's checksum (u32 @24) is not validated: its algorithm is unknown (the
+  MTF headers inside the data set are, and a decompressor validates its own frame).
 - XPRESS: per block a 256-byte table of 512 4-bit code lengths, then the LZ77+Huffman stream;
   decoding stops at the output size; symbol 256 is not end-of-stream (W§3, X§5).
 
@@ -512,7 +755,9 @@ Byte offsets are from the experiments; each is **(2025)** unless marked otherwis
 - File header page 0, slot 0 record (its offset varies: 96 or 2,494 seen; read it through the slot
   array): u16 file id +167, u16 filegroup id +169, u32 `Size` in pages +171.
 - IAM: header record at 96, u32 sequence +4, start page +40, eight single-page slots +46; extent
-  bitmap at 194 relative to the start page.
+  bitmap at 194 relative to the start page. The chain follows the page header's next-page pointer
+  (u32 page @16, u16 file @20, as on every page; to be pinned on the samples in task 11a); the
+  sequence must ascend and each start page must open a GAM interval, else a named error.
 - `IsLive(file, page)`: the allocation pages themselves (0, 1, 9, the PFS pages, GAM / SGAM / DCM / BCM)
   are live; any other page is live iff `page < Size` and its extent's GAM bit is 0 and its PFS byte has
   0x40.
@@ -659,12 +904,15 @@ Each component of 085, with its home or its bound:
 
 | component | grows with | home or bound |
 |---|---|---|
-| page index, block index (stage 2) | the file's pages and blocks (~0.2 % of the backup) | buffer-managed blocks, pinned while read; they spill |
+| extent bitmaps and ranks, block samples (stage 2, D4a, DQ-41) | the file's extents (≈ 45 MB for 10 TB) and the probes made | resident while the backup is open; within D4a's 0.4 MB per GB |
+| a table's pages (stage 4a, DQ-40) | the runs of the scanned tables' extents (tens of MB typically, ≈ 2 GB worst case for a 10 TB table) | built from the IAM chain at a table's first scan; buffer-managed per AU in the opened backup, a scan pins its table's; they spill |
+| allocation (stage 3) | the files' extents (≈ 21 MB for 10 TB) | resident: `Size` and GAM bits; PFS pages read on demand, 64 kept |
 | opened-file cache (D9) | files opened | DuckDB's `ObjectCache`: an entry reports `GetEstimatedCacheMemory` (`DD/src/include/duckdb/storage/object_cache.hpp:48`), so the buffer pool evicts it under pressure (`DD/src/storage/buffer/buffer_pool.cpp:348`); an attached catalog pins its entry; an evicted entry costs a reopen |
 | catalog (stage 4) | objects × columns | the decoded base tables in `ColumnDataCollection`s built with the `ClientContext`, spillable; the model over them indexes them by id, and a `TableLayout` is built only for a table a call binds |
 | log tail (stage 5) | the tail's records | read block by block; the transaction table and the per-AU flags of D11 are buffer-managed (090 D9 extends them) |
 | decode staging | the rows of a chunk | one chunk per running unit, closed at the codec's staging byte budget or a full vector, whichever comes first; reserved (D17) |
 | a compressed block being read | ≤ 64 KB | one per thread (§ Scan) |
+| fetched ranges (D3a) | the ranges in flight and cached | the buffer manager's: a remote file's cached blocks are counted and evictable once unpinned; a local file's reads are counted and freed on release; the ranges in flight are bounded by the units in flight |
 | a LOB value | its length | not streamed: DuckDB has no streamed value, so a value is assembled whole in its vector, fragment by fragment, capped at 2^31 − 1 bytes. Its length, known from its root before a fragment is read, is reserved first, by D17's rule: a unit that cannot reserve it waits for the others, and a value that still cannot fit while its unit runs alone is refused by name (table, `_mssql_rid`, column, length, `max_memory`, `temp_directory`) |
 
 So a scan holds at most `MaxThreads()` (≤ `max_threads`) chunks and LOB values at once, under the
@@ -701,6 +949,12 @@ A backup file is untrusted input (R§9). Every parser:
   Huffman table (lengths ≤ 15, a complete prefix code); a match before the block start or past its end
   is an error. ZSTD frames are decoded into a buffer of the declared size and refused if the frame
   claims more.
+- **Does not let row data steer the block chain** (DQ-41): a compressed backup's stored blocks
+  carry row bytes verbatim, so a database user can place forged block headers in a row, and a resync
+  from an arbitrary offset (E13) can take them for blocks whose "pages" name any page id and AU.
+  By default a container's blocks are reached only by walking the chain from a block known to be
+  one (its first block, a seek index entry, a block reached that way); the resync search runs only
+  under `trust_layout := true`.
 - **Treats pads as sensitive** (E2§7: in 26 of 35 files the pad bodies carried row data of the
   database, in three of them rows on no live page of that file). Pads are skipped by type at index
   time, and their bodies are never read further. The same holds for non-live pages and ghost records,
@@ -768,13 +1022,21 @@ committed samples only.
 6. On E3's fuzzy runs the per-table status equals flag (v): every differing table flagged, no
    consistent table flagged.
 7. A second call on an opened file reads no file bytes (counted); a rewritten file is reopened.
-8. `s3://` (MinIO in the lane) and `https://` reads give the local result.
+8. `s3://` (MinIO in the lane) and `https://` reads give the local result. The open pass and a scan
+   are measured on MinIO in requests and in time, sequential against D3a's parallel ranges; a second
+   call on the same file, with nothing evicted in between, fetches no range again (D3a).
 9. ATTACH: `SELECT` works; `CREATE`, `INSERT`, `UPDATE`, `DELETE`, `COPY … TO`, `ALTER`, `DROP`
    are refused by DuckDB's read-only check.
 10. Every refusal of § Scope names its object and feature; no InternalException.
 11. The fuzz harnesses replay their corpora clean under ASan and UBSan.
-12. Opening a 100 GB backup (generated in a manual lane) holds under 300 MB resident and reads the
-    file once.
+12. An ATTACH of a 100 GB single-family uncompressed full (generated in a manual lane) reads its
+    MTF headers, its allocation and catalog pages and its pass 2, and none of a user table's pages or
+    IAM pages (counted), and leaves at most 40 MB resident (D4a's 0.4 MB per GB, `duckdb_memory()`'s
+    `EXTENSION` tag after the open); a table's first scan reads its IAM pages and its own pages, a
+    second reads no IAM page again; a synthetic database whose tables interleave extent by extent
+    (D4a's worst case) stays within the same bound for its resident tier. The same database backed
+    up `WITH COMPRESSION`, and striped in two, reads at most 1 % of its files at ATTACH (counted:
+    DQ-41's search, no chain walk, no header pass over pass 1).
 13. A backup much larger than memory (a generated 20 GB full, the manual lane), every table scanned
     with `memory_limit = '1GB'` and every thread, completes: the peak memory DuckDB accounts
     (`duckdb_memory()`, the buffer manager's used bytes) stays under the limit, and every table equals
@@ -789,25 +1051,39 @@ merges before the next opens (never stacked).
 
 **PR 1 — container and pages (`mssql_backup_info`)**
 1. Skeleton: folders, CMake, namespaces, `ByteReader`, the error type — 1 d
-2. `ByteSource`: FileSystem handles for every family, positional reads, globs and lists — 1.5 d
+2. `ByteSource`: FileSystem handles for every family through `CachingFileSystem`, globs and lists;
+   range requests coalesced, fetched as `AsyncTask`s on the ASYNC pool (D3a) — 3 d
 3. MTF walker, checksums, SQL Server DBLKs; SSET / VOLB / MSCI / SCIN / SFIN / MSLS fields; locate
    `backup_start_date` / `backup_finish_date` / `recovery_model` and the recovery fork
    (`RecoveryForkID`, `FirstRecoveryForkID`, `ForkPointLSN`) against HEADERONLY. The fork is on the
    path to every apply by LSN: until it is read, 089's chain check refuses every differential and
    every full applied incrementally (089 D7) — 3 d
-4. MSSQLBAK header, block chain, block index — 1.5 d
+4. MSSQLBAK header, block chain, block index; whether the seek index after the chain gives the blocks'
+   offsets, so the chain is fetched in parallel (D3a) — 2.5 d
 5. XPRESS decoder, table-driven — 2 d
 6. ZSTD: link DuckDB's bundled `duckdb_zstd` if every platform's host exports it, else vcpkg `zstd`
    statically with hidden visibility (as OpenSSL) — 0.5 d
-7. Page index: units of every pass and family, latest copy, pads and zero units, positional check,
-   spillable storage — 3 d
-8. Allocation map and `IsLive`, several files and GAM intervals — 2 d
+7. E12: does a full backup's first pass carry exactly the GAM-allocated extents, in order (on every
+   fixture of E2, then the version matrix)? Decides whether the open pass reads every page (D4a) —
+   1.5 d
+7a. Page index (D4a): units of every pass and family, latest copy, pads and zero units, positional
+   check; the extent bitmaps and ranks with the order check and explicit runs where it breaks; the
+   header pass over parallel ranges (D3a); the search (DQ-41, E13): block resync, samples, bisection
+   over a family's groups or a container's blocks, interpolation on the block index on the rank
+   path, a `Locate` that reads, the fallback to the header scan when the order breaks — 6.5 d (4
+   before DQ-41's search, +4 d less the chain checkpoints' 1.5 d; 5 before DQ-40 moved the AU index
+   out, to task 11a)
+8. Allocation map and `IsLive`, several files and GAM intervals, PFS on demand — 2 d
 9. `mssql_backup_info`, registered through `RegisterDocumentedFunction` — 1 d
 10. Fuzz harnesses mtf / container / xpress / page; committed seed samples — 2 d
 
 **PR 2 — catalog and rows (`mssql_backup_tables`, `_views`, `_catalog`, `_scan`)**, after spec 091's
 module `src/codec/code_page/` has merged (D7)
 
+11a. IAM chain (DQ-40): an AU's IAM pages through the page store, extent bitmaps and single-page
+    slots, sequence and interval checks; the per-AU runs built at a table's first scan, buffer-managed
+    and kept in the opened backup; the header-AU check at read; the catalog's base tables read
+    through it — 2 d
 11. Boot page, bootstrap layouts table, generic base-table decoder; pin the `sysobjvalues` value
     classes DQ-11 serves (view, computed-column and default definitions; boundaries are valclass 30)
     — 4 d
@@ -839,7 +1115,8 @@ module `src/codec/code_page/` has merged (D7)
 22. Opened-file cache: staged build, key, eviction estimate — 1.5 d
 23. ATTACH: storage extension, catalog / schema / table entries, transaction manager, isolation from
     `TYPE mssql` (a test that sets every pool / optimizer counter and asserts zero) — 4 d
-24. Differential overlay and chain check — 1.5 d
+24. Differential overlay and chain check: the diff's pages by their header AU, the full's by the IAM
+    chain through the overlay (D4) — 2 d
 25. `s3://` (MinIO) and `https://` tests in the lane; measure the open pass and decide filter pushdown
     with late materialisation (a follow-up spec if it is worth it) — 2 d
 
@@ -854,7 +1131,9 @@ module `src/codec/code_page/` has merged (D7)
 29. Docs per PR: README (user-facing), `DATAMODEL.md` (a "Backup reader" layer section with the
     diagram above), CLAUDE.md (functions, settings, layout), CHANGELOG, website — 2 d
 
-**Total ≈ 69 days, 12.5–14 weeks** (66.5 before E7's partitioning model joined task 12, 68.5
+**Total ≈ 79 days, 14.5–16 weeks** (76.5 before DQ-41's search joined task 7a, +2.5 d; 75 before DQ-40's IAM chain took the AU index out of task 7a,
+−1 d, into task 11a, +2 d, and the differential's header path joined task 24, +0.5 d; 72.5 before D4a's index and E12 joined task 7, +2.5 d; 69 before
+D3a's ranged, asynchronous I/O joined tasks 2, 4 and 7, +3.5 d, both owner 2026-11-09; 66.5 before E7's partitioning model joined task 12, 68.5
 before the plain `_mssql_lob` output joined task 20 from 089 task 7, DQ-05, 69.5 before spec 091
 took the code-page tables out of task 13, −1 d, and D17's budget joined task 16, +0.5 d). Spec 091's
 days are its own, outside this total. R§8 gave phase 0 6–8 weeks; this spec also carries the
@@ -867,17 +1146,22 @@ cost.
 - **Version drift is the main risk.** Every offset above is **(2025)**. The catalog layouts (D5), the
   boot page, SCIN offsets and the MSSQLBAK header may differ on 2017–2022. The CI matrix is what turns
   each into a verified row; until a version passes, it is refused (D14).
-- **The open pass** reads the whole file once, from S3 too. A 1 TB backup is one sequential read
-  before the first row. A persisted index (a side file next to the backup) is a possible later step;
-  not proposed.
+- **The open pass**: a backup opens from its allocation and catalog pages (E12, DQ-40), found in a
+  striped or compressed pass by search (DQ-41). What stays read whole is pass 2 and a
+  differential's pass (small in the samples; a pass 2 of terabytes was not seen), and any pass
+  whose order breaks (none in 210, E13), which falls back to its header scan; the order and the
+  64 KB block are 2025's until the version matrix checks them. A saved index is a later option
+  (D4a).
 - **MS_XPRESS on older versions** may carry history across blocks (W§3; Redgate hints 2008 R2
   differs). D10 makes that a named error, not wrong data.
 - **Legacy LOB types** (`text`, `ntext`, `image`) are unverified.
 - **RCSI / snapshot version tags** (statusA 0x40) are handled by length only; no experiment ran with
   row versioning (E2§10, E3§8). ADR's in-row versions are unknown.
-- **Unlocated header fields**: backup dates, recovery model, the recovery fork. The importer tags
+- **Header fields located on 2025 only**: the backup dates, the recovery model and the recovery
+  fork are in the trailer SCIN (§ Rules), and the fork rule rests on one case. The importer tags
   snapshots with `backup_finish_date` (R§6.2) and refuses every apply by LSN until the fork id is
-  read (089 D7), so locating them is in PR 1.
+  read (089 D7), so each version of the matrix re-checks them against HEADERONLY before it is
+  accepted (D14).
 - **Appended backup sets** (`position`) were never produced.
 - **Partitioning not covered by E7** (E7§7): RANGE LEFT SPLIT / MERGE, an `ALL TO` scheme after a
   SPLIT, PAGE compression per partition, boundary types beyond those listed above, a computed

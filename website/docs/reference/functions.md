@@ -229,6 +229,26 @@ SELECT mssql_preload_catalog('sqlserver', 'dbo');
 
 The function loads metadata per-schema to avoid SQL Server tempdb sort spills on large databases. Statistics (approximate row counts) are also pre-populated to avoid per-table DMV queries.
 
+### mssql_backup_info()
+
+Describe the backup set in a SQL Server backup file, read from the file alone — no SQL Server, no
+ATTACH. Reports what `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` report. The path is one
+file, a glob or a list: every file (stripe) of one media set. See [Backup Files](../reading/backups.md)
+for what it reads, what it refuses and every column.
+
+**Signature:** `mssql_backup_info(path VARCHAR | VARCHAR[], position := 1, reread := false) -> TABLE(...)`
+
+```sql
+SELECT backup_type, database_name, first_lsn, last_lsn
+FROM mssql_backup_info('/backups/sales_full.bak');
+
+-- A striped backup: every file of the set
+SELECT * FROM mssql_backup_info(['/backups/s1.bak', '/backups/s2.bak']);
+```
+
+`position` is the backup set on the media (only `1` for now: a file holding appended sets is
+refused). `reread := true` makes a prepared statement read the file again on every `EXECUTE`.
+
 ### Authentication Test Functions
 
 Connectivity diagnostics that exercise the auth path without a full query.

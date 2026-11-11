@@ -1,5 +1,6 @@
 #include "mssql_extension.hpp"
 #include "azure/azure_test_function.hpp"
+#include "backup/backup_info_function.hpp"
 #include "catalog/mssql_preload_catalog.hpp"
 #include "catalog/mssql_refresh_function.hpp"
 #include "codec/target_string_type.hpp"
@@ -202,6 +203,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// 9. Register COPY functions (bcp format)
 	RegisterMSSQLCopyFunctions(loader);
+
+	// Spec 085: the backup reader's functions (mssql_backup_info).
+	mssql::backup::RegisterBackupInfoFunction(loader);
 
 	// Spec 060: parameterised target types (see the note above).
 	//

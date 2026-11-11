@@ -4,10 +4,12 @@
   "description": "DuckDB extension for Microsoft SQL Server using native TDS protocol",
   "dependencies": [
     "openssl",
-    "simdutf"
+    "simdutf",
+    "zstd"
   ],
   "$comment-builtin-baseline": "vcpkg 2026.06.24. Moved off 5ee5eee (openssl 3.4.1) because that baseline's version DB tops out at 3.4.1 -- vcpkg never packaged 3.4.2-3.4.6, so reaching a patched OpenSSL requires moving the baseline, not just the override.",
   "builtin-baseline": "52c9e08cdf8580d2d9762f547d22b96fd81e82f2",
+  "$comment-zstd": "Spec 085 task 6: the ZSTD blocks of a compressed backup. Pinned at the baseline's 1.5.7. Not DuckDB's bundled duckdb_zstd: its symbols are not DUCKDB_API, so a loadable extension cannot rely on the host exporting them (Windows imports only exported symbols); statically linked here, hidden by the loadable's export list like OpenSSL, and C (ZSTD_*), so it cannot collide with duckdb_zstd in the static build.",
   "$comment-overrides": "Both deps are pinned so that moving the baseline changes exactly one thing: OpenSSL. simdutf stays at 6.1.1 (the old baseline's version) even though the new baseline offers 8.2.0 -- a two-major-version codec jump does not belong in a security bump and would confound the MinGW result this change exists to test. openssl 3.5.4 is the newest 3.5.x in vcpkg; 3.5 is LTS (supported to 2030-04-08) whereas 3.4 goes EOL 2026-10-22.",
   "overrides": [
     {
@@ -17,6 +19,10 @@
     {
       "name": "simdutf",
       "version": "6.1.1"
+    },
+    {
+      "name": "zstd",
+      "version": "1.5.7"
     }
   ]
 }

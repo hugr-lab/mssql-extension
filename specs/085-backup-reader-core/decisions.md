@@ -69,8 +69,12 @@ the specs it affects. **Blocking** means the named PR cannot open until the ques
 | DQ-33 | whether the automatic policy also compacts | **decided** (owner, 2026-11-05): no, expiry only; compaction is DuckLake's own | — |
 | DQ-34 | the run id in file names | keep it | 022 |
 | DQ-35 | the helper naming family | keep as drafted | 022–024 |
-| DQ-36 | committed samples or a release asset | committed, ≤ 2 MB each, ≤ 16 MB in all | 085 PR 1 |
+| DQ-36 | committed samples or a release asset | committed, ≤ 16 MB in all; **decided** (owner, 2026-11-10): three samples over 2 MB accepted (a plain full 4.4 MB, a plain stripe 2 × 2.2 MB: a database's system tables alone are ~3 MB), 12.9 MB in all, ~3 MB in git | — |
 | DQ-37 | `backup_<component>.cpp` source names | yes | 085 PR 1 |
+| DQ-41 | how a striped or compressed pass is indexed | **decided** (owner, 2026-11-09): searched, not read (E13: every pass ascending, a container's block = one extent group); samples kept; the header scan only for pass 2, a differential's pass and a pass whose order breaks; a container is walked from known blocks by default (rows can forge a resync), resync search under `trust_layout := true` (085 D4a, task 7a) | — |
+| DQ-40 | which pages are a table's | **decided** (owner, 2026-11-09): its AU's IAM chain, walked at the table's first scan through the page store; the page header checked at read; a differential's own pages by their header AU; an ATTACH reads the headers, allocation and catalog pages only (085 D4, D4a) | — |
+| DQ-39 | what an opened backup keeps in memory | **decided** (owner, 2026-11-09): at most 0.4 MB resident per GB of backup (4 GB for 10 TB); extent bitmaps with ranks, block checkpoints, the catalog model resident; the AU index buffer-managed (replaced by DQ-40's IAM chain); page bytes not kept; a slow open is acceptable; a saved index later, as an option (085 D4a) | — |
+| DQ-38 | how the reader does I/O | **decided** (owner, 2026-11-09): coalesced ranges, fetched asynchronously and in parallel through DuckDB's I/O pool and `CachingFileSystem`, as the Parquet reader does (085 D3a) | — |
 
 ## The questions
 
@@ -157,7 +161,7 @@ R§10.4 left it open.
 Options:
 - 090 first (track A: 085 → 089 PR 1 → 090), as the mssql README's single-developer interleave does;
 - 088 first;
-- two developers on both tracks (about 34 weeks instead of 52).
+- two developers on both tracks (about 35 weeks instead of 52.5).
 
 The guard extensions of 090, each refused by name until built: ROW / PAGE compression (2–3 wk), ADR /
 RCSI (3–4 wk), DDL in the tail (1–2 wk), columnstore delta stores and bitmaps (1 wk, after 088).
@@ -573,6 +577,11 @@ Affects 022–024. It is the mssql-ducklake README's question 2.
 HEADERONLY output and golden results. Reason: `make test` and the fuzz seeds then work offline on every
 platform. Only synthetic data made on a clean instance is ever committed (T4).
 
+**Decided (owner, 2026-11-10):** the samples of `test/data/backup/` (made on a throwaway clean
+instance by its `generate.sh`) are committed as they came: 12.9 MB in all, three of them over 2 MB (a
+plain full of the smallest database is ~4.4 MB, its system tables ~3 MB), about 3 MB once git
+compresses them.
+
 ### DQ-37 — `backup_<component>.cpp` source names?
 
 **Blocks** 085 PR 1 (task 1: the skeleton). Affects 085 D16 and CLAUDE.md's file rule, which names only
@@ -580,6 +589,94 @@ platform. Only synthetic data made on a clean instance is ever committed (T4).
 
 **Recommendation: yes.** `backup_<component>.cpp` is the peer of `tds_<component>.cpp`, and CLAUDE.md's
 rule is extended to name it.
+
+### DQ-38 — How does the reader do I/O? — **DECIDED** (owner, 2026-11-09)
+
+**DECIDED: as the Parquet reader does on DuckDB 2.0. Reads are byte ranges (HTTP range requests on
+httpfs), adjacent ones coalesced, fetched as `AsyncTask`s on DuckDB's ASYNC pool from a `BLOCKED`
+table-function result, through `CachingFileSystem` / `ExternalFileCache`; the open pass fetches the
+data stream in parallel ranges, and a compressed chain too where its seek index gives the blocks'
+offsets.** Recorded as 085 D3a; +3.5 d on 085 PR 1 (tasks 2, 4, 7).
+
+The draft (D3) read positionally through the FileSystem, which on httpfs is already a range request,
+but one at a time, and the open pass as one sequential read of the whole file, the main cost of a
+backup on object storage (085 § Risks). The parsers are unchanged: they stay DuckDB-free over spans
+(D15), and only the I/O layer is DuckDB's.
+
+**Affects** 085 D3 / D9 / D17 (the fetched ranges are buffer-managed), tasks 2, 4, 7 and acceptance 8;
+089's export and 090's recovery read through the same layer.
+
+### DQ-39 — What does an opened backup keep in memory? — **DECIDED** (owner, 2026-11-09)
+
+**DECIDED: at most 0.4 MB of resident memory per GB of backup, 4 GB for a 10 TB backup. The open may
+be slow; a bind and a read must be fast.** Recorded as 085 D4a:
+- resident while open: the headers, per pass an extent bitmap with ranks (a page's place in O(1)),
+  compressed-media checkpoints every 64 blocks, the catalog model, the fuzzy status;
+- buffer-managed: the AU index (runs of live extents per allocation unit, sorted at open; replaced
+  by DQ-40's per-table IAM chain), liveness applied once and GAM / PFS dropped;
+- not kept: page bytes, decoded pages, LOB values, log records;
+- E12 decides whether the open reads every page;
+- a saved index is a later option at a path the user names (`temp_directory` does not outlive the
+  process).
+
+The draft (stage 2) kept 16 bytes per page, about 0.2 % of the backup: 20 GB for 10 TB, buffer-managed
+but far past the budget. +2.5 d on 085 PR 1 (task 7 and E12).
+
+### DQ-40 — Which pages are a table's? — **DECIDED** (owner, 2026-11-09)
+
+**DECIDED: the allocation unit's IAM chain, read through the page store, walked lazily at the table's
+first scan; the page header is the check at read, not the map; a differential's own pages are read
+by their header AU.** Recorded as 085 D4 / D4a; tasks 7a −1 d, 11a +2 d, 24 +0.5 d.
+
+D4 took the page header as the map (E2: right on 10,473 of 10,473 allocated pages), so the AU index
+needed every page's header: a 10 TB backup read whole at open, which E12's rank path had just made
+unnecessary for the extents. E2 chose the header for differentials, which lack the IAM pages of
+unchanged AUs; it did not find the IAM wrong on a live page. Through the page store a differential's
+overlay takes the full's IAM pages where its own did not change, and its own pages, indexed from
+their headers anyway, keep the header path.
+
+So an ATTACH reads the MTF headers, the allocation pages and the catalog (enough to list the schemas,
+tables and views and to bind them with `rcrows` as cardinality), and a table's first scan reads its
+IAM pages (one per 4 GB the AU spans) and then its pages. The per-AU runs are buffer-managed and kept
+for later scans; D4a's sorted AU index and the resident PFS bitmap (168 MB for 10 TB) are gone.
+A striped set is still indexed from its page headers (E12: extents split between families at run
+time), and a compressed backup still walks its block chain at open.
+
+**Affects** 085 D4 / D4a, stages 2–4a, § Resources, acceptance 12, tasks 7a / 8 / 11a / 24, § Risks;
+089's previous-owner rule already reads the base IAM images (E7); its changed-set pass over the
+page headers (089 D3) is unchanged.
+
+### DQ-41 — How is a striped or compressed pass indexed? — **DECIDED** (owner, 2026-11-09)
+
+**DECIDED: by searching it, not by reading it.** Recorded as 085 D4a and E13; task 7a +2.5 d.
+
+D4a and DQ-40 left two backups read whole at open: a striped set (its passes indexed from their page
+headers, E12 found no rank per family) and a compressed one (its chain walked, a header per ≤ 64 KB
+block, which on object storage reads most of the file). E13 found every pass of the samples
+ascending by (file, extent), 210 of 210, each family of a striped set included; in a container
+every block of a pass outputs exactly 64 KB from a unit boundary (block *k* = extent group *k*), the
+seek index names the pass boundaries, and a block is found from any offset by its next four
+plausible headers (0 wrong in 3.6 M probes). So an extent is found by bisection over a family's
+groups or a container's blocks, interpolating on the block index where the rank gives it, with the
+probes kept as samples: 6–8 requests a cold lookup on the samples, 0.4–1.9 warm; extrapolated, the
+open of a 10 TB compressed full reads about 1 GB instead of the whole file.
+
+**Amended the same day (owner, 2026-11-09), after the review of the search:** a block found by
+resync from an arbitrary offset can be forged by row data (a stored block carries row bytes
+verbatim, so four chained fake headers in a row take a probe; reproduced). By default a container
+is therefore not resynced: its groups are read at their data-set offsets through the chain walked
+lazily from its start or a seek index entry (checkpoints kept), the search gallops from the nearest
+walked sample, and the GAMs are read per interval when first needed, not at ATTACH; a first scan
+deep in the file walks the chain to it. The ATTACH option `trust_layout := true` turns E13's resync
+search on, for backups whose row data is trusted. A striped set of plain files is unaffected (its
+groups are at computed offsets).
+
+The order is checked by every probe; a pass whose order breaks falls back to its header scan.
+Pass 2 and a differential's pass stay header-scanned (small; a differential's yields DQ-40's
+`(AU, page)` pairs). The chain walk stays for that fallback and `verify`.
+
+**Affects** 085 D4a, stage 2, the block index (now samples), § Rules (MSSQLBAK), § Resources,
+acceptance 12, task 7a, § Risks.
 
 ## Settled during the consistency pass (no question)
 

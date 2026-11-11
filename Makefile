@@ -35,7 +35,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check crap-cpp crap-cpp-selftest help
+.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay fuzz-backup-replay check-credential-logging leak-check crap-cpp crap-cpp-selftest help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -652,6 +652,18 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_ddl_translator.cpp \
     test/cpp/test_ctas_type_mapping.cpp \
     test/cpp/test_login_retry.cpp \
+    test/cpp/backup/test_backup_allocation.cpp \
+    test/cpp/backup/test_backup_bytes.cpp \
+    test/cpp/backup/test_backup_container.cpp \
+    test/cpp/backup/test_backup_info.cpp \
+    test/cpp/backup/test_backup_mtf.cpp \
+    test/cpp/backup/test_backup_open_pass.cpp \
+    test/cpp/backup/test_backup_page_index.cpp \
+    test/cpp/backup/test_backup_pass_search.cpp \
+    test/cpp/backup/test_backup_ranges.cpp \
+    test/cpp/backup/test_backup_source.cpp \
+    test/cpp/backup/test_backup_xpress.cpp \
+    test/cpp/backup/test_backup_zstd.cpp \
     test/cpp/test_catalog_filter.cpp \
     test/cpp/test_filter_encoder.cpp \
     test/cpp/test_statistics_provider.cpp \
@@ -695,7 +707,8 @@ STANDALONE_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
 STANDALONE_TEST_INCLUDES := -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include
 STANDALONE_TEST_VCPKG_LIB := $(firstword $(wildcard build/release/vcpkg_installed/*/lib))
 # The vcpkg include dir is for test_tls_verification.cpp (spec 074), whose
-# in-process server is written against OpenSSL directly. Appended here, after
+# in-process server is written against OpenSSL directly, and for the backup tests' zstd (spec 085;
+# DuckDB's own zstd.h is not on this path). Appended here, after
 # the lib dir it is derived from, because both are simply-expanded.
 STANDALONE_TEST_INCLUDES += -I $(STANDALONE_TEST_VCPKG_LIB)/../include
 STANDALONE_TEST_UNAME := $(shell uname -s)
@@ -735,7 +748,7 @@ test-cpp-run:
 	libs="build/release/extension/mssql/libmssql_extension.a build/release/src/libduckdb_static.a \
 	      $$(find build/release/extension build/release/third_party -name '*.a' 2>/dev/null | grep -v mssql | tr '\n' ' ') \
 	      build/release/src/libduckdb_static.a \
-	      $(STANDALONE_TEST_VCPKG_LIB)/libssl.a $(STANDALONE_TEST_VCPKG_LIB)/libcrypto.a $(STANDALONE_TEST_VCPKG_LIB)/libsimdutf.a"; \
+	      $(STANDALONE_TEST_VCPKG_LIB)/libssl.a $(STANDALONE_TEST_VCPKG_LIB)/libcrypto.a $(STANDALONE_TEST_VCPKG_LIB)/libsimdutf.a $(STANDALONE_TEST_VCPKG_LIB)/libzstd.a"; \
 	for f in $(STANDALONE_TEST_SOURCES); do \
 		n=$$(basename $$f .cpp); \
 		$(CXX) $(STANDALONE_TEST_FLAGS) $(STANDALONE_TEST_INCLUDES) $$f \
@@ -1182,7 +1195,7 @@ else
 PIN_TEST_VCPKG_LIB = $(PIN_TEST_VCPKG)/$(PIN_TEST_TRIPLET)/lib
 endif
 PIN_TEST_LIBS = build/$(PIN_TEST_BUILD)/extension/mssql/libmssql_extension.a \
-    $(PIN_TEST_VCPKG_LIB)/libssl.a $(PIN_TEST_VCPKG_LIB)/libcrypto.a $(PIN_TEST_VCPKG_LIB)/libsimdutf.a \
+    $(PIN_TEST_VCPKG_LIB)/libssl.a $(PIN_TEST_VCPKG_LIB)/libcrypto.a $(PIN_TEST_VCPKG_LIB)/libsimdutf.a $(PIN_TEST_VCPKG_LIB)/libzstd.a \
     -L build/$(PIN_TEST_BUILD)/src -lduckdb -ldl -pthread
 ifeq ($(shell uname -s),Darwin)
 PIN_TEST_LIBS += -framework GSS -framework Security -framework CoreFoundation \
@@ -1398,6 +1411,16 @@ fuzz-encode-replay: release
 	@echo "Replaying the BCP/PLP encode corpus..."
 	DYLD_LIBRARY_PATH=$(FUZZ_DUCKDB_LIB) LD_LIBRARY_PATH=$(FUZZ_DUCKDB_LIB) \
 	    $(PROJ_DIR)fuzz/out/fuzz_bcp_encode $(PROJ_DIR)fuzz/corpus/bcp_encode
+# The backup reader's harnesses (spec 085 task 10) replayed over their stored corpora: DuckDB-free,
+# so no release build is needed. Discovery is fuzz/run.sh's; this is the regression run, and the
+# Linux leak-check lane replays the same corpora under ASan + LSan. The corpora are synthetic
+# (fuzz/gen_backup_seeds.cc): no backup of a server whose data is not ours (spec 085 T4).
+fuzz-backup-replay:
+	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page" \
+	    $(PROJ_DIR)fuzz/build.sh
+	@for t in backup_mtf backup_container backup_xpress backup_page; do \
+	    $(PROJ_DIR)fuzz/out/fuzz_$$t $(PROJ_DIR)fuzz/corpus/$$t || exit 1; \
+	done
 # LeakSanitizer over the DuckDB-free fuzz harnesses' stored corpora
 # (scripts/ci/leak_check.sh). LSan ships inside ASan and is ON BY DEFAULT on
 # Linux; the one lane that would run it passes detect_leaks=0, because libduckdb
@@ -1453,6 +1476,7 @@ help:
 	@echo "  make joern-scan           - Run the Joern query suite (JOERN_QUERY=q3 for one query)"
 	@echo "  make joern-shell          - Open the Joern REPL on the CPG"
 	@echo "  make fuzz-encode-replay   - Replay the BCP/PLP encode corpus under ASan+UBSan (fuzz/README.md)"
+	@echo "  make fuzz-backup-replay   - Replay the backup reader's corpora (mtf, container, xpress, page)"
 	@echo "  make leak-check           - LeakSanitizer over the DuckDB-free fuzz corpora (Linux only)"
 	@echo "  make check-credential-logging - Gate: no credential value reaches a log, exception or format call"
 	@echo "  make test-all             - Run all tests"
