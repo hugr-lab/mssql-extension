@@ -1369,7 +1369,11 @@ per-AU runs and parallel units (2e), off-row values (PR 3), `mssql_backup_column
 24. Differential overlay and chain check: the diff's pages by their header AU, the full's by the IAM
     chain through the overlay (D4) — 2 d
 25. `s3://` (MinIO) and `https://` tests in the lane; measure the open pass and decide filter pushdown
-    with late materialisation (a follow-up spec if it is worth it) — 2 d
+    with late materialisation (a follow-up spec if it is worth it) — 2 d. Owner, 2026-11-11: the
+    scan is to make filtering cheap enough for an importer that exports a table with a filter over
+    it (mssql-ducklake spec 025, frozen history, on a daily differential): pushdown of a filter on
+    `_mssql_page_lsn` / `_mssql_page` (pages skipped unread) and on a column, for now the importer
+    reads the table whole; a filter in 089's export (`exclude_upto`) stays an acceptable alternative.
 
 **PR 5 — fuzzy status**
 
