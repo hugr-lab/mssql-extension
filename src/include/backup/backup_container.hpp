@@ -117,7 +117,7 @@ std::vector<uint8_t> ReadContainerTape(const RandomAccess &file, const BlockDeco
 
 //! The data set as a RandomAccess over the container: a read finds its blocks through the chain
 //! and decodes them (stored blocks are copied; compressed ones go to `decoder`, which may be
-//! empty until tasks 5 / 6, then refused by name). Keeps the last decoded block per instance and
+//! empty until tasks 5 / 6, then refused by name). Keeps the last decoded blocks per instance and
 //! serialises its readers: it serves the header walks (SSET .. MSCI, the trailer). The open pass
 //! and the scan decode blocks on their own threads (D10), each with its own buffer (task 7).
 class ContainerStream : public RandomAccess {
@@ -143,7 +143,15 @@ public:
 	}
 
 private:
-	void Decode(const ChainBlock &block) const;
+	struct DecodedBlock {
+		ChainBlock block;
+		bool valid = false;
+		std::vector<uint8_t> output;
+	};
+	//! `block` decoded, from the recent blocks when it is one of them, else into the oldest slot.
+	const DecodedBlock &Decoded(const ChainBlock &block) const;
+	//! The recent block holding data-set offset `logical`, or null.
+	const DecodedBlock *Recent(uint64_t logical) const;
 	//! The block of `logical`: walked from its checkpoint, adding checkpoints as WalkChain would.
 	ChainBlock Locate(uint64_t logical) const;
 
@@ -152,9 +160,25 @@ private:
 	BlockDecoder decoder_;
 	std::string name_;
 	mutable std::mutex lock_;
-	mutable ChainBlock cached_;
-	mutable bool has_cached_ = false;
-	mutable std::vector<uint8_t> cached_output_;
+	//! The last RECENT_BLOCKS blocks decoded (1 MiB): a search reads a window of 16 groups and the
+	//! pages it found are then read from the same blocks, which would otherwise be decoded twice
+	//! (measured on the large fixture's MS_XPRESS heap: decoding was then the scan's whole cost).
+	static constexpr size_t RECENT_BLOCKS = 16;
+	mutable std::vector<DecodedBlock> recent_ = std::vector<DecodedBlock>(RECENT_BLOCKS);
+	mutable size_t next_slot_ = 0;
+	//! The blocks the last RECENT_LOCATED Locates returned: a later offset in the same span between
+	//! checkpoints is walked to from the nearest of them at or before it, not from the checkpoint.
+	//! In a well-compressed container a checkpoint's span holds ~1600 blocks (one checkpoint per MiB
+	//! of the file, a 64 KB block of pages compressing to ~600 bytes), and a search's probes step back
+	//! and forth within it (measured: a 530k-row heap of the large fixture, 527 s, 94% of it walking
+	//! headers). Kept apart from the chain's checkpoints, whose count D4a bounds.
+	static constexpr size_t RECENT_LOCATED = 64;
+	struct Located {
+		ChainBlock block;
+		uint64_t since = 0;	 // blocks walked past the checkpoint before it, for CHECKPOINT_STRIDE
+	};
+	mutable std::vector<Located> located_;
+	mutable size_t next_located_ = 0;
 };
 
 }  // namespace backup
