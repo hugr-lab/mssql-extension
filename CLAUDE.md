@@ -106,6 +106,9 @@ make test-code-page     # Code-page kernels vs the committed server data (spec 0
                         # SQL Server, no DuckDB); test-code-page-portable = SWAR form
 make bench-code-page    # Code-page kernel microbenchmark (manual, not in CI)
 make code-pages-check-wire   # Every collation's wire key against a live server (spec 092 D1)
+make crap-cpp           # CRAP per C++ function (lizard + an LCOV report; crapper reads
+                        # no C++, and nothing computes CRAP for it). Complexity only
+                        # without LCOV=<file>; make crap-cpp-selftest needs neither
 make bench-code-page-column  # One 2048-row column, staging to vector: DecodeColumn vs today's
                         # NVARCHAR path (needs a release build; CELL=thai filters cells)
 make test-backup-golden # mssql_backup_info vs the samples' golden RESTORE output, every field (spec 085)
