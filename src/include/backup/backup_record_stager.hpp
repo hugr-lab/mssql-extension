@@ -57,7 +57,9 @@ public:
 	//! column's default and the physical places can differ by partition). A column the layout does not
 	//! hold where its type says, or a default of another width, is a FormatError naming it.
 	void UseLayout(const RowsetLayout &layout);
-	//! Start a chunk that FinalizeChunk will publish into `out` (Types()' columns, flat and empty).
+	//! Start a chunk that FinalizeChunk will publish into `targets` (one flat, empty vector of Types()
+	//! per column, in order), or into `out`'s first Types().size() vectors.
+	void BeginChunk(const std::vector<Vector *> &targets);
 	void BeginChunk(DataChunk &out);
 	//! Stage one record of the layout's rowset (a primary or a forwarded record). A value stored off
 	//! row (row-overflow, a LOB) is a FormatError naming the column until PR 3; a record the layout
@@ -74,7 +76,9 @@ public:
 	bool Full() const {
 		return count_ == STANDARD_VECTOR_SIZE || payload_bytes_ >= codec::staging::STAGING_CHUNK_PAYLOAD_BUDGET_BYTES;
 	}
-	//! Publish the staged rows into `out` (the DataChunk BeginChunk was given) and set its cardinality.
+	//! Publish the staged rows into the vectors BeginChunk was given; the caller sets its chunk's
+	//! cardinality (Count()). The DataChunk form sets it.
+	void FinalizeChunk();
 	void FinalizeChunk(DataChunk &out);
 
 private:
@@ -96,6 +100,7 @@ private:
 	std::vector<Column> columns_;
 	vector<LogicalType> types_;
 	codec::staging::StagingArena arena_;
+	std::vector<Vector *> targets_;
 	const RowsetLayout *layout_ = nullptr;
 	idx_t count_ = 0;
 	idx_t payload_bytes_ = 0;

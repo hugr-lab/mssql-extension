@@ -1,0 +1,125 @@
+# name: test/sql/backup/mssql_backup_scan.test
+# description: mssql_backup_scan over the committed samples (spec 085 PR 2d)
+# group: [mssql]
+#
+# The samples are synthetic (test/backup/gen/samples.sql): dbo.items (a clustered primary key, 2000
+# rows) and dbo.events (a heap, 3000 rows), whose values are expressions of their id, checked here
+# whole. Every fixture of the oracle lane is compared with RESTORE + TYPE mssql there
+# (test/backup/compare_rows.py). No SQL Server is needed.
+
+require mssql
+
+# items: every value its samples.sql expression.
+query IIIIIII
+SELECT count(*),
+       count(*) FILTER (WHERE name = 'item ' || id || ' ' || chr(233 + id % 7)),
+       count(*) FILTER (WHERE (code IS NULL) = (id % 5 = 0) AND (code IS NULL OR code = 'C' || (id % 997))),
+       count(*) FILTER (WHERE price = id * 1.25),
+       count(*) FILTER (WHERE created = TIMESTAMP_MS '2026-01-01 00:00:00' + to_seconds(id * 37)),
+       count(*) FILTER (WHERE flag = (id % 2 = 1)),
+       count(*) FILTER (WHERE (blob IS NULL) = (id % 3 <> 0) AND (blob IS NULL OR octet_length(blob) = 32))
+FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items');
+----
+2000	2000	2000	2000	2000	2000	2000
+
+# events, a heap: its datetime and its NULL notes.
+query IIII
+SELECT count(*),
+       count(*) FILTER (WHERE item_id = 1 + event_id % 2000),
+       count(*) FILTER (WHERE (note IS NULL) = (event_id % 4 = 0) AND (note IS NULL OR note = 'event ' || event_id)),
+       count(*) FILTER (WHERE "at" = TIMESTAMP '2026-02-01 00:00:00' + to_minutes(event_id))
+FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events');
+----
+3000	3000	3000	3000
+
+# The types are D6's, as mssql_backup_tables reports them.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items'));
+----
+id	INTEGER
+name	VARCHAR
+code	VARCHAR
+price	DECIMAL(12,2)
+created	TIMESTAMP_MS
+flag	BOOLEAN
+blob	BLOB
+
+# A projection, out of order.
+query II
+SELECT count(*), sum(event_id) FROM (SELECT note, event_id FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events'));
+----
+3000	4501500
+
+# count(*) decodes no column of the table (DuckDB's empty column, not the first one).
+query I
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items');
+----
+2000
+
+query II
+EXPLAIN SELECT count(*) FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items');
+----
+physical_plan	<!REGEX>:.*Projections: id.*
+
+# Only virtual columns: a row's page and identity, with no column of the table.
+query II
+SELECT count(*), count(DISTINCT _mssql_page) FROM (SELECT _mssql_page, _mssql_rid FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items'));
+----
+2000	18
+
+# The virtual columns (D8): a heap row's _mssql_rid is 0x00 ‖ u32 page ‖ u16 file ‖ u16 slot (its
+# %%physloc%% after the shape byte), a clustered row's 0x01 ‖ u16 length ‖ its key's bytes;
+# _mssql_page is 01 ‖ file ‖ page in 14 hex digits, the row's page -- for a heap row that has not
+# moved, the page its rid names; _mssql_page_lsn its page's LSN, at most the set's last.
+query IIIII
+SELECT count(DISTINCT _mssql_rid), bool_and(substr(hex(_mssql_rid), 1, 2) = '00' AND octet_length(_mssql_rid) = 9),
+       bool_and(length(_mssql_page) = 14 AND _mssql_page LIKE '010001%'),
+       bool_and(_mssql_page = '01' || substr(hex(_mssql_rid), 13, 2) || substr(hex(_mssql_rid), 11, 2) ||
+                substr(hex(_mssql_rid), 9, 2) || substr(hex(_mssql_rid), 7, 2) || substr(hex(_mssql_rid), 5, 2) ||
+                substr(hex(_mssql_rid), 3, 2)),
+       bool_and(_mssql_page_lsn <= (SELECT last_lsn FROM mssql_backup_info('test/data/backup/full.bak')))
+FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events');
+----
+3000	true	true	true	true
+
+query IIT
+SELECT count(DISTINCT _mssql_rid), bool_and(octet_length(_mssql_rid) = 7),
+       max(_mssql_rid) FILTER (WHERE id = 1)
+FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items');
+----
+2000	true	\x01\x04\x00\x01\x00\x00\x00
+
+# Uncompressed, MS_XPRESS and striped backups of one database give identical rows (acceptance 3, 4).
+query II
+SELECT
+    (SELECT count(*) FROM (
+        SELECT *, _mssql_rid FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items')
+        EXCEPT ALL SELECT *, _mssql_rid FROM mssql_backup_scan('test/data/backup/full_xpress.bak', 'dbo', 'items'))),
+    (SELECT count(*) FROM (
+        SELECT *, _mssql_rid FROM mssql_backup_scan(['test/data/backup/stripe_1.bak', 'test/data/backup/stripe_2.bak'], 'dbo', 'events')
+        EXCEPT ALL SELECT *, _mssql_rid FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events')));
+----
+0	0
+
+# The catalog's row count is an estimate, never a maximum: a LIMIT past it stays in the plan (a maximum
+# would let DuckDB drop it, and the count is approximate).
+query II
+EXPLAIN SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events') LIMIT 3001;
+----
+physical_plan	<REGEX>:.*Limit: 3001.*~3,000 rows.*
+
+# Refused by name: a table the backup does not have, NULL arguments, a log backup.
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'nope');
+----
+the backup has no table dbo.nope
+
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', NULL, 'items');
+----
+must not be NULL
+
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/log.trn', 'dbo', 'items');
+----
+mssql_backup_scan:

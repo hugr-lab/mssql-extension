@@ -235,9 +235,22 @@ void RecordStager::UseLayout(const RowsetLayout &layout) {
 }
 
 void RecordStager::BeginChunk(DataChunk &out) {
+	std::vector<Vector *> targets;
+	for (size_t i = 0; i < columns_.size(); i++) {
+		targets.push_back(&out.data[i]);
+	}
+	BeginChunk(targets);
+}
+
+void RecordStager::BeginChunk(const std::vector<Vector *> &targets) {
+	if (targets.size() != columns_.size()) {
+		throw InternalException("backup: RecordStager::BeginChunk with %d vectors for %d columns",
+								static_cast<int>(targets.size()), static_cast<int>(columns_.size()));
+	}
+	targets_ = targets;
 	for (size_t i = 0; i < columns_.size(); i++) {
 		uint8_t *direct = columns_[i].ops.direct_write
-							  ? reinterpret_cast<uint8_t *>(FlatVector::GetDataMutable(out.data[i]))
+							  ? reinterpret_cast<uint8_t *>(FlatVector::GetDataMutable(*targets_[i]))
 							  : nullptr;
 		arena_.Column(i).BeginChunk(direct);
 	}
@@ -332,15 +345,19 @@ void RecordStager::Append(const RecordView &record) {
 }
 
 void RecordStager::FinalizeChunk(DataChunk &out) {
+	FinalizeChunk();
+	out.SetChildCardinality(count_);
+}
+
+void RecordStager::FinalizeChunk() {
 	if (spoiled_) {
 		throw InternalException("backup: RecordStager::FinalizeChunk on a chunk spoiled by an error");
 	}
 	for (size_t i = 0; i < columns_.size(); i++) {
 		const ColumnStaging &st = arena_.Column(i);
-		codec::staging::FinalizeStagedColumn(columns_[i].ops.kernel, st, count_, columns_[i].meta, out.data[i]);
-		codec::staging::PublishStagedValidity(st, count_, out.data[i]);
+		codec::staging::FinalizeStagedColumn(columns_[i].ops.kernel, st, count_, columns_[i].meta, *targets_[i]);
+		codec::staging::PublishStagedValidity(st, count_, *targets_[i]);
 	}
-	out.SetChildCardinality(count_);
 	arena_.EndChunk();
 }
 

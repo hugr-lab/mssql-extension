@@ -276,6 +276,19 @@ SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak');
 SELECT id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs');
 ```
 
+### mssql_backup_scan()
+
+A user table's rows from a SQL Server full backup, with no SQL Server, typed as `TYPE mssql` reads
+them; virtual columns `_mssql_page`, `_mssql_rid` and `_mssql_page_lsn`. See
+[Backup Files](../reading/backups.md#rows).
+
+**Signature:** `mssql_backup_scan(path VARCHAR | VARCHAR[], schema VARCHAR, table VARCHAR) -> TABLE(...)`
+
+```sql
+SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');
+SELECT _mssql_page, _mssql_rid, order_id FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');
+```
+
 ### Authentication Test Functions
 
 Connectivity diagnostics that exercise the auth path without a full query.

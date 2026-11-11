@@ -334,7 +334,7 @@ jobs:
     # were stored, or one version failing): a version with no DONE fails its own leg, by name.
     if: ${{ always() && needs.key.outputs.enabled == 'true' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -377,6 +377,28 @@ jobs:
         run: |
           python3 -I test/backup/compare_catalog.py --duckdb cli/duckdb --require-done \
             "s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}"
+      # Spec 085 PR 2d: every quiet full set restored on a server of its version (images.txt's, by
+      # digest) and its tables compared with mssql_backup_scan through TYPE mssql (compare_rows.sh).
+      - name: mssql_backup_scan against RESTORE + TYPE mssql
+        if: ${{ !cancelled() }}
+        env:
+          MSSQL_R2_ACCESS_KEY: ${{ secrets.MSSQL_R2_ACCESS_KEY }}
+          MSSQL_R2_ACCESS_SECRET_KEY: ${{ secrets.MSSQL_R2_ACCESS_SECRET_KEY }}
+          MSSQL_R2_URL: ${{ secrets.MSSQL_R2_URL }}
+          MSSQL_R2_BUCKET_NAME: ${{ vars.MSSQL_R2_BUCKET_NAME || secrets.MSSQL_R2_BUCKET_NAME }}
+          QUIET: full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full
+        run: |
+          export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
+                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
+          prefix="s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}"
+          run="$(aws s3 cp "${prefix}/DONE" - | tr -d '[:space:]')" || true
+          [ -n "${run}" ] || { echo "not stored: no DONE under ${prefix} (its generate leg failed or never ran)"; exit 1; }
+          dir="${RUNNER_TEMP}/rows"
+          mkdir -p "${dir}"
+          include=(--exclude '*' --include sets.txt)
+          for s in ${QUIET}; do include+=(--include "${s}.bak" --include "${s}.filelistonly.txt"); done
+          aws s3 cp --recursive --only-show-errors "${include[@]}" "${prefix}/${run}/" "${dir}/"
+          VERSION=${{ matrix.version }} DUCKDB=cli/duckdb test/backup/compare_rows.sh "${dir}"
 
   cleanup:
     name: Remove sets no run reads

@@ -2,6 +2,7 @@
 #include "azure/azure_test_function.hpp"
 #include "backup/backup_catalog_function.hpp"
 #include "backup/backup_info_function.hpp"
+#include "backup/backup_scan_function.hpp"
 #include "backup/backup_tables_function.hpp"
 #include "catalog/mssql_preload_catalog.hpp"
 #include "catalog/mssql_refresh_function.hpp"
@@ -210,6 +211,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	mssql::backup::RegisterBackupInfoFunction(loader);
 	mssql::backup::RegisterBackupTablesFunctions(loader);
 	mssql::backup::RegisterBackupCatalogFunction(loader);
+	mssql::backup::RegisterBackupScanFunction(loader);
 
 	// Spec 060: parameterised target types (see the note above).
 	//

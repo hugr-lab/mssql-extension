@@ -12,6 +12,7 @@
 #pragma once
 
 #include "backup/backup_catalog_model.hpp"
+#include "backup/backup_lsn.hpp"
 #include "backup/backup_sql_variant.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -47,6 +48,10 @@ Value GuidValue(const std::string &bytes, const std::string &what);
 //! offset outside +-14:00), a time(7) / datetimeoffset(7) with a 100 ns digit (not cut to the
 //! microsecond), a code page with no table or a base type this does not read.
 Value SqlVariantValue(const SqlVariant &variant, const std::string &what);
+
+//! An LSN in RESTORE HEADERONLY's numeric form (vlf, then block in 10 digits, then slot in 5), a
+//! DECIMAL(25, 0): mssql_backup_info's LSNs and the scan's _mssql_page_lsn.
+Value LsnValue(const Lsn &lsn);
 
 //! How the scan reads column `c` (owner, 2026-11-11: no refusal by type). A type the reader converts
 //! takes the DuckDB type TYPE mssql reads it as with native types off (D6: MapSQLServerTypeToDuckDB on

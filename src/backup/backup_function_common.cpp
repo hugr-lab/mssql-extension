@@ -380,6 +380,15 @@ ColumnReading ReadingOf(const CatalogColumn &c) {
 	return r;
 }
 
+Value LsnValue(const Lsn &lsn) {
+	// HEADERONLY's form: vlf, then block in 10 digits, then slot in 5 (< 10^25).
+	const hugeint_t value =
+		hugeint_t(static_cast<int64_t>(lsn.vlf)) * hugeint_t(static_cast<int64_t>(1000000000000000LL)) +
+		hugeint_t(static_cast<int64_t>(lsn.block)) * hugeint_t(static_cast<int64_t>(100000)) +
+		hugeint_t(static_cast<int64_t>(lsn.slot));
+	return Value::DECIMAL(value, 25, 0);
+}
+
 }  // namespace backup
 }  // namespace mssql
 }  // namespace duckdb
