@@ -35,7 +35,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check help
+.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay check-credential-logging leak-check crap-cpp crap-cpp-selftest help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -849,6 +849,27 @@ bench-utf16: release
 #   make bench-code-page-tiers     the single-byte kernel's time per tier (ns per 32 bytes)
 # Both tests compile -std=c++17, the standard the extension builds at (DuckDB requires it), and run in CI's
 # cpp-unit-tests job on Linux and macOS.
+# CRAP for the C++ (CC2 x (1 - coverage)3 + CC), which `crapper` does not read -- it
+# covers Clojure, Java, Go, TypeScript, Rust, Python and Scala, and no tool computes
+# CRAP for C++ at all. `tools/crap/crap_cpp.py` joins the two halves that do exist:
+# lizard's complexity (`uv tool install lizard`) and an LCOV report.
+#   make crap-cpp                  complexity only; CRAP is what it would be at 0%
+#                                  coverage (CC2 + CC), which is the floor until this
+#                                  repository grows an instrumented build
+#   make crap-cpp LCOV=x.lcov      the real score, from `llvm-cov export -format=lcov`
+#   make crap-cpp PATHS=src/tds    one subtree
+#   make crap-cpp-selftest         the tool's own joins and arithmetic; no lizard, no lcov
+# Exits 2 when anything is at or above CRAP 10 (CRAP_THRESHOLD), so it can gate.
+CRAP_PATHS ?= src
+CRAP_THRESHOLD ?= 10
+
+crap-cpp:
+	@python3 tools/crap/crap_cpp.py --threshold $(CRAP_THRESHOLD) \
+	    $(if $(LCOV),--lcov $(LCOV),) $(if $(JSON),--json $(JSON),) $(or $(PATHS),$(CRAP_PATHS))
+
+crap-cpp-selftest:
+	@python3 tools/crap/crap_cpp.py --selftest
+
 CODE_PAGE_SOURCES := src/codec/code_page/code_page.cpp src/codec/code_page/code_page_avx2.cpp \
     src/codec/code_page/code_page_avx512.cpp \
     src/codec/code_page/code_page_tables.cpp
