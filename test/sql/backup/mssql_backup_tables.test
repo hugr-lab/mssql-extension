@@ -1,0 +1,81 @@
+# name: test/sql/backup/mssql_backup_tables.test
+# description: mssql_backup_tables / mssql_backup_views over the committed samples (spec 085 PR 2b)
+# group: [mssql]
+#
+# The samples are synthetic (test/backup/gen/samples.sql): dbo.items (a clustered primary key) and
+# dbo.events (a heap), no view. The column types are the ones TYPE mssql gives (spec 085 D6). The
+# catalog fixture's richer shapes are compared with the server's own catalog in the oracle lane
+# (test/backup/compare_catalog.py). No SQL Server is needed.
+
+require mssql
+
+query TTITTIITTI
+SELECT schema_name, table_name, object_id > 0, shape, compression, partition_count, row_count, decodable, reason,
+       len(columns)
+FROM mssql_backup_tables('test/data/backup/full.bak') ORDER BY table_name;
+----
+dbo	events	1	heap	none	1	3000	true	NULL	4
+dbo	items	1	clustered	none	1	2000	true	NULL	7
+
+# Every form of the full lists the same tables.
+query TI
+SELECT table_name, row_count FROM mssql_backup_tables(['test/data/backup/stripe_zstd_1.bak', 'test/data/backup/stripe_zstd_2.bak'])
+ORDER BY table_name;
+----
+events	3000
+items	2000
+
+query ITTTTITT
+SELECT c.column_id, c.name, c.sql_type, c.duckdb_type, c.collation, c.code_page, c.is_nullable, c.decodable
+FROM (SELECT unnest(columns) AS c FROM mssql_backup_tables('test/data/backup/full_xpress.bak') WHERE table_name = 'items');
+----
+1	id	int	INTEGER	NULL	NULL	false	true
+2	name	nvarchar(40)	VARCHAR	SQL_Latin1_General_CP1_CI_AS	1252	false	true
+3	code	varchar(12)	VARCHAR	SQL_Latin1_General_CP1_CI_AS	1252	true	true
+4	price	decimal(12,2)	DECIMAL(12,2)	NULL	NULL	false	true
+5	created	datetime2(3)	TIMESTAMP_MS	NULL	NULL	false	true
+6	flag	bit	BOOLEAN	NULL	NULL	false	true
+7	blob	varbinary(64)	BLOB	NULL	NULL	true	true
+
+# A table's allocation units: one in-row unit, its IAM chain's first page named; no live-page count
+# before the scan walks the chain (DQ-40).
+query TITTT
+SELECT a.type, a.index_id, a.first_iam_page IS NOT NULL, a.au_id > 0, a.live_pages IS NULL
+FROM (SELECT unnest(allocation_units) AS a FROM mssql_backup_tables('test/data/backup/full.bak') WHERE table_name = 'events');
+----
+IN_ROW_DATA	0	true	true	true
+
+# The dates: created before modified or with it, within the day the samples were made.
+query T
+SELECT bool_and(created <= modified AND created >= TIMESTAMP '2026-01-01') FROM mssql_backup_tables('test/data/backup/full.bak');
+----
+true
+
+# Not yet located: NULL, never guessed.
+query TTTT
+SELECT bool_and(fuzzy_status IS NULL), bool_and(open_transactions IS NULL), bool_and(stale_transactions IS NULL),
+       bool_and(partitioning IS NULL)
+FROM mssql_backup_tables('test/data/backup/full.bak');
+----
+true	true	true	true
+
+query I
+SELECT count(*) FROM mssql_backup_views('test/data/backup/full.bak');
+----
+0
+
+# A differential is read over its full (not yet), and a log backup holds no data pages.
+statement error
+SELECT * FROM mssql_backup_tables('test/data/backup/diff.bak');
+----
+is a differential backup
+
+statement error
+SELECT * FROM mssql_backup_views('test/data/backup/log.trn');
+----
+mssql_backup_views: backup file "test/data/backup/log.trn" is a log backup
+
+statement error
+SELECT * FROM mssql_backup_tables(NULL::VARCHAR);
+----
+the path is NULL

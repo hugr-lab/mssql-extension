@@ -1,0 +1,122 @@
+# name: test/sql/backup/mssql_backup_catalog.test
+# description: mssql_backup_catalog over the committed samples (spec 085 PR 2b): the allow-listed base tables, their rows, _mssql_page / _mssql_rid
+# group: [mssql]
+#
+# The samples are synthetic (test/backup/gen/samples.sql). No SQL Server is needed.
+
+require mssql
+
+# A big-endian hex string of n bytes, as its little-endian byte order.
+statement ok
+CREATE MACRO le(h, n) AS list_reduce(list_transform(range(n), lambda i: substr(h, (n - i - 1) * 2 + 1, 2)), lambda a, b: a || b);
+
+# The base tables served, each with its rowset's row count (= the rows served), NULL for the two
+# served by value class.
+query TT
+SELECT base_table, CASE WHEN row_count IS NULL THEN 'filtered' WHEN row_count > 0 THEN 'rows' ELSE 'empty' END
+FROM mssql_backup_catalog('test/data/backup/full.bak') ORDER BY base_table;
+----
+sysallocunits	rows
+sysclsobjs	rows
+syscolpars	rows
+sysidxstats	rows
+sysiscols	rows
+sysobjvalues	filtered
+sysrowsets	rows
+sysrscols	rows
+sysscalartypes	rows
+sysschobjs	rows
+sysseobjvalues	filtered
+syssingleobjrefs	rows
+systypedsubobjs	empty
+
+query T
+SELECT bool_and(l.row_count = (SELECT count(*) FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysschobjs')))
+FROM mssql_backup_catalog('test/data/backup/full.bak') l WHERE l.base_table = 'sysschobjs';
+----
+true
+
+# Two base tables in one statement each read their own (the calls differ by their parameters).
+query II
+SELECT (SELECT count(*) FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysschobjs')),
+       (SELECT count(*) FROM mssql_backup_catalog('test/data/backup/full.bak', 'syscolpars'));
+----
+2909	1280
+
+# A base table's key columns, by ordkey (sysrscols' own: rsid, then hbcolid).
+query TI
+SELECT c.name, c.key_ordinal FROM (SELECT unnest(columns) AS c FROM mssql_backup_catalog('test/data/backup/full.bak')
+WHERE base_table = 'sysrscols') WHERE c.key_ordinal IS NOT NULL ORDER BY 2;
+----
+rsid	1
+hbcolid	2
+
+# Rows typed by the table's own description; the user tables are there with their schema and type.
+query TIT
+SELECT name, nsid, type FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysschobjs')
+WHERE name IN ('items', 'events') AND nsid = 1 ORDER BY name;
+----
+events	1	U 
+items	1	U 
+
+# The virtual columns: not in SELECT *, there when named. _mssql_page is '01' + file + page (14 hex
+# digits); _mssql_rid is 0x01 then the key: sysschobjs' is id, an int (u16 length 4 + its 4 bytes).
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysschobjs'))
+WHERE column_name LIKE '\_mssql\_%' ESCAPE '\';
+----
+0
+
+query TTT
+SELECT bool_and(_mssql_page SIMILAR TO '01[0-9A-F]{12}'), bool_and(octet_length(_mssql_rid) = 7),
+       bool_and(hex(_mssql_rid) = '010400' || substr(h, 7, 2) || substr(h, 5, 2) || substr(h, 3, 2) || substr(h, 1, 2))
+FROM (SELECT *, printf('%08X', id::BIGINT & 4294967295) AS h, _mssql_page, _mssql_rid
+      FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysschobjs'));
+----
+true	true	true
+
+# A composite key, byte for byte: sysrscols' (rsid bigint, hbcolid int).
+query T
+SELECT bool_and(hex(_mssql_rid) = '010800' || le(printf('%016X', rsid), 8) || '0400' || le(printf('%08X', hbcolid::BIGINT & 4294967295), 4))
+FROM (SELECT *, _mssql_rid FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysrscols'));
+----
+true
+
+# _mssql_rid identifies a row: one per key.
+query T
+SELECT count(DISTINCT _mssql_rid) = count(*) FROM mssql_backup_catalog('test/data/backup/full_xpress.bak', 'syscolpars');
+----
+true
+
+# The datetimes as mssql_backup_tables reads them (one conversion).
+query T
+SELECT o.created = t.created
+FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysschobjs') o
+JOIN mssql_backup_tables('test/data/backup/full.bak') t ON t.object_id = o.id WHERE t.table_name = 'items';
+----
+true
+
+# sysobjvalues only by value class: definitions (1, of views and defaults), computed columns (2),
+# partition boundaries (30), each checked against its object. The samples have none of them, so none of
+# its 242 rows is served: no module source, no other class (the oracle lane checks the catalog
+# fixture's set against the server's).
+query I
+SELECT count(*) FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysobjvalues');
+----
+0
+
+# Anything else is refused by name.
+statement error
+SELECT * FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysowners');
+----
+sysowners is not a base table the reader serves
+
+statement error
+SELECT * FROM mssql_backup_catalog('test/data/backup/full.bak', NULL::VARCHAR);
+----
+the base table is NULL
+
+statement error
+SELECT * FROM mssql_backup_catalog('test/data/backup/log.trn');
+----
+is a log backup

@@ -1,6 +1,9 @@
--- Spec 085 task 10: the committed backup samples, made on a CLEAN instance (spec 085 T4: only
--- synthetic data from an instance of our own is committed). Run by generate.sh; every row below is
--- generated, nothing comes from anyone's database. Backups go to /var/opt/mssql/backup/samples.
+-- Spec 085: the backup samples, made on a CLEAN instance (spec 085 T4: only synthetic data from an
+-- instance of our own). Run by generate.sh, which passes the backup directory as the sqlcmd variable
+-- DIR; every row below is generated, nothing comes from anyone's database. One script for every
+-- version the oracle lane runs (2017-2025): what a version lacks is skipped by its major version
+-- (MS_XPRESS by name from 2022, before that plain WITH COMPRESSION, which is MS_XPRESS; ZSTD from
+-- 2025), and generate.sh lists the sets the same way.
 SET NOCOUNT ON;
 GO
 IF DB_ID('bak_sample') IS NOT NULL DROP DATABASE bak_sample;
@@ -39,15 +42,21 @@ SELECT i, 1 + i % 2000, CASE WHEN i % 4 = 0 THEN NULL ELSE CONCAT('event ', i) E
 FROM n;
 GO
 -- The full backups: plain (WITH CHECKSUM), MS_XPRESS, ZSTD (2025), and striped in two, plain and ZSTD.
-BACKUP DATABASE bak_sample TO DISK = '/var/opt/mssql/backup/samples/full.bak' WITH FORMAT, INIT, CHECKSUM, NAME = 'full';
-BACKUP DATABASE bak_sample TO DISK = '/var/opt/mssql/backup/samples/full_xpress.bak'
-	WITH FORMAT, INIT, COPY_ONLY, COMPRESSION (ALGORITHM = MS_XPRESS), NAME = 'full_xpress';
-BACKUP DATABASE bak_sample TO DISK = '/var/opt/mssql/backup/samples/full_zstd.bak'
-	WITH FORMAT, INIT, COPY_ONLY, COMPRESSION (ALGORITHM = ZSTD), NAME = 'full_zstd';
-BACKUP DATABASE bak_sample TO DISK = '/var/opt/mssql/backup/samples/stripe_1.bak', DISK = '/var/opt/mssql/backup/samples/stripe_2.bak'
+DECLARE @major int = CAST(SERVERPROPERTY('ProductMajorVersion') AS int);
+BACKUP DATABASE bak_sample TO DISK = '$(DIR)/full.bak' WITH FORMAT, INIT, CHECKSUM, NAME = 'full';
+IF @major >= 16
+	EXEC (N'BACKUP DATABASE bak_sample TO DISK = ''$(DIR)/full_xpress.bak''
+		WITH FORMAT, INIT, COPY_ONLY, COMPRESSION (ALGORITHM = MS_XPRESS), NAME = ''full_xpress''');
+ELSE
+	BACKUP DATABASE bak_sample TO DISK = '$(DIR)/full_xpress.bak' WITH FORMAT, INIT, COPY_ONLY, COMPRESSION, NAME = 'full_xpress';
+IF @major >= 17
+	EXEC (N'BACKUP DATABASE bak_sample TO DISK = ''$(DIR)/full_zstd.bak''
+		WITH FORMAT, INIT, COPY_ONLY, COMPRESSION (ALGORITHM = ZSTD), NAME = ''full_zstd''');
+BACKUP DATABASE bak_sample TO DISK = '$(DIR)/stripe_1.bak', DISK = '$(DIR)/stripe_2.bak'
 	WITH FORMAT, INIT, COPY_ONLY, NAME = 'stripe';
-BACKUP DATABASE bak_sample TO DISK = '/var/opt/mssql/backup/samples/stripe_zstd_1.bak', DISK = '/var/opt/mssql/backup/samples/stripe_zstd_2.bak'
-	WITH FORMAT, INIT, COPY_ONLY, COMPRESSION (ALGORITHM = ZSTD), NAME = 'stripe_zstd';
+IF @major >= 17
+	EXEC (N'BACKUP DATABASE bak_sample TO DISK = ''$(DIR)/stripe_zstd_1.bak'', DISK = ''$(DIR)/stripe_zstd_2.bak''
+		WITH FORMAT, INIT, COPY_ONLY, COMPRESSION (ALGORITHM = ZSTD), NAME = ''stripe_zstd''');
 GO
 -- Changes after the full: a differential, then a log backup.
 UPDATE dbo.items SET price = price + 1, name = CONCAT(name, N' (updated)') WHERE id % 10 = 0;
@@ -56,6 +65,6 @@ WITH n AS (SELECT TOP (500) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM
 INSERT INTO dbo.items (id, name, code, price, created, flag, blob)
 SELECT 10000 + i, CONCAT(N'new ', i), 'NEW', 9.99, '2026-03-01', 1, NULL FROM n;
 GO
-BACKUP DATABASE bak_sample TO DISK = '/var/opt/mssql/backup/samples/diff.bak' WITH FORMAT, INIT, DIFFERENTIAL, NAME = 'diff';
-BACKUP LOG bak_sample TO DISK = '/var/opt/mssql/backup/samples/log.trn' WITH FORMAT, INIT, NAME = 'log';
+BACKUP DATABASE bak_sample TO DISK = '$(DIR)/diff.bak' WITH FORMAT, INIT, DIFFERENTIAL, NAME = 'diff';
+BACKUP LOG bak_sample TO DISK = '$(DIR)/log.trn' WITH FORMAT, INIT, NAME = 'log';
 GO

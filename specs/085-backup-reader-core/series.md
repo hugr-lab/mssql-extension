@@ -18,21 +18,21 @@ experiment ran on; **(unverified)** = inferred or never observed.
 
 | spec | title | scope in one line | depends on | estimate | risk |
 |---|---|---|---|---|---|
-| [085](spec.md) | the core | MTF, `MSSQLBAK` (MS_XPRESS, ZSTD), stripes, several data files, page store with liveness, catalog with E7's partition model, FixedVar rows, LOBs and row-overflow, common types, the file functions with the opened-file cache, read-only ATTACH, DuckDB FileSystem I/O (ranged, asynchronous, parallel: D3a), `mssql_backup_info`, the fuzzy status, a differential overlay for browsing | 091's `src/codec/code_page/` (for PR 2) | 79 d, 14.5–16 wk | low–medium (version drift) |
+| [085](spec.md) | the core | MTF, `MSSQLBAK` (MS_XPRESS, ZSTD), stripes, several data files, page store with liveness, catalog with E7's partition model, FixedVar rows, LOBs and row-overflow, common types, the file functions with the opened-file cache, read-only ATTACH, DuckDB FileSystem I/O (ranged, asynchronous, parallel: D3a), `mssql_backup_info`, the fuzzy status, a differential overlay for browsing | 091's `src/codec/code_page/` (for PR 2) | 84.5–86.5 d, 15.5–17.5 wk (PR 2 in five PRs, 2a–2e) | low–medium (version drift) |
 | [086](../086-backup-row-formats-and-types/spec.md) | row formats and types | ROW and PAGE compression, sparse, `sql_variant` → `VARIANT`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector`, double-byte code pages, the 2025 `json` spike | 085 (+ 091's double-byte tables) | 36 d, 7–8 wk + `json` spike 1–2 wk | medium (ROW / PAGE known only through DbReader's facts); high for `json` |
 | [087](../087-backup-encryption/spec.md) | encryption and TDE | the `mssql_backup_key` secret, selection by scope then thumbprint, encrypted containers, TDE pages | 085 | 16.5 d, 3–3.5 wk + E10 spike | low–medium; the TDE log tail is open |
 | [088](../088-backup-columnstore/spec.md) | columnstore | E5's decoder in C++: segments, dictionaries, VLD, rowgroups, delete bitmaps, delta stores, archive | 085 (+ CD integers from 086 PR 1) | 37.5 d, 6–9 wk | medium (version drift) |
 | [089](../089-backup-incremental-api/spec.md) | the incremental API | the chain check, changed and freed pages with each page's previous owner from the base IAM images, dead / gone / moved AUs (E7's ownership rule), allocation images, the catalog mirror, LOB fragment maps, lake-mode decoding of a lone differential, the Parquet export in DuckLake's layout | 085 | 41.5 d, 8 wk | medium |
 | [090](../090-backup-tail-recovery/spec.md) | tail recovery | redo and undo of a backup's own log tail, restore mode and lake mode, pending pages with the allocation-first rule, stale pages with variant 1, the allocation images of the recovered state | 085, 089 | 58.5 d, 10–12 wk | medium |
 
-**Total ≈ 269 working days, about 54 weeks for one developer; about 36 weeks with two** (085's
-79 days, then track A's 89 days beside track B's 101, 089's docs day included; see below). The
+**Total ≈ 274.5–276.5 working days, about 55 weeks for one developer; about 37 weeks with two** (085's
+84.5–86.5 days (79 before PR 2 was split in five, owner 2026-11-10), then track A's 89 days beside track B's 101, 089's docs day included; see below). The
 `json` decoder (086 PR 6, ~3 d, only if E9 passes), the spikes E9 and E10, and spec 091 (SQL Server
 code pages, generated tables and vectorized kernels), which 085 PR 2 needs, are outside the total;
 E11 is 088 task 9, inside it.
 
 **What approving the series approves** (the review of #526, 2026-11-06): the design, not the
-calendar. Building is decided per track: 085 with track A (085 → 089 PR 1 → 090; 75 + 89 working
+calendar. Building is decided per track: 085 with track A (085 → 089 PR 1 → 090; 84.5–86.5 + 89 working
 days) as one commitment, and 086, 087 and 088 each as its own call. After 089 PR 1 mssql-ducklake
 already imports quiet backups and refuses the rest by name, so stopping there leaves a working
 product.
@@ -101,7 +101,7 @@ Each PR merges before the next opens (no stacked PRs).
 
 | R§8 phase | R§8 estimate | now | spec | what changed |
 |---|---|---|---|---|
-| 0: container, page store, catalog, FixedVar, LOB, common types, file functions, cache, ATTACH, fuzzy flags | 6–8 wk, low–med | 14.5–16 wk | 085 | 085 also takes phase 1's overlay, locators and parallel scan (~2 wk) and E7's partition model (2 d), and costs per spec the hardening, fuzz harnesses, CI oracle lane and docs R§9 lists but §8 did not cost; D3a's ranged, asynchronous I/O (+3.5 d) and D4a's index with E12 (+2.5 d); DQ-40's IAM chain (+1.5 d); DQ-41's search (+2.5 d) |
+| 0: container, page store, catalog, FixedVar, LOB, common types, file functions, cache, ATTACH, fuzzy flags | 6–8 wk, low–med | 15.5–17.5 wk | 085 | 085 also takes phase 1's overlay, locators and parallel scan (~2 wk) and E7's partition model (2 d), and costs per spec the hardening, fuzz harnesses, CI oracle lane and docs R§9 lists but §8 did not cost; D3a's ranged, asynchronous I/O (+3.5 d) and D4a's index with E12 (+2.5 d); DQ-40's IAM chain (+1.5 d); DQ-41's search (+2.5 d); PR 2 split in five, the oracle lane first (+5.5–7.5 d) |
 | 1: ROW / PAGE, sparse, `sql_variant`, xml, spatial, vector; overlay; locators; parallel scan | 5–6 wk, med | 7–8 wk + json spike | 086 | overlay / locators / parallel moved to 085; `hierarchyid` and double-byte code pages added; one oracle test per type |
 | 1b: encryption and TDE | 1–2 wk, low–med (E4) | 3–3.5 wk + E10 | 087 | the secret type, the selection rule, CI fixtures; the TDE log tail found open |
 | 1c: tail recovery | 9–12 wk, med (E3, E6) | 10–12 wk | 090 | about a week of it (the log reader) is in 085; guard extensions listed separately (ROW and PAGE 2–3, ADR / RCSI 3–4, DDL 1–2 wk) |
@@ -207,9 +207,12 @@ open-pass and memory bounds.
 | E10 | the log tail of a TDE backup | 087, 090 | 3–5 d | planned |
 | E12 | does a full backup's first pass carry exactly the GAM-allocated extents, in order (so the open reads the allocation pages, not every page) | 085 (D4a, task 7) | 1.5 d | **done** (`research/experiments/E12-gam-rank.md`): yes for one media family, 56 of 56 fulls; not per family on a striped set |
 | E13 | are passes ordered, and can a compressed backup's block be found without walking its chain (so a striped or compressed backup opens by search) | 085 (D4a, DQ-41, task 7a) | 1 d | **done** (`research/experiments/E13-ordered-passes-search.md`): 210 of 210 passes ascending; a container's block = one extent group; resync from any offset, 0 wrong in 3.6 M probes |
+| E17 | where a later GAM interval puts its allocation pages | 085 (PR 2b, allocation) | — | **done** (`research/experiments/E17-gam-intervals.md`): GAM, SGAM, DCM, BCM at +0, +1, +6, +7 of the interval |
+| E18 | does the boot page follow a rename, a level change and a restore under another name | 085 (PR 2b, the boot page check) | — | **done** (`research/experiments/E18-boot-page.md`): it does; the check passes |
+| E19 | IAM chains across two files and after a file is removed | 085 (PR 2b, DQ-40) | — | **done** (`research/experiments/E19-iam-chains.md`): a page per (file, interval); not renumbered after a removal (chains start at 1); the removed file an SFIN record flagged 0x20 |
 | E11 | columnstore in differentials (incl. a partitioned CCI's SPLIT / MERGE, a SWITCH with an OPEN delta store, rowgroup id reuse), and the tuple mover during a backup | 088, 089 | 3.5 d | planned |
 
-(E8, the import commit cost, was not run, R§12.) R§12 lists E9–E11 as planned; E12 joined with 085 D4a, E13 with DQ-41 (2026-11-09).
+(E8, the import commit cost, was not run, R§12.) R§12 lists E9–E11 as planned; E12 joined with 085 D4a, E13 with DQ-41 (2026-11-09), E17-E19 with PR 2b (2026-11-10).
 
 ## Decisions for the owner
 

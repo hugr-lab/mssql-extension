@@ -1,4 +1,5 @@
 #include "backup/backup_allocation.hpp"
+#include "backup/backup_record.hpp"
 
 #include "backup/backup_bytes.hpp"
 
@@ -10,10 +11,11 @@ namespace mssql {
 namespace backup {
 
 // Spec 085 § Rules, allocation (E2 layouts): PFS at page 1 and every 8,088 pages, its byte for page
-// p at 100 + (p mod 8088), 0x40 = allocated; GAM / SGAM / DCM / BCM at +2 / +3 / +6 / +7 of every
-// 511,232-page interval, a 7,988-byte bitmap at 194 (bit i, LSB first, = extent i; 1 = free); the
-// file header at page 0, its slot 0 record's u32 Size at +171; the boot page at 1:9 (in another
-// file page 9 is an ordinary page).
+// p at 100 + (p mod 8088), 0x40 = allocated; GAM / SGAM / DCM / BCM at pages 2 / 3 / 6 / 7 of the
+// first 511,232-page interval and +0 / +1 / +6 / +7 of every later one (E17), a 7,988-byte bitmap
+// at 194 (bit i, LSB first, = extent i; 1 = free); the file header at page 0, its slot 0 record's
+// Size its variable column 4 (ReadFileHeaderRecord); the boot page at 1:9 (in another file page 9
+// is an ordinary page).
 static constexpr uint32_t PFS_INTERVAL = 8088;
 static constexpr size_t PFS_BYTES_AT = 100;
 static constexpr uint8_t PFS_ALLOCATED = 0x40;
@@ -21,17 +23,33 @@ static constexpr uint32_t GAM_INTERVAL_PAGES = 511232;
 static constexpr uint32_t GAM_INTERVAL_EXTENTS = GAM_INTERVAL_PAGES / PAGES_PER_EXTENT;
 static constexpr size_t GAM_BITMAP_AT = 194;
 static constexpr size_t GAM_BITMAP_BYTES = 7988;
-static constexpr size_t FILE_HEADER_ID_AT = 167;
-static constexpr size_t FILE_HEADER_SIZE_AT = 171;
 static constexpr uint16_t BOOT_FILE = 1;
 static constexpr uint32_t BOOT_PAGE = 9;
 static constexpr size_t PFS_CACHE_PAGES = 64;
+static constexpr uint8_t PAGE_TYPE_GAM = 8;
+static constexpr uint8_t PAGE_TYPE_PFS = 11;
+static constexpr uint8_t PAGE_TYPE_FILE_HEADER = 15;
 
 static std::string PageName(uint16_t file, uint32_t page) {
 	return std::to_string(file) + ":" + std::to_string(page);
 }
 
-std::vector<uint8_t> AllocationMap::ReadPage(uint16_t file, uint32_t page, const char *what) const {
+//! `bytes`, the copy of allocation page (file, page), checked: a page, that page, of m_type `type`.
+static void CheckAllocationPage(const std::vector<uint8_t> &bytes, uint16_t file, uint32_t page, uint8_t type,
+								const char *what) {
+	ByteReader r(bytes.data(), bytes.size(), what, 0);
+	if (r.U8(0) != 1 || r.U32(32) != page || r.U16(36) != file) {
+		throw FormatError("backup: " + std::string(what) + " (page " + PageName(file, page) + ") is not that page");
+	}
+	// The page is where the format puts this allocation page: if it is of another type, the format's
+	// arithmetic does not hold here (as a later interval's +2 / +3 did not, E17).
+	if (r.U8(1) != type) {
+		throw FormatError("backup: " + std::string(what) + " (page " + PageName(file, page) + ") is a page of type " +
+						  std::to_string(r.U8(1)) + ", not " + std::to_string(type));
+	}
+}
+
+std::vector<uint8_t> AllocationMap::ReadPage(uint16_t file, uint32_t page, uint8_t type, const char *what) const {
 	std::vector<uint8_t> bytes;
 	// Every allocation page a map reads is one a full's pass 1 carries (E12): `expected`, so a
 	// searched pass cannot answer it absent on an order it does not have.
@@ -39,10 +57,7 @@ std::vector<uint8_t> AllocationMap::ReadPage(uint16_t file, uint32_t page, const
 		throw FormatError("backup: " + std::string(what) + " (page " + PageName(file, page) +
 						  ") is in no data pass of the backup");
 	}
-	ByteReader r(bytes.data(), bytes.size(), what, 0);
-	if (r.U8(0) != 1 || r.U32(32) != page || r.U16(36) != file) {
-		throw FormatError("backup: " + std::string(what) + " (page " + PageName(file, page) + ") is not that page");
-	}
+	CheckAllocationPage(bytes, file, page, type, what);
 	return bytes;
 }
 
@@ -53,15 +68,16 @@ AllocationMap::AllocationMap(const PageIndex &index, const std::vector<uint16_t>
 	for (uint16_t id : ids) {
 		File f;
 		f.id = id;
-		auto header = ReadPage(id, 0, "the file header page");
-		ByteReader h(header.data(), header.size(), "the file header page", 0);
-		const uint16_t slot0 = h.U16(PAGE_SIZE - 2);
-		if (slot0 < 96 || slot0 + FILE_HEADER_SIZE_AT + 4 > PAGE_SIZE || h.U16(slot0 + FILE_HEADER_ID_AT) != id) {
-			h.Fail(PAGE_SIZE - 2, "file " + std::to_string(id) + "'s header has no record naming it");
+		auto header = ReadPage(id, 0, PAGE_TYPE_FILE_HEADER, "the file header page");
+		const auto record = ReadFileHeaderRecord(header.data(), header.size());
+		if (record.file_id != id) {
+			throw FormatError("backup: file " + std::to_string(id) + "'s header record names file " +
+							  std::to_string(record.file_id));
 		}
-		f.size = h.U32(slot0 + FILE_HEADER_SIZE_AT);
+		f.size = record.size;
 		// One slot per GAM interval (at most 8,402 for 2^32 pages); the bits are read on demand, so a
-		// crafted Size allocates no bitmap for intervals nobody asks about.
+		// crafted Size allocates no bitmap for intervals nobody asks about, and an interval asked about
+		// that the backup carries no GAM for keeps none (an empty slot: all free; review of #549).
 		const size_t intervals =
 			static_cast<size_t>((static_cast<uint64_t>(f.size) + GAM_INTERVAL_PAGES - 1) / GAM_INTERVAL_PAGES);
 		f.gam_free.resize(intervals);
@@ -76,23 +92,48 @@ bool AllocationMap::GamFree(const File &file, uint32_t extent) const {
 	auto &f = const_cast<File &>(file);
 	{
 		std::lock_guard<std::mutex> guard(lock_);
+		// An interval past the recorded Size: the Size is a lower bound (a stale header after an
+		// autogrow; DbReader's PROVENANCE, "File size is a lower bound"), so a page there is asked of
+		// its interval's GAM like any other.
+		if (interval >= f.gam_free.size()) {
+			f.gam_free.resize(interval + 1);
+			f.gam_loaded.resize(interval + 1, false);
+		}
 		if (f.gam_loaded[interval]) {
-			return (f.gam_free[interval][within / 8] >> (within % 8)) & 1;
+			// An interval the backup carries no GAM for is cached as an empty bitmap: all free.
+			return f.gam_free[interval].empty() || ((f.gam_free[interval][within / 8] >> (within % 8)) & 1);
 		}
 	}
 	// Read outside the lock, as PfsByte does: the read may search a pass or map one by its headers
 	// (PageIndex::ReadPage, expected), and the other threads' hits must not wait for it. Two threads
 	// missing one interval both read it; the first to finish keeps its bits.
-	const uint32_t gam_page = static_cast<uint32_t>(interval * GAM_INTERVAL_PAGES + 2);
-	auto gam = ReadPage(f.id, gam_page, "a GAM page");
-	ByteReader g(gam.data(), gam.size(), "a GAM page", 0);
-	const uint8_t *bits = g.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES);
+	// Page 2 of the first interval, the first page of every later one (E17).
+	const uint32_t gam_page = interval == 0 ? 2 : static_cast<uint32_t>(interval * GAM_INTERVAL_PAGES);
+	std::vector<uint8_t> bits;	// empty: no GAM, all free -- nothing kept for an interval past the data
+	const bool recorded = static_cast<uint64_t>(interval) * GAM_INTERVAL_PAGES < f.size;
+	std::vector<uint8_t> gam;
+	// An interval within the recorded Size has its GAM in the backup (E12); one past it has one only
+	// when the data reached it -- if the backup carries none, nothing there is allocated. Asked with
+	// `expected` either way: an absence a searched pass answers on an order it did not check would
+	// mark a whole interval free, and its pages not live.
+	if (recorded) {
+		gam = ReadPage(f.id, gam_page, PAGE_TYPE_GAM, "a GAM page");
+	} else if (index_.ReadPage(f.id, gam_page, gam, true)) {
+		CheckAllocationPage(gam, f.id, gam_page, PAGE_TYPE_GAM, "a GAM page");
+	} else {
+		gam.clear();
+	}
+	if (!gam.empty()) {
+		ByteReader g(gam.data(), gam.size(), "a GAM page", 0);
+		const uint8_t *b = g.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES);
+		bits.assign(b, b + GAM_BITMAP_BYTES);
+	}
 	std::lock_guard<std::mutex> guard(lock_);
 	if (!f.gam_loaded[interval]) {
-		f.gam_free[interval].assign(bits, bits + GAM_BITMAP_BYTES);
+		f.gam_free[interval] = std::move(bits);
 		f.gam_loaded[interval] = true;
 	}
-	return (f.gam_free[interval][within / 8] >> (within % 8)) & 1;
+	return f.gam_free[interval].empty() || ((f.gam_free[interval][within / 8] >> (within % 8)) & 1);
 }
 
 const AllocationMap::File *AllocationMap::Find(uint16_t file) const {
@@ -113,13 +154,21 @@ bool AllocationMap::IsAllocationPage(uint16_t file, uint32_t page) {
 	if (page == 0 || page == 1 || (file == BOOT_FILE && page == BOOT_PAGE) || page % PFS_INTERVAL == 0) {
 		return true;
 	}
+	// GAM / SGAM / DCM / BCM: pages 2 / 3 / 6 / 7 of the first interval (0 and 1 are the file header
+	// and the PFS), then 0 / 1 / 6 / 7 of every later one (E17: 511232 GAM, 511233 SGAM, 511238 DCM,
+	// 511239 BCM, on 2022). Not measured: GAM interval 1011 (page 516855552 = 8088 x 63904, a file past
+	// 3.9 TB) starts on a PFS page's place too; which page SQL Server puts there is unknown, and the
+	// reader asks it for both types (GamFree, PfsByte), so one of them is a FormatError naming it.
 	const uint32_t in_interval = page % GAM_INTERVAL_PAGES;
-	return in_interval == 2 || in_interval == 3 || in_interval == 6 || in_interval == 7;
+	if (page < GAM_INTERVAL_PAGES) {
+		return in_interval == 2 || in_interval == 3 || in_interval == 6 || in_interval == 7;
+	}
+	return in_interval == 0 || in_interval == 1 || in_interval == 6 || in_interval == 7;
 }
 
 bool AllocationMap::ExtentAllocated(uint16_t file, uint32_t page) const {
 	auto f = Find(file);
-	if (!f || page >= f->size) {
+	if (!f) {
 		return false;
 	}
 	return !GamFree(*f, page / PAGES_PER_EXTENT);
@@ -141,7 +190,7 @@ uint8_t AllocationMap::PfsByte(const File &file, uint32_t page) const {
 	PfsPage entry;
 	entry.file = file.id;
 	entry.page = pfs_page;
-	entry.bytes = ReadPage(file.id, pfs_page, "a PFS page");
+	entry.bytes = ReadPage(file.id, pfs_page, PAGE_TYPE_PFS, "a PFS page");
 	const uint8_t value = entry.bytes[PFS_BYTES_AT + page % PFS_INTERVAL];
 	std::lock_guard<std::mutex> guard(lock_);
 	if (pfs_cache_.size() >= PFS_CACHE_PAGES) {
@@ -153,11 +202,17 @@ uint8_t AllocationMap::PfsByte(const File &file, uint32_t page) const {
 
 bool AllocationMap::IsLive(uint16_t file, uint32_t page) const {
 	auto f = Find(file);
-	if (!f || page >= f->size) {
+	if (!f) {
 		return false;
 	}
 	if (IsAllocationPage(file, page)) {
-		return true;
+		// Within the recorded Size always; past it (the Size a lower bound) only where the data
+		// reached, which the backup's copy of the page says.
+		if (page < f->size) {
+			return true;
+		}
+		PageLocation location;
+		return index_.Locate(file, page, location, true);
 	}
 	return ExtentAllocated(file, page) && (PfsByte(*f, page) & PFS_ALLOCATED) != 0;
 }

@@ -18,6 +18,7 @@ static constexpr size_t SCIN_MIN = 270;
 static constexpr size_t SCIN_COMPRESSED_SIZE_AT = 344;
 // An SFIN's fixed part ends at +202 (UniqueId).
 static constexpr size_t SFIN_MIN = 202;
+static constexpr uint32_t SFIN_REMOVED = 0x20;
 // A compressed container's soft filemark (spec 085 § Rules, MSSQLBAK).
 static constexpr uint64_t CONTAINER_SOFT_FILEMARK = 4096;
 
@@ -192,13 +193,16 @@ static const MtfBlock &Require(const RandomAccess &file, const MtfLayout &layout
 	return *block;
 }
 
-static void ReadTrailer(const RandomAccess &file, const MtfBlock &msls, BackupSetHeader &set) {
-	auto stream = msls.Stream("MQCI");
+//! The MQCI stream of `block` (the trailer's MSLS, or the MSCI before the data) into `set`: its SFGI
+//! and SFIN records, and in the trailer (`trailer`) its SCIN, which it must hold.
+static void ReadTrailer(const RandomAccess &file, const MtfBlock &block, BackupSetHeader &set, bool trailer = true) {
+	auto stream = block.Stream("MQCI");
 	if (!stream) {
-		throw FormatError("backup file \"" + file.Name() + "\": its MSLS block carries no MQCI stream");
+		throw FormatError("backup file \"" + file.Name() + "\": its " + block.type + " block carries no MQCI stream");
 	}
 	auto data = ReadStreamData(file, *stream, MAX_HEADER_STREAM);
-	ByteReader mqci(data.data(), data.size(), "the trailer MQCI stream", stream->data_offset);
+	ByteReader mqci(data.data(), data.size(), trailer ? "the trailer MQCI stream" : "the MSCI block's MQCI stream",
+					stream->data_offset);
 	size_t at = 0;
 	std::vector<std::pair<uint32_t, std::string>> filegroups;
 	bool scin = false;
@@ -209,7 +213,7 @@ static void ReadTrailer(const RandomAccess &file, const MtfBlock &msls, BackupSe
 			mqci.Fail(at, "a " + tag + " record of " + std::to_string(length) + " bytes");
 		}
 		auto record = mqci.Sub(at, length, "a trailer record");
-		if (tag == "SCIN") {
+		if (tag == "SCIN" && trailer) {
 			if (length < SCIN_MIN) {
 				mqci.Fail(at, "a SCIN record of " + std::to_string(length) + " bytes, shorter than its fixed part");
 			}
@@ -253,6 +257,9 @@ static void ReadTrailer(const RandomAccess &file, const MtfBlock &msls, BackupSe
 				mqci.Fail(at, "an SFIN record of " + std::to_string(length) + " bytes, shorter than its fixed part");
 			}
 			DatabaseFile f;
+			// Flags at +8: 0x20 on a file emptied and removed in the files fixture (2022); a hint, not
+			// a fact (DatabaseFile::marked_removed).
+			f.marked_removed = (record.U32(8) & SFIN_REMOVED) != 0;
 			f.file_id = record.U32(20);
 			const uint32_t type = record.U32(28);
 			if (type != 1 && type != 2) {
@@ -271,7 +278,7 @@ static void ReadTrailer(const RandomAccess &file, const MtfBlock &msls, BackupSe
 		}
 		at += length;
 	}
-	if (!scin) {
+	if (trailer && !scin) {
 		throw FormatError("backup file \"" + file.Name() + "\": its trailer MQCI stream has no SCIN record");
 	}
 	for (auto &f : set.files) {
@@ -357,6 +364,16 @@ BackupSetHeader ReadBackupSet(const RandomAccess &file, const MtfLayout &layout)
 		set.backup_size = msls.offset - layout.soft_filemark_bytes;
 	}
 	ReadTrailer(file, msls, set);
+	// The files as the backup began: what FILELISTONLY lists. Their sizes are the start's; the
+	// trailer's are the end's, larger once a file grew while the backup ran (load fixture: 46080 pages
+	// at the start, 47104 at the end, FILELISTONLY 46080).
+	if (auto msci = layout.Find("MSCI")) {
+		if (msci->Stream("MQCI")) {
+			BackupSetHeader start;
+			ReadTrailer(file, *msci, start, false);
+			set.start_files = std::move(start.files);
+		}
+	}
 
 	for (const auto &block : layout.blocks) {
 		for (const auto &stream : block.streams) {

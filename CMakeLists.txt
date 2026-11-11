@@ -166,16 +166,28 @@ set(EXTENSION_SOURCES
     src/codec/uuid_codec.cpp
     # Backup reader (spec 085): the parsers over byte spans, DuckDB-free (D15).
     src/backup/backup_allocation.cpp
+    src/backup/backup_boot.cpp
     src/backup/backup_bytes.cpp
+    src/backup/backup_catalog_function.cpp
+    src/backup/backup_catalog_model.cpp
+    src/backup/backup_collation.cpp
     src/backup/backup_container.cpp
+    src/backup/backup_function_common.cpp
+    src/backup/backup_iam.cpp
+    src/backup/backup_lob.cpp
     src/backup/backup_info_function.cpp
     src/backup/backup_mtf.cpp
     src/backup/backup_open_pass.cpp
     src/backup/backup_opened.cpp
+    src/backup/backup_page.cpp
     src/backup/backup_page_index.cpp
     src/backup/backup_pass_search.cpp
     src/backup/backup_ranges.cpp
+    src/backup/backup_record.cpp
     src/backup/backup_set.cpp
+    src/backup/backup_sql_variant.cpp
+    src/backup/backup_system_tables.cpp
+    src/backup/backup_tables_function.cpp
     src/backup/backup_xpress.cpp
     src/backup/backup_zstd.cpp
     src/backup/backup_source.cpp

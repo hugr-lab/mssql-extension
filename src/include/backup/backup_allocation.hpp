@@ -5,9 +5,11 @@
 //
 // Spec 085 task 8, D4 / D4a: which pages of a backup are live (E2 R3). A page's rows are read, and
 // its header allocation-unit id believed, only if the page is live: the allocation pages
-// themselves (the file header 0, PFS, GAM / SGAM / DCM / BCM, file 1's boot page 9) always; any other
-// page iff it is below its file's Size, its extent's GAM bit is 0 (allocated) and its PFS byte has
-// 0x40. Full backups carry dead pages too (E2 §1.3), which is why this gate exists.
+// themselves (the file header 0, PFS, GAM / SGAM / DCM / BCM, file 1's boot page 9) below the recorded
+// Size, and past it where the backup carries them; any other page iff its extent's GAM bit is 0
+// (allocated) and its PFS byte has 0x40 -- past the recorded Size too, which is a lower bound
+// (DbReader's PROVENANCE: a live database autogrows during its backup). Full backups carry dead pages
+// too (E2 §1.3), which is why this gate exists.
 //
 // The map reads the latest copy of each allocation page through the page index (PageIndex::ReadPage,
 // which may search a pass, DQ-41). It reads each file's header (Size) when it is built; a GAM
@@ -42,13 +44,17 @@ public:
 	AllocationMap(const PageIndex &index, const std::vector<uint16_t> &files);
 	AllocationMap(PageIndex &&, const std::vector<uint16_t> &) = delete;
 
-	//! The file's Size in pages, or 0 when the file is not one of the map's.
+	//! The file's Size in pages as its header records it, or 0 when the file is not one of the map's.
+	//! A lower bound, not the end of the data: a backup can carry allocated extents past it (a header
+	//! image older than the last autogrow; DbReader's PROVENANCE). Liveness does not stop at it.
 	uint32_t FileSize(uint16_t file) const;
 	//! True for an allocation page of file `file` (always live). The boot page is file 1's only.
 	static bool IsAllocationPage(uint16_t file, uint32_t page);
 	//! The liveness rule (E2 R3) for page `page` of file `file`.
 	bool IsLive(uint16_t file, uint32_t page) const;
-	//! The GAM's answer alone: the page's extent is allocated (and below Size).
+	//! The GAM's answer alone: the page's extent is allocated. Past the recorded Size too: GAM marks
+	//! nothing allocated past the end of the data (measured on the lane's 2017-2025 sets of the samples' database, in
+	//! R2).
 	bool ExtentAllocated(uint16_t file, uint32_t page) const;
 
 	size_t MemoryBytes() const;
@@ -72,7 +78,8 @@ private:
 	uint8_t PfsByte(const File &file, uint32_t page) const;
 	//! Whether extent `extent` of `file` is GAM-free: its interval's GAM page read first if needed.
 	bool GamFree(const File &file, uint32_t extent) const;
-	std::vector<uint8_t> ReadPage(uint16_t file, uint32_t page, const char *what) const;
+	//! The allocation page (file, page), of m_type `type`; FormatError naming `what` otherwise.
+	std::vector<uint8_t> ReadPage(uint16_t file, uint32_t page, uint8_t type, const char *what) const;
 
 	const PageIndex &index_;
 	mutable std::vector<File> files_;  // the GAM intervals are filled in on demand, under lock_

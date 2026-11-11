@@ -93,3 +93,6 @@ tools/code_pages/data/*.alt.psv
 
 # local design / research scratch (not committed)
 design/
+
+# Spec 085: written by cflite-pr.yml's weekly job only (the backup harnesses), never committed.
+.clusterfuzzlite/extra_targets

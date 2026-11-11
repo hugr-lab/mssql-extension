@@ -1,4 +1,5 @@
 #include "backup/backup_page_index.hpp"
+#include "backup/backup_record.hpp"
 
 #include "backup/backup_container.hpp"
 #include "backup/backup_pass_search.hpp"
@@ -431,7 +432,8 @@ PassMap BuildPassMap(const RandomAccess &stream, uint64_t offset, uint64_t lengt
 }
 
 // Allocation-page layout (spec 085 § Rules, allocation): PFS pages at 1 and every 8,088 pages;
-// GAM / SGAM / DCM / BCM at +2 / +3 / +6 / +7 of every 511,232-page interval, whose GAM covers
+// GAM / SGAM / DCM / BCM at 2 / 3 / 6 / 7 of the first 511,232-page interval and at +0 / +1 / +6 / +7
+// of every later one (E17), whose GAM covers
 // 63,904 extents with a 7,988-byte bitmap at page offset 194 (bit set = free); the boot page at 9 of file 1.
 static constexpr uint32_t PFS_INTERVAL = 8088;
 static constexpr uint32_t GAM_INTERVAL_PAGES = 511232;
@@ -440,9 +442,6 @@ static constexpr size_t GAM_BITMAP_AT = 194;
 static constexpr size_t GAM_BITMAP_BYTES = 7988;
 static constexpr uint8_t PAGE_TYPE_FILE_HEADER = 15;
 static constexpr uint8_t PAGE_TYPE_GAM = 8;
-// The file header page (page 0): its slot 0 record holds u16 file id +167, u32 Size (pages) +171.
-static constexpr size_t FILE_HEADER_ID_AT = 167;
-static constexpr size_t FILE_HEADER_SIZE_AT = 171;
 // The boot page: page 9 of file 1 only (as AllocationMap's).
 static constexpr uint16_t BOOT_FILE = 1;
 static constexpr uint32_t BOOT_PAGE = 9;
@@ -507,9 +506,25 @@ const uint8_t *GroupPage(const ReadGroup &g, uint32_t page_in_extent, uint8_t ty
 //! Adds interval `interval`'s extents of a file of `size` pages, in order: its allocation pages'
 //! extents (the PFS pages in it, its own first extent, in file 1 the boot page's in interval 0)
 //! and the extents its GAM marks allocated. Every extent added is below the next interval's first.
-void AddInterval(uint16_t file, uint32_t size, uint32_t interval, const uint8_t *gam_bits, ExtentBitmap &bitmap) {
+//! Returns how many extents the interval's GAM marks allocated.
+size_t AddInterval(uint16_t file, uint32_t size, uint32_t interval, const uint8_t *gam_bits, ExtentBitmap &bitmap) {
 	const uint64_t first_page = static_cast<uint64_t>(interval) * GAM_INTERVAL_PAGES;
-	const uint64_t end_page = std::min<uint64_t>(first_page + GAM_INTERVAL_PAGES, size);
+	const uint32_t first_extent = interval * GAM_INTERVAL_EXTENTS;
+	// The interval's GAM-allocated extents, past the recorded Size too: the Size is a lower bound (a
+	// header image older than the last autogrow, DbReader's PROVENANCE), and the GAM marks nothing
+	// allocated past the end of the data (measured, 2017-2025). The data's end, for the PFS pages:
+	// the Size or the last allocated extent's end, whichever is later.
+	std::vector<uint32_t> allocated;
+	for (uint32_t i = 0; i < GAM_INTERVAL_EXTENTS; i++) {
+		if (!((gam_bits[i / 8] >> (i % 8)) & 1)) {
+			allocated.push_back(first_extent + i);
+		}
+	}
+	uint64_t data_end = size;
+	if (!allocated.empty()) {
+		data_end = std::max<uint64_t>(data_end, (static_cast<uint64_t>(allocated.back()) + 1) * PAGES_PER_EXTENT);
+	}
+	const uint64_t end_page = std::min<uint64_t>(first_page + GAM_INTERVAL_PAGES, data_end);
 	std::vector<uint32_t> extents;
 	extents.push_back(static_cast<uint32_t>(first_page / PAGES_PER_EXTENT));  // pages 0..7: header, PFS, GAM, ...
 	if (file == BOOT_FILE && interval == 0 && size > BOOT_PAGE) {
@@ -521,20 +536,12 @@ void AddInterval(uint16_t file, uint32_t size, uint32_t interval, const uint8_t 
 	for (uint64_t p = (first_page / PFS_INTERVAL + 1) * PFS_INTERVAL; p < end_page; p += PFS_INTERVAL) {
 		extents.push_back(static_cast<uint32_t>(p / PAGES_PER_EXTENT));
 	}
-	const uint32_t first_extent = interval * GAM_INTERVAL_EXTENTS;
-	for (uint32_t i = 0; i < GAM_INTERVAL_EXTENTS; i++) {
-		// An extent that starts at or past Size is not copied (E12).
-		if (static_cast<uint64_t>(first_extent + i) * PAGES_PER_EXTENT >= size) {
-			break;
-		}
-		if (!((gam_bits[i / 8] >> (i % 8)) & 1)) {
-			extents.push_back(first_extent + i);
-		}
-	}
+	extents.insert(extents.end(), allocated.begin(), allocated.end());
 	std::sort(extents.begin(), extents.end());
 	for (uint32_t e : extents) {
 		bitmap.Add(e);
 	}
+	return allocated.size();
 }
 
 }  // namespace
@@ -549,11 +556,20 @@ bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint6
 	ReadGroup g;
 	uint64_t file_group = 0;  // the group of the current file's extent 0
 	uint16_t last_file = 0;
+	// The group read past a file's last interval (is the next interval's GAM there?) is the next
+	// file's group 0 or a pad when it is not: kept, so that group is read once.
+	uint64_t peeked = ~uint64_t(0);
+	ReadGroup ahead;
 	while (file_group < result.groups_) {
-		if (!ReadPassGroup(stream, result.units_offset, result.groups_, file_group, g)) {
-			return false;
+		if (peeked == file_group) {
+			g = std::move(ahead);
+		} else {
+			if (!ReadPassGroup(stream, result.units_offset, result.groups_, file_group, g)) {
+				return false;
+			}
+			reads++;
 		}
-		reads++;
+		peeked = ~uint64_t(0);
 		if (g.is_pad) {
 			break;	// the pass's trailing pads: every file is mapped
 		}
@@ -565,12 +581,16 @@ bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint6
 			return false;
 		}
 		const uint16_t file = g.extent.file;
-		ByteReader h(header, PAGE_SIZE, "a file header page", 0);
-		const uint16_t slot0 = h.U16(PAGE_SIZE - 2);
-		if (slot0 < 96 || slot0 + FILE_HEADER_SIZE_AT + 4 > PAGE_SIZE || h.U16(slot0 + FILE_HEADER_ID_AT) != file) {
+		FileHeaderRecord record;
+		try {
+			record = ReadFileHeaderRecord(header, PAGE_SIZE);
+		} catch (FormatError &) {
+			return false;  // the rule does not hold: the pass is searched or mapped by its headers
+		}
+		if (record.file_id != file) {
 			return false;
 		}
-		const uint32_t size = h.U32(slot0 + FILE_HEADER_SIZE_AT);
+		const uint32_t size = record.size;
 		// Every PFS page's extent is copied, so a file has at least size / 8088 extents: one whose
 		// Size the rest of the pass cannot hold is refused before anything is allocated for it.
 		if (size == 0 || size / PFS_INTERVAL + 1 > result.groups_ - file_group) {
@@ -580,23 +600,43 @@ bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint6
 		std::vector<uint8_t> gam_copy(gam, gam + PAGE_SIZE);
 		for (uint32_t interval = 0;; interval++) {
 			ByteReader bm(gam_copy.data(), PAGE_SIZE, "a GAM page", 0);
-			AddInterval(file, size, interval, bm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES), bitmap);
+			const size_t allocated =
+				AddInterval(file, size, interval, bm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES), bitmap);
 			if (bitmap.Count() > result.groups_ - file_group) {
 				return false;
 			}
 			const uint64_t next_base = static_cast<uint64_t>(interval + 1) * GAM_INTERVAL_PAGES;
-			if (next_base >= size) {
+			// Past the recorded Size, an interval whose GAM allocates nothing ends the file: data that
+			// outgrew the Size fills an interval before the next (and a crafted pass cannot grow the
+			// bitmap an interval a group).
+			const bool past_size = static_cast<uint64_t>(interval) * GAM_INTERVAL_PAGES >= size;
+			if (next_base >= (static_cast<uint64_t>(1) << 32) || (past_size && allocated == 0)) {
 				break;
 			}
 			// The next GAM's extent comes after every extent added so far: its rank is their count.
 			const uint32_t next_extent = static_cast<uint32_t>(next_base / PAGES_PER_EXTENT);
-			if (!ReadPassGroup(stream, result.units_offset, result.groups_, file_group + bitmap.Count(), g)) {
-				return false;
+			const uint64_t next_group = file_group + bitmap.Count();
+			const bool recorded = next_base < size;
+			if (!ReadPassGroup(stream, result.units_offset, result.groups_, next_group, ahead)) {
+				if (recorded) {
+					return false;
+				}
+				break;	// the pass ends: no interval past the recorded Size
 			}
 			reads++;
-			const uint8_t *next_gam = GroupPage(g, 2, PAGE_TYPE_GAM);
-			if (!g.has_extent || g.extent.file != file || g.extent.extent != next_extent || !next_gam) {
-				return false;
+			// A later interval's GAM is its first page, unit 0 of its first extent (E17).
+			const uint8_t *next_gam = GroupPage(ahead, 0, PAGE_TYPE_GAM);
+			const bool is_next =
+				ahead.has_extent && ahead.extent.file == file && ahead.extent.extent == next_extent && next_gam;
+			if (!is_next) {
+				if (recorded) {
+					return false;
+				}
+				// Past the recorded Size the data reaches the next interval only if its GAM comes
+				// next (the Size a lower bound); otherwise the file ends here, and `ahead` is the
+				// next file's group 0 or a pad, kept for the loop.
+				peeked = next_group;
+				break;
 			}
 			gam_copy.assign(next_gam, next_gam + PAGE_SIZE);
 		}

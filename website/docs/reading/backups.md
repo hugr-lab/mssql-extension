@@ -10,9 +10,10 @@ server to connect to. The file is read only through DuckDB's file system, so wit
 extension (and its secrets) an `s3://` or `https://` path is read the way a local one is. A glob
 needs a file system that can list files: a local path or `s3://`, not `https://`.
 
-This release describes a backup: `mssql_backup_info` reports what `RESTORE HEADERONLY`,
-`RESTORE LABELONLY` and `RESTORE FILELISTONLY` report. Reading the tables inside a backup comes in
-later releases.
+`mssql_backup_info` describes a backup: what `RESTORE HEADERONLY`, `RESTORE LABELONLY` and
+`RESTORE FILELISTONLY` report. `mssql_backup_tables` and `mssql_backup_views` list what a full
+backup's database holds: its tables, their columns and types, and its views
+([below](#tables-and-views)). Reading the rows of a table comes in a later release.
 
 ```sql
 SELECT backup_type, database_name, software_version, compatibility_level,
@@ -44,9 +45,12 @@ SELECT f.logical_name, f.type, f.filegroup_name, f.size_bytes
 FROM (SELECT unnest(files) AS f FROM mssql_backup_info('/backups/sales_full.bak'));
 ```
 
-The reader has been checked against SQL Server 2025 backups, against what `RESTORE HEADERONLY` /
-`LABELONLY` / `FILELISTONLY` print for them. Backups of SQL Server 2017, 2019 and 2022 are to be
-checked by a test matrix in a later release.
+The reader is compared, field by field, with what `RESTORE HEADERONLY` / `LABELONLY` /
+`FILELISTONLY` print: on synthetic backups made by SQL Server 2025, on every change, and, when the
+project's oracle lane runs (it needs the repository's storage credentials, so not for a pull request
+from a fork), on each version's backups made by SQL Server 2017, 2019, 2022 and 2025. Each version
+makes what it can: ZSTD compression on 2025 only, `MS_XPRESS` named from 2022 and plain
+`WITH COMPRESSION` (the same algorithm) before.
 
 ## What is refused
 
@@ -95,10 +99,74 @@ Each of these is refused by name, before any value is returned:
 | `recovery_model` | `VARCHAR` | `FULL`, `BULK_LOGGED` or `SIMPLE` |
 | `files` | `LIST(STRUCT(…))` | the database's files: `logical_name`, `physical_name`, `type` (`data` / `log`), `file_id`, `filegroup_id`, `filegroup_name`, `size_bytes`, `max_size_bytes`, `create_lsn`, `unique_id`, `backup_size_bytes` (NULL for now) |
 
+## Tables and views
+
+`mssql_backup_tables(path)` lists the user tables of a full backup, one row each, read from the
+database's own catalog inside the file; `mssql_backup_views(path)` its views with their T-SQL
+definitions. A log backup holds no data pages and is refused; a differential is read over its full
+backup, which comes in a later release, and is refused too.
+
+```sql
+SELECT schema_name, table_name, shape, row_count, decodable, reason
+FROM mssql_backup_tables('/backups/sales_full.bak');
+
+-- One table's columns: the SQL Server type and the DuckDB type the extension reads it as
+SELECT c.name, c.sql_type, c.duckdb_type, c.collation, c.is_nullable
+FROM (SELECT unnest(columns) AS c FROM mssql_backup_tables('/backups/sales_full.bak')
+      WHERE schema_name = 'sales' AND table_name = 'orders');
+
+SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sales_full.bak');
+```
+
+`mssql_backup_tables` columns:
+
+| column | type | meaning |
+|---|---|---|
+| `schema_name`, `table_name`, `object_id` | `VARCHAR`, `VARCHAR`, `INTEGER` | |
+| `shape` | `VARCHAR` | `heap`, `clustered` or `columnstore` |
+| `compression` | `VARCHAR` | `none`, `row`, `page`, `columnstore`, `columnstore_archive` (`level n` for a level the reader does not name); `mixed` when partitions differ |
+| `partition_count`, `row_count` | `INTEGER`, `BIGINT` | the row count the catalog keeps (`sys.partitions.rows`); NULL when a partition's count is negative (an upgraded database can hold one until `DBCC UPDATEUSAGE`) |
+| `created`, `modified` | `TIMESTAMP` | `sys.tables.create_date` / `modify_date` |
+| `decodable`, `reason` | `BOOLEAN`, `VARCHAR` | whether a later release's scan reads the table, and why not (a clustered columnstore, ROW / PAGE compression, sparse columns, a partitioned table, for now) |
+| `fuzzy_status`, `open_transactions`, `stale_transactions` | `VARCHAR`, `INTEGER`, `INTEGER` | NULL for now |
+| `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off: a plain `VARCHAR` for a string), `decodable`, `reason` |
+| `allocation_units` | `LIST(STRUCT(…))` | the table's allocation units: `au_id`, `type` (`IN_ROW_DATA`, `LOB_DATA`, `ROW_OVERFLOW_DATA`), `rowset_id`, `index_id`, `partition_number`, `compression`, `filegroup_id`, `first_page`, `root_page`, `first_iam_page`, `live_pages` (NULL for now) |
+| `partitioning` | `STRUCT(…)` | NULL for now |
+
+`mssql_backup_views` columns: `schema_name`, `view_name`, `object_id`, `definition` (the T-SQL text
+as stored; NULL for a view created `WITH ENCRYPTION`, which the reader does not de-obfuscate),
+`is_encrypted`, `created`, `modified`, and `reason`: why a definition could not be read, NULL
+otherwise.
+
+The oracle lane compares both with the server's own catalog of the same database (`sys.tables`,
+`sys.columns`, `sys.sql_modules`): per table its id, shape, partitions, rows and dates, per column
+its name, type, length, precision, scale, collation and flags, per view its definition (length and
+SHA-256), on backups made by SQL Server 2017 to 2025.
+
+### The catalog's base tables
+
+`mssql_backup_catalog(path, base_table)` returns a system base table of the database as stored,
+for a tool that mirrors the catalog: its rows, its columns typed by its own description (a
+`sql_variant` column as its raw bytes), and two virtual columns that `SELECT *` leaves out:
+`_mssql_page`, the row's page (`'01'`, then the file and page number in hex), and `_mssql_rid`, the
+row's clustered key. With no `base_table` it lists the tables it serves: `sysallocunits`,
+`sysrowsets`, `sysschobjs`, `syscolpars`, `sysrscols`, `sysseobjvalues`, `sysclsobjs`,
+`sysobjvalues`, `sysidxstats`, `sysiscols`, `systypedsubobjs`, `syssingleobjrefs` and
+`sysscalartypes`. Any other is refused by name. `sysobjvalues` gives only the definitions of views
+(not encrypted ones), defaults and the computed columns of tables, and partition boundaries -- never
+the source of a procedure, function or trigger -- and `sysseobjvalues` only the defaults of columns
+added after rows were written; the listing's `row_count` is NULL for these two.
+
+```sql
+SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak');
+SELECT _mssql_page, id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs');
+```
+
 ## Prepared statements
 
-The file is read when the statement binds, and a prepared statement keeps what its `PREPARE`
-read. `reread := true` reads the file again on every `EXECUTE`, for a file that is overwritten
+`mssql_backup_info` reads the file when the statement binds, and a prepared statement keeps what
+its `PREPARE` read (`mssql_backup_tables`, `mssql_backup_views` and `mssql_backup_catalog` read it on
+every execution). `reread := true` reads the file again on every `EXECUTE`, for a file that is overwritten
 between runs (a nightly backup to the same path):
 
 ```sql

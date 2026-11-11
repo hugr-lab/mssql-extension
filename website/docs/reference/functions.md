@@ -249,6 +249,33 @@ SELECT * FROM mssql_backup_info(['/backups/s1.bak', '/backups/s2.bak']);
 `position` is the backup set on the media (only `1` for now: a file holding appended sets is
 refused). `reread := true` makes a prepared statement read the file again on every `EXECUTE`.
 
+### mssql_backup_tables() / mssql_backup_views()
+
+List the user tables, and the views with their definitions, of the database in a SQL Server full
+backup, read from the file alone. See [Backup Files](../reading/backups.md#tables-and-views) for
+every column.
+
+**Signature:** `mssql_backup_tables(path VARCHAR | VARCHAR[]) -> TABLE(...)`,
+`mssql_backup_views(path VARCHAR | VARCHAR[]) -> TABLE(...)`
+
+```sql
+SELECT schema_name, table_name, row_count FROM mssql_backup_tables('/backups/sales_full.bak');
+SELECT view_name, definition FROM mssql_backup_views('/backups/sales_full.bak');
+```
+
+### mssql_backup_catalog()
+
+A system base table of the database in a SQL Server full backup, as stored, with the virtual
+`_mssql_page` and `_mssql_rid`; with no table, the base tables it serves. See
+[Backup Files](../reading/backups.md#the-catalogs-base-tables).
+
+**Signature:** `mssql_backup_catalog(path VARCHAR | VARCHAR[] [, base_table VARCHAR]) -> TABLE(...)`
+
+```sql
+SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak');
+SELECT id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs');
+```
+
 ### Authentication Test Functions
 
 Connectivity diagnostics that exercise the auth path without a full query.

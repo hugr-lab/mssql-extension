@@ -5,7 +5,9 @@ name: ClusterFuzzLite PR fuzzing
 #
 # PRs run ASan only (fast feedback). UBSan is offloaded to a weekly batch run
 # (`ubsan-weekly` below) against the full corpus, so a UBSan regression is still
-# caught within the week without doubling every PR's fuzzing wall-time.
+# caught within the week without doubling every PR's fuzzing wall-time. The weekly
+# run also fuzzes the backup reader's harnesses (spec 085), which the PR budget
+# leaves out: replaying their stored corpora cannot discover a path, a fuzzer can.
 on:
   pull_request:
     paths:
@@ -60,6 +62,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # The backup reader's harnesses (spec 085), beside the default targets:
+      # read by .clusterfuzzlite/build.sh; the PR job above builds none of them.
+      - name: Add the backup reader's harnesses
+        run: echo "backup_mtf backup_container backup_xpress backup_page backup_catalog" > .clusterfuzzlite/extra_targets
+
       - name: Build fuzzers (undefined)
         id: build
         uses: google/clusterfuzzlite/actions/build_fuzzers@v1
@@ -72,7 +79,9 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 600
+          # run_fuzzers splits this between the targets: 1000 s over ten keeps
+          # the six default ones at the ~100 s each that 600 s over six gave.
+          fuzz-seconds: 1000
           mode: 'batch'
           sanitizer: undefined
           output-sarif: true
