@@ -154,6 +154,7 @@ struct CatalogTable {
 	TableShape shape = TableShape::Heap;
 	std::vector<CatalogPartition> partitions;  // owner type 1, by partition number
 	int64_t row_count = 0;					   // rcrows of the base rowsets of owner types 1 and 3
+	bool row_count_known = true;			   // false: a count negative, or the sum past int64
 	std::vector<CatalogColumn> columns;		   // by column id
 	std::vector<CatalogUnit> units;
 	//! Whether the scan can read the table; `reason` names what it cannot when not (spec 085 D13).
@@ -190,6 +191,10 @@ struct CatalogModel {
 
 //! The most bytes of one module's text the catalog reads (a view's definition is nvarchar(max)).
 static constexpr uint64_t MAX_MODULE_TEXT_BYTES = 64ull << 20;
+//! The most bytes of off-row values one call of a catalog function reads in all (each within
+//! MAX_MODULE_TEXT_BYTES): a crafted file whose rows all point to one large LOB must not cost its size
+//! once per row.
+static constexpr uint64_t MAX_CALL_OFF_ROW_BYTES = 1ull << 30;
 
 //! The catalog model of the database whose base tables are `tables`, its other system tables read
 //! through `store`. What one object's rows get wrong is named on that object (D13): a table the scan
@@ -201,8 +206,11 @@ static constexpr uint64_t MAX_MODULE_TEXT_BYTES = 64ull << 20;
 //! a malformed row of sysclsobjs or sysscalartypes).
 CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &tables);
 
+//! The flag of a module's sysobjvalues `value` that says its text is Latin-1, not UTF-16LE.
+constexpr int64_t MODULE_TEXT_LATIN1 = 0x2;
+
 //! A module's text from its sysobjvalues bytes and flags (`value`, a sql_variant int): Latin-1 bytes
-//! when the flags have 0x2, else UTF-16LE; UTF-8 either way.
+//! when the flags have MODULE_TEXT_LATIN1, else UTF-16LE; UTF-8 either way.
 std::string ModuleText(const std::string &bytes, int64_t flags, const std::string &what);
 
 }  // namespace backup

@@ -180,7 +180,9 @@ for fixture in ${FIXTURES}; do
 		# which the server's user can write (from the 2019 image on it is mssql; /tmp/gen is root's).
 		docker exec -d -e SQLCMDPASSWORD "${CONTAINER}" sh -c '"$@" >/tmp/workload.log 2>&1' sh \
 			"${SQLCMD[@]}" -S localhost -U sa -b -i /tmp/gen/load_workload.sql
-		ticks() { scalar "SELECT ticks FROM bak_load.dbo.control"; }
+		# A failed query answers empty, so the checks below name it (under set -e a bare assignment of a
+		# failed substitution would end the script with no word).
+		ticks() { scalar "SELECT ticks FROM bak_load.dbo.control" || true; }
 		workload_failed() {	# $1 = what went wrong
 			echo "ERROR: the load fixture's workload $1; its log:" >&2
 			docker exec "${CONTAINER}" cat /tmp/workload.log >&2 || true
@@ -201,7 +203,7 @@ for fixture in ${FIXTURES}; do
 		sql -Q "UPDATE bak_load.dbo.control SET stop_requested = 1" >/dev/null
 		left=""
 		for _ in $(seq 1 60); do
-			left="$(scalar "SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE database_id = DB_ID('bak_load') AND session_id <> @@SPID")"
+			left="$(scalar "SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE database_id = DB_ID('bak_load') AND session_id <> @@SPID" || true)"
 			[ "${left}" = 0 ] && break
 			sleep 1
 		done

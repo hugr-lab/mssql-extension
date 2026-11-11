@@ -100,6 +100,10 @@ uint16_t SlotOffset(const Page &page, uint16_t slot) {
 // The data records of one page through `layout`, each handed to `row`.
 void PageRows(const Page &page, const RowsetLayout &layout, const std::function<void(const SystemRow &)> &row) {
 	const std::string what = layout.table + " page " + page.header.page_id.ToString();
+	if (page.bytes.size() != PAGE_SIZE) {
+		throw FormatError("backup: " + what + " holds " + std::to_string(page.bytes.size()) + " bytes, not a page's " +
+						  std::to_string(PAGE_SIZE));
+	}
 	if (static_cast<size_t>(page.header.slot_count) * 2 + PAGE_HEADER_SIZE > PAGE_SIZE) {
 		throw FormatError("backup: " + what + " has " + std::to_string(page.header.slot_count) +
 						  " slots, more than an 8 KB page holds");
@@ -116,6 +120,18 @@ void PageRows(const Page &page, const RowsetLayout &layout, const std::function<
 	std::sort(offsets.begin(), offsets.end());
 	if (std::adjacent_find(offsets.begin(), offsets.end()) != offsets.end()) {
 		throw FormatError("backup: " + what + " has two slots pointing to one record");
+	}
+	// Records lie apart: a FixedVar record ends at or before the next record's start (its variable
+	// columns are bounded by the slot array alone otherwise, so one could take the next record's bytes
+	// as its own value; review of #549).
+	for (size_t i = 0; i + 1 < offsets.size(); i++) {
+		const RecordView record =
+			ReadRecord(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * page.header.slot_count, offsets[i], what.c_str());
+		const uint32_t end = static_cast<uint32_t>(offsets[i]) + record.End();
+		if (record.End() != 0 && end > offsets[i + 1]) {
+			throw FormatError("backup: " + what + " has a record at offset " + std::to_string(offsets[i]) +
+							  " that runs past the next record's start (" + std::to_string(offsets[i + 1]) + ")");
+		}
 	}
 	SystemRow out;
 	for (uint16_t s = 0; s < page.header.slot_count; s++) {
@@ -289,6 +305,9 @@ int64_t ValueInt(const RowsetLayout &layout, size_t column, const SystemValue &v
 	if (v.is_null) {
 		return null_value;
 	}
+	if (v.off_row) {
+		throw FormatError("backup: " + ColumnName(layout, column) + " is stored off-row");
+	}
 	const PhysicalColumn &c = layout.columns[column];
 	const uint8_t *b = reinterpret_cast<const uint8_t *>(v.bytes.data());
 	ByteReader r(b, v.bytes.size(), c.name.c_str());
@@ -338,6 +357,9 @@ PagePointer ValuePointer(const RowsetLayout &layout, size_t column, const System
 	const PhysicalColumn &c = layout.columns[column];
 	if (v.is_null) {
 		return PagePointer();
+	}
+	if (v.off_row) {
+		throw FormatError("backup: " + ColumnName(layout, column) + " is stored off-row");
 	}
 	if (c.xtype != XTYPE_BINARY) {
 		throw FormatError("backup: " + ColumnName(layout, column) + " is " + XtypeName(c.xtype) +
@@ -545,7 +567,15 @@ RowsetLayout BootstrapTables::LayoutOf(int32_t object_id, const SysRowset &base)
 
 std::vector<PagePointer> UnitPages(const PageStore &store, const SysAllocUnit &unit) {
 	const AuPages pages = ReadIamChain(store, unit.first_iam, unit.auid);
+	// An IAM page whose bits are all set lists 511,232 pages: no unit lists more pages than the backup
+	// carries (review of #549), and the list is built once at its size.
+	if (pages.PageCount() > store.PageCapacity()) {
+		throw FormatError("backup: allocation unit " + std::to_string(unit.auid) + "'s IAM chain lists " +
+						  std::to_string(pages.PageCount()) + " pages, more than the backup's " +
+						  std::to_string(store.PageCapacity()));
+	}
 	std::vector<PagePointer> out(pages.single_pages.begin(), pages.single_pages.end());
+	out.reserve(static_cast<size_t>(pages.PageCount()));
 	for (const auto &run : pages.extents) {
 		for (uint64_t e = run.first; e < static_cast<uint64_t>(run.first) + run.count; e++) {
 			for (uint32_t k = 0; k < 8; k++) {
@@ -565,6 +595,9 @@ bool ReadUnitDataPage(const PageStore &store, const SysAllocUnit &unit, const Pa
 		if (!store.Read(at.file, at.page, out)) {
 			return false;  // in one of the unit's extents, and not in use
 		}
+	} catch (PendingPageError &e) {
+		// Kept a PendingPageError: the catalog model names it on the objects that need the table (D13).
+		throw PendingPageError(std::string(e.what()) + " (reading " + table + ")");
 	} catch (FormatError &e) {
 		throw FormatError(std::string(e.what()) + " (reading " + table + ")");
 	}
@@ -705,10 +738,42 @@ void AddBootstrapRow(BootstrapTables &out, const std::string &table, const Syste
 	}
 }
 
+namespace {
+
+BootstrapTables ReadBootstrapTablesThroughLiterals(const PageStore &store, const BootPage &boot, uint64_t &self_au);
+
+}  // namespace
+
+static void CheckBootstrapUnits(const BootstrapTables &out, uint64_t self_au);
+
 BootstrapTables ReadBootstrapTables(const PageStore &store, const BootPage &boot) {
+	// The five are decoded through literal layouts before their own description can be read, and the
+	// literals are checked against it only once all five are in (the description IS those tables). A
+	// version that moved a field fails on the way, and says so: the failure is named with the
+	// database's version and whether the reader was measured on it (review of #549).
+	uint64_t self_au = 0;
+	BootstrapTables out;
+	try {
+		out = ReadBootstrapTablesThroughLiterals(store, boot, self_au);
+		CheckBootstrapLayouts(out);
+		CheckBootstrapUnits(out, self_au);
+	} catch (FormatError &e) {
+		const bool measured = boot.version == 869 || boot.version == 904 || boot.version == 957 || boot.version == 998;
+		throw FormatError(std::string(e.what()) +
+						  " (reading the bootstrap system tables through the layouts the reader "
+						  "knows, measured on database versions 869, 904, 957 and 998: this "
+						  "database is version " +
+						  std::to_string(boot.version) +
+						  (measured ? ")" : ", which the reader has not been checked on: a layout it may not know)"));
+	}
+	return out;
+}
+
+namespace {
+
+BootstrapTables ReadBootstrapTablesThroughLiterals(const PageStore &store, const BootPage &boot, uint64_t &self_au) {
 	BootstrapTables out;
 	// sysallocunits along its leaf chain from dbi_firstSysIndexes.
-	uint64_t self_au = 0;
 	std::set<std::pair<uint16_t, uint32_t>> chain;
 	{
 		const RowsetLayout &l = BootstrapLayout("sysallocunits");
@@ -777,7 +842,12 @@ BootstrapTables ReadBootstrapTables(const PageStore &store, const BootPage &boot
 	read("syscolpars", AU_SYSCOLPARS);
 	read("sysrscols", AU_SYSRSCOLS);
 	out.BuildIndexes();
-	CheckBootstrapLayouts(out);
+	return out;
+}
+
+}  // namespace
+
+static void CheckBootstrapUnits(const BootstrapTables &out, uint64_t self_au) {
 	// The units the reader found the four by are their base rowsets' in-row units.
 	const std::pair<const char *, uint64_t> units_of[] = {{"sysrowsets", AU_SYSROWSETS},
 														  {"sysschobjs", AU_SYSSCHOBJS},
@@ -793,7 +863,6 @@ BootstrapTables ReadBootstrapTables(const PageStore &store, const BootPage &boot
 							  std::to_string(in_row));
 		}
 	}
-	return out;
 }
 
 void CheckBootstrapLayouts(const BootstrapTables &tables) {

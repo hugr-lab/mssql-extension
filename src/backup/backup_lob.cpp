@@ -157,7 +157,19 @@ std::string ReadLobValue(const LobPageFetch &fetch, const std::string &pointer, 
 						  " bytes, not a header and whole links");
 	}
 	const size_t links = (pointer.size() - ROOT_HEADER) / ROOT_LINK;
-	const uint64_t total = root.U32(ROOT_HEADER + ROOT_LINK * (links - 1));
+	// Every link checked before any is followed: ascending, so the last is the total, and that total
+	// within max_bytes -- a node's own links are then bounded by what its parent claims (Child), so
+	// no subtree is read past the bound (a first link of 0xFFFFFFFF before a last of 1 is refused
+	// here, not after its subtree was read; review of #549).
+	uint64_t ascending = 0;
+	for (size_t i = 0; i < links; i++) {
+		const uint64_t cumulative = root.U32(ROOT_HEADER + ROOT_LINK * i);
+		if (cumulative <= ascending) {
+			throw FormatError("backup: " + what + "'s in-row LOB root has links whose sizes do not ascend");
+		}
+		ascending = cumulative;
+	}
+	const uint64_t total = ascending;
 	if (total > max_bytes) {
 		throw FormatError("backup: " + what + " is a value of " + std::to_string(total) + " bytes, more than the " +
 						  std::to_string(max_bytes) + " the reader takes");

@@ -148,10 +148,13 @@ def compare_set(c, db, name, arg, texts):
     listed = db.query(f"SELECT base_table, row_count::VARCHAR AS row_count FROM mssql_backup_catalog({arg})")
     c.check(f"{name}: mssql_backup_catalog", "lists sysschobjs", any(r["base_table"] == "sysschobjs" for r in listed),
             True)
+    # Every table in one statement: one DuckDB process rather than one a table (each call still opens the backup).
+    served = {r["base_table"]: r["n"] for r in db.query(" UNION ALL ".join(
+        f"SELECT {sql_string(r['base_table'])} AS base_table, count(*)::VARCHAR AS n "
+        f"FROM mssql_backup_catalog({arg}, {sql_string(r['base_table'])})" for r in listed))} if listed else {}
     for r in listed:
-        served = db.query(f"SELECT count(*)::VARCHAR AS n FROM mssql_backup_catalog({arg}, {sql_string(r['base_table'])})")
         if r["row_count"] is not None:
-            c.check(f"{name}: mssql_backup_catalog {r['base_table']}", "rows", served[0]["n"], r["row_count"])
+            c.check(f"{name}: mssql_backup_catalog {r['base_table']}", "rows", served[r["base_table"]], r["row_count"])
     # main() requires <set>.modules.txt beside .tables.txt.
     ours = {(r["valclass"], r["objid"], r["subobjid"]) for r in db.query(
         "SELECT DISTINCT valclass::VARCHAR AS valclass, objid::VARCHAR AS objid, subobjid::VARCHAR AS subobjid "
@@ -191,14 +194,19 @@ def main():
     for name, file_list in sets:
         if f"{name}.tables.txt" not in texts:
             # No golden (a backup taken under a workload, a differential, a log): a full's catalog is
-            # still opened -- it lists, or is refused by name for a page that became live while the
-            # backup ran (its content in the log tail) --, never a crash or an unnamed error.
+            # still opened -- it lists (a page of sysobjvalues / sysseobjvalues that became live while
+            # the backup ran named on the objects that need it), or is refused by name for such a page
+            # of a base table the model is built from --, never a crash or an unnamed error.
             arg = "[" + ", ".join(sql_string(f"{base}/{f}") for f in file_list.split(",")) + "]"
             kind = db.query(f"SELECT backup_type FROM mssql_backup_info({arg})")[0]["backup_type"]
             if kind == "full":
-                ok, out = db.try_query(f"SELECT count(*)::VARCHAR AS n FROM mssql_backup_tables({arg})")
-                c.check(f"{name}: mssql_backup_tables (no golden)", "lists or refuses by name",
-                        ok or "became live while the backup ran" in out, True)
+                for function in ("mssql_backup_tables", "mssql_backup_views"):
+                    ok, out = db.try_query(f"SELECT count(*)::VARCHAR AS n FROM {function}({arg})")
+                    # A refusal for a page of sysobjvalues / sysseobjvalues would be a regression: the
+                    # model names those on the objects that need them.
+                    refused = ("became live while the backup ran" in out and "(reading sysobjvalues)" not in out
+                               and "(reading sysseobjvalues)" not in out)
+                    c.check(f"{name}: {function} (no golden)", "lists or refuses by name", ok or refused, True)
             continue
         for kind in ("columns", "views", "modules"):
             if f"{name}.{kind}.txt" not in texts:

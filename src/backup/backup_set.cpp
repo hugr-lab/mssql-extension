@@ -256,15 +256,10 @@ static void ReadTrailer(const RandomAccess &file, const MtfBlock &block, BackupS
 			if (length < SFIN_MIN) {
 				mqci.Fail(at, "an SFIN record of " + std::to_string(length) + " bytes, shorter than its fixed part");
 			}
-			// Flags at +8: 0x20 on a file emptied and removed (ALTER DATABASE ... REMOVE FILE), which
-			// FILELISTONLY leaves out and the backup carries no page of; 0x04 / 0x84 on the others
-			// (measured, files fixture, 2022).
-			if (record.U32(8) & SFIN_REMOVED) {
-				set.removed_file_ids.push_back(record.U32(20));
-				at += length;
-				continue;
-			}
 			DatabaseFile f;
+			// Flags at +8: 0x20 on a file emptied and removed in the files fixture (2022); a hint, not
+			// a fact (DatabaseFile::marked_removed).
+			f.marked_removed = (record.U32(8) & SFIN_REMOVED) != 0;
 			f.file_id = record.U32(20);
 			const uint32_t type = record.U32(28);
 			if (type != 1 && type != 2) {
@@ -376,11 +371,7 @@ BackupSetHeader ReadBackupSet(const RandomAccess &file, const MtfLayout &layout)
 		if (msci->Stream("MQCI")) {
 			BackupSetHeader start;
 			ReadTrailer(file, *msci, start, false);
-			if (!start.files.empty()) {
-				set.files = std::move(start.files);
-			}
-			set.removed_file_ids.insert(set.removed_file_ids.end(), start.removed_file_ids.begin(),
-										start.removed_file_ids.end());
+			set.start_files = std::move(start.files);
 		}
 	}
 

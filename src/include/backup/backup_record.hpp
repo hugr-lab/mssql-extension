@@ -55,6 +55,10 @@ struct RecordView {
 	bool HasVariableColumns() const {
 		return (status_a & 0x20) != 0;
 	}
+	//! Where a FixedVar record ends, from its start: its last variable column's end (or where variable
+	//! data would start), plus the 14-byte version tag statusA 0x40 adds (E20). 0 for a record that
+	//! is not FixedVar (its view holds the status bytes only).
+	uint16_t End() const;
 	//! Column `column` (0-based, of column_count) is NULL in the bitmap; false without a bitmap.
 	bool IsNull(size_t column) const;
 	//! Variable column `i`'s bytes: [start, end) from the record's start, bit 15 masked off.

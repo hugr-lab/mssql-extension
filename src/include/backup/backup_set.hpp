@@ -82,6 +82,11 @@ struct DatabaseFile {
 	uint64_t max_size_bytes = 0;
 	Lsn create_lsn;
 	Guid unique_id;
+	//! SFIN flag 0x20 at +8: set on a file emptied and removed (ALTER DATABASE ... REMOVE FILE) in the
+	//! files fixture (2022), which FILELISTONLY leaves out and the backup carries no page of. The word
+	//! holds other per-backup bits (0x84 / 0x04 for one unchanged file, review of #549), so the flag is
+	//! a hint: the page reader drops such a file only when the backup carries no page 0 of it.
+	bool marked_removed = false;
 };
 
 struct BackupSetHeader {
@@ -140,11 +145,12 @@ struct BackupSetHeader {
 	//! A differential's base; zero for any other backup.
 	Lsn differential_base_lsn;
 	Guid differential_base_guid;
+	//! The trailer's files: what the page reader reads (marked_removed ones included).
 	std::vector<DatabaseFile> files;
-	//! Files the set's SFIN records mark removed (flag 0x20: emptied and removed by ALTER DATABASE ...
-	//! REMOVE FILE), left out of `files` as FILELISTONLY leaves them out. Kept so that a backup
-	//! carrying a page of one is refused rather than read as a file with no live page.
-	std::vector<uint32_t> removed_file_ids;
+	//! The files as the backup began (MSCI's SFIN records), when the set has them: what FILELISTONLY
+	//! lists, their sizes the start's (a file grown while the backup ran is larger in the trailer).
+	//! mssql_backup_info's `files` only, never the page reader's.
+	std::vector<DatabaseFile> start_files;
 
 	//! This file's share of HEADERONLY's BackupSize: the MSLS block's offset less one soft filemark.
 	uint64_t backup_size = 0;

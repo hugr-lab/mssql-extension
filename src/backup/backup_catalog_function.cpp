@@ -107,16 +107,14 @@ LogicalType TypeOf(const RowsetLayout &layout, const PhysicalColumn &c) {
 	}
 	const char *name = SystemTypeName(c.xtype);
 	if (!name) {
-		throw InvalidInputException("%s: %s.%s is of xtype %d, which the reader does not read", FUNCTION, layout.table,
-									c.name, static_cast<int>(c.xtype));
+		// A type the base tables' values are not converted from (decimal, datetime2, image, ... on some
+		// version): its stored bytes, as CellValue gives them, never a refusal of the whole listing
+		// (review of #549).
+		return LogicalType::BLOB;
 	}
 	const int16_t length = c.length == 0xFFFF ? int16_t(-1) : static_cast<int16_t>(c.length);
 	return MSSQLColumnInfo::MapSQLServerTypeToDuckDB(name, length, c.precision, c.scale);
 }
-
-//! The most bytes of off-row values one call reads in all (each within MAX_MODULE_TEXT_BYTES): a
-//! crafted file whose rows all point to one large LOB must not cost its size once per row.
-constexpr uint64_t MAX_CALL_OFF_ROW_BYTES = 1ull << 30;
 
 std::string AllowedList() {
 	std::string out;
@@ -233,9 +231,8 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		}
 	}
 	try {
-		data->catalog = std::shared_ptr<OpenedCatalog>(
-			OpenBackupCatalog(context, std::vector<std::string>(data->paths.begin(), data->paths.end()), false)
-				.release());
+		data->catalog =
+			OpenBackupCatalog(context, std::vector<std::string>(data->paths.begin(), data->paths.end()), false);
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", FUNCTION, e.what());
 	}
@@ -381,6 +378,12 @@ std::string RowId(const BaseTableBindData &data, const SystemRow &row) {
 		if (v.is_null) {
 			rid.append("\xFF\xFF", 2);
 			continue;
+		}
+		// u16 lengths, 0xFFFF the NULL marker: a key value of 65535 bytes or more (an off-row one, read in
+		// full) cannot be written, and is named rather than truncated into another key (review of #549).
+		if (v.bytes.size() >= 0xFFFF) {
+			throw FormatError("backup: " + data.table + "." + data.layout.columns[i].name + ", a key column, holds " +
+							  std::to_string(v.bytes.size()) + " bytes, more than _mssql_rid's u16 length takes");
 		}
 		const uint16_t length = static_cast<uint16_t>(v.bytes.size());
 		rid.push_back(static_cast<char>(length & 0xFF));

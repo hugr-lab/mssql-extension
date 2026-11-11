@@ -50,9 +50,10 @@ bool PageStore::Read(uint16_t file, uint32_t page, Page &out) const {
 		PagePointer p;
 		p.file = file;
 		p.page = page;
-		throw FormatError("backup: page " + p.ToString() +
-						  " became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
-						  "backup), which is not replayed yet");
+		throw PendingPageError(
+			"backup: page " + p.ToString() +
+			" became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
+			"backup), which is not replayed yet");
 	}
 	return state == PageState::Present;
 }

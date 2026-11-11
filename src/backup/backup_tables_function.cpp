@@ -23,6 +23,8 @@
 #include "mssql_function_docs.hpp"
 #include "tds/encoding/datetime_encoding.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 
 namespace duckdb {
@@ -239,7 +241,21 @@ Value ColumnValue(const CatalogColumn &c) {
 	const uint32_t code_page = collation ? collation->code_page : 0;
 	std::string reason = ColumnRefusal(c, code_page);
 	Value duckdb_type(LogicalType::VARCHAR);
-	if (!c.system_type_name.empty()) {
+	// The precision and scale are the file's: LogicalType::DECIMAL asserts what they must be (an
+	// assertion, not an exception), so a declaration no server writes is named here instead. By the
+	// name too, which the type map dispatches on: the file's sysscalartypes names it, and a CLR column
+	// (xtype 240) takes its name from its user type.
+	std::string name = c.system_type_name;
+	std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
+	const bool decimal = c.system_type_id == 106 || c.system_type_id == 108 || name == "decimal" || name == "numeric";
+	const bool scaled = c.system_type_id == 41 || c.system_type_id == 42 || c.system_type_id == 43 || name == "time" ||
+						name == "datetime2" || name == "datetimeoffset";
+	if ((decimal && (c.precision < 1 || c.precision > 38 || c.scale > c.precision)) || (scaled && c.scale > 7)) {
+		if (reason.empty()) {
+			reason = c.system_type_name + " is declared with precision " + std::to_string(c.precision) + " and scale " +
+					 std::to_string(c.scale) + ", which no SQL Server type has";
+		}
+	} else if (!c.system_type_name.empty()) {
 		try {
 			duckdb_type =
 				Value(MSSQLColumnInfo::MapSQLServerTypeToDuckDB(c.system_type_name, c.max_length, c.precision, c.scale)
@@ -307,7 +323,7 @@ std::vector<Value> TableRow(const CatalogTable &t) {
 	row.push_back(Text(ShapeName(t.shape)));
 	row.push_back(OptionalText(compression));
 	row.push_back(Value::INTEGER(static_cast<int32_t>(t.partitions.size())));
-	row.push_back(Value::BIGINT(t.row_count));
+	row.push_back(t.row_count_known ? Value::BIGINT(t.row_count) : Value(LogicalType::BIGINT));
 	row.push_back(RecordDatetimeValue(t.created));
 	row.push_back(RecordDatetimeValue(t.modified));
 	row.push_back(Value::BOOLEAN(t.decodable));
@@ -321,7 +337,9 @@ std::vector<Value> TableRow(const CatalogTable &t) {
 	return row;
 }
 
-std::vector<Value> ViewRow(const PageStore &store, const CatalogView &v) {
+// `off_row_bytes`: the call's off-row definitions so far, within MAX_CALL_OFF_ROW_BYTES in all (as
+// mssql_backup_catalog's; review of #549): past it a view's definition is NULL with the reason.
+std::vector<Value> ViewRow(const PageStore &store, const CatalogView &v, uint64_t &off_row_bytes) {
 	Value definition(LogicalType::VARCHAR);
 	std::string reason = v.reason;
 	auto add = [&reason](std::string why) {
@@ -332,7 +350,17 @@ std::vector<Value> ViewRow(const PageStore &store, const CatalogView &v) {
 	};
 	if (!v.is_encrypted && v.definition.state != ModuleDefinition::State::Absent) {
 		try {
-			definition = Value(ReadModuleDefinition(store, v.definition, "the definition of view " + v.name));
+			const bool off_row = v.definition.state == ModuleDefinition::State::Deferred;
+			if (off_row && off_row_bytes >= MAX_CALL_OFF_ROW_BYTES) {
+				add("its definition is stored off row, and the call's off-row definitions pass " +
+					std::to_string(MAX_CALL_OFF_ROW_BYTES) + " bytes in all");
+			} else {
+				std::string text = ReadModuleDefinition(store, v.definition, "the definition of view " + v.name);
+				if (off_row) {
+					off_row_bytes += text.size();
+				}
+				definition = Value(std::move(text));
+			}
 		} catch (FormatError &e) {
 			add(e.what());
 		}
@@ -372,6 +400,7 @@ struct CatalogListBindData : public TableFunctionData {
 struct CatalogListState : public GlobalTableFunctionState {
 	std::unique_ptr<OpenedCatalog> catalog;
 	size_t next = 0;
+	uint64_t off_row_bytes = 0;	 // the views' off-row definitions read so far
 };
 
 const char *FunctionName(Listing listing) {
@@ -409,9 +438,10 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	const size_t total = data.listing == Listing::Tables ? model.tables.size() : model.views.size();
 	idx_t count = 0;
 	while (state.next < total && count < STANDARD_VECTOR_SIZE) {
-		const std::vector<Value> row = data.listing == Listing::Tables
-										   ? TableRow(model.tables[state.next])
-										   : ViewRow(*state.catalog->pages->store, model.views[state.next]);
+		const std::vector<Value> row =
+			data.listing == Listing::Tables
+				? TableRow(model.tables[state.next])
+				: ViewRow(*state.catalog->pages->store, model.views[state.next], state.off_row_bytes);
 		for (idx_t c = 0; c < row.size(); c++) {
 			output.data[c].SetValue(count, row[c]);
 		}

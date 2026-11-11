@@ -480,7 +480,8 @@ Common named parameters of every function, and ATTACH options of the same names:
 `mssql_backup_tables(path)` returns one row per user table: `schema_name`, `table_name`, `object_id`,
 `shape` (`heap` / `clustered` / `columnstore`), `compression` (from `sysrowsets.cmprlevel`; `mixed`
 when partitions differ, E7: `cmprlevel` is per partition), `partition_count`, `row_count` (sum of
-`sysrowsets.rcrows`, exact in every rowset of E7's 16 states), `created`, `modified`, `decodable`,
+`sysrowsets.rcrows`, exact in every rowset of E7's 16 states; NULL when one is negative or the sum passes
+int64 -- a statistic, so the table is read all the same), `created`, `modified`, `decodable`,
 `reason`, `fuzzy_status`, `open_transactions`, `stale_transactions`, and three nested values:
 
 - `columns LIST(STRUCT(column_id, name, sql_type, system_type_id, max_length, precision, scale,

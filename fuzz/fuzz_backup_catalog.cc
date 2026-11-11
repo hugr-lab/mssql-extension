@@ -77,9 +77,16 @@ static void Touch(const RowsetLayout &layout, const SystemRow &row) {
 				g_sink += ValuePointer(layout, c, v).page;
 				break;
 			case XTYPE_SQL_VARIANT: {
+				// The model reads a module's flags as this sql_variant's integer and decodes its text
+				// (imageval) by them: the integer, and the text in both of its forms.
 				const SqlVariant variant = ParseSqlVariant(v.bytes, "a value");
 				g_sink += variant.value.size();
-				g_sink += ModuleText(v.bytes, variant.xtype, "a value").size();
+				try {
+					g_sink += static_cast<size_t>(SqlVariantInt(variant, "a value"));
+				} catch (FormatError &) {
+				}
+				g_sink += ModuleText(variant.value, 0, "a value").size();
+				g_sink += ModuleText(variant.value, MODULE_TEXT_LATIN1, "a value").size();
 				break;
 			}
 			default:

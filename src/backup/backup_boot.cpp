@@ -53,7 +53,7 @@ void CheckBootAgainstSet(const BootPage &boot, const BackupSetHeader &set) {
 		throw FormatError("backup: the boot page and the backup set's trailer disagree on the database's " + field +
 						  " (" + boot_value + " against " + set_value + ")");
 	};
-	if (boot.database_name != set.database_name) {
+	if (!set.database_name.empty() && boot.database_name != set.database_name) {
 		refuse("name", boot.database_name, set.database_name);
 	}
 	if (set.database_version != 0 && boot.version != set.database_version) {

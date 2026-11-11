@@ -1411,7 +1411,7 @@ flowchart BT
   set --> opened["OpenedHeaders<br/>families checked to be one complete set"]
   opened --> info["mssql_backup_info"]
   src --> idx["PageIndex (built, used from PR 2)<br/>pass maps: ranked / runs;<br/>PassSearch over ordered passes;<br/>open pass over parallel ranges"]
-  idx --> alloc["AllocationMap<br/>file Size, GAM (lazy), PFS → live"]
+  idx --> alloc["AllocationMap<br/>GAM (lazy), PFS → live"]
   alloc --> store["PageStore<br/>a live page's latest copy, checked<br/>(Present / Pending)"]
   store --> iam["IAM chains<br/>an AU's pages"]
   iam --> sys["system base tables<br/>bootstrap five by literal layouts,<br/>checked against sysrscols;<br/>any other by its own description"]
@@ -1460,7 +1460,9 @@ flowchart BT
   (`OrderBroken` → mapped by headers); every other pass is mapped by its page headers. `AllocationMap` decides which pages are live
   (GAM allocated, PFS 0x40; the file's Size is a lower bound). `PageStore` hands out a live page's
   latest copy with its header checked, or `Pending` for a page that became live while the backup ran
-  (its content in the log tail). A table's pages come from its allocation unit's IAM chain (DQ-40,
+  (its content in the log tail; `Read` throws it as `PendingPageError`, which the catalog model names
+  on the views, computed columns and added-default tables that need `sysobjvalues` / `sysseobjvalues`
+  rather than failing the listing). A table's pages come from its allocation unit's IAM chain (DQ-40,
   `backup_iam`), the page header's AU only a check.
 - **The catalog's base tables** (`backup_system_tables`, PR 2b): one FixedVar decoder through a
   rowset's physical layout (sysrscols, named by syscolpars). The five bootstrap tables cannot be

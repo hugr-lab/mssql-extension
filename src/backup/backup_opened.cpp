@@ -206,6 +206,7 @@ std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &context, const Opene
 	index_options.trust_layout = options.trust_layout;
 	index_options.mapper = RangedPassMapper(context);
 	std::vector<uint16_t> data_files;
+	std::vector<uint16_t> marked_removed;
 	for (const auto &file : set.files) {
 		if (file.type != 'D') {
 			continue;
@@ -215,22 +216,25 @@ std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &context, const Opene
 			throw FormatError("backup file \"" + first + "\" lists data file \"" + file.logical_name + "\" with id " +
 							  std::to_string(file.file_id) + ", outside 1..32767");
 		}
-		data_files.push_back(static_cast<uint16_t>(file.file_id));
-	}
-	if (data_files.empty()) {
-		throw FormatError("backup file \"" + first + "\" lists no data file");
+		(file.marked_removed ? marked_removed : data_files).push_back(static_cast<uint16_t>(file.file_id));
 	}
 	try {
 		pages->index = BuildPageIndex(pages->streams, index_options);
-		// A removed file (SFIN flag 0x20) has no page in the backup (files fixture, 2022). One that has
-		// would mean the flag says something else here, and its pages would silently read as not live.
-		for (uint32_t removed : set.removed_file_ids) {
+		// A file marked removed (SFIN flag 0x20, a hint: DatabaseFile::marked_removed) is one only when
+		// the backup carries no page 0 of it -- asked as an expected page, so a searched pass is mapped
+		// rather than trusted --; else it is a live file, read as any other (its id reused by a later ADD
+		// FILE, or the bit meaning something else there; review of #549). The cost: for a file that is
+		// removed, the answer "absent" maps every searched pass (a striped set, a container) by its
+		// headers -- one read of such a backup's passes per open, paid only by a backup that lists a
+		// file marked removed.
+		for (uint16_t id : marked_removed) {
 			PageLocation at;
-			if (removed >= 1 && removed <= 32767 && pages->index.Locate(static_cast<uint16_t>(removed), 0, at)) {
-				throw FormatError("file " + std::to_string(removed) +
-								  " is marked removed (SFIN flag 0x20), and the backup carries its pages: a file "
-								  "state the reader does not know");
+			if (pages->index.Locate(id, 0, at, true)) {
+				data_files.push_back(id);
 			}
+		}
+		if (data_files.empty()) {
+			throw FormatError("the set lists no data file");
 		}
 		pages->allocation.reset(new AllocationMap(pages->index, data_files));
 	} catch (FormatError &e) {

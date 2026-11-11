@@ -40,7 +40,7 @@ BootPage ReadBootPage(const Page &page);
 
 //! The boot page and the backup set's trailer describe one database: name, version, compatibility
 //! level, family GUID and collation (the boot page's CollationId one the trailer's TDS form names).
-//! FormatError naming the field that disagrees. A field the trailer does not record (0), or a
+//! FormatError naming the field that disagrees. A field the trailer does not record (0, or an empty name), or a
 //! CollationId the reader's table lacks, is not compared. The boot page follows a rename, a level
 //! change and a RESTORE under a new name (E18); a level changed while a backup runs is not tested.
 void CheckBootAgainstSet(const BootPage &boot, const BackupSetHeader &set);

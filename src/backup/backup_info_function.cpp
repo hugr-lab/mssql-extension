@@ -160,9 +160,13 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 		log_tail += f->set.log_tail_bytes;
 		checksums = checksums || f->checksums;
 	}
+	// FILELISTONLY's list: the files as the backup began when the set records them (MSCI), else the
+	// trailer's, a file marked removed left out as FILELISTONLY leaves it (files fixture, 2022).
 	std::vector<Value> files;
-	for (const auto &f : set.files) {
-		files.push_back(FileValue(f));
+	for (const auto &f : set.start_files.empty() ? set.files : set.start_files) {
+		if (!f.marked_removed) {
+			files.push_back(FileValue(f));
+		}
 	}
 	const bool single = opened.families.size() == 1;
 	const Value no_int(LogicalType::INTEGER);

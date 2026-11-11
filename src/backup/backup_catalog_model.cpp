@@ -4,6 +4,7 @@
 #include "backup/backup_sql_variant.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -14,7 +15,6 @@ namespace backup {
 
 namespace {
 
-constexpr int64_t MODULE_TEXT_LATIN1 = 0x2;
 constexpr int64_t CLASS_SCHEMA = 50;
 constexpr uint8_t OWNER_PARTITION = 1;
 constexpr uint8_t OWNER_DELTA_STORE = 3;
@@ -82,9 +82,11 @@ ModuleDefinition DefinitionOf(const SystemRow &row, size_t value, size_t imageva
 	}
 }
 
-std::map<ModuleKey, ModuleDefinition> ReadModuleTexts(const PageStore &store, const BootstrapTables &tables,
-													  const std::set<int32_t> &objects) {
+// The texts the model keeps: the rows of valclass 1 and 2 the audited ObjectValueFilter lets leave (DQ-11),
+// so the model and mssql_backup_catalog keep one rule.
+std::map<ModuleKey, ModuleDefinition> ReadModuleTexts(const PageStore &store, const BootstrapTables &tables) {
 	std::map<ModuleKey, ModuleDefinition> out;
+	const ObjectValueFilter filter(tables, std::set<int32_t>());
 	const SysObject *object = tables.SystemObject("sysobjvalues");
 	if (!object) {
 		throw FormatError("backup: the database has no system table sysobjvalues");
@@ -98,13 +100,11 @@ std::map<ModuleKey, ModuleDefinition> ReadModuleTexts(const PageStore &store, co
 	ForEachRowsetRow(store, tables.InRowUnit(layout.rowset_id, "sysobjvalues"), layout, [&](const SystemRow &row) {
 		const int64_t cls = ValueInt(layout, valclass, row.values[valclass]);
 		const int32_t id = static_cast<int32_t>(ValueInt(layout, objid, row.values[objid]));
-		if ((cls != 1 && cls != 2) || ValueInt(layout, valnum, row.values[valnum]) != 0 || !objects.count(id)) {
+		const int64_t sub_value = ValueInt(layout, subobjid, row.values[subobjid]);
+		if ((cls != 1 && cls != 2) || !filter.Keep(cls, id, sub_value, ValueInt(layout, valnum, row.values[valnum]))) {
 			return;
 		}
-		const int32_t sub = static_cast<int32_t>(ValueInt(layout, subobjid, row.values[subobjid]));
-		if (cls == 1 && sub != 0) {
-			return;
-		}
+		const int32_t sub = static_cast<int32_t>(sub_value);
 		const std::string what =
 			"the text of object " + std::to_string(id) + (cls == 2 ? " column " + std::to_string(sub) : "");
 		const ModuleKey key{cls, id, sub};
@@ -197,7 +197,8 @@ bool AddedDefault(const std::map<std::pair<uint64_t, int32_t>, std::string> &def
 }
 
 void DecideDecodable(const BootstrapTables &tables, const std::map<std::pair<uint64_t, int32_t>, std::string> &defaults,
-					 const std::set<std::pair<uint64_t, int32_t>> &ambiguous, const SysRowset *base, CatalogTable &t) {
+					 const std::set<std::pair<uint64_t, int32_t>> &ambiguous, const std::string &defaults_pending,
+					 const SysRowset *base, CatalogTable &t) {
 	if (!t.reason.empty()) {
 		t.decodable = false;  // already refused (its schema or a column's type)
 		return;
@@ -246,6 +247,10 @@ void DecideDecodable(const BootstrapTables &tables, const std::map<std::pair<uin
 		auto column = by_id.find(physical.rscolid);
 		if (column == by_id.end()) {
 			t.reason = "physical column " + std::to_string(physical.rscolid) + " has no column";
+			return;
+		}
+		if (!defaults_pending.empty()) {
+			t.reason = "column " + column->second->name + " was added with a default, and " + defaults_pending;
 			return;
 		}
 		std::string why;
@@ -391,22 +396,35 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 			columns_of[c.object_id].push_back(&c);
 		}
 	}
-	std::set<int32_t> wanted;
 	std::vector<const SysObject *> user_tables, views;
 	for (const auto &o : tables.objects) {
 		if (IsUserTable(o)) {
 			user_tables.push_back(&o);
-			wanted.insert(o.id);
 		} else if (IsUserView(o)) {
 			views.push_back(&o);
-			if (IsReadableView(o)) {
-				wanted.insert(o.id);  // an encrypted view's bytes are obfuscated, not text
-			}
 		}
 	}
-	const std::map<ModuleKey, ModuleDefinition> texts = ReadModuleTexts(store, tables, wanted);
+	// A Pending page of sysobjvalues / sysseobjvalues may hold any of their rows: what they define is named
+	// as unreadable, on the objects that need it, instead of failing the whole model (D13). The base
+	// tables the model is built from (bootstrap, sysclsobjs, ...) still fail it: they are read whole.
+	std::map<ModuleKey, ModuleDefinition> texts;
+	std::string texts_pending;
+	try {
+		texts = ReadModuleTexts(store, tables);
+	} catch (PendingPageError &e) {
+		texts.clear();
+		texts_pending = std::string("sysobjvalues cannot be read: ") + e.what();
+	}
 	std::set<std::pair<uint64_t, int32_t>> ambiguous;
-	const auto defaults = ReadAddedDefaults(store, tables, ambiguous);
+	std::map<std::pair<uint64_t, int32_t>, std::string> defaults;
+	std::string defaults_pending;
+	try {
+		defaults = ReadAddedDefaults(store, tables, ambiguous);
+	} catch (PendingPageError &e) {
+		defaults.clear();
+		ambiguous.clear();
+		defaults_pending = std::string("sysseobjvalues cannot be read: ") + e.what();
+	}
 	// The object's schema; one sysclsobjs does not list is named on the object, not the model.
 	auto schema_of = [&](const SysObject &o, std::string &reason) {
 		const std::string name = model.SchemaName(o.schema_id);
@@ -455,7 +473,9 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 			col.is_persisted = (c->status & COLUMN_PERSISTED) != 0;
 			col.is_sparse = (c->status & COLUMN_SPARSE) != 0;
 			col.is_column_set = (c->status & COLUMN_SET) != 0;
-			if (col.is_computed) {
+			if (col.is_computed && !texts_pending.empty()) {
+				col.definition = Unreadable(texts_pending);
+			} else if (col.is_computed) {
 				auto text = texts.find(ModuleKey{2, o->id, c->column_id});
 				if (text != texts.end()) {
 					col.definition = text->second;
@@ -489,14 +509,22 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 				base = base ? base : r;
 			}
 			if (r->owner_type == OWNER_PARTITION || r->owner_type == OWNER_DELTA_STORE) {
-				t.row_count += r->rows;
+				// The file's counts, a statistic: a negative one (an upgraded database can hold one until
+				// DBCC UPDATEUSAGE), or a sum past int64, leaves the count unknown -- never UB, and the
+				// table's rows are read all the same.
+				if (t.row_count_known && (r->rows < 0 || r->rows > std::numeric_limits<int64_t>::max() - t.row_count)) {
+					t.row_count_known = false;
+					t.row_count = 0;
+				} else if (t.row_count_known) {
+					t.row_count += r->rows;
+				}
 			}
 		}
 		std::sort(t.partitions.begin(), t.partitions.end(), [](const CatalogPartition &a, const CatalogPartition &b) {
 			return a.partition_number < b.partition_number;
 		});
 		t.shape = columnstore ? TableShape::Columnstore : heap ? TableShape::Heap : TableShape::Clustered;
-		DecideDecodable(tables, defaults, ambiguous, base, t);
+		DecideDecodable(tables, defaults, ambiguous, defaults_pending, base, t);
 		model.tables.push_back(std::move(t));
 	}
 	for (const SysObject *o : views) {
@@ -509,7 +537,9 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 		v.modified = o->modified;
 		v.is_encrypted = (o->status & VIEW_ENCRYPTED) != 0;
 		auto text = texts.find(ModuleKey{1, o->id, 0});
-		if (!v.is_encrypted && text != texts.end()) {
+		if (!v.is_encrypted && !texts_pending.empty()) {
+			v.definition = Unreadable(texts_pending);
+		} else if (!v.is_encrypted && text != texts.end()) {
 			v.definition = text->second;
 		}
 		model.views.push_back(std::move(v));

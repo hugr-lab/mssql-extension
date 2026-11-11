@@ -21,6 +21,14 @@ bool RecordView::IsNull(size_t column) const {
 	return (data[null_bitmap + column / 8] >> (column % 8)) & 1;
 }
 
+uint16_t RecordView::End() const {
+	if (fixed_end == 0) {
+		return 0;
+	}
+	const uint16_t end = var_count ? VarEnd(var_count - 1) : var_start;
+	return static_cast<uint16_t>(end + ((status_a & 0x40) ? 14 : 0));
+}
+
 uint16_t RecordView::VarStart(size_t i) const {
 	return i == 0 ? var_start : static_cast<uint16_t>(var_end[i - 1] & 0x7FFF);
 }

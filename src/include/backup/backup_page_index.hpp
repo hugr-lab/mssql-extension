@@ -306,6 +306,15 @@ public:
 	size_t PassCount() const {
 		return passes_.size();
 	}
+	//! The most pages the backup can carry: its passes' data, 8 KB a page. An allocation unit cannot
+	//! list more (its extents are allocated, so live, so in pass 1 of a full).
+	uint64_t PageCapacity() const {
+		uint64_t pages = 0;
+		for (const auto &p : passes_) {
+			pages += p.data_length / 8192;
+		}
+		return pages;
+	}
 	//! Its `map` is the pass's only while it is not Searched(): a search that gives up replaces it.
 	const IndexedPass &Pass(size_t i) const {
 		return passes_[i];

@@ -104,6 +104,13 @@ enum class PageState : uint8_t {
 	Pending,
 };
 
+//! A Pending page met by a reader that needs it: a FormatError a caller can tell apart, to name the objects whose
+//! rows the page may hold rather than fail the whole call (spec 085 D13).
+class PendingPageError : public FormatError {
+public:
+	explicit PendingPageError(const std::string &message) : FormatError(message) {}
+};
+
 class PageStore {
 public:
 	//! Pages located by `index`, alive as `allocation` says; both are kept by reference.
@@ -114,12 +121,17 @@ public:
 	//! Page `page` of file `file` when it is live (E2 R3; an allocation page always is): its latest
 	//! copy, its header read and checked -- version 1, not a pad, and the page's own id. False
 	//! when the page is not live. A live page whose copy the backup lacks, a Pending one (a zero unit in
-	//! its place), or a header naming another page is a FormatError naming the page.
+	//! its place; a PendingPageError), or a header naming another page is a FormatError naming the page.
 	bool Read(uint16_t file, uint32_t page, Page &out) const;
-	//! Read, with a Pending page (live, its copy a zero unit) answered as such instead of refused.
+	//! Read, with a Pending page (live, its copy a zero unit) answered as such instead of refused. `out` is
+	//! written only for Present and Pending: a page that is not live leaves it as it was.
 	PageState Fetch(uint16_t file, uint32_t page, Page &out) const;
 	//! Read, with a page that is not live a FormatError too, naming `what` (the reader that needed it).
 	void ReadLive(uint16_t file, uint32_t page, Page &out, const char *what) const;
+	//! The most pages the backup carries (PageIndex::PageCapacity).
+	uint64_t PageCapacity() const {
+		return index_.PageCapacity();
+	}
 
 private:
 	//! A version-0 copy of live page `want` that is Pending: the backup has a pass after the first,

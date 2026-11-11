@@ -76,7 +76,8 @@ AllocationMap::AllocationMap(const PageIndex &index, const std::vector<uint16_t>
 		}
 		f.size = record.size;
 		// One slot per GAM interval (at most 8,402 for 2^32 pages); the bits are read on demand, so a
-		// crafted Size allocates no bitmap for intervals nobody asks about.
+		// crafted Size allocates no bitmap for intervals nobody asks about, and an interval asked about
+		// that the backup carries no GAM for keeps none (an empty slot: all free; review of #549).
 		const size_t intervals =
 			static_cast<size_t>((static_cast<uint64_t>(f.size) + GAM_INTERVAL_PAGES - 1) / GAM_INTERVAL_PAGES);
 		f.gam_free.resize(intervals);
@@ -99,7 +100,8 @@ bool AllocationMap::GamFree(const File &file, uint32_t extent) const {
 			f.gam_loaded.resize(interval + 1, false);
 		}
 		if (f.gam_loaded[interval]) {
-			return (f.gam_free[interval][within / 8] >> (within % 8)) & 1;
+			// An interval the backup carries no GAM for is cached as an empty bitmap: all free.
+			return f.gam_free[interval].empty() || ((f.gam_free[interval][within / 8] >> (within % 8)) & 1);
 		}
 	}
 	// Read outside the lock, as PfsByte does: the read may search a pass or map one by its headers
@@ -107,7 +109,7 @@ bool AllocationMap::GamFree(const File &file, uint32_t extent) const {
 	// missing one interval both read it; the first to finish keeps its bits.
 	// Page 2 of the first interval, the first page of every later one (E17).
 	const uint32_t gam_page = interval == 0 ? 2 : static_cast<uint32_t>(interval * GAM_INTERVAL_PAGES);
-	std::vector<uint8_t> bits(GAM_BITMAP_BYTES, 0xFF);	// all free
+	std::vector<uint8_t> bits;	// empty: no GAM, all free -- nothing kept for an interval past the data
 	const bool recorded = static_cast<uint64_t>(interval) * GAM_INTERVAL_PAGES < f.size;
 	std::vector<uint8_t> gam;
 	// An interval within the recorded Size has its GAM in the backup (E12); one past it has one only
@@ -131,7 +133,7 @@ bool AllocationMap::GamFree(const File &file, uint32_t extent) const {
 		f.gam_free[interval] = std::move(bits);
 		f.gam_loaded[interval] = true;
 	}
-	return (f.gam_free[interval][within / 8] >> (within % 8)) & 1;
+	return f.gam_free[interval].empty() || ((f.gam_free[interval][within / 8] >> (within % 8)) & 1);
 }
 
 const AllocationMap::File *AllocationMap::Find(uint16_t file) const {
@@ -154,7 +156,9 @@ bool AllocationMap::IsAllocationPage(uint16_t file, uint32_t page) {
 	}
 	// GAM / SGAM / DCM / BCM: pages 2 / 3 / 6 / 7 of the first interval (0 and 1 are the file header
 	// and the PFS), then 0 / 1 / 6 / 7 of every later one (E17: 511232 GAM, 511233 SGAM, 511238 DCM,
-	// 511239 BCM, on 2022).
+	// 511239 BCM, on 2022). Not measured: GAM interval 1011 (page 516855552 = 8088 x 63904, a file past
+	// 3.9 TB) starts on a PFS page's place too; which page SQL Server puts there is unknown, and the
+	// reader asks it for both types (GamFree, PfsByte), so one of them is a FormatError naming it.
 	const uint32_t in_interval = page % GAM_INTERVAL_PAGES;
 	if (page < GAM_INTERVAL_PAGES) {
 		return in_interval == 2 || in_interval == 3 || in_interval == 6 || in_interval == 7;

@@ -167,6 +167,12 @@ struct Options {
 	size_t msls_pad_to = 0;
 	bool forked = false;
 	uint32_t sfin_type = 1;
+	//! The SFIN record's flags at +8 (0x04 / 0x84 measured on files the backup reads, 0x20 on one
+	//! removed: the files fixture, 2022).
+	uint32_t sfin_flags = 0x04;
+	//! When non-zero, an MSCI block before MSLS whose MQCI holds the file as the backup began, at
+	//! this size (the trailer's is 16777216).
+	uint64_t msci_file_size = 0;
 	//! This file's FamilySequenceNumber in the RAID stream (the media set has two families).
 	uint16_t family_sequence = 1;
 	//! The MSDA block's header bytes (52 common + its specific part): a larger header moves the MQDA
@@ -267,16 +273,17 @@ inline Bytes BuildImage(const Options &o) {
 			std::memcpy(&sfgi[o.sfgi_name_offset], u.data(), u.size());
 		}
 	}
-	Bytes sfin(260, 0);
-	PutTag(sfin, 0, "SFIN");
-	Put32(sfin, 20, 1);
-	Put32(sfin, 28, o.sfin_type);
-	Put32(sfin, 36, 1);
-	Put64(sfin, 40, 16777216);
-	Put64(sfin, 86, 209715200);
-	PutLsn(sfin, 138, 0, 0, 0);
-	PutGuid(sfin, 186, 0x80);
-	{
+	auto make_sfin = [&](uint64_t size_bytes) {
+		Bytes sfin(260, 0);
+		PutTag(sfin, 0, "SFIN");
+		Put32(sfin, 8, o.sfin_flags);
+		Put32(sfin, 20, 1);
+		Put32(sfin, 28, o.sfin_type);
+		Put32(sfin, 36, 1);
+		Put64(sfin, 40, size_bytes);
+		Put64(sfin, 86, 209715200);
+		PutLsn(sfin, 138, 0, 0, 0);
+		PutGuid(sfin, 186, 0x80);
 		Bytes logical = Utf16("db_data");
 		Bytes physical = Utf16("/data/db.mdf");
 		Put16(sfin, 48, static_cast<uint16_t>(logical.size()));
@@ -286,6 +293,15 @@ inline Bytes BuildImage(const Options &o) {
 		Put16(sfin, 54, static_cast<uint16_t>(sfin.size()));
 		sfin.insert(sfin.end(), physical.begin(), physical.end());
 		Put32(sfin, 4, static_cast<uint32_t>(sfin.size()));
+		return sfin;
+	};
+	const Bytes sfin = make_sfin(16777216);
+	if (o.msci_file_size) {
+		Bytes start;
+		start.insert(start.end(), sfgi.begin(), sfgi.end());
+		const Bytes start_sfin = make_sfin(o.msci_file_size);
+		start.insert(start.end(), start_sfin.begin(), start_sfin.end());
+		AppendBlock(image, "MSCI", Bytes(56, 0), {{"MQCI", start}}, o.align_blocks ? 1 : 0);
 	}
 	Bytes mqci;
 	mqci.insert(mqci.end(), scin.begin(), scin.end());

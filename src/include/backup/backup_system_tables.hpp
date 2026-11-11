@@ -43,23 +43,21 @@ namespace mssql {
 namespace backup {
 
 //! The xtype values the system-table decoder reads (sys.types' system_type_id).
-enum SystemXtype : uint8_t {
-	XTYPE_UNIQUEIDENTIFIER = 36,
-	XTYPE_TINYINT = 48,
-	XTYPE_SMALLINT = 52,
-	XTYPE_INT = 56,
-	XTYPE_SMALLDATETIME = 58,
-	XTYPE_DATETIME = 61,
-	XTYPE_SQL_VARIANT = 98,
-	XTYPE_BIT = 104,
-	XTYPE_BIGINT = 127,
-	XTYPE_VARBINARY = 165,
-	XTYPE_VARCHAR = 167,
-	XTYPE_BINARY = 173,
-	XTYPE_CHAR = 175,
-	XTYPE_NVARCHAR = 231,
-	XTYPE_NCHAR = 239,
-};
+constexpr uint8_t XTYPE_UNIQUEIDENTIFIER = 36;
+constexpr uint8_t XTYPE_TINYINT = 48;
+constexpr uint8_t XTYPE_SMALLINT = 52;
+constexpr uint8_t XTYPE_INT = 56;
+constexpr uint8_t XTYPE_SMALLDATETIME = 58;
+constexpr uint8_t XTYPE_DATETIME = 61;
+constexpr uint8_t XTYPE_SQL_VARIANT = 98;
+constexpr uint8_t XTYPE_BIT = 104;
+constexpr uint8_t XTYPE_BIGINT = 127;
+constexpr uint8_t XTYPE_VARBINARY = 165;
+constexpr uint8_t XTYPE_VARCHAR = 167;
+constexpr uint8_t XTYPE_BINARY = 173;
+constexpr uint8_t XTYPE_CHAR = 175;
+constexpr uint8_t XTYPE_NVARCHAR = 231;
+constexpr uint8_t XTYPE_NCHAR = 239;
 
 //! One physical column of a rowset (a sysrscols row, named by syscolpars).
 struct PhysicalColumn {
