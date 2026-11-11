@@ -289,10 +289,12 @@ Value SqlVariantValue(const SqlVariant &v, const std::string &what) {
 			}
 			return Value(v.value);
 		}
+		// Every page the server stores a varchar in has a table, double-byte ones included: a backup has
+		// no server to convert it, so the client does (spec 092's direction for the backup reader).
 		const auto *page = codec::code_page::FindCodePage(static_cast<int32_t>(collation->code_page));
-		if (!page || codec::code_page::IsDoubleByte(*page)) {
+		if (!page) {
 			throw FormatError("backup: " + what + " is a varchar of code page " + std::to_string(collation->code_page) +
-							  ", which is not read (spec 086)");
+							  ", which has no table");
 		}
 		std::string out(codec::code_page::Utf8Bound(v.value.size()), '\0');
 		out.resize(codec::code_page::DecodeToUtf8(*page, b, v.value.size(), &out[0]));
@@ -305,8 +307,6 @@ Value SqlVariantValue(const SqlVariant &v, const std::string &what) {
 }
 
 std::string ColumnRefusal(const CatalogColumn &c) {
-	const CollationRow *collation = c.collation_id ? CollationById(static_cast<int32_t>(c.collation_id)) : nullptr;
-	const uint32_t code_page = collation ? collation->code_page : 0;
 	switch (c.system_type_id) {
 	case 98:
 		return "sql_variant is not read (spec 086)";
@@ -329,10 +329,6 @@ std::string ColumnRefusal(const CatalogColumn &c) {
 	const bool code_page_text = c.system_type_id == 167 || c.system_type_id == 175 || c.system_type_id == 35;
 	if (code_page_text && c.collation_id != 0 && !CollationById(static_cast<int32_t>(c.collation_id))) {
 		return "its collation (CollationId " + std::to_string(c.collation_id) + ") is not one the reader knows";
-	}
-	if ((c.system_type_id == 167 || c.system_type_id == 175) &&
-		(code_page == 932 || code_page == 936 || code_page == 949 || code_page == 950)) {
-		return "a varchar of double-byte code page " + std::to_string(code_page) + " is not read (spec 086)";
 	}
 	if (c.is_computed && !c.is_persisted) {
 		return "a computed column that is not persisted is not stored";

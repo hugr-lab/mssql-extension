@@ -5,6 +5,7 @@
 // datetimeoffset, time, date, uniqueidentifier, char, nchar, binary, timestamp, tinyint, smallint,
 // real, float, bits), added columns' defaults, a value stored off row, and the refusals.
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <string>
@@ -569,6 +570,93 @@ int main() {
 				  stager.Append(ReadSlot(page.bytes.data(), PAGE_SIZE, 2, 1, "the test"));
 			  }).find("dbo.more.n_odd holds 3 bytes, not a whole number of UTF-16 units") != std::string::npos,
 			  "an odd UTF-16 length is refused naming the column");
+	}
+
+	// The double-byte pages, decoded on the client like any other: a backup has no server to convert
+	// them (where the TDS path keeps the server's cast for them, only because it is faster there).
+	{
+		struct Page_ {
+			const char *collation;
+			std::vector<uint8_t> bytes;
+			const char *utf8;
+		};
+		const std::vector<Page_> pages = {
+			{"Japanese_CI_AS",
+			 {0x93, 0xfa, 0x96, 0x7b, 0xb1, 0xb2},
+			 "\xE6\x97\xA5\xE6\x9C\xAC\xEF\xBD\xB1\xEF\xBD\xB2"},
+			{"Chinese_PRC_CI_AS", {0xd6, 0xd0, 0xce, 0xc4}, "\xE4\xB8\xAD\xE6\x96\x87"},
+			{"Korean_Wansung_CI_AS", {0xc7, 0xd1, 0xb1, 0xb9}, "\xED\x95\x9C\xEA\xB5\xAD"},
+			{"Chinese_Taiwan_Stroke_CI_AS", {0xa4, 0xa4, 0xa4, 0xe5}, "\xE4\xB8\xAD\xE6\x96\x87"}};
+		for (const auto &pg : pages) {
+			const auto *collation =
+				mssql::codec::code_page::FindCollationByName(pg.collation, std::strlen(pg.collation));
+			if (!collation) {
+				Check(false, std::string("the collation ") + pg.collation + " is in the tables");
+				continue;
+			}
+			const uint32_t id = static_cast<uint32_t>(collation->collation_id);
+			CatalogTable t;
+			t.schema_name = "dbo";
+			t.name = "dbcs";
+			t.columns = {Col(1, "c", XTYPE_CHAR, "char", 8, 0, 0, id),
+						 Col(2, "v", XTYPE_VARCHAR, "varchar", 20, 0, 0, id)};
+			Check(ColumnRefusal(t.columns[0]).empty() && ColumnRefusal(t.columns[1]).empty(),
+				  std::string(pg.collation) + ": no refusal");
+			RowsetLayout layout;
+			layout.table = "dbcs";
+			layout.columns = {Phys(1, XTYPE_CHAR, 4, 1, 8), Phys(2, XTYPE_VARCHAR, -1, 2, 20)};
+			std::vector<uint8_t> fixed(pg.bytes);  // char(8): the text, padded with spaces
+			fixed.resize(8, 0x20);
+			const Page page = PageOf({Record(fixed, 2, 0, {pg.bytes})});
+			RecordStager stager(t, {1, 2});
+			stager.UseLayout(layout);
+			DataChunk chunk;
+			chunk.Initialize(Allocator::DefaultAllocator(), stager.Types());
+			stager.BeginChunk(chunk);
+			stager.Append(ReadSlot(page.bytes.data(), PAGE_SIZE, 1, 0, "the test"));
+			stager.FinalizeChunk(chunk);
+			Check(chunk.GetValue(0, 0).ToString() == pg.utf8 && chunk.GetValue(1, 0).ToString() == pg.utf8,
+				  std::string(pg.collation) + ": char(8) trimmed and varchar decode to " +
+					  chunk.GetValue(1, 0).ToString());
+		}
+	}
+
+	// 932's edges at the stager: a trail byte in the ASCII range (0x95 0x5C is a kanji, not a
+	// backslash), a value past the kernel's 16-byte block, and a lead byte left alone at the end
+	// (it reads as nothing, as the server drops it).
+	{
+		const auto *japanese = mssql::codec::code_page::FindCollationByName("Japanese_CI_AS", 14);
+		const uint32_t id = static_cast<uint32_t>(japanese->collation_id);
+		CatalogTable t;
+		t.schema_name = "dbo";
+		t.name = "edges";
+		t.columns = {Col(1, "v", XTYPE_VARCHAR, "varchar", 100, 0, 0, id)};
+		RowsetLayout layout;
+		layout.table = "edges";
+		layout.columns = {Phys(1, XTYPE_VARCHAR, -1, 1, 100)};
+		const std::vector<uint8_t> unit = {0x93, 0xfa, 0x96, 0x7b, 0x95, 0x5c, 'A'};  // 日本表A
+		std::vector<uint8_t> longer;
+		for (int i = 0; i < 3; i++) {
+			longer.insert(longer.end(), unit.begin(), unit.end());	// 21 bytes
+		}
+		const std::vector<uint8_t> lone = {'x', 0x93};
+		const Page page =
+			PageOf({Record({}, 1, 0, {{0x95, 0x5c}}), Record({}, 1, 0, {longer}), Record({}, 1, 0, {lone})});
+		RecordStager stager(t, {1});
+		stager.UseLayout(layout);
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), stager.Types());
+		stager.BeginChunk(chunk);
+		for (uint16_t s = 0; s < 3; s++) {
+			stager.Append(ReadSlot(page.bytes.data(), PAGE_SIZE, 3, s, "the test"));
+		}
+		stager.FinalizeChunk(chunk);
+		const std::string kanji = "\xE8\xA1\xA8", word =
+													  "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xA1\xA8"
+													  "A";
+		Check(chunk.GetValue(0, 0).ToString() == kanji, "932: 0x95 0x5C is one kanji, its trail byte not a backslash");
+		Check(chunk.GetValue(0, 1).ToString() == word + word + word, "932: a 21-byte value, past the 16-byte block");
+		Check(chunk.GetValue(0, 2).ToString() == "x", "932: a lead byte alone at the end reads as nothing");
 	}
 
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;

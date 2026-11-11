@@ -44,7 +44,7 @@ Out, each refused by name until its spec lands:
 | feature | where | refusal scope |
 |---|---|---|
 | ROW / PAGE compressed rowsets, sparse columns | 086 | the table |
-| `sql_variant`, `xml`, `geometry`, `geography`, `hierarchyid`, other CLR types, `vector`, `json` (2025), DBCS code pages (932/936/949/950) | 086 | the column, when projected |
+| `sql_variant`, `xml`, `geometry`, `geography`, `hierarchyid`, other CLR types, `vector`, `json` (2025) | 086 | the column, when projected |
 | encrypted backups, TDE databases | 087 | the file |
 | clustered / nonclustered columnstore | 088 | the table (an NCCI is ignored: the scan reads the base rowset) |
 | `since_lsn`, changed / freed pages, the export, lake-mode state | 089 | — |
@@ -259,7 +259,9 @@ Out, each refused by name until its spec lands:
   generator writes the collation → code page table (`tools/code_pages/data/collations.psv`, § Rules,
   catalog). Spec 091 (SQL Server code pages, generated tables and vectorized kernels) builds it all,
   as the module `src/codec/code_page/`; 085 and 086 reuse it. 085 maps the on-disk CollationId onto
-  091's table and reuses its single-byte tables (task 13).
+  091's table and reuses its tables, the double-byte pages included (task 13; owner, 2026-11-11: a
+  backup has no server to convert a varchar, so every page is decoded on the client -- the TDS path
+  keeps the server's cast for a double-byte page only because there the server is faster, 092 D10).
 
 - **D8 — service columns are virtual columns with a `_mssql_` prefix (owner, R§5, R§10.2).** The
   scan and the catalog's table entries expose:
@@ -498,7 +500,7 @@ rowgroup metadata, makes it exact; until then compare_catalog does not compare a
   reason VARCHAR)`, NULL for a table on a filegroup (E7§2, § Rules, catalog). Each boundary is a VARIANT
   of the DuckDB type TYPE mssql reads the parameter's type as (D6: `datetime2(7)` a TIMESTAMP_NS to the
   100 ns, `datetimeoffset` a TIMESTAMP_TZ at its UTC instant). `reason` names why the partitioning cannot
-  be given -- a boundary the reader cannot decode (a double-byte varchar: 086), a function whose
+  be given -- a boundary the reader cannot decode (a code page with no table), a function whose
   boundaries, destinations or partitions do not agree with its fanout -- and then the boundaries are NULL,
   never a guessed or partial list (D13). Boundaries are listed in their current order;
   their ids are positional and renumbered by SPLIT / MERGE, so a consumer compares value lists, never
@@ -951,8 +953,8 @@ offsets above are in its fixed part.
   rows **(2025)**), for its code page and name (D7). The on-disk id is encoded differently from the
   5 bytes of a TDS COLMETADATA collation, and its low byte is not the LCID. A collation is UTF-8 iff
   `id >> 24 == 0` and `id & 0x80` (exact over all 5,540, X§4). Code pages used: 65001, 1250–1258,
-  874, 437, 850 (single byte: 091's tables, here) and 932, 936, 949, 950 (double byte: 091's tables,
-  spec 086); 0 = Unicode-only collations, which no `varchar` can carry.
+  874, 437, 850 (single byte) and 932, 936, 949, 950 (double byte), all through 091's tables, here
+  (PR 2d); 0 = Unicode-only collations, which no `varchar` can carry.
 
 **Records** (X§4, E1§4.1, E1§5 rule 7, E2 R7):
 - Slot array at the page end, u16 per slot, `m_slotCnt` @22; a slot offset below 96 is a freed slot
@@ -1260,13 +1262,13 @@ before the next opens.
 11b. `OpenedBackup`'s stages 2–4 (page index, allocation, catalog) built for a file function's call,
     with no cache yet (task 22 caches them) — 1 d
 12. Catalog model: schemas, objects, rowsets, partitions, AUs, columns, defaults, views — 3 d
-13. 085 maps the on-disk CollationId onto spec 091's table; 091's single-byte code-page tables and
-    kernel reused (D7) — 0.5 d
+13. 085 maps the on-disk CollationId onto spec 091's table; 091's code-page tables and kernel reused,
+    the double-byte pages included (D7; owner, 2026-11-11, from 086 D9) — 0.5 d
 17. `mssql_backup_tables`, `mssql_backup_views`, `mssql_backup_catalog`; in the lane, compared with
     the restored database's catalog views — 2.5 d
 18. Fuzz harness catalog — 0.5 d
 
-*PR 2b as landed (2026-11-10).* Tasks 11a, 11, 11b, 12, 13 (the collation mapping; the single-byte
+*PR 2b as landed (2026-11-10).* Tasks 11a, 11, 11b, 12, 13 (the collation mapping; the code-page
 kernel is the scan's, 2d), 17 and 18. Moved: 11a's per-AU runs, buffer-managed and kept in the opened
 backup, are built at a table's first scan, so they come with the scan (2d); 2b walks a chain when it
 reads a base table. Pulled in: the part of task 20 the catalog needs -- an in-row LOB root over DATA /

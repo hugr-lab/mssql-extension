@@ -37,8 +37,9 @@ tds::ColumnMetadata MetadataOf(const CatalogColumn &c) {
 	m.scale = c.scale;
 	m.flags = tds::COL_FLAG_NULLABLE;
 	if (c.system_type_id == XTYPE_VARCHAR || c.system_type_id == XTYPE_CHAR) {
-		// A UTF-8 collation's bytes are UTF-8 already (no table); every other page ColumnRefusal let
-		// through is single-byte and has one.
+		// A UTF-8 collation's bytes are UTF-8 already (no table); every other page has one, double-byte
+		// ones included (spec 091), which the code-page kernel decodes on the client: a backup has no
+		// server to convert it, where the TDS path keeps the server's cast for them only for speed.
 		const CollationRow *row = CollationById(static_cast<int32_t>(c.collation_id));
 		if (row && row->code_page != 65001) {
 			m.code_page = codec::code_page::FindCodePage(static_cast<int32_t>(row->code_page));

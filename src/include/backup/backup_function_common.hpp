@@ -45,7 +45,7 @@ Value GuidValue(const std::string &bytes, const std::string &what);
 //! varchar through its collation's code page). A FormatError naming `what` for a value its type's
 //! size does not fit, one outside its type's range (a time past midnight, a date past 9999-12-31, an
 //! offset outside +-14:00), a time(7) / datetimeoffset(7) with a 100 ns digit (not cut to the
-//! microsecond), a double-byte code page (spec 086) or a base type this does not read.
+//! microsecond), a code page with no table or a base type this does not read.
 Value SqlVariantValue(const SqlVariant &variant, const std::string &what);
 
 //! Why the scan cannot read column `c` (spec 085 § Scope's refusals), or "". One predicate for
