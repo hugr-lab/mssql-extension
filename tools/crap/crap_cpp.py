@@ -40,9 +40,9 @@ import shutil
 import subprocess
 import sys
 
-#: lizard's `--csv` has no header. Its column order, which this script reads by
-#: position and then validates per row, so a format change is a named error
-#: rather than silent nonsense:
+#: lizard's `--csv` has no header. Its column order, verified against lizard
+#: 1.26.0, read here by position and then validated per row -- so a lizard that
+#: changes it is a named error rather than silent nonsense:
 CSV_COLUMNS = ("nloc", "ccn", "tokens", "params", "length", "location",
                "file", "function", "long_name", "start", "end")
 CC, FILE, FUNCTION, START, END = 1, 6, 7, 9, 10
@@ -224,9 +224,11 @@ def selftest():
     check("unknown coverage scores nothing", crap(10, None) is None, crap(10, None))
 
     print("\nlizard's csv:")
-    csv_text = ('12,4,80,2,15,"Foo::bar( int )",'
-                '"src/backup/backup_lob.cpp","Foo::bar","Foo::bar( int )",100,120\n'
-                '3,1,9,0,3,"plain()","src/x.cpp","plain","plain()",5,8\n')
+    # Verbatim in the shape lizard 1.26.0 writes, `location` included:
+    #   nloc,ccn,tokens,params,length,location,file,function,long_name,start,end
+    csv_text = ('12,4,44,1,12,"Foo::bar@100-120@src/backup/backup_lob.cpp",'
+                '"src/backup/backup_lob.cpp","Foo::bar","Foo::bar( int n)",100,120\n'
+                '3,1,12,0,3,"plain@5-8@src/x.cpp","src/x.cpp","plain","plain()",5,8\n')
     rows = parse_lizard_csv(csv_text)
     check("two rows, by position", len(rows) == 2, f"{len(rows)} rows")
     check("the complexity is the CCN column", rows[0]["cc"] == 4, rows[0]["cc"])
