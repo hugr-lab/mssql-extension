@@ -96,6 +96,37 @@ int main() {
 			  "the file list from SFIN and SFGI");
 		const auto msls = layout.Find("MSLS");
 		Check(msls && set.backup_size == msls->offset - 4096, "BackupSize is MSLS's offset less one soft filemark");
+		Check(set.start_files.empty() && !set.files[0].marked_removed,
+			  "no MSCI: no start list; flags 0x04 do not mark the file removed");
+	}
+	{
+		// The files as the backup began (MSCI) are FILELISTONLY's list only; the page reader keeps the
+		// trailer's (review of #549: the start list replaced it, and a file missing from it read empty).
+		Options o;
+		o.msci_file_size = 8388608;
+		const Bytes image = BuildImage(o);
+		MemoryAccess access("msci.bak", image.data(), image.size());
+		const MtfLayout layout = WalkMtf(access);
+		const BackupSetHeader set = ReadBackupSet(access, layout);
+		Check(set.files.size() == 1 && set.files[0].size_bytes == 16777216 && set.start_files.size() == 1 &&
+				  set.start_files[0].size_bytes == 8388608 && set.start_files[0].logical_name == "db_data",
+			  "MSCI's list kept apart, at the start's size; the trailer's list stays the reader's");
+	}
+	{
+		// Flag 0x20 marks a file, it no longer drops it before the file-type check (review of #549).
+		Options o;
+		o.sfin_flags = 0x20;
+		const Bytes image = BuildImage(o);
+		MemoryAccess access("removed.bak", image.data(), image.size());
+		const BackupSetHeader set = ReadBackupSet(access, WalkMtf(access));
+		Check(set.files.size() == 1 && set.files[0].marked_removed, "flag 0x20 marks the file, which stays listed");
+		o.sfin_type = 3;
+		const Bytes bad = BuildImage(o);
+		MemoryAccess bad_access("removed_bad.bak", bad.data(), bad.size());
+		Check(ErrorOf([&]() {
+				  ReadBackupSet(bad_access, WalkMtf(bad_access));
+			  }).find("a file type the reader does not know") != std::string::npos,
+			  "and a marked file of an unknown type is still refused");
 	}
 	{
 		Options o;

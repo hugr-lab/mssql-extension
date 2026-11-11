@@ -112,9 +112,10 @@ private:
 	uint64_t base_;
 };
 
-//! `bytes` bytes of UTF-16LE as UTF-8, trailing NULs dropped; an unpaired surrogate becomes
-//! U+FFFD (the strings of a backup's headers are names and paths, never data).
-std::string Utf16LeToUtf8(const uint8_t *data, size_t bytes);
+//! `bytes` bytes of UTF-16LE as UTF-8, trailing NULs dropped (`drop_trailing_nuls`: a header's
+//! fixed-width, NUL-padded field) or kept (a column's value, whose every unit is data); an unpaired
+//! surrogate becomes U+FFFD (the strings read this way are names and paths, never row data).
+std::string Utf16LeToUtf8(const uint8_t *data, size_t bytes, bool drop_trailing_nuls = true);
 
 }  // namespace backup
 }  // namespace mssql

@@ -35,9 +35,9 @@ static void AppendUtf8(std::string &out, uint32_t cp) {
 	}
 }
 
-std::string Utf16LeToUtf8(const uint8_t *data, size_t bytes) {
+std::string Utf16LeToUtf8(const uint8_t *data, size_t bytes, bool drop_trailing_nuls) {
 	size_t units = bytes / 2;
-	while (units > 0 && data[2 * (units - 1)] == 0 && data[2 * (units - 1) + 1] == 0) {
+	while (drop_trailing_nuls && units > 0 && data[2 * (units - 1)] == 0 && data[2 * (units - 1) + 1] == 0) {
 		units--;
 	}
 	std::string out;

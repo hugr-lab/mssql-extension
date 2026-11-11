@@ -16,6 +16,7 @@
 #include "backup/backup_bytes.hpp"
 #include "backup/backup_mtf.hpp"
 #include "backup/backup_page_index.hpp"
+#include "mtf_builder.hpp"
 
 using namespace duckdb::mssql::backup;
 
@@ -88,16 +89,13 @@ void AddEmpty(std::vector<Unit> &units, char kind) {
 	}
 }
 
-//! A file header page body: slot 0 at 96 holding the file id (+167) and Size in pages (+171).
+//! A file header page body: slot 0 at 96, its record's variable columns 2 / 4 the file id and Size.
 Bytes FileHeader(uint16_t file, uint32_t size) {
 	Bytes b(8192, 0);
 	b[1] = 15;	// m_type: a file header page
 	b[8190] = 96;
-	b[96 + 167] = file & 0xFF;
-	b[96 + 168] = file >> 8;
-	for (int i = 0; i < 4; i++) {
-		b[96 + 171 + i] = (size >> (8 * i)) & 0xFF;
-	}
+	const Bytes record = mtf_builder::FileHeaderRecordBytes(file, size);
+	std::memcpy(&b[96], record.data(), record.size());
 	return b;
 }
 
@@ -493,9 +491,37 @@ int main() {
 			  "and the index searches the pass instead (DQ-41), which locates the pages right");
 	}
 	{
+		// The recorded Size is a lower bound (a header image older than an autogrow, as on a live
+		// database; DbReader's PROVENANCE): file 1 records 16 pages, its GAM allocates extents 0, 2 and
+		// 4 (pages to 39). The rank path takes every GAM-allocated extent, as the header scan finds.
+		Bytes h1 = FileHeader(1, 16);
+		Bytes g1 = Gam({0, 2, 4});
+		std::vector<Unit> units;
+		AddFirstExtent(units, 1, &h1, &g1);
+		AddExtent(units, 1, 1);
+		AddExtent(units, 1, 2);
+		AddExtent(units, 1, 4);
+		AddEmpty(units, 'P');
+		auto b = Pass(units);
+		MemoryAccess f("past_size.bak", b.data(), b.size());
+		PassMap ranked;
+		const bool ok = BuildRankedPassMap(f, 0, b.size(), ranked);
+		auto scanned = BuildPassMap(f, 0, b.size(), 0);
+		bool same = ok && ranked.Ranked() && ranked.ExtentCount() == 4 && scanned.ExtentCount() == 4;
+		for (uint32_t e : {0u, 1u, 2u, 4u}) {
+			ExtentId x;
+			x.file = 1;
+			x.extent = e;
+			uint64_t a = 0;
+			uint64_t c = 0;
+			same = same && ranked.Find(x, a) && scanned.Find(x, c) && a == c;
+		}
+		Check(same, "a file whose data runs past its recorded Size is ranked whole (its GAM, not its Size)");
+	}
+	{
 		// Two GAM intervals: file 1 of 511232 + 64 pages. Interval 0's GAM allocates extents 0..20
-		// and 30000; interval 1's (page 511234, extent 63904) its first four. The PFS pages 8088 k
-		// are copied though not GAM-allocated (E12). File 3 is small. Expected extents computed here.
+		// and 30000; interval 1's (page 511232, the interval's first: E17; extent 63904) its first four. The PFS pages
+		// 8088 k are copied though not GAM-allocated (E12). File 3 is small. Expected extents computed here.
 		const uint32_t size1 = 511232 + 64;
 		std::vector<uint32_t> gam0_bits;
 		for (uint32_t e = 0; e <= 20; e++) {
@@ -530,8 +556,7 @@ int main() {
 			pass.groups.push_back(x);
 		}
 		pass.pad_groups = 2;
-		pass.bodies = {
-			{{1, 0}, &header1}, {{1, 2}, &gam0}, {{1, 511232 + 2}, &gam1}, {{3, 0}, &header3}, {{3, 2}, &gam3}};
+		pass.bodies = {{{1, 0}, &header1}, {{1, 2}, &gam0}, {{1, 511232}, &gam1}, {{3, 0}, &header3}, {{3, 2}, &gam3}};
 		PassMap ranked;
 		uint64_t reads = 0;
 		Check(BuildRankedPassMap(pass, 0, pass.Size(), ranked, &reads), "a file of two GAM intervals is ranked");

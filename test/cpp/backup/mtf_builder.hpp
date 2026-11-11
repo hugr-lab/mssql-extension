@@ -22,6 +22,37 @@ inline void Put32(Bytes &b, size_t at, uint32_t v) {
 		b[at + i] = (v >> (8 * i)) & 0xFF;
 	}
 }
+//! A data file's header record (page 0's slot 0) as SQL Server lays it out: a primary FixedVar
+//! record (statusA 0x30) with no fixed columns, a null bitmap, and five variable columns -- a
+//! `first_var`-byte value (a GUID on a server: 16), an empty one, the file id (u16), its filegroup
+//! (u16) and its Size in pages (u32), the columns ReadFileHeaderRecord reads by number. Returns its
+//! bytes; place them at a slot's offset.
+inline Bytes FileHeaderRecordBytes(uint16_t file, uint32_t size, uint16_t first_var = 16) {
+	const uint16_t columns = 5;
+	const uint16_t data = 4 + 2 + 1 + 2 + 2 * columns;	// header, column count, bitmap, var count, ends
+	const uint16_t ends[columns] = {static_cast<uint16_t>(data + first_var), static_cast<uint16_t>(data + first_var),
+									static_cast<uint16_t>(data + first_var + 2),
+									static_cast<uint16_t>(data + first_var + 4),
+									static_cast<uint16_t>(data + first_var + 8)};
+	Bytes r(ends[columns - 1], 0);
+	r[0] = 0x30;
+	r[2] = 4;  // fixed part ends at 4: no fixed columns
+	r[4] = columns;
+	r[7] = columns;	 // variable column count (the null bitmap's one byte at 6 is zero)
+	for (uint16_t i = 0; i < columns; i++) {
+		r[9 + 2 * i] = static_cast<uint8_t>(ends[i] & 0xFF);
+		r[10 + 2 * i] = static_cast<uint8_t>(ends[i] >> 8);
+	}
+	const size_t at = ends[1];
+	r[at] = static_cast<uint8_t>(file & 0xFF);
+	r[at + 1] = static_cast<uint8_t>(file >> 8);
+	r[at + 2] = 1;	// PRIMARY
+	for (int i = 0; i < 4; i++) {
+		r[at + 4 + i] = static_cast<uint8_t>((size >> (8 * i)) & 0xFF);
+	}
+	return r;
+}
+
 inline void Put64(Bytes &b, size_t at, uint64_t v) {
 	for (int i = 0; i < 8; i++) {
 		b[at + i] = (v >> (8 * i)) & 0xFF;
@@ -136,6 +167,12 @@ struct Options {
 	size_t msls_pad_to = 0;
 	bool forked = false;
 	uint32_t sfin_type = 1;
+	//! The SFIN record's flags at +8 (0x04 / 0x84 measured on files the backup reads, 0x20 on one
+	//! removed: the files fixture, 2022).
+	uint32_t sfin_flags = 0x04;
+	//! When non-zero, an MSCI block before MSLS whose MQCI holds the file as the backup began, at
+	//! this size (the trailer's is 16777216).
+	uint64_t msci_file_size = 0;
 	//! This file's FamilySequenceNumber in the RAID stream (the media set has two families).
 	uint16_t family_sequence = 1;
 	//! The MSDA block's header bytes (52 common + its specific part): a larger header moves the MQDA
@@ -236,16 +273,17 @@ inline Bytes BuildImage(const Options &o) {
 			std::memcpy(&sfgi[o.sfgi_name_offset], u.data(), u.size());
 		}
 	}
-	Bytes sfin(260, 0);
-	PutTag(sfin, 0, "SFIN");
-	Put32(sfin, 20, 1);
-	Put32(sfin, 28, o.sfin_type);
-	Put32(sfin, 36, 1);
-	Put64(sfin, 40, 16777216);
-	Put64(sfin, 86, 209715200);
-	PutLsn(sfin, 138, 0, 0, 0);
-	PutGuid(sfin, 186, 0x80);
-	{
+	auto make_sfin = [&](uint64_t size_bytes) {
+		Bytes sfin(260, 0);
+		PutTag(sfin, 0, "SFIN");
+		Put32(sfin, 8, o.sfin_flags);
+		Put32(sfin, 20, 1);
+		Put32(sfin, 28, o.sfin_type);
+		Put32(sfin, 36, 1);
+		Put64(sfin, 40, size_bytes);
+		Put64(sfin, 86, 209715200);
+		PutLsn(sfin, 138, 0, 0, 0);
+		PutGuid(sfin, 186, 0x80);
 		Bytes logical = Utf16("db_data");
 		Bytes physical = Utf16("/data/db.mdf");
 		Put16(sfin, 48, static_cast<uint16_t>(logical.size()));
@@ -255,6 +293,15 @@ inline Bytes BuildImage(const Options &o) {
 		Put16(sfin, 54, static_cast<uint16_t>(sfin.size()));
 		sfin.insert(sfin.end(), physical.begin(), physical.end());
 		Put32(sfin, 4, static_cast<uint32_t>(sfin.size()));
+		return sfin;
+	};
+	const Bytes sfin = make_sfin(16777216);
+	if (o.msci_file_size) {
+		Bytes start;
+		start.insert(start.end(), sfgi.begin(), sfgi.end());
+		const Bytes start_sfin = make_sfin(o.msci_file_size);
+		start.insert(start.end(), start_sfin.begin(), start_sfin.end());
+		AppendBlock(image, "MSCI", Bytes(56, 0), {{"MQCI", start}}, o.align_blocks ? 1 : 0);
 	}
 	Bytes mqci;
 	mqci.insert(mqci.end(), scin.begin(), scin.end());

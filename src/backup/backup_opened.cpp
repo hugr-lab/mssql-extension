@@ -1,5 +1,6 @@
 #include "backup/backup_opened.hpp"
 
+#include "backup/backup_boot.hpp"
 #include "backup/backup_xpress.hpp"
 #include "backup/backup_zstd.hpp"
 
@@ -166,6 +167,106 @@ std::unique_ptr<OpenedHeaders> OpenBackupHeaders(ClientContext &context, const s
 						  std::to_string(computed));
 	}
 	families = std::move(ordered);
+	return opened;
+}
+
+std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &context, const OpenedHeaders &headers,
+											 const OpenPagesOptions &options) {
+	const auto &set = headers.Set();
+	const std::string &first = headers.source->Path(headers.families.front()->file);
+	if (set.kind == BackupKind::Log) {
+		throw FormatError("backup file \"" + first + "\" is a log backup: it holds no data pages to read");
+	}
+	if (set.kind == BackupKind::Differential) {
+		throw FormatError("backup file \"" + first +
+						  "\" is a differential backup: its pages are read over its full backup, which is not "
+						  "supported yet");
+	}
+	std::unique_ptr<OpenedPages> pages(new OpenedPages());
+	const size_t n = headers.families.size();
+	pages->containers.resize(n);
+	for (size_t i = 0; i < n; i++) {
+		const auto &f = *headers.families[i];
+		FamilyStream s;
+		s.stream = &f.Stream();
+		s.layout = &f.layout;
+		if (f.container) {
+			auto &c = pages->containers[i];
+			c.file = f.access.get();
+			c.stream = f.data_set.get();
+			c.seek = &f.seek;
+			c.chain_end = f.chain.end;
+			c.decoder = f.decoder;
+			s.container = &c;
+		}
+		pages->streams.push_back(s);
+	}
+	PageIndexOptions index_options;
+	index_options.full_backup = true;
+	index_options.trust_layout = options.trust_layout;
+	index_options.mapper = RangedPassMapper(context);
+	std::vector<uint16_t> data_files;
+	std::vector<uint16_t> marked_removed;
+	for (const auto &file : set.files) {
+		if (file.type != 'D') {
+			continue;
+		}
+		// SQL Server's file ids are 1..32767; a page pointer carries one in 16 bits.
+		if (file.file_id == 0 || file.file_id > 32767) {
+			throw FormatError("backup file \"" + first + "\" lists data file \"" + file.logical_name + "\" with id " +
+							  std::to_string(file.file_id) + ", outside 1..32767");
+		}
+		(file.marked_removed ? marked_removed : data_files).push_back(static_cast<uint16_t>(file.file_id));
+	}
+	try {
+		pages->index = BuildPageIndex(pages->streams, index_options);
+		// A file marked removed (SFIN flag 0x20, a hint: DatabaseFile::marked_removed) is one only when
+		// the backup carries no page 0 of it -- asked as an expected page, so a searched pass is mapped
+		// rather than trusted --; else it is a live file, read as any other (its id reused by a later ADD
+		// FILE, or the bit meaning something else there; review of #549). The cost: for a file that is
+		// removed, the answer "absent" maps every searched pass (a striped set, a container) by its
+		// headers -- one read of such a backup's passes per open, paid only by a backup that lists a
+		// file marked removed.
+		for (uint16_t id : marked_removed) {
+			PageLocation at;
+			if (pages->index.Locate(id, 0, at, true)) {
+				data_files.push_back(id);
+			}
+		}
+		if (data_files.empty()) {
+			throw FormatError("the set lists no data file");
+		}
+		pages->allocation.reset(new AllocationMap(pages->index, data_files));
+	} catch (FormatError &e) {
+		// Name the backup, as the headers' stage does (a page or file id alone does not say which).
+		throw FormatError("backup file \"" + first + "\": " + e.what());
+	}
+	pages->store.reset(new PageStore(pages->index, *pages->allocation));
+	return pages;
+}
+
+std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths,
+												 bool with_model) {
+	std::unique_ptr<OpenedCatalog> opened(new OpenedCatalog());
+	opened->headers = OpenBackupHeaders(context, paths);
+	opened->pages = OpenBackupPages(context, *opened->headers);
+	try {
+		Page boot_page;
+		opened->pages->store->ReadLive(1, 9, boot_page, "the boot page");
+		const BootPage boot = ReadBootPage(boot_page);
+		CheckBootAgainstSet(boot, opened->headers->Set());
+		opened->tables = ReadBootstrapTables(*opened->pages->store, boot);
+		if (with_model) {
+			opened->model = BuildCatalogModel(*opened->pages->store, opened->tables);
+		}
+	} catch (FormatError &e) {
+		// The readers' messages start "backup: "; under the file's name that is said already.
+		std::string why = e.what();
+		if (why.compare(0, 8, "backup: ") == 0) {
+			why = why.substr(8);
+		}
+		throw FormatError("backup file \"" + paths.front() + "\": " + why);
+	}
 	return opened;
 }
 

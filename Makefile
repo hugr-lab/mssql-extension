@@ -653,15 +653,22 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_ctas_type_mapping.cpp \
     test/cpp/test_login_retry.cpp \
     test/cpp/backup/test_backup_allocation.cpp \
+    test/cpp/backup/test_backup_boot.cpp \
     test/cpp/backup/test_backup_bytes.cpp \
+    test/cpp/backup/test_backup_catalog_model.cpp \
     test/cpp/backup/test_backup_container.cpp \
+    test/cpp/backup/test_backup_iam.cpp \
+    test/cpp/backup/test_backup_lob.cpp \
     test/cpp/backup/test_backup_info.cpp \
     test/cpp/backup/test_backup_mtf.cpp \
     test/cpp/backup/test_backup_open_pass.cpp \
     test/cpp/backup/test_backup_page_index.cpp \
+    test/cpp/backup/test_backup_pages.cpp \
     test/cpp/backup/test_backup_pass_search.cpp \
     test/cpp/backup/test_backup_ranges.cpp \
+    test/cpp/backup/test_backup_record.cpp \
     test/cpp/backup/test_backup_source.cpp \
+    test/cpp/backup/test_backup_system_tables.cpp \
     test/cpp/backup/test_backup_xpress.cpp \
     test/cpp/backup/test_backup_zstd.cpp \
     test/cpp/test_catalog_filter.cpp \
@@ -1395,9 +1402,9 @@ fuzz-encode-replay: release
 # Linux leak-check lane replays the same corpora under ASan + LSan. The corpora are synthetic
 # (fuzz/gen_backup_seeds.cc): no backup of a server whose data is not ours (spec 085 T4).
 fuzz-backup-replay:
-	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page" \
+	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog" \
 	    $(PROJ_DIR)fuzz/build.sh
-	@for t in backup_mtf backup_container backup_xpress backup_page; do \
+	@for t in backup_mtf backup_container backup_xpress backup_page backup_catalog; do \
 	    $(PROJ_DIR)fuzz/out/fuzz_$$t $(PROJ_DIR)fuzz/corpus/$$t || exit 1; \
 	done
 # Spec 085 acceptance 2 over the committed samples: mssql_backup_info against the golden RESTORE
@@ -1472,7 +1479,7 @@ help:
 	@echo "  make joern-scan           - Run the Joern query suite (JOERN_QUERY=q3 for one query)"
 	@echo "  make joern-shell          - Open the Joern REPL on the CPG"
 	@echo "  make fuzz-encode-replay   - Replay the BCP/PLP encode corpus under ASan+UBSan (fuzz/README.md)"
-	@echo "  make fuzz-backup-replay   - Replay the backup reader's corpora (mtf, container, xpress, page)"
+	@echo "  make fuzz-backup-replay   - Replay the backup reader's corpora (mtf, container, xpress, page, catalog)"
 	@echo "  make test-backup-golden   - mssql_backup_info against the samples' golden RESTORE output"
 	@echo "  make backup-oracle-build  - Release build with httpfs linked in, for the backup oracle lane"
 	@echo "  make leak-check           - LeakSanitizer over the DuckDB-free fuzz corpora (Linux only)"
