@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""CRAP scores for this repository's C++, from lizard's complexity and an LCOV report.
+"""CRAP scores for this repository's C or C++, from lizard's complexity and an LCOV report.
+
+One file, kept identical in hugr-lab/mssql-extension, hugr-lab/duck-changepoint and hugr-lab/duck-emeans;
+change it in all three. test_crap_cpp.py beside it is the same everywhere too (`uvx pytest tools/crap`).
 
 CRAP = CC² × (1 − coverage)³ + CC, the metric `crapper` applies to the languages it
 reads. It does not read C++ -- no tool does, for CRAP: crap4j is Java-only -- so this
@@ -99,12 +102,24 @@ def parse_lcov(text):
         elif line.startswith("DA:") and current is not None:
             number, _, count = line[3:].partition(",")
             try:
-                current[int(number)] = int(count.split(",")[0])
+                hits = int(count.split(",")[0])
+                current[int(number)] = current.get(int(number), 0) + hits
             except ValueError:
                 continue
         elif line == "end_of_record":
             current = None
     return files
+
+
+def merge_coverage(into, parsed):
+    """Adds a second report's hit counts to the first, line by line, so a file that several
+    binaries or runs report keeps every hit instead of the last record's."""
+    merged = {path: dict(lines) for path, lines in (into or {}).items()}
+    for path, lines in parsed.items():
+        target = merged.setdefault(path, {})
+        for number, hits in lines.items():
+            target[number] = target.get(number, 0) + hits
+    return merged
 
 
 def lines_for(coverage, path):
@@ -158,20 +173,22 @@ def score(functions, coverage):
     return rows
 
 
-def run_lizard(paths, binary):
-    """lizard over `paths`, or exit saying how to get it."""
+def lizard_command(binary):
+    """How to invoke lizard: the binary on PATH, the module in this interpreter, or exit saying how to get it."""
     command = shutil.which(binary)
     if command:
-        argv = [command, "--csv"]
-    elif subprocess.run([sys.executable, "-c", "import lizard"],
-                        capture_output=True).returncode == 0:
-        argv = [sys.executable, "-m", "lizard", "--csv"]
-    else:
-        sys.exit("crap_cpp: lizard is not installed. It is the complexity half of this\n"
-                 "  tool and the only part that reads C++:\n"
-                 "    uv tool install lizard   (or: pipx install lizard, pip install lizard)\n"
-                 "  Then re-run. `--lizard-csv <file>` reads a csv you already have.")
-    argv += ["-l", "cpp"] + [str(p) for p in paths]
+        return [command, "--csv"]
+    if subprocess.run([sys.executable, "-c", "import lizard"], capture_output=True).returncode == 0:
+        return [sys.executable, "-m", "lizard", "--csv"]
+    sys.exit("crap_cpp: lizard is not installed. It is the complexity half of this\n"
+             "  tool and the only part that reads C++:\n"
+             "    uv tool install lizard   (or: pipx install lizard, pip install lizard)\n"
+             "  Then re-run. `--lizard-csv <file>` reads a csv you already have.")
+
+
+def run_lizard(paths, binary):
+    """lizard's csv over `paths`."""
+    argv = lizard_command(binary) + ["-l", "cpp"] + [str(p) for p in paths]
     run = subprocess.run(argv, capture_output=True, text=True)
     # lizard exits non-zero when a threshold is exceeded, which is not our failure;
     # empty output is.
@@ -181,38 +198,67 @@ def run_lizard(paths, binary):
     return run.stdout
 
 
-def report(rows, threshold, limit):
-    known = [r for r in rows if r["crap"] is not None]
-    print("CRAP Report (C++)")
-    print("=================")
-    print(f"{len(rows)} function(s)" + ("" if known else
-          "; coverage N/A, so the CRAP column is what it WOULD be at 0% coverage (CC² + CC)"))
-    print()
+def shown_crap(row):
+    """The score a row is judged by: its CRAP, or what it would be at 0% coverage when unknown."""
+    return row["crap"] if row["crap"] is not None else row["crap_at_zero"]
+
+
+def format_row(row):
+    cov = "N/A" if row["coverage"] is None else f"{row['coverage'] * 100:.1f}%"
+    return f"{row['function'][:44]:<44} {row['file'][-46:]:<46} {row['cc']:>4} {cov:>7} {shown_crap(row):>9.1f}"
+
+
+def print_rows(rows, limit):
     print(f"{'function':<44} {'file':<46} {'CC':>4} {'Cov%':>7} {'CRAP':>9}")
     print("-" * 114)
     for row in rows[:limit]:
-        cov = "N/A" if row["coverage"] is None else f"{row['coverage'] * 100:.1f}%"
-        value = row["crap"] if row["crap"] is not None else row["crap_at_zero"]
-        print(f"{row['function'][:44]:<44} {row['file'][-46:]:<46} "
-              f"{row['cc']:>4} {cov:>7} {value:>9.1f}")
+        print(format_row(row))
     if len(rows) > limit:
         print(f"... {len(rows) - limit} more; --limit 0 for all, --json for the lot")
-    over = [r for r in rows
-            if (r["crap"] if r["crap"] is not None else r["crap_at_zero"]) >= threshold]
+
+
+def over_threshold(rows, threshold):
+    return [r for r in rows if shown_crap(r) >= threshold]
+
+
+def report(rows, threshold, limit):
+    known = any(r["crap"] is not None for r in rows)
+    print("CRAP Report (C/C++)")
+    print("===================")
+    print(f"{len(rows)} function(s)" + ("" if known else
+          "; coverage N/A, so the CRAP column is what it WOULD be at 0% coverage (CC² + CC)"))
     print()
-    print(f"{len(over)} function(s) at or above CRAP {threshold}"
-          + (" (at 0% coverage)" if not known else ""))
+    print_rows(rows, limit)
+    over = over_threshold(rows, threshold)
+    print()
+    print(f"{len(over)} function(s) at or above CRAP {threshold}" + (" (at 0% coverage)" if not known else ""))
     return over
+
+
+class Checks:
+    """Counts the self-test's failures while printing each check."""
+
+    def __init__(self):
+        self.failures = 0
+
+    def check(self, label, ok, detail):
+        print(f"  [{'ok' if ok else 'FAIL'}] {label:<58} -> {detail}")
+        self.failures += 0 if ok else 1
+
+
+def refusal(csv_text):
+    """What parse_lizard_csv says when it refuses a csv, or ACCEPTED."""
+    try:
+        parse_lizard_csv(csv_text)
+        return "ACCEPTED"
+    except SystemExit as exc:
+        return str(exc)
 
 
 def selftest():
     """The joins and the arithmetic, with no lizard and no lcov on disk."""
-    failures = 0
-
-    def check(label, ok, detail):
-        nonlocal failures
-        print(f"  [{'ok' if ok else 'FAIL'}] {label:<58} -> {detail}")
-        failures += 0 if ok else 1
+    checks = Checks()
+    check = checks.check
 
     print("the CRAP formula:")
     check("CC 1 fully covered is 1", crap(1, 1.0) == 1.0, crap(1, 1.0))
@@ -236,11 +282,7 @@ def selftest():
           f"{rows[0]['start']}..{rows[0]['end']}")
     check("the name is the function, not the signature", rows[0]["function"] == "Foo::bar",
           rows[0]["function"])
-    try:
-        parse_lizard_csv("1,2,3\n")
-        why = "ACCEPTED"
-    except SystemExit as exc:
-        why = str(exc)
+    why = refusal("1,2,3\n")
     check("a short row is refused, naming lizard", "lizard version" in why, why[:46])
 
     print("\nlcov, and the file join:")
@@ -254,6 +296,13 @@ def selftest():
     check("a build-dir path joins by its suffix", fraction == 0.5, fraction)
     check("a function outside the lines scores nothing",
           coverage_for({"file": "src/x.cpp", "start": 90, "end": 99}, coverage) is None, "None")
+    twice = parse_lcov(lcov + "SF:/build/elsewhere/src/x.cpp\nDA:6,2\nend_of_record\n")
+    check("a file reported twice adds its hits", twice["/build/elsewhere/src/x.cpp"][6] == 2
+          and twice["/build/elsewhere/src/x.cpp"][5] == 1, dict(sorted(twice["/build/elsewhere/src/x.cpp"].items())))
+    merged = merge_coverage(coverage, {"/build/elsewhere/src/x.cpp": {8: 4}, "src/y.cpp": {1: 1}})
+    check("two reports merge by adding", merged["/build/elsewhere/src/x.cpp"][8] == 4
+          and merged["/build/elsewhere/src/x.cpp"][5] == 1 and merged["src/y.cpp"] == {1: 1}, "x.cpp line 8 -> 4")
+    check("merging leaves the first report alone", coverage["/build/elsewhere/src/x.cpp"][8] == 0, "still 0")
     check("an unmentioned file scores nothing",
           coverage_for({"file": "src/other.cpp", "start": 5, "end": 8}, coverage) is None, "None")
     scored = score(parse_lizard_csv(csv_text), coverage)
@@ -266,11 +315,11 @@ def selftest():
           scored[0]["crap"] is None, str(scored[0]["crap"]))
     check("and a half-covered CC 1 is 1.125, not 1",
           abs(scored[1]["crap"] - 1.125) < 1e-9, scored[1]["crap"])
-    print(f"\n{'FAIL' if failures else 'PASS'}: self-test, {failures} failure(s)")
-    return 1 if failures else 0
+    print(f"\n{'FAIL' if checks.failures else 'PASS'}: self-test, {checks.failures} failure(s)")
+    return 1 if checks.failures else 0
 
 
-def main():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("paths", nargs="*", default=["src"], help="files or directories (default: src)")
@@ -281,37 +330,53 @@ def main():
     ap.add_argument("--limit", type=int, default=30, help="rows to print; 0 for all")
     ap.add_argument("--json", help="write every row here")
     ap.add_argument("--selftest", action="store_true", help="check this tool's own joins")
-    args = ap.parse_args()
-    if args.selftest:
-        return selftest()
+    return ap.parse_args(argv)
 
+
+def lizard_text(args):
+    """lizard's csv: the file given, or a run over the paths."""
     if args.lizard_csv:
-        text = pathlib.Path(args.lizard_csv).read_text()
-    else:
-        paths = [pathlib.Path(p) for p in args.paths]
-        missing = [str(p) for p in paths if not p.exists()]
-        if missing:
-            sys.exit(f"crap_cpp: no such path: {', '.join(missing)}")
-        text = run_lizard(paths, args.lizard)
-    functions = [f for f in parse_lizard_csv(text)
-                 if pathlib.PurePath(f["file"]).suffix in SUFFIXES]
+        return pathlib.Path(args.lizard_csv).read_text()
+    paths = [pathlib.Path(p) for p in args.paths]
+    missing = [str(p) for p in paths if not p.exists()]
+    if missing:
+        sys.exit(f"crap_cpp: no such path: {', '.join(missing)}")
+    return run_lizard(paths, args.lizard)
+
+
+def load_functions(args):
+    """The C and C++ functions lizard found, or exit."""
+    functions = [f for f in parse_lizard_csv(lizard_text(args)) if pathlib.PurePath(f["file"]).suffix in SUFFIXES]
     if not functions:
         sys.exit("crap_cpp: no C or C++ functions in lizard's output")
+    return functions
 
+
+def load_coverage(paths):
+    """Every LCOV report merged, or None when there is none."""
     coverage = None
-    for path in args.lcov:
-        text = pathlib.Path(path).read_text()
-        parsed = parse_lcov(text)
+    for path in paths:
+        parsed = parse_lcov(pathlib.Path(path).read_text())
         if not parsed:
             sys.exit(f"crap_cpp: {path} holds no SF/DA records -- is it LCOV?")
-        coverage = {**(coverage or {}), **parsed}
+        coverage = merge_coverage(coverage, parsed)
+    return coverage
 
-    rows = score(functions, coverage)
+
+def write_json(rows, path):
+    pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+    pathlib.Path(path).write_text(json.dumps(rows, indent=2) + "\n")
+    print(f"wrote {path}")
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.selftest:
+        return selftest()
+    rows = score(load_functions(args), load_coverage(args.lcov))
     over = report(rows, args.threshold, args.limit or len(rows))
     if args.json:
-        pathlib.Path(args.json).parent.mkdir(parents=True, exist_ok=True)
-        pathlib.Path(args.json).write_text(json.dumps(rows, indent=2) + "\n")
-        print(f"wrote {args.json}")
+        write_json(rows, args.json)
     return 2 if over else 0
 
 
