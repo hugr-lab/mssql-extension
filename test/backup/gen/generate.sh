@@ -141,7 +141,7 @@ run_sql() {	# $1 = a script of /tmp/gen
 golden() {	# $1 = database, $2 = set
 	sql -d "$1" -v OUTPREFIX="${DIR}/$2" -s '|' -W -i /tmp/gen/catalog_golden.sql
 	local kind
-	for kind in tables columns views modules partitioning boundaries partitions; do extras+=("$2.${kind}.txt"); done
+	for kind in tables columns views modules partitioning boundaries partitions schemas; do extras+=("$2.${kind}.txt"); done
 }
 scalar() {	# $1 = a query answering one value
 	sql -h -1 -W -Q "SET NOCOUNT ON; $1" | head -1 | tr -d ' \r'

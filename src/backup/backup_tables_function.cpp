@@ -121,6 +121,13 @@ std::vector<Column> TableColumns() {
 			{"partitions", LogicalType::LIST(PartitionStructType())}};
 }
 
+std::vector<Column> SchemaColumns() {
+	return {{"schema_id", LogicalType::INTEGER},
+			{"schema_name", LogicalType::VARCHAR},
+			{"table_count", LogicalType::INTEGER},
+			{"view_count", LogicalType::INTEGER}};
+}
+
 std::vector<Column> ViewColumns() {
 	return {{"schema_name", LogicalType::VARCHAR},	{"view_name", LogicalType::VARCHAR},
 			{"object_id", LogicalType::INTEGER},	{"definition", LogicalType::VARCHAR},
@@ -320,6 +327,19 @@ std::vector<Value> TableRow(const CatalogTable &t) {
 	return row;
 }
 
+// One schema (sysclsobjs class 50, every one the database has, the system schemas and the roles'
+// included, as sys.schemas lists them) with the user tables and views the catalog lists in it.
+std::vector<Value> SchemaRow(const CatalogModel &model, const CatalogSchema &s) {
+	int32_t tables = 0, views = 0;
+	for (const auto &t : model.tables) {
+		tables += t.schema_id == s.id;
+	}
+	for (const auto &v : model.views) {
+		views += v.schema_id == s.id;
+	}
+	return {Value::INTEGER(s.id), Text(s.name), Value::INTEGER(tables), Value::INTEGER(views)};
+}
+
 // `off_row_bytes`: the call's off-row definitions so far, within MAX_CALL_OFF_ROW_BYTES in all (as
 // mssql_backup_catalog's; review of #549): past it a view's definition is NULL with the reason.
 std::vector<Value> ViewRow(const PageStore &store, const CatalogView &v, uint64_t &off_row_bytes) {
@@ -362,7 +382,7 @@ std::vector<Value> ViewRow(const PageStore &store, const CatalogView &v, uint64_
 	return row;
 }
 
-enum class Listing : uint8_t { Tables, Views };
+enum class Listing : uint8_t { Tables, Views, Schemas };
 
 struct CatalogListBindData : public TableFunctionData {
 	vector<std::string> paths;
@@ -387,7 +407,9 @@ struct CatalogListState : public GlobalTableFunctionState {
 };
 
 const char *FunctionName(Listing listing) {
-	return listing == Listing::Tables ? "mssql_backup_tables" : "mssql_backup_views";
+	return listing == Listing::Tables  ? "mssql_backup_tables"
+		   : listing == Listing::Views ? "mssql_backup_views"
+									   : "mssql_backup_schemas";
 }
 
 template <Listing L>
@@ -396,7 +418,9 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	auto data = make_uniq<CatalogListBindData>();
 	data->listing = L;
 	data->paths = PathsOf(input.inputs[0], FunctionName(L));
-	for (const auto &column : L == Listing::Tables ? TableColumns() : ViewColumns()) {
+	for (const auto &column : L == Listing::Tables	? TableColumns()
+							  : L == Listing::Views ? ViewColumns()
+													: SchemaColumns()) {
 		names.emplace_back(column.name);
 		return_types.push_back(column.type);
 	}
@@ -418,13 +442,15 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	const auto &data = input.bind_data->Cast<CatalogListBindData>();
 	auto &state = input.global_state->Cast<CatalogListState>();
 	const CatalogModel &model = state.catalog->model;
-	const size_t total = data.listing == Listing::Tables ? model.tables.size() : model.views.size();
+	const size_t total = data.listing == Listing::Tables  ? model.tables.size()
+						 : data.listing == Listing::Views ? model.views.size()
+														  : model.schemas.size();
 	idx_t count = 0;
 	while (state.next < total && count < STANDARD_VECTOR_SIZE) {
-		const std::vector<Value> row =
-			data.listing == Listing::Tables
-				? TableRow(model.tables[state.next])
-				: ViewRow(*state.catalog->pages->store, model.views[state.next], state.off_row_bytes);
+		const std::vector<Value> row = data.listing == Listing::Tables ? TableRow(model.tables[state.next])
+									   : data.listing == Listing::Views
+										   ? ViewRow(*state.catalog->pages->store, model.views[state.next], state.off_row_bytes)
+										   : SchemaRow(model, model.schemas[state.next]);
 		for (idx_t c = 0; c < row.size(); c++) {
 			output.data[c].SetValue(count, row[c]);
 		}
@@ -462,6 +488,11 @@ void RegisterBackupTablesFunctions(ExtensionLoader &loader) {
 		"Lists the views in a SQL Server full backup (.bak), with their T-SQL definitions as stored (NULL for "
 		"a view created WITH ENCRYPTION, which the reader does not de-obfuscate), read from the file alone.",
 		{"SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sales_full.bak')"});
+	Register<Listing::Schemas>(
+		loader,
+		"Lists the schemas of the database in a SQL Server full backup (.bak), as sys.schemas does (the system "
+		"schemas and the roles' included), with the user tables and views in each, read from the file alone.",
+		{"SELECT schema_name, table_count, view_count FROM mssql_backup_schemas('/backups/sales_full.bak')"});
 }
 
 }  // namespace backup

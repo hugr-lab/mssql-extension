@@ -37,6 +37,20 @@ FROM (SELECT unnest(columns) AS c FROM mssql_backup_tables('test/data/backup/ful
 6	flag	bit	BOOLEAN	NULL	NULL	false	true	NULL
 7	blob	varbinary(64)	BLOB	NULL	NULL	true	true	NULL
 
+# The schemas, as sys.schemas lists them (spec 085 PR 2d), with the tables and views in each.
+query ITII
+SELECT * FROM mssql_backup_schemas('test/data/backup/full.bak') WHERE schema_id < 16384 ORDER BY schema_id;
+----
+1	dbo	2	0
+2	guest	0	0
+3	INFORMATION_SCHEMA	0	0
+4	sys	0	0
+
+query I
+SELECT count(*) FROM mssql_backup_schemas('test/data/backup/full.bak') WHERE schema_name LIKE 'db\_%' ESCAPE '\';
+----
+9
+
 # A table's allocation units: one in-row unit, its IAM chain's first page named; no live-page count
 # before the scan walks the chain (DQ-40).
 query TITTT

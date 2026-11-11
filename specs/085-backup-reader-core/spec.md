@@ -1354,6 +1354,11 @@ per-AU runs and parallel units (2e), off-row values (PR 3), `mssql_backup_column
     still to come, `off_row_pending` until PR 3, `not_stored`, `storage_format`) and `reason` -- the
     state of every column at a glance (owner, 2026-11-11: the next PR after 2d; no flag in
     `mssql_backup_tables` instead) — 0.5 d
+16e. Filter pushdown into the catalog functions (owner, 2026-11-11): `schema_name` / `table_name` /
+    `view_name` equalities and IN lists of `mssql_backup_schemas` / `_tables` / `_views` / `_columns`
+    pushed into the model's build, so only the objects asked for get their columns, layouts, defaults
+    and partitioning built and listed; the open pass and the bootstrap tables are the fixed cost the
+    cache (task 22) and an attached catalog (task 23) take away — 1 d
 
 **PR 3 — LOBs**
 
@@ -1365,7 +1370,15 @@ per-AU runs and parallel units (2e), off-row values (PR 3), `mssql_backup_column
 
 22. Opened-file cache: staged build, key, eviction estimate — 1.5 d
 23. ATTACH: storage extension, catalog / schema / table entries, transaction manager, isolation from
-    `TYPE mssql` (a test that sets every pool / optimizer counter and asserts zero) — 4 d
+    `TYPE mssql` (a test that sets every pool / optimizer counter and asserts zero) — 4 d. Owner,
+    2026-11-11: the file functions then take an attached backup catalog in place of a path
+    (`mssql_backup_scan('bk', 'dbo', 'orders')`, `mssql_backup_tables('bk')`), as `mssql_scan` takes
+    an attached database, and the catalog keeps what an open built -- the page index, the model, a
+    unit's runs (the scan's read indexes) -- so a call reads nothing it has already read. And an
+    ATTACH is limited to the schemas and tables asked for (owner, 2026-11-11): `schema_filter` /
+    `table_filter`, regexes with TYPE mssql's semantics (case-insensitive, partial match), so the
+    catalog builds its model, and keeps its indexes, for those objects only (task 16e's pushdown is
+    the same restriction for one call).
 24. Differential overlay and chain check: the diff's pages by their header AU, the full's by the IAM
     chain through the overlay (D4) — 2 d
 25. `s3://` (MinIO) and `https://` tests in the lane; measure the open pass and decide filter pushdown

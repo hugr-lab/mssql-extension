@@ -285,6 +285,23 @@ def compare_set(c, db, name, arg, texts):
 
     compare_partitioning(c, db, name, arg, texts)
 
+    # mssql_backup_schemas (PR 2d): every schema sys.schemas lists, by id, with the tables and views
+    # counted against the listings above. A set generated before the schemas golden existed has none.
+    if f"{name}.schemas.txt" in texts:
+        schemas = db.query("SELECT schema_id::VARCHAR AS schema_id, schema_name, table_count::VARCHAR AS table_count, "
+                           f"view_count::VARCHAR AS view_count FROM mssql_backup_schemas({arg})")
+        ours = keyed(schemas, "schema_id")
+        theirs = keyed(parse_golden(texts[f"{name}.schemas.txt"]), "schema_id")
+        compare_keys(c, f"{name}: schemas", ours, theirs)
+        for k in sorted(set(ours) & set(theirs), key=lambda k: int(k[0])):
+            o = ours[k]
+            where = f"{name}: schema {k[0]}"
+            c.check(where, "schema_name", o["schema_name"], theirs[k]["schema_name"])
+            c.check(where, "table_count", o["table_count"],
+                    str(sum(1 for t in tables if t["schema_name"] == o["schema_name"])))
+            c.check(where, "view_count", o["view_count"],
+                    str(sum(1 for v in views if v["schema_name"] == o["schema_name"])))
+
     # mssql_backup_catalog: every base table it lists reads whole (an xtype a version adds fails here),
     # its count the rowset's; and sysobjvalues serves exactly the rows the server says it may (DQ-11).
     listed = db.query(f"SELECT base_table, row_count::VARCHAR AS row_count FROM mssql_backup_catalog({arg})")

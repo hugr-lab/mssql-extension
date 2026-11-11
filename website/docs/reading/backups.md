@@ -134,6 +134,10 @@ SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sale
 | `partitioning` | `STRUCT(…)` | for a partitioned table (NULL on a filegroup): `function_name`, `scheme_name`, `column_name`, `column_id`, `parameter_type`, `range_right`, `boundaries` (a list of `VARIANT`s in the parameter's type, in boundary order; a NULL boundary is a NULL element), `destinations` (the filegroup of each partition), `next_used`, and `reason` when the reader cannot give it exactly (the boundaries are then NULL, never a partial list; the destinations and `next_used` are still given when only a boundary's value could not be read). The table's rows are read either way |
 | `partitions` | `LIST(STRUCT(…))` | every partition: `partition_number`, `rows`, `compression`, `filegroup` |
 
+`mssql_backup_schemas(path)` lists the database's schemas as `sys.schemas` does (the system schemas
+and the roles' included): `schema_id`, `schema_name`, and the `table_count` and `view_count` of user
+tables and views in each.
+
 `mssql_backup_views` columns: `schema_name`, `view_name`, `object_id`, `definition` (the T-SQL text
 as stored; NULL for a view created `WITH ENCRYPTION`, which the reader does not de-obfuscate),
 `is_encrypted`, `created`, `modified`, and `reason`: why a definition could not be read, NULL

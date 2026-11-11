@@ -2,7 +2,7 @@
 -- through sqlcmd's :OUT, one batch per file (sqlcmd runs a batch at its GO): <set>.tables.txt
 -- (shape, partitions, rows, dates), .columns.txt, .views.txt (definition length and SHA-256),
 -- .modules.txt (the sysobjvalues rows mssql_backup_catalog may serve), .partitioning.txt /
--- .boundaries.txt / .partitions.txt (spec 085 PR 2c) --
+-- .boundaries.txt / .partitions.txt (spec 085 PR 2c), .schemas.txt (sys.schemas, PR 2d) --
 -- what test/backup/compare_catalog.py compares mssql_backup_tables / _views with. Run by
 -- generate.sh's golden() with -d <the database the backup was taken of> -v OUTPREFIX=<dir>/<the set>
 -- -s '|' -W, right after that backup, nothing changed since.
@@ -24,6 +24,9 @@ SELECT s.name AS schema_name, t.name AS table_name, c.column_id, c.name AS colum
 FROM sys.columns c JOIN sys.tables t ON t.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = t.schema_id
 WHERE t.is_ms_shipped = 0
 ORDER BY s.name, t.name, c.column_id;
+GO
+:OUT $(OUTPREFIX).schemas.txt
+SELECT schema_id, name AS schema_name FROM sys.schemas ORDER BY schema_id;
 GO
 :OUT $(OUTPREFIX).views.txt
 SELECT s.name AS schema_name, v.name AS view_name, v.object_id,
