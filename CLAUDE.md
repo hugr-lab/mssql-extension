@@ -18,7 +18,11 @@ src/
                         # backup_source (DuckDB FileSystem, ranges), backup_mtf, backup_container
                         # (MSSQLBAK) + backup_xpress / backup_zstd, backup_set (TAPE/SSET/SCIN/SFIN),
                         # backup_opened (OpenedHeaders), backup_page_index / _pass_search /
-                        # _allocation (pages, PR 2), backup_info_function. DuckDB-free except
+                        # _allocation (pages, PR 2), backup_page / _record / _boot / _collation /
+                        # _iam / _system_tables / _sql_variant / _lob / _catalog_model (PageStore,
+                        # records, the boot page, IAM chains, the base tables, the catalog model; PR 2b),
+                        # backup_info_function / _tables_function / _catalog_function (+ _function_common).
+                        # DuckDB-free except
                         # the files whose header says [DuckDB] (D15)
   catalog/              # DuckDB catalog integration + transaction manager
   codec/                # Per-type-family codec layer (spec 045): boolean/integer/
@@ -46,7 +50,7 @@ test/
   sql/                  # SQLLogicTest files (require SQL Server for most)
     attach/             # ATTACH/DETACH tests
     azure/              # Azure AD authentication tests (no SQL Server required)
-    backup/             # mssql_backup_info over test/data/backup (no SQL Server required)
+    backup/             # mssql_backup_info / _tables / _views / _catalog over test/data/backup (no SQL Server required)
     catalog/            # Catalog, DDL, filter pushdown, statistics
     copy/               # COPY TO MSSQL (BulkLoadBCP) tests
     ctas/               # CREATE TABLE AS SELECT tests
@@ -58,6 +62,14 @@ test/
     tds_connection/     # TDS protocol tests
     transaction/        # Transaction management tests
   cpp/                  # C++ unit tests (no SQL Server required); cpp/backup/ for spec 085
+  backup/               # Spec 085 PR 2a/2b: gen/ (generate.sh; fixtures samples / catalog / files (two
+                        # files, a file removed) / load (backups under a workload) / large (data past
+                        # a GAM interval); catalog_golden.sql, run by generate.sh with ONE -v path
+                        # variable (sqlcmd substitutes no :setvar and only the first -v in :OUT); images.txt pinning each
+                        # SQL Server image by digest), compare_catalog.py (mssql_backup_tables / _views vs the
+                        # server's catalog), compare_info.py (mssql_backup_info vs RESTORE,
+                        # local dir or s3://), httpfs_extension_config.cmake + oracle_vcpkg_manifest.py
+                        # (the oracle build: httpfs static, curl from vcpkg)
   data/backup/          # Synthetic backup samples + golden RESTORE HEADERONLY/LABELONLY/FILELISTONLY,
                         # made by generate.sh on a throwaway container. Never commit a backup of
                         # any other instance (spec 085 T4); .gitignore admits only this directory's .bak
@@ -99,7 +111,10 @@ make crap-cpp           # CRAP per C++ function (lizard + an LCOV report; crappe
                         # without LCOV=<file>; make crap-cpp-selftest needs neither
 make bench-code-page-column  # One 2048-row column, staging to vector: DecodeColumn vs today's
                         # NVARCHAR path (needs a release build; CELL=thai filters cells)
-make fuzz-backup-replay # Replay the backup reader's fuzz corpora (mtf, container, xpress, page;
+make test-backup-golden # mssql_backup_info vs the samples' golden RESTORE output, every field (spec 085)
+make backup-oracle-build # Release build with httpfs linked in statically, for the backup oracle lane
+                        # (.github/workflows/backup-oracle.yml: backups of 2017-2025 in R2, read via s3://)
+make fuzz-backup-replay # Replay the backup reader's fuzz corpora (mtf, container, xpress, page, catalog;
                         # spec 085), DuckDB-free, under sanitizers
 
 # Docker
@@ -286,6 +301,8 @@ Available in: ATTACH options, ADO.NET connection strings (`SchemaFilter`/`TableF
 | `mssql_scan_params(context, statement, STRUCT [, declarations] [, prepared := false])` | Table | `mssql_scan` with parameters: `{'p': 1}` becomes `@p`, declared from the DuckDB type (spec 075 W5 table: VARCHAR → `nvarchar(4000)`/`nvarchar(max)`, `MSSQL_VARCHAR(n)` exact, TIMESTAMP → `datetime2(6)`, …) or by the caller's own list (`'@ts datetime, @c varchar(8)'`), and sent through `sp_executesql` as an RPC call (spec 083; `sp_execute` by handle with `prepared := true`) — one server plan per statement text, shared by every session. A bare NULL, a nested type or a name that is not a T-SQL identifier is refused with the fix named. |
 | `mssql_dml(context, statement [, params [, declarations]], kind :=, target_schema :=, target_table := [, identity_insert :=])` | Table | Spec 080 PR 3b, **internal**: the vehicle a pushed UPDATE / DELETE / INSERT … SELECT / MERGE runs through (`kind` 'update' / 'delete' / 'insert' / 'merge' -- a MERGE registers INSERT | UPDATE | DELETE, its actions unknown at bind; `identity_insert := true` wraps the statement in SET IDENTITY_INSERT ON / OFF on its connection, PR 3d) (the rewriter's target since PR 3c, `MSSQLCatalog::DmlVehicleFor`). Binds with no connection; the bind registers the write (`RegisterDBModify`) and `CheckWriteAccess` -- with `CHANGED_ROWS` that makes its handle read like a native UPDATE's (DuckDB's `StreamsByDefault` answers no; since DuckDB #26880 there is no ResultEagerness and no FORCED: a submitted write, native or this, runs and waits at its count until its consumer settles it -- `test/cpp/test_dml_vehicle.cpp`, `make test-dml-vehicle`, in the concurrency job), and refuses a statement `SqlMayChangeSchema` flags; registered with `call_return_type = CHANGED_ROWS` and `verify_serialization = false` (never folded by the common-subplan optimizer); bind data `SupportStatementCache() = false` (every EXECUTE rebinds); a run-once latch, a re-initialised source (recursive CTE) refused by name, not an InternalException. Runs at InitGlobal on a `MSSQLStatementConnection` (atomic in autocommit, the pinned connection in a transaction) with NO deadline (`mssql::ExecuteDmlBatch` with `interruptible`: waits in 1 s slices asking `ClientContext::IsInterrupted`, ATTENTION + InterruptException on Ctrl-C; `mssql_query_timeout` is not applied -- a pushed copy answers nothing until its DONE; a dead peer ends the wait through the TCP keepalive every socket sets since PR 3d: 30 s idle / 10 s / 6 probes (over TLS too since #456: a TLS read error or a closed peer marks the socket dead, where it used to read as a timeout and the wait spun)); `Count` is the last DONE carrying a count (an AFTER trigger's arrive first, measured); an autocommit DELETE moves the planner's estimate (`NoteRowsDeleted`). |
 | `mssql_backup_info(path [, position := 1, reread := false])` | Table | Spec 085 PR 1: one row describing the backup set of a SQL Server backup -- RESTORE HEADERONLY / LABELONLY / FILELISTONLY's fields (`files` a LIST of STRUCTs) -- read from the file alone through DuckDB's file system, no connection. `path` is a file, a glob or a `LIST(VARCHAR)`: every family of one media set (an incomplete set names the missing `FamilySequenceNumber`s). Plain and MSSQLBAK containers (MS_XPRESS, ZSTD); refused by name: encrypted (spec 087), a file holding appended sets (more than one SSET) and any `position` other than 1, families of different sets, an unknown container flag word (QAT_DEFLATE, encrypted ZSTD). Read at bind; `reread := true` binds again on every EXECUTE. `page_count`, the D11 columns and `files.backup_size_bytes` are NULL until PRs 2 / 5 |
+| `mssql_backup_tables(path)` / `mssql_backup_views(path)` | Table | Spec 085 PR 2b: a full backup's user tables (shape, compression, partitions, rows, dates, `decodable` / `reason`, `columns` with `sql_type` and the `duckdb_type` TYPE mssql reads it as with native types off -- `MSSQLColumnInfo::MapSQLServerTypeToDuckDB` on the system type, D6 --, `allocation_units`) and views (definition, read on demand when off-row; NULL `WITH ENCRYPTION`; `reason`). Opened at init (`OpenBackupCatalog`: headers, pages, boot, bootstrap, model), every execution anew. NULL until their PRs: fuzzy / transactions (PR 5), `live_pages` (the scan's IAM walk), `partitioning` (PR 2c). Checked in the oracle lane by `test/backup/compare_catalog.py` against `catalog_golden.sql`'s files |
+| `mssql_backup_catalog(path [, base_table])` | Table | Spec 085 PR 2b: a system base table as stored (allow-list of § Security + `sysscalartypes`; `sysobjvalues` only valclass 1 of views / defaults, 2 of user tables' computed columns -- a TVF's return-table computed column is valclass 2 too --, 30 of partition functions; `sysseobjvalues` only valclass 1), typed by its own description through D6's map (`sql_variant` raw `BLOB`), virtual `_mssql_page` / `_mssql_rid` (`get_virtual_columns`, `projection_pushdown`; the key by `sysrscols.ordkey`). No table: the served list. Opened at bind without the model (the columns depend on the version); every EXECUTE rebinds; rows a page at a time, off-row values within 1 GiB a call |
 | `mssql_exec(context, sql)` | Scalar | Execute T-SQL, return affected row count |
 | `mssql_exec_params(context, statement, STRUCT [, declarations])` | Scalar | `mssql_exec` with the same parameter contract as `mssql_scan_params`; one round trip per row, the plan reused across rows and sessions. |
 | `mssql_pool_stats([context])` | Table | View connection pool statistics |

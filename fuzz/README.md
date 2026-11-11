@@ -50,6 +50,7 @@ Three modes:
 | `fuzz_backup_container` | the MSSQLBAK container: header, `WalkChain` / `OpenChainFromTail`, `ReadSeekIndex`, `ReadContainerTape`, `ContainerStream`, and its page index both ways (`BuildPageIndex`: the gallop through the walked chain and trust_layout's resync search), `ReadPage`, `AllocationMap` | `src/backup/` | ✅ (ZSTD blocks to a copying decoder: zstd is fuzzed upstream) |
 | `fuzz_backup_xpress` | `backup::XpressHuffmanDecode` (output size from the first two bytes) | `src/backup/backup_xpress.cpp` | ✅ |
 | `fuzz_backup_page` | `BuildPassMap`, `BuildRankedPassMap`, `BuildPageIndex` (`Locate` / `ReadPage`, searches and their fallback), `AllocationMap`, a galloping `PassSearch`, over a pass expanded from 64-byte chunks tiled into units | `src/backup/` | ✅ |
+| `fuzz_backup_catalog` | the catalog reader over up to 16 pages: `ReadBootPage`, `ReadIamPage`, FixedVar records through the bootstrap tables' literal layouts and the layouts their rows describe (`ForEachPageRow`, `DecodeRecord`), `AddBootstrapRow`, `BuildIndexes`, `BaseLayout`, `CheckBootstrapLayouts`, every value's accessor, `ParseSqlVariant`, `ModuleText`, and `ReadLobValue` over the same pages | `src/backup/` (spec 085 PR 2b) | ✅ |
 
 `fuzz_code_page` (spec 091) is in the default `TARGETS`, so it shares the per-PR
 job's one fuzzing budget with the other default targets. Its oracles are the
@@ -85,12 +86,17 @@ Both pick up the family codecs with a **non-recursive** glob, `src/codec/*.cpp`,
 in `build.sh`, plus `src/codec/code_page/*.cpp`, which `string_codec.cpp` and the
 stager call (spec 092).
 
-The four backup harnesses (spec 085 task 10) are **not in the default `TARGETS`**, so the per-PR
-ClusterFuzzLite budget stays the TDS layer's. Their corpora are synthetic, written by
-`fuzz/gen_backup_seeds.cc` from the unit tests' builders (never a backup of a server whose data is
-not ours to publish, spec 085 T4). `make fuzz-backup-replay` replays them; the Linux leak-check lane
-(`scripts/ci/leak_check.sh`) replays them under ASan + LSan; discovery is `fuzz/run.sh` with
-`TARGETS="backup_mtf backup_container backup_xpress backup_page"`.
+The five backup harnesses (spec 085 tasks 10 and 18) are **not in the default `TARGETS`**, so the per-PR
+ClusterFuzzLite budget stays the TDS layer's. Their corpora are written by `fuzz/gen_backup_seeds.cc`:
+from the unit tests' builders, and for `backup_catalog` pages of the committed sample
+`test/data/backup/full.bak` (a real backup of a database of generated rows, made on a throwaway
+instance) beside a built LOB tree -- never a backup of a server whose data is not ours to publish
+(spec 085 T4). `make fuzz-backup-replay` replays them; the Linux leak-check lane
+(`scripts/ci/leak_check.sh`) replays them under ASan + LSan; the weekly ClusterFuzzLite UBSan run
+(`ubsan-weekly` in `cflite-pr.yml`) fuzzes them beside the default targets, which it adds through
+`.clusterfuzzlite/extra_targets` (read by `.clusterfuzzlite/build.sh` as `TARGETS_EXTRA`); local
+discovery is `fuzz/run.sh` with `TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog"`.
+On macOS, where ASan hangs at the process's start, replay with `make fuzz-backup-replay FUZZ_REPLAY_SANITIZE=0`.
 
 ### `fuzz_bcp_encode`'s three oracles
 

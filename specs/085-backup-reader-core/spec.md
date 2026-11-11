@@ -480,7 +480,8 @@ Common named parameters of every function, and ATTACH options of the same names:
 `mssql_backup_tables(path)` returns one row per user table: `schema_name`, `table_name`, `object_id`,
 `shape` (`heap` / `clustered` / `columnstore`), `compression` (from `sysrowsets.cmprlevel`; `mixed`
 when partitions differ, E7: `cmprlevel` is per partition), `partition_count`, `row_count` (sum of
-`sysrowsets.rcrows`, exact in every rowset of E7's 16 states), `created`, `modified`, `decodable`,
+`sysrowsets.rcrows`, exact in every rowset of E7's 16 states; NULL when one is negative or the sum passes
+int64 -- a statistic, so the table is read all the same), `created`, `modified`, `decodable`,
 `reason`, `fuzzy_status`, `open_transactions`, `stale_transactions`, and three nested values:
 
 - `columns LIST(STRUCT(column_id, name, sql_type, system_type_id, max_length, precision, scale,
@@ -497,15 +498,35 @@ when partitions differ, E7: `cmprlevel` is per partition), `partition_count`, `r
 
 `mssql_backup_views(path)`: `schema_name`, `view_name`, `object_id`, `definition` (`VARCHAR`, the
 T-SQL text from `sysobjvalues`, X§4), `is_encrypted`, `created`, `modified`. A `WITH ENCRYPTION` view
-reports `definition` NULL and `is_encrypted` true; the reader does not de-obfuscate.
+reports `definition` NULL and `is_encrypted` true; the reader does not de-obfuscate. A `reason` column (NULL otherwise) names why a
+definition could not be read (D13: the view is listed, its text refused by name, not guessed).
+
+Both open the catalog at init (stages 1–4, `OpenBackupCatalog`; DESCRIBE reads no file) and read the
+file on every execution until task 22's cache. In 2b, NULL until their PR: `fuzzy_status` /
+`open_transactions` / `stale_transactions` (PR 5), `allocation_units.live_pages` (a unit's IAM chain is
+walked at its table's first scan, DQ-40, not to list it), `partitioning` (PR 2c). A column's
+`decodable` / `reason` name 085's refusals (§ Scope; `text` / `ntext` / `image` too, until PR 3, and a
+non-persisted computed column, which is not stored); its `duckdb_type` is D6's map on the system type
+underneath an alias. Checked against `sys.tables` / `sys.columns` / `sys.sql_modules` by
+`test/backup/compare_catalog.py` (the oracle lane; 2022 locally: 771 fields of the catalog fixture, 0
+differences).
 
 `mssql_backup_catalog(path, base_table)`: the base table's rows with its own columns as typed by its
 `syscolpars` rows, plus the virtual `_mssql_page` / `_mssql_rid` (for a base table, `_mssql_rid` is
-its clustering key by `ordkey`; checked against E1's keys: `sysallocunits(auid)`,
-`sysrowsets(rowsetid)`, `sysschobjs(id)`, `syscolpars(id, number, colid)`, `sysrscols(rsid,
-rscolid)`, `sysseobjvalues(valclass, id, subid, valnum)`, `sysclsobjs(class, id)`). Without
-`base_table` it lists the allow-listed base tables (`base_table`, `object_id`, `row_count`,
-`columns`), which is the set an importer mirrors (022 D3); the list is the reader's, per version.
+its clustering key by `ordkey`: `0x01`, then per key column u16 length and its stored bytes,
+`0xFFFF` for NULL; checked against E1's keys: `sysallocunits(auid)`, `sysrowsets(rowsetid)`,
+`sysschobjs(id)`, `syscolpars(id, number, colid)`, `sysseobjvalues(valclass, id, subid, valnum)`,
+`sysclsobjs(class, id)` -- and `sysrscols(rsid, hbcolid)`, not E1's `(rsid, rscolid)`: its own
+`ordkey` says so on 2017–2025, and the two agree only without a uniquifier; `syssingleobjrefs` is
+`(depid, class, depsubid)`). The columns are typed through D6's map; a `sql_variant` (`value`) is its
+raw bytes, `BLOB` (a VARIANT is 086's). Without `base_table` it lists the allow-listed base tables
+(`base_table`, `object_id`, `row_count` -- the rowset's, NULL for the two served by value class --,
+`columns`: `name`, `duckdb_type`, `key_ordinal`), which is
+the set an importer mirrors (022 D3); the list is the reader's, per version (a table the version
+lacks is left out). The catalog is opened at bind, since a table's columns depend on the version
+(2022 added `sysrscols.ordlock`), and every EXECUTE binds again. Rows are produced a page at a time
+(the unit's IAM-listed pages and a cursor, never the table), an off-row value as its row is, within one
+value's bound and 1 GiB for the call.
 
 `mssql_backup_scan(path, schema, table)`: the table's columns plus the D8 virtual columns.
 Projection pushdown; LOBs read only when their column is projected. **No filter pushdown in this
@@ -537,17 +558,19 @@ src/backup/                         namespace duckdb::mssql::backup (no prefix);
   backup_page_index.cpp             PageIndex: every unit of every MSDA pass of every family; latest copy
   backup_allocation.cpp             AllocationMap: file header Size, GAM, PFS on demand; IsLive (R3)
   backup_iam.cpp                    IamChain: an AU's IAM pages → its extent runs and single pages (DQ-40)
-  backup_page_store.cpp             PageStore: page bytes by (file, page); differential overlay
-  backup_catalog_reader.cpp         boot page, the five bootstrap layouts, generic base-table decoder
-  backup_catalog_model.cpp          CatalogModel: schemas, objects, rowsets, AUs, columns, TableLayout
+  backup_page.cpp                   PageStore: a live page's latest copy by (file, page); differential overlay
+  backup_boot.cpp                   the boot page (1:9), checked against the trailer
+  backup_system_tables.cpp          the five bootstrap layouts (literals, checked), generic base-table decoder
+  backup_sql_variant.cpp            sql_variant values of the base tables (defaults, flags, boundaries)
+  backup_catalog_model.cpp          CatalogModel: schemas, tables, columns, rowsets, AUs, layouts, views
   backup_collation.cpp              on-disk collation id → spec 091's collation table (code page, name)
   backup_record.cpp                 RecordView: FixedVar split, record types, forwarding, uniquifier
-  backup_lob.cpp                    LobReader: in-row roots, LOB trees, row-overflow, text pointers
+  backup_lob.cpp                    LobReader: in-row roots, LOB trees (the catalog's, PR 2b), row-overflow, text pointers
   backup_value_kernels.cpp          on-disk bytes → codec staging → DuckDB vectors                    [DuckDB]
   backup_log_tail.cpp               LogTail: MQTL blocks, sector parity, record headers, transactions
   backup_fuzzy.cpp                  FuzzyStatus: E3 flag (v) per table
   backup_opened.cpp                 OpenedBackup: the cached object, staged build, cache key           [DuckDB]
-src/backup/functions/               mssql_backup_info / _tables / _views / _catalog / _scan            [DuckDB]
+src/backup/backup_*_function.cpp    mssql_backup_info / _tables / _views / _catalog / _scan            [DuckDB]
 src/catalog/backup/                 namespace duckdb, MSSQL prefix                                      [DuckDB]
   mssql_backup_storage.cpp          StorageExtension (attach, transaction manager)
   mssql_backup_catalog.cpp          MSSQLBackupCatalog
@@ -687,7 +710,13 @@ until seen), u32 FileGroupId +36 (0 for the log), u64 Size in bytes +40, two str
 (u16 byte length, u16 offset in the record, UTF-16LE) +48 LogicalName and +52 PhysicalName, u64
 MaxSize in bytes +86 (unaligned), CreateLSN +138, UniqueId +186. **SFGI**: u32 filegroup id +12 and a
 string descriptor +16 for its name. FILELISTONLY's `BackupSizeInBytes` is not in SFIN: it is the
-file's pages in the data stream.
+file's pages in the data stream. Two MQCI streams carry the file list: the MSCI block's, before the
+data, and the trailer's (MSLS). FILELISTONLY lists the MSCI one -- its sizes are the start's, the
+trailer's the end's, larger once a file grew while the backup ran (the load fixture: 46080 pages at
+the start, 47104 at the end, FILELISTONLY 46080) -- so the reader takes the MSCI list (the trailer's
+when there is no MSCI). SFIN flags u32 +8: 0x20 on a file emptied and removed (`REMOVE FILE`), which
+FILELISTONLY leaves out and the data stream carries no page of; 0x04 / 0x84 on the others (the
+files fixture, 2022): a removed file is skipped.
 
 HEADERONLY's `FirstRecoveryForkID` and `ForkPointLSN` are derived: a log backup whose FirstLSN is not
 past the fork point spans the fork, and reports the parent fork and the fork point; every other
@@ -740,35 +769,84 @@ offsets above are in its fixed part.
   decoding stops at the output size; symbol 256 is not end-of-stream (W§3, X§5).
 
 **Page index**:
-- Unit kinds: header version byte (offset 0) ≠ 1 → a never-formatted zero unit, skipped; `m_type`
+- Unit kinds: header version byte (offset 0) 0 → a never-formatted zero unit, skipped (any other value but 1 is
+  a named error); `m_type`
   101 → a pad, skipped by type and never read further (§ Security); otherwise a page.
 - Later pass wins over earlier; within one pass a page id twice is a named error (never observed).
 - Positional cross-check (`verify`): a unit at position k of its 8-unit group carries a page id ≡ k
   (mod 8). 0 mismatches over every file of E2.
 
 **Allocation and liveness** (E2 layouts, R3):
-- GAM page 2, SGAM 3, DCM 6, BCM 7, repeated every 511,232 pages; bitmap at page offset 194, 7,988
-  bytes, bit i (LSB first) = extent i; GAM 1 = free. The second GAM interval is decoded but was never
-  exercised (E2§10).
+- GAM page 2, SGAM 3, DCM 6, BCM 7 in the first 511,232-page interval (pages 0 and 1 are the file
+  header and the first PFS); in every later interval GAM, SGAM, DCM, BCM at +0, +1, +6, +7 of its
+  first page (E17, 2026-11-10, SQL Server 2022, `sys.dm_db_page_info` on a 5 GB file: 511232 GAM,
+  511233 SGAM, 511238 DIFF_MAP, 511239 ML_MAP; 511234-511237 ordinary). Bitmap at page offset 194,
+  7,988 bytes, bit i (LSB first) = extent i; GAM 1 = free. Each allocation page read is checked to
+  be of its type (8 GAM, 11 PFS, 15 file header).
 - PFS page 1, then every 8,088 pages; byte for page p at `100 + (p mod 8088)` (page 1 covers pages 0–8087):
   0x40 allocated, 0x20 mixed extent, 0x10 IAM, 0x08 has ghosts, low 3 bits fullness.
 - File header page 0, slot 0 record (its offset varies: 96 or 2,494 seen; read it through the slot
-  array): u16 file id +167, u16 filegroup id +169, u32 `Size` in pages +171.
-- IAM: header record at 96, u32 sequence +4, start page +40, eight single-page slots +46; extent
-  bitmap at 194 relative to the start page. The chain follows the page header's next-page pointer
-  (u32 page @16, u16 file @20, as on every page; to be pinned on the samples in task 11a); the
-  sequence must ascend and each start page must open a GAM interval, else a named error.
+  array), a FixedVar record whose variable columns 2, 3 and 4 are the u16 file id, the u16 filegroup id
+  and the u32 `Size` in pages -- by column, not by offset: it has 66 columns on 2025 and 60 on 2022,
+  so its data starts 13 bytes apart (+167 / +171 hold on 2025 only; found 2026-11-10, checked on the
+  lane's 2017-2025 backups). A later interval whose first page is also a PFS page (an interval number
+  that is a multiple of 1011: a file of about 3.9 TB) is open: which of the two the page is, unknown.
+- IAM (type 10), two records: slot 0 the header (a primary record, fixed only: u32 sequence +4,
+  start page +40, eight 6-byte single-page slots +46), slot 1 the extent bitmap (its fixed part 7,988
+  bytes: bit i = extent i of the interval the start page opens). Read through the slots: slot 1
+  lies at 190 or 192 on the samples, not at 194. The chain follows the page header's next-page
+  pointer (u32 page @16, u16 file @20), and `prev` points back; the sequence numbers ascend along the
+  chain, not from 0 nor without gaps (E19: after `SHRINKFILE … EMPTYFILE` + `REMOVE FILE` five chains
+  start at 1); single-page slots on the chain's first page only; each start page opens a GAM
+  interval, no interval twice, each page names the chain's AU, no page comes twice (a single page
+  neither repeated nor inside the AU's extents), else a named error. Pinned 2026-11-10
+  (`ReadIamChain`): on the lane's 2017-2025 backups, the catalog fixture and E19 (a table across two
+  files: a two-page chain, its second page mapping file 3) every live data, index, LOB and IAM page
+  lies in exactly one chain, under the AU of its own header.
+- A live page whose latest copy is a zero unit became live while the backup ran: its content is in
+  the log tail only (RESTORE writes the frame whole and redoes the page from the log; DbReader alike).
+  The page store answers it `Pending` (the load fixture's full: one page of pass 2 of 45,603 live), and
+  a reader that needs it refuses by name until spec 090 replays the tail. Only in a backup with a later
+  pass (one that ran under changes), and only for a copy that is all zeros or names the page; in a one-pass
+  backup, or for a unit naming another page, it is the named error a misplaced copy is.
+- A file whose SFIN record carries flag 0x20 was emptied and removed (`ALTER DATABASE … REMOVE FILE`):
+  FILELISTONLY leaves it out and so does the reader. The backup carries no page of it (files fixture);
+  one that does is refused, so that another meaning of the flag cannot silently hide a file's pages.
 - `IsLive(file, page)`: the allocation pages themselves (0, 1, 9, the PFS pages, GAM / SGAM / DCM / BCM)
-  are live; any other page is live iff `page < Size` and its extent's GAM bit is 0 and its PFS byte has
-  0x40.
+  are live below the recorded `Size`, and past it where the backup carries them; any other page is live
+  iff its extent's GAM bit is 0 and its PFS byte has 0x40. **The recorded `Size` is a lower bound, not the
+  end of the data** (BusinessCentral.DbReader's PROVENANCE, MIT, "File size is a lower bound": on four
+  backups of a live database the copied, GAM-allocated extents ran 52 to 331 extents past it, always
+  less than the file's growth -- a file header image older than an autogrow during the backup). The GAM
+  marks nothing allocated past the end of the data (measured on the lane's 2017-2025 backups, and
+  DbReader's), so liveness and the rank path (D4a) follow the GAM, not the `Size`; the rank path goes on
+  into the next interval past the `Size` when that interval's GAM is the pass's next group.
 
 **Catalog** (X§4, E1§4.8, E2§4, `experiments/E1/pages_ext.py`):
-- Boot page 1:9, one record at 96: `dbi_version` u16 +4, `dbi_dbname` nvarchar(128) +52,
-  `dbi_cmptlevel` +314, `dbi_collation` u32 +392, `dbi_familyGUID` +408, `dbi_firstSysIndexes` +516
-  (6-byte page pointer, = 1:20, the first `sysallocunits` page).
-- Bootstrap tables, found by the page header's `(m_objId, m_indexId)` on live level-0 data pages:
+- Boot page 1:9 (type 13), one primary record of fixed columns only (statusA 0x00), its fixed part
+  1644 bytes on 2017, 1768 on 2019, 1786 on 2022, 1832 on 2025, the fields read here at one place on
+  all four (measured 2026-11-10 on the lane's backups): `dbi_version` u16 +4 (869 / 904 / 957 / 998),
+  `dbi_dbname` UTF-16 +52 (128 units, padded) with its length in bytes u16 +308, `dbi_cmptlevel` u8
+  +314, `dbi_collation` u32 +392 (a CollationId), `dbi_familyGUID` +408, `dbi_firstSysIndexes` +516
+  (6-byte page pointer, = 1:20, the first `sysallocunits` page). Checked against the trailer's name,
+  version, level, family GUID and collation (`CheckBootAgainstSet`; the CollationId's row must be one
+  the TDS form names: 13 collations of E15 / E16, `_SC` and KS / WS included).
+- Bootstrap tables, by the allocation unit their pages' headers name, `(m_objId, m_indexId)`:
   `sysallocunits` (7, 0), `sysrowsets` (5, 0), `sysschobjs` (34, 1), `syscolpars` (41, 1), `sysrscols`
-  (3, 0). Fixed-part offsets (record offsets):
+  (3, 0). The AU is not the rowset's (object, index): every one of the five is a clustered index
+  (`sysrowsets.idminor` 1), its AU owned by its rowset (`ownerid` = `rowsetid`). `sysallocunits` is read
+  along its leaf chain (next-page pointers) from `dbi_firstSysIndexes`; its own row (the first page's
+  AU) names that page as `pgfirst`, and its IAM chain (`pgfirstiam`) lists exactly the chain's pages.
+  The other four through their IAM chains (DQ-40). The reader's layouts of the five are literals, the
+  table below, decoded by the generic decoder; once read, each literal (name, type, fixed offset or
+  variable index, null bit, a fixed type's length) is checked against the five's own description
+  (`sysrscols` of their base rowsets, named by `syscolpars`: a system table's columns are listed like
+  a user table's), and a field described elsewhere is refused by name. Measured on the lane's
+  2017–2025 backups (2026-11-10): every literal holds on all four; `sysrscols` gained a trailing
+  `ordlock` (int, offset 54) on 2022, which the literals do not take. Every database's `sysschobjs` also
+  lists two MS-shipped user tables with no rowset (`trace_xe_action_map`, `trace_xe_event_map`, type
+  `'U '`, status bit 0x1): their data is the resource database's; the catalog model leaves out every
+  object with that bit. Record offsets:
 
   | table | fields |
   |---|---|
@@ -781,8 +859,46 @@ offsets above are in its fixed part.
 - Generic tables needed by 085: `sysclsobjs` (class 50 = schemas; schema 1 = `dbo`), `sysseobjvalues`
   (defaults of metadata-only ADD COLUMN: valclass 1, `id` = rowset id, **`subid` = hbcolid**, valnum 0,
   value sql_variant; E1§4.8 — E2§4 says rscolid, which equals hbcolid only without a uniquifier),
-  `sysobjvalues` (module text; valclass of a view definition to pin, task 11), and the partitioning
-  tables below.
+  `sysobjvalues` (module text: valclass 1 by object -- a view's definition, a default's, a check's --,
+  valclass 2 by (table, column id) a computed column's; `value` a sql_variant int of flags, `imageval`
+  the text, off-row past 8000 bytes), `sysscalartypes` (every type by its utype, the system types
+  included: `TYPE_NAME`), and the partitioning tables below.
+- **The catalog model** (task 12, `backup_catalog_model`; pinned on the catalog fixture, 2022, and
+  compared field by field with its `.tables` / `.columns` / `.views` files by a local script: 1102
+  fields, 0 differences -- the lane's comparison is task 17's `compare_catalog.py`, which reads the
+  file functions):
+  - a user table is a `sysschobjs` row of type `'U '`, a view one of type `'V '`, each without status bit
+    0x1; a view has bit 0x10000 when `WITH ENCRYPTION` (its `imageval` is then obfuscated, not read);
+  - `syscolpars.status`: 0x1 NOT NULL, 0x2 ANSI padding, 0x4 identity, 0x8 ROWGUIDCOL, 0x10 computed
+    (0x80 beside it on both computed columns, meaning unpinned), 0x40 persisted, 0x1000000 sparse,
+    0x2000000 a column set. A sparse column has no fixed offset or variable index (offset 0, null bit 0,
+    sysrscols status 0x100), nor does a column set any physical column;
+  - a module's text is Latin-1 bytes when the `value` flags have 0x2 -- every character in U+0000–U+00FF:
+    `N'café ü'` is stored so, `N'price €'` is not, though code page 1252 has the euro sign -- and UTF-16LE
+    otherwise (the flags 0 on an encrypted view too). A definition past 8000 bytes is an in-row LOB root
+    (kind 4, a 12-byte header and 12-byte links) over DATA fragments: 9058 bytes as two of 8040 and 1018
+    (`backup_lob`, the catalog's own reader; the scan's LOBs, row-overflow and text pointers are PR 3's).
+    The model keeps such a definition's root and reads it on demand (`ReadModuleDefinition`, at most
+    64 MiB), so listing a catalog reads no long definition. The reader refuses by name a child that
+    claims more bytes than its parent (before reading it), a fragment referenced twice, a slot count past
+    the page, a page of another unit;
+  - a sql_variant is u8 xtype, u8 version 1, the properties and the value in its record form, measured
+    for int, varchar and nvarchar (u16 maximum length, u32 CollationId), decimal (u8 precision, u8 scale),
+    datetime2 (u8 scale) and varbinary (u16 maximum length) (`backup_sql_variant`). A metadata-only ADD
+    COLUMN's default is taken into the layout only when its xtype, precision / scale and collation are
+    the column's, else the table is not decodable, naming the column;
+  - shape: a heap when a base rowset has index 0, a columnstore when one has `cmprlevel` 3 or more, else
+    clustered. A base rowset of `ownertype` 1 is a partition's; a clustered columnstore also has rowsets of
+    owner types 2 and 3, the delta store's `rcrows` holding the rows not yet compressed (1000 rows, none
+    compressed: 0 / 0 / 1000), so `row_count` sums owner types 1 and 3 (to be checked on compressed
+    rowgroups and deleted rows in spec 088);
+  - what one object's rows get wrong is named on that object (D13): a table the scan cannot read is
+    listed with `decodable` false and its reason -- a clustered columnstore (088), ROW / PAGE compression
+    or sparse columns (086), more than one partition (PR 2c), its schema or a column's type not in the
+    catalog, a layout the reader cannot build, an added column's default missing, listed twice, malformed
+    or not of the column's type and size -- and a definition that cannot be read is Unreadable with its
+    reason. Coarser than D13 for now: a sparse column or an unusable default refuses the table, not the
+    column (column-level refusal is the scan's, PR 2d).
 - **Partitioning** (E7§2, decoded generically and verified against the catalog views in 16 states,
   0 mismatches **(2025)**):
 
@@ -826,7 +942,7 @@ offsets above are in its fixed part.
   present; 0x40 a 14-byte version tag follows the record (RCSI / snapshot; unverified — no experiment
   ran with row versioning). Types: 0 primary, 1 forwarded, 2 forwarding stub, 3 index, 4 blob
   fragment, 5 ghost index, 6 ghost data, 7 ghost version. **Scan rows from types 0 and 1 only.**
-- Layout: u16 end of the fixed part @2, fixed data from 4, u16 column count, null bitmap of
+- Layout: u16 end of the fixed part @2, fixed data from 4, (0x10) u16 column count and null bitmap of
   `ceil(n / 8)` bytes, then (0x20) u16 variable count and that many u16 end offsets (bit 15 = complex
   column), then the data.
 - Column value, per physical column of the rowset, in this order: dropped (status 0x2) → skipped, its
@@ -836,7 +952,14 @@ offsets above are in its fixed part.
   variable column −offset−1. When that index is beyond the record's variable count and the column
   passed the two tests above, the value is empty: that is E1's prototype (`pages_ext.py`, 0 failures
   over its chains). E2 R7 states the beyond-the-count case as "the default, else NULL", which is the
-  added-column case the `nullbit` test already catches. The oracle fixtures include trailing empty
+  added-column case the `nullbit` test already catches. **The order is load-bearing** (catalog
+  fixture, 2022): after `DROP COLUMN drop_me` (int, offset 8) and `ADD added_default int NOT NULL DEFAULT
+  42`, the dropped column is renumbered (rscolid `0x04000001`, status 0x2) and the added one takes its
+  offset 8: a record written before holds `drop_me`'s value there, and only the `nullbit` test reading
+  first gives it 42. A physical column is named by the `syscolpars` column whose colid is its rscolid
+  (held on every table of the fixture); a non-persisted computed column has a `syscolpars` row and no
+  physical column, and a clustered columnstore has three live base rowsets (`cmprlevel` 3, 2 and 0),
+  refused by name until its PR. The oracle fixtures include trailing empty
   strings and binaries to settle it (trailing NULL variable columns are omitted, and are caught by the
   bitmap).
 - Forwarding stub (type 2): 9 bytes, a pointer to the new location; skipped (the row is read where it
@@ -943,7 +1066,8 @@ A backup file is untrusted input (R§9). Every parser:
   record ends against the slot's span; column counts against the layout; variable end offsets
   monotonic and within the record; null bitmap within the record.
 - **Terminates**: the MTF walk advances strictly; a block chain cannot loop (offsets increase); LOB
-  trees carry a visited set of node RIDs, a depth limit (32) and a total-length limit (2^31 − 1);
+  trees carry a visited set of node RIDs, a depth limit (32) and a total-length limit (2^31 − 1) -- the
+  scan's (PR 3); the catalog's own reader, `backup_lob`, takes 16 levels and 64 MiB a value;
   forwarding is one hop (a stub pointing at a stub is refused).
 - **Decompresses with declared sizes**: XPRESS never writes past `unit × 512` and validates the
   Huffman table (lengths ≤ 15, a complete prefix code); a match before the block start or past its end
@@ -962,18 +1086,29 @@ A backup file is untrusted input (R§9). Every parser:
   forensic tool: it returns what RESTORE returns.
 - **Limits the base tables it exposes**: `mssql_backup_catalog` serves an allow-list (the mirror set of
   E1§4.8 — `sysallocunits`, `sysrowsets`, `sysschobjs`, `syscolpars`, `sysrscols`, `sysseobjvalues`,
-  `sysclsobjs` — plus `sysobjvalues`, `sysidxstats`, `sysiscols`, the columnstore tables of 088 and the
-  partitioning tables of E7: `systypedsubobjs`, `syssingleobjrefs`). Others, such as `sysowners`
+  `sysclsobjs` — plus `sysobjvalues`, `sysidxstats`, `sysiscols`, the columnstore tables of 088, the
+  partitioning tables of E7: `systypedsubobjs`, `syssingleobjrefs`, and `sysscalartypes`, the type
+  names an alias column needs). Others, such as `sysowners`
   (contained users' password hashes) or the certificate and key tables, are refused by name.
-  `sysobjvalues` is served by value class only: view definitions, partition boundaries (valclass 30),
-  and the computed-column and default definitions, the classes pinned by task 11; module source never
-  leaves (DQ-11, accepted).
+  `sysobjvalues` is served by value class only, each row checked against the object it belongs to:
+  valclass 1 of a view (not one `WITH ENCRYPTION`) or a default, with subobjid and valnum 0; valclass
+  2 of a computed column of a user table -- not by its class alone: a multi-statement function's
+  return table can have a computed column, and its definition is a valclass 2 row of the function
+  (measured, catalog fixture 2022: `([a]+(1))` of an encrypted TVF); valclass 30 of a partition
+  function. `sysseobjvalues` by its valclass 1 (an added column's default, the one class measured).
+  Module source -- a procedure's, a function's, a trigger's, a check's -- never leaves (DQ-11,
+  accepted); the oracle lane compares the served set with the one the server's catalog views give
+  (`catalog_golden.sql`'s `.modules.txt`, the fixture holding a procedure, functions, an encrypted TVF,
+  a trigger and a partition function).
 - **Fuzzing** (ClusterFuzzLite, `fuzz/`, D15): one harness per parser, each with a seed corpus cut from
   the committed samples: `fuzz_backup_mtf` (walker), `fuzz_backup_container` (MSSQLBAK chain),
   `fuzz_backup_xpress` (raw codec, with a differential oracle against a reference decode of the seed),
   `fuzz_backup_page` (header, slot array, record split), `fuzz_backup_record` (row decode against a
   synthetic layout), `fuzz_backup_lob` (tree walk over a synthetic page set), `fuzz_backup_catalog`
-  (bootstrap over synthetic pages), `fuzz_backup_log` (blocks, parity, records). `src/backup/**` joins
+  (PR 2b: the boot and IAM pages, records through the bootstrap layouts and the described ones, the
+  bootstrap rows, indexes and self-description check, value accessors, sql_variant, module text, and
+  the catalog's LOB tree walk, over up to 16 pages; seeds: pages of the committed sample (one set chosen so the five describe themselves) and a built LOB
+  tree), `fuzz_backup_log` (blocks, parity, records). `src/backup/**` joins
   `cflite-pr.yml`'s paths.
 - **Memory** (D17, § Resources): whatever grows with the file is buffer-managed; a LOB value is capped
   at 2^31 − 1 bytes and reserved before it is read; a chunk closes at the staging budget.
@@ -1077,8 +1212,24 @@ merges before the next opens (never stacked).
 9. `mssql_backup_info`, registered through `RegisterDocumentedFunction` — 1 d
 10. Fuzz harnesses mtf / container / xpress / page; committed seed samples — 2 d
 
-**PR 2 — catalog and rows (`mssql_backup_tables`, `_views`, `_catalog`, `_scan`)**, after spec 091's
-module `src/codec/code_page/` has merged (D7)
+**PR 2 — catalog and rows, in five PRs** (`mssql_backup_tables`, `_views`, `_catalog`, `_scan`),
+after spec 091's module `src/codec/code_page/` has merged (D7). Split for review (owner,
+2026-11-10): one 31-day PR is not reviewable, and the oracle lane, which tests the series' first
+risk (version drift: PR 1 is checked against 2025 only), goes first instead of last. Each merges
+before the next opens.
+
+*PR 2a — the oracle lane*
+
+19. CI oracle lane: `docker run` of each image (2017, 2019, 2022, 2025) with a host volume at
+    `/var/opt/mssql/backup`, generator scripts under `test/backup/gen/`, RESTORE. This PR compares
+    `mssql_backup_info` with `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` on every version
+    (acceptance 2); 2b adds the catalog's comparison, 2d the rows' (the `TYPE mssql` comparison),
+    PR 3 the LOBs' — 3 d
+19a. A test that reads the committed golden files (`test/data/backup/*.headeronly.txt`, …) and
+    compares every field `mssql_backup_info` reports (PR 1 compared them by hand) — 0.5 d
+19b. The version drift the lane finds, fixed (SCIN, MSSQLBAK and MTF offsets on 2017–2022) — 1–3 d
+
+*PR 2b — the catalog*
 
 11a. IAM chain (DQ-40): an AU's IAM pages through the page store, extent bitmaps and single-page
     slots, sequence and interval checks; the per-AU runs built at a table's first scan, buffer-managed
@@ -1087,22 +1238,53 @@ module `src/codec/code_page/` has merged (D7)
 11. Boot page, bootstrap layouts table, generic base-table decoder; pin the `sysobjvalues` value
     classes DQ-11 serves (view, computed-column and default definitions; boundaries are valclass 30)
     — 4 d
-12. Catalog model: schemas, objects, rowsets, partitions, AUs, columns, defaults, views; the
-    partitioning model of E7 (functions, typed boundaries through the catalog's sql_variant reader,
-    schemes, destinations, index data spaces, the partition column), the `partitioning` column and
-    E7's verify as a test — 5 d
+11b. `OpenedBackup`'s stages 2–4 (page index, allocation, catalog) built for a file function's call,
+    with no cache yet (task 22 caches them) — 1 d
+12. Catalog model: schemas, objects, rowsets, partitions, AUs, columns, defaults, views — 3 d
 13. 085 maps the on-disk CollationId onto spec 091's table; 091's single-byte code-page tables and
     kernel reused (D7) — 0.5 d
+17. `mssql_backup_tables`, `mssql_backup_views`, `mssql_backup_catalog`; in the lane, compared with
+    the restored database's catalog views — 2.5 d
+18. Fuzz harness catalog — 0.5 d
+
+*PR 2b as landed (2026-11-10).* Tasks 11a, 11, 11b, 12, 13 (the collation mapping; the single-byte
+kernel is the scan's, 2d), 17 and 18. Moved: 11a's per-AU runs, buffer-managed and kept in the opened
+backup, are built at a table's first scan, so they come with the scan (2d); 2b walks a chain when it
+reads a base table. Pulled in: the part of task 20 the catalog needs -- an in-row LOB root over DATA /
+SMALL_ROOT / INTERNAL / LARGE_ROOT fragments, for a view's definition past 8,000 bytes
+(`backup_lob`; the scan's LOBs, row-overflow and text pointers stay PR 3's) -- and `fuzz_backup_catalog`
+walks it. Found by the new fixtures and fixed here: a later GAM interval's allocation pages (E17); the
+file header's Size read by column, and a lower bound; the file list as the backup began (MSCI), a
+removed file (SFIN 0x20) left out (E19); a page that became live while the backup ran (`Pending`);
+the golden catalog files the generator never wrote (sqlcmd's `:OUT` substitution). The comparisons
+with the server's catalog ran locally on 2022; the lane runs them on 2017–2025 once the PR's branch
+is pushed.
+
+*PR 2c — partitioning*
+
+12b. The partitioning model of E7 (functions, typed boundaries through the catalog's sql_variant
+    reader, schemes, destinations, index data spaces, the partition column), the `partitioning`
+    column and E7's verify as a test — 2 d
+
+*PR 2d — rows*
+
 14. FixedVar records: types, forwarding, uniquifier, dropped and added columns, version tag — 3 d
 15. Value kernels over the codec staging; own kernels for datetime, smalldatetime, money, bit (the
     code-page kernel is spec 091's, D7) — 4 d
-16. `mssql_backup_scan`: bind, projection, units, parallelism, cardinality, virtual columns,
-    serialisation; the D17 budget (`max_memory`, `max_threads`, the clamp's WARNING, the reservations
-    of § Resources and their wait-then-refuse rule) and acceptance 13 — 5.5 d
-17. `mssql_backup_tables`, `mssql_backup_views`, `mssql_backup_catalog` — 2 d
-18. Fuzz harnesses record / catalog — 1 d
-19. CI oracle lane: `docker run` of each image with a host volume at `/var/opt/mssql/backup`,
-    generator scripts, RESTORE, the `TYPE mssql` comparison — 4 d
+16. `mssql_backup_scan`: bind, projection, cardinality, virtual columns, serialisation, one unit at
+    a time; in the lane, every fixture table compared with RESTORE + SELECT through `TYPE mssql`
+    (acceptance 1 without LOBs) — 3.5 d
+18b. Fuzz harness record — 0.5 d
+
+*PR 2e — parallel scan and memory*
+
+16b. Units of 64 pages and parallelism; the D17 budget (`max_memory`, `max_threads`, the clamp's
+    WARNING, the reservations of § Resources and their wait-then-refuse rule) and acceptance 13 —
+    2.5 d
+16c. PR 1's review findings on the paths a scan takes: `PageIndex::FallBack` through the ranged
+    mapper (D3a) rather than sequentially; `WalkChain` on a tail of an unknown layout reading block
+    headers in windows, not one 28-byte read each; `LocateOnce`'s probe of the other families' pass
+    only where a crafted file could carry an extent twice — 1.5 d
 
 **PR 3 — LOBs**
 
@@ -1131,7 +1313,7 @@ module `src/codec/code_page/` has merged (D7)
 29. Docs per PR: README (user-facing), `DATAMODEL.md` (a "Backup reader" layer section with the
     diagram above), CLAUDE.md (functions, settings, layout), CHANGELOG, website — 2 d
 
-**Total ≈ 79 days, 14.5–16 weeks** (76.5 before DQ-41's search joined task 7a, +2.5 d; 75 before DQ-40's IAM chain took the AU index out of task 7a,
+**Total ≈ 84.5–86.5 days, 15.5–17.5 weeks** (79 before PR 2 was split in five, +5.5–7.5 d (owner, 2026-11-10): the golden-file test 19a, +0.5 d; PR 1's review findings 16c, +1.5 d; the stages 11b, +1 d; four more PRs' docs and review rounds, +1.5 d; the version drift 19b, +1–3 d; 76.5 before DQ-41's search joined task 7a, +2.5 d; 75 before DQ-40's IAM chain took the AU index out of task 7a,
 −1 d, into task 11a, +2 d, and the differential's header path joined task 24, +0.5 d; 72.5 before D4a's index and E12 joined task 7, +2.5 d; 69 before
 D3a's ranged, asynchronous I/O joined tasks 2, 4 and 7, +3.5 d, both owner 2026-11-09; 66.5 before E7's partitioning model joined task 12, 68.5
 before the plain `_mssql_lob` output joined task 20 from 089 task 7, DQ-05, 69.5 before spec 091
@@ -1143,6 +1325,12 @@ cost.
 
 ## Risks
 
+- **Pass 2's page headers.** DbReader (PROVENANCE, "MQDA region 2") found a frame of live pages of one
+  extent whose header page ids point at a different page (an internal page type whose id field is a
+  reference), which RESTORE places positionally, whole frame; it picks each frame's extent by consensus
+  of the frame's headers, constrained to ascend and to the interval's final DCM image. The header scan
+  here (D4a) refuses a group whose headers disagree, so such a backup fails to open by name rather than
+  misplacing pages; matching RESTORE on it is for PR 2d (rows), with a fixture that reproduces it.
 - **Version drift is the main risk.** Every offset above is **(2025)**. The catalog layouts (D5), the
   boot page, SCIN offsets and the MSSQLBAK header may differ on 2017–2022. The CI matrix is what turns
   each into a verified row; until a version passes, it is refused (D14).

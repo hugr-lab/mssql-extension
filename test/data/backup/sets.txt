@@ -1,0 +1,7 @@
+full|full.bak
+full_xpress|full_xpress.bak
+full_zstd|full_zstd.bak
+stripe|stripe_1.bak,stripe_2.bak
+stripe_zstd|stripe_zstd_1.bak,stripe_zstd_2.bak
+diff|diff.bak
+log|log.trn

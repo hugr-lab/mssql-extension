@@ -35,7 +35,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay fuzz-backup-replay check-credential-logging leak-check crap-cpp crap-cpp-selftest help
+.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay fuzz-backup-replay test-backup-golden backup-oracle-build check-credential-logging leak-check crap-cpp crap-cpp-selftest help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -653,15 +653,22 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_ctas_type_mapping.cpp \
     test/cpp/test_login_retry.cpp \
     test/cpp/backup/test_backup_allocation.cpp \
+    test/cpp/backup/test_backup_boot.cpp \
     test/cpp/backup/test_backup_bytes.cpp \
+    test/cpp/backup/test_backup_catalog_model.cpp \
     test/cpp/backup/test_backup_container.cpp \
+    test/cpp/backup/test_backup_iam.cpp \
+    test/cpp/backup/test_backup_lob.cpp \
     test/cpp/backup/test_backup_info.cpp \
     test/cpp/backup/test_backup_mtf.cpp \
     test/cpp/backup/test_backup_open_pass.cpp \
     test/cpp/backup/test_backup_page_index.cpp \
+    test/cpp/backup/test_backup_pages.cpp \
     test/cpp/backup/test_backup_pass_search.cpp \
     test/cpp/backup/test_backup_ranges.cpp \
+    test/cpp/backup/test_backup_record.cpp \
     test/cpp/backup/test_backup_source.cpp \
+    test/cpp/backup/test_backup_system_tables.cpp \
     test/cpp/backup/test_backup_xpress.cpp \
     test/cpp/backup/test_backup_zstd.cpp \
     test/cpp/test_catalog_filter.cpp \
@@ -1416,11 +1423,28 @@ fuzz-encode-replay: release
 # Linux leak-check lane replays the same corpora under ASan + LSan. The corpora are synthetic
 # (fuzz/gen_backup_seeds.cc): no backup of a server whose data is not ours (spec 085 T4).
 fuzz-backup-replay:
-	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page" \
+	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog" \
 	    $(PROJ_DIR)fuzz/build.sh
-	@for t in backup_mtf backup_container backup_xpress backup_page; do \
+	@for t in backup_mtf backup_container backup_xpress backup_page backup_catalog; do \
 	    $(PROJ_DIR)fuzz/out/fuzz_$$t $(PROJ_DIR)fuzz/corpus/$$t || exit 1; \
 	done
+# Spec 085 acceptance 2 over the committed samples: mssql_backup_info against the golden RESTORE
+# HEADERONLY / LABELONLY / FILELISTONLY beside them, field by field (test/backup/compare_info.py).
+# Any release build; ci.yml's build job runs it on every pull request, and the oracle lane runs the
+# same script over each version's backups in R2. The samples are SQL Server 2025's (major 17).
+test-backup-golden:
+	@if [ ! -x build/release/duckdb ]; then echo "test-backup-golden: run 'make' first." >&2; exit 1; fi
+	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --expect-major 17 $(PROJ_DIR)test/data/backup
+# Spec 085 PR 2a: the release build the backup oracle lane tests with -- httpfs linked in
+# statically (test/backup/httpfs_extension_config.cmake, at the duckdb pin's own httpfs commit), so
+# the lane reads its backups from R2 through s3://. Like bench-build, a later plain `make`
+# reconfigures without it.
+# curl comes from vcpkg through a manifest of its own (test/backup/oracle_vcpkg_manifest.py), so
+# nothing in it links the system's libcurl or OpenSSL.
+backup-oracle-build:
+	python3 -I $(PROJ_DIR)test/backup/oracle_vcpkg_manifest.py $(PROJ_DIR)build/backup-oracle-vcpkg
+	EXTRA_EXTENSION_CONFIGS='$(PROJ_DIR)test/backup/httpfs_extension_config.cmake' $(MAKE) release \
+	    EXT_FLAGS='-DCMAKE_TOOLCHAIN_FILE="$(VCPKG_TOOLCHAIN)" -DVCPKG_MANIFEST_DIR="$(PROJ_DIR)build/backup-oracle-vcpkg"'
 # LeakSanitizer over the DuckDB-free fuzz harnesses' stored corpora
 # (scripts/ci/leak_check.sh). LSan ships inside ASan and is ON BY DEFAULT on
 # Linux; the one lane that would run it passes detect_leaks=0, because libduckdb
@@ -1476,7 +1500,9 @@ help:
 	@echo "  make joern-scan           - Run the Joern query suite (JOERN_QUERY=q3 for one query)"
 	@echo "  make joern-shell          - Open the Joern REPL on the CPG"
 	@echo "  make fuzz-encode-replay   - Replay the BCP/PLP encode corpus under ASan+UBSan (fuzz/README.md)"
-	@echo "  make fuzz-backup-replay   - Replay the backup reader's corpora (mtf, container, xpress, page)"
+	@echo "  make fuzz-backup-replay   - Replay the backup reader's corpora (mtf, container, xpress, page, catalog)"
+	@echo "  make test-backup-golden   - mssql_backup_info against the samples' golden RESTORE output"
+	@echo "  make backup-oracle-build  - Release build with httpfs linked in, for the backup oracle lane"
 	@echo "  make leak-check           - LeakSanitizer over the DuckDB-free fuzz corpora (Linux only)"
 	@echo "  make check-credential-logging - Gate: no credential value reaches a log, exception or format call"
 	@echo "  make test-all             - Run all tests"
