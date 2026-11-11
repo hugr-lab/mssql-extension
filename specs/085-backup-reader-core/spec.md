@@ -1359,6 +1359,15 @@ per-AU runs and parallel units (2e), off-row values (PR 3), `mssql_backup_column
     pushed into the model's build, so only the objects asked for get their columns, layouts, defaults
     and partitioning built and listed; the open pass and the bootstrap tables are the fixed cost the
     cache (task 22) and an attached catalog (task 23) take away — 1 d
+16f. Indexed views (owner, 2026-11-11). A view `WITH SCHEMABINDING` with a unique clustered index
+    stores its result as that index: a base rowset of the view's object (`sysrowsets` index 1, its
+    allocation units, IAM chain and `sysrscols` layout), leaf records FixedVar like a clustered
+    table's, kept by the server on every write -- so the scan of PR 2d reads it unchanged.
+    `mssql_backup_views` says whether a view is indexed (and its shape, compression, rows);
+    `mssql_backup_scan` reads an indexed view's clustered index as it reads a table (its nonclustered
+    indexes ignored, `_mssql_rid` its clustered key); a non-indexed view is refused by name (no stored
+    rows). An indexed view in `catalog.sql` (an aggregate with `COUNT_BIG(*)` and a join), compared in
+    the lane with `SELECT … WITH (NOEXPAND)` — 1 d
 
 **PR 3 — LOBs**
 
