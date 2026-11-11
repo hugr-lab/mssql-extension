@@ -17,6 +17,8 @@
 // of order. backup_catalog (fuzz_backup_catalog's format: options, a LOB root, pages): pages of the committed
 // synthetic sample test/data/backup/full.bak (made by test/backup/gen/generate.sh on a throwaway instance) -- the
 // boot page and sysallocunits, the other bootstrap tables, a mix with an IAM page -- and a synthetic LOB tree.
+// backup_record (fuzz_backup_record's format: a layout, then a page): the sample's two user tables' first
+// pages with their layouts, and pages of the record forms E20 measured.
 
 #include <cstdint>
 #include <cstdio>
@@ -245,6 +247,62 @@ static Bytes CatalogInput(const std::vector<Bytes> &pages, const Bytes &root = B
 	return out;
 }
 
+//! One column of fuzz_backup_record's layout: its xtype, the ti bytes above it, offset, null bit, bit
+//! position and flags (fuzz/fuzz_backup_record.cc).
+struct RecordColumn {
+	uint8_t xtype;
+	uint32_t ti_high;  // ti >> 8
+	int16_t offset;
+	uint16_t null_bit;
+	uint8_t bit = 0;
+	uint8_t flags = 0;
+};
+
+//! fuzz_backup_record's input: the column count, 10 bytes a column, then the page.
+static Bytes RecordInput(const std::vector<RecordColumn> &columns, const Bytes &page) {
+	Bytes out = {static_cast<uint8_t>(columns.size())};
+	for (const auto &c : columns) {
+		out.push_back(c.xtype);
+		out.push_back(static_cast<uint8_t>(c.ti_high));
+		out.push_back(static_cast<uint8_t>(c.ti_high >> 8));
+		out.push_back(static_cast<uint8_t>(c.ti_high >> 16));
+		out.push_back(static_cast<uint8_t>(c.offset));
+		out.push_back(static_cast<uint8_t>(static_cast<uint16_t>(c.offset) >> 8));
+		out.push_back(static_cast<uint8_t>(c.null_bit));
+		out.push_back(static_cast<uint8_t>(c.null_bit >> 8));
+		out.push_back(c.bit);
+		out.push_back(c.flags);
+	}
+	out.insert(out.end(), page.begin(), page.end());
+	return out;
+}
+
+static Bytes Hex(const std::string &hex) {
+	Bytes out;
+	for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+		out.push_back(static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+	}
+	return out;
+}
+
+//! An 8 KB data page holding `records` from offset 96, slot i at record i (its header's type and slot
+//! count set, the rest zero).
+static Bytes RecordPage(const std::vector<Bytes> &records) {
+	Bytes page(8192, 0);
+	page[0] = 1;
+	page[1] = 1;
+	size_t at = 96;
+	for (size_t i = 0; i < records.size(); i++) {
+		std::copy(records[i].begin(), records[i].end(), page.begin() + at);
+		page[8190 - 2 * i] = static_cast<uint8_t>(at);
+		page[8191 - 2 * i] = static_cast<uint8_t>(at >> 8);
+		at += records[i].size();
+	}
+	page[22] = static_cast<uint8_t>(records.size());
+	page[23] = static_cast<uint8_t>(records.size() >> 8);
+	return page;
+}
+
 //! The pages of file 1 of the sample `path`, by the allocation unit their headers name; data pages of
 //! level 0 only, and the boot page and IAM pages beside them.
 struct SamplePages {
@@ -448,5 +506,51 @@ int main(int argc, char **argv) {
 	}
 	Write("backup_catalog", "mix", CatalogInput(mix));
 	Write("backup_catalog", "lob_tree", LobInput());
+
+	// backup_record: the sample's two user tables' first pages with their layouts (as the catalog
+	// describes them: test/data/backup/full.bak), and pages of the record forms E20 measured on 2022
+	// (test/cpp/backup/test_backup_rows.cpp's records): a version tag, a version ghost and a stub beside
+	// a row, the uniquifier, bits sharing a byte, a forwarded record's back pointer.
+	const uint64_t ITEMS = 72057594053984256ull, EVENTS = 72057594054049792ull;
+	if (pages_of(ITEMS).empty() || pages_of(EVENTS).empty()) {
+		std::fprintf(stderr, "the sample has no page of items or events\n");
+		std::exit(1);
+	}
+	Write("backup_record", "items",
+		  RecordInput({{56, 0, 4, 1},
+					   {231, 80, -1, 2},
+					   {167, 12, -2, 3},
+					   {106, 12 | (2 << 8), 8, 4},
+					   {42, 3, 17, 5},
+					   {104, 0, 24, 6},
+					   {165, 64, -3, 7}},
+					  pages_of(ITEMS)[0]));
+	Write("backup_record", "events",
+		  RecordInput({{127, 0, 4, 1}, {56, 0, 12, 2}, {167, 100, -1, 3}, {61, 0, 16, 4}}, pages_of(EVENTS)[0]));
+	const std::vector<RecordColumn> ver = {{56, 0, 4, 1}, {56, 0, 8, 2}, {167, 20, -1, 3}};
+	Write("backup_record", "versioned",
+		  RecordInput(ver, RecordPage({Hex("70000c0001000000010000000300000100150076310000000000000000a60300000000"),
+									   Hex("4e0b00000009002400b9030000000067330000000000000000b60300000000"),
+									   Hex("04510100000100a600"),
+									   Hex("320008000700000002000002001300"
+										   "1d806162000451010000"
+										   "0100a600")})));
+	RecordColumn uniquifier = {56, 0, -1, 1};
+	uniquifier.flags = 2;
+	Write(
+		"backup_record", "uniquifier",
+		RecordInput({uniquifier, {56, 0, 4, 2}, {167, 20, -2, 3}, {56, 0, 8, 4}},
+					RecordPage({Hex("70000c00000000000a0000000400000200150018007531300000000000000000a00300000000")})));
+	std::vector<RecordColumn> bits = {{104, 0, 4, 1}, {104, 0, 4, 2, 1}, {56, 0, 5, 3}};
+	for (uint8_t b = 3; b <= 8; b++) {
+		bits.push_back({104, 0, 4, static_cast<uint16_t>(b + 1), static_cast<uint8_t>(b - 1)});
+	}
+	bits.push_back({104, 0, 9, 10});
+	RecordColumn added = {56, 0, 10, 11};
+	added.flags = 4 | 8 | (4 << 4);	 // added after the records, with a 4-byte default
+	bits.push_back(added);
+	Write("backup_record", "bits_added",
+		  RecordInput(bits, RecordPage({Hex("50000a005505000000010a0000000000000000000000e20300000000"),
+										Hex("50000a00aa05000000000a0005000000000000000000e20300000000")})));
 	return 0;
 }
