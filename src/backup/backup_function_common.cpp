@@ -363,8 +363,8 @@ ColumnReading ReadingOf(const CatalogColumn &c) {
 	// which the type map dispatches on and the file's own sysscalartypes supplies (review of #549).
 	std::string name = c.system_type_name;
 	std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
-	const bool decimal = c.system_type_id == XTYPE_DECIMAL || c.system_type_id == XTYPE_NUMERIC ||
-						 name == "decimal" || name == "numeric";
+	const bool decimal = c.system_type_id == XTYPE_DECIMAL || c.system_type_id == XTYPE_NUMERIC || name == "decimal" ||
+						 name == "numeric";
 	const bool scaled = c.system_type_id == XTYPE_TIME || c.system_type_id == XTYPE_DATETIME2 ||
 						c.system_type_id == XTYPE_DATETIMEOFFSET || name == "time" || name == "datetime2" ||
 						name == "datetimeoffset";

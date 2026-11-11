@@ -72,7 +72,7 @@ constexpr uint8_t XTYPE_CHAR = 175;
 constexpr uint8_t XTYPE_TIMESTAMP = 189;
 constexpr uint8_t XTYPE_NVARCHAR = 231;
 constexpr uint8_t XTYPE_NCHAR = 239;
-constexpr uint8_t XTYPE_CLR = 240;  // hierarchyid, geometry, geography, a user-defined CLR type
+constexpr uint8_t XTYPE_CLR = 240;	// hierarchyid, geometry, geography, a user-defined CLR type
 constexpr uint8_t XTYPE_XML = 241;
 
 //! One physical column of a rowset (a sysrscols row, named by syscolpars).

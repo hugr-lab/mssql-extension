@@ -178,6 +178,7 @@ struct ScanState : public GlobalTableFunctionState {
 	bool have_page = false;
 	uint16_t next_slot = 0;
 	std::vector<uint16_t> offsets;	// the current page's slot offsets, a freed slot as 0
+	std::vector<uint16_t> bounds;	// where each slot's record must end (the next record's start)
 
 	// The chunk's virtual values, row by row (only those projected are filled).
 	std::vector<std::string> page_keys;
@@ -359,6 +360,17 @@ bool NextPage(const ScanBindData &data, ScanState &state) {
 		if (std::adjacent_find(live.begin(), live.end()) != live.end()) {
 			throw FormatError("backup: page " + at.ToString() + " has two slots pointing to one record");
 		}
+		// Where each slot's record must end: the next record's start, or the slot array (records lie
+		// apart, as PageRows checks for the system tables; review of #549). Checked per record in Execute
+		// against RecordView::End, with no second read of the record.
+		state.bounds.assign(slots, 0);
+		const uint16_t slot_array = static_cast<uint16_t>(PAGE_SIZE - 2u * slots);
+		for (uint16_t s = 0; s < slots; s++) {
+			if (state.offsets[s] != 0) {
+				auto next = std::upper_bound(live.begin(), live.end(), state.offsets[s]);
+				state.bounds[s] = next == live.end() ? slot_array : *next;
+			}
+		}
 		state.next_slot = 0;
 		state.have_page = true;
 		return true;
@@ -427,6 +439,11 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 				ReadSlot(state.page.bytes.data(), PAGE_SIZE, state.page.header.slot_count, slot, data.table.c_str());
 			if (record.Type() != RECORD_PRIMARY && record.Type() != RECORD_FORWARDED) {
 				continue;  // ghosts, stubs (the row is read where it lives), index and LOB records
+			}
+			if (static_cast<uint32_t>(state.offsets[slot]) + record.End() > state.bounds[slot]) {
+				throw FormatError("backup: page " + state.page.header.page_id.ToString() + " has a record at offset " +
+								  std::to_string(state.offsets[slot]) + " that runs past the next record's start (" +
+								  std::to_string(state.bounds[slot]) + ")");
 			}
 			state.stager->Append(record);
 			if (state.page_output != DConstants::INVALID_INDEX) {

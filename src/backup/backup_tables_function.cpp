@@ -24,8 +24,6 @@
 #include "mssql_function_docs.hpp"
 #include "tds/encoding/datetime_encoding.hpp"
 
-#include <algorithm>
-#include <cctype>
 #include <cstring>
 
 namespace duckdb {
@@ -447,10 +445,11 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 														  : model.schemas.size();
 	idx_t count = 0;
 	while (state.next < total && count < STANDARD_VECTOR_SIZE) {
-		const std::vector<Value> row = data.listing == Listing::Tables ? TableRow(model.tables[state.next])
-									   : data.listing == Listing::Views
-										   ? ViewRow(*state.catalog->pages->store, model.views[state.next], state.off_row_bytes)
-										   : SchemaRow(model, model.schemas[state.next]);
+		const std::vector<Value> row =
+			data.listing == Listing::Tables ? TableRow(model.tables[state.next])
+			: data.listing == Listing::Views
+				? ViewRow(*state.catalog->pages->store, model.views[state.next], state.off_row_bytes)
+				: SchemaRow(model, model.schemas[state.next]);
 		for (idx_t c = 0; c < row.size(); c++) {
 			output.data[c].SetValue(count, row[c]);
 		}
