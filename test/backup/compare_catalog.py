@@ -247,7 +247,8 @@ def compare_set(c, db, name, arg, texts):
     listed = db.query("SELECT schema_name, table_name, column_id::VARCHAR AS column_id, column_name, sql_type, "
                       f"system_type FROM mssql_backup_columns({arg})")
     views = db.query("SELECT schema_name, view_name, object_id::VARCHAR AS object_id, "
-                     f"is_encrypted::VARCHAR AS is_encrypted, definition, reason FROM mssql_backup_views({arg})")
+                     "is_encrypted::VARCHAR AS is_encrypted, definition, reason, is_indexed::VARCHAR AS is_indexed, "
+                     f"row_count::VARCHAR AS row_count FROM mssql_backup_views({arg})")
 
     ours = keyed(tables, "schema_name", "table_name")
     theirs = keyed(parse_golden(texts[f"{name}.tables.txt"]), "schema_name", "table_name")
@@ -304,6 +305,9 @@ def compare_set(c, db, name, arg, texts):
         where = f"{name}: view {'.'.join(k)}"
         c.check(where, "object_id", o["object_id"], t["object_id"])
         c.check(where, "is_encrypted", flag(o["is_encrypted"]), t["is_encrypted"])
+        if "is_indexed" in t:  # goldens made before task 16f have none
+            c.check(where, "is_indexed", flag(o["is_indexed"]), t["is_indexed"])
+            c.check(where, "row_count", o["row_count"], t["row_count"])
         c.check(where, "reason", o["reason"], None)
         if o["definition"] is None:
             c.check(where, "definition", (None, None), (t["definition_length"], t["definition_sha256"]))

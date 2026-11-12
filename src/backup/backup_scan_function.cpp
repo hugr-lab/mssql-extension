@@ -107,14 +107,16 @@ struct ScanBindData : public TableFunctionData {
 	}
 };
 
-//! The scan's model: the one table (task 16e: the bind described every table of the database for it).
+//! The scan's model: the one table, or view of the name (task 16e: the bind described every table of
+//! the database for it; 16f: an indexed view's rows are read as a table's).
 CatalogScope TableScope(const std::string &schema, const std::string &table) {
 	CatalogScope scope;
 	scope.by_schema = true;
 	scope.schemas = {schema};
 	scope.by_table = true;
 	scope.tables = {table};
-	scope.no_views = true;
+	scope.by_view = true;
+	scope.views = {table};
 	return scope;
 }
 
@@ -130,8 +132,21 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 	}
 	data.entry = data.catalog->model.FindTable(data.schema, data.table);
 	if (!data.entry) {
-		throw InvalidInputException("%s: the backup has no table %s.%s (mssql_backup_tables lists them)", FUNCTION,
-									data.schema, data.table);
+		// An indexed view's clustered index, read as a clustered table's (task 16f); a view without one
+		// stores no rows.
+		data.entry = data.catalog->model.FindIndexedView(data.schema, data.table);
+	}
+	if (!data.entry && data.catalog->model.FindView(data.schema, data.table)) {
+		throw InvalidInputException(
+			"%s: %s.%s is a view that stores no rows: only an indexed view's (a unique "
+			"clustered index on it) are read (mssql_backup_views says which)",
+			FUNCTION, data.schema, data.table);
+	}
+	if (!data.entry) {
+		throw InvalidInputException(
+			"%s: the backup has no table or indexed view %s.%s (mssql_backup_tables and "
+			"mssql_backup_views list them)",
+			FUNCTION, data.schema, data.table);
 	}
 	if (!data.entry->decodable) {
 		throw InvalidInputException("%s: %s.%s is not read: %s", FUNCTION, data.schema, data.table, data.entry->reason);

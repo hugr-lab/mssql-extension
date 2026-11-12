@@ -120,7 +120,7 @@ physical_plan	<REGEX>:.*Limit: 3001.*~3,000 rows.*
 statement error
 SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'nope');
 ----
-the backup has no table dbo.nope
+the backup has no table or indexed view dbo.nope
 
 statement error
 SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', NULL, 'items');

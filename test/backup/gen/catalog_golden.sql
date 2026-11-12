@@ -32,7 +32,12 @@ GO
 SELECT s.name AS schema_name, v.name AS view_name, v.object_id,
 	   CASE WHEN m.definition IS NULL THEN 1 ELSE 0 END AS is_encrypted,
 	   DATALENGTH(m.definition) / 2 AS definition_length,	-- UTF-16 units, trailing blanks included
-	   CONVERT(varchar(64), HASHBYTES('SHA2_256', CAST(m.definition AS nvarchar(max))), 2) AS definition_sha256
+	   CONVERT(varchar(64), HASHBYTES('SHA2_256', CAST(m.definition AS nvarchar(max))), 2) AS definition_sha256,
+	   -- An indexed view (task 16f): a unique clustered index stores its rows.
+	   -- (a disabled one keeps its sys.indexes row but no data).
+	   CASE WHEN EXISTS (SELECT 1 FROM sys.indexes i WHERE i.object_id = v.object_id AND i.index_id = 1
+						 AND i.is_disabled = 0) THEN 1 ELSE 0 END AS is_indexed,
+	   (SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = v.object_id AND p.index_id = 1) AS row_count
 FROM sys.views v JOIN sys.schemas s ON s.schema_id = v.schema_id LEFT JOIN sys.sql_modules m ON m.object_id = v.object_id
 WHERE v.is_ms_shipped = 0
 ORDER BY s.name, v.name;

@@ -144,7 +144,51 @@ def main():
             rows_total += backup_rows
             break
 
-    print(f"compare_rows: {args.backup}: {compared} tables, {rows_total} rows compared, {len(failures)} failures")
+    # An indexed view's rows (task 16f): its unique clustered index, read as a clustered table's, against
+    # the view through TYPE mssql (the same rows as WITH (NOEXPAND) in a backup at rest, typed as the
+    # catalog types them); every column the scan returns, _mssql_rid one per row.
+    ok, views = session.query(f"SELECT schema_name, view_name, decodable, scan_reason FROM mssql_backup_views({paths}) "
+                              "WHERE is_indexed ORDER BY schema_name, view_name")
+    if not ok:
+        sys.exit(f"compare_rows: mssql_backup_views failed on {args.backup}:\n{views}")
+    for v in views:
+        schema, view = v["schema_name"], v["view_name"]
+        where = f"{schema}.{view} (indexed view)"
+        if v["decodable"] in (False, "false"):
+            print(f"  skip {where}: {v['scan_reason']}")
+            continue
+        scan = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(view)})"
+        server = f"srv.{ident(schema)}.{ident(view)}"
+        ok, described = session.query(f"DESCRIBE SELECT * FROM {scan}")
+        ok_server, server_described = session.query(f"DESCRIBE SELECT * FROM {server}")
+        if not ok or not ok_server:
+            failures.append(f"{where}: {(described if not ok else server_described).splitlines()[0]}")
+            continue
+        if [c["column_name"] for c in described] != [c["column_name"] for c in server_described]:
+            failures.append(f"{where}: the scan's columns {[c['column_name'] for c in described]} are not the "
+                            f"server view's {[c['column_name'] for c in server_described]}")
+            continue
+        select = ", ".join(ident(c["column_name"]) for c in described)
+        ok, result = session.query(
+            f"SELECT (SELECT count(*) FROM (SELECT {select} FROM {scan} EXCEPT ALL SELECT {select} FROM {server})) "
+            f"AS only_backup, (SELECT count(*) FROM (SELECT {select} FROM {server} EXCEPT ALL "
+            f"SELECT {select} FROM {scan})) AS only_server, (SELECT count(*) FROM {scan}) AS backup_rows, "
+            f"(SELECT count(*) FROM {server}) AS server_rows, (SELECT count(DISTINCT _mssql_rid) FROM {scan}) AS rids")
+        if not ok:
+            failures.append(f"{where}: {result.splitlines()[0] if result else 'failed'}")
+            continue
+        r = result[0]
+        backup_rows = int(r["backup_rows"])
+        status = "ok" if (int(r["only_backup"]), int(r["only_server"])) == (0, 0) and backup_rows == int(
+            r["server_rows"]) and int(r["rids"]) == backup_rows else "DIFF"
+        if status != "ok":
+            failures.append(f"{where}: {r}")
+        print(f"  {status:4} {where}: {backup_rows} rows, {len(described)} columns")
+        compared += 1
+        rows_total += backup_rows
+
+    print(f"compare_rows: {args.backup}: {compared} tables and indexed views, {rows_total} rows compared, "
+          f"{len(failures)} failures")
     for f in failures:
         print(f"  FAIL {f}")
     if failures or compared < args.min_tables:

@@ -861,6 +861,22 @@ const CatalogTable *CatalogModel::FindTable(const std::string &schema, const std
 	return it != tables.end() && it->schema_name == schema && it->name == name ? &*it : nullptr;
 }
 
+const CatalogTable *CatalogModel::FindIndexedView(const std::string &schema, const std::string &name) const {
+	auto it = std::lower_bound(indexed_views.begin(), indexed_views.end(), std::make_pair(schema, name),
+							   [](const CatalogTable &t, const std::pair<std::string, std::string> &key) {
+								   return ByName(t.schema_name, t.name, key.first, key.second);
+							   });
+	return it != indexed_views.end() && it->schema_name == schema && it->name == name ? &*it : nullptr;
+}
+
+const CatalogView *CatalogModel::FindView(const std::string &schema, const std::string &name) const {
+	auto it = std::lower_bound(views.begin(), views.end(), std::make_pair(schema, name),
+							   [](const CatalogView &v, const std::pair<std::string, std::string> &key) {
+								   return ByName(v.schema_name, v.name, key.first, key.second);
+							   });
+	return it != views.end() && it->schema_name == schema && it->name == name ? &*it : nullptr;
+}
+
 std::string CatalogModel::SchemaName(int32_t id) const {
 	auto it = std::lower_bound(schemas.begin(), schemas.end(), id,
 							   [](const CatalogSchema &s, int32_t key) { return s.id < key; });
@@ -935,21 +951,19 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 		reason = "its schema " + std::to_string(o.schema_id) + " is not in sysclsobjs";
 		return "schema " + std::to_string(o.schema_id);
 	};
-	for (const SysObject *o : user_tables) {
-		std::string schema_reason;
-		std::string schema_name = schema_of(*o, schema_reason);
-		if (!scope.WantsTable(schema_name, o->name)) {
-			continue;
-		}
+	// A table, or an indexed view's stored rows (task 16f: its clustered index is a rowset of the view's
+	// object, laid out as a clustered table's): its columns, allocation units, partitions, shape,
+	// partitioning, and whether the scan reads it.
+	auto describe = [&](const SysObject &o, const std::string &schema_name, const std::string &schema_reason) {
 		CatalogTable t;
-		t.object_id = o->id;
-		t.schema_id = o->schema_id;
-		t.schema_name = std::move(schema_name);
-		t.reason = std::move(schema_reason);
-		t.name = o->name;
-		t.created = o->created;
-		t.modified = o->modified;
-		std::vector<const SysColumn *> &cols = columns_of[o->id];
+		t.object_id = o.id;
+		t.schema_id = o.schema_id;
+		t.schema_name = schema_name;
+		t.reason = schema_reason;
+		t.name = o.name;
+		t.created = o.created;
+		t.modified = o.modified;
+		std::vector<const SysColumn *> &cols = columns_of[o.id];
 		std::sort(cols.begin(), cols.end(),
 				  [](const SysColumn *a, const SysColumn *b) { return a->column_id < b->column_id; });
 		for (const SysColumn *c : cols) {
@@ -982,7 +996,7 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 			if (col.is_computed && !texts_pending.empty()) {
 				col.definition = Unreadable(texts_pending);
 			} else if (col.is_computed) {
-				auto text = texts.find(ModuleKey{2, o->id, c->column_id});
+				auto text = texts.find(ModuleKey{2, o.id, c->column_id});
 				if (text != texts.end()) {
 					col.definition = text->second;
 				}
@@ -992,7 +1006,7 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 		bool heap = false, columnstore = false;
 		std::map<int32_t, int64_t> delta_rows;	// a columnstore's delta store rows, by partition
 		std::unordered_map<uint64_t, const SysRowset *> rowset_of;
-		for (const SysRowset *r : tables.RowsetsOf(o->id)) {
+		for (const SysRowset *r : tables.RowsetsOf(o.id)) {
 			for (const SysAllocUnit *a : tables.UnitsOf(r->rowset_id)) {
 				CatalogUnit u;
 				u.unit = *a;
@@ -1052,7 +1066,15 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 		t.shape = columnstore ? TableShape::Columnstore : heap ? TableShape::Heap : TableShape::Clustered;
 		DescribePartitioning(partition_catalog, type_names, heap ? 0 : 1, check, t);
 		DecideDecodable(tables, defaults, rowset_of, t);
-		model.tables.push_back(std::move(t));
+		return t;
+	};
+	for (const SysObject *o : user_tables) {
+		std::string schema_reason;
+		std::string schema_name = schema_of(*o, schema_reason);
+		if (!scope.WantsTable(schema_name, o->name)) {
+			continue;
+		}
+		model.tables.push_back(describe(*o, schema_name, schema_reason));
 	}
 	for (const SysObject *o : views) {
 		std::string schema_reason;
@@ -1075,12 +1097,23 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 		} else if (!v.is_encrypted && text != texts.end()) {
 			v.definition = text->second;
 		}
+		// An indexed view (task 16f): a unique clustered index on the view stores its rows, a rowset
+		// of index 1 of the view's object with its in-row unit (none: a deferred drop, as for a table).
+		for (const SysRowset *r : tables.RowsetsOf(o->id)) {
+			v.indexed = v.indexed || (r->index_id == 1 && tables.FindInRowUnit(r->rowset_id));
+		}
+		if (v.indexed) {
+			model.indexed_views.push_back(describe(*o, v.schema_name, v.reason));
+		}
 		model.views.push_back(std::move(v));
 	}
 	std::sort(model.tables.begin(), model.tables.end(), [](const CatalogTable &a, const CatalogTable &b) {
 		return ByName(a.schema_name, a.name, b.schema_name, b.name);
 	});
 	std::sort(model.views.begin(), model.views.end(), [](const CatalogView &a, const CatalogView &b) {
+		return ByName(a.schema_name, a.name, b.schema_name, b.name);
+	});
+	std::sort(model.indexed_views.begin(), model.indexed_views.end(), [](const CatalogTable &a, const CatalogTable &b) {
 		return ByName(a.schema_name, a.name, b.schema_name, b.name);
 	});
 	return model;

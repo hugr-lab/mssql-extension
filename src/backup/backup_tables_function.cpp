@@ -142,10 +142,22 @@ std::vector<Column> ColumnColumns() {
 }
 
 std::vector<Column> ViewColumns() {
-	return {{"schema_name", LogicalType::VARCHAR},	{"view_name", LogicalType::VARCHAR},
-			{"object_id", LogicalType::INTEGER},	{"definition", LogicalType::VARCHAR},
-			{"is_encrypted", LogicalType::BOOLEAN}, {"created", LogicalType::TIMESTAMP},
-			{"modified", LogicalType::TIMESTAMP},	{"reason", LogicalType::VARCHAR}};
+	return {{"schema_name", LogicalType::VARCHAR},
+			{"view_name", LogicalType::VARCHAR},
+			{"object_id", LogicalType::INTEGER},
+			{"definition", LogicalType::VARCHAR},
+			{"is_encrypted", LogicalType::BOOLEAN},
+			{"created", LogicalType::TIMESTAMP},
+			{"modified", LogicalType::TIMESTAMP},
+			{"reason", LogicalType::VARCHAR},
+			// Task 16f: an indexed view's stored rows (NULL shape, compression and rows otherwise).
+			{"is_indexed", LogicalType::BOOLEAN},
+			{"shape", LogicalType::VARCHAR},
+			{"compression", LogicalType::VARCHAR},
+			{"row_count", LogicalType::BIGINT},
+			// Whether mssql_backup_scan reads the stored rows, and why not (NULL for a plain view).
+			{"decodable", LogicalType::BOOLEAN},
+			{"scan_reason", LogicalType::VARCHAR}};
 }
 
 Value Text(const std::string &s) {
@@ -296,12 +308,18 @@ Value PartitioningValue(const CatalogTable &t) {
 	return Value::STRUCT(std::move(f));
 }
 
-std::vector<Value> TableRow(const CatalogTable &t) {
+//! The partitions' compression: one name, or `mixed` when they differ.
+std::string CompressionOf(const CatalogTable &t) {
 	std::string compression;
 	for (const auto &p : t.partitions) {
 		const std::string name = CompressionName(p.compression);
 		compression = compression.empty() || compression == name ? name : "mixed";
 	}
+	return compression;
+}
+
+std::vector<Value> TableRow(const CatalogTable &t) {
+	const std::string compression = CompressionOf(t);
 	vector<Value> columns, units;
 	for (const auto &c : t.columns) {
 		columns.push_back(ColumnValue(c));
@@ -355,7 +373,8 @@ std::vector<Value> SchemaRow(const CatalogModel &model, const CatalogSchema &s) 
 
 // `off_row_bytes`: the call's off-row definitions so far, within MAX_CALL_OFF_ROW_BYTES in all (as
 // mssql_backup_catalog's; review of #549): past it a view's definition is NULL with the reason.
-std::vector<Value> ViewRow(const PageStore &store, const CatalogView &v, uint64_t &off_row_bytes) {
+std::vector<Value> ViewRow(const PageStore &store, const CatalogModel &model, const CatalogView &v,
+						   uint64_t &off_row_bytes) {
 	Value definition(LogicalType::VARCHAR);
 	std::string reason = v.reason;
 	auto add = [&reason](std::string why) {
@@ -392,6 +411,13 @@ std::vector<Value> ViewRow(const PageStore &store, const CatalogView &v, uint64_
 	row.push_back(RecordDatetimeValue(v.created));
 	row.push_back(RecordDatetimeValue(v.modified));
 	row.push_back(OptionalText(reason));
+	const CatalogTable *stored = v.indexed ? model.FindIndexedView(v.schema_name, v.name) : nullptr;
+	row.push_back(Value::BOOLEAN(stored != nullptr));
+	row.push_back(stored ? Text(ShapeName(stored->shape)) : Value(LogicalType::VARCHAR));
+	row.push_back(stored ? OptionalText(CompressionOf(*stored)) : Value(LogicalType::VARCHAR));
+	row.push_back(stored && stored->row_count_known ? Value::BIGINT(stored->row_count) : Value(LogicalType::BIGINT));
+	row.push_back(stored ? Value::BOOLEAN(stored->decodable) : Value(LogicalType::BOOLEAN));
+	row.push_back(stored ? OptionalText(stored->reason) : Value(LogicalType::VARCHAR));
 	return row;
 }
 
@@ -690,7 +716,7 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 		const std::vector<Value> row =
 			data.listing == Listing::Tables ? TableRow(model.tables[state.next])
 			: data.listing == Listing::Views
-				? ViewRow(*state.catalog->pages->store, model.views[state.next], state.off_row_bytes)
+				? ViewRow(*state.catalog->pages->store, model, model.views[state.next], state.off_row_bytes)
 				: SchemaRow(model, model.schemas[state.next]);
 		for (idx_t c = 0; c < row.size(); c++) {
 			output.data[c].SetValue(count, row[c]);

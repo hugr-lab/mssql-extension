@@ -181,3 +181,15 @@ query II
 EXPLAIN SELECT * FROM mssql_backup_columns('test/data/backup/full.bak', 'dbo') WHERE table_name = 'items';
 ----
 physical_plan	<REGEX>:.*schemas \{dbo\}; tables \{items\}; no views.*
+
+# mssql_backup_views' columns (task 16f: an indexed view's stored rows); the samples hold no view, and the
+# catalog fixture's indexed view is compared in the oracle lane.
+query T
+SELECT list(column_name) FROM (DESCRIBE SELECT * FROM mssql_backup_views('test/data/backup/full.bak'));
+----
+[schema_name, view_name, object_id, definition, is_encrypted, created, modified, reason, is_indexed, shape, compression, row_count, decodable, scan_reason]
+
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'nothing');
+----
+the backup has no table or indexed view dbo.nothing

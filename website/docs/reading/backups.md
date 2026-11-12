@@ -174,8 +174,11 @@ what a call describes (`Describes`).
 
 `mssql_backup_views` columns: `schema_name`, `view_name`, `object_id`, `definition` (the T-SQL text
 as stored; NULL for a view created `WITH ENCRYPTION`, which the reader does not de-obfuscate),
-`is_encrypted`, `created`, `modified`, and `reason`: why a definition could not be read, NULL
-otherwise.
+`is_encrypted`, `created`, `modified`, `reason`: why a definition could not be read, NULL
+otherwise; and `is_indexed`: true for an indexed view (one with a unique clustered index, which
+stores its rows), with its `shape`, `compression`, `row_count`, and `decodable` / `scan_reason`
+(whether `mssql_backup_scan` reads them, and why not) -- all NULL for a view that stores no rows
+(`row_count` also when the count is unknown).
 
 The oracle lane compares both with the server's own catalog of the same database (`sys.tables`,
 `sys.columns`, `sys.sql_modules`): per table its id, shape, partitions, rows and dates, per column
@@ -211,6 +214,11 @@ included. A type whose conversion comes in a later release -- `sql_variant`, `xm
 is refused for its type. A column the scan cannot read -- a computed column that is not persisted (no
 stored value), a sparse column, and for now a `text` / `ntext` / `image` one -- is left out of
 `SELECT *`; a query that names it is refused, with the reason (`mssql_backup_tables.columns`).
+
+An indexed view is read the same way: `mssql_backup_scan(path, schema, view)` returns the rows its
+unique clustered index stores (`_mssql_rid` its clustered key), the rows `SELECT … WITH (NOEXPAND)`
+returns on the server. A view without one stores no rows and is refused by name. Its columns are
+the scan's (`DESCRIBE`); `mssql_backup_columns` lists the tables'.
 
 The scan runs on DuckDB's threads (`threads`); `max_threads := n` uses fewer for one call (a value
 above `threads` is clamped to it, with a warning in `duckdb_logs`). `max_memory := '2GB'` bounds

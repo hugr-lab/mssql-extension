@@ -1413,7 +1413,16 @@ per-AU runs and parallel units (2e), off-row values (PR 3), `mssql_backup_column
     `mssql_backup_scan` reads an indexed view's clustered index as it reads a table (its nonclustered
     indexes ignored, `_mssql_rid` its clustered key); a non-indexed view is refused by name (no stored
     rows). An indexed view in `catalog.sql` (an aggregate with `COUNT_BIG(*)` and a join), compared in
-    the lane with `SELECT … WITH (NOEXPAND)` — 1 d
+    the lane with `SELECT … WITH (NOEXPAND)` — 1 d. As landed: the model describes an indexed view's
+    stored rows with the table's own code (`CatalogModel::indexed_views`, `FindIndexedView`;
+    `CatalogView::indexed`); `mssql_backup_views` gains `is_indexed`, `shape`, `compression`,
+    `row_count`, `decodable`, `scan_reason` (an index 1 rowset with its in-row unit; the golden's
+    `is_indexed` leaves a disabled index out); the scan finds a table, then an indexed view, and refuses a view that stores none by
+    name. catalog.sql's `sales.v_region_totals` (a join, `COUNT_BIG(*)`, two SUMs, on two new tables);
+    compare_rows.py compares it with the server's view through TYPE mssql (the rows of NOEXPAND in a
+    backup at rest, typed as the catalog types them), compare_catalog.py `is_indexed` and `row_count`
+    with the golden's (sys.indexes, sys.partitions). Locally on 2022: 3 rows, 5 columns, 0
+    differences; the catalog, 1,206 fields, 0
 
 **PR 3 — LOBs**
 

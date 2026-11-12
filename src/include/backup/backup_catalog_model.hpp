@@ -240,15 +240,22 @@ struct CatalogView {
 	ModuleDefinition definition;
 	//! Why the view's own row cannot be trusted (its schema is not one); empty otherwise.
 	std::string reason;
+	//! A unique clustered index stores its rows (task 16f): CatalogModel::FindIndexedView has them.
+	bool indexed = false;
 };
 
 struct CatalogModel {
 	std::vector<CatalogSchema> schemas;	 // by id
 	std::vector<CatalogTable> tables;	 // by schema name, then name (bytes)
 	std::vector<CatalogView> views;		 // by schema name, then name (bytes)
+	//! The indexed views' stored rows, described as a clustered table's (by schema name, then name).
+	std::vector<CatalogTable> indexed_views;
 
 	//! The table `name` of schema `schema`, or null (a binary search).
 	const CatalogTable *FindTable(const std::string &schema, const std::string &name) const;
+	//! The view `name` of schema `schema`, or null; and its stored rows when it is indexed.
+	const CatalogView *FindView(const std::string &schema, const std::string &name) const;
+	const CatalogTable *FindIndexedView(const std::string &schema, const std::string &name) const;
 	//! The schema `id`'s name, or "" when the catalog has none (a binary search).
 	std::string SchemaName(int32_t id) const;
 };
