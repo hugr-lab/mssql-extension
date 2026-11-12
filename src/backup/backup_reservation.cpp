@@ -8,7 +8,9 @@ namespace backup {
 
 void ReservationGate::Acquire(uint64_t bytes, const std::function<bool()> &interrupted) {
 	if (bytes > budget_) {
-		// No release can make room: refused at once, whatever else is held.
+		// No release can make room: refused at once, whatever else is held. Keep this first: with
+		// `held_ <= budget_` always and `bytes <= budget_` from here on, `held_ + bytes` below cannot
+		// pass 2 * budget_, so it never overflows (review of #553).
 		throw ReservationRefused(true, "");
 	}
 	std::unique_lock<std::mutex> guard(lock_);

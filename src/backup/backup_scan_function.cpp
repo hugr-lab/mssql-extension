@@ -574,6 +574,11 @@ size_t UnitPagesOf(const PartitionCursor &cursor) {
 // partition order, then page order, with batch indexes in that order: each task's only grow, as
 // DuckDB requires, and DuckDB can give the single-threaded order back where order is kept. The
 // partition the next unit needs is listed here (its IAM chain walked), by the task that claims it.
+// The walk is I/O under the shared lock, once per partition, on purpose: the units are cut in order,
+// so every task waiting on the lock needs this very list for its next unit too. Outside the lock it
+// would be walked by each of them, or they would wait on a "being listed" mark instead -- the same
+// wait. Tasks holding a unit keep decoding meanwhile; they take the lock only when it is read
+// (review of #553).
 bool ClaimUnit(const ScanBindData &data, ScanGlobalState &global, ScanLocalState &local) {
 	std::lock_guard<std::mutex> guard(global.claim);
 	while (!global.cutting || global.cut_page >= global.cutting->pages.size()) {
