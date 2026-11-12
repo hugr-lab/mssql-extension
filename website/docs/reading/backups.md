@@ -138,6 +138,32 @@ SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sale
 and the roles' included): `schema_id`, `schema_name`, and the `table_count` and `view_count` of user
 tables and views in each.
 
+`mssql_backup_columns(path [, schema [, table]])` lists every column of the user tables, one row
+each, with its state at a glance: `schema_name`, `table_name`, `column_id`, `column_name`,
+`sql_type` (as declared: an alias type by its own name, e.g. AdventureWorks' `Name`), `system_type`
+(the type underneath, declared: `nvarchar(50)`; NULL for a user-defined CLR type), `duckdb_type` (the
+type the scan returns a column it reads as; the declared type's otherwise), `state` and `reason`.
+The states:
+
+| state | meaning |
+|---|---|
+| `converted` | read as `duckdb_type` |
+| `stored_bytes` | read as its stored bytes (`BLOB`) until its type's conversion comes: `sql_variant`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector`, `json` |
+| `off_row_pending` | `text` / `ntext` / `image`, not read yet; or a column whose value can be stored off row -- a MAX type, or a variable one in a table whose row can pass 8,060 bytes (row-overflow): a value in row is read, one off row is refused by name until a later release |
+| `not_stored` | a computed column that is not persisted: it has no stored value |
+| `storage_format` | a sparse column or a column set: its value is in the row's sparse vector, read in a later release |
+
+`off_row_pending` is said generously: of a column whose value *can* be stored off row, not only of
+one that is. The `schema` and `table` arguments are matched as stored (a name that is not there lists
+nothing). A column's state is its own: a table that `mssql_backup_tables` says is not read (a
+columnstore, ROW / PAGE compression, for now) keeps its columns' states and says so in each
+`reason`, so a query for what will not be read asks for both:
+
+```sql
+SELECT table_name, column_name, state, reason
+FROM mssql_backup_columns('/backups/sales_full.bak') WHERE state <> 'converted' OR reason IS NOT NULL;
+```
+
 `mssql_backup_views` columns: `schema_name`, `view_name`, `object_id`, `definition` (the T-SQL text
 as stored; NULL for a view created `WITH ENCRYPTION`, which the reader does not de-obfuscate),
 `is_encrypted`, `created`, `modified`, and `reason`: why a definition could not be read, NULL

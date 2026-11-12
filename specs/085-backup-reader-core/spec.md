@@ -1382,7 +1382,14 @@ per-AU runs and parallel units (2e), off-row values (PR 3), `mssql_backup_column
     id, name, SQL type, DuckDB type, `state` (`converted`, `stored_bytes` for a type whose conversion is
     still to come, `off_row_pending` until PR 3, `not_stored`, `storage_format`) and `reason` -- the
     state of every column at a glance (owner, 2026-11-11: the next PR after 2d; no flag in
-    `mssql_backup_tables` instead) — 0.5 d
+    `mssql_backup_tables` instead) — 0.5 d. As landed: `system_type` beside `sql_type` (an alias type's
+    base, the owner's question 2026-11-12); `off_row_pending` also for a MAX column and a variable one
+    wider than the 24-byte off-row pointer in a table whose declared row can pass 8,060 bytes (counted
+    generously -- a MAX column at its 8,000-byte in-row share, a uniquifier, a version tag -- since the
+    server moves the widest value off row, whichever it is: `converted` is never promised for a value
+    that can go off row; dropped columns' bytes in old records are not counted), read in row and
+    refused off row until PR 3; a table not read says so in each column's reason. Checked in the
+    oracle lane: the columns, `sql_type` and `system_type` against the server's (compare_catalog.py)
 16e. Filter pushdown into the catalog functions (owner, 2026-11-11): `schema_name` / `table_name` /
     `view_name` equalities and IN lists of `mssql_backup_schemas` / `_tables` / `_views` / `_columns`
     pushed into the model's build, so only the objects asked for get their columns, layouts, defaults

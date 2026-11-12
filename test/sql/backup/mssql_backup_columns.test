@@ -1,0 +1,68 @@
+# name: test/sql/backup/mssql_backup_columns.test
+# description: mssql_backup_columns over the committed samples (spec 085 PR 2e, task 16d)
+# group: [mssql]
+#
+# The samples are synthetic (test/backup/gen/samples.sql): every column of dbo.items and dbo.events is
+# converted. The other states (stored_bytes, off_row_pending, not_stored, storage_format) are tested on
+# the catalog model's synthetic columns (test_backup_catalog_model.cpp: StateOf); the oracle lane
+# compares the columns, sql_type and system_type with the server's catalog (compare_catalog.py: the
+# catalog fixture's alias type code_t over varchar(12) among them). No SQL Server is needed.
+
+require mssql
+
+query TTITTTTTT
+SELECT * FROM mssql_backup_columns('test/data/backup/full.bak') ORDER BY table_name, column_id;
+----
+dbo	events	1	event_id	bigint	bigint	BIGINT	converted	NULL
+dbo	events	2	item_id	int	int	INTEGER	converted	NULL
+dbo	events	3	note	varchar(100)	varchar(100)	VARCHAR	converted	NULL
+dbo	events	4	at	datetime	datetime	TIMESTAMP	converted	NULL
+dbo	items	1	id	int	int	INTEGER	converted	NULL
+dbo	items	2	name	nvarchar(40)	nvarchar(40)	VARCHAR	converted	NULL
+dbo	items	3	code	varchar(12)	varchar(12)	VARCHAR	converted	NULL
+dbo	items	4	price	decimal(12,2)	decimal(12,2)	DECIMAL(12,2)	converted	NULL
+dbo	items	5	created	datetime2(3)	datetime2(3)	TIMESTAMP_MS	converted	NULL
+dbo	items	6	flag	bit	bit	BOOLEAN	converted	NULL
+dbo	items	7	blob	varbinary(64)	varbinary(64)	BLOB	converted	NULL
+
+# One schema's, one table's; every family of a striped set, a compressed one.
+query I
+SELECT count(*) FROM mssql_backup_columns('test/data/backup/full.bak', 'dbo');
+----
+11
+
+query IT
+SELECT column_id, column_name FROM mssql_backup_columns(['test/data/backup/stripe_zstd_1.bak', 'test/data/backup/stripe_zstd_2.bak'], 'dbo', 'events') ORDER BY 1;
+----
+1	event_id
+2	item_id
+3	note
+4	at
+
+# The duckdb_type is the scan's: the same types mssql_backup_scan returns.
+query I
+SELECT list(duckdb_type ORDER BY column_name) = (SELECT list(column_type ORDER BY column_name) FROM (DESCRIBE SELECT * FROM mssql_backup_scan('test/data/backup/full_xpress.bak', 'dbo', 'items')))
+FROM mssql_backup_columns('test/data/backup/full_xpress.bak', 'dbo', 'items');
+----
+true
+
+# Names are matched as stored: no such schema or table lists nothing.
+query I
+SELECT count(*) FROM mssql_backup_columns('test/data/backup/full.bak', 'DBO');
+----
+0
+
+query I
+SELECT count(*) FROM mssql_backup_columns('test/data/backup/full.bak', 'dbo', 'nothing');
+----
+0
+
+statement error
+SELECT * FROM mssql_backup_columns('test/data/backup/full.bak', NULL);
+----
+the schema is NULL
+
+statement error
+SELECT * FROM mssql_backup_columns('test/data/backup/full.bak', 'dbo', NULL);
+----
+the table is NULL

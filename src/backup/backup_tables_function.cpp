@@ -126,6 +126,14 @@ std::vector<Column> SchemaColumns() {
 			{"view_count", LogicalType::INTEGER}};
 }
 
+std::vector<Column> ColumnColumns() {
+	return {{"schema_name", LogicalType::VARCHAR}, {"table_name", LogicalType::VARCHAR},
+			{"column_id", LogicalType::INTEGER},   {"column_name", LogicalType::VARCHAR},
+			{"sql_type", LogicalType::VARCHAR},	   {"system_type", LogicalType::VARCHAR},
+			{"duckdb_type", LogicalType::VARCHAR}, {"state", LogicalType::VARCHAR},
+			{"reason", LogicalType::VARCHAR}};
+}
+
 std::vector<Column> ViewColumns() {
 	return {{"schema_name", LogicalType::VARCHAR},	{"view_name", LogicalType::VARCHAR},
 			{"object_id", LogicalType::INTEGER},	{"definition", LogicalType::VARCHAR},
@@ -380,34 +388,70 @@ std::vector<Value> ViewRow(const PageStore &store, const CatalogView &v, uint64_
 	return row;
 }
 
-enum class Listing : uint8_t { Tables, Views, Schemas };
+// mssql_backup_columns (task 16d): one row per column of a user table, its state at a glance (StateOf).
+std::vector<Value> ColumnRow(const CatalogTable &t, const CatalogColumn &c) {
+	const ColumnReading reading = ReadingOf(c);
+	const ColumnState state = StateOf(t, c);
+	return {Text(t.schema_name), Text(t.name), Value::INTEGER(c.column_id), Text(c.name),
+			Text(SqlTypeText(c.type_name, c.system_type_name, c.system_type_id, c.max_length, c.precision, c.scale)),
+			// The system type underneath, declared (an alias type's base: Name -> nvarchar(50)); NULL for a
+			// user-defined CLR type, which has none.
+			OptionalText(SqlTypeText(c.system_type_name, c.system_type_name, c.system_type_id, c.max_length,
+									 c.precision, c.scale)),
+			Value(reading.type.ToString()), Value(state.state), OptionalText(state.reason)};
+}
+
+enum class Listing : uint8_t { Tables, Views, Schemas, Columns };
 
 struct CatalogListBindData : public TableFunctionData {
 	vector<std::string> paths;
 	Listing listing = Listing::Tables;
+	//! mssql_backup_columns' optional schema and table: only that schema's (that table's) columns.
+	bool by_schema = false;
+	bool by_table = false;
+	std::string schema;
+	std::string table;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<CatalogListBindData>();
 		copy->paths = paths;
 		copy->listing = listing;
+		copy->by_schema = by_schema;
+		copy->by_table = by_table;
+		copy->schema = schema;
+		copy->table = table;
 		return std::move(copy);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<CatalogListBindData>();
-		return paths == other.paths && listing == other.listing;
+		return paths == other.paths && listing == other.listing && by_schema == other.by_schema &&
+			   by_table == other.by_table && schema == other.schema && table == other.table;
+	}
+	bool Wants(const CatalogTable &t) const {
+		return (!by_schema || t.schema_name == schema) && (!by_table || t.name == table);
 	}
 };
 
 struct CatalogListState : public GlobalTableFunctionState {
 	std::unique_ptr<OpenedCatalog> catalog;
 	size_t next = 0;
+	size_t next_column = 0;		 // mssql_backup_columns: the next column of table `next`
 	uint64_t off_row_bytes = 0;	 // the views' off-row definitions read so far
 };
 
 const char *FunctionName(Listing listing) {
-	return listing == Listing::Tables  ? "mssql_backup_tables"
-		   : listing == Listing::Views ? "mssql_backup_views"
-									   : "mssql_backup_schemas";
+	return listing == Listing::Tables	 ? "mssql_backup_tables"
+		   : listing == Listing::Views	 ? "mssql_backup_views"
+		   : listing == Listing::Columns ? "mssql_backup_columns"
+										 : "mssql_backup_schemas";
+}
+
+//! A name argument of mssql_backup_columns (schema, table): a NULL is refused naming it.
+std::string NameArgument(const Value &value, const char *what) {
+	if (value.IsNull()) {
+		throw InvalidInputException("mssql_backup_columns: the %s is NULL (leave it out to list every %s)", what, what);
+	}
+	return StringValue::Get(value);
 }
 
 template <Listing L>
@@ -416,9 +460,18 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	auto data = make_uniq<CatalogListBindData>();
 	data->listing = L;
 	data->paths = PathsOf(input.inputs[0], FunctionName(L));
-	for (const auto &column : L == Listing::Tables	? TableColumns()
-							  : L == Listing::Views ? ViewColumns()
-													: SchemaColumns()) {
+	if (L == Listing::Columns && input.inputs.size() > 1) {
+		data->by_schema = true;
+		data->schema = NameArgument(input.inputs[1], "schema");
+	}
+	if (L == Listing::Columns && input.inputs.size() > 2) {
+		data->by_table = true;
+		data->table = NameArgument(input.inputs[2], "table");
+	}
+	for (const auto &column : L == Listing::Tables	  ? TableColumns()
+							  : L == Listing::Views	  ? ViewColumns()
+							  : L == Listing::Columns ? ColumnColumns()
+													  : SchemaColumns()) {
 		names.emplace_back(column.name);
 		return_types.push_back(column.type);
 	}
@@ -440,6 +493,25 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	const auto &data = input.bind_data->Cast<CatalogListBindData>();
 	auto &state = input.global_state->Cast<CatalogListState>();
 	const CatalogModel &model = state.catalog->model;
+	if (data.listing == Listing::Columns) {
+		idx_t count = 0;
+		while (state.next < model.tables.size() && count < STANDARD_VECTOR_SIZE) {
+			const CatalogTable &t = model.tables[state.next];
+			if (!data.Wants(t) || state.next_column >= t.columns.size()) {
+				state.next++;
+				state.next_column = 0;
+				continue;
+			}
+			const std::vector<Value> row = ColumnRow(t, t.columns[state.next_column]);
+			for (idx_t c = 0; c < row.size(); c++) {
+				output.data[c].SetValue(count, row[c]);
+			}
+			state.next_column++;
+			count++;
+		}
+		output.SetChildCardinality(count);
+		return;
+	}
 	const size_t total = data.listing == Listing::Tables  ? model.tables.size()
 						 : data.listing == Listing::Views ? model.views.size()
 														  : model.schemas.size();
@@ -465,6 +537,12 @@ void Register(ExtensionLoader &loader, const char *description, std::vector<std:
 	const vector<LogicalType> arguments{LogicalType(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)};
 	for (const auto &argument : arguments) {
 		set.AddFunction(TableFunction(FunctionName(L), {argument}, Execute, Bind<L>, Init));
+		if (L == Listing::Columns) {
+			// (path, schema) and (path, schema, table).
+			set.AddFunction(TableFunction(FunctionName(L), {argument, LogicalType::VARCHAR}, Execute, Bind<L>, Init));
+			set.AddFunction(TableFunction(FunctionName(L), {argument, LogicalType::VARCHAR, LogicalType::VARCHAR},
+										  Execute, Bind<L>, Init));
+		}
 	}
 	mssql::RegisterDocumentedFunction(loader, std::move(set), {{}, description, std::move(examples), {"backup"}});
 }
@@ -487,6 +565,19 @@ void RegisterBackupTablesFunctions(ExtensionLoader &loader) {
 		"Lists the views in a SQL Server full backup (.bak), with their T-SQL definitions as stored (NULL for "
 		"a view created WITH ENCRYPTION, which the reader does not de-obfuscate), read from the file alone.",
 		{"SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sales_full.bak')"});
+	Register<Listing::Columns>(
+		loader,
+		"Lists every column of the user tables in a SQL Server full backup (.bak), one row each, with its state at "
+		"a glance (sql_type as declared, an alias type by its name, system_type the type underneath): converted (read "
+		"as duckdb_type), stored_bytes (read as its stored bytes until its type's "
+		"conversion comes), off_row_pending (a value stored off row is read from spec 085 PR 3), not_stored (a "
+		"computed column not persisted) or storage_format (a sparse column, a column set), and why. Optionally "
+		"one schema's or one table's (names as stored). The path is one file, a glob, or a list: every family of "
+		"one media set.",
+		{"SELECT table_name, column_name, state, reason FROM mssql_backup_columns('/backups/sales_full.bak') "
+		 "WHERE state <> 'converted'",
+		 "SELECT column_name, sql_type, duckdb_type FROM mssql_backup_columns('/backups/sales_full.bak', 'sales', "
+		 "'orders')"});
 	Register<Listing::Schemas>(
 		loader,
 		"Lists the schemas of the database in a SQL Server full backup (.bak), as sys.schemas does (the system "

@@ -547,6 +547,69 @@ int main() {
 			  "a boundary the check refuses is the reason, without the backup: prefix: " + refused.partitioning.reason);
 	}
 
+	{
+		// mssql_backup_columns' states (task 16d): each from ReadingOf, the off-row ones by type and by
+		// what the table's row can hold.
+		auto column = [](int32_t id, uint8_t type, int16_t max_length) {
+			CatalogColumn c;
+			c.column_id = id;
+			c.name = "c" + std::to_string(id);
+			c.system_type_id = type;
+			c.max_length = max_length;
+			c.collation_id = type == XTYPE_VARCHAR || type == XTYPE_TEXT ? 53256 : 0;
+			c.system_type_name = type == XTYPE_INT			 ? "int"
+								 : type == XTYPE_VARCHAR	 ? "varchar"
+								 : type == XTYPE_VARBINARY	 ? "varbinary"
+								 : type == XTYPE_TEXT		 ? "text"
+								 : type == XTYPE_SQL_VARIANT ? "sql_variant"
+															 : "";
+			c.type_name = c.system_type_name;
+			return c;
+		};
+		CatalogTable narrow;
+		narrow.decodable = true;
+		narrow.columns = {column(1, XTYPE_INT, 4),	 column(2, XTYPE_VARCHAR, 20), column(3, XTYPE_VARBINARY, -1),
+						  column(4, XTYPE_TEXT, 16), column(5, XTYPE_INT, 4),	   column(6, XTYPE_INT, 4)};
+		narrow.columns[4].is_computed = true;
+		narrow.columns[5].is_sparse = true;
+		auto state = [](const CatalogTable &t, size_t i) { return std::string(StateOf(t, t.columns[i]).state); };
+		Check(state(narrow, 0) == "converted" && StateOf(narrow, narrow.columns[0]).reason.empty() &&
+				  state(narrow, 1) == "converted" && state(narrow, 2) == "off_row_pending" &&
+				  state(narrow, 3) == "off_row_pending" && state(narrow, 4) == "not_stored" &&
+				  state(narrow, 5) == "storage_format",
+			  "states: converted (an int, a varchar(20)), a MAX and a text off_row_pending, a computed column "
+			  "not_stored, a sparse one storage_format");
+		CatalogTable variant;
+		variant.decodable = true;
+		variant.columns = {column(1, XTYPE_INT, 4), column(2, XTYPE_SQL_VARIANT, 8016), column(3, XTYPE_VARCHAR, 100)};
+		const ColumnState v = StateOf(variant, variant.columns[1]);
+		Check(std::string(v.state) == "stored_bytes" && v.reason.find("sql_variant") != std::string::npos &&
+				  v.reason.find("8,060") != std::string::npos && state(variant, 2) == "off_row_pending",
+			  "a sql_variant: stored_bytes, and (8,016 bytes declared) its row can pass 8,060, so it and a "
+			  "varchar(100) beside it can go off row: " +
+				  v.reason);
+		CatalogTable wide;
+		wide.decodable = true;
+		wide.columns = {column(1, XTYPE_INT, 4), column(2, XTYPE_VARCHAR, 6000), column(3, XTYPE_VARCHAR, 6000),
+						column(4, XTYPE_VARCHAR, 20)};
+		Check(state(wide, 1) == "off_row_pending" && state(wide, 2) == "off_row_pending" &&
+				  state(wide, 3) == "converted" && state(wide, 0) == "converted",
+			  "a row that can pass 8,060 bytes: its varchar(6000)s off_row_pending, a varchar(20) (no wider than "
+			  "the off-row pointer) and an int converted");
+		CatalogTable with_max;
+		with_max.decodable = true;
+		with_max.columns = {column(1, XTYPE_VARCHAR, 4000), column(2, XTYPE_VARBINARY, -1),
+							column(3, XTYPE_VARCHAR, 20)};
+		Check(state(with_max, 0) == "off_row_pending" && state(with_max, 2) == "converted",
+			  "a MAX column counts as its 8,000-byte in-row share: a varchar(4000) beside it can be pushed off row "
+			  "(the server moves the widest value, not the MAX one first), a varchar(20) cannot");
+		CatalogTable unread = with_max;
+		unread.decodable = false;
+		unread.reason = "PAGE compression";
+		Check(StateOf(unread, unread.columns[2]).reason == "the table is not read: PAGE compression",
+			  "a table not read says so in each column's reason");
+	}
+
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;
 	return failures ? 1 : 0;
 }

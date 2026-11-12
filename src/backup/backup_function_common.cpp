@@ -406,6 +406,90 @@ ColumnReading ReadingOf(const CatalogColumn &c) {
 	return r;
 }
 
+//! A type whose in-row value is variable-length, so the server can push it off row (row-overflow).
+static bool IsVariable(const CatalogColumn &c) {
+	switch (c.system_type_id) {
+	case XTYPE_VARCHAR:
+	case XTYPE_NVARCHAR:
+	case XTYPE_VARBINARY:
+	case XTYPE_SQL_VARIANT:
+	case XTYPE_CLR:
+		return true;
+	default:
+		return false;
+	}
+}
+
+//! A row-overflow pointer's in-row size: a value no longer than it is never pushed off row.
+static constexpr uint64_t OFF_ROW_POINTER = 24;
+
+//! Whether `t`'s declared columns can make a row pass the 8,060 bytes a page holds in row, so a
+//! variable value can be pushed off row (the server moves the widest value off row then, which can
+//! be any of them: review of task 16d, the documentation names no order). Counted generously, so
+//! `converted` is never promised for a value that can go off row: a MAX column's in-row share (8,000
+//! bytes), a text / ntext / image pointer (16), a sparse column in the sparse vector (its width and
+//! 4), and a record's overhead -- header 4, column count 2, the null bitmap, the variable columns'
+//! count 2 and an offset of 2 each, a uniquifier (6) and a version tag (14). From the declared
+//! columns: a dropped column's bytes, kept in old records until a rebuild, are not counted.
+static bool RowCanOverflow(const CatalogTable &t) {
+	uint64_t bytes = 4 + 2 + 2 + 6 + 14;
+	uint64_t columns = 0;
+	for (const auto &c : t.columns) {
+		if (c.is_computed && !c.is_persisted) {
+			continue;
+		}
+		if (c.is_sparse || c.is_column_set) {
+			bytes += 4 + (c.max_length < 0 ? 8000 : static_cast<uint64_t>(c.max_length));
+			continue;
+		}
+		columns++;
+		bytes += c.max_length < 0 ? 8000 : static_cast<uint64_t>(c.max_length);
+		if (IsVariable(c) || c.max_length < 0) {
+			bytes += 2;
+		}
+	}
+	bytes += (columns + 7) / 8;
+	return bytes > 8060;
+}
+
+ColumnState StateOf(const CatalogTable &t, const CatalogColumn &c) {
+	const ColumnReading r = ReadingOf(c);
+	ColumnState s;
+	auto join = [](const std::string &a, const std::string &b) { return a.empty() ? b : b.empty() ? a : a + "; " + b; };
+	const bool lob =
+		c.system_type_id == XTYPE_TEXT || c.system_type_id == XTYPE_NTEXT || c.system_type_id == XTYPE_IMAGE;
+	std::string off_row;
+	if (!lob && c.max_length < 0) {
+		off_row =
+			"a value stored off row (past its in-row share, or out of row by the table's option) is refused by "
+			"name until spec 085 PR 3; one in row is read";
+	} else if (!lob && IsVariable(c) && static_cast<uint64_t>(c.max_length) > OFF_ROW_POINTER && RowCanOverflow(t)) {
+		off_row =
+			"the table's row can pass 8,060 bytes, so a value can be pushed off row (row-overflow): refused by "
+			"name until spec 085 PR 3; one in row is read";
+	}
+	if (c.is_computed && !c.is_persisted) {
+		s.state = "not_stored";
+		s.reason = r.note;
+	} else if (c.is_sparse || c.is_column_set) {
+		s.state = "storage_format";
+		s.reason = r.note;
+	} else if (lob) {
+		s.state = "off_row_pending";
+		s.reason = r.note;
+	} else if (r.raw) {
+		s.state = "stored_bytes";
+		s.reason = join(r.note, off_row);
+	} else if (!off_row.empty()) {
+		s.state = "off_row_pending";
+		s.reason = off_row;
+	}
+	if (!t.decodable) {
+		s.reason = join(s.reason, "the table is not read: " + t.reason);
+	}
+	return s;
+}
+
 Value LsnValue(const Lsn &lsn) {
 	// HEADERONLY's form: vlf, then block in 10 digits, then slot in 5 (< 10^25).
 	const hugeint_t value =
