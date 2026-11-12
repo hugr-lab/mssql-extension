@@ -9,10 +9,6 @@ namespace backup {
 static constexpr size_t PAGE_HEADER_BYTES = 96;
 static constexpr uint8_t STATUS_NULL_BITMAP = 0x10;
 static constexpr uint8_t STATUS_VARIABLE = 0x20;
-static constexpr uint8_t RECORD_FORWARDING_STUB = 2;
-static constexpr uint8_t RECORD_INDEX = 3;
-static constexpr uint8_t RECORD_BLOB_FRAGMENT = 4;
-static constexpr uint8_t RECORD_GHOST_INDEX = 5;
 
 bool RecordView::IsNull(size_t column) const {
 	if (!null_bitmap || column >= column_count) {
@@ -30,11 +26,11 @@ uint16_t RecordView::End() const {
 }
 
 uint16_t RecordView::VarStart(size_t i) const {
-	return i == 0 ? var_start : static_cast<uint16_t>(var_end[i - 1] & 0x7FFF);
+	return i == 0 ? var_start : static_cast<uint16_t>(RawVarEnd(i - 1) & 0x7FFF);
 }
 
 uint16_t RecordView::VarEnd(size_t i) const {
-	return static_cast<uint16_t>(var_end[i] & 0x7FFF);
+	return static_cast<uint16_t>(RawVarEnd(i) & 0x7FFF);
 }
 
 ByteReader RecordView::Var(size_t i, const char *what) const {
@@ -67,13 +63,14 @@ RecordView ReadRecord(const uint8_t *page, size_t page_size, size_t slot_array, 
 	r.status_a = b.U8(0);
 	r.status_b = b.U8(1);
 	if (r.Type() == RECORD_FORWARDING_STUB || r.Type() == RECORD_BLOB_FRAGMENT || r.Type() == RECORD_INDEX ||
-		r.Type() == RECORD_GHOST_INDEX) {
+		r.Type() == RECORD_GHOST_INDEX || r.Type() == RECORD_GHOST_VERSION) {
 		// Not FixedVar: a stub is a 9-byte pointer to the row's new place, a LOB fragment has its own
 		// header (spec 085 § Rules, records / LOBs), and an index record is its status byte, its keys
 		// packed to the page's pminlen and a child pointer, with no statusB and no fixed end @2
-		// (DbReader's PROVENANCE, "Non-leaf index record layout"). The view carries the status bytes
-		// only; the caller skips a stub, reads a fragment with the LOB reader, an index record with
-		// the page's pminlen.
+		// (DbReader's PROVENANCE, "Non-leaf index record layout"). A version ghost (a heap row deleted
+		// under row versioning, statusA 0x4E) has a layout of its own whose bytes 2..3 are no fixed
+		// end (E20: 0x0000). The view carries the status bytes only; the caller skips a stub and a
+		// version ghost, reads a fragment with the LOB reader, an index record with the page's pminlen.
 		return r;
 	}
 	r.fixed_end = b.U16(2);
@@ -94,10 +91,7 @@ RecordView ReadRecord(const uint8_t *page, size_t page_size, size_t slot_array, 
 		r.var_count = b.U16(at);
 		at += 2;
 		b.Require(at, 2u * r.var_count);
-		r.var_end.resize(r.var_count);
-		for (size_t i = 0; i < r.var_count; i++) {
-			r.var_end[i] = b.U16(at + 2 * i);
-		}
+		r.var_ends = r.data + at;
 		at += 2u * r.var_count;
 	}
 	r.var_start = static_cast<uint16_t>(at);

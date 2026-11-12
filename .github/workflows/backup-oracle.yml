@@ -126,7 +126,8 @@ jobs:
           key=$(cd test/backup/gen && find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-16)
           echo "key=${key}" >> "$GITHUB_OUTPUT"
           export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
-                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
+                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}" \
+                 AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
           # 0 when the object exists, 1 when it does not (404); any other failure -- a refused or
           # expired token, a bucket the token cannot read, the endpoint unreachable -- fails the job
           # with the CLI's reason (it names the operation and the error code, not the credentials),
@@ -205,11 +206,35 @@ jobs:
         run: |
           set -euo pipefail
           export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
-                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
+                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}" \
+                 AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+          # The aws CLI's default checksums (from 2.23) are not what R2 expects on a multipart upload:
+          # R2's documentation says to send them only when required (every AWS block of this workflow
+          # does). And a multipart upload to R2 failed now and then with InvalidPart on
+          # CompleteMultipartUpload (#551's run, two of four versions, files of 90-390 MB), so the upload
+          # is tried three times -- a sync, which sends again only what did not arrive -- and so is DONE,
+          # written only after the files: the run's directory is its own, nothing another run reads is
+          # overwritten, and a lost DONE must not cost the version a regeneration. A retry that
+          # succeeds is a warning in the log, so a remaining cause is not hidden.
           prefix="s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}"
           run="${{ github.run_id }}-${{ github.run_attempt }}"
-          aws s3 cp --recursive --only-show-errors "${RUNNER_TEMP}/oracle/" "${prefix}/${run}/"
-          echo "${run}" | aws s3 cp - "${prefix}/DONE"
+          retry() {  # $1 = what, then the command
+            local what="$1" attempt
+            shift
+            for attempt in 1 2 3; do
+              if "$@"; then
+                return 0
+              fi
+              if [ "${attempt}" = 3 ]; then
+                echo "::error::${what} to R2 failed three times"; exit 1
+              fi
+              echo "::warning::${what} to R2 failed (attempt ${attempt}); trying again"
+              sleep $((attempt * 15))
+            done
+          }
+          retry "the upload" aws s3 sync --only-show-errors "${RUNNER_TEMP}/oracle/" "${prefix}/${run}/"
+          printf '%s\n' "${run}" > "${RUNNER_TEMP}/DONE"
+          retry "DONE" aws s3 cp --only-show-errors "${RUNNER_TEMP}/DONE" "${prefix}/DONE"
           echo "stored $(ls "${RUNNER_TEMP}/oracle" | wc -l) files under oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}/${run}/"
 
   build:
@@ -309,7 +334,7 @@ jobs:
     # were stored, or one version failing): a version with no DONE fails its own leg, by name.
     if: ${{ always() && needs.key.outputs.enabled == 'true' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -352,6 +377,28 @@ jobs:
         run: |
           python3 -I test/backup/compare_catalog.py --duckdb cli/duckdb --require-done \
             "s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}"
+      # Spec 085 PR 2d: every quiet full set restored on a server of its version (images.txt's, by
+      # digest) and its tables compared with mssql_backup_scan through TYPE mssql (compare_rows.sh).
+      - name: mssql_backup_scan against RESTORE + TYPE mssql
+        if: ${{ !cancelled() }}
+        env:
+          MSSQL_R2_ACCESS_KEY: ${{ secrets.MSSQL_R2_ACCESS_KEY }}
+          MSSQL_R2_ACCESS_SECRET_KEY: ${{ secrets.MSSQL_R2_ACCESS_SECRET_KEY }}
+          MSSQL_R2_URL: ${{ secrets.MSSQL_R2_URL }}
+          MSSQL_R2_BUCKET_NAME: ${{ vars.MSSQL_R2_BUCKET_NAME || secrets.MSSQL_R2_BUCKET_NAME }}
+          QUIET: full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full
+        run: |
+          export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
+                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
+          prefix="s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}"
+          run="$(aws s3 cp "${prefix}/DONE" - | tr -d '[:space:]')" || true
+          [ -n "${run}" ] || { echo "not stored: no DONE under ${prefix} (its generate leg failed or never ran)"; exit 1; }
+          dir="${RUNNER_TEMP}/rows"
+          mkdir -p "${dir}"
+          include=(--exclude '*' --include sets.txt)
+          for s in ${QUIET}; do include+=(--include "${s}.bak" --include "${s}.filelistonly.txt"); done
+          aws s3 cp --recursive --only-show-errors "${include[@]}" "${prefix}/${run}/" "${dir}/"
+          VERSION=${{ matrix.version }} DUCKDB=cli/duckdb test/backup/compare_rows.sh "${dir}"
 
   cleanup:
     name: Remove sets no run reads
@@ -378,7 +425,8 @@ jobs:
             echo "::error::the bucket name or main's key is empty: nothing to clean up against"; exit 1
           fi
           export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
-                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
+                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}" \
+                 AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
           B="${MSSQL_R2_BUCKET_NAME}"
           now=$(date -u +%s)
           run_grace=$(( KEEP_SWITCHED_HOURS * 3600 ))

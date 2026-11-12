@@ -327,6 +327,21 @@ int main() {
 				  " against " + std::to_string(walked.checkpoints.size()) + ")");
 		auto layout = WalkMtfDataSet(ts);
 		Check(layout.Find("SSET") && layout.Find("MSLS"), "the MTF walk of the data set runs on the located chain");
+		{
+			// Reads out of order on a fresh stream (forward, back, across checkpoints, the last block
+			// then the first): each walk starts from a block located lately, never past its offset.
+			ContainerStream rs(t, located, BlockDecoder());
+			const uint64_t n = data.size();
+			const uint64_t at[] = {n / 2, n / 2 + 700, n / 4, n - 600, 0, n / 3, n / 2 - 1, n - 1};
+			bool same = true;
+			for (uint64_t a : at) {
+				const size_t count = static_cast<size_t>(std::min<uint64_t>(512, n - a));
+				Bytes got(count);
+				rs.ReadAt(a, got.data(), count);
+				same = same && std::equal(got.begin(), got.end(), data.begin() + static_cast<std::ptrdiff_t>(a));
+			}
+			Check(same, "reads out of order give the data set's bytes (walks from recently located blocks)");
+		}
 
 		Check(!OpenChainFromTail(file, located, seek), "a container without the tail: not located (walk it)");
 		auto long_trailer = Pack(data, 1, {10, 70, 140}, 0x3, false, true);

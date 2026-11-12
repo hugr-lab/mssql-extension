@@ -1,7 +1,6 @@
 # Spec 086: compressed row formats and the remaining types
 
-Status: **draft**, 2026-11-05. Not started. Depends on spec 085, and for the double-byte code pages
-on spec 091's module `src/codec/code_page/` (D9). Series overview: `../README.md`.
+Status: **draft**, 2026-11-05. Not started. Depends on spec 085. Series overview: `../README.md`.
 Markers as in 085: **(2025)**, **(unverified)**. Sources cited as in 085 (R§, X§, W§, A§, E<n>§);
 the owner's decisions as DQ-nn ([decisions.md](../085-backup-reader-core/decisions.md)).
 
@@ -17,8 +16,8 @@ binary is undocumented; it is a research task with a gate, not a promise (R§2, 
 
 In: ROW compression (the CD record format), PAGE compression (anchor and dictionary), sparse columns
 and the column set, `sql_variant` → `VARIANT`, `xml` (MS-BINXML → text), `geometry` / `geography`
-(MS-SSCLRT → WKB), `hierarchyid`, `vector`, the double-byte code pages (932, 936, 949, 950), and the
-`json` research spike.
+(MS-SSCLRT → WKB), `hierarchyid`, `vector`, and the `json` research spike. The double-byte code pages
+(932, 936, 949, 950) moved to 085 PR 2d (D9).
 
 Out: user CLR types (opaque bytes, W§7: refused by name, as now), columnstore (088), the redo of CD
 and page-dictionary records (090's follow-up).
@@ -93,10 +92,17 @@ and page-dictionary records (090's follow-up).
 - **D8 — `json` is a research task with a gate.** A spike (E9, below) decodes controlled values and
   compares them with `CAST(j AS nvarchar(max))`. The decoder ships only when every value of the
   corpus (every JSON type, nesting to the server's limit, Unicode, escapes, numbers at every edge,
-  large documents that go off-row) equals the server's text. Until then the column is refused by name.
-  No raw-bytes escape hatch: nobody downstream could read an undocumented binary.
+  large documents that go off-row) equals the server's text. Until then the column is its stored
+  bytes (085 D13, owner 2026-11-11: no refusal by type; the earlier "no raw-bytes escape hatch" is
+  overturned).
+- **D8a — one decoder for both paths (owner, 2026-11-11).** `sql_variant`, `vector`, `hierarchyid`,
+  `json`, `xml` and the spatial types are converted by codec kernels the TDS read path uses too, so
+  each lands for a backup and for TYPE mssql together; until then 085 returns their stored bytes.
 
-- **D9 — the double-byte code pages** (932, 936, 949, 950: 206 + 172 + 86 + 274 collations of 5,540)
+- **D9 — the double-byte code pages: moved to 085 PR 2d (owner, 2026-11-11).** A backup has no server
+  to convert a varchar, so 085 decodes every page on the client; the TDS path keeps the server's cast
+  for a double-byte page only because it is faster there (092 D10). What follows is kept for the
+  record. The pages (932, 936, 949, 950: 206 + 172 + 86 + 274 collations of 5,540)
   go through spec 091's kernel, one call per column per chunk: ASCII a block at a time, then a pass
   indexed by lead byte. The tables come from SQL Server itself: spec 091 (SQL Server code pages,
   generated tables and vectorized kernels, PR #527) reads every lead / trail pair in a scratch
@@ -173,8 +179,6 @@ oracle before they ship.
 - **`vector(n)`** (X§4): `0xA9`, version `0x01`, u16 dims, u32 element type (0 = float32), dims ×
   float32, into `FLOAT[n]`. Another element type (float16 is announced for 2025 previews) is refused
   by name.
-- **Double-byte code pages**: spec 091's lead-byte-indexed tables for 932, 936, 949, 950, through
-  091's kernel (D9).
 
 ### Sparse columns
 
@@ -237,8 +241,7 @@ Fixtures (`test/backup/gen/086_*.sql`):
   comments, CDATA, processing instructions, entities, large documents); spatial of every OGC type,
   empty shapes, holes, collections, SRIDs 0 / 4326 / 3857, Z / M values (dropped), curves (refused);
   `hierarchyid` from the root to depth 20 with negative and fractional labels; `vector` of 1, 3 and
-  1,998 dims; sparse tables with and without a column set; varchar columns under each double-byte
-  code page.
+  1,998 dims; sparse tables with and without a column set.
 
 Version matrix: 2017 / 2019 / 2022 / 2025 for everything but `vector` and `json` (2025). The CD
 format dates from 2008, so a 2017 failure points at a layout difference, not a new format.
@@ -269,14 +272,13 @@ Order is the PR order.
 5. Compression-info record, anchor, dictionary, reconstruction; fixtures first — 4 d
 6. `fuzz_backup_page_ci`; PAGE fixtures — 1 d
 
-**PR 3 — sparse, `sql_variant`, `vector`, `hierarchyid`, double-byte code pages**
+**PR 3 — sparse, `sql_variant`, `vector`, `hierarchyid`**
 
 7. Sparse vector and the column set (D7) — 1.5 d
 8. `sql_variant` → `VARIANT` — 2 d
 9. `vector` → `FLOAT[n]` — 0.5 d
 10. `hierarchyid` → text — 2 d
-11. Double-byte code pages: spec 091's tables and kernel reused (D9), plus the backup-specific oracle
-    fixtures — 0.5 d
+11. (Moved to 085 PR 2d: the double-byte code pages, D9.)
 12. Fuzz harnesses variant / hierarchyid; fixtures — 1 d
 
 **PR 4 — `xml`**
@@ -298,11 +300,12 @@ Order is the PR order.
 
 19. Docs per PR (README type table, `DATAMODEL.md` row-engine section, CLAUDE.md, CHANGELOG) — 1 d
 
-**Total ≈ 36 days, 7–8 weeks** (37.5 before spec 091 took the double-byte tables out of task 11),
+**Total ≈ 35.5 days, 7–8 weeks** (37.5 before spec 091 took the double-byte tables out of task 11, 36
+before task 11 moved to 085 PR 2d),
 plus the `json` spike (1–2 weeks) and its decoder (~3 days) if the gate passes. R§8 phase 1 gave
 5–6 weeks for ROW / PAGE, sparse, `sql_variant`, xml, spatial and vector together with the overlay,
-locators and parallel scan (which moved to 085). The difference is `hierarchyid`, the double-byte
-code pages and the per-type oracle tests and fuzz harnesses.
+locators and parallel scan (which moved to 085). The difference is `hierarchyid` and the per-type oracle
+tests and fuzz harnesses.
 
 ## Risks
 

@@ -6,7 +6,7 @@
 // execution reads the file anew; the opened-file cache shared across statements is task 22. Columns
 // whose source is a later PR are NULL until it lands: fuzzy_status / open_transactions /
 // stale_transactions (D11, PR 5), allocation_units.live_pages (a unit's IAM chain is walked at its
-// table's first scan, DQ-40, not to list it), partitioning (PR 2c). A column's DuckDB type is D6's:
+// table's first scan, DQ-40, not to list it). A column's DuckDB type is D6's:
 // MSSQLColumnInfo::MapSQLServerTypeToDuckDB, TYPE mssql's map with native types off (a plain VARCHAR
 // where mssql_catalog_native_types reports MSSQL_NVARCHAR(n)).
 
@@ -16,6 +16,7 @@
 #include "backup/backup_collation.hpp"
 #include "backup/backup_function_common.hpp"
 #include "backup/backup_opened.hpp"
+#include "backup/backup_sql_variant.hpp"
 #include "catalog/mssql_column_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -23,8 +24,6 @@
 #include "mssql_function_docs.hpp"
 #include "tds/encoding/datetime_encoding.hpp"
 
-#include <algorithm>
-#include <cctype>
 #include <cstring>
 
 namespace duckdb {
@@ -86,6 +85,16 @@ LogicalType PartitioningType() {
 	f.emplace_back("boundaries", LogicalType::LIST(LogicalType::VARIANT()));
 	f.emplace_back("destinations", LogicalType::LIST(LogicalType::VARCHAR));
 	f.emplace_back("next_used", LogicalType::VARCHAR);
+	f.emplace_back("reason", LogicalType::VARCHAR);
+	return LogicalType::STRUCT(std::move(f));
+}
+
+LogicalType PartitionStructType() {
+	child_list_t<LogicalType> f;
+	f.emplace_back("partition_number", LogicalType::INTEGER);
+	f.emplace_back("rows", LogicalType::BIGINT);
+	f.emplace_back("compression", LogicalType::VARCHAR);
+	f.emplace_back("filegroup", LogicalType::VARCHAR);
 	return LogicalType::STRUCT(std::move(f));
 }
 
@@ -106,7 +115,15 @@ std::vector<Column> TableColumns() {
 			{"stale_transactions", LogicalType::INTEGER},
 			{"columns", LogicalType::LIST(ColumnStructType())},
 			{"allocation_units", LogicalType::LIST(UnitStructType())},
-			{"partitioning", PartitioningType()}};
+			{"partitioning", PartitioningType()},
+			{"partitions", LogicalType::LIST(PartitionStructType())}};
+}
+
+std::vector<Column> SchemaColumns() {
+	return {{"schema_id", LogicalType::INTEGER},
+			{"schema_name", LogicalType::VARCHAR},
+			{"table_count", LogicalType::INTEGER},
+			{"view_count", LogicalType::INTEGER}};
 }
 
 std::vector<Column> ViewColumns() {
@@ -171,105 +188,15 @@ Value PointerValue(const PagePointer &p) {
 	return p.IsNull() ? Value(LogicalType::VARCHAR) : Value(p.ToString());
 }
 
-//! The type as T-SQL declares it: a system type with its length, precision or scale; an alias or a
-//! CLR type by its own name.
-std::string SqlType(const CatalogColumn &c) {
-	if (c.system_type_name.empty() || c.type_name != c.system_type_name) {
-		return c.type_name;
-	}
-	switch (c.system_type_id) {
-	case 165:  // varbinary
-	case 167:  // varchar
-	case 173:  // binary
-	case 175:  // char
-		return c.type_name + "(" + (c.max_length < 0 ? std::string("max") : std::to_string(c.max_length)) + ")";
-	case 231:  // nvarchar
-	case 239:  // nchar
-		return c.type_name + "(" + (c.max_length < 0 ? std::string("max") : std::to_string(c.max_length / 2)) + ")";
-	case 106:  // decimal
-	case 108:  // numeric
-		return c.type_name + "(" + std::to_string(c.precision) + "," + std::to_string(c.scale) + ")";
-	case 41:  // time
-	case 42:  // datetime2
-	case 43:  // datetimeoffset
-		return c.type_name + "(" + std::to_string(c.scale) + ")";
-	default:
-		return c.type_name;
-	}
-}
-
-//! Why the scan cannot read column `c` (spec 085 § Scope's refusals), or "".
-std::string ColumnRefusal(const CatalogColumn &c, uint32_t code_page) {
-	switch (c.system_type_id) {
-	case 98:
-		return "sql_variant is not read (spec 086)";
-	case 241:
-		return "xml is not read (spec 086)";
-	case 240:
-		return (c.system_type_name.empty() ? "the CLR type " + c.type_name : c.system_type_name) +
-			   " is not read (spec 086)";
-	case 34:
-	case 35:
-	case 99:
-		return "text, ntext and image are not read yet";
-	default:
-		break;
-	}
-	if (c.system_type_name.empty() || c.system_type_name == "json" || c.system_type_name == "vector") {
-		return (c.type_name.empty() ? "type " + std::to_string(c.user_type_id) : c.type_name) +
-			   " is not read (spec 086)";
-	}
-	const bool code_page_text = c.system_type_id == 167 || c.system_type_id == 175 || c.system_type_id == 35;
-	if (code_page_text && c.collation_id != 0 && !CollationById(static_cast<int32_t>(c.collation_id))) {
-		return "its collation (CollationId " + std::to_string(c.collation_id) + ") is not one the reader knows";
-	}
-	if ((c.system_type_id == 167 || c.system_type_id == 175) &&
-		(code_page == 932 || code_page == 936 || code_page == 949 || code_page == 950)) {
-		return "a varchar of double-byte code page " + std::to_string(code_page) + " is not read (spec 086)";
-	}
-	if (c.is_computed && !c.is_persisted) {
-		return "a computed column that is not persisted is not stored";
-	}
-	if (c.is_sparse || c.is_column_set) {
-		return "sparse columns are not read (spec 086)";
-	}
-	return std::string();
-}
-
 Value ColumnValue(const CatalogColumn &c) {
 	const CollationRow *collation = c.collation_id ? CollationById(static_cast<int32_t>(c.collation_id)) : nullptr;
 	const uint32_t code_page = collation ? collation->code_page : 0;
-	std::string reason = ColumnRefusal(c, code_page);
-	Value duckdb_type(LogicalType::VARCHAR);
-	// The precision and scale are the file's: LogicalType::DECIMAL asserts what they must be (an
-	// assertion, not an exception), so a declaration no server writes is named here instead. By the
-	// name too, which the type map dispatches on: the file's sysscalartypes names it, and a CLR column
-	// (xtype 240) takes its name from its user type.
-	std::string name = c.system_type_name;
-	std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
-	const bool decimal = c.system_type_id == 106 || c.system_type_id == 108 || name == "decimal" || name == "numeric";
-	const bool scaled = c.system_type_id == 41 || c.system_type_id == 42 || c.system_type_id == 43 || name == "time" ||
-						name == "datetime2" || name == "datetimeoffset";
-	if ((decimal && (c.precision < 1 || c.precision > 38 || c.scale > c.precision)) || (scaled && c.scale > 7)) {
-		if (reason.empty()) {
-			reason = c.system_type_name + " is declared with precision " + std::to_string(c.precision) + " and scale " +
-					 std::to_string(c.scale) + ", which no SQL Server type has";
-		}
-	} else if (!c.system_type_name.empty()) {
-		try {
-			duckdb_type =
-				Value(MSSQLColumnInfo::MapSQLServerTypeToDuckDB(c.system_type_name, c.max_length, c.precision, c.scale)
-						  .ToString());
-		} catch (std::exception &e) {
-			if (reason.empty()) {
-				reason = c.system_type_name + " has no DuckDB type: " + e.what();
-			}
-		}
-	}
+	const ColumnReading reading = ReadingOf(c);
 	child_list_t<Value> f;
 	f.emplace_back("column_id", Value::INTEGER(c.column_id));
 	f.emplace_back("name", Text(c.name));
-	f.emplace_back("sql_type", Text(SqlType(c)));
+	f.emplace_back("sql_type", Text(SqlTypeText(c.type_name, c.system_type_name, c.system_type_id, c.max_length,
+												c.precision, c.scale)));
 	f.emplace_back("system_type_id", Value::INTEGER(c.system_type_id));
 	f.emplace_back("max_length", Value::INTEGER(c.max_length));
 	f.emplace_back("precision", Value::INTEGER(c.precision));
@@ -281,9 +208,9 @@ Value ColumnValue(const CatalogColumn &c) {
 	f.emplace_back("is_identity", Value::BOOLEAN(c.is_identity));
 	f.emplace_back("is_computed", Value::BOOLEAN(c.is_computed));
 	f.emplace_back("is_sparse", Value::BOOLEAN(c.is_sparse));
-	f.emplace_back("duckdb_type", duckdb_type);
-	f.emplace_back("decodable", Value::BOOLEAN(reason.empty()));
-	f.emplace_back("reason", OptionalText(reason));
+	f.emplace_back("duckdb_type", Value(reading.type.ToString()));
+	f.emplace_back("decodable", Value::BOOLEAN(reading.readable));
+	f.emplace_back("reason", OptionalText(reading.note));
 	return Value::STRUCT(std::move(f));
 }
 
@@ -300,6 +227,57 @@ Value UnitValue(const CatalogUnit &u) {
 	f.emplace_back("root_page", PointerValue(u.unit.root_page));
 	f.emplace_back("first_iam_page", PointerValue(u.unit.first_iam));
 	f.emplace_back("live_pages", Value(LogicalType::BIGINT));  // the scan's (DQ-40)
+	return Value::STRUCT(std::move(f));
+}
+
+//! A partitioned table's partitioning (NULL on a filegroup): its boundaries as VARIANTs of the
+//! parameter's DuckDB type; with a reason, the boundaries NULL (D13: named, never guessed).
+Value PartitioningValue(const CatalogTable &t) {
+	if (!t.partitioned) {
+		return Value(PartitioningType());
+	}
+	const CatalogPartitioning &p = t.partitioning;
+	// The model's verdict is the one given: it has decoded every boundary already (BoundaryCheck), so a
+	// reason here is its reason, and without one each boundary decodes. With a reason the boundaries
+	// are NULL (D13: never a partial list); the destinations and NEXT USED are given when the model
+	// kept them (only the boundaries could not be given).
+	const std::string &reason = p.reason;
+	Value boundaries(LogicalType::LIST(LogicalType::VARIANT()));
+	Value destinations(LogicalType::LIST(LogicalType::VARCHAR));
+	if (reason.empty() || !p.destinations.empty()) {
+		vector<Value> names;
+		for (const auto &d : p.destinations) {
+			names.push_back(Value(d));
+		}
+		destinations = Value::LIST(LogicalType::VARCHAR, std::move(names));
+	}
+	if (reason.empty()) {
+		vector<Value> values;
+		for (size_t i = 0; i < p.boundaries.size(); i++) {
+			if (p.boundaries[i].is_null) {
+				values.push_back(Value(LogicalType::VARIANT()));
+				continue;
+			}
+			const std::string what = "boundary " + std::to_string(i + 1) + " of " + p.function_name;
+			values.push_back(SqlVariantValue(ParseSqlVariant(p.boundaries[i].bytes, what), what)
+								 .DefaultCastAs(LogicalType::VARIANT()));
+		}
+		boundaries = Value::LIST(LogicalType::VARIANT(), std::move(values));
+	}
+	child_list_t<Value> f;
+	f.emplace_back("function_name", OptionalText(p.function_name));
+	f.emplace_back("scheme_name", OptionalText(p.scheme_name));
+	f.emplace_back("column_name", OptionalText(p.column_name));
+	f.emplace_back("column_id", p.column_id ? Value::INTEGER(p.column_id) : Value(LogicalType::INTEGER));
+	f.emplace_back("parameter_type",
+				   OptionalText(SqlTypeText(p.parameter_type_name, p.parameter_system_type_name, p.parameter_xtype,
+											p.parameter_length, p.parameter_precision, p.parameter_scale)));
+	f.emplace_back("range_right",
+				   p.function_name.empty() ? Value(LogicalType::BOOLEAN) : Value::BOOLEAN(p.range_right));
+	f.emplace_back("boundaries", boundaries);
+	f.emplace_back("destinations", destinations);
+	f.emplace_back("next_used", OptionalText(p.next_used));	 // empty unless the model kept it
+	f.emplace_back("reason", OptionalText(reason));
 	return Value::STRUCT(std::move(f));
 }
 
@@ -333,8 +311,31 @@ std::vector<Value> TableRow(const CatalogTable &t) {
 	row.push_back(Value(LogicalType::INTEGER));	 // stale_transactions
 	row.push_back(Value::LIST(ColumnStructType(), std::move(columns)));
 	row.push_back(Value::LIST(UnitStructType(), std::move(units)));
-	row.push_back(Value(PartitioningType()));  // PR 2c
+	row.push_back(PartitioningValue(t));
+	vector<Value> partitions;
+	for (const auto &p : t.partitions) {
+		child_list_t<Value> f;
+		f.emplace_back("partition_number", Value::INTEGER(p.partition_number));
+		f.emplace_back("rows", p.rows < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(p.rows));
+		f.emplace_back("compression", Text(CompressionName(p.compression)));
+		f.emplace_back("filegroup", OptionalText(p.filegroup));
+		partitions.push_back(Value::STRUCT(std::move(f)));
+	}
+	row.push_back(Value::LIST(PartitionStructType(), std::move(partitions)));
 	return row;
+}
+
+// One schema (sysclsobjs class 50, every one the database has, the system schemas and the roles'
+// included, as sys.schemas lists them) with the user tables and views the catalog lists in it.
+std::vector<Value> SchemaRow(const CatalogModel &model, const CatalogSchema &s) {
+	int32_t tables = 0, views = 0;
+	for (const auto &t : model.tables) {
+		tables += t.schema_id == s.id;
+	}
+	for (const auto &v : model.views) {
+		views += v.schema_id == s.id;
+	}
+	return {Value::INTEGER(s.id), Text(s.name), Value::INTEGER(tables), Value::INTEGER(views)};
 }
 
 // `off_row_bytes`: the call's off-row definitions so far, within MAX_CALL_OFF_ROW_BYTES in all (as
@@ -379,7 +380,7 @@ std::vector<Value> ViewRow(const PageStore &store, const CatalogView &v, uint64_
 	return row;
 }
 
-enum class Listing : uint8_t { Tables, Views };
+enum class Listing : uint8_t { Tables, Views, Schemas };
 
 struct CatalogListBindData : public TableFunctionData {
 	vector<std::string> paths;
@@ -404,7 +405,9 @@ struct CatalogListState : public GlobalTableFunctionState {
 };
 
 const char *FunctionName(Listing listing) {
-	return listing == Listing::Tables ? "mssql_backup_tables" : "mssql_backup_views";
+	return listing == Listing::Tables  ? "mssql_backup_tables"
+		   : listing == Listing::Views ? "mssql_backup_views"
+									   : "mssql_backup_schemas";
 }
 
 template <Listing L>
@@ -413,7 +416,9 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	auto data = make_uniq<CatalogListBindData>();
 	data->listing = L;
 	data->paths = PathsOf(input.inputs[0], FunctionName(L));
-	for (const auto &column : L == Listing::Tables ? TableColumns() : ViewColumns()) {
+	for (const auto &column : L == Listing::Tables	? TableColumns()
+							  : L == Listing::Views ? ViewColumns()
+													: SchemaColumns()) {
 		names.emplace_back(column.name);
 		return_types.push_back(column.type);
 	}
@@ -435,13 +440,16 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	const auto &data = input.bind_data->Cast<CatalogListBindData>();
 	auto &state = input.global_state->Cast<CatalogListState>();
 	const CatalogModel &model = state.catalog->model;
-	const size_t total = data.listing == Listing::Tables ? model.tables.size() : model.views.size();
+	const size_t total = data.listing == Listing::Tables  ? model.tables.size()
+						 : data.listing == Listing::Views ? model.views.size()
+														  : model.schemas.size();
 	idx_t count = 0;
 	while (state.next < total && count < STANDARD_VECTOR_SIZE) {
 		const std::vector<Value> row =
-			data.listing == Listing::Tables
-				? TableRow(model.tables[state.next])
-				: ViewRow(*state.catalog->pages->store, model.views[state.next], state.off_row_bytes);
+			data.listing == Listing::Tables ? TableRow(model.tables[state.next])
+			: data.listing == Listing::Views
+				? ViewRow(*state.catalog->pages->store, model.views[state.next], state.off_row_bytes)
+				: SchemaRow(model, model.schemas[state.next]);
 		for (idx_t c = 0; c < row.size(); c++) {
 			output.data[c].SetValue(count, row[c]);
 		}
@@ -479,6 +487,11 @@ void RegisterBackupTablesFunctions(ExtensionLoader &loader) {
 		"Lists the views in a SQL Server full backup (.bak), with their T-SQL definitions as stored (NULL for "
 		"a view created WITH ENCRYPTION, which the reader does not de-obfuscate), read from the file alone.",
 		{"SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sales_full.bak')"});
+	Register<Listing::Schemas>(
+		loader,
+		"Lists the schemas of the database in a SQL Server full backup (.bak), as sys.schemas does (the system "
+		"schemas and the roles' included), with the user tables and views in each, read from the file alone.",
+		{"SELECT schema_name, table_count, view_count FROM mssql_backup_schemas('/backups/sales_full.bak')"});
 }
 
 }  // namespace backup

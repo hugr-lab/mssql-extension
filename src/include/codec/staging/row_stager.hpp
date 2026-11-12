@@ -84,6 +84,17 @@ struct StagingCounters {
 	uint64_t unbounded_columns = 0;
 };
 
+//! Publish one staged column into `out` through its finalize kernel: a family's batch decode, or for
+//! FinalizeKernel::Text the issue-#89 rendering as text; None does nothing (the values were written
+//! straight into the vector). Validity is not touched: PublishStagedValidity. Shared by RowStager and
+//! the backup reader's RecordStager (spec 085 PR 2d), so a column decodes the one way.
+void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
+						  Vector &out);
+
+//! AND the staged NULLs of `count` rows into `out`'s mask (a kernel may have set NULLs of its own,
+//! which must stay); nothing when the column staged none.
+void PublishStagedValidity(const ColumnStaging &st, idx_t count, Vector &out);
+
 //! Walks TDS row bytes into DuckDB vectors, column-major where it pays.
 //!
 //! Owned by MSSQLResultStream, one per stream, reused across chunks and result

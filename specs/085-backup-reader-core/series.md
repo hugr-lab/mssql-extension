@@ -19,7 +19,7 @@ experiment ran on; **(unverified)** = inferred or never observed.
 | spec | title | scope in one line | depends on | estimate | risk |
 |---|---|---|---|---|---|
 | [085](spec.md) | the core | MTF, `MSSQLBAK` (MS_XPRESS, ZSTD), stripes, several data files, page store with liveness, catalog with E7's partition model, FixedVar rows, LOBs and row-overflow, common types, the file functions with the opened-file cache, read-only ATTACH, DuckDB FileSystem I/O (ranged, asynchronous, parallel: D3a), `mssql_backup_info`, the fuzzy status, a differential overlay for browsing | 091's `src/codec/code_page/` (for PR 2) | 84.5–86.5 d, 15.5–17.5 wk (PR 2 in five PRs, 2a–2e) | low–medium (version drift) |
-| [086](../086-backup-row-formats-and-types/spec.md) | row formats and types | ROW and PAGE compression, sparse, `sql_variant` → `VARIANT`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector`, double-byte code pages, the 2025 `json` spike | 085 (+ 091's double-byte tables) | 36 d, 7–8 wk + `json` spike 1–2 wk | medium (ROW / PAGE known only through DbReader's facts); high for `json` |
+| [086](../086-backup-row-formats-and-types/spec.md) | row formats and types | ROW and PAGE compression, sparse, `sql_variant` → `VARIANT`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector`, the 2025 `json` spike | 085 | 35.5 d, 7–8 wk + `json` spike 1–2 wk | medium (ROW / PAGE known only through DbReader's facts); high for `json` |
 | [087](../087-backup-encryption/spec.md) | encryption and TDE | the `mssql_backup_key` secret, selection by scope then thumbprint, encrypted containers, TDE pages | 085 | 16.5 d, 3–3.5 wk + E10 spike | low–medium; the TDE log tail is open |
 | [088](../088-backup-columnstore/spec.md) | columnstore | E5's decoder in C++: segments, dictionaries, VLD, rowgroups, delete bitmaps, delta stores, archive | 085 (+ CD integers from 086 PR 1) | 37.5 d, 6–9 wk | medium (version drift) |
 | [089](../089-backup-incremental-api/spec.md) | the incremental API | the chain check, changed and freed pages with each page's previous owner from the base IAM images, dead / gone / moved AUs (E7's ownership rule), allocation images, the catalog mirror, LOB fragment maps, lake-mode decoding of a lone differential, the Parquet export in DuckLake's layout | 085 | 41.5 d, 8 wk | medium |
@@ -72,13 +72,13 @@ flowchart LR
   c088 -.delta stores in recovery.-> c090
   c087 -.E10: TDE log.-> c090
   c091[091 code pages: tables, kernels] -.085 PR 2.-> c085
-  c091 -.double-byte.-> c086b
 ```
 
 **Spec 091, before 085 PR 2**: 085 PR 2 (the catalog and the rows) needs spec 091's module
 `src/codec/code_page/` merged. Spec 091 builds the code-page tables, the decode kernels and the
 collation → code page table; 085 maps the on-disk CollationId onto 091's table and reuses its
-single-byte tables (085 D7, task 13), and 086 PR 3 its double-byte tables (086 D9, task 11).
+tables, the double-byte ones included (085 D7, task 13; moved from 086 D9 by the owner, 2026-11-11:
+a backup has no server to convert a varchar).
 
 **Track A (the lake's critical path): 085 → 089 PR 1 → 090.** After 089 PR 1, mssql-ducklake can import
 quiet backups and differentials exactly, refusing a file in which any imported table is not
@@ -102,7 +102,7 @@ Each PR merges before the next opens (no stacked PRs).
 | R§8 phase | R§8 estimate | now | spec | what changed |
 |---|---|---|---|---|
 | 0: container, page store, catalog, FixedVar, LOB, common types, file functions, cache, ATTACH, fuzzy flags | 6–8 wk, low–med | 15.5–17.5 wk | 085 | 085 also takes phase 1's overlay, locators and parallel scan (~2 wk) and E7's partition model (2 d), and costs per spec the hardening, fuzz harnesses, CI oracle lane and docs R§9 lists but §8 did not cost; D3a's ranged, asynchronous I/O (+3.5 d) and D4a's index with E12 (+2.5 d); DQ-40's IAM chain (+1.5 d); DQ-41's search (+2.5 d); PR 2 split in five, the oracle lane first (+5.5–7.5 d) |
-| 1: ROW / PAGE, sparse, `sql_variant`, xml, spatial, vector; overlay; locators; parallel scan | 5–6 wk, med | 7–8 wk + json spike | 086 | overlay / locators / parallel moved to 085; `hierarchyid` and double-byte code pages added; one oracle test per type |
+| 1: ROW / PAGE, sparse, `sql_variant`, xml, spatial, vector; overlay; locators; parallel scan | 5–6 wk, med | 7–8 wk + json spike | 086 | overlay / locators / parallel moved to 085; `hierarchyid` added (the double-byte code pages moved to 085 PR 2d); one oracle test per type |
 | 1b: encryption and TDE | 1–2 wk, low–med (E4) | 3–3.5 wk + E10 | 087 | the secret type, the selection rule, CI fixtures; the TDE log tail found open |
 | 1c: tail recovery | 9–12 wk, med (E3, E6) | 10–12 wk | 090 | about a week of it (the log reader) is in 085; guard extensions listed separately (ROW and PAGE 2–3, ADR / RCSI 3–4, DDL 1–2 wk) |
 | 2: mssql-ducklake import | 3–4 wk, med | not in this series (mssql-ducklake 022–024: 18.5–23.5 wk) | — | the reader side of it is 089 (8 wk), which §8 did not cost |

@@ -29,11 +29,15 @@
 
 #pragma once
 
+#include "backup/backup_sql_variant.hpp"
 #include "backup/backup_system_tables.hpp"
 
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -130,8 +134,56 @@ struct CatalogColumn {
 struct CatalogPartition {
 	uint64_t rowset_id = 0;
 	int32_t partition_number = 0;
+	//! rcrows of the partition's rowsets of owner types 1 and 3 (a columnstore's delta stores), -1 unknown.
+	//! A clustered columnstore's delta stores include those a REORGANIZE left as tombstones until the
+	//! tuple mover drops them, which sysrowsets cannot tell from an open one: the sum is what
+	//! sys.partitions.rows says up to SQL Server 2022 (measured on 2019 and 2022; 2025's leaves
+	//! tombstones out, the live count); spec 088 reads the rowgroup metadata that makes it exact (#551).
 	int64_t rows = 0;
-	uint8_t compression = 0;  // sysrowsets.cmprlevel: 0 none, 1 row, 2 page, 3 columnstore, 4 archive
+	uint8_t compression = 0;   // sysrowsets.cmprlevel: 0 none, 1 row, 2 page, 3 columnstore, 4 archive
+	int16_t filegroup_id = 0;  // its in-row unit's (= the scheme's destination, E7)
+	std::string filegroup;	   // its name (sysclsobjs class 31), "" when not listed
+	//! Its layout, an index into CatalogTable::layouts (CatalogTable::Layout); only when the table is
+	//! decodable. Rows are decoded per rowset: partitions may differ (in compression, after a SWITCH).
+	size_t layout = 0;
+};
+
+//! A partition function's boundary as sysobjvalues holds it: a sql_variant, or NULL (a legal
+//! boundary, the lowest value: sys.partition_range_values shows it so).
+struct PartitionBoundary {
+	bool is_null = false;
+	std::string bytes;
+};
+
+//! A partitioned table's partitioning (E7; spec 085 § Rules, catalog, partitioning).
+struct CatalogPartitioning {
+	int32_t function_id = 0;
+	std::string function_name;
+	int32_t scheme_id = 0;
+	std::string scheme_name;
+	int32_t column_id = 0;	// the partitioning column (sysiscols' partition ordinal 1)
+	std::string column_name;
+	//! The function's parameter (systypedsubobjs class 30): its type as a column's (TYPE_NAME by utype).
+	uint8_t parameter_xtype = 0;
+	std::string parameter_type_name;
+	std::string parameter_system_type_name;
+	int16_t parameter_length = 0;
+	uint8_t parameter_precision = 0;
+	uint8_t parameter_scale = 0;
+	uint32_t parameter_collation = 0;
+	bool range_right = false;
+	int32_t fanout = 0;	 // partitions; boundaries = fanout - 1
+	//! The boundaries, by boundary id 1..fanout-1 (positional: SPLIT / MERGE renumber them): each a
+	//! sql_variant in the parameter's own type (a varbinary one without its trailing zero bytes, as
+	//! the server stores and prints it).
+	std::vector<PartitionBoundary> boundaries;
+	std::vector<std::string> destinations;	// filegroup names by destination (= partition number) 1..fanout
+	std::string next_used;					// the destination past the fanout, "" when none
+	//! Why the partitioning cannot be given exactly (D13: named, never a guess); empty otherwise. With a
+	//! reason the boundaries are empty (never a partial list); the destinations and NEXT USED are given
+	//! when only the boundaries could not be (they do not depend on the values), empty otherwise. The
+	//! rows are read either way: partitioning is reference only.
+	std::string reason;
 };
 
 //! An allocation unit of one of the table's rowsets (any index), with its rowset's fields.
@@ -153,15 +205,27 @@ struct CatalogTable {
 	std::string modified;
 	TableShape shape = TableShape::Heap;
 	std::vector<CatalogPartition> partitions;  // owner type 1, by partition number
-	int64_t row_count = 0;					   // rcrows of the base rowsets of owner types 1 and 3
-	bool row_count_known = true;			   // false: a count negative, or the sum past int64
-	std::vector<CatalogColumn> columns;		   // by column id
+	//! Its base index's data space is a partition scheme; `partitioning` then describes it.
+	bool partitioned = false;
+	CatalogPartitioning partitioning;
+	int64_t row_count = 0;				 // the partitions' rows summed (CatalogPartition::rows: tombstones too)
+	bool row_count_known = true;		 // false: a count negative, or the sum past int64
+	std::vector<CatalogColumn> columns;	 // by column id
 	std::vector<CatalogUnit> units;
 	//! Whether the scan can read the table; `reason` names what it cannot when not (spec 085 D13).
 	bool decodable = false;
 	std::string reason;
-	//! The base rowset's layout, its defaults filled in; only when decodable.
-	RowsetLayout layout;
+	//! The layouts of its partitions, each distinct one once (a table of 15000 partitions has one
+	//! layout, not 15000 copies of it, review of #551); only when decodable. A shared layout's
+	//! `rowset_id` is 0: a partition's own is CatalogPartition::rowset_id (a unit looked up by the
+	//! layout's would be the first partition's for every partition).
+	std::vector<RowsetLayout> layouts;
+	const RowsetLayout &Layout(const CatalogPartition &p) const {
+		if (p.layout >= layouts.size()) {
+			throw FormatError("backup: " + schema_name + "." + name + " has no layout: it is not decodable");
+		}
+		return layouts[p.layout];
+	}
 };
 
 struct CatalogView {
@@ -189,12 +253,68 @@ struct CatalogModel {
 	std::string SchemaName(int32_t id) const;
 };
 
+//! A type as T-SQL declares it: a system type with its length, precision or scale (nchar / nvarchar
+//! counted in characters); an alias or a CLR type by its own name.
+std::string SqlTypeText(const std::string &type_name, const std::string &system_type_name, uint8_t system_type_id,
+						int16_t max_length, uint8_t precision, uint8_t scale);
+
 //! The most bytes of one module's text the catalog reads (a view's definition is nvarchar(max)).
 static constexpr uint64_t MAX_MODULE_TEXT_BYTES = 64ull << 20;
 //! The most bytes of off-row values one call of a catalog function reads in all (each within
 //! MAX_MODULE_TEXT_BYTES): a crafted file whose rows all point to one large LOB must not cost its size
 //! once per row.
 static constexpr uint64_t MAX_CALL_OFF_ROW_BYTES = 1ull << 30;
+
+//! Refuses a value the reader cannot give (a FormatError naming `what`), or returns: how the model
+//! asks whether a partition boundary decodes, so that the model's `reason` and the value
+//! mssql_backup_tables gives are one verdict (review of #551). The extension passes the DuckDB-side
+//! decoder (SqlVariantValue); without one, a boundary is checked against its parameter only.
+using BoundaryCheck = std::function<void(const SqlVariant &value, const std::string &what)>;
+
+//! The base tables partitioning is read from (E7), each read through its own description. A key listed
+//! twice is kept in a `*_twice` set and refuses only what uses it (D13).
+struct PartitionCatalog {
+	struct Function {
+		std::string name;
+		bool range_right = false;
+		int32_t fanout = 0;
+	};
+	struct Parameter {
+		uint8_t xtype = 0;
+		int32_t user_type = 0;
+		int16_t length = 0;
+		uint8_t precision = 0, scale = 0;
+		uint32_t collation = 0;
+	};
+	std::map<int32_t, Function> functions;								 // sysclsobjs class 30
+	std::map<int32_t, Parameter> parameters;							 // systypedsubobjs class 30, subid 1
+	std::map<int32_t, std::map<int32_t, PartitionBoundary>> boundaries;	 // sysobjvalues valclass 30
+	std::set<std::pair<int32_t, int32_t>> boundaries_twice;				 // (function, boundary id)
+	std::map<int32_t, std::string> filegroups, schemes;					 // sysclsobjs class 31
+	std::map<int32_t, int32_t> scheme_function;							 // syssingleobjrefs class 31
+	std::map<int32_t, std::map<int32_t, int32_t>> destinations;			 // class 30: scheme -> dest -> fg
+	std::map<std::pair<int32_t, int32_t>, int32_t> data_space;			 // class 7: (object, index) -> space
+	std::map<std::pair<int32_t, int32_t>, int32_t> partition_column;	 // sysiscols, partition ordinal 1
+	std::set<int32_t> functions_twice, data_spaces_twice, parameters_twice, schemes_twice;
+	std::set<std::pair<int32_t, int32_t>> destinations_twice, data_space_twice, partition_column_twice;
+	std::set<int32_t> boundaries_off_row;  // functions with a boundary stored off-row
+	//! A table of these could not be read: the partitioning of a table it leaves unknown is named so.
+	std::string reason;
+	//! syssingleobjrefs was read whole: a table with no data-space row is then on the default one,
+	//! whatever table failed after it.
+	bool data_spaces_read = false;
+};
+
+//! The partitioning catalog: `classes` is sysclsobjs, read already by the model; the other tables are
+//! read only when it lists a partition scheme (a database without one reads none of them).
+PartitionCatalog ReadPartitionCatalog(const PageStore &store, const BootstrapTables &tables,
+									  const SystemTable &classes);
+
+//! Table `t`'s partitioning from `pc` into t.partitioned / t.partitioning, or its reason (D13): named,
+//! never a guess and never a partial list. `base_index` is its heap's 0 or clustered 1; `check`, when
+//! given, decides whether each boundary decodes. `type_names` is sysscalartypes by id.
+void DescribePartitioning(const PartitionCatalog &pc, const std::unordered_map<int32_t, std::string> &type_names,
+						  int32_t base_index, const BoundaryCheck &check, CatalogTable &t);
 
 //! The catalog model of the database whose base tables are `tables`, its other system tables read
 //! through `store`. What one object's rows get wrong is named on that object (D13): a table the scan
@@ -204,7 +324,8 @@ static constexpr uint64_t MAX_CALL_OFF_ROW_BYTES = 1ull << 30;
 //! column or an unusable default refuses the table, not the column (the scan's column-level refusal
 //! is PR 2d's). A FormatError only for what the model as a whole rests on (a system table missing,
 //! a malformed row of sysclsobjs or sysscalartypes).
-CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &tables);
+CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &tables,
+							   const BoundaryCheck &check = BoundaryCheck());
 
 //! The flag of a module's sysobjvalues `value` that says its text is Latin-1, not UTF-16LE.
 constexpr int64_t MODULE_TEXT_LATIN1 = 0x2;
