@@ -316,7 +316,11 @@ uint64_t PassSearch::Reads() const {
 	return reads_;
 }
 
-bool PassSearch::Bounds(const ExtentId &extent, uint64_t &from, uint64_t &to, uint64_t &position) const {
+bool PassSearch::Bounds(const ExtentId &extent, uint64_t &from, uint64_t &to, uint64_t &position,
+						PassSample *below) const {
+	if (below) {
+		below->position = UINT64_MAX;
+	}
 	from = medium_->Begin();
 	to = medium_->End();
 	auto above = by_extent_.upper_bound(extent);
@@ -329,6 +333,9 @@ bool PassSearch::Bounds(const ExtentId &extent, uint64_t &from, uint64_t &to, ui
 		if (at_or_below->first == extent) {
 			position = sample.position;
 			return true;
+		}
+		if (below) {
+			*below = sample;
 		}
 		from = sample.next;
 	}
@@ -399,10 +406,53 @@ void PassSearch::SkipEmptyLocked(uint64_t &from, uint64_t &to) const {
 bool PassSearch::Find(const ExtentId &extent, uint64_t &position) {
 	uint64_t from = 0;
 	uint64_t to = 0;
+	PassSample below;
 	{
 		std::lock_guard<std::mutex> guard(lock_);
-		if (Bounds(extent, from, to, position)) {
+		if (Bounds(extent, from, to, position, &below)) {
 			return true;
+		}
+	}
+	// A guess first, where positions are groups: a pass's groups name ascending extents, so with no
+	// group between them that names none (zero units, pads), `extent`'s group lies as many groups past
+	// the sample below it as their extents are apart -- exactly there for a table whose extents follow
+	// one another in the pass. One group read: it is the extent, or it narrows the interval to either
+	// side of it and the search goes on. Without it, tasks scanning units ahead of the samples the
+	// others have found gallop from those samples through groups of the others' units (measured on
+	// 16 tasks: 4.3 decodes a block; PR 2e).
+	if (medium_->GroupPositions() && below.position != UINT64_MAX && below.extent.file == extent.file &&
+		extent.extent > below.extent.extent) {
+		const uint64_t apart = extent.extent - below.extent.extent;
+		const uint64_t guess = below.position + apart;
+		bool known_empty = false;
+		{
+			// A group a search found empty is not read again (KeepEmpty).
+			std::lock_guard<std::mutex> guard(lock_);
+			auto span = empty_.upper_bound(guess);
+			known_empty = span != empty_.begin() && std::prev(span)->second > guess;
+		}
+		if (guess >= from && guess < to && !known_empty) {
+			PassSample sample;
+			uint64_t resumed = 0;
+			const bool got = medium_->Probe(guess, guess + 1, sample, resumed);
+			{
+				std::lock_guard<std::mutex> guard(lock_);
+				reads_++;
+			}
+			if (!got) {
+				KeepEmpty(guess, guess + 1);
+			} else {
+				Keep(sample);
+				if (sample.extent == extent) {
+					position = sample.position;
+					return true;
+				}
+				if (extent < sample.extent) {
+					to = sample.position;
+				} else {
+					from = sample.next;
+				}
+			}
 		}
 	}
 	bool window_rest = false;

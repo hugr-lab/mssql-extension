@@ -3,6 +3,7 @@
 #include "backup/backup_bytes.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
@@ -355,36 +356,52 @@ bool OpenChainFromTail(const RandomAccess &file, BlockChain &chain, std::vector<
 	return true;
 }
 
-ContainerStream::ContainerStream(const RandomAccess &file, BlockChain chain, BlockDecoder decoder)
-	: file_(file), chain_(std::move(chain)), decoder_(std::move(decoder)), name_(file.Name() + " (data set)") {}
+static uint64_t NextStreamId() {
+	static std::atomic<uint64_t> next{1};
+	return next.fetch_add(1);
+}
 
-const ContainerStream::DecodedBlock *ContainerStream::Recent(uint64_t logical) const {
+ContainerStream::ContainerStream(const RandomAccess &file, BlockChain chain, BlockDecoder decoder)
+	: file_(file),
+	  chain_(std::move(chain)),
+	  decoder_(std::move(decoder)),
+	  name_(file.Name() + " (data set)"),
+	  id_(NextStreamId()) {}
+
+ContainerStream::Shared ContainerStream::RecentLocked(uint64_t logical) const {
 	for (const auto &d : recent_) {
-		if (d.valid && logical >= d.block.logical && logical < d.block.logical + d.block.output) {
-			return &d;
+		if (d && logical >= d->block.logical && logical < d->block.logical + d->block.output) {
+			return d;
 		}
 	}
 	return nullptr;
 }
 
-const ContainerStream::DecodedBlock &ContainerStream::Decoded(const ChainBlock &block) const {
-	DecodedBlock &d = recent_[next_slot_];
-	next_slot_ = (next_slot_ + 1) % recent_.size();
-	d.valid = false;
+ContainerStream::Shared ContainerStream::Decode(const ChainBlock &block) const {
+	auto d = std::make_shared<DecodedBlock>();
 	auto payload = Read(file_, block.physical + BLOCK_HEADER, block.payload, "a block's payload");
-	d.output.resize(block.output);
+	d->output.resize(block.output);
 	if (block.Stored()) {
-		std::memcpy(d.output.data(), payload.data(), block.output);
+		std::memcpy(d->output.data(), payload.data(), block.output);
 	} else {
 		if (!decoder_) {
 			throw FormatError(Where(file_, block.physical) +
 							  ": a compressed block, and no decoder for this container's algorithm");
 		}
-		decoder_(payload.data(), payload.size(), d.output.data(), block.output);
+		decoder_(payload.data(), payload.size(), d->output.data(), block.output);
 	}
-	d.block = block;
-	d.valid = true;
+	d->block = block;
 	return d;
+}
+
+void ContainerStream::KeepLocked(Shared decoded) const {
+	for (const auto &d : recent_) {
+		if (d && d->block.physical == decoded->block.physical) {
+			return;
+		}
+	}
+	recent_[next_slot_] = std::move(decoded);
+	next_slot_ = (next_slot_ + 1) % recent_.size();
 }
 
 ChainBlock ContainerStream::Locate(uint64_t logical) const {
@@ -473,11 +490,39 @@ void ContainerStream::ReadAt(uint64_t offset, uint8_t *dest, size_t count) const
 	if (offset > chain_.logical_size || count > chain_.logical_size - offset) {
 		throw FormatError("backup file \"" + file_.Name() + "\": a read past the end of its data set");
 	}
-	std::lock_guard<std::mutex> guard(lock_);
+	// The thread's last block (§ Scan: each thread keeps its last block, at most 64 KB), by this
+	// stream's id: a read in the block the thread read last -- the next page of a run, a page of the
+	// group its search just probed -- takes no lock. Held weakly: the recent blocks own it, so it goes
+	// with the stream (or when evicted), never kept by a worker thread past its backup (review).
+	struct LastBlock {
+		uint64_t stream = 0;
+		std::weak_ptr<const DecodedBlock> block;
+	};
+	static thread_local LastBlock last;
 	while (count > 0) {
-		const DecodedBlock *d = Recent(offset);
+		Shared d;
+		if (last.stream == id_) {
+			d = last.block.lock();
+			if (d && (offset < d->block.logical || offset >= d->block.logical + d->block.output)) {
+				d.reset();
+			}
+		}
 		if (!d) {
-			d = &Decoded(Locate(offset));
+			ChainBlock block;
+			{
+				std::lock_guard<std::mutex> guard(lock_);
+				d = RecentLocked(offset);
+				if (!d) {
+					block = Locate(offset);
+				}
+			}
+			if (!d) {
+				d = Decode(block);
+				std::lock_guard<std::mutex> guard(lock_);
+				KeepLocked(d);
+			}
+			last.stream = id_;
+			last.block = d;
 		}
 		const size_t within = static_cast<size_t>(offset - d->block.logical);
 		const size_t n = std::min(count, static_cast<size_t>(d->block.output) - within);

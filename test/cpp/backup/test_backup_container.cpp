@@ -8,9 +8,11 @@
 // unknown version or flag word, a payload past the end). XPRESS / ZSTD blocks are tasks 5 / 6.
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "backup/backup_bytes.hpp"
@@ -191,6 +193,35 @@ int main() {
 		stream.ReadAt(1000, middle.data(), middle.size());
 		Check(all == data && std::memcmp(middle.data(), data.data() + 1000, 1500) == 0,
 			  "the stream returns the data set, across block boundaries");
+	}
+	{
+		// Readers on eight threads at once (the scan's tasks, PR 2e): each its own spans, across block
+		// boundaries, every one equal to the data set's bytes. A fresh stream, so its recent blocks
+		// and its chain's checkpoints are built under the readers.
+		ContainerStream shared(file, WalkChain(file), BlockDecoder());
+		std::atomic<int> wrong{0};
+		std::vector<std::thread> readers;
+		for (int t = 0; t < 8; t++) {
+			readers.emplace_back([&, t]() {
+				uint64_t seed = 0x9E3779B97F4A7C15ull * static_cast<uint64_t>(t + 1);
+				Bytes got;
+				for (int i = 0; i < 2000; i++) {
+					seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+					const uint64_t at = (seed >> 11) % data.size();
+					const size_t n =
+						static_cast<size_t>(std::min<uint64_t>(1 + (seed >> 40) % 20000, data.size() - at));
+					got.resize(n);
+					shared.ReadAt(at, got.data(), n);
+					if (std::memcmp(got.data(), data.data() + at, n) != 0) {
+						wrong++;
+					}
+				}
+			});
+		}
+		for (auto &r : readers) {
+			r.join();
+		}
+		Check(wrong == 0, "eight threads reading at once each get the data set's bytes");
 	}
 	{
 		auto layout = WalkMtfDataSet(stream);

@@ -178,8 +178,15 @@ is refused for its type. A column the scan cannot read -- a computed column that
 stored value), a sparse column, and for now a `text` / `ntext` / `image` one -- is left out of
 `SELECT *`; a query that names it is refused, with the reason (`mssql_backup_tables.columns`).
 
+The scan runs on DuckDB's threads (`threads`); `max_threads := n` uses fewer for one call (a value
+above `threads` is clamped to it, with a warning in `duckdb_logs`). Rows come in page order, which
+DuckDB keeps where insertion order is preserved.
+
 ```sql
 SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');
+
+-- On two threads at most
+SELECT count(*) FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders', max_threads := 2);
 
 -- Import into DuckDB
 CREATE TABLE orders AS SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');

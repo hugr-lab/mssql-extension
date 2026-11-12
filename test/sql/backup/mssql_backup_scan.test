@@ -131,3 +131,39 @@ statement error
 SELECT * FROM mssql_backup_scan('test/data/backup/log.trn', 'dbo', 'items');
 ----
 mssql_backup_scan:
+
+# max_threads (D17, PR 2e): the same rows on one task as on DuckDB's threads; a value above DuckDB's
+# threads is clamped (a WARNING in duckdb_logs); NULL is the default; below 1 refused by name. The
+# samples' tables are one unit each (under 64 pages): units of several are compared in the oracle lane.
+query III
+SELECT count(*), sum(event_id), (SELECT count(*) FROM (
+        SELECT *, _mssql_rid FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events', max_threads := 1)
+        EXCEPT ALL SELECT *, _mssql_rid FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events', max_threads := 4096)))
+FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events', max_threads := NULL);
+----
+3000	4501500	0
+
+statement ok
+SET logging_storage = 'memory';
+
+statement ok
+SET enable_logging = true;
+
+statement ok
+SET logging_level = 'WARNING';
+
+statement ok
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events', max_threads := 4096);
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE message LIKE '%max_threads 4096 is above DuckDB''s threads%clamped to it%';
+----
+true
+
+statement ok
+SET enable_logging = false;
+
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events', max_threads := 0);
+----
+max_threads must be at least 1, not 0

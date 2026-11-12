@@ -62,6 +62,11 @@ public:
 	virtual void Window(uint64_t from, uint64_t limit, std::vector<PassSample> &out) const = 0;
 	//! The span of positions read as one window rather than bisected.
 	virtual uint64_t WindowSpan() const = 0;
+	//! Positions are group indexes, one group a position: the search may then guess a group from
+	//! the extents between it and a known sample (PassSearch::Find).
+	virtual bool GroupPositions() const {
+		return false;
+	}
 	virtual const std::string &Name() const = 0;
 	//! The file bytes its reads have asked for, for the counters and the tests.
 	uint64_t BytesRead() const {
@@ -85,6 +90,9 @@ public:
 	bool Probe(uint64_t at, uint64_t limit, PassSample &sample, uint64_t &resumed) const override;
 	void Window(uint64_t from, uint64_t limit, std::vector<PassSample> &out) const override;
 	uint64_t WindowSpan() const override;
+	bool GroupPositions() const override {
+		return true;
+	}
 	const std::string &Name() const override {
 		return file_.Name();
 	}
@@ -184,8 +192,10 @@ public:
 
 private:
 	//! The narrowest [from, to) the samples leave for `extent`, or true with its position when a
-	//! sample is it.
-	bool Bounds(const ExtentId &extent, uint64_t &from, uint64_t &to, uint64_t &position) const;
+	//! sample is it. `below`, when given, is the nearest sample below `extent` (position UINT64_MAX
+	//! when none).
+	bool Bounds(const ExtentId &extent, uint64_t &from, uint64_t &to, uint64_t &position,
+				PassSample *below = nullptr) const;
 	//! Keeps `sample` (up to MAX_SAMPLES), checking it against its neighbours: OrderBroken when the
 	//! extents do not ascend with the positions.
 	void Keep(const PassSample &sample);

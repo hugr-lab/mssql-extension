@@ -1042,10 +1042,17 @@ offsets above are in its fixed part.
 
 ### Scan
 
-- Units: the live level-0 data pages (type 1) whose header AU is an IN_ROW AU of the table's base
-  rowsets, in page-id order, cut into units of 64 pages; one unit per task, `MaxThreads` = units.
-  Batch indexes follow unit order, so DuckDB can preserve insertion order.
-- A compressed backup reads a page by decompressing its block; each thread keeps its last block.
+- Units: the pages each base rowset's IN_ROW AU lists through its IAM chain, in page-id order, cut into
+  units of 64 pages (as landed in PR 2e: from the IAM chain's list, so a unit's pages not live, IAM pages
+  and upper levels are skipped as it is read; a partition listed when its first unit is claimed; a unit
+  cut longer, up to 2048 pages, where the catalog's rows per page would leave 64 pages short of a
+  vector); one unit per task at a time, `MaxThreads` ≤ `max_threads`, estimated from the catalog's rows.
+  Rows of a live level-0 data page (type 1) whose header AU is the unit's. A chunk holds one unit's
+  rows; batch indexes follow unit order, so DuckDB can preserve insertion order.
+- A compressed backup reads a page by decompressing its block, outside the stream's lock; each thread
+  keeps its last block. A pass search guesses an extent's group from the sample below it (one group
+  read where the table's extents follow one another in the pass), so tasks ahead of the samples do not
+  gallop through the others' groups.
 - LOBs and overflow values are read only for projected columns; a chunk closes early on the codec's
   staging byte budget, as on the live read path.
 - The bind data serialises and deserialises (the common-subplan optimizer could otherwise merge two

@@ -1503,8 +1503,11 @@ flowchart BT
   records); `RecordStager` appends it into the codec's staging -- as it is for every type but
   datetime, smalldatetime, money (halves swapped) and bit (its bit of a shared byte) -- and publishes a
   chunk through the TDS path's family kernels, so a value decodes as `TYPE mssql` decodes it. A value
-  stored off row is refused by name until PR 3. `mssql_backup_scan` walks each partition's in-row IAM chain page by page on one
-  thread (PR 2e makes units parallel) and adds the virtual `_mssql_page`, `_mssql_rid` (a heap row's
+  stored off row is refused by name until PR 3. `mssql_backup_scan` cuts each partition's in-row IAM-listed pages, in page order, into units of
+  64 that DuckDB's tasks claim one at a time (PR 2e; a chunk is one unit's rows, its batch index the
+  unit's, `max_threads` bounding the tasks); a container's stream decodes outside its lock, each
+  thread keeping its last block, and the pass search guesses an extent's group from the sample below
+  it. It adds the virtual `_mssql_page`, `_mssql_rid` (a heap row's
   original place = its `%%physloc%%`; a clustered row's key and uniquifier) and `_mssql_page_lsn`.
 - **Prepared statements** keep the row their bind read (`SupportStatementCache`); `reread := true`
   binds again on every `EXECUTE`. The opened-file cache shared across statements (D9) is task 22.

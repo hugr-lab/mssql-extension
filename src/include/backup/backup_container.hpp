@@ -23,6 +23,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -117,10 +118,15 @@ std::vector<uint8_t> ReadContainerTape(const RandomAccess &file, const BlockDeco
 
 //! The data set as a RandomAccess over the container: a read finds its blocks through the chain
 //! and decodes them (stored blocks are copied; compressed ones go to `decoder`, which may be
-//! empty until tasks 5 / 6, then refused by name). Keeps the last decoded blocks per instance and
-//! serialises its readers: it serves the header walks (SSET .. MSCI, the trailer), and the page
-//! reads of the catalog and the scan (PageIndex reads a container's pages through it; one stream a
-//! family). The open pass decodes blocks on its own threads (D10), each with its own buffer (task 7).
+//! empty until tasks 5 / 6, then refused by name). Keeps the last decoded blocks per instance: it
+//! serves the header walks (SSET .. MSCI, the trailer), and the page reads of the catalog and the
+//! scan (PageIndex reads a container's pages through it; one stream a family), from several threads
+//! (the scan's tasks, PR 2e). Each thread keeps the last block it read (§ Scan; weakly, the recent
+//! blocks owning it), so a run of reads
+//! within one block -- a block holds 8 pages -- takes no lock. The lock covers the recent blocks and
+//! the chain's walk only: a block is read and decoded outside it, into a buffer of its own, so readers
+//! decode in parallel. Two readers missing one block at once both decode it (the second's copy is not
+//! kept). The open pass decodes blocks on its own threads (D10), each with its own buffer (task 7).
 class ContainerStream : public RandomAccess {
 public:
 	ContainerStream(const RandomAccess &file, BlockChain chain, BlockDecoder decoder);
@@ -146,13 +152,15 @@ public:
 private:
 	struct DecodedBlock {
 		ChainBlock block;
-		bool valid = false;
 		std::vector<uint8_t> output;
 	};
-	//! `block` decoded, from the recent blocks when it is one of them, else into the oldest slot.
-	const DecodedBlock &Decoded(const ChainBlock &block) const;
-	//! The recent block holding data-set offset `logical`, or null.
-	const DecodedBlock *Recent(uint64_t logical) const;
+	using Shared = std::shared_ptr<const DecodedBlock>;
+	//! `block` read and decoded; touches no member but the file and the decoder (no lock).
+	Shared Decode(const ChainBlock &block) const;
+	//! `decoded` into the oldest slot, unless a reader kept the same block meanwhile; the lock is held.
+	void KeepLocked(Shared decoded) const;
+	//! The recent block holding data-set offset `logical`, or null; the lock is held.
+	Shared RecentLocked(uint64_t logical) const;
 	//! The block of `logical`: walked from its checkpoint, adding checkpoints as WalkChain would.
 	ChainBlock Locate(uint64_t logical) const;
 
@@ -160,13 +168,18 @@ private:
 	mutable BlockChain chain_;
 	BlockDecoder decoder_;
 	std::string name_;
+	//! This stream among every one made, so a thread's last block (ReadAt) is never another
+	//! stream's, even one at a reused address.
+	const uint64_t id_;
 	mutable std::mutex lock_;
 	//! The last RECENT_BLOCKS blocks decoded (up to 4 MiB). A search reads windows of 16 groups, its
 	//! galloping probes overlap, and the pages it found are then read from the same blocks: with
 	//! 16 slots every block of a scan was decoded about 5 times (measured, 25k blocks decoded 125k
 	//! times on a 200k-page heap); with 64, once. 128 measured no better.
+	//! Held as shared pointers: a reader copies out of a block it took after the lock is released,
+	//! while another may evict it from its slot.
 	static constexpr size_t RECENT_BLOCKS = 64;
-	mutable std::vector<DecodedBlock> recent_ = std::vector<DecodedBlock>(RECENT_BLOCKS);
+	mutable std::vector<Shared> recent_ = std::vector<Shared>(RECENT_BLOCKS);
 	mutable size_t next_slot_ = 0;
 	//! The blocks the last RECENT_LOCATED Locates returned: a later offset in the same span between
 	//! checkpoints is walked to from the nearest of them at or before it, not from the checkpoint.
