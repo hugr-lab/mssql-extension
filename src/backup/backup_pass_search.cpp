@@ -290,8 +290,13 @@ void ContainerPassMedium::WindowChecked(uint64_t from, uint64_t limit, std::vect
 // PassSearch
 //===--------------------------------------------------------------------===//
 
+static uint64_t NextSearchId() {
+	static std::atomic<uint64_t> next{1};
+	return next.fetch_add(1);
+}
+
 PassSearch::PassSearch(std::unique_ptr<PassMedium> medium, Strategy strategy)
-	: medium_(std::move(medium)), strategy_(strategy) {
+	: medium_(std::move(medium)), strategy_(strategy), id_(NextSearchId()) {
 	if (!medium_) {
 		throw FormatError("backup: a pass search over no pass");
 	}
@@ -404,6 +409,29 @@ void PassSearch::SkipEmptyLocked(uint64_t &from, uint64_t &to) const {
 }
 
 bool PassSearch::Find(const ExtentId &extent, uint64_t &position) {
+	// The extent this thread found last, by this search's id: a scan reads a page at a time, eight to
+	// an extent, and would otherwise take the lock for each (PR 2e: 3.8k of the samples a 16-task scan
+	// waited in). A sample kept is never moved, so the answer stays right.
+	struct LastFound {
+		uint64_t search = 0;
+		ExtentId extent;
+		uint64_t position = 0;
+	};
+	static thread_local LastFound last;
+	if (last.search == id_ && last.extent == extent) {
+		position = last.position;
+		return true;
+	}
+	if (FindLocked(extent, position)) {
+		last.search = id_;
+		last.extent = extent;
+		last.position = position;
+		return true;
+	}
+	return false;
+}
+
+bool PassSearch::FindLocked(const ExtentId &extent, uint64_t &position) {
 	uint64_t from = 0;
 	uint64_t to = 0;
 	PassSample below;

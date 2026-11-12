@@ -332,7 +332,7 @@ int main() {
 
 	{
 		// The chain located from its tail (E13, DQ-41): the same data set, its index entries as
-		// checkpoints, reads that walk only where they read and add checkpoints as they go.
+		// checkpoints, reads that walk a span only as far as they read, keeping marks as they go.
 		const size_t blocks = packed.block_physical.size();
 		auto tailed = Pack(data, 1, {10, 70, blocks - 3}, 0x3, false, true);
 		MemoryAccess t("tailed.bak", tailed.file.data(), tailed.file.size());
@@ -349,18 +349,39 @@ int main() {
 				  located.checkpoints.size() == 4 && located.block_count == 0,
 			  "a chain located from its tail: the data set's size and end, the seek entries, four checkpoints");
 		ContainerStream ts(t, located, BlockDecoder());
+		{
+			// The first read of a span walks it only to its block (review of PR 2e: the open read the
+			// whole of pass 1 when a span was walked to its end).
+			Bytes first(512);
+			ts.ReadAt(0, first.data(), first.size());
+			Check(ts.WalkedBytes() == tailed.block_physical[1] - tailed.block_physical[0] &&
+					  std::equal(first.begin(), first.end(), data.begin()),
+				  "a read of the first block walks the first block only (" + std::to_string(ts.WalkedBytes()) +
+					  " bytes)");
+		}
 		Bytes all(data.size());
 		ts.ReadAt(0, all.data(), all.size());
 		Check(all == data, "a stream on the located chain reads the whole data set");
-		const auto grown = ts.Chain().checkpoints.size();
-		Check(grown > 4 && grown <= walked.checkpoints.size() + 4,
-			  "the read added checkpoints as it walked, no more than a full walk keeps (" + std::to_string(grown) +
-				  " against " + std::to_string(walked.checkpoints.size()) + ")");
+		Check(ts.WalkedBytes() == walked.end - tailed.block_physical[0] &&
+				  ts.MarkCount() <= 4 + tailed.file.size() / (256 << 10) + 4,
+			  "the whole data set read: every span walked, a mark per 256 KiB at most (" +
+				  std::to_string(ts.MarkCount()) + " marks)");
+		// Every block located where a full walk finds it, the chain itself unchanged (PR 2e).
+		bool every_block = ts.Chain().checkpoints.size() == 4;
+		for (size_t i = 0; every_block && i < tailed.block_physical.size(); i++) {
+			const auto b = ts.BlockOf(tailed.block_logical[i]);
+			every_block =
+				b.physical == tailed.block_physical[i] && b.logical == tailed.block_logical[i] &&
+				b.output == (i + 1 < tailed.block_logical.size() ? tailed.block_logical[i + 1] : data.size()) -
+								tailed.block_logical[i];
+		}
+		Check(every_block,
+			  "every block located from its span as a full walk finds it, the chain's checkpoints unchanged");
 		auto layout = WalkMtfDataSet(ts);
 		Check(layout.Find("SSET") && layout.Find("MSLS"), "the MTF walk of the data set runs on the located chain");
 		{
 			// Reads out of order on a fresh stream (forward, back, across checkpoints, the last block
-			// then the first): each walk starts from a block located lately, never past its offset.
+			// then the first): each walks from the nearest mark, or the thread's last block, before it.
 			ContainerStream rs(t, located, BlockDecoder());
 			const uint64_t n = data.size();
 			const uint64_t at[] = {n / 2, n / 2 + 700, n / 4, n - 600, 0, n / 3, n / 2 - 1, n - 1};
@@ -371,7 +392,58 @@ int main() {
 				rs.ReadAt(a, got.data(), count);
 				same = same && std::equal(got.begin(), got.end(), data.begin() + static_cast<std::ptrdiff_t>(a));
 			}
-			Check(same, "reads out of order give the data set's bytes (walks from recently located blocks)");
+			Check(same, "reads out of order give the data set's bytes (walks from the marks and the last block)");
+		}
+		{
+			// Eight threads on a fresh stream of the located chain, whose spans are long (one between
+			// entries 10 and 70, one past 70): each reads its stretch in order, then at random, while
+			// the others walk the spans on (the lock-free walk from a thread's last block and the walk
+			// on under a span's lock side by side).
+			ContainerStream shared(t, located, BlockDecoder());
+			std::atomic<int> wrong{0};
+			std::vector<std::thread> readers;
+			const uint64_t n = data.size();
+			for (int k = 0; k < 8; k++) {
+				readers.emplace_back([&, k]() {
+					uint64_t seed = 0x9E3779B97F4A7C15ull * static_cast<uint64_t>(k + 1);
+					Bytes got(700);
+					for (uint64_t at = n / 8 * k; at + got.size() <= n / 8 * (k + 1); at += 650) {
+						shared.ReadAt(at, got.data(), got.size());
+						if (!std::equal(got.begin(), got.end(), data.begin() + static_cast<std::ptrdiff_t>(at))) {
+							wrong++;
+						}
+					}
+					for (int i = 0; i < 500; i++) {
+						seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+						const uint64_t at = (seed >> 11) % (n - got.size());
+						shared.ReadAt(at, got.data(), got.size());
+						if (!std::equal(got.begin(), got.end(), data.begin() + static_cast<std::ptrdiff_t>(at))) {
+							wrong++;
+						}
+					}
+				});
+			}
+			for (auto &reader : readers) {
+				reader.join();
+			}
+			Check(wrong == 0, "eight threads on the located chain, in order and at random: the data set's bytes");
+		}
+		{
+			// A header in the middle of a span that is no block's: the read that walks to it is refused
+			// naming it, and so is the next (the span stays walked up to it).
+			auto broken = tailed.file;
+			broken[static_cast<size_t>(tailed.block_physical[40])] = 0x55;
+			MemoryAccess br("broken.bak", broken.data(), broken.size());
+			ContainerStream bs(br, located, BlockDecoder());
+			Bytes byte(1);
+			const auto first = ErrorOf([&]() { bs.ReadAt(tailed.block_logical[45], byte.data(), 1); });
+			const auto second = ErrorOf([&]() { bs.ReadAt(tailed.block_logical[45], byte.data(), 1); });
+			Bytes before(512);
+			bs.ReadAt(tailed.block_logical[39], before.data(), before.size());
+			Check(first.find("no block of the chain where its span") != std::string::npos && first == second &&
+					  std::equal(before.begin(), before.end(),
+								 data.begin() + static_cast<std::ptrdiff_t>(tailed.block_logical[39])),
+				  "a header mid-span that is no block's: refused, again on the next read; the blocks before it read");
 		}
 
 		Check(!OpenChainFromTail(file, located, seek), "a container without the tail: not located (walk it)");
@@ -399,6 +471,10 @@ int main() {
 					  shifted_stream.ReadAt(tailed.block_logical[70], byte.data(), 1);
 				  }).find("do not reach the checkpoint") != std::string::npos,
 				  "a seek entry at the wrong data-set offset: refused where a walk reaches it");
+			Check(ErrorOf([&]() {
+					  shifted_stream.ReadAt(tailed.block_logical[70], byte.data(), 1);
+				  }).find("do not reach the checkpoint") != std::string::npos,
+				  "the same read again: refused again (a walk that threw leaves its span to be walked on)");
 			auto huge = tailed.file;
 			Put64(huge, static_cast<size_t>(walked.end) + 40 + 32, uint64_t(1) << 62);
 			MemoryAccess hu("huge.bak", huge.data(), huge.size());

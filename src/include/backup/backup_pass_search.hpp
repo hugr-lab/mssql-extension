@@ -191,6 +191,8 @@ public:
 	}
 
 private:
+	//! Find, past the thread's last answer: the samples, then the medium.
+	bool FindLocked(const ExtentId &extent, uint64_t &position);
 	//! The narrowest [from, to) the samples leave for `extent`, or true with its position when a
 	//! sample is it. `below`, when given, is the nearest sample below `extent` (position UINT64_MAX
 	//! when none).
@@ -209,6 +211,8 @@ private:
 
 	std::unique_ptr<PassMedium> medium_;
 	Strategy strategy_;
+	//! This search among every one made, for the thread's last answer (Find).
+	const uint64_t id_;
 	mutable std::mutex lock_;
 	std::map<uint64_t, PassSample> by_position_;
 	std::map<ExtentId, uint64_t> by_extent_;
