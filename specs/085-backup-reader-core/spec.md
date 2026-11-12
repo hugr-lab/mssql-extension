@@ -1060,6 +1060,14 @@ offsets above are in its fixed part.
   guesses an extent's group from the sample below it (one group read where the table's extents follow
   one another in the pass), so tasks ahead of the samples do not gallop through the others' groups, and
   each thread keeps the extent it found last.
+- A plain backup's pages are read through the thread's read-ahead (as landed in PR 2e step 7): a short
+  read that starts where the thread's last read of the file ended, or within 64 KiB past it (a unit's
+  pages, one after another in the file; a chain walk's headers in a container), is served from 256 KiB
+  the thread read at once; a read that follows no other (a search's first probe, a page far from the
+  last) is read as asked, and the second of two reads within 64 KiB of each other fetches the 256 KiB
+  (up to 32 pages more than asked; one fetch, on a remote file within the cache's 2 MiB blocks). A
+  fetch a page had cost 12 µs of the kernel's time at 16 threads: a 16-task scan of an 8 GB heap,
+  0.33x the time.
 - LOBs and overflow values are read only for projected columns; a chunk closes early on the codec's
   staging byte budget, as on the live read path.
 - The bind data serialises and deserialises (the common-subplan optimizer could otherwise merge two
@@ -1081,7 +1089,7 @@ Each component of 085, with its home or its bound:
 | decode staging | the rows of a chunk | one chunk per running unit, closed at the codec's staging byte budget or a full vector, whichever comes first; reserved (D17). As landed in PR 2e: the staging's bound from the declared widths (a row's in-row 8,060 bytes at most; buffers counted twice, as they grow by doubling) for a vector, or 8 MiB with the chunk closing on the bytes it staged; held for one `Execute` call only, so a task blocked downstream holds no reservation another waits for -- what it keeps between calls is its staging's capacity, about one reservation, unaccounted. The output vectors' string heaps are DuckDB's allocations (accounted by DuckDB, #536), not reserved again |
 | a compressed block being read | ≤ 64 KB | one per thread (§ Scan) |
 | a container's walked spans (PR 2e) | the file walked | 16 bytes a mark, a mark per 256 KiB of the file walked (64 KB a GB, whatever the blocks' sizes); resident while open, within D4a's 0.4 MB per GB |
-| a thread's read window (PR 2e) | -- | 256 KiB per thread that read a container; kept by the thread until it reads another container's, past the query: at most 256 KiB × DuckDB's threads, unaccounted |
+| a thread's read window and read-ahead (PR 2e) | -- | 256 KiB per thread that read a container's data set (the window) and 256 KiB per thread that read a family file on (the read-ahead); their bytes are a file's until the thread reads another, their capacity stays with the thread for its life: at most 512 KiB × the threads that read a backup (DuckDB's and the clients'), unaccounted; beside them a pass search's 64 KiB group a thread |
 | fetched ranges (D3a) | the ranges in flight and cached | the buffer manager's: a remote file's cached blocks are counted and evictable once unpinned; a local file's reads are counted and freed on release; the ranges in flight are bounded by the units in flight |
 | a LOB value | its length | not streamed: DuckDB has no streamed value, so a value is assembled whole in its vector, fragment by fragment, capped at 2^31 − 1 bytes. Its length, known from its root before a fragment is read, is reserved first, by D17's rule: a unit that cannot reserve it waits for the others, and a value that still cannot fit while its unit runs alone is refused by name (table, `_mssql_rid`, column, length, `max_memory`, `temp_directory`) |
 

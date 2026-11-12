@@ -17,6 +17,7 @@
 #include "backup/backup_page_index.hpp"
 #include "backup/backup_source.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -27,8 +28,12 @@ namespace mssql {
 namespace backup {
 
 //! One family file of a ByteSource as a RandomAccess, for the DuckDB-free parsers (MTF walk,
-//! header fields, the rank path). Each ReadAt is one fetch through CachingFileSystem; reads from
-//! several threads are safe (positioned reads on a shared handle).
+//! header fields, the rank path, the scan's pages). A ReadAt is one fetch through CachingFileSystem,
+//! but a short read that starts where the thread's last read of this file ended, or a little past
+//! it (a scan's pages, one after another in the file; a chain walk's headers), is served from
+//! READ_AHEAD bytes the thread read at once and keeps (PR 2e step 7: one fetch a page cost 12 us of
+//! the kernel's time at 16 threads); any other read is read as asked. Reads from several threads are safe (positioned
+//! reads on a shared handle; the read-ahead is the thread's own).
 class SourceAccess final : public RandomAccess {
 public:
 	SourceAccess(ByteSource &source, size_t file);
@@ -42,9 +47,24 @@ public:
 		return file_;
 	}
 
+	//! The fetches made through the source (for the tests: what the read-ahead saved).
+	uint64_t Fetches() const {
+		return fetches_.load(std::memory_order_relaxed);
+	}
+	//! A thread's read-ahead (256 KiB) and the gap past its last read that still counts as reading on.
+	static constexpr size_t READ_AHEAD = 256 << 10;
+	static constexpr uint64_t SEQUENTIAL_GAP = 64 << 10;
+
 private:
+	//! `count` bytes at `offset`, fetched as asked.
+	void ReadDirect(uint64_t offset, uint8_t *dest, size_t count) const;
+
 	ByteSource &source_;
 	size_t file_;
+	//! This access among every one made, so a thread's read-ahead is never another file's, even one at
+	//! a reused address.
+	const uint64_t id_;
+	mutable std::atomic<uint64_t> fetches_{0};
 };
 
 struct PassScanOptions {

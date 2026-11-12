@@ -390,7 +390,8 @@ ContainerStream::ContainerStream(const RandomAccess &file, BlockChain chain, Blo
 //! The bytes of `file` a thread read last, by the stream's id (§ Scan: a thread keeps what it read):
 //! READ_WINDOW bytes read at once, so the headers a walk reads and the payloads of the blocks that
 //! follow one another are read in a few reads, not one a header and one a block. At most READ_WINDOW
-//! a thread (a block is at most 64 KiB), kept until the thread reads another stream's.
+//! a thread (a block is at most 64 KiB): its bytes the stream's until the thread reads another's,
+//! its capacity the thread's for its life (spec 085 § Resources).
 static constexpr size_t READ_WINDOW = 256 << 10;
 
 const uint8_t *ContainerStream::Window(uint64_t at, size_t count) const {
