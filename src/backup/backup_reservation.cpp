@@ -40,8 +40,13 @@ void ReservationGate::Acquire(uint64_t bytes, const std::function<bool()> &inter
 			}
 			// DuckDB refused while others hold: only a release can change its answer, so wait for one
 			// -- not for another waiter's failed attempt, which would retry (and evict) back to back.
+			// The wait ends too when the others go without releasing anything (every one of them
+			// refused, or DuckDB's side threw): no release can come then, and waiting for one parked
+			// the task for ever while DuckDB waited for the task (review of #553). Falling out that
+			// way, the loop tries once more -- nothing of the call is held now, so DuckDB's answer
+			// may differ -- and a refusal there finds `holders_` 0 and is the refusal by name.
 			const uint64_t seen = releases_;
-			while (releases_ == seen) {
+			while (releases_ == seen && holders_ > 0) {
 				WaitLocked(guard, interrupted);
 			}
 			continue;

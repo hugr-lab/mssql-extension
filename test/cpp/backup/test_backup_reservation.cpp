@@ -1,12 +1,15 @@
 // Spec 085 D17: ReservationGate, the reader's rule for its working memory. A reservation past the
 // budget is refused at once; one that does not fit beside others waits for a release; one DuckDB
 // cannot make room for waits while others hold, and is refused when alone; a wait asks to be
-// interrupted. Eight threads under a budget of three reservations never hold more than three, all
+// interrupted; two refused at once are both refused, neither waiting for a release that nothing can
+// make. Eight threads under a budget of three reservations never hold more than three, all
 // finish, and every byte DuckDB reserved is given back.
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -124,6 +127,61 @@ int main() {
 		}
 		Check(alone && why == "out of memory (fake)" && gate.Held() == 0 && gate.Holders() == 0,
 			  "DuckDB without room and nothing else held: refused, naming DuckDB's reason");
+	}
+	{
+		// Two tasks DuckDB refuses with nothing held: each is refused by name, and neither waits for
+		// a release that nothing can make (review of #553). The first to give back used to see the
+		// other's in-flight attempt in `holders_` and park on `releases_` for ever, while DuckDB
+		// waited for that task to end -- so the whole query hung instead of reporting the refusal.
+		// Both attempts must be in flight at once for the first to see the other in `holders_`, so
+		// DuckDB's side here holds each caller until the other has entered it, then refuses both.
+		// `interrupted` is the test's own deadline, so a regression fails rather than hanging CI;
+		// `duck.reserved` stays 0 because nothing is ever reserved, which a stray release would break.
+		FakeDuckDB duck(10);
+		std::mutex both_in;
+		std::condition_variable entered;
+		int inside_reserve = 0;
+		ReservationGate gate(
+			100,
+			[&](uint64_t, std::string &why) {
+				std::unique_lock<std::mutex> meet(both_in);
+				inside_reserve++;
+				entered.notify_all();
+				entered.wait_for(meet, std::chrono::seconds(2), [&]() { return inside_reserve >= 2; });
+				why = "out of memory (fake)";
+				return false;
+			},
+			duck.Release());
+		std::atomic<int> refused{0};
+		std::atomic<int> stuck{0};
+		std::atomic<int> done{0};
+		std::atomic<bool> too_slow{false};
+		std::vector<std::thread> tasks;
+		for (int t = 0; t < 2; t++) {
+			tasks.emplace_back([&]() {
+				try {
+					HeldReservation held(gate, 40, [&]() { return too_slow.load(); });
+				} catch (ReservationRefused &e) {
+					if (!e.past_budget) {
+						refused++;
+					}
+				} catch (ReservationInterrupted &) {
+					stuck++;
+				}
+				done++;
+			});
+		}
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (done < 2 && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		too_slow = true;  // frees a task the fix would have freed, so the check below fails instead
+		for (auto &t : tasks) {
+			t.join();
+		}
+		Check(refused == 2 && stuck == 0 && gate.Held() == 0 && gate.Holders() == 0 && duck.reserved == 0,
+			  "two tasks refused with nothing held: both refused by name, neither waits for a release "
+			  "that cannot come");
 	}
 	{
 		// A wait asked to stop: interrupted, nothing held by the waiter.
