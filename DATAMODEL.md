@@ -1505,7 +1505,8 @@ flowchart BT
   chunk through the TDS path's family kernels, so a value decodes as `TYPE mssql` decodes it. A value
   stored off row is refused by name until PR 3. `mssql_backup_scan` cuts each partition's in-row IAM-listed pages, in page order, into units of
   64 that DuckDB's tasks claim one at a time (PR 2e; a chunk is one unit's rows, its batch index the
-  unit's, `max_threads` bounding the tasks); a container's stream decodes outside its lock, each
+  unit's, `max_threads` bounding the tasks; each call reserves its chunk's decoding against half of
+  `max_memory` and DuckDB's memory, D17's wait-then-refuse rule in `ReservationGate`); a container's stream decodes outside its lock, each
   thread keeping its last block, and the pass search guesses an extent's group from the sample below
   it. It adds the virtual `_mssql_page`, `_mssql_rid` (a heap row's
   original place = its `%%physloc%%`; a clustered row's key and uniquifier) and `_mssql_page_lsn`.

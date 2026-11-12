@@ -668,6 +668,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_ranges.cpp \
     test/cpp/backup/test_backup_record.cpp \
     test/cpp/backup/test_backup_record_stager.cpp \
+    test/cpp/backup/test_backup_reservation.cpp \
     test/cpp/backup/test_backup_rows.cpp \
     test/cpp/backup/test_backup_source.cpp \
     test/cpp/backup/test_backup_system_tables.cpp \

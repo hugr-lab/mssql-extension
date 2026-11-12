@@ -22,6 +22,7 @@
 #include "backup/backup_function_common.hpp"
 #include "backup/backup_opened.hpp"
 #include "backup/backup_record_stager.hpp"
+#include "backup/backup_reservation.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -29,7 +30,9 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "mssql_function_docs.hpp"
 
@@ -74,6 +77,9 @@ struct ScanBindData : public TableFunctionData {
 	std::vector<UnreadColumn> unread;  // UNREAD_COLUMN_START + i
 	//! `max_threads` as the call gave it; 0 = not given (DuckDB's `threads`). Clamped at init.
 	idx_t max_threads = 0;
+	//! `max_memory` in bytes as the call gave it; 0 = not given (DuckDB's `memory_limit`). Clamped at
+	//! init; half of it is the budget of the scan's reservations (D17).
+	idx_t max_memory = 0;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<ScanBindData>();
@@ -81,6 +87,7 @@ struct ScanBindData : public TableFunctionData {
 		copy->schema = schema;
 		copy->table = table;
 		copy->max_threads = max_threads;
+		copy->max_memory = max_memory;
 		copy->catalog = catalog;
 		copy->entry = entry;
 		copy->column_ids = column_ids;
@@ -92,7 +99,7 @@ struct ScanBindData : public TableFunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<ScanBindData>();
 		return paths == other.paths && schema == other.schema && table == other.table &&
-			   max_threads == other.max_threads;
+			   max_threads == other.max_threads && max_memory == other.max_memory;
 	}
 	//! Every EXECUTE binds again: the file is read at bind.
 	bool SupportStatementCache() const override {
@@ -176,6 +183,39 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 			}
 		}
 	}
+	for (const auto &kv : input.named_parameters) {
+		if (kv.first == "max_memory" && !kv.second.IsNull()) {
+			// DuckDB's own syntax ('2GB', '512MiB'), or bytes as a bare number; an unlimited one ('-1',
+			// 'none', any case) is DuckDB's limit. Any other '-...' is refused, not read as unlimited.
+			const std::string given = StringUtil::Lower(StringUtil::Replace(kv.second.ToString(), " ", ""));
+			optional_idx bytes;
+			bool parsed = !given.empty() && (given[0] != '-' || given == "-1");
+			if (parsed && given.size() <= 19 &&
+				std::all_of(given.begin(), given.end(), [](char ch) { return ch >= '0' && ch <= '9'; })) {
+				bytes = optional_idx(std::stoull(given));  // 19 digits fit in 64 bits
+			} else if (parsed) {
+				try {
+					bytes = DBConfig::ParseMemoryLimit(given);
+				} catch (std::exception &) {
+					parsed = false;
+				}
+			}
+			if (!parsed) {
+				throw InvalidInputException("%s: max_memory '%s' is not a size (as memory_limit takes, e.g. '2GB')",
+											FUNCTION, kv.second.ToString());
+			}
+			if (bytes.IsValid() && bytes.GetIndex() == 0) {
+				throw InvalidInputException("%s: max_memory must be more than 0", FUNCTION);
+			}
+			data->max_memory = bytes.IsValid() ? bytes.GetIndex() : 0;
+			const idx_t limit = BufferManager::GetBufferManager(context).GetMaxMemory();
+			if (data->max_memory > limit) {
+				DUCKDB_LOG_WARNING(context, "%s: max_memory %s is above DuckDB's memory_limit (%s): clamped to it",
+								   FUNCTION, StringUtil::BytesToHumanReadableString(data->max_memory),
+								   StringUtil::BytesToHumanReadableString(limit));
+			}
+		}
+	}
 	BindTable(context, *data, &names);
 	return_types = data->types;
 	return std::move(data);
@@ -194,6 +234,7 @@ void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_dat
 	}
 	serializer.WriteProperty(105, "unread", unread);
 	serializer.WritePropertyWithDefault<idx_t>(106, "max_threads", data.max_threads, 0);
+	serializer.WritePropertyWithDefault<idx_t>(107, "max_memory", data.max_memory, 0);
 }
 
 unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunction &) {
@@ -205,6 +246,7 @@ unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunct
 	const auto names = deserializer.ReadProperty<vector<std::string>>(104, "names");
 	const auto unread = deserializer.ReadProperty<vector<std::string>>(105, "unread");
 	data->max_threads = deserializer.ReadPropertyWithExplicitDefault<idx_t>(106, "max_threads", 0);
+	data->max_memory = deserializer.ReadPropertyWithExplicitDefault<idx_t>(107, "max_memory", 0);
 	BindTable(deserializer.Get<ClientContext &>(), *data, nullptr);
 	// The plan's column positions and vectors are those it was bound with: a file at the same path that
 	// reads otherwise now (a nightly backup replaced: a column added, dropped, renamed or retyped) is
@@ -289,6 +331,14 @@ struct ScanGlobalState : public GlobalTableFunctionState {
 	size_t next_partition = 0;
 	idx_t next_batch = 0;
 	idx_t max_threads = 1;
+	//! D17: a chunk's decoding is reserved before it runs (`chunk_bytes`, ChunkBound), against half
+	//! of the call's max_memory and DuckDB's memory (the EXTENSION tag), and released after it.
+	std::unique_ptr<ReservationGate> gate;
+	uint64_t chunk_bytes = 0;
+	uint64_t chunk_allowance = 0;  // RecordStager::LimitBytes: 0 when a vector of the widest rows fits
+	uint64_t virtual_row = 0;
+	idx_t max_memory = 0;  // the call's, clamped: for the refusal's words
+
 	//! For the progress bar: rows staged by every task, and the catalog's count (-1 unknown).
 	std::atomic<uint64_t> rows_read{0};
 	int64_t row_count = -1;
@@ -369,6 +419,29 @@ PartitionCursor BuildPartition(const ScanBindData &data, const CatalogPartition 
 	return cursor;
 }
 
+//! What a chunk's reservation is held to (D17) when a vector of the table's widest declared rows would
+//! need more: its chunks close on the bytes actually staged (RecordStager::LimitBytes), so a
+//! varchar(8000) holding a few bytes still fills a vector, and the reservation stays this size.
+constexpr uint64_t CHUNK_RESERVATION_BYTES = 8ull << 20;
+
+// What the scan's own virtual values hold a row, for the reservation: a page key (a std::string, 14
+// characters in place), a rid (its std::string with a key of 1,700 bytes at most, a shape byte and a
+// uniquifier), an LSN. Their vectors' string heaps, like the table columns', are DuckDB's own
+// allocations, which it accounts itself.
+uint64_t VirtualRowBytes(const ScanGlobalState &global) {
+	uint64_t bytes = 0;
+	if (global.page_output != DConstants::INVALID_INDEX) {
+		bytes += sizeof(std::string);
+	}
+	if (global.rid_output != DConstants::INVALID_INDEX) {
+		bytes += sizeof(std::string) + 1 + 1700 + 4;
+	}
+	if (global.lsn_output != DConstants::INVALID_INDEX) {
+		bytes += sizeof(hugeint_t);
+	}
+	return bytes;
+}
+
 unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionInitInput &input) {
 	const auto &data = input.bind_data->Cast<ScanBindData>();
 	auto state = make_uniq<ScanGlobalState>();
@@ -410,6 +483,38 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 		threads = std::min(threads, units);
 	}
 	state->max_threads = std::max<idx_t>(1, threads);
+	// D17: the call's max_memory, DuckDB's memory_limit at most; half of it for the reservations.
+	auto &buffers = BufferManager::GetBufferManager(context);
+	const idx_t limit = buffers.GetMaxMemory();
+	state->max_memory = data.max_memory == 0 ? limit : std::min(limit, data.max_memory);
+	// A chunk's reservation (§ Resources, decode staging): what the stager holds -- its fixed part, and
+	// twice a row's variable values (buffers grow by doubling) -- and the virtual values, for a vector of
+	// the widest rows, or CHUNK_RESERVATION_BYTES with the chunk closing on what it staged; never past
+	// the budget unless one row is (then refused by name at the first chunk).
+	RecordStager probe(*data.entry, state->staged);
+	const uint64_t fixed = probe.FixedStagingBytes();
+	const uint64_t virtual_row = VirtualRowBytes(*state);
+	const uint64_t row = 2 * probe.VarRowBytes() + virtual_row;
+	const uint64_t budget = state->max_memory / 2;
+	const uint64_t vector = fixed + STANDARD_VECTOR_SIZE * row;
+	uint64_t chunk = std::min(vector, std::max(CHUNK_RESERVATION_BYTES, fixed + row));
+	chunk = std::min(chunk, std::max(budget, fixed + row));
+	state->chunk_bytes = chunk;
+	state->chunk_allowance = chunk < vector ? chunk - fixed : 0;
+	state->virtual_row = virtual_row;
+	BufferManager *manager = &buffers;
+	state->gate = make_uniq<ReservationGate>(
+		budget,
+		[manager](uint64_t bytes, std::string &why) {
+			try {
+				manager->ReserveMemory(bytes);
+				return true;
+			} catch (OutOfMemoryException &e) {
+				why = e.what();
+				return false;
+			}
+		},
+		[manager](uint64_t bytes) { manager->FreeReservedMemory(bytes); });
 	return std::move(state);
 }
 
@@ -419,6 +524,7 @@ unique_ptr<LocalTableFunctionState> InitLocal(ExecutionContext &, TableFunctionI
 	const auto &global = global_state->Cast<ScanGlobalState>();
 	auto local = make_uniq<ScanLocalState>();
 	local->stager = make_uniq<RecordStager>(*data.entry, global.staged);
+	local->stager->LimitBytes(global.chunk_allowance, global.virtual_row);
 	return std::move(local);
 }
 
@@ -663,6 +769,16 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 	auto &global = input.global_state->Cast<ScanGlobalState>();
 	auto &local = input.local_state->Cast<ScanLocalState>();
 	try {
+		// A unit first: the call that finds none left returns no rows and reserves nothing.
+		if (!local.have_unit && !ClaimUnit(data, global, local)) {
+			output.SetChildCardinality(0);
+			return;
+		}
+		// The chunk's decoding reserved for this call only: a task between calls holds no reservation,
+		// so one blocked in DuckDB's pipeline (an order-keeping sink waiting for an earlier batch) never
+		// keeps one the task reading that batch waits for. What it keeps unaccounted between calls is
+		// its staging's capacity, at most about its reservation (buffers keep capacity across chunks).
+		HeldReservation held(*global.gate, global.chunk_bytes, [&context]() { return context.IsInterrupted(); });
 		std::vector<Vector *> targets;
 		for (idx_t c : global.stager_outputs) {
 			targets.push_back(&output.data[c]);
@@ -723,6 +839,25 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		output.SetChildCardinality(count);
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", FUNCTION, e.what());
+	} catch (ReservationInterrupted &) {
+		throw InterruptException();
+	} catch (ReservationRefused &e) {
+		auto &buffers = BufferManager::GetBufferManager(context);
+		const std::string temp =
+			buffers.HasTemporaryDirectory() ? "'" + buffers.GetTemporaryDirectory() + "'" : "none (nothing spills)";
+		const std::string need = StringUtil::BytesToHumanReadableString(global.chunk_bytes);
+		const std::string max = StringUtil::BytesToHumanReadableString(global.max_memory);
+		if (e.past_budget) {
+			throw InvalidInputException(
+				"%s: %s.%s: decoding a chunk needs up to %s, past the scan's half (%s) of "
+				"max_memory %s; raise max_memory or memory_limit (temp_directory %s)",
+				FUNCTION, data.schema, data.table, need, StringUtil::BytesToHumanReadableString(global.gate->Budget()),
+				max, temp);
+		}
+		throw OutOfMemoryException(
+			"%s: %s.%s: decoding a chunk needs up to %s and DuckDB cannot make room for it "
+			"with nothing else of the scan held (max_memory %s, temp_directory %s): %s",
+			FUNCTION, data.schema, data.table, need, max, temp, e.duckdb_reason);
 	}
 }
 
@@ -735,6 +870,8 @@ void RegisterBackupScanFunction(ExtensionLoader &loader) {
 		TableFunction f(FUNCTION, {path, LogicalType::VARCHAR, LogicalType::VARCHAR}, Execute, Bind, Init, InitLocal);
 		// NULL (the default): DuckDB's threads.
 		f.GetSignature().AddKeywordOnly("max_threads", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+		// NULL (the default): DuckDB's memory_limit. A size as memory_limit takes it ('2GB').
+		f.GetSignature().AddKeywordOnly("max_memory", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 		f.projection_pushdown = true;
 		f.get_partition_data = PartitionData;
 		f.table_scan_progress = Progress;
@@ -750,7 +887,9 @@ void RegisterBackupScanFunction(ExtensionLoader &loader) {
 		 "Reads a user table's rows from a SQL Server full backup, with no SQL Server, typed as TYPE mssql reads "
 		 "them; a type whose conversion is still to come is its stored bytes. Virtual columns: _mssql_page (the "
 		 "row's page), _mssql_rid (its identity: a heap row's original place, a clustered row's key) and "
-		 "_mssql_page_lsn (the page's last change). Parallel on DuckDB's threads; max_threads := n uses fewer.",
+		 "_mssql_page_lsn (the page's last change). Parallel on DuckDB's threads; max_threads := n uses fewer, "
+		 "max_memory := '2GB' bounds what it "
+		 "reserves for decoding.",
 		 {"SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'dbo', 'orders')",
 		  "SELECT count(*) FROM mssql_backup_scan('/backups/sales_full.bak', 'dbo', 'orders', max_threads := 2)",
 		  "SELECT _mssql_page, _mssql_rid, id FROM mssql_backup_scan('/backups/sales_full.bak', 'dbo', 'orders')"},

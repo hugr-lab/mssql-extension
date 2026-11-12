@@ -179,8 +179,10 @@ stored value), a sparse column, and for now a `text` / `ntext` / `image` one -- 
 `SELECT *`; a query that names it is refused, with the reason (`mssql_backup_tables.columns`).
 
 The scan runs on DuckDB's threads (`threads`); `max_threads := n` uses fewer for one call (a value
-above `threads` is clamped to it, with a warning in `duckdb_logs`). Rows come in page order, which
-DuckDB keeps where insertion order is preserved.
+above `threads` is clamped to it, with a warning in `duckdb_logs`). `max_memory := '2GB'` bounds
+the memory one call reserves for decoding to half of it (default `memory_limit`, which it cannot
+exceed): tasks wait for each other's memory, and a table whose rows cannot be decoded within it is
+refused by name. Rows come in page order, which DuckDB keeps where insertion order is preserved.
 
 ```sql
 SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');
