@@ -481,7 +481,11 @@ Common named parameters of every function, and ATTACH options of the same names:
 `shape` (`heap` / `clustered` / `columnstore`), `compression` (from `sysrowsets.cmprlevel`; `mixed`
 when partitions differ, E7: `cmprlevel` is per partition), `partition_count`, `row_count` (sum of
 `sysrowsets.rcrows`, exact in every rowset of E7's 16 states; NULL when one is negative or the sum passes
-int64 -- a statistic, so the table is read all the same), `created`, `modified`, `decodable`,
+int64 -- a statistic, so the table is read all the same. A clustered columnstore's sum includes the delta
+stores left as tombstones until the tuple mover drops them: SQL Server 2022's `sys.partitions` counts them
+too, 2025's does not (measured on the lane's partition fixture after `REORGANIZE ... COMPRESS_ALL_ROW_GROUPS`,
+#551), and sysrowsets cannot tell a tombstone delta store from an open one -- spec 088, which reads the
+rowgroup metadata, makes it exact; until then compare_catalog does not compare a columnstore's counts), `created`, `modified`, `decodable`,
 `reason`, `fuzzy_status`, `open_transactions`, `stale_transactions`, and three nested values:
 
 - `columns LIST(STRUCT(column_id, name, sql_type, system_type_id, max_length, precision, scale,

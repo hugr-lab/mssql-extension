@@ -56,6 +56,10 @@ class Comparison:
     def __init__(self):
         self.fields = 0
         self.differences = []
+        self.skipped = []
+
+    def skip(self, what):
+        self.skipped.append(what)
 
     def check(self, where, field, ours, theirs):
         self.fields += 1
@@ -206,13 +210,16 @@ def compare_partitioning(c, db, name, arg, texts):
 
     ours = keyed(db.query(
         "SELECT schema_name, table_name, p.partition_number::VARCHAR AS partition_number, p.filegroup, "
-        "p.rows::VARCHAR AS rows, upper(p.compression) AS compression FROM "
-        f"(SELECT schema_name, table_name, unnest(partitions) AS p FROM mssql_backup_tables({arg}))"),
+        "p.rows::VARCHAR AS rows, upper(p.compression) AS compression, shape FROM "
+        f"(SELECT schema_name, table_name, shape, unnest(partitions) AS p FROM mssql_backup_tables({arg}))"),
         "schema_name", "table_name", "partition_number")
     theirs = keyed(parse_golden(texts[f"{name}.partitions.txt"]), "schema_name", "table_name", "partition_number")
     compare_keys(c, f"{name}: partitions", ours, theirs)
     for k in sorted(set(ours) & set(theirs)):
         for field in ("filegroup", "rows", "compression"):
+            if field == "rows" and ours[k]["shape"] == "columnstore":
+                c.skip(f"{name}: {'.'.join(k)} rows (a clustered columnstore: tombstone delta stores, spec 088)")
+                continue
             c.check(f"{name}: {'.'.join(k)}", field, ours[k][field], theirs[k][field])
 
 
@@ -236,6 +243,12 @@ def compare_set(c, db, name, arg, texts):
         o, t = ours[k], theirs[k]
         where = f"{name}: {'.'.join(k)}"
         for field in ("object_id", "shape", "partition_count", "row_count"):
+            # A clustered columnstore's count includes the delta stores the tuple mover has not dropped yet
+            # (tombstones): SQL Server 2022's sys.partitions counts them too, 2025's does not, and only the
+            # rowgroup metadata (spec 088) tells them apart -- not compared until then (owner, #551).
+            if field == "row_count" and o["shape"] == "columnstore":
+                c.skip(f"{where} row_count (a clustered columnstore: tombstone delta stores, spec 088)")
+                continue
             c.check(where, field, o[field], t[field])
         for field in ("created", "modified"):
             c.check(where, field, millis(o[field]), t[field])
@@ -346,6 +359,9 @@ def main():
 
     for d in c.differences:
         print(d)
+    if c.skipped:
+        print(f"compare_catalog: {len(c.skipped)} fields not compared, by rule: " + "; ".join(sorted(set(
+            s.split(":", 1)[1].strip() for s in c.skipped))))
     print(f"compare_catalog: {compared} backup sets, {c.fields} fields compared, "
           f"{len(c.differences)} differences ({base})")
     if c.differences:
