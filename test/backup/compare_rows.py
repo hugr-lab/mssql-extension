@@ -82,6 +82,14 @@ def main():
             continue
         columns = json.loads(t["columns"]) if isinstance(t["columns"], str) else t["columns"]
         cols = [c["name"] for c in columns if c["decodable"] and c["reason"] is None]
+        # A column the scan cannot read is left out of SELECT * and refuses a query that names it, by
+        # name (owner, review of #552): checked on the first such column of each table.
+        unread = [c["name"] for c in columns if not c["decodable"]]
+        if unread:
+            scan_of = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)})"
+            ok, result = session.query(f"SELECT {ident(unread[0])} FROM {scan_of} LIMIT 1")
+            if ok or "is not read" not in str(result):
+                failures.append(f"{where}: naming {unread[0]}, which is not read, was not refused by name")
         left_out = {c["name"]: c["reason"] for c in columns if not (c["decodable"] and c["reason"] is None)}
         while True:
             if not cols:

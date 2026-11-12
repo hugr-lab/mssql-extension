@@ -1443,9 +1443,11 @@ flowchart BT
 - **A compressed container is walked from known blocks** (DQ-41): its chain is located from the
   tail record at EOF−12304, which names the seek index, so the chain starts with checkpoints at
   block 0 and at the seek index's entries only. A read walks block headers from the nearest
-  checkpoint before it and adds a checkpoint every 64 blocks and 1 MiB as it goes, so the chain is
-  walked once, piece by piece, as it is read; opening reads the header, the tail and the blocks it
-  decodes. A tail of another layout makes the open walk the chain whole (`WalkChain`). A resync
+  checkpoint before it, or from the nearest of the last 64 blocks it located past that checkpoint
+  (`ContainerStream`; in a well-compressed container a checkpoint's span holds ~1600 blocks), and
+  adds a checkpoint every 64 blocks and 1 MiB as it goes, so the chain is walked once, piece by
+  piece, as it is read; opening reads the header, the tail and the blocks it decodes. The stream
+  keeps its last decoded blocks, so a page read after the search that found it decodes nothing again. A tail of another layout makes the open walk the chain whole (`WalkChain`). A resync
   from an arbitrary offset is never the default: row data can forge a block chain (spec 085
   § Security; `trust_layout` is the opt-in, for the scan).
 - **The media set is checked whole** (`OpenBackupHeaders`): one backup set per file (an appended
@@ -1491,7 +1493,9 @@ flowchart BT
   through spec 091's kernels on the client --; one whose conversion is still to come (`sql_variant`,
   `xml`, the CLR types, `vector`, `json`, a type the reader does not know) is its stored bytes, a `BLOB`.
   Not readable, named: a computed column not persisted (no stored value), a sparse column (the sparse
-  vector, 086). `mssql_backup_tables.columns` and the scan take this one answer.
+  vector, 086), and until PR 3 a text / ntext / image column (its in-row bytes are a pointer). The scan
+  registers these as virtual columns, so `SELECT *` leaves them out and naming one is refused with its
+  reason. `mssql_backup_tables.columns` and the scan take this one answer.
 - **Rows** (PR 2d). A record (`RecordView`, allocation-free) is split by its header alone; types 2-7
   (stubs, index and LOB records, ghosts, version ghosts) are not rows, a forwarded record's last
   variable column is its back pointer, a version tag (statusA 0x40) trails the record unread.
@@ -1499,8 +1503,7 @@ flowchart BT
   records); `RecordStager` appends it into the codec's staging -- as it is for every type but
   datetime, smalldatetime, money (halves swapped) and bit (its bit of a shared byte) -- and publishes a
   chunk through the TDS path's family kernels, so a value decodes as `TYPE mssql` decodes it. A value
-  stored off row is refused by name until PR 3 (a text / ntext / image value always: its in-row bytes
-  are a pointer). `mssql_backup_scan` walks each partition's in-row IAM chain page by page on one
+  stored off row is refused by name until PR 3. `mssql_backup_scan` walks each partition's in-row IAM chain page by page on one
   thread (PR 2e makes units parallel) and adds the virtual `_mssql_page`, `_mssql_rid` (a heap row's
   original place = its `%%physloc%%`; a clustered row's key and uniquifier) and `_mssql_page_lsn`.
 - **Prepared statements** keep the row their bind read (`SupportStatementCache`); `reread := true`

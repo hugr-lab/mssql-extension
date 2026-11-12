@@ -231,12 +231,41 @@ uint16_t PhysicalColumn::FixedLength(const std::string &table) const {
 	case XTYPE_CHAR:
 	case XTYPE_NCHAR:
 		return length;
+	case XTYPE_VARBINARY:
+	case XTYPE_VARCHAR:
+	case XTYPE_NVARCHAR:
+	case XTYPE_IMAGE:
+	case XTYPE_TEXT:
+	case XTYPE_NTEXT:
+	case XTYPE_SQL_VARIANT:
+	case XTYPE_XML:
+		// A variable type is never at a fixed offset: named, not read as `length` bytes of the fixed part
+		// (the system tables' decoder takes the width from here too; review of #552).
+		throw FormatError("backup: " + table + "." + name + " is a " + XtypeName(xtype) +
+						  ", a variable type, at a fixed offset");
 	default:
 		if (length > 0) {
 			return length;	// a type the reader does not know: its bytes, as wide as sysrscols says
 		}
 		throw FormatError("backup: " + table + "." + name + " is a fixed column of " + XtypeName(xtype) +
 						  ", a type the record decoder does not know, with no length given");
+	}
+}
+
+bool KnownVariableXtype(uint8_t xtype) {
+	switch (xtype) {
+	case XTYPE_VARBINARY:
+	case XTYPE_VARCHAR:
+	case XTYPE_NVARCHAR:
+	case XTYPE_TEXT:
+	case XTYPE_NTEXT:
+	case XTYPE_IMAGE:
+	case XTYPE_SQL_VARIANT:
+	case XTYPE_XML:
+	case XTYPE_CLR:
+		return true;
+	default:
+		return false;
 	}
 }
 

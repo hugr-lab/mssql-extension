@@ -700,9 +700,9 @@ int main() {
 		Check(chunk.GetValue(0, 2).ToString() == "x", "932: a lead byte alone at the end reads as nothing");
 	}
 
-	// text / ntext / image: never refused for their type, but their in-row bytes are a text pointer, so
-	// a non-NULL value is the off-row error until PR 3 -- complex bit or not. And types still to be
-	// converted, read as their bytes: an unknown fixed-width type at its offset, an xml of max length.
+	// text / ntext / image are not read until PR 3 (their in-row bytes are a text pointer): the stager
+	// refuses them by name, and the scan leaves them out of SELECT * (owner, review of #552). Types still
+	// to be converted are read as their bytes: an unknown fixed-width type at its offset, an xml.
 	{
 		const auto *latin = mssql::codec::code_page::FindCollationByName("Latin1_General_CI_AS", 20);
 		CatalogTable t;
@@ -717,29 +717,38 @@ int main() {
 						  Phys(4, XTYPE_XML, -3, 4)};
 		const std::vector<uint8_t> odd = {1, 2, 3, 4, 5, 6};
 		const std::vector<uint8_t> pointer(16, 0x11), doc = {0xdf, 0xff, 0x01, 0xb0, 0x04};
-		// Row 0: the text columns NULL; row 1: a 16-byte pointer in `notes`, not flagged complex.
-		const Page page = PageOf({Record(odd, 4, 0x06, {{}, {}, doc}), Record(odd, 4, 0x04, {pointer, {}, doc})});
-		RecordStager stager(t, {1, 2, 3, 4});
+		const Page page = PageOf({Record(odd, 4, 0x04, {pointer, {}, doc})});
+		const ColumnReading notes = ReadingOf(t.columns[1]), nnotes = ReadingOf(t.columns[2]);
+		Check(!notes.readable && !nnotes.readable && notes.type.id() == LogicalTypeId::VARCHAR &&
+				  notes.note.find("PR 3") != std::string::npos && ErrorOf([&]() {
+																	  RecordStager refused(t, {1, 2});
+																  }).find("dbo.legacy.notes") != std::string::npos,
+			  "text and ntext are not readable until PR 3 (typed VARCHAR all the same), and refused by name");
+		RecordStager stager(t, {1, 4});
 		stager.UseLayout(layout);
-		Check(stager.Types()[0].id() == LogicalTypeId::BLOB && stager.Types()[1].id() == LogicalTypeId::VARCHAR &&
-				  stager.Types()[2].id() == LogicalTypeId::VARCHAR && stager.Types()[3].id() == LogicalTypeId::BLOB,
-			  "an unknown type and xml as BLOB; text and ntext as VARCHAR, not refused");
+		Check(stager.Types()[0].id() == LogicalTypeId::BLOB && stager.Types()[1].id() == LogicalTypeId::BLOB,
+			  "an unknown type and xml as BLOB");
 		DataChunk chunk;
 		chunk.Initialize(Allocator::DefaultAllocator(), stager.Types());
 		stager.BeginChunk(chunk);
-		stager.Append(ReadSlot(page.bytes.data(), PAGE_SIZE, 2, 0, "the test"));
+		stager.Append(ReadSlot(page.bytes.data(), PAGE_SIZE, 1, 0, "the test"));
 		stager.FinalizeChunk(chunk);
-		Check(chunk.GetValue(0, 0).ToString() == "\\x01\\x02\\x03\\x04\\x05\\x06" && chunk.GetValue(1, 0).IsNull() &&
-				  chunk.GetValue(2, 0).IsNull() && StringValue::Get(chunk.GetValue(3, 0)).size() == 5,
-			  "an unknown fixed type's 6 bytes at its offset, NULL text and ntext, xml's stored bytes");
-		stager.BeginChunk(chunk);
-		Check(ErrorOf([&]() {
-				  stager.Append(ReadSlot(page.bytes.data(), PAGE_SIZE, 2, 1, "the test"));
-			  }).find("dbo.legacy.notes holds a value stored off row") != std::string::npos,
-			  "a text value is its pointer: the off-row error until PR 3, though not flagged complex");
+		Check(chunk.GetValue(0, 0).ToString() == "\\x01\\x02\\x03\\x04\\x05\\x06" &&
+				  StringValue::Get(chunk.GetValue(1, 0)).size() == 5,
+			  "an unknown fixed type's 6 bytes at its offset, xml's stored bytes, the text columns left out");
 		Check(ReadingOf(t.columns[0]).note.find("does not know") != std::string::npos &&
 				  SqlTypeText("", "int", XTYPE_INT, 4, 10, 0) == "int",
 			  "an unknown type says so; a type with no row of its own is named by its system type");
+		// The stager's own order: an Append before a BeginChunk, and vectors of another type, are refused.
+		RecordStager unbegun(t, {1});
+		unbegun.UseLayout(layout);
+		DataChunk wrong;
+		wrong.Initialize(Allocator::DefaultAllocator(), {LogicalType::INTEGER});
+		Check(ErrorOf([&]() {
+				  unbegun.Append(ReadSlot(page.bytes.data(), PAGE_SIZE, 1, 0, "the test"));
+			  }).find("not begun") != std::string::npos &&
+				  ErrorOf([&]() { unbegun.BeginChunk(wrong); }).find("vector is INTEGER") != std::string::npos,
+			  "an Append with no BeginChunk, and a vector of another type, are refused");
 	}
 
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;

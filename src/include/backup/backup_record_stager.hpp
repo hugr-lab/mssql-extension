@@ -91,7 +91,6 @@ private:
 		size_t layout_index = 0;  // in the current layout
 		uint8_t bit_position = 0;
 		uint8_t budget_weight = 0;	// how many times its staged bytes count toward Full(): 0, 1, 2
-		bool text_pointer = false;	// text / ntext / image: its in-row bytes are a pointer (PR 3)
 	};
 
 	void AppendValue(Column &c, codec::staging::ColumnStaging &st, const ValueRef &v);
@@ -106,6 +105,8 @@ private:
 	idx_t payload_bytes_ = 0;
 	//! An Append threw after staging part of a row; cleared by BeginChunk.
 	bool spoiled_ = false;
+	//! BeginChunk ran and FinalizeChunk has not: Append and FinalizeChunk need it.
+	bool begun_ = false;
 };
 
 }  // namespace backup

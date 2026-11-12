@@ -427,8 +427,11 @@ ChainBlock ContainerStream::Locate(uint64_t logical) const {
 			Located found;
 			found.block = block;
 			found.since = since;
-			if (block.physical == start.physical && start.physical != last_checkpoint_start.physical) {
-				return block;  // a recent block, found again without a step: it is in the ring already
+			// Not recorded: a recent block found again without a step (it is in the ring already), and
+			// the span's checkpoint itself (a walk starts there anyway; the ring keeps only blocks past
+			// one, review of #552).
+			if (block.physical == start.physical) {
+				return block;
 			}
 			if (located_.size() < RECENT_LOCATED) {
 				located_.push_back(found);

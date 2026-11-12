@@ -249,6 +249,11 @@ bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &default
 		}
 		auto column = by_id.find(physical.rscolid);
 		if (column == by_id.end()) {
+			if (physical.ordkey > 0) {
+				// The scan builds _mssql_rid from the key columns: one unchecked here would fail on every row.
+				why = "key column " + std::to_string(physical.rscolid) + " has no column";
+				return false;
+			}
 			continue;  // named below when it matters (an added column), as before
 		}
 		const CatalogColumn &c = *column->second;
@@ -263,17 +268,28 @@ bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &default
 			return false;
 		}
 		// A fixed type stored as a variable column is the vardecimal storage format (or a layout the
-		// reader does not know); a variable type at a fixed offset is not one either. A type the reader
-		// does not know is not checked: it is read as its bytes wherever it is stored (ReadingOf).
-		const bool fixed_type = KnownFixedXtype(physical.xtype);
-		const bool variable_type =
-			physical.xtype == XTYPE_VARCHAR || physical.xtype == XTYPE_NVARCHAR || physical.xtype == XTYPE_VARBINARY ||
-			physical.xtype == XTYPE_SQL_VARIANT || physical.xtype == XTYPE_CLR || physical.xtype == XTYPE_XML ||
-			physical.xtype == XTYPE_IMAGE || physical.xtype == XTYPE_TEXT || physical.xtype == XTYPE_NTEXT;
+		// reader does not know); a variable type at a fixed offset is not one either. Two are both: char /
+		// nchar / binary NULL under ANSI_PADDING OFF are stored variable (and read so: their bytes,
+		// unpadded), and a CLR type of fixed length is stored fixed (its bytes). A type the reader does
+		// not know is not checked: it is read as its bytes wherever it is stored (ReadingOf).
+		const bool padded =
+			physical.xtype == XTYPE_CHAR || physical.xtype == XTYPE_NCHAR || physical.xtype == XTYPE_BINARY;
+		const bool fixed_type = KnownFixedXtype(physical.xtype) && !padded;
+		const bool variable_type = physical.xtype == XTYPE_VARCHAR || physical.xtype == XTYPE_NVARCHAR ||
+								   physical.xtype == XTYPE_VARBINARY || physical.xtype == XTYPE_SQL_VARIANT ||
+								   physical.xtype == XTYPE_XML || physical.xtype == XTYPE_IMAGE ||
+								   physical.xtype == XTYPE_TEXT || physical.xtype == XTYPE_NTEXT;
 		if ((fixed_type && physical.offset < 0) || (variable_type && physical.offset > 0)) {
 			why = "column " + c.name + " (xtype " + std::to_string(physical.xtype) + ") is stored as a " +
 				  (physical.offset < 0 ? "variable" : "fixed") +
 				  " column, which its type is not (the vardecimal storage format is not read)";
+			return false;
+		}
+		// A fixed char / nchar / binary is as wide as its declaration: a sysrscols width that disagrees
+		// with syscolpars' would read the neighbouring columns as its value (review of #552).
+		if (padded && physical.offset > 0 && physical.length != c.max_length) {
+			why = "column " + c.name + " is stored as " + std::to_string(physical.length) + " bytes, declared " +
+				  std::to_string(c.max_length);
 			return false;
 		}
 		if (physical.offset > 0) {

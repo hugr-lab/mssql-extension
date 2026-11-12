@@ -64,6 +64,35 @@ CREATE TABLE dbo.notnull (a int NOT NULL, b bigint NOT NULL);
 INSERT INTO dbo.notnull VALUES (1, 2), (3, 4);
 CREATE TABLE dbo.bits (b1 bit NULL, b2 bit NOT NULL, i int NULL, b3 bit NULL, b4 bit NULL, b5 bit NULL, b6 bit NULL, b7 bit NULL, b8 bit NULL, b9 bit NULL);
 INSERT INTO dbo.bits VALUES (1, 0, 5, 1, 0, 1, 0, 1, 0, 1), (NULL, 1, NULL, 0, 1, 0, 1, 0, 1, 0);
+-- 8. A column dropped and others added after rows were written, and one widened: the catalog column ids
+-- and the rowset's physical columns (sysrscols' rscolid / hbcolid) diverge, and each column must still
+-- read its own bytes (review of #552). Then a clustered table with the same history.
+CREATE TABLE dbo.dropadd (a int NOT NULL, b int NULL, c varchar(10) NULL, w char(4) NULL);
+INSERT INTO dbo.dropadd VALUES (1, 10, 'c1', 'w1'), (2, 20, 'c2', 'w2'), (3, NULL, NULL, NULL);
+ALTER TABLE dbo.dropadd DROP COLUMN b;
+ALTER TABLE dbo.dropadd ADD d int NULL;
+ALTER TABLE dbo.dropadd ADD e int NOT NULL CONSTRAINT df_dropadd_e DEFAULT 5;
+ALTER TABLE dbo.dropadd ALTER COLUMN w char(8) NULL;
+-- Added after the widening, so its physical id (hbcolid) is past its column id (rscolid): which one
+-- sysseobjvalues keys its default by is what this row tells.
+ALTER TABLE dbo.dropadd ADD f int NOT NULL CONSTRAINT df_dropadd_f DEFAULT 9;
+INSERT INTO dbo.dropadd (a, c, w, d, e, f) VALUES (4, 'c4', 'w4', 40, 41, 42);
+UPDATE dbo.dropadd SET d = 30 WHERE a = 3;
+CREATE TABLE dbo.dropadd_cl (a int NOT NULL PRIMARY KEY, b int NULL, c varchar(10) NULL);
+INSERT INTO dbo.dropadd_cl VALUES (1, 10, 'c1'), (2, 20, 'c2');
+ALTER TABLE dbo.dropadd_cl DROP COLUMN b;
+ALTER TABLE dbo.dropadd_cl ADD d int NULL;
+INSERT INTO dbo.dropadd_cl (a, c, d) VALUES (3, 'c3', 30);
+-- A fixed char narrowed after rows were written: does its physical width follow the declaration?
+CREATE TABLE dbo.narrowed (id int NOT NULL, s char(8) NULL, t int NULL);
+INSERT INTO dbo.narrowed VALUES (1, 'ab', 10), (2, 'cdef', 20), (3, NULL, 30);
+ALTER TABLE dbo.narrowed ALTER COLUMN s char(4) NULL;
+INSERT INTO dbo.narrowed VALUES (4, 'gh', 40);
+-- 9. A partitioned table with a non-unique clustered index on another column than the partitioning one:
+-- rows of one key in two partitions, each partition numbering its uniquifiers apart (review of #552).
+CREATE TABLE dbo.part_nu (k int NOT NULL, v int NOT NULL, x varchar(10) NULL) ON ps_rows (k);
+CREATE CLUSTERED INDEX cx_part_nu ON dbo.part_nu (v) ON ps_rows (k);
+INSERT INTO dbo.part_nu VALUES (5, 7, 'a'), (150, 7, 'b'), (250, 7, 'c'), (6, 7, 'd'), (151, 7, 'e');
 GO
 CHECKPOINT;
 GO

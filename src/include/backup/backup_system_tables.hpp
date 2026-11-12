@@ -114,6 +114,9 @@ struct PhysicalColumn {
 
 //! `xtype` is a fixed-width type the reader knows (FixedLength computes its width from the type).
 bool KnownFixedXtype(uint8_t xtype);
+//! The variable storage types the record decoder reads (varbinary, varchar, nvarchar, text, ntext,
+//! image, sql_variant, xml, a CLR type's 240).
+bool KnownVariableXtype(uint8_t xtype);
 
 //! The column's fields sysrscols.ti carries: the xtype in its low byte, then the length, or a decimal's
 //! precision and scale, or a time type's scale (E20: 0x0412 is decimal(18, 4), 0x07 datetime2(7)).

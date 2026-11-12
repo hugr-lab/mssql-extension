@@ -178,11 +178,6 @@ RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t>
 			throw InvalidInputException("backup: %s (%s) is staged by the codec in a form this reader does not fill",
 										col.name, c.system_type_name);
 		}
-		// A text / ntext / image column holds a 16-byte text pointer in row, never its value (spec 085 §
-		// Rules, LOBs): a value is read through the pointer from PR 3 on, so until then a non-NULL one is
-		// the off-row error, whatever its complex bit says.
-		col.text_pointer =
-			c.system_type_id == XTYPE_TEXT || c.system_type_id == XTYPE_NTEXT || c.system_type_id == XTYPE_IMAGE;
 		// The live path's budget (RowStager::Configure): its MAX columns, a code-page one twice.
 		if (col.ops.arm >= AppendArm::PlpStageString && col.ops.arm <= AppendArm::LobStageBinary) {
 			col.budget_weight = col.ops.kernel == FinalizeKernel::CodePage ? 2 : 1;
@@ -234,6 +229,10 @@ void RecordStager::UseLayout(const RowsetLayout &layout) {
 }
 
 void RecordStager::BeginChunk(DataChunk &out) {
+	if (out.ColumnCount() != columns_.size()) {
+		throw InternalException("backup: RecordStager::BeginChunk with a chunk of %d columns for %d",
+								static_cast<int>(out.ColumnCount()), static_cast<int>(columns_.size()));
+	}
 	std::vector<Vector *> targets;
 	for (size_t i = 0; i < columns_.size(); i++) {
 		targets.push_back(&out.data[i]);
@@ -246,6 +245,14 @@ void RecordStager::BeginChunk(const std::vector<Vector *> &targets) {
 		throw InternalException("backup: RecordStager::BeginChunk with %d vectors for %d columns",
 								static_cast<int>(targets.size()), static_cast<int>(columns_.size()));
 	}
+	// The kernels and the direct writes resolved against Types(): a vector of another type (a plan whose
+	// types are not this stager's) would be written at another width -- refused before any write.
+	for (size_t i = 0; i < columns_.size(); i++) {
+		if (targets[i]->GetType() != types_[i]) {
+			throw InternalException("backup: RecordStager::BeginChunk: %s's vector is %s, the stager's type %s",
+									columns_[i].name, targets[i]->GetType().ToString(), types_[i].ToString());
+		}
+	}
 	targets_ = targets;
 	for (size_t i = 0; i < columns_.size(); i++) {
 		uint8_t *direct = columns_[i].ops.direct_write
@@ -256,6 +263,7 @@ void RecordStager::BeginChunk(const std::vector<Vector *> &targets) {
 	count_ = 0;
 	payload_bytes_ = 0;
 	spoiled_ = false;
+	begun_ = true;
 }
 
 void RecordStager::AppendValue(Column &c, ColumnStaging &st, const ValueRef &v) {
@@ -308,8 +316,9 @@ void RecordStager::AppendValue(Column &c, ColumnStaging &st, const ValueRef &v) 
 }
 
 void RecordStager::Append(const RecordView &record) {
-	if (spoiled_ || !layout_ || count_ == STANDARD_VECTOR_SIZE) {
-		throw InternalException("backup: RecordStager::Append on a chunk that is %s", spoiled_	 ? "spoiled by an error"
+	if (!begun_ || spoiled_ || !layout_ || count_ == STANDARD_VECTOR_SIZE) {
+		throw InternalException("backup: RecordStager::Append on a chunk that is %s", !begun_	 ? "not begun"
+																					  : spoiled_ ? "spoiled by an error"
 																					  : !layout_ ? "of no layout"
 																								 : "full");
 	}
@@ -325,11 +334,8 @@ void RecordStager::Append(const RecordView &record) {
 			st.AppendNull();
 			break;
 		case ValueState::Inline:
-			if (!c.text_pointer) {
-				AppendValue(c, st, v);
-				break;
-			}
-			DUCKDB_EXPLICIT_FALLTHROUGH;
+			AppendValue(c, st, v);
+			break;
 		case ValueState::OffRow:
 			throw FormatError("backup: " + c.name +
 							  " holds a value stored off row (row-overflow or a LOB), which the reader reads from spec "
@@ -349,9 +355,11 @@ void RecordStager::FinalizeChunk(DataChunk &out) {
 }
 
 void RecordStager::FinalizeChunk() {
-	if (spoiled_) {
-		throw InternalException("backup: RecordStager::FinalizeChunk on a chunk spoiled by an error");
+	if (!begun_ || spoiled_) {
+		throw InternalException("backup: RecordStager::FinalizeChunk on a chunk %s",
+								begun_ ? "spoiled by an error" : "not begun");
 	}
+	begun_ = false;
 	for (size_t i = 0; i < columns_.size(); i++) {
 		const ColumnStaging &st = arena_.Column(i);
 		codec::staging::FinalizeStagedColumn(columns_[i].ops.kernel, st, count_, columns_[i].meta, *targets_[i]);

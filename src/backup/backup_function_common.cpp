@@ -308,28 +308,14 @@ Value SqlVariantValue(const SqlVariant &v, const std::string &what) {
 	}
 }
 
-ColumnReading ReadingOf(const CatalogColumn &c) {
+namespace {
+
+// The type column `c` is read as, its readability aside: converted, or its stored bytes (`raw`).
+ColumnReading TypeReading(const CatalogColumn &c) {
 	ColumnReading r;
 	const std::string type = c.system_type_name.empty()
 								 ? (c.type_name.empty() ? "type " + std::to_string(c.user_type_id) : c.type_name)
 								 : c.system_type_name;
-	// What is not readable still says the type it is declared as.
-	auto not_readable = [&](const std::string &why) {
-		// The type a readable column of its type would be read as (a raw one's BLOB included).
-		CatalogColumn readable_form = c;
-		readable_form.is_computed = readable_form.is_persisted = false;
-		readable_form.is_sparse = readable_form.is_column_set = false;
-		r.type = ReadingOf(readable_form).type;
-		r.readable = false;
-		r.note = why;
-		return r;
-	};
-	if (c.is_computed && !c.is_persisted) {
-		return not_readable("a computed column that is not persisted has no stored value");
-	}
-	if (c.is_sparse || c.is_column_set) {
-		return not_readable("a sparse column's value is in the row's sparse vector, read from spec 086");
-	}
 	auto raw = [&](const std::string &why) {
 		r.raw = true;
 		r.type = LogicalType::BLOB;
@@ -352,11 +338,29 @@ ColumnReading ReadingOf(const CatalogColumn &c) {
 	if (c.system_type_name == "json" || c.system_type_name == "vector") {
 		return raw(type + " is converted later, with the TDS path's");
 	}
+	// Only a storage type the record decoder knows is converted: the kernels are keyed by the TDS id the
+	// xtype is passed as, and an xtype that is no storage type (a TDS-only id -- INTN, BITN, the legacy
+	// forms -- in a crafted catalog) would be decoded as a form its bytes are not. Any other is its bytes
+	// (review of #552).
+	if (!KnownFixedXtype(c.system_type_id) && !KnownVariableXtype(c.system_type_id)) {
+		return raw("xtype " + std::to_string(c.system_type_id) + " is not a storage type the reader decodes");
+	}
+	// A code-page text is converted through its collation's page: one the reader has no table for, or no
+	// collation at all, is its bytes -- never bytes of another page in a VARCHAR, which is UTF-8 (#224;
+	// review of #552).
 	const bool code_page_text =
 		c.system_type_id == XTYPE_VARCHAR || c.system_type_id == XTYPE_CHAR || c.system_type_id == XTYPE_TEXT;
-	if (code_page_text && c.collation_id != 0 && !CollationById(static_cast<int32_t>(c.collation_id))) {
-		return raw("its collation (CollationId " + std::to_string(c.collation_id) +
-				   ") is newer than the code-page tables");
+	if (code_page_text) {
+		const CollationRow *collation = c.collation_id ? CollationById(static_cast<int32_t>(c.collation_id)) : nullptr;
+		if (!collation) {
+			return raw(c.collation_id ? "its collation (CollationId " + std::to_string(c.collation_id) +
+											") is newer than the code-page tables"
+									  : std::string("it has no collation"));
+		}
+		if (collation->code_page != 65001 &&
+			!codec::code_page::FindCodePage(static_cast<int32_t>(collation->code_page))) {
+			return raw("its code page " + std::to_string(collation->code_page) + " has no table");
+		}
 	}
 	// The precision and scale are the file's: LogicalType::DECIMAL asserts what they must be (an
 	// assertion, not an exception), so a declaration no server writes is caught here. By the name too,
@@ -376,6 +380,28 @@ ColumnReading ReadingOf(const CatalogColumn &c) {
 		r.type = MSSQLColumnInfo::MapSQLServerTypeToDuckDB(c.system_type_name, c.max_length, c.precision, c.scale);
 	} catch (std::exception &e) {
 		return raw(type + " has no DuckDB type here (" + std::string(e.what()) + ")");
+	}
+	return r;
+}
+
+}  // namespace
+
+ColumnReading ReadingOf(const CatalogColumn &c) {
+	// What is not readable still says the type it is declared as (raw included).
+	ColumnReading r = TypeReading(c);
+	auto not_readable = [&](const std::string &why) {
+		r.readable = false;
+		r.note = why;
+		return r;
+	};
+	if (c.is_computed && !c.is_persisted) {
+		return not_readable("a computed column that is not persisted has no stored value");
+	}
+	if (c.is_sparse || c.is_column_set) {
+		return not_readable("a sparse column's value is in the row's sparse vector, read from spec 086");
+	}
+	if (c.system_type_id == XTYPE_TEXT || c.system_type_id == XTYPE_NTEXT || c.system_type_id == XTYPE_IMAGE) {
+		return not_readable("a text, ntext or image value is read from spec 085 PR 3 (the large values)");
 	}
 	return r;
 }

@@ -41,6 +41,17 @@ const char *const FUNCTION = "mssql_backup_scan";
 const column_t PAGE_COLUMN = VIRTUAL_COLUMN_START;
 const column_t RID_COLUMN = VIRTUAL_COLUMN_START + 1;
 const column_t PAGE_LSN_COLUMN = VIRTUAL_COLUMN_START + 2;
+//! The columns the scan cannot read (no stored value, a sparse one, text / ntext / image until PR 3) are
+//! virtual from here on: `SELECT *` leaves them out, and naming one refuses the query by name, with
+//! its reason (owner, review of #552).
+const column_t UNREAD_COLUMN_START = VIRTUAL_COLUMN_START + 16;
+
+//! A column the scan does not read: its name, the type it would have, why.
+struct UnreadColumn {
+	std::string name;
+	LogicalType type;
+	std::string reason;
+};
 
 struct ScanBindData : public TableFunctionData {
 	vector<std::string> paths;
@@ -50,6 +61,8 @@ struct ScanBindData : public TableFunctionData {
 	const CatalogTable *entry = nullptr;  // in catalog->model
 	std::vector<int32_t> column_ids;	  // the scan's columns: catalog column ids, in output order
 	vector<LogicalType> types;
+	vector<std::string> names;		   // of column_ids
+	std::vector<UnreadColumn> unread;  // UNREAD_COLUMN_START + i
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<ScanBindData>();
@@ -60,6 +73,8 @@ struct ScanBindData : public TableFunctionData {
 		copy->entry = entry;
 		copy->column_ids = column_ids;
 		copy->types = types;
+		copy->names = names;
+		copy->unread = unread;
 		return std::move(copy);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -88,14 +103,38 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 	if (!data.entry->decodable) {
 		throw InvalidInputException("%s: %s.%s is not read: %s", FUNCTION, data.schema, data.table, data.entry->reason);
 	}
+	std::vector<UnreadColumn> unread;
 	for (const auto &c : data.entry->columns) {
-		if (c.is_computed && !c.is_persisted) {
-			continue;  // no stored value: not a column of the scan
+		const ColumnReading reading = ReadingOf(c);
+		if (!reading.readable) {
+			unread.push_back(UnreadColumn{c.name, reading.type, reading.note});
+			continue;
 		}
 		data.column_ids.push_back(c.column_id);
-		data.types.push_back(ReadingOf(c).type);
+		data.types.push_back(reading.type);
+		data.names.push_back(c.name);
 		if (names) {
 			names->emplace_back(c.name);
+		}
+	}
+	// An unread column is a virtual one only when its name is no other column's: a readable column and
+	// the service columns win, and the binder must not pick among equal names (review of #552).
+	auto taken = [&](const std::string &name) {
+		for (const char *service : {"_mssql_page", "_mssql_rid", "_mssql_page_lsn"}) {
+			if (StringUtil::CIEquals(name, service)) {
+				return true;
+			}
+		}
+		for (const auto &n : data.names) {
+			if (StringUtil::CIEquals(name, n)) {
+				return true;
+			}
+		}
+		return false;
+	};
+	for (auto &u : unread) {
+		if (!taken(u.name)) {
+			data.unread.push_back(std::move(u));
 		}
 	}
 }
@@ -119,6 +158,13 @@ void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_dat
 	serializer.WriteProperty(100, "paths", data.paths);
 	serializer.WriteProperty(101, "schema", data.schema);
 	serializer.WriteProperty(102, "table", data.table);
+	serializer.WriteProperty(103, "types", data.types);
+	serializer.WriteProperty(104, "names", data.names);
+	vector<std::string> unread;
+	for (const auto &u : data.unread) {
+		unread.push_back(u.name);
+	}
+	serializer.WriteProperty(105, "unread", unread);
 }
 
 unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunction &) {
@@ -126,7 +172,23 @@ unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunct
 	data->paths = deserializer.ReadProperty<vector<std::string>>(100, "paths");
 	data->schema = deserializer.ReadProperty<std::string>(101, "schema");
 	data->table = deserializer.ReadProperty<std::string>(102, "table");
+	const auto types = deserializer.ReadProperty<vector<LogicalType>>(103, "types");
+	const auto names = deserializer.ReadProperty<vector<std::string>>(104, "names");
+	const auto unread = deserializer.ReadProperty<vector<std::string>>(105, "unread");
 	BindTable(deserializer.Get<ClientContext &>(), *data, nullptr);
+	// The plan's column positions and vectors are those it was bound with: a file at the same path that
+	// reads otherwise now (a nightly backup replaced: a column added, dropped, renamed or retyped) is
+	// refused, never read into positions or vectors of other columns.
+	vector<std::string> now_unread;
+	for (const auto &u : data->unread) {
+		now_unread.push_back(u.name);
+	}
+	if (data->types != types || data->names != names || now_unread != unread) {
+		throw InvalidInputException(
+			"%s: %s.%s in the backup at the same path reads otherwise than when the "
+			"query was planned (the file changed): plan the query again",
+			FUNCTION, data->schema, data->table);
+	}
 	return std::move(data);
 }
 
@@ -135,16 +197,22 @@ unique_ptr<NodeStatistics> Cardinality(ClientContext &, const FunctionData *bind
 		return nullptr;
 	}
 	const auto &data = bind_data->Cast<ScanBindData>();
-	if (data.entry->row_count < 0) {
-		return nullptr;
+	if (!data.entry->row_count_known) {
+		return nullptr;	 // a count the catalog does not know is no estimate (not 0 rows)
 	}
 	// An estimate, never a maximum: the count is the catalog's (approximate, and behind the pages in a
 	// backup taken under writes), and a maximum below a LIMIT lets DuckDB drop the LIMIT.
 	return make_uniq<NodeStatistics>(static_cast<idx_t>(data.entry->row_count));
 }
 
-virtual_column_map_t VirtualColumns(ClientContext &, optional_ptr<FunctionData>) {
+virtual_column_map_t VirtualColumns(ClientContext &, optional_ptr<FunctionData> bind_data) {
 	virtual_column_map_t result;
+	if (bind_data) {
+		const auto &unread = bind_data->Cast<ScanBindData>().unread;
+		for (size_t i = 0; i < unread.size(); i++) {
+			result.insert(make_pair(UNREAD_COLUMN_START + i, TableColumn(Identifier(unread[i].name), unread[i].type)));
+		}
+	}
 	// count(*) projects this one rather than the table's first column, which may not be readable.
 	result.insert(make_pair(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN)));
 	result.insert(make_pair(PAGE_COLUMN, TableColumn("_mssql_page", LogicalType::VARCHAR)));
@@ -169,6 +237,7 @@ struct ScanState : public GlobalTableFunctionState {
 	idx_t page_output = DConstants::INVALID_INDEX;
 	idx_t rid_output = DConstants::INVALID_INDEX;
 	idx_t lsn_output = DConstants::INVALID_INDEX;
+	std::vector<idx_t> empty_outputs;  // COLUMN_IDENTIFIER_EMPTY (count(*)): a constant NULL
 
 	size_t next_partition = 0;
 	PartitionCursor cursor;
@@ -202,12 +271,20 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInpu
 			state->rid_output = c;
 		} else if (id == PAGE_LSN_COLUMN) {
 			state->lsn_output = c;
+		} else if (id == COLUMN_IDENTIFIER_EMPTY) {
+			state->empty_outputs.push_back(c);
+		} else if (id >= UNREAD_COLUMN_START && id - UNREAD_COLUMN_START < data.unread.size()) {
+			const UnreadColumn &u = data.unread[id - UNREAD_COLUMN_START];
+			throw InvalidInputException("%s: %s.%s.%s is not read: %s", FUNCTION, data.schema, data.table, u.name,
+										u.reason);
 		} else if (id < data.column_ids.size()) {
 			staged.push_back(data.column_ids[id]);
 			state->stager_outputs.push_back(c);
+		} else {
+			throw InternalException("%s: column id %llu is none of the scan's", FUNCTION,
+									static_cast<unsigned long long>(id));
 		}
 	}
-	// A column that is not readable (a sparse one) is refused here, when projected (D13).
 	state->stager = make_uniq<RecordStager>(*data.entry, staged);
 	return std::move(state);
 }
@@ -232,7 +309,9 @@ void PutU32(std::string &out, uint32_t v) {
 // _mssql_rid (D8): a heap row's place before it moved (its own, or a forwarded record's back pointer),
 // 0x00 ‖ u32 page ‖ u16 file ‖ u16 slot; a clustered row 0x01 ‖ per key column in ordkey order u16
 // length ‖ its stored bytes (0xFFFF for NULL; a bit as one byte 0 / 1) ‖ u32 uniquifier when the index
-// is not unique (0 when absent).
+// is not unique (0 when absent). No partition number, which SPLIT / MERGE renumber: a partitioned
+// clustered index carries its partitioning column as a key column (measured, 2022: added by the server
+// to a non-unique index on another column, ordkey 2 of 3), so rows of two partitions differ in it.
 std::string RowId(const ScanBindData &data, const PartitionCursor &cursor, const RecordView &record,
 				  const PagePointer &page, uint16_t slot) {
 	std::string rid;
@@ -264,9 +343,19 @@ std::string RowId(const ScanBindData &data, const PartitionCursor &cursor, const
 							  ", a key column, holds a value stored off row");
 		}
 		if (c.xtype == XTYPE_BIT && v.state == ValueState::Inline) {
+			if (c.offset <= 0) {
+				throw FormatError("backup: " + layout.table + "." + c.name +
+								  ", a bit key column, is not at a fixed offset");
+			}
 			PutU16(rid, 1);
 			rid.push_back(static_cast<char>((v.data[0] >> c.bit_position) & 1));
 			continue;
+		}
+		if (v.size >= 0xFFFF) {
+			// 0xFFFF is NULL's length: a value that long is named rather than taken for one (as the
+			// catalog's rid; review of #549).
+			throw FormatError("backup: " + layout.table + "." + c.name + ", a key column, holds a value of " +
+							  std::to_string(v.size) + " bytes, past what _mssql_rid encodes");
 		}
 		PutU16(rid, static_cast<uint16_t>(v.size));
 		rid.append(reinterpret_cast<const char *>(v.data), v.size);
@@ -280,6 +369,11 @@ std::string RowId(const ScanBindData &data, const PartitionCursor &cursor, const
 		} else if (u.state == ValueState::Inline && u.size != 0) {
 			throw FormatError("backup: " + layout.table + "'s uniquifier holds " + std::to_string(u.size) +
 							  " bytes, not 0 or 4");
+		} else if (u.state == ValueState::OffRow || u.state == ValueState::Default) {
+			// Absent (an empty or missing variable column) is 0; stored off row or as an added default
+			// it is no uniquifier the reader knows: named, not taken for 0.
+			throw FormatError("backup: " + layout.table + "'s uniquifier is stored " +
+							  (u.state == ValueState::OffRow ? "off row" : "as a default"));
 		}
 		PutU32(rid, value);
 	}
@@ -295,6 +389,10 @@ bool NextPartition(const ScanBindData &data, ScanState &state) {
 		cursor.partition = &p;
 		for (const auto &u : data.entry->units) {
 			if (u.unit.owner_id == p.rowset_id && u.unit.type == 1) {
+				if (cursor.unit) {
+					throw FormatError("backup: " + data.schema + "." + data.table + "'s partition " +
+									  std::to_string(p.partition_number) + " has two in-row allocation units");
+				}
 				cursor.unit = &u.unit;
 			}
 		}
@@ -323,6 +421,13 @@ bool NextPartition(const ScanBindData &data, ScanState &state) {
 		std::sort(cursor.pages.begin(), cursor.pages.end(), [](const PagePointer &x, const PagePointer &y) {
 			return x.file != y.file ? x.file < y.file : x.page < y.page;
 		});
+		// A page an IAM chain lists twice (a single page that is also in an extent run) is read once:
+		// its rows would otherwise be handed out twice (review of #552).
+		cursor.pages.erase(std::unique(cursor.pages.begin(), cursor.pages.end(),
+									   [](const PagePointer &x, const PagePointer &y) {
+										   return x.file == y.file && x.page == y.page;
+									   }),
+						   cursor.pages.end());
 		state.stager->UseLayout(layout);
 		state.cursor = std::move(cursor);
 		state.have_partition = true;
@@ -334,9 +439,14 @@ bool NextPartition(const ScanBindData &data, ScanState &state) {
 }
 
 // The next live data page of the partition's unit into state.page; false when the unit has no more.
-bool NextPage(const ScanBindData &data, ScanState &state) {
+bool NextPage(ClientContext &context, const ScanBindData &data, ScanState &state) {
 	const PageStore &store = *data.catalog->pages->store;
 	while (state.next_page < state.cursor.pages.size()) {
+		// A unit of pages with no live row (ghosts, freed pages) is walked here without a row to return:
+		// Ctrl-C is asked page by page.
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
 		const PagePointer at = state.cursor.pages[state.next_page++];
 		if (!ReadUnitDataPage(store, *state.cursor.unit, at, data.schema + "." + data.table, state.page)) {
 			continue;
@@ -408,7 +518,7 @@ hugeint_t LsnNumber(const Lsn &lsn) {
 		   hugeint_t(static_cast<int64_t>(lsn.slot));
 }
 
-void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	const auto &data = input.bind_data->Cast<ScanBindData>();
 	auto &state = input.global_state->Cast<ScanState>();
 	try {
@@ -424,7 +534,7 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 			if (!state.have_partition && !NextPartition(data, state)) {
 				break;
 			}
-			if (!state.have_page && !NextPage(data, state)) {
+			if (!state.have_page && !NextPage(context, data, state)) {
 				state.have_partition = false;
 				continue;
 			}
@@ -460,6 +570,10 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 		const idx_t count = state.stager->Count();
 		state.stager->FinalizeChunk();
 		WriteVirtual(state, output, count);
+		for (idx_t c : state.empty_outputs) {
+			output.data[c].SetVectorType(VectorType::CONSTANT_VECTOR);
+			ConstantVector::SetNull(output.data[c], true);
+		}
 		output.SetChildCardinality(count);
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", FUNCTION, e.what());
