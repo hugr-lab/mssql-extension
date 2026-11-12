@@ -134,8 +134,12 @@ struct CatalogColumn {
 struct CatalogPartition {
 	uint64_t rowset_id = 0;
 	int32_t partition_number = 0;
-	int64_t rows =
-		0;	// rcrows of the partition's rowsets of owner types 1 and 3 (a columnstore's delta store); -1 unknown
+	//! rcrows of the partition's rowsets of owner types 1 and 3 (a columnstore's delta stores), -1 unknown.
+	//! A clustered columnstore's delta stores include those a REORGANIZE left as tombstones until the
+	//! tuple mover drops them, which sysrowsets cannot tell from an open one: the sum is what
+	//! sys.partitions.rows says up to SQL Server 2022 (measured on 2019 and 2022; 2025's leaves
+	//! tombstones out, the live count); spec 088 reads the rowgroup metadata that makes it exact (#551).
+	int64_t rows = 0;
 	uint8_t compression = 0;   // sysrowsets.cmprlevel: 0 none, 1 row, 2 page, 3 columnstore, 4 archive
 	int16_t filegroup_id = 0;  // its in-row unit's (= the scheme's destination, E7)
 	std::string filegroup;	   // its name (sysclsobjs class 31), "" when not listed
@@ -204,7 +208,7 @@ struct CatalogTable {
 	//! Its base index's data space is a partition scheme; `partitioning` then describes it.
 	bool partitioned = false;
 	CatalogPartitioning partitioning;
-	int64_t row_count = 0;				 // rcrows of the base rowsets of owner types 1 and 3
+	int64_t row_count = 0;				 // the partitions' rows summed (CatalogPartition::rows: tombstones too)
 	bool row_count_known = true;		 // false: a count negative, or the sum past int64
 	std::vector<CatalogColumn> columns;	 // by column id
 	std::vector<CatalogUnit> units;
