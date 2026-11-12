@@ -205,18 +205,42 @@ void AddRowCount(int64_t &sum, int64_t rows) {
 	sum = rows < 0 || rows > std::numeric_limits<int64_t>::max() - sum ? -1 : sum + rows;
 }
 
+// The added columns' defaults, found once per model build.
+struct AddedDefaults {
+	std::map<std::pair<uint64_t, int32_t>, std::string> values;
+	std::set<std::pair<uint64_t, int32_t>> ambiguous;
+	std::string pending;  // sysseobjvalues could not be read: why
+};
+
+// Two layouts that read records alike (their rowset ids aside).
+bool SameLayout(const RowsetLayout &a, const RowsetLayout &b) {
+	if (a.columns.size() != b.columns.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < a.columns.size(); i++) {
+		const PhysicalColumn &x = a.columns[i], &y = b.columns[i];
+		if (x.name != y.name || x.rscolid != y.rscolid || x.hbcolid != y.hbcolid || x.xtype != y.xtype ||
+			x.length != y.length || x.precision != y.precision || x.scale != y.scale || x.collation != y.collation ||
+			x.status != y.status || x.offset != y.offset || x.null_bit != y.null_bit ||
+			x.bit_position != y.bit_position || x.ordkey != y.ordkey || x.has_default != y.has_default ||
+			x.default_bytes != y.default_bytes) {
+			return false;
+		}
+	}
+	return true;
+}
+
 // One partition's layout, its added columns' defaults filled in; false with `why`.
-bool PartitionLayout(const BootstrapTables &tables, const std::map<std::pair<uint64_t, int32_t>, std::string> &defaults,
-					 const std::set<std::pair<uint64_t, int32_t>> &ambiguous, const std::string &defaults_pending,
+bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &defaults,
 					 const std::map<int32_t, const CatalogColumn *> &by_id, const CatalogTable &t,
-					 const SysRowset &rowset, CatalogPartition &partition, std::string &why) {
+					 const SysRowset &rowset, RowsetLayout &layout, std::string &why) {
 	try {
-		partition.layout = tables.LayoutOf(t.object_id, rowset);
+		layout = tables.LayoutOf(t.object_id, rowset);
 	} catch (FormatError &e) {
 		why = std::string("its physical layout: ") + e.what();
 		return false;
 	}
-	for (auto &physical : partition.layout.columns) {
+	for (auto &physical : layout.columns) {
 		if (physical.Dropped() || physical.Uniquifier() || !physical.HasDefaultStatus()) {
 			continue;
 		}
@@ -225,12 +249,12 @@ bool PartitionLayout(const BootstrapTables &tables, const std::map<std::pair<uin
 			why = "physical column " + std::to_string(physical.rscolid) + " has no column";
 			return false;
 		}
-		if (!defaults_pending.empty()) {
-			why = "column " + column->second->name + " was added with a default, and " + defaults_pending;
+		if (!defaults.pending.empty()) {
+			why = "column " + column->second->name + " was added with a default, and " + defaults.pending;
 			return false;
 		}
-		if (!AddedDefault(defaults, ambiguous, partition.layout, physical, *column->second, physical.default_bytes,
-						  why)) {
+		if (!AddedDefault(defaults.values, defaults.ambiguous, layout, physical, *column->second,
+						  physical.default_bytes, why)) {
 			return false;
 		}
 		physical.has_default = true;
@@ -238,8 +262,7 @@ bool PartitionLayout(const BootstrapTables &tables, const std::map<std::pair<uin
 	return true;
 }
 
-void DecideDecodable(const BootstrapTables &tables, const std::map<std::pair<uint64_t, int32_t>, std::string> &defaults,
-					 const std::set<std::pair<uint64_t, int32_t>> &ambiguous, const std::string &defaults_pending,
+void DecideDecodable(const BootstrapTables &tables, const AddedDefaults &defaults,
 					 const std::unordered_map<uint64_t, const SysRowset *> &rowsets, CatalogTable &t) {
 	t.decodable = false;
 	if (!t.reason.empty()) {
@@ -247,6 +270,21 @@ void DecideDecodable(const BootstrapTables &tables, const std::map<std::pair<uin
 	}
 	if (t.partitions.empty()) {
 		t.reason = "it has no live base rowset";
+		return;
+	}
+	// Each partition has one live base rowset, and a table on no partition scheme has one partition:
+	// two rowsets for one partition (a heap and a clustered index both live, an index built or switched
+	// while the backup ran) are refused by name, not read with one layout for both (review of #551).
+	for (size_t i = 1; i < t.partitions.size(); i++) {
+		if (t.partitions[i].partition_number == t.partitions[i - 1].partition_number) {
+			t.reason = "partition " + std::to_string(t.partitions[i].partition_number) +
+					   " has two live base rowsets (an index built or switched while the backup ran?)";
+			return;
+		}
+	}
+	if (!t.partitioned && t.partitions.size() > 1) {
+		t.reason = "it has " + std::to_string(t.partitions.size()) +
+				   " live base rowsets, and its index is on no partition scheme";
 		return;
 	}
 	if (t.shape == TableShape::Columnstore) {
@@ -274,49 +312,42 @@ void DecideDecodable(const BootstrapTables &tables, const std::map<std::pair<uin
 	}
 	for (auto &p : t.partitions) {
 		std::string why;
-		if (!PartitionLayout(tables, defaults, ambiguous, defaults_pending, by_id, t, *rowsets.at(p.rowset_id), p,
-							 why)) {
-			t.reason = t.partitions.size() > 1 ? "partition " + std::to_string(p.partition_number) + ": " + why : why;
-			return;
+		auto rowset = rowsets.find(p.rowset_id);
+		RowsetLayout layout;
+		if (rowset == rowsets.end()) {
+			why = "its rowset " + std::to_string(p.rowset_id) + " is not in sysrowsets";
+		} else if (PartitionLayout(tables, defaults, by_id, t, *rowset->second, layout, why)) {
+			// A layout like the previous partition's is shared (neighbours agree, as a rule: one layout
+			// for a table of 15000 partitions); compared with that one only, so that a file of distinct
+			// layouts costs one comparison a partition, not one per layout kept.
+			layout.rowset_id = 0;  // shared: a partition's own is CatalogPartition::rowset_id
+			if (t.layouts.empty() || !SameLayout(t.layouts.back(), layout)) {
+				t.layouts.push_back(std::move(layout));
+			}
+			p.layout = t.layouts.size() - 1;
+			continue;
 		}
+		t.reason = t.partitions.size() > 1 ? "partition " + std::to_string(p.partition_number) + ": " + why : why;
+		t.layouts.clear();
+		for (auto &q : t.partitions) {
+			q.layout = 0;
+		}
+		return;
 	}
-	t.layout = t.partitions.front().layout;
 	t.decodable = true;
 }
 
-// The base tables partitioning is read from (E7), each read through its own description.
-struct PartitionCatalog {
-	struct Function {
-		std::string name;
-		bool range_right = false;
-		int32_t fanout = 0;
-	};
-	struct Parameter {
-		uint8_t xtype = 0;
-		int32_t user_type = 0;
-		int16_t length = 0;
-		uint8_t precision = 0, scale = 0;
-		uint32_t collation = 0;
-	};
-	std::map<int32_t, Function> functions;							  // sysclsobjs class 30
-	std::map<int32_t, Parameter> parameters;						  // systypedsubobjs class 30, subid 1
-	std::map<int32_t, std::map<int32_t, std::string>> boundaries;	  // sysobjvalues valclass 30
-	std::set<std::pair<int32_t, int32_t>> boundaries_twice;			  // (function, boundary id)
-	std::map<int32_t, std::string> filegroups, schemes;				  // sysclsobjs class 31
-	std::map<int32_t, int32_t> scheme_function;						  // syssingleobjrefs class 31
-	std::map<int32_t, std::map<int32_t, int32_t>> destinations;		  // class 30: scheme -> dest -> fg
-	std::map<std::pair<int32_t, int32_t>, int32_t> data_space;		  // class 7: (object, index) -> space
-	std::map<std::pair<int32_t, int32_t>, int32_t> partition_column;  // sysiscols, partition ordinal 1
-	std::set<int32_t> schemes_twice;								  // syssingleobjrefs class 31 listed twice
-	std::set<std::pair<int32_t, int32_t>> destinations_twice, data_space_twice;
-	std::set<int32_t> boundaries_off_row;  // functions with a boundary stored off-row
-	std::string reason;					   // a table of these could not be read: every partitioned table's reason
-};
+// A reason as the model keeps it: without the "backup: " prefix FormatError messages carry.
+std::string Reason(const std::string &message) {
+	return message.compare(0, 8, "backup: ") == 0 ? message.substr(8) : message;
+}
 
-PartitionCatalog ReadPartitionCatalog(const PageStore &store, const BootstrapTables &tables) {
+}  // namespace
+
+PartitionCatalog ReadPartitionCatalog(const PageStore &store, const BootstrapTables &tables,
+									  const SystemTable &classes) {
 	PartitionCatalog out;
 	try {
-		const SystemTable classes = ReadSystemTable(store, tables, "sysclsobjs");
 		const size_t cls = classes.Column("class"), id = classes.Column("id"), name = classes.Column("name"),
 					 status = classes.Column("status"), type = classes.Column("type"),
 					 intprop = classes.Column("intprop");
@@ -328,13 +359,22 @@ PartitionCatalog ReadPartitionCatalog(const PageStore &store, const BootstrapTab
 				f.name = classes.Text(r, name);
 				f.range_right = (classes.Int(r, status) & 1) != 0;
 				f.fanout = static_cast<int32_t>(classes.Int(r, intprop));
-				out.functions[i] = f;
+				if (!out.functions.emplace(i, f).second) {
+					out.functions_twice.insert(i);
+				}
 			} else if (c == 31) {
 				// A partition scheme is 'PS'; filegroups ('FG') and the other data spaces (FILESTREAM 'FD',
 				// memory-optimized 'FX') hold a partition's pages.
 				const std::string t = classes.Text(r, type);
-				(t == "PS" ? out.schemes : out.filegroups)[i] = classes.Text(r, name);
+				const bool scheme = t == "PS";
+				if (out.schemes.count(i) || out.filegroups.count(i)) {
+					out.data_spaces_twice.insert(i);
+				}
+				(scheme ? out.schemes : out.filegroups)[i] = classes.Text(r, name);
 			}
+		}
+		if (out.schemes.empty()) {
+			return out;	 // no partition scheme: no table is partitioned, nothing more to read
 		}
 		const SystemTable typed = ReadSystemTable(store, tables, "systypedsubobjs");
 		const size_t tc = typed.Column("class"), major = typed.Column("idmajor"), sub = typed.Column("subid"),
@@ -351,7 +391,10 @@ PartitionCatalog ReadPartitionCatalog(const PageStore &store, const BootstrapTab
 			p.precision = static_cast<uint8_t>(typed.Int(r, prec));
 			p.scale = static_cast<uint8_t>(typed.Int(r, scale));
 			p.collation = static_cast<uint32_t>(typed.Int(r, coll));
-			out.parameters[static_cast<int32_t>(typed.Int(r, major))] = p;
+			const int32_t f = static_cast<int32_t>(typed.Int(r, major));
+			if (!out.parameters.emplace(f, p).second) {
+				out.parameters_twice.insert(f);
+			}
 		}
 		const SystemTable refs = ReadSystemTable(store, tables, "syssingleobjrefs");
 		const size_t rc = refs.Column("class"), dep = refs.Column("depid"), depsub = refs.Column("depsubid"),
@@ -374,14 +417,17 @@ PartitionCatalog ReadPartitionCatalog(const PageStore &store, const BootstrapTab
 				}
 			}
 		}
+		out.data_spaces_read = true;
 		const SystemTable iscols = ReadSystemTable(store, tables, "sysiscols");
 		const size_t im = iscols.Column("idmajor"), in = iscols.Column("idminor"), ip = iscols.Column("intprop"),
 					 t2 = iscols.Column("tinyprop2");
 		for (size_t r = 0; r < iscols.rows.size(); r++) {
 			if (iscols.Int(r, t2) == 1) {
-				out.partition_column[std::make_pair(static_cast<int32_t>(iscols.Int(r, im)),
-													static_cast<int32_t>(iscols.Int(r, in)))] =
-					static_cast<int32_t>(iscols.Int(r, ip));
+				const auto key =
+					std::make_pair(static_cast<int32_t>(iscols.Int(r, im)), static_cast<int32_t>(iscols.Int(r, in)));
+				if (!out.partition_column.emplace(key, static_cast<int32_t>(iscols.Int(r, ip))).second) {
+					out.partition_column_twice.insert(key);
+				}
 			}
 		}
 		const SysObject *object = tables.SystemObject("sysobjvalues");
@@ -393,50 +439,113 @@ PartitionCatalog ReadPartitionCatalog(const PageStore &store, const BootstrapTab
 		const size_t vc = layout.IndexOf("valclass"), oid = layout.IndexOf("objid"), sid = layout.IndexOf("subobjid"),
 					 vn = layout.IndexOf("valnum"), value = layout.IndexOf("value");
 		ForEachRowsetRow(store, tables.InRowUnit(layout.rowset_id, "sysobjvalues"), layout, [&](const SystemRow &row) {
-			if (ValueInt(layout, vc, row.values[vc]) != 30 || ValueInt(layout, vn, row.values[vn]) != 1 ||
-				row.values[value].is_null) {
+			// valclass 30 of a partition function only, as ObjectValueFilter keeps them (DQ-11).
+			if (ValueInt(layout, vc, row.values[vc]) != 30 || ValueInt(layout, vn, row.values[vn]) != 1) {
 				return;
 			}
 			const int32_t f = static_cast<int32_t>(ValueInt(layout, oid, row.values[oid]));
+			if (!out.functions.count(f)) {
+				return;
+			}
 			const int32_t b = static_cast<int32_t>(ValueInt(layout, sid, row.values[sid]));
 			if (row.values[value].off_row) {
 				out.boundaries_off_row.insert(f);  // a sql_variant is never off-row: refused for its function
 				return;
 			}
-			if (!out.boundaries[f].emplace(b, row.values[value].bytes).second) {
+			PartitionBoundary boundary;
+			boundary.is_null = row.values[value].is_null;  // a NULL boundary is legal: the lowest value
+			boundary.bytes = row.values[value].bytes;
+			if (!out.boundaries[f].emplace(b, std::move(boundary)).second) {
 				out.boundaries_twice.insert(std::make_pair(f, b));
 			}
 		});
 	} catch (FormatError &e) {
-		out.reason = std::string("the partitioning tables: ") + e.what();
+		out.reason = "the partitioning tables: " + Reason(e.what());
 	}
 	return out;
 }
 
-// Table `t`'s partitioning from `pc`, or its reason (D13). `base_index` is its heap's 0 or clustered 1.
+namespace {
+
+// Why boundary `boundary` (not NULL) of `p`'s function cannot be given, or "" when it can: it parses,
+// is a value of the parameter's own type, collation and length, and `check` (when given) decodes it.
+std::string BoundaryRefusal(const CatalogPartitioning &p, const PartitionBoundary &boundary, const std::string &what,
+							const BoundaryCheck &check) {
+	SqlVariant variant;
+	try {
+		variant = ParseSqlVariant(boundary.bytes, what);
+	} catch (FormatError &e) {
+		return Reason(e.what());
+	}
+	const uint8_t x = variant.xtype;
+	const bool scaled = x == 41 || x == 42 || x == 43;
+	const bool decimal = x == 106 || x == 108;
+	const bool text = x == 167 || x == 175 || x == 231 || x == 239;
+	const bool sized = text || x == 165 || x == 173;
+	if (x != p.parameter_xtype || (scaled && variant.scale != p.parameter_scale) ||
+		(decimal && (variant.precision != p.parameter_precision || variant.scale != p.parameter_scale))) {
+		return what + " is a value of xtype " + std::to_string(x) + ", not of its parameter's type";
+	}
+	if (text && variant.collation != p.parameter_collation) {
+		return what + " is of collation " + std::to_string(variant.collation) + ", its parameter's " +
+			   std::to_string(p.parameter_collation);
+	}
+	if (sized && p.parameter_length > 0 && variant.value.size() > static_cast<size_t>(p.parameter_length)) {
+		return what + " holds " + std::to_string(variant.value.size()) + " bytes, its parameter " +
+			   std::to_string(p.parameter_length);
+	}
+	if (check) {
+		try {
+			check(variant, what);
+		} catch (FormatError &e) {
+			return Reason(e.what());
+		}
+	}
+	return std::string();
+}
+
+}  // namespace
+
 void DescribePartitioning(const PartitionCatalog &pc, const std::unordered_map<int32_t, std::string> &type_names,
-						  int32_t base_index, CatalogTable &t) {
+						  int32_t base_index, const BoundaryCheck &check, CatalogTable &t) {
+	CatalogPartitioning &p = t.partitioning;
+	// A reason clears every list: never a partial one (D13).
+	auto fail = [&](const std::string &why) {
+		t.partitioned = true;
+		p.reason = why;
+		p.boundaries.clear();
+		p.destinations.clear();
+		p.next_used.clear();
+	};
 	const auto space_key = std::make_pair(t.object_id, base_index);
+	if (pc.data_space_twice.count(space_key)) {
+		return fail("syssingleobjrefs lists its index's data space twice");
+	}
 	auto space = pc.data_space.find(space_key);
-	const int32_t data_space = space == pc.data_space.end() ? 1 : space->second;  // no row: PRIMARY
+	if (space == pc.data_space.end()) {
+		// No class-7 row: the index is on the default data space (measured: tables on a scheme have one,
+		// tables on the default filegroup none), unless syssingleobjrefs itself could not be read.
+		if (!pc.data_spaces_read && !pc.reason.empty() && !pc.schemes.empty()) {
+			return fail(pc.reason);
+		}
+		return;
+	}
+	const int32_t data_space = space->second;
+	if (pc.data_spaces_twice.count(data_space)) {
+		return fail("sysclsobjs lists its index's data space " + std::to_string(data_space) + " twice");
+	}
 	auto scheme = pc.schemes.find(data_space);
 	if (scheme == pc.schemes.end()) {
-		if (!pc.reason.empty() && t.partitions.size() > 1) {
-			t.partitioned = true;
-			t.partitioning.reason = pc.reason;
-		}
 		return;	 // on a filegroup
 	}
 	t.partitioned = true;
-	CatalogPartitioning &p = t.partitioning;
 	p.scheme_id = data_space;
 	p.scheme_name = scheme->second;
-	auto fail = [&](const std::string &why) { p.reason = why; };
 	if (!pc.reason.empty()) {
 		return fail(pc.reason);
 	}
-	if (pc.data_space_twice.count(space_key) || pc.schemes_twice.count(data_space)) {
-		return fail("syssingleobjrefs lists its index's data space or its scheme's function twice");
+	if (pc.schemes_twice.count(data_space)) {
+		return fail("syssingleobjrefs lists scheme " + p.scheme_name + "'s function twice");
 	}
 	auto fn_id = pc.scheme_function.find(data_space);
 	if (fn_id == pc.scheme_function.end()) {
@@ -449,6 +558,9 @@ void DescribePartitioning(const PartitionCatalog &pc, const std::unordered_map<i
 		return fail("scheme " + p.scheme_name + "'s partition function " + std::to_string(p.function_id) +
 					" is not in the catalog");
 	}
+	if (pc.functions_twice.count(p.function_id) || pc.parameters_twice.count(p.function_id)) {
+		return fail("partition function " + std::to_string(p.function_id) + " is listed twice in the catalog");
+	}
 	p.function_name = fn->second.name;
 	p.range_right = fn->second.range_right;
 	p.fanout = fn->second.fanout;
@@ -458,10 +570,17 @@ void DescribePartitioning(const PartitionCatalog &pc, const std::unordered_map<i
 	p.parameter_scale = param->second.scale;
 	p.parameter_collation = param->second.collation;
 	auto type = type_names.find(param->second.user_type);
-	p.parameter_type_name = type == type_names.end() ? std::string() : type->second;
 	auto system = type_names.find(param->second.xtype);
-	p.parameter_system_type_name = system == type_names.end() ? std::string() : system->second;
-	auto column = pc.partition_column.find(std::make_pair(t.object_id, base_index));
+	if (type == type_names.end() || system == type_names.end()) {
+		return fail("function " + p.function_name + "'s parameter type " + std::to_string(param->second.user_type) +
+					" is not in sysscalartypes");
+	}
+	p.parameter_type_name = type->second;
+	p.parameter_system_type_name = system->second;
+	if (pc.partition_column_twice.count(space_key)) {
+		return fail("sysiscols lists two partitioning columns for its index " + std::to_string(base_index));
+	}
+	auto column = pc.partition_column.find(space_key);
 	if (column == pc.partition_column.end()) {
 		return fail("its index " + std::to_string(base_index) + " has no partitioning column in sysiscols");
 	}
@@ -474,61 +593,66 @@ void DescribePartitioning(const PartitionCatalog &pc, const std::unordered_map<i
 	if (p.column_name.empty()) {
 		return fail("its partitioning column " + std::to_string(p.column_id) + " is not one of its columns");
 	}
-	if (pc.boundaries_off_row.count(p.function_id)) {
-		return fail("function " + p.function_name + " has a boundary stored off-row");
-	}
 	if (p.fanout < 1 || p.fanout > 15000) {
 		return fail("function " + p.function_name + " has a fanout of " + std::to_string(p.fanout));
 	}
-	// The boundaries: ids 1..fanout-1, each once, each a value of the parameter's own type.
+	// The boundaries: ids 1..fanout-1, each once, each NULL or a value of the parameter's own type, as
+	// the parameter declares it (a string's collation and length too, as AddedDefault checks a default).
+	// They are reference only -- the rows are read whatever they hold -- and the destinations do not
+	// depend on them: a boundary the reader cannot give is the reason, the boundaries are not given,
+	// and the destinations and NEXT USED still are (owner, review of #551).
+	std::string boundary_reason;
+	std::vector<PartitionBoundary> boundaries;
 	auto values = pc.boundaries.find(p.function_id);
 	const size_t count = values == pc.boundaries.end() ? 0 : values->second.size();
-	if (count != static_cast<size_t>(p.fanout - 1)) {
-		return fail("function " + p.function_name + " has " + std::to_string(count) + " boundaries, its fanout " +
-					std::to_string(p.fanout) + " says " + std::to_string(p.fanout - 1));
+	if (pc.boundaries_off_row.count(p.function_id)) {
+		boundary_reason = "function " + p.function_name + " has a boundary stored off-row";
+	} else if (count != static_cast<size_t>(p.fanout - 1)) {
+		boundary_reason = "function " + p.function_name + " has " + std::to_string(count) + " boundaries, its fanout " +
+						  std::to_string(p.fanout) + " says " + std::to_string(p.fanout - 1);
 	}
-	for (int32_t b = 1; b < p.fanout; b++) {
+	for (int32_t b = 1; boundary_reason.empty() && b < p.fanout; b++) {
 		auto v = values->second.find(b);
+		const std::string what = "boundary " + std::to_string(b) + " of " + p.function_name;
 		if (v == values->second.end() || pc.boundaries_twice.count(std::make_pair(p.function_id, b))) {
-			return fail("function " + p.function_name + "'s boundary " + std::to_string(b) +
-						(v == values->second.end() ? " is missing" : " is listed twice"));
+			boundary_reason = "function " + p.function_name + "'s boundary " + std::to_string(b) +
+							  (v == values->second.end() ? " is missing" : " is listed twice");
+			break;
 		}
-		SqlVariant variant;
-		try {
-			variant = ParseSqlVariant(v->second, "boundary " + std::to_string(b) + " of " + p.function_name);
-		} catch (FormatError &e) {
-			return fail(e.what());
+		if (!v->second.is_null) {
+			boundary_reason = BoundaryRefusal(p, v->second, what, check);
+			if (!boundary_reason.empty()) {
+				break;
+			}
 		}
-		const bool scaled = variant.xtype == 41 || variant.xtype == 42 || variant.xtype == 43;
-		const bool decimal = variant.xtype == 106 || variant.xtype == 108;
-		if (variant.xtype != p.parameter_xtype || (scaled && variant.scale != p.parameter_scale) ||
-			(decimal && (variant.precision != p.parameter_precision || variant.scale != p.parameter_scale))) {
-			return fail("function " + p.function_name + "'s boundary " + std::to_string(b) + " is a value of xtype " +
-						std::to_string(variant.xtype) + ", not of its parameter's type");
-		}
-		p.boundaries.push_back(v->second);
+		boundaries.push_back(v->second);
 	}
 	// The destinations: 1..fanout each a filegroup, and NEXT USED at fanout + 1 when there is one.
 	auto dests = pc.destinations.find(data_space);
+	if (dests == pc.destinations.end()) {
+		return fail("scheme " + p.scheme_name + " has no destination 1");
+	}
+	auto filegroup = [&](int32_t fg) {
+		auto it = pc.filegroups.find(fg);
+		return it == pc.filegroups.end() ? "filegroup " + std::to_string(fg) : it->second;
+	};
+	std::vector<std::string> destinations;
 	for (int32_t d = 1; d <= p.fanout + 1; d++) {
-		auto it = dests == pc.destinations.end() ? std::map<int32_t, int32_t>::const_iterator() : dests->second.find(d);
-		const bool found = dests != pc.destinations.end() && it != dests->second.end();
-		if (!found) {
+		auto it = dests->second.find(d);
+		if (it == dests->second.end()) {
 			if (d <= p.fanout) {
-				p.boundaries.clear();
-				p.destinations.clear();
 				return fail("scheme " + p.scheme_name + " has no destination " + std::to_string(d));
 			}
 			break;
 		}
-		if (pc.destinations_twice.count(std::make_pair(data_space, d))) {
-			p.boundaries.clear();
-			p.destinations.clear();
-			return fail("scheme " + p.scheme_name + " lists destination " + std::to_string(d) + " twice");
+		if (pc.destinations_twice.count(std::make_pair(data_space, d)) || pc.data_spaces_twice.count(it->second)) {
+			return fail("scheme " + p.scheme_name + "'s destination " + std::to_string(d) + " is listed twice");
 		}
-		auto fg = pc.filegroups.find(it->second);
-		const std::string name = fg == pc.filegroups.end() ? "filegroup " + std::to_string(it->second) : fg->second;
-		(d <= p.fanout ? p.destinations.push_back(name) : (void)(p.next_used = name));
+		if (d <= p.fanout) {
+			destinations.push_back(filegroup(it->second));
+		} else {
+			p.next_used = filegroup(it->second);
+		}
 	}
 	// Its partitions: 1..fanout, each once (t.partitions is sorted by number).
 	bool numbered = t.partitions.size() == static_cast<size_t>(p.fanout);
@@ -539,7 +663,15 @@ void DescribePartitioning(const PartitionCatalog &pc, const std::unordered_map<i
 		return fail(std::to_string(t.partitions.size()) + " partitions where function " + p.function_name + " has " +
 					std::to_string(p.fanout) + " (1.." + std::to_string(p.fanout) + ", each once)");
 	}
+	p.destinations = std::move(destinations);
+	if (!boundary_reason.empty()) {
+		p.reason = boundary_reason;	 // the boundaries alone are not given
+		return;
+	}
+	p.boundaries = std::move(boundaries);
 }
+
+namespace {
 
 bool ByName(const std::string &as, const std::string &an, const std::string &bs, const std::string &bn) {
 	return as != bs ? as < bs : an < bn;
@@ -670,10 +802,10 @@ std::string CatalogModel::SchemaName(int32_t id) const {
 	return it != schemas.end() && it->id == id ? it->name : std::string();
 }
 
-CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &tables) {
+CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &tables, const BoundaryCheck &check) {
 	CatalogModel model;
+	const SystemTable classes = ReadSystemTable(store, tables, "sysclsobjs");
 	{
-		const SystemTable classes = ReadSystemTable(store, tables, "sysclsobjs");
 		const size_t cls = classes.Column("class"), id = classes.Column("id"), name = classes.Column("name");
 		for (size_t r = 0; r < classes.rows.size(); r++) {
 			if (classes.Int(r, cls) == CLASS_SCHEMA) {
@@ -719,16 +851,14 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 		texts.clear();
 		texts_pending = std::string("sysobjvalues cannot be read: ") + e.what();
 	}
-	const PartitionCatalog partition_catalog = ReadPartitionCatalog(store, tables);
-	std::set<std::pair<uint64_t, int32_t>> ambiguous;
-	std::map<std::pair<uint64_t, int32_t>, std::string> defaults;
-	std::string defaults_pending;
+	const PartitionCatalog partition_catalog = ReadPartitionCatalog(store, tables, classes);
+	AddedDefaults defaults;
 	try {
-		defaults = ReadAddedDefaults(store, tables, ambiguous);
+		defaults.values = ReadAddedDefaults(store, tables, defaults.ambiguous);
 	} catch (PendingPageError &e) {
-		defaults.clear();
-		ambiguous.clear();
-		defaults_pending = std::string("sysseobjvalues cannot be read: ") + e.what();
+		defaults.values.clear();
+		defaults.ambiguous.clear();
+		defaults.pending = std::string("sysseobjvalues cannot be read: ") + e.what();
 	}
 	// The object's schema; one sysclsobjs does not list is named on the object, not the model.
 	auto schema_of = [&](const SysObject &o, std::string &reason) {
@@ -800,7 +930,9 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 				u.compression = r->compression;
 				t.units.push_back(u);
 			}
-			if ((r->index_id != 0 && r->index_id != 1) || !tables.FindInRowUnit(r->rowset_id)) {
+			const SysAllocUnit *in_row =
+				r->index_id == 0 || r->index_id == 1 ? tables.FindInRowUnit(r->rowset_id) : nullptr;
+			if (!in_row) {
 				continue;  // another index, or a deferred drop
 			}
 			heap = heap || r->index_id == 0;
@@ -812,11 +944,10 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 				p.partition_number = r->partition_number;
 				AddRowCount(p.rows, r->rows);
 				p.compression = r->compression;
-				const SysAllocUnit *in_row = tables.FindInRowUnit(r->rowset_id);
 				p.filegroup_id = in_row->filegroup_id;
 				auto fg = partition_catalog.filegroups.find(in_row->filegroup_id);
 				p.filegroup = fg == partition_catalog.filegroups.end() ? std::string() : fg->second;
-				t.partitions.push_back(p);
+				t.partitions.push_back(std::move(p));
 			}
 			if (r->owner_type == OWNER_DELTA_STORE) {
 				AddRowCount(delta_rows[r->partition_number], r->rows);
@@ -834,19 +965,22 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 			}
 		}
 		for (auto &p : t.partitions) {
-			const int64_t delta = delta_rows[p.partition_number];
-			if (delta < 0) {
+			auto delta = delta_rows.find(p.partition_number);
+			if (delta == delta_rows.end()) {
+				continue;
+			}
+			if (delta->second < 0) {
 				p.rows = -1;
 			} else {
-				AddRowCount(p.rows, delta);
+				AddRowCount(p.rows, delta->second);
 			}
 		}
 		std::sort(t.partitions.begin(), t.partitions.end(), [](const CatalogPartition &a, const CatalogPartition &b) {
 			return a.partition_number < b.partition_number;
 		});
 		t.shape = columnstore ? TableShape::Columnstore : heap ? TableShape::Heap : TableShape::Clustered;
-		DescribePartitioning(partition_catalog, type_names, heap ? 0 : 1, t);
-		DecideDecodable(tables, defaults, ambiguous, defaults_pending, rowset_of, t);
+		DescribePartitioning(partition_catalog, type_names, heap ? 0 : 1, check, t);
+		DecideDecodable(tables, defaults, rowset_of, t);
 		model.tables.push_back(std::move(t));
 	}
 	for (const SysObject *o : views) {

@@ -296,34 +296,32 @@ Value PartitioningValue(const CatalogTable &t) {
 		return Value(PartitioningType());
 	}
 	const CatalogPartitioning &p = t.partitioning;
-	std::string reason = p.reason;
+	// The model's verdict is the one given: it has decoded every boundary already (BoundaryCheck), so a
+	// reason here is its reason, and without one each boundary decodes. With a reason the boundaries
+	// are NULL (D13: never a partial list); the destinations and NEXT USED are given when the model
+	// kept them (only the boundaries could not be given).
+	const std::string &reason = p.reason;
 	Value boundaries(LogicalType::LIST(LogicalType::VARIANT()));
-	if (reason.empty()) {
-		vector<Value> values;
-		try {
-			for (size_t i = 0; i < p.boundaries.size(); i++) {
-				const std::string what = "boundary " + std::to_string(i + 1) + " of " + p.function_name;
-				values.push_back(SqlVariantValue(ParseSqlVariant(p.boundaries[i], what), what)
-									 .DefaultCastAs(LogicalType::VARIANT()));
-			}
-			boundaries = Value::LIST(LogicalType::VARIANT(), std::move(values));
-		} catch (FormatError &e) {
-			reason = e.what();
-			if (reason.compare(0, 8, "backup: ") == 0) {
-				reason = reason.substr(8);
-			}
-		}
-	} else if (reason.compare(0, 8, "backup: ") == 0) {
-		reason = reason.substr(8);
-	}
-	// With a reason, no list is given: neither boundaries nor destinations (D13, never a partial one).
 	Value destinations(LogicalType::LIST(LogicalType::VARCHAR));
-	if (reason.empty()) {
+	if (reason.empty() || !p.destinations.empty()) {
 		vector<Value> names;
 		for (const auto &d : p.destinations) {
 			names.push_back(Value(d));
 		}
 		destinations = Value::LIST(LogicalType::VARCHAR, std::move(names));
+	}
+	if (reason.empty()) {
+		vector<Value> values;
+		for (size_t i = 0; i < p.boundaries.size(); i++) {
+			if (p.boundaries[i].is_null) {
+				values.push_back(Value(LogicalType::VARIANT()));
+				continue;
+			}
+			const std::string what = "boundary " + std::to_string(i + 1) + " of " + p.function_name;
+			values.push_back(SqlVariantValue(ParseSqlVariant(p.boundaries[i].bytes, what), what)
+								 .DefaultCastAs(LogicalType::VARIANT()));
+		}
+		boundaries = Value::LIST(LogicalType::VARIANT(), std::move(values));
 	}
 	child_list_t<Value> f;
 	f.emplace_back("function_name", OptionalText(p.function_name));
@@ -337,7 +335,7 @@ Value PartitioningValue(const CatalogTable &t) {
 				   p.function_name.empty() ? Value(LogicalType::BOOLEAN) : Value::BOOLEAN(p.range_right));
 	f.emplace_back("boundaries", boundaries);
 	f.emplace_back("destinations", destinations);
-	f.emplace_back("next_used", OptionalText(p.next_used));
+	f.emplace_back("next_used", OptionalText(p.next_used));	 // empty unless the model kept it
 	f.emplace_back("reason", OptionalText(reason));
 	return Value::STRUCT(std::move(f));
 }

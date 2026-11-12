@@ -62,9 +62,9 @@ test/
     tds_connection/     # TDS protocol tests
     transaction/        # Transaction management tests
   cpp/                  # C++ unit tests (no SQL Server required); cpp/backup/ for spec 085
-  backup/               # Spec 085 PR 2a/2b: gen/ (generate.sh; fixtures samples / catalog / files (two
-                        # files, a file removed) / load (backups under a workload) / large (data past
-                        # a GAM interval); catalog_golden.sql, run by generate.sh with ONE -v path
+  backup/               # Spec 085 PR 2a/2b/2c: gen/ (generate.sh; fixtures samples / catalog / partition
+                        # (partitioned tables of every boundary type) / files (two files, a file
+                        # removed) / load (backups under a workload) / large (data past a GAM interval); catalog_golden.sql, run by generate.sh with ONE -v path
                         # variable (sqlcmd substitutes no :setvar and only the first -v in :OUT); images.txt pinning each
                         # SQL Server image by digest), compare_catalog.py (mssql_backup_tables / _views vs the
                         # server's catalog), compare_info.py (mssql_backup_info vs RESTORE,

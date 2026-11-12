@@ -1,6 +1,7 @@
 #include "backup/backup_opened.hpp"
 
 #include "backup/backup_boot.hpp"
+#include "backup/backup_function_common.hpp"
 #include "backup/backup_xpress.hpp"
 #include "backup/backup_zstd.hpp"
 
@@ -257,7 +258,11 @@ std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const s
 		CheckBootAgainstSet(boot, opened->headers->Set());
 		opened->tables = ReadBootstrapTables(*opened->pages->store, boot);
 		if (with_model) {
-			opened->model = BuildCatalogModel(*opened->pages->store, opened->tables);
+			// A boundary decodes when the value mssql_backup_tables would give it does: one verdict, the
+			// model's (review of #551).
+			opened->model =
+				BuildCatalogModel(*opened->pages->store, opened->tables,
+								  [](const SqlVariant &v, const std::string &what) { (void)SqlVariantValue(v, what); });
 		}
 	} catch (FormatError &e) {
 		// The readers' messages start "backup: "; under the file's name that is said already.

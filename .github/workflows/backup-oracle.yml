@@ -126,7 +126,8 @@ jobs:
           key=$(cd test/backup/gen && find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-16)
           echo "key=${key}" >> "$GITHUB_OUTPUT"
           export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
-                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
+                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}" \
+                 AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
           # 0 when the object exists, 1 when it does not (404); any other failure -- a refused or
           # expired token, a bucket the token cannot read, the endpoint unreachable -- fails the job
           # with the CLI's reason (it names the operation and the error code, not the credentials),
@@ -205,27 +206,35 @@ jobs:
         run: |
           set -euo pipefail
           export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
-                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
-          # The aws CLI's default checksums (from 2.23) are not what R2 expects on a multipart upload;
-          # R2's documentation says to send them only when required. And a multipart upload to R2
-          # failed now and then with InvalidPart on CompleteMultipartUpload (#551's run, two of four
-          # versions, files of 90-390 MB): the copy is tried three times. The run's directory is its
-          # own and DONE is written only after a copy that succeeded, so a retry overwrites nothing
-          # another run reads.
-          export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}" \
+                 AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+          # The aws CLI's default checksums (from 2.23) are not what R2 expects on a multipart upload:
+          # R2's documentation says to send them only when required (every AWS block of this workflow
+          # does). And a multipart upload to R2 failed now and then with InvalidPart on
+          # CompleteMultipartUpload (#551's run, two of four versions, files of 90-390 MB), so the upload
+          # is tried three times -- a sync, which sends again only what did not arrive -- and so is DONE,
+          # written only after the files: the run's directory is its own, nothing another run reads is
+          # overwritten, and a lost DONE must not cost the version a regeneration. A retry that
+          # succeeds is a warning in the log, so a remaining cause is not hidden.
           prefix="s3://${MSSQL_R2_BUCKET_NAME}/oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}"
           run="${{ github.run_id }}-${{ github.run_attempt }}"
-          for attempt in 1 2 3; do
-            if aws s3 cp --recursive --only-show-errors "${RUNNER_TEMP}/oracle/" "${prefix}/${run}/"; then
-              break
-            fi
-            if [ "${attempt}" = 3 ]; then
-              echo "::error::the upload to R2 failed three times"; exit 1
-            fi
-            echo "::warning::the upload to R2 failed (attempt ${attempt}); trying again"
-            sleep $((attempt * 15))
-          done
-          echo "${run}" | aws s3 cp - "${prefix}/DONE"
+          retry() {  # $1 = what, then the command
+            local what="$1" attempt
+            shift
+            for attempt in 1 2 3; do
+              if "$@"; then
+                return 0
+              fi
+              if [ "${attempt}" = 3 ]; then
+                echo "::error::${what} to R2 failed three times"; exit 1
+              fi
+              echo "::warning::${what} to R2 failed (attempt ${attempt}); trying again"
+              sleep $((attempt * 15))
+            done
+          }
+          retry "the upload" aws s3 sync --only-show-errors "${RUNNER_TEMP}/oracle/" "${prefix}/${run}/"
+          printf '%s\n' "${run}" > "${RUNNER_TEMP}/DONE"
+          retry "DONE" aws s3 cp --only-show-errors "${RUNNER_TEMP}/DONE" "${prefix}/DONE"
           echo "stored $(ls "${RUNNER_TEMP}/oracle" | wc -l) files under oracle/${{ needs.key.outputs.key }}/${{ matrix.version }}/${run}/"
 
   build:
@@ -394,7 +403,8 @@ jobs:
             echo "::error::the bucket name or main's key is empty: nothing to clean up against"; exit 1
           fi
           export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
-                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
+                 AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}" \
+                 AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
           B="${MSSQL_R2_BUCKET_NAME}"
           now=$(date -u +%s)
           run_grace=$(( KEEP_SWITCHED_HOURS * 3600 ))

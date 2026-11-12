@@ -10,6 +10,7 @@
 #include <functional>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "backup/backup_catalog_model.hpp"
@@ -125,9 +126,12 @@ int main() {
 		for (const auto &u : items->units) {
 			in_row += u.unit.type == 1 && u.index_id == 1 ? 1 : 0;
 		}
-		Check(in_row == 1 && items->layout.columns.size() == 7 &&
-				  items->layout.rowset_id == items->partitions[0].rowset_id,
-			  form.front() + ": items' clustered index has one in-row unit, and its layout seven physical columns");
+		Check(in_row == 1 && items->layouts.size() == 1 && items->Layout(items->partitions[0]).columns.size() == 7 &&
+				  items->Layout(items->partitions[0]).rowset_id == 0 && items->partitions[0].rowset_id != 0,
+			  form.front() +
+				  ": items' clustered index has one in-row unit, and its layout seven physical columns (the shared "
+				  "layout's rowset id 0, "
+				  "the partition's its own)");
 	}
 
 	// sql_variant: the bytes of the catalog fixture's defaults (2022).
@@ -274,6 +278,274 @@ int main() {
 		}
 		Check(error.find("code page 932") != std::string::npos && error.find("086") != std::string::npos,
 			  "a varchar of a double-byte code page is refused, naming spec 086: " + error);
+	}
+
+	// More sql_variant values: money in record form (a plain little-endian i64 of 1/10,000; TDS sends the
+	// high word first), and the values outside a type's range, refused by name (review of #551).
+	{
+		auto text = [](const std::vector<int> &bytes) {
+			return SqlVariantValue(ParseSqlVariant(Bytes(bytes), "v"), "v");
+		};
+		const Value money = text({0x3c, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f});
+		const Value small = text({0x7a, 0x01, 0x30, 0x75, 0x00, 0x00});
+		Check(money.ToString() == "922337203685477.5807" && small.ToString() == "3.0000",
+			  "money and smallmoney: the record form's little-endian integer of 1/10,000 (" + money.ToString() + ", " +
+				  small.ToString() + ")");
+		// time(0) is 3 bytes of seconds: 86400 is midnight of the next day, past the type.
+		Check(ErrorOf([&]() {
+				  text({0x29, 0x01, 0x00, 0x80, 0x51, 0x01});
+			  }).find("past midnight") != std::string::npos &&
+				  text({0x29, 0x01, 0x00, 0x7f, 0x51, 0x01}).ToString() == "23:59:59",
+			  "a time past midnight is refused (86400 s), 86399 s is not");
+		// time(7): units of 100 ns; 1 has a 100 ns digit, 10 does not.
+		Check(ErrorOf([&]() {
+				  text({0x29, 0x01, 0x07, 0x01, 0, 0, 0, 0});
+			  }).find("100 ns") != std::string::npos &&
+				  text({0x29, 0x01, 0x07, 0x0a, 0, 0, 0, 0}).ToString() == "00:00:00.000001",
+			  "a time(7) with a 100 ns digit is refused, not cut to the microsecond");
+		// datetimeoffset(7) at 2026-01-31 (day 739646 = 0x0b4a3e) +00:00, with a 100 ns digit; and one at
+		// +15:00 (900 minutes).
+		Check(ErrorOf([&]() {
+				  text({0x2b, 0x01, 0x07, 0x01, 0, 0, 0, 0, 0x3e, 0x4a, 0x0b, 0x00, 0x00});
+			  }).find("100 ns") != std::string::npos &&
+				  ErrorOf([&]() {
+					  text({0x2b, 0x01, 0x07, 0x0a, 0, 0, 0, 0, 0x3e, 0x4a, 0x0b, 0x84, 0x03});
+				  }).find("-14:00..+14:00") != std::string::npos,
+			  "a datetimeoffset(7) with a 100 ns digit, and one at +15:00, are refused");
+		// nvarchar: a high surrogate alone (D800) is refused; a pair (D83D DE00) is one character.
+		Check(ErrorOf([&]() {
+				  text({0xe7, 0x01, 0x10, 0x00, 0x08, 0xd0, 0x00, 0x34, 0x00, 0xd8, 0x41, 0x00});
+			  }).find("unpaired surrogate") != std::string::npos &&
+				  text({0xe7, 0x01, 0x10, 0x00, 0x08, 0xd0, 0x00, 0x34, 0x3d, 0xd8, 0x00, 0xde}).ToString() ==
+					  "\xf0\x9f\x98\x80",
+			  "an nvarchar with an unpaired surrogate is refused, not given U+FFFD; a pair is read");
+		// date: 3652058 (0x37b9da) is 9999-12-31, 3652059 past it.
+		Check(ErrorOf([&]() {
+				  text({0x28, 0x01, 0xdb, 0xb9, 0x37});
+			  }).find("past 9999-12-31") != std::string::npos &&
+				  text({0x28, 0x01, 0xda, 0xb9, 0x37}).ToString() == "9999-12-31",
+			  "a date past 9999-12-31 is refused, 9999-12-31 is not");
+	}
+
+	// Partitioning from a synthetic catalog (no .bak): one table on a scheme of a function of int with
+	// fanout 3, and every way its catalog can be wrong -- each a reason, with no list and no NEXT USED
+	// beside it (D13; review of #551).
+	{
+		auto int_variant = [](int32_t v) {
+			PartitionBoundary b;
+			b.bytes = std::string("\x38\x01", 2) + std::string(reinterpret_cast<const char *>(&v), 4);
+			return b;
+		};
+		PartitionCatalog good;
+		good.functions[65536] = PartitionCatalog::Function{"pf", true, 3};
+		PartitionCatalog::Parameter param;
+		param.xtype = 56;
+		param.user_type = 56;
+		param.length = 4;
+		param.precision = 10;
+		good.parameters[65536] = param;
+		good.boundaries[65536][1] = int_variant(100);
+		good.boundaries[65536][2] = int_variant(200);
+		good.schemes[65601] = "ps";
+		good.filegroups[1] = "PRIMARY";
+		good.filegroups[2] = "FG2";
+		good.scheme_function[65601] = 65536;
+		good.destinations[65601] = {{1, 1}, {2, 2}, {3, 1}, {4, 2}};
+		good.data_space[std::make_pair(500, 1)] = 65601;
+		good.partition_column[std::make_pair(500, 1)] = 1;
+		good.data_spaces_read = true;
+		const std::unordered_map<int32_t, std::string> types = {{56, "int"}, {127, "bigint"}, {167, "varchar"}};
+		auto table = [](size_t partitions) {
+			CatalogTable t;
+			t.object_id = 500;
+			CatalogColumn k;
+			k.column_id = 1;
+			k.name = "k";
+			t.columns.push_back(k);
+			for (size_t i = 0; i < partitions; i++) {
+				CatalogPartition p;
+				p.partition_number = static_cast<int32_t>(i + 1);
+				t.partitions.push_back(p);
+			}
+			return t;
+		};
+		auto describe = [&](const PartitionCatalog &pc, size_t partitions, const BoundaryCheck &check) {
+			CatalogTable t = table(partitions);
+			DescribePartitioning(pc, types, 1, check, t);
+			return t;
+		};
+		const CatalogTable ok = describe(good, 3, BoundaryCheck());
+		const CatalogPartitioning &p = ok.partitioning;
+		Check(ok.partitioned && p.reason.empty() && p.function_name == "pf" && p.scheme_name == "ps" &&
+				  p.column_name == "k" && p.range_right && p.boundaries.size() == 2 && !p.boundaries[0].is_null &&
+				  p.destinations == std::vector<std::string>({"PRIMARY", "FG2", "PRIMARY"}) && p.next_used == "FG2" &&
+				  p.parameter_type_name == "int",
+			  "a table on a scheme: its function, column, two boundaries, three destinations and NEXT USED");
+		PartitionCatalog null_boundary = good;
+		null_boundary.boundaries[65536][1] = PartitionBoundary();
+		null_boundary.boundaries[65536][1].is_null = true;
+		const CatalogTable with_null = describe(null_boundary, 3, BoundaryCheck());
+		Check(with_null.partitioning.reason.empty() && with_null.partitioning.boundaries.size() == 2 &&
+				  with_null.partitioning.boundaries[0].is_null,
+			  "a NULL boundary is a boundary (the lowest value), not a count mismatch");
+		const CatalogTable filegroup = [&]() {
+			PartitionCatalog pc = good;
+			pc.data_space[std::make_pair(500, 1)] = 2;
+			return describe(pc, 1, BoundaryCheck());
+		}();
+		const CatalogTable default_space = [&]() {
+			PartitionCatalog pc = good;
+			pc.data_space.clear();
+			return describe(pc, 1, BoundaryCheck());
+		}();
+		Check(!filegroup.partitioned && !default_space.partitioned,
+			  "on a filegroup, or with no data-space row (the default one, as measured), a table is not partitioned");
+
+		// Each wrong catalog: its reason, and nothing else given.
+		struct Wrong {
+			std::string what;
+			std::function<void(PartitionCatalog &)> change;
+			size_t partitions;
+			std::string expect;
+		};
+		std::vector<Wrong> wrongs = {
+			{"no data-space row while syssingleobjrefs could not be read",
+			 [](PartitionCatalog &pc) {
+				 pc.data_space.clear();
+				 pc.data_spaces_read = false;
+				 pc.reason = "the partitioning tables: x";
+			 },
+			 3, "the partitioning tables"},
+			{"the data-space row twice",
+			 [](PartitionCatalog &pc) {
+				 pc.data_space_twice.insert({500, 1});
+			 },
+			 3, "data space twice"},
+			{"the scheme's id twice in sysclsobjs", [](PartitionCatalog &pc) { pc.data_spaces_twice.insert(65601); }, 3,
+			 "twice"},
+			{"the function twice", [](PartitionCatalog &pc) { pc.functions_twice.insert(65536); }, 3, "listed twice"},
+			{"the parameter's type not in sysscalartypes",
+			 [](PartitionCatalog &pc) { pc.parameters[65536].user_type = 999; }, 3, "not in sysscalartypes"},
+			{"no partitioning column", [](PartitionCatalog &pc) { pc.partition_column.clear(); }, 3,
+			 "no partitioning column"},
+			{"two partitioning columns",
+			 [](PartitionCatalog &pc) {
+				 pc.partition_column_twice.insert({500, 1});
+			 },
+			 3, "two partitioning columns"},
+			{"a fanout of 0", [](PartitionCatalog &pc) { pc.functions[65536].fanout = 0; }, 3, "fanout of 0"},
+			{"a fanout past 15000", [](PartitionCatalog &pc) { pc.functions[65536].fanout = 15001; }, 3,
+			 "fanout of 15001"},
+			{"no destination at all", [](PartitionCatalog &pc) { pc.destinations.clear(); }, 3, "no destination 1"},
+			{"a destination missing", [](PartitionCatalog &pc) { pc.destinations[65601].erase(2); }, 3,
+			 "no destination 2"},
+			{"a destination twice",
+			 [](PartitionCatalog &pc) {
+				 pc.destinations_twice.insert({65601, 3});
+			 },
+			 3, "destination 3 is listed twice"},
+			{"two partitions where the fanout says three", [](PartitionCatalog &) {}, 2, "2 partitions"},
+		};
+		// Boundaries the reader cannot give: the reason, no boundaries, the destinations and NEXT USED
+		// still given (they do not depend on the values; owner, review of #551).
+		std::vector<Wrong> boundary_wrongs = {
+			{"a boundary off-row", [](PartitionCatalog &pc) { pc.boundaries_off_row.insert(65536); }, 3, "off-row"},
+			{"one boundary fewer", [](PartitionCatalog &pc) { pc.boundaries[65536].erase(2); }, 3, "has 1 boundaries"},
+			{"a boundary at the wrong id",
+			 [&](PartitionCatalog &pc) {
+				 pc.boundaries[65536].erase(2);
+				 pc.boundaries[65536][3] = int_variant(300);
+			 },
+			 3, "boundary 2 is missing"},
+			{"a boundary twice",
+			 [](PartitionCatalog &pc) {
+				 pc.boundaries_twice.insert({65536, 2});
+			 },
+			 3, "listed twice"},
+			{"a boundary of another type",
+			 [](PartitionCatalog &pc) {
+				 pc.boundaries[65536][2].bytes = std::string("\x7f\x01\x01\0\0\0\0\0\0\0", 10);
+			 },
+			 3, "not of its parameter's type"},
+			{"a boundary that does not parse",
+			 [](PartitionCatalog &pc) { pc.boundaries[65536][2].bytes = std::string("\x38", 1); }, 3, "boundary 2"},
+		};
+		bool kept = true;
+		std::string kept_failed;
+		for (auto &w : boundary_wrongs) {
+			PartitionCatalog pc = good;
+			w.change(pc);
+			const CatalogTable t = describe(pc, w.partitions, BoundaryCheck());
+			const CatalogPartitioning &q = t.partitioning;
+			if (!(t.partitioned && q.reason.find(w.expect) != std::string::npos && q.boundaries.empty() &&
+				  q.destinations.size() == 3 && q.next_used == "FG2")) {
+				kept = false;
+				kept_failed += " [" + w.what + ": '" + q.reason + "']";
+			}
+		}
+		Check(kept, std::to_string(boundary_wrongs.size()) +
+						" boundaries the reader cannot give: named, no boundaries, destinations and NEXT USED kept" +
+						kept_failed);
+		const CatalogTable later_failure = [&]() {
+			PartitionCatalog pc = good;
+			pc.data_space.clear();
+			pc.data_spaces_read = true;
+			pc.reason = "the partitioning tables: sysobjvalues failed";
+			return describe(pc, 1, BoundaryCheck());
+		}();
+		Check(!later_failure.partitioned,
+			  "with syssingleobjrefs read whole, no data-space row is the default data space whatever failed later");
+		bool all = true;
+		std::string failed;
+		for (auto &w : wrongs) {
+			PartitionCatalog pc = good;
+			w.change(pc);
+			const CatalogTable t = describe(pc, w.partitions, BoundaryCheck());
+			const CatalogPartitioning &q = t.partitioning;
+			const bool right = t.partitioned && q.reason.find(w.expect) != std::string::npos && q.boundaries.empty() &&
+							   q.destinations.empty() && q.next_used.empty() && q.reason.compare(0, 8, "backup: ") != 0;
+			if (!right) {
+				all = false;
+				failed += " [" + w.what + ": '" + q.reason + "']";
+			}
+		}
+		Check(all, std::to_string(wrongs.size()) + " wrong catalogs, each named, with no list beside it" + failed);
+
+		// A varchar(10) parameter: a boundary of another collation, or longer than 10 bytes, is refused.
+		PartitionCatalog strings = good;
+		strings.parameters[65536].xtype = 167;
+		strings.parameters[65536].user_type = 167;
+		strings.parameters[65536].length = 10;
+		strings.parameters[65536].collation = 0x0000D008;
+		auto varchar = [](uint32_t collation, const std::string &v) {
+			PartitionBoundary b;
+			b.bytes = std::string("\xa7\x01", 2) + std::string("\x0a\x00", 2) +
+					  std::string(reinterpret_cast<const char *>(&collation), 4) + v;
+			return b;
+		};
+		strings.boundaries[65536][1] = varchar(0x0000D008, "b");
+		strings.boundaries[65536][2] = varchar(0x0000D008, "m");
+		const CatalogTable strings_ok = describe(strings, 3, BoundaryCheck());
+		PartitionCatalog other_collation = strings;
+		other_collation.boundaries[65536][2] = varchar(0x0000D009, "m");
+		PartitionCatalog too_long = strings;
+		too_long.boundaries[65536][2] = varchar(0x0000D008, "mmmmmmmmmmmm");
+		Check(
+			strings_ok.partitioning.reason.empty() &&
+				describe(other_collation, 3, BoundaryCheck()).partitioning.reason.find("collation") !=
+					std::string::npos &&
+				describe(too_long, 3, BoundaryCheck()).partitioning.reason.find("holds 12 bytes") != std::string::npos,
+			"a varchar boundary of its parameter's collation and length passes; another collation, or 12 bytes "
+			"for a varchar(10), is refused: " +
+				strings_ok.partitioning.reason);
+
+		// The check decides whether a boundary decodes: its refusal is the model's reason.
+		const CatalogTable refused = describe(good, 3, [](const SqlVariant &, const std::string &what) {
+			throw FormatError("backup: " + what + " is not given");
+		});
+		Check(refused.partitioning.reason == "boundary 1 of pf is not given" &&
+				  refused.partitioning.boundaries.empty() && refused.partitioning.destinations.size() == 3,
+			  "a boundary the check refuses is the reason, without the backup: prefix: " + refused.partitioning.reason);
 	}
 
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;

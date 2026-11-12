@@ -40,7 +40,9 @@ Value GuidValue(const std::string &bytes, const std::string &what);
 //! TYPE mssql reads its base type (D6: datetime2 by its scale TIMESTAMP_S / _MS / TIMESTAMP / _NS,
 //! datetimeoffset TIMESTAMP_TZ at the UTC instant, decimal exact, money DECIMAL(19, 4), a char /
 //! varchar through its collation's code page). A FormatError naming `what` for a value its type's
-//! size does not fit, a double-byte code page (spec 086) or a base type this does not read.
+//! size does not fit, one outside its type's range (a time past midnight, a date past 9999-12-31, an
+//! offset outside +-14:00), a time(7) / datetimeoffset(7) with a 100 ns digit (not cut to the
+//! microsecond), a double-byte code page (spec 086) or a base type this does not read.
 Value SqlVariantValue(const SqlVariant &variant, const std::string &what);
 
 }  // namespace backup

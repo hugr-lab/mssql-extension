@@ -398,7 +398,11 @@ void BootstrapTables::BuildIndexes() {
 			throw FormatError("backup: sysschobjs lists system table " + objects[i].name + " twice");
 		}
 	}
+	std::set<uint64_t> rowset_ids;
 	for (size_t i = 0; i < rowsets.size(); i++) {
+		if (!rowset_ids.insert(rowsets[i].rowset_id).second) {
+			throw FormatError("backup: sysrowsets lists rowset " + std::to_string(rowsets[i].rowset_id) + " twice");
+		}
 		rowsets_by_object_[rowsets[i].object_id].push_back(i);
 	}
 	for (size_t i = 0; i < columns.size(); i++) {
@@ -515,7 +519,7 @@ RowsetLayout BootstrapTables::BaseLayout(int32_t object_id) const {
 	if (live.size() > 1) {
 		throw FormatError(
 			"backup: " + name + " has " + std::to_string(live.size()) +
-			" live base rowsets (a partitioned table or a columnstore, which the reader does not read yet)");
+			" live base rowsets: a system table has one (a partitioned or columnstore one is not read here)");
 	}
 	return LayoutOf(object_id, *live[0]);
 }

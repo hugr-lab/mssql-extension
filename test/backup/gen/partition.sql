@@ -238,6 +238,12 @@ CREATE PARTITION FUNCTION pf_bit_r (bit) AS RANGE RIGHT FOR VALUES (1);
 CREATE PARTITION SCHEME ps_bit_r AS PARTITION pf_bit_r ALL TO ([PRIMARY]);
 CREATE TABLE dbo.t_bit_r (b bit NOT NULL, id int NOT NULL) ON ps_bit_r (b);
 INSERT INTO dbo.t_bit_r VALUES (0, 1), (1, 2);
+-- A NULL boundary: legal (NULL is the lowest value; the NULL keys go to partition 1, RANGE RIGHT), shown
+-- NULL by sys.partition_range_values, a NULL element of the reader's boundaries (review of #551).
+CREATE PARTITION FUNCTION pf_null_r (int) AS RANGE RIGHT FOR VALUES (NULL, 100);
+CREATE PARTITION SCHEME ps_null_r AS PARTITION pf_null_r ALL TO ([PRIMARY]);
+CREATE TABLE dbo.t_null_r (k int NULL, id int NOT NULL) ON ps_null_r (k);
+INSERT INTO dbo.t_null_r VALUES (NULL, 1), (5, 2), (100, 3), (150, 4);
 CREATE PARTITION FUNCTION pf_real_l (real) AS RANGE LEFT FOR VALUES (-0.5, 2.25);
 CREATE PARTITION SCHEME ps_real_l AS PARTITION pf_real_l ALL TO ([PRIMARY]);
 CREATE TABLE dbo.t_real_l (r real NOT NULL, id int NOT NULL) ON ps_real_l (r);

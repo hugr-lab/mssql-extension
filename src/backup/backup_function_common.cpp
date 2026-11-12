@@ -72,6 +72,7 @@ namespace {
 
 constexpr int64_t DAYS_0001_TO_EPOCH = 719162;
 constexpr int64_t SECONDS_PER_DAY = 86400;
+constexpr int64_t DAYS_0001_TO_9999_12_31 = 3652058;  // date's last day, counted from 0001-01-01
 
 //! The bytes a time of `scale` takes (3, 4 or 5), as in TDS.
 size_t TimeBytes(uint8_t scale) {
@@ -92,6 +93,28 @@ int64_t Pow10(uint8_t n) {
 		p *= 10;
 	}
 	return p;
+}
+
+// The days of a date / datetime2 / datetimeoffset (3 bytes since 0001-01-01), within the type's
+// range (0001-01-01 .. 9999-12-31), as days since 1970-01-01.
+int64_t Days(const uint8_t *b, const std::string &what) {
+	const int64_t days = static_cast<int64_t>(LittleEndian(b, 3));
+	if (days > DAYS_0001_TO_9999_12_31) {
+		throw FormatError("backup: " + what + " is a date past 9999-12-31 (day " + std::to_string(days) + ")");
+	}
+	return days - DAYS_0001_TO_EPOCH;
+}
+
+// The units of 10^-scale s since midnight of a time part (`n` bytes), within one day; at scale 7 a
+// value with a 100 ns digit is refused, not cut to the microsecond the DuckDB types hold (a partition
+// boundary cut so would put the rows between the two in the wrong partition; review of #551).
+int64_t TimeUnits(const uint8_t *b, size_t n, uint8_t scale, const std::string &what) {
+	const int64_t units = static_cast<int64_t>(LittleEndian(b, n));
+	if (units >= SECONDS_PER_DAY * Pow10(scale)) {
+		throw FormatError("backup: " + what + " is a time past midnight (" + std::to_string(units) + " units of 10^-" +
+						  std::to_string(scale) + " s)");
+	}
+	return units;
 }
 
 void Require(const SqlVariant &v, size_t size, const std::string &what) {
@@ -168,13 +191,16 @@ Value SqlVariantValue(const SqlVariant &v, const std::string &what) {
 	}
 	case 40:  // date: 3 bytes of days since 0001-01-01
 		Require(v, 3, what);
-		return Value::DATE(date_t(static_cast<int32_t>(LittleEndian(b, 3) - DAYS_0001_TO_EPOCH)));
+		return Value::DATE(date_t(static_cast<int32_t>(Days(b, what))));
 	case 41: {	// time: units of 10^-scale s since midnight
 		if (v.scale > 7) {
 			throw FormatError("backup: " + what + " is a time of scale " + std::to_string(v.scale));
 		}
 		Require(v, TimeBytes(v.scale), what);
-		const int64_t units = static_cast<int64_t>(LittleEndian(b, v.value.size()));
+		const int64_t units = TimeUnits(b, v.value.size(), v.scale, what);
+		if (v.scale == 7 && units % 10) {
+			throw FormatError("backup: " + what + " is a time(7) with a 100 ns digit, which a TIME cannot hold");
+		}
 		const int64_t micros = v.scale <= 6 ? units * Pow10(6 - v.scale) : units / 10;
 		return Value::TIME(dtime_t(micros));
 	}
@@ -185,8 +211,19 @@ Value SqlVariantValue(const SqlVariant &v, const std::string &what) {
 		}
 		const size_t time_bytes = TimeBytes(v.scale);
 		Require(v, time_bytes + 3 + (v.xtype == 43 ? 2 : 0), what);
-		const int64_t units = static_cast<int64_t>(LittleEndian(b, time_bytes));
-		const int64_t days = static_cast<int64_t>(LittleEndian(b + time_bytes, 3)) - DAYS_0001_TO_EPOCH;
+		const int64_t units = TimeUnits(b, time_bytes, v.scale, what);
+		const int64_t days = Days(b + time_bytes, what);
+		if (v.xtype == 43) {
+			const int16_t offset = static_cast<int16_t>(LittleEndian(b + time_bytes + 3, 2));
+			if (offset < -840 || offset > 840) {
+				throw FormatError("backup: " + what + " is a datetimeoffset of offset " + std::to_string(offset) +
+								  " minutes, outside -14:00..+14:00");
+			}
+			if (v.scale == 7 && units % 10) {
+				throw FormatError("backup: " + what +
+								  " is a datetimeoffset(7) with a 100 ns digit, which a TIMESTAMP_TZ cannot hold");
+			}
+		}
 		// TIMESTAMP_NS holds about 1677-2262 (int64 nanoseconds): a datetime2(7) value past it -- a
 		// 9999-12-31 sentinel, 0001-01-01 -- is refused by name (D13), where TYPE mssql's read gives NULL.
 		if (v.xtype == 42 && v.scale == 7 && (days > 106750 || days < -106751)) {
@@ -224,6 +261,18 @@ Value SqlVariantValue(const SqlVariant &v, const std::string &what) {
 	case 239:  // nchar
 		if (v.value.size() % 2) {
 			throw FormatError("backup: " + what + " holds an odd number of bytes of UTF-16");
+		}
+		// A surrogate without its pair is refused: Utf16LeToUtf8 would write U+FFFD for it, a guess.
+		for (size_t i = 0; i + 1 < v.value.size(); i += 2) {
+			const uint16_t unit = static_cast<uint16_t>(b[i] | (b[i + 1] << 8));
+			const bool high = unit >= 0xD800 && unit <= 0xDBFF;
+			const bool low = unit >= 0xDC00 && unit <= 0xDFFF;
+			const uint16_t next = i + 3 < v.value.size() ? static_cast<uint16_t>(b[i + 2] | (b[i + 3] << 8)) : 0;
+			if (low || (high && !(next >= 0xDC00 && next <= 0xDFFF))) {
+				throw FormatError("backup: " + what + " is UTF-16 with an unpaired surrogate at byte " +
+								  std::to_string(i));
+			}
+			i += high ? 2 : 0;
 		}
 		return Value(Utf16LeToUtf8(b, v.value.size(), false));
 	case 167:	 // varchar
