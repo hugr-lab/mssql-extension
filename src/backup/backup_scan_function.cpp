@@ -236,7 +236,7 @@ void PutU32(std::string &out, uint32_t v) {
 std::string RowId(const ScanBindData &data, const PartitionCursor &cursor, const RecordView &record,
 				  const PagePointer &page, uint16_t slot) {
 	std::string rid;
-	const RowsetLayout &layout = cursor.partition->layout;
+	const RowsetLayout &layout = data.entry->Layout(*cursor.partition);
 	if (data.entry->shape == TableShape::Heap) {
 		RowLocation at;
 		at.page = page;
@@ -302,9 +302,10 @@ bool NextPartition(const ScanBindData &data, ScanState &state) {
 			throw FormatError("backup: " + data.schema + "." + data.table + "'s partition " +
 							  std::to_string(p.partition_number) + " has no in-row allocation unit");
 		}
+		const RowsetLayout &layout = data.entry->Layout(p);
 		std::vector<std::pair<int16_t, size_t>> key;
-		for (size_t i = 0; i < p.layout.columns.size(); i++) {
-			const PhysicalColumn &c = p.layout.columns[i];
+		for (size_t i = 0; i < layout.columns.size(); i++) {
+			const PhysicalColumn &c = layout.columns[i];
 			if (c.Uniquifier()) {
 				cursor.has_uniquifier = true;
 				cursor.uniquifier = i;
@@ -322,7 +323,7 @@ bool NextPartition(const ScanBindData &data, ScanState &state) {
 		std::sort(cursor.pages.begin(), cursor.pages.end(), [](const PagePointer &x, const PagePointer &y) {
 			return x.file != y.file ? x.file < y.file : x.page < y.page;
 		});
-		state.stager->UseLayout(p.layout);
+		state.stager->UseLayout(layout);
 		state.cursor = std::move(cursor);
 		state.have_partition = true;
 		state.next_page = 0;

@@ -49,7 +49,7 @@ size_t ScanTable(const PageStore &store, const CatalogTable &table, const std::v
 				 const std::function<void(DataChunk &, idx_t)> &row) {
 	RecordStager stager(table, ids);
 	const CatalogPartition &p = table.partitions[0];
-	stager.UseLayout(p.layout);
+	stager.UseLayout(table.Layout(p));
 	const SysAllocUnit *in_row = nullptr;
 	for (const auto &u : table.units) {
 		if (u.unit.owner_id == p.rowset_id && u.unit.type == 1) {

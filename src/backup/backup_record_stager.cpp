@@ -206,8 +206,7 @@ void RecordStager::UseLayout(const RowsetLayout &layout) {
 			k++;
 		}
 		if (k == layout.columns.size()) {
-			throw FormatError("backup: " + col.name + " has no physical column in rowset " +
-							  std::to_string(layout.rowset_id));
+			throw FormatError("backup: " + col.name + " has no physical column in its partition's layout");
 		}
 		const PhysicalColumn &p = layout.columns[k];
 		const bool fixed_arm = col.arm == StageArm::Direct || col.arm == StageArm::Fixed ||
