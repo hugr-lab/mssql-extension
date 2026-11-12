@@ -867,7 +867,8 @@ std::string CatalogModel::SchemaName(int32_t id) const {
 	return it != schemas.end() && it->id == id ? it->name : std::string();
 }
 
-CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &tables, const BoundaryCheck &check) {
+CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &tables, const BoundaryCheck &check,
+							   const CatalogScope &scope) {
 	CatalogModel model;
 	const SystemTable classes = ReadSystemTable(store, tables, "sysclsobjs");
 	{
@@ -935,10 +936,16 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 		return "schema " + std::to_string(o.schema_id);
 	};
 	for (const SysObject *o : user_tables) {
+		std::string schema_reason;
+		std::string schema_name = schema_of(*o, schema_reason);
+		if (!scope.WantsTable(schema_name, o->name)) {
+			continue;
+		}
 		CatalogTable t;
 		t.object_id = o->id;
 		t.schema_id = o->schema_id;
-		t.schema_name = schema_of(*o, t.reason);
+		t.schema_name = std::move(schema_name);
+		t.reason = std::move(schema_reason);
 		t.name = o->name;
 		t.created = o->created;
 		t.modified = o->modified;
@@ -1048,10 +1055,16 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 		model.tables.push_back(std::move(t));
 	}
 	for (const SysObject *o : views) {
+		std::string schema_reason;
+		std::string schema_name = schema_of(*o, schema_reason);
+		if (!scope.WantsView(schema_name, o->name)) {
+			continue;
+		}
 		CatalogView v;
 		v.object_id = o->id;
 		v.schema_id = o->schema_id;
-		v.schema_name = schema_of(*o, v.reason);
+		v.schema_name = std::move(schema_name);
+		v.reason = std::move(schema_reason);
 		v.name = o->name;
 		v.created = o->created;
 		v.modified = o->modified;

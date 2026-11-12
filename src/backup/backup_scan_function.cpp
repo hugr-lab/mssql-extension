@@ -107,11 +107,24 @@ struct ScanBindData : public TableFunctionData {
 	}
 };
 
+//! The scan's model: the one table (task 16e: the bind described every table of the database for it).
+CatalogScope TableScope(const std::string &schema, const std::string &table) {
+	CatalogScope scope;
+	scope.by_schema = true;
+	scope.schemas = {schema};
+	scope.by_table = true;
+	scope.tables = {table};
+	scope.no_views = true;
+	return scope;
+}
+
 // The backup on `paths` opened and `schema`.`table` found; its columns into `data`.
 void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *names) {
 	try {
 		data.catalog = std::shared_ptr<OpenedCatalog>(
-			OpenBackupCatalog(context, std::vector<std::string>(data.paths.begin(), data.paths.end())).release());
+			OpenBackupCatalog(context, std::vector<std::string>(data.paths.begin(), data.paths.end()), true,
+							  TableScope(data.schema, data.table))
+				.release());
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", FUNCTION, e.what());
 	}

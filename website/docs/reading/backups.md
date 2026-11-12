@@ -164,6 +164,14 @@ SELECT table_name, column_name, state, reason
 FROM mssql_backup_columns('/backups/sales_full.bak') WHERE state <> 'converted' OR reason IS NOT NULL;
 ```
 
+A filter on `schema_name`, `table_name` or `view_name` -- `=` a name, `IN` a list, or an `OR` of
+those -- makes the listings (and `mssql_backup_columns`) describe only the objects it names: on a
+database of thousands of tables, `WHERE table_name = 'orders'` reads the system tables but builds
+one table's columns, layout and partitioning. The rows are the same either way, but for one bound: a
+call reads at most 1 GiB of views' definitions stored off row, so a narrowed call can give a
+definition that the whole listing, past that bound, gives as NULL with its reason. `EXPLAIN` shows
+what a call describes (`Describes`).
+
 `mssql_backup_views` columns: `schema_name`, `view_name`, `object_id`, `definition` (the T-SQL text
 as stored; NULL for a view created `WITH ENCRYPTION`, which the reader does not de-obfuscate),
 `is_encrypted`, `created`, `modified`, and `reason`: why a definition could not be read, NULL

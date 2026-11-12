@@ -316,6 +316,32 @@ PartitionCatalog ReadPartitionCatalog(const PageStore &store, const BootstrapTab
 void DescribePartitioning(const PartitionCatalog &pc, const std::unordered_map<int32_t, std::string> &type_names,
 						  int32_t base_index, const BoundaryCheck &check, CatalogTable &t);
 
+//! Which objects a model is built for (task 16e: the names a catalog function's filter or a scan
+//! asks for), by name as stored. A kind not narrowed is every object of it; one narrowed to an empty
+//! set is none. The schemas themselves are never narrowed; mssql_backup_schemas narrows tables and
+//! views by schema only, so its counts stay whole.
+struct CatalogScope {
+	bool by_schema = false;
+	std::set<std::string> schemas;
+	bool by_table = false;
+	std::set<std::string> tables;  // table names
+	bool no_tables = false;
+	bool by_view = false;
+	std::set<std::string> views;  // view names
+	bool no_views = false;
+
+	bool WantsTable(const std::string &schema, const std::string &name) const {
+		return !no_tables && (!by_schema || schemas.count(schema)) && (!by_table || tables.count(name));
+	}
+	bool WantsView(const std::string &schema, const std::string &name) const {
+		return !no_views && (!by_schema || schemas.count(schema)) && (!by_view || views.count(name));
+	}
+	bool operator==(const CatalogScope &o) const {
+		return by_schema == o.by_schema && schemas == o.schemas && by_table == o.by_table && tables == o.tables &&
+			   no_tables == o.no_tables && by_view == o.by_view && views == o.views && no_views == o.no_views;
+	}
+};
+
 //! The catalog model of the database whose base tables are `tables`, its other system tables read
 //! through `store`. What one object's rows get wrong is named on that object (D13): a table the scan
 //! cannot read -- its schema or a column's type not in the catalog, an added column's default it
@@ -324,8 +350,11 @@ void DescribePartitioning(const PartitionCatalog &pc, const std::unordered_map<i
 //! column or an unusable default refuses the table, not the column (the scan's column-level refusal
 //! is PR 2d's). A FormatError only for what the model as a whole rests on (a system table missing,
 //! a malformed row of sysclsobjs or sysscalartypes).
+//! Only the tables and views `scope` asks for are described and listed: their columns, layouts,
+//! defaults, partitioning and definitions are the per-object cost; the system tables are read whole.
 CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &tables,
-							   const BoundaryCheck &check = BoundaryCheck());
+							   const BoundaryCheck &check = BoundaryCheck(),
+							   const CatalogScope &scope = CatalogScope());
 
 //! The flag of a module's sysobjvalues `value` that says its text is Latin-1, not UTF-16LE.
 constexpr int64_t MODULE_TEXT_LATIN1 = 0x2;

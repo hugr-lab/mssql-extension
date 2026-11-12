@@ -21,10 +21,17 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "mssql_function_docs.hpp"
 #include "tds/encoding/datetime_encoding.hpp"
 
 #include <cstring>
+#include <set>
 
 namespace duckdb {
 namespace mssql {
@@ -411,6 +418,9 @@ struct CatalogListBindData : public TableFunctionData {
 	bool by_table = false;
 	std::string schema;
 	std::string table;
+	//! The objects the model is built for (task 16e): the listing's kind, the arguments, and the
+	//! names the query's filters ask for (PushdownNames).
+	CatalogScope scope;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<CatalogListBindData>();
@@ -420,12 +430,13 @@ struct CatalogListBindData : public TableFunctionData {
 		copy->by_table = by_table;
 		copy->schema = schema;
 		copy->table = table;
+		copy->scope = scope;
 		return std::move(copy);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<CatalogListBindData>();
 		return paths == other.paths && listing == other.listing && by_schema == other.by_schema &&
-			   by_table == other.by_table && schema == other.schema && table == other.table;
+			   by_table == other.by_table && schema == other.schema && table == other.table && scope == other.scope;
 	}
 	bool Wants(const CatalogTable &t) const {
 		return (!by_schema || t.schema_name == schema) && (!by_table || t.name == table);
@@ -468,6 +479,17 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 		data->by_table = true;
 		data->table = NameArgument(input.inputs[2], "table");
 	}
+	// What the listing describes: a table listing no view, a view listing no table; the arguments.
+	data->scope.no_views = L == Listing::Tables || L == Listing::Columns;
+	data->scope.no_tables = L == Listing::Views;
+	if (data->by_schema) {
+		data->scope.by_schema = true;
+		data->scope.schemas = {data->schema};
+	}
+	if (data->by_table) {
+		data->scope.by_table = true;
+		data->scope.tables = {data->table};
+	}
 	for (const auto &column : L == Listing::Tables	  ? TableColumns()
 							  : L == Listing::Views	  ? ViewColumns()
 							  : L == Listing::Columns ? ColumnColumns()
@@ -478,11 +500,159 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	return std::move(data);
 }
 
+//! The names `filter` asks one column for: `c = 'x'`, `c IN ('x', ...)`, or an OR of those on one
+//! column, `c` a bare column of the function (its output index into `column`). False for anything else
+//! (a function of the column, a collation, another type, a NULL): that filter narrows nothing.
+bool NamesOf(const Expression &filter, const LogicalGet &get, idx_t &column, std::set<std::string> &names) {
+	auto column_of = [&](const Expression &e, idx_t &out) {
+		if (e.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return false;
+		}
+		const idx_t at = e.Cast<BoundColumnRefExpression>().Binding().column_index;
+		const auto &ids = get.GetColumnIds();
+		if (at >= ids.size() || ids[at].IsVirtualColumn()) {
+			return false;
+		}
+		out = ids[at].GetPrimaryIndex();
+		return true;
+	};
+	auto name_of = [](const Expression &e, std::string &out) {
+		if (e.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return false;
+		}
+		const Value &v = e.Cast<BoundConstantExpression>().GetValue();
+		if (v.IsNull() || v.type().id() != LogicalTypeId::VARCHAR) {
+			return false;
+		}
+		out = StringValue::Get(v);
+		return true;
+	};
+	if (filter.GetExpressionType() == ExpressionType::COMPARE_EQUAL &&
+		filter.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		const auto &f = filter.Cast<BoundFunctionExpression>();
+		const Expression &l = BoundComparisonExpression::Left(f);
+		const Expression &r = BoundComparisonExpression::Right(f);
+		std::string name;
+		if ((column_of(l, column) && name_of(r, name)) || (column_of(r, column) && name_of(l, name))) {
+			names.insert(name);
+			return true;
+		}
+		return false;
+	}
+	if (filter.GetExpressionType() == ExpressionType::COMPARE_IN &&
+		filter.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
+		const auto &children = filter.Cast<BoundOperatorExpression>().GetChildren();
+		if (children.size() < 2 || !column_of(*children[0], column)) {
+			return false;
+		}
+		for (size_t i = 1; i < children.size(); i++) {
+			std::string name;
+			if (!name_of(*children[i], name)) {
+				return false;
+			}
+			names.insert(name);
+		}
+		return true;
+	}
+	if (filter.GetExpressionType() == ExpressionType::CONJUNCTION_OR &&
+		filter.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION) {
+		bool first = true;
+		for (const auto &child : filter.Cast<BoundConjunctionExpression>().GetChildren()) {
+			idx_t at = 0;
+			if (!NamesOf(*child, get, at, names) || (!first && at != column)) {
+				return false;
+			}
+			column = at;
+			first = false;
+		}
+		return !first;
+	}
+	return false;
+}
+
+//! `set` narrowed to `names` (the filters are ANDed: an intersection).
+void Narrow(bool &by, std::set<std::string> &set, const std::set<std::string> &names) {
+	if (!by) {
+		by = true;
+		set = names;
+		return;
+	}
+	std::set<std::string> both;
+	for (const auto &n : names) {
+		if (set.count(n)) {
+			both.insert(n);
+		}
+	}
+	set = std::move(both);
+}
+
+//! Task 16e: the query's filters on the listing's name columns narrow the objects the model is built
+//! for. Every filter stays in `filters`, so DuckDB still applies it: the scope only decides what is
+//! described, never which rows are returned -- a filter misread here costs work, not rows.
+template <Listing L>
+void PushdownNames(ClientContext &, LogicalGet &get, FunctionData *bind_data_p,
+				   vector<unique_ptr<Expression>> &filters) {
+	auto &data = bind_data_p->Cast<CatalogListBindData>();
+	const auto columns = L == Listing::Tables	 ? TableColumns()
+						 : L == Listing::Views	 ? ViewColumns()
+						 : L == Listing::Columns ? ColumnColumns()
+												 : SchemaColumns();
+	for (const auto &filter : filters) {
+		idx_t column = 0;
+		std::set<std::string> names;
+		if (!NamesOf(*filter, get, column, names) || column >= columns.size()) {
+			continue;
+		}
+		const std::string name = columns[column].name;
+		if (name == "schema_name") {
+			Narrow(data.scope.by_schema, data.scope.schemas, names);
+		} else if (name == "table_name") {
+			Narrow(data.scope.by_table, data.scope.tables, names);
+		} else if (name == "view_name") {
+			Narrow(data.scope.by_view, data.scope.views, names);
+		}
+	}
+}
+
+//! The scope as EXPLAIN shows it (task 16e): what the call describes, so a narrowing can be seen.
+InsertionOrderPreservingMap<string> ScopeToString(TableFunctionToStringInput &input) {
+	InsertionOrderPreservingMap<string> result;
+	if (!input.bind_data) {
+		return result;
+	}
+	const CatalogScope &scope = input.bind_data->Cast<CatalogListBindData>().scope;
+	auto names = [](const std::set<std::string> &set) {
+		std::string out;
+		for (const auto &n : set) {
+			out += (out.empty() ? "" : ", ") + n;
+		}
+		return "{" + out + "}";
+	};
+	std::string text;
+	auto part = [&text](const std::string &p) { text += (text.empty() ? "" : "; ") + p; };
+	if (scope.by_schema) {
+		part("schemas " + names(scope.schemas));
+	}
+	if (scope.no_tables) {
+		part("no tables");
+	} else if (scope.by_table) {
+		part("tables " + names(scope.tables));
+	}
+	if (scope.no_views) {
+		part("no views");
+	} else if (scope.by_view) {
+		part("views " + names(scope.views));
+	}
+	result["Describes"] = text.empty() ? "every table and view" : text;
+	return result;
+}
+
 unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionInitInput &input) {
 	const auto &data = input.bind_data->Cast<CatalogListBindData>();
 	auto state = make_uniq<CatalogListState>();
 	try {
-		state->catalog = OpenBackupCatalog(context, std::vector<std::string>(data.paths.begin(), data.paths.end()));
+		state->catalog = OpenBackupCatalog(context, std::vector<std::string>(data.paths.begin(), data.paths.end()),
+										   true, data.scope);
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", FunctionName(data.listing), e.what());
 	}
@@ -535,13 +705,18 @@ template <Listing L>
 void Register(ExtensionLoader &loader, const char *description, std::vector<std::string> examples) {
 	TableFunctionSet set(FunctionName(L));
 	const vector<LogicalType> arguments{LogicalType(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)};
+	auto add = [&](vector<LogicalType> args) {
+		TableFunction f(FunctionName(L), std::move(args), Execute, Bind<L>, Init);
+		f.pushdown_complex_filter = PushdownNames<L>;
+		f.to_string = ScopeToString;
+		set.AddFunction(std::move(f));
+	};
 	for (const auto &argument : arguments) {
-		set.AddFunction(TableFunction(FunctionName(L), {argument}, Execute, Bind<L>, Init));
+		add({argument});
 		if (L == Listing::Columns) {
 			// (path, schema) and (path, schema, table).
-			set.AddFunction(TableFunction(FunctionName(L), {argument, LogicalType::VARCHAR}, Execute, Bind<L>, Init));
-			set.AddFunction(TableFunction(FunctionName(L), {argument, LogicalType::VARCHAR, LogicalType::VARCHAR},
-										  Execute, Bind<L>, Init));
+			add({argument, LogicalType::VARCHAR});
+			add({argument, LogicalType::VARCHAR, LogicalType::VARCHAR});
 		}
 	}
 	mssql::RegisterDocumentedFunction(loader, std::move(set), {{}, description, std::move(examples), {"backup"}});

@@ -66,3 +66,19 @@ statement error
 SELECT * FROM mssql_backup_columns('test/data/backup/full.bak', 'dbo', NULL);
 ----
 the table is NULL
+
+# Task 16e: a filter narrows the tables described; the arguments and the filter together.
+query I
+SELECT count(*) FROM mssql_backup_columns('test/data/backup/full.bak') WHERE table_name = 'items';
+----
+7
+
+query I
+SELECT count(*) FROM mssql_backup_columns('test/data/backup/full.bak', 'dbo') WHERE table_name IN ('events', 'items');
+----
+11
+
+query I
+SELECT count(*) FROM mssql_backup_columns('test/data/backup/full.bak', 'dbo', 'items') WHERE table_name = 'events';
+----
+0

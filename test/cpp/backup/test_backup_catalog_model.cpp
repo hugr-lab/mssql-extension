@@ -92,6 +92,29 @@ int main() {
 				  ": dbo.items and dbo.events, no other user table (the MS-shipped trace_xe_* left out), "
 				  "no view; schemas dbo and sys" +
 				  (error.empty() ? "" : " -- " + error));
+		{
+			// Task 16e: a scope builds only the objects it names; the schemas are every one either way.
+			const BootstrapTables bootstrap = ReadBootstrapTables(*pages->store, ReadBootPage(boot));
+			CatalogScope one;
+			one.by_table = true;
+			one.tables = {"items"};
+			const CatalogModel scoped = BuildCatalogModel(*pages->store, bootstrap, BoundaryCheck(), one);
+			CatalogScope none;
+			none.no_tables = true;
+			none.no_views = true;
+			const CatalogModel empty = BuildCatalogModel(*pages->store, bootstrap, BoundaryCheck(), none);
+			CatalogScope elsewhere;
+			elsewhere.by_schema = true;
+			elsewhere.schemas = {"sales"};
+			const CatalogModel other = BuildCatalogModel(*pages->store, bootstrap, BoundaryCheck(), elsewhere);
+			const CatalogTable *scoped_items = scoped.FindTable("dbo", "items");
+			Check(scoped.tables.size() == 1 && scoped_items && scoped_items->columns.size() == 7 &&
+					  scoped_items->decodable && empty.tables.empty() && other.tables.empty() &&
+					  scoped.schemas.size() == m.schemas.size() && empty.schemas.size() == m.schemas.size(),
+				  form.front() +
+					  ": a scope of dbo.items builds it alone, whole; no tables builds none; another "
+					  "schema none; the schemas all, every time");
+		}
 		if (!items || !events || items->columns.size() != 7 || items->partitions.size() != 1) {
 			continue;
 		}

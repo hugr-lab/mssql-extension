@@ -1387,14 +1387,24 @@ per-AU runs and parallel units (2e), off-row values (PR 3), `mssql_backup_column
     wider than the 24-byte off-row pointer in a table whose declared row can pass 8,060 bytes (counted
     generously -- a MAX column at its 8,000-byte in-row share, a uniquifier, a version tag -- since the
     server moves the widest value off row, whichever it is: `converted` is never promised for a value
-    that can go off row; dropped columns' bytes in old records are not counted), read in row and
+    that can go off row -- confirmed by the owner, 2026-11-12; dropped columns' bytes in old records
+    are not counted), read in row and
     refused off row until PR 3; a table not read says so in each column's reason. Checked in the
     oracle lane: the columns, `sql_type` and `system_type` against the server's (compare_catalog.py)
 16e. Filter pushdown into the catalog functions (owner, 2026-11-11): `schema_name` / `table_name` /
     `view_name` equalities and IN lists of `mssql_backup_schemas` / `_tables` / `_views` / `_columns`
     pushed into the model's build, so only the objects asked for get their columns, layouts, defaults
     and partitioning built and listed; the open pass and the bootstrap tables are the fixed cost the
-    cache (task 22) and an attached catalog (task 23) take away — 1 d
+    cache (task 22) and an attached catalog (task 23) take away — 1 d. As landed: `CatalogScope`
+    (BuildCatalogModel, OpenBackupCatalog), filled from a listing's kind (a table listing describes
+    no view, a view listing no table), mssql_backup_columns' arguments, and `pushdown_complex_filter`
+    reading `c = 'x'`, `c IN (…)` and an OR of those on one bare name column (several on one column
+    intersect); every filter stays in the plan, so DuckDB still applies it and a filter the reader
+    misreads costs work, never rows (one exception: the 1 GiB a call reads of views' off-row
+    definitions is charged over the views it builds, so a narrowed call can give a definition the whole
+    listing gives past the bound; review of 16e). EXPLAIN shows the scope (`Describes`). `mssql_backup_schemas` is narrowed by schema only, so its
+    counts stay whole. `mssql_backup_scan`'s bind builds its one table, not the database's (beyond
+    the task). The system tables (sysobjvalues, the partitioning, the defaults) are still read whole
 16f. Indexed views (owner, 2026-11-11). A view `WITH SCHEMABINDING` with a unique clustered index
     stores its result as that index: a base rowset of the view's object (`sysrowsets` index 1, its
     allocation units, IAM chain and `sysrscols` layout), leaf records FixedVar like a clustered

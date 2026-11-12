@@ -101,9 +101,9 @@ struct OpenedCatalog {
 //! and checked (CheckBootAgainstSet), ReadBootstrapTables and BuildCatalogModel. FormatError naming
 //! the backup otherwise.
 //! `with_model` false stops after the bootstrap tables (the model left empty): what a reader of the
-//! base tables needs.
+//! base tables needs. `scope`: the tables and views the model is built for (task 16e).
 std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths,
-												 bool with_model = true);
+												 bool with_model = true, const CatalogScope &scope = CatalogScope());
 
 //! The files of `paths` (paths or globs: the families of one media set) opened, walked and checked:
 //! one backup set per file (an appended set is refused), the same backup set GUID in every family,

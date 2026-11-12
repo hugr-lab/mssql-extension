@@ -101,3 +101,83 @@ statement error
 SELECT * FROM mssql_backup_tables(NULL::VARCHAR);
 ----
 the path is NULL
+
+# Task 16e: a filter on schema_name / table_name / view_name narrows the objects the catalog model is
+# built for; DuckDB still applies every filter, so the rows are those of the unfiltered listing.
+query T
+SELECT table_name FROM mssql_backup_tables('test/data/backup/full.bak') WHERE table_name = 'items';
+----
+items
+
+query T
+SELECT table_name FROM mssql_backup_tables('test/data/backup/full.bak')
+WHERE table_name IN ('items', 'events', 'nothing') AND schema_name = 'dbo' ORDER BY 1;
+----
+events
+items
+
+query T
+SELECT table_name FROM mssql_backup_tables('test/data/backup/full.bak')
+WHERE table_name = 'items' OR table_name = 'events' ORDER BY 1;
+----
+events
+items
+
+# A filter the pushdown does not read narrows nothing, and still filters.
+query T
+SELECT table_name FROM mssql_backup_tables('test/data/backup/full.bak') WHERE lower(table_name) = 'items';
+----
+items
+
+query I
+SELECT count(*) FROM mssql_backup_tables('test/data/backup/full.bak') WHERE table_name = 'items' AND table_name = 'events';
+----
+0
+
+query I
+SELECT count(*) FROM mssql_backup_tables('test/data/backup/full.bak') WHERE table_name = NULL;
+----
+0
+
+# Through an unnest of the columns, and on the schemas' counts (narrowed by schema only).
+query I
+SELECT count(*) FROM (SELECT table_name, unnest(columns) FROM mssql_backup_tables('test/data/backup/full.bak'))
+WHERE table_name = 'items';
+----
+7
+
+query TII
+SELECT schema_name, table_count, view_count FROM mssql_backup_schemas('test/data/backup/full.bak') WHERE schema_name = 'dbo';
+----
+dbo	2	0
+
+query I
+SELECT count(*) FROM mssql_backup_views('test/data/backup/full.bak') WHERE view_name = 'v';
+----
+0
+
+# The scope a call describes, in EXPLAIN (task 16e): the filters narrow it.
+query II
+EXPLAIN SELECT * FROM mssql_backup_tables('test/data/backup/full.bak') WHERE table_name IN ('items', 'events') AND schema_name = 'dbo';
+----
+physical_plan	<REGEX>:.*schemas \{dbo\}; tables \{events, items\}; no views.*
+
+query II
+EXPLAIN SELECT * FROM mssql_backup_tables('test/data/backup/full.bak') WHERE lower(table_name) = 'items';
+----
+physical_plan	<REGEX>:.*Describes: no views.*
+
+query II
+EXPLAIN SELECT * FROM mssql_backup_views('test/data/backup/full.bak') WHERE view_name = 'v' OR view_name = 'w';
+----
+physical_plan	<REGEX>:.*no tables; views \{v, w\}.*
+
+query II
+EXPLAIN SELECT * FROM mssql_backup_schemas('test/data/backup/full.bak') WHERE schema_name = 'dbo';
+----
+physical_plan	<REGEX>:.*Describes: schemas \{dbo\}.*
+
+query II
+EXPLAIN SELECT * FROM mssql_backup_columns('test/data/backup/full.bak', 'dbo') WHERE table_name = 'items';
+----
+physical_plan	<REGEX>:.*schemas \{dbo\}; tables \{items\}; no views.*

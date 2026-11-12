@@ -247,7 +247,7 @@ std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &context, const Opene
 }
 
 std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths,
-												 bool with_model) {
+												 bool with_model, const CatalogScope &scope) {
 	std::unique_ptr<OpenedCatalog> opened(new OpenedCatalog());
 	opened->headers = OpenBackupHeaders(context, paths);
 	opened->pages = OpenBackupPages(context, *opened->headers);
@@ -260,9 +260,9 @@ std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const s
 		if (with_model) {
 			// A boundary decodes when the value mssql_backup_tables would give it does: one verdict, the
 			// model's (review of #551).
-			opened->model =
-				BuildCatalogModel(*opened->pages->store, opened->tables,
-								  [](const SqlVariant &v, const std::string &what) { (void)SqlVariantValue(v, what); });
+			opened->model = BuildCatalogModel(
+				*opened->pages->store, opened->tables,
+				[](const SqlVariant &v, const std::string &what) { (void)SqlVariantValue(v, what); }, scope);
 		}
 	} catch (FormatError &e) {
 		// The readers' messages start "backup: "; under the file's name that is said already.
