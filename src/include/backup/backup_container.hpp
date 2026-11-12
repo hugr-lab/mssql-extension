@@ -118,8 +118,9 @@ std::vector<uint8_t> ReadContainerTape(const RandomAccess &file, const BlockDeco
 //! The data set as a RandomAccess over the container: a read finds its blocks through the chain
 //! and decodes them (stored blocks are copied; compressed ones go to `decoder`, which may be
 //! empty until tasks 5 / 6, then refused by name). Keeps the last decoded blocks per instance and
-//! serialises its readers: it serves the header walks (SSET .. MSCI, the trailer). The open pass
-//! and the scan decode blocks on their own threads (D10), each with its own buffer (task 7).
+//! serialises its readers: it serves the header walks (SSET .. MSCI, the trailer), and the page
+//! reads of the catalog and the scan (PageIndex reads a container's pages through it; one stream a
+//! family). The open pass decodes blocks on its own threads (D10), each with its own buffer (task 7).
 class ContainerStream : public RandomAccess {
 public:
 	ContainerStream(const RandomAccess &file, BlockChain chain, BlockDecoder decoder);
@@ -160,10 +161,11 @@ private:
 	BlockDecoder decoder_;
 	std::string name_;
 	mutable std::mutex lock_;
-	//! The last RECENT_BLOCKS blocks decoded (1 MiB): a search reads a window of 16 groups and the
-	//! pages it found are then read from the same blocks, which would otherwise be decoded twice
-	//! (measured on the large fixture's MS_XPRESS heap: decoding was then the scan's whole cost).
-	static constexpr size_t RECENT_BLOCKS = 16;
+	//! The last RECENT_BLOCKS blocks decoded (up to 4 MiB). A search reads windows of 16 groups, its
+	//! galloping probes overlap, and the pages it found are then read from the same blocks: with
+	//! 16 slots every block of a scan was decoded about 5 times (measured, 25k blocks decoded 125k
+	//! times on a 200k-page heap); with 64, once. 128 measured no better.
+	static constexpr size_t RECENT_BLOCKS = 64;
 	mutable std::vector<DecodedBlock> recent_ = std::vector<DecodedBlock>(RECENT_BLOCKS);
 	mutable size_t next_slot_ = 0;
 	//! The blocks the last RECENT_LOCATED Locates returned: a later offset in the same span between
