@@ -358,20 +358,33 @@ bool OpenChainFromTail(const RandomAccess &file, BlockChain &chain, std::vector<
 ContainerStream::ContainerStream(const RandomAccess &file, BlockChain chain, BlockDecoder decoder)
 	: file_(file), chain_(std::move(chain)), decoder_(std::move(decoder)), name_(file.Name() + " (data set)") {}
 
-void ContainerStream::Decode(const ChainBlock &block) const {
+const ContainerStream::DecodedBlock *ContainerStream::Recent(uint64_t logical) const {
+	for (const auto &d : recent_) {
+		if (d.valid && logical >= d.block.logical && logical < d.block.logical + d.block.output) {
+			return &d;
+		}
+	}
+	return nullptr;
+}
+
+const ContainerStream::DecodedBlock &ContainerStream::Decoded(const ChainBlock &block) const {
+	DecodedBlock &d = recent_[next_slot_];
+	next_slot_ = (next_slot_ + 1) % recent_.size();
+	d.valid = false;
 	auto payload = Read(file_, block.physical + BLOCK_HEADER, block.payload, "a block's payload");
-	cached_output_.resize(block.output);
+	d.output.resize(block.output);
 	if (block.Stored()) {
-		std::memcpy(cached_output_.data(), payload.data(), block.output);
+		std::memcpy(d.output.data(), payload.data(), block.output);
 	} else {
 		if (!decoder_) {
 			throw FormatError(Where(file_, block.physical) +
 							  ": a compressed block, and no decoder for this container's algorithm");
 		}
-		decoder_(payload.data(), payload.size(), cached_output_.data(), block.output);
+		decoder_(payload.data(), payload.size(), d.output.data(), block.output);
 	}
-	cached_ = block;
-	has_cached_ = true;
+	d.block = block;
+	d.valid = true;
+	return d;
 }
 
 ChainBlock ContainerStream::Locate(uint64_t logical) const {
@@ -391,13 +404,40 @@ ChainBlock ContainerStream::Locate(uint64_t logical) const {
 	--it;
 	ChainBlock block = *it;
 	const uint64_t stop = (it + 1) != chain_.checkpoints.end() ? (it + 1)->physical : chain_.end;
-	ChainBlock last_checkpoint = block;
+	// From the nearest block located lately that lies in this span at or before `logical` (a block a
+	// walk already confirmed, so the walk from it reads only the headers after it). The checkpoints
+	// the walk adds keep their spacing from the span's checkpoint, as a walk from it would: in bytes
+	// from the checkpoint itself, in blocks from the count the recent block was found at.
+	const ChainBlock last_checkpoint_start = block;
 	uint64_t since = 0;
+	for (const auto &recent : located_) {
+		if (recent.block.physical > block.physical && recent.block.physical < stop && recent.block.logical <= logical) {
+			block = recent.block;
+			since = recent.since;
+		}
+	}
+	ChainBlock last_checkpoint = last_checkpoint_start;
+	const ChainBlock start = block;
 	std::vector<ChainBlock> added;
 	while (block.physical < stop) {
 		if (logical < block.logical + block.output) {
 			if (!added.empty()) {
 				chain_.checkpoints.insert(it + 1, added.begin(), added.end());
+			}
+			Located found;
+			found.block = block;
+			found.since = since;
+			// Not recorded: a recent block found again without a step (it is in the ring already), and
+			// the span's checkpoint itself (a walk starts there anyway; the ring keeps only blocks past
+			// one, review of #552).
+			if (block.physical == start.physical) {
+				return block;
+			}
+			if (located_.size() < RECENT_LOCATED) {
+				located_.push_back(found);
+			} else {
+				located_[next_located_] = found;
+				next_located_ = (next_located_ + 1) % RECENT_LOCATED;
 			}
 			return block;
 		}
@@ -435,13 +475,13 @@ void ContainerStream::ReadAt(uint64_t offset, uint8_t *dest, size_t count) const
 	}
 	std::lock_guard<std::mutex> guard(lock_);
 	while (count > 0) {
-		if (!has_cached_ || offset < cached_.logical || offset >= cached_.logical + cached_.output) {
-			has_cached_ = false;
-			Decode(Locate(offset));
+		const DecodedBlock *d = Recent(offset);
+		if (!d) {
+			d = &Decoded(Locate(offset));
 		}
-		const size_t within = static_cast<size_t>(offset - cached_.logical);
-		const size_t n = std::min(count, static_cast<size_t>(cached_.output) - within);
-		std::memcpy(dest, cached_output_.data() + within, n);
+		const size_t within = static_cast<size_t>(offset - d->block.logical);
+		const size_t n = std::min(count, static_cast<size_t>(d->block.output) - within);
+		std::memcpy(dest, d->output.data() + within, n);
 		dest += n;
 		offset += n;
 		count -= n;

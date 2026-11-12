@@ -263,6 +263,17 @@ SELECT schema_name, table_name, row_count FROM mssql_backup_tables('/backups/sal
 SELECT view_name, definition FROM mssql_backup_views('/backups/sales_full.bak');
 ```
 
+### mssql_backup_schemas()
+
+The schemas of the database in a SQL Server full backup, as `sys.schemas` lists them, with the user
+tables and views in each. See [Backup Files](../reading/backups.md#tables-and-views).
+
+**Signature:** `mssql_backup_schemas(path VARCHAR | VARCHAR[]) -> TABLE(schema_id INTEGER, schema_name VARCHAR, table_count INTEGER, view_count INTEGER)`
+
+```sql
+SELECT schema_name, table_count FROM mssql_backup_schemas('/backups/sales_full.bak');
+```
+
 ### mssql_backup_catalog()
 
 A system base table of the database in a SQL Server full backup, as stored, with the virtual
@@ -274,6 +285,19 @@ A system base table of the database in a SQL Server full backup, as stored, with
 ```sql
 SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak');
 SELECT id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs');
+```
+
+### mssql_backup_scan()
+
+A user table's rows from a SQL Server full backup, with no SQL Server, typed as `TYPE mssql` reads
+them; virtual columns `_mssql_page`, `_mssql_rid` and `_mssql_page_lsn`. See
+[Backup Files](../reading/backups.md#rows).
+
+**Signature:** `mssql_backup_scan(path VARCHAR | VARCHAR[], schema VARCHAR, table VARCHAR) -> TABLE(...)`
+
+```sql
+SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');
+SELECT _mssql_page, _mssql_rid, order_id FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');
 ```
 
 ### Authentication Test Functions

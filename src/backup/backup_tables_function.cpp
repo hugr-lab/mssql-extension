@@ -24,8 +24,6 @@
 #include "mssql_function_docs.hpp"
 #include "tds/encoding/datetime_encoding.hpp"
 
-#include <algorithm>
-#include <cctype>
 #include <cstring>
 
 namespace duckdb {
@@ -121,6 +119,13 @@ std::vector<Column> TableColumns() {
 			{"partitions", LogicalType::LIST(PartitionStructType())}};
 }
 
+std::vector<Column> SchemaColumns() {
+	return {{"schema_id", LogicalType::INTEGER},
+			{"schema_name", LogicalType::VARCHAR},
+			{"table_count", LogicalType::INTEGER},
+			{"view_count", LogicalType::INTEGER}};
+}
+
 std::vector<Column> ViewColumns() {
 	return {{"schema_name", LogicalType::VARCHAR},	{"view_name", LogicalType::VARCHAR},
 			{"object_id", LogicalType::INTEGER},	{"definition", LogicalType::VARCHAR},
@@ -183,74 +188,10 @@ Value PointerValue(const PagePointer &p) {
 	return p.IsNull() ? Value(LogicalType::VARCHAR) : Value(p.ToString());
 }
 
-//! Why the scan cannot read column `c` (spec 085 § Scope's refusals), or "".
-std::string ColumnRefusal(const CatalogColumn &c, uint32_t code_page) {
-	switch (c.system_type_id) {
-	case 98:
-		return "sql_variant is not read (spec 086)";
-	case 241:
-		return "xml is not read (spec 086)";
-	case 240:
-		return (c.system_type_name.empty() ? "the CLR type " + c.type_name : c.system_type_name) +
-			   " is not read (spec 086)";
-	case 34:
-	case 35:
-	case 99:
-		return "text, ntext and image are not read yet";
-	default:
-		break;
-	}
-	if (c.system_type_name.empty() || c.system_type_name == "json" || c.system_type_name == "vector") {
-		return (c.type_name.empty() ? "type " + std::to_string(c.user_type_id) : c.type_name) +
-			   " is not read (spec 086)";
-	}
-	const bool code_page_text = c.system_type_id == 167 || c.system_type_id == 175 || c.system_type_id == 35;
-	if (code_page_text && c.collation_id != 0 && !CollationById(static_cast<int32_t>(c.collation_id))) {
-		return "its collation (CollationId " + std::to_string(c.collation_id) + ") is not one the reader knows";
-	}
-	if ((c.system_type_id == 167 || c.system_type_id == 175) &&
-		(code_page == 932 || code_page == 936 || code_page == 949 || code_page == 950)) {
-		return "a varchar of double-byte code page " + std::to_string(code_page) + " is not read (spec 086)";
-	}
-	if (c.is_computed && !c.is_persisted) {
-		return "a computed column that is not persisted is not stored";
-	}
-	if (c.is_sparse || c.is_column_set) {
-		return "sparse columns are not read (spec 086)";
-	}
-	return std::string();
-}
-
 Value ColumnValue(const CatalogColumn &c) {
 	const CollationRow *collation = c.collation_id ? CollationById(static_cast<int32_t>(c.collation_id)) : nullptr;
 	const uint32_t code_page = collation ? collation->code_page : 0;
-	std::string reason = ColumnRefusal(c, code_page);
-	Value duckdb_type(LogicalType::VARCHAR);
-	// The precision and scale are the file's: LogicalType::DECIMAL asserts what they must be (an
-	// assertion, not an exception), so a declaration no server writes is named here instead. By the
-	// name too, which the type map dispatches on: the file's sysscalartypes names it, and a CLR column
-	// (xtype 240) takes its name from its user type.
-	std::string name = c.system_type_name;
-	std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
-	const bool decimal = c.system_type_id == 106 || c.system_type_id == 108 || name == "decimal" || name == "numeric";
-	const bool scaled = c.system_type_id == 41 || c.system_type_id == 42 || c.system_type_id == 43 || name == "time" ||
-						name == "datetime2" || name == "datetimeoffset";
-	if ((decimal && (c.precision < 1 || c.precision > 38 || c.scale > c.precision)) || (scaled && c.scale > 7)) {
-		if (reason.empty()) {
-			reason = c.system_type_name + " is declared with precision " + std::to_string(c.precision) + " and scale " +
-					 std::to_string(c.scale) + ", which no SQL Server type has";
-		}
-	} else if (!c.system_type_name.empty()) {
-		try {
-			duckdb_type =
-				Value(MSSQLColumnInfo::MapSQLServerTypeToDuckDB(c.system_type_name, c.max_length, c.precision, c.scale)
-						  .ToString());
-		} catch (std::exception &e) {
-			if (reason.empty()) {
-				reason = c.system_type_name + " has no DuckDB type: " + e.what();
-			}
-		}
-	}
+	const ColumnReading reading = ReadingOf(c);
 	child_list_t<Value> f;
 	f.emplace_back("column_id", Value::INTEGER(c.column_id));
 	f.emplace_back("name", Text(c.name));
@@ -267,9 +208,9 @@ Value ColumnValue(const CatalogColumn &c) {
 	f.emplace_back("is_identity", Value::BOOLEAN(c.is_identity));
 	f.emplace_back("is_computed", Value::BOOLEAN(c.is_computed));
 	f.emplace_back("is_sparse", Value::BOOLEAN(c.is_sparse));
-	f.emplace_back("duckdb_type", duckdb_type);
-	f.emplace_back("decodable", Value::BOOLEAN(reason.empty()));
-	f.emplace_back("reason", OptionalText(reason));
+	f.emplace_back("duckdb_type", Value(reading.type.ToString()));
+	f.emplace_back("decodable", Value::BOOLEAN(reading.readable));
+	f.emplace_back("reason", OptionalText(reading.note));
 	return Value::STRUCT(std::move(f));
 }
 
@@ -384,6 +325,19 @@ std::vector<Value> TableRow(const CatalogTable &t) {
 	return row;
 }
 
+// One schema (sysclsobjs class 50, every one the database has, the system schemas and the roles'
+// included, as sys.schemas lists them) with the user tables and views the catalog lists in it.
+std::vector<Value> SchemaRow(const CatalogModel &model, const CatalogSchema &s) {
+	int32_t tables = 0, views = 0;
+	for (const auto &t : model.tables) {
+		tables += t.schema_id == s.id;
+	}
+	for (const auto &v : model.views) {
+		views += v.schema_id == s.id;
+	}
+	return {Value::INTEGER(s.id), Text(s.name), Value::INTEGER(tables), Value::INTEGER(views)};
+}
+
 // `off_row_bytes`: the call's off-row definitions so far, within MAX_CALL_OFF_ROW_BYTES in all (as
 // mssql_backup_catalog's; review of #549): past it a view's definition is NULL with the reason.
 std::vector<Value> ViewRow(const PageStore &store, const CatalogView &v, uint64_t &off_row_bytes) {
@@ -426,7 +380,7 @@ std::vector<Value> ViewRow(const PageStore &store, const CatalogView &v, uint64_
 	return row;
 }
 
-enum class Listing : uint8_t { Tables, Views };
+enum class Listing : uint8_t { Tables, Views, Schemas };
 
 struct CatalogListBindData : public TableFunctionData {
 	vector<std::string> paths;
@@ -451,7 +405,9 @@ struct CatalogListState : public GlobalTableFunctionState {
 };
 
 const char *FunctionName(Listing listing) {
-	return listing == Listing::Tables ? "mssql_backup_tables" : "mssql_backup_views";
+	return listing == Listing::Tables  ? "mssql_backup_tables"
+		   : listing == Listing::Views ? "mssql_backup_views"
+									   : "mssql_backup_schemas";
 }
 
 template <Listing L>
@@ -460,7 +416,9 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	auto data = make_uniq<CatalogListBindData>();
 	data->listing = L;
 	data->paths = PathsOf(input.inputs[0], FunctionName(L));
-	for (const auto &column : L == Listing::Tables ? TableColumns() : ViewColumns()) {
+	for (const auto &column : L == Listing::Tables	? TableColumns()
+							  : L == Listing::Views ? ViewColumns()
+													: SchemaColumns()) {
 		names.emplace_back(column.name);
 		return_types.push_back(column.type);
 	}
@@ -482,13 +440,16 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	const auto &data = input.bind_data->Cast<CatalogListBindData>();
 	auto &state = input.global_state->Cast<CatalogListState>();
 	const CatalogModel &model = state.catalog->model;
-	const size_t total = data.listing == Listing::Tables ? model.tables.size() : model.views.size();
+	const size_t total = data.listing == Listing::Tables  ? model.tables.size()
+						 : data.listing == Listing::Views ? model.views.size()
+														  : model.schemas.size();
 	idx_t count = 0;
 	while (state.next < total && count < STANDARD_VECTOR_SIZE) {
 		const std::vector<Value> row =
-			data.listing == Listing::Tables
-				? TableRow(model.tables[state.next])
-				: ViewRow(*state.catalog->pages->store, model.views[state.next], state.off_row_bytes);
+			data.listing == Listing::Tables ? TableRow(model.tables[state.next])
+			: data.listing == Listing::Views
+				? ViewRow(*state.catalog->pages->store, model.views[state.next], state.off_row_bytes)
+				: SchemaRow(model, model.schemas[state.next]);
 		for (idx_t c = 0; c < row.size(); c++) {
 			output.data[c].SetValue(count, row[c]);
 		}
@@ -526,6 +487,11 @@ void RegisterBackupTablesFunctions(ExtensionLoader &loader) {
 		"Lists the views in a SQL Server full backup (.bak), with their T-SQL definitions as stored (NULL for "
 		"a view created WITH ENCRYPTION, which the reader does not de-obfuscate), read from the file alone.",
 		{"SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sales_full.bak')"});
+	Register<Listing::Schemas>(
+		loader,
+		"Lists the schemas of the database in a SQL Server full backup (.bak), as sys.schemas does (the system "
+		"schemas and the roles' included), with the user tables and views in each, read from the file alone.",
+		{"SELECT schema_name, table_count, view_count FROM mssql_backup_schemas('/backups/sales_full.bak')"});
 }
 
 }  // namespace backup

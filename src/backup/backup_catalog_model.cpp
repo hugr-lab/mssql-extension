@@ -240,6 +240,67 @@ bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &default
 		why = std::string("its physical layout: ") + e.what();
 		return false;
 	}
+	// What sysrscols.ti says of each live column, checked against syscolpars' row of it (E20 pinned
+	// ti's fields): a disagreement, or a fixed column whose width is unknown, refuses the table here,
+	// by name, rather than mid-scan.
+	for (const auto &physical : layout.columns) {
+		if (physical.Dropped() || physical.Uniquifier()) {
+			continue;
+		}
+		auto column = by_id.find(physical.rscolid);
+		if (column == by_id.end()) {
+			if (physical.ordkey > 0) {
+				// The scan builds _mssql_rid from the key columns: one unchecked here would fail on every row.
+				why = "key column " + std::to_string(physical.rscolid) + " has no column";
+				return false;
+			}
+			continue;  // named below when it matters (an added column), as before
+		}
+		const CatalogColumn &c = *column->second;
+		const bool decimal = physical.xtype == XTYPE_DECIMAL || physical.xtype == XTYPE_NUMERIC;
+		const bool scaled =
+			physical.xtype == XTYPE_TIME || physical.xtype == XTYPE_DATETIME2 || physical.xtype == XTYPE_DATETIMEOFFSET;
+		if (physical.xtype != c.system_type_id || (decimal && physical.precision != c.precision) ||
+			((decimal || scaled) && physical.scale != c.scale)) {
+			why = "column " + c.name + " is stored as xtype " + std::to_string(physical.xtype) + " (precision " +
+				  std::to_string(physical.precision) + ", scale " + std::to_string(physical.scale) +
+				  "), which its declaration does not say";
+			return false;
+		}
+		// A fixed type stored as a variable column is the vardecimal storage format (or a layout the
+		// reader does not know); a variable type at a fixed offset is not one either. Two are both: char /
+		// nchar / binary NULL under ANSI_PADDING OFF are stored variable (and read so: their bytes,
+		// unpadded), and a CLR type of fixed length is stored fixed (its bytes). A type the reader does
+		// not know is not checked: it is read as its bytes wherever it is stored (ReadingOf).
+		const bool padded =
+			physical.xtype == XTYPE_CHAR || physical.xtype == XTYPE_NCHAR || physical.xtype == XTYPE_BINARY;
+		const bool fixed_type = KnownFixedXtype(physical.xtype) && !padded;
+		const bool variable_type = physical.xtype == XTYPE_VARCHAR || physical.xtype == XTYPE_NVARCHAR ||
+								   physical.xtype == XTYPE_VARBINARY || physical.xtype == XTYPE_SQL_VARIANT ||
+								   physical.xtype == XTYPE_XML || physical.xtype == XTYPE_IMAGE ||
+								   physical.xtype == XTYPE_TEXT || physical.xtype == XTYPE_NTEXT;
+		if ((fixed_type && physical.offset < 0) || (variable_type && physical.offset > 0)) {
+			why = "column " + c.name + " (xtype " + std::to_string(physical.xtype) + ") is stored as a " +
+				  (physical.offset < 0 ? "variable" : "fixed") +
+				  " column, which its type is not (the vardecimal storage format is not read)";
+			return false;
+		}
+		// A fixed char / nchar / binary is as wide as its declaration: a sysrscols width that disagrees
+		// with syscolpars' would read the neighbouring columns as its value (review of #552).
+		if (padded && physical.offset > 0 && physical.length != c.max_length) {
+			why = "column " + c.name + " is stored as " + std::to_string(physical.length) + " bytes, declared " +
+				  std::to_string(c.max_length);
+			return false;
+		}
+		if (physical.offset > 0) {
+			try {
+				(void)physical.FixedLength(t.name);
+			} catch (FormatError &e) {
+				why = e.what();
+				return false;
+			}
+		}
+	}
 	for (auto &physical : layout.columns) {
 		if (physical.Dropped() || physical.Uniquifier() || !physical.HasDefaultStatus()) {
 			continue;
@@ -303,11 +364,9 @@ void DecideDecodable(const BootstrapTables &tables, const AddedDefaults &default
 		}
 	}
 	std::map<int32_t, const CatalogColumn *> by_id;
+	// A sparse column (and the column set over them) is not readable, the narrowest refusal (D13): its
+	// value is in the row's sparse vector, a storage format of 086's; the table's other columns are.
 	for (const auto &c : t.columns) {
-		if (c.is_sparse || c.is_column_set) {
-			t.reason = "sparse columns are not read (spec 086)";
-			return;
-		}
 		by_id[c.column_id] = &c;
 	}
 	for (auto &p : t.partitions) {
@@ -740,6 +799,12 @@ std::set<int32_t> ReadPartitionFunctions(const PageStore &store, const Bootstrap
 
 std::string SqlTypeText(const std::string &type_name, const std::string &system_type_name, uint8_t system_type_id,
 						int16_t max_length, uint8_t precision, uint8_t scale) {
+	if (type_name.empty()) {
+		// No sysscalartypes row of its own (the column reads by its system type): named by that.
+		return system_type_name.empty()
+				   ? std::string()
+				   : SqlTypeText(system_type_name, system_type_name, system_type_id, max_length, precision, scale);
+	}
 	if (system_type_name.empty() || type_name != system_type_name) {
 		return type_name;
 	}
@@ -887,11 +952,10 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 			col.system_type_id = c->xtype;
 			col.user_type_id = c->user_type;
 			auto type = type_names.find(c->user_type);
+			// A type with no sysscalartypes row keeps an empty name: the column is read by its xtype, or as
+			// its stored bytes (ReadingOf), never refused by its type (owner, 2026-11-11).
 			if (type != type_names.end()) {
 				col.type_name = type->second;
-			} else if (t.reason.empty()) {
-				t.reason =
-					"column " + c->name + "'s type " + std::to_string(c->user_type) + " is not in sysscalartypes";
 			}
 			// A CLR type (xtype 240) has no row of its xtype: the system ones are known by their user type.
 			const int32_t system_id = c->xtype == 240 ? (c->user_type < 256 ? c->user_type : -1) : c->xtype;

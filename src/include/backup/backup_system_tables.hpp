@@ -42,22 +42,38 @@ namespace duckdb {
 namespace mssql {
 namespace backup {
 
-//! The xtype values the system-table decoder reads (sys.types' system_type_id).
+//! The xtype values the record decoder knows (sys.types' system_type_id).
+constexpr uint8_t XTYPE_IMAGE = 34;
+constexpr uint8_t XTYPE_TEXT = 35;
 constexpr uint8_t XTYPE_UNIQUEIDENTIFIER = 36;
+constexpr uint8_t XTYPE_DATE = 40;
+constexpr uint8_t XTYPE_TIME = 41;
+constexpr uint8_t XTYPE_DATETIME2 = 42;
+constexpr uint8_t XTYPE_DATETIMEOFFSET = 43;
 constexpr uint8_t XTYPE_TINYINT = 48;
 constexpr uint8_t XTYPE_SMALLINT = 52;
 constexpr uint8_t XTYPE_INT = 56;
 constexpr uint8_t XTYPE_SMALLDATETIME = 58;
+constexpr uint8_t XTYPE_REAL = 59;
+constexpr uint8_t XTYPE_MONEY = 60;
 constexpr uint8_t XTYPE_DATETIME = 61;
+constexpr uint8_t XTYPE_FLOAT = 62;
 constexpr uint8_t XTYPE_SQL_VARIANT = 98;
+constexpr uint8_t XTYPE_NTEXT = 99;
 constexpr uint8_t XTYPE_BIT = 104;
+constexpr uint8_t XTYPE_DECIMAL = 106;
+constexpr uint8_t XTYPE_NUMERIC = 108;
+constexpr uint8_t XTYPE_SMALLMONEY = 122;
 constexpr uint8_t XTYPE_BIGINT = 127;
 constexpr uint8_t XTYPE_VARBINARY = 165;
 constexpr uint8_t XTYPE_VARCHAR = 167;
 constexpr uint8_t XTYPE_BINARY = 173;
 constexpr uint8_t XTYPE_CHAR = 175;
+constexpr uint8_t XTYPE_TIMESTAMP = 189;
 constexpr uint8_t XTYPE_NVARCHAR = 231;
 constexpr uint8_t XTYPE_NCHAR = 239;
+constexpr uint8_t XTYPE_CLR = 240;	// hierarchyid, geometry, geography, a user-defined CLR type
+constexpr uint8_t XTYPE_XML = 241;
 
 //! One physical column of a rowset (a sysrscols row, named by syscolpars).
 struct PhysicalColumn {
@@ -65,7 +81,11 @@ struct PhysicalColumn {
 	int32_t rscolid = 0;
 	int32_t hbcolid = 0;
 	uint8_t xtype = 0;
-	uint16_t length = 0;  // bytes, for binary / char / nchar and the variable types (ti >> 8)
+	//! Bytes, for binary / char / nchar and the variable types; 0 for a MAX type. sysrscols.ti carries
+	//! it above the xtype, where a decimal / numeric has its precision and scale instead (one byte
+	//! each) and a time / datetime2 / datetimeoffset its scale (E20): those are in `precision` /
+	//! `scale`, and `length` is 0.
+	uint16_t length = 0;
 	uint8_t precision = 0;
 	uint8_t scale = 0;
 	uint32_t collation = 0;	 // a CollationId
@@ -87,9 +107,20 @@ struct PhysicalColumn {
 	bool HasDefaultStatus() const {
 		return (status & 0x200) != 0;
 	}
-	//! Bytes the column takes in the fixed part; a FormatError for a type this reader does not read.
+	//! Bytes the column takes in the fixed part: its type's width, or for a type the reader does not
+	//! know the length sysrscols gives it (read as its bytes); a FormatError when neither says.
 	uint16_t FixedLength(const std::string &table) const;
 };
+
+//! `xtype` is a fixed-width type the reader knows (FixedLength computes its width from the type).
+bool KnownFixedXtype(uint8_t xtype);
+//! The variable storage types the record decoder reads (varbinary, varchar, nvarchar, text, ntext,
+//! image, sql_variant, xml, a CLR type's 240).
+bool KnownVariableXtype(uint8_t xtype);
+
+//! The column's fields sysrscols.ti carries: the xtype in its low byte, then the length, or a decimal's
+//! precision and scale, or a time type's scale (E20: 0x0412 is decimal(18, 4), 0x07 datetime2(7)).
+void SetTypeInfo(PhysicalColumn &column, uint32_t ti);
 
 //! A rowset's physical columns, in rscolid order.
 struct RowsetLayout {
@@ -117,10 +148,42 @@ struct SystemRow {
 	uint16_t slot = 0;
 };
 
-//! The record `record` through `layout`: one value per column. Every byte read is bounded by the
-//! record's parts; a column the record does not hold where its layout says is a FormatError naming
-//! the column. A column added after the record with the default status and no default given is a
-//! FormatError too (it would read as NULL where the server reads its default).
+//! Where one column's value lies in a record: no copy. The scan's staging and DecodeRecord read it.
+enum class ValueState : uint8_t {
+	Null,	  // the null bitmap's NULL, or a dropped column
+	Inline,	  // `data` in the record: the fixed bytes (a bit's whole byte), or a variable column's
+	OffRow,	  // a complex variable column: `data` is its in-row pointer (row-overflow, LOB root)
+	Default,  // added after the record was written: `data` is the layout's default_bytes
+};
+struct ValueRef {
+	ValueState state = ValueState::Null;
+	const uint8_t *data = nullptr;
+	uint32_t size = 0;
+};
+
+//! The variable columns of `record` that belong to the table: all of them for a primary record, all
+//! but the last for a forwarded one, whose last is the back pointer (checked: complex, 10 bytes, tag
+//! 0x0400; else a FormatError naming `table`).
+size_t RowVarCount(const RecordView &record, const std::string &table);
+
+//! A forwarded record's place before it moved (its back pointer): the row's identity (`_mssql_rid`).
+struct RowLocation {
+	PagePointer page;
+	uint16_t slot = 0;
+};
+RowLocation ForwardedFrom(const RecordView &record, const std::string &table);
+
+//! Column `k` of `layout` in `record`, whose table variable columns are `var_count`
+//! (RowVarCount), by spec 085 § Rules, records, in its order: dropped -> Null; null bit past the
+//! record's column count -> Default when the layout gives one (a FormatError when the column has
+//! the default status and none was given, which would read NULL where the server reads the
+//! default; else Null); NULL bit -> Null; a fixed offset -> Inline, bounded by the fixed part (a bit
+//! column's whole byte; its bit is `bit_position`); a variable column -> Inline / OffRow, empty past
+//! the record's count. The uniquifier is a variable column like the others (empty = 0).
+ValueRef LocateValue(const RecordView &record, size_t var_count, const RowsetLayout &layout, size_t k);
+
+//! The record `record` through `layout`: one value per column (dropped and uniquifier columns NULL,
+//! a bit as one byte 0 / 1, LocateValue's rules and errors).
 std::vector<SystemValue> DecodeRecord(const RecordView &record, const RowsetLayout &layout);
 
 //! Value `value` of column `column` of `layout` as an integer (tinyint / smallint / int / bigint /

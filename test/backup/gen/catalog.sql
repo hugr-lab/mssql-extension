@@ -181,5 +181,12 @@ CREATE TRIGGER dbo.tr_secret ON dbo.empty_table AFTER INSERT AS BEGIN SET NOCOUN
 GO
 CREATE PARTITION FUNCTION pf_catalog (int) AS RANGE RIGHT FOR VALUES (10, 20, 30);
 GO
+-- Spec 085 PR 2d: a heap whose rows grew past their page with no row versioning in the database
+-- (forwarded records and stubs without a version tag; rows.sql has them with one).
+CREATE TABLE dbo.fwd_plain (id int NOT NULL, v varchar(3000) NULL);
+WITH n AS (SELECT TOP (300) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects)
+INSERT INTO dbo.fwd_plain SELECT i, CONCAT('s', i) FROM n;
+UPDATE dbo.fwd_plain SET v = REPLICATE(CAST(CONCAT('g', id) AS varchar(10)), 300) WHERE id % 3 = 0;
+GO
 BACKUP DATABASE bak_catalog TO DISK = '$(DIR)/catalog_full.bak' WITH FORMAT, INIT, CHECKSUM, NAME = 'catalog_full';
 GO

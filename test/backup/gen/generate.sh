@@ -7,13 +7,15 @@
 #   OUT=/tmp/bak IMAGE=mcr.microsoft.com/mssql/server:2022-latest test/backup/gen/generate.sh
 #   OUT=/tmp/bak FIXTURES=samples test/backup/gen/generate.sh  # samples.sql only (the committed set)
 #
-# FIXTURES (default "samples catalog partition files load large"): samples.sql, the database of the
+# FIXTURES (default "samples catalog partition files load large rows dbcs"): samples.sql, the database of the
 # committed samples; catalog.sql, the catalog fixture (spec 085 PR 2b); partition.sql, E7's partitioning
 # database and more boundary types (PR 2c); files.sql, two data files and a second
 # filegroup, then (files_remove.sql) a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
 # while load_workload.sql commits in the background (a live database: pass 2, a fuzzy tail, the file
 # outgrowing its recorded Size); large.sql, data past one GAM interval (LARGE_ROWS rows of a page each,
-# 530000 by default). A fixture's backups come with the server's own catalog of them where it holds
+# 530000 by default); rows.sql, the record forms of user tables (E20: version tags, forwarding, the
+# uniquifier, ghosts, row-overflow, added columns of a partitioned table); dbcs.sql, varchar under the
+# double-byte code pages (PR 2d). A fixture's backups come with the server's own catalog of them where it holds
 # still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).
 #
 # Writes into OUT: the backups, <set>.headeronly.txt / .labelonly.txt / .filelistonly.txt, sets.txt
@@ -29,7 +31,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
-FIXTURES="${FIXTURES:-samples catalog partition files load large}"
+FIXTURES="${FIXTURES:-samples catalog partition files load large rows dbcs}"
 LARGE_ROWS="${LARGE_ROWS:-530000}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
@@ -139,7 +141,7 @@ run_sql() {	# $1 = a script of /tmp/gen
 golden() {	# $1 = database, $2 = set
 	sql -d "$1" -v OUTPREFIX="${DIR}/$2" -s '|' -W -i /tmp/gen/catalog_golden.sql
 	local kind
-	for kind in tables columns views modules partitioning boundaries partitions; do extras+=("$2.${kind}.txt"); done
+	for kind in tables columns views modules partitioning boundaries partitions schemas; do extras+=("$2.${kind}.txt"); done
 }
 scalar() {	# $1 = a query answering one value
 	sql -h -1 -W -Q "SET NOCOUNT ON; $1" | head -1 | tr -d ' \r'
@@ -215,6 +217,14 @@ for fixture in ${FIXTURES}; do
 		done
 		[ "${left}" = 0 ] || workload_failed "did not end 60 s after it was asked to stop (${left} session(s) left)"
 		sets+=("load_base|load_base.bak" "load_full|load_full.bak" "load_xpress|load_xpress.bak" "load_diff|load_diff.bak" "load_log|load_log.trn")
+		;;
+	rows)
+		golden bak_rows rows_full
+		sets+=("rows_full|rows_full.bak")
+		;;
+	dbcs)
+		golden bak_dbcs dbcs_full
+		sets+=("dbcs_full|dbcs_full.bak")
 		;;
 	large)
 		golden bak_large large_xpress

@@ -267,17 +267,16 @@ int main() {
 				  text({0xa7, 0x01, 0x01, 0x00, 0x05, 0x00, 0x00, 0x7f, 0x47});
 			  }).find("does not know") != std::string::npos,
 			  "a varchar of an unknown collation is refused by name");
+		// A double-byte page is decoded on the client like any other (a backup has no server to do it).
 		const CollationRow *japanese = mssql::codec::code_page::FindCollationByName("Japanese_CI_AS", 14);
-		std::string error = "no Japanese_CI_AS";
+		std::string got = "no Japanese_CI_AS";
 		if (japanese) {
 			const uint32_t id = static_cast<uint32_t>(japanese->collation_id);
-			error = ErrorOf([&]() {
-				text({0xa7, 0x01, 0x01, 0x00, static_cast<int>(id & 0xff), static_cast<int>((id >> 8) & 0xff),
-					  static_cast<int>((id >> 16) & 0xff), static_cast<int>(id >> 24), 0x47});
-			});
+			got = text({0xa7, 0x01, 0x04, 0x00, static_cast<int>(id & 0xff), static_cast<int>((id >> 8) & 0xff),
+						static_cast<int>((id >> 16) & 0xff), static_cast<int>(id >> 24), 0x93, 0xfa, 0x96, 0x7b})
+					  .ToString();
 		}
-		Check(error.find("code page 932") != std::string::npos && error.find("086") != std::string::npos,
-			  "a varchar of a double-byte code page is refused, naming spec 086: " + error);
+		Check(got == "\xE6\x97\xA5\xE6\x9C\xAC", "a varchar of code page 932 (Japanese_CI_AS) decodes: " + got);
 	}
 
 	// More sql_variant values: money in record form (a plain little-endian i64 of 1/10,000; TDS sends the

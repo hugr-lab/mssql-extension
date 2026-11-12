@@ -667,6 +667,8 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_pass_search.cpp \
     test/cpp/backup/test_backup_ranges.cpp \
     test/cpp/backup/test_backup_record.cpp \
+    test/cpp/backup/test_backup_record_stager.cpp \
+    test/cpp/backup/test_backup_rows.cpp \
     test/cpp/backup/test_backup_source.cpp \
     test/cpp/backup/test_backup_system_tables.cpp \
     test/cpp/backup/test_backup_xpress.cpp \
@@ -1402,9 +1404,9 @@ fuzz-encode-replay: release
 # Linux leak-check lane replays the same corpora under ASan + LSan. The corpora are synthetic
 # (fuzz/gen_backup_seeds.cc): no backup of a server whose data is not ours (spec 085 T4).
 fuzz-backup-replay:
-	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog" \
+	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record" \
 	    $(PROJ_DIR)fuzz/build.sh
-	@for t in backup_mtf backup_container backup_xpress backup_page backup_catalog; do \
+	@for t in backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record; do \
 	    $(PROJ_DIR)fuzz/out/fuzz_$$t $(PROJ_DIR)fuzz/corpus/$$t || exit 1; \
 	done
 # Spec 085 acceptance 2 over the committed samples: mssql_backup_info against the golden RESTORE
