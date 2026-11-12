@@ -60,6 +60,32 @@ static void BuildTable(const uint8_t *lengths_bytes, std::vector<uint16_t> &tabl
 	}
 }
 
+//! `length` bytes at `to` copied from `distance` bytes back, the source overlapping the destination
+//! when `distance` < `length` (the run repeats with period `distance`). Pages are full of such runs
+//! -- a char column's padding, a page's free space --, a byte at a time each cost a store-to-load
+//! dependency: one byte is a memset; a short period is copied in non-overlapping pieces that double
+//! (each a multiple of the period, from a source already written).
+static inline void CopyMatch(uint8_t *to, size_t distance, size_t length) {
+	const uint8_t *from = to - distance;
+	if (distance >= length) {
+		std::memcpy(to, from, length);
+		return;
+	}
+	if (distance == 1) {
+		std::memset(to, from[0], length);
+		return;
+	}
+	size_t copied = 0;
+	while (copied < length) {
+		// Every byte from `from` to `to + copied` is written and repeats with period `distance`: a
+		// piece of `period` bytes copied from `period` bytes back neither overlaps nor breaks it.
+		const size_t period = (distance + copied) / distance * distance;
+		const size_t n = length - copied < period ? length - copied : period;
+		std::memcpy(to + copied, to + copied - period, n);
+		copied += n;
+	}
+}
+
 void XpressHuffmanDecode(const uint8_t *input, size_t input_size, uint8_t *output, size_t output_size) {
 	size_t pos = 0;
 	size_t produced = 0;
@@ -166,15 +192,7 @@ void XpressHuffmanDecode(const uint8_t *input, size_t input_size, uint8_t *outpu
 			if (length > output_size - produced) {
 				Fail("a match of " + std::to_string(length) + " bytes past the block's declared size", pos, produced);
 			}
-			const uint8_t *from = output + produced - distance;
-			uint8_t *to = output + produced;
-			if (distance >= length) {
-				std::memcpy(to, from, length);
-			} else {
-				for (size_t i = 0; i < length; i++) {
-					to[i] = from[i];  // overlapping: byte by byte, the run repeats
-				}
-			}
+			CopyMatch(output + produced, distance, length);
 			produced += length;
 		}
 	}
