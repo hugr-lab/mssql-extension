@@ -171,6 +171,35 @@ int main() {
 	Check(found_all, "FindBlock finds the first and the last byte of every block from its checkpoint");
 	Check(!ErrorOf([&]() { FindBlock(file, chain, data.size()); }).empty(), "an offset past the data set is refused");
 
+	{
+		// The walk reads its headers in windows (task 16c: one 28-byte read a header was one range
+		// request each on a remote file), and finds the chain a header at a time would.
+		struct Counting : public RandomAccess {
+			const RandomAccess &inner;
+			mutable uint64_t reads = 0;
+			explicit Counting(const RandomAccess &inner_p) : inner(inner_p) {}
+			uint64_t Size() const override {
+				return inner.Size();
+			}
+			void ReadAt(uint64_t offset, uint8_t *dest, size_t count) const override {
+				reads++;
+				inner.ReadAt(offset, dest, count);
+			}
+			const std::string &Name() const override {
+				return inner.Name();
+			}
+		} counting(file);
+		auto counted = WalkChain(counting);
+		Check(file.Size() < (4 << 20) && counted.block_count == chain.block_count && counted.end == chain.end &&
+				  counted.checkpoints.size() == chain.checkpoints.size() && counting.reads == 1,
+			  "the chain walked in 4 MiB windows: " + std::to_string(counting.reads) + " reads for " +
+				  std::to_string(chain.block_count) + " blocks");
+		counting.reads = 0;
+		auto found = FindBlock(counting, chain, packed.block_logical[100] + 7);
+		Check(found.physical == packed.block_physical[100] && counting.reads == 1,
+			  "a block found from its checkpoint in one window read (" + std::to_string(counting.reads) + ")");
+	}
+
 	auto index = ReadSeekIndex(file, chain);
 	Check(index.size() == 3 && index[1].logical == 70 * 512 && index[1].physical == packed.block_physical[70],
 		  "the seek index's three entries, each a block of the chain");

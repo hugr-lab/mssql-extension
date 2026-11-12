@@ -1372,7 +1372,12 @@ per-AU runs and parallel units (2e), off-row values (PR 3), `mssql_backup_column
 16c. PR 1's review findings on the paths a scan takes: `PageIndex::FallBack` through the ranged
     mapper (D3a) rather than sequentially; `WalkChain` on a tail of an unknown layout reading block
     headers in windows, not one 28-byte read each; `LocateOnce`'s probe of the other families' pass
-    only where a crafted file could carry an extent twice — 1.5 d
+    only where a crafted file could carry an extent twice — 1.5 d. As landed: the page index keeps
+    the build's mapper, so a fallback maps the pass as parallel ranges; `WalkChain` and `FindBlock`
+    read headers in 4 MiB windows (a 5,876-block test chain in one read); the page index keeps each
+    thread's last extent located, so the other families' probe costs one search an extent, not one a
+    page, whatever the families (the probe itself stays: any striped pass could carry one twice). A
+    fallback's waves of ranges, now inside a scan, are buffer-managed but not D17-reserved
 16d. `mssql_backup_columns(path [, schema [, table]])`: one row per column -- schema, table, column
     id, name, SQL type, DuckDB type, `state` (`converted`, `stored_bytes` for a type whose conversion is
     still to come, `off_row_pending` until PR 3, `not_stored`, `storage_format`) and `reason` -- the

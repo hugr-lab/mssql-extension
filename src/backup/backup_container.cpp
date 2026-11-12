@@ -146,13 +146,43 @@ static bool ReadBlockHeader(const RandomAccess &file, uint64_t at, uint64_t logi
 	return ParseBlockHeader(file, bytes, at, logical, block);
 }
 
+//! A chain's headers walked forward, read CHAIN_WINDOW bytes at a time up to `limit` (PR 1's review,
+//! task 16c: one 28-byte read a header was one range request each on a remote file, 16M for 1 TB of
+//! 64 KB blocks; a window holds 64 of those headers, thousands of well-compressed ones).
+class HeaderWindow {
+public:
+	static constexpr uint64_t CHAIN_WINDOW = 4 << 20;
+	HeaderWindow(const RandomAccess &file, uint64_t limit) : file_(file), limit_(std::min(limit, file.Size())) {}
+	//! As ReadBlockHeader, from the window.
+	bool Read(uint64_t at, uint64_t logical, ChainBlock &block) {
+		if (at > file_.Size() || file_.Size() - at < BLOCK_HEADER) {
+			return false;
+		}
+		if (at < base_ || at - base_ > bytes_.size() || bytes_.size() - (at - base_) < BLOCK_HEADER) {
+			const uint64_t until = std::max(limit_, at + BLOCK_HEADER);
+			const uint64_t n = std::min<uint64_t>(CHAIN_WINDOW, until - at);
+			bytes_.resize(static_cast<size_t>(std::max<uint64_t>(n, BLOCK_HEADER)));
+			base_ = at;
+			file_.ReadAt(at, bytes_.data(), bytes_.size());
+		}
+		return ParseBlockHeader(file_, bytes_.data() + (at - base_), at, logical, block);
+	}
+
+private:
+	const RandomAccess &file_;
+	const uint64_t limit_;
+	uint64_t base_ = 0;
+	std::vector<uint8_t> bytes_;
+};
+
 BlockChain WalkChain(const RandomAccess &file) {
 	BlockChain chain;
 	uint64_t at = CHAIN_START;
 	uint64_t logical = 0;
 	ChainBlock block;
 	uint64_t since = 0;
-	while (ReadBlockHeader(file, at, logical, block)) {
+	HeaderWindow headers(file, file.Size());
+	while (headers.Read(at, logical, block)) {
 		if (chain.checkpoints.empty() ||
 			(since >= BlockChain::CHECKPOINT_STRIDE &&
 			 block.physical - chain.checkpoints.back().physical >= BlockChain::CHECKPOINT_BYTES)) {
@@ -195,13 +225,14 @@ ChainBlock FindBlock(const RandomAccess &file, const BlockChain &chain, uint64_t
 	ChainBlock block = chain.checkpoints[lo];
 	// The walk ends at the next checkpoint (or the chain's end): within a checkpoint's span.
 	const uint64_t stop = lo + 1 < chain.checkpoints.size() ? chain.checkpoints[lo + 1].physical : chain.end;
+	HeaderWindow headers(file, stop);
 	while (block.physical < stop) {
 		if (logical < block.logical + block.output) {
 			return block;
 		}
 		ChainBlock next;
 		const uint64_t at = block.physical + BLOCK_HEADER + block.payload;
-		if (!ReadBlockHeader(file, at, block.logical + block.output, next)) {
+		if (!headers.Read(at, block.logical + block.output, next)) {
 			break;
 		}
 		block = next;

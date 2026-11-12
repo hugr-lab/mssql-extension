@@ -82,7 +82,8 @@ struct OpenPagesOptions {
 
 //! The pages of the full backup `headers` holds. A log backup has no data pages and a differential
 //! is read over its full (task 24's overlay): both are refused by name. The header scans read the
-//! families as parallel ranges (D3a) through `context`, used only within this call.
+//! families as parallel ranges (D3a) through `context`, and so does a searched pass's fallback later
+//! (the index keeps the mapper): the pages, like `headers`' source, must not outlive `context`.
 std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &context, const OpenedHeaders &headers,
 											 const OpenPagesOptions &options = OpenPagesOptions());
 
