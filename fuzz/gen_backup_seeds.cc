@@ -495,9 +495,9 @@ static void LobSeeds() {
 	const Bytes root = InRowRoot(0, {{5, 100, 0}, {7, 100, 1}});
 	Bytes map = {0x80, 0x01, 1, 0, 1, 0, 0, 0, 2, 0, static_cast<uint8_t>(root.size()), 0};
 	map.insert(map.end(), root.begin(), root.end());
-	const Bytes tail = {7, 0, 0, 0, 2, 0, 0, 0,										 // length, node count
-						100, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 1, 3,	 // page 100 slot 0, bytes 0-4
-						100, 0, 0, 0, 1, 0, 1, 0, 5, 0, 0, 0, 2, 0, 0, 0, 1, 3}; // slot 1, bytes 5-6
+	const Bytes tail = {7,	 0, 0, 0, 2, 0, 0, 0,								  // length, node count
+						100, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 1, 3,	  // page 100 slot 0, bytes 0-4
+						100, 0, 0, 0, 1, 0, 1, 0, 5, 0, 0, 0, 2, 0, 0, 0, 1, 3};  // slot 1, bytes 5-6
 	map.insert(map.end(), tail.begin(), tail.end());
 	Write("backup_lob", "map", map);
 }

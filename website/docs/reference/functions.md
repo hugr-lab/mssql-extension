@@ -277,7 +277,7 @@ SELECT schema_name, table_count FROM mssql_backup_schemas('/backups/sales_full.b
 ### mssql_backup_columns()
 
 Every column of the user tables in a SQL Server full backup, one row each, with its state at a
-glance (`converted`, `stored_bytes`, `off_row_pending`, `not_stored`, `storage_format`) and why;
+glance (`converted`, `stored_bytes`, `not_stored`, `storage_format`) and why;
 optionally one schema's or one table's. See [Backup Files](../reading/backups.md#tables-and-views).
 
 **Signature:** `mssql_backup_columns(path VARCHAR | VARCHAR[] [, schema VARCHAR [, table VARCHAR]]) -> TABLE(schema_name VARCHAR, table_name VARCHAR, column_id INTEGER, column_name VARCHAR, sql_type VARCHAR, system_type VARCHAR, duckdb_type VARCHAR, state VARCHAR, reason VARCHAR)`
@@ -302,10 +302,11 @@ SELECT id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'syss
 ### mssql_backup_scan()
 
 A user table's rows from a SQL Server full backup, with no SQL Server, typed as `TYPE mssql` reads
-them; virtual columns `_mssql_page`, `_mssql_rid` and `_mssql_page_lsn`. See
+them, values stored off row included; virtual columns `_mssql_page`, `_mssql_rid`, `_mssql_page_lsn`
+and `_mssql_lob`. See
 [Backup Files](../reading/backups.md#rows).
 
-**Signature:** `mssql_backup_scan(path VARCHAR | VARCHAR[], schema VARCHAR, table VARCHAR) -> TABLE(...)`
+**Signature:** `mssql_backup_scan(path VARCHAR | VARCHAR[], schema VARCHAR, table VARCHAR [, max_threads := BIGINT, max_memory := VARCHAR]) -> TABLE(...)`
 
 ```sql
 SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');
