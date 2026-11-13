@@ -19,7 +19,11 @@
 // boot page and sysallocunits, the other bootstrap tables, a mix with an IAM page -- and a synthetic LOB tree.
 // backup_record (fuzz_backup_record's format: a layout, then a page): the sample's two user tables' first
 // pages with their layouts, and pages of the record forms E20 measured.
+// backup_lob (fuzz_backup_lob's format): every off-row form over synthetic text pages -- an in-row root
+// over an INTERNAL node, a last leaf holding more than claimed, row-overflow, root pointers to a LARGE_ROOT,
+// a SMALL_ROOT and a NULL root -- and a map.
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -383,34 +387,67 @@ static std::vector<Bytes> First(const std::vector<Bytes> &pages, size_t n) {
 	return std::vector<Bytes>(pages.begin(), pages.begin() + static_cast<long>(std::min(n, pages.size())));
 }
 
-//! A synthetic LOB tree: a text page of two DATA fragments and an INTERNAL node over them (file 1, pages
-//! 100 and 101, allocation unit 255 << 16: no bootstrap table's), and an in-row root over the node.
+//! A text page of `records` (fragment records), file 1, allocation unit 255 << 16 (no bootstrap table's).
+static Bytes TextPage(uint32_t number, const std::vector<Bytes> &records) {
+	Bytes p(8192, 0);
+	p[0] = 1;
+	p[1] = 3;
+	Put16(p, 22, static_cast<uint16_t>(records.size()));
+	Put32(p, 24, 255);
+	Put32(p, 32, number);
+	Put16(p, 36, 1);
+	size_t at = 96;
+	for (size_t i = 0; i < records.size(); i++) {
+		std::memcpy(&p[at], records[i].data(), records[i].size());
+		Put16(p, 8190 - 2 * i, static_cast<uint16_t>(at));
+		at += records[i].size();
+	}
+	return p;
+}
+
+//! A LOB fragment record of `type` (0 SMALL_ROOT, 2 INTERNAL, 3 DATA, 5 LARGE_ROOT, 8 NULL), `body` after
+//! its 14-byte header.
+static Bytes Fragment(uint16_t type, const Bytes &body) {
+	Bytes r(14, 0);
+	r[0] = 0x08;
+	Put16(r, 2, static_cast<uint16_t>(14 + body.size()));
+	Put16(r, 12, type);
+	r.insert(r.end(), body.begin(), body.end());
+	return r;
+}
+
+static const Bytes HELLO = {'h', 'e', 'l', 'l', 'o'}, ABC = {'a', 'b', 'c'};
+
+//! Page 100: DATA "hello" in slot 0, DATA "abc" in slot 1.
+static Bytes LeafPage() {
+	return TextPage(100, {Fragment(3, HELLO), Fragment(3, ABC)});
+}
+
+//! An in-row root (kind 5) of `level` whose links (cumulative, page, slot) name file 1.
+static Bytes InRowRoot(uint8_t level, const std::vector<std::array<uint32_t, 3>> &links) {
+	Bytes root(12 + 12 * links.size(), 0);
+	root[0] = 5;
+	root[2] = level;
+	for (size_t i = 0; i < links.size(); i++) {
+		Put32(root, 12 + 12 * i, links[i][0]);
+		Put32(root, 16 + 12 * i, links[i][1]);
+		Put16(root, 20 + 12 * i, 1);
+		Put16(root, 22 + 12 * i, static_cast<uint16_t>(links[i][2]));
+	}
+	return root;
+}
+
+//! A root pointer (16 bytes) to page `page` of file 1, slot 0.
+static Bytes RootPointer(uint32_t page) {
+	Bytes pointer(16, 0);
+	Put32(pointer, 8, page);
+	Put16(pointer, 12, 1);
+	return pointer;
+}
+
+//! A synthetic LOB tree: DATA fragments on page 100 and an INTERNAL node over them on page 101, and an
+//! in-row root of level 1 over the node (E21).
 static Bytes LobInput() {
-	auto page = [](uint32_t number, const std::vector<Bytes> &records) {
-		Bytes p(8192, 0);
-		p[0] = 1;
-		p[1] = 3;
-		Put16(p, 22, static_cast<uint16_t>(records.size()));
-		Put32(p, 24, 255);
-		Put32(p, 32, number);
-		Put16(p, 36, 1);
-		size_t at = 96;
-		for (size_t i = 0; i < records.size(); i++) {
-			std::memcpy(&p[at], records[i].data(), records[i].size());
-			Put16(p, 8190 - 2 * i, static_cast<uint16_t>(at));
-			at += records[i].size();
-		}
-		return p;
-	};
-	auto fragment = [](uint16_t type, const Bytes &body) {
-		Bytes r(14, 0);
-		r[0] = 0x08;
-		Put16(r, 2, static_cast<uint16_t>(14 + body.size()));
-		Put16(r, 12, type);
-		r.insert(r.end(), body.begin(), body.end());
-		return r;
-	};
-	const Bytes hello = {'h', 'e', 'l', 'l', 'o'}, abc = {'a', 'b', 'c'};
 	Bytes internal(6 + 32, 0);
 	Put16(internal, 0, 2);
 	Put16(internal, 2, 2);
@@ -421,13 +458,48 @@ static Bytes LobInput() {
 	Put32(internal, 30, 100);
 	Put16(internal, 34, 1);
 	Put16(internal, 36, 1);
-	Bytes root(24, 0);
-	root[0] = 5;
-	root[2] = 1;		 // level 1: the link names an INTERNAL node (E21)
-	Put32(root, 12, 8);	 // cumulative 8, page 101, file 1, slot 0
-	Put32(root, 16, 101);
-	Put16(root, 20, 1);
-	return CatalogInput({page(100, {fragment(3, hello), fragment(3, abc)}), page(101, {fragment(2, internal)})}, root);
+	return CatalogInput({LeafPage(), TextPage(101, {Fragment(2, internal)})}, InRowRoot(1, {{8, 101, 0}}));
+}
+
+//! fuzz_backup_lob's seeds (its format is fuzz_backup_catalog's, options bit 7 a map): every off-row form
+//! over the leaf page.
+static void LobSeeds() {
+	Write("backup_lob", "inrow_internal", LobInput());
+	// A truncating .WRITE: the last leaf holds 3 bytes where its link claims 2.
+	Write("backup_lob", "last_leaf_over", CatalogInput({LeafPage()}, InRowRoot(0, {{5, 100, 0}, {7, 100, 1}})));
+	Bytes overflow(24, 0);
+	overflow[0] = 2;
+	Put32(overflow, 12, 5);	 // length, then page 100, file 1, slot 0
+	Put32(overflow, 16, 100);
+	Put16(overflow, 20, 1);
+	Write("backup_lob", "row_overflow", CatalogInput({LeafPage()}, overflow));
+	Bytes large(10 + 24, 0);  // LARGE_ROOT: maxlinks, count, level 0, then narrow links from record byte 24
+	Put16(large, 0, 2);
+	Put16(large, 2, 2);
+	Put32(large, 10, 5);
+	Put32(large, 14, 100);
+	Put16(large, 18, 1);
+	Put32(large, 22, 8);
+	Put32(large, 26, 100);
+	Put16(large, 30, 1);
+	Put16(large, 32, 1);
+	Write("backup_lob", "root_pointer_large",
+		  CatalogInput({LeafPage(), TextPage(102, {Fragment(5, large)})}, RootPointer(102)));
+	Bytes small(6, 0);	// SMALL_ROOT: its size, four bytes, then the value
+	Put16(small, 0, 5);
+	small.insert(small.end(), HELLO.begin(), HELLO.end());
+	Write("backup_lob", "root_pointer_small", CatalogInput({TextPage(102, {Fragment(0, small)})}, RootPointer(102)));
+	Write("backup_lob", "null_root", CatalogInput({TextPage(102, {Fragment(8, Bytes())})}, RootPointer(102)));
+	// A map (backup_lob_map.hpp) behind options bit 7, as AppendLobMap writes the last_leaf_over row: one
+	// in-row root (its 36 bytes), 7 bytes, two DATA nodes on page 100.
+	const Bytes root = InRowRoot(0, {{5, 100, 0}, {7, 100, 1}});
+	Bytes map = {0x80, 0x01, 1, 0, 1, 0, 0, 0, 2, 0, static_cast<uint8_t>(root.size()), 0};
+	map.insert(map.end(), root.begin(), root.end());
+	const Bytes tail = {7, 0, 0, 0, 2, 0, 0, 0,										 // length, node count
+						100, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 1, 3,	 // page 100 slot 0, bytes 0-4
+						100, 0, 0, 0, 1, 0, 1, 0, 5, 0, 0, 0, 2, 0, 0, 0, 1, 3}; // slot 1, bytes 5-6
+	map.insert(map.end(), tail.begin(), tail.end());
+	Write("backup_lob", "map", map);
 }
 
 int main(int argc, char **argv) {
@@ -507,6 +579,7 @@ int main(int argc, char **argv) {
 	}
 	Write("backup_catalog", "mix", CatalogInput(mix));
 	Write("backup_catalog", "lob_tree", LobInput());
+	LobSeeds();
 
 	// backup_record: the sample's two user tables' first pages with their layouts (as the catalog
 	// describes them: test/data/backup/full.bak), and pages of the record forms E20 measured on 2022

@@ -43,7 +43,7 @@ Three modes:
 | `fuzz_utf16` | `tds::encoding::Utf16LEDecode` / `LegacyUtf16LEDecode` | `src/tds/encoding/utf16.cpp` | ✅ (uses simdutf) |
 | `fuzz_envchange_txn` | `tds::FindBeginTxnDescriptor` | `src/tds/tds_token_parser.cpp` | ✅ |
 | `fuzz_login_response` | `tds::TdsProtocol::ParseLoginResponse` | `src/tds/tds_protocol.cpp` (+ packet, types, utf16) | ✅ |
-| `fuzz_code_page` | `codec::code_page::DecodeToUtf8` / `DecodeToUtf16` / `DecodeValues` / `ExactUtf8Length` / `CopyAscii`, each against the others | `src/codec/code_page/code_page.cpp` (+ the generated tables) | ✅ (simdutf for its UTF-8 / UTF-16 oracles) |
+| `fuzz_code_page` | `codec::code_page::DecodeToUtf8` / `DecodeToUtf16` / `DecodeValues` / `ExactUtf8Length` / `CopyAscii` / `DecodeToUtf8Block` (block by block, a lone lead carried: the whole input's bytes), each against the others | `src/codec/code_page/code_page.cpp` (+ the generated tables) | ✅ (simdutf for its UTF-8 / UTF-16 oracles) |
 | `fuzz_row_stager` | `codec::staging::RowStager::StageRow` / `StageNBCRow` | `src/codec/staging/row_stager.cpp` | ❌ links libduckdb |
 | `fuzz_bcp_encode` | `codec::string::PlanColumn` + `ScatterVarBlock` vs `EncodeToBcp` | `src/codec/string_codec.cpp` | ❌ links libduckdb |
 | `fuzz_backup_mtf` | `backup::WalkMtf` + `ReadBackupSet`, `WalkMtfTape` + `ReadMediaFields`, `WalkMtfDataSet` | `src/backup/` (spec 085) | ✅ |
@@ -51,6 +51,7 @@ Three modes:
 | `fuzz_backup_xpress` | `backup::XpressHuffmanDecode` (output size from the first two bytes) | `src/backup/backup_xpress.cpp` | ✅ |
 | `fuzz_backup_page` | `BuildPassMap`, `BuildRankedPassMap`, `BuildPageIndex` (`Locate` / `ReadPage`, searches and their fallback), `AllocationMap`, a galloping `PassSearch`, over a pass expanded from 64-byte chunks tiled into units | `src/backup/` | ✅ |
 | `fuzz_backup_catalog` | the catalog reader over up to 16 pages: `ReadBootPage`, `ReadIamPage`, FixedVar records through the bootstrap tables' literal layouts and the layouts their rows describe (`ForEachPageRow`, `DecodeRecord`), `AddBootstrapRow`, `BuildIndexes`, `BaseLayout`, `CheckBootstrapLayouts`, every value's accessor, `ParseSqlVariant`, `ModuleText`, and `ReadLobValue` over the same pages | `src/backup/` (spec 085 PR 2b) | ✅ |
+| `fuzz_backup_lob` | values stored off row: `ParseOffRowPointer`, `WalkLob` assembled and map-only over up to 16 pages (the bytes handed over are the data nodes' records' bytes, covering the value in order; the nodes tile it as a tree; where the assembled walk succeeds the map-only walk agrees node for node and hands over no bytes), the value's `_mssql_lob` entry through `AppendLobMap` / `ParseLobMap`, and any map `ParseLobMap` takes written back byte for byte. Not fuzzed: the scan's UTF-16 block decode (`DecodeUtf16Block`, carrying a cut surrogate pair), which links DuckDB | `src/backup/` (spec 085 PR 3) | ✅ |
 | `fuzz_backup_record` | a user table's records through a layout the input gives (types, `sysrscols.ti`, offsets, null bits, bit positions, dropped / uniquifier / added-with-default flags) over one page: `ReadSlot`, `RowVarCount`, `ForwardedFrom`, `LocateValue` (every byte it names read, and required to lie in the page or the default), `DecodeRecord`, `FixedLength`, `KnownFixedXtype` | `src/backup/` (spec 085 PR 2d) | ✅ |
 
 `fuzz_code_page` (spec 091) is in the default `TARGETS`, so it shares the per-PR
@@ -87,17 +88,17 @@ Both pick up the family codecs with a **non-recursive** glob, `src/codec/*.cpp`,
 in `build.sh`, plus `src/codec/code_page/*.cpp`, which `string_codec.cpp` and the
 stager call (spec 092).
 
-The six backup harnesses (spec 085 tasks 10, 18 and 18b) are **not in the default `TARGETS`**, so the
+The seven backup harnesses (spec 085 tasks 10, 18, 18b and PR 3) are **not in the default `TARGETS`**, so the
 per-PR ClusterFuzzLite budget stays the TDS layer's. Their corpora are written by `fuzz/gen_backup_seeds.cc`:
 from the unit tests' builders, for `backup_record` the record forms E20 measured, and for
 `backup_catalog` and `backup_record` pages of the committed sample
 `test/data/backup/full.bak` (a real backup of a database of generated rows, made on a throwaway
-instance) beside a built LOB tree -- never a backup of a server whose data is not ours to publish
+instance) beside a built LOB tree, and for `backup_lob` every off-row form over synthetic text pages -- never a backup of a server whose data is not ours to publish
 (spec 085 T4). `make fuzz-backup-replay` replays them; the Linux leak-check lane
 (`scripts/ci/leak_check.sh`) replays them under ASan + LSan; the weekly ClusterFuzzLite UBSan run
 (`ubsan-weekly` in `cflite-pr.yml`) fuzzes them beside the default targets, which it adds through
 `.clusterfuzzlite/extra_targets` (read by `.clusterfuzzlite/build.sh` as `TARGETS_EXTRA`); local
-discovery is `fuzz/run.sh` with `TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record"`.
+discovery is `fuzz/run.sh <target>`, which builds a backup target on its own (`fuzz/run.sh backup_lob 600 6`).
 On macOS, where ASan hangs at the process's start, replay with `make fuzz-backup-replay FUZZ_REPLAY_SANITIZE=0`.
 
 ### `fuzz_bcp_encode`'s three oracles
@@ -183,7 +184,7 @@ docker build -t mssql-fuzz -f fuzz/Dockerfile .
 
 # Run a campaign (CmpLog + dict + all cores). Findings persist on the host.
 docker run --rm -it -v "$PWD/fuzz/findings:/repo/fuzz/findings" mssql-fuzz \
-    fuzz/run.sh tds_tokens          # or: browser_response | utf16 | envchange_txn | login_response | code_page
+    fuzz/run.sh tds_tokens          # or: browser_response | utf16 | envchange_txn | login_response | code_page | backup_*
 #   fuzz/run.sh tds_tokens 600 4    # 600s/core, 4 cores
 ```
 

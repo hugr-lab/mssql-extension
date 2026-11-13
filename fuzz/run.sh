@@ -6,6 +6,8 @@
 #   fuzz/run.sh <target> [seconds] [cores]
 #     <target>  : browser_response | tds_tokens | utf16 | envchange_txn | login_response
 #                 | code_page
+#                 | backup_mtf | backup_container | backup_xpress | backup_page | backup_catalog
+#                 | backup_record | backup_lob   (spec 085; built here through TARGETS)
 #                 (default: browser_response)
 #     seconds   : per-core wall-clock budget (default: 0 = run until Ctrl-C)
 #     cores     : parallel instances (default: nproc, capped at 8)
@@ -20,9 +22,15 @@ CORES="${3:-$(( $(nproc) < 8 ? $(nproc) : 8 ))}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 case "${TARGET}" in
 	browser_response|tds_tokens|utf16|envchange_txn|login_response|code_page) ;;
-	*) echo "unknown target '${TARGET}' (browser_response|tds_tokens|utf16|envchange_txn|login_response|code_page)"; exit 2 ;;
+	backup_mtf|backup_container|backup_xpress|backup_page|backup_catalog|backup_record|backup_lob)
+		# Not in build.sh's default TARGETS (the per-PR budget is the TDS layer's): build this one.
+		export TARGETS="${TARGET}" ;;
+	*) echo "unknown target '${TARGET}' (browser_response|tds_tokens|utf16|envchange_txn|login_response|code_page|backup_*)"; exit 2 ;;
 esac
 BIN="fuzz_${TARGET}"
+# AFL++'s compiler wrappers print their banners on stdout, which build.sh's compile_objs captures as
+# object paths: keep them quiet.
+export AFL_QUIET=1
 
 # AFL++ driver: compile libFuzzer-style harnesses for afl-fuzz.
 DRIVER="$(find / -name 'libAFLDriver.a' 2>/dev/null | head -1)"
@@ -47,8 +55,9 @@ mkdir -p "${FIND}"
 [[ -d "${SEED}" && -n "$(ls -A "${SEED}" 2>/dev/null)" ]] || { mkdir -p "${SEED}"; printf '\x05\x00\x00' > "${SEED}/min"; }
 
 DICT_ARG=()
-# The TDS token dictionary means nothing to the browser datagram or to code-page bytes.
-[[ -f "${HERE}/tds.dict" && "${TARGET}" != "browser_response" && "${TARGET}" != "code_page" ]] && DICT_ARG=(-x "${HERE}/tds.dict")
+# The TDS token dictionary means nothing to the browser datagram, to code-page bytes or to a backup.
+[[ -f "${HERE}/tds.dict" && "${TARGET}" != "browser_response" && "${TARGET}" != "code_page" &&
+	"${TARGET}" != backup_* ]] && DICT_ARG=(-x "${HERE}/tds.dict")
 TMOUT_ARG=()
 [[ "${DURATION}" != "0" ]] && TMOUT_ARG=(-V "${DURATION}")
 
