@@ -139,13 +139,22 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata &column) {
 	case TDS_TYPE_IMAGE:
 		return LogicalType::BLOB;
 
-	// Unsupported types
-	case TDS_TYPE_UDT:
+	// Not read by a raw scan yet (spec 093 T1, T4, T5). Their COLMETADATA and rows are parsed (T0), so
+	// the refusal names the type; an attached catalog reads them through a server-side conversion.
+	case TDS_TYPE_UDT: {
+		const std::string type_name =
+			column.udt_type_name.empty() ? std::string("UDT") : column.udt_schema + "." + column.udt_type_name;
+		throw InvalidInputException(
+			"MSSQL Error: column '%s' is of the CLR type %s, which a raw mssql_scan does not read yet. Read it "
+			"through an attached catalog, or convert it in the query (geometry / geography: .STAsBinary(); "
+			"hierarchyid and other CLR types: CAST(... AS nvarchar(max))).",
+			column.name.c_str(), type_name.c_str());
+	}
 	case TDS_TYPE_SQL_VARIANT:
 		throw InvalidInputException(
-			"MSSQL Error: Unsupported SQL Server type '%s' (0x%02X) for column '%s'. "
-			"Consider casting to VARCHAR or excluding this column.",
-			GetTypeName(column.type_id).c_str(), column.type_id, column.name.c_str());
+			"MSSQL Error: column '%s' is a sql_variant, which a raw mssql_scan does not read yet. Read it through "
+			"an attached catalog, or CAST it in the query.",
+			column.name.c_str());
 
 	default:
 		throw InvalidInputException("MSSQL Error: Unknown SQL Server type (0x%02X) for column '%s'.", column.type_id,

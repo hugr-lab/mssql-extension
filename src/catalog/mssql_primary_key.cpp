@@ -223,9 +223,9 @@ bool RowIdKeyInfo::AppendCandidateRow(RowIdKeyInfo &info, const vector<string> &
 	col.collation_name = values(14);
 	col.is_nullable = ToBool(values(15));
 	col.is_identity = ToBool(values(16));
-	// The one client-side fact the SQL cannot supply: is this column read
-	// through the lossy NVARCHAR(MAX) cast? Same predicate MSSQLColumnInfo uses.
-	col.cast_required = !MSSQLColumnInfo::IsKnownSQLServerType(col.type_name);
+	// The one client-side fact the SQL cannot supply: does the server compare
+	// this type unlike DuckDB's read of it? Same predicate MSSQLColumnInfo uses.
+	col.comparison_differs = MSSQLColumnInfo::ComparisonDiffersFor(col.type_name);
 	info.candidates_.back().columns.push_back(std::move(col));
 	return true;
 }

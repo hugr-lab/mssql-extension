@@ -16,6 +16,13 @@ struct CodePageTable;
 }  // namespace codec
 }  // namespace mssql
 
+//! How the scan reads a column (spec 093 D2): as itself; through a server-side cast, for a type the
+//! extension does not decode yet (sql_variant's CASE, hierarchyid and CLR types as NVARCHAR(MAX):
+//! BuildReadExpression); or as OGC WKB through `.STAsBinary()` (geometry, geography). A type's PR
+//! moves it to Bare when its kernel lands; what the server's comparison does with it is a separate
+//! answer (MSSQLColumnInfo::comparison_differs).
+enum class MSSQLReadForm : uint8_t { Bare, ServerCast, SpatialBinary };
+
 //===----------------------------------------------------------------------===//
 // MSSQLColumnInfo - Column metadata including SQL Server-specific information
 //===----------------------------------------------------------------------===//
@@ -45,17 +52,26 @@ struct MSSQLColumnInfo {
 									 // the metadata loaders after construction, like is_identity (issue #361)
 	int32_t database_code_page = 0;	 // The same for the database collation — a varchar PARAMETER takes
 									 // this page, so a constant must fit both (mssql::CodePageCanEncode)
-	bool is_cast_required;			 // Unsupported type: needs CAST to NVARCHAR(MAX)
-	bool is_geometry;				 // True for SQL Server geometry/geography columns; table scan projects
-									 // [col].STAsBinary() AS [col] so the wire delivers OGC WKB which lands
-									 // in a LogicalType::GEOMETRY() vector via the Binary codec.
-	bool is_identity;				 // sys.columns.is_identity (spec 062 W4, issue #327). Set by the
-									 // metadata loaders after construction; the INSERT planner keeps a
-									 // column list that names one on the statement path, where the server
-									 // decides about the explicit value (error 544 without IDENTITY_INSERT).
+	MSSQLReadForm read_form;		 // How the scan reads it (ReadFormFor). SpatialBinary: the scan projects
+									 // [col].STAsBinary() AS [col], so the wire delivers OGC WKB, which lands
+									 // in a LogicalType::GEOMETRY() vector through the Binary codec.
+	//! The server compares, orders, groups or keys a value of this type unlike DuckDB's read of it
+	//! (ComparisonDiffersFor), whatever its read form: a filter on it runs in DuckDB, it is never a
+	//! rowid key or a MERGE key, an ORDER BY on it is not pushed (#514: a pushed filter on a
+	//! sql_variant dropped rows). Spatial types are left out here and named by IsSpatial() where they
+	//! matter, as before spec 093 split the flag.
+	bool comparison_differs;
+	bool is_identity;  // sys.columns.is_identity (spec 062 W4, issue #327). Set by the
+					   // metadata loaders after construction; the INSERT planner keeps a
+					   // column list that names one on the statement path, where the server
+					   // decides about the explicit value (error 544 without IDENTITY_INSERT).
 
 	// Default constructor
 	MSSQLColumnInfo();
+
+	bool IsSpatial() const {
+		return read_form == MSSQLReadForm::SpatialBinary;
+	}
 
 	// Constructor from SQL Server metadata
 	MSSQLColumnInfo(const string &name, int32_t column_id, const string &sql_type_name, int16_t max_length,
@@ -117,16 +133,27 @@ struct MSSQLColumnInfo {
 												uint8_t scale);
 
 	// The two spatial CLR UDTs, by name. ONE predicate, because four things key
-	// on the same pair and they have to agree: the catalog sets `is_geometry`
-	// from it, the type map answers GEOMETRY() from it, `IsKnownSQLServerType`
+	// on the same pair and they have to agree: the catalog sets the read form
+	// SpatialBinary from it, the type map answers GEOMETRY() from it, `IsKnownSQLServerType`
 	// admits them from it, and the DML literal renderer decides from it whether
 	// to wrap a value in the server's WKB reader. If the routing and the
 	// rendering ever disagreed the failure would be silent in one direction
 	// (WKB sent as text on the bulk wire) and a server error in the other.
 	static bool IsSpatialType(const string &sql_type_name);
 
-	// Check if SQL Server type is natively supported (has explicit mapping or TDS-level support)
+	// Check if SQL Server type is natively supported (has explicit mapping or TDS-level support).
+	// The type list behind ReadFormFor, ComparisonDiffersFor and the bulk wire (BulkWireCanCarry,
+	// BulkWireTakesType). A type that becomes decodable changes ReadFormFor, not this list: the
+	// others must not follow it by accident (#296; spec 093 D2).
 	static bool IsKnownSQLServerType(const string &sql_type_name);
+
+	//! Spec 093 D2: the read form of a column of this type.
+	static MSSQLReadForm ReadFormFor(const string &sql_type_name);
+	//! Spec 093 D2: whether the server compares, orders or keys this type unlike DuckDB's read of it.
+	static bool ComparisonDiffersFor(const string &sql_type_name);
+	//! Spec 093 D2: whether an INSERT may send a column of this type on the bulk wire. A type joins
+	//! it in its own write PR (spec 093 T2, T6), measured first.
+	static bool BulkWireTakesType(const string &sql_type_name);
 
 	// Check if type is a text type that has collation
 	static bool IsTextType(const string &sql_type_name);

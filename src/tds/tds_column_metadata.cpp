@@ -124,8 +124,9 @@ bool ColumnMetadata::IsNullableVariant() const {
 }
 
 bool ColumnMetadata::IsPLPType() const {
-	// XML is always PLP regardless of max_length
-	if (type_id == TDS_TYPE_XML) {
+	// XML is always PLP regardless of max_length, and so is a UDT, hierarchyid's MAX_BYTE_SIZE of 892
+	// included (spec 093 G2, measured on 2022).
+	if (type_id == TDS_TYPE_XML || type_id == TDS_TYPE_UDT) {
 		return true;
 	}
 	// PLP (Partially Length-Prefixed) encoding is used for MAX types
@@ -392,6 +393,45 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, siz
 				return false;
 			offset += byte_len;
 		}
+		break;
+	}
+
+	// UDT (CLR types: geometry, geography, hierarchyid, user types), MS-TDS 2.2.5.5.2, measured on
+	// 2022 (spec 093 G2): u16 MAX_BYTE_SIZE, DB_NAME / SCHEMA_NAME / TYPE_NAME as B_VARCHAR, then the
+	// ASSEMBLY_QUALIFIED_NAME as US_VARCHAR. Values are PLP.
+	case TDS_TYPE_UDT: {
+		if (offset + 2 > length)
+			return false;
+		column.max_length = static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
+		offset += 2;
+		std::string database;
+		if (!ParseColumnName(data, length, offset, database) ||
+			!ParseColumnName(data, length, offset, column.udt_schema) ||
+			!ParseColumnName(data, length, offset, column.udt_type_name)) {
+			return false;
+		}
+		if (offset + 2 > length)
+			return false;
+		const uint16_t char_count =
+			static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
+		offset += 2;
+		const size_t byte_len = static_cast<size_t>(char_count) * 2;
+		if (offset + byte_len > length)
+			return false;
+		offset += byte_len;
+		break;
+	}
+
+	// SSVARIANT, MS-TDS 2.2.5.5.4: a LONGLEN maximum (8009, spec 093 G2). Values are a u32 length,
+	// 0 for NULL, then the base type, its property bytes, the properties and the value.
+	case TDS_TYPE_SQL_VARIANT: {
+		if (offset + 4 > length)
+			return false;
+		const uint32_t declared = static_cast<uint32_t>(data[offset]) | (static_cast<uint32_t>(data[offset + 1]) << 8) |
+								  (static_cast<uint32_t>(data[offset + 2]) << 16) |
+								  (static_cast<uint32_t>(data[offset + 3]) << 24);
+		offset += 4;
+		column.max_length = static_cast<uint16_t>(declared < SQL_VARIANT_MAX_BYTES ? declared : SQL_VARIANT_MAX_BYTES);
 		break;
 	}
 

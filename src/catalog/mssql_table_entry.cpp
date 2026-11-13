@@ -474,7 +474,7 @@ string MSSQLTableEntry::KeylessKeyRefusal() const {
 				   : "Keying a table by all its columns is not available on this platform.";
 	}
 	for (const auto &col : mssql_columns_) {
-		switch (mssql::IsRoundTripExactForKey(col.sql_type_name, col.scale, col.is_cast_required)) {
+		switch (mssql::IsRoundTripExactForKey(col.sql_type_name, col.scale, col.comparison_differs)) {
 		case mssql::KeyFidelity::Exact:
 			break;
 		case mssql::KeyFidelity::NotRead:
