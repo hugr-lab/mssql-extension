@@ -389,7 +389,7 @@ unique_ptr<Expression> MergeRewriter::Inline(const Expression &action_expr) cons
 
 bool MergeRewriter::LikeTargetFits(idx_t column, const LogicalType &source_type) const {
 	const auto &info = columns_[column];
-	if (info.is_geometry || IsRoundTripExactForKey(info.sql_type_name, info.scale, info.is_cast_required,
+	if (info.IsSpatial() || IsRoundTripExactForKey(info.sql_type_name, info.scale, info.comparison_differs,
 												   info.ReadsDatetime2Truncated()) == KeyFidelity::NotRead) {
 		return false;
 	}
@@ -507,7 +507,7 @@ void MergeRewriter::CheckOnColumns(const Expression &conjunct) const {
 			Refuse("the ON condition reads a row id");
 		}
 		const auto &info = columns_[column.GetIndex()];
-		switch (IsRoundTripExactForKey(info.sql_type_name, info.scale, info.is_cast_required,
+		switch (IsRoundTripExactForKey(info.sql_type_name, info.scale, info.comparison_differs,
 									   info.ReadsDatetime2Truncated())) {
 		case KeyFidelity::Exact:
 			return;

@@ -32,14 +32,14 @@ static int g_failures = 0;
 	} while (0)
 
 static RowIdKeyColumn Col(const std::string &name, const std::string &type, int16_t max_length, bool nullable = false,
-						  bool identity = false, bool cast_required = false, uint8_t scale = 0) {
+						  bool identity = false, bool comparison_differs = false, uint8_t scale = 0) {
 	RowIdKeyColumn c;
 	c.name = name;
 	c.type_name = type;
 	c.max_length = max_length;
 	c.is_nullable = nullable;
 	c.is_identity = identity;
-	c.cast_required = cast_required;
+	c.comparison_differs = comparison_differs;
 	c.scale = scale;
 	return c;
 }

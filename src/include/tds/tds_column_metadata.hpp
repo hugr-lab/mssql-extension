@@ -40,6 +40,11 @@ struct ColumnMetadata {
 	// COLMETADATA and only when its catalog transcodes, so no decoder looks a page
 	// up. The parser leaves it null: the TDS layer does not link the codec module.
 	const mssql::codec::code_page::tables::CodePageTable *code_page = nullptr;
+	// A UDT column's (0xF0) UDT_INFO (spec 093 G2): the schema and name of its type -- `sys` and
+	// geometry / geography / hierarchyid for the system CLR types -- with MAX_BYTE_SIZE in max_length
+	// (0xFFFF for the spatial types, 892 for hierarchyid). Empty for every other type.
+	std::string udt_schema;
+	std::string udt_type_name;
 
 	// Derived properties
 	bool IsNullable() const {

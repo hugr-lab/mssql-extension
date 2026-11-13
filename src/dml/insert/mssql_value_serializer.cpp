@@ -95,9 +95,9 @@ string MSSQLValueSerializer::WrapSpatialLiteral(const string &literal, const str
 	if (literal == "NULL") {
 		return literal;
 	}
-	// The membership test is MSSQLColumnInfo's, so this cannot drift from the
-	// `is_geometry` that decides an INSERT's path. Only the choice between the
-	// two T-SQL type names lives here, because only the renderer needs it.
+	// The membership test is MSSQLColumnInfo's, so this cannot drift from
+	// BulkWireTakesType, which decides an INSERT's path. Only the choice between
+	// the two T-SQL type names lives here, because only the renderer needs it.
 	if (!MSSQLColumnInfo::IsSpatialType(mssql_type)) {
 		return literal;
 	}

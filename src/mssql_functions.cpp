@@ -283,6 +283,8 @@ static bool DescribedTypeToTdsMetadata(const string &base, int16_t max_length, u
 		column.type_id = tds::TDS_TYPE_SQL_VARIANT;
 	} else if (base == "hierarchyid" || base == "geography" || base == "geometry") {
 		column.type_id = tds::TDS_TYPE_UDT;
+		column.udt_schema = "sys";	// as COLMETADATA's UDT_INFO names the system CLR types (spec 093 G2)
+		column.udt_type_name = base;
 	} else {
 		return false;
 	}
