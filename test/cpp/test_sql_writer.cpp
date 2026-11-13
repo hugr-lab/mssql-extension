@@ -32,37 +32,51 @@ static int failures = 0;
 
 static std::vector<MSSQLColumnInfo> Columns() {
 	std::vector<MSSQLColumnInfo> columns;
-	columns.emplace_back("id", 1, "int", 4, 10, 0, false, "", "SQL_Latin1_General_CP1_CI_AS");
+	columns.emplace_back("id", 1, "int", 4, 10, 0, false, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
 	columns.emplace_back("name", 2, "nvarchar", 200, 0, 0, true, "SQL_Latin1_General_CP1_CI_AS",
-						 "SQL_Latin1_General_CP1_CI_AS");
+						 "SQL_Latin1_General_CP1_CI_AS", MSSQLDatetime2Read::Nanoseconds);
 	columns.emplace_back("code", 3, "varchar", 20, 0, 0, true, "Latin1_General_100_BIN2_UTF8",
-						 "SQL_Latin1_General_CP1_CI_AS");
-	columns.emplace_back("amount", 4, "decimal", 9, 10, 2, true, "", "SQL_Latin1_General_CP1_CI_AS");
-	columns.emplace_back("day", 5, "date", 3, 10, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
-	columns.emplace_back("flag", 6, "bit", 1, 1, 0, false, "", "SQL_Latin1_General_CP1_CI_AS");
-	columns.emplace_back("ts", 7, "datetime2", 8, 27, 7, true, "", "SQL_Latin1_General_CP1_CI_AS");
+						 "SQL_Latin1_General_CP1_CI_AS", MSSQLDatetime2Read::Nanoseconds);
+	columns.emplace_back("amount", 4, "decimal", 9, 10, 2, true, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
+	columns.emplace_back("day", 5, "date", 3, 10, 0, true, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
+	columns.emplace_back("flag", 6, "bit", 1, 1, 0, false, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
+	columns.emplace_back("ts", 7, "datetime2", 8, 27, 7, true, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
 	columns.emplace_back("legacy", 8, "varchar", 30, 0, 0, true, "SQL_Latin1_General_CP1_CI_AS",
-						 "SQL_Latin1_General_CP1_CI_AS");
-	columns.emplace_back("wide", 9, "decimal", 17, 38, 10, true, "", "SQL_Latin1_General_CP1_CI_AS");
-	columns.emplace_back("mid", 10, "decimal", 9, 19, 4, true, "", "SQL_Latin1_General_CP1_CI_AS");
+						 "SQL_Latin1_General_CP1_CI_AS", MSSQLDatetime2Read::Nanoseconds);
+	columns.emplace_back("wide", 9, "decimal", 17, 38, 10, true, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
+	columns.emplace_back("mid", 10, "decimal", 9, 19, 4, true, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
 	// tinyint is 0-255 on the server, which is DuckDB's UTINYINT -- the only
 	// integer type whose rank is 1, so the only one a widening cast can target
 	// without widening (roborev 1819 finding 1).
-	columns.emplace_back("tiny", 11, "tinyint", 1, 3, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
-	columns.emplace_back("ratio", 12, "float", 8, 53, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
-	columns.emplace_back("doc", 13, "xml", -1, 0, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
-	columns.emplace_back("small", 14, "decimal", 5, 5, 2, true, "", "SQL_Latin1_General_CP1_CI_AS");
+	columns.emplace_back("tiny", 11, "tinyint", 1, 3, 0, true, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
+	columns.emplace_back("ratio", 12, "float", 8, 53, 0, true, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
+	columns.emplace_back("doc", 13, "xml", -1, 0, 0, true, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
+	columns.emplace_back("small", 14, "decimal", 5, 5, 2, true, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
 	return columns;
 }
 
 //! A second table for joins: u(id int NOT NULL, t_id int NULL, label nvarchar(50) NULL, big bigint NULL).
 static std::vector<MSSQLColumnInfo> OtherColumns() {
 	std::vector<MSSQLColumnInfo> columns;
-	columns.emplace_back("id", 1, "int", 4, 10, 0, false, "", "SQL_Latin1_General_CP1_CI_AS");
-	columns.emplace_back("t_id", 2, "int", 4, 10, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
+	columns.emplace_back("id", 1, "int", 4, 10, 0, false, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
+	columns.emplace_back("t_id", 2, "int", 4, 10, 0, true, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
 	columns.emplace_back("label", 3, "nvarchar", 100, 0, 0, true, "SQL_Latin1_General_CP1_CI_AS",
-						 "SQL_Latin1_General_CP1_CI_AS");
-	columns.emplace_back("big", 4, "bigint", 8, 19, 0, true, "", "SQL_Latin1_General_CP1_CI_AS");
+						 "SQL_Latin1_General_CP1_CI_AS", MSSQLDatetime2Read::Nanoseconds);
+	columns.emplace_back("big", 4, "bigint", 8, 19, 0, true, "", "SQL_Latin1_General_CP1_CI_AS",
+						 MSSQLDatetime2Read::Nanoseconds);
 	return columns;
 }
 

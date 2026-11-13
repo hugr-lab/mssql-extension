@@ -60,6 +60,8 @@ void TableScanExecute(ClientContext &context, TableFunctionInput &data, DataChun
 			global_state.done = true;
 			// Surface any warnings
 			global_state.result_stream->SurfaceWarnings(context);
+		} else if (global_state.result_stream->HasPendingWarnings()) {
+			global_state.result_stream->SurfaceWarnings(context);  // as met: a LIMIT may end the scan here
 		}
 	} catch (const Exception &e) {
 		global_state.done = true;

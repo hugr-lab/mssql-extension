@@ -279,6 +279,10 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromSecret(ClientContext &c
 	if (!isolation_val.IsNull()) {
 		result->transaction_isolation = isolation_val.ToString();
 	}
+	auto datetime2_7_as_val = kv_secret.TryGetValue("datetime2_7_as");
+	if (!datetime2_7_as_val.IsNull()) {
+		result->datetime2_7_as = datetime2_7_as_val.ToString();
+	}
 	auto default_schema_val = kv_secret.TryGetValue("default_schema");
 	if (!default_schema_val.IsNull()) {
 		result->default_schema = default_schema_val.ToString();
@@ -478,6 +482,8 @@ static case_insensitive_map_t<string> ParseUri(const string &uri) {
 					result["table_filter"] = value;
 				} else if (lower_key == "transaction_isolation" || lower_key == "transactionisolation") {
 					result["transaction_isolation"] = value;
+				} else if (lower_key == "datetime2_7_as" || lower_key == "datetime27as") {
+					result["datetime2_7_as"] = value;
 				} else if (lower_key == "default_schema" || lower_key == "defaultschema") {
 					result["default_schema"] = value;
 				} else if (lower_key == "authenticator") {
@@ -646,6 +652,8 @@ static case_insensitive_map_t<string> ParseConnectionString(const string &connec
 		} else if (lower_key == "transactionisolation" || lower_key == "transaction_isolation" ||
 				   lower_key == "transaction isolation") {
 			result["transaction_isolation"] = value;
+		} else if (lower_key == "datetime2_7_as" || lower_key == "datetime27as") {
+			result["datetime2_7_as"] = value;
 		} else if (lower_key == "defaultschema" || lower_key == "default_schema" || lower_key == "default schema") {
 			result["default_schema"] = value;
 		} else if (lower_key == "authenticator") {
@@ -961,6 +969,9 @@ shared_ptr<MSSQLConnectionInfo> MSSQLConnectionInfo::FromConnectionString(const 
 	if (params.find("transaction_isolation") != params.end()) {
 		result->transaction_isolation = params["transaction_isolation"];
 	}
+	if (params.find("datetime2_7_as") != params.end()) {
+		result->datetime2_7_as = params["datetime2_7_as"];
+	}
 	if (params.find("default_schema") != params.end()) {
 		result->default_schema = params["default_schema"];
 	}
@@ -1255,6 +1266,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	int8_t remote_pushdown_option = -1;	  // Spec 079 PR E2: mssql_remote_pushdown per catalog (-1=unset)
 	int8_t native_types_option = -1;	  // mssql_catalog_native_types per catalog (-1=unset)
 	int8_t client_transcode_option = -1;  // Spec 092: mssql_client_transcode per catalog (-1=unset)
+	string datetime2_7_as_option;		  // Spec 093 D8: mssql_datetime2_7_as per catalog
+	bool datetime2_7_as_specified = false;
 	bool lazy_validation = false;		  // Spec 047 (US2): opt out of eager creds check
 	bool preload_option = false;		  // Issue #324: preload the catalog at ATTACH
 	int64_t min_connections_option = -1;  // Issue #324: ATTACH-level mssql_min_connections (-1=unset)
@@ -1315,6 +1328,13 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			// Spec 092 D4: mssql_client_transcode for this catalog only. Two ATTACHes
 			// of one DSN are how one session measures both forms.
 			client_transcode_option = BooleanAttachOption(it->first, it->second) ? 1 : 0;
+			it = options.options.erase(it);
+		} else if (lower_name == "datetime2_7_as") {
+			// Spec 093 D8: mssql_datetime2_7_as for this catalog only (DuckLake's
+			// METADATA_PARAMETERS reaches ATTACH options, not settings).
+			// Validated with the connection's own value, before anything touches the network.
+			datetime2_7_as_option = it->second.ToString();
+			datetime2_7_as_specified = true;
 			it = options.options.erase(it);
 		} else if (lower_name == "lazy_validation" || lower_name == "lazyvalidation") {
 			// Spec 047 (US2): suppress the eager TCP+LOGIN7 round trip below.
@@ -1457,6 +1477,27 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		connection_info->transaction_isolation = transaction_isolation_option;
 	}
 	connection_info->transaction_isolation = NormalizeTransactionIsolation(connection_info->transaction_isolation);
+	// Spec 093 D8: the ATTACH option, then the connection's own (a secret, a connection string, a URI),
+	// then the setting -- decided here, before a Browser lookup or an Azure login, since the options
+	// alone decide it. Empty from any source is unset, and an explicit '' on the ATTACH clears the
+	// connection's, handing the choice back to the setting (as default_schema's does).
+	if (datetime2_7_as_specified) {
+		connection_info->datetime2_7_as = datetime2_7_as_option;
+	}
+	StringUtil::Trim(connection_info->datetime2_7_as);
+	MSSQLDatetime2Read datetime2_read = MSSQLDatetime2Read::Nanoseconds;
+	if (!connection_info->datetime2_7_as.empty()) {
+		datetime2_read = ParseDatetime2Read(connection_info->datetime2_7_as,
+											datetime2_7_as_specified
+												? "MSSQL ATTACH error: the ATTACH option datetime2_7_as"
+												: "MSSQL ATTACH error: the datetime2_7_as of the connection's secret, "
+												  "connection string or URI");
+	} else {
+		Value datetime2_7_as;
+		if (context.TryGetCurrentSetting("mssql_datetime2_7_as", datetime2_7_as) && !datetime2_7_as.IsNull()) {
+			datetime2_read = ParseDatetime2Read(datetime2_7_as.ToString(), "mssql_datetime2_7_as");
+		}
+	}
 	if (default_schema_specified) {
 		connection_info->default_schema = default_schema_option;
 	}
@@ -1640,6 +1681,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		startup.client_transcode = !context.TryGetCurrentSetting("mssql_client_transcode", client_transcode) ||
 								   client_transcode.IsNull() || client_transcode.GetValue<bool>();
 	}
+	startup.datetime2_read = datetime2_read;  // decided above, before the network
 	Value dml_platform;
 	if (context.TryGetCurrentSetting("mssql_test_dml_platform", dml_platform) && !dml_platform.IsNull()) {
 		startup.dml_platform = StringUtil::Lower(dml_platform.ToString());

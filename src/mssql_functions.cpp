@@ -321,7 +321,8 @@ static LogicalType NativeStringType(const LogicalType &stream_type, bool native_
 	} else if (base != "nchar" && base != "nvarchar") {
 		return stream_type;
 	}
-	MSSQLColumnInfo info(string(), 0, base, max_length, 0, 0, true, collation, string());
+	MSSQLColumnInfo info(string(), 0, base, max_length, 0, 0, true, collation, string(),
+						 MSSQLDatetime2Read::Nanoseconds);	// a string column: no datetime2 read form
 	return info.NativeDuckDBType();
 }
 
@@ -1407,6 +1408,8 @@ unique_ptr<GlobalTableFunctionState> MSSQLScanInitGlobal(ClientContext &context,
 				collection->Append(chunk);
 				total += rows;
 			}
+			// Drained here, not by Execute: its warnings are logged here too (spec 093 D8 review).
+			stream->SurfaceWarnings(context);
 			stream.reset();
 			result->materialized = std::move(collection);
 			result->materialized->InitializeScan(result->materialized_scan);
@@ -1531,6 +1534,8 @@ void MSSQLScanFunction(ClientContext &context, TableFunctionInput &data, DataChu
 			global_state.done = true;
 			// Surface any warnings
 			global_state.result_stream->SurfaceWarnings(context);
+		} else if (global_state.result_stream->HasPendingWarnings()) {
+			global_state.result_stream->SurfaceWarnings(context);  // as met: a LIMIT may end the scan here
 		}
 	} catch (const Exception &e) {
 		global_state.done = true;

@@ -473,6 +473,8 @@ void MSSQLStagedDml::ReadReturned(ClientContext &context) {
 			out.SetChildCardinality(count);
 			returned_->Append(out);
 		}
+		// The server's notices, and a datetime2(7) value read as NULL (spec 093 D8).
+		stream.SurfaceWarnings(context);
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
 		stage_.FailAndThrow(context,

@@ -109,6 +109,15 @@ int main() {
 			  "smalldatetime is usable");
 		CHECK(ChooseRowIdKey({Idx(1, "PK_dt27", {Col("k", "datetime2", 8, false, false, false, 7)}, true)}).Found(),
 			  "datetime2(7) is usable");
+		{
+			// spec 093 D8: a catalog reading datetime2(7) in microseconds truncates it like time(7)
+			RowIdKeyColumn k = Col("k", "datetime2", 8, false, false, false, 7);
+			k.datetime2_truncated = true;
+			auto r = ChooseRowIdKey({Idx(1, "PK_dt27us", {k}, true)});
+			CHECK(!r.Found() && r.rejections.size() == 1 && Contains(r.rejections[0].reason, "datetime2(7)") &&
+					  Contains(r.rejections[0].reason, "#358"),
+				  "datetime2(7) read in microseconds is refused, named with its scale");
+		}
 		CHECK(ChooseRowIdKey({Idx(1, "PK_t6", {Col("k", "time", 5, false, false, false, 6)}, true)}).Found(),
 			  "time(6) is usable");
 		CHECK(
@@ -219,24 +228,32 @@ int main() {
 
 	// --- spec 080 D3: the predicate rungs 2 and 3 share
 	{
-		CHECK(IsRoundTripExactForKey("int", 0, false) == KeyFidelity::Exact, "int is exact");
-		CHECK(IsRoundTripExactForKey("nvarchar", 0, false) == KeyFidelity::Exact, "nvarchar (incl. MAX) is exact");
-		CHECK(IsRoundTripExactForKey("datetime2", 7, false) == KeyFidelity::Exact,
+		CHECK(IsRoundTripExactForKey("int", 0, false, false) == KeyFidelity::Exact, "int is exact");
+		CHECK(IsRoundTripExactForKey("nvarchar", 0, false, false) == KeyFidelity::Exact,
+			  "nvarchar (incl. MAX) is exact");
+		CHECK(IsRoundTripExactForKey("datetime2", 7, false, false) == KeyFidelity::Exact,
 			  "datetime2(7) reads as TIMESTAMP_NS");
-		CHECK(IsRoundTripExactForKey("smalldatetime", 0, false) == KeyFidelity::Exact, "smalldatetime has no fraction");
-		CHECK(IsRoundTripExactForKey("time", 6, false) == KeyFidelity::Exact, "time(6) fits microseconds");
-		CHECK(IsRoundTripExactForKey("datetime", 3, false) == KeyFidelity::Exact,
+		CHECK(IsRoundTripExactForKey("smalldatetime", 0, false, false) == KeyFidelity::Exact,
+			  "smalldatetime has no fraction");
+		CHECK(IsRoundTripExactForKey("time", 6, false, false) == KeyFidelity::Exact, "time(6) fits microseconds");
+		CHECK(IsRoundTripExactForKey("datetime", 3, false, false) == KeyFidelity::Exact,
 			  "datetime: matched in its own type (#358, spec 080 W3)");
-		CHECK(IsRoundTripExactForKey("time", 7, false) == KeyFidelity::NotRoundTrip, "time(7): 100 ns digit lost");
-		CHECK(IsRoundTripExactForKey("DATETIMEOFFSET", 7, false) == KeyFidelity::NotRoundTrip,
+		CHECK(IsRoundTripExactForKey("time", 7, false, false) == KeyFidelity::NotRoundTrip,
+			  "time(7): 100 ns digit lost");
+		CHECK(IsRoundTripExactForKey("DATETIMEOFFSET", 7, false, false) == KeyFidelity::NotRoundTrip,
 			  "datetimeoffset(7), any case");
-		CHECK(IsRoundTripExactForKey("sql_variant", 0, true) == KeyFidelity::NotRead, "a CAST column is not read");
+		CHECK(IsRoundTripExactForKey("sql_variant", 0, true, false) == KeyFidelity::NotRead,
+			  "a CAST column is not read");
 		const char *named[] = {"xml", "image", "text", "ntext", "geometry", "geography"};
 		for (auto t : named) {
-			CHECK(IsRoundTripExactForKey(t, 0, false) == KeyFidelity::NotRead, std::string(t) + " is named");
+			CHECK(IsRoundTripExactForKey(t, 0, false, false) == KeyFidelity::NotRead, std::string(t) + " is named");
 		}
-		CHECK(SpelledKeyType("time", 7) == "time(7)", "time(7) spelled with its scale");
-		CHECK(SpelledKeyType("datetime", 3) == "datetime", "datetime spelled bare");
+		CHECK(SpelledKeyType("time", 7, false) == "time(7)", "time(7) spelled with its scale");
+		CHECK(SpelledKeyType("datetime", 3, false) == "datetime", "datetime spelled bare");
+		// spec 093 D8: a datetime2(7) its catalog reads in microseconds is time(7)'s case
+		CHECK(IsRoundTripExactForKey("datetime2", 7, false, true) == KeyFidelity::NotRoundTrip,
+			  "datetime2(7) read in microseconds: 100 ns digit lost");
+		CHECK(SpelledKeyType("datetime2", 7, true) == "datetime2(7)", "... spelled with its scale");
 	}
 
 	if (g_failures) {

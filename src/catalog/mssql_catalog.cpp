@@ -90,7 +90,7 @@ MSSQLCatalog::MSSQLCatalog(AttachedDatabase &db, const string &context_name,
 																					: string("dbo")) {
 	// Create metadata cache with TTL from settings (0 = manual refresh only)
 	int64_t cache_ttl = 0;	// Default: manual refresh only
-	metadata_cache_ = make_uniq<MSSQLMetadataCache>(cache_ttl);
+	metadata_cache_ = make_uniq<MSSQLMetadataCache>(cache_ttl, startup_.datetime2_read);
 
 	// Configure catalog visibility filters from connection info (Spec 033)
 	if (!connection_info_->schema_filter.empty()) {

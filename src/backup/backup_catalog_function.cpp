@@ -115,7 +115,9 @@ LogicalType TypeOf(const RowsetLayout &layout, const PhysicalColumn &c) {
 	// sysrscols.ti gives a MAX type a length of 0 (E20).
 	const bool variable = c.xtype == XTYPE_VARBINARY || c.xtype == XTYPE_VARCHAR || c.xtype == XTYPE_NVARCHAR;
 	const int16_t length = variable && c.length == 0 ? int16_t(-1) : static_cast<int16_t>(c.length);
-	return MSSQLColumnInfo::MapSQLServerTypeToDuckDB(name, length, c.precision, c.scale);
+	// The backup reads datetime2(7) as TIMESTAMP_NS until spec 093 T8 hooks mssql_datetime2_7_as.
+	return MSSQLColumnInfo::MapSQLServerTypeToDuckDB(name, length, c.precision, c.scale,
+													 MSSQLDatetime2Read::Nanoseconds);
 }
 
 std::string AllowedList() {
