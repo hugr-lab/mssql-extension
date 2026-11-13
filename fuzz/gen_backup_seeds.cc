@@ -423,6 +423,7 @@ static Bytes LobInput() {
 	Put16(internal, 36, 1);
 	Bytes root(24, 0);
 	root[0] = 5;
+	root[2] = 1;		 // level 1: the link names an INTERNAL node (E21)
 	Put32(root, 12, 8);	 // cumulative 8, page 101, file 1, slot 0
 	Put32(root, 16, 101);
 	Put16(root, 20, 1);
