@@ -109,12 +109,23 @@ SELECT c_rowversion FROM mssql_scan('dt75', 'SELECT CAST(0x0000000000000001 AS t
 statement error
 SELECT * FROM mssql_scan('dt75', 'SELECT CAST(1 AS sql_variant) AS v');
 ----
-Unsupported SQL Server type
+column 'v' is a sql_variant, which a raw mssql_scan does not read yet
 
 statement error
 SELECT * FROM mssql_scan('dt75', 'SELECT hierarchyid::Parse(''/1/'') AS h');
 ----
-Unsupported SQL Server type
+column 'h' is of the CLR type sys.hierarchyid, which a raw mssql_scan does not read yet
+
+# Spec 093 T0: the COLMETADATA and rows of a UDT / sql_variant column are parsed, so the
+# prepared path refuses with the same message, and a batch that returns one to mssql_exec runs
+# (it used to fail at the COLMETADATA parse).
+statement error
+SELECT * FROM mssql_scan('dt75', 'SELECT CAST(1 AS sql_variant) AS v', prepared := true);
+----
+column 'v' is a sql_variant, which a raw mssql_scan does not read yet
+
+statement ok
+SELECT mssql_exec('dt75', 'SELECT hierarchyid::GetRoot() AS h, CAST(1 AS sql_variant) AS v, geometry::Point(1, 2, 0) AS g');
 
 statement ok
 DETACH dt75;

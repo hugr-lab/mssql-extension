@@ -68,7 +68,7 @@ true
 # mssql_convert_varchar_max = false must not break these columns.
 #
 # The setting governs declared VARCHAR(MAX) only. TEXT is never opted out: it is a known type
-# (is_cast_required = false), so dropping its CAST would put TDS_TYPE_TEXT (0x23) on the wire,
+# (its read form is not ServerCast), so dropping its CAST would put TDS_TYPE_TEXT (0x23) on the wire,
 # which no codec handles — the read fails outright rather than degrading. varchar(4001..8000) is
 # likewise still promoted to NVARCHAR(MAX), since no shorter NVARCHAR can hold it.
 statement ok

@@ -191,7 +191,11 @@ bool RowReader::ReadNBCRow(const uint8_t *data, size_t length, size_t &bytes_con
 			return false;  // Need more data
 		}
 
-		// Note: is_null should always be false here since we already checked bitmap
+		// The bitmap says present; a value can still say NULL by itself (a sql_variant of length 0,
+		// spec 093 T0). No other type sets it here.
+		if (is_null) {
+			row.null_mask[col_idx] = true;
+		}
 		offset += consumed;
 	}
 
@@ -310,7 +314,12 @@ size_t RowReader::SkipValue(const uint8_t *data, size_t length, size_t col_idx) 
 
 	// XML (always PLP)
 	case TDS_TYPE_XML:
+	case TDS_TYPE_UDT:
 		return SkipPLPType(data, length);
+
+	// sql_variant (spec 093 G2): a u32 length, then that many bytes.
+	case TDS_TYPE_SQL_VARIANT:
+		return SkipVariant(data, length);
 
 	// Variable-length (2-byte length prefix, or PLP for MAX types)
 	case TDS_TYPE_BIGCHAR:
@@ -366,7 +375,12 @@ size_t RowReader::ReadValue(const uint8_t *data, size_t length, size_t col_idx, 
 
 	// XML (always PLP)
 	case TDS_TYPE_XML:
+	case TDS_TYPE_UDT:
 		return ReadPLPType(data, length, value, is_null);
+
+	// sql_variant (spec 093 G2): a u32 length, then that many bytes; 0 is NULL in a ROW.
+	case TDS_TYPE_SQL_VARIANT:
+		return ReadVariant(data, length, value, is_null);
 
 	// Variable-length types
 	case TDS_TYPE_BIGCHAR:
@@ -626,6 +640,37 @@ size_t RowReader::ReadGuidType(const uint8_t *data, size_t length, std::vector<u
 	return 1 + 16;
 }
 
+// A sql_variant value: a u32 length, then the value (its header included). A length of 0 is NULL; past
+// SQL_VARIANT_MAX_BYTES the stream is malformed. Returns the bytes consumed, 0 when they have not all
+// arrived yet.
+static size_t VariantFrame(const uint8_t *data, size_t length, uint32_t &value_length) {
+	if (length < 4)
+		return 0;
+	value_length = static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8) |
+				   (static_cast<uint32_t>(data[2]) << 16) | (static_cast<uint32_t>(data[3]) << 24);
+	if (value_length > SQL_VARIANT_MAX_BYTES) {
+		throw std::runtime_error("sql_variant value declares " + std::to_string(value_length) + " bytes, past the " +
+								 std::to_string(SQL_VARIANT_MAX_BYTES) + "-byte maximum. The TDS stream is malformed.");
+	}
+	return length >= 4u + value_length ? 4u + value_length : 0;
+}
+
+size_t RowReader::SkipVariant(const uint8_t *data, size_t length) {
+	uint32_t value_length = 0;
+	return VariantFrame(data, length, value_length);
+}
+
+size_t RowReader::ReadVariant(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null) {
+	uint32_t value_length = 0;
+	const size_t consumed = VariantFrame(data, length, value_length);
+	if (consumed == 0) {
+		return 0;
+	}
+	is_null = value_length == 0;
+	value.assign(data + 4, data + 4 + value_length);
+	return consumed;
+}
+
 // PLP_NULL marker: 0xFFFFFFFFFFFFFFFF (all bits set = null value)
 static constexpr uint64_t PLP_NULL_MARKER = 0xFFFFFFFFFFFFFFFFULL;
 // PLP_UNKNOWN marker: 0xFFFFFFFFFFFFFFFE (unknown total length, chunks follow)
@@ -836,7 +881,12 @@ size_t RowReader::ReadValueNBC(const uint8_t *data, size_t length, size_t col_id
 
 	// XML (always PLP)
 	case TDS_TYPE_XML:
+	case TDS_TYPE_UDT:
 		return ReadPLPType(data, length, value, is_null);
+
+	// sql_variant (spec 093 G2): a u32 length, then that many bytes; 0 is NULL in a ROW.
+	case TDS_TYPE_SQL_VARIANT:
+		return ReadVariant(data, length, value, is_null);
 
 	// Variable-length types still have 2-byte length prefix (or PLP for MAX types)
 	case TDS_TYPE_BIGCHAR:
@@ -991,7 +1041,12 @@ size_t RowReader::SkipValueNBC(const uint8_t *data, size_t length, size_t col_id
 
 	// XML (always PLP)
 	case TDS_TYPE_XML:
+	case TDS_TYPE_UDT:
 		return SkipPLPType(data, length);
+
+	// sql_variant (spec 093 G2): a u32 length, then that many bytes.
+	case TDS_TYPE_SQL_VARIANT:
+		return SkipVariant(data, length);
 
 	// Variable-length (still have 2-byte length prefix, or PLP for MAX types)
 	case TDS_TYPE_BIGCHAR:

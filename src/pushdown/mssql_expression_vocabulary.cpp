@@ -188,7 +188,7 @@ std::string DeclarationOfValueOrEmpty(const Value &value, const LogicalType &typ
 
 std::string ExpressionVocabulary::DeclarationForColumn(const MSSQLColumnInfo &column, const Value &value,
 													   const LogicalType &type) {
-	if (column.is_cast_required || column.is_geometry) {
+	if (column.comparison_differs || column.IsSpatial()) {
 		return "";
 	}
 	const std::string t = StringUtil::Lower(column.sql_type_name);
