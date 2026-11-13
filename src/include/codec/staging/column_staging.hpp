@@ -48,6 +48,7 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/vector_size.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -482,13 +483,22 @@ struct ColumnStaging {
 		return buffer.data() + offset;
 	}
 
-	//! Room for `more` bytes past what is staged, grown now to exactly that, so a value appended in
-	//! pieces (a LOB's fragments) grows the buffer once, to what it needs, not doubling past it.
+	//! Room for `more` bytes past what is staged, grown now, so a value appended in pieces (a LOB's
+	//! fragments) grows the buffer once: doubling, but never more than RESERVE_SLACK_BYTES past what it
+	//! needs, so a large value is not held twice. Grown to exactly each value, the chunk's payload was
+	//! copied once a value (measured, PR 3 S7: 0.16 s of a 0.8 s scan of 200,000 values of 10 KB).
 	inline void ReserveMore(idx_t more) {
-		if (payload_used + more > buffer.size()) {
-			GrowPayload(payload_used + more, true);
+		const idx_t needed = payload_used + more;
+		if (needed > buffer.size()) {
+			const idx_t doubled = static_cast<idx_t>(buffer.size()) * 2;
+			idx_t room = std::min<idx_t>(std::min<idx_t>(doubled, needed + RESERVE_SLACK_BYTES), payload_cap);
+			if (payload_bound > 0 && needed <= payload_bound) {
+				room = std::min(room, payload_bound);  // never past the column's provable worst case
+			}
+			GrowPayload(std::max(needed, room), true);
 		}
 	}
+	static constexpr idx_t RESERVE_SLACK_BYTES = 1 << 20;
 
 	//! Bytes appended since BeginVar — the length of the value still being built.
 	inline idx_t PendingVarLength() const {

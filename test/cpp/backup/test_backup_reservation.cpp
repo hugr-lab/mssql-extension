@@ -34,9 +34,11 @@ void Check(bool ok, const std::string &what) {
 struct FakeDuckDB {
 	std::atomic<int64_t> room;
 	std::atomic<int64_t> reserved{0};
+	std::atomic<int64_t> attempts{0};
 	explicit FakeDuckDB(int64_t r) : room(r) {}
 	ReservationGate::ReserveFn Reserve() {
 		return [this](uint64_t bytes, std::string &why) {
+			attempts++;
 			if (room.fetch_sub(static_cast<int64_t>(bytes)) < static_cast<int64_t>(bytes)) {
 				room += static_cast<int64_t>(bytes);
 				why = "out of memory (fake)";
@@ -298,6 +300,71 @@ int main() {
 		}
 		Check(small.Held() == 50 && tight.reserved == 5, "the destructor gives back what is left");
 		small.Release(50, 5);
+	}
+
+	std::cout << "A call's rows share a grant's credit (PR 3 S7)" << std::endl;
+	{
+		FakeDuckDB duck(1ull << 40);
+		ReservationGate gate(64ull << 20, duck.Reserve(), duck.Release());	// a sixteenth: 4 MiB, CREDIT_BYTES caps
+		const uint64_t credit = CallReservations::CREDIT_BYTES;
+		{
+			CallReservations call(gate, std::function<bool()>());
+			call.Acquire(1000, 1000);  // the chunk's staging
+			bool all = true;
+			for (int i = 0; i < 100; i++) {
+				all = all && call.TryAcquire(10000, 4000);
+			}
+			Check(all && gate.Holders() == 2 && gate.Held() == 1000 + credit &&
+					  duck.reserved == static_cast<int64_t>(1000 + 4000 + (credit - 10000) * 4000 / 10000),
+				  "100 rows of 10 KB (4 KB of it DuckDB's): one grant of 1 MiB, its credit the rows after the first, "
+				  "DuckDB's share of it the rows' own");
+			Check(call.TryAcquire(credit, credit) && gate.Holders() == 3 && gate.Held() == 1000 + 2 * credit,
+				  "a row the credit does not cover, as large as a grant: taken alone");
+			call.ReleaseAll();
+			Check(gate.Held() == 0 && gate.Holders() == 0 && duck.reserved == 0, "... and every grant given back");
+			Check(call.TryAcquire(10, 10) && gate.Held() == credit, "the credit went with them: a new grant");
+		}
+		Check(gate.Held() == 0 && duck.reserved == 0, "the destructor gives the grant back");
+		FakeDuckDB tight(50000);
+		ReservationGate exact(64ull << 20, tight.Reserve(), tight.Release());
+		{
+			CallReservations call(exact, std::function<bool()>());
+			Check(call.TryAcquire(10000, 10000) && exact.Held() == 10000 && tight.reserved == 10000,
+				  "DuckDB cannot reserve a grant's credit: the row is asked for alone");
+		}
+		{
+			CallReservations call(exact, std::function<bool()>());
+			const auto before = tight.attempts.load();
+			Check(call.TryAcquire(10000, 10000) && call.TryAcquire(10000, 10000) && exact.Holders() == 2 &&
+					  tight.attempts == before + 3,
+				  "a grant DuckDB refused is not asked again in the call: one refused grant, then each row alone");
+		}
+		ReservationGate shared(32ull << 20, duck.Reserve(), duck.Release());
+		{
+			CallReservations call(shared, std::function<bool()>());
+			call.Acquire(30ull << 20, 30ull << 20);
+			Check(call.TryAcquire(10000, 10000) && shared.Held() == (30ull << 20) + credit, "a grant beside a chunk");
+			std::atomic<bool> in{false};
+			std::thread waiter([&]() {
+				shared.Acquire(2ull << 20, std::function<bool()>());
+				in = true;
+			});
+			for (int i = 0; i < 400 && !shared.HasWaiters(); i++) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+			}
+			Check(shared.HasWaiters() && !call.TryAcquire(10000, 10000),
+				  "while an Acquire waits for the budget, the credit serves no row: the chunk closes");
+			call.ReleaseAll();
+			waiter.join();
+			Check(in && shared.Held() == (2ull << 20), "... and the waiter takes what the call gave back");
+			shared.Release(2ull << 20);
+		}
+		ReservationGate tiny(160, duck.Reserve(), duck.Release());
+		{
+			CallReservations call(tiny, std::function<bool()>());
+			Check(call.TryAcquire(5, 5) && tiny.Held() == 10 && call.TryAcquire(5, 5) && tiny.Held() == 10,
+				  "a grant is a sixteenth of the budget at most (160: 10)");
+		}
 	}
 
 	std::cout << "A waiter for the budget goes first (PR 3 S4)" << std::endl;

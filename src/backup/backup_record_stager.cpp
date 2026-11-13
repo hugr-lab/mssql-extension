@@ -448,7 +448,8 @@ OffRowNeed RecordStager::PrepareRow(const RecordView &record) {
 		if (p.direct || p.stream) {
 			need.direct += p.output;
 		} else {
-			// AppendOffRow grows the buffer to exactly what the value needs (ReserveMore): it is in memory once.
+			// AppendOffRow grows the buffer once for the value (ReserveMore): it is in memory once, the
+			// buffer's slack past it (RESERVE_SLACK_BYTES at most) unaccounted, like its retained capacity.
 			need.staged += p.length + (c.arm == StageArm::Utf16 ? 2 : 0);
 		}
 	}
@@ -533,8 +534,8 @@ void RecordStager::AppendOffRow(Column &c, ColumnStaging &st, const PreparedValu
 		st.AppendNull();
 		return;
 	}
-	// The buffer grown once, to exactly what the value needs, before its fragments are copied in; a large
-	// one closes the chunk after its row (Full).
+	// The buffer grown once for the value (doubling, within RESERVE_SLACK_BYTES of what it needs) before
+	// its fragments are copied in; a large one closes the chunk after its row (Full).
 	st.ReserveMore(p.length + (c.arm == StageArm::Utf16 ? 2 : 0));
 	if (p.length >= DIRECT_VALUE_BYTES) {
 		large_staged_ = true;
