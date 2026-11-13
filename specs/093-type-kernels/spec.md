@@ -443,11 +443,11 @@ it carries DQ-44, decided after the split.
 
 | PR | content | days |
 |---|---|---|
-| **T0** | D2's split of `is_cast_required` (no behaviour change); TYPE_INFO and row framing for `0x62`, `0xF0`, `0xF5`; a user CLR type reads `BLOB` in a raw scan; experiment G2 | 2–3 |
+| **T0** | D2's split of `is_cast_required` (no behaviour change); TYPE_INFO and row framing for `0x62` and `0xF0`, the raw-scan refusal naming the type; experiment G2 (`measured/G2.md`). #557 | 2–3 |
 | **T1** | `sql_variant` read as `VARIANT` (D3): both envelopes, the kernel, catalog / raw scan / describe / `column_types` / RETURNING; S1; `fuzz_variant_envelope` | 5–6 |
 | **T2** | `sql_variant` write (D3): literals, refusals, the bulk encoder if S2 passes; CTAS | 3–4 |
-| **T3** | `vector(n)` as `FLOAT[n]` (D4): VECTORSUPPORT, `mssql_vector_support`, the kernel, the JSON fallback, writes, CTAS / COPY; V1–V6; the 2025 CI job; `fuzz_vector` | 4.5–5.5 |
-| **T4** | `hierarchyid` on the client (D5); H1; `fuzz_hierarchyid` | 2–3 |
+| **T3** | `vector(n)` as `FLOAT[n]` (D4): the `0xF5` TYPE_INFO and row framing (moved from T0: the server sends it only under VECTORSUPPORT, and V1 measures its byte order), VECTORSUPPORT, `mssql_vector_support`, the kernel, the JSON fallback, writes, CTAS / COPY; V1–V6; the 2025 CI job; `fuzz_vector` | 4.5–5.5 |
+| **T4** | `hierarchyid` on the client (D5); H1; `fuzz_hierarchyid`; a user CLR type read as `BLOB` in a raw scan (moved from T0: testing how the describe reports one needs a CLR assembly, built in a .NET SDK container) | 2–3 |
 | **T5** | spatial read (D6): the MS-SSCLRT kernel, bare read, `GEOMETRY('OGC:CRS84')`, the curve error, `geometry_as`; G1, G3, G6, D1; `fuzz_ssclrt` | 5–7 |
 | **T6** | spatial write (D6): SRID from the CRS, the stage, client MS-SSCLRT for geometry if G4 passes, CTAS creates `geometry`; G4, G7 | 4–5 |
 | **T7** | `json` as `JSON` (D7) | 0.5 |
