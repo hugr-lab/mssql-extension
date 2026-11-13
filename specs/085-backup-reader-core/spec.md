@@ -289,6 +289,23 @@ a type whose conversion is still to come is read as its stored bytes (below).
   `m_lsn > since_lsn`, spec 089 D3; R§6.2 point 4). The lake deletes by `_mssql_page` with DuckLake's own
   `DELETE` (R§6.2).
 
+  **`_mssql_lob`'s bytes** (PR 3, task 20; DQ-46: NULL for a row with no off-row value; every off-row
+  value of the row, projected or not; the leaves listed; keyed by the catalog's column id;
+  `backup/backup_lob_map.hpp`):
+
+  | field | bytes | meaning |
+  |---|---|---|
+  | format | u8 | `0x01` |
+  | entry count | u16 | one per off-row value, ascending column id |
+  | column id | u32 | `syscolpars.colid` |
+  | form | u8 | 1 row-overflow, 2 in-row root, 3 root pointer (E21) |
+  | flags | u8 | bit 0: a NULL root (a `text` / `image` updated to NULL, E21) |
+  | pointer | u16 length, bytes | the in-row bytes as stored (089's root identity) |
+  | value length | u32 | |
+  | node count | u32 | then per node, depth first in link order: u32 page, u16 file, u16 slot, u32 offset and u32 length of the value it covers, u8 depth (0 a root record), u8 fragment type |
+
+  18 bytes a node. A map-only walk lists a leaf from its parent's link, unread (`WalkLob`).
+
 - **D9 — the opened-file cache (owner, R§6.1).** An import calls the functions once per table on the
   same file, and a cold open costs a pass over the whole file. The opened backup is kept in DuckDB's
   per-instance `ObjectCache` (`storage/object_cache.hpp`), keyed by every family file's canonical path,
