@@ -75,8 +75,12 @@ enum class AppendArm : uint8_t {
 	//! whose wire value may legitimately be SHORTER than the declared width;
 	//! the append zero-extends instead of rejecting it.
 	P1StageDecimal,
+	//! SQL_VARIANT (spec 093 T1): a four-byte length, 0 meaning NULL, then the
+	//! value's envelope (base type, properties, value), staged as it is and
+	//! written as a VARIANT at finalize.
+	P4StageVariant,
 	//! The wire type has no staged framing at all, so no value of it can be read.
-	//! TEXT/NTEXT/IMAGE via raw mssql_scan, UDT and SQL_VARIANT land here; the
+	//! TEXT/NTEXT/IMAGE via raw mssql_scan and UDT land here; the
 	//! shipped row reader cannot decode them either. It throws when a value
 	//! ARRIVES rather than at column resolution, so a query that selects such a
 	//! column but returns no rows keeps succeeding, as it does today.
@@ -116,12 +120,15 @@ enum class FinalizeKernel : uint8_t {
 	//! rendered as text. The one kernel that is not a family batch decode.
 	Text,
 	//! Spec 092: a CHAR / VARCHAR / TEXT column transcoded from its code page.
-	CodePage
+	CodePage,
+	//! Spec 093 T1: a SQL_VARIANT column, each value written as a VARIANT
+	//! (`src/codec/variant/variant_codec.cpp`).
+	Variant
 };
 
 //! Number of FinalizeKernel values, for counter arrays.
-static const uint8_t FINALIZE_KERNEL_COUNT = 9;
-static_assert(FINALIZE_KERNEL_COUNT == static_cast<uint8_t>(FinalizeKernel::CodePage) + 1,
+static const uint8_t FINALIZE_KERNEL_COUNT = 10;
+static_assert(FINALIZE_KERNEL_COUNT == static_cast<uint8_t>(FinalizeKernel::Variant) + 1,
 			  "a new kernel must not index past the counter arrays");
 
 //! Short lowercase name, for the debug counters.

@@ -163,8 +163,9 @@ public:
 	void SurfaceWarnings(ClientContext &context);
 
 	//! A warning the stream found while filling a chunk and has not logged yet (spec 093 D8: a
-	//! datetime2 value read as NULL for not fitting TIMESTAMP_NS). A scan's Execute asks after every
-	//! FillChunk and calls SurfaceWarnings when it is true, so a query that stops early still says it.
+	//! datetime2 value read as NULL for not fitting TIMESTAMP_NS; T1: a sql_variant value read as its
+	//! bytes). A scan's Execute asks after every FillChunk and calls SurfaceWarnings when it is true,
+	//! so a query that stops early still says it.
 	bool HasPendingWarnings() const {
 		return warnings_pending_;
 	}
@@ -262,6 +263,8 @@ private:
 	//! RefuseOutOfRangeIn's columns and table (issue #559).
 	std::vector<bool> refuse_out_of_range_;
 	std::string refuse_table_;
+	//! Spec 093 T1: per column, whether its sql_variant values read as bytes were logged.
+	std::vector<bool> variant_notes_warned_;
 	bool is_catalog_scan_ = false;
 
 	// Statistics

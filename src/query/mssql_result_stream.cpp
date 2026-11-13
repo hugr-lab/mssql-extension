@@ -465,6 +465,15 @@ exit_loop:
 			if (stager_.ChunkOutOfRange(c) > 0) {
 				NoteOutOfRange(c);
 			}
+			// Spec 093 T1: a sql_variant value read as its bytes is said as soon as the scan meets
+			// one, like D8's out-of-range values, so a query that stops early still says it.
+			if (column_metadata_[c].type_id == tds::TDS_TYPE_SQL_VARIANT &&
+				(c >= variant_notes_warned_.size() || !variant_notes_warned_[c])) {
+				const auto &notes = stager_.VariantNotes(c);
+				if (notes.unknown_collation + notes.invalid_utf8 > 0) {
+					warnings_pending_ = true;
+				}
+			}
 		}
 		if (counters_enabled_) {
 			CountChunkForDebug(chunk, row_count);
@@ -997,6 +1006,29 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 							   "datetime2_7_as 'timestamp' (or SET mssql_datetime2_7_as = 'timestamp' before ATTACH) "
 							   "to read them as TIMESTAMP, the 100 ns digit truncated",
 							   column_metadata_[c].name.c_str());
+		}
+	}
+
+	// Spec 093 T1: sql_variant values the scan read as their bytes (a collation this build has no code
+	// page for, UTF-8 bytes that are not UTF-8), once a column.
+	if (stager_.IsConfigured()) {
+		variant_notes_warned_.resize(column_metadata_.size(), false);
+		for (idx_t c = 0; c < column_metadata_.size(); c++) {
+			if (column_metadata_[c].type_id != tds::TDS_TYPE_SQL_VARIANT || variant_notes_warned_[c]) {
+				continue;
+			}
+			const auto &notes = stager_.VariantNotes(c);
+			if (notes.unknown_collation + notes.invalid_utf8 == 0) {
+				continue;
+			}
+			variant_notes_warned_[c] = true;
+			DUCKDB_LOG_WARNING(context,
+							   "mssql: column \"%s\": %llu sql_variant string value(s) read as their bytes (a BLOB "
+							   "inside the VARIANT): %llu under a collation this build has no code page for, %llu "
+							   "under a UTF-8 collation but not UTF-8",
+							   column_metadata_[c].name.c_str(),
+							   (unsigned long long)(notes.unknown_collation + notes.invalid_utf8),
+							   (unsigned long long)notes.unknown_collation, (unsigned long long)notes.invalid_utf8);
 		}
 	}
 

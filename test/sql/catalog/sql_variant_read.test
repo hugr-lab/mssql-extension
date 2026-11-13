@@ -1,18 +1,21 @@
 # name: test/sql/catalog/sql_variant_read.test
-# description: a sql_variant column reads every base type whole, and a filter on it runs in DuckDB
+# description: Spec 093 T1 -- a sql_variant column is read as a VARIANT of each value's base type, through the catalog and a raw scan alike
 # group: [catalog]
 
 # Environment variables required:
 #   MSSQL_TESTDB_DSN - Connection string to test database
 #
-# Issue #354, until sql_variant is decoded on the wire: the column is still text, but each value is
-# converted by the style that keeps its base type whole, where the plain cast (style 0) cut a
-# datetime2 to the minute, a float to six digits, a money to two decimals, and read a varbinary's
-# bytes as UTF-16.
+# The values are experiment S1's (specs/093-type-kernels/measured/S1.md): every base type a
+# sql_variant holds, decimal at precisions 1-38, time / datetime2 / datetimeoffset at every scale
+# (9999-12-31 and 0001-01-01, +/-14:00), padded char / nchar / binary, varchar under 1252, 1251, 932
+# and a UTF-8 collation, an nvarchar with a surrogate pair, empty values, NULL. Each reads as D3's
+# VARIANT tag, and its text is the server's (SQL_VARIANT_PROPERTY / CONVERT 121 in S1): a time(7) /
+# datetime2(7) keeps its 100 ns digit (TIME_NANOS / TIMESTAMP_NANOS), a datetime2(7) past 2262 reads
+# in microseconds, a datetimeoffset as its UTC instant, char / nchar trimmed.
 #
-# Issue #514: a filter on the column was pushed against the raw sql_variant, which SQL Server
-# compares by its base type: WHERE v = '5' found the nvarchar '5' and lost the int 5, which DuckDB
-# reads as '5' too.
+# A filter on the column runs in DuckDB, over the VARIANT (issue #514: the server compares a
+# sql_variant by its base type, so a pushed WHERE lost rows); v = 5 is the int, v = '5' the string.
+# Writing one is spec 093 T2: refused by name until then.
 
 require mssql
 
@@ -22,77 +25,259 @@ statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS sv (TYPE mssql);
 
 statement ok
-SELECT mssql_exec('sv', 'DROP TABLE IF EXISTS dbo.sv_read; CREATE TABLE dbo.sv_read (id int PRIMARY KEY, v sql_variant NULL)');
-
-# One INSERT per value: a VALUES list converts every row to one type first.
-statement ok
-SELECT mssql_exec('sv', 'INSERT dbo.sv_read VALUES (1, CAST(5 AS int)); INSERT dbo.sv_read VALUES (2, CAST(N''5'' AS nvarchar(10))); INSERT dbo.sv_read VALUES (3, CAST(''2026-09-16T10:11:12.1234567'' AS datetime2(7))); INSERT dbo.sv_read VALUES (4, CAST(''10:11:12.1234567'' AS time(7))); INSERT dbo.sv_read VALUES (5, CAST(''2026-09-16'' AS date)); INSERT dbo.sv_read VALUES (6, CAST(''2026-09-16T10:11:12.123'' AS datetime)); INSERT dbo.sv_read VALUES (7, CAST(''2026-09-16T10:11:12.1234567+03:00'' AS datetimeoffset(7)))');
-
-statement ok
-SELECT mssql_exec('sv', 'INSERT dbo.sv_read VALUES (8, CAST(0x0102FF AS varbinary(10))); INSERT dbo.sv_read VALUES (9, CAST(0.1 AS float)); INSERT dbo.sv_read VALUES (10, CAST(1.2345678 AS real)); INSERT dbo.sv_read VALUES (11, CAST(123456.7891 AS money)); INSERT dbo.sv_read VALUES (12, CAST(12345.678901 AS decimal(18,6))); INSERT dbo.sv_read VALUES (13, CAST(''A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'' AS uniqueidentifier)); INSERT dbo.sv_read VALUES (14, CAST(1 AS bit)); INSERT dbo.sv_read VALUES (15, NULL)');
+SELECT mssql_exec('sv', 'DROP TABLE IF EXISTS dbo.sv_read; CREATE TABLE dbo.sv_read (id int NOT NULL PRIMARY KEY, v sql_variant NULL); INSERT INTO dbo.sv_read VALUES  (1, CAST(CAST(1 AS bit) AS sql_variant)), (2, CAST(CAST(0 AS bit) AS sql_variant)),  (3, CAST(CAST(255 AS tinyint) AS sql_variant)), (4, CAST(CAST(-32768 AS smallint) AS sql_variant)),  (5, CAST(CAST(-2147483648 AS int) AS sql_variant)), (6, CAST(CAST(-9223372036854775808 AS bigint) AS sql_variant)),  (7, CAST(CAST(1.5 AS real) AS sql_variant)), (8, CAST(CAST(-1.25e300 AS float) AS sql_variant)),  (9, CAST(CAST(0.5 AS decimal(1,1)) AS sql_variant)), (10, CAST(CAST(-1234567.89 AS decimal(9,2)) AS sql_variant)),  (11, CAST(CAST(123456789012345678 AS decimal(18,0)) AS sql_variant)), (12, CAST(CAST(1234567890.123456789 AS decimal(19,9)) AS sql_variant)),  (13, CAST(CAST(-12345678901234567890.12345678 AS decimal(28,8)) AS sql_variant)), (14, CAST(CAST(99999999999999999999999999999999999999 AS decimal(38,0)) AS sql_variant)),  (15, CAST(CAST(-0.00000000000000000000000000000000000001 AS decimal(38,38)) AS sql_variant)), (16, CAST(CAST(12.5 AS numeric(10,3)) AS sql_variant)),  (17, CAST(CAST(-922337203685477.5808 AS money) AS sql_variant)), (18, CAST(CAST(214748.3647 AS smallmoney) AS sql_variant)),  (19, CAST(CAST(''0001-01-01'' AS date) AS sql_variant)), (20, CAST(CAST(''9999-12-31'' AS date) AS sql_variant)),  (21, CAST(CAST(''23:59:59'' AS time(0)) AS sql_variant)), (22, CAST(CAST(''10:00:00.123'' AS time(3)) AS sql_variant)),  (23, CAST(CAST(''10:00:00.123456'' AS time(6)) AS sql_variant)), (24, CAST(CAST(''10:00:00.1234567'' AS time(7)) AS sql_variant)),  (25, CAST(CAST(''2026-01-01 10:00:00'' AS datetime2(0)) AS sql_variant)), (26, CAST(CAST(''2026-01-01 10:00:00.123'' AS datetime2(3)) AS sql_variant)),  (27, CAST(CAST(''2026-01-01 10:00:00.123456'' AS datetime2(6)) AS sql_variant)), (28, CAST(CAST(''2026-01-01 10:00:00.1234567'' AS datetime2(7)) AS sql_variant)),  (29, CAST(CAST(''9999-12-31 23:59:59.9999999'' AS datetime2(7)) AS sql_variant)), (30, CAST(CAST(''0001-01-01 00:00:00'' AS datetime2(7)) AS sql_variant)),  (31, CAST(CAST(''2026-11-13 07:08:09.123'' AS datetime) AS sql_variant)), (32, CAST(CAST(''2026-11-13 07:08:00'' AS smalldatetime) AS sql_variant)),  (33, CAST(CAST(''2026-01-01 10:00:00 +14:00'' AS datetimeoffset(0)) AS sql_variant)), (34, CAST(CAST(''2026-01-01 10:00:00.123456 -14:00'' AS datetimeoffset(6)) AS sql_variant)),  (35, CAST(CAST(''2026-01-01 10:00:00.1234567 +05:30'' AS datetimeoffset(7)) AS sql_variant)), (36, CAST(CAST(''9999-12-31 23:59:59.9999999 +00:00'' AS datetimeoffset(7)) AS sql_variant)),  (37, CAST(CAST(''6F9619FF-8B86-D011-B42D-00C04FC964FF'' AS uniqueidentifier) AS sql_variant)), (38, CAST(CAST(0x0102 AS binary(4)) AS sql_variant)),  (39, CAST(CAST(0x010203 AS varbinary(10)) AS sql_variant)), (40, CAST(CAST(''ab'' AS char(5)) AS sql_variant)),  (41, CAST(CAST(''café'' COLLATE SQL_Latin1_General_CP1_CI_AS AS varchar(10)) AS sql_variant)),  (42, CAST(CAST(N''дом'' COLLATE Cyrillic_General_CI_AS AS varchar(10)) AS sql_variant)),  (43, CAST(CAST(N''漢字'' COLLATE Japanese_CI_AS AS varchar(10)) AS sql_variant)),  (44, CAST(CAST(N''😀é'' COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS varchar(20)) AS sql_variant)),  (45, CAST(CAST(N''ab'' AS nchar(5)) AS sql_variant)), (46, CAST(CAST(N''😀x'' COLLATE Latin1_General_100_CI_AS_SC AS nvarchar(10)) AS sql_variant)),  (47, CAST(CAST(N''дом'' COLLATE Cyrillic_General_CI_AS AS char(6)) AS sql_variant)), (48, NULL),  (49, CAST(CAST('''' AS varchar(5)) AS sql_variant)), (50, CAST(CAST(0x AS varbinary(5)) AS sql_variant)); ');
 
 statement ok
 SELECT mssql_invalidate_cache('sv');
 
+query ITTT
+SELECT id, typeof(v), variant_typeof(v), v::VARCHAR FROM sv.dbo.sv_read ORDER BY id;
+----
+1	VARIANT	BOOL_TRUE	true
+2	VARIANT	BOOL_FALSE	false
+3	VARIANT	UINT8	255
+4	VARIANT	INT16	-32768
+5	VARIANT	INT32	-2147483648
+6	VARIANT	INT64	-9223372036854775808
+7	VARIANT	FLOAT	1.5
+8	VARIANT	DOUBLE	-1.25e+300
+9	VARIANT	DECIMAL(1, 1)	.5
+10	VARIANT	DECIMAL(9, 2)	-1234567.89
+11	VARIANT	DECIMAL(18, 0)	123456789012345678
+12	VARIANT	DECIMAL(19, 9)	1234567890.123456789
+13	VARIANT	DECIMAL(28, 8)	-12345678901234567890.12345678
+14	VARIANT	DECIMAL(38, 0)	99999999999999999999999999999999999999
+15	VARIANT	DECIMAL(38, 38)	-.00000000000000000000000000000000000001
+16	VARIANT	DECIMAL(10, 3)	12.500
+17	VARIANT	DECIMAL(19, 4)	-922337203685477.5808
+18	VARIANT	DECIMAL(10, 4)	214748.3647
+19	VARIANT	DATE	0001-01-01
+20	VARIANT	DATE	9999-12-31
+21	VARIANT	TIME_MICROS	23:59:59
+22	VARIANT	TIME_MICROS	10:00:00.123
+23	VARIANT	TIME_MICROS	10:00:00.123456
+24	VARIANT	TIME_NANOS	10:00:00.1234567
+25	VARIANT	TIMESTAMP_SEC	2026-01-01 10:00:00
+26	VARIANT	TIMESTAMP_MILIS	2026-01-01 10:00:00.123
+27	VARIANT	TIMESTAMP_MICROS	2026-01-01 10:00:00.123456
+28	VARIANT	TIMESTAMP_NANOS	2026-01-01 10:00:00.1234567
+29	VARIANT	TIMESTAMP_MICROS	9999-12-31 23:59:59.999999
+30	VARIANT	TIMESTAMP_MICROS	0001-01-01 00:00:00
+31	VARIANT	TIMESTAMP_MICROS	2026-11-13 07:08:09.123333
+32	VARIANT	TIMESTAMP_MICROS	2026-11-13 07:08:00
+33	VARIANT	TIMESTAMP_MICROS_TZ	2025-12-31 20:00:00+00
+34	VARIANT	TIMESTAMP_MICROS_TZ	2026-01-02 00:00:00.123456+00
+35	VARIANT	TIMESTAMP_NANOS_TZ	2026-01-01 04:30:00.1234567+00
+36	VARIANT	TIMESTAMP_MICROS_TZ	9999-12-31 23:59:59.999999+00
+37	VARIANT	UUID	6f9619ff-8b86-d011-b42d-00c04fc964ff
+38	VARIANT	BLOB	\x01\x02\x00\x00
+39	VARIANT	BLOB	\x01\x02\x03
+40	VARIANT	VARCHAR	ab
+41	VARIANT	VARCHAR	café
+42	VARIANT	VARCHAR	дом
+43	VARIANT	VARCHAR	漢字
+44	VARIANT	VARCHAR	😀é
+45	VARIANT	VARCHAR	ab
+46	VARIANT	VARCHAR	😀x
+47	VARIANT	VARCHAR	дом
+48	VARIANT	VARIANT_NULL	NULL
+49	VARIANT	VARCHAR	(empty)
+50	VARIANT	BLOB	(empty)
+
+query ITTT
+SELECT id, typeof(v), variant_typeof(v), v::VARCHAR FROM mssql_scan('sv', 'SELECT id, v FROM dbo.sv_read ORDER BY id');
+----
+1	VARIANT	BOOL_TRUE	true
+2	VARIANT	BOOL_FALSE	false
+3	VARIANT	UINT8	255
+4	VARIANT	INT16	-32768
+5	VARIANT	INT32	-2147483648
+6	VARIANT	INT64	-9223372036854775808
+7	VARIANT	FLOAT	1.5
+8	VARIANT	DOUBLE	-1.25e+300
+9	VARIANT	DECIMAL(1, 1)	.5
+10	VARIANT	DECIMAL(9, 2)	-1234567.89
+11	VARIANT	DECIMAL(18, 0)	123456789012345678
+12	VARIANT	DECIMAL(19, 9)	1234567890.123456789
+13	VARIANT	DECIMAL(28, 8)	-12345678901234567890.12345678
+14	VARIANT	DECIMAL(38, 0)	99999999999999999999999999999999999999
+15	VARIANT	DECIMAL(38, 38)	-.00000000000000000000000000000000000001
+16	VARIANT	DECIMAL(10, 3)	12.500
+17	VARIANT	DECIMAL(19, 4)	-922337203685477.5808
+18	VARIANT	DECIMAL(10, 4)	214748.3647
+19	VARIANT	DATE	0001-01-01
+20	VARIANT	DATE	9999-12-31
+21	VARIANT	TIME_MICROS	23:59:59
+22	VARIANT	TIME_MICROS	10:00:00.123
+23	VARIANT	TIME_MICROS	10:00:00.123456
+24	VARIANT	TIME_NANOS	10:00:00.1234567
+25	VARIANT	TIMESTAMP_SEC	2026-01-01 10:00:00
+26	VARIANT	TIMESTAMP_MILIS	2026-01-01 10:00:00.123
+27	VARIANT	TIMESTAMP_MICROS	2026-01-01 10:00:00.123456
+28	VARIANT	TIMESTAMP_NANOS	2026-01-01 10:00:00.1234567
+29	VARIANT	TIMESTAMP_MICROS	9999-12-31 23:59:59.999999
+30	VARIANT	TIMESTAMP_MICROS	0001-01-01 00:00:00
+31	VARIANT	TIMESTAMP_MICROS	2026-11-13 07:08:09.123333
+32	VARIANT	TIMESTAMP_MICROS	2026-11-13 07:08:00
+33	VARIANT	TIMESTAMP_MICROS_TZ	2025-12-31 20:00:00+00
+34	VARIANT	TIMESTAMP_MICROS_TZ	2026-01-02 00:00:00.123456+00
+35	VARIANT	TIMESTAMP_NANOS_TZ	2026-01-01 04:30:00.1234567+00
+36	VARIANT	TIMESTAMP_MICROS_TZ	9999-12-31 23:59:59.999999+00
+37	VARIANT	UUID	6f9619ff-8b86-d011-b42d-00c04fc964ff
+38	VARIANT	BLOB	\x01\x02\x00\x00
+39	VARIANT	BLOB	\x01\x02\x03
+40	VARIANT	VARCHAR	ab
+41	VARIANT	VARCHAR	café
+42	VARIANT	VARCHAR	дом
+43	VARIANT	VARCHAR	漢字
+44	VARIANT	VARCHAR	😀é
+45	VARIANT	VARCHAR	ab
+46	VARIANT	VARCHAR	😀x
+47	VARIANT	VARCHAR	дом
+48	VARIANT	VARIANT_NULL	NULL
+49	VARIANT	VARCHAR	(empty)
+50	VARIANT	BLOB	(empty)
+
+# column_types and mssql_scan_unsafe take VARIANT too
 query IT
-SELECT id, v FROM sv.dbo.sv_read ORDER BY id;
+SELECT id, variant_typeof(v) FROM mssql_scan('sv', 'SELECT id, v FROM dbo.sv_read WHERE id IN (5, 24, 48)', column_types := ['', 'VARIANT']) ORDER BY id;
 ----
-1	5
-2	5
-3	2026-09-16T10:11:12.1234567
-4	10:11:12.1234567
-5	2026-09-16
-6	2026-09-16T10:11:12.123
-7	2026-09-16T10:11:12.1234567+03:00
-8	0x0102FF
-9	1.0000000000000001e-001
-10	1.2345677614212036e+000
-11	123456.7891
-12	12345.678901
-13	A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11
-14	1
-15	NULL
+5	INT32
+24	TIME_NANOS
+48	VARIANT_NULL
 
-# The float and the real read back as the values the server holds.
-query I
-SELECT v::DOUBLE = 0.1 FROM sv.dbo.sv_read WHERE id = 9;
+query IT
+SELECT id, variant_typeof(v) FROM mssql_scan_unsafe('sv', 'SELECT id, v FROM dbo.sv_read WHERE id IN (5, 24)', columns := {'id': 'INTEGER', 'v': 'VARIANT'}) ORDER BY id;
 ----
-true
+5	INT32
+24	TIME_NANOS
 
-query I
-SELECT v::DOUBLE = 1.2345678::REAL::DOUBLE FROM sv.dbo.sv_read WHERE id = 10;
+# A query pushed to the server whole (spec 079) reads the column as the catalog does
+query IT
+SELECT id, variant_typeof(v) FROM sv.dbo.sv_read ORDER BY id LIMIT 3;
 ----
-true
+1	BOOL_TRUE
+2	BOOL_FALSE
+3	UINT8
 
-# Issue #514: the int 5 and the nvarchar '5' are one text here, and both come back.
-query I
-SELECT id FROM sv.dbo.sv_read WHERE v = '5' ORDER BY id;
+query II
+EXPLAIN SELECT id, v FROM sv.dbo.sv_read ORDER BY id LIMIT 3;
 ----
-1
-2
+physical_plan	<REGEX>:.*Mssql Scan Unsafe.*SELECT TOP \(3\).*Shape: given.*
 
-query I
-SELECT id FROM sv.dbo.sv_read WHERE v IN ('5', '0x0102FF') ORDER BY id;
-----
-1
-2
-8
+# In a transaction the scan is materialised at init (ColumnDataCollection): the VARIANTs too
+statement ok
+BEGIN;
 
-query I
-SELECT id FROM sv.dbo.sv_read WHERE v LIKE '2026-09-16%' ORDER BY id;
+query IT
+SELECT id, v::VARCHAR FROM sv.dbo.sv_read WHERE id IN (24, 42, 37) ORDER BY id;
 ----
-3
-5
-6
-7
-
-query I
-SELECT count(*) FROM sv.dbo.sv_read WHERE v IS NULL;
-----
-1
+24	10:00:00.1234567
+37	6f9619ff-8b86-d011-b42d-00c04fc964ff
+42	дом
 
 statement ok
-SELECT mssql_exec('sv', 'DROP TABLE dbo.sv_read');
+COMMIT;
+
+# More than one chunk: the vector is rebuilt chunk after chunk
+statement ok
+SELECT mssql_exec('sv', 'DROP TABLE IF EXISTS dbo.sv_many; CREATE TABLE dbo.sv_many (id int PRIMARY KEY, v sql_variant NULL); WITH n AS (SELECT TOP (5000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b) INSERT dbo.sv_many SELECT i, CASE i % 4 WHEN 0 THEN CAST(i AS sql_variant) WHEN 1 THEN CAST(CAST(i AS nvarchar(10)) AS sql_variant) WHEN 2 THEN CAST(CAST(i AS decimal(9,2)) AS sql_variant) ELSE NULL END FROM n');
+
+statement ok
+SELECT mssql_invalidate_cache('sv');
+
+query IIIII
+SELECT count(*), count(v), count(*) FILTER (WHERE variant_typeof(v) = 'INT64'), count(*) FILTER (WHERE variant_typeof(v) = 'VARCHAR'), sum(v::DECIMAL(18,2)) FILTER (WHERE variant_typeof(v) = 'DECIMAL(9, 2)') FROM sv.dbo.sv_many;
+----
+5000	3750	1250	1250	3125000.00
+
+# The per-value path (a composite key's rowid is read row by row): the same VARIANTs
+statement ok
+SELECT mssql_exec('sv', 'DROP TABLE IF EXISTS dbo.sv_ck; CREATE TABLE dbo.sv_ck (a int NOT NULL, b int NOT NULL, v sql_variant NULL, PRIMARY KEY (a, b)); INSERT dbo.sv_ck VALUES (1, 1, CAST(CAST(''10:00:00.1234567'' AS time(7)) AS sql_variant)); INSERT dbo.sv_ck VALUES (1, 2, CAST(N''дом'' AS nvarchar(5))); INSERT dbo.sv_ck VALUES (2, 1, NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('sv');
+
+query TTT
+SELECT rowid::VARCHAR, variant_typeof(v), v::VARCHAR FROM sv.dbo.sv_ck ORDER BY a, b;
+----
+{'a': 1, 'b': 1}	TIME_NANOS	10:00:00.1234567
+{'a': 1, 'b': 2}	VARCHAR	дом
+{'a': 2, 'b': 1}	VARIANT_NULL	NULL
+
+# A varchar under a UTF-8 collation whose bytes are not UTF-8, or under a collation this build has no
+# code page for, is read as its bytes with a WARNING; a server sends neither (it converts what it
+# stores: CAST(0x61FF AS varchar) COLLATE a _UTF8 collation reads back as 'aÿ'), so the C++ test
+# (test_variant_envelope) and fuzz_variant_envelope cover them.
+
+# =============================================================================
+# Filters run in DuckDB, over the VARIANT (#514)
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('sv', 'DROP TABLE IF EXISTS dbo.sv_eq; CREATE TABLE dbo.sv_eq (id int PRIMARY KEY, v sql_variant NULL); INSERT dbo.sv_eq VALUES (1, CAST(5 AS int)); INSERT dbo.sv_eq VALUES (2, CAST(N''5'' AS nvarchar(10))); INSERT dbo.sv_eq VALUES (3, NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('sv');
+
+query III
+SELECT (SELECT list(id) FROM sv.dbo.sv_eq WHERE v = 5), (SELECT list(id) FROM sv.dbo.sv_eq WHERE v = '5'), (SELECT list(id) FROM sv.dbo.sv_eq WHERE v IS NULL);
+----
+[1]	[2]	[3]
+
+# =============================================================================
+# Writes: spec 093 T2
+# =============================================================================
+
+statement error
+INSERT INTO sv.dbo.sv_eq VALUES (10, 7::VARIANT);
+----
+a VARIANT value cannot be written to SQL Server yet
+
+# A NULL and a value set from an empty nvarchar on the server: no VARIANT to write
+statement ok
+INSERT INTO sv.dbo.sv_eq VALUES (4, NULL);
+
+statement ok
+SELECT mssql_exec('sv', 'INSERT dbo.sv_eq VALUES (5, CAST(N'''' AS nvarchar(5)))');
+
+statement error
+CREATE TABLE sv.dbo.sv_ctas AS SELECT * FROM sv.dbo.sv_eq;
+----
+a VARIANT value cannot be written to SQL Server yet
+
+statement error
+UPDATE sv.dbo.sv_eq SET v = 9::VARIANT WHERE id = 1;
+----
+a VARIANT value cannot be written to SQL Server yet
+
+# A row path that leaves the column alone is not affected
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+SELECT mssql_exec('sv', 'ALTER TABLE dbo.sv_eq ADD n int NULL');
+
+statement ok
+SELECT mssql_invalidate_cache('sv');
+
+statement ok
+UPDATE sv.dbo.sv_eq SET n = 1 WHERE id = 1;
+
+statement ok
+RESET mssql_dml_pushdown;
+
+query IIT
+SELECT id, n, v::VARCHAR FROM sv.dbo.sv_eq ORDER BY id;
+----
+1	1	5
+2	NULL	5
+3	NULL	NULL
+4	NULL	NULL
+5	NULL	(empty)
+
+statement ok
+SELECT mssql_exec('sv', 'DROP TABLE dbo.sv_read; DROP TABLE dbo.sv_eq; DROP TABLE dbo.sv_many; DROP TABLE dbo.sv_ck');
 
 statement ok
 DETACH sv;

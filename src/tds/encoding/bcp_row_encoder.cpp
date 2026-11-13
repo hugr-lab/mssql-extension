@@ -78,6 +78,13 @@ EncodeFn ResolveEncoder(const mssql::BCPColumnMetadata &col) {
 	try {
 		family = mssql::codec::FamilyFromLogicalType(col.duckdb_type);
 	} catch (const NotImplementedException &) {
+		if (col.duckdb_type.id() == LogicalTypeId::VARIANT) {
+			// Spec 093: a sql_variant column reads as VARIANT (T1); writing one is T2.
+			throw InvalidInputException(
+				"MSSQL: column \"%s\": a VARIANT value cannot be written to SQL Server yet (a "
+				"sql_variant column is written from spec 093 T2 on); write it with mssql_exec",
+				col.ReportedName());
+		}
 		throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
 	}
 	switch (family) {
@@ -956,6 +963,13 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 	try {
 		family = mssql::codec::FamilyFromLogicalType(col.duckdb_type);
 	} catch (const NotImplementedException &) {
+		if (col.duckdb_type.id() == LogicalTypeId::VARIANT) {
+			// Spec 093: a sql_variant column reads as VARIANT (T1); writing one is T2.
+			throw InvalidInputException(
+				"MSSQL: column \"%s\": a VARIANT value cannot be written to SQL Server yet (a "
+				"sql_variant column is written from spec 093 T2 on); write it with mssql_exec",
+				col.ReportedName());
+		}
 		throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
 	}
 	switch (family) {

@@ -85,6 +85,11 @@ MSSQLReadForm MSSQLColumnInfo::ReadFormFor(const string &sql_type_name) {
 	if (IsSpatialType(sql_type_name)) {
 		return MSSQLReadForm::SpatialBinary;
 	}
+	// sql_variant (spec 093 T1): read bare, each value a VARIANT of its base type. Not a known type for
+	// comparisons or the bulk wire: the server compares a sql_variant unlike DuckDB (#514), and T2 writes it.
+	if (StringUtil::CIEquals(sql_type_name, "sql_variant")) {
+		return MSSQLReadForm::Bare;
+	}
 	return IsKnownSQLServerType(sql_type_name) ? MSSQLReadForm::Bare : MSSQLReadForm::ServerCast;
 }
 
@@ -376,6 +381,10 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 	if (lower_type == "uniqueidentifier") {
 		return LogicalType::UUID;
 	}
+	// sql_variant (spec 093 T1, D3): read bare off the wire, each value a VARIANT of its base type.
+	if (lower_type == "sql_variant") {
+		return LogicalType::VARIANT();
+	}
 
 	// Spatial types — geometry and geography both arrive via STAsBinary() rewrite
 	// (see ReadFormFor's SpatialBinary + table_scan::BuildColumnExpression).
@@ -624,34 +633,6 @@ string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string
 	}
 	if (lob_kind == LegacyLob::Image) {
 		return "CAST(" + reference + " AS VARBINARY(MAX)) AS " + escaped_name;
-	}
-
-	// Issue #354, until sql_variant is decoded on the wire: each value is converted by the style
-	// that keeps its base type whole. The plain cast is style 0, which kept the minute of a
-	// datetime2 (`Sep 16 2026 10:11AM`), six digits of a float, two decimals of a money, and read
-	// a varbinary's bytes as UTF-16. Measured per base type on SQL Server 2025: 3 gives a float
-	// or a real its 17 digits, 2 a money its four decimals, 126 the date/time family ISO 8601
-	// with every fraction digit, 1 a binary its 0x hex; the rest are exact under style 0. One
-	// style cannot serve a column whose type lives in each value (126 refuses a varbinary, 9809).
-	// The styles hold on SQL Server 2025 (local), 2022 (the CI lane) and 2019 (15.0.4500,
-	// sql_variant_read.test run against it; time(0/3/7) and datetimeoffset by 126 alike).
-	// Cost (review of #542, 1M rows of int / float / datetime2 / nvarchar, server under Rosetta):
-	// 7.7 s of server CPU against 0.87 s for the plain cast. Each comparison of the base type
-	// calls SQL_VARIANT_PROPERTY again (an IN of n names is n calls, and the server does not
-	// share them), so a value of a type no WHEN names pays twelve. Six other forms were measured
-	// (no cast, a BIN2 compare, a derived table, a CHARINDEX position, a two-level tree, a single
-	// guard): none was cheaper than 5%. Decoding sql_variant on the wire (#515) removes the
-	// CASE; until then the cost is a sql_variant column's only, and the plain cast lost data.
-	if (StringUtil::Lower(sql_type_name) == "sql_variant") {
-		const string base_type = "CAST(SQL_VARIANT_PROPERTY(" + reference + ", 'BaseType') AS NVARCHAR(128))";
-		const auto styled = [&](const char *style) {
-			return "CONVERT(NVARCHAR(MAX), " + reference + ", " + style + ")";
-		};
-		return "CASE WHEN " + base_type + " IN (N'float', N'real') THEN " + styled("3") + " WHEN " + base_type +
-			   " IN (N'money', N'smallmoney') THEN " + styled("2") + " WHEN " + base_type +
-			   " IN (N'date', N'time', N'datetime', N'datetime2', N'smalldatetime', N'datetimeoffset') THEN " +
-			   styled("126") + " WHEN " + base_type + " IN (N'binary', N'varbinary') THEN " + styled("1") +
-			   " ELSE CAST(" + reference + " AS NVARCHAR(MAX)) END AS " + escaped_name;
 	}
 
 	// Unsupported SQL Server types (hierarchyid, CLR UDTs) must be CAST to

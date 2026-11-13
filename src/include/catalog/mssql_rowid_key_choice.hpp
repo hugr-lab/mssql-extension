@@ -193,8 +193,9 @@ inline RowIdKeyRejection Unusable(const RowIdKeyCandidate &c) {
 		case KeyFidelity::Exact:
 			break;
 		case KeyFidelity::NotRead:
-			r.reason = "its key column '" + col.name + "' has type " + col.type_name +
-					   ", which is read through a lossy CAST and cannot identify its row (see issue #354)";
+			r.reason =
+				"its key column '" + col.name + "' has type " + col.type_name +
+				", which the server compares unlike DuckDB's read of it and cannot identify its row (see issue #354)";
 			r.unmatchable = true;
 			return r;
 		case KeyFidelity::NotRoundTrip:

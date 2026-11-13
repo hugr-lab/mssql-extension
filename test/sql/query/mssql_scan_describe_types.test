@@ -106,10 +106,11 @@ SELECT c_rowversion FROM mssql_scan('dt75', 'SELECT CAST(0x0000000000000001 AS t
 
 # The types the stream refuses are refused at bind with the stream's message,
 # as before spec 075 -- not at init with a closed connection.
-statement error
-SELECT * FROM mssql_scan('dt75', 'SELECT CAST(1 AS sql_variant) AS v');
+# Spec 093 T1: a sql_variant is read, each value a VARIANT of its base type.
+query TT
+SELECT typeof(v), variant_typeof(v) FROM mssql_scan('dt75', 'SELECT CAST(1 AS sql_variant) AS v');
 ----
-column 'v' is a sql_variant, which a raw mssql_scan does not read yet
+VARIANT	INT32
 
 statement error
 SELECT * FROM mssql_scan('dt75', 'SELECT hierarchyid::Parse(''/1/'') AS h');
@@ -119,10 +120,10 @@ column 'h' is of the CLR type sys.hierarchyid, which a raw mssql_scan does not r
 # Spec 093 T0: the COLMETADATA and rows of a UDT / sql_variant column are parsed, so the
 # prepared path refuses with the same message, and a batch that returns one to mssql_exec runs
 # (it used to fail at the COLMETADATA parse).
-statement error
-SELECT * FROM mssql_scan('dt75', 'SELECT CAST(1 AS sql_variant) AS v', prepared := true);
+query TT
+SELECT typeof(v), variant_typeof(v) FROM mssql_scan('dt75', 'SELECT CAST(1 AS sql_variant) AS v', prepared := true);
 ----
-column 'v' is a sql_variant, which a raw mssql_scan does not read yet
+VARIANT	INT32
 
 statement ok
 SELECT mssql_exec('dt75', 'SELECT hierarchyid::GetRoot() AS h, CAST(1 AS sql_variant) AS v, geometry::Point(1, 2, 0) AS g');
