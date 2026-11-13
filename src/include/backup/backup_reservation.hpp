@@ -19,6 +19,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace duckdb {
 namespace mssql {
@@ -55,9 +57,27 @@ public:
 	//! Holds `bytes` once they fit the budget and DuckDB has reserved them; until then waits for a
 	//! release, asking `interrupted` (may be empty) every 100 ms. ReservationRefused when they cannot
 	//! fit with nothing else held; ReservationInterrupted when asked to stop.
-	void Acquire(uint64_t bytes, const std::function<bool()> &interrupted);
-	//! Gives back what one Acquire of `bytes` held; never throws.
-	void Release(uint64_t bytes);
+	void Acquire(uint64_t bytes, const std::function<bool()> &interrupted) {
+		Acquire(bytes, bytes, interrupted);
+	}
+	//! The same, of which only `duckdb_bytes` (at most `bytes`) are reserved with DuckDB: the rest is
+	//! memory DuckDB accounts itself when it is allocated (a value written straight into an output
+	//! vector's heap, PR 3), held against the budget only, so the call's values in flight stay within
+	//! it without being counted twice in DuckDB's memory.
+	//! `holds_nothing`: the caller holds no reservation of this gate, so it may wait behind those
+	//! already waiting for the budget (it waits for nobody it blocks). One that holds some must not:
+	//! a waiter could be waiting for exactly what it holds.
+	void Acquire(uint64_t bytes, uint64_t duckdb_bytes, const std::function<bool()> &interrupted,
+				 bool holds_nothing = false);
+	//! The same without waiting: false when they do not fit the budget beside what is held, when an
+	//! Acquire is waiting for the budget, or when DuckDB cannot make room now. ReservationRefused only
+	//! when `bytes` alone is past the budget.
+	bool TryAcquire(uint64_t bytes, uint64_t duckdb_bytes);
+	//! Gives back what one Acquire of `bytes` (`duckdb_bytes` of them DuckDB's) held; never throws.
+	void Release(uint64_t bytes) {
+		Release(bytes, bytes);
+	}
+	void Release(uint64_t bytes, uint64_t duckdb_bytes);
 
 	uint64_t Budget() const {
 		return budget_;
@@ -83,6 +103,51 @@ private:
 	uint64_t generation_ = 0;
 	//! Counts releases only (a waiter DuckDB refused wakes on these).
 	uint64_t releases_ = 0;
+	//! Acquires waiting for the budget: while there are any, a new Acquire of a caller that holds
+	//! nothing waits before it tries, and a TryAcquire answers false, so a large one is not starved by
+	//! smaller ones taking every release (review of PR 3 S4). The one waiting behind holds nothing, so
+	//! the tasks it waits for are running and will release.
+	uint64_t waiting_ = 0;
+	friend struct WaitingCount;
+};
+
+//! Every reservation of one call (a chunk's, then a row's values stored off row, PR 3), given back
+//! together by ReleaseAll or the destructor (an error mid-chunk gives the memory back too).
+class CallReservations {
+public:
+	CallReservations(ReservationGate &gate, std::function<bool()> interrupted)
+		: gate_(gate), interrupted_(std::move(interrupted)) {}
+	~CallReservations() {
+		ReleaseAll();
+	}
+	CallReservations(const CallReservations &) = delete;
+	CallReservations &operator=(const CallReservations &) = delete;
+	// The list grows before the gate grants anything: a reservation granted is always recorded, so it
+	// is always given back (review of PR 3 S4: a bad_alloc after the grant left it held for ever).
+	void Acquire(uint64_t bytes, uint64_t duckdb_bytes) {
+		held_.reserve(held_.size() + 1);
+		gate_.Acquire(bytes, duckdb_bytes, interrupted_, held_.empty());
+		held_.emplace_back(bytes, duckdb_bytes);
+	}
+	bool TryAcquire(uint64_t bytes, uint64_t duckdb_bytes) {
+		held_.reserve(held_.size() + 1);
+		if (!gate_.TryAcquire(bytes, duckdb_bytes)) {
+			return false;
+		}
+		held_.emplace_back(bytes, duckdb_bytes);
+		return true;
+	}
+	void ReleaseAll() {
+		for (const auto &h : held_) {
+			gate_.Release(h.first, h.second);
+		}
+		held_.clear();
+	}
+
+private:
+	ReservationGate &gate_;
+	std::function<bool()> interrupted_;
+	std::vector<std::pair<uint64_t, uint64_t>> held_;
 };
 
 //! One Acquire, released by its destructor (an error mid-chunk gives the memory back too).

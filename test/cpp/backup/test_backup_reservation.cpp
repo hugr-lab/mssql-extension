@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -265,6 +266,65 @@ int main() {
 			  "waiters DuckDB refused retry on releases only (" + std::to_string(before) +
 				  " attempts while one held, 3 at most), then hold");
 	}
+	std::cout << "TryAcquire and DuckDB's share (PR 3 S4)" << std::endl;
+	{
+		FakeDuckDB duck(1000);
+		ReservationGate gate(100, duck.Reserve(), duck.Release());
+		Check(gate.TryAcquire(60, 20) && gate.Held() == 60 && duck.reserved == 20,
+			  "60 held against the budget, only 20 of them reserved with DuckDB");
+		Check(!gate.TryAcquire(50, 50) && gate.Held() == 60 && duck.reserved == 20,
+			  "50 more do not fit the budget beside 60: refused at once, nothing taken");
+		bool refused = false;
+		try {
+			gate.TryAcquire(101, 0);
+		} catch (ReservationRefused &e) {
+			refused = e.past_budget;
+		}
+		Check(refused, "past the budget alone: ReservationRefused, as Acquire");
+		gate.Release(60, 20);
+		Check(gate.Held() == 0 && duck.reserved == 0, "released with its share");
+		FakeDuckDB tight(10);
+		ReservationGate small(100, tight.Reserve(), tight.Release());
+		Check(!small.TryAcquire(50, 50) && small.Held() == 0 && small.Holders() == 0,
+			  "DuckDB cannot make room: false, the attempt given back");
+		Check(small.TryAcquire(50, 5) && tight.reserved == 5, "a share DuckDB can reserve: held");
+		{
+			CallReservations call(small, std::function<bool()>());
+			call.Acquire(30, 0);
+			Check(small.Held() == 80 && call.TryAcquire(10, 0) && small.Held() == 90, "a call's reservations add up");
+			call.ReleaseAll();
+			Check(small.Held() == 50, "... and go back together");
+			call.Acquire(20, 1);
+		}
+		Check(small.Held() == 50 && tight.reserved == 5, "the destructor gives back what is left");
+		small.Release(50, 5);
+	}
+
+	std::cout << "A waiter for the budget goes first (PR 3 S4)" << std::endl;
+	{
+		FakeDuckDB duck(1000);
+		ReservationGate gate(100, duck.Reserve(), duck.Release());
+		gate.Acquire(60, std::function<bool()>());
+		std::atomic<bool> large_in{false};
+		std::thread large([&]() {
+			gate.Acquire(80, std::function<bool()>());
+			large_in = true;
+		});
+		// Give it time to start waiting (60 + 80 > 100).
+		for (int i = 0; i < 200 && gate.Holders() == 1 && !large_in; i++) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		const bool small_refused = !gate.TryAcquire(10, 10);
+		Check(small_refused && !large_in, "while 80 wait, 10 more are not taken, though they would fit");
+		gate.Release(60);
+		large.join();
+		Check(large_in && gate.Held() == 80, "the waiter took the release");
+		Check(gate.TryAcquire(10, 10) && gate.Held() == 90, "... and with none waiting, 10 more fit again");
+		gate.Release(10, 10);
+		gate.Release(80);
+	}
+
 	std::cout << (failures ? "FAILED: " + std::to_string(failures) + " check(s)" : "all checks passed") << std::endl;
 	return failures ? 1 : 0;
 }

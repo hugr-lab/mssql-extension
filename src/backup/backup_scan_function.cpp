@@ -861,6 +861,9 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 	const auto &data = input.bind_data->Cast<ScanBindData>();
 	auto &global = input.global_state->Cast<ScanGlobalState>();
 	auto &local = input.local_state->Cast<ScanLocalState>();
+	// What the call is reserving, for a refusal's words: a chunk's decoding, or a row's values stored off row.
+	std::string reserving_row;	// empty: a chunk's decoding; else the row being reserved, as a refusal names it
+	uint64_t reserving_bytes = global.chunk_bytes;
 	try {
 		// A unit first: the call that finds none left returns no rows and reserves nothing.
 		if (!local.have_unit && !ClaimUnit(data, global, local)) {
@@ -871,7 +874,8 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		// so one blocked in DuckDB's pipeline (an order-keeping sink waiting for an earlier batch) never
 		// keeps one the task reading that batch waits for. What it keeps unaccounted between calls is
 		// its staging's capacity, at most about its reservation (buffers keep capacity across chunks).
-		HeldReservation held(*global.gate, global.chunk_bytes, [&context]() { return context.IsInterrupted(); });
+		CallReservations held(*global.gate, [&context]() { return context.IsInterrupted(); });
+		held.Acquire(global.chunk_bytes, global.chunk_bytes);
 		std::vector<Vector *> targets;
 		for (idx_t c : global.stager_outputs) {
 			targets.push_back(&output.data[c]);
@@ -911,6 +915,44 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 								  std::to_string(local.offsets[slot]) + " that runs past the next record's start (" +
 								  std::to_string(local.bounds[slot]) + ")");
 			}
+			// A row's values stored off row are reserved before it is staged (D17, PR 3 S4). Never while
+			// waiting holding another reservation: a refusal with rows staged closes the chunk before this
+			// row (its slot is read again by the next call); with none, the chunk's reservation is given back
+			// and taken again with the row's, in one wait.
+			const OffRowNeed need = local.stager->PrepareRow(record);
+			if (need.Total() > 0) {
+				// Named only when refused: the row by its _mssql_rid and place, and what it holds off row.
+				auto describe = [&](uint64_t bytes) {
+					static const char *digits = "0123456789ABCDEF";
+					std::string rid = "0x";
+					for (unsigned char b : RowId(data, *local.cursor, record, local.page.header.page_id, slot)) {
+						rid.push_back(digits[b >> 4]);
+						rid.push_back(digits[b & 15]);
+					}
+					reserving_row = "the row of _mssql_rid " + rid + " (page " + local.page.header.page_id.ToString() +
+									" slot " + std::to_string(slot) + "), whose values stored off row (" +
+									local.stager->DescribePrepared() + "),";
+					reserving_bytes = bytes;
+				};
+				bool fits = false;
+				try {
+					fits = held.TryAcquire(need.Total(), need.Ours());
+				} catch (ReservationRefused &) {
+					describe(need.Total());
+					throw;
+				}
+				if (!fits) {
+					if (local.stager->Count() > 0) {
+						local.next_slot = slot;
+						break;
+					}
+					describe(global.chunk_bytes + need.Total());
+					held.ReleaseAll();
+					held.Acquire(global.chunk_bytes + need.Total(), global.chunk_bytes + need.Ours());
+					reserving_row.clear();
+					reserving_bytes = global.chunk_bytes;
+				}
+			}
 			local.stager->Append(record);
 			if (global.page_output != DConstants::INVALID_INDEX) {
 				local.page_keys.push_back(PageKey(local.page.header.page_id));
@@ -942,19 +984,21 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		auto &buffers = BufferManager::GetBufferManager(context);
 		const std::string temp =
 			buffers.HasTemporaryDirectory() ? "'" + buffers.GetTemporaryDirectory() + "'" : "none (nothing spills)";
-		const std::string need = StringUtil::BytesToHumanReadableString(global.chunk_bytes);
+		const std::string need = StringUtil::BytesToHumanReadableString(reserving_bytes);
+		const std::string reserving = reserving_row.empty() ? std::string("decoding a chunk") : reserving_row;
 		const std::string max = StringUtil::BytesToHumanReadableString(global.max_memory);
 		if (e.past_budget) {
 			throw InvalidInputException(
-				"%s: %s.%s: decoding a chunk needs up to %s, past the scan's half (%s) of "
+				"%s: %s.%s: %s need%s up to %s, past the scan's half (%s) of "
 				"max_memory %s; raise max_memory or memory_limit (temp_directory %s)",
-				FUNCTION, data.schema, data.table, need, StringUtil::BytesToHumanReadableString(global.gate->Budget()),
-				max, temp);
+				FUNCTION, data.schema, data.table, reserving, reserving_row.empty() ? "s" : "", need,
+				StringUtil::BytesToHumanReadableString(global.gate->Budget()), max, temp);
 		}
 		throw OutOfMemoryException(
-			"%s: %s.%s: decoding a chunk needs up to %s and DuckDB cannot make room for it "
+			"%s: %s.%s: %s need%s up to %s and DuckDB cannot make room for it "
 			"with nothing else of the scan held (max_memory %s, temp_directory %s): %s",
-			FUNCTION, data.schema, data.table, need, max, temp, e.duckdb_reason);
+			FUNCTION, data.schema, data.table, reserving, reserving_row.empty() ? "s" : "", need, max, temp,
+			e.duckdb_reason);
 	}
 }
 

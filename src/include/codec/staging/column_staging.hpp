@@ -273,6 +273,10 @@ struct ColumnStaging {
 	//! vector::resize() value-initialises the new bytes, and we memcpy over them
 	//! immediately, so resizing per value would write every payload byte twice.
 	idx_t payload_used = 0;
+	//! The most the payload may reach (GrowPayload): MAX_STAGING_PAYLOAD_BYTES on the wire, where a
+	//! larger one is a corrupt length prefix; the backup reader raises it for a value of up to 2^31 - 1
+	//! bytes stored off row (spec 085 PR 3, DQ-46), within the offsets' 32 bits.
+	idx_t payload_cap = MAX_STAGING_PAYLOAD_BYTES;
 
 	//! This column's provable worst case for a chunk (STAGING_PREALLOC_BUDGET_BYTES),
 	//! or 0 when it has none worth capping at: growth stops there.
@@ -478,6 +482,14 @@ struct ColumnStaging {
 		return buffer.data() + offset;
 	}
 
+	//! Room for `more` bytes past what is staged, grown now to exactly that, so a value appended in
+	//! pieces (a LOB's fragments) grows the buffer once, to what it needs, not doubling past it.
+	inline void ReserveMore(idx_t more) {
+		if (payload_used + more > buffer.size()) {
+			GrowPayload(payload_used + more, true);
+		}
+	}
+
 	//! Bytes appended since BeginVar — the length of the value still being built.
 	inline idx_t PendingVarLength() const {
 		return payload_used - offsets[count];
@@ -549,7 +561,7 @@ private:
 	//! Out of line: growth and the wire-corruption error stay off the inlined
 	//! append body. Growth doubles, so a steady stream allocates once and then
 	//! never again — the capacity is retained across chunks.
-	void GrowPayload(idx_t needed);
+	void GrowPayload(idx_t needed, bool exact = false);
 };
 
 //===----------------------------------------------------------------------===//

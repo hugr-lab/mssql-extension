@@ -582,6 +582,12 @@ void DecodeChunkImpl(const staging::ColumnStaging &st, idx_t count, Vector &out)
 
 }  // namespace
 
+size_t DecodeUtf16Block(const uint8_t *src, size_t units, char *dst, idx_t &replaced) {
+	const char16_t *const units16 = reinterpret_cast<const char16_t *>(src);
+	const size_t written = simdutf::convert_utf16le_to_utf8(units16, units, dst);
+	return written != 0 || units == 0 ? written : ConvertReplacingInvalid(units16, units, dst, replaced);
+}
+
 const char *MaxTypeName(VarKind kind) {
 	switch (kind) {
 	case VarKind::NVarchar:

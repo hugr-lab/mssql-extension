@@ -168,9 +168,12 @@ inline size_t Utf8LengthBmp(uint32_t cp) {
 //! overwritten). At the first byte >= 0x80 it drops into the table mode, which reads one
 //! byte (or a double-byte pair) per step and writes its UTF-8 with one 4-byte store, and
 //! returns to the block mode at the next ASCII byte.
+//! `lone_lead`, when given, is set to a double-byte lead byte that ends the range unread (a block of
+//! a longer value, cut there: the caller carries it into the next block). Only that rare branch
+//! looks at it.
 template <bool DOUBLE_BYTE>
 inline char *DecodeRun(const CodePageTable &page, const uint8_t *p, const uint8_t *end, const uint8_t *readable,
-					   char *d) {
+					   char *d, const uint8_t **lone_lead = nullptr) {
 	const uint32_t *single = page.single;
 	while (p < end) {
 		if (static_cast<size_t>(readable - p) >= BLOCK) {
@@ -195,6 +198,9 @@ inline char *DecodeRun(const CodePageTable &page, const uint8_t *p, const uint8_
 				if (row) {
 					if (p + 1 >= end) {
 						// A lead byte that ends its value: the server reads it as nothing.
+						if (lone_lead) {
+							*lone_lead = p;
+						}
 						return d;
 					}
 					const uint8_t trail = p[1];
@@ -1345,6 +1351,19 @@ size_t DecodeToUtf8(const CodePageTable &page, const uint8_t *src, size_t n, cha
 	}
 #endif
 	return static_cast<size_t>(DecodeRun<false>(page, src, src + n, src + n, dst) - dst);
+}
+
+size_t DecodeToUtf8Block(const CodePageTable &page, const uint8_t *src, size_t n, char *dst, size_t &consumed) {
+	consumed = n;
+	if (!IsDoubleByte(page)) {
+		return DecodeToUtf8(page, src, n, dst);	 // every byte a character: any cut is a boundary
+	}
+	const uint8_t *lone = nullptr;
+	char *const end = DecodeRun<true>(page, src, src + n, src + n, dst, &lone);
+	if (lone) {
+		consumed = static_cast<size_t>(lone - src);
+	}
+	return static_cast<size_t>(end - dst);
 }
 
 size_t CopyAscii(const uint8_t *src, size_t n, char *dst) {

@@ -5,8 +5,11 @@
 #include "backup/backup_lob_map.hpp"
 #include "codec/code_page/code_page.hpp"
 #include "codec/staging/row_stager.hpp"
+#include "codec/string_codec.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -64,6 +67,88 @@ public:
 		}
 		std::memcpy(st.ExtendVar(static_cast<uint32_t>(size)), data, size);
 	}
+};
+
+// Where a value written straight into an output vector goes: its string_t's bytes, never past the
+// length its pointer (or root record) said.
+class DirectSink : public LobSink {
+public:
+	DirectSink(char *data_p, uint64_t length_p, const std::string &what_p)
+		: data(data_p), length(length_p), what(what_p) {}
+	char *data;
+	uint64_t length;
+	const std::string &what;
+	uint64_t at = 0;
+	void Data(const uint8_t *bytes, size_t size) override {
+		if (size > length - at) {
+			throw FormatError("backup: " + what + " holds more bytes off row than its " + std::to_string(length));
+		}
+		std::memcpy(data + at, bytes, size);
+		at += size;
+	}
+};
+
+// Where a long text value goes (PR 3 S4): its fragments gathered into a block, each block decoded
+// into the output vector at once -- by the batch kernels' own functions, so the text is theirs -- with
+// a character the block's end would cut carried into the next one: the second half of a UTF-16
+// surrogate pair, or a double-byte lead byte. Every byte is decoded once.
+class StreamSink : public LobSink {
+public:
+	StreamSink(std::vector<uint8_t> &block_p, char *dst_p, const codec::code_page::tables::CodePageTable *page_p,
+			   idx_t &replaced_p)
+		: block(block_p), dst(dst_p), page(page_p), replaced(replaced_p) {}
+	std::vector<uint8_t> &block;
+	char *dst;
+	const codec::code_page::tables::CodePageTable *page;  // nullptr: UTF-16
+	idx_t &replaced;
+	size_t used = 0;
+	size_t written = 0;
+	void Data(const uint8_t *bytes, size_t size) override {
+		while (size > 0) {
+			const size_t take = std::min(size, block.size() - used);
+			std::memcpy(block.data() + used, bytes, take);
+			used += take;
+			bytes += take;
+			size -= take;
+			if (used == block.size()) {
+				Flush(false);
+			}
+		}
+	}
+	//! Decodes what the block holds; on the last block (`last`) all of it, else up to a character's cut.
+	//! Returns the bytes left undecoded (a UTF-16 value of an odd length leaves its last byte).
+	size_t Flush(bool last) {
+		size_t keep = 0;
+		if (!page) {
+			size_t units = used / 2;
+			keep = used - units * 2;
+			if (!last && units > 0) {
+				const uint16_t unit = static_cast<uint16_t>(block[units * 2 - 2] | (block[units * 2 - 1] << 8));
+				if (unit >= 0xD800 && unit <= 0xDBFF) {
+					units--;  // a high surrogate: its pair's low half is in the next block
+					keep += 2;
+				}
+			}
+			written += codec::string::DecodeUtf16Block(block.data(), units, dst + written, replaced);
+		} else if (last) {
+			written += codec::code_page::DecodeToUtf8(*page, block.data(), used, dst + written);
+		} else {
+			size_t consumed = used;
+			written += codec::code_page::DecodeToUtf8Block(*page, block.data(), used, dst + written, consumed);
+			keep = used - consumed;
+		}
+		if (keep > 0) {
+			std::memmove(block.data(), block.data() + used - keep, keep);
+		}
+		used = keep;
+		return keep;
+	}
+};
+
+// A walk whose bytes and nodes go nowhere: a root pointer's length and NULL, from its root record.
+class NoSink : public LobSink {
+public:
+	void Data(const uint8_t *, size_t) override {}
 };
 
 // A column read as its stored bytes (ReadingOf's `raw`): a varbinary of its declared length, which the
@@ -162,6 +247,10 @@ RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t>
 		const LogicalType type = reading.type;
 		col.meta = reading.raw ? RawMetadataOf(c) : MetadataOf(c);
 		col.ops = codec::staging::ResolveColumnOps(col.meta, type);
+		col.binary_kernel = col.ops.kernel == FinalizeKernel::Binary && col.meta.type_id != tds::TDS_TYPE_BIGCHAR;
+		col.utf16_kernel = col.ops.kernel == FinalizeKernel::String && col.meta.type_id != tds::TDS_TYPE_NCHAR;
+		col.code_page_kernel = col.ops.kernel == FinalizeKernel::CodePage && col.meta.code_page != nullptr &&
+							   col.meta.type_id != tds::TDS_TYPE_BIGCHAR;
 		if (col.ops.arm == AppendArm::Unsupported || col.ops.kernel == FinalizeKernel::Text) {
 			// The TDS map and D6's would disagree about the column (the text fallback), or the codec
 			// has no way in: both are this reader's gap, named, never a value rendered another way.
@@ -207,9 +296,18 @@ RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t>
 		columns_.push_back(std::move(col));
 		types_.push_back(type);
 	}
+	prepared_.assign(columns_.size(), PreparedValue());
+	for (size_t i = 0; i < columns_.size(); i++) {
+		if (columns_[i].arm == StageArm::Utf16 || columns_[i].arm == StageArm::Bytes) {
+			var_columns_.push_back(i);
+		}
+	}
 	arena_.Configure(columns_.size());
 	for (size_t i = 0; i < columns_.size(); i++) {
 		arena_.Column(i).Configure(columns_[i].ops.kind, columns_[i].ops.stride, columns_[i].ops.max_value_bytes);
+		// A value stored off row runs to 2^31 - 1 bytes (DQ-46: past the wire's 2047 MiB cap, on this path
+		// only), within the offsets' 32 bits.
+		arena_.Column(i).payload_cap = 0xFFFFFFFFull;
 	}
 	// The staging's bound (FixedStagingBytes, VarRowBytes): a direct value or a bit goes into its vector
 	// and stages nothing; a fixed one a vector of strides; a variable one its offset and length per row
@@ -293,13 +391,157 @@ const LobPageFetch &RecordStager::Fetch(const std::string &what) const {
 	return *fetch_;
 }
 
-void RecordStager::AppendOffRow(Column &c, ColumnStaging &st, const ValueRef &v) {
-	if (c.arm != StageArm::Utf16 && c.arm != StageArm::Bytes) {
-		throw FormatError("backup: " + c.name + " is a fixed-width column whose value is marked as stored off row");
+OffRowNeed RecordStager::PrepareRow(const RecordView &record) {
+	if (!layout_) {
+		throw InternalException("backup: RecordStager::PrepareRow with no layout");
 	}
-	const OffRowPointer pointer = ParseOffRowPointer(v.data, v.size, c.name);
+	OffRowNeed need;
+	prepared_record_ = record.data;
+	prepared_valid_ = true;
+	// Only the columns that can hold a value stored off row are looked at; a row of none, with no map
+	// wanted, costs nothing more (review of PR 3 S4: this runs for every row).
+	if (var_columns_.empty() && !map_off_row_) {
+		return need;
+	}
+	prepared_valid_ = false;
+	const size_t var_count = RowVarCount(record, layout_->table);
+	for (size_t i : var_columns_) {
+		Column &c = columns_[i];
+		PreparedValue &p = prepared_[i];
+		p = PreparedValue();
+		const ValueRef v = LocateValue(record, var_count, *layout_, c.layout_index);
+		if (v.state != ValueState::OffRow) {
+			continue;
+		}
+		p.off_row = true;
+		p.pointer = ParseOffRowPointer(v.data, v.size, c.name);
+		if (p.pointer.form == OffRowForm::RootPointer) {
+			// Its length (and whether it is NULL) is its root record's: read now, so it is reserved
+			// before it is assembled.
+			NoSink none;
+			const LobValue root =
+				WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::MapOnly, MAX_OFF_ROW_BYTES, c.name, none);
+			p.length = root.length;
+			p.is_null = root.is_null;
+		} else {
+			p.length = p.pointer.length;
+		}
+		if (p.is_null) {
+			continue;
+		}
+		// A long value goes to its vector by the shortest way: its bytes (a BLOB, a UTF-8 text), or decoded
+		// block by block into room for its longest UTF-8 (3 bytes a UTF-16 unit or a code-page byte); a short
+		// one, and any other, is staged for its column's batch kernel.
+		if (p.length >= DIRECT_VALUE_BYTES && (c.binary_kernel || c.utf16_kernel || c.code_page_kernel)) {
+			p.direct = c.binary_kernel;
+			p.stream = !c.binary_kernel;
+			p.output = c.binary_kernel	? p.length
+					   : c.utf16_kernel ? 3 * (p.length / 2)
+										: codec::code_page::Utf8Bound(p.length);
+			if (p.output > string_t::MAX_STRING_SIZE) {
+				// Room for its longest UTF-8 passes DuckDB's longest string (a code page's 3 bytes a byte past
+				// about 1.43 GB): staged instead, where the kernel sizes the output exactly (review of PR 3 S4).
+				p.direct = p.stream = false;
+				p.output = 0;
+			}
+		}
+		if (p.direct || p.stream) {
+			need.direct += p.output;
+		} else {
+			// AppendOffRow grows the buffer to exactly what the value needs (ReserveMore): it is in memory once.
+			need.staged += p.length + (c.arm == StageArm::Utf16 ? 2 : 0);
+		}
+	}
+	if (map_off_row_) {
+		MapRow(record, var_count);
+		need.map = row_lob_map_.size();
+	}
+	prepared_valid_ = true;
+	return need;
+}
+
+std::string RecordStager::DescribePrepared() const {
+	std::string out;
+	for (size_t i : var_columns_) {
+		const PreparedValue &p = prepared_[i];
+		if (p.off_row && !p.is_null) {
+			out += (out.empty() ? "" : ", ") + columns_[i].name + " (" +
+				   StringUtil::BytesToHumanReadableString(p.length) + ")";
+		}
+	}
+	return out;
+}
+
+void RecordStager::AppendDirect(size_t column, Column &c, ColumnStaging &st, const PreparedValue &p) {
+	string_t value;
+	try {
+		value = StringVector::EmptyString(*targets_[column], p.length);
+	} catch (OutOfMemoryException &e) {
+		throw OutOfMemoryException("backup: %s holds a value of %s stored off row, which DuckDB cannot allocate: %s",
+								   c.name, StringUtil::BytesToHumanReadableString(p.length), e.what());
+	}
+	DirectSink sink(value.GetDataWriteable(), p.length, c.name);
+	WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink);
+	if (sink.at != p.length) {
+		throw FormatError("backup: " + c.name + " holds " + std::to_string(sink.at) + " bytes off row, not its " +
+						  std::to_string(p.length));
+	}
+	value.Finalize();
+	st.AppendVar(nullptr, 0);  // a placeholder, set to the value once the kernel has run
+	direct_values_.push_back(DirectValue{column, count_, value});
+	// Its bytes are the chunk's too, in the vector's heap until the chunk is consumed: they count
+	// toward Full(), so a chunk of large values closes on them (review of PR 3 S4).
+	payload_bytes_ += p.length;
+}
+
+void RecordStager::AppendStream(size_t column, Column &c, ColumnStaging &st, const PreparedValue &p) {
+	string_t value;
+	try {
+		value = StringVector::EmptyString(*targets_[column], p.output);
+	} catch (OutOfMemoryException &e) {
+		throw OutOfMemoryException(
+			"backup: %s holds a value of %s stored off row, which DuckDB cannot allocate "
+			"room to decode (%s): %s",
+			c.name, StringUtil::BytesToHumanReadableString(p.length), StringUtil::BytesToHumanReadableString(p.output),
+			e.what());
+	}
+	if (stream_block_.size() != STREAM_BLOCK_BYTES) {
+		stream_block_.resize(STREAM_BLOCK_BYTES);
+	}
+	StreamSink sink(stream_block_, value.GetDataWriteable(), c.code_page_kernel ? c.meta.code_page : nullptr,
+					st.replaced_units);
+	WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink);
+	if (sink.Flush(true) != 0) {
+		throw FormatError("backup: " + c.name + " holds " + std::to_string(p.length) +
+						  " bytes off row, not a whole number of UTF-16 units");
+	}
+	value.SetSizeAndFinalize(static_cast<uint32_t>(sink.written), p.output);
+	// A placeholder, set to the value once the kernel has run; a UTF-16 column's carries its delimiter,
+	// which its kernel splits the column on (review of PR 3 S4: without it the next value lost a byte).
+	if (c.arm == StageArm::Utf16) {
+		st.BeginVar();
+		st.FinishVarDelimited();
+	} else {
+		st.AppendVar(nullptr, 0);
+	}
+	direct_values_.push_back(DirectValue{column, count_, value});
+	payload_bytes_ += p.output;
+}
+
+void RecordStager::AppendOffRow(Column &c, ColumnStaging &st, const PreparedValue &p) {
+	if (p.is_null) {
+		st.AppendNull();
+		return;
+	}
+	// The buffer grown once, to exactly what the value needs, before its fragments are copied in; a large
+	// one closes the chunk after its row (Full).
+	st.ReserveMore(p.length + (c.arm == StageArm::Utf16 ? 2 : 0));
+	if (p.length >= DIRECT_VALUE_BYTES) {
+		large_staged_ = true;
+	}
 	StagingSink sink(st);
-	const LobValue value = WalkLob(Fetch(c.name), pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink);
+	const LobValue value =
+		WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink);
 	if (value.is_null) {
 		st.AppendNull();
 		return;
@@ -345,10 +587,6 @@ void RecordStager::MapRow(const RecordView &record, size_t var_count) {
 	}
 	if (!entries.empty()) {
 		AppendLobMap(entries, table_, row_lob_map_);
-		// The map is staged for the chunk too (the scan keeps it until the chunk is written): it counts
-		// toward Full() like a value, so a chunk of deep trees' maps closes on its bytes (review of S3).
-		payload_bytes_ += row_lob_map_.size();
-		staged_bytes_ += row_lob_map_.size();
 	}
 }
 
@@ -387,6 +625,9 @@ void RecordStager::BeginChunk(const std::vector<Vector *> &targets) {
 	count_ = 0;
 	payload_bytes_ = 0;
 	staged_bytes_ = 0;
+	direct_values_.clear();
+	prepared_valid_ = false;
+	large_staged_ = false;
 	spoiled_ = false;
 	begun_ = true;
 }
@@ -449,6 +690,10 @@ void RecordStager::Append(const RecordView &record) {
 																					  : !layout_ ? "of no layout"
 																								 : "full");
 	}
+	if (!prepared_valid_ || prepared_record_ != record.data) {
+		PrepareRow(record);	 // a caller that reserves nothing for it (tests), or another record than prepared
+	}
+	prepared_valid_ = false;
 	// Set until the row is whole: a throw below leaves a chunk with part of a row.
 	spoiled_ = true;
 	const size_t var_count = RowVarCount(record, layout_->table);
@@ -464,7 +709,17 @@ void RecordStager::Append(const RecordView &record) {
 			AppendValue(c, st, v);
 			break;
 		case ValueState::OffRow:
-			AppendOffRow(c, st, v);
+			if (c.arm != StageArm::Utf16 && c.arm != StageArm::Bytes) {
+				throw FormatError("backup: " + c.name +
+								  " is a fixed-width column whose value is marked as stored off row");
+			}
+			if (prepared_[i].direct) {
+				AppendDirect(i, c, st, prepared_[i]);
+			} else if (prepared_[i].stream) {
+				AppendStream(i, c, st, prepared_[i]);
+			} else {
+				AppendOffRow(c, st, prepared_[i]);
+			}
 			break;
 		case ValueState::Default:
 			AppendValue(c, st, v);
@@ -472,7 +727,10 @@ void RecordStager::Append(const RecordView &record) {
 		}
 	}
 	if (map_off_row_) {
-		MapRow(record, var_count);
+		// The map is staged for the chunk too (the scan keeps it until the chunk is written): it counts
+		// toward Full() like a value, so a chunk of deep trees' maps closes on its bytes (review of S3).
+		payload_bytes_ += row_lob_map_.size();
+		staged_bytes_ += row_lob_map_.size();
 	}
 	spoiled_ = false;
 	count_++;
@@ -494,7 +752,23 @@ void RecordStager::FinalizeChunk() {
 		codec::staging::FinalizeStagedColumn(columns_[i].ops.kernel, st, count_, columns_[i].meta, *targets_[i]);
 		codec::staging::PublishStagedValidity(st, count_, *targets_[i]);
 	}
+	// The values written straight into their vectors, over their placeholders.
+	for (const auto &d : direct_values_) {
+		FlatVector::GetDataMutable<string_t>(*targets_[d.column])[d.row] = d.value;
+	}
+	direct_values_.clear();
 	arena_.EndChunk();
+	// A value stored off row may have grown a column's buffer far past what its next chunk needs; what
+	// a task keeps between calls stays about one reservation (D17), so the excess goes now.
+	for (size_t i = 0; i < columns_.size(); i++) {
+		ColumnStaging &st = arena_.Column(i);
+		if (!st.payload_bounded && st.buffer.capacity() > RETAINED_STAGING_BYTES) {
+			// A first buffer kept, as Configure leaves one: a chunk of empty values still has storage.
+			codec::staging::PayloadBuffer fresh;
+			fresh.resize(codec::staging::STAGING_INITIAL_PAYLOAD_BYTES);
+			st.buffer.swap(fresh);
+		}
+	}
 }
 
 }  // namespace backup
