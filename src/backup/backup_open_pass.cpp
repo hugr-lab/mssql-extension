@@ -6,7 +6,9 @@
 #include "duckdb/storage/buffer_manager.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <vector>
 
 namespace duckdb {
 namespace mssql {
@@ -14,7 +16,12 @@ namespace backup {
 
 static constexpr uint64_t GROUP_BYTES = static_cast<uint64_t>(PAGE_SIZE) * PAGES_PER_EXTENT;
 
-SourceAccess::SourceAccess(ByteSource &source, size_t file) : source_(source), file_(file) {
+static uint64_t NextAccessId() {
+	static std::atomic<uint64_t> next{1};
+	return next.fetch_add(1);
+}
+
+SourceAccess::SourceAccess(ByteSource &source, size_t file) : source_(source), file_(file), id_(NextAccessId()) {
 	if (file >= source.FileCount()) {
 		throw FormatError("backup: family file " + std::to_string(file) + " of a source of " +
 						  std::to_string(source.FileCount()));
@@ -25,13 +32,61 @@ uint64_t SourceAccess::Size() const {
 	return source_.FileSize(file_);
 }
 
-void SourceAccess::ReadAt(uint64_t offset, uint8_t *dest, size_t count) const {
+void SourceAccess::ReadDirect(uint64_t offset, uint8_t *dest, size_t count) const {
 	ByteRange range;
 	range.family = static_cast<uint32_t>(file_);
 	range.offset = offset;
 	range.length = count;
 	auto fetched = source_.Read(range, "a backup structure");
 	std::memcpy(dest, fetched.Data(), count);
+	fetches_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SourceAccess::ReadAt(uint64_t offset, uint8_t *dest, size_t count) const {
+	// The thread's read-ahead, by this access's id: what it read at once (`bytes`, `size` of them from
+	// `base`) and where its last read of this file ended. Its bytes are this file's until the thread
+	// reads another; its buffer's capacity, READ_AHEAD at most, stays with the thread (spec 085
+	// § Resources). A read as long as the read-ahead (a container's window) is fetched as asked:
+	// buffering it again would only copy it.
+	struct ThreadAhead {
+		uint64_t access = 0;
+		uint64_t base = 0;
+		uint64_t size = 0;
+		uint64_t last_end = 0;
+		std::vector<uint8_t> bytes;
+	};
+	static thread_local ThreadAhead ahead;
+	if (ahead.access != id_) {
+		ahead.access = 0;
+		ahead.size = 0;
+		ahead.last_end = UINT64_MAX;
+	}
+	const uint64_t size = Size();
+	if (count > 0 && offset <= size && count <= size - offset) {
+		if (offset >= ahead.base && count <= ahead.size && offset - ahead.base <= ahead.size - count) {
+			std::memcpy(dest, ahead.bytes.data() + (offset - ahead.base), count);
+			ahead.last_end = offset + count;
+			return;
+		}
+		if (count < READ_AHEAD && ahead.last_end != UINT64_MAX && offset >= ahead.last_end &&
+			offset - ahead.last_end <= SEQUENTIAL_GAP) {
+			const uint64_t n = std::min<uint64_t>(READ_AHEAD, size - offset);  // >= count
+			ahead.access = 0;  // not this file's while the read may throw
+			ahead.size = 0;
+			ahead.bytes.resize(static_cast<size_t>(n));
+			ReadDirect(offset, ahead.bytes.data(), static_cast<size_t>(n));
+			ahead.access = id_;
+			ahead.base = offset;
+			ahead.size = n;
+			std::memcpy(dest, ahead.bytes.data(), count);
+			ahead.last_end = offset + count;
+			return;
+		}
+	}
+	// As asked (a read past the end is the source's to refuse, naming the file).
+	ReadDirect(offset, dest, count);
+	ahead.access = id_;
+	ahead.last_end = offset + count;
 }
 
 const std::string &SourceAccess::Name() const {

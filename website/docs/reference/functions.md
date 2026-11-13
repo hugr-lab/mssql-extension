@@ -274,6 +274,18 @@ tables and views in each. See [Backup Files](../reading/backups.md#tables-and-vi
 SELECT schema_name, table_count FROM mssql_backup_schemas('/backups/sales_full.bak');
 ```
 
+### mssql_backup_columns()
+
+Every column of the user tables in a SQL Server full backup, one row each, with its state at a
+glance (`converted`, `stored_bytes`, `off_row_pending`, `not_stored`, `storage_format`) and why;
+optionally one schema's or one table's. See [Backup Files](../reading/backups.md#tables-and-views).
+
+**Signature:** `mssql_backup_columns(path VARCHAR | VARCHAR[] [, schema VARCHAR [, table VARCHAR]]) -> TABLE(schema_name VARCHAR, table_name VARCHAR, column_id INTEGER, column_name VARCHAR, sql_type VARCHAR, system_type VARCHAR, duckdb_type VARCHAR, state VARCHAR, reason VARCHAR)`
+
+```sql
+SELECT column_name, sql_type, system_type, state FROM mssql_backup_columns('/backups/sales_full.bak', 'sales', 'orders');
+```
+
 ### mssql_backup_catalog()
 
 A system base table of the database in a SQL Server full backup, as stored, with the virtual

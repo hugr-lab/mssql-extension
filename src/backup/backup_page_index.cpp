@@ -727,7 +727,12 @@ IndexedPass &IndexedPass::operator=(IndexedPass &&other) {
 }
 IndexedPass::~IndexedPass() = default;
 
-PageIndex::PageIndex() : fallback_lock_(new std::mutex()) {}
+static uint64_t NextIndexId() {
+	static std::atomic<uint64_t> next{1};
+	return next.fetch_add(1);
+}
+
+PageIndex::PageIndex() : id_(NextIndexId()), fallback_lock_(new std::mutex()) {}
 PageIndex::PageIndex(PageIndex &&) = default;
 PageIndex &PageIndex::operator=(PageIndex &&) = default;
 PageIndex::~PageIndex() = default;
@@ -752,13 +757,16 @@ bool PageIndex::FindIn(size_t i, const ExtentId &extent, uint64_t &position, boo
 void PageIndex::FallBack(size_t i) const {
 	auto &pass = passes_[i];
 	// The map is published by `fell_back` after it is built; the search object stays, for readers
-	// still in it. Sequential (BuildPassMap), under the index's lock: a fallback is the rare path.
+	// still in it. Under the index's lock (a fallback is the rare path), through the index's mapper:
+	// the DuckDB layer's reads a family file as parallel ranges (task 16c: BuildPassMap read a
+	// remote pass 1 MiB at a time on one thread).
 	std::lock_guard<std::mutex> guard(*fallback_lock_);
 	if (!pass.search || pass.fell_back.load(std::memory_order_acquire)) {
 		return;
 	}
 	const auto &stream = *families_[pass.family].stream;
-	PassMap map = BuildPassMap(stream, pass.data_offset, pass.data_length, pass.number);
+	PassMap map = mapper_ ? mapper_(stream, pass.data_offset, pass.data_length, pass.number)
+						  : BuildPassMap(stream, pass.data_offset, pass.data_length, pass.number);
 	map.number = pass.number;
 	map.family = pass.family;
 	pass.map = std::move(map);
@@ -789,13 +797,30 @@ bool PageIndex::LocateOnce(uint16_t file, uint32_t page, PageLocation &location)
 	ExtentId extent;
 	extent.file = file;
 	extent.extent = page / PAGES_PER_EXTENT;
+	// The extent this thread located last in this index, and where: a scan reads a page at a time,
+	// eight to an extent, and each would search every family's pass again -- the other families' to
+	// refuse an extent carried twice (task 16c: a search with I/O, under the pass's lock, a page). Its
+	// place does not change (a located extent's group was read; a fallback maps the same groups).
+	struct LastLocated {
+		uint64_t index = 0;
+		ExtentId extent;
+		PageLocation location;
+	};
+	static thread_local LastLocated last;
+	if (last.index == id_ && last.extent == extent) {
+		location = last.location;  // its offset the extent's first page's
+		if (location.block == PageLocation::NO_BLOCK) {
+			location.offset += static_cast<uint64_t>(page % PAGES_PER_EXTENT) * PAGE_SIZE;
+		}
+		return true;
+	}
 	for (size_t i = passes_.size(); i-- > 0;) {
 		uint64_t group;
 		bool by_block = false;
 		if (FindIn(i, extent, group, by_block)) {
 			// Within one pass an extent is in one family (E12): the same pass of another family
 			// carrying it too is a crafted file, refused here rather than by an open-time pass
-			// over every extent.
+			// over every extent. Once an extent: the thread keeps the extent it located last (above).
 			for (size_t j = i; j-- > 0 && passes_[j].number == passes_[i].number;) {
 				uint64_t other;
 				bool other_block = false;
@@ -814,8 +839,13 @@ bool PageIndex::LocateOnce(uint16_t file, uint32_t page, PageLocation &location)
 				location.offset = PageLocation::NO_BLOCK;
 			} else {
 				location.block = PageLocation::NO_BLOCK;
-				location.offset = pass.units_offset + group * GROUP_BYTES +
-								  static_cast<uint64_t>(page % PAGES_PER_EXTENT) * PAGE_SIZE;
+				location.offset = pass.units_offset + group * GROUP_BYTES;
+			}
+			last.index = id_;
+			last.extent = extent;
+			last.location = location;
+			if (location.block == PageLocation::NO_BLOCK) {
+				location.offset += static_cast<uint64_t>(page % PAGES_PER_EXTENT) * PAGE_SIZE;
 			}
 			return true;
 		}
@@ -975,6 +1005,7 @@ static void AddFamilyPasses(const FamilyStream &family_stream, uint32_t family, 
 PageIndex BuildPageIndex(const std::vector<FamilyStream> &families, const PageIndexOptions &options) {
 	PageIndex index;
 	index.families_ = families;
+	index.mapper_ = options.mapper;
 	for (uint32_t f = 0; f < families.size(); f++) {
 		AddFamilyPasses(families[f], f, families.size() == 1, options, index.passes_);
 	}

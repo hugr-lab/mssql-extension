@@ -6,7 +6,7 @@
 -- altered, identities, computed columns (one persisted), a rowversion, a ROWGUIDCOL, an alias type,
 -- sparse columns and a column set, a non-unique clustered index, defaults and a check, and views: two
 -- WITH ENCRYPTION, one SCHEMABINDING, one with non-ASCII text, two whose definitions pass 8000 bytes
--- (single-byte and Cyrillic); a procedure, functions and a trigger, and a partition function. Every
+-- (single-byte and Cyrillic), one indexed (its rows stored by a unique clustered index); a procedure, functions and a trigger, and a partition function. Every
 -- row is generated; nothing comes from
 -- anyone's database (spec 085 T4). Run by generate.sh with the sqlcmd variable DIR.
 --
@@ -166,6 +166,26 @@ DECLARE @x nvarchar(max) = REPLICATE(CAST(N'x' AS nvarchar(max)), 9000);
 EXEC (N'CREATE VIEW dbo.v_long AS SELECT id /* ' + @x + N' */ FROM dbo.shapes');
 DECLARE @y nvarchar(max) = REPLICATE(CAST(N'ж' AS nvarchar(max)), 5000);
 EXEC (N'CREATE VIEW dbo.v_long_unicode AS SELECT id /* ' + @y + N' */ FROM dbo.shapes');
+GO
+-- An indexed view (task 16f): WITH SCHEMABINDING, a join and an aggregate with COUNT_BIG(*), and a
+-- unique clustered index, which stores its rows as a clustered table's (index 1 of the view's object).
+-- Its own two tables, created under the SET options an indexed view needs of its base tables.
+SET ANSI_NULLS, ANSI_PADDING, ANSI_WARNINGS, ARITHABORT, CONCAT_NULL_YIELDS_NULL, QUOTED_IDENTIFIER ON;
+SET NUMERIC_ROUNDABORT OFF;
+GO
+CREATE TABLE sales.regions (region_id int NOT NULL PRIMARY KEY, name nvarchar(40) NOT NULL);
+CREATE TABLE sales.region_orders (id int NOT NULL PRIMARY KEY, region_id int NOT NULL, amount decimal(12, 2) NOT NULL,
+	qty int NOT NULL);
+GO
+INSERT INTO sales.regions VALUES (1, N'North'), (2, N'South'), (3, N'Восток'), (4, N'empty');
+WITH n AS (SELECT TOP (500) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects)
+INSERT INTO sales.region_orders SELECT i, 1 + i % 3, i * 1.25, i % 7 FROM n;
+GO
+CREATE VIEW sales.v_region_totals WITH SCHEMABINDING AS
+SELECT r.region_id, r.name, COUNT_BIG(*) AS orders, SUM(o.amount) AS amount, SUM(o.qty) AS qty
+FROM sales.region_orders o JOIN sales.regions r ON r.region_id = o.region_id GROUP BY r.region_id, r.name;
+GO
+CREATE UNIQUE CLUSTERED INDEX cx_v_region_totals ON sales.v_region_totals (region_id);
 GO
 -- Modules whose source mssql_backup_catalog must never serve (DQ-11) -- a procedure, a function, an
 -- encrypted multi-statement function whose return table has a computed column, a trigger -- and a

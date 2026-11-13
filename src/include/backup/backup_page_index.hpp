@@ -255,7 +255,8 @@ struct PageIndexOptions {
 	//! its chain walked from known blocks.
 	bool trust_layout = false;
 	//! The header scans' mapper (the DuckDB layer's reads them as parallel ranges); BuildPassMap
-	//! when empty.
+	//! when empty. Kept by the index for a searched pass that gives up (FallBack, task 16c), so it
+	//! must live as long as the index -- as the families' streams must.
 	PassMapper mapper;
 };
 
@@ -337,6 +338,10 @@ private:
 	bool LocateOnce(uint16_t file, uint32_t page, PageLocation &location) const;
 
 	std::vector<FamilyStream> families_;
+	//! PageIndexOptions::mapper, for FallBack.
+	PassMapper mapper_;
+	//! This index among every one made, for the thread's last extent located (LocateOnce).
+	uint64_t id_ = 0;
 	mutable std::vector<IndexedPass> passes_;
 	mutable std::unique_ptr<std::mutex> fallback_lock_;
 };

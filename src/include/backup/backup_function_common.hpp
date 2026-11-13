@@ -71,6 +71,19 @@ struct ColumnReading {
 };
 ColumnReading ReadingOf(const CatalogColumn &c);
 
+//! Column `c` of table `t` at a glance (mssql_backup_columns, task 16d; owner, 2026-11-11), from
+//! ReadingOf: `not_stored` (a computed column not persisted), `storage_format` (sparse, a column
+//! set: 086), `off_row_pending` (text / ntext / image, not read until PR 3; and a column whose value
+//! can be stored off row -- a MAX type, or a variable one in a table whose row can pass 8,060 bytes --
+//! read in row, refused by name off row until PR 3), `stored_bytes` (a type whose conversion is
+//! still to come, read as its stored bytes) or `converted`; `reason` says why (empty when converted),
+//! and that the table is not read when mssql_backup_tables says so.
+struct ColumnState {
+	const char *state = "converted";
+	std::string reason;
+};
+ColumnState StateOf(const CatalogTable &t, const CatalogColumn &c);
+
 }  // namespace backup
 }  // namespace mssql
 }  // namespace duckdb

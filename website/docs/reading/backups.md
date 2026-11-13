@@ -138,10 +138,47 @@ SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sale
 and the roles' included): `schema_id`, `schema_name`, and the `table_count` and `view_count` of user
 tables and views in each.
 
+`mssql_backup_columns(path [, schema [, table]])` lists every column of the user tables, one row
+each, with its state at a glance: `schema_name`, `table_name`, `column_id`, `column_name`,
+`sql_type` (as declared: an alias type by its own name, e.g. AdventureWorks' `Name`), `system_type`
+(the type underneath, declared: `nvarchar(50)`; NULL for a user-defined CLR type), `duckdb_type` (the
+type the scan returns a column it reads as; the declared type's otherwise), `state` and `reason`.
+The states:
+
+| state | meaning |
+|---|---|
+| `converted` | read as `duckdb_type` |
+| `stored_bytes` | read as its stored bytes (`BLOB`) until its type's conversion comes: `sql_variant`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector`, `json` |
+| `off_row_pending` | `text` / `ntext` / `image`, not read yet; or a column whose value can be stored off row -- a MAX type, or a variable one in a table whose row can pass 8,060 bytes (row-overflow): a value in row is read, one off row is refused by name until a later release |
+| `not_stored` | a computed column that is not persisted: it has no stored value |
+| `storage_format` | a sparse column or a column set: its value is in the row's sparse vector, read in a later release |
+
+`off_row_pending` is said generously: of a column whose value *can* be stored off row, not only of
+one that is. The `schema` and `table` arguments are matched as stored (a name that is not there lists
+nothing). A column's state is its own: a table that `mssql_backup_tables` says is not read (a
+columnstore, ROW / PAGE compression, for now) keeps its columns' states and says so in each
+`reason`, so a query for what will not be read asks for both:
+
+```sql
+SELECT table_name, column_name, state, reason
+FROM mssql_backup_columns('/backups/sales_full.bak') WHERE state <> 'converted' OR reason IS NOT NULL;
+```
+
+A filter on `schema_name`, `table_name` or `view_name` -- `=` a name, `IN` a list, or an `OR` of
+those -- makes the listings (and `mssql_backup_columns`) describe only the objects it names: on a
+database of thousands of tables, `WHERE table_name = 'orders'` reads the system tables but builds
+one table's columns, layout and partitioning. The rows are the same either way, but for one bound: a
+call reads at most 1 GiB of views' definitions stored off row, so a narrowed call can give a
+definition that the whole listing, past that bound, gives as NULL with its reason. `EXPLAIN` shows
+what a call describes (`Describes`).
+
 `mssql_backup_views` columns: `schema_name`, `view_name`, `object_id`, `definition` (the T-SQL text
 as stored; NULL for a view created `WITH ENCRYPTION`, which the reader does not de-obfuscate),
-`is_encrypted`, `created`, `modified`, and `reason`: why a definition could not be read, NULL
-otherwise.
+`is_encrypted`, `created`, `modified`, `reason`: why a definition could not be read, NULL
+otherwise; and `is_indexed`: true for an indexed view (one with a unique clustered index, which
+stores its rows), with its `shape`, `compression`, `row_count`, and `decodable` / `scan_reason`
+(whether `mssql_backup_scan` reads them, and why not) -- all NULL for a view that stores no rows
+(`row_count` also when the count is unknown).
 
 The oracle lane compares both with the server's own catalog of the same database (`sys.tables`,
 `sys.columns`, `sys.sql_modules`): per table its id, shape, partitions, rows and dates, per column
@@ -178,8 +215,22 @@ is refused for its type. A column the scan cannot read -- a computed column that
 stored value), a sparse column, and for now a `text` / `ntext` / `image` one -- is left out of
 `SELECT *`; a query that names it is refused, with the reason (`mssql_backup_tables.columns`).
 
+An indexed view is read the same way: `mssql_backup_scan(path, schema, view)` returns the rows its
+unique clustered index stores (`_mssql_rid` its clustered key), the rows `SELECT … WITH (NOEXPAND)`
+returns on the server. A view without one stores no rows and is refused by name. Its columns are
+the scan's (`DESCRIBE`); `mssql_backup_columns` lists the tables'.
+
+The scan runs on DuckDB's threads (`threads`); `max_threads := n` uses fewer for one call (a value
+above `threads` is clamped to it, with a warning in `duckdb_logs`). `max_memory := '2GB'` bounds
+the memory one call reserves for decoding to half of it (default `memory_limit`, which it cannot
+exceed): tasks wait for each other's memory, and a table whose rows cannot be decoded within it is
+refused by name. Rows come in page order, which DuckDB keeps where insertion order is preserved.
+
 ```sql
 SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');
+
+-- On two threads at most
+SELECT count(*) FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders', max_threads := 2);
 
 -- Import into DuckDB
 CREATE TABLE orders AS SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');

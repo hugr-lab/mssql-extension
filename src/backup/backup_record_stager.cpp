@@ -133,6 +133,7 @@ RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t>
 		Column col;
 		col.column_id = id;
 		col.name = table_ + "." + c.name;
+		col.declared_bytes = c.max_length < 0 ? IN_ROW_BYTES : static_cast<uint32_t>(c.max_length);
 		const ColumnReading reading = ReadingOf(c);
 		if (!reading.readable) {
 			throw InvalidInputException("backup: %s: %s", col.name, reading.note);
@@ -189,6 +190,22 @@ RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t>
 	for (size_t i = 0; i < columns_.size(); i++) {
 		arena_.Column(i).Configure(columns_[i].ops.kind, columns_[i].ops.stride, columns_[i].ops.max_value_bytes);
 	}
+	// The staging's bound (FixedStagingBytes, VarRowBytes): a direct value or a bit goes into its vector
+	// and stages nothing; a fixed one a vector of strides; a variable one its offset and length per row
+	// and a first buffer, and its stored bytes (+2 for UTF-16's delimiter), a row's in-row part at most.
+	uint64_t declared = 0;
+	uint64_t delimiters = 0;
+	for (const auto &col : columns_) {
+		if (col.arm == StageArm::Fixed || col.arm == StageArm::SwapHalves) {
+			fixed_staging_ += static_cast<uint64_t>(col.ops.stride) * STANDARD_VECTOR_SIZE;
+		} else if (col.arm == StageArm::Utf16 || col.arm == StageArm::Bytes) {
+			fixed_staging_ +=
+				STANDARD_VECTOR_SIZE * 2 * sizeof(uint64_t) + codec::staging::STAGING_INITIAL_PAYLOAD_BYTES;
+			declared += col.declared_bytes;
+			delimiters += col.arm == StageArm::Utf16 ? 2 : 0;
+		}
+	}
+	var_row_ = std::min<uint64_t>(declared, IN_ROW_BYTES) + delimiters;
 }
 
 void RecordStager::UseLayout(const RowsetLayout &layout) {
@@ -262,6 +279,7 @@ void RecordStager::BeginChunk(const std::vector<Vector *> &targets) {
 	}
 	count_ = 0;
 	payload_bytes_ = 0;
+	staged_bytes_ = 0;
 	spoiled_ = false;
 	begun_ = true;
 }
@@ -307,10 +325,12 @@ void RecordStager::AppendValue(Column &c, ColumnStaging &st, const ValueRef &v) 
 		}
 		st.AppendVarDelimited(v.data, v.size);
 		payload_bytes_ += c.budget_weight * (v.size + 2);
+		staged_bytes_ += v.size + 2;
 		return;
 	case StageArm::Bytes:
 		st.AppendVar(v.data, v.size);
 		payload_bytes_ += c.budget_weight * v.size;
+		staged_bytes_ += v.size;
 		return;
 	}
 }

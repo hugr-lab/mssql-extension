@@ -43,6 +43,8 @@ enum class StageArm : uint8_t {
 
 class RecordStager {
 public:
+	//! A record's in-row part at most: the most bytes of values one row stages.
+	static constexpr uint32_t IN_ROW_BYTES = 8060;
 	//! The columns `column_ids` of `table`, in that order, read as ReadingOf says: converted to D6's
 	//! type, or a type still to be converted as its stored bytes (BLOB). A column that is not readable
 	//! (no stored value, a sparse column), one not in the table, or one the codec would stage another
@@ -73,8 +75,26 @@ public:
 	//! MAX columns past the codec's per-chunk budget (STAGING_CHUNK_PAYLOAD_BUDGET_BYTES), weighed as
 	//! RowStager weighs it (a code-page column twice: its output heap is accounted at 3 bytes a
 	//! character, #536). A bounded column's chunk is bounded by its declaration.
+	//! Under LimitBytes, also when one more of the widest rows could pass the chunk's allowance.
 	bool Full() const {
-		return count_ == STANDARD_VECTOR_SIZE || payload_bytes_ >= codec::staging::STAGING_CHUNK_PAYLOAD_BUDGET_BYTES;
+		return count_ == STANDARD_VECTOR_SIZE || payload_bytes_ >= codec::staging::STAGING_CHUNK_PAYLOAD_BUDGET_BYTES ||
+			   (allowance_ != 0 && 2 * staged_bytes_ + count_ * extra_row_ + 2 * var_row_ + extra_row_ > allowance_);
+	}
+	//! The most the staging holds, for a reservation (D17): FixedStagingBytes() for any chunk (the
+	//! fixed columns' strides for a vector, the variable ones' offsets and first buffers), plus twice
+	//! (buffers grow by doubling) the variable values staged -- at most VarRowBytes() a row: the
+	//! declared widths, a record's in-row 8,060 bytes at most, and a UTF-16 value's delimiter.
+	uint64_t FixedStagingBytes() const {
+		return fixed_staging_;
+	}
+	uint64_t VarRowBytes() const {
+		return var_row_;
+	}
+	//! A chunk closes before its staging -- twice its variable values, plus `extra_row` a row for the
+	//! caller's own (the virtual columns) -- could pass `allowance` with one more row. 0: no limit.
+	void LimitBytes(uint64_t allowance, uint64_t extra_row) {
+		allowance_ = allowance;
+		extra_row_ = extra_row;
 	}
 	//! Publish the staged rows into the vectors BeginChunk was given; the caller sets its chunk's
 	//! cardinality (Count()). The DataChunk form sets it.
@@ -90,7 +110,8 @@ private:
 		StageArm arm = StageArm::Bytes;
 		size_t layout_index = 0;  // in the current layout
 		uint8_t bit_position = 0;
-		uint8_t budget_weight = 0;	// how many times its staged bytes count toward Full(): 0, 1, 2
+		uint8_t budget_weight = 0;	  // how many times its staged bytes count toward Full(): 0, 1, 2
+		uint32_t declared_bytes = 0;  // its max_length (a MAX one: a row's in-row part)
 	};
 
 	void AppendValue(Column &c, codec::staging::ColumnStaging &st, const ValueRef &v);
@@ -103,6 +124,12 @@ private:
 	const RowsetLayout *layout_ = nullptr;
 	idx_t count_ = 0;
 	idx_t payload_bytes_ = 0;
+	//! The variable values staged in this chunk, as staged (a UTF-16 one with its delimiter).
+	uint64_t staged_bytes_ = 0;
+	uint64_t fixed_staging_ = 0;
+	uint64_t var_row_ = 0;
+	uint64_t allowance_ = 0;
+	uint64_t extra_row_ = 0;
 	//! An Append threw after staging part of a row; cleared by BeginChunk.
 	bool spoiled_ = false;
 	//! BeginChunk ran and FinalizeChunk has not: Append and FinalizeChunk need it.

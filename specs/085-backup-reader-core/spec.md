@@ -210,7 +210,8 @@ a type whose conversion is still to come is read as its stored bytes (below).
   - **A container is searched safely by default** (owner, 2026-11-09, DQ-41): a block found from an
     arbitrary offset can be forged by row data (§ Security), so by default a container's group *g*
     is read at its data-set offset through the chain walked from its start or a seek index entry,
-    lazily, checkpoints kept as it goes (the stream located from its tail, task 7a part 4a); the
+    lazily, a mark kept every 256 KiB of the file walked (the stream located from its tail, task 7a
+    part 4a; as landed in PR 2e, a span between checkpoints is walked only up to the block read); the
     search over such a pass gallops from the nearest walked sample (1, 2, 4 … groups, then bisects),
     so it walks at most twice as far as the group it finds. Neither the rank path nor the GAMs run at
     ATTACH for a container: the GAM of an interval is read when a page of it is first located
@@ -1042,10 +1043,31 @@ offsets above are in its fixed part.
 
 ### Scan
 
-- Units: the live level-0 data pages (type 1) whose header AU is an IN_ROW AU of the table's base
-  rowsets, in page-id order, cut into units of 64 pages; one unit per task, `MaxThreads` = units.
-  Batch indexes follow unit order, so DuckDB can preserve insertion order.
-- A compressed backup reads a page by decompressing its block; each thread keeps its last block.
+- Units: the pages each base rowset's IN_ROW AU lists through its IAM chain, in page-id order, cut into
+  units of 64 pages (as landed in PR 2e: from the IAM chain's list, so a unit's pages not live, IAM pages
+  and upper levels are skipped as it is read; a partition listed when its first unit is claimed; a unit
+  cut longer, up to 2048 pages, where the catalog's rows per page would leave 64 pages short of a
+  vector); one unit per task at a time, `MaxThreads` ≤ `max_threads`, estimated from the catalog's rows.
+  Rows of a live level-0 data page (type 1) whose header AU is the unit's. A chunk holds one unit's
+  rows; batch indexes follow unit order, so DuckDB can preserve insertion order.
+- A compressed backup reads a page by decompressing its block, outside the stream's lock; each thread
+  keeps its last block. A block is located from the marks of its span (one every 256 KiB of the file
+  walked), under that span's lock only to look a mark up or to walk the span on past the block; the
+  walk from the mark, or from the thread's last block located, reads headers already confirmed, with
+  no lock, through the thread's read window (256 KiB), which then serves the block's payload too (as
+  landed in PR 2e: a 16-task scan of an 8 GB heap, MS_XPRESS, 0.75x the time of the walk under the
+  stream's lock; the open reads no more than the walk to the block it reads and one window past it). A pass search
+  guesses an extent's group from the sample below it (one group read where the table's extents follow
+  one another in the pass), so tasks ahead of the samples do not gallop through the others' groups, and
+  each thread keeps the extent it found last.
+- A plain backup's pages are read through the thread's read-ahead (as landed in PR 2e step 7): a short
+  read that starts where the thread's last read of the file ended, or within 64 KiB past it (a unit's
+  pages, one after another in the file; a chain walk's headers in a container), is served from 256 KiB
+  the thread read at once; a read that follows no other (a search's first probe, a page far from the
+  last) is read as asked, and the second of two reads within 64 KiB of each other fetches the 256 KiB
+  (up to 32 pages more than asked; one fetch, on a remote file within the cache's 2 MiB blocks). A
+  fetch a page had cost 12 µs of the kernel's time at 16 threads: a 16-task scan of an 8 GB heap,
+  0.33x the time.
 - LOBs and overflow values are read only for projected columns; a chunk closes early on the codec's
   staging byte budget, as on the live read path.
 - The bind data serialises and deserialises (the common-subplan optimizer could otherwise merge two
@@ -1064,8 +1086,10 @@ Each component of 085, with its home or its bound:
 | opened-file cache (D9) | files opened | DuckDB's `ObjectCache`: an entry reports `GetEstimatedCacheMemory` (`DD/src/include/duckdb/storage/object_cache.hpp:48`), so the buffer pool evicts it under pressure (`DD/src/storage/buffer/buffer_pool.cpp:348`); an attached catalog pins its entry; an evicted entry costs a reopen |
 | catalog (stage 4) | objects × columns | the decoded base tables in `ColumnDataCollection`s built with the `ClientContext`, spillable; the model over them indexes them by id, and a `TableLayout` is built only for a table a call binds |
 | log tail (stage 5) | the tail's records | read block by block; the transaction table and the per-AU flags of D11 are buffer-managed (090 D9 extends them) |
-| decode staging | the rows of a chunk | one chunk per running unit, closed at the codec's staging byte budget or a full vector, whichever comes first; reserved (D17) |
+| decode staging | the rows of a chunk | one chunk per running unit, closed at the codec's staging byte budget or a full vector, whichever comes first; reserved (D17). As landed in PR 2e: the staging's bound from the declared widths (a row's in-row 8,060 bytes at most; buffers counted twice, as they grow by doubling) for a vector, or 8 MiB with the chunk closing on the bytes it staged; held for one `Execute` call only, so a task blocked downstream holds no reservation another waits for -- what it keeps between calls is its staging's capacity, about one reservation, unaccounted. The output vectors' string heaps are DuckDB's allocations (accounted by DuckDB, #536), not reserved again |
 | a compressed block being read | ≤ 64 KB | one per thread (§ Scan) |
+| a container's walked spans (PR 2e) | the file walked | 16 bytes a mark, a mark per 256 KiB of the file walked (64 KB a GB, whatever the blocks' sizes); resident while open, within D4a's 0.4 MB per GB |
+| a thread's read window and read-ahead (PR 2e) | -- | 256 KiB per thread that read a container's data set (the window) and 256 KiB per thread that read a family file on (the read-ahead); their bytes are a file's until the thread reads another, their capacity stays with the thread for its life: at most 512 KiB × the threads that read a backup (DuckDB's and the clients'), unaccounted; beside them a pass search's 64 KiB group a thread |
 | fetched ranges (D3a) | the ranges in flight and cached | the buffer manager's: a remote file's cached blocks are counted and evictable once unpinned; a local file's reads are counted and freed on release; the ranges in flight are bounded by the units in flight |
 | a LOB value | its length | not streamed: DuckDB has no streamed value, so a value is assembled whole in its vector, fragment by fragment, capped at 2^31 − 1 bytes. Its length, known from its root before a fragment is read, is reserved first, by D17's rule: a unit that cannot reserve it waits for the others, and a value that still cannot fit while its unit runs alone is refused by name (table, `_mssql_rid`, column, length, `max_memory`, `temp_directory`) |
 
@@ -1348,17 +1372,39 @@ per-AU runs and parallel units (2e), off-row values (PR 3), `mssql_backup_column
 16c. PR 1's review findings on the paths a scan takes: `PageIndex::FallBack` through the ranged
     mapper (D3a) rather than sequentially; `WalkChain` on a tail of an unknown layout reading block
     headers in windows, not one 28-byte read each; `LocateOnce`'s probe of the other families' pass
-    only where a crafted file could carry an extent twice — 1.5 d
+    only where a crafted file could carry an extent twice — 1.5 d. As landed: the page index keeps
+    the build's mapper, so a fallback maps the pass as parallel ranges; `WalkChain` and `FindBlock`
+    read headers in 4 MiB windows (a 5,876-block test chain in one read); the page index keeps each
+    thread's last extent located, so the other families' probe costs one search an extent, not one a
+    page, whatever the families (the probe itself stays: any striped pass could carry one twice). A
+    fallback's waves of ranges, now inside a scan, are buffer-managed but not D17-reserved
 16d. `mssql_backup_columns(path [, schema [, table]])`: one row per column -- schema, table, column
     id, name, SQL type, DuckDB type, `state` (`converted`, `stored_bytes` for a type whose conversion is
     still to come, `off_row_pending` until PR 3, `not_stored`, `storage_format`) and `reason` -- the
     state of every column at a glance (owner, 2026-11-11: the next PR after 2d; no flag in
-    `mssql_backup_tables` instead) — 0.5 d
+    `mssql_backup_tables` instead) — 0.5 d. As landed: `system_type` beside `sql_type` (an alias type's
+    base, the owner's question 2026-11-12); `off_row_pending` also for a MAX column and a variable one
+    wider than the 24-byte off-row pointer in a table whose declared row can pass 8,060 bytes (counted
+    generously -- a MAX column at its 8,000-byte in-row share, a uniquifier, a version tag -- since the
+    server moves the widest value off row, whichever it is: `converted` is never promised for a value
+    that can go off row -- confirmed by the owner, 2026-11-12; dropped columns' bytes in old records
+    are not counted), read in row and
+    refused off row until PR 3; a table not read says so in each column's reason. Checked in the
+    oracle lane: the columns, `sql_type` and `system_type` against the server's (compare_catalog.py)
 16e. Filter pushdown into the catalog functions (owner, 2026-11-11): `schema_name` / `table_name` /
     `view_name` equalities and IN lists of `mssql_backup_schemas` / `_tables` / `_views` / `_columns`
     pushed into the model's build, so only the objects asked for get their columns, layouts, defaults
     and partitioning built and listed; the open pass and the bootstrap tables are the fixed cost the
-    cache (task 22) and an attached catalog (task 23) take away — 1 d
+    cache (task 22) and an attached catalog (task 23) take away — 1 d. As landed: `CatalogScope`
+    (BuildCatalogModel, OpenBackupCatalog), filled from a listing's kind (a table listing describes
+    no view, a view listing no table), mssql_backup_columns' arguments, and `pushdown_complex_filter`
+    reading `c = 'x'`, `c IN (…)` and an OR of those on one bare name column (several on one column
+    intersect); every filter stays in the plan, so DuckDB still applies it and a filter the reader
+    misreads costs work, never rows (one exception: the 1 GiB a call reads of views' off-row
+    definitions is charged over the views it builds, so a narrowed call can give a definition the whole
+    listing gives past the bound; review of 16e). EXPLAIN shows the scope (`Describes`). `mssql_backup_schemas` is narrowed by schema only, so its
+    counts stay whole. `mssql_backup_scan`'s bind builds its one table, not the database's (beyond
+    the task). The system tables (sysobjvalues, the partitioning, the defaults) are still read whole
 16f. Indexed views (owner, 2026-11-11). A view `WITH SCHEMABINDING` with a unique clustered index
     stores its result as that index: a base rowset of the view's object (`sysrowsets` index 1, its
     allocation units, IAM chain and `sysrscols` layout), leaf records FixedVar like a clustered
@@ -1367,7 +1413,16 @@ per-AU runs and parallel units (2e), off-row values (PR 3), `mssql_backup_column
     `mssql_backup_scan` reads an indexed view's clustered index as it reads a table (its nonclustered
     indexes ignored, `_mssql_rid` its clustered key); a non-indexed view is refused by name (no stored
     rows). An indexed view in `catalog.sql` (an aggregate with `COUNT_BIG(*)` and a join), compared in
-    the lane with `SELECT … WITH (NOEXPAND)` — 1 d
+    the lane with `SELECT … WITH (NOEXPAND)` — 1 d. As landed: the model describes an indexed view's
+    stored rows with the table's own code (`CatalogModel::indexed_views`, `FindIndexedView`;
+    `CatalogView::indexed`); `mssql_backup_views` gains `is_indexed`, `shape`, `compression`,
+    `row_count`, `decodable`, `scan_reason` (an index 1 rowset with its in-row unit; the golden's
+    `is_indexed` leaves a disabled index out); the scan finds a table, then an indexed view, and refuses a view that stores none by
+    name. catalog.sql's `sales.v_region_totals` (a join, `COUNT_BIG(*)`, two SUMs, on two new tables);
+    compare_rows.py compares it with the server's view through TYPE mssql (the rows of NOEXPAND in a
+    backup at rest, typed as the catalog types them), compare_catalog.py `is_indexed` and `row_count`
+    with the golden's (sys.indexes, sys.partitions). Locally on 2022: 3 rows, 5 columns, 0
+    differences; the catalog, 1,206 fields, 0
 
 **PR 3 — LOBs**
 

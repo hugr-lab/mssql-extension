@@ -285,6 +285,27 @@ int main() {
 		Check(fallback_alike && !searched.Pass(0).Searched(),
 			  "a family out of order: its search gives up to a header scan, every page still where it is");
 		{
+			// The fallback maps the pass through the index's mapper (task 16c: the DuckDB layer's reads a
+			// family file as parallel ranges), not BuildPassMap behind its back.
+			int mapped = 0;
+			PageIndexOptions counted = full;
+			counted.mapper = [&mapped](const RandomAccess &stream, uint64_t offset, uint64_t length, uint32_t number) {
+				mapped++;
+				return BuildPassMap(stream, offset, length, number);
+			};
+			auto with_mapper = BuildPageIndex(mixed, counted);
+			const int at_build = mapped;
+			bool alike = true;
+			for (uint32_t p = 0; p < 48; p++) {
+				PageLocation x, y;
+				const bool fx = with_mapper.Locate(1, p, x), fy = by_headers.Locate(1, p, y);
+				alike = alike && fx == fy && (!fx || (x.family == y.family && x.offset == y.offset));
+			}
+			Check(alike && !with_mapper.Pass(0).Searched() && mapped == at_build + 1,
+				  "the fallback maps the given-up pass through the index's mapper, once (" +
+					  std::to_string(mapped - at_build) + " call(s))");
+		}
+		{
 			// The review's case: one plain family, extents 0..299 with 150 and 200 swapped; the rank
 			// fails, the pass is searched, and asked in order without `expected` a search that has not
 			// met the break calls some of 150..199 absent. Asked as `expected` (the page must be

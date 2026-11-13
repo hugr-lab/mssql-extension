@@ -82,7 +82,8 @@ struct OpenPagesOptions {
 
 //! The pages of the full backup `headers` holds. A log backup has no data pages and a differential
 //! is read over its full (task 24's overlay): both are refused by name. The header scans read the
-//! families as parallel ranges (D3a) through `context`, used only within this call.
+//! families as parallel ranges (D3a) through `context`, and so does a searched pass's fallback later
+//! (the index keeps the mapper): the pages, like `headers`' source, must not outlive `context`.
 std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &context, const OpenedHeaders &headers,
 											 const OpenPagesOptions &options = OpenPagesOptions());
 
@@ -100,9 +101,9 @@ struct OpenedCatalog {
 //! and checked (CheckBootAgainstSet), ReadBootstrapTables and BuildCatalogModel. FormatError naming
 //! the backup otherwise.
 //! `with_model` false stops after the bootstrap tables (the model left empty): what a reader of the
-//! base tables needs.
+//! base tables needs. `scope`: the tables and views the model is built for (task 16e).
 std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths,
-												 bool with_model = true);
+												 bool with_model = true, const CatalogScope &scope = CatalogScope());
 
 //! The files of `paths` (paths or globs: the families of one media set) opened, walked and checked:
 //! one backup set per file (an appended set is refused), the same backup set GUID in every family,

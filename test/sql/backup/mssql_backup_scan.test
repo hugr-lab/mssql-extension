@@ -120,7 +120,7 @@ physical_plan	<REGEX>:.*Limit: 3001.*~3,000 rows.*
 statement error
 SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'nope');
 ----
-the backup has no table dbo.nope
+the backup has no table or indexed view dbo.nope
 
 statement error
 SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', NULL, 'items');
@@ -131,3 +131,98 @@ statement error
 SELECT * FROM mssql_backup_scan('test/data/backup/log.trn', 'dbo', 'items');
 ----
 mssql_backup_scan:
+
+# max_threads (D17, PR 2e): the same rows on one task as on DuckDB's threads; a value above DuckDB's
+# threads is clamped (a WARNING in duckdb_logs); NULL is the default; below 1 refused by name. The
+# samples' tables are one unit each (under 64 pages): units of several are compared in the oracle lane.
+query III
+SELECT count(*), sum(event_id), (SELECT count(*) FROM (
+        SELECT *, _mssql_rid FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events', max_threads := 1)
+        EXCEPT ALL SELECT *, _mssql_rid FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events', max_threads := 4096)))
+FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events', max_threads := NULL);
+----
+3000	4501500	0
+
+statement ok
+SET logging_storage = 'memory';
+
+statement ok
+SET enable_logging = true;
+
+statement ok
+SET logging_level = 'WARNING';
+
+statement ok
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events', max_threads := 4096);
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE message LIKE '%max_threads 4096 is above DuckDB''s threads%clamped to it%';
+----
+true
+
+statement ok
+SET enable_logging = false;
+
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events', max_threads := 0);
+----
+max_threads must be at least 1, not 0
+
+# max_memory (D17, PR 2e): half of it bounds what the scan reserves -- a chunk's decoding, reserved
+# before it runs and released after (duckdb_memory()'s EXTENSION tag is 0 once the query is done). A
+# chunk that cannot fit is refused by name; count(*) decodes no column and reserves nothing. The
+# waits of several tasks under a budget are test_backup_reservation.cpp's.
+query II
+SELECT count(*), sum(id) FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items', max_memory := '64MB');
+----
+2000	2001000
+
+query I
+SELECT memory_usage_bytes FROM duckdb_memory() WHERE tag = 'EXTENSION';
+----
+0
+
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items', max_memory := '64KB');
+----
+dbo.items: decoding a chunk needs up to
+
+query I
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items', max_memory := '64KB');
+----
+2000
+
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items', max_memory := 'lots');
+----
+max_memory 'lots' is not a size
+
+statement error
+SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items', max_memory := '0KB');
+----
+max_memory must be more than 0
+
+statement ok
+SET memory_limit = '1GB';
+
+statement ok
+SET logging_storage = 'memory';
+
+statement ok
+SET enable_logging = true;
+
+statement ok
+SET logging_level = 'WARNING';
+
+query I
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items', max_memory := '2GB');
+----
+2000
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE message LIKE '%max_memory 1.8 GiB is above DuckDB''s memory_limit%clamped to it%';
+----
+true
+
+statement ok
+SET enable_logging = false;

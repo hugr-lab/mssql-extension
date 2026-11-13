@@ -223,6 +223,17 @@ def compare_partitioning(c, db, name, arg, texts):
             c.check(f"{name}: {'.'.join(k)}", field, ours[k][field], theirs[k][field])
 
 
+# sys.types' names of the system types by system_type_id: the type an alias is declared over
+# (mssql_backup_columns' system_type, task 16d). CLR types (240) are named by their user type, not here.
+SYSTEM_TYPE_NAMES = {
+    34: "image", 35: "text", 36: "uniqueidentifier", 40: "date", 41: "time", 42: "datetime2",
+    43: "datetimeoffset", 48: "tinyint", 52: "smallint", 56: "int", 58: "smalldatetime", 59: "real",
+    60: "money", 61: "datetime", 62: "float", 98: "sql_variant", 99: "ntext", 104: "bit", 106: "decimal",
+    108: "numeric", 122: "smallmoney", 127: "bigint", 165: "varbinary", 167: "varchar", 173: "binary",
+    175: "char", 189: "timestamp", 231: "nvarchar", 239: "nchar", 241: "xml",
+}
+
+
 def compare_set(c, db, name, arg, texts):
     tables = db.query("SELECT schema_name, table_name, object_id::VARCHAR AS object_id, shape, "
                       "partition_count::VARCHAR AS partition_count, row_count::VARCHAR AS row_count, "
@@ -233,8 +244,11 @@ def compare_set(c, db, name, arg, texts):
                        "c.is_nullable::VARCHAR AS is_nullable, c.is_identity::VARCHAR AS is_identity, "
                        "c.is_computed::VARCHAR AS is_computed, c.is_sparse::VARCHAR AS is_sparse "
                        f"FROM (SELECT schema_name, table_name, unnest(columns) AS c FROM mssql_backup_tables({arg}))")
+    listed = db.query("SELECT schema_name, table_name, column_id::VARCHAR AS column_id, column_name, sql_type, "
+                      f"system_type FROM mssql_backup_columns({arg})")
     views = db.query("SELECT schema_name, view_name, object_id::VARCHAR AS object_id, "
-                     f"is_encrypted::VARCHAR AS is_encrypted, definition, reason FROM mssql_backup_views({arg})")
+                     "is_encrypted::VARCHAR AS is_encrypted, definition, reason, is_indexed::VARCHAR AS is_indexed, "
+                     f"row_count::VARCHAR AS row_count FROM mssql_backup_views({arg})")
 
     ours = keyed(tables, "schema_name", "table_name")
     theirs = keyed(parse_golden(texts[f"{name}.tables.txt"]), "schema_name", "table_name")
@@ -267,6 +281,22 @@ def compare_set(c, db, name, arg, texts):
         for field in ("is_nullable", "is_identity", "is_computed", "is_sparse"):
             c.check(where, field, flag(o[field]), t[field])
 
+    # mssql_backup_columns: the same columns as mssql_backup_tables' lists, the same sql_type, and the
+    # system type underneath (an alias type's base) as the server declares it.
+    listing = keyed(listed, "schema_name", "table_name", "column_id")
+    compare_keys(c, f"{name}: mssql_backup_columns", listing, theirs)
+    for k in sorted(set(listing) & set(theirs), key=lambda k: (k[0], k[1], int(k[2]))):
+        o, t = listing[k], theirs[k]
+        where = f"{name}: {'.'.join(k)} (mssql_backup_columns)"
+        c.check(where, "column_name", o["column_name"], t["column_name"])
+        c.check(where, "sql_type", o["sql_type"], ours[k]["sql_type"] if k in ours else None)
+        base = SYSTEM_TYPE_NAMES.get(int(t["system_type_id"]))
+        if base is None:
+            c.skip(f"{where} system_type (system type {t['system_type_id']}: a CLR or unlisted type)")
+            continue
+        c.check(where, "system_type", o["system_type"],
+                declaration(base, t["max_length"], t["precision"], t["scale"]))
+
     ours = keyed(views, "schema_name", "view_name")
     theirs = keyed(parse_golden(texts[f"{name}.views.txt"]), "schema_name", "view_name")
     compare_keys(c, f"{name}: views", ours, theirs)
@@ -275,6 +305,9 @@ def compare_set(c, db, name, arg, texts):
         where = f"{name}: view {'.'.join(k)}"
         c.check(where, "object_id", o["object_id"], t["object_id"])
         c.check(where, "is_encrypted", flag(o["is_encrypted"]), t["is_encrypted"])
+        if "is_indexed" in t:  # goldens made before task 16f have none
+            c.check(where, "is_indexed", flag(o["is_indexed"]), t["is_indexed"])
+            c.check(where, "row_count", o["row_count"], t["row_count"])
         c.check(where, "reason", o["reason"], None)
         if o["definition"] is None:
             c.check(where, "definition", (None, None), (t["definition_length"], t["definition_sha256"]))

@@ -3,6 +3,7 @@
 #include "backup/backup_bytes.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 
@@ -106,14 +107,10 @@ ContainerHeader ReadContainerHeader(const RandomAccess &file) {
 	return header;
 }
 
-//! The chain block whose header is at `at`, or a block with kind 0 when no chain block is there
-//! (the chain's end). `logical` is where its output starts.
-static bool ReadBlockHeader(const RandomAccess &file, uint64_t at, uint64_t logical, ChainBlock &block) {
-	if (at > file.Size() || file.Size() - at < BLOCK_HEADER) {
-		return false;
-	}
-	uint8_t bytes[BLOCK_HEADER];
-	file.ReadAt(at, bytes, BLOCK_HEADER);
+//! The chain block whose header's BLOCK_HEADER bytes are `bytes`, at `at` of `file`: false when no
+//! chain block is there (the chain's end). `logical` is where its output starts.
+static bool ParseBlockHeader(const RandomAccess &file, const uint8_t *bytes, uint64_t at, uint64_t logical,
+							 ChainBlock &block) {
 	ByteReader r(bytes, BLOCK_HEADER, "a container block header", at);
 	const uint8_t kind = r.U8(0);
 	if (kind != KIND_COMPRESSED && kind != KIND_STORED) {
@@ -138,13 +135,54 @@ static bool ReadBlockHeader(const RandomAccess &file, uint64_t at, uint64_t logi
 	return true;
 }
 
+//! The chain block whose header is at `at`, or false when no chain block is there (the chain's end).
+//! `logical` is where its output starts.
+static bool ReadBlockHeader(const RandomAccess &file, uint64_t at, uint64_t logical, ChainBlock &block) {
+	if (at > file.Size() || file.Size() - at < BLOCK_HEADER) {
+		return false;
+	}
+	uint8_t bytes[BLOCK_HEADER];
+	file.ReadAt(at, bytes, BLOCK_HEADER);
+	return ParseBlockHeader(file, bytes, at, logical, block);
+}
+
+//! A chain's headers walked forward, read CHAIN_WINDOW bytes at a time up to `limit` (PR 1's review,
+//! task 16c: one 28-byte read a header was one range request each on a remote file, 16M for 1 TB of
+//! 64 KB blocks; a window holds 64 of those headers, thousands of well-compressed ones).
+class HeaderWindow {
+public:
+	static constexpr uint64_t CHAIN_WINDOW = 4 << 20;
+	HeaderWindow(const RandomAccess &file, uint64_t limit) : file_(file), limit_(std::min(limit, file.Size())) {}
+	//! As ReadBlockHeader, from the window.
+	bool Read(uint64_t at, uint64_t logical, ChainBlock &block) {
+		if (at > file_.Size() || file_.Size() - at < BLOCK_HEADER) {
+			return false;
+		}
+		if (at < base_ || at - base_ > bytes_.size() || bytes_.size() - (at - base_) < BLOCK_HEADER) {
+			const uint64_t until = std::max(limit_, at + BLOCK_HEADER);
+			const uint64_t n = std::min<uint64_t>(CHAIN_WINDOW, until - at);
+			bytes_.resize(static_cast<size_t>(std::max<uint64_t>(n, BLOCK_HEADER)));
+			base_ = at;
+			file_.ReadAt(at, bytes_.data(), bytes_.size());
+		}
+		return ParseBlockHeader(file_, bytes_.data() + (at - base_), at, logical, block);
+	}
+
+private:
+	const RandomAccess &file_;
+	const uint64_t limit_;
+	uint64_t base_ = 0;
+	std::vector<uint8_t> bytes_;
+};
+
 BlockChain WalkChain(const RandomAccess &file) {
 	BlockChain chain;
 	uint64_t at = CHAIN_START;
 	uint64_t logical = 0;
 	ChainBlock block;
 	uint64_t since = 0;
-	while (ReadBlockHeader(file, at, logical, block)) {
+	HeaderWindow headers(file, file.Size());
+	while (headers.Read(at, logical, block)) {
 		if (chain.checkpoints.empty() ||
 			(since >= BlockChain::CHECKPOINT_STRIDE &&
 			 block.physical - chain.checkpoints.back().physical >= BlockChain::CHECKPOINT_BYTES)) {
@@ -187,13 +225,14 @@ ChainBlock FindBlock(const RandomAccess &file, const BlockChain &chain, uint64_t
 	ChainBlock block = chain.checkpoints[lo];
 	// The walk ends at the next checkpoint (or the chain's end): within a checkpoint's span.
 	const uint64_t stop = lo + 1 < chain.checkpoints.size() ? chain.checkpoints[lo + 1].physical : chain.end;
+	HeaderWindow headers(file, stop);
 	while (block.physical < stop) {
 		if (logical < block.logical + block.output) {
 			return block;
 		}
 		ChainBlock next;
 		const uint64_t at = block.physical + BLOCK_HEADER + block.payload;
-		if (!ReadBlockHeader(file, at, block.logical + block.output, next)) {
+		if (!headers.Read(at, block.logical + block.output, next)) {
 			break;
 		}
 		block = next;
@@ -355,36 +394,138 @@ bool OpenChainFromTail(const RandomAccess &file, BlockChain &chain, std::vector<
 	return true;
 }
 
-ContainerStream::ContainerStream(const RandomAccess &file, BlockChain chain, BlockDecoder decoder)
-	: file_(file), chain_(std::move(chain)), decoder_(std::move(decoder)), name_(file.Name() + " (data set)") {}
+static uint64_t NextStreamId() {
+	static std::atomic<uint64_t> next{1};
+	return next.fetch_add(1);
+}
 
-const ContainerStream::DecodedBlock *ContainerStream::Recent(uint64_t logical) const {
+ContainerStream::ContainerStream(const RandomAccess &file, BlockChain chain, BlockDecoder decoder)
+	: file_(file),
+	  chain_(std::move(chain)),
+	  decoder_(std::move(decoder)),
+	  name_(file.Name() + " (data set)"),
+	  id_(NextStreamId()) {
+	spans_.reserve(chain_.checkpoints.size());
+	for (const auto &checkpoint : chain_.checkpoints) {
+		std::unique_ptr<Span> span(new Span());
+		Mark start;
+		start.physical = checkpoint.physical;
+		start.logical = checkpoint.logical;
+		span->marks.push_back(start);
+		span->frontier = start;
+		span->walked.store(start.logical, std::memory_order_relaxed);
+		spans_.push_back(std::move(span));
+	}
+}
+
+//! The bytes of `file` a thread read last, by the stream's id (§ Scan: a thread keeps what it read):
+//! READ_WINDOW bytes read at once, so the headers a walk reads and the payloads of the blocks that
+//! follow one another are read in a few reads, not one a header and one a block. At most READ_WINDOW
+//! a thread (a block is at most 64 KiB): its bytes the stream's until the thread reads another's,
+//! its capacity the thread's for its life (spec 085 § Resources).
+static constexpr size_t READ_WINDOW = 256 << 10;
+
+const uint8_t *ContainerStream::Window(uint64_t at, size_t count) const {
+	struct ThreadWindow {
+		uint64_t stream = 0;
+		uint64_t base = 0;
+		std::vector<uint8_t> bytes;
+	};
+	static thread_local ThreadWindow window;
+	if (window.stream == id_ && at >= window.base && count <= window.bytes.size() &&
+		at - window.base <= window.bytes.size() - count) {
+		return window.bytes.data() + (at - window.base);
+	}
+	if (at > file_.Size() || count > file_.Size() - at) {
+		throw FormatError(Where(file_, at) + ": " + std::to_string(count) + " bytes that run past the end of the " +
+						  std::to_string(file_.Size()) + "-byte file");
+	}
+	const size_t n = static_cast<size_t>(std::max<uint64_t>(count, std::min<uint64_t>(READ_WINDOW, file_.Size() - at)));
+	window.stream = 0;	// not this stream's while the read may throw
+	window.bytes.resize(n);
+	file_.ReadAt(at, window.bytes.data(), n);
+	window.stream = id_;
+	window.base = at;
+	return window.bytes.data();
+}
+
+ContainerStream::Shared ContainerStream::RecentLocked(uint64_t logical) const {
 	for (const auto &d : recent_) {
-		if (d.valid && logical >= d.block.logical && logical < d.block.logical + d.block.output) {
-			return &d;
+		if (d && logical >= d->block.logical && logical < d->block.logical + d->block.output) {
+			return d;
 		}
 	}
 	return nullptr;
 }
 
-const ContainerStream::DecodedBlock &ContainerStream::Decoded(const ChainBlock &block) const {
-	DecodedBlock &d = recent_[next_slot_];
-	next_slot_ = (next_slot_ + 1) % recent_.size();
-	d.valid = false;
-	auto payload = Read(file_, block.physical + BLOCK_HEADER, block.payload, "a block's payload");
-	d.output.resize(block.output);
+ContainerStream::Shared ContainerStream::Decode(const ChainBlock &block) const {
+	auto d = std::make_shared<DecodedBlock>();
+	const uint8_t *payload = Window(block.physical + BLOCK_HEADER, block.payload);
+	d->output.resize(block.output);
 	if (block.Stored()) {
-		std::memcpy(d.output.data(), payload.data(), block.output);
+		std::memcpy(d->output.data(), payload, block.output);
 	} else {
 		if (!decoder_) {
 			throw FormatError(Where(file_, block.physical) +
 							  ": a compressed block, and no decoder for this container's algorithm");
 		}
-		decoder_(payload.data(), payload.size(), d.output.data(), block.output);
+		decoder_(payload, block.payload, d->output.data(), block.output);
 	}
-	d.block = block;
-	d.valid = true;
+	d->block = block;
 	return d;
+}
+
+void ContainerStream::KeepLocked(Shared decoded) const {
+	for (const auto &d : recent_) {
+		if (d && d->block.physical == decoded->block.physical) {
+			return;
+		}
+	}
+	recent_[next_slot_] = std::move(decoded);
+	next_slot_ = (next_slot_ + 1) % recent_.size();
+}
+
+uint64_t ContainerStream::SpanStop(size_t i) const {
+	return i + 1 == chain_.checkpoints.size() ? chain_.end : chain_.checkpoints[i + 1].physical;
+}
+
+ChainBlock ContainerStream::HeaderAt(uint64_t at, uint64_t logical, uint64_t stop) const {
+	ChainBlock block;
+	if (at >= stop || stop - at < BLOCK_HEADER ||
+		!ParseBlockHeader(file_, Window(at, BLOCK_HEADER), at, logical, block)) {
+		throw FormatError(Where(file_, at) + ": no block of the chain where its span (to offset " +
+						  std::to_string(stop) + ") goes on");
+	}
+	return block;
+}
+
+void ContainerStream::WalkOnLocked(size_t i, Span &span, uint64_t logical) const {
+	// On from the frontier, a header at a time from the thread's window, until the block holding
+	// `logical` is walked or the span ends. The walk must land on the next checkpoint at its data-set
+	// offset, so a span walked to its end confirms the checkpoint after it (a seek index entry's
+	// logical offset is otherwise trusted). The frontier moves a block at a time: a walk that throws
+	// leaves the span as walked so far, and the next read throws at the same header.
+	const uint64_t stop = SpanStop(i);
+	const bool last = i + 1 == chain_.checkpoints.size();
+	while (!span.complete && span.frontier.logical <= logical) {
+		const Mark at = span.frontier;
+		const ChainBlock block = HeaderAt(at.physical, at.logical, stop);
+		if (at.physical - span.marks.back().physical >= MARK_BYTES) {
+			span.marks.push_back(at);
+		}
+		Mark next;
+		next.physical = at.physical + BLOCK_HEADER + block.payload;
+		next.logical = at.logical + block.output;
+		if (next.physical > stop ||
+			(next.physical == stop && !last && next.logical != chain_.checkpoints[i + 1].logical)) {
+			throw FormatError(Where(file_, next.physical) +
+							  ": the chain's blocks do not reach the checkpoint at offset " + std::to_string(stop) +
+							  " where it says");
+		}
+		span.frontier = next;
+		span.complete = next.physical == stop;
+		span.walked.store(next.logical, std::memory_order_release);
+	}
 }
 
 ChainBlock ContainerStream::Locate(uint64_t logical) const {
@@ -392,92 +533,120 @@ ChainBlock ContainerStream::Locate(uint64_t logical) const {
 		throw FormatError("backup file \"" + file_.Name() + "\": data-set offset " + std::to_string(logical) +
 						  " is past its " + std::to_string(chain_.logical_size) + " bytes");
 	}
-	// From the last checkpoint at or before `logical`, walking headers; a checkpoint is added every
-	// CHECKPOINT_STRIDE blocks and CHECKPOINT_BYTES of the file walked, as WalkChain keeps them,
-	// so a chain located from its tail is walked once, piece by piece, and only where it is read.
 	auto it = std::upper_bound(chain_.checkpoints.begin(), chain_.checkpoints.end(), logical,
 							   [](uint64_t l, const ChainBlock &b) { return l < b.logical; });
 	if (it == chain_.checkpoints.begin()) {
 		throw FormatError("backup file \"" + file_.Name() + "\": a block chain with no checkpoint at or before " +
 						  std::to_string(logical));
 	}
-	--it;
-	ChainBlock block = *it;
-	const uint64_t stop = (it + 1) != chain_.checkpoints.end() ? (it + 1)->physical : chain_.end;
-	// From the nearest block located lately that lies in this span at or before `logical` (a block a
-	// walk already confirmed, so the walk from it reads only the headers after it). The checkpoints
-	// the walk adds keep their spacing from the span's checkpoint, as a walk from it would: in bytes
-	// from the checkpoint itself, in blocks from the count the recent block was found at.
-	const ChainBlock last_checkpoint_start = block;
-	uint64_t since = 0;
-	for (const auto &recent : located_) {
-		if (recent.block.physical > block.physical && recent.block.physical < stop && recent.block.logical <= logical) {
-			block = recent.block;
-			since = recent.since;
+	const size_t i = static_cast<size_t>(it - chain_.checkpoints.begin()) - 1;
+	Span &span = *spans_[i];
+	const uint64_t stop = SpanStop(i);
+	// The thread's last block located, when it lies in this span at or before `logical`: a scan reads
+	// its blocks one after another, so the walk on from it to the next block or so is a header or two,
+	// and needs no lock while `logical` is behind the frontier (every block before it was walked and
+	// confirmed). Farther on (the thread's next unit, past the units the others claimed) the nearest
+	// mark is looked up instead: a walk from the last block would read every byte between through
+	// the window (measured: 1 s more of the kernel's time on a 16-task scan of an 8 GB heap).
+	struct LastLocated {
+		uint64_t stream = 0;
+		ChainBlock block;
+	};
+	static thread_local LastLocated last;
+	const bool last_here = last.stream == id_ && last.block.physical >= chain_.checkpoints[i].physical &&
+						   last.block.physical < stop && last.block.logical <= logical;
+	if (last_here && logical < last.block.logical + last.block.output) {
+		return last.block;
+	}
+	Mark from;
+	if (last_here && logical - last.block.logical < static_cast<uint64_t>(last.block.output) + NEAR_OUTPUT &&
+		logical < span.walked.load(std::memory_order_acquire)) {
+		from.physical = last.block.physical + BLOCK_HEADER + last.block.payload;
+		from.logical = last.block.logical + last.block.output;
+	} else {
+		{
+			std::lock_guard<std::mutex> guard(span.lock);
+			if (logical >= span.frontier.logical) {
+				WalkOnLocked(i, span, logical);
+				if (logical >= span.frontier.logical) {
+					throw FormatError(Where(file_, span.frontier.physical) +
+									  ": no block of the chain holds data-set offset " + std::to_string(logical) +
+									  " (the file changed since it was opened?)");
+				}
+			}
+			auto mark = std::upper_bound(span.marks.begin(), span.marks.end(), logical,
+										 [](uint64_t l, const Mark &m) { return l < m.logical; });
+			from = *(mark - 1);	 // marks[0] is the checkpoint, at or before `logical`
+		}
+		if (last_here && last.block.physical >= from.physical) {
+			from.physical = last.block.physical + BLOCK_HEADER + last.block.payload;
+			from.logical = last.block.logical + last.block.output;
 		}
 	}
-	ChainBlock last_checkpoint = last_checkpoint_start;
-	const ChainBlock start = block;
-	std::vector<ChainBlock> added;
-	while (block.physical < stop) {
-		if (logical < block.logical + block.output) {
-			if (!added.empty()) {
-				chain_.checkpoints.insert(it + 1, added.begin(), added.end());
-			}
-			Located found;
-			found.block = block;
-			found.since = since;
-			// Not recorded: a recent block found again without a step (it is in the ring already), and
-			// the span's checkpoint itself (a walk starts there anyway; the ring keeps only blocks past
-			// one, review of #552).
-			if (block.physical == start.physical) {
-				return block;
-			}
-			if (located_.size() < RECENT_LOCATED) {
-				located_.push_back(found);
-			} else {
-				located_[next_located_] = found;
-				next_located_ = (next_located_ + 1) % RECENT_LOCATED;
-			}
+	for (;;) {
+		const ChainBlock block = HeaderAt(from.physical, from.logical, stop);
+		if (logical < from.logical + block.output) {
+			last.stream = id_;
+			last.block = block;
 			return block;
 		}
-		ChainBlock next;
-		const uint64_t at = block.physical + BLOCK_HEADER + block.payload;
-		if (at >= stop && (it + 1) != chain_.checkpoints.end()) {
-			// The walk reached the next checkpoint: it must land on it, at its data-set offset, so
-			// any walk across a span confirms the checkpoints at its ends (a seek index entry's
-			// logical offset is otherwise trusted).
-			if (at != stop || block.logical + block.output != (it + 1)->logical) {
-				throw FormatError(Where(file_, at) + ": the chain's blocks do not reach the checkpoint at offset " +
-								  std::to_string(stop) + " (data-set offset " + std::to_string((it + 1)->logical) +
-								  ") where it says");
-			}
-			break;
-		}
-		if (!ReadBlockHeader(file_, at, block.logical + block.output, next)) {
-			break;
-		}
-		block = next;
-		if (++since >= BlockChain::CHECKPOINT_STRIDE &&
-			block.physical - last_checkpoint.physical >= BlockChain::CHECKPOINT_BYTES && block.physical < stop) {
-			added.push_back(block);
-			last_checkpoint = block;
-			since = 0;
-		}
+		from.physical += BLOCK_HEADER + block.payload;
+		from.logical += block.output;
 	}
-	throw FormatError(Where(file_, block.physical) + ": no block of the chain holds data-set offset " +
-					  std::to_string(logical) + " (the file changed since it was opened?)");
+}
+
+uint64_t ContainerStream::MarkCount() const {
+	uint64_t n = 0;
+	for (const auto &span : spans_) {
+		std::lock_guard<std::mutex> guard(span->lock);
+		n += span->marks.size();
+	}
+	return n;
+}
+
+uint64_t ContainerStream::WalkedBytes() const {
+	uint64_t n = 0;
+	for (const auto &span : spans_) {
+		std::lock_guard<std::mutex> guard(span->lock);
+		n += span->frontier.physical - span->marks.front().physical;
+	}
+	return n;
 }
 
 void ContainerStream::ReadAt(uint64_t offset, uint8_t *dest, size_t count) const {
 	if (offset > chain_.logical_size || count > chain_.logical_size - offset) {
 		throw FormatError("backup file \"" + file_.Name() + "\": a read past the end of its data set");
 	}
-	std::lock_guard<std::mutex> guard(lock_);
+	// The thread's last block (§ Scan: each thread keeps its last block, at most 64 KB), by this
+	// stream's id: a read in the block the thread read last -- the next page of a run, a page of the
+	// group its search just probed -- takes no lock. Held weakly: the recent blocks own it, so it goes
+	// with the stream (or when evicted), never kept by a worker thread past its backup (review).
+	struct LastBlock {
+		uint64_t stream = 0;
+		std::weak_ptr<const DecodedBlock> block;
+	};
+	static thread_local LastBlock last;
 	while (count > 0) {
-		const DecodedBlock *d = Recent(offset);
+		Shared d;
+		if (last.stream == id_) {
+			d = last.block.lock();
+			if (d && (offset < d->block.logical || offset >= d->block.logical + d->block.output)) {
+				d.reset();
+			}
+		}
 		if (!d) {
-			d = &Decoded(Locate(offset));
+			{
+				std::lock_guard<std::mutex> guard(lock_);
+				d = RecentLocked(offset);
+			}
+			if (!d) {
+				// Located (its span's lock held only to look a mark up or walk on), read and decoded with no lock.
+				d = Decode(Locate(offset));
+				std::lock_guard<std::mutex> guard(lock_);
+				KeepLocked(d);
+			}
+			last.stream = id_;
+			last.block = d;
 		}
 		const size_t within = static_cast<size_t>(offset - d->block.logical);
 		const size_t n = std::min(count, static_cast<size_t>(d->block.output) - within);

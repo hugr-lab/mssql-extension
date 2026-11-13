@@ -20,10 +20,27 @@ static constexpr size_t CHUNK = 65536;
 					  std::to_string(out) + ")");
 }
 
-//! The canonical code of a 256-byte length table as a 2^15-entry lookup of (symbol << 4 | length);
-//! 0 marks a code no symbol has. Lengths are 4 bits, so <= 15 by construction; an over-subscribed
-//! table (the lengths' Kraft sum above 1) is refused.
-static void BuildTable(const uint8_t *lengths_bytes, std::vector<uint16_t> &table, size_t in, size_t out) {
+//! The bits a code is looked up by at once: every code up to this long is one lookup in a table of
+//! 2^FAST_BITS entries (4 KB, in L1); a longer one -- rare, the lengths being a Huffman code's --
+//! is decoded canonically. PR 1 looked every code up in 2^15 entries (64 KB), built afresh for
+//! every 64 KB of output.
+static constexpr unsigned FAST_BITS = 11;
+
+//! A 256-byte length table's canonical code: `fast` holds (symbol << 4 | length) for the codes up to
+//! FAST_BITS long at every index they prefix, 0 elsewhere; the longer codes are found by length,
+//! from the first code and the first symbol of each (the symbols of a length in symbol order, as
+//! codes are assigned).
+struct HuffmanTable {
+	uint16_t fast[1u << FAST_BITS];
+	uint32_t first_code[MAX_CODE + 1];
+	uint16_t count[MAX_CODE + 1];
+	uint16_t first_index[MAX_CODE + 1];
+	uint16_t symbols[SYMBOLS];
+};
+
+//! The table of a 256-byte length table. Lengths are 4 bits, so <= 15 by construction; an
+//! over-subscribed table (the lengths' Kraft sum above 1) is refused, so the code is prefix-free.
+static void BuildTable(const uint8_t *lengths_bytes, HuffmanTable &table, size_t in, size_t out) {
 	uint8_t lengths[SYMBOLS];
 	for (size_t i = 0; i < TABLE_BYTES; i++) {
 		lengths[2 * i] = lengths_bytes[i] & 0x0F;
@@ -41,22 +58,69 @@ static void BuildTable(const uint8_t *lengths_bytes, std::vector<uint16_t> &tabl
 	if (kraft == 0) {
 		Fail("a Huffman table with no symbol", in, out);
 	}
-	table.assign(static_cast<size_t>(1) << MAX_CODE, 0);
+	std::memset(table.fast, 0, sizeof(table.fast));
 	uint32_t code = 0;
+	uint16_t index = 0;
 	for (unsigned len = 1; len <= MAX_CODE; len++) {
+		table.first_code[len] = code;
+		table.first_index[len] = index;
+		table.count[len] = 0;
 		for (size_t sym = 0; sym < SYMBOLS; sym++) {
 			if (lengths[sym] != len) {
 				continue;
 			}
-			const uint32_t span = 1u << (MAX_CODE - len);
-			const uint32_t start = code << (MAX_CODE - len);
-			const uint16_t entry = static_cast<uint16_t>((sym << 4) | len);
-			for (uint32_t i = 0; i < span; i++) {
-				table[start + i] = entry;
+			table.symbols[index++] = static_cast<uint16_t>(sym);
+			table.count[len]++;
+			if (len <= FAST_BITS) {
+				const uint32_t span = 1u << (FAST_BITS - len);
+				const uint32_t start = code << (FAST_BITS - len);
+				const uint16_t entry = static_cast<uint16_t>((sym << 4) | len);
+				for (uint32_t i = 0; i < span; i++) {
+					table.fast[start + i] = entry;
+				}
 			}
 			code++;
 		}
 		code <<= 1;
+	}
+}
+
+//! The entry of the code that prefixes the 15-bit window `window`, when no code up to FAST_BITS long
+//! does (its `fast` entry is 0): the longer codes by length; 0 when no code prefixes it.
+static uint16_t LongCode(const HuffmanTable &table, uint32_t window) {
+	for (unsigned len = FAST_BITS + 1; len <= MAX_CODE; len++) {
+		const uint32_t code = window >> (MAX_CODE - len);
+		if (code >= table.first_code[len] && code - table.first_code[len] < table.count[len]) {
+			const uint16_t sym = table.symbols[table.first_index[len] + (code - table.first_code[len])];
+			return static_cast<uint16_t>((sym << 4) | len);
+		}
+	}
+	return 0;
+}
+
+//! `length` bytes at `to` copied from `distance` bytes back, the source overlapping the destination
+//! when `distance` < `length` (the run repeats with period `distance`). Pages are full of such runs
+//! -- a char column's padding, a page's free space --, a byte at a time each cost a store-to-load
+//! dependency: one byte is a memset; a short period is copied in non-overlapping pieces that double
+//! (each a multiple of the period, from a source already written).
+static inline void CopyMatch(uint8_t *to, size_t distance, size_t length) {
+	const uint8_t *from = to - distance;
+	if (distance >= length) {
+		std::memcpy(to, from, length);
+		return;
+	}
+	if (distance == 1) {
+		std::memset(to, from[0], length);
+		return;
+	}
+	size_t copied = 0;
+	while (copied < length) {
+		// Every byte from `from` to `to + copied` is written and repeats with period `distance`: a
+		// piece of `period` bytes copied from `period` bytes back neither overlaps nor breaks it.
+		const size_t period = (distance + copied) / distance * distance;
+		const size_t n = length - copied < period ? length - copied : period;
+		std::memcpy(to + copied, to + copied - period, n);
+		copied += n;
 	}
 }
 
@@ -80,7 +144,7 @@ void XpressHuffmanDecode(const uint8_t *input, size_t input_size, uint8_t *outpu
 		}
 		return input[at];
 	};
-	std::vector<uint16_t> table;
+	HuffmanTable table;
 	int extra = 16;
 	// Where the last word the window loaded ends, and where the last long-length byte read ends:
 	// the window's unconsumed bits are the tail of its loaded words, which a long-length byte read
@@ -103,9 +167,13 @@ void XpressHuffmanDecode(const uint8_t *input, size_t input_size, uint8_t *outpu
 			if (pos > input_size + 4) {
 				Fail("the input ends before the output is complete", pos, produced);
 			}
-			const uint16_t entry = table[(bits >> 17) & 0x7FFF];
+			const uint32_t window = (bits >> 17) & 0x7FFF;
+			uint16_t entry = table.fast[window >> (MAX_CODE - FAST_BITS)];
 			if (entry == 0) {
-				Fail("a bit pattern no Huffman code has", pos, produced);
+				entry = LongCode(table, window);
+				if (entry == 0) {
+					Fail("a bit pattern no Huffman code has", pos, produced);
+				}
 			}
 			const unsigned len = entry & 0x0F;
 			unsigned sym = entry >> 4;
@@ -166,15 +234,7 @@ void XpressHuffmanDecode(const uint8_t *input, size_t input_size, uint8_t *outpu
 			if (length > output_size - produced) {
 				Fail("a match of " + std::to_string(length) + " bytes past the block's declared size", pos, produced);
 			}
-			const uint8_t *from = output + produced - distance;
-			uint8_t *to = output + produced;
-			if (distance >= length) {
-				std::memcpy(to, from, length);
-			} else {
-				for (size_t i = 0; i < length; i++) {
-					to[i] = from[i];  // overlapping: byte by byte, the run repeats
-				}
-			}
+			CopyMatch(output + produced, distance, length);
 			produced += length;
 		}
 	}
