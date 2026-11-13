@@ -168,6 +168,10 @@ struct MSSQLConnectionInfo {
 	//! "repeatable_read", "serializable", "snapshot", or "auto" (snapshot when the
 	//! database allows it, else nothing).
 	string transaction_isolation;
+	//! Spec 093 D8: mssql_datetime2_7_as for this connection ('timestamp_ns' /
+	//! 'timestamp'), from a secret, a connection string or a URI; empty = unset
+	//! (the setting decides). The ATTACH option wins over it.
+	string datetime2_7_as;
 
 	//===----------------------------------------------------------------------===//
 	// ORDER BY Pushdown (Spec 039)

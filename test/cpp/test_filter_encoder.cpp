@@ -394,9 +394,10 @@ namespace {
 // pages come from the server with the metadata (COLLATIONPROPERTY, #361), so
 // the test sets them the way the loaders do.
 MSSQLColumnInfo Col(const std::string &name, int32_t id, const std::string &sql_type, int16_t max_length,
-					uint8_t precision, uint8_t scale, const std::string &collation = "", int32_t code_page = 1252) {
-	MSSQLColumnInfo c(name, id, sql_type, max_length, precision, scale, true, collation,
-					  "SQL_Latin1_General_CP1_CI_AS");
+					uint8_t precision, uint8_t scale, const std::string &collation = "", int32_t code_page = 1252,
+					MSSQLDatetime2Read datetime2_read = MSSQLDatetime2Read::Nanoseconds) {
+	MSSQLColumnInfo c(name, id, sql_type, max_length, precision, scale, true, collation, "SQL_Latin1_General_CP1_CI_AS",
+					  datetime2_read);
 	c.code_page = code_page;
 	c.database_code_page = 1252;
 	return c;
@@ -854,6 +855,32 @@ static void TestTruncatedReadComparisons() {
 	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*cmp(ExpressionType::COMPARE_EQUAL, COL_DT, t(10, 0, 0, 123456)),
 													exact_ctx),
 			   "([dt] = '10:00:00.1234560')");
+
+	// spec 093 D8: a datetime2(7) its catalog reads in microseconds (TIMESTAMP) is time(7)'s case
+	auto micros = cols;
+	micros[COL_DT] = Col("dt", 2, "datetime2", 8, 27, 7, "", 1252, MSSQLDatetime2Read::Microseconds);
+	ASSERT_TRUE(micros[COL_DT].ReadsDatetime2Truncated() && micros[COL_DT].duckdb_type == LogicalType::TIMESTAMP);
+	fx.column_types[COL_DT] = LogicalType::TIMESTAMP;
+	SqlParamSet micro_params;
+	auto micro_ctx = fx.Context();
+	micro_ctx.mssql_columns = &micros;
+	micro_ctx.params = &micro_params;
+	const auto ts = [](int32_t y, int32_t mo, int32_t d, int32_t us) {
+		return Value::TIMESTAMP(Timestamp::FromDatetime(Date::FromDate(y, mo, d), Time::FromTime(10, 0, 0, us)));
+	};
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*cmp(ExpressionType::COMPARE_EQUAL, COL_DT, ts(2026, 1, 1, 123456)),
+													micro_ctx),
+			   "([dt] >= @p0 AND [dt] < @p1)");
+	ASSERT_TRUE(micro_params.params[0].declaration == "datetime2(7)");
+	ASSERT_TRUE(Value::NotDistinctFrom(micro_params.params[1].value, ts(2026, 1, 1, 123457)));
+	// the last microsecond of 9999-12-31: 10000-01-01 is never sent
+	const auto last_ts =
+		Value::TIMESTAMP(Timestamp::FromDatetime(Date::FromDate(9999, 12, 31), Time::FromTime(23, 59, 59, 999999)));
+	ASSERT_SQL(
+		FilterEncoder::EncodeSearchCondition(*cmp(ExpressionType::COMPARE_GREATERTHAN, COL_DT, last_ts), micro_ctx),
+		"([dt] <> [dt])");
+	// read in nanoseconds (the default), it is compared as it always was
+	ASSERT_TRUE(!cols[COL_DT].ReadsDatetime2Truncated());
 }
 
 //==============================================================================

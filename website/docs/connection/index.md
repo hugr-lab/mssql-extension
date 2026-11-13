@@ -59,6 +59,7 @@ Recognized query parameters:
 | `hostnameincertificate` | host name | Name the certificate must carry, when it differs from the host connected to |
 | `catalog` | `true`/`false` | Catalog integration (default: true) |
 | `schema_filter` / `table_filter` | regex | Limit visible schemas / tables |
+| `datetime2_7_as` | `timestamp_ns`/`timestamp` | The type a `datetime2(7)` column is read as -- see [Types](../reading/types.md#datetime-types) |
 | `applicationname` | string | LOGIN7 `program_name` (spaceless form in URIs) |
 
 ### Using Secrets
@@ -92,6 +93,7 @@ CREATE SECRET secret_name (
 | `catalog`     | BOOLEAN | No       | Enable catalog integration (default: true). Set to false for serverless/restricted databases that don't support catalog queries |
 | `schema_filter` | VARCHAR | No     | Regex pattern to filter visible schemas (case-insensitive partial match) |
 | `table_filter`  | VARCHAR | No     | Regex pattern to filter visible tables/views (case-insensitive partial match) |
+| `datetime2_7_as` | VARCHAR | No    | `'timestamp_ns'` (default) or `'timestamp'`: the type a `datetime2(7)` column is read as -- see [Types](../reading/types.md#datetime-types) |
 | `azure_secret`  | VARCHAR | No     | Name of an Azure secret (DuckDB Azure extension) for Azure AD auth — see [AZURE.md](./azure.md) |
 | `access_token`  | VARCHAR | No     | Pre-acquired Azure AD JWT (hidden in `duckdb_secrets()`) — see [AZURE.md](./azure.md) |
 | `authenticator` | VARCHAR | No     | `krb5` (POSIX) or `winsspi` (Windows SSPI) — Kerberos / SSPI integrated auth, see [Kerberos.md](./kerberos.md) |
@@ -347,6 +349,7 @@ In addition to options propagated from the secret / connection string, the follo
 | `order_pushdown`    | BOOLEAN | Per-ATTACH ORDER BY pushdown override (overrides `mssql_order_pushdown` setting) |
 | `remote_pushdown`   | BOOLEAN | Per-ATTACH remote pushdown (overrides the `mssql_remote_pushdown` setting); `false` keeps DuckDB's string equality for GROUP BY / DISTINCT / joins — see [Remote Pushdown](../reading/queries.md#remote-pushdown-whole-statements) |
 | `client_transcode`  | BOOLEAN | Per-ATTACH `mssql_client_transcode` (overrides the setting): read code-page text as bytes and convert it on the client |
+| `datetime2_7_as`    | VARCHAR | Per-ATTACH `mssql_datetime2_7_as` (overrides the setting, and the secret's / connection string's / URI's `datetime2_7_as`): `'timestamp_ns'` or `'timestamp'`, the type a `datetime2(7)` column is read as -- see [Types](../reading/types.md#datetime-types) |
 | `native_types`      | BOOLEAN | Per-ATTACH `mssql_catalog_native_types` (overrides the setting for this catalog): `false` reports bounded string columns as plain `VARCHAR` instead of `MSSQL_VARCHAR(n)` / `MSSQL_NVARCHAR(n)` |
 | `lazy_validation`   | BOOLEAN | Skip the eager ATTACH-time credential check (default `false`)                |
 | `min_connections`   | BIGINT  | Connections to open at ATTACH, their logins in parallel (overrides `mssql_min_connections`). Refused beside `lazy_validation true`. Fewer than asked is logged as a WARNING, not an error |

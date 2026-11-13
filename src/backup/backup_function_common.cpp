@@ -377,7 +377,9 @@ ColumnReading TypeReading(const CatalogColumn &c) {
 				   std::to_string(c.scale) + ", which no SQL Server type has");
 	}
 	try {
-		r.type = MSSQLColumnInfo::MapSQLServerTypeToDuckDB(c.system_type_name, c.max_length, c.precision, c.scale);
+		// datetime2(7) as TIMESTAMP_NS until spec 093 T8 hooks mssql_datetime2_7_as into the backup scan.
+		r.type = MSSQLColumnInfo::MapSQLServerTypeToDuckDB(c.system_type_name, c.max_length, c.precision, c.scale,
+														   MSSQLDatetime2Read::Nanoseconds);
 	} catch (std::exception &e) {
 		return raw(type + " has no DuckDB type here (" + std::string(e.what()) + ")");
 	}

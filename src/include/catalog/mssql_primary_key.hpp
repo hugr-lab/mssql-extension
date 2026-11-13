@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include "catalog/mssql_column_info.hpp"
 #include "catalog/mssql_rowid_key_choice.hpp"
 #include "duckdb/common/types.hpp"
 
@@ -29,7 +30,8 @@ struct PKColumnInfo {
 	// Construct from discovery query result
 	static PKColumnInfo FromMetadata(const string &name, int32_t column_id, int32_t key_ordinal,
 									 const string &type_name, int16_t max_length, uint8_t precision, uint8_t scale,
-									 const string &collation_name, const string &database_collation);
+									 const string &collation_name, const string &database_collation,
+									 MSSQLDatetime2Read datetime2_read);
 
 	// The right-hand side of `t.[k] = <this>` in the UPDATE/DELETE key join,
 	// given the VALUES column it compares against. Every rowid value is sent
@@ -111,7 +113,9 @@ struct RowIdKeyInfo {
 	//! After the last row: run the choice over the accumulated candidates and
 	//! publish the result into exists / source / index_name / columns /
 	//! rejections / rowid_type. Idempotent on an empty candidate list.
-	void FinalizeChoice(const string &database_collation);
+	//! `datetime2_read`: the catalog's (spec 093 D8) -- a key column's read type, and whether a
+	//! datetime2(7) one is read one-to-one.
+	void FinalizeChoice(const string &database_collation, MSSQLDatetime2Read datetime2_read);
 
 	//! The W5b refusal for a statement that needs rowid on this table: what
 	//! was looked for, what was found, why each candidate was rejected, and

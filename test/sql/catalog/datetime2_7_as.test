@@ -1,0 +1,440 @@
+# name: test/sql/catalog/datetime2_7_as.test
+# description: Spec 093 D8 -- mssql_datetime2_7_as / datetime2_7_as: datetime2(7) read as TIMESTAMP_NS (default, out-of-range NULL and a WARNING) or as TIMESTAMP (the 100 ns digit truncated, compared and keyed as time(7))
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN, MSSQL_TESTDB_URI, MSSQL_TEST_HOST/PORT/USER/PASS
+#
+# A datetime2(7) column counts 100 ns ticks over 0001-9999. Read as TIMESTAMP_NS
+# (the default) every tick survives but a value outside 1677-2262 -- a temporal
+# table's 9999-12-31 ValidTo -- is read as NULL (#168), and the scan says so once
+# per column in duckdb_logs. Read as TIMESTAMP (mssql_datetime2_7_as =
+# 'timestamp', or the datetime2_7_as ATTACH option, read at ATTACH) every value
+# is read with its seventh digit dropped: d7 of rows 1-7 reads 10:00:00.123456
+# (x3), .123457, 9999-12-31 23:59:59.999999, 0001-01-01, NULL. A pushed filter
+# then decides as DuckDB does over those values, as for time(7): `=` is the range
+# [c, c + 1 us), `>` starts at c + 1 us, `<=` ends before it. Such a column is no
+# longer a lossless key: a table keyed by it falls through, and with no other key
+# its UPDATE / DELETE are refused by name.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+require-env MSSQL_TESTDB_URI
+
+require-env MSSQL_TEST_HOST
+
+require-env MSSQL_TEST_PORT
+
+require-env MSSQL_TEST_USER
+
+require-env MSSQL_TEST_PASS
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dt27n (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('dt27n', 'DROP TABLE IF EXISTS dbo.Dt27; CREATE TABLE dbo.Dt27 (id int PRIMARY KEY, d7 datetime2(7) NULL, d6 datetime2(6) NULL); INSERT INTO dbo.Dt27 VALUES (1, ''2026-01-01 10:00:00.1234560'', ''2026-01-01 10:00:00.123456''), (2, ''2026-01-01 10:00:00.1234561'', NULL), (3, ''2026-01-01 10:00:00.1234569'', NULL), (4, ''2026-01-01 10:00:00.1234570'', NULL), (5, ''9999-12-31 23:59:59.9999999'', ''9999-12-31 23:59:59.999999''), (6, ''0001-01-01 00:00:00'', NULL), (7, NULL, NULL)');
+
+statement ok
+SELECT mssql_exec('dt27n', 'DROP TABLE IF EXISTS dbo.Dt27Key; CREATE TABLE dbo.Dt27Key (k datetime2(7) NOT NULL PRIMARY KEY, v int NULL); INSERT INTO dbo.Dt27Key VALUES (''2026-01-01 10:00:00.1234567'', 1), (''9999-12-31 23:59:59.9999999'', 2)');
+
+statement ok
+SELECT mssql_exec('dt27n', 'DROP TABLE IF EXISTS dbo.Dt27Uq; CREATE TABLE dbo.Dt27Uq (k datetime2(7) NOT NULL PRIMARY KEY, u int NOT NULL UNIQUE, v int NULL); INSERT INTO dbo.Dt27Uq VALUES (''2026-01-01 10:00:00.1234567'', 1, 1), (''2026-01-01 10:00:00.1234568'', 2, 2)');
+
+statement ok
+SELECT mssql_exec('dt27n', 'DROP TABLE IF EXISTS dbo.Dt27Heap; CREATE TABLE dbo.Dt27Heap (d7 datetime2(7) NULL, v int NULL); INSERT INTO dbo.Dt27Heap VALUES (''2026-01-01 10:00:00.1234567'', 1), (''2026-01-01 10:00:00.1234568'', 2)');
+
+statement ok
+SELECT mssql_exec('dt27n', 'DROP TABLE IF EXISTS dbo.Dt27Same; CREATE TABLE dbo.Dt27Same (id int NOT NULL, d7 datetime2(7) NULL); INSERT INTO dbo.Dt27Same VALUES (1, ''9999-12-31 23:59:59.9999999''), (2, ''9999-12-31 23:59:59.9999999''), (3, ''9999-12-31 23:59:59.9999999'')');
+
+statement ok
+SELECT mssql_invalidate_cache('dt27n');
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dt27u (TYPE mssql, datetime2_7_as 'timestamp');
+
+# =============================================================================
+# The types
+# =============================================================================
+
+query TTT
+SELECT typeof(n.d7), typeof(u.d7), typeof(u.d6) FROM dt27n.dbo.Dt27 n, dt27u.dbo.Dt27 u WHERE n.id = 1 AND u.id = 1;
+----
+TIMESTAMP_NS	TIMESTAMP	TIMESTAMP
+
+# A raw scan reads datetime2 as TIMESTAMP whatever the catalog says (unchanged)
+query T
+SELECT typeof(d7) FROM mssql_scan('dt27u', 'SELECT d7 FROM dbo.Dt27 WHERE id = 1');
+----
+TIMESTAMP
+
+# =============================================================================
+# The values
+# =============================================================================
+
+# TIMESTAMP_NS: every tick; 9999-12-31 and 0001-01-01 read as NULL (#168)
+query IT
+SELECT id, d7 FROM dt27n.dbo.Dt27 WHERE id IN (2, 5, 6) ORDER BY id;
+----
+2	2026-01-01 10:00:00.1234561
+5	NULL
+6	NULL
+
+# TIMESTAMP: the whole range, the seventh digit dropped
+query IT
+SELECT id, d7 FROM dt27u.dbo.Dt27 ORDER BY id;
+----
+1	2026-01-01 10:00:00.123456
+2	2026-01-01 10:00:00.123456
+3	2026-01-01 10:00:00.123456
+4	2026-01-01 10:00:00.123457
+5	9999-12-31 23:59:59.999999
+6	0001-01-01 00:00:00
+7	NULL
+
+# =============================================================================
+# The warning: once per column, as the scan meets a value it reads as NULL
+# =============================================================================
+
+statement ok
+SET enable_logging = true;
+
+statement ok
+SELECT * FROM dt27n.dbo.Dt27;
+
+statement ok
+SELECT * FROM dt27n.dbo.Dt27;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%column "d7" holds datetime2(7) values outside 1677-2262%mssql_datetime2_7_as%';
+----
+2
+
+# d6 is datetime2(6), read as TIMESTAMP: it holds 9999-12-31 and is not warned about
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%column "d6"%';
+----
+0
+
+# a LIMIT ends the scan early: the warning is logged as it is met, not at the end
+statement ok
+SELECT d7 FROM dt27n.dbo.Dt27 WHERE id = 5 LIMIT 1;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%column "d7" holds datetime2(7)%';
+----
+3
+
+# read as TIMESTAMP: nothing to warn about
+statement ok
+SELECT * FROM dt27u.dbo.Dt27;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%column "d7" holds datetime2(7)%';
+----
+3
+
+# a catalog scan stopped by DuckDB's LIMIT (remote pushdown off: no TOP sent), before the stream's end
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dt27c (TYPE mssql, remote_pushdown false);
+
+statement ok
+SELECT d7 FROM dt27c.dbo.Dt27 WHERE id >= 5 LIMIT 1;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%column "d7" holds datetime2(7)%';
+----
+4
+
+# every value of a chunk the same and out of range: the column is published as one constant
+statement ok
+SELECT d7 FROM dt27c.dbo.Dt27Same;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%column "d7" holds datetime2(7)%';
+----
+5
+
+# in a transaction the scan (here a pushed one, with LIMIT) is materialised at init: warned there
+statement ok
+BEGIN;
+
+statement ok
+SELECT d7 FROM dt27n.dbo.Dt27 ORDER BY id LIMIT 10;
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%column "d7" holds datetime2(7)%';
+----
+6
+
+statement ok
+SET enable_logging = false;
+
+# =============================================================================
+# Filters on the truncated read: as DuckDB decides over the values it reads
+# =============================================================================
+
+query IIIIII
+SELECT (SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 = TIMESTAMP '2026-01-01 10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 <> TIMESTAMP '2026-01-01 10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 < TIMESTAMP '2026-01-01 10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 <= TIMESTAMP '2026-01-01 10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 > TIMESTAMP '2026-01-01 10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 >= TIMESTAMP '2026-01-01 10:00:00.123456');
+----
+[1, 2, 3]	[4, 5, 6]	[6]	[1, 2, 3, 6]	[4, 5]	[1, 2, 3, 4, 5]
+
+# the sentinel's last microsecond: 10000-01-01 is never sent
+query III
+SELECT (SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 = TIMESTAMP '9999-12-31 23:59:59.999999'), (SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 > TIMESTAMP '9999-12-31 23:59:59.999999'), (SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 >= TIMESTAMP '9999-12-31 23:59:59.999999');
+----
+[5]	NULL	[5]
+
+# IN and BETWEEN
+query II
+SELECT (SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 IN (TIMESTAMP '2026-01-01 10:00:00.123457', TIMESTAMP '0001-01-01')), (SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 BETWEEN TIMESTAMP '2026-01-01 10:00:00.123456' AND TIMESTAMP '2026-01-01 10:00:00.123456');
+----
+[4, 6]	[1, 2, 3]
+
+# as literals (mssql_scan_parameterize_filters off): the same answers
+statement ok
+SET mssql_scan_parameterize_filters = false;
+
+query II
+SELECT (SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 = TIMESTAMP '2026-01-01 10:00:00.123456'), (SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 > TIMESTAMP '2026-01-01 10:00:00.123456');
+----
+[1, 2, 3]	[4, 5]
+
+statement ok
+RESET mssql_scan_parameterize_filters;
+
+query I
+SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 NOT IN (TIMESTAMP '2026-01-01 10:00:00.123456');
+----
+[4, 5, 6]
+
+# the filter is pushed as the range, not left to DuckDB
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dt27cu (TYPE mssql, datetime2_7_as 'timestamp', remote_pushdown false);
+
+query I
+SELECT list(id ORDER BY id) FROM dt27cu.dbo.Dt27 WHERE d7 = TIMESTAMP '2026-01-01 10:00:00.123456';
+----
+[1, 2, 3]
+
+# the server compiled the rewritten statement (EXPLAIN does not show what a catalog scan pushes)
+query I
+SELECT n > 0 FROM mssql_scan('dt27cu', 'SELECT count(*) AS n FROM sys.dm_exec_cached_plans p CROSS APPLY sys.dm_exec_sql_text(p.plan_handle) t WHERE CHARINDEX(N''[d7] >= @p0 AND [d7] < @p1'', t.text) > 0 AND CHARINDEX(N''Dt27'', t.text) > 0');
+----
+true
+
+# against another column: stays with DuckDB (two stored values 100 ns apart are one read value)
+query I
+SELECT list(id ORDER BY id) FROM dt27u.dbo.Dt27 WHERE d7 = d6;
+----
+[1, 5]
+
+# =============================================================================
+# Keys: a datetime2(7) read in microseconds identifies no row
+# =============================================================================
+
+# Not pushed whole (mssql_dml_pushdown off), so the statement needs the rowid key
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+UPDATE dt27n.dbo.Dt27Key SET v = v + 10 WHERE v = 1;
+
+statement error
+UPDATE dt27u.dbo.Dt27Key SET v = v + 10 WHERE v = 2;
+----
+datetime2(7)
+
+statement error
+DELETE FROM dt27u.dbo.Dt27Key WHERE v = 2;
+----
+datetime2(7)
+
+query II
+SELECT v, k IS NULL FROM dt27n.dbo.Dt27Key ORDER BY v;
+----
+2	true
+11	false
+
+# the primary key is datetime2(7): the unique index on u keys the rows instead
+statement ok
+UPDATE dt27u.dbo.Dt27Uq SET v = v + 10 WHERE u = 2;
+
+query I
+SELECT list(v ORDER BY u) FROM dt27n.dbo.Dt27Uq;
+----
+[1, 12]
+
+# a heap with no key and a datetime2(7) column: keyed by all its columns read as TIMESTAMP_NS,
+# refused read in microseconds
+statement ok
+UPDATE dt27n.dbo.Dt27Heap SET v = v + 10 WHERE v = 1;
+
+statement error
+UPDATE dt27u.dbo.Dt27Heap SET v = v + 10 WHERE v = 2;
+----
+keyed by all its columns
+
+query I
+SELECT list(v ORDER BY v) FROM dt27n.dbo.Dt27Heap;
+----
+[2, 11]
+
+# a staged MERGE whose ON compares the column: refused by name
+statement error
+MERGE INTO dt27u.dbo.Dt27Heap AS t USING (SELECT TIMESTAMP '2026-01-01 10:00:00.123456' AS k) AS s ON t.d7 = s.k WHEN MATCHED THEN UPDATE SET v = 0;
+----
+datetime2(7)
+
+statement ok
+RESET mssql_dml_pushdown;
+
+# pushed whole, the server keys the rows itself: the read type does not matter
+statement ok
+UPDATE dt27u.dbo.Dt27Key SET v = v + 10 WHERE v = 2;
+
+query I
+SELECT list(v ORDER BY v) FROM dt27n.dbo.Dt27Key;
+----
+[11, 12]
+
+# =============================================================================
+# The setting and the option
+# =============================================================================
+
+statement ok
+SET mssql_datetime2_7_as = 'timestamp';
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dt27s (TYPE mssql);
+
+statement ok
+RESET mssql_datetime2_7_as;
+
+# read at ATTACH: the reset does not change the catalog attached before it
+query TT
+SELECT typeof(s.d7), typeof(n.d7) FROM dt27s.dbo.Dt27 s, dt27n.dbo.Dt27 n WHERE s.id = 1 AND n.id = 1;
+----
+TIMESTAMP	TIMESTAMP_NS
+
+# the option wins over the setting
+statement ok
+SET mssql_datetime2_7_as = 'timestamp';
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS dt27o (TYPE mssql, datetime2_7_as 'timestamp_ns');
+
+statement ok
+RESET mssql_datetime2_7_as;
+
+query T
+SELECT typeof(d7) FROM dt27o.dbo.Dt27 WHERE id = 1;
+----
+TIMESTAMP_NS
+
+statement error
+ATTACH '{MSSQL_TESTDB_DSN}' AS dt27bad (TYPE mssql, datetime2_7_as 'nanoseconds');
+----
+datetime2_7_as must be 'timestamp_ns'
+
+# refused at SET, so a typo does not fail every later ATTACH
+statement error
+SET mssql_datetime2_7_as = 'micros';
+----
+mssql_datetime2_7_as must be 'timestamp_ns'
+
+# The connection's own: a connection string, a URI, a secret -- and the ATTACH option over them
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN};Datetime2_7_As=timestamp' AS dt27cs (TYPE mssql);
+
+statement ok
+ATTACH '{MSSQL_TESTDB_URI}&datetime27as=timestamp' AS dt27uri (TYPE mssql);
+
+statement ok
+CREATE SECRET dt27_secret (TYPE mssql, host '{MSSQL_TEST_HOST}', port {MSSQL_TEST_PORT}, database 'TestDB', user '{MSSQL_TEST_USER}', password '{MSSQL_TEST_PASS}', trust_server_certificate true, datetime2_7_as 'timestamp');
+
+statement ok
+ATTACH '' AS dt27sec (TYPE mssql, SECRET dt27_secret);
+
+statement ok
+ATTACH '' AS dt27secopt (TYPE mssql, SECRET dt27_secret, datetime2_7_as 'timestamp_ns');
+
+# an explicit '' on the ATTACH clears the secret's: the setting (default timestamp_ns) decides
+statement ok
+ATTACH '' AS dt27secclr (TYPE mssql, SECRET dt27_secret, datetime2_7_as '');
+
+# the option over a connection string's
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN};Datetime2_7_As=timestamp' AS dt27csopt (TYPE mssql, datetime2_7_as 'timestamp_ns');
+
+query TTTTTT
+SELECT (SELECT typeof(d7) FROM dt27cs.dbo.Dt27 WHERE id = 1), (SELECT typeof(d7) FROM dt27uri.dbo.Dt27 WHERE id = 1), (SELECT typeof(d7) FROM dt27sec.dbo.Dt27 WHERE id = 1), (SELECT typeof(d7) FROM dt27secopt.dbo.Dt27 WHERE id = 1), (SELECT typeof(d7) FROM dt27secclr.dbo.Dt27 WHERE id = 1), (SELECT typeof(d7) FROM dt27csopt.dbo.Dt27 WHERE id = 1);
+----
+TIMESTAMP	TIMESTAMP	TIMESTAMP	TIMESTAMP_NS	TIMESTAMP_NS	TIMESTAMP_NS
+
+statement error
+ATTACH '{MSSQL_TESTDB_DSN};Datetime2_7_As=micros' AS dt27bad (TYPE mssql);
+----
+datetime2_7_as of the connection's secret, connection string or URI must be 'timestamp_ns'
+
+statement ok
+CREATE SECRET dt27_bad_secret (TYPE mssql, host '{MSSQL_TEST_HOST}', port {MSSQL_TEST_PORT}, database 'TestDB', user '{MSSQL_TEST_USER}', password '{MSSQL_TEST_PASS}', trust_server_certificate true, datetime2_7_as 'nanos');
+
+statement error
+ATTACH '' AS dt27bad (TYPE mssql, SECRET dt27_bad_secret);
+----
+datetime2_7_as of the connection's secret, connection string or URI must be 'timestamp_ns'
+
+statement ok
+DROP SECRET dt27_bad_secret;
+
+statement ok
+DETACH dt27cs;
+
+statement ok
+DETACH dt27uri;
+
+statement ok
+DETACH dt27sec;
+
+statement ok
+DETACH dt27secopt;
+
+statement ok
+DETACH dt27secclr;
+
+statement ok
+DETACH dt27csopt;
+
+statement ok
+DROP SECRET dt27_secret;
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+
+statement ok
+SELECT mssql_exec('dt27n', 'DROP TABLE IF EXISTS dbo.Dt27; DROP TABLE IF EXISTS dbo.Dt27Key; DROP TABLE IF EXISTS dbo.Dt27Uq; DROP TABLE IF EXISTS dbo.Dt27Heap; DROP TABLE IF EXISTS dbo.Dt27Same');
+
+statement ok
+DETACH dt27cu;
+
+statement ok
+DETACH dt27c;
+
+statement ok
+DETACH dt27o;
+
+statement ok
+DETACH dt27s;
+
+statement ok
+DETACH dt27u;
+
+statement ok
+DETACH dt27n;

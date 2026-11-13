@@ -158,7 +158,10 @@ struct BulkLoadStage {
 
 class MSSQLMetadataCache {
 public:
-	explicit MSSQLMetadataCache(int64_t ttl_seconds = 0);
+	//! `datetime2_read`: the catalog's, fixed at ATTACH (spec 093 D8): the type its datetime2(7)
+	//! columns and keys are read as. A cache made without a catalog (tests) reads them as TIMESTAMP_NS.
+	explicit MSSQLMetadataCache(int64_t ttl_seconds = 0,
+								MSSQLDatetime2Read datetime2_read = MSSQLDatetime2Read::Nanoseconds);
 	~MSSQLMetadataCache() = default;
 
 	// Non-copyable
@@ -456,8 +459,9 @@ private:
 	const MSSQLCatalogFilter *filter_ = nullptr;		  // Set once at catalog init, before any concurrency
 	unordered_map<string, MSSQLSchemaMetadata> schemas_;  // Cached schemas
 	std::chrono::steady_clock::time_point last_refresh_;  // Last refresh timestamp (backward compat)
-	int32_t database_code_page_ = 0;  // COLLATIONPROPERTY(database collation, 'CodePage'), issue #361
-	string database_collation_;		  // Database default collation
+	int32_t database_code_page_ = 0;		   // COLLATIONPROPERTY(database collation, 'CodePage'), issue #361
+	string database_collation_;				   // Database default collation
+	const MSSQLDatetime2Read datetime2_read_;  // The catalog's, fixed at ATTACH (spec 093 D8)
 
 	// Atomics, NOT guarded by mutex_ (issue #178 D4): written by EnsureCacheLoaded
 	// on every catalog lookup while loaders concurrently read them mid-query

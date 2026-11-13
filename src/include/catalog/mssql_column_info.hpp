@@ -16,6 +16,16 @@ struct CodePageTable;
 }  // namespace codec
 }  // namespace mssql
 
+//! How a `datetime2(7)` column is read (spec 093 D8, DQ-44): `mssql_datetime2_7_as` or the
+//! connection's `datetime2_7_as` (ATTACH option, secret, connection string, URI), fixed per catalog at ATTACH.
+//! Nanoseconds: TIMESTAMP_NS, every 100 ns tick, a value outside 1677-2262 NULL. Microseconds: TIMESTAMP over the whole
+//! 0001-9999 range, the 100 ns digit truncated -- read, compared and keyed as `time(7)` / `datetimeoffset(7)` are.
+enum class MSSQLDatetime2Read : uint8_t { Nanoseconds, Microseconds };
+
+//! `'timestamp_ns'` / `'timestamp'` (any case, trimmed); an InvalidInputException naming `source` for
+//! anything else.
+MSSQLDatetime2Read ParseDatetime2Read(const string &value, const string &source);
+
 //===----------------------------------------------------------------------===//
 // MSSQLColumnInfo - Column metadata including SQL Server-specific information
 //===----------------------------------------------------------------------===//
@@ -57,10 +67,15 @@ struct MSSQLColumnInfo {
 	// Default constructor
 	MSSQLColumnInfo();
 
-	// Constructor from SQL Server metadata
+	// Constructor from SQL Server metadata. `datetime2_read`: the catalog's answer (no default: a
+	// datetime2(7) column's type follows it).
 	MSSQLColumnInfo(const string &name, int32_t column_id, const string &sql_type_name, int16_t max_length,
 					uint8_t precision, uint8_t scale, bool is_nullable, const string &collation_name,
-					const string &database_collation);
+					const string &database_collation, MSSQLDatetime2Read datetime2_read);
+
+	//! A datetime2 column read with its 100 ns digit truncated (MSSQLDatetime2Read::Microseconds at scale 7):
+	//! not one-to-one, so compared and keyed as time(7) is. Asked of the column's read type.
+	bool ReadsDatetime2Truncated() const;
 
 	// Parse collation name to extract sensitivity flags
 	static bool IsCaseSensitiveCollation(const string &collation_name);
@@ -114,7 +129,7 @@ struct MSSQLColumnInfo {
 	LogicalType NativeDuckDBType() const;
 
 	static LogicalType MapSQLServerTypeToDuckDB(const string &sql_type_name, int16_t max_length, uint8_t precision,
-												uint8_t scale);
+												uint8_t scale, MSSQLDatetime2Read datetime2_read);
 
 	// The two spatial CLR UDTs, by name. ONE predicate, because four things key
 	// on the same pair and they have to agree: the catalog sets `is_geometry`

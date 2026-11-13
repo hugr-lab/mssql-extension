@@ -89,7 +89,7 @@ void MSSQLCatalog::InvalidateTableEntry(const string &schema_name, const string 
 }
 
 unique_ptr<MSSQLMetadataCache> MSSQLCatalog::CreateTransactionMetadataCache(ClientContext &context) {
-	auto cache = make_uniq<MSSQLMetadataCache>(0);
+	auto cache = make_uniq<MSSQLMetadataCache>(0, startup_.datetime2_read);
 	if (catalog_filter_.HasFilters()) {
 		cache->SetFilter(&catalog_filter_);
 	}
