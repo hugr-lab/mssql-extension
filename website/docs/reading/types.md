@@ -119,8 +119,29 @@ comparison pushes down to the server as a `varbinary` parameter.
 | `DATETIME2(0)`      | `TIMESTAMP_S`   | Scale-precise mapping (spec 045) |
 | `DATETIME2(1-3)`    | `TIMESTAMP_MS`  | |
 | `DATETIME2(4-6)`    | `TIMESTAMP`     | Microseconds |
-| `DATETIME2(7)`      | `TIMESTAMP_NS`  | Round-trips losslessly |
+| `DATETIME2(7)`      | `TIMESTAMP_NS`  | Every 100 ns tick, 1677–2262; or `TIMESTAMP` with `datetime2_7_as` (below) |
 | `DATETIMEOFFSET`    | `TIMESTAMP_TZ`  | Timezone-aware               |
+
+**`datetime2(7)`** (the default scale) counts 100 ns ticks over 0001–9999. DuckDB's
+`TIMESTAMP_NS` keeps every tick but holds only 1677–2262, so a value outside it -- a temporal
+table's `9999-12-31 23:59:59.9999999` `ValidTo`, a `0001-01-01` -- is read as NULL, and each scan
+that meets one logs a `WARNING` into `duckdb_logs`, once per column. To read the whole range, set
+`mssql_datetime2_7_as = 'timestamp'` before ATTACH, or give the connection `datetime2_7_as 'timestamp'` (an
+ATTACH option, a secret parameter, `Datetime2_7_As=timestamp` in a connection string or
+`datetime2_7_as=timestamp` in a URI):
+the catalog then reads such a column as `TIMESTAMP`, the 100 ns digit truncated, as it reads
+`time(7)` and `datetimeoffset(7)`. Read at ATTACH, for the catalog's life. What changes with it:
+
+- A filter on the column decides as DuckDB does over the values it reads (`= c` matches every
+  stored value from `c` to the next microsecond); against another column it runs in DuckDB.
+- The column no longer identifies a row: a table whose primary key holds it uses another unique
+  index; a table with no usable key and such a column -- a heap with a `datetime2(7)` column, say --
+  can no longer be keyed by all its columns. Their row-by-row UPDATE / DELETE, and a MERGE whose `ON`
+  compares the column, are refused by name; a statement pushed to the server whole is not affected.
+- A value written through the column's type drops its seventh digit too: a table created from it
+  (CTAS, COPY) gets `datetime2(6)`, and an UPDATE or INSERT that DuckDB evaluates writes microseconds.
+
+A raw `mssql_scan` reads any `datetime2` as `TIMESTAMP`, whatever the setting.
 
 ### Special Types
 

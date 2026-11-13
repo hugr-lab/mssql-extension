@@ -162,7 +162,17 @@ public:
 	//! first time was the one shape that said nothing.
 	void SurfaceWarnings(ClientContext &context);
 
+	//! A warning the stream found while filling a chunk and has not logged yet (spec 093 D8: a
+	//! datetime2 value read as NULL for not fitting TIMESTAMP_NS). A scan's Execute asks after every
+	//! FillChunk and calls SurfaceWarnings when it is true, so a query that stops early still says it.
+	bool HasPendingWarnings() const {
+		return warnings_pending_;
+	}
+
 private:
+	//! Notes `rows` values of column `c` read as NULL for not fitting their target (once per column).
+	void NoteOutOfRange(idx_t c, idx_t rows);
+
 	// Read more data from connection into parser
 	// timeout_ms: socket receive timeout in milliseconds
 	bool ReadMoreData(int timeout_ms);
@@ -234,6 +244,10 @@ private:
 	// already, and whether the one-shot column warnings have been emitted.
 	size_t info_surfaced_ = 0;
 	bool collations_warned_ = false;
+	//! Spec 093 D8: per column, 1 once a datetime2 value of it was read as NULL (not fitting
+	//! TIMESTAMP_NS), 2 once that was logged; and whether any is still to be logged.
+	std::vector<uint8_t> out_of_range_;
+	bool warnings_pending_ = false;
 	bool is_catalog_scan_ = false;
 
 	// Statistics

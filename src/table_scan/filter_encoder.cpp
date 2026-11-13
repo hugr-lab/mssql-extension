@@ -321,14 +321,15 @@ static const MSSQLColumnInfo *ColumnInfoByName(const std::string &name, const Ex
 	return nullptr;
 }
 
-//! time(7) / datetimeoffset(7): read as microseconds, their 100 ns digit
-//! TRUNCATED (ConvertTime / ConvertDatetimeOffset). Unlike a datetime's read,
+//! time(7) / datetimeoffset(7) -- and a datetime2(7) its catalog reads in
+//! microseconds (spec 093 D8) --: read as microseconds, their 100 ns digit
+//! TRUNCATED (ConvertTime / ConvertDatetimeOffset / Datetime2WireToNativeUnit). Unlike a datetime's read,
 //! not one-to-one: .1234567 and .1234561 are two values there and one here.
 //! The rowid key choice's question too (read, but not round-trip exact), so
 //! the two cannot disagree on which columns these are.
 static bool IsTruncatedReadColumn(const MSSQLColumnInfo *column) {
-	return column && IsRoundTripExactForKey(column->sql_type_name, column->scale, column->is_cast_required) ==
-						 KeyFidelity::NotRoundTrip;
+	return column && IsRoundTripExactForKey(column->sql_type_name, column->scale, column->is_cast_required,
+											column->ReadsDatetime2Truncated()) == KeyFidelity::NotRoundTrip;
 }
 
 //! IS [NOT] NULL on the filter's own column: what a column read through a cast may still push
@@ -509,14 +510,15 @@ static bool LossyOperandsPushable(const Expression &subject, const vector<const 
 	return true;
 }
 
-//! Issue #426: `column OP c` for a time(7) / datetimeoffset(7) column, as
+//! Issue #426: `column OP c` for a time(7) / datetimeoffset(7) column (and a datetime2(7) read in
+//! microseconds, spec 093 D8, its constant a TIMESTAMP), as
 //! DuckDB decides it over the read value -- the stored value with its 100 ns
 //! digit dropped, so the read equals c for every stored value in
 //! [c, c + 1 us). `=` is that range, `<>` its complement, `>` starts at
 //! c + 1 us, `<=` ends before it; `>=` and `<` are the stored values' own.
 //! Constants declared from the column (time(7) / datetimeoffset(7)). At the
 //! top of the type's range c + 1 us does not exist (24:00:00,
-//! 10000-01-01) and is never sent: what lies beyond it is nothing, so `>`
+//! 10000-01-01, for datetime2 too) and is never sent: what lies beyond it is nothing, so `>`
 //! is false and `<=` true for every row -- written `k <> k` / `k = k`, NULL
 //! for a NULL as the comparison is. False -- not pushed -- for a constant
 //! the server cannot hold (ServerHoldsTemporal) or of another type.
@@ -524,7 +526,10 @@ static bool TruncatedReadComparison(const std::string &column_sql, ExpressionTyp
 									const ExpressionEncodeContext &ctx, const MSSQLColumnInfo &column,
 									std::string &out) {
 	const auto id = constant.type().id();
-	if (constant.IsNull() || (id != LogicalTypeId::TIME && id != LogicalTypeId::TIMESTAMP_TZ) ||
+	// The constant of the column's own read type (TIME, TIMESTAMP_TZ, TIMESTAMP): a naive TIMESTAMP
+	// beside a datetimeoffset would be sent as +00:00 where DuckDB compares in the session's zone.
+	if (constant.IsNull() || id != column.duckdb_type.id() ||
+		(id != LogicalTypeId::TIME && id != LogicalTypeId::TIMESTAMP_TZ && id != LogicalTypeId::TIMESTAMP) ||
 		!codec::datetime::ServerHoldsTemporal(constant)) {
 		return false;
 	}
@@ -534,9 +539,13 @@ static bool TruncatedReadComparison(const std::string &column_sql, ExpressionTyp
 		const auto micros = TimeValue::Get(constant).value + 1;
 		next_exists = micros < Interval::MICROS_PER_DAY;
 		next = Value::TIME(dtime_t(micros));
-	} else {
+	} else if (id == LogicalTypeId::TIMESTAMP_TZ) {
 		const auto micros = TimestampValue::Get(constant).value + 1;
 		next = Value::TIMESTAMPTZ(timestamp_tz_t(micros));
+		next_exists = codec::datetime::ServerHoldsTemporal(next);
+	} else {
+		const auto micros = TimestampValue::Get(constant).value + 1;
+		next = Value::TIMESTAMP(timestamp_t(micros));
 		next_exists = codec::datetime::ServerHoldsTemporal(next);
 	}
 	auto constant_ctx = ctx.child();

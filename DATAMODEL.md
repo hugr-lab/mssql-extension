@@ -722,6 +722,20 @@ UTF8SUPPORT (`MSSQLCatalog::UTF8SupportObserved`, which never borrows a connecti
 as not granted), is read as `CAST(col AS NCHAR(n))`, and past 4000 as
 `RTRIM(CAST(col AS NVARCHAR(MAX)))`.
 
+**`datetime2(7)` is read in one of two forms per catalog (spec 093 D8).** The kernel writes a
+datetime2 into whatever TIMESTAMP variant its vector is (`Datetime2WireToNativeUnit`): TIMESTAMP_NS
+keeps every 100 ns tick and reads a value outside 1677-2262 as NULL (#168); TIMESTAMP truncates the
+seventh digit over the whole range. Which one a catalog's `datetime2(7)` columns are is
+`mssql_datetime2_7_as` (or the connection's `datetime2_7_as`: ATTACH option, secret, connection
+string, URI), fixed at ATTACH
+(`MSSQLCatalog::Datetime2Read`) and given to the metadata cache, so the column's type and the rowid
+key's agree. Under `'timestamp'` the column is time(7)'s case wherever a read must equal the stored
+value -- keys, MERGE ON, the 079 writer's grouping, filters -- asked of the column's read type
+(`MSSQLColumnInfo::ReadsDatetime2Truncated`). Under the default, the values the kernel reads as NULL
+are counted per chunk (`RowStager::ChunkOutOfRange`: the mask's NULLs before the staged validity is
+ANDed in) and the stream logs one `WARNING` per column as it meets one
+(`HasPendingWarnings`, asked after every chunk, so a LIMIT still says it).
+
 ### Reading a column's collation
 
 `ColumnMetadata` carries all five wire bytes of the TDS collation

@@ -73,6 +73,10 @@ struct MSSQLCatalogStartup {
 	//! which wins) as it stood at ATTACH. One catalog must not mix the two forms:
 	//! the raw-scan types and the describe cache would disagree.
 	bool client_transcode = true;
+	//! Spec 093 D8: mssql_datetime2_7_as (or the connection's datetime2_7_as -- the
+	//! ATTACH option, a secret, a connection string, a URI -- which wins) as it stood at ATTACH -- the type this
+	//! catalog's datetime2(7) columns are read as for its life (column types, keys, filters, the 079 vehicle's types).
+	MSSQLDatetime2Read datetime2_read = MSSQLDatetime2Read::Nanoseconds;
 	//! The `native_types` ATTACH option: 1 / 0 over mssql_catalog_native_types
 	//! for this catalog's life, -1 = unset (the setting decides, read where it
 	//! always was). DuckLake's METADATA_PARAMETERS reaches ATTACH options, not
@@ -379,6 +383,10 @@ public:
 	//! client (spec 092 D4)? Fixed at ATTACH.
 	bool ClientTranscode() const {
 		return startup_.client_transcode;
+	}
+	//! How this catalog reads datetime2(7) (spec 093 D8). Fixed at ATTACH.
+	MSSQLDatetime2Read Datetime2Read() const {
+		return startup_.datetime2_read;
 	}
 	//! Records a logged-in connection's answer when none is cached yet -- a
 	//! lazily validated ATTACH learns it from its first connection (#405).

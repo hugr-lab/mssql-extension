@@ -934,6 +934,9 @@ static void TableScanExecute(ClientContext &context, TableFunctionInput &data, D
 				global_state.result_stream->SurfaceWarnings(context);
 				break;
 			}
+			if (global_state.result_stream->HasPendingWarnings()) {
+				global_state.result_stream->SurfaceWarnings(context);  // as met: a LIMIT may end the scan here
+			}
 			if (global_state.rowid_requested) {
 				// Populate rowid vector from PK columns
 				PopulateRowIdVector(global_state, output, rows);
