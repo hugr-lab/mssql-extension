@@ -1002,16 +1002,34 @@ offsets above are in its fixed part.
   i32.
 
 **LOBs and row-overflow** (X§4, E1 `LobReader`):
-- A complex variable column starts with its kind: 2 = row-overflow / text pointer, 24 bytes (u32
-  update counter +4, u32 length +12, root RID +16); 4 or 5 = in-row root: 12-byte header (u32 update
-  counter `ts` +4), then 12-byte links `u32 cumulative size, u32 page, u16 file, u16 slot`.
-- A LOB fragment record (statusA 0x08): u16 length @2, u64 blob id @4, u16 type @12: 0 SMALL_ROOT
-  (u16 size @14, data @20), 2 INTERNAL (u16 maxlinks @14, curlinks @16, level @18, 16-byte links @20:
-  `u64 cumulative size, u32 page, u16 file, u16 slot`), 3 DATA (data from 14 to the record length),
-  5 LARGE_ROOT (12-byte links @24).
-- The rebuilt value is checked at every node: a node's bytes equal the length its parent claims.
-- Legacy `text` / `ntext` / `image` hold a 16-byte text pointer in row (W§6); **unverified** (E1§6:
-  not tested), so these types are behind an oracle test before they ship.
+- A complex variable column holds one of three forms (E21): 16 bytes is always the root pointer (its
+  first byte is a blob id's low byte, not a kind); 24 bytes is row-overflow (kind 2) or an in-row root
+  of one link (kind 4), told apart by the first byte:
+  - 24 bytes of kind 2, **row-overflow** (bounded types only): u32 update counter +4, u32 length +12,
+    the RID of one DATA fragment +16, on the rowset's ROW_OVERFLOW_DATA unit;
+  - 12 + 12n bytes of kind 4, an **in-row root**: a 12-byte header (byte 2 the level: 0, the links name
+    DATA fragments; above, INTERNAL nodes; u32 update counter `ts` +4), then up to 5 links `u32
+    cumulative size, u32 page, u16 file, u16 slot`, on the LOB_DATA unit (kind 5, never seen in row, is
+    accepted as the catalog reader accepts it);
+  - 16 bytes, a **pointer to a root record**: u64 blob id (the root's own @4), u32 page, u16 file, u16
+    slot, on the LOB_DATA unit. `text` / `ntext` / `image` with text in row off use it for every value,
+    an empty one included; MAX columns with `large value types out of row` = 1 too, for values written
+    after the option was set.
+- With text in row on (limit L) a `text` / `ntext` / `image` value of up to L bytes is plain bytes in
+  row when the row has room, and otherwise an in-row root. One table can hold every form: an option
+  changes only the values written, or the columns updated, after it; text in row OFF converts the
+  inline values and in-row roots to root pointers at once.
+- A LOB fragment record (statusA 0x08, length 84 for a root): u16 length @2, u64 blob id @4, u16 type
+  @12: 0 SMALL_ROOT (u16 size @14, at most 64 bytes, data @20), 2 INTERNAL (u16 maxlinks @14, curlinks
+  @16, level @18, about 500 16-byte links @20: `u64 cumulative size, u32 page, u16 file, u16 slot`),
+  3 DATA (data from 14 to the record length, at most 8,040 bytes), 5 LARGE_ROOT (maxlinks 5 @14,
+  curlinks @16, level @18, 12-byte links @24), 8 NULL (only as a root). E21.
+- **A NULL `text` / `image` (and presumably `ntext`) can be not NULL in the null bitmap**: an UPDATE
+  to NULL keeps the 16-byte pointer, leaves the null bit clear and rewrites the root as type 8, whose
+  size bytes are stale. Its NULL is the root's, read by fragment type before any size (E21). A MAX
+  value behind a root pointer updated to NULL has its null bit set.
+- The rebuilt value is checked at every node: a node's bytes equal the length its parent claims. A
+  character can straddle two fragments (E21), so a value is assembled before it is decoded.
 
 **Value encodings that differ from TDS** (W§7, X§4):
 
