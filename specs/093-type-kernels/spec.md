@@ -11,8 +11,9 @@ ROW / PAGE compression, sparse columns, MS-BINXML and the `json` spike.
 
 Markers: **[spec]** a Microsoft open specification (MS-TDS, MS-SSCLRT, MS-BCP); **[doc]** Microsoft
 Learn product documentation; **[measure]** to be measured on a throwaway container before the PR that
-depends on it (§ Experiments); **(derived)** a rule this spec derives from an owner decision rather
-than one the owner stated, open to review.
+depends on it (§ Experiments); **[measured]** measured on one, recorded in `measured/<id>.md`;
+**(derived)** a rule this spec derives from an owner decision rather than one the owner stated, open
+to review.
 
 ## Problem
 
@@ -21,7 +22,7 @@ Today, by type:
 | SQL Server | `TYPE mssql` read | raw `mssql_scan` | write | backup (085) |
 |---|---|---|---|---|
 | `sql_variant` | `VARCHAR`, through a `CASE` over `SQL_VARIANT_PROPERTY(…, 'BaseType')` with CONVERT styles (#542, `src/catalog/mssql_column_info.cpp:589-598`); the base type is lost, and the server spends 8.8× the CPU of a plain cast | **refused**: COLMETADATA type `0x62` is not parsed (`src/tds/tds_column_metadata.cpp:438`) and the describe refuses it at bind | statement path only, as a string literal, so the server stores an `nvarchar` base type; BCP refused | `BLOB`, its stored bytes |
-| `vector(n)` (2025) | **unreadable** (#363): `sys.columns` says `varbinary`, so the catalog declares `BLOB`; the server sends `varchar(max)` JSON, and the stream fails its shape check | `VARCHAR`, the JSON text | none (`src/codec/type_family.cpp:127` throws for `ARRAY`) | `BLOB` labelled `converted`: the reader takes the system type from the xtype, `varbinary`, so its `vector` test never fires (**[measure]**, finding of the recon) |
+| `vector(n)` (2025) | **unreadable** (#363): `sys.columns` says `varbinary`, so the catalog declares `BLOB`; the server sends `varchar(max)` JSON, and the stream fails its shape check | `VARCHAR`, the JSON text | none (`src/codec/type_family.cpp:127` throws for `ARRAY`) | `BLOB` labelled `converted`: the reader takes the system type from the xtype, `varbinary`, so its `vector` test never fires (finding of the recon, measured in V4) |
 | `geometry` | `GEOMETRY`, no CRS, through `.STAsBinary()` (`mssql_column_info.cpp:561-563`): 2D only, Z and M dropped, server CPU per value | **refused** (UDT `0xF0` not parsed) | statement path: `geometry::STGeomFromWKB(0x…, 0)`, SRID fixed at 0 (`WrapSpatialLiteral`, `src/dml/insert/mssql_value_serializer.cpp:92-112`); COPY / INSERT BULK / staged DML refused (`BulkWireCanCarry`); CTAS creates `VARBINARY(MAX)` (`type_family.cpp:108-113`) | `BLOB` |
 | `geography` | as geometry, indistinguishable from it | **refused** | as geometry, SRID fixed at 4326 | `BLOB` |
 | `hierarchyid` | `VARCHAR` through `CAST(… AS NVARCHAR(MAX))` | **refused** | string literal (the server parses it); BCP refused | `BLOB` |
@@ -229,29 +230,68 @@ column.
 
 ### D4: `vector(n)` → `FLOAT[n]`
 
-- **Negotiation.** LOGIN7 FeatureExt `0x0E` VECTORSUPPORT, version 2 (float32 and float16); the
-  FEATUREEXTACK echoes the version **[spec]** (MS-TDS 2.2.6.4, 2.2.7.11). The ack parser already skips
-  unknown ids by length, so the request is safe on every server. A setting `mssql_vector_support`
-  (default `true`) turns the request off, as `mssql_utf8_support` does **(derived)**.
-- **Wire.** VECTORTYPE `0xF5`, USHORTLEN; TYPE_INFO's SCALE is the element type; a value is an
-  8-byte header (`A9 01`, u16 dims, u8 element type, 3 zero bytes) and the little-endian elements
-  **[spec]** (2.2.5.5.7). The order of the TYPE_INFO bytes is **[measure]** V1.
+- **Negotiation.** LOGIN7 FeatureExt `0x0E` VECTORSUPPORT, requesting version 2 (float32 and
+  float16) **[spec]** (MS-TDS 2.2.6.4, 2.2.7.11). The ack parser already skips unknown ids by length,
+  so the request is safe on every server.
+  - A setting `mssql_vector_support` (default `true`) turns the request off, as
+    `mssql_utf8_support` does **(derived)**.
+  - It is read once per catalog at ATTACH, as `mssql_client_transcode` is **(derived)**, so the
+    logins of one catalog's pool ask alike.
+  - SQL Server 2025 17.0.5035.5 acknowledges a request for version 1, 2 or 3 with **version 1**. A
+    login that requests version 0 is dropped with no error token **[measured]** V1.
+  - The acknowledged version is kept per connection.
+- **Wire.** The type is VECTORTYPE `0xF5`, and its TYPE_INFO is `<USHORT max length> <BYTE element
+  type>` (0 = float32, 1 = float16) **[measured]** V1.
+  - A value is a USHORT length and exactly the column's number of bytes **[measured]** V1. A NULL
+    is `0xFFFF` **[spec]**, which the bulk path takes **[measured]** V6.
+  - Those bytes are an 8-byte header and the little-endian elements: `A9 01`, the dims as a u16, the
+    element type as a u8, three zero bytes. They are the same bytes a backup stores (V4).
+- **Form per column.** COLMETADATA decides, column by column.
+  - Under version 1, a float32 column streams `0xF5`, and a float16 column streams the JSON form
+    below **[measured]** V1. The float16 `0xF5` read form was not seen: no version above 1 was
+    acknowledged.
+  - Every form carries UserType 255: a column, an alias, a `CAST(… AS vector(n))` and an `ISNULL`
+    over it **[measured]** V1. A raw scan therefore recognises a vector from COLMETADATA alone.
+  - n is `(max length − 8) / element size`.
 - **Catalog type.** `ARRAY(FLOAT, n)`. The metadata queries name a column's type by
   `ISNULL(TYPE_NAME(c.system_type_id), …)` (`mssql_metadata_cache.cpp:205, 237`,
-  `mssql_primary_key.cpp:61`), which says `varbinary` for a vector; they gain the user type's name
-  when it is `vector`. n and the element type come from `sys.columns` (`max_length` is `8 + 4n` for
-  float32, `8 + 2n` for float16); whether 2025 exposes the element type directly is **[measure]** V5.
-  A float16 vector widens to `FLOAT` exactly.
-- **Without the feature** (a server that does not acknowledge it): the column is still declared
-  `FLOAT[n]`, read as its JSON text, and parsed on the client. The server prints 8 significant digits
-  and a float32 needs 9 to round-trip, so this form may be inexact **[measure]** V2. A one-line
-  `WARNING` per catalog says so if V2 confirms it.
-- **The describe trap** **[doc]**: `sp_describe_first_result_set` "doesn't correctly return the vector
-  data type". A raw `mssql_scan` described as `varchar(max)` that streams `0xF5` is a tolerated
-  mismatch, as the UTF-8 one is (V3).
-- **Write.** The statement path sends `CAST(N'[…]' AS vector(n))` with 9 significant digits (`%.9g`),
-  exact for float32. COPY and INSERT BULK send `0xF5` if V6 shows the server takes it, else the JSON
-  text as `nvarchar(max)`. A CTAS or COPY creates `vector(n)` from `FLOAT[n]` (n ≤ 1998) on a server
+  `mssql_primary_key.cpp:61`), which says `varbinary` for a vector. They gain the user type's name
+  when it is `vector` (`user_type_id` 255).
+  - The element type is `sys.columns.scale` (0 or 1). n is `(max_length − 8) / (scale = 1 ? 2 :
+    4)` **[measured]** V5.
+  - 2025's `vector_dimensions` / `vector_base_type_desc` say the same, but the queries do not name
+    them, because the query text must also compile on 2017–2022.
+  - An alias type over `vector` cannot exist: Msg 42212 **[measured]** V5.
+  - A float16 vector widens to `FLOAT` exactly.
+- **Without the feature, and for float16 under version 1,** the column is still declared `FLOAT[n]`.
+  - It arrives as `varchar(max)` PLP text under `Latin1_General_100_BIN2_UTF8`, as `[e1,…]` with each
+    element printed `%.7e`. It is parsed on the client.
+  - **float32 is inexact** **[measured]** V2. 8 significant digits do not identify every float32.
+    Two neighbouring values print as the same text, and about 1.5 % of float32 values read back as a
+    neighbour, one ulp (unit in the last place) away.
+  - **float16 is exact** **(derived)**: 8 digits are more than float16 needs, and the values V2
+    tried print exactly.
+  - A one-line `WARNING` per catalog says so the first time a float32 vector is read this way.
+- **The describe.** **[doc]** says `sp_describe_first_result_set` "doesn't correctly return the
+  vector data type".
+  - The procedure and `sys.dm_exec_describe_first_result_set` follow the session **[measured]** V3.
+    On a session that acknowledged the feature, a float32 column is `vector(n)` (165 / 255, max
+    length 20 for n = 3). A float16 column is `varchar(max)` on every session, as is any vector on
+    a session without the feature.
+  - In each case it names the form that session streams. With the setting fixed per catalog, one
+    catalog's describe and stream agree. A stream that still differs is the existing shape-check
+    error (for example, after a failover to another build).
+- **Write.** The statement path sends `CAST(N'[…]' AS vector(n))` with 9 significant digits
+  (`%.9g`), which is exact for float32 **(derived)** from V2.
+  - COPY, INSERT BULK and `#stage` declare `vector(n)` / `vector(n, float16)` in the INSERT BULK
+    statement. They send each value's bytes, the header and the elements, as `varbinary(length)`
+    (`0xA5`) on every session **(derived)**. No JSON is needed.
+  - The server takes `0xA5` with the feature and without it, float32 and float16 alike, and stores
+    the bytes as sent **[measured]** V6.
+  - `0xF5` would work only on a session that acknowledged the feature (4816 otherwise), so one
+    form covers both.
+  - A wrong length is the server's 7347, and a bad header its 42206 **[measured]** V6.
+- **CTAS.** A CTAS or COPY creates `vector(n)` from `FLOAT[n]` (n ≤ 1998) on a server
   that has the type (2025, Azure SQL), and refuses by name elsewhere. `DOUBLE[n]` is refused with the
   fix named (`::FLOAT[n]`) **(derived)**: a narrowing the user should write.
 - Filters on a vector are never pushed, and it is never a key (D2).
@@ -341,8 +381,14 @@ Slightly breaking: a `DESCRIBE` says `JSON`.
 ### D9: the backup's use of the kernels
 
 `TypeReading` and `MetadataOf` gain one call into a new `src/backup/backup_type_forms.cpp`, which
-maps a catalog column to its kernel: the disk envelope for `sql_variant`; `vector` detected by its user
-type (255) and `type_name`, not the xtype; the CLR system types by name; a user CLR type stays `BLOB`.
+maps a catalog column to its kernel:
+- the disk envelope for `sql_variant`;
+- `vector`, detected by its user type (255) and `type_name`, not the xtype. In `syscolpars` it has
+  xtype 165 and utype 255, `scale` is the element type and `length` is `8 + n × element size`. The
+  stored bytes are the `0xF5` wire value's (V4);
+- the CLR system types, by name;
+- a user CLR type, which stays `BLOB`.
+
 The stager keeps its `Bytes` arm, so no new staging arm is needed. A spatial or `sql_variant` value
 that went off row is assembled by PR 3 before the kernel sees it. The state column of
 `mssql_backup_columns` says `converted` for each type once its kernel is hooked.
@@ -375,12 +421,12 @@ the PR it decides.
 
 | # | for | what | decides |
 |---|---|---|---|
-| V1 | T3 | LOGIN7 with VECTORSUPPORT v1 / v2; `SELECT v` from `vector(3)` and `vector(3, float16)` | the `0xF5` TYPE_INFO byte order; the float16 element byte |
+| V1 | T3 | LOGIN7 with VECTORSUPPORT v0 – v3; `SELECT v` from `vector(3)` and `vector(3, float16)`, and expressions over it | the acknowledged version; the `0xF5` TYPE_INFO byte order; the float16 form; UserType |
 | V2 | T3 | the same without the feature: the text of 1.0, 0.1, 3.4028235e38, denormals, −0.0 | whether the JSON fallback is exact |
-| V3 | T3 | `sp_describe_first_result_set` on `SELECT v` with the feature negotiated | the tolerated describe / stream mismatch |
+| V3 | T3 | `sp_describe_first_result_set` on `SELECT v`, float32 and float16, with and without the feature | whether the describe and the stream agree |
 | V4 | T8 | a backup of `vector(3)` and `vector(3, float16)`: syscolpars xtype / utype / length, the stored bytes | u32 vs u8 + reserved element type on disk; the backup's vector detection |
 | V5 | T3 | `sys.columns` and `sys.types` for vector columns on 2025 | how the element type is known |
-| V6 | T3 | INSERT BULK into a vector column with `0xF5`, and with `nvarchar(max)` JSON | the bulk form |
+| V6 | T3 | INSERT BULK into a vector column with `0xF5`, `varbinary` and JSON text, with and without the feature | the bulk form |
 | S1 | T1 | `sql_variant` over TDS: one row per base type, char padding, code-page / UTF-8 / SC collations, decimal(38,x), datetime2(7) 9999-12-31, time(7) with a 100 ns digit, datetimeoffset +14:00 | envelope test vectors; the char trim |
 | S2 | T2 | INSERT BULK with `0x62` in COLMETADATA | the bulk encoder for `VARIANT` |
 | G1 | T5 | every OGC type, EMPTY of each, holes, collections, Z, M, ZM, CircularString, CompoundCurve, CurvePolygon, `FullGlobe`, as `CAST(g AS varbinary(max))`, `STAsBinary()`, `AsBinaryZM()`, `STAsText()` | kernel output equal to `AsBinaryZM()` byte for byte (to `STAsBinary()` without Z / M); the curve and FullGlobe bytes |
@@ -445,8 +491,8 @@ it carries DQ-44, decided after the split.
 |---|---|---|
 | **T0** | D2's split of `is_cast_required` (no behaviour change); TYPE_INFO and row framing for `0x62` and `0xF0`, the raw-scan refusal naming the type; experiment G2 (`measured/G2.md`). #557 | 2–3 |
 | **T1** | `sql_variant` read as `VARIANT` (D3): both envelopes, the kernel, catalog / raw scan / describe / `column_types` / RETURNING; S1; `fuzz_variant_envelope` | 5–6 |
-| **T2** | `sql_variant` write (D3): literals, refusals, the bulk encoder if S2 passes; CTAS | 3–4 |
-| **T3** | `vector(n)` as `FLOAT[n]` (D4): the `0xF5` TYPE_INFO and row framing (moved from T0: the server sends it only under VECTORSUPPORT, and V1 measures its byte order), VECTORSUPPORT, `mssql_vector_support`, the kernel, the JSON fallback, writes, CTAS / COPY; V1–V6; the 2025 CI job; `fuzz_vector` | 4.5–5.5 |
+| **T2** | `sql_variant` write (D3): literals, refusals, the bulk encoder (S2: INSERT BULK takes `0x62` with the row envelope); CTAS | 3–4 |
+| **T3** | `vector(n)` as `FLOAT[n]` (D4): the `0xF5` TYPE_INFO and row framing (moved from T0: the server sends it only under VECTORSUPPORT), VECTORSUPPORT, `mssql_vector_support`, the kernel, the JSON fallback (float16 under version 1, every vector without the feature), writes (the bytes as `varbinary` on the bulk path), CTAS / COPY; V1–V6 (measured); the 2025 CI job; `fuzz_vector` | 4.5–5.5 |
 | **T4** | `hierarchyid` on the client (D5); H1; `fuzz_hierarchyid`; a user CLR type read as `BLOB` in a raw scan (moved from T0: testing how the describe reports one needs a CLR assembly, built in a .NET SDK container) | 2–3 |
 | **T5** | spatial read (D6): the MS-SSCLRT kernel, bare read, `GEOMETRY('OGC:CRS84')`, the curve error, `geometry_as`; G1, G3, G6, D1; `fuzz_ssclrt` | 5–7 |
 | **T6** | spatial write (D6): SRID from the CRS, the stage, client MS-SSCLRT for geometry if G4 passes, CTAS creates `geometry`; G4, G7 | 4–5 |
@@ -463,10 +509,9 @@ it carries DQ-44, decided after the split.
 - **The geography CRS downstream**: `OGC:CRS84` is built in and GeoParquet's default; whether
   DuckLake keeps it on a geometry column is D1.
 - **Z / M values change** for anyone who reads them today (they were dropped). Documented as breaking.
-- **The vector JSON fallback** may be inexact (V2); then a server without VECTORSUPPORT reads vectors
-  within one float32 ulp, and the warning says so.
-- **sql_variant bulk load** may not exist (S2); then COPY of a `VARIANT` is refused by name and
-  INSERT takes the statement path, slower for large loads.
+- **The vector JSON fallback** is inexact for float32 (V2: about 1.5 % of values a neighbour away).
+  A server without VECTORSUPPORT reads them so, and the warning says so. The bulk write sends the
+  bytes and is exact either way (V6).
 - **MS-SSCLRT version 2 details** (FullGlobe's bytes, segment forms) are known only from the spec
   until G1; the kernel refuses what G1 did not show.
 - **`datetime2_7_as = 'timestamp'`** makes a datetime2(7) key lossy, as `time(7)` is: such a key
