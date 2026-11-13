@@ -17,6 +17,7 @@
 #pragma once
 
 #include "backup/backup_catalog_model.hpp"
+#include "backup/backup_lob.hpp"
 #include "backup/backup_record.hpp"
 #include "backup/backup_system_tables.hpp"
 #include "codec/staging/column_ops.hpp"
@@ -59,14 +60,29 @@ public:
 	//! column's default and the physical places can differ by partition). A column the layout does not
 	//! hold where its type says, or a default of another width, is a FormatError naming it.
 	void UseLayout(const RowsetLayout &layout);
+	//! Where a value stored off row is read from (PR 3, backup_lob): pages through `fetch` (which must
+	//! outlive the stager's use of it), on the units of the partition whose records are appended from
+	//! now on -- set for every partition, since partitions sharing a layout have units of their own.
+	void UseOffRow(const LobPageFetch *fetch, const LobUnits &units);
+	//! Build each row's `_mssql_lob` map (LastRowLobMap): every value of the row stored off row,
+	//! projected or not. Off: no map is built.
+	void MapOffRow(bool on);
+	//! The map of the row Append staged last (backup_lob_map's bytes); empty when the row has no value
+	//! stored off row (the column is NULL) or MapOffRow is off.
+	const std::string &LastRowLobMap() const {
+		return row_lob_map_;
+	}
+	//! The longest value stored off row the stager assembles: a LOB's 2^31 - 1 bytes.
+	static constexpr uint64_t MAX_OFF_ROW_BYTES = 2147483647ull;
 	//! Start a chunk that FinalizeChunk will publish into `targets` (one flat, empty vector of Types()
 	//! per column, in order), or into `out`'s first Types().size() vectors.
 	void BeginChunk(const std::vector<Vector *> &targets);
 	void BeginChunk(DataChunk &out);
 	//! Stage one record of the layout's rowset (a primary or a forwarded record). A value stored off
-	//! row (row-overflow, a LOB) is a FormatError naming the column until PR 3; a record the layout
-	//! does not fit is LocateValue's FormatError. After a throw the chunk holds part of a row: the next
-	//! Append or FinalizeChunk without a BeginChunk first is an InternalException, never a row shifted.
+	//! row (row-overflow, a LOB tree, a text pointer) is assembled into its column's staging through
+	//! UseOffRow's pages (a NULL root is NULL); a malformed one is WalkLob's FormatError naming the
+	//! column. A record the layout does not fit is LocateValue's FormatError. After a throw the chunk holds part of a
+	//! row: the next Append or FinalizeChunk without a BeginChunk first is an InternalException, never a row shifted.
 	void Append(const RecordView &record);
 	idx_t Count() const {
 		return count_;
@@ -115,6 +131,9 @@ private:
 	};
 
 	void AppendValue(Column &c, codec::staging::ColumnStaging &st, const ValueRef &v);
+	void AppendOffRow(Column &c, codec::staging::ColumnStaging &st, const ValueRef &v);
+	void MapRow(const RecordView &record, size_t var_count);
+	const LobPageFetch &Fetch(const std::string &what) const;
 
 	std::string table_;
 	std::vector<Column> columns_;
@@ -122,6 +141,17 @@ private:
 	codec::staging::StagingArena arena_;
 	std::vector<Vector *> targets_;
 	const RowsetLayout *layout_ = nullptr;
+	const LobPageFetch *fetch_ = nullptr;
+	LobUnits units_;
+	bool map_off_row_ = false;
+	//! The layout's variable columns, for the map, ascending catalog column id.
+	struct MapColumn {
+		size_t layout_index;
+		int32_t column_id;
+		std::string name;  // table.column, for errors
+	};
+	std::vector<MapColumn> map_columns_;
+	std::string row_lob_map_;
 	idx_t count_ = 0;
 	idx_t payload_bytes_ = 0;
 	//! The variable values staged in this chunk, as staged (a UTF-16 one with its delimiter).

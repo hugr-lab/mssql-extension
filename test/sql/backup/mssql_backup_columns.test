@@ -3,7 +3,7 @@
 # group: [mssql]
 #
 # The samples are synthetic (test/backup/gen/samples.sql): every column of dbo.items and dbo.events is
-# converted. The other states (stored_bytes, off_row_pending, not_stored, storage_format) are tested on
+# converted. The other states (stored_bytes, not_stored, storage_format) are tested on
 # the catalog model's synthetic columns (test_backup_catalog_model.cpp: StateOf); the oracle lane
 # compares the columns, sql_type and system_type with the server's catalog (compare_catalog.py: the
 # catalog fixture's alias type code_t over varchar(12) among them). No SQL Server is needed.

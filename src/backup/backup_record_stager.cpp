@@ -2,11 +2,13 @@
 
 #include "backup/backup_collation.hpp"
 #include "backup/backup_function_common.hpp"
+#include "backup/backup_lob_map.hpp"
 #include "codec/code_page/code_page.hpp"
 #include "codec/staging/row_stager.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace duckdb {
@@ -47,6 +49,22 @@ tds::ColumnMetadata MetadataOf(const CatalogColumn &c) {
 	}
 	return m;
 }
+
+// Where a value walked off row goes: straight into its column's staging, leaf by leaf, the value
+// begun at its first byte (a NULL root has none), and its nodes kept when the row's map wants them.
+class StagingSink : public LobSink {
+public:
+	explicit StagingSink(ColumnStaging &st_p) : st(st_p) {}
+	ColumnStaging &st;
+	bool begun = false;
+	void Data(const uint8_t *data, size_t size) override {
+		if (!begun) {
+			st.BeginVar();
+			begun = true;
+		}
+		std::memcpy(st.ExtendVar(static_cast<uint32_t>(size)), data, size);
+	}
+};
 
 // A column read as its stored bytes (ReadingOf's `raw`): a varbinary of its declared length, which the
 // binary kernel publishes as they are.
@@ -133,7 +151,10 @@ RecordStager::RecordStager(const CatalogTable &table, const std::vector<int32_t>
 		Column col;
 		col.column_id = id;
 		col.name = table_ + "." + c.name;
-		col.declared_bytes = c.max_length < 0 ? IN_ROW_BYTES : static_cast<uint32_t>(c.max_length);
+		// text / ntext / image declare 16 bytes (their pointer), but text in row keeps up to 7,000 in the row.
+		const bool legacy_lob =
+			c.system_type_id == XTYPE_TEXT || c.system_type_id == XTYPE_NTEXT || c.system_type_id == XTYPE_IMAGE;
+		col.declared_bytes = c.max_length < 0 || legacy_lob ? IN_ROW_BYTES : static_cast<uint32_t>(c.max_length);
 		const ColumnReading reading = ReadingOf(c);
 		if (!reading.readable) {
 			throw InvalidInputException("backup: %s: %s", col.name, reading.note);
@@ -242,7 +263,93 @@ void RecordStager::UseLayout(const RowsetLayout &layout) {
 		columns_[i].layout_index = places[i].first;
 		columns_[i].bit_position = places[i].second;
 	}
+	// The map's columns: every variable column of the rowset, projected or not (DQ-46), by catalog id.
+	map_columns_.clear();
+	for (size_t k = 0; k < layout.columns.size(); k++) {
+		const PhysicalColumn &p = layout.columns[k];
+		if (p.offset < 0 && !p.Dropped() && !p.Uniquifier()) {
+			map_columns_.push_back(MapColumn{k, p.rscolid, table_ + "." + p.name});
+		}
+	}
+	std::sort(map_columns_.begin(), map_columns_.end(),
+			  [](const MapColumn &a, const MapColumn &b) { return a.column_id < b.column_id; });
 	layout_ = &layout;
+}
+
+void RecordStager::UseOffRow(const LobPageFetch *fetch, const LobUnits &units) {
+	fetch_ = fetch;
+	units_ = units;
+}
+
+void RecordStager::MapOffRow(bool on) {
+	map_off_row_ = on;
+}
+
+const LobPageFetch &RecordStager::Fetch(const std::string &what) const {
+	if (!fetch_) {
+		throw InternalException("backup: %s is stored off row, and the stager was given no pages to read it from",
+								what);
+	}
+	return *fetch_;
+}
+
+void RecordStager::AppendOffRow(Column &c, ColumnStaging &st, const ValueRef &v) {
+	if (c.arm != StageArm::Utf16 && c.arm != StageArm::Bytes) {
+		throw FormatError("backup: " + c.name + " is a fixed-width column whose value is marked as stored off row");
+	}
+	const OffRowPointer pointer = ParseOffRowPointer(v.data, v.size, c.name);
+	StagingSink sink(st);
+	const LobValue value = WalkLob(Fetch(c.name), pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink);
+	if (value.is_null) {
+		st.AppendNull();
+		return;
+	}
+	if (!sink.begun) {
+		st.BeginVar();	// an empty value
+	}
+	if (c.arm == StageArm::Utf16) {
+		if (value.length & 1) {
+			throw FormatError("backup: " + c.name + " holds " + std::to_string(value.length) +
+							  " bytes off row, not a whole number of UTF-16 units");
+		}
+		st.FinishVarDelimited();
+		payload_bytes_ += c.budget_weight * (value.length + 2);
+		staged_bytes_ += value.length + 2;
+		return;
+	}
+	st.FinishVar();
+	payload_bytes_ += c.budget_weight * value.length;
+	staged_bytes_ += value.length;
+}
+
+void RecordStager::MapRow(const RecordView &record, size_t var_count) {
+	row_lob_map_.clear();
+	std::vector<LobMapEntry> entries;
+	for (const auto &mc : map_columns_) {
+		const ValueRef v = LocateValue(record, var_count, *layout_, mc.layout_index);
+		if (v.state != ValueState::OffRow) {
+			continue;
+		}
+		const std::string &what = mc.name;
+		LobMapEntry e;
+		e.column_id = static_cast<uint32_t>(mc.column_id);
+		const OffRowPointer pointer = ParseOffRowPointer(v.data, v.size, what);
+		e.form = pointer.form;
+		e.pointer.assign(reinterpret_cast<const char *>(v.data), v.size);
+		LobNodeList nodes;
+		const LobValue value = WalkLob(Fetch(what), pointer, units_, LobWalk::MapOnly, MAX_OFF_ROW_BYTES, what, nodes);
+		e.is_null = value.is_null;
+		e.length = static_cast<uint32_t>(value.length);
+		e.nodes = std::move(nodes.nodes);
+		entries.push_back(std::move(e));
+	}
+	if (!entries.empty()) {
+		AppendLobMap(entries, table_, row_lob_map_);
+		// The map is staged for the chunk too (the scan keeps it until the chunk is written): it counts
+		// toward Full() like a value, so a chunk of deep trees' maps closes on its bytes (review of S3).
+		payload_bytes_ += row_lob_map_.size();
+		staged_bytes_ += row_lob_map_.size();
+	}
 }
 
 void RecordStager::BeginChunk(DataChunk &out) {
@@ -357,13 +464,15 @@ void RecordStager::Append(const RecordView &record) {
 			AppendValue(c, st, v);
 			break;
 		case ValueState::OffRow:
-			throw FormatError("backup: " + c.name +
-							  " holds a value stored off row (row-overflow or a LOB), which the reader reads from spec "
-							  "085 PR 3; leave the column out of the projection to read the others");
+			AppendOffRow(c, st, v);
+			break;
 		case ValueState::Default:
 			AppendValue(c, st, v);
 			break;
 		}
+	}
+	if (map_off_row_) {
+		MapRow(record, var_count);
 	}
 	spoiled_ = false;
 	count_++;

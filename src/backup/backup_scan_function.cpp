@@ -53,7 +53,10 @@ const char *const FUNCTION = "mssql_backup_scan";
 const column_t PAGE_COLUMN = VIRTUAL_COLUMN_START;
 const column_t RID_COLUMN = VIRTUAL_COLUMN_START + 1;
 const column_t PAGE_LSN_COLUMN = VIRTUAL_COLUMN_START + 2;
-//! The columns the scan cannot read (no stored value, a sparse one, text / ntext / image until PR 3) are
+//! PR 3 (task 20, DQ-46): the row's values stored off row and their trees (backup_lob_map), NULL when
+//! it has none.
+const column_t LOB_COLUMN = VIRTUAL_COLUMN_START + 3;
+//! The columns the scan cannot read (no stored value, a sparse one) are
 //! virtual from here on: `SELECT *` leaves them out, and naming one refuses the query by name, with
 //! its reason (owner, review of #552).
 const column_t UNREAD_COLUMN_START = VIRTUAL_COLUMN_START + 16;
@@ -168,7 +171,7 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 	// An unread column is a virtual one only when its name is no other column's: a readable column and
 	// the service columns win, and the binder must not pick among equal names (review of #552).
 	auto taken = [&](const std::string &name) {
-		for (const char *service : {"_mssql_page", "_mssql_rid", "_mssql_page_lsn"}) {
+		for (const char *service : {"_mssql_page", "_mssql_rid", "_mssql_page_lsn", "_mssql_lob"}) {
 			if (StringUtil::CIEquals(name, service)) {
 				return true;
 			}
@@ -318,6 +321,7 @@ virtual_column_map_t VirtualColumns(ClientContext &, optional_ptr<FunctionData> 
 	result.insert(make_pair(PAGE_COLUMN, TableColumn("_mssql_page", LogicalType::VARCHAR)));
 	result.insert(make_pair(RID_COLUMN, TableColumn("_mssql_rid", LogicalType::BLOB)));
 	result.insert(make_pair(PAGE_LSN_COLUMN, TableColumn("_mssql_page_lsn", LogicalType::DECIMAL(25, 0))));
+	result.insert(make_pair(LOB_COLUMN, TableColumn("_mssql_lob", LogicalType::BLOB)));
 	return result;
 }
 
@@ -333,6 +337,7 @@ constexpr size_t MAX_UNIT_PAGES = 2048;
 struct PartitionCursor {
 	const CatalogPartition *partition = nullptr;
 	const SysAllocUnit *unit = nullptr;
+	LobUnits off_row;  // its LOB_DATA and ROW_OVERFLOW_DATA units, 0 where it has none
 	std::vector<PagePointer> pages;
 	std::vector<size_t> key;  // layout indexes of the clustered key, in ordkey order
 	bool has_uniquifier = false;
@@ -350,6 +355,7 @@ struct ScanGlobalState : public GlobalTableFunctionState {
 	idx_t page_output = DConstants::INVALID_INDEX;
 	idx_t rid_output = DConstants::INVALID_INDEX;
 	idx_t lsn_output = DConstants::INVALID_INDEX;
+	idx_t lob_output = DConstants::INVALID_INDEX;
 	std::vector<idx_t> empty_outputs;  // COLUMN_IDENTIFIER_EMPTY (count(*)): a constant NULL
 
 	std::mutex claim;
@@ -380,6 +386,7 @@ struct ScanGlobalState : public GlobalTableFunctionState {
 struct ScanLocalState : public LocalTableFunctionState {
 	std::unique_ptr<RecordStager> stager;
 	const RowsetLayout *layout = nullptr;  // the stager's (UseLayout), to switch only between partitions
+	LobPageFetch off_row_fetch;			   // the stager's pages for values stored off row (live ones only)
 
 	std::shared_ptr<const PartitionCursor> cursor;	// of the unit being read
 	idx_t batch = 0;								// the unit's batch index
@@ -396,6 +403,7 @@ struct ScanLocalState : public LocalTableFunctionState {
 	std::vector<std::string> page_keys;
 	std::vector<std::string> rids;
 	std::vector<hugeint_t> lsns;
+	std::vector<std::string> lob_maps;	// empty: NULL
 };
 
 // Partition `p`'s cursor: its in-row unit, the pages its IAM chain lists (in page order, each once),
@@ -405,12 +413,30 @@ PartitionCursor BuildPartition(const ScanBindData &data, const CatalogPartition 
 	PartitionCursor cursor;
 	cursor.partition = &p;
 	for (const auto &u : data.entry->units) {
-		if (u.unit.owner_id == p.rowset_id && u.unit.type == 1) {
-			if (cursor.unit) {
-				throw FormatError("backup: " + data.schema + "." + data.table + "'s partition " +
-								  std::to_string(p.partition_number) + " has two in-row allocation units");
-			}
+		if (u.unit.owner_id != p.rowset_id) {
+			continue;
+		}
+		// Each kind once: a rowset's in-row, LOB and row-overflow units (E21: a rebuilt partition owns
+		// its own, a LOB unit kept), the units a pointer of its rows may name.
+		const char *kind = u.unit.type == 1	  ? "in-row"
+						   : u.unit.type == 2 ? "LOB"
+						   : u.unit.type == 3 ? "row-overflow"
+											  : nullptr;
+		if (!kind) {
+			continue;
+		}
+		const bool twice = (u.unit.type == 1 && cursor.unit) || (u.unit.type == 2 && cursor.off_row.lob) ||
+						   (u.unit.type == 3 && cursor.off_row.row_overflow);
+		if (twice) {
+			throw FormatError("backup: " + data.schema + "." + data.table + "'s partition " +
+							  std::to_string(p.partition_number) + " has two " + kind + " allocation units");
+		}
+		if (u.unit.type == 1) {
 			cursor.unit = &u.unit;
+		} else if (u.unit.type == 2) {
+			cursor.off_row.lob = u.unit.auid;
+		} else {
+			cursor.off_row.row_overflow = u.unit.auid;
 		}
 	}
 	if (!cursor.unit) {
@@ -467,6 +493,11 @@ uint64_t VirtualRowBytes(const ScanGlobalState &global) {
 	if (global.lsn_output != DConstants::INVALID_INDEX) {
 		bytes += sizeof(hugeint_t);
 	}
+	if (global.lob_output != DConstants::INVALID_INDEX) {
+		// The map's entries for a row of in-row roots and row-overflow pointers; a deep tree's nodes are
+		// reserved with its value (S4).
+		bytes += sizeof(std::string) + 256;
+	}
 	return bytes;
 }
 
@@ -482,6 +513,8 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 			state->rid_output = c;
 		} else if (id == PAGE_LSN_COLUMN) {
 			state->lsn_output = c;
+		} else if (id == LOB_COLUMN) {
+			state->lob_output = c;
 		} else if (id == COLUMN_IDENTIFIER_EMPTY) {
 			state->empty_outputs.push_back(c);
 		} else if (id >= UNREAD_COLUMN_START && id - UNREAD_COLUMN_START < data.unread.size()) {
@@ -546,13 +579,26 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 	return std::move(state);
 }
 
-unique_ptr<LocalTableFunctionState> InitLocal(ExecutionContext &, TableFunctionInitInput &input,
+unique_ptr<LocalTableFunctionState> InitLocal(ExecutionContext &execution, TableFunctionInitInput &input,
 											  GlobalTableFunctionState *global_state) {
 	const auto &data = input.bind_data->Cast<ScanBindData>();
 	const auto &global = global_state->Cast<ScanGlobalState>();
 	auto local = make_uniq<ScanLocalState>();
 	local->stager = make_uniq<RecordStager>(*data.entry, global.staged);
 	local->stager->LimitBytes(global.chunk_allowance, global.virtual_row);
+	const PageStore &store = *data.catalog->pages->store;
+	const std::string fragment = "a fragment of a value of " + data.schema + "." + data.table + " stored off row";
+	// A value's walk asks for interruption every 256 fragments: one 2 GiB value is about 267,000 of
+	// them, read between two of the scan's own checks (NextPage's, per in-row page; review of S3).
+	ClientContext *context = &execution.client;
+	auto fetched = std::make_shared<uint32_t>(0);
+	local->off_row_fetch = [&store, fragment, context, fetched](const PagePointer &at, Page &out) {
+		if ((++*fetched & 255) == 0 && context->IsInterrupted()) {
+			throw InterruptException();
+		}
+		store.ReadLive(at.file, at.page, out, fragment.c_str());
+	};
+	local->stager->MapOffRow(global.lob_output != DConstants::INVALID_INDEX);
 	return std::move(local);
 }
 
@@ -603,6 +649,8 @@ bool ClaimUnit(const ScanBindData &data, ScanGlobalState &global, ScanLocalState
 		local.stager->UseLayout(layout);
 		local.layout = &layout;
 	}
+	// Every claim: partitions sharing a layout have units of their own.
+	local.stager->UseOffRow(&local.off_row_fetch, local.cursor->off_row);
 	return true;
 }
 
@@ -789,6 +837,18 @@ void WriteVirtual(const ScanGlobalState &global, ScanLocalState &local, DataChun
 			out[i] = local.lsns[i];
 		}
 	}
+	if (global.lob_output != DConstants::INVALID_INDEX) {
+		Vector &v = output.data[global.lob_output];
+		auto *out = FlatVector::GetDataMutable<string_t>(v);
+		auto &validity = FlatVector::ValidityMutable(v);
+		for (idx_t i = 0; i < count; i++) {
+			if (local.lob_maps[i].empty()) {
+				validity.SetInvalid(i);
+			} else {
+				out[i] = StringVector::AddStringOrBlob(v, local.lob_maps[i]);
+			}
+		}
+	}
 }
 
 hugeint_t LsnNumber(const Lsn &lsn) {
@@ -820,6 +880,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		local.page_keys.clear();
 		local.rids.clear();
 		local.lsns.clear();
+		local.lob_maps.clear();
 		while (!local.stager->Full()) {
 			if (!local.have_unit) {
 				// A chunk holds one unit's rows: its batch index is the unit's. The next unit is claimed
@@ -859,6 +920,9 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 			}
 			if (global.lsn_output != DConstants::INVALID_INDEX) {
 				local.lsns.push_back(LsnNumber(local.page.header.lsn));
+			}
+			if (global.lob_output != DConstants::INVALID_INDEX) {
+				local.lob_maps.push_back(local.stager->LastRowLobMap());
 			}
 		}
 		const idx_t count = local.stager->Count();
@@ -918,9 +982,11 @@ void RegisterBackupScanFunction(ExtensionLoader &loader) {
 		loader, std::move(set),
 		{{},
 		 "Reads a user table's rows from a SQL Server full backup, with no SQL Server, typed as TYPE mssql reads "
-		 "them; a type whose conversion is still to come is its stored bytes. Virtual columns: _mssql_page (the "
-		 "row's page), _mssql_rid (its identity: a heap row's original place, a clustered row's key) and "
-		 "_mssql_page_lsn (the page's last change). Parallel on DuckDB's threads; max_threads := n uses fewer, "
+		 "them, values stored off row (LOBs, row-overflow, text) included; a type whose conversion is still to "
+		 "come is its stored bytes. Virtual columns: _mssql_page (the row's page), _mssql_rid (its identity: a "
+		 "heap row's original place, a clustered row's key), _mssql_page_lsn (the page's last change) and "
+		 "_mssql_lob (the row's off-row values and their trees, NULL when it has none). Parallel on DuckDB's threads; "
+		 "max_threads := n uses fewer, "
 		 "max_memory := '2GB' bounds what it "
 		 "reserves for decoding.",
 		 {"SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'dbo', 'orders')",
