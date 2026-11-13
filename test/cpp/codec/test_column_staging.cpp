@@ -446,6 +446,31 @@ void TestBoundStopsGrowth() {
 	CHECK_EQ(wide.payload_bound, static_cast<idx_t>(0), "over-budget bound is not used");
 }
 
+void TestReserveMoreGrowsWithinSlack() {
+	std::cout << "[9] ReserveMore: doubling, within RESERVE_SLACK_BYTES of the need (spec 085 PR 3 S7)..." << std::endl;
+	ColumnStaging col;
+	col.Configure(StagingKind::Var, 0);
+	col.BeginChunk(nullptr);
+	const idx_t grows_before = col.grow_events;
+	std::vector<uint8_t> value(10000, 0x41);
+	for (int i = 0; i < 1000; i++) {
+		col.ReserveMore(value.size());
+		col.BeginVar();
+		std::memcpy(col.ExtendVar(static_cast<uint32_t>(value.size())), value.data(), value.size());
+		col.FinishVar();
+	}
+	CHECK_TRUE(col.grow_events - grows_before < 30,
+			   "1000 values of 10 KB: the buffer grows a few dozen times, not once a value");
+	CHECK_TRUE(col.buffer.size() <= col.payload_used + ColumnStaging::RESERVE_SLACK_BYTES,
+			   "... and holds at most the slack past what is staged");
+	const idx_t used = col.payload_used;
+	const idx_t large = 64ull << 20;
+	col.ReserveMore(large);
+	CHECK_TRUE(
+		col.buffer.size() >= used + large && col.buffer.size() <= used + large + ColumnStaging::RESERVE_SLACK_BYTES,
+		"a 64 MiB value: room for it and at most the slack, not twice the buffer");
+}
+
 }  // namespace
 
 int main() {
@@ -462,6 +487,7 @@ int main() {
 		TestWatermarkRetainsThenReleases();
 		TestColumnOpsResolution();
 		TestBoundStopsGrowth();
+		TestReserveMoreGrowsWithinSlack();
 	} catch (const std::exception &e) {
 		std::cerr << "UNCAUGHT EXCEPTION: " << e.what() << std::endl;
 		return 2;

@@ -25,6 +25,7 @@
 #include "backup/backup_page_index.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -43,6 +44,9 @@ public:
 	//! outlive it.
 	AllocationMap(const PageIndex &index, const std::vector<uint16_t> &files);
 	AllocationMap(PageIndex &&, const std::vector<uint16_t> &) = delete;
+	//! Not copied: a thread's last answers (GamFree, PfsByte) are kept by the map's id.
+	AllocationMap(const AllocationMap &) = delete;
+	AllocationMap &operator=(const AllocationMap &) = delete;
 
 	//! The file's Size in pages as its header records it, or 0 when the file is not one of the map's.
 	//! A lower bound, not the end of the data: a backup can carry allocated extents past it (a header
@@ -71,7 +75,8 @@ private:
 	struct PfsPage {
 		uint16_t file = 0;
 		uint32_t page = 0;
-		std::vector<uint8_t> bytes;
+		//! Shared with the threads whose last answer it gave, which read it with no lock.
+		std::shared_ptr<const std::vector<uint8_t>> bytes;
 	};
 
 	const File *Find(uint16_t file) const;
@@ -82,6 +87,8 @@ private:
 	std::vector<uint8_t> ReadPage(uint16_t file, uint32_t page, uint8_t type, const char *what) const;
 
 	const PageIndex &index_;
+	//! This map among every one made, so a thread's last answer is never another map's.
+	const uint64_t id_;
 	mutable std::vector<File> files_;  // the GAM intervals are filled in on demand, under lock_
 	mutable std::mutex lock_;
 	mutable std::vector<PfsPage> pfs_cache_;  // the last few PFS pages read

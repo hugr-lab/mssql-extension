@@ -6,7 +6,33 @@ namespace duckdb {
 namespace mssql {
 namespace backup {
 
-void ReservationGate::Acquire(uint64_t bytes, const std::function<bool()> &interrupted) {
+//! An Acquire counted among those waiting for the budget until it stops waiting, by success or by any
+//! way out (a refusal, an interruption, DuckDB's side throwing). Its destructor runs with the gate's
+//! lock held: every way out of Acquire that can leave it counted leaves under the lock.
+struct WaitingCount {
+	explicit WaitingCount(ReservationGate &gate_p) : gate(gate_p) {}
+	~WaitingCount() {
+		Stop();
+	}
+	void Start() {
+		if (!counted) {
+			gate.waiting_++;
+			counted = true;
+		}
+	}
+	void Stop() {
+		if (counted) {
+			gate.waiting_--;
+			counted = false;
+			gate.released_.notify_all();
+		}
+	}
+	ReservationGate &gate;
+	bool counted = false;
+};
+
+void ReservationGate::Acquire(uint64_t bytes, uint64_t duckdb_bytes, const std::function<bool()> &interrupted,
+							  bool holds_nothing) {
 	if (bytes > budget_) {
 		// No release can make room: refused at once, whatever else is held. Keep this first: with
 		// `held_ <= budget_` always and `bytes <= budget_` from here on, `held_ + bytes` below cannot
@@ -14,16 +40,23 @@ void ReservationGate::Acquire(uint64_t bytes, const std::function<bool()> &inter
 		throw ReservationRefused(true, "");
 	}
 	std::unique_lock<std::mutex> guard(lock_);
+	WaitingCount waiting(*this);
+	// Behind those already waiting for the budget: a newcomer that holds nothing does not take what they
+	// wait for.
+	while (holds_nothing && waiting_ > 0) {
+		WaitLocked(guard, interrupted);
+	}
 	for (;;) {
 		if (held_ + bytes <= budget_) {
 			held_ += bytes;
 			holders_++;
+			waiting.Stop();
 			guard.unlock();
 			std::string why;
 			bool reserved = false;
 			try {
 				// DuckDB's reservation outside the lock: it may evict blocks to make room, or spill them.
-				reserved = reserve_(bytes, why);
+				reserved = duckdb_bytes == 0 || reserve_(duckdb_bytes, why);
 			} catch (...) {
 				// Anything but a refusal (a spill that found the disk full): the attempt given back, and
 				// the waiters woken, before it goes up (review: the counters stayed raised, a hang).
@@ -54,12 +87,41 @@ void ReservationGate::Acquire(uint64_t bytes, const std::function<bool()> &inter
 			continue;
 		}
 		// Past the budget beside the others (holders_ > 0 here: with none held, held_ is 0 and `bytes`
-		// fits it): wait for any memory given back.
+		// fits it): wait for any memory given back, counted as waiting.
+		waiting.Start();
 		const uint64_t seen = generation_;
 		while (generation_ == seen) {
 			WaitLocked(guard, interrupted);
 		}
 	}
+}
+
+bool ReservationGate::TryAcquire(uint64_t bytes, uint64_t duckdb_bytes) {
+	if (bytes > budget_) {
+		throw ReservationRefused(true, "");
+	}
+	std::unique_lock<std::mutex> guard(lock_);
+	if (held_ + bytes > budget_ || waiting_ > 0) {
+		return false;
+	}
+	held_ += bytes;
+	holders_++;
+	guard.unlock();
+	std::string why;
+	bool reserved = false;
+	try {
+		reserved = duckdb_bytes == 0 || reserve_(duckdb_bytes, why);
+	} catch (...) {
+		guard.lock();
+		GiveBackLocked(bytes);
+		throw;
+	}
+	if (!reserved) {
+		guard.lock();
+		GiveBackLocked(bytes);
+		return false;
+	}
+	return true;
 }
 
 void ReservationGate::GiveBackLocked(uint64_t bytes) {
@@ -76,12 +138,14 @@ void ReservationGate::WaitLocked(std::unique_lock<std::mutex> &guard, const std:
 	released_.wait_for(guard, std::chrono::milliseconds(100));
 }
 
-void ReservationGate::Release(uint64_t bytes) {
+void ReservationGate::Release(uint64_t bytes, uint64_t duckdb_bytes) {
 	// DuckDB's side first, so a waiter woken below finds the room there too (else, alone by then, it
 	// would be refused). Never thrown past: HeldReservation releases from its destructor, and
 	// FreeReservedMemory only adjusts a counter.
 	try {
-		release_(bytes);
+		if (duckdb_bytes) {
+			release_(duckdb_bytes);
+		}
 	} catch (...) {
 	}
 	std::lock_guard<std::mutex> guard(lock_);

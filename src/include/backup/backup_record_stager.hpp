@@ -17,6 +17,7 @@
 #pragma once
 
 #include "backup/backup_catalog_model.hpp"
+#include "backup/backup_lob.hpp"
 #include "backup/backup_record.hpp"
 #include "backup/backup_system_tables.hpp"
 #include "codec/staging/column_ops.hpp"
@@ -41,6 +42,22 @@ enum class StageArm : uint8_t {
 	Bytes,		 // varchar, char, varbinary, binary, timestamp: staged as they are
 };
 
+//! What a row's values stored off row need before the row is appended (D17; PR 3 S4): the bytes
+//! the stager stages (its own memory, reserved with DuckDB; the buffer grown to exactly them), the
+//! bytes it writes straight into an output vector's heap (DuckDB accounts those when it allocates
+//! them, so they are held against the call's budget only), and the row's `_mssql_lob` map.
+struct OffRowNeed {
+	uint64_t staged = 0;
+	uint64_t direct = 0;
+	uint64_t map = 0;
+	uint64_t Total() const {
+		return staged + direct + map;
+	}
+	uint64_t Ours() const {
+		return staged + map;
+	}
+};
+
 class RecordStager {
 public:
 	//! A record's in-row part at most: the most bytes of values one row stages.
@@ -59,14 +76,46 @@ public:
 	//! column's default and the physical places can differ by partition). A column the layout does not
 	//! hold where its type says, or a default of another width, is a FormatError naming it.
 	void UseLayout(const RowsetLayout &layout);
+	//! Where a value stored off row is read from (PR 3, backup_lob): pages through `fetch` (which must
+	//! outlive the stager's use of it), on the units of the partition whose records are appended from
+	//! now on -- set for every partition, since partitions sharing a layout have units of their own.
+	void UseOffRow(const LobPageFetch *fetch, const LobUnits &units);
+	//! Build each row's `_mssql_lob` map (LastRowLobMap): every value of the row stored off row,
+	//! projected or not. Off: no map is built.
+	void MapOffRow(bool on);
+	//! The map of the row Append staged last (backup_lob_map's bytes); empty when the row has no value
+	//! stored off row (the column is NULL) or MapOffRow is off.
+	const std::string &LastRowLobMap() const {
+		return row_lob_map_;
+	}
+	//! The longest value stored off row the stager assembles: a LOB's 2^31 - 1 bytes.
+	static constexpr uint64_t MAX_OFF_ROW_BYTES = 2147483647ull;
+	//! A value stored off row at least this long, of a column the binary kernel publishes (a BLOB, a
+	//! UTF-8 text), is written straight into its output vector, not staged: it is in memory once.
+	static constexpr uint64_t DIRECT_VALUE_BYTES = 1ull << 20;
+	//! A streamed value's block (above).
+	static constexpr size_t STREAM_BLOCK_BYTES = 64 * 1024;
+	// A block holds more than what is carried into the next one (a surrogate unit and an odd byte, a lead
+	// byte), so every flush makes room.
+	static_assert(STREAM_BLOCK_BYTES > 8, "a stream block must outgrow its carry");
+	//! A column's staging buffer kept past a chunk at most this large (else released: D17's "about one
+	//! reservation" between calls).
+	static constexpr uint64_t RETAINED_STAGING_BYTES = 16ull << 20;
+	//! What `record`'s values stored off row need (reading a root record for a root pointer's length,
+	//! and building the row's map when MapOffRow is on), kept for the Append of that record, which
+	//! must come next. Append prepares a record itself when it was not.
+	OffRowNeed PrepareRow(const RecordView &record);
+	//! The prepared row's values stored off row, for a refusal: `table.column (size)`, comma separated.
+	std::string DescribePrepared() const;
 	//! Start a chunk that FinalizeChunk will publish into `targets` (one flat, empty vector of Types()
 	//! per column, in order), or into `out`'s first Types().size() vectors.
 	void BeginChunk(const std::vector<Vector *> &targets);
 	void BeginChunk(DataChunk &out);
 	//! Stage one record of the layout's rowset (a primary or a forwarded record). A value stored off
-	//! row (row-overflow, a LOB) is a FormatError naming the column until PR 3; a record the layout
-	//! does not fit is LocateValue's FormatError. After a throw the chunk holds part of a row: the next
-	//! Append or FinalizeChunk without a BeginChunk first is an InternalException, never a row shifted.
+	//! row (row-overflow, a LOB tree, a text pointer) is assembled into its column's staging through
+	//! UseOffRow's pages (a NULL root is NULL); a malformed one is WalkLob's FormatError naming the
+	//! column. A record the layout does not fit is LocateValue's FormatError. After a throw the chunk holds part of a
+	//! row: the next Append or FinalizeChunk without a BeginChunk first is an InternalException, never a row shifted.
 	void Append(const RecordView &record);
 	idx_t Count() const {
 		return count_;
@@ -76,8 +125,11 @@ public:
 	//! RowStager weighs it (a code-page column twice: its output heap is accounted at 3 bytes a
 	//! character, #536). A bounded column's chunk is bounded by its declaration.
 	//! Under LimitBytes, also when one more of the widest rows could pass the chunk's allowance.
+	//! Also after a value stored off row of DIRECT_VALUE_BYTES or more was staged: its buffer was grown
+	//! to exactly what it holds, and one more value would double it, unreserved (PR 3 S4).
 	bool Full() const {
 		return count_ == STANDARD_VECTOR_SIZE || payload_bytes_ >= codec::staging::STAGING_CHUNK_PAYLOAD_BUDGET_BYTES ||
+			   large_staged_ ||
 			   (allowance_ != 0 && 2 * staged_bytes_ + count_ * extra_row_ + 2 * var_row_ + extra_row_ > allowance_);
 	}
 	//! The most the staging holds, for a reservation (D17): FixedStagingBytes() for any chunk (the
@@ -110,11 +162,28 @@ private:
 		StageArm arm = StageArm::Bytes;
 		size_t layout_index = 0;  // in the current layout
 		uint8_t bit_position = 0;
-		uint8_t budget_weight = 0;	  // how many times its staged bytes count toward Full(): 0, 1, 2
-		uint32_t declared_bytes = 0;  // its max_length (a MAX one: a row's in-row part)
+		uint8_t budget_weight = 0;		// how many times its staged bytes count toward Full(): 0, 1, 2
+		uint32_t declared_bytes = 0;	// its max_length (a MAX one: a row's in-row part)
+		bool binary_kernel = false;		// published as its bytes (a BLOB, a UTF-8 text): written direct when long
+		bool utf16_kernel = false;		// decoded from UTF-16 (nvarchar, ntext): streamed when long
+		bool code_page_kernel = false;	// decoded from its code page (varchar, text): streamed when long
 	};
 
 	void AppendValue(Column &c, codec::staging::ColumnStaging &st, const ValueRef &v);
+	struct PreparedValue {
+		bool off_row = false;
+		OffRowPointer pointer;
+		uint64_t length = 0;
+		bool is_null = false;
+		bool direct = false;  // written straight into the vector as its bytes (a BLOB, a UTF-8 text)
+		bool stream = false;  // decoded block by block straight into the vector (UTF-16, a code page)
+		uint64_t output = 0;  // what a direct or streamed value allocates in the vector's heap
+	};
+	void AppendOffRow(Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);
+	void AppendDirect(size_t column, Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);
+	void AppendStream(size_t column, Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);
+	void MapRow(const RecordView &record, size_t var_count);
+	const LobPageFetch &Fetch(const std::string &what) const;
 
 	std::string table_;
 	std::vector<Column> columns_;
@@ -122,6 +191,34 @@ private:
 	codec::staging::StagingArena arena_;
 	std::vector<Vector *> targets_;
 	const RowsetLayout *layout_ = nullptr;
+	const LobPageFetch *fetch_ = nullptr;
+	LobUnits units_;
+	bool map_off_row_ = false;
+	//! The layout's variable columns, for the map, ascending catalog column id.
+	struct MapColumn {
+		size_t layout_index;
+		int32_t column_id;
+		std::string name;  // table.column, for errors
+	};
+	std::vector<MapColumn> map_columns_;
+	std::string row_lob_map_;
+	//! PrepareRow's answer for the record Append takes next (columns_ order); valid until that Append.
+	std::vector<PreparedValue> prepared_;  // sized once; only var_columns_' entries are ever set
+	bool prepared_valid_ = false;
+	const uint8_t *prepared_record_ = nullptr;	// the record PrepareRow was given
+	std::vector<size_t> var_columns_;			// the columns a value stored off row can be in
+	//! The chunk's values written straight into their output vectors, set over their staged
+	//! placeholders (empty values) once the kernels have run.
+	struct DirectValue {
+		size_t column;
+		idx_t row;
+		string_t value;
+	};
+	std::vector<DirectValue> direct_values_;
+	//! The block a streamed value is decoded through: its fragments gathered to STREAM_BLOCK_BYTES, then
+	//! decoded into the vector, a cut character carried into the next block.
+	std::vector<uint8_t> stream_block_;
+	bool large_staged_ = false;	 // a value of DIRECT_VALUE_BYTES or more staged in this chunk
 	idx_t count_ = 0;
 	idx_t payload_bytes_ = 0;
 	//! The variable values staged in this chunk, as staged (a UTF-16 one with its delimiter).
