@@ -386,7 +386,7 @@ jobs:
           MSSQL_R2_ACCESS_SECRET_KEY: ${{ secrets.MSSQL_R2_ACCESS_SECRET_KEY }}
           MSSQL_R2_URL: ${{ secrets.MSSQL_R2_URL }}
           MSSQL_R2_BUCKET_NAME: ${{ vars.MSSQL_R2_BUCKET_NAME || secrets.MSSQL_R2_BUCKET_NAME }}
-          QUIET: full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full
+          QUIET: full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full lob_full lob_xpress
         run: |
           export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
                  AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"

@@ -33,6 +33,10 @@ constexpr size_t SEEN_LINEAR = 32;
 struct Expect {
 	enum Kind : uint8_t { Root, Leaf, Inner } kind;
 	uint16_t level;
+	//! A DATA fragment named by its parent's last link: it may hold more than the link claims (a
+	//! truncating .WRITE leaves the last leaf's tail stale, lob.sql on 2022), its first claimed bytes the
+	//! value's. Never for row-overflow: its pointer's length is exact.
+	bool last;
 };
 
 struct Reader {
@@ -189,7 +193,8 @@ struct Reader {
 				}
 			}
 			sink.Node(LobNode{at, slot, offset, expected, static_cast<uint8_t>(depth), static_cast<uint8_t>(type)});
-			const Expect child = level == 0 ? Expect{Expect::Leaf, 0} : Expect{Expect::Inner, uint16_t(level - 1u)};
+			const Expect child =
+				level == 0 ? Expect{Expect::Leaf, 0, false} : Expect{Expect::Inner, uint16_t(level - 1u), false};
 			uint64_t previous = 0;
 			for (uint16_t i = 0; i < count; i++) {
 				const size_t link = first + step * i;
@@ -203,8 +208,10 @@ struct Reader {
 						 "has a link to " + std::to_string(cumulative) + " bytes where its parent claims " +
 							 std::to_string(expected));
 				}
+				Expect named = child;
+				named.last = i + 1u == count;
 				Child(ReadPagePointer(body, pointer), body.U16(pointer + 6), offset + previous, cumulative - previous,
-					  depth + 1, child);
+					  depth + 1, named);
 				previous = cumulative;
 			}
 			if (previous != expected) {
@@ -232,16 +239,19 @@ struct Reader {
 		if (expect.kind == Expect::Root) {
 			expected = size;  // a SMALL_ROOT root record: its size is the value's
 		}
-		if (size != expected) {
+		// A DATA fragment may hold more than its parent claims: a truncating .WRITE rewrites the links, not
+		// the last leaf, whose tail is then stale (measured, lob.sql on 2022: 8,040 bytes held, 5,880
+		// claimed). The value is its first `expected` bytes; fewer than claimed is a broken tree.
+		if (size < expected || (size != expected && !(type == FRAGMENT_DATA && expect.last))) {
 			Fail(at, slot,
 				 "holds " + std::to_string(size) + " bytes where its parent claims " + std::to_string(expected));
 		}
-		const uint8_t *data = body.Bytes(from, size);
-		sink.Node(LobNode{at, slot, offset, size, static_cast<uint8_t>(depth), static_cast<uint8_t>(type)});
+		const uint8_t *data = body.Bytes(from, static_cast<size_t>(expected));
+		sink.Node(LobNode{at, slot, offset, expected, static_cast<uint8_t>(depth), static_cast<uint8_t>(type)});
 		if (mode == LobWalk::Assemble) {
-			sink.Data(data, size);
+			sink.Data(data, static_cast<size_t>(expected));
 		}
-		return size;
+		return expected;
 	}
 };
 
@@ -314,18 +324,21 @@ LobValue WalkLob(const LobPageFetch &fetch, const OffRowPointer &pointer, const 
 	}
 	switch (pointer.form) {
 	case OffRowForm::RowOverflow:
-		reader.Child(ReadPagePointer(r, 16), r.U16(22), 0, pointer.length, 1, Expect{Expect::Leaf, 0});
+		reader.Child(ReadPagePointer(r, 16), r.U16(22), 0, pointer.length, 1, Expect{Expect::Leaf, 0, false});
 		value.length = pointer.length;
 		break;
 	case OffRowForm::RootPointer:
-		value.length = reader.Node(ReadPagePointer(r, 8), r.U16(14), 0, 0, max_bytes, 0, Expect{Expect::Root, 0});
+		value.length =
+			reader.Node(ReadPagePointer(r, 8), r.U16(14), 0, 0, max_bytes, 0, Expect{Expect::Root, 0, false});
 		value.is_null = reader.is_null;
 		break;
 	case OffRowForm::InRowRoot: {
 		const uint16_t level = r.U8(2);
-		const Expect child = level == 0 ? Expect{Expect::Leaf, 0} : Expect{Expect::Inner, uint16_t(level - 1u)};
+		const Expect child =
+			level == 0 ? Expect{Expect::Leaf, 0, false} : Expect{Expect::Inner, uint16_t(level - 1u), false};
+		const size_t links = (pointer.size - ROOT_HEADER) / ROOT_LINK;
 		uint64_t previous = 0;
-		for (size_t i = 0; i < (pointer.size - ROOT_HEADER) / ROOT_LINK; i++) {
+		for (size_t i = 0; i < links; i++) {
 			const size_t link = ROOT_HEADER + ROOT_LINK * i;
 			const uint64_t cumulative = r.U32(link);
 			// Checked here again, not trusted from ParseOffRowPointer: the walk is bounded by what it reads
@@ -334,7 +347,9 @@ LobValue WalkLob(const LobPageFetch &fetch, const OffRowPointer &pointer, const 
 				throw FormatError("backup: " + what + "'s in-row LOB root has links that do not ascend to its " +
 								  std::to_string(pointer.length) + " bytes");
 			}
-			reader.Child(ReadPagePointer(r, link + 4), r.U16(link + 10), previous, cumulative - previous, 1, child);
+			Expect named = child;
+			named.last = i + 1 == links;
+			reader.Child(ReadPagePointer(r, link + 4), r.U16(link + 10), previous, cumulative - previous, 1, named);
 			previous = cumulative;
 		}
 		if (previous != pointer.length) {

@@ -9,14 +9,14 @@ localhost:MSSQL_ROWS_PORT as sa with MSSQL_ROWS_PASSWORD (the password goes to D
 on a command line, and is masked in anything printed). For every table mssql_backup_tables says the
 scan reads, every column it converts (not one read as its stored bytes, not one that is not readable)
 is compared both ways with EXCEPT ALL against the restored table attached with native types off (D6:
-the types TYPE mssql reads), and the row counts too. A column whose values are stored off row
-(row-overflow, a LOB, a text pointer: PR 3) is left out, named, and the table compared without it.
+the types TYPE mssql reads), and the row counts too; values stored off row (row-overflow, LOB trees,
+text pointers) are compared like any others since PR 3, and each table's _mssql_lob is built for every
+row (its map of them, NULL where a row has none).
 Exits 1 on any difference or failure, or when fewer than --min-tables tables were compared.
 """
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 
@@ -104,11 +104,6 @@ def main():
                 f"SELECT {select} FROM {scan})) AS only_server, (SELECT count(*) FROM {scan}) AS backup_rows, "
                 f"(SELECT count(*) FROM {server}) AS server_rows")
             if not ok:
-                off_row = re.search(r"backup: [^ ]+\.([^ .]+) holds a value stored off row", result)
-                if off_row and off_row.group(1) in cols:
-                    cols.remove(off_row.group(1))
-                    left_out[off_row.group(1)] = "values stored off row (PR 3)"
-                    continue
                 failures.append(f"{where}: {result.splitlines()[0] if result else 'failed'}")
                 break
             r = result[0]
@@ -138,8 +133,28 @@ def main():
                     failures.append(f"{where}: _mssql_rid against %%physloc%%: {rid if not ok else rid[0]}")
                 else:
                     rid_note = ", _mssql_rid = %%physloc%%"
+            # _mssql_lob (PR 3): built for every row -- every off-row value of it, projected or not -- and
+            # present at least for each row the server holds a value of more than 8,000 bytes in (no such
+            # value fits in a row).
+            readable = [c["name"] for c in columns if c["decodable"]]
+            long_sql = (f"SELECT count(*) AS n FROM [{schema}].[{table}] WHERE " +
+                        " OR ".join(f"DATALENGTH([{c}]) > 8000" for c in readable)) if readable else None
+            ok, lob = session.query(f"SELECT count(*) AS n, count(_mssql_lob) AS maps FROM {scan}")
+            ok_long, long_rows = (session.query(f"SELECT n FROM mssql_scan('srv', {sql_string(long_sql)})")
+                                  if long_sql else (True, [{"n": 0}]))
+            lob_note = ""
+            if not ok or not ok_long:
+                status = "DIFF"
+                error = lob if not ok else long_rows
+                failures.append(f"{where}: _mssql_lob: {error.splitlines()[0] if error else 'failed'}")
+            elif int(lob[0]["n"]) != backup_rows or int(lob[0]["maps"]) < int(long_rows[0]["n"]):
+                status = "DIFF"
+                failures.append(f"{where}: _mssql_lob in {lob[0]['maps']} rows, where the server holds "
+                                f"{long_rows[0]['n']} rows with a value past 8,000 bytes")
+            elif int(lob[0]["maps"]) > 0:
+                lob_note = f", {lob[0]['maps']} rows with values off row"
             note = f"; left out: {', '.join(sorted(left_out))}" if left_out else ""
-            print(f"  {status:4} {where}: {backup_rows} rows, {len(cols)} columns{rid_note}{note}")
+            print(f"  {status:4} {where}: {backup_rows} rows, {len(cols)} columns{rid_note}{lob_note}{note}")
             compared += 1
             rows_total += backup_rows
             break

@@ -1045,8 +1045,13 @@ offsets above are in its fixed part.
   to NULL keeps the 16-byte pointer, leaves the null bit clear and rewrites the root as type 8, whose
   size bytes are stale. Its NULL is the root's, read by fragment type before any size (E21). A MAX
   value behind a root pointer updated to NULL has its null bit set.
-- The rebuilt value is checked at every node: a node's bytes equal the length its parent claims. A
-  character can straddle two fragments (E21), so a value is assembled before it is decoded.
+- The rebuilt value is checked at every node: a node's bytes equal the length its parent claims, but
+  for the DATA fragment of a node's last link, which may hold more -- a truncating `.WRITE` rewrites the
+  links and leaves the last leaf's tail stale (lob.sql on 2022: 8,040 bytes held, 5,880 claimed) -- whose
+  first claimed bytes are the value's; a row-overflow fragment is exact, and fewer than claimed is a
+  broken tree. A character can straddle two fragments (E21), so
+  a value is decoded across them: assembled, or (past 1 MiB, D17) decoded block by block with a cut
+  character carried into the next block.
 
 **Value encodings that differ from TDS** (W§7, X§4):
 

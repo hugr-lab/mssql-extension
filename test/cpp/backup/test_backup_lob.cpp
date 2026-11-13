@@ -232,6 +232,10 @@ int main() {
 	p.pages[104] = TextPage(104, {Data("hello")}, OBJECT + 1);
 	refused(Root({{5, 104, 0}}), "not the value's unit", "a page of another allocation unit");
 	refused(Root({{5, 100, 0}, {8, 100, 1}}), "more than the 4", "a value past the caller's bound", 4);
+	Check(Read(p, Root({{5, 100, 0}, {7, 100, 1}})) == "helloab",
+		  "the last DATA fragment holding more than its link claims: its first claimed bytes (a truncating .WRITE)");
+	refused(Root({{3, 100, 0}, {6, 100, 1}}), "holds 5 bytes where its parent claims 3",
+			"... but not a fragment before the last");
 	refused(Root({{6, 100, 0}}), "holds 5 bytes where its parent claims 6",
 			"a leaf whose size is not its parent's claim");
 	refused(Root({{5, 100, 0}}, 2), "kind 2", "a row-overflow pointer, to the catalog reader");

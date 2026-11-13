@@ -19,6 +19,8 @@
 // their level a u16 at 18 (0: the links name DATA fragments); NULL (8), a root only: a text / image
 // value updated to NULL keeps its pointer and its null bit clear (E21; ntext presumably alike).
 // Every node's bytes must equal what its parent claims (a child may never claim more than its parent),
+// but for the DATA fragment of a node's last link, which may hold more: its first claimed bytes are the
+// value's (a truncating .WRITE leaves the last leaf's tail stale; never for row-overflow),
 // a node's level agree with its children, every fragment be referenced once, every page name the
 // form's unit, and the value stay within the caller's bound. DuckDB-free (D15).
 //===----------------------------------------------------------------------===//
