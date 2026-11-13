@@ -955,7 +955,7 @@ static void TestCastReadColumnNotPushed() {
 	std::vector<MSSQLColumnInfo> cols = {Col("id", 1, "int", 4, 10, 0), Col("dt", 2, "datetime2", 8, 27, 7),
 										 Col("flag", 3, "bit", 1, 1, 0), Col("name", 4, "sql_variant", 8016, 0, 0),
 										 Col("d", 5, "float", 8, 53, 0)};
-	ASSERT_TRUE(cols[3].is_cast_required);
+	ASSERT_TRUE(cols[3].comparison_differs);
 	auto ctx = fx.Context();
 	ctx.mssql_columns = &cols;
 	auto variant =

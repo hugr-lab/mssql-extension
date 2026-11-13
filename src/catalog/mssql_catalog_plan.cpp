@@ -194,13 +194,9 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 				bulk.statement_path_reason = "explicit identity column '" + col.name + "'";
 				break;
 			}
-			// A geometry/geography column arrives as WKB, which the statement
-			// path renders as a 0x literal the server converts; on the bulk wire
-			// FromServerColumn would declare it nvarchar and send the bytes as
-			// text. The same for the types the catalog casts to NVARCHAR(MAX)
-			// on read (hierarchyid, sql_variant): the statement path sends a
-			// string literal the server converts, the bulk wire would not.
-			if (col.is_geometry || col.is_cast_required) {
+			// Geometry / geography and the types read through a cast go on
+			// the statement path (BulkWireTakesType says why).
+			if (!MSSQLColumnInfo::BulkWireTakesType(col.sql_type_name)) {
 				bulk.statement_path_reason = "column '" + col.name + "' of type " + col.sql_type_name;
 				break;
 			}

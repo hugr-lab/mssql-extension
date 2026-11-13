@@ -39,10 +39,11 @@ static const uint64_t PLP_NULL_MARKER = 0xFFFFFFFFFFFFFFFFULL;
 //! be read. Thrown when a value ARRIVES, not at column resolution, so a query
 //! that selects such a column and returns no rows still succeeds.
 //!
-//! A guard rather than a path anyone is expected to hit: the types with no
-//! framing (TEXT/NTEXT/IMAGE uncast, UDT, SQL_VARIANT) break the COLMETADATA
-//! parse first, upstream of here. Catalog scans never produce them at all —
-//! BuildColumnExpression casts them server-side.
+//! A guard rather than a path anyone is expected to hit: a UDT or SQL_VARIANT
+//! column is framed since spec 093 T0, but the stream refuses it at
+//! TypeConverter::GetDuckDBType, upstream of here, until its type's PR decodes
+//! it. Catalog scans never produce them at all — BuildColumnExpression casts
+//! them server-side.
 [[noreturn]] void ThrowUnsupportedType(const tds::ColumnMetadata &column) {
 	throw InvalidInputException(
 		"MSSQL: column '%s' arrives as TDS type 0x%02X, which this extension cannot decode. CAST it in the query to a "

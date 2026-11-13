@@ -327,7 +327,7 @@ static const MSSQLColumnInfo *ColumnInfoByName(const std::string &name, const Ex
 //! The rowid key choice's question too (read, but not round-trip exact), so
 //! the two cannot disagree on which columns these are.
 static bool IsTruncatedReadColumn(const MSSQLColumnInfo *column) {
-	return column && IsRoundTripExactForKey(column->sql_type_name, column->scale, column->is_cast_required) ==
+	return column && IsRoundTripExactForKey(column->sql_type_name, column->scale, column->comparison_differs) ==
 						 KeyFidelity::NotRoundTrip;
 }
 
@@ -664,7 +664,7 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 		// compared in DuckDB as the text the cast gave, and on the server as itself, by its own
 		// rules: an int 5 in a sql_variant is not N'5' there. The filter runs in DuckDB, over
 		// what DuckDB read.
-		if (ctx.filter_column_info && ctx.filter_column_info->is_cast_required &&
+		if (ctx.filter_column_info && ctx.filter_column_info->comparison_differs &&
 			!IsNullTestFilter(filter_entry.Filter())) {
 			MSSQL_FILTER_DEBUG_LOG(2, "  %s is read through a cast: filtered in DuckDB", col_name.c_str());
 			result.needs_duckdb_filter = true;
@@ -1433,7 +1433,7 @@ ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpres
 		if (!ctx.resolver->Resolve(expr, sql, column)) {
 			return {"", false};
 		}
-		if (column && column->is_cast_required && !ctx.null_test_operand) {
+		if (column && column->comparison_differs && !ctx.null_test_operand) {
 			return {"", false};	 // issue #514: compared as itself on the server, as text here
 		}
 		return {sql, true};
@@ -1492,7 +1492,7 @@ ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpres
 
 	// Issue #514, as in Encode: a column read through a cast is not compared on the server.
 	if (ctx.mssql_columns && table_col_idx < ctx.mssql_columns->size() &&
-		(*ctx.mssql_columns)[table_col_idx].is_cast_required && !ctx.null_test_operand) {
+		(*ctx.mssql_columns)[table_col_idx].comparison_differs && !ctx.null_test_operand) {
 		MSSQL_FILTER_DEBUG_LOG(1, "EncodeColumnRef: column %llu is read through a cast, not pushed",
 							   (unsigned long long)table_col_idx);
 		return {"", false};

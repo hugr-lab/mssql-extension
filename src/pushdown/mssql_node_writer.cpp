@@ -39,7 +39,7 @@ namespace mssql {
 namespace node_writer {
 
 ComparableKind KindOf(const MSSQLColumnInfo &column) {
-	if (column.is_cast_required || column.is_geometry) {
+	if (column.comparison_differs || column.IsSpatial()) {
 		return ComparableKind::None;
 	}
 	const auto type = StringUtil::Lower(column.sql_type_name);
@@ -147,7 +147,7 @@ bool HasSubqueryExpression(const SelectNode &node) {
 }
 
 bool IsGroupable(const MSSQLColumnInfo &column) {
-	if (IsRoundTripExactForKey(column.sql_type_name, column.scale, column.is_cast_required) ==
+	if (IsRoundTripExactForKey(column.sql_type_name, column.scale, column.comparison_differs) ==
 		KeyFidelity::NotRoundTrip) {
 		// time(7) / datetimeoffset(7), read as microseconds: two values 100 ns
 		// apart are two groups there and one value here -- harmless for an

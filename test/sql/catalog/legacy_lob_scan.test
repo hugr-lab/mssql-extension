@@ -1,6 +1,6 @@
 # name: test/sql/catalog/legacy_lob_scan.test
 # description: TEXT / NTEXT / IMAGE columns are readable through a catalog scan.
-#   Issue #197: all three are "known" SQL Server types, so is_cast_required is false
+#   Issue #197: all three are "known" SQL Server types, so their read form is not ServerCast
 #   and nothing rewrote them; their uncast wire forms (TEXT 0x23, NTEXT 0x63,
 #   IMAGE 0x22) have no decoder, and the query died with "Connection closed while
 #   waiting for COLMETADATA". Spec 055 D9 rewrites them server-side:

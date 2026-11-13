@@ -89,7 +89,7 @@ statement ok
 SELECT mssql_exec('retu', 'DROP TABLE dbo.RetUdt; DROP TABLE dbo.RetUdtSrc');
 
 # =============================================================================
-# The legacy LOBs: text, ntext, image. Not UDTs and not is_cast_required — they
+# The legacy LOBs: text, ntext, image. Not UDTs and read bare (MSSQLReadForm::Bare) — they
 # are KNOWN types, which is exactly why the first version of the OUTPUT list
 # missed them. It copied two of the read path's four rewrites, and a `text`
 # value answered `Unsupported type in RowReader: TEXT` while a SELECT over the

@@ -123,20 +123,22 @@ XML uses PLP (Partially Length-Prefixed) wire encoding with UTF-16LE data, ident
 
 **DML (INSERT/UPDATE via SQL literals)**: Small XML values (up to 4096 bytes serialized) are allowed. Larger values are rejected with an error recommending COPY TO with BCP protocol, since SQL literal serialization has size limits while XML documents can be up to 2 GB.
 
-### Unsupported Types
+### Not read by a raw scan yet
 
-| SQL Server Type | TDS Type ID | Reason |
+An attached catalog reads these columns through a server-side conversion (spatial as WKB,
+`sql_variant` per base type, `hierarchyid` and other CLR types as text). A raw `mssql_scan` /
+`mssql_scan_params` that selects one bare is refused at bind, naming the column and the type; spec 093
+decodes them on the client type by type. Their COLMETADATA and rows are parsed, so a batch that returns
+them to `mssql_exec`, or a DML whose trigger does, no longer fails.
+
+| SQL Server Type | TDS Type ID | Read by a raw scan |
 |---|---|---|
-| UDT (GEOGRAPHY, GEOMETRY, HIERARCHYID) | 0xF0 | User-defined CLR types |
-| SQL_VARIANT | 0x62 | Dynamic type container |
-| IMAGE | 0x22 | Deprecated (use VARBINARY(MAX)) |
-| TEXT | 0x23 | Deprecated (use VARCHAR(MAX)) |
-| NTEXT | 0x63 | Deprecated (use NVARCHAR(MAX)) |
+| UDT (GEOGRAPHY, GEOMETRY, HIERARCHYID, user CLR types) | 0xF0 | not yet (spec 093 T4, T5) |
+| SQL_VARIANT | 0x62 | not yet (spec 093 T1) |
 
-Unsupported types produce the error:
 ```
-MSSQL Error: Unsupported SQL Server type '<TYPE>' (0x<ID>) for column 'col_name'.
-Consider casting to VARCHAR or excluding this column.
+MSSQL Error: column 'g' is of the CLR type sys.geometry, which a raw mssql_scan does not read yet. ...
+MSSQL Error: column 'v' is a sql_variant, which a raw mssql_scan does not read yet. ...
 ```
 
 ## NULL Handling

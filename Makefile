@@ -697,6 +697,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/test_pool_prewarm.cpp \
     test/cpp/test_pool_acquire_limit.cpp \
     test/cpp/test_token_parser_tokens.cpp \
+    test/cpp/test_udt_variant_wire.cpp \
     test/cpp/test_sql_params.cpp \
     test/cpp/test_sql_writer.cpp \
     test/cpp/test_merge_shape.cpp \
