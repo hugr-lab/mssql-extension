@@ -1,6 +1,7 @@
 # Spec 093: one decoder per type, for the TDS stream and for backups
 
-Status: **draft**, 2026-11-13. Not started. The owner's decisions are recorded as DQ-42 – DQ-45 in
+Status: **draft**, 2026-11-13. In progress: T0 (#557) and T9 (#560) are in review, and T1 is built
+on T0; the `measured/` records go in with T0. The owner's decisions are recorded as DQ-42 – DQ-45 in
 [085's decisions.md](../085-backup-reader-core/decisions.md) and quoted where they apply; geography's CRS label was amended
 the same day (§ Why `OGC:CRS84`). Line references were taken at main `96ecf7e`.
 
@@ -61,6 +62,13 @@ Out:
 - MS-BINXML (`xml` in a backup) and the `json` binary in a backup: these formats never cross the wire
   (the server sends text), so there is no shared kernel; they stay in 086 (PR 4, E9).
 - Decoding user CLR types: opaque bytes by design (`BLOB`).
+- Two DuckDB functions over the MS-SSCLRT bytes, possible later, once T5's kernel has the format
+  (owner, 2026-11-14), not here:
+  - from bytes: `BLOB` → `GEOMETRY`, for bytes read with `geometry_as 'blob'` or kept elsewhere
+    (`geography` latitude-first, as D1's kernel reads it);
+  - to bytes: `GEOMETRY` → `BLOB`, so such bytes can be written back (an SRID, and whether the
+    target is `geometry` or `geography`, as parameters: the bytes carry both).
+  The names are to be settled then (`mssql_geom_from_bytes` / `mssql_geom_to_bytes`, say).
 - Storage formats (ROW / PAGE, sparse, columnstore): 086 and 088. The owner's "no refusals after PR 3"
   covers types and off-row values, not storage formats (DQ-42).
 
@@ -71,7 +79,8 @@ Out:
   compression, sparse columns and columnstore are storage formats and are not covered.
 - **DQ-43: `sql_variant` is read as `VARIANT`** (owner, 2026-11-13; breaking accepted). The base value
   is kept in its own type. `time(7)` inside keeps its nanoseconds (`TIME_NANOS`). A write of a value
-  that SQL Server's `sql_variant` cannot hold is refused by name.
+  that SQL Server's `sql_variant` cannot hold is refused by name. There is no setting back to
+  `VARCHAR` (owner, 2026-11-14, on #555's review): a reader who wants the text casts the `VARIANT`.
 - **DQ-44: `datetime2(7)`** (owner, 2026-11-13):
   - inside a `VARIANT`, per value: `TIMESTAMP_NANOS` inside 1677 – 2262, otherwise `TIMESTAMP_MICROS`
     (the 100 ns digit dropped); never NULL;
@@ -251,7 +260,7 @@ column.
   - A value is a USHORT length and exactly the column's number of bytes **[measured]** V1. A NULL
     is `0xFFFF` **[spec]**, which the bulk path takes **[measured]** V6.
   - Those bytes are an 8-byte header and the little-endian elements: `A9 01`, the dims as a u16, the
-    element type as a u8, three zero bytes. They are the same bytes a backup stores (V4).
+    element type as a u8, three zero bytes. They are the same bytes a backup stores **[measured]** V4.
 - **Form per column.** COLMETADATA decides, column by column.
   - Under version 1, a float32 column streams `0xF5`, and a float16 column streams the JSON form
     below **[measured]** V1. The float16 `0xF5` read form was not seen: no version above 1 was
@@ -326,8 +335,11 @@ types:
   carries. A value in another SRID
   (4120 – 4999 are allowed) keeps the label; this is documented;
 - `geometry` → `GEOMETRY`;
-- with `geometry_as := 'blob'`: `BLOB`, the MS-SSCLRT bytes as `CAST(g AS varbinary(max))` returns
-  them (they load back by `CAST(… AS geometry)`).
+- with `geometry_as := 'blob'`: `BLOB`, the MS-SSCLRT bytes, read bare (the UDT `0xF0` value as
+  it arrives, no server cast). They are the bytes `CAST(g AS varbinary(max))` returns (G2: 15 of 15,
+  NULLs included) and a backup stores, so the catalog, a raw scan and the backup scan agree; a
+  server cast would have made the TDS path differ from the backup, which has no server (owner,
+  2026-11-14, on #555's review). They load back by `CAST(… AS geometry)`.
 
 A curve (version 2 shape types 8 – 10, figure attributes 2 / 3) or a `FullGlobe` (shape type 11)
 fails the query: `column "dbo"."t"."g" holds a CircularString, which GEOMETRY cannot hold; read the
@@ -407,7 +419,7 @@ maps a catalog column to its kernel:
 - the disk envelope for `sql_variant`;
 - `vector`, detected by its user type (255) and `type_name`, not the xtype. In `syscolpars` it has
   xtype 165 and utype 255, `scale` is the element type and `length` is `8 + n × element size`. The
-  stored bytes are the `0xF5` wire value's (V4);
+  stored bytes are the `0xF5` wire value's **[measured]** V4;
 - the CLR system types, by name;
 - a user CLR type, which stays `BLOB`.
 
@@ -569,8 +581,10 @@ it carries DQ-44, decided after the split.
   DuckLake keeps it on a geometry column is K1.
 - **Z / M values change** for anyone who reads them today (they were dropped). Documented as breaking.
 - **The vector JSON fallback** is inexact for float32 (V2: about 1.5 % of values a neighbour away).
-  A server without VECTORSUPPORT reads them so, and the warning says so. The bulk write sends the
-  bytes and is exact either way (V6).
+  A server without VECTORSUPPORT reads them so, and the warning says so. On 2025 that takes
+  `mssql_vector_support = false`: 2025 acknowledges the feature (V1), so a float32 vector streams
+  `0xF5`; what Azure SQL answers is not measured. The bulk write sends the bytes and is exact either
+  way (V6).
 - **MS-SSCLRT version 2 details** (FullGlobe's bytes, segment forms) are known only from the spec
   until G1; the kernel refuses what G1 did not show.
 - **`datetime2_7_as = 'timestamp'`** makes a datetime2(7) key lossy, as `time(7)` is: such a key
