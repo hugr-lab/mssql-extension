@@ -19,17 +19,18 @@ experiment ran on; **(unverified)** = inferred or never observed.
 | spec | title | scope in one line | depends on | estimate | risk |
 |---|---|---|---|---|---|
 | [085](spec.md) | the core | MTF, `MSSQLBAK` (MS_XPRESS, ZSTD), stripes, several data files, page store with liveness, catalog with E7's partition model, FixedVar rows, LOBs and row-overflow, common types, the file functions with the opened-file cache, read-only ATTACH, DuckDB FileSystem I/O (ranged, asynchronous, parallel: D3a), `mssql_backup_info`, the fuzzy status, a differential overlay for browsing | 091's `src/codec/code_page/` (for PR 2) | 84.5–86.5 d, 15.5–17.5 wk (PR 2 in five PRs, 2a–2e) | low–medium (version drift) |
-| [086](../086-backup-row-formats-and-types/spec.md) | row formats and types | ROW and PAGE compression, sparse, `sql_variant` → `VARIANT`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector`, the 2025 `json` spike | 085 | 35.5 d, 7–8 wk + `json` spike 1–2 wk | medium (ROW / PAGE known only through DbReader's facts); high for `json` |
+| [086](../086-backup-row-formats-and-types/spec.md) | row formats and types | ROW and PAGE compression, sparse, `xml`, the 2025 `json` spike (`sql_variant`, spatial, `hierarchyid`, `vector`: spec 093, both paths, 2026-11-13) | 085 | 25 d, 5 wk + `json` spike 1–2 wk | medium (ROW / PAGE known only through DbReader's facts); high for `json` |
 | [087](../087-backup-encryption/spec.md) | encryption and TDE | the `mssql_backup_key` secret, selection by scope then thumbprint, encrypted containers, TDE pages | 085 | 16.5 d, 3–3.5 wk + E10 spike | low–medium; the TDE log tail is open |
 | [088](../088-backup-columnstore/spec.md) | columnstore | E5's decoder in C++: segments, dictionaries, VLD, rowgroups, delete bitmaps, delta stores, archive | 085 (+ CD integers from 086 PR 1) | 37.5 d, 6–9 wk | medium (version drift) |
 | [089](../089-backup-incremental-api/spec.md) | the incremental API | the chain check, changed and freed pages with each page's previous owner from the base IAM images, dead / gone / moved AUs (E7's ownership rule), allocation images, the catalog mirror, LOB fragment maps, lake-mode decoding of a lone differential, the Parquet export in DuckLake's layout | 085 | 41.5 d, 8 wk | medium |
 | [090](../090-backup-tail-recovery/spec.md) | tail recovery | redo and undo of a backup's own log tail, restore mode and lake mode, pending pages with the allocation-first rule, stale pages with variant 1, the allocation images of the recovered state | 085, 089 | 58.5 d, 10–12 wk | medium |
 
-**Total ≈ 274.5–276.5 working days, about 55 weeks for one developer; about 37 weeks with two** (085's
+**Total ≈ 264–266 working days since 2026-11-13, about 53 weeks for one developer (274.5–276.5, 55 weeks, before 086's shared types moved to spec 093); about 37 weeks with two** (085's
 84.5–86.5 days (79 before PR 2 was split in five, owner 2026-11-10), then track A's 89 days beside track B's 101, 089's docs day included; see below). The
 `json` decoder (086 PR 6, ~3 d, only if E9 passes), the spikes E9 and E10, and spec 091 (SQL Server
 code pages, generated tables and vectorized kernels), which 085 PR 2 needs, are outside the total;
-E11 is 088 task 9, inside it.
+E11 is 088 task 9, inside it. On 2026-11-13 10.5 days of 086 (its shared types) moved to spec 093,
+which runs beside the series (31–41 d, both read paths); track B is about 90.5 days.
 
 **What approving the series approves** (the review of #526, 2026-11-06): the design, not the
 calendar. Building is decided per track: 085 with track A (085 → 089 PR 1 → 090; 84.5–86.5 + 89 working
@@ -146,7 +147,8 @@ comparisons:
 - *typed* (a cross-check of the type map): the restored database attached as `TYPE mssql`, compared
   with `EXCEPT ALL` both ways. Both sides use one type map (085 D6), so a difference is a decoding bug,
   except where `TYPE mssql` reads lossily (time(7)'s 100 ns digit, datetime2(7) past 2262) or types
-  differently (086 D2); those columns rely on the canonical comparison.
+  differently (086 D2, until spec 093 makes both paths one); those columns rely on the canonical
+  comparison.
 
 Locators are checked against `%%physloc%%` (E1§3).
 

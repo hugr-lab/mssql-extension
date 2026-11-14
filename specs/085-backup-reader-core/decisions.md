@@ -414,6 +414,9 @@ few files. The export writes files and registers nothing, so mssql stays lake-ag
 
 ### DQ-19 — `VARIANT` for `sql_variant` and `FLOAT[n]` for `vector`?
 
+*Made moot 2026-11-13 by DQ-43 and spec 093: `TYPE mssql` reads these types the same way, so the
+divergence is gone.*
+
 Affects 086 D2. The backup reader would type these columns differently from `TYPE mssql`, which returns
 `VARCHAR`.
 
@@ -422,6 +425,8 @@ vector type). DuckLake stores `VARIANT`, and the importer casts `FLOAT[n]` to `F
 catalog may follow later.
 
 ### DQ-20 — How are spatial values returned: Z / M, and the CRS?
+
+*Superseded 2026-11-13 by DQ-45.*
 
 Affects 086 D6.
 
@@ -677,6 +682,66 @@ Pass 2 and a differential's pass stay header-scanned (small; a differential's yi
 
 **Affects** 085 D4a, stage 2, the block index (now samples), § Rules (MSSQLBAK), § Resources,
 acceptance 12, task 7a, § Risks.
+
+### DQ-42 — Does "no refusals after PR 3" cover storage formats? — **DECIDED** (owner, 2026-11-13)
+
+**DECIDED: types and off-row values only.** After 085 PR 3 every type in a backup reads, as its
+DuckDB type once spec 093's kernel lands and as its stored bytes before (085 D13). ROW / PAGE
+compression, sparse columns and columnstore are storage formats and keep their named refusals until
+086 / 088.
+
+**Affects** 085 PR 3, spec 093 (scope), 086 (unchanged).
+
+### DQ-43 — `sql_variant` in `TYPE mssql` too? — **DECIDED** (owner, 2026-11-13)
+
+**DECIDED: `VARIANT` on both paths, breaking accepted.** The base value keeps its own type;
+`time(7)` inside keeps its nanoseconds (`TIME_NANOS`); a write of a value SQL Server's `sql_variant`
+cannot hold is refused by name.
+
+**Affects** spec 093 D3 (T1, T2), #354, #515 (Types); makes DQ-19 moot.
+
+### DQ-44 — `datetime2(7)` outside 1677 – 2262? — **DECIDED** (owner, 2026-11-13)
+
+**DECIDED:**
+- inside a `VARIANT`, per value: `TIMESTAMP_NANOS` inside the range, else `TIMESTAMP_MICROS`; never NULL;
+- a plain column keeps `TIMESTAMP_NS` by default and logs one `WARNING` per column on an out-of-range
+  value (today a silent NULL, #168; a temporal table's `ValidTo` is the common case);
+- `mssql_datetime2_7_as = 'timestamp_ns' | 'timestamp'`, the setting, with the ATTACH option
+  `datetime2_7_as` beside it (the house form, as `client_transcode` is to `mssql_client_transcode`),
+  read at ATTACH;
+  `'timestamp'` reads microseconds over 0001 – 9999, as `time(7)` / `datetimeoffset(7)` are read;
+- the backup scan follows the same setting.
+
+**Affects** spec 093 D3, D8 (T9).
+
+### DQ-45 — Spatial: CRS, Z / M, curves, CTAS? — **DECIDED** (owner, 2026-11-13)
+
+**DECIDED:** `geography` → `GEOMETRY('OGC:CRS84')` for the whole column (amended below); `geometry` → `GEOMETRY` with
+no CRS (a column declares no SRID, the bind sees no values); a CTAS from `GEOMETRY` creates
+`geometry`; a curve or `FullGlobe` value is an error naming the column and the escape hatch
+`geometry_as := 'blob'` (ATTACH option, `mssql_backup_scan` parameter: the whole column as bytes); no
+linearisation. Both paths read the stored MS-SSCLRT bytes, so Z / M are kept. Full support, both
+paths (2026-11-12).
+
+**Affects** spec 093 D6 (T5, T6, T8); supersedes DQ-20 and 086 D6.
+
+**Amended the same day (owner, 2026-11-13: "это одно и то же"):** first decided as `EPSG:4326`. At
+the DuckDB pin `EPSG:4326` cannot be written in SQL without the spatial extension and fails a
+GeoParquet write, so the label is `OGC:CRS84`: the same WGS 84, longitude first, built in (spec 093
+§ Why `OGC:CRS84`). The rest of DQ-45 stands.
+
+### DQ-46 — 085 PR 3's open points — **DECIDED** (owner, 2026-11-13)
+
+**DECIDED as recommended by PR 3's recon:**
+- `_mssql_lob` is NULL when a row has no off-row value, maps every off-row column of the row (not only
+  the projected ones), keeps leaves as nodes, and is keyed by catalog column id;
+- values between 2047 MiB and 2^31 − 1 bytes are read: the cap is raised on the backup path only;
+- a code-page value whose UTF-8 passes 4 GiB is refused by name (a DuckDB limit);
+- a ~1 MB LOB sample may be committed;
+- a Pending or torn LOB page is refused by name until 090;
+- about 9 days, plus a day of experiments (M1 – M4) first.
+
+**Affects** 085 PR 3 (recorded in 085's spec by that PR).
 
 ## Settled during the consistency pass (no question)
 
