@@ -50,6 +50,15 @@ statement ok
 SELECT mssql_exec('dt27n', 'DROP TABLE IF EXISTS dbo.Dt27Same; CREATE TABLE dbo.Dt27Same (id int NOT NULL, d7 datetime2(7) NULL); INSERT INTO dbo.Dt27Same VALUES (1, ''9999-12-31 23:59:59.9999999''), (2, ''9999-12-31 23:59:59.9999999''), (3, ''9999-12-31 23:59:59.9999999'')');
 
 statement ok
+SELECT mssql_exec('dt27n', 'DROP TABLE IF EXISTS dbo.Dt27Null; CREATE TABLE dbo.Dt27Null (d7 datetime2(7) NULL, v int NULL); INSERT INTO dbo.Dt27Null VALUES (''9999-12-31 23:59:59.9999999'', 1), (NULL, 1)');
+
+statement ok
+SELECT mssql_exec('dt27n', 'DROP TABLE IF EXISTS dbo.Dt27Big; CREATE TABLE dbo.Dt27Big (k datetime2(7) NOT NULL PRIMARY KEY, v int NOT NULL); INSERT INTO dbo.Dt27Big SELECT TOP (3000) DATEADD(second, CAST(ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS int), ''2026-01-01''), 1 FROM sys.all_objects a CROSS JOIN sys.all_objects b; INSERT INTO dbo.Dt27Big VALUES (''9999-12-31 23:59:59.9999999'', 1)');
+
+statement ok
+SELECT mssql_exec('dt27n', 'DROP TABLE IF EXISTS dbo.Dt27Comp; CREATE TABLE dbo.Dt27Comp (k datetime2(7) NOT NULL, i int NOT NULL, v int NULL, PRIMARY KEY (k, i)); INSERT INTO dbo.Dt27Comp VALUES (''9999-12-31 23:59:59.9999999'', 1, 1), (''2026-01-01 10:00:00.1234567'', 2, 2)');
+
+statement ok
 SELECT mssql_invalidate_cache('dt27n');
 
 statement ok
@@ -113,6 +122,12 @@ SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%
 2
 
 # d6 is datetime2(6), read as TIMESTAMP: it holds 9999-12-31 and is not warned about
+# the ATTACH form comes first: whoever reads this has an attached catalog, where a bare SET changes nothing
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%column "d7" holds datetime2(7)%cannot hold them; attach with datetime2_7_as ''timestamp'' (or SET mssql_datetime2_7_as = ''timestamp'' before ATTACH)%';
+----
+2
+
 query I
 SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%column "d6"%';
 ----
@@ -245,6 +260,98 @@ SET mssql_dml_pushdown = false;
 statement ok
 UPDATE dt27n.dbo.Dt27Key SET v = v + 10 WHERE v = 1;
 
+# Issue #559, read as TIMESTAMP_NS (the default): a key value outside 1677-2262 reads as NULL, and the
+# row it keys cannot be found again by it. A rowid's key column is NOT NULL, so the DML refuses a NULL
+# component by name before anything is sent for the row, instead of an UPDATE / DELETE of no row. Rows
+# inside the range are keyed as before (above: the filter is pushed, the 9999-12-31 row is never read).
+statement error
+UPDATE dt27n.dbo.Dt27Key SET v = v + 10 WHERE v = 2;
+----
+key column "k" of a row to update or delete was read as NULL
+
+statement error
+DELETE FROM dt27n.dbo.Dt27Key WHERE v = 2;
+----
+issue #559
+
+# in a transaction the scan feeding the DML is materialised at init: refused there, the same way
+statement ok
+BEGIN;
+
+statement error
+UPDATE dt27n.dbo.Dt27Key SET v = v + 10;
+----
+issue #559
+
+statement ok
+ROLLBACK;
+
+# checked where the DML takes the key, after DuckDB's own filters: a filter DuckDB applies (lower() is
+# never pushed) drops the 9999-12-31 row before it, and the other row is updated
+query I
+UPDATE dt27n.dbo.Dt27Key SET v = v WHERE lower(CAST(v AS VARCHAR)) = '11';
+----
+1
+
+# a composite key: the VALUES path and the staged one (#stage, threshold 0) refuse alike
+statement error
+UPDATE dt27n.dbo.Dt27Comp SET v = v + 10;
+----
+key column "k" of a row to update or delete was read as NULL
+
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+statement error
+UPDATE dt27n.dbo.Dt27Comp SET v = v + 10;
+----
+key column "k" of a row to update or delete was read as NULL
+
+statement error
+DELETE FROM dt27n.dbo.Dt27Key WHERE v = 2;
+----
+key column "k" of a row to update or delete was read as NULL
+
+# the out-of-range key in a later chunk, the stage's INSERT BULK already open: refused through the
+# stage's own failure path, nothing written, and the next statement runs
+statement error
+UPDATE dt27n.dbo.Dt27Big SET v = v + 1;
+----
+key column "k" of a row to update or delete was read as NULL
+
+statement ok
+RESET mssql_dml_stage_threshold;
+
+query II
+SELECT count(*), sum(v) FROM dt27n.dbo.Dt27Big;
+----
+3001	3001
+
+query I
+SELECT list(v ORDER BY i) FROM dt27n.dbo.Dt27Comp;
+----
+[1, 2]
+
+# a keyless table, keyed by all its columns (spec 080 D3, rung 3), matches a nullable key NULL-safely:
+# the 9999-12-31 row, read as (NULL, 1), would update the row that really holds (NULL, 1). Refused.
+statement error
+UPDATE dt27n.dbo.Dt27Null SET v = v + 100 WHERE v = 1;
+----
+column "d7" identifies the rows of [dbo].[Dt27Null]
+
+query II
+SELECT d7, v FROM mssql_scan('dt27n', 'SELECT CONVERT(varchar(27), d7, 121) AS d7, v FROM dbo.Dt27Null') ORDER BY 1 NULLS FIRST;
+----
+NULL	1
+9999-12-31 23:59:59.9999999	1
+
+# a plain read of the same rows is not refused (remote pushdown off, so the filter runs in DuckDB,
+# which sees two NULLs)
+query I
+SELECT count(*) FILTER (WHERE d7 IS NULL) FROM dt27c.dbo.Dt27Null;
+----
+2
+
 statement error
 UPDATE dt27u.dbo.Dt27Key SET v = v + 10 WHERE v = 2;
 ----
@@ -297,6 +404,16 @@ RESET mssql_dml_pushdown;
 # pushed whole, the server keys the rows itself: the read type does not matter
 statement ok
 UPDATE dt27u.dbo.Dt27Key SET v = v + 10 WHERE v = 2;
+
+# under the default too: the server compares the stored values, so the right row changes
+statement ok
+UPDATE dt27n.dbo.Dt27Null SET v = v + 100 WHERE v = 1 AND d7 IS NOT NULL;
+
+query II
+SELECT d7, v FROM mssql_scan('dt27n', 'SELECT CONVERT(varchar(27), d7, 121) AS d7, v FROM dbo.Dt27Null') ORDER BY 1 NULLS FIRST;
+----
+NULL	1
+9999-12-31 23:59:59.9999999	101
 
 query I
 SELECT list(v ORDER BY v) FROM dt27n.dbo.Dt27Key;
@@ -419,7 +536,7 @@ DROP SECRET dt27_secret;
 # =============================================================================
 
 statement ok
-SELECT mssql_exec('dt27n', 'DROP TABLE IF EXISTS dbo.Dt27; DROP TABLE IF EXISTS dbo.Dt27Key; DROP TABLE IF EXISTS dbo.Dt27Uq; DROP TABLE IF EXISTS dbo.Dt27Heap; DROP TABLE IF EXISTS dbo.Dt27Same');
+SELECT mssql_exec('dt27n', 'DROP TABLE IF EXISTS dbo.Dt27; DROP TABLE IF EXISTS dbo.Dt27Key; DROP TABLE IF EXISTS dbo.Dt27Uq; DROP TABLE IF EXISTS dbo.Dt27Heap; DROP TABLE IF EXISTS dbo.Dt27Same; DROP TABLE IF EXISTS dbo.Dt27Null; DROP TABLE IF EXISTS dbo.Dt27Comp; DROP TABLE IF EXISTS dbo.Dt27Big');
 
 statement ok
 DETACH dt27cu;

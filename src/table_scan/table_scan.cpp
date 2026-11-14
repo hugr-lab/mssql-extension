@@ -483,6 +483,26 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 	// that stops early -- any LIMIT (issue #224).
 	if (result->result_stream) {
 		result->result_stream->MarkCatalogScan();
+		// Issue #559: a keyless table's hidden key columns (spec 080 D3, rung 3) refuse a value read as
+		// NULL for not fitting, by name: keyed NULL-safely, the row would match another one. Here, in
+		// the scan, because such a plan has every filter on the server (`PlanKeylessDml`), so every row
+		// read is a row to write. A rowid's key is checked where the DML takes it instead (its columns
+		// are NOT NULL: `RefuseNullKeyValue`), after DuckDB's own filters.
+		std::unordered_set<const MSSQLColumnInfo *> key_columns;
+		for (const auto column_id : input.column_ids) {
+			if (IsKeylessKeyColumn(column_id)) {
+				key_columns.insert(&bind_data.mssql_columns[ResolveKeylessKeyColumn(column_id)]);
+			}
+		}
+		if (!key_columns.empty()) {
+			std::vector<bool> refuse(read_columns.size(), false);
+			for (idx_t i = 0; i < read_columns.size(); i++) {
+				refuse[i] = key_columns.count(read_columns[i]) > 0;
+			}
+			result->result_stream->RefuseOutOfRangeIn(
+				std::move(refuse),
+				mssql::QuoteIdentifier(bind_data.schema_name) + "." + mssql::QuoteIdentifier(bind_data.table_name));
+		}
 		// A bare read assumed its collation's page. The stream decodes by the wire's,
 		// so a disagreement reads correctly, but the catalog is stale: say so (spec 092
 		// D1), or nobody learns why a column is labelled with the wrong collation.
@@ -670,26 +690,34 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		// What Execute's first call does for its own output chunk.
 		BindRowIdTargetVectors(*result, chunk);
 		idx_t total = 0;
-		for (;;) {
-			chunk.Reset();
-			idx_t rows = result->result_stream->FillChunk(chunk);
-			if (rows == 0) {
-				break;
-			}
-			PopulateRowIdVector(*result, chunk, rows);
-			// The filters the encoder did not push run here, as in Execute: the
-			// collection is served as it stands, and DuckDB does not re-check a
-			// filter it handed to the scan (issue #451 -- a materialized scan
-			// returned rows such a filter rejects, so an UPDATE in a transaction
-			// changed them).
-			if (!result->client_filters.empty()) {
-				rows = ApplyClientFilters(context, *result, chunk, rows);
+		try {
+			for (;;) {
+				chunk.Reset();
+				idx_t rows = result->result_stream->FillChunk(chunk);
 				if (rows == 0) {
-					continue;
+					break;
 				}
+				PopulateRowIdVector(*result, chunk, rows);
+				// The filters the encoder did not push run here, as in Execute: the
+				// collection is served as it stands, and DuckDB does not re-check a
+				// filter it handed to the scan (issue #451 -- a materialized scan
+				// returned rows such a filter rejects, so an UPDATE in a transaction
+				// changed them).
+				if (!result->client_filters.empty()) {
+					rows = ApplyClientFilters(context, *result, chunk, rows);
+					if (rows == 0) {
+						continue;
+					}
+				}
+				result->materialized->Append(chunk);
+				total += rows;
 			}
-			result->materialized->Append(chunk);
-			total += rows;
+		} catch (...) {
+			// The stream closed (ATTENTION, then the drain) while the materialize lock is still held:
+			// unwinding would release the lock first, and another scan on the pinned connection could
+			// start while it still answers (review of #560).
+			result->result_stream.reset();
+			throw;
 		}
 		result->result_stream->SurfaceWarnings(context);
 		// Closing the stream is what releases the connection back to Idle. Without

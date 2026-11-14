@@ -125,7 +125,10 @@ comparison pushes down to the server as a `varbinary` parameter.
 **`datetime2(7)`** (the default scale) counts 100 ns ticks over 0001–9999. DuckDB's
 `TIMESTAMP_NS` keeps every tick but holds only 1677–2262, so a value outside it -- a temporal
 table's `9999-12-31 23:59:59.9999999` `ValidTo`, a `0001-01-01` -- is read as NULL, and each scan
-that meets one logs a `WARNING` into `duckdb_logs`, once per column. To read the whole range, set
+that meets one logs a `WARNING` into `duckdb_logs`, once per column. A statement that needs such a
+value as a row's key -- a row-by-row UPDATE or DELETE on a table keyed by the column, or on a table
+with no key and such a column -- is refused by name, since the row cannot be found again by a NULL;
+one pushed to the server whole is not affected. To read the whole range, set
 `mssql_datetime2_7_as = 'timestamp'` before ATTACH, or give the connection `datetime2_7_as 'timestamp'` (an
 ATTACH option, a secret parameter, `Datetime2_7_As=timestamp` in a connection string or
 `datetime2_7_as=timestamp` in a URI):

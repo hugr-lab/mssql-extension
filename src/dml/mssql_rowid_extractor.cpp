@@ -1,6 +1,7 @@
 #include "dml/mssql_rowid_extractor.hpp"
 #include "dml/insert/mssql_value_serializer.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 
@@ -9,6 +10,23 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 // ExtractSingleRowPK - Extract PK values for a single row
 //===----------------------------------------------------------------------===//
+
+string NullKeyValueMessage(const string &column) {
+	// The rowid's columns are NOT NULL (a primary key, or a unique index usable as the key: spec 077
+	// W1), so a NULL here is a value the read could not hold -- today only a datetime2(7) outside
+	// 1677-2262 read as TIMESTAMP_NS (issue #559). Keyed by NULL, the row would not be found.
+	return StringUtil::Format(
+		"mssql: key column \"%s\" of a row to update or delete was read as NULL, which a key column cannot "
+		"hold -- a value its read type cannot hold, such as a datetime2(7) outside 1677-2262 read as "
+		"TIMESTAMP_NS (issue #559) -- so the row cannot be found again by its key. Attach with datetime2_7_as "
+		"'timestamp' to read such values (a datetime2(7) key is then not used: the table is keyed by another "
+		"unique index, or the statement is refused by name), or narrow the statement to rows inside the range",
+		column);
+}
+
+void RefuseNullKeyValue(const string &column) {
+	throw InvalidInputException(NullKeyValueMessage(column));
+}
 
 vector<Value> ExtractSingleRowPK(Vector &rowid_vector, idx_t row_idx, const mssql::RowIdKeyInfo &pk_info) {
 	vector<Value> pk_values;
@@ -22,6 +40,9 @@ vector<Value> ExtractSingleRowPK(Vector &rowid_vector, idx_t row_idx, const mssq
 
 	if (pk_info.IsScalar()) {
 		// Scalar PK: rowid is the PK value directly
+		if (rowid_value.IsNull()) {
+			RefuseNullKeyValue(pk_info.columns[0].name);
+		}
 		pk_values.push_back(std::move(rowid_value));
 	} else {
 		// Composite PK: rowid is STRUCT with PK fields
@@ -37,6 +58,9 @@ vector<Value> ExtractSingleRowPK(Vector &rowid_vector, idx_t row_idx, const mssq
 		for (idx_t i = 0; i < pk_info.columns.size(); i++) {
 			if (i >= struct_children.size()) {
 				throw InternalException("STRUCT rowid has fewer fields than PK columns");
+			}
+			if (struct_children[i].IsNull()) {
+				RefuseNullKeyValue(pk_info.columns[i].name);
 			}
 			pk_values.push_back(struct_children[i]);
 		}

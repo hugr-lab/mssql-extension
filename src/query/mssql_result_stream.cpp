@@ -463,7 +463,7 @@ exit_loop:
 		stager_.FinalizeChunk(row_count);
 		for (idx_t c = 0; c < column_metadata_.size(); c++) {
 			if (stager_.ChunkOutOfRange(c) > 0) {
-				NoteOutOfRange(c, stager_.ChunkOutOfRange(c));
+				NoteOutOfRange(c);
 			}
 		}
 		if (counters_enabled_) {
@@ -551,7 +551,7 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 		if (column_metadata_[col_idx].type_id == tds::TDS_TYPE_DATETIME2 && !row.null_mask[col_idx] &&
 			target_vector->GetType().id() == LogicalTypeId::TIMESTAMP_NS &&
 			FlatVector::IsNull(*target_vector, row_idx)) {
-			NoteOutOfRange(col_idx, 1);
+			NoteOutOfRange(col_idx);
 		}
 	}
 
@@ -941,8 +941,19 @@ void MSSQLResultStream::DrainRemainingTokens() {
 	}
 }
 
-void MSSQLResultStream::NoteOutOfRange(idx_t c, idx_t rows) {
-	(void)rows;
+void MSSQLResultStream::NoteOutOfRange(idx_t c) {
+	if (c < refuse_out_of_range_.size() && refuse_out_of_range_[c]) {
+		// Issue #559: under TIMESTAMP_NS a value outside 1677-2262 reads as NULL, and a table with no usable
+		// key is matched by all its columns NULL-safely, so the row would update the one that really holds
+		// NULL. Refused by name before any row is written.
+		throw InvalidInputException(
+			"mssql: column \"%s\" identifies the rows of %s (a table with no usable key, matched by all its "
+			"columns) and holds a datetime2(7) value outside 1677-2262, which TIMESTAMP_NS cannot hold and reads "
+			"as NULL, so the row would match another one (issue #559). Attach with datetime2_7_as 'timestamp' "
+			"(such a table's row-by-row UPDATE / DELETE is then refused by name), narrow the statement to rows "
+			"inside the range, or give the table a primary key",
+			column_metadata_[c].name, refuse_table_);
+	}
 	if (out_of_range_.size() < column_metadata_.size()) {
 		out_of_range_.resize(column_metadata_.size(), 0);
 	}
@@ -978,11 +989,13 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 				continue;
 			}
 			out_of_range_[c] = 2;
+			// The ATTACH form first: the setting is read at ATTACH, and whoever reads this has an attached
+			// catalog, on which a bare SET changes nothing (review of #560).
 			DUCKDB_LOG_WARNING(context,
 							   "mssql: column \"%s\" holds datetime2(7) values outside 1677-2262 (a temporal "
-							   "table's 9999-12-31, say), read as NULL as TIMESTAMP_NS cannot hold them; set "
-							   "mssql_datetime2_7_as = 'timestamp' (or attach with datetime2_7_as 'timestamp') to "
-							   "read them as TIMESTAMP, the 100 ns digit truncated",
+							   "table's 9999-12-31, say), read as NULL as TIMESTAMP_NS cannot hold them; attach with "
+							   "datetime2_7_as 'timestamp' (or SET mssql_datetime2_7_as = 'timestamp' before ATTACH) "
+							   "to read them as TIMESTAMP, the 100 ns digit truncated",
 							   column_metadata_[c].name.c_str());
 		}
 	}

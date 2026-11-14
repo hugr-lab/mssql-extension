@@ -4,6 +4,7 @@
 
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_table_entry.hpp"
+#include "dml/mssql_rowid_extractor.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -352,10 +353,31 @@ void MSSQLStagedDml::Execute(ClientContext &context, DataChunk &chunk) {
 	if (chunk.size() == 0) {
 		return;
 	}
+	BuildFillChunk(chunk);
+	if (target_.key_source == MSSQLStagedKeySource::ROWID) {
+		// Issue #559: a rowid key column is NOT NULL, so a NULL is a value the read could not hold;
+		// refused by name. Once the stage is open (INSERT BULK in flight on the statement's
+		// connection), through its own failure path, which abandons that connection first.
+		for (idx_t k = 0; k < target_.key_columns.size(); k++) {
+			UnifiedVectorFormat format;
+			fill_.data[k].ToUnifiedFormat(chunk.size(), format);
+			if (format.validity.CannotHaveNull()) {
+				continue;
+			}
+			for (idx_t r = 0; r < chunk.size(); r++) {
+				if (format.validity.RowIsValid(format.sel->get_index(r))) {
+					continue;
+				}
+				if (stage_.IsOpen()) {
+					stage_.FailAndThrow(context, NullKeyValueMessage(target_.key_columns[k].name));
+				}
+				RefuseNullKeyValue(target_.key_columns[k].name);
+			}
+		}
+	}
 	if (!stage_.IsOpen()) {
 		Start(context);
 	}
-	BuildFillChunk(chunk);
 	stage_.Write(context, fill_);
 }
 

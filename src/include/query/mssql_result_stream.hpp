@@ -169,9 +169,19 @@ public:
 		return warnings_pending_;
 	}
 
+	//! Issue #559: the columns (by result index, `true` for each) that identify the rows of a table with
+	//! no usable key -- its hidden key columns (spec 080 D3, rung 3) -- and the table. A value of such a
+	//! column read as NULL for not fitting its target is not a warning but a refusal by name: matched
+	//! NULL-safely, the row would update another one. (A rowid's key is checked by the DML that takes it.)
+	void RefuseOutOfRangeIn(std::vector<bool> key_columns, std::string table) {
+		refuse_out_of_range_ = std::move(key_columns);
+		refuse_table_ = std::move(table);
+	}
+
 private:
-	//! Notes `rows` values of column `c` read as NULL for not fitting their target (once per column).
-	void NoteOutOfRange(idx_t c, idx_t rows);
+	//! Notes that a value of column `c` was read as NULL for not fitting its target (once per column);
+	//! throws for a column RefuseOutOfRangeIn named.
+	void NoteOutOfRange(idx_t c);
 
 	// Read more data from connection into parser
 	// timeout_ms: socket receive timeout in milliseconds
@@ -245,9 +255,13 @@ private:
 	size_t info_surfaced_ = 0;
 	bool collations_warned_ = false;
 	//! Spec 093 D8: per column, 1 once a datetime2 value of it was read as NULL (not fitting
-	//! TIMESTAMP_NS), 2 once that was logged; and whether any is still to be logged.
+	//! TIMESTAMP_NS), 2 once that was logged; and whether any is still to be logged. Never reset: a
+	//! stream is one result set (a second COLMETADATA throws), so its columns never change under it.
 	std::vector<uint8_t> out_of_range_;
 	bool warnings_pending_ = false;
+	//! RefuseOutOfRangeIn's columns and table (issue #559).
+	std::vector<bool> refuse_out_of_range_;
+	std::string refuse_table_;
 	bool is_catalog_scan_ = false;
 
 	// Statistics

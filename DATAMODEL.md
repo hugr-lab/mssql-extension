@@ -734,7 +734,13 @@ value -- keys, MERGE ON, the 079 writer's grouping, filters -- asked of the colu
 (`MSSQLColumnInfo::ReadsDatetime2Truncated`). Under the default, the values the kernel reads as NULL
 are counted per chunk (`RowStager::ChunkOutOfRange`: the mask's NULLs before the staged validity is
 ANDed in) and the stream logs one `WARNING` per column as it meets one
-(`HasPendingWarnings`, asked after every chunk, so a LIMIT still says it).
+(`HasPendingWarnings`, asked after every chunk, so a LIMIT still says it). A row is never keyed by such a NULL (issue #559): a row-by-row
+UPDATE / DELETE would update nothing, or another row. A rowid's key columns are NOT NULL, so the DML
+refuses a NULL component where it takes the key (`RefuseNullKeyValue`, on the VALUES and the staged
+path), after DuckDB's own filters; a keyless table's hidden key columns are refused as the scan reads
+them (`MSSQLResultStream::RefuseOutOfRangeIn`), since that plan has every filter on the server. Only a
+catalog scan produces either: the 079 writer vetoes `rowid`, the hidden key columns come from the
+plan, and a DML pushed whole reads no key.
 
 ### Reading a column's collation
 
