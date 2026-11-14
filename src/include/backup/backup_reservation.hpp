@@ -84,7 +84,8 @@ public:
 	uint64_t Budget() const {
 		return budget_;
 	}
-	//! An Acquire waits for the budget now (read with no lock: a caller holding credit yields to it).
+	//! An Acquire waits now -- for the budget, or for a release after DuckDB had no room, or is retrying
+	//! DuckDB's reservation after such a wait (read with no lock: a caller holding credit yields to it).
 	bool HasWaiters() const {
 		return waiting_.load(std::memory_order_relaxed) > 0;
 	}
@@ -109,7 +110,8 @@ private:
 	uint64_t generation_ = 0;
 	//! Counts releases only (a waiter DuckDB refused wakes on these).
 	uint64_t releases_ = 0;
-	//! Acquires waiting for the budget: while there are any, a new Acquire of a caller that holds
+	//! Acquires waiting for the budget, or for a release after DuckDB refused them (and retrying it):
+	//! while there are any, a new Acquire of a caller that holds
 	//! nothing waits before it tries, and a TryAcquire answers false, so a large one is not starved by
 	//! smaller ones taking every release (review of PR 3 S4). The one waiting behind holds nothing, so
 	//! the tasks it waits for are running and will release.
@@ -146,6 +148,8 @@ public:
 		gate_.Acquire(bytes, duckdb_bytes, interrupted_, held_.empty());
 		held_.emplace_back(bytes, duckdb_bytes);
 	}
+	//! False when the reservation does not fit now; throws ReservationRefused, as the gate's TryAcquire,
+	//! for `bytes` past the whole budget, which no release can make room for (review of #558).
 	bool TryAcquire(uint64_t bytes, uint64_t duckdb_bytes) {
 		if (bytes <= credit_ && duckdb_bytes <= credit_duckdb_ && !gate_.HasWaiters()) {
 			credit_ -= bytes;

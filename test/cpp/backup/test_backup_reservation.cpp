@@ -392,6 +392,40 @@ int main() {
 		gate.Release(80);
 	}
 
+	std::cout << "A waiter DuckDB refused is a waiter too (review of #558)" << std::endl;
+	{
+		// DuckDB holds 50, 40 of them taken: a second 40 fits the budget but not DuckDB, so it waits for
+		// a release -- counted, so a newcomer holding nothing does not take DuckDB's last 10 before it.
+		FakeDuckDB duck(50);
+		ReservationGate gate(100, duck.Reserve(), duck.Release());
+		gate.Acquire(40, 40, std::function<bool()>());
+		std::atomic<bool> second_in{false};
+		std::thread second([&]() {
+			gate.Acquire(40, 40, std::function<bool()>(), true);
+			second_in = true;
+		});
+		for (int i = 0; i < 200 && !gate.HasWaiters(); i++) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+		Check(gate.HasWaiters() && !second_in, "refused by DuckDB beside a holder: counted as waiting");
+		Check(!gate.TryAcquire(10, 10) && duck.reserved == 40, "... so 10 more are not taken, though DuckDB has them");
+		std::atomic<bool> newcomer_in{false};
+		std::thread newcomer([&]() {
+			gate.Acquire(10, 10, std::function<bool()>(), true);
+			newcomer_in = true;
+		});
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		Check(!newcomer_in, "... and a newcomer holding nothing queues behind it");
+		gate.Release(40, 40);
+		second.join();
+		newcomer.join();
+		Check(second_in && newcomer_in && gate.Held() == 50 && duck.reserved == 50,
+			  "the release went to the waiter first, then the newcomer");
+		gate.Release(40, 40);
+		gate.Release(10, 10);
+		Check(gate.Held() == 0 && duck.reserved == 0, "all given back");
+	}
+
 	std::cout << (failures ? "FAILED: " + std::to_string(failures) + " check(s)" : "all checks passed") << std::endl;
 	return failures ? 1 : 0;
 }

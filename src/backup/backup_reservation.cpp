@@ -50,7 +50,10 @@ void ReservationGate::Acquire(uint64_t bytes, uint64_t duckdb_bytes, const std::
 		if (held_ + bytes <= budget_) {
 			held_ += bytes;
 			holders_++;
-			waiting.Stop();
+			// Still counted through DuckDB's reservation when it waited: stopped first, a newcomer
+			// holding nothing would pass the entry loop and race it for DuckDB's room, and could win
+			// every round (review of #558). Stopped under the lock once DuckDB said yes; every other way
+			// out leaves under the lock, where WaitingCount's destructor stops it.
 			guard.unlock();
 			std::string why;
 			bool reserved = false;
@@ -65,6 +68,10 @@ void ReservationGate::Acquire(uint64_t bytes, uint64_t duckdb_bytes, const std::
 				throw;
 			}
 			if (reserved) {
+				if (waiting.counted) {
+					guard.lock();
+					waiting.Stop();
+				}
 				return;
 			}
 			guard.lock();
@@ -80,6 +87,11 @@ void ReservationGate::Acquire(uint64_t bytes, uint64_t duckdb_bytes, const std::
 			// the task for ever while DuckDB waited for the task (review of #553). Falling out that
 			// way, the loop tries once more -- nothing of the call is held now, so DuckDB's answer
 			// may differ -- and a refusal there finds `holders_` 0 and is the refusal by name.
+			// Counted as waiting meanwhile, as below: uncounted, a newcomer holding nothing would walk
+			// past the entry loop and take what this one waits for (review of #558). The count holds no
+			// one up who could release: a holder asking for more is not queued behind it, and its
+			// TryAcquire is refused, so it closes its chunk and gives its memory back.
+			waiting.Start();
 			const uint64_t seen = releases_;
 			while (releases_ == seen && holders_ > 0) {
 				WaitLocked(guard, interrupted);

@@ -936,6 +936,9 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 				};
 				bool fits = false;
 				try {
+					// False is "not now": others hold or wait, or DuckDB has no room (alone, the Acquire
+					// below names it); a row past the whole budget throws ReservationRefused instead,
+					// since no release can make room: named here.
 					fits = held.TryAcquire(need.Total(), need.Ours());
 				} catch (ReservationRefused &) {
 					describe(need.Total());
