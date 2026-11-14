@@ -68,8 +68,10 @@ and page-dictionary records (090's follow-up).
 - **D3 — every decoder ships behind an oracle test.** The expected value is the server's own
   conversion of the restored column, read through `mssql_scan`: `CAST(x AS nvarchar(max))` for xml,
   hierarchyid and json; `x.STAsBinary()` for spatial; `SQL_VARIANT_PROPERTY(v, 'BaseType' /
-  'Precision' / 'Scale' / 'Collation')` plus the cast value for `sql_variant`; the plain column for the
-  rest. A value the oracle does not confirm keeps the 085 refusal (by name, when projected).
+  'Precision' / 'Scale' / 'Collation')` plus the cast value for `sql_variant` -- on READ; spec 093
+  D3 owns `sql_variant` now and a `VARIANT` does not carry the collation or the declared length, so
+  the full round-trip promise is replaced there by the narrower check of 093's acceptance 1; the
+  plain column for the rest. A value the oracle does not confirm keeps the 085 refusal (by name, when projected).
 
 - **D4 — CD values are batch-decoded like FixedVar ones.** The CD walk writes each value's bytes and
   its CD code into the codec staging; per-column kernels convert the CD encodings (big-endian

@@ -48,6 +48,11 @@ In:
 - `datetime2(7)`: a warning for out-of-range values, and a setting to read the column as `TIMESTAMP`.
 - The `0x62` / `0xF0` / `0xF5` COLMETADATA and row framing, so a raw `mssql_scan` reads every one of
   these types; a user CLR type reads as `BLOB`.
+- **A user CLR type through the catalog (`TYPE mssql`) keeps today's `VARCHAR` through
+  `CAST(… AS NVARCHAR(MAX))`** (T4) **(derived)**. It is the one type here that stays on a
+  server-side rewrite: its bytes are opaque by design, so the cast is what makes it readable at all.
+  A raw scan and a backup have no server to cast on and hand the bytes over as `BLOB`, so the three
+  paths differ for this one type, deliberately -- and the backup oracle's typed comparison skips it.
 - The backup reader's use of the same kernels (085 D13's stored bytes give way to the real types).
 
 Out:
@@ -72,8 +77,9 @@ Out:
     (the 100 ns digit dropped); never NULL;
   - a plain column keeps `TIMESTAMP_NS` by default, and an out-of-range value logs one `WARNING` per
     column into `duckdb_logs`;
-  - a setting `mssql_datetime2_7_as = 'timestamp_ns' | 'timestamp'`, with an ATTACH option of the
-    same name, read at ATTACH. `'timestamp'` reads the column in microseconds over the whole
+  - a setting `mssql_datetime2_7_as = 'timestamp_ns' | 'timestamp'`, with the ATTACH option
+    `datetime2_7_as` beside it -- the house form, as `client_transcode` is to
+    `mssql_client_transcode` and `remote_pushdown` to `mssql_remote_pushdown` -- read at ATTACH. `'timestamp'` reads the column in microseconds over the whole
     0001 – 9999 range, as `time(7)` and `datetimeoffset(7)` are read already;
   - the backup scan follows the same setting (one kernel).
 - **DQ-45: spatial** (owner, 2026-11-13):
@@ -111,7 +117,7 @@ needed):
 So a `geography` column labelled `EPSG:4326` could not be copied to Parquet without the spatial
 extension. **The owner amended it to `OGC:CRS84`** (2026-11-13: "это одно и то же"), #515's first
 proposal: the same WGS 84 datum, with the axis order longitude, latitude that the WKB holds; it is
-built in, and Parquet writes it with no conversion. D1 still checks the DuckLake write.
+built in, and Parquet writes it with no conversion. K1 still checks the DuckLake write.
 
 ## Design
 
@@ -152,7 +158,7 @@ questions and move with it:
 Once `sql_variant` is decoded natively the first meaning goes, and the second must not go with it: a
 pushed filter on a `sql_variant` drops rows (#514).
 
-T0 replaces it with two answers, without changing behaviour:
+T0 replaces it with three answers, without changing behaviour:
 - the **read form**: bare, server cast, or CLR rewrite. Each later PR moves its type to bare;
 - the **comparison fidelity**: a type-level predicate that the filter encoder, the rowid key choice,
   MERGE and the writer ask. `sql_variant`, `vector`, `hierarchyid`, `json` (the 2025 type has no
@@ -252,7 +258,14 @@ column.
     acknowledged.
   - Every form carries UserType 255: a column, an alias, a `CAST(… AS vector(n))` and an `ISNULL`
     over it **[measured]** V1. A raw scan therefore recognises a vector from COLMETADATA alone.
-  - n is `(max length − 8) / element size`.
+  - n is `(max length − 8) / element size`, **for the `0xF5` form only**: the JSON form arrives as
+    `varchar(max)`, whose max length says nothing about n.
+  - **A raw scan of a vector in the JSON form reads `VARCHAR`**, the server's own text -- the one
+    exception to acceptance 2 **(derived)**. The describe says `varchar(max)` for such a column (V3),
+    so there is no n on the wire, and a raw scan has no catalog to take one from; binding `FLOAT[n]`
+    would fail the init-time shape check. Through the catalog the column is `FLOAT[n]` in both forms,
+    the JSON parsed on the client, because the catalog knows n. The 2025 CI job covers the raw-scan
+    float16 and no-feature cases.
 - **Catalog type.** `ARRAY(FLOAT, n)`. The metadata queries name a column's type by
   `ISNULL(TYPE_NAME(c.system_type_id), …)` (`mssql_metadata_cache.cpp:205, 237`,
   `mssql_primary_key.cpp:61`), which says `varbinary` for a vector. They gain the user type's name
@@ -330,9 +343,14 @@ A raw `mssql_scan` takes the type from UDT_INFO's type name (geometry, geography
   `geometry` target and 4326 for a `geography` one (today's fixed values).
 - The statement path keeps `STGeomFromWKB(lit, srid)`; a Z / M value needs a form the server takes,
   **[measure]** G7 (WKT `POINT(x y z m)` is documented to carry them **[doc]**). If no form keeps
-  them, a value with Z / M is refused by name on write, never written flat **(derived)**.
+  them, a value with Z / M is refused by name on **every** write path, never written flat
+  **(derived)**.
 - COPY, INSERT BULK and staged DML: the WKB is staged as `varbinary(max)` in the session table spec
   080 D3 already fills, and `INSERT … SELECT geography::STGeomFromWKB(w, srid) FROM #stage` writes it.
+  G7 decides this path too, not only the statement one: the stage calls the same `STGeomFromWKB`, so
+  whatever form G7 picks for a Z / M value (a WKT `POINT(x y z m)` staged as text, say) the stage
+  takes, and if no form keeps them a Z / M value is refused by name here as well. The spatial COPY
+  round-trip test carries a Z / M row.
   The server computes geography's "larger than a hemisphere" bit, so no geodesic code runs on the
   client. It also interprets ring orientation as it does for any WKB: a clockwise exterior ring is the
   complement of the area meant. That is the server's semantics, recorded by G4 and documented, not
@@ -354,8 +372,12 @@ Slightly breaking: a `DESCRIBE` says `JSON`.
 
 - **The warning.** The kernel counts the values it cannot hold as `TIMESTAMP_NS`. The stream (TDS) or
   the scan (backup) logs one `WARNING` per column per statement, the first time it sees one: `mssql: column
-  "ValidTo" holds datetime2(7) values outside 1677-2262 (e.g. 9999-12-31), read as NULL; set
-  mssql_datetime2_7_as = 'timestamp' to read them`. The NULL itself is unchanged by default.
+  "ValidTo" holds datetime2(7) values outside 1677-2262 (e.g. 9999-12-31), read as NULL; attach with
+  datetime2_7_as 'timestamp' (or SET mssql_datetime2_7_as before ATTACH) to read them`. The NULL
+  itself is unchanged by default. The ATTACH form comes FIRST on purpose: the setting is read at
+  ATTACH, and whoever reads this warning has an attached catalog by definition, so a bare `SET`
+  would change nothing and the next scan would log the same line. A test asserts the message an
+  already-attached catalog gets.
 - **The setting.** `mssql_datetime2_7_as`, `'timestamp_ns'` (default) or `'timestamp'`, read once per
   catalog at ATTACH like `mssql_client_transcode`, with the ATTACH option `datetime2_7_as` winning.
   Under `'timestamp'` the column is `TIMESTAMP`, the 100 ns digit truncated; filters are rewritten
@@ -438,7 +460,7 @@ the PR it decides.
 | G7 | T6 | `STGeomFromWKB` with ISO Z / M codes, and `STGeomFromText` with `POINT(x y z m)` | how a Z / M value is written |
 | H1 | T4 | `hierarchyid` from the root to depth 20, negative and fractional labels (`/-1/`, `/1.5/`, `/1.-2/`), every Li range boundary, against `ToString()` | the kernel's test vectors |
 | J1 | T0 | comparisons, `GROUP BY` and `ORDER BY` on a 2025 `json` column | whether `json` is comparable on the server |
-| D1 | T5 | DuckDB at the pin, no server: `GEOMETRY('OGC:CRS84')` cast to and from `GEOMETRY`, with and without the spatial extension; Parquet and DuckLake writes | the label works downstream |
+| K1 | T5 | DuckDB at the pin, no server: `GEOMETRY('OGC:CRS84')` cast to and from `GEOMETRY`, with and without the spatial extension; Parquet and DuckLake writes | the label works downstream |
 | C1 | T8 | a user CLR type with `IsFixedLength = true`, `Format.Native`, in a backup | where the record holds it |
 
 ## Security and hardening
@@ -459,7 +481,13 @@ the PR it decides.
 ## Tests and acceptance
 
 - **Integration (CI, 2022)**: every base type in `sql_variant` read through the catalog and a raw
-  scan; written back, its base type checked with `SQL_VARIANT_PROPERTY`; every spatial form of G1
+  scan; written back, the base type checked with `SQL_VARIANT_PROPERTY` against **D3's write table
+  applied to the tag the read produced**, not against the base type it started as -- D3 lists what a
+  `VARIANT` cannot carry, so these round trips CHANGE type and are expected, not failures: `money` /
+  `smallmoney` return as `decimal(19,4)` / `decimal(10,4)`, `datetime` / `smalldatetime` as
+  `datetime2(6)`, `numeric` as `decimal`, `char` / `varchar` as `nvarchar`, a `datetime2(7)` outside
+  1677-2262 as `datetime2(6)` (DQ-44), and the collation and declared length are not kept. Each is
+  named in the test as an expected change; every other base type returns as itself; every spatial form of G1
   read and compared with `AsBinaryZM()` on the server; geography's CRS; the curve error and
   `geometry_as`; spatial COPY / INSERT / UPDATE / DELETE / MERGE round trips with SRIDs 0, 4326 and
   3857; `hierarchyid` against `ToString()`; `datetime2(7)` 9999-12-31 under both settings, with the
@@ -473,11 +501,14 @@ the PR it decides.
   `geometry_as` and `datetime2_7_as` forms included.
 
 Acceptance:
-1. Every value of every fixture equals the server's own conversion (`SQL_VARIANT_PROPERTY` + the
-   cast value, a `char` / `nchar` base value trimmed as the column codec trims it; `AsBinaryZM()`;
-   `ToString()`; the float32 bits) on both paths.
+1. Every value of every fixture equals the server's own conversion ON READ (`SQL_VARIANT_PROPERTY`
+   + the cast value, a `char` / `nchar` base value trimmed as the column codec trims it;
+   `AsBinaryZM()`; `ToString()`; the float32 bits) on both paths. A `sql_variant` value WRITTEN back
+   equals it through D3's write table, whose named type changes (above) are expected: the VALUE
+   survives a round trip, the base type's spelling need not.
 2. A raw `mssql_scan` reads a table of every type in this spec.
-3. No type in this spec is read through a server-side rewrite.
+3. No type this spec DECODES is read through a server-side rewrite. A user CLR type is not
+   decoded -- it keeps its cast through the catalog and its bytes everywhere else (§ Scope).
 4. The fuzz harnesses replay clean under ASan and UBSan.
 5. `mssql_backup_columns` reports `converted` for every type in this spec (T8 on).
 
@@ -489,12 +520,12 @@ it carries DQ-44, decided after the split.
 
 | PR | content | days |
 |---|---|---|
-| **T0** | D2's split of `is_cast_required` (no behaviour change); TYPE_INFO and row framing for `0x62` and `0xF0`, the raw-scan refusal naming the type; experiment G2 (`measured/G2.md`). #557 | 2–3 |
+| **T0** | D2's split of `is_cast_required` (no behaviour change); TYPE_INFO and row framing for `0x62` and `0xF0`, the raw-scan refusal naming the type; experiments G2 (`measured/G2.md`) and J1 (`measured/J1.md`: D2's comparison rule for `json` needs it). #557 | 2–3 |
 | **T1** | `sql_variant` read as `VARIANT` (D3): both envelopes, the kernel, catalog / raw scan / describe / `column_types` / RETURNING; S1; `fuzz_variant_envelope` | 5–6 |
 | **T2** | `sql_variant` write (D3): literals, refusals, the bulk encoder (S2: INSERT BULK takes `0x62` with the row envelope); CTAS | 3–4 |
 | **T3** | `vector(n)` as `FLOAT[n]` (D4): the `0xF5` TYPE_INFO and row framing (moved from T0: the server sends it only under VECTORSUPPORT), VECTORSUPPORT, `mssql_vector_support`, the kernel, the JSON fallback (float16 under version 1, every vector without the feature), writes (the bytes as `varbinary` on the bulk path), CTAS / COPY; V1–V6 (measured); the 2025 CI job; `fuzz_vector` | 4.5–5.5 |
 | **T4** | `hierarchyid` on the client (D5); H1; `fuzz_hierarchyid`; a user CLR type read as `BLOB` in a raw scan (moved from T0: testing how the describe reports one needs a CLR assembly, built in a .NET SDK container) | 2–3 |
-| **T5** | spatial read (D6): the MS-SSCLRT kernel, bare read, `GEOMETRY('OGC:CRS84')`, the curve error, `geometry_as`; G1, G3, G6, D1; `fuzz_ssclrt` | 5–7 |
+| **T5** | spatial read (D6): the MS-SSCLRT kernel, bare read, `GEOMETRY('OGC:CRS84')`, the curve error, `geometry_as`; G1, G3, G6, K1; `fuzz_ssclrt` | 5–7 |
 | **T6** | spatial write (D6): SRID from the CRS, the stage, client MS-SSCLRT for geometry if G4 passes, CTAS creates `geometry`; G4, G7 | 4–5 |
 | **T7** | `json` as `JSON` (D7) | 0.5 |
 | **T8** | the backup hookup (D9): `backup_type_forms.cpp`, the vector detection fixed, fixtures per type on 2017–2025; C1 | 2–3 |
@@ -507,7 +538,7 @@ it carries DQ-44, decided after the split.
 ## Risks
 
 - **The geography CRS downstream**: `OGC:CRS84` is built in and GeoParquet's default; whether
-  DuckLake keeps it on a geometry column is D1.
+  DuckLake keeps it on a geometry column is K1.
 - **Z / M values change** for anyone who reads them today (they were dropped). Documented as breaking.
 - **The vector JSON fallback** is inexact for float32 (V2: about 1.5 % of values a neighbour away).
   A server without VECTORSUPPORT reads them so, and the warning says so. The bulk write sends the

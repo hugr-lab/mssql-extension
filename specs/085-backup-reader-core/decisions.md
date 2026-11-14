@@ -706,7 +706,9 @@ cannot hold is refused by name.
 - inside a `VARIANT`, per value: `TIMESTAMP_NANOS` inside the range, else `TIMESTAMP_MICROS`; never NULL;
 - a plain column keeps `TIMESTAMP_NS` by default and logs one `WARNING` per column on an out-of-range
   value (today a silent NULL, #168; a temporal table's `ValidTo` is the common case);
-- `mssql_datetime2_7_as = 'timestamp_ns' | 'timestamp'`, setting and ATTACH option, read at ATTACH;
+- `mssql_datetime2_7_as = 'timestamp_ns' | 'timestamp'`, the setting, with the ATTACH option
+  `datetime2_7_as` beside it (the house form, as `client_transcode` is to `mssql_client_transcode`),
+  read at ATTACH;
   `'timestamp'` reads microseconds over 0001 – 9999, as `time(7)` / `datetimeoffset(7)` are read;
 - the backup scan follows the same setting.
 
