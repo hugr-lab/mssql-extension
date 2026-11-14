@@ -483,15 +483,38 @@ the PR it decides.
 - **Integration (CI, 2022)**: every base type in `sql_variant` read through the catalog and a raw
   scan; written back, the base type checked with `SQL_VARIANT_PROPERTY` against **D3's write table
   applied to the tag the read produced**, not against the base type it started as -- D3 lists what a
-  `VARIANT` cannot carry, so these round trips CHANGE type and are expected, not failures: `money` /
-  `smallmoney` return as `decimal(19,4)` / `decimal(10,4)`, `datetime` / `smalldatetime` as
-  `datetime2(6)`, `numeric` as `decimal`, `char` / `varchar` as `nvarchar`, a `datetime2(7)` outside
-  1677-2262 as `datetime2(6)` (DQ-44), and the collation and declared length are not kept. Each is
-  named in the test as an expected change; every other base type returns as itself; every spatial form of G1
+  `VARIANT` cannot carry, so these round trips CHANGE type and are expected, not failures. The list
+  is **D3's write table composed with D3's read table**, not a hand-written one -- composed, sixteen
+  base types come back as something else:
+
+  | base type | read tag | returns as |
+  |---|---|---|
+  | `numeric(p,s)` | DECIMAL(p,s) | `decimal(p,s)` |
+  | `money` / `smallmoney` | DECIMAL(19,4) / (10,4) | `decimal(19,4)` / `decimal(10,4)` |
+  | `time(0-5)` | TIME_MICROS | `time(6)` |
+  | `datetime2(1,2)` | TIMESTAMP_MILIS | `datetime2(3)` |
+  | `datetime2(4,5)` | TIMESTAMP_MICROS | `datetime2(6)` |
+  | `datetime2(7)` outside 1677-2262 | TIMESTAMP_MICROS | `datetime2(6)` (DQ-44) |
+  | `datetime` / `smalldatetime` | TIMESTAMP_MICROS | `datetime2(6)` |
+  | `datetimeoffset(0-6)` | TIMESTAMP_MICROS_TZ | `datetimeoffset(6)` at `+00:00` |
+  | `datetimeoffset(7)` | TIMESTAMP_NANOS_TZ / _MICROS_TZ | `datetimeoffset(7)` / `(6)`, at `+00:00` |
+  | `binary(n)` | BLOB | `varbinary(n)` |
+  | `char(n)` / `varchar(n)` | VARCHAR | `nvarchar(n)` |
+  | `nchar(n)` | VARCHAR | `nvarchar(n)` |
+
+  The collation and the declared length are not kept either. A base type whose read tag writes back
+  to itself -- `bit`, the integers, `real` / `float`, `decimal`, `date`, `time(6)` / `time(7)`,
+  `datetime2(0,3,6)`, an in-range `datetime2(7)`, `uniqueidentifier`, `varbinary(n)`, `nvarchar(n)`
+  -- returns as itself. The test composes the two tables rather than repeating this one, so a change
+  to either cannot leave it stale; every spatial form of G1
   read and compared with `AsBinaryZM()` on the server; geography's CRS; the curve error and
   `geometry_as`; spatial COPY / INSERT / UPDATE / DELETE / MERGE round trips with SRIDs 0, 4326 and
   3857; `hierarchyid` against `ToString()`; `datetime2(7)` 9999-12-31 under both settings, with the
-  warning in `duckdb_logs` and filters `=`, `<`, `>=` on the sentinel.
+  warning in `duckdb_logs` and filters `=`, `<`, `>=` on the sentinel. Two obligations the design
+  sections add, named here so this list stands on its own: the warning's **text** asserted for an
+  **already-attached** catalog, so it cannot drift back to naming a bare `SET` (D8), and a
+  **Z / M row** in the spatial COPY round trip, so the staged path's Z / M rule is exercised and not
+  only the statement path's (D6).
 - **Integration (CI, 2025)**: a new job on the 2025 image pinned by digest in
   `test/backup/gen/images.txt` for the 2025 types, `vector` (float32, float16, 1 / 3 / 1998 dims, NULL, with and without the feature) and
   `json`. It runs only the `test/sql/types_2025/` files.
@@ -504,9 +527,14 @@ Acceptance:
 1. Every value of every fixture equals the server's own conversion ON READ (`SQL_VARIANT_PROPERTY`
    + the cast value, a `char` / `nchar` base value trimmed as the column codec trims it;
    `AsBinaryZM()`; `ToString()`; the float32 bits) on both paths. A `sql_variant` value WRITTEN back
-   equals it through D3's write table, whose named type changes (above) are expected: the VALUE
-   survives a round trip, the base type's spelling need not.
-2. A raw `mssql_scan` reads a table of every type in this spec.
+   equals it through D3's write table, whose type changes (the table above) are expected. The VALUE
+   survives a round trip with **two stated exceptions**, which are losses rather than spellings: a
+   `datetimeoffset`'s offset (the UTC instant is kept, the zone is not -- D3's read table loses it
+   too) and a `char` / `nchar` value's trailing padding (trimmed on read, as this acceptance itself
+   says). Otherwise the value returns as it went in; only the base type's spelling need not match.
+2. A raw `mssql_scan` reads a table of every type in this spec -- with the one exception D4
+   states: a `vector` that arrives in the JSON form (float16 under version 1, any vector on a
+   session without the feature) reads as `VARCHAR`, the server's text, there being no n on the wire.
 3. No type this spec DECODES is read through a server-side rewrite. A user CLR type is not
    decoded -- it keeps its cast through the catalog and its bytes everywhere else (§ Scope).
 4. The fuzz harnesses replay clean under ASan and UBSan.
