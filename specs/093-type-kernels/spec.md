@@ -69,6 +69,18 @@ Out:
   - to bytes: `GEOMETRY` → `BLOB`, so such bytes can be written back (an SRID, and whether the
     target is `geometry` or `geography`, as parameters: the bytes carry both).
   The names are to be settled then (`mssql_geom_from_bytes` / `mssql_geom_to_bytes`, say).
+- Types `MSSQL_GEOMETRY` / `MSSQL_GEOGRAPHY` over the same bytes, as `MSSQL_VARCHAR(n)` is over
+  `VARCHAR`, with the two functions above as their casts to and from `GEOMETRY` (owner, 2026-11-14,
+  to be thought over after T5 / T6):
+  - nothing lost: the SRID, geometry vs geography, curves and `FullGlobe` stay in the bytes, and a
+    curve fails only when cast to `GEOMETRY`, not when read;
+  - an exact write back, as bytes, with no `STGeomFromWKB` and no SRID guessed;
+  - `ST_*` through the implicit cast, at the cost of decoding MS-SSCLRT on every call;
+  - one form for the catalog, a raw scan and the backup scan;
+  - to settle then: the type agreeing on every path (the `MSSQL_VARCHAR` lesson: `ReinterpretCast`,
+    one shared predicate), what Parquet / DuckLake get (a `BLOB` unless cast), and which type the
+    catalog reads by default (`GEOMETRY('OGC:CRS84')`, or the `MSSQL_*` type as an option, or the
+    reverse).
 - Storage formats (ROW / PAGE, sparse, columnstore): 086 and 088. The owner's "no refusals after PR 3"
   covers types and off-row values, not storage formats (DQ-42).
 
