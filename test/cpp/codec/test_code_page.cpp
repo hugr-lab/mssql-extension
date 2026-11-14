@@ -700,7 +700,12 @@ int main() {
 	// The kernels of every instruction set this CPU runs: the best one, and the portable
 	// scalar path, which a CPU without the SIMD one takes.
 	const detail::Isa best = detail::DetectIsa();
-	std::vector<detail::Isa> isas = {best};
+	// Reserved, then pushed: built from a one-element initializer list and then grown,
+	// GCC 15 at -O2 reports a false -Warray-bounds inside the reallocation (an error
+	// under -Werror on the x86-64 job).
+	std::vector<detail::Isa> isas;
+	isas.reserve(3);
+	isas.push_back(best);
 	if (best == detail::Isa::Avx512) {
 		isas.push_back(detail::Isa::Avx2);
 	}
