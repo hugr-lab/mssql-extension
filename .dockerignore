@@ -11,6 +11,18 @@ build/
 # (e.g. from `make vcpkg-setup`) would add 100+ MB to the build context.
 vcpkg/
 
+# The host's fuzz build (fuzz/build.sh): its objects are the host's (Mach-O on macOS), which the fuzz
+# image's build would link as they are; and the campaigns' findings.
+fuzz/out/
+fuzz/work/
+fuzz/findings/
+
+# Not sources of any build: design material, the documentation site, DuckDB's test scratch directory
+# (together ~6 GB, which made the fuzz image 20 GB).
+design/
+website/
+duckdb_unittest_tempdir/
+
 # Worktree / IDE
 .worktrees/
 .claude/

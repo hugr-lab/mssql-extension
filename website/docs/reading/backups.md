@@ -129,7 +129,7 @@ SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sale
 | `created`, `modified` | `TIMESTAMP` | `sys.tables.create_date` / `modify_date` |
 | `decodable`, `reason` | `BOOLEAN`, `VARCHAR` | whether `mssql_backup_scan` reads the table, and why not (a clustered columnstore or ROW / PAGE compression, for now) |
 | `fuzzy_status`, `open_transactions`, `stale_transactions` | `VARCHAR`, `INTEGER`, `INTEGER` | NULL for now |
-| `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type the scan returns: the one `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off -- a plain `VARCHAR` for a string --, or for now `BLOB`, its stored bytes, for `sql_variant`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector` and `json`, which a later release converts), `decodable` (false only for a column the scan cannot read: a computed one not persisted, a sparse one, and for now `text` / `ntext` / `image`), `reason` (why a column is not converted or not readable) |
+| `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type the scan returns: the one `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off -- a plain `VARCHAR` for a string --, or for now `BLOB`, its stored bytes, for `sql_variant`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector` and `json`, which a later release converts), `decodable` (false only for a column the scan cannot read: a computed one not persisted, a sparse one), `reason` (why a column is not converted or not readable) |
 | `allocation_units` | `LIST(STRUCT(…))` | the table's allocation units: `au_id`, `type` (`IN_ROW_DATA`, `LOB_DATA`, `ROW_OVERFLOW_DATA`), `rowset_id`, `index_id`, `partition_number`, `compression`, `filegroup_id`, `first_page`, `root_page`, `first_iam_page`, `live_pages` (NULL for now) |
 | `partitioning` | `STRUCT(…)` | for a partitioned table (NULL on a filegroup): `function_name`, `scheme_name`, `column_name`, `column_id`, `parameter_type`, `range_right`, `boundaries` (a list of `VARIANT`s in the parameter's type, in boundary order; a NULL boundary is a NULL element), `destinations` (the filegroup of each partition), `next_used`, and `reason` when the reader cannot give it exactly (the boundaries are then NULL, never a partial list; the destinations and `next_used` are still given when only a boundary's value could not be read). The table's rows are read either way |
 | `partitions` | `LIST(STRUCT(…))` | every partition: `partition_number`, `rows`, `compression`, `filegroup` |
@@ -149,13 +149,12 @@ The states:
 |---|---|
 | `converted` | read as `duckdb_type` |
 | `stored_bytes` | read as its stored bytes (`BLOB`) until its type's conversion comes: `sql_variant`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector`, `json` |
-| `off_row_pending` | `text` / `ntext` / `image`, not read yet; or a column whose value can be stored off row -- a MAX type, or a variable one in a table whose row can pass 8,060 bytes (row-overflow): a value in row is read, one off row is refused by name until a later release |
 | `not_stored` | a computed column that is not persisted: it has no stored value |
 | `storage_format` | a sparse column or a column set: its value is in the row's sparse vector, read in a later release |
 
-`off_row_pending` is said generously: of a column whose value *can* be stored off row, not only of
-one that is. The `schema` and `table` arguments are matched as stored (a name that is not there lists
-nothing). A column's state is its own: a table that `mssql_backup_tables` says is not read (a
+A value stored off row -- `text` / `ntext` / `image`, a MAX type's long value, a value pushed off a
+row past 8,060 bytes -- is read like one in row, so it has no state of its own. The `schema` and
+`table` arguments are matched as stored (a name that is not there lists nothing). A column's state is its own: a table that `mssql_backup_tables` says is not read (a
 columnstore, ROW / PAGE compression, for now) keeps its columns' states and says so in each
 `reason`, so a query for what will not be read asks for both:
 
@@ -212,8 +211,16 @@ string). Every collation is converted, the double-byte code pages (Japanese, Chi
 included. A type whose conversion comes in a later release -- `sql_variant`, `xml`, `geometry` /
 `geography`, `hierarchyid`, `vector`, `json` -- is returned as its stored bytes, a `BLOB`; no column
 is refused for its type. A column the scan cannot read -- a computed column that is not persisted (no
-stored value), a sparse column, and for now a `text` / `ntext` / `image` one -- is left out of
-`SELECT *`; a query that names it is refused, with the reason (`mssql_backup_tables.columns`).
+stored value) or a sparse column -- is left out of `SELECT *`; a query that names it is refused,
+with the reason (`mssql_backup_tables.columns`).
+
+Values stored off row are read like the others: `text` / `ntext` / `image`, a `varchar(max)` /
+`nvarchar(max)` / `varbinary(max)` / `xml` value too long for its row, and a value a row past 8,060
+bytes pushed off (row-overflow), up to 2^31 − 1 bytes a value. Each is assembled from the pieces
+SQL Server stored it in and checked as it is: every piece holds at least the bytes the value's tree
+says it does, lies in the partition's own LOB or row-overflow pages, and is used once. A value is
+reserved before it is read, within half of `max_memory` (below); one of a mebibyte or more is copied
+or decoded straight into its result.
 
 An indexed view is read the same way: `mssql_backup_scan(path, schema, view)` returns the rows its
 unique clustered index stores (`_mssql_rid` its clustered key), the rows `SELECT … WITH (NOEXPAND)`
@@ -236,19 +243,20 @@ SELECT count(*) FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orde
 CREATE TABLE orders AS SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');
 ```
 
-Three virtual columns, which `SELECT *` leaves out:
+Four virtual columns, which `SELECT *` leaves out:
 
 | column | type | meaning |
 |---|---|---|
 | `_mssql_page` | `VARCHAR` | the row's page: `'01'`, then its file and page number in hex (14 characters) |
 | `_mssql_rid` | `BLOB` | the row's identity: a heap row's original place (its `%%physloc%%`, after a byte `0x00`), a clustered row's key (after `0x01`), stable across index rebuilds |
 | `_mssql_page_lsn` | `DECIMAL(25,0)` | the LSN of the page's last change, in `RESTORE HEADERONLY`'s numeric form |
+| `_mssql_lob` | `BLOB` | the row's values stored off row and the pages that hold them -- every one of the row's, whichever columns are selected -- in a format of the reader's own (versioned by its first byte), for a later differential backup's import; NULL for a row with none (a `text` / `ntext` / `image` value updated to NULL keeps its place off row, so its row has a map) |
 
 Refused by name, for now: a table with ROW or PAGE compression or a clustered columnstore index
 (see `mssql_backup_tables.reason`); a column the scan cannot read, when it is named (above); a
-value stored off row -- a long `varchar(max)` / `nvarchar(max)` / `varbinary(max)` value, a row past
-8,060 bytes -- when its column is selected; and a page that
-became live while the backup ran (a backup taken under writes), whose content is only in the
+value stored off row that cannot fit in half of `max_memory` even with nothing else of the scan
+held, or in DuckDB's memory (named by its row's `_mssql_rid`, its page and slot, and its columns and
+sizes), or whose stored pieces do not form its tree; and a page that became live while the backup ran (a backup taken under writes), whose content is only in the
 backup's log tail. A backup taken under writes is read as its data pages hold it, which may differ
 from what `RESTORE` makes of it by replaying the log tail.
 

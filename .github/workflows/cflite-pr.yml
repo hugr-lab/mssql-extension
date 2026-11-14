@@ -65,7 +65,7 @@ jobs:
       # The backup reader's harnesses (spec 085), beside the default targets:
       # read by .clusterfuzzlite/build.sh; the PR job above builds none of them.
       - name: Add the backup reader's harnesses
-        run: echo "backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record" > .clusterfuzzlite/extra_targets
+        run: echo "backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob" > .clusterfuzzlite/extra_targets
 
       - name: Build fuzzers (undefined)
         id: build
@@ -79,9 +79,10 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # run_fuzzers splits this between the targets: 1000 s over ten keeps
-          # the six default ones at the ~100 s each that 600 s over six gave.
-          fuzz-seconds: 1000
+          # run_fuzzers splits this between the targets: 1300 s over thirteen (the
+          # six default ones and the seven backup ones) keeps the ~100 s each that
+          # 600 s over six gave.
+          fuzz-seconds: 1300
           mode: 'batch'
           sanitizer: undefined
           output-sarif: true

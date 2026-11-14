@@ -19,7 +19,11 @@
 //     gives for that value alone (inline up to 12 bytes or 0, the input's choice), a NULL
 //     row's is zero, and nothing is written past the total + STORE_SLACK;
 //   - CopyAscii stops at the first byte >= 0x80 and writes nothing past n.
+//   - DecodeToUtf8Block over the input cut into blocks (a lone lead byte carried into the next
+//     block, the last one through DecodeToUtf8, as the backup scan decodes a long value) gives
+//     DecodeToUtf8's bytes for the whole input.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -189,5 +193,32 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 		Require(in[i] < 0x80);
 	}
 	Require(ascii == n || in[ascii] >= 0x80);
+
+	// DecodeToUtf8Block as the backup scan drives it over a value past a mebibyte (spec 085 PR 3,
+	// backup_record_stager.cpp): blocks of b bytes, the bytes a block leaves unconsumed (a double-byte
+	// lead at its end) carried to the front of the next, the last block through DecodeToUtf8. The
+	// UTF-8 is the whole input's, byte for byte, and nothing is written past it + STORE_SLACK. Once with
+	// a block length the input picks (1-64), once a byte a block.
+	const size_t block_lengths[] = {n > 0 ? 1 + in[0] % 64u : 1, 1};
+	for (size_t b : block_lengths) {
+		std::vector<char> blocks(bound + 32, static_cast<char>(CANARY));
+		std::vector<uint8_t> block;
+		size_t written = 0;
+		for (size_t at = 0; at < n || !block.empty();) {
+			const size_t take = std::min(b, n - at);
+			block.insert(block.end(), in + at, in + at + take);
+			at += take;
+			if (at == n) {
+				written += DecodeToUtf8(page, block.data(), block.size(), blocks.data() + written);
+				break;
+			}
+			size_t consumed = block.size();
+			written += DecodeToUtf8Block(page, block.data(), block.size(), blocks.data() + written, consumed);
+			Require(consumed <= block.size() && consumed + 1 >= block.size());
+			block.erase(block.begin(), block.begin() + static_cast<std::ptrdiff_t>(consumed));
+		}
+		Require(written == len && memcmp(blocks.data(), utf8.data(), len) == 0);
+		RequireCanary(blocks, len + STORE_SLACK);
+	}
 	return 0;
 }

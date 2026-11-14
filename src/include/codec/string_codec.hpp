@@ -101,6 +101,11 @@ void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata 
 //! step on that path either. Fixed-length NCHAR's trailing-space trim is a
 //! property of the TDS type, so it is derived from `col` rather than passed in.
 void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col, Vector &out);
+
+//! UTF-16LE `units` at `src` to UTF-8 at `dst` (room for 3 bytes a unit), as the batch kernel converts
+//! a chunk: valid input through simdutf, otherwise U+FFFD for each unpaired surrogate (counted in
+//! `replaced`). One block of a longer value (spec 085 PR 3): the caller never cuts a surrogate pair.
+size_t DecodeUtf16Block(const uint8_t *src, size_t units, char *dst, idx_t &replaced);
 // W1 (spec 054): format-threaded overload — fmt is built once per column per
 // chunk by BCPRowEncoder::EncodeChunk. The (Vector, row) overload below
 // wraps it for per-row callers (builds the format per call).

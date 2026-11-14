@@ -175,6 +175,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_function_common.cpp
     src/backup/backup_iam.cpp
     src/backup/backup_lob.cpp
+    src/backup/backup_lob_map.cpp
     src/backup/backup_info_function.cpp
     src/backup/backup_mtf.cpp
     src/backup/backup_open_pass.cpp

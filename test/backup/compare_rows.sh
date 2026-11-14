@@ -16,7 +16,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DIR="$(cd "${1:?usage: compare_rows.sh DIR}" && pwd)"
 : "${VERSION:?set VERSION (2017, 2019, 2022 or 2025)}"
 DUCKDB="${DUCKDB:-build/release/duckdb}"
-QUIET="${QUIET:-full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full}"
+QUIET="${QUIET:-full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full lob_full lob_xpress}"
 IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/gen/images.txt")"
 [ -n "${IMAGE}" ] || { echo "ERROR: no image for VERSION=${VERSION} in images.txt" >&2; exit 1; }
 CONTAINER="${CONTAINER:-mssql-bak-rows}"

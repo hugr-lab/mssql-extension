@@ -114,6 +114,11 @@ size_t DecodeToUtf8(const CodePageTable &page, const uint8_t *src, size_t n, cha
 //! same loads), and returns how many leading bytes are ASCII (n when all are;
 //! dst then holds them, which ARE their UTF-8). dst holds n bytes, and nothing
 //! is written past them; past the returned count its content is undefined.
+//! DecodeToUtf8 of one block of a longer value (spec 085 PR 3: a value stored off row, decoded as its
+//! fragments arrive): the same output, but a double-byte lead byte that ends the block is not read --
+//! `consumed` excludes it, and the caller decodes it with the next block. On the value's last block a
+//! lone lead byte is what DecodeToUtf8 makes of it (nothing): pass that block to DecodeToUtf8.
+size_t DecodeToUtf8Block(const CodePageTable &page, const uint8_t *src, size_t n, char *dst, size_t &consumed);
 size_t CopyAscii(const uint8_t *src, size_t n, char *dst);
 
 //! Stage 1 of the two-stage decode: n code-page bytes as UTF-16LE code units

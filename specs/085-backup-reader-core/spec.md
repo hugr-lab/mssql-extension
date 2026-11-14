@@ -289,6 +289,23 @@ a type whose conversion is still to come is read as its stored bytes (below).
   `m_lsn > since_lsn`, spec 089 D3; R§6.2 point 4). The lake deletes by `_mssql_page` with DuckLake's own
   `DELETE` (R§6.2).
 
+  **`_mssql_lob`'s bytes** (PR 3, task 20; DQ-46: NULL for a row with no off-row value; every off-row
+  value of the row, projected or not; the leaves listed; keyed by the catalog's column id;
+  `backup/backup_lob_map.hpp`):
+
+  | field | bytes | meaning |
+  |---|---|---|
+  | format | u8 | `0x01` |
+  | entry count | u16 | one per off-row value, ascending column id |
+  | column id | u32 | `syscolpars.colid` |
+  | form | u8 | 1 row-overflow, 2 in-row root, 3 root pointer (E21) |
+  | flags | u8 | bit 0: a NULL root (a `text` / `image` updated to NULL, E21) |
+  | pointer | u16 length, bytes | the in-row bytes as stored (089's root identity) |
+  | value length | u32 | |
+  | node count | u32 | then per node, depth first in link order: u32 page, u16 file, u16 slot, u32 offset and u32 length of the value it covers, u8 depth (0 a root record), u8 fragment type |
+
+  18 bytes a node. A map-only walk lists a leaf from its parent's link, unread (`WalkLob`).
+
 - **D9 — the opened-file cache (owner, R§6.1).** An import calls the functions once per table on the
   same file, and a cold open costs a pass over the whole file. The opened backup is kept in DuckDB's
   per-instance `ObjectCache` (`storage/object_cache.hpp`), keyed by every family file's canonical path,
@@ -1002,16 +1019,39 @@ offsets above are in its fixed part.
   i32.
 
 **LOBs and row-overflow** (X§4, E1 `LobReader`):
-- A complex variable column starts with its kind: 2 = row-overflow / text pointer, 24 bytes (u32
-  update counter +4, u32 length +12, root RID +16); 4 or 5 = in-row root: 12-byte header (u32 update
-  counter `ts` +4), then 12-byte links `u32 cumulative size, u32 page, u16 file, u16 slot`.
-- A LOB fragment record (statusA 0x08): u16 length @2, u64 blob id @4, u16 type @12: 0 SMALL_ROOT
-  (u16 size @14, data @20), 2 INTERNAL (u16 maxlinks @14, curlinks @16, level @18, 16-byte links @20:
-  `u64 cumulative size, u32 page, u16 file, u16 slot`), 3 DATA (data from 14 to the record length),
-  5 LARGE_ROOT (12-byte links @24).
-- The rebuilt value is checked at every node: a node's bytes equal the length its parent claims.
-- Legacy `text` / `ntext` / `image` hold a 16-byte text pointer in row (W§6); **unverified** (E1§6:
-  not tested), so these types are behind an oracle test before they ship.
+- A complex variable column holds one of three forms (E21): 16 bytes is always the root pointer (its
+  first byte is a blob id's low byte, not a kind); 24 bytes is row-overflow (kind 2) or an in-row root
+  of one link (kind 4), told apart by the first byte:
+  - 24 bytes of kind 2, **row-overflow** (bounded types only): u32 update counter +4, u32 length +12,
+    the RID of one DATA fragment +16, on the rowset's ROW_OVERFLOW_DATA unit;
+  - 12 + 12n bytes of kind 4, an **in-row root**: a 12-byte header (byte 2 the level: 0, the links name
+    DATA fragments; above, INTERNAL nodes; u32 update counter `ts` +4), then up to 5 links `u32
+    cumulative size, u32 page, u16 file, u16 slot`, on the LOB_DATA unit (kind 5, never seen in row, is
+    accepted as the catalog reader accepts it);
+  - 16 bytes, a **pointer to a root record**: u64 blob id (the root's own @4), u32 page, u16 file, u16
+    slot, on the LOB_DATA unit. `text` / `ntext` / `image` with text in row off use it for every value,
+    an empty one included; MAX columns with `large value types out of row` = 1 too, for values written
+    after the option was set.
+- With text in row on (limit L) a `text` / `ntext` / `image` value of up to L bytes is plain bytes in
+  row when the row has room, and otherwise an in-row root. One table can hold every form: an option
+  changes only the values written, or the columns updated, after it; text in row OFF converts the
+  inline values and in-row roots to root pointers at once.
+- A LOB fragment record (statusA 0x08, length 84 for a root): u16 length @2, u64 blob id @4, u16 type
+  @12: 0 SMALL_ROOT (u16 size @14, at most 64 bytes, data @20), 2 INTERNAL (u16 maxlinks @14, curlinks
+  @16, level @18, about 500 16-byte links @20: `u64 cumulative size, u32 page, u16 file, u16 slot`),
+  3 DATA (data from 14 to the record length, at most 8,040 bytes), 5 LARGE_ROOT (maxlinks 5 @14,
+  curlinks @16, level @18, 12-byte links @24), 8 NULL (only as a root). E21.
+- **A NULL `text` / `image` (and presumably `ntext`) can be not NULL in the null bitmap**: an UPDATE
+  to NULL keeps the 16-byte pointer, leaves the null bit clear and rewrites the root as type 8, whose
+  size bytes are stale. Its NULL is the root's, read by fragment type before any size (E21). A MAX
+  value behind a root pointer updated to NULL has its null bit set.
+- The rebuilt value is checked at every node: a node's bytes equal the length its parent claims, but
+  for the DATA fragment of a node's last link, which may hold more -- a truncating `.WRITE` rewrites the
+  links and leaves the last leaf's tail stale (lob.sql on 2022: 8,040 bytes held, 5,880 claimed) -- whose
+  first claimed bytes are the value's; a row-overflow fragment is exact, and fewer than claimed is a
+  broken tree. A character can straddle two fragments (E21), so
+  a value is decoded across them: assembled, or (past 1 MiB, D17) decoded block by block with a cut
+  character carried into the next block.
 
 **Value encodings that differ from TDS** (W§7, X§4):
 
@@ -1082,16 +1122,16 @@ Each component of 085, with its home or its bound:
 |---|---|---|
 | extent bitmaps and ranks, block samples (stage 2, D4a, DQ-41) | the file's extents (≈ 45 MB for 10 TB) and the probes made | resident while the backup is open; within D4a's 0.4 MB per GB |
 | a table's pages (stage 4a, DQ-40) | the runs of the scanned tables' extents (tens of MB typically, ≈ 2 GB worst case for a 10 TB table) | built from the IAM chain at a table's first scan; buffer-managed per AU in the opened backup, a scan pins its table's; they spill |
-| allocation (stage 3) | the files' extents (≈ 21 MB for 10 TB) | resident: `Size` and GAM bits; PFS pages read on demand, 64 kept |
+| allocation (stage 3) | the files' extents (≈ 21 MB for 10 TB) | resident: `Size` and GAM bits; PFS pages read on demand, 64 kept; each thread keeps the last PFS page it was answered from (PR 3 S7: read with no lock), 8 KiB a thread, unaccounted |
 | opened-file cache (D9) | files opened | DuckDB's `ObjectCache`: an entry reports `GetEstimatedCacheMemory` (`DD/src/include/duckdb/storage/object_cache.hpp:48`), so the buffer pool evicts it under pressure (`DD/src/storage/buffer/buffer_pool.cpp:348`); an attached catalog pins its entry; an evicted entry costs a reopen |
 | catalog (stage 4) | objects × columns | the decoded base tables in `ColumnDataCollection`s built with the `ClientContext`, spillable; the model over them indexes them by id, and a `TableLayout` is built only for a table a call binds |
 | log tail (stage 5) | the tail's records | read block by block; the transaction table and the per-AU flags of D11 are buffer-managed (090 D9 extends them) |
-| decode staging | the rows of a chunk | one chunk per running unit, closed at the codec's staging byte budget or a full vector, whichever comes first; reserved (D17). As landed in PR 2e: the staging's bound from the declared widths (a row's in-row 8,060 bytes at most; buffers counted twice, as they grow by doubling) for a vector, or 8 MiB with the chunk closing on the bytes it staged; held for one `Execute` call only, so a task blocked downstream holds no reservation another waits for -- what it keeps between calls is its staging's capacity, about one reservation, unaccounted. The output vectors' string heaps are DuckDB's allocations (accounted by DuckDB, #536), not reserved again |
+| decode staging | the rows of a chunk | one chunk per running unit, closed at the codec's staging byte budget or a full vector, whichever comes first; reserved (D17). As landed in PR 2e: the staging's bound from the declared widths (a row's in-row 8,060 bytes at most; buffers counted twice, as they grow by doubling) for a vector, or 8 MiB with the chunk closing on the bytes it staged; held for one `Execute` call only, so a task blocked downstream holds no reservation another waits for -- what it keeps between calls is its staging's capacity, about one reservation, unaccounted. The output vectors' string heaps are DuckDB's allocations (accounted by DuckDB, #536), not reserved again. PR 3 S7: a row's values stored off row are reserved from the call's credit when it covers them -- a grant takes up to 1 MiB (a sixteenth of the budget at most) beyond its row, and of that extra the row's own share with DuckDB, so a chunk's rows do not each take the gate's lock; not while an Acquire waits for the budget, not again in a call after DuckDB refused one; at most a grant unused per running call, held from the others until the call returns |
 | a compressed block being read | ≤ 64 KB | one per thread (§ Scan) |
 | a container's walked spans (PR 2e) | the file walked | 16 bytes a mark, a mark per 256 KiB of the file walked (64 KB a GB, whatever the blocks' sizes); resident while open, within D4a's 0.4 MB per GB |
 | a thread's read window and read-ahead (PR 2e) | -- | 256 KiB per thread that read a container's data set (the window) and 256 KiB per thread that read a family file on (the read-ahead); their bytes are a file's until the thread reads another, their capacity stays with the thread for its life: at most 512 KiB × the threads that read a backup (DuckDB's and the clients'), unaccounted; beside them a pass search's 64 KiB group a thread |
 | fetched ranges (D3a) | the ranges in flight and cached | the buffer manager's: a remote file's cached blocks are counted and evictable once unpinned; a local file's reads are counted and freed on release; the ranges in flight are bounded by the units in flight |
-| a LOB value | its length | not streamed: DuckDB has no streamed value, so a value is assembled whole in its vector, fragment by fragment, capped at 2^31 − 1 bytes. Its length, known from its root before a fragment is read, is reserved first, by D17's rule: a unit that cannot reserve it waits for the others, and a value that still cannot fit while its unit runs alone is refused by name (table, `_mssql_rid`, column, length, `max_memory`, `temp_directory`) |
+| a LOB value | its length | not streamed: DuckDB has no streamed value, so a value is assembled whole in its vector, fragment by fragment, capped at 2^31 − 1 bytes. Its length, known from its root before a fragment is read, is reserved first, by D17's rule: a unit that cannot reserve it waits for the others, and a value that still cannot fit while its unit runs alone is refused by name (table, `_mssql_rid`, column, length, `max_memory`, `temp_directory`). A value staged for its column's kernel grows the staging once, doubling within 1 MiB of what it needs (PR 3 S7: grown to exactly each value, a chunk's payload was copied once a value): up to 1 MiB a column a thread past what is reserved, unaccounted |
 
 So a scan holds at most `MaxThreads()` (≤ `max_threads`) chunks and LOB values at once, under the
 reservations' half of `max_memory` (D17); the rest is buffer-managed and spills. 088 (rowgroup

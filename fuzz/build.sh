@@ -130,7 +130,7 @@ TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn login_respon
 # whole space-separated words, so a stray separator or a typo would otherwise build fewer harnesses
 # than asked, green.
 TARGETS="$(printf '%s %s' "${TARGETS}" "${TARGETS_EXTRA:-}" | tr ',\n\r\t' '    ')"
-KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record "
+KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob "
 for t in ${TARGETS}; do
 	if [[ "${KNOWN_TARGETS}" != *" ${t} "* ]]; then
 		echo "ERROR: unknown fuzz target '${t}' in TARGETS / TARGETS_EXTRA (known:${KNOWN_TARGETS})" >&2
@@ -210,21 +210,28 @@ BACKUP_CATALOG_SRCS=(
 	"${BACKUP}/backup_lob.cpp"
 	"${BACKUP}/backup_catalog_model.cpp"
 )
+# Values stored off row (PR 3): the walker above and the `_mssql_lob` map.
+BACKUP_LOB_SRCS=("${BACKUP}/backup_lob_map.cpp")
 BACKUP_OBJS=""
 if want backup_mtf || want backup_container || want backup_xpress || want backup_page || want backup_catalog ||
-	want backup_record; then
+	want backup_record || want backup_lob; then
 	BACKUP_OBJS="$(compile_objs backup "${BACKUP_SRCS[@]}")"
 fi
 want backup_mtf && build_harness fuzz_backup_mtf fuzz_backup_mtf.cc ${BACKUP_OBJS}
 want backup_container && build_harness fuzz_backup_container fuzz_backup_container.cc ${BACKUP_OBJS}
 want backup_xpress && build_harness fuzz_backup_xpress fuzz_backup_xpress.cc ${BACKUP_OBJS}
 want backup_page && build_harness fuzz_backup_page fuzz_backup_page.cc ${BACKUP_OBJS}
-if want backup_catalog || want backup_record; then
+if want backup_catalog || want backup_record || want backup_lob; then
 	BACKUP_CATALOG_OBJS="$(compile_objs backup_catalog "${BACKUP_CATALOG_SRCS[@]}")"
 fi
 want backup_catalog && build_harness fuzz_backup_catalog fuzz_backup_catalog.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS}
 # The records of user tables (PR 2d): ReadRecord, RowVarCount, ForwardedFrom, LocateValue, DecodeRecord.
 want backup_record && build_harness fuzz_backup_record fuzz_backup_record.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS}
+# Values stored off row (PR 3): ParseOffRowPointer, WalkLob in both modes, AppendLobMap / ParseLobMap.
+if want backup_lob; then
+	BACKUP_LOB_OBJS="$(compile_objs backup_lob "${BACKUP_LOB_SRCS[@]}")"
+	build_harness fuzz_backup_lob fuzz_backup_lob.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS} ${BACKUP_LOB_OBJS}
+fi
 
 # 6. The STAGED read path (spec 059 D4): parser in raw-row mode feeding
 #    codec::staging::RowStager. Deliberately NOT in the default TARGETS — it is
@@ -334,7 +341,7 @@ fi
 
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---
 for t in browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode \
-	backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record; do
+	backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob; do
 	# Only the corpora of the targets this build makes: OSS-Fuzz pairs a zip with its binary.
 	want "${t}" || continue
 	if [[ -d "${HERE}/corpus/${t}" ]]; then

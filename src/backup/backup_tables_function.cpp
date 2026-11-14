@@ -771,7 +771,7 @@ void RegisterBackupTablesFunctions(ExtensionLoader &loader) {
 		"Lists every column of the user tables in a SQL Server full backup (.bak), one row each, with its state at "
 		"a glance (sql_type as declared, an alias type by its name, system_type the type underneath): converted (read "
 		"as duckdb_type), stored_bytes (read as its stored bytes until its type's "
-		"conversion comes), off_row_pending (a value stored off row is read from spec 085 PR 3), not_stored (a "
+		"conversion comes), not_stored (a "
 		"computed column not persisted) or storage_format (a sparse column, a column set), and why. Optionally "
 		"one schema's or one table's (names as stored). The path is one file, a glob, or a list: every family of "
 		"one media set.",

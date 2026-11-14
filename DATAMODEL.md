@@ -1420,14 +1420,17 @@ flowchart BT
   sys --> basetables["mssql_backup_catalog<br/>(allow-list; sysobjvalues by DQ-11)"]
   model --> rec["records of a partition's in-row unit<br/>RecordView, LocateValue (types 0 / 1)"]
   rec --> stager["RecordStager<br/>codec staging + family kernels<br/>(FinalizeStagedColumn, shared with RowStager)"]
-  stager --> scan["mssql_backup_scan<br/>+ _mssql_page / _mssql_rid / _mssql_page_lsn"]
+  rec --> lob["backup_lob (PR 2b; rows in PR 3)<br/>off-row pointer → LOB tree / row-overflow,<br/>every node checked; _mssql_lob map"]
+  store --> lob
+  lob --> stager
+  stager --> scan["mssql_backup_scan<br/>+ _mssql_page / _mssql_rid / _mssql_page_lsn / _mssql_lob"]
 ```
 
 - **The file is untrusted input.** Every parser reads through `ByteReader` (`backup_bytes`), which
   checks each length, offset and count against its span; a read past one is a named `FormatError`,
   and the table function turns it into an `InvalidInputException` naming the file. Each MTF
   descriptor and stream header's XOR checksum is validated; the walk follows header lengths only,
-  never a resync. `make fuzz-backup-replay` replays the six harnesses (`fuzz/fuzz_backup_*`) over
+  never a resync. `make fuzz-backup-replay` replays the seven harnesses (`fuzz/fuzz_backup_*`) over
   their corpora, which `fuzz/gen_backup_seeds.cc` builds from synthetic files only.
 - **DuckDB-free parsers.** Everything but `backup_source`, `backup_open_pass`, `backup_opened`,
   `backup_function_common` and the functions (`backup_info_function`, `backup_tables_function`,
@@ -1493,8 +1496,7 @@ flowchart BT
   through spec 091's kernels on the client --; one whose conversion is still to come (`sql_variant`,
   `xml`, the CLR types, `vector`, `json`, a type the reader does not know) is its stored bytes, a `BLOB`.
   Not readable, named: a computed column not persisted (no stored value), a sparse column (the sparse
-  vector, 086), and until PR 3 a text / ntext / image column (its in-row bytes are a pointer). The scan
-  registers these as virtual columns, so `SELECT *` leaves them out and naming one is refused with its
+  vector, 086). The scan registers these as virtual columns, so `SELECT *` leaves them out and naming one is refused with its
   reason. `mssql_backup_tables.columns` and the scan take this one answer.
 - **Rows** (PR 2d). A record (`RecordView`, allocation-free) is split by its header alone; types 2-7
   (stubs, index and LOB records, ghosts, version ghosts) are not rows, a forwarded record's last
@@ -1503,7 +1505,7 @@ flowchart BT
   records); `RecordStager` appends it into the codec's staging -- as it is for every type but
   datetime, smalldatetime, money (halves swapped) and bit (its bit of a shared byte) -- and publishes a
   chunk through the TDS path's family kernels, so a value decodes as `TYPE mssql` decodes it. A value
-  stored off row is refused by name until PR 3. `mssql_backup_scan` cuts each partition's in-row IAM-listed pages, in page order, into units of
+  stored off row is read since PR 3 (below). `mssql_backup_scan` cuts each partition's in-row IAM-listed pages, in page order, into units of
   64 that DuckDB's tasks claim one at a time (PR 2e; a chunk is one unit's rows, its batch index the
   unit's, `max_threads` bounding the tasks; each call reserves its chunk's decoding against half of
   `max_memory` and DuckDB's memory, D17's wait-then-refuse rule in `ReservationGate`); a container's stream decodes outside its lock, each
@@ -1512,6 +1514,27 @@ flowchart BT
   order come from the thread's 256 KiB read-ahead, and the pass search guesses an extent's group from the sample below
   it. It adds the virtual `_mssql_page`, `_mssql_rid` (a heap row's
   original place = its `%%physloc%%`; a clustered row's key and uniquifier) and `_mssql_page_lsn`.
+- **Values stored off row** (`backup_lob`, PR 2b for view definitions, rows since PR 3; forms
+  measured in E21). A complex column's in-row bytes are told apart by their length: 16 a pointer to
+  a root record (text / ntext / image with `text in row` off, and a MAX type under `large value types
+  out of row`; with `text in row` on, a long value takes an in-row root), 24 of kind 2 a row-overflow pointer to one DATA
+  fragment in the rowset's ROW_OVERFLOW_DATA unit, 12 + 12n of kind 4 or 5 an in-row root over up to
+  five links. `WalkLob` follows the tree over `PageStore`'s live pages and checks every node as it
+  reads it: a node's bytes are what its parent claims (but the DATA fragment of a node's last link,
+  which a truncating `.WRITE` leaves with a stale tail), its level agrees with its children, its page
+  is of the form's unit, each fragment is referenced once, a NULL root (a text value updated to NULL
+  keeps its pointer) is NULL; up to 2^31 − 1 bytes. A character can straddle two fragments, so a
+  value is decoded across them. `RecordStager::PrepareRow` measures a row's off-row values before it
+  is staged and the scan reserves them by D17's rule (`CallReservations`: served from a grant's
+  credit, so a chunk's rows do not each take the gate's lock; a refusal with rows staged closes the
+  chunk before the row); a value of 1 MiB or more goes straight into its vector -- a BLOB or UTF-8
+  text copied, UTF-16 and code-page text decoded in 64 KiB blocks, a cut character carried -- and a
+  shorter one is staged for its column's kernel. The map-only walk (the leaves are their parents'
+  claims, not read) builds the virtual `_mssql_lob` (`backup_lob_map`, format 0x01): every off-row
+  value of the row with its in-row pointer and its nodes, for spec 089 to splice a value a
+  differential changed in part. A thread keeps the last GAM interval and PFS page it was answered
+  from (`AllocationMap`, read with no lock), so an off-row page's liveness check takes no lock.
+  Fuzzed by `fuzz_backup_lob`; compared with RESTORE on `lob.sql`'s fixture.
 - **Prepared statements** keep the row their bind read (`SupportStatementCache`); `reread := true`
   binds again on every `EXECUTE`. The opened-file cache shared across statements (D9) is task 22.
 
@@ -1526,7 +1549,7 @@ Server. Every column `mssql_backup_info` returns is compared or listed with its 
 the repository's R2 credentials), makes the fixtures' backups -- the samples' database, the catalog
 fixture, partitioned tables of every boundary type, two data files and a file removed, backups taken under a running workload, and data past
 one GAM interval, and from PR 2d the record forms of user tables (`rows.sql`) and the double-byte
-code pages (`dbcs.sql`); `test/backup/gen/*.sql` -- on SQL Server 2017, 2019, 2022 and 2025 (each image pinned by digest in `test/backup/gen/images.txt`): what that version can make --
+code pages (`dbcs.sql`), from PR 3 every off-row form (`lob.sql`); `test/backup/gen/*.sql` -- on SQL Server 2017, 2019, 2022 and 2025 (each image pinned by digest in `test/backup/gen/images.txt`): what that version can make --
 ZSTD on 2025 only, `MS_XPRESS` named from 2022 and plain `WITH COMPRESSION` before -- and stores them in R2 under `oracle/<key>/<version>/<run>/`, `<key>` a hash of `test/backup/gen/`:
 they are made again only when the generator, the data or an image changes, or when a `DONE` names
 a run that is no longer stored. `<version>/DONE`, written last, names the run whose upload is
