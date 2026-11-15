@@ -11,7 +11,7 @@ bool OrderKeyReadTruncates(const MSSQLColumnInfo &column) {
 	// under `datetime2_7_as = 'timestamp'` a datetime2(7) is read truncated too, so it is a
 	// last-key-only key here for the same reason time(7) is. `OrdersLikeDuckDB` already refuses
 	// datetime2(7) outright, so today this only keeps the two predicates from disagreeing.
-	return IsRoundTripExactForKey(column.sql_type_name, column.scale, column.is_cast_required,
+	return IsRoundTripExactForKey(column.sql_type_name, column.scale, column.comparison_differs,
 								  column.ReadsDatetime2Truncated()) == KeyFidelity::NotRoundTrip;
 }
 
