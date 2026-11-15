@@ -15,6 +15,7 @@
 
 #include "backup/backup_allocation.hpp"
 #include "backup/backup_bytes.hpp"
+#include "backup/backup_lsn.hpp"
 #include "backup/backup_page_index.hpp"
 
 #include <cstdint>
@@ -75,6 +76,7 @@ struct PageHeader {
 	uint16_t free_count = 0;
 	uint16_t free_data = 0;
 	PagePointer page_id;
+	Lsn lsn;  // m_lsn @40: the last log record that changed the page
 	uint16_t ghost_count = 0;
 
 	//! The allocation unit the header names: m_indexId << 48 | m_objId << 16.

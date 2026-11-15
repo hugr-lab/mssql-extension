@@ -147,8 +147,8 @@ bool HasSubqueryExpression(const SelectNode &node) {
 }
 
 bool IsGroupable(const MSSQLColumnInfo &column) {
-	if (IsRoundTripExactForKey(column.sql_type_name, column.scale, column.is_cast_required) ==
-		KeyFidelity::NotRoundTrip) {
+	if (IsRoundTripExactForKey(column.sql_type_name, column.scale, column.is_cast_required,
+							   column.ReadsDatetime2Truncated()) == KeyFidelity::NotRoundTrip) {
 		// time(7) / datetimeoffset(7), read as microseconds: two values 100 ns
 		// apart are two groups there and one value here -- harmless for an
 		// order, not for a set (the filter encoder's IsTruncatedReadColumn).
@@ -218,7 +218,8 @@ MSSQLColumnInfo DerivedColumn(const std::string &name, const LogicalType &type) 
 	default:
 		break;
 	}
-	return MSSQLColumnInfo(name, 0, sql_type, length, precision, scale, true, "", "");
+	// No datetime2 is built here (the switch above): its read form does not apply.
+	return MSSQLColumnInfo(name, 0, sql_type, length, precision, scale, true, "", "", MSSQLDatetime2Read::Nanoseconds);
 }
 
 }  // namespace node_writer

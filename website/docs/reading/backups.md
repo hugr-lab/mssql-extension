@@ -13,7 +13,7 @@ needs a file system that can list files: a local path or `s3://`, not `https://`
 `mssql_backup_info` describes a backup: what `RESTORE HEADERONLY`, `RESTORE LABELONLY` and
 `RESTORE FILELISTONLY` report. `mssql_backup_tables` and `mssql_backup_views` list what a full
 backup's database holds: its tables, their columns and types, and its views
-([below](#tables-and-views)). Reading the rows of a table comes in a later release.
+([below](#tables-and-views)). `mssql_backup_scan` reads a table's rows ([below](#rows)).
 
 ```sql
 SELECT backup_type, database_name, software_version, compatibility_level,
@@ -125,18 +125,59 @@ SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sale
 | `schema_name`, `table_name`, `object_id` | `VARCHAR`, `VARCHAR`, `INTEGER` | |
 | `shape` | `VARCHAR` | `heap`, `clustered` or `columnstore` |
 | `compression` | `VARCHAR` | `none`, `row`, `page`, `columnstore`, `columnstore_archive` (`level n` for a level the reader does not name); `mixed` when partitions differ |
-| `partition_count`, `row_count` | `INTEGER`, `BIGINT` | the row count the catalog keeps (`sys.partitions.rows`); NULL when a partition's count is negative (an upgraded database can hold one until `DBCC UPDATEUSAGE`) |
+| `partition_count`, `row_count` | `INTEGER`, `BIGINT` | the row count the catalog keeps (`sys.partitions.rows`); NULL when a partition's count is negative (an upgraded database can hold one until `DBCC UPDATEUSAGE`). For a clustered columnstore it includes the delta stores the tuple mover has not dropped yet, as SQL Server 2022 counts them (2025 does not); exact once columnstores are read |
 | `created`, `modified` | `TIMESTAMP` | `sys.tables.create_date` / `modify_date` |
-| `decodable`, `reason` | `BOOLEAN`, `VARCHAR` | whether a later release's scan reads the table, and why not (a clustered columnstore, ROW / PAGE compression, sparse columns, a partitioned table, for now) |
+| `decodable`, `reason` | `BOOLEAN`, `VARCHAR` | whether `mssql_backup_scan` reads the table, and why not (a clustered columnstore or ROW / PAGE compression, for now) |
 | `fuzzy_status`, `open_transactions`, `stale_transactions` | `VARCHAR`, `INTEGER`, `INTEGER` | NULL for now |
-| `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off: a plain `VARCHAR` for a string), `decodable`, `reason` |
+| `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type the scan returns: the one `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off -- a plain `VARCHAR` for a string --, or for now `BLOB`, its stored bytes, for `sql_variant`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector` and `json`, which a later release converts), `decodable` (false only for a column the scan cannot read: a computed one not persisted, a sparse one), `reason` (why a column is not converted or not readable) |
 | `allocation_units` | `LIST(STRUCT(…))` | the table's allocation units: `au_id`, `type` (`IN_ROW_DATA`, `LOB_DATA`, `ROW_OVERFLOW_DATA`), `rowset_id`, `index_id`, `partition_number`, `compression`, `filegroup_id`, `first_page`, `root_page`, `first_iam_page`, `live_pages` (NULL for now) |
-| `partitioning` | `STRUCT(…)` | NULL for now |
+| `partitioning` | `STRUCT(…)` | for a partitioned table (NULL on a filegroup): `function_name`, `scheme_name`, `column_name`, `column_id`, `parameter_type`, `range_right`, `boundaries` (a list of `VARIANT`s in the parameter's type, in boundary order; a NULL boundary is a NULL element), `destinations` (the filegroup of each partition), `next_used`, and `reason` when the reader cannot give it exactly (the boundaries are then NULL, never a partial list; the destinations and `next_used` are still given when only a boundary's value could not be read). The table's rows are read either way |
+| `partitions` | `LIST(STRUCT(…))` | every partition: `partition_number`, `rows`, `compression`, `filegroup` |
+
+`mssql_backup_schemas(path)` lists the database's schemas as `sys.schemas` does (the system schemas
+and the roles' included): `schema_id`, `schema_name`, and the `table_count` and `view_count` of user
+tables and views in each.
+
+`mssql_backup_columns(path [, schema [, table]])` lists every column of the user tables, one row
+each, with its state at a glance: `schema_name`, `table_name`, `column_id`, `column_name`,
+`sql_type` (as declared: an alias type by its own name, e.g. AdventureWorks' `Name`), `system_type`
+(the type underneath, declared: `nvarchar(50)`; NULL for a user-defined CLR type), `duckdb_type` (the
+type the scan returns a column it reads as; the declared type's otherwise), `state` and `reason`.
+The states:
+
+| state | meaning |
+|---|---|
+| `converted` | read as `duckdb_type` |
+| `stored_bytes` | read as its stored bytes (`BLOB`) until its type's conversion comes: `sql_variant`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector`, `json` |
+| `not_stored` | a computed column that is not persisted: it has no stored value |
+| `storage_format` | a sparse column or a column set: its value is in the row's sparse vector, read in a later release |
+
+A value stored off row -- `text` / `ntext` / `image`, a MAX type's long value, a value pushed off a
+row past 8,060 bytes -- is read like one in row, so it has no state of its own. The `schema` and
+`table` arguments are matched as stored (a name that is not there lists nothing). A column's state is its own: a table that `mssql_backup_tables` says is not read (a
+columnstore, ROW / PAGE compression, for now) keeps its columns' states and says so in each
+`reason`, so a query for what will not be read asks for both:
+
+```sql
+SELECT table_name, column_name, state, reason
+FROM mssql_backup_columns('/backups/sales_full.bak') WHERE state <> 'converted' OR reason IS NOT NULL;
+```
+
+A filter on `schema_name`, `table_name` or `view_name` -- `=` a name, `IN` a list, or an `OR` of
+those -- makes the listings (and `mssql_backup_columns`) describe only the objects it names: on a
+database of thousands of tables, `WHERE table_name = 'orders'` reads the system tables but builds
+one table's columns, layout and partitioning. The rows are the same either way, but for one bound: a
+call reads at most 1 GiB of views' definitions stored off row, so a narrowed call can give a
+definition that the whole listing, past that bound, gives as NULL with its reason. `EXPLAIN` shows
+what a call describes (`Describes`).
 
 `mssql_backup_views` columns: `schema_name`, `view_name`, `object_id`, `definition` (the T-SQL text
 as stored; NULL for a view created `WITH ENCRYPTION`, which the reader does not de-obfuscate),
-`is_encrypted`, `created`, `modified`, and `reason`: why a definition could not be read, NULL
-otherwise.
+`is_encrypted`, `created`, `modified`, `reason`: why a definition could not be read, NULL
+otherwise; and `is_indexed`: true for an indexed view (one with a unique clustered index, which
+stores its rows), with its `shape`, `compression`, `row_count`, and `decodable` / `scan_reason`
+(whether `mssql_backup_scan` reads them, and why not) -- all NULL for a view that stores no rows
+(`row_count` also when the count is unknown).
 
 The oracle lane compares both with the server's own catalog of the same database (`sys.tables`,
 `sys.columns`, `sys.sql_modules`): per table its id, shape, partitions, rows and dates, per column
@@ -162,11 +203,71 @@ SELECT * FROM mssql_backup_catalog('/backups/sales_full.bak');
 SELECT _mssql_page, id, name, type FROM mssql_backup_catalog('/backups/sales_full.bak', 'sysschobjs');
 ```
 
+## Rows
+
+`mssql_backup_scan(path, schema, table)` reads a user table's rows from a full backup, typed as
+`TYPE mssql` reads them over a connection (`mssql_catalog_native_types` off: a plain `VARCHAR` for a
+string). Every collation is converted, the double-byte code pages (Japanese, Chinese, Korean)
+included. A type whose conversion comes in a later release -- `sql_variant`, `xml`, `geometry` /
+`geography`, `hierarchyid`, `vector`, `json` -- is returned as its stored bytes, a `BLOB`; no column
+is refused for its type. A column the scan cannot read -- a computed column that is not persisted (no
+stored value) or a sparse column -- is left out of `SELECT *`; a query that names it is refused,
+with the reason (`mssql_backup_tables.columns`).
+
+Values stored off row are read like the others: `text` / `ntext` / `image`, a `varchar(max)` /
+`nvarchar(max)` / `varbinary(max)` / `xml` value too long for its row, and a value a row past 8,060
+bytes pushed off (row-overflow), up to 2^31 − 1 bytes a value. Each is assembled from the pieces
+SQL Server stored it in and checked as it is: every piece holds at least the bytes the value's tree
+says it does, lies in the partition's own LOB or row-overflow pages, and is used once. A value is
+reserved before it is read, within half of `max_memory` (below); one of a mebibyte or more is copied
+or decoded straight into its result.
+
+An indexed view is read the same way: `mssql_backup_scan(path, schema, view)` returns the rows its
+unique clustered index stores (`_mssql_rid` its clustered key), the rows `SELECT … WITH (NOEXPAND)`
+returns on the server. A view without one stores no rows and is refused by name. Its columns are
+the scan's (`DESCRIBE`); `mssql_backup_columns` lists the tables'.
+
+The scan runs on DuckDB's threads (`threads`); `max_threads := n` uses fewer for one call (a value
+above `threads` is clamped to it, with a warning in `duckdb_logs`). `max_memory := '2GB'` bounds
+the memory one call reserves for decoding to half of it (default `memory_limit`, which it cannot
+exceed): tasks wait for each other's memory, and a table whose rows cannot be decoded within it is
+refused by name. Rows come in page order, which DuckDB keeps where insertion order is preserved.
+
+```sql
+SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');
+
+-- On two threads at most
+SELECT count(*) FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders', max_threads := 2);
+
+-- Import into DuckDB
+CREATE TABLE orders AS SELECT * FROM mssql_backup_scan('/backups/sales_full.bak', 'sales', 'orders');
+```
+
+Four virtual columns, which `SELECT *` leaves out:
+
+| column | type | meaning |
+|---|---|---|
+| `_mssql_page` | `VARCHAR` | the row's page: `'01'`, then its file and page number in hex (14 characters) |
+| `_mssql_rid` | `BLOB` | the row's identity: a heap row's original place (its `%%physloc%%`, after a byte `0x00`), a clustered row's key (after `0x01`), stable across index rebuilds |
+| `_mssql_page_lsn` | `DECIMAL(25,0)` | the LSN of the page's last change, in `RESTORE HEADERONLY`'s numeric form |
+| `_mssql_lob` | `BLOB` | the row's values stored off row and the pages that hold them -- every one of the row's, whichever columns are selected -- in a format of the reader's own (versioned by its first byte), for a later differential backup's import; NULL for a row with none (a `text` / `ntext` / `image` value updated to NULL keeps its place off row, so its row has a map) |
+
+Refused by name, for now: a table with ROW or PAGE compression or a clustered columnstore index
+(see `mssql_backup_tables.reason`); a column the scan cannot read, when it is named (above); a
+value stored off row that cannot fit in half of `max_memory` even with nothing else of the scan
+held, or in DuckDB's memory (named by its row's `_mssql_rid`, its page and slot, and its columns and
+sizes), or whose stored pieces do not form its tree; and a page that became live while the backup ran (a backup taken under writes), whose content is only in the
+backup's log tail. A backup taken under writes is read as its data pages hold it, which may differ
+from what `RESTORE` makes of it by replaying the log tail.
+
+The oracle lane restores every fixture backup of SQL Server 2017 to 2025 and compares each table's
+rows with `mssql_backup_scan`'s, both ways, through `TYPE mssql`.
+
 ## Prepared statements
 
 `mssql_backup_info` reads the file when the statement binds, and a prepared statement keeps what
-its `PREPARE` read (`mssql_backup_tables`, `mssql_backup_views` and `mssql_backup_catalog` read it on
-every execution). `reread := true` reads the file again on every `EXECUTE`, for a file that is overwritten
+its `PREPARE` read (`mssql_backup_tables`, `mssql_backup_views`, `mssql_backup_catalog` and
+`mssql_backup_scan` read it on every execution). `reread := true` reads the file again on every `EXECUTE`, for a file that is overwritten
 between runs (a nightly backup to the same path):
 
 ```sql

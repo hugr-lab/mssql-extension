@@ -299,6 +299,58 @@ void FinalizeFallbackColumn(const ColumnStaging &st, idx_t count, const tds::Col
 
 }  // namespace
 
+void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
+						  Vector &out) {
+	switch (kernel) {
+	case FinalizeKernel::None:
+		break;
+	case FinalizeKernel::String:
+		string::DecodeChunkFromStaging(st, count, meta, out);
+		break;
+	case FinalizeKernel::Binary:
+		binary::DecodeChunkFromStaging(st, count, meta, out);
+		break;
+	case FinalizeKernel::Uuid:
+		uuid::DecodeChunkFromStaging(st, count, meta, out);
+		break;
+	case FinalizeKernel::Decimal:
+		decimal::DecodeChunkFromStaging(st, count, meta, out);
+		break;
+	case FinalizeKernel::Money:
+		money::DecodeChunkFromStaging(st, count, meta, out);
+		break;
+	case FinalizeKernel::Datetime:
+		datetime::DecodeChunkFromStaging(st, count, meta, out);
+		break;
+	case FinalizeKernel::Text:
+		FinalizeFallbackColumn(st, count, meta, out);
+		break;
+	case FinalizeKernel::CodePage:
+		code_page::DecodeChunkFromStaging(st, count, meta, out);
+		break;
+	}
+}
+
+void PublishStagedValidity(const ColumnStaging &st, idx_t count, Vector &out) {
+	if (st.null_count == 0) {
+		return;
+	}
+	ValidityMask &mask = FlatVector::ValidityMutable(out);
+	mask.EnsureWritable();
+	// AND, not memcpy: a kernel may have set NULLs of its own before this runs
+	// — datetime does, for a datetime2 whose value does not fit the target
+	// variant (issue #168) — and overwriting the mask would silently republish
+	// those rows as valid, with a slot the kernel never wrote. Same layout on
+	// both sides (64-bit words, 1 = valid), which is why ColumnStaging keeps
+	// validity in this shape. Bits past `count` are set from BeginChunk and
+	// are ignored downstream.
+	uint64_t *published = mask.GetData();
+	const idx_t words = (count + 63) / 64;
+	for (idx_t w = 0; w < words; w++) {
+		published[w] &= st.validity_words[w];
+	}
+}
+
 void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, const std::vector<Vector *> &targets) {
 	metadata_ = &metadata;
 	reader_ = make_uniq<tds::RowReader>(metadata);
@@ -307,6 +359,7 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 	const idx_t column_count = metadata.size();
 	ops_.assign(column_count, ColumnOps());
 	chunk_nulls_.assign(column_count, 0);
+	chunk_out_of_range_.assign(column_count, 0);
 	unbounded_columns_.clear();
 	arena_.Configure(column_count);
 	// Bind the staging addresses ONCE. They are stable for as long as the arena
@@ -588,7 +641,6 @@ size_t RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_i
 }
 
 void RowStager::FinalizeChunk(idx_t row_count) {
-	const idx_t words = (row_count + 63) / 64;
 	for (idx_t c = 0; c < ops_.size(); c++) {
 		if (ops_[c].arm >= AppendArm::Unsupported) {
 			chunk_nulls_[c] = 0;
@@ -596,8 +648,18 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		}
 		const ColumnStaging &st = *staging_[c];
 		const tds::ColumnMetadata &meta = (*metadata_)[c];
+		// A datetime2 read as TIMESTAMP_NS is the one kernel that reads a value as NULL (issue #168):
+		// counted for spec 093 D8's warning. The kernel's NULLs are in the mask before the staged
+		// validity is ANDed in, so the mask's NULLs then are exactly the values that did not fit.
+		const bool out_of_range_counted = ops_[c].kernel == FinalizeKernel::Datetime &&
+										  meta.type_id == tds::TDS_TYPE_DATETIME2 &&
+										  targets_[c]->GetType().id() == LogicalTypeId::TIMESTAMP_NS;
+		chunk_out_of_range_[c] = 0;
 		if (TryEmitConstant(c, st, meta, row_count)) {
 			chunk_nulls_[c] = st.null_count;
+			if (out_of_range_counted && st.null_count == 0 && ConstantVector::IsNull(*targets_[c])) {
+				chunk_out_of_range_[c] = row_count;	 // one value, repeated: it did not fit
+			}
 			continue;
 		}
 		std::chrono::steady_clock::time_point started;
@@ -607,33 +669,10 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		// Which kernel is a property of the column, resolved with the append arm
 		// after COLMETADATA, so this is one switch on one invariant value and the
 		// kernel's own loop carries no dispatch at all.
-		switch (ops_[c].kernel) {
-		case FinalizeKernel::None:
-			break;
-		case FinalizeKernel::String:
-			string::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
-			break;
-		case FinalizeKernel::Binary:
-			binary::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
-			break;
-		case FinalizeKernel::Uuid:
-			uuid::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
-			break;
-		case FinalizeKernel::Decimal:
-			decimal::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
-			break;
-		case FinalizeKernel::Money:
-			money::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
-			break;
-		case FinalizeKernel::Datetime:
-			datetime::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
-			break;
-		case FinalizeKernel::Text:
-			FinalizeFallbackColumn(st, row_count, meta, *targets_[c]);
-			break;
-		case FinalizeKernel::CodePage:
-			code_page::DecodeChunkFromStaging(st, row_count, meta, *targets_[c]);
-			break;
+		FinalizeStagedColumn(ops_[c].kernel, st, row_count, meta, *targets_[c]);
+		if (out_of_range_counted) {
+			const ValidityMask &kernel_nulls = FlatVector::Validity(*targets_[c]);
+			chunk_out_of_range_[c] = kernel_nulls.CannotHaveNull() ? 0 : row_count - kernel_nulls.CountValid(row_count);
 		}
 		if (counters_enabled_) {
 			const auto elapsed = std::chrono::steady_clock::now() - started;
@@ -645,22 +684,7 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		// DuckDB to allocate a mask it does not need, and the append arm already
 		// counted the NULLs, so that costs one test rather than a scan.
 		chunk_nulls_[c] = st.null_count;
-		if (st.null_count == 0) {
-			continue;
-		}
-		ValidityMask &mask = FlatVector::ValidityMutable(*targets_[c]);
-		mask.EnsureWritable();
-		// AND, not memcpy: a kernel may have set NULLs of its own before this runs
-		// — datetime does, for a datetime2 whose value does not fit the target
-		// variant (issue #168) — and overwriting the mask would silently republish
-		// those rows as valid, with a slot the kernel never wrote. Same layout on
-		// both sides (64-bit words, 1 = valid), which is why ColumnStaging keeps
-		// validity in this shape. Bits past row_count are set from BeginChunk and
-		// are ignored downstream.
-		uint64_t *published = mask.GetData();
-		for (idx_t w = 0; w < words; w++) {
-			published[w] &= st.validity_words[w];
-		}
+		PublishStagedValidity(st, row_count, *targets_[c]);
 	}
 	arena_.EndChunk();
 }

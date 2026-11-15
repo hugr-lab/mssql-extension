@@ -233,6 +233,33 @@ int main() {
 				  std::to_string(gap >> 20) + " MiB gap), then not at all");
 	}
 	{
+		// The guess (PR 2e): a table's extents following one another in the pass, an extent far past
+		// the only sample is found by reading its own group alone, not the groups of the extents
+		// between, which a gallop from the sample would read. With zero
+		// groups before it the guess lands short and the search goes on from there: still found.
+		std::vector<ExtentId> layout;
+		for (uint32_t e = 0; e < 1000; e++) {
+			layout.push_back(E(1, e));
+		}
+		layout.insert(layout.begin() + 600, 5, NO_EXTENT);
+		Bytes file;
+		for (const auto &g : layout) {
+			auto bytes = Group(g);
+			file.insert(file.end(), bytes.begin(), bytes.end());
+		}
+		MemoryAccess access("contiguous.bak", file.data(), file.size());
+		PassSearch search(std::unique_ptr<PassMedium>(new FilePassMedium(access, 0, layout.size())));
+		uint64_t at = 0;
+		const bool first = search.Find(E(1, 0), at) && at == 0;
+		const uint64_t before = search.BytesRead();
+		const bool far = search.Find(E(1, 400), at) && at == 400;
+		const uint64_t read = search.BytesRead() - before;
+		const bool past_gap = search.Find(E(1, 900), at) && at == 905;
+		Check(first && far && read == 65536 && past_gap,
+			  "a guessed group: an extent 400 groups past the sample read as its one group (" +
+				  std::to_string(read >> 10) + " KB), and one past zero groups found where it is");
+	}
+	{
 		// A container: a 8 KB lead-in block, the pass's 64 KB blocks, five trailer blocks.
 		Bytes file(8192, 0);
 		AppendBlock(file, Bytes(8192, 0));

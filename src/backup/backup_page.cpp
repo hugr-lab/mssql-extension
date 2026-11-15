@@ -37,6 +37,9 @@ PageHeader ReadPageHeader(const uint8_t *page) {
 	h.free_count = r.U16(28);
 	h.free_data = r.U16(30);
 	h.page_id = ReadPagePointer(r, 32);
+	h.lsn.vlf = r.U32(40);
+	h.lsn.block = r.U32(44);
+	h.lsn.slot = r.U16(48);
 	h.ghost_count = r.U16(58);
 	return h;
 }

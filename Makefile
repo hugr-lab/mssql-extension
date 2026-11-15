@@ -35,7 +35,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Custom targets (preserved from original Makefile)
 #
 
-.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay fuzz-backup-replay test-backup-golden backup-oracle-build check-credential-logging leak-check crap-cpp crap-cpp-selftest crap-cpp-test help
+.PHONY: azure-test code-pages-generate code-pages-tables code-pages-check-wire test-code-page test-code-page-portable bench-code-page bench-backup-xpress bench-code-page-tiers bench-code-page-column test-cpp test-cpp-run test-transaction-pin test-dml-vehicle test-dead-connection test-rowid-debug vcpkg-setup docker-up docker-down docker-status integration-test test-all test-debug test-simple-query test-multi-instance-pool-isolation test-issue-96-attach-loop test-spec047-us1 test-result-stream-registry-isolation test-spec047-us3 test-token-cache-isolation test-spec047-us-sec test-concurrent-reads bench-build test-column-staging test-skip-form-equivalence test-row-stager test-row-stager-framing test-index-kind test-load-policy test-dml-capabilities counters-test joern-cpg joern-scan joern-shell fuzz-encode-replay fuzz-backup-replay test-backup-golden backup-oracle-build check-credential-logging leak-check crap-cpp crap-cpp-selftest crap-cpp-test help
 
 # Bootstrap vcpkg if not present.
 # Spec 052 PR #127 CI fix: check for the toolchain file specifically, not just
@@ -659,6 +659,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_container.cpp \
     test/cpp/backup/test_backup_iam.cpp \
     test/cpp/backup/test_backup_lob.cpp \
+    test/cpp/backup/test_backup_lob_map.cpp \
     test/cpp/backup/test_backup_info.cpp \
     test/cpp/backup/test_backup_mtf.cpp \
     test/cpp/backup/test_backup_open_pass.cpp \
@@ -667,9 +668,13 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_pass_search.cpp \
     test/cpp/backup/test_backup_ranges.cpp \
     test/cpp/backup/test_backup_record.cpp \
+    test/cpp/backup/test_backup_record_stager.cpp \
+    test/cpp/backup/test_backup_reservation.cpp \
+    test/cpp/backup/test_backup_rows.cpp \
     test/cpp/backup/test_backup_source.cpp \
     test/cpp/backup/test_backup_system_tables.cpp \
     test/cpp/backup/test_backup_xpress.cpp \
+    test/cpp/backup/test_backup_xpress_diff.cpp \
     test/cpp/backup/test_backup_zstd.cpp \
     test/cpp/test_catalog_filter.cpp \
     test/cpp/test_filter_encoder.cpp \
@@ -935,6 +940,17 @@ bench-code-page: release
 	$(CXX) $(BENCH_UTF16_FLAGS) -DNDEBUG $(BENCH_UTF16_INCLUDES) test/cpp/bench_code_page.cpp $(CODE_PAGE_SOURCES) \
 	    $(BENCH_UTF16_LIBS) -o build/test/bench_code_page
 	build/test/bench_code_page
+
+# Spec 085 PR 2e: the MS_XPRESS decoder over every compressed block of the given containers --
+# compared with PR 1's decoder (test/cpp/backup/xpress_reference.hpp) block by block, then timed
+# (MB/s of output, best of PASSES). DuckDB-free. Manual target, not in CI:
+#   make bench-backup-xpress FILES="test/data/backup/full_xpress.bak /tmp/bench/xpress.bak"
+BENCH_XPRESS_FILES ?= $(if $(FILES),$(FILES),test/data/backup/full_xpress.bak)
+bench-backup-xpress:
+	@mkdir -p build/test
+	$(CXX) -std=c++17 -O3 -DNDEBUG -I src/include -I test/cpp/backup test/cpp/backup/bench_backup_xpress.cpp \
+	    src/backup/backup_xpress.cpp -o build/test/bench_backup_xpress
+	build/test/bench_backup_xpress $(BENCH_XPRESS_FILES)
 
 # Spec 091 / 092 D12: one column of a 2048-row chunk, staging to finished vector: today's
 # NVARCHAR path (the production codec::string::DecodeChunkFromStaging) against
@@ -1427,9 +1443,9 @@ fuzz-encode-replay: release
 # Linux leak-check lane replays the same corpora under ASan + LSan. The corpora are synthetic
 # (fuzz/gen_backup_seeds.cc): no backup of a server whose data is not ours (spec 085 T4).
 fuzz-backup-replay:
-	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog" \
+	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob" \
 	    $(PROJ_DIR)fuzz/build.sh
-	@for t in backup_mtf backup_container backup_xpress backup_page backup_catalog; do \
+	@for t in backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob; do \
 	    $(PROJ_DIR)fuzz/out/fuzz_$$t $(PROJ_DIR)fuzz/corpus/$$t || exit 1; \
 	done
 # Spec 085 acceptance 2 over the committed samples: mssql_backup_info against the golden RESTORE

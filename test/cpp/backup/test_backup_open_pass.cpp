@@ -8,10 +8,13 @@
 // wave is refused naming the file and its offset. Groups fed out of order or past the pass are
 // refused. RangedPassMapper scans a SourceAccess in ranges and anything else in memory.
 
+#include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "backup/backup_bytes.hpp"
@@ -158,6 +161,79 @@ int main() {
 		uint8_t at = 0;
 		file.ReadAt(PREFIX + 2, &at, 1);
 		Check(file.Size() == ordered.size() && at == 1, "SourceAccess reads the family file");
+	}
+	{
+		// The thread's read-ahead (PR 2e step 7), each case on a fresh access so its fetches are counted
+		// from 0: every read gives the file's bytes, and the fetches are what the read-ahead says.
+		auto same = [](const SourceAccess &access, const Bytes &bytes, uint64_t offset, size_t count) {
+			Bytes got(count);
+			access.ReadAt(offset, got.data(), count);
+			return std::equal(got.begin(), got.end(), bytes.begin() + static_cast<std::ptrdiff_t>(offset));
+		};
+		const uint64_t ra = SourceAccess::READ_AHEAD;
+		{
+			SourceAccess in_order(*source, 0);
+			bool ok = true;
+			uint64_t read = 0;
+			for (uint64_t at = PREFIX; at + 8192 <= mixed.size(); at += 8192, read += 8192) {
+				ok = ok && same(in_order, mixed, at, 8192);
+			}
+			// The first read as asked, then one fetch of READ_AHEAD a run of it.
+			const uint64_t expect = 1 + (read - 8192 + ra - 1) / ra;
+			Check(ok && in_order.Fetches() == expect,
+				  "pages in order: the first fetched as asked, then one fetch a 256 KiB (" +
+					  std::to_string(in_order.Fetches()) + " fetches, " + std::to_string(expect) + " expected)");
+		}
+		{
+			SourceAccess gaps(*source, 0);
+			const uint64_t p = PREFIX;
+			bool ok = same(gaps, mixed, p, 8192);					   // as asked: 1
+			ok = ok && same(gaps, mixed, p + 8192 + 40000, 8192);	   // 40000 past the last: read ahead, 2
+			ok = ok && same(gaps, mixed, p + 2 * 8192 + 40000, 8192);  // within it: no fetch
+			ok = ok && same(gaps, mixed, p + 8192 + 40000, 100);	   // a step back within it: no fetch
+			const uint64_t gaps_two = gaps.Fetches();
+			ok = ok && same(gaps, mixed, p + 8192 + 40000 + ra + 100000, 8192);	 // far past: as asked, 3
+			const uint64_t gaps_three = gaps.Fetches();
+			Check(ok && gaps_two == 2 && gaps_three == 3,
+				  "a gap within 64 KiB reads ahead, a read within the read-ahead or a step back in it fetches "
+				  "nothing, a gap past it is read as asked (" +
+					  std::to_string(gaps_two) + ", " + std::to_string(gaps_three) + " fetches)");
+		}
+		{
+			SourceAccess a(*source, 0);
+			SourceAccess b(*source, 1);
+			bool ok = same(a, mixed, PREFIX, 8192) && same(a, mixed, PREFIX + 8192, 8192);	// 1 + read ahead
+			ok = ok && same(b, ordered, PREFIX, 8192);	// another file on this thread: a's read-ahead goes
+			ok = ok && same(a, mixed, PREFIX + 2 * 8192, 8192) && same(a, mixed, PREFIX + 3 * 8192, 8192);
+			Check(ok && a.Fetches() == 4 && b.Fetches() == 1,
+				  "back from another file: read as asked, then ahead again (" + std::to_string(a.Fetches()) +
+					  " fetches)");
+			SourceAccess end(*source, 0);
+			ok = same(end, mixed, mixed.size() - 9000, 4000) && same(end, mixed, mixed.size() - 5000, 4000) &&
+				 same(end, mixed, mixed.size() - 1000, 1000) && same(end, mixed, 0, static_cast<size_t>(ra) + 10);
+			Check(ok && end.Fetches() == 3,
+				  "the file's end: the read-ahead clamped to it; a read as long as the read-ahead fetched as asked (" +
+					  std::to_string(end.Fetches()) + " fetches)");
+		}
+		SourceAccess a(*source, 0);
+		Bytes past(2);
+		Check(ErrorOf([&]() { a.ReadAt(mixed.size() - 1, past.data(), 2); }).find("mixed.bak") != std::string::npos,
+			  "a read past the end is refused naming the file");
+		std::vector<std::thread> threads;
+		std::atomic<int> wrong{0};
+		for (int t = 0; t < 4; t++) {
+			threads.emplace_back([&, t]() {
+				for (uint64_t at = PREFIX + t * 4096; at + 8192 <= mixed.size(); at += 8192) {
+					if (!same(a, mixed, at, 8192)) {
+						wrong++;
+					}
+				}
+			});
+		}
+		for (auto &thread : threads) {
+			thread.join();
+		}
+		Check(wrong == 0, "four threads reading one file in order, each from its own read-ahead: the file's bytes");
 	}
 	{
 		Bytes bad = mixed;

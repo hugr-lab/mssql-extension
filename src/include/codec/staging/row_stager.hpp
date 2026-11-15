@@ -84,6 +84,17 @@ struct StagingCounters {
 	uint64_t unbounded_columns = 0;
 };
 
+//! Publish one staged column into `out` through its finalize kernel: a family's batch decode, or for
+//! FinalizeKernel::Text the issue-#89 rendering as text; None does nothing (the values were written
+//! straight into the vector). Validity is not touched: PublishStagedValidity. Shared by RowStager and
+//! the backup reader's RecordStager (spec 085 PR 2d), so a column decodes the one way.
+void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
+						  Vector &out);
+
+//! AND the staged NULLs of `count` rows into `out`'s mask (a kernel may have set NULLs of its own,
+//! which must stay); nothing when the column staged none.
+void PublishStagedValidity(const ColumnStaging &st, idx_t count, Vector &out);
+
 //! Walks TDS row bytes into DuckDB vectors, column-major where it pays.
 //!
 //! Owned by MSSQLResultStream, one per stream, reused across chunks and result
@@ -167,6 +178,13 @@ public:
 		return chunk_nulls_[c];
 	}
 
+	//! Values of column `c` in the chunk just finalized that its kernel read as NULL because they do
+	//! not fit the target -- a datetime2 outside 1677-2262 read as TIMESTAMP_NS (issue #168; spec 093
+	//! D8's warning). Counted only for a datetime2 column read as TIMESTAMP_NS, else 0.
+	idx_t ChunkOutOfRange(idx_t c) const {
+		return chunk_out_of_range_[c];
+	}
+
 	//! True when column `c` never reaches an output vector (Skip arm).
 	bool IsSkipped(idx_t c) const {
 		return ops_[c].arm == AppendArm::Skip;
@@ -202,6 +220,8 @@ private:
 	std::vector<Vector *> targets_;
 	//! Per-column NULL count for the chunk just finalized (D4 counters).
 	std::vector<idx_t> chunk_nulls_;
+	//! Per-column values read as NULL for not fitting the target (ChunkOutOfRange).
+	std::vector<idx_t> chunk_out_of_range_;
 	//! Columns whose staged size is not bounded by their declared width (PLP).
 	//! Pointers, not indices: this list is walked once per ROW.
 	std::vector<ColumnStaging *> unbounded_columns_;

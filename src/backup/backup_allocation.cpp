@@ -4,6 +4,7 @@
 #include "backup/backup_bytes.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <string>
 
 namespace duckdb {
@@ -61,7 +62,38 @@ std::vector<uint8_t> AllocationMap::ReadPage(uint16_t file, uint32_t page, uint8
 	return bytes;
 }
 
-AllocationMap::AllocationMap(const PageIndex &index, const std::vector<uint16_t> &files) : index_(index) {
+namespace {
+
+uint64_t NextMapId() {
+	static std::atomic<uint64_t> next{1};
+	return next.fetch_add(1);
+}
+
+//! A thread's last answers of one map (by its id), read with no lock: a scan's off-row pages are asked
+//! about one by one, each a GAM and a PFS lookup, and two locks a page held 8 threads on the map's mutex
+//! for a third of their time (PR 3 S7, 200,000 rows of 10 KB off row). A GAM interval's bits never
+//! change once loaded (their buffer stays put when the intervals' vector grows); a PFS page is shared
+//! with the cache, so it outlives its eviction while the thread keeps it (one page a thread, unaccounted
+//! in MemoryBytes).
+struct LastGam {
+	uint64_t map = 0;
+	uint16_t file = 0;
+	size_t interval = 0;
+	const uint8_t *bits = nullptr;	// null: all free
+};
+struct LastPfs {
+	uint64_t map = 0;
+	uint16_t file = 0;
+	uint32_t page = 0;
+	std::shared_ptr<const std::vector<uint8_t>> bytes;
+};
+thread_local LastGam last_gam;
+thread_local LastPfs last_pfs;
+
+}  // namespace
+
+AllocationMap::AllocationMap(const PageIndex &index, const std::vector<uint16_t> &files)
+	: index_(index), id_(NextMapId()) {
 	std::vector<uint16_t> ids = files;
 	std::sort(ids.begin(), ids.end());
 	ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
@@ -89,7 +121,17 @@ AllocationMap::AllocationMap(const PageIndex &index, const std::vector<uint16_t>
 bool AllocationMap::GamFree(const File &file, uint32_t extent) const {
 	const size_t interval = extent / GAM_INTERVAL_EXTENTS;
 	const uint32_t within = extent % GAM_INTERVAL_EXTENTS;
+	if (last_gam.map == id_ && last_gam.file == file.id && last_gam.interval == interval) {
+		return !last_gam.bits || ((last_gam.bits[within / 8] >> (within % 8)) & 1);
+	}
 	auto &f = const_cast<File &>(file);
+	auto remember = [&]() {
+		// Under the lock: the interval is loaded, and its bits are published to this thread.
+		last_gam.map = id_;
+		last_gam.file = file.id;
+		last_gam.interval = interval;
+		last_gam.bits = f.gam_free[interval].empty() ? nullptr : f.gam_free[interval].data();
+	};
 	{
 		std::lock_guard<std::mutex> guard(lock_);
 		// An interval past the recorded Size: the Size is a lower bound (a stale header after an
@@ -100,6 +142,7 @@ bool AllocationMap::GamFree(const File &file, uint32_t extent) const {
 			f.gam_loaded.resize(interval + 1, false);
 		}
 		if (f.gam_loaded[interval]) {
+			remember();
 			// An interval the backup carries no GAM for is cached as an empty bitmap: all free.
 			return f.gam_free[interval].empty() || ((f.gam_free[interval][within / 8] >> (within % 8)) & 1);
 		}
@@ -133,6 +176,7 @@ bool AllocationMap::GamFree(const File &file, uint32_t extent) const {
 		f.gam_free[interval] = std::move(bits);
 		f.gam_loaded[interval] = true;
 	}
+	remember();
 	return f.gam_free[interval].empty() || ((f.gam_free[interval][within / 8] >> (within % 8)) & 1);
 }
 
@@ -177,11 +221,18 @@ bool AllocationMap::ExtentAllocated(uint16_t file, uint32_t page) const {
 uint8_t AllocationMap::PfsByte(const File &file, uint32_t page) const {
 	const uint32_t interval = page / PFS_INTERVAL;
 	const uint32_t pfs_page = interval == 0 ? 1 : interval * PFS_INTERVAL;
+	if (last_pfs.map == id_ && last_pfs.file == file.id && last_pfs.page == pfs_page) {
+		return (*last_pfs.bytes)[PFS_BYTES_AT + page % PFS_INTERVAL];
+	}
 	{
 		std::lock_guard<std::mutex> guard(lock_);
 		for (size_t i = 0; i < pfs_cache_.size(); i++) {
 			if (pfs_cache_[i].file == file.id && pfs_cache_[i].page == pfs_page) {
-				return pfs_cache_[i].bytes[PFS_BYTES_AT + page % PFS_INTERVAL];
+				last_pfs.map = id_;
+				last_pfs.file = file.id;
+				last_pfs.page = pfs_page;
+				last_pfs.bytes = pfs_cache_[i].bytes;
+				return (*pfs_cache_[i].bytes)[PFS_BYTES_AT + page % PFS_INTERVAL];
 			}
 		}
 	}
@@ -190,8 +241,13 @@ uint8_t AllocationMap::PfsByte(const File &file, uint32_t page) const {
 	PfsPage entry;
 	entry.file = file.id;
 	entry.page = pfs_page;
-	entry.bytes = ReadPage(file.id, pfs_page, PAGE_TYPE_PFS, "a PFS page");
-	const uint8_t value = entry.bytes[PFS_BYTES_AT + page % PFS_INTERVAL];
+	entry.bytes =
+		std::make_shared<const std::vector<uint8_t>>(ReadPage(file.id, pfs_page, PAGE_TYPE_PFS, "a PFS page"));
+	const uint8_t value = (*entry.bytes)[PFS_BYTES_AT + page % PFS_INTERVAL];
+	last_pfs.map = id_;
+	last_pfs.file = file.id;
+	last_pfs.page = pfs_page;
+	last_pfs.bytes = entry.bytes;
 	std::lock_guard<std::mutex> guard(lock_);
 	if (pfs_cache_.size() >= PFS_CACHE_PAGES) {
 		pfs_cache_.erase(pfs_cache_.begin());

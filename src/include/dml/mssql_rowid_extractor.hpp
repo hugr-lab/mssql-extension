@@ -7,6 +7,12 @@
 
 namespace duckdb {
 
+//! Issue #559: throws for a rowid component read as NULL -- a key column is NOT NULL, so the value
+//! did not fit its read type (a datetime2(7) outside 1677-2262 as TIMESTAMP_NS). Names the column.
+[[noreturn]] void RefuseNullKeyValue(const string &column);
+//! RefuseNullKeyValue's message, for a caller that must fail through its own path (the staged DML).
+string NullKeyValueMessage(const string &column);
+
 //===----------------------------------------------------------------------===//
 // Rowid-to-PK Extraction Utilities
 //

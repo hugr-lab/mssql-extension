@@ -39,12 +39,13 @@ per table. Making a busy full backup exact (redo and undo of its own log tail) i
 
 In: everything above.
 
-Out, each refused by name until its spec lands:
+Out, each refused by name until its spec lands -- storage formats, never a type (owner, 2026-11-11):
+a type whose conversion is still to come is read as its stored bytes (below).
 
 | feature | where | refusal scope |
 |---|---|---|
-| ROW / PAGE compressed rowsets, sparse columns | 086 | the table |
-| `sql_variant`, `xml`, `geometry`, `geography`, `hierarchyid`, other CLR types, `vector`, `json` (2025), DBCS code pages (932/936/949/950) | 086 | the column, when projected |
+| ROW / PAGE compressed rowsets | 086 | the table |
+| sparse columns (the sparse vector) and the column set | 086 | the column, when projected |
 | encrypted backups, TDE databases | 087 | the file |
 | clustered / nonclustered columnstore | 088 | the table (an NCCI is ignored: the scan reads the base rowset) |
 | `since_lsn`, changed / freed pages, the export, lake-mode state | 089 | — |
@@ -209,7 +210,8 @@ Out, each refused by name until its spec lands:
   - **A container is searched safely by default** (owner, 2026-11-09, DQ-41): a block found from an
     arbitrary offset can be forged by row data (§ Security), so by default a container's group *g*
     is read at its data-set offset through the chain walked from its start or a seek index entry,
-    lazily, checkpoints kept as it goes (the stream located from its tail, task 7a part 4a); the
+    lazily, a mark kept every 256 KiB of the file walked (the stream located from its tail, task 7a
+    part 4a; as landed in PR 2e, a span between checkpoints is walked only up to the block read); the
     search over such a pass gallops from the nearest walked sample (1, 2, 4 … groups, then bisects),
     so it walks at most twice as far as the group it finds. Neither the rank path nor the GAMs run at
     ATTACH for a container: the GAM of an interval is read when a page of it is first located
@@ -237,7 +239,8 @@ Out, each refused by name until its spec lands:
   backup then report the same types, which is what the oracle tests compare (§ Testing); DuckLake
   rejects alias and collated string types (A§1, `ducklake_types.cpp:158-163`). The reader needs a
   `system_type_id → name` table for it. The deliberate exceptions, where a backup can return what the
-  wire cannot, are spec 086's (`sql_variant` → `VARIANT`, `vector` → `FLOAT[n]`); 085 has none.
+  wire cannot, are spec 086's (`sql_variant` → `VARIANT`, `vector` → `FLOAT[n]`); 085 has none. A type
+  whose conversion is still to come is its stored bytes, a `BLOB`, until then (D13).
 
 - **D7 — values go through the codec layer's batch kernels.** The row engine copies each value's
   bytes into the codec's column-major staging (`codec/staging/column_staging.hpp`) and finalises one
@@ -259,7 +262,9 @@ Out, each refused by name until its spec lands:
   generator writes the collation → code page table (`tools/code_pages/data/collations.psv`, § Rules,
   catalog). Spec 091 (SQL Server code pages, generated tables and vectorized kernels) builds it all,
   as the module `src/codec/code_page/`; 085 and 086 reuse it. 085 maps the on-disk CollationId onto
-  091's table and reuses its single-byte tables (task 13).
+  091's table and reuses its tables, the double-byte pages included (task 13; owner, 2026-11-11: a
+  backup has no server to convert a varchar, so every page is decoded on the client -- the TDS path
+  keeps the server's cast for a double-byte page only because there the server is faster, 092 D10).
 
 - **D8 — service columns are virtual columns with a `_mssql_` prefix (owner, R§5, R§10.2).** The
   scan and the catalog's table entries expose:
@@ -283,6 +288,23 @@ Out, each refused by name until its spec lands:
   column only: no lake stores a page LSN, because which pages changed is decided by the file (the DCM and
   `m_lsn > since_lsn`, spec 089 D3; R§6.2 point 4). The lake deletes by `_mssql_page` with DuckLake's own
   `DELETE` (R§6.2).
+
+  **`_mssql_lob`'s bytes** (PR 3, task 20; DQ-46: NULL for a row with no off-row value; every off-row
+  value of the row, projected or not; the leaves listed; keyed by the catalog's column id;
+  `backup/backup_lob_map.hpp`):
+
+  | field | bytes | meaning |
+  |---|---|---|
+  | format | u8 | `0x01` |
+  | entry count | u16 | one per off-row value, ascending column id |
+  | column id | u32 | `syscolpars.colid` |
+  | form | u8 | 1 row-overflow, 2 in-row root, 3 root pointer (E21) |
+  | flags | u8 | bit 0: a NULL root (a `text` / `image` updated to NULL, E21) |
+  | pointer | u16 length, bytes | the in-row bytes as stored (089's root identity) |
+  | value length | u32 | |
+  | node count | u32 | then per node, depth first in link order: u32 page, u16 file, u16 slot, u32 offset and u32 length of the value it covers, u8 depth (0 a root record), u8 fragment type |
+
+  18 bytes a node. A map-only walk lists a leaf from its parent's link, unread (`WalkLob`).
 
 - **D9 — the opened-file cache (owner, R§6.1).** An import calls the functions once per table on the
   same file, and a cold open costs a pass over the whole file. The opened backup is kept in DuckDB's
@@ -327,9 +349,18 @@ Out, each refused by name until its spec lands:
   that did not change since its base (089 D5). Without spec 090 the overlay reflects the diff's
   `CheckpointLSN`; the fuzzy status is the diff's.
 
-- **D13 — refuse by name at the narrowest scope, never fill with NULL.** An undecodable column is
-  refused when projected (`SELECT` of the other columns works); an undecodable table when scanned; an
-  undecodable file at open. The message names the object, the feature and the SQL Server type.
+- **D13 — refuse by name at the narrowest scope, never fill with NULL; never refuse a type (owner,
+  2026-11-11).** A storage format the reader does not read yet is refused: a column when projected
+  (`SELECT` of the other columns works: a sparse column, a value stored off row until PR 3), a table
+  when scanned (ROW / PAGE compression, a clustered columnstore), a file at open; the message names
+  the object, the feature and the SQL Server type. A *type* is never refused: one the reader
+  converts takes D6's type, and one whose conversion is still to come -- `sql_variant`, `xml`, the
+  CLR types (`geometry`, `geography`, `hierarchyid`, a user's), `vector`, `json`, a type the reader
+  does not know, a text whose collation is newer than the code-page tables -- is its stored bytes as
+  they are, a `BLOB`, with `columns.reason` saying why (`ReadingOf`); the conversion is the reader's,
+  into DuckDB's types wherever one fits (owner, 2026-11-11: no flag for it). Their
+  conversions come with 086, together with the TDS path's (one decoder for both). A computed column
+  that is not persisted has no stored value: not readable, named.
 
 - **D14 — versions.** `dbi_version` 998 (2025) is verified. 869 / 904 / 957 (2017 / 2019 / 2022,
   expected values, unverified) are accepted once the CI version matrix passes on their images;
@@ -481,7 +512,11 @@ Common named parameters of every function, and ATTACH options of the same names:
 `shape` (`heap` / `clustered` / `columnstore`), `compression` (from `sysrowsets.cmprlevel`; `mixed`
 when partitions differ, E7: `cmprlevel` is per partition), `partition_count`, `row_count` (sum of
 `sysrowsets.rcrows`, exact in every rowset of E7's 16 states; NULL when one is negative or the sum passes
-int64 -- a statistic, so the table is read all the same), `created`, `modified`, `decodable`,
+int64 -- a statistic, so the table is read all the same. A clustered columnstore's sum includes the delta
+stores left as tombstones until the tuple mover drops them: SQL Server 2022's `sys.partitions` counts them
+too, 2025's does not (measured on the lane's partition fixture after `REORGANIZE ... COMPRESS_ALL_ROW_GROUPS`,
+#551), and sysrowsets cannot tell a tombstone delta store from an open one -- spec 088, which reads the
+rowgroup metadata, makes it exact; until then compare_catalog does not compare a columnstore's counts), `created`, `modified`, `decodable`,
 `reason`, `fuzzy_status`, `open_transactions`, `stale_transactions`, and three nested values:
 
 - `columns LIST(STRUCT(column_id, name, sql_type, system_type_id, max_length, precision, scale,
@@ -490,11 +525,19 @@ int64 -- a statistic, so the table is read all the same), `created`, `modified`,
 - `allocation_units LIST(STRUCT(au_id, type, rowset_id, index_id, partition_number, compression,
   filegroup_id, first_page, root_page, first_iam_page, live_pages))`;
 - `partitioning STRUCT(function_name, scheme_name, column_name, column_id, parameter_type,
-  range_right BOOLEAN, boundaries LIST(VARIANT), destinations LIST(VARCHAR), next_used VARCHAR)`, NULL
-  for a table on a filegroup (E7§2, § Rules, catalog). Boundaries are listed in their current order;
+  range_right BOOLEAN, boundaries LIST(VARIANT), destinations LIST(VARCHAR), next_used VARCHAR,
+  reason VARCHAR)`, NULL for a table on a filegroup (E7§2, § Rules, catalog). Each boundary is a VARIANT
+  of the DuckDB type TYPE mssql reads the parameter's type as (D6: `datetime2(7)` a TIMESTAMP_NS to the
+  100 ns, `datetimeoffset` a TIMESTAMP_TZ at its UTC instant). `reason` names why the partitioning cannot
+  be given -- a boundary the reader cannot decode (a code page with no table), a function whose
+  boundaries, destinations or partitions do not agree with its fanout -- and then the boundaries are NULL,
+  never a guessed or partial list (D13). Boundaries are listed in their current order;
   their ids are positional and renumbered by SPLIT / MERGE, so a consumer compares value lists, never
   ids (E7§6). The base index's data space only: a non-aligned nonclustered index is not reported (the
   scan never reads it). Deriving a DuckLake spec from it is mssql-ducklake's (022 D5).
+- `partitions LIST(STRUCT(partition_number, rows, compression, filegroup))` (PR 2c): every table's base
+  partitions, one for a table on a filegroup; `rows` sums a columnstore partition's compressed and delta
+  rowsets; `filegroup` is its in-row unit's (= the scheme's destination, E7).
 
 `mssql_backup_views(path)`: `schema_name`, `view_name`, `object_id`, `definition` (`VARCHAR`, the
 T-SQL text from `sysobjvalues`, X§4), `is_encrypted`, `created`, `modified`. A `WITH ENCRYPTION` view
@@ -894,11 +937,10 @@ offsets above are in its fixed part.
     rowgroups and deleted rows in spec 088);
   - what one object's rows get wrong is named on that object (D13): a table the scan cannot read is
     listed with `decodable` false and its reason -- a clustered columnstore (088), ROW / PAGE compression
-    or sparse columns (086), more than one partition (PR 2c), its schema or a column's type not in the
-    catalog, a layout the reader cannot build, an added column's default missing, listed twice, malformed
-    or not of the column's type and size -- and a definition that cannot be read is Unreadable with its
-    reason. Coarser than D13 for now: a sparse column or an unusable default refuses the table, not the
-    column (column-level refusal is the scan's, PR 2d).
+    (086), its schema not in the catalog, a layout the reader cannot build, an added column's default
+    missing, listed twice, malformed or not of the column's type and size -- and a definition that cannot be read is Unreadable with its
+    reason. A sparse column is refused alone, when projected (PR 2d); an unusable default still refuses
+    the table.
 - **Partitioning** (E7§2, decoded generically and verified against the catalog views in 16 states,
   0 mismatches **(2025)**):
 
@@ -920,8 +962,15 @@ offsets above are in its fixed part.
   datetime, …), 1-byte scale (time, datetime2, datetimeoffset), precision + scale (decimal), u16 maximum
   length (binary), u16 maximum length + u32 collation (strings). The catalog's own sql_variant reader
   (ADD COLUMN defaults, boundaries) decodes it; E7 exercised int, bigint, date, datetime,
-  datetime2(0/3/7), datetimeoffset(0), varchar and nvarchar; decimal, uniqueidentifier, binary and
-  time boundaries ship behind fixtures (E7§7). A boundary that cannot be decoded refuses the table's
+  datetime2(0/3/7), datetimeoffset(0), varchar and nvarchar; the partitioning fixture
+  (`test/backup/gen/partition.sql`, 2026-11-10) adds decimal, uniqueidentifier, varbinary, time,
+  smalldatetime and tinyint. Measured there: a datetime or smalldatetime value is in its record form (ticks
+  then days, minutes then days), a datetimeoffset its UTC time, date and offset in minutes, a GUID in SQL
+  Server's byte order, a time(3) four bytes -- each as a record or TDS stores it; and **a varbinary
+  boundary is stored without its trailing zero bytes** (`0x8000` is `0x80`, which is how
+  `sys.partition_range_values` prints it too; for an importer: DuckDB orders BLOBs with trailing zero bytes
+  as greater, SQL Server compares a varbinary without them, so a RANGE LEFT edge differs). A boundary
+  that cannot be decoded refuses the table's
   `partitioning` by name, never a NULL boundary (D13).
 - A table = `sysschobjs` type `'U '`; its base rowsets = `sysrowsets` with `idmajor` = object id and
   `idminor` ∈ {0 heap, 1 clustered}, one per partition (`numpart`); allocation units by `ownerid` =
@@ -932,8 +981,8 @@ offsets above are in its fixed part.
   rows **(2025)**), for its code page and name (D7). The on-disk id is encoded differently from the
   5 bytes of a TDS COLMETADATA collation, and its low byte is not the LCID. A collation is UTF-8 iff
   `id >> 24 == 0` and `id & 0x80` (exact over all 5,540, X§4). Code pages used: 65001, 1250–1258,
-  874, 437, 850 (single byte: 091's tables, here) and 932, 936, 949, 950 (double byte: 091's tables,
-  spec 086); 0 = Unicode-only collations, which no `varchar` can carry.
+  874, 437, 850 (single byte) and 932, 936, 949, 950 (double byte), all through 091's tables, here
+  (PR 2d); 0 = Unicode-only collations, which no `varchar` can carry.
 
 **Records** (X§4, E1§4.1, E1§5 rule 7, E2 R7):
 - Slot array at the page end, u16 per slot, `m_slotCnt` @22; a slot offset below 96 is a freed slot
@@ -970,16 +1019,39 @@ offsets above are in its fixed part.
   i32.
 
 **LOBs and row-overflow** (X§4, E1 `LobReader`):
-- A complex variable column starts with its kind: 2 = row-overflow / text pointer, 24 bytes (u32
-  update counter +4, u32 length +12, root RID +16); 4 or 5 = in-row root: 12-byte header (u32 update
-  counter `ts` +4), then 12-byte links `u32 cumulative size, u32 page, u16 file, u16 slot`.
-- A LOB fragment record (statusA 0x08): u16 length @2, u64 blob id @4, u16 type @12: 0 SMALL_ROOT
-  (u16 size @14, data @20), 2 INTERNAL (u16 maxlinks @14, curlinks @16, level @18, 16-byte links @20:
-  `u64 cumulative size, u32 page, u16 file, u16 slot`), 3 DATA (data from 14 to the record length),
-  5 LARGE_ROOT (12-byte links @24).
-- The rebuilt value is checked at every node: a node's bytes equal the length its parent claims.
-- Legacy `text` / `ntext` / `image` hold a 16-byte text pointer in row (W§6); **unverified** (E1§6:
-  not tested), so these types are behind an oracle test before they ship.
+- A complex variable column holds one of three forms (E21): 16 bytes is always the root pointer (its
+  first byte is a blob id's low byte, not a kind); 24 bytes is row-overflow (kind 2) or an in-row root
+  of one link (kind 4), told apart by the first byte:
+  - 24 bytes of kind 2, **row-overflow** (bounded types only): u32 update counter +4, u32 length +12,
+    the RID of one DATA fragment +16, on the rowset's ROW_OVERFLOW_DATA unit;
+  - 12 + 12n bytes of kind 4, an **in-row root**: a 12-byte header (byte 2 the level: 0, the links name
+    DATA fragments; above, INTERNAL nodes; u32 update counter `ts` +4), then up to 5 links `u32
+    cumulative size, u32 page, u16 file, u16 slot`, on the LOB_DATA unit (kind 5, never seen in row, is
+    accepted as the catalog reader accepts it);
+  - 16 bytes, a **pointer to a root record**: u64 blob id (the root's own @4), u32 page, u16 file, u16
+    slot, on the LOB_DATA unit. `text` / `ntext` / `image` with text in row off use it for every value,
+    an empty one included; MAX columns with `large value types out of row` = 1 too, for values written
+    after the option was set.
+- With text in row on (limit L) a `text` / `ntext` / `image` value of up to L bytes is plain bytes in
+  row when the row has room, and otherwise an in-row root. One table can hold every form: an option
+  changes only the values written, or the columns updated, after it; text in row OFF converts the
+  inline values and in-row roots to root pointers at once.
+- A LOB fragment record (statusA 0x08, length 84 for a root): u16 length @2, u64 blob id @4, u16 type
+  @12: 0 SMALL_ROOT (u16 size @14, at most 64 bytes, data @20), 2 INTERNAL (u16 maxlinks @14, curlinks
+  @16, level @18, about 500 16-byte links @20: `u64 cumulative size, u32 page, u16 file, u16 slot`),
+  3 DATA (data from 14 to the record length, at most 8,040 bytes), 5 LARGE_ROOT (maxlinks 5 @14,
+  curlinks @16, level @18, 12-byte links @24), 8 NULL (only as a root). E21.
+- **A NULL `text` / `image` (and presumably `ntext`) can be not NULL in the null bitmap**: an UPDATE
+  to NULL keeps the 16-byte pointer, leaves the null bit clear and rewrites the root as type 8, whose
+  size bytes are stale. Its NULL is the root's, read by fragment type before any size (E21). A MAX
+  value behind a root pointer updated to NULL has its null bit set.
+- The rebuilt value is checked at every node: a node's bytes equal the length its parent claims, but
+  for the DATA fragment of a node's last link, which may hold more -- a truncating `.WRITE` rewrites the
+  links and leaves the last leaf's tail stale (lob.sql on 2022: 8,040 bytes held, 5,880 claimed) -- whose
+  first claimed bytes are the value's; a row-overflow fragment is exact, and fewer than claimed is a
+  broken tree. A character can straddle two fragments (E21), so
+  a value is decoded across them: assembled, or (past 1 MiB, D17) decoded block by block with a cut
+  character carried into the next block.
 
 **Value encodings that differ from TDS** (W§7, X§4):
 
@@ -1011,10 +1083,31 @@ offsets above are in its fixed part.
 
 ### Scan
 
-- Units: the live level-0 data pages (type 1) whose header AU is an IN_ROW AU of the table's base
-  rowsets, in page-id order, cut into units of 64 pages; one unit per task, `MaxThreads` = units.
-  Batch indexes follow unit order, so DuckDB can preserve insertion order.
-- A compressed backup reads a page by decompressing its block; each thread keeps its last block.
+- Units: the pages each base rowset's IN_ROW AU lists through its IAM chain, in page-id order, cut into
+  units of 64 pages (as landed in PR 2e: from the IAM chain's list, so a unit's pages not live, IAM pages
+  and upper levels are skipped as it is read; a partition listed when its first unit is claimed; a unit
+  cut longer, up to 2048 pages, where the catalog's rows per page would leave 64 pages short of a
+  vector); one unit per task at a time, `MaxThreads` ≤ `max_threads`, estimated from the catalog's rows.
+  Rows of a live level-0 data page (type 1) whose header AU is the unit's. A chunk holds one unit's
+  rows; batch indexes follow unit order, so DuckDB can preserve insertion order.
+- A compressed backup reads a page by decompressing its block, outside the stream's lock; each thread
+  keeps its last block. A block is located from the marks of its span (one every 256 KiB of the file
+  walked), under that span's lock only to look a mark up or to walk the span on past the block; the
+  walk from the mark, or from the thread's last block located, reads headers already confirmed, with
+  no lock, through the thread's read window (256 KiB), which then serves the block's payload too (as
+  landed in PR 2e: a 16-task scan of an 8 GB heap, MS_XPRESS, 0.75x the time of the walk under the
+  stream's lock; the open reads no more than the walk to the block it reads and one window past it). A pass search
+  guesses an extent's group from the sample below it (one group read where the table's extents follow
+  one another in the pass), so tasks ahead of the samples do not gallop through the others' groups, and
+  each thread keeps the extent it found last.
+- A plain backup's pages are read through the thread's read-ahead (as landed in PR 2e step 7): a short
+  read that starts where the thread's last read of the file ended, or within 64 KiB past it (a unit's
+  pages, one after another in the file; a chain walk's headers in a container), is served from 256 KiB
+  the thread read at once; a read that follows no other (a search's first probe, a page far from the
+  last) is read as asked, and the second of two reads within 64 KiB of each other fetches the 256 KiB
+  (up to 32 pages more than asked; one fetch, on a remote file within the cache's 2 MiB blocks). A
+  fetch a page had cost 12 µs of the kernel's time at 16 threads: a 16-task scan of an 8 GB heap,
+  0.33x the time.
 - LOBs and overflow values are read only for projected columns; a chunk closes early on the codec's
   staging byte budget, as on the live read path.
 - The bind data serialises and deserialises (the common-subplan optimizer could otherwise merge two
@@ -1029,14 +1122,16 @@ Each component of 085, with its home or its bound:
 |---|---|---|
 | extent bitmaps and ranks, block samples (stage 2, D4a, DQ-41) | the file's extents (≈ 45 MB for 10 TB) and the probes made | resident while the backup is open; within D4a's 0.4 MB per GB |
 | a table's pages (stage 4a, DQ-40) | the runs of the scanned tables' extents (tens of MB typically, ≈ 2 GB worst case for a 10 TB table) | built from the IAM chain at a table's first scan; buffer-managed per AU in the opened backup, a scan pins its table's; they spill |
-| allocation (stage 3) | the files' extents (≈ 21 MB for 10 TB) | resident: `Size` and GAM bits; PFS pages read on demand, 64 kept |
+| allocation (stage 3) | the files' extents (≈ 21 MB for 10 TB) | resident: `Size` and GAM bits; PFS pages read on demand, 64 kept; each thread keeps the last PFS page it was answered from (PR 3 S7: read with no lock), 8 KiB a thread, unaccounted |
 | opened-file cache (D9) | files opened | DuckDB's `ObjectCache`: an entry reports `GetEstimatedCacheMemory` (`DD/src/include/duckdb/storage/object_cache.hpp:48`), so the buffer pool evicts it under pressure (`DD/src/storage/buffer/buffer_pool.cpp:348`); an attached catalog pins its entry; an evicted entry costs a reopen |
 | catalog (stage 4) | objects × columns | the decoded base tables in `ColumnDataCollection`s built with the `ClientContext`, spillable; the model over them indexes them by id, and a `TableLayout` is built only for a table a call binds |
 | log tail (stage 5) | the tail's records | read block by block; the transaction table and the per-AU flags of D11 are buffer-managed (090 D9 extends them) |
-| decode staging | the rows of a chunk | one chunk per running unit, closed at the codec's staging byte budget or a full vector, whichever comes first; reserved (D17) |
+| decode staging | the rows of a chunk | one chunk per running unit, closed at the codec's staging byte budget or a full vector, whichever comes first; reserved (D17). As landed in PR 2e: the staging's bound from the declared widths (a row's in-row 8,060 bytes at most; buffers counted twice, as they grow by doubling) for a vector, or 8 MiB with the chunk closing on the bytes it staged; held for one `Execute` call only, so a task blocked downstream holds no reservation another waits for -- what it keeps between calls is its staging's capacity, about one reservation, unaccounted. The output vectors' string heaps are DuckDB's allocations (accounted by DuckDB, #536), not reserved again. PR 3 S7: a row's values stored off row are reserved from the call's credit when it covers them -- a grant takes up to 1 MiB (a sixteenth of the budget at most) beyond its row, and of that extra the row's own share with DuckDB, so a chunk's rows do not each take the gate's lock; not while an Acquire waits for the budget, not again in a call after DuckDB refused one; at most a grant unused per running call, held from the others until the call returns |
 | a compressed block being read | ≤ 64 KB | one per thread (§ Scan) |
+| a container's walked spans (PR 2e) | the file walked | 16 bytes a mark, a mark per 256 KiB of the file walked (64 KB a GB, whatever the blocks' sizes); resident while open, within D4a's 0.4 MB per GB |
+| a thread's read window and read-ahead (PR 2e) | -- | 256 KiB per thread that read a container's data set (the window) and 256 KiB per thread that read a family file on (the read-ahead); their bytes are a file's until the thread reads another, their capacity stays with the thread for its life: at most 512 KiB × the threads that read a backup (DuckDB's and the clients'), unaccounted; beside them a pass search's 64 KiB group a thread |
 | fetched ranges (D3a) | the ranges in flight and cached | the buffer manager's: a remote file's cached blocks are counted and evictable once unpinned; a local file's reads are counted and freed on release; the ranges in flight are bounded by the units in flight |
-| a LOB value | its length | not streamed: DuckDB has no streamed value, so a value is assembled whole in its vector, fragment by fragment, capped at 2^31 − 1 bytes. Its length, known from its root before a fragment is read, is reserved first, by D17's rule: a unit that cannot reserve it waits for the others, and a value that still cannot fit while its unit runs alone is refused by name (table, `_mssql_rid`, column, length, `max_memory`, `temp_directory`) |
+| a LOB value | its length | not streamed: DuckDB has no streamed value, so a value is assembled whole in its vector, fragment by fragment, capped at 2^31 − 1 bytes. Its length, known from its root before a fragment is read, is reserved first, by D17's rule: a unit that cannot reserve it waits for the others, and a value that still cannot fit while its unit runs alone is refused by name (table, `_mssql_rid`, column, length, `max_memory`, `temp_directory`). A value staged for its column's kernel grows the staging once, doubling within 1 MiB of what it needs (PR 3 S7: grown to exactly each value, a chunk's payload was copied once a value): up to 1 MiB a column a thread past what is reserved, unaccounted |
 
 So a scan holds at most `MaxThreads()` (≤ `max_threads`) chunks and LOB values at once, under the
 reservations' half of `max_memory` (D17); the rest is buffer-managed and spills. 088 (rowgroup
@@ -1241,13 +1336,13 @@ before the next opens.
 11b. `OpenedBackup`'s stages 2–4 (page index, allocation, catalog) built for a file function's call,
     with no cache yet (task 22 caches them) — 1 d
 12. Catalog model: schemas, objects, rowsets, partitions, AUs, columns, defaults, views — 3 d
-13. 085 maps the on-disk CollationId onto spec 091's table; 091's single-byte code-page tables and
-    kernel reused (D7) — 0.5 d
+13. 085 maps the on-disk CollationId onto spec 091's table; 091's code-page tables and kernel reused,
+    the double-byte pages included (D7; owner, 2026-11-11, from 086 D9) — 0.5 d
 17. `mssql_backup_tables`, `mssql_backup_views`, `mssql_backup_catalog`; in the lane, compared with
     the restored database's catalog views — 2.5 d
 18. Fuzz harness catalog — 0.5 d
 
-*PR 2b as landed (2026-11-10).* Tasks 11a, 11, 11b, 12, 13 (the collation mapping; the single-byte
+*PR 2b as landed (2026-11-10).* Tasks 11a, 11, 11b, 12, 13 (the collation mapping; the code-page
 kernel is the scan's, 2d), 17 and 18. Moved: 11a's per-AU runs, buffer-managed and kept in the opened
 backup, are built at a table's first scan, so they come with the scan (2d); 2b walks a chain when it
 reads a base table. Pulled in: the part of task 20 the catalog needs -- an in-row LOB root over DATA /
@@ -1266,6 +1361,20 @@ is pushed.
     reader, schemes, destinations, index data spaces, the partition column), the `partitioning`
     column and E7's verify as a test — 2 d
 
+*PR 2c as landed (2026-11-10).* The model is `backup_catalog_model`'s (`CatalogPartitioning`, checked:
+fanout − 1 boundaries with ids 1..n each once, each of the parameter's own type, every destination of
+1..fanout, as many partitions as the fanout; else `reason`); the values are `SqlVariantValue`
+(`backup_function_common`, D6's types). A partitioned rowstore table is now decodable: each partition has
+its own layout, and an added column's default is looked up by the partition's own rowset (whether
+`sysseobjvalues` holds one row per partition rowset is unmeasured -- no fixture adds a column to a
+partitioned table; a miss refuses the table by name). Rows are decoded per rowset (2d). A datetime2(7)
+boundary outside TIMESTAMP_NS's 1677–2262 (a `9999-12-31` sentinel) is a `reason`, where TYPE mssql's
+read gives NULL; money is a plain little-endian i64 in a sql_variant (measured: 922337203685477.5807). E7's verify is the oracle
+lane's: `compare_catalog.py` against `catalog_golden.sql`'s `.partitioning` / `.boundaries` /
+`.partitions` (function, scheme, column, parameter type, side, fanout, NEXT USED, every boundary as the
+server prints it, every partition's filegroup, rows and compression), 1443 fields on the fixture locally
+(2022). The (partition, column value) multiset of E7's verify needs the rows: 2d's.
+
 *PR 2d — rows*
 
 14. FixedVar records: types, forwarding, uniquifier, dropped and added columns, version tag — 3 d
@@ -1276,6 +1385,25 @@ is pushed.
     (acceptance 1 without LOBs) — 3.5 d
 18b. Fuzz harness record — 0.5 d
 
+*PR 2d as landed (2026-11-11).* Tasks 14, 15, 16, 18b, plus what the owner moved in: the double-byte
+code pages (from 086 D9: decoded on the client, a backup having no server) and no refusal by type
+(D13: a type still to be converted is its stored bytes). Measured first (E20, 2022): version tags
+(statusA 0x40, 14 bytes after the record, ignored), forwarded records and stubs, the uniquifier (the
+first variable column, empty for 0), ghosts of both kinds (a heap's under row versioning is a type-7
+version ghost, not FixedVar: skipped by type before parsing), row-overflow and LOB pointers, a
+default per partition rowset for a column added to a partitioned table (2c's open question), and
+`sysrscols.ti`'s fields (a decimal's precision low and scale high, a time type's scale, MAX as 0). Task
+15 needed no kernel of its own: page bytes are the TDS staged form for every type but datetime,
+smalldatetime, money (halves swapped while staging) and bit (its bit taken), so `RecordStager` feeds
+the live path's family kernels (`FinalizeStagedColumn`, extracted from `RowStager`). Task 16's
+`mssql_backup_scan` opens at bind (the columns are the file's), estimates rows from the catalog
+(never a maximum: a LIMIT would be dropped), and its `_mssql_rid` of a heap equals the server's
+`%%physloc%%` on every heap of the fixtures, forwarded rows included. The lane restores each quiet full
+set on its version's image (`test/backup/compare_rows.sh`) and compares every converted column both
+ways through `TYPE mssql`; locally on 2022, 10 sets, 89 tables, ~190k rows, 0 differences. New fixtures
+`rows.sql`, `dbcs.sql` and a heap with forwarded records and no versioning in `catalog.sql`. Moved on:
+per-AU runs and parallel units (2e), off-row values (PR 3), `mssql_backup_columns` (task 16d).
+
 *PR 2e — parallel scan and memory*
 
 16b. Units of 64 pages and parallelism; the D17 budget (`max_memory`, `max_threads`, the clamp's
@@ -1284,7 +1412,57 @@ is pushed.
 16c. PR 1's review findings on the paths a scan takes: `PageIndex::FallBack` through the ranged
     mapper (D3a) rather than sequentially; `WalkChain` on a tail of an unknown layout reading block
     headers in windows, not one 28-byte read each; `LocateOnce`'s probe of the other families' pass
-    only where a crafted file could carry an extent twice — 1.5 d
+    only where a crafted file could carry an extent twice — 1.5 d. As landed: the page index keeps
+    the build's mapper, so a fallback maps the pass as parallel ranges; `WalkChain` and `FindBlock`
+    read headers in 4 MiB windows (a 5,876-block test chain in one read); the page index keeps each
+    thread's last extent located, so the other families' probe costs one search an extent, not one a
+    page, whatever the families (the probe itself stays: any striped pass could carry one twice). A
+    fallback's waves of ranges, now inside a scan, are buffer-managed but not D17-reserved
+16d. `mssql_backup_columns(path [, schema [, table]])`: one row per column -- schema, table, column
+    id, name, SQL type, DuckDB type, `state` (`converted`, `stored_bytes` for a type whose conversion is
+    still to come, `off_row_pending` until PR 3, `not_stored`, `storage_format`) and `reason` -- the
+    state of every column at a glance (owner, 2026-11-11: the next PR after 2d; no flag in
+    `mssql_backup_tables` instead) — 0.5 d. As landed: `system_type` beside `sql_type` (an alias type's
+    base, the owner's question 2026-11-12); `off_row_pending` also for a MAX column and a variable one
+    wider than the 24-byte off-row pointer in a table whose declared row can pass 8,060 bytes (counted
+    generously -- a MAX column at its 8,000-byte in-row share, a uniquifier, a version tag -- since the
+    server moves the widest value off row, whichever it is: `converted` is never promised for a value
+    that can go off row -- confirmed by the owner, 2026-11-12; dropped columns' bytes in old records
+    are not counted), read in row and
+    refused off row until PR 3; a table not read says so in each column's reason. Checked in the
+    oracle lane: the columns, `sql_type` and `system_type` against the server's (compare_catalog.py)
+16e. Filter pushdown into the catalog functions (owner, 2026-11-11): `schema_name` / `table_name` /
+    `view_name` equalities and IN lists of `mssql_backup_schemas` / `_tables` / `_views` / `_columns`
+    pushed into the model's build, so only the objects asked for get their columns, layouts, defaults
+    and partitioning built and listed; the open pass and the bootstrap tables are the fixed cost the
+    cache (task 22) and an attached catalog (task 23) take away — 1 d. As landed: `CatalogScope`
+    (BuildCatalogModel, OpenBackupCatalog), filled from a listing's kind (a table listing describes
+    no view, a view listing no table), mssql_backup_columns' arguments, and `pushdown_complex_filter`
+    reading `c = 'x'`, `c IN (…)` and an OR of those on one bare name column (several on one column
+    intersect); every filter stays in the plan, so DuckDB still applies it and a filter the reader
+    misreads costs work, never rows (one exception: the 1 GiB a call reads of views' off-row
+    definitions is charged over the views it builds, so a narrowed call can give a definition the whole
+    listing gives past the bound; review of 16e). EXPLAIN shows the scope (`Describes`). `mssql_backup_schemas` is narrowed by schema only, so its
+    counts stay whole. `mssql_backup_scan`'s bind builds its one table, not the database's (beyond
+    the task). The system tables (sysobjvalues, the partitioning, the defaults) are still read whole
+16f. Indexed views (owner, 2026-11-11). A view `WITH SCHEMABINDING` with a unique clustered index
+    stores its result as that index: a base rowset of the view's object (`sysrowsets` index 1, its
+    allocation units, IAM chain and `sysrscols` layout), leaf records FixedVar like a clustered
+    table's, kept by the server on every write -- so the scan of PR 2d reads it unchanged.
+    `mssql_backup_views` says whether a view is indexed (and its shape, compression, rows);
+    `mssql_backup_scan` reads an indexed view's clustered index as it reads a table (its nonclustered
+    indexes ignored, `_mssql_rid` its clustered key); a non-indexed view is refused by name (no stored
+    rows). An indexed view in `catalog.sql` (an aggregate with `COUNT_BIG(*)` and a join), compared in
+    the lane with `SELECT … WITH (NOEXPAND)` — 1 d. As landed: the model describes an indexed view's
+    stored rows with the table's own code (`CatalogModel::indexed_views`, `FindIndexedView`;
+    `CatalogView::indexed`); `mssql_backup_views` gains `is_indexed`, `shape`, `compression`,
+    `row_count`, `decodable`, `scan_reason` (an index 1 rowset with its in-row unit; the golden's
+    `is_indexed` leaves a disabled index out); the scan finds a table, then an indexed view, and refuses a view that stores none by
+    name. catalog.sql's `sales.v_region_totals` (a join, `COUNT_BIG(*)`, two SUMs, on two new tables);
+    compare_rows.py compares it with the server's view through TYPE mssql (the rows of NOEXPAND in a
+    backup at rest, typed as the catalog types them), compare_catalog.py `is_indexed` and `row_count`
+    with the golden's (sys.indexes, sys.partitions). Locally on 2022: 3 rows, 5 columns, 0
+    differences; the catalog, 1,206 fields, 0
 
 **PR 3 — LOBs**
 
@@ -1296,11 +1474,23 @@ is pushed.
 
 22. Opened-file cache: staged build, key, eviction estimate — 1.5 d
 23. ATTACH: storage extension, catalog / schema / table entries, transaction manager, isolation from
-    `TYPE mssql` (a test that sets every pool / optimizer counter and asserts zero) — 4 d
+    `TYPE mssql` (a test that sets every pool / optimizer counter and asserts zero) — 4 d. Owner,
+    2026-11-11: the file functions then take an attached backup catalog in place of a path
+    (`mssql_backup_scan('bk', 'dbo', 'orders')`, `mssql_backup_tables('bk')`), as `mssql_scan` takes
+    an attached database, and the catalog keeps what an open built -- the page index, the model, a
+    unit's runs (the scan's read indexes) -- so a call reads nothing it has already read. And an
+    ATTACH is limited to the schemas and tables asked for (owner, 2026-11-11): `schema_filter` /
+    `table_filter`, regexes with TYPE mssql's semantics (case-insensitive, partial match), so the
+    catalog builds its model, and keeps its indexes, for those objects only (task 16e's pushdown is
+    the same restriction for one call).
 24. Differential overlay and chain check: the diff's pages by their header AU, the full's by the IAM
     chain through the overlay (D4) — 2 d
 25. `s3://` (MinIO) and `https://` tests in the lane; measure the open pass and decide filter pushdown
-    with late materialisation (a follow-up spec if it is worth it) — 2 d
+    with late materialisation (a follow-up spec if it is worth it) — 2 d. Owner, 2026-11-11: the
+    scan is to make filtering cheap enough for an importer that exports a table with a filter over
+    it (mssql-ducklake spec 025, frozen history, on a daily differential): pushdown of a filter on
+    `_mssql_page_lsn` / `_mssql_page` (pages skipped unread) and on a column, for now the importer
+    reads the table whole; a filter in 089's export (`exclude_upto`) stays an acceptable alternative.
 
 **PR 5 — fuzzy status**
 

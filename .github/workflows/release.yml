@@ -23,7 +23,9 @@ jobs:
   # ============================================================================
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    # Pinned: the format is clang-format 14's (CLAUDE.md), and ubuntu-latest became
+    # 26.04 on 2026-11-11, whose apt has no clang-format-14 package.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 

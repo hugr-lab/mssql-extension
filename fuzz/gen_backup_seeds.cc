@@ -17,7 +17,13 @@
 // of order. backup_catalog (fuzz_backup_catalog's format: options, a LOB root, pages): pages of the committed
 // synthetic sample test/data/backup/full.bak (made by test/backup/gen/generate.sh on a throwaway instance) -- the
 // boot page and sysallocunits, the other bootstrap tables, a mix with an IAM page -- and a synthetic LOB tree.
+// backup_record (fuzz_backup_record's format: a layout, then a page): the sample's two user tables' first
+// pages with their layouts, and pages of the record forms E20 measured.
+// backup_lob (fuzz_backup_lob's format): every off-row form over synthetic text pages -- an in-row root
+// over an INTERNAL node, a last leaf holding more than claimed, row-overflow, root pointers to a LARGE_ROOT,
+// a SMALL_ROOT and a NULL root -- and a map.
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -245,6 +251,62 @@ static Bytes CatalogInput(const std::vector<Bytes> &pages, const Bytes &root = B
 	return out;
 }
 
+//! One column of fuzz_backup_record's layout: its xtype, the ti bytes above it, offset, null bit, bit
+//! position and flags (fuzz/fuzz_backup_record.cc).
+struct RecordColumn {
+	uint8_t xtype;
+	uint32_t ti_high;  // ti >> 8
+	int16_t offset;
+	uint16_t null_bit;
+	uint8_t bit = 0;
+	uint8_t flags = 0;
+};
+
+//! fuzz_backup_record's input: the column count, 10 bytes a column, then the page.
+static Bytes RecordInput(const std::vector<RecordColumn> &columns, const Bytes &page) {
+	Bytes out = {static_cast<uint8_t>(columns.size())};
+	for (const auto &c : columns) {
+		out.push_back(c.xtype);
+		out.push_back(static_cast<uint8_t>(c.ti_high));
+		out.push_back(static_cast<uint8_t>(c.ti_high >> 8));
+		out.push_back(static_cast<uint8_t>(c.ti_high >> 16));
+		out.push_back(static_cast<uint8_t>(c.offset));
+		out.push_back(static_cast<uint8_t>(static_cast<uint16_t>(c.offset) >> 8));
+		out.push_back(static_cast<uint8_t>(c.null_bit));
+		out.push_back(static_cast<uint8_t>(c.null_bit >> 8));
+		out.push_back(c.bit);
+		out.push_back(c.flags);
+	}
+	out.insert(out.end(), page.begin(), page.end());
+	return out;
+}
+
+static Bytes Hex(const std::string &hex) {
+	Bytes out;
+	for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+		out.push_back(static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+	}
+	return out;
+}
+
+//! An 8 KB data page holding `records` from offset 96, slot i at record i (its header's type and slot
+//! count set, the rest zero).
+static Bytes RecordPage(const std::vector<Bytes> &records) {
+	Bytes page(8192, 0);
+	page[0] = 1;
+	page[1] = 1;
+	size_t at = 96;
+	for (size_t i = 0; i < records.size(); i++) {
+		std::copy(records[i].begin(), records[i].end(), page.begin() + at);
+		page[8190 - 2 * i] = static_cast<uint8_t>(at);
+		page[8191 - 2 * i] = static_cast<uint8_t>(at >> 8);
+		at += records[i].size();
+	}
+	page[22] = static_cast<uint8_t>(records.size());
+	page[23] = static_cast<uint8_t>(records.size() >> 8);
+	return page;
+}
+
 //! The pages of file 1 of the sample `path`, by the allocation unit their headers name; data pages of
 //! level 0 only, and the boot page and IAM pages beside them.
 struct SamplePages {
@@ -325,34 +387,67 @@ static std::vector<Bytes> First(const std::vector<Bytes> &pages, size_t n) {
 	return std::vector<Bytes>(pages.begin(), pages.begin() + static_cast<long>(std::min(n, pages.size())));
 }
 
-//! A synthetic LOB tree: a text page of two DATA fragments and an INTERNAL node over them (file 1, pages
-//! 100 and 101, allocation unit 255 << 16: no bootstrap table's), and an in-row root over the node.
+//! A text page of `records` (fragment records), file 1, allocation unit 255 << 16 (no bootstrap table's).
+static Bytes TextPage(uint32_t number, const std::vector<Bytes> &records) {
+	Bytes p(8192, 0);
+	p[0] = 1;
+	p[1] = 3;
+	Put16(p, 22, static_cast<uint16_t>(records.size()));
+	Put32(p, 24, 255);
+	Put32(p, 32, number);
+	Put16(p, 36, 1);
+	size_t at = 96;
+	for (size_t i = 0; i < records.size(); i++) {
+		std::memcpy(&p[at], records[i].data(), records[i].size());
+		Put16(p, 8190 - 2 * i, static_cast<uint16_t>(at));
+		at += records[i].size();
+	}
+	return p;
+}
+
+//! A LOB fragment record of `type` (0 SMALL_ROOT, 2 INTERNAL, 3 DATA, 5 LARGE_ROOT, 8 NULL), `body` after
+//! its 14-byte header.
+static Bytes Fragment(uint16_t type, const Bytes &body) {
+	Bytes r(14, 0);
+	r[0] = 0x08;
+	Put16(r, 2, static_cast<uint16_t>(14 + body.size()));
+	Put16(r, 12, type);
+	r.insert(r.end(), body.begin(), body.end());
+	return r;
+}
+
+static const Bytes HELLO = {'h', 'e', 'l', 'l', 'o'}, ABC = {'a', 'b', 'c'};
+
+//! Page 100: DATA "hello" in slot 0, DATA "abc" in slot 1.
+static Bytes LeafPage() {
+	return TextPage(100, {Fragment(3, HELLO), Fragment(3, ABC)});
+}
+
+//! An in-row root (kind 5) of `level` whose links (cumulative, page, slot) name file 1.
+static Bytes InRowRoot(uint8_t level, const std::vector<std::array<uint32_t, 3>> &links) {
+	Bytes root(12 + 12 * links.size(), 0);
+	root[0] = 5;
+	root[2] = level;
+	for (size_t i = 0; i < links.size(); i++) {
+		Put32(root, 12 + 12 * i, links[i][0]);
+		Put32(root, 16 + 12 * i, links[i][1]);
+		Put16(root, 20 + 12 * i, 1);
+		Put16(root, 22 + 12 * i, static_cast<uint16_t>(links[i][2]));
+	}
+	return root;
+}
+
+//! A root pointer (16 bytes) to page `page` of file 1, slot 0.
+static Bytes RootPointer(uint32_t page) {
+	Bytes pointer(16, 0);
+	Put32(pointer, 8, page);
+	Put16(pointer, 12, 1);
+	return pointer;
+}
+
+//! A synthetic LOB tree: DATA fragments on page 100 and an INTERNAL node over them on page 101, and an
+//! in-row root of level 1 over the node (E21).
 static Bytes LobInput() {
-	auto page = [](uint32_t number, const std::vector<Bytes> &records) {
-		Bytes p(8192, 0);
-		p[0] = 1;
-		p[1] = 3;
-		Put16(p, 22, static_cast<uint16_t>(records.size()));
-		Put32(p, 24, 255);
-		Put32(p, 32, number);
-		Put16(p, 36, 1);
-		size_t at = 96;
-		for (size_t i = 0; i < records.size(); i++) {
-			std::memcpy(&p[at], records[i].data(), records[i].size());
-			Put16(p, 8190 - 2 * i, static_cast<uint16_t>(at));
-			at += records[i].size();
-		}
-		return p;
-	};
-	auto fragment = [](uint16_t type, const Bytes &body) {
-		Bytes r(14, 0);
-		r[0] = 0x08;
-		Put16(r, 2, static_cast<uint16_t>(14 + body.size()));
-		Put16(r, 12, type);
-		r.insert(r.end(), body.begin(), body.end());
-		return r;
-	};
-	const Bytes hello = {'h', 'e', 'l', 'l', 'o'}, abc = {'a', 'b', 'c'};
 	Bytes internal(6 + 32, 0);
 	Put16(internal, 0, 2);
 	Put16(internal, 2, 2);
@@ -363,12 +458,48 @@ static Bytes LobInput() {
 	Put32(internal, 30, 100);
 	Put16(internal, 34, 1);
 	Put16(internal, 36, 1);
-	Bytes root(24, 0);
-	root[0] = 5;
-	Put32(root, 12, 8);	 // cumulative 8, page 101, file 1, slot 0
-	Put32(root, 16, 101);
-	Put16(root, 20, 1);
-	return CatalogInput({page(100, {fragment(3, hello), fragment(3, abc)}), page(101, {fragment(2, internal)})}, root);
+	return CatalogInput({LeafPage(), TextPage(101, {Fragment(2, internal)})}, InRowRoot(1, {{8, 101, 0}}));
+}
+
+//! fuzz_backup_lob's seeds (its format is fuzz_backup_catalog's, options bit 7 a map): every off-row form
+//! over the leaf page.
+static void LobSeeds() {
+	Write("backup_lob", "inrow_internal", LobInput());
+	// A truncating .WRITE: the last leaf holds 3 bytes where its link claims 2.
+	Write("backup_lob", "last_leaf_over", CatalogInput({LeafPage()}, InRowRoot(0, {{5, 100, 0}, {7, 100, 1}})));
+	Bytes overflow(24, 0);
+	overflow[0] = 2;
+	Put32(overflow, 12, 5);	 // length, then page 100, file 1, slot 0
+	Put32(overflow, 16, 100);
+	Put16(overflow, 20, 1);
+	Write("backup_lob", "row_overflow", CatalogInput({LeafPage()}, overflow));
+	Bytes large(10 + 24, 0);  // LARGE_ROOT: maxlinks, count, level 0, then narrow links from record byte 24
+	Put16(large, 0, 2);
+	Put16(large, 2, 2);
+	Put32(large, 10, 5);
+	Put32(large, 14, 100);
+	Put16(large, 18, 1);
+	Put32(large, 22, 8);
+	Put32(large, 26, 100);
+	Put16(large, 30, 1);
+	Put16(large, 32, 1);
+	Write("backup_lob", "root_pointer_large",
+		  CatalogInput({LeafPage(), TextPage(102, {Fragment(5, large)})}, RootPointer(102)));
+	Bytes small(6, 0);	// SMALL_ROOT: its size, four bytes, then the value
+	Put16(small, 0, 5);
+	small.insert(small.end(), HELLO.begin(), HELLO.end());
+	Write("backup_lob", "root_pointer_small", CatalogInput({TextPage(102, {Fragment(0, small)})}, RootPointer(102)));
+	Write("backup_lob", "null_root", CatalogInput({TextPage(102, {Fragment(8, Bytes())})}, RootPointer(102)));
+	// A map (backup_lob_map.hpp) behind options bit 7, as AppendLobMap writes the last_leaf_over row: one
+	// in-row root (its 36 bytes), 7 bytes, two DATA nodes on page 100.
+	const Bytes root = InRowRoot(0, {{5, 100, 0}, {7, 100, 1}});
+	Bytes map = {0x80, 0x01, 1, 0, 1, 0, 0, 0, 2, 0, static_cast<uint8_t>(root.size()), 0};
+	map.insert(map.end(), root.begin(), root.end());
+	const Bytes tail = {7,	 0, 0, 0, 2, 0, 0, 0,								  // length, node count
+						100, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 1, 3,	  // page 100 slot 0, bytes 0-4
+						100, 0, 0, 0, 1, 0, 1, 0, 5, 0, 0, 0, 2, 0, 0, 0, 1, 3};  // slot 1, bytes 5-6
+	map.insert(map.end(), tail.begin(), tail.end());
+	Write("backup_lob", "map", map);
 }
 
 int main(int argc, char **argv) {
@@ -448,5 +579,52 @@ int main(int argc, char **argv) {
 	}
 	Write("backup_catalog", "mix", CatalogInput(mix));
 	Write("backup_catalog", "lob_tree", LobInput());
+	LobSeeds();
+
+	// backup_record: the sample's two user tables' first pages with their layouts (as the catalog
+	// describes them: test/data/backup/full.bak), and pages of the record forms E20 measured on 2022
+	// (test/cpp/backup/test_backup_rows.cpp's records): a version tag, a version ghost and a stub beside
+	// a row, the uniquifier, bits sharing a byte, a forwarded record's back pointer.
+	const uint64_t ITEMS = 72057594053984256ull, EVENTS = 72057594054049792ull;
+	if (pages_of(ITEMS).empty() || pages_of(EVENTS).empty()) {
+		std::fprintf(stderr, "the sample has no page of items or events\n");
+		std::exit(1);
+	}
+	Write("backup_record", "items",
+		  RecordInput({{56, 0, 4, 1},
+					   {231, 80, -1, 2},
+					   {167, 12, -2, 3},
+					   {106, 12 | (2 << 8), 8, 4},
+					   {42, 3, 17, 5},
+					   {104, 0, 24, 6},
+					   {165, 64, -3, 7}},
+					  pages_of(ITEMS)[0]));
+	Write("backup_record", "events",
+		  RecordInput({{127, 0, 4, 1}, {56, 0, 12, 2}, {167, 100, -1, 3}, {61, 0, 16, 4}}, pages_of(EVENTS)[0]));
+	const std::vector<RecordColumn> ver = {{56, 0, 4, 1}, {56, 0, 8, 2}, {167, 20, -1, 3}};
+	Write("backup_record", "versioned",
+		  RecordInput(ver, RecordPage({Hex("70000c0001000000010000000300000100150076310000000000000000a60300000000"),
+									   Hex("4e0b00000009002400b9030000000067330000000000000000b60300000000"),
+									   Hex("04510100000100a600"),
+									   Hex("320008000700000002000002001300"
+										   "1d806162000451010000"
+										   "0100a600")})));
+	RecordColumn uniquifier = {56, 0, -1, 1};
+	uniquifier.flags = 2;
+	Write(
+		"backup_record", "uniquifier",
+		RecordInput({uniquifier, {56, 0, 4, 2}, {167, 20, -2, 3}, {56, 0, 8, 4}},
+					RecordPage({Hex("70000c00000000000a0000000400000200150018007531300000000000000000a00300000000")})));
+	std::vector<RecordColumn> bits = {{104, 0, 4, 1}, {104, 0, 4, 2, 1}, {56, 0, 5, 3}};
+	for (uint8_t b = 3; b <= 8; b++) {
+		bits.push_back({104, 0, 4, static_cast<uint16_t>(b + 1), static_cast<uint8_t>(b - 1)});
+	}
+	bits.push_back({104, 0, 9, 10});
+	RecordColumn added = {56, 0, 10, 11};
+	added.flags = 4 | 8 | (4 << 4);	 // added after the records, with a 4-byte default
+	bits.push_back(added);
+	Write("backup_record", "bits_added",
+		  RecordInput(bits, RecordPage({Hex("50000a005505000000010a0000000000000000000000e20300000000"),
+										Hex("50000a00aa05000000000a0005000000000000000000e20300000000")})));
 	return 0;
 }
