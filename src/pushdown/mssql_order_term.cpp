@@ -7,8 +7,12 @@ namespace duckdb {
 namespace mssql {
 
 bool OrderKeyReadTruncates(const MSSQLColumnInfo &column) {
-	return IsRoundTripExactForKey(column.sql_type_name, column.scale, column.is_cast_required) ==
-		   KeyFidelity::NotRoundTrip;
+	// The datetime2 answer is the catalog's (spec 093 D8, merged as #560 while this was in review):
+	// under `datetime2_7_as = 'timestamp'` a datetime2(7) is read truncated too, so it is a
+	// last-key-only key here for the same reason time(7) is. `OrdersLikeDuckDB` already refuses
+	// datetime2(7) outright, so today this only keeps the two predicates from disagreeing.
+	return IsRoundTripExactForKey(column.sql_type_name, column.scale, column.is_cast_required,
+								  column.ReadsDatetime2Truncated()) == KeyFidelity::NotRoundTrip;
 }
 
 bool OrderKeyFragment(const MSSQLColumnInfo &column, const std::string &fragment, bool is_column, bool limited,
