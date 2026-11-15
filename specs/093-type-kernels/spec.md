@@ -182,9 +182,10 @@ pushed filter on a `sql_variant` drops rows (#514).
 T0 replaces it with three answers, without changing behaviour:
 - the **read form**: bare, server cast, or CLR rewrite. Each later PR moves its type to bare;
 - the **comparison fidelity**: a type-level predicate that the filter encoder, the rowid key choice,
-  MERGE and the writer ask. `sql_variant`, `vector`, `hierarchyid`, `json` (the 2025 type has no
-  comparison operators **[measure]** J1), spatial and CLR types stay out of pushed comparisons and keys
-  whatever their read form;
+  MERGE and the writer ask. `sql_variant`, `vector`, `hierarchyid`, `json` (the 2025 type compares by
+  `IS NULL` alone: 402 / 13636 / 421 for everything else, and no index holds it **[measured]** J1),
+  spatial and CLR types stay out of pushed comparisons and keys whatever their read form. Each answer
+  names its own types, so a type moved to bare moves nothing else (review of #557);
 - the **bulk wire**: a per-type answer, so a type joins COPY / INSERT BULK only in its own write PR.
 
 ### D3: `sql_variant` → `VARIANT`

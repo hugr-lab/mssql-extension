@@ -68,7 +68,8 @@ struct MSSQLColumnInfo {
 	//! The server compares, orders, groups or keys a value of this type unlike DuckDB's read of it
 	//! (ComparisonDiffersFor), whatever its read form: a filter on it runs in DuckDB, it is never a
 	//! rowid key or a MERGE key, an ORDER BY on it is not pushed (#514: a pushed filter on a
-	//! sql_variant dropped rows). Spatial types are left out here and named by IsSpatial() where they
+	//! sql_variant dropped rows; json, which the server compares by IS NULL alone, J1; an IS NULL
+	//! test is still pushed). Spatial types are left out here and named by IsSpatial() where they
 	//! matter, as before spec 093 split the flag.
 	bool comparison_differs;
 	bool is_identity;  // sys.columns.is_identity (spec 062 W4, issue #327). Set by the
@@ -157,9 +158,9 @@ struct MSSQLColumnInfo {
 	static bool IsSpatialType(const string &sql_type_name);
 
 	// Check if SQL Server type is natively supported (has explicit mapping or TDS-level support).
-	// The type list behind ReadFormFor, ComparisonDiffersFor and the bulk wire (BulkWireCanCarry,
-	// BulkWireTakesType). A type that becomes decodable changes ReadFormFor, not this list: the
-	// others must not follow it by accident (#296; spec 093 D2).
+	// The type list behind ReadFormFor (and COPY's BulkWireCanCarry). ComparisonDiffersFor and
+	// BulkWireTakesType name their own types, so a type that becomes decodable changes the read
+	// form and nothing else (#296, #514; spec 093 D2, review of #557).
 	static bool IsKnownSQLServerType(const string &sql_type_name);
 
 	//! Spec 093 D2: the read form of a column of this type.

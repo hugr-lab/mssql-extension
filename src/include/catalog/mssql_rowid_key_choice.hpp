@@ -124,12 +124,13 @@ inline bool IsLiteralMismatch(const std::string &type_name, uint8_t scale, bool 
 //! silently mis-key into a 0-row UPDATE.
 enum class KeyFidelity : uint8_t {
 	Exact,		  //!< read losslessly, compares exactly
-	NotRead,	  //!< the catalog does not read its value (CAST, LOB, spatial)
+	NotRead,	  //!< no match by the value read (CAST, LOB, spatial, a type the server cannot compare)
 	NotRoundTrip  //!< read, but rounded: no literal matches it (#358)
 };
 
 //! comparison_differs: MSSQLColumnInfo::comparison_differs (sql_variant,
-//! hierarchyid, CLR UDTs; spec 093 D2). xml, image, text, ntext and the spatial
+//! hierarchyid, CLR UDTs, json -- which the server compares by IS NULL alone,
+//! J1; spec 093 D2). xml, image, text, ntext and the spatial
 //! types are named, because the catalog knows those types and still cannot
 //! match by them: xml / image / text / ntext do not compare, and a spatial
 //! value is read as WKB, not as the stored serialisation.

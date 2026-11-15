@@ -671,11 +671,12 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 
 		// Issue #514: a column read through a cast (sql_variant, hierarchyid, a CLR type) is
 		// compared in DuckDB as the text the cast gave, and on the server as itself, by its own
-		// rules: an int 5 in a sql_variant is not N'5' there. The filter runs in DuckDB, over
-		// what DuckDB read.
+		// rules: an int 5 in a sql_variant is not N'5' there. json is compared by nothing but
+		// IS NULL on the server (J1). The filter runs in DuckDB, over what DuckDB read.
 		if (ctx.filter_column_info && ctx.filter_column_info->comparison_differs &&
 			!IsNullTestFilter(filter_entry.Filter())) {
-			MSSQL_FILTER_DEBUG_LOG(2, "  %s is read through a cast: filtered in DuckDB", col_name.c_str());
+			MSSQL_FILTER_DEBUG_LOG(2, "  %s compares unlike DuckDB on the server: filtered in DuckDB",
+								   col_name.c_str());
 			result.needs_duckdb_filter = true;
 			result.unhandled.emplace_back(projected_col_idx, &filter_entry.Filter());
 			continue;
@@ -1502,7 +1503,7 @@ ExpressionEncodeResult FilterEncoder::EncodeColumnRef(const BoundColumnRefExpres
 	// Issue #514, as in Encode: a column read through a cast is not compared on the server.
 	if (ctx.mssql_columns && table_col_idx < ctx.mssql_columns->size() &&
 		(*ctx.mssql_columns)[table_col_idx].comparison_differs && !ctx.null_test_operand) {
-		MSSQL_FILTER_DEBUG_LOG(1, "EncodeColumnRef: column %llu is read through a cast, not pushed",
+		MSSQL_FILTER_DEBUG_LOG(1, "EncodeColumnRef: column %llu compares unlike DuckDB, not pushed",
 							   (unsigned long long)table_col_idx);
 		return {"", false};
 	}
