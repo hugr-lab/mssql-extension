@@ -1,6 +1,9 @@
 # Spec 086: compressed row formats and the remaining types
 
 Status: **draft**, 2026-11-05. Not started. Depends on spec 085. Series overview: `../README.md`.
+**Amended 2026-11-13:** the types that cross the TDS wire too (`sql_variant`, `vector`, `hierarchyid`,
+`geometry`, `geography`) moved to [spec 093](../093-type-kernels/spec.md), which decodes each once for
+both paths (D8a). This spec keeps the storage formats, `xml` and the `json` spike.
 Markers as in 085: **(2025)**, **(unverified)**. Sources cited as in 085 (R§, X§, W§, A§, E<n>§);
 the owner's decisions as DQ-nn ([decisions.md](../085-backup-reader-core/decisions.md)).
 
@@ -15,11 +18,11 @@ binary is undocumented; it is a research task with a gate, not a promise (R§2, 
 ## Scope
 
 In: ROW compression (the CD record format), PAGE compression (anchor and dictionary), sparse columns
-and the column set, `sql_variant` → `VARIANT`, `xml` (MS-BINXML → text), `geometry` / `geography`
-(MS-SSCLRT → WKB), `hierarchyid`, `vector`, and the `json` research spike. The double-byte code pages
-(932, 936, 949, 950) moved to 085 PR 2d (D9).
+and the column set, `xml` (MS-BINXML → text), and the `json` research spike. The double-byte code pages
+(932, 936, 949, 950) moved to 085 PR 2d (D9). `sql_variant`, `vector`, `hierarchyid`, `geometry` and
+`geography` moved to spec 093 (2026-11-13).
 
-Out: user CLR types (opaque bytes, W§7: refused by name, as now), columnstore (088), the redo of CD
+Out: user CLR types (opaque bytes, W§7: their stored bytes, 085 D13), columnstore (088), the redo of CD
 and page-dictionary records (090's follow-up).
 
 ## What is known
@@ -45,8 +48,10 @@ and page-dictionary records (090's follow-up).
   `PROVENANCE.md` next to the code as E5 §8 does. No GPL or AGPL decoder source (OrcaMDF, Internals
   Viewer, mdf-rs) is opened. MS-BINXML and MS-SSCLRT are Microsoft open specifications.
 
-- **D2 — output types.** As 085's map (`MapSQLServerTypeToDuckDB`), except where the backup can return
-  what the wire cannot:
+- **D2 — output types.** *Superseded 2026-11-13 by spec 093: `TYPE mssql` now reads the same types
+  as the backup (`VARIANT`, `FLOAT[n]`, a CRS-labelled `GEOMETRY` for geography, `JSON`), so the only divergence
+  left is `xml` and `json` in a backup, its stored bytes until this spec's PR 4 and E9. The table is kept for the record.* As 085's map (`MapSQLServerTypeToDuckDB`), except
+  where the backup can return what the wire cannot:
 
   | SQL Server | `TYPE mssql` today | backup reader | reason |
   |---|---|---|---|
@@ -63,8 +68,10 @@ and page-dictionary records (090's follow-up).
 - **D3 — every decoder ships behind an oracle test.** The expected value is the server's own
   conversion of the restored column, read through `mssql_scan`: `CAST(x AS nvarchar(max))` for xml,
   hierarchyid and json; `x.STAsBinary()` for spatial; `SQL_VARIANT_PROPERTY(v, 'BaseType' /
-  'Precision' / 'Scale' / 'Collation')` plus the cast value for `sql_variant`; the plain column for the
-  rest. A value the oracle does not confirm keeps the 085 refusal (by name, when projected).
+  'Precision' / 'Scale' / 'Collation')` plus the cast value for `sql_variant` -- on READ; spec 093
+  D3 owns `sql_variant` now and a `VARIANT` does not carry the collation or the declared length, so
+  the full round-trip promise is replaced there by the narrower check of 093's acceptance 1; the
+  plain column for the rest. A value the oracle does not confirm keeps the 085 refusal (by name, when projected).
 
 - **D4 — CD values are batch-decoded like FixedVar ones.** The CD walk writes each value's bytes and
   its CD code into the codec staging; per-column kernels convert the CD encodings (big-endian
@@ -76,7 +83,9 @@ and page-dictionary records (090's follow-up).
   4 COLUMNSTORE_ARCHIVE; E5§3.1) decides the decoder of each rowset. Partitions of one table may
   differ (085 `TableLayout`).
 
-- **D6 — spatial is 2D WKB, as `STAsBinary()`.** The live catalog reads spatial columns through
+- **D6 — spatial is 2D WKB, as `STAsBinary()`.** *Superseded 2026-11-13 by spec 093 D6 (DQ-45): both
+  paths read the stored MS-SSCLRT bytes, Z / M are kept, geography is `GEOMETRY('OGC:CRS84')`, a curve
+  or FullGlobe is an error naming `geometry_as := 'blob'`. Kept for the record:* The live catalog reads spatial columns through
   `.STAsBinary()` (`mssql_column_info.cpp:532-534`), which emits 2D OGC WKB; the reader emits the
   same bytes, so the two agree. Z and M values are dropped as `STAsBinary()` drops them, and that is
   documented. Curves (MS-SSCLRT version 2 segments: CircularString, CompoundCurve, CurvePolygon) are
@@ -98,6 +107,8 @@ and page-dictionary records (090's follow-up).
 - **D8a — one decoder for both paths (owner, 2026-11-11).** `sql_variant`, `vector`, `hierarchyid`,
   `json`, `xml` and the spatial types are converted by codec kernels the TDS read path uses too, so
   each lands for a backup and for TYPE mssql together; until then 085 returns their stored bytes.
+  Spec 093 carries this out for every type but `xml` and `json`, whose wire form is text and whose
+  disk form is not (they stay here, backup-only).
 
 - **D9 — the double-byte code pages: moved to 085 PR 2d (owner, 2026-11-11).** A backup has no server
   to convert a varchar, so 085 decodes every page on the client; the TDS path keeps the server's cast
@@ -156,6 +167,9 @@ oracle before they ship.
 
 ### Types
 
+*`sql_variant`, `geometry` / `geography`, `hierarchyid` and `vector` moved to spec 093 (D1, D3 – D6,
+D9); their facts below are kept for the record and are 093's starting point.*
+
 - **`sql_variant`** (X§4): byte 0 = base type (xtype), byte 1 = version (1), then the properties and
   the value. Properties: strings (167, 175, 231, 239) u16 maximum length + u32 collation id (header 8
   bytes); `decimal` / `numeric` u8 precision + u8 scale (4); `binary` / `varbinary` u16 maximum length
@@ -211,18 +225,15 @@ Timebox: 2 weeks. If it fails, the refusal stays and the spec records why.
 - MS-BINXML: a token stream with a depth limit and a size limit; names and namespace tables bounded;
   no entity expansion (MS-BINXML has no DTD expansion, but the renderer still caps output at
   2^31 − 1 bytes).
-- MS-SSCLRT: point, figure, shape and segment counts against the value length; offsets within their
-  arrays; a shape's parent before it.
-- `sql_variant`: header length per base type; the value length within the column.
+- MS-SSCLRT and `sql_variant`: spec 093 § Security and hardening.
 - SCSU and the code-page decoders (091's): invalid sequences take the oracle's behaviour (D9), never
   a read past the value.
 - Resources (085 D17): the CD walk, the anchor and the dictionary are bounded by their page; an `xml`
-  or spatial value renders into a buffer reserved as it grows, capped at 2^31 − 1 bytes like a LOB
+  value renders into a buffer reserved as it grows, capped at 2^31 − 1 bytes like a LOB
   value, waiting or refused by name by 085 D17's rule (085 § Resources).
 - Fuzz harnesses, seeded from the fixtures: `fuzz_backup_cd` (CD record and value kernels),
   `fuzz_backup_page_ci` (compression-info record and reconstruction), `fuzz_backup_binxml`,
-  `fuzz_backup_ssclrt`, `fuzz_backup_variant`, `fuzz_backup_hierarchyid`, `fuzz_backup_json` (when it
-  exists). DuckDB-free (085 D15) except the kernels' final vector writes.
+  `fuzz_backup_json` (when it exists); the type harnesses are spec 093's. DuckDB-free (085 D15) except the kernels' final vector writes.
 
 ## Testing and acceptance
 
@@ -237,13 +248,11 @@ Fixtures (`test/backup/gen/086_*.sql`):
   deletes in the backup's batch; metadata-only ADD COLUMN after the data; per-partition compression
   (the partition metadata is 085's, from E7; E7 decoded a ROW-compressed partition beside plain ones,
   PAGE per partition was not covered, E7§7).
-- `sql_variant` of every base type; typed and untyped xml (elements, attributes, namespaces,
-  comments, CDATA, processing instructions, entities, large documents); spatial of every OGC type,
-  empty shapes, holes, collections, SRIDs 0 / 4326 / 3857, Z / M values (dropped), curves (refused);
-  `hierarchyid` from the root to depth 20 with negative and fractional labels; `vector` of 1, 3 and
-  1,998 dims; sparse tables with and without a column set.
+- typed and untyped xml (elements, attributes, namespaces, comments, CDATA, processing
+  instructions, entities, large documents); sparse tables with and without a column set. The
+  fixtures of `sql_variant`, spatial, `hierarchyid` and `vector` are spec 093's (T8).
 
-Version matrix: 2017 / 2019 / 2022 / 2025 for everything but `vector` and `json` (2025). The CD
+Version matrix: 2017 / 2019 / 2022 / 2025 for everything but `json` (2025). The CD
 format dates from 2008, so a 2017 failure points at a layout difference, not a new format.
 
 Acceptance:
@@ -251,8 +260,8 @@ Acceptance:
    the reason the oracle found.
 2. ROW and PAGE versions of a table equal its uncompressed version, `_mssql_rid` included (085 D8's
    uncompressed key bytes).
-3. A `sql_variant` column round-trips base type, precision, scale and collation.
-4. Spatial WKB equals `STAsBinary()` byte for byte.
+3. (Moved to spec 093: `sql_variant`.)
+4. (Moved to spec 093: spatial.)
 5. The fuzz harnesses replay their corpora clean under ASan and UBSan.
 6. `json`: D8's gate passes, or the spike report records why not and the refusal stays.
 
@@ -272,24 +281,21 @@ Order is the PR order.
 5. Compression-info record, anchor, dictionary, reconstruction; fixtures first — 4 d
 6. `fuzz_backup_page_ci`; PAGE fixtures — 1 d
 
-**PR 3 — sparse, `sql_variant`, `vector`, `hierarchyid`**
+**PR 3 — sparse**
 
 7. Sparse vector and the column set (D7) — 1.5 d
-8. `sql_variant` → `VARIANT` — 2 d
-9. `vector` → `FLOAT[n]` — 0.5 d
-10. `hierarchyid` → text — 2 d
+8. – 10., 12. (Moved to spec 093, 2026-11-13: `sql_variant`, `vector`, `hierarchyid` and their fuzz
+    harnesses and fixtures.)
 11. (Moved to 085 PR 2d: the double-byte code pages, D9.)
-12. Fuzz harnesses variant / hierarchyid; fixtures — 1 d
 
 **PR 4 — `xml`**
 
 13. MS-BINXML reader and text renderer, typed values — 5 d
 14. `fuzz_backup_binxml`; fixtures — 1 d
 
-**PR 5 — spatial**
+**PR 5 — spatial** (moved to spec 093 T5 / T8, 2026-11-13)
 
-15. MS-SSCLRT reader and WKB writer, curves refused, `crs` option if confirmed — 4 d
-16. `fuzz_backup_ssclrt`; fixtures — 1 d
+15. – 16. (Moved.)
 
 **PR 6 — `json` (only if the spike passes)**
 
@@ -300,11 +306,12 @@ Order is the PR order.
 
 19. Docs per PR (README type table, `DATAMODEL.md` row-engine section, CLAUDE.md, CHANGELOG) — 1 d
 
-**Total ≈ 35.5 days, 7–8 weeks** (37.5 before spec 091 took the double-byte tables out of task 11, 36
-before task 11 moved to 085 PR 2d),
+**Total ≈ 25 days, 5 weeks** (35.5 before tasks 8 – 10, 12, 15 and 16 moved to spec 093 on
+2026-11-13; 37.5 before spec 091 took the double-byte tables out of task 11, 36 before task 11 moved
+to 085 PR 2d),
 plus the `json` spike (1–2 weeks) and its decoder (~3 days) if the gate passes. R§8 phase 1 gave
 5–6 weeks for ROW / PAGE, sparse, `sql_variant`, xml, spatial and vector together with the overlay,
-locators and parallel scan (which moved to 085). The difference is `hierarchyid` and the per-type oracle
+locators and parallel scan (which moved to 085), and the shared types (moved to spec 093). The difference was `hierarchyid` and the per-type oracle
 tests and fuzz harnesses.
 
 ## Risks
@@ -314,14 +321,12 @@ tests and fuzz harnesses.
   2025 was not tested (X§10).
 - **xml text exactness**: the server's serialisation choices (whitespace, entity escaping,
   namespace placement, typed-value formatting) must be matched exactly or the oracle rejects them.
-- **Geography coordinate order** on disk versus `STAsBinary()`'s longitude-first output.
-- **Z / M and CRS** are lost or flattened in parity with the live catalog (D6); a lake user who needs
-  them has no path yet.
+- (Geography's coordinate order and Z / M / CRS moved to spec 093 with the spatial types.)
 - **`json` may not be decodable** in the timebox; then 2025 tables with `json` columns import without
   that column only if the user projects it away.
 - Decided ([decisions.md](../085-backup-reader-core/decisions.md)): the `VARIANT` / `FLOAT[n]`
-  divergences (D2; DQ-19, accepted); 2D WKB without Z / M, with the optional per-column CRS (D6;
-  DQ-20, accepted).
+  divergences (D2; DQ-19, accepted, then made moot by spec 093); 2D WKB without Z / M (D6; DQ-20,
+  superseded by DQ-45).
 
 ## References
 
