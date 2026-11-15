@@ -142,6 +142,11 @@ int main() {
 		}
 		int rows = 0;
 		bool all_equal = true;
+		// Review of #2416: the null mask has to be checked APART from the bytes. `got` below renders
+		// a NULL and a non-NULL value of zero bytes alike (both ""), so without these a 0-length PLP
+		// UDT read as NULL -- or a real value read as NULL -- compares equal and passes.
+		int nulls = 0;
+		int empty_non_null = 0;
 		while (at < b.size() && (b[at] == 0xD1 || b[at] == 0xD2)) {
 			const bool nbc = b[at] == 0xD2;
 			RowData row;
@@ -160,6 +165,15 @@ int main() {
 				all_equal = false;
 				std::cout << "    id " << id << " got " << got << " want " << want << std::endl;
 			}
+			if (row.null_mask[1]) {
+				nulls++;
+				if (!want.empty()) {  // a value the server gave bytes for must not read as NULL
+					all_equal = false;
+					std::cout << "    id " << id << " read as NULL, want " << want << std::endl;
+				}
+			} else if (row.values[1].empty()) {
+				empty_non_null++;
+			}
 			rows++;
 			at += 1 + used;
 			// Skipped the same way, for the drain path.
@@ -172,6 +186,14 @@ int main() {
 			}
 		}
 		Check(rows == 5 && all_equal, std::to_string(rows) + " rows (ROW and NBCROW), every value the server's bytes");
+		// G2 measured that the ROOT hierarchyid is a non-NULL value of ZERO bytes -- the one value in
+		// these responses that `got` cannot tell from a NULL. Asserting the COUNT rather than naming
+		// the id keeps this independent of which row holds it, and it is what fails if a 0-length PLP
+		// UDT is ever read as NULL (review of #2416). The other three columns have no such value.
+		Check(empty_non_null == (r == 2 ? 1 : 0), "null mask apart from the bytes: " + std::to_string(nulls) +
+													  " NULL, " + std::to_string(empty_non_null) +
+													  " non-NULL of zero bytes (the root hierarchyid in " +
+													  std::string(r == 2 ? "this" : "no other") + " response)");
 	}
 
 	std::cout << "UDT_INFO cut short, and a user CLR type" << std::endl;
