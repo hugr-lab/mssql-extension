@@ -43,7 +43,7 @@ SELECT mssql_exec('optk', 'DROP TABLE IF EXISTS dbo.opc_trunc;
 query II
 EXPLAIN SELECT k FROM optk.dbo.opc_trunc ORDER BY t7, k;
 ----
-physical_plan	<REGEX>:.*ORDER_BY.*
+physical_plan	<REGEX>:.*(ORDER_BY|Order By).*
 
 query I
 SELECT k FROM optk.dbo.opc_trunc ORDER BY t7, k;
@@ -79,11 +79,13 @@ statement ok
 DETACH optplain;
 
 # As the LAST key it is still pushed: one key, no tie-break after it, so the
-# server's order is one DuckDB accepts. TOP N proves it went.
+# server's order is one DuckDB accepts. A pushed order shows as the ABSENCE of a
+# sort -- the key and the LIMIT travel in the scan's own T-SQL, so there is no
+# Order By and no TOP N operator left in the plan (measured against a server).
 query II
 EXPLAIN SELECT id FROM optk.dbo.opc_trunc ORDER BY t7 LIMIT 2;
 ----
-physical_plan	<REGEX>:.*(TOP_N|Top N).*
+physical_plan	<!REGEX>:.*(ORDER_BY|Order By).*
 
 # And a non-truncated key BEFORE it is fine: the truncated one is last.
 query I
