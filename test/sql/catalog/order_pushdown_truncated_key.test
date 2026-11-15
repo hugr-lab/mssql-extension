@@ -20,6 +20,12 @@ require mssql
 
 require-env MSSQL_TESTDB_DSN
 
+# `mssql_remote_pushdown` is read ONCE PER CATALOG, AT ATTACH: this SET must come
+# BEFORE the ATTACH or the rewriter takes these statements whole and the scan
+# path is never exercised (measured: it returned the server's order either way).
+statement ok
+SET mssql_remote_pushdown = false;
+
 statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS optk (TYPE mssql, order_pushdown true);
 
@@ -29,11 +35,8 @@ SELECT mssql_exec('optk', 'DROP TABLE IF EXISTS dbo.opc_trunc;
 	INSERT INTO dbo.opc_trunc VALUES (1, ''00:00:00.0000001'', 5), (2, ''00:00:00.0000002'', 1)');
 
 # =============================================================================
-# The scan path (MSSQLOptimizer). Remote pushdown off so these go through it.
+# The scan path (MSSQLOptimizer)
 # =============================================================================
-
-statement ok
-SET mssql_remote_pushdown = false;
 
 # A key list led by the truncated column: DuckDB's sort must stay, so the
 # plan still holds an ORDER_BY of its own.
@@ -54,23 +57,26 @@ SELECT k FROM optk.dbo.opc_trunc ORDER BY t7, k LIMIT 1;
 ----
 1
 
-# The same answers with the pushdown off -- the point of the fix.
+# The same answers with no pushdown at all -- the ground truth the pushed form
+# must match. A SEPARATE catalog: the ATTACH option `order_pushdown true` above
+# WINS over `SET mssql_order_pushdown`, so setting it false on `optk` would be a
+# no-op and this check would prove nothing (measured).
 statement ok
-SET mssql_order_pushdown = false;
+ATTACH '{MSSQL_TESTDB_DSN}' AS optplain (TYPE mssql);
 
 query I
-SELECT k FROM optk.dbo.opc_trunc ORDER BY t7, k;
+SELECT k FROM optplain.dbo.opc_trunc ORDER BY t7, k;
 ----
 1
 5
 
 query I
-SELECT k FROM optk.dbo.opc_trunc ORDER BY t7, k LIMIT 1;
+SELECT k FROM optplain.dbo.opc_trunc ORDER BY t7, k LIMIT 1;
 ----
 1
 
 statement ok
-SET mssql_order_pushdown = true;
+DETACH optplain;
 
 # As the LAST key it is still pushed: one key, no tie-break after it, so the
 # server's order is one DuckDB accepts. TOP N proves it went.
@@ -89,9 +95,6 @@ SELECT k FROM optk.dbo.opc_trunc ORDER BY k, t7;
 # =============================================================================
 # The remote-pushdown writer (spec 079), including a window's ORDER BY
 # =============================================================================
-
-statement ok
-SET mssql_remote_pushdown = true;
 
 statement ok
 DETACH optk;
