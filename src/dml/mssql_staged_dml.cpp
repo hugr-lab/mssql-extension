@@ -353,6 +353,9 @@ void MSSQLStagedDml::Execute(ClientContext &context, DataChunk &chunk) {
 	if (chunk.size() == 0) {
 		return;
 	}
+	// Deliberately before the stage is opened: the first chunk's NULL key component is refused
+	// before INSERT BULK starts, with nothing sent. BuildFillChunk builds fill_ on its own, and
+	// Start does not touch it, so the order is free to be this one.
 	BuildFillChunk(chunk);
 	if (target_.key_source == MSSQLStagedKeySource::ROWID) {
 		// Issue #559: a rowid key column is NOT NULL, so a NULL is a value the read could not hold;
