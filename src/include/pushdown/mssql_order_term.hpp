@@ -20,13 +20,24 @@ struct MSSQLColumnInfo;
 
 namespace mssql {
 
+//! Issue #556: the column's read drops a digit the server still orders by --
+//! `time(7)` / `datetimeoffset(7)`, read with the 100 ns digit truncated, and
+//! so NOT one-to-one. The same question `IsRoundTripExactForKey` answers for a
+//! rowid key, asked here because an order has the same problem.
+bool OrderKeyReadTruncates(const MSSQLColumnInfo &column);
+
 //! The key expression to sort `column` by, given `fragment` (the column or a
 //! mapped function of it). The column's own order when the server's is
 //! DuckDB's (`OrdersLikeDuckDB`, #362); its bytes -- `CAST(… AS varbinary(n))`
 //! -- for a bare UTF-8 varchar under a LIMIT (`limited`), where the key not
 //! being sargable costs N rows rather than the table. False otherwise.
+//!
+//! `is_last_key`: this key is the LAST of its order. A truncated-read column
+//! (`OrderKeyReadTruncates`) is pushed only there (#556), and the parameter has
+//! no default so a new caller cannot skip the question -- the answer needs the
+//! key LIST, which this function never sees.
 bool OrderKeyFragment(const MSSQLColumnInfo &column, const std::string &fragment, bool is_column, bool limited,
-					  std::string &out_fragment);
+					  bool is_last_key, std::string &out_fragment);
 
 //! The ORDER BY term for one key, with DuckDB's NULL placement.
 //!

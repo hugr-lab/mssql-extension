@@ -356,7 +356,10 @@ bool NodeWriter::WriteStringAgg(const AggregateCall &call, const Operand &arg, c
 
 bool NodeWriter::WriteSortKeys(const std::vector<OrderByNode> &orders, std::string &sql) {
 	std::vector<std::string> keys;
-	for (auto &node : orders) {
+	for (idx_t key_index = 0; key_index < orders.size(); key_index++) {
+		auto &node = orders[key_index];
+		// #556: a truncated-read key only as the last of the order.
+		const bool is_last_key = key_index + 1 == orders.size();
 		Operand key;
 		if (!WriteValue(*node.expression, key)) {
 			return false;
@@ -384,7 +387,7 @@ bool NodeWriter::WriteSortKeys(const std::vector<OrderByNode> &orders, std::stri
 		// the column is (an empty group, a FILTER).
 		if (key.column && node.expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			std::string fragment;
-			if (!OrderKeyFragment(*key.column, key.sql, true, true, fragment)) {
+			if (!OrderKeyFragment(*key.column, key.sql, true, true, is_last_key, fragment)) {
 				return Veto("an ordering by " + key.column->name + ": the server does not order " +
 							key.column->sql_type_name + " as DuckDB does");
 			}
@@ -627,7 +630,10 @@ bool NodeWriter::WriteOrder(const OrderModifier &order, bool limited, std::strin
 		keys.push_back(key);
 		return false;
 	};
-	for (auto &node : order.orders) {
+	for (idx_t key_index = 0; key_index < order.orders.size(); key_index++) {
+		auto &node = order.orders[key_index];
+		// #556: a truncated-read key only as the last of the order.
+		const bool is_last_key = key_index + 1 == order.orders.size();
 		// DuckDB resolves an ORDER BY name against the select list first, then
 		// the FROM; a bare integer is a position in the select list.
 		const OutputColumn *output = nullptr;
@@ -717,7 +723,7 @@ bool NodeWriter::WriteOrder(const OrderModifier &order, bool limited, std::strin
 		std::string fragment;
 		// Under DISTINCT neither the bytes key nor the NULL-placing CASE is a
 		// result column (145): the key must be sent as it is.
-		if (!OrderKeyFragment(column, column_ref, true, limited && !distinct_, fragment)) {
+		if (!OrderKeyFragment(column, column_ref, true, limited && !distinct_, is_last_key, fragment)) {
 			return Veto("ORDER BY " + column.name + ": the server does not order " + column.sql_type_name +
 						" as DuckDB does");
 		}

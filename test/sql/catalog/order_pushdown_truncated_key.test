@@ -1,0 +1,125 @@
+# name: test/sql/catalog/order_pushdown_truncated_key.test
+# description: A time(7) / datetimeoffset(7) key is pushed only as the LAST key of an order (#556)
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# time(7) and datetimeoffset(7) are read with the 100 ns digit dropped, so two
+# stored values 100 ns apart read as ONE DuckDB value. As the last key that is
+# harmless: rows DuckDB sees as equal may come back in either order. With
+# another key after it the server breaks the tie on the digit DuckDB never saw,
+# and the DuckDB sort this pushdown removes is not there to fix it -- under a
+# LIMIT that returns a different ROW, not merely a different order (#556).
+#
+# The rows below are built so the two orders disagree: the server orders by the
+# full t7 and returns k = 5 first; DuckDB sees t7 equal, falls through to k, and
+# must return k = 1 first.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS optk (TYPE mssql, order_pushdown true);
+
+statement ok
+SELECT mssql_exec('optk', 'DROP TABLE IF EXISTS dbo.opc_trunc;
+	CREATE TABLE dbo.opc_trunc (id int NOT NULL PRIMARY KEY, t7 time(7) NOT NULL, k int NOT NULL);
+	INSERT INTO dbo.opc_trunc VALUES (1, ''00:00:00.0000001'', 5), (2, ''00:00:00.0000002'', 1)');
+
+# =============================================================================
+# The scan path (MSSQLOptimizer). Remote pushdown off so these go through it.
+# =============================================================================
+
+statement ok
+SET mssql_remote_pushdown = false;
+
+# A key list led by the truncated column: DuckDB's sort must stay, so the
+# plan still holds an ORDER_BY of its own.
+query II
+EXPLAIN SELECT k FROM optk.dbo.opc_trunc ORDER BY t7, k;
+----
+physical_plan	<REGEX>:.*ORDER_BY.*
+
+query I
+SELECT k FROM optk.dbo.opc_trunc ORDER BY t7, k;
+----
+1
+5
+
+# The LIMIT form: the row itself differs, not only the order.
+query I
+SELECT k FROM optk.dbo.opc_trunc ORDER BY t7, k LIMIT 1;
+----
+1
+
+# The same answers with the pushdown off -- the point of the fix.
+statement ok
+SET mssql_order_pushdown = false;
+
+query I
+SELECT k FROM optk.dbo.opc_trunc ORDER BY t7, k;
+----
+1
+5
+
+query I
+SELECT k FROM optk.dbo.opc_trunc ORDER BY t7, k LIMIT 1;
+----
+1
+
+statement ok
+SET mssql_order_pushdown = true;
+
+# As the LAST key it is still pushed: one key, no tie-break after it, so the
+# server's order is one DuckDB accepts. TOP N proves it went.
+query II
+EXPLAIN SELECT id FROM optk.dbo.opc_trunc ORDER BY t7 LIMIT 2;
+----
+physical_plan	<REGEX>:.*(TOP_N|Top N).*
+
+# And a non-truncated key BEFORE it is fine: the truncated one is last.
+query I
+SELECT k FROM optk.dbo.opc_trunc ORDER BY k, t7;
+----
+1
+5
+
+# =============================================================================
+# The remote-pushdown writer (spec 079), including a window's ORDER BY
+# =============================================================================
+
+statement ok
+SET mssql_remote_pushdown = true;
+
+statement ok
+DETACH optk;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS optkw (TYPE mssql, order_pushdown true, remote_pushdown true);
+
+query I
+SELECT k FROM optkw.dbo.opc_trunc ORDER BY t7, k;
+----
+1
+5
+
+query I
+SELECT k FROM optkw.dbo.opc_trunc ORDER BY t7, k LIMIT 1;
+----
+1
+
+# A window ordered by the truncated key with another key after it: the row
+# numbers must be DuckDB's, so the window is not pushed as written.
+query II
+SELECT k, rn FROM (SELECT k, ROW_NUMBER() OVER (ORDER BY t7, k) AS rn FROM optkw.dbo.opc_trunc) s ORDER BY rn;
+----
+1	1
+5	2
+
+statement ok
+SELECT mssql_exec('optkw', 'DROP TABLE dbo.opc_trunc');
+
+statement ok
+DETACH optkw;

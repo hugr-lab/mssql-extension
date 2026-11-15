@@ -333,7 +333,8 @@ static idx_t ProcessOrderByNodes(const vector<BoundOrderByNode> &orders, const L
 			break;
 		}
 		const auto &column = bind_data.mssql_columns[table_col_idx];
-		if (!mssql::OrderKeyFragment(column, fragment, is_column, limited, fragment)) {
+		// #556: a truncated-read key only as the last of the order.
+		if (!mssql::OrderKeyFragment(column, fragment, is_column, limited, i + 1 == orders.size(), fragment)) {
 			MSSQL_OPT_DEBUG(1, "  ORDER BY[%llu]: %s does not order like DuckDB on the server", (unsigned long long)i,
 							source_column.c_str());
 			break;	// Stop at first non-pushable column (prefix only)
