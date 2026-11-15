@@ -389,8 +389,8 @@ unique_ptr<Expression> MergeRewriter::Inline(const Expression &action_expr) cons
 
 bool MergeRewriter::LikeTargetFits(idx_t column, const LogicalType &source_type) const {
 	const auto &info = columns_[column];
-	if (info.is_geometry ||
-		IsRoundTripExactForKey(info.sql_type_name, info.scale, info.is_cast_required) == KeyFidelity::NotRead) {
+	if (info.is_geometry || IsRoundTripExactForKey(info.sql_type_name, info.scale, info.is_cast_required,
+												   info.ReadsDatetime2Truncated()) == KeyFidelity::NotRead) {
 		return false;
 	}
 	const auto &column_type = table_.GetColumns().GetColumn(LogicalIndex(column)).Type();
@@ -507,12 +507,13 @@ void MergeRewriter::CheckOnColumns(const Expression &conjunct) const {
 			Refuse("the ON condition reads a row id");
 		}
 		const auto &info = columns_[column.GetIndex()];
-		switch (IsRoundTripExactForKey(info.sql_type_name, info.scale, info.is_cast_required)) {
+		switch (IsRoundTripExactForKey(info.sql_type_name, info.scale, info.is_cast_required,
+									   info.ReadsDatetime2Truncated())) {
 		case KeyFidelity::Exact:
 			return;
 		case KeyFidelity::NotRoundTrip:
 			Refuse("the ON condition compares column '" + info.name + "' of type " +
-				   SpelledKeyType(info.sql_type_name, info.scale) +
+				   SpelledKeyType(info.sql_type_name, info.scale, info.ReadsDatetime2Truncated()) +
 				   ", whose value does not survive the round trip through DuckDB");
 		case KeyFidelity::NotRead:
 			Refuse("the ON condition compares column '" + info.name + "' of type " + info.sql_type_name +

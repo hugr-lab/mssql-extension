@@ -461,6 +461,11 @@ idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 exit_loop:
 	if (staged) {
 		stager_.FinalizeChunk(row_count);
+		for (idx_t c = 0; c < column_metadata_.size(); c++) {
+			if (stager_.ChunkOutOfRange(c) > 0) {
+				NoteOutOfRange(c);
+			}
+		}
 		if (counters_enabled_) {
 			CountChunkForDebug(chunk, row_count);
 		}
@@ -542,6 +547,12 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 
 		tds::encoding::TypeConverter::ConvertValue(row.values[col_idx], row.null_mask[col_idx],
 												   column_metadata_[col_idx], *target_vector, row_idx);
+		// A datetime2 value read as NULL for not fitting TIMESTAMP_NS (issue #168): spec 093 D8's warning.
+		if (column_metadata_[col_idx].type_id == tds::TDS_TYPE_DATETIME2 && !row.null_mask[col_idx] &&
+			target_vector->GetType().id() == LogicalTypeId::TIMESTAMP_NS &&
+			FlatVector::IsNull(*target_vector, row_idx)) {
+			NoteOutOfRange(col_idx);
+		}
 	}
 
 	if (counters_enabled_) {
@@ -930,6 +941,28 @@ void MSSQLResultStream::DrainRemainingTokens() {
 	}
 }
 
+void MSSQLResultStream::NoteOutOfRange(idx_t c) {
+	if (c < refuse_out_of_range_.size() && refuse_out_of_range_[c]) {
+		// Issue #559: under TIMESTAMP_NS a value outside 1677-2262 reads as NULL, and a table with no usable
+		// key is matched by all its columns NULL-safely, so the row would update the one that really holds
+		// NULL. Refused by name before any row is written.
+		throw InvalidInputException(
+			"mssql: column \"%s\" identifies the rows of %s (a table with no usable key, matched by all its "
+			"columns) and holds a datetime2(7) value outside 1677-2262, which TIMESTAMP_NS cannot hold and reads "
+			"as NULL, so the row would match another one (issue #559). Attach with datetime2_7_as 'timestamp' "
+			"(such a table's row-by-row UPDATE / DELETE is then refused by name), narrow the statement to rows "
+			"inside the range, or give the table a primary key",
+			column_metadata_[c].name, refuse_table_);
+	}
+	if (out_of_range_.size() < column_metadata_.size()) {
+		out_of_range_.resize(column_metadata_.size(), 0);
+	}
+	if (out_of_range_[c] == 0) {
+		out_of_range_[c] = 1;
+		warnings_pending_ = true;
+	}
+}
+
 void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 	// Called when the stream has its COLMETADATA and again when it is drained --
 	// never per row, never per chunk. Both loops below walk metadata, not data,
@@ -945,6 +978,26 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 	// these accumulate as the batch runs.
 	for (; info_surfaced_ < info_messages_.size(); info_surfaced_++) {
 		LogTdsInfo(context, info_messages_[info_surfaced_]);
+	}
+
+	// Spec 093 D8: a datetime2 column read as TIMESTAMP_NS whose values outside 1677-2262 were read
+	// as NULL (issue #168), once per column per statement, as soon as the scan meets one.
+	if (warnings_pending_) {
+		warnings_pending_ = false;
+		for (idx_t c = 0; c < out_of_range_.size(); c++) {
+			if (out_of_range_[c] != 1) {
+				continue;
+			}
+			out_of_range_[c] = 2;
+			// The ATTACH form first: the setting is read at ATTACH, and whoever reads this has an attached
+			// catalog, on which a bare SET changes nothing (review of #560).
+			DUCKDB_LOG_WARNING(context,
+							   "mssql: column \"%s\" holds datetime2(7) values outside 1677-2262 (a temporal "
+							   "table's 9999-12-31, say), read as NULL as TIMESTAMP_NS cannot hold them; attach with "
+							   "datetime2_7_as 'timestamp' (or SET mssql_datetime2_7_as = 'timestamp' before ATTACH) "
+							   "to read them as TIMESTAMP, the 100 ns digit truncated",
+							   column_metadata_[c].name.c_str());
+		}
 	}
 
 	// Issue #224, narrowed by spec 092 D9: a CHAR / VARCHAR / TEXT column under a

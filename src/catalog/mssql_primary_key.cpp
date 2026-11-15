@@ -92,7 +92,8 @@ static const string &PkDiscoverySql() {
 
 PKColumnInfo PKColumnInfo::FromMetadata(const string &name, int32_t column_id, int32_t key_ordinal,
 										const string &type_name, int16_t max_length, uint8_t precision, uint8_t scale,
-										const string &collation_name, const string &database_collation) {
+										const string &collation_name, const string &database_collation,
+										MSSQLDatetime2Read datetime2_read) {
 	PKColumnInfo info;
 	info.name = name;
 	info.column_id = column_id;
@@ -106,7 +107,8 @@ PKColumnInfo PKColumnInfo::FromMetadata(const string &name, int32_t column_id, i
 	}
 
 	// Map SQL Server type to DuckDB type using MSSQLColumnInfo helper
-	info.duckdb_type = MSSQLColumnInfo::MapSQLServerTypeToDuckDB(type_name, max_length, precision, scale);
+	info.duckdb_type =
+		MSSQLColumnInfo::MapSQLServerTypeToDuckDB(type_name, max_length, precision, scale, datetime2_read);
 
 	// Only SQL_ collations compare varchar and nvarchar under different rules;
 	// a Windows or UTF-8 collation applies the same rules to both. The name is
@@ -230,12 +232,20 @@ bool RowIdKeyInfo::AppendCandidateRow(RowIdKeyInfo &info, const vector<string> &
 	return true;
 }
 
-void RowIdKeyInfo::FinalizeChoice(const string &database_collation) {
+void RowIdKeyInfo::FinalizeChoice(const string &database_collation, MSSQLDatetime2Read datetime2_read) {
 	columns.clear();
 	rejections.clear();
 	index_name.clear();
 	source = RowIdKeySource::NONE;
 
+	// A datetime2(7) key column read in microseconds is time(7)'s case (spec 093 D8): no literal matches it.
+	if (datetime2_read == MSSQLDatetime2Read::Microseconds) {
+		for (auto &candidate : candidates_) {
+			for (auto &col : candidate.columns) {
+				col.datetime2_truncated = col.scale >= 7 && StringUtil::CIEquals(col.type_name, "datetime2");
+			}
+		}
+	}
 	auto choice = ChooseRowIdKey(candidates_);
 	candidates_.clear();
 
@@ -251,7 +261,7 @@ void RowIdKeyInfo::FinalizeChoice(const string &database_collation) {
 	for (const auto &col : choice.columns) {
 		columns.push_back(PKColumnInfo::FromMetadata(col.name, col.column_id, col.key_ordinal, col.type_name,
 													 col.max_length, col.precision, col.scale, col.collation_name,
-													 database_collation));
+													 database_collation, datetime2_read));
 	}
 	exists = true;
 	ComputeRowIdType();

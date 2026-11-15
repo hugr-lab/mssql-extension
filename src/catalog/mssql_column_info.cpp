@@ -6,9 +6,31 @@
 #include "codec/target_string_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/extension_type_info.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "query/mssql_identifier.hpp"
 
 namespace duckdb {
+
+MSSQLDatetime2Read ParseDatetime2Read(const string &value, const string &source) {
+	string v = value;
+	StringUtil::Trim(v);
+	v = StringUtil::Lower(v);
+	if (v == "timestamp_ns") {
+		return MSSQLDatetime2Read::Nanoseconds;
+	}
+	if (v == "timestamp") {
+		return MSSQLDatetime2Read::Microseconds;
+	}
+	throw InvalidInputException(
+		"%s must be 'timestamp_ns' (datetime2(7) as TIMESTAMP_NS, 1677-2262) or 'timestamp' "
+		"(as TIMESTAMP, the 100 ns digit truncated), not '%s'",
+		source, value);
+}
+
+bool MSSQLColumnInfo::ReadsDatetime2Truncated() const {
+	return scale >= 7 && duckdb_type.id() == LogicalTypeId::TIMESTAMP &&
+		   StringUtil::CIEquals(sql_type_name, "datetime2");
+}
 
 MSSQLColumnInfo::MSSQLColumnInfo()
 	: column_id(0),
@@ -27,7 +49,7 @@ MSSQLColumnInfo::MSSQLColumnInfo()
 
 MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const string &sql_type_name, int16_t max_length,
 								 uint8_t precision, uint8_t scale, bool is_nullable, const string &collation_name,
-								 const string &database_collation)
+								 const string &database_collation, MSSQLDatetime2Read datetime2_read)
 	: name(name),
 	  column_id(column_id),
 	  sql_type_name(sql_type_name),
@@ -49,7 +71,7 @@ MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const st
 	is_utf8 = IsUTF8Collation(this->collation_name);
 
 	// Map to DuckDB type
-	duckdb_type = MapSQLServerTypeToDuckDB(sql_type_name, max_length, precision, scale);
+	duckdb_type = MapSQLServerTypeToDuckDB(sql_type_name, max_length, precision, scale, datetime2_read);
 
 	// Detect geometry/geography UDTs — table scan rewrites these to .STAsBinary()
 	// so the wire delivers OGC WKB bytes (varbinary(max)) instead of MS's
@@ -198,7 +220,8 @@ bool MSSQLColumnInfo::IsUTF8Collation(const string &collation_name) {
 //===----------------------------------------------------------------------===//
 
 LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_name, int16_t max_length,
-													  uint8_t precision, uint8_t scale) {
+													  uint8_t precision, uint8_t scale,
+													  MSSQLDatetime2Read datetime2_read) {
 	// Convert to lowercase for comparison
 	string lower_type = sql_type_name;
 	std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
@@ -266,14 +289,16 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 		// scale 0       → TIMESTAMP_S  (seconds)
 		// scale 1-3     → TIMESTAMP_MS (milliseconds)
 		// scale 4-6     → TIMESTAMP    (microseconds — DuckDB native)
-		// scale 7       → TIMESTAMP_NS (DuckDB ns can hold 100-ns wire ticks losslessly)
+		// scale 7       → TIMESTAMP_NS (DuckDB ns can hold 100-ns wire ticks losslessly, within
+		//                 1677-2262), or TIMESTAMP when the catalog reads datetime2(7) in
+		//                 microseconds (spec 093 D8: the whole range, the 100 ns digit truncated)
 		if (scale == 0) {
 			return LogicalType::TIMESTAMP_S;
 		}
 		if (scale <= 3) {
 			return LogicalType::TIMESTAMP_MS;
 		}
-		if (scale <= 6) {
+		if (scale <= 6 || datetime2_read == MSSQLDatetime2Read::Microseconds) {
 			return LogicalType::TIMESTAMP;
 		}
 		return LogicalType::TIMESTAMP_NS;

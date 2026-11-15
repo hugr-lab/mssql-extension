@@ -1,4 +1,5 @@
 #include "connection/mssql_settings.hpp"
+#include "catalog/mssql_column_info.hpp"
 #include "copy/bcp_config.hpp"
 #include "dml/ctas/mssql_ctas_config.hpp"
 #include "dml/insert/mssql_insert_config.hpp"
@@ -25,6 +26,14 @@ static void ValidateNonNegative(ClientContext &context, SetScope scope, Value &p
 	auto val = parameter.GetValue<int64_t>();
 	if (val < 0) {
 		throw InvalidInputException("Value must be >= 0, got: %lld", val);
+	}
+}
+
+// Spec 093 D8: refused at SET, so a typo does not fail every later ATTACH of the instance
+// (DuckLake's metadata catalog included).
+static void ValidateDatetime2As(ClientContext &context, SetScope scope, Value &parameter) {
+	if (!parameter.IsNull()) {
+		ParseDatetime2Read(parameter.ToString(), "mssql_datetime2_7_as");
 	}
 }
 
@@ -593,6 +602,16 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "Read code-page CHAR / VARCHAR as bytes and transcode them to UTF-8 on the client; "
 							  "read at ATTACH (default: true)",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+
+	// mssql_datetime2_7_as - Spec 093 D8 (DQ-44): the type a datetime2(7) column is read
+	// as. 'timestamp_ns' keeps every 100 ns tick and reads a value outside 1677-2262 as
+	// NULL; 'timestamp' reads 0001-9999 with the 100 ns digit truncated, compared and
+	// keyed as time(7) is. Read once per catalog at ATTACH, like mssql_client_transcode
+	// (the connection's datetime2_7_as wins: ATTACH option, secret, connection string, URI).
+	config.AddExtensionOption("mssql_datetime2_7_as",
+							  "Type a datetime2(7) column is read as: 'timestamp_ns' (default; 1677-2262, else NULL) "
+							  "or 'timestamp' (0001-9999, the 100 ns digit truncated); read at ATTACH",
+							  LogicalType::VARCHAR, Value("timestamp_ns"), ValidateDatetime2As, SetScope::GLOBAL);
 
 	// mssql_convert_varchar_max - Convert VARCHAR(MAX) to NVARCHAR(MAX) in table scans
 	// When true: VARCHAR(MAX) with non-UTF8 collation is wrapped in CAST(... AS NVARCHAR(MAX))

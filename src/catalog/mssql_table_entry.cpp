@@ -474,7 +474,8 @@ string MSSQLTableEntry::KeylessKeyRefusal() const {
 				   : "Keying a table by all its columns is not available on this platform.";
 	}
 	for (const auto &col : mssql_columns_) {
-		switch (mssql::IsRoundTripExactForKey(col.sql_type_name, col.scale, col.is_cast_required)) {
+		switch (mssql::IsRoundTripExactForKey(col.sql_type_name, col.scale, col.is_cast_required,
+											  col.ReadsDatetime2Truncated())) {
 		case mssql::KeyFidelity::Exact:
 			break;
 		case mssql::KeyFidelity::NotRead:
@@ -482,7 +483,7 @@ string MSSQLTableEntry::KeylessKeyRefusal() const {
 				   col.sql_type_name + ", which the catalog does not read in a form that identifies a row.";
 		case mssql::KeyFidelity::NotRoundTrip:
 			return "It cannot be keyed by all its columns either: column '" + col.name + "' has type " +
-				   mssql::SpelledKeyType(col.sql_type_name, col.scale) +
+				   mssql::SpelledKeyType(col.sql_type_name, col.scale, col.ReadsDatetime2Truncated()) +
 				   ", whose value does not survive the round trip through DuckDB (see issue #358).";
 		}
 	}

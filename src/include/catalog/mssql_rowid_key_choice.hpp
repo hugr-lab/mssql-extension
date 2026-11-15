@@ -43,6 +43,9 @@ struct RowIdKeyColumn {
 	bool is_nullable = false;
 	bool is_identity = false;
 	bool cast_required = false;	 // MSSQLColumnInfo::is_cast_required for this column
+	//! A datetime2(7) the catalog reads in microseconds (spec 093 D8, MSSQLColumnInfo::ReadsDatetime2Truncated):
+	//! set by RowIdKeyInfo::FinalizeChoice from the catalog's answer before the choice runs.
+	bool datetime2_truncated = false;
 };
 
 struct RowIdKeyCandidate {
@@ -97,7 +100,8 @@ inline std::string Lower(std::string s) {
 //! such values, 1 updated — the one with a zero seventh digit); no conversion
 //! recovers the digit. `smalldatetime` has no fraction and matches its
 //! datetime2 literal exactly; `datetime2(7)` reads as TIMESTAMP_NS and
-//! round-trips.
+//! round-trips -- unless its catalog reads it in microseconds
+//! (`datetime2_truncated`, spec 093 D8), when it is time(7)'s case.
 //!
 //! `datetime` is no longer here (spec 080 W3, #358). It counts in 1/300 s
 //! ticks, and compared with a datetime2 it is converted more precisely than
@@ -107,9 +111,9 @@ inline std::string Lower(std::string s) {
 //! (PKColumnInfo::KeyComparand, the VALUES path) matched 603 of 603, and the
 //! value written into a datetime stage column by INSERT BULK (the #stage path)
 //! 603 of 603 -- every tick of two seconds and both ends of the range.
-inline bool IsLiteralMismatch(const std::string &type_name, uint8_t scale) {
+inline bool IsLiteralMismatch(const std::string &type_name, uint8_t scale, bool datetime2_truncated) {
 	const std::string t = Lower(type_name);
-	return (t == "time" || t == "datetimeoffset") && scale == 7;
+	return ((t == "time" || t == "datetimeoffset") && scale == 7) || datetime2_truncated;
 }
 
 //! Spec 080 D3: whether a column's value, read into DuckDB and written back,
@@ -128,7 +132,10 @@ enum class KeyFidelity : uint8_t {
 //! types are named, because the catalog knows those types (no CAST flag) and
 //! still cannot match by them: xml / image / text / ntext do not compare, and
 //! a spatial value is read as WKB, not as the stored serialisation.
-inline KeyFidelity IsRoundTripExactForKey(const std::string &type_name, uint8_t scale, bool cast_required) {
+//! datetime2_truncated: the column's read drops a datetime2(7)'s 100 ns digit (no default: it is the
+//! catalog's answer, spec 093 D8).
+inline KeyFidelity IsRoundTripExactForKey(const std::string &type_name, uint8_t scale, bool cast_required,
+										  bool datetime2_truncated) {
 	if (cast_required) {
 		return KeyFidelity::NotRead;
 	}
@@ -136,16 +143,16 @@ inline KeyFidelity IsRoundTripExactForKey(const std::string &type_name, uint8_t 
 	if (t == "xml" || t == "image" || t == "text" || t == "ntext" || t == "geometry" || t == "geography") {
 		return KeyFidelity::NotRead;
 	}
-	if (IsLiteralMismatch(type_name, scale)) {
+	if (IsLiteralMismatch(type_name, scale, datetime2_truncated)) {
 		return KeyFidelity::NotRoundTrip;
 	}
 	return KeyFidelity::Exact;
 }
 
 //! The type as a refusal spells it: `time(7)`, not `time`.
-inline std::string SpelledKeyType(const std::string &type_name, uint8_t scale) {
+inline std::string SpelledKeyType(const std::string &type_name, uint8_t scale, bool datetime2_truncated) {
 	const std::string t = Lower(type_name);
-	if ((t == "time" || t == "datetimeoffset") && scale == 7) {
+	if (((t == "time" || t == "datetimeoffset") && scale == 7) || datetime2_truncated) {
 		return type_name + "(7)";
 	}
 	return type_name;
@@ -180,7 +187,7 @@ inline RowIdKeyRejection Unusable(const RowIdKeyCandidate &c) {
 		}
 	}
 	for (const auto &col : c.columns) {
-		switch (IsRoundTripExactForKey(col.type_name, col.scale, col.cast_required)) {
+		switch (IsRoundTripExactForKey(col.type_name, col.scale, col.cast_required, col.datetime2_truncated)) {
 		case KeyFidelity::Exact:
 			break;
 		case KeyFidelity::NotRead:
@@ -189,7 +196,8 @@ inline RowIdKeyRejection Unusable(const RowIdKeyCandidate &c) {
 			r.unmatchable = true;
 			return r;
 		case KeyFidelity::NotRoundTrip:
-			r.reason = "its key column '" + col.name + "' has type " + SpelledKeyType(col.type_name, col.scale) +
+			r.reason = "its key column '" + col.name + "' has type " +
+					   SpelledKeyType(col.type_name, col.scale, col.datetime2_truncated) +
 					   ", which no rowid literal can match (see issue #358)";
 			r.unmatchable = true;
 			return r;
