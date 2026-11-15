@@ -186,7 +186,7 @@ int IntegerRank(LogicalTypeId id) {
 }
 
 MSSQLColumnInfo DerivedColumn(const std::string &name, const LogicalType &type) {
-	string sql_type = "derived";  // unknown to IsKnownSQLServerType: not comparable
+	string sql_type = "derived";  // on no type list: ComparisonDiffersFor answers true, not comparable
 	int16_t length = 0;
 	uint8_t precision = 0;
 	uint8_t scale = 0;

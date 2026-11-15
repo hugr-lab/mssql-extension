@@ -1019,6 +1019,47 @@ static void TestCastReadColumnNotPushed() {
 	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*resolver_null, rctx), "([t].[v] IS NULL)");
 }
 
+// Spec 093 D2, review of #557: the three answers name their own types, so a type that becomes
+// decodable (sql_variant in T1) moves its read form and nothing else.
+static void TestD2AnswersAreSeparate() {
+	std::cout << "  TestD2AnswersAreSeparate..." << std::endl;
+	for (const char *t : {"sql_variant", "hierarchyid", "vector", "json", "my_clr_type"}) {
+		ASSERT_TRUE(MSSQLColumnInfo::ComparisonDiffersFor(t));
+	}
+	for (const char *t : {"int", "nvarchar", "datetime2", "datetimeoffset", "uniqueidentifier", "xml", "geometry"}) {
+		ASSERT_TRUE(!MSSQLColumnInfo::ComparisonDiffersFor(t));
+	}
+	for (const char *t : {"sql_variant", "hierarchyid", "vector", "geometry", "geography", "my_clr_type"}) {
+		ASSERT_TRUE(!MSSQLColumnInfo::BulkWireTakesType(t));
+	}
+	for (const char *t : {"int", "nvarchar", "datetime2", "rowversion", "json", "xml"}) {
+		ASSERT_TRUE(MSSQLColumnInfo::BulkWireTakesType(t));
+	}
+	// Case as the server spells it in sys.types, or not.
+	ASSERT_TRUE(MSSQLColumnInfo::ComparisonDiffersFor("JSON"));
+	ASSERT_TRUE(!MSSQLColumnInfo::BulkWireTakesType("SQL_VARIANT"));
+}
+
+// J1 (measured/J1.md): the 2025 json type is compared by nothing but IS NULL on the server (402,
+// 13636, 421), so a comparison of it runs in DuckDB, over the text it read, and IS NULL is pushed.
+static void TestJsonComparisonNotPushed() {
+	std::cout << "  TestJsonComparisonNotPushed..." << std::endl;
+	Fixture fx;
+	std::vector<MSSQLColumnInfo> cols = {Col("id", 1, "int", 4, 10, 0), Col("dt", 2, "datetime2", 8, 27, 7),
+										 Col("flag", 3, "bit", 1, 1, 0), Col("name", 4, "json", -1, 0, 0),
+										 Col("d", 5, "float", 8, 53, 0)};
+	ASSERT_TRUE(cols[3].comparison_differs);
+	ASSERT_TRUE(cols[3].read_form == MSSQLReadForm::Bare);
+	auto ctx = fx.Context();
+	ctx.mssql_columns = &cols;
+	auto eq = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, ColRef(fx, COL_NAME),
+												Const(Value("{\"a\":1}")));
+	ASSERT_TRUE(!FilterEncoder::EncodeSearchCondition(*eq, ctx).supported);
+	auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
+	is_null->GetChildrenMutable().push_back(ColRef(fx, COL_NAME));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*is_null, ctx), "([name] IS NULL)");
+}
+
 // The declaration table of spec 076 W1: the column's kind, never narrower
 // than the constant.
 static void TestDeclarationForColumn() {
@@ -1207,6 +1248,8 @@ int main() {
 	TestInListOperatorExpressions();
 	TestDeclarationForColumn();
 	TestCastReadColumnNotPushed();
+	TestD2AnswersAreSeparate();
+	TestJsonComparisonNotPushed();
 	TestColumnResolver();
 	TestWideningCasts();
 

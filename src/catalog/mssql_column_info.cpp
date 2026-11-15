@@ -89,15 +89,34 @@ MSSQLReadForm MSSQLColumnInfo::ReadFormFor(const string &sql_type_name) {
 }
 
 bool MSSQLColumnInfo::ComparisonDiffersFor(const string &sql_type_name) {
-	return !IsKnownSQLServerType(sql_type_name);
+	// Its own list, not IsKnownSQLServerType's (review of #557): a type that becomes decodable must
+	// not join it by accident (#514). An allow-list, so a type not named -- a user CLR type, one SQL
+	// Server adds later -- differs. Not on it: sql_variant, hierarchyid, vector (#514), and json,
+	// which the server compares by nothing but IS NULL (J1: 402 / 13636 / 421 on SQL Server 2025).
+	// Spatial types are on it and named by IsSpatial() where they matter, as before the split.
+	const string t = StringUtil::Lower(sql_type_name);
+	return !(t == "bit" || t == "tinyint" || t == "smallint" || t == "int" || t == "bigint" || t == "real" ||
+			 t == "float" || t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" || t == "char" ||
+			 t == "varchar" || t == "text" || t == "nchar" || t == "nvarchar" || t == "ntext" || t == "date" ||
+			 t == "time" || t == "datetime" || t == "datetime2" || t == "smalldatetime" || t == "datetimeoffset" ||
+			 t == "binary" || t == "varbinary" || t == "image" || t == "uniqueidentifier" || t == "timestamp" ||
+			 t == "rowversion" || t == "xml" || IsSpatialType(t));
 }
 
 bool MSSQLColumnInfo::BulkWireTakesType(const string &sql_type_name) {
-	// A geometry / geography column arrives as WKB, which the statement path renders as a 0x literal
-	// the server converts; on the bulk wire FromServerColumn would declare it nvarchar and send the
-	// bytes as text. The same for the types read through a cast (hierarchyid, sql_variant): the
-	// statement path sends a string literal the server converts, the bulk wire would not.
-	return IsKnownSQLServerType(sql_type_name) && !IsSpatialType(sql_type_name);
+	// Its own list, not IsKnownSQLServerType's (review of #557): a type joins it in its own write PR,
+	// measured first (spec 093 T2, T6), never because it became decodable (#296). A geometry /
+	// geography column arrives as WKB, which the statement path renders as a 0x literal the server
+	// converts; on the bulk wire FromServerColumn would declare it nvarchar and send the bytes as
+	// text. The same for the types read through a cast (hierarchyid, sql_variant): the statement
+	// path sends a string literal the server converts, the bulk wire would not.
+	const string t = StringUtil::Lower(sql_type_name);
+	return t == "bit" || t == "tinyint" || t == "smallint" || t == "int" || t == "bigint" || t == "real" ||
+		   t == "float" || t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" || t == "char" ||
+		   t == "varchar" || t == "text" || t == "nchar" || t == "nvarchar" || t == "ntext" || t == "date" ||
+		   t == "time" || t == "datetime" || t == "datetime2" || t == "smalldatetime" || t == "datetimeoffset" ||
+		   t == "binary" || t == "varbinary" || t == "image" || t == "uniqueidentifier" || t == "timestamp" ||
+		   t == "rowversion" || t == "json" || t == "xml";
 }
 
 //===----------------------------------------------------------------------===//
