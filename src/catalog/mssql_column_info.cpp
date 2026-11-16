@@ -361,15 +361,13 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 		return LogicalType::BLOB;
 	}
 
-	// The native JSON type of SQL Server 2025. On the wire it is plain
-	// varchar(max) under a UTF-8 BIN2 collation — `sp_describe_first_result_set`
-	// answers system_type_name `varchar(max)`, tds_type_id 167 — so the bytes
-	// are already what a DuckDB VARCHAR wants and the binary kernel reads them
-	// as they are. Naming it here is only about NOT treating it as unknown:
-	// without the name it is CAST to NVARCHAR(MAX), which works and costs a
-	// server-side conversion of every value for nothing.
+	// The native JSON type of SQL Server 2025, reported as DuckDB's JSON (spec 093 D7): a VARCHAR
+	// by its id, so it reads as one. On the wire it is plain varchar(max) under a UTF-8 BIN2
+	// collation — `sp_describe_first_result_set` answers system_type_name `varchar(max)`, tds_type_id
+	// 167; JSONSUPPORT (0x0D) is not requested, it would change the describe only — so the bytes are
+	// already what the vector wants. A raw scan, typed by the describe, reads VARCHAR.
 	if (lower_type == "json") {
-		return LogicalType::VARCHAR;
+		return LogicalType::JSON();
 	}
 
 	// Special types

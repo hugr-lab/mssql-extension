@@ -780,6 +780,17 @@ static bool IsCacheableTypeText(const string &text, const LogicalType &type) {
 	return !quoted;
 }
 
+// A type name of `columns :=` / `column_types :=`. JSON is the core's own type (spec 093 D7: a 2025
+// `json` column), which the name reaches only through the json extension's catalog entry: a pushed
+// statement carries it as text, and without that extension loaded it failed to bind where the
+// unpushed read did not.
+static LogicalType TypeFromName(const string &text, ClientContext &context) {
+	if (StringUtil::CIEquals(text, "JSON")) {
+		return LogicalType::JSON();
+	}
+	return TransformStringToLogicalType(text, context);
+}
+
 // Spec 081: the declared types of `columns :=`, parsed once per catalog. The
 // parse goes through DuckDB's parser (~20 us a type), and pushed statements and
 // DuckLake's metadata reads repeat the same few. Only what parses the same in
@@ -790,7 +801,7 @@ static LogicalType ParseDeclaredType(const string &text, ClientContext &context,
 	if (catalog.TryGetDeclaredType(text, cached)) {
 		return cached;
 	}
-	auto type = TransformStringToLogicalType(text, context);
+	auto type = TypeFromName(text, context);
 	if (IsCacheableTypeText(text, type)) {
 		catalog.StoreDeclaredType(text, type);
 	}
@@ -864,7 +875,7 @@ static void ApplyColumnTypes(ClientContext &context, const TableFunctionBindInpu
 		if (wanted[i].IsNull() || wanted[i].ToString().empty()) {
 			continue;
 		}
-		auto type = TransformStringToLogicalType(wanted[i].ToString(), context);
+		auto type = TypeFromName(wanted[i].ToString(), context);
 		const bool datetime2 = i < bind_data.described_datetime2.size() && bind_data.described_datetime2[i];
 		if (!ColumnTypeFits(described[i], type, datetime2)) {
 			throw InvalidInputException("mssql_scan: column %llu is described as %s and cannot be read as %s",

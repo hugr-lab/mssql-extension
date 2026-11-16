@@ -152,7 +152,7 @@ A raw `mssql_scan` reads any `datetime2` as `TIMESTAMP`, whatever the setting.
 | ------------------- | -------------- | ---------------------------- |
 | `UNIQUEIDENTIFIER`  | `UUID`         | 128-bit GUID                 |
 | `XML`               | `VARCHAR`      | PLP encoding, UTF-16LE decoded to UTF-8, up to 2 GB |
-| `JSON`              | `VARCHAR`      | SQL Server 2025 and later; arrives as UTF-8 `varchar(max)`, read verbatim, and writable by INSERT and COPY as a string |
+| `JSON`              | `JSON`         | SQL Server 2025 and later; arrives as UTF-8 `varchar(max)`, read verbatim, and writable by INSERT and COPY as a string. A raw `mssql_scan` reads it as `VARCHAR` (the server describes it so). Compared only in DuckDB: the server compares a `json` value by nothing but `IS NULL` |
 
 **XML type notes:**
 - **SELECT**: XML columns are read via the same PLP + UTF-16LE code path as NVARCHAR(MAX)
