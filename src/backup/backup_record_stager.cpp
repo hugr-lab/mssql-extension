@@ -345,7 +345,9 @@ void RecordStager::UseLayout(const RowsetLayout &layout) {
 		// A fixed arm copies `stride` bytes from the record (a bit, one): the physical column must be a
 		// fixed one of that width, and a default given for it the same width, so no value needs a test.
 		const uint32_t width = col.arm == StageArm::Bit ? 1u : col.ops.stride;
-		if (fixed_arm && (p.offset <= 0 || p.FixedLength(layout.table) != width)) {
+		// A ROW-compressed rowset's values are put in that width as they are read (CdRow), whatever
+		// their CD index.
+		if (fixed_arm && layout.compression == 0 && (p.offset <= 0 || p.FixedLength(layout.table) != width)) {
 			throw FormatError("backup: " + col.name + " is stored " +
 							  (p.offset <= 0 ? std::string("as a variable column")
 											 : std::to_string(p.FixedLength(layout.table)) + " bytes wide") +
@@ -395,8 +397,15 @@ OffRowNeed RecordStager::PrepareRow(const RecordView &record) {
 	if (!layout_) {
 		throw InternalException("backup: RecordStager::PrepareRow with no layout");
 	}
+	return PrepareRow(RowRecord::Fixed(record, RowVarCount(record, layout_->table)));
+}
+
+OffRowNeed RecordStager::PrepareRow(const RowRecord &row) {
+	if (!layout_) {
+		throw InternalException("backup: RecordStager::PrepareRow with no layout");
+	}
 	OffRowNeed need;
-	prepared_record_ = record.data;
+	prepared_record_ = row.data;
 	prepared_valid_ = true;
 	// Only the columns that can hold a value stored off row are looked at; a row of none, with no map
 	// wanted, costs nothing more (review of PR 3 S4: this runs for every row).
@@ -404,12 +413,11 @@ OffRowNeed RecordStager::PrepareRow(const RecordView &record) {
 		return need;
 	}
 	prepared_valid_ = false;
-	const size_t var_count = RowVarCount(record, layout_->table);
 	for (size_t i : var_columns_) {
 		Column &c = columns_[i];
 		PreparedValue &p = prepared_[i];
 		p = PreparedValue();
-		const ValueRef v = LocateValue(record, var_count, *layout_, c.layout_index);
+		const ValueRef v = row.Locate(*layout_, c.layout_index);
 		if (v.state != ValueState::OffRow) {
 			continue;
 		}
@@ -454,7 +462,7 @@ OffRowNeed RecordStager::PrepareRow(const RecordView &record) {
 		}
 	}
 	if (map_off_row_) {
-		MapRow(record, var_count);
+		MapRow(row);
 		need.map = row_lob_map_.size();
 	}
 	prepared_valid_ = true;
@@ -565,11 +573,11 @@ void RecordStager::AppendOffRow(Column &c, ColumnStaging &st, const PreparedValu
 	staged_bytes_ += value.length;
 }
 
-void RecordStager::MapRow(const RecordView &record, size_t var_count) {
+void RecordStager::MapRow(const RowRecord &row) {
 	row_lob_map_.clear();
 	std::vector<LobMapEntry> entries;
 	for (const auto &mc : map_columns_) {
-		const ValueRef v = LocateValue(record, var_count, *layout_, mc.layout_index);
+		const ValueRef v = row.Locate(*layout_, mc.layout_index);
 		if (v.state != ValueState::OffRow) {
 			continue;
 		}
@@ -684,24 +692,40 @@ void RecordStager::AppendValue(Column &c, ColumnStaging &st, const ValueRef &v) 
 	}
 }
 
+void RecordStager::MarkNeeded(std::vector<bool> &needed) const {
+	if (!layout_) {
+		throw InternalException("backup: RecordStager::MarkNeeded with no layout");
+	}
+	needed.assign(layout_->columns.size(), false);
+	for (const auto &c : columns_) {
+		needed[c.layout_index] = true;
+	}
+}
+
 void RecordStager::Append(const RecordView &record) {
+	if (!layout_) {
+		throw InternalException("backup: RecordStager::Append with no layout");
+	}
+	Append(RowRecord::Fixed(record, RowVarCount(record, layout_->table)));
+}
+
+void RecordStager::Append(const RowRecord &row) {
 	if (!begun_ || spoiled_ || !layout_ || count_ == STANDARD_VECTOR_SIZE) {
 		throw InternalException("backup: RecordStager::Append on a chunk that is %s", !begun_	 ? "not begun"
 																					  : spoiled_ ? "spoiled by an error"
 																					  : !layout_ ? "of no layout"
 																								 : "full");
 	}
-	if (!prepared_valid_ || prepared_record_ != record.data) {
-		PrepareRow(record);	 // a caller that reserves nothing for it (tests), or another record than prepared
+	if (!prepared_valid_ || prepared_record_ != row.data) {
+		PrepareRow(row);  // a caller that reserves nothing for it (tests), or another record than prepared
 	}
 	prepared_valid_ = false;
 	// Set until the row is whole: a throw below leaves a chunk with part of a row.
 	spoiled_ = true;
-	const size_t var_count = RowVarCount(record, layout_->table);
 	for (size_t i = 0; i < columns_.size(); i++) {
 		Column &c = columns_[i];
 		ColumnStaging &st = arena_.Column(i);
-		const ValueRef v = LocateValue(record, var_count, *layout_, c.layout_index);
+		const ValueRef v = row.Locate(*layout_, c.layout_index);
 		switch (v.state) {
 		case ValueState::Null:
 			st.AppendNull();

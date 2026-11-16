@@ -396,6 +396,9 @@ struct ScanLocalState : public LocalTableFunctionState {
 	Page page;
 	bool have_page = false;
 	uint16_t next_slot = 0;
+	CdRecord cd_record;	 // a ROW-compressed rowset's record and its values (spec 086 PR 1), reused
+	CdRow cd_row;
+	std::vector<bool> cd_needed;	// the layout's columns this scan reads: the stager's, the key's
 	std::vector<uint16_t> offsets;	// the current page's slot offsets, a freed slot as 0
 	std::vector<uint16_t> bounds;	// where each slot's record must end (the next record's start)
 
@@ -648,6 +651,15 @@ bool ClaimUnit(const ScanBindData &data, ScanGlobalState &global, ScanLocalState
 	if (local.layout != &layout) {
 		local.stager->UseLayout(layout);
 		local.layout = &layout;
+		// The columns a compressed row's values are read for: the projected ones and _mssql_rid's (its
+		// key and uniquifier, also named in a refusal's words).
+		local.stager->MarkNeeded(local.cd_needed);
+		for (size_t k : local.cursor->key) {
+			local.cd_needed[k] = true;
+		}
+		if (local.cursor->has_uniquifier) {
+			local.cd_needed[local.cursor->uniquifier] = true;
+		}
 	}
 	// Every claim: partitions sharing a layout have units of their own.
 	local.stager->UseOffRow(&local.off_row_fetch, local.cursor->off_row);
@@ -697,17 +709,12 @@ void PutU32(std::string &out, uint32_t v) {
 // is not unique (0 when absent). No partition number, which SPLIT / MERGE renumber: a partitioned
 // clustered index carries its partitioning column as a key column (measured, 2022: added by the server
 // to a non-unique index on another column, ordkey 2 of 3), so rows of two partitions differ in it.
-std::string RowId(const ScanBindData &data, const PartitionCursor &cursor, const RecordView &record,
-				  const PagePointer &page, uint16_t slot) {
+// `at`: where the row lives, a forwarded record's place before it moved (its back pointer).
+std::string RowId(const ScanBindData &data, const PartitionCursor &cursor, const RowRecord &row,
+				  const RowLocation &at) {
 	std::string rid;
 	const RowsetLayout &layout = data.entry->Layout(*cursor.partition);
 	if (data.entry->shape == TableShape::Heap) {
-		RowLocation at;
-		at.page = page;
-		at.slot = slot;
-		if (record.Type() == RECORD_FORWARDED) {
-			at = ForwardedFrom(record, layout.table);
-		}
 		rid.push_back('\x00');
 		PutU32(rid, at.page.page);
 		PutU16(rid, at.page.file);
@@ -715,9 +722,8 @@ std::string RowId(const ScanBindData &data, const PartitionCursor &cursor, const
 		return rid;
 	}
 	rid.push_back('\x01');
-	const size_t var_count = RowVarCount(record, layout.table);
 	for (size_t k : cursor.key) {
-		const ValueRef v = LocateValue(record, var_count, layout, k);
+		const ValueRef v = row.Locate(layout, k);
 		const PhysicalColumn &c = layout.columns[k];
 		if (v.state == ValueState::Null) {
 			PutU16(rid, 0xFFFF);
@@ -728,7 +734,8 @@ std::string RowId(const ScanBindData &data, const PartitionCursor &cursor, const
 							  ", a key column, holds a value stored off row");
 		}
 		if (c.xtype == XTYPE_BIT && v.state == ValueState::Inline) {
-			if (c.offset <= 0) {
+			// A compressed row's bit is put in its byte as the uncompressed record holds it (CdRow).
+			if (!row.cd && c.offset <= 0) {
 				throw FormatError("backup: " + layout.table + "." + c.name +
 								  ", a bit key column, is not at a fixed offset");
 			}
@@ -746,7 +753,7 @@ std::string RowId(const ScanBindData &data, const PartitionCursor &cursor, const
 		rid.append(reinterpret_cast<const char *>(v.data), v.size);
 	}
 	if (cursor.has_uniquifier) {
-		const ValueRef u = LocateValue(record, var_count, layout, cursor.uniquifier);
+		const ValueRef u = row.Locate(layout, cursor.uniquifier);
 		uint32_t value = 0;
 		if (u.state == ValueState::Inline && u.size == 4) {
 			value = static_cast<uint32_t>(u.data[0]) | (static_cast<uint32_t>(u.data[1]) << 8) |
@@ -905,12 +912,40 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 			if (local.offsets[slot] == 0) {
 				continue;  // a freed slot
 			}
-			const RecordView record =
-				ReadSlot(local.page.bytes.data(), PAGE_SIZE, local.page.header.slot_count, slot, data.table.c_str());
-			if (record.Type() != RECORD_PRIMARY && record.Type() != RECORD_FORWARDED) {
-				continue;  // ghosts, stubs (the row is read where it lives), index and LOB records
+			const RowsetLayout &layout = data.entry->Layout(*local.cursor->partition);
+			RowLocation at;
+			at.page = local.page.header.page_id;
+			at.slot = slot;
+			RecordView fixed;
+			RowRecord row;
+			uint32_t record_end = 0;
+			if (layout.compression == 1) {
+				// ROW compression (spec 086 PR 1): a CD record, its values put in the uncompressed form.
+				CdRecord &cd = local.cd_record;
+				ReadCdRecord(local.page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * local.page.header.slot_count,
+							 local.offsets[slot], data.table.c_str(), cd);
+				if (cd.kind == CdRecord::Kind::Ghost || cd.kind == CdRecord::Kind::Stub) {
+					continue;  // ghosts, stubs (the row is read where it lives)
+				}
+				if (cd.kind == CdRecord::Kind::Forwarded) {
+					cd.BackPointer(at.page.page, at.page.file, at.slot);
+				}
+				local.cd_row.Read(cd, layout, &local.cd_needed);
+				row = RowRecord::Compressed(cd, local.cd_row);
+				record_end = cd.end;
+			} else {
+				fixed = ReadSlot(local.page.bytes.data(), PAGE_SIZE, local.page.header.slot_count, slot,
+								 data.table.c_str());
+				if (fixed.Type() != RECORD_PRIMARY && fixed.Type() != RECORD_FORWARDED) {
+					continue;  // ghosts, stubs (the row is read where it lives), index and LOB records
+				}
+				if (fixed.Type() == RECORD_FORWARDED) {
+					at = ForwardedFrom(fixed, layout.table);
+				}
+				row = RowRecord::Fixed(fixed, RowVarCount(fixed, layout.table));
+				record_end = fixed.End();
 			}
-			if (static_cast<uint32_t>(local.offsets[slot]) + record.End() > local.bounds[slot]) {
+			if (static_cast<uint32_t>(local.offsets[slot]) + record_end > local.bounds[slot]) {
 				throw FormatError("backup: page " + local.page.header.page_id.ToString() + " has a record at offset " +
 								  std::to_string(local.offsets[slot]) + " that runs past the next record's start (" +
 								  std::to_string(local.bounds[slot]) + ")");
@@ -919,13 +954,13 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 			// waiting holding another reservation: a refusal with rows staged closes the chunk before this
 			// row (its slot is read again by the next call); with none, the chunk's reservation is given back
 			// and taken again with the row's, in one wait.
-			const OffRowNeed need = local.stager->PrepareRow(record);
+			const OffRowNeed need = local.stager->PrepareRow(row);
 			if (need.Total() > 0) {
 				// Named only when refused: the row by its _mssql_rid and place, and what it holds off row.
 				auto describe = [&](uint64_t bytes) {
 					static const char *digits = "0123456789ABCDEF";
 					std::string rid = "0x";
-					for (unsigned char b : RowId(data, *local.cursor, record, local.page.header.page_id, slot)) {
+					for (unsigned char b : RowId(data, *local.cursor, row, at)) {
 						rid.push_back(digits[b >> 4]);
 						rid.push_back(digits[b & 15]);
 					}
@@ -956,12 +991,12 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 					reserving_bytes = global.chunk_bytes;
 				}
 			}
-			local.stager->Append(record);
+			local.stager->Append(row);
 			if (global.page_output != DConstants::INVALID_INDEX) {
 				local.page_keys.push_back(PageKey(local.page.header.page_id));
 			}
 			if (global.rid_output != DConstants::INVALID_INDEX) {
-				local.rids.push_back(RowId(data, *local.cursor, record, local.page.header.page_id, slot));
+				local.rids.push_back(RowId(data, *local.cursor, row, at));
 			}
 			if (global.lsn_output != DConstants::INVALID_INDEX) {
 				local.lsns.push_back(LsnNumber(local.page.header.lsn));

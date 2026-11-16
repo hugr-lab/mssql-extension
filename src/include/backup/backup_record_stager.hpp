@@ -17,6 +17,7 @@
 #pragma once
 
 #include "backup/backup_catalog_model.hpp"
+#include "backup/backup_cd_record.hpp"
 #include "backup/backup_lob.hpp"
 #include "backup/backup_record.hpp"
 #include "backup/backup_system_tables.hpp"
@@ -104,6 +105,8 @@ public:
 	//! What `record`'s values stored off row need (reading a root record for a root pointer's length,
 	//! and building the row's map when MapOffRow is on), kept for the Append of that record, which
 	//! must come next. Append prepares a record itself when it was not.
+	OffRowNeed PrepareRow(const RowRecord &row);
+	//! A FixedVar record of the layout (its variable columns RowVarCount's).
 	OffRowNeed PrepareRow(const RecordView &record);
 	//! The prepared row's values stored off row, for a refusal: `table.column (size)`, comma separated.
 	std::string DescribePrepared() const;
@@ -116,6 +119,10 @@ public:
 	//! UseOffRow's pages (a NULL root is NULL); a malformed one is WalkLob's FormatError naming the
 	//! column. A record the layout does not fit is LocateValue's FormatError. After a throw the chunk holds part of a
 	//! row: the next Append or FinalizeChunk without a BeginChunk first is an InternalException, never a row shifted.
+	void Append(const RowRecord &row);
+	//! The layout's columns whose values the stager reads (its columns'), set in `needed` (by layout
+	//! index, sized to the layout); for CdRow::Read.
+	void MarkNeeded(std::vector<bool> &needed) const;
 	void Append(const RecordView &record);
 	idx_t Count() const {
 		return count_;
@@ -182,7 +189,7 @@ private:
 	void AppendOffRow(Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);
 	void AppendDirect(size_t column, Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);
 	void AppendStream(size_t column, Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);
-	void MapRow(const RecordView &record, size_t var_count);
+	void MapRow(const RowRecord &row);
 	const LobPageFetch &Fetch(const std::string &what) const;
 
 	std::string table_;

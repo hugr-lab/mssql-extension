@@ -127,7 +127,7 @@ SELECT schema_name, view_name, definition FROM mssql_backup_views('/backups/sale
 | `compression` | `VARCHAR` | `none`, `row`, `page`, `columnstore`, `columnstore_archive` (`level n` for a level the reader does not name); `mixed` when partitions differ |
 | `partition_count`, `row_count` | `INTEGER`, `BIGINT` | the row count the catalog keeps (`sys.partitions.rows`); NULL when a partition's count is negative (an upgraded database can hold one until `DBCC UPDATEUSAGE`). For a clustered columnstore it includes the delta stores the tuple mover has not dropped yet, as SQL Server 2022 counts them (2025 does not); exact once columnstores are read |
 | `created`, `modified` | `TIMESTAMP` | `sys.tables.create_date` / `modify_date` |
-| `decodable`, `reason` | `BOOLEAN`, `VARCHAR` | whether `mssql_backup_scan` reads the table, and why not (a clustered columnstore or ROW / PAGE compression, for now) |
+| `decodable`, `reason` | `BOOLEAN`, `VARCHAR` | whether `mssql_backup_scan` reads the table, and why not (a clustered columnstore or PAGE compression, for now; ROW compression is read) |
 | `fuzzy_status`, `open_transactions`, `stale_transactions` | `VARCHAR`, `INTEGER`, `INTEGER` | NULL for now |
 | `columns` | `LIST(STRUCT(…))` | `column_id`, `name`, `sql_type` (as T-SQL declares it, e.g. `nvarchar(40)`), `system_type_id`, `max_length`, `precision`, `scale`, `collation`, `code_page`, `is_nullable`, `is_identity`, `is_computed`, `is_sparse`, `duckdb_type` (the type the scan returns: the one `TYPE mssql` reads the column as, with `mssql_catalog_native_types` off -- a plain `VARCHAR` for a string --, or for now `BLOB`, its stored bytes, for `sql_variant`, `xml`, `geometry` / `geography`, `hierarchyid`, `vector` and `json`, which a later release converts), `decodable` (false only for a column the scan cannot read: a computed one not persisted, a sparse one), `reason` (why a column is not converted or not readable) |
 | `allocation_units` | `LIST(STRUCT(…))` | the table's allocation units: `au_id`, `type` (`IN_ROW_DATA`, `LOB_DATA`, `ROW_OVERFLOW_DATA`), `rowset_id`, `index_id`, `partition_number`, `compression`, `filegroup_id`, `first_page`, `root_page`, `first_iam_page`, `live_pages` (NULL for now) |
@@ -155,7 +155,7 @@ The states:
 A value stored off row -- `text` / `ntext` / `image`, a MAX type's long value, a value pushed off a
 row past 8,060 bytes -- is read like one in row, so it has no state of its own. The `schema` and
 `table` arguments are matched as stored (a name that is not there lists nothing). A column's state is its own: a table that `mssql_backup_tables` says is not read (a
-columnstore, ROW / PAGE compression, for now) keeps its columns' states and says so in each
+columnstore, PAGE compression, for now) keeps its columns' states and says so in each
 `reason`, so a query for what will not be read asks for both:
 
 ```sql
@@ -252,7 +252,8 @@ Four virtual columns, which `SELECT *` leaves out:
 | `_mssql_page_lsn` | `DECIMAL(25,0)` | the LSN of the page's last change, in `RESTORE HEADERONLY`'s numeric form |
 | `_mssql_lob` | `BLOB` | the row's values stored off row and the pages that hold them -- every one of the row's, whichever columns are selected -- in a format of the reader's own (versioned by its first byte), for a later differential backup's import; NULL for a row with none (a `text` / `ntext` / `image` value updated to NULL keeps its place off row, so its row has a map) |
 
-Refused by name, for now: a table with ROW or PAGE compression or a clustered columnstore index
+A ROW-compressed table, or partition, is read like an uncompressed one: the same values, the same
+`_mssql_rid`. Refused by name, for now: a table with PAGE compression or a clustered columnstore index
 (see `mssql_backup_tables.reason`); a column the scan cannot read, when it is named (above); a
 value stored off row that cannot fit in half of `max_memory` even with nothing else of the scan
 held, or in DuckDB's memory (named by its row's `_mssql_rid`, its page and slot, and its columns and

@@ -1,6 +1,7 @@
 # Spec 086: compressed row formats and the remaining types
 
-Status: **draft**, 2026-11-05. Not started. Depends on spec 085. Series overview: `../README.md`.
+Status: **draft**, 2026-11-05. PR 1 (ROW) built 2026-11-16 from main: the CD format measured in
+[E22](measured/E22-cd-records.md). Depends on spec 085. Series overview: `../README.md`.
 **Amended 2026-11-13:** the types that cross the TDS wire too (`sql_variant`, `vector`, `hierarchyid`,
 `geometry`, `geography`) moved to [spec 093](../093-type-kernels/spec.md), which decodes each once for
 both paths (D8a). This spec keeps the storage formats, `xml` and the `json` spike.
@@ -77,7 +78,13 @@ and page-dictionary records (090's follow-up).
   its CD code into the codec staging; per-column kernels convert the CD encodings (big-endian
   sign-flipped integers, trimmed floats, vardecimal, SCSU, …) in one call per column (085 D7). The
   column's CD index is `−offset − 1` from its `sysrscols` row (every physical column of a compressed
-  rowset has a negative offset, E1 `_decode_cd`) **(2025)**.
+  rowset has a negative offset, E1 `_decode_cd`) **(2025)**. *As built (PR 1, 2026-11-16):* the walk
+  puts each value in the form the uncompressed record holds it (`CdRow`), so the stager's arms and
+  the family kernels -- the batch calls per column -- are the uncompressed path's, unchanged, and
+  `_mssql_rid`'s key bytes are the uncompressed form's (acceptance 2) by construction. A per-value
+  step remains in the walk (the integers' widening, vardecimal, SCSU), as the uncompressed path's
+  copy of a datetime's halves; CD-specific kernels would add a second form to every kernel for no
+  measured gain.
 
 - **D5 — compression is per rowset.** `sysrowsets.cmprlevel` (0 none, 1 ROW, 2 PAGE, 3 COLUMNSTORE,
   4 COLUMNSTORE_ARCHIVE; E5§3.1) decides the decoder of each rowset. Partitions of one table may
@@ -240,7 +247,7 @@ Timebox: 2 weeks. If it fails, the refusal stays and the spec records why.
 Oracle lane (085): each fixture is backed up (uncompressed and ZSTD), restored, and compared through
 `TYPE mssql` for the parity types and through the D3 server-side conversions for the others.
 
-Fixtures (`test/backup/gen/086_*.sql`):
+Fixtures (`test/backup/gen/cd.sql` for PR 1: the sets `cd_full` and `cd_xpress`):
 - ROW and PAGE versions of one wide table with every type 085 decodes, plus NULL / empty / maximum /
   minimum / negative values, trailing spaces and zeros, Unicode strings with and without non-BMP
   characters; 31, 60, 129 and 300 columns; LOB and row-overflow columns in compressed rows; a
@@ -275,6 +282,33 @@ Order is the PR order.
 2. CD value kernels per family, SCSU included — 5 d
 3. CD forms: forwarded, stub, uniquifier, ghosts, added and dropped columns — 1.5 d
 4. ROW fixtures, version matrix; `fuzz_backup_cd` — 2 d
+
+*PR 1 as built (2026-11-16).* E22 first: every type's compressed form and the record's layout
+measured on SQL Server 2022's pages (DBCC PAGE), D1's clean room (no decoder source opened), where
+the facts above said "to verify" -- among them several the design did not have: the header's record
+type in bits 2-4 (CD's own numbering) and bit 1 a 14-byte version tag (row versioning), a version
+ghost of a heap (header and tag only), every record padded to 9 bytes, a forwarded record's back
+pointer after its data and a forwarding stub of header `0x09`, the long region's per-cluster counts
+past 30 columns, rowversion big-endian without its leading zeros, a nullable char / binary under
+ANSI_PADDING OFF read as stored (and, found by the same fixture, read padded on the uncompressed path
+since 085: fixed here), a CLR column described as varbinary (also an uncompressed one SELECT INTO
+makes, which 085 refused: fixed); and in `sysrscols.ti` of a compressed rowset, a decimal's precision
+carrying `0x80` above 18. `backup_cd_record` (DuckDB-free):
+`ReadCdRecord` (every part bounded, the cluster array and the long counts checked against the CD
+array) and `CdRow` (D4 as built). The scan takes either record through a `RowRecord`; the model reads
+ROW rowsets, PAGE stays refused by name. Tests: `test_backup_cd` (E22's records and every family's
+value against its uncompressed form, the malformed records named), `fuzz_backup_cd` (E22 seeds; the
+replay and leak-check lanes, the weekly run), the fixture `cd.sql` (every type at its edges in a ROW
+table and an uncompressed twin, 31 / 60 / 129 / 300 columns, off-row and row-overflow values, a ROW
+heap with forwarded rows, the uniquifier, ghosts, added columns, keys of a bit, a datetime, a
+decimal and an nvarchar, a ROW partition beside plain ones, a PAGE partition refused, nullable char /
+binary under ANSI_PADDING OFF, rowversion, sql_variant / xml / hierarchyid / geometry, and row
+versioning -- tagged rows, ghosts, version ghosts, a forwarded heap) compared with RESTORE on 2022
+(`compare_rows`: 21 tables, 1,760 rows, 0 failures, plain and MS_XPRESS; the four twins equal,
+`_mssql_rid` included) and the catalog (`compare_catalog`: 9,560 fields, 0 differences).
+`partition.sql`'s ROW partition is read since (33 tables, 0 failures). Measured on 1M rows of six
+columns, one thread: a ROW table's scan 0.27 s against 0.10 s uncompressed, one bigint of it 0.11 s
+against 0.04 s (only the columns a scan reads are put in their uncompressed form).
 
 **PR 2 — PAGE**
 

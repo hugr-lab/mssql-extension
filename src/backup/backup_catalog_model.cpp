@@ -214,7 +214,7 @@ struct AddedDefaults {
 
 // Two layouts that read records alike (their rowset ids aside).
 bool SameLayout(const RowsetLayout &a, const RowsetLayout &b) {
-	if (a.columns.size() != b.columns.size()) {
+	if (a.columns.size() != b.columns.size() || a.compression != b.compression) {
 		return false;
 	}
 	for (size_t i = 0; i < a.columns.size(); i++) {
@@ -223,7 +223,7 @@ bool SameLayout(const RowsetLayout &a, const RowsetLayout &b) {
 			x.length != y.length || x.precision != y.precision || x.scale != y.scale || x.collation != y.collation ||
 			x.status != y.status || x.offset != y.offset || x.null_bit != y.null_bit ||
 			x.bit_position != y.bit_position || x.ordkey != y.ordkey || x.has_default != y.has_default ||
-			x.default_bytes != y.default_bytes) {
+			x.unpadded != y.unpadded || x.default_bytes != y.default_bytes) {
 			return false;
 		}
 	}
@@ -240,12 +240,28 @@ bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &default
 		why = std::string("its physical layout: ") + e.what();
 		return false;
 	}
+	layout.compression = rowset.compression;
+	// ROW compression (spec 086 PR 1, E22): every column a CD index, whatever its type; and a decimal's
+	// precision in sysrscols.ti carries 0x80 when it is above 18 (measured: 19 -> 147, 38 -> 166).
+	const bool cd = rowset.compression == 1;
+	if (cd) {
+		for (auto &physical : layout.columns) {
+			if (physical.xtype == XTYPE_DECIMAL || physical.xtype == XTYPE_NUMERIC) {
+				physical.precision &= 0x7F;
+			}
+		}
+	}
 	// What sysrscols.ti says of each live column, checked against syscolpars' row of it (E20 pinned
 	// ti's fields): a disagreement, or a fixed column whose width is unknown, refuses the table here,
 	// by name, rather than mid-scan.
-	for (const auto &physical : layout.columns) {
+	for (auto &physical : layout.columns) {
 		if (physical.Dropped() || physical.Uniquifier()) {
 			continue;
+		}
+		if (cd && physical.offset >= 0) {
+			why = "column " + physical.name + " is at fixed offset " + std::to_string(physical.offset) +
+				  " in a ROW-compressed rowset, whose columns are CD indexes";
+			return false;
 		}
 		auto column = by_id.find(physical.rscolid);
 		if (column == by_id.end()) {
@@ -260,8 +276,12 @@ bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &default
 		const bool decimal = physical.xtype == XTYPE_DECIMAL || physical.xtype == XTYPE_NUMERIC;
 		const bool scaled =
 			physical.xtype == XTYPE_TIME || physical.xtype == XTYPE_DATETIME2 || physical.xtype == XTYPE_DATETIMEOFFSET;
-		if (physical.xtype != c.system_type_id || (decimal && physical.precision != c.precision) ||
-			((decimal || scaled) && physical.scale != c.scale)) {
+		// A CLR type's column can be described as varbinary in sysrscols (E22: hierarchyid, geometry of a
+		// ROW-compressed rowset, and of an uncompressed one SELECT INTO made); its bytes are the type's as
+		// stored, read as such (ReadingOf).
+		const bool clr_as_varbinary = c.system_type_id == XTYPE_CLR && physical.xtype == XTYPE_VARBINARY;
+		if ((physical.xtype != c.system_type_id && !clr_as_varbinary) ||
+			(decimal && physical.precision != c.precision) || ((decimal || scaled) && physical.scale != c.scale)) {
 			why = "column " + c.name + " is stored as xtype " + std::to_string(physical.xtype) + " (precision " +
 				  std::to_string(physical.precision) + ", scale " + std::to_string(physical.scale) +
 				  "), which its declaration does not say";
@@ -269,9 +289,10 @@ bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &default
 		}
 		// A fixed type stored as a variable column is the vardecimal storage format (or a layout the
 		// reader does not know); a variable type at a fixed offset is not one either. Two are both: char /
-		// nchar / binary NULL under ANSI_PADDING OFF are stored variable (and read so: their bytes,
-		// unpadded), and a CLR type of fixed length is stored fixed (its bytes). A type the reader does
-		// not know is not checked: it is read as its bytes wherever it is stored (ReadingOf).
+		// nchar / binary may be stored variable (and read so: their bytes, unpadded) -- a nullable one
+		// declared under ANSI_PADDING OFF with the table is stored fixed and padded, and trimmed on read
+		// (`unpadded` below, E22) --, and a CLR type of fixed length is stored fixed (its bytes). A type
+		// the reader does not know is not checked: it is read as its bytes wherever it is stored (ReadingOf).
 		const bool padded =
 			physical.xtype == XTYPE_CHAR || physical.xtype == XTYPE_NCHAR || physical.xtype == XTYPE_BINARY;
 		const bool fixed_type = KnownFixedXtype(physical.xtype) && !padded;
@@ -279,7 +300,14 @@ bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &default
 								   physical.xtype == XTYPE_VARBINARY || physical.xtype == XTYPE_SQL_VARIANT ||
 								   physical.xtype == XTYPE_XML || physical.xtype == XTYPE_IMAGE ||
 								   physical.xtype == XTYPE_TEXT || physical.xtype == XTYPE_NTEXT;
-		if ((fixed_type && physical.offset < 0) || (variable_type && physical.offset > 0)) {
+		// A nullable char / binary under ANSI_PADDING OFF is read as the server returns it, its trailing
+		// spaces / zero bytes left out (E22, measured: DATALENGTH 1 for 0x0100 in a binary(8)). An
+		// uncompressed rowset stores it at a fixed offset, padded, and a CD one trimmed: only the column
+		// says which. nchar and NOT NULL columns are padded whatever the setting (is_ansi_padded).
+		if ((physical.xtype == XTYPE_CHAR || physical.xtype == XTYPE_BINARY) && c.is_nullable && !c.is_ansi_padded) {
+			physical.unpadded = true;
+		}
+		if (!cd && ((fixed_type && physical.offset < 0) || (variable_type && physical.offset > 0))) {
 			why = "column " + c.name + " (xtype " + std::to_string(physical.xtype) + ") is stored as a " +
 				  (physical.offset < 0 ? "variable" : "fixed") +
 				  " column, which its type is not (the vardecimal storage format is not read)";
@@ -353,12 +381,12 @@ void DecideDecodable(const BootstrapTables &tables, const AddedDefaults &default
 		return;
 	}
 	for (const auto &p : t.partitions) {
-		if (p.compression == 1 || p.compression == 2) {
-			t.reason = std::string(p.compression == 1 ? "ROW" : "PAGE") + " compression is not read (spec 086" +
+		if (p.compression == 2) {
+			t.reason = std::string("PAGE compression is not read (spec 086 PR 2") +
 					   (t.partitions.size() > 1 ? ", partition " + std::to_string(p.partition_number) : "") + ")";
 			return;
 		}
-		if (p.compression != 0) {
+		if (p.compression > 2) {
 			t.reason = "compression level " + std::to_string(p.compression) + " is not read";
 			return;
 		}
@@ -987,6 +1015,7 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 			col.scale = c->scale;
 			col.collation_id = c->collation_id;
 			col.is_nullable = !(c->status & COLUMN_NOT_NULL);
+			col.is_ansi_padded = (c->status & COLUMN_ANSI_PADDED) != 0;
 			col.is_identity = (c->status & COLUMN_IDENTITY) != 0;
 			col.is_rowguidcol = (c->status & COLUMN_ROWGUIDCOL) != 0;
 			col.is_computed = (c->status & COLUMN_COMPUTED) != 0;

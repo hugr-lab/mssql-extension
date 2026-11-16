@@ -94,6 +94,10 @@ struct PhysicalColumn {
 	uint16_t null_bit = 0;	 // 1-based, in the null bitmap
 	uint8_t bit_position = 0;
 	int16_t ordkey = 0;	 // its place in the clustered index key, 1-based; 0 when not a key column
+	//! A nullable char / binary declared under ANSI_PADDING OFF (syscolpars.status lacks 0x2): read as
+	//! the server returns it, its trailing spaces / zero bytes left out -- trimmed from a fixed column of
+	//! an uncompressed rowset (LocateValue), as stored in a CD one (E22). The model's to set.
+	bool unpadded = false;
 	//! The value of a column added after a record was written (sysseobjvalues; the model's to give).
 	bool has_default = false;
 	std::string default_bytes;
@@ -106,6 +110,17 @@ struct PhysicalColumn {
 	}
 	bool HasDefaultStatus() const {
 		return (status & 0x200) != 0;
+	}
+	//! `size` bytes of this column's value without the padding an `unpadded` column's server leaves out
+	//! (trailing spaces of a char, zero bytes of a binary); `size` as it is otherwise.
+	uint32_t Unpadded(const uint8_t *data, uint32_t size) const {
+		if (unpadded) {
+			const uint8_t pad = xtype == XTYPE_CHAR ? 0x20 : 0x00;
+			while (size > 0 && data[size - 1] == pad) {
+				size--;
+			}
+		}
+		return size;
 	}
 	//! Bytes the column takes in the fixed part: its type's width, or for a type the reader does not
 	//! know the length sysrscols gives it (read as its bytes); a FormatError when neither says.
@@ -126,6 +141,9 @@ void SetTypeInfo(PhysicalColumn &column, uint32_t ti);
 struct RowsetLayout {
 	std::string table;	// for errors
 	uint64_t rowset_id = 0;
+	//! sysrowsets.cmprlevel: 0 none (FixedVar records), 1 ROW (CD records: every column a CD index,
+	//! -offset - 1; spec 086 PR 1).
+	uint8_t compression = 0;
 	std::vector<PhysicalColumn> columns;
 
 	//! The column named `name`, or null.
@@ -178,7 +196,8 @@ RowLocation ForwardedFrom(const RecordView &record, const std::string &table);
 //! record's column count -> Default when the layout gives one (a FormatError when the column has
 //! the default status and none was given, which would read NULL where the server reads the
 //! default; else Null); NULL bit -> Null; a fixed offset -> Inline, bounded by the fixed part (a bit
-//! column's whole byte; its bit is `bit_position`); a variable column -> Inline / OffRow, empty past
+//! column's whole byte; its bit is `bit_position`; an `unpadded` char / binary without its trailing
+//! spaces / zero bytes); a variable column -> Inline / OffRow, empty past
 //! the record's count. The uniquifier is a variable column like the others (empty = 0).
 ValueRef LocateValue(const RecordView &record, size_t var_count, const RowsetLayout &layout, size_t k);
 

@@ -49,7 +49,11 @@ class Session:
         if run.returncode != 0:
             return False, self.mask((run.stderr + run.stdout).strip())
         out = run.stdout.strip()
-        return True, (json.loads(out) if out else [])
+        try:
+            return True, (json.loads(out) if out else [])
+        except json.JSONDecodeError as e:
+            # Named, not a traceback that ends every set's comparison (spec 086 PR 1).
+            return False, self.mask(f"not JSON ({e}): {out[:300]!r}")
 
 
 def main():
@@ -201,6 +205,26 @@ def main():
         print(f"  {status:4} {where}: {backup_rows} rows, {len(described)} columns")
         compared += 1
         rows_total += backup_rows
+
+    # Spec 086 acceptance 2: a compressed table <x>_row beside its uncompressed twin <x>_plain (the same rows,
+    # cd.sql) reads alike, _mssql_rid included -- the key bytes are the uncompressed form's.
+    names = {(t["schema_name"], t["table_name"]): t for t in tables}
+    for (schema, table), t in sorted(names.items()):
+        twin = names.get((schema, table[:-4] + "_plain")) if table.endswith("_row") else None
+        if not twin or t["decodable"] in (False, "false") or twin["decodable"] in (False, "false"):
+            continue
+        where = f"{schema}.{table} against {twin['table_name']}"
+        a = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)})"
+        b = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(twin['table_name'])})"
+        ok, result = session.query(
+            f"SELECT (SELECT count(*) FROM (SELECT *, _mssql_rid FROM {a} EXCEPT ALL SELECT *, _mssql_rid FROM {b})) "
+            f"AS only_row, (SELECT count(*) FROM (SELECT *, _mssql_rid FROM {b} EXCEPT ALL "
+            f"SELECT *, _mssql_rid FROM {a})) AS only_plain")
+        if not ok or (int(result[0]["only_row"]), int(result[0]["only_plain"])) != (0, 0):
+            failures.append(f"{where}: {result if not ok else result[0]}")
+            print(f"  DIFF {where}")
+        else:
+            print(f"  ok   {where}: equal, _mssql_rid included")
 
     print(f"compare_rows: {args.backup}: {compared} tables and indexed views, {rows_total} rows compared, "
           f"{len(failures)} failures")

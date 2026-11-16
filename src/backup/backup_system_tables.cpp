@@ -379,7 +379,7 @@ ValueRef LocateValue(const RecordView &record, size_t var_count, const RowsetLay
 		if (c.has_default) {
 			v.state = ValueState::Default;
 			v.data = reinterpret_cast<const uint8_t *>(c.default_bytes.data());
-			v.size = static_cast<uint32_t>(c.default_bytes.size());
+			v.size = c.Unpadded(v.data, static_cast<uint32_t>(c.default_bytes.size()));
 		} else if (c.HasDefaultStatus()) {
 			throw FormatError("backup: " + layout.table + "." + c.name +
 							  " was added after a record was written, with a default the reader was not given");
@@ -408,6 +408,7 @@ ValueRef LocateValue(const RecordView &record, size_t var_count, const RowsetLay
 		v.state = ValueState::Inline;
 		v.data = record.data + c.offset;
 		v.size = length;
+		v.size = c.Unpadded(v.data, v.size);  // ANSI_PADDING OFF: stored padded, returned without it (E22)
 		return v;
 	}
 	if (c.offset < 0) {
