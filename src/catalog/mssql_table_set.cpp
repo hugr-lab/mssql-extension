@@ -336,8 +336,14 @@ bool MSSQLTableSet::LoadSingleEntry(ClientContext &context, const string &name,
 	{
 		std::unique_lock<std::mutex> lock(entry_mutex_);
 		load_cv_.wait(lock, [this, &name]() { return loads_in_progress_.find(name) == loads_in_progress_.end(); });
-		// Owner-before-us may have already loaded or confirmed not-exists.
-		if (entries_.find(name) != entries_.end()) {
+		// Owner-before-us may have already loaded or confirmed not-exists. The entry is handed
+		// back here, under the lock: GetEntry looking it up again after we return found nothing
+		// when an Invalidate cleared entries_ in between, and answered "does not exist".
+		auto loaded_it = entries_.find(name);
+		if (loaded_it != entries_.end()) {
+			if (out_entry) {
+				*out_entry = loaded_it->second;
+			}
 			return true;
 		}
 		if (attempted_tables_.find(name) != attempted_tables_.end()) {
@@ -443,6 +449,15 @@ void MSSQLTableSet::Invalidate() {
 		std::lock_guard<std::mutex> nlock(names_mutex_);
 		known_table_names_.clear();
 	}
+	// Again once the containers are empty. A Scan that read the epoch between the increment
+	// above and the clears snapshotted entries still there (its pass A), and its publication,
+	// finding the epoch unchanged, set is_fully_loaded_ over the emptied entries_: GetEntry then
+	// answered "does not exist" for those tables until the next invalidation (the concurrency
+	// lane's sibling-cache scenario, all four readers at once; reproduced with a delay before the
+	// clears). The first increment stays for the publications made without load_mutex_ --
+	// LoadSingleEntry's and Scan's pass C --, which could otherwise land between the clears and
+	// this one with the epoch unchanged and persist what was read before the invalidation.
+	invalidation_epoch_.fetch_add(1);
 }
 
 void MSSQLTableSet::InvalidateEntry(const string &name) {
@@ -463,6 +478,7 @@ void MSSQLTableSet::InvalidateEntry(const string &name) {
 		std::lock_guard<std::mutex> nlock(names_mutex_);
 		known_table_names_.erase(name);
 	}
+	invalidation_epoch_.fetch_add(1);  // as in Invalidate(): a Scan that read the epoch before the erase
 }
 
 //===----------------------------------------------------------------------===//
