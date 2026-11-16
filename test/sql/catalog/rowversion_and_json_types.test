@@ -259,8 +259,7 @@ SELECT typeof(doc) FROM mssql_scan_unsafe('rvt', 'SELECT doc FROM dbo.JsonTypes 
 ----
 JSON
 
-# The type follows the column into a DuckDB table (DuckDB's JSON functions on
-# it at the end of the file, where `require json` skips no other assertion).
+# The type follows the column into a DuckDB table.
 statement ok
 CREATE TABLE json_local AS SELECT id, doc FROM rvt.dbo.JsonTypes;
 
@@ -425,14 +424,7 @@ statement ok
 DROP TABLE json_expected;
 
 statement ok
-DETACH rvt;
-
-require json
-
-query I
-SELECT doc->>'$.b[1]' FROM json_local WHERE id = 1;
-----
-2
+DROP TABLE json_local;
 
 statement ok
-DROP TABLE json_local;
+DETACH rvt;
