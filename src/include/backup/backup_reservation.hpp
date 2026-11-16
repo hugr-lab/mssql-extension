@@ -161,6 +161,8 @@ public:
 		if (bytes < grant && !grant_refused_) {
 			const uint64_t extra = grant - bytes;
 			const uint64_t extra_duckdb = bytes ? extra * duckdb_bytes / bytes : 0;	 // < 2^40: both below 1 MiB
+			// Cannot throw: a grant is at most a sixteenth of the budget (ReservationRefused is for a
+			// request past all of it).
 			if (gate_.TryAcquire(grant, duckdb_bytes + extra_duckdb)) {
 				held_.emplace_back(grant, duckdb_bytes + extra_duckdb);
 				credit_ += extra;
@@ -171,6 +173,7 @@ public:
 			// evict for) and one more wakeup of the waiters, before the row is asked for alone.
 			grant_refused_ = true;
 		}
+		// May throw ReservationRefused (`bytes` past the whole budget): left to the caller, as documented.
 		if (!gate_.TryAcquire(bytes, duckdb_bytes)) {
 			return false;
 		}
