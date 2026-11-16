@@ -113,6 +113,9 @@ struct CatalogColumn {
 	uint8_t system_type_id = 0;
 	int32_t user_type_id = 0;
 	std::string type_name;	// TYPE_NAME(user_type_id): an alias type's own name
+	//! SCHEMA_NAME of the type's schema (sys.types.schema_id): `sys` for a system type and sysname, the
+	//! schema an alias or CLR type was created in; "" when the type has no sysscalartypes row.
+	std::string type_schema;
 	//! The system type underneath: sysscalartypes' row of id system_type_id (a CLR type's by its
 	//! user type: hierarchyid, geometry, geography; "" for a user-defined CLR type).
 	std::string system_type_name;
