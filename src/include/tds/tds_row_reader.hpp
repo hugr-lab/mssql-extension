@@ -106,6 +106,10 @@ private:
 	// PLP type skipper for MAX types
 	size_t SkipPLPType(const uint8_t *data, size_t length);
 
+	// sql_variant (0x62): a u32 length, 0 for NULL, then the value (spec 093 G2).
+	size_t ReadVariant(const uint8_t *data, size_t length, std::vector<uint8_t> &value, bool &is_null);
+	size_t SkipVariant(const uint8_t *data, size_t length);
+
 	const std::vector<ColumnMetadata> &columns_;
 };
 

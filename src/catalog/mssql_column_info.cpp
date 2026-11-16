@@ -43,8 +43,8 @@ MSSQLColumnInfo::MSSQLColumnInfo()
 	  is_utf8(false),
 	  code_page(0),
 	  database_code_page(0),
-	  is_cast_required(false),
-	  is_geometry(false),
+	  read_form(MSSQLReadForm::Bare),
+	  comparison_differs(false),
 	  is_identity(false) {}
 
 MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const string &sql_type_name, int16_t max_length,
@@ -73,19 +73,50 @@ MSSQLColumnInfo::MSSQLColumnInfo(const string &name, int32_t column_id, const st
 	// Map to DuckDB type
 	duckdb_type = MapSQLServerTypeToDuckDB(sql_type_name, max_length, precision, scale, datetime2_read);
 
-	// Detect geometry/geography UDTs — table scan rewrites these to .STAsBinary()
-	// so the wire delivers OGC WKB bytes (varbinary(max)) instead of MS's
-	// proprietary Spatial Type Binary Format. Catalog reports LogicalType::GEOMETRY().
-	{
-		string lower_type = sql_type_name;
-		std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
-					   [](unsigned char c) { return std::tolower(c); });
-		is_geometry = IsSpatialType(lower_type);
-	}
+	// Spec 093 D2: how the scan reads it, and whether the server compares it unlike DuckDB -- two
+	// answers that were one flag (is_cast_required) while the two always coincided.
+	read_form = ReadFormFor(sql_type_name);
+	comparison_differs = ComparisonDiffersFor(sql_type_name);
+}
 
-	// Mark columns with unsupported SQL Server types for auto-CAST in pushdown.
-	// Geometry/geography are "known" (we handle them via STAsBinary rewrite), not auto-CAST.
-	is_cast_required = !IsKnownSQLServerType(sql_type_name);
+MSSQLReadForm MSSQLColumnInfo::ReadFormFor(const string &sql_type_name) {
+	// Geometry / geography: the table scan rewrites them to .STAsBinary(), so the wire delivers OGC WKB
+	// (varbinary(max)) instead of MS-SSCLRT; the catalog reports LogicalType::GEOMETRY().
+	if (IsSpatialType(sql_type_name)) {
+		return MSSQLReadForm::SpatialBinary;
+	}
+	return IsKnownSQLServerType(sql_type_name) ? MSSQLReadForm::Bare : MSSQLReadForm::ServerCast;
+}
+
+bool MSSQLColumnInfo::ComparisonDiffersFor(const string &sql_type_name) {
+	// Its own list, not IsKnownSQLServerType's (review of #557): a type that becomes decodable must
+	// not join it by accident (#514). An allow-list, so a type not named -- a user CLR type, one SQL
+	// Server adds later -- differs. Not on it: sql_variant, hierarchyid, vector (#514), and json,
+	// which the server compares by nothing but IS NULL (J1: 402 / 13636 / 421 on SQL Server 2025).
+	// Spatial types are on it and named by IsSpatial() where they matter, as before the split.
+	const string t = StringUtil::Lower(sql_type_name);
+	return !(t == "bit" || t == "tinyint" || t == "smallint" || t == "int" || t == "bigint" || t == "real" ||
+			 t == "float" || t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" || t == "char" ||
+			 t == "varchar" || t == "text" || t == "nchar" || t == "nvarchar" || t == "ntext" || t == "date" ||
+			 t == "time" || t == "datetime" || t == "datetime2" || t == "smalldatetime" || t == "datetimeoffset" ||
+			 t == "binary" || t == "varbinary" || t == "image" || t == "uniqueidentifier" || t == "timestamp" ||
+			 t == "rowversion" || t == "xml" || IsSpatialType(t));
+}
+
+bool MSSQLColumnInfo::BulkWireTakesType(const string &sql_type_name) {
+	// Its own list, not IsKnownSQLServerType's (review of #557): a type joins it in its own write PR,
+	// measured first (spec 093 T2, T6), never because it became decodable (#296). A geometry /
+	// geography column arrives as WKB, which the statement path renders as a 0x literal the server
+	// converts; on the bulk wire FromServerColumn would declare it nvarchar and send the bytes as
+	// text. The same for the types read through a cast (hierarchyid, sql_variant): the statement
+	// path sends a string literal the server converts, the bulk wire would not.
+	const string t = StringUtil::Lower(sql_type_name);
+	return t == "bit" || t == "tinyint" || t == "smallint" || t == "int" || t == "bigint" || t == "real" ||
+		   t == "float" || t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" || t == "char" ||
+		   t == "varchar" || t == "text" || t == "nchar" || t == "nvarchar" || t == "ntext" || t == "date" ||
+		   t == "time" || t == "datetime" || t == "datetime2" || t == "smalldatetime" || t == "datetimeoffset" ||
+		   t == "binary" || t == "varbinary" || t == "image" || t == "uniqueidentifier" || t == "timestamp" ||
+		   t == "rowversion" || t == "json" || t == "xml";
 }
 
 //===----------------------------------------------------------------------===//
@@ -107,7 +138,7 @@ LogicalType MSSQLColumnInfo::NativeDuckDBType() const {
 	// outcome, different
 	// route — worth stating because the guard's clause list reads like a
 	// complete enumeration and is not one.
-	if (duckdb_type.id() != LogicalTypeId::VARCHAR || max_length <= 0 || is_cast_required || is_geometry) {
+	if (duckdb_type.id() != LogicalTypeId::VARCHAR || max_length <= 0 || read_form != MSSQLReadForm::Bare) {
 		return duckdb_type;
 	}
 
@@ -347,7 +378,7 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 	}
 
 	// Spatial types — geometry and geography both arrive via STAsBinary() rewrite
-	// (see is_geometry handling in the constructor + table_scan::BuildColumnExpression).
+	// (see ReadFormFor's SpatialBinary + table_scan::BuildColumnExpression).
 	// DuckDB's first-class GEOMETRY type stores WKB bytes — same physical storage as BLOB.
 	if (IsSpatialType(lower_type)) {
 		return LogicalType::GEOMETRY();
@@ -369,7 +400,7 @@ bool MSSQLColumnInfo::IsBinary2Collation(const string &collation_name) {
 }
 
 bool MSSQLColumnInfo::OrdersLikeDuckDB() const {
-	if (is_cast_required || is_geometry) {
+	if (comparison_differs || IsSpatial()) {
 		return false;
 	}
 	string lower_type = sql_type_name;
@@ -393,7 +424,7 @@ bool MSSQLColumnInfo::OrdersLikeDuckDB() const {
 }
 
 bool MSSQLColumnInfo::OrdersLikeDuckDBAsBytes() const {
-	if (is_cast_required || !is_utf8 || max_length <= 0) {
+	if (comparison_differs || !is_utf8 || max_length <= 0) {
 		return false;
 	}
 	string lower_type = sql_type_name;
@@ -626,7 +657,7 @@ string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string
 	// Unsupported SQL Server types (hierarchyid, CLR UDTs) must be CAST to
 	// NVARCHAR(MAX) so the server sends text instead of a native wire form
 	// nothing decodes.
-	if (!IsKnownSQLServerType(sql_type_name)) {
+	if (ReadFormFor(sql_type_name) == MSSQLReadForm::ServerCast) {
 		return "CAST(" + reference + " AS NVARCHAR(MAX)) AS " + escaped_name;
 	}
 

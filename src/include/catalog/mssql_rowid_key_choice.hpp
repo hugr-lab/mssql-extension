@@ -19,9 +19,10 @@
 //     is decided here, where it can be named.
 //
 // The two client-side criteria the SQL cannot see are carried on the key
-// column by the caller: `cast_required` (the read is lossy — sql_variant,
-// hierarchyid, a CLR UDT — the column's own MSSQLColumnInfo flag) and the
-// type name, from which the datetime exclusion is decided below.
+// column by the caller: `comparison_differs` (the server compares the type
+// unlike DuckDB's read of it — sql_variant, hierarchyid, a CLR UDT — the
+// column's own MSSQLColumnInfo answer, spec 093 D2) and the type name, from
+// which the datetime exclusion is decided below.
 //===----------------------------------------------------------------------===//
 
 #include <cstdint>
@@ -42,7 +43,7 @@ struct RowIdKeyColumn {
 	std::string collation_name;
 	bool is_nullable = false;
 	bool is_identity = false;
-	bool cast_required = false;	 // MSSQLColumnInfo::is_cast_required for this column
+	bool comparison_differs = false;  // MSSQLColumnInfo::comparison_differs for this column
 	//! A datetime2(7) the catalog reads in microseconds (spec 093 D8, MSSQLColumnInfo::ReadsDatetime2Truncated):
 	//! set by RowIdKeyInfo::FinalizeChoice from the catalog's answer before the choice runs.
 	bool datetime2_truncated = false;
@@ -123,20 +124,21 @@ inline bool IsLiteralMismatch(const std::string &type_name, uint8_t scale, bool 
 //! silently mis-key into a 0-row UPDATE.
 enum class KeyFidelity : uint8_t {
 	Exact,		  //!< read losslessly, compares exactly
-	NotRead,	  //!< the catalog does not read its value (CAST, LOB, spatial)
+	NotRead,	  //!< no match by the value read (CAST, LOB, spatial, a type the server cannot compare)
 	NotRoundTrip  //!< read, but rounded: no literal matches it (#358)
 };
 
-//! cast_required: MSSQLColumnInfo::is_cast_required (sql_variant, hierarchyid,
-//! CLR UDTs -- read as NVARCHAR(MAX)). xml, image, text, ntext and the spatial
-//! types are named, because the catalog knows those types (no CAST flag) and
-//! still cannot match by them: xml / image / text / ntext do not compare, and
-//! a spatial value is read as WKB, not as the stored serialisation.
+//! comparison_differs: MSSQLColumnInfo::comparison_differs (sql_variant,
+//! hierarchyid, CLR UDTs, json -- which the server compares by IS NULL alone,
+//! J1; spec 093 D2). xml, image, text, ntext and the spatial
+//! types are named, because the catalog knows those types and still cannot
+//! match by them: xml / image / text / ntext do not compare, and a spatial
+//! value is read as WKB, not as the stored serialisation.
 //! datetime2_truncated: the column's read drops a datetime2(7)'s 100 ns digit (no default: it is the
 //! catalog's answer, spec 093 D8).
-inline KeyFidelity IsRoundTripExactForKey(const std::string &type_name, uint8_t scale, bool cast_required,
+inline KeyFidelity IsRoundTripExactForKey(const std::string &type_name, uint8_t scale, bool comparison_differs,
 										  bool datetime2_truncated) {
-	if (cast_required) {
+	if (comparison_differs) {
 		return KeyFidelity::NotRead;
 	}
 	const std::string t = Lower(type_name);
@@ -187,7 +189,7 @@ inline RowIdKeyRejection Unusable(const RowIdKeyCandidate &c) {
 		}
 	}
 	for (const auto &col : c.columns) {
-		switch (IsRoundTripExactForKey(col.type_name, col.scale, col.cast_required, col.datetime2_truncated)) {
+		switch (IsRoundTripExactForKey(col.type_name, col.scale, col.comparison_differs, col.datetime2_truncated)) {
 		case KeyFidelity::Exact:
 			break;
 		case KeyFidelity::NotRead:

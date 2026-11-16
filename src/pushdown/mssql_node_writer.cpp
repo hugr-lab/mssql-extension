@@ -39,7 +39,7 @@ namespace mssql {
 namespace node_writer {
 
 ComparableKind KindOf(const MSSQLColumnInfo &column) {
-	if (column.is_cast_required || column.is_geometry) {
+	if (column.comparison_differs || column.IsSpatial()) {
 		return ComparableKind::None;
 	}
 	const auto type = StringUtil::Lower(column.sql_type_name);
@@ -147,7 +147,7 @@ bool HasSubqueryExpression(const SelectNode &node) {
 }
 
 bool IsGroupable(const MSSQLColumnInfo &column) {
-	if (IsRoundTripExactForKey(column.sql_type_name, column.scale, column.is_cast_required,
+	if (IsRoundTripExactForKey(column.sql_type_name, column.scale, column.comparison_differs,
 							   column.ReadsDatetime2Truncated()) == KeyFidelity::NotRoundTrip) {
 		// time(7) / datetimeoffset(7), read as microseconds: two values 100 ns
 		// apart are two groups there and one value here -- harmless for an
@@ -186,7 +186,7 @@ int IntegerRank(LogicalTypeId id) {
 }
 
 MSSQLColumnInfo DerivedColumn(const std::string &name, const LogicalType &type) {
-	string sql_type = "derived";  // unknown to IsKnownSQLServerType: not comparable
+	string sql_type = "derived";  // on no type list: ComparisonDiffersFor answers true, not comparable
 	int16_t length = 0;
 	uint8_t precision = 0;
 	uint8_t scale = 0;

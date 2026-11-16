@@ -184,6 +184,9 @@ constexpr uint8_t TDS_TYPE_DATETIMEOFFSET = 0x2B;
 constexpr uint8_t TDS_TYPE_XML = 0xF1;
 constexpr uint8_t TDS_TYPE_UDT = 0xF0;	// Also GEOGRAPHY, GEOMETRY, HIERARCHYID
 constexpr uint8_t TDS_TYPE_SQL_VARIANT = 0x62;
+//! The longest sql_variant value: 8,000 bytes of value plus its header (MS-TDS 2.2.5.5.4; the
+//! TYPE_INFO maximum measured on 2022, spec 093 G2).
+constexpr uint16_t SQL_VARIANT_MAX_BYTES = 8009;
 constexpr uint8_t TDS_TYPE_IMAGE = 0x22;  // Deprecated
 constexpr uint8_t TDS_TYPE_TEXT = 0x23;	  // Deprecated
 constexpr uint8_t TDS_TYPE_NTEXT = 0x63;  // Deprecated

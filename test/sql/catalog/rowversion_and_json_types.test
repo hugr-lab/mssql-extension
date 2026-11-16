@@ -268,6 +268,77 @@ SELECT count(*), count(doc) FROM rvt.dbo.JsonTypes;
 ----
 23	22
 
+# --- spec 093 J1: the server compares a JSON value by nothing but IS NULL (402
+# on json = nvarchar, 13636 on json = json), so a comparison of it runs in
+# DuckDB over the text it read, and IS NULL is still pushed. On 2025 the first
+# two queries would fail if their filters were pushed.
+query I
+SELECT id FROM rvt.dbo.JsonTypes WHERE doc = '{"a":1,"b":[1,2]}';
+----
+1
+
+query I
+SELECT id FROM rvt.dbo.JsonTypes WHERE doc IN ('{"copied":true}', '{"i":10}') ORDER BY id;
+----
+3
+10
+
+query I
+SELECT id FROM rvt.dbo.JsonTypes WHERE doc IS NULL;
+----
+2
+
+# --- J1 again: a JSON column cannot key a row, so on the row path a table with
+# no usable key that has one refuses UPDATE / DELETE by name, and so does a
+# staged MERGE whose ON compares it -- both sent the server a comparison of it
+# before, which it refuses (13636).
+# (A statement the server is sent whole, mssql_dml_pushdown, needs no key and
+# runs: hence the setting.) Where there is no JSON type (CI's 2022) the column
+# is xml, which is refused the same way, so the assertions hold on both.
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+SELECT mssql_exec('rvt', 'IF OBJECT_ID(''dbo.JsonNoKey'') IS NOT NULL DROP TABLE dbo.JsonNoKey;
+IF EXISTS (SELECT 1 FROM sys.types WHERE name = ''json'')
+  EXEC(''CREATE TABLE dbo.JsonNoKey (id INT NOT NULL, doc JSON NULL)'')
+ELSE
+  EXEC(''CREATE TABLE dbo.JsonNoKey (id INT NOT NULL, doc XML NULL)'');
+INSERT INTO dbo.JsonNoKey (id, doc) VALUES (1, ''{"a":1}'')');
+
+statement ok
+SELECT mssql_invalidate_cache('rvt');
+
+statement error
+UPDATE rvt.dbo.JsonNoKey SET id = 2 WHERE id = 1;
+----
+column 'doc' has type
+
+statement error
+DELETE FROM rvt.dbo.JsonNoKey WHERE id = 1;
+----
+which the catalog does not read in a form that identifies a row
+
+statement error
+MERGE INTO rvt.dbo.JsonNoKey AS t USING (SELECT '{"a":1}' AS doc) AS s ON t.doc = s.doc WHEN MATCHED THEN DELETE;
+----
+which the catalog does not read as the server stores it
+
+statement ok
+RESET mssql_dml_pushdown;
+
+# Sent whole, the same UPDATE needs no key and runs.
+statement ok
+UPDATE rvt.dbo.JsonNoKey SET id = 2 WHERE id = 1;
+
+query I
+SELECT id FROM rvt.dbo.JsonNoKey;
+----
+2
+
+statement ok
+SELECT mssql_exec('rvt', 'DROP TABLE dbo.JsonNoKey');
+
 statement ok
 SELECT mssql_exec('rvt', 'DROP TABLE dbo.JsonTypes');
 
