@@ -861,6 +861,8 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 	const auto &data = input.bind_data->Cast<ScanBindData>();
 	auto &global = input.global_state->Cast<ScanGlobalState>();
 	auto &local = input.local_state->Cast<ScanLocalState>();
+	// Every page this call reads, through the statement's files (the backup's state may be cached, D9).
+	BindFiles bound(data.catalog->Binding());
 	// What the call is reserving, for a refusal's words: a chunk's decoding, or a row's values stored off row.
 	std::string reserving_row;	// empty: a chunk's decoding; else the row being reserved, as a refusal names it
 	uint64_t reserving_bytes = global.chunk_bytes;

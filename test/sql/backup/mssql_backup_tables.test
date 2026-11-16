@@ -193,3 +193,37 @@ statement error
 SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'nothing');
 ----
 the backup has no table or indexed view dbo.nothing
+
+# Spec 085 D9 (PR 4a): the opened-file cache changes no answer. The same listing and scan with every
+# call opening the backup anew, then from the cache again (test_backup_cache.cpp checks the hits).
+statement ok
+CREATE TABLE cached AS SELECT schema_name, table_name, row_count FROM mssql_backup_tables('test/data/backup/full.bak');
+
+statement ok
+SET mssql_backup_cache = false;
+
+query I
+SELECT count(*) FROM (SELECT schema_name, table_name, row_count FROM mssql_backup_tables('test/data/backup/full.bak') EXCEPT SELECT * FROM cached);
+----
+0
+
+query I
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full_xpress.bak', 'dbo', 'items');
+----
+2000
+
+statement ok
+RESET mssql_backup_cache;
+
+query I
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full_xpress.bak', 'dbo', 'items');
+----
+2000
+
+query I
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full_xpress.bak', 'dbo', 'items');
+----
+2000
+
+statement ok
+DROP TABLE cached;

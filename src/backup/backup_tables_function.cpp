@@ -2,8 +2,9 @@
 // catalog model of a full backup (backup_catalog_model), one row per user table / view (spec 085
 // § Functions). [DuckDB]
 //
-// The catalog is opened at init (stages 1-4, OpenBackupCatalog), so DESCRIBE reads no file and every
-// execution reads the file anew; the opened-file cache shared across statements is task 22. Columns
+// The catalog is opened at init (stages 1-4, OpenBackupCatalog), so DESCRIBE reads no file. Every
+// execution opens the files anew, and takes the headers, pages and base tables from the opened-file
+// cache when an earlier call on the same unchanged files put them there (D9, task 22). Columns
 // whose source is a later PR are NULL until it lands: fuzzy_status / open_transactions /
 // stale_transactions (D11, PR 5), allocation_units.live_pages (a unit's IAM chain is walked at its
 // table's first scan, DQ-40, not to list it). A column's DuckDB type is D6's:
@@ -688,6 +689,7 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	const auto &data = input.bind_data->Cast<CatalogListBindData>();
 	auto &state = input.global_state->Cast<CatalogListState>();
+	BindFiles bound(state.catalog->Binding());	// a view's off-row definition is read here
 	const CatalogModel &model = state.catalog->model;
 	if (data.listing == Listing::Columns) {
 		idx_t count = 0;
