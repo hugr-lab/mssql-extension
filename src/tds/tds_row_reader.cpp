@@ -191,8 +191,11 @@ bool RowReader::ReadNBCRow(const uint8_t *data, size_t length, size_t &bytes_con
 			return false;  // Need more data
 		}
 
-		// The bitmap says present; a value can still say NULL by itself (a sql_variant of length 0,
-		// spec 093 T0). No other type sets it here.
+		// The bitmap says present; a value can still say NULL by itself, and that NULL is honoured
+		// whatever the bitmap said (spec 093 T0; review of #557): a sql_variant of length 0, a PLP
+		// value (xml, a UDT, a MAX string or binary) carrying PLP_NULL, a non-MAX string or binary of
+		// length 0xFFFF. Before T0 it was dropped, and such a value read as an empty one. The other
+		// types' NBC arms take no NULL form of their own.
 		if (is_null) {
 			row.null_mask[col_idx] = true;
 		}

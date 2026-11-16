@@ -263,6 +263,32 @@ int main() {
 		Check(ok && used == nbc.size() && row.null_mask[0], "read, as NULL, all five bytes consumed");
 	}
 
+	// Review of #557: the same honouring reaches the types that had it dropped before T0 -- a PLP
+	// value carrying PLP_NULL and a non-MAX string of length 0xFFFF, each under a present bit.
+	std::cout << "An NBCROW value present by its bitmap but NULL by itself, older types" << std::endl;
+	{
+		std::vector<ColumnMetadata> columns(3);
+		columns[0].type_id = TDS_TYPE_NVARCHAR;	 // nvarchar(max): PLP
+		columns[0].max_length = 0xFFFF;
+		columns[1].type_id = TDS_TYPE_XML;		 // always PLP
+		columns[2].type_id = TDS_TYPE_NVARCHAR;	 // nvarchar(10): a u16 length
+		columns[2].max_length = 20;
+		for (auto &c : columns) {
+			c.flags = 0;
+		}
+		RowReader reader(columns);
+		std::vector<uint8_t> nbc = {0x00};	// bitmap: all three present
+		for (int i = 0; i < 2; i++) {
+			nbc.insert(nbc.end(), 8, 0xFF);	 // PLP_NULL
+		}
+		nbc.insert(nbc.end(), {0xFF, 0xFF});  // CHARBIN_NULL
+		RowData row;
+		size_t used = 0;
+		const bool ok = reader.ReadNBCRow(nbc.data(), nbc.size(), used, row);
+		Check(ok && used == nbc.size() && row.null_mask[0] && row.null_mask[1] && row.null_mask[2],
+			  "nvarchar(max) PLP_NULL, xml PLP_NULL, nvarchar(10) 0xFFFF: each read as NULL, every byte consumed");
+	}
+
 	std::cout << "A malformed variant length" << std::endl;
 	{
 		std::vector<ColumnMetadata> columns(1);
