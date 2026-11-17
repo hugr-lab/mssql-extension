@@ -61,19 +61,12 @@ const column_t LOB_COLUMN = VIRTUAL_COLUMN_START + 3;
 //! its reason (owner, review of #552).
 const column_t UNREAD_COLUMN_START = VIRTUAL_COLUMN_START + 16;
 
-//! A column the scan does not read: its name, the type it would have, why.
-struct UnreadColumn {
-	std::string name;
-	LogicalType type;
-	std::string reason;
-};
-
 struct ScanBindData : public TableFunctionData {
 	vector<std::string> paths;
 	std::string schema;
 	std::string table;
 	std::shared_ptr<OpenedCatalog> catalog;
-	const CatalogTable *entry = nullptr;  // in catalog->model
+	const CatalogTable *entry = nullptr;  // in catalog->Model()
 	std::vector<int32_t> column_ids;	  // the scan's columns: catalog column ids, in output order
 	vector<LogicalType> types;
 	vector<std::string> names;		   // of column_ids
@@ -83,6 +76,11 @@ struct ScanBindData : public TableFunctionData {
 	//! `max_memory` in bytes as the call gave it; 0 = not given (DuckDB's `memory_limit`). Clamped at
 	//! init; half of it is the budget of the scan's reservations (D17).
 	idx_t max_memory = 0;
+	//! An attached backup's table entry the scan reads (task 23), for the binder, and that backup, read
+	//! through its catalog, never found again by name; none for a file's (and for a plan deserialized,
+	//! which resolves `paths` and checks the columns).
+	optional_ptr<TableCatalogEntry> table_entry;
+	std::shared_ptr<const AttachedBackup> attached;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<ScanBindData>();
@@ -97,6 +95,8 @@ struct ScanBindData : public TableFunctionData {
 		copy->types = types;
 		copy->names = names;
 		copy->unread = unread;
+		copy->table_entry = table_entry;
+		copy->attached = attached;
 		return std::move(copy);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -127,25 +127,33 @@ CatalogScope TableScope(const std::string &schema, const std::string &table) {
 void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *names) {
 	try {
 		data.catalog = std::shared_ptr<OpenedCatalog>(
-			OpenBackupCatalog(context, std::vector<std::string>(data.paths.begin(), data.paths.end()), true,
-							  TableScope(data.schema, data.table))
-				.release());
+			data.attached ? OpenAttachedCatalog(context, *data.attached).release()
+						  : OpenBackupCatalog(context, std::vector<std::string>(data.paths.begin(), data.paths.end()),
+											  true, TableScope(data.schema, data.table))
+								.release());
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", FUNCTION, e.what());
 	}
-	data.entry = data.catalog->model.FindTable(data.schema, data.table);
+	data.entry = data.catalog->Model().FindTable(data.schema, data.table);
 	if (!data.entry) {
 		// An indexed view's clustered index, read as a clustered table's (task 16f); a view without one
 		// stores no rows.
-		data.entry = data.catalog->model.FindIndexedView(data.schema, data.table);
+		data.entry = data.catalog->Model().FindIndexedView(data.schema, data.table);
 	}
-	if (!data.entry && data.catalog->model.FindView(data.schema, data.table)) {
+	if (!data.entry && data.catalog->Model().FindView(data.schema, data.table)) {
 		throw InvalidInputException(
 			"%s: %s.%s is a view that stores no rows: only an indexed view's (a unique "
 			"clustered index on it) are read (mssql_backup_views says which)",
 			FUNCTION, data.schema, data.table);
 	}
 	if (!data.entry) {
+		auto attached = data.attached ? data.attached : FindAttachedBackup(context, data.paths.front());
+		if (attached && data.paths.size() == 1) {
+			throw InvalidInputException(
+				"%s: the backup attached as %s has no table or indexed view %s.%s that its schema_filter / "
+				"table_filter keep (mssql_backup_tables('%s') lists them)",
+				FUNCTION, attached->name, data.schema, data.table, attached->name);
+		}
 		throw InvalidInputException(
 			"%s: the backup has no table or indexed view %s.%s (mssql_backup_tables and "
 			"mssql_backup_views list them)",
@@ -154,38 +162,14 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 	if (!data.entry->decodable) {
 		throw InvalidInputException("%s: %s.%s is not read: %s", FUNCTION, data.schema, data.table, data.entry->reason);
 	}
-	std::vector<UnreadColumn> unread;
-	for (const auto &c : data.entry->columns) {
-		const ColumnReading reading = ReadingOf(c);
-		if (!reading.readable) {
-			unread.push_back(UnreadColumn{c.name, reading.type, reading.note});
-			continue;
-		}
-		data.column_ids.push_back(c.column_id);
-		data.types.push_back(reading.type);
-		data.names.push_back(c.name);
-		if (names) {
-			names->emplace_back(c.name);
-		}
-	}
-	// An unread column is a virtual one only when its name is no other column's: a readable column and
-	// the service columns win, and the binder must not pick among equal names (review of #552).
-	auto taken = [&](const std::string &name) {
-		for (const char *service : {"_mssql_page", "_mssql_rid", "_mssql_page_lsn", "_mssql_lob"}) {
-			if (StringUtil::CIEquals(name, service)) {
-				return true;
-			}
-		}
+	ScanColumns columns = ScanColumnsOf(*data.entry);
+	data.column_ids = std::move(columns.column_ids);
+	data.types = std::move(columns.types);
+	data.names = std::move(columns.names);
+	data.unread = std::move(columns.unread);
+	if (names) {
 		for (const auto &n : data.names) {
-			if (StringUtil::CIEquals(name, n)) {
-				return true;
-			}
-		}
-		return false;
-	};
-	for (auto &u : unread) {
-		if (!taken(u.name)) {
-			data.unread.push_back(std::move(u));
+			names->emplace_back(n);
 		}
 	}
 }
@@ -309,20 +293,8 @@ unique_ptr<NodeStatistics> Cardinality(ClientContext &, const FunctionData *bind
 }
 
 virtual_column_map_t VirtualColumns(ClientContext &, optional_ptr<FunctionData> bind_data) {
-	virtual_column_map_t result;
-	if (bind_data) {
-		const auto &unread = bind_data->Cast<ScanBindData>().unread;
-		for (size_t i = 0; i < unread.size(); i++) {
-			result.insert(make_pair(UNREAD_COLUMN_START + i, TableColumn(Identifier(unread[i].name), unread[i].type)));
-		}
-	}
-	// count(*) projects this one rather than the table's first column, which may not be readable.
-	result.insert(make_pair(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN)));
-	result.insert(make_pair(PAGE_COLUMN, TableColumn("_mssql_page", LogicalType::VARCHAR)));
-	result.insert(make_pair(RID_COLUMN, TableColumn("_mssql_rid", LogicalType::BLOB)));
-	result.insert(make_pair(PAGE_LSN_COLUMN, TableColumn("_mssql_page_lsn", LogicalType::DECIMAL(25, 0))));
-	result.insert(make_pair(LOB_COLUMN, TableColumn("_mssql_lob", LogicalType::BLOB)));
-	return result;
+	static const std::vector<UnreadColumn> none;
+	return ScanVirtualColumns(bind_data ? bind_data->Cast<ScanBindData>().unread : none);
 }
 
 //! The pages of a unit (§ Scan): what a task claims at once, and what one batch index covers. Cut from
@@ -338,7 +310,8 @@ struct PartitionCursor {
 	const CatalogPartition *partition = nullptr;
 	const SysAllocUnit *unit = nullptr;
 	LobUnits off_row;  // its LOB_DATA and ROW_OVERFLOW_DATA units, 0 where it has none
-	std::vector<PagePointer> pages;
+	//! In page order, each once; an attached backup's kept list (task 23), else this scan's.
+	std::shared_ptr<const std::vector<PagePointer>> pages;
 	std::vector<size_t> key;  // layout indexes of the clustered key, in ordkey order
 	bool has_uniquifier = false;
 	size_t uniquifier = 0;
@@ -461,18 +434,25 @@ PartitionCursor BuildPartition(const ScanBindData &data, const CatalogPartition 
 	for (const auto &k : key) {
 		cursor.key.push_back(k.second);
 	}
-	// Page order (§ Scan): the IAM chain lists its single pages before its extents, so its order is
-	// not the pages'; a page's rows stay together either way.
-	cursor.pages = UnitPages(store, *cursor.unit);
-	std::sort(cursor.pages.begin(), cursor.pages.end(), [](const PagePointer &x, const PagePointer &y) {
-		return x.file != y.file ? x.file < y.file : x.page < y.page;
-	});
-	// A page an IAM chain lists twice (a single page that is also in an extent run) is read once:
-	// its rows would otherwise be handed out twice (review of #552).
-	cursor.pages.erase(
-		std::unique(cursor.pages.begin(), cursor.pages.end(),
-					[](const PagePointer &x, const PagePointer &y) { return x.file == y.file && x.page == y.page; }),
-		cursor.pages.end());
+	const SysAllocUnit &unit = *cursor.unit;
+	auto list = [&store, &unit]() {
+		// Page order (§ Scan): the IAM chain lists its single pages before its extents, so its order is
+		// not the pages'; a page's rows stay together either way.
+		std::vector<PagePointer> pages = UnitPages(store, unit);
+		std::sort(pages.begin(), pages.end(), [](const PagePointer &x, const PagePointer &y) {
+			return x.file != y.file ? x.file < y.file : x.page < y.page;
+		});
+		// A page an IAM chain lists twice (a single page that is also in an extent run) is read once:
+		// its rows would otherwise be handed out twice (review of #552).
+		pages.erase(std::unique(pages.begin(), pages.end(),
+								[](const PagePointer &x, const PagePointer &y) {
+									return x.file == y.file && x.page == y.page;
+								}),
+					pages.end());
+		return pages;
+	};
+	cursor.pages = data.catalog->unit_pages ? data.catalog->unit_pages->Get(unit.auid, list)
+											: std::make_shared<const std::vector<PagePointer>>(list());
 	return cursor;
 }
 
@@ -609,7 +589,7 @@ unique_ptr<LocalTableFunctionState> InitLocal(ExecutionContext &execution, Table
 // (the catalog's rows over the pages its IAM chain lists) would leave 64 pages short of a vector.
 size_t UnitPagesOf(const PartitionCursor &cursor) {
 	const int64_t rows = cursor.partition->rows;
-	const size_t pages = cursor.pages.size();
+	const size_t pages = cursor.pages->size();
 	if (rows <= 0 || pages == 0) {
 		return UNIT_PAGES;	// unknown or empty: nothing to size by
 	}
@@ -630,7 +610,7 @@ size_t UnitPagesOf(const PartitionCursor &cursor) {
 // (review of #553).
 bool ClaimUnit(const ScanBindData &data, ScanGlobalState &global, ScanLocalState &local) {
 	std::lock_guard<std::mutex> guard(global.claim);
-	while (!global.cutting || global.cut_page >= global.cutting->pages.size()) {
+	while (!global.cutting || global.cut_page >= global.cutting->pages->size()) {
 		global.cutting.reset();
 		if (global.next_partition >= data.entry->partitions.size()) {
 			return false;
@@ -643,7 +623,7 @@ bool ClaimUnit(const ScanBindData &data, ScanGlobalState &global, ScanLocalState
 	local.cursor = global.cutting;
 	local.batch = global.next_batch++;
 	local.next_page = global.cut_page;
-	local.end_page = std::min(global.cutting->pages.size(), global.cut_page + global.unit_pages);
+	local.end_page = std::min(global.cutting->pages->size(), global.cut_page + global.unit_pages);
 	global.cut_page = local.end_page;
 	local.have_page = false;
 	local.have_unit = true;
@@ -781,7 +761,7 @@ bool NextPage(ClientContext &context, const ScanBindData &data, ScanLocalState &
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
-		const PagePointer at = local.cursor->pages[local.next_page++];
+		const PagePointer at = (*local.cursor->pages)[local.next_page++];
 		if (!ReadUnitDataPage(store, *local.cursor->unit, at, data.schema + "." + data.table, local.page)) {
 			continue;
 		}
@@ -1042,25 +1022,98 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 	}
 }
 
+TableFunction MakeScanFunction(const LogicalType &path) {
+	TableFunction f(FUNCTION, {path, LogicalType::VARCHAR, LogicalType::VARCHAR}, Execute, Bind, Init, InitLocal);
+	// NULL (the default): DuckDB's threads.
+	f.GetSignature().AddKeywordOnly("max_threads", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	// NULL (the default): DuckDB's memory_limit. A size as memory_limit takes it ('2GB').
+	f.GetSignature().AddKeywordOnly("max_memory", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
+	f.projection_pushdown = true;
+	f.get_partition_data = PartitionData;
+	f.table_scan_progress = Progress;
+	f.get_virtual_columns = VirtualColumns;
+	f.cardinality = Cardinality;
+	f.serialize = Serialize;
+	f.deserialize = Deserialize;
+	return f;
+}
+
 }  // namespace
+
+ScanColumns ScanColumnsOf(const CatalogTable &table) {
+	ScanColumns result;
+	std::vector<UnreadColumn> unread;
+	for (const auto &c : table.columns) {
+		const ColumnReading reading = ReadingOf(c);
+		if (!reading.readable) {
+			unread.push_back(UnreadColumn{c.DuckDBName(), reading.type, reading.note});
+			continue;
+		}
+		result.column_ids.push_back(c.column_id);
+		result.types.push_back(reading.type);
+		result.names.push_back(c.DuckDBName());
+	}
+	// An unread column is a virtual one only when its name is no other column's: a readable column and
+	// the service columns win, and the binder must not pick among equal names (review of #552).
+	auto taken = [&](const std::string &name) {
+		for (const char *service : {"_mssql_page", "_mssql_rid", "_mssql_page_lsn", "_mssql_lob"}) {
+			if (StringUtil::CIEquals(name, service)) {
+				return true;
+			}
+		}
+		for (const auto &n : result.names) {
+			if (StringUtil::CIEquals(name, n)) {
+				return true;
+			}
+		}
+		return false;
+	};
+	for (auto &u : unread) {
+		if (!taken(u.name)) {
+			result.unread.push_back(std::move(u));
+		}
+	}
+	return result;
+}
+
+virtual_column_map_t ScanVirtualColumns(const std::vector<UnreadColumn> &unread) {
+	virtual_column_map_t result;
+	for (size_t i = 0; i < unread.size(); i++) {
+		result.insert(make_pair(UNREAD_COLUMN_START + i, TableColumn(Identifier(unread[i].name), unread[i].type)));
+	}
+	// count(*) projects this one rather than the table's first column, which may not be readable.
+	result.insert(make_pair(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN)));
+	result.insert(make_pair(PAGE_COLUMN, TableColumn("_mssql_page", LogicalType::VARCHAR)));
+	result.insert(make_pair(RID_COLUMN, TableColumn("_mssql_rid", LogicalType::BLOB)));
+	result.insert(make_pair(PAGE_LSN_COLUMN, TableColumn("_mssql_page_lsn", LogicalType::DECIMAL(25, 0))));
+	result.insert(make_pair(LOB_COLUMN, TableColumn("_mssql_lob", LogicalType::BLOB)));
+	return result;
+}
+
+TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &entry,
+								   std::shared_ptr<const AttachedBackup> attached, const std::string &schema,
+								   const std::string &table, unique_ptr<FunctionData> &bind_data) {
+	auto data = make_uniq<ScanBindData>();
+	data->paths = {attached->name};
+	data->schema = schema;
+	data->table = table;
+	data->table_entry = &entry;
+	data->attached = std::move(attached);
+	BindTable(context, *data, nullptr);
+	bind_data = std::move(data);
+	TableFunction f = MakeScanFunction(LogicalType::VARCHAR);
+	// The binder names a table entry's columns -- D8's virtual ones included -- through it.
+	f.get_table_entry = [](optional_ptr<const FunctionData> data_p) -> optional_ptr<TableCatalogEntry> {
+		return data_p ? data_p->Cast<ScanBindData>().table_entry : nullptr;
+	};
+	return f;
+}
 
 void RegisterBackupScanFunction(ExtensionLoader &loader) {
 	TableFunctionSet set(FUNCTION);
 	const vector<LogicalType> paths{LogicalType(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)};
 	for (const auto &path : paths) {
-		TableFunction f(FUNCTION, {path, LogicalType::VARCHAR, LogicalType::VARCHAR}, Execute, Bind, Init, InitLocal);
-		// NULL (the default): DuckDB's threads.
-		f.GetSignature().AddKeywordOnly("max_threads", LogicalType::BIGINT, Value(LogicalType::BIGINT));
-		// NULL (the default): DuckDB's memory_limit. A size as memory_limit takes it ('2GB').
-		f.GetSignature().AddKeywordOnly("max_memory", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
-		f.projection_pushdown = true;
-		f.get_partition_data = PartitionData;
-		f.table_scan_progress = Progress;
-		f.get_virtual_columns = VirtualColumns;
-		f.cardinality = Cardinality;
-		f.serialize = Serialize;
-		f.deserialize = Deserialize;
-		set.AddFunction(f);
+		set.AddFunction(MakeScanFunction(path));
 	}
 	mssql::RegisterDocumentedFunction(
 		loader, std::move(set),

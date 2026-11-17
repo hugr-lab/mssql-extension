@@ -28,9 +28,11 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace duckdb {
@@ -116,6 +118,21 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers,
 std::unique_ptr<OpenedPages> OpenBackupPages(ClientContext &context, const OpenedHeaders &headers,
 											 const OpenPagesOptions &options = OpenPagesOptions());
 
+//! The pages each in-row allocation unit's IAM chain lists, in page order, each once: walked at a
+//! table's first scan and kept with the opened backup (task 23), so a later scan reads no IAM page
+//! again. Its bytes count in the cache entry's estimate.
+class UnitPageCache {
+public:
+	//! The unit's list, `build`'s answer the first time it is asked for.
+	std::shared_ptr<const std::vector<PagePointer>> Get(uint64_t auid,
+														const std::function<std::vector<PagePointer>()> &build);
+	size_t MemoryBytes();
+
+private:
+	std::mutex lock_;
+	std::unordered_map<uint64_t, std::shared_ptr<const std::vector<PagePointer>>> units_;
+};
+
 //! Stages 1-4 but the model, held for every statement that opens the same files (spec 085 D9, task
 //! 22): the DuckDB instance's ObjectCache entry, keyed by every file's path, size and version tag,
 //! evictable by its memory. Stages 2-4 (the pages, the boot page checked against the trailer, the
@@ -144,6 +161,10 @@ public:
 	const BootstrapTables &Tables() const {
 		return *tables_;
 	}
+	//! The in-row units' page lists the scans have walked (task 23).
+	UnitPageCache &UnitPages() const {
+		return unit_pages_;
+	}
 
 	static std::string ObjectType() {
 		return "mssql_backup_opened";
@@ -163,6 +184,7 @@ private:
 	bool building_ = false;
 	std::unique_ptr<OpenedPages> pages_;
 	std::unique_ptr<BootstrapTables> tables_;
+	mutable UnitPageCache unit_pages_;
 	std::atomic<size_t> estimate_{0};
 };
 
@@ -177,21 +199,56 @@ struct OpenedForStatement {
 	std::string cache_key;
 };
 
+//! A backup attached as a catalog (ATTACH … (TYPE mssql_backup), task 23): what its ATTACH opened, held
+//! for its life -- the opened backup (the ObjectCache's entry, which stays alive while attached even if
+//! the cache evicts it) and its model, built once for the ATTACH's schema_filter / table_filter, its
+//! schemas filtered too. The file functions take its name in place of a path and read through it.
+struct AttachedBackup {
+	std::string name;
+	shared_ptr<OpenedBackup> backup;
+	std::string cache_key;	// the ObjectCache's, empty when not cached
+	std::shared_ptr<const CatalogModel> model;
+	//! The ATTACH's schema_filter; none: every schema.
+	std::function<bool(const std::string &schema)> wants_schema;
+
+	bool WantsSchema(const std::string &schema) const {
+		return !wants_schema || wants_schema(schema);
+	}
+};
+
+//! The backup attached as `name` (a catalog of TYPE mssql_backup), or none. [the catalog layer]
+std::shared_ptr<const AttachedBackup> FindAttachedBackup(ClientContext &context, const std::string &name);
+
+//! The backup on `paths` opened for an ATTACH as `name`: OpenBackup's shared stages (the ObjectCache's
+//! entry when there is one, never another attached backup's name) and the model of the tables and views
+//! `wants_object` keeps, built now. FormatError naming the backup when it cannot be read.
+std::shared_ptr<AttachedBackup> OpenAttachedBackup(
+	ClientContext &context, const std::string &name, const std::vector<std::string> &paths,
+	std::function<bool(const std::string &schema)> wants_schema,
+	std::function<bool(const std::string &schema, const std::string &object)> wants_object);
+
 //! The backup on `paths` (paths or globs: the families of one media set): its files opened for this
 //! statement and its headers taken from the DuckDB instance's ObjectCache when `mssql_backup_cache`
 //! is on and a backup of exactly these files -- path, size, version tag -- is there, else read now
-//! (OpenBackupHeaders' checks) and put there. A file that changed is a new key: never trusted.
+//! (OpenBackupHeaders' checks) and put there. A file that changed is a new key: never trusted. One
+//! path that names an attached backup (FindAttachedBackup) is that backup, its files opened again for
+//! the statement and refused by name when one changed since the ATTACH.
 OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::string> &paths);
 
 //! Stages 1-4 of an opened backup for one statement: the shared stages (OpenBackup, EnsureTables)
-//! and the catalog model, the statement's own (its scope is the statement's).
+//! and the catalog model, the statement's own (its scope is the statement's), or an attached backup's.
 struct OpenedCatalog {
 	OpenedForStatement opened;
 	//! The shared stages' (owned by `opened.backup`).
 	const OpenedHeaders *headers = nullptr;
 	const OpenedPages *pages = nullptr;
 	const BootstrapTables *tables = nullptr;
-	CatalogModel model;
+	std::shared_ptr<const CatalogModel> model;
+	//! The opened backup's (owned by `opened.backup`).
+	UnitPageCache *unit_pages = nullptr;
+	const CatalogModel &Model() const {
+		return *model;
+	}
 	const FileBinding &Binding() const {
 		return opened.binding;
 	}
@@ -200,9 +257,12 @@ struct OpenedCatalog {
 //! The catalog of the full backup on `paths`: OpenBackup, EnsureTables and BuildCatalogModel, read
 //! through the statement's files. FormatError naming the backup otherwise.
 //! `with_model` false stops after the bootstrap tables (the model left empty): what a reader of the
-//! base tables needs. `scope`: the tables and views the model is built for (task 16e).
+//! base tables needs. `scope`: the tables and views the model is built for (task 16e). An attached
+//! backup's is its own model, built at its ATTACH (`with_model` and `scope` do not apply).
 std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths,
 												 bool with_model = true, const CatalogScope &scope = CatalogScope());
+//! The catalog of `attached` for one statement: its files opened again and checked, its model.
+std::unique_ptr<OpenedCatalog> OpenAttachedCatalog(ClientContext &context, const AttachedBackup &attached);
 
 //! The headers of the backup whose files `files` opened, read through them: one backup set per file
 //! (an appended set is refused), the same backup set GUID in every family, and for plain families

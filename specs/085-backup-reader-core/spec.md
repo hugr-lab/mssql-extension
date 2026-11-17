@@ -623,11 +623,9 @@ src/backup/                         namespace duckdb::mssql::backup (no prefix);
   backup_opened.cpp                 OpenedBackup: the cached object, staged build, cache key           [DuckDB]
 src/backup/backup_*_function.cpp    mssql_backup_info / _tables / _views / _catalog / _scan            [DuckDB]
 src/catalog/backup/                 namespace duckdb, MSSQL prefix                                      [DuckDB]
-  mssql_backup_storage.cpp          StorageExtension (attach, transaction manager)
-  mssql_backup_catalog.cpp          MSSQLBackupCatalog
-  mssql_backup_schema_entry.cpp     MSSQLBackupSchemaEntry
-  mssql_backup_table_entry.cpp      MSSQLBackupTableEntry
-  mssql_backup_transaction.cpp      MSSQLBackupTransactionManager, MSSQLBackupTransaction (read-only, no state)
+  mssql_backup_catalog.cpp          as built (PR 4b), one file: the StorageExtension (attach), MSSQLBackupCatalog,
+                                    MSSQLBackupSchemaEntry, MSSQLBackupTableEntry, MSSQLBackupTransactionManager
+                                    (DuckDB's plain Transaction: read-only, no state)
 src/include/backup/, src/include/catalog/backup/   headers, mirroring the sources
 src/codec/code_page/                spec 091: code-page tables and kernels, reused here (D7)
 ```
@@ -1493,6 +1491,33 @@ before the next opens.
     `table_filter`, regexes with TYPE mssql's semantics (case-insensitive, partial match), so the
     catalog builds its model, and keeps its indexes, for those objects only (task 16e's pushdown is
     the same restriction for one call).
+    As built (PR 4b): `src/catalog/backup/mssql_backup_catalog.cpp` (the storage extension, catalog,
+    schema and table entries, transaction manager, in one file) over `backup_opened`'s
+    `AttachedBackup` -- the `OpenedBackup` (the cache's entry, held while attached: an eviction drops
+    its accounting, not the object) and the model built at ATTACH for the filters
+    (`CatalogScope::objects`; the schema list filtered too). The in-row units' page lists are an
+    `OpenedBackup` stage (`UnitPageCache`, counted in its estimate), so any later scan of the same
+    files -- through an ATTACH or a file function -- walks no IAM chain again. A table entry's scan is
+    `mssql_backup_scan` bound on the catalog's own `AttachedBackup` (`AttachedScanFunction`, never
+    looked up by name again; `get_table_entry`, so the binder sees D8's virtual columns), its columns
+    `ScanColumnsOf`'s, as the file function's. `OpenBackup` / `OpenBackupCatalog` resolve one path that
+    names an attached backup (`FindAttachedBackup`) to it: the statement's files opened again and each
+    checked against the ATTACH's size and version tag (changed: refused by name). The attach sets the
+    database read-only (`SetReadOnlyDatabase`); a write DuckDB plans before its own read-only check
+    (INSERT, UPDATE, DELETE, MERGE, TRUNCATE) is refused by `MSSQLBackupCatalog::RefuseWrite`. An option
+    other than the two filters is refused by name; `ATTACH OR REPLACE` attaches anew
+    (`HasConflictingAttachOptions`). Names are the backup's; columns that differ only in case (a case-sensitive database), which a
+    DuckDB table cannot hold even quoted, get a `CatalogColumn::duckdb_name` in the model
+    (`AssignDuckDBNames`: `Id`, `ID_1`, `id_2`, the first suffix no column of the table is named, every
+    real name reserved first), read by `ScanColumnsOf` and listed as `duckdb_name` by
+    `mssql_backup_columns` / `mssql_backup_tables.columns`, so the entry, the file function and the
+    listings agree and nothing is refused (owner, review of PR 4b; TYPE mssql's side is #572); tables and schemas that differ only in case are found by the exact name
+    first. Fixture `names.sql` (oracle lane): spaces, quotes, `]`, dots, tables that differ by case.
+    The isolation test is `mssql_pool_stats()`
+    empty with backups attached (no pool exists; `MSSQLOptimizer` and the remote-pushdown hooks ask for
+    `TYPE mssql`): weaker than "every counter zero", which needs a `TYPE mssql` catalog beside it.
+    Tests: `test/sql/backup/mssql_backup_attach.test`, `test_backup_cache` (shared model and page
+    lists, the ATTACH's backup held with the cache off).
 24. Differential overlay and chain check: the diff's pages by their header AU, the full's by the IAM
     chain through the overlay (D4) — 2 d
 25. `s3://` (MinIO) and `https://` tests in the lane; measure the open pass and decide filter pushdown

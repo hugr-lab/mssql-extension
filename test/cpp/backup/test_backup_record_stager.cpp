@@ -246,8 +246,8 @@ int main() {
 		auto opened = OpenBackupCatalog(*con.context, {"test/data/backup/full.bak"});
 		BindFiles bound(opened->Binding());	 // reads through the statement's files, as a function's calls do
 		const PageStore &store = *opened->pages->store;
-		const CatalogTable *items = opened->model.FindTable("dbo", "items");
-		const CatalogTable *events = opened->model.FindTable("dbo", "events");
+		const CatalogTable *items = opened->Model().FindTable("dbo", "items");
+		const CatalogTable *events = opened->Model().FindTable("dbo", "events");
 		Check(items && events && items->decodable && events->decodable, "the sample's two tables are decodable");
 
 		// items (id int PRIMARY KEY, name nvarchar(40), code varchar(12) NULL, price decimal(12, 2),

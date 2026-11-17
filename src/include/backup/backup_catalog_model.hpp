@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -111,6 +112,14 @@ std::string ReadModuleDefinition(const PageStore &store, const ModuleDefinition 
 struct CatalogColumn {
 	int32_t column_id = 0;
 	std::string name;
+	//! The name DuckDB reads it under (spec 085 PR 4b): `name`, but for a column whose name repeats an
+	//! earlier one's but for case (a case-sensitive database: `Id`, `ID`), which no DuckDB table can hold
+	//! -- `ID_1`, the first suffix no column of the table is named (AssignDuckDBNames).
+	std::string duckdb_name;
+	//! duckdb_name, or `name` for a column not built by the model (a test's).
+	const std::string &DuckDBName() const {
+		return duckdb_name.empty() ? name : duckdb_name;
+	}
 	uint8_t system_type_id = 0;
 	int32_t user_type_id = 0;
 	std::string type_name;	// TYPE_NAME(user_type_id): an alias type's own name
@@ -341,18 +350,27 @@ struct CatalogScope {
 	bool by_view = false;
 	std::set<std::string> views;  // view names
 	bool no_views = false;
+	//! Task 23: an ATTACH's schema_filter / table_filter, over the schema and the table's or view's name;
+	//! none: every object.
+	std::shared_ptr<const std::function<bool(const std::string &schema, const std::string &name)>> objects;
 
 	bool WantsTable(const std::string &schema, const std::string &name) const {
-		return !no_tables && (!by_schema || schemas.count(schema)) && (!by_table || tables.count(name));
+		return !no_tables && (!by_schema || schemas.count(schema)) && (!by_table || tables.count(name)) &&
+			   (!objects || (*objects)(schema, name));
 	}
 	bool WantsView(const std::string &schema, const std::string &name) const {
-		return !no_views && (!by_schema || schemas.count(schema)) && (!by_view || views.count(name));
+		return !no_views && (!by_schema || schemas.count(schema)) && (!by_view || views.count(name)) &&
+			   (!objects || (*objects)(schema, name));
 	}
 	bool operator==(const CatalogScope &o) const {
 		return by_schema == o.by_schema && schemas == o.schemas && by_table == o.by_table && tables == o.tables &&
-			   no_tables == o.no_tables && by_view == o.by_view && views == o.views && no_views == o.no_views;
+			   no_tables == o.no_tables && by_view == o.by_view && views == o.views && no_views == o.no_views &&
+			   objects == o.objects;
 	}
 };
+
+//! Sets each column's duckdb_name (CatalogColumn), in the table's order.
+void AssignDuckDBNames(std::vector<CatalogColumn> &columns);
 
 //! The catalog model of the database whose base tables are `tables`, its other system tables read
 //! through `store`. What one object's rows get wrong is named on that object (D13): a table the scan

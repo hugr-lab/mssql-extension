@@ -911,6 +911,45 @@ std::string CatalogModel::SchemaName(int32_t id) const {
 	return it != schemas.end() && it->id == id ? it->name : std::string();
 }
 
+namespace {
+
+std::string AsciiLower(const std::string &s) {
+	std::string out = s;
+	for (auto &ch : out) {
+		if (ch >= 'A' && ch <= 'Z') {
+			ch = static_cast<char>(ch - 'A' + 'a');
+		}
+	}
+	return out;
+}
+
+}  // namespace
+
+void AssignDuckDBNames(std::vector<CatalogColumn> &columns) {
+	// DuckDB compares names case-insensitively (ASCII). Every column's own name is reserved first, so a
+	// generated name never takes a real column's: (Id, ID, ID_1) reads as Id, ID_2, ID_1.
+	std::set<std::string> reserved;
+	for (const auto &c : columns) {
+		reserved.insert(AsciiLower(c.name));
+	}
+	std::set<std::string> used;
+	for (auto &c : columns) {
+		std::string lower = AsciiLower(c.name);
+		c.duckdb_name = c.name;
+		if (used.insert(lower).second) {
+			continue;
+		}
+		for (size_t k = 1;; k++) {
+			std::string candidate = c.name + "_" + std::to_string(k);
+			std::string candidate_lower = AsciiLower(candidate);
+			if (!reserved.count(candidate_lower) && used.insert(candidate_lower).second) {
+				c.duckdb_name = std::move(candidate);
+				break;
+			}
+		}
+	}
+}
+
 CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &tables, const BoundaryCheck &check,
 							   const CatalogScope &scope) {
 	CatalogModel model;
@@ -1035,6 +1074,7 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 			}
 			t.columns.push_back(std::move(col));
 		}
+		AssignDuckDBNames(t.columns);
 		bool heap = false, columnstore = false;
 		std::map<int32_t, int64_t> delta_rows;	// a columnstore's delta store rows, by partition
 		std::unordered_map<uint64_t, const SysRowset *> rowset_of;
