@@ -427,6 +427,9 @@ OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::str
 	opened.files.reset(
 		new StatementFiles(context, ByteSource::Open(context, vector<std::string>(paths.begin(), paths.end()))));
 	auto &cache = ObjectCache::GetObjectCache(context);
+	// D9: the key (each file's path, size and version tag) is trusted alone, no header read again on a
+	// hit: a file rewritten in place at the same size whose modification time reads as before is taken for
+	// the cached one (owner, review of #567; documented, `mssql_backup_cache = false` the way out).
 	if (BackupCacheOn(context)) {
 		opened.cache_key = CacheKey(*opened.files);
 		opened.backup = cache.Get<OpenedBackup>(opened.cache_key);
