@@ -268,7 +268,9 @@ bool AllocationMap::IsLive(uint16_t file, uint32_t page) const {
 			return true;
 		}
 		PageLocation location;
-		return index_.Locate(file, page, location, true);
+		// This backup's own copy: under an overlay, the full's allocation pages past a file the
+		// differential's header records as smaller (a shrink) are not the database's any more.
+		return index_.LocateOwn(file, page, location, true);
 	}
 	return ExtentAllocated(file, page) && (PfsByte(*f, page) & PFS_ALLOCATED) != 0;
 }

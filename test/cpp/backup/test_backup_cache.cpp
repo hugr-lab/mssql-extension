@@ -269,6 +269,32 @@ int main() {
 			  "columns that differ only in case read as Id, ID_2, id_3: a real column ID_1 keeps its name");
 	}
 
+	{
+		// Task 24: a differential over its full is its own entry, keyed by both backups' files, whose
+		// base is the full's entry; a second statement takes it and reads nothing it holds again.
+		auto full = OpenBackupCatalog(context, {DIR + "full.bak"});
+		auto a = OpenBackupCatalog(context, {DIR + "full.bak"}, true, CatalogScope(), {DIR + "diff.bak"});
+		auto b = OpenBackupCatalog(context, {DIR + "full.bak"}, true, CatalogScope(), {DIR + "diff.bak"});
+		Check(a->opened.backup.get() == b->opened.backup.get() && !a->opened.cache_key.empty(),
+			  "a differential over its full is cached, keyed by both backups' files");
+		Check(a->opened.backup->Base().get() == full->opened.backup.get(),
+			  "and its base is the full's entry, not a second open of the full");
+		Check(a->opened.backup.get() != full->opened.backup.get() && a->pages != full->pages,
+			  "the overlay's pages are its own: the differential's index over the full's");
+		const CatalogTable *items = a->Model().FindTable("dbo", "items");
+		Check(items && items->row_count == 2500, "the overlay's catalog counts the differential's rows (2500 items)");
+		Check(Fetches(*b) < Fetches(*a) || Fetches(*b) == 0, "a second open of the overlay reads less");
+		// The full's entry evicted (each entry goes on its own) and opened anew while the overlay's stays:
+		// the overlay still reads through its own base, bound to the statement's files of the full.
+		ObjectCache::GetObjectCache(context).Delete(full->opened.cache_key);
+		auto again = OpenBackupCatalog(context, {DIR + "full.bak"});
+		Check(again->opened.backup.get() != full->opened.backup.get(), "the full opened anew after its eviction");
+		const int64_t rows =
+			ScalarInt(con, "SELECT count(*) FROM mssql_backup_scan('" + DIR + "full.bak', 'dbo', 'events', diff := '" +
+							   DIR + "diff.bak')");
+		Check(rows == 2572, "and the cached overlay over its old base still reads (" + std::to_string(rows) + " rows)");
+	}
+
 	if (failures) {
 		std::cout << failures << " check(s) failed" << std::endl;
 		return 1;

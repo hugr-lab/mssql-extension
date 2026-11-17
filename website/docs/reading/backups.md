@@ -265,6 +265,30 @@ from what `RESTORE` makes of it by replaying the log tail.
 The oracle lane restores every fixture backup of SQL Server 2017 to 2025 and compares each table's
 rows with `mssql_backup_scan`'s, both ways, through `TYPE mssql`.
 
+## A differential over its full
+
+A differential backup holds only the pages that changed since its full backup, so it is read over
+that full: `diff :=` names it.
+
+```sql
+SELECT count(*) FROM mssql_backup_scan('/backups/sales_full.bak', 'dbo', 'orders',
+                                       diff := '/backups/sales_diff_1500.bak');
+SELECT table_name, row_count FROM mssql_backup_tables('/backups/sales_full.bak',
+                                                      diff := '/backups/sales_diff_1500.bak');
+ATTACH '/backups/sales_full.bak' AS b (TYPE mssql_backup, diff '/backups/sales_diff_1500.bak');
+```
+
+The result is what `RESTORE` of the full `WITH NORECOVERY`, then of the differential `WITH RECOVERY`,
+gives: rows changed, added and deleted since the full, tables created, dropped and truncated, columns
+added and dropped, all as the differential's time saw them. A differential is cumulative since its
+full, so a day of hourly differentials needs no chain: the state at 15:00 is the full plus the 15:00
+differential alone. Every function takes `diff :=` but `mssql_backup_info`, which describes one backup.
+
+It must be that full's differential: one based on another backup set (a later full, or a copy-only
+one), of another database, a full or a log given as `diff :=`, and a differential given as the path
+are refused, each naming the files. Without a log replay the differential reads as of its own
+checkpoint, as the full does.
+
 ## Attaching a backup
 
 A full backup can be attached as a read-only catalog, its schemas and user tables DuckDB entries:
@@ -288,6 +312,7 @@ It is always read-only, whatever the options say: `CREATE`, `INSERT`, `UPDATE`, 
 |---|---|
 | `schema_filter` | A regex: only the schemas it matches (case-insensitive, a partial match: `^sales$` for one) |
 | `table_filter` | A regex: only the tables and views it matches |
+| `diff` | A differential backup to read over the attached full ([above](#a-differential-over-its-full)) |
 
 They work as for `TYPE mssql`, and the catalog is built for what they keep only, which on a large
 database keeps the `ATTACH` and its memory small. Any other option is refused by name.

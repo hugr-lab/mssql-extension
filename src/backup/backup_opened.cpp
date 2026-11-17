@@ -243,10 +243,14 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 	if (set.kind == BackupKind::Log) {
 		throw FormatError("backup file \"" + first + "\" is a log backup: it holds no data pages to read");
 	}
-	if (set.kind == BackupKind::Differential) {
+	if (set.kind == BackupKind::Differential && !options.base) {
+		// It lacks every page that did not change since its base, the catalog's among them (089 D5).
 		throw FormatError("backup file \"" + first +
-						  "\" is a differential backup: its pages are read over its full backup, which is not "
-						  "supported yet");
+						  "\" is a differential backup: its pages are read over its full backup -- give the full "
+						  "as the path and this one as diff := '...'");
+	}
+	if (set.kind != BackupKind::Differential && options.base) {
+		throw FormatError("backup file \"" + first + "\" is not a differential backup, so it is not read over another");
 	}
 	std::unique_ptr<OpenedPages> pages(new OpenedPages());
 	const size_t n = headers.families.size();
@@ -268,7 +272,8 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 		pages->streams.push_back(s);
 	}
 	PageIndexOptions index_options;
-	index_options.full_backup = true;
+	// A differential's passes are mapped by their headers (D4a): small, and their order is not a full's.
+	index_options.full_backup = !options.base;
 	index_options.trust_layout = options.trust_layout;
 	index_options.mapper = BoundPassMapper();
 	std::vector<uint16_t> data_files;
@@ -286,6 +291,10 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 	}
 	try {
 		pages->index = BuildPageIndex(pages->streams, index_options);
+		// D12: a page the differential does not carry is its full's; liveness is then the overlaid
+		// allocation pages' (the map below reads them through the index), never the full's alone -- a
+		// naive overlay doubled every row after a shrink (E2 apply_diff).
+		pages->index.SetBase(options.base);
 		// A file marked removed (SFIN flag 0x20, a hint: DatabaseFile::marked_removed) is one only when
 		// the backup carries no page 0 of it -- asked as an expected page, so a searched pass is mapped
 		// rather than trusted --; else it is a live file, read as any other (its id reused by a later ADD
@@ -295,7 +304,8 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 		// file marked removed.
 		for (uint16_t id : marked_removed) {
 			PageLocation at;
-			if (pages->index.Locate(id, 0, at, true)) {
+			// This backup's own passes: under an overlay, the full's page 0 of a file removed since says nothing.
+			if (pages->index.LocateOwn(id, 0, at, true)) {
 				data_files.push_back(id);
 			}
 		}
@@ -320,7 +330,8 @@ static std::string WithoutPrefix(const FormatError &e) {
 	return why;
 }
 
-OpenedBackup::OpenedBackup(std::unique_ptr<OpenedHeaders> headers) : headers_(std::move(headers)) {}
+OpenedBackup::OpenedBackup(std::unique_ptr<OpenedHeaders> headers, shared_ptr<OpenedBackup> base)
+	: headers_(std::move(headers)), base_(std::move(base)) {}
 
 bool OpenedBackup::EnsureTables(ClientContext &context) {
 	std::unique_lock<std::mutex> guard(lock_);
@@ -339,7 +350,13 @@ bool OpenedBackup::EnsureTables(ClientContext &context) {
 	std::unique_ptr<OpenedPages> pages;
 	std::unique_ptr<BootstrapTables> tables(new BootstrapTables());
 	try {
-		pages = OpenBackupPages(*headers_);
+		OpenPagesOptions options;
+		if (base_) {
+			// A differential: its full's stages first (the statement's binding names both backups).
+			base_->EnsureTables(context);
+			options.base = &base_->Pages().index;
+		}
+		pages = OpenBackupPages(*headers_, options);
 		try {
 			Page boot_page;
 			pages->store->ReadLive(1, 9, boot_page, "the boot page");
@@ -448,9 +465,38 @@ size_t UnitPageCache::MemoryBytes() {
 	return bytes;
 }
 
-//! The attached backup's files opened for this statement, each checked to be as its ATTACH opened it.
-static OpenedForStatement OpenAttached(ClientContext &context, const AttachedBackup &attached) {
-	const OpenedHeaders &headers = attached.backup->Headers();
+void CheckDifferentialBase(const OpenedHeaders &full, const OpenedHeaders &diff) {
+	const auto &f = full.Set();
+	const auto &d = diff.Set();
+	const std::string full_name = "\"" + full.Path(full.families.front()->file) + "\"";
+	const std::string diff_name = "\"" + diff.Path(diff.families.front()->file) + "\"";
+	auto kind = [](BackupKind k) {
+		return k == BackupKind::Full ? "a full" : k == BackupKind::Differential ? "a differential" : "a log";
+	};
+	if (d.kind != BackupKind::Differential) {
+		throw FormatError("diff := " + diff_name + " is " + kind(d.kind) + " backup, not a differential");
+	}
+	if (f.kind != BackupKind::Full) {
+		throw FormatError("backup file " + full_name + " is " + kind(f.kind) +
+						  " backup: diff := goes beside the full backup the differential is based on");
+	}
+	if (!f.family_guid.IsZero() && !d.family_guid.IsZero() && f.family_guid.bytes != d.family_guid.bytes) {
+		throw FormatError("the differential " + diff_name + " is of another database than " + full_name +
+						  " (family GUID " + d.family_guid.ToString() + ", not " + f.family_guid.ToString() + ")");
+	}
+	if (d.differential_base_guid.bytes != f.backup_set_guid.bytes) {
+		// E1 rule 1: a differential over another full than its base corrupted the tables it changed.
+		throw FormatError("the differential " + diff_name + " is based on backup set " +
+						  d.differential_base_guid.ToString() + ", not on " + full_name + " (backup set " +
+						  f.backup_set_guid.ToString() + "): give it its own full backup");
+	}
+}
+
+//! `backup`'s files opened for this statement, each checked to be as when `backup` was opened (an
+//! attached backup's, named `name`), its base's too for a differential.
+static OpenedForStatement OpenHeld(ClientContext &context, const shared_ptr<OpenedBackup> &backup,
+								   const std::string &cache_key, const std::string &name) {
+	const OpenedHeaders &headers = backup->Headers();
 	vector<std::string> paths;
 	for (const auto &key : headers.files) {
 		paths.push_back(key.path);
@@ -464,29 +510,83 @@ static OpenedForStatement OpenAttached(ClientContext &context, const AttachedBac
 			throw InvalidInputException(
 				"mssql backup: the file \"%s\" of %s changed since it was attached (its "
 				"size or modification time): DETACH %s and ATTACH it again",
-				key.path, attached.name, attached.name);
+				key.path, name, name);
 		}
 	}
-	opened.backup = attached.backup;
+	opened.backup = backup;
 	// Re-measured and put again by the statement (OpenBackupCatalog) only while the cache is on.
-	opened.cache_key = BackupCacheOn(context) ? attached.cache_key : std::string();
+	opened.cache_key = BackupCacheOn(context) ? cache_key : std::string();
 	opened.binding = BindingFor(headers, *opened.files);
+	if (backup->Base()) {
+		opened.base.reset(new OpenedForStatement(OpenHeld(context, backup->Base(), std::string(), name)));
+		opened.binding.also = &opened.base->binding;
+	}
 	return opened;
 }
 
-static OpenedForStatement OpenBackupFiles(ClientContext &context, const std::vector<std::string> &paths);
+//! The attached backup's files opened for this statement, each checked to be as its ATTACH opened it.
+static OpenedForStatement OpenAttached(ClientContext &context, const AttachedBackup &attached) {
+	return OpenHeld(context, attached.backup, attached.cache_key, attached.name);
+}
 
-OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::string> &paths) {
+static OpenedForStatement OpenBackupFiles(ClientContext &context, const std::vector<std::string> &paths,
+										  const std::vector<std::string> &diff);
+
+OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::string> &paths,
+							  const std::vector<std::string> &diff) {
 	if (paths.size() == 1) {
 		auto attached = FindAttachedBackup(context, paths.front());
 		if (attached) {
+			if (!diff.empty()) {
+				throw InvalidInputException("mssql backup: %s is an attached backup: give diff := to its ATTACH",
+											attached->name);
+			}
 			return OpenAttached(context, *attached);
 		}
 	}
-	return OpenBackupFiles(context, paths);
+	return OpenBackupFiles(context, paths, diff);
 }
 
-static OpenedForStatement OpenBackupFiles(ClientContext &context, const std::vector<std::string> &paths) {
+//! The differential on `diff` over `full` (opened for the statement): its own files, its entry in the
+//! ObjectCache keyed by both backups' files (the full's stages its base), its chain checked.
+static OpenedForStatement OpenOverlay(ClientContext &context, OpenedForStatement full,
+									  const std::vector<std::string> &diff) {
+	OpenedForStatement opened;
+	opened.files.reset(
+		new StatementFiles(context, ByteSource::Open(context, vector<std::string>(diff.begin(), diff.end()))));
+	auto &cache = ObjectCache::GetObjectCache(context);
+	const std::string diff_key = CacheKey(*opened.files);
+	if (!full.cache_key.empty() && !diff_key.empty()) {
+		opened.cache_key = "mssql_backup_overlay:" + full.cache_key + '\x1d' + diff_key;
+		opened.backup = cache.Get<OpenedBackup>(opened.cache_key);
+	}
+	if (opened.backup && opened.backup->Base() != full.backup) {
+		// The overlay's entry outlived the full's (each is evicted on its own) or was put by another
+		// statement that opened the full meanwhile: its base is the full the overlay was built on, so the
+		// statement's files of the full -- the same files, by the key -- are bound to that one.
+		full.backup = opened.backup->Base();
+		full.binding = BindingFor(full.backup->Headers(), *full.files);
+	}
+	if (!opened.backup) {
+		auto headers = ReadBackupHeaders(*opened.files);
+		CheckDifferentialBase(full.backup->Headers(), *headers);
+		opened.backup = make_shared_ptr<OpenedBackup>(std::move(headers), full.backup);
+		if (!opened.cache_key.empty()) {
+			opened.backup->Reweigh();
+			cache.Put(opened.cache_key, opened.backup);
+		}
+	}
+	opened.binding = BindingFor(opened.backup->Headers(), *opened.files);
+	opened.base.reset(new OpenedForStatement(std::move(full)));
+	opened.binding.also = &opened.base->binding;
+	return opened;
+}
+
+static OpenedForStatement OpenBackupFiles(ClientContext &context, const std::vector<std::string> &paths,
+										  const std::vector<std::string> &diff) {
+	if (!diff.empty()) {
+		return OpenOverlay(context, OpenBackupFiles(context, paths, std::vector<std::string>()), diff);
+	}
 	OpenedForStatement opened;
 	opened.files.reset(
 		new StatementFiles(context, ByteSource::Open(context, vector<std::string>(paths.begin(), paths.end()))));
@@ -520,6 +620,10 @@ static void TakeStages(ClientContext &context, OpenedCatalog &catalog) {
 	if (!opened.cache_key.empty() && opened.backup->Reweigh()) {
 		ObjectCache::GetObjectCache(context).Put(opened.cache_key, opened.backup);
 	}
+	// A differential's full: its stages were built through the overlay, and grow as its reads search it.
+	if (opened.base && !opened.base->cache_key.empty() && opened.base->backup->Reweigh()) {
+		ObjectCache::GetObjectCache(context).Put(opened.base->cache_key, opened.base->backup);
+	}
 	catalog.headers = &opened.backup->Headers();
 	catalog.pages = &opened.backup->Pages();
 	catalog.tables = &opened.backup->Tables();
@@ -535,15 +639,20 @@ std::unique_ptr<OpenedCatalog> OpenAttachedCatalog(ClientContext &context, const
 }
 
 std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths,
-												 bool with_model, const CatalogScope &scope) {
+												 bool with_model, const CatalogScope &scope,
+												 const std::vector<std::string> &diff) {
 	if (paths.size() == 1) {
 		auto attached = FindAttachedBackup(context, paths.front());
 		if (attached) {
+			if (!diff.empty()) {
+				throw InvalidInputException("mssql backup: %s is an attached backup: give diff := to its ATTACH",
+											attached->name);
+			}
 			return OpenAttachedCatalog(context, *attached);
 		}
 	}
 	std::unique_ptr<OpenedCatalog> catalog(new OpenedCatalog());
-	catalog->opened = OpenBackupFiles(context, paths);
+	catalog->opened = OpenBackupFiles(context, paths, diff);
 	TakeStages(context, *catalog);
 	auto model = std::make_shared<CatalogModel>();
 	catalog->model = model;
@@ -556,7 +665,9 @@ std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const s
 				*catalog->pages->store, *catalog->tables,
 				[](const SqlVariant &v, const std::string &what) { (void)SqlVariantValue(v, what); }, scope);
 		} catch (FormatError &e) {
-			throw FormatError("backup file \"" + paths.front() + "\": " + WithoutPrefix(e));
+			throw FormatError("backup file \"" + paths.front() + "\"" +
+							  (diff.empty() ? std::string() : " with the differential \"" + diff.front() + "\"") +
+							  ": " + WithoutPrefix(e));
 		}
 	}
 	return catalog;
@@ -565,11 +676,12 @@ std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const s
 std::shared_ptr<AttachedBackup> OpenAttachedBackup(
 	ClientContext &context, const std::string &name, const std::vector<std::string> &paths,
 	std::function<bool(const std::string &schema)> wants_schema,
-	std::function<bool(const std::string &schema, const std::string &object)> wants_object) {
+	std::function<bool(const std::string &schema, const std::string &object)> wants_object,
+	const std::vector<std::string> &diff) {
 	auto attached = std::make_shared<AttachedBackup>();
 	attached->name = name;
 	attached->wants_schema = std::move(wants_schema);
-	OpenedForStatement opened = OpenBackupFiles(context, paths);
+	OpenedForStatement opened = OpenBackupFiles(context, paths, diff);
 	BindFiles bound(opened.binding);
 	opened.backup->EnsureTables(context);
 	if (!opened.cache_key.empty() && opened.backup->Reweigh()) {
@@ -586,7 +698,9 @@ std::shared_ptr<AttachedBackup> OpenAttachedBackup(
 			*opened.backup->Pages().store, opened.backup->Tables(),
 			[](const SqlVariant &v, const std::string &what) { (void)SqlVariantValue(v, what); }, scope);
 	} catch (FormatError &e) {
-		throw FormatError("backup file \"" + paths.front() + "\": " + WithoutPrefix(e));
+		throw FormatError("backup file \"" + paths.front() + "\"" +
+						  (diff.empty() ? std::string() : " with the differential \"" + diff.front() + "\"") + ": " +
+						  WithoutPrefix(e));
 	}
 	// The schemas a listing of the attached backup shows are the filter's too.
 	model->schemas.erase(std::remove_if(model->schemas.begin(), model->schemas.end(),

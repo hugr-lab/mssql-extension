@@ -16,7 +16,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DIR="$(cd "${1:?usage: compare_rows.sh DIR}" && pwd)"
 : "${VERSION:?set VERSION (2017, 2019, 2022 or 2025)}"
 DUCKDB="${DUCKDB:-build/release/duckdb}"
-QUIET="${QUIET:-full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full lob_full lob_xpress cd_full cd_xpress names_full}"
+QUIET="${QUIET:-full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full lob_full lob_xpress cd_full cd_xpress names_full diffs_full}"
+# Spec 085 PR 4c: the full + differential pairs of overlays.txt (name|full set|differential set) compared
+# too: the full restored WITH NORECOVERY, the differential WITH RECOVERY, against
+# mssql_backup_scan(full, diff := differential).
+OVERLAYS="${OVERLAYS-diffs_over diffs_over_xpress}"
 IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/gen/images.txt")"
 [ -n "${IMAGE}" ] || { echo "ERROR: no image for VERSION=${VERSION} in images.txt" >&2; exit 1; }
 CONTAINER="${CONTAINER:-mssql-bak-rows}"
@@ -87,6 +91,64 @@ while IFS='|' read -r name files; do
 	sql -Q "ALTER DATABASE cmp SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE cmp" >/dev/null
 	docker exec -u 0 "${CONTAINER}" sh -c "rm -f '${BAK}'/*"
 done <"${DIR}/sets.txt"
+
+# A set's files, as sets.txt lists them (comma-separated).
+set_files() {
+	awk -F'|' -v n="$1" '$1 == n { print $2 }' "${DIR}/sets.txt"
+}
+# Copies a set's files into the container: its RESTORE's FROM clause into `from`, its local paths into
+# `local_files`.
+stage_set() {
+	from=""
+	local_files=""
+	IFS=, read -r -a parts <<<"$(set_files "$1")"
+	for f in "${parts[@]}"; do
+		docker cp -L "${DIR}/${f}" "${CONTAINER}:${BAK}/${f}"
+		docker exec -u 0 "${CONTAINER}" sh -c "if id mssql >/dev/null 2>&1; then chown mssql '${BAK}/${f}'; fi"
+		from="${from:+${from}, }DISK = '${BAK}/${f}'"
+		local_files="${local_files:+${local_files},}${DIR}/${f}"
+	done
+}
+# Every pair asked for must be there: a diffs fixture that failed to generate is a failure, not a skip.
+for want in ${OVERLAYS}; do
+	if [ ! -f "${DIR}/overlays.txt" ] || ! awk -F'|' -v n="${want}" '$1 == n { found = 1 } END { exit !found }' "${DIR}/overlays.txt"; then
+		echo "ERROR: ${want} is not in ${DIR}/overlays.txt (OVERLAYS='' compares no pair)" >&2
+		failed=$((failed + 1))
+	fi
+done
+if [ -f "${DIR}/overlays.txt" ]; then
+	while IFS='|' read -r name full diff; do
+		case " ${OVERLAYS} " in *" ${name} "*) ;; *) continue ;; esac
+		echo ">> ${name} (${full} + ${diff})"
+		if [ -z "$(set_files "${full}")" ] || [ -z "$(set_files "${diff}")" ]; then
+			echo "ERROR: ${name}: ${full} or ${diff} is not in sets.txt" >&2
+			failed=$((failed + 1))
+			continue
+		fi
+		stage_set "${full}"
+		full_from="${from}"
+		full_files="${local_files}"
+		stage_set "${diff}"
+		diff_from="${from}"
+		diff_files="${local_files}"
+		moves="$(awk -F'|' 'NR > 2 && NF > 3 { printf ", MOVE N'\''%s'\'' TO N'\''/var/opt/mssql/data/cmp_%d.f'\''", $1, NR }' \
+			"${DIR}/${full}.filelistonly.txt")"
+		if ! restored="$(sql -Q "RESTORE DATABASE cmp FROM ${full_from} WITH REPLACE, NORECOVERY${moves}; RESTORE DATABASE cmp FROM ${diff_from} WITH RECOVERY" 2>&1)"; then
+			echo "ERROR: RESTORE of ${name} failed:" >&2
+			echo "${restored}" | tail -5 >&2
+			failed=$((failed + 1))
+			docker exec -u 0 "${CONTAINER}" sh -c "rm -f '${BAK}'/*"
+			continue
+		fi
+		if python3 -I "${HERE}/compare_rows.py" --duckdb "${DUCKDB}" --diff "${diff_files}" "${full_files}"; then
+			compared=$((compared + 1))
+		else
+			failed=$((failed + 1))
+		fi
+		sql -Q "ALTER DATABASE cmp SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE cmp" >/dev/null
+		docker exec -u 0 "${CONTAINER}" sh -c "rm -f '${BAK}'/*"
+	done <"${DIR}/overlays.txt"
+fi
 
 echo ">> compare_rows: ${compared} sets equal, ${failed} with differences"
 [ "${failed}" = 0 ] && [ "${compared}" -gt 0 ]

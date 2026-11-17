@@ -1,0 +1,116 @@
+# name: test/sql/backup/mssql_backup_diff.test
+# description: a differential laid over its full, diff := (spec 085 task 24, PR 4c)
+# group: [mssql]
+#
+# The committed samples' diff.bak is a differential over full.bak taken after samples.sql's changes:
+# every tenth item updated (price + 1, its name suffixed " (updated)"), every event whose id is a
+# multiple of 7 deleted, 500 items inserted (ids 10001-10500). full_xpress.bak is a copy-only full taken
+# after full.bak: not the differential's base. The oracle lane compares full + differential with
+# RESTORE … WITH NORECOVERY / RECOVERY on diffs.sql's fixture. No SQL Server is needed.
+
+require mssql
+
+# Without diff :=, the full as it is.
+query II
+SELECT count(*), count(*) FILTER (WHERE name LIKE '% (updated)') FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items');
+----
+2000	0
+
+# Over the differential: the updates, the deletes and the inserts.
+query IIII
+SELECT count(*), count(*) FILTER (WHERE name LIKE '% (updated)'), count(*) FILTER (WHERE id > 10000),
+	count(*) FILTER (WHERE id % 10 = 0 AND id <= 2000 AND name NOT LIKE '% (updated)')
+FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items', diff := 'test/data/backup/diff.bak');
+----
+2500	200	500	0
+
+query II
+SELECT count(*), count(*) FILTER (WHERE event_id % 7 = 0) FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'events', diff := 'test/data/backup/diff.bak');
+----
+2572	0
+
+# An updated row: its new values.
+query II
+SELECT name, price FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items') WHERE id = 10;
+----
+item 10 ì	12.50
+
+query II
+SELECT name, price FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items', diff := 'test/data/backup/diff.bak') WHERE id = 10;
+----
+item 10 ì (updated)	13.50
+
+# The listings read the overlay's catalog.
+query T
+SELECT list(table_name || ':' || row_count ORDER BY table_name) FROM mssql_backup_tables('test/data/backup/full.bak', diff := 'test/data/backup/diff.bak');
+----
+['events:2572', 'items:2500']
+
+query I
+SELECT count(*) FROM mssql_backup_columns('test/data/backup/full.bak', diff := 'test/data/backup/diff.bak');
+----
+11
+
+query I
+SELECT count(*) > 0 FROM mssql_backup_catalog('test/data/backup/full.bak', 'sysschobjs', diff := 'test/data/backup/diff.bak');
+----
+true
+
+# As a list of stripes, and as an ATTACH option.
+query I
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items', diff := ['test/data/backup/diff.bak']);
+----
+2500
+
+statement ok
+ATTACH 'test/data/backup/full.bak' AS bd (TYPE mssql_backup, diff 'test/data/backup/diff.bak');
+
+query II
+SELECT count(*), count(*) FILTER (WHERE id > 10000) FROM bd.dbo.items;
+----
+2500	500
+
+query I
+SELECT count(*) FROM (SELECT * FROM bd.dbo.items EXCEPT ALL SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items', diff := 'test/data/backup/diff.bak'));
+----
+0
+
+query I
+SELECT count(*) FROM mssql_backup_scan('bd', 'dbo', 'events');
+----
+2572
+
+# The attached backup's differential is its ATTACH's.
+statement error
+SELECT count(*) FROM mssql_backup_scan('bd', 'dbo', 'items', diff := 'test/data/backup/diff.bak');
+----
+bd is an attached backup: give diff := to its ATTACH
+
+statement ok
+DETACH bd;
+
+# The chain is checked first: refused by name.
+statement error
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full_xpress.bak', 'dbo', 'items', diff := 'test/data/backup/diff.bak');
+----
+is based on backup set
+
+statement error
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items', diff := 'test/data/backup/full_xpress.bak');
+----
+is a full backup, not a differential
+
+statement error
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items', diff := 'test/data/backup/log.trn');
+----
+is a log backup, not a differential
+
+statement error
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/diff.bak', 'dbo', 'items');
+----
+give the full as the path and this one as diff :=
+
+statement error
+ATTACH 'test/data/backup/diff.bak' AS bdx (TYPE mssql_backup);
+----
+give the full as the path and this one as diff :=

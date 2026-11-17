@@ -298,8 +298,12 @@ public:
 	//! A searched pass's "absent" rests on its order, which a search sees only where it looks: with
 	//! `expected` (the page is live, or an allocation page: a full's pass 1 carries every one, E12),
 	//! an answer of absent maps every searched pass by its headers and asks again, so a break the
-	//! search did not see cannot hide a page.
+	//! search did not see cannot hide a page. With a base (SetBase), a page this index's passes do not
+	//! carry is located in the base: `location` is then the base's, for its answer only (ReadPage reads
+	//! through the index that holds the copy).
 	bool Locate(uint16_t file, uint32_t page, PageLocation &location, bool expected = false) const;
+	//! Locate over this index's own passes only, never its base's: whether this backup carries the page.
+	bool LocateOwn(uint16_t file, uint32_t page, PageLocation &location, bool expected = false) const;
 	//! The 8 KB at `page`'s location into `out`: false when no pass carries it (`expected` as for
 	//! Locate). Its header is the caller's to check (a ranked pass may locate a zero unit, E12).
 	bool ReadPage(uint16_t file, uint32_t page, std::vector<uint8_t> &out, bool expected = false) const;
@@ -308,15 +312,26 @@ public:
 		return passes_.size();
 	}
 	//! The most pages the backup can carry: its passes' data, 8 KB a page. An allocation unit cannot
-	//! list more (its extents are allocated, so live, so in pass 1 of a full).
+	//! list more (its extents are allocated, so live, so in pass 1 of a full). A differential's with
+	//! its base's.
 	uint64_t PageCapacity() const {
-		uint64_t pages = 0;
+		uint64_t pages = base_ ? base_->PageCapacity() : 0;
 		for (const auto &p : passes_) {
 			pages += p.data_length / 8192;
 		}
 		return pages;
 	}
-	//! Its `map` is the pass's only while it is not Searched(): a search that gives up replaces it.
+	//! Task 24 (D12): a differential's index over its full's. A page its own passes do not carry is
+	//! the base's latest copy (Locate, ReadPage); its own passes are header-scanned, so their "absent"
+	//! is sure. `base` must outlive this index.
+	void SetBase(const PageIndex *base) {
+		base_ = base;
+	}
+	const PageIndex *Base() const {
+		return base_;
+	}
+	//! This index's own passes (not its base's). Its `map` is the pass's only while it is not
+	//! Searched(): a search that gives up replaces it.
 	const IndexedPass &Pass(size_t i) const {
 		return passes_[i];
 	}
@@ -344,6 +359,7 @@ private:
 	uint64_t id_ = 0;
 	mutable std::vector<IndexedPass> passes_;
 	mutable std::unique_ptr<std::mutex> fallback_lock_;
+	const PageIndex *base_ = nullptr;
 };
 
 //! Every data pass of every family (each MSDA block's MQDA stream), ordered by pass number: a full

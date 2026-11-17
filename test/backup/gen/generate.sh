@@ -7,7 +7,7 @@
 #   OUT=/tmp/bak IMAGE=mcr.microsoft.com/mssql/server:2022-latest test/backup/gen/generate.sh
 #   OUT=/tmp/bak FIXTURES=samples test/backup/gen/generate.sh  # samples.sql only (the committed set)
 #
-# FIXTURES (default "samples catalog partition files load lob large rows dbcs cd names"): samples.sql, the database of the
+# FIXTURES (default "samples catalog partition files load lob large rows dbcs cd names diffs"): samples.sql, the database of the
 # committed samples; catalog.sql, the catalog fixture (spec 085 PR 2b); partition.sql, E7's partitioning
 # database and more boundary types (PR 2c); files.sql, two data files and a second
 # filegroup, then (files_remove.sql) a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
@@ -17,7 +17,9 @@
 # uniquifier, ghosts, row-overflow, added columns of a partitioned table); dbcs.sql, varchar under the
 # double-byte code pages (PR 2d); lob.sql, values stored off row in every form (PR 3: lob_full plain,
 # lob_xpress compressed); cd.sql, ROW-compressed tables (spec 086 PR 1: cd_full plain, cd_xpress compressed); names.sql, a
-# case-sensitive database whose tables differ only in case, and names with spaces, quotes, ] and dots (spec 085 PR 4b). A fixture's backups come with the server's own catalog of them where it holds
+# case-sensitive database whose tables differ only in case, and names with spaces, quotes, ] and dots (spec 085 PR 4b);
+# diffs.sql, a full and a differential over it after E2's changes (spec 085 PR 4c: diffs_full, diffs_diff and
+# diffs_diff_xpress, paired in overlays.txt). A fixture's backups come with the server's own catalog of them where it holds
 # still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).
 #
 # Writes into OUT: the backups, <set>.headeronly.txt / .labelonly.txt / .filelistonly.txt, sets.txt
@@ -33,7 +35,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
-FIXTURES="${FIXTURES:-samples catalog partition files load lob large rows dbcs cd names}"
+FIXTURES="${FIXTURES:-samples catalog partition files load lob large rows dbcs cd names diffs}"
 LARGE_ROWS="${LARGE_ROWS:-530000}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
@@ -150,6 +152,7 @@ scalar() {	# $1 = a query answering one value
 }
 sets=()
 extras=()
+overlays=()	# name|full set|differential set: what compare_rows restores as a pair
 for fixture in ${FIXTURES}; do
 	if [ "${fixture}" = large ]; then
 		# Its 4.4 GB data file beside the others' databases and backups is close to a runner's disk:
@@ -247,6 +250,11 @@ for fixture in ${FIXTURES}; do
 		golden bak_names names_full
 		sets+=("names_full|names_full.bak")
 		;;
+	diffs)
+		# A differential over its full (spec 085 PR 4c), plain and compressed; compare_rows restores each pair.
+		sets+=("diffs_full|diffs_full.bak" "diffs_diff|diffs_diff.bak" "diffs_diff_xpress|diffs_diff_xpress.bak")
+		overlays+=("diffs_over|diffs_full|diffs_diff" "diffs_over_xpress|diffs_full|diffs_diff_xpress")
+		;;
 	*)
 		echo "ERROR: unknown fixture ${fixture}" >&2
 		exit 1
@@ -272,6 +280,10 @@ for entry in "${sets[@]}"; do
 done
 for f in "${extras[@]+"${extras[@]}"}"; do
 	docker cp "${CONTAINER}:${DIR}/${f}" "${OUT}/${f}"
+done
+: >"${OUT}/overlays.txt"
+for entry in "${overlays[@]+"${overlays[@]}"}"; do
+	echo "${entry}" >>"${OUT}/overlays.txt"
 done
 
 echo ">> done: $(wc -l <"${OUT}/sets.txt" | tr -d ' ') sets in ${OUT}"

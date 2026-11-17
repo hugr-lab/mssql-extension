@@ -171,7 +171,8 @@ RowFilter FilterFor(const PageStore &store, const BootstrapTables &tables, const
 
 struct BaseTableBindData : public TableFunctionData {
 	vector<std::string> paths;
-	std::string table;	// "" lists the allow-listed tables
+	vector<std::string> diff;  // task 24
+	std::string table;		   // "" lists the allow-listed tables
 	std::shared_ptr<OpenedCatalog> catalog;
 	RowsetLayout layout;			 // the table's
 	std::vector<size_t> columns;	 // its served columns: layout indexes (not dropped, not the uniquifier)
@@ -181,6 +182,7 @@ struct BaseTableBindData : public TableFunctionData {
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<BaseTableBindData>();
 		copy->paths = paths;
+		copy->diff = diff;
 		copy->table = table;
 		copy->catalog = catalog;
 		copy->layout = layout;
@@ -191,7 +193,7 @@ struct BaseTableBindData : public TableFunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<BaseTableBindData>();
-		return paths == other.paths && table == other.table;
+		return paths == other.paths && diff == other.diff && table == other.table;
 	}
 	//! Every EXECUTE binds again: the file is read at bind.
 	bool SupportStatementCache() const override {
@@ -224,6 +226,7 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 							  vector<Identifier> &names) {
 	auto data = make_uniq<BaseTableBindData>();
 	data->paths = PathsOf(input.inputs[0], FUNCTION);
+	data->diff = DiffPathsOf(input.named_parameters, FUNCTION);
 	if (input.inputs.size() > 1) {
 		if (input.inputs[1].IsNull()) {
 			throw InvalidInputException("%s: the base table is NULL", FUNCTION);
@@ -236,7 +239,8 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	}
 	try {
 		data->catalog =
-			OpenBackupCatalog(context, std::vector<std::string>(data->paths.begin(), data->paths.end()), false);
+			OpenBackupCatalog(context, std::vector<std::string>(data->paths.begin(), data->paths.end()), false,
+							  CatalogScope(), std::vector<std::string>(data->diff.begin(), data->diff.end()));
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", FUNCTION, e.what());
 	}
@@ -532,6 +536,7 @@ void RegisterBackupCatalogFunction(ExtensionLoader &loader) {
 				arguments.push_back(LogicalType::VARCHAR);
 			}
 			TableFunction f(FUNCTION, arguments, Execute, Bind, Init);
+			AddDiffParameter(f);
 			f.projection_pushdown = true;
 			f.get_virtual_columns = VirtualColumns;
 			set.AddFunction(f);

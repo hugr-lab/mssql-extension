@@ -38,8 +38,10 @@ BoundFile::BoundFile(uint64_t backup, size_t number, std::string path, uint64_t 
 
 const FileBinding &BoundFile::Binding() const {
 	for (const BindFiles *scope = innermost; scope; scope = scope->previous_) {
-		if (scope->binding_.backup == backup_) {
-			return scope->binding_;
+		for (const FileBinding *b = &scope->binding_; b; b = b->also) {
+			if (b->backup == backup_) {
+				return *b;
+			}
 		}
 	}
 	if (own_) {
