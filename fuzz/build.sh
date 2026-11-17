@@ -130,7 +130,7 @@ TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn login_respon
 # whole space-separated words, so a stray separator or a typo would otherwise build fewer harnesses
 # than asked, green.
 TARGETS="$(printf '%s %s' "${TARGETS}" "${TARGETS_EXTRA:-}" | tr ',\n\r\t' '    ')"
-KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob "
+KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob variant_envelope "
 for t in ${TARGETS}; do
 	if [[ "${KNOWN_TARGETS}" != *" ${t} "* ]]; then
 		echo "ERROR: unknown fuzz target '${t}' in TARGETS / TARGETS_EXTRA (known:${KNOWN_TARGETS})" >&2
@@ -176,6 +176,17 @@ if want code_page; then
 		"${REPO}/src/codec/code_page/code_page_avx512.cpp" \
 		"${REPO}/src/codec/code_page/code_page_tables.cpp")"
 	build_harness fuzz_code_page fuzz_code_page.cc ${CP_OBJS}
+fi
+
+# 5b'. A sql_variant value's TDS envelope as a DuckDB VARIANT payload (spec 093 T1): standalone like
+#      code_page, whose decoders it calls for a code-page string. Not a default target (the per-PR
+#      budget is the TDS layer's); the weekly run fuzzes it through .clusterfuzzlite/extra_targets.
+if want variant_envelope; then
+	ensure_simdutf
+	VE_OBJS="$(compile_objs ve "${REPO}/src/codec/variant/variant_envelope.cpp" "${REPO}/src/codec/code_page/code_page.cpp" \
+		"${REPO}/src/codec/code_page/code_page_avx2.cpp" "${REPO}/src/codec/code_page/code_page_avx512.cpp" \
+		"${REPO}/src/codec/code_page/code_page_tables.cpp")"
+	build_harness fuzz_variant_envelope fuzz_variant_envelope.cc ${VE_OBJS}
 fi
 
 # 5c. The backup reader (spec 085): the MTF walk and header fields, the MSSQLBAK container (chain,
@@ -341,7 +352,7 @@ fi
 
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---
 for t in browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode \
-	backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob; do
+	backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob variant_envelope; do
 	# Only the corpora of the targets this build makes: OSS-Fuzz pairs a zip with its binary.
 	want "${t}" || continue
 	if [[ -d "${HERE}/corpus/${t}" ]]; then

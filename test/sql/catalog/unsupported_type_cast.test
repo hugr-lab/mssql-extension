@@ -1,11 +1,12 @@
 # name: test/sql/catalog/unsupported_type_cast.test
-# description: Test that unsupported SQL Server types (hierarchyid, sql_variant) are auto-CAST to NVARCHAR(MAX)
+# description: Test that a SQL Server type with no client decoder (hierarchyid) is auto-CAST to NVARCHAR(MAX) beside a sql_variant read as VARIANT
 # group: [mssql]
 #
-# When a column uses a SQL Server type that has no native TDS decoder (e.g., hierarchyid,
-# sql_variant, geometry, CLR UDTs), the extension maps it to VARCHAR in the catalog and
-# wraps it with CAST([col] AS NVARCHAR(MAX)) in the pushdown SELECT to ensure SQL Server
-# sends text instead of the native wire format.
+# When a column uses a SQL Server type that has no native TDS decoder (hierarchyid, CLR
+# UDTs), the extension maps it to VARCHAR in the catalog and wraps it with
+# CAST([col] AS NVARCHAR(MAX)) in the pushdown SELECT to ensure SQL Server sends text instead
+# of the native wire format. A sql_variant is read bare as a VARIANT since spec 093 T1; it
+# renders here as its value's text.
 #
 # REQUIRES: SQL Server running with TestDB initialized
 # Run with: make integration-test
@@ -49,7 +50,7 @@ SELECT mssql_refresh_cache('mssql_cast');
 # Test: SELECT columns with unsupported types — should return VARCHAR data
 # =============================================================================
 
-# Test 1: Select all columns — unsupported types come back as text
+# Test 1: Select all columns — hierarchyid comes back as text, the sql_variant as a VARIANT
 query ITT
 SELECT * FROM mssql_cast.dbo.UnsupportedTypeCast ORDER BY id;
 ----

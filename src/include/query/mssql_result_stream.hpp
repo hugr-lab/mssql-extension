@@ -19,6 +19,10 @@ namespace tds {
 class ConnectionPool;
 }  // namespace tds
 
+//! The extra-info key of a statement's server error (an InvalidInputException): the SQL Server
+//! error numbers of the statement, decimal, comma-separated, in the order they came (issue #570).
+static constexpr const char *MSSQL_SERVER_ERROR_NUMBERS = "mssql_server_error_numbers";
+
 //===----------------------------------------------------------------------===//
 // MSSQLResultStream - Streaming result iterator that yields DataChunks
 //===----------------------------------------------------------------------===//
@@ -163,8 +167,9 @@ public:
 	void SurfaceWarnings(ClientContext &context);
 
 	//! A warning the stream found while filling a chunk and has not logged yet (spec 093 D8: a
-	//! datetime2 value read as NULL for not fitting TIMESTAMP_NS). A scan's Execute asks after every
-	//! FillChunk and calls SurfaceWarnings when it is true, so a query that stops early still says it.
+	//! datetime2 value read as NULL for not fitting TIMESTAMP_NS; T1: a sql_variant value read as its
+	//! bytes). A scan's Execute asks after every FillChunk and calls SurfaceWarnings when it is true,
+	//! so a query that stops early still says it.
 	bool HasPendingWarnings() const {
 		return warnings_pending_;
 	}
@@ -262,6 +267,10 @@ private:
 	//! RefuseOutOfRangeIn's columns and table (issue #559).
 	std::vector<bool> refuse_out_of_range_;
 	std::string refuse_table_;
+	//! Spec 093 T1: per column, whether its sql_variant values read as bytes were logged; and the
+	//! per-value path's counts (ProcessRow: target vectors, e.g. a composite rowid), beside the stager's.
+	std::vector<bool> variant_notes_warned_;
+	std::vector<mssql::codec::variant::VariantColumnNotes> row_variant_notes_;
 	bool is_catalog_scan_ = false;
 
 	// Statistics

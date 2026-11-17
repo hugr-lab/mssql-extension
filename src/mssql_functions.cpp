@@ -726,6 +726,7 @@ static bool StreamCanProduce(const LogicalType &declared) {
 	case LogicalTypeId::TIMESTAMP_NS:
 	case LogicalTypeId::TIMESTAMP_TZ:
 	case LogicalTypeId::UUID:
+	case LogicalTypeId::VARIANT:  // a sql_variant (spec 093 T1)
 		return true;
 	default:
 		return false;

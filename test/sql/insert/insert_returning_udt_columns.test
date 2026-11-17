@@ -65,16 +65,24 @@ SELECT * FROM mssql_scan('retu', 'SELECT id, g.STAsText() AS wkt FROM dbo.RetUdt
 ----
 2	POINT (3 4)
 
-# --- a sql_variant column comes back as its text form, the same as a catalog
-# scan gives.
-query III
+# --- a sql_variant column comes back as a VARIANT of its base type, as a catalog scan reads it
+# (spec 093 T1); writing one is spec 093 T2, refused by name until then.
+statement ok
+SELECT mssql_exec('retu', 'INSERT INTO dbo.RetUdt (v, n) VALUES (CAST(N''hello'' AS nvarchar(10)), 9)');
+
+query IIII
+UPDATE retu.dbo.RetUdt SET n = 10 WHERE n = 9 RETURNING id, variant_typeof(v), v::VARCHAR, n;
+----
+3	VARCHAR	hello	10
+
+statement error
 INSERT INTO retu.dbo.RetUdt (v, n) VALUES ('hello', 9) RETURNING id, v, n;
 ----
-3	hello	9
+a VARIANT value cannot be written to SQL Server yet
 
 # --- RETURNING * takes the whole width, which is what the OUTPUT clause always
 # built. The types are the catalog's: GEOMETRY for the spatial column, VARCHAR
-# for the two the scan casts.
+# for the hierarchyid the scan casts, VARIANT for the sql_variant.
 query IIIII
 INSERT INTO retu.dbo.RetUdt (n) VALUES (11) RETURNING id, ST_AsText(g), h, v, n;
 ----

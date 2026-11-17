@@ -206,20 +206,43 @@ for spatial data until that is fixed.
 
 ### Other Server-Specific Types
 
-`SQL_VARIANT`, `hierarchyid` and CLR UDT columns are read as text by the catalog
-scan, so three-part-name queries return a `VARCHAR`. A `SQL_VARIANT` value is
-converted by its own base type, which the column does not fix: a `float` or `real`
-with all 17 digits (`1.0000000000000001e-001`), a `money` with its four decimals,
-the date and time types as ISO 8601 with every fraction digit
-(`2026-09-16T10:11:12.1234567`), a `binary` or `varbinary` as `0x` hex, the rest
-as their plain text. A filter on any of these columns runs in DuckDB, on that
-text: SQL Server would compare the value as its own type, so `WHERE v = '5'` there
-finds an `nvarchar` `'5'` and not an `int` 5, which both read as `5`. Raw
-`mssql_scan()` queries that select such columns without a conversion fail: convert
-them in the T-SQL. A plain `CAST(col AS NVARCHAR(MAX))` of a `SQL_VARIANT` is the
-lossy form above (style 0); `CONVERT(NVARCHAR(MAX), col, 126)` keeps a date or time
-whole and `CONVERT(NVARCHAR(MAX), col, 3)` a float, as the catalog read does for
-each value.
+A `SQL_VARIANT` column is a DuckDB `VARIANT`, through the catalog and a raw `mssql_scan()`
+alike: each value keeps its own base type, read off the wire with no conversion on the
+server.
+
+| base type | inside the `VARIANT` |
+|---|---|
+| `bit` / `tinyint` / `smallint` / `int` / `bigint` | `BOOLEAN` / `UTINYINT` / `SMALLINT` / `INTEGER` / `BIGINT` |
+| `real` / `float` | `FLOAT` / `DOUBLE` |
+| `decimal(p,s)` / `numeric(p,s)` | `DECIMAL(p,s)` |
+| `money` / `smallmoney` | `DECIMAL(19,4)` / `DECIMAL(10,4)` |
+| `date` | `DATE` |
+| `time(0-6)` / `time(7)` | `TIME` / `TIME_NS` (every 100 ns tick) |
+| `datetime2(0)` / `(1-3)` / `(4-6)` / `(7)` | `TIMESTAMP_S` / `TIMESTAMP_MS` / `TIMESTAMP` / `TIMESTAMP_NS` (outside 1677-2262 `TIMESTAMP`, the 100 ns digit dropped) |
+| `datetime` / `smalldatetime` | `TIMESTAMP` |
+| `datetimeoffset(0-6)` / `(7)` | `TIMESTAMPTZ` / `TIMESTAMPTZ` in nanoseconds inside 1677-2262 -- the UTC instant; the offset is not kept |
+| `uniqueidentifier` | `UUID` |
+| `binary` / `varbinary` | `BLOB` (a `binary(n)` with its padding) |
+| `char` / `varchar` | `VARCHAR`, converted from the value's own collation (any code page, UTF-8 included); `char(n)` trimmed of trailing spaces |
+| `nchar` / `nvarchar` | `VARCHAR`; `nchar(n)` trimmed |
+
+`variant_typeof(v)` names a value's type (`INT32`, `DECIMAL(9, 2)`, `TIME_NANOS`, ...), and
+`v::INTEGER`, `v::VARCHAR` and the like convert it. A `varchar` under a collation this build has no
+code page for -- one newer than the extension --, or under a UTF-8 collation with bytes that are not
+UTF-8, is the value's bytes, a `BLOB` inside the `VARIANT`, with a `WARNING` in `duckdb_logs`
+naming the column. What a `VARIANT` cannot say -- decimal
+vs numeric, money vs decimal, the datetime types apart, varchar vs nvarchar, the collation, the
+declared length -- is not kept.
+
+A filter on the column runs in DuckDB, over the `VARIANT`: SQL Server compares a `sql_variant` by its
+base type in an order of its own, so `WHERE v = 5` finds the `int` 5 and `WHERE v = '5'` the string
+`'5'`, in DuckDB as on the server. Such a column is never a row key. Writing a `VARIANT` into SQL
+Server comes with a later release: an `INSERT` / `UPDATE` / `COPY` / CTAS of one is refused by name
+(a `NULL` is written as before); write such values with `mssql_exec()`.
+
+`hierarchyid` and CLR UDT columns are read as text by the catalog scan, so three-part-name queries
+return a `VARCHAR`; a raw `mssql_scan()` that selects one without a conversion fails: convert it in
+the T-SQL.
 
 ### Catalog-Reported String Types
 
