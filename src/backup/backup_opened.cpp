@@ -5,11 +5,16 @@
 #include "backup/backup_xpress.hpp"
 #include "backup/backup_zstd.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/time.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/client_context.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <map>
 
 namespace duckdb {
@@ -201,6 +206,41 @@ static void FillHeaders(OpenedHeaders *opened, const StatementFiles &files) {
 						  std::to_string(computed));
 	}
 	families = std::move(ordered);
+}
+
+BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::string> &paths) {
+	OpenedHeaders opened;
+	opened.own_files.reset(
+		new StatementFiles(context, ByteSource::Open(context, vector<std::string>(paths.begin(), paths.end()))));
+	opened.own_binding.reset(new FileBinding());
+	const auto &source = opened.own_files->Source();
+	opened.id = NextBackupId();
+	for (size_t i = 0; i < source.FileCount(); i++) {
+		BackupFileKey key;
+		key.path = source.Path(i);
+		key.size = source.FileSize(i);
+		key.version = source.VersionTag(i);
+		opened.files.push_back(std::move(key));
+	}
+	*opened.own_binding = IdentityBinding(opened, *opened.own_files);
+	std::vector<HistoryFamily> families;
+	for (size_t i = 0; i < opened.files.size(); i++) {
+		try {
+			HistoryFamily family;
+			family.path = opened.Path(i);
+			family.size = opened.files[i].size;
+			family.version_tag = opened.files[i].version;
+			family.set = OpenFamily(opened, i)->set;
+			families.push_back(std::move(family));
+		} catch (FormatError &e) {
+			const std::string &path = opened.Path(i);
+			if (std::string(e.what()).find(path) != std::string::npos) {
+				throw;
+			}
+			throw FormatError("backup file \"" + path + "\": " + e.what());
+		}
+	}
+	return BuildHistory(std::move(families));
 }
 
 std::unique_ptr<OpenedHeaders> ReadBackupHeaders(const StatementFiles &files) {
@@ -532,10 +572,146 @@ static OpenedForStatement OpenAttached(ClientContext &context, const AttachedBac
 static OpenedForStatement OpenBackupFiles(ClientContext &context, const std::vector<std::string> &paths,
 										  const std::vector<std::string> &diff);
 
-OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::string> &paths,
-							  const std::vector<std::string> &diff) {
+void CheckVersionFiles(const OpenedBackup &opened, const BackupHistory &history, const HistoryVersion &version,
+					   const std::string &name) {
+	const OpenedBackup *full = opened.Base() ? opened.Base().get() : &opened;
+	auto check = [&](const OpenedBackup &backup, const HistoryBackup &expected) {
+		const auto &headers = backup.Headers();
+		for (size_t i = 0; i < expected.paths.size(); i++) {
+			bool same = headers.Set().backup_set_guid.bytes == expected.set.backup_set_guid.bytes;
+			bool found = false;
+			for (const auto &key : headers.files) {
+				if (key.path == expected.paths[i]) {
+					found = true;
+					same = same && key.size == expected.sizes[i] && key.version == expected.version_tags[i];
+				}
+			}
+			if (!found || !same) {
+				throw InvalidInputException(
+					"mssql backup: the file \"%s\" of %s changed since it was attached (its "
+					"size, modification time or backup set): DETACH %s and ATTACH it again",
+					expected.paths[i], name, name);
+			}
+		}
+	};
+	check(*full, history.backups[version.full]);
+	if (version.IsDifferential()) {
+		check(opened, history.backups[version.diff]);
+	}
+}
+
+uint64_t ResolveVersion(const BackupHistory &history, optional_ptr<ClientContext> context, const BackupAt &at,
+						const std::string &what) {
+	const uint64_t latest = history.versions.back().number;
+	if (!at.IsSet()) {
+		return latest;
+	}
+	const std::string unit = StringUtil::Lower(at.unit);
+	if (unit != "version" && unit != "timestamp") {
+		throw BinderException("%s: AT (%s => …) names no version of a backup history (VERSION or TIMESTAMP)", what,
+							  at.unit);
+	}
+	if (at.value.IsNull()) {
+		throw BinderException("%s: %s NULL names no version", what, unit);
+	}
+	if (unit == "version") {
+		// A whole number: 1.6 or '2.5' names no version (a string, as DuckLake's METADATA_PARAMETERS sends
+		// one, when it reads as one).
+		int64_t number = 0;
+		if (at.value.type().IsIntegral()) {
+			number = at.value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+		} else {
+			const auto as_double = at.value.DefaultTryCastAs(LogicalType::DOUBLE);
+			const double d = as_double ? as_double->GetValue<double>() : 0.5;
+			if (d != std::floor(d) || d < -9e18 || d > 9e18) {
+				throw BinderException("%s: VERSION %s is not a version number (a whole number, 1 the first)", what,
+									  at.value.ToString());
+			}
+			number = static_cast<int64_t>(d);
+		}
+		if (number < 1 || static_cast<uint64_t>(number) > latest) {
+			throw BinderException("%s has versions 1 to %llu, not %lld (mssql_backup_snapshots lists them)", what,
+								  (unsigned long long)latest, (long long)number);
+		}
+		return static_cast<uint64_t>(number);
+	}
+	// The backups' times are the server's local time, as RESTORE HEADERONLY gives them: compared as a
+	// TIMESTAMP (a TIMESTAMPTZ cast to one in the session's time zone).
+	const Value cast =
+		context ? at.value.CastAs(*context, LogicalType::TIMESTAMP) : at.value.DefaultCastAs(LogicalType::TIMESTAMP);
+	const timestamp_t when = cast.GetValue<timestamp_t>();
+	if (when == timestamp_t::infinity()) {
+		return latest;
+	}
+	const auto &first = history.Last(history.versions.front()).set.backup_finish_date;
+	if (!when.IsFinite()) {
+		throw BinderException("%s: no version finished by %s (the first finished at %s)", what, cast.ToString(),
+							  first.ToString());
+	}
+	date_t day;
+	dtime_t time;
+	Timestamp::Convert(when, day, time);
+	int32_t year, month, mday, hour, minute, second, micros;
+	Date::Convert(day, year, month, mday);
+	Time::Convert(time, hour, minute, second, micros);
+	MtfDate by;
+	by.year = year;
+	by.month = month;
+	by.day = mday;
+	by.hour = hour;
+	by.minute = minute;
+	by.second = second;
+	const HistoryVersion *found = history.FinishedBy(by);
+	if (!found) {
+		throw BinderException("%s: no version finished by %s (the first finished at %s)", what, cast.ToString(),
+							  first.ToString());
+	}
+	return found->number;
+}
+
+BackupAt BackupAtOf(const named_argument_map_t &named, const char *function) {
+	BackupAt at;
+	for (const auto &kv : named) {
+		if ((kv.first != "version" && kv.first != "as_of") || kv.second.IsNull()) {
+			continue;
+		}
+		if (at.IsSet()) {
+			throw BinderException("%s: version := and as_of := name a version twice: give one", function);
+		}
+		at.unit = kv.first == "version" ? "version" : "timestamp";
+		at.value = kv.second;
+	}
+	return at;
+}
+
+void AddVersionParameters(TableFunction &function) {
+	function.GetSignature().AddKeywordOnly("version", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	function.GetSignature().AddKeywordOnly("as_of", LogicalType::TIMESTAMP, Value(LogicalType::TIMESTAMP));
+}
+
+//! The full and differential paths of the version `at` names in the history of the files on `paths`.
+static void PathsOfVersion(ClientContext &context, std::vector<std::string> &paths, std::vector<std::string> &diff,
+						   const BackupAt &at) {
+	if (!diff.empty()) {
+		throw BinderException(
+			"mssql backup: version := / as_of := pick a version of the files' history: diff := "
+			"does not go beside them");
+	}
+	const auto history = ReadBackupHistory(context, paths);
+	const auto number = ResolveVersion(history, context, at, "the backups \"" + paths.front() + "\"");
+	const auto &version = history.versions[number - 1];
+	paths = history.backups[version.full].paths;
+	if (version.IsDifferential()) {
+		diff = history.backups[version.diff].paths;
+	}
+}
+
+OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::string> &paths_p,
+							  const std::vector<std::string> &diff_p, const BackupAt &at) {
+	std::vector<std::string> paths = paths_p;
+	std::vector<std::string> diff = diff_p;
 	if (paths.size() == 1) {
-		auto attached = FindAttachedBackup(context, paths.front());
+		auto attached = FindAttachedBackup(context, paths.front(), at);
 		if (attached) {
 			if (!diff.empty()) {
 				throw InvalidInputException("mssql backup: %s is an attached backup: give diff := to its ATTACH",
@@ -543,6 +719,9 @@ OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::str
 			}
 			return OpenAttached(context, *attached);
 		}
+	}
+	if (at.IsSet()) {
+		PathsOfVersion(context, paths, diff, at);
 	}
 	return OpenBackupFiles(context, paths, diff);
 }
@@ -643,11 +822,13 @@ std::unique_ptr<OpenedCatalog> OpenAttachedCatalog(ClientContext &context, const
 	return catalog;
 }
 
-std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths,
+std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths_p,
 												 bool with_model, const CatalogScope &scope,
-												 const std::vector<std::string> &diff) {
+												 const std::vector<std::string> &diff_p, const BackupAt &at) {
+	std::vector<std::string> paths = paths_p;
+	std::vector<std::string> diff = diff_p;
 	if (paths.size() == 1) {
-		auto attached = FindAttachedBackup(context, paths.front());
+		auto attached = FindAttachedBackup(context, paths.front(), at);
 		if (attached) {
 			if (!diff.empty()) {
 				throw InvalidInputException("mssql backup: %s is an attached backup: give diff := to its ATTACH",
@@ -655,6 +836,9 @@ std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const s
 			}
 			return OpenAttachedCatalog(context, *attached);
 		}
+	}
+	if (at.IsSet()) {
+		PathsOfVersion(context, paths, diff, at);
 	}
 	std::unique_ptr<OpenedCatalog> catalog(new OpenedCatalog());
 	catalog->opened = OpenBackupFiles(context, paths, diff);

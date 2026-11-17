@@ -822,6 +822,12 @@ be told.
   (`Catalog::SupportsTimeTravel`, the AT clause reaching `LookupEntry`). A state's overlay (task 24) is
   built at its first query and cached.
 - DQ-47's change functions take two versions or timestamps of the history, as `ducklake_table_changes`.
+- Owner, 2026-11-17 (on PR 4c-2's plan): new backups are taken in by attaching again, not by a glob
+  expanded on every statement (a LIST of an object store per query); a version's number is its
+  position among the files, stable while backups are only added, and a time or the files is what an
+  importer keeps; a copy-only full is a version (no differential lies over it); and, as DuckLake's,
+  `bk.snapshots()` beside `mssql_backup_snapshots('bk')`, with `snapshot_version` / `snapshot_time` on
+  the ATTACH for the version read without AT.
 - The grain is the backups': a daily full and hourly differentials give a state an hour. A point
   between them needs log backups, whose replay stays out (090 replays a backup's own tail only). A
   database restored, recreated or on another fork breaks the history there: the versions on either

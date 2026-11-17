@@ -1,0 +1,270 @@
+# name: test/sql/backup/mssql_backup_history.test
+# description: a history of backups, its versions and time travel (spec 085 task 24b, PR 4c-2, DQ-48)
+# group: [mssql]
+#
+# The committed samples are one database's backups, all finished within two seconds: full.bak (a full),
+# four copy-only fulls taken after it (full_xpress, full_zstd, the stripes), diff.bak (a differential over
+# full.bak: 500 items inserted, every event with an id divisible by 7 deleted) and log.trn (a log backup,
+# left out). Ordered by finish, then checkpoint LSN. The order of states with a restore between them, a
+# differential without its full and a stripe missing a family are test_backup_history.cpp's. No SQL
+# Server is needed.
+
+require mssql
+
+# The files' history, each read for its header only.
+query IITTTT
+SELECT snapshot_id, snapshot_time = max(snapshot_time) OVER (), backup_type, is_copy_only, is_default,
+       full_files::VARCHAR || coalesce(' + ' || diff_files::VARCHAR, '')
+FROM mssql_backup_snapshots('test/data/backup/*.bak') ORDER BY snapshot_id;
+----
+1	false	full	false	false	[test/data/backup/full.bak]
+2	true	full	true	false	[test/data/backup/full_xpress.bak]
+3	true	full	true	false	[test/data/backup/full_zstd.bak]
+4	true	full	true	false	[test/data/backup/stripe_1.bak, test/data/backup/stripe_2.bak]
+5	true	full	true	false	[test/data/backup/stripe_zstd_1.bak, test/data/backup/stripe_zstd_2.bak]
+6	true	differential	false	true	[test/data/backup/full.bak] + [test/data/backup/diff.bak]
+
+query TTT
+SELECT backup_set_guid::VARCHAR, differential_base_guid::VARCHAR, history_break FROM mssql_backup_snapshots('test/data/backup/*.bak') WHERE snapshot_id IN (1, 6) ORDER BY snapshot_id;
+----
+71111bc0-b06c-4d1a-9655-20fffb61d2ea	NULL	false
+84bf2a5c-092c-4a6f-bbf7-3b6330da71b3	71111bc0-b06c-4d1a-9655-20fffb61d2ea	false
+
+# A log backup is no state; with no full among the files there is none.
+statement error
+SELECT * FROM mssql_backup_snapshots('test/data/backup/log.trn');
+----
+no full backup among them
+
+statement error
+SELECT * FROM mssql_backup_snapshots('test/data/backup/README.md');
+----
+not an MTF backup file
+
+# ATTACH … history true: every backup the glob names, as one catalog's versions.
+statement ok
+ATTACH 'test/data/backup/*.[bt][ar][kn]' AS h (TYPE mssql_backup, history true);
+
+query IT
+SELECT snapshot_id, backup_type FROM h.snapshots() WHERE is_default;
+----
+6	differential
+
+query I
+SELECT count(*) FROM h.snapshots();
+----
+6
+
+# Without AT the latest state; AT picks one, by number or by the time it finished.
+query II
+SELECT (SELECT count(*) FROM h.dbo.items), (SELECT count(*) FROM h.items AT (VERSION => 1));
+----
+2500	2000
+
+query I
+SELECT count(*) FROM h.dbo.events AT (TIMESTAMP => TIMESTAMP '2026-11-09 22:35:29.9');
+----
+3000
+
+query I
+SELECT count(*) FROM h.dbo.events AT (TIMESTAMP => TIMESTAMP '2026-11-09 22:35:30');
+----
+2572
+
+query I
+SELECT count(*) FROM h.dbo.events AT (TIMESTAMP => 'infinity'::TIMESTAMP);
+----
+2572
+
+# Two versions in one query: what the differential added.
+query I
+SELECT count(*) FROM (SELECT id FROM h.items EXCEPT SELECT id FROM h.items AT (VERSION => 1));
+----
+500
+
+statement error
+SELECT count(*) FROM h.items AT (VERSION => 7);
+----
+has versions 1 to 6, not 7
+
+statement error
+SELECT count(*) FROM h.items AT (VERSION => 0);
+----
+has versions 1 to 6, not 0
+
+statement error
+SELECT count(*) FROM h.items AT (VERSION => 1.6);
+----
+is not a version number
+
+query I
+SELECT count(*) FROM h.items AT (VERSION => '1');
+----
+2000
+
+# A TIMESTAMPTZ is taken in the session's time zone (UTC without ICU, as here).
+query I
+SELECT count(*) FROM h.dbo.events AT (TIMESTAMP => TIMESTAMPTZ '2026-11-09 22:35:29+00');
+----
+3000
+
+# Prepared: the versions are read again on every EXECUTE.
+statement ok
+PREPARE versions AS SELECT count(*) FROM mssql_backup_snapshots('h');
+
+statement ok
+ATTACH OR REPLACE 'test/data/backup/full.bak' AS h (TYPE mssql_backup);
+
+query I
+EXECUTE versions;
+----
+1
+
+statement ok
+ATTACH OR REPLACE 'test/data/backup/*.[bt][ar][kn]' AS h (TYPE mssql_backup, history true);
+
+query I
+EXECUTE versions;
+----
+6
+
+statement error
+SELECT count(*) FROM h.items AT (TIMESTAMP => TIMESTAMP '2026-11-09 22:35:28');
+----
+no version finished by 2026-11-09 22:35:28
+
+# The file functions on the name: its default version, or the one version := / as_of := names.
+query II
+SELECT (SELECT row_count FROM mssql_backup_tables('h') WHERE table_name = 'items'),
+       (SELECT row_count FROM mssql_backup_tables('h', version := 1) WHERE table_name = 'items');
+----
+2500	2000
+
+query I
+SELECT count(*) FROM mssql_backup_scan('h', 'dbo', 'items', as_of := TIMESTAMP '2026-11-09 22:35:29');
+----
+2000
+
+query T
+SELECT backup_type FROM mssql_backup_info('h', version := 2);
+----
+full
+
+statement error
+SELECT count(*) FROM mssql_backup_scan('h', 'dbo', 'items', version := 1, as_of := TIMESTAMP '2026-11-09 22:35:29');
+----
+name a version twice
+
+# … and on files, a version of their history, no ATTACH.
+query I
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/*.bak', 'dbo', 'items', version := 6);
+----
+2500
+
+query I
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/*.bak', 'dbo', 'items', as_of := TIMESTAMP '2026-11-09 22:35:29');
+----
+2000
+
+statement error
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items', diff := 'test/data/backup/diff.bak', version := 1);
+----
+diff := does not go beside them
+
+# snapshot_version / snapshot_time (DuckLake's): the version read without AT.
+statement ok
+ATTACH 'test/data/backup/*.bak' AS h1 (TYPE mssql_backup, history true, snapshot_version 1);
+
+query II
+SELECT (SELECT count(*) FROM h1.items), (SELECT count(*) FROM h1.items AT (VERSION => 6));
+----
+2000	2500
+
+query I
+SELECT snapshot_id FROM h1.snapshots() WHERE is_default;
+----
+1
+
+statement ok
+ATTACH 'test/data/backup/*.bak' AS h2 (TYPE mssql_backup, history 'true', snapshot_time '2026-11-09 22:35:29');
+
+query I
+SELECT count(*) FROM h2.items;
+----
+2000
+
+statement error
+ATTACH 'test/data/backup/*.bak' AS h3 (TYPE mssql_backup, history true, snapshot_version 1, snapshot_time '2026-11-09 22:35:29');
+----
+name the default version twice
+
+statement error
+ATTACH 'test/data/backup/*.bak' AS h3 (TYPE mssql_backup, history true, snapshot_version 9);
+----
+has versions 1 to 6, not 9
+
+statement error
+ATTACH 'test/data/backup/full.bak' AS h3 (TYPE mssql_backup, history true, diff 'test/data/backup/diff.bak');
+----
+diff does not go beside history
+
+# Without history the backup attached is a history of its own: the full, and the full with its
+# differential.
+statement ok
+ATTACH 'test/data/backup/full.bak' AS fd (TYPE mssql_backup, diff 'test/data/backup/diff.bak');
+
+query ITT
+SELECT snapshot_id, backup_type, is_default FROM fd.snapshots() ORDER BY 1;
+----
+1	full	false
+2	differential	true
+
+query II
+SELECT (SELECT count(*) FROM fd.items), (SELECT count(*) FROM fd.items AT (VERSION => 1));
+----
+2500	2000
+
+statement ok
+ATTACH 'test/data/backup/full.bak' AS f1 (TYPE mssql_backup);
+
+query I
+SELECT count(*) FROM f1.items AT (VERSION => 1);
+----
+2000
+
+statement error
+SELECT count(*) FROM f1.items AT (VERSION => 2);
+----
+has versions 1 to 1, not 2
+
+# The filters apply to every version.
+statement ok
+ATTACH 'test/data/backup/*.bak' AS hf (TYPE mssql_backup, history true, table_filter '^events$');
+
+statement error
+SELECT count(*) FROM hf.items AT (VERSION => 1);
+----
+does not exist
+
+query I
+SELECT count(*) FROM hf.events AT (VERSION => 1);
+----
+3000
+
+statement ok
+DETACH h;
+
+statement ok
+DETACH h1;
+
+statement ok
+DETACH h2;
+
+statement ok
+DETACH fd;
+
+statement ok
+DETACH f1;
+
+statement ok
+DETACH hf;

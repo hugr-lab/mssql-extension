@@ -1545,6 +1545,36 @@ before the next opens.
     statement's files of the full to its own base (`OpenOverlay`), and the base is weighed with it
     (`TakeStages`); `PageIndex::LocateOwn` answers "does this backup carry the page" for a file marked
     removed and an allocation page past a shrunk file, never the base.
+24b. A history of backups and time travel over it (DQ-48) — 2 d. As built (PR 4c-2): `ReadBackupHistory`
+    reads each file's header (`OpenFamily`, nothing past it) and `BuildHistory` (`backup_history`,
+    DuckDB-free) groups the families by backup set GUID, leaves out (named, a WARNING at ATTACH) a log
+    backup, a differential whose full is not among the files and a stripe missing a family, refuses
+    files of two databases (family GUID) and no full, and orders the states -- each full (copy-only
+    included), each differential over its full -- by finish then checkpoint LSN, numbered 1..N;
+    `history_break` where the recovery fork changes. `ATTACH … (history true)` makes the catalog's
+    versions those; without it the backup attached is its own history (a full: 1; a full and its `diff`:
+    the full, then the overlay). `MSSQLBackupCatalog::SupportsTimeTravel`: `LookupSchema` reads the AT
+    clause (`EntryLookupInfo::GetAtClause`, carried to the schema lookup) and answers with that version's
+    schema entries, each version its own `AttachedBackup` and entries, built at its first lookup outside
+    the catalog's lock and kept (the default version's at ATTACH; `snapshot_version` / `snapshot_time`
+    choose it, DuckLake's options). `ResolveVersion`: VERSION a number, TIMESTAMP the last version
+    finished by it (whole seconds, the backups' local time; a TIMESTAMPTZ cast in the session's zone).
+    `mssql_backup_snapshots(name | paths)` lists the versions, and each schema answers `snapshots()` as a
+    table macro over it (DuckLake's `db.snapshots()`). The file functions take `version :=` / `as_of :=`
+    over a name (`FindAttachedBackup(…, at)`) or over files (their history read, the version's full and
+    differential opened); the scan serialises it, and an AT scan of an entry carries its version number
+    (`AttachedBackup::version`). Tests: `test/sql/backup/mssql_backup_history.test` (the committed samples:
+    six versions, a log left out), `test_backup_history` (a restore between states, a differential
+    without its full, a stripe missing a family, two databases, states within one second). DQ-47's change
+    functions over it are 4c-3. Not done: the headers are read one file after another (a month of hourly
+    differentials on `s3://` is ~750 short reads at ATTACH). Review of the change: a copy of a file (one backup set and family twice) is read once; a
+    stripe's families must be 1..n; one database name with another family GUID is the database
+    recreated, a `history_break`, not a refusal; a version opened after the ATTACH is checked against
+    the history's files (`HistoryBackup::sizes` / `version_tags`, `CheckVersionFiles`); VERSION takes a
+    whole number only; a version the catalog lacks is an error under the search path too, as DuckLake's
+    (DuckDB does not tell a catalog named explicitly from one of the search path). Also not done: the
+    file functions' `version :=` over files reads every header on every call, and a version's state is
+    held until DETACH, outside the cache's eviction.
 25. `s3://` (MinIO) and `https://` tests in the lane; measure the open pass and decide filter pushdown
     with late materialisation (a follow-up spec if it is worth it) — 2 d. Owner, 2026-11-11: the
     scan is to make filtering cheap enough for an importer that exports a table with a filter over

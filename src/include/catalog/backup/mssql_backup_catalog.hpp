@@ -9,6 +9,10 @@
 // for GetCatalogType() == "mssql"). One schema entry per schema of the model, one table entry per user
 // table (views are not entries: T-SQL is not DuckDB SQL); a table entry's scan is mssql_backup_scan on
 // the catalog's AttachedBackup. The file functions take the catalog's name in place of a path.
+// Task 24b (PR 4c-2, DQ-48): the catalog has a history -- the versions of a set of backups, `history
+// true`, or of the one it attached (a full, and a full with its differential) -- and AT (VERSION / TIMESTAMP)
+// picks one: each version its own schema and table entries over its own AttachedBackup, built at its
+// first lookup (the default one at ATTACH).
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -21,21 +25,30 @@
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 namespace duckdb {
 
 class MSSQLBackupSchemaEntry;
 
-//! The catalog of an attached backup. Built whole at ATTACH (the model, its schemas and tables), never
-//! changed after: no lock is needed to read it.
+//! The catalog of an attached backup. Each version's entries are built whole (the model, its schemas
+//! and tables) at its first lookup and never changed after; the versions are kept for the catalog's life.
 class MSSQLBackupCatalog : public Catalog {
 public:
 	static constexpr const char *TYPE = "mssql_backup";
+	//! How a version's backup is opened for the catalog (the ATTACH's name and filters).
+	using Opener = std::function<std::shared_ptr<const mssql::backup::AttachedBackup>(
+		ClientContext &, const mssql::backup::HistoryVersion &)>;
 
-	MSSQLBackupCatalog(AttachedDatabase &db, std::shared_ptr<const mssql::backup::AttachedBackup> backup);
+	//! `default_version`: the version read without AT, `default_backup` its backup, opened by the ATTACH.
+	MSSQLBackupCatalog(AttachedDatabase &db, std::string name,
+					   std::shared_ptr<const mssql::backup::BackupHistory> history, uint64_t default_version,
+					   std::shared_ptr<const mssql::backup::AttachedBackup> default_backup, Opener opener);
 	~MSSQLBackupCatalog() override;
 
 	void Initialize(bool load_builtin) override;
@@ -43,6 +56,9 @@ public:
 		return TYPE;
 	}
 	optional<Identifier> GetDefaultSchema() const override;
+	bool SupportsTimeTravel() const override {
+		return true;
+	}
 
 	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction, const EntryLookupInfo &schema_lookup,
 												  OnEntryNotFound if_not_found) override;
@@ -70,12 +86,23 @@ public:
 		return true;
 	}
 
-	const mssql::backup::AttachedBackup &Backup() const {
-		return *backup_;
+	const mssql::backup::BackupHistory &History() const {
+		return *history_;
 	}
-	std::shared_ptr<const mssql::backup::AttachedBackup> SharedBackup() const {
-		return backup_;
+	std::shared_ptr<const mssql::backup::BackupHistory> SharedHistory() const {
+		return history_;
 	}
+	uint64_t DefaultVersion() const {
+		return default_version_;
+	}
+	const std::string &Name() const {
+		return name_;
+	}
+	//! The version an AT clause names -- `unit` VERSION (a number) or TIMESTAMP (the last version finished
+	//! by it) --, the default one when `unit` is empty. A BinderException naming the catalog otherwise.
+	uint64_t VersionAt(optional_ptr<ClientContext> context, const std::string &unit, const Value &value) const;
+	//! The backup of `version`, opened now when it was not.
+	std::shared_ptr<const mssql::backup::AttachedBackup> BackupOf(ClientContext &context, uint64_t version);
 
 	//! A refusal of anything but a read, naming the catalog (DuckDB's read-only check comes first; this is
 	//! what is left for the paths it does not cover: INSERT, UPDATE, DELETE, MERGE, TRUNCATE are planned
@@ -83,14 +110,37 @@ public:
 	[[noreturn]] void RefuseWrite() const;
 
 private:
-	std::shared_ptr<const mssql::backup::AttachedBackup> backup_;
-	std::map<std::string, unique_ptr<MSSQLBackupSchemaEntry>> schemas_;
+	struct State {
+		std::shared_ptr<const mssql::backup::AttachedBackup> backup;
+		std::map<std::string, unique_ptr<MSSQLBackupSchemaEntry>> schemas;
+	};
+	//! The entries of `version`, built now when they are not: opened outside the lock (two lookups may
+	//! open one version together; the first kept).
+	State &StateOf(optional_ptr<ClientContext> context, uint64_t version);
+	unique_ptr<State> MakeState(std::shared_ptr<const mssql::backup::AttachedBackup> backup);
+	State &DefaultState() const {
+		return *states_[default_version_ - 1];
+	}
+
+	std::string name_;
+	std::shared_ptr<const mssql::backup::BackupHistory> history_;
+	uint64_t default_version_;
+	Opener opener_;
+	std::mutex lock_;
+	std::vector<unique_ptr<State>> states_;	 // by version - 1
 };
 
-//! A schema of the backup: its user tables the ATTACH's filters keep.
+//! A schema of one version of the backup: its user tables the ATTACH's filters keep, and `snapshots()`
+//! (DuckLake's form: `FROM bk.snapshots()` is `mssql_backup_snapshots('bk')`).
 class MSSQLBackupSchemaEntry : public SchemaCatalogEntry {
 public:
-	MSSQLBackupSchemaEntry(MSSQLBackupCatalog &catalog, CreateSchemaInfo &info);
+	MSSQLBackupSchemaEntry(MSSQLBackupCatalog &catalog, CreateSchemaInfo &info,
+						   std::shared_ptr<const mssql::backup::AttachedBackup> backup);
+
+	//! The backup of the version this schema is of.
+	const std::shared_ptr<const mssql::backup::AttachedBackup> &Backup() const {
+		return backup_;
+	}
 
 	void AddTable(const mssql::backup::CatalogTable &table);
 
@@ -118,7 +168,9 @@ public:
 private:
 	MSSQLBackupCatalog &BackupCatalog() const;
 
+	std::shared_ptr<const mssql::backup::AttachedBackup> backup_;
 	std::map<std::string, unique_ptr<CatalogEntry>> tables_;
+	unique_ptr<CatalogEntry> snapshots_;
 };
 
 //! A user table of the backup: its columns as mssql_backup_scan reads them, D8's virtual columns, and

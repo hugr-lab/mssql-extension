@@ -446,6 +446,7 @@ enum class Listing : uint8_t { Tables, Views, Schemas, Columns };
 struct CatalogListBindData : public TableFunctionData {
 	vector<std::string> paths;
 	vector<std::string> diff;  // task 24
+	BackupAt at;			   // task 24b
 	Listing listing = Listing::Tables;
 	//! mssql_backup_columns' optional schema and table: only that schema's (that table's) columns.
 	bool by_schema = false;
@@ -460,6 +461,7 @@ struct CatalogListBindData : public TableFunctionData {
 		auto copy = make_uniq<CatalogListBindData>();
 		copy->paths = paths;
 		copy->diff = diff;
+		copy->at = at;
 		copy->listing = listing;
 		copy->by_schema = by_schema;
 		copy->by_table = by_table;
@@ -470,8 +472,10 @@ struct CatalogListBindData : public TableFunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<CatalogListBindData>();
-		return paths == other.paths && diff == other.diff && listing == other.listing && by_schema == other.by_schema &&
-			   by_table == other.by_table && schema == other.schema && table == other.table && scope == other.scope;
+		return paths == other.paths && diff == other.diff && at.unit == other.at.unit &&
+			   (!at.IsSet() || at.value == other.at.value) && listing == other.listing &&
+			   by_schema == other.by_schema && by_table == other.by_table && schema == other.schema &&
+			   table == other.table && scope == other.scope;
 	}
 	bool Wants(const CatalogTable &t) const {
 		return (!by_schema || t.schema_name == schema) && (!by_table || t.name == table);
@@ -507,6 +511,7 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	data->listing = L;
 	data->paths = PathsOf(input.inputs[0], FunctionName(L));
 	data->diff = DiffPathsOf(input.named_parameters, FunctionName(L));
+	data->at = BackupAtOf(input.named_parameters, FunctionName(L));
 	if (L == Listing::Columns && input.inputs.size() > 1) {
 		data->by_schema = true;
 		data->schema = NameArgument(input.inputs[1], "schema");
@@ -689,7 +694,7 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 	try {
 		state->catalog =
 			OpenBackupCatalog(context, std::vector<std::string>(data.paths.begin(), data.paths.end()), true, data.scope,
-							  std::vector<std::string>(data.diff.begin(), data.diff.end()));
+							  std::vector<std::string>(data.diff.begin(), data.diff.end()), data.at);
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", FunctionName(data.listing), e.what());
 	}
@@ -746,6 +751,7 @@ void Register(ExtensionLoader &loader, const char *description, std::vector<std:
 	auto add = [&](vector<LogicalType> args) {
 		TableFunction f(FunctionName(L), std::move(args), Execute, Bind<L>, Init);
 		AddDiffParameter(f);
+		AddVersionParameters(f);
 		f.pushdown_complex_filter = PushdownNames<L>;
 		f.to_string = ScopeToString;
 		set.AddFunction(std::move(f));

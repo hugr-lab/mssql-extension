@@ -18,12 +18,15 @@
 #include "backup/backup_catalog_model.hpp"
 #include "backup/backup_container.hpp"
 #include "backup/backup_files.hpp"
+#include "backup/backup_history.hpp"
 #include "backup/backup_mtf.hpp"
 #include "backup/backup_open_pass.hpp"
 #include "backup/backup_page.hpp"
 #include "backup/backup_set.hpp"
 #include "backup/backup_source.hpp"
 #include "backup/backup_system_tables.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
 #include <atomic>
@@ -218,6 +221,8 @@ struct OpenedForStatement {
 //! schemas filtered too. The file functions take its name in place of a path and read through it.
 struct AttachedBackup {
 	std::string name;
+	//! Its version in the catalog's history (task 24b), 1..N; 0 when not set.
+	uint64_t version = 0;
 	shared_ptr<OpenedBackup> backup;
 	std::string cache_key;	// the ObjectCache's, empty when not cached
 	std::shared_ptr<const CatalogModel> model;
@@ -229,8 +234,36 @@ struct AttachedBackup {
 	}
 };
 
-//! The backup attached as `name` (a catalog of TYPE mssql_backup), or none. [the catalog layer]
-std::shared_ptr<const AttachedBackup> FindAttachedBackup(ClientContext &context, const std::string &name);
+//! A version of a history (task 24b, DQ-48), as AT names one: `unit` "version" (a number) or "timestamp"
+//! (the last version finished by it); none when `unit` is empty -- the default version.
+struct BackupAt {
+	std::string unit;
+	Value value;
+	bool IsSet() const {
+		return !unit.empty();
+	}
+};
+
+//! The version `at` names in `history` (the latest when none). A BinderException naming `what` when
+//! there is none: a number out of range, a time before the first version finished, another unit.
+uint64_t ResolveVersion(const BackupHistory &history, optional_ptr<ClientContext> context, const BackupAt &at,
+						const std::string &what);
+
+//! `opened`, the backup of `version` opened after the history was read, is the history's: the same
+//! files (path, size, version tag) and backup sets. An InvalidInputException naming the file and the
+//! catalog `name` otherwise.
+void CheckVersionFiles(const OpenedBackup &opened, const BackupHistory &history, const HistoryVersion &version,
+					   const std::string &name);
+
+//! The file functions' `version :=` / `as_of :=` (an attached backup's or a set of files' version).
+BackupAt BackupAtOf(const named_argument_map_t &named, const char *function);
+//! Those keyword parameters, on a function's signature.
+void AddVersionParameters(TableFunction &function);
+
+//! The backup attached as `name` (a catalog of TYPE mssql_backup), or none: its version `at` names, its
+//! default version when none. [the catalog layer]
+std::shared_ptr<const AttachedBackup> FindAttachedBackup(ClientContext &context, const std::string &name,
+														 const BackupAt &at = BackupAt());
 
 //! The backup on `paths` opened for an ATTACH as `name`: OpenBackup's shared stages (the ObjectCache's
 //! entry when there is one, never another attached backup's name) and the model of the tables and views
@@ -250,8 +283,11 @@ std::shared_ptr<AttachedBackup> OpenAttachedBackup(
 //! `diff` (task 24, D12): a differential to lay over the full on `paths` -- the families of one
 //! differential backup; its chain checked first (CheckDifferentialBase). Its ObjectCache entry holds
 //! the full's, keyed by both backups' files.
+//! `at` (task 24b): a version of the attached backup's history, or of the files' (ReadBackupHistory over
+//! `paths`, the version's full and differential then opened as above); not beside `diff`.
 OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::string> &paths,
-							  const std::vector<std::string> &diff = std::vector<std::string>());
+							  const std::vector<std::string> &diff = std::vector<std::string>(),
+							  const BackupAt &at = BackupAt());
 
 //! D12's chain: `diff` is a differential whose base is `full`'s backup set, of the same database, and
 //! `full` a full backup. A FormatError naming both files otherwise.
@@ -283,7 +319,8 @@ struct OpenedCatalog {
 //! backup's is its own model, built at its ATTACH (`with_model` and `scope` do not apply).
 std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths,
 												 bool with_model = true, const CatalogScope &scope = CatalogScope(),
-												 const std::vector<std::string> &diff = std::vector<std::string>());
+												 const std::vector<std::string> &diff = std::vector<std::string>(),
+												 const BackupAt &at = BackupAt());
 //! The catalog of `attached` for one statement: its files opened again and checked, its model.
 std::unique_ptr<OpenedCatalog> OpenAttachedCatalog(ClientContext &context, const AttachedBackup &attached);
 
@@ -295,6 +332,11 @@ std::unique_ptr<OpenedCatalog> OpenAttachedCatalog(ClientContext &context, const
 std::unique_ptr<OpenedHeaders> ReadBackupHeaders(const StatementFiles &files);
 //! `files`' binding to `headers` (each of the backup's files to the statement file of its path).
 FileBinding BindingFor(const OpenedHeaders &headers, const StatementFiles &files);
+
+//! The history of the backups on `paths` (task 24b, DQ-48): each file's header read, and nothing else --
+//! no page, no index -- ordered into versions (BuildHistory). FormatError naming the file that is not a
+//! backup this reader takes (encrypted, appended sets, …), or files of two databases.
+BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::string> &paths);
 
 //! A backup opened for one call (the tests, and nothing cached): ReadBackupHeaders over files opened
 //! from `paths`, which the headers keep (own_files) and read through on any thread.
