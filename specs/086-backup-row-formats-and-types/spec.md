@@ -302,10 +302,11 @@ replay and leak-check lanes, the weekly run), the fixture `cd.sql` (every type a
 table and an uncompressed twin, 31 / 60 / 129 / 300 columns, off-row and row-overflow values, a ROW
 heap with forwarded rows, the uniquifier, ghosts, added columns, keys of a bit, a datetime, a
 decimal and an nvarchar, a ROW partition beside plain ones, a PAGE partition refused, nullable char /
-binary under ANSI_PADDING OFF, rowversion, sql_variant / xml / hierarchyid / geometry, and row
-versioning -- tagged rows, ghosts, version ghosts, a forwarded heap) compared with RESTORE on 2022
-(`compare_rows`: 21 tables, 1,760 rows, 0 failures, plain and MS_XPRESS; the four twins equal,
-`_mssql_rid` included) and the catalog (`compare_catalog`: 9,560 fields, 0 differences).
+binary under ANSI_PADDING OFF, rowversion, sql_variant / xml / hierarchyid / geometry, text / ntext /
+image, and row versioning -- tagged rows, ghosts, version ghosts, a forwarded heap) compared with RESTORE on 2022
+(`compare_rows`: 23 tables, 1,768 rows, 0 failures, plain and MS_XPRESS; the five twins equal,
+`_mssql_rid` included, and each column projected alone, the `needed` path) and the catalog
+(`compare_catalog`: 9,690 fields, 0 differences).
 `partition.sql`'s ROW partition is read since (33 tables, 0 failures). Measured on 1M rows of six
 columns, one thread: a ROW table's scan 0.27 s against 0.10 s uncompressed, one bigint of it 0.11 s
 against 0.04 s (only the columns a scan reads are put in their uncompressed form).

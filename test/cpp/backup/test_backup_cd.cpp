@@ -281,6 +281,29 @@ int main() {
 			  "a column past the record's count: its default");
 	}
 
+	{
+		// Review of #569: `needed` -- a column not needed is located only (its bytes as stored), the
+		// others converted; a column past the vector's end counts as not needed.
+		OnPage p(Hex(Record(2, "81")));	 // id = 3, v = 1 (one byte, the sign bit flipped)
+		RowsetLayout layout;
+		layout.table = "t";
+		layout.compression = 1;
+		layout.columns.push_back(Column("id", XTYPE_INT, -1));
+		layout.columns.push_back(Column("v", XTYPE_INT, -2));
+		const auto hex = [](const ValueRef &r) { return ToHex(r.data, r.size); };
+		CdRow row;
+		const std::vector<bool> only_v = {false, true};
+		row.Read(p.record, layout, &only_v);
+		Check(row.Value(0).state == ValueState::Inline && hex(row.Value(0)) == "83" && hex(row.Value(1)) == "01000000",
+			  "needed v only: v converted, id located as stored");
+		const std::vector<bool> only_id = {true};
+		row.Read(p.record, layout, &only_id);
+		Check(hex(row.Value(0)) == "03000000" && row.Value(1).state == ValueState::Inline && hex(row.Value(1)) == "81",
+			  "needed id only (v past the vector): id converted, v located as stored");
+		row.Read(p.record, layout);
+		Check(hex(row.Value(0)) == "03000000" && hex(row.Value(1)) == "01000000", "no `needed`: every column converted");
+	}
+
 	// Malformed records: named, never read past.
 	Check(Throws([] { OnPage p(Hex("010222838100000080"), 3); }, "runs past"), "a record past its limit");
 	Check(Throws([] { OnPage p(Hex("0102d2838100000080")); }, "CD code 13"), "a CD code no value has");

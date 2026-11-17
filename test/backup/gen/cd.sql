@@ -8,7 +8,8 @@
 -- nvarchar; a partitioned table with one partition ROW-compressed beside uncompressed ones, and one
 -- with a PAGE-compressed partition (refused by name until spec 086 PR 2); Unicode compression (SCSU)
 -- over several scripts; nullable char / binary under ANSI_PADDING OFF; rowversion, sql_variant, xml,
--- hierarchyid and geometry in a ROW record; and, last, row versioning (version tags, version ghosts).
+-- hierarchyid and geometry in a ROW record; text / ntext / image (their text pointers) in a ROW record; and,
+-- last, row versioning (version tags, version ghosts).
 SET NOCOUNT ON;
 GO
 DBCC TRACEON (661, -1);	-- no ghost cleanup: deleted rows stay as ghosts
@@ -194,6 +195,17 @@ INSERT INTO dbo.stored_row VALUES (3, CAST(123.45 AS decimal(9, 2)), NULL, '/1/2
 INSERT INTO dbo.stored_row VALUES (4, CAST('2026-11-16' AS datetime), NULL, NULL, NULL);
 SELECT * INTO dbo.stored_plain FROM dbo.stored_row;
 ALTER TABLE dbo.stored_plain ADD CONSTRAINT pk_stored_plain PRIMARY KEY (id);
+-- text / ntext / image in a ROW record (review of #569): the value's 16-byte text pointer stands in the
+-- row, a NULL, an empty, a short and a value past a page each, beside the uncompressed twin.
+CREATE TABLE dbo.textptr_row (id int NOT NULL PRIMARY KEY, tx text NULL, ntx ntext NULL, im image NULL)
+	WITH (DATA_COMPRESSION = ROW);
+INSERT INTO dbo.textptr_row VALUES (1, NULL, NULL, NULL);
+INSERT INTO dbo.textptr_row VALUES (2, '', N'', 0x);
+INSERT INTO dbo.textptr_row VALUES (3, 'abc', N'жук', 0x0102);
+INSERT INTO dbo.textptr_row VALUES (4, REPLICATE(CAST('t' AS varchar(max)), 9000), REPLICATE(CAST(N'ж' AS nvarchar(max)), 5000),
+ CAST(REPLICATE(CAST('i' AS varchar(max)), 9000) AS varbinary(max)));
+SELECT * INTO dbo.textptr_plain FROM dbo.textptr_row;
+ALTER TABLE dbo.textptr_plain ADD CONSTRAINT pk_textptr_plain PRIMARY KEY (id);
 GO
 -- 12. Row versioning (RCSI): every record written from here on carries a 14-byte version tag; updated rows,
 -- ghosts of a clustered table, version ghosts of a heap, forwarded rows of a heap.

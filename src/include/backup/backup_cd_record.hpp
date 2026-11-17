@@ -101,8 +101,9 @@ public:
 	//! precision, a truncated SCSU sequence) is a FormatError naming the column.
 	//! `needed` (by layout index; null: every column): the columns whose values are read. Another column
 	//! is located only -- its value stays as stored, and a complex one is OffRow as any -- so a query of
-	//! a few columns does not pay for the others' decoding (measured: a 1M-row scan of one bigint of
-	//! six columns, 0.27 s against 0.04 s uncompressed before).
+	//! a few columns does not pay for the others' decoding (measured on 1M rows of six columns, one
+	//! thread: the whole ROW table 0.27 s against 0.10 s uncompressed; one bigint of it, with `needed`,
+	//! 0.11 s against 0.04 s).
 	void Read(const CdRecord &record, const RowsetLayout &layout, const std::vector<bool> *needed = nullptr);
 
 	const ValueRef &Value(size_t k) const {
