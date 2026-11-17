@@ -37,6 +37,21 @@ static int GetDebugLevel() {
 
 namespace duckdb {
 
+//! A statement's server errors as the user's error: the message the first one's, as it always was, and
+//! the numbers of all of them, in order, in the exception's extra info (MSSQL_SERVER_ERROR_NUMBERS) for a
+//! caller that answers some of them (issue #570: a catalog scan's 207 / 208, and the 4413 after them when
+//! the object read is a view).
+[[noreturn]] static void ThrowServerError(const std::vector<tds::TdsError> &errors) {
+	string numbers;
+	for (const auto &e : errors) {
+		numbers += (numbers.empty() ? "" : ",") + std::to_string(e.number);
+	}
+	const auto &err = errors[0];
+	throw InvalidInputException(
+		{{MSSQL_SERVER_ERROR_NUMBERS, numbers}},
+		StringUtil::Format("SQL Server error [%d, severity %d]: %s", err.number, err.severity, err.message));
+}
+
 //===----------------------------------------------------------------------===//
 // MSSQLResultStream Implementation
 //===----------------------------------------------------------------------===//
@@ -226,9 +241,7 @@ bool MSSQLResultStream::Initialize() {
 				// Check for errors accumulated from previous ERROR tokens
 				if (!errors_.empty()) {
 					state_ = MSSQLResultStreamState::Error;
-					auto &err = errors_[0];
-					throw InvalidInputException("SQL Server error [%d, severity %d]: %s", err.number, err.severity,
-												err.message);
+					ThrowServerError(errors_);
 				}
 				// If more results follow, continue looking for COLMETADATA
 				if (!done.IsFinal()) {
@@ -371,9 +384,7 @@ idx_t MSSQLResultStream::FillChunk(DataChunk &chunk) {
 				// Error indicated in DONE token
 				state_ = MSSQLResultStreamState::Error;
 				if (!errors_.empty()) {
-					auto &err = errors_[0];
-					throw InvalidInputException("SQL Server error [%d, severity %d]: %s", err.number, err.severity,
-												err.message);
+					ThrowServerError(errors_);
 				}
 				throw InvalidInputException("SQL Server returned error status");
 			}
