@@ -4,6 +4,7 @@
 #include "backup/backup_info_function.hpp"
 #include "backup/backup_scan_function.hpp"
 #include "backup/backup_tables_function.hpp"
+#include "catalog/backup/mssql_backup_catalog.hpp"
 #include "catalog/mssql_preload_catalog.hpp"
 #include "catalog/mssql_refresh_function.hpp"
 #include "codec/target_string_type.hpp"
@@ -179,6 +180,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// 2. Register storage extension (ATTACH TYPE mssql)
 	RegisterMSSQLStorageExtension(loader);
+	RegisterMSSQLBackupStorageExtension(loader);
 
 	// 3. Register table functions
 	RegisterMSSQLFunctions(loader);

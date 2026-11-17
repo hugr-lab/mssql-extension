@@ -29,6 +29,11 @@ def ident(s):
     return '"' + s.replace('"', '""') + '"'
 
 
+def tsql_ident(s):
+    # A T-SQL bracketed name: ] doubled (names.sql's dbo.[q]]t'x]).
+    return "[" + s.replace("]", "]]") + "]"
+
+
 class Session:
     def __init__(self, binary, port, password, database):
         self.binary = binary
@@ -125,7 +130,7 @@ def main():
                 status = "DIFF"
                 failures.append(f"{where}: _mssql_rid is not one per row ({rid if not ok else rid[0]['rids']})")
             elif t["shape"] == "heap":
-                loc_sql = f"SELECT CAST(%%physloc%% AS varbinary(8)) AS loc FROM [{schema}].[{table}]"
+                loc_sql = f"SELECT CAST(%%physloc%% AS varbinary(8)) AS loc FROM {tsql_ident(schema)}.{tsql_ident(table)}"
                 physloc = f"mssql_scan('srv', {sql_string(loc_sql)})"
                 ok, rid = session.query(
                     f"SELECT (SELECT count(*) FROM (SELECT _mssql_rid FROM {scan} EXCEPT ALL "
@@ -141,8 +146,8 @@ def main():
             # present at least for each row the server holds a value of more than 8,000 bytes in (no such
             # value fits in a row).
             readable = [c["name"] for c in columns if c["decodable"]]
-            long_sql = (f"SELECT count(*) AS n FROM [{schema}].[{table}] WHERE " +
-                        " OR ".join(f"DATALENGTH([{c}]) > 8000" for c in readable)) if readable else None
+            long_sql = (f"SELECT count(*) AS n FROM {tsql_ident(schema)}.{tsql_ident(table)} WHERE " +
+                        " OR ".join(f"DATALENGTH({tsql_ident(c)}) > 8000" for c in readable)) if readable else None
             ok, lob = session.query(f"SELECT count(*) AS n, count(_mssql_lob) AS maps FROM {scan}")
             ok_long, long_rows = (session.query(f"SELECT n FROM mssql_scan('srv', {sql_string(long_sql)})")
                                   if long_sql else (True, [{"n": 0}]))

@@ -49,6 +49,7 @@ LogicalType ColumnStructType() {
 	child_list_t<LogicalType> f;
 	f.emplace_back("column_id", LogicalType::INTEGER);
 	f.emplace_back("name", LogicalType::VARCHAR);
+	f.emplace_back("duckdb_name", LogicalType::VARCHAR);
 	f.emplace_back("sql_type", LogicalType::VARCHAR);
 	f.emplace_back("type_schema", LogicalType::VARCHAR);
 	f.emplace_back("system_type_id", LogicalType::INTEGER);
@@ -138,9 +139,10 @@ std::vector<Column> SchemaColumns() {
 std::vector<Column> ColumnColumns() {
 	return {{"schema_name", LogicalType::VARCHAR}, {"table_name", LogicalType::VARCHAR},
 			{"column_id", LogicalType::INTEGER},   {"column_name", LogicalType::VARCHAR},
-			{"sql_type", LogicalType::VARCHAR},	   {"type_schema", LogicalType::VARCHAR},
-			{"system_type", LogicalType::VARCHAR}, {"duckdb_type", LogicalType::VARCHAR},
-			{"state", LogicalType::VARCHAR},	   {"reason", LogicalType::VARCHAR}};
+			{"duckdb_name", LogicalType::VARCHAR}, {"sql_type", LogicalType::VARCHAR},
+			{"type_schema", LogicalType::VARCHAR}, {"system_type", LogicalType::VARCHAR},
+			{"duckdb_type", LogicalType::VARCHAR}, {"state", LogicalType::VARCHAR},
+			{"reason", LogicalType::VARCHAR}};
 }
 
 std::vector<Column> ViewColumns() {
@@ -224,6 +226,7 @@ Value ColumnValue(const CatalogColumn &c) {
 	child_list_t<Value> f;
 	f.emplace_back("column_id", Value::INTEGER(c.column_id));
 	f.emplace_back("name", Text(c.name));
+	f.emplace_back("duckdb_name", Text(c.DuckDBName()));
 	f.emplace_back("sql_type", Text(SqlTypeText(c.type_name, c.system_type_name, c.system_type_id, c.max_length,
 												c.precision, c.scale)));
 	f.emplace_back("type_schema", OptionalText(c.type_schema));
@@ -428,7 +431,7 @@ std::vector<Value> ViewRow(const PageStore &store, const CatalogModel &model, co
 std::vector<Value> ColumnRow(const CatalogTable &t, const CatalogColumn &c) {
 	const ColumnReading reading = ReadingOf(c);
 	const ColumnState state = StateOf(t, c);
-	return {Text(t.schema_name), Text(t.name), Value::INTEGER(c.column_id), Text(c.name),
+	return {Text(t.schema_name), Text(t.name), Value::INTEGER(c.column_id), Text(c.name), Text(c.DuckDBName()),
 			Text(SqlTypeText(c.type_name, c.system_type_name, c.system_type_id, c.max_length, c.precision, c.scale)),
 			OptionalText(c.type_schema),
 			// The system type underneath, declared (an alias type's base: Name -> nvarchar(50)); NULL for a
@@ -693,7 +696,7 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	const auto &data = input.bind_data->Cast<CatalogListBindData>();
 	auto &state = input.global_state->Cast<CatalogListState>();
 	BindFiles bound(state.catalog->Binding());	// a view's off-row definition is read here
-	const CatalogModel &model = state.catalog->model;
+	const CatalogModel &model = state.catalog->Model();
 	if (data.listing == Listing::Columns) {
 		idx_t count = 0;
 		while (state.next < model.tables.size() && count < STANDARD_VECTOR_SIZE) {

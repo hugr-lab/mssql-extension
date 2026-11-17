@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "backup/backup_opened.hpp"
+#include "backup/backup_scan_function.hpp"
 #include "duckdb.hpp"
 #include "mssql_extension.hpp"
 
@@ -77,7 +78,7 @@ int main() {
 		Check(Fetches(*second) < Fetches(*first),
 			  "the second open reads less: the headers, pages and base tables are not read again (" +
 				  std::to_string(Fetches(*first)) + " fetches, then " + std::to_string(Fetches(*second)) + ")");
-		Check(first->model.tables.size() == second->model.tables.size() && !second->model.tables.empty(),
+		Check(first->Model().tables.size() == second->Model().tables.size() && !second->Model().tables.empty(),
 			  "the second open's model lists the same tables");
 		Check(first->opened.files.get() != second->opened.files.get(), "each open has its own files");
 	}
@@ -132,7 +133,7 @@ int main() {
 		Check(before->opened.backup.get() != after->opened.backup.get() &&
 				  before->opened.cache_key != after->opened.cache_key,
 			  "a file whose version tag changed is opened anew, never trusted");
-		Check(after->model.tables.size() == before->model.tables.size(), "and reads as before");
+		Check(after->Model().tables.size() == before->Model().tables.size(), "and reads as before");
 		std::filesystem::remove_all(dir);
 	}
 
@@ -204,6 +205,68 @@ int main() {
 		auto catalog = OpenBackupCatalog(context, {DIR + "full_xpress.bak"});
 		Check(info.backup.get() == catalog->opened.backup.get(),
 			  "mssql_backup_info's open and a catalog's share one entry");
+	}
+
+	{
+		// Task 23: an attached backup's name is the backup; every statement takes the model its ATTACH
+		// built and the page lists its scans walked, and opens its own files.
+		con.Query("ATTACH '" + DIR + "full.bak' AS bk (TYPE mssql_backup)");
+		auto a = OpenBackupCatalog(context, {"bk"});
+		auto b = OpenBackupCatalog(context, {"bk"});
+		Check(a->opened.backup.get() == b->opened.backup.get() && a->model.get() == b->model.get() &&
+				  a->unit_pages && a->unit_pages == b->unit_pages,
+			  "two statements on an attached backup share its opened backup, model and page lists");
+		Check(a->opened.files.get() != b->opened.files.get(), "and open their own files");
+		const CatalogTable *items = a->Model().FindTable("dbo", "items");
+		uint64_t in_row = 0;
+		if (items) {
+			for (const auto &u : items->units) {
+				if (u.unit.type == 1) {
+					in_row = u.unit.auid;
+				}
+			}
+		}
+		Check(ScalarInt(con, "SELECT count(*) FROM bk.dbo.items") == 2000, "a scan of the attached table");
+		bool walked = false;
+		auto pages = a->unit_pages->Get(in_row, [&walked]() {
+			walked = true;
+			return std::vector<PagePointer>();
+		});
+		Check(in_row != 0 && !walked && pages && !pages->empty(),
+			  "its in-row unit's pages are kept: a later scan walks no IAM chain");
+		// Pinned by the catalog, whatever the cache setting: an ATTACH made with it off is opened once.
+		con.Query("SET mssql_backup_cache = false");
+		con.Query("ATTACH '" + DIR + "full_xpress.bak' AS bx (TYPE mssql_backup)");
+		auto c = OpenBackupCatalog(context, {"bx"});
+		auto d = OpenBackupCatalog(context, {"bx"});
+		Check(c->opened.backup.get() == d->opened.backup.get(), "with mssql_backup_cache off, the ATTACH's backup");
+		con.Query("SET mssql_backup_cache = true");
+		con.Query("DETACH bk");
+		con.Query("DETACH bx");
+	}
+
+	{
+		// A case-sensitive database's columns that differ only in case are read under a suffix no column of
+		// the table has, never refused; spaces and quotes stay as they are.
+		CatalogTable t;
+		t.schema_name = "dbo";
+		t.name = "cs";
+		const char *names[] = {"Id", "ID", "id", "my col", "Other \"Col\"", "ID_1"};
+		int32_t id = 1;
+		for (const char *n : names) {
+			CatalogColumn c;
+			c.column_id = id++;
+			c.name = n;
+			c.system_type_id = 56;	// int
+			c.type_name = c.system_type_name = "int";
+			c.max_length = 4;
+			t.columns.push_back(c);
+		}
+		AssignDuckDBNames(t.columns);
+		const auto columns = ScanColumnsOf(t);
+		const std::vector<std::string> want = {"Id", "ID_2", "id_3", "my col", "Other \"Col\"", "ID_1"};
+		Check(std::vector<std::string>(columns.names.begin(), columns.names.end()) == want,
+			  "columns that differ only in case read as Id, ID_2, id_3: a real column ID_1 keeps its name");
 	}
 
 	if (failures) {

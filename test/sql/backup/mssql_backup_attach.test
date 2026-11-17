@@ -1,0 +1,265 @@
+# name: test/sql/backup/mssql_backup_attach.test
+# description: ATTACH … (TYPE mssql_backup) over the committed samples (spec 085 task 23, PR 4b)
+# group: [mssql]
+#
+# A backup attached as a read-only catalog: its schemas and user tables as entries, read by the same
+# scan as mssql_backup_scan; every write refused; schema_filter / table_filter as TYPE mssql's; the file
+# functions take the catalog's name in place of a path. No SQL Server is needed.
+
+require mssql
+
+statement ok
+ATTACH 'test/data/backup/full.bak' AS bk (TYPE mssql_backup);
+
+query TTT
+SELECT database_name, readonly, type FROM duckdb_databases() WHERE database_name = 'bk';
+----
+bk	true	mssql_backup
+
+query TTI
+SELECT schema_name, table_name, column_count FROM duckdb_tables() WHERE database_name = 'bk' ORDER BY ALL;
+----
+dbo	events	4
+dbo	items	7
+
+# The entries' columns are the scan's.
+query I
+SELECT list(data_type ORDER BY column_index) = (SELECT list(column_type) FROM (DESCRIBE SELECT * FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items')))
+FROM duckdb_columns() WHERE database_name = 'bk' AND table_name = 'items';
+----
+true
+
+# The rows are the file function's, D8's virtual columns included.
+query I
+SELECT count(*) FROM (SELECT *, _mssql_rid FROM bk.dbo.items EXCEPT ALL SELECT *, _mssql_rid FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'items'));
+----
+0
+
+query II
+SELECT count(*), count(DISTINCT _mssql_page) > 1 FROM bk.dbo.events;
+----
+3000	true
+
+# dbo is the default schema; USE works.
+query I
+SELECT count(*) FROM bk.items;
+----
+2000
+
+statement ok
+USE bk;
+
+query I
+SELECT count(*) FROM items i JOIN events e ON e.item_id = i.id;
+----
+3000
+
+statement ok
+USE memory;
+
+# A missing table or schema is DuckDB's "does not exist".
+statement error
+SELECT * FROM bk.dbo.nosuch;
+----
+does not exist
+
+statement error
+SELECT * FROM bk.nosuch.items;
+----
+does not exist
+
+# Read-only, whatever the options say: every write is refused.
+statement error
+CREATE TABLE bk.dbo.t (a INTEGER);
+----
+read-only
+
+statement error
+INSERT INTO bk.dbo.items (id) VALUES (1);
+----
+read-only
+
+statement error
+UPDATE bk.dbo.items SET name = name;
+----
+read-only
+
+statement error
+DELETE FROM bk.dbo.items;
+----
+read-only
+
+statement error
+ALTER TABLE bk.dbo.items ADD COLUMN z INTEGER;
+----
+read-only
+
+statement error
+DROP TABLE bk.dbo.items;
+----
+read-only
+
+statement error
+TRUNCATE bk.dbo.items;
+----
+bk is a backup attached read-only
+
+statement error
+CREATE SCHEMA bk.s2;
+----
+read-only
+
+statement ok
+COPY (SELECT * FROM bk.dbo.items LIMIT 1) TO '__TEST_DIR__/backup_attach_items.csv';
+
+statement error
+COPY bk.dbo.items FROM '__TEST_DIR__/backup_attach_items.csv';
+----
+read-only
+
+# In a transaction too, and beside one that commits.
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM bk.dbo.items;
+----
+2000
+
+statement ok
+COMMIT;
+
+# A prepared statement binds again on EXECUTE.
+statement ok
+PREPARE items_count AS SELECT count(*) FROM bk.dbo.items;
+
+query I
+EXECUTE items_count;
+----
+2000
+
+# The file functions take the attached catalog's name in place of a path.
+query I
+SELECT count(*) FROM mssql_backup_scan('bk', 'dbo', 'items');
+----
+2000
+
+query T
+SELECT list(table_name ORDER BY table_name) FROM mssql_backup_tables('bk');
+----
+[events, items]
+
+query I
+SELECT count(*) FROM mssql_backup_columns('bk', 'dbo', 'events');
+----
+4
+
+query T
+SELECT backup_type FROM mssql_backup_info('bk');
+----
+full
+
+query I
+SELECT count(*) > 0 FROM mssql_backup_catalog('bk', 'sysschobjs');
+----
+true
+
+# No TYPE mssql state: no pool.
+query I
+SELECT count(*) FROM mssql_pool_stats();
+----
+0
+
+# Detached, the name is a path again.
+statement ok
+DETACH bk;
+
+statement error
+SELECT count(*) FROM mssql_backup_scan('bk', 'dbo', 'items');
+----
+<REGEX>:.*bk.*
+
+# Compressed and striped sets attach alike.
+statement ok
+ATTACH 'test/data/backup/full_xpress.bak' AS bx (TYPE mssql_backup);
+
+query I
+SELECT count(*) FROM bx.dbo.items;
+----
+2000
+
+statement ok
+ATTACH 'test/data/backup/stripe_?.bak' AS bs (TYPE mssql_backup);
+
+query I
+SELECT count(*) FROM bs.dbo.events;
+----
+3000
+
+# schema_filter / table_filter: regexes as TYPE mssql takes them (case-insensitive, a partial match).
+statement ok
+ATTACH 'test/data/backup/full.bak' AS bf (TYPE mssql_backup, table_filter '^EV');
+
+query T
+SELECT list(table_name) FROM duckdb_tables() WHERE database_name = 'bf';
+----
+[events]
+
+statement error
+SELECT * FROM bf.dbo.items;
+----
+does not exist
+
+query T
+SELECT list(table_name ORDER BY table_name) FROM mssql_backup_tables('bf');
+----
+[events]
+
+# A file function on the attached name follows the filters too, and says why a table is not there.
+statement error
+SELECT count(*) FROM mssql_backup_scan('bf', 'dbo', 'items');
+----
+the backup attached as bf has no table or indexed view dbo.items that its schema_filter / table_filter keep
+
+# ATTACH OR REPLACE reads the file and the options again.
+statement ok
+ATTACH OR REPLACE 'test/data/backup/full.bak' AS bf (TYPE mssql_backup, table_filter '^it');
+
+query T
+SELECT list(table_name) FROM duckdb_tables() WHERE database_name = 'bf';
+----
+[items]
+
+statement ok
+ATTACH 'test/data/backup/full.bak' AS bn (TYPE mssql_backup, schema_filter '^nope$');
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'bn';
+----
+0
+
+query I
+SELECT count(*) FROM mssql_backup_schemas('bn');
+----
+0
+
+# Refused by name: a bad regex, an option it does not take, a backup with no pages to read.
+statement error
+ATTACH 'test/data/backup/full.bak' AS b1 (TYPE mssql_backup, table_filter '(');
+----
+table_filter
+
+statement error
+ATTACH 'test/data/backup/full.bak' AS b2 (TYPE mssql_backup, bogus 1);
+----
+'bogus' is not an option of an attached backup
+
+statement error
+ATTACH 'test/data/backup/log.trn' AS b3 (TYPE mssql_backup);
+----
+is a log backup
+
+statement error
+ATTACH 'test/data/backup/diff.bak' AS b4 (TYPE mssql_backup);
+----
+is a differential backup

@@ -389,6 +389,7 @@ bool OpenedBackup::Reweigh() {
 							tables->columns.size() + tables->rscols.size();
 		bytes += rows * 256;
 	}
+	bytes += unit_pages_.MemoryBytes();
 	return estimate_.exchange(bytes, std::memory_order_relaxed) != bytes;
 }
 
@@ -422,7 +423,70 @@ static bool BackupCacheOn(ClientContext &context) {
 	return true;
 }
 
+std::shared_ptr<const std::vector<PagePointer>> UnitPageCache::Get(
+	uint64_t auid, const std::function<std::vector<PagePointer>()> &build) {
+	{
+		std::lock_guard<std::mutex> guard(lock_);
+		auto found = units_.find(auid);
+		if (found != units_.end()) {
+			return found->second;
+		}
+	}
+	// Built outside the lock (an IAM walk reads pages); two scans of one unit at once may both build it,
+	// and the first kept is the one every later scan takes.
+	auto built = std::make_shared<const std::vector<PagePointer>>(build());
+	std::lock_guard<std::mutex> guard(lock_);
+	return units_.emplace(auid, std::move(built)).first->second;
+}
+
+size_t UnitPageCache::MemoryBytes() {
+	std::lock_guard<std::mutex> guard(lock_);
+	size_t bytes = 0;
+	for (const auto &unit : units_) {
+		bytes += sizeof(unit) + unit.second->capacity() * sizeof(PagePointer);
+	}
+	return bytes;
+}
+
+//! The attached backup's files opened for this statement, each checked to be as its ATTACH opened it.
+static OpenedForStatement OpenAttached(ClientContext &context, const AttachedBackup &attached) {
+	const OpenedHeaders &headers = attached.backup->Headers();
+	vector<std::string> paths;
+	for (const auto &key : headers.files) {
+		paths.push_back(key.path);
+	}
+	OpenedForStatement opened;
+	opened.files.reset(new StatementFiles(context, ByteSource::Open(context, paths)));
+	const auto &source = opened.files->Source();
+	for (const auto &key : headers.files) {
+		const size_t file = opened.files->FileOf(key.path);
+		if (file == source.FileCount() || source.FileSize(file) != key.size || source.VersionTag(file) != key.version) {
+			throw InvalidInputException(
+				"mssql backup: the file \"%s\" of %s changed since it was attached (its "
+				"size or modification time): DETACH %s and ATTACH it again",
+				key.path, attached.name, attached.name);
+		}
+	}
+	opened.backup = attached.backup;
+	// Re-measured and put again by the statement (OpenBackupCatalog) only while the cache is on.
+	opened.cache_key = BackupCacheOn(context) ? attached.cache_key : std::string();
+	opened.binding = BindingFor(headers, *opened.files);
+	return opened;
+}
+
+static OpenedForStatement OpenBackupFiles(ClientContext &context, const std::vector<std::string> &paths);
+
 OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::string> &paths) {
+	if (paths.size() == 1) {
+		auto attached = FindAttachedBackup(context, paths.front());
+		if (attached) {
+			return OpenAttached(context, *attached);
+		}
+	}
+	return OpenBackupFiles(context, paths);
+}
+
+static OpenedForStatement OpenBackupFiles(ClientContext &context, const std::vector<std::string> &paths) {
 	OpenedForStatement opened;
 	opened.files.reset(
 		new StatementFiles(context, ByteSource::Open(context, vector<std::string>(paths.begin(), paths.end()))));
@@ -445,27 +509,50 @@ OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::str
 	return opened;
 }
 
-std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths,
-												 bool with_model, const CatalogScope &scope) {
-	std::unique_ptr<OpenedCatalog> catalog(new OpenedCatalog());
-	catalog->opened = OpenBackup(context, paths);
-	auto &opened = catalog->opened;
+//! The shared stages of the backup `catalog->opened` opened, built now when they are not, into `catalog`.
+static void TakeStages(ClientContext &context, OpenedCatalog &catalog) {
+	auto &opened = catalog.opened;
 	BindFiles bound(opened.binding);
 	opened.backup->EnsureTables(context);
 	// What it holds grows as statements read it (the stages just built, the searches' samples, GAM
-	// intervals): measured at every open, outside the cache's lock, and put again when it changed, the
-	// reservation being taken at a Put.
+	// intervals, the units' page lists): measured at every open, outside the cache's lock, and put
+	// again when it changed, the reservation being taken at a Put.
 	if (!opened.cache_key.empty() && opened.backup->Reweigh()) {
 		ObjectCache::GetObjectCache(context).Put(opened.cache_key, opened.backup);
 	}
-	catalog->headers = &opened.backup->Headers();
-	catalog->pages = &opened.backup->Pages();
-	catalog->tables = &opened.backup->Tables();
+	catalog.headers = &opened.backup->Headers();
+	catalog.pages = &opened.backup->Pages();
+	catalog.tables = &opened.backup->Tables();
+	catalog.unit_pages = &opened.backup->UnitPages();
+}
+
+std::unique_ptr<OpenedCatalog> OpenAttachedCatalog(ClientContext &context, const AttachedBackup &attached) {
+	std::unique_ptr<OpenedCatalog> catalog(new OpenedCatalog());
+	catalog->opened = OpenAttached(context, attached);
+	TakeStages(context, *catalog);
+	catalog->model = attached.model;
+	return catalog;
+}
+
+std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths,
+												 bool with_model, const CatalogScope &scope) {
+	if (paths.size() == 1) {
+		auto attached = FindAttachedBackup(context, paths.front());
+		if (attached) {
+			return OpenAttachedCatalog(context, *attached);
+		}
+	}
+	std::unique_ptr<OpenedCatalog> catalog(new OpenedCatalog());
+	catalog->opened = OpenBackupFiles(context, paths);
+	TakeStages(context, *catalog);
+	auto model = std::make_shared<CatalogModel>();
+	catalog->model = model;
 	if (with_model) {
+		BindFiles bound(catalog->Binding());  // the model reads the catalog's pages
 		try {
 			// A boundary decodes when the value mssql_backup_tables would give it does: one verdict, the
 			// model's (review of #551).
-			catalog->model = BuildCatalogModel(
+			*model = BuildCatalogModel(
 				*catalog->pages->store, *catalog->tables,
 				[](const SqlVariant &v, const std::string &what) { (void)SqlVariantValue(v, what); }, scope);
 		} catch (FormatError &e) {
@@ -473,6 +560,42 @@ std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const s
 		}
 	}
 	return catalog;
+}
+
+std::shared_ptr<AttachedBackup> OpenAttachedBackup(
+	ClientContext &context, const std::string &name, const std::vector<std::string> &paths,
+	std::function<bool(const std::string &schema)> wants_schema,
+	std::function<bool(const std::string &schema, const std::string &object)> wants_object) {
+	auto attached = std::make_shared<AttachedBackup>();
+	attached->name = name;
+	attached->wants_schema = std::move(wants_schema);
+	OpenedForStatement opened = OpenBackupFiles(context, paths);
+	BindFiles bound(opened.binding);
+	opened.backup->EnsureTables(context);
+	if (!opened.cache_key.empty() && opened.backup->Reweigh()) {
+		ObjectCache::GetObjectCache(context).Put(opened.cache_key, opened.backup);
+	}
+	CatalogScope scope;
+	if (wants_object) {
+		scope.objects = std::make_shared<const std::function<bool(const std::string &, const std::string &)>>(
+			std::move(wants_object));
+	}
+	auto model = std::make_shared<CatalogModel>();
+	try {
+		*model = BuildCatalogModel(
+			*opened.backup->Pages().store, opened.backup->Tables(),
+			[](const SqlVariant &v, const std::string &what) { (void)SqlVariantValue(v, what); }, scope);
+	} catch (FormatError &e) {
+		throw FormatError("backup file \"" + paths.front() + "\": " + WithoutPrefix(e));
+	}
+	// The schemas a listing of the attached backup shows are the filter's too.
+	model->schemas.erase(std::remove_if(model->schemas.begin(), model->schemas.end(),
+										[&](const CatalogSchema &s) { return !attached->WantsSchema(s.name); }),
+						 model->schemas.end());
+	attached->backup = opened.backup;
+	attached->cache_key = opened.cache_key;
+	attached->model = std::move(model);
+	return attached;
 }
 
 }  // namespace backup

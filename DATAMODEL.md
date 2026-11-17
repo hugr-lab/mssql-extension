@@ -1455,7 +1455,24 @@ flowchart BT
   store --> lob
   lob --> stager
   stager --> scan["mssql_backup_scan<br/>+ _mssql_page / _mssql_rid / _mssql_page_lsn / _mssql_lob"]
+  model --> att["ATTACH … (TYPE mssql_backup)<br/>MSSQLBackupCatalog: schema / table entries,<br/>read-only; AttachedBackup holds the opened backup<br/>and its model"]
+  att --> scan
 ```
+
+- **An attached backup** (spec 085 PR 4b, `src/catalog/backup/`) is a second `StorageExtension`
+  beside `TYPE mssql`, sharing none of layers 1-4: its catalog type is `mssql_backup`, so the
+  pool, `MSSQLOptimizer` and the remote-pushdown hooks never see it. Its state is an
+  `AttachedBackup` built at ATTACH: the `OpenedBackup` (the opened-file cache's entry, held while
+  attached) and the `CatalogModel` for the ATTACH's `schema_filter` / `table_filter`; the catalog's
+  schema and table entries are built from it once and never change (no lock on the lookup path). The
+  in-row units' page lists are a stage of the `OpenedBackup` (`UnitPageCache`, under its own lock,
+  filled at a table's first scan, counted in the cache entry's estimate), shared by every scan of the
+  same files. A table entry's scan is `mssql_backup_scan` on the entry's own `AttachedBackup`; a
+  statement opens the backup's files again (`StatementFiles` keep the statement's `ClientContext`)
+  and checks each against the ATTACH's size and version tag. The file functions resolve an attached
+  name (`FindAttachedBackup`) before treating it as a path. A column's DuckDB name is the model's
+  (`CatalogColumn::duckdb_name`): the backup's, but for columns of a case-sensitive database that
+  differ only in case, which get the first `_N` no column of the table is named.
 
 - **The file is untrusted input.** Every parser reads through `ByteReader` (`backup_bytes`), which
   checks each length, offset and count against its span; a read past one is a named `FormatError`,

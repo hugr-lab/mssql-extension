@@ -11,20 +11,20 @@
 
 require mssql
 
-query TTITTTTTTT
+query TTITTTTTTTT
 SELECT * FROM mssql_backup_columns('test/data/backup/full.bak') ORDER BY table_name, column_id;
 ----
-dbo	events	1	event_id	bigint	sys	bigint	BIGINT	converted	NULL
-dbo	events	2	item_id	int	sys	int	INTEGER	converted	NULL
-dbo	events	3	note	varchar(100)	sys	varchar(100)	VARCHAR	converted	NULL
-dbo	events	4	at	datetime	sys	datetime	TIMESTAMP	converted	NULL
-dbo	items	1	id	int	sys	int	INTEGER	converted	NULL
-dbo	items	2	name	nvarchar(40)	sys	nvarchar(40)	VARCHAR	converted	NULL
-dbo	items	3	code	varchar(12)	sys	varchar(12)	VARCHAR	converted	NULL
-dbo	items	4	price	decimal(12,2)	sys	decimal(12,2)	DECIMAL(12,2)	converted	NULL
-dbo	items	5	created	datetime2(3)	sys	datetime2(3)	TIMESTAMP_MS	converted	NULL
-dbo	items	6	flag	bit	sys	bit	BOOLEAN	converted	NULL
-dbo	items	7	blob	varbinary(64)	sys	varbinary(64)	BLOB	converted	NULL
+dbo	events	1	event_id	event_id	bigint	sys	bigint	BIGINT	converted	NULL
+dbo	events	2	item_id	item_id	int	sys	int	INTEGER	converted	NULL
+dbo	events	3	note	note	varchar(100)	sys	varchar(100)	VARCHAR	converted	NULL
+dbo	events	4	at	at	datetime	sys	datetime	TIMESTAMP	converted	NULL
+dbo	items	1	id	id	int	sys	int	INTEGER	converted	NULL
+dbo	items	2	name	name	nvarchar(40)	sys	nvarchar(40)	VARCHAR	converted	NULL
+dbo	items	3	code	code	varchar(12)	sys	varchar(12)	VARCHAR	converted	NULL
+dbo	items	4	price	price	decimal(12,2)	sys	decimal(12,2)	DECIMAL(12,2)	converted	NULL
+dbo	items	5	created	created	datetime2(3)	sys	datetime2(3)	TIMESTAMP_MS	converted	NULL
+dbo	items	6	flag	flag	bit	sys	bit	BOOLEAN	converted	NULL
+dbo	items	7	blob	blob	varbinary(64)	sys	varbinary(64)	BLOB	converted	NULL
 
 # One schema's, one table's; every family of a striped set, a compressed one.
 query I

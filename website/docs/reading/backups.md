@@ -13,7 +13,8 @@ needs a file system that can list files: a local path or `s3://`, not `https://`
 `mssql_backup_info` describes a backup: what `RESTORE HEADERONLY`, `RESTORE LABELONLY` and
 `RESTORE FILELISTONLY` report. `mssql_backup_tables` and `mssql_backup_views` list what a full
 backup's database holds: its tables, their columns and types, and its views
-([below](#tables-and-views)). `mssql_backup_scan` reads a table's rows ([below](#rows)).
+([below](#tables-and-views)). `mssql_backup_scan` reads a table's rows ([below](#rows)), and
+`ATTACH … (TYPE mssql_backup)` makes the backup a read-only catalog ([below](#attaching-a-backup)).
 
 ```sql
 SELECT backup_type, database_name, software_version, compatibility_level,
@@ -263,6 +264,54 @@ from what `RESTORE` makes of it by replaying the log tail.
 
 The oracle lane restores every fixture backup of SQL Server 2017 to 2025 and compares each table's
 rows with `mssql_backup_scan`'s, both ways, through `TYPE mssql`.
+
+## Attaching a backup
+
+A full backup can be attached as a read-only catalog, its schemas and user tables DuckDB entries:
+
+```sql
+ATTACH '/backups/sales_full.bak' AS bk (TYPE mssql_backup);
+SHOW ALL TABLES;
+SELECT count(*) FROM bk.dbo.orders;
+SELECT o.id, c.name FROM bk.sales.orders o JOIN bk.sales.customers c ON c.id = o.customer_id;
+```
+
+A table reads as `mssql_backup_scan` reads it -- the same columns and types, the virtual
+`_mssql_page`, `_mssql_rid`, `_mssql_page_lsn` and `_mssql_lob` included -- and `dbo` is the default
+schema (`bk.orders`, `USE bk`). Views are not entries: their definitions are T-SQL, which DuckDB does
+not run (`mssql_backup_views` lists them). A log or differential backup is refused at `ATTACH`.
+
+It is always read-only, whatever the options say: `CREATE`, `INSERT`, `UPDATE`, `DELETE`, `ALTER`,
+`DROP` and `COPY … FROM` are refused.
+
+| ATTACH option | Description |
+|---|---|
+| `schema_filter` | A regex: only the schemas it matches (case-insensitive, a partial match: `^sales$` for one) |
+| `table_filter` | A regex: only the tables and views it matches |
+
+They work as for `TYPE mssql`, and the catalog is built for what they keep only, which on a large
+database keeps the `ATTACH` and its memory small. Any other option is refused by name.
+
+The `ATTACH` opens the backup and builds its catalog once (`ATTACH OR REPLACE` does it again); a
+table's pages are listed at its first scan and kept for the next.
+
+Names are the backup's, quoted in DuckDB where they need it: `bk."my schema"."q]t'x"`, `"v'"`,
+`"r.x"`. A case-sensitive database may hold columns whose names differ only in case (`Id`, `ID`,
+`id`), which no DuckDB table can (its names are case-insensitive, quoted or not): they are read as
+`Id`, `ID_1`, `id_2` -- the first suffix no column of the table is named, so a real column keeps its
+own -- by the catalog and `mssql_backup_scan` alike. `mssql_backup_columns` gives that name as
+`duckdb_name` beside the backup's `column_name`. Tables and schemas that differ only in case are
+entries of their own, found by the exact name.
+
+The file functions take the attached name in place of a path:
+
+```sql
+SELECT * FROM mssql_backup_scan('bk', 'dbo', 'orders', max_threads := 2);
+SELECT table_name, row_count FROM mssql_backup_tables('bk');
+```
+
+Every statement opens the files again and checks each one against what the `ATTACH` opened: a file
+whose size or modification time changed since is refused (`DETACH` it and `ATTACH` it again).
 
 ## Opening a backup once
 
