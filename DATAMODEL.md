@@ -742,6 +742,17 @@ them (`MSSQLResultStream::RefuseOutOfRangeIn`), since that plan has every filter
 catalog scan produces either: the 079 writer vetoes `rowid`, the hidden key columns come from the
 plan, and a DML pushed whole reads no key.
 
+**A `sql_variant` is a DuckDB `VARIANT` (spec 093 T1).** The column is read bare: each value
+arrives as SSVARIANT (`0x62`), a u32 length and an envelope -- base type, properties, the value in
+its TDS form (measured: `specs/093-type-kernels/measured/S1.md`). The stager keeps the envelopes as
+they are (`AppendArm::P4StageVariant`) and the `Variant` kernel writes the column through DuckDB's
+`VariantBuilder` (`BuildVariant`, one call a chunk): `codec/variant/variant_envelope` (DuckDB-free,
+fuzzed by `fuzz_variant_envelope`) splits each envelope and writes the value's VARIANT payload by
+spec 093 D3's table -- a string through spec 091's code-page kernels by its own collation, a
+`time(7)` / `datetime2(7)` in nanoseconds where they fit -- and `codec/variant/variant_codec` puts it
+in the vector. The column stays out of pushed comparisons and keys (`comparison_differs`): the server
+compares a `sql_variant` by its base type (#514).
+
 ### Reading a column's collation
 
 `ColumnMetadata` carries all five wire bytes of the TDS collation

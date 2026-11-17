@@ -13,6 +13,7 @@
 #include "codec/money_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "codec/uuid_codec.hpp"
+#include "codec/variant/variant_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
@@ -139,7 +140,7 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata &column) {
 	case TDS_TYPE_IMAGE:
 		return LogicalType::BLOB;
 
-	// Not read by a raw scan yet (spec 093 T1, T4, T5). Their COLMETADATA and rows are parsed (T0), so
+	// Not read by a raw scan yet (spec 093 T4, T5). Their COLMETADATA and rows are parsed (T0), so
 	// the refusal names the type; an attached catalog reads them through a server-side conversion.
 	case TDS_TYPE_UDT: {
 		const std::string type_name =
@@ -150,11 +151,9 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata &column) {
 			"hierarchyid and other CLR types: CAST(... AS nvarchar(max))).",
 			column.name.c_str(), type_name.c_str());
 	}
+	// sql_variant (spec 093 T1, D3): each value a VARIANT of its base type.
 	case TDS_TYPE_SQL_VARIANT:
-		throw InvalidInputException(
-			"MSSQL Error: column '%s' is a sql_variant, which a raw mssql_scan does not read yet. Read it through "
-			"an attached catalog, or CAST it in the query.",
-			column.name.c_str());
+		return LogicalType::VARIANT();
 
 	default:
 		throw InvalidInputException("MSSQL Error: Unknown SQL Server type (0x%02X) for column '%s'.", column.type_id,
@@ -197,6 +196,7 @@ bool TypeConverter::IsSupported(uint8_t type_id) {
 	case TDS_TYPE_TEXT:
 	case TDS_TYPE_NTEXT:
 	case TDS_TYPE_IMAGE:
+	case TDS_TYPE_SQL_VARIANT:
 		return true;
 	default:
 		return false;
@@ -281,7 +281,8 @@ std::string TypeConverter::GetTypeName(uint8_t type_id) {
 }
 
 void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null, const ColumnMetadata &column,
-								 Vector &vector, idx_t row_idx) {
+								 Vector &vector, idx_t row_idx,
+								 mssql::codec::variant::VariantColumnNotes *variant_notes) {
 	if (is_null) {
 		FlatVector::SetNull(vector, row_idx, true);
 		return;
@@ -334,6 +335,10 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 	case TDS_TYPE_NVARCHAR:
 	case TDS_TYPE_XML:
 		mssql::codec::string::DecodeFromTds(value, column, vector, row_idx);
+		break;
+
+	case TDS_TYPE_SQL_VARIANT:
+		mssql::codec::variant::DecodeFromTds(value, column, vector, row_idx, variant_notes);
 		break;
 
 	case TDS_TYPE_BIGBINARY:

@@ -3,13 +3,15 @@
 // values). The parser takes each response's TYPE_INFO -- UDT_INFO's schema and type name, the variant's
 // LONGLEN maximum -- and the row reader frames every value (UDT as PLP, hierarchyid's MAX_BYTE_SIZE of
 // 892 included; sql_variant behind a u32 length), ROW and NBCROW alike, to the bytes the server's own
-// CAST(x AS varbinary(max)) gives. No SQL Server, no DuckDB.
+// CAST(x AS varbinary(max)) gives. No SQL Server; DuckDB only for the vector the last case decodes into.
 
 #include <cstdint>
 #include <iostream>
 #include <string>
 #include <vector>
 
+#include "codec/variant/variant_codec.hpp"
+#include "duckdb/common/types/vector.hpp"
 #include "tds/encoding/type_converter.hpp"
 #include "tds/tds_column_metadata.hpp"
 #include "tds/tds_row_reader.hpp"
@@ -308,6 +310,25 @@ int main() {
 		Check(error.find("past the 8009-byte maximum") != std::string::npos, "a length past 8009 is refused: " + error);
 		const std::vector<uint8_t> partial = {0x06, 0x00, 0x00, 0x00, 0x38, 0x00};
 		Check(!reader.ReadRow(partial.data(), partial.size(), used, row), "a value not all arrived is not read");
+	}
+
+	// Review of #564: the per-value path (TypeConverter::ConvertValue, used with target vectors -- a
+	// composite rowid) counts a value read as its bytes for the stream's WARNING, as the chunk path does.
+	std::cout << "The per-value path counts a variant read as its bytes" << std::endl;
+	{
+		ColumnMetadata col;
+		col.name = "v";
+		col.type_id = TDS_TYPE_SQL_VARIANT;
+		col.max_length = SQL_VARIANT_MAX_BYTES;
+		// varchar (0xA7) under Latin1_General_100_CI_AS_SC_UTF8 (props: collation 0904d02400, length 1400),
+		// bytes 61 FF: not UTF-8.
+		const std::vector<uint8_t> envelope = FromHex("A7070904D02400140061FF");
+		duckdb::Vector out(duckdb::LogicalType::VARIANT(), 2);
+		duckdb::mssql::codec::variant::VariantColumnNotes notes;
+		encoding::TypeConverter::ConvertValue(envelope, false, col, out, 0, &notes);
+		encoding::TypeConverter::ConvertValue(envelope, false, col, out, 1);
+		Check(notes.invalid_utf8 == 1 && notes.unknown_collation == 0,
+			  "invalid UTF-8 counted once, only where notes were passed");
 	}
 
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;

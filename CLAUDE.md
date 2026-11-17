@@ -36,6 +36,9 @@ src/
                         # (tools/code_pages/), the code-page -> UTF-8 kernels, the
                         # UTF-16 stage 1 (DecodeToUtf16) and the collation lookups
                         # (by CollationId, by name, by wire key -> code page).
+                        # variant/ (spec 093 T1): a sql_variant as a DuckDB VARIANT --
+                        # variant_envelope (the TDS envelope -> VARIANT payload, DuckDB-free)
+                        # and variant_codec (the vector, through DuckDB's VariantBuilder).
   connection/           # Connection pooling, provider, settings
   dml/                  # DML operations
     insert/             # INSERT (batched VALUES, OUTPUT INSERTED for RETURNING)
