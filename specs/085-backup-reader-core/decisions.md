@@ -854,12 +854,43 @@ is older than a year or so, for its own speed, while the lake is to keep years o
   so its schema only grows. A column added: added in the lake (NULL in older rows). A column dropped at
   the source: kept in the lake (older rows have values), NULL in new rows. A column renamed (one
   `column_id`): renamed in the lake. A type widened: widened in the lake (DuckLake's type promotion), no
-  rewrite. A type narrowed or changed incompatibly: never rewritten -- the old column kept, and the new
-  values in a new column `<name>__v2` (owner, 2026-11-17). A table
+  rewrite. A type narrowed or changed incompatibly: the column rewritten when every kept value casts
+  (below), else never -- the old column kept, and the new values in a new column `<name>__v2` (owner,
+  2026-11-17). A table
   dropped at the source: kept in the lake, marked inactive. A table recreated under its name (a new
   object id): its rows appended to the same lake table when the schema is compatible by these rules,
   else to a new one. A `reload` (the history broken, DQ-48): an upsert by key from the new state, never a
   delete -- rows no longer at the source stay.
+- **Applying changes to DuckLake** (its documentation, checked 2026-11-17): an update goes in as
+  `MERGE` / `UPDATE`, never DELETE + INSERT, so DuckLake keeps the row's `rowid` (row lineage) and its
+  own change feed (`table_changes`) reports `update_preimage` / `update_postimage`; deletes as DELETE by
+  key, inserts as INSERT; all of one backup version in one DuckLake transaction (one snapshot), its DDL
+  first, in this order: renames (through a temporary name for a swap or a chain), drops (`mirror`
+  only), adds, type changes, then the rows. A rename is DuckLake's `RENAME COLUMN` / `RENAME TO` (DQ-27
+  for tables), no rewrite; an added column is `ADD COLUMN` with the source's default for the rows
+  already there (SQL Server's metadata-only `ADD … NOT NULL DEFAULT x` reads them as x, and so must the
+  lake); a column dropped and added again under its name in an `accumulate` / `retain` table, the old
+  one kept, is `<name>__v2`. DuckLake's type promotion is narrow -- integer widening and float32 to
+  float64 only, no decimal precision, no string length -- so **a type change is applied by rewriting
+  the column** (owner, 2026-11-17), as a large SQL Server table's column is changed: in one snapshot,
+  `RENAME COLUMN c TO c__old`, `ADD COLUMN c <new type>`, `UPDATE … SET c = CAST(c__old AS <new type>)`,
+  `DROP COLUMN c__old`. The rows keep their `rowid` (an UPDATE); the table's files are rewritten once,
+  the old ones gone at expiry; `table_changes` shows every row updated, which they are. In an
+  `accumulate` / `retain` table the same when the cast holds for every row kept; when any does not
+  (a narrowing, an incompatible type) nothing is rewritten: the old column stays and new values go to
+  `<name>__v2`. Wide lake types from the start (`DECIMAL(38,s)`, `BIGINT`) are an importer option for a
+  table whose types change often, not the default.
+- **Large batches of inserts as files** (owner, 2026-11-17): when a version brings more new rows to a
+  table than a threshold (about a row group or a target file size, configurable), the importer writes
+  them as Parquet itself -- `COPY (SELECT * FROM mssql_backup_table_insertions(…) ORDER BY <date or
+  key>) TO … (FORMAT parquet, PARTITION_BY (…))`, streamed and parallel -- and registers them with
+  `ducklake_add_data_files`, in the version's one transaction with its DDL, `MERGE` and `DELETE`; fewer
+  rows go in as INSERT. The natural path for `accumulate` / `retain` tables (mostly inserts), and for a
+  `mirror` table's first import or reload. Files sorted and partitioned this way keep DuckLake's
+  min/max narrow and need little merging. Open, for the mssql-ducklake prototype: `add_data_files`
+  in one transaction with DELETE / MERGE / ALTER; with a partitioned table (the files' partition values
+  matching the table's); the files' schema against the table's after that transaction's DDL; who owns
+  the files once added (expiry, drop); `rowid`s of the added rows for later MERGEs.
 - **Two imports into one lake**: an ATTACH per mode, split by `table_filter` and its complement
   `table_exclude` (schema_exclude / table_exclude, to come for TYPE mssql and mssql_backup alike); the
   mode is the importer's, per import or per table, never an ATTACH option.
