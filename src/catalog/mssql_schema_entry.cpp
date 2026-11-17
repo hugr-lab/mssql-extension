@@ -411,6 +411,29 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	// The table name is stored in the base AlterInfo class
 	const string &table_name = alter_table_info.GetQualifiedName().Name().GetIdentifierName();
 
+	// A column the statement names is a DuckDB name; T-SQL names the server's column (issue #572: in a
+	// case-sensitive database `ID` beside `Id` reads as ID_1). Null when the table or column is not
+	// known here: the name goes as written and the server answers for it.
+	auto column_of = [&](const string &duckdb_name) -> const MSSQLColumnInfo * {
+		if (!transaction.HasContext()) {
+			return nullptr;
+		}
+		auto entry = tables_.GetEntry(transaction.GetContext(), table_name);
+		if (!entry) {
+			return nullptr;
+		}
+		for (auto &col : entry->Cast<MSSQLTableEntry>().GetMSSQLColumns()) {
+			if (StringUtil::CIEquals(col.DuckDBName(), duckdb_name)) {
+				return &col;
+			}
+		}
+		return nullptr;
+	};
+	auto server_name = [&](const string &duckdb_name) -> string {
+		auto col = column_of(duckdb_name);
+		return col ? col->name : duckdb_name;
+	};
+
 	switch (alter_table_info.alter_table_type) {
 	case AlterTableType::RENAME_TABLE: {
 		auto &rename_info = alter_table_info.Cast<RenameTableInfo>();
@@ -428,14 +451,14 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	case AlterTableType::REMOVE_COLUMN: {
 		auto &remove_info = alter_table_info.Cast<RemoveColumnInfo>();
 		tsql = MSSQLDDLTranslator::TranslateDropColumn(name.GetIdentifierName(), table_name,
-													   remove_info.removed_column.GetIdentifierName());
+													   server_name(remove_info.removed_column.GetIdentifierName()));
 		break;
 	}
 
 	case AlterTableType::RENAME_COLUMN: {
 		auto &rename_col_info = alter_table_info.Cast<RenameColumnInfo>();
 		tsql = MSSQLDDLTranslator::TranslateRenameColumn(name.GetIdentifierName(), table_name,
-														 rename_col_info.old_name.GetIdentifierName(),
+														 server_name(rename_col_info.old_name.GetIdentifierName()),
 														 rename_col_info.new_name.GetIdentifierName());
 		break;
 	}
@@ -446,67 +469,46 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		// We default to NULL since we don't have that info easily available
 		tsql = MSSQLDDLTranslator::TranslateAlterColumnType(
 			name.GetIdentifierName(), table_name,
-			SingleColumnOf(type_info.column_path, "ALTER COLUMN TYPE").GetIdentifierName(), type_info.target_type,
-			true);
+			server_name(SingleColumnOf(type_info.column_path, "ALTER COLUMN TYPE").GetIdentifierName()),
+			type_info.target_type, true);
 		break;
 	}
 
 	case AlterTableType::SET_NOT_NULL: {
 		auto &notnull_info = alter_table_info.Cast<SetNotNullInfo>();
 		const Identifier &column_name = SingleColumnOf(notnull_info.column_path, "SET NOT NULL");
-		// For SET NOT NULL, we need the column's current type
-		// Look up the table to get the column type
+		// The column's current type is needed to change its nullability.
 		if (!transaction.HasContext()) {
 			throw InternalException("Cannot execute SET NOT NULL without client context");
 		}
-		auto entry = tables_.GetEntry(transaction.GetContext(), table_name);
-		if (!entry) {
+		if (!tables_.GetEntry(transaction.GetContext(), table_name)) {
 			throw CatalogException("Table '%s' not found", table_name);
 		}
-		auto &mssql_table = entry->Cast<MSSQLTableEntry>();
-		LogicalType col_type;
-		bool found = false;
-		for (auto &col : mssql_table.GetMSSQLColumns()) {
-			if (col.name == column_name) {
-				col_type = col.duckdb_type;
-				found = true;
-				break;
-			}
-		}
-		if (!found) {
+		auto col = column_of(column_name.GetIdentifierName());
+		if (!col) {
 			throw CatalogException("Column '%s' not found in table '%s'", column_name, table_name);
 		}
-		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name.GetIdentifierName(), table_name,
-																   column_name.GetIdentifierName(), col_type, true);
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name.GetIdentifierName(), table_name, col->name,
+																   col->duckdb_type, true);
 		break;
 	}
 
 	case AlterTableType::DROP_NOT_NULL: {
 		auto &dropnull_info = alter_table_info.Cast<DropNotNullInfo>();
 		const Identifier &column_name = SingleColumnOf(dropnull_info.column_path, "DROP NOT NULL");
-		// For DROP NOT NULL, we need the column's current type
+		// The column's current type is needed to change its nullability.
 		if (!transaction.HasContext()) {
 			throw InternalException("Cannot execute DROP NOT NULL without client context");
 		}
-		auto entry = tables_.GetEntry(transaction.GetContext(), table_name);
-		if (!entry) {
+		if (!tables_.GetEntry(transaction.GetContext(), table_name)) {
 			throw CatalogException("Table '%s' not found", table_name);
 		}
-		auto &mssql_table = entry->Cast<MSSQLTableEntry>();
-		LogicalType col_type;
-		bool found = false;
-		for (auto &col : mssql_table.GetMSSQLColumns()) {
-			if (col.name == column_name) {
-				col_type = col.duckdb_type;
-				found = true;
-				break;
-			}
-		}
-		if (!found) {
+		auto col = column_of(column_name.GetIdentifierName());
+		if (!col) {
 			throw CatalogException("Column '%s' not found in table '%s'", column_name, table_name);
 		}
-		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name.GetIdentifierName(), table_name,
-																   column_name.GetIdentifierName(), col_type, false);
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name.GetIdentifierName(), table_name, col->name,
+																   col->duckdb_type, false);
 		break;
 	}
 

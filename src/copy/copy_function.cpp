@@ -1,4 +1,5 @@
 #include "copy/copy_function.hpp"
+#include "catalog/mssql_column_names.hpp"
 #include "connection/mssql_login_retry.hpp"
 
 #include <mutex>
@@ -444,10 +445,16 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 				// chunk and routes them through the NullOnly path. A bare
 				// `NULL AS col` is a different case, decided below by its
 				// SQLNULL source type.
+				// By the target's DuckDB names, as the source names them (issue #572).
+				std::vector<std::string> server_names;
+				for (const auto &col : gstate->columns) {
+					server_names.push_back(col.name);
+				}
+				const auto duckdb_names = mssql::DuckDBColumnNames(server_names);
 				for (const auto &nn : bdata.config.null_only_columns) {
-					for (auto &col : gstate->columns) {
-						if (StringUtil::Lower(col.name) == nn) {
-							col.null_only_source = true;
+					for (idx_t c = 0; c < gstate->columns.size(); c++) {
+						if (StringUtil::Lower(duckdb_names[c]) == nn) {
+							gstate->columns[c].null_only_source = true;
 						}
 					}
 				}

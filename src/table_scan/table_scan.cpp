@@ -1419,9 +1419,12 @@ static virtual_column_map_t GetVirtualColumns(ClientContext &context, optional_p
 	// Spec 080 D3, rung 3: the same hidden key columns the table entry names in
 	// GetRowIdColumns, so the LogicalGet can type the ones the binder adds.
 	if (bind_data.keyless_key) {
+		// Named as the entry's columns (their DuckDB names, issue #572), not the server's.
 		for (idx_t i = 0; i < bind_data.all_column_names.size(); i++) {
-			virtual_columns.insert(make_pair(
-				KeylessKeyColumn(i), TableColumn(Identifier(bind_data.all_column_names[i]), bind_data.all_types[i])));
+			const string &name = i < bind_data.mssql_columns.size() ? bind_data.mssql_columns[i].DuckDBName()
+																	: bind_data.all_column_names[i];
+			virtual_columns.insert(
+				make_pair(KeylessKeyColumn(i), TableColumn(Identifier(name), bind_data.all_types[i])));
 		}
 	}
 

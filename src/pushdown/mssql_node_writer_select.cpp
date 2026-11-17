@@ -412,10 +412,16 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 	std::string list;
 	auto add = [&](idx_t index, const std::string &alias) {
 		const auto &column = columns_[index];
-		const std::string output = alias.empty() ? column.name : alias;
+		// A column's result name is its DuckDB name (issue #572: the server's `ID` beside `Id` reads as
+		// ID_1), sent as an alias where the two differ.
+		const std::string output = alias.empty() ? column.DuckDBName() : alias;
+		const std::string as = alias.empty() && column.DuckDBName() != column.name ? column.DuckDBName() : alias;
+		if (as.size() > 128) {
+			return Veto("a result column name longer than 128 characters");
+		}
 		for (auto &existing : outputs_) {
-			// The vehicle's result names are the server's: two equal names would
-			// come back deduplicated differently than DuckDB names them.
+			// Two equal result names would come back deduplicated differently than DuckDB names
+			// them.
 			if (StringUtil::CIEquals(existing.name, output)) {
 				return Veto("two result columns are named " + output);
 			}
@@ -435,7 +441,7 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			list += ColumnSql(index) + " AS " + QuoteIdentifier(output);
 			entry.plain_read = true;
 		} else if (raw_columns_) {
-			list += ColumnSql(index) + (alias.empty() ? "" : " AS " + QuoteIdentifier(alias));
+			list += ColumnSql(index) + (as.empty() ? "" : " AS " + QuoteIdentifier(as));
 			entry.plain_read = true;
 		} else {
 			const auto read = MSSQLColumnInfo::BuildReadExpression(
@@ -444,7 +450,7 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 			list += MSSQLColumnInfo::BuildReadExpression(
 				column.name, column.sql_type_name, column.max_length, column.collation_name,
 				options_.convert_varchar_max, options_.client_transcode, relation.sql.empty() ? "" : relation.sql + ".",
-				alias, options_.utf8_on_wire);
+				as, options_.utf8_on_wire);
 			entry.plain_read = read == QuoteIdentifier(column.name);
 		}
 		outputs_.push_back(std::move(entry));
@@ -501,7 +507,7 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 				return false;
 			}
 			// An alias equal to the column's own name renders as the bare column.
-			const bool renamed = !alias.empty() && alias != columns_[index].name;
+			const bool renamed = !alias.empty() && alias != columns_[index].DuckDBName();
 			if (!add(index, renamed ? alias : "")) {
 				return false;
 			}
@@ -1133,7 +1139,8 @@ bool NodeWriter::WriteSetOperation(const SetOperationNode &node) {
 		entry.name = reference.name;
 		if (plain) {
 			auto column = first.FlatColumn(reference.column_index);
-			column.name = reference.name;
+			column.name = reference.name;  // the set operation's column, named by its output on both sides
+			column.duckdb_name = reference.name;
 			column.is_nullable = nullable;
 			entry.column_index = columns_.size();
 			entry.plain_read = true;

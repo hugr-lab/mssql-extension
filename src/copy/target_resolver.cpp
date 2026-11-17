@@ -1,5 +1,6 @@
 #include "copy/target_resolver.hpp"
 #include "catalog/mssql_column_info.hpp"
+#include "catalog/mssql_column_names.hpp"
 #include "query/mssql_identifier.hpp"
 #include "query/mssql_sql_params.hpp"
 
@@ -842,12 +843,18 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 		throw InvalidInputException("MSSQL COPY: Failed to query table schema: %s", result.error_message);
 	}
 
-	// Build a map of target column names to their type information (case-insensitive)
+	// Build a map of target column names to their type information (case-insensitive), by the names
+	// DuckDB reads them under (issue #572: a case-sensitive table's `ID` beside `Id` is ID_1, which a
+	// source column of that name loads).
+	std::vector<std::string> server_names;
+	for (idx_t i = 0; i < result.rows.size(); i++) {
+		server_names.push_back(result.rows[i].empty() ? string() : result.rows[i][0]);
+	}
+	const auto duckdb_names = mssql::DuckDBColumnNames(server_names);
 	std::unordered_map<string, std::pair<string, idx_t>> target_columns;  // name -> (type, index)
 	for (idx_t i = 0; i < result.rows.size(); i++) {
 		if (result.rows[i].size() >= 2) {
-			string col_name_lower = StringUtil::Lower(result.rows[i][0]);
-			target_columns[col_name_lower] = {result.rows[i][1], i};
+			target_columns[StringUtil::Lower(duckdb_names[i])] = {result.rows[i][1], i};
 		}
 	}
 
@@ -1271,9 +1278,15 @@ vector<int32_t> TargetResolver::BuildColumnMapping(const vector<string> &source_
 		source_name_to_idx[StringUtil::Lower(source_names[i])] = static_cast<int32_t>(i);
 	}
 
-	// For each target column, find the matching source column by name
+	// For each target column, find the matching source column by name -- the target's DuckDB name
+	// (issue #572), the one a source names it by.
+	std::vector<std::string> server_names;
+	for (const auto &column : target_columns) {
+		server_names.push_back(column.name);
+	}
+	const auto duckdb_names = mssql::DuckDBColumnNames(server_names);
 	for (idx_t target_idx = 0; target_idx < target_columns.size(); target_idx++) {
-		string target_name_lower = StringUtil::Lower(target_columns[target_idx].name);
+		string target_name_lower = StringUtil::Lower(duckdb_names[target_idx]);
 		auto it = source_name_to_idx.find(target_name_lower);
 		if (it != source_name_to_idx.end()) {
 			mapping.push_back(it->second);

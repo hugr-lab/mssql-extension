@@ -79,12 +79,12 @@ int NodeWriter::FindColumn(const ColumnRefExpression &ref, idx_t &out) const {
 			// rows have, as DuckDB binds it (spec 080 PR 4a).
 			(relation == DConstants::INVALID_INDEX && merge_forbidden_first_ != DConstants::INVALID_INDEX &&
 			 relation_of_[i] >= merge_forbidden_first_ && relation_of_[i] < merge_forbidden_last_) ||
-			!StringUtil::CIEquals(columns_[i].name, name)) {
+			!StringUtil::CIEquals(columns_[i].DuckDBName(), name)) {
 			continue;
 		}
 		if (found) {
-			// Two relations with the column (DuckDB's ambiguity error), or a
-			// case-sensitive database holding `a` and `A`.
+			// Two relations with the column (DuckDB's ambiguity error). A table's own columns have
+			// names apart in DuckDB (issue #572: `a` and `A` read as a and A_1).
 			return -1;
 		}
 		found = true;
@@ -306,7 +306,9 @@ bool NodeWriter::KeyCovered(idx_t relation, idx_t other_first, idx_t other_last)
 			for (auto side : {std::make_pair(pair.first, pair.second), std::make_pair(pair.second, pair.first)}) {
 				const auto rel = relation_of_[side.first];
 				const auto other = relation_of_[side.second];
-				equated = equated || (rel == relation && StringUtil::CIEquals(columns_[side.first].name, key_column) &&
+				// The key's names are the server's, compared as they are: `Id` is not `ID` in a
+				// case-sensitive database (issue #572).
+				equated = equated || (rel == relation && columns_[side.first].name == key_column &&
 									  other >= other_first && other < other_last);
 			}
 		}
@@ -329,7 +331,7 @@ bool NodeWriter::CoversEveryKey(const std::vector<idx_t> &columns) const {
 		for (auto &key_column : key) {
 			bool found = false;
 			for (auto index : columns) {
-				found = found || (relation_of_[index] == r && StringUtil::CIEquals(columns_[index].name, key_column));
+				found = found || (relation_of_[index] == r && columns_[index].name == key_column);
 			}
 			if (!found) {
 				return false;
@@ -459,7 +461,8 @@ bool NodeWriter::CollectDerivedNode(const QueryNode &node, const std::string &na
 		auto &output = outputs[i];
 		if (output.column_index != DConstants::INVALID_INDEX && output.plain_read) {
 			auto column = inner.FlatColumn(output.column_index);
-			column.name = output.name;
+			column.name = output.name;	// the derived table's column, named by its output on both sides
+			column.duckdb_name = output.name;
 			columns_.push_back(std::move(column));
 		} else {
 			// The operand type the server's value has (an integer SUM is
@@ -540,7 +543,7 @@ bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
 			idx_t left_column = DConstants::INVALID_INDEX;
 			idx_t right_column = DConstants::INVALID_INDEX;
 			for (idx_t i = 0; i < columns_.size(); i++) {
-				if (!StringUtil::CIEquals(columns_[i].name, name)) {
+				if (!StringUtil::CIEquals(columns_[i].DuckDBName(), name)) {
 					continue;
 				}
 				// A SEMI / ANTI join's table is not on the left: it left no columns.
@@ -551,7 +554,7 @@ bool NodeWriter::WriteFrom(const TableRef &ref, std::string &sql) {
 					}
 					left_column = i;
 				} else if (relation_of_[i] == right_relation) {
-					right_column = i;
+					right_column = i;  // one: a relation's columns have names apart in DuckDB (issue #572)
 				}
 			}
 			if (left_column == DConstants::INVALID_INDEX || right_column == DConstants::INVALID_INDEX) {

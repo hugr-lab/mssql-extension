@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
 #include "catalog/mssql_column_info.hpp"
+#include "catalog/mssql_column_names.hpp"
 #include "catalog/mssql_table_entry.hpp"
 #include "catalog/mssql_transaction.hpp"
 #include "catalog/mssql_transaction_metadata.hpp"
@@ -936,7 +937,7 @@ static void BindDescribedScan(ClientContext &context, const char *function, MSSQ
 													LoadCatalogCacheTTL(context), cached)) {
 			return_types.assign(cached.types.begin(), cached.types.end());
 			names.clear();
-			for (const auto &name : cached.names) {
+			for (const auto &name : mssql::DuckDBColumnNames(cached.names)) {
 				names.push_back(Identifier(name));
 			}
 			bind_data.return_types = return_types;
@@ -1051,7 +1052,7 @@ static void BindDescribedScan(ClientContext &context, const char *function, MSSQ
 	if (shape.ok) {
 		return_types = shape.types;
 		names.clear();
-		for (const auto &name : shape.names) {
+		for (const auto &name : mssql::DuckDBColumnNames(shape.names)) {
 			names.push_back(Identifier(name));
 		}
 		bind_data.return_types = shape.types;
@@ -1107,8 +1108,10 @@ static void BindDescribedScan(ClientContext &context, const char *function, MSSQ
 	}
 	// Before the stream is kept: thrown here, it closes and gives its connection back.
 	RequireResultSet(return_types, function);
+	// The names DuckDB gives the result (issue #572: `Id` and `ID` read as Id and ID_1);
+	// bind_data.column_names keep the server's, for the shape checks.
 	names.clear();
-	for (const auto &name : result_stream->GetColumnNames()) {
+	for (const auto &name : mssql::DuckDBColumnNames(result_stream->GetColumnNames())) {
 		names.push_back(Identifier(name));
 	}
 	bind_data.return_types = return_types;

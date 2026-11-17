@@ -1,6 +1,7 @@
 #include "catalog/mssql_table_entry.hpp"
 #include <cstdlib>
 #include "catalog/mssql_catalog.hpp"
+#include "catalog/mssql_column_names.hpp"
 #include "catalog/mssql_keyless_key.hpp"
 #include "catalog/mssql_primary_key.hpp"
 #include "catalog/mssql_rowid_key_choice.hpp"
@@ -55,10 +56,24 @@ bool MSSQLReportsNativeTypes(Catalog &catalog) {
 	return setting.IsNull() ? true : setting.GetValue<bool>();
 }
 
-static ColumnList MakeColumnList(const MSSQLTableMetadata &metadata, bool native_types) {
+//! The columns with their DuckDB names set (issue #572).
+static vector<MSSQLColumnInfo> WithDuckDBNames(vector<MSSQLColumnInfo> columns) {
+	std::vector<std::string> names;
+	for (const auto &col : columns) {
+		names.push_back(col.name);
+	}
+	const auto duckdb_names = mssql::DuckDBColumnNames(names);
+	for (idx_t i = 0; i < columns.size(); i++) {
+		columns[i].duckdb_name = duckdb_names[i];
+	}
+	return columns;
+}
+
+static ColumnList MakeColumnList(const vector<MSSQLColumnInfo> &mssql_columns, bool native_types) {
 	ColumnList columns;
-	for (const auto &col : metadata.columns) {
-		ColumnDefinition column_def(Identifier(col.name), native_types ? col.NativeDuckDBType() : col.duckdb_type);
+	for (const auto &col : mssql_columns) {
+		ColumnDefinition column_def(Identifier(col.DuckDBName()),
+									native_types ? col.NativeDuckDBType() : col.duckdb_type);
 		columns.AddColumn(std::move(column_def));
 	}
 	return columns;
@@ -89,8 +104,8 @@ MSSQLTableEntry::MSSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, c
 							info = MakeTableInfo(metadata);
 							return info;
 						}()),
-	  columns_(MakeColumnList(metadata, MSSQLReportsNativeTypes(catalog))),
-	  mssql_columns_(metadata.columns),
+	  columns_(MakeColumnList(WithDuckDBNames(metadata.columns), MSSQLReportsNativeTypes(catalog))),
+	  mssql_columns_(WithDuckDBNames(metadata.columns)),
 	  object_type_(metadata.object_type),
 	  approx_row_count_(metadata.approx_row_count),
 	  index_kind_(metadata.index_kind),
@@ -100,6 +115,22 @@ MSSQLTableEntry::MSSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, c
 	D_ASSERT(metadata.pk_loaded);
 	if (metadata.pk_loaded) {
 		pk_info_ = metadata.pk_info;
+		// A composite rowid's fields are named as its columns read (issue #572: a key of `Id` and `ID`
+		// is {Id, ID_1}), so `rowid.ID_1` is the column "ID_1".
+		if (pk_info_.exists && pk_info_.columns.size() > 1 && pk_info_.rowid_type.id() == LogicalTypeId::STRUCT) {
+			child_list_t<LogicalType> children;
+			for (const auto &key : pk_info_.columns) {
+				string field = key.name;
+				for (const auto &col : mssql_columns_) {
+					if (col.column_id == key.column_id) {
+						field = col.DuckDBName();
+						break;
+					}
+				}
+				children.push_back({Identifier(field), key.duckdb_type});
+			}
+			pk_info_.rowid_type = LogicalType::STRUCT(std::move(children));
+		}
 		pk_loaded_.store(true, std::memory_order_release);
 	}
 }

@@ -13,6 +13,21 @@ Results are streamed directly into DuckDB without buffering the entire result se
 SELECT * FROM sqlserver.dbo.large_table;
 ```
 
+### Column names
+
+A column reads under its SQL Server name, quoted in DuckDB where it needs it (`"order date"`,
+`"q]t'x"`). A case-sensitive database may hold columns whose names differ only in case (`Id`, `ID`),
+which no DuckDB table can: its names are case-insensitive, quoted or not. Such a column reads under the
+first suffix no column of the table is named -- `Id`, `ID_1`, `id_2` -- and every statement the
+extension sends (pushdown, DML, COPY, ALTER) names the server's own column; a composite rowid's fields
+are named the same way. A real column keeps its own name, so a column the server adds later (a new real
+`ID_2`) can move a suffix once the catalog reloads. A raw `mssql_scan` names its result columns by the
+same rule, so an exact repeat (`SELECT a.id, b.id`) reads as `id`, `id_1`:
+
+```sql
+SELECT "Id", "ID_1" FROM sqlserver.dbo.t WHERE "ID_1" > 0;   -- sent as ... [ID] ... WHERE [ID] > ...
+```
+
 ### Filter and Projection Pushdown
 
 The extension pushes filters and column selections to SQL Server:
