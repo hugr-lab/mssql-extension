@@ -122,6 +122,25 @@ types, so the same query runs there. Tracked as
   ([Catalog-Reported String Types](../reading/types.md#catalog-reported-string-types)).
 - Per query, `CAST(col AS VARCHAR)` yields a plain `VARCHAR` as well.
 
+### "Invalid column name" / "Invalid object name" after a change on the server
+
+```
+SQL Server error [207, severity 16]: Invalid column name 'FieldName'. (table db.dbo.MyTable: its columns
+changed on the server since they were loaded; its cached metadata is dropped now, run the statement again)
+```
+
+The catalog keeps a table's columns from its first read until it is invalidated (`mssql_catalog_cache_ttl` is 0 by default), and a long-lived DuckDB process -- the DuckDB UI, a server -- keeps them for days. When another client drops or renames a column, or the table, the next read of it fails once, as above, and the table's cached entry is dropped: run the statement again.
+
+A view that names a column dropped from its table no longer compiles on the server; reloading its columns would not help, so its error says *"fix the view there, then mssql_invalidate_cache(…)"*.
+
+A statement sent to the server whole (an aggregate, a join, an `ORDER BY` …, [remote pushdown](../reading/queries.md)) can read several tables, and it fails until the catalog is invalidated. To pick up changes made outside DuckDB:
+
+```sql
+SELECT mssql_invalidate_cache('db', 'dbo', 'MyTable');  -- one table
+SELECT mssql_invalidate_cache('db');                    -- the whole catalog
+SET mssql_catalog_cache_ttl = 3600;                     -- or: reload metadata older than an hour
+```
+
 ### Slow Query Performance
 
 **Solutions:**

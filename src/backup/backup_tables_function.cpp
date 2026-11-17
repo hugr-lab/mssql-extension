@@ -49,6 +49,7 @@ LogicalType ColumnStructType() {
 	f.emplace_back("column_id", LogicalType::INTEGER);
 	f.emplace_back("name", LogicalType::VARCHAR);
 	f.emplace_back("sql_type", LogicalType::VARCHAR);
+	f.emplace_back("type_schema", LogicalType::VARCHAR);
 	f.emplace_back("system_type_id", LogicalType::INTEGER);
 	f.emplace_back("max_length", LogicalType::INTEGER);
 	f.emplace_back("precision", LogicalType::INTEGER);
@@ -136,9 +137,9 @@ std::vector<Column> SchemaColumns() {
 std::vector<Column> ColumnColumns() {
 	return {{"schema_name", LogicalType::VARCHAR}, {"table_name", LogicalType::VARCHAR},
 			{"column_id", LogicalType::INTEGER},   {"column_name", LogicalType::VARCHAR},
-			{"sql_type", LogicalType::VARCHAR},	   {"system_type", LogicalType::VARCHAR},
-			{"duckdb_type", LogicalType::VARCHAR}, {"state", LogicalType::VARCHAR},
-			{"reason", LogicalType::VARCHAR}};
+			{"sql_type", LogicalType::VARCHAR},	   {"type_schema", LogicalType::VARCHAR},
+			{"system_type", LogicalType::VARCHAR}, {"duckdb_type", LogicalType::VARCHAR},
+			{"state", LogicalType::VARCHAR},	   {"reason", LogicalType::VARCHAR}};
 }
 
 std::vector<Column> ViewColumns() {
@@ -224,6 +225,7 @@ Value ColumnValue(const CatalogColumn &c) {
 	f.emplace_back("name", Text(c.name));
 	f.emplace_back("sql_type", Text(SqlTypeText(c.type_name, c.system_type_name, c.system_type_id, c.max_length,
 												c.precision, c.scale)));
+	f.emplace_back("type_schema", OptionalText(c.type_schema));
 	f.emplace_back("system_type_id", Value::INTEGER(c.system_type_id));
 	f.emplace_back("max_length", Value::INTEGER(c.max_length));
 	f.emplace_back("precision", Value::INTEGER(c.precision));
@@ -427,6 +429,7 @@ std::vector<Value> ColumnRow(const CatalogTable &t, const CatalogColumn &c) {
 	const ColumnState state = StateOf(t, c);
 	return {Text(t.schema_name), Text(t.name), Value::INTEGER(c.column_id), Text(c.name),
 			Text(SqlTypeText(c.type_name, c.system_type_name, c.system_type_id, c.max_length, c.precision, c.scale)),
+			OptionalText(c.type_schema),
 			// The system type underneath, declared (an alias type's base: Name -> nvarchar(50)); NULL for a
 			// user-defined CLR type, which has none.
 			OptionalText(SqlTypeText(c.system_type_name, c.system_type_name, c.system_type_id, c.max_length,
