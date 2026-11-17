@@ -105,7 +105,8 @@ private:
 //! Lifetime: the file handles keep the opening ClientContext's file system and query context
 //! (CachingFileHandle reopens through them), so a ByteSource -- and every task it made -- must
 //! not outlive the ClientContext that opened it. What outlives a statement (spec 085 D9's
-//! opened-file cache) keeps the parsed state, not the source, and reopens files per context.
+//! opened-file cache, OpenedBackup) keeps the parsed state, not the source: each statement opens its
+//! own (StatementFiles) and its reads go through it (BoundFile, backup_files.hpp).
 class ByteSource {
 public:
 	//! The files of `paths`, each a path or a glob (expanded in sorted order; a glob that matches
@@ -118,7 +119,8 @@ public:
 	}
 	const std::string &Path(size_t file) const;
 	uint64_t FileSize(size_t file) const;
-	//! The cache key's version: the ETag of a remote file, else its last-modified time (D9).
+	//! The cache key's version: the ETag of a remote file, else its last-modified time (D9); empty when
+	//! the file system gives neither (such a file is never cached).
 	std::string VersionTag(size_t file) const;
 	bool IsRemote(size_t file) const;
 

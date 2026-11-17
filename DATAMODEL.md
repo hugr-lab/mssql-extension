@@ -1567,7 +1567,17 @@ flowchart BT
   from (`AllocationMap`, read with no lock), so an off-row page's liveness check takes no lock.
   Fuzzed by `fuzz_backup_lob`; compared with RESTORE on `lob.sql`'s fixture.
 - **Prepared statements** keep the row their bind read (`SupportStatementCache`); `reread := true`
-  binds again on every `EXECUTE`. The opened-file cache shared across statements (D9) is task 22.
+  binds again on every `EXECUTE`.
+- **The opened-file cache** (D9, PR 4a): what an open read -- headers, page index, allocation map,
+  bootstrap tables -- is an `OpenedBackup` in the DuckDB instance's `ObjectCache`, keyed by every
+  file's path, size and version tag, evictable by its memory; the next call on the same files takes
+  it, and builds only its own catalog model. It holds no file: the handles of a `ByteSource` keep the
+  ClientContext that opened them, so every call opens its own (`StatementFiles`) and the long-lived
+  objects read a family file through a `BoundFile`, which reads through the statement files bound
+  to the reading thread (`BindFiles` in each bind / init / execute that reads). The shared state was
+  already safe across threads (the chain's spans, the searches' samples, the GAM bits and PFS pages
+  under their locks; the threads' last block / page keyed by object ids), so two statements read one
+  entry at once. `mssql_backup_cache = false` opens anew.
 
 Samples: `test/data/backup/` (synthetic, made by `test/backup/gen/generate.sh` on a throwaway
 container, with the golden `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` beside each), checked by

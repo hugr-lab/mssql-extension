@@ -124,7 +124,9 @@ std::string ByteSource::VersionTag(size_t file) const {
 	if (!tag.empty()) {
 		return tag;
 	}
-	return std::to_string(Timestamp::GetEpochMicroSeconds(handle.GetLastModifiedTime()));
+	const auto micros = Timestamp::GetEpochMicroSeconds(handle.GetLastModifiedTime());
+	// A file system that gives neither: no version to tell an overwritten file by.
+	return micros == 0 ? std::string() : std::to_string(micros);
 }
 
 bool ByteSource::IsRemote(size_t file) const {

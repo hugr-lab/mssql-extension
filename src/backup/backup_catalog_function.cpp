@@ -246,7 +246,7 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 						LogicalType::LIST(ListingColumnType())};
 		return std::move(data);
 	}
-	const BootstrapTables &tables = data->catalog->tables;
+	const BootstrapTables &tables = *data->catalog->tables;
 	const SysObject *object = tables.SystemObject(data->table);
 	if (!object) {
 		throw InvalidInputException("%s: the database has no system table %s", FUNCTION, data->table);
@@ -311,7 +311,8 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInpu
 	if (data.table.empty()) {
 		return std::move(state);
 	}
-	const BootstrapTables &tables = data.catalog->tables;
+	BindFiles bound(data.catalog->Binding());
+	const BootstrapTables &tables = *data.catalog->tables;
 	const PageStore &store = *data.catalog->pages->store;
 	try {
 		state->filter = FilterFor(store, tables, data.table, data.layout);
@@ -439,7 +440,7 @@ Value CellValue(const BaseTableBindData &data, size_t layout_index, const Logica
 }
 
 void ExecuteListing(const BaseTableBindData &data, BaseTableState &state, DataChunk &output) {
-	const BootstrapTables &tables = data.catalog->tables;
+	const BootstrapTables &tables = *data.catalog->tables;
 	idx_t count = 0;
 	for (; state.next_listed < sizeof(ALLOWED) / sizeof(ALLOWED[0]) && count < STANDARD_VECTOR_SIZE;
 		 state.next_listed++) {
@@ -486,6 +487,7 @@ void ExecuteListing(const BaseTableBindData &data, BaseTableState &state, DataCh
 void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	const auto &data = input.bind_data->Cast<BaseTableBindData>();
 	auto &state = input.global_state->Cast<BaseTableState>();
+	BindFiles bound(data.catalog->Binding());
 	try {
 		if (data.table.empty()) {
 			ExecuteListing(data, state, output);
