@@ -1,0 +1,146 @@
+# name: test/sql/catalog/stale_table_metadata.test
+# description: a table changed on the server after its columns were cached fails once, names the table, and reads again (issue #570)
+# group: [mssql]
+# issue: 570
+#
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS stale_db (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('stale_db', 'IF OBJECT_ID(''dbo.StaleColsTest'',''U'') IS NOT NULL DROP TABLE dbo.StaleColsTest');
+
+statement ok
+SELECT mssql_exec('stale_db', 'CREATE TABLE dbo.StaleColsTest (id INT, keep_me INT, drop_me INT)');
+
+statement ok
+SELECT mssql_exec('stale_db', 'INSERT INTO dbo.StaleColsTest VALUES (1, 10, 100)');
+
+statement ok
+SELECT mssql_invalidate_cache('stale_db', 'dbo', 'StaleColsTest');
+
+# The columns are cached by this read.
+query III
+SELECT * FROM stale_db.dbo.StaleColsTest;
+----
+1	10	100
+
+# Another client drops a column: mssql_exec with mssql_exec_invalidate_cache off (the default) does
+# not touch the cache, like SSMS or a migration.
+statement ok
+SELECT mssql_exec('stale_db', 'ALTER TABLE dbo.StaleColsTest DROP COLUMN drop_me');
+
+# The issue's statement: a CTAS of the cached table. It fails once, naming the table and what to do.
+statement error
+CREATE TABLE local_copy AS SELECT * FROM stale_db.dbo.StaleColsTest;
+----
+<REGEX>:.*Invalid column name 'drop_me'.*table stale_db\.dbo\.StaleColsTest: its columns changed on the server since they were loaded; its cached metadata is dropped now, run the statement again.*
+
+# Run again: it binds against what the server has now.
+statement ok
+CREATE TABLE local_copy AS SELECT * FROM stale_db.dbo.StaleColsTest;
+
+query II
+SELECT * FROM local_copy;
+----
+1	10
+
+# Dropped on the server: the read says so once; then the table is gone from the catalog too.
+statement ok
+SELECT mssql_exec('stale_db', 'DROP TABLE dbo.StaleColsTest');
+
+statement error
+SELECT * FROM stale_db.dbo.StaleColsTest;
+----
+<REGEX>:.*Invalid object name.*table stale_db\.dbo\.StaleColsTest: it no longer exists on the server under that name; its cached metadata is dropped now, run the statement again.*
+
+statement error
+SELECT * FROM stale_db.dbo.StaleColsTest;
+----
+does not exist
+
+# Inside an explicit transaction the same: the transaction's own lookups stop trusting the entry.
+statement ok
+SELECT mssql_exec('stale_db', 'CREATE TABLE dbo.StaleColsTest (id INT, drop_me INT)');
+
+statement ok
+SELECT mssql_invalidate_cache('stale_db', 'dbo', 'StaleColsTest');
+
+query II
+SELECT * FROM stale_db.dbo.StaleColsTest;
+----
+
+statement ok
+SELECT mssql_exec('stale_db', 'ALTER TABLE dbo.StaleColsTest DROP COLUMN drop_me');
+
+statement ok
+BEGIN;
+
+statement error
+SELECT * FROM stale_db.dbo.StaleColsTest;
+----
+its columns changed on the server since they were loaded; its cached metadata is dropped now, roll back the transaction and run the statement again
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+query I
+SELECT * FROM stale_db.dbo.StaleColsTest;
+----
+
+statement ok
+COMMIT;
+
+# A view naming a column that is gone does not compile on the server: nothing to drop here, the error
+# says to fix the view there.
+statement ok
+SELECT mssql_exec('stale_db', 'ALTER TABLE dbo.StaleColsTest ADD drop_me INT');
+
+statement ok
+SELECT mssql_exec('stale_db', 'IF OBJECT_ID(''dbo.StaleColsView'',''V'') IS NOT NULL DROP VIEW dbo.StaleColsView');
+
+statement ok
+SELECT mssql_exec('stale_db', 'CREATE VIEW dbo.StaleColsView AS SELECT id, drop_me FROM dbo.StaleColsTest');
+
+statement ok
+SELECT mssql_invalidate_cache('stale_db', 'dbo', 'StaleColsView');
+
+query II
+SELECT * FROM stale_db.dbo.StaleColsView;
+----
+
+statement ok
+SELECT mssql_exec('stale_db', 'ALTER TABLE dbo.StaleColsTest DROP COLUMN drop_me');
+
+statement error
+SELECT * FROM stale_db.dbo.StaleColsView;
+----
+<REGEX>:.*Invalid column name 'drop_me'.*view stale_db\.dbo\.StaleColsView: it does not compile on the server, a table it reads changed; fix the view there, then mssql_invalidate_cache\('stale_db', 'dbo', 'StaleColsView'\).*
+
+statement ok
+SELECT mssql_exec('stale_db', 'ALTER VIEW dbo.StaleColsView AS SELECT id FROM dbo.StaleColsTest');
+
+statement ok
+SELECT mssql_invalidate_cache('stale_db', 'dbo', 'StaleColsView');
+
+query I
+SELECT * FROM stale_db.dbo.StaleColsView;
+----
+
+statement ok
+SELECT mssql_exec('stale_db', 'DROP VIEW dbo.StaleColsView');
+
+statement ok
+SELECT mssql_exec('stale_db', 'DROP TABLE dbo.StaleColsTest');
+
+statement ok
+DETACH stale_db;

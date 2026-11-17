@@ -17,6 +17,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/common.hpp"	 // For COLUMN_IDENTIFIER_ROW_ID
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/table_column.hpp"  // For TableColumn, virtual_column_map_t
@@ -31,6 +32,7 @@
 #include "mssql_functions.hpp"	// For backward compatibility with MSSQLCatalogScanBindData
 #include "query/mssql_identifier.hpp"
 #include "query/mssql_query_executor.hpp"
+#include "query/mssql_result_stream.hpp"
 #include "query/mssql_sql_params.hpp"
 #include "table_scan/filter_encoder.hpp"
 #include "table_scan/table_scan_bind.hpp"
@@ -125,6 +127,55 @@ static unique_ptr<FunctionData> TableScanBind(ClientContext &context, TableFunct
 //------------------------------------------------------------------------------
 // Init Functions
 //------------------------------------------------------------------------------
+
+// Issue #570: the catalog's cached metadata of a table that changed on the server since it was loaded --
+// a column dropped or renamed (207, "Invalid column name"), the table dropped or renamed (208, "Invalid
+// object name") by another client, a migration, or mssql_exec with mssql_exec_invalidate_cache off. The
+// statement was written from the cached columns, so it cannot run; the table's entry is dropped as
+// mssql_invalidate_cache(db, schema, table) drops it, and the error says so: run again, the statement
+// binds against what the server has now. Nothing is retried here -- the columns are the bind's.
+// A view naming a column (or a table) that is gone answers 207 / 208 and then 4413 ("binding errors"):
+// the view itself is broken on the server, and dropping the entry would load the same columns again --
+// the error says to fix the view there. (A `SELECT *` view that lost a column answers 4502 instead,
+// sp_refreshview's case, and goes on as it came: the server's message says it.) In a transaction the error aborts it
+// (DuckDB's rule for this exception), so it says to roll back first. Any other error, or one with no numbers, goes on
+// as it came. Only this scan's statement: a statement sent whole (remote pushdown, mssql_dml) can read several tables,
+// and the server's error does not say which.
+static void RefuseStaleTable(ClientContext &context, const MSSQLCatalogScanBindData &bind_data,
+							 const std::exception &ex, std::unique_lock<std::mutex> &materialize_lock) {
+	ErrorData error(ex);
+	auto found = error.ExtraInfo().find(MSSQL_SERVER_ERROR_NUMBERS);
+	if (found == error.ExtraInfo().end()) {
+		return;
+	}
+	const auto numbers = StringUtil::Split(found->second, ',');
+	if (numbers.empty() || (numbers[0] != "207" && numbers[0] != "208")) {
+		return;
+	}
+	const bool view = std::find(numbers.begin(), numbers.end(), "4413") != numbers.end();
+	const string name = bind_data.context_name + "." + bind_data.schema_name + "." + bind_data.table_name;
+	if (view) {
+		throw InvalidInputException(
+			error.ExtraInfo(),
+			StringUtil::Format("%s (view %s: it does not compile on the server, a table it reads changed; "
+							   "fix the view there, then mssql_invalidate_cache('%s', '%s', '%s'))",
+							   error.RawMessage(), name, bind_data.context_name, bind_data.schema_name,
+							   bind_data.table_name));
+	}
+	if (materialize_lock.owns_lock()) {
+		materialize_lock.unlock();	// the invalidation takes the cache's locks
+	}
+	auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.context_name)).Cast<MSSQLCatalog>();
+	catalog.InvalidateTableEntry(bind_data.schema_name, bind_data.table_name);
+	catalog.NoteTransactionChange(context, bind_data.schema_name, bind_data.table_name);
+	const char *what = numbers[0] == "207" ? "its columns changed on the server since they were loaded"
+										   : "it no longer exists on the server under that name";
+	const char *then = context.transaction.IsAutoCommit() ? "run the statement again"
+														  : "roll back the transaction and run the statement again";
+	throw InvalidInputException(error.ExtraInfo(),
+								StringUtil::Format("%s (table %s: %s; its cached metadata is dropped now, %s)",
+												   error.RawMessage(), name, what, then));
+}
 
 static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	MSSQL_SCAN_DEBUG_LOG(1, "TableScanInitGlobal: START");
@@ -476,7 +527,12 @@ static unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &c
 		materialize_lock = std::unique_lock<std::mutex>(catalog.MaterializeMutexFor(context));
 	}
 	MSSQLQueryExecutor executor(bind_data.context_name);
-	result->result_stream = executor.Execute(context, request);
+	try {
+		result->result_stream = executor.Execute(context, request);
+	} catch (const std::exception &ex) {
+		RefuseStaleTable(context, bind_data, ex, materialize_lock);
+		throw;
+	}
 
 	// COLMETADATA is known now, so say what is wrong with the columns before any
 	// rows move. Waiting for the drain-end call loses this entirely on a query

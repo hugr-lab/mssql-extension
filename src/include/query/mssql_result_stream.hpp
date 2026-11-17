@@ -19,6 +19,10 @@ namespace tds {
 class ConnectionPool;
 }  // namespace tds
 
+//! The extra-info key of a statement's server error (an InvalidInputException): the SQL Server
+//! error numbers of the statement, decimal, comma-separated, in the order they came (issue #570).
+static constexpr const char *MSSQL_SERVER_ERROR_NUMBERS = "mssql_server_error_numbers";
+
 //===----------------------------------------------------------------------===//
 // MSSQLResultStream - Streaming result iterator that yields DataChunks
 //===----------------------------------------------------------------------===//
