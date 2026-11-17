@@ -248,7 +248,7 @@ SELECT typeof(doc) FROM mssql_scan('rvt', 'SELECT doc FROM dbo.JsonTypes WHERE i
 VARCHAR
 
 # Asked for by name, JSON is the core's type: a pushed statement names it so, and
-# it binds with the json extension not loaded (this file loads it only at the end).
+# it binds with the json extension not loaded (this file never loads it).
 query I
 SELECT typeof(doc) FROM mssql_scan('rvt', 'SELECT doc FROM dbo.JsonTypes WHERE id = 1', column_types := ['JSON']);
 ----
