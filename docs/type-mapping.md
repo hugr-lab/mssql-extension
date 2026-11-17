@@ -109,11 +109,12 @@ Bytes 8-15: Data4 (big-endian, as-is)
 
 `GuidEncoding::ReorderGuidBytes()` converts to standard big-endian format before creating the DuckDB `hugeint_t` UUID representation.
 
-### XML Type
+### XML and JSON Types
 
 | SQL Server Type | TDS Type ID | Wire Format | DuckDB Type | Notes |
 |---|---|---|---|---|
 | XML | 0xF1 | PLP encoding (UTF-16LE) | VARCHAR | UTF-16LE → UTF-8, up to 2 GB |
+| JSON (2025) | 0xA7 | `varchar(max)` PLP, UTF-8 BIN2 collation | JSON | read verbatim; JSONSUPPORT (0x0D) is not requested, so the server sends it as `varchar(max)` (spec 093 D7) |
 
 XML uses PLP (Partially Length-Prefixed) wire encoding with UTF-16LE data, identical to NVARCHAR(MAX). The column metadata includes a SCHEMA_PRESENT flag byte (and optional XML schema info if schema-bound).
 

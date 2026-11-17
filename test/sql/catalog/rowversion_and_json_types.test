@@ -224,10 +224,47 @@ SELECT mssql_exec('rvt', 'INSERT INTO dbo.JsonTypes (id, doc) VALUES (1, ''{"a":
 statement ok
 SELECT mssql_invalidate_cache('rvt');
 
-# --- the column reads as VARCHAR either way: on 2025 because the JSON type is
-# now named in the catalog's table, on 2022 because NVARCHAR(MAX) always did.
+# --- spec 093 D7: a JSON column is DuckDB's JSON on 2025; the NVARCHAR(MAX)
+# stand-in of an older server stays VARCHAR. Which one this server has decides
+# the expected name.
+statement ok
+CREATE TABLE json_expected AS SELECT CASE WHEN n > 0 THEN 'JSON' ELSE 'VARCHAR' END AS t
+FROM mssql_scan('rvt', 'SELECT COUNT(*) AS n FROM sys.types WHERE name = ''json''');
+
 query I
-SELECT count(*) FROM duckdb_columns() WHERE table_name = 'JsonTypes' AND column_name = 'doc' AND data_type = 'VARCHAR';
+SELECT count(*) FROM duckdb_columns() c, json_expected e WHERE c.table_name = 'JsonTypes' AND c.column_name = 'doc' AND c.data_type = e.t;
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT typeof(doc) AS t FROM rvt.dbo.JsonTypes WHERE id = 1) r, json_expected e WHERE r.t = e.t;
+----
+1
+
+# A raw scan is typed by the describe, which answers varchar(max): VARCHAR on both.
+query I
+SELECT typeof(doc) FROM mssql_scan('rvt', 'SELECT doc FROM dbo.JsonTypes WHERE id = 1');
+----
+VARCHAR
+
+# Asked for by name, JSON is the core's type: a pushed statement names it so, and
+# it binds with the json extension not loaded (this file never loads it).
+query I
+SELECT typeof(doc) FROM mssql_scan('rvt', 'SELECT doc FROM dbo.JsonTypes WHERE id = 1', column_types := ['JSON']);
+----
+JSON
+
+query I
+SELECT typeof(doc) FROM mssql_scan_unsafe('rvt', 'SELECT doc FROM dbo.JsonTypes WHERE id = 1', columns := {'doc': 'JSON'});
+----
+JSON
+
+# The type follows the column into a DuckDB table.
+statement ok
+CREATE TABLE json_local AS SELECT id, doc FROM rvt.dbo.JsonTypes;
+
+query I
+SELECT count(*) FROM duckdb_columns() c, json_expected e WHERE c.table_name = 'json_local' AND c.column_name = 'doc' AND c.data_type = e.t;
 ----
 1
 
@@ -288,6 +325,47 @@ SELECT id FROM rvt.dbo.JsonTypes WHERE doc IS NULL;
 ----
 2
 
+# --- spec 093 D7: a pushed SELECT (spec 079) has the entry's types, JSON on 2025;
+# it binds with the json extension not loaded (the vehicle names the type as text).
+query II
+SELECT id, doc FROM rvt.dbo.JsonTypes ORDER BY id LIMIT 3;
+----
+1	{"a":1,"b":[1,2]}
+2	NULL
+3	{"copied":true}
+
+query I
+SELECT count(*) FROM (SELECT typeof(doc) AS t FROM rvt.dbo.JsonTypes ORDER BY id LIMIT 1) r, json_expected e WHERE r.t = e.t;
+----
+1
+
+# --- and a JSON column is written: an UPDATE with the DML pushdown on and one with
+# it off, and an INSERT … RETURNING. (On 2025 both UPDATEs go row by row: the
+# rewriter does not push a constant SET into a column the server compares unlike
+# DuckDB, json among them; on 2022's nvarchar the first is pushed.)
+statement ok
+UPDATE rvt.dbo.JsonTypes SET doc = '{"u":1}' WHERE id = 10;
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+UPDATE rvt.dbo.JsonTypes SET doc = '{"u":2}' WHERE id = 11;
+
+statement ok
+RESET mssql_dml_pushdown;
+
+query II
+SELECT id, doc FROM rvt.dbo.JsonTypes WHERE id IN (10, 11) ORDER BY id;
+----
+10	{"u":1}
+11	{"u":2}
+
+query II
+INSERT INTO rvt.dbo.JsonTypes (id, doc) VALUES (40, '{"r":true}') RETURNING id, doc;
+----
+40	{"r":true}
+
 # --- J1 again: a JSON column cannot key a row, so on the row path a table with
 # no usable key that has one refuses UPDATE / DELETE by name, and so does a
 # staged MERGE whose ON compares it -- both sent the server a comparison of it
@@ -341,6 +419,12 @@ SELECT mssql_exec('rvt', 'DROP TABLE dbo.JsonNoKey');
 
 statement ok
 SELECT mssql_exec('rvt', 'DROP TABLE dbo.JsonTypes');
+
+statement ok
+DROP TABLE json_expected;
+
+statement ok
+DROP TABLE json_local;
 
 statement ok
 DETACH rvt;
