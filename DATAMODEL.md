@@ -742,6 +742,17 @@ them (`MSSQLResultStream::RefuseOutOfRangeIn`), since that plan has every filter
 catalog scan produces either: the 079 writer vetoes `rowid`, the hidden key columns come from the
 plan, and a DML pushed whole reads no key.
 
+**A `sql_variant` is a DuckDB `VARIANT` (spec 093 T1).** The column is read bare: each value
+arrives as SSVARIANT (`0x62`), a u32 length and an envelope -- base type, properties, the value in
+its TDS form (measured: `specs/093-type-kernels/measured/S1.md`). The stager keeps the envelopes as
+they are (`AppendArm::P4StageVariant`) and the `Variant` kernel writes the column through DuckDB's
+`VariantBuilder` (`BuildVariant`, one call a chunk): `codec/variant/variant_envelope` (DuckDB-free,
+fuzzed by `fuzz_variant_envelope`) splits each envelope and writes the value's VARIANT payload by
+spec 093 D3's table -- a string through spec 091's code-page kernels by its own collation, a
+`time(7)` / `datetime2(7)` in nanoseconds where they fit -- and `codec/variant/variant_codec` puts it
+in the vector. The column stays out of pushed comparisons and keys (`comparison_differs`): the server
+compares a `sql_variant` by its base type (#514).
+
 ### Reading a column's collation
 
 `ColumnMetadata` carries all five wire bytes of the TDS collation
@@ -1564,7 +1575,17 @@ flowchart BT
   UTF-16), so the stager's arms, the family kernels and `_mssql_rid`'s key bytes are the uncompressed
   path's: a `RowRecord` is either form. PAGE compression (the page dictionary) is PR 2's, refused by name.
 - **Prepared statements** keep the row their bind read (`SupportStatementCache`); `reread := true`
-  binds again on every `EXECUTE`. The opened-file cache shared across statements (D9) is task 22.
+  binds again on every `EXECUTE`.
+- **The opened-file cache** (D9, PR 4a): what an open read -- headers, page index, allocation map,
+  bootstrap tables -- is an `OpenedBackup` in the DuckDB instance's `ObjectCache`, keyed by every
+  file's path, size and version tag, evictable by its memory; the next call on the same files takes
+  it, and builds only its own catalog model. It holds no file: the handles of a `ByteSource` keep the
+  ClientContext that opened them, so every call opens its own (`StatementFiles`) and the long-lived
+  objects read a family file through a `BoundFile`, which reads through the statement files bound
+  to the reading thread (`BindFiles` in each bind / init / execute that reads). The shared state was
+  already safe across threads (the chain's spans, the searches' samples, the GAM bits and PFS pages
+  under their locks; the threads' last block / page keyed by object ids), so two statements read one
+  entry at once. `mssql_backup_cache = false` opens anew.
 
 Samples: `test/data/backup/` (synthetic, made by `test/backup/gen/generate.sh` on a throwaway
 container, with the golden `RESTORE HEADERONLY` / `LABELONLY` / `FILELISTONLY` beside each), checked by

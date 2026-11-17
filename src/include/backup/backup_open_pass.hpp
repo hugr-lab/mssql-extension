@@ -83,11 +83,10 @@ PassMap BuildPassMapInRanges(ClientContext &context, ByteSource &source, size_t 
 							 uint32_t number, const PassScanOptions &options = PassScanOptions(),
 							 uint64_t *ranges_read = nullptr);
 
-//! A PassMapper for BuildPageIndex: a family whose stream is a SourceAccess is scanned in ranges,
-//! any other (a container's decoded data set) through BuildPassMap. It keeps `context` by pointer,
-//! and the page index keeps it for a fallback (task 16c): the index lives no longer than the
-//! ByteSource its streams read, which must not outlive the context either (an opened-file cache
-//! keeping the index across statements, task 22, will have to give it each statement's mapper).
+//! A PassMapper for BuildPageIndex over SourceAccess streams: a family whose stream is a SourceAccess
+//! is scanned in ranges, any other (a container's decoded data set) through BuildPassMap. It keeps
+//! `context` by pointer, so the index must not outlive it. An opened backup's index, which may be
+//! cached across statements (task 22), takes BoundPassMapper instead (backup_files.hpp).
 PassMapper RangedPassMapper(ClientContext &context, const PassScanOptions &options = PassScanOptions());
 
 }  // namespace backup

@@ -164,6 +164,8 @@ set(EXTENSION_SOURCES
     src/codec/binary_codec.cpp
     src/codec/datetime_codec.cpp
     src/codec/uuid_codec.cpp
+    src/codec/variant/variant_envelope.cpp
+    src/codec/variant/variant_codec.cpp
     # Backup reader (spec 085): the parsers over byte spans, DuckDB-free (D15).
     src/backup/backup_allocation.cpp
     src/backup/backup_boot.cpp
@@ -179,6 +181,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_lob_map.cpp
     src/backup/backup_info_function.cpp
     src/backup/backup_mtf.cpp
+    src/backup/backup_files.cpp
     src/backup/backup_open_pass.cpp
     src/backup/backup_opened.cpp
     src/backup/backup_page.cpp

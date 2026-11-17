@@ -244,6 +244,7 @@ int main() {
 	// The committed sample: every row of both tables against samples.sql's expressions.
 	{
 		auto opened = OpenBackupCatalog(*con.context, {"test/data/backup/full.bak"});
+		BindFiles bound(opened->Binding());	 // reads through the statement's files, as a function's calls do
 		const PageStore &store = *opened->pages->store;
 		const CatalogTable *items = opened->model.FindTable("dbo", "items");
 		const CatalogTable *events = opened->model.FindTable("dbo", "events");

@@ -278,8 +278,10 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		return_types.push_back(column.type);
 	}
 	try {
-		auto opened = OpenBackupHeaders(context, std::vector<std::string>(data->paths.begin(), data->paths.end()));
-		data->row = InfoRow(*opened);
+		// The headers are what the opened-file cache holds first (D9): a later call on the same files
+		// takes them, and so does a catalog call after this one.
+		auto opened = OpenBackup(context, std::vector<std::string>(data->paths.begin(), data->paths.end()));
+		data->row = InfoRow(opened.backup->Headers());
 	} catch (FormatError &e) {
 		throw InvalidInputException("mssql_backup_info: %s", e.what());
 	}

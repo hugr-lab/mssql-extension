@@ -161,8 +161,8 @@ statement ok
 SELECT mssql_exec('ux', 'DROP TABLE dbo.UxDatetime');
 
 # =============================================================================
-# A SQL_VARIANT primary key: the read is lossy (issue #354), so it cannot
-# identify its row either. Same two shapes.
+# A SQL_VARIANT primary key: the server compares it by its base type, unlike DuckDB's VARIANT
+# (issues #354, #514), so it cannot identify its row either. Same two shapes.
 # =============================================================================
 
 statement ok
@@ -174,7 +174,7 @@ SELECT mssql_invalidate_cache('ux');
 statement error
 UPDATE ux.dbo.UxVariant SET v = 2 WHERE v = 1;
 ----
-key column 'p' has type sql_variant, which is read through a lossy CAST and cannot identify its row (see issue #354)
+key column 'p' has type sql_variant, which the server compares unlike DuckDB's read of it and cannot identify its row (see issue #354)
 
 # =============================================================================
 # The refusals name what was looked for and why each candidate was rejected.

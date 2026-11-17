@@ -53,6 +53,7 @@ Three modes:
 | `fuzz_backup_catalog` | the catalog reader over up to 16 pages: `ReadBootPage`, `ReadIamPage`, FixedVar records through the bootstrap tables' literal layouts and the layouts their rows describe (`ForEachPageRow`, `DecodeRecord`), `AddBootstrapRow`, `BuildIndexes`, `BaseLayout`, `CheckBootstrapLayouts`, every value's accessor, `ParseSqlVariant`, `ModuleText`, and `ReadLobValue` over the same pages | `src/backup/` (spec 085 PR 2b) | ✅ |
 | `fuzz_backup_lob` | values stored off row: `ParseOffRowPointer`, `WalkLob` assembled and map-only over up to 16 pages (the bytes handed over are the data nodes' records' bytes, covering the value in order; the nodes tile it as a tree; where the assembled walk succeeds the map-only walk agrees node for node and hands over no bytes), the value's `_mssql_lob` entry through `AppendLobMap` / `ParseLobMap`, and any map `ParseLobMap` takes written back byte for byte. Not fuzzed: the scan's UTF-16 block decode (`DecodeUtf16Block`, carrying a cut surrogate pair), which links DuckDB | `src/backup/` (spec 085 PR 3) | ✅ |
 | `fuzz_backup_cd` | ROW-compressed (CD) records: `ReadCdRecord` (the header, the column count in both forms, the CD array, the cluster array checked against the short region, the long region with its per-cluster counts, the back pointer of a forwarded record), `CdRow::Read` over the layout (every value put in its uncompressed form: the sign-flipped integers, vardecimal, the trimmed floats, datetime, the padded types, SCSU), and `DecodeCompressedUnicode` / `DecodeVardecimal` over every stored value whatever its column | `src/backup/` (spec 086 PR 1) | ✅ |
+| `fuzz_variant_envelope` | a sql_variant value's TDS envelope as a DuckDB VARIANT payload (spec 093 T1): `SplitTdsVariant`, `EncodeVariant` -- a value split is encoded or refused with a reason, its payload well-formed for its tag, a VARCHAR valid UTF-8. Seeds: experiment S1's values | `src/codec/variant/` | ✅ |
 | `fuzz_backup_record` | a user table's records through a layout the input gives (types, `sysrscols.ti`, offsets, null bits, bit positions, dropped / uniquifier / added-with-default flags) over one page: `ReadSlot`, `RowVarCount`, `ForwardedFrom`, `LocateValue` (every byte it names read, and required to lie in the page or the default), `DecodeRecord`, `FixedLength`, `KnownFixedXtype` | `src/backup/` (spec 085 PR 2d) | ✅ |
 
 `fuzz_code_page` (spec 091) is in the default `TARGETS`, so it shares the per-PR
@@ -99,7 +100,7 @@ instance) beside a built LOB tree, and for `backup_lob` every off-row form over 
 (`scripts/ci/leak_check.sh`) replays them under ASan + LSan; the weekly ClusterFuzzLite UBSan run
 (`ubsan-weekly` in `cflite-pr.yml`) fuzzes them beside the default targets, which it adds through
 `.clusterfuzzlite/extra_targets` (read by `.clusterfuzzlite/build.sh` as `TARGETS_EXTRA`); local
-discovery is `fuzz/run.sh <target>`, which builds a backup target on its own (`fuzz/run.sh backup_lob 600 6`).
+discovery is `fuzz/run.sh <target>`, which builds a backup target or `variant_envelope` on its own (`fuzz/run.sh backup_lob 600 6`).
 On macOS, where ASan hangs at the process's start, replay with `make fuzz-backup-replay FUZZ_REPLAY_SANITIZE=0`.
 
 ### `fuzz_bcp_encode`'s three oracles
@@ -185,7 +186,7 @@ docker build -t mssql-fuzz -f fuzz/Dockerfile .
 
 # Run a campaign (CmpLog + dict + all cores). Findings persist on the host.
 docker run --rm -it -v "$PWD/fuzz/findings:/repo/fuzz/findings" mssql-fuzz \
-    fuzz/run.sh tds_tokens          # or: browser_response | utf16 | envchange_txn | login_response | code_page | backup_*
+    fuzz/run.sh tds_tokens          # or: browser_response | utf16 | envchange_txn | login_response | code_page | backup_* | variant_envelope
 #   fuzz/run.sh tds_tokens 600 4    # 600s/core, 4 cores
 ```
 

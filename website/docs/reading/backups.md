@@ -264,6 +264,20 @@ from what `RESTORE` makes of it by replaying the log tail.
 The oracle lane restores every fixture backup of SQL Server 2017 to 2025 and compares each table's
 rows with `mssql_backup_scan`'s, both ways, through `TYPE mssql`.
 
+## Opening a backup once
+
+A backup is opened once per DuckDB instance: what a call read to open it -- the headers, where
+each page lies, which pages are live, the catalog's base tables -- is kept for the next call on the
+same files, so a query per table of a large backup (an import, say) pays the open once. The files
+themselves are opened again by every call, which checks that each one is the same: a file whose size
+or modification time (an ETag on object storage) changed is opened anew, and so is a local file
+replaced by another one (a new inode). What is not caught: a backup rewritten in place at the same size
+whose modification time then reads as before -- set back with `touch -r`, or within a coarse clock (2 s on
+FAT, 1 s over HTTP without an ETag). It is taken for the cached one, and its pages are looked for where
+the old one had them. Turn the cache off for such files. What is kept
+is evicted under memory pressure, like DuckDB's other caches, and another DuckDB instance in the
+same process keeps its own. `SET mssql_backup_cache = false` opens the backup anew on every call.
+
 ## Prepared statements
 
 `mssql_backup_info` reads the file when the statement binds, and a prepared statement keeps what

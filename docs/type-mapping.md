@@ -109,11 +109,12 @@ Bytes 8-15: Data4 (big-endian, as-is)
 
 `GuidEncoding::ReorderGuidBytes()` converts to standard big-endian format before creating the DuckDB `hugeint_t` UUID representation.
 
-### XML Type
+### XML and JSON Types
 
 | SQL Server Type | TDS Type ID | Wire Format | DuckDB Type | Notes |
 |---|---|---|---|---|
 | XML | 0xF1 | PLP encoding (UTF-16LE) | VARCHAR | UTF-16LE → UTF-8, up to 2 GB |
+| JSON (2025) | 0xA7 | `varchar(max)` PLP, UTF-8 BIN2 collation | JSON | read verbatim; JSONSUPPORT (0x0D) is not requested, so the server sends it as `varchar(max)` (spec 093 D7) |
 
 XML uses PLP (Partially Length-Prefixed) wire encoding with UTF-16LE data, identical to NVARCHAR(MAX). The column metadata includes a SCHEMA_PRESENT flag byte (and optional XML schema info if schema-bound).
 
@@ -123,10 +124,20 @@ XML uses PLP (Partially Length-Prefixed) wire encoding with UTF-16LE data, ident
 
 **DML (INSERT/UPDATE via SQL literals)**: Small XML values (up to 4096 bytes serialized) are allowed. Larger values are rejected with an error recommending COPY TO with BCP protocol, since SQL literal serialization has size limits while XML documents can be up to 2 GB.
 
+### SQL_VARIANT Type
+
+| SQL Server Type | TDS Type ID | Wire Format | DuckDB Type | Notes |
+|---|---|---|---|---|
+| SQL_VARIANT | 0x62 | 4-byte len + base type, property bytes, value | VARIANT | Each value keeps its base type (spec 093 T1) |
+
+Read the same way by an attached catalog and by a raw `mssql_scan` / `mssql_scan_params`, with no
+conversion on the server: the envelope's base type picks the family codec that decodes the value. See
+the types page for each base type's DuckDB type.
+
 ### Not read by a raw scan yet
 
 An attached catalog reads these columns through a server-side conversion (spatial as WKB,
-`sql_variant` per base type, `hierarchyid` and other CLR types as text). A raw `mssql_scan` /
+`hierarchyid` and other CLR types as text). A raw `mssql_scan` /
 `mssql_scan_params` that selects one bare is refused at bind, naming the column and the type; spec 093
 decodes them on the client type by type. Their COLMETADATA and rows are parsed, so a batch that returns
 them to `mssql_exec`, or a DML whose trigger does, no longer fails.
@@ -134,11 +145,9 @@ them to `mssql_exec`, or a DML whose trigger does, no longer fails.
 | SQL Server Type | TDS Type ID | Read by a raw scan |
 |---|---|---|
 | UDT (GEOGRAPHY, GEOMETRY, HIERARCHYID, user CLR types) | 0xF0 | not yet (spec 093 T4, T5) |
-| SQL_VARIANT | 0x62 | not yet (spec 093 T1) |
 
 ```
 MSSQL Error: column 'g' is of the CLR type sys.geometry, which a raw mssql_scan does not read yet. ...
-MSSQL Error: column 'v' is a sql_variant, which a raw mssql_scan does not read yet. ...
 ```
 
 ## NULL Handling

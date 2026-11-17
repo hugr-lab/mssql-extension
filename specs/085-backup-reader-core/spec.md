@@ -309,10 +309,18 @@ a type whose conversion is still to come is read as its stored bytes (below).
 - **D9 — the opened-file cache (owner, R§6.1).** An import calls the functions once per table on the
   same file, and a cold open costs a pass over the whole file. The opened backup is kept in DuckDB's
   per-instance `ObjectCache` (`storage/object_cache.hpp`), keyed by every family file's canonical path,
-  size and version tag (`GetVersionTag`, the ETag, else `GetLastModifiedTime`), and re-checked against
-  `BackupSetGUID` after opening. The entry reports `GetEstimatedCacheMemory`, so it is evictable under
+  size and version tag (`GetVersionTag`: on a local file DuckDB's device, inode, size and
+  modification time to the microsecond; over HTTP the ETag, else `Last-Modified`; a file with neither
+  is not cached). The key alone is trusted (owner, 2026-11-17, review of #567): a hit reads no header
+  again, so a file rewritten in place at the same size whose modification time then reads as before --
+  set back (`touch -r`), or within a coarse clock (2 s on FAT, 1 s of `Last-Modified` with no ETag) --
+  is taken for the one cached; `mssql_backup_cache = false` is the way out. The entry reports `GetEstimatedCacheMemory`, so it is evictable under
   memory pressure; an attached catalog holds a `shared_ptr` and pins it. A file whose size or version
-  tag changed is reopened, never trusted.
+  tag changed is reopened, never trusted. Per DuckDB instance, never per process, and an ATTACH keeps
+  its opened backup in its own catalog (owner, 2026-11-16). As built (PR 4a): the entry holds no file
+  -- a ByteSource's handles keep the opening ClientContext -- so each statement opens its own
+  (`StatementFiles`) and the long-lived objects read through a `BoundFile`, which reads through the
+  statement files bound to the reading thread; the catalog model stays the statement's.
 
 - **D10 — MS_XPRESS blocks decode one at a time.** R§3 and W§3 (from Internals Viewer) say the match
   window spans blocks, which would force a sequential pass. Our own decoder
@@ -1470,7 +1478,9 @@ per-AU runs and parallel units (2e), off-row values (PR 3), `mssql_backup_column
     output, root bytes and node list (DQ-05) — 5 d
 21. Fuzz harness lob; LOB fixtures in the oracle lane — 1 d
 
-**PR 4 — cache, ATTACH, overlay, remote**
+**PR 4 — cache, ATTACH, overlay, remote**, in four PRs (owner, 2026-11-16): 4a the cache (task 22),
+4b ATTACH (23), 4c the overlay (24), 4d the remote tests and the open pass measured (25); each merges
+before the next opens.
 
 22. Opened-file cache: staged build, key, eviction estimate — 1.5 d
 23. ATTACH: storage extension, catalog / schema / table entries, transaction manager, isolation from

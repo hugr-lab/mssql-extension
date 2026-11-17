@@ -476,6 +476,15 @@ exit_loop:
 			if (stager_.ChunkOutOfRange(c) > 0) {
 				NoteOutOfRange(c);
 			}
+			// Spec 093 T1: a sql_variant value read as its bytes is said as soon as the scan meets
+			// one, like D8's out-of-range values, so a query that stops early still says it.
+			if (column_metadata_[c].type_id == tds::TDS_TYPE_SQL_VARIANT &&
+				(c >= variant_notes_warned_.size() || !variant_notes_warned_[c])) {
+				const auto &notes = stager_.VariantNotes(c);
+				if (notes.unknown_collation + notes.invalid_utf8 > 0) {
+					warnings_pending_ = true;
+				}
+			}
 		}
 		if (counters_enabled_) {
 			CountChunkForDebug(chunk, row_count);
@@ -556,8 +565,18 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 			target_vector = &chunk.data[col_idx];
 		}
 
+		mssql::codec::variant::VariantColumnNotes *variant_notes = nullptr;
+		if (column_metadata_[col_idx].type_id == tds::TDS_TYPE_SQL_VARIANT) {
+			row_variant_notes_.resize(column_metadata_.size());
+			variant_notes = &row_variant_notes_[col_idx];
+		}
 		tds::encoding::TypeConverter::ConvertValue(row.values[col_idx], row.null_mask[col_idx],
-												   column_metadata_[col_idx], *target_vector, row_idx);
+												   column_metadata_[col_idx], *target_vector, row_idx, variant_notes);
+		// Spec 093 T1: as the staged path, said as soon as the scan meets one.
+		if (variant_notes && variant_notes->unknown_collation + variant_notes->invalid_utf8 > 0 &&
+			(col_idx >= variant_notes_warned_.size() || !variant_notes_warned_[col_idx])) {
+			warnings_pending_ = true;
+		}
 		// A datetime2 value read as NULL for not fitting TIMESTAMP_NS (issue #168): spec 093 D8's warning.
 		if (column_metadata_[col_idx].type_id == tds::TDS_TYPE_DATETIME2 && !row.null_mask[col_idx] &&
 			target_vector->GetType().id() == LogicalTypeId::TIMESTAMP_NS &&
@@ -1008,6 +1027,36 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 							   "datetime2_7_as 'timestamp' (or SET mssql_datetime2_7_as = 'timestamp' before ATTACH) "
 							   "to read them as TIMESTAMP, the 100 ns digit truncated",
 							   column_metadata_[c].name.c_str());
+		}
+	}
+
+	// Spec 093 T1: sql_variant values the scan read as their bytes (a collation this build has no code
+	// page for, UTF-8 bytes that are not UTF-8), once a column.
+	if (stager_.IsConfigured() || !row_variant_notes_.empty()) {
+		variant_notes_warned_.resize(column_metadata_.size(), false);
+		for (idx_t c = 0; c < column_metadata_.size(); c++) {
+			if (column_metadata_[c].type_id != tds::TDS_TYPE_SQL_VARIANT || variant_notes_warned_[c]) {
+				continue;
+			}
+			mssql::codec::variant::VariantColumnNotes notes;
+			if (stager_.IsConfigured()) {
+				notes = stager_.VariantNotes(c);
+			}
+			if (c < row_variant_notes_.size()) {
+				notes.unknown_collation += row_variant_notes_[c].unknown_collation;
+				notes.invalid_utf8 += row_variant_notes_[c].invalid_utf8;
+			}
+			if (notes.unknown_collation + notes.invalid_utf8 == 0) {
+				continue;
+			}
+			variant_notes_warned_[c] = true;
+			DUCKDB_LOG_WARNING(context,
+							   "mssql: column \"%s\": %llu sql_variant string value(s) read as their bytes (a BLOB "
+							   "inside the VARIANT): %llu under a collation this build has no code page for, %llu "
+							   "under a UTF-8 collation but not UTF-8",
+							   column_metadata_[c].name.c_str(),
+							   (unsigned long long)(notes.unknown_collation + notes.invalid_utf8),
+							   (unsigned long long)notes.unknown_collation, (unsigned long long)notes.invalid_utf8);
 		}
 	}
 

@@ -594,6 +594,16 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "read at ATTACH (default: true)",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 
+	// mssql_backup_cache - Spec 085 D9 (task 22): a backup file function keeps what it opened -- the
+	// headers, the page index, the allocation map, the bootstrap tables -- in the DuckDB instance's
+	// ObjectCache, keyed by every file's path, size and version tag, so the next call on the same
+	// files reads none of it again. Off: every call opens the backup anew.
+	config.AddExtensionOption("mssql_backup_cache",
+							  "Keep an opened backup (headers, page index, allocation, catalog base tables) for the "
+							  "next call on the same unchanged files, in the DuckDB instance's object cache "
+							  "(default: true)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	// mssql_client_transcode - Spec 092 D4: read code-page text as bytes and
 	// transcode it on the client, with the tables spec 091 generated from the server.
 	// Read once per catalog, at ATTACH: one catalog must not mix the two forms. Two

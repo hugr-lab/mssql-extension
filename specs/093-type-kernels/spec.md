@@ -1,7 +1,7 @@
 # Spec 093: one decoder per type, for the TDS stream and for backups
 
-Status: **draft**, 2026-11-13. In progress: T0 (#557) and T9 (#560) are in review, and T1 is built
-on T0; the `measured/` records go in with T0. The owner's decisions are recorded as DQ-42 – DQ-45 in
+Status: **draft**, 2026-11-13. In progress: T0 (#557) and T9 (#560) are merged, with the `measured/`
+records; T1 is in review (#564); T7 is built from main. The owner's decisions are recorded as DQ-42 – DQ-45 in
 [085's decisions.md](../085-backup-reader-core/decisions.md) and quoted where they apply; geography's CRS label was amended
 the same day (§ Why `OGC:CRS84`). Line references were taken at main `96ecf7e`.
 
@@ -391,7 +391,11 @@ A raw `mssql_scan` takes the type from UDT_INFO's type name (geometry, geography
 `TYPE mssql` reports `LogicalType::JSON()` for a `json` column (the recon's T7, accepted with the PR
 split). The wire form is unchanged
 (`varchar(max)` UTF-8). JSONSUPPORT (`0x0D`) is not requested: it changes nothing but the describe.
-Slightly breaking: a `DESCRIBE` says `JSON`.
+Slightly breaking: a `DESCRIBE` says `JSON`. A raw scan keeps `VARCHAR`, the describe's type. `JSON` is
+the core's type, but its name resolves only through the json extension's catalog entry, and a pushed
+statement names its result types as text (`columns :=` / `column_types :=`): the name `JSON` is
+mapped to the core's type there, so a pushed query binds without the extension (found building T7: a
+pushed `ORDER BY` over a `json` column failed with `Type with name "JSON" is not in the catalog`).
 
 ### D8: `datetime2(7)`
 

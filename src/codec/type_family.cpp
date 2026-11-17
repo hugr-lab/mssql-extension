@@ -123,6 +123,11 @@ TypeFamily FamilyFromLogicalType(const LogicalType &type) {
 	case LogicalTypeId::UUID:
 		return TypeFamily::Uuid;
 
+	case LogicalTypeId::VARIANT:
+		// Spec 093: read from a sql_variant (T1); written, and created by CTAS, from T2 on.
+		throw NotImplementedException(
+			"a VARIANT value cannot be written to SQL Server yet (a sql_variant column is "
+			"written from spec 093 T2 on); write it with mssql_exec");
 	default:
 		throw NotImplementedException("Unsupported DuckDB type '%s' for TypeFamily mapping", type.ToString());
 	}
