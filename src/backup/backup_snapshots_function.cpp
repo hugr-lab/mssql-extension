@@ -96,9 +96,9 @@ std::shared_ptr<const BackupHistory> AttachedHistory(ClientContext &context, con
 	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {
 		return nullptr;
 	}
-	auto &catalog = db->GetCatalog().Cast<MSSQLBackupCatalog>();
-	default_version = catalog.DefaultVersion();
-	return catalog.SharedHistory();
+	const auto versions = db->GetCatalog().Cast<MSSQLBackupCatalog>().VersionsFor(&context);
+	default_version = versions->default_version;
+	return versions->history;
 }
 
 unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
@@ -166,9 +166,70 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	output.SetChildCardinality(count);
 }
 
+// mssql_backup_refresh(name): the attached history read again, at execution (not at bind: an EXPLAIN or a
+// PREPARE refreshes nothing).
+struct RefreshBindData : public TableFunctionData {
+	std::string name;
+};
+
+struct RefreshState : public GlobalTableFunctionState {
+	bool done = false;
+};
+
+unique_ptr<FunctionData> RefreshBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
+									 vector<Identifier> &names) {
+	if (input.inputs[0].IsNull()) {
+		throw InvalidInputException("mssql_backup_refresh: the name is NULL");
+	}
+	auto data = make_uniq<RefreshBindData>();
+	data->name = input.inputs[0].ToString();
+	names = {Identifier("versions_before"), Identifier("versions")};
+	return_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+	return std::move(data);
+}
+
+unique_ptr<GlobalTableFunctionState> RefreshInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<RefreshState>();
+}
+
+void RefreshExecute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<RefreshState>();
+	if (state.done) {
+		output.SetChildCardinality(0);
+		return;
+	}
+	state.done = true;
+	const auto &name = input.bind_data->Cast<RefreshBindData>().name;
+	auto db = DatabaseManager::Get(context).GetDatabase(Identifier(name));
+	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {
+		throw InvalidInputException(
+			"mssql_backup_refresh: %s is not a backup attached as a catalog "
+			"(ATTACH … (TYPE mssql_backup, history true))",
+			name);
+	}
+	const auto counts = db->GetCatalog().Cast<MSSQLBackupCatalog>().Refresh(context);
+	output.data[0].SetValue(0, Value::BIGINT(static_cast<int64_t>(counts.first)));
+	output.data[1].SetValue(0, Value::BIGINT(static_cast<int64_t>(counts.second)));
+	output.SetChildCardinality(1);
+}
+
 }  // namespace
 
 void RegisterBackupSnapshotsFunction(ExtensionLoader &loader) {
+	{
+		TableFunctionSet refresh("mssql_backup_refresh");
+		refresh.AddFunction(
+			TableFunction("mssql_backup_refresh", {LogicalType::VARCHAR}, RefreshExecute, RefreshBind, RefreshInit));
+		mssql::RegisterDocumentedFunction(
+			loader, std::move(refresh),
+			{{},
+			 "Reads again the files of a backup history attached with ATTACH … (TYPE mssql_backup, history true): "
+			 "the glob expanded again, the headers of new or changed files read (the others kept), and the "
+			 "versions renumbered; a version already read keeps its catalog. Returns the number of versions "
+			 "before and after.",
+			 {"CALL mssql_backup_refresh('bk')"},
+			 {"backup"}});
+	}
 	TableFunctionSet set(FUNCTION);
 	const vector<LogicalType> arguments{LogicalType(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)};
 	for (const auto &argument : arguments) {

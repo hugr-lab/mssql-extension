@@ -47,10 +47,12 @@ ScanColumns ScanColumnsOf(const CatalogTable &table);
 virtual_column_map_t ScanVirtualColumns(const std::vector<UnreadColumn> &unread);
 
 //! mssql_backup_scan bound on `schema`.`table` of `attached` (task 23): what the catalog's table entry
-//! `entry` hands DuckDB.
+//! `entry` hands DuckDB. `version`: its number in the catalog's history now (task 24b), what a plan
+//! deserialized finds it by; 0 when the history no longer has it.
 TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &entry,
-								   std::shared_ptr<const AttachedBackup> attached, const std::string &schema,
-								   const std::string &table, unique_ptr<FunctionData> &bind_data);
+								   std::shared_ptr<const AttachedBackup> attached, uint64_t version,
+								   const std::string &schema, const std::string &table,
+								   unique_ptr<FunctionData> &bind_data);
 
 void RegisterBackupScanFunction(ExtensionLoader &loader);
 

@@ -49,6 +49,7 @@ const HistoryVersion *BackupHistory::FinishedBy(const MtfDate &when) const {
 
 BackupHistory BuildHistory(std::vector<HistoryFamily> families) {
 	BackupHistory history;
+	history.families = families;
 	const std::string first_path = families.empty() ? std::string() : families.front().path;
 	// One backup per backup set GUID, its families by sequence number.
 	std::map<std::array<uint8_t, 16>, std::vector<HistoryFamily>> by_set;

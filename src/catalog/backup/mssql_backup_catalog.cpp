@@ -20,6 +20,8 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
@@ -43,20 +45,139 @@ using mssql::backup::CatalogTable;
 //===----------------------------------------------------------------------===//
 
 MSSQLBackupCatalog::MSSQLBackupCatalog(AttachedDatabase &db, std::string name,
-									   std::shared_ptr<const BackupHistory> history, uint64_t default_version,
-									   std::shared_ptr<const AttachedBackup> default_backup, Opener opener)
-	: Catalog(db),
-	  name_(std::move(name)),
-	  history_(std::move(history)),
-	  default_version_(default_version),
-	  opener_(std::move(opener)) {
-	states_.resize(history_->versions.size());
-	states_[default_version_ - 1] = MakeState(std::move(default_backup));
+									   std::shared_ptr<const BackupHistory> history, mssql::backup::BackupAt default_at,
+									   uint64_t default_version, std::shared_ptr<const AttachedBackup> default_backup,
+									   Opener opener, Reader reader)
+	: Catalog(db), name_(std::move(name)), opener_(std::move(opener)), reader_(std::move(reader)) {
+	// The file functions on the catalog's name as its own table functions (DuckLake's `db.snapshots()`),
+	// parsed once for every schema of every version.
+	std::string literal = "'";
+	for (const char c : name_) {
+		literal += c;
+		if (c == '\'') {
+			literal += c;
+		}
+	}
+	literal += "'";
+	struct Macro {
+		const char *name;
+		const char *function;
+		bool versioned;
+	};
+	static const Macro MACROS[] = {{"snapshots", "mssql_backup_snapshots", false},
+								   {"refresh", "mssql_backup_refresh", false},
+								   {"info", "mssql_backup_info", true},
+								   {"schemas", "mssql_backup_schemas", true},
+								   {"tables", "mssql_backup_tables", true},
+								   {"views", "mssql_backup_views", true},
+								   {"columns", "mssql_backup_columns", true}};
+	for (const auto &m : MACROS) {
+		const std::string sql = std::string("FROM ") + m.function + "(" + literal +
+								(m.versioned ? ", version := version, as_of := as_of)" : ")");
+		auto function = make_uniq<TableMacroFunction>(Parser::GetBuiltinParser().ParseSelectNode(sql));
+		if (m.versioned) {
+			for (const char *parameter : {"version", "as_of"}) {
+				function->parameters.push_back(make_uniq<ColumnRefExpression>(parameter));
+				function->default_parameters.insert(Identifier(parameter), ConstantExpression::Null());
+			}
+		}
+		macros_.emplace_back(m.name, std::move(function));
+	}
+	auto versions = std::make_shared<Versions>();
+	versions->history = std::move(history);
+	versions->default_version = default_version;
+	const auto &chosen = versions->history->versions[default_version - 1];
+	if (default_at.IsSet()) {
+		pinned_ = Identity(*versions->history, chosen);
+	}
+	states_[StateKey(*versions->history, chosen)] = MakeState(std::move(default_backup));
+	versions_ = std::move(versions);
 }
 
 MSSQLBackupCatalog::~MSSQLBackupCatalog() = default;
 
 void MSSQLBackupCatalog::Initialize(bool) {}
+
+static std::string BackupKey(const std::string &set_guid, const std::vector<std::string> &paths,
+							 const std::vector<uint64_t> &sizes, const std::vector<std::string> &tags) {
+	std::string key = set_guid;
+	for (size_t i = 0; i < paths.size(); i++) {
+		key += '\x1f' + paths[i] + '\x1e' + std::to_string(sizes[i]) + '\x1e' + tags[i];
+	}
+	return key;
+}
+
+std::string MSSQLBackupCatalog::StateKey(const BackupHistory &history, const mssql::backup::HistoryVersion &version) {
+	auto of = [&](size_t i) {
+		const auto &b = history.backups[i];
+		return BackupKey(b.set.backup_set_guid.ToString(), b.paths, b.sizes, b.version_tags);
+	};
+	return of(version.full) + (version.IsDifferential() ? '\x1d' + of(version.diff) : std::string());
+}
+
+std::string MSSQLBackupCatalog::StateKey(const AttachedBackup &backup) {
+	auto of = [](const mssql::backup::OpenedBackup &opened) {
+		const auto &headers = opened.Headers();
+		std::vector<std::string> paths, tags;
+		std::vector<uint64_t> sizes;
+		// The families' files in sequence order, as the history lists them.
+		for (const auto &family : headers.families) {
+			const auto &key = headers.files[family->file];
+			paths.push_back(key.path);
+			sizes.push_back(key.size);
+			tags.push_back(key.version);
+		}
+		return BackupKey(headers.Set().backup_set_guid.ToString(), paths, sizes, tags);
+	};
+	const auto &opened = *backup.backup;
+	return opened.Base() ? of(*opened.Base()) + '\x1d' + of(opened) : of(opened);
+}
+
+std::string MSSQLBackupCatalog::Identity(const BackupHistory &history, const mssql::backup::HistoryVersion &version) {
+	std::string key = history.backups[version.full].set.backup_set_guid.ToString();
+	if (version.IsDifferential()) {
+		key += "/" + history.backups[version.diff].set.backup_set_guid.ToString();
+	}
+	return key;
+}
+
+std::shared_ptr<const MSSQLBackupCatalog::Versions> MSSQLBackupCatalog::CurrentVersions() const {
+	std::lock_guard<std::mutex> guard(lock_);
+	return versions_;
+}
+
+std::shared_ptr<const MSSQLBackupCatalog::Versions> MSSQLBackupCatalog::VersionsFor(
+	optional_ptr<ClientContext> context) {
+	if (context && context->transaction.HasActiveTransaction()) {
+		auto transaction = Transaction::TryGet(*context, GetAttached());
+		if (transaction) {
+			auto &own = transaction->Cast<MSSQLBackupTransaction>();
+			std::lock_guard<std::mutex> guard(own.lock);
+			if (!own.versions) {
+				own.versions = CurrentVersions();
+			}
+			return own.versions;
+		}
+	}
+	return CurrentVersions();
+}
+
+uint64_t MSSQLBackupCatalog::NumberOf(optional_ptr<ClientContext> context, const AttachedBackup &backup) {
+	const auto versions = VersionsFor(context);
+	const std::string key = StateKey(backup);
+	for (const auto &v : versions->history->versions) {
+		if (StateKey(*versions->history, v) == key) {
+			return v.number;
+		}
+	}
+	return 0;
+}
+
+MSSQLBackupCatalog::State &MSSQLBackupCatalog::DefaultState() const {
+	std::lock_guard<std::mutex> guard(lock_);
+	const auto &history = *versions_->history;
+	return *states_.at(StateKey(history, history.versions[versions_->default_version - 1]));
+}
 
 unique_ptr<MSSQLBackupCatalog::State> MSSQLBackupCatalog::MakeState(std::shared_ptr<const AttachedBackup> backup) {
 	auto state = make_uniq<State>();
@@ -71,6 +192,14 @@ unique_ptr<MSSQLBackupCatalog::State> MSSQLBackupCatalog::MakeState(std::shared_
 		info.internal = false;
 		state->schemas[s.name] = make_uniq<MSSQLBackupSchemaEntry>(*this, info, state->backup);
 	}
+	if (state->schemas.empty()) {
+		// The filters kept no schema: an empty dbo, internal, so the catalog's own functions still answer
+		// (`bk.tables()` lists nothing, `bk.snapshots()` the versions; owner, 2026-11-18).
+		CreateSchemaInfo info;
+		info.SetSchema(Identifier("dbo"));
+		info.internal = true;
+		state->schemas["dbo"] = make_uniq<MSSQLBackupSchemaEntry>(*this, info, state->backup);
+	}
 	for (const auto &t : model.tables) {
 		auto schema = state->schemas.find(t.schema_name);
 		if (schema != state->schemas.end()) {
@@ -80,38 +209,89 @@ unique_ptr<MSSQLBackupCatalog::State> MSSQLBackupCatalog::MakeState(std::shared_
 	return state;
 }
 
-MSSQLBackupCatalog::State &MSSQLBackupCatalog::StateOf(optional_ptr<ClientContext> context, uint64_t version) {
+MSSQLBackupCatalog::State &MSSQLBackupCatalog::StateOf(optional_ptr<ClientContext> context, const Versions &versions,
+													   uint64_t version) {
+	const auto &history = *versions.history;
+	const auto &entry = history.versions[version - 1];
+	const std::string key = StateKey(history, entry);
 	{
 		std::lock_guard<std::mutex> guard(lock_);
-		if (states_[version - 1]) {
-			return *states_[version - 1];
+		auto found = states_.find(key);
+		if (found != states_.end()) {
+			return *found->second;
 		}
 	}
 	if (!context) {
 		throw InternalException("%s: version %llu of the backup is first read without a client context", name_,
 								(unsigned long long)version);
 	}
-	auto state = MakeState(opener_(*context, history_->versions[version - 1]));
+	auto state = MakeState(opener_(*context, history, entry));
 	std::lock_guard<std::mutex> guard(lock_);
-	if (!states_[version - 1]) {
-		states_[version - 1] = std::move(state);
+	auto &slot = states_[key];
+	if (!slot) {
+		slot = std::move(state);
 	}
-	return *states_[version - 1];
+	return *slot;
 }
 
-uint64_t MSSQLBackupCatalog::VersionAt(optional_ptr<ClientContext> context, const std::string &unit,
-									   const Value &value) const {
-	if (unit.empty()) {
-		return default_version_;
+uint64_t MSSQLBackupCatalog::Resolve(const Versions &versions, optional_ptr<ClientContext> context,
+									 const mssql::backup::BackupAt &at) const {
+	if (!at.IsSet()) {
+		return versions.default_version;
 	}
-	mssql::backup::BackupAt at;
-	at.unit = unit;
-	at.value = value;
-	return mssql::backup::ResolveVersion(*history_, context, at, "the backup attached as " + name_);
+	return mssql::backup::ResolveVersion(*versions.history, context, at, "the backup attached as " + name_);
 }
 
-std::shared_ptr<const AttachedBackup> MSSQLBackupCatalog::BackupOf(ClientContext &context, uint64_t version) {
-	return StateOf(context, version).backup;
+std::shared_ptr<const AttachedBackup> MSSQLBackupCatalog::BackupAt(optional_ptr<ClientContext> context,
+																   const mssql::backup::BackupAt &at) {
+	const auto versions = VersionsFor(context);
+	return StateOf(context, *versions, Resolve(*versions, context, at)).backup;
+}
+
+std::pair<uint64_t, uint64_t> MSSQLBackupCatalog::Refresh(ClientContext &context) {
+	if (!reader_) {
+		throw InvalidInputException(
+			"mssql_backup_refresh: %s was attached without history: ATTACH it with "
+			"(TYPE mssql_backup, history true) to take new backups in",
+			name_);
+	}
+	std::lock_guard<std::mutex> one_at_a_time(refresh_lock_);
+	const auto before = CurrentVersions();
+	auto refreshed = std::make_shared<Versions>();
+	refreshed->history = reader_(context, *before->history);
+	const auto &versions = refreshed->history->versions;
+	refreshed->default_version = versions.back().number;
+	if (!pinned_.empty()) {
+		// The version snapshot_version / snapshot_time chose, by its backups, wherever it is now.
+		bool found = false;
+		for (const auto &v : versions) {
+			if (Identity(*refreshed->history, v) == pinned_) {
+				refreshed->default_version = v.number;
+				found = true;
+			}
+		}
+		if (!found) {
+			DUCKDB_LOG_WARNING(context,
+							   "mssql_backup_refresh: the version %s's snapshot_version / snapshot_time chose is no "
+							   "longer among its files: the latest is read without AT",
+							   name_);
+		}
+	}
+	// The default version's entries now, so a lookup without AT never opens a backup under the swap.
+	StateOf(&context, *refreshed, refreshed->default_version);
+	{
+		std::lock_guard<std::mutex> guard(lock_);
+		versions_ = refreshed;
+	}
+	// The refreshing transaction reads the new versions from here on; any other, from its next one.
+	auto transaction = context.transaction.HasActiveTransaction() ? Transaction::TryGet(context, GetAttached())
+																  : optional_ptr<Transaction>();
+	if (transaction) {
+		auto &own = transaction->Cast<MSSQLBackupTransaction>();
+		std::lock_guard<std::mutex> guard(own.lock);
+		own.versions = refreshed;
+	}
+	return {before->history->versions.size(), versions.size()};
 }
 
 optional<Identifier> MSSQLBackupCatalog::GetDefaultSchema() const {
@@ -151,9 +331,13 @@ optional_ptr<SchemaCatalogEntry> MSSQLBackupCatalog::LookupSchema(CatalogTransac
 	// A version this catalog does not have is an error, never a miss, as DuckLake's: DuckDB asks a
 	// catalog named explicitly and one of the search path alike, and the error names what versions exist
 	// (a search path's catalog ahead of the one meant has the AT read against it too).
-	const uint64_t version =
-		at ? VersionAt(transaction.context, at->Unit().GetIdentifierName(), at->GetValue()) : default_version_;
-	auto &state = StateOf(transaction.context, version);
+	const auto versions = VersionsFor(transaction.context);
+	mssql::backup::BackupAt chosen;
+	if (at) {
+		chosen.unit = at->Unit().GetIdentifierName();
+		chosen.value = at->GetValue();
+	}
+	auto &state = StateOf(transaction.context, *versions, Resolve(*versions, transaction.context, chosen));
 	auto found = FindByName(state.schemas, lookup.GetEntryName());
 	if (!found && if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
 		throw CatalogException("Schema '%s' not found in the backup attached as %s", lookup.GetEntryName(), name_);
@@ -161,8 +345,9 @@ optional_ptr<SchemaCatalogEntry> MSSQLBackupCatalog::LookupSchema(CatalogTransac
 	return found;
 }
 
-void MSSQLBackupCatalog::ScanSchemas(ClientContext &, std::function<void(SchemaCatalogEntry &)> callback) {
-	for (auto &s : DefaultState().schemas) {
+void MSSQLBackupCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
+	const auto versions = VersionsFor(&context);
+	for (auto &s : StateOf(&context, *versions, versions->default_version).schemas) {
 		callback(*s.second);
 	}
 }
@@ -216,23 +401,14 @@ string MSSQLBackupCatalog::GetDBPath() {
 MSSQLBackupSchemaEntry::MSSQLBackupSchemaEntry(MSSQLBackupCatalog &catalog, CreateSchemaInfo &info,
 											   std::shared_ptr<const AttachedBackup> backup)
 	: SchemaCatalogEntry(catalog, info), backup_(std::move(backup)) {
-	// `snapshots()`, DuckLake's: a table macro over mssql_backup_snapshots on the catalog's name.
-	std::string literal = "'";
-	for (const char c : catalog.Name()) {
-		literal += c;
-		if (c == '\'') {
-			literal += c;
-		}
+	for (const auto &m : catalog.Macros()) {
+		CreateMacroInfo macro(CatalogType::TABLE_MACRO_ENTRY);
+		macro.SetQualifiedName(QualifiedName({Identifier(name)}, Identifier(m.first)));
+		macro.temporary = true;
+		macro.internal = true;
+		macro.macros.push_back(m.second->Copy());
+		functions_[m.first] = make_uniq_base<CatalogEntry, TableMacroCatalogEntry>(catalog, *this, macro);
 	}
-	literal += "'";
-	auto function = make_uniq<TableMacroFunction>(
-		Parser::GetBuiltinParser().ParseSelectNode("FROM mssql_backup_snapshots(" + literal + ")"));
-	CreateMacroInfo macro(CatalogType::TABLE_MACRO_ENTRY);
-	macro.SetQualifiedName(QualifiedName({Identifier(name)}, Identifier("snapshots")));
-	macro.temporary = true;
-	macro.internal = true;
-	macro.macros.push_back(std::move(function));
-	snapshots_ = make_uniq_base<CatalogEntry, TableMacroCatalogEntry>(catalog, *this, macro);
 }
 
 MSSQLBackupCatalog &MSSQLBackupSchemaEntry::BackupCatalog() const {
@@ -251,7 +427,8 @@ void MSSQLBackupSchemaEntry::AddTable(const CatalogTable &table) {
 
 optional_ptr<CatalogEntry> MSSQLBackupSchemaEntry::LookupEntry(CatalogTransaction, const EntryLookupInfo &lookup) {
 	if (lookup.GetCatalogType() == CatalogType::TABLE_FUNCTION_ENTRY) {
-		return StringUtil::CIEquals(lookup.GetEntryName(), "snapshots") ? snapshots_.get() : nullptr;
+		auto found = functions_.find(StringUtil::Lower(lookup.GetEntryName()));
+		return found == functions_.end() ? nullptr : found->second.get();
 	}
 	if (lookup.GetCatalogType() != CatalogType::TABLE_ENTRY) {
 		return nullptr;
@@ -330,7 +507,9 @@ unique_ptr<BaseStatistics> MSSQLBackupTableEntry::GetStatistics(ClientContext &,
 }
 
 TableFunction MSSQLBackupTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
-	return mssql::backup::AttachedScanFunction(context, *this, schema.Cast<MSSQLBackupSchemaEntry>().Backup(),
+	const auto &backup = schema.Cast<MSSQLBackupSchemaEntry>().Backup();
+	return mssql::backup::AttachedScanFunction(context, *this, backup,
+											   catalog.Cast<MSSQLBackupCatalog>().NumberOf(&context, *backup),
 											   schema_name_, table_name_, bind_data);
 }
 
@@ -353,7 +532,7 @@ virtual_column_map_t MSSQLBackupTableEntry::GetVirtualColumns() const {
 // Keyed by the transaction, not its context: a context destroyed with a transaction open leaves no key
 // behind.
 Transaction &MSSQLBackupTransactionManager::StartTransaction(ClientContext &context) {
-	auto transaction = make_uniq<Transaction>(*this, context);
+	auto transaction = make_uniq<MSSQLBackupTransaction>(*this, context);
 	auto &result = *transaction;
 	std::lock_guard<std::mutex> guard(lock_);
 	transactions_[result] = std::move(transaction);
@@ -388,8 +567,7 @@ std::shared_ptr<const AttachedBackup> mssql::backup::FindAttachedBackup(ClientCo
 	if (catalog.GetCatalogType() != MSSQLBackupCatalog::TYPE) {
 		return nullptr;
 	}
-	auto &backup_catalog = catalog.Cast<MSSQLBackupCatalog>();
-	return backup_catalog.BackupOf(context, backup_catalog.VersionAt(context, at.unit, at.value));
+	return catalog.Cast<MSSQLBackupCatalog>().BackupAt(context, at);
 }
 
 static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
@@ -461,7 +639,8 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 	for (const auto &option : options.options) {
 		throw InvalidInputException(
 			"ATTACH %s (TYPE mssql_backup): '%s' is not an option of an attached backup "
-			"(schema_filter, table_filter, schema_exclude, table_exclude, diff, history, snapshot_version, snapshot_time)",
+			"(schema_filter, table_filter, schema_exclude, table_exclude, diff, history, snapshot_version, "
+			"snapshot_time)",
 			name, option.first);
 	}
 	// Always read-only (D1): DuckDB's own check refuses every write before the catalog sees it.
@@ -512,19 +691,19 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 				}
 			}
 			history = std::make_shared<BackupHistory>(mssql::backup::BuildHistory(std::move(families)));
-			opened->version = history->versions.back().number;
 		}
-		auto opener = [catalog_name, wants_schema, wants_object, history](
-						  ClientContext &c, const mssql::backup::HistoryVersion &version) {
-			const auto &full = history->backups[version.full].paths;
+		MSSQLBackupCatalog::Opener opener = [catalog_name, wants_schema, wants_object](
+												ClientContext &c, const BackupHistory &versions,
+												const mssql::backup::HistoryVersion &version) {
+			const auto &full = versions.backups[version.full].paths;
 			const std::vector<std::string> over =
-				version.IsDifferential() ? history->backups[version.diff].paths : std::vector<std::string>();
+				version.IsDifferential() ? versions.backups[version.diff].paths : std::vector<std::string>();
 			try {
 				auto opened =
 					mssql::backup::OpenAttachedBackup(c, catalog_name, full, wants_schema, wants_object, over);
-				// The files as the ATTACH read them (PR 4b's promise, from the ATTACH, not the version's open).
-				mssql::backup::CheckVersionFiles(*opened->backup, *history, version, catalog_name);
-				opened->version = version.number;
+				// The files as the history read them (PR 4b's promise, from the ATTACH or the refresh, not
+				// from the version's open).
+				mssql::backup::CheckVersionFiles(*opened->backup, versions, version, catalog_name);
 				return std::shared_ptr<const AttachedBackup>(std::move(opened));
 			} catch (mssql::backup::FormatError &e) {
 				throw InvalidInputException("%s (TYPE mssql_backup), version %llu: %s", catalog_name,
@@ -534,10 +713,26 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 		const uint64_t default_version =
 			mssql::backup::ResolveVersion(*history, context, default_at, "ATTACH " + name + " (TYPE mssql_backup)");
 		if (!attached || default_version != history->versions.back().number) {
-			attached = opener(context, history->versions[default_version - 1]);
+			attached = opener(context, *history, history->versions[default_version - 1]);
 		}
-		return make_uniq<MSSQLBackupCatalog>(db, catalog_name, std::move(history), default_version, std::move(attached),
-											 std::move(opener));
+		MSSQLBackupCatalog::Reader reader;
+		if (history_mode) {
+			const std::vector<std::string> paths{info.path};
+			reader = [paths, catalog_name](ClientContext &c, const BackupHistory &previous) {
+				try {
+					auto read = std::make_shared<BackupHistory>(mssql::backup::ReadBackupHistory(c, paths, &previous));
+					for (const auto &skipped : read->skipped) {
+						DUCKDB_LOG_WARNING(c, "%s (TYPE mssql_backup): \"%s\" is left out of the history: %s",
+										   catalog_name, skipped.path, skipped.reason);
+					}
+					return std::shared_ptr<const BackupHistory>(std::move(read));
+				} catch (mssql::backup::FormatError &e) {
+					throw InvalidInputException("mssql_backup_refresh: %s: %s", catalog_name, e.what());
+				}
+			};
+		}
+		return make_uniq<MSSQLBackupCatalog>(db, catalog_name, std::move(history), default_at, default_version,
+											 std::move(attached), std::move(opener), std::move(reader));
 	} catch (mssql::backup::FormatError &e) {
 		throw InvalidInputException("ATTACH %s (TYPE mssql_backup): %s", name, e.what());
 	}

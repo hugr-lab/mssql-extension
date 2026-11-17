@@ -1108,14 +1108,15 @@ virtual_column_map_t ScanVirtualColumns(const std::vector<UnreadColumn> &unread)
 }
 
 TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &entry,
-								   std::shared_ptr<const AttachedBackup> attached, const std::string &schema,
-								   const std::string &table, unique_ptr<FunctionData> &bind_data) {
+								   std::shared_ptr<const AttachedBackup> attached, uint64_t version,
+								   const std::string &schema, const std::string &table,
+								   unique_ptr<FunctionData> &bind_data) {
 	auto data = make_uniq<ScanBindData>();
 	data->paths = {attached->name};
-	if (attached->version != 0) {
+	if (version != 0) {
 		// A plan deserialized finds the version again by its number (AT picked it).
 		data->at.unit = "version";
-		data->at.value = Value::BIGINT(static_cast<int64_t>(attached->version));
+		data->at.value = Value::BIGINT(static_cast<int64_t>(version));
 	}
 	data->schema = schema;
 	data->table = table;

@@ -63,6 +63,8 @@ struct HistorySkipped {
 };
 
 struct BackupHistory {
+	//! Every file read, as it was read (a refresh reads again only the files that are new or changed).
+	std::vector<HistoryFamily> families;
 	std::vector<HistoryBackup> backups;
 	std::vector<HistoryVersion> versions;
 	std::vector<HistorySkipped> skipped;

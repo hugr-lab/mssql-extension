@@ -1574,7 +1574,23 @@ before the next opens.
     whole number only; a version the catalog lacks is an error under the search path too, as DuckLake's
     (DuckDB does not tell a catalog named explicitly from one of the search path). Also not done: the
     file functions' `version :=` over files reads every header on every call, and a version's state is
-    held until DETACH, outside the cache's eviction.
+    held until DETACH, outside the cache's eviction. `mssql_backup_refresh(name)`
+    (owner, 2026-11-17): the catalog keeps a `Reader` (the ATTACH's paths) and swaps its `Versions`
+    (history and default) whole; states are kept by `StateKey` (the backup set GUIDs of a version's full
+    and differential), so a renumbered version keeps its entries; a file read before at the same path,
+    size and version tag is not read again; a plan's serialised version is the number at its bind
+    (`NumberOf`). Each schema answers the file functions on the catalog's name as table macros (owner, the
+    same day: `bk.tables()`, `bk.views()` -- the views' T-SQL kept --, `bk.columns()`, `bk.schemas()`,
+    `bk.info()` with `version :=` / `as_of :=`, `bk.snapshots()`, `bk.refresh()`; parsed once per catalog,
+    `Macros()`). Review of the refresh: a state's key is its backups and their files (path, size, version
+    tag), so a file touched, rewritten or moved is a new state, opened and checked, and a refresh heals
+    it; snapshot_version / snapshot_time pin the chosen version by its backups (`Identity`), the latest
+    with a WARNING when they are gone; one refresh at a time (`refresh_lock_`, across read and swap); a
+    transaction keeps the versions of its first read (`MSSQLBackupTransaction::versions`, DuckLake's
+    snapshot per transaction; the refreshing one takes the new ones); a file gone under a kept state is
+    refused by name. Tested by `test_backup_cache` over a folder that grows (a differential and a copy-only
+    full added -- the differential renumbered, its state kept --, a pinned snapshot_version, a file touched
+    then healed by a refresh, a file renamed, a transaction across another connection's refresh).
 25. `s3://` (MinIO) and `https://` tests in the lane; measure the open pass and decide filter pushdown
     with late materialisation (a follow-up spec if it is worth it) — 2 d. Owner, 2026-11-11: the
     scan is to make filtering cheap enough for an importer that exports a table with a filter over

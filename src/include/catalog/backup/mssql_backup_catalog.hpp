@@ -22,6 +22,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/function/macro_function.hpp"
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
@@ -37,18 +38,31 @@ namespace duckdb {
 class MSSQLBackupSchemaEntry;
 
 //! The catalog of an attached backup. Each version's entries are built whole (the model, its schemas
-//! and tables) at its first lookup and never changed after; the versions are kept for the catalog's life.
+//! and tables) at its first lookup and never changed after; a version's entries are kept for the
+//! catalog's life, by its backups (a refresh renumbers the versions, never drops what was read).
 class MSSQLBackupCatalog : public Catalog {
 public:
 	static constexpr const char *TYPE = "mssql_backup";
 	//! How a version's backup is opened for the catalog (the ATTACH's name and filters).
 	using Opener = std::function<std::shared_ptr<const mssql::backup::AttachedBackup>(
-		ClientContext &, const mssql::backup::HistoryVersion &)>;
+		ClientContext &, const mssql::backup::BackupHistory &, const mssql::backup::HistoryVersion &)>;
+	//! How the history is read again (mssql_backup_refresh), from the one read last; none for a backup
+	//! attached without `history`.
+	using Reader = std::function<std::shared_ptr<const mssql::backup::BackupHistory>(
+		ClientContext &, const mssql::backup::BackupHistory &previous)>;
 
-	//! `default_version`: the version read without AT, `default_backup` its backup, opened by the ATTACH.
+	//! The history and the version read without AT, as of now: replaced whole by a refresh.
+	struct Versions {
+		std::shared_ptr<const mssql::backup::BackupHistory> history;
+		uint64_t default_version = 0;
+	};
+
+	//! `default_at`: the version read without AT (none: the latest), `default_backup` its backup, opened
+	//! by the ATTACH.
 	MSSQLBackupCatalog(AttachedDatabase &db, std::string name,
-					   std::shared_ptr<const mssql::backup::BackupHistory> history, uint64_t default_version,
-					   std::shared_ptr<const mssql::backup::AttachedBackup> default_backup, Opener opener);
+					   std::shared_ptr<const mssql::backup::BackupHistory> history, mssql::backup::BackupAt default_at,
+					   uint64_t default_version, std::shared_ptr<const mssql::backup::AttachedBackup> default_backup,
+					   Opener opener, Reader reader);
 	~MSSQLBackupCatalog() override;
 
 	void Initialize(bool load_builtin) override;
@@ -86,23 +100,28 @@ public:
 		return true;
 	}
 
-	const mssql::backup::BackupHistory &History() const {
-		return *history_;
-	}
-	std::shared_ptr<const mssql::backup::BackupHistory> SharedHistory() const {
-		return history_;
-	}
-	uint64_t DefaultVersion() const {
-		return default_version_;
+	//! The versions a statement reads: its transaction's, taken at the transaction's first read (as a
+	//! DuckLake transaction keeps its snapshot), or the catalog's now with no transaction at hand.
+	std::shared_ptr<const Versions> VersionsFor(optional_ptr<ClientContext> context);
+	//! The number `backup` (one of this catalog's versions) has in `context`'s versions; 0 when none.
+	uint64_t NumberOf(optional_ptr<ClientContext> context, const mssql::backup::AttachedBackup &backup);
+	//! The table macros every schema answers (DuckLake's `db.snapshots()` form), parsed once.
+	const std::vector<std::pair<std::string, unique_ptr<MacroFunction>>> &Macros() const {
+		return macros_;
 	}
 	const std::string &Name() const {
 		return name_;
 	}
-	//! The version an AT clause names -- `unit` VERSION (a number) or TIMESTAMP (the last version finished
-	//! by it) --, the default one when `unit` is empty. A BinderException naming the catalog otherwise.
-	uint64_t VersionAt(optional_ptr<ClientContext> context, const std::string &unit, const Value &value) const;
-	//! The backup of `version`, opened now when it was not.
-	std::shared_ptr<const mssql::backup::AttachedBackup> BackupOf(ClientContext &context, uint64_t version);
+	//! The backup of the version `at` names (AT's VERSION a number, TIMESTAMP the last version finished
+	//! by it; none: the default), opened now when it was not. A BinderException naming the catalog when
+	//! there is no such version.
+	std::shared_ptr<const mssql::backup::AttachedBackup> BackupAt(optional_ptr<ClientContext> context,
+																  const mssql::backup::BackupAt &at);
+	//! Task 24b (owner, 2026-11-17): the files the ATTACH named read again -- the headers of new or
+	//! changed files, the others kept -- and the versions renumbered; the default version's entries built
+	//! now. Returns the number of versions before and after. Refused by name for a backup attached
+	//! without `history`.
+	std::pair<uint64_t, uint64_t> Refresh(ClientContext &context);
 
 	//! A refusal of anything but a read, naming the catalog (DuckDB's read-only check comes first; this is
 	//! what is left for the paths it does not cover: INSERT, UPDATE, DELETE, MERGE, TRUNCATE are planned
@@ -114,24 +133,43 @@ private:
 		std::shared_ptr<const mssql::backup::AttachedBackup> backup;
 		std::map<std::string, unique_ptr<MSSQLBackupSchemaEntry>> schemas;
 	};
-	//! The entries of `version`, built now when they are not: opened outside the lock (two lookups may
-	//! open one version together; the first kept).
-	State &StateOf(optional_ptr<ClientContext> context, uint64_t version);
+	//! A version's backups and their files (the backup set GUIDs of its full and differential, each
+	//! file's path, size and version tag): what a state is kept by, so a file changed or moved since is a
+	//! new state, opened and checked anew.
+	static std::string StateKey(const mssql::backup::BackupHistory &history,
+								const mssql::backup::HistoryVersion &version);
+	//! The same key of an opened version's backup.
+	static std::string StateKey(const mssql::backup::AttachedBackup &backup);
+	//! A version's backups alone (their backup set GUIDs): what snapshot_version / snapshot_time pin.
+	static std::string Identity(const mssql::backup::BackupHistory &history,
+								const mssql::backup::HistoryVersion &version);
+	std::shared_ptr<const Versions> CurrentVersions() const;
+	//! The version `at` names in `versions` (its default when none).
+	uint64_t Resolve(const Versions &versions, optional_ptr<ClientContext> context,
+					 const mssql::backup::BackupAt &at) const;
+	//! The entries of `version` of `versions`, built now when they are not: opened outside the lock (two
+	//! lookups may open one version together; the first kept).
+	State &StateOf(optional_ptr<ClientContext> context, const Versions &versions, uint64_t version);
 	unique_ptr<State> MakeState(std::shared_ptr<const mssql::backup::AttachedBackup> backup);
-	State &DefaultState() const {
-		return *states_[default_version_ - 1];
-	}
+	State &DefaultState() const;
 
 	std::string name_;
-	std::shared_ptr<const mssql::backup::BackupHistory> history_;
-	uint64_t default_version_;
+	//! The version snapshot_version / snapshot_time chose at ATTACH, by its backups; empty: the latest.
+	std::string pinned_;
 	Opener opener_;
-	std::mutex lock_;
-	std::vector<unique_ptr<State>> states_;	 // by version - 1
+	Reader reader_;
+	std::vector<std::pair<std::string, unique_ptr<MacroFunction>>> macros_;
+	//! One refresh at a time, across its read and its swap.
+	std::mutex refresh_lock_;
+	mutable std::mutex lock_;
+	std::shared_ptr<const Versions> versions_;
+	std::map<std::string, unique_ptr<State>> states_;  // by StateKey
 };
 
-//! A schema of one version of the backup: its user tables the ATTACH's filters keep, and `snapshots()`
-//! (DuckLake's form: `FROM bk.snapshots()` is `mssql_backup_snapshots('bk')`).
+//! A schema of one version of the backup: its user tables the ATTACH's filters keep, and the file
+//! functions on the catalog's name as table macros, DuckLake's form: `FROM bk.snapshots()` is
+//! `mssql_backup_snapshots('bk')`; `refresh()`, and `info()` / `schemas()` / `tables()` / `views()` /
+//! `columns()` with `version :=` / `as_of :=`.
 class MSSQLBackupSchemaEntry : public SchemaCatalogEntry {
 public:
 	MSSQLBackupSchemaEntry(MSSQLBackupCatalog &catalog, CreateSchemaInfo &info,
@@ -170,7 +208,7 @@ private:
 
 	std::shared_ptr<const mssql::backup::AttachedBackup> backup_;
 	std::map<std::string, unique_ptr<CatalogEntry>> tables_;
-	unique_ptr<CatalogEntry> snapshots_;
+	std::map<std::string, unique_ptr<CatalogEntry>> functions_;	 // the table macros, by lower-case name
 };
 
 //! A user table of the backup: its columns as mssql_backup_scan reads them, D8's virtual columns, and
@@ -200,7 +238,16 @@ private:
 	int64_t row_count_ = -1;  // the catalog's, -1 unknown
 };
 
-//! A backup is read, never written: a transaction holds nothing.
+//! A backup is read, never written: a transaction holds only the versions it reads (task 24b), taken at
+//! its first read, so a refresh meanwhile reaches the next transaction, not the middle of this one.
+class MSSQLBackupTransaction : public Transaction {
+public:
+	MSSQLBackupTransaction(TransactionManager &manager, ClientContext &context) : Transaction(manager, context) {}
+
+	std::mutex lock;
+	std::shared_ptr<const MSSQLBackupCatalog::Versions> versions;
+};
+
 class MSSQLBackupTransactionManager : public TransactionManager {
 public:
 	explicit MSSQLBackupTransactionManager(AttachedDatabase &db) : TransactionManager(db) {}

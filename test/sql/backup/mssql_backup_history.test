@@ -133,6 +133,49 @@ SELECT count(*) FROM h.items AT (TIMESTAMP => TIMESTAMP '2026-11-09 22:35:28');
 ----
 no version finished by 2026-11-09 22:35:28
 
+# The file functions as the catalog's own, DuckLake's form: a version where the function takes one.
+query TI
+SELECT table_name, row_count FROM h.tables() ORDER BY 1;
+----
+events	2572
+items	2500
+
+query TI
+SELECT table_name, row_count FROM h.tables(version := 1) ORDER BY 1;
+----
+events	3000
+items	2000
+
+query I
+SELECT row_count FROM h.Tables(as_of := TIMESTAMP '2026-11-09 22:35:29') WHERE table_name = 'items';
+----
+2000
+
+query III
+SELECT (SELECT count(*) FROM h.views()), (SELECT count(*) FROM h.columns() WHERE table_name = 'items'),
+       (SELECT count(*) FROM h.schemas() WHERE schema_name = 'dbo');
+----
+0	7	1
+
+query T
+SELECT backup_type FROM h.info(version := 6);
+----
+differential
+
+statement ok
+CALL h.refresh();
+
+# mssql_backup_refresh reads the files again (a growing folder is test_backup_cache's): nothing new here.
+query II
+SELECT * FROM mssql_backup_refresh('h');
+----
+6	6
+
+statement error
+SELECT * FROM mssql_backup_refresh('nope');
+----
+is not a backup attached
+
 # The file functions on the name: its default version, or the one version := / as_of := names.
 query II
 SELECT (SELECT row_count FROM mssql_backup_tables('h') WHERE table_name = 'items'),
@@ -233,6 +276,11 @@ SELECT count(*) FROM f1.items AT (VERSION => 1);
 2000
 
 statement error
+SELECT * FROM mssql_backup_refresh('f1');
+----
+was attached without history
+
+statement error
 SELECT count(*) FROM f1.items AT (VERSION => 2);
 ----
 has versions 1 to 1, not 2
@@ -250,6 +298,24 @@ query I
 SELECT count(*) FROM hf.events AT (VERSION => 1);
 ----
 3000
+
+# The filters keep nothing: the catalog's functions answer, empty (owner, 2026-11-18).
+statement ok
+ATTACH 'test/data/backup/full.bak' AS nf (TYPE mssql_backup, schema_filter '^no_such_schema$');
+
+query IIIII
+SELECT (SELECT count(*) FROM nf.tables()), (SELECT count(*) FROM nf.views()), (SELECT count(*) FROM nf.columns()),
+       (SELECT count(*) FROM nf.schemas()), (SELECT count(*) FROM nf.snapshots());
+----
+0	0	0	0	1
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'nf';
+----
+0
+
+statement ok
+DETACH nf;
 
 statement ok
 DETACH h;

@@ -208,7 +208,14 @@ static void FillHeaders(OpenedHeaders *opened, const StatementFiles &files) {
 	families = std::move(ordered);
 }
 
-BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::string> &paths) {
+BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::string> &paths,
+								const BackupHistory *previous) {
+	std::map<std::string, const HistoryFamily *> known;
+	if (previous) {
+		for (const auto &f : previous->families) {
+			known[f.path] = &f;
+		}
+	}
 	OpenedHeaders opened;
 	opened.own_files.reset(
 		new StatementFiles(context, ByteSource::Open(context, vector<std::string>(paths.begin(), paths.end()))));
@@ -225,6 +232,12 @@ BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::s
 	*opened.own_binding = IdentityBinding(opened, *opened.own_files);
 	std::vector<HistoryFamily> families;
 	for (size_t i = 0; i < opened.files.size(); i++) {
+		auto was = known.find(opened.Path(i));
+		if (was != known.end() && was->second->size == opened.files[i].size &&
+			was->second->version_tag == opened.files[i].version && !opened.files[i].version.empty()) {
+			families.push_back(*was->second);
+			continue;
+		}
 		try {
 			HistoryFamily family;
 			family.path = opened.Path(i);
@@ -542,7 +555,14 @@ static OpenedForStatement OpenHeld(ClientContext &context, const shared_ptr<Open
 		paths.push_back(key.path);
 	}
 	OpenedForStatement opened;
-	opened.files.reset(new StatementFiles(context, ByteSource::Open(context, paths)));
+	try {
+		opened.files.reset(new StatementFiles(context, ByteSource::Open(context, paths)));
+	} catch (IOException &e) {
+		throw InvalidInputException(
+			"mssql backup: a file of %s is gone or unreadable since it was attached (%s): "
+			"refresh a history (mssql_backup_refresh) or DETACH %s and ATTACH it again",
+			name, e.what(), name);
+	}
 	const auto &source = opened.files->Source();
 	for (const auto &key : headers.files) {
 		const size_t file = opened.files->FileOf(key.path);

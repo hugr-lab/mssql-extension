@@ -382,6 +382,12 @@ going through hundreds of versions holds each one's index: attach again, or read
 functions, to let them go); while the opened-file cache keeps it, the full a day's differentials lie
 over is indexed once for all of them.
 
+The file functions are the catalog's own too, as a DuckLake's: `b.snapshots()`, `b.refresh()`, and
+`b.info()`, `b.schemas()`, `b.tables()`, `b.views()` (the views' T-SQL definitions) and `b.columns()`,
+each taking `version :=` or `as_of :=` (`FROM b.tables(version := 3)`). They are
+`mssql_backup_<name>('b', …)`, which reads the same. When the filters keep nothing they still answer,
+with no rows.
+
 `mssql_backup_snapshots('b')` -- or `b.snapshots()` -- lists the versions: `snapshot_id`,
 `snapshot_time` (the finish), `backup_type`, `is_copy_only`, `backup_start_date`, `checkpoint_lsn`, the
 backup set GUIDs, `recovery_fork_id`, `history_break` (another recovery fork than the version before:
@@ -394,8 +400,14 @@ differential whose full is not among the files, a striped backup missing a file 
 beside it (the same backup, read once). Files of two databases (another name), a file that is not a
 backup, and one the reader refuses (encrypted, appended sets) refuse the whole `ATTACH`; a database
 recreated under its name is one history, with `history_break` where it was. A file that changed since
-the `ATTACH` is refused when its version is read. New backups are taken in by attaching again
-(`ATTACH OR REPLACE`). A version's number is its place among the files, so a backup added that
+the `ATTACH` is refused when its version is read, until a refresh reads it again. New backups are
+taken in by `CALL b.refresh()` (`mssql_backup_refresh('b')`): the glob is expanded again and the headers
+of the new or changed files read (a file whose server gives no ETag or modification time is read every
+time), and the default version opened; a version already read keeps its catalog, a file moved or
+rewritten makes its version a new one. A transaction keeps the versions of its first read: a refresh
+reaches the next transaction, but the refreshing one's own. `snapshot_version` / `snapshot_time` choose
+a version by its backups, which it stays across a refresh (if its files are gone, the latest is read,
+with a WARNING). A version's number is its place among the files, so a backup added that
 finished earlier than others (a full found for a differential left out, say) moves the later ones;
 a time does not move, so an importer is better served by the time or by the files.
 

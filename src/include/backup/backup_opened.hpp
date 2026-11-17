@@ -221,8 +221,6 @@ struct OpenedForStatement {
 //! schemas filtered too. The file functions take its name in place of a path and read through it.
 struct AttachedBackup {
 	std::string name;
-	//! Its version in the catalog's history (task 24b), 1..N; 0 when not set.
-	uint64_t version = 0;
 	shared_ptr<OpenedBackup> backup;
 	std::string cache_key;	// the ObjectCache's, empty when not cached
 	std::shared_ptr<const CatalogModel> model;
@@ -336,7 +334,10 @@ FileBinding BindingFor(const OpenedHeaders &headers, const StatementFiles &files
 //! The history of the backups on `paths` (task 24b, DQ-48): each file's header read, and nothing else --
 //! no page, no index -- ordered into versions (BuildHistory). FormatError naming the file that is not a
 //! backup this reader takes (encrypted, appended sets, …), or files of two databases.
-BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::string> &paths);
+//! `previous` (a refresh): a file it read, at the same path, size and version tag, is taken from it
+//! unread.
+BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::string> &paths,
+								const BackupHistory *previous = nullptr);
 
 //! A backup opened for one call (the tests, and nothing cached): ReadBackupHeaders over files opened
 //! from `paths`, which the headers keep (own_files) and read through on any thread.
