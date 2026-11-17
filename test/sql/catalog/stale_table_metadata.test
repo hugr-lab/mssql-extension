@@ -51,6 +51,26 @@ SELECT * FROM local_copy;
 ----
 1	10
 
+# A scan with a pushed filter goes as an sp_executesql RPC call (its constant a parameter); its 207 is
+# answered the same way.
+query II
+SELECT * FROM stale_db.dbo.StaleColsTest WHERE id = 1;
+----
+1	10
+
+statement ok
+SELECT mssql_exec('stale_db', 'ALTER TABLE dbo.StaleColsTest DROP COLUMN keep_me');
+
+statement error
+SELECT * FROM stale_db.dbo.StaleColsTest WHERE id = 1;
+----
+<REGEX>:.*Invalid column name 'keep_me'.*table stale_db\.dbo\.StaleColsTest: its columns changed on the server since they were loaded; its cached metadata is dropped now, run the statement again.*
+
+query I
+SELECT * FROM stale_db.dbo.StaleColsTest WHERE id = 1;
+----
+1
+
 # Dropped on the server: the read says so once; then the table is gone from the catalog too.
 statement ok
 SELECT mssql_exec('stale_db', 'DROP TABLE dbo.StaleColsTest');
