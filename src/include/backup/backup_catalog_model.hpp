@@ -350,7 +350,7 @@ struct CatalogScope {
 	bool by_view = false;
 	std::set<std::string> views;  // view names
 	bool no_views = false;
-	//! Task 23: an ATTACH's schema_filter / table_filter, over the schema and the table's or view's name;
+	//! Task 23: an ATTACH's filters and exclusions, over the schema and the table's or view's name;
 	//! none: every object.
 	std::shared_ptr<const std::function<bool(const std::string &schema, const std::string &name)>> objects;
 

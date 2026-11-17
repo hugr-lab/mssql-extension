@@ -288,9 +288,20 @@ It is always read-only, whatever the options say: `CREATE`, `INSERT`, `UPDATE`, 
 |---|---|
 | `schema_filter` | A regex: only the schemas it matches (case-insensitive, a partial match: `^sales$` for one) |
 | `table_filter` | A regex: only the tables and views it matches |
+| `schema_exclude` | A regex: the schemas it matches are left out |
+| `table_exclude` | A regex: the tables and views it matches are left out |
 
-They work as for `TYPE mssql`, and the catalog is built for what they keep only, which on a large
-database keeps the `ATTACH` and its memory small. Any other option is refused by name.
+The filters work as `TYPE mssql`'s, and an object is kept when it matches the filter (or none is
+given) and not the exclusion. So a filter and the same pattern as an exclusion split one backup in two
+attachments -- say, the tables a lake accumulates and the ones it mirrors:
+
+```sql
+ATTACH '/backups/sales_full.bak' AS acc (TYPE mssql_backup, table_filter  '^(events|order_items)$');
+ATTACH '/backups/sales_full.bak' AS mir (TYPE mssql_backup, table_exclude '^(events|order_items)$');
+```
+
+The catalog is built for what they keep only, which on a large database keeps the `ATTACH` and its
+memory small. Any other option is refused by name.
 
 The `ATTACH` opens the backup and builds its catalog once (`ATTACH OR REPLACE` does it again); a
 table's pages are listed at its first scan and kept for the next.
