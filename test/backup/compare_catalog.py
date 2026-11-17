@@ -9,7 +9,8 @@ in the lane's layout); the sets compared are those with a golden <set>.tables.tx
 .views.txt beside them (test/backup/gen/catalog_golden.sql, run by generate.sh right after the set's
 backup). Per table: schema, name, object id, shape, partitions, rows, created and modified (to the
 millisecond: the server rounds a datetime's 1/300 s ticks to it, TYPE mssql reads them truncated
-to the microsecond); per column: id, name, type name (sql_type's base, or an alias type's name),
+to the microsecond); per column: id, name, type name (sql_type's base, or an alias type's name), the
+type's schema (type_schema),
 system type id, length, precision, scale, collation, nullable, identity, computed, sparse; per view:
 object id, encrypted, and the definition's length and SHA-256 over UTF-16LE (sys.sql_modules'
 nvarchar). mssql_backup_catalog: every base table it lists read whole, its count the rowset's, and the
@@ -239,13 +240,14 @@ def compare_set(c, db, name, arg, texts):
                       "partition_count::VARCHAR AS partition_count, row_count::VARCHAR AS row_count, "
                       f"created::VARCHAR AS created, modified::VARCHAR AS modified FROM mssql_backup_tables({arg})")
     columns = db.query("SELECT schema_name, table_name, c.column_id::VARCHAR AS column_id, c.name, c.sql_type, "
+                       "c.type_schema, "
                        "c.system_type_id::VARCHAR AS system_type_id, c.max_length::VARCHAR AS max_length, "
                        "c.precision::VARCHAR AS precision, c.scale::VARCHAR AS scale, c.collation, "
                        "c.is_nullable::VARCHAR AS is_nullable, c.is_identity::VARCHAR AS is_identity, "
                        "c.is_computed::VARCHAR AS is_computed, c.is_sparse::VARCHAR AS is_sparse "
                        f"FROM (SELECT schema_name, table_name, unnest(columns) AS c FROM mssql_backup_tables({arg}))")
     listed = db.query("SELECT schema_name, table_name, column_id::VARCHAR AS column_id, column_name, sql_type, "
-                      f"system_type FROM mssql_backup_columns({arg})")
+                      f"type_schema, system_type FROM mssql_backup_columns({arg})")
     views = db.query("SELECT schema_name, view_name, object_id::VARCHAR AS object_id, "
                      "is_encrypted::VARCHAR AS is_encrypted, definition, reason, is_indexed::VARCHAR AS is_indexed, "
                      f"row_count::VARCHAR AS row_count FROM mssql_backup_views({arg})")
@@ -275,6 +277,7 @@ def compare_set(c, db, name, arg, texts):
         where = f"{name}: {'.'.join(k)}"
         c.check(where, "name", o["name"], t["column_name"])
         c.check(where, "type_name", re.sub(r"\(.*\)$", "", o["sql_type"]), t["type_name"])
+        c.check(where, "type_schema", o["type_schema"], t["type_schema"])
         for field in ("system_type_id", "max_length", "precision", "scale"):
             c.check(where, field, o[field], t[field])
         c.check(where, "collation", o["collation"], t["collation_name"])
@@ -290,6 +293,7 @@ def compare_set(c, db, name, arg, texts):
         where = f"{name}: {'.'.join(k)} (mssql_backup_columns)"
         c.check(where, "column_name", o["column_name"], t["column_name"])
         c.check(where, "sql_type", o["sql_type"], ours[k]["sql_type"] if k in ours else None)
+        c.check(where, "type_schema", o["type_schema"], t["type_schema"])
         base = SYSTEM_TYPE_NAMES.get(int(t["system_type_id"]))
         if base is None:
             c.skip(f"{where} system_type (system type {t['system_type_id']}: a CLR or unlisted type)")

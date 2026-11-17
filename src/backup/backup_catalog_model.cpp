@@ -901,11 +901,13 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 				  [](const CatalogSchema &a, const CatalogSchema &b) { return a.id < b.id; });
 	}
 	std::unordered_map<int32_t, std::string> type_names;
+	std::unordered_map<int32_t, int32_t> type_schemas;	// a type's schema id (sysscalartypes.schid)
 	{
 		const SystemTable types = ReadSystemTable(store, tables, "sysscalartypes");
-		const size_t id = types.Column("id"), name = types.Column("name");
+		const size_t id = types.Column("id"), name = types.Column("name"), schid = types.Column("schid");
 		for (size_t r = 0; r < types.rows.size(); r++) {
 			type_names[static_cast<int32_t>(types.Int(r, id))] = types.Text(r, name);
+			type_schemas[static_cast<int32_t>(types.Int(r, id))] = static_cast<int32_t>(types.Int(r, schid));
 		}
 	}
 	std::map<int32_t, std::vector<const SysColumn *>> columns_of;
@@ -977,6 +979,7 @@ CatalogModel BuildCatalogModel(const PageStore &store, const BootstrapTables &ta
 			// its stored bytes (ReadingOf), never refused by its type (owner, 2026-11-11).
 			if (type != type_names.end()) {
 				col.type_name = type->second;
+				col.type_schema = model.SchemaName(type_schemas[c->user_type]);
 			}
 			// A CLR type (xtype 240) has no row of its xtype: the system ones are known by their user type.
 			const int32_t system_id = c->xtype == 240 ? (c->user_type < 256 ? c->user_type : -1) : c->xtype;

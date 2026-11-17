@@ -13,6 +13,7 @@
 #include "codec/money_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "codec/uuid_codec.hpp"
+#include "codec/variant/variant_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "tds/encoding/type_converter.hpp"
@@ -301,7 +302,7 @@ void FinalizeFallbackColumn(const ColumnStaging &st, idx_t count, const tds::Col
 }  // namespace
 
 void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
-						  Vector &out) {
+						  Vector &out, variant::VariantColumnNotes *variant_notes) {
 	switch (kernel) {
 	case FinalizeKernel::None:
 		break;
@@ -328,6 +329,9 @@ void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t 
 		break;
 	case FinalizeKernel::CodePage:
 		code_page::DecodeChunkFromStaging(st, count, meta, out);
+		break;
+	case FinalizeKernel::Variant:
+		variant::DecodeChunkFromStaging(st, count, meta, out, variant_notes);
 		break;
 	}
 }
@@ -361,6 +365,7 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 	ops_.assign(column_count, ColumnOps());
 	chunk_nulls_.assign(column_count, 0);
 	chunk_out_of_range_.assign(column_count, 0);
+	variant_notes_.assign(column_count, variant::VariantColumnNotes());
 	unbounded_columns_.clear();
 	arena_.Configure(column_count);
 	// Bind the staging addresses ONCE. They are stable for as long as the arena
@@ -519,6 +524,18 @@ size_t RowStager::StageRow(const uint8_t *row, size_t row_length, idx_t row_idx)
 		case AppendArm::LobStageBinary:
 			p += AppendLob<false>(*staging_[c], p);
 			break;
+		case AppendArm::P4StageVariant: {
+			// Spec 093 T1: a u32 length, 0 meaning NULL, then the envelope (the row reader bounded it).
+			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+									(static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+			if (length == 0) {
+				staging_[c]->AppendNull();
+			} else {
+				staging_[c]->AppendVar(p + 4, length);
+			}
+			p += 4 + length;
+			break;
+		}
 		case AppendArm::Unsupported:
 			ThrowUnsupportedType((*metadata_)[c]);
 		case AppendArm::Skip:
@@ -630,6 +647,19 @@ size_t RowStager::StageNBCRow(const uint8_t *row, size_t row_length, idx_t row_i
 		case AppendArm::LobStageBinary:
 			p += AppendLob<false>(*staging_[c], p);
 			break;
+		case AppendArm::P4StageVariant: {
+			// The bitmap says present, but a value can still say NULL by its own zero length, as the
+			// per-value reader reads it (RowReader::ReadVariant, spec 093 T0).
+			const uint32_t length = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+									(static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+			if (length == 0) {
+				staging_[c]->AppendNull();
+			} else {
+				staging_[c]->AppendVar(p + 4, length);
+			}
+			p += 4 + length;
+			break;
+		}
 		case AppendArm::Unsupported:
 			ThrowUnsupportedType((*metadata_)[c]);
 		case AppendArm::Skip:
@@ -670,7 +700,7 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		// Which kernel is a property of the column, resolved with the append arm
 		// after COLMETADATA, so this is one switch on one invariant value and the
 		// kernel's own loop carries no dispatch at all.
-		FinalizeStagedColumn(ops_[c].kernel, st, row_count, meta, *targets_[c]);
+		FinalizeStagedColumn(ops_[c].kernel, st, row_count, meta, *targets_[c], &variant_notes_[c]);
 		if (out_of_range_counted) {
 			const ValidityMask &kernel_nulls = FlatVector::Validity(*targets_[c]);
 			chunk_out_of_range_[c] = kernel_nulls.CannotHaveNull() ? 0 : row_count - kernel_nulls.CountValid(row_count);
@@ -758,6 +788,10 @@ bool RowStager::TryEmitConstant(idx_t c, const ColumnStaging &st, const tds::Col
 		return false;
 	}
 	Vector &out = *targets_[c];
+	if (ops_[c].kernel == FinalizeKernel::Variant) {
+		// A VARIANT vector is lists and a blob: its kernel builds it whole, NULLs included (spec 093 T1).
+		return false;
+	}
 
 	// All NULL. Free to detect — two numbers already in hand — and it skips the
 	// kernel entirely, which is the whole win for a column a query does not
@@ -842,6 +876,7 @@ void RowStager::DecodeFirstValue(idx_t c, const ColumnStaging &st, const tds::Co
 	case FinalizeKernel::CodePage:
 		code_page::DecodeFromTds(bytes, meta, out, 0);
 		break;
+	case FinalizeKernel::Variant:  // never constant (TryEmitConstant)
 	case FinalizeKernel::None:
 	case FinalizeKernel::Text:
 		break;

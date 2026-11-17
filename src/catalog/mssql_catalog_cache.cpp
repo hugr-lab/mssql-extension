@@ -294,23 +294,29 @@ void MSSQLCatalog::RefreshCache(ClientContext &context) {
 	// must be returned to the pool BEFORE the exception propagates, or
 	// ~ConnectionPool fires its debug-only D_ASSERT about checked-out
 	// connections during catalog teardown and the process aborts on Linux.
+	// Invalidate all schema table sets to pick up any changes.
+	// Spec 052 (Option D): in-flight binders are anchored in
+	// MSSQLBindAnchors per ClientContext (released at QueryEnd).
+	const auto invalidate_table_sets = [this]() {
+		std::lock_guard<std::mutex> lock(schema_mutex_);
+		for (auto &entry : schema_entries_) {
+			entry.second->GetTableSet().Invalidate();
+		}
+	};
 	try {
 		metadata_cache_->Refresh(context, *connection, database_collation_);
 	} catch (...) {
 		connection_pool_->Release(std::move(connection));
+		// A failed Refresh has emptied the metadata cache's schemas: a table set's Scan that
+		// read it meanwhile saw them empty, and with no invalidation to move its epoch it
+		// published "fully loaded" over a listing missing every table.
+		invalidate_table_sets();
 		throw;
 	}
 
 	// Release connection
 	connection_pool_->Release(std::move(connection));
-
-	// Invalidate all schema table sets to pick up any changes.
-	// Spec 052 (Option D): in-flight binders are anchored in
-	// MSSQLBindAnchors per ClientContext (released at QueryEnd).
-	std::lock_guard<std::mutex> lock(schema_mutex_);
-	for (auto &entry : schema_entries_) {
-		entry.second->GetTableSet().Invalidate();
-	}
+	invalidate_table_sets();
 }
 
 }  // namespace duckdb

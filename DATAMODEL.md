@@ -479,7 +479,7 @@ flowchart TD
 
 Statements run through `mssql_exec()` are plain T-SQL — DuckDB never sees them, so it cannot invalidate the cache on its own. Spec/issue **#151**: `mssql_exec()` detects DDL keywords (`CREATE`/`DROP`/`ALTER`/`TRUNCATE`/`RENAME`/`EXEC`) and calls `InvalidateMetadataCache()` after a successful run. `INSERT`/`UPDATE`/`DELETE` do not invalidate anything, so transaction-pinned DML through `mssql_exec()` is unaffected.
 
-The auto-invalidation is gated by the `mssql_exec_invalidate_cache` setting, which **defaults to `false`** (matching the Postgres extension's `postgres_execute`): by default `mssql_exec()` does not touch the cache and the caller invalidates at a chosen granularity with `mssql_invalidate_cache(catalog [, schema [, table]])`. Set the flag `true` to auto-invalidate after `mssql_exec()` DDL.
+The auto-invalidation is gated by the `mssql_exec_invalidate_cache` setting, which **defaults to `false`** (matching the Postgres extension's `postgres_execute`): by default `mssql_exec()` does not touch the cache and the caller invalidates at a chosen granularity with `mssql_invalidate_cache(catalog [, schema [, table]])`. Set the flag `true` to auto-invalidate after `mssql_exec()` DDL. A catalog table scan the server refuses with 207 / 208 (a cached column or the table gone: changed by another client) drops that table's entry the same way and asks for the statement to run again (`RefuseStaleTable`, issue #570; the statement's server error numbers ride in the exception's extra info, `MSSQL_SERVER_ERROR_NUMBERS`). A view that no longer compiles on the server (207 / 208 followed by 4413) is not dropped: re-reading its columns would fail the same way, so the error says to fix the view there.
 
 | Granularity | Catalog call | Metadata cache | Table set |
 |---|---|---|---|
@@ -741,6 +741,17 @@ path), after DuckDB's own filters; a keyless table's hidden key columns are refu
 them (`MSSQLResultStream::RefuseOutOfRangeIn`), since that plan has every filter on the server. Only a
 catalog scan produces either: the 079 writer vetoes `rowid`, the hidden key columns come from the
 plan, and a DML pushed whole reads no key.
+
+**A `sql_variant` is a DuckDB `VARIANT` (spec 093 T1).** The column is read bare: each value
+arrives as SSVARIANT (`0x62`), a u32 length and an envelope -- base type, properties, the value in
+its TDS form (measured: `specs/093-type-kernels/measured/S1.md`). The stager keeps the envelopes as
+they are (`AppendArm::P4StageVariant`) and the `Variant` kernel writes the column through DuckDB's
+`VariantBuilder` (`BuildVariant`, one call a chunk): `codec/variant/variant_envelope` (DuckDB-free,
+fuzzed by `fuzz_variant_envelope`) splits each envelope and writes the value's VARIANT payload by
+spec 093 D3's table -- a string through spec 091's code-page kernels by its own collation, a
+`time(7)` / `datetime2(7)` in nanoseconds where they fit -- and `codec/variant/variant_codec` puts it
+in the vector. The column stays out of pushed comparisons and keys (`comparison_differs`): the server
+compares a `sql_variant` by its base type (#514).
 
 ### Reading a column's collation
 

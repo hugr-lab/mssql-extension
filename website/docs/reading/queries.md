@@ -215,9 +215,11 @@ changed since it was cached … Run the statement again"*: running it again
 describes it anew. A column whose type the statement takes from the catalog
 (including every column of a statement planned without a round trip, which
 then fails naming the statement) stays wrong until the catalog is
-invalidated, as for the table scan; call
+invalidated; call
 `mssql_invalidate_cache()` after such DDL (or set a
-`mssql_catalog_cache_ttl`).
+`mssql_catalog_cache_ttl`). A plain read of a table whose column, or the
+table itself, is gone on the server fails once with the server's error and
+*"its cached metadata is dropped now, run the statement again"* (#570).
 
 On very small tables a pushed aggregate can be a few milliseconds slower than
 reading the rows; `mssql_pushdown_min_rows` sets a floor below which

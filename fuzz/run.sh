@@ -8,6 +8,7 @@
 #                 | code_page
 #                 | backup_mtf | backup_container | backup_xpress | backup_page | backup_catalog
 #                 | backup_record | backup_lob   (spec 085; built here through TARGETS)
+#                 | variant_envelope              (spec 093 T1; likewise)
 #                 (default: browser_response)
 #     seconds   : per-core wall-clock budget (default: 0 = run until Ctrl-C)
 #     cores     : parallel instances (default: nproc, capped at 8)
@@ -22,10 +23,10 @@ CORES="${3:-$(( $(nproc) < 8 ? $(nproc) : 8 ))}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 case "${TARGET}" in
 	browser_response|tds_tokens|utf16|envchange_txn|login_response|code_page) ;;
-	backup_mtf|backup_container|backup_xpress|backup_page|backup_catalog|backup_record|backup_lob)
+	backup_mtf|backup_container|backup_xpress|backup_page|backup_catalog|backup_record|backup_lob|variant_envelope)
 		# Not in build.sh's default TARGETS (the per-PR budget is the TDS layer's): build this one.
 		export TARGETS="${TARGET}" ;;
-	*) echo "unknown target '${TARGET}' (browser_response|tds_tokens|utf16|envchange_txn|login_response|code_page|backup_*)"; exit 2 ;;
+	*) echo "unknown target '${TARGET}' (browser_response|tds_tokens|utf16|envchange_txn|login_response|code_page|backup_*|variant_envelope)"; exit 2 ;;
 esac
 BIN="fuzz_${TARGET}"
 # AFL++'s compiler wrappers print their banners on stdout, which build.sh's compile_objs captures as

@@ -61,11 +61,13 @@ jobs:
   concurrency-tests:
     name: Concurrency stress
     runs-on: ubuntu-latest
-    # A cold debug build (no ccache hit: a new DuckDB pin) takes ~36 min on
-    # its own; the tests after it ~15-20. At 45 the job timed out building
-    # the transaction-pin test (#399), and a cancelled job never saved the
-    # cache, so every later run was cold too.
-    timeout-minutes: 75
+    # A cold debug build (no ccache hit: a new DuckDB pin, or a change to a
+    # widely included header) takes 36-46 min on its own; the tests after it
+    # ~20-30. At 45 the job timed out building the transaction-pin test
+    # (#399); at 75 it timed out twice in November 2026 after builds of 39
+    # and 46 min (#563, #557), and each rerun then had to build again. A
+    # cancelled job never saves the cache, so every later run was cold too.
+    timeout-minutes: 120
 
     # SQL Server 2022 sidecar — same image and credentials as the existing
     # integration-test job in ci.yml. Concurrency tests only need `master`

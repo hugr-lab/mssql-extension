@@ -271,6 +271,8 @@ FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &co
 		return column.code_page != nullptr ? FinalizeKernel::CodePage : FinalizeKernel::Binary;
 	case AppendArm::P1StageDecimal:
 		return FinalizeKernel::Decimal;
+	case AppendArm::P4StageVariant:
+		return FinalizeKernel::Variant;
 	case AppendArm::P1StageFixed:
 	case AppendArm::RawStageFixed:
 		// Three families share the staged-fixed framing; the TDS type says which.
@@ -396,6 +398,14 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 
 	const bool binary = column.type_id == tds::TDS_TYPE_BIGVARBINARY || column.type_id == tds::TDS_TYPE_BIGBINARY;
 
+	// SQL_VARIANT (spec 093 T1): the envelope as it arrives, at most SQL_VARIANT_MAX_BYTES a value.
+	if (column.type_id == tds::TDS_TYPE_SQL_VARIANT && target_type.id() == LogicalTypeId::VARIANT) {
+		ops.kind = StagingKind::Var;
+		ops.arm = AppendArm::P4StageVariant;
+		ops.max_value_bytes = tds::SQL_VARIANT_MAX_BYTES;
+		return ops;
+	}
+
 	// The legacy LOBs. A catalog scan casts them server-side and never produces
 	// them (spec 055 D9), but raw mssql_scan has no metadata to cast from — so
 	// they are decoded natively too rather than left as the one shape the
@@ -468,7 +478,7 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 
 	// Nothing above claimed it. The types that reach here are the legacy LOBs
 	// (TEXT / NTEXT / IMAGE) when they arrive without the catalog's server-side
-	// CAST, plus UDT and SQL_VARIANT — none of which the shipped row reader can
+	// CAST, plus UDT and a SQL_VARIANT not read as a VARIANT — none of which the shipped row reader can
 	// decode either. Say so instead of inventing a framing.
 	ops.arm = AppendArm::Unsupported;
 	return ops;
@@ -496,6 +506,8 @@ const char *FinalizeKernelName(FinalizeKernel kernel) {
 		return "text";
 	case FinalizeKernel::CodePage:
 		return "code_page";
+	case FinalizeKernel::Variant:
+		return "variant";
 	}
 	return "?";
 }

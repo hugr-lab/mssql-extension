@@ -30,6 +30,7 @@
 
 #include "codec/staging/column_ops.hpp"
 #include "codec/staging/column_staging.hpp"
+#include "codec/variant/variant_codec.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "tds/tds_column_metadata.hpp"
 #include "tds/tds_row_reader.hpp"
@@ -88,8 +89,9 @@ struct StagingCounters {
 //! FinalizeKernel::Text the issue-#89 rendering as text; None does nothing (the values were written
 //! straight into the vector). Validity is not touched: PublishStagedValidity. Shared by RowStager and
 //! the backup reader's RecordStager (spec 085 PR 2d), so a column decodes the one way.
+//! `variant_notes`, for a Variant column: what its values needed beyond their decode (spec 093 T1).
 void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
-						  Vector &out);
+						  Vector &out, variant::VariantColumnNotes *variant_notes = nullptr);
 
 //! AND the staged NULLs of `count` rows into `out`'s mask (a kernel may have set NULLs of its own,
 //! which must stay); nothing when the column staged none.
@@ -184,6 +186,11 @@ public:
 	idx_t ChunkOutOfRange(idx_t c) const {
 		return chunk_out_of_range_[c];
 	}
+	//! A Variant column's values read as their bytes since the stager was configured (spec 093 T1): a
+	//! collation with no code page, UTF-8 bytes that are not UTF-8. For the stream's WARNING.
+	const variant::VariantColumnNotes &VariantNotes(idx_t c) const {
+		return variant_notes_[c];
+	}
 
 	//! True when column `c` never reaches an output vector (Skip arm).
 	bool IsSkipped(idx_t c) const {
@@ -222,6 +229,8 @@ private:
 	std::vector<idx_t> chunk_nulls_;
 	//! Per-column values read as NULL for not fitting the target (ChunkOutOfRange).
 	std::vector<idx_t> chunk_out_of_range_;
+	//! Per-column VariantNotes.
+	std::vector<variant::VariantColumnNotes> variant_notes_;
 	//! Columns whose staged size is not bounded by their declared width (PLP).
 	//! Pointers, not indices: this list is walked once per ROW.
 	std::vector<ColumnStaging *> unbounded_columns_;
