@@ -281,7 +281,8 @@ std::string TypeConverter::GetTypeName(uint8_t type_id) {
 }
 
 void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null, const ColumnMetadata &column,
-								 Vector &vector, idx_t row_idx) {
+								 Vector &vector, idx_t row_idx,
+								 mssql::codec::variant::VariantColumnNotes *variant_notes) {
 	if (is_null) {
 		FlatVector::SetNull(vector, row_idx, true);
 		return;
@@ -337,7 +338,7 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 		break;
 
 	case TDS_TYPE_SQL_VARIANT:
-		mssql::codec::variant::DecodeFromTds(value, column, vector, row_idx);
+		mssql::codec::variant::DecodeFromTds(value, column, vector, row_idx, variant_notes);
 		break;
 
 	case TDS_TYPE_BIGBINARY:

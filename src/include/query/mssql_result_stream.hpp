@@ -263,8 +263,10 @@ private:
 	//! RefuseOutOfRangeIn's columns and table (issue #559).
 	std::vector<bool> refuse_out_of_range_;
 	std::string refuse_table_;
-	//! Spec 093 T1: per column, whether its sql_variant values read as bytes were logged.
+	//! Spec 093 T1: per column, whether its sql_variant values read as bytes were logged; and the
+	//! per-value path's counts (ProcessRow: target vectors, e.g. a composite rowid), beside the stager's.
 	std::vector<bool> variant_notes_warned_;
+	std::vector<mssql::codec::variant::VariantColumnNotes> row_variant_notes_;
 	bool is_catalog_scan_ = false;
 
 	// Statistics

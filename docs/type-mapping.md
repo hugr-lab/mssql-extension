@@ -123,6 +123,16 @@ XML uses PLP (Partially Length-Prefixed) wire encoding with UTF-16LE data, ident
 
 **DML (INSERT/UPDATE via SQL literals)**: Small XML values (up to 4096 bytes serialized) are allowed. Larger values are rejected with an error recommending COPY TO with BCP protocol, since SQL literal serialization has size limits while XML documents can be up to 2 GB.
 
+### SQL_VARIANT Type
+
+| SQL Server Type | TDS Type ID | Wire Format | DuckDB Type | Notes |
+|---|---|---|---|---|
+| SQL_VARIANT | 0x62 | 4-byte len + base type, property bytes, value | VARIANT | Each value keeps its base type (spec 093 T1) |
+
+Read the same way by an attached catalog and by a raw `mssql_scan` / `mssql_scan_params`, with no
+conversion on the server: the envelope's base type picks the family codec that decodes the value. See
+the types page for each base type's DuckDB type.
+
 ### Not read by a raw scan yet
 
 An attached catalog reads these columns through a server-side conversion (spatial as WKB,
@@ -134,7 +144,6 @@ them to `mssql_exec`, or a DML whose trigger does, no longer fails.
 | SQL Server Type | TDS Type ID | Read by a raw scan |
 |---|---|---|
 | UDT (GEOGRAPHY, GEOMETRY, HIERARCHYID, user CLR types) | 0xF0 | not yet (spec 093 T4, T5) |
-| SQL_VARIANT | 0x62 | yes, as `VARIANT` (spec 093 T1; see the types page) |
 
 ```
 MSSQL Error: column 'g' is of the CLR type sys.geometry, which a raw mssql_scan does not read yet. ...

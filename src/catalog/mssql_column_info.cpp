@@ -113,8 +113,8 @@ bool MSSQLColumnInfo::BulkWireTakesType(const string &sql_type_name) {
 	// measured first (spec 093 T2, T6), never because it became decodable (#296). A geometry /
 	// geography column arrives as WKB, which the statement path renders as a 0x literal the server
 	// converts; on the bulk wire FromServerColumn would declare it nvarchar and send the bytes as
-	// text. The same for the types read through a cast (hierarchyid, sql_variant): the statement
-	// path sends a string literal the server converts, the bulk wire would not.
+	// text. The same for hierarchyid, read through a cast: the statement path sends a string literal
+	// the server converts, the bulk wire would not. sql_variant's write is T2's (refused until then).
 	const string t = StringUtil::Lower(sql_type_name);
 	return t == "bit" || t == "tinyint" || t == "smallint" || t == "int" || t == "bigint" || t == "real" ||
 		   t == "float" || t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" || t == "char" ||
@@ -130,9 +130,9 @@ bool MSSQLColumnInfo::BulkWireTakesType(const string &sql_type_name) {
 
 LogicalType MSSQLColumnInfo::NativeDuckDBType() const {
 	// Only a bounded character column has anything to state. A MAX column
-	// (max_length -1) is already what a plain VARCHAR means, and a column the
-	// scan has to CAST — geometry, hierarchyid, sql_variant — does not arrive as
-	// the type the catalog names anyway.
+	// (max_length -1) is already what a plain VARCHAR means, and a column that is
+	// not read as a bare string -- geometry, hierarchyid (a CAST), sql_variant (a
+	// VARIANT) -- does not arrive as the type the catalog names anyway.
 	//
 	// text/ntext are NOT caught by this guard, despite being MAX by nature:
 	// sys.columns reports max_length 16 for them (the in-row pointer size, which

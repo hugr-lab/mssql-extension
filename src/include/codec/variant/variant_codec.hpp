@@ -35,8 +35,10 @@ struct VariantColumnNotes {
 void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const tds::ColumnMetadata &col, Vector &out,
 							VariantColumnNotes *notes = nullptr);
 
-//! One envelope (`bytes`, non-empty) into `out` at `row` (the per-value path).
-void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row);
+//! One envelope (`bytes`, non-empty) into `out` at `row` (the per-value path), counted into `notes` as the
+//! chunk path counts.
+void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row,
+				   VariantColumnNotes *notes = nullptr);
 
 }  // namespace variant
 }  // namespace codec

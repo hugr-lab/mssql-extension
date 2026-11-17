@@ -79,8 +79,8 @@ struct StagedSource : EnvelopeSource {
 
 struct OneValueSource : EnvelopeSource {
 	const std::vector<uint8_t> &bytes;
-	OneValueSource(const tds::ColumnMetadata &col_p, const std::vector<uint8_t> &bytes_p)
-		: EnvelopeSource{col_p, nullptr}, bytes(bytes_p) {}
+	OneValueSource(const tds::ColumnMetadata &col_p, VariantColumnNotes *notes_p, const std::vector<uint8_t> &bytes_p)
+		: EnvelopeSource{col_p, notes_p}, bytes(bytes_p) {}
 	bool Emit(idx_t, VariantBuilder &builder) {
 		EmitEnvelope(bytes.data(), bytes.size(), builder);
 		return false;
@@ -95,10 +95,11 @@ void DecodeChunkFromStaging(const staging::ColumnStaging &st, idx_t count, const
 	BuildVariant(source, count, out);
 }
 
-void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row) {
+void DecodeFromTds(const std::vector<uint8_t> &bytes, const tds::ColumnMetadata &col, Vector &out, idx_t row,
+				   VariantColumnNotes *notes) {
 	// BuildVariant fills a fresh vector from row 0: built alone, then copied into place.
 	Vector one(LogicalType::VARIANT(), 1);
-	OneValueSource source(col, bytes);
+	OneValueSource source(col, notes, bytes);
 	BuildVariant(source, 1, one);
 	VectorOperations::Copy(one, out, 1, 0, row);
 }
