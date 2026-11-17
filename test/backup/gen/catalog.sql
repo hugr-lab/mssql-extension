@@ -134,6 +134,13 @@ CREATE TABLE dbo.colset (id int NOT NULL PRIMARY KEY, a int SPARSE NULL, b varch
 -- A column whose type is changed after rows were written (a new physical column), then one added.
 CREATE TABLE dbo.altered (id int NOT NULL PRIMARY KEY, v int NOT NULL);
 GO
+-- An alias type of the same name in another schema, over another type: told apart only by its schema
+-- (mssql_backup_columns.type_schema, compared with SCHEMA_NAME(sys.types.schema_id)).
+CREATE TYPE sales.code_t FROM nvarchar(20) NULL;
+GO
+CREATE TABLE sales.coded (id int NOT NULL PRIMARY KEY, code sales.code_t, dbo_code dbo.code_t);
+INSERT INTO sales.coded (id, code, dbo_code) VALUES (1, N'sales-one', 'dbo-one'), (2, NULL, 'dbo-two');
+GO
 WITH n AS (SELECT TOP (100) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects)
 INSERT INTO dbo.shapes (code, qty, price, sp1, sp2)
 SELECT CONCAT('S', i % 7), i % 5, i * 2.5, CASE WHEN i % 3 = 0 THEN i END, CASE WHEN i % 4 = 0 THEN CONCAT(N'с', i) END FROM n;
