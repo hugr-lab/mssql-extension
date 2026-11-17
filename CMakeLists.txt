@@ -172,6 +172,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_bytes.cpp
     src/backup/backup_catalog_function.cpp
     src/backup/backup_catalog_model.cpp
+    src/backup/backup_cd_record.cpp
     src/backup/backup_collation.cpp
     src/backup/backup_container.cpp
     src/backup/backup_function_common.cpp

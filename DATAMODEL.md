@@ -1566,6 +1566,14 @@ flowchart BT
   differential changed in part. A thread keeps the last GAM interval and PFS page it was answered
   from (`AllocationMap`, read with no lock), so an off-row page's liveness check takes no lock.
   Fuzzed by `fuzz_backup_lob`; compared with RESTORE on `lob.sql`'s fixture.
+- **ROW compression** (spec 086 PR 1; `backup_cd_record`, E22's measurements): a rowset whose
+  `sysrowsets.cmprlevel` is 1 holds CD records -- a header byte, a column count, 4-bit CD codes, a
+  cluster array past 30 columns, the short and long regions -- and every column is a CD index
+  (`-offset - 1`). `CdRow` walks a record once and puts each value in the form an uncompressed record
+  holds it (an integer from its sign-flipped big-endian bytes, a decimal from vardecimal, a float
+  padded back, a datetime from its one integer, char / binary / nchar padded, SCSU decoded to
+  UTF-16), so the stager's arms, the family kernels and `_mssql_rid`'s key bytes are the uncompressed
+  path's: a `RowRecord` is either form. PAGE compression (the page dictionary) is PR 2's, refused by name.
 - **Prepared statements** keep the row their bind read (`SupportStatementCache`); `reread := true`
   binds again on every `EXECUTE`.
 - **The opened-file cache** (D9, PR 4a): what an open read -- headers, page index, allocation map,

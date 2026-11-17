@@ -54,6 +54,7 @@ struct CatalogSchema {
 static constexpr int32_t OBJECT_MS_SHIPPED = 0x1;
 static constexpr int32_t VIEW_ENCRYPTED = 0x10000;
 static constexpr int32_t COLUMN_NOT_NULL = 0x1;
+static constexpr int32_t COLUMN_ANSI_PADDED = 0x2;	// sys.columns.is_ansi_padded (E22)
 static constexpr int32_t COLUMN_IDENTITY = 0x4;
 static constexpr int32_t COLUMN_ROWGUIDCOL = 0x8;
 static constexpr int32_t COLUMN_COMPUTED = 0x10;
@@ -124,6 +125,7 @@ struct CatalogColumn {
 	uint8_t scale = 0;
 	uint32_t collation_id = 0;	// 0 for a type without one
 	bool is_nullable = false;
+	bool is_ansi_padded = false;  // syscolpars.status 0x2 (sys.columns.is_ansi_padded)
 	bool is_identity = false;
 	bool is_computed = false;
 	bool is_persisted = false;
