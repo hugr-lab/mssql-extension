@@ -20,9 +20,12 @@ A column reads under its SQL Server name, quoted in DuckDB where it needs it (`"
 which no DuckDB table can: its names are case-insensitive, quoted or not. Such a column reads under the
 first suffix no column of the table is named -- `Id`, `ID_1`, `id_2` -- and every statement the
 extension sends (pushdown, DML, COPY, ALTER) names the server's own column; a composite rowid's fields
-are named the same way. A real column keeps its own name, so a column the server adds later (a new real
-`ID_2`) can move a suffix once the catalog reloads. A raw `mssql_scan` names its result columns by the
-same rule, so an exact repeat (`SELECT a.id, b.id`) reads as `id`, `id_1`:
+carry the DuckDB names (`{Id, ID_1}`). A real column keeps its own name, so a column the server adds
+later (a new real `ID_2`) can move a suffix once the catalog reloads. A raw `mssql_scan` names its
+result columns by the same rule, so an exact repeat (`SELECT a.id, b.id`) reads as `id`, `id_1`; an
+unnamed one (`SELECT 1`) as DuckDB names it, `C0`, `C1`, … by position, but not over a real column's
+name (`SELECT 1, 2 AS C0` reads as `C0_1`, `C0`); and a suffix avoids the query's own aliases
+(`… AS s(x_1)`):
 
 ```sql
 SELECT "Id", "ID_1" FROM sqlserver.dbo.t WHERE "ID_1" > 0;   -- sent as ... [ID] ... WHERE [ID] > ...

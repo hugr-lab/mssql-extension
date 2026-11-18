@@ -30,7 +30,8 @@ int main() {
 	Check({"Id", "ID", "id"}, {"Id", "ID_1", "id_2"}, "names that differ only in case take _1, _2");
 	Check({"Id", "ID", "ID_1"}, {"Id", "ID_2", "ID_1"}, "a real column ID_1 keeps its name");
 	Check({"Id", "ID", "id_1"}, {"Id", "ID_2", "id_1"}, "reserved whatever its case");
-	Check({"", "", "x"}, {"", "", "x"}, "unnamed result columns stay unnamed (DuckDB names them)");
+	Check({"", "", "x"}, {"C0", "C1", "x"}, "unnamed result columns named as DuckDB names them");
+	Check({"", "C0"}, {"C0_1", "C0"}, "an unnamed column never takes a real column's name (review of #574)");
 	Check({"x", "x"}, {"x", "x_1"}, "an exact repeat (a raw scan's) is named apart too");
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;
 	return failures ? 1 : 0;

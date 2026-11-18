@@ -25,6 +25,7 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "mssql_function_docs.hpp"
 #include "mssql_storage.hpp"
@@ -1159,6 +1160,25 @@ static void BindDescribedScan(ClientContext &context, const char *function, MSSQ
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: END (total %ldms)", (long)bind_ms);
 }
 
+//! The query's own column aliases (`… AS s(a, b)`), which DuckDB lays over the first result names: the
+//! later columns' suffixes (issue #572) avoid them, so `SELECT 1 AS x, 2 AS x` aliased `s(x_1)` reads as
+//! x_1, x (review of #574).
+static void ReserveAliases(const TableFunctionBindInput &input, const vector<string> &server_names,
+						   vector<Identifier> &names) {
+	const auto &aliases = input.ref.column_name_alias;
+	if (aliases.empty()) {
+		return;
+	}
+	std::vector<std::string> with_aliases(server_names.begin(), server_names.end());
+	for (idx_t i = 0; i < aliases.size() && i < with_aliases.size(); i++) {
+		with_aliases[i] = aliases[i].GetIdentifierName();
+	}
+	const auto deduplicated = mssql::DuckDBColumnNames(with_aliases);
+	for (idx_t i = aliases.size(); i < names.size() && i < deduplicated.size(); i++) {
+		names[i] = Identifier(deduplicated[i]);
+	}
+}
+
 unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBindInput &input,
 									   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: START");
@@ -1174,6 +1194,7 @@ unique_ptr<FunctionData> MSSQLScanBind(ClientContext &context, TableFunctionBind
 	mssql::SqlParamSet no_params;
 	bind_data->wants_column_types = HasColumnTypes(input);
 	BindDescribedScan(context, "mssql_scan", *bind_data, no_params, return_types, names);
+	ReserveAliases(input, bind_data->column_names, names);
 	RequireResultSet(return_types, "mssql_scan");
 	ApplyColumnTypes(context, input, *bind_data, return_types);
 	return std::move(bind_data);
@@ -1201,6 +1222,7 @@ unique_ptr<FunctionData> MSSQLScanParamsBind(ClientContext &context, TableFuncti
 	bind_data->execute_sql = params.ExecuteSqlRequest(bind_data->query);
 	bind_data->wants_column_types = HasColumnTypes(input);
 	BindDescribedScan(context, "mssql_scan_params", *bind_data, params, return_types, names);
+	ReserveAliases(input, bind_data->column_names, names);
 	RequireResultSet(return_types, "mssql_scan_params");
 	ApplyColumnTypes(context, input, *bind_data, return_types);
 	return std::move(bind_data);

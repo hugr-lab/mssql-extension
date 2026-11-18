@@ -96,7 +96,19 @@ SELECT sum("ID_2") FROM (SELECT "ID_2" FROM cs.dbo.t WHERE "Id" = 1 UNION ALL SE
 ----
 7
 
-# A raw scan's result columns too; an unnamed one stays DuckDB's to name, an exact repeat is named apart.
+# An alias is measured as SQL Server measures an identifier, in characters: 60 CJK characters (180
+# UTF-8 bytes) still push (review of #574).
+query II
+EXPLAIN SELECT "Id" AS "列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列" FROM cs.dbo.t ORDER BY "Id" LIMIT 1;
+----
+physical_plan	<REGEX>:.*SELECT TOP \(1\) \[Id\] AS \[列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列\].*
+
+query I
+SELECT "Id" AS "列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列列" FROM cs.dbo.t ORDER BY "Id" LIMIT 1;
+----
+1
+
+# A raw scan's result columns too; an unnamed one named as DuckDB names it, an exact repeat named apart.
 query TT
 SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('cs', 'SELECT 1, 2, Id, ID, ID FROM dbo.t'));
 ----
@@ -105,6 +117,19 @@ C1	INTEGER
 Id	INTEGER
 ID_1	INTEGER
 ID_2	INTEGER
+
+# An unnamed column beside a real C0, and the query's own aliases, which a suffix avoids (review of #574).
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('cs', 'SELECT 1, 2 AS C0'));
+----
+C0_1	INTEGER
+C0	INTEGER
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('cs', 'SELECT 1 AS x, 2 AS x') AS s(x_1));
+----
+x_1	INTEGER
+x	INTEGER
 
 query TT
 SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('cs', 'SELECT * FROM dbo.t'));

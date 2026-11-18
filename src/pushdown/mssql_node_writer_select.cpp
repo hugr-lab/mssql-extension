@@ -408,6 +408,18 @@ bool NodeWriter::WriteSortKeys(const std::vector<OrderByNode> &orders, std::stri
 	return true;
 }
 
+//! A name's length as SQL Server counts an identifier's (UTF-16 code units: one per code point, two above
+//! U+FFFF), from its UTF-8 bytes.
+static size_t IdentifierLength(const std::string &utf8) {
+	size_t units = 0;
+	for (const unsigned char b : utf8) {
+		if ((b & 0xC0) != 0x80) {
+			units += b >= 0xF0 ? 2 : 1;
+		}
+	}
+	return units;
+}
+
 bool NodeWriter::WriteSelectList(const SelectNode &node) {
 	std::string list;
 	auto add = [&](idx_t index, const std::string &alias) {
@@ -416,7 +428,7 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 		// ID_1), sent as an alias where the two differ.
 		const std::string output = alias.empty() ? column.DuckDBName() : alias;
 		const std::string as = alias.empty() && column.DuckDBName() != column.name ? column.DuckDBName() : alias;
-		if (as.size() > 128) {
+		if (IdentifierLength(as) > 128) {
 			return Veto("a result column name longer than 128 characters");
 		}
 		for (auto &existing : outputs_) {
