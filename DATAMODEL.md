@@ -1463,7 +1463,8 @@ flowchart BT
   beside `TYPE mssql`, sharing none of layers 1-4: its catalog type is `mssql_backup`, so the
   pool, `MSSQLOptimizer` and the remote-pushdown hooks never see it. Its state is an
   `AttachedBackup` built at ATTACH: the `OpenedBackup` (the opened-file cache's entry, held while
-  attached) and the `CatalogModel` for the ATTACH's `schema_filter` / `table_filter`; the catalog's
+  attached) and the `CatalogModel` for the ATTACH's `schema_filter` / `table_filter` and
+  `schema_exclude` / `table_exclude`; the catalog's
   schema and table entries are built from it once and never change (no lock on the lookup path). The
   in-row units' page lists are a stage of the `OpenedBackup` (`UnitPageCache`, under its own lock,
   filled at a table's first scan, counted in the cache entry's estimate), shared by every scan of the
