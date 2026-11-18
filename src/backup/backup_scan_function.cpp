@@ -1324,9 +1324,10 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 	}
 	// Each record bounded by the next one's start, as the scan bounds it; two slots naming one record
 	// refused (review of #549).
-	std::vector<RecordSpan> spans;
+	static thread_local std::vector<RecordSpan> spans;	// kept by the thread, page to page
+	static thread_local std::vector<uint16_t> bound;
 	RecordSpans(page, spans);
-	std::vector<uint16_t> bound(slots, 0);
+	bound.assign(slots, 0);
 	for (size_t i = 0; i < spans.size(); i++) {
 		if (i > 0 && spans[i].offset == spans[i - 1].offset) {
 			throw FormatError("backup: page " + page.header.page_id.ToString() + " has slots " +
@@ -1418,7 +1419,7 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 //! must lie in the same slot too: its rid is its place.
 void SameRecords(const Page &old_page, const Page &new_page, bool same_slot, std::vector<bool> &old_same,
 				 std::vector<bool> &new_same) {
-	std::vector<RecordSpan> old_spans, new_spans;
+	static thread_local std::vector<RecordSpan> old_spans, new_spans;  // kept by the thread
 	RecordSpans(old_page, old_spans);
 	RecordSpans(new_page, new_spans);
 	old_same.assign(old_page.header.slot_count, false);
@@ -2014,7 +2015,7 @@ private:
 		check.units = side.cursors[partition].off_row;
 		check.hash_always = true;
 		check.sha256 = sha256_;
-		Page one_page;
+		static thread_local Page one_page;	// kept by the thread: no page allocated a value
 		std::vector<PageRow> one;
 		if (ReadUnitDataPage(store, *side.cursors[partition].unit, p, name_, one_page)) {
 			ReadPageRows(side.data, side.cursors[partition], one_page, one, &check, slot);

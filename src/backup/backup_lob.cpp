@@ -2,6 +2,7 @@
 
 #include "backup/backup_record.hpp"
 
+#include <memory>
 #include <set>
 #include <tuple>
 #include <vector>
@@ -56,6 +57,16 @@ struct Reader {
 	typedef std::tuple<uint16_t, uint32_t, uint16_t> FragmentId;
 	std::vector<FragmentId> seen_few;
 	std::set<FragmentId> seen_many;
+
+	//! A node's page buffer, by depth: a node's body is read while its children are (one level down), and
+	//! the buffers stay with the thread, so a walk allocates and clears no page.
+	static Page &PageAt(size_t depth) {
+		static thread_local std::vector<std::unique_ptr<Page>> pages;
+		while (pages.size() <= depth) {
+			pages.push_back(std::unique_ptr<Page>(new Page()));
+		}
+		return *pages[depth];
+	}
 
 	bool FirstVisit(const PagePointer &at, uint16_t slot) {
 		const FragmentId id = std::make_tuple(at.file, at.page, slot);
@@ -140,7 +151,7 @@ struct Reader {
 	uint64_t Node(const PagePointer &at, uint16_t slot, uint64_t offset, uint64_t expected, uint64_t bound,
 				  size_t depth, Expect expect) {
 		Count(at, slot, depth);
-		Page page;
+		Page &page = PageAt(depth);
 		const ByteReader body = Fragment(at, slot, page);
 		const uint16_t type = body.U16(12);
 		if (expect.kind == Expect::Leaf && type != FRAGMENT_DATA) {
