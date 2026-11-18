@@ -181,10 +181,10 @@ uint64_t MSSQLBackupCatalog::NumberOf(optional_ptr<ClientContext> context, const
 	return 0;
 }
 
-MSSQLBackupCatalog::State &MSSQLBackupCatalog::DefaultState() const {
+std::shared_ptr<MSSQLBackupCatalog::State> MSSQLBackupCatalog::DefaultState() const {
 	std::lock_guard<std::mutex> guard(lock_);
 	const auto &history = *versions_->history;
-	return *states_.at(StateKey(history, history.versions[versions_->default_version - 1]));
+	return states_.at(StateKey(history, history.versions[versions_->default_version - 1]));
 }
 
 unique_ptr<MSSQLBackupCatalog::State> MSSQLBackupCatalog::MakeState(std::shared_ptr<const AttachedBackup> backup) {
@@ -217,11 +217,19 @@ unique_ptr<MSSQLBackupCatalog::State> MSSQLBackupCatalog::MakeState(std::shared_
 	return state;
 }
 
-MSSQLBackupCatalog::State &MSSQLBackupCatalog::StateOf(optional_ptr<ClientContext> context, const Versions &versions,
-													   uint64_t version) {
+std::shared_ptr<MSSQLBackupCatalog::State> MSSQLBackupCatalog::StateOf(optional_ptr<ClientContext> context,
+																	   const Versions &versions, uint64_t version) {
 	const auto &history = *versions.history;
 	const auto &entry = history.versions[version - 1];
 	const std::string key = StateKey(history, entry);
+	auto own = OwnTransaction(context, *this);
+	if (own) {
+		std::lock_guard<std::mutex> guard(own->lock);
+		auto it = own->states.find(key);
+		if (it != own->states.end()) {
+			return it->second;
+		}
+	}
 	std::shared_ptr<State> found;
 	{
 		std::lock_guard<std::mutex> guard(lock_);
@@ -243,13 +251,13 @@ MSSQLBackupCatalog::State &MSSQLBackupCatalog::StateOf(optional_ptr<ClientContex
 		}
 		found = slot;
 	}
-	// The transaction keeps what it read: a refresh meanwhile drops the state from the catalog only.
-	auto own = OwnTransaction(context, *this);
+	// The transaction keeps what it read, once (by key): a refresh meanwhile drops the state from the catalog
+	// only.
 	if (own) {
 		std::lock_guard<std::mutex> guard(own->lock);
-		own->states.push_back(found);
+		own->states.emplace(key, found);
 	}
-	return *found;
+	return found;
 }
 
 uint64_t MSSQLBackupCatalog::Resolve(const Versions &versions, optional_ptr<ClientContext> context,
@@ -263,7 +271,7 @@ uint64_t MSSQLBackupCatalog::Resolve(const Versions &versions, optional_ptr<Clie
 std::shared_ptr<const AttachedBackup> MSSQLBackupCatalog::BackupAt(optional_ptr<ClientContext> context,
 																   const mssql::backup::BackupAt &at) {
 	const auto versions = VersionsFor(context);
-	return StateOf(context, *versions, Resolve(*versions, context, at)).backup;
+	return StateOf(context, *versions, Resolve(*versions, context, at))->backup;
 }
 
 std::pair<uint64_t, uint64_t> MSSQLBackupCatalog::Refresh(ClientContext &context) {
@@ -323,7 +331,8 @@ std::pair<uint64_t, uint64_t> MSSQLBackupCatalog::Refresh(ClientContext &context
 
 optional<Identifier> MSSQLBackupCatalog::GetDefaultSchema() const {
 	// dbo, as SQL Server resolves a one-part name; the first schema the filter kept when it hid dbo.
-	const auto &schemas = DefaultState().schemas;
+	const auto state = DefaultState();
+	const auto &schemas = state->schemas;
 	if (schemas.empty() || schemas.count("dbo")) {
 		return Identifier("dbo");
 	}
@@ -364,8 +373,9 @@ optional_ptr<SchemaCatalogEntry> MSSQLBackupCatalog::LookupSchema(CatalogTransac
 		chosen.unit = at->Unit().GetIdentifierName();
 		chosen.value = at->GetValue();
 	}
-	auto &state = StateOf(transaction.context, *versions, Resolve(*versions, transaction.context, chosen));
-	auto found = FindByName(state.schemas, lookup.GetEntryName());
+	// The entry returned lives on in the transaction's states (or the catalog's, with no transaction).
+	const auto state = StateOf(transaction.context, *versions, Resolve(*versions, transaction.context, chosen));
+	auto found = FindByName(state->schemas, lookup.GetEntryName());
 	if (!found && if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
 		throw CatalogException("Schema '%s' not found in the backup attached as %s", lookup.GetEntryName(), name_);
 	}
@@ -374,7 +384,8 @@ optional_ptr<SchemaCatalogEntry> MSSQLBackupCatalog::LookupSchema(CatalogTransac
 
 void MSSQLBackupCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
 	const auto versions = VersionsFor(&context);
-	for (auto &s : StateOf(&context, *versions, versions->default_version).schemas) {
+	const auto state = StateOf(&context, *versions, versions->default_version);
+	for (auto &s : state->schemas) {
 		callback(*s.second);
 	}
 }
@@ -409,7 +420,8 @@ PhysicalOperator &MSSQLBackupCatalog::PlanUpdate(ClientContext &, PhysicalPlanGe
 DatabaseSize MSSQLBackupCatalog::GetDatabaseSize(ClientContext &) {
 	// The default version's files: its full's, and its differential's.
 	DatabaseSize size;
-	for (auto backup = DefaultState().backup->backup.get(); backup; backup = backup->Base().get()) {
+	const auto state = DefaultState();
+	for (auto backup = state->backup->backup.get(); backup; backup = backup->Base().get()) {
 		for (const auto &file : backup->Headers().files) {
 			size.bytes += file.size;
 		}
@@ -418,7 +430,8 @@ DatabaseSize MSSQLBackupCatalog::GetDatabaseSize(ClientContext &) {
 }
 
 string MSSQLBackupCatalog::GetDBPath() {
-	return DefaultState().backup->backup->Headers().files.front().path;
+	const auto state = DefaultState();
+	return state->backup->backup->Headers().files.front().path;
 }
 
 //===----------------------------------------------------------------------===//

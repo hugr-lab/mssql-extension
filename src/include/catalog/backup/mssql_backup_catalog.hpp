@@ -139,20 +139,26 @@ public:
 	//! before it).
 	[[noreturn]] void RefuseWrite() const;
 
-private:
+	//! One version's entries: shared by the catalog (states_) and every transaction that read it.
 	struct State {
 		std::shared_ptr<const mssql::backup::AttachedBackup> backup;
 		std::map<std::string, unique_ptr<MSSQLBackupSchemaEntry>> schemas;
 	};
+
+private:
 	std::shared_ptr<const Versions> CurrentVersions() const;
 	//! The version `at` names in `versions` (its default when none).
 	uint64_t Resolve(const Versions &versions, optional_ptr<ClientContext> context,
 					 const mssql::backup::BackupAt &at) const;
-	//! The entries of `version` of `versions`, built now when they are not: opened outside the lock (two
-	//! lookups may open one version together; the first kept).
-	State &StateOf(optional_ptr<ClientContext> context, const Versions &versions, uint64_t version);
+	//! The entries of `version` of `versions`: the ones `context`'s transaction read, else the catalog's,
+	//! else built now -- opened outside the lock (two lookups may open one version together; the first
+	//! kept). A transaction keeps what it reads, so a version it read stays readable while it runs, though a
+	//! refresh drops it from the catalog (review of #579).
+	std::shared_ptr<State> StateOf(optional_ptr<ClientContext> context, const Versions &versions, uint64_t version);
 	unique_ptr<State> MakeState(std::shared_ptr<const mssql::backup::AttachedBackup> backup);
-	State &DefaultState() const;
+	//! The default version's entries, held by the caller while it reads them: a refresh may drop them from
+	//! the catalog meanwhile (review of #579).
+	std::shared_ptr<State> DefaultState() const;
 
 	std::string name_;
 	//! The version snapshot_version / snapshot_time chose at ATTACH, by its backups; empty: the latest.
@@ -249,8 +255,9 @@ public:
 
 	std::mutex lock;
 	std::shared_ptr<const MSSQLBackupCatalog::Versions> versions;
-	//! The version states it read: alive while it runs, though a refresh drops them from the catalog.
-	std::vector<std::shared_ptr<const void>> states;
+	//! The version states it read, by StateKey: its lookups find them here first, so they stay readable
+	//! while it runs, though a refresh drops them from the catalog (review of #579).
+	std::map<std::string, std::shared_ptr<MSSQLBackupCatalog::State>> states;
 };
 
 class MSSQLBackupTransactionManager : public TransactionManager {

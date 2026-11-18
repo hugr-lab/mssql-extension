@@ -12,13 +12,16 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "backup/backup_opened.hpp"
 #include "backup/backup_scan_function.hpp"
+#include "catalog/backup/mssql_backup_catalog.hpp"
 #include "duckdb.hpp"
+#include "duckdb/transaction/transaction.hpp"
 #include "mssql_extension.hpp"
 
 using namespace duckdb;
@@ -387,6 +390,39 @@ int main() {
 			Check(ScalarInt(con, "SELECT count(*) FROM mssql_backup_snapshots('hr')") == 4,
 				  "the transaction still reads its 4");
 			con.Query("COMMIT");
+			// The states a transaction read are its own, by key (review of #579): read again, they are not
+			// added again; dropped from the catalog by a refresh on another connection (the file touched: a
+			// new state), they stay the transaction's, the same entries. Reading the touched file's rows is
+			// refused by name all the same.
+			con.Query("BEGIN");
+			Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000,
+				  "a transaction reads version 1, the full");
+			auto &attached = Catalog::GetCatalog(*con.context, "hr").GetAttached();
+			auto &own = Transaction::Get(*con.context, attached).Cast<MSSQLBackupTransaction>();
+			const size_t read = own.states.size();
+			std::set<const void *> held;
+			for (const auto &s : own.states) {
+				held.insert(s.second.get());
+			}
+			Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000 &&
+					  ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000 &&
+					  own.states.size() == read,
+				  "reading it again adds no state (" + std::to_string(read) + " held)");
+			std::filesystem::last_write_time(
+				dir / "a_full.bak", std::filesystem::last_write_time(dir / "a_full.bak") + std::chrono::seconds(20));
+			Check(ScalarInt(other, "SELECT versions FROM mssql_backup_refresh('hr')") == 5,
+				  "another connection refreshes past the touched full");
+			auto rows = con.Query("SELECT count(*) FROM hr.items AT (VERSION => 1)");
+			Check(rows->HasError() && rows->GetError().find("changed since it was attached") != std::string::npos,
+				  "the transaction's version 1, its file changed, refused by name");
+			bool same = own.states.size() == read;
+			for (const auto &s : own.states) {
+				same = same && held.count(s.second.get());
+			}
+			Check(same, "and the transaction holds the same states it read, none opened again");
+			con.Query("ROLLBACK");
+			Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000,
+				  "the next transaction reads the touched full as refreshed");
 		}
 		auto refused = con.Query("SELECT * FROM mssql_backup_refresh('nope')");
 		Check(refused->HasError() && refused->GetError().find("is not a backup attached") != std::string::npos,
