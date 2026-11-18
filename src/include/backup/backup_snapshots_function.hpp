@@ -9,13 +9,24 @@
 
 #pragma once
 
+#include "backup/backup_history.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace duckdb {
 namespace mssql {
 namespace backup {
 
 void RegisterBackupSnapshotsFunction(ExtensionLoader &loader);
+
+//! The history `paths` name: an attached backup's (its transaction's versions) when one path names one,
+//! else the files' (ReadBackupHistory); `default_version` its version read without AT, `attached` (when
+//! given) whether it is an attached backup's.
+std::shared_ptr<const BackupHistory> HistoryOf(ClientContext &context, const std::vector<std::string> &paths,
+											   uint64_t &default_version, bool *attached = nullptr);
 
 }  // namespace backup
 }  // namespace mssql

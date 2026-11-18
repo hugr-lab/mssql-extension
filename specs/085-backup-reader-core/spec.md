@@ -1593,6 +1593,30 @@ before the next opens.
     refused by name. Tested by `test_backup_cache` over a folder that grows (a differential and a copy-only
     full added -- the differential renumbered, its state kept --, a pinned snapshot_version, a file touched
     then healed by a refresh, a file renamed, a transaction across another connection's refresh).
+24c. Schema changes between two states (DQ-47) -- 1 d. As built (PR 4c-3a): `CompareCatalogs`
+    (`backup_schema_changes`, DuckDB-free) over two catalog models, by object id and column id, in the
+    order an importer applies them (reloads and drops; each kept table's rename, truncation, switch and
+    columns -- renames, drops, additions, type, nullability --; creations; then the views). The partition
+    rules, judged by rowset (a MERGE / SPLIT renumbers partitions; review of the change: by number a
+    sliding window read as false switches), measured on the oracle fixtures `diffs.sql` and
+    `schema_changes.sql` (2022): a TRUNCATE keeps the rowset; a unit of it (in-row, LOB -- a clustered
+    columnstore's segments --, row-overflow) loses its IAM chain when nothing was inserted since, starts
+    at another first page when something was, or, past 128 extents (a deferred drop), is replaced by a
+    new unit -- `table_truncated`; a DBCC SHRINKFILE moves a unit's IAM and root pages and leaves its
+    recorded first page, and so does a DELETE of every row -- no event (comparing the first IAM page read
+    both as truncations: measured, and dropped); a REBUILD gives new rowsets and units, its
+    pages written anew -- no event, the row changes see it; a new rowset that was another table's in the
+    old state is a partition switched in -- `table_reload` (its pages keep their LSNs); an old rowset
+    another table's now -- `partition_switched_out`, by its old number (DQ-49: a purge, not a reload); a
+    switch to a table since dropped is no event (the row changes give its deletes). Off-row view
+    definitions within MAX_CALL_OFF_ROW_BYTES a call; a view altered whose text cannot be read is a
+    `view_definition_changed` with NULL texts and the reason. Over files the history is read once and
+    each version opened by its files, checked against that read. `mssql_backup_schema_changes(name | path,
+    start_version :=, end_version :=, diff :=)` and the catalog's `schema_changes()` macro. Tests:
+    `test_backup_schema_changes` (synthetic models: every event, the order, a history break), the SQL
+    shape and refusals (`mssql_backup_schema_changes.test`; the committed samples share one schema), and
+    by hand on the 2022 `diffs` fixture (dropped, truncated, a column dropped and one added, created; the
+    rebuilt table no event). The row changes are 24d.
 25. `s3://` (MinIO) and `https://` tests in the lane; measure the open pass and decide filter pushdown
     with late materialisation (a follow-up spec if it is worth it) — 2 d. Owner, 2026-11-11: the
     scan is to make filtering cheap enough for an importer that exports a table with a filter over

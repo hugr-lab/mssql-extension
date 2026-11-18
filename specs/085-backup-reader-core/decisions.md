@@ -785,7 +785,10 @@ what an earlier differential already brought.
   rows appear or go: a `table_created` / `table_dropped` of its rows for an importer that keeps them). A change that cannot be
   expressed row by row -- a type change that rewrites the rows, a table rebuilt under a new object id, a
   partition SWITCH -- marks the table `reload`: its row changes are then its whole new content, and the
-  importer rebuilds it. The importer applies the DDL before the rows.
+  importer rebuilds it. As built (PR 4c-3a, measured on the oracle fixture): a type change that rewrites the rows
+  and an index rebuild write every page anew, so the row changes see them and neither is a reload; a
+  partition switched *in* is (its pages keep their LSNs), a switch *out* and a TRUNCATE are DQ-49's
+  events. The importer applies the DDL before the rows.
 - **Row changes, in the new schema**, as DuckLake names them: `mssql_backup_table_changes(catalog,
   schema, table [, start, end])` (versions or timestamps, as `ducklake_table_changes`) with `change_type` `'insert'`, `'delete'`, `'update_preimage'`,
   `'update_postimage'`; `mssql_backup_table_insertions` / `_deletions` the rows an importer inserts /

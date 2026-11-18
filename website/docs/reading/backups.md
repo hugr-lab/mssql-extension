@@ -432,6 +432,38 @@ SELECT count(*) FROM mssql_backup_scan('/backups/sales/*.bak', 'dbo', 'orders',
                                        as_of := TIMESTAMP '2026-11-17 15:30');
 ```
 
+## Changes between two states
+
+`mssql_backup_schema_changes` gives what changed in the schema from one state of a history to another,
+as an importer applies it before the rows -- compared by object id and column id, so a rename is a
+rename:
+
+```sql
+FROM b.schema_changes(start_version := 41, end_version := 42);
+FROM mssql_backup_schema_changes('b', start_version := TIMESTAMP '2026-11-17 14:00');
+FROM mssql_backup_schema_changes('/backups/sales_full.bak', diff := '/backups/sales_diff.bak');
+```
+
+| `change_type` | When |
+|---|---|
+| `table_created`, `table_dropped`, `table_renamed` | as they say |
+| `table_truncated` | `TRUNCATE` (the partition's pages all freed: its allocation starts anew, or not at all; a `DELETE` of every row or a shrink is no truncation), with the `partitions` concerned |
+| `partition_switched_out` | a partition's rows moved to another table that the newer state still has (a sliding window's `SWITCH OUT`), by its old partition number |
+| `table_reload` | the table is to be read whole: recreated under a new object id, a partition switched in from another table (its pages are not rewritten, so they cannot be told apart by their LSNs), or the database restored or recreated between the two states (`reason` says which) |
+| `column_added`, `column_dropped`, `column_renamed`, `column_type_changed`, `column_nullability_changed` | with the old and new name, type and nullability |
+| `view_created`, `view_dropped`, `view_renamed`, `view_definition_changed`, `view_indexed`, `view_unindexed` | with the old and new T-SQL, which the lake keeps though it cannot run it |
+
+The rows come in the order an importer applies them: the tables' reloads and drops, then each kept
+table's rename, truncation, switch and columns (renames, drops, additions, type and nullability changes),
+then the tables created, then the views. `start_version` / `end_version` take a version's number or a
+time; with neither, the default version against its full alone. One state gives no rows, not an error,
+so an importer can ask on every backup. An index rebuild, a partition `MERGE` or `SPLIT` and a switch to
+a table since dropped are no event: their pages are written anew, or their rows are gone, and the row
+changes see them. Partitions are matched by their data (rowset), not their number, which a `MERGE` or
+`SPLIT` moves. A table recreated under a new object id is a reload with no column events: compare its
+columns to know whether the lake's table still fits. Not events: a column's collation, identity,
+computed definition or sparseness alone.
+
 ## Opening a backup once
 
 A backup is opened once per DuckDB instance: what a call read to open it -- the headers, where

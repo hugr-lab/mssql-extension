@@ -19,7 +19,8 @@
 # lob_xpress compressed); cd.sql, ROW-compressed tables (spec 086 PR 1: cd_full plain, cd_xpress compressed); names.sql, a
 # case-sensitive database whose tables differ only in case, and names with spaces, quotes, ] and dots (spec 085 PR 4b);
 # diffs.sql, a full and a differential over it after E2's changes (spec 085 PR 4c: diffs_full, diffs_diff and
-# diffs_diff_xpress, paired in overlays.txt). A fixture's backups come with the server's own catalog of them where it holds
+# diffs_diff_xpress, paired in overlays.txt); schema_changes.sql, truncates, a shrink and a sliding window between a
+# full and its differential (PR 4c-3: schema_full, schema_diff; not run by default). A fixture's backups come with the server's own catalog of them where it holds
 # still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).
 #
 # Writes into OUT: the backups, <set>.headeronly.txt / .labelonly.txt / .filelistonly.txt, sets.txt
@@ -254,6 +255,11 @@ for fixture in ${FIXTURES}; do
 		# A differential over its full (spec 085 PR 4c), plain and compressed; compare_rows restores each pair.
 		sets+=("diffs_full|diffs_full.bak" "diffs_diff|diffs_diff.bak" "diffs_diff_xpress|diffs_diff_xpress.bak")
 		overlays+=("diffs_over|diffs_full|diffs_diff" "diffs_over_xpress|diffs_full|diffs_diff_xpress")
+		;;
+	schema_changes)
+		# What the catalog alone shows between a full and its differential (spec 085 PR 4c-3): truncates, a
+		# delete of every row, pages moved by a shrink, a sliding window. Not an overlay compare_rows takes.
+		sets+=("schema_full|schema_full.bak" "schema_diff|schema_diff.bak")
 		;;
 	*)
 		echo "ERROR: unknown fixture ${fixture}" >&2

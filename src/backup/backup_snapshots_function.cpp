@@ -89,18 +89,6 @@ struct SnapshotsState : public GlobalTableFunctionState {
 	idx_t next = 0;
 };
 
-//! The history of the catalog attached as `name` (TYPE mssql_backup), or none.
-std::shared_ptr<const BackupHistory> AttachedHistory(ClientContext &context, const std::string &name,
-													 uint64_t &default_version) {
-	auto db = DatabaseManager::Get(context).GetDatabase(Identifier(name));
-	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {
-		return nullptr;
-	}
-	const auto versions = db->GetCatalog().Cast<MSSQLBackupCatalog>().VersionsFor(&context);
-	default_version = versions->default_version;
-	return versions->history;
-}
-
 unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
 							  vector<Identifier> &names) {
 	auto data = make_uniq<SnapshotsBindData>();
@@ -111,17 +99,10 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	}
 	uint64_t default_version = 0;
 	std::shared_ptr<const BackupHistory> history;
-	if (paths.size() == 1) {
-		history = AttachedHistory(context, paths.front(), default_version);
-	}
-	if (!history) {
-		try {
-			auto read = std::make_shared<BackupHistory>(ReadBackupHistory(context, paths));
-			default_version = read->versions.back().number;
-			history = std::move(read);
-		} catch (FormatError &e) {
-			throw InvalidInputException("%s: %s", FUNCTION, e.what());
-		}
+	try {
+		history = HistoryOf(context, paths, default_version);
+	} catch (FormatError &e) {
+		throw InvalidInputException("%s: %s", FUNCTION, e.what());
 	}
 	for (const auto &v : history->versions) {
 		const auto &full = history->backups[v.full];
@@ -214,6 +195,27 @@ void RefreshExecute(ClientContext &context, TableFunctionInput &input, DataChunk
 }
 
 }  // namespace
+
+std::shared_ptr<const BackupHistory> HistoryOf(ClientContext &context, const std::vector<std::string> &paths,
+											   uint64_t &default_version, bool *attached) {
+	if (attached) {
+		*attached = false;
+	}
+	if (paths.size() == 1) {
+		auto db = DatabaseManager::Get(context).GetDatabase(Identifier(paths.front()));
+		if (db && db->GetCatalog().GetCatalogType() == MSSQLBackupCatalog::TYPE) {
+			const auto versions = db->GetCatalog().Cast<MSSQLBackupCatalog>().VersionsFor(&context);
+			default_version = versions->default_version;
+			if (attached) {
+				*attached = true;
+			}
+			return versions->history;
+		}
+	}
+	auto read = std::make_shared<BackupHistory>(ReadBackupHistory(context, paths));
+	default_version = read->versions.back().number;
+	return read;
+}
 
 void RegisterBackupSnapshotsFunction(ExtensionLoader &loader) {
 	{
