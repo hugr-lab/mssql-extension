@@ -33,6 +33,27 @@ int main() {
 	Check({"", "", "x"}, {"C0", "C1", "x"}, "unnamed result columns named as DuckDB names them");
 	Check({"", "C0"}, {"C0_1", "C0"}, "an unnamed column never takes a real column's name (review of #574)");
 	Check({"x", "x"}, {"x", "x_1"}, "an exact repeat (a raw scan's) is named apart too");
+	// A query's own aliases over the first names (review of #574): only a later name equal to one moves.
+	auto aliased = [](const std::vector<std::string> &server, const std::vector<std::string> &aliases) {
+		auto got = duckdb::mssql::AvoidAliases(duckdb::mssql::DuckDBColumnNames(server), server, aliases);
+		for (size_t i = 0; i < aliases.size(); i++) {
+			got[i] = aliases[i];  // DuckDB's overlay
+		}
+		return got;
+	};
+	auto check_aliased = [&](const std::vector<std::string> &server, const std::vector<std::string> &aliases,
+							 const std::vector<std::string> &want, const std::string &what) {
+		const bool ok = aliased(server, aliases) == want;
+		std::cout << (ok ? "  ok   " : "  FAIL ") << what << std::endl;
+		if (!ok) {
+			failures++;
+		}
+	};
+	check_aliased({"x", "x"}, {"x_1"}, {"x_1", "x"}, "x, x AS s(x_1): x_1, x");
+	check_aliased({"x", "x", "x"}, {"a"}, {"a", "x_1", "x_2"}, "x, x, x AS s(a): a, x_1, x_2 (s.x_1 reads 2)");
+	check_aliased({"x", "x", "x"}, {"a", "b"}, {"a", "b", "x_2"}, "x, x, x AS s(a, b): a, b, x_2");
+	check_aliased({"p", "q", "r"}, {"a"}, {"a", "q", "r"}, "no repeat: unchanged");
+	check_aliased({"x", "x", "x"}, {"x_2"}, {"x_2", "x_1", "x"}, "x, x, x AS s(x_2): the third moves to x");
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;
 	return failures ? 1 : 0;
 }

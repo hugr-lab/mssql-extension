@@ -29,7 +29,12 @@ name (`SELECT 1, 2 AS C0` reads as `C0_1`, `C0`); and a suffix avoids the query'
 
 ```sql
 SELECT "Id", "ID_1" FROM sqlserver.dbo.t WHERE "ID_1" > 0;   -- sent as ... [ID] ... WHERE [ID] > ...
+DESCRIBE SELECT * FROM mssql_scan('sqlserver', 'SELECT 1 AS x, 2 AS x') AS s(x_1);         -- x_1, x
+DESCRIBE SELECT * FROM mssql_scan('sqlserver', 'SELECT 1 AS x, 2 AS x, 3 AS x') AS s(a);   -- a, x_1, x_2
 ```
+
+Only a name equal to one of the query's aliases moves; every other keeps the name it has without
+them.
 
 ### Filter and Projection Pushdown
 

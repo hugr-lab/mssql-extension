@@ -1338,6 +1338,27 @@ connection created) but cannot assert that the parallel section ran concurrently
 global writer's connection and the one sink thread then claims a session on top of
 it. `MSSQL_COUNTERS=1` reports the truth as `writers=N/M`, but only to stderr.
 
+### COPY into an existing table: one read of its columns
+
+`TargetResolver::ValidateTarget` runs at COPY's init on the load's connection: it creates, replaces or
+truncates the target as the options ask, and for a table that exists it reads the target's columns
+**once** (`GetExistingTableColumnMetadata`: `sys.columns` by `column_id`, type, length, precision,
+scale, nullability, collation). `ValidateExistingTableSchema` checks the source against that read and
+returns it, and the load's COLMETADATA and the source-to-target mapping (by the target's DuckDB names,
+issue #572) are built from the same read. Until the review of #574 the init read the columns a second
+time for the COLMETADATA, and a column another session added in between could move a `_N` suffix and
+send a source column's rows into another target column. A table the COPY itself created is read after
+the CREATE, as before (it has no columns to validate).
+
+```mermaid
+flowchart LR
+  init["COPY init<br/>(load connection)"] --> vt["ValidateTarget"]
+  vt -- "exists, append / truncate" --> read["GetExistingTableColumnMetadata<br/>(the one read)"]
+  read --> check["ValidateExistingTableSchema<br/>source vs target types"]
+  check --> meta["COLMETADATA +<br/>BuildColumnMapping (DuckDB names)"]
+  vt -- "created / replaced" --> fresh["read after CREATE"] --> meta
+```
+
 ### Encoding: one resolution per column, one decision per chunk
 
 `codec::ResolveWriteColumnOps(source, target)` maps each column to a `ScatterArm`

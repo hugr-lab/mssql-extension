@@ -131,6 +131,17 @@ SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('cs', 'S
 x_1	INTEGER
 x	INTEGER
 
+# Only a name equal to an alias moves: every other keeps its own (s.x_1 still the second column).
+query III
+SELECT s.a, s.x_1, s.x_2 FROM mssql_scan('cs', 'SELECT 1 AS x, 2 AS x, 3 AS x') AS s(a);
+----
+1	2	3
+
+query III
+SELECT s.a, s.b, s.x_2 FROM mssql_scan('cs', 'SELECT 1 AS x, 2 AS x, 3 AS x') AS s(a, b);
+----
+1	2	3
+
 query TT
 SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('cs', 'SELECT * FROM dbo.t'));
 ----

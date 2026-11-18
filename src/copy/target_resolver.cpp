@@ -501,6 +501,9 @@ TableLoadShape TargetResolver::QueryTableShape(tds::TdsConnection &conn, const B
 void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &conn, BCPCopyTarget &target,
 									BCPCopyConfig &config, const vector<LogicalType> &source_types,
 									const vector<string> &source_names, vector<BCPColumnMetadata> *existing_columns) {
+	if (existing_columns) {
+		existing_columns->clear();	// filled only when an existing table is validated
+	}
 	DebugLog(2, "ValidateTarget: checking %s", target.GetFullyQualifiedName().c_str());
 
 	// Build object check SQL.

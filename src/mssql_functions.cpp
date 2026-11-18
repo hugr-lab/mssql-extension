@@ -1160,22 +1160,29 @@ static void BindDescribedScan(ClientContext &context, const char *function, MSSQ
 	MSSQL_FN_DEBUG_LOG(1, "MSSQLScanBind: END (total %ldms)", (long)bind_ms);
 }
 
-//! The query's own column aliases (`… AS s(a, b)`), which DuckDB lays over the first result names: the
-//! later columns' suffixes (issue #572) avoid them, so `SELECT 1 AS x, 2 AS x` aliased `s(x_1)` reads as
-//! x_1, x (review of #574).
+//! The query's own column aliases (`… AS s(a, b)`), which DuckDB lays over the first result names: a
+//! later name equal to one moves, every other stays (`mssql::AvoidAliases`), so `SELECT 1 AS x, 2 AS x`
+//! aliased `s(x_1)` reads as x_1, x, and three `x` aliased `s(a)` as a, x_1, x_2 (review of #574).
 static void ReserveAliases(const TableFunctionBindInput &input, const vector<string> &server_names,
 						   vector<Identifier> &names) {
 	const auto &aliases = input.ref.column_name_alias;
 	if (aliases.empty()) {
 		return;
 	}
-	std::vector<std::string> with_aliases(server_names.begin(), server_names.end());
-	for (idx_t i = 0; i < aliases.size() && i < with_aliases.size(); i++) {
-		with_aliases[i] = aliases[i].GetIdentifierName();
+	if (server_names.size() != names.size()) {
+		return;
 	}
-	const auto deduplicated = mssql::DuckDBColumnNames(with_aliases);
-	for (idx_t i = aliases.size(); i < names.size() && i < deduplicated.size(); i++) {
-		names[i] = Identifier(deduplicated[i]);
+	std::vector<std::string> current, alias_names;
+	for (const auto &n : names) {
+		current.push_back(n.GetIdentifierName());
+	}
+	for (const auto &a : aliases) {
+		alias_names.push_back(a.GetIdentifierName());
+	}
+	const auto moved =
+		mssql::AvoidAliases(current, std::vector<std::string>(server_names.begin(), server_names.end()), alias_names);
+	for (idx_t i = aliases.size(); i < names.size(); i++) {
+		names[i] = Identifier(moved[i]);
 	}
 }
 
