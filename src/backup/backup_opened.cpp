@@ -563,9 +563,14 @@ static OpenedForStatement OpenOverlay(ClientContext &context, OpenedForStatement
 	if (opened.backup && opened.backup->Base() != full.backup) {
 		// The overlay's entry outlived the full's (each is evicted on its own) or was put by another
 		// statement that opened the full meanwhile: its base is the full the overlay was built on, so the
-		// statement's files of the full -- the same files, by the key -- are bound to that one.
+		// statement's files of the full -- the same files, by the key -- are bound to that one, and it is
+		// put back as the full's entry (review of #575): the overlay holds it anyway, so one copy of the
+		// full is kept and counted, not that one unaccounted beside a second built anew.
 		full.backup = opened.backup->Base();
 		full.binding = BindingFor(full.backup->Headers(), *full.files);
+		if (!full.cache_key.empty()) {
+			cache.Put(full.cache_key, full.backup);
+		}
 	}
 	if (!opened.backup) {
 		auto headers = ReadBackupHeaders(*opened.files);

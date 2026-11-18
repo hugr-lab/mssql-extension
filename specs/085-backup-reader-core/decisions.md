@@ -816,7 +816,9 @@ be told.
   (cheap) and orders the states: each full, and each differential over it, is a version, at its
   backup's finish time. `mssql_backup_snapshots('b')` lists them, as `ducklake_snapshots`.
 - A query without `AT` reads the latest state. `AT (TIMESTAMP => T)` reads the latest state finished by
-  T -- the latest full before T with its latest differential before T; `AT (VERSION => n)` the n-th
+  T -- a full, or a differential over the full it names as its base (a copy-only full is a state of
+  its own and never a differential's base: with F at 00:00, a copy-only C at 02:00 and D at 03:00 over
+  F, T = 03:30 reads F + D, never C + D); `AT (VERSION => n)` the n-th
   (`Catalog::SupportsTimeTravel`, the AT clause reaching `LookupEntry`). A state's overlay (task 24) is
   built at its first query and cached.
 - DQ-47's change functions take two versions or timestamps of the history, as `ducklake_table_changes`.
@@ -851,7 +853,9 @@ is older than a year or so, for its own speed, while the lake is to keep years o
   WHERE created_at < …`) is many such deletes in the next file, skipped; a skipped file or the next
   full changes nothing, the change being between two versions.
 - **Schema evolution of an `accumulate` / `retain` table**: the lake holds rows of every past schema,
-  so its schema only grows. A column added: added in the lake (NULL in older rows). A column dropped at
+  so its schema only grows. A column added: added in the lake, its older rows NULL when it has no
+  default, else the source's default (below: SQL Server reads a metadata-only `ADD … NOT NULL DEFAULT x`
+  as x in every older row, the archived ones of an `accumulate` / `retain` table included). A column dropped at
   the source: kept in the lake (older rows have values), NULL in new rows. A column renamed (one
   `column_id`): renamed in the lake. A type widened: widened in the lake (DuckLake's type promotion), no
   rewrite. A type narrowed or changed incompatibly: the column rewritten when every kept value casts
@@ -882,10 +886,12 @@ is older than a year or so, for its own speed, while the lake is to keep years o
   table whose types change often, not the default.
 - **Large batches of inserts as files** (owner, 2026-11-17): when a version brings more new rows to a
   table than a threshold (about a row group or a target file size, configurable), the importer writes
-  them as Parquet itself -- `COPY (SELECT * FROM mssql_backup_table_insertions(…) ORDER BY <date or
-  key>) TO … (FORMAT parquet, PARTITION_BY (…))`, streamed and parallel -- and registers them with
-  `ducklake_add_data_files`, in the version's one transaction with its DDL, `MERGE` and `DELETE`; fewer
-  rows go in as INSERT. The natural path for `accumulate` / `retain` tables (mostly inserts), and for a
+  them as Parquet itself -- `COPY (SELECT * EXCLUDE (change_type) FROM mssql_backup_table_changes(…)
+  WHERE change_type = 'insert' ORDER BY <date or key>) TO … (FORMAT parquet, PARTITION_BY (…))`,
+  streamed and parallel: the true inserts only, never `_insertions`, which holds the updates' new rows
+  too, which go through `MERGE` (review of #575: an update in both would land twice) -- and registers
+  them with `ducklake_add_data_files`, in the version's one transaction with its DDL, `MERGE` and
+  `DELETE`; fewer rows go in as INSERT. The natural path for `accumulate` / `retain` tables (mostly inserts), and for a
   `mirror` table's first import or reload. Files sorted and partitioned this way keep DuckLake's
   min/max narrow and need little merging. Open, for the mssql-ducklake prototype: `add_data_files`
   in one transaction with DELETE / MERGE / ALTER; with a partitioned table (the files' partition values
