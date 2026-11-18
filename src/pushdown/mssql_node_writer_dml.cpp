@@ -84,11 +84,11 @@ bool NodeWriter::TargetColumn(const std::vector<MSSQLColumnInfo> &columns, idx_t
 							  const char *role, std::vector<idx_t> &taken, idx_t &index) {
 	index = DConstants::INVALID_INDEX;
 	for (idx_t c = 0; c < count; c++) {
-		if (!StringUtil::CIEquals(columns[c].name, name)) {
+		if (!StringUtil::CIEquals(columns[c].DuckDBName(), name)) {
 			continue;
 		}
 		if (index != DConstants::INVALID_INDEX) {
-			// A case-sensitive database holding `a` and `A`.
+			// Cannot happen for a table's columns, whose DuckDB names are apart (issue #572).
 			return Veto(std::string(role) + " column " + name + " matches more than one column");
 		}
 		index = c;

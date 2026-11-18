@@ -276,10 +276,14 @@ struct TargetResolver {
 	// @param config COPY configuration options (is_new_table may be modified)
 	// @param source_types DuckDB types from the source query
 	// @param source_names Column names from the source query
+	// @param existing_columns receives the target's columns when it existed and was validated (empty when
+	//        it was created or replaced): the one read the load's COLMETADATA is built from, so the table is
+	//        read once and a column another session adds in between cannot move a name (review of #574)
 	// @throws InvalidInputException for validation failures
 	static void ValidateTarget(ClientContext &context, tds::TdsConnection &conn, BCPCopyTarget &target,
 							   BCPCopyConfig &config, const vector<LogicalType> &source_types,
-							   const vector<string> &source_names);
+							   const vector<string> &source_names,
+							   vector<BCPColumnMetadata> *existing_columns = nullptr);
 
 	//===----------------------------------------------------------------------===//
 	// Table Management
@@ -311,10 +315,12 @@ struct TargetResolver {
 	// @param config receives null_only_columns
 	// @param source_types DuckDB types from the source query
 	// @param source_names Column names from the source query
+	// @return the target's columns as GetExistingTableColumnMetadata reads them (the one read)
 	// @throws InvalidInputException when no source column matches the target
-	static void ValidateExistingTableSchema(tds::TdsConnection &conn, const BCPCopyTarget &target,
-											BCPCopyConfig &config, const vector<LogicalType> &source_types,
-											const vector<string> &source_names);
+	static vector<BCPColumnMetadata> ValidateExistingTableSchema(tds::TdsConnection &conn, const BCPCopyTarget &target,
+																 BCPCopyConfig &config,
+																 const vector<LogicalType> &source_types,
+																 const vector<string> &source_names);
 
 	//! The target's physical shape as the server has it NOW -- heap, clustered
 	//! rowstore, clustered columnstore -- from one sys.indexes lookup on `conn`
