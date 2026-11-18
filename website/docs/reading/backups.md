@@ -278,7 +278,8 @@ SELECT table_name, row_count FROM mssql_backup_tables('/backups/sales_full.bak',
 ATTACH '/backups/sales_full.bak' AS b (TYPE mssql_backup, diff '/backups/sales_diff_1500.bak');
 ```
 
-For a differential taken with no transaction open (a quiescent database) the result is what `RESTORE`
+For a differential taken while the database had no writes at all, from its start to its end, the
+result is what `RESTORE`
 of the full `WITH NORECOVERY`, then of the differential `WITH RECOVERY`, gives: rows changed, added and
 deleted since the full, tables created, dropped and truncated, columns added and dropped. Taken under
 writes, it is the data pages as the differential stored them: `RESTORE … WITH RECOVERY` also replays the
@@ -287,9 +288,11 @@ differ there, as for a full taken under writes (above). A differential is cumula
 full, so a day of hourly differentials needs no chain: the state at 15:00 is the full plus the 15:00
 differential alone. Every function takes `diff :=` but `mssql_backup_info`, which describes one backup.
 
-It must be that full's differential: one based on another backup set (a later full, or a copy-only
-one), of another database, a full or a log given as `diff :=`, and a differential given as the path
-are refused, each naming the files.
+It must be that full's differential: the full named is the one the differential names as its base,
+and a copy-only full never is (with a full F, a copy-only C after it and a differential D, D goes over F:
+`diff :=` beside C is refused, naming F's backup set). A differential over another backup set, of
+another database, a full or a log given as `diff :=`, and a differential given as the path are refused,
+each naming the files.
 
 ## Attaching a backup
 

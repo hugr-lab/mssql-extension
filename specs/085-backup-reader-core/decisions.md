@@ -853,9 +853,12 @@ is older than a year or so, for its own speed, while the lake is to keep years o
   WHERE created_at < …`) is many such deletes in the next file, skipped; a skipped file or the next
   full changes nothing, the change being between two versions.
 - **Schema evolution of an `accumulate` / `retain` table**: the lake holds rows of every past schema,
-  so its schema only grows. A column added: added in the lake, its older rows NULL when it has no
-  default, else the source's default (below: SQL Server reads a metadata-only `ADD … NOT NULL DEFAULT x`
-  as x in every older row, the archived ones of an `accumulate` / `retain` table included). A column dropped at
+  so its schema only grows. A column added: added in the lake, its older rows what the source holds for
+  them -- the default only where SQL Server backfills it, a metadata-only `ADD … NOT NULL DEFAULT x` or an
+  `ADD … DEFAULT x WITH VALUES` (every older row reads x, the archived ones of an `accumulate` / `retain`
+  table included), NULL otherwise: a nullable column added with a default and without `WITH VALUES`
+  leaves the older rows NULL, the default governing later inserts only (review of #575). The default is
+  the lake column's for later inserts either way. A column dropped at
   the source: kept in the lake (older rows have values), NULL in new rows. A column renamed (one
   `column_id`): renamed in the lake. A type widened: widened in the lake (DuckLake's type promotion), no
   rewrite. A type narrowed or changed incompatibly: the column rewritten when every kept value casts
@@ -871,9 +874,9 @@ is older than a year or so, for its own speed, while the lake is to keep years o
   key, inserts as INSERT; all of one backup version in one DuckLake transaction (one snapshot), its DDL
   first, in this order: renames (through a temporary name for a swap or a chain), drops (`mirror`
   only), adds, type changes, then the rows. A rename is DuckLake's `RENAME COLUMN` / `RENAME TO` (DQ-27
-  for tables), no rewrite; an added column is `ADD COLUMN` with the source's default for the rows
-  already there (SQL Server's metadata-only `ADD … NOT NULL DEFAULT x` reads them as x, and so must the
-  lake); a column dropped and added again under its name in an `accumulate` / `retain` table, the old
+  for tables), no rewrite; an added column is `ADD COLUMN`, its rows already there what the source holds
+  (above: the default where SQL Server backfills it, a metadata-only `ADD … NOT NULL DEFAULT x` or
+  `WITH VALUES`, else NULL); a column dropped and added again under its name in an `accumulate` / `retain` table, the old
   one kept, is `<name>__v2`. DuckLake's type promotion is narrow -- integer widening and float32 to
   float64 only, no decimal precision, no string length -- so **a type change is applied by rewriting
   the column** (owner, 2026-11-17), as a large SQL Server table's column is changed: in one snapshot,
@@ -887,9 +890,13 @@ is older than a year or so, for its own speed, while the lake is to keep years o
 - **Large batches of inserts as files** (owner, 2026-11-17): when a version brings more new rows to a
   table than a threshold (about a row group or a target file size, configurable), the importer writes
   them as Parquet itself -- `COPY (SELECT * EXCLUDE (change_type) FROM mssql_backup_table_changes(…)
-  WHERE change_type = 'insert' ORDER BY <date or key>) TO … (FORMAT parquet, PARTITION_BY (…))`,
-  streamed and parallel: the true inserts only, never `_insertions`, which holds the updates' new rows
-  too, which go through `MERGE` (review of #575: an update in both would land twice) -- and registers
+  WHERE change_type = 'insert' AND <key> NOT IN (the keys of the change set's deletes) ORDER BY <date or
+  key>) TO … (FORMAT parquet, PARTITION_BY (…))`, streamed and parallel: the true inserts only -- a key
+  the change set does not also delete --, never `_insertions`, which holds the updates' new rows too.
+  Every replacement goes through `MERGE`, both shapes of one: an `update_preimage` / `update_postimage`
+  pair, and a delete and an insert of one key in one change set (above; a heap row the server moved, a
+  row deleted and inserted again); the importer classifies the change set by key before it splits it
+  (review of #575: a replacement in both would land twice) -- and registers
   them with `ducklake_add_data_files`, in the version's one transaction with its DDL, `MERGE` and
   `DELETE`; fewer rows go in as INSERT. The natural path for `accumulate` / `retain` tables (mostly inserts), and for a
   `mirror` table's first import or reload. Files sorted and partitioned this way keep DuckLake's
