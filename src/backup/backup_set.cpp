@@ -19,6 +19,7 @@ static constexpr size_t SCIN_COMPRESSED_SIZE_AT = 344;
 // An SFIN's fixed part ends at +202 (UniqueId).
 static constexpr size_t SFIN_MIN = 202;
 static constexpr uint32_t SFIN_REMOVED = 0x20;
+static constexpr uint32_t SFIN_PRESENT = 0x4;
 // A compressed container's soft filemark (spec 085 § Rules, MSSQLBAK).
 static constexpr uint64_t CONTAINER_SOFT_FILEMARK = 4096;
 
@@ -67,6 +68,45 @@ std::string MtfDate::ToString() const {
 	char buf[32];
 	snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", year, month, day, hour, minute, second);
 	return buf;
+}
+
+std::vector<const DatabaseFile *> BackupSetHeader::AbsentDataFiles() const {
+	std::vector<const DatabaseFile *> absent;
+	for (const auto &f : files) {
+		if (f.type == 'D' && !f.present && !f.marked_removed) {
+			absent.push_back(&f);
+		}
+	}
+	return absent;
+}
+
+std::string BackupSetHeader::NotWholeDatabase() const {
+	const auto absent = AbsentDataFiles();
+	if (absent.empty() || kind == BackupKind::Log) {
+		return std::string();
+	}
+	std::string carried, left_out;
+	for (const auto &f : files) {
+		if (f.type != 'D' || f.marked_removed) {
+			continue;
+		}
+		std::string &list = f.present ? carried : left_out;
+		list +=
+			(list.empty() ? "" : ", ") + f.logical_name + " (" +
+			(f.filegroup_name.empty() ? std::string("filegroup ") + std::to_string(f.filegroup_id) : f.filegroup_name) +
+			")";
+	}
+	return std::string("a ") + (kind == BackupKind::Differential ? "file differential" : "file") +
+		   " backup: it carries " + (carried.empty() ? std::string("no data file") : carried) +
+		   ", not the database's other data files (" + left_out +
+		   "), so it is no state of the whole database (a file, filegroup or partial backup is not read)";
+}
+
+std::string BackupTypeName(const BackupSetHeader &set) {
+	if (set.kind != BackupKind::Log && !set.AbsentDataFiles().empty()) {
+		return set.kind == BackupKind::Differential ? "file differential" : "file";
+	}
+	return BackupKindName(set.kind);
 }
 
 const char *BackupKindName(BackupKind kind) {
@@ -260,6 +300,7 @@ static void ReadTrailer(const RandomAccess &file, const MtfBlock &block, BackupS
 			// Flags at +8: 0x20 on a file emptied and removed in the files fixture (2022); a hint, not
 			// a fact (DatabaseFile::marked_removed).
 			f.marked_removed = (record.U32(8) & SFIN_REMOVED) != 0;
+			f.present = (record.U32(8) & SFIN_PRESENT) != 0;
 			f.file_id = record.U32(20);
 			const uint32_t type = record.U32(28);
 			if (type != 1 && type != 2) {

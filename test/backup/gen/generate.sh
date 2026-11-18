@@ -269,6 +269,14 @@ for fixture in ${FIXTURES}; do
 		# Does a change to a value stored off row move its data row's page (spec 085 PR 4c-3)? No shrink.
 		sets+=("lob_changes_full|lob_changes_full.bak" "lob_changes_diff|lob_changes_diff.bak")
 		;;
+	diff_layouts)
+		# Differentials over a striped full of a database of three data files: to one file, in two stripes, and
+		# in two stripes compressed, and of one filegroup (DQ-41 revisited: the DCM-computed map). Not run by default.
+		sets+=("dlayout_full|dlayout_full_1.bak,dlayout_full_2.bak" "dlayout_diff|dlayout_diff.bak"
+			"dlayout_diff_striped|dlayout_diff_s1.bak,dlayout_diff_s2.bak"
+			"dlayout_diff_xpress|dlayout_diff_x1.bak,dlayout_diff_x2.bak" "dlayout_fg2_diff|dlayout_fg2_diff.bak"
+			"dlayout_fg2_diff_striped|dlayout_fg2_s1.bak,dlayout_fg2_s2.bak")
+		;;
 	switch_in)
 		# A partition switched in with no shrink after it (spec 085 PR 4c-3): only the catalog tells.
 		sets+=("switch_full|switch_full.bak" "switch_diff|switch_diff.bak")

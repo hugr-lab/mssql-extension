@@ -303,6 +303,12 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 	if (set.kind == BackupKind::Log) {
 		throw FormatError("backup file \"" + first + "\" is a log backup: it holds no data pages to read");
 	}
+	const std::string partial = set.NotWholeDatabase();
+	if (!partial.empty()) {
+		// Its other files' pages are not in it, and the base's are of another time (a read/write
+		// filegroup is consistent with the rest of the database only through the log).
+		throw FormatError("backup file \"" + first + "\" is " + partial);
+	}
 	if (set.kind == BackupKind::Differential && !options.base) {
 		// It lacks every page that did not change since its base, the catalog's among them (089 D5).
 		throw FormatError("backup file \"" + first +

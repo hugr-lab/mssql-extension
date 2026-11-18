@@ -26,7 +26,9 @@ import os
 import subprocess
 import sys
 
-BACKUP_TYPES = {"1": "full", "5": "differential", "2": "log"}
+# 4 / 6: a file or filegroup backup and its differential (one that leaves data files out); a partial
+# backup (7 / 8) is not told apart from them yet.
+BACKUP_TYPES = {"1": "full", "5": "differential", "2": "log", "4": "file", "6": "file differential"}
 # Not located yet (spec 085): must be NULL.
 UNLOCATED = ["page_count", "consistent", "open_transactions", "committed_after_checkpoint"]
 # Returned, and compared with nothing, for the reason given.
@@ -246,6 +248,7 @@ def compare_set(c, name, files, info, file_rows, header, label, filelist):
             c.check(fw, field, of_file(field), row[theirs])
         c.check(fw, "type", of_file("type"), {"D": "data", "L": "log"}.get(row["Type"], row["Type"]))
         c.check(fw, "unique_id", upper(of_file("unique_id")), row["UniqueId"])
+        c.check(fw, "is_present", of_file("is_present"), {"1": "true", "0": "false"}.get(row["IsPresent"], row["IsPresent"]))
         for field in FILE_UNLOCATED:
             c.check(fw, field, of_file(field), None)
 

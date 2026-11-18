@@ -159,6 +159,28 @@ int main() {
 				  h.skipped[0].reason.find("2 files, 1 of them") != std::string::npos,
 			  "a stripe missing a family left out, named");
 	}
+	{
+		// A file differential (one filegroup's): its other data files are not present (SFIN 0x4).
+		auto file = [](uint32_t id, const char *name, const char *filegroup, bool present) {
+			DatabaseFile f;
+			f.file_id = id;
+			f.logical_name = name;
+			f.filegroup_name = filegroup;
+			f.present = present;
+			return f;
+		};
+		auto fg2 = Backup("fg2_diff.bak", BackupKind::Differential, 30, At(40), 7, 10);
+		fg2.set.files = {file(1, "db", "PRIMARY", false), file(3, "db_fg2", "fg2", true)};
+		auto whole = Backup("diff.bak", BackupKind::Differential, 31, At(41), 8, 10);
+		whole.set.files = {file(1, "db", "PRIMARY", true), file(3, "db_fg2", "fg2", true)};
+		auto h = BuildHistory({Backup("full1.bak", BackupKind::Full, 10, At(0), 1), fg2, whole});
+		Check(h.versions.size() == 2 && h.skipped.size() == 1 && h.skipped[0].path == "fg2_diff.bak" &&
+				  h.skipped[0].reason.find("a file differential backup: it carries db_fg2 (fg2), not the "
+										   "database's other data files (db (PRIMARY))") != std::string::npos,
+			  "a file differential left out of the history, its files named");
+		Check(BackupTypeName(fg2.set) == "file differential" && BackupTypeName(whole.set) == "differential",
+			  "a file differential named as HEADERONLY's type 6");
+	}
 	Check(ErrorOf([] {
 			  BuildHistory({Backup("a.bak", BackupKind::Full, 10, At(0), 1),
 							Backup("b.bak", BackupKind::Full, 20, At(1), 2, 0, 1, 8)});

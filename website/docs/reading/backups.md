@@ -68,6 +68,11 @@ Each of these is refused by name, before any value is returned:
   backup): refused naming the container's flag word.
 - **A database file of a type other than data or log** in the file list (FILESTREAM, full-text):
   refused naming the file id.
+- **A file, filegroup or partial backup**, and its differential (`BACKUP DATABASE … FILEGROUP = …`,
+  `READ_WRITE_FILEGROUPS`), for reading: it leaves data files out, and those files' pages in its full
+  are of another time (a read/write filegroup is consistent with the rest of the database only
+  through the log). The error names what it carries and what it does not. `mssql_backup_info` reads
+  it, with `is_present` false on the files it leaves out.
 - **A file that is not a well-formed backup.** The headers the reader uses are checked (their
   checksums, lengths and offsets), and one that does not fit is an error naming the file, not a
   guess.
@@ -79,7 +84,7 @@ Each of these is refused by name, before any value is returned:
 | column | type | meaning |
 |---|---|---|
 | `position` | `INTEGER` | the backup set's position on the media (RESTORE's `FILE = n`) |
-| `backup_type` | `VARCHAR` | `full`, `differential` or `log` |
+| `backup_type` | `VARCHAR` | `full`, `differential` or `log`; `file` / `file differential` for a file, filegroup or partial backup (one that leaves data files out: HEADERONLY's types 4 / 6, and 7 / 8 not told apart from them) |
 | `is_copy_only` | `BOOLEAN` | `BACKUP … WITH COPY_ONLY` |
 | `backup_set_guid` | `UUID` | the backup set's GUID |
 | `first_lsn`, `last_lsn`, `checkpoint_lsn`, `database_backup_lsn` | `DECIMAL(25,0)` | as `RESTORE HEADERONLY` prints them |
@@ -98,7 +103,7 @@ Each of these is refused by name, before any value is returned:
 | `log_tail_bytes` | `BIGINT` | the bytes of log the backup carries |
 | `consistent`, `open_transactions`, `committed_after_checkpoint` | `BOOLEAN`, `INTEGER`, `INTEGER` | NULL for now |
 | `recovery_model` | `VARCHAR` | `FULL`, `BULK_LOGGED` or `SIMPLE` |
-| `files` | `LIST(STRUCT(…))` | the database's files: `logical_name`, `physical_name`, `type` (`data` / `log`), `file_id`, `filegroup_id`, `filegroup_name`, `size_bytes`, `max_size_bytes`, `create_lsn`, `unique_id`, `backup_size_bytes` (NULL for now) |
+| `files` | `LIST(STRUCT(…))` | the database's files: `logical_name`, `physical_name`, `type` (`data` / `log`), `file_id`, `filegroup_id`, `filegroup_name`, `size_bytes`, `max_size_bytes`, `create_lsn`, `unique_id`, `backup_size_bytes` (NULL for now), `is_present` (FILELISTONLY's IsPresent: the file is in this backup) |
 
 ## Tables and views
 
@@ -397,8 +402,10 @@ recovery fork or another family GUID: the database restored or recreated between
 
 The `ATTACH` reads every file's header, one after another, and the default version's pages; nothing
 else until a version is read. Log backups are left out with a WARNING in `duckdb_logs`, as are a
-differential whose full is not among the files, a striped backup missing a file and a copy of a file
-beside it (the same backup, read once). Files of two databases (another name and family GUID), a file that is not a
+differential whose full is not among the files, a striped backup missing a file, a copy of a file
+beside it (the same backup, read once), and a file, filegroup or partial backup (it is no state of the
+whole database; the WARNING names its files). A backup left out because files of it are missing joins
+the history at the refresh that finds them. Files of two databases (another name and family GUID), a file that is not a
 backup, and one the reader refuses (encrypted, appended sets) refuse the whole `ATTACH`; a database
 recreated under its name is one history, with `history_break` where it was. A file that changed since
 the `ATTACH` is refused when its version is read, until a refresh reads it again. New backups are
