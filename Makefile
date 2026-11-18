@@ -659,6 +659,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_catalog_model.cpp \
     test/cpp/backup/test_backup_cd.cpp \
     test/cpp/backup/test_backup_container.cpp \
+    test/cpp/backup/test_backup_hash.cpp \
     test/cpp/backup/test_backup_history.cpp \
     test/cpp/backup/test_backup_iam.cpp \
     test/cpp/backup/test_backup_schema_changes.cpp \

@@ -464,6 +464,48 @@ changes see them. Partitions are matched by their data (rowset), not their numbe
 columns to know whether the lake's table still fits. Not events: a column's collation, identity,
 computed definition or sparseness alone.
 
+### Row changes
+
+`mssql_backup_table_changes` gives a table's rows that changed between the same two states, as
+DuckLake's `table_changes` names them; `mssql_backup_table_insertions` / `_deletions` the rows an
+importer inserts (inserts and the updates' new rows) and deletes (deletes and the updates' old rows):
+
+```sql
+FROM b.table_changes('dbo', 'orders', start_version := 41, end_version := 42);
+FROM mssql_backup_table_deletions('b', 'dbo', 'orders', start_version := TIMESTAMP '2026-11-17 14:00');
+```
+
+Each row is `change_type` (`insert`, `delete`, `update_preimage`, `update_postimage`), then the
+table's columns in the newer state's schema (a column the older state did not have is NULL in its rows,
+one it dropped is gone), then `_mssql_rid`: the row's key, a clustered table's key or a heap row's place.
+A heap row forwarded to another page keeps its `_mssql_rid` (its place before it moved); a heap row a
+shrink or a rebuild moved has a new place, so it reads as a delete and an insert, as does a row deleted
+and inserted again. A clustered table's rows keep theirs wherever they move.
+
+Only what may have changed is read: the newer state's pages written since the older state's checkpoint
+-- a differential's own pages, when it lies over the older state's full; every page's header otherwise
+(two fulls, or a full after a differential) -- each with its older version; and the older state's pages
+the table no longer has. On a page the two versions share, a record whose bytes lie unchanged at the
+same place is the same row, unchanged, and is passed over; the others are paired by `_mssql_rid` and
+compared as stored. A value stored off row changed in place rewrites only its LOB pages, not its row's
+page (measured on SQL Server 2022): when a table's LOB pages changed, its rows' value trees are walked
+(their leaves not read) and a row whose tree touches a changed page has its two versions' values
+compared by their digests. A created table, or one to reload (see `schema_changes`), gives all its rows as
+inserts. A column whose type changed takes the older rows' values through DuckDB's cast, not the
+server's conversion; a value the cast refuses is NULL, with a `WARNING` in `duckdb_logs`.
+
+The pages are read on DuckDB's threads, a unit of 64 at a time per task, as a scan reads them, and
+each unit's changes are returned as it is done. A row that moved to another page (a page split, a
+shrink, an index rebuild moves every row) cannot be paired on its page: it is kept by its place and
+digests -- about a hundred bytes and its key, not the row -- in partitions by `_mssql_rid` that DuckDB
+writes to its `temp_directory` past `memory_limit`, as its own hash join does, and paired one partition
+at a time when every unit is done. A chunk's decoding is reserved against half of `memory_limit`, as
+the scan's is.
+
+The digests are XXH64 with the length by default: an accidental collision is out of reach, but bytes chosen to collide (by someone who writes to the source database and wants a change to
+go unseen) are not. `SET mssql_backup_change_hash = 'sha256'` makes them SHA-256, a few per cent slower
+on DuckDB's threads (about 15 % on one).
+
 ## Opening a backup once
 
 A backup is opened once per DuckDB instance: what a call read to open it -- the headers, where

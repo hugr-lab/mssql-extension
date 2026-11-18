@@ -37,6 +37,14 @@ static void ValidateDatetime2As(ClientContext &context, SetScope scope, Value &p
 	}
 }
 
+static void ValidateBackupChangeHash(ClientContext &context, SetScope scope, Value &parameter) {
+	if (!parameter.IsNull() && !StringUtil::CIEquals(parameter.ToString(), "fast") &&
+		!StringUtil::CIEquals(parameter.ToString(), "sha256")) {
+		throw InvalidInputException("mssql_backup_change_hash: '%s' is neither 'fast' nor 'sha256'",
+									parameter.ToString());
+	}
+}
+
 static void ValidateDmlPlatform(ClientContext &context, SetScope scope, Value &parameter) {
 	const auto v = StringUtil::Lower(parameter.ToString());
 	if (!v.empty() && v != "sqlserver" && v != "fabric" && v != "synapse") {
@@ -603,6 +611,15 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "next call on the same unchanged files, in the DuckDB instance's object cache "
 							  "(default: true)",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
+	// mssql_backup_change_hash - Spec 085 PR 4c-3: how mssql_backup_table_changes tells two versions of
+	// a row apart where it keeps their digests, not their bytes (a row moved between pages, a value
+	// stored off row): 'fast', XXH64 with the length (owner, 2026-11-18: the source's writers are
+	// trusted), or 'sha256', which bytes chosen to collide cannot fool (backup_hash.hpp).
+	config.AddExtensionOption("mssql_backup_change_hash",
+							  "How mssql_backup_table_changes compares rows it keeps by digest: 'fast' (XXH64, "
+							  "default) or 'sha256' (collision resistant)",
+							  LogicalType::VARCHAR, Value("fast"), ValidateBackupChangeHash);
 
 	// mssql_client_transcode - Spec 092 D4: read code-page text as bytes and
 	// transcode it on the client, with the tables spec 091 generated from the server.

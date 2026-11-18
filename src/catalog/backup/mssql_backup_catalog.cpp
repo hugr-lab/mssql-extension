@@ -65,7 +65,8 @@ MSSQLBackupCatalog::MSSQLBackupCatalog(AttachedDatabase &db, std::string name,
 	struct Macro {
 		const char *name;
 		const char *function;
-		std::vector<const char *> parameters;
+		std::vector<const char *> parameters;  // keyword, NULL by default
+		std::vector<const char *> positional;  // before them, required
 	};
 	const std::vector<const char *> versioned{"version", "as_of"};
 	const std::vector<Macro> MACROS = {
@@ -76,14 +77,32 @@ MSSQLBackupCatalog::MSSQLBackupCatalog(AttachedDatabase &db, std::string name,
 		{"tables", "mssql_backup_tables", versioned},
 		{"views", "mssql_backup_views", versioned},
 		{"columns", "mssql_backup_columns", versioned},
-		{"schema_changes", "mssql_backup_schema_changes", {"start_version", "end_version"}}};
+		{"schema_changes", "mssql_backup_schema_changes", {"start_version", "end_version"}},
+		{"table_changes",
+		 "mssql_backup_table_changes",
+		 {"start_version", "end_version"},
+		 {"schema_name", "table_name"}},
+		{"table_insertions",
+		 "mssql_backup_table_insertions",
+		 {"start_version", "end_version"},
+		 {"schema_name", "table_name"}},
+		{"table_deletions",
+		 "mssql_backup_table_deletions",
+		 {"start_version", "end_version"},
+		 {"schema_name", "table_name"}}};
 	for (const auto &m : MACROS) {
 		std::string sql = std::string("FROM ") + m.function + "(" + literal;
+		for (const char *parameter : m.positional) {
+			sql += std::string(", ") + parameter;
+		}
 		for (const char *parameter : m.parameters) {
 			sql += std::string(", ") + parameter + " := " + parameter;
 		}
 		sql += ")";
 		auto function = make_uniq<TableMacroFunction>(Parser::GetBuiltinParser().ParseSelectNode(sql));
+		for (const char *parameter : m.positional) {
+			function->parameters.push_back(make_uniq<ColumnRefExpression>(parameter));
+		}
 		for (const char *parameter : m.parameters) {
 			function->parameters.push_back(make_uniq<ColumnRefExpression>(parameter));
 			function->default_parameters.insert(Identifier(parameter), ConstantExpression::Null());

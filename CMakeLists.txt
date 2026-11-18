@@ -184,6 +184,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_info_function.cpp
     src/backup/backup_mtf.cpp
     src/backup/backup_files.cpp
+    src/backup/backup_hash.cpp
     src/backup/backup_open_pass.cpp
     src/backup/backup_opened.cpp
     src/backup/backup_page.cpp

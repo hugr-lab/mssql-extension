@@ -788,7 +788,16 @@ what an earlier differential already brought.
   importer rebuilds it. As built (PR 4c-3a, measured on the oracle fixture): a type change that rewrites the rows
   and an index rebuild write every page anew, so the row changes see them and neither is a reload; a
   partition switched *in* is (its pages keep their LSNs), a switch *out* and a TRUNCATE are DQ-49's
-  events. The importer applies the DDL before the rows.
+  events.
+- **Measured for the row changes (lob_changes.sql, 2022):** a change to a value stored off row -- the
+  whole varchar(max) replaced, `.WRITE` appending or overwriting in place, `UPDATETEXT` on a text, a
+  varbinary(max) replaced at its length -- rewrites LOB pages only: the data row's page and its LSN
+  stay as they were, and for all but the appending `.WRITE` so do the tree's node pages (the leaves
+  change). Only a value that grows from in row to off row rewrites the data page. So the changed data
+  pages alone miss them, silently: for a table whose LOB / row-overflow pages changed, a row is also a
+  candidate when its value tree touches a changed LOB page (a map-only pass over the newer state's data
+  pages and tree nodes, the leaves not read), and its two versions are compared by their assembled
+  values, not by the tree. The importer applies the DDL before the rows.
 - **Row changes, in the new schema**, as DuckLake names them: `mssql_backup_table_changes(catalog,
   schema, table [, start, end])` (versions or timestamps, as `ducklake_table_changes`) with `change_type` `'insert'`, `'delete'`, `'update_preimage'`,
   `'update_postimage'`; `mssql_backup_table_insertions` / `_deletions` the rows an importer inserts /

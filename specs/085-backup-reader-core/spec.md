@@ -1617,6 +1617,42 @@ before the next opens.
     shape and refusals (`mssql_backup_schema_changes.test`; the committed samples share one schema), and
     by hand on the 2022 `diffs` fixture (dropped, truncated, a column dropped and one added, created; the
     rebuilt table no event). The row changes are 24d.
+24d. Row changes between two states (DQ-47) -- 3 d. As built (PR 4c-3b): `mssql_backup_table_changes` /
+    `_insertions` / `_deletions(name | path, schema, table, start_version :=, end_version :=, diff :=)`
+    and the catalog's macros. The newer table's IAM-listed pages, then the older table's pages it no
+    longer lists, cut into units of 64 claimed by DuckDB's tasks as the scan's are (`ChangeCollector`,
+    the unit's index its batch index): a page that may have changed -- one the differential holds when
+    it lies over the older state's full (`PageIndex::LocateOwn`, no bitmap needed: the index answers
+    it), any otherwise -- and was written since the older state's checkpoint is read with its older
+    version (the older table's page of that id); a record whose bytes lie unchanged at the same offset in
+    both is the same row, unchanged, and passed over (`SameRecords`); the others are paired by
+    `_mssql_rid` and compared as stored; each unit's changes are staged and returned by its task. A row
+    left unpaired on its page (a split, a shrink, an index rebuild moves every row) is kept by its place
+    and digests (`LoneRow`, about a hundred bytes and its key; `mssql_backup_change_hash`: XXH64 by default, `backup_hash`, SHA-256 on request) in DuckDB's radix-partitioned
+    collections (`RadixPartitionedColumnData`, its hash join's: spilled to `temp_directory` past
+    `memory_limit`), a task's own over its units, put together when it finds none left; the last task to
+    leave pairs them a partition at a time (the map of one reserved, `CollectMemory`). For a table with
+    values stored off row the records compare with their off-row pointers masked (a compressed record's
+    found in its long data) and, where only those differ (a shrink moved the LOB pages), by their
+    values' digests; and since a change to a value stored off row rewrites LOB pages only (measured on
+    `lob_changes.sql`, 2022: the data page and LSN unchanged for a replaced varchar(max), `.WRITE`,
+    `UPDATETEXT`, a replaced varbinary(max)), a table whose LOB pages changed walks its unwritten pages'
+    rows' trees map-only and compares the values of a row whose tree touches a changed page. A chunk's
+    staging is reserved as the scan's (D17). A partition switched in is a reload, seen against the two
+    whole models. A retyped column's older values go through DuckDB's TryCast (NULL and a WARNING where
+    it refuses). Tests: `mssql_backup_table_changes.test` (the samples, checked against a whole
+    comparison with EXCEPT ALL both ways; through another full; one state), and by hand on 2022 the
+    same way on `diffs` (every table: splits, forwarded rows, values off row rewritten, a truncate then
+    inserts, added / dropped columns compared by name, a rebuild, a shrink, a table created),
+    `schema_changes` (truncates, a delete of every row, a shrink, a sliding window), `lob_changes`,
+    `switch_in` (a partition switched in with no shrink) and `bench_changes` (10 million rows; measured
+    on 16 threads: 0.09-0.2 s for 10 thousand to 1.1 million scattered changes against a 0.08 s scan of
+    the full; 4.1 s for an index rebuild, every row paired across the table, 4.9 s under a 1 GB
+    `memory_limit` with 1 GB spilled (16 partitions; 32 took 6.5 s, 64 9.7 s); values off row, 0.13 s for 1 thousand changed, 1.6 s for 111
+    thousand). Not done: the changed LOB pages are listed on one thread at init, and a row touching one
+    has its values assembled for their digests (a value's id in its pointer and its LOB record would
+    tell without reading the tree); a full after a differential reads every page's header (the full's
+    DCM pages would name the extents to read).
 25. `s3://` (MinIO) and `https://` tests in the lane; measure the open pass and decide filter pushdown
     with late materialisation (a follow-up spec if it is worth it) — 2 d. Owner, 2026-11-11: the
     scan is to make filtering cheap enough for an importer that exports a table with a filter over

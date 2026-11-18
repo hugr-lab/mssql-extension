@@ -138,66 +138,16 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 	auto state = make_uniq<ChangesState>();
 	const std::vector<std::string> paths(data.paths.begin(), data.paths.end());
 	try {
-		std::unique_ptr<OpenedCatalog> old_catalog, new_catalog;
-		Value start_number(LogicalType::BIGINT), end_number(LogicalType::BIGINT);
-		bool history_break = false;
-		if (!data.diff.empty()) {
-			// The full, and the full with the differential.
-			old_catalog = OpenBackupCatalog(context, paths);
-			new_catalog = OpenBackupCatalog(context, paths, true, CatalogScope(),
-											std::vector<std::string>(data.diff.begin(), data.diff.end()));
-		} else {
-			// The history read once: its versions are opened by their files, checked against this read
-			// (review: three reads of every header, which could disagree).
-			uint64_t default_version = 0;
-			bool attached = false;
-			const auto history = HistoryOf(context, paths, default_version, &attached);
-			const std::string what = std::string(FUNCTION) + ": " + paths.front();
-			const BackupAt end_at = BoundOf(data.end);
-			const uint64_t end =
-				end_at.IsSet() ? ResolveVersion(*history, &context, end_at, what + ", end_version") : default_version;
-			uint64_t start = 0;
-			const BackupAt start_at = BoundOf(data.start);
-			if (start_at.IsSet()) {
-				start = ResolveVersion(*history, &context, start_at, what + ", start_version");
-			} else {
-				// No start: the end state's full alone (DQ-47), version `end` itself when it is a full.
-				const auto &e = history->versions[end - 1];
-				for (const auto &v : history->versions) {
-					if (v.full == e.full && !v.IsDifferential()) {
-						start = v.number;
-					}
-				}
-			}
-			if (start > end) {
-				throw InvalidInputException("%s: start_version %llu is after end_version %llu", FUNCTION,
-											(unsigned long long)start, (unsigned long long)end);
-			}
-			start_number = Value::BIGINT(static_cast<int64_t>(start));
-			end_number = Value::BIGINT(static_cast<int64_t>(end));
-			if (start == end) {
-				return std::move(state);  // one state: no change (DQ-47: an empty set, not an error)
-			}
-			for (uint64_t v = start + 1; v <= end; v++) {
-				history_break = history_break || history->versions[v - 1].history_break;
-			}
-			auto open = [&](uint64_t number) {
-				if (attached) {
-					return OpenBackupCatalog(context, paths, true, CatalogScope(), {}, Version(number));
-				}
-				const auto &v = history->versions[number - 1];
-				const auto &full = history->backups[v.full].paths;
-				std::vector<std::string> diff;
-				if (v.IsDifferential()) {
-					diff = history->backups[v.diff].paths;
-				}
-				auto catalog = OpenBackupCatalog(context, full, true, CatalogScope(), diff);
-				CheckVersionFiles(*catalog->opened.backup, *history, v, "the backups \"" + paths.front() + "\"", false);
-				return catalog;
-			};
-			old_catalog = open(start);
-			new_catalog = open(end);
+		auto states = OpenTwoStates(context, paths, std::vector<std::string>(data.diff.begin(), data.diff.end()),
+									data.start, data.end, FUNCTION);
+		if (states.same) {
+			return std::move(state);  // one state: no change (DQ-47: an empty set, not an error)
 		}
+		const auto &old_catalog = states.old_catalog;
+		const auto &new_catalog = states.new_catalog;
+		const Value &start_number = states.start;
+		const Value &end_number = states.end;
+		const bool history_break = states.history_break;
 		// Off-row definitions within MAX_CALL_OFF_ROW_BYTES a call, as mssql_backup_views reads them (review of
 		// #549): past it a definition is NULL with the reason.
 		uint64_t off_row_bytes = 0;
@@ -269,6 +219,80 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 }
 
 }  // namespace
+
+TwoStates OpenTwoStates(ClientContext &context, const std::vector<std::string> &paths,
+						const std::vector<std::string> &diff_paths, const Value &start_value, const Value &end_value,
+						const char *function) {
+	TwoStates states;
+	if (!diff_paths.empty()) {
+		// The full, and the full with the differential.
+		states.old_catalog = OpenBackupCatalog(context, paths);
+		states.new_catalog = OpenBackupCatalog(context, paths, true, CatalogScope(), diff_paths);
+	} else {
+		// The history read once: its versions are opened by their files, checked against this read
+		// (review: three reads of every header, which could disagree).
+		uint64_t default_version = 0;
+		bool attached = false;
+		const auto history = HistoryOf(context, paths, default_version, &attached);
+		const std::string what = std::string(function) + ": " + paths.front();
+		const BackupAt end_at = BoundOf(end_value);
+		const uint64_t end =
+			end_at.IsSet() ? ResolveVersion(*history, &context, end_at, what + ", end_version") : default_version;
+		uint64_t start = 0;
+		const BackupAt start_at = BoundOf(start_value);
+		if (start_at.IsSet()) {
+			start = ResolveVersion(*history, &context, start_at, what + ", start_version");
+		} else {
+			// No start: the end state's full alone (DQ-47), version `end` itself when it is a full.
+			const auto &e = history->versions[end - 1];
+			for (const auto &v : history->versions) {
+				if (v.full == e.full && !v.IsDifferential()) {
+					start = v.number;
+				}
+			}
+		}
+		if (start > end) {
+			throw InvalidInputException("%s: start_version %llu is after end_version %llu", function,
+										(unsigned long long)start, (unsigned long long)end);
+		}
+		states.start = Value::BIGINT(static_cast<int64_t>(start));
+		states.end = Value::BIGINT(static_cast<int64_t>(end));
+		if (start == end) {
+			states.same = true;
+			return states;
+		}
+		for (uint64_t v = start + 1; v <= end; v++) {
+			states.history_break = states.history_break || history->versions[v - 1].history_break;
+		}
+		auto open = [&](uint64_t number) {
+			if (attached) {
+				return std::shared_ptr<OpenedCatalog>(
+					OpenBackupCatalog(context, paths, true, CatalogScope(), {}, Version(number)).release());
+			}
+			const auto &v = history->versions[number - 1];
+			const auto &full = history->backups[v.full].paths;
+			std::vector<std::string> diff;
+			if (v.IsDifferential()) {
+				diff = history->backups[v.diff].paths;
+			}
+			std::shared_ptr<OpenedCatalog> catalog(
+				OpenBackupCatalog(context, full, true, CatalogScope(), diff).release());
+			CheckVersionFiles(*catalog->opened.backup, *history, v, "the backups \"" + paths.front() + "\"", false);
+			return catalog;
+		};
+		states.old_catalog = open(start);
+		states.new_catalog = open(end);
+	}
+	// What the older state holds as of: its last backup's checkpoint (a page written since is past it);
+	// and whether the newer state is a differential over the older state's own full.
+	const auto &old_backup = *states.old_catalog->opened.backup;
+	const auto &new_backup = *states.new_catalog->opened.backup;
+	states.old_checkpoint = old_backup.Headers().Set().checkpoint_lsn;
+	const auto &old_full = old_backup.Base() ? *old_backup.Base() : old_backup;
+	states.same_full = new_backup.Base() && new_backup.Base()->Headers().Set().backup_set_guid.bytes ==
+												old_full.Headers().Set().backup_set_guid.bytes;
+	return states;
+}
 
 void RegisterBackupChangesFunctions(ExtensionLoader &loader) {
 	TableFunctionSet set(FUNCTION);

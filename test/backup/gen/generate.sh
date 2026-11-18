@@ -20,7 +20,11 @@
 # case-sensitive database whose tables differ only in case, and names with spaces, quotes, ] and dots (spec 085 PR 4b);
 # diffs.sql, a full and a differential over it after E2's changes (spec 085 PR 4c: diffs_full, diffs_diff and
 # diffs_diff_xpress, paired in overlays.txt); schema_changes.sql, truncates, a shrink and a sliding window between a
-# full and its differential (PR 4c-3: schema_full, schema_diff; not run by default). A fixture's backups come with the server's own catalog of them where it holds
+# full and its differential (PR 4c-3: schema_full, schema_diff; not run by default); lob_changes.sql, values stored
+# off row changed in each form (PR 4c-3: lob_changes_full, lob_changes_diff; not run by default); switch_in.sql, a
+# partition switched in with no shrink (PR 4c-3: switch_full, switch_diff; not run by default);
+# bench_changes.sql, a benchmark of 10 million rows and differentials of 10k / 110k / 1.1M changes and an index rebuild
+# (PR 4c-3: bench_full, bench_diff_*; not run by default). A fixture's backups come with the server's own catalog of them where it holds
 # still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).
 #
 # Writes into OUT: the backups, <set>.headeronly.txt / .labelonly.txt / .filelistonly.txt, sets.txt
@@ -260,6 +264,20 @@ for fixture in ${FIXTURES}; do
 		# What the catalog alone shows between a full and its differential (spec 085 PR 4c-3): truncates, a
 		# delete of every row, pages moved by a shrink, a sliding window. Not an overlay compare_rows takes.
 		sets+=("schema_full|schema_full.bak" "schema_diff|schema_diff.bak")
+		;;
+	lob_changes)
+		# Does a change to a value stored off row move its data row's page (spec 085 PR 4c-3)? No shrink.
+		sets+=("lob_changes_full|lob_changes_full.bak" "lob_changes_diff|lob_changes_diff.bak")
+		;;
+	switch_in)
+		# A partition switched in with no shrink after it (spec 085 PR 4c-3): only the catalog tells.
+		sets+=("switch_full|switch_full.bak" "switch_diff|switch_diff.bak")
+		;;
+	bench_changes)
+		# A benchmark (spec 085 PR 4c-3): 10 million rows, then differentials of 10k / 110k / 1.1M changes, and
+		# one after an index rebuild.
+		sets+=("bench_full|bench_full.bak" "bench_diff_10k|bench_diff_10k.bak" "bench_diff_110k|bench_diff_110k.bak"
+			"bench_diff_1m|bench_diff_1m.bak" "bench_diff_rebuild|bench_diff_rebuild.bak")
 		;;
 	*)
 		echo "ERROR: unknown fixture ${fixture}" >&2
