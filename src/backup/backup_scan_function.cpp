@@ -151,8 +151,9 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 		if (attached && data.paths.size() == 1) {
 			throw InvalidInputException(
 				"%s: the backup attached as %s has no table or indexed view %s.%s that its filters keep "
-				"(schema_filter / table_filter, schema_exclude / table_exclude; mssql_backup_tables('%s') lists them)",
-				FUNCTION, attached->name, data.schema, data.table, attached->name);
+				"(schema_filter / table_filter, schema_exclude / table_exclude; mssql_backup_tables('%s') and "
+				"mssql_backup_views('%s') list them)",
+				FUNCTION, attached->name, data.schema, data.table, attached->name, attached->name);
 		}
 		throw InvalidInputException(
 			"%s: the backup has no table or indexed view %s.%s (mssql_backup_tables and "

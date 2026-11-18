@@ -303,7 +303,7 @@ SELECT list(schema_name ORDER BY schema_name) FROM mssql_backup_schemas('bx5');
 statement error
 ATTACH 'test/data/backup/full.bak' AS bx4 (TYPE mssql_backup, table_exclude '(');
 ----
-table_exclude
+<REGEX>:.*table_exclude: Invalid regex pattern '\('.*
 
 # Refused by name: a bad regex, an option it does not take, a backup with no pages to read.
 statement error

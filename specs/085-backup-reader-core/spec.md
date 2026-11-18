@@ -1504,9 +1504,10 @@ before the next opens.
     names an attached backup (`FindAttachedBackup`) to it: the statement's files opened again and each
     checked against the ATTACH's size and version tag (changed: refused by name). The attach sets the
     database read-only (`SetReadOnlyDatabase`); a write DuckDB plans before its own read-only check
-    (INSERT, UPDATE, DELETE, MERGE, TRUNCATE) is refused by `MSSQLBackupCatalog::RefuseWrite`. An option
-    other than the filters is refused by name (`schema_exclude` / `table_exclude` too: an object kept when
-    it matches the filter and not the exclusion; TYPE mssql keeps its filters alone); `ATTACH OR REPLACE` attaches anew
+    (INSERT, UPDATE, DELETE, MERGE, TRUNCATE) is refused by `MSSQLBackupCatalog::RefuseWrite`. The options
+    are `schema_filter`, `table_filter`, `schema_exclude` and `table_exclude` (an object is kept when it
+    passes the include filter -- matches it, or none is given -- and does not match the exclusion; TYPE
+    mssql keeps its filters alone); any other option is refused by name; `ATTACH OR REPLACE` attaches anew
     (`HasConflictingAttachOptions`). Names are the backup's; columns that differ only in case (a case-sensitive database), which a
     DuckDB table cannot hold even quoted, get a `CatalogColumn::duckdb_name` in the model
     (`AssignDuckDBNames`: `Id`, `ID_1`, `id_2`, the first suffix no column of the table is named, every

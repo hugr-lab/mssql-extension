@@ -291,17 +291,18 @@ It is always read-only, whatever the options say: `CREATE`, `INSERT`, `UPDATE`, 
 | `schema_exclude` | A regex: the schemas it matches are left out |
 | `table_exclude` | A regex: the tables and views it matches are left out |
 
-The filters work as `TYPE mssql`'s, and an object is kept when it matches the filter (or none is
-given) and not the exclusion. So a filter and the same pattern as an exclusion split one backup in two
-attachments -- say, the tables a lake accumulates and the ones it mirrors:
+The filters work as `TYPE mssql`'s. An object is kept when it passes the filter -- it matches it, or
+no filter is given -- and does not match the exclusion, so an exclusion alone keeps everything else:
 
 ```sql
-ATTACH '/backups/sales_full.bak' AS acc (TYPE mssql_backup, table_filter  '^(events|order_items)$');
-ATTACH '/backups/sales_full.bak' AS mir (TYPE mssql_backup, table_exclude '^(events|order_items)$');
+ATTACH '/backups/sales_full.bak' AS bk (TYPE mssql_backup, schema_filter '^sales$',
+                                        table_exclude '^(audit_log|staging_.*)$');
 ```
 
-The catalog is built for what they keep only, which on a large database keeps the `ATTACH` and its
-memory small. Any other option is refused by name.
+The `ATTACH` still reads the backup's headers, page index and system tables whole; what the filters
+keep small is the catalog built from them -- the tables' and views' descriptions and the entries --,
+which on a database of many objects is most of the `ATTACH`'s time and memory. Any other option is
+refused by name.
 
 The `ATTACH` opens the backup and builds its catalog once (`ATTACH OR REPLACE` does it again); a
 table's pages are listed at its first scan and kept for the next.
