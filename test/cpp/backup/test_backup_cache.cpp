@@ -306,7 +306,13 @@ int main() {
 		std::filesystem::create_directories(dir);
 		std::filesystem::copy_file(DIR + "full.bak", dir / "a_full.bak");
 		std::filesystem::copy_file(DIR + "diff.bak", dir / "b_diff.bak");
-		const std::string glob = (dir / "*.bak").string();
+		std::string glob;
+		for (const char ch : (dir / "*.bak").string()) {
+			glob += ch;
+			if (ch == '\'') {
+				glob += ch;	 // inside a SQL literal
+			}
+		}
 		auto attach = con.Query("ATTACH '" + glob + "' AS hr (TYPE mssql_backup, history true)");
 		Check(!attach->HasError(),
 			  "a history of a full and its differential attached " + (attach->HasError() ? attach->GetError() : ""));
@@ -359,12 +365,52 @@ int main() {
 			Check(ScalarInt(con, "SELECT count(*) FROM hr.snapshots()") == 3 &&
 					  ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 3)") == 2500,
 				  "the open transaction still reads its 3 (version 3 the differential)");
+			// The file functions on the name too, which do no catalog lookup (review of #579).
+			Check(ScalarInt(con, "SELECT count(*) FROM mssql_backup_snapshots('hr')") == 3 &&
+					  ScalarInt(con, "SELECT count(*) FROM mssql_backup_scan('hr', 'dbo', 'items', version := 3)") ==
+						  2500,
+				  "and so do mssql_backup_snapshots / mssql_backup_scan on its name");
+			Check(
+				ScalarInt(other, "SELECT count(*) FROM mssql_backup_scan('hr', 'dbo', 'items', version := 3)") == 2000,
+				"while the other connection's version 3 is the new copy-only full");
 			con.Query("COMMIT");
 			Check(ScalarInt(con, "SELECT count(*) FROM hr.snapshots()") == 4, "its next transaction reads 4");
+			// A transaction whose first read is a file function on the name (no catalog lookup starts it):
+			// pinned all the same (review of #579).
+			con.Query("BEGIN");
+			Check(ScalarInt(con, "SELECT count(*) FROM mssql_backup_snapshots('hr')") == 4,
+				  "a transaction opened by mssql_backup_snapshots reads 4");
+			std::filesystem::copy_file(DIR + "stripe_1.bak", dir / "a_stripe_1.bak");
+			std::filesystem::copy_file(DIR + "stripe_2.bak", dir / "a_stripe_2.bak");
+			Check(ScalarInt(other, "SELECT versions FROM mssql_backup_refresh('hr')") == 5,
+				  "another connection refreshes: 5 versions (a striped full)");
+			Check(ScalarInt(con, "SELECT count(*) FROM mssql_backup_snapshots('hr')") == 4,
+				  "the transaction still reads its 4");
+			con.Query("COMMIT");
 		}
 		auto refused = con.Query("SELECT * FROM mssql_backup_refresh('nope')");
 		Check(refused->HasError() && refused->GetError().find("is not a backup attached") != std::string::npos,
 			  "a refresh of no attached backup refused");
+		// A file whose name has glob characters, found by a glob, is opened again as itself (review of #579:
+		// `s[1].bak` was taken for a glob that matches `s1.bak`).
+		{
+			const auto odd = std::filesystem::temp_directory_path() /
+							 ("mssql_backup_glob_" + std::to_string(reinterpret_cast<uintptr_t>(&db)));
+			std::filesystem::remove_all(odd);
+			std::filesystem::create_directories(odd);
+			std::filesystem::copy_file(DIR + "full.bak", odd / "s[1].bak");
+			std::string pattern;
+			for (const char ch : (odd / "*.bak").string()) {
+				pattern += ch;
+				if (ch == '\'') {
+					pattern += ch;
+				}
+			}
+			Check(ScalarInt(con, "SELECT count(*) FROM mssql_backup_scan('" + pattern +
+									 "', 'dbo', 'items', version := 1)") == 2000,
+				  "a history's file named s[1].bak read as itself");
+			std::filesystem::remove_all(odd);
+		}
 		con.Query("DETACH hp");
 		con.Query("DETACH hr");
 		std::filesystem::remove_all(dir);

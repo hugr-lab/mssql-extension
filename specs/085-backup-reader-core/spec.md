@@ -1549,7 +1549,8 @@ before the next opens.
     reads each file's header (`OpenFamily`, nothing past it) and `BuildHistory` (`backup_history`,
     DuckDB-free) groups the families by backup set GUID, leaves out (named, a WARNING at ATTACH) a log
     backup, a differential whose full is not among the files and a stripe missing a family, refuses
-    files of two databases (family GUID) and no full, and orders the states -- each full (copy-only
+    files of two databases (another name and family GUID; one name with another family GUID is the database
+    recreated, a `history_break`) and no full, and orders the states -- each full (copy-only
     included), each differential over its full -- by finish then checkpoint LSN, numbered 1..N;
     `history_break` where the recovery fork changes. `ATTACH … (history true)` makes the catalog's
     versions those; without it the backup attached is its own history (a full: 1; a full and its `diff`:
@@ -1574,7 +1575,8 @@ before the next opens.
     whole number only; a version the catalog lacks is an error under the search path too, as DuckLake's
     (DuckDB does not tell a catalog named explicitly from one of the search path). Also not done: the
     file functions' `version :=` over files reads every header on every call, and a version's state is
-    held until DETACH, outside the cache's eviction. `mssql_backup_refresh(name)`
+    held while the history has it (review of #579: a refresh drops the states of versions it no longer
+    finds, a transaction keeping what it read). `mssql_backup_refresh(name)`
     (owner, 2026-11-17): the catalog keeps a `Reader` (the ATTACH's paths) and swaps its `Versions`
     (history and default) whole; states are kept by `StateKey` (the backup set GUIDs of a version's full
     and differential), so a renumbered version keeps its entries; a file read before at the same path,

@@ -216,41 +216,48 @@ BackupHistory ReadBackupHistory(ClientContext &context, const std::vector<std::s
 			known[f.path] = &f;
 		}
 	}
-	OpenedHeaders opened;
-	opened.own_files.reset(
-		new StatementFiles(context, ByteSource::Open(context, vector<std::string>(paths.begin(), paths.end()))));
-	opened.own_binding.reset(new FileBinding());
-	const auto &source = opened.own_files->Source();
-	opened.id = NextBackupId();
-	for (size_t i = 0; i < source.FileCount(); i++) {
-		BackupFileKey key;
-		key.path = source.Path(i);
-		key.size = source.FileSize(i);
-		key.version = source.VersionTag(i);
-		opened.files.push_back(std::move(key));
-	}
-	*opened.own_binding = IdentityBinding(opened, *opened.own_files);
+	// The files a batch at a time (review of #579): a history of thousands of files must not hold a
+	// descriptor for each at once.
+	constexpr size_t BATCH = 64;
+	const auto expanded = ByteSource::Expand(context, vector<std::string>(paths.begin(), paths.end()));
 	std::vector<HistoryFamily> families;
-	for (size_t i = 0; i < opened.files.size(); i++) {
-		auto was = known.find(opened.Path(i));
-		if (was != known.end() && was->second->size == opened.files[i].size &&
-			was->second->version_tag == opened.files[i].version && !opened.files[i].version.empty()) {
-			families.push_back(*was->second);
-			continue;
+	for (size_t from = 0; from < expanded.size(); from += BATCH) {
+		const vector<std::string> batch(expanded.begin() + from,
+										expanded.begin() + std::min(expanded.size(), from + BATCH));
+		OpenedHeaders opened;
+		opened.own_files.reset(new StatementFiles(context, ByteSource::Open(context, batch)));
+		opened.own_binding.reset(new FileBinding());
+		const auto &source = opened.own_files->Source();
+		opened.id = NextBackupId();
+		for (size_t i = 0; i < source.FileCount(); i++) {
+			BackupFileKey key;
+			key.path = source.Path(i);
+			key.size = source.FileSize(i);
+			key.version = source.VersionTag(i);
+			opened.files.push_back(std::move(key));
 		}
-		try {
-			HistoryFamily family;
-			family.path = opened.Path(i);
-			family.size = opened.files[i].size;
-			family.version_tag = opened.files[i].version;
-			family.set = OpenFamily(opened, i)->set;
-			families.push_back(std::move(family));
-		} catch (FormatError &e) {
-			const std::string &path = opened.Path(i);
-			if (std::string(e.what()).find(path) != std::string::npos) {
-				throw;
+		*opened.own_binding = IdentityBinding(opened, *opened.own_files);
+		for (size_t i = 0; i < opened.files.size(); i++) {
+			auto was = known.find(opened.Path(i));
+			if (was != known.end() && was->second->size == opened.files[i].size &&
+				was->second->version_tag == opened.files[i].version && !opened.files[i].version.empty()) {
+				families.push_back(*was->second);
+				continue;
 			}
-			throw FormatError("backup file \"" + path + "\": " + e.what());
+			try {
+				HistoryFamily family;
+				family.path = opened.Path(i);
+				family.size = opened.files[i].size;
+				family.version_tag = opened.files[i].version;
+				family.set = OpenFamily(opened, i)->set;
+				families.push_back(std::move(family));
+			} catch (FormatError &e) {
+				const std::string &path = opened.Path(i);
+				if (std::string(e.what()).find(path) != std::string::npos) {
+					throw;
+				}
+				throw FormatError("backup file \"" + path + "\": " + e.what());
+			}
 		}
 	}
 	return BuildHistory(std::move(families));
@@ -593,7 +600,7 @@ static OpenedForStatement OpenBackupFiles(ClientContext &context, const std::vec
 										  const std::vector<std::string> &diff);
 
 void CheckVersionFiles(const OpenedBackup &opened, const BackupHistory &history, const HistoryVersion &version,
-					   const std::string &name) {
+					   const std::string &name, bool attached) {
 	const OpenedBackup *full = opened.Base() ? opened.Base().get() : &opened;
 	auto check = [&](const OpenedBackup &backup, const HistoryBackup &expected) {
 		const auto &headers = backup.Headers();
@@ -607,10 +614,17 @@ void CheckVersionFiles(const OpenedBackup &opened, const BackupHistory &history,
 				}
 			}
 			if (!found || !same) {
+				if (attached) {
+					throw InvalidInputException(
+						"mssql backup: the file \"%s\" of %s changed since it was attached (its size, modification "
+						"time or backup set): refresh a history (mssql_backup_refresh), or DETACH %s and ATTACH it "
+						"again",
+						expected.paths[i], name, name);
+				}
 				throw InvalidInputException(
-					"mssql backup: the file \"%s\" of %s changed since it was attached (its "
-					"size, modification time or backup set): DETACH %s and ATTACH it again",
-					expected.paths[i], name, name);
+					"mssql backup: the file \"%s\" of %s changed while it was read (its size, "
+					"modification time or backup set): run the statement again",
+					expected.paths[i], name);
 			}
 		}
 	};
@@ -637,17 +651,19 @@ uint64_t ResolveVersion(const BackupHistory &history, optional_ptr<ClientContext
 	if (unit == "version") {
 		// A whole number: 1.6 or '2.5' names no version (a string, as DuckLake's METADATA_PARAMETERS sends
 		// one, when it reads as one).
+		// Exactly a whole number (review of #579: 1.6 is no version, nor is an exact DECIMAL a hair past
+		// 1): the number cast back to the value's own type must be the value.
 		int64_t number = 0;
 		if (at.value.type().IsIntegral()) {
 			number = at.value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
 		} else {
-			const auto as_double = at.value.DefaultTryCastAs(LogicalType::DOUBLE);
-			const double d = as_double ? as_double->GetValue<double>() : 0.5;
-			if (d != std::floor(d) || d < -9e18 || d > 9e18) {
+			const auto as_number = at.value.DefaultTryCastAs(LogicalType::BIGINT, nullptr, true);
+			const auto back = as_number ? as_number->DefaultTryCastAs(at.value.type()) : optional<Value>();
+			if (!as_number || !back || *back != at.value) {
 				throw BinderException("%s: VERSION %s is not a version number (a whole number, 1 the first)", what,
 									  at.value.ToString());
 			}
-			number = static_cast<int64_t>(d);
+			number = as_number->GetValue<int64_t>();
 		}
 		if (number < 1 || static_cast<uint64_t>(number) > latest) {
 			throw BinderException("%s has versions 1 to %llu, not %lld (mssql_backup_snapshots lists them)", what,
@@ -705,25 +721,36 @@ BackupAt BackupAtOf(const named_argument_map_t &named, const char *function) {
 }
 
 void AddVersionParameters(TableFunction &function) {
-	function.GetSignature().AddKeywordOnly("version", LogicalType::BIGINT, Value(LogicalType::BIGINT));
+	// ANY, so the value reaches ResolveVersion as given (a BIGINT parameter would round 1.6 to 2 first).
+	function.GetSignature().AddKeywordOnly("version", LogicalType::ANY, Value());
 	function.GetSignature().AddKeywordOnly("as_of", LogicalType::TIMESTAMP, Value(LogicalType::TIMESTAMP));
 }
 
-//! The full and differential paths of the version `at` names in the history of the files on `paths`.
-static void PathsOfVersion(ClientContext &context, std::vector<std::string> &paths, std::vector<std::string> &diff,
-						   const BackupAt &at) {
+//! The version `at` names in the history of the files on `paths`: its full and differential paths into
+//! `paths` / `diff`, the history and the version kept to check the files opened next against them.
+struct ChosenVersion {
+	BackupHistory history;
+	HistoryVersion version;
+	std::string name;
+};
+
+static ChosenVersion PathsOfVersion(ClientContext &context, std::vector<std::string> &paths,
+									std::vector<std::string> &diff, const BackupAt &at) {
 	if (!diff.empty()) {
 		throw BinderException(
 			"mssql backup: version := / as_of := pick a version of the files' history: diff := "
 			"does not go beside them");
 	}
-	const auto history = ReadBackupHistory(context, paths);
-	const auto number = ResolveVersion(history, context, at, "the backups \"" + paths.front() + "\"");
-	const auto &version = history.versions[number - 1];
-	paths = history.backups[version.full].paths;
-	if (version.IsDifferential()) {
-		diff = history.backups[version.diff].paths;
+	ChosenVersion chosen;
+	chosen.name = "the backups \"" + paths.front() + "\"";
+	chosen.history = ReadBackupHistory(context, paths);
+	const auto number = ResolveVersion(chosen.history, context, at, chosen.name);
+	chosen.version = chosen.history.versions[number - 1];
+	paths = chosen.history.backups[chosen.version.full].paths;
+	if (chosen.version.IsDifferential()) {
+		diff = chosen.history.backups[chosen.version.diff].paths;
 	}
+	return chosen;
 }
 
 OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::string> &paths_p,
@@ -741,7 +768,11 @@ OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::str
 		}
 	}
 	if (at.IsSet()) {
-		PathsOfVersion(context, paths, diff, at);
+		// The files opened must be the ones the history chose (review of #579: one replaced meanwhile).
+		const auto chosen = PathsOfVersion(context, paths, diff, at);
+		auto opened = OpenBackupFiles(context, paths, diff);
+		CheckVersionFiles(*opened.backup, chosen.history, chosen.version, chosen.name, false);
+		return opened;
 	}
 	return OpenBackupFiles(context, paths, diff);
 }
@@ -857,11 +888,14 @@ std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const s
 			return OpenAttachedCatalog(context, *attached);
 		}
 	}
-	if (at.IsSet()) {
-		PathsOfVersion(context, paths, diff, at);
-	}
 	std::unique_ptr<OpenedCatalog> catalog(new OpenedCatalog());
-	catalog->opened = OpenBackupFiles(context, paths, diff);
+	if (at.IsSet()) {
+		const auto chosen = PathsOfVersion(context, paths, diff, at);
+		catalog->opened = OpenBackupFiles(context, paths, diff);
+		CheckVersionFiles(*catalog->opened.backup, chosen.history, chosen.version, chosen.name, false);
+	} else {
+		catalog->opened = OpenBackupFiles(context, paths, diff);
+	}
 	TakeStages(context, *catalog);
 	auto model = std::make_shared<CatalogModel>();
 	catalog->model = model;

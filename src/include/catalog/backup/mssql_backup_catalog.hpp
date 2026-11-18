@@ -123,16 +123,6 @@ public:
 	//! without `history`.
 	std::pair<uint64_t, uint64_t> Refresh(ClientContext &context);
 
-	//! A refusal of anything but a read, naming the catalog (DuckDB's read-only check comes first; this is
-	//! what is left for the paths it does not cover: INSERT, UPDATE, DELETE, MERGE, TRUNCATE are planned
-	//! before it).
-	[[noreturn]] void RefuseWrite() const;
-
-private:
-	struct State {
-		std::shared_ptr<const mssql::backup::AttachedBackup> backup;
-		std::map<std::string, unique_ptr<MSSQLBackupSchemaEntry>> schemas;
-	};
 	//! A version's backups and their files (the backup set GUIDs of its full and differential, each
 	//! file's path, size and version tag): what a state is kept by, so a file changed or moved since is a
 	//! new state, opened and checked anew.
@@ -143,6 +133,17 @@ private:
 	//! A version's backups alone (their backup set GUIDs): what snapshot_version / snapshot_time pin.
 	static std::string Identity(const mssql::backup::BackupHistory &history,
 								const mssql::backup::HistoryVersion &version);
+
+	//! A refusal of anything but a read, naming the catalog (DuckDB's read-only check comes first; this is
+	//! what is left for the paths it does not cover: INSERT, UPDATE, DELETE, MERGE, TRUNCATE are planned
+	//! before it).
+	[[noreturn]] void RefuseWrite() const;
+
+private:
+	struct State {
+		std::shared_ptr<const mssql::backup::AttachedBackup> backup;
+		std::map<std::string, unique_ptr<MSSQLBackupSchemaEntry>> schemas;
+	};
 	std::shared_ptr<const Versions> CurrentVersions() const;
 	//! The version `at` names in `versions` (its default when none).
 	uint64_t Resolve(const Versions &versions, optional_ptr<ClientContext> context,
@@ -163,7 +164,9 @@ private:
 	std::mutex refresh_lock_;
 	mutable std::mutex lock_;
 	std::shared_ptr<const Versions> versions_;
-	std::map<std::string, unique_ptr<State>> states_;  // by StateKey
+	//! By StateKey. A refresh drops the states of versions the history no longer has; a transaction that
+	//! read one keeps it (MSSQLBackupTransaction::states) until it ends (review of #579).
+	std::map<std::string, std::shared_ptr<State>> states_;
 };
 
 //! A schema of one version of the backup: its user tables the ATTACH's filters keep, and the file
@@ -246,6 +249,8 @@ public:
 
 	std::mutex lock;
 	std::shared_ptr<const MSSQLBackupCatalog::Versions> versions;
+	//! The version states it read: alive while it runs, though a refresh drops them from the catalog.
+	std::vector<std::shared_ptr<const void>> states;
 };
 
 class MSSQLBackupTransactionManager : public TransactionManager {

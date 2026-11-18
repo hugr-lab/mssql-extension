@@ -88,6 +88,10 @@ int main() {
 			Backup("orphan.bak", BackupKind::Differential, 30, At(50), 10, 99),
 		});
 		Check(h.versions.size() == 5, "five versions: two fulls, three differentials over them");
+		if (h.versions.size() != 5) {
+			std::cout << failures << " FAILED (the rest of this case indexes five versions)" << std::endl;
+			return 1;
+		}
 		std::vector<std::string> last;
 		for (const auto &v : h.versions) {
 			last.push_back(h.Last(v).paths.front());

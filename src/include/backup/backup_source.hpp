@@ -113,6 +113,8 @@ public:
 	//! nothing is an error naming it), opened read-only. Duplicates are refused. The order is the
 	//! caller's; which file is which family is the MTF header's to say.
 	static unique_ptr<ByteSource> Open(ClientContext &context, const vector<std::string> &paths);
+	//! `paths` expanded as Open expands them, opening nothing.
+	static vector<std::string> Expand(ClientContext &context, const vector<std::string> &paths);
 
 	size_t FileCount() const {
 		return files_.size();

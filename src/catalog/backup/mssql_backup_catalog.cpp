@@ -34,6 +34,8 @@
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 
+#include <set>
+
 namespace duckdb {
 
 using mssql::backup::AttachedBackup;
@@ -90,7 +92,7 @@ MSSQLBackupCatalog::MSSQLBackupCatalog(AttachedDatabase &db, std::string name,
 	if (default_at.IsSet()) {
 		pinned_ = Identity(*versions->history, chosen);
 	}
-	states_[StateKey(*versions->history, chosen)] = MakeState(std::move(default_backup));
+	states_[StateKey(*versions->history, chosen)] = std::shared_ptr<State>(MakeState(std::move(default_backup)));
 	versions_ = std::move(versions);
 }
 
@@ -146,20 +148,26 @@ std::shared_ptr<const MSSQLBackupCatalog::Versions> MSSQLBackupCatalog::CurrentV
 	return versions_;
 }
 
+//! The catalog's transaction in `context`'s, started when it is not (review of #579: a file function on the
+//! name does no catalog lookup, which is what starts it otherwise); none outside a transaction.
+static optional_ptr<MSSQLBackupTransaction> OwnTransaction(optional_ptr<ClientContext> context, Catalog &catalog) {
+	if (!context || !context->transaction.HasActiveTransaction()) {
+		return nullptr;
+	}
+	return &Transaction::Get(*context, catalog.GetAttached()).Cast<MSSQLBackupTransaction>();
+}
+
 std::shared_ptr<const MSSQLBackupCatalog::Versions> MSSQLBackupCatalog::VersionsFor(
 	optional_ptr<ClientContext> context) {
-	if (context && context->transaction.HasActiveTransaction()) {
-		auto transaction = Transaction::TryGet(*context, GetAttached());
-		if (transaction) {
-			auto &own = transaction->Cast<MSSQLBackupTransaction>();
-			std::lock_guard<std::mutex> guard(own.lock);
-			if (!own.versions) {
-				own.versions = CurrentVersions();
-			}
-			return own.versions;
-		}
+	auto own = OwnTransaction(context, *this);
+	if (!own) {
+		return CurrentVersions();
 	}
-	return CurrentVersions();
+	std::lock_guard<std::mutex> guard(own->lock);
+	if (!own->versions) {
+		own->versions = CurrentVersions();
+	}
+	return own->versions;
 }
 
 uint64_t MSSQLBackupCatalog::NumberOf(optional_ptr<ClientContext> context, const AttachedBackup &backup) {
@@ -214,24 +222,34 @@ MSSQLBackupCatalog::State &MSSQLBackupCatalog::StateOf(optional_ptr<ClientContex
 	const auto &history = *versions.history;
 	const auto &entry = history.versions[version - 1];
 	const std::string key = StateKey(history, entry);
+	std::shared_ptr<State> found;
 	{
 		std::lock_guard<std::mutex> guard(lock_);
-		auto found = states_.find(key);
-		if (found != states_.end()) {
-			return *found->second;
+		auto it = states_.find(key);
+		if (it != states_.end()) {
+			found = it->second;
 		}
 	}
-	if (!context) {
-		throw InternalException("%s: version %llu of the backup is first read without a client context", name_,
-								(unsigned long long)version);
+	if (!found) {
+		if (!context) {
+			throw InternalException("%s: version %llu of the backup is first read without a client context", name_,
+									(unsigned long long)version);
+		}
+		std::shared_ptr<State> state(MakeState(opener_(*context, history, entry)));
+		std::lock_guard<std::mutex> guard(lock_);
+		auto &slot = states_[key];
+		if (!slot) {
+			slot = std::move(state);
+		}
+		found = slot;
 	}
-	auto state = MakeState(opener_(*context, history, entry));
-	std::lock_guard<std::mutex> guard(lock_);
-	auto &slot = states_[key];
-	if (!slot) {
-		slot = std::move(state);
+	// The transaction keeps what it read: a refresh meanwhile drops the state from the catalog only.
+	auto own = OwnTransaction(context, *this);
+	if (own) {
+		std::lock_guard<std::mutex> guard(own->lock);
+		own->states.push_back(found);
 	}
-	return *slot;
+	return *found;
 }
 
 uint64_t MSSQLBackupCatalog::Resolve(const Versions &versions, optional_ptr<ClientContext> context,
@@ -280,8 +298,17 @@ std::pair<uint64_t, uint64_t> MSSQLBackupCatalog::Refresh(ClientContext &context
 	// The default version's entries now, so a lookup without AT never opens a backup under the swap.
 	StateOf(&context, *refreshed, refreshed->default_version);
 	{
+		// The states of versions the history no longer has go (a rolling archive's oldest files gone); a
+		// transaction that read one keeps it until it ends.
+		std::set<std::string> kept;
+		for (const auto &v : versions) {
+			kept.insert(StateKey(*refreshed->history, v));
+		}
 		std::lock_guard<std::mutex> guard(lock_);
 		versions_ = refreshed;
+		for (auto it = states_.begin(); it != states_.end();) {
+			it = kept.count(it->first) ? std::next(it) : states_.erase(it);
+		}
 	}
 	// The refreshing transaction reads the new versions from here on; any other, from its next one.
 	auto transaction = context.transaction.HasActiveTransaction() ? Transaction::TryGet(context, GetAttached())
@@ -687,7 +714,12 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 				const auto &headers = backup->Headers();
 				for (const auto &family : headers.families) {
 					const auto &key = headers.files[family->file];
-					families.push_back({key.path, key.size, key.version, family->set});
+					mssql::backup::HistoryFamily f;
+					f.path = key.path;
+					f.size = key.size;
+					f.version_tag = key.version;
+					f.set = family->set;
+					families.push_back(std::move(f));
 				}
 			}
 			history = std::make_shared<BackupHistory>(mssql::backup::BuildHistory(std::move(families)));
@@ -703,7 +735,7 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 					mssql::backup::OpenAttachedBackup(c, catalog_name, full, wants_schema, wants_object, over);
 				// The files as the history read them (PR 4b's promise, from the ATTACH or the refresh, not
 				// from the version's open).
-				mssql::backup::CheckVersionFiles(*opened->backup, versions, version, catalog_name);
+				mssql::backup::CheckVersionFiles(*opened->backup, versions, version, catalog_name, true);
 				return std::shared_ptr<const AttachedBackup>(std::move(opened));
 			} catch (mssql::backup::FormatError &e) {
 				throw InvalidInputException("%s (TYPE mssql_backup), version %llu: %s", catalog_name,
@@ -712,7 +744,10 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 		};
 		const uint64_t default_version =
 			mssql::backup::ResolveVersion(*history, context, default_at, "ATTACH " + name + " (TYPE mssql_backup)");
-		if (!attached || default_version != history->versions.back().number) {
+		// The backup opened is the default version's only when their files say so (review of #579: under a
+		// clock set back, the latest by finish need not be the backup attached).
+		if (!attached || MSSQLBackupCatalog::StateKey(*attached) !=
+							 MSSQLBackupCatalog::StateKey(*history, history->versions[default_version - 1])) {
 			attached = opener(context, *history, history->versions[default_version - 1]);
 		}
 		MSSQLBackupCatalog::Reader reader;

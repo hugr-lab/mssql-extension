@@ -193,6 +193,17 @@ SELECT backup_type FROM mssql_backup_info('h', version := 2);
 ----
 full
 
+# version := takes a whole number only, as AT does (review of #579: it was cast to BIGINT, 1.6 read 2).
+statement error
+SELECT count(*) FROM mssql_backup_tables('h', version := 1.6);
+----
+is not a version number
+
+query I
+SELECT row_count FROM mssql_backup_tables('h', version := '1') WHERE table_name = 'items';
+----
+2000
+
 statement error
 SELECT count(*) FROM mssql_backup_scan('h', 'dbo', 'items', version := 1, as_of := TIMESTAMP '2026-11-09 22:35:29');
 ----

@@ -69,14 +69,16 @@ size_t FetchBatch::RequestOf(size_t member) const {
 	return request_of_[member];
 }
 
-unique_ptr<ByteSource> ByteSource::Open(ClientContext &context, const vector<std::string> &paths) {
+vector<std::string> ByteSource::Expand(ClientContext &context, const vector<std::string> &paths) {
 	if (paths.empty()) {
 		throw InvalidInputException("mssql backup: no file given");
 	}
 	auto &fs = FileSystem::GetFileSystem(context);
 	vector<std::string> expanded;
 	for (const auto &path : paths) {
-		if (FileSystem::HasGlob(path)) {
+		// A path with glob characters that names a file is that file (a name the history found, such as
+		// `sales[1].bak`, opened again), else a glob.
+		if (FileSystem::HasGlob(path) && !fs.FileExists(path)) {
 			auto matches = fs.GlobFiles(path, FileGlobOptions::ALLOW_EMPTY);
 			if (matches.empty()) {
 				throw IOException("mssql backup: no file matches \"%s\"", path);
@@ -97,6 +99,11 @@ unique_ptr<ByteSource> ByteSource::Open(ClientContext &context, const vector<std
 			throw InvalidInputException("mssql backup: \"%s\" is given twice", path);
 		}
 	}
+	return expanded;
+}
+
+unique_ptr<ByteSource> ByteSource::Open(ClientContext &context, const vector<std::string> &paths) {
+	const auto expanded = Expand(context, paths);
 	auto source = make_uniq<ByteSource>();
 	auto caching = CachingFileSystem::Get(context);
 	for (const auto &path : expanded) {

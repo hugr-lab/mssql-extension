@@ -40,7 +40,9 @@ const HistoryVersion *BackupHistory::Version(uint64_t number) const {
 const HistoryVersion *BackupHistory::FinishedBy(const MtfDate &when) const {
 	const HistoryVersion *found = nullptr;
 	for (const auto &v : versions) {
-		if (CompareDates(Last(v).set.backup_finish_date, when) <= 0) {
+		// A backup whose finish is not recorded is finished by no time (review of #579).
+		const auto &finish = Last(v).set.backup_finish_date;
+		if (!finish.IsZero() && CompareDates(finish, when) <= 0) {
 			found = &v;
 		}
 	}
@@ -80,7 +82,8 @@ BackupHistory BuildHistory(std::vector<HistoryFamily> families) {
 		const auto &first = group.front();
 		bool whole = first.set.family_count == group.size();
 		for (size_t i = 0; whole && i < group.size(); i++) {
-			whole = group[i].set.family_sequence_number == i + 1;
+			whole = group[i].set.family_sequence_number == i + 1 &&
+					group[i].set.media_set_guid.bytes == first.set.media_set_guid.bytes;
 		}
 		if (!whole) {
 			history.skipped.push_back({first.path, "a backup striped over " + std::to_string(first.set.family_count) +

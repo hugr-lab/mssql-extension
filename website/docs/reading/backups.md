@@ -377,10 +377,11 @@ the n-th; `AT (TIMESTAMP => t)` the last one finished at or before `t`, in whole
 the backups' times as `RESTORE HEADERONLY` gives them: the server's local time, so a `TIMESTAMPTZ` is
 taken in the session's time zone, and the hour a clock is set back in is ambiguous. Two versions can be
 read in one query. A version this catalog does not have is an error, also when the catalog is only on
-the `search_path`. A version's catalog is built at its first read and kept until `DETACH` (an importer
-going through hundreds of versions holds each one's index: attach again, or read through the file
-functions, to let them go); while the opened-file cache keeps it, the full a day's differentials lie
-over is indexed once for all of them.
+the `search_path`. A version's catalog is built at its first read and kept while the history has the
+version (a refresh that no longer finds its files lets it go, once no transaction reading it is open);
+while the opened-file cache keeps it, the full a day's differentials lie over is indexed once for all of
+them. A name with no schema (`b.orders`) is looked up in the default version's default schema, `dbo`
+unless the filters hid it, whatever `AT` names.
 
 The file functions are the catalog's own too, as a DuckLake's: `b.snapshots()`, `b.refresh()`, and
 `b.info()`, `b.schemas()`, `b.tables()`, `b.views()` (the views' T-SQL definitions) and `b.columns()`,
@@ -390,26 +391,28 @@ with no rows.
 
 `mssql_backup_snapshots('b')` -- or `b.snapshots()` -- lists the versions: `snapshot_id`,
 `snapshot_time` (the finish), `backup_type`, `is_copy_only`, `backup_start_date`, `checkpoint_lsn`, the
-backup set GUIDs, `recovery_fork_id`, `history_break` (another recovery fork than the version before:
-the database was restored between them), `is_default`, `database_name` and the files (`full_files`,
+backup set GUIDs, `recovery_fork_id`, `history_break` (another lineage than the version before -- another
+recovery fork or another family GUID: the database restored or recreated between them), `is_default`, `database_name` and the files (`full_files`,
 `diff_files`). It takes files too, with no `ATTACH`, reading each one's header only.
 
 The `ATTACH` reads every file's header, one after another, and the default version's pages; nothing
 else until a version is read. Log backups are left out with a WARNING in `duckdb_logs`, as are a
 differential whose full is not among the files, a striped backup missing a file and a copy of a file
-beside it (the same backup, read once). Files of two databases (another name), a file that is not a
+beside it (the same backup, read once). Files of two databases (another name and family GUID), a file that is not a
 backup, and one the reader refuses (encrypted, appended sets) refuse the whole `ATTACH`; a database
 recreated under its name is one history, with `history_break` where it was. A file that changed since
 the `ATTACH` is refused when its version is read, until a refresh reads it again. New backups are
 taken in by `CALL b.refresh()` (`mssql_backup_refresh('b')`): the glob is expanded again and the headers
 of the new or changed files read (a file whose server gives no ETag or modification time is read every
 time), and the default version opened; a version already read keeps its catalog, a file moved or
-rewritten makes its version a new one. A transaction keeps the versions of its first read: a refresh
-reaches the next transaction, but the refreshing one's own. `snapshot_version` / `snapshot_time` choose
+rewritten makes its version a new one. A transaction keeps the versions of its first read -- through the
+catalog or through a file function on its name alike: a refresh on another connection reaches its next
+transaction, and the transaction that refreshes reads the new versions from the refresh on. `snapshot_version` / `snapshot_time` choose
 a version by its backups, which it stays across a refresh (if its files are gone, the latest is read,
 with a WARNING). A version's number is its place among the files, so a backup added that
-finished earlier than others (a full found for a differential left out, say) moves the later ones;
-a time does not move, so an importer is better served by the time or by the files.
+finished earlier than others (a full found for a differential left out, say) moves the later ones, and
+an importer resuming by number would skip it; one resuming by the files it applied, or by time with a
+look for versions that arrived late, does not. The headers are read 64 files at a time.
 
 | ATTACH option | Description |
 |---|---|

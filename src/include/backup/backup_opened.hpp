@@ -250,10 +250,12 @@ uint64_t ResolveVersion(const BackupHistory &history, optional_ptr<ClientContext
 //! `opened`, the backup of `version` opened after the history was read, is the history's: the same
 //! files (path, size, version tag) and backup sets. An InvalidInputException naming the file and the
 //! catalog `name` otherwise.
+//! `attached`: `name` is an attached catalog (refresh or ATTACH again), else a set of files read now.
 void CheckVersionFiles(const OpenedBackup &opened, const BackupHistory &history, const HistoryVersion &version,
-					   const std::string &name);
+					   const std::string &name, bool attached);
 
-//! The file functions' `version :=` / `as_of :=` (an attached backup's or a set of files' version).
+//! The file functions' `version :=` (ANY: a whole number, checked by ResolveVersion) / `as_of :=` (an attached backup's
+//! or a set of files' version).
 BackupAt BackupAtOf(const named_argument_map_t &named, const char *function);
 //! Those keyword parameters, on a function's signature.
 void AddVersionParameters(TableFunction &function);
