@@ -405,8 +405,11 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		}
 
 		// Validate target and optionally create table
+		// The target's columns when it existed: read once, there, and the COLMETADATA built from that read
+		// (review of #574: a second read could see a column another session added, and move a name).
+		vector<BCPColumnMetadata> existing_columns;
 		TargetResolver::ValidateTarget(context, *gstate->connection, bdata.target, bdata.config, bdata.source_types,
-									   bdata.source_names);
+									   bdata.source_names, &existing_columns);
 
 		// Point invalidation: invalidate schema's table list if table was created/dropped
 		// This ensures the new table schema is visible for subsequent queries
@@ -435,7 +438,9 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		if (need_target_metadata) {
 			// Try to get target column metadata - this will work for existing tables
 			try {
-				gstate->columns = TargetResolver::GetExistingTableColumnMetadata(*gstate->connection, bdata.target);
+				gstate->columns = !existing_columns.empty() ? std::move(existing_columns)
+															: TargetResolver::GetExistingTableColumnMetadata(
+																  *gstate->connection, bdata.target);
 				CopyDebugLog(1, "BCPCopyInitGlobal: using target table column metadata (%llu columns)",
 							 (unsigned long long)gstate->columns.size());
 

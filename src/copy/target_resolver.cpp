@@ -500,7 +500,7 @@ TableLoadShape TargetResolver::QueryTableShape(tds::TdsConnection &conn, const B
 
 void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &conn, BCPCopyTarget &target,
 									BCPCopyConfig &config, const vector<LogicalType> &source_types,
-									const vector<string> &source_names) {
+									const vector<string> &source_names, vector<BCPColumnMetadata> *existing_columns) {
 	DebugLog(2, "ValidateTarget: checking %s", target.GetFullyQualifiedName().c_str());
 
 	// Build object check SQL.
@@ -589,7 +589,10 @@ void TargetResolver::ValidateTarget(ClientContext &context, tds::TdsConnection &
 		} else {
 			// Table exists and we'll append - validate schema compatibility
 			DebugLog(1, "ValidateTarget: table exists and OVERWRITE=false, validating schema compatibility");
-			ValidateExistingTableSchema(conn, target, config, source_types, source_names);
+			auto columns = ValidateExistingTableSchema(conn, target, config, source_types, source_names);
+			if (existing_columns) {
+				*existing_columns = std::move(columns);
+			}
 
 			// Spec 060 D7: empty it first if asked, keeping its definition. On THIS
 			// connection, which is the one the load runs on: routing it elsewhere
@@ -822,40 +825,25 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 // TargetResolver::ValidateExistingTableSchema
 //===----------------------------------------------------------------------===//
 
-void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const BCPCopyTarget &target,
-												 BCPCopyConfig &config, const vector<LogicalType> &source_types,
-												 const vector<string> &source_names) {
-	// Query the target table's column information
-	const tds::Request column_sql = ObjectProbe(
-		"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
-		"type_name, c.max_length, c.precision, c.scale "
-		"FROM " +
-			string(target.IsTempTable() ? "tempdb.sys" : "sys") +
-			".columns c "
-			"WHERE c.object_id = OBJECT_ID(@o) "
-			"ORDER BY c.column_id",
-		target);
-
-	DebugLog(3, "ValidateExistingTableSchema SQL: %s", column_sql.sql.c_str());
-
-	auto result = MSSQLSimpleQuery::Execute(conn, column_sql);
-	if (!result.success) {
-		throw InvalidInputException("MSSQL COPY: Failed to query table schema: %s", result.error_message);
-	}
+vector<BCPColumnMetadata> TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn,
+																	  const BCPCopyTarget &target,
+																	  BCPCopyConfig &config,
+																	  const vector<LogicalType> &source_types,
+																	  const vector<string> &source_names) {
+	// The target's columns, read once: the load's COLMETADATA is built from this same read.
+	auto columns = GetExistingTableColumnMetadata(conn, target);
 
 	// Build a map of target column names to their type information (case-insensitive), by the names
 	// DuckDB reads them under (issue #572: a case-sensitive table's `ID` beside `Id` is ID_1, which a
 	// source column of that name loads).
 	std::vector<std::string> server_names;
-	for (idx_t i = 0; i < result.rows.size(); i++) {
-		server_names.push_back(result.rows[i].empty() ? string() : result.rows[i][0]);
+	for (const auto &column : columns) {
+		server_names.push_back(column.name);
 	}
 	const auto duckdb_names = mssql::DuckDBColumnNames(server_names);
 	std::unordered_map<string, std::pair<string, idx_t>> target_columns;  // name -> (type, index)
-	for (idx_t i = 0; i < result.rows.size(); i++) {
-		if (result.rows[i].size() >= 2) {
-			target_columns[StringUtil::Lower(duckdb_names[i])] = {result.rows[i][1], i};
-		}
+	for (idx_t i = 0; i < columns.size(); i++) {
+		target_columns[StringUtil::Lower(duckdb_names[i])] = {columns[i].server_type_name, i};
 	}
 
 	// Validate each source column exists in target and has compatible type
@@ -903,14 +891,14 @@ void TargetResolver::ValidateExistingTableSchema(tds::TdsConnection &conn, const
 			"MSSQL COPY: No matching columns between source and target table '%s'. "
 			"Source columns: %s. Target table has %llu columns. "
 			"Column matching is case-insensitive by name.",
-			target.GetFullyQualifiedName(), StringUtil::Join(source_names, ", "),
-			(unsigned long long)result.rows.size());
+			target.GetFullyQualifiedName(), StringUtil::Join(source_names, ", "), (unsigned long long)columns.size());
 	}
 
 	DebugLog(2,
 			 "ValidateExistingTableSchema: validated %llu/%llu source columns match target (target has %llu columns)",
 			 (unsigned long long)matched_columns, (unsigned long long)source_names.size(),
-			 (unsigned long long)result.rows.size());
+			 (unsigned long long)columns.size());
+	return columns;
 }
 
 //===----------------------------------------------------------------------===//
