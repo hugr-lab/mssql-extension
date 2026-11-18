@@ -306,7 +306,10 @@ std::shared_ptr<const AttachedBackup> mssql::backup::FindAttachedBackup(ClientCo
 static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
 											 AttachedDatabase &db, const string &name, AttachInfo &info,
 											 AttachOptions &options) {
+	// schema_filter / table_filter keep what they match; schema_exclude / table_exclude drop what they
+	// match. All regexes as TYPE mssql's: case-insensitive, a partial match.
 	auto filter = std::make_shared<MSSQLCatalogFilter>();
+	auto exclude = std::make_shared<MSSQLCatalogFilter>();
 	std::vector<std::string> diff;
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		const std::string key = StringUtil::Lower(it->first);
@@ -320,7 +323,7 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 			it = options.options.erase(it);
 			continue;
 		}
-		if (key != "schema_filter" && key != "table_filter") {
+		if (key != "schema_filter" && key != "table_filter" && key != "schema_exclude" && key != "table_exclude") {
 			++it;
 			continue;
 		}
@@ -331,8 +334,12 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 		}
 		if (key == "schema_filter") {
 			filter->SetSchemaFilter(pattern);
-		} else {
+		} else if (key == "table_filter") {
 			filter->SetTableFilter(pattern);
+		} else if (key == "schema_exclude") {
+			exclude->SetSchemaFilter(pattern);
+		} else {
+			exclude->SetTableFilter(pattern);
 		}
 		it = options.options.erase(it);
 	}
@@ -341,7 +348,7 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 	for (const auto &option : options.options) {
 		throw InvalidInputException(
 			"ATTACH %s (TYPE mssql_backup): '%s' is not an option of an attached backup "
-			"(schema_filter, table_filter, diff)",
+			"(schema_filter, table_filter, schema_exclude, table_exclude, diff)",
 			name, option.first);
 	}
 	// Always read-only (D1): DuckDB's own check refuses every write before the catalog sees it.
@@ -349,12 +356,16 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 
 	std::function<bool(const std::string &)> wants_schema;
 	std::function<bool(const std::string &, const std::string &)> wants_object;
-	if (filter->HasFilters()) {
-		// The same regexes as TYPE mssql's (case-insensitive, a partial match); the table filter judges
-		// views too.
-		wants_schema = [filter](const std::string &schema) { return filter->MatchesSchema(schema); };
-		wants_object = [filter](const std::string &schema, const std::string &object) {
-			return filter->MatchesSchema(schema) && filter->MatchesTable(object);
+	if (filter->HasFilters() || exclude->HasFilters()) {
+		// A name is kept when it matches the filter (or there is none) and not the exclusion; the table
+		// filter and exclusion judge views too.
+		auto keeps_schema = [filter, exclude](const std::string &schema) {
+			return filter->MatchesSchema(schema) && !(exclude->HasSchemaFilter() && exclude->MatchesSchema(schema));
+		};
+		wants_schema = keeps_schema;
+		wants_object = [filter, exclude, keeps_schema](const std::string &schema, const std::string &object) {
+			return keeps_schema(schema) && filter->MatchesTable(object) &&
+				   !(exclude->HasTableFilter() && exclude->MatchesTable(object));
 		};
 	}
 	std::shared_ptr<AttachedBackup> attached;

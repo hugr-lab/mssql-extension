@@ -39,7 +39,14 @@ enum class MSSQLReadForm : uint8_t { Bare, ServerCast, SpatialBinary };
 
 struct MSSQLColumnInfo {
 	// Basic column info
-	string name;			  // Column name
+	string name;  // Column name, the server's: every name the extension sends is this one
+	//! The name DuckDB reads it under (issue #572, mssql::DuckDBColumnNames): `name`, but for a column of
+	//! a case-sensitive database whose name repeats another's but for case. Set by the table entry; empty
+	//! where nothing set it (DuckDBName() is then `name`).
+	string duckdb_name;
+	const string &DuckDBName() const {
+		return duckdb_name.empty() ? name : duckdb_name;
+	}
 	int32_t column_id;		  // Ordinal position (1-based)
 	string sql_type_name;	  // SQL Server type name (e.g., "varchar", "int")
 	LogicalType duckdb_type;  // Mapped DuckDB type

@@ -76,10 +76,9 @@ bool NodeWriter::KeyedToOneRow(const SelectNode &node) const {
 			auto &cmp = conjunct->Cast<ComparisonExpression>();
 			for (auto pair : {std::make_pair(&cmp.Left(), &cmp.Right()), std::make_pair(&cmp.Right(), &cmp.Left())}) {
 				idx_t index;
-				equated =
-					equated || (pair.first->GetExpressionClass() == ExpressionClass::COLUMN_REF &&
-								FindColumn(pair.first->Cast<ColumnRefExpression>(), index) == 1 &&
-								StringUtil::CIEquals(columns_[index].name, key_column) && fixed(*pair.second, index));
+				equated = equated || (pair.first->GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+									  FindColumn(pair.first->Cast<ColumnRefExpression>(), index) == 1 &&
+									  columns_[index].name == key_column && fixed(*pair.second, index));
 			}
 		}
 		if (!equated) {

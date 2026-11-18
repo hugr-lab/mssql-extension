@@ -214,14 +214,14 @@ struct OpenedForStatement {
 
 //! A backup attached as a catalog (ATTACH … (TYPE mssql_backup), task 23): what its ATTACH opened, held
 //! for its life -- the opened backup (the ObjectCache's entry, which stays alive while attached even if
-//! the cache evicts it) and its model, built once for the ATTACH's schema_filter / table_filter, its
+//! the cache evicts it) and its model, built once for the ATTACH's filters and exclusions, its
 //! schemas filtered too. The file functions take its name in place of a path and read through it.
 struct AttachedBackup {
 	std::string name;
 	shared_ptr<OpenedBackup> backup;
 	std::string cache_key;	// the ObjectCache's, empty when not cached
 	std::shared_ptr<const CatalogModel> model;
-	//! The ATTACH's schema_filter; none: every schema.
+	//! The ATTACH's schema_filter and schema_exclude; none: every schema.
 	std::function<bool(const std::string &schema)> wants_schema;
 
 	bool WantsSchema(const std::string &schema) const {

@@ -219,7 +219,7 @@ SELECT list(table_name ORDER BY table_name) FROM mssql_backup_tables('bf');
 statement error
 SELECT count(*) FROM mssql_backup_scan('bf', 'dbo', 'items');
 ----
-the backup attached as bf has no table or indexed view dbo.items that its schema_filter / table_filter keep
+the backup attached as bf has no table or indexed view dbo.items that its filters keep
 
 # ATTACH OR REPLACE reads the file and the options again.
 statement ok
@@ -242,6 +242,68 @@ query I
 SELECT count(*) FROM mssql_backup_schemas('bn');
 ----
 0
+
+# schema_exclude / table_exclude: what they match is dropped -- with a filter, its complement (two
+# imports of one backup split by mode).
+statement ok
+ATTACH 'test/data/backup/full.bak' AS bx1 (TYPE mssql_backup, table_exclude '^EV');
+
+query T
+SELECT list(table_name) FROM duckdb_tables() WHERE database_name = 'bx1';
+----
+[items]
+
+query T
+SELECT list(table_name ORDER BY table_name) FROM mssql_backup_tables('bx1');
+----
+[items]
+
+# The file functions on the name follow the exclusion too (a filter's complement: bf above keeps
+# [events] with table_filter '^EV').
+statement error
+SELECT count(*) FROM mssql_backup_scan('bx1', 'dbo', 'events');
+----
+that its filters keep
+
+statement ok
+ATTACH 'test/data/backup/full.bak' AS bx2 (TYPE mssql_backup, table_filter 'e', table_exclude '^items$');
+
+query T
+SELECT list(table_name) FROM duckdb_tables() WHERE database_name = 'bx2';
+----
+[events]
+
+statement ok
+ATTACH 'test/data/backup/full.bak' AS bx3 (TYPE mssql_backup, schema_exclude '^dbo$');
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'bx3';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'bx3' AND schema_name = 'dbo';
+----
+0
+
+query I
+SELECT count(*) FROM mssql_backup_schemas('bx3') WHERE schema_name = 'dbo';
+----
+0
+
+# A schema filter and a schema exclusion together.
+statement ok
+ATTACH 'test/data/backup/full.bak' AS bx5 (TYPE mssql_backup, schema_filter '^(dbo|sys)$', schema_exclude '^sys$');
+
+query T
+SELECT list(schema_name ORDER BY schema_name) FROM mssql_backup_schemas('bx5');
+----
+[dbo]
+
+statement error
+ATTACH 'test/data/backup/full.bak' AS bx4 (TYPE mssql_backup, table_exclude '(');
+----
+<REGEX>:.*table_exclude: Invalid regex pattern '\('.*
 
 # Refused by name: a bad regex, an option it does not take, a backup with no pages to read.
 statement error

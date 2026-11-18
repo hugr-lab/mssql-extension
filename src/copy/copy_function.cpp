@@ -1,4 +1,5 @@
 #include "copy/copy_function.hpp"
+#include "catalog/mssql_column_names.hpp"
 #include "connection/mssql_login_retry.hpp"
 
 #include <mutex>
@@ -404,8 +405,11 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		}
 
 		// Validate target and optionally create table
+		// The target's columns when it existed: read once, there, and the COLMETADATA built from that read
+		// (review of #574: a second read could see a column another session added, and move a name).
+		vector<BCPColumnMetadata> existing_columns;
 		TargetResolver::ValidateTarget(context, *gstate->connection, bdata.target, bdata.config, bdata.source_types,
-									   bdata.source_names);
+									   bdata.source_names, &existing_columns);
 
 		// Point invalidation: invalidate schema's table list if table was created/dropped
 		// This ensures the new table schema is visible for subsequent queries
@@ -434,7 +438,9 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		if (need_target_metadata) {
 			// Try to get target column metadata - this will work for existing tables
 			try {
-				gstate->columns = TargetResolver::GetExistingTableColumnMetadata(*gstate->connection, bdata.target);
+				gstate->columns = !existing_columns.empty() ? std::move(existing_columns)
+															: TargetResolver::GetExistingTableColumnMetadata(
+																  *gstate->connection, bdata.target);
 				CopyDebugLog(1, "BCPCopyInitGlobal: using target table column metadata (%llu columns)",
 							 (unsigned long long)gstate->columns.size());
 
@@ -444,10 +450,16 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 				// chunk and routes them through the NullOnly path. A bare
 				// `NULL AS col` is a different case, decided below by its
 				// SQLNULL source type.
+				// By the target's DuckDB names, as the source names them (issue #572).
+				std::vector<std::string> server_names;
+				for (const auto &col : gstate->columns) {
+					server_names.push_back(col.name);
+				}
+				const auto duckdb_names = mssql::DuckDBColumnNames(server_names);
 				for (const auto &nn : bdata.config.null_only_columns) {
-					for (auto &col : gstate->columns) {
-						if (StringUtil::Lower(col.name) == nn) {
-							col.null_only_source = true;
+					for (idx_t c = 0; c < gstate->columns.size(); c++) {
+						if (StringUtil::Lower(duckdb_names[c]) == nn) {
+							gstate->columns[c].null_only_source = true;
 						}
 					}
 				}
