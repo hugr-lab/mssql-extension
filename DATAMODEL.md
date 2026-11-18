@@ -1479,7 +1479,16 @@ flowchart BT
   stager --> scan["mssql_backup_scan<br/>+ _mssql_page / _mssql_rid / _mssql_page_lsn / _mssql_lob"]
   model --> att["ATTACH … (TYPE mssql_backup)<br/>MSSQLBackupCatalog: schema / table entries,<br/>read-only; AttachedBackup holds the opened backup<br/>and its model"]
   att --> scan
+  idx -. "a differential: PageIndex::SetBase<br/>(its passes, then the full's)" .-> idx
 ```
+
+- **A differential over its full** (spec 085 PR 4c, `diff :=`): its own `OpenedBackup`, whose base is
+  the full's (`OpenedBackup::Base`; a cache entry of its own, keyed by both backups' files). Its
+  passes are header-scanned and its `PageIndex` answers what they lack from the full's
+  (`PageIndex::SetBase`), so the `AllocationMap` and `PageStore` built over it are the overlay: the
+  allocation pages the differential carries win, and liveness is recomputed from them. A table's
+  pages are its IAM chain read through that store. A statement opens both backups' files, the
+  differential's `FileBinding` naming the full's (`also`), so one `BindFiles` binds both.
 
 - **An attached backup** (spec 085 PR 4b, `src/catalog/backup/`) is a second `StorageExtension`
   beside `TYPE mssql`, sharing none of layers 1-4: its catalog type is `mssql_backup`, so the

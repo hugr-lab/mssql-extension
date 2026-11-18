@@ -445,6 +445,7 @@ enum class Listing : uint8_t { Tables, Views, Schemas, Columns };
 
 struct CatalogListBindData : public TableFunctionData {
 	vector<std::string> paths;
+	vector<std::string> diff;  // task 24
 	Listing listing = Listing::Tables;
 	//! mssql_backup_columns' optional schema and table: only that schema's (that table's) columns.
 	bool by_schema = false;
@@ -458,6 +459,7 @@ struct CatalogListBindData : public TableFunctionData {
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<CatalogListBindData>();
 		copy->paths = paths;
+		copy->diff = diff;
 		copy->listing = listing;
 		copy->by_schema = by_schema;
 		copy->by_table = by_table;
@@ -468,7 +470,7 @@ struct CatalogListBindData : public TableFunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<CatalogListBindData>();
-		return paths == other.paths && listing == other.listing && by_schema == other.by_schema &&
+		return paths == other.paths && diff == other.diff && listing == other.listing && by_schema == other.by_schema &&
 			   by_table == other.by_table && schema == other.schema && table == other.table && scope == other.scope;
 	}
 	bool Wants(const CatalogTable &t) const {
@@ -504,6 +506,7 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	auto data = make_uniq<CatalogListBindData>();
 	data->listing = L;
 	data->paths = PathsOf(input.inputs[0], FunctionName(L));
+	data->diff = DiffPathsOf(input.named_parameters, FunctionName(L));
 	if (L == Listing::Columns && input.inputs.size() > 1) {
 		data->by_schema = true;
 		data->schema = NameArgument(input.inputs[1], "schema");
@@ -684,8 +687,9 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 	const auto &data = input.bind_data->Cast<CatalogListBindData>();
 	auto state = make_uniq<CatalogListState>();
 	try {
-		state->catalog = OpenBackupCatalog(context, std::vector<std::string>(data.paths.begin(), data.paths.end()),
-										   true, data.scope);
+		state->catalog =
+			OpenBackupCatalog(context, std::vector<std::string>(data.paths.begin(), data.paths.end()), true, data.scope,
+							  std::vector<std::string>(data.diff.begin(), data.diff.end()));
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", FunctionName(data.listing), e.what());
 	}
@@ -741,6 +745,7 @@ void Register(ExtensionLoader &loader, const char *description, std::vector<std:
 	const vector<LogicalType> arguments{LogicalType(LogicalType::VARCHAR), LogicalType::LIST(LogicalType::VARCHAR)};
 	auto add = [&](vector<LogicalType> args) {
 		TableFunction f(FunctionName(L), std::move(args), Execute, Bind<L>, Init);
+		AddDiffParameter(f);
 		f.pushdown_complex_filter = PushdownNames<L>;
 		f.to_string = ScopeToString;
 		set.AddFunction(std::move(f));

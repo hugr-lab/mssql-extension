@@ -106,10 +106,14 @@ struct OpenedPages {
 struct OpenPagesOptions {
 	//! DQ-41: a container's pass searched by resync from any offset (trusted row data only).
 	bool trust_layout = false;
+	//! Task 24 (D12): a differential's pages over these, its full's (chain checked by the caller):
+	//! its own passes win, liveness from the overlaid allocation pages. Must outlive the pages.
+	const PageIndex *base = nullptr;
 };
 
-//! The pages of the full backup `headers` holds. A log backup has no data pages and a differential
-//! is read over its full (task 24's overlay): both are refused by name. The header scans read the
+//! The pages of the full backup `headers` holds, or of a differential over its full's
+//! (`options.base`, task 24). A log backup has no data pages, and a differential with no base is
+//! refused by name. The header scans read the
 //! families as parallel ranges (D3a) through the statement files read on the thread, and so does a
 //! searched pass's fallback later (BoundPassMapper): the pages live as long as `headers`.
 std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers,
@@ -140,7 +144,9 @@ private:
 //! attached catalog would hold one too. Reads only through a statement's files bound to the thread.
 class OpenedBackup : public ObjectCacheEntry {
 public:
-	explicit OpenedBackup(std::unique_ptr<OpenedHeaders> headers);
+	//! `base`: a differential's full (task 24, D12), whose stages this one's pages lie over; its chain is
+	//! checked by the caller (CheckDifferentialBase).
+	explicit OpenedBackup(std::unique_ptr<OpenedHeaders> headers, shared_ptr<OpenedBackup> base = nullptr);
 
 	const OpenedHeaders &Headers() const {
 		return *headers_;
@@ -165,6 +171,10 @@ public:
 	UnitPageCache &UnitPages() const {
 		return unit_pages_;
 	}
+	//! A differential's full, or none.
+	const shared_ptr<OpenedBackup> &Base() const {
+		return base_;
+	}
 
 	static std::string ObjectType() {
 		return "mssql_backup_opened";
@@ -179,6 +189,7 @@ public:
 
 private:
 	std::unique_ptr<OpenedHeaders> headers_;
+	shared_ptr<OpenedBackup> base_;
 	std::mutex lock_;
 	std::condition_variable built_;
 	bool building_ = false;
@@ -193,6 +204,8 @@ private:
 struct OpenedForStatement {
 	shared_ptr<OpenedBackup> backup;  // DuckDB's shared_ptr, the ObjectCache's
 	std::unique_ptr<StatementFiles> files;
+	//! A differential's: its full opened for the statement too, which `binding.also` binds.
+	std::unique_ptr<OpenedForStatement> base;
 	FileBinding binding;
 	//! The ObjectCache key of the backup, empty when it is not cached (mssql_backup_cache off, or a file
 	//! with no version tag).
@@ -225,7 +238,8 @@ std::shared_ptr<const AttachedBackup> FindAttachedBackup(ClientContext &context,
 std::shared_ptr<AttachedBackup> OpenAttachedBackup(
 	ClientContext &context, const std::string &name, const std::vector<std::string> &paths,
 	std::function<bool(const std::string &schema)> wants_schema,
-	std::function<bool(const std::string &schema, const std::string &object)> wants_object);
+	std::function<bool(const std::string &schema, const std::string &object)> wants_object,
+	const std::vector<std::string> &diff = std::vector<std::string>());
 
 //! The backup on `paths` (paths or globs: the families of one media set): its files opened for this
 //! statement and its headers taken from the DuckDB instance's ObjectCache when `mssql_backup_cache`
@@ -233,7 +247,15 @@ std::shared_ptr<AttachedBackup> OpenAttachedBackup(
 //! (OpenBackupHeaders' checks) and put there. A file that changed is a new key: never trusted. One
 //! path that names an attached backup (FindAttachedBackup) is that backup, its files opened again for
 //! the statement and refused by name when one changed since the ATTACH.
-OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::string> &paths);
+//! `diff` (task 24, D12): a differential to lay over the full on `paths` -- the families of one
+//! differential backup; its chain checked first (CheckDifferentialBase). Its ObjectCache entry holds
+//! the full's, keyed by both backups' files.
+OpenedForStatement OpenBackup(ClientContext &context, const std::vector<std::string> &paths,
+							  const std::vector<std::string> &diff = std::vector<std::string>());
+
+//! D12's chain: `diff` is a differential whose base is `full`'s backup set, of the same database, and
+//! `full` a full backup. A FormatError naming both files otherwise.
+void CheckDifferentialBase(const OpenedHeaders &full, const OpenedHeaders &diff);
 
 //! Stages 1-4 of an opened backup for one statement: the shared stages (OpenBackup, EnsureTables)
 //! and the catalog model, the statement's own (its scope is the statement's), or an attached backup's.
@@ -260,7 +282,8 @@ struct OpenedCatalog {
 //! base tables needs. `scope`: the tables and views the model is built for (task 16e). An attached
 //! backup's is its own model, built at its ATTACH (`with_model` and `scope` do not apply).
 std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths,
-												 bool with_model = true, const CatalogScope &scope = CatalogScope());
+												 bool with_model = true, const CatalogScope &scope = CatalogScope(),
+												 const std::vector<std::string> &diff = std::vector<std::string>());
 //! The catalog of `attached` for one statement: its files opened again and checked, its model.
 std::unique_ptr<OpenedCatalog> OpenAttachedCatalog(ClientContext &context, const AttachedBackup &attached);
 

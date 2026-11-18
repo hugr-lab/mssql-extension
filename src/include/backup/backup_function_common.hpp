@@ -16,6 +16,7 @@
 #include "backup/backup_sql_variant.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/function/table_function.hpp"
 
 #include <string>
 #include <vector>
@@ -27,6 +28,12 @@ namespace backup {
 //! The paths of a function's first argument (VARCHAR or LIST(VARCHAR)); NULL, a NULL element or an
 //! empty list is an InvalidInputException naming `function`.
 vector<std::string> PathsOf(const Value &value, const char *function);
+
+//! Task 24 (D12): the call's `diff :=` -- a differential backup to lay over the full (its paths as
+//! PathsOf takes them); empty when not given or NULL.
+vector<std::string> DiffPathsOf(const named_argument_map_t &named, const char *function);
+//! The `diff` keyword parameter, on a function's signature.
+void AddDiffParameter(TableFunction &function);
 
 //! A datetime as a record stores it (u32 ticks of 1/300 s, then i32 days since 1900-01-01) as TYPE
 //! mssql reads one off the wire (days, then ticks: DateTimeEncoding::ConvertDatetime). NULL TIMESTAMP

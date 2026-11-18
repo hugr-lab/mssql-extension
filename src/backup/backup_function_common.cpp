@@ -39,6 +39,27 @@ vector<std::string> PathsOf(const Value &value, const char *function) {
 	return paths;
 }
 
+vector<std::string> DiffPathsOf(const named_argument_map_t &named, const char *function) {
+	for (const auto &kv : named) {
+		if (kv.first == "diff" && !kv.second.IsNull()) {
+			const auto id = kv.second.type().id();
+			if (id != LogicalTypeId::VARCHAR &&
+				!(id == LogicalTypeId::LIST &&
+				  ListType::GetChildType(kv.second.type()).id() == LogicalTypeId::VARCHAR)) {
+				throw InvalidInputException("%s: diff := takes a path or a list of paths, not a %s", function,
+											kv.second.type().ToString());
+			}
+			return PathsOf(kv.second, function);
+		}
+	}
+	return vector<std::string>();
+}
+
+void AddDiffParameter(TableFunction &function) {
+	// VARCHAR or LIST(VARCHAR), as the path: one file, a glob, or a differential's stripes.
+	function.GetSignature().AddKeywordOnly("diff", LogicalType::ANY, Value());
+}
+
 Value RecordDatetimeValue(const std::string &record_form) {
 	if (record_form.size() != 8) {
 		return Value(LogicalType::TIMESTAMP);

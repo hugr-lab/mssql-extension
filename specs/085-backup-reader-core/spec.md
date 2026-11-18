@@ -149,7 +149,9 @@ a type whose conversion is still to come is read as its stored bytes (below).
     Under an overlay a table's scan takes the diff's live pages whose header names its AU, and the
     full's pages by the AU's IAM chain through the overlay (the diff's copy of an IAM page that
     changed), both gated by R3 on the overlay's allocation pages, one copy per page id (task 24).
-    `verify := true` also checks that the two agree where both speak.
+    `verify := true` also checks that the two agree where both speak. As built (PR 4c, owner
+    2026-11-17): the IAM chain through the overlay alone -- it is the state after the differential and
+    lists every page the AU has -- and the header pairs are `verify`'s and 089's.
 
 - **D4a — what an opened backup keeps, and the budget: at most 0.4 MB of resident memory per GB of
   backup, 4 GB for 10 TB (owner, 2026-11-09).** The open pass may be slow (a backup is opened once per
@@ -1521,7 +1523,28 @@ before the next opens.
     Tests: `test/sql/backup/mssql_backup_attach.test`, `test_backup_cache` (shared model and page
     lists, the ATTACH's backup held with the cache off).
 24. Differential overlay and chain check: the diff's pages by their header AU, the full's by the IAM
-    chain through the overlay (D4) — 2 d
+    chain through the overlay (D4) — 2 d. As built (PR 4c): `diff :=` on every file function but
+    `mssql_backup_info`, and `diff` on ATTACH. The differential's `OpenedBackup` has the full's as its
+    base (`OpenedBackup::Base`, a cache entry of its own keyed by both backups' files): its passes are
+    header-scanned (`PageIndexOptions::full_backup` false) and its `PageIndex` answers what they lack
+    from the full's (`SetBase`), so `AllocationMap` and `PageStore` over it are the overlay (the file
+    header, GAM and PFS the differential carries win: D12's liveness recomputed). A statement opens both
+    backups' files, one `FileBinding` naming the other (`also`), so one `BindFiles` binds both. The
+    chain is `CheckDifferentialBase` (a differential, its base GUID the full's backup set GUID, one
+    family GUID, the full a full), before the stages. **A table's pages are its IAM chain read through
+    the overlay only** (owner, 2026-11-17): the overlay's IAM is the state after the differential (its
+    copy where the allocation changed, the full's elsewhere), so it lists every page the table has; the
+    differential's own pages by their header AU add none it does not and are left to `verify := true`
+    and to 089's lone differential. Tests: `test/sql/backup/mssql_backup_diff.test` (the committed
+    samples), `test_backup_cache` (the overlay cached, its base the full's entry), and the oracle
+    fixture `diffs.sql` (E2's changes: splits, forwarded rows, off-row values rewritten, DROP, TRUNCATE,
+    ADD / DROP COLUMN, a REBUILD, a SHRINKFILE that moves pages), restored as full `WITH NORECOVERY` +
+    differential `WITH RECOVERY` by `compare_rows.sh` (`overlays.txt`): locally on 2022, plain and
+    MS_XPRESS, every table equal (the lane runs 2017-2025; before 2022 the compressed differential is
+    plain `COMPRESSION`). A cached overlay whose full's entry was evicted or replaced meanwhile binds the
+    statement's files of the full to its own base (`OpenOverlay`), and the base is weighed with it
+    (`TakeStages`); `PageIndex::LocateOwn` answers "does this backup carry the page" for a file marked
+    removed and an allocation page past a shrunk file, never the base.
 25. `s3://` (MinIO) and `https://` tests in the lane; measure the open pass and decide filter pushdown
     with late materialisation (a follow-up spec if it is worth it) — 2 d. Owner, 2026-11-11: the
     scan is to make filtering cheap enough for an importer that exports a table with a filter over

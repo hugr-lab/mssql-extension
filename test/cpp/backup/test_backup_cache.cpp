@@ -123,7 +123,8 @@ int main() {
 
 	{
 		// A copy whose modification time moves: the same bytes, another version tag, another key.
-		const auto dir = std::filesystem::temp_directory_path() / ("mssql_backup_cache_" + std::to_string(reinterpret_cast<uintptr_t>(&context)));
+		const auto dir = std::filesystem::temp_directory_path() /
+						 ("mssql_backup_cache_" + std::to_string(reinterpret_cast<uintptr_t>(&context)));
 		std::filesystem::create_directories(dir);
 		const auto copy = dir / "full.bak";
 		std::filesystem::copy_file(DIR + "full.bak", copy, std::filesystem::copy_options::overwrite_existing);
@@ -148,11 +149,10 @@ int main() {
 	}
 
 	{
-		const std::string count =
-			"SELECT count(*) FROM mssql_backup_scan('" + DIR + "full_zstd.bak', 'dbo', 'items')";
+		const std::string count = "SELECT count(*) FROM mssql_backup_scan('" + DIR + "full_zstd.bak', 'dbo', 'items')";
 		const int64_t expected = ScalarInt(con, count);
 		Check(expected > 0, "the scan reads the sample's rows (" + std::to_string(expected) + ")");
-		std::atomic<int> wrong {0};
+		std::atomic<int> wrong{0};
 		std::vector<std::thread> threads;
 		for (int t = 0; t < 4; t++) {
 			threads.emplace_back([&]() {
@@ -175,7 +175,7 @@ int main() {
 		// builds its stages, the others wait for it or build their own entry, and every count is whole.
 		DuckDB cold_db(nullptr);
 		cold_db.LoadStaticExtension<MssqlExtension>();
-		std::atomic<int> ready {0};
+		std::atomic<int> ready{0};
 		std::vector<int64_t> counts(4, 0);
 		std::vector<std::thread> threads;
 		for (int t = 0; t < 4; t++) {
@@ -184,8 +184,8 @@ int main() {
 				ready++;
 				while (ready.load() < 4) {
 				}
-				counts[t] =
-					ScalarInt(mine, "SELECT count(*) FROM mssql_backup_scan('" + DIR + "stripe_zstd_*.bak', 'dbo', 'items')");
+				counts[t] = ScalarInt(
+					mine, "SELECT count(*) FROM mssql_backup_scan('" + DIR + "stripe_zstd_*.bak', 'dbo', 'items')");
 			});
 		}
 		for (auto &t : threads) {
@@ -213,8 +213,8 @@ int main() {
 		con.Query("ATTACH '" + DIR + "full.bak' AS bk (TYPE mssql_backup)");
 		auto a = OpenBackupCatalog(context, {"bk"});
 		auto b = OpenBackupCatalog(context, {"bk"});
-		Check(a->opened.backup.get() == b->opened.backup.get() && a->model.get() == b->model.get() &&
-				  a->unit_pages && a->unit_pages == b->unit_pages,
+		Check(a->opened.backup.get() == b->opened.backup.get() && a->model.get() == b->model.get() && a->unit_pages &&
+				  a->unit_pages == b->unit_pages,
 			  "two statements on an attached backup share its opened backup, model and page lists");
 		Check(a->opened.files.get() != b->opened.files.get(), "and open their own files");
 		const CatalogTable *items = a->Model().FindTable("dbo", "items");
@@ -267,6 +267,34 @@ int main() {
 		const std::vector<std::string> want = {"Id", "ID_2", "id_3", "my col", "Other \"Col\"", "ID_1"};
 		Check(std::vector<std::string>(columns.names.begin(), columns.names.end()) == want,
 			  "columns that differ only in case read as Id, ID_2, id_3: a real column ID_1 keeps its name");
+	}
+
+	{
+		// Task 24: a differential over its full is its own entry, keyed by both backups' files, whose
+		// base is the full's entry; a second statement takes it and reads nothing it holds again.
+		auto full = OpenBackupCatalog(context, {DIR + "full.bak"});
+		auto a = OpenBackupCatalog(context, {DIR + "full.bak"}, true, CatalogScope(), {DIR + "diff.bak"});
+		auto b = OpenBackupCatalog(context, {DIR + "full.bak"}, true, CatalogScope(), {DIR + "diff.bak"});
+		Check(a->opened.backup.get() == b->opened.backup.get() && !a->opened.cache_key.empty(),
+			  "a differential over its full is cached, keyed by both backups' files");
+		Check(a->opened.backup->Base().get() == full->opened.backup.get(),
+			  "and its base is the full's entry, not a second open of the full");
+		Check(a->opened.backup.get() != full->opened.backup.get() && a->pages != full->pages,
+			  "the overlay's pages are its own: the differential's index over the full's");
+		const CatalogTable *items = a->Model().FindTable("dbo", "items");
+		Check(items && items->row_count == 2500, "the overlay's catalog counts the differential's rows (2500 items)");
+		Check(Fetches(*b) < Fetches(*a) || Fetches(*b) == 0, "a second open of the overlay reads less");
+		// The full's entry evicted (each entry goes on its own) and opened anew while the overlay's stays:
+		// the overlay still reads through its own base, bound to the statement's files of the full.
+		ObjectCache::GetObjectCache(context).Delete(full->opened.cache_key);
+		auto again = OpenBackupCatalog(context, {DIR + "full.bak"});
+		Check(again->opened.backup.get() != full->opened.backup.get(), "the full opened anew after its eviction");
+		const int64_t rows = ScalarInt(con, "SELECT count(*) FROM mssql_backup_scan('" + DIR +
+												"full.bak', 'dbo', 'events', diff := '" + DIR + "diff.bak')");
+		Check(rows == 2572, "and the cached overlay over its old base still reads (" + std::to_string(rows) + " rows)");
+		auto entry = ObjectCache::GetObjectCache(context).Get<OpenedBackup>(full->opened.cache_key);
+		Check(entry.get() == a->opened.backup->Base().get(),
+			  "and its base is the full's entry again: one copy of the full, counted (review of #575)");
 	}
 
 	if (failures) {

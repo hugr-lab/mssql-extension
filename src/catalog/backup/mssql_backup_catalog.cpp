@@ -9,6 +9,8 @@
 
 #include "catalog/backup/mssql_backup_catalog.hpp"
 
+#include "backup/backup_function_common.hpp"
+
 #include "catalog/mssql_catalog_filter.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -305,12 +307,22 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 											 AttachedDatabase &db, const string &name, AttachInfo &info,
 											 AttachOptions &options) {
 	// schema_filter / table_filter keep what they match; schema_exclude / table_exclude drop what they
-	// match (two imports of one backup split by a filter and its complement, say an accumulating and a
-	// mirrored part of a lake). All regexes as TYPE mssql's: case-insensitive, a partial match.
+	// match. All regexes as TYPE mssql's: case-insensitive, a partial match.
 	auto filter = std::make_shared<MSSQLCatalogFilter>();
 	auto exclude = std::make_shared<MSSQLCatalogFilter>();
+	std::vector<std::string> diff;
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		const std::string key = StringUtil::Lower(it->first);
+		if (key == "diff") {
+			// Task 24 (D12): a differential laid over the attached full.
+			if (!it->second.IsNull()) {
+				for (auto &path : mssql::backup::PathsOf(it->second, "ATTACH (TYPE mssql_backup) diff")) {
+					diff.push_back(path);
+				}
+			}
+			it = options.options.erase(it);
+			continue;
+		}
 		if (key != "schema_filter" && key != "table_filter" && key != "schema_exclude" && key != "table_exclude") {
 			++it;
 			continue;
@@ -336,7 +348,7 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 	for (const auto &option : options.options) {
 		throw InvalidInputException(
 			"ATTACH %s (TYPE mssql_backup): '%s' is not an option of an attached backup "
-			"(schema_filter, table_filter, schema_exclude, table_exclude)",
+			"(schema_filter, table_filter, schema_exclude, table_exclude, diff)",
 			name, option.first);
 	}
 	// Always read-only (D1): DuckDB's own check refuses every write before the catalog sees it.
@@ -359,7 +371,7 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 	std::shared_ptr<AttachedBackup> attached;
 	try {
 		attached = mssql::backup::OpenAttachedBackup(context, name, {info.path}, std::move(wants_schema),
-													 std::move(wants_object));
+													 std::move(wants_object), diff);
 	} catch (mssql::backup::FormatError &e) {
 		throw InvalidInputException("ATTACH %s (TYPE mssql_backup): %s", name, e.what());
 	}

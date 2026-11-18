@@ -66,6 +66,7 @@ def main():
     parser.add_argument("backup", help="the backup: a file, or its stripes comma-separated")
     parser.add_argument("--duckdb", required=True)
     parser.add_argument("--min-tables", type=int, default=1)
+    parser.add_argument("--diff", default="", help="a differential to lay over the backup: its stripes comma-separated")
     args = parser.parse_args()
     try:
         session = Session(args.duckdb, os.environ["MSSQL_ROWS_PORT"], os.environ["MSSQL_ROWS_PASSWORD"],
@@ -74,11 +75,14 @@ def main():
         sys.exit(f"compare_rows: set {e.args[0]}")
     files = [f for f in args.backup.split(",") if f]
     paths = "[" + ", ".join(sql_string(f) for f in files) + "]"
+    diff = [f for f in args.diff.split(",") if f]
+    # Spec 085 PR 4c: every call reads the differential over the full (a named parameter, last).
+    opts = (", diff := [" + ", ".join(sql_string(f) for f in diff) + "]") if diff else ""
 
     ok, tables = session.query(
         f"SELECT schema_name, table_name, shape, decodable, reason, "
         f"to_json([{{'name': c.name, 'decodable': c.decodable, 'reason': c.reason}} FOR c IN columns]) AS columns "
-        f"FROM mssql_backup_tables({paths}) ORDER BY schema_name, table_name")
+        f"FROM mssql_backup_tables({paths}{opts}) ORDER BY schema_name, table_name")
     if not ok:
         sys.exit(f"compare_rows: mssql_backup_tables failed on {args.backup}:\n{tables}")
 
@@ -95,7 +99,7 @@ def main():
         # name (owner, review of #552): checked on the first such column of each table.
         unread = [c["name"] for c in columns if not c["decodable"]]
         if unread:
-            scan_of = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)})"
+            scan_of = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)}{opts})"
             ok, result = session.query(f"SELECT {ident(unread[0])} FROM {scan_of} LIMIT 1")
             if ok or "is not read" not in str(result):
                 failures.append(f"{where}: naming {unread[0]}, which is not read, was not refused by name")
@@ -105,7 +109,7 @@ def main():
                 failures.append(f"{where}: no column left to compare ({left_out})")
                 break
             select = ", ".join(ident(c) for c in cols)
-            scan = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)})"
+            scan = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)}{opts})"
             server = f"srv.{ident(schema)}.{ident(table)}"
             ok, result = session.query(
                 f"SELECT (SELECT count(*) FROM (SELECT {select} FROM {scan} EXCEPT ALL SELECT {select} FROM {server})) "
@@ -171,7 +175,7 @@ def main():
     # An indexed view's rows (task 16f): its unique clustered index, read as a clustered table's, against
     # the view through TYPE mssql (the same rows as WITH (NOEXPAND) in a backup at rest, typed as the
     # catalog types them); every column the scan returns, _mssql_rid one per row.
-    ok, views = session.query(f"SELECT schema_name, view_name, decodable, scan_reason FROM mssql_backup_views({paths}) "
+    ok, views = session.query(f"SELECT schema_name, view_name, decodable, scan_reason FROM mssql_backup_views({paths}{opts}) "
                               "WHERE is_indexed ORDER BY schema_name, view_name")
     if not ok:
         sys.exit(f"compare_rows: mssql_backup_views failed on {args.backup}:\n{views}")
@@ -181,7 +185,7 @@ def main():
         if v["decodable"] in (False, "false"):
             print(f"  skip {where}: {v['scan_reason']}")
             continue
-        scan = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(view)})"
+        scan = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(view)}{opts})"
         server = f"srv.{ident(schema)}.{ident(view)}"
         ok, described = session.query(f"DESCRIBE SELECT * FROM {scan}")
         ok_server, server_described = session.query(f"DESCRIBE SELECT * FROM {server}")
@@ -219,8 +223,8 @@ def main():
         if not twin or t["decodable"] in (False, "false") or twin["decodable"] in (False, "false"):
             continue
         where = f"{schema}.{table} against {twin['table_name']}"
-        a = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)})"
-        b = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(twin['table_name'])})"
+        a = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)}{opts})"
+        b = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(twin['table_name'])}{opts})"
         ok, result = session.query(
             f"SELECT (SELECT count(*) FROM (SELECT *, _mssql_rid FROM {a} EXCEPT ALL SELECT *, _mssql_rid FROM {b})) "
             f"AS only_row, (SELECT count(*) FROM (SELECT *, _mssql_rid FROM {b} EXCEPT ALL "

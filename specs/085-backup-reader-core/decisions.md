@@ -75,6 +75,9 @@ the specs it affects. **Blocking** means the named PR cannot open until the ques
 | DQ-40 | which pages are a table's | **decided** (owner, 2026-11-09): its AU's IAM chain, walked at the table's first scan through the page store; the page header checked at read; a differential's own pages by their header AU; an ATTACH reads the headers, allocation and catalog pages only (085 D4, D4a) | — |
 | DQ-39 | what an opened backup keeps in memory | **decided** (owner, 2026-11-09): at most 0.4 MB resident per GB of backup (4 GB for 10 TB); extent bitmaps with ranks, block checkpoints, the catalog model resident; the AU index buffer-managed (replaced by DQ-40's IAM chain); page bytes not kept; a slow open is acceptable; a saved index later, as an option (085 D4a) | — |
 | DQ-38 | how the reader does I/O | **decided** (owner, 2026-11-09): coalesced ranges, fetched asynchronously and in parallel through DuckDB's I/O pool and `CachingFileSystem`, as the Parquet reader does (085 D3a) | — |
+| DQ-47 | how an importer applies a differential | **decided** (owner, 2026-11-17): it names the full; the reader gives the schema changes and the row changes between two states (versions of DQ-48's history) through DuckLake-shaped functions (`mssql_backup_schema_changes`, `_table_changes`, `_insertions`, `_deletions`); empty with no differential | 085 PR 4c-3, 089, 022–024 |
+| DQ-48 | time travel over backups | **decided** (owner, 2026-11-17): a set of backups attaches as one catalog with a history; `AT (TIMESTAMP / VERSION)` picks a state; `mssql_backup_snapshots` | 085 PR 4c-2 |
+| DQ-49 | tables the lake accumulates while the source purges them | **decided** (owner, 2026-11-17): importer modes `mirror` / `accumulate` / `retain` per table; TRUNCATE and SWITCH OUT named as events, not a reload | 022–024, 085 PR 4c-3 |
 
 ## The questions
 
@@ -742,6 +745,171 @@ GeoParquet write, so the label is `OGC:CRS84`: the same WGS 84, longitude first,
 - about 9 days, plus a day of experiments (M1 – M4) first.
 
 **Affects** 085 PR 3 (recorded in 085's spec by that PR).
+
+### DQ-47 — How does an importer apply a differential? — **DECIDED** (owner, 2026-11-17)
+
+**DECIDED: the importer names the full backup the differential is based on, and the reader gives it
+the changes between two states -- schema first, then rows -- through functions in DuckLake's shape,
+on an attached backup (or a path with `diff :=`), whatever the ATTACH's mode.** Reached during 085 PR 4c
+(the overlay).
+
+A differential is cumulative since its base full (its DCM resets only at a full without `COPY_ONLY`):
+`full + diff_N` alone is the state at diff N, whatever came between. An importer that loads a full
+once a day and a differential every hour therefore needs the change between the last state it applied
+and the new one, not between the full and the new differential, or it would delete and insert again
+what an earlier differential already brought.
+
+- **Two states, as versions of a history (DQ-48).** A state is a full backup, with or without a
+  differential over it; an attached history numbers them. The new state is the one attached (or the
+  end version); the old one is the version the importer applied last (the start version). The next
+  day's full is applied as the change since yesterday's last differential, about an hour of work, not a
+  reload; two fulls in a row the same way. Without a start the old state is the attached full alone.
+  Only the pages of the new state whose `m_lsn` is past the old state's checkpoint (089's W) are
+  compared, their old versions read from the old state; a skipped file costs nothing. This holds while
+  the two states are of one database whose LSNs only grow (the same family GUID and recovery fork,
+  checked first, with the chain of each state): a database restored, recreated or on another fork makes
+  every table `reload`, said by name, never guessed. An attached backup always reads as one state;
+  there is no row-change mode on ATTACH.
+- **Open, for mssql-ducklake**: how each change lands in DuckLake -- a schema change as DuckLake's
+  `ALTER TABLE` (add / drop / rename column, rename table, type widening; its history kept), and a
+  `reload` as a table recreated under the same name -- to be checked on a prototype there (time travel
+  by name across the recreation, old files gone only at expiry).
+- **Schema changes first**: `mssql_backup_schema_changes(catalog [, start, end])` compares the two
+  catalogs by `object_id` and `column_id` (a rename is a rename): `table_created`, `table_dropped`,
+  `table_renamed`, `column_added`, `column_dropped`, `column_renamed`, `column_type_changed`,
+  `column_nullability_changed`, each with its old and new description. A change that cannot be
+  expressed row by row -- a type change that rewrites the rows, a table rebuilt under a new object id, a
+  partition SWITCH -- marks the table `reload`: its row changes are then its whole new content, and the
+  importer rebuilds it. The importer applies the DDL before the rows.
+- **Row changes, in the new schema**, as DuckLake names them: `mssql_backup_table_changes(catalog,
+  schema, table [, start, end])` (versions or timestamps, as `ducklake_table_changes`) with `change_type` `'insert'`, `'delete'`, `'update_preimage'`,
+  `'update_postimage'`; `mssql_backup_table_insertions` / `_deletions` the rows an importer inserts /
+  deletes (an update in both: delete the old row, insert the new). Rows are matched by `_mssql_rid` (a
+  clustered table's key; a heap's physical place, so a heap row the server moved reads as a delete and
+  an insert -- documented, not a fault). A deleted row's old values are laid on the new schema by
+  `column_id` (a dropped column gone, an added one NULL); its key and `_mssql_rid` are always there,
+  which is what a delete in the lake needs. A metadata-only `ADD` / `DROP COLUMN` changes no row. A
+  created table is `table_created` plus all its rows as inserts; a dropped one `table_dropped` and no
+  rows. The functions take a path and `diff :=` too, as every file function does. With no differential
+  (a full attached alone, or a path without `diff :=`) the two states are the same and every function
+  returns an empty set, not an error (owner, 2026-11-17): an importer can call them on every file.
+
+**Why.** The lake then deletes only the rows that changed, by their key, which DuckLake's file
+statistics prune well, instead of every row of every changed page by `_mssql_page` across thousands of
+files (089 needs 10); and the importer keeps no mirror of the allocation pages and no previous-owner
+logic (089 needs 3, 4, 6, 9, 12): the reader works them out from the full it is given. The cost: the
+full's file must stay at hand while its differentials are applied, and the old versions of the changed
+pages are read from it (about the differential's size again).
+
+**Affects** 085 (PR 4c-3: `mssql_backup_schema_changes`, then the three row-change functions, over
+DQ-48's versions); 089 (its lake-as-base contract becomes the fallback for a full no longer at hand, or is
+retired -- to be decided when 089 is revisited); mssql-ducklake 022-024 (the importer's apply step: DDL
+from the schema changes, then `DELETE … WHERE <key> IN` the deletions and `INSERT` the insertions), to
+be told.
+
+### DQ-48 — Time travel over backups? — **DECIDED** (owner, 2026-11-17)
+
+**DECIDED: a set of backups of one database attaches as one catalog with a history; DuckDB's `AT
+(TIMESTAMP => …)` / `AT (VERSION => …)` picks a state.**
+
+- `ATTACH 's3://bak/sales/*.bak' AS b (TYPE mssql_backup, history true)` reads the headers of every file
+  (cheap) and orders the states: each full, and each differential over it, is a version, at its
+  backup's finish time. `mssql_backup_snapshots('b')` lists them, as `ducklake_snapshots`.
+- A query without `AT` reads the latest state. `AT (TIMESTAMP => T)` reads the latest state finished by
+  T -- a full, or a differential over the full it names as its base (a copy-only full is a state of
+  its own and never a differential's base: with F at 00:00, a copy-only C at 02:00 and D at 03:00 over
+  F, T = 03:30 reads F + D, never C + D); `AT (VERSION => n)` the n-th
+  (`Catalog::SupportsTimeTravel`, the AT clause reaching `LookupEntry`). A state's overlay (task 24) is
+  built at its first query and cached.
+- DQ-47's change functions take two versions or timestamps of the history, as `ducklake_table_changes`.
+- The grain is the backups': a daily full and hourly differentials give a state an hour. A point
+  between them needs log backups, whose replay stays out (090 replays a backup's own tail only). A
+  database restored, recreated or on another fork breaks the history there: the versions on either
+  side compare only as a `reload`.
+
+**Affects** 085 (PR 4c-2: the history ATTACH, `mssql_backup_snapshots`, `AT`; PR 4c-3: DQ-47 over it).
+
+### DQ-49 — Tables the lake accumulates while the source purges them? — **DECIDED** (owner, 2026-11-17)
+
+**DECIDED: the importer has a mode per table -- `mirror` (the default: inserts, updates and deletes
+applied), `accumulate` (no delete applied: what was ever there stays) and `retain` (a delete of a row
+older than a threshold on a column, against the backup's time, is a purge and is not applied; a delete
+of a newer row is).** An OLTP system writes `events` or `order_items` and every few months purges what
+is older than a year or so, for its own speed, while the lake is to keep years of it.
+
+- An update is still applied in every mode (a delete of the old row and an insert of the new one, by
+  key): only deletes are judged.
+- **The reader names a purge that is not row by row**: `TRUNCATE` and a partition `SWITCH OUT` (a
+  sliding window) are explicit events of `mssql_backup_schema_changes` (`table_truncated`,
+  `partition_switched_out`, with the partitions concerned), not a `reload`: for an `accumulate` /
+  `retain` table a reload would drop what the lake keeps, so the importer applies only that table's
+  inserts after such an event.
+- Deleted rows carry their old values in full (DQ-47), so `retain` is judged on them.
+- DuckLake's snapshot expiry (024) does not touch them: they are not deleted in the lake.
+- **Deletes and updates, from the row changes (DQ-47)**: an update (`update_preimage` +
+  `update_postimage`, or a delete and an insert of one key in one change set) replaces the lake's row
+  of that key in every mode -- else the key would be there twice; a delete with no insert of its key is
+  skipped in `accumulate`, and in `retain` when the row is older than the threshold. A purge (`DELETE …
+  WHERE created_at < …`) is many such deletes in the next file, skipped; a skipped file or the next
+  full changes nothing, the change being between two versions.
+- **Schema evolution of an `accumulate` / `retain` table**: the lake holds rows of every past schema,
+  so its schema only grows. A column added: added in the lake, its older rows what the source holds for
+  them -- the default only where SQL Server backfills it, a metadata-only `ADD … NOT NULL DEFAULT x` or an
+  `ADD … DEFAULT x WITH VALUES` (every older row reads x, the archived ones of an `accumulate` / `retain`
+  table included), NULL otherwise: a nullable column added with a default and without `WITH VALUES`
+  leaves the older rows NULL, the default governing later inserts only (review of #575). The default is
+  the lake column's for later inserts either way. A column dropped at
+  the source: kept in the lake (older rows have values), NULL in new rows. A column renamed (one
+  `column_id`): renamed in the lake. A type widened: widened in the lake (DuckLake's type promotion), no
+  rewrite. A type narrowed or changed incompatibly: the column rewritten when every kept value casts
+  (below), else never -- the old column kept, and the new values in a new column `<name>__v2` (owner,
+  2026-11-17). A table
+  dropped at the source: kept in the lake, marked inactive. A table recreated under its name (a new
+  object id): its rows appended to the same lake table when the schema is compatible by these rules,
+  else to a new one. A `reload` (the history broken, DQ-48): an upsert by key from the new state, never a
+  delete -- rows no longer at the source stay.
+- **Applying changes to DuckLake** (its documentation, checked 2026-11-17): an update goes in as
+  `MERGE` / `UPDATE`, never DELETE + INSERT, so DuckLake keeps the row's `rowid` (row lineage) and its
+  own change feed (`table_changes`) reports `update_preimage` / `update_postimage`; deletes as DELETE by
+  key, inserts as INSERT; all of one backup version in one DuckLake transaction (one snapshot), its DDL
+  first, in this order: renames (through a temporary name for a swap or a chain), drops (`mirror`
+  only), adds, type changes, then the rows. A rename is DuckLake's `RENAME COLUMN` / `RENAME TO` (DQ-27
+  for tables), no rewrite; an added column is `ADD COLUMN`, its rows already there what the source holds
+  (above: the default where SQL Server backfills it, a metadata-only `ADD … NOT NULL DEFAULT x` or
+  `WITH VALUES`, else NULL); a column dropped and added again under its name in an `accumulate` / `retain` table, the old
+  one kept, is `<name>__v2`. DuckLake's type promotion is narrow -- integer widening and float32 to
+  float64 only, no decimal precision, no string length -- so **a type change is applied by rewriting
+  the column** (owner, 2026-11-17), as a large SQL Server table's column is changed: in one snapshot,
+  `RENAME COLUMN c TO c__old`, `ADD COLUMN c <new type>`, `UPDATE … SET c = CAST(c__old AS <new type>)`,
+  `DROP COLUMN c__old`. The rows keep their `rowid` (an UPDATE); the table's files are rewritten once,
+  the old ones gone at expiry; `table_changes` shows every row updated, which they are. In an
+  `accumulate` / `retain` table the same when the cast holds for every row kept; when any does not
+  (a narrowing, an incompatible type) nothing is rewritten: the old column stays and new values go to
+  `<name>__v2`. Wide lake types from the start (`DECIMAL(38,s)`, `BIGINT`) are an importer option for a
+  table whose types change often, not the default.
+- **Large batches of inserts as files** (owner, 2026-11-17): when a version brings more new rows to a
+  table than a threshold (about a row group or a target file size, configurable), the importer writes
+  them as Parquet itself -- `COPY (SELECT * EXCLUDE (change_type) FROM mssql_backup_table_changes(…)
+  WHERE change_type = 'insert' AND <key> NOT IN (the keys of the change set's deletes) ORDER BY <date or
+  key>) TO … (FORMAT parquet, PARTITION_BY (…))`, streamed and parallel: the true inserts only -- a key
+  the change set does not also delete --, never `_insertions`, which holds the updates' new rows too.
+  Every replacement goes through `MERGE`, both shapes of one: an `update_preimage` / `update_postimage`
+  pair, and a delete and an insert of one key in one change set (above; a heap row the server moved, a
+  row deleted and inserted again); the importer classifies the change set by key before it splits it
+  (review of #575: a replacement in both would land twice) -- and registers
+  them with `ducklake_add_data_files`, in the version's one transaction with its DDL, `MERGE` and
+  `DELETE`; fewer rows go in as INSERT. The natural path for `accumulate` / `retain` tables (mostly inserts), and for a
+  `mirror` table's first import or reload. Files sorted and partitioned this way keep DuckLake's
+  min/max narrow and need little merging. Open, for the mssql-ducklake prototype: `add_data_files`
+  in one transaction with DELETE / MERGE / ALTER; with a partitioned table (the files' partition values
+  matching the table's); the files' schema against the table's after that transaction's DDL; who owns
+  the files once added (expiry, drop); `rowid`s of the added rows for later MERGEs.
+- **Two imports into one lake**: an ATTACH per mode, split by `table_filter` and its complement
+  `table_exclude` (schema_exclude / table_exclude, to come for TYPE mssql and mssql_backup alike); the
+  mode is the importer's, per import or per table, never an ATTACH option.
+
+**Affects** mssql-ducklake 022-024 (the modes, per table; the schema-evolution rules), 085 PR 4c-3 (the
+two events), the exclude filters (their own PR).
 
 ## Settled during the consistency pass (no question)
 

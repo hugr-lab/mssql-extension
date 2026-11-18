@@ -265,6 +265,35 @@ from what `RESTORE` makes of it by replaying the log tail.
 The oracle lane restores every fixture backup of SQL Server 2017 to 2025 and compares each table's
 rows with `mssql_backup_scan`'s, both ways, through `TYPE mssql`.
 
+## A differential over its full
+
+A differential backup holds only the pages that changed since its full backup, so it is read over
+that full: `diff :=` names it.
+
+```sql
+SELECT count(*) FROM mssql_backup_scan('/backups/sales_full.bak', 'dbo', 'orders',
+                                       diff := '/backups/sales_diff_1500.bak');
+SELECT table_name, row_count FROM mssql_backup_tables('/backups/sales_full.bak',
+                                                      diff := '/backups/sales_diff_1500.bak');
+ATTACH '/backups/sales_full.bak' AS b (TYPE mssql_backup, diff '/backups/sales_diff_1500.bak');
+```
+
+For a differential taken while the database had no writes at all, from its start to its end, the
+result is what `RESTORE`
+of the full `WITH NORECOVERY`, then of the differential `WITH RECOVERY`, gives: rows changed, added and
+deleted since the full, tables created, dropped and truncated, columns added and dropped. Taken under
+writes, it is the data pages as the differential stored them: `RESTORE … WITH RECOVERY` also replays the
+backup's log tail and rolls back what was uncommitted, which this reader does not (yet), so the two may
+differ there, as for a full taken under writes (above). A differential is cumulative since its
+full, so a day of hourly differentials needs no chain: the state at 15:00 is the full plus the 15:00
+differential alone. Every function takes `diff :=` but `mssql_backup_info`, which describes one backup.
+
+It must be that full's differential: the full named is the one the differential names as its base,
+and a copy-only full never is (with a full F, a copy-only C after it and a differential D, D goes over F:
+`diff :=` beside C is refused, naming F's backup set). A differential over another backup set, of
+another database, a full or a log given as `diff :=`, and a differential given as the path are refused,
+each naming the files.
+
 ## Attaching a backup
 
 A full backup can be attached as a read-only catalog, its schemas and user tables DuckDB entries:
@@ -290,13 +319,14 @@ It is always read-only, whatever the options say: `CREATE`, `INSERT`, `UPDATE`, 
 | `table_filter` | A regex: only the tables and views it matches |
 | `schema_exclude` | A regex: the schemas it matches are left out |
 | `table_exclude` | A regex: the tables and views it matches are left out |
+| `diff` | A differential backup to read over the attached full ([above](#a-differential-over-its-full)) |
 
 The filters work as `TYPE mssql`'s. An object is kept when it passes the filter -- it matches it, or
 no filter is given -- and does not match the exclusion, so an exclusion alone keeps everything else:
 
 ```sql
-ATTACH '/backups/sales_full.bak' AS bk (TYPE mssql_backup, schema_filter '^sales$',
-                                        table_exclude '^(audit_log|staging_.*)$');
+ATTACH '/backups/sales_full.bak' AS sales (TYPE mssql_backup, schema_filter '^sales$',
+                                           table_exclude '^(audit_log|staging_.*)$');
 ```
 
 The `ATTACH` still reads the backup's headers, page index and system tables whole; what the filters

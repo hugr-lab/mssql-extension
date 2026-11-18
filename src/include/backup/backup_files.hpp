@@ -57,6 +57,8 @@ struct FileBinding {
 	uint64_t backup = 0;
 	const StatementFiles *files = nullptr;
 	std::vector<size_t> file_of;
+	//! Task 24: a differential's binding names its full's too, so one BindFiles binds both.
+	const FileBinding *also = nullptr;
 };
 
 //! Binds `binding` to this thread for the scope's life: a BoundFile of its backup read on the thread

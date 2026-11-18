@@ -774,6 +774,14 @@ void PageIndex::FallBack(size_t i) const {
 }
 
 bool PageIndex::Locate(uint16_t file, uint32_t page, PageLocation &location, bool expected) const {
+	if (base_) {
+		// A differential's passes are mapped by their headers: what they lack is the base's.
+		return LocateOnce(file, page, location) || base_->Locate(file, page, location, expected);
+	}
+	return LocateOwn(file, page, location, expected);
+}
+
+bool PageIndex::LocateOwn(uint16_t file, uint32_t page, PageLocation &location, bool expected) const {
 	if (LocateOnce(file, page, location)) {
 		return true;
 	}
@@ -855,7 +863,10 @@ bool PageIndex::LocateOnce(uint16_t file, uint32_t page, PageLocation &location)
 
 bool PageIndex::ReadPage(uint16_t file, uint32_t page, std::vector<uint8_t> &out, bool expected) const {
 	PageLocation at;
-	if (!Locate(file, page, at, expected)) {
+	if (base_ && !LocateOnce(file, page, at)) {
+		return base_->ReadPage(file, page, out, expected);
+	}
+	if (!base_ && !Locate(file, page, at, expected)) {
 		return false;
 	}
 	out.resize(PAGE_SIZE);
