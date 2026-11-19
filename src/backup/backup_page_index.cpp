@@ -1047,7 +1047,8 @@ void PageIndex::FallBack(size_t i) const {
 
 bool PageIndex::Locate(uint16_t file, uint32_t page, PageLocation &location, bool expected) const {
 	if (base_) {
-		// A differential's passes are mapped by their headers: what they lack is the base's.
+		// A differential's passes (its pass 1 ranked from its DCM, the others by their headers): what they lack is
+		// the base's.
 		return LocateOnce(file, page, location) || base_->Locate(file, page, location, expected);
 	}
 	return LocateOwn(file, page, location, expected);
@@ -1271,10 +1272,12 @@ static void AddFamilyPasses(const FamilyStream &family_stream, uint32_t family, 
 			// searched instead.
 			mapped = BuildRankedPassMap(stream, data->data_offset, data->length, pass.map);
 		}
-		if (this_number == 0 && !options.full_backup && single_family && !family_stream.container) {
-			// A differential's pass 1, one plain family: from its own allocation and DCM pages, ranked as a
-			// full's (DQ-41 revisited: a large differential is not read through to map it; its "absent" as
-			// sure as the full's ranks, checked the same way); a rank that fails maps it by its headers.
+		if (this_number == 0 && !options.full_backup && single_family) {
+			// A differential's pass 1, one family: from its own allocation and DCM pages, ranked as a full's
+			// (DQ-41 revisited: a large differential is not read through to map it; its "absent" as sure as the
+			// full's ranks, checked the same way); a rank that fails maps it by its headers. A compressed one's
+			// groups are read through its container's stream (the chain walked from known blocks, only the
+			// groups read decoded), so it is not decoded whole to be mapped.
 			mapped = BuildRankedPassMap(stream, data->data_offset, data->length, pass.map, nullptr, true);
 		}
 		if (!mapped && first_of_full) {

@@ -1105,6 +1105,9 @@ struct ChangeItem {
 	PagePointer page;
 	uint16_t slot = 0;
 	ChangeKind kind = ChangeKind::Insert;
+	//! Its page's place among the collection's pages (ChangeCollector's work list, in page order): where a row
+	//! that moved is returned from once paired (PlacedChanges).
+	uint64_t work = 0;
 };
 
 //! One state's side of the comparison: the table, read as the scan reads it (BuildPartition, RowId).
@@ -1597,16 +1600,43 @@ struct LoneRow {
 	std::vector<ValueDigest> values;
 };
 
+//! DuckDB's radix partitions, a partition's allocator released once it is taken (the allocators are shared by
+//! every task's partitions, so moving a collection out frees none of its blocks).
+class ReleasablePartitions : public RadixPartitionedColumnData {
+public:
+	ReleasablePartitions(ClientContext &context, vector<LogicalType> types, idx_t radix_bits)
+		: RadixPartitionedColumnData(context, std::move(types), radix_bits, 0) {}
+	void Release(idx_t i) {
+		if (i < partitions.size()) {
+			partitions[i].reset();
+		}
+		if (i < allocators->allocators.size()) {
+			allocators->allocators[i].reset();
+		}
+	}
+};
+
 //! The rows left unpaired, every unit's, in partitions by a hash of _mssql_rid: DuckDB's own partitioned
 //! collections (its hash join's), in buffers DuckDB evicts to its temp_directory past memory_limit. The
 //! pairing takes one partition at a time.
 class LoneRows {
 public:
 	LoneRows(ClientContext &context, idx_t radix_bits, CollectMemory &memory)
-		: radix_bits_(radix_bits), data_(make_uniq<PartitionData>(context, Types(), radix_bits)), memory_(memory) {}
+		: radix_bits_(radix_bits),
+		  data_(make_uniq<ReleasablePartitions>(context, Types(), radix_bits)),
+		  memory_(memory) {}
 
 	idx_t Partitions() const {
 		return RadixPartitioning::NumberOfPartitions(radix_bits_);
+	}
+
+	//! The rows held, every partition's (once every unit is handed in).
+	uint64_t Count() {
+		uint64_t count = 0;
+		for (auto &part : data_->GetPartitions()) {
+			count += part ? part->Count() : 0;
+		}
+		return count;
 	}
 
 	//! A task's own partitions, appended to over its units and put with the others' when it is done (so
@@ -1644,6 +1674,7 @@ public:
 			auto &masked_valid = FlatVector::ValidityMutable(chunk.data[8]);
 			auto *touches = FlatVector::GetDataMutable<bool>(chunk.data[9]);
 			auto *values = FlatVector::GetDataMutable<string_t>(chunk.data[10]);
+			auto *work = FlatVector::GetDataMutable<uint64_t>(chunk.data[11]);
 			for (idx_t k = 0; k < count; k++) {
 				const LoneRow &r = rows[from + k];
 				hash[k] = Hash(r.rid.data(), r.rid.size());
@@ -1669,6 +1700,7 @@ public:
 					encoded.append(reinterpret_cast<const char *>(&v.length), sizeof(v.length));
 				}
 				values[k] = StringVector::AddStringOrBlob(chunk.data[10], encoded);
+				work[k] = r.item.work;
 			}
 			chunk.SetChildCardinality(count);
 			appender.data->Append(*appender.state, chunk);
@@ -1712,8 +1744,10 @@ public:
 			const auto &masked_valid = FlatVector::Validity(chunk.data[8]);
 			const auto *touches = FlatVector::GetData<bool>(chunk.data[9]);
 			const auto *values = FlatVector::GetData<string_t>(chunk.data[10]);
+			const auto *work = FlatVector::GetData<uint64_t>(chunk.data[11]);
 			for (idx_t k = 0; k < chunk.size(); k++) {
 				LoneRow r;
+				r.item.work = work[k];
 				r.rid = rid[k].GetString();
 				r.item.old_side = old_side[k];
 				r.item.partition = partition[k];
@@ -1749,32 +1783,154 @@ private:
 	static vector<LogicalType> Types() {
 		return {LogicalType::HASH,		LogicalType::BLOB,	   LogicalType::BOOLEAN,   LogicalType::UBIGINT,
 				LogicalType::USMALLINT, LogicalType::UINTEGER, LogicalType::USMALLINT, LogicalType::BLOB,
-				LogicalType::BLOB,		LogicalType::BOOLEAN,  LogicalType::BLOB};
+				LogicalType::BLOB,		LogicalType::BOOLEAN,  LogicalType::BLOB,	   LogicalType::UBIGINT};
 	}
 
-	//! DuckDB's radix partitions, a partition's allocator released once it is paired (the allocators are
-	//! shared by every task's partitions, so moving a collection out frees none of its blocks).
-	class PartitionData : public RadixPartitionedColumnData {
-	public:
-		PartitionData(ClientContext &context, vector<LogicalType> types, idx_t radix_bits)
-			: RadixPartitionedColumnData(context, std::move(types), radix_bits, 0) {}
-		void Release(idx_t i) {
-			if (i < partitions.size()) {
-				partitions[i].reset();
+	idx_t radix_bits_;
+	unique_ptr<ReleasablePartitions> data_;
+	CollectMemory &memory_;
+};
+
+//! The rows that moved, once paired, in partitions by their page's place (ChangeItem::work, in the work list's
+//! page order: a partition is a run of pages), DuckDB's partitioned collections again, evicted to its
+//! temp_directory past memory_limit. Returned a partition at a time, sorted by place (KeepListed), so a page is
+//! read once for its rows: in the pairing's partitions (by rid) every page holding a moved row was read again
+//! for each of them (a rebuild's 16 times; in a compressed differential its block decoded again).
+class PlacedChanges {
+public:
+	PlacedChanges(ClientContext &context, idx_t radix_bits, uint64_t works, CollectMemory &memory)
+		: radix_bits_(radix_bits),
+		  works_(std::max<uint64_t>(works, 1)),
+		  data_(make_uniq<ReleasablePartitions>(context, Types(), radix_bits)),
+		  memory_(memory) {
+		appending_ = data_->CreateShared();
+		state_ = make_uniq<PartitionedColumnDataAppendState>();
+		appending_->InitializeAppendState(*state_);
+		chunk_.Initialize(Allocator::DefaultAllocator(), Types());
+	}
+
+	idx_t Partitions() const {
+		return RadixPartitioning::NumberOfPartitions(radix_bits_);
+	}
+
+	//! Paired items, from one task (the pairing's). (Items a unit pairs on its own pages are returned with the
+	//! unit's and never come here: their `work` is not set.)
+	void Append(const std::vector<ChangeItem> &items) {
+		const uint64_t partitions = Partitions();
+		const idx_t shift = RadixPartitioning::Shift(radix_bits_);
+		for (size_t from = 0; from < items.size(); from += STANDARD_VECTOR_SIZE) {
+			const idx_t count = std::min<idx_t>(STANDARD_VECTOR_SIZE, items.size() - from);
+			chunk_.Reset();
+			auto *hash = FlatVector::GetDataMutable<hash_t>(chunk_.data[0]);
+			auto *old_side = FlatVector::GetDataMutable<bool>(chunk_.data[1]);
+			auto *partition = FlatVector::GetDataMutable<uint64_t>(chunk_.data[2]);
+			auto *file = FlatVector::GetDataMutable<uint16_t>(chunk_.data[3]);
+			auto *page = FlatVector::GetDataMutable<uint32_t>(chunk_.data[4]);
+			auto *slot = FlatVector::GetDataMutable<uint16_t>(chunk_.data[5]);
+			auto *kind = FlatVector::GetDataMutable<uint8_t>(chunk_.data[6]);
+			auto *work = FlatVector::GetDataMutable<uint64_t>(chunk_.data[7]);
+			for (idx_t k = 0; k < count; k++) {
+				const ChangeItem &item = items[from + k];
+				// The partition is the hash's radix bits: a run of the work list each.
+				const uint64_t at = std::min<uint64_t>(partitions - 1, item.work * partitions / works_);
+				hash[k] = static_cast<hash_t>(at) << shift;
+				old_side[k] = item.old_side;
+				partition[k] = item.partition;
+				file[k] = item.page.file;
+				page[k] = item.page.page;
+				slot[k] = item.slot;
+				kind[k] = static_cast<uint8_t>(item.kind);
+				work[k] = item.work;
 			}
-			if (i < allocators->allocators.size()) {
-				allocators->allocators[i].reset();
+			chunk_.SetChildCardinality(count);
+			appending_->Append(*state_, chunk_);
+		}
+	}
+
+	//! Every item appended.
+	void Finish() {
+		appending_->FlushAppendState(*state_);
+		data_->Combine(*appending_);
+		state_.reset();	 // its pinned blocks, every partition's
+		appending_.reset();
+		chunk_.Reset();	 // reused for the scans
+	}
+
+	//! The next items, at most `most`, a partition at a time: a partition larger than that (its moved rows on few
+	//! pages) in pieces, each its own list (its pages read once a piece). `bytes` what they hold out of DuckDB's
+	//! buffers, reserved as they are built; false when every partition is returned.
+	bool TakeNext(size_t most, std::vector<ChangeItem> &items, uint64_t &bytes) {
+		items.clear();
+		bytes = 0;
+		auto &partitions = data_->GetPartitions();
+		while (items.size() < most) {
+			if (!current_) {
+				if (next_ >= partitions.size()) {
+					break;
+				}
+				current_index_ = next_++;
+				current_ = std::move(partitions[current_index_]);
+				if (!current_) {
+					continue;
+				}
+				current_->InitializeScan(scan_);
+			}
+			if (!current_->Scan(scan_, chunk_)) {
+				current_.reset();
+				data_->Release(current_index_);
+				if (!items.empty()) {
+					break;	// a list of one partition
+				}
+				continue;
+			}
+			const uint64_t more = chunk_.size() * sizeof(ChangeItem);
+			memory_.Add(more);
+			bytes += more;
+			const auto *old_side = FlatVector::GetData<bool>(chunk_.data[1]);
+			const auto *partition = FlatVector::GetData<uint64_t>(chunk_.data[2]);
+			const auto *file = FlatVector::GetData<uint16_t>(chunk_.data[3]);
+			const auto *page = FlatVector::GetData<uint32_t>(chunk_.data[4]);
+			const auto *slot = FlatVector::GetData<uint16_t>(chunk_.data[5]);
+			const auto *kind = FlatVector::GetData<uint8_t>(chunk_.data[6]);
+			const auto *work = FlatVector::GetData<uint64_t>(chunk_.data[7]);
+			for (idx_t k = 0; k < chunk_.size(); k++) {
+				ChangeItem item;
+				item.old_side = old_side[k];
+				item.partition = partition[k];
+				item.page.file = file[k];
+				item.page.page = page[k];
+				item.slot = slot[k];
+				item.kind = static_cast<ChangeKind>(kind[k]);
+				item.work = work[k];
+				items.push_back(item);
 			}
 		}
-	};
+		return !items.empty();
+	}
+
+private:
+	static vector<LogicalType> Types() {
+		return {LogicalType::HASH,	   LogicalType::BOOLEAN,   LogicalType::UBIGINT,  LogicalType::USMALLINT,
+				LogicalType::UINTEGER, LogicalType::USMALLINT, LogicalType::UTINYINT, LogicalType::UBIGINT};
+	}
 
 	idx_t radix_bits_;
-	unique_ptr<PartitionData> data_;
+	uint64_t works_;
+	unique_ptr<ReleasablePartitions> data_;
+	unique_ptr<PartitionedColumnData> appending_;  // the pairing's own partitions, put in data_ at Finish
+	unique_ptr<PartitionedColumnDataAppendState> state_;
+	DataChunk chunk_;  // appended from, then scanned into
+	// The partition being returned (TakeNext).
+	unique_ptr<ColumnDataCollection> current_;
+	ColumnDataScanState scan_;
+	idx_t current_index_ = 0;
+	idx_t next_ = 0;
 	CollectMemory &memory_;
 };
 
 //! What a task found on a unit's pages.
 struct CollectTask {
+	size_t work = 0;  // the page of the work list it reads
 	std::vector<ChangeItem> items;
 	std::vector<LoneRow> lone;	  // the rows left unpaired on a unit's pages
 	LoneRows::Appender appender;  // all its units' rows left unpaired
@@ -1894,6 +2050,7 @@ public:
 		}
 		const size_t from = unit * UNIT_PAGES;
 		for (size_t i = from; i < std::min(work_.size(), from + UNIT_PAGES); i++) {
+			task.work = i;
 			Work(task, i);
 		}
 	}
@@ -1958,6 +2115,41 @@ public:
 		}
 		memory_.Release(held);
 		return items;
+	}
+
+	//! Every partition of the rows left unpaired paired, into partitions by place (PlacedChanges), once every
+	//! unit is handed in: the pairing's task. Partitions enough that one is at most a 32nd of memory_limit
+	//! (an item a row at most: a moved row's two versions are one item or none), and no more than an eighth of
+	//! it holds the chunks of while they are added to (a block each).
+	void PlaceAll(ClientContext &context) {
+		auto &buffers = BufferManager::GetBufferManager(context);
+		const uint64_t limit = buffers.GetMaxMemory();
+		const uint64_t most = (lone_ ? lone_->Count() : 0) * sizeof(ChangeItem);
+		idx_t bits = 0;
+		while (bits < RadixPartitioning::MAX_RADIX_BITS && (most >> bits) > limit / 32 &&
+			   (uint64_t(2) << bits) * buffers.GetBlockAllocSize() <= limit / 8) {
+			bits++;
+		}
+		placed_ = make_uniq<PlacedChanges>(context, bits, work_.size(), memory_);
+		for (idx_t i = 0; i < LonePartitions(); i++) {
+			if (context.IsInterrupted()) {
+				throw InterruptException();
+			}
+			placed_->Append(PairPartition(i));
+		}
+		placed_->Finish();
+	}
+
+	//! The next list of the paired rows (PlaceAll): at most a 32nd of memory_limit, held (`bytes`) until
+	//! ReleaseItems; false when none is left.
+	bool TakePlaced(ClientContext &context, std::vector<ChangeItem> &items, uint64_t &bytes) {
+		const uint64_t limit = BufferManager::GetBufferManager(context).GetMaxMemory();
+		const size_t most =
+			static_cast<size_t>(std::max<uint64_t>(STANDARD_VECTOR_SIZE, limit / 32 / sizeof(ChangeItem)));
+		return placed_ && placed_->TakeNext(most, items, bytes);
+	}
+	void ReleaseItems(uint64_t bytes) {
+		memory_.Release(bytes);
 	}
 
 private:
@@ -2046,6 +2238,7 @@ private:
 		r.item.partition = partition;
 		r.item.page = page;
 		r.item.slot = row.slot;
+		r.item.work = task.work;
 		r.rid = row.rid;
 		r.record = task.hash.Of(row.bytes);
 		r.has_masked = !row.masked.empty();
@@ -2207,6 +2400,7 @@ private:
 	bool off_row_table_ = false;
 	std::vector<CollectWork> work_;
 	std::unique_ptr<LoneRows> lone_;
+	std::unique_ptr<PlacedChanges> placed_;
 	std::atomic<size_t> active_{0};
 	std::atomic<bool> paired_{false};
 };
@@ -2239,7 +2433,9 @@ struct TableChangesLocal : public LocalTableFunctionState {
 	idx_t batch = 0;
 	bool entered = false, done = false;	 // claimed units (Enter), and found none left (Leave)
 	bool pairing = false;				 // the last to leave: it pairs what every unit left
-	idx_t pair_next = 0;				 // the next partition of them
+	bool placed = false;				 // its rows paired into partitions by place (PlaceAll)
+	idx_t place_next = 0;				 // the lists of them returned (each its own batch index)
+	uint64_t held_items = 0;			 // the bytes of the partition it returns (TakePlaced)
 	std::unique_ptr<RecordStager> new_stager, old_stager;
 	LobPageFetch new_fetch, old_fetch;
 	DataChunk old_values;  // the older state's columns, before their cast to the newer state's types
@@ -2380,11 +2576,20 @@ unique_ptr<GlobalTableFunctionState> TableChangesInit(ClientContext &context, Ta
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", data.function, e.what());
 	}
-	state->max_threads = std::max<idx_t>(1, context.db->NumberOfThreads());	 // DuckDB's `threads`
+	auto &buffers = BufferManager::GetBufferManager(context);
+	// DuckDB's `threads`, but no more tasks than a quarter of memory_limit holds the buffers of: each task adds
+	// the rows it leaves unpaired to every partition of them through a chunk it keeps (a block of their values
+	// and one of their strings each), and the smaller memory_limit, the more partitions (measured: 16 tasks of
+	// 64 partitions under 256 MB were out of memory at once; DuckDB's own operators bound their threads alike).
+	const uint64_t per_task = state->collector->LonePartitions() * 2 * buffers.GetBlockAllocSize();
+	idx_t tasks = std::max<idx_t>(1, context.db->NumberOfThreads());
+	if (per_task > 0) {
+		tasks = std::max<idx_t>(1, std::min<idx_t>(tasks, buffers.GetMaxMemory() / 4 / per_task));
+	}
+	state->max_threads = tasks;
 	// A chunk's reservation, as the scan's (Init): the stager's fixed part and twice a row's variable
 	// values plus a rid, for a vector of the widest rows, or CHUNK_RESERVATION_BYTES with the chunk
 	// closing on what it staged; never past the budget unless one row is.
-	auto &buffers = BufferManager::GetBufferManager(context);
 	const uint64_t budget = buffers.GetMaxMemory() / 2;
 	state->virtual_row = sizeof(std::string) + 1 + 1700 + 4;
 	auto size_side = [&](int side, const CatalogTable &table, const std::vector<int32_t> &staged, uint64_t copies) {
@@ -2435,23 +2640,29 @@ void KeepListed(const TableChangesBindData &data, std::vector<ChangeItem> &items
 }
 
 //! The next changes to return, into local.queue: the rest of its unit, then a newly claimed unit's, then
-//! (for the last task to find none left) the pairing's, a partition at a time. False when none are left.
+//! (for the last task to find none left) the pairing's, paired into partitions by place and returned one at a time.
+//! False when none are left.
 bool NextChanges(ClientContext &context, const TableChangesBindData &data, TableChangesState &global,
 				 TableChangesLocal &local) {
 	while (local.pos >= local.queue.size()) {
 		local.queue.clear();
 		local.pos = 0;
 		if (local.pairing) {
-			if (local.pair_next >= global.collector->LonePartitions()) {
-				local.pairing = false;
-				return false;
+			global.collector->ReleaseItems(local.held_items);
+			local.held_items = 0;
+			if (!local.placed) {
+				global.collector->PlaceAll(context);
+				local.placed = true;
 			}
 			if (context.IsInterrupted()) {
 				throw InterruptException();
 			}
-			local.queue = global.collector->PairPartition(local.pair_next);
-			local.batch = global.collector->Units() + local.pair_next;
-			local.pair_next++;
+			if (!global.collector->TakePlaced(context, local.queue, local.held_items)) {
+				local.pairing = false;
+				return false;
+			}
+			local.batch = global.collector->Units() + local.place_next;
+			local.place_next++;
 			KeepListed(data, local.queue);
 			continue;
 		}

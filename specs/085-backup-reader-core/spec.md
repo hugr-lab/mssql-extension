@@ -200,7 +200,8 @@ a type whose conversion is still to come is read as its stored bytes (below).
     needs them (D4a's allocation tier). Pass 2 is indexed from its page headers, one per 8-unit group;
     a differential's pass 1 of one plain family from its own GAM and DCM pages, as a full's (DQ-41
     revisited, 2026-11-19: the extents its DCM marks that are allocated or hold an allocation page,
-    within the file's size -- 15 of 15 differentials), its striped or compressed forms from their
+    within the file's size -- 15 of 15 differentials), a compressed one's through its container's stream
+    (the chain walked from known blocks, only the groups read decoded), its striped forms from their
     headers. The rule is checked where the reader reads a group, never trusted blindly; for a
     differential also where the database changed while the backup ran (`CheckDifferentialRanks`: the
     extents a later pass copies again, and those whose GAM / DCM bit moved between pass 1's copy and the
@@ -668,7 +669,7 @@ flowchart BT
      search, DQ-41); a striped set's passes searched (DQ-41), their samples growing as pages are
      located; pass 2 from its page headers, one read per 8-unit group, in parallel ranges (D3a; I/O
      plus decompression); a differential's pass 1 of one plain family from its GAM and DCM pages
-     (DQ-41 revisited), a striped or compressed one from its headers.
+     (DQ-41 revisited; a compressed one's through its container's stream), a striped one from its headers.
   3. *allocation* (D4a): per data file `Size` and the GAM bits, kept; PFS pages on demand; the DCM /
      BCM bitmaps only for `verify` and spec 089.
   4. *catalog*: the decoded base tables (through their IAM chains) and the derived model. Stages 1–4
@@ -1702,7 +1703,7 @@ cost.
   each into a verified row; until a version passes, it is refused (D14).
 - **The open pass**: a backup opens from its allocation and catalog pages (E12, DQ-40), found in a
   striped or compressed pass by search (DQ-41). What stays read whole is pass 2 (small in the
-  samples; a pass 2 of terabytes was not seen), a striped or compressed differential's pass (a plain
+  samples; a pass 2 of terabytes was not seen), a striped differential's pass (a plain or compressed
   one's is ranked from its DCM: DQ-41 revisited), and any pass
   whose order breaks (none in 210, E13), which falls back to its header scan; the order and the
   64 KB block are 2025's until the version matrix checks them. A saved index is a later option

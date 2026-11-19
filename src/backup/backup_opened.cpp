@@ -338,7 +338,8 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 		pages->streams.push_back(s);
 	}
 	PageIndexOptions index_options;
-	// A differential's passes are mapped by their headers (D4a): small, and their order is not a full's.
+	// A differential's pass 1 is ranked from its own DCM (DQ-41 revisited), its later passes mapped by their
+	// headers (D4a).
 	index_options.full_backup = !options.base;
 	index_options.trust_layout = options.trust_layout;
 	index_options.mapper = BoundPassMapper();
