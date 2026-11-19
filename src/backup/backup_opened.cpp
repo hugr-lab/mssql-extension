@@ -338,8 +338,8 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 		pages->streams.push_back(s);
 	}
 	PageIndexOptions index_options;
-	// A differential's pass 1 is ranked from its own DCM (DQ-41 revisited), its later passes mapped by their
-	// headers (D4a).
+	// A differential's pass 1 is ranked from its own DCM (DQ-41 revisited) -- a striped one's searched, its
+	// extents the DCM set of its data files --, its later passes mapped by their headers (D4a).
 	index_options.full_backup = !options.base;
 	index_options.trust_layout = options.trust_layout;
 	index_options.mapper = BoundPassMapper();
@@ -356,6 +356,9 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 		}
 		(file.marked_removed ? marked_removed : data_files).push_back(static_cast<uint16_t>(file.file_id));
 	}
+	// By id, as a pass orders its extents.
+	index_options.data_files = data_files;
+	std::sort(index_options.data_files.begin(), index_options.data_files.end());
 	try {
 		pages->index = BuildPageIndex(pages->streams, index_options);
 		// D12: a page the differential does not carry is its full's; liveness is then the overlaid

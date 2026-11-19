@@ -269,6 +269,22 @@ struct FamilyStream {
 	const ContainerFamily *container = nullptr;
 };
 
+//! The extents a striped differential's pass 1 carries, across its families (DQ-41 revisited): per data file
+//! the extents its DCM pages mark that are allocated or hold an allocation page (AddInterval's rule), built
+//! from those pages wherever the families' searches find them. A family's search answers where an extent
+//! lies; this set, whether it is there at all.
+class DcmSet {
+public:
+	bool Contains(const ExtentId &extent) const;
+	uint64_t Count() const;
+	size_t MemoryBytes() const;
+
+private:
+	friend class StripedDcmBuilder;
+	std::vector<uint16_t> files_;
+	std::vector<ExtentBitmap> bitmaps_;
+};
+
 //! How BuildPageIndex maps a full backup's pass 1 and every other pass (D4a, DQ-41).
 struct PageIndexOptions {
 	//! A full backup: its pass 1 is ranked (one plain family, E12) or searched (a striped set, a
@@ -281,6 +297,8 @@ struct PageIndexOptions {
 	//! when empty. Kept by the index for a searched pass that gives up (FallBack, task 16c), so it
 	//! must live as long as the index -- as the families' streams must.
 	PassMapper mapper;
+	//! The backup's data files (SFIN), by id (a differential's: what a striped one's DCM set is built over).
+	std::vector<uint16_t> data_files;
 };
 
 //! One pass of the index: mapped (ranked or by headers) or searched.
@@ -300,8 +318,11 @@ struct IndexedPass {
 	std::unique_ptr<PassSearch> search;
 	bool by_block = false;	// the search's positions are a container's block offsets
 	//! A differential's pass 1 ranked from its GAM and DCM pages, not mapped by its headers (DQ-41
-	//! revisited); kept only when its later passes carry allocation pages' extents alone.
+	//! revisited), checked where the database changed while the backup ran (CheckDifferentialRanks).
 	bool from_dcm = false;
+	//! A striped differential's pass 1, searched: the extents its families carry together (StripedDcmBuilder),
+	//! shared by the families' passes. An extent the set lacks is in none of them, asked of no search.
+	std::shared_ptr<const DcmSet> dcm;
 	//! The search gave the pass up and `map` (its header scan) answers now. Set once, after the map
 	//! is built; the search stays alive for the readers still in it.
 	std::atomic<bool> fell_back{false};
@@ -372,6 +393,7 @@ public:
 
 private:
 	friend PageIndex BuildPageIndex(const std::vector<FamilyStream> &, const PageIndexOptions &);
+	friend class StripedDcmBuilder;
 	//! Pass `i`'s position of `extent` when it carries it: a group index, or under trust_layout a
 	//! container block's offset (`by_block`). A search that gives up maps the pass by its headers.
 	bool FindIn(size_t i, const ExtentId &extent, uint64_t &position, bool &by_block) const;

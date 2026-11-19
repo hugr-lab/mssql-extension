@@ -16,6 +16,7 @@
 #include "backup/backup_bytes.hpp"
 #include "backup/backup_mtf.hpp"
 #include "backup/backup_page_index.hpp"
+#include "backup/backup_pass_search.hpp"
 #include "mtf_builder.hpp"
 
 using namespace duckdb::mssql::backup;
@@ -824,6 +825,154 @@ int main() {
 		}
 		ComputedPass everywhere = later_pass(spread, &gam_then, &dcm_then);
 		Check(!check(right, everywhere, ranked, reads) && ranked, "written everywhere: its headers decide");
+	}
+	{
+		// A striped differential (StripedDcmBuilder): file 1 of 80 pages, GAM allocating 0..9, DCM marking 0, 1 (the
+		// boot page's), 3, 5, 8; family 1 carries 0, 1, 8 and family 2 carries 3 and 5, each then a pad.
+		Bytes header = FileHeader(1, 80), gam = Gam({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}), dcm = Dcm({0, 1, 3, 5, 8});
+		auto family_bytes = [&](const std::vector<uint32_t> &extents) {
+			std::vector<Unit> units;
+			for (uint32_t e : extents) {
+				if (e == 0) {
+					for (uint32_t k = 0; k < 8; k++) {
+						Unit u{'p', 1, k};
+						u.body = k == 0 ? &header : (k == 2 ? &gam : (k == 6 ? &dcm : nullptr));
+						units.push_back(u);
+					}
+				} else {
+					AddExtent(units, 1, e);
+				}
+			}
+			AddEmpty(units, 'P');
+			return Pass(units);
+		};
+		auto layout_of = [](const Bytes &b) {
+			MtfLayout layout;
+			MtfBlock block;
+			block.type = "MSDA";
+			MtfStream data;
+			data.id = "MQDA";
+			data.data_offset = 0;
+			data.length = b.size();
+			block.streams.push_back(data);
+			layout.blocks.push_back(block);
+			return layout;
+		};
+		auto index_of = [&](const Bytes &a, const Bytes &b, const MemoryAccess &fa, const MemoryAccess &fb,
+							const MtfLayout &la, const MtfLayout &lb) {
+			std::vector<FamilyStream> families(2);
+			families[0].stream = &fa;
+			families[0].layout = &la;
+			families[1].stream = &fb;
+			families[1].layout = &lb;
+			PageIndexOptions options;
+			options.full_backup = false;
+			options.data_files.push_back(1);
+			return BuildPageIndex(families, options);
+		};
+		Bytes a = family_bytes({0, 1, 8}), b = family_bytes({3, 5});
+		MemoryAccess fa("s1.bak", a.data(), a.size()), fb("s2.bak", b.data(), b.size());
+		MtfLayout la = layout_of(a), lb = layout_of(b);
+		auto index = index_of(a, b, fa, fb, la, lb);
+		PageLocation at;
+		Check(index.PassCount() == 2 && index.Pass(0).dcm && index.Pass(0).Searched() &&
+				  index.Pass(0).dcm->Count() == 5 && index.Pass(1).dcm == index.Pass(0).dcm,
+			  "a striped differential's pass 1: searched, its families' DCM set of 5 extents");
+		Check(index.Locate(1, 5 * 8 + 2, at) && at.family == 1 && index.Locate(1, 8 * 8, at) && at.family == 0,
+			  "a marked extent located in its family");
+		const uint64_t searched = index.Pass(0).search->Reads() + index.Pass(1).search->Reads();
+		Check(!index.Locate(1, 4 * 8, at) && !index.Locate(1, 2 * 8, at) &&
+				  index.Pass(0).search->Reads() + index.Pass(1).search->Reads() == searched,
+			  "an unmarked one (allocated) in none, answered by the set: no family searched");
+		// A family lacking a marked extent: the groups are fewer than the set; mapped by the headers.
+		Bytes b_short = family_bytes({3});
+		MemoryAccess fb_short("s2.bak", b_short.data(), b_short.size());
+		MtfLayout lb_short = layout_of(b_short);
+		auto fewer = index_of(a, b_short, fa, fb_short, la, lb_short);
+		Check(!fewer.Pass(0).dcm && !fewer.Pass(0).Searched() && fewer.Locate(1, 3 * 8, at) &&
+				  !fewer.Locate(1, 5 * 8, at),
+			  "a family lacking a marked extent: mapped by its headers");
+		// An unmarked extent in place of a marked one (as many groups): a sampled group names it; headers again.
+		Bytes b_swap = family_bytes({3, 4});
+		MemoryAccess fb_swap("s2.bak", b_swap.data(), b_swap.size());
+		MtfLayout lb_swap = layout_of(b_swap);
+		auto swapped = index_of(a, b_swap, fa, fb_swap, la, lb_swap);
+		Check(!swapped.Pass(0).dcm && swapped.Locate(1, 4 * 8, at) && at.family == 1,
+			  "an unmarked extent in a family: mapped by its headers, which find it");
+		// Under load: family 1's pass 2 copies again extent 3 (family 2's, written while the backup ran) and the
+		// interval's allocation pages; the set holds 3 and family 2 has it, so the set holds.
+		{
+			std::vector<Unit> later_units;
+			for (uint32_t k = 0; k < 8; k++) {
+				Unit u{'p', 1, k};
+				u.body = k == 0 ? &header : (k == 2 ? &gam : (k == 6 ? &dcm : nullptr));
+				later_units.push_back(u);
+			}
+			AddExtent(later_units, 1, 3);
+			Bytes second = Pass(later_units);
+			Bytes both = a;
+			both.insert(both.end(), second.begin(), second.end());
+			MemoryAccess fboth("s1.bak", both.data(), both.size());
+			MtfLayout two;
+			for (int pass = 0; pass < 2; pass++) {
+				MtfBlock block;
+				block.type = "MSDA";
+				MtfStream data;
+				data.id = "MQDA";
+				data.data_offset = pass == 0 ? 0 : a.size();
+				data.length = pass == 0 ? a.size() : second.size();
+				block.streams.push_back(data);
+				two.blocks.push_back(block);
+			}
+			auto loaded = index_of(both, b, fboth, fb, two, lb);
+			Check(loaded.PassCount() == 3 && loaded.Pass(0).dcm && loaded.Locate(1, 3 * 8, at) && at.pass == 1,
+				  "under load: the set checked where the backup changed and kept; extent 3's latest copy pass 2's");
+		}
+		// Three GAM intervals, the middle one unchanged (left out whole): family 1 carries 0, 1 and 127808, family
+		// 2 carries 3 and 127809.
+		{
+			const uint32_t size3 = 2 * 511232 + 64;
+			Bytes h3 = FileHeader(1, size3), g0 = Gam({0, 1, 2, 3}), d0 = Dcm({0, 1, 3}), g2 = Gam({0, 1}),
+				  d2 = Dcm({0, 1});
+			auto computed = [&](const std::vector<uint32_t> &extents) {
+				ComputedPass pass;
+				for (uint32_t e : extents) {
+					ExtentId x;
+					x.file = 1;
+					x.extent = e;
+					pass.groups.push_back(x);
+				}
+				pass.pad_groups = 1;
+				pass.bodies = {{{1, 0}, &h3}, {{1, 2}, &g0}, {{1, 6}, &d0}, {{1, 1022464}, &g2}, {{1, 1022470}, &d2}};
+				return pass;
+			};
+			ComputedPass p1 = computed({0, 1, 127808}), p2 = computed({3, 127809});
+			auto layout_computed = [](const ComputedPass &p) {
+				MtfLayout layout;
+				MtfBlock block;
+				block.type = "MSDA";
+				MtfStream data;
+				data.id = "MQDA";
+				data.data_offset = 0;
+				data.length = p.Size();
+				block.streams.push_back(data);
+				layout.blocks.push_back(block);
+				return layout;
+			};
+			MtfLayout l1 = layout_computed(p1), l2 = layout_computed(p2);
+			std::vector<FamilyStream> families(2);
+			families[0].stream = &p1;
+			families[0].layout = &l1;
+			families[1].stream = &p2;
+			families[1].layout = &l2;
+			PageIndexOptions options;
+			options.full_backup = false;
+			options.data_files.push_back(1);
+			auto three = BuildPageIndex(families, options);
+			Check(three.Pass(0).dcm && three.Pass(0).dcm->Count() == 5 && three.Locate(1, 127809 * 8, at) &&
+					  at.family == 1 && !three.Locate(1, 63904 * 8, at),
+				  "three intervals, the middle one left out: the set of 5, the last interval's extents found");
+		}
 	}
 	{
 		ExtentBitmap bm;
