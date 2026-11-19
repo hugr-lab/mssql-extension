@@ -1588,11 +1588,14 @@ before the next opens.
     tag), so a file touched, rewritten or moved is a new state, opened and checked, and a refresh heals
     it; snapshot_version / snapshot_time pin the chosen version by its backups (`Identity`), the latest
     with a WARNING when they are gone; one refresh at a time (`refresh_lock_`, across read and swap); a
-    transaction keeps the versions of its first read (`MSSQLBackupTransaction::versions`, DuckLake's
-    snapshot per transaction; the refreshing one takes the new ones); a file gone under a kept state is
-    refused by name. Tested by `test_backup_cache` over a folder that grows (a differential and a copy-only
+    version is resolved at bind to its key (its backups and files, `BackupAt::key`, `PinAttachedVersion`;
+    the default one too) and the plan carries and serializes it; the states a query read are held to its
+    end (`MSSQLBackupQueryStates`, a ClientContextState cleared at QueryBegin / QueryEnd, the anchors TYPE
+    mssql keeps); a transaction keeps nothing (owner, 2026-11-19: not DuckLake's snapshot per transaction
+    -- the next statement reads a refresh); a file gone under a kept state is refused by name, a pinned
+    version a refresh dropped while no query holds it too ("run the query again"). Tested by `test_backup_cache` over a folder that grows (a differential and a copy-only
     full added -- the differential renumbered, its state kept --, a pinned snapshot_version, a file touched
-    then healed by a refresh, a file renamed, a transaction across another connection's refresh).
+    then healed by a refresh, a file renamed, a query bound before another connection's refresh and read after it -- its version renumbered, or dropped --, a file function pinned at bind, a transaction's next statement after one).
 25. `s3://` (MinIO) and `https://` tests in the lane; measure the open pass and decide filter pushdown
     with late materialisation (a follow-up spec if it is worth it) — 2 d. Owner, 2026-11-11: the
     scan is to make filtering cheap enough for an importer that exports a table with a filter over

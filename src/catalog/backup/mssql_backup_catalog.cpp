@@ -148,37 +148,29 @@ std::shared_ptr<const MSSQLBackupCatalog::Versions> MSSQLBackupCatalog::CurrentV
 	return versions_;
 }
 
-//! The catalog's transaction in `context`'s, started when it is not (review of #579: a file function on the
-//! name does no catalog lookup, which is what starts it otherwise); none outside a transaction.
-static optional_ptr<MSSQLBackupTransaction> OwnTransaction(optional_ptr<ClientContext> context, Catalog &catalog) {
-	if (!context || !context->transaction.HasActiveTransaction()) {
-		return nullptr;
-	}
-	return &Transaction::Get(*context, catalog.GetAttached()).Cast<MSSQLBackupTransaction>();
+void MSSQLBackupQueryStates::QueryBegin(ClientContext &) {
+	// A lookup outside a query (TableInfo, an appender, the relation API) leaves nothing for the next one.
+	std::lock_guard<std::mutex> guard(lock);
+	states.clear();
 }
 
-std::shared_ptr<const MSSQLBackupCatalog::Versions> MSSQLBackupCatalog::VersionsFor(
-	optional_ptr<ClientContext> context) {
-	auto own = OwnTransaction(context, *this);
-	if (!own) {
-		return CurrentVersions();
-	}
-	std::lock_guard<std::mutex> guard(own->lock);
-	if (!own->versions) {
-		own->versions = CurrentVersions();
-	}
-	return own->versions;
+void MSSQLBackupQueryStates::QueryEnd(ClientContext &) {
+	std::lock_guard<std::mutex> guard(lock);
+	states.clear();
 }
 
-uint64_t MSSQLBackupCatalog::NumberOf(optional_ptr<ClientContext> context, const AttachedBackup &backup) {
-	const auto versions = VersionsFor(context);
-	const std::string key = StateKey(backup);
-	for (const auto &v : versions->history->versions) {
-		if (StateKey(*versions->history, v) == key) {
-			return v.number;
-		}
+MSSQLBackupQueryStates &MSSQLBackupQueryStates::For(ClientContext &context, const MSSQLBackupCatalog &catalog) {
+	// By the catalog's name: what it holds is dropped at the query's end whichever catalog it was.
+	return *context.registered_state->GetOrCreate<MSSQLBackupQueryStates>("mssql_backup_states:" + catalog.Name());
+}
+
+std::string MSSQLBackupCatalog::KeyOf(optional_ptr<ClientContext> context, const mssql::backup::BackupAt &at) {
+	if (!at.key.empty()) {
+		return at.key;
 	}
-	return 0;
+	const auto versions = CurrentVersions();
+	const auto number = Resolve(*versions, context, at);
+	return StateKey(*versions->history, versions->history->versions[number - 1]);
 }
 
 std::shared_ptr<MSSQLBackupCatalog::State> MSSQLBackupCatalog::DefaultState() const {
@@ -222,11 +214,12 @@ std::shared_ptr<MSSQLBackupCatalog::State> MSSQLBackupCatalog::StateOf(optional_
 	const auto &history = *versions.history;
 	const auto &entry = history.versions[version - 1];
 	const std::string key = StateKey(history, entry);
-	auto own = OwnTransaction(context, *this);
-	if (own) {
-		std::lock_guard<std::mutex> guard(own->lock);
-		auto it = own->states.find(key);
-		if (it != own->states.end()) {
+	optional_ptr<MSSQLBackupQueryStates> query;
+	if (context) {
+		query = &MSSQLBackupQueryStates::For(*context, *this);
+		std::lock_guard<std::mutex> guard(query->lock);
+		auto it = query->states.find(key);
+		if (it != query->states.end()) {
 			return it->second;
 		}
 	}
@@ -251,11 +244,11 @@ std::shared_ptr<MSSQLBackupCatalog::State> MSSQLBackupCatalog::StateOf(optional_
 		}
 		found = slot;
 	}
-	// The transaction keeps what it read, once (by key): a refresh meanwhile drops the state from the catalog
-	// only.
-	if (own) {
-		std::lock_guard<std::mutex> guard(own->lock);
-		own->states.emplace(key, found);
+	// The query keeps what it read, once (by key), to its end: a refresh meanwhile drops the state from the
+	// catalog only.
+	if (query) {
+		std::lock_guard<std::mutex> guard(query->lock);
+		query->states.emplace(key, found);
 	}
 	return found;
 }
@@ -270,8 +263,36 @@ uint64_t MSSQLBackupCatalog::Resolve(const Versions &versions, optional_ptr<Clie
 
 std::shared_ptr<const AttachedBackup> MSSQLBackupCatalog::BackupAt(optional_ptr<ClientContext> context,
 																   const mssql::backup::BackupAt &at) {
-	const auto versions = VersionsFor(context);
-	return StateOf(context, *versions, Resolve(*versions, context, at))->backup;
+	const auto versions = CurrentVersions();
+	if (at.key.empty()) {
+		return StateOf(context, *versions, Resolve(*versions, context, at))->backup;
+	}
+	// Pinned at bind: the version of that key, wherever it is now among the versions.
+	for (const auto &v : versions->history->versions) {
+		if (StateKey(*versions->history, v) == at.key) {
+			return StateOf(context, *versions, v.number)->backup;
+		}
+	}
+	// Dropped by a refresh since: still read while the query or the catalog holds its state.
+	if (context) {
+		auto &query = MSSQLBackupQueryStates::For(*context, *this);
+		std::lock_guard<std::mutex> guard(query.lock);
+		auto it = query.states.find(at.key);
+		if (it != query.states.end()) {
+			return it->second->backup;
+		}
+	}
+	{
+		std::lock_guard<std::mutex> guard(lock_);
+		auto it = states_.find(at.key);
+		if (it != states_.end()) {
+			return it->second->backup;
+		}
+	}
+	throw InvalidInputException(
+		"%s: the version this query was bound to is no longer among the backups' files "
+		"(a refresh dropped it): run the query again",
+		name_);
 }
 
 std::pair<uint64_t, uint64_t> MSSQLBackupCatalog::Refresh(ClientContext &context) {
@@ -304,14 +325,14 @@ std::pair<uint64_t, uint64_t> MSSQLBackupCatalog::Refresh(ClientContext &context
 		}
 	}
 	// The default version's entries now, so a lookup without AT never opens a backup under the swap -- put in
-	// the catalog's states with the versions it publishes: StateOf may answer from the refreshing transaction's
-	// own states without touching the catalog's (a version it read, dropped by another refresh, back since).
+	// the catalog's states with the versions it publishes: StateOf may answer from the refreshing query's own
+	// states without touching the catalog's (a version it read, dropped by another refresh, back since).
 	const auto default_state = StateOf(&context, *refreshed, refreshed->default_version);
 	const std::string default_key =
 		StateKey(*refreshed->history, refreshed->history->versions[refreshed->default_version - 1]);
 	{
-		// The states of versions the history no longer has go (a rolling archive's oldest files gone); a
-		// transaction that read one keeps it until it ends.
+		// The states of versions the history no longer has go (a rolling archive's oldest files gone); a query
+		// that read one keeps it to its end.
 		std::set<std::string> kept;
 		for (const auto &v : versions) {
 			kept.insert(StateKey(*refreshed->history, v));
@@ -326,14 +347,7 @@ std::pair<uint64_t, uint64_t> MSSQLBackupCatalog::Refresh(ClientContext &context
 			it = kept.count(it->first) ? std::next(it) : states_.erase(it);
 		}
 	}
-	// The refreshing transaction reads the new versions from here on; any other, from its next one.
-	auto transaction = context.transaction.HasActiveTransaction() ? Transaction::TryGet(context, GetAttached())
-																  : optional_ptr<Transaction>();
-	if (transaction) {
-		auto &own = transaction->Cast<MSSQLBackupTransaction>();
-		std::lock_guard<std::mutex> guard(own.lock);
-		own.versions = refreshed;
-	}
+	// Every query from the next one reads the new versions, in a transaction or not.
 	return {before->history->versions.size(), versions.size()};
 }
 
@@ -375,13 +389,13 @@ optional_ptr<SchemaCatalogEntry> MSSQLBackupCatalog::LookupSchema(CatalogTransac
 	// A version this catalog does not have is an error, never a miss, as DuckLake's: DuckDB asks a
 	// catalog named explicitly and one of the search path alike, and the error names what versions exist
 	// (a search path's catalog ahead of the one meant has the AT read against it too).
-	const auto versions = VersionsFor(transaction.context);
+	const auto versions = CurrentVersions();
 	mssql::backup::BackupAt chosen;
 	if (at) {
 		chosen.unit = at->Unit().GetIdentifierName();
 		chosen.value = at->GetValue();
 	}
-	// The entry returned lives on in the transaction's states (or the catalog's, with no transaction).
+	// The entry returned lives on in the query's states to its end.
 	const auto state = StateOf(transaction.context, *versions, Resolve(*versions, transaction.context, chosen));
 	auto found = FindByName(state->schemas, lookup.GetEntryName());
 	if (!found && if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
@@ -391,7 +405,7 @@ optional_ptr<SchemaCatalogEntry> MSSQLBackupCatalog::LookupSchema(CatalogTransac
 }
 
 void MSSQLBackupCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
-	const auto versions = VersionsFor(&context);
+	const auto versions = CurrentVersions();
 	const auto state = StateOf(&context, *versions, versions->default_version);
 	for (auto &s : state->schemas) {
 		callback(*s.second);
@@ -556,8 +570,8 @@ unique_ptr<BaseStatistics> MSSQLBackupTableEntry::GetStatistics(ClientContext &,
 
 TableFunction MSSQLBackupTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
 	const auto &backup = schema.Cast<MSSQLBackupSchemaEntry>().Backup();
-	return mssql::backup::AttachedScanFunction(context, *this, backup,
-											   catalog.Cast<MSSQLBackupCatalog>().NumberOf(&context, *backup),
+	// The version by its key: a plan run or deserialized after a refresh reads this one.
+	return mssql::backup::AttachedScanFunction(context, *this, backup, MSSQLBackupCatalog::StateKey(*backup),
 											   schema_name_, table_name_, bind_data);
 }
 
@@ -616,6 +630,18 @@ std::shared_ptr<const AttachedBackup> mssql::backup::FindAttachedBackup(ClientCo
 		return nullptr;
 	}
 	return catalog.Cast<MSSQLBackupCatalog>().BackupAt(context, at);
+}
+
+void mssql::backup::PinAttachedVersion(ClientContext &context, const std::string &name, BackupAt &at) {
+	auto db = DatabaseManager::Get(context).GetDatabase(Identifier(name));
+	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {
+		return;
+	}
+	auto &catalog = db->GetCatalog().Cast<MSSQLBackupCatalog>();
+	at.key = catalog.KeyOf(&context, at);
+	// Held by the query from its bind (MSSQLBackupQueryStates): a refresh dropping it before the init still
+	// leaves the query its version.
+	catalog.BackupAt(&context, at);
 }
 
 static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,

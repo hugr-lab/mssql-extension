@@ -357,77 +357,114 @@ int main() {
 		Check(ScalarInt(con, "SELECT versions FROM mssql_backup_refresh('hr')") == 3 &&
 				  ScalarInt(con, "SELECT count(*) FROM hr.items") == 2500,
 			  "a renamed differential read at its new path after a refresh");
-		// A transaction keeps the versions it read first; a refresh on another connection reaches its next one.
+		// A version is resolved when a query is bound, to its backups and files, and the query keeps them to its
+		// end; a transaction keeps no versions, so its next statement reads a refresh made meanwhile (owner,
+		// 2026-11-19).
 		{
 			Connection other(db);
-			con.Query("BEGIN");
-			Check(ScalarInt(con, "SELECT count(*) FROM hr.snapshots()") == 3, "a transaction reads 3 versions");
+			// Submitted, so bound and streaming, before the refresh; read after it.
+			auto streaming = con.Submit("SELECT id FROM hr.items AT (VERSION => 3)");
+			Check(!streaming->HasError(), "a query of version 3, the differential, bound");
 			std::filesystem::copy_file(DIR + "full_zstd.bak", dir / "a_copy_only_2.bak");
 			Check(ScalarInt(other, "SELECT versions FROM mssql_backup_refresh('hr')") == 4,
-				  "another connection refreshes: 4 versions");
-			Check(ScalarInt(con, "SELECT count(*) FROM hr.snapshots()") == 3 &&
-					  ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 3)") == 2500,
-				  "the open transaction still reads its 3 (version 3 the differential)");
-			// The file functions on the name too, which do no catalog lookup (review of #579).
-			Check(ScalarInt(con, "SELECT count(*) FROM mssql_backup_snapshots('hr')") == 3 &&
+				  "another connection refreshes: 4 versions, the differential now version 4");
+			int64_t streamed = 0;
+			while (!streaming->HasError()) {
+				auto chunk = streaming->Fetch();
+				if (!chunk || chunk->size() == 0) {
+					break;
+				}
+				streamed += static_cast<int64_t>(chunk->size());
+			}
+			Check(!streaming->HasError() && streamed == 2500,
+				  "the query bound before the refresh reads the version its bind named (" + std::to_string(streamed) +
+					  " items)");
+			streaming.reset();
+			Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 3)") == 2000 &&
 					  ScalarInt(con, "SELECT count(*) FROM mssql_backup_scan('hr', 'dbo', 'items', version := 3)") ==
-						  2500,
-				  "and so do mssql_backup_snapshots / mssql_backup_scan on its name");
-			Check(
-				ScalarInt(other, "SELECT count(*) FROM mssql_backup_scan('hr', 'dbo', 'items', version := 3)") == 2000,
-				"while the other connection's version 3 is the new copy-only full");
-			con.Query("COMMIT");
-			Check(ScalarInt(con, "SELECT count(*) FROM hr.snapshots()") == 4, "its next transaction reads 4");
-			// A transaction whose first read is a file function on the name (no catalog lookup starts it):
-			// pinned all the same (review of #579).
+						  2000,
+				  "the next query's version 3 is the new copy-only full, through the catalog and the file functions");
 			con.Query("BEGIN");
-			Check(ScalarInt(con, "SELECT count(*) FROM mssql_backup_snapshots('hr')") == 4,
-				  "a transaction opened by mssql_backup_snapshots reads 4");
+			Check(ScalarInt(con, "SELECT count(*) FROM hr.snapshots()") == 4, "a transaction reads 4 versions");
 			std::filesystem::copy_file(DIR + "stripe_1.bak", dir / "a_stripe_1.bak");
 			std::filesystem::copy_file(DIR + "stripe_2.bak", dir / "a_stripe_2.bak");
 			Check(ScalarInt(other, "SELECT versions FROM mssql_backup_refresh('hr')") == 5,
 				  "another connection refreshes: 5 versions (a striped full)");
-			Check(ScalarInt(con, "SELECT count(*) FROM mssql_backup_snapshots('hr')") == 4,
-				  "the transaction still reads its 4");
+			Check(ScalarInt(con, "SELECT count(*) FROM hr.snapshots()") == 5 &&
+					  ScalarInt(con, "SELECT count(*) FROM mssql_backup_snapshots('hr')") == 5,
+				  "the transaction's next statement reads 5");
 			con.Query("COMMIT");
-			// The states a transaction read are its own, by key (review of #579): read again, they are not
-			// added again; dropped from the catalog by a refresh on another connection (the file touched: a
-			// new state), they stay the transaction's, the same entries. Reading the touched file's rows is
-			// refused by name all the same.
-			con.Query("BEGIN");
-			Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000,
-				  "a transaction reads version 1, the full");
-			auto &attached = Catalog::GetCatalog(*con.context, "hr").GetAttached();
-			auto &own = Transaction::Get(*con.context, attached).Cast<MSSQLBackupTransaction>();
-			const size_t read = own.states.size();
-			std::set<const void *> held;
-			for (const auto &s : own.states) {
-				held.insert(s.second.get());
-			}
-			Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000 &&
-					  ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000 &&
-					  own.states.size() == read,
-				  "reading it again adds no state (" + std::to_string(read) + " held)");
+			// A file read before, touched and refreshed: the next query opens its version anew.
+			Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000, "version 1, the full");
 			std::filesystem::last_write_time(
 				dir / "a_full.bak", std::filesystem::last_write_time(dir / "a_full.bak") + std::chrono::seconds(20));
 			Check(ScalarInt(other, "SELECT versions FROM mssql_backup_refresh('hr')") == 5,
 				  "another connection refreshes past the touched full");
-			auto rows = con.Query("SELECT count(*) FROM hr.items AT (VERSION => 1)");
-			Check(rows->HasError() && rows->GetError().find("changed since it was attached") != std::string::npos,
-				  "the transaction's version 1, its file changed, refused by name");
-			bool same = own.states.size() == read;
-			for (const auto &s : own.states) {
-				same = same && held.count(s.second.get());
-			}
-			Check(same, "and the transaction holds the same states it read, none opened again");
-			con.Query("ROLLBACK");
 			Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000,
-				  "the next transaction reads the touched full as refreshed");
-			// The default version a transaction read, dropped from the catalog by another connection's refresh
-			// (its files gone) and back since, is the default again after the transaction's own refresh: the
-			// catalog holds its state (re-review of #579: the refresh found it among the transaction's states and
-			// left the catalog's without it, so a lookup with no AT -- the database size, the default schema --
-			// threw).
+				  "the next query reads the touched full as refreshed");
+			// A query bound on a version that a refresh then drops (its full touched: a new key) reads it to its
+			// end, its state held by the query.
+			auto held = con.Submit("SELECT id FROM hr.items AT (VERSION => 1)");
+			Check(!held->HasError(), "a query of version 1 bound");
+			std::filesystem::last_write_time(
+				dir / "a_full.bak", std::filesystem::last_write_time(dir / "a_full.bak") + std::chrono::seconds(20));
+			Check(ScalarInt(other, "SELECT versions FROM mssql_backup_refresh('hr')") == 5,
+				  "another connection refreshes: version 1's key dropped");
+			int64_t held_rows = 0;
+			while (!held->HasError()) {
+				auto chunk = held->Fetch();
+				if (!chunk || chunk->size() == 0) {
+					break;
+				}
+				held_rows += static_cast<int64_t>(chunk->size());
+			}
+			Check(!held->HasError() && held_rows == 2000, "the dropped version read to the query's end (" +
+															  std::to_string(held_rows) + " items)" +
+															  (held->HasError() ? held->GetError() : ""));
+			held.reset();
+			// A file function on the name pins its version at bind, by its key (PinAttachedVersion): what its init
+			// and a deserialized plan find the version by. The differential's number pinned, an earlier backup
+			// then gone (the numbers move down), the key still finds the differential.
+			const int64_t diff_number =
+				ScalarInt(con, "SELECT snapshot_id FROM hr.snapshots() WHERE backup_type = 'differential'");
+			BackupAt pinned;
+			pinned.unit = "version";
+			pinned.value = Value::BIGINT(diff_number);
+			PinAttachedVersion(context, "hr", pinned);
+			const auto diff_backup = FindAttachedBackup(context, "hr", pinned);
+			Check(!pinned.key.empty() && diff_backup && diff_backup->backup->Base(),
+				  "the differential's number pinned to its key");
+			std::filesystem::rename(dir / "a_copy_only.bak", dir / "a_copy_only.bak.away");
+			Check(ScalarInt(other, "SELECT versions FROM mssql_backup_refresh('hr')") == 4,
+				  "another connection refreshes without a copy-only full: 4 versions");
+			Check(ScalarInt(con, "SELECT snapshot_id FROM hr.snapshots() WHERE backup_type = 'differential'") ==
+					  diff_number - 1,
+				  "the differential is one lower now");
+			const auto again = FindAttachedBackup(context, "hr", pinned);
+			Check(again && again.get() == diff_backup.get(), "the pinned key finds the differential at its new number");
+			// A key no version has and no one holds: refused by name.
+			BackupAt gone = pinned;
+			gone.key += "/gone";
+			bool refused_gone = false;
+			try {
+				FindAttachedBackup(context, "hr", gone);
+			} catch (std::exception &e) {
+				refused_gone = std::string(e.what()).find("run the query again") != std::string::npos;
+			}
+			Check(refused_gone, "a pinned version no longer among the files refused by name");
+			// Two versions of one table in one query are two scans (their keys differ), not one merged.
+			Check(ScalarInt(con,
+							"SELECT count(*) FROM (SELECT id FROM hr.items AT (VERSION => 1) UNION ALL "
+							"SELECT id FROM hr.items AT (VERSION => " +
+								std::to_string(diff_number - 1) + "))") == 4500,
+				  "a UNION ALL of the full and the differential: 2000 + 2500");
+			std::filesystem::rename(dir / "a_copy_only.bak.away", dir / "a_copy_only.bak");
+			Check(ScalarInt(other, "SELECT versions FROM mssql_backup_refresh('hr')") == 5,
+				  "the full back: 5 versions");
+			// The default version read, dropped from the catalog by another connection's refresh (its files gone)
+			// and back since, is the default again after a refresh: the catalog holds its state (re-review of
+			// #579: the refresh found it among the refreshing side's own states and left the catalog's without it,
+			// so a lookup with no AT -- the database size, the default schema -- threw).
 			con.Query("BEGIN");
 			const int64_t default_rows = ScalarInt(con, "SELECT count(*) FROM hr.items");
 			auto files = con.Query(
