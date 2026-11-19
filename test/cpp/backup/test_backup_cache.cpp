@@ -50,6 +50,18 @@ uint64_t Fetches(const OpenedCatalog &catalog) {
 	return n;
 }
 
+//! `text` inside a SQL string literal: every apostrophe doubled.
+std::string InLiteral(const std::string &text) {
+	std::string out;
+	for (const char ch : text) {
+		out += ch;
+		if (ch == '\'') {
+			out += ch;
+		}
+	}
+	return out;
+}
+
 int64_t ScalarInt(Connection &con, const std::string &sql) {
 	auto result = con.Query(sql);
 	if (result->HasError()) {
@@ -309,13 +321,7 @@ int main() {
 		std::filesystem::create_directories(dir);
 		std::filesystem::copy_file(DIR + "full.bak", dir / "a_full.bak");
 		std::filesystem::copy_file(DIR + "diff.bak", dir / "b_diff.bak");
-		std::string glob;
-		for (const char ch : (dir / "*.bak").string()) {
-			glob += ch;
-			if (ch == '\'') {
-				glob += ch;	 // inside a SQL literal
-			}
-		}
+		const std::string glob = InLiteral((dir / "*.bak").string());
 		auto attach = con.Query("ATTACH '" + glob + "' AS hr (TYPE mssql_backup, history true)");
 		Check(!attach->HasError(),
 			  "a history of a full and its differential attached " + (attach->HasError() ? attach->GetError() : ""));
@@ -422,6 +428,20 @@ int main() {
 															  std::to_string(held_rows) + " items)" +
 															  (held->HasError() ? held->GetError() : ""));
 			held.reset();
+			// A prepared listing pins its version again at every EXECUTE: the default's key dropped by a refresh
+			// (its full touched) is not the version an EXECUTE after it looks for (review of #581: the bind data
+			// kept the statement cache, so every EXECUTE asked for the PREPARE's key and failed for good).
+			auto prepared = con.Query("PREPARE listed AS SELECT count(*) FROM mssql_backup_tables('hr')");
+			Check(!prepared->HasError(),
+				  "a listing of the attached name prepared " + (prepared->HasError() ? prepared->GetError() : ""));
+			const int64_t listed = ScalarInt(con, "EXECUTE listed");
+			std::filesystem::last_write_time(
+				dir / "a_full.bak", std::filesystem::last_write_time(dir / "a_full.bak") + std::chrono::seconds(20));
+			Check(ScalarInt(other, "SELECT versions FROM mssql_backup_refresh('hr')") == 5,
+				  "another connection refreshes: the default's key dropped");
+			Check(listed > 0 && ScalarInt(con, "EXECUTE listed") == listed,
+				  "the prepared listing executed after the refresh lists the default again");
+			con.Query("DEALLOCATE listed");
 			// A file function on the name pins its version at bind, by its key (PinAttachedVersion): what its init
 			// and a deserialized plan find the version by. The differential's number pinned, an earlier backup
 			// then gone (the numbers move down), the key still finds the differential.
@@ -508,8 +528,8 @@ int main() {
 			std::filesystem::copy_file(DIR + "diff.bak", many / "b_diff.bak");
 			std::filesystem::copy_file(DIR + "stripe_2.bak", many / "c_s2.bak");  // family 2 first by name
 			std::filesystem::copy_file(DIR + "stripe_1.bak", many / "d_s1.bak");
-			auto attached_many =
-				con.Query("ATTACH '" + (many / "*.bak").string() + "' AS hm (TYPE mssql_backup, history true)");
+			auto attached_many = con.Query("ATTACH '" + InLiteral((many / "*.bak").string()) +
+										   "' AS hm (TYPE mssql_backup, history true)");
 			Check(!attached_many->HasError(), "a history with a striped full attached " +
 												  (attached_many->HasError() ? attached_many->GetError() : ""));
 			const int64_t striped = ScalarInt(
@@ -580,13 +600,7 @@ int main() {
 			std::filesystem::remove_all(odd);
 			std::filesystem::create_directories(odd);
 			std::filesystem::copy_file(DIR + "full.bak", odd / "s[1].bak");
-			std::string pattern;
-			for (const char ch : (odd / "*.bak").string()) {
-				pattern += ch;
-				if (ch == '\'') {
-					pattern += ch;
-				}
-			}
+			const std::string pattern = InLiteral((odd / "*.bak").string());
 			Check(ScalarInt(con, "SELECT count(*) FROM mssql_backup_scan('" + pattern +
 									 "', 'dbo', 'items', version := 1)") == 2000,
 				  "a history's file named s[1].bak read as itself");

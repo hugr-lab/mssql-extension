@@ -246,9 +246,10 @@ struct BackupInfoBindData : public TableFunctionData {
 	}
 	//! The row is read at bind, and a prepared statement keeps it: a backup is opened to be read, and
 	//! a file rewritten under an open backup is invalid anyway while the rewrite runs. `reread := true`
-	//! binds again on every EXECUTE (a device overwritten nightly, read by a statement prepared once).
+	//! binds again on every EXECUTE (a device overwritten nightly, read by a statement prepared once). An
+	//! attached name's version is pinned again at every EXECUTE too, so it follows a refresh (review of #581).
 	bool SupportStatementCache() const override {
-		return !reread;
+		return !reread && at.key.empty();
 	}
 };
 

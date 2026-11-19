@@ -470,6 +470,12 @@ struct CatalogListBindData : public TableFunctionData {
 		copy->scope = scope;
 		return std::move(copy);
 	}
+	//! A version pinned at bind (an attached name's: `PinAttachedVersion`) must be pinned again by the
+	//! next EXECUTE, else a prepared listing keeps the version of its PREPARE, and fails for good once a
+	//! refresh drops it (review of #581). Files keep the cache: init opens them anew.
+	bool SupportStatementCache() const override {
+		return at.key.empty();
+	}
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<CatalogListBindData>();
 		return paths == other.paths && diff == other.diff && at.Same(other.at) && listing == other.listing &&
