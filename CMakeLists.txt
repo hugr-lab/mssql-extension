@@ -195,6 +195,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_record_stager.cpp
     src/backup/backup_reservation.cpp
     src/backup/backup_scan_function.cpp
+    src/backup/backup_table_changes_function.cpp
     src/backup/backup_schema_changes.cpp
     src/backup/backup_set.cpp
     src/backup/backup_snapshots_function.cpp
