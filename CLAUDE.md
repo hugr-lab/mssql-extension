@@ -84,7 +84,8 @@ test/
                         # variable (sqlcmd substitutes no :setvar and only the first -v in :OUT); images.txt pinning each
                         # SQL Server image by digest), compare_catalog.py (mssql_backup_tables / _views vs the
                         # server's catalog), compare_info.py (mssql_backup_info vs RESTORE,
-                        # local dir or s3://), httpfs_extension_config.cmake + oracle_vcpkg_manifest.py
+                        # local dir or s3://), compare_remote.py / .sh (every backup function over s3:// and
+                        # https:// against the local files, an S3 server of its own: RustFS on TLS; spec 085 task 25), httpfs_extension_config.cmake + oracle_vcpkg_manifest.py
                         # (the oracle build: httpfs static, curl from vcpkg)
   data/backup/          # Synthetic backup samples + golden RESTORE HEADERONLY/LABELONLY/FILELISTONLY,
                         # made by generate.sh on a throwaway container. Never commit a backup of

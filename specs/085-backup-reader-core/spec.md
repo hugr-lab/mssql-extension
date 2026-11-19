@@ -1674,6 +1674,39 @@ before the next opens.
     it (mssql-ducklake spec 025, frozen history, on a daily differential): pushdown of a filter on
     `_mssql_page_lsn` / `_mssql_page` (pages skipped unread) and on a column, for now the importer
     reads the table whole; a filter in 089's export (`exclude_upto`) stays an acceptable alternative.
+    As built (PR 4d): the lane's `remote` job (`test/backup/compare_remote.sh`) starts an S3 server
+    of its own -- RustFS 1.0.4 by digest (MinIO publishes no images any more), TLS on a certificate it
+    makes, credentials it generates --, puts the committed samples and the databases beside them into
+    a bucket and has `compare_remote.py` run every backup function over them through `s3://` (the S3
+    API) and `https://` (anonymous range reads, no listing) and over the local files, each answer
+    required equal: mssql_backup_info of each set, the four listings of each full and full + diff,
+    each table's rows (a count and a hash over every column and the virtual ones), table_changes and
+    schema_changes of the overlays, and through s3:// a history attached from a glob, its snapshots
+    and each version's rows (133 comparisons on the samples and switch_in, 0 differences; a
+    differential over no full beside it, or a state with no table read, fails the job). Measured over
+    S3 (a local MinIO, the development machine's own; httpfs, 16 threads) on `bench_changes` (10M rows): opening a full 0.34 s / 42 MB
+    (compressed 0.03 s / 3 MB); a full + differential 0.36-0.49 s / 76-83 MB (compressed 1.0-1.9 s /
+    183-354 MB); the 10M-row table scanned 3.5 s / 656 MB (compressed 0.9 s / 141 MB); its changes
+    over 110 thousand scattered updates 7.1 s / 1.3 GB (compressed 4.4 s / 819 MB). Pushdown, measured:
+    scattered changes touch nearly every page (110 thousand of 10M rows: 80,504 of the table's 80,505
+    pages newer than the full; the 10-thousand differential holds 691 MB of the full's 1,548), so a
+    filter on `_mssql_page_lsn` would save little over S3 -- and table_changes already reads a
+    differential's own pages only -- and a column filter on a row-store page saves decoding, not the
+    page's bytes (the scan is IO-bound over S3). What would skip pages: a filter on `_mssql_page`, a
+    partition eliminated by its partitioning column, a clustered key's range sought through its index.
+    Measured with stand-ins (a 10M-row table in ten partitions, one selected, against a table of that
+    partition's rows alone; over S3): 3.9 s / 643 MB read whole and filtered by DuckDB against 0.71 s /
+    99 MB for the partition's pages alone on a plain backup -- and nothing on a compressed one (0.93 s /
+    140 MB against 0.87 s / 152 MB: a block is found by walking the container's chain, so the file is
+    read either way); one column of the same rows, late materialisation's stand-in, read as many bytes
+    (4.1 s / 643 MB) and saved a third of the decode locally only (0.10 -> 0.06 s). Decided (owner,
+    2026-11-19): filter pushdown is a spec of its own, not a priority -- the reader is not a lake over
+    backups, and a workload that filters imports into DuckLake and filters there; reading whole stays
+    what is to be fast. Memory of table_changes under `memory_limit`, measured on Linux (CI's
+    linux_amd64 CLI, jemalloc, 16 threads, the 10M-row index rebuild from a compressed differential):
+    peak RSS 234 MB under 128 MB (1.7 GB spilled), 318 under 256, 595 under 512, 1,074 under 1 GB,
+    1,910 under 2 GB, 2.5 GB unbounded -- the limit and 50-110 MB the buffer manager does not account
+    (the binary, I/O buffers); macOS reads 0.5-0.6 GB higher (its malloc keeps freed regions mapped).
 
 **PR 5 — fuzzy status**
 
