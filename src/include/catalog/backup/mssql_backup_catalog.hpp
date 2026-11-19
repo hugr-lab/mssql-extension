@@ -249,19 +249,23 @@ private:
 	int64_t row_count_ = -1;  // the catalog's, -1 unknown
 };
 
-//! The version states one query read of a backup catalog, by StateKey (registered on its ClientContext,
-//! cleared when a query begins and ends): the entries its plan holds live to its end though a refresh drops
-//! them from the catalog -- the anchors TYPE mssql's catalog keeps for its entries (MSSQLBindAnchors). No
-//! version is chosen here: the bind data pins it (BackupAt::key).
+//! The version states one query read of the backup catalogs, by catalog and StateKey (registered on its
+//! ClientContext once per connection, whatever catalogs it reads, and cleared when a query begins and
+//! ends): the entries its plan holds live to its end though a refresh drops them from the catalog -- the
+//! anchors TYPE mssql's catalog keeps for its entries (MSSQLBindAnchors). No version is chosen here: the
+//! bind data pins it (BackupAt::key). It used to be one registration per alias name, never unregistered,
+//! paid for on every later query of the connection (#584). By the catalog itself, not its name: two
+//! aliases of one backup (another filter each) share a StateKey, and a state's entries are its catalog's.
 class MSSQLBackupQueryStates : public ClientContextState {
 public:
 	void QueryBegin(ClientContext &context) override;
 	void QueryEnd(ClientContext &context) override;
-	//! The catalog's in `context`.
-	static MSSQLBackupQueryStates &For(ClientContext &context, const MSSQLBackupCatalog &catalog);
+	//! The one in `context` (registered as "mssql_backup_states").
+	static MSSQLBackupQueryStates &For(ClientContext &context);
 
 	std::mutex lock;
-	std::map<std::string, std::shared_ptr<MSSQLBackupCatalog::State>> states;
+	//! By catalog, then StateKey.
+	std::map<const MSSQLBackupCatalog *, std::map<std::string, std::shared_ptr<MSSQLBackupCatalog::State>>> states;
 };
 
 //! A backup is read, never written: a transaction holds nothing (a query keeps what it reads,

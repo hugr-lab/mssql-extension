@@ -611,6 +611,50 @@ int main() {
 		std::filesystem::remove_all(dir);
 	}
 
+	{
+		// One registration of the query states a connection, whatever aliases it reads (review of #580's
+		// merge: one an alias name, never unregistered, each paid for on every later query).
+		Connection cycling(db);
+		auto query_states = [&]() {
+			size_t n = 0;
+			for (const auto &state : cycling.context->registered_state->States()) {
+				n += dynamic_cast<MSSQLBackupQueryStates *>(state.get()) != nullptr;
+			}
+			return n;
+		};
+		bool read = true;
+		for (int i = 0; i < 4; i++) {
+			const std::string alias = "cycle_" + std::to_string(i);
+			read =
+				read && !cycling.Query("ATTACH '" + DIR + "full.bak' AS " + alias + " (TYPE mssql_backup)")->HasError();
+			read = read && ScalarInt(cycling, "SELECT count(*) FROM mssql_backup_tables('" + alias + "')") > 0;
+			read = read && !cycling.Query("DETACH " + alias)->HasError();
+		}
+		Check(read && query_states() == 1,
+			  "four aliases attached, read and detached in turn: one query-state "
+			  "registration (" +
+				  std::to_string(query_states()) + ")");
+		// Two aliases of one backup, another filter each, read in ONE query: their states share a StateKey
+		// (the files), never their entries (each its catalog's, its filter's).
+		bool attached =
+			!cycling.Query("ATTACH '" + DIR + "full.bak' AS only_items (TYPE mssql_backup, table_filter '^items$')")
+				 ->HasError() &&
+			!cycling.Query("ATTACH '" + DIR + "full.bak' AS only_events (TYPE mssql_backup, table_filter '^events$')")
+				 ->HasError();
+		// One query, a digit each: only_items' items, only_events' events (1 each), anything else (0).
+		const int64_t listed =
+			ScalarInt(cycling,
+					  "SELECT count(*) FILTER (WHERE database_name = 'only_items' AND table_name = 'items') + "
+					  "10 * count(*) FILTER (WHERE database_name = 'only_events' AND table_name = 'events') + "
+					  "100 * count(*) FILTER (WHERE NOT ((database_name = 'only_items' AND table_name = 'items') OR "
+					  "(database_name = 'only_events' AND table_name = 'events'))) "
+					  "FROM duckdb_tables() WHERE database_name IN ('only_items', 'only_events')");
+		Check(attached && listed == 11, "two filtered aliases of one backup in one query keep their own tables (" +
+											std::to_string(listed) + ", 11 expected)");
+		cycling.Query("DETACH only_items");
+		cycling.Query("DETACH only_events");
+	}
+
 	if (failures) {
 		std::cout << failures << " check(s) failed" << std::endl;
 		return 1;
