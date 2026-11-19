@@ -284,21 +284,104 @@ void test_alter_column_type() {
 void test_alter_column_nullability() {
 	std::cout << "\n=== Test: ALTER COLUMN NULLABILITY Translation ===" << std::endl;
 
-	// Set NOT NULL
-	std::string sql =
-		MSSQLDDLTranslator::TranslateAlterColumnNullability("dbo", "users", "email", LogicalType::VARCHAR, true);
-
-	ASSERT_CONTAINS(sql, "ALTER TABLE [dbo].[users]");
-	ASSERT_CONTAINS(sql, "ALTER COLUMN [email]");
-	ASSERT_CONTAINS(sql, "NOT NULL");
+	// Set NOT NULL: the column re-declared as given, only its nullability changed (issue #577).
+	std::string sql = MSSQLDDLTranslator::TranslateAlterColumnNullability(
+		"dbo", "users", "email", "varchar(100) COLLATE Latin1_General_CI_AS", true);
+	ASSERT_EQ(sql,
+			  "ALTER TABLE [dbo].[users] ALTER COLUMN [email] varchar(100) COLLATE Latin1_General_CI_AS NOT NULL;");
 
 	// Set NULL
-	sql = MSSQLDDLTranslator::TranslateAlterColumnNullability("dbo", "users", "phone", LogicalType::VARCHAR, false);
+	sql = MSSQLDDLTranslator::TranslateAlterColumnNullability("dbo", "users", "price", "money", false);
+	ASSERT_EQ(sql, "ALTER TABLE [dbo].[users] ALTER COLUMN [price] money NULL;");
 
-	ASSERT_CONTAINS(sql, "ALTER COLUMN [phone]");
-	// Should have NULL but NOT "NOT NULL"
-	ASSERT_CONTAINS(sql, " NULL");
+	std::cout << "PASSED!" << std::endl;
+}
 
+//==============================================================================
+// Test: a column's server declaration (issue #577)
+//==============================================================================
+void test_column_declaration() {
+	std::cout << "\n=== Test: Column declaration as the server declares it ===" << std::endl;
+	auto system = [](const std::string &type, int16_t max_length, uint8_t precision, uint8_t scale,
+					 const std::string &collation) {
+		MSSQLServerColumnType c;
+		c.type_name = type;
+		c.type_schema = "sys";
+		c.system_type = type;
+		c.max_length = max_length;
+		c.precision = precision;
+		c.scale = scale;
+		c.collation = collation;
+		return MSSQLDDLTranslator::ColumnDeclaration(c);
+	};
+	ASSERT_EQ(system("money", 8, 19, 4, ""), "money");
+	ASSERT_EQ(system("datetime", 8, 23, 3, ""), "datetime");
+	ASSERT_EQ(system("smalldatetime", 4, 16, 0, ""), "smalldatetime");
+	ASSERT_EQ(system("datetime2", 7, 24, 4, ""), "datetime2(4)");
+	ASSERT_EQ(system("datetimeoffset", 10, 34, 7, ""), "datetimeoffset(7)");
+	ASSERT_EQ(system("time", 3, 11, 2, ""), "time(2)");
+	ASSERT_EQ(system("decimal", 9, 12, 3, ""), "decimal(12, 3)");
+	ASSERT_EQ(system("numeric", 5, 5, 0, ""), "numeric(5, 0)");
+	ASSERT_EQ(system("varchar", 30, 0, 0, "Latin1_General_CS_AS"), "varchar(30) COLLATE Latin1_General_CS_AS");
+	ASSERT_EQ(system("nvarchar", 60, 0, 0, "Latin1_General_CI_AS"), "nvarchar(30) COLLATE Latin1_General_CI_AS");
+	ASSERT_EQ(system("nvarchar", -1, 0, 0, "Latin1_General_CI_AS"), "nvarchar(max) COLLATE Latin1_General_CI_AS");
+	ASSERT_EQ(system("char", 10, 0, 0, "SQL_Latin1_General_CP1_CI_AS"),
+			  "char(10) COLLATE SQL_Latin1_General_CP1_CI_AS");
+	ASSERT_EQ(system("varbinary", -1, 0, 0, ""), "varbinary(max)");
+	ASSERT_EQ(system("binary", 16, 0, 0, ""), "binary(16)");
+	ASSERT_EQ(system("uniqueidentifier", 16, 0, 0, ""), "uniqueidentifier");
+	ASSERT_EQ(system("geometry", -1, 0, 0, ""), "geometry");
+	ASSERT_EQ(system("xml", -1, 0, 0, ""), "xml");
+
+	// An alias type by its own qualified name (its length is its own), never with COLLATE (error 452).
+	MSSQLServerColumnType alias;
+	alias.type_name = "Name";
+	alias.type_schema = "dbo";
+	alias.system_type = "nvarchar";
+	alias.user_defined = true;
+	alias.max_length = 100;
+	alias.collation = "Latin1_General_CI_AS";
+	ASSERT_EQ(MSSQLDDLTranslator::ColumnDeclaration(alias), "[dbo].[Name]");
+	// A user CLR type: its case and schema kept, no collation.
+	MSSQLServerColumnType clr;
+	clr.type_name = "Point";
+	clr.type_schema = "geo";
+	clr.user_defined = true;
+	clr.assembly = true;
+	ASSERT_EQ(MSSQLDDLTranslator::ColumnDeclaration(clr), "[geo].[Point]");
+	// A typed xml, and a sparse column.
+	MSSQLServerColumnType typed = MSSQLServerColumnType();
+	typed.type_name = "xml";
+	typed.system_type = "xml";
+	typed.max_length = -1;
+	typed.xml_collection_id = 65536;
+	typed.xml_collection = "Orders";
+	typed.xml_collection_schema = "dbo";
+	typed.xml_document = true;
+	ASSERT_EQ(MSSQLDDLTranslator::ColumnDeclaration(typed), "xml(DOCUMENT [dbo].[Orders])");
+	typed.xml_document = false;
+	ASSERT_EQ(MSSQLDDLTranslator::ColumnDeclaration(typed), "xml(CONTENT [dbo].[Orders])");
+	MSSQLServerColumnType sparse;
+	sparse.type_name = "int";
+	sparse.system_type = "int";
+	sparse.sparse = true;
+	ASSERT_EQ(MSSQLDDLTranslator::ColumnDeclaration(sparse), "int SPARSE");
+
+	// The server's row (NULL as empty).
+	auto parsed = MSSQLDDLTranslator::ParseServerColumnType(
+		{"Name", "dbo", "1", "0", "nvarchar", "100", "0", "0", "Latin1_General_CI_AS", "0", "0", "0", "0"});
+	ASSERT_EQ(MSSQLDDLTranslator::ColumnDeclaration(parsed), "[dbo].[Name]");
+	ASSERT_EQ(parsed.nullable ? "nullable" : "not null", std::string("not null"));
+
+	// A type change keeps a character column's collation where the new type names none.
+	ASSERT_EQ(MSSQLDDLTranslator::TranslateAlterColumnType("dbo", "t", "c", LogicalType::VARCHAR, false,
+														   "Latin1_General_CS_AS"),
+			  "ALTER TABLE [dbo].[t] ALTER COLUMN [c] " + MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::VARCHAR) +
+				  " COLLATE Latin1_General_CS_AS NOT NULL;");
+	ASSERT_EQ(MSSQLDDLTranslator::TranslateAlterColumnType("dbo", "t", "c", LogicalType::BIGINT, true,
+														   "Latin1_General_CS_AS"),
+			  "ALTER TABLE [dbo].[t] ALTER COLUMN [c] " + MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::BIGINT) +
+				  " NULL;");
 	std::cout << "PASSED!" << std::endl;
 }
 
@@ -350,6 +433,7 @@ int main() {
 		test_rename_column();
 		test_alter_column_type();
 		test_alter_column_nullability();
+		test_column_declaration();
 
 		// DDLOperation enum tests
 		test_ddl_operation_to_string();

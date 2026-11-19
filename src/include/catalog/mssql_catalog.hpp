@@ -20,6 +20,7 @@
 #include "mssql_storage.hpp"
 #include "query/mssql_describe_cache.hpp"
 #include "query/mssql_result_stream.hpp"
+#include "query/mssql_simple_query.hpp"
 #include "tds/tds_connection_pool.hpp"
 
 namespace duckdb {
@@ -576,6 +577,9 @@ public:
 	//        false, issue #451). Otherwise only on a pool of one (issue #419).
 	// @throws on SQL Server error or connection failure
 	void ExecuteDDL(ClientContext &context, const string &tsql, bool on_transaction_connection = false);
+	//! A query on the connection ExecuteDDL would run a DDL on (issue #577: an ALTER COLUMN reads the
+	//! column's declaration there first). A CatalogException with the server's error.
+	SimpleQueryResult ExecuteCatalogQuery(ClientContext &context, const string &tsql);
 
 	// Invalidate the metadata cache (forces refresh on next access)
 	void InvalidateMetadataCache();
@@ -599,6 +603,9 @@ protected:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 
 private:
+	//! ExecuteDDL's choice of connection (the transaction's on a pool of one, else a pool connection), the
+	//! batch run on it.
+	SimpleQueryResult RunOnDDLConnection(ClientContext &context, const string &tsql, bool on_transaction_connection);
 	//! The cache whose schema list a lookup reads and loads: the shared one, or
 	//! inside a transaction the transaction's own when the shared list is not
 	//! loaded or the transaction changed everything (issue #380).

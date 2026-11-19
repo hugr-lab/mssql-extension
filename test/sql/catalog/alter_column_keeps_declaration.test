@@ -1,0 +1,197 @@
+# name: test/sql/catalog/alter_column_keeps_declaration.test
+# description: ALTER COLUMN changes only the property it names: a type change keeps NOT NULL, a nullability change keeps the server's own declaration (issue #577)
+# group: [mssql]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS akd (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('akd', 'DROP TABLE IF EXISTS dbo.AlterKeepsDecl; CREATE TABLE dbo.AlterKeepsDecl (n int NOT NULL, m money NULL, dt datetime NULL, sdt smalldatetime NULL, d2 datetime2(4) NULL, t time(2) NULL, dec decimal(12, 3) NULL, vc varchar(30) COLLATE Latin1_General_CS_AS NULL, nv nvarchar(20) COLLATE Latin1_General_CI_AS NULL, ch char(10) COLLATE SQL_Latin1_General_CP1_CI_AS NULL, vb varbinary(max) NULL); INSERT INTO dbo.AlterKeepsDecl VALUES (1, 2.5, ''2026-01-02 03:04:05'', ''2026-01-02 03:04'', ''2026-01-02 03:04:05.1234'', ''03:04:05.12'', 12.345, ''a'', N''b'', ''c'', 0x01)');
+
+statement ok
+SELECT mssql_invalidate_cache('akd');
+
+# 1. A type change keeps NOT NULL (it sent `bigint NULL`).
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN n TYPE BIGINT;
+
+query TI
+SELECT * FROM mssql_scan('akd', 'SELECT TYPE_NAME(user_type_id) AS t, CAST(is_nullable AS int) AS nullable FROM sys.columns WHERE object_id = OBJECT_ID(''dbo.AlterKeepsDecl'') AND name = ''n''');
+----
+bigint	0
+
+# 2. SET NOT NULL re-declares each column as the server declares it (it sent the DuckDB type: money as
+# decimal(19,4), datetime as datetime2, varchar(30) as varchar(max), the collation dropped).
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN m SET NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN dt SET NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN sdt SET NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN d2 SET NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN t SET NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN dec SET NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN vc SET NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN nv SET NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN ch SET NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN vb SET NOT NULL;
+
+query TTIIITI
+SELECT * FROM mssql_scan('akd', 'SELECT name, TYPE_NAME(user_type_id) AS t, CAST(max_length AS int) AS len, CAST(precision AS int) AS p, CAST(scale AS int) AS s, collation_name, CAST(is_nullable AS int) AS nullable FROM sys.columns WHERE object_id = OBJECT_ID(''dbo.AlterKeepsDecl'') ORDER BY column_id');
+----
+n	bigint	8	19	0	NULL	0
+m	money	8	19	4	NULL	0
+dt	datetime	8	23	3	NULL	0
+sdt	smalldatetime	4	16	0	NULL	0
+d2	datetime2	7	24	4	NULL	0
+t	time	3	11	2	NULL	0
+dec	decimal	9	12	3	NULL	0
+vc	varchar	30	0	0	Latin1_General_CS_AS	0
+nv	nvarchar	40	0	0	Latin1_General_CI_AS	0
+ch	char	10	0	0	SQL_Latin1_General_CP1_CI_AS	0
+vb	varbinary	-1	0	0	NULL	0
+
+# 3. DROP NOT NULL the same way.
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN m DROP NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN dt DROP NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN sdt DROP NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN d2 DROP NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN t DROP NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN dec DROP NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN vc DROP NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN nv DROP NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN ch DROP NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl ALTER COLUMN vb DROP NOT NULL;
+
+query TTIIITI
+SELECT * FROM mssql_scan('akd', 'SELECT name, TYPE_NAME(user_type_id) AS t, CAST(max_length AS int) AS len, CAST(precision AS int) AS p, CAST(scale AS int) AS s, collation_name, CAST(is_nullable AS int) AS nullable FROM sys.columns WHERE object_id = OBJECT_ID(''dbo.AlterKeepsDecl'') ORDER BY column_id');
+----
+n	bigint	8	19	0	NULL	0
+m	money	8	19	4	NULL	1
+dt	datetime	8	23	3	NULL	1
+sdt	smalldatetime	4	16	0	NULL	1
+d2	datetime2	7	24	4	NULL	1
+t	time	3	11	2	NULL	1
+dec	decimal	9	12	3	NULL	1
+vc	varchar	30	0	0	Latin1_General_CS_AS	1
+nv	nvarchar	40	0	0	Latin1_General_CI_AS	1
+ch	char	10	0	0	SQL_Latin1_General_CP1_CI_AS	1
+vb	varbinary	-1	0	0	NULL	1
+
+# The row's values survive the round trips.
+statement ok
+SELECT mssql_invalidate_cache('akd');
+
+query IRTTRTTT
+SELECT n, m, dt, d2, dec, vc, nv, ch FROM akd.dbo.AlterKeepsDecl;
+----
+1	2.5	2026-01-02 03:04:05	2026-01-02 03:04:05.1234	12.345	a	b	c
+
+statement ok
+SELECT mssql_exec('akd', 'DROP TABLE IF EXISTS dbo.AlterKeepsDecl');
+
+# 4. What the catalog's cache cannot say, read from the server at the ALTER: an alias type, a typed xml,
+# SPARSE, and a column another client (here mssql_exec, the cache not invalidated) changed since.
+statement ok
+SELECT mssql_exec('akd', 'DROP TABLE IF EXISTS dbo.AlterKeepsDecl2; IF TYPE_ID(N''dbo.AkdName'') IS NOT NULL DROP TYPE dbo.AkdName; IF EXISTS (SELECT 1 FROM sys.xml_schema_collections WHERE name = N''AkdOrders'') DROP XML SCHEMA COLLECTION dbo.AkdOrders');
+
+statement ok
+SELECT mssql_exec('akd', 'CREATE TYPE dbo.AkdName FROM nvarchar(20) NULL');
+
+statement ok
+SELECT mssql_exec('akd', 'CREATE XML SCHEMA COLLECTION dbo.AkdOrders AS N''<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="order" type="xs:string"/></xs:schema>''');
+
+statement ok
+SELECT mssql_exec('akd', 'CREATE TABLE dbo.AlterKeepsDecl2 (al dbo.AkdName NULL, x xml(DOCUMENT dbo.AkdOrders) NULL, u uniqueidentifier NULL, sp int SPARSE NULL, st int NULL, cs varchar(30) COLLATE Latin1_General_CS_AS NULL, nl int NULL); INSERT INTO dbo.AlterKeepsDecl2 VALUES (N''n'', N''<order>1</order>'', NEWID(), 1, 1, ''Ab'', 1)');
+
+statement ok
+SELECT mssql_invalidate_cache('akd');
+
+# Loaded into the cache now (nullable), then made NOT NULL behind its back.
+query I
+SELECT count(*) FROM akd.dbo.AlterKeepsDecl2;
+----
+1
+
+statement ok
+SELECT mssql_exec('akd', 'ALTER TABLE dbo.AlterKeepsDecl2 ALTER COLUMN st int NOT NULL');
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl2 ALTER COLUMN al SET NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl2 ALTER COLUMN x SET NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl2 ALTER COLUMN u SET NOT NULL;
+
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl2 ALTER COLUMN sp DROP NOT NULL;
+
+# The server's NOT NULL, not the cache's NULL.
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl2 ALTER COLUMN st TYPE BIGINT;
+
+# A character column changed to another character type keeps its collation.
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl2 ALTER COLUMN cs TYPE VARCHAR;
+
+# A nullable column stays nullable.
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl2 ALTER COLUMN nl TYPE BIGINT;
+
+query TTTIII
+SELECT * FROM mssql_scan('akd', 'SELECT c.name, TYPE_NAME(c.user_type_id) AS t, CASE WHEN c.name = ''al'' THEN NULL ELSE c.collation_name END AS collation_name, CAST(c.is_nullable AS int) AS nullable, CAST(c.is_sparse AS int) AS sparse, CAST(CASE WHEN c.xml_collection_id = 0 THEN 0 ELSE c.is_xml_document + 1 END AS int) AS xml_kind FROM sys.columns c WHERE c.object_id = OBJECT_ID(''dbo.AlterKeepsDecl2'') ORDER BY c.column_id');
+----
+al	AkdName	NULL	0	0	0
+x	xml	NULL	0	0	2
+u	uniqueidentifier	NULL	0	0	0
+sp	int	NULL	1	1	0
+st	bigint	NULL	0	0	0
+cs	nvarchar	Latin1_General_CS_AS	1	0	0
+nl	bigint	NULL	1	0	0
+
+statement ok
+SELECT mssql_exec('akd', 'DROP TABLE IF EXISTS dbo.AlterKeepsDecl2; IF TYPE_ID(N''dbo.AkdName'') IS NOT NULL DROP TYPE dbo.AkdName; IF EXISTS (SELECT 1 FROM sys.xml_schema_collections WHERE name = N''AkdOrders'') DROP XML SCHEMA COLLECTION dbo.AkdOrders');

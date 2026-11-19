@@ -433,6 +433,35 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		auto col = column_of(duckdb_name);
 		return col ? col->name : duckdb_name;
 	};
+	// ALTER COLUMN declares the column whole, so what the statement does not name is the column's own,
+	// read from the server now (issue #577: the cache may be outdated by another client or mssql_exec, and
+	// does not hold an alias type, a CLR type's schema, a typed xml's collection or SPARSE).
+	auto server_column = [&](const Identifier &column_name, const char *what) {
+		if (!transaction.HasContext()) {
+			throw InternalException("Cannot execute %s without client context", what);
+		}
+		auto &context = transaction.GetContext();
+		const string column = server_name(column_name.GetIdentifierName());
+		auto found = mssql_catalog.ExecuteCatalogQuery(
+			context, MSSQLDDLTranslator::ServerColumnTypeQuery(name.GetIdentifierName(), table_name, column));
+		if (found.rows.empty()) {
+			throw CatalogException("Column '%s' not found in table '%s'", column_name, table_name);
+		}
+		auto type = MSSQLDDLTranslator::ParseServerColumnType(found.rows[0]);
+		if (type.xml_collection_id != 0) {
+			auto collection = mssql_catalog.ExecuteCatalogQuery(
+				context,
+				"SELECT name, SCHEMA_NAME(schema_id) FROM sys.xml_schema_collections WHERE xml_collection_id = " +
+					std::to_string(type.xml_collection_id));
+			if (collection.rows.empty() || collection.rows[0].size() < 2) {
+				throw CatalogException("Column '%s' of table '%s': its XML schema collection was not found",
+									   column_name, table_name);
+			}
+			type.xml_collection = collection.rows[0][0];
+			type.xml_collection_schema = collection.rows[0][1];
+		}
+		return std::make_pair(column, type);
+	};
 
 	switch (alter_table_info.alter_table_type) {
 	case AlterTableType::RENAME_TABLE: {
@@ -465,50 +494,29 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 
 	case AlterTableType::ALTER_COLUMN_TYPE: {
 		auto &type_info = alter_table_info.Cast<ChangeColumnTypeInfo>();
-		// SQL Server requires specifying nullability when altering type
-		// We default to NULL since we don't have that info easily available
+		// Its nullability kept (a literal NULL made a NOT NULL column nullable), and a character column
+		// changed to a character type keeps its collation unless the new type names one: without COLLATE
+		// the server gives the database's (a case-sensitive or UTF-8 column changed its comparisons, or
+		// lost characters).
+		const auto column =
+			server_column(SingleColumnOf(type_info.column_path, "ALTER COLUMN TYPE"), "ALTER COLUMN TYPE");
 		tsql = MSSQLDDLTranslator::TranslateAlterColumnType(
-			name.GetIdentifierName(), table_name,
-			server_name(SingleColumnOf(type_info.column_path, "ALTER COLUMN TYPE").GetIdentifierName()),
-			type_info.target_type, true);
+			name.GetIdentifierName(), table_name, column.first, type_info.target_type, column.second.nullable,
+			MSSQLDDLTranslator::IsCharacterType(column.second.system_type) ? column.second.collation : string());
 		break;
 	}
 
-	case AlterTableType::SET_NOT_NULL: {
-		auto &notnull_info = alter_table_info.Cast<SetNotNullInfo>();
-		const Identifier &column_name = SingleColumnOf(notnull_info.column_path, "SET NOT NULL");
-		// The column's current type is needed to change its nullability.
-		if (!transaction.HasContext()) {
-			throw InternalException("Cannot execute SET NOT NULL without client context");
-		}
-		if (!tables_.GetEntry(transaction.GetContext(), table_name)) {
-			throw CatalogException("Table '%s' not found", table_name);
-		}
-		auto col = column_of(column_name.GetIdentifierName());
-		if (!col) {
-			throw CatalogException("Column '%s' not found in table '%s'", column_name, table_name);
-		}
-		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name.GetIdentifierName(), table_name, col->name,
-																   col->duckdb_type, true);
-		break;
-	}
-
+	case AlterTableType::SET_NOT_NULL:
 	case AlterTableType::DROP_NOT_NULL: {
-		auto &dropnull_info = alter_table_info.Cast<DropNotNullInfo>();
-		const Identifier &column_name = SingleColumnOf(dropnull_info.column_path, "DROP NOT NULL");
-		// The column's current type is needed to change its nullability.
-		if (!transaction.HasContext()) {
-			throw InternalException("Cannot execute DROP NOT NULL without client context");
-		}
-		if (!tables_.GetEntry(transaction.GetContext(), table_name)) {
-			throw CatalogException("Table '%s' not found", table_name);
-		}
-		auto col = column_of(column_name.GetIdentifierName());
-		if (!col) {
-			throw CatalogException("Column '%s' not found in table '%s'", column_name, table_name);
-		}
-		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name.GetIdentifierName(), table_name, col->name,
-																   col->duckdb_type, false);
+		const bool set_not_null = alter_table_info.alter_table_type == AlterTableType::SET_NOT_NULL;
+		const char *what = set_not_null ? "SET NOT NULL" : "DROP NOT NULL";
+		const auto &path = set_not_null ? alter_table_info.Cast<SetNotNullInfo>().column_path
+										: alter_table_info.Cast<DropNotNullInfo>().column_path;
+		// Re-declared as the server declares it, so only its nullability changes.
+		const auto column = server_column(SingleColumnOf(path, what), what);
+		tsql = MSSQLDDLTranslator::TranslateAlterColumnNullability(name.GetIdentifierName(), table_name, column.first,
+																   MSSQLDDLTranslator::ColumnDeclaration(column.second),
+																   set_not_null);
 		break;
 	}
 
