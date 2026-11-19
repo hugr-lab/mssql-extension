@@ -139,7 +139,7 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 	const std::vector<std::string> paths(data.paths.begin(), data.paths.end());
 	try {
 		auto states = OpenTwoStates(context, paths, std::vector<std::string>(data.diff.begin(), data.diff.end()),
-									data.start, data.end, FUNCTION);
+									data.start, data.end, FUNCTION, false);
 		if (states.same) {
 			return std::move(state);  // one state: no change (DQ-47: an empty set, not an error)
 		}
@@ -223,7 +223,7 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 
 TwoStates OpenTwoStates(ClientContext &context, const std::vector<std::string> &paths,
 						const std::vector<std::string> &diff_paths, const Value &start_value, const Value &end_value,
-						const char *function) {
+						const char *function, bool open_same) {
 	TwoStates states;
 	if (!diff_paths.empty()) {
 		// The full, and the full with the differential.
@@ -268,7 +268,8 @@ TwoStates OpenTwoStates(ClientContext &context, const std::vector<std::string> &
 				at.key = AttachedStateKey(*history, number);
 				const auto backup = FindAttachedBackup(context, paths.front(), at);
 				std::shared_ptr<OpenedCatalog> catalog(OpenAttachedCatalog(context, *backup).release());
-				if (backup->objects) {
+				// Every object's model: what rowset owners are found in, between two states only.
+				if (backup->objects && start != end) {
 					(number == start ? states.old_whole : states.new_whole) =
 						WholeModel(*catalog, "attached backup " + backup->name);
 				}
@@ -289,7 +290,9 @@ TwoStates OpenTwoStates(ClientContext &context, const std::vector<std::string> &
 			// One state: no change, but table_changes names its columns by it (opened from this read, not
 			// its number read again).
 			states.same = true;
-			states.new_catalog = open(end);
+			if (open_same) {
+				states.new_catalog = open(end);
+			}
 			return states;
 		}
 		states.old_catalog = open(start);

@@ -37,9 +37,11 @@ struct TwoStates {
 	//! leave out is still a reload. None without filters.
 	std::shared_ptr<const CatalogModel> old_whole, new_whole;
 };
+//! `open_same`: when the bounds are one state, open it (table_changes names its columns by it);
+//! schema_changes, which returns no rows then, opens nothing.
 TwoStates OpenTwoStates(ClientContext &context, const std::vector<std::string> &paths,
 						const std::vector<std::string> &diff_paths, const Value &start_value, const Value &end_value,
-						const char *function);
+						const char *function, bool open_same);
 
 }  // namespace backup
 }  // namespace mssql
