@@ -32,6 +32,10 @@ struct TwoStates {
 	bool history_break = false;	 // the database restored or recreated between them
 	Lsn old_checkpoint;			 // the older state's last backup's checkpoint
 	bool same_full = false;		 // the newer state a differential over the older state's full
+	//! Every object's models where an ATTACH's filters narrow the states' (OpenBackupCatalog gives the
+	//! attached backup's own): what a rowset's owner is found in, so a switch in from a table the filters
+	//! leave out is still a reload. None without filters.
+	std::shared_ptr<const CatalogModel> old_whole, new_whole;
 };
 TwoStates OpenTwoStates(ClientContext &context, const std::vector<std::string> &paths,
 						const std::vector<std::string> &diff_paths, const Value &start_value, const Value &end_value,

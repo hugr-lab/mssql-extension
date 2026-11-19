@@ -170,35 +170,6 @@ void CheckOffRow(const RowsetLayout &layout, const RowRecord &row, const OffRowC
 	}
 }
 
-//! The records of `page` by where they lie: each live slot's offset, the next record's start (or the slot
-//! array), its slot; by offset.
-struct RecordSpan {
-	uint16_t offset = 0, end = 0, slot = 0;
-};
-
-void RecordSpans(const Page &page, std::vector<RecordSpan> &out) {
-	out.clear();
-	const uint16_t slots = page.header.slot_count;
-	if (static_cast<size_t>(slots) * 2 + PAGE_HEADER_SIZE > PAGE_SIZE) {
-		return;	 // ReadPageRows names it
-	}
-	for (uint16_t slot = 0; slot < slots; slot++) {
-		const size_t pos = PAGE_SIZE - 2 - 2 * static_cast<size_t>(slot);
-		const uint16_t offset = static_cast<uint16_t>(page.bytes[pos] | (page.bytes[pos + 1] << 8));
-		if (offset >= PAGE_HEADER_SIZE) {
-			RecordSpan span;
-			span.offset = offset;
-			span.slot = slot;
-			out.push_back(span);
-		}
-	}
-	std::sort(out.begin(), out.end(), [](const RecordSpan &a, const RecordSpan &b) { return a.offset < b.offset; });
-	const uint16_t slot_array = static_cast<uint16_t>(PAGE_SIZE - 2u * slots);
-	for (size_t i = 0; i < out.size(); i++) {
-		out[i].end = i + 1 < out.size() ? out[i + 1].offset : slot_array;
-	}
-}
-
 //! The live rows of `page` (a data page of `cursor`'s unit, read) as the scan finds them: ghosts and
 //! stubs skipped, a forwarded record at its place before it moved.
 void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const Page &page, std::vector<PageRow> &out,
@@ -222,7 +193,7 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 	// refused (review of #549).
 	static thread_local std::vector<RecordSpan> spans;	// kept by the thread, page to page
 	static thread_local std::vector<uint16_t> bound;
-	RecordSpans(page, spans);
+	RecordSpans(page.bytes.data(), PAGE_SIZE, slots, spans);
 	bound.assign(slots, 0);
 	for (size_t i = 0; i < spans.size(); i++) {
 		if (i > 0 && spans[i].offset == spans[i - 1].offset) {
@@ -291,49 +262,25 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 		}
 		if (check) {
 			CheckOffRow(layout, row, *check, r);
-			// The pointers zeroed where they lie in the record: in place for a record as stored; a compressed
-			// one's values are copied out of it (CdRow), a pointer's bytes found again in its long data.
+			// The pointers zeroed where they lie in the record. Both forms locate a complex value in the page:
+			// LocateValue in the record as stored, CdRow at the CD record's long data (it copies the values it
+			// normalizes, never a complex one), so a pointer outside the compared bytes is a page the reader
+			// misread, named (review of #580: a search of its bytes could zero another field's).
 			r.masked = r.bytes;
 			const uint8_t *start = page.bytes.data() + offset;
-			ForEachOffRow(layout, row, [&](size_t, const OffRowPointer &pointer) {
-				size_t at_byte = static_cast<size_t>(pointer.bytes - start);
-				if (pointer.bytes < start || at_byte + pointer.size > r.masked.size()) {
-					at_byte = r.masked.find(std::string(reinterpret_cast<const char *>(pointer.bytes), pointer.size));
+			const uint8_t *compared = start + r.masked.size();
+			ForEachOffRow(layout, row, [&](size_t k, const OffRowPointer &pointer) {
+				if (pointer.bytes < start || pointer.bytes > compared ||
+					pointer.size > static_cast<size_t>(compared - pointer.bytes)) {
+					throw FormatError("backup: page " + page.header.page_id.ToString() + " slot " +
+									  std::to_string(slot) + ": the off-row pointer of " + layout.columns[k].name +
+									  " does not lie in its record");
 				}
-				if (at_byte != std::string::npos && at_byte + pointer.size <= r.masked.size()) {
-					std::fill(r.masked.begin() + at_byte, r.masked.begin() + at_byte + pointer.size, '\0');
-				}
+				const size_t at_byte = static_cast<size_t>(pointer.bytes - start);
+				std::fill(r.masked.begin() + at_byte, r.masked.begin() + at_byte + pointer.size, '\0');
 			});
 		}
 		out.push_back(std::move(r));
-	}
-}
-
-//! Records two versions of a page share unchanged: the same bytes at the same offset are the same row
-//! (its key is in them) and the same values -- a write moves nothing it does not rewrite. Marks their
-//! slots in `old_same` / `new_same`, so only the others are read for their _mssql_rid. A heap's (`same_slot`)
-//! must lie in the same slot too: its rid is its place.
-void SameRecords(const Page &old_page, const Page &new_page, bool same_slot, std::vector<bool> &old_same,
-				 std::vector<bool> &new_same) {
-	static thread_local std::vector<RecordSpan> old_spans, new_spans;  // kept by the thread
-	RecordSpans(old_page, old_spans);
-	RecordSpans(new_page, new_spans);
-	old_same.assign(old_page.header.slot_count, false);
-	new_same.assign(new_page.header.slot_count, false);
-	size_t o = 0;
-	for (const auto &n : new_spans) {
-		while (o < old_spans.size() && old_spans[o].offset < n.offset) {
-			o++;
-		}
-		if (o == old_spans.size()) {
-			break;
-		}
-		const auto &old_span = old_spans[o];
-		if (old_span.offset == n.offset && old_span.end == n.end && (!same_slot || old_span.slot == n.slot) &&
-			std::memcmp(old_page.bytes.data() + n.offset, new_page.bytes.data() + n.offset, n.end - n.offset) == 0) {
-			old_same[old_span.slot] = true;
-			new_same[n.slot] = true;
-		}
 	}
 }
 
@@ -1193,8 +1140,9 @@ private:
 		// value stored off row may have changed under one (its record the same, its LOB pages not).
 		const bool skip_same = live && old_live && !lob_changed_;
 		if (skip_same) {
-			SameRecords(task.old_page, task.page, now_.data.entry->shape == TableShape::Heap, task.old_same,
-						task.new_same);
+			SameRecords(task.old_page.bytes.data(), task.old_page.header.slot_count, task.page.bytes.data(),
+						task.page.header.slot_count, PAGE_SIZE, now_.data.entry->shape == TableShape::Heap,
+						task.old_same, task.new_same);
 		}
 		const OffRowCheck check = NewCheck(i);
 		if (live) {

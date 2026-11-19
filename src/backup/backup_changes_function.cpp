@@ -166,7 +166,8 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 			}
 			return text;
 		};
-		for (const auto &c : CompareCatalogs(old_catalog->Model(), new_catalog->Model(), history_break, definition)) {
+		for (const auto &c : CompareCatalogs(old_catalog->Model(), new_catalog->Model(), history_break, definition,
+											 states.old_whole.get(), states.new_whole.get())) {
 			vector<Value> row;
 			row.push_back(start_number);
 			row.push_back(end_number);
@@ -266,8 +267,13 @@ TwoStates OpenTwoStates(ClientContext &context, const std::vector<std::string> &
 		}
 		auto open = [&](uint64_t number) {
 			if (attached) {
-				return std::shared_ptr<OpenedCatalog>(
-					OpenBackupCatalog(context, paths, true, CatalogScope(), {}, Version(number)).release());
+				const auto backup = FindAttachedBackup(context, paths.front(), Version(number));
+				std::shared_ptr<OpenedCatalog> catalog(OpenAttachedCatalog(context, *backup).release());
+				if (backup->objects) {
+					(number == start ? states.old_whole : states.new_whole) =
+						WholeModel(*catalog, "attached backup " + backup->name);
+				}
+				return catalog;
 			}
 			const auto &v = history->versions[number - 1];
 			const auto &full = history->backups[v.full].paths;

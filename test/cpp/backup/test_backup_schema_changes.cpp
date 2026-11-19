@@ -209,6 +209,22 @@ int main() {
 		}
 	}
 	{
+		// An ATTACH whose filters leave the switch's source out (review of #580): the models compared hold
+		// the target alone, the rowset's owner is found in every object's models.
+		CatalogModel old_whole, new_whole, old_kept, new_kept;
+		old_whole.tables.push_back(Table(12, "dbo", "target", 120, {Column(1, "id", "int", 56, false)}));
+		old_whole.tables.push_back(Table(13, "dbo", "staging", 130, {Column(1, "id", "int", 56, false)}));
+		new_whole.tables.push_back(Table(12, "dbo", "target", 130, {Column(1, "id", "int", 56, false)}));
+		new_whole.tables.push_back(Table(13, "dbo", "staging", 131, {Column(1, "id", "int", 56, false)}));
+		old_kept.tables.push_back(old_whole.tables[0]);
+		new_kept.tables.push_back(new_whole.tables[0]);
+		Check(CompareCatalogs(old_kept, new_kept, false, DEFINITION).empty(),
+			  "the narrowed models alone: the switch in unseen");
+		Check(Types(CompareCatalogs(old_kept, new_kept, false, DEFINITION, &old_whole, &new_whole)) ==
+				  std::vector<std::string>({"table_reload:target"}),
+			  "owners from every object's models: the target a reload, the source left out of the report");
+	}
+	{
 		// A sliding window: p1 switched out to archive, MERGE at the low end, SPLIT at the top -- the
 		// partitions renumbered, which by number read as false switches (review).
 		auto partitioned = [](int32_t id, std::vector<std::pair<int32_t, uint64_t>> parts) {

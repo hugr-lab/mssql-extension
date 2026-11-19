@@ -1534,10 +1534,11 @@ before the next opens.
 24. Differential overlay and chain check: the diff's pages by their header AU, the full's by the IAM
     chain through the overlay (D4) — 2 d. As built (PR 4c): `diff :=` on every file function but
     `mssql_backup_info`, and `diff` on ATTACH. The differential's `OpenedBackup` has the full's as its
-    base (`OpenedBackup::Base`, a cache entry of its own keyed by both backups' files): its passes are
-    header-scanned (`PageIndexOptions::full_backup` false; since DQ-41 was revisited its pass 1 of one
-    plain family is ranked from its GAM and DCM pages, `BuildRankedPassMap(…, differential)`) and its
-    `PageIndex` answers what they lack
+    base (`OpenedBackup::Base`, a cache entry of its own keyed by both backups' files): its pass 2 is
+    header-scanned, and its pass 1 is ranked from its GAM and DCM pages when they make a usable map --
+    one family, plain or compressed, `BuildRankedPassMap(…, differential)`; a striped one searched with
+    its DCM set, `StripedDcmBuilder` -- and header-scanned otherwise (`PageIndexOptions::full_backup`
+    false; DQ-41 revisited); its `PageIndex` answers what they lack
     from the full's (`SetBase`), so `AllocationMap` and `PageStore` over it are the overlay (the file
     header, GAM and PFS the differential carries win: D12's liveness recomputed). A statement opens both
     backups' files, one `FileBinding` naming the other (`also`), so one `BindFiles` binds both. The

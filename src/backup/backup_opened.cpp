@@ -883,6 +883,19 @@ std::unique_ptr<OpenedCatalog> OpenAttachedCatalog(ClientContext &context, const
 	return catalog;
 }
 
+std::shared_ptr<const CatalogModel> WholeModel(const OpenedCatalog &catalog, const std::string &what) {
+	BindFiles bound(catalog.Binding());	 // the model reads the catalog's pages
+	auto model = std::make_shared<CatalogModel>();
+	try {
+		*model = BuildCatalogModel(
+			*catalog.pages->store, *catalog.tables,
+			[](const SqlVariant &v, const std::string &what) { (void)SqlVariantValue(v, what); }, CatalogScope());
+	} catch (FormatError &e) {
+		throw FormatError(what + ": " + WithoutPrefix(e));
+	}
+	return model;
+}
+
 std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths_p,
 												 bool with_model, const CatalogScope &scope,
 												 const std::vector<std::string> &diff_p, const BackupAt &at) {
@@ -961,6 +974,7 @@ std::shared_ptr<AttachedBackup> OpenAttachedBackup(
 						 model->schemas.end());
 	attached->backup = opened.backup;
 	attached->cache_key = opened.cache_key;
+	attached->objects = scope.objects;
 	attached->model = std::move(model);
 	return attached;
 }

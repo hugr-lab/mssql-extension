@@ -226,9 +226,14 @@ struct AttachedBackup {
 	std::shared_ptr<const CatalogModel> model;
 	//! The ATTACH's schema_filter and schema_exclude; none: every schema.
 	std::function<bool(const std::string &schema)> wants_schema;
+	//! Its table_filter and table_exclude too (the model was built for them); none: every object.
+	std::shared_ptr<const std::function<bool(const std::string &schema, const std::string &object)>> objects;
 
 	bool WantsSchema(const std::string &schema) const {
 		return !wants_schema || wants_schema(schema);
+	}
+	bool WantsObject(const std::string &schema, const std::string &object) const {
+		return !objects || (*objects)(schema, object);
 	}
 };
 
@@ -323,6 +328,9 @@ std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const s
 												 const BackupAt &at = BackupAt());
 //! The catalog of `attached` for one statement: its files opened again and checked, its model.
 std::unique_ptr<OpenedCatalog> OpenAttachedCatalog(ClientContext &context, const AttachedBackup &attached);
+//! The model of every object of `catalog` (opened for the statement), whatever an ATTACH's filters keep:
+//! what a rowset's owner is found in (review of #580). `what` names the backup in a FormatError.
+std::shared_ptr<const CatalogModel> WholeModel(const OpenedCatalog &catalog, const std::string &what);
 
 //! The headers of the backup whose files `files` opened, read through them: one backup set per file
 //! (an appended set is refused), the same backup set GUID in every family, and for plain families

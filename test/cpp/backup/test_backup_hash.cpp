@@ -84,7 +84,10 @@ int main() {
 	for (size_t at = 0; at < data.size(); at += 13) {
 		sha.Update(data.data() + at, std::min<size_t>(13, data.size() - at));
 	}
-	Check(sha.Finish() == sha.Of(data), "SHA-256 in pieces");
+	// Each digest taken on its own: the operands of == are evaluated in no set order, and GCC took the
+	// right one first, appending `data` to the pieces (CI, linux_amd64).
+	const Digest pieces = sha.Finish();
+	Check(pieces == sha.Of(data), "SHA-256 in pieces");
 
 	if (failures) {
 		std::cerr << failures << " check(s) failed\n";

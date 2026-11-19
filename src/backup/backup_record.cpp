@@ -1,5 +1,7 @@
 #include "backup/backup_record.hpp"
 
+#include <algorithm>
+#include <cstring>
 #include <string>
 
 namespace duckdb {
@@ -136,6 +138,55 @@ FileHeaderRecord ReadFileHeaderRecord(const uint8_t *page, size_t page_size) {
 	h.filegroup_id = filegroup.U16(0);
 	h.size = size.U32(0);
 	return h;
+}
+
+void RecordSpans(const uint8_t *page, size_t page_size, uint16_t slot_count, std::vector<RecordSpan> &out) {
+	out.clear();
+	if (static_cast<size_t>(slot_count) * 2 + PAGE_HEADER_BYTES > page_size) {
+		return;	 // the page's reader names it
+	}
+	const size_t slot_array = page_size - 2u * slot_count;
+	for (uint16_t slot = 0; slot < slot_count; slot++) {
+		const size_t pos = page_size - 2 - 2 * static_cast<size_t>(slot);
+		const uint16_t offset = static_cast<uint16_t>(page[pos] | (page[pos + 1] << 8));
+		// Within the records' area only: an offset at or past the slot array has no bytes to compare
+		// (review of #580: SameRecords compared from it).
+		if (offset >= PAGE_HEADER_BYTES && offset < slot_array) {
+			RecordSpan span;
+			span.offset = offset;
+			span.slot = slot;
+			out.push_back(span);
+		}
+	}
+	std::sort(out.begin(), out.end(), [](const RecordSpan &a, const RecordSpan &b) { return a.offset < b.offset; });
+	for (size_t i = 0; i < out.size(); i++) {
+		out[i].end = static_cast<uint16_t>(i + 1 < out.size() ? out[i + 1].offset : slot_array);
+	}
+}
+
+void SameRecords(const uint8_t *old_page, uint16_t old_slots, const uint8_t *new_page, uint16_t new_slots,
+				 size_t page_size, bool same_slot, std::vector<bool> &old_same, std::vector<bool> &new_same) {
+	static thread_local std::vector<RecordSpan> old_spans, new_spans;  // kept by the thread
+	RecordSpans(old_page, page_size, old_slots, old_spans);
+	RecordSpans(new_page, page_size, new_slots, new_spans);
+	old_same.assign(old_slots, false);
+	new_same.assign(new_slots, false);
+	size_t o = 0;
+	for (const auto &n : new_spans) {
+		while (o < old_spans.size() && old_spans[o].offset < n.offset) {
+			o++;
+		}
+		if (o == old_spans.size()) {
+			break;
+		}
+		const auto &old_span = old_spans[o];
+		if (old_span.offset == n.offset && old_span.end == n.end && n.end > n.offset &&
+			(!same_slot || old_span.slot == n.slot) &&
+			std::memcmp(old_page + n.offset, new_page + n.offset, n.end - n.offset) == 0) {
+			old_same[old_span.slot] = true;
+			new_same[n.slot] = true;
+		}
+	}
 }
 
 }  // namespace backup

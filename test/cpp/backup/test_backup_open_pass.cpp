@@ -212,16 +212,24 @@ int main() {
 			Check(ok && a.Fetches() == 2 && b.Fetches() == 2, "two files read in turn keep their read-aheads (" +
 																  std::to_string(a.Fetches()) + " and " +
 																  std::to_string(b.Fetches()) + " fetches)");
-			// More streams than windows: the least recently used gives way, and is read again as asked.
+			// More streams than windows: the least recently used gives way, and is read again as asked. The
+			// oldest stream read again before the last one comes, so the one that gives way is the second:
+			// least recently used, not first in (review of #580: the oldest was both).
 			std::vector<std::unique_ptr<SourceAccess>> many;
-			for (size_t i = 0; i < SourceAccess::WINDOWS + 1; i++) {
+			auto start = [&]() {
 				many.emplace_back(new SourceAccess(*source, 0));
 				ok = ok && same(*many.back(), mixed, PREFIX, 8192) && same(*many.back(), mixed, PREFIX + 8192, 8192);
+			};
+			for (size_t i = 0; i < SourceAccess::WINDOWS; i++) {
+				start();
 			}
-			ok = ok && same(*many.front(), mixed, PREFIX + 2 * 8192, 8192);
-			Check(ok && many.front()->Fetches() == 3 && many.back()->Fetches() == 2,
+			ok = ok && same(*many[0], mixed, PREFIX + 2 * 8192, 8192);	// its window, used again
+			start();
+			ok = ok && same(*many[0], mixed, PREFIX + 3 * 8192, 8192) && same(*many[1], mixed, PREFIX + 2 * 8192, 8192);
+			Check(ok && many[0]->Fetches() == 2 && many[1]->Fetches() == 3 && many.back()->Fetches() == 2,
 				  "a stream past the windows' count evicts the least recently used one (" +
-					  std::to_string(many.front()->Fetches()) + " fetches for it)");
+					  std::to_string(many[0]->Fetches()) + " fetches for the oldest, used again; " +
+					  std::to_string(many[1]->Fetches()) + " for the next)");
 			SourceAccess end(*source, 0);
 			ok = same(end, mixed, mixed.size() - 9000, 4000) && same(end, mixed, mixed.size() - 5000, 4000) &&
 				 same(end, mixed, mixed.size() - 1000, 1000) && same(end, mixed, 0, static_cast<size_t>(ra) + 10);

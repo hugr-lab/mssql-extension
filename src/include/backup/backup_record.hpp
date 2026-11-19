@@ -29,6 +29,7 @@
 #include "backup/backup_bytes.hpp"
 
 #include <cstdint>
+#include <vector>
 
 namespace duckdb {
 namespace mssql {
@@ -114,6 +115,26 @@ struct FileHeaderRecord {
 
 //! The header record of a data file's page 0 (PAGE_SIZE bytes, one slot).
 FileHeaderRecord ReadFileHeaderRecord(const uint8_t *page, size_t page_size);
+
+//! A record of a page by where it lies (spec 085 PR 4c-3): its slot's offset, the next record's start
+//! (or the slot array), its slot.
+struct RecordSpan {
+	uint16_t offset = 0, end = 0, slot = 0;
+};
+
+//! The records of the page at `page` (page_size bytes, `slot_count` slots) by offset: each slot whose
+//! offset lies from the page header to the slot array (a freed slot, below it, and a crafted one at or
+//! past the slot array are left out: the reader of the slot names the latter), each bounded by the next
+//! one's start; nothing when the slot array would overlap the header. Two slots naming one record give
+//! two spans of one offset, the first empty.
+void RecordSpans(const uint8_t *page, size_t page_size, uint16_t slot_count, std::vector<RecordSpan> &out);
+
+//! Records two versions of a page (page_size bytes each) share unchanged: the same bytes at the same
+//! offset, to the same end, are the same row (its key is in them) with the same values -- a write moves
+//! nothing it does not rewrite. Marks their slots in `old_same` / `new_same` (sized to each page's slot
+//! count); with `same_slot` (a heap: a row's id is its place) only a record in the same slot.
+void SameRecords(const uint8_t *old_page, uint16_t old_slots, const uint8_t *new_page, uint16_t new_slots,
+				 size_t page_size, bool same_slot, std::vector<bool> &old_same, std::vector<bool> &new_same);
 
 }  // namespace backup
 }  // namespace mssql

@@ -55,9 +55,14 @@ using ViewDefinition = std::function<std::string(bool old_state, const CatalogVi
 //! Not events: a column's collation, identity, computed definition, sparseness or alias type schema
 //! alone; a table recreated under another case of its name (names compare as bytes). `history_break`: the two states
 //! are of a database restored or recreated between them -- object ids compare as nothing, so every table of the new
-//! state is a `table_reload` and one the old state alone has is dropped, by name.
+//! state is a `table_reload` and one the old state alone has is dropped, by name. `old_owners` /
+//! `new_owners`: the models a rowset's owner is found in, every object's where the models compared are
+//! narrowed by an ATTACH's filters (review of #580: a partition switched in from a table they leave out
+//! is still a reload); none: the models compared.
 std::vector<SchemaChange> CompareCatalogs(const CatalogModel &old_model, const CatalogModel &new_model,
-										  bool history_break, const ViewDefinition &definition);
+										  bool history_break, const ViewDefinition &definition,
+										  const CatalogModel *old_owners = nullptr,
+										  const CatalogModel *new_owners = nullptr);
 
 }  // namespace backup
 }  // namespace mssql

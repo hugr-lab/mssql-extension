@@ -230,7 +230,8 @@ std::string NameKey(const std::string &schema, const std::string &name) {
 }  // namespace
 
 std::vector<SchemaChange> CompareCatalogs(const CatalogModel &old_model, const CatalogModel &new_model,
-										  bool history_break, const ViewDefinition &definition) {
+										  bool history_break, const ViewDefinition &definition,
+										  const CatalogModel *old_owners_model, const CatalogModel *new_owners_model) {
 	std::vector<SchemaChange> out;
 	// Tables, by object id -- by name across a break, where object ids compare as nothing.
 	std::map<int32_t, const CatalogTable *> old_by_id, new_by_id;
@@ -256,8 +257,8 @@ std::vector<SchemaChange> CompareCatalogs(const CatalogModel &old_model, const C
 			out.push_back(std::move(c));
 		}
 	} else {
-		const auto old_owners = RowsetOwners(old_model);
-		const auto new_owners = RowsetOwners(new_model);
+		const auto old_owners = RowsetOwners(old_owners_model ? *old_owners_model : old_model);
+		const auto new_owners = RowsetOwners(new_owners_model ? *new_owners_model : new_model);
 		// A table dropped and another created under its name (a rebuild under a new object id) is one
 		// reload of that name, not a drop and a creation.
 		std::set<int32_t> reloaded_old, reloaded_new;

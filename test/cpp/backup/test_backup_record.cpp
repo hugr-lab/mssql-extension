@@ -155,6 +155,54 @@ int main() {
 			  "an index record is not split as FixedVar");
 	}
 
+	{
+		// Spec 085 PR 4c-3: the records two versions of a page share. Slots at 96 and 200 on a page of two
+		// slots (slot array at 8188); the second record changed on the newer page.
+		auto two = [](uint16_t first, uint16_t second, uint8_t fill) {
+			std::vector<uint8_t> page(8192, 0);
+			page[22] = 2;
+			page[8190] = first & 0xFF;
+			page[8191] = first >> 8;
+			page[8188] = second & 0xFF;
+			page[8189] = second >> 8;
+			std::fill(page.begin() + 96, page.begin() + 8188, 0x11);
+			std::fill(page.begin() + 200, page.begin() + 300, fill);
+			return page;
+		};
+		auto older = two(96, 200, 0x22), newer = two(96, 200, 0x33);
+		std::vector<RecordSpan> spans;
+		RecordSpans(newer.data(), newer.size(), 2, spans);
+		Check(spans.size() == 2 && spans[0].offset == 96 && spans[0].end == 200 && spans[1].end == 8188,
+			  "a page's records by offset, each to the next one's start or the slot array");
+		std::vector<bool> old_same, new_same;
+		SameRecords(older.data(), 2, newer.data(), 2, 8192, false, old_same, new_same);
+		Check(old_same == std::vector<bool>({true, false}) && new_same == std::vector<bool>({true, false}),
+			  "the unchanged record shared, the changed one not");
+		// Review of #580: a slot past the slot array, the same on both pages, was compared from beyond the
+		// page; it is left out (its reader names it).
+		auto bad_old = two(96, 0xFFF0, 0x22), bad_new = two(96, 0xFFF0, 0x22);
+		RecordSpans(bad_new.data(), bad_new.size(), 2, spans);
+		Check(spans.size() == 1 && spans[0].offset == 96 && spans[0].end == 8188,
+			  "a slot at or past the slot array is no record span");
+		SameRecords(bad_old.data(), 2, bad_new.data(), 2, 8192, false, old_same, new_same);
+		Check(old_same == std::vector<bool>({true, false}) && new_same == std::vector<bool>({true, false}),
+			  "and is never compared");
+		auto at_array = two(96, 8188, 0x22);
+		RecordSpans(at_array.data(), at_array.size(), 2, spans);
+		Check(spans.size() == 1, "a slot at the slot array's own start is none either");
+		// Two slots naming one record: two spans of one offset, the first empty, neither shared.
+		auto doubled = two(200, 200, 0x22);
+		RecordSpans(doubled.data(), doubled.size(), 2, spans);
+		Check(spans.size() == 2 && spans[0].end == spans[0].offset, "two slots of one record: the first empty");
+		SameRecords(doubled.data(), 2, doubled.data(), 2, 8192, true, old_same, new_same);
+		Check(!old_same[0] || !old_same[1], "an empty span is not shared");
+		std::vector<uint8_t> crowded(8192, 0);
+		crowded[22] = 0xFF;
+		crowded[23] = 0x0F;	 // 4095 slots: the slot array over the header
+		RecordSpans(crowded.data(), crowded.size(), 4095, spans);
+		Check(spans.empty(), "a slot array over the page header: no spans");
+	}
+
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;
 	return failures ? 1 : 0;
 }
