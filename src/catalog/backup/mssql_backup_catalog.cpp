@@ -241,10 +241,12 @@ std::shared_ptr<MSSQLBackupCatalog::State> MSSQLBackupCatalog::StateOf(optional_
 	if (context) {
 		query = &MSSQLBackupQueryStates::For(*context);
 		std::lock_guard<std::mutex> guard(query->lock);
-		auto &mine = query->states[this];
-		auto it = mine.find(key);
-		if (it != mine.end()) {
-			return it->second;
+		auto mine = query->states.find(this);
+		if (mine != query->states.end()) {
+			auto it = mine->second.find(key);
+			if (it != mine->second.end()) {
+				return it->second;
+			}
 		}
 	}
 	std::shared_ptr<State> found;
@@ -301,10 +303,12 @@ std::shared_ptr<const AttachedBackup> MSSQLBackupCatalog::BackupAt(optional_ptr<
 	if (context) {
 		auto &query = MSSQLBackupQueryStates::For(*context);
 		std::lock_guard<std::mutex> guard(query.lock);
-		auto &mine = query.states[this];
-		auto it = mine.find(at.key);
-		if (it != mine.end()) {
-			return it->second->backup;
+		auto mine = query.states.find(this);
+		if (mine != query.states.end()) {
+			auto it = mine->second.find(at.key);
+			if (it != mine->second.end()) {
+				return it->second->backup;
+			}
 		}
 	}
 	{
