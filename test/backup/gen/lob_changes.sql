@@ -23,7 +23,7 @@
 --   defaults  a bit added with a default before the full (the records hold none), the table rebuilt
 --             after it (the records hold it now): nothing changed;
 --   filler    dropped after the first differential, so the shrink has room to move pages into.
--- For local development (and 4c-3's tests); not run by default.
+-- Compressed (MS_XPRESS): the three are committed under test/data/backup/lob_changes. Not run by default.
 SET NOCOUNT ON;
 SET QUOTED_IDENTIFIER ON;
 GO
@@ -84,7 +84,7 @@ ALTER TABLE dbo.defaults ADD flag bit NOT NULL CONSTRAINT df_defaults_flag DEFAU
 GO
 CHECKPOINT;
 GO
-BACKUP DATABASE bak_lob_changes TO DISK = '$(DIR)/lob_changes_full.bak' WITH FORMAT, INIT, CHECKSUM, NAME = 'lob_changes_full';
+BACKUP DATABASE bak_lob_changes TO DISK = '$(DIR)/lob_changes_full.bak' WITH FORMAT, INIT, CHECKSUM, COMPRESSION, NAME = 'lob_changes_full';
 GO
 UPDATE dbo.lobs SET vmax = REPLICATE(CAST('V1' AS varchar(max)), 4000) WHERE id = 1;
 UPDATE dbo.lobs SET vmax.WRITE('appended', NULL, NULL) WHERE id = 2;
@@ -131,7 +131,7 @@ ALTER TABLE dbo.defaults REBUILD;
 GO
 CHECKPOINT;
 GO
-BACKUP DATABASE bak_lob_changes TO DISK = '$(DIR)/lob_changes_diff.bak' WITH FORMAT, INIT, CHECKSUM, DIFFERENTIAL, NAME = 'lob_changes_diff';
+BACKUP DATABASE bak_lob_changes TO DISK = '$(DIR)/lob_changes_diff.bak' WITH FORMAT, INIT, CHECKSUM, COMPRESSION, DIFFERENTIAL, NAME = 'lob_changes_diff';
 GO
 DROP TABLE dbo.filler;
 GO
@@ -141,5 +141,5 @@ DBCC SHRINKFILE (1, 1) WITH NO_INFOMSGS;
 GO
 CHECKPOINT;
 GO
-BACKUP DATABASE bak_lob_changes TO DISK = '$(DIR)/lob_changes_shrink.bak' WITH FORMAT, INIT, CHECKSUM, DIFFERENTIAL, NAME = 'lob_changes_shrink';
+BACKUP DATABASE bak_lob_changes TO DISK = '$(DIR)/lob_changes_shrink.bak' WITH FORMAT, INIT, CHECKSUM, COMPRESSION, DIFFERENTIAL, NAME = 'lob_changes_shrink';
 GO

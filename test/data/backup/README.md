@@ -18,6 +18,7 @@ repository ignores every other `*.bak`.
 | `diff.bak` | a differential over `full.bak` |
 | `log.trn` | a log backup after it |
 | `switch_in/switch_full.bak` + `switch_diff.bak` | another database (`test/backup/gen/switch_in.sql`): a partition switched in from a staging table between a full and its differential, both compressed (MS_XPRESS: 0.7 MB), with `sets.txt` and golden files of its own (`mssql_backup_table_changes` past an ATTACH's filters) |
+| `lob_changes/lob_changes_full.bak` + `_diff.bak` + `_shrink.bak` | another database (`test/backup/gen/lob_changes.sql`): values stored off row changed in every form, columns dropped, copied and defaulted, then a shrink, the two differentials over the full, compressed (MS_XPRESS: 1.1 MB), with `sets.txt` and golden files of their own (`mssql_backup_lob_changes.test`) |
 | `sets.txt` | one line per backup set, `name\|file[,file]`: the sets the comparison reads, in order |
 | `<set>.headeronly.txt`, `.labelonly.txt`, `.filelistonly.txt` | the server's `RESTORE` answers for the set (`sqlcmd -s '\|' -W`) |
 

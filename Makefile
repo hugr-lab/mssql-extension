@@ -1439,6 +1439,7 @@ test-backup-golden:
 	@if [ ! -x build/release/duckdb ]; then echo "test-backup-golden: run 'make' first." >&2; exit 1; fi
 	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --expect-major 17 $(PROJ_DIR)test/data/backup
 	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 100 $(PROJ_DIR)test/data/backup/switch_in
+	python3 -I $(PROJ_DIR)test/backup/compare_info.py --duckdb build/release/duckdb --min-fields 100 $(PROJ_DIR)test/data/backup/lob_changes
 # Spec 085 PR 2a: the release build the backup oracle lane tests with -- httpfs linked in
 # statically (test/backup/httpfs_extension_config.cmake, at the duckdb pin's own httpfs commit), so
 # the lane reads its backups from R2 through s3://. Like bench-build, a later plain `make`

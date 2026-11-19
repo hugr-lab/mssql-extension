@@ -1669,7 +1669,8 @@ before the next opens.
     row, a column copied into a new one and dropped, a bit added with a default then the table rebuilt)
     and shrinks the
     file for a second differential: checked against a whole comparison with EXCEPT ALL both ways on
-    2019, 2022 and 2025 (2017's server does not start on the development machine). A chunk's
+    2019, 2022 and 2025 (2017's server does not start on the development machine), and committed
+    (compressed, 2025's: `test/data/backup/lob_changes`, `mssql_backup_lob_changes.test`). A chunk's
     staging is reserved as the scan's (D17). A partition switched in is a reload, seen against the two
     whole models. A retyped column's older values go through DuckDB's TryCast (NULL and a WARNING where
     it refuses). Tests: `mssql_backup_table_changes.test` (the samples, checked against a whole
