@@ -64,6 +64,7 @@ const column_t UNREAD_COLUMN_START = VIRTUAL_COLUMN_START + 16;
 struct ScanBindData : public TableFunctionData {
 	vector<std::string> paths;
 	vector<std::string> diff;  // task 24: a differential over the full on `paths`
+	BackupAt at;			   // task 24b: a version of the history of `paths`
 	std::string schema;
 	std::string table;
 	std::shared_ptr<OpenedCatalog> catalog;
@@ -87,6 +88,7 @@ struct ScanBindData : public TableFunctionData {
 		auto copy = make_uniq<ScanBindData>();
 		copy->paths = paths;
 		copy->diff = diff;
+		copy->at = at;
 		copy->schema = schema;
 		copy->table = table;
 		copy->max_threads = max_threads;
@@ -103,7 +105,8 @@ struct ScanBindData : public TableFunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<ScanBindData>();
-		return paths == other.paths && diff == other.diff && schema == other.schema && table == other.table &&
+		return paths == other.paths && diff == other.diff && at.unit == other.at.unit &&
+			   (!at.IsSet() || at.value == other.at.value) && schema == other.schema && table == other.table &&
 			   max_threads == other.max_threads && max_memory == other.max_memory;
 	}
 	//! Every EXECUTE binds again: the file is read at bind.
@@ -132,7 +135,7 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 			data.attached ? OpenAttachedCatalog(context, *data.attached).release()
 						  : OpenBackupCatalog(context, std::vector<std::string>(data.paths.begin(), data.paths.end()),
 											  true, TableScope(data.schema, data.table),
-											  std::vector<std::string>(data.diff.begin(), data.diff.end()))
+											  std::vector<std::string>(data.diff.begin(), data.diff.end()), data.at)
 								.release());
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", FUNCTION, e.what());
@@ -150,7 +153,7 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 			FUNCTION, data.schema, data.table);
 	}
 	if (!data.entry) {
-		auto attached = data.attached ? data.attached : FindAttachedBackup(context, data.paths.front());
+		auto attached = data.attached ? data.attached : FindAttachedBackup(context, data.paths.front(), data.at);
 		if (attached && data.paths.size() == 1) {
 			throw InvalidInputException(
 				"%s: the backup attached as %s has no table or indexed view %s.%s that its filters keep "
@@ -183,6 +186,7 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	auto data = make_uniq<ScanBindData>();
 	data->paths = PathsOf(input.inputs[0], FUNCTION);
 	data->diff = DiffPathsOf(input.named_parameters, FUNCTION);
+	data->at = BackupAtOf(input.named_parameters, FUNCTION);
 	if (input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
 		throw InvalidInputException("%s: the schema and the table must not be NULL", FUNCTION);
 	}
@@ -256,6 +260,8 @@ void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_dat
 	serializer.WritePropertyWithDefault<idx_t>(106, "max_threads", data.max_threads, 0);
 	serializer.WritePropertyWithDefault<idx_t>(107, "max_memory", data.max_memory, 0);
 	serializer.WritePropertyWithDefault<vector<std::string>>(108, "diff", data.diff);
+	serializer.WritePropertyWithDefault<std::string>(109, "at_unit", data.at.unit);
+	serializer.WritePropertyWithDefault<Value>(110, "at_value", data.at.value, Value());
 }
 
 unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunction &) {
@@ -269,6 +275,8 @@ unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunct
 	data->max_threads = deserializer.ReadPropertyWithExplicitDefault<idx_t>(106, "max_threads", 0);
 	data->max_memory = deserializer.ReadPropertyWithExplicitDefault<idx_t>(107, "max_memory", 0);
 	data->diff = deserializer.ReadPropertyWithDefault<vector<std::string>>(108, "diff");
+	data->at.unit = deserializer.ReadPropertyWithDefault<std::string>(109, "at_unit");
+	data->at.value = deserializer.ReadPropertyWithExplicitDefault<Value>(110, "at_value", Value());
 	BindTable(deserializer.Get<ClientContext &>(), *data, nullptr);
 	// The plan's column positions and vectors are those it was bound with: a file at the same path that
 	// reads otherwise now (a nightly backup replaced: a column added, dropped, renamed or retyped) is
@@ -1036,6 +1044,7 @@ TableFunction MakeScanFunction(const LogicalType &path) {
 	// NULL (the default): DuckDB's memory_limit. A size as memory_limit takes it ('2GB').
 	f.GetSignature().AddKeywordOnly("max_memory", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 	AddDiffParameter(f);
+	AddVersionParameters(f);
 	f.projection_pushdown = true;
 	f.get_partition_data = PartitionData;
 	f.table_scan_progress = Progress;
@@ -1099,10 +1108,16 @@ virtual_column_map_t ScanVirtualColumns(const std::vector<UnreadColumn> &unread)
 }
 
 TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &entry,
-								   std::shared_ptr<const AttachedBackup> attached, const std::string &schema,
-								   const std::string &table, unique_ptr<FunctionData> &bind_data) {
+								   std::shared_ptr<const AttachedBackup> attached, uint64_t version,
+								   const std::string &schema, const std::string &table,
+								   unique_ptr<FunctionData> &bind_data) {
 	auto data = make_uniq<ScanBindData>();
 	data->paths = {attached->name};
+	if (version != 0) {
+		// A plan deserialized finds the version again by its number (AT picked it).
+		data->at.unit = "version";
+		data->at.value = Value::BIGINT(static_cast<int64_t>(version));
+	}
 	data->schema = schema;
 	data->table = table;
 	data->table_entry = &entry;

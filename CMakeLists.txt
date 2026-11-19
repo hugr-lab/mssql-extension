@@ -176,6 +176,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_collation.cpp
     src/backup/backup_container.cpp
     src/backup/backup_function_common.cpp
+    src/backup/backup_history.cpp
     src/backup/backup_iam.cpp
     src/backup/backup_lob.cpp
     src/backup/backup_lob_map.cpp
@@ -193,6 +194,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_reservation.cpp
     src/backup/backup_scan_function.cpp
     src/backup/backup_set.cpp
+    src/backup/backup_snapshots_function.cpp
     src/backup/backup_sql_variant.cpp
     src/backup/backup_system_tables.cpp
     src/backup/backup_tables_function.cpp

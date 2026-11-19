@@ -308,7 +308,8 @@ SELECT o.id, c.name FROM bk.sales.orders o JOIN bk.sales.customers c ON c.id = o
 A table reads as `mssql_backup_scan` reads it -- the same columns and types, the virtual
 `_mssql_page`, `_mssql_rid`, `_mssql_page_lsn` and `_mssql_lob` included -- and `dbo` is the default
 schema (`bk.orders`, `USE bk`). Views are not entries: their definitions are T-SQL, which DuckDB does
-not run (`mssql_backup_views` lists them). A log or differential backup is refused at `ATTACH`.
+not run (`mssql_backup_views` lists them). Without `history`, a log or differential backup is refused
+at `ATTACH` (a differential goes beside its full, `diff`).
 
 It is always read-only, whatever the options say: `CREATE`, `INSERT`, `UPDATE`, `DELETE`, `ALTER`,
 `DROP` and `COPY … FROM` are refused.
@@ -320,6 +321,7 @@ It is always read-only, whatever the options say: `CREATE`, `INSERT`, `UPDATE`, 
 | `schema_exclude` | A regex: the schemas it matches are left out |
 | `table_exclude` | A regex: the tables and views it matches are left out |
 | `diff` | A differential backup to read over the attached full ([above](#a-differential-over-its-full)) |
+| `history`, `snapshot_version`, `snapshot_time` | A history of backups ([below](#a-history-of-backups)) |
 
 The filters work as `TYPE mssql`'s. An object is kept when it passes the filter -- it matches it, or
 no filter is given -- and does not match the exclusion, so an exclusion alone keeps everything else:
@@ -354,6 +356,81 @@ SELECT table_name, row_count FROM mssql_backup_tables('bk');
 
 Every statement opens the files again and checks each one against what the `ATTACH` opened: a file
 whose size or modification time changed since is refused (`DETACH` it and `ATTACH` it again).
+
+## A history of backups
+
+A database backed up as a full a day and a differential an hour is a history of states, one an hour.
+`history true` attaches every backup a glob or list names as one catalog, and DuckDB's `AT` reads any
+state of it, as a DuckLake's snapshots are read:
+
+```sql
+ATTACH 's3://backups/sales/*.bak' AS b (TYPE mssql_backup, history true);
+FROM b.snapshots();
+SELECT count(*) FROM b.dbo.orders;                                         -- the latest state
+SELECT count(*) FROM b.dbo.orders AT (VERSION => 42);
+SELECT count(*) FROM b.dbo.orders AT (TIMESTAMP => TIMESTAMP '2026-11-17 15:30');
+```
+
+Each full backup is a version, and so is each differential over a full among the files, numbered from
+1 in the order they finished (two in one second by their checkpoint LSN). `AT (VERSION => n)` reads
+the n-th; `AT (TIMESTAMP => t)` the last one finished at or before `t`, in whole seconds, compared with
+the backups' times as `RESTORE HEADERONLY` gives them: the server's local time, so a `TIMESTAMPTZ` is
+taken in the session's time zone, and the hour a clock is set back in is ambiguous. Two versions can be
+read in one query. A version this catalog does not have is an error, also when the catalog is only on
+the `search_path`. A version's catalog is built at its first read and kept while the history has the
+version (a refresh that no longer finds its files lets it go, once no transaction reading it is open);
+while the opened-file cache keeps it, the full a day's differentials lie over is indexed once for all of
+them. A name with no schema (`b.orders`) is looked up in the default version's default schema, `dbo`
+unless the filters hid it, whatever `AT` names.
+
+The file functions are the catalog's own too, as a DuckLake's: `b.snapshots()`, `b.refresh()`, and
+`b.info()`, `b.schemas()`, `b.tables()`, `b.views()` (the views' T-SQL definitions) and `b.columns()`,
+each taking `version :=` or `as_of :=` (`FROM b.tables(version := 3)`). They are
+`mssql_backup_<name>('b', …)`, which reads the same. When the filters keep nothing they still answer,
+with no rows.
+
+`mssql_backup_snapshots('b')` -- or `b.snapshots()` -- lists the versions: `snapshot_id`,
+`snapshot_time` (the finish), `backup_type`, `is_copy_only`, `backup_start_date`, `checkpoint_lsn`, the
+backup set GUIDs, `recovery_fork_id`, `history_break` (another lineage than the version before -- another
+recovery fork or another family GUID: the database restored or recreated between them), `is_default`, `database_name` and the files (`full_files`,
+`diff_files`). It takes files too, with no `ATTACH`, reading each one's header only.
+
+The `ATTACH` reads every file's header, one after another, and the default version's pages; nothing
+else until a version is read. Log backups are left out with a WARNING in `duckdb_logs`, as are a
+differential whose full is not among the files, a striped backup missing a file and a copy of a file
+beside it (the same backup, read once). Files of two databases (another name and family GUID), a file that is not a
+backup, and one the reader refuses (encrypted, appended sets) refuse the whole `ATTACH`; a database
+recreated under its name is one history, with `history_break` where it was. A file that changed since
+the `ATTACH` is refused when its version is read, until a refresh reads it again. New backups are
+taken in by `CALL b.refresh()` (`mssql_backup_refresh('b')`): the glob is expanded again and the headers
+of the new or changed files read (a file whose server gives no ETag or modification time is read every
+time), and the default version opened; a version already read keeps its catalog, a file moved or
+rewritten makes its version a new one. A transaction keeps the versions of its first read -- through the
+catalog or through a file function on its name alike: a refresh on another connection reaches its next
+transaction, and the transaction that refreshes reads the new versions from the refresh on. `snapshot_version` / `snapshot_time` choose
+a version by its backups, which it stays across a refresh (if its files are gone, the latest is read,
+with a WARNING). A version's number is its place among the files, so a backup added that
+finished earlier than others (a full found for a differential left out, say) moves the later ones, and
+an importer resuming by number would skip it; one resuming by the files it applied, or by time with a
+look for versions that arrived late, does not. The headers are read 64 files at a time.
+
+| ATTACH option | Description |
+|---|---|
+| `history` | Every backup the path names, as the catalog's versions |
+| `snapshot_version` | The version read without `AT` (the latest by default) |
+| `snapshot_time` | The version read without `AT`: the last one finished by this time |
+
+Without `history` the backup attached is a history of its own: a full is version 1; a full with its
+`diff` is version 1, the full, and version 2, with the differential.
+
+The file functions take `version :=` or `as_of :=`, over an attached name or over files (which reads
+every file's header again on every call, so a long history is better attached):
+
+```sql
+SELECT table_name, row_count FROM mssql_backup_tables('b', version := 3);
+SELECT count(*) FROM mssql_backup_scan('/backups/sales/*.bak', 'dbo', 'orders',
+                                       as_of := TIMESTAMP '2026-11-17 15:30');
+```
 
 ## Opening a backup once
 

@@ -1506,6 +1506,28 @@ flowchart BT
   (`CatalogColumn::duckdb_name`): the backup's, but for columns of a case-sensitive database that
   differ only in case, which get the first `_N` no column of the table is named.
 
+- **A history of backups** (spec 085 PR 4c-2, DQ-48): the catalog's versions, from every file the
+  ATTACH names (`history true`: `ReadBackupHistory` reads each file's header only, `BuildHistory`
+  orders the fulls and the differentials over them by finish, then checkpoint LSN) or from the backup
+  it attached (a full; the full, then full + `diff`). Each version is a state of its own -- an
+  `AttachedBackup` (`version` its number) and the schema and table entries built from its model --,
+  built at its first lookup outside the catalog's lock (two lookups may build one together; the first
+  is kept) and never changed after; the default version's at ATTACH. `SupportsTimeTravel`: the AT
+  clause reaches `LookupSchema` (DuckDB carries it to the schema lookup), which answers with the
+  version's schemas. The versions over one full share its `OpenedBackup` (the cache entry, each
+  overlay's base), so the full is indexed once for a day of differentials.
+
+```mermaid
+flowchart LR
+  files["*.bak (headers only)"] --> hist["BackupHistory<br/>versions 1..N"]
+  hist --> cat["MSSQLBackupCatalog"]
+  cat -- "AT (VERSION / TIMESTAMP)" --> st["state of version n<br/>AttachedBackup + entries<br/>(built at first lookup)"]
+  st --> full["full's OpenedBackup<br/>(shared)"]
+  st -. "a differential" .-> ov["overlay OpenedBackup<br/>(base = the full's)"]
+  ov --> full
+  hist --> snap["mssql_backup_snapshots<br/>bk.snapshots()"]
+```
+
 - **The file is untrusted input.** Every parser reads through `ByteReader` (`backup_bytes`), which
   checks each length, offset and count against its span; a read past one is a named `FormatError`,
   and the table function turns it into an `InvalidInputException` naming the file. Each MTF

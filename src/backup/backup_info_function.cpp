@@ -228,18 +228,21 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 
 struct BackupInfoBindData : public TableFunctionData {
 	vector<std::string> paths;
+	BackupAt at;  // task 24b
 	std::vector<Value> row;
 	bool reread = false;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<BackupInfoBindData>();
 		copy->paths = paths;
+		copy->at = at;
 		copy->row = row;
 		copy->reread = reread;
 		return std::move(copy);
 	}
 	bool Equals(const FunctionData &other_p) const override {
-		return paths == other_p.Cast<BackupInfoBindData>().paths;
+		const auto &other = other_p.Cast<BackupInfoBindData>();
+		return paths == other.paths && at.unit == other.at.unit && (!at.IsSet() || at.value == other.at.value);
 	}
 	//! The row is read at bind, and a prepared statement keeps it: a backup is opened to be read, and
 	//! a file rewritten under an open backup is invalid anyway while the rewrite runs. `reread := true`
@@ -257,6 +260,7 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 							  vector<Identifier> &names) {
 	auto data = make_uniq<BackupInfoBindData>();
 	data->paths = PathsOf(input.inputs[0], "mssql_backup_info");
+	data->at = BackupAtOf(input.named_parameters, "mssql_backup_info");
 	for (const auto &kv : input.named_parameters) {
 		if (kv.first == "reread") {
 			data->reread = !kv.second.IsNull() && kv.second.GetValue<bool>();
@@ -280,7 +284,8 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	try {
 		// The headers are what the opened-file cache holds first (D9): a later call on the same files
 		// takes them, and so does a catalog call after this one.
-		auto opened = OpenBackup(context, std::vector<std::string>(data->paths.begin(), data->paths.end()));
+		auto opened = OpenBackup(context, std::vector<std::string>(data->paths.begin(), data->paths.end()),
+								 std::vector<std::string>(), data->at);
 		data->row = InfoRow(opened.backup->Headers());
 	} catch (FormatError &e) {
 		throw InvalidInputException("mssql_backup_info: %s", e.what());
@@ -315,6 +320,7 @@ void RegisterBackupInfoFunction(ExtensionLoader &loader) {
 		TableFunction f("mssql_backup_info", {argument}, Execute, Bind, Init);
 		f.GetSignature().AddKeywordOnly("position", LogicalType::INTEGER, Value::INTEGER(1));
 		f.GetSignature().AddKeywordOnly("reread", LogicalType::BOOLEAN, Value::BOOLEAN(false));
+		AddVersionParameters(f);
 		set.AddFunction(f);
 	}
 	mssql::RegisterDocumentedFunction(

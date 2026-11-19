@@ -12,13 +12,16 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "backup/backup_opened.hpp"
 #include "backup/backup_scan_function.hpp"
+#include "catalog/backup/mssql_backup_catalog.hpp"
 #include "duckdb.hpp"
+#include "duckdb/transaction/transaction.hpp"
 #include "mssql_extension.hpp"
 
 using namespace duckdb;
@@ -295,6 +298,193 @@ int main() {
 		auto entry = ObjectCache::GetObjectCache(context).Get<OpenedBackup>(full->opened.cache_key);
 		Check(entry.get() == a->opened.backup->Base().get(),
 			  "and its base is the full's entry again: one copy of the full, counted (review of #575)");
+	}
+
+	{
+		// Task 24b: a history's folder grows; mssql_backup_refresh takes the new backups in and keeps a
+		// version read before by its backups and files, not by its number.
+		const auto dir = std::filesystem::temp_directory_path() /
+						 ("mssql_backup_history_" + std::to_string(reinterpret_cast<uintptr_t>(&db)));
+		std::filesystem::remove_all(dir);
+		std::filesystem::create_directories(dir);
+		std::filesystem::copy_file(DIR + "full.bak", dir / "a_full.bak");
+		std::filesystem::copy_file(DIR + "diff.bak", dir / "b_diff.bak");
+		std::string glob;
+		for (const char ch : (dir / "*.bak").string()) {
+			glob += ch;
+			if (ch == '\'') {
+				glob += ch;	 // inside a SQL literal
+			}
+		}
+		auto attach = con.Query("ATTACH '" + glob + "' AS hr (TYPE mssql_backup, history true)");
+		Check(!attach->HasError(),
+			  "a history of a full and its differential attached " + (attach->HasError() ? attach->GetError() : ""));
+		auto pinned = con.Query("ATTACH '" + glob + "' AS hp (TYPE mssql_backup, history true, snapshot_version 1)");
+		Check(!pinned->HasError(), "the same, snapshot_version 1");
+		Check(ScalarInt(con, "SELECT count(*) FROM hr.items") == 2500, "the differential's rows");
+		auto diff_before = OpenBackupCatalog(context, {"hr"});
+		Check(ScalarInt(con, "SELECT versions_before * 10 + versions FROM mssql_backup_refresh('hr')") == 22,
+			  "a refresh with nothing new: 2 versions before and after");
+		// A copy-only full that finished between the full and the differential: the differential moves from
+		// version 2 to 3 and keeps its state.
+		std::filesystem::copy_file(DIR + "full_xpress.bak", dir / "a_copy_only.bak");
+		Check(ScalarInt(con, "SELECT versions FROM mssql_backup_refresh('hr')") == 3,
+			  "a refresh takes a copy-only full in: 3 versions");
+		Check(ScalarInt(con, "SELECT snapshot_id FROM hr.snapshots() WHERE backup_type = 'differential'") == 3,
+			  "the differential, finished last, is version 3 now");
+		auto diff_after = OpenBackupCatalog(context, {"hr"});
+		Check(diff_after->opened.backup.get() == diff_before->opened.backup.get(),
+			  "and keeps the state read as version 2 (the same opened backup)");
+		Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000,
+			  "version 1, the full, still reads");
+		// snapshot_version 1 pins the full by its backup, wherever it lands.
+		Check(ScalarInt(con, "SELECT versions FROM mssql_backup_refresh('hp')") == 3, "the pinned history refreshed");
+		Check(ScalarInt(con, "SELECT snapshot_id FROM hp.snapshots() WHERE is_default") == 1 &&
+				  ScalarInt(con, "SELECT count(*) FROM hp.items") == 2000,
+			  "snapshot_version 1 still the full (2000 items)");
+		// A file read before, touched: its version is a new state, opened and checked against the refresh.
+		std::filesystem::last_write_time(
+			dir / "a_full.bak", std::filesystem::last_write_time(dir / "a_full.bak") + std::chrono::seconds(10));
+		auto stale = con.Query("SELECT count(*) FROM hr.items AT (VERSION => 1)");
+		Check(stale->HasError() && stale->GetError().find("changed since it was attached") != std::string::npos,
+			  "a file touched since the refresh refused by name");
+		Check(ScalarInt(con, "SELECT versions FROM mssql_backup_refresh('hr')") == 3, "refreshed again");
+		Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000 &&
+				  ScalarInt(con, "SELECT count(*) FROM hr.items") == 2500,
+			  "and the touched full reads again, alone and under the differential");
+		// A file renamed: the refresh follows it.
+		std::filesystem::rename(dir / "b_diff.bak", dir / "c_diff.bak");
+		Check(ScalarInt(con, "SELECT versions FROM mssql_backup_refresh('hr')") == 3 &&
+				  ScalarInt(con, "SELECT count(*) FROM hr.items") == 2500,
+			  "a renamed differential read at its new path after a refresh");
+		// A transaction keeps the versions it read first; a refresh on another connection reaches its next one.
+		{
+			Connection other(db);
+			con.Query("BEGIN");
+			Check(ScalarInt(con, "SELECT count(*) FROM hr.snapshots()") == 3, "a transaction reads 3 versions");
+			std::filesystem::copy_file(DIR + "full_zstd.bak", dir / "a_copy_only_2.bak");
+			Check(ScalarInt(other, "SELECT versions FROM mssql_backup_refresh('hr')") == 4,
+				  "another connection refreshes: 4 versions");
+			Check(ScalarInt(con, "SELECT count(*) FROM hr.snapshots()") == 3 &&
+					  ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 3)") == 2500,
+				  "the open transaction still reads its 3 (version 3 the differential)");
+			// The file functions on the name too, which do no catalog lookup (review of #579).
+			Check(ScalarInt(con, "SELECT count(*) FROM mssql_backup_snapshots('hr')") == 3 &&
+					  ScalarInt(con, "SELECT count(*) FROM mssql_backup_scan('hr', 'dbo', 'items', version := 3)") ==
+						  2500,
+				  "and so do mssql_backup_snapshots / mssql_backup_scan on its name");
+			Check(
+				ScalarInt(other, "SELECT count(*) FROM mssql_backup_scan('hr', 'dbo', 'items', version := 3)") == 2000,
+				"while the other connection's version 3 is the new copy-only full");
+			con.Query("COMMIT");
+			Check(ScalarInt(con, "SELECT count(*) FROM hr.snapshots()") == 4, "its next transaction reads 4");
+			// A transaction whose first read is a file function on the name (no catalog lookup starts it):
+			// pinned all the same (review of #579).
+			con.Query("BEGIN");
+			Check(ScalarInt(con, "SELECT count(*) FROM mssql_backup_snapshots('hr')") == 4,
+				  "a transaction opened by mssql_backup_snapshots reads 4");
+			std::filesystem::copy_file(DIR + "stripe_1.bak", dir / "a_stripe_1.bak");
+			std::filesystem::copy_file(DIR + "stripe_2.bak", dir / "a_stripe_2.bak");
+			Check(ScalarInt(other, "SELECT versions FROM mssql_backup_refresh('hr')") == 5,
+				  "another connection refreshes: 5 versions (a striped full)");
+			Check(ScalarInt(con, "SELECT count(*) FROM mssql_backup_snapshots('hr')") == 4,
+				  "the transaction still reads its 4");
+			con.Query("COMMIT");
+			// The states a transaction read are its own, by key (review of #579): read again, they are not
+			// added again; dropped from the catalog by a refresh on another connection (the file touched: a
+			// new state), they stay the transaction's, the same entries. Reading the touched file's rows is
+			// refused by name all the same.
+			con.Query("BEGIN");
+			Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000,
+				  "a transaction reads version 1, the full");
+			auto &attached = Catalog::GetCatalog(*con.context, "hr").GetAttached();
+			auto &own = Transaction::Get(*con.context, attached).Cast<MSSQLBackupTransaction>();
+			const size_t read = own.states.size();
+			std::set<const void *> held;
+			for (const auto &s : own.states) {
+				held.insert(s.second.get());
+			}
+			Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000 &&
+					  ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000 &&
+					  own.states.size() == read,
+				  "reading it again adds no state (" + std::to_string(read) + " held)");
+			std::filesystem::last_write_time(
+				dir / "a_full.bak", std::filesystem::last_write_time(dir / "a_full.bak") + std::chrono::seconds(20));
+			Check(ScalarInt(other, "SELECT versions FROM mssql_backup_refresh('hr')") == 5,
+				  "another connection refreshes past the touched full");
+			auto rows = con.Query("SELECT count(*) FROM hr.items AT (VERSION => 1)");
+			Check(rows->HasError() && rows->GetError().find("changed since it was attached") != std::string::npos,
+				  "the transaction's version 1, its file changed, refused by name");
+			bool same = own.states.size() == read;
+			for (const auto &s : own.states) {
+				same = same && held.count(s.second.get());
+			}
+			Check(same, "and the transaction holds the same states it read, none opened again");
+			con.Query("ROLLBACK");
+			Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000,
+				  "the next transaction reads the touched full as refreshed");
+			// The default version a transaction read, dropped from the catalog by another connection's refresh
+			// (its files gone) and back since, is the default again after the transaction's own refresh: the
+			// catalog holds its state (re-review of #579: the refresh found it among the transaction's states and
+			// left the catalog's without it, so a lookup with no AT -- the database size, the default schema --
+			// threw).
+			con.Query("BEGIN");
+			const int64_t default_rows = ScalarInt(con, "SELECT count(*) FROM hr.items");
+			auto files = con.Query(
+				"SELECT unnest(CASE WHEN len(diff_files) > 0 THEN diff_files ELSE full_files END) "
+				"FROM hr.snapshots() WHERE is_default");
+			std::vector<std::string> moved;
+			while (!files->HasError()) {
+				auto chunk = files->Fetch();
+				if (!chunk || chunk->size() == 0) {
+					break;
+				}
+				for (idx_t r = 0; r < chunk->size(); r++) {
+					moved.push_back(chunk->GetValue(0, r).ToString());
+				}
+			}
+			Check(!moved.empty(), "the default version's files");
+			for (const auto &f : moved) {
+				std::filesystem::rename(f, f + ".away");
+			}
+			auto fewer = other.Query("SELECT versions FROM mssql_backup_refresh('hr')");
+			Check(!fewer->HasError(), "another connection refreshes without the default's files");
+			for (const auto &f : moved) {
+				std::filesystem::rename(f + ".away", f);
+			}
+			Check(ScalarInt(con, "SELECT versions FROM mssql_backup_refresh('hr')") == 5,
+				  "the transaction refreshes with them back: 5 versions");
+			auto size = other.Query("SELECT count(*) FROM pragma_database_size() WHERE database_name = 'hr'");
+			Check(!size->HasError() && ScalarInt(other, "SELECT count(*) FROM hr.items") == default_rows,
+				  "the default version read with no AT, its size too " + (size->HasError() ? size->GetError() : ""));
+			con.Query("COMMIT");
+		}
+		auto refused = con.Query("SELECT * FROM mssql_backup_refresh('nope')");
+		Check(refused->HasError() && refused->GetError().find("is not a backup attached") != std::string::npos,
+			  "a refresh of no attached backup refused");
+		// A file whose name has glob characters, found by a glob, is opened again as itself (review of #579:
+		// `s[1].bak` was taken for a glob that matches `s1.bak`).
+		{
+			const auto odd = std::filesystem::temp_directory_path() /
+							 ("mssql_backup_glob_" + std::to_string(reinterpret_cast<uintptr_t>(&db)));
+			std::filesystem::remove_all(odd);
+			std::filesystem::create_directories(odd);
+			std::filesystem::copy_file(DIR + "full.bak", odd / "s[1].bak");
+			std::string pattern;
+			for (const char ch : (odd / "*.bak").string()) {
+				pattern += ch;
+				if (ch == '\'') {
+					pattern += ch;
+				}
+			}
+			Check(ScalarInt(con, "SELECT count(*) FROM mssql_backup_scan('" + pattern +
+									 "', 'dbo', 'items', version := 1)") == 2000,
+				  "a history's file named s[1].bak read as itself");
+			std::filesystem::remove_all(odd);
+		}
+		con.Query("DETACH hp");
+		con.Query("DETACH hr");
+		std::filesystem::remove_all(dir);
 	}
 
 	if (failures) {

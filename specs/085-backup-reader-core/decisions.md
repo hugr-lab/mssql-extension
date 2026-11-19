@@ -78,6 +78,7 @@ the specs it affects. **Blocking** means the named PR cannot open until the ques
 | DQ-47 | how an importer applies a differential | **decided** (owner, 2026-11-17): it names the full; the reader gives the schema changes and the row changes between two states (versions of DQ-48's history) through DuckLake-shaped functions (`mssql_backup_schema_changes`, `_table_changes`, `_insertions`, `_deletions`); empty with no differential | 085 PR 4c-3, 089, 022–024 |
 | DQ-48 | time travel over backups | **decided** (owner, 2026-11-17): a set of backups attaches as one catalog with a history; `AT (TIMESTAMP / VERSION)` picks a state; `mssql_backup_snapshots` | 085 PR 4c-2 |
 | DQ-49 | tables the lake accumulates while the source purges them | **decided** (owner, 2026-11-17): importer modes `mirror` / `accumulate` / `retain` per table; TRUNCATE and SWITCH OUT named as events, not a reload | 022–024, 085 PR 4c-3 |
+| DQ-50 | the T-SQL of procedures, functions and triggers from a backup | **follow-up** (owner, 2026-11-17): listed with their definitions as views are, their changes in `schema_changes`; together with issue #210 (TYPE mssql) | follow-up, #210 |
 
 ## The questions
 
@@ -777,7 +778,11 @@ what an earlier differential already brought.
 - **Schema changes first**: `mssql_backup_schema_changes(catalog [, start, end])` compares the two
   catalogs by `object_id` and `column_id` (a rename is a rename): `table_created`, `table_dropped`,
   `table_renamed`, `column_added`, `column_dropped`, `column_renamed`, `column_type_changed`,
-  `column_nullability_changed`, each with its old and new description. A change that cannot be
+  `column_nullability_changed`, each with its old and new description; and the views alike (owner,
+  2026-11-17: how a lake learns a view or table was dropped is this function, not one of its own):
+  `view_created`, `view_dropped`, `view_renamed`, `view_definition_changed` (its T-SQL old and new, which
+  a lake keeps though it cannot run it), `view_indexed` / `view_unindexed` (an indexed view's stored
+  rows appear or go: a `table_created` / `table_dropped` of its rows for an importer that keeps them). A change that cannot be
   expressed row by row -- a type change that rewrites the rows, a table rebuilt under a new object id, a
   partition SWITCH -- marks the table `reload`: its row changes are then its whole new content, and the
   importer rebuilds it. The importer applies the DDL before the rows.
@@ -822,10 +827,20 @@ be told.
   (`Catalog::SupportsTimeTravel`, the AT clause reaching `LookupEntry`). A state's overlay (task 24) is
   built at its first query and cached.
 - DQ-47's change functions take two versions or timestamps of the history, as `ducklake_table_changes`.
-- The grain is the backups': a daily full and hourly differentials give a state an hour. A point
-  between them needs log backups, whose replay stays out (090 replays a backup's own tail only). A
-  database restored, recreated or on another fork breaks the history there: the versions on either
-  side compare only as a `reload`.
+- Owner, 2026-11-17 (on PR 4c-2's plan): a version's number is its position among the files, stable
+  while backups are only added, and a time or the files is what an importer keeps; a copy-only full is
+  a version (no differential lies over it); and, as DuckLake's, `bk.snapshots()` beside
+  `mssql_backup_snapshots('bk')`, with `snapshot_version` / `snapshot_time` on the ATTACH for the version
+  read without AT. New backups are taken in by `mssql_backup_refresh('bk')` (owner, the same day,
+  replacing "attach again"; not a glob expanded on every statement, a LIST of an object store per
+  query): the glob expanded again, the headers of new or changed files read, the others kept; the
+  versions renumbered, a version already read kept by its backups (not its number).
+- **The importer** (owner, 2026-11-17): one ATTACH of the folder (`history true`) for the database's
+  life; on a schedule `mssql_backup_refresh`, then the versions after the last one imported (by time or
+  files, from `snapshots()`), each applied through DQ-47's change functions from the version applied last
+  to it -- a differential over the same full, a new full, alike; `history_break` a reload. The modes
+  (DQ-49) and the tables are arguments of the import (mssql-ducklake), per table, not ATTACHes: no
+  row-change mode, no marker column, no second catalog.
 
 **Affects** 085 (PR 4c-2: the history ATTACH, `mssql_backup_snapshots`, `AT`; PR 4c-3: DQ-47 over it).
 
@@ -904,12 +919,37 @@ is older than a year or so, for its own speed, while the lake is to keep years o
   in one transaction with DELETE / MERGE / ALTER; with a partitioned table (the files' partition values
   matching the table's); the files' schema against the table's after that transaction's DDL; who owns
   the files once added (expiry, drop); `rowid`s of the added rows for later MERGEs.
-- **Two imports into one lake**: an ATTACH per mode, split by `table_filter` and its complement
-  `table_exclude` (schema_exclude / table_exclude, to come for TYPE mssql and mssql_backup alike); the
-  mode is the importer's, per import or per table, never an ATTACH option.
+- **Modes per table in one import** (owner, 2026-11-17, replacing "two imports, an ATTACH per mode"):
+  the import function takes the tables and each one's mode (`mirror` the default, `accumulate`,
+  `retain` with its column and threshold) over one attached history. The ATTACH's filters
+  (`schema_filter` / `table_filter`, and `schema_exclude` / `table_exclude` of TYPE mssql_backup, #576) only
+  narrow what the catalog is built for, a large database's memory; the mode is never an ATTACH option.
 
 **Affects** mssql-ducklake 022-024 (the modes, per table; the schema-evolution rules), 085 PR 4c-3 (the
 two events), the exclude filters (their own PR).
+
+### DQ-50 — Procedures, functions and triggers? — **FOLLOW-UP** (owner, 2026-11-17)
+
+**A follow-up, not 085's: a backup's modules -- stored procedures, scalar and table-valued functions,
+triggers (DML and DDL), with their T-SQL -- listed as `mssql_backup_views` lists views, so a history
+shows what changed in them as well as in the data.** A lake keeps the text though it cannot run it.
+
+- A listing, `mssql_backup_modules(path)` (and `bk.modules()`): schema, name, type (`P`, `FN`, `IF`,
+  `TF`, `TR`, …), the parent table of a DML trigger, created / modified dates, `definition` (the module's
+  `sysobjvalues` valclass 1 text, read on demand when off row, as a view's; NULL `WITH ENCRYPTION`), and
+  a CLR module's assembly method instead of a definition. The allow-list of § Security grows by those
+  rows of `sysobjvalues` only.
+- In DQ-47's `schema_changes`: `module_created`, `module_dropped`, `module_renamed`,
+  `module_definition_changed` (old and new text), as the views' events.
+- With issue #210 (the same objects in a `TYPE mssql` catalog, from the server's `sys.sql_modules`):
+  one shape of listing on both sides, so a live database and its backups answer alike. What the two
+  share is the listing only: #210 also means calling the server's functions and procedures from DuckDB
+  -- OUT parameters, procedures returning result sets (tables), scalar functions called for many rows
+  at once rather than per row, volatility (what DuckDB may fold, cache or reorder), errors and
+  transactions -- a design of its own there; a backup's modules are text and are never called.
+
+**Affects** a follow-up spec (with #210); 085 PR 4c-3 leaves room for the module events in
+`schema_changes`.
 
 ## Settled during the consistency pass (no question)
 
