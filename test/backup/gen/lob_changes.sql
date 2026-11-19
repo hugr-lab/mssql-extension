@@ -22,6 +22,9 @@
 --             same value under another column id): every row updated;
 --   defaults  a bit added with a default before the full (the records hold none), the table rebuilt
 --             after it (the records hold it now): nothing changed;
+--   evolved   a nullable int and an int with a default added, an int dropped, between the full and the
+--             differential (metadata only, the records as they were, then moved by the shrink), and one
+--             row's new int set: that row alone updated;
 --   filler    dropped after the first differential, so the shrink has room to move pages into.
 -- Compressed (MS_XPRESS): the three are committed under test/data/backup/lob_changes. Not run by default.
 SET NOCOUNT ON;
@@ -55,6 +58,8 @@ CREATE TABLE dbo.renamed (id int NOT NULL PRIMARY KEY, l varchar(max) NULL, b va
 EXEC sp_tableoption 'dbo.renamed', 'large value types out of row', 1;
 CREATE TABLE dbo.defaults (id int NOT NULL PRIMARY KEY, l varchar(max) NULL);
 EXEC sp_tableoption 'dbo.defaults', 'large value types out of row', 1;
+CREATE TABLE dbo.evolved (id int NOT NULL PRIMARY KEY, l varchar(max) NULL, z int NULL);
+EXEC sp_tableoption 'dbo.evolved', 'large value types out of row', 1;
 GO
 WITH n AS (SELECT TOP (8) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects)
 INSERT INTO dbo.lobs SELECT i, REPLICATE(CAST(CONCAT('v', i) AS varchar(max)), 4000), REPLICATE(CONCAT('t', i), 2000),
@@ -77,6 +82,8 @@ WITH n AS (SELECT TOP (4) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM s
 INSERT INTO dbo.renamed SELECT i, REPLICATE(CAST(CONCAT('l', i) AS varchar(max)), 4500), CONCAT('b', i) FROM n;
 WITH n AS (SELECT TOP (4) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects)
 INSERT INTO dbo.defaults SELECT i, REPLICATE(CAST(CONCAT('d', i) AS varchar(max)), 4500) FROM n;
+WITH n AS (SELECT TOP (4) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects)
+INSERT INTO dbo.evolved SELECT i, REPLICATE(CAST(CONCAT('e', i) AS varchar(max)), 4500), i FROM n;
 GO
 ALTER TABLE dbo.dropped DROP COLUMN gone;  -- metadata only: the values stay in the records
 ALTER TABLE dbo.dropped_inrow DROP COLUMN gone;
@@ -128,6 +135,11 @@ GO
 UPDATE dbo.renamed SET c = b;
 ALTER TABLE dbo.renamed DROP COLUMN b;
 ALTER TABLE dbo.defaults REBUILD;
+ALTER TABLE dbo.evolved ADD x int NULL;
+ALTER TABLE dbo.evolved ADD y int NOT NULL CONSTRAINT df_evolved_y DEFAULT 7;  -- metadata only
+ALTER TABLE dbo.evolved DROP COLUMN z;
+GO
+UPDATE dbo.evolved SET x = 5 WHERE id = 1;
 GO
 CHECKPOINT;
 GO

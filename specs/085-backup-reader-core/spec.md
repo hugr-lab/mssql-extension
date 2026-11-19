@@ -1601,7 +1601,11 @@ before the next opens.
     it; snapshot_version / snapshot_time pin the chosen version by its backups (`Identity`), the latest
     with a WARNING when they are gone; one refresh at a time (`refresh_lock_`, across read and swap); a
     version is resolved at bind to its key (its backups and files, `BackupAt::key`, `PinAttachedVersion`;
-    the default one too) and the plan carries and serializes it; the states a query read are held to its
+    the default one too; resolved, held and keyed from one read of the versions, `Pin`) and the plan
+    carries and serializes it -- the changes functions resolve their two bounds in one read of the
+    versions and open both by key (`AttachedStateKey`; table_changes at bind, schema_changes at init; review
+    of #580's merge: each re-resolved its numbers, so a refresh between the two opens paired the wrong
+    versions); the states a query read are held to its
     end (`MSSQLBackupQueryStates`, a ClientContextState cleared at QueryBegin / QueryEnd, the anchors TYPE
     mssql keeps); a transaction keeps nothing (owner, 2026-11-19: not DuckLake's snapshot per transaction
     -- the next statement reads a refresh); a file gone under a kept state is refused by name, a pinned
@@ -1647,9 +1651,12 @@ before the next opens.
     collections (`RadixPartitionedColumnData`, its hash join's: spilled to `temp_directory` past
     `memory_limit`), a task's own over its units, put together when it finds none left; the last task to
     leave pairs them a partition at a time (the map of one reserved, `CollectMemory`). For a table with
-    values stored off row two records that differ compare by their values: the in-row ones as the scan
-    takes them, each under its column id (no dropped column, no uniquifier; a bit as 0 or 1, from the
-    record or from its default), then where those agree the off-row ones' digests -- a
+    values stored off row two records that differ compare by their values in the newer state's columns
+    (what the changes are given in): the in-row ones as the scan takes them, each under its column id
+    (no dropped column, no uniquifier; a bit as 0 or 1, from the record or from its default; NULL, and a
+    default of a column the older state did not have, as no value: a column added between the two, the
+    records unchanged, is no change however they move -- review of #582), then where those agree the
+    off-row ones' digests -- a
     shrink rewrites the off-row pointers and, moving a record, drops a dropped column's bytes (measured on
     `lob_changes.sql`: every row of a table whose varchar(max) was dropped read as updated when the
     records' bytes with their pointers zeroed were compared; review of #580; and by column id, since two
@@ -1666,8 +1673,8 @@ before the next opens.
     0.84 s, 11 thousand 0.40 -> 0.27 s). The fixture `lob_changes.sql` changes every off-row form
     (root pointers, an in-row root, row-overflow, values under 8,000 bytes, text through WRITETEXT and
     UPDATETEXT, a value set to itself, rows deleted and inserted, a dropped column off row and one in
-    row, a column copied into a new one and dropped, a bit added with a default then the table rebuilt)
-    and shrinks the
+    row, a column copied into a new one and dropped, a bit added with a default then the table rebuilt,
+    columns added and one dropped between the two with no value changed) and shrinks the
     file for a second differential: checked against a whole comparison with EXCEPT ALL both ways on
     2019, 2022 and 2025 (2017's server does not start on the development machine), and committed
     (compressed, 2025's: `test/data/backup/lob_changes`, `mssql_backup_lob_changes.test`). A chunk's

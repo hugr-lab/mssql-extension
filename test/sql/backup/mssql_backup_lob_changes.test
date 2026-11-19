@@ -11,8 +11,10 @@
 # itself), values under 8,000 bytes (replaced, overwritten, set to itself, to NULL, from NULL), text
 # (WRITETEXT, UPDATETEXT inserting and deleting), a varchar(max) and a char(200) dropped before the full,
 # a column copied into a new one and dropped between the two (every row updated), a bit added with a
-# default and the table rebuilt (no change). Each result is checked against a whole comparison of the
-# two states' rows (EXCEPT ALL both ways). No SQL Server is needed.
+# default and the table rebuilt (no change), columns added (one nullable, one with a default) and one
+# dropped between the two, one row's new column set (that row alone, however the shrink moves the
+# rest). Each result is checked against a whole comparison of the two states' rows (EXCEPT ALL both
+# ways). No SQL Server is needed.
 
 require mssql
 
@@ -67,6 +69,27 @@ query T
 SELECT coalesce(string_agg(change_type || '=' || n, ',' ORDER BY change_type), 'none') FROM (SELECT change_type, count(*) n FROM mssql_backup_table_changes('test/data/backup/lob_changes/lob_changes_full.bak', 'dbo', 'defaults', diff := 'test/data/backup/lob_changes/lob_changes_{diff}.bak') GROUP BY 1);
 ----
 none
+
+
+query T
+SELECT coalesce(string_agg(change_type || '=' || n, ',' ORDER BY change_type), 'none') FROM (SELECT change_type, count(*) n FROM mssql_backup_table_changes('test/data/backup/lob_changes/lob_changes_full.bak', 'dbo', 'evolved', diff := 'test/data/backup/lob_changes/lob_changes_{diff}.bak') GROUP BY 1);
+----
+update_postimage=1,update_preimage=1
+
+# On the columns the older state has and the one it gained (x NULL there, as the preimages give it); y's
+# default stands for every row in the newer state, never a change.
+query II
+WITH o AS (SELECT id, l, NULL::INTEGER AS x FROM mssql_backup_scan('test/data/backup/lob_changes/lob_changes_full.bak', 'dbo', 'evolved')),
+  n AS (SELECT id, l, x FROM mssql_backup_scan('test/data/backup/lob_changes/lob_changes_full.bak', 'dbo', 'evolved', diff := 'test/data/backup/lob_changes/lob_changes_{diff}.bak')),
+  c AS (SELECT * FROM mssql_backup_table_changes('test/data/backup/lob_changes/lob_changes_full.bak', 'dbo', 'evolved', diff := 'test/data/backup/lob_changes/lob_changes_{diff}.bak')),
+  c_new AS (SELECT id, l, x FROM c WHERE change_type IN ('insert', 'update_postimage')),
+  c_old AS (SELECT id, l, x FROM c WHERE change_type IN ('delete', 'update_preimage')),
+  t_new AS (SELECT * FROM n EXCEPT ALL SELECT * FROM o),
+  t_old AS (SELECT * FROM o EXCEPT ALL SELECT * FROM n)
+SELECT (SELECT count(*) FROM (SELECT * FROM t_new EXCEPT ALL SELECT * FROM c_new)) + (SELECT count(*) FROM (SELECT * FROM c_new EXCEPT ALL SELECT * FROM t_new)),
+  (SELECT count(*) FROM (SELECT * FROM t_old EXCEPT ALL SELECT * FROM c_old)) + (SELECT count(*) FROM (SELECT * FROM c_old EXCEPT ALL SELECT * FROM t_old));
+----
+0	0
 
 endloop
 

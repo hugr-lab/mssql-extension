@@ -188,12 +188,17 @@ MSSQLBackupQueryStates &MSSQLBackupQueryStates::For(ClientContext &context, cons
 	return *context.registered_state->GetOrCreate<MSSQLBackupQueryStates>("mssql_backup_states:" + catalog.Name());
 }
 
-std::string MSSQLBackupCatalog::KeyOf(optional_ptr<ClientContext> context, const mssql::backup::BackupAt &at) {
+std::string MSSQLBackupCatalog::Pin(ClientContext &context, const mssql::backup::BackupAt &at) {
 	if (!at.key.empty()) {
+		BackupAt(&context, at);
 		return at.key;
 	}
+	// One read of the versions: the number resolved, its state held by the query (MSSQLBackupQueryStates)
+	// and its key taken from the same versions -- a refresh between two reads could leave the key in none
+	// of them (review of #580's merge).
 	const auto versions = CurrentVersions();
-	const auto number = Resolve(*versions, context, at);
+	const auto number = Resolve(*versions, &context, at);
+	StateOf(&context, *versions, number);
 	return StateKey(*versions->history, versions->history->versions[number - 1]);
 }
 
@@ -661,11 +666,11 @@ void mssql::backup::PinAttachedVersion(ClientContext &context, const std::string
 	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {
 		return;
 	}
-	auto &catalog = db->GetCatalog().Cast<MSSQLBackupCatalog>();
-	at.key = catalog.KeyOf(&context, at);
-	// Held by the query from its bind (MSSQLBackupQueryStates): a refresh dropping it before the init still
-	// leaves the query its version.
-	catalog.BackupAt(&context, at);
+	at.key = db->GetCatalog().Cast<MSSQLBackupCatalog>().Pin(context, at);
+}
+
+std::string mssql::backup::AttachedStateKey(const BackupHistory &history, uint64_t number) {
+	return MSSQLBackupCatalog::StateKey(history, history.versions[number - 1]);
 }
 
 static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,

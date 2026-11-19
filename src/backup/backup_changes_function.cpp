@@ -258,16 +258,15 @@ TwoStates OpenTwoStates(ClientContext &context, const std::vector<std::string> &
 		}
 		states.start = Value::BIGINT(static_cast<int64_t>(start));
 		states.end = Value::BIGINT(static_cast<int64_t>(end));
-		if (start == end) {
-			states.same = true;
-			return states;
-		}
 		for (uint64_t v = start + 1; v <= end; v++) {
 			states.history_break = states.history_break || history->versions[v - 1].history_break;
 		}
 		auto open = [&](uint64_t number) {
 			if (attached) {
-				const auto backup = FindAttachedBackup(context, paths.front(), Version(number));
+				// By its key in the history read above, not its number: a refresh meanwhile renumbers them.
+				BackupAt at = Version(number);
+				at.key = AttachedStateKey(*history, number);
+				const auto backup = FindAttachedBackup(context, paths.front(), at);
 				std::shared_ptr<OpenedCatalog> catalog(OpenAttachedCatalog(context, *backup).release());
 				if (backup->objects) {
 					(number == start ? states.old_whole : states.new_whole) =
@@ -286,6 +285,13 @@ TwoStates OpenTwoStates(ClientContext &context, const std::vector<std::string> &
 			CheckVersionFiles(*catalog->opened.backup, *history, v, "the backups \"" + paths.front() + "\"", false);
 			return catalog;
 		};
+		if (start == end) {
+			// One state: no change, but table_changes names its columns by it (opened from this read, not
+			// its number read again).
+			states.same = true;
+			states.new_catalog = open(end);
+			return states;
+		}
 		states.old_catalog = open(start);
 		states.new_catalog = open(end);
 	}

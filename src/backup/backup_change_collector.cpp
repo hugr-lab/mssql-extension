@@ -136,8 +136,20 @@ struct OffRowCheck {
 	//! there (a page not live there: it does). None: every node on a changed page does.
 	const PageStore *old_store = nullptr;
 	LobNodePages *node_pages = nullptr;	 // with old_store: the task's
-	bool hash_always = false;			 // hash every row's values, touching or not
-	bool sha256 = false;				 // mssql_backup_change_hash
+	//! The column ids of the newer and the older state's table (sorted): a row's values are compared in the
+	//! newer state's columns (what the changes are given in), so a column the newer state no longer has is
+	//! left out, and a column the older state did not have reads as it did there -- absent (its default
+	//! too, as a record that holds none reads it). None: every column of the row's own layout.
+	const std::vector<int32_t> *newer_columns = nullptr;
+	const std::vector<int32_t> *older_columns = nullptr;
+	bool Compared(int32_t id) const {
+		return !newer_columns || std::binary_search(newer_columns->begin(), newer_columns->end(), id);
+	}
+	bool OlderHas(int32_t id) const {
+		return !older_columns || std::binary_search(older_columns->begin(), older_columns->end(), id);
+	}
+	bool hash_always = false;  // hash every row's values, touching or not
+	bool sha256 = false;	   // mssql_backup_change_hash
 };
 
 //! Each off-row value of `row`, by layout index.
@@ -159,6 +171,9 @@ void ForEachOffRow(const RowsetLayout &layout, const RowRecord &row,
 void CheckOffRow(const RowsetLayout &layout, const RowRecord &row, const OffRowCheck &check, PageRow &out) {
 	ForEachOffRow(layout, row, [&](size_t k, const OffRowPointer &pointer) {
 		const std::string what = layout.table + "." + layout.columns[k].name;
+		if (!check.Compared(layout.columns[k].rscolid)) {
+			return;
+		}
 		if (check.changed && !check.changed->empty() && !out.touches) {
 			NodeSink nodes;
 			WalkLob(*check.fetch, pointer, check.units, LobWalk::MapOnly, MAX_CHANGE_VALUE_BYTES, what, nodes);
@@ -201,6 +216,9 @@ void CheckOffRow(const RowsetLayout &layout, const RowRecord &row, const OffRowC
 	});
 	if (out.touches || check.hash_always) {
 		ForEachOffRow(layout, row, [&](size_t k, const OffRowPointer &pointer) {
+			if (!check.Compared(layout.columns[k].rscolid)) {
+				return;
+			}
 			HashSink hash;
 			if (check.sha256) {
 				hash.UseSha256();
@@ -311,12 +329,16 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 			// its variable column; review of #580), and a version tag comes and goes. Per column (dropped
 			// ones and the uniquifier, which the _mssql_rid holds, left out), in the layout's order: its
 			// column id (two states' layouts differ when the table's columns changed between them: a column
-			// copied into a new one and dropped holds the same value under another id), its state -- NULL, a
-			// value, off row -- and a value's length and bytes; a bit as 0 or 1, from its byte in the record
-			// or from its default (a metadata-only ADD COLUMN: the record has none). An off-row pointer must
-			// lie in the compared bytes: equal records stand for equal pointers (the trees are compared by
-			// them).
-			r.masked.clear();
+			// copied into a new one and dropped holds the same value under another id) and the value -- off
+			// row (its digest compared beside), or its length and bytes, a bit as 0 or 1 from its byte in the
+			// record or from its default (a metadata-only ADD COLUMN: the record has none). Only the newer
+			// state's columns (`check.Compared`), and only those that hold a value: NULL is none, and so is a
+			// default of a column the older state did not have -- a column added between the two, the records
+			// unchanged, is no change however the records move (review of #582). An off-row pointer must lie
+			// in the compared bytes: equal records stand for equal pointers (the trees are compared by them).
+			// A leading byte: a row whose every compared value is NULL has a form too (empty means "not
+			// computed", no check).
+			r.masked.assign(1, '\1');
 			const uint8_t *start = page.bytes.data() + offset;
 			const uint8_t *compared = start + r.bytes.size();
 			for (size_t k = 0; k < layout.columns.size(); k++) {
@@ -325,6 +347,10 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 					continue;
 				}
 				const ValueRef v = row.Locate(layout, k);
+				if (!check->Compared(c.rscolid) || v.state == ValueState::Null ||
+					(v.state == ValueState::Default && !check->OlderHas(c.rscolid))) {
+					continue;
+				}
 				const uint32_t id = static_cast<uint32_t>(c.rscolid);
 				r.masked.append(reinterpret_cast<const char *>(&id), sizeof(id));
 				if (v.state == ValueState::OffRow) {
@@ -334,10 +360,6 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 										  " does not lie in its record");
 					}
 					r.masked.push_back('\2');
-					continue;
-				}
-				if (v.state == ValueState::Null) {
-					r.masked.push_back('\0');
 					continue;
 				}
 				r.masked.push_back('\1');
@@ -856,6 +878,14 @@ public:
 		}
 		old_store_ = before->data.catalog->pages->store.get();
 		old_fetch_ = FetchOf(*old_store_);
+		for (const auto &c : data.new_table->columns) {
+			newer_columns_.push_back(c.column_id);
+		}
+		for (const auto &c : data.old_table->columns) {
+			older_columns_.push_back(c.column_id);
+		}
+		std::sort(newer_columns_.begin(), newer_columns_.end());
+		std::sort(older_columns_.begin(), older_columns_.end());
 		checkpoint_ = data.states.old_checkpoint;
 		old_owners_ = OwnersOf(*before);
 		const PageOwners new_owners = OwnersOf(now);
@@ -1060,6 +1090,8 @@ private:
 		check.units = now_.cursors[partition].off_row;
 		check.changed = &changed_lob_;
 		check.old_store = old_store_;
+		check.newer_columns = &newer_columns_;
+		check.older_columns = &older_columns_;
 		check.sha256 = sha256_;
 		return check;
 	}
@@ -1069,6 +1101,8 @@ private:
 		OffRowCheck check;
 		check.fetch = &old_fetch_;
 		check.units = before_->cursors[partition].off_row;
+		check.newer_columns = &newer_columns_;
+		check.older_columns = &older_columns_;
 		return check;
 	}
 
@@ -1080,6 +1114,8 @@ private:
 		check.units = side.cursors[partition].off_row;
 		check.hash_always = true;
 		check.sha256 = sha256_;
+		check.newer_columns = &newer_columns_;
+		check.older_columns = &older_columns_;
 		static thread_local Page one_page;	// kept by the thread: no page allocated a value
 		std::vector<PageRow> one;
 		if (ReadUnitDataPage(store, *side.cursors[partition].unit, p, name_, one_page)) {
@@ -1266,6 +1302,7 @@ private:
 	CollectMemory &memory_;
 	const PageStore &new_store_;
 	const PageStore *old_store_ = nullptr;
+	std::vector<int32_t> newer_columns_, older_columns_;  // the two tables' column ids, sorted (OffRowCheck)
 	std::string name_;
 	bool sha256_;
 	Lsn checkpoint_;

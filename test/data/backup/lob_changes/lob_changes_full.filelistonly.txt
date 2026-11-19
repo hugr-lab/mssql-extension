@@ -1,4 +1,4 @@
 LogicalName|PhysicalName|Type|FileGroupName|Size|MaxSize|FileId|CreateLSN|DropLSN|UniqueId|ReadOnlyLSN|ReadWriteLSN|BackupSizeInBytes|SourceBlockSize|FileGroupId|LogGroupGUID|DifferentialBaseLSN|DifferentialBaseGUID|IsReadOnly|IsPresent|TDEThumbprint|SnapshotUrl
 -----------|------------|----|-------------|----|-------|------|---------|-------|--------|-----------|------------|-----------------|---------------|-----------|------------|-------------------|--------------------|----------|---------|-------------|-----------
-bak_lob_changes|/var/opt/mssql/data/bak_lob_changes.mdf|D|PRIMARY|75497472|35184372080640|1|0|0|2A42F859-C452-45B3-8A1A-D4B3413684E4|0|0|10551296|4096|1|NULL|0|00000000-0000-0000-0000-000000000000|0|1|NULL|NULL
-bak_lob_changes_log|/var/opt/mssql/data/bak_lob_changes_log.ldf|L|NULL|8388608|2199023255552|2|0|0|846F08B6-9399-49EC-BB89-4536F2A5DA68|0|0|0|4096|0|NULL|0|00000000-0000-0000-0000-000000000000|0|1|NULL|NULL
+bak_lob_changes|/var/opt/mssql/data/bak_lob_changes.mdf|D|PRIMARY|75497472|35184372080640|1|0|0|672D6487-C6DA-4B11-97AF-A8267C6249E2|0|0|10682368|4096|1|NULL|0|00000000-0000-0000-0000-000000000000|0|1|NULL|NULL
+bak_lob_changes_log|/var/opt/mssql/data/bak_lob_changes_log.ldf|L|NULL|8388608|2199023255552|2|0|0|0F33AB33-2C3D-4074-A420-46393E76A7F4|0|0|0|4096|0|NULL|0|00000000-0000-0000-0000-000000000000|0|1|NULL|NULL

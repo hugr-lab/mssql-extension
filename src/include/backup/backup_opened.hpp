@@ -278,6 +278,11 @@ void AddVersionParameters(TableFunction &function);
 //! key when pinned), its default version when none. [the catalog layer]
 std::shared_ptr<const AttachedBackup> FindAttachedBackup(ClientContext &context, const std::string &name,
 														 const BackupAt &at = BackupAt());
+//! The key a version of an attached backup's history is pinned by (BackupAt::key): its backups and their
+//! files. A caller that resolved numbers in one `history` (the catalog's versions it read) opens them by
+//! these keys, so a refresh between two opens cannot renumber one of them (review of #580's merge).
+//! [the catalog layer]
+std::string AttachedStateKey(const BackupHistory &history, uint64_t number);
 //! At a file function's bind: when `name` is an attached backup, `at`'s version (its default when none)
 //! pinned by its key, so the plan reads it whatever a refresh renumbers before it runs. [the catalog layer]
 void PinAttachedVersion(ClientContext &context, const std::string &name, BackupAt &at);

@@ -141,16 +141,8 @@ unique_ptr<FunctionData> TableChangesBind(ClientContext &context, TableFunctionB
 		data->states = OpenTwoStates(context, std::vector<std::string>(data->paths.begin(), data->paths.end()),
 									 std::vector<std::string>(data->diff.begin(), data->diff.end()), data->start,
 									 data->end, data->function);
-		// The newer state's table names the columns, whatever the states (one state: no rows).
-		if (data->states.same) {
-			BackupAt at;
-			at.unit = "version";
-			at.value = data->states.end;
-			data->states.new_catalog.reset(
-				OpenBackupCatalog(context, std::vector<std::string>(data->paths.begin(), data->paths.end()), true,
-								  CatalogScope(), {}, at)
-					.release());
-		}
+		// The newer state's table names the columns, whatever the states (one state: no rows; OpenTwoStates
+		// opened it).
 		const CatalogModel &new_model = data->states.new_catalog->Model();
 		data->new_table = new_model.FindTable(data->schema, data->table);
 		if (!data->new_table) {
