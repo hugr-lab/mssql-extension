@@ -201,7 +201,11 @@ a type whose conversion is still to come is read as its stored bytes (below).
     a differential's pass 1 of one plain family from its own GAM and DCM pages, as a full's (DQ-41
     revisited, 2026-11-19: the extents its DCM marks that are allocated or hold an allocation page,
     within the file's size -- 15 of 15 differentials), its striped or compressed forms from their
-    headers. The rule is checked where the reader reads a group, never trusted blindly.
+    headers. The rule is checked where the reader reads a group, never trusted blindly; for a
+    differential also where the database changed while the backup ran (`CheckDifferentialRanks`: the
+    extents a later pass copies again, and those whose GAM / DCM bit moved between pass 1's copy and the
+    backup's last, each at its rank with the next extent after it), so a backup under load keeps the
+    map, and its headers decide only when that would read as much as the pass.
   - **E13 (done, `research/experiments/E13-ordered-passes-search.md`) and DQ-41: a striped or
     compressed pass is searched, not read.** Every pass is ascending by (file, extent) (210 of 210:
     pass 1 and 2, fulls and differentials, plain and compressed, each family of a striped set);

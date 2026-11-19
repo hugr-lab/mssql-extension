@@ -38,6 +38,8 @@ GO
 CHECKPOINT;
 GO
 BACKUP DATABASE bak_bench TO DISK = '$(DIR)/bench_full.bak' WITH FORMAT, INIT, NAME = 'bench_full';
+-- Its compressed twin, copy-only so the differentials' base stays bench_full.
+BACKUP DATABASE bak_bench TO DISK = '$(DIR)/bench_full_x.bak' WITH FORMAT, INIT, COPY_ONLY, COMPRESSION, NAME = 'bench_full_x';
 GO
 UPDATE dbo.big SET a = a + 1, b = CONCAT(b, ' u1') WHERE id % 1000 = 0;
 UPDATE dbo.lobs SET v.WRITE('X', 0, 1) WHERE id % 1000 = 0;
@@ -47,6 +49,7 @@ GO
 CHECKPOINT;
 GO
 BACKUP DATABASE bak_bench TO DISK = '$(DIR)/bench_diff_10k.bak' WITH FORMAT, INIT, DIFFERENTIAL, NAME = 'bench_diff_10k';
+BACKUP DATABASE bak_bench TO DISK = '$(DIR)/bench_diff_10k_x.bak' WITH FORMAT, INIT, DIFFERENTIAL, COMPRESSION, NAME = 'bench_diff_10k_x';
 GO
 UPDATE dbo.big SET a = a + 1 WHERE id % 100 = 1;
 UPDATE dbo.lobs SET v.WRITE('Y', 0, 1) WHERE id % 100 = 1;
@@ -54,6 +57,7 @@ GO
 CHECKPOINT;
 GO
 BACKUP DATABASE bak_bench TO DISK = '$(DIR)/bench_diff_110k.bak' WITH FORMAT, INIT, DIFFERENTIAL, NAME = 'bench_diff_110k';
+BACKUP DATABASE bak_bench TO DISK = '$(DIR)/bench_diff_110k_x.bak' WITH FORMAT, INIT, DIFFERENTIAL, COMPRESSION, NAME = 'bench_diff_110k_x';
 GO
 UPDATE dbo.big SET a = a + 1 WHERE id % 10 = 2;
 UPDATE dbo.lobs SET v.WRITE('Z', 0, 1) WHERE id % 10 = 2;
@@ -61,6 +65,7 @@ GO
 CHECKPOINT;
 GO
 BACKUP DATABASE bak_bench TO DISK = '$(DIR)/bench_diff_1m.bak' WITH FORMAT, INIT, DIFFERENTIAL, NAME = 'bench_diff_1m';
+BACKUP DATABASE bak_bench TO DISK = '$(DIR)/bench_diff_1m_x.bak' WITH FORMAT, INIT, DIFFERENTIAL, COMPRESSION, NAME = 'bench_diff_1m_x';
 GO
 ALTER INDEX ALL ON dbo.big REBUILD;
 GO
@@ -69,4 +74,5 @@ GO
 CHECKPOINT;
 GO
 BACKUP DATABASE bak_bench TO DISK = '$(DIR)/bench_diff_rebuild.bak' WITH FORMAT, INIT, DIFFERENTIAL, NAME = 'bench_diff_rebuild';
+BACKUP DATABASE bak_bench TO DISK = '$(DIR)/bench_diff_rebuild_x.bak' WITH FORMAT, INIT, DIFFERENTIAL, COMPRESSION, NAME = 'bench_diff_rebuild_x';
 GO

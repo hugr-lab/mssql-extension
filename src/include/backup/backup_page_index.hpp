@@ -133,6 +133,8 @@ public:
 private:
 	friend PassMap BuildPassMap(const RandomAccess &, uint64_t, uint64_t, uint32_t);
 	friend bool BuildRankedPassMap(const RandomAccess &, uint64_t, uint64_t, PassMap &, uint64_t *, bool);
+	friend bool CheckDifferentialRanks(const RandomAccess &, const PassMap &, const std::vector<const PassMap *> &,
+									   uint64_t *);
 	friend class PassMapBuilder;
 	friend class RankedPassBuilder;
 	friend class PassHeaderScan;
@@ -219,6 +221,20 @@ PassMap BuildPassMap(const RandomAccess &stream, uint64_t offset, uint64_t lengt
 //! last extent is checked where its rank puts it.
 bool BuildRankedPassMap(const RandomAccess &stream, uint64_t offset, uint64_t length, PassMap &map,
 						uint64_t *groups_read = nullptr, bool differential = false);
+
+//! A differential's pass 1 ranked from its DCM (`first`, BuildRankedPassMap's), checked where the database
+//! changed while the backup ran. Its ranks come from each interval's GAM and DCM as pass 1 copied them; the
+//! backup copies them again at its end (`later`: the family's later passes, in order, mapped by their
+//! headers), and copies again the extents written meanwhile. An extent pass 1 may have caught changing --
+//! one whose GAM or DCM bit differs between the two copies, or one a later pass carries that holds no
+//! allocation page -- is checked where its rank puts it (with the extent of its PFS page, and in file 1 the boot
+//! page's), and so is the next extent the map holds after it,
+//! so an extent the map wrongly holds or lacks there moves a rank that is read. Elsewhere the two copies
+//! agree and the sampled checks hold as for a quiet backup. False when a check fails or when the checks
+//! would read more than reading the pass through (the caller maps it by its headers). `groups_read`, when
+//! given, counts the groups it read.
+bool CheckDifferentialRanks(const RandomAccess &stream, const PassMap &first, const std::vector<const PassMap *> &later,
+							uint64_t *groups_read = nullptr);
 
 //! Where a page's latest copy lies.
 struct PageLocation {

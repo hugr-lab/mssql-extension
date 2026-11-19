@@ -196,6 +196,30 @@ private:
 	}
 };
 
+//! Two passes in one stream, as a family's file holds them (a read does not cross from one to the other).
+class TwoPasses : public RandomAccess {
+public:
+	TwoPasses(const ComputedPass &a, const ComputedPass &b) : a_(a), b_(b) {}
+	uint64_t Size() const override {
+		return a_.Size() + b_.Size();
+	}
+	const std::string &Name() const override {
+		return name_;
+	}
+	void ReadAt(uint64_t offset, uint8_t *dest, size_t count) const override {
+		if (offset >= a_.Size()) {
+			b_.ReadAt(offset - a_.Size(), dest, count);
+		} else {
+			a_.ReadAt(offset, dest, count);
+		}
+	}
+
+private:
+	const ComputedPass &a_;
+	const ComputedPass &b_;
+	std::string name_ = "two.bak";
+};
+
 }  // namespace
 
 int main() {
@@ -702,6 +726,104 @@ int main() {
 		no_dcm.bodies.erase(no_dcm.bodies.begin() + 2);
 		Check(!BuildRankedPassMap(no_dcm, 0, no_dcm.Size(), refused, nullptr, true),
 			  "a group 0 with no DCM page is refused");
+		// Under load (CheckDifferentialRanks): the backup's pass 2 copies both intervals' allocation pages again,
+		// interval 1's DCM marking 63905 by then; pass 1 as its copies say. Interval 1's GAM is its unit 0.
+		{
+			Bytes dcm1_end = Dcm({0, 1, 2});
+			ComputedPass p1 = diff_pass(expected);
+			ComputedPass p2;
+			for (uint32_t e : {0u, 63904u}) {
+				ExtentId x;
+				x.file = 1;
+				x.extent = e;
+				p2.groups.push_back(x);
+			}
+			p2.bodies = {{{1, 2}, &gam0}, {{1, 6}, &dcm0}, {{1, 511232}, &gam1}, {{1, 511238}, &dcm1_end}};
+			TwoPasses both(p1, p2);
+			PassMap first;
+			const bool ranked = BuildRankedPassMap(both, 0, p1.Size(), first, nullptr, true);
+			PassMap second = BuildPassMap(both, p1.Size(), p2.Size(), 1);
+			uint64_t checked = 0;
+			Check(ranked && CheckDifferentialRanks(both, first, {&second}, &checked) && checked == 11,
+				  "under load, two intervals: each one's copies compared, the moved bit checked (" +
+					  std::to_string(checked) + " reads)");
+		}
+	}
+	{
+		// A differential taken under load (CheckDifferentialRanks): file 1 of 2001 extents, all allocated, pass
+		// 1's DCM copy marks all but 1501. Pass 1 carries 1501 where its copies put 1500 -- 1500 freed and 1501
+		// written while the backup ran --, a swap the sampled checks pass over. The backup's pass 2 copies 1501
+		// again and the interval's GAM and DCM as they ended.
+		const uint32_t n = 2001;
+		std::vector<uint32_t> all, marked, all_but_1500, marked_final;
+		for (uint32_t e = 0; e < n; e++) {
+			all.push_back(e);
+			if (e != 1500) {
+				all_but_1500.push_back(e);
+			}
+			if (e != 1501) {
+				marked.push_back(e);
+			}
+		}
+		Bytes header = FileHeader(1, n * 8), gam_then = Gam(all), dcm_then = Dcm(marked);
+		Bytes gam_end = Gam(all_but_1500), dcm_end = Dcm(all);
+		auto first_pass = [&](uint32_t carried_for_1500) {
+			ComputedPass pass;
+			for (uint32_t e = 0; e < n; e++) {
+				if (e == 1501) {
+					continue;
+				}
+				ExtentId x;
+				x.file = 1;
+				x.extent = e == 1500 ? carried_for_1500 : e;
+				pass.groups.push_back(x);
+			}
+			pass.pad_groups = 1;
+			pass.bodies = {{{1, 0}, &header}, {{1, 2}, &gam_then}, {{1, 6}, &dcm_then}};
+			return pass;
+		};
+		auto later_pass = [&](std::vector<uint32_t> extents, const Bytes *gam, const Bytes *dcm) {
+			ComputedPass pass;
+			for (uint32_t e : extents) {
+				ExtentId x;
+				x.file = 1;
+				x.extent = e;
+				pass.groups.push_back(x);
+			}
+			pass.bodies = {{{1, 2}, gam}, {{1, 6}, dcm}};
+			return pass;
+		};
+		auto check = [&](const ComputedPass &p1, const ComputedPass &p2, bool &ranked, uint64_t &reads) {
+			TwoPasses stream(p1, p2);
+			PassMap first;
+			ranked = BuildRankedPassMap(stream, 0, p1.Size(), first, nullptr, true);
+			PassMap second = BuildPassMap(stream, p1.Size(), p2.Size(), 1);
+			return ranked && CheckDifferentialRanks(stream, first, {&second}, &reads);
+		};
+		bool ranked = false;
+		uint64_t reads = 0;
+		ComputedPass swapped = first_pass(1501);
+		ComputedPass busy = later_pass({0, 1501}, &gam_end, &dcm_end);
+		Check(!check(swapped, busy, ranked, reads) && ranked,
+			  "under load: a swap the sampled checks pass over is found where the backup changed");
+		// The same swap, the later pass copying only the allocation pages again (the moved bits alone).
+		ComputedPass alloc_only = later_pass({0}, &gam_end, &dcm_end);
+		Check(!check(swapped, alloc_only, ranked, reads) && ranked, "and by the GAM / DCM bits that moved alone");
+		// Pass 1 as its copies say, a written extent copied again: the checks hold, a few groups read.
+		ComputedPass right = first_pass(1500);
+		ComputedPass rewritten = later_pass({0, 700}, &gam_then, &dcm_then);
+		Check(check(right, rewritten, ranked, reads) && reads < 12,
+			  "under load, pass 1 right: kept, a few groups read (" + std::to_string(reads) + ")");
+		// Quiet: the later pass copies the allocation pages again, unchanged.
+		ComputedPass quiet = later_pass({0}, &gam_then, &dcm_then);
+		Check(check(right, quiet, ranked, reads) && reads == 4, "quiet: kept, its allocation pages compared only");
+		// Pass 1 right, but written all over while the backup ran: the checks would read as much as the pass.
+		std::vector<uint32_t> spread = {0};
+		for (uint32_t e = 50; e < n; e += 50) {
+			spread.push_back(e);
+		}
+		ComputedPass everywhere = later_pass(spread, &gam_then, &dcm_then);
+		Check(!check(right, everywhere, ranked, reads) && ranked, "written everywhere: its headers decide");
 	}
 	{
 		ExtentBitmap bm;

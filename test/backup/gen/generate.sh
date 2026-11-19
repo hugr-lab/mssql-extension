@@ -24,7 +24,7 @@
 # off row changed in each form (PR 4c-3: lob_changes_full, lob_changes_diff; not run by default); switch_in.sql, a
 # partition switched in with no shrink (PR 4c-3: switch_full, switch_diff; not run by default);
 # bench_changes.sql, a benchmark of 10 million rows and differentials of 10k / 110k / 1.1M changes and an index rebuild
-# (PR 4c-3: bench_full, bench_diff_*; not run by default). A fixture's backups come with the server's own catalog of them where it holds
+# (PR 4c-3: bench_full, bench_diff_*, each also compressed as *_x; not run by default). A fixture's backups come with the server's own catalog of them where it holds
 # still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).
 #
 # Writes into OUT: the backups, <set>.headeronly.txt / .labelonly.txt / .filelistonly.txt, sets.txt
@@ -283,9 +283,11 @@ for fixture in ${FIXTURES}; do
 		;;
 	bench_changes)
 		# A benchmark (spec 085 PR 4c-3): 10 million rows, then differentials of 10k / 110k / 1.1M changes, and
-		# one after an index rebuild.
+		# one after an index rebuild; each also compressed (_x: the full copy-only, the differentials over bench_full).
 		sets+=("bench_full|bench_full.bak" "bench_diff_10k|bench_diff_10k.bak" "bench_diff_110k|bench_diff_110k.bak"
-			"bench_diff_1m|bench_diff_1m.bak" "bench_diff_rebuild|bench_diff_rebuild.bak")
+			"bench_diff_1m|bench_diff_1m.bak" "bench_diff_rebuild|bench_diff_rebuild.bak" "bench_full_x|bench_full_x.bak"
+			"bench_diff_10k_x|bench_diff_10k_x.bak" "bench_diff_110k_x|bench_diff_110k_x.bak"
+			"bench_diff_1m_x|bench_diff_1m_x.bak" "bench_diff_rebuild_x|bench_diff_rebuild_x.bak")
 		;;
 	*)
 		echo "ERROR: unknown fixture ${fixture}" >&2
