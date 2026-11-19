@@ -31,7 +31,8 @@ unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
 work="$(mktemp -d)"
 id=""
 cleanup() {
-	[ -n "${id}" ] && docker rm -f "${id}" >/dev/null 2>&1
+	# -v: the anonymous volume of /data with it (the bind mount of the certificates is never removed).
+	[ -n "${id}" ] && docker rm -fv "${id}" >/dev/null 2>&1
 	rm -rf "${work}"
 }
 trap cleanup EXIT
@@ -46,9 +47,12 @@ CERT="${work}/certs/rustfs_cert.pem"
 # shows them).
 access_key="$(openssl rand -hex 12)"
 secret_key="$(openssl rand -hex 24)"
-id="$(RUSTFS_ACCESS_KEY="${access_key}" RUSTFS_SECRET_KEY="${secret_key}" docker run -d --name "${CONTAINER}" \
+# Created, then started: the id is known before a start can fail (a port taken, a mount refused), so
+# the trap removes a container that never ran too.
+id="$(RUSTFS_ACCESS_KEY="${access_key}" RUSTFS_SECRET_KEY="${secret_key}" docker create --name "${CONTAINER}" \
 	-p "127.0.0.1:${PORT}:9000" -e RUSTFS_ACCESS_KEY -e RUSTFS_SECRET_KEY -e RUSTFS_TLS_PATH=/tls \
 	-e RUSTFS_ADDRESS=0.0.0.0:9000 -v "${work}/certs:/tls:ro" --entrypoint rustfs "${IMAGE}" server /data)"
+docker start "${id}" >/dev/null
 # Up once it answers over TLS at all (an anonymous request is refused: any HTTP status will do).
 up() { [ "$(curl -s -o /dev/null -w '%{http_code}' --cacert "${CERT}" "https://localhost:${PORT}/")" != 000 ]; }
 for _ in $(seq 1 60); do
