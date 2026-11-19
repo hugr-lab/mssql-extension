@@ -496,6 +496,79 @@ int main() {
 				  "the default version read with no AT, its size too " + (size->HasError() ? size->GetError() : ""));
 			con.Query("COMMIT");
 		}
+		// A version of several files -- a striped full whose files sort by name against their family order, a
+		// full and its differential -- is pinned by all of them: the key the history gives (by family) is the
+		// one its opened backup gives, and a file of it touched makes the version a new one.
+		{
+			const auto many = std::filesystem::temp_directory_path() /
+							  ("mssql_backup_many_" + std::to_string(reinterpret_cast<uintptr_t>(&db)));
+			std::filesystem::remove_all(many);
+			std::filesystem::create_directories(many);
+			std::filesystem::copy_file(DIR + "full.bak", many / "a_full.bak");
+			std::filesystem::copy_file(DIR + "diff.bak", many / "b_diff.bak");
+			std::filesystem::copy_file(DIR + "stripe_2.bak", many / "c_s2.bak");  // family 2 first by name
+			std::filesystem::copy_file(DIR + "stripe_1.bak", many / "d_s1.bak");
+			auto attached_many =
+				con.Query("ATTACH '" + (many / "*.bak").string() + "' AS hm (TYPE mssql_backup, history true)");
+			Check(!attached_many->HasError(), "a history with a striped full attached " +
+												  (attached_many->HasError() ? attached_many->GetError() : ""));
+			const int64_t striped = ScalarInt(
+				con, "SELECT snapshot_id FROM hm.snapshots() WHERE len(full_files) = 2 AND backup_type = 'full'");
+			const int64_t with_diff =
+				ScalarInt(con, "SELECT snapshot_id FROM hm.snapshots() WHERE backup_type = 'differential'");
+			auto pin = [&](int64_t number) {
+				BackupAt at;
+				at.unit = "version";
+				at.value = Value::BIGINT(number);
+				PinAttachedVersion(context, "hm", at);
+				return at;
+			};
+			const BackupAt striped_at = pin(striped);
+			const BackupAt diff_at = pin(with_diff);
+			const auto striped_backup = FindAttachedBackup(context, "hm", striped_at);
+			const auto diff_backup = FindAttachedBackup(context, "hm", diff_at);
+			Check(striped_backup && striped_backup->backup->Headers().families.size() == 2 &&
+					  MSSQLBackupCatalog::StateKey(*striped_backup) == striped_at.key,
+				  "the striped full's key from the history is its opened backup's (both files, by family)");
+			Check(
+				diff_backup && diff_backup->backup->Base() && MSSQLBackupCatalog::StateKey(*diff_backup) == diff_at.key,
+				"and the full + differential's (the full's file and the differential's)");
+			Check(
+				ScalarInt(con, "SELECT count(*) FROM hm.items AT (VERSION => " + std::to_string(striped) + ")") == 2000,
+				"the striped full read");
+			// One stripe touched: the striped version is a new one; the old key, held by no query, is refused.
+			std::filesystem::last_write_time(
+				many / "d_s1.bak", std::filesystem::last_write_time(many / "d_s1.bak") + std::chrono::seconds(10));
+			Check(ScalarInt(con, "SELECT versions FROM mssql_backup_refresh('hm')") == 3, "refreshed: 3 versions");
+			bool striped_refused = false;
+			try {
+				FindAttachedBackup(context, "hm", striped_at);
+			} catch (std::exception &e) {
+				striped_refused = std::string(e.what()).find("run the query again") != std::string::npos;
+			}
+			Check(striped_refused, "a stripe touched: the striped version's old key refused by name");
+			Check(FindAttachedBackup(context, "hm", diff_at).get() == diff_backup.get(),
+				  "the full + differential, none of its files touched, still found by its key");
+			Check(
+				ScalarInt(con, "SELECT count(*) FROM hm.items AT (VERSION => " + std::to_string(striped) + ")") == 2000,
+				"the next query reads the striped full anew");
+			// The full touched: the differential's version (the full's file in its key) is a new one too.
+			std::filesystem::last_write_time(
+				many / "a_full.bak", std::filesystem::last_write_time(many / "a_full.bak") + std::chrono::seconds(10));
+			Check(ScalarInt(con, "SELECT versions FROM mssql_backup_refresh('hm')") == 3, "refreshed again");
+			bool diff_refused = false;
+			try {
+				FindAttachedBackup(context, "hm", diff_at);
+			} catch (std::exception &e) {
+				diff_refused = std::string(e.what()).find("run the query again") != std::string::npos;
+			}
+			Check(diff_refused, "its full touched: the differential's old key refused by name");
+			Check(ScalarInt(con, "SELECT count(*) FROM hm.items AT (VERSION => " + std::to_string(with_diff) + ")") ==
+					  2500,
+				  "the next query reads the full + differential anew");
+			con.Query("DETACH hm");
+			std::filesystem::remove_all(many);
+		}
 		auto refused = con.Query("SELECT * FROM mssql_backup_refresh('nope')");
 		Check(refused->HasError() && refused->GetError().find("is not a backup attached") != std::string::npos,
 			  "a refresh of no attached backup refused");
