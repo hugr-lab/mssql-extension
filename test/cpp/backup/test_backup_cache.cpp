@@ -423,6 +423,41 @@ int main() {
 			con.Query("ROLLBACK");
 			Check(ScalarInt(con, "SELECT count(*) FROM hr.items AT (VERSION => 1)") == 2000,
 				  "the next transaction reads the touched full as refreshed");
+			// The default version a transaction read, dropped from the catalog by another connection's refresh
+			// (its files gone) and back since, is the default again after the transaction's own refresh: the
+			// catalog holds its state (re-review of #579: the refresh found it among the transaction's states and
+			// left the catalog's without it, so a lookup with no AT -- the database size, the default schema --
+			// threw).
+			con.Query("BEGIN");
+			const int64_t default_rows = ScalarInt(con, "SELECT count(*) FROM hr.items");
+			auto files = con.Query(
+				"SELECT unnest(CASE WHEN len(diff_files) > 0 THEN diff_files ELSE full_files END) "
+				"FROM hr.snapshots() WHERE is_default");
+			std::vector<std::string> moved;
+			while (!files->HasError()) {
+				auto chunk = files->Fetch();
+				if (!chunk || chunk->size() == 0) {
+					break;
+				}
+				for (idx_t r = 0; r < chunk->size(); r++) {
+					moved.push_back(chunk->GetValue(0, r).ToString());
+				}
+			}
+			Check(!moved.empty(), "the default version's files");
+			for (const auto &f : moved) {
+				std::filesystem::rename(f, f + ".away");
+			}
+			auto fewer = other.Query("SELECT versions FROM mssql_backup_refresh('hr')");
+			Check(!fewer->HasError(), "another connection refreshes without the default's files");
+			for (const auto &f : moved) {
+				std::filesystem::rename(f + ".away", f);
+			}
+			Check(ScalarInt(con, "SELECT versions FROM mssql_backup_refresh('hr')") == 5,
+				  "the transaction refreshes with them back: 5 versions");
+			auto size = other.Query("SELECT count(*) FROM pragma_database_size() WHERE database_name = 'hr'");
+			Check(!size->HasError() && ScalarInt(other, "SELECT count(*) FROM hr.items") == default_rows,
+				  "the default version read with no AT, its size too " + (size->HasError() ? size->GetError() : ""));
+			con.Query("COMMIT");
 		}
 		auto refused = con.Query("SELECT * FROM mssql_backup_refresh('nope')");
 		Check(refused->HasError() && refused->GetError().find("is not a backup attached") != std::string::npos,

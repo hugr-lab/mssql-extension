@@ -303,8 +303,12 @@ std::pair<uint64_t, uint64_t> MSSQLBackupCatalog::Refresh(ClientContext &context
 							   name_);
 		}
 	}
-	// The default version's entries now, so a lookup without AT never opens a backup under the swap.
-	StateOf(&context, *refreshed, refreshed->default_version);
+	// The default version's entries now, so a lookup without AT never opens a backup under the swap -- put in
+	// the catalog's states with the versions it publishes: StateOf may answer from the refreshing transaction's
+	// own states without touching the catalog's (a version it read, dropped by another refresh, back since).
+	const auto default_state = StateOf(&context, *refreshed, refreshed->default_version);
+	const std::string default_key =
+		StateKey(*refreshed->history, refreshed->history->versions[refreshed->default_version - 1]);
 	{
 		// The states of versions the history no longer has go (a rolling archive's oldest files gone); a
 		// transaction that read one keeps it until it ends.
@@ -313,6 +317,10 @@ std::pair<uint64_t, uint64_t> MSSQLBackupCatalog::Refresh(ClientContext &context
 			kept.insert(StateKey(*refreshed->history, v));
 		}
 		std::lock_guard<std::mutex> guard(lock_);
+		auto &slot = states_[default_key];
+		if (!slot) {
+			slot = default_state;
+		}
 		versions_ = refreshed;
 		for (auto it = states_.begin(); it != states_.end();) {
 			it = kept.count(it->first) ? std::next(it) : states_.erase(it);
