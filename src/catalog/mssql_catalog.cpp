@@ -1335,7 +1335,8 @@ void MSSQLCatalog::CheckWriteAccess(const char *operation_name) const {
 // DDL Execution
 //===----------------------------------------------------------------------===//
 
-void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql, bool on_transaction_connection) {
+SimpleQueryResult MSSQLCatalog::RunOnDDLConnection(ClientContext &context, const string &tsql,
+												   bool on_transaction_connection) {
 	if (!connection_pool_) {
 		throw IOException("MSSQL connection pool not initialized - cannot execute DDL");
 	}
@@ -1361,10 +1362,7 @@ void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql, bool o
 			throw;
 		}
 		ConnectionProvider::ReleaseConnection(context, *this, connection);
-		if (!result.success) {
-			throw CatalogException("MSSQL DDL error: %s", result.DescribeError());
-		}
-		return;
+		return result;
 	}
 
 	std::string why;
@@ -1374,19 +1372,30 @@ void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql, bool o
 		throw IOException("Failed to acquire connection for DDL execution: " + why);
 	}
 
+	SimpleQueryResult result;
 	try {
-		auto result = MSSQLSimpleQuery::Execute(*connection, tsql);
-
-		if (!result.success) {
-			connection_pool_->Release(std::move(connection));
-			throw CatalogException("MSSQL DDL error: %s", result.DescribeError());
-		}
+		result = MSSQLSimpleQuery::Execute(*connection, tsql);
 	} catch (...) {
 		connection_pool_->Release(std::move(connection));
 		throw;
 	}
-
 	connection_pool_->Release(std::move(connection));
+	return result;
+}
+
+void MSSQLCatalog::ExecuteDDL(ClientContext &context, const string &tsql, bool on_transaction_connection) {
+	auto result = RunOnDDLConnection(context, tsql, on_transaction_connection);
+	if (!result.success) {
+		throw CatalogException("MSSQL DDL error: %s", result.DescribeError());
+	}
+}
+
+SimpleQueryResult MSSQLCatalog::ExecuteCatalogQuery(ClientContext &context, const string &tsql) {
+	auto result = RunOnDDLConnection(context, tsql, false);
+	if (!result.success) {
+		throw CatalogException("MSSQL catalog query error: %s", result.DescribeError());
+	}
+	return result;
 }
 
 }  // namespace duckdb

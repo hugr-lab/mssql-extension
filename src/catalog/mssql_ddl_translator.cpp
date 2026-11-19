@@ -14,6 +14,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "query/mssql_identifier.hpp"
+#include "query/mssql_sql_params.hpp"
 
 namespace duckdb {
 
@@ -284,7 +285,7 @@ string MSSQLDDLTranslator::TranslateRenameColumn(const string &schema_name, cons
 
 string MSSQLDDLTranslator::TranslateAlterColumnType(const string &schema_name, const string &table_name,
 													const string &column_name, const LogicalType &new_type,
-													bool is_nullable) {
+													bool is_nullable, const string &collation, bool sparse) {
 	string result = "ALTER TABLE ";
 	result += mssql::QuoteIdentifier(schema_name);
 	result += ".";
@@ -292,16 +293,25 @@ string MSSQLDDLTranslator::TranslateAlterColumnType(const string &schema_name, c
 	result += " ALTER COLUMN ";
 	result += mssql::QuoteIdentifier(column_name);
 	result += " ";
-	result += MapTypeToSQLServer(new_type);
+	const string declaration = MapTypeToSQLServer(new_type);
+	result += declaration;
+	const string lower = StringUtil::Lower(declaration);
+	const string type = lower.substr(0, lower.find('('));
+	if (!collation.empty() && IsCharacterType(type) && lower.find(" collate ") == string::npos) {
+		result += " COLLATE " + collation;
+	}
+	if (sparse) {
+		result += " SPARSE";
+	}
 	result += is_nullable ? " NULL" : " NOT NULL";
 	result += ";";
 	return result;
 }
 
 string MSSQLDDLTranslator::TranslateAlterColumnNullability(const string &schema_name, const string &table_name,
-														   const string &column_name, const LogicalType &current_type,
+														   const string &column_name, const string &declaration,
 														   bool set_not_null) {
-	// SQL Server requires specifying the full type when altering nullability
+	// SQL Server requires specifying the full type when altering nullability: the column's own.
 	string result = "ALTER TABLE ";
 	result += mssql::QuoteIdentifier(schema_name);
 	result += ".";
@@ -309,10 +319,85 @@ string MSSQLDDLTranslator::TranslateAlterColumnNullability(const string &schema_
 	result += " ALTER COLUMN ";
 	result += mssql::QuoteIdentifier(column_name);
 	result += " ";
-	result += MapTypeToSQLServer(current_type);
+	result += declaration;
 	result += set_not_null ? " NOT NULL" : " NULL";
 	result += ";";
 	return result;
+}
+
+bool MSSQLDDLTranslator::IsCharacterType(const string &system_type) {
+	const string type = StringUtil::Lower(system_type);
+	return type == "char" || type == "varchar" || type == "nchar" || type == "nvarchar" || type == "text" ||
+		   type == "ntext";
+}
+
+string MSSQLDDLTranslator::ColumnDeclaration(const MSSQLServerColumnType &column) {
+	string result;
+	if (column.user_defined) {
+		// An alias type carries its own length; a user CLR type has none.
+		result = mssql::QuoteIdentifier(column.type_schema) + "." + mssql::QuoteIdentifier(column.type_name);
+	} else {
+		const string type = StringUtil::Lower(column.type_name);
+		result = type;
+		if (type == "char" || type == "varchar" || type == "binary" || type == "varbinary") {
+			result += column.max_length == -1 ? "(max)" : "(" + std::to_string(column.max_length) + ")";
+		} else if (type == "nchar" || type == "nvarchar") {
+			// sys.columns.max_length counts bytes, two a character.
+			result += column.max_length == -1 ? "(max)" : "(" + std::to_string(column.max_length / 2) + ")";
+		} else if (type == "decimal" || type == "numeric") {
+			result += "(" + std::to_string(column.precision) + ", " + std::to_string(column.scale) + ")";
+		} else if (type == "time" || type == "datetime2" || type == "datetimeoffset") {
+			result += "(" + std::to_string(column.scale) + ")";
+		} else if (type == "xml" && !column.xml_collection.empty()) {
+			result += string(column.xml_document ? "(DOCUMENT " : "(CONTENT ") +
+					  mssql::QuoteIdentifier(column.xml_collection_schema) + "." +
+					  mssql::QuoteIdentifier(column.xml_collection) + ")";
+		}
+	}
+	// No COLLATE on an alias type (the server refuses it, error 452: the alias's column takes the
+	// database's).
+	if (!column.user_defined && !column.collation.empty() && IsCharacterType(column.system_type)) {
+		result += " COLLATE " + column.collation;
+	}
+	if (column.sparse) {
+		result += " SPARSE";
+	}
+	return result;
+}
+
+string MSSQLDDLTranslator::ServerColumnTypeQuery(const string &schema_name, const string &table_name,
+												 const string &column_name) {
+	const string object = mssql::QuoteIdentifier(schema_name) + "." + mssql::QuoteIdentifier(table_name);
+	return "SELECT TYPE_NAME(c.user_type_id), SCHEMA_NAME(t.schema_id), CAST(t.is_user_defined AS int), "
+		   "CAST(t.is_assembly_type AS int), TYPE_NAME(c.system_type_id), CAST(c.max_length AS int), "
+		   "CAST(c.precision AS int), CAST(c.scale AS int), c.collation_name, CAST(c.is_nullable AS int), "
+		   "CAST(c.is_sparse AS int), CAST(c.is_xml_document AS int), CAST(c.xml_collection_id AS int) "
+		   "FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id "
+		   "WHERE c.object_id = OBJECT_ID(" +
+		   mssql::NVarcharLiteral(object) + ") AND c.name = " + mssql::NVarcharLiteral(column_name);
+}
+
+MSSQLServerColumnType MSSQLDDLTranslator::ParseServerColumnType(const std::vector<string> &row) {
+	if (row.size() < 13) {
+		throw InternalException("ALTER COLUMN: the column's declaration came back with %llu values",
+								(unsigned long long)row.size());
+	}
+	auto number = [&](size_t i) { return row[i].empty() ? 0 : std::stoi(row[i]); };
+	MSSQLServerColumnType c;
+	c.type_name = row[0];
+	c.type_schema = row[1];
+	c.user_defined = number(2) != 0;
+	c.assembly = number(3) != 0;
+	c.system_type = row[4];
+	c.max_length = static_cast<int16_t>(number(5));
+	c.precision = static_cast<uint8_t>(number(6));
+	c.scale = static_cast<uint8_t>(number(7));
+	c.collation = row[8];
+	c.nullable = number(9) != 0;
+	c.sparse = number(10) != 0;
+	c.xml_document = number(11) != 0;
+	c.xml_collection_id = number(12);
+	return c;
 }
 
 //===----------------------------------------------------------------------===//
