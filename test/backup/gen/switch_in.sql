@@ -3,6 +3,7 @@
 -- switched into the table's empty partition and a row of another partition updated, then the
 -- differential. The switched-in pages keep their LSNs (older than the full's checkpoint): only the
 -- catalog tells they are new to the table, so mssql_backup_table_changes must take it whole (a reload).
+-- Compressed (MS_XPRESS), so the committed pair under test/data/backup/switch_in stays small.
 SET NOCOUNT ON;
 SET QUOTED_IDENTIFIER ON;
 GO
@@ -28,12 +29,12 @@ INSERT INTO dbo.staging SELECT 2000 + i, i FROM n;
 GO
 CHECKPOINT;
 GO
-BACKUP DATABASE bak_switch TO DISK = '$(DIR)/switch_full.bak' WITH FORMAT, INIT, CHECKSUM, NAME = 'switch_full';
+BACKUP DATABASE bak_switch TO DISK = '$(DIR)/switch_full.bak' WITH FORMAT, INIT, CHECKSUM, COMPRESSION, NAME = 'switch_full';
 GO
 ALTER TABLE dbo.staging SWITCH TO dbo.facts PARTITION 3;
 UPDATE dbo.facts SET v = -v WHERE id = 10;
 GO
 CHECKPOINT;
 GO
-BACKUP DATABASE bak_switch TO DISK = '$(DIR)/switch_diff.bak' WITH FORMAT, INIT, CHECKSUM, DIFFERENTIAL, NAME = 'switch_diff';
+BACKUP DATABASE bak_switch TO DISK = '$(DIR)/switch_diff.bak' WITH FORMAT, INIT, CHECKSUM, COMPRESSION, DIFFERENTIAL, NAME = 'switch_diff';
 GO

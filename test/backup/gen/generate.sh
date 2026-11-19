@@ -22,7 +22,7 @@
 # diffs_diff_xpress, paired in overlays.txt); schema_changes.sql, truncates, a shrink and a sliding window between a
 # full and its differential (PR 4c-3: schema_full, schema_diff; not run by default); lob_changes.sql, values stored
 # off row changed in each form (PR 4c-3: lob_changes_full, lob_changes_diff; not run by default); switch_in.sql, a
-# partition switched in with no shrink (PR 4c-3: switch_full, switch_diff; not run by default);
+# partition switched in with no shrink (PR 4c-3: switch_full, switch_diff; not run by default; committed under test/data/backup/switch_in, made by its generate.sh);
 # bench_changes.sql, a benchmark of 10 million rows and differentials of 10k / 110k / 1.1M changes and an index rebuild
 # (PR 4c-3: bench_full, bench_diff_*, each also compressed as *_x; not run by default). A fixture's backups come with the server's own catalog of them where it holds
 # still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).

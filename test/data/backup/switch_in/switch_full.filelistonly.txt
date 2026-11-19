@@ -1,0 +1,4 @@
+LogicalName|PhysicalName|Type|FileGroupName|Size|MaxSize|FileId|CreateLSN|DropLSN|UniqueId|ReadOnlyLSN|ReadWriteLSN|BackupSizeInBytes|SourceBlockSize|FileGroupId|LogGroupGUID|DifferentialBaseLSN|DifferentialBaseGUID|IsReadOnly|IsPresent|TDEThumbprint|SnapshotUrl
+-----------|------------|----|-------------|----|-------|------|---------|-------|--------|-----------|------------|-----------------|---------------|-----------|------------|-------------------|--------------------|----------|---------|-------------|-----------
+bak_switch|/var/opt/mssql/data/bak_switch.mdf|D|PRIMARY|8388608|35184372080640|1|0|0|4ACAF3CB-5CDC-4C62-8387-1F8ACE259284|0|0|4128768|4096|1|NULL|0|00000000-0000-0000-0000-000000000000|0|1|NULL|NULL
+bak_switch_log|/var/opt/mssql/data/bak_switch_log.ldf|L|NULL|8388608|2199023255552|2|0|0|00DDF537-93A1-43C3-9649-E45962579399|0|0|0|4096|0|NULL|0|00000000-0000-0000-0000-000000000000|0|1|NULL|NULL

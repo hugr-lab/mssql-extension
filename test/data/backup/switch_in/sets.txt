@@ -1,0 +1,2 @@
+switch_full|switch_full.bak
+switch_diff|switch_diff.bak

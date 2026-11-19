@@ -16,4 +16,7 @@ if [ "${VERSION}" != 2025 ]; then
 	echo "       Generate another version elsewhere: OUT=/tmp/bak VERSION=${VERSION} test/backup/gen/generate.sh" >&2
 	exit 1
 fi
-OUT="${HERE}" VERSION="${VERSION}" FIXTURES=samples exec "${HERE}/../../backup/gen/generate.sh"
+OUT="${HERE}" VERSION="${VERSION}" FIXTURES=samples "${HERE}/../../backup/gen/generate.sh"
+# A database of its own, in a directory of its own (the samples' history globs *.bak, one database):
+# a partition switched in from another table (spec 085 PR 4c-3, review of #580).
+OUT="${HERE}/switch_in" VERSION="${VERSION}" FIXTURES=switch_in exec "${HERE}/../../backup/gen/generate.sh"
