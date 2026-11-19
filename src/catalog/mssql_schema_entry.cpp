@@ -502,7 +502,8 @@ void MSSQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 			server_column(SingleColumnOf(type_info.column_path, "ALTER COLUMN TYPE"), "ALTER COLUMN TYPE");
 		tsql = MSSQLDDLTranslator::TranslateAlterColumnType(
 			name.GetIdentifierName(), table_name, column.first, type_info.target_type, column.second.nullable,
-			MSSQLDDLTranslator::IsCharacterType(column.second.system_type) ? column.second.collation : string());
+			MSSQLDDLTranslator::IsCharacterType(column.second.system_type) ? column.second.collation : string(),
+			column.second.sparse);
 		break;
 	}
 

@@ -158,9 +158,10 @@ public:
 	//! @param collation The column's collation, kept when the new type is a character type that names none
 	//! (empty: none kept)
 	//! @return T-SQL statement
+	//! @param sparse Whether the column is SPARSE -- kept (review of #586)
 	static string TranslateAlterColumnType(const string &schema_name, const string &table_name,
 										   const string &column_name, const LogicalType &new_type, bool is_nullable,
-										   const string &collation = string());
+										   const string &collation = string(), bool sparse = false);
 
 	//! Generate ALTER COLUMN T-SQL for nullability change. The column is re-declared as the server
 	//! declares it (ColumnDeclaration), so only its nullability changes: its DuckDB type re-declared a

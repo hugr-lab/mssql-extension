@@ -182,13 +182,17 @@ ALTER TABLE akd.dbo.AlterKeepsDecl2 ALTER COLUMN cs TYPE VARCHAR;
 statement ok
 ALTER TABLE akd.dbo.AlterKeepsDecl2 ALTER COLUMN nl TYPE BIGINT;
 
+# A sparse column stays sparse through a type change too (review of #586).
+statement ok
+ALTER TABLE akd.dbo.AlterKeepsDecl2 ALTER COLUMN sp TYPE BIGINT;
+
 query TTTIII
 SELECT * FROM mssql_scan('akd', 'SELECT c.name, TYPE_NAME(c.user_type_id) AS t, CASE WHEN c.name = ''al'' THEN NULL ELSE c.collation_name END AS collation_name, CAST(c.is_nullable AS int) AS nullable, CAST(c.is_sparse AS int) AS sparse, CAST(CASE WHEN c.xml_collection_id = 0 THEN 0 ELSE c.is_xml_document + 1 END AS int) AS xml_kind FROM sys.columns c WHERE c.object_id = OBJECT_ID(''dbo.AlterKeepsDecl2'') ORDER BY c.column_id');
 ----
 al	AkdName	NULL	0	0	0
 x	xml	NULL	0	0	2
 u	uniqueidentifier	NULL	0	0	0
-sp	int	NULL	1	1	0
+sp	bigint	NULL	1	1	0
 st	bigint	NULL	0	0	0
 cs	nvarchar	Latin1_General_CS_AS	1	0	0
 nl	bigint	NULL	1	0	0

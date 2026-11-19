@@ -382,6 +382,10 @@ void test_column_declaration() {
 														   "Latin1_General_CS_AS"),
 			  "ALTER TABLE [dbo].[t] ALTER COLUMN [c] " + MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::BIGINT) +
 				  " NULL;");
+	// A sparse column stays sparse through a type change.
+	ASSERT_EQ(MSSQLDDLTranslator::TranslateAlterColumnType("dbo", "t", "c", LogicalType::BIGINT, true, "", true),
+			  "ALTER TABLE [dbo].[t] ALTER COLUMN [c] " + MSSQLDDLTranslator::MapTypeToSQLServer(LogicalType::BIGINT) +
+				  " SPARSE NULL;");
 	std::cout << "PASSED!" << std::endl;
 }
 

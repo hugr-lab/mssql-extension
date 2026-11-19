@@ -285,7 +285,7 @@ string MSSQLDDLTranslator::TranslateRenameColumn(const string &schema_name, cons
 
 string MSSQLDDLTranslator::TranslateAlterColumnType(const string &schema_name, const string &table_name,
 													const string &column_name, const LogicalType &new_type,
-													bool is_nullable, const string &collation) {
+													bool is_nullable, const string &collation, bool sparse) {
 	string result = "ALTER TABLE ";
 	result += mssql::QuoteIdentifier(schema_name);
 	result += ".";
@@ -299,6 +299,9 @@ string MSSQLDDLTranslator::TranslateAlterColumnType(const string &schema_name, c
 	const string type = lower.substr(0, lower.find('('));
 	if (!collation.empty() && IsCharacterType(type) && lower.find(" collate ") == string::npos) {
 		result += " COLLATE " + collation;
+	}
+	if (sparse) {
+		result += " SPARSE";
 	}
 	result += is_nullable ? " NULL" : " NOT NULL";
 	result += ";";
