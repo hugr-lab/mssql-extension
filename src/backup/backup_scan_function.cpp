@@ -18,15 +18,22 @@
 //===----------------------------------------------------------------------===//
 
 #include "backup/backup_scan_function.hpp"
+#include "backup/backup_scan_internal.hpp"
 
+#include "backup/backup_changes_function.hpp"
 #include "backup/backup_function_common.hpp"
+#include "backup/backup_hash.hpp"
 #include "backup/backup_opened.hpp"
 #include "backup/backup_record_stager.hpp"
 #include "backup/backup_reservation.hpp"
+#include "backup/backup_schema_changes.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/radix_partitioning.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/common/types/column/partitioned_column_data.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -39,8 +46,16 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
+#include <exception>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace duckdb {
 namespace mssql {
@@ -60,59 +75,6 @@ const column_t LOB_COLUMN = VIRTUAL_COLUMN_START + 3;
 //! virtual from here on: `SELECT *` leaves them out, and naming one refuses the query by name, with
 //! its reason (owner, review of #552).
 const column_t UNREAD_COLUMN_START = VIRTUAL_COLUMN_START + 16;
-
-struct ScanBindData : public TableFunctionData {
-	vector<std::string> paths;
-	vector<std::string> diff;  // task 24: a differential over the full on `paths`
-	BackupAt at;			   // task 24b: a version of the history of `paths`
-	std::string schema;
-	std::string table;
-	std::shared_ptr<OpenedCatalog> catalog;
-	const CatalogTable *entry = nullptr;  // in catalog->Model()
-	std::vector<int32_t> column_ids;	  // the scan's columns: catalog column ids, in output order
-	vector<LogicalType> types;
-	vector<std::string> names;		   // of column_ids
-	std::vector<UnreadColumn> unread;  // UNREAD_COLUMN_START + i
-	//! `max_threads` as the call gave it; 0 = not given (DuckDB's `threads`). Clamped at init.
-	idx_t max_threads = 0;
-	//! `max_memory` in bytes as the call gave it; 0 = not given (DuckDB's `memory_limit`). Clamped at
-	//! init; half of it is the budget of the scan's reservations (D17).
-	idx_t max_memory = 0;
-	//! An attached backup's table entry the scan reads (task 23), for the binder, and that backup, read
-	//! through its catalog, never found again by name; none for a file's (and for a plan deserialized,
-	//! which resolves `paths` and checks the columns).
-	optional_ptr<TableCatalogEntry> table_entry;
-	std::shared_ptr<const AttachedBackup> attached;
-
-	unique_ptr<FunctionData> Copy() const override {
-		auto copy = make_uniq<ScanBindData>();
-		copy->paths = paths;
-		copy->diff = diff;
-		copy->at = at;
-		copy->schema = schema;
-		copy->table = table;
-		copy->max_threads = max_threads;
-		copy->max_memory = max_memory;
-		copy->catalog = catalog;
-		copy->entry = entry;
-		copy->column_ids = column_ids;
-		copy->types = types;
-		copy->names = names;
-		copy->unread = unread;
-		copy->table_entry = table_entry;
-		copy->attached = attached;
-		return std::move(copy);
-	}
-	bool Equals(const FunctionData &other_p) const override {
-		const auto &other = other_p.Cast<ScanBindData>();
-		return paths == other.paths && diff == other.diff && at.Same(other.at) && schema == other.schema &&
-			   table == other.table && max_threads == other.max_threads && max_memory == other.max_memory;
-	}
-	//! Every EXECUTE binds again: the file is read at bind.
-	bool SupportStatementCache() const override {
-		return false;
-	}
-};
 
 //! The scan's model: the one table, or view of the name (task 16e: the bind described every table of
 //! the database for it; 16f: an indexed view's rows are read as a table's).
@@ -325,18 +287,6 @@ virtual_column_map_t VirtualColumns(ClientContext &, optional_ptr<FunctionData> 
 constexpr size_t UNIT_PAGES = 64;
 constexpr size_t MAX_UNIT_PAGES = 2048;
 
-// One partition's place in the scan: its layout, in-row unit, IAM-listed pages, and the rid's parts.
-struct PartitionCursor {
-	const CatalogPartition *partition = nullptr;
-	const SysAllocUnit *unit = nullptr;
-	LobUnits off_row;  // its LOB_DATA and ROW_OVERFLOW_DATA units, 0 where it has none
-	//! In page order, each once; an attached backup's kept list (task 23), else this scan's.
-	std::shared_ptr<const std::vector<PagePointer>> pages;
-	std::vector<size_t> key;  // layout indexes of the clustered key, in ordkey order
-	bool has_uniquifier = false;
-	size_t uniquifier = 0;
-};
-
 // What every task shares: the projection (built at init, then only read), and where the next unit is
 // cut, under `claim`: the partition being cut, its next page and unit length, the next partition to
 // list, and the next batch index. A partition's pages are listed when its first unit is claimed, so
@@ -401,6 +351,8 @@ struct ScanLocalState : public LocalTableFunctionState {
 	std::vector<hugeint_t> lsns;
 	std::vector<std::string> lob_maps;	// empty: NULL
 };
+
+}  // namespace
 
 // Partition `p`'s cursor: its in-row unit, the pages its IAM chain lists (in page order, each once),
 // and the layout indexes of its clustered key.
@@ -476,10 +428,7 @@ PartitionCursor BuildPartition(const ScanBindData &data, const CatalogPartition 
 	return cursor;
 }
 
-//! What a chunk's reservation is held to (D17) when a vector of the table's widest declared rows would
-//! need more: its chunks close on the bytes actually staged (RecordStager::LimitBytes), so a
-//! varchar(8000) holding a few bytes still fills a vector, and the reservation stays this size.
-constexpr uint64_t CHUNK_RESERVATION_BYTES = 8ull << 20;
+namespace {
 
 // What the scan's own virtual values hold a row, for the reservation: a page key (a std::string, 14
 // characters in place), a rid (its std::string with a key of 1,700 bytes at most, a shape byte and a
@@ -703,6 +652,8 @@ void PutU32(std::string &out, uint32_t v) {
 	}
 }
 
+}  // namespace
+
 // _mssql_rid (D8): a heap row's place before it moved (its own, or a forwarded record's back pointer),
 // 0x00 ‖ u32 page ‖ u16 file ‖ u16 slot; a clustered row 0x01 ‖ per key column in ordkey order u16
 // length ‖ its stored bytes (0xFFFF for NULL; a bit as one byte 0 / 1) ‖ u32 uniquifier when the index
@@ -771,6 +722,8 @@ std::string RowId(const ScanBindData &data, const PartitionCursor &cursor, const
 	}
 	return rid;
 }
+
+namespace {
 
 // The next live data page of the unit into local.page; false when the unit has no more.
 bool NextPage(ClientContext &context, const ScanBindData &data, ScanLocalState &local) {
@@ -1140,6 +1093,7 @@ void RegisterBackupScanFunction(ExtensionLoader &loader) {
 	for (const auto &path : paths) {
 		set.AddFunction(MakeScanFunction(path));
 	}
+	RegisterBackupTableChangesFunctions(loader, paths);
 	mssql::RegisterDocumentedFunction(
 		loader, std::move(set),
 		{{},

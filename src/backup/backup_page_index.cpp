@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <map>
+#include <set>
 #include <string>
 
 namespace duckdb {
@@ -121,6 +123,28 @@ bool ExtentBitmap::Select(uint64_t rank, uint32_t &extent) const {
 		}
 	}
 	return false;
+}
+
+void PassMap::ForEachExtent(const std::function<void(const ExtentId &)> &fn) const {
+	if (ranked_) {
+		for (size_t f = 0; f < files_.size(); f++) {
+			for (uint64_t r = 0; r < bitmaps_[f].Count(); r++) {
+				ExtentId e;
+				e.file = files_[f];
+				if (bitmaps_[f].Select(r, e.extent)) {
+					fn(e);
+				}
+			}
+		}
+		return;
+	}
+	for (const auto &run : runs_) {
+		for (uint32_t i = 0; i < run.count; i++) {
+			ExtentId e = run.first;
+			e.extent += i;
+			fn(e);
+		}
+	}
 }
 
 bool PassMap::Find(const ExtentId &extent, uint64_t &group) const {
@@ -442,6 +466,7 @@ static constexpr size_t GAM_BITMAP_AT = 194;
 static constexpr size_t GAM_BITMAP_BYTES = 7988;
 static constexpr uint8_t PAGE_TYPE_FILE_HEADER = 15;
 static constexpr uint8_t PAGE_TYPE_GAM = 8;
+static constexpr uint8_t PAGE_TYPE_DCM = 16;  // a GAM interval's differential changed map, its page 6
 // The boot page: page 9 of file 1 only (as AllocationMap's).
 static constexpr uint16_t BOOT_FILE = 1;
 static constexpr uint32_t BOOT_PAGE = 9;
@@ -507,7 +532,8 @@ const uint8_t *GroupPage(const ReadGroup &g, uint32_t page_in_extent, uint8_t ty
 //! extents (the PFS pages in it, its own first extent, in file 1 the boot page's in interval 0)
 //! and the extents its GAM marks allocated. Every extent added is below the next interval's first.
 //! Returns how many extents the interval's GAM marks allocated.
-size_t AddInterval(uint16_t file, uint32_t size, uint32_t interval, const uint8_t *gam_bits, ExtentBitmap &bitmap) {
+size_t AddInterval(uint16_t file, uint32_t size, uint32_t interval, const uint8_t *gam_bits, const uint8_t *dcm_bits,
+				   ExtentBitmap &bitmap) {
 	const uint64_t first_page = static_cast<uint64_t>(interval) * GAM_INTERVAL_PAGES;
 	const uint32_t first_extent = interval * GAM_INTERVAL_EXTENTS;
 	// The interval's GAM-allocated extents, past the recorded Size too: the Size is a lower bound (a
@@ -539,20 +565,40 @@ size_t AddInterval(uint16_t file, uint32_t size, uint32_t interval, const uint8_
 	extents.insert(extents.end(), allocated.begin(), allocated.end());
 	std::sort(extents.begin(), extents.end());
 	for (uint32_t e : extents) {
-		bitmap.Add(e);
+		// A differential carries those of them its DCM marks (DQ-41 revisited: measured on 15
+		// differentials -- plain, compressed, striped, of three files, under load, after a shrink).
+		const uint32_t i = e - first_extent;
+		if (!dcm_bits || ((dcm_bits[i / 8] >> (i % 8)) & 1)) {
+			bitmap.Add(e);
+		}
 	}
 	return allocated.size();
 }
 
 }  // namespace
 
+//! Whether `e` holds an allocation page: the file header and an interval's GAM / SGAM / DCM / BCM (its first
+//! extent), a PFS page (page 1 and every 8,088th), file 1's boot page (E17).
+bool HoldsAllocationPage(const ExtentId &e) {
+	const uint64_t first = static_cast<uint64_t>(e.extent) * PAGES_PER_EXTENT;
+	if (first % GAM_INTERVAL_PAGES == 0 || (e.file == BOOT_FILE && e.extent == BOOT_PAGE / PAGES_PER_EXTENT)) {
+		return true;
+	}
+	for (uint64_t p = first; p < first + PAGES_PER_EXTENT; p++) {
+		if (p == 1 || p % PFS_INTERVAL == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 //! The rank path's body (a friend of PassMap): false when the rule does not hold.
 class RankedPassBuilder {
 public:
-	static bool Build(const RandomAccess &stream, PassMap &result, uint64_t &reads);
+	static bool Build(const RandomAccess &stream, PassMap &result, uint64_t &reads, bool differential);
 };
 
-bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint64_t &reads) {
+bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint64_t &reads, bool differential) {
 	ReadGroup g;
 	uint64_t file_group = 0;  // the group of the current file's extent 0
 	uint16_t last_file = 0;
@@ -576,7 +622,8 @@ bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint6
 		// Group 0 of a file: its extent 0, the file header (page 0) and the first GAM (page 2).
 		const uint8_t *header = GroupPage(g, 0, PAGE_TYPE_FILE_HEADER);
 		const uint8_t *gam = GroupPage(g, 2, PAGE_TYPE_GAM);
-		if (!g.has_extent || g.extent.extent != 0 || !header || !gam ||
+		const uint8_t *dcm = differential ? GroupPage(g, 6, PAGE_TYPE_DCM) : nullptr;
+		if (!g.has_extent || g.extent.extent != 0 || !header || !gam || (differential && !dcm) ||
 			(!result.files_.empty() && g.extent.file <= last_file)) {
 			return false;
 		}
@@ -591,17 +638,27 @@ bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint6
 			return false;
 		}
 		const uint32_t size = record.size;
-		// Every PFS page's extent is copied, so a file has at least size / 8088 extents: one whose
-		// Size the rest of the pass cannot hold is refused before anything is allocated for it.
-		if (size == 0 || size / PFS_INTERVAL + 1 > result.groups_ - file_group) {
+		// Every PFS page's extent is copied by a full, so a file has at least size / 8088 extents: one
+		// whose Size the rest of the pass cannot hold is refused before anything is allocated for it (a
+		// differential copies those its DCM marks only).
+		if (size == 0 || (!differential && size / PFS_INTERVAL + 1 > result.groups_ - file_group)) {
 			return false;
 		}
 		ExtentBitmap bitmap;
 		std::vector<uint8_t> gam_copy(gam, gam + PAGE_SIZE);
+		std::vector<uint8_t> dcm_copy;
+		if (dcm) {
+			dcm_copy.assign(dcm, dcm + PAGE_SIZE);
+		}
 		for (uint32_t interval = 0;; interval++) {
 			ByteReader bm(gam_copy.data(), PAGE_SIZE, "a GAM page", 0);
+			const uint8_t *dcm_bits = nullptr;
+			if (differential) {
+				ByteReader dm(dcm_copy.data(), PAGE_SIZE, "a DCM page", 0);
+				dcm_bits = dm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES);
+			}
 			const size_t allocated =
-				AddInterval(file, size, interval, bm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES), bitmap);
+				AddInterval(file, size, interval, bm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES), dcm_bits, bitmap);
 			if (bitmap.Count() > result.groups_ - file_group) {
 				return false;
 			}
@@ -624,12 +681,24 @@ bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint6
 				break;	// the pass ends: no interval past the recorded Size
 			}
 			reads++;
-			// A later interval's GAM is its first page, unit 0 of its first extent (E17).
+			// A later interval's GAM is its first page, unit 0 of its first extent (E17); its DCM unit 6.
 			const uint8_t *next_gam = GroupPage(ahead, 0, PAGE_TYPE_GAM);
-			const bool is_next =
-				ahead.has_extent && ahead.extent.file == file && ahead.extent.extent == next_extent && next_gam;
+			const uint8_t *next_dcm = differential ? GroupPage(ahead, 6, PAGE_TYPE_DCM) : nullptr;
+			bool is_next = ahead.has_extent && ahead.extent.file == file && ahead.extent.extent == next_extent &&
+						   next_gam && (!differential || next_dcm);
+			if (!is_next && differential && ahead.has_extent && ahead.extent.file == file &&
+				ahead.extent.extent > next_extent && ahead.extent.extent % GAM_INTERVAL_EXTENTS == 0 && next_gam &&
+				next_dcm) {
+				// A differential leaves out an interval that changed in nothing (its GAM and DCM pages too):
+				// the next group is a later interval's first. Anything else it carries there would come
+				// before it, so the ranks hold.
+				interval = ahead.extent.extent / GAM_INTERVAL_EXTENTS - 1;
+				is_next = true;
+			}
 			if (!is_next) {
-				if (recorded) {
+				const bool next_file_or_end =
+					ahead.is_pad || (ahead.has_extent && ahead.extent.file > file && ahead.extent.extent == 0);
+				if (recorded && !(differential && next_file_or_end)) {
 					return false;
 				}
 				// Past the recorded Size the data reaches the next interval only if its GAM comes
@@ -639,9 +708,25 @@ bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint6
 				break;
 			}
 			gam_copy.assign(next_gam, next_gam + PAGE_SIZE);
+			if (differential) {
+				dcm_copy.assign(next_dcm, next_dcm + PAGE_SIZE);
+			}
 		}
 		bitmap.Seal();
 		const uint64_t count = bitmap.Count();
+		if (differential && count > 0) {
+			// Its last extent where its rank puts it: a surplus at the file's tail would land on the
+			// pass's trailing pads, which the next file's group 0 does not check (review of the DCM map).
+			uint32_t last = 0;
+			if (!bitmap.Select(count - 1, last) ||
+				!ReadPassGroup(stream, result.units_offset, result.groups_, file_group + count - 1, g)) {
+				return false;
+			}
+			reads++;
+			if (g.is_pad || !g.has_extent || g.extent.file != file || g.extent.extent != last) {
+				return false;
+			}
+		}
 		// Check groups spread over the file: each names the extent its rank gives.
 		for (uint32_t c = 1; c <= RANK_CHECKS_PER_FILE && c < count; c++) {
 			uint64_t rank = (count - 1) * c / RANK_CHECKS_PER_FILE;
@@ -680,7 +765,7 @@ bool RankedPassBuilder::Build(const RandomAccess &stream, PassMap &result, uint6
 }
 
 bool BuildRankedPassMap(const RandomAccess &stream, uint64_t offset, uint64_t length, PassMap &map,
-						uint64_t *groups_read) {
+						uint64_t *groups_read, bool differential) {
 	if (length < 2 || offset > stream.Size() || length > stream.Size() - offset || (length - 2) % GROUP_BYTES != 0) {
 		return false;
 	}
@@ -691,7 +776,7 @@ bool BuildRankedPassMap(const RandomAccess &stream, uint64_t offset, uint64_t le
 	uint64_t reads = 0;
 	bool ok = false;
 	try {
-		ok = RankedPassBuilder::Build(stream, result, reads);
+		ok = RankedPassBuilder::Build(stream, result, reads, differential);
 	} catch (FormatError &) {
 		// Something read did not parse: the rule does not hold here; the header scan decides.
 		ok = false;
@@ -704,6 +789,472 @@ bool BuildRankedPassMap(const RandomAccess &stream, uint64_t offset, uint64_t le
 	}
 	result.ranked_ = true;
 	map = std::move(result);
+	return true;
+}
+
+namespace {
+
+// The reads CheckDifferentialRanks may make, counted in windows of this size (a remote file's read is
+// a block of about this size, a local one's a page cache's read-ahead): two, or at most half the pass's.
+static constexpr uint64_t CHECK_WINDOW_BYTES = 2ull << 20;
+
+//! Whether the group at `rank` of a ranked file names the extent of that rank. A group of zero units
+//! only names nothing: the next ranks are read, at most RANK_CHECK_STEPS of them (as the sampled checks).
+bool CheckRankAt(const RandomAccess &stream, uint64_t units_offset, uint64_t groups, const ExtentBitmap &bitmap,
+				 uint64_t file_group, uint16_t file, uint64_t rank, uint64_t &reads) {
+	ReadGroup g;
+	for (uint32_t step = 0; step < RANK_CHECK_STEPS && rank < bitmap.Count(); step++, rank++) {
+		uint32_t expected = 0;
+		if (!bitmap.Select(rank, expected) || !ReadPassGroup(stream, units_offset, groups, file_group + rank, g)) {
+			return false;
+		}
+		reads++;
+		if (g.is_pad || (g.has_extent && (g.extent.file != file || g.extent.extent != expected))) {
+			return false;
+		}
+		if (g.has_extent) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! Unit `unit` of group `group` of a pass whose units start at `units_offset`, when it is a page of
+//! type `type`.
+bool ReadAllocationUnit(const RandomAccess &stream, uint64_t units_offset, uint64_t groups, uint64_t group,
+						uint32_t unit, uint8_t type, std::vector<uint8_t> &out) {
+	if (group >= groups) {
+		return false;
+	}
+	out.resize(PAGE_SIZE);
+	stream.ReadAt(units_offset + group * GROUP_BYTES + static_cast<uint64_t>(unit) * PAGE_SIZE, out.data(), PAGE_SIZE);
+	return out[0] == PAGE_HEADER_VERSION && out[1] == type;
+}
+
+}  // namespace
+
+namespace {
+
+//! A pass the backup wrote after pass 1, mapped by its headers, and the stream that holds it.
+struct LaterPass {
+	const PassMap *map = nullptr;
+	const RandomAccess *stream = nullptr;
+};
+
+//! Pass 1's copies of the allocation pages of the interval starting at `first_extent` of `file`: 1 with them,
+//! 0 when pass 1 carries no such interval (it changed in nothing when pass 1 came to it), -1 when what pass 1
+//! carries there is not them.
+using FirstCopies =
+	std::function<int(uint16_t file, uint32_t first_extent, std::vector<uint8_t> &gam, std::vector<uint8_t> &dcm)>;
+
+//! The extents pass 1 may have caught changing (the load check, DQ-41 revisited): those the later passes copy
+//! again that hold no allocation page, those whose GAM or DCM bit moved between pass 1's copy of their
+//! interval's pages and the latest, and each one's PFS page's (and file 1's boot page's) extent. False when
+//! what was read is not the pages it should be.
+bool ChangedWhileBackedUp(const std::vector<LaterPass> &later, const FirstCopies &first_copies,
+						  std::vector<ExtentId> &changed, uint64_t &reads, size_t *written_out = nullptr) {
+	std::map<std::pair<uint16_t, uint32_t>, LaterPass> intervals;  // the latest copy wins
+	for (const auto &pass : later) {
+		pass.map->ForEachExtent([&](const ExtentId &e) {
+			if (!HoldsAllocationPage(e)) {
+				changed.push_back(e);
+			} else if (e.extent % GAM_INTERVAL_EXTENTS == 0) {
+				intervals[std::make_pair(e.file, e.extent)] = pass;
+			}
+		});
+	}
+	std::vector<uint8_t> old_gam, old_dcm, new_gam, new_dcm;
+	for (const auto &entry : intervals) {
+		const uint16_t file = entry.first.first;
+		const uint32_t first_extent = entry.first.second;
+		ExtentId e;
+		e.file = file;
+		e.extent = first_extent;
+		uint64_t group = 0;
+		const PassMap &latest = *entry.second.map;
+		if (!latest.Find(e, group)) {
+			return false;
+		}
+		const uint32_t gam_unit = first_extent == 0 ? 2 : 0;
+		if (!ReadAllocationUnit(*entry.second.stream, latest.units_offset, latest.GroupCount(), group, gam_unit,
+								PAGE_TYPE_GAM, new_gam) ||
+			!ReadAllocationUnit(*entry.second.stream, latest.units_offset, latest.GroupCount(), group, 6, PAGE_TYPE_DCM,
+								new_dcm)) {
+			return false;
+		}
+		reads += 2;
+		const int had = first_copies(file, first_extent, old_gam, old_dcm);
+		if (had < 0) {
+			return false;
+		}
+		if (had == 0) {
+			// An interval pass 1 left out had changed in nothing when it came to it: no bit marked then.
+			old_gam = new_gam;
+			old_dcm.assign(PAGE_SIZE, 0);
+		} else {
+			reads += 2;
+		}
+		for (size_t b = 0; b < GAM_BITMAP_BYTES; b++) {
+			const size_t at = GAM_BITMAP_AT + b;
+			const uint8_t moved = static_cast<uint8_t>((old_gam[at] ^ new_gam[at]) | (old_dcm[at] ^ new_dcm[at]));
+			for (uint32_t bit = 0; bit < 8; bit++) {
+				if ((moved >> bit) & 1) {
+					ExtentId x;
+					x.file = file;
+					x.extent = first_extent + static_cast<uint32_t>(b * 8 + bit);
+					changed.push_back(x);
+				}
+			}
+		}
+	}
+	// Each changed extent's PFS page's extent too, and file 1's boot page's: an allocation there changes them,
+	// and their bits need not move between the two copies (pass 1's copy may postdate the change) while a later
+	// pass does not copy them as data (review of the load check).
+	const size_t written = changed.size();
+	if (written_out) {
+		*written_out = written;
+	}
+	for (size_t k = 0; k < written; k++) {
+		const uint64_t page = static_cast<uint64_t>(changed[k].extent) * PAGES_PER_EXTENT;
+		const uint64_t pfs = page < PFS_INTERVAL ? 1 : page / PFS_INTERVAL * PFS_INTERVAL;
+		ExtentId x;
+		x.file = changed[k].file;
+		x.extent = static_cast<uint32_t>(pfs / PAGES_PER_EXTENT);
+		changed.push_back(x);
+		if (x.file == BOOT_FILE) {
+			x.extent = BOOT_PAGE / PAGES_PER_EXTENT;
+			changed.push_back(x);
+		}
+	}
+	return true;
+}
+
+}  // namespace
+
+bool CheckDifferentialRanks(const RandomAccess &stream, const PassMap &first, const std::vector<const PassMap *> &later,
+							uint64_t *groups_read) {
+	uint64_t reads = 0;
+	bool ok = false;
+	try {
+		ok = [&]() -> bool {
+			if (!first.ranked_) {
+				return false;
+			}
+			auto file_index = [&](uint16_t file, size_t &i) -> bool {
+				for (i = 0; i < first.files_.size(); i++) {
+					if (first.files_[i] == file) {
+						return true;
+					}
+				}
+				return false;
+			};
+			std::vector<LaterPass> passes;
+			for (const PassMap *pass : later) {
+				LaterPass p;
+				p.map = pass;
+				p.stream = &stream;
+				passes.push_back(p);
+			}
+			std::vector<ExtentId> changed;
+			size_t written = 0;
+			const bool read = ChangedWhileBackedUp(
+				passes,
+				[&](uint16_t file, uint32_t first_extent, std::vector<uint8_t> &gam, std::vector<uint8_t> &dcm) -> int {
+					size_t i = 0;
+					if (!file_index(file, i)) {
+						return -1;	// pass 1 carries every file's extent 0: a shape the rule does not know
+					}
+					const ExtentBitmap &bitmap = first.bitmaps_[i];
+					if (!bitmap.Contains(first_extent)) {
+						return 0;
+					}
+					const uint64_t at = first.file_first_group_[i] + bitmap.Rank(first_extent);
+					const uint32_t gam_unit = first_extent == 0 ? 2 : 0;
+					return ReadAllocationUnit(stream, first.units_offset, first.groups_, at, gam_unit, PAGE_TYPE_GAM,
+											  gam) &&
+								   ReadAllocationUnit(stream, first.units_offset, first.groups_, at, 6, PAGE_TYPE_DCM,
+													  dcm)
+							   ? 1
+							   : -1;
+				},
+				changed, reads, &written);
+			// More changed than the pass has groups: reading it through is cheaper.
+			if (!read || written > first.groups_) {
+				return false;
+			}
+			// Each changed extent's rank when the map holds it, and the rank of the next extent it holds.
+			std::vector<std::pair<size_t, uint64_t>> checks;
+			for (const auto &e : changed) {
+				size_t i = 0;
+				if (!file_index(e.file, i)) {
+					continue;  // a file pass 1 does not carry: nothing of it is ranked
+				}
+				const ExtentBitmap &bitmap = first.bitmaps_[i];
+				uint64_t below = bitmap.Rank(e.extent);
+				if (bitmap.Contains(e.extent)) {
+					checks.emplace_back(i, below);
+					below++;
+				}
+				if (below < bitmap.Count()) {
+					checks.emplace_back(i, below);
+				}
+			}
+			std::sort(checks.begin(), checks.end());
+			checks.erase(std::unique(checks.begin(), checks.end()), checks.end());
+			// The windows the checks read (a check that meets zero-unit groups steps on: counted as its first).
+			std::set<uint64_t> windows;
+			for (const auto &c : checks) {
+				windows.insert((first.file_first_group_[c.first] + c.second) * GROUP_BYTES / CHECK_WINDOW_BYTES);
+			}
+			const uint64_t pass_windows = first.groups_ * GROUP_BYTES / CHECK_WINDOW_BYTES + 1;
+			if (windows.size() > 2 && windows.size() * 2 > pass_windows) {
+				return false;  // as much as reading the pass through: its headers decide
+			}
+			for (const auto &c : checks) {
+				if (!CheckRankAt(stream, first.units_offset, first.groups_, first.bitmaps_[c.first],
+								 first.file_first_group_[c.first], first.files_[c.first], c.second, reads)) {
+					return false;
+				}
+			}
+			return true;
+		}();
+	} catch (FormatError &) {
+		ok = false;	 // something read did not parse: the header scan decides
+	}
+	if (groups_read) {
+		*groups_read = reads;
+	}
+	return ok;
+}
+
+bool DcmSet::Contains(const ExtentId &extent) const {
+	for (size_t i = 0; i < files_.size(); i++) {
+		if (files_[i] == extent.file) {
+			return bitmaps_[i].Contains(extent.extent);
+		}
+	}
+	return false;
+}
+
+uint64_t DcmSet::Count() const {
+	uint64_t count = 0;
+	for (const auto &b : bitmaps_) {
+		count += b.Count();
+	}
+	return count;
+}
+
+size_t DcmSet::MemoryBytes() const {
+	size_t bytes = files_.capacity() * sizeof(uint16_t);
+	for (const auto &b : bitmaps_) {
+		bytes += b.MemoryBytes();
+	}
+	return bytes;
+}
+
+//! A striped differential's pass 1 (DQ-41 revisited): the families' passes searched (each ascending, E13),
+//! the extents they carry together the DCM's rule over its pages, wherever the searches find them. Checked:
+//! the families' groups up to their trailing pads are as many as the set holds; groups sampled in each are
+//! extents of the set; and where the database changed while the backup ran (ChangedWhileBackedUp), the set
+//! holds an extent exactly when a family's search finds it. False when anything disagrees: the passes are then
+//! mapped by their headers.
+class StripedDcmBuilder {
+public:
+	static bool Build(PageIndex &index, const PageIndexOptions &options);
+};
+
+// Groups sampled in each family of a striped differential's pass 1.
+static constexpr uint32_t STRIPED_SAMPLES = 64;
+
+bool StripedDcmBuilder::Build(PageIndex &index, const PageIndexOptions &options) {
+	std::vector<size_t> firsts;
+	for (size_t i = 0; i < index.passes_.size(); i++) {
+		const auto &pass = index.passes_[i];
+		if (pass.number == 0 && pass.search) {
+			if (pass.by_block) {
+				return false;  // positions are a resync's block offsets (trust_layout): no group read by index
+			}
+			firsts.push_back(i);
+		}
+	}
+	if (firsts.size() < 2 || options.data_files.empty()) {
+		return false;
+	}
+	auto stream_of = [&](size_t i) -> const RandomAccess & { return *index.families_[index.passes_[i].family].stream; };
+	// The family whose pass 1 carries `e`, and its group.
+	auto find = [&](const ExtentId &e, size_t &which, uint64_t &group) -> bool {
+		for (size_t i : firsts) {
+			if (index.passes_[i].search->Find(e, group)) {
+				which = i;
+				return true;
+			}
+		}
+		return false;
+	};
+	uint64_t total_groups = 0;
+	for (size_t i : firsts) {
+		total_groups += index.passes_[i].groups;
+	}
+	auto set = std::make_shared<DcmSet>();
+	ReadGroup g;
+	for (const uint16_t id : options.data_files) {
+		ExtentId first;
+		first.file = id;
+		size_t which = 0;
+		uint64_t group = 0;
+		if (!find(first, which, group) || !ReadPassGroup(stream_of(which), index.passes_[which].units_offset,
+														 index.passes_[which].groups, group, g)) {
+			return false;  // every data file's extent 0 is in pass 1: its header, GAM and DCM
+		}
+		const uint8_t *header = GroupPage(g, 0, PAGE_TYPE_FILE_HEADER);
+		const uint8_t *gam = GroupPage(g, 2, PAGE_TYPE_GAM);
+		const uint8_t *dcm = GroupPage(g, 6, PAGE_TYPE_DCM);
+		if (!header || !gam || !dcm) {
+			return false;
+		}
+		const FileHeaderRecord record = ReadFileHeaderRecord(header, PAGE_SIZE);
+		if (record.file_id != id || record.size == 0) {
+			return false;
+		}
+		const uint32_t size = record.size;
+		std::vector<uint8_t> gam_copy(gam, gam + PAGE_SIZE), dcm_copy(dcm, dcm + PAGE_SIZE);
+		ExtentBitmap bitmap;
+		for (uint32_t interval = 0;; interval++) {
+			ByteReader bm(gam_copy.data(), PAGE_SIZE, "a GAM page", 0);
+			ByteReader dm(dcm_copy.data(), PAGE_SIZE, "a DCM page", 0);
+			const size_t allocated = AddInterval(id, size, interval, bm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES),
+												 dm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES), bitmap);
+			if (bitmap.Count() > total_groups) {
+				return false;
+			}
+			const bool past_size = static_cast<uint64_t>(interval) * GAM_INTERVAL_PAGES >= size;
+			if (past_size && allocated == 0) {
+				break;
+			}
+			// The next interval pass 1 carries: one that changed in nothing is left out, its GAM and DCM too.
+			bool found = false;
+			bool past_tried = false;  // past the recorded Size only the next interval may carry data
+			for (uint32_t next = interval + 1; !found; next++) {
+				const uint64_t base = static_cast<uint64_t>(next) * GAM_INTERVAL_PAGES;
+				if (base >= (static_cast<uint64_t>(1) << 32) || (base >= size && past_tried)) {
+					break;
+				}
+				past_tried = past_tried || base >= size;
+				ExtentId e;
+				e.file = id;
+				e.extent = static_cast<uint32_t>(base / PAGES_PER_EXTENT);
+				if (!find(e, which, group)) {
+					if (base >= size) {
+						break;	// past the recorded Size: the file ends here
+					}
+					continue;
+				}
+				if (!ReadPassGroup(stream_of(which), index.passes_[which].units_offset, index.passes_[which].groups,
+								   group, g)) {
+					return false;
+				}
+				const uint8_t *next_gam = GroupPage(g, 0, PAGE_TYPE_GAM);
+				const uint8_t *next_dcm = GroupPage(g, 6, PAGE_TYPE_DCM);
+				if (!next_gam || !next_dcm) {
+					return false;
+				}
+				gam_copy.assign(next_gam, next_gam + PAGE_SIZE);
+				dcm_copy.assign(next_dcm, next_dcm + PAGE_SIZE);
+				interval = next - 1;
+				found = true;
+			}
+			if (!found) {
+				break;
+			}
+		}
+		bitmap.Seal();
+		set->files_.push_back(id);
+		set->bitmaps_.push_back(std::move(bitmap));
+	}
+	// The families' groups before their trailing pads (pads only trail, E13), together as many as the set.
+	uint64_t carried = 0;
+	for (size_t i : firsts) {
+		const auto &pass = index.passes_[i];
+		uint64_t lo = 0, hi = pass.groups;
+		while (lo < hi) {
+			const uint64_t mid = lo + (hi - lo) / 2;
+			if (!ReadPassGroup(stream_of(i), pass.units_offset, pass.groups, mid, g)) {
+				return false;
+			}
+			if (g.is_pad) {
+				hi = mid;
+			} else {
+				lo = mid + 1;
+			}
+		}
+		// Groups sampled over the family: each that names an extent names one of the set, ascending. (An extent
+		// swapped for another between two samples, the count kept, is what they do not see -- a file at odds
+		// with its own DCM, as a swap in place is for the ranked map.)
+		bool have_previous = false;
+		ExtentId previous;
+		for (uint32_t c = 0; c < STRIPED_SAMPLES && lo > 0; c++) {
+			const uint64_t at = (lo - 1) * c / (STRIPED_SAMPLES - 1);
+			if (!ReadPassGroup(stream_of(i), pass.units_offset, pass.groups, at, g) || g.is_pad ||
+				(g.has_extent && !set->Contains(g.extent)) ||
+				(g.has_extent && have_previous && !(previous < g.extent) && !(previous == g.extent))) {
+				return false;
+			}
+			if (g.has_extent) {
+				previous = g.extent;
+				have_previous = true;
+			}
+		}
+		carried += lo;
+	}
+	if (carried != set->Count()) {
+		return false;
+	}
+	// Where the database changed while the backup ran: the set holds an extent exactly when a family has it.
+	std::vector<LaterPass> later;
+	for (const auto &pass : index.passes_) {
+		if (pass.number > 0 && !pass.search) {
+			LaterPass p;
+			p.map = &pass.map;
+			p.stream = index.families_[pass.family].stream;
+			later.push_back(p);
+		}
+	}
+	std::vector<ExtentId> changed;
+	uint64_t reads = 0;
+	const bool read = ChangedWhileBackedUp(
+		later,
+		[&](uint16_t file, uint32_t first_extent, std::vector<uint8_t> &gam, std::vector<uint8_t> &dcm_page) -> int {
+			ExtentId e;
+			e.file = file;
+			e.extent = first_extent;
+			size_t at_family = 0;
+			uint64_t at_group = 0;
+			if (!find(e, at_family, at_group)) {
+				return first_extent == 0 ? -1 : 0;
+			}
+			const auto &pass = index.passes_[at_family];
+			const uint32_t gam_unit = first_extent == 0 ? 2 : 0;
+			return ReadAllocationUnit(stream_of(at_family), pass.units_offset, pass.groups, at_group, gam_unit,
+									  PAGE_TYPE_GAM, gam) &&
+						   ReadAllocationUnit(stream_of(at_family), pass.units_offset, pass.groups, at_group, 6,
+											  PAGE_TYPE_DCM, dcm_page)
+					   ? 1
+					   : -1;
+		},
+		changed, reads);
+	if (!read || changed.size() * firsts.size() > std::max<uint64_t>(64, total_groups / 4)) {
+		return false;  // as much as reading the passes through
+	}
+	for (const auto &e : changed) {
+		size_t which = 0;
+		uint64_t group = 0;
+		if (set->Contains(e) != find(e, which, group)) {
+			return false;
+		}
+	}
+	for (size_t i : firsts) {
+		index.passes_[i].dcm = set;
+	}
 	return true;
 }
 
@@ -722,6 +1273,8 @@ IndexedPass &IndexedPass::operator=(IndexedPass &&other) {
 	map = std::move(other.map);
 	search = std::move(other.search);
 	by_block = other.by_block;
+	from_dcm = other.from_dcm;
+	dcm = std::move(other.dcm);
 	fell_back.store(other.fell_back.load());
 	return *this;
 }
@@ -741,6 +1294,9 @@ bool PageIndex::FindIn(size_t i, const ExtentId &extent, uint64_t &position, boo
 	auto &pass = passes_[i];
 	by_block = false;
 	if (pass.Searched()) {
+		if (pass.dcm && !pass.dcm->Contains(extent)) {
+			return false;  // a striped differential's: in none of its families
+		}
 		try {
 			by_block = pass.by_block;
 			return pass.search->Find(extent, position);
@@ -775,7 +1331,8 @@ void PageIndex::FallBack(size_t i) const {
 
 bool PageIndex::Locate(uint16_t file, uint32_t page, PageLocation &location, bool expected) const {
 	if (base_) {
-		// A differential's passes are mapped by their headers: what they lack is the base's.
+		// A differential's passes (its pass 1 ranked from its DCM, the others by their headers): what they lack is
+		// the base's.
 		return LocateOnce(file, page, location) || base_->Locate(file, page, location, expected);
 	}
 	return LocateOwn(file, page, location, expected);
@@ -895,10 +1452,15 @@ size_t PageIndex::MemoryBytes() const {
 	// Under the fallback lock: a fallback replaces a pass's map.
 	std::lock_guard<std::mutex> guard(*fallback_lock_);
 	size_t bytes = passes_.capacity() * sizeof(IndexedPass);
+	const DcmSet *counted = nullptr;
 	for (const auto &p : passes_) {
 		bytes += p.map.MemoryBytes();
 		if (p.search) {
 			bytes += p.search->MemoryBytes();
+		}
+		if (p.dcm && p.dcm.get() != counted) {
+			bytes += p.dcm->MemoryBytes();	// shared by the families' passes: once
+			counted = p.dcm.get();
 		}
 	}
 	return bytes;
@@ -999,7 +1561,21 @@ static void AddFamilyPasses(const FamilyStream &family_stream, uint32_t family, 
 			// searched instead.
 			mapped = BuildRankedPassMap(stream, data->data_offset, data->length, pass.map);
 		}
+		if (this_number == 0 && !options.full_backup && single_family) {
+			// A differential's pass 1, one family: from its own allocation and DCM pages, ranked as a full's
+			// (DQ-41 revisited: a large differential is not read through to map it; its "absent" as sure as the
+			// full's ranks, checked the same way); a rank that fails maps it by its headers. A compressed one's
+			// groups are read through its container's stream (the chain walked from known blocks, only the
+			// groups read decoded), so it is not decoded whole to be mapped.
+			mapped = BuildRankedPassMap(stream, data->data_offset, data->length, pass.map, nullptr, true);
+		}
 		if (!mapped && first_of_full) {
+			pass.search = SearchFor(family_stream, *data, bounds, options.trust_layout, pass.by_block);
+			mapped = true;
+		}
+		if (this_number == 0 && !options.full_backup && !single_family) {
+			// A striped differential's pass 1: searched, its extents the families' DCM set (StripedDcmBuilder,
+			// once every family is added); mapped by its headers when the set does not hold.
 			pass.search = SearchFor(family_stream, *data, bounds, options.trust_layout, pass.by_block);
 			mapped = true;
 		}
@@ -1007,9 +1583,33 @@ static void AddFamilyPasses(const FamilyStream &family_stream, uint32_t family, 
 			pass.map = options.mapper ? options.mapper(stream, data->data_offset, data->length, this_number)
 									  : BuildPassMap(stream, data->data_offset, data->length, this_number);
 		}
+		pass.from_dcm = this_number == 0 && !options.full_backup && mapped && pass.map.Ranked();
 		pass.map.number = this_number;
 		pass.map.family = family;
 		passes.push_back(std::move(pass));
+	}
+	// A differential's pass 1 ranked from its DCM, checked where the database changed while the backup ran
+	// (a backup under load: its later passes copy again the extents written meanwhile, measured dozens on
+	// `load`; a quiet one only its allocation pages' extents): there its DCM / GAM copies may disagree with
+	// what pass 1 carries in ways the sampled ranks do not see (a changed extent and a freed one between two
+	// checks). When the checks fail, or would read as much as the pass, it is mapped by its headers.
+	for (auto &first : passes) {
+		if (first.family != family || !first.from_dcm) {
+			continue;
+		}
+		std::vector<const PassMap *> later;
+		for (const auto &pass : passes) {
+			if (pass.family == family && pass.number > first.number) {
+				later.push_back(&pass.map);
+			}
+		}
+		if (!CheckDifferentialRanks(stream, first.map, later)) {
+			first.map = options.mapper ? options.mapper(stream, first.data_offset, first.data_length, first.number)
+									   : BuildPassMap(stream, first.data_offset, first.data_length, first.number);
+			first.map.number = first.number;
+			first.map.family = family;
+			first.from_dcm = false;
+		}
 	}
 }
 
@@ -1023,6 +1623,27 @@ PageIndex BuildPageIndex(const std::vector<FamilyStream> &families, const PageIn
 	// By pass number, so Locate meets the later pass first going backwards.
 	std::stable_sort(index.passes_.begin(), index.passes_.end(),
 					 [](const IndexedPass &a, const IndexedPass &b) { return a.number < b.number; });
+	if (!options.full_backup && families.size() > 1) {
+		bool built = false;
+		try {
+			built = StripedDcmBuilder::Build(index, options);
+		} catch (FormatError &) {
+			built = false;	// something read did not parse (an order broken included): the headers decide
+		}
+		if (!built) {
+			for (auto &pass : index.passes_) {
+				if (pass.number == 0 && pass.search) {
+					const auto &stream = *families[pass.family].stream;
+					pass.map = options.mapper ? options.mapper(stream, pass.data_offset, pass.data_length, 0)
+											  : BuildPassMap(stream, pass.data_offset, pass.data_length, 0);
+					pass.map.number = 0;
+					pass.map.family = pass.family;
+					pass.search.reset();
+					pass.dcm.reset();
+				}
+			}
+		}
+	}
 	return index;
 }
 

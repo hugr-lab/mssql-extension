@@ -197,9 +197,18 @@ a type whose conversion is still to come is read as its stored bytes (below).
     **(2025)**). So the open of such a backup reads the file headers and the GAMs (at ranks the GAMs
     give: 2,560 GAM pages for 10 TB, at most 160 MB as the 64 KB groups that hold them) and the MTF
     headers, not every page; the extent bitmap is the GAM's, and the PFS pages are read when a scan
-    needs them (D4a's allocation tier). Pass 2 and a differential's pass (small; a differential's for
-    its `(AU, page)` pairs, D4) are indexed from their page headers, one per 8-unit group. The rule
-    is checked where the reader reads a group, never trusted blindly.
+    needs them (D4a's allocation tier). Pass 2 is indexed from its page headers, one per 8-unit group;
+    a differential's pass 1 of one plain family from its own GAM and DCM pages, as a full's (DQ-41
+    revisited, 2026-11-19: the extents its DCM marks that are allocated or hold an allocation page,
+    within the file's size -- 15 of 15 differentials), a compressed one's through its container's stream
+    (the chain walked from known blocks, only the groups read decoded), a striped one's families
+    searched as a full's with the DCM set of its data files saying which extents they carry together
+    (`StripedDcmBuilder`: the families' groups as many as the set, sampled groups in it, the extents
+    changed while the backup ran found exactly when the set holds them; else their headers). The rule is checked where the reader reads a group, never trusted blindly; for a
+    differential also where the database changed while the backup ran (`CheckDifferentialRanks`: the
+    extents a later pass copies again, and those whose GAM / DCM bit moved between pass 1's copy and the
+    backup's last, each at its rank with the next extent after it), so a backup under load keeps the
+    map, and its headers decide only when that would read as much as the pass.
   - **E13 (done, `research/experiments/E13-ordered-passes-search.md`) and DQ-41: a striped or
     compressed pass is searched, not read.** Every pass is ascending by (file, extent) (210 of 210:
     pass 1 and 2, fulls and differentials, plain and compressed, each family of a striped set);
@@ -660,9 +669,9 @@ flowchart BT
   2. *page index* (D4a): per pass the extent bitmap and its ranks (or explicit runs where the order
      breaks): a single-family full's pass 1 from its GAMs (E12; in a container its GAMs found by
      search, DQ-41); a striped set's passes searched (DQ-41), their samples growing as pages are
-     located; pass 2 and a differential's pass from their page headers, one read per 8-unit group,
-     in parallel ranges (D3a; I/O plus decompression); a differential's pass also yields its
-     `(AU, page)` pairs (D4).
+     located; pass 2 from its page headers, one read per 8-unit group, in parallel ranges (D3a; I/O
+     plus decompression); a differential's pass 1 of one plain family from its GAM and DCM pages
+     (DQ-41 revisited; a compressed one's through its container's stream), a striped one's families searched with its DCM set.
   3. *allocation* (D4a): per data file `Size` and the GAM bits, kept; PFS pages on demand; the DCM /
      BCM bitmaps only for `verify` and spec 089.
   4. *catalog*: the decoded base tables (through their IAM chains) and the derived model. Stages 1–4
@@ -1525,8 +1534,11 @@ before the next opens.
 24. Differential overlay and chain check: the diff's pages by their header AU, the full's by the IAM
     chain through the overlay (D4) — 2 d. As built (PR 4c): `diff :=` on every file function but
     `mssql_backup_info`, and `diff` on ATTACH. The differential's `OpenedBackup` has the full's as its
-    base (`OpenedBackup::Base`, a cache entry of its own keyed by both backups' files): its passes are
-    header-scanned (`PageIndexOptions::full_backup` false) and its `PageIndex` answers what they lack
+    base (`OpenedBackup::Base`, a cache entry of its own keyed by both backups' files): its pass 2 is
+    header-scanned, and its pass 1 is ranked from its GAM and DCM pages when they make a usable map --
+    one family, plain or compressed, `BuildRankedPassMap(…, differential)`; a striped one searched with
+    its DCM set, `StripedDcmBuilder` -- and header-scanned otherwise (`PageIndexOptions::full_backup`
+    false; DQ-41 revisited); its `PageIndex` answers what they lack
     from the full's (`SetBase`), so `AllocationMap` and `PageStore` over it are the overlay (the file
     header, GAM and PFS the differential carries win: D12's liveness recomputed). A statement opens both
     backups' files, one `FileBinding` naming the other (`also`), so one `BindFiles` binds both. The
@@ -1596,6 +1608,66 @@ before the next opens.
     version a refresh dropped while no query holds it too ("run the query again"). Tested by `test_backup_cache` over a folder that grows (a differential and a copy-only
     full added -- the differential renumbered, its state kept --, a pinned snapshot_version, a file touched
     then healed by a refresh, a file renamed, a query bound before another connection's refresh and read after it -- its version renumbered, or dropped --, a file function pinned at bind, a transaction's next statement after one, a listing prepared before a refresh that dropped its version and executed after it).
+24c. Schema changes between two states (DQ-47) -- 1 d. As built (PR 4c-3a): `CompareCatalogs`
+    (`backup_schema_changes`, DuckDB-free) over two catalog models, by object id and column id, in the
+    order an importer applies them (reloads and drops; each kept table's rename, truncation, switch and
+    columns -- renames, drops, additions, type, nullability --; creations; then the views). The partition
+    rules, judged by rowset (a MERGE / SPLIT renumbers partitions; review of the change: by number a
+    sliding window read as false switches), measured on the oracle fixtures `diffs.sql` and
+    `schema_changes.sql` (2022): a TRUNCATE keeps the rowset; a unit of it (in-row, LOB -- a clustered
+    columnstore's segments --, row-overflow) loses its IAM chain when nothing was inserted since, starts
+    at another first page when something was, or, past 128 extents (a deferred drop), is replaced by a
+    new unit -- `table_truncated`; a DBCC SHRINKFILE moves a unit's IAM and root pages and leaves its
+    recorded first page, and so does a DELETE of every row -- no event (comparing the first IAM page read
+    both as truncations: measured, and dropped); a REBUILD gives new rowsets and units, its
+    pages written anew -- no event, the row changes see it; a new rowset that was another table's in the
+    old state is a partition switched in -- `table_reload` (its pages keep their LSNs); an old rowset
+    another table's now -- `partition_switched_out`, by its old number (DQ-49: a purge, not a reload); a
+    switch to a table since dropped is no event (the row changes give its deletes). Off-row view
+    definitions within MAX_CALL_OFF_ROW_BYTES a call; a view altered whose text cannot be read is a
+    `view_definition_changed` with NULL texts and the reason. Over files the history is read once and
+    each version opened by its files, checked against that read. `mssql_backup_schema_changes(name | path,
+    start_version :=, end_version :=, diff :=)` and the catalog's `schema_changes()` macro. Tests:
+    `test_backup_schema_changes` (synthetic models: every event, the order, a history break), the SQL
+    shape and refusals (`mssql_backup_schema_changes.test`; the committed samples share one schema), and
+    by hand on the 2022 `diffs` fixture (dropped, truncated, a column dropped and one added, created; the
+    rebuilt table no event). The row changes are 24d.
+24d. Row changes between two states (DQ-47) -- 3 d. As built (PR 4c-3b): `mssql_backup_table_changes` /
+    `_insertions` / `_deletions(name | path, schema, table, start_version :=, end_version :=, diff :=)`
+    and the catalog's macros. The newer table's IAM-listed pages, then the older table's pages it no
+    longer lists, cut into units of 64 claimed by DuckDB's tasks as the scan's are (`ChangeCollector`,
+    the unit's index its batch index): a page that may have changed -- one the differential holds when
+    it lies over the older state's full (`PageIndex::LocateOwn`, no bitmap needed: the index answers
+    it), any otherwise -- and was written since the older state's checkpoint is read with its older
+    version (the older table's page of that id); a record whose bytes lie unchanged at the same offset in
+    both is the same row, unchanged, and passed over (`SameRecords`); the others are paired by
+    `_mssql_rid` and compared as stored; each unit's changes are staged and returned by its task. A row
+    left unpaired on its page (a split, a shrink, an index rebuild moves every row) is kept by its place
+    and digests (`LoneRow`, about a hundred bytes and its key; `mssql_backup_change_hash`: XXH64 by default, `backup_hash`, SHA-256 on request) in DuckDB's radix-partitioned
+    collections (`RadixPartitionedColumnData`, its hash join's: spilled to `temp_directory` past
+    `memory_limit`), a task's own over its units, put together when it finds none left; the last task to
+    leave pairs them a partition at a time (the map of one reserved, `CollectMemory`). For a table with
+    values stored off row the records compare with their off-row pointers masked (zeroed where they lie in
+    the record, a compressed record's in its long data) and, where only those differ (a shrink moved the LOB pages), by their
+    values' digests; and since a change to a value stored off row rewrites LOB pages only (measured on
+    `lob_changes.sql`, 2022: the data page and LSN unchanged for a replaced varchar(max), `.WRITE`,
+    `UPDATETEXT`, a replaced varbinary(max)), a table whose LOB pages changed walks its unwritten pages'
+    rows' trees map-only and compares the values of a row whose tree touches a changed page. A chunk's
+    staging is reserved as the scan's (D17). A partition switched in is a reload, seen against the two
+    whole models. A retyped column's older values go through DuckDB's TryCast (NULL and a WARNING where
+    it refuses). Tests: `mssql_backup_table_changes.test` (the samples, checked against a whole
+    comparison with EXCEPT ALL both ways; through another full; one state), and by hand on 2022 the
+    same way on `diffs` (every table: splits, forwarded rows, values off row rewritten, a truncate then
+    inserts, added / dropped columns compared by name, a rebuild, a shrink, a table created),
+    `schema_changes` (truncates, a delete of every row, a shrink, a sliding window), `lob_changes`,
+    `switch_in` (a partition switched in with no shrink) and `bench_changes` (10 million rows; measured
+    on 16 threads: 0.09-0.2 s for 10 thousand to 1.1 million scattered changes against a 0.08 s scan of
+    the full; 4.1 s for an index rebuild, every row paired across the table, 4.9 s under a 1 GB
+    `memory_limit` with 1 GB spilled (16 partitions; 32 took 6.5 s, 64 9.7 s); values off row, 0.13 s for 1 thousand changed, 1.6 s for 111
+    thousand). Not done: the changed LOB pages are listed on one thread at init, and a row touching one
+    has its values assembled for their digests (a value's id in its pointer and its LOB record would
+    tell without reading the tree); a full after a differential reads every page's header (the full's
+    DCM pages would name the extents to read).
 25. `s3://` (MinIO) and `https://` tests in the lane; measure the open pass and decide filter pushdown
     with late materialisation (a follow-up spec if it is worth it) — 2 d. Owner, 2026-11-11: the
     scan is to make filtering cheap enough for an importer that exports a table with a filter over
@@ -1636,8 +1708,9 @@ cost.
   boot page, SCIN offsets and the MSSQLBAK header may differ on 2017–2022. The CI matrix is what turns
   each into a verified row; until a version passes, it is refused (D14).
 - **The open pass**: a backup opens from its allocation and catalog pages (E12, DQ-40), found in a
-  striped or compressed pass by search (DQ-41). What stays read whole is pass 2 and a
-  differential's pass (small in the samples; a pass 2 of terabytes was not seen), and any pass
+  striped or compressed pass by search (DQ-41). What stays read whole is pass 2 (small in the
+  samples; a pass 2 of terabytes was not seen), a differential's pass whose DCM set does not hold
+  (DQ-41 revisited: a plain or compressed one's ranked from its DCM, a striped one's searched with it), and any pass
   whose order breaks (none in 210, E13), which falls back to its header scan; the order and the
   64 KB block are 2025's until the version matrix checks them. A saved index is a later option
   (D4a).

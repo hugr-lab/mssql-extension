@@ -68,6 +68,11 @@ Each of these is refused by name, before any value is returned:
   backup): refused naming the container's flag word.
 - **A database file of a type other than data or log** in the file list (FILESTREAM, full-text):
   refused naming the file id.
+- **A file, filegroup or partial backup**, and its differential (`BACKUP DATABASE … FILEGROUP = …`,
+  `READ_WRITE_FILEGROUPS`), for reading: it leaves data files out, and those files' pages in its full
+  are of another time (a read/write filegroup is consistent with the rest of the database only
+  through the log). The error names what it carries and what it does not. `mssql_backup_info` reads
+  it, with `is_present` false on the files it leaves out.
 - **A file that is not a well-formed backup.** The headers the reader uses are checked (their
   checksums, lengths and offsets), and one that does not fit is an error naming the file, not a
   guess.
@@ -79,7 +84,7 @@ Each of these is refused by name, before any value is returned:
 | column | type | meaning |
 |---|---|---|
 | `position` | `INTEGER` | the backup set's position on the media (RESTORE's `FILE = n`) |
-| `backup_type` | `VARCHAR` | `full`, `differential` or `log` |
+| `backup_type` | `VARCHAR` | `full`, `differential` or `log`; `file` / `file differential` for a file, filegroup or partial backup (one that leaves data files out: HEADERONLY's types 4 / 6, and 7 / 8 not told apart from them) |
 | `is_copy_only` | `BOOLEAN` | `BACKUP … WITH COPY_ONLY` |
 | `backup_set_guid` | `UUID` | the backup set's GUID |
 | `first_lsn`, `last_lsn`, `checkpoint_lsn`, `database_backup_lsn` | `DECIMAL(25,0)` | as `RESTORE HEADERONLY` prints them |
@@ -98,7 +103,7 @@ Each of these is refused by name, before any value is returned:
 | `log_tail_bytes` | `BIGINT` | the bytes of log the backup carries |
 | `consistent`, `open_transactions`, `committed_after_checkpoint` | `BOOLEAN`, `INTEGER`, `INTEGER` | NULL for now |
 | `recovery_model` | `VARCHAR` | `FULL`, `BULK_LOGGED` or `SIMPLE` |
-| `files` | `LIST(STRUCT(…))` | the database's files: `logical_name`, `physical_name`, `type` (`data` / `log`), `file_id`, `filegroup_id`, `filegroup_name`, `size_bytes`, `max_size_bytes`, `create_lsn`, `unique_id`, `backup_size_bytes` (NULL for now) |
+| `files` | `LIST(STRUCT(…))` | the database's files: `logical_name`, `physical_name`, `type` (`data` / `log`), `file_id`, `filegroup_id`, `filegroup_name`, `size_bytes`, `max_size_bytes`, `create_lsn`, `unique_id`, `backup_size_bytes` (NULL for now), `is_present` (FILELISTONLY's IsPresent: the file is in this backup) |
 
 ## Tables and views
 
@@ -397,8 +402,10 @@ recovery fork or another family GUID: the database restored or recreated between
 
 The `ATTACH` reads every file's header, one after another, and the default version's pages; nothing
 else until a version is read. Log backups are left out with a WARNING in `duckdb_logs`, as are a
-differential whose full is not among the files, a striped backup missing a file and a copy of a file
-beside it (the same backup, read once). Files of two databases (another name and family GUID), a file that is not a
+differential whose full is not among the files, a striped backup missing a file, a copy of a file
+beside it (the same backup, read once), and a file, filegroup or partial backup (it is no state of the
+whole database; the WARNING names its files). A backup left out because files of it are missing joins
+the history at the refresh that finds them. Files of two databases (another name and family GUID), a file that is not a
 backup, and one the reader refuses (encrypted, appended sets) refuse the whole `ATTACH`; a database
 recreated under its name is one history, with `history_break` where it was. A file that changed since
 the `ATTACH` is refused when its version is read, until a refresh reads it again. New backups are
@@ -432,6 +439,80 @@ SELECT table_name, row_count FROM mssql_backup_tables('b', version := 3);
 SELECT count(*) FROM mssql_backup_scan('/backups/sales/*.bak', 'dbo', 'orders',
                                        as_of := TIMESTAMP '2026-11-17 15:30');
 ```
+
+## Changes between two states
+
+`mssql_backup_schema_changes` gives what changed in the schema from one state of a history to another,
+as an importer applies it before the rows -- compared by object id and column id, so a rename is a
+rename:
+
+```sql
+FROM b.schema_changes(start_version := 41, end_version := 42);
+FROM mssql_backup_schema_changes('b', start_version := TIMESTAMP '2026-11-17 14:00');
+FROM mssql_backup_schema_changes('/backups/sales_full.bak', diff := '/backups/sales_diff.bak');
+```
+
+| `change_type` | When |
+|---|---|
+| `table_created`, `table_dropped`, `table_renamed` | as they say |
+| `table_truncated` | `TRUNCATE` (the partition's pages all freed: its allocation starts anew, or not at all; a `DELETE` of every row or a shrink is no truncation), with the `partitions` concerned |
+| `partition_switched_out` | a partition's rows moved to another table that the newer state still has (a sliding window's `SWITCH OUT`), by its old partition number |
+| `table_reload` | the table is to be read whole: recreated under a new object id, a partition switched in from another table (its pages are not rewritten, so they cannot be told apart by their LSNs), or the database restored or recreated between the two states (`reason` says which) |
+| `column_added`, `column_dropped`, `column_renamed`, `column_type_changed`, `column_nullability_changed` | with the old and new name, type and nullability |
+| `view_created`, `view_dropped`, `view_renamed`, `view_definition_changed`, `view_indexed`, `view_unindexed` | with the old and new T-SQL, which the lake keeps though it cannot run it |
+
+The rows come in the order an importer applies them: the tables' reloads and drops, then each kept
+table's rename, truncation, switch and columns (renames, drops, additions, type and nullability changes),
+then the tables created, then the views. `start_version` / `end_version` take a version's number or a
+time; with neither, the default version against its full alone. One state gives no rows, not an error,
+so an importer can ask on every backup. An index rebuild, a partition `MERGE` or `SPLIT` and a switch to
+a table since dropped are no event: their pages are written anew, or their rows are gone, and the row
+changes see them. Partitions are matched by their data (rowset), not their number, which a `MERGE` or
+`SPLIT` moves. A table recreated under a new object id is a reload with no column events: compare its
+columns to know whether the lake's table still fits. Not events: a column's collation, identity,
+computed definition or sparseness alone.
+
+### Row changes
+
+`mssql_backup_table_changes` gives a table's rows that changed between the same two states, as
+DuckLake's `table_changes` names them; `mssql_backup_table_insertions` / `_deletions` the rows an
+importer inserts (inserts and the updates' new rows) and deletes (deletes and the updates' old rows):
+
+```sql
+FROM b.table_changes('dbo', 'orders', start_version := 41, end_version := 42);
+FROM mssql_backup_table_deletions('b', 'dbo', 'orders', start_version := TIMESTAMP '2026-11-17 14:00');
+```
+
+Each row is `change_type` (`insert`, `delete`, `update_preimage`, `update_postimage`), then the
+table's columns in the newer state's schema (a column the older state did not have is NULL in its rows,
+one it dropped is gone), then `_mssql_rid`: the row's key, a clustered table's key or a heap row's place.
+A heap row forwarded to another page keeps its `_mssql_rid` (its place before it moved); a heap row a
+shrink or a rebuild moved has a new place, so it reads as a delete and an insert, as does a row deleted
+and inserted again. A clustered table's rows keep theirs wherever they move.
+
+Only what may have changed is read: the newer state's pages written since the older state's checkpoint
+-- a differential's own pages, when it lies over the older state's full; every page's header otherwise
+(two fulls, or a full after a differential) -- each with its older version; and the older state's pages
+the table no longer has. On a page the two versions share, a record whose bytes lie unchanged at the
+same place is the same row, unchanged, and is passed over; the others are paired by `_mssql_rid` and
+compared as stored. A value stored off row changed in place rewrites only its LOB pages, not its row's
+page (measured on SQL Server 2022): when a table's LOB pages changed, its rows' value trees are walked
+(their leaves not read) and a row whose tree touches a changed page has its two versions' values
+compared by their digests. A created table, or one to reload (see `schema_changes`), gives all its rows as
+inserts. A column whose type changed takes the older rows' values through DuckDB's cast, not the
+server's conversion; a value the cast refuses is NULL, with a `WARNING` in `duckdb_logs`.
+
+The pages are read on DuckDB's threads, a unit of 64 at a time per task, as a scan reads them, and
+each unit's changes are returned as it is done. A row that moved to another page (a page split, a
+shrink, an index rebuild moves every row) cannot be paired on its page: it is kept by its place and
+digests -- about a hundred bytes and its key, not the row -- in partitions by `_mssql_rid` that DuckDB
+writes to its `temp_directory` past `memory_limit`, as its own hash join does, and paired one partition
+at a time when every unit is done. A chunk's decoding is reserved against half of `memory_limit`, as
+the scan's is.
+
+The digests are XXH64 with the length by default: an accidental collision is out of reach, but bytes chosen to collide (by someone who writes to the source database and wants a change to
+go unseen) are not. `SET mssql_backup_change_hash = 'sha256'` makes them SHA-256, a few per cent slower
+on DuckDB's threads (about 15 % on one).
 
 ## Opening a backup once
 

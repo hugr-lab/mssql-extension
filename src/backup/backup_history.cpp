@@ -97,6 +97,11 @@ BackupHistory BuildHistory(std::vector<HistoryFamily> families) {
 									   "backups)"});
 			continue;
 		}
+		const std::string partial = first.set.NotWholeDatabase();
+		if (!partial.empty()) {
+			history.skipped.push_back({first.path, partial});
+			continue;
+		}
 		HistoryBackup backup;
 		for (const auto &f : group) {
 			backup.paths.push_back(f.path);

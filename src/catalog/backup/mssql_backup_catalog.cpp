@@ -61,27 +61,51 @@ MSSQLBackupCatalog::MSSQLBackupCatalog(AttachedDatabase &db, std::string name,
 		}
 	}
 	literal += "'";
+	// Each macro passes its keyword parameters, NULL by default, through to the function.
 	struct Macro {
 		const char *name;
 		const char *function;
-		bool versioned;
+		std::vector<const char *> parameters;  // keyword, NULL by default
+		std::vector<const char *> positional;  // before them, required
 	};
-	static const Macro MACROS[] = {{"snapshots", "mssql_backup_snapshots", false},
-								   {"refresh", "mssql_backup_refresh", false},
-								   {"info", "mssql_backup_info", true},
-								   {"schemas", "mssql_backup_schemas", true},
-								   {"tables", "mssql_backup_tables", true},
-								   {"views", "mssql_backup_views", true},
-								   {"columns", "mssql_backup_columns", true}};
+	const std::vector<const char *> versioned{"version", "as_of"};
+	const std::vector<Macro> MACROS = {
+		{"snapshots", "mssql_backup_snapshots", {}},
+		{"refresh", "mssql_backup_refresh", {}},
+		{"info", "mssql_backup_info", versioned},
+		{"schemas", "mssql_backup_schemas", versioned},
+		{"tables", "mssql_backup_tables", versioned},
+		{"views", "mssql_backup_views", versioned},
+		{"columns", "mssql_backup_columns", versioned},
+		{"schema_changes", "mssql_backup_schema_changes", {"start_version", "end_version"}},
+		{"table_changes",
+		 "mssql_backup_table_changes",
+		 {"start_version", "end_version"},
+		 {"schema_name", "table_name"}},
+		{"table_insertions",
+		 "mssql_backup_table_insertions",
+		 {"start_version", "end_version"},
+		 {"schema_name", "table_name"}},
+		{"table_deletions",
+		 "mssql_backup_table_deletions",
+		 {"start_version", "end_version"},
+		 {"schema_name", "table_name"}}};
 	for (const auto &m : MACROS) {
-		const std::string sql = std::string("FROM ") + m.function + "(" + literal +
-								(m.versioned ? ", version := version, as_of := as_of)" : ")");
+		std::string sql = std::string("FROM ") + m.function + "(" + literal;
+		for (const char *parameter : m.positional) {
+			sql += std::string(", ") + parameter;
+		}
+		for (const char *parameter : m.parameters) {
+			sql += std::string(", ") + parameter + " := " + parameter;
+		}
+		sql += ")";
 		auto function = make_uniq<TableMacroFunction>(Parser::GetBuiltinParser().ParseSelectNode(sql));
-		if (m.versioned) {
-			for (const char *parameter : {"version", "as_of"}) {
-				function->parameters.push_back(make_uniq<ColumnRefExpression>(parameter));
-				function->default_parameters.insert(Identifier(parameter), ConstantExpression::Null());
-			}
+		for (const char *parameter : m.positional) {
+			function->parameters.push_back(make_uniq<ColumnRefExpression>(parameter));
+		}
+		for (const char *parameter : m.parameters) {
+			function->parameters.push_back(make_uniq<ColumnRefExpression>(parameter));
+			function->default_parameters.insert(Identifier(parameter), ConstantExpression::Null());
 		}
 		macros_.emplace_back(m.name, std::move(function));
 	}

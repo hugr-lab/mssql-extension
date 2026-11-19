@@ -1,0 +1,75 @@
+# name: test/sql/backup/mssql_backup_switch_in.test
+# description: a partition switched in between a full and its differential, past an ATTACH's filters (spec 085 PR 4c-3, review of #580)
+# group: [mssql]
+#
+# test/data/backup/switch_in (test/backup/gen/switch_in.sql, SQL Server 2025): dbo.facts holds ids 1-1500
+# in partitions 1-2 and an empty partition 3; dbo.staging holds ids 2001-2700. Between the full and the
+# differential, staging is switched into facts' partition 3 and the row of id 10 updated. The switched-in
+# pages keep their LSNs, so only the catalog says they are new to facts: a reload, every row inserted --
+# also when the ATTACH's filters leave staging out (the rowsets' owners are found in every object's models).
+# No SQL Server is needed.
+
+require mssql
+
+statement ok
+ATTACH 'test/data/backup/switch_in/switch_full.bak' AS sw (TYPE mssql_backup, diff 'test/data/backup/switch_in/switch_diff.bak');
+
+statement ok
+ATTACH 'test/data/backup/switch_in/switch_full.bak' AS sw_ex (TYPE mssql_backup, diff 'test/data/backup/switch_in/switch_diff.bak', table_exclude 'staging');
+
+statement ok
+ATTACH 'test/data/backup/switch_in/switch_full.bak' AS sw_only (TYPE mssql_backup, diff 'test/data/backup/switch_in/switch_diff.bak', table_filter '^facts$');
+
+query TIII
+SELECT change_type, count(*), min(id), max(id) FROM mssql_backup_table_changes('sw', 'dbo', 'facts') GROUP BY 1 ORDER BY 1;
+----
+insert	2200	1	2700
+
+query TIII
+SELECT change_type, count(*), min(id), max(id) FROM mssql_backup_table_changes('sw_ex', 'dbo', 'facts') GROUP BY 1 ORDER BY 1;
+----
+insert	2200	1	2700
+
+query TIII
+SELECT change_type, count(*), min(id), max(id) FROM mssql_backup_table_changes('sw_only', 'dbo', 'facts') GROUP BY 1 ORDER BY 1;
+----
+insert	2200	1	2700
+
+# The files themselves, no ATTACH.
+query TI
+SELECT change_type, count(*) FROM mssql_backup_table_changes('test/data/backup/switch_in/switch_full.bak', 'dbo', 'facts', diff := 'test/data/backup/switch_in/switch_diff.bak') GROUP BY 1;
+----
+insert	2200
+
+# Every row of the newer state, inserted.
+query I
+SELECT count(*) FROM (SELECT id, v FROM sw_ex.dbo.facts EXCEPT ALL SELECT id, v FROM mssql_backup_table_changes('sw_ex', 'dbo', 'facts'));
+----
+0
+
+# The schema changes: the switch seen from both tables; under the filters, what they keep.
+query TTT
+SELECT change_type, name, partitions FROM mssql_backup_schema_changes('sw') ORDER BY ALL;
+----
+partition_switched_out	facts	[3]
+partition_switched_out	staging	[1]
+table_reload	facts	NULL
+table_reload	staging	NULL
+
+query TTT
+SELECT change_type, name, partitions FROM mssql_backup_schema_changes('sw_ex') ORDER BY ALL;
+----
+partition_switched_out	facts	[3]
+table_reload	facts	NULL
+
+query TTT
+SELECT change_type, name, partitions FROM mssql_backup_schema_changes('sw_only') ORDER BY ALL;
+----
+partition_switched_out	facts	[3]
+table_reload	facts	NULL
+
+# A table the filters leave out is not the catalog's.
+statement error
+SELECT count(*) FROM mssql_backup_table_changes('sw_ex', 'dbo', 'staging');
+----
+the newer state has no table dbo.staging

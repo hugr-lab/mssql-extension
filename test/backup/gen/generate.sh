@@ -19,7 +19,12 @@
 # lob_xpress compressed); cd.sql, ROW-compressed tables (spec 086 PR 1: cd_full plain, cd_xpress compressed); names.sql, a
 # case-sensitive database whose tables differ only in case, and names with spaces, quotes, ] and dots (spec 085 PR 4b);
 # diffs.sql, a full and a differential over it after E2's changes (spec 085 PR 4c: diffs_full, diffs_diff and
-# diffs_diff_xpress, paired in overlays.txt). A fixture's backups come with the server's own catalog of them where it holds
+# diffs_diff_xpress, paired in overlays.txt); schema_changes.sql, truncates, a shrink and a sliding window between a
+# full and its differential (PR 4c-3: schema_full, schema_diff; not run by default); lob_changes.sql, values stored
+# off row changed in each form (PR 4c-3: lob_changes_full, lob_changes_diff; not run by default); switch_in.sql, a
+# partition switched in with no shrink (PR 4c-3: switch_full, switch_diff; not run by default; committed under test/data/backup/switch_in, made by its generate.sh);
+# bench_changes.sql, a benchmark of 10 million rows and differentials of 10k / 110k / 1.1M changes and an index rebuild
+# (PR 4c-3: bench_full, bench_diff_*, each also compressed as *_x; not run by default). A fixture's backups come with the server's own catalog of them where it holds
 # still (<set>.tables.txt / .columns.txt / .views.txt: catalog_golden.sql, run by golden() below).
 #
 # Writes into OUT: the backups, <set>.headeronly.txt / .labelonly.txt / .filelistonly.txt, sets.txt
@@ -254,6 +259,35 @@ for fixture in ${FIXTURES}; do
 		# A differential over its full (spec 085 PR 4c), plain and compressed; compare_rows restores each pair.
 		sets+=("diffs_full|diffs_full.bak" "diffs_diff|diffs_diff.bak" "diffs_diff_xpress|diffs_diff_xpress.bak")
 		overlays+=("diffs_over|diffs_full|diffs_diff" "diffs_over_xpress|diffs_full|diffs_diff_xpress")
+		;;
+	schema_changes)
+		# What the catalog alone shows between a full and its differential (spec 085 PR 4c-3): truncates, a
+		# delete of every row, pages moved by a shrink, a sliding window. Not an overlay compare_rows takes.
+		sets+=("schema_full|schema_full.bak" "schema_diff|schema_diff.bak")
+		;;
+	lob_changes)
+		# Does a change to a value stored off row move its data row's page (spec 085 PR 4c-3)? No shrink.
+		sets+=("lob_changes_full|lob_changes_full.bak" "lob_changes_diff|lob_changes_diff.bak")
+		;;
+	diff_layouts)
+		# Differentials over a striped full of a database of three data files: to one file, in two stripes, and
+		# in two stripes compressed, and of one filegroup (DQ-41 revisited: the DCM-computed map). Not run by default.
+		sets+=("dlayout_full|dlayout_full_1.bak,dlayout_full_2.bak" "dlayout_diff|dlayout_diff.bak"
+			"dlayout_diff_striped|dlayout_diff_s1.bak,dlayout_diff_s2.bak"
+			"dlayout_diff_xpress|dlayout_diff_x1.bak,dlayout_diff_x2.bak" "dlayout_fg2_diff|dlayout_fg2_diff.bak"
+			"dlayout_fg2_diff_striped|dlayout_fg2_s1.bak,dlayout_fg2_s2.bak")
+		;;
+	switch_in)
+		# A partition switched in with no shrink after it (spec 085 PR 4c-3): only the catalog tells.
+		sets+=("switch_full|switch_full.bak" "switch_diff|switch_diff.bak")
+		;;
+	bench_changes)
+		# A benchmark (spec 085 PR 4c-3): 10 million rows, then differentials of 10k / 110k / 1.1M changes, and
+		# one after an index rebuild; each also compressed (_x: the full copy-only, the differentials over bench_full).
+		sets+=("bench_full|bench_full.bak" "bench_diff_10k|bench_diff_10k.bak" "bench_diff_110k|bench_diff_110k.bak"
+			"bench_diff_1m|bench_diff_1m.bak" "bench_diff_rebuild|bench_diff_rebuild.bak" "bench_full_x|bench_full_x.bak"
+			"bench_diff_10k_x|bench_diff_10k_x.bak" "bench_diff_110k_x|bench_diff_110k_x.bak"
+			"bench_diff_1m_x|bench_diff_1m_x.bak" "bench_diff_rebuild_x|bench_diff_rebuild_x.bak")
 		;;
 	*)
 		echo "ERROR: unknown fixture ${fixture}" >&2

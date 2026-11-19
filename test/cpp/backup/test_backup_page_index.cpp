@@ -16,6 +16,7 @@
 #include "backup/backup_bytes.hpp"
 #include "backup/backup_mtf.hpp"
 #include "backup/backup_page_index.hpp"
+#include "backup/backup_pass_search.hpp"
 #include "mtf_builder.hpp"
 
 using namespace duckdb::mssql::backup;
@@ -112,6 +113,16 @@ Bytes Gam(const std::vector<uint32_t> &allocated) {
 	return b;
 }
 
+//! A DCM page body: bit e set (changed since the differential base) for every extent in `changed`.
+Bytes Dcm(const std::vector<uint32_t> &changed) {
+	Bytes b(8192, 0);
+	b[1] = 16;	// m_type: a DCM page
+	for (uint32_t e : changed) {
+		b[194 + e / 8] |= static_cast<uint8_t>(1u << (e % 8));
+	}
+	return b;
+}
+
 //! Extent 0 of `file`, its page 0 a file header and its page 2 a GAM.
 void AddFirstExtent(std::vector<Unit> &units, uint16_t file, const Bytes *header, const Bytes *gam) {
 	for (uint32_t k = 0; k < 8; k++) {
@@ -184,6 +195,30 @@ private:
 		}
 		return page;
 	}
+};
+
+//! Two passes in one stream, as a family's file holds them (a read does not cross from one to the other).
+class TwoPasses : public RandomAccess {
+public:
+	TwoPasses(const ComputedPass &a, const ComputedPass &b) : a_(a), b_(b) {}
+	uint64_t Size() const override {
+		return a_.Size() + b_.Size();
+	}
+	const std::string &Name() const override {
+		return name_;
+	}
+	void ReadAt(uint64_t offset, uint8_t *dest, size_t count) const override {
+		if (offset >= a_.Size()) {
+			b_.ReadAt(offset - a_.Size(), dest, count);
+		} else {
+			a_.ReadAt(offset, dest, count);
+		}
+	}
+
+private:
+	const ComputedPass &a_;
+	const ComputedPass &b_;
+	std::string name_ = "two.bak";
 };
 
 }  // namespace
@@ -591,6 +626,353 @@ int main() {
 		pass.throw_past = 2 + 30 * 8 * 8192ull;
 		Check(!BuildRankedPassMap(pass, 0, pass.Size(), refused),
 			  "a read that fails turns the rank path down, not the index");
+	}
+	{
+		// DQ-41 revisited: a differential's pass 1 ranked from its own GAM and DCM pages -- the extents its
+		// DCM marks that are allocated or hold an allocation page, within the file's size. File 1 of two
+		// intervals: GAM 0 allocates 0..20 and 30000, DCM 0 marks 0, 3, 5, 1011 (a PFS page's, not
+		// allocated), 30000 and 31000 (freed since: not copied); interval 1's GAM allocates its first four,
+		// its DCM marks 63904 (its GAM's own) and 63906. File 3: GAM {0, 1}, DCM {0}.
+		const uint32_t size1 = 511232 + 64;
+		std::vector<uint32_t> alloc0;
+		for (uint32_t e = 0; e <= 20; e++) {
+			alloc0.push_back(e);
+		}
+		alloc0.push_back(30000);
+		Bytes header1 = FileHeader(1, size1), gam0 = Gam(alloc0), dcm0 = Dcm({0, 3, 5, 1011, 30000, 31000});
+		Bytes gam1 = Gam({0, 1, 2, 3}), dcm1 = Dcm({0, 2});
+		Bytes header3 = FileHeader(3, 16), gam3 = Gam({0, 1}), dcm3 = Dcm({0});
+		const std::vector<uint32_t> expected = {0, 3, 5, 1011, 30000, 63904, 63906};
+		auto diff_pass = [&](const std::vector<uint32_t> &file1) {
+			ComputedPass pass;
+			for (uint32_t e : file1) {
+				ExtentId x;
+				x.file = 1;
+				x.extent = e;
+				pass.groups.push_back(x);
+			}
+			ExtentId x3;
+			x3.file = 3;
+			x3.extent = 0;
+			pass.groups.push_back(x3);
+			pass.pad_groups = 1;
+			pass.bodies = {{{1, 0}, &header1},	 {{1, 2}, &gam0},	 {{1, 6}, &dcm0}, {{1, 511232}, &gam1},
+						   {{1, 511238}, &dcm1}, {{3, 0}, &header3}, {{3, 2}, &gam3}, {{3, 6}, &dcm3}};
+			return pass;
+		};
+		ComputedPass pass = diff_pass(expected);
+		PassMap ranked;
+		uint64_t reads = 0;
+		Check(BuildRankedPassMap(pass, 0, pass.Size(), ranked, &reads, true),
+			  "a differential's pass 1 ranked from its GAM and DCM pages");
+		auto scanned = BuildPassMap(pass, 0, pass.Size(), 0);
+		bool same = ranked.ExtentCount() == expected.size() + 1 && scanned.ExtentCount() == ranked.ExtentCount();
+		for (size_t i = 0; i < expected.size(); i++) {
+			ExtentId x;
+			x.file = 1;
+			x.extent = expected[i];
+			uint64_t a = 0, c = 0;
+			same = same && ranked.Find(x, a) && scanned.Find(x, c) && a == i && c == i;
+		}
+		for (uint32_t absent : {4u, 20u, 31000u, 63905u}) {
+			ExtentId x;
+			x.file = 1;
+			x.extent = absent;
+			same = same && !ranked.Find(x, g);
+		}
+		Check(same,
+			  "every extent where the header scan finds it; allocated but unmarked, and marked but freed, "
+			  "extents absent");
+		Check(reads < 2 * expected.size() + 4,
+			  "it reads the file's group 0, the second interval's and a few checks, not the pass: " +
+				  std::to_string(reads) + " groups");
+		// A marked extent the pass does not carry, or one it carries unmarked: the ranks no longer hold.
+		ComputedPass missing = diff_pass({0, 3, 1011, 30000, 63904, 63906});
+		PassMap refused;
+		Check(!BuildRankedPassMap(missing, 0, missing.Size(), refused, nullptr, true),
+			  "a pass lacking a marked extent is refused (mapped by its headers instead)");
+		ComputedPass extra = diff_pass({0, 3, 4, 5, 1011, 30000, 63904, 63906});
+		Check(!BuildRankedPassMap(extra, 0, extra.Size(), refused, nullptr, true),
+			  "a pass carrying an unmarked extent is refused");
+		// A marked, allocated extent at the tail of the last file the pass does not carry: its rank would
+		// land on the pass's pads (review of the DCM map).
+		ComputedPass tail = diff_pass({0, 3, 5, 1011, 30000, 63904});
+		Check(!BuildRankedPassMap(tail, 0, tail.Size(), refused, nullptr, true),
+			  "a pass lacking the last file's marked tail extent is refused");
+		// An interval that changed in nothing is left out whole, its GAM and DCM too: the next interval's
+		// first extent follows. File 1 of three intervals, the middle one unchanged.
+		{
+			const uint32_t size3 = 2 * 511232 + 64;
+			Bytes h = FileHeader(1, size3), g2 = Gam({0, 1}), d2 = Dcm({0, 1});
+			ComputedPass p3;
+			for (uint32_t e : {0u, 3u, 5u, 1011u, 30000u, 127808u, 127809u}) {
+				ExtentId x;
+				x.file = 1;
+				x.extent = e;
+				p3.groups.push_back(x);
+			}
+			p3.pad_groups = 1;
+			p3.bodies = {{{1, 0}, &h}, {{1, 2}, &gam0}, {{1, 6}, &dcm0}, {{1, 1022464}, &g2}, {{1, 1022470}, &d2}};
+			PassMap skipped;
+			const bool ok = BuildRankedPassMap(p3, 0, p3.Size(), skipped, nullptr, true);
+			ExtentId later;
+			later.file = 1;
+			later.extent = 127809;
+			uint64_t at = 0;
+			Check(ok && skipped.Find(later, at) && at == 6 && skipped.ExtentCount() == 7,
+				  "an unchanged interval left out: the next interval's extents in place");
+		}
+		// No DCM page in a file's group 0: not a differential's pass the rule knows.
+		ComputedPass no_dcm = diff_pass(expected);
+		no_dcm.bodies.erase(no_dcm.bodies.begin() + 2);
+		Check(!BuildRankedPassMap(no_dcm, 0, no_dcm.Size(), refused, nullptr, true),
+			  "a group 0 with no DCM page is refused");
+		// Under load (CheckDifferentialRanks): the backup's pass 2 copies both intervals' allocation pages again,
+		// interval 1's DCM marking 63905 by then; pass 1 as its copies say. Interval 1's GAM is its unit 0.
+		{
+			Bytes dcm1_end = Dcm({0, 1, 2});
+			ComputedPass p1 = diff_pass(expected);
+			ComputedPass p2;
+			for (uint32_t e : {0u, 63904u}) {
+				ExtentId x;
+				x.file = 1;
+				x.extent = e;
+				p2.groups.push_back(x);
+			}
+			p2.bodies = {{{1, 2}, &gam0}, {{1, 6}, &dcm0}, {{1, 511232}, &gam1}, {{1, 511238}, &dcm1_end}};
+			TwoPasses both(p1, p2);
+			PassMap first;
+			const bool ranked = BuildRankedPassMap(both, 0, p1.Size(), first, nullptr, true);
+			PassMap second = BuildPassMap(both, p1.Size(), p2.Size(), 1);
+			uint64_t checked = 0;
+			Check(ranked && CheckDifferentialRanks(both, first, {&second}, &checked) && checked == 11,
+				  "under load, two intervals: each one's copies compared, the moved bit checked (" +
+					  std::to_string(checked) + " reads)");
+		}
+	}
+	{
+		// A differential taken under load (CheckDifferentialRanks): file 1 of 2001 extents, all allocated, pass
+		// 1's DCM copy marks all but 1501. Pass 1 carries 1501 where its copies put 1500 -- 1500 freed and 1501
+		// written while the backup ran --, a swap the sampled checks pass over. The backup's pass 2 copies 1501
+		// again and the interval's GAM and DCM as they ended.
+		const uint32_t n = 2001;
+		std::vector<uint32_t> all, marked, all_but_1500, marked_final;
+		for (uint32_t e = 0; e < n; e++) {
+			all.push_back(e);
+			if (e != 1500) {
+				all_but_1500.push_back(e);
+			}
+			if (e != 1501) {
+				marked.push_back(e);
+			}
+		}
+		Bytes header = FileHeader(1, n * 8), gam_then = Gam(all), dcm_then = Dcm(marked);
+		Bytes gam_end = Gam(all_but_1500), dcm_end = Dcm(all);
+		auto first_pass = [&](uint32_t carried_for_1500) {
+			ComputedPass pass;
+			for (uint32_t e = 0; e < n; e++) {
+				if (e == 1501) {
+					continue;
+				}
+				ExtentId x;
+				x.file = 1;
+				x.extent = e == 1500 ? carried_for_1500 : e;
+				pass.groups.push_back(x);
+			}
+			pass.pad_groups = 1;
+			pass.bodies = {{{1, 0}, &header}, {{1, 2}, &gam_then}, {{1, 6}, &dcm_then}};
+			return pass;
+		};
+		auto later_pass = [&](std::vector<uint32_t> extents, const Bytes *gam, const Bytes *dcm) {
+			ComputedPass pass;
+			for (uint32_t e : extents) {
+				ExtentId x;
+				x.file = 1;
+				x.extent = e;
+				pass.groups.push_back(x);
+			}
+			pass.bodies = {{{1, 2}, gam}, {{1, 6}, dcm}};
+			return pass;
+		};
+		auto check = [&](const ComputedPass &p1, const ComputedPass &p2, bool &ranked, uint64_t &reads) {
+			TwoPasses stream(p1, p2);
+			PassMap first;
+			ranked = BuildRankedPassMap(stream, 0, p1.Size(), first, nullptr, true);
+			PassMap second = BuildPassMap(stream, p1.Size(), p2.Size(), 1);
+			return ranked && CheckDifferentialRanks(stream, first, {&second}, &reads);
+		};
+		bool ranked = false;
+		uint64_t reads = 0;
+		ComputedPass swapped = first_pass(1501);
+		ComputedPass busy = later_pass({0, 1501}, &gam_end, &dcm_end);
+		Check(!check(swapped, busy, ranked, reads) && ranked,
+			  "under load: a swap the sampled checks pass over is found where the backup changed");
+		// The same swap, the later pass copying only the allocation pages again (the moved bits alone).
+		ComputedPass alloc_only = later_pass({0}, &gam_end, &dcm_end);
+		Check(!check(swapped, alloc_only, ranked, reads) && ranked, "and by the GAM / DCM bits that moved alone");
+		// Pass 1 as its copies say, a written extent copied again: the checks hold, a few groups read.
+		ComputedPass right = first_pass(1500);
+		ComputedPass rewritten = later_pass({0, 700}, &gam_then, &dcm_then);
+		Check(check(right, rewritten, ranked, reads) && reads < 12,
+			  "under load, pass 1 right: kept, a few groups read (" + std::to_string(reads) + ")");
+		// Quiet: the later pass copies the allocation pages again, unchanged.
+		ComputedPass quiet = later_pass({0}, &gam_then, &dcm_then);
+		Check(check(right, quiet, ranked, reads) && reads == 4, "quiet: kept, its allocation pages compared only");
+		// Pass 1 right, but written all over while the backup ran: the checks would read as much as the pass.
+		std::vector<uint32_t> spread = {0};
+		for (uint32_t e = 50; e < n; e += 50) {
+			spread.push_back(e);
+		}
+		ComputedPass everywhere = later_pass(spread, &gam_then, &dcm_then);
+		Check(!check(right, everywhere, ranked, reads) && ranked, "written everywhere: its headers decide");
+	}
+	{
+		// A striped differential (StripedDcmBuilder): file 1 of 80 pages, GAM allocating 0..9, DCM marking 0, 1 (the
+		// boot page's), 3, 5, 8; family 1 carries 0, 1, 8 and family 2 carries 3 and 5, each then a pad.
+		Bytes header = FileHeader(1, 80), gam = Gam({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}), dcm = Dcm({0, 1, 3, 5, 8});
+		auto family_bytes = [&](const std::vector<uint32_t> &extents) {
+			std::vector<Unit> units;
+			for (uint32_t e : extents) {
+				if (e == 0) {
+					for (uint32_t k = 0; k < 8; k++) {
+						Unit u{'p', 1, k};
+						u.body = k == 0 ? &header : (k == 2 ? &gam : (k == 6 ? &dcm : nullptr));
+						units.push_back(u);
+					}
+				} else {
+					AddExtent(units, 1, e);
+				}
+			}
+			AddEmpty(units, 'P');
+			return Pass(units);
+		};
+		auto layout_of = [](const Bytes &b) {
+			MtfLayout layout;
+			MtfBlock block;
+			block.type = "MSDA";
+			MtfStream data;
+			data.id = "MQDA";
+			data.data_offset = 0;
+			data.length = b.size();
+			block.streams.push_back(data);
+			layout.blocks.push_back(block);
+			return layout;
+		};
+		auto index_of = [&](const Bytes &a, const Bytes &b, const MemoryAccess &fa, const MemoryAccess &fb,
+							const MtfLayout &la, const MtfLayout &lb) {
+			std::vector<FamilyStream> families(2);
+			families[0].stream = &fa;
+			families[0].layout = &la;
+			families[1].stream = &fb;
+			families[1].layout = &lb;
+			PageIndexOptions options;
+			options.full_backup = false;
+			options.data_files.push_back(1);
+			return BuildPageIndex(families, options);
+		};
+		Bytes a = family_bytes({0, 1, 8}), b = family_bytes({3, 5});
+		MemoryAccess fa("s1.bak", a.data(), a.size()), fb("s2.bak", b.data(), b.size());
+		MtfLayout la = layout_of(a), lb = layout_of(b);
+		auto index = index_of(a, b, fa, fb, la, lb);
+		PageLocation at;
+		Check(index.PassCount() == 2 && index.Pass(0).dcm && index.Pass(0).Searched() &&
+				  index.Pass(0).dcm->Count() == 5 && index.Pass(1).dcm == index.Pass(0).dcm,
+			  "a striped differential's pass 1: searched, its families' DCM set of 5 extents");
+		Check(index.Locate(1, 5 * 8 + 2, at) && at.family == 1 && index.Locate(1, 8 * 8, at) && at.family == 0,
+			  "a marked extent located in its family");
+		const uint64_t searched = index.Pass(0).search->Reads() + index.Pass(1).search->Reads();
+		Check(!index.Locate(1, 4 * 8, at) && !index.Locate(1, 2 * 8, at) &&
+				  index.Pass(0).search->Reads() + index.Pass(1).search->Reads() == searched,
+			  "an unmarked one (allocated) in none, answered by the set: no family searched");
+		// A family lacking a marked extent: the groups are fewer than the set; mapped by the headers.
+		Bytes b_short = family_bytes({3});
+		MemoryAccess fb_short("s2.bak", b_short.data(), b_short.size());
+		MtfLayout lb_short = layout_of(b_short);
+		auto fewer = index_of(a, b_short, fa, fb_short, la, lb_short);
+		Check(!fewer.Pass(0).dcm && !fewer.Pass(0).Searched() && fewer.Locate(1, 3 * 8, at) &&
+				  !fewer.Locate(1, 5 * 8, at),
+			  "a family lacking a marked extent: mapped by its headers");
+		// An unmarked extent in place of a marked one (as many groups): a sampled group names it; headers again.
+		Bytes b_swap = family_bytes({3, 4});
+		MemoryAccess fb_swap("s2.bak", b_swap.data(), b_swap.size());
+		MtfLayout lb_swap = layout_of(b_swap);
+		auto swapped = index_of(a, b_swap, fa, fb_swap, la, lb_swap);
+		Check(!swapped.Pass(0).dcm && swapped.Locate(1, 4 * 8, at) && at.family == 1,
+			  "an unmarked extent in a family: mapped by its headers, which find it");
+		// Under load: family 1's pass 2 copies again extent 3 (family 2's, written while the backup ran) and the
+		// interval's allocation pages; the set holds 3 and family 2 has it, so the set holds.
+		{
+			std::vector<Unit> later_units;
+			for (uint32_t k = 0; k < 8; k++) {
+				Unit u{'p', 1, k};
+				u.body = k == 0 ? &header : (k == 2 ? &gam : (k == 6 ? &dcm : nullptr));
+				later_units.push_back(u);
+			}
+			AddExtent(later_units, 1, 3);
+			Bytes second = Pass(later_units);
+			Bytes both = a;
+			both.insert(both.end(), second.begin(), second.end());
+			MemoryAccess fboth("s1.bak", both.data(), both.size());
+			MtfLayout two;
+			for (int pass = 0; pass < 2; pass++) {
+				MtfBlock block;
+				block.type = "MSDA";
+				MtfStream data;
+				data.id = "MQDA";
+				data.data_offset = pass == 0 ? 0 : a.size();
+				data.length = pass == 0 ? a.size() : second.size();
+				block.streams.push_back(data);
+				two.blocks.push_back(block);
+			}
+			auto loaded = index_of(both, b, fboth, fb, two, lb);
+			Check(loaded.PassCount() == 3 && loaded.Pass(0).dcm && loaded.Locate(1, 3 * 8, at) && at.pass == 1,
+				  "under load: the set checked where the backup changed and kept; extent 3's latest copy pass 2's");
+		}
+		// Three GAM intervals, the middle one unchanged (left out whole): family 1 carries 0, 1 and 127808, family
+		// 2 carries 3 and 127809.
+		{
+			const uint32_t size3 = 2 * 511232 + 64;
+			Bytes h3 = FileHeader(1, size3), g0 = Gam({0, 1, 2, 3}), d0 = Dcm({0, 1, 3}), g2 = Gam({0, 1}),
+				  d2 = Dcm({0, 1});
+			auto computed = [&](const std::vector<uint32_t> &extents) {
+				ComputedPass pass;
+				for (uint32_t e : extents) {
+					ExtentId x;
+					x.file = 1;
+					x.extent = e;
+					pass.groups.push_back(x);
+				}
+				pass.pad_groups = 1;
+				pass.bodies = {{{1, 0}, &h3}, {{1, 2}, &g0}, {{1, 6}, &d0}, {{1, 1022464}, &g2}, {{1, 1022470}, &d2}};
+				return pass;
+			};
+			ComputedPass p1 = computed({0, 1, 127808}), p2 = computed({3, 127809});
+			auto layout_computed = [](const ComputedPass &p) {
+				MtfLayout layout;
+				MtfBlock block;
+				block.type = "MSDA";
+				MtfStream data;
+				data.id = "MQDA";
+				data.data_offset = 0;
+				data.length = p.Size();
+				block.streams.push_back(data);
+				layout.blocks.push_back(block);
+				return layout;
+			};
+			MtfLayout l1 = layout_computed(p1), l2 = layout_computed(p2);
+			std::vector<FamilyStream> families(2);
+			families[0].stream = &p1;
+			families[0].layout = &l1;
+			families[1].stream = &p2;
+			families[1].layout = &l2;
+			PageIndexOptions options;
+			options.full_backup = false;
+			options.data_files.push_back(1);
+			auto three = BuildPageIndex(families, options);
+			Check(three.Pass(0).dcm && three.Pass(0).dcm->Count() == 5 && three.Locate(1, 127809 * 8, at) &&
+					  at.family == 1 && !three.Locate(1, 63904 * 8, at),
+				  "three intervals, the middle one left out: the set of 5, the last interval's extents found");
+		}
 	}
 	{
 		ExtentBitmap bm;

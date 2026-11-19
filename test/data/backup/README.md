@@ -17,6 +17,7 @@ repository ignores every other `*.bak`.
 | `stripe_zstd_1.bak` + `stripe_zstd_2.bak` | a ZSTD-compressed full striped in two (the media label's family fields) |
 | `diff.bak` | a differential over `full.bak` |
 | `log.trn` | a log backup after it |
+| `switch_in/switch_full.bak` + `switch_diff.bak` | another database (`test/backup/gen/switch_in.sql`): a partition switched in from a staging table between a full and its differential, both compressed (MS_XPRESS: 0.7 MB), with `sets.txt` and golden files of its own (`mssql_backup_table_changes` past an ATTACH's filters) |
 | `sets.txt` | one line per backup set, `name\|file[,file]`: the sets the comparison reads, in order |
 | `<set>.headeronly.txt`, `.labelonly.txt`, `.filelistonly.txt` | the server's `RESTORE` answers for the set (`sqlcmd -s '\|' -W`) |
 

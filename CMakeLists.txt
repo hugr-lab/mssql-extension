@@ -172,6 +172,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_bytes.cpp
     src/backup/backup_catalog_function.cpp
     src/backup/backup_catalog_model.cpp
+    src/backup/backup_changes_function.cpp
     src/backup/backup_cd_record.cpp
     src/backup/backup_collation.cpp
     src/backup/backup_container.cpp
@@ -183,6 +184,7 @@ set(EXTENSION_SOURCES
     src/backup/backup_info_function.cpp
     src/backup/backup_mtf.cpp
     src/backup/backup_files.cpp
+    src/backup/backup_hash.cpp
     src/backup/backup_open_pass.cpp
     src/backup/backup_opened.cpp
     src/backup/backup_page.cpp
@@ -193,6 +195,9 @@ set(EXTENSION_SOURCES
     src/backup/backup_record_stager.cpp
     src/backup/backup_reservation.cpp
     src/backup/backup_scan_function.cpp
+    src/backup/backup_change_collector.cpp
+    src/backup/backup_table_changes_function.cpp
+    src/backup/backup_schema_changes.cpp
     src/backup/backup_set.cpp
     src/backup/backup_snapshots_function.cpp
     src/backup/backup_sql_variant.cpp

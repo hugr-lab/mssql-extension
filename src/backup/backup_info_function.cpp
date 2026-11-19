@@ -43,6 +43,7 @@ LogicalType FileType() {
 	fields.emplace_back("create_lsn", LogicalType::DECIMAL(25, 0));
 	fields.emplace_back("unique_id", LogicalType::UUID);
 	fields.emplace_back("backup_size_bytes", LogicalType::BIGINT);
+	fields.emplace_back("is_present", LogicalType::BOOLEAN);
 	return LogicalType::STRUCT(std::move(fields));
 }
 
@@ -123,7 +124,7 @@ Value Text(const std::string &s) {
 	return s.empty() ? Value(LogicalType::VARCHAR) : Value(s);
 }
 
-Value FileValue(const DatabaseFile &f) {
+Value FileValue(const DatabaseFile &f, bool present) {
 	child_list_t<Value> fields;
 	fields.emplace_back("logical_name", Value(f.logical_name));
 	fields.emplace_back("physical_name", Value(f.physical_name));
@@ -136,6 +137,7 @@ Value FileValue(const DatabaseFile &f) {
 	fields.emplace_back("create_lsn", LsnValue(f.create_lsn));
 	fields.emplace_back("unique_id", GuidValue(f.unique_id));
 	fields.emplace_back("backup_size_bytes", Value(LogicalType::BIGINT));
+	fields.emplace_back("is_present", Value::BOOLEAN(present));
 	return Value::STRUCT(std::move(fields));
 }
 
@@ -156,14 +158,21 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 	std::vector<Value> files;
 	for (const auto &f : set.start_files.empty() ? set.files : set.start_files) {
 		if (!f.marked_removed) {
-			files.push_back(FileValue(f));
+			// FILELISTONLY's IsPresent: the trailer's flag (the start's list may predate it).
+			bool present = f.present;
+			for (const auto &t : set.files) {
+				if (t.file_id == f.file_id && t.type == f.type) {
+					present = t.present;
+				}
+			}
+			files.push_back(FileValue(f, present));
 		}
 	}
 	const bool single = opened.families.size() == 1;
 	const Value no_int(LogicalType::INTEGER);
 	std::vector<Value> row;
 	row.push_back(Value::INTEGER(set.position));
-	row.push_back(Value(BackupKindName(set.kind)));
+	row.push_back(Value(BackupTypeName(set)));
 	row.push_back(Value::BOOLEAN(set.is_copy_only));
 	row.push_back(GuidValue(set.backup_set_guid));
 	row.push_back(LsnValue(set.first_lsn));

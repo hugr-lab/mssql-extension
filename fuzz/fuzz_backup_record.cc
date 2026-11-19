@@ -8,8 +8,10 @@
 // padded with zeros to 8 KB; its slot count is its own header's. Every slot goes through ReadSlot and,
 // for a primary or forwarded record, RowVarCount, ForwardedFrom, LocateValue for every column (each
 // byte a ValueRef names is read here, and it must lie in the page or in the layout's default) and
-// DecodeRecord, with FixedLength and KnownFixedXtype on every column. Every malformed input must end in
-// a FormatError; any sanitizer report, trap, signal, hang or other exception is a real bug.
+// DecodeRecord, with FixedLength and KnownFixedXtype on every column; then the page's record spans and the
+// records it shares with itself and with a copy whose last byte before the slot array is changed
+// (RecordSpans, SameRecords: spec 085 PR 4c-3). Every malformed input must end in a FormatError; any
+// sanitizer report, trap, signal, hang or other exception is a real bug.
 
 #include <algorithm>
 #include <cstddef>
@@ -123,5 +125,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 		} catch (const FormatError &) {
 		}
 	}
+	std::vector<RecordSpan> spans;
+	RecordSpans(page.data(), PAGE_SIZE, slots, spans);
+	g_sink += spans.size();
+	std::vector<uint8_t> other = page;
+	if (static_cast<size_t>(slots) * 2 < PAGE_SIZE) {
+		other[PAGE_SIZE - 2u * slots - 1] ^= 0xFF;
+	}
+	std::vector<bool> old_same, new_same;
+	SameRecords(page.data(), slots, page.data(), slots, PAGE_SIZE, false, old_same, new_same);
+	SameRecords(page.data(), slots, other.data(), slots, PAGE_SIZE, true, old_same, new_same);
+	g_sink += old_same.size() + new_same.size();
 	return 0;
 }

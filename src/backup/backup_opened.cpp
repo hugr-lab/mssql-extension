@@ -303,6 +303,12 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 	if (set.kind == BackupKind::Log) {
 		throw FormatError("backup file \"" + first + "\" is a log backup: it holds no data pages to read");
 	}
+	const std::string partial = set.NotWholeDatabase();
+	if (!partial.empty()) {
+		// Its other files' pages are not in it, and the base's are of another time (a read/write
+		// filegroup is consistent with the rest of the database only through the log).
+		throw FormatError("backup file \"" + first + "\" is " + partial);
+	}
 	if (set.kind == BackupKind::Differential && !options.base) {
 		// It lacks every page that did not change since its base, the catalog's among them (089 D5).
 		throw FormatError("backup file \"" + first +
@@ -332,7 +338,8 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 		pages->streams.push_back(s);
 	}
 	PageIndexOptions index_options;
-	// A differential's passes are mapped by their headers (D4a): small, and their order is not a full's.
+	// A differential's pass 1 is ranked from its own DCM (DQ-41 revisited) -- a striped one's searched, its
+	// extents the DCM set of its data files --, its later passes mapped by their headers (D4a).
 	index_options.full_backup = !options.base;
 	index_options.trust_layout = options.trust_layout;
 	index_options.mapper = BoundPassMapper();
@@ -349,6 +356,9 @@ std::unique_ptr<OpenedPages> OpenBackupPages(const OpenedHeaders &headers, const
 		}
 		(file.marked_removed ? marked_removed : data_files).push_back(static_cast<uint16_t>(file.file_id));
 	}
+	// By id, as a pass orders its extents.
+	index_options.data_files = data_files;
+	std::sort(index_options.data_files.begin(), index_options.data_files.end());
 	try {
 		pages->index = BuildPageIndex(pages->streams, index_options);
 		// D12: a page the differential does not carry is its full's; liveness is then the overlaid
@@ -873,6 +883,19 @@ std::unique_ptr<OpenedCatalog> OpenAttachedCatalog(ClientContext &context, const
 	return catalog;
 }
 
+std::shared_ptr<const CatalogModel> WholeModel(const OpenedCatalog &catalog, const std::string &what) {
+	BindFiles bound(catalog.Binding());	 // the model reads the catalog's pages
+	auto model = std::make_shared<CatalogModel>();
+	try {
+		*model = BuildCatalogModel(
+			*catalog.pages->store, *catalog.tables,
+			[](const SqlVariant &v, const std::string &what) { (void)SqlVariantValue(v, what); }, CatalogScope());
+	} catch (FormatError &e) {
+		throw FormatError(what + ": " + WithoutPrefix(e));
+	}
+	return model;
+}
+
 std::unique_ptr<OpenedCatalog> OpenBackupCatalog(ClientContext &context, const std::vector<std::string> &paths_p,
 												 bool with_model, const CatalogScope &scope,
 												 const std::vector<std::string> &diff_p, const BackupAt &at) {
@@ -951,6 +974,7 @@ std::shared_ptr<AttachedBackup> OpenAttachedBackup(
 						 model->schemas.end());
 	attached->backup = opened.backup;
 	attached->cache_key = opened.cache_key;
+	attached->objects = scope.objects;
 	attached->model = std::move(model);
 	return attached;
 }

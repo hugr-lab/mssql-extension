@@ -1,0 +1,138 @@
+# name: test/sql/backup/mssql_backup_table_changes.test
+# description: mssql_backup_table_changes / _insertions / _deletions -- a table's row changes between two states (spec 085 task 24d, PR 4c-3, DQ-47)
+# group: [mssql]
+#
+# The committed samples: diff.bak over full.bak updated every tenth item (200), inserted 500 items and
+# deleted every event whose id is a multiple of 7 (428); the copy-only fulls hold full.bak's rows. Each
+# result is also checked against a whole comparison of the two states' rows (EXCEPT ALL both ways).
+# Truncates, a shrink, a sliding window and values stored off row changed in place are the oracle
+# fixtures' (diffs.sql, schema_changes.sql, lob_changes.sql), checked the same way on 2022. No SQL
+# Server is needed.
+
+require mssql
+
+statement ok
+ATTACH 'test/data/backup/*.bak' AS tc (TYPE mssql_backup, history true);
+
+query I
+SELECT list(column_name ORDER BY rowid) FROM (SELECT column_name, row_number() OVER () rowid FROM (DESCRIBE SELECT * FROM mssql_backup_table_changes('tc', 'dbo', 'items')));
+----
+[change_type, id, name, code, price, created, flag, blob, _mssql_rid]
+
+# The differential over its own full: its pages only.
+query TI
+SELECT change_type, count(*) FROM mssql_backup_table_changes('tc', 'dbo', 'items', start_version := 1, end_version := 6) GROUP BY 1 ORDER BY 1;
+----
+insert	500
+update_postimage	200
+update_preimage	200
+
+query TI
+SELECT change_type, count(*) FROM tc.table_changes('dbo', 'events', start_version := 1, end_version := 6) GROUP BY 1 ORDER BY 1;
+----
+delete	428
+
+# What the two states hold, compared whole: the newer rows the changes insert, the older ones they delete.
+query II
+SELECT
+  (SELECT count(*) FROM ((SELECT *, _mssql_rid FROM tc.items EXCEPT ALL SELECT *, _mssql_rid FROM tc.items AT (VERSION => 1))
+                         EXCEPT ALL SELECT * EXCLUDE change_type FROM tc.table_insertions('dbo', 'items', start_version := 1))) +
+  (SELECT count(*) FROM (SELECT * EXCLUDE change_type FROM tc.table_insertions('dbo', 'items', start_version := 1)
+                         EXCEPT ALL (SELECT *, _mssql_rid FROM tc.items EXCEPT ALL SELECT *, _mssql_rid FROM tc.items AT (VERSION => 1)))),
+  (SELECT count(*) FROM ((SELECT *, _mssql_rid FROM tc.items AT (VERSION => 1) EXCEPT ALL SELECT *, _mssql_rid FROM tc.items)
+                         EXCEPT ALL SELECT * EXCLUDE change_type FROM tc.table_deletions('dbo', 'items', start_version := 1))) +
+  (SELECT count(*) FROM (SELECT * EXCLUDE change_type FROM tc.table_deletions('dbo', 'items', start_version := 1)
+                         EXCEPT ALL (SELECT *, _mssql_rid FROM tc.items AT (VERSION => 1) EXCEPT ALL SELECT *, _mssql_rid FROM tc.items)));
+----
+0	0
+
+query I
+SELECT
+  (SELECT count(*) FROM ((SELECT *, _mssql_rid FROM tc.events AT (VERSION => 1) EXCEPT ALL SELECT *, _mssql_rid FROM tc.events)
+                         EXCEPT ALL SELECT * EXCLUDE change_type FROM tc.table_deletions('dbo', 'events', start_version := 1))) +
+  (SELECT count(*) FROM (SELECT * EXCLUDE change_type FROM tc.table_deletions('dbo', 'events', start_version := 1)
+                         EXCEPT ALL (SELECT *, _mssql_rid FROM tc.events AT (VERSION => 1) EXCEPT ALL SELECT *, _mssql_rid FROM tc.events))) +
+  (SELECT count(*) FROM tc.table_insertions('dbo', 'events', start_version := 1));
+----
+0
+
+# The insertions' errors name the function called.
+statement error
+SELECT * FROM mssql_backup_table_insertions('tc', 'dbo', 'nope');
+----
+mssql_backup_table_insertions: the newer state has no table dbo.nope
+
+# SHA-256 digests give the same changes.
+statement ok
+SET mssql_backup_change_hash = 'sha256';
+
+query TI
+SELECT change_type, count(*) FROM mssql_backup_table_changes('tc', 'dbo', 'items', start_version := 1, end_version := 6) GROUP BY 1 ORDER BY 1;
+----
+insert	500
+update_postimage	200
+update_preimage	200
+
+statement ok
+RESET mssql_backup_change_hash;
+
+statement error
+SET mssql_backup_change_hash = 'md5';
+----
+is neither 'fast' nor 'sha256'
+
+# Through another full (the copy-only one, version 2): no differential's pages to go by, every page's
+# LSN read -- the same changes.
+query TI
+SELECT change_type, count(*) FROM mssql_backup_table_changes('tc', 'dbo', 'items', start_version := 2, end_version := 6) GROUP BY 1 ORDER BY 1;
+----
+insert	500
+update_postimage	200
+update_preimage	200
+
+query I
+SELECT count(*) FROM mssql_backup_table_changes('tc', 'dbo', 'items', start_version := 1, end_version := 2);
+----
+0
+
+# One state: no rows, not an error (DQ-47).
+query I
+SELECT count(*) FROM tc.table_changes('dbo', 'items', start_version := 6, end_version := 6);
+----
+0
+
+query II
+SELECT (SELECT count(*) FROM tc.table_insertions('dbo', 'items', start_version := 1)),
+       (SELECT count(*) FROM tc.table_deletions('dbo', 'items', start_version := 1));
+----
+700	200
+
+# Over files, a full and its differential.
+query TI
+SELECT change_type, count(*) FROM mssql_backup_table_changes('test/data/backup/full.bak', 'dbo', 'events', diff := 'test/data/backup/diff.bak') GROUP BY 1;
+----
+delete	428
+
+# A deleted row carries its key and its old values.
+query II
+SELECT min(event_id), count(*) FILTER (WHERE event_id % 7 <> 0) FROM tc.table_deletions('dbo', 'events', start_version := 1);
+----
+7	0
+
+statement error
+SELECT * FROM mssql_backup_table_changes('tc', 'dbo', 'nope');
+----
+the newer state has no table dbo.nope
+
+statement error
+SELECT * FROM mssql_backup_table_changes('tc', 'dbo', 'items', start_version := 6, end_version := 1);
+----
+start_version 6 is after end_version 1
+
+statement error
+SELECT * FROM mssql_backup_table_changes('test/data/backup/full.bak', 'dbo', 'items', diff := 'test/data/backup/diff.bak', start_version := 1);
+----
+do not go beside it
+
+statement ok
+DETACH tc;

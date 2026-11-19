@@ -71,7 +71,7 @@ the specs it affects. **Blocking** means the named PR cannot open until the ques
 | DQ-35 | the helper naming family | keep as drafted | 022–024 |
 | DQ-36 | committed samples or a release asset | committed, ≤ 16 MB in all; **decided** (owner, 2026-11-10): three samples over 2 MB accepted (a plain full 4.4 MB, a plain stripe 2 × 2.2 MB: a database's system tables alone are ~3 MB), 12.9 MB in all, ~3 MB in git | — |
 | DQ-37 | `backup_<component>.cpp` source names | yes | 085 PR 1 |
-| DQ-41 | how a striped or compressed pass is indexed | **decided** (owner, 2026-11-09): searched, not read (E13: every pass ascending, a container's block = one extent group); samples kept; the header scan only for pass 2, a differential's pass and a pass whose order breaks; a container is walked from known blocks by default (rows can forge a resync), resync search under `trust_layout := true` (085 D4a, task 7a) | — |
+| DQ-41 | how a striped or compressed pass is indexed | **decided** (owner, 2026-11-09): searched, not read (E13: every pass ascending, a container's block = one extent group); samples kept; the header scan only for pass 2, a differential's pass and a pass whose order breaks -- **revisited** (owner, 2026-11-19: a large database's differential is not small, and over object storage its header scan read the whole file -- 8.3 s / 1.5 GB of 1.5 GB to open one): a differential's pass 1 carries exactly the extents its DCM marks that are allocated or hold an allocation page, within the file's size (measured on 15 differentials, 2022: plain, compressed, striped, of three files, of one filegroup, after a shrink, under load), so one plain family's is ranked from its own GAM and DCM pages as a full's is (0.4 s / 79 MB to open over S3), checked also where the database changed while the backup ran (owner: a differential under load is the usual case, not a rare one -- the extents its later passes copy again and the GAM / DCM bits that moved, each at its rank), a compressed one's too, through its container's stream (the chain walked from known blocks, only the groups read decoded: 1.5 s -> 0.03 s to open a 2.2 GB one), a striped one's families searched as a full's, the DCM set of its data files saying which extents they carry together (`StripedDcmBuilder`, checked by the families' group count, samples and the extents changed while the backup ran); a container is walked from known blocks by default (rows can forge a resync), resync search under `trust_layout := true` (085 D4a, task 7a) | — |
 | DQ-40 | which pages are a table's | **decided** (owner, 2026-11-09): its AU's IAM chain, walked at the table's first scan through the page store; the page header checked at read; a differential's own pages by their header AU; an ATTACH reads the headers, allocation and catalog pages only (085 D4, D4a) | — |
 | DQ-39 | what an opened backup keeps in memory | **decided** (owner, 2026-11-09): at most 0.4 MB resident per GB of backup (4 GB for 10 TB); extent bitmaps with ranks, block checkpoints, the catalog model resident; the AU index buffer-managed (replaced by DQ-40's IAM chain); page bytes not kept; a slow open is acceptable; a saved index later, as an option (085 D4a) | — |
 | DQ-38 | how the reader does I/O | **decided** (owner, 2026-11-09): coalesced ranges, fetched asynchronously and in parallel through DuckDB's I/O pool and `CachingFileSystem`, as the Parquet reader does (085 D3a) | — |
@@ -785,7 +785,19 @@ what an earlier differential already brought.
   rows appear or go: a `table_created` / `table_dropped` of its rows for an importer that keeps them). A change that cannot be
   expressed row by row -- a type change that rewrites the rows, a table rebuilt under a new object id, a
   partition SWITCH -- marks the table `reload`: its row changes are then its whole new content, and the
-  importer rebuilds it. The importer applies the DDL before the rows.
+  importer rebuilds it. As built (PR 4c-3a, measured on the oracle fixture): a type change that rewrites the rows
+  and an index rebuild write every page anew, so the row changes see them and neither is a reload; a
+  partition switched *in* is (its pages keep their LSNs), a switch *out* and a TRUNCATE are DQ-49's
+  events.
+- **Measured for the row changes (lob_changes.sql, 2022):** a change to a value stored off row -- the
+  whole varchar(max) replaced, `.WRITE` appending or overwriting in place, `UPDATETEXT` on a text, a
+  varbinary(max) replaced at its length -- rewrites LOB pages only: the data row's page and its LSN
+  stay as they were, and for all but the appending `.WRITE` so do the tree's node pages (the leaves
+  change). Only a value that grows from in row to off row rewrites the data page. So the changed data
+  pages alone miss them, silently: for a table whose LOB / row-overflow pages changed, a row is also a
+  candidate when its value tree touches a changed LOB page (a map-only pass over the newer state's data
+  pages and tree nodes, the leaves not read), and its two versions are compared by their assembled
+  values, not by the tree. The importer applies the DDL before the rows.
 - **Row changes, in the new schema**, as DuckLake names them: `mssql_backup_table_changes(catalog,
   schema, table [, start, end])` (versions or timestamps, as `ducklake_table_changes`) with `change_type` `'insert'`, `'delete'`, `'update_preimage'`,
   `'update_postimage'`; `mssql_backup_table_insertions` / `_deletions` the rows an importer inserts /

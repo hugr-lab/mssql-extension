@@ -1,0 +1,80 @@
+# name: test/sql/backup/mssql_backup_schema_changes.test
+# description: mssql_backup_schema_changes -- the schema changes between two states (spec 085 task 24c, PR 4c-3, DQ-47)
+# group: [mssql]
+#
+# The committed samples' states share one schema, so every call here is empty: what this file pins is
+# the function's shape, its bounds and its refusals. The events themselves are test_backup_schema_changes's
+# (synthetic catalog models), and the oracle fixture diffs.sql's (a table dropped, one truncated, a column
+# dropped and one added, a table created, a rebuild that is no reload). No SQL Server is needed.
+
+require mssql
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM mssql_backup_schema_changes('test/data/backup/full.bak', diff := 'test/data/backup/diff.bak'));
+----
+21
+
+query I
+SELECT count(*) FROM mssql_backup_schema_changes('test/data/backup/full.bak', diff := 'test/data/backup/diff.bak');
+----
+0
+
+statement ok
+ATTACH 'test/data/backup/*.bak' AS sc (TYPE mssql_backup, history true);
+
+# No bounds: the default version (the differential, 6) against its full alone (1).
+query I
+SELECT count(*) FROM sc.schema_changes();
+----
+0
+
+query I
+SELECT count(*) FROM mssql_backup_schema_changes('sc', start_version := 1, end_version := 6);
+----
+0
+
+query I
+SELECT count(*) FROM sc.schema_changes(start_version := 2, end_version := TIMESTAMP '2026-11-09 22:35:30');
+----
+0
+
+# One state: an empty set, not an error (DQ-47).
+query I
+SELECT count(*) FROM mssql_backup_schema_changes('sc', start_version := 4, end_version := 4);
+----
+0
+
+# Over files, with no ATTACH.
+query I
+SELECT count(*) FROM mssql_backup_schema_changes('test/data/backup/*.bak', start_version := 1, end_version := 6);
+----
+0
+
+# A bound as a string or a whole decimal reads as a number (DuckLake's METADATA_PARAMETERS sends strings).
+query I
+SELECT count(*) FROM mssql_backup_schema_changes('sc', start_version := '2', end_version := 6.0);
+----
+0
+
+statement error
+SELECT * FROM mssql_backup_schema_changes('sc', start_version := 1.5);
+----
+start_version: VERSION 1.5 is not a version number
+
+statement error
+SELECT * FROM mssql_backup_schema_changes('sc', start_version := 6, end_version := 1);
+----
+start_version 6 is after end_version 1
+
+statement error
+SELECT * FROM mssql_backup_schema_changes('sc', start_version := 9);
+----
+has versions 1 to 6, not 9
+
+statement error
+SELECT * FROM mssql_backup_schema_changes('test/data/backup/full.bak', diff := 'test/data/backup/diff.bak', start_version := 1);
+----
+do not go beside it
+
+statement ok
+DETACH sc;

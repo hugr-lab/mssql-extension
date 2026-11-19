@@ -53,6 +53,9 @@ enum class BackupKind : uint8_t { Full, Differential, Log };
 enum class RecoveryModel : uint8_t { Full, BulkLogged, Simple };
 
 const char *BackupKindName(BackupKind kind);
+//! HEADERONLY's backup type, by name: BackupKindName's, or "file" / "file differential" for a backup
+//! that leaves data files out (types 4 / 6; a partial backup, 7 / 8, is not told apart from them yet).
+std::string BackupTypeName(const struct BackupSetHeader &set);
 const char *RecoveryModelName(RecoveryModel model);
 
 //! One file of the database (FILELISTONLY's row), from the trailer's SFIN / SFGI records.
@@ -74,6 +77,11 @@ struct DatabaseFile {
 	//! holds other per-backup bits (0x84 / 0x04 for one unchanged file, review of #549), so the flag is
 	//! a hint: the page reader drops such a file only when the backup carries no page 0 of it.
 	bool marked_removed = false;
+	//! SFIN flag 0x4 at +8: the file is in this backup (FILELISTONLY's IsPresent). Every file of a
+	//! database or a database differential backup has it; a file or filegroup backup, and a partial one
+	//! (READ_WRITE_FILEGROUPS), lack it on the files they leave out (diff_layouts fixture, 2022:
+	//! BackupType 6 with its other filegroups' files at 0x0).
+	bool present = true;
 };
 
 struct BackupSetHeader {
@@ -149,6 +157,12 @@ struct BackupSetHeader {
 	uint64_t compressed_backup_size = 0;
 	bool has_compressed_backup_size = false;
 
+	//! The data files the backup leaves out (not `present`, not marked removed): none for a database
+	//! backup; a file, filegroup or partial backup's other files.
+	std::vector<const DatabaseFile *> AbsentDataFiles() const;
+	//! Why the backup is no state of the whole database, or empty: a file, filegroup or partial
+	//! backup (it leaves data files out), named with what it carries and what it does not.
+	std::string NotWholeDatabase() const;
 	//! HEADERONLY's FirstRecoveryForkID: the parent fork for a log backup that spans the fork point,
 	//! else the current fork.
 	const Guid &FirstRecoveryForkId() const;
