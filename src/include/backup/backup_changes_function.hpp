@@ -26,7 +26,7 @@ void RegisterBackupChangesFunctions(ExtensionLoader &loader);
 //! versions `start_value` / `end_value` of the history of `paths` (an attached backup's or the files';
 //! a number, or a time; no start: the end's full alone; no end: the default version).
 struct TwoStates {
-	std::shared_ptr<OpenedCatalog> old_catalog, new_catalog;					 // none when `same`
+	std::shared_ptr<OpenedCatalog> old_catalog, new_catalog;  // `same`: new_catalog only with open_same
 	Value start = Value(LogicalType::BIGINT), end = Value(LogicalType::BIGINT);	 // NULL for diff :=
 	bool same = false;															 // one state: no change
 	bool history_break = false;	 // the database restored or recreated between them
