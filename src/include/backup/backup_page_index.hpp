@@ -111,6 +111,8 @@ class PassMap {
 public:
 	//! The group holding `extent`, or false when the pass does not carry it.
 	bool Find(const ExtentId &extent, uint64_t &group) const;
+	//! Each extent the pass carries, in order.
+	void ForEachExtent(const std::function<void(const ExtentId &)> &fn) const;
 	bool Ranked() const {
 		return ranked_;
 	}
@@ -130,7 +132,7 @@ public:
 
 private:
 	friend PassMap BuildPassMap(const RandomAccess &, uint64_t, uint64_t, uint32_t);
-	friend bool BuildRankedPassMap(const RandomAccess &, uint64_t, uint64_t, PassMap &, uint64_t *);
+	friend bool BuildRankedPassMap(const RandomAccess &, uint64_t, uint64_t, PassMap &, uint64_t *, bool);
 	friend class PassMapBuilder;
 	friend class RankedPassBuilder;
 	friend class PassHeaderScan;
@@ -209,9 +211,14 @@ PassMap BuildPassMap(const RandomAccess &stream, uint64_t offset, uint64_t lengt
 //! caller then maps the pass by its headers (BuildPassMap). `groups_read`, when given, counts the
 //! groups it read. One difference from the header scan, harmless: a GAM-allocated extent whose
 //! pages are all unallocated is a group of zero units, which this path counts as carried (Locate
-//! then returns zero units, which hold no row) and the header scan as empty.
+//! then returns zero units, which hold no row) and the header scan as empty (a differential's too: a
+//! page there is live only where the overlaid PFS says so, and then its unit is a page). `differential`:
+//! the pass is a differential's first, which carries the extents its DCM marks (each interval's page 6,
+//! in the same group as its GAM) that are allocated or hold an allocation page (DQ-41 revisited); an
+//! interval whose first extent it does not carry changed in nothing and carries nothing; each file's
+//! last extent is checked where its rank puts it.
 bool BuildRankedPassMap(const RandomAccess &stream, uint64_t offset, uint64_t length, PassMap &map,
-						uint64_t *groups_read = nullptr);
+						uint64_t *groups_read = nullptr, bool differential = false);
 
 //! Where a page's latest copy lies.
 struct PageLocation {
@@ -276,6 +283,9 @@ struct IndexedPass {
 	PassMap map;  // when not searched, or once its search gave up (fell_back)
 	std::unique_ptr<PassSearch> search;
 	bool by_block = false;	// the search's positions are a container's block offsets
+	//! A differential's pass 1 ranked from its GAM and DCM pages, not mapped by its headers (DQ-41
+	//! revisited); kept only when its later passes carry allocation pages' extents alone.
+	bool from_dcm = false;
 	//! The search gave the pass up and `map` (its header scan) answers now. Set once, after the map
 	//! is built; the search stays alive for the readers still in it.
 	std::atomic<bool> fell_back{false};
@@ -322,8 +332,9 @@ public:
 		return pages;
 	}
 	//! Task 24 (D12): a differential's index over its full's. A page its own passes do not carry is
-	//! the base's latest copy (Locate, ReadPage); its own passes are header-scanned, so their "absent"
-	//! is sure. `base` must outlive this index.
+	//! the base's latest copy (Locate, ReadPage); its own passes are header-scanned, or its pass 1 ranked
+	//! from its GAM and DCM pages when its later passes show the database did not change during the backup
+	//! (DQ-41 revisited), so their "absent" is sure. `base` must outlive this index.
 	void SetBase(const PageIndex *base) {
 		base_ = base;
 	}

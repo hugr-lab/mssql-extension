@@ -112,6 +112,16 @@ Bytes Gam(const std::vector<uint32_t> &allocated) {
 	return b;
 }
 
+//! A DCM page body: bit e set (changed since the differential base) for every extent in `changed`.
+Bytes Dcm(const std::vector<uint32_t> &changed) {
+	Bytes b(8192, 0);
+	b[1] = 16;	// m_type: a DCM page
+	for (uint32_t e : changed) {
+		b[194 + e / 8] |= static_cast<uint8_t>(1u << (e % 8));
+	}
+	return b;
+}
+
 //! Extent 0 of `file`, its page 0 a file header and its page 2 a GAM.
 void AddFirstExtent(std::vector<Unit> &units, uint16_t file, const Bytes *header, const Bytes *gam) {
 	for (uint32_t k = 0; k < 8; k++) {
@@ -591,6 +601,107 @@ int main() {
 		pass.throw_past = 2 + 30 * 8 * 8192ull;
 		Check(!BuildRankedPassMap(pass, 0, pass.Size(), refused),
 			  "a read that fails turns the rank path down, not the index");
+	}
+	{
+		// DQ-41 revisited: a differential's pass 1 ranked from its own GAM and DCM pages -- the extents its
+		// DCM marks that are allocated or hold an allocation page, within the file's size. File 1 of two
+		// intervals: GAM 0 allocates 0..20 and 30000, DCM 0 marks 0, 3, 5, 1011 (a PFS page's, not
+		// allocated), 30000 and 31000 (freed since: not copied); interval 1's GAM allocates its first four,
+		// its DCM marks 63904 (its GAM's own) and 63906. File 3: GAM {0, 1}, DCM {0}.
+		const uint32_t size1 = 511232 + 64;
+		std::vector<uint32_t> alloc0;
+		for (uint32_t e = 0; e <= 20; e++) {
+			alloc0.push_back(e);
+		}
+		alloc0.push_back(30000);
+		Bytes header1 = FileHeader(1, size1), gam0 = Gam(alloc0), dcm0 = Dcm({0, 3, 5, 1011, 30000, 31000});
+		Bytes gam1 = Gam({0, 1, 2, 3}), dcm1 = Dcm({0, 2});
+		Bytes header3 = FileHeader(3, 16), gam3 = Gam({0, 1}), dcm3 = Dcm({0});
+		const std::vector<uint32_t> expected = {0, 3, 5, 1011, 30000, 63904, 63906};
+		auto diff_pass = [&](const std::vector<uint32_t> &file1) {
+			ComputedPass pass;
+			for (uint32_t e : file1) {
+				ExtentId x;
+				x.file = 1;
+				x.extent = e;
+				pass.groups.push_back(x);
+			}
+			ExtentId x3;
+			x3.file = 3;
+			x3.extent = 0;
+			pass.groups.push_back(x3);
+			pass.pad_groups = 1;
+			pass.bodies = {{{1, 0}, &header1},	 {{1, 2}, &gam0},	 {{1, 6}, &dcm0}, {{1, 511232}, &gam1},
+						   {{1, 511238}, &dcm1}, {{3, 0}, &header3}, {{3, 2}, &gam3}, {{3, 6}, &dcm3}};
+			return pass;
+		};
+		ComputedPass pass = diff_pass(expected);
+		PassMap ranked;
+		uint64_t reads = 0;
+		Check(BuildRankedPassMap(pass, 0, pass.Size(), ranked, &reads, true),
+			  "a differential's pass 1 ranked from its GAM and DCM pages");
+		auto scanned = BuildPassMap(pass, 0, pass.Size(), 0);
+		bool same = ranked.ExtentCount() == expected.size() + 1 && scanned.ExtentCount() == ranked.ExtentCount();
+		for (size_t i = 0; i < expected.size(); i++) {
+			ExtentId x;
+			x.file = 1;
+			x.extent = expected[i];
+			uint64_t a = 0, c = 0;
+			same = same && ranked.Find(x, a) && scanned.Find(x, c) && a == i && c == i;
+		}
+		for (uint32_t absent : {4u, 20u, 31000u, 63905u}) {
+			ExtentId x;
+			x.file = 1;
+			x.extent = absent;
+			same = same && !ranked.Find(x, g);
+		}
+		Check(same,
+			  "every extent where the header scan finds it; allocated but unmarked, and marked but freed, "
+			  "extents absent");
+		Check(reads < 2 * expected.size() + 4,
+			  "it reads the file's group 0, the second interval's and a few checks, not the pass: " +
+				  std::to_string(reads) + " groups");
+		// A marked extent the pass does not carry, or one it carries unmarked: the ranks no longer hold.
+		ComputedPass missing = diff_pass({0, 3, 1011, 30000, 63904, 63906});
+		PassMap refused;
+		Check(!BuildRankedPassMap(missing, 0, missing.Size(), refused, nullptr, true),
+			  "a pass lacking a marked extent is refused (mapped by its headers instead)");
+		ComputedPass extra = diff_pass({0, 3, 4, 5, 1011, 30000, 63904, 63906});
+		Check(!BuildRankedPassMap(extra, 0, extra.Size(), refused, nullptr, true),
+			  "a pass carrying an unmarked extent is refused");
+		// A marked, allocated extent at the tail of the last file the pass does not carry: its rank would
+		// land on the pass's pads (review of the DCM map).
+		ComputedPass tail = diff_pass({0, 3, 5, 1011, 30000, 63904});
+		Check(!BuildRankedPassMap(tail, 0, tail.Size(), refused, nullptr, true),
+			  "a pass lacking the last file's marked tail extent is refused");
+		// An interval that changed in nothing is left out whole, its GAM and DCM too: the next interval's
+		// first extent follows. File 1 of three intervals, the middle one unchanged.
+		{
+			const uint32_t size3 = 2 * 511232 + 64;
+			Bytes h = FileHeader(1, size3), g2 = Gam({0, 1}), d2 = Dcm({0, 1});
+			ComputedPass p3;
+			for (uint32_t e : {0u, 3u, 5u, 1011u, 30000u, 127808u, 127809u}) {
+				ExtentId x;
+				x.file = 1;
+				x.extent = e;
+				p3.groups.push_back(x);
+			}
+			p3.pad_groups = 1;
+			p3.bodies = {{{1, 0}, &h}, {{1, 2}, &gam0}, {{1, 6}, &dcm0}, {{1, 1022464}, &g2}, {{1, 1022470}, &d2}};
+			PassMap skipped;
+			const bool ok = BuildRankedPassMap(p3, 0, p3.Size(), skipped, nullptr, true);
+			ExtentId later;
+			later.file = 1;
+			later.extent = 127809;
+			uint64_t at = 0;
+			Check(ok && skipped.Find(later, at) && at == 6 && skipped.ExtentCount() == 7,
+				  "an unchanged interval left out: the next interval's extents in place");
+		}
+		// No DCM page in a file's group 0: not a differential's pass the rule knows.
+		ComputedPass no_dcm = diff_pass(expected);
+		no_dcm.bodies.erase(no_dcm.bodies.begin() + 2);
+		Check(!BuildRankedPassMap(no_dcm, 0, no_dcm.Size(), refused, nullptr, true),
+			  "a group 0 with no DCM page is refused");
 	}
 	{
 		ExtentBitmap bm;
