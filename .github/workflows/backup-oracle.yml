@@ -319,8 +319,9 @@ jobs:
           [ -d vcpkg_bincache ] || exit 0
           find vcpkg_bincache -type f -mtime +14 -delete
           find vcpkg_bincache -mindepth 1 -type d -empty -delete
-      # The committed samples (test/data/backup) are compared in ci.yml's build job, on every pull
-      # request, a fork's included: they need no credentials, which this lane's jobs all hold.
+      # The committed samples (test/data/backup) are compared with their golden files in ci.yml's build
+      # job, on every pull request, a fork's included; here they are read through s3:// and https://
+      # (the `remote` job, which holds no credential but runs behind this build's gate).
       - uses: actions/upload-artifact@v7
         with:
           name: backup-oracle-duckdb
@@ -402,6 +403,27 @@ jobs:
           for s in ${QUIET} ${OVERLAY_SETS}; do include+=(--include "${s}.bak" --include "${s}.filelistonly.txt"); done
           aws s3 cp --recursive --only-show-errors "${include[@]}" "${prefix}/${run}/" "${dir}/"
           VERSION=${{ matrix.version }} DUCKDB=cli/duckdb test/backup/compare_rows.sh "${dir}"
+
+  # Spec 085 task 25: the committed samples read through s3:// and https:// (an S3 server of the job's
+  # own, RustFS on TLS, test/backup/compare_remote.sh) answer as the local files do. No R2, no secret.
+  remote:
+    name: Read through s3:// and https://
+    needs: [key, build]
+    if: needs.key.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.pr && format('refs/pull/{0}/head', inputs.pr) || '' }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: backup-oracle-duckdb
+          path: cli
+      - name: The samples through s3:// and https:// against the local files
+        run: |
+          chmod +x cli/duckdb
+          DUCKDB=cli/duckdb test/backup/compare_remote.sh
 
   cleanup:
     name: Remove sets no run reads
