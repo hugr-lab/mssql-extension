@@ -69,9 +69,8 @@ struct ScanBindData : public TableFunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<ScanBindData>();
-		return paths == other.paths && diff == other.diff && at.unit == other.at.unit &&
-			   (!at.IsSet() || at.value == other.at.value) && schema == other.schema && table == other.table &&
-			   max_threads == other.max_threads && max_memory == other.max_memory;
+		return paths == other.paths && diff == other.diff && at.Same(other.at) && schema == other.schema &&
+			   table == other.table && max_threads == other.max_threads && max_memory == other.max_memory;
 	}
 	//! Every EXECUTE binds again: the file is read at bind.
 	bool SupportStatementCache() const override {

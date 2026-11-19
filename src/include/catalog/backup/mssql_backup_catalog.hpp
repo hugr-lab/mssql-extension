@@ -23,6 +23,7 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/function/macro_function.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
@@ -100,11 +101,12 @@ public:
 		return true;
 	}
 
-	//! The versions a statement reads: its transaction's, taken at the transaction's first read (as a
-	//! DuckLake transaction keeps its snapshot), or the catalog's now with no transaction at hand.
-	std::shared_ptr<const Versions> VersionsFor(optional_ptr<ClientContext> context);
-	//! The number `backup` (one of this catalog's versions) has in `context`'s versions; 0 when none.
-	uint64_t NumberOf(optional_ptr<ClientContext> context, const mssql::backup::AttachedBackup &backup);
+	//! The versions now. A version named by number or time is resolved against them when a query is bound and
+	//! pinned by its key (BackupAt::key) in the bind data, serialized with the plan (owner, 2026-11-19: no
+	//! transaction keeps versions, and no connection state either): a refresh reaches the next bind.
+	std::shared_ptr<const Versions> CurrentVersions() const;
+	//! The key of the version `at` names now (its own key when it has one).
+	std::string KeyOf(optional_ptr<ClientContext> context, const mssql::backup::BackupAt &at);
 	//! The table macros every schema answers (DuckLake's `db.snapshots()` form), parsed once.
 	const std::vector<std::pair<std::string, unique_ptr<MacroFunction>>> &Macros() const {
 		return macros_;
@@ -112,9 +114,10 @@ public:
 	const std::string &Name() const {
 		return name_;
 	}
-	//! The backup of the version `at` names (AT's VERSION a number, TIMESTAMP the last version finished
-	//! by it; none: the default), opened now when it was not. A BinderException naming the catalog when
-	//! there is no such version.
+	//! The backup of the version `at` names (by its key when pinned; else AT's VERSION a number, TIMESTAMP
+	//! the last version finished by it; none: the default), opened now when it was not. A BinderException
+	//! naming the catalog when there is no such version; an InvalidInputException when the pinned one is
+	//! no longer among the files (a refresh dropped it: the query is to run again).
 	std::shared_ptr<const mssql::backup::AttachedBackup> BackupAt(optional_ptr<ClientContext> context,
 																  const mssql::backup::BackupAt &at);
 	//! Task 24b (owner, 2026-11-17): the files the ATTACH named read again -- the headers of new or
@@ -146,14 +149,13 @@ public:
 	};
 
 private:
-	std::shared_ptr<const Versions> CurrentVersions() const;
 	//! The version `at` names in `versions` (its default when none).
 	uint64_t Resolve(const Versions &versions, optional_ptr<ClientContext> context,
 					 const mssql::backup::BackupAt &at) const;
-	//! The entries of `version` of `versions`: the ones `context`'s transaction read, else the catalog's,
-	//! else built now -- opened outside the lock (two lookups may open one version together; the first
-	//! kept). A transaction keeps what it reads, so a version it read stays readable while it runs, though a
-	//! refresh drops it from the catalog (review of #579).
+	//! The entries of `version` of `versions`: the ones `context`'s query read, else the catalog's, else
+	//! built now -- opened outside the lock (two lookups may open one version together; the first kept). A
+	//! query keeps what it reads to its end (MSSQLBackupQueryStates), so the entries its plan holds outlive
+	//! a refresh that drops them from the catalog (review of #579).
 	std::shared_ptr<State> StateOf(optional_ptr<ClientContext> context, const Versions &versions, uint64_t version);
 	unique_ptr<State> MakeState(std::shared_ptr<const mssql::backup::AttachedBackup> backup);
 	//! The default version's entries, held by the caller while it reads them: a refresh may drop them from
@@ -170,8 +172,8 @@ private:
 	std::mutex refresh_lock_;
 	mutable std::mutex lock_;
 	std::shared_ptr<const Versions> versions_;
-	//! By StateKey. A refresh drops the states of versions the history no longer has; a transaction that
-	//! read one keeps it (MSSQLBackupTransaction::states) until it ends (review of #579).
+	//! By StateKey. A refresh drops the states of versions the history no longer has; a query that read one
+	//! keeps it (MSSQLBackupQueryStates) to its end (review of #579).
 	std::map<std::string, std::shared_ptr<State>> states_;
 };
 
@@ -247,17 +249,26 @@ private:
 	int64_t row_count_ = -1;  // the catalog's, -1 unknown
 };
 
-//! A backup is read, never written: a transaction holds only the versions it reads (task 24b), taken at
-//! its first read, so a refresh meanwhile reaches the next transaction, not the middle of this one.
+//! The version states one query read of a backup catalog, by StateKey (registered on its ClientContext,
+//! cleared when a query begins and ends): the entries its plan holds live to its end though a refresh drops
+//! them from the catalog -- the anchors TYPE mssql's catalog keeps for its entries (MSSQLBindAnchors). No
+//! version is chosen here: the bind data pins it (BackupAt::key).
+class MSSQLBackupQueryStates : public ClientContextState {
+public:
+	void QueryBegin(ClientContext &context) override;
+	void QueryEnd(ClientContext &context) override;
+	//! The catalog's in `context`.
+	static MSSQLBackupQueryStates &For(ClientContext &context, const MSSQLBackupCatalog &catalog);
+
+	std::mutex lock;
+	std::map<std::string, std::shared_ptr<MSSQLBackupCatalog::State>> states;
+};
+
+//! A backup is read, never written: a transaction holds nothing (a query keeps what it reads,
+//! MSSQLBackupQueryStates).
 class MSSQLBackupTransaction : public Transaction {
 public:
 	MSSQLBackupTransaction(TransactionManager &manager, ClientContext &context) : Transaction(manager, context) {}
-
-	std::mutex lock;
-	std::shared_ptr<const MSSQLBackupCatalog::Versions> versions;
-	//! The version states it read, by StateKey: its lookups find them here first, so they stay readable
-	//! while it runs, though a refresh drops them from the catalog (review of #579).
-	std::map<std::string, std::shared_ptr<MSSQLBackupCatalog::State>> states;
 };
 
 class MSSQLBackupTransactionManager : public TransactionManager {

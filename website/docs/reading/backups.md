@@ -412,9 +412,10 @@ the `ATTACH` is refused when its version is read, until a refresh reads it again
 taken in by `CALL b.refresh()` (`mssql_backup_refresh('b')`): the glob is expanded again and the headers
 of the new or changed files read (a file whose server gives no ETag or modification time is read every
 time), and the default version opened; a version already read keeps its catalog, a file moved or
-rewritten makes its version a new one. A transaction keeps the versions of its first read -- through the
-catalog or through a file function on its name alike: a refresh on another connection reaches its next
-transaction, and the transaction that refreshes reads the new versions from the refresh on. `snapshot_version` / `snapshot_time` choose
+rewritten makes its version a new one. A version named by number or time (or the default one, with no
+`AT`) is resolved when a query is bound -- to its backups and their files -- and the query reads those to
+its end, through the catalog or a file function on its name alike: a refresh meanwhile reaches the next
+query, in a transaction or not. `snapshot_version` / `snapshot_time` choose
 a version by its backups, which it stays across a refresh (if its files are gone, the latest is read,
 with a WARNING). A version's number is its place among the files, so a backup added that
 finished earlier than others (a full found for a differential left out, say) moves the later ones, and

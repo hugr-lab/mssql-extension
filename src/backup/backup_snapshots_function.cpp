@@ -204,7 +204,7 @@ std::shared_ptr<const BackupHistory> HistoryOf(ClientContext &context, const std
 	if (paths.size() == 1) {
 		auto db = DatabaseManager::Get(context).GetDatabase(Identifier(paths.front()));
 		if (db && db->GetCatalog().GetCatalogType() == MSSQLBackupCatalog::TYPE) {
-			const auto versions = db->GetCatalog().Cast<MSSQLBackupCatalog>().VersionsFor(&context);
+			const auto versions = db->GetCatalog().Cast<MSSQLBackupCatalog>().CurrentVersions();
 			default_version = versions->default_version;
 			if (attached) {
 				*attached = true;
