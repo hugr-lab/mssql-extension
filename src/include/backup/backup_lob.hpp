@@ -113,6 +113,13 @@ struct LobValue {
 LobValue WalkLob(const LobPageFetch &fetch, const OffRowPointer &pointer, const LobUnits &units, LobWalk mode,
 				 uint64_t max_bytes, const std::string &what, LobSink &sink);
 
+//! The bytes of the LOB fragment record in slot `slot` of `page` (its length as its header says), or
+//! none -- an empty string -- when that slot holds no fragment of `unit`:
+//! another page type or unit, a slot past the slot array or freed, another record type, a length that
+//! does not fit. What two states' versions of a value's node are compared by (spec 085, the LOB tail):
+//! a node whose record is the same in both is the same node, its links the same.
+std::string LobFragmentRecord(const Page &page, uint16_t slot, uint64_t unit);
+
 //! The value whose in-row root is `pointer` (the catalog's own values: a view's definition past 8000
 //! bytes), its fragments on pages of allocation unit `lob_unit`; at most `max_bytes`. Any other form
 //! is refused by name.

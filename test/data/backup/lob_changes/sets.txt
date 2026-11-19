@@ -1,0 +1,3 @@
+lob_changes_full|lob_changes_full.bak
+lob_changes_diff|lob_changes_diff.bak
+lob_changes_shrink|lob_changes_shrink.bak

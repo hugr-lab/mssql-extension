@@ -105,8 +105,9 @@ public:
 	//! pinned by its key (BackupAt::key) in the bind data, serialized with the plan (owner, 2026-11-19: no
 	//! transaction keeps versions, and no connection state either): a refresh reaches the next bind.
 	std::shared_ptr<const Versions> CurrentVersions() const;
-	//! The key of the version `at` names now (its own key when it has one).
-	std::string KeyOf(optional_ptr<ClientContext> context, const mssql::backup::BackupAt &at);
+	//! A query's bind: the version `at` names resolved, its state held by the query to its end, and its key
+	//! (PinAttachedVersion), from one read of the versions.
+	std::string Pin(ClientContext &context, const mssql::backup::BackupAt &at);
 	//! The table macros every schema answers (DuckLake's `db.snapshots()` form), parsed once.
 	const std::vector<std::pair<std::string, unique_ptr<MacroFunction>>> &Macros() const {
 		return macros_;

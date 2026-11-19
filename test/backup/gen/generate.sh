@@ -21,7 +21,7 @@
 # diffs.sql, a full and a differential over it after E2's changes (spec 085 PR 4c: diffs_full, diffs_diff and
 # diffs_diff_xpress, paired in overlays.txt); schema_changes.sql, truncates, a shrink and a sliding window between a
 # full and its differential (PR 4c-3: schema_full, schema_diff; not run by default); lob_changes.sql, values stored
-# off row changed in each form (PR 4c-3: lob_changes_full, lob_changes_diff; not run by default); switch_in.sql, a
+# off row changed in every form, then a shrink (PR 4c-3: lob_changes_full, lob_changes_diff, lob_changes_shrink; not run by default; committed under test/data/backup/lob_changes, made by its generate.sh); switch_in.sql, a
 # partition switched in with no shrink (PR 4c-3: switch_full, switch_diff; not run by default; committed under test/data/backup/switch_in, made by its generate.sh);
 # bench_changes.sql, a benchmark of 10 million rows and differentials of 10k / 110k / 1.1M changes and an index rebuild
 # (PR 4c-3: bench_full, bench_diff_*, each also compressed as *_x; not run by default). A fixture's backups come with the server's own catalog of them where it holds
@@ -266,8 +266,10 @@ for fixture in ${FIXTURES}; do
 		sets+=("schema_full|schema_full.bak" "schema_diff|schema_diff.bak")
 		;;
 	lob_changes)
-		# Does a change to a value stored off row move its data row's page (spec 085 PR 4c-3)? No shrink.
-		sets+=("lob_changes_full|lob_changes_full.bak" "lob_changes_diff|lob_changes_diff.bak")
+		# Values stored off row changed in every form (spec 085 PR 4c-3, the LOB tail): a differential with no
+		# shrink, then one after a shrink that moves the LOB pages, both over the full.
+		sets+=("lob_changes_full|lob_changes_full.bak" "lob_changes_diff|lob_changes_diff.bak"
+			"lob_changes_shrink|lob_changes_shrink.bak")
 		;;
 	diff_layouts)
 		# Differentials over a striped full of a database of three data files: to one file, in two stripes, and

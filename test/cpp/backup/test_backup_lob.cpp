@@ -386,6 +386,37 @@ int main() {
 		Check(v.length == 40 && t.data == std::string(40, 'z'), "40 distinct fragments assemble");
 	}
 
+	{
+		// LobFragmentRecord (the LOB tail): a node's record as stored, or none where the slot holds no
+		// fragment of the unit -- what two states' versions of a node are compared by.
+		Pages q;
+		const std::string first = Data("hello"), second = SmallRoot("abc");
+		q.pages[500] = TextPage(500, {first, second});
+		auto data_page = TextPage(501, {Data("x")});
+		data_page[1] = 1;  // a data page, not a text page
+		q.pages[501] = data_page;
+		auto freed = TextPage(502, {Data("y"), Data("z")});
+		Put(freed, PAGE_SIZE - 4, 0, 2);  // slot 1 freed
+		q.pages[502] = freed;
+		auto torn = TextPage(503, {Data("w")});
+		Put(torn, 98, 9000, 2);	 // a length past the slot array
+		q.pages[503] = torn;
+		auto record = [&](uint32_t page, uint16_t slot, uint64_t unit = UNIT) {
+			Page out;
+			PagePointer at;
+			at.file = 1;
+			at.page = page;
+			q.Fetch()(at, out);
+			return LobFragmentRecord(out, slot, unit);
+		};
+		Check(record(500, 0) == first && record(500, 1) == second, "each slot's record, by its own length");
+		Check(record(500, 2).empty(), "a slot past the page's: none");
+		Check(record(500, 0, OVERFLOW_UNIT).empty(), "another unit's page: none");
+		Check(record(501, 0).empty(), "a page that is no text page: none");
+		Check(record(502, 0) == Data("y") && record(502, 1).empty(), "a freed slot: none");
+		Check(record(503, 0).empty(), "a length past the slot array: none");
+	}
+
 	std::cout << (failures ? "FAILED" : "PASSED") << " (" << failures << " failure(s))" << std::endl;
 	return failures ? 1 : 0;
 }
