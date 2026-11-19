@@ -1603,7 +1603,8 @@ before the next opens.
     version is resolved at bind to its key (its backups and files, `BackupAt::key`, `PinAttachedVersion`;
     the default one too) and the plan carries and serializes it; the states a query read are held to its
     end (`MSSQLBackupQueryStates`, a ClientContextState cleared at QueryBegin / QueryEnd, the anchors TYPE
-    mssql keeps); a transaction keeps nothing (owner, 2026-11-19: not DuckLake's snapshot per transaction
+    mssql keeps; one registration per connection, keyed by catalog inside -- it was one per alias name,
+    never unregistered, #584); a transaction keeps nothing (owner, 2026-11-19: not DuckLake's snapshot per transaction
     -- the next statement reads a refresh); a file gone under a kept state is refused by name, a pinned
     version a refresh dropped while no query holds it too ("run the query again"). Tested by `test_backup_cache` over a folder that grows (a differential and a copy-only
     full added -- the differential renumbered, its state kept --, a pinned snapshot_version, a file touched

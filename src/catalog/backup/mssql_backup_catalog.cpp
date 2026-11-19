@@ -183,9 +183,8 @@ void MSSQLBackupQueryStates::QueryEnd(ClientContext &) {
 	states.clear();
 }
 
-MSSQLBackupQueryStates &MSSQLBackupQueryStates::For(ClientContext &context, const MSSQLBackupCatalog &catalog) {
-	// By the catalog's name: what it holds is dropped at the query's end whichever catalog it was.
-	return *context.registered_state->GetOrCreate<MSSQLBackupQueryStates>("mssql_backup_states:" + catalog.Name());
+MSSQLBackupQueryStates &MSSQLBackupQueryStates::For(ClientContext &context) {
+	return *context.registered_state->GetOrCreate<MSSQLBackupQueryStates>("mssql_backup_states");
 }
 
 std::string MSSQLBackupCatalog::KeyOf(optional_ptr<ClientContext> context, const mssql::backup::BackupAt &at) {
@@ -240,10 +239,11 @@ std::shared_ptr<MSSQLBackupCatalog::State> MSSQLBackupCatalog::StateOf(optional_
 	const std::string key = StateKey(history, entry);
 	optional_ptr<MSSQLBackupQueryStates> query;
 	if (context) {
-		query = &MSSQLBackupQueryStates::For(*context, *this);
+		query = &MSSQLBackupQueryStates::For(*context);
 		std::lock_guard<std::mutex> guard(query->lock);
-		auto it = query->states.find(key);
-		if (it != query->states.end()) {
+		auto &mine = query->states[this];
+		auto it = mine.find(key);
+		if (it != mine.end()) {
 			return it->second;
 		}
 	}
@@ -272,7 +272,7 @@ std::shared_ptr<MSSQLBackupCatalog::State> MSSQLBackupCatalog::StateOf(optional_
 	// catalog only.
 	if (query) {
 		std::lock_guard<std::mutex> guard(query->lock);
-		query->states.emplace(key, found);
+		query->states[this].emplace(key, found);
 	}
 	return found;
 }
@@ -299,10 +299,11 @@ std::shared_ptr<const AttachedBackup> MSSQLBackupCatalog::BackupAt(optional_ptr<
 	}
 	// Dropped by a refresh since: still read while the query or the catalog holds its state.
 	if (context) {
-		auto &query = MSSQLBackupQueryStates::For(*context, *this);
+		auto &query = MSSQLBackupQueryStates::For(*context);
 		std::lock_guard<std::mutex> guard(query.lock);
-		auto it = query.states.find(at.key);
-		if (it != query.states.end()) {
+		auto &mine = query.states[this];
+		auto it = mine.find(at.key);
+		if (it != mine.end()) {
 			return it->second->backup;
 		}
 	}
