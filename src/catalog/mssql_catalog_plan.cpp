@@ -213,9 +213,9 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 		// same mapping COPY's query goes through.
 		for (auto col_idx : target.insert_column_indices) {
 			const auto &col = mssql_columns[col_idx];
-			bulk.columns.push_back(mssql::BCPColumnMetadata::FromServerColumn(col.name, col.sql_type_name,
-																			  col.max_length, col.precision, col.scale,
-																			  col.is_nullable, col.collation_name));
+			bulk.columns.push_back(mssql::BCPColumnMetadata::FromServerColumn(
+				col.name, col.sql_type_name, col.max_length, col.precision, col.scale, col.is_nullable,
+				col.BulkCollationName(GetDatabaseCollation())));
 			// The 2.0 insert child is full-width in table order, so the chunk
 			// column of a table column IS its ordinal.
 			bulk.column_mapping.push_back(static_cast<int32_t>(col_idx));

@@ -1,4 +1,5 @@
 #include "copy/bcp_writer.hpp"
+#include "codec/variant/variant_write.hpp"
 
 #include <chrono>
 #include <cstdarg>
@@ -513,6 +514,10 @@ void BCPWriter::WriteTypeInfo(vector<uint8_t> &buffer, const BCPColumnMetadata &
 
 	case tds::TDS_TYPE_DATETIMEOFFSET:	// 0x2B
 		WriteUInt8(buffer, col.scale);
+		break;
+
+	case tds::TDS_TYPE_SQL_VARIANT:	 // 0x62 - spec 093 T2: LONGLEN, the maximum length (S2)
+		WriteUInt32LE(buffer, mssql::codec::variant::SQL_VARIANT_MAX_LENGTH);
 		break;
 
 	default:

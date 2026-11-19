@@ -236,9 +236,43 @@ declared length -- is not kept.
 
 A filter on the column runs in DuckDB, over the `VARIANT`: SQL Server compares a `sql_variant` by its
 base type in an order of its own, so `WHERE v = 5` finds the `int` 5 and `WHERE v = '5'` the string
-`'5'`, in DuckDB as on the server. Such a column is never a row key. Writing a `VARIANT` into SQL
-Server comes with a later release: an `INSERT` / `UPDATE` / `COPY` / CTAS of one is refused by name
-(a `NULL` is written as before); write such values with `mssql_exec()`.
+`'5'`, in DuckDB as on the server. Such a column is never a row key.
+
+A `VARIANT` is written into a `sql_variant` column -- `INSERT`, `UPDATE`, `MERGE`, `COPY`, and a
+CTAS, which creates the column as `sql_variant` -- each value under the narrowest SQL Server type that
+holds every value of its DuckDB type:
+
+| inside the `VARIANT` | written as |
+|---|---|
+| `BOOLEAN` | `bit` |
+| `TINYINT` / `SMALLINT` / `UTINYINT` | `smallint` / `smallint` / `tinyint` |
+| `INTEGER` / `USMALLINT` / `BIGINT` / `UINTEGER` | `int` / `int` / `bigint` / `bigint` |
+| `UBIGINT` / `HUGEINT` / `UHUGEINT` | `decimal(38,0)` when it has 38 digits or fewer |
+| `FLOAT` / `DOUBLE` | `real` / `float` |
+| `DECIMAL(w,s)` | `decimal(w,s)` |
+| `DATE` / `TIME` / `TIME_NS` | `date` / `time(6)` / `time(7)` |
+| `TIMESTAMP_S` / `_MS` / `TIMESTAMP` / `_NS` | `datetime2(0)` / `(3)` / `(6)` / `(7)` (nanoseconds rounded to 100 ns) |
+| `TIMESTAMPTZ` (microseconds / nanoseconds) | `datetimeoffset(6)` / `(7)` at `+00:00` |
+| `UUID` | `uniqueidentifier` |
+| `BLOB` | `varbinary(n)`, up to 8000 bytes |
+| `VARCHAR` | `nvarchar(n)`, up to 4000 UTF-16 units; longer, `varchar(n)` when it is all ASCII (up to 8000) |
+
+An `INSERT ... SELECT` from a table of the same attached database is sent to the server whole by default
+(`mssql_dml_pushdown`), and the server copies each `sql_variant` value as it is -- its base type,
+precision, scale, length and collation unchanged. The table above is what a `VARIANT` that comes
+through DuckDB is written as. So a value read and written back keeps its value and its `VARIANT` type,
+while its SQL Server type may change: a `numeric` returns as a `decimal`, `money` as `decimal(19,4)`, `smallmoney` as `decimal(10,4)`, a `time(0)`-`(5)` as `time(6)`, a `datetime2(1)` / `(2)` as `datetime2(3)` and `(4)` / `(5)` as `datetime2(6)`, a `datetime` / `smalldatetime` as `datetime2(6)`, a `datetime2(7)` / `datetimeoffset(7)` outside 1677-2262 at scale 6, a `datetimeoffset` at `+00:00` (scale 6 below 7), a `char` / `varchar` / `nchar` as `nvarchar`, a `binary` as `varbinary`. A string value is written under the
+database's default collation -- except, on the bulk path (COPY, a large INSERT, CTAS, a staged UPDATE
+or MERGE), a database collation this version does not know, which is written as
+`Latin1_General_100_BIN2_UTF8`: such a value then compares and sorts by that collation rather than the
+database's. A value `sql_variant` cannot hold -- a list or struct, an `INTERVAL`, a
+`TIMETZ`, `NaN` or an infinity, a date outside 0001-9999, a number past 38 digits, a longer string or
+blob, a `VARCHAR` whose bytes are not valid UTF-8 -- is refused, the column and the value's type named;
+write such values with `mssql_exec()`. A subnormal `DOUBLE` (below about 2.2e-308) written as a
+literal -- an INSERT of up to `mssql_insert_bcp_threshold` rows, an UPDATE of up to
+`mssql_dml_stage_threshold` rows -- is stored as 0, as it is for a plain `float` column; the bulk paths (COPY, a large INSERT, CTAS, a staged UPDATE / DELETE / MERGE)
+keep it (an UPDATE past its threshold stages). A plain `float` column written as a literal also
+stores -0.0 as 0; a `VARIANT` keeps its sign.
 
 `hierarchyid` and CLR UDT columns are read as text by the catalog scan, so three-part-name queries
 return a `VARCHAR`; a raw `mssql_scan()` that selects one without a conversion fails: convert it in

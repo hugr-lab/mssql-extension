@@ -121,7 +121,9 @@ bool MSSQLColumnInfo::BulkWireTakesType(const string &sql_type_name) {
 		   t == "varchar" || t == "text" || t == "nchar" || t == "nvarchar" || t == "ntext" || t == "date" ||
 		   t == "time" || t == "datetime" || t == "datetime2" || t == "smalldatetime" || t == "datetimeoffset" ||
 		   t == "binary" || t == "varbinary" || t == "image" || t == "uniqueidentifier" || t == "timestamp" ||
-		   t == "rowversion" || t == "json" || t == "xml";
+		   t == "rowversion" || t == "json" || t == "xml" ||
+		   // Spec 093 T2: SSVARIANT envelopes (S2: INSERT BULK takes them, base type and value kept).
+		   t == "sql_variant";
 }
 
 //===----------------------------------------------------------------------===//

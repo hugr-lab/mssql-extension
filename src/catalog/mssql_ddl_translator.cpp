@@ -353,10 +353,8 @@ string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const m
 			"CTAS does not support DuckDB type ARRAY. "
 			"SQL Server has no array type. Consider flattening or serializing to JSON.");
 	case LogicalTypeId::VARIANT:
-		// Spec 093: read from a sql_variant (T1); a CTAS creates one from T2 on.
-		throw NotImplementedException(
-			"a VARIANT value cannot be written to SQL Server yet (a sql_variant column is "
-			"written, and created by CTAS, from spec 093 T2 on)");
+		// Spec 093 T2 (D3): each value's base type is its own, in the envelope.
+		return "sql_variant";
 	default:
 		break;
 	}
