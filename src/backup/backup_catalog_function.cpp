@@ -195,8 +195,7 @@ struct BaseTableBindData : public TableFunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<BaseTableBindData>();
-		return paths == other.paths && diff == other.diff && at.unit == other.at.unit &&
-			   (!at.IsSet() || at.value == other.at.value) && table == other.table;
+		return paths == other.paths && diff == other.diff && at.Same(other.at) && table == other.table;
 	}
 	//! Every EXECUTE binds again: the file is read at bind.
 	bool SupportStatementCache() const override {
@@ -231,6 +230,10 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	data->paths = PathsOf(input.inputs[0], FUNCTION);
 	data->diff = DiffPathsOf(input.named_parameters, FUNCTION);
 	data->at = BackupAtOf(input.named_parameters, FUNCTION);
+	if (data->paths.size() == 1) {
+		// Over an attached backup, the version pinned now by its files (task 24b, owner 2026-11-19).
+		PinAttachedVersion(context, data->paths.front(), data->at);
+	}
 	if (input.inputs.size() > 1) {
 		if (input.inputs[1].IsNull()) {
 			throw InvalidInputException("%s: the base table is NULL", FUNCTION);

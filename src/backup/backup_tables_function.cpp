@@ -470,10 +470,15 @@ struct CatalogListBindData : public TableFunctionData {
 		copy->scope = scope;
 		return std::move(copy);
 	}
+	//! A version pinned at bind (an attached name's: `PinAttachedVersion`) must be pinned again by the
+	//! next EXECUTE, else a prepared listing keeps the version of its PREPARE, and fails for good once a
+	//! refresh drops it (review of #581). Files keep the cache: init opens them anew.
+	bool SupportStatementCache() const override {
+		return at.key.empty();
+	}
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<CatalogListBindData>();
-		return paths == other.paths && diff == other.diff && at.unit == other.at.unit &&
-			   (!at.IsSet() || at.value == other.at.value) && listing == other.listing &&
+		return paths == other.paths && diff == other.diff && at.Same(other.at) && listing == other.listing &&
 			   by_schema == other.by_schema && by_table == other.by_table && schema == other.schema &&
 			   table == other.table && scope == other.scope;
 	}
@@ -505,13 +510,17 @@ std::string NameArgument(const Value &value, const char *what) {
 }
 
 template <Listing L>
-unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
+unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
 							  vector<Identifier> &names) {
 	auto data = make_uniq<CatalogListBindData>();
 	data->listing = L;
 	data->paths = PathsOf(input.inputs[0], FunctionName(L));
 	data->diff = DiffPathsOf(input.named_parameters, FunctionName(L));
 	data->at = BackupAtOf(input.named_parameters, FunctionName(L));
+	if (data->paths.size() == 1) {
+		// Over an attached backup, the version pinned now by its files (task 24b, owner 2026-11-19).
+		PinAttachedVersion(context, data->paths.front(), data->at);
+	}
 	if (L == Listing::Columns && input.inputs.size() > 1) {
 		data->by_schema = true;
 		data->schema = NameArgument(input.inputs[1], "schema");

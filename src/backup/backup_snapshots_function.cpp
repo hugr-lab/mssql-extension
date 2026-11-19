@@ -96,7 +96,7 @@ std::shared_ptr<const BackupHistory> AttachedHistory(ClientContext &context, con
 	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {
 		return nullptr;
 	}
-	const auto versions = db->GetCatalog().Cast<MSSQLBackupCatalog>().VersionsFor(&context);
+	const auto versions = db->GetCatalog().Cast<MSSQLBackupCatalog>().CurrentVersions();
 	default_version = versions->default_version;
 	return versions->history;
 }

@@ -233,12 +233,21 @@ struct AttachedBackup {
 };
 
 //! A version of a history (task 24b, DQ-48), as AT names one: `unit` "version" (a number) or "timestamp"
-//! (the last version finished by it); none when `unit` is empty -- the default version.
+//! (the last version finished by it); none when `unit` is empty -- the default version. `key`, set when a
+//! query over an attached backup is bound (PinAttachedVersion), names the version AT named then by its
+//! backups and files (the catalog's StateKey), and wins: a plan run or deserialized after a refresh reads
+//! that version, whatever its number now (owner, 2026-11-19).
 struct BackupAt {
 	std::string unit;
 	Value value;
+	std::string key;
 	bool IsSet() const {
 		return !unit.empty();
+	}
+	//! The same version named: a bind data's Equals (two scans of two versions are never one, whatever
+	//! DuckDB's plan dedup sees).
+	bool Same(const BackupAt &other) const {
+		return unit == other.unit && (!IsSet() || value == other.value) && key == other.key;
 	}
 };
 
@@ -260,10 +269,13 @@ BackupAt BackupAtOf(const named_argument_map_t &named, const char *function);
 //! Those keyword parameters, on a function's signature.
 void AddVersionParameters(TableFunction &function);
 
-//! The backup attached as `name` (a catalog of TYPE mssql_backup), or none: its version `at` names, its
-//! default version when none. [the catalog layer]
+//! The backup attached as `name` (a catalog of TYPE mssql_backup), or none: its version `at` names (by its
+//! key when pinned), its default version when none. [the catalog layer]
 std::shared_ptr<const AttachedBackup> FindAttachedBackup(ClientContext &context, const std::string &name,
 														 const BackupAt &at = BackupAt());
+//! At a file function's bind: when `name` is an attached backup, `at`'s version (its default when none)
+//! pinned by its key, so the plan reads it whatever a refresh renumbers before it runs. [the catalog layer]
+void PinAttachedVersion(ClientContext &context, const std::string &name, BackupAt &at);
 
 //! The backup on `paths` opened for an ATTACH as `name`: OpenBackup's shared stages (the ObjectCache's
 //! entry when there is one, never another attached backup's name) and the model of the tables and views

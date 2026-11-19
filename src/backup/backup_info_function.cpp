@@ -242,13 +242,14 @@ struct BackupInfoBindData : public TableFunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		const auto &other = other_p.Cast<BackupInfoBindData>();
-		return paths == other.paths && at.unit == other.at.unit && (!at.IsSet() || at.value == other.at.value);
+		return paths == other.paths && at.Same(other.at);
 	}
 	//! The row is read at bind, and a prepared statement keeps it: a backup is opened to be read, and
 	//! a file rewritten under an open backup is invalid anyway while the rewrite runs. `reread := true`
-	//! binds again on every EXECUTE (a device overwritten nightly, read by a statement prepared once).
+	//! binds again on every EXECUTE (a device overwritten nightly, read by a statement prepared once). An
+	//! attached name's version is pinned again at every EXECUTE too, so it follows a refresh (review of #581).
 	bool SupportStatementCache() const override {
-		return !reread;
+		return !reread && at.key.empty();
 	}
 };
 
@@ -261,6 +262,10 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	auto data = make_uniq<BackupInfoBindData>();
 	data->paths = PathsOf(input.inputs[0], "mssql_backup_info");
 	data->at = BackupAtOf(input.named_parameters, "mssql_backup_info");
+	if (data->paths.size() == 1) {
+		// Over an attached backup, the version pinned now by its files (task 24b, owner 2026-11-19).
+		PinAttachedVersion(context, data->paths.front(), data->at);
+	}
 	for (const auto &kv : input.named_parameters) {
 		if (kv.first == "reread") {
 			data->reread = !kv.second.IsNull() && kv.second.GetValue<bool>();
