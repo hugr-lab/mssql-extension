@@ -1,5 +1,6 @@
 // Fuzz harness: values stored off row (spec 085 PR 3): ParseOffRowPointer, WalkLob in both of its
-// modes over up to 16 pages, and the `_mssql_lob` map (AppendLobMap / ParseLobMap).
+// modes over up to 16 pages, LobFragmentRecord on every slot of them, and the `_mssql_lob` map
+// (AppendLobMap / ParseLobMap).
 //
 // The input: u8 options, u8 n, n bytes of an in-row pointer (any of the three forms: its length and
 // first byte decide), then up to 16 pages of 8 KB (a short last page padded with zeros). Options bit 7
@@ -119,6 +120,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 		std::memcpy(pages[i].bytes.data(), body + i * PAGE_SIZE, take);
 		pages[i].header = ReadPageHeader(pages[i].bytes.data());
 		by_id.emplace(std::make_pair(pages[i].header.page_id.file, pages[i].header.page_id.page), &pages[i]);
+	}
+	// Every slot of every page through LobFragmentRecord (the LOB tail): none or a record inside the page,
+	// never a FormatError, never a read past it.
+	for (const auto &page : pages) {
+		const uint64_t page_unit = page.header.AllocationUnit();
+		for (uint32_t slot = 0; slot <= page.header.slot_count && slot <= PAGE_SIZE / 2; slot++) {
+			const std::string record = LobFragmentRecord(page, static_cast<uint16_t>(slot), page_unit);
+			if (record.size() > PAGE_SIZE) {
+				__builtin_trap();
+			}
+			g_sink += record.size();
+		}
 	}
 	const LobPageFetch fetch = [&](const PagePointer &at, Page &out) {
 		auto it = by_id.find(std::make_pair(at.file, at.page));

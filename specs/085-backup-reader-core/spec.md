@@ -1647,12 +1647,29 @@ before the next opens.
     collections (`RadixPartitionedColumnData`, its hash join's: spilled to `temp_directory` past
     `memory_limit`), a task's own over its units, put together when it finds none left; the last task to
     leave pairs them a partition at a time (the map of one reserved, `CollectMemory`). For a table with
-    values stored off row the records compare with their off-row pointers masked (zeroed where they lie in
-    the record, a compressed record's in its long data) and, where only those differ (a shrink moved the LOB pages), by their
-    values' digests; and since a change to a value stored off row rewrites LOB pages only (measured on
-    `lob_changes.sql`, 2022: the data page and LSN unchanged for a replaced varchar(max), `.WRITE`,
-    `UPDATETEXT`, a replaced varbinary(max)), a table whose LOB pages changed walks its unwritten pages'
-    rows' trees map-only and compares the values of a row whose tree touches a changed page. A chunk's
+    values stored off row two records that differ compare by their values: the in-row ones as the scan
+    takes them, each under its column id (no dropped column, no uniquifier; a bit as 0 or 1, from the
+    record or from its default), then where those agree the off-row ones' digests -- a
+    shrink rewrites the off-row pointers and, moving a record, drops a dropped column's bytes (measured on
+    `lob_changes.sql`: every row of a table whose varchar(max) was dropped read as updated when the
+    records' bytes with their pointers zeroed were compared; review of #580; and by column id, since two
+    states' layouts differ when the columns changed between them: a value copied into a new column and the
+    old one dropped is the same bytes under another id, an update). And since a change to a
+    value stored off row rewrites LOB pages only (measured on `lob_changes.sql`, 2022: the data page and
+    LSN unchanged for a replaced varchar(max), `.WRITE`, `UPDATETEXT`, a replaced varbinary(max)), a
+    table whose LOB pages changed walks its unwritten pages' rows' trees map-only; a row touches the
+    change when a node of its tree lies on a changed page and its record (`LobFragmentRecord`) is not the
+    older state's at that place -- a value whose every node is the same is the same value, each record
+    holding its links, a leaf its bytes -- and only then are its values compared by their digests (the
+    LOB tail: the roots of the values beside a changed one lie on its root's page, and were hashed for
+    nothing; measured on `bench_changes`, values off row: 111 thousand of a million changed 1.04 ->
+    0.84 s, 11 thousand 0.40 -> 0.27 s). The fixture `lob_changes.sql` changes every off-row form
+    (root pointers, an in-row root, row-overflow, values under 8,000 bytes, text through WRITETEXT and
+    UPDATETEXT, a value set to itself, rows deleted and inserted, a dropped column off row and one in
+    row, a column copied into a new one and dropped, a bit added with a default then the table rebuilt)
+    and shrinks the
+    file for a second differential: checked against a whole comparison with EXCEPT ALL both ways on
+    2019, 2022 and 2025 (2017's server does not start on the development machine). A chunk's
     staging is reserved as the scan's (D17). A partition switched in is a reload, seen against the two
     whole models. A retyped column's older values go through DuckDB's TryCast (NULL and a WARNING where
     it refuses). Tests: `mssql_backup_table_changes.test` (the samples, checked against a whole
@@ -1664,10 +1681,12 @@ before the next opens.
     on 16 threads: 0.09-0.2 s for 10 thousand to 1.1 million scattered changes against a 0.08 s scan of
     the full; 4.1 s for an index rebuild, every row paired across the table, 4.9 s under a 1 GB
     `memory_limit` with 1 GB spilled (16 partitions; 32 took 6.5 s, 64 9.7 s); values off row, 0.13 s for 1 thousand changed, 1.6 s for 111
-    thousand). Not done: the changed LOB pages are listed on one thread at init, and a row touching one
-    has its values assembled for their digests (a value's id in its pointer and its LOB record would
-    tell without reading the tree); a full after a differential reads every page's header (the full's
-    DCM pages would name the extents to read).
+    thousand). Not done: the changed LOB pages are listed on one thread at init; a root pointer's root
+    is read for every row of an unwritten page whose table's LOB pages changed -- not reading it while its
+    page is unchanged would rest on the server rewriting the root at every change of its value (measured
+    so: its record holds a counter that each change raised, in all five forms of `lob_changes.sql`), not on
+    what the pages say; a full after a differential reads every page's header (the full's DCM pages would
+    name the extents to read).
 25. `s3://` (MinIO) and `https://` tests in the lane; measure the open pass and decide filter pushdown
     with late materialisation (a follow-up spec if it is worth it) — 2 d. Owner, 2026-11-11: the
     scan is to make filtering cheap enough for an importer that exports a table with a filter over

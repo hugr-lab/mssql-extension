@@ -399,6 +399,27 @@ std::string ReadLobValue(const PageStore &store, const std::string &pointer, uin
 						pointer, lob_unit, what, max_bytes);
 }
 
+std::string LobFragmentRecord(const Page &page, uint16_t slot, uint64_t unit) {
+	if (page.bytes.size() != PAGE_SIZE ||
+		(page.header.type != static_cast<uint8_t>(PageType::TextMix) &&
+		 page.header.type != static_cast<uint8_t>(PageType::TextTree)) ||
+		page.header.AllocationUnit() != unit || slot >= page.header.slot_count ||
+		static_cast<size_t>(page.header.slot_count) * 2 + PAGE_HEADER_SIZE > PAGE_SIZE) {
+		return std::string();
+	}
+	const size_t slot_array = PAGE_SIZE - 2u * page.header.slot_count;
+	const size_t slot_at = PAGE_SIZE - 2 - 2 * static_cast<size_t>(slot);
+	const size_t offset = page.bytes[slot_at] | (page.bytes[slot_at + 1] << 8);
+	if (offset < PAGE_HEADER_SIZE || offset + 4 > slot_array || ((page.bytes[offset] >> 1) & 7) != 4) {
+		return std::string();
+	}
+	const size_t length = page.bytes[offset + 2] | (page.bytes[offset + 3] << 8);
+	if (length < 14 || offset + length > slot_array) {
+		return std::string();
+	}
+	return std::string(reinterpret_cast<const char *>(page.bytes.data()) + offset, length);
+}
+
 }  // namespace backup
 }  // namespace mssql
 }  // namespace duckdb

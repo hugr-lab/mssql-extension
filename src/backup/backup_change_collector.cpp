@@ -54,6 +54,14 @@ namespace duckdb {
 namespace mssql {
 namespace backup {
 
+//! A task's last LOB page of each state, kept across its rows (the roots of the values of a page's rows
+//! lie side by side): what their nodes are compared on.
+struct LobNodePages {
+	uint64_t new_key = UINT64_MAX, old_key = UINT64_MAX;  // PageKeyOf, UINT64_MAX none
+	Page new_page, old_page;
+	bool old_live = false;	// the older state has the page (old_page)
+};
+
 namespace {
 
 //! A value's digest and its length.
@@ -74,8 +82,9 @@ struct PageRow {
 	//! changed LOB page; then their values' hashes, one per off-row column in layout order.
 	bool touches = false;
 	std::vector<ValueDigest> hashes;
-	//! The record's bytes with its off-row pointers zeroed (a table with values stored off row): a shrink
-	//! moves LOB pages and rewrites the pointers to them, the values the same (measured, diffs.sql).
+	//! The row's values but its off-row ones (a table with values stored off row: ReadPageRows): a shrink
+	//! moves LOB pages and rewrites the pointers to them, and drops a dropped column's bytes, the values the
+	//! same (measured, diffs.sql and lob_changes.sql).
 	std::string masked;
 };
 
@@ -106,9 +115,9 @@ class NodeSink : public LobSink {
 public:
 	void Data(const uint8_t *, size_t) override {}
 	void Node(const LobNode &node) override {
-		pages.push_back(node.page);
+		nodes.push_back(node);
 	}
-	std::vector<PagePointer> pages;
+	std::vector<LobNode> nodes;
 };
 
 constexpr uint64_t MAX_CHANGE_VALUE_BYTES = (1ull << 31) - 1;
@@ -123,8 +132,12 @@ struct OffRowCheck {
 	const LobPageFetch *fetch = nullptr;
 	LobUnits units;
 	const std::vector<uint64_t> *changed = nullptr;	 // PageKeyOf, sorted
-	bool hash_always = false;						 // hash every row's values, touching or not
-	bool sha256 = false;							 // mssql_backup_change_hash
+	//! The older state's pages: a node on a changed page touches the change only when its record differs
+	//! there (a page not live there: it does). None: every node on a changed page does.
+	const PageStore *old_store = nullptr;
+	LobNodePages *node_pages = nullptr;	 // with old_store: the task's
+	bool hash_always = false;			 // hash every row's values, touching or not
+	bool sha256 = false;				 // mssql_backup_change_hash
 };
 
 //! Each off-row value of `row`, by layout index.
@@ -149,8 +162,37 @@ void CheckOffRow(const RowsetLayout &layout, const RowRecord &row, const OffRowC
 		if (check.changed && !check.changed->empty() && !out.touches) {
 			NodeSink nodes;
 			WalkLob(*check.fetch, pointer, check.units, LobWalk::MapOnly, MAX_CHANGE_VALUE_BYTES, what, nodes);
-			for (const auto &p : nodes.pages) {
-				if (std::binary_search(check.changed->begin(), check.changed->end(), PageKeyOf(p.file, p.page))) {
+			// A node on a changed page whose record is the older state's at its place is that node: a value
+			// whose every node is the same is the same value (each record holds its links, a leaf its bytes).
+			// So a root on a page another value's change rewrote is no change (spec 085, the LOB tail:
+			// measured on lob_changes.sql, a change rewrites its own root and leaves the roots beside it).
+			const uint64_t unit = pointer.form == OffRowForm::RowOverflow ? check.units.row_overflow : check.units.lob;
+			for (const auto &n : nodes.nodes) {
+				if (!std::binary_search(check.changed->begin(), check.changed->end(),
+										PageKeyOf(n.page.file, n.page.page))) {
+					continue;
+				}
+				if (!check.old_store || !check.node_pages) {
+					out.touches = true;
+					break;
+				}
+				LobNodePages &pages = *check.node_pages;
+				const uint64_t key = PageKeyOf(n.page.file, n.page.page);
+				if (pages.new_key != key) {
+					(*check.fetch)(n.page, pages.new_page);
+					pages.new_key = key;
+				}
+				if (pages.old_key != key) {
+					// Fetch, not Read: the older state may never have used the page (not live, or Pending in a
+					// backup taken under load) -- the node is then another, never an error.
+					pages.old_live =
+						check.old_store->Fetch(n.page.file, n.page.page, pages.old_page) == PageState::Present;
+					pages.old_key = key;
+				}
+				// A node the newer state holds no fragment for (a leaf the map-only walk did not read) touches
+				// too: assembled, its value names what is wrong with it.
+				const std::string record = LobFragmentRecord(pages.new_page, n.slot, unit);
+				if (!pages.old_live || record.empty() || record != LobFragmentRecord(pages.old_page, n.slot, unit)) {
 					out.touches = true;
 					break;
 				}
@@ -262,23 +304,53 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 		}
 		if (check) {
 			CheckOffRow(layout, row, *check, r);
-			// The pointers zeroed where they lie in the record. Both forms locate a complex value in the page:
-			// LocateValue in the record as stored, CdRow at the CD record's long data (it copies the values it
-			// normalizes, never a complex one), so a pointer outside the compared bytes is a page the reader
-			// misread, named (review of #580: a search of its bytes could zero another field's).
-			r.masked = r.bytes;
+			// The row's values as the scan takes them, its off-row ones left to their digests: what decides
+			// whether a row whose record differs is another row. A shrink rewrites the off-row pointers (the
+			// values the same; measured, diffs.sql) and drops the bytes of a dropped column as it moves a
+			// record (measured on lob_changes.sql: the records of a table whose varchar(max) was dropped lost
+			// its variable column; review of #580), and a version tag comes and goes. Per column (dropped
+			// ones and the uniquifier, which the _mssql_rid holds, left out), in the layout's order: its
+			// column id (two states' layouts differ when the table's columns changed between them: a column
+			// copied into a new one and dropped holds the same value under another id), its state -- NULL, a
+			// value, off row -- and a value's length and bytes; a bit as 0 or 1, from its byte in the record
+			// or from its default (a metadata-only ADD COLUMN: the record has none). An off-row pointer must
+			// lie in the compared bytes: equal records stand for equal pointers (the trees are compared by
+			// them).
+			r.masked.clear();
 			const uint8_t *start = page.bytes.data() + offset;
-			const uint8_t *compared = start + r.masked.size();
-			ForEachOffRow(layout, row, [&](size_t k, const OffRowPointer &pointer) {
-				if (pointer.bytes < start || pointer.bytes > compared ||
-					pointer.size > static_cast<size_t>(compared - pointer.bytes)) {
-					throw FormatError("backup: page " + page.header.page_id.ToString() + " slot " +
-									  std::to_string(slot) + ": the off-row pointer of " + layout.columns[k].name +
-									  " does not lie in its record");
+			const uint8_t *compared = start + r.bytes.size();
+			for (size_t k = 0; k < layout.columns.size(); k++) {
+				const PhysicalColumn &c = layout.columns[k];
+				if (c.Dropped() || c.Uniquifier()) {
+					continue;
 				}
-				const size_t at_byte = static_cast<size_t>(pointer.bytes - start);
-				std::fill(r.masked.begin() + at_byte, r.masked.begin() + at_byte + pointer.size, '\0');
-			});
+				const ValueRef v = row.Locate(layout, k);
+				const uint32_t id = static_cast<uint32_t>(c.rscolid);
+				r.masked.append(reinterpret_cast<const char *>(&id), sizeof(id));
+				if (v.state == ValueState::OffRow) {
+					if (v.data < start || v.data > compared || v.size > static_cast<size_t>(compared - v.data)) {
+						throw FormatError("backup: page " + page.header.page_id.ToString() + " slot " +
+										  std::to_string(slot) + ": the off-row pointer of " + c.name +
+										  " does not lie in its record");
+					}
+					r.masked.push_back('\2');
+					continue;
+				}
+				if (v.state == ValueState::Null) {
+					r.masked.push_back('\0');
+					continue;
+				}
+				r.masked.push_back('\1');
+				if (c.xtype == XTYPE_BIT && v.size >= 1) {
+					const bool set =
+						v.state == ValueState::Default ? v.data[0] != 0 : ((v.data[0] >> c.bit_position) & 1) != 0;
+					r.masked.push_back(set ? '\1' : '\0');
+					continue;
+				}
+				const uint32_t size = v.size;
+				r.masked.append(reinterpret_cast<const char *>(&size), sizeof(size));
+				r.masked.append(reinterpret_cast<const char *>(v.data), v.size);
+			}
 		}
 		out.push_back(std::move(r));
 	}
@@ -375,7 +447,7 @@ struct LoneRow {
 	ChangeItem item;
 	std::string rid;
 	Digest record;
-	bool has_masked = false;  // a table with values stored off row: its record with the pointers zeroed
+	bool has_masked = false;  // a table with values stored off row: the digest of its values but the off-row ones
 	Digest masked;
 	bool touches = false;  // its value trees touch a changed LOB page: `values` are its values' digests
 	std::vector<ValueDigest> values;
@@ -734,6 +806,7 @@ struct CollectTask {
 	Page page, old_page;
 	std::vector<PageRow> rows, old_rows;
 	std::vector<bool> old_same, new_same;
+	LobNodePages node_pages;
 };
 
 namespace {
@@ -817,8 +890,8 @@ public:
 			bits++;
 		}
 		lone_ = make_uniq<LoneRows>(context, bits, memory);
-		// A table with values stored off row compares its rows' records with their pointers masked, and
-		// their values where the masked records agree but the records do not (a shrink moved the LOB pages).
+		// A table with values stored off row compares the rows whose records differ by their values: the
+		// in-row ones, then the off-row ones' digests where those agree (a shrink moved the LOB pages).
 		for (const auto &c : now.cursors) {
 			off_row_table_ = off_row_table_ || c.off_row.lob != 0 || c.off_row.row_overflow != 0;
 		}
@@ -986,11 +1059,12 @@ private:
 		check.fetch = &new_fetch_;
 		check.units = now_.cursors[partition].off_row;
 		check.changed = &changed_lob_;
+		check.old_store = old_store_;
 		check.sha256 = sha256_;
 		return check;
 	}
 
-	//! The older rows' check: the masked record only, no tree walked, no value hashed.
+	//! The older rows' check: their in-row values only, no tree walked, no value hashed.
 	OffRowCheck MaskOnly(size_t partition) const {
 		OffRowCheck check;
 		check.fetch = &old_fetch_;
@@ -1100,7 +1174,8 @@ private:
 		if (!read && !ReadUnitDataPage(new_store_, *now_.cursors[w.partition].unit, w.page, name_, task.page)) {
 			return;
 		}
-		const OffRowCheck check = NewCheck(w.partition);
+		OffRowCheck check = NewCheck(w.partition);
+		check.node_pages = &task.node_pages;
 		ReadPageRows(now_.data, now_.cursors[w.partition], task.page, task.rows, &check);
 		for (const auto &r : task.rows) {
 			if (!r.touches || HashesOf(true, owner->partition, w.page, r.slot) == r.hashes) {
@@ -1144,7 +1219,8 @@ private:
 						task.page.header.slot_count, PAGE_SIZE, now_.data.entry->shape == TableShape::Heap,
 						task.old_same, task.new_same);
 		}
-		const OffRowCheck check = NewCheck(i);
+		OffRowCheck check = NewCheck(i);
+		check.node_pages = &task.node_pages;
 		if (live) {
 			ReadPageRows(now_.data, now_.cursors[i], task.page, task.rows, off_row_table_ ? &check : nullptr, -1,
 						 skip_same ? &task.new_same : nullptr);
