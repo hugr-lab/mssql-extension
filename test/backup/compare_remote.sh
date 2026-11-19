@@ -20,7 +20,7 @@ CONTAINER="${CONTAINER:-mssql-backup-s3}"
 # RustFS 1.0.4, by the digest of its multi-platform index (as images.txt pins the SQL Server images).
 IMAGE="rustfs/rustfs@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2"
 BUCKET=backups
-# Refused when a container of the name exists; once started, the container is removed by its own id
+# Refused when a container of the name exists; once created, the container is removed by its own id
 # (never by name: a second run, or one an earlier docker error let through, must not remove another's).
 if docker container inspect "${CONTAINER}" >/dev/null 2>&1; then
 	echo "ERROR: a container named ${CONTAINER} exists; remove it or set CONTAINER." >&2
