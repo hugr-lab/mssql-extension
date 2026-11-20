@@ -338,6 +338,20 @@ type stays `VARCHAR`. It is non-breaking, and the server's `CAST … NVARCHAR(MA
 not sort like the tree, so it stays out of ORDER BY pushdown, and filters stay in DuckDB (D2). Writes
 are unchanged (a string literal the server parses).
 
+**As built (T4).** `codec/clr/hierarchyid` decodes the bit string (13 label ranges, a level bit, a
+continuing label stored as its value + 1, zero padding shorter than a byte) and encodes it back, for
+the tests and the fuzz harness: one encoding per value, so `fuzz_hierarchyid` asserts a decoded value
+encodes to its own bytes. Checked against G2's server bytes (the root, `/1/2/`, `/1.5/-2/`) and each
+range's bit layout at its ends (`test/cpp/codec/test_hierarchyid.cpp`). H1 is run against the server
+by `test/sql/types/hierarchyid_read.test`, not recorded in `measured/`: every range's first and last
+value at a level's end and inside one, negative and fractional labels, depth 20, an 885-byte path
+and 200 values `GetDescendant` made, each compared with `ToString()` through the catalog and a raw scan.
+`MSSQLColumnInfo::ReadFormFor` answers Bare; `comparison_differs` stays true. A user CLR type is a
+`BLOB` in a raw scan (`ColumnMetadata::IsUserClrUdt`; the describe names it by `system_type_id` 240
+and `user_type_schema` / `user_type_name`, its `system_type_name` NULL -- from the documentation,
+checked by `test/sql/types/clr_udt_raw_scan.test`, whose assembly `test/clr/build.sh` builds in a .NET
+SDK container); through the catalog it keeps `CAST(… AS NVARCHAR(MAX))`.
+
 ### D6: `geometry` / `geography`
 
 **Read.** The column is read bare: UDT `0xF0`, PLP, the MS-SSCLRT value **[spec]** (MS-TDS

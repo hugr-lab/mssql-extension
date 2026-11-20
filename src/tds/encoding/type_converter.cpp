@@ -6,6 +6,7 @@
 #include <sstream>
 #include "codec/binary_codec.hpp"
 #include "codec/boolean_codec.hpp"
+#include "codec/clr/hierarchyid_codec.hpp"
 #include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
@@ -140,16 +141,20 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata &column) {
 	case TDS_TYPE_IMAGE:
 		return LogicalType::BLOB;
 
-	// Not read by a raw scan yet (spec 093 T4, T5). Their COLMETADATA and rows are parsed (T0), so
-	// the refusal names the type; an attached catalog reads them through a server-side conversion.
+	// A CLR type (spec 093 T4): hierarchyid decoded on the client into its ToString() text, a user CLR
+	// type as its bytes (opaque by design), geometry / geography refused until T5 decodes them (a raw scan;
+	// an attached catalog reads them through .STAsBinary()).
 	case TDS_TYPE_UDT: {
-		const std::string type_name =
-			column.udt_type_name.empty() ? std::string("UDT") : column.udt_schema + "." + column.udt_type_name;
+		if (column.IsHierarchyIdUdt()) {
+			return LogicalType::VARCHAR;
+		}
+		if (column.IsUserClrUdt()) {
+			return LogicalType::BLOB;
+		}
 		throw InvalidInputException(
-			"MSSQL Error: column '%s' is of the CLR type %s, which a raw mssql_scan does not read yet. Read it "
-			"through an attached catalog, or convert it in the query (geometry / geography: .STAsBinary(); "
-			"hierarchyid and other CLR types: CAST(... AS nvarchar(max))).",
-			column.name.c_str(), type_name.c_str());
+			"MSSQL Error: column '%s' is of the CLR type sys.%s, which a raw mssql_scan does not read yet. Read it "
+			"through an attached catalog, or convert it in the query (.STAsBinary()).",
+			column.name.c_str(), column.udt_type_name.c_str());
 	}
 	// sql_variant (spec 093 T1, D3): each value a VARIANT of its base type.
 	case TDS_TYPE_SQL_VARIANT:
@@ -293,7 +298,9 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 	// view definition). When the destination vector was allocated as VARCHAR from the catalog
 	// but TDS sends back a non-string type, render the value as a string instead of crashing
 	// inside FlatVector::GetData<T> with a vector-type assertion.
-	if (vector.GetType().id() == LogicalTypeId::VARCHAR && !IsStringTdsType(column.type_id)) {
+	// A hierarchyid's VARCHAR is its own decoded text (spec 093 T4), not a divergence.
+	if (vector.GetType().id() == LogicalTypeId::VARCHAR && !IsStringTdsType(column.type_id) &&
+		!column.IsHierarchyIdUdt()) {
 		WriteAsStringFallback(value, column, vector, row_idx);
 		return;
 	}
@@ -339,6 +346,15 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 
 	case TDS_TYPE_SQL_VARIANT:
 		mssql::codec::variant::DecodeFromTds(value, column, vector, row_idx, variant_notes);
+		break;
+
+	// A CLR type (spec 093 T4): hierarchyid as its text, a user CLR type as its bytes.
+	case TDS_TYPE_UDT:
+		if (column.IsHierarchyIdUdt()) {
+			mssql::codec::hierarchyid::DecodeFromTds(value, column, vector, row_idx);
+		} else {
+			mssql::codec::binary::DecodeFromTds(value, column, vector, row_idx);
+		}
 		break;
 
 	case TDS_TYPE_BIGBINARY:

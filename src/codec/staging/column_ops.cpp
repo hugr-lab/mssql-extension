@@ -266,6 +266,11 @@ FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &co
 	case AppendArm::P2StageBinary:
 	case AppendArm::PlpStageBinary:
 	case AppendArm::LobStageBinary:
+		// Spec 093 T4: a hierarchyid UDT stages its bytes on the PLP binary arm and is decoded to text; a
+		// user CLR type stays bytes.
+		if (column.IsHierarchyIdUdt()) {
+			return FinalizeKernel::HierarchyId;
+		}
 		// The binary arms carry VARBINARY / IMAGE as well; code_page is set on
 		// single-byte text only, and only when its catalog transcodes.
 		return column.code_page != nullptr ? FinalizeKernel::CodePage : FinalizeKernel::Binary;
@@ -406,6 +411,15 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 		return ops;
 	}
 
+	// A CLR type (spec 093 T4), always PLP: hierarchyid into VARCHAR (its text), a user CLR type into BLOB
+	// (its bytes). Both stage the assembled bytes; ResolveKernel decodes the hierarchyid.
+	if ((column.IsHierarchyIdUdt() && target_type.id() == LogicalTypeId::VARCHAR) ||
+		(column.IsUserClrUdt() && target_type.id() == LogicalTypeId::BLOB)) {
+		ops.kind = StagingKind::Var;
+		ops.arm = AppendArm::PlpStageBinary;
+		return ops;
+	}
+
 	// The legacy LOBs. A catalog scan casts them server-side and never produces
 	// them (spec 055 D9), but raw mssql_scan has no metadata to cast from — so
 	// they are decoded natively too rather than left as the one shape the
@@ -508,6 +522,8 @@ const char *FinalizeKernelName(FinalizeKernel kernel) {
 		return "code_page";
 	case FinalizeKernel::Variant:
 		return "variant";
+	case FinalizeKernel::HierarchyId:
+		return "hierarchyid";
 	}
 	return "?";
 }

@@ -754,6 +754,16 @@ spec 093 D3's table -- a string through spec 091's code-page kernels by its own 
 in the vector. The column stays out of pushed comparisons and keys (`comparison_differs`): the server
 compares a `sql_variant` by its base type (#514).
 
+**A `hierarchyid` is decoded on the client (spec 093 T4).** The column is read bare -- a UDT (`0xF0`)
+whose UDT_INFO names `sys.hierarchyid`, always PLP (G2) -- and its MS-SSCLRT 2.2.2 bit string is
+written as its `ToString()` text: the stager keeps the assembled bytes on the PLP binary arm and the
+`HierarchyId` kernel (`codec/clr/hierarchyid_codec`) decodes a chunk into one buffer and one string
+allocation, through `codec/clr/hierarchyid` (DuckDB-free, fuzzed by `fuzz_hierarchyid`: a value
+decoded encodes back to its own bytes, so nothing non-canonical is accepted). The type stays
+`VARCHAR`; the text does not sort like the tree, so `comparison_differs` keeps it out of pushed
+filters, ORDER BY and keys. A user CLR type stays opaque: a raw scan reads its bytes as a `BLOB`
+(`ColumnMetadata::IsUserClrUdt`, the binary kernel), the catalog keeps `CAST(… AS NVARCHAR(MAX))`.
+
 ### Reading a column's collation
 
 `ColumnMetadata` carries all five wire bytes of the TDS collation

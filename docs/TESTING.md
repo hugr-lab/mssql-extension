@@ -1459,6 +1459,23 @@ non-zero — a "skip" and a "broken" must never look alike.
 
 ---
 
+## User CLR Types (spec 093 T4)
+
+`test/sql/types/clr_udt_raw_scan.test` reads two user CLR types: a raw `mssql_scan` as a `BLOB` of
+their bytes, the catalog as their `ToString()` text. The types (`test/clr/TestTypes.cs`) are built into
+an assembly by `test/clr/build.sh` in a .NET SDK container, which writes
+`test/data/clr/mssql_test_udt.dll.hex`. The test deploys it with `CREATE ASSEMBLY … FROM 0x…`, trusted
+by its SHA-512 (`sys.sp_add_trusted_assembly`). It turns the server's `clr enabled` on and needs
+sysadmin, so it runs only with `MSSQL_TEST_CLR=1`:
+
+```bash
+test/clr/build.sh                               # once, or after TestTypes.cs changes
+MSSQL_TEST_CLR=1 make integration-test          # or: build/release/test/unittest test/sql/types/clr_udt_raw_scan.test
+```
+
+SQL Server 2017 or later (`sp_add_trusted_assembly`). `clr enabled` is left on afterwards; everything
+else the test creates is dropped.
+
 ## CI/CD Integration
 
 ### GitHub Actions Example

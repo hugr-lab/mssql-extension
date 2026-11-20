@@ -61,7 +61,7 @@ cd "$HERE"
 # spec 086 PR 1's CD records) and spec 093 T1's variant envelope.
 # Deliberately NOT row_stager or bcp_encode: both link libduckdb and need the suppression file that
 # does not exist yet.
-TARGETS=(browser_response tds_tokens utf16 envchange_txn login_response backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd variant_envelope)
+TARGETS=(browser_response tds_tokens utf16 envchange_txn login_response backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd variant_envelope hierarchyid)
 
 if [ "$(uname -s)" != "Linux" ]; then
 	echo "SKIP: LeakSanitizer is not supported on $(uname -s) — Apple's toolchain ships no LSan."
