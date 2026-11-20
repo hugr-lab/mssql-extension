@@ -213,10 +213,14 @@ bool IsSupportedRetarget(const tds::ColumnMetadata &column, const LogicalType &t
 		}
 	case tds::TDS_TYPE_BIGBINARY:
 	case tds::TDS_TYPE_BIGVARBINARY:
-		// Raw bytes into any string_t-backed target. Spatial columns arrive this
-		// way: the scan auto-projects STAsBinary(), so the wire says VARBINARY
-		// while the catalog says GEOMETRY.
+		// Raw bytes into any string_t-backed target: a raw scan's `.STAsBinary()`
+		// read into the GEOMETRY its column_types name, say.
 		return target_type.InternalType() == PhysicalType::VARCHAR;
+	case tds::TDS_TYPE_UDT:
+		// geometry / geography (spec 093 T5) into a GEOMETRY of either label: the
+		// CRS is a name on the same WKB (a geography read as a plain GEOMETRY by
+		// column_types, say).
+		return column.IsSpatialUdt() && target_type.id() == LogicalTypeId::GEOMETRY;
 	default:
 		return false;
 	}
@@ -241,7 +245,7 @@ AppendArm DirectArm(uint8_t type_id, uint32_t width) {
 //! One switch in one place, so a new staging arm cannot be added without saying
 //! how it finalizes: there is no `default`, and -Wswitch makes the omission a
 //! build failure rather than a column that silently publishes nothing.
-FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &column) {
+FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &column, const LogicalType &target_type) {
 	if (ops.needs_value_fallback) {
 		// Wins over the family: the bytes staged are the WIRE type's, and the
 		// output vector is a different type entirely (issue #89).
@@ -266,6 +270,13 @@ FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &co
 	case AppendArm::P2StageBinary:
 	case AppendArm::PlpStageBinary:
 	case AppendArm::LobStageBinary:
+		// Spec 093 T5: a geometry / geography UDT stages its bytes on the PLP binary
+		// arm and is decoded into WKB -- always into a GEOMETRY, into a BLOB unless
+		// geometry_as 'native' asks for the stored bytes.
+		if (column.IsSpatialUdt() &&
+			(target_type.id() == LogicalTypeId::GEOMETRY || column.geometry_as != tds::GeometryAs::Native)) {
+			return FinalizeKernel::Spatial;
+		}
 		// The binary arms carry VARBINARY / IMAGE as well; code_page is set on
 		// single-byte text only, and only when its catalog transcodes.
 		return column.code_page != nullptr ? FinalizeKernel::CodePage : FinalizeKernel::Binary;
@@ -406,6 +417,16 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 		return ops;
 	}
 
+	// geometry / geography (spec 093 T5), always PLP: into a GEOMETRY (the WKB) or a
+	// BLOB (the WKB, or the stored bytes under geometry_as 'native'). Both stage the
+	// assembled bytes; ResolveKernel picks the kernel.
+	if (column.IsSpatialUdt() &&
+		(target_type.id() == LogicalTypeId::GEOMETRY || target_type.id() == LogicalTypeId::BLOB)) {
+		ops.kind = StagingKind::Var;
+		ops.arm = AppendArm::PlpStageBinary;
+		return ops;
+	}
+
 	// The legacy LOBs. A catalog scan casts them server-side and never produces
 	// them (spec 055 D9), but raw mssql_scan has no metadata to cast from — so
 	// they are decoded natively too rather than left as the one shape the
@@ -508,13 +529,15 @@ const char *FinalizeKernelName(FinalizeKernel kernel) {
 		return "code_page";
 	case FinalizeKernel::Variant:
 		return "variant";
+	case FinalizeKernel::Spatial:
+		return "spatial";
 	}
 	return "?";
 }
 
 ColumnOps ResolveColumnOps(const tds::ColumnMetadata &column, const LogicalType &target_type) {
 	ColumnOps ops = ResolveAppend(column, target_type);
-	ops.kernel = ResolveKernel(ops, column);
+	ops.kernel = ResolveKernel(ops, column, target_type);
 	return ops;
 }
 

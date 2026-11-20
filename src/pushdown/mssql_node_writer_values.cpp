@@ -894,6 +894,8 @@ bool NodeWriter::WritePredicateImpl(const ParsedExpression &expr, std::string &s
 			if (value.constant) {
 				return Veto("IS NULL of a constant");
 			}
+			// A geometry's IS NULL is the server's (owner, 2026-11-20): true NULLs only, a curve read as
+			// GEOMETRY being NULL here (spec 093 T5).
 			sql = ExpressionVocabulary::IsNull(value.sql,
 											   expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL);
 			return true;

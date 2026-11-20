@@ -8,9 +8,10 @@
 // Also services DuckDB GEOMETRY: type_family.cpp routes
 // LogicalTypeId::GEOMETRY to TypeFamily::Binary, so geometry/geography
 // columns (mapped to LogicalType::GEOMETRY() in mssql_column_info) reuse
-// the literal/DDL/encode paths here. The decode path is shared by
-// physical-type storage: BLOB and GEOMETRY both use string_t, so
-// DecodeFromTds writes correctly into either via AddStringOrBlob.
+// the literal/DDL/encode paths here. Their read is codec/clr/spatial_codec
+// (spec 093 T5); this decode writes a raw scan's varbinary WKB
+// (`.STAsBinary()`) into a GEOMETRY, and a geometry_as 'native' column's
+// stored bytes into a BLOB, via AddStringOrBlob.
 //
 // EncodeToBcp handles PLP vs non-PLP via col.IsPLPType(). Literal
 // format produces 0x<UPPERHEX> for both Filter and InsertValues contexts.

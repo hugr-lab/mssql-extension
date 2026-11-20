@@ -57,7 +57,7 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const tds::Request &request,
-									 const string &context_name, bool client_transcode,
+									 const string &context_name, bool client_transcode, tds::GeometryAs geometry_as,
 									 weak_ptr<tds::ConnectionPool> pool_handle, bool transaction_pinned,
 									 int query_timeout_seconds, bool reset_on_release)
 	: connection_(std::move(connection)),
@@ -66,6 +66,7 @@ MSSQLResultStream::MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connect
 	  transaction_pinned_(transaction_pinned),
 	  reset_on_release_(reset_on_release),
 	  client_transcode_(client_transcode),
+	  geometry_as_(geometry_as),
 	  sql_(request.sql),
 	  request_(request.IsRpc() ? request : tds::Request()),
 	  state_(MSSQLResultStreamState::Initializing),
@@ -189,6 +190,11 @@ bool MSSQLResultStream::Initialize() {
 				}
 				if (client_transcode_) {
 					mssql::codec::code_page::ResolveWireCodePages(column_metadata_);
+				}
+				// Spec 093 T5: what a geometry / geography column is read as, the catalog's, before its
+				// type is asked below.
+				for (auto &col : column_metadata_) {
+					col.geometry_as = geometry_as_;
 				}
 				column_names_.clear();
 				column_types_.clear();
@@ -577,9 +583,13 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 			(col_idx >= variant_notes_warned_.size() || !variant_notes_warned_[col_idx])) {
 			warnings_pending_ = true;
 		}
-		// A datetime2 value read as NULL for not fitting TIMESTAMP_NS (issue #168): spec 093 D8's warning.
-		if (column_metadata_[col_idx].type_id == tds::TDS_TYPE_DATETIME2 && !row.null_mask[col_idx] &&
-			target_vector->GetType().id() == LogicalTypeId::TIMESTAMP_NS &&
+		// A datetime2 value read as NULL for not fitting TIMESTAMP_NS (issue #168): spec 093 D8's warning;
+		// a curve or FullGlobe read as NULL for not fitting GEOMETRY: T5's.
+		const auto &meta = column_metadata_[col_idx];
+		const auto target_id = target_vector->GetType().id();
+		if (!row.null_mask[col_idx] &&
+			((meta.type_id == tds::TDS_TYPE_DATETIME2 && target_id == LogicalTypeId::TIMESTAMP_NS) ||
+			 (meta.IsSpatialUdt() && target_id == LogicalTypeId::GEOMETRY)) &&
 			FlatVector::IsNull(*target_vector, row_idx)) {
 			NoteOutOfRange(col_idx);
 		}
@@ -1011,7 +1021,8 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 	}
 
 	// Spec 093 D8: a datetime2 column read as TIMESTAMP_NS whose values outside 1677-2262 were read
-	// as NULL (issue #168), once per column per statement, as soon as the scan meets one.
+	// as NULL (issue #168), once per column per statement, as soon as the scan meets one; T5: a
+	// geometry / geography column read as GEOMETRY whose curves or FullGlobe were read as NULL, likewise.
 	if (warnings_pending_) {
 		warnings_pending_ = false;
 		for (idx_t c = 0; c < out_of_range_.size(); c++) {
@@ -1019,6 +1030,16 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 				continue;
 			}
 			out_of_range_[c] = 2;
+			if (column_metadata_[c].IsSpatialUdt()) {
+				// The ATTACH option first, as below: it is read at ATTACH.
+				DUCKDB_LOG_WARNING(context,
+								   "mssql: column \"%s\" (%s) holds values a GEOMETRY cannot hold (a CircularString, "
+								   "CompoundCurve, CurvePolygon or FullGlobe, or collections nested deeper than 15), "
+								   "read as NULL; attach with geometry_as "
+								   "'wkb' (ISO WKB, the curves included) or 'native' (the stored bytes) to read them",
+								   column_metadata_[c].name.c_str(), column_metadata_[c].udt_type_name.c_str());
+				continue;
+			}
 			// The ATTACH form first: the setting is read at ATTACH, and whoever reads this has an attached
 			// catalog, on which a bare SET changes nothing (review of #560).
 			DUCKDB_LOG_WARNING(context,

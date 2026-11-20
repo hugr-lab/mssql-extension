@@ -49,9 +49,9 @@ unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::ExecuteOn(ClientContext &conte
 	if (release_to_pool && !transaction_pinned) {
 		pool_handle = mssql_catalog.GetConnectionPoolHandle();
 	}
-	auto result_stream =
-		make_uniq<MSSQLResultStream>(std::move(connection), request, context_name_, mssql_catalog.ClientTranscode(),
-									 pool_handle, transaction_pinned, query_timeout, reset_on_release);
+	auto result_stream = make_uniq<MSSQLResultStream>(std::move(connection), request, context_name_,
+													  mssql_catalog.ClientTranscode(), mssql_catalog.GeometryAs(),
+													  pool_handle, transaction_pinned, query_timeout, reset_on_release);
 	if (!result_stream->Initialize()) {
 		throw IOException("Failed to initialize query result stream");
 	}
@@ -117,7 +117,7 @@ unique_ptr<MSSQLResultStream> MSSQLQueryExecutor::Execute(ClientContext &context
 	const bool transaction_pinned = ConnectionProvider::IsPinnedConnection(context, mssql_catalog, connection);
 	const bool reset_on_release = ConnectionProvider::ShouldResetOnRelease(context);
 	auto result_stream = make_uniq<MSSQLResultStream>(
-		std::move(connection), request, context_name_, mssql_catalog.ClientTranscode(),
+		std::move(connection), request, context_name_, mssql_catalog.ClientTranscode(), mssql_catalog.GeometryAs(),
 		mssql_catalog.GetConnectionPoolHandle(), transaction_pinned, query_timeout, reset_on_release);
 
 	// Initialize the stream (sends query, waits for COLMETADATA)

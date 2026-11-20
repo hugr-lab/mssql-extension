@@ -397,7 +397,7 @@ MSSQLColumnInfo Col(const std::string &name, int32_t id, const std::string &sql_
 					uint8_t precision, uint8_t scale, const std::string &collation = "", int32_t code_page = 1252,
 					MSSQLDatetime2Read datetime2_read = MSSQLDatetime2Read::Nanoseconds) {
 	MSSQLColumnInfo c(name, id, sql_type, max_length, precision, scale, true, collation, "SQL_Latin1_General_CP1_CI_AS",
-					  datetime2_read);
+					  datetime2_read, tds::GeometryAs::Geometry);
 	c.code_page = code_page;
 	c.database_code_page = 1252;
 	return c;
@@ -1023,10 +1023,12 @@ static void TestCastReadColumnNotPushed() {
 // decodable (sql_variant in T1) moves its read form and nothing else.
 static void TestD2AnswersAreSeparate() {
 	std::cout << "  TestD2AnswersAreSeparate..." << std::endl;
-	for (const char *t : {"sql_variant", "hierarchyid", "vector", "json", "my_clr_type"}) {
+	// geometry / geography differ since spec 093 T5: read bare (and as a BLOB under geometry_as 'wkb' /
+	// 'native') they are compared by nothing the server could push.
+	for (const char *t : {"sql_variant", "hierarchyid", "vector", "json", "my_clr_type", "geometry", "geography"}) {
 		ASSERT_TRUE(MSSQLColumnInfo::ComparisonDiffersFor(t));
 	}
-	for (const char *t : {"int", "nvarchar", "datetime2", "datetimeoffset", "uniqueidentifier", "xml", "geometry"}) {
+	for (const char *t : {"int", "nvarchar", "datetime2", "datetimeoffset", "uniqueidentifier", "xml"}) {
 		ASSERT_TRUE(!MSSQLColumnInfo::ComparisonDiffersFor(t));
 	}
 	for (const char *t : {"sql_variant", "hierarchyid", "vector", "geometry", "geography", "my_clr_type"}) {
@@ -1058,6 +1060,42 @@ static void TestJsonComparisonNotPushed() {
 	auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
 	is_null->GetChildrenMutable().push_back(ColRef(fx, COL_NAME));
 	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*is_null, ctx), "([name] IS NULL)");
+}
+
+// Spec 093 T5: a geometry read bare, here as a BLOB of its WKB (geometry_as 'wkb'): a comparison with a
+// BLOB constant runs in DuckDB (the server would compare the column, not those bytes), IS NULL is pushed.
+static void TestSpatialComparisonNotPushed() {
+	std::cout << "  TestSpatialComparisonNotPushed..." << std::endl;
+	Fixture fx;
+	std::vector<MSSQLColumnInfo> cols = {Col("id", 1, "int", 4, 10, 0), Col("dt", 2, "datetime2", 8, 27, 7),
+										 Col("flag", 3, "bit", 1, 1, 0),
+										 MSSQLColumnInfo("name", 4, "geometry", -1, 0, 0, true, "", "",
+														 MSSQLDatetime2Read::Nanoseconds, tds::GeometryAs::Wkb),
+										 Col("d", 5, "float", 8, 53, 0)};
+	ASSERT_TRUE(cols[3].comparison_differs && cols[3].IsSpatial());
+	ASSERT_TRUE(cols[3].read_form == MSSQLReadForm::Bare && cols[3].duckdb_type == LogicalType::BLOB);
+	auto ctx = fx.Context();
+	ctx.mssql_columns = &cols;
+	const uint8_t wkb[] = {0x01, 0x01, 0x00, 0x00, 0x00};
+	auto eq = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, ColRef(fx, COL_NAME),
+												Const(Value::BLOB(wkb, sizeof(wkb))));
+	ASSERT_TRUE(!FilterEncoder::EncodeSearchCondition(*eq, ctx).supported);
+	auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
+	is_null->GetChildrenMutable().push_back(ColRef(fx, COL_NAME));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*is_null, ctx), "([name] IS NULL)");
+	// Read as GEOMETRY (geometry_as 'geometry') too: IS NULL is the server's, true NULLs only (owner,
+	// 2026-11-20), where a curve is NULL here.
+	cols[3] = Col("name", 4, "geometry", -1, 0, 0);
+	ASSERT_TRUE(cols[3].duckdb_type.id() == LogicalTypeId::GEOMETRY);
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*is_null, ctx), "([name] IS NULL)");
+	// geography is GEOMETRY('OGC:CRS84') under geometry_as 'geometry', a BLOB under 'native'
+	ASSERT_TRUE(Col("g", 1, "geography", -1, 0, 0).duckdb_type == LogicalType::GEOMETRY("OGC:CRS84"));
+	ASSERT_TRUE(Col("g", 1, "geometry", -1, 0, 0).duckdb_type == LogicalType::GEOMETRY());
+	ASSERT_TRUE(MSSQLColumnInfo("g", 1, "geography", -1, 0, 0, true, "", "", MSSQLDatetime2Read::Nanoseconds,
+								tds::GeometryAs::Native)
+					.duckdb_type == LogicalType::BLOB);
+	// read bare: the column itself, no .STAsBinary()
+	ASSERT_TRUE(MSSQLColumnInfo::BuildReadExpression("g", "geography", -1, "", true, true) == "[g]");
 }
 
 // The declaration table of spec 076 W1: the column's kind, never narrower
@@ -1250,6 +1288,7 @@ int main() {
 	TestCastReadColumnNotPushed();
 	TestD2AnswersAreSeparate();
 	TestJsonComparisonNotPushed();
+	TestSpatialComparisonNotPushed();
 	TestColumnResolver();
 	TestWideningCasts();
 

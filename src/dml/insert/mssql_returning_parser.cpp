@@ -6,8 +6,11 @@
 namespace duckdb {
 
 MSSQLReturningParser::MSSQLReturningParser(const MSSQLInsertTarget &target, const vector<idx_t> &returning_column_ids,
-										   bool client_transcode)
-	: target_(target), returning_column_ids_(returning_column_ids), client_transcode_(client_transcode) {
+										   bool client_transcode, tds::GeometryAs geometry_as)
+	: target_(target),
+	  returning_column_ids_(returning_column_ids),
+	  client_transcode_(client_transcode),
+	  geometry_as_(geometry_as) {
 	// Build result types from returning column indices
 	for (auto col_idx : returning_column_ids_) {
 		if (col_idx < target_.columns.size()) {
@@ -22,6 +25,9 @@ void MSSQLReturningParser::Attach(mssql::DmlBatchOptions &options) {
 		columns_ = columns;
 		if (client_transcode_) {
 			mssql::codec::code_page::ResolveWireCodePages(columns_);
+		}
+		for (auto &col : columns_) {
+			col.geometry_as = geometry_as_;	 // spec 093 T5: a geometry / geography as the catalog reads it
 		}
 		rows_.clear();
 	};

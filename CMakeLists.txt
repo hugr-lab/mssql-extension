@@ -166,6 +166,8 @@ set(EXTENSION_SOURCES
     src/codec/uuid_codec.cpp
     src/codec/variant/variant_envelope.cpp
     src/codec/variant/variant_codec.cpp
+    src/codec/clr/ssclrt_wkb.cpp
+    src/codec/clr/spatial_codec.cpp
     # Backup reader (spec 085): the parsers over byte spans, DuckDB-free (D15).
     src/backup/backup_allocation.cpp
     src/backup/backup_boot.cpp

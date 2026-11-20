@@ -7,6 +7,7 @@
 #include "codec/staging/row_stager.hpp"
 
 #include "codec/binary_codec.hpp"
+#include "codec/clr/spatial_codec.hpp"
 #include "codec/code_page/code_page_codec.hpp"
 #include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
@@ -332,6 +333,9 @@ void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t 
 		break;
 	case FinalizeKernel::Variant:
 		variant::DecodeChunkFromStaging(st, count, meta, out, variant_notes);
+		break;
+	case FinalizeKernel::Spatial:
+		spatial::DecodeChunkFromStaging(st, count, meta, out);
 		break;
 	}
 }
@@ -679,12 +683,14 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		}
 		const ColumnStaging &st = *staging_[c];
 		const tds::ColumnMetadata &meta = (*metadata_)[c];
-		// A datetime2 read as TIMESTAMP_NS is the one kernel that reads a value as NULL (issue #168):
-		// counted for spec 093 D8's warning. The kernel's NULLs are in the mask before the staged
-		// validity is ANDed in, so the mask's NULLs then are exactly the values that did not fit.
-		const bool out_of_range_counted = ops_[c].kernel == FinalizeKernel::Datetime &&
-										  meta.type_id == tds::TDS_TYPE_DATETIME2 &&
-										  targets_[c]->GetType().id() == LogicalTypeId::TIMESTAMP_NS;
+		// Two kernels read a value as NULL for not fitting the target: a datetime2 read as TIMESTAMP_NS
+		// (issue #168, spec 093 D8's warning) and a curve or FullGlobe read as GEOMETRY (spec 093 T5).
+		// Counted for the stream's WARNING. The kernel's NULLs are in the mask before the staged validity
+		// is ANDed in, so the mask's NULLs then are exactly the values that did not fit.
+		const bool out_of_range_counted =
+			(ops_[c].kernel == FinalizeKernel::Datetime && meta.type_id == tds::TDS_TYPE_DATETIME2 &&
+			 targets_[c]->GetType().id() == LogicalTypeId::TIMESTAMP_NS) ||
+			(ops_[c].kernel == FinalizeKernel::Spatial && targets_[c]->GetType().id() == LogicalTypeId::GEOMETRY);
 		chunk_out_of_range_[c] = 0;
 		if (TryEmitConstant(c, st, meta, row_count)) {
 			chunk_nulls_[c] = st.null_count;
@@ -875,6 +881,9 @@ void RowStager::DecodeFirstValue(idx_t c, const ColumnStaging &st, const tds::Co
 		break;
 	case FinalizeKernel::CodePage:
 		code_page::DecodeFromTds(bytes, meta, out, 0);
+		break;
+	case FinalizeKernel::Spatial:
+		spatial::DecodeFromTds(bytes, meta, out, 0);
 		break;
 	case FinalizeKernel::Variant:  // never constant (TryEmitConstant)
 	case FinalizeKernel::None:

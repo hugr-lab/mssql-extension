@@ -14,9 +14,10 @@
 #   TDS parse error: COLMETADATA parse error: Unsupported SQL Server type: UDT
 #
 # The read path had already solved this for the same columns, and OUTPUT accepts
-# the same expressions: `.STAsBinary()` for the spatial UDTs, whose bytes then
-# arrive as the OGC WKB a DuckDB GEOMETRY wants, and a CAST to NVARCHAR(MAX) for
-# the types with no decodable wire form.
+# the same expressions: since spec 093 T5 the spatial UDTs bare, their MS-SSCLRT
+# bytes decoded on the client into the ISO WKB a DuckDB GEOMETRY holds (until
+# then `.STAsBinary()`), and a CAST to NVARCHAR(MAX) for the types with no
+# decodable wire form.
 
 require mssql
 

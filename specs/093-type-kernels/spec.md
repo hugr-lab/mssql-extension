@@ -410,6 +410,76 @@ A raw `mssql_scan` takes the type from UDT_INFO's type name (geometry, geography
   it.
 - A CTAS or COPY from `GEOMETRY`, any CRS, creates `geometry` (DQ-45); today it creates
   `VARBINARY(MAX)`.
+- **The write's codec is vectorized too** (owner, 2026-11-20): WKB → MS-SSCLRT on the client, a column at
+  a time with no allocation per value, as the read's kernel. If G4 shows the server takes client-built
+  bytes on the bulk wire, COPY / INSERT BULK / the staged DML send them directly and skip the stage's
+  `STGeomFromWKB`; the statement path's literal can carry them too (`CAST(0x… AS geometry)`, G7).
+
+**T5 as built** (2026-11-20).
+- **The kernel**: `codec/clr/ssclrt_wkb.{hpp,cpp}` (`ToWkb`), DuckDB-free, G1's prototype in C++. It
+  checks everything the writer relies on and refuses by name (`SpatialStatus`): a value cut short or with
+  bytes after it, a version other than 1 / 2, an undefined property bit or P with L, a figure out of
+  order or past the points or with an attribute past 3, a shape whose parent is not a collection before
+  it or not on the depth-first path, a MULTI* member of another type, a leaf with the wrong number of
+  figures or points, a curve in version 1, a FullGlobe anywhere but alone, segments that do not cut a
+  compound's points or are left over, collections nested past 64. Past DuckDB's 15 (its
+  `MAX_RECURSION_DEPTH`) a value is `NotGeometry`, as a curve is. Every prefix of every G1 value is
+  refused (`test_ssclrt`).
+- **POINT EMPTY, decided where the owner left room**: DuckDB's POINT EMPTY (a point of NaN in every
+  dimension, Z / M included) wherever a POINT is stored with no figure -- the value, a GEOMETRYCOLLECTION
+  member, **and a MULTIPOINT member**, which the server leaves out. One rule: the value as stored, and
+  what DuckDB itself makes of `MULTIPOINT(1 2, EMPTY)` (a NaN member). The other EMPTY members (a
+  LINESTRING, POLYGON or collection EMPTY in a MULTI* or a collection) are the server's form. Five G1
+  values differ from `AsBinaryZM()` for it: `point_empty`, `g_point_empty`, `mpoint_with_empty`,
+  `mpoint_z_empty`, `gc_with_empty`; the other 60 are its bytes. (T6: the server refuses a NaN point, so
+  each of these writes back only once the writer rewrites it.)
+- **The codec**: `codec/clr/spatial_codec` (`FinalizeKernel::Spatial`, the per-value and constant
+  paths). A GEOMETRY target is decoded whatever `geometry_as` says (a raw scan's `column_types :=
+  ['GEOMETRY']` under `'native'`); a BLOB target is the WKB under `'wkb'`, the binary kernel's bytes
+  under `'native'`. A malformed value is an error naming the column.
+- **`geometry_as`**: an ATTACH option of `TYPE mssql` only (no setting: DQ-45 names an ATTACH option),
+  parsed before the network (`ParseGeometryAs`), held in `MSSQLCatalogStartup::geometry_as` and set on
+  `tds::ColumnMetadata::geometry_as` by every reader of a catalog's COLMETADATA -- the stream after
+  COLMETADATA, the describe, sp_prepare's answer, the RETURNING parser -- before its type is asked; the
+  column type follows it in `MSSQLColumnInfo` (`'wkb'` / `'native'`: BLOB). **Not registered on the
+  backup side**: there a spatial column is its stored bytes until T8 hooks the kernel, and a
+  `geometry_as` defaulting to `'geometry'` would have named bytes; a TODO in `TypeReading` says so.
+- **The warning**: one per column per stream, as D8's (the stager's `ChunkOutOfRange` counts the
+  kernel's NULLs; `SurfaceWarnings` words it by the column's type): `mssql: column "g" (geometry) holds
+  values a GEOMETRY cannot hold (a CircularString, CompoundCurve, CurvePolygon or FullGlobe, or
+  collections nested deeper than 15), read as NULL; attach with geometry_as 'wkb' (ISO WKB, the curves
+  included) or 'native' (the stored bytes) to read them`. The stream knows the column, not its table, so the table is not named (D8's form).
+- **Comparisons**: `ComparisonDiffersFor` now names geometry / geography (D2's third answer: under
+  `'wkb'` / `'native'` a `BLOB` filter would otherwise have been pushed against the column), so a
+  filter on one runs in DuckDB; `IsSpatial()` asks the type name now that the read form is `Bare` (the
+  `SpatialBinary` form is gone). `IS NULL` / `IS NOT NULL` and `COUNT(col)` are pushed, in every
+  `geometry_as` (owner, 2026-11-20, on the review of T5, which had them vetoed): the server answers by the
+  real values, so a `DELETE … WHERE g IS NULL` cannot take a curve's row, which DuckDB reads as NULL; the
+  server's `IS NOT NULL` / `COUNT` count the curves, documented. What DuckDB computes over the column does
+  see NULL (`SET g = <expr over g>`, `coalesce(g, …)`, a cross-catalog `INSERT … SELECT`): documented,
+  with `'wkb'` the way to keep curves. The same divergence exists for a `datetime2(7)` read as NULL under
+  D8's default, unchanged here.
+- **Writes** untouched: `BulkWireTakesType` still refuses spatial, the statement path still wraps the
+  WKB in `STGeomFromWKB` (which takes ISO Z / M, G7). Under `'native'` the values are the stored bytes,
+  which `STGeomFromWKB` would refuse with an opaque 24xxx error: an INSERT naming such a column, or an
+  UPDATE setting one, is refused by name at planning (`RefuseNativeSpatialWrite`, review of T5); a DML
+  pushed whole copies on the server and is not affected.
+- **Cost** (review of T5, after G6's first measure, 163 ns a value end to end): the decoder
+  (`WkbDecoder`) is kept for the column-chunk, its arrays cleared but not freed, so a column allocates
+  nothing per value once it has met its widest; a single point or line (P / L) takes a path that
+  checks the length and writes the header and the points, with no arrays and no shape walk; the WKB is
+  sized first (a walk counting lengths, which also checks the segments) and written straight into the
+  vector's string heap, no buffer copied after; coordinates are copied eight bytes at a time. Measured
+  on the M-series laptop, kernel alone: a geography point 150 -> 7.5 ns, a polygon of two rings 44 ns;
+  staged and decoded, 18.5 ns a point (`test_ssclrt`'s printed throughput). A WKB past 4 GiB (a DuckDB
+  string's length is 32 bits) is refused by name (`TooLarge`).
+- **Tests**: `test/cpp/codec/test_ssclrt.cpp` (G1's 65 stored values with their expected WKB, the
+  server's `AsBinaryZM()` but for the five above; both modes; DuckDB's `Geometry::FromBinary` takes every
+  non-curve output unchanged; every prefix refused; malformed values by status; the stager, constant and
+  per-value paths under each `geometry_as`); `test/sql/types/spatial_read.test` (the G1 values on a
+  server: every value against `AsBinaryZM()` / `CAST(g AS varbinary(max))`, the curves NULL with the
+  warning, the raw scan in its three binds, the 079 vehicle, RETURNING, a Z / M value written back);
+  `fuzz_ssclrt`, seeded from G1's stored bytes.
 
 ### D7: `json` → `JSON`
 
@@ -480,7 +550,7 @@ each later type PR hooks its own kernel.
 | `VARIANT` values write into `sql_variant` in their own base types | T2 | no (was a string base type) |
 | `vector(n)` tables are readable, as `FLOAT[n]`; writes and CTAS `vector(n)` | T3 | no (was unreadable) |
 | `hierarchyid` decoded on the client, raw scans read it | T4 | no (same text) |
-| `geography` is `GEOMETRY('OGC:CRS84')`; Z / M kept; curves / FullGlobe a named error with `geometry_as` | T5 | **yes**: the type of geography columns; the WKB of values with Z / M; a curve that read before (as whatever `STAsBinary()` emitted) now fails |
+| `geography` is `GEOMETRY('OGC:CRS84')`; Z / M kept; curves / FullGlobe NULL with a WARNING, `geometry_as` | T5 | **yes**: the type of geography columns; the WKB of values with Z / M; POINT EMPTY; a curve that read before (as whatever `STAsBinary()` emitted) now reads NULL |
 | spatial COPY / INSERT BULK / staged DML; SRID from the CRS; CTAS creates `geometry` | T6 | **yes**: CTAS from GEOMETRY creates geometry, not VARBINARY(MAX) |
 | `json` is `JSON` | T7 | slightly: the type name |
 | the backup reads the types above instead of their bytes | T8 | yes for backup users of PR 2's `BLOB`s; the backup reader is unreleased |

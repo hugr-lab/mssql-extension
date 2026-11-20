@@ -182,7 +182,8 @@ public:
 
 	//! Values of column `c` in the chunk just finalized that its kernel read as NULL because they do
 	//! not fit the target -- a datetime2 outside 1677-2262 read as TIMESTAMP_NS (issue #168; spec 093
-	//! D8's warning). Counted only for a datetime2 column read as TIMESTAMP_NS, else 0.
+	//! D8's warning), a curve or FullGlobe read as GEOMETRY (spec 093 T5). Counted only for a datetime2
+	//! column read as TIMESTAMP_NS and a spatial one read as GEOMETRY, else 0.
 	idx_t ChunkOutOfRange(idx_t c) const {
 		return chunk_out_of_range_[c];
 	}

@@ -1,14 +1,15 @@
 # name: test/sql/catalog/geometry_scan.test
-# description: SQL Server geometry/geography columns auto-rewritten to STAsBinary() →
-#   delivered as OGC WKB → land in DuckDB LogicalType::GEOMETRY() vectors via the
-#   Binary codec. Spec 045 / Phase 6 sub-phase 5 (Binary + Geometry).
+# description: SQL Server geometry/geography columns read bare (UDT 0xF0) and decoded on
+#   the client from their MS-SSCLRT bytes into ISO WKB in DuckDB GEOMETRY vectors
+#   (spec 093 T5; spec 045 read them through .STAsBinary()). geography is
+#   GEOMETRY('OGC:CRS84'), geometry GEOMETRY. The values themselves: spatial_read.test.
 # group: [sql]
 #
 # Setup pattern:
 #   - table with one geometry + one geography column
 #   - INSERT a Point via SQL Server's geometry::STGeomFromText (server-side parse)
-#   - SELECT the columns — extension auto-projects .STAsBinary(), wire delivers WKB,
-#     DuckDB stores in GEOMETRY vector
+#   - SELECT the columns — read bare, decoded on the client into WKB, DuckDB
+#     stores it in the GEOMETRY vector
 #   - Verify the column type is GEOMETRY and the WKB byte length matches expected
 #     21 bytes (1 endian + 4 type + 8 x + 8 y for a 2D point).
 
@@ -37,18 +38,19 @@ SELECT mssql_exec('geo', 'INSERT INTO dbo.geo_test (id, shape, where_at) VALUES 
 statement ok
 SELECT mssql_refresh_cache('geo');
 
-# Catalog should report the geometry/geography columns as DuckDB GEOMETRY.
+# Catalog should report the geometry/geography columns as DuckDB GEOMETRY, geography's
+# labelled OGC:CRS84 (spec 093 T5, DQ-45).
 query II
 SELECT column_name, column_type FROM (DESCRIBE SELECT id, shape, where_at FROM geo.dbo.geo_test) ORDER BY column_name;
 ----
 id	INTEGER
 shape	GEOMETRY
-where_at	GEOMETRY
+where_at	GEOMETRY('OGC:CRS84')
 
 # Core regression: SELECT against geometry/geography MUST NOT crash. Pre-spec-045
 # this either produced raw MS Spatial Binary Format bytes (uninterpretable) or
-# crashed on the UDT dispatch. Post-spec-045 the columns auto-project STAsBinary()
-# and arrive as WKB blobs in GEOMETRY vectors.
+# crashed on the UDT dispatch. Post-spec-045 the columns auto-projected STAsBinary();
+# since spec 093 T5 they arrive bare and are decoded on the client.
 statement ok
 SELECT id, shape, where_at FROM geo.dbo.geo_test ORDER BY id;
 

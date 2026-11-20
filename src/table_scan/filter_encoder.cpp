@@ -672,7 +672,9 @@ FilterEncoderResult FilterEncoder::Encode(const TableFilterSet *filters, const s
 		// Issue #514: a column read through a cast (sql_variant, hierarchyid, a CLR type) is
 		// compared in DuckDB as the text the cast gave, and on the server as itself, by its own
 		// rules: an int 5 in a sql_variant is not N'5' there. json is compared by nothing but
-		// IS NULL on the server (J1). The filter runs in DuckDB, over what DuckDB read.
+		// IS NULL on the server (J1). The filter runs in DuckDB, over what DuckDB read. An IS NULL test goes to
+		// the server, a geometry's too (owner, 2026-11-20): there it matches true NULLs only, where a curve read
+		// as GEOMETRY is NULL here (spec 093 T5) -- a DELETE ... WHERE g IS NULL leaves the curves alone.
 		if (ctx.filter_column_info && ctx.filter_column_info->comparison_differs &&
 			!IsNullTestFilter(filter_entry.Filter())) {
 			MSSQL_FILTER_DEBUG_LOG(2, "  %s compares unlike DuckDB on the server: filtered in DuckDB",

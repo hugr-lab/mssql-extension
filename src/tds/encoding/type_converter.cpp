@@ -6,6 +6,7 @@
 #include <sstream>
 #include "codec/binary_codec.hpp"
 #include "codec/boolean_codec.hpp"
+#include "codec/clr/spatial_codec.hpp"
 #include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
@@ -140,15 +141,22 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata &column) {
 	case TDS_TYPE_IMAGE:
 		return LogicalType::BLOB;
 
-	// Not read by a raw scan yet (spec 093 T4, T5). Their COLMETADATA and rows are parsed (T0), so
-	// the refusal names the type; an attached catalog reads them through a server-side conversion.
+	// A CLR type. geometry / geography (spec 093 T5, D6) are decoded on the client: GEOMETRY of the ISO WKB,
+	// geography's labelled OGC:CRS84 (DQ-45), or a BLOB under the catalog's geometry_as 'wkb' / 'native'.
+	// The rest are not read by a raw scan yet (T4): their COLMETADATA and rows are parsed (T0), so the
+	// refusal names the type; an attached catalog reads them through a server-side conversion.
 	case TDS_TYPE_UDT: {
+		if (column.IsSpatialUdt()) {
+			if (column.geometry_as != GeometryAs::Geometry) {
+				return LogicalType::BLOB;
+			}
+			return column.IsGeographyUdt() ? LogicalType::GEOMETRY("OGC:CRS84") : LogicalType::GEOMETRY();
+		}
 		const std::string type_name =
 			column.udt_type_name.empty() ? std::string("UDT") : column.udt_schema + "." + column.udt_type_name;
 		throw InvalidInputException(
 			"MSSQL Error: column '%s' is of the CLR type %s, which a raw mssql_scan does not read yet. Read it "
-			"through an attached catalog, or convert it in the query (geometry / geography: .STAsBinary(); "
-			"hierarchyid and other CLR types: CAST(... AS nvarchar(max))).",
+			"through an attached catalog, or convert it in the query (CAST(... AS nvarchar(max))).",
 			column.name.c_str(), type_name.c_str());
 	}
 	// sql_variant (spec 093 T1, D3): each value a VARIANT of its base type.
@@ -344,6 +352,20 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY:
 		mssql::codec::binary::DecodeFromTds(value, column, vector, row_idx);
+		break;
+
+	// geometry / geography (spec 093 T5): the WKB the client decodes, or under geometry_as 'native' the
+	// stored bytes into a BLOB. Into a GEOMETRY it is always the WKB, whatever geometry_as says.
+	case TDS_TYPE_UDT:
+		if (!column.IsSpatialUdt()) {
+			throw InvalidInputException("Type conversion not implemented for the CLR type %s.%s", column.udt_schema,
+										column.udt_type_name);
+		}
+		if (vector.GetType().id() == LogicalTypeId::BLOB && column.geometry_as == GeometryAs::Native) {
+			mssql::codec::binary::DecodeFromTds(value, column, vector, row_idx);
+		} else {
+			mssql::codec::spatial::DecodeFromTds(value, column, vector, row_idx);
+		}
 		break;
 
 	case TDS_TYPE_DATE:

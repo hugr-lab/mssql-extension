@@ -754,6 +754,29 @@ spec 093 D3's table -- a string through spec 091's code-page kernels by its own 
 in the vector. The column stays out of pushed comparisons and keys (`comparison_differs`): the server
 compares a `sql_variant` by its base type (#514).
 
+**`geometry` / `geography` are decoded on the client (spec 093 T5, D6).** The column is read bare: a
+UDT (`0xF0`, PLP) carrying the stored MS-SSCLRT bytes (G2), staged on the PLP binary arm. The
+`Spatial` kernel (`codec/clr/spatial_codec`, one call a column-chunk) hands each value to
+`codec/clr/ssclrt_wkb` (DuckDB-free, fuzzed by `fuzz_ssclrt`), which checks the header, the point,
+figure and shape arrays and the segments against the value's length and writes little-endian ISO WKB,
+the form DuckDB's `GEOMETRY` stores: Z / M by their ISO codes, a geography's latitude-first points
+swapped, NaN canonical, POINT EMPTY as a point of NaN (owner's rule, G1), the curves 8 - 10 and
+FullGlobe's 126 when asked for. What the column is follows the catalog's `geometry_as`, fixed at ATTACH
+(`MSSQLCatalogStartup::geometry_as`) and carried to every reader of its COLMETADATA on
+`tds::ColumnMetadata::geometry_as` -- the stream, the describe, sp_prepare's answer, the RETURNING
+parser -- before `TypeConverter::GetDuckDBType` is asked:
+
+| `geometry_as` | column type | kernel |
+|---|---|---|
+| `geometry` | `GEOMETRY` / `GEOMETRY('OGC:CRS84')` (geography) | `Spatial`: a curve or FullGlobe set NULL, counted by the stager (`ChunkOutOfRange`, as D8's datetime2), one WARNING per column per stream |
+| `wkb` | `BLOB` | `Spatial`, curves written |
+| `native` | `BLOB` | `Binary`: the bytes as they arrived |
+
+A `GEOMETRY` target is decoded whatever `geometry_as` says (a raw scan's `column_types`). The column is
+out of pushed comparisons, ORDER BY and keys (`comparison_differs`, `IsSpatial()`); `IS NULL` and
+`COUNT(col)` are pushed, so they answer by the server's values (a curve, NULL here under `'geometry'`, is
+not NULL there: a `DELETE … WHERE g IS NULL` leaves it).
+
 ### Reading a column's collation
 
 `ColumnMetadata` carries all five wire bytes of the TDS collation

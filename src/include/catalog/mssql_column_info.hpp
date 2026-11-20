@@ -3,6 +3,7 @@
 #include <string>
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "tds/tds_column_metadata.hpp"
 
 namespace duckdb {
 
@@ -26,12 +27,16 @@ enum class MSSQLDatetime2Read : uint8_t { Nanoseconds, Microseconds };
 //! anything else.
 MSSQLDatetime2Read ParseDatetime2Read(const string &value, const string &source);
 
-//! How the scan reads a column (spec 093 D2): as itself; through a server-side cast, for a type the
-//! extension does not decode yet (sql_variant's CASE, hierarchyid and CLR types as NVARCHAR(MAX):
-//! BuildReadExpression); or as OGC WKB through `.STAsBinary()` (geometry, geography). A type's PR
-//! moves it to Bare when its kernel lands; what the server's comparison does with it is a separate
-//! answer (MSSQLColumnInfo::comparison_differs).
-enum class MSSQLReadForm : uint8_t { Bare, ServerCast, SpatialBinary };
+//! The `geometry_as` ATTACH option (spec 093 T5, D6): `'geometry'` / `'wkb'` / `'native'` (any case,
+//! trimmed); an InvalidInputException naming `source` for anything else.
+tds::GeometryAs ParseGeometryAs(const string &value, const string &source);
+
+//! How the scan reads a column (spec 093 D2): as itself, or through a server-side cast, for a type the
+//! extension does not decode yet (hierarchyid and CLR types as NVARCHAR(MAX): BuildReadExpression).
+//! A type's PR moves it to Bare when its kernel lands (sql_variant T1, geometry / geography T5, read
+//! as their UDT bytes and decoded on the client); what the server's comparison does with it is a
+//! separate answer (MSSQLColumnInfo::comparison_differs).
+enum class MSSQLReadForm : uint8_t { Bare, ServerCast };
 
 //===----------------------------------------------------------------------===//
 // MSSQLColumnInfo - Column metadata including SQL Server-specific information
@@ -69,15 +74,14 @@ struct MSSQLColumnInfo {
 									 // the metadata loaders after construction, like is_identity (issue #361)
 	int32_t database_code_page = 0;	 // The same for the database collation — a varchar PARAMETER takes
 									 // this page, so a constant must fit both (mssql::CodePageCanEncode)
-	MSSQLReadForm read_form;		 // How the scan reads it (ReadFormFor). SpatialBinary: the scan projects
-									 // [col].STAsBinary() AS [col], so the wire delivers OGC WKB, which lands
-									 // in a LogicalType::GEOMETRY() vector through the Binary codec.
+	MSSQLReadForm read_form;		 // How the scan reads it (ReadFormFor).
 	//! The server compares, orders, groups or keys a value of this type unlike DuckDB's read of it
 	//! (ComparisonDiffersFor), whatever its read form: a filter on it runs in DuckDB, it is never a
 	//! rowid key or a MERGE key, an ORDER BY on it is not pushed (#514: a pushed filter on a
 	//! sql_variant dropped rows; json, which the server compares by IS NULL alone, J1; an IS NULL
-	//! test is still pushed). Spatial types are left out here and named by IsSpatial() where they
-	//! matter, as before spec 093 split the flag.
+	//! test is still pushed). Spatial types are on it since spec 093 T5 (a geometry read as a BLOB,
+	//! geometry_as 'wkb' / 'native', is no varbinary on the server), and are named by IsSpatial()
+	//! too where they always were.
 	bool comparison_differs;
 	bool is_identity;  // sys.columns.is_identity (spec 062 W4, issue #327). Set by the
 					   // metadata loaders after construction; the INSERT planner keeps a
@@ -88,14 +92,14 @@ struct MSSQLColumnInfo {
 	MSSQLColumnInfo();
 
 	bool IsSpatial() const {
-		return read_form == MSSQLReadForm::SpatialBinary;
+		return IsSpatialType(sql_type_name);
 	}
 
-	// Constructor from SQL Server metadata. `datetime2_read`: the catalog's answer (no default: a
-	// datetime2(7) column's type follows it).
+	// Constructor from SQL Server metadata. `datetime2_read`, `geometry_as`: the catalog's answers (no
+	// default: a datetime2(7) column's type follows the one, a geometry / geography column's the other).
 	MSSQLColumnInfo(const string &name, int32_t column_id, const string &sql_type_name, int16_t max_length,
 					uint8_t precision, uint8_t scale, bool is_nullable, const string &collation_name,
-					const string &database_collation, MSSQLDatetime2Read datetime2_read);
+					const string &database_collation, MSSQLDatetime2Read datetime2_read, tds::GeometryAs geometry_as);
 
 	//! A datetime2 column read with its 100 ns digit truncated (MSSQLDatetime2Read::Microseconds at scale 7):
 	//! not one-to-one, so compared and keyed as time(7) is. Asked of the column's read type.
@@ -155,11 +159,11 @@ struct MSSQLColumnInfo {
 	static LogicalType MapSQLServerTypeToDuckDB(const string &sql_type_name, int16_t max_length, uint8_t precision,
 												uint8_t scale, MSSQLDatetime2Read datetime2_read);
 
-	// The two spatial CLR UDTs, by name. ONE predicate, because four things key
-	// on the same pair and they have to agree: the catalog sets the read form
-	// SpatialBinary from it, the type map answers GEOMETRY() from it, `IsKnownSQLServerType`
-	// admits them from it, and the DML literal renderer decides from it whether
-	// to wrap a value in the server's WKB reader. If the routing and the
+	// The two spatial CLR UDTs, by name. ONE predicate, because several things key
+	// on the same pair and they have to agree: the type map answers GEOMETRY from
+	// it, `IsKnownSQLServerType` admits them from it, IsSpatial() keeps them out of
+	// keys and the 079 writer from it, and the DML literal renderer decides from it
+	// whether to wrap a value in the server's WKB reader. If the routing and the
 	// rendering ever disagreed the failure would be silent in one direction
 	// (WKB sent as text on the bulk wire) and a server error in the other.
 	static bool IsSpatialType(const string &sql_type_name);
@@ -196,8 +200,8 @@ struct MSSQLColumnInfo {
 	//! value still failed the whole INSERT with `Unsupported type in RowReader:
 	//! TEXT` while the very same column read fine through a SELECT.
 	//!
-	//!   - spatial UDTs -> `.STAsBinary()`, so the wire carries OGC WKB rather
-	//!     than SQL Server's own Spatial Type Binary Format;
+	//!   - spatial UDTs are read bare since spec 093 T5: the wire carries the
+	//!     MS-SSCLRT bytes, decoded on the client (codec/clr/ssclrt_wkb.hpp);
 	//!   - `ntext` -> `NVARCHAR(MAX)`, `image` -> `VARBINARY(MAX)`: the per-value
 	//!     decoders have no arm for their wire tokens;
 	//!   - a type with no decodable wire form at all (sql_variant, hierarchyid,

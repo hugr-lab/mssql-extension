@@ -1070,10 +1070,10 @@ namespace {
 //! Can the bulk-load wire carry a column of this SQL Server type?
 //!
 //! Two families cannot. The **spatial CLR UDTs** are readable — the scan
-//! rewrites them to `.STAsBinary()` and they arrive as WKB, which is why
-//! `IsKnownSQLServerType` admits them — but their WIRE form on the way back is
-//! SQL Server's own Spatial Type Binary Format, not those bytes, so a bulk load
-//! cannot send them. And the types with no decodable wire form at all
+//! decodes their stored bytes into WKB on the client (spec 093 T5), which is why
+//! `IsKnownSQLServerType` admits them — but a DuckDB GEOMETRY holds WKB, not
+//! SQL Server's own Spatial Type Binary Format the column takes, so a bulk load
+//! cannot send them (spec 093 T6). And the types with no decodable wire form at all
 //! (`sql_variant`, `hierarchyid`, any other CLR UDT) are exactly the ones
 //! `IsKnownSQLServerType` already rejects.
 //!

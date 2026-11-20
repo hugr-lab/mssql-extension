@@ -123,12 +123,15 @@ enum class FinalizeKernel : uint8_t {
 	CodePage,
 	//! Spec 093 T1: a SQL_VARIANT column, each value written as a VARIANT
 	//! (`src/codec/variant/variant_codec.cpp`).
-	Variant
+	Variant,
+	//! Spec 093 T5: a geometry / geography column (UDT, PLP) into GEOMETRY or
+	//! BLOB, each value its ISO WKB (`src/codec/clr/spatial_codec.cpp`).
+	Spatial
 };
 
 //! Number of FinalizeKernel values, for counter arrays.
-static const uint8_t FINALIZE_KERNEL_COUNT = 10;
-static_assert(FINALIZE_KERNEL_COUNT == static_cast<uint8_t>(FinalizeKernel::Variant) + 1,
+static const uint8_t FINALIZE_KERNEL_COUNT = 11;
+static_assert(FINALIZE_KERNEL_COUNT == static_cast<uint8_t>(FinalizeKernel::Spatial) + 1,
 			  "a new kernel must not index past the counter arrays");
 
 //! Short lowercase name, for the debug counters.

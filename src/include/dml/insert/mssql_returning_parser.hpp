@@ -39,8 +39,9 @@ public:
 	// @param target Insert target with column metadata
 	// @param returning_column_ids Column indices to return (maps to OUTPUT INSERTED columns)
 	// @param client_transcode The catalog's answer (spec 092 D4); no default, as on MSSQLResultStream
+	// @param geometry_as The catalog's answer (spec 093 T5); no default, likewise
 	MSSQLReturningParser(const MSSQLInsertTarget &target, const vector<idx_t> &returning_column_ids,
-						 bool client_transcode);
+						 bool client_transcode, tds::GeometryAs geometry_as);
 
 	//! Route the result sets of the statement `options` runs into this parser.
 	//! The parser must outlive that call.
@@ -68,6 +69,7 @@ private:
 	vector<idx_t> returning_column_ids_;
 
 	bool client_transcode_;
+	tds::GeometryAs geometry_as_;
 
 	// Result types (derived from returning columns)
 	vector<LogicalType> result_types_;

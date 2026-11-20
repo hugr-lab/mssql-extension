@@ -57,8 +57,10 @@ public:
 	// client_transcode: the catalog's answer (spec 092 D4), fixed at ATTACH. No
 	//                   default: a caller must not keep verbatim bytes by forgetting
 	//                   it, nor transcode a catalog that turned it off.
+	// geometry_as: the catalog's (spec 093 T5), fixed at ATTACH: what a geometry /
+	//              geography column is read as. No default, for the same reason.
 	MSSQLResultStream(std::shared_ptr<tds::TdsConnection> connection, const tds::Request &request,
-					  const string &context_name, bool client_transcode,
+					  const string &context_name, bool client_transcode, tds::GeometryAs geometry_as,
 					  weak_ptr<tds::ConnectionPool> pool_handle = weak_ptr<tds::ConnectionPool>(),
 					  bool transaction_pinned = false, int query_timeout_seconds = 30,
 					  bool reset_on_release = tds::DEFAULT_RESET_CONNECTION);
@@ -232,6 +234,8 @@ private:
 	bool reset_on_release_;
 	// The catalog's mssql_client_transcode, fixed at ATTACH (spec 092 D4).
 	bool client_transcode_;
+	// The catalog's geometry_as, fixed at ATTACH (spec 093 T5).
+	tds::GeometryAs geometry_as_;
 
 	// Query
 	string sql_;

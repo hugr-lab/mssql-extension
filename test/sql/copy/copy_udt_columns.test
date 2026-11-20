@@ -187,14 +187,15 @@ SELECT mssql_invalidate_cache('udtc');
 # the catalog queries already used a LEFT JOIN with a TYPE_NAME fallback, so
 # CLR UDT columns were visible there. This is here as the regression guard for
 # the resolver change, and for the identical substitution those four queries
-# got in the same change. Both spatial types map to DuckDB GEOMETRY, which is
-# why `gg` is not its own thing.
+# got in the same change. Both spatial types map to DuckDB GEOMETRY; since
+# spec 093 T5 (DQ-45) geography's is labelled OGC:CRS84 (WGS 84, longitude
+# first), geometry's has no CRS.
 query II
 SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = 'UdtShapes' ORDER BY column_index;
 ----
 id	INTEGER
 g	GEOMETRY
-gg	GEOMETRY
+gg	GEOMETRY('OGC:CRS84')
 h	VARCHAR
 v	VARIANT
 n	MSSQL_NVARCHAR(10)

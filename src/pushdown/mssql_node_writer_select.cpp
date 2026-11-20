@@ -213,6 +213,7 @@ bool NodeWriter::WriteAggregate(const AggregateCall &call, AggregateKind kind, O
 			// The server's COUNT refuses them (8117, measured in PR E2).
 			return Veto("count over " + type);
 		}
+		// A geometry's COUNT is the server's (owner, 2026-11-20): it counts a curve, NULL here (spec 093 T5).
 		out.sql = over("COUNT_BIG(" + distinct + arg.sql + ")");
 		out.type = out.result_type = LogicalType::BIGINT;
 		out.orderable = out.not_null = true;
