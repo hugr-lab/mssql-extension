@@ -1029,15 +1029,18 @@ static void TestD2AnswersAreSeparate() {
 	for (const char *t : {"int", "nvarchar", "datetime2", "datetimeoffset", "uniqueidentifier", "xml", "geometry"}) {
 		ASSERT_TRUE(!MSSQLColumnInfo::ComparisonDiffersFor(t));
 	}
-	for (const char *t : {"sql_variant", "hierarchyid", "vector", "geometry", "geography", "my_clr_type"}) {
+	for (const char *t : {"hierarchyid", "geometry", "geography", "my_clr_type"}) {
 		ASSERT_TRUE(!MSSQLColumnInfo::BulkWireTakesType(t));
 	}
-	for (const char *t : {"int", "nvarchar", "datetime2", "rowversion", "json", "xml"}) {
+	// vector and sql_variant joined the bulk wire in their own write PRs (spec 093 T3: its bytes as
+	// varbinary, V6; T2: SSVARIANT envelopes, S2), and stay out of comparisons (above).
+	for (const char *t : {"int", "nvarchar", "datetime2", "rowversion", "json", "xml", "vector", "sql_variant"}) {
 		ASSERT_TRUE(MSSQLColumnInfo::BulkWireTakesType(t));
 	}
 	// Case as the server spells it in sys.types, or not.
 	ASSERT_TRUE(MSSQLColumnInfo::ComparisonDiffersFor("JSON"));
-	ASSERT_TRUE(!MSSQLColumnInfo::BulkWireTakesType("SQL_VARIANT"));
+	ASSERT_TRUE(MSSQLColumnInfo::BulkWireTakesType("SQL_VARIANT"));
+	ASSERT_TRUE(!MSSQLColumnInfo::BulkWireTakesType("HIERARCHYID"));
 }
 
 // J1 (measured/J1.md): the 2025 json type is compared by nothing but IS NULL on the server (402,

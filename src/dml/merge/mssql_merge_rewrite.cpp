@@ -185,7 +185,8 @@ private:
 	void CheckOnColumns(const Expression &conjunct) const;
 	string ConditionSql(const Expression &condition, MergeScope scope, const string &what);
 	void StripAssignmentCast(unique_ptr<Expression> &expr, const LogicalType &column_type) const;
-	string ValueSql(const Expression &value, MergeScope scope, const string &what, const LogicalType &column_type);
+	string ValueSql(const Expression &value, MergeScope scope, const string &what, const LogicalType &column_type,
+					idx_t column_index);
 	string Clause(MergeActionCondition when, const BoundMergeIntoAction &action);
 	void TypeSrcColumns(MSSQLStagedMergeTarget &target, string &select_list);
 
@@ -557,10 +558,24 @@ void MergeRewriter::StripAssignmentCast(unique_ptr<Expression> &expr, const Logi
 }
 
 string MergeRewriter::ValueSql(const Expression &value, MergeScope scope, const string &what,
-							   const LogicalType &column_type) {
+							   const LogicalType &column_type, idx_t column_index) {
 	auto expr = Inline(value);
 	const auto text = expr->ToString();
 	StripAssignmentCast(expr, column_type);
+	// Spec 093 T3: a value assigned to a vector column is staged as that column (like-target), so #src
+	// holds its declaration -- vector(n, float16) for a float16 column. CTAS-typed from FLOAT[n] it would
+	// be a float32 vector(n), which the server will not assign to a float16 one (42238, measured), and
+	// T-SQL computes no vector from a source value or a constant anyway.
+	if (StringUtil::CIEquals(columns_[column_index].sql_type_name, "vector")) {
+		const auto reach = Classify(*expr);
+		if (reach == REACH_SOURCE || (reach == REACH_NONE && scope != MergeScope::BY_SOURCE)) {
+			Stage(expr, column_index);
+			// The #src column itself: an assignment, not a comparison, so not through FilterEncoder, which
+			// refuses a column the server compares unlike DuckDB (#514) -- a vector is one.
+			const auto &staged = expr->Cast<BoundColumnRefExpression>();
+			return "[s]." + QuoteIdentifier(SrcName(staged.Binding().column_index.GetIndex()));
+		}
+	}
 	Split(expr, scope);
 	const auto result = FilterEncoder::EncodeExpression(*expr, ctx_);
 	if (!result.supported) {
@@ -591,7 +606,7 @@ string MergeRewriter::Clause(MergeActionCondition when, const BoundMergeIntoActi
 			}
 			sets += (sets.empty() ? "" : ", ") + QuoteIdentifier(col.name) + " = " +
 					ValueSql(*action.expressions[i], scope, "the value SET for column '" + col.name + "'",
-							 merge_.table.GetColumns().GetColumn(LogicalIndex(index)).Type());
+							 merge_.table.GetColumns().GetColumn(LogicalIndex(index)).Type(), index);
 		}
 		return sql + " THEN UPDATE SET " + sets;
 	}
@@ -623,8 +638,9 @@ string MergeRewriter::Clause(MergeActionCondition when, const BoundMergeIntoActi
 					   "' (a MERGE runs without IDENTITY_INSERT)");
 			}
 			names += (names.empty() ? "" : ", ") + QuoteIdentifier(col.name);
-			values += (values.empty() ? "" : ", ") +
-					  ValueSql(expr, scope, "the value INSERTed into column '" + col.name + "'", column.Type());
+			values +=
+				(values.empty() ? "" : ", ") +
+				ValueSql(expr, scope, "the value INSERTed into column '" + col.name + "'", column.Type(), storage_idx);
 		}
 		if (names.empty()) {
 			return sql + " THEN INSERT DEFAULT VALUES";
@@ -668,7 +684,8 @@ void MergeRewriter::TypeSrcColumns(MSSQLStagedMergeTarget &target, string &selec
 				}
 			}
 			target.src_columns.push_back(BCPColumnMetadata::FromServerColumn(
-				name, declared.type_name, declared.max_length, col.precision, col.scale, true, col.collation_name));
+				name, declared.type_name, declared.max_length, col.precision, col.scale, true,
+				col.BulkCollationName(catalog_.GetDatabaseCollation())));
 			target.src_columns.back().reported_name = col.name;
 		} else {
 			const auto type = IsStringType(column.type) ? LogicalType::VARCHAR : column.type;
@@ -693,8 +710,8 @@ void MergeRewriter::TypeSrcColumns(MSSQLStagedMergeTarget &target, string &selec
 			}
 			vector<BCPColumnMetadata> metadata;
 			try {
-				metadata =
-					TargetResolver::GenerateColumnMetadata({type}, {name}, config.wire_varchar_collation, single_byte);
+				metadata = TargetResolver::GenerateColumnMetadata({type}, {name}, config.wire_varchar_collation,
+																  single_byte, catalog_.GetDatabaseCollation());
 			} catch (std::exception &) {
 				Refuse("a value of type " + column.type.ToString() + " cannot be staged in #src");
 			}

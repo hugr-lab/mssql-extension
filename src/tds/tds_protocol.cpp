@@ -222,14 +222,33 @@ std::vector<uint8_t> TdsProtocol::EncodePassword(const std::string &password) {
 
 static constexpr uint32_t UTF8_SUPPORT_EXT_LEN = 1 + 4;
 
-static void AppendUtf8SupportFeature(TdsPacket &packet) {
-	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::UTF8SUPPORT));
-	packet.AppendUInt32LE(0);
+// VECTORSUPPORT ([MS-TDS] 2.2.6.4; spec 093 D4): FeatureId, FeatureDataLen 1, and the version byte
+// requested -- the form measured on SQL Server 2025 (V1: `0E 01000000 <version>`), which answers with
+// the version it grants.
+static constexpr uint32_t VECTOR_SUPPORT_EXT_LEN = 1 + 4 + 1;
+
+//! The bytes the requested features add to the feature list (FEDAUTH and the terminator apart).
+static uint32_t FeatureExtLength(const Login7Features &features) {
+	return (features.utf8_support ? UTF8_SUPPORT_EXT_LEN : 0) +
+		   (features.vector_version > 0 ? VECTOR_SUPPORT_EXT_LEN : 0);
+}
+
+//! The requested features, FEDAUTH and the terminator apart, in one order for every builder.
+static void AppendRequestedFeatures(TdsPacket &packet, const Login7Features &features) {
+	if (features.utf8_support) {
+		packet.AppendByte(static_cast<uint8_t>(FeatureExtId::UTF8SUPPORT));
+		packet.AppendUInt32LE(0);
+	}
+	if (features.vector_version > 0) {
+		packet.AppendByte(static_cast<uint8_t>(FeatureExtId::VECTORSUPPORT));
+		packet.AppendUInt32LE(1);
+		packet.AppendByte(features.vector_version);
+	}
 }
 
 TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &username, const std::string &password,
 								   const std::string &database, const std::string &app_name, uint32_t packet_size,
-								   bool request_utf8_support, const std::string &server_name) {
+								   Login7Features request_utf8_support, const std::string &server_name) {
 	TdsPacket packet(PacketType::LOGIN7);
 
 	// LOGIN7 fixed header is 94 bytes; variable-length strings follow.
@@ -268,7 +287,7 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 	// feature list. Both go AFTER every variable string — the same placement the
 	// FEDAUTH and ADAL builders use — so the string region stays contiguous and
 	// nothing between HostName and Database moves.
-	const bool want_utf8_support = request_utf8_support;
+	const bool want_utf8_support = request_utf8_support.Any();	// any feature: the Extension slot is used
 	uint16_t unused1_offset = var_offset;
 	uint16_t unused1_len = 0;
 	if (want_utf8_support) {
@@ -287,7 +306,7 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 
 	uint32_t total_length = var_offset;
 	if (want_utf8_support) {
-		total_length += UTF8_SUPPORT_EXT_LEN + 1;  // feature + terminator
+		total_length += FeatureExtLength(request_utf8_support) + 1;	 // features + terminator
 	}
 
 	// Build fixed header (94 bytes)
@@ -433,7 +452,7 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 		// The Extension field points HERE; this DWORD points at the feature list,
 		// which follows immediately.
 		packet.AppendUInt32LE(feature_ext_offset);
-		AppendUtf8SupportFeature(packet);
+		AppendRequestedFeatures(packet, request_utf8_support);
 		packet.AppendByte(static_cast<uint8_t>(FeatureExtId::TERMINATOR));
 	}
 
@@ -455,7 +474,7 @@ TdsPacket TdsProtocol::BuildLogin7(const std::string &host, const std::string &u
 TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, const std::string &server_name,
 										   const std::string &database, const std::vector<uint8_t> &sspi_initial_blob,
 										   const std::string &app_name, uint32_t packet_size,
-										   bool request_utf8_support) {
+										   Login7Features request_utf8_support) {
 	TdsPacket packet(PacketType::LOGIN7);
 
 	// Field lengths are UTF-16 CODE UNITS, not UTF-8 bytes. Taking .size() of the
@@ -540,10 +559,10 @@ TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, c
 	uint16_t unused1_len = 0;
 	uint32_t feature_ext_offset = 0;
 	uint32_t total_length = var_offset;
-	if (request_utf8_support) {
+	if (request_utf8_support.Any()) {
 		unused1_len = 4;  // cbExtension = the DWORD only
 		feature_ext_offset = var_offset + 4;
-		total_length += 4 + UTF8_SUPPORT_EXT_LEN + 1;  // DWORD + feature + terminator
+		total_length += 4 + FeatureExtLength(request_utf8_support) + 1;	 // DWORD + features + terminator
 	}
 
 	// Fixed header (94 bytes)
@@ -574,7 +593,7 @@ TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, c
 	// TypeFlags
 	packet.AppendByte(0x00);
 	// OptionFlags3: fExtension (0x10) says the Extension slot is populated.
-	packet.AppendByte(request_utf8_support ? 0x10 : 0x00);
+	packet.AppendByte(request_utf8_support.Any() ? 0x10 : 0x00);
 	// ClientTimeZone
 	packet.AppendUInt32LE(0);
 	// ClientLCID
@@ -645,11 +664,11 @@ TdsPacket TdsProtocol::BuildLogin7WithSSPI(const std::string &client_hostname, c
 		packet.AppendPayload(sspi_initial_blob);
 	}
 
-	if (request_utf8_support) {
+	if (request_utf8_support.Any()) {
 		// The Extension field points HERE; this DWORD points at the feature list,
 		// which follows immediately.
 		packet.AppendUInt32LE(feature_ext_offset);
-		AppendUtf8SupportFeature(packet);
+		AppendRequestedFeatures(packet, request_utf8_support);
 		packet.AppendByte(static_cast<uint8_t>(FeatureExtId::TERMINATOR));
 	}
 
@@ -1038,6 +1057,8 @@ LoginResponse TdsProtocol::ParseLoginResponse(const std::vector<uint8_t> &data) 
 					response.fedauth_acked = true;
 				} else if (feature_id == static_cast<uint8_t>(FeatureExtId::UTF8SUPPORT)) {
 					response.utf8_support_acked = true;
+				} else if (feature_id == static_cast<uint8_t>(FeatureExtId::VECTORSUPPORT) && data_len >= 1) {
+					response.vector_support_version = ptr[0];
 				}
 				ptr += data_len;
 			}
@@ -1642,7 +1663,7 @@ TdsPacket TdsProtocol::BuildPreloginWithFedAuth(bool use_encrypt, bool fedauth_r
 TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname, const std::string &server_name,
 											  const std::string &database, const std::vector<uint8_t> &fedauth_token,
 											  bool fedauth_echo, const std::string &app_name, uint32_t packet_size,
-											  bool request_utf8_support) {
+											  Login7Features request_utf8_support) {
 	TdsPacket packet(PacketType::LOGIN7);
 
 	// LOGIN7 with FEDAUTH uses feature extensions (MS-TDS 2.2.7)
@@ -1711,7 +1732,7 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname
 	// Add: FEDAUTH extension + Terminator (1)
 	// Issue #225: UTF8_SUPPORT rides along in the same feature list, before the
 	// terminator. A server that does not support it acks only FEDAUTH.
-	uint32_t total_length = var_offset + fedauth_ext_len + (request_utf8_support ? UTF8_SUPPORT_EXT_LEN : 0) + 1;
+	uint32_t total_length = var_offset + fedauth_ext_len + FeatureExtLength(request_utf8_support) + 1;
 
 	// Build fixed header (94 bytes)
 
@@ -1866,9 +1887,7 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname
 	// Token (UTF-16LE encoded access token)
 	packet.AppendPayload(fedauth_token);
 
-	if (request_utf8_support) {
-		AppendUtf8SupportFeature(packet);
-	}
+	AppendRequestedFeatures(packet, request_utf8_support);
 
 	// Feature terminator
 	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::TERMINATOR));
@@ -1878,7 +1897,7 @@ TdsPacket TdsProtocol::BuildLogin7WithFedAuth(const std::string &client_hostname
 
 TdsPacket TdsProtocol::BuildLogin7WithADAL(const std::string &client_hostname, const std::string &server_name,
 										   const std::string &database, bool fedauth_echo, const std::string &app_name,
-										   uint32_t packet_size, bool request_utf8_support) {
+										   uint32_t packet_size, Login7Features request_utf8_support) {
 	TdsPacket packet(PacketType::LOGIN7);
 
 	// LOGIN7 with ADAL FEDAUTH workflow (per go-mssqldb implementation)
@@ -1917,7 +1936,7 @@ TdsPacket TdsProtocol::BuildLogin7WithADAL(const std::string &client_hostname, c
 	// Total length = fixed header + variable strings + extension DWORD + FEDAUTH extension + terminator
 	// Issue #225: UTF8_SUPPORT rides along in the same feature list, before the
 	// terminator. A server that does not support it acks only FEDAUTH.
-	uint32_t total_length = var_offset + fedauth_ext_len + (request_utf8_support ? UTF8_SUPPORT_EXT_LEN : 0) + 1;
+	uint32_t total_length = var_offset + fedauth_ext_len + FeatureExtLength(request_utf8_support) + 1;
 
 	// Build fixed header (94 bytes)
 
@@ -2059,9 +2078,7 @@ TdsPacket TdsProtocol::BuildLogin7WithADAL(const std::string &client_hostname, c
 	packet.AppendByte(fedauth_options);
 	packet.AppendByte(FEDAUTH_ADAL_WORKFLOW_PASSWORD);	// Service Principal uses Password workflow
 
-	if (request_utf8_support) {
-		AppendUtf8SupportFeature(packet);
-	}
+	AppendRequestedFeatures(packet, request_utf8_support);
 
 	// Feature terminator
 	packet.AppendByte(static_cast<uint8_t>(FeatureExtId::TERMINATOR));

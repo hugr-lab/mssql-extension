@@ -2,9 +2,12 @@
 
 #include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
+#include "codec/sql_vector/vector_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "codec/uuid_codec.hpp"
+#include "codec/variant/variant_write.hpp"
 #include "codec/write_column_ops.hpp"
+#include "duckdb/common/vector/array_vector.hpp"
 #include "mssql_counters.hpp"
 
 #include "tds/tds_types.hpp"
@@ -21,6 +24,7 @@
 #include "codec/vector_format.hpp"
 #include "copy/target_resolver.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/variant.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "tds/encoding/utf16.hpp"
 
@@ -65,27 +69,33 @@ using EncodeFn = void (*)(Vector &, const UnifiedVectorFormat &, idx_t, const ms
 
 // Wire form of NULL for a column, resolved once (was an IsPLPType /
 // IsVariableLengthUSHORT branch pair per cell).
-enum class NullWireKind : uint8_t { Plp, VariableUShort, Fixed };
+enum class NullWireKind : uint8_t { Plp, VariableUShort, Fixed, Long };
 
 [[noreturn]] static void EncodeMoneyUnreachable(Vector &vec, const UnifiedVectorFormat &, idx_t,
 												const mssql::BCPColumnMetadata &, vector<uint8_t> &) {
 	ThrowMoneyUnreachable(vec.GetType());
 }
 
+[[noreturn]] void ThrowUnsupportedBcpType(const mssql::BCPColumnMetadata &col) {
+	if (col.duckdb_type.id() == LogicalTypeId::VARIANT) {
+		throw InvalidInputException(
+			"MSSQL: column \"%s\": a VARIANT value is written to SQL Server only into a "
+			"sql_variant column; cast it to the column's type otherwise",
+			col.ReportedName());
+	}
+	throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
+}
+
 // W2: resolve the family encoder once per column (was a 9-way switch per row).
 EncodeFn ResolveEncoder(const mssql::BCPColumnMetadata &col) {
+	if (col.IsVector()) {
+		return mssql::codec::sql_vector::EncodeToBcp;  // spec 093 T3: header + elements as varbinary
+	}
 	mssql::codec::TypeFamily family;
 	try {
 		family = mssql::codec::FamilyFromLogicalType(col.duckdb_type);
 	} catch (const NotImplementedException &) {
-		if (col.duckdb_type.id() == LogicalTypeId::VARIANT) {
-			// Spec 093: a sql_variant column reads as VARIANT (T1); writing one is T2.
-			throw InvalidInputException(
-				"MSSQL: column \"%s\": a VARIANT value cannot be written to SQL Server yet (a "
-				"sql_variant column is written from spec 093 T2 on); write it with mssql_exec",
-				col.ReportedName());
-		}
-		throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
+		ThrowUnsupportedBcpType(col);
 	}
 	switch (family) {
 	case mssql::codec::TypeFamily::Boolean:
@@ -117,11 +127,18 @@ EncodeFn ResolveEncoder(const mssql::BCPColumnMetadata &col) {
 	return EncodeMoneyUnreachable;	// unreachable — switch is exhaustive
 }
 
+//! A VARIANT source column (spec 093 T2), read through DuckDB's variant layout once a chunk.
+struct VariantSource {
+	RecursiveUnifiedVectorFormat format;
+	unique_ptr<UnifiedVariantVectorData> data;
+};
+
 struct ColumnEncodeState {
 	Vector *vec = nullptr;	// nullptr → source column missing: NULL every row
 	UnifiedVectorFormat fmt;
 	EncodeFn encode = nullptr;
 	NullWireKind null_kind = NullWireKind::Fixed;
+	unique_ptr<VariantSource> variant;	// a sql_variant column fed by a VARIANT: encoded by codec::variant
 };
 
 void EncodeNullOfKind(vector<uint8_t> &buffer, NullWireKind kind) {
@@ -135,6 +152,9 @@ void EncodeNullOfKind(vector<uint8_t> &buffer, NullWireKind kind) {
 	case NullWireKind::Fixed:
 		BCPRowEncoder::EncodeNullFixed(buffer);
 		return;
+	case NullWireKind::Long:
+		buffer.insert(buffer.end(), 4, 0);	// a sql_variant's NULL: a length of 0
+		return;
 	}
 }
 
@@ -146,7 +166,9 @@ void EncodeNullOfKind(vector<uint8_t> &buffer, NullWireKind kind) {
 // such a column usually had a real variable column too and went row-major,
 // where EncodeNullOfKind above did it right).
 inline uint32_t NullMarkerSize(NullWireKind kind) {
-	return kind == NullWireKind::Plp ? 8 : (kind == NullWireKind::VariableUShort ? 2 : 1);
+	return kind == NullWireKind::Plp
+			   ? 8
+			   : (kind == NullWireKind::VariableUShort ? 2 : (kind == NullWireKind::Long ? 4 : 1));
 }
 
 inline void WriteNullMarker(uint8_t *out, NullWireKind kind) {
@@ -161,6 +183,9 @@ inline void WriteNullMarker(uint8_t *out, NullWireKind kind) {
 	case NullWireKind::Fixed:
 		out[0] = 0x00;
 		return;
+	case NullWireKind::Long:
+		std::memset(out, 0, 4);
+		return;
 	}
 }
 
@@ -173,15 +198,34 @@ void PrepareColumnStates(DataChunk &chunk, idx_t format_count, const vector<mssq
 	for (idx_t target_idx = 0; target_idx < columns.size(); target_idx++) {
 		auto &col = columns[target_idx];
 		auto &state = states[target_idx];
-		state.null_kind = col.IsPLPType()
-							  ? NullWireKind::Plp
-							  : (col.IsVariableLengthUSHORT() ? NullWireKind::VariableUShort : NullWireKind::Fixed);
+		state.null_kind = col.IsSqlVariant()
+							  ? NullWireKind::Long
+							  : (col.IsPLPType() ? NullWireKind::Plp
+												 : (col.IsVariableLengthUSHORT() ? NullWireKind::VariableUShort
+																				 : NullWireKind::Fixed));
 		// If source_idx is -1 or out of range, the column stays NULL for every row.
 		int32_t source_idx = column_mapping ? (*column_mapping)[target_idx] : static_cast<int32_t>(target_idx);
 		if (source_idx < 0 || static_cast<idx_t>(source_idx) >= chunk.ColumnCount()) {
 			continue;
 		}
 		state.vec = &chunk.data[source_idx];
+		if (col.IsVector() && !col.null_only_source) {
+			// Spec 093 T3: the encoder reads the elements as float, a row's dimensions apart in a flat child.
+			// Once per chunk: the source is FLOAT[n] of the column's n (a DOUBLE[n] is the user's cast to
+			// write, IsTypeCompatible; another n is no vector(n) value), its child flattened if it is not.
+			const auto &source_type = state.vec->GetType();
+			if (!mssql::codec::sql_vector::IsVectorType(source_type) ||
+				ArrayType::GetSize(source_type) != col.vector_dims) {
+				throw InvalidInputException(
+					"MSSQL: column \"%s\" is a vector(%d), which takes a FLOAT[%d] value, not %s%s", col.ReportedName(),
+					static_cast<int>(col.vector_dims), static_cast<int>(col.vector_dims), source_type.ToString(),
+					source_type.id() == LogicalTypeId::ARRAY ? " (cast it)" : "");
+			}
+			auto &child = ArrayVector::GetChildMutable(*state.vec);
+			if (child.GetVectorType() != VectorType::FLAT_VECTOR) {
+				child.Flatten();
+			}
+		}
 		state.vec->ToUnifiedFormat(state.fmt);
 		if (col.null_only_source) {
 			// Bind admitted this pair for the all-NULL case only (a constant
@@ -202,8 +246,30 @@ void PrepareColumnStates(DataChunk &chunk, idx_t format_count, const vector<mssq
 			state.vec = nullptr;
 			continue;
 		}
+		if (col.IsSqlVariant()) {
+			// Spec 093 T2: the column's values are VARIANTs (the binder casts to the column's type);
+			// their layout is read once here, each row's envelope written by codec::variant.
+			if (state.vec->GetType().id() != LogicalTypeId::VARIANT) {
+				throw InternalException("MSSQL: sql_variant column \"%s\" fed by a %s, not a VARIANT",
+										col.ReportedName(), state.vec->GetType().ToString());
+			}
+			state.variant = make_uniq<VariantSource>();
+			Vector::RecursiveToUnifiedFormat(*state.vec, state.variant->format);
+			state.variant->data = make_uniq<UnifiedVariantVectorData>(state.variant->format);
+			continue;
+		}
 		state.encode = ResolveEncoder(col);
 	}
+}
+
+//! Whether any column of the chunk is a sql_variant fed by a VARIANT (EncodeRowWithVariants then).
+bool HasVariant(const vector<ColumnEncodeState> &states) {
+	for (auto &state : states) {
+		if (state.variant) {
+			return true;
+		}
+	}
+	return false;
 }
 
 // Encode one row from prepared states (no 0xD1 token byte).
@@ -211,6 +277,25 @@ void EncodeRowFromStates(vector<uint8_t> &buffer, idx_t row_idx, const vector<ms
 						 vector<ColumnEncodeState> &states) {
 	for (idx_t target_idx = 0; target_idx < columns.size(); target_idx++) {
 		auto &state = states[target_idx];
+		if (!state.vec || mssql::codec::FormatIsNull(state.fmt, row_idx)) {
+			EncodeNullOfKind(buffer, state.null_kind);
+			continue;
+		}
+		state.encode(*state.vec, state.fmt, row_idx, columns[target_idx], buffer);
+	}
+}
+
+// EncodeRowFromStates for a chunk with a sql_variant column (spec 093 T2): the family columns as there,
+// a VARIANT one through codec::variant (its NULL included). Chosen once a chunk, so the rows of a chunk
+// without one carry no test.
+void EncodeRowWithVariants(vector<uint8_t> &buffer, idx_t row_idx, const vector<mssql::BCPColumnMetadata> &columns,
+						   vector<ColumnEncodeState> &states) {
+	for (idx_t target_idx = 0; target_idx < columns.size(); target_idx++) {
+		auto &state = states[target_idx];
+		if (state.variant) {
+			mssql::codec::variant::EncodeToBcp(*state.variant->data, row_idx, columns[target_idx], buffer);
+			continue;
+		}
 		if (!state.vec || mssql::codec::FormatIsNull(state.fmt, row_idx)) {
 			EncodeNullOfKind(buffer, state.null_kind);
 			continue;
@@ -569,6 +654,10 @@ inline void ScatterBlock(uint8_t *bdst, size_t stride, idx_t row_begin, idx_t ro
 		case mssql::codec::ScatterArm::FloatConvert:
 			ScatterConvFloat(bdst + col_off, stride, row_begin, rows, st.fmt, ops[c]);
 			break;
+		case mssql::codec::ScatterArm::Vector:
+			mssql::codec::sql_vector::ScatterChunkStrided(bdst + col_off, stride, row_begin, rows, *st.vec, st.fmt,
+														  columns[c]);
+			break;
 		default:
 			throw InternalException("BCPRowEncoder: unreachable scatter arm");
 		}
@@ -667,6 +756,9 @@ inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t ren
 			mssql::codec::datetime::ScatterChunkCursor(dst, cursor, r0, rend - r0, *st.vec, st.fmt, columns[c],
 													   col_all_valid);
 			break;
+		case mssql::codec::ScatterArm::Vector:
+			mssql::codec::sql_vector::ScatterChunkCursor(dst, cursor, r0, rend - r0, *st.vec, st.fmt, columns[c]);
+			break;
 		default:
 			throw InternalException("BCPRowEncoder: unreachable cursor arm");
 		}
@@ -749,7 +841,9 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 		// — and the cast truncates silently, stride comes out short, and the
 		// kernel writes the full width into it. Widening costs nothing: widths is
 		// indexed per column, not per value.
-		widths[c] = ops[c].wire_width;
+		// A vector's length is two bytes, not one: its width holds the second, so `1 + widths[c]` is
+		// its whole non-NULL value as for every other column (spec 093 T3).
+		widths[c] = ops[c].arm == mssql::codec::ScatterArm::Vector ? 1 + ops[c].wire_width : ops[c].wire_width;
 		stride += 1 + widths[c];
 		if (states[c].vec && !states[c].fmt.validity.CannotHaveNull()) {
 			all_valid = false;
@@ -802,7 +896,9 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 			if (st.fmt.validity.CannotHaveNull()) {
 				continue;  // contributes its full width to every row already
 			}
-			const uint32_t w = widths[c];
+			// A NULL row drops the value and keeps its marker: 1 byte for a fixed column, 2 (0xFFFF) for
+			// a vector's u16 length.
+			const uint32_t w = widths[c] - (NullMarkerSize(st.null_kind) - 1);
 			if (st.fmt.sel->IsSet()) {
 				const auto *sel = st.fmt.sel;
 				for (idx_t r = 0; r < row_count; r++) {
@@ -911,7 +1007,9 @@ void BCPRowEncoder::EncodeChunk(vector<uint8_t> &buffer, DataChunk &chunk,
 	// magnitude (2048 rows x nvarchar(4000) = 16 MB).
 	size_t per_row_estimate = 1;  // 0xD1 ROW token
 	for (auto &col : columns) {
-		if (col.IsPLPType()) {
+		if (col.IsSqlVariant()) {
+			per_row_estimate += 4 + 2 + 7 + 16;
+		} else if (col.IsPLPType()) {
 			per_row_estimate += 8 + 4 + 64 + 4;
 		} else if (col.IsVariableLengthUSHORT()) {
 			per_row_estimate += 2 + MinValue<size_t>(col.max_length, 64);
@@ -930,6 +1028,17 @@ void BCPRowEncoder::EncodeChunk(vector<uint8_t> &buffer, DataChunk &chunk,
 
 	vector<ColumnEncodeState> states;
 	PrepareColumnStates(chunk, row_count, columns, column_mapping, states);
+	if (HasVariant(states)) {
+		// No scatter arm for an envelope: the row loop, the VARIANT columns through codec::variant.
+		if (mssql::CountersEnabled()) {
+			mssql::GetEncodePathCounters().chunks_row_major.fetch_add(1, std::memory_order_relaxed);
+		}
+		for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
+			buffer.push_back(BCP_TOKEN_ROW);
+			EncodeRowWithVariants(buffer, row_idx, columns, states);
+		}
+		return;
+	}
 	if (TryEncodeChunkColumnar(buffer, row_count, columns, states)) {
 		return;
 	}
@@ -943,10 +1052,18 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 							  const vector<mssql::BCPColumnMetadata> &columns, const vector<int32_t> *column_mapping) {
 	vector<ColumnEncodeState> states;
 	PrepareColumnStates(chunk, row_idx + 1, columns, column_mapping, states);
-	EncodeRowFromStates(buffer, row_idx, columns, states);
+	EncodeRowWithVariants(buffer, row_idx, columns, states);
 }
 
 void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, const mssql::BCPColumnMetadata &col) {
+	if (col.IsVector()) {
+		mssql::codec::sql_vector::EncodeValueToBcp(value, col, buffer);	 // spec 093 T3, its NULL included
+		return;
+	}
+	if (col.IsSqlVariant()) {
+		mssql::codec::variant::EncodeValueToBcp(value, col, buffer);  // its NULL included
+		return;
+	}
 	if (value.IsNull()) {
 		if (col.IsPLPType()) {
 			EncodeNullPLP(buffer);
@@ -963,14 +1080,7 @@ void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, con
 	try {
 		family = mssql::codec::FamilyFromLogicalType(col.duckdb_type);
 	} catch (const NotImplementedException &) {
-		if (col.duckdb_type.id() == LogicalTypeId::VARIANT) {
-			// Spec 093: a sql_variant column reads as VARIANT (T1); writing one is T2.
-			throw InvalidInputException(
-				"MSSQL: column \"%s\": a VARIANT value cannot be written to SQL Server yet (a "
-				"sql_variant column is written from spec 093 T2 on); write it with mssql_exec",
-				col.ReportedName());
-		}
-		throw NotImplementedException("MSSQL: Unsupported type for BCP encoding: %s", col.duckdb_type.ToString());
+		ThrowUnsupportedBcpType(col);
 	}
 	switch (family) {
 	case mssql::codec::TypeFamily::Boolean:

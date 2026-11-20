@@ -316,6 +316,59 @@ against 0.04 s (only the columns a scan reads are put in their uncompressed form
 5. Compression-info record, anchor, dictionary, reconstruction; fixtures first — 4 d
 6. `fuzz_backup_page_ci`; PAGE fixtures — 1 d
 
+*PR 2 as built (2026-11-20).*
+
+**E23 first** (`measured/E23-page-compression.md`): 25 pages of six PAGE tables on SQL Server 2025, read by
+DBCC PAGE, D1's clean room. A prototype rebuilt 30,204 values from the bytes alone, each equal to the server's
+text. What it found:
+- **The record's header:** flags, a modification count, the dictionary's offset when there is one, the size.
+- **The anchor record:** a CD record, not padded to 9 bytes.
+- **The dictionary:** a count, the end offsets, the entries in their CD form.
+- **Code 12:** one byte, a symbol.
+- **A prefix length:** one byte, or two with `0x80`, taken over the compressed bytes.
+- **EMPTY beside an anchor:** the anchor's value.
+- **The order:** a dictionary entry first, then its prefix.
+- **A page without `0x80`:** a ROW page of the rowset.
+- **Not in E22:** a ghost forwarded record, type 5, met by the fixture's differential (a forwarded heap row
+  deleted under row versioning). Measured in a throwaway container: under ROW too.
+
+**`backup_cd_record`:**
+- `ReadPageCompression`: every part bounded, an unknown flag refused.
+- `ReadCdRecord`: code 12's byte placed; type 5 read as a ghost; the anchor read unpadded.
+- `CdRow::Read` with a page's compression information: the symbol, prefix and EMPTY rules, the rebuilt bytes
+  kept in the row's buffer.
+
+**The scan and the model:**
+- Both take PAGE rowsets: the layout is a CD layout, and the refusal is gone.
+- A page's record is read once per page, and a record inside it is refused (the scan, the collector and
+  `table_changes`' second read alike).
+
+**`table_changes`:**
+- A PAGE row is compared, paired and digested by its values in the uncompressed form (`PageRow::bytes`), so a
+  page rebuilt with another anchor and dictionary is no change. The form is built as `masked` is: by column id,
+  the newer state's columns only, NULL and a default of a column the older state lacked as no value, a stored
+  default and a default alike (review: by the layout's positions, a column added between the states made every
+  row of a recompressed page an update). Every row of a table is compared so when a rowset of either state is
+  PAGE (`ValueForm::by_value`): a rebuild from ROW or none into PAGE is no change either. A value of a column the
+  older state lacked that equals the column's default is no value too (`IsColumnDefault`, in `masked` as well).
+  Measured on the fixture: a rebuild clears a metadata-only default from `sysrscols` (status 640 to 128), so a
+  column added *with a default* between the states and then rebuilt reports every row as an update, under any
+  compression, the preimage reading the column as absent: more rows than changed, none missed. Its default is
+  then only the constraint's expression, which the reader does not evaluate.
+- A page's unchanged records are passed over only when both versions' compression information is the same
+  (`SameCompressionInfo`).
+
+**Tests:**
+- `test_backup_page_ci`: E23's bytes, the two-byte prefix, the ghost forwarded record, the refusals.
+- `fuzz_backup_page_ci`: E23 seeds; the replay and leak-check lanes, the weekly run.
+- The fixture `page.sql`: cd.sql's shapes under PAGE, filled so pages hold the record, and an uncompressed twin
+  where cd.sql has one; then changes and a differential (`page_over`).
+- Against RESTORE on 2025:
+  - `compare_rows`: 21 tables, 32,636 rows, 0 failures, plain and MS_XPRESS; the overlay 33,066 rows.
+  - `table_changes` against the two scans' differences: 500 inserts, 61 deletes, 58 updates of
+    `types_page`; 16 updates of `uniq_page`; 9 deletes of the heap; 0 of a table rebuilt whole, and 0 of
+    `added_page`, a nullable column added and then rebuilt (its four defaults stored by the rebuild).
+
 **PR 3 — sparse**
 
 7. Sparse vector and the column set (D7) — 1.5 d

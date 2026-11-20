@@ -2,6 +2,7 @@
 
 #include "catalog/mssql_index_kind.hpp"
 #include "catalog/mssql_table_options.hpp"
+#include "codec/collation_defaults.hpp"
 #include "copy/bcp_config.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -37,7 +38,8 @@ constexpr const char *MSSQL_DEFAULT_CTAS_TEXT_TYPE = "NVARCHAR";
 // database's own collation is already UTF-8: there the column INHERITS, which is
 // the Fabric path and is conflict-free by construction (see
 // MSSQLCatalog::ResolveVarcharCollation).
-constexpr const char *MSSQL_DEFAULT_UTF8_COLLATION = "Latin1_General_100_BIN2_UTF8";
+// The constant itself is the codec's (codec/collation_defaults.hpp): a sql_variant's string values fall
+// back to it too (spec 093 T2).
 
 // Text type policy for CTAS DDL generation
 enum class CTASTextType { NVARCHAR, VARCHAR };

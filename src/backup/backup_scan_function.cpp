@@ -369,6 +369,7 @@ struct ScanLocalState : public LocalTableFunctionState {
 	uint16_t next_slot = 0;
 	CdRecord cd_record;	 // a ROW-compressed rowset's record and its values (spec 086 PR 1), reused
 	CdRow cd_row;
+	PageCompression page_ci;		// a PAGE page's compression information (spec 086 PR 2); not present on a ROW page
 	std::vector<bool> cd_needed;	// the layout's columns this scan reads: the stager's, the key's
 	std::vector<uint16_t> offsets;	// the current page's slot offsets, a freed slot as 0
 	std::vector<uint16_t> bounds;	// where each slot's record must end (the next record's start)
@@ -842,6 +843,17 @@ bool NextPage(ClientContext &context, const ScanBindData &data, ScanLocalState &
 				local.bounds[s] = next == live.end() ? slot_array : *next;
 			}
 		}
+		// PAGE compression (spec 086 PR 2): a page with header flag 0x80 holds its compression information at
+		// offset 96, which every record follows; a page without it is a ROW page of the rowset.
+		local.page_ci.present = false;
+		if (data.entry->Layout(*local.cursor->partition).compression == 2 && (local.page.header.type_flags & 0x80)) {
+			ReadPageCompression(local.page.bytes.data(), PAGE_SIZE, slot_array, data.table.c_str(), local.page_ci);
+			if (!live.empty() && live.front() < local.page_ci.end) {
+				throw FormatError("backup: page " + at.ToString() + " has a record at offset " +
+								  std::to_string(live.front()) + " inside its compression information (to " +
+								  std::to_string(local.page_ci.end) + ")");
+			}
+		}
 		local.next_slot = 0;
 		local.have_page = true;
 		return true;
@@ -947,8 +959,9 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 			RecordView fixed;
 			RowRecord row;
 			uint32_t record_end = 0;
-			if (layout.compression == 1) {
-				// ROW compression (spec 086 PR 1): a CD record, its values put in the uncompressed form.
+			if (layout.compression == 1 || layout.compression == 2) {
+				// ROW compression (spec 086 PR 1): a CD record, its values put in the uncompressed form; PAGE (PR 2)
+				// the same, its symbols and prefixes resolved through the page's compression information.
 				CdRecord &cd = local.cd_record;
 				ReadCdRecord(local.page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * local.page.header.slot_count,
 							 local.offsets[slot], data.table.c_str(), cd);
@@ -958,7 +971,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 				if (cd.kind == CdRecord::Kind::Forwarded) {
 					cd.BackPointer(at.page.page, at.page.file, at.slot);
 				}
-				local.cd_row.Read(cd, layout, &local.cd_needed);
+				local.cd_row.Read(cd, layout, &local.cd_needed, layout.compression == 2 ? &local.page_ci : nullptr);
 				row = RowRecord::Compressed(cd, local.cd_row);
 				record_end = cd.end;
 			} else {

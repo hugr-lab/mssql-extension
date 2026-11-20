@@ -424,6 +424,12 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 	std::string list;
 	auto add = [&](idx_t index, const std::string &alias) {
 		const auto &column = columns_[index];
+		// Spec 093 D4: a vector column streams VECTORTYPE or its JSON text as the session negotiated, and a
+		// pushed statement's result types are fixed before it runs; the catalog scan reads either form.
+		// Copied as written (a pushed INSERT ... SELECT), the server keeps its bytes.
+		if (!raw_columns_ && StringUtil::CIEquals(column.sql_type_name, "vector")) {
+			return Veto("a vector column in the result");
+		}
 		// A column's result name is its DuckDB name (issue #572: the server's `ID` beside `Id` reads as
 		// ID_1), sent as an alias where the two differ.
 		const std::string output = alias.empty() ? column.DuckDBName() : alias;
