@@ -247,7 +247,7 @@ SELECT h FROM hr.dbo.HidOrder WHERE id = 1;
 /1.-2/
 
 statement ok
-SELECT mssql_exec('hr', 'DROP TABLE dbo.HidH1; DROP TABLE dbo.HidOrder');
+SELECT mssql_exec('hr', 'DROP TABLE dbo.HidH1; DROP TABLE dbo.HidOrder; DROP TABLE dbo.HidText');
 
 statement ok
 DETACH hr;
