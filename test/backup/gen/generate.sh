@@ -7,7 +7,7 @@
 #   OUT=/tmp/bak IMAGE=mcr.microsoft.com/mssql/server:2022-latest test/backup/gen/generate.sh
 #   OUT=/tmp/bak FIXTURES=samples test/backup/gen/generate.sh  # samples.sql only (the committed set)
 #
-# FIXTURES (default "samples catalog partition files load lob large rows dbcs cd names diffs"): samples.sql, the database of the
+# FIXTURES (default "samples catalog partition files load lob large rows dbcs cd page names diffs"): samples.sql, the database of the
 # committed samples; catalog.sql, the catalog fixture (spec 085 PR 2b); partition.sql, E7's partitioning
 # database and more boundary types (PR 2c); files.sql, two data files and a second
 # filegroup, then (files_remove.sql) a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
@@ -16,7 +16,7 @@
 # 530000 by default); rows.sql, the record forms of user tables (E20: version tags, forwarding, the
 # uniquifier, ghosts, row-overflow, added columns of a partitioned table); dbcs.sql, varchar under the
 # double-byte code pages (PR 2d); lob.sql, values stored off row in every form (PR 3: lob_full plain,
-# lob_xpress compressed); cd.sql, ROW-compressed tables (spec 086 PR 1: cd_full plain, cd_xpress compressed); names.sql, a
+# lob_xpress compressed); cd.sql, ROW-compressed tables (spec 086 PR 1: cd_full plain, cd_xpress compressed); page.sql, PAGE-compressed ones (spec 086 PR 2: page_full, page_xpress); names.sql, a
 # case-sensitive database whose tables differ only in case, and names with spaces, quotes, ] and dots (spec 085 PR 4b);
 # diffs.sql, a full and a differential over it after E2's changes (spec 085 PR 4c: diffs_full, diffs_diff and
 # diffs_diff_xpress, paired in overlays.txt); schema_changes.sql, truncates, a shrink and a sliding window between a
@@ -40,7 +40,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
-FIXTURES="${FIXTURES:-samples catalog partition files load lob large rows dbcs cd names diffs}"
+FIXTURES="${FIXTURES:-samples catalog partition files load lob large rows dbcs cd page names diffs}"
 LARGE_ROWS="${LARGE_ROWS:-530000}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
@@ -249,6 +249,13 @@ for fixture in ${FIXTURES}; do
 		# ROW compression (spec 086 PR 1); the compressed set a copy-only backup taken after the plain one.
 		golden bak_cd cd_full
 		sets+=("cd_full|cd_full.bak" "cd_xpress|cd_xpress.bak")
+		;;
+	page)
+		# PAGE compression (spec 086 PR 2: anchor records and page dictionaries); the compressed set a copy-only
+		# backup taken after the plain one.
+		golden bak_page page_full
+		sets+=("page_full|page_full.bak" "page_xpress|page_xpress.bak" "page_diff|page_diff.bak")
+		overlays+=("page_over|page_full|page_diff")
 		;;
 	names)
 		# Names DuckDB holds otherwise (spec 085 PR 4b): a case-sensitive database, spaces, quotes.

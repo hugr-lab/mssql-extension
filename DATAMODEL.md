@@ -1644,7 +1644,21 @@ flowchart LR
   holds it (an integer from its sign-flipped big-endian bytes, a decimal from vardecimal, a float
   padded back, a datetime from its one integer, char / binary / nchar padded, SCSU decoded to
   UTF-16), so the stager's arms, the family kernels and `_mssql_rid`'s key bytes are the uncompressed
-  path's: a `RowRecord` is either form. PAGE compression (the page dictionary) is PR 2's, refused by name.
+  path's: a `RowRecord` is either form.
+- **PAGE compression** (spec 086 PR 2; E23's measurements): a page whose header flags carry `0x80`
+  holds a compression-information record at offset 96 (`ReadPageCompression`: flags, the anchor record --
+  a CD record of each column's prefix, not padded --, the dictionary's entries in their CD form). Its
+  records are CD records whose values `CdRow::Read` rebuilds with it before the ROW decoding: a symbol
+  (code 12, one byte) is its entry, an anchored column's value its prefix of the anchor's (one byte, or two
+  with `0x80`) and its suffix, EMPTY there the anchor's value. A page without the flag is a ROW page of
+  the rowset. The scan reads a page's record once per page; `table_changes` compares a PAGE row by its
+  values in the uncompressed form (`PageRow::bytes`, by column id in the newer state's columns, as
+  `masked`), so a row moved, a page rebuilt with another anchor and dictionary, or a column added between
+  the states is no change -- every row of a table one of whose states holds a PAGE rowset
+  (`ValueForm`), and passes over a page's unchanged records only when both
+  versions' compression information is the same (`SameCompressionInfo`). A ghost forwarded record (type 5,
+  a forwarded row deleted under row versioning) is a ghost, under ROW too. Fuzzed by
+  `fuzz_backup_page_ci`; compared with RESTORE on `page.sql`'s fixture.
 - **Prepared statements** keep the row their bind read (`SupportStatementCache`); `reread := true`
   binds again on every `EXECUTE`.
 - **The opened-file cache** (D9, PR 4a): what an open read -- headers, page index, allocation map,

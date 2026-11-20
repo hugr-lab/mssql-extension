@@ -242,8 +242,9 @@ bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &default
 	}
 	layout.compression = rowset.compression;
 	// ROW compression (spec 086 PR 1, E22): every column a CD index, whatever its type; and a decimal's
-	// precision in sysrscols.ti carries 0x80 when it is above 18 (measured: 19 -> 147, 38 -> 166).
-	const bool cd = rowset.compression == 1;
+	// precision in sysrscols.ti carries 0x80 when it is above 18 (measured: 19 -> 147, 38 -> 166). PAGE
+	// compression's records are CD records too (spec 086 PR 2, E23).
+	const bool cd = rowset.compression == 1 || rowset.compression == 2;
 	if (cd) {
 		for (auto &physical : layout.columns) {
 			if (physical.xtype == XTYPE_DECIMAL || physical.xtype == XTYPE_NUMERIC) {
@@ -260,7 +261,7 @@ bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &default
 		}
 		if (cd && physical.offset >= 0) {
 			why = "column " + physical.name + " is at fixed offset " + std::to_string(physical.offset) +
-				  " in a ROW-compressed rowset, whose columns are CD indexes";
+				  " in a compressed rowset, whose columns are CD indexes";
 			return false;
 		}
 		auto column = by_id.find(physical.rscolid);
@@ -381,11 +382,6 @@ void DecideDecodable(const BootstrapTables &tables, const AddedDefaults &default
 		return;
 	}
 	for (const auto &p : t.partitions) {
-		if (p.compression == 2) {
-			t.reason = std::string("PAGE compression is not read (spec 086 PR 2") +
-					   (t.partitions.size() > 1 ? ", partition " + std::to_string(p.partition_number) : "") + ")";
-			return;
-		}
 		if (p.compression > 2) {
 			t.reason = "compression level " + std::to_string(p.compression) + " is not read";
 			return;
