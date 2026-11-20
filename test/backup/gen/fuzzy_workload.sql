@@ -1,6 +1,6 @@
 -- Spec 085 PR 5: the fuzzy fixture's workload (fuzzy.sql), run in the background by generate.sh -- three sessions,
 -- SESSION 0, 1 and 2, as E3's (a) -- until it sets dbo.control.stop_requested: short transactions on busy, heap
--- and lob with no pause, one in twenty rolled back. Each session keeps to keys of its own (a third of busy's and
+-- and lob with no pause, one in twenty rolled back (and only those change rolled_only). Each session keeps to keys of its own (a third of busy's and
 -- heap's first 240000, the lob rows id % 3 = SESSION, its own appends), so no session waits for another; none
 -- reaches busy's rows from 290000 to 291000, which the open transaction (fuzzy_open.sql) holds.
 SET NOCOUNT ON;
@@ -25,7 +25,12 @@ BEGIN
 		WHERE id = (@i * 3 + $(SESSION)) % 3000 + 1;
 		UPDATE dbo.control SET ticks = ticks + 1;
 		IF @i % 20 = 7
+		BEGIN
+			-- rolled_only: changed by nothing that commits (each session in its own third of it).
+			UPDATE dbo.rolled_only SET v = v + 1, pad = CONCAT('u', @i) WHERE id BETWEEN (@i * 53) % 9900 + 1 + $(SESSION) * 10000
+				AND (@i * 53) % 9900 + 60 + $(SESSION) * 10000;
 			ROLLBACK;
+		END
 		ELSE
 			COMMIT;
 	END TRY

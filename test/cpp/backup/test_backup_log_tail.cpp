@@ -193,18 +193,21 @@ int main() {
 		ParseLogBlock(b.data(), b.size(), 72, "test", keep);
 		Check(got.size() == 2 && got[0].lsn.slot == 1 && got[1].lsn.slot == 2 && got[0].has_allocation_unit,
 			  "a well-formed block: its records, slots 1 and 2");
-		Check(ErrorOf([&] { ParseLogBlock(b.data(), 500, 72, "test", keep); }).find("multiple of 512") != std::string::npos,
+		Check(ErrorOf([&] { ParseLogBlock(b.data(), 500, 72, "test", keep); }).find("multiple of 512") !=
+				  std::string::npos,
 			  "a size that is no multiple of 512");
 		auto c = b;
 		c[4] = 0x10;
 		c[5] = 0x02;  // the slot array's end: 528, past the 512-byte block
-		Check(ErrorOf([&] { ParseLogBlock(c.data(), c.size(), 72, "test", keep); }).find("slot array") != std::string::npos,
+		Check(ErrorOf([&] { ParseLogBlock(c.data(), c.size(), 72, "test", keep); }).find("slot array") !=
+				  std::string::npos,
 			  "a slot array past the block");
 		auto d = b;
 		d[498] = 0x10;	// the first record's offset: 16, inside the header
 		d[499] = 0x00;
-		Check(ErrorOf([&] { ParseLogBlock(d.data(), d.size(), 72, "test", keep); }).find("outside") != std::string::npos,
-			  "a record offset inside the header");
+		Check(
+			ErrorOf([&] { ParseLogBlock(d.data(), d.size(), 72, "test", keep); }).find("outside") != std::string::npos,
+			"a record offset inside the header");
 		// SQL Server 2017's blocks: a header of 48 bytes, records from there on (the oracle lane's 2017 backups).
 		Check(LogBlockHeaderBytes(14) == 48 && LogBlockHeaderBytes(15) == 72 && LogBlockHeaderBytes(17) == 72,
 			  "a block header of 48 bytes before SQL Server 2019 (15), 72 from it on");
@@ -212,11 +215,59 @@ int main() {
 		got.clear();
 		ParseLogBlock(old.data(), old.size(), 48, "test", keep);
 		Check(got.size() == 2, "a 2017 block: its records from 48");
-		Check(ErrorOf([&] { ParseLogBlock(old.data(), old.size(), 72, "test", keep); }).find("outside") != std::string::npos,
+		Check(ErrorOf([&] { ParseLogBlock(old.data(), old.size(), 72, "test", keep); }).find("outside") !=
+				  std::string::npos,
 			  "the same block read as a 2019 one: its first record inside the header");
 		auto e = Block(1, 600);
-		Check(ErrorOf([&] { ParseLogBlock(e.data(), e.size(), 72, "test", keep); }).find("runs past") != std::string::npos,
+		Check(ErrorOf([&] { ParseLogBlock(e.data(), e.size(), 72, "test", keep); }).find("runs past") !=
+				  std::string::npos,
 			  "a record's fixed part past the records");
+
+		// Review of #591: a fixed part is bounded by the record's own span (64 bytes here), not the block's
+		// records, and two slots may not name one record.
+		auto f = Block(2, 70);
+		Check(ErrorOf([&] { ParseLogBlock(f.data(), f.size(), 72, "test", keep); }).find("record's end") !=
+				  std::string::npos,
+			  "a fixed part reaching into the next record");
+		auto g = Block(2, 48);
+		g[500 - 4] = g[500 - 2];
+		g[500 - 3] = g[500 - 1];
+		Check(ErrorOf([&] { ParseLogBlock(g.data(), g.size(), 72, "test", keep); }).find("two records at") !=
+				  std::string::npos,
+			  "two slots at one offset");
+	}
+	std::cout << "D11's rule for one transaction's changes on one page (ChangeShows)" << std::endl;
+	{
+		auto lsn = [](uint32_t block) {
+			Lsn l;
+			l.vlf = 1;
+			l.block = block;
+			return l;
+		};
+		FuzzySummary::Change c;
+		c.oldest = lsn(10);
+		c.newest = lsn(20);
+		const Lsn checkpoint = lsn(5);
+		// Committed: stale when the copy is older than its newest change.
+		Check(ChangeShows(false, c, PageState::Present, lsn(15), checkpoint) &&
+				  !ChangeShows(false, c, PageState::Present, lsn(20), checkpoint),
+			  "committed: stale before its newest change, not at it");
+		// Rolled back: only a copy between its first change and its compensation holds what was undone.
+		c.rolled_back = true;
+		Check(!ChangeShows(false, c, PageState::Present, lsn(8), checkpoint),
+			  "rolled back, copied before it: as RESTORE");
+		Check(ChangeShows(false, c, PageState::Present, lsn(15), checkpoint),
+			  "rolled back, copied between a change and its undo: stale");
+		Check(!ChangeShows(false, c, PageState::Present, lsn(25), checkpoint),
+			  "rolled back, copied after its undo: as RESTORE");
+		Check(!ChangeShows(false, c, PageState::NotLive, lsn(0), checkpoint) &&
+				  !ChangeShows(false, c, PageState::Pending, lsn(0), checkpoint),
+			  "rolled back, on a page the backup does not hold: as RESTORE");
+		// Open: dirty when the copy holds its oldest change.
+		c.rolled_back = false;
+		Check(ChangeShows(true, c, PageState::Present, lsn(10), checkpoint) &&
+				  !ChangeShows(true, c, PageState::Present, lsn(9), checkpoint),
+			  "open: dirty from its oldest change on");
 	}
 	std::cout << "the pages the tail formats (a zero copy in a one-pass backup: Pending)" << std::endl;
 	{

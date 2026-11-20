@@ -669,6 +669,14 @@ std::shared_ptr<const AttachedBackup> mssql::backup::FindAttachedBackup(ClientCo
 	return catalog.Cast<MSSQLBackupCatalog>().BackupAt(context, at);
 }
 
+std::string mssql::backup::AttachedFuzzy(ClientContext &context, const std::string &name) {
+	auto db = DatabaseManager::Get(context).GetDatabase(Identifier(name));
+	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {
+		return std::string();
+	}
+	return db->GetCatalog().Cast<MSSQLBackupCatalog>().Fuzzy();
+}
+
 void mssql::backup::PinAttachedVersion(ClientContext &context, const std::string &name, BackupAt &at) {
 	auto db = DatabaseManager::Get(context).GetDatabase(Identifier(name));
 	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {

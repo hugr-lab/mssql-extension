@@ -389,16 +389,8 @@ std::map<uint64_t, std::map<uint64_t, UnitEffect>> EffectsOf(const FuzzySummary 
 					if (!pages) {
 						continue;  // a log backup: no copy to compare with
 					}
-					// TableFuzziness's rules (backup_fuzzy.cpp), by transaction.
-					if (open) {
-						e.effect = e.effect || (state == PageState::Present	  ? c.oldest <= copy.header.lsn
-												: state == PageState::NotLive ? false
-																			  : true);
-					} else {
-						e.effect = e.effect || (state == PageState::Present	  ? !(c.newest <= copy.header.lsn)
-												: state == PageState::NotLive ? !(c.newest <= tail.checkpoint)
-																			  : true);
-					}
+					// TableFuzziness's rules, by transaction.
+					e.effect = e.effect || ChangeShows(open != 0, c, state, copy.header.lsn, tail.checkpoint);
 				}
 			}
 		}

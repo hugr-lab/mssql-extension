@@ -101,7 +101,7 @@ Each of these is refused by name, before any value is returned:
 | `backup_size`, `compressed_size` | `BIGINT` | `BackupSize` / `CompressedBackupSize`; equal for an uncompressed backup; `compressed_size` NULL when the backup does not record it |
 | `page_count` | `BIGINT` | NULL for now |
 | `log_tail_bytes` | `BIGINT` | the bytes of log the backup carries |
-| `consistent`, `open_transactions`, `committed_after_checkpoint` | `BOOLEAN`, `INTEGER`, `INTEGER` | from the backup's log tail (see [A backup taken under writes](#a-backup-taken-under-writes)): no transaction open at the backup's end and none finished after its checkpoint; the transactions open, and those finished with a row change after the checkpoint. NULL for a log backup |
+| `consistent`, `open_transactions`, `committed_after_checkpoint`, `rolled_back_after_checkpoint` | `BOOLEAN`, `INTEGER`, `INTEGER`, `INTEGER` | from the backup's log tail (see [A backup taken under writes](#a-backup-taken-under-writes)): no transaction open at the backup's end and none committed or rolled back after its checkpoint; the transactions open, and those committed / rolled back with a row change after the checkpoint (a rolled-back one makes `consistent` false: whether a page copy holds what it undid is the tables' `fuzzy_status`). NULL for a log backup, and with a WARNING when the tail cannot be read whole |
 | `recovery_model` | `VARCHAR` | `FULL`, `BULK_LOGGED` or `SIMPLE` |
 | `files` | `LIST(STRUCT(…))` | the database's files: `logical_name`, `physical_name`, `type` (`data` / `log`), `file_id`, `filegroup_id`, `filegroup_name`, `size_bytes`, `max_size_bytes`, `create_lsn`, `unique_id`, `backup_size_bytes` (NULL for now), `is_present` (FILELISTONLY's IsPresent: the file is in this backup) |
 
@@ -256,7 +256,7 @@ Four virtual columns, which `SELECT *` leaves out:
 | `_mssql_page` | `VARCHAR` | the row's page: `'01'`, then its file and page number in hex (14 characters) |
 | `_mssql_rid` | `BLOB` | the row's identity: a heap row's original place (its `%%physloc%%`, after a byte `0x00`), a clustered row's key (after `0x01`), stable across index rebuilds |
 | `_mssql_page_lsn` | `DECIMAL(25,0)` | the LSN of the page's last change, in `RESTORE HEADERONLY`'s numeric form |
-| `_mssql_lob` | `BLOB` | the row's values stored off row and the pages that hold them -- every one of the row's, whichever columns are selected -- in a format of the reader's own (versioned by its first byte), for a later differential backup's import; NULL for a row with none (a `text` / `ntext` / `image` value updated to NULL keeps its place off row, so its row has a map) |
+| `_mssql_lob` | `BLOB` | the row's values stored off row and the pages that hold them -- every one of the row's, whichever columns are selected -- in a format of the reader's own (versioned by its first byte), for a later differential backup's import; NULL for a row with none (a `text` / `ntext` / `image` value updated to NULL keeps its place off row, so its row has a map). It maps a value's tree as the row points to it: a value read as NULL because a page of it became live while the backup ran (see [A backup taken under writes](#a-backup-taken-under-writes)) keeps its entry when only its data, not its tree, is on that page |
 
 A ROW- or PAGE-compressed table, or partition, is read like an uncompressed one: the same values, the
 same `_mssql_rid`; a PAGE page's values are rebuilt from its anchor record and dictionary, so a row reads
@@ -282,8 +282,10 @@ can differ from the restored database's:
 
 - `dirty`: a transaction still open at the backup's end changed the table, and the copies of its
   pages hold that change (`RESTORE` undoes it);
-- `stale`: a finished transaction changed the table after its pages were copied, or on a page the
-  backup does not hold (`RESTORE` redoes it);
+- `stale`: a committed transaction changed the table after its pages were copied, or on a page the
+  backup does not hold (`RESTORE` redoes it); or a rolled-back one changed a page before its copy and
+  undid it after (`RESTORE` redoes the undo). A rolled-back transaction whose changes and undo are all
+  before a page's copy, or all after it, leaves the copy as `RESTORE` has it;
 - `stale+dirty`: both; `consistent`: neither.
 
 ```sql
@@ -292,7 +294,7 @@ FROM mssql_backup_tables('/backups/busy.bak') WHERE fuzzy_status <> 'consistent'
 ```
 
 `mssql_backup_info` says it for the whole database: `consistent` when no transaction was open at the
-end and none finished after the checkpoint. A table the status does not name is read exactly as the
+end and none committed or rolled back after the checkpoint. A table the status does not name is read exactly as the
 restored database holds it; one it names may differ in the rows those transactions changed.
 
 What a scan does with a table that is not consistent is `fuzzy :=` on `mssql_backup_scan`, the `fuzzy`
@@ -314,8 +316,9 @@ A page the database took into use while the backup ran has no copy in the data t
 content is only in the backup's log tail, which the reader does not replay yet. Its table is never
 `consistent`. Its other pages are read as for any table that is not -- what was committed when the
 backup began is in them -- and the page is passed over: with a WARNING naming it under `'warn'`,
-silently under `'ignore'`; `'error'` refuses the table by name. `RESTORE` holds its rows, and so will
-the reader once it replays the tail.
+silently under `'ignore'`; `'error'` refuses the table by name. A value stored off row (a `varchar(max)`
+past the row, say) on such a page is read as NULL and its row read, with a WARNING of its own under
+`'warn'`. `RESTORE` holds its rows and values, and so will the reader once it replays the tail.
 
 ### The log a backup carries
 

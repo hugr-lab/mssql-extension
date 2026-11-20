@@ -3,8 +3,8 @@
 //
 // PR 1 reads the headers only (stage 1): the columns whose source is a later stage are NULL until it
 // lands -- page_count (the allocation pages, PR 2) and each file's backup_size_bytes (the page index).
-// consistent / open_transactions / committed_after_checkpoint are D11's database level (task 27): the
-// log tail read (stage 5, kept by the opened-file cache); NULL for a log backup, whose records are not
+// consistent / open_transactions / committed_after_checkpoint / rolled_back_after_checkpoint are D11's database level
+// (task 27): the log tail read (stage 5, kept by the opened-file cache); NULL for a log backup, whose records are not
 // a tail. The database's version, level and collation come from the trailer SCIN.
 
 #include "backup/backup_info_function.hpp"
@@ -93,6 +93,7 @@ std::vector<Column> Columns() {
 			{"consistent", LogicalType::BOOLEAN},
 			{"open_transactions", LogicalType::INTEGER},
 			{"committed_after_checkpoint", LogicalType::INTEGER},
+			{"rolled_back_after_checkpoint", LogicalType::INTEGER},
 			{"recovery_model", LogicalType::VARCHAR},
 			{"files", LogicalType::LIST(FileType())}};
 }
@@ -230,7 +231,8 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened, const FuzzySummary *tail
 	row.push_back(Value::BIGINT(static_cast<int64_t>(log_tail)));
 	row.push_back(tail ? Value::BOOLEAN(tail->Consistent()) : Value(LogicalType::BOOLEAN));	 // consistent: D11
 	row.push_back(tail ? Value::INTEGER(static_cast<int32_t>(tail->open_transactions)) : no_int);
-	row.push_back(tail ? Value::INTEGER(static_cast<int32_t>(tail->finished_after_checkpoint)) : no_int);
+	row.push_back(tail ? Value::INTEGER(static_cast<int32_t>(tail->committed_after_checkpoint)) : no_int);
+	row.push_back(tail ? Value::INTEGER(static_cast<int32_t>(tail->rolled_back_after_checkpoint)) : no_int);
 	row.push_back(Value(RecoveryModelName(set.recovery_model)));
 	row.push_back(Value::LIST(FileType(), std::move(files)));
 	return row;

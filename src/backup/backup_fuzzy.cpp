@@ -20,6 +20,24 @@ bool Newer(const Lsn &a, const Lsn &b) {
 	return !(a <= b);
 }
 
+//! A change's place: its allocation unit, its page and its transaction.
+struct ChangeKey {
+	uint64_t unit;
+	uint64_t page;
+	uint64_t transaction;
+	bool operator==(const ChangeKey &other) const {
+		return unit == other.unit && page == other.page && transaction == other.transaction;
+	}
+};
+struct ChangeKeyHash {
+	size_t operator()(const ChangeKey &k) const {
+		uint64_t h = k.unit * 0x9E3779B97F4A7C15ULL;
+		h ^= k.page + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+		h ^= k.transaction + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+		return static_cast<size_t>(h);
+	}
+};
+
 //! The summary's builder: one pass over the records, the transactions' fates known only at its end.
 class Summarizer {
 public:
@@ -34,6 +52,9 @@ public:
 			return;	 // LastLSN is the next record after the backup's (HEADERONLY): not the backup's
 		}
 		summary_.records++;
+		if (r.lsn <= summary_.checkpoint && summary_.checkpoint <= r.lsn) {
+			saw_checkpoint_ = true;
+		}
 		if (r.op == log_op::FORMAT_PAGE && r.has_page) {
 			summary_.formatted.insert(static_cast<uint64_t>(r.file) << 32 | r.page);
 		}
@@ -72,29 +93,34 @@ public:
 		}
 		const uint64_t page = (static_cast<uint64_t>(r.file) << 32) | r.page;
 		auto &changes = changes_[r.allocation_unit][page];
-		bool found = false;
-		for (auto &c : changes) {
-			if (c.transaction == r.transaction) {
-				if (Newer(r.lsn, c.newest)) {
-					c.newest = r.lsn;
-				}
-				if (Newer(c.oldest, r.lsn)) {
-					c.oldest = r.lsn;
-				}
-				found = true;
-				break;
+		// The page's change by this transaction, found by its index (review of #591: a linear search of the
+		// page's changes was quadratic in the short transactions of a hot page).
+		const ChangeKey key{r.allocation_unit, page, r.transaction};
+		auto at = index_.find(key);
+		if (at != index_.end()) {
+			auto &c = changes[at->second];
+			if (Newer(r.lsn, c.newest)) {
+				c.newest = r.lsn;
 			}
-		}
-		if (!found) {
+			if (Newer(c.oldest, r.lsn)) {
+				c.oldest = r.lsn;
+			}
+		} else {
 			FuzzySummary::Change c;
 			c.transaction = r.transaction;
 			c.oldest = r.lsn;
 			c.newest = r.lsn;
+			index_.emplace(key, changes.size());
 			changes.push_back(c);
 		}
 		if (Newer(r.lsn, summary_.checkpoint)) {
 			after_checkpoint_.insert(r.transaction);
 		}
+	}
+
+	//! The record at CheckpointLSN was read: the tail holds what it claims, at least to there.
+	bool SawCheckpoint() const {
+		return saw_checkpoint_;
 	}
 
 	FuzzySummary Finish() {
@@ -107,16 +133,26 @@ public:
 				summary_.open_transactions++;
 			}
 		}
+		auto rolled_back = [&](uint64_t transaction) {
+			auto it = summary_.transactions.find(transaction);
+			return it != summary_.transactions.end() && it->second.state == FuzzySummary::State::RolledBack;
+		};
 		for (auto transaction : after_checkpoint_) {
-			if (!open(transaction)) {
-				summary_.finished_after_checkpoint++;
+			if (open(transaction)) {
+				continue;
 			}
+			(rolled_back(transaction) ? summary_.rolled_back_after_checkpoint : summary_.committed_after_checkpoint)++;
 		}
 		for (auto &unit : changes_) {
 			auto &out = summary_.units[unit.first];
 			for (auto &page : unit.second) {
-				for (const auto &c : page.second) {
-					(open(c.transaction) ? out.open : out.finished)[page.first].push_back(c);
+				for (auto &c : page.second) {
+					if (open(c.transaction)) {
+						out.open[page.first].push_back(c);
+					} else {
+						c.rolled_back = rolled_back(c.transaction);
+						out.finished[page.first].push_back(c);
+					}
 				}
 			}
 		}
@@ -127,6 +163,9 @@ private:
 	FuzzySummary summary_;
 	std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::vector<FuzzySummary::Change>>> changes_;
 	std::unordered_set<uint64_t> after_checkpoint_;
+	//! Where each (unit, page, transaction)'s change is in its page's vector.
+	std::unordered_map<ChangeKey, size_t, ChangeKeyHash> index_;
+	bool saw_checkpoint_ = false;
 };
 
 //! What the backup holds of a page: its copy's state, and its copy read when Present.
@@ -161,6 +200,14 @@ bool FormattedInTail(const FuzzySummary &tail, uint16_t file, uint32_t page) {
 FuzzySummary SummarizeLogTail(const LogTailReader &tail, const Lsn &first, const Lsn &last, const Lsn &checkpoint) {
 	Summarizer summarizer(first, last, checkpoint);
 	tail.ForEach([&](const LogRecord &r) { summarizer.Add(r); });
+	// A data backup's tail runs from FirstLSN (at or before the checkpoint) to LastLSN: one that does not
+	// hold the checkpoint's own record was not read whole, and a summary of what it holds would read as
+	// consistent (review of #591: an empty one did).
+	if (!checkpoint.IsZero() && first <= checkpoint && !(last <= checkpoint) && !summarizer.SawCheckpoint()) {
+		throw FormatError("backup: the log tail (" + first.ToDecimal() + " to " + last.ToDecimal() +
+						  ") holds no record at its CheckpointLSN " + checkpoint.ToDecimal() +
+						  ": it is not read whole");
+	}
 	return summarizer.Finish();
 }
 
@@ -203,6 +250,27 @@ const char *TableFuzziness::Status() const {
 	return dirty ? "dirty" : "consistent";
 }
 
+bool ChangeShows(bool open, const FuzzySummary::Change &c, PageState state, const Lsn &copy_lsn,
+				 const Lsn &checkpoint) {
+	if (open) {
+		// (iii): its oldest row operation on the page no newer than the copy: the copy holds what a RESTORE
+		// undoes. One made after the copy (or on a page the image does not have) is not in it; a Pending or
+		// unreadable page may hold it.
+		return state == PageState::Present ? !Newer(c.oldest, copy_lsn) : state != PageState::NotLive;
+	}
+	if (c.rolled_back) {
+		// Its changes undone in the tail: the copy differs only when it holds a change and lacks the
+		// compensation, between the two. A page the image does not have, or does not hold, holds none of it.
+		return state == PageState::Present && !Newer(c.oldest, copy_lsn) && Newer(c.newest, copy_lsn);
+	}
+	// (iv): a committed change the copy does not hold. A page the backup holds as not live was freed before
+	// the image (its rows gone with it: a delete, a split), unless the change came after CheckpointLSN, on a
+	// page taken into use after the image; a Pending or unreadable one holds none.
+	return state == PageState::Present	 ? Newer(c.newest, copy_lsn)
+		   : state == PageState::NotLive ? Newer(c.newest, checkpoint)
+										 : true;
+}
+
 TableFuzziness FuzzinessOf(const FuzzySummary &summary, const std::vector<uint64_t> &units, const PageStore &pages) {
 	TableFuzziness result;
 	std::unordered_set<uint64_t> dirty;
@@ -213,31 +281,13 @@ TableFuzziness FuzzinessOf(const FuzzySummary &summary, const std::vector<uint64
 		if (it == summary.units.end()) {
 			continue;
 		}
-		// (iv): a finished transaction's change the copy does not hold. A page the backup holds as not live was
-		// freed before the image (its rows gone with it: a delete, a split), unless the change came after
-		// CheckpointLSN, on a page taken into use after the image; a Pending or unreadable one holds none.
-		for (const auto &page : it->second.finished) {
-			const PageState state = CopyOf(pages, page.first, copy);
-			for (const auto &c : page.second) {
-				const bool missing = state == PageState::Present   ? Newer(c.newest, copy.header.lsn)
-									 : state == PageState::NotLive ? Newer(c.newest, summary.checkpoint)
-																   : true;
-				if (missing) {
-					stale.insert(c.transaction);
-				}
-			}
-		}
-		// (iii): an open transaction's change the copy holds -- its oldest row operation on the page no newer
-		// than the copy -- which a RESTORE undoes. One made after the copy (or on a page the image does not
-		// have) is not in it, as the RESTORE's undo leaves it; a Pending or unreadable page may hold it.
-		for (const auto &page : it->second.open) {
-			const PageState state = CopyOf(pages, page.first, copy);
-			for (const auto &c : page.second) {
-				const bool held = state == PageState::Present	? !Newer(c.oldest, copy.header.lsn)
-								  : state == PageState::NotLive ? false
-																: true;
-				if (held) {
-					dirty.insert(c.transaction);
+		for (int open = 0; open < 2; open++) {
+			for (const auto &page : open ? it->second.open : it->second.finished) {
+				const PageState state = CopyOf(pages, page.first, copy);
+				for (const auto &c : page.second) {
+					if (ChangeShows(open != 0, c, state, copy.header.lsn, summary.checkpoint)) {
+						(open ? dirty : stale).insert(c.transaction);
+					}
 				}
 			}
 		}

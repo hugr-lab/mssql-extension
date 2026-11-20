@@ -105,8 +105,8 @@ TableFuzziness CheckFuzzy(ClientContext &context, const FuzzySummary &tail, cons
 	}
 	const std::string what = StringUtil::Format(
 		"%s.%s is %s in this backup: %u transaction(s) open at its LastLSN changed it (their changes may show), "
-		"%u finished transaction(s) changed pages after their copy (those changes are missing); its rows are as "
-		"of the backup's CheckpointLSN",
+		"%u finished transaction(s) changed pages after their copy (those changes are missing); its rows are "
+		"each page's as the backup copied it",
 		table.schema_name, table.name, fuzzy.Status(), fuzzy.open_transactions, fuzzy.stale_transactions);
 	if (mode == FuzzyMode::Error) {
 		throw InvalidInputException(

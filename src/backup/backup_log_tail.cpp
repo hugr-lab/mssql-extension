@@ -104,6 +104,11 @@ void ParseLogBlock(const uint8_t *block, size_t size, size_t header_bytes, const
 	}
 	std::vector<uint16_t> sorted(starts);
 	std::sort(sorted.begin(), sorted.end());
+	// Two slots at one offset would give one record twice (review of #591).
+	const auto twice = std::adjacent_find(sorted.begin(), sorted.end());
+	if (twice != sorted.end()) {
+		throw FormatError(where + ": two records at " + std::to_string(*twice));
+	}
 	LogRecord record;
 	record.lsn.vlf = U32(block + 12);
 	record.lsn.block = U32(block + 16);
@@ -117,16 +122,17 @@ void ParseLogBlock(const uint8_t *block, size_t size, size_t header_bytes, const
 		}
 		const uint16_t fixed = U16(block + at + 2);
 		const size_t header = std::max<size_t>(fixed, 24);
-		if (at + header > records_end) {
-			throw FormatError(record_where + ": a fixed part of " + std::to_string(fixed) + " bytes at " +
-							  std::to_string(at) + " runs past the block's records (" + std::to_string(records_end) +
-							  ")");
-		}
-		const uint8_t *r = block + at;
+		// The record runs to the next one (the last to the records' end): its fixed part within that, or
+		// its page and unit fields would be the next record's bytes (review of #591).
 		auto next = std::upper_bound(sorted.begin(), sorted.end(), static_cast<uint16_t>(at));
 		const size_t end = next == sorted.end() ? records_end : std::min<size_t>(*next, records_end);
+		if (at + header > end) {
+			throw FormatError(record_where + ": a fixed part of " + std::to_string(fixed) + " bytes at " +
+							  std::to_string(at) + " runs past the record's end (" + std::to_string(end) + ")");
+		}
+		const uint8_t *r = block + at;
 		record.bytes = r;
-		record.length = static_cast<uint16_t>(std::max(end, at + header) - at);
+		record.length = static_cast<uint16_t>(end - at);
 		record.fixed_length = fixed;
 		record.previous.vlf = U32(r + 4);
 		record.previous.block = U32(r + 8);

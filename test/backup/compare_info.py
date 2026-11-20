@@ -38,6 +38,7 @@ NOT_COMPARED = {
                   "checks each table's status against a RESTORE)",
     "open_transactions": "not compared: RESTORE prints no such field (D11, from the log tail)",
     "committed_after_checkpoint": "not compared: RESTORE prints no such field (D11, from the log tail)",
+    "rolled_back_after_checkpoint": "not compared: RESTORE prints no such field (D11, from the log tail)",
 }
 # The same for the fields of each `files` entry.
 FILE_UNLOCATED = ["backup_size_bytes"]

@@ -298,6 +298,10 @@ void AddVersionParameters(TableFunction &function);
 //! key when pinned), its default version when none. [the catalog layer]
 std::shared_ptr<const AttachedBackup> FindAttachedBackup(ClientContext &context, const std::string &name,
 														 const BackupAt &at = BackupAt());
+//! The `fuzzy` ATTACH option of the backup attached as `name` ("" when none, or `name` is no such
+//! catalog): what a file function named by it does with a table that is not consistent, after its own
+//! fuzzy := and before the setting (review of #591). [the catalog layer]
+std::string AttachedFuzzy(ClientContext &context, const std::string &name);
 //! The key a version of an attached backup's history is pinned by (BackupAt::key): its backups and their
 //! files. A caller that resolved numbers in one `history` (the catalog's versions it read) opens them by
 //! these keys, so a refresh between two opens cannot renumber one of them (review of #580's merge).

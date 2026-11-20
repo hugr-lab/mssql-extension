@@ -400,6 +400,22 @@ OffRowNeed RecordStager::PrepareRow(const RecordView &record) {
 	return PrepareRow(RowRecord::Fixed(record, RowVarCount(record, layout_->table)));
 }
 
+template <class WALK>
+bool RecordStager::UnlessPending(WALK &&walk) {
+	try {
+		walk();
+		return true;
+	} catch (PendingPageError &e) {
+		if (!pending_as_null_) {
+			throw PendingValueError(e.what());
+		}
+		if (pending_values_++ == 0) {
+			first_pending_ = e.what();
+		}
+		return false;
+	}
+}
+
 OffRowNeed RecordStager::PrepareRow(const RowRecord &row) {
 	if (!layout_) {
 		throw InternalException("backup: RecordStager::PrepareRow with no layout");
@@ -427,8 +443,13 @@ OffRowNeed RecordStager::PrepareRow(const RowRecord &row) {
 			// Its length (and whether it is NULL) is its root record's: read now, so it is reserved
 			// before it is assembled.
 			NoSink none;
-			const LobValue root =
-				WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::MapOnly, MAX_OFF_ROW_BYTES, c.name, none);
+			LobValue root;
+			if (!UnlessPending([&]() {
+					root = WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::MapOnly, MAX_OFF_ROW_BYTES, c.name, none);
+				})) {
+				p.is_null = true;  // a node on a Pending page: the value NULL (PendingValuesAsNull)
+				continue;
+			}
 			p.length = root.length;
 			p.is_null = root.is_null;
 		} else {
@@ -490,7 +511,11 @@ void RecordStager::AppendDirect(size_t column, Column &c, ColumnStaging &st, con
 								   c.name, StringUtil::BytesToHumanReadableString(p.length), e.what());
 	}
 	DirectSink sink(value.GetDataWriteable(), p.length, c.name);
-	WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink);
+	if (!UnlessPending(
+			[&]() { WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink); })) {
+		st.AppendNull();  // its room in the vector's heap stays unused
+		return;
+	}
 	if (sink.at != p.length) {
 		throw FormatError("backup: " + c.name + " holds " + std::to_string(sink.at) + " bytes off row, not its " +
 						  std::to_string(p.length));
@@ -519,7 +544,11 @@ void RecordStager::AppendStream(size_t column, Column &c, ColumnStaging &st, con
 	}
 	StreamSink sink(stream_block_, value.GetDataWriteable(), c.code_page_kernel ? c.meta.code_page : nullptr,
 					st.replaced_units);
-	WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink);
+	if (!UnlessPending(
+			[&]() { WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink); })) {
+		st.AppendNull();
+		return;
+	}
 	if (sink.Flush(true) != 0) {
 		throw FormatError("backup: " + c.name + " holds " + std::to_string(p.length) +
 						  " bytes off row, not a whole number of UTF-16 units");
@@ -549,8 +578,15 @@ void RecordStager::AppendOffRow(Column &c, ColumnStaging &st, const PreparedValu
 		large_staged_ = true;
 	}
 	StagingSink sink(st);
-	const LobValue value =
-		WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink);
+	const idx_t staged_before = st.payload_used;
+	LobValue value;
+	if (!UnlessPending([&]() {
+			value = WalkLob(Fetch(c.name), p.pointer, units_, LobWalk::Assemble, MAX_OFF_ROW_BYTES, c.name, sink);
+		})) {
+		st.payload_used = staged_before;  // the fragments staged before the Pending page, given back
+		st.AppendNull();
+		return;
+	}
 	if (value.is_null) {
 		st.AppendNull();
 		return;
@@ -588,7 +624,12 @@ void RecordStager::MapRow(const RowRecord &row) {
 		e.form = pointer.form;
 		e.pointer.assign(reinterpret_cast<const char *>(v.data), v.size);
 		LobNodeList nodes;
-		const LobValue value = WalkLob(Fetch(what), pointer, units_, LobWalk::MapOnly, MAX_OFF_ROW_BYTES, what, nodes);
+		LobValue value;
+		if (!UnlessPending([&]() {
+				value = WalkLob(Fetch(what), pointer, units_, LobWalk::MapOnly, MAX_OFF_ROW_BYTES, what, nodes);
+			})) {
+			continue;  // its tree on a Pending page: not in the map, as the value is NULL
+		}
 		e.is_null = value.is_null;
 		e.length = static_cast<uint32_t>(value.length);
 		e.nodes = std::move(nodes.nodes);

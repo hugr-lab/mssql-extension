@@ -3,26 +3,32 @@
 //
 // backup/backup_fuzzy.hpp
 //
-// Spec 085 D11, task 27 (PR 5): the fuzzy status of a data backup from its log tail. A backup's pages
-// hold the database as of its CheckpointLSN, dirty reads included (E3§2); the tail (FirstLSN to LastLSN)
-// says where that differs from a RESTORE, per allocation unit, by E3's flag (v), the one that held at
-// table level on every run (precision 1.00, recall 1.00 over 54 table-runs):
+// Spec 085 D11, task 27 (PR 5): the fuzzy status of a data backup from its log tail. A backup holds each
+// page as it was when it copied it, dirty reads included (E3§2); the tail (FirstLSN to LastLSN) says where
+// that differs from a RESTORE, per allocation unit, by E3's flag (v), the one that held at table level on
+// every run (precision 1.00, recall 1.00 over 54 table-runs):
 //   (iii) a transaction open at LastLSN has a row operation on the unit: its changes may show (dirty);
-//   (iv)  a finished transaction's row operation in the tail is newer than its page's copy, or the page
+//   (iv)  a committed transaction's row operation in the tail is newer than its page's copy, or the page
 //         has no copy: the change is missing (stale).
 // Not "page LSN > CheckpointLSN": a page copied before it changed keeps its old LSN (recall 0.42).
-// A finished transaction is a committed one, and also one rolled back: a rollback written after a
-// page's copy leaves the copy holding what it undid (E3 counted committed ones; a rolled-back one
-// before the checkpoint never left dirt there, so this widens nothing E3 measured). A transaction whose
-// BEGIN is not in the tail counts as finished: in a data backup's tail (FirstLSN covers the oldest open
-// one's BEGIN) that is the system's work. A record of no transaction (id 0) is no row change of the
-// flags. LastLSN is exclusive: the next record after the backup's (HEADERONLY). DuckDB-free (D15).
+// A rolled-back transaction is stale on a page only when the copy is between its oldest change there
+// and its newest (the rollback's compensation after the copy): the copy holds what it undid. A copy
+// before all of them, or after all of them, is what a RESTORE has (review of #591: counted as committed
+// before, a table equal to the RESTORE read stale). It takes the undo to land on the page of the change
+// it undoes; a logical undo moved to another page by a split between them (a clustered index) can be
+// missed -- the copy of either page judged alone. Not measured: the fuzzy fixture's rolled_only is updated
+// in place. A transaction whose BEGIN is not in the tail counts
+// as committed: in a data backup's tail (FirstLSN covers the oldest open one's BEGIN) that is the
+// system's work. A record of no transaction (id 0) is no row change of the flags. LastLSN is exclusive:
+// the next record after the backup's (HEADERONLY). The rules are ChangeShows's, the one place both the
+// tables' status and mssql_backup_transactions' effects ask. DuckDB-free (D15).
 //===----------------------------------------------------------------------===//
 
 #pragma once
 
 #include "backup/backup_log_tail.hpp"
 #include "backup/backup_lsn.hpp"
+#include "backup/backup_page.hpp"
 
 #include <cstdint>
 #include <string>
@@ -35,7 +41,6 @@ namespace duckdb {
 namespace mssql {
 namespace backup {
 
-class PageStore;
 struct CatalogTable;
 
 //! What the tail of one data backup says (stage 5): read once, before any page is.
@@ -45,14 +50,20 @@ struct FuzzySummary {
 	uint64_t records = 0;
 	//! Transactions begun in the tail and not ended by LastLSN.
 	uint32_t open_transactions = 0;
-	//! Finished transactions with a row operation after CheckpointLSN: changes the pages do not hold.
-	uint32_t finished_after_checkpoint = 0;
+	//! Committed transactions (and the system's, no BEGIN) with a row operation after CheckpointLSN:
+	//! changes the pages may not hold.
+	uint32_t committed_after_checkpoint = 0;
+	//! Rolled-back ones with a row operation after CheckpointLSN: a page copied between a change and its
+	//! compensation holds what was undone (the tables' status says which).
+	uint32_t rolled_back_after_checkpoint = 0;
 
 	//! A page's row operations by one transaction: the LSNs of its oldest and its newest.
 	struct Change {
 		uint64_t transaction = 0;
 		Lsn oldest;
 		Lsn newest;
+		//! Its transaction was rolled back (in `finished` only).
+		bool rolled_back = false;
 	};
 	struct Unit {
 		//! By page, (file << 32) | page: the finished transactions' changes (flag (iv)) and the open ones'
@@ -86,9 +97,10 @@ struct FuzzySummary {
 	//! By transaction id; the id 0 (records of no transaction) is not one.
 	std::unordered_map<uint64_t, Transaction> transactions;
 
-	//! D11's database level: no open transaction, no finished row operation after CheckpointLSN.
+	//! D11's database level: no open transaction, no finished row operation after CheckpointLSN (a
+	//! rolled-back one too: whether a copy holds what it undid is per page, the tables' status).
 	bool Consistent() const {
-		return open_transactions == 0 && finished_after_checkpoint == 0;
+		return open_transactions == 0 && committed_after_checkpoint == 0 && rolled_back_after_checkpoint == 0;
 	}
 	//! What it holds, for the opened-file cache's estimate.
 	size_t MemoryBytes() const;
@@ -107,6 +119,12 @@ FuzzySummary SummarizeLogRecords(const std::vector<LogRecord> &records, const Ls
 const char *TransactionStateName(FuzzySummary::State state);
 //! fn_dblog's spelling of a transaction id: "hhhh:hhhhhhhh".
 std::string TransactionIdText(uint64_t transaction);
+
+//! D11's rule for one transaction's changes on one page (`c`, from `open` or `finished`), its copy's
+//! `state` and, when Present, `copy_lsn`: whether the copy differs from a RESTORE by them -- an open
+//! one's change it holds (dirty), a committed one's it lacks, a rolled-back one's it holds undone after
+//! it (stale).
+bool ChangeShows(bool open, const FuzzySummary::Change &c, PageState state, const Lsn &copy_lsn, const Lsn &checkpoint);
 
 //! A table's status: over its base rowsets' allocation units (in-row, row-overflow, LOB).
 struct TableFuzziness {

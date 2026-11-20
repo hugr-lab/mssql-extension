@@ -12,6 +12,8 @@
 --   open_only   changed only by the open transaction, before the backups: dirty
 --   pre_commit  changed and committed after the open transaction began, before the backups: its records are in
 --               the tail, older than its pages' copies, so consistent (flag (iv) must not fire on them)
+--   rolled_only changed only by the workload's rolled-back transactions: stale only where a page was copied
+--               between a change and its undo, else equal to the RESTORE (review of #591: it read stale)
 -- Synthetic rows only (T4).
 SET NOCOUNT ON;
 GO
@@ -33,6 +35,7 @@ CREATE TABLE dbo.lob (id int PRIMARY KEY, doc varchar(max) NOT NULL);
 CREATE TABLE dbo.static (id int PRIMARY KEY, v int NOT NULL);
 CREATE TABLE dbo.open_only (id int PRIMARY KEY, v int NOT NULL);
 CREATE TABLE dbo.pre_commit (id int PRIMARY KEY, v int NOT NULL);
+CREATE TABLE dbo.rolled_only (id int PRIMARY KEY, v int NOT NULL, pad char(200) NOT NULL);
 GO
 -- About 400 MB, so a backup throttled to one 64 KB buffer runs long enough for commits to land after its
 -- checkpoint.
@@ -48,6 +51,8 @@ WITH n AS (SELECT TOP (5000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FRO
 INSERT INTO dbo.open_only (id, v) SELECT i, i FROM n;
 WITH n AS (SELECT TOP (5000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b)
 INSERT INTO dbo.pre_commit (id, v) SELECT i, i FROM n;
+WITH n AS (SELECT TOP (30000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b)
+INSERT INTO dbo.rolled_only (id, v, pad) SELECT i, i, CONCAT('r', i) FROM n;
 GO
 -- The base of the differential, taken quiet (the log chain starts here too).
 BACKUP DATABASE bak_fuzzy TO DISK = '$(DIR)/fuzzy_base.bak' WITH FORMAT, INIT, CHECKSUM, NAME = 'fuzzy_base';

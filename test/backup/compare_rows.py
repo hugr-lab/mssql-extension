@@ -298,7 +298,9 @@ def main():
                               "WHERE is_indexed ORDER BY schema_name, view_name")
     if not ok:
         sys.exit(f"compare_rows: mssql_backup_views failed on {args.backup}:\n{views}")
-    for v in views:
+    # Not on a backup taken under load (--fuzzy): a view's rows may differ there, and no fuzzy status is
+    # given for a view, so its exact comparison would fail where nothing is wrong (review of #591).
+    for v in ([] if args.fuzzy else views):
         schema, view = v["schema_name"], v["view_name"]
         where = f"{schema}.{view} (indexed view)"
         if v["decodable"] in (False, "false"):
