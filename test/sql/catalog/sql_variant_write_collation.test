@@ -1,0 +1,140 @@
+# name: test/sql/catalog/sql_variant_write_collation.test
+# description: Spec 093 T2 -- a string value written into a sql_variant carries the database's default collation on every write path, in a database whose default is not the server's
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN, MSSQL_TEST_HOST, MSSQL_TEST_PORT, MSSQL_TEST_USER, MSSQL_TEST_PASS
+#
+# A sql_variant has no collation of its own: a string base value carries one. The statement path's
+# CAST(CAST(N'...' AS nvarchar(n)) AS sql_variant) takes the database's default by T-SQL's rule; the
+# bulk envelope states it -- from the catalog's database collation (INSERT BULK, CTAS, #stage, a staged
+# MERGE's #src) or the probe's DATABASEPROPERTYEX for COPY into an existing table. TestDB is
+# SQL_Latin1_General_CP1_CI_AS, the BCP column's default bytes, so a path that wrote no collation at all
+# would pass there; this makes a database whose default is Cyrillic_General_CI_AS, where such a path
+# would say SQL_Latin1_General_CP1_CI_AS and one that did not find the name Latin1_General_100_BIN2_UTF8.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+require-env MSSQL_TEST_HOST
+
+require-env MSSQL_TEST_PORT
+
+require-env MSSQL_TEST_USER
+
+require-env MSSQL_TEST_PASS
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS svwc_admin (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('svwc_admin', 'IF DB_ID(''SvwCyrDb'') IS NOT NULL BEGIN ALTER DATABASE SvwCyrDb SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE SvwCyrDb; END');
+
+statement ok
+SELECT mssql_exec('svwc_admin', 'CREATE DATABASE SvwCyrDb COLLATE Cyrillic_General_CI_AS');
+
+statement ok
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=SvwCyrDb;User Id={MSSQL_TEST_USER};Password={MSSQL_TEST_PASS};TrustServerCertificate=yes' AS svwc (TYPE mssql);
+
+query T
+SELECT * FROM mssql_scan('svwc', 'SELECT CONVERT(sysname, DATABASEPROPERTYEX(DB_NAME(), ''Collation''))');
+----
+Cyrillic_General_CI_AS
+
+statement ok
+SELECT mssql_exec('svwc', 'CREATE TABLE dbo.svwc_stmt (id int NOT NULL PRIMARY KEY, v sql_variant NULL); CREATE TABLE dbo.svwc_bulk (id int NOT NULL PRIMARY KEY, v sql_variant NULL); CREATE TABLE dbo.svwc_copy (id int NOT NULL PRIMARY KEY, v sql_variant NULL); CREATE TABLE dbo.svwc_upd (id int NOT NULL PRIMARY KEY, v sql_variant NULL); CREATE TABLE dbo.svwc_merge (id int NOT NULL PRIMARY KEY, v sql_variant NULL); INSERT INTO dbo.svwc_upd VALUES (1, NULL), (2, NULL); INSERT INTO dbo.svwc_merge VALUES (1, NULL), (2, NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('svwc');
+
+# The source is DuckDB's: an nvarchar base value and an ASCII one (both nvarchar: within 4000 units).
+statement ok
+CREATE TEMP TABLE svwc_src AS SELECT * FROM (VALUES (1, 'дом'::VARIANT), (2, 'abc'::VARIANT)) t(id, v);
+
+# --- the statement path
+statement ok
+SET mssql_insert_bcp_threshold = 100000;
+
+statement ok
+INSERT INTO svwc.dbo.svwc_stmt SELECT id, v FROM svwc_src;
+
+# --- INSERT BULK
+statement ok
+SET mssql_insert_bcp_threshold = 1;
+
+statement ok
+INSERT INTO svwc.dbo.svwc_bulk SELECT id, v FROM svwc_src;
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+# --- COPY into an existing table (the probe's collation)
+statement ok
+COPY (SELECT id, v FROM svwc_src) TO 'mssql://svwc/dbo/svwc_copy' (FORMAT 'bcp', CREATE_TABLE false);
+
+# --- CTAS (the catalog's database collation)
+statement ok
+CREATE TABLE svwc.dbo.svwc_ctas AS SELECT id, v FROM svwc_src;
+
+# --- an UPDATE through #stage
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+statement ok
+UPDATE svwc.dbo.svwc_upd SET v = s.v FROM svwc_src s WHERE svwc_upd.id = s.id;
+
+statement ok
+RESET mssql_dml_stage_threshold;
+
+# --- a staged MERGE (its source is DuckDB's: staged through #src)
+statement ok
+MERGE INTO svwc.dbo.svwc_merge t USING svwc_src s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v;
+
+query T
+SELECT * FROM mssql_scan('svwc', 'SELECT STRING_AGG(CONCAT(t, id, '':'', CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS sysname), '':'', CAST(SQL_VARIANT_PROPERTY(v, ''Collation'') AS sysname)), '' '') WITHIN GROUP (ORDER BY t, id) FROM (SELECT ''a_stmt'' AS t, id, v FROM dbo.svwc_stmt UNION ALL SELECT ''b_bulk'', id, v FROM dbo.svwc_bulk UNION ALL SELECT ''c_copy'', id, v FROM dbo.svwc_copy UNION ALL SELECT ''d_ctas'', id, v FROM dbo.svwc_ctas UNION ALL SELECT ''e_stage'', id, v FROM dbo.svwc_upd UNION ALL SELECT ''f_merge'', id, v FROM dbo.svwc_merge) x');
+----
+a_stmt1:nvarchar:Cyrillic_General_CI_AS a_stmt2:nvarchar:Cyrillic_General_CI_AS b_bulk1:nvarchar:Cyrillic_General_CI_AS b_bulk2:nvarchar:Cyrillic_General_CI_AS c_copy1:nvarchar:Cyrillic_General_CI_AS c_copy2:nvarchar:Cyrillic_General_CI_AS d_ctas1:nvarchar:Cyrillic_General_CI_AS d_ctas2:nvarchar:Cyrillic_General_CI_AS e_stage1:nvarchar:Cyrillic_General_CI_AS e_stage2:nvarchar:Cyrillic_General_CI_AS f_merge1:nvarchar:Cyrillic_General_CI_AS f_merge2:nvarchar:Cyrillic_General_CI_AS
+
+# The values read back as written.
+query IIT
+SELECT * FROM (SELECT 1 AS k, id, v::VARCHAR FROM svwc.dbo.svwc_stmt UNION ALL SELECT 2, id, v::VARCHAR FROM svwc.dbo.svwc_bulk UNION ALL SELECT 3, id, v::VARCHAR FROM svwc.dbo.svwc_copy UNION ALL SELECT 4, id, v::VARCHAR FROM svwc.dbo.svwc_ctas UNION ALL SELECT 5, id, v::VARCHAR FROM svwc.dbo.svwc_upd UNION ALL SELECT 6, id, v::VARCHAR FROM svwc.dbo.svwc_merge) ORDER BY k, id;
+----
+1	1	дом
+1	2	abc
+2	1	дом
+2	2	abc
+3	1	дом
+3	2	abc
+4	1	дом
+4	2	abc
+5	1	дом
+5	2	abc
+6	1	дом
+6	2	abc
+
+# --- a catalog that never read the database's collation (catalog false skips the ATTACH query): a COPY
+# that creates the table asks its own connection, so its string values still take Cyrillic_General_CI_AS
+# (not Latin1_General_100_BIN2_UTF8, what an empty name gives).
+statement ok
+ATTACH 'Server={MSSQL_TEST_HOST},{MSSQL_TEST_PORT};Database=SvwCyrDb;User Id={MSSQL_TEST_USER};Password={MSSQL_TEST_PASS};TrustServerCertificate=yes' AS svwc_nocat (TYPE mssql, catalog false);
+
+statement ok
+COPY (SELECT id, v FROM svwc_src) TO 'mssql://svwc_nocat/dbo/svwc_copy_new' (FORMAT 'bcp');
+
+query T
+SELECT * FROM mssql_scan('svwc', 'SELECT STRING_AGG(CONCAT(id, '':'', CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS sysname), '':'', CAST(SQL_VARIANT_PROPERTY(v, ''Collation'') AS sysname)), '' '') WITHIN GROUP (ORDER BY id) FROM dbo.svwc_copy_new');
+----
+1:nvarchar:Cyrillic_General_CI_AS 2:nvarchar:Cyrillic_General_CI_AS
+
+statement ok
+DETACH svwc_nocat;
+
+statement ok
+DETACH svwc;
+
+statement ok
+SELECT mssql_exec('svwc_admin', 'IF DB_ID(''SvwCyrDb'') IS NOT NULL BEGIN ALTER DATABASE SvwCyrDb SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE SvwCyrDb; END');
+
+statement ok
+DETACH svwc_admin;

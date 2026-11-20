@@ -668,7 +668,8 @@ void MergeRewriter::TypeSrcColumns(MSSQLStagedMergeTarget &target, string &selec
 				}
 			}
 			target.src_columns.push_back(BCPColumnMetadata::FromServerColumn(
-				name, declared.type_name, declared.max_length, col.precision, col.scale, true, col.collation_name));
+				name, declared.type_name, declared.max_length, col.precision, col.scale, true,
+				col.BulkCollationName(catalog_.GetDatabaseCollation())));
 			target.src_columns.back().reported_name = col.name;
 		} else {
 			const auto type = IsStringType(column.type) ? LogicalType::VARCHAR : column.type;
@@ -693,8 +694,8 @@ void MergeRewriter::TypeSrcColumns(MSSQLStagedMergeTarget &target, string &selec
 			}
 			vector<BCPColumnMetadata> metadata;
 			try {
-				metadata =
-					TargetResolver::GenerateColumnMetadata({type}, {name}, config.wire_varchar_collation, single_byte);
+				metadata = TargetResolver::GenerateColumnMetadata({type}, {name}, config.wire_varchar_collation,
+																  single_byte, catalog_.GetDatabaseCollation());
 			} catch (std::exception &) {
 				Refuse("a value of type " + column.type.ToString() + " cannot be staged in #src");
 			}

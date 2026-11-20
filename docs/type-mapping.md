@@ -134,6 +134,23 @@ Read the same way by an attached catalog and by a raw `mssql_scan` / `mssql_scan
 conversion on the server: the envelope's base type picks the family codec that decodes the value. See
 the types page for each base type's DuckDB type.
 
+Written from a `VARIANT` (spec 093 T2): each value's base type is the narrowest SQL Server type that
+holds every value of its VARIANT tag (spec 093 D3's write table, `codec/variant/variant_write`). On the
+statement path the value is `CAST(CAST(<literal> AS <base type>) AS sql_variant)` -- the outer cast
+keeps a multi-row `VALUES` list from folding its rows to one type by data type precedence; on the bulk
+wire (INSERT BULK, COPY, CTAS, a staged UPDATE / DELETE's `#stage`, a staged MERGE's `#src`) the
+column is declared `0x62` with a LONGLEN maximum of 8009 and each value is its envelope (measured to
+be taken: `specs/093-type-kernels/measured/S2.md`), a string base value under the database's default
+collation on every path (the literal by T-SQL's rule; the envelope from the catalog's database
+collation, or the COPY probe's for an existing table). A database collation this build's table lacks
+is written on the bulk path as `Latin1_General_100_BIN2_UTF8`, so such a value compares and sorts by
+BIN2_UTF8 rather than the database's collation. A subnormal `DOUBLE` (a `float` base value) written by the
+statement path is stored as 0 -- the server's parse of the literal flushes it, as it does for a plain
+`float` column's literal --, while the bulk paths keep its bits; native RPC parameters (#515) are what
+would remove the difference. A plain `float` column's statement path also stores -0.0 as +0 (its
+literal `-0.0` is a decimal literal to T-SQL; the float codec's behaviour before T2); a `VARIANT`'s
+literal is a float literal and keeps the sign. A CTAS creates the column as `sql_variant`.
+
 ### HIERARCHYID and user CLR types
 
 | SQL Server Type | TDS Type ID | Wire Format | DuckDB Type | Notes |

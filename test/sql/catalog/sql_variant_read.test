@@ -15,7 +15,7 @@
 #
 # A filter on the column runs in DuckDB, over the VARIANT (issue #514: the server compares a
 # sql_variant by its base type, so a pushed WHERE lost rows); v = 5 is the int, v = '5' the string.
-# Writing one is spec 093 T2: refused by name until then.
+# Writing one is spec 093 T2 (sql_variant_write.test); here, that a write leaves the read alone.
 
 require mssql
 
@@ -229,10 +229,11 @@ SELECT (SELECT list(id) FROM sv.dbo.sv_eq WHERE v = 5), (SELECT list(id) FROM sv
 # Writes: spec 093 T2
 # =============================================================================
 
-statement error
+statement ok
 INSERT INTO sv.dbo.sv_eq VALUES (10, 7::VARIANT);
-----
-a VARIANT value cannot be written to SQL Server yet
+
+statement ok
+DELETE FROM sv.dbo.sv_eq WHERE id = 10;
 
 # A NULL and a value set from an empty nvarchar on the server: no VARIANT to write
 statement ok
@@ -241,15 +242,20 @@ INSERT INTO sv.dbo.sv_eq VALUES (4, NULL);
 statement ok
 SELECT mssql_exec('sv', 'INSERT dbo.sv_eq VALUES (5, CAST(N'''' AS nvarchar(5)))');
 
-statement error
-CREATE TABLE sv.dbo.sv_ctas AS SELECT * FROM sv.dbo.sv_eq;
-----
-a VARIANT value cannot be written to SQL Server yet
+statement ok
+SELECT mssql_exec('sv', 'DROP TABLE IF EXISTS dbo.sv_ctas');
 
-statement error
-UPDATE sv.dbo.sv_eq SET v = 9::VARIANT WHERE id = 1;
-----
-a VARIANT value cannot be written to SQL Server yet
+statement ok
+SELECT mssql_invalidate_cache('sv');
+
+statement ok
+CREATE TABLE sv.dbo.sv_ctas AS SELECT * FROM sv.dbo.sv_eq;
+
+statement ok
+DROP TABLE sv.dbo.sv_ctas;
+
+statement ok
+UPDATE sv.dbo.sv_eq SET v = 5::VARIANT WHERE id = 1;
 
 # A row path that leaves the column alone is not affected
 statement ok
@@ -277,7 +283,7 @@ SELECT id, n, v::VARCHAR FROM sv.dbo.sv_eq ORDER BY id;
 5	NULL	(empty)
 
 statement ok
-SELECT mssql_exec('sv', 'DROP TABLE dbo.sv_read; DROP TABLE dbo.sv_eq; DROP TABLE dbo.sv_many; DROP TABLE dbo.sv_ck');
+SELECT mssql_exec('sv', 'DROP TABLE dbo.sv_read; DROP TABLE dbo.sv_eq; DROP TABLE dbo.sv_many; DROP TABLE dbo.sv_ck; DROP TABLE IF EXISTS dbo.sv_ctas');
 
 statement ok
 DETACH sv;

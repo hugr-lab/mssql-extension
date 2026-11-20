@@ -60,7 +60,14 @@ struct MSSQLColumnInfo {
 	bool is_nullable;  // Allows NULL values
 
 	// Collation info (for text types)
-	string collation_name;			 // Column collation (may be empty for non-text)
+	string collation_name;	// Column collation (may be empty for non-text)
+
+	//! The collation a bulk load declares for this column: its own, but for a sql_variant (which has
+	//! none) the database's default -- the one the statement path's CAST gives a string base value
+	//! (spec 093 T2), so the two paths store a value under one collation.
+	string BulkCollationName(const string &database_collation) const {
+		return StringUtil::CIEquals(sql_type_name, "sql_variant") ? database_collation : collation_name;
+	}
 	bool is_case_sensitive;			 // Derived from collation (_CS_ or _BIN)
 	bool is_unicode;				 // True for NVARCHAR/NCHAR/NTEXT
 	bool is_utf8;					 // Derived from collation (_UTF8)
