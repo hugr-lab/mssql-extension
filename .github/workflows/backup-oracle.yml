@@ -388,12 +388,8 @@ jobs:
           MSSQL_R2_URL: ${{ secrets.MSSQL_R2_URL }}
           MSSQL_R2_BUCKET_NAME: ${{ vars.MSSQL_R2_BUCKET_NAME || secrets.MSSQL_R2_BUCKET_NAME }}
           QUIET: full catalog_full partition_full files_full files_removed large_xpress load_base rows_full dbcs_full lob_full lob_xpress cd_full cd_xpress names_full diffs_full
-          # The full + differential pairs of overlays.txt (spec 085 PR 4c), and the differentials they read.
+          # The full + differential pairs of overlays.txt (spec 085 PR 4c).
           OVERLAYS: diffs_over diffs_over_xpress
-          OVERLAY_SETS: diffs_diff diffs_diff_xpress
-          # The backups taken under load that compare_rows.sh compares with --fuzzy (its FUZZY and
-          # FUZZY_OVERLAYS defaults: spec 085 PR 5), and fuzzy_over's two sets.
-          FUZZY_SETS: fuzzy_full fuzzy_xpress load_full load_xpress fuzzy_base fuzzy_diff
         run: |
           export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
                  AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
@@ -402,9 +398,10 @@ jobs:
           [ -n "${run}" ] || { echo "not stored: no DONE under ${prefix} (its generate leg failed or never ran)"; exit 1; }
           dir="${RUNNER_TEMP}/rows"
           mkdir -p "${dir}"
-          include=(--exclude '*' --include sets.txt --include overlays.txt)
-          for s in ${QUIET} ${OVERLAY_SETS} ${FUZZY_SETS}; do include+=(--include "${s}.bak" --include "${s}.filelistonly.txt"); done
-          aws s3 cp --recursive --only-show-errors "${include[@]}" "${prefix}/${run}/" "${dir}/"
+          # Every file of the run: compare_rows.sh reads the quiet sets, the overlays, the fuzzy sets (spec 085
+          # PR 5: FUZZY / FUZZY_OVERLAYS) and every set's log (LOG_SETS, all of sets.txt, a striped one's
+          # families and the log backups included), so a list of its own here falls behind it.
+          aws s3 cp --recursive --only-show-errors "${prefix}/${run}/" "${dir}/"
           VERSION=${{ matrix.version }} DUCKDB=cli/duckdb test/backup/compare_rows.sh "${dir}"
 
   # Spec 085 task 25: the committed samples read through s3:// and https:// (an S3 server of the job's
