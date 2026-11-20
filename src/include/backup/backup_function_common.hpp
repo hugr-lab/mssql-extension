@@ -12,6 +12,7 @@
 #pragma once
 
 #include "backup/backup_catalog_model.hpp"
+#include "backup/backup_fuzzy.hpp"
 #include "backup/backup_lsn.hpp"
 #include "backup/backup_sql_variant.hpp"
 #include "duckdb/common/types.hpp"
@@ -34,6 +35,18 @@ vector<std::string> PathsOf(const Value &value, const char *function);
 vector<std::string> DiffPathsOf(const named_argument_map_t &named, const char *function);
 //! The `diff` keyword parameter, on a function's signature.
 void AddDiffParameter(TableFunction &function);
+
+//! D11's `fuzzy` (task 27): `given` ('warn', 'error' or 'ignore', any case), or when empty the setting
+//! mssql_backup_fuzzy. Anything else is an InvalidInputException naming `function`.
+FuzzyMode FuzzyModeOf(ClientContext &context, const std::string &given, const char *function);
+//! The `fuzzy :=` keyword parameter (VARCHAR), on a function's signature; its value as given, "" when absent.
+void AddFuzzyParameter(TableFunction &function);
+std::string FuzzyParameterOf(const named_argument_map_t &named, const char *function);
+//! `table`'s status in the backup whose log tail is `tail` and pages `pages`, acted on as `mode` says: a
+//! table that is not consistent gets one WARNING in duckdb_logs (warn) or is refused by name (error);
+//! `function` names the caller. Returns the status.
+TableFuzziness CheckFuzzy(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
+						  const CatalogTable &table, FuzzyMode mode, const char *function);
 
 //! A datetime as a record stores it (u32 ticks of 1/300 s, then i32 days since 1900-01-01) as TYPE
 //! mssql reads one off the wire (days, then ticks: DateTimeEncoding::ConvertDatetime). NULL TIMESTAMP

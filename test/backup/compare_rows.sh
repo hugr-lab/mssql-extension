@@ -150,5 +150,94 @@ if [ -f "${DIR}/overlays.txt" ]; then
 	done <"${DIR}/overlays.txt"
 fi
 
+# Spec 085 PR 5 (D11, task 27): the backups taken under load (FUZZY), and the full + differential pairs of
+# overlays.txt among them (FUZZY_OVERLAYS), restored -- RESTORE recovers them: the tail redone, its open
+# transactions undone -- and compared with --fuzzy: each table's fuzzy_status against whether it differs.
+# Every one asked for must be there.
+FUZZY="${FUZZY-fuzzy_full fuzzy_xpress load_full load_xpress}"
+FUZZY_OVERLAYS="${FUZZY_OVERLAYS-fuzzy_over}"
+fuzzy_compare() {	# $1 = what, then compare_rows.py's arguments
+	local what="$1"
+	shift
+	if python3 -I "${HERE}/compare_rows.py" --duckdb "${DUCKDB}" --fuzzy "$@"; then
+		compared=$((compared + 1))
+	else
+		echo "ERROR: ${what}: a fuzzy_status disagrees with the RESTORE" >&2
+		failed=$((failed + 1))
+	fi
+	sql -Q "ALTER DATABASE cmp SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE cmp" >/dev/null
+	docker exec -u 0 "${CONTAINER}" sh -c "rm -f '${BAK}'/*"
+}
+for name in ${FUZZY}; do
+	if [ -z "$(set_files "${name}")" ]; then
+		echo "ERROR: ${name} is not in ${DIR}/sets.txt (FUZZY='' compares none)" >&2
+		failed=$((failed + 1))
+		continue
+	fi
+	echo ">> ${name} (fuzzy)"
+	stage_set "${name}"
+	moves="$(awk -F'|' 'NR > 2 && NF > 3 { printf ", MOVE N'\''%s'\'' TO N'\''/var/opt/mssql/data/cmp_%d.f'\''", $1, NR }' \
+		"${DIR}/${name}.filelistonly.txt")"
+	if ! restored="$(sql -Q "RESTORE DATABASE cmp FROM ${from} WITH REPLACE, RECOVERY${moves}" 2>&1)"; then
+		echo "ERROR: RESTORE of ${name} failed:" >&2
+		echo "${restored}" | tail -5 >&2
+		failed=$((failed + 1))
+		docker exec -u 0 "${CONTAINER}" sh -c "rm -f '${BAK}'/*"
+		continue
+	fi
+	fuzzy_compare "${name}" "${local_files}"
+done
+for want in ${FUZZY_OVERLAYS}; do
+	pair="$(awk -F'|' -v n="${want}" '$1 == n { print $2 "|" $3 }' "${DIR}/overlays.txt" 2>/dev/null || true)"
+	full="${pair%%|*}"
+	diff="${pair#*|}"
+	if [ -z "${pair}" ] || [ -z "$(set_files "${full}")" ] || [ -z "$(set_files "${diff}")" ]; then
+		echo "ERROR: ${want} is not a pair of ${DIR}/overlays.txt with both sets in sets.txt" >&2
+		failed=$((failed + 1))
+		continue
+	fi
+	echo ">> ${want} (${full} + ${diff}, fuzzy)"
+	stage_set "${full}"
+	full_from="${from}"
+	full_files="${local_files}"
+	stage_set "${diff}"
+	moves="$(awk -F'|' 'NR > 2 && NF > 3 { printf ", MOVE N'\''%s'\'' TO N'\''/var/opt/mssql/data/cmp_%d.f'\''", $1, NR }' \
+		"${DIR}/${full}.filelistonly.txt")"
+	if ! restored="$(sql -Q "RESTORE DATABASE cmp FROM ${full_from} WITH REPLACE, NORECOVERY${moves}; RESTORE DATABASE cmp FROM ${from} WITH RECOVERY" 2>&1)"; then
+		echo "ERROR: RESTORE of ${want} failed:" >&2
+		echo "${restored}" | tail -5 >&2
+		failed=$((failed + 1))
+		docker exec -u 0 "${CONTAINER}" sh -c "rm -f '${BAK}'/*"
+		continue
+	fi
+	fuzzy_compare "${want}" --diff "${local_files}" "${full_files}"
+done
+
+# Spec 085 task 27: every set's log -- a data backup's tail, a log backup's whole log -- as
+# mssql_backup_transaction_records reads it, against fn_dump_dblog over the same files on this server
+# (compare_rows.py --log). LOG_SETS: the sets compared, "all" (default) for every set of sets.txt.
+LOG_SETS="${LOG_SETS-all}"
+while IFS='|' read -r name files; do
+	if [ "${LOG_SETS}" != all ]; then
+		case " ${LOG_SETS} " in *" ${name} "*) ;; *) continue ;; esac
+	fi
+	echo ">> ${name} (log)"
+	stage_set "${name}"
+	server_files=""
+	IFS=, read -r -a parts <<<"${files}"
+	for f in "${parts[@]}"; do
+		server_files="${server_files:+${server_files},}${BAK}/${f}"
+	done
+	# No database is restored for it: the session attaches master.
+	if MSSQL_ROWS_DATABASE=master python3 -I "${HERE}/compare_rows.py" --duckdb "${DUCKDB}" --log "${server_files}" \
+		"${local_files}"; then
+		compared=$((compared + 1))
+	else
+		echo "ERROR: ${name}: its log differs from fn_dump_dblog's" >&2
+		failed=$((failed + 1))
+	fi
+	docker exec -u 0 "${CONTAINER}" sh -c "rm -f '${BAK}'/*"
+done <"${DIR}/sets.txt"
+
 echo ">> compare_rows: ${compared} sets equal, ${failed} with differences"
 [ "${failed}" = 0 ] && [ "${compared}" -gt 0 ]

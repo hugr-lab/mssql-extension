@@ -30,10 +30,14 @@ import sys
 # backup (7 / 8) is not told apart from them yet.
 BACKUP_TYPES = {"1": "full", "5": "differential", "2": "log", "4": "file", "6": "file differential"}
 # Not located yet (spec 085): must be NULL.
-UNLOCATED = ["page_count", "consistent", "open_transactions", "committed_after_checkpoint"]
+UNLOCATED = ["page_count"]
 # Returned, and compared with nothing, for the reason given.
 NOT_COMPARED = {
     "log_tail_bytes": "not compared: RESTORE prints no such field (HEADERONLY has no log tail length)",
+    "consistent": "not compared: RESTORE prints no such field (D11, from the log tail; compare_rows.sh --fuzzy "
+                  "checks each table's status against a RESTORE)",
+    "open_transactions": "not compared: RESTORE prints no such field (D11, from the log tail)",
+    "committed_after_checkpoint": "not compared: RESTORE prints no such field (D11, from the log tail)",
 }
 # The same for the fields of each `files` entry.
 FILE_UNLOCATED = ["backup_size_bytes"]

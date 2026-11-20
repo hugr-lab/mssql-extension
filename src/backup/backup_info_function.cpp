@@ -2,9 +2,10 @@
 // HEADERONLY + LABELONLY, with FILELISTONLY as a nested list (spec 085 § Functions). [DuckDB]
 //
 // PR 1 reads the headers only (stage 1): the columns whose source is a later stage are NULL until it
-// lands -- page_count (the allocation pages, PR 2), consistent / open_transactions /
-// committed_after_checkpoint (D11's log tail, PR 5), and each file's backup_size_bytes (the page
-// index). The database's version, level and collation come from the trailer SCIN.
+// lands -- page_count (the allocation pages, PR 2) and each file's backup_size_bytes (the page index).
+// consistent / open_transactions / committed_after_checkpoint are D11's database level (task 27): the
+// log tail read (stage 5, kept by the opened-file cache); NULL for a log backup, whose records are not
+// a tail. The database's version, level and collation come from the trailer SCIN.
 
 #include "backup/backup_info_function.hpp"
 
@@ -142,7 +143,7 @@ Value FileValue(const DatabaseFile &f, bool present) {
 }
 
 //! The row of the backup set the files of `opened` hold.
-std::vector<Value> InfoRow(const OpenedHeaders &opened) {
+std::vector<Value> InfoRow(const OpenedHeaders &opened, const FuzzySummary *tail) {
 	const auto &set = opened.Set();
 	const auto &first = *opened.families.front();
 	uint64_t backup_size = 0;
@@ -227,9 +228,9 @@ std::vector<Value> InfoRow(const OpenedHeaders &opened) {
 												 : Value(LogicalType::BIGINT));
 	row.push_back(Value(LogicalType::BIGINT));	// page_count: the allocation pages (PR 2)
 	row.push_back(Value::BIGINT(static_cast<int64_t>(log_tail)));
-	row.push_back(Value(LogicalType::BOOLEAN));	 // consistent: D11 (PR 5)
-	row.push_back(no_int);						 // open_transactions: D11
-	row.push_back(no_int);						 // committed_after_checkpoint: D11
+	row.push_back(tail ? Value::BOOLEAN(tail->Consistent()) : Value(LogicalType::BOOLEAN));	 // consistent: D11
+	row.push_back(tail ? Value::INTEGER(static_cast<int32_t>(tail->open_transactions)) : no_int);
+	row.push_back(tail ? Value::INTEGER(static_cast<int32_t>(tail->finished_after_checkpoint)) : no_int);
 	row.push_back(Value(RecoveryModelName(set.recovery_model)));
 	row.push_back(Value::LIST(FileType(), std::move(files)));
 	return row;
@@ -300,7 +301,13 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		// takes them, and so does a catalog call after this one.
 		auto opened = OpenBackup(context, std::vector<std::string>(data->paths.begin(), data->paths.end()),
 								 std::vector<std::string>(), data->at);
-		data->row = InfoRow(opened.backup->Headers());
+		// D11's database level from the log tail (stage 5): a data backup's only.
+		const FuzzySummary *tail = nullptr;
+		if (opened.backup->Headers().Set().kind != BackupKind::Log) {
+			BindFiles bound(opened.binding);
+			tail = TailOrWarn(context, opened, "mssql_backup_info");
+		}
+		data->row = InfoRow(opened.backup->Headers(), tail);
 	} catch (FormatError &e) {
 		throw InvalidInputException("mssql_backup_info: %s", e.what());
 	}

@@ -1,0 +1,219 @@
+# name: test/sql/backup/mssql_backup_fuzzy.test
+# description: D11's fuzzy status from a backup's log tail, and the log functions over it (spec 085 PR 5)
+# group: [mssql]
+#
+# test/data/backup/open_tail (test/backup/gen/open_tail.sql, SQL Server 2025): one transaction, open_tail,
+# updates rows 1-10 of dbo.changed (v + 1000), deletes rows 50-52 and inserts 201-203, then stays open while
+# a copy-only full (open_tail_full) and a differential over open_tail_base (open_tail_diff) are taken, and
+# rolls back afterwards. Both backups hold its changes: dbo.changed is dirty, dbo.static consistent. The
+# committed samples of test/data/backup are quiet: their tails hold a checkpoint only. No SQL Server is needed.
+
+require mssql
+
+# --- the database level (mssql_backup_info) ---
+
+query TTII
+SELECT backup_type, consistent, open_transactions, committed_after_checkpoint
+FROM mssql_backup_info('test/data/backup/open_tail/open_tail_full.bak');
+----
+full	false	1	0
+
+query TTII
+SELECT backup_type, consistent, open_transactions, committed_after_checkpoint
+FROM mssql_backup_info('test/data/backup/full.bak');
+----
+full	true	0	0
+
+# A log backup's records are its content, not a tail: no status.
+query TTII
+SELECT backup_type, consistent, open_transactions, committed_after_checkpoint FROM mssql_backup_info('test/data/backup/log.trn');
+----
+log	NULL	NULL	NULL
+
+# --- the table level (mssql_backup_tables), a full and a differential over its full ---
+
+query TTII
+SELECT table_name, fuzzy_status, open_transactions, stale_transactions
+FROM mssql_backup_tables('test/data/backup/open_tail/open_tail_full.bak') ORDER BY 1;
+----
+changed	dirty	1	0
+control	consistent	0	0
+static	consistent	0	0
+
+query TTII
+SELECT table_name, fuzzy_status, open_transactions, stale_transactions
+FROM mssql_backup_tables('test/data/backup/open_tail/open_tail_base.bak', diff := 'test/data/backup/open_tail/open_tail_diff.bak')
+ORDER BY 1;
+----
+changed	dirty	1	0
+control	consistent	0	0
+static	consistent	0	0
+
+query I
+SELECT count(*) FROM mssql_backup_tables('test/data/backup/full.bak') WHERE fuzzy_status <> 'consistent';
+----
+0
+
+# --- the scan: fuzzy := 'warn' (the default) reads and logs, 'error' refuses, 'ignore' reads ---
+
+statement ok
+SET enable_logging = true;
+
+# The open transaction's changes as the copies hold them: 5050 + 10 * 1000 - (50 + 51 + 52) + (201 + 202 + 203).
+query II
+SELECT count(*), sum(v) FROM mssql_backup_scan('test/data/backup/open_tail/open_tail_full.bak', 'dbo', 'changed');
+----
+100	15503
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE message LIKE '%dbo.changed is dirty in this backup: 1 transaction(s) open%';
+----
+true
+
+statement ok
+SET enable_logging = false;
+
+statement error
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/open_tail/open_tail_full.bak', 'dbo', 'changed', fuzzy := 'error');
+----
+dbo.changed is dirty in this backup
+
+query I
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/open_tail/open_tail_full.bak', 'dbo', 'static', fuzzy := 'error');
+----
+100
+
+query I
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/open_tail/open_tail_full.bak', 'dbo', 'changed', fuzzy := 'IGNORE');
+----
+100
+
+statement error
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/full.bak', 'dbo', 'x', fuzzy := 'maybe');
+----
+fuzzy 'maybe' is not 'warn', 'error' or 'ignore'
+
+statement error
+SET mssql_backup_fuzzy = 'maybe';
+----
+is not 'warn', 'error' or 'ignore'
+
+# The setting, and an ATTACH's option over it.
+statement ok
+SET mssql_backup_fuzzy = 'error';
+
+statement error
+SELECT count(*) FROM mssql_backup_scan('test/data/backup/open_tail/open_tail_full.bak', 'dbo', 'changed');
+----
+Refused (fuzzy := 'error')
+
+statement ok
+ATTACH 'test/data/backup/open_tail/open_tail_full.bak' AS ot_warn (TYPE mssql_backup, fuzzy 'warn');
+
+query I
+SELECT count(*) FROM ot_warn.dbo.changed;
+----
+100
+
+statement ok
+RESET mssql_backup_fuzzy;
+
+statement ok
+ATTACH 'test/data/backup/open_tail/open_tail_full.bak' AS ot_error (TYPE mssql_backup, fuzzy 'error');
+
+statement error
+SELECT count(*) FROM ot_error.dbo.changed;
+----
+dbo.changed is dirty in this backup
+
+statement error
+ATTACH 'test/data/backup/open_tail/open_tail_full.bak' AS ot_bad (TYPE mssql_backup, fuzzy 'often');
+----
+fuzzy 'often' is not 'warn', 'error' or 'ignore'
+
+# --- mssql_backup_transactions: the open one, with its effect on the table it changed ---
+
+query TTTIT
+SELECT name, status, after_checkpoint, row_operations, [u.table_name || ':' || coalesce(u.effect, '-') FOR u IN tables]
+FROM mssql_backup_transactions('test/data/backup/open_tail/open_tail_full.bak') WHERE row_operations > 0;
+----
+open_tail	open	false	16	['changed:dirty']
+
+# The catalog's macro, and the differential over its full.
+query TT
+SELECT name, status FROM ot_warn.transactions() WHERE row_operations > 0;
+----
+open_tail	open
+
+query TT
+SELECT name, status FROM mssql_backup_transactions('test/data/backup/open_tail/open_tail_base.bak',
+	diff := 'test/data/backup/open_tail/open_tail_diff.bak') WHERE row_operations > 0;
+----
+open_tail	open
+
+# An attached differential over its full: its catalog names the tables (review of PR 5).
+statement ok
+ATTACH 'test/data/backup/open_tail/open_tail_base.bak' AS ot_diff (TYPE mssql_backup, diff 'test/data/backup/open_tail/open_tail_diff.bak');
+
+query TTT
+SELECT t.name, u.table_name, u.effect FROM ot_diff.transactions() t, unnest(t.tables) AS x(u) WHERE t.row_operations > 0;
+----
+open_tail	changed	dirty
+
+query I
+SELECT count(*) FROM ot_diff.transaction_records() WHERE table_name = 'changed' AND operation = 'LOP_INSERT_ROWS';
+----
+3
+
+statement ok
+DETACH ot_diff;
+
+# A log backup's: every transaction of it, none open (fn_dump_dblog over log.trn: 24 BEGIN, 24 COMMIT).
+query TI
+SELECT status, count(*) FROM mssql_backup_transactions('test/data/backup/log.trn') WHERE status <> 'no begin' GROUP BY 1;
+----
+committed	24
+
+# --- mssql_backup_transaction_records: the open transaction's records, the row images decoded ---
+
+query TT
+SELECT operation, contents::VARCHAR FROM mssql_backup_transaction_records('test/data/backup/open_tail/open_tail_full.bak')
+WHERE table_name = 'changed' AND operation IN ('LOP_INSERT_ROWS', 'LOP_DELETE_ROWS') ORDER BY lsn;
+----
+LOP_DELETE_ROWS	{'row': {'id': 50, 'note': row 50, 'v': 50}}
+LOP_DELETE_ROWS	{'row': {'id': 51, 'note': row 51, 'v': 51}}
+LOP_DELETE_ROWS	{'row': {'id': 52, 'note': row 52, 'v': 52}}
+LOP_INSERT_ROWS	{'rows': [{'id': 201, 'note': new 201, 'v': 201}]}
+LOP_INSERT_ROWS	{'rows': [{'id': 202, 'note': new 202, 'v': 202}]}
+LOP_INSERT_ROWS	{'rows': [{'id': 203, 'note': new 203, 'v': 203}]}
+
+# A modified row's byte range: v of row 1, 1 -> 1001 at offset 8 of the record.
+query IIT
+SELECT contents.offset::INTEGER, contents.size::INTEGER, contents.after::BLOB
+FROM mssql_backup_transaction_records('test/data/backup/open_tail/open_tail_full.bak')
+WHERE table_name = 'changed' AND operation = 'LOP_MODIFY_ROW' ORDER BY lsn LIMIT 1;
+----
+8	2	\xE9\x03
+
+query T
+SELECT contents.name::VARCHAR FROM ot_warn.transaction_records() WHERE operation = 'LOP_BEGIN_XACT' AND transaction_status = 'open';
+----
+open_tail
+
+# A log backup's records, as fn_dump_dblog lists them (1628), the units with no table named (no pages).
+query II
+SELECT count(*), count(table_name) FROM mssql_backup_transaction_records('test/data/backup/log.trn');
+----
+1628	0
+
+query TTTT
+SELECT lsn::VARCHAR, operation, context, transaction_id FROM mssql_backup_transaction_records('test/data/backup/log.trn')
+WHERE lsn = 44000000209600002;
+----
+44000000209600002	LOP_MODIFY_COLUMNS	LCX_CLUSTERED	0000:000003f5
+
+statement ok
+DETACH ot_warn;
+
+statement ok
+DETACH ot_error;

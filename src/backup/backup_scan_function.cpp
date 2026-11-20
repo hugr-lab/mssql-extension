@@ -130,6 +130,28 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 	if (!data.entry->decodable) {
 		throw InvalidInputException("%s: %s.%s is not read: %s", FUNCTION, data.schema, data.table, data.entry->reason);
 	}
+	// D11 (task 27): the table's status from the backup's log tail, acted on as fuzzy := says.
+	const FuzzyMode mode = FuzzyModeOf(context, data.fuzzy, FUNCTION);
+	if (mode != FuzzyMode::Ignore) {
+		BindFiles bound(data.catalog->Binding());
+		const FuzzySummary *tail = nullptr;
+		try {
+			tail = &StatementTail(context, data.catalog->opened);
+		} catch (FormatError &e) {
+			// The status unknown: refused when the call asks for a consistent table, else said and read.
+			if (mode == FuzzyMode::Error) {
+				throw InvalidInputException(
+					"%s: %s.%s: the backup's log tail is not read, so whether the table is consistent is unknown "
+					"(fuzzy := 'error'): %s",
+					FUNCTION, data.schema, data.table, e.what());
+			}
+			DUCKDB_LOG_WARNING(context, "%s: %s.%s: the backup's log tail is not read, its fuzzy status unknown: %s",
+							   FUNCTION, data.schema, data.table, e.what());
+		}
+		if (tail) {
+			CheckFuzzy(context, *tail, *data.catalog->pages->store, *data.entry, mode, FUNCTION);
+		}
+	}
 	ScanColumns columns = ScanColumnsOf(*data.entry);
 	data.column_ids = std::move(columns.column_ids);
 	data.types = std::move(columns.types);
@@ -157,6 +179,7 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	}
 	data->schema = input.inputs[1].ToString();
 	data->table = input.inputs[2].ToString();
+	data->fuzzy = FuzzyParameterOf(input.named_parameters, FUNCTION);
 	for (const auto &kv : input.named_parameters) {
 		if (kv.first == "max_threads" && !kv.second.IsNull()) {
 			if (kv.second.GetValue<int64_t>() < 1) {
@@ -228,6 +251,7 @@ void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_dat
 	serializer.WritePropertyWithDefault<std::string>(109, "at_unit", data.at.unit);
 	serializer.WritePropertyWithDefault<Value>(110, "at_value", data.at.value, Value());
 	serializer.WritePropertyWithDefault<std::string>(111, "at_key", data.at.key);
+	serializer.WritePropertyWithDefault<std::string>(112, "fuzzy", data.fuzzy);
 }
 
 unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunction &) {
@@ -244,6 +268,7 @@ unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunct
 	data->at.unit = deserializer.ReadPropertyWithDefault<std::string>(109, "at_unit");
 	data->at.value = deserializer.ReadPropertyWithExplicitDefault<Value>(110, "at_value", Value());
 	data->at.key = deserializer.ReadPropertyWithDefault<std::string>(111, "at_key");
+	data->fuzzy = deserializer.ReadPropertyWithDefault<std::string>(112, "fuzzy");
 	BindTable(deserializer.Get<ClientContext &>(), *data, nullptr);
 	// The plan's column positions and vectors are those it was bound with: a file at the same path that
 	// reads otherwise now (a nightly backup replaced: a column added, dropped, renamed or retyped) is
@@ -1002,6 +1027,7 @@ TableFunction MakeScanFunction(const LogicalType &path) {
 	// NULL (the default): DuckDB's memory_limit. A size as memory_limit takes it ('2GB').
 	f.GetSignature().AddKeywordOnly("max_memory", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 	AddDiffParameter(f);
+	AddFuzzyParameter(f);
 	AddVersionParameters(f);
 	f.projection_pushdown = true;
 	f.get_partition_data = PartitionData;
@@ -1067,7 +1093,7 @@ virtual_column_map_t ScanVirtualColumns(const std::vector<UnreadColumn> &unread)
 
 TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &entry,
 								   std::shared_ptr<const AttachedBackup> attached, const std::string &key,
-								   const std::string &schema, const std::string &table,
+								   const std::string &schema, const std::string &table, const std::string &fuzzy,
 								   unique_ptr<FunctionData> &bind_data) {
 	auto data = make_uniq<ScanBindData>();
 	data->paths = {attached->name};
@@ -1076,6 +1102,7 @@ TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &en
 	data->schema = schema;
 	data->table = table;
 	data->table_entry = &entry;
+	data->fuzzy = fuzzy;
 	data->attached = std::move(attached);
 	BindTable(context, *data, nullptr);
 	bind_data = std::move(data);

@@ -7,7 +7,7 @@
 #   OUT=/tmp/bak IMAGE=mcr.microsoft.com/mssql/server:2022-latest test/backup/gen/generate.sh
 #   OUT=/tmp/bak FIXTURES=samples test/backup/gen/generate.sh  # samples.sql only (the committed set)
 #
-# FIXTURES (default "samples catalog partition files load lob large rows dbcs cd names diffs"): samples.sql, the database of the
+# FIXTURES (default "samples catalog partition files load fuzzy lob large rows dbcs cd names diffs"): samples.sql, the database of the
 # committed samples; catalog.sql, the catalog fixture (spec 085 PR 2b); partition.sql, E7's partitioning
 # database and more boundary types (PR 2c); files.sql, two data files and a second
 # filegroup, then (files_remove.sql) a file emptied and removed (multi-page IAM chains, E19); load.sql, backups taken
@@ -18,6 +18,10 @@
 # double-byte code pages (PR 2d); lob.sql, values stored off row in every form (PR 3: lob_full plain,
 # lob_xpress compressed); cd.sql, ROW-compressed tables (spec 086 PR 1: cd_full plain, cd_xpress compressed); names.sql, a
 # case-sensitive database whose tables differ only in case, and names with spaces, quotes, ] and dots (spec 085 PR 4b);
+# fuzzy.sql, E3's controls under load (spec 085 PR 5: fuzzy_base, then fuzzy_full, fuzzy_xpress and fuzzy_diff
+# taken while three sessions commit and one transaction stays open; fuzzy_over pairs the last with the first);
+# open_tail.sql, one transaction held open across a full and a differential (PR 5: open_tail_base, _full,
+# _diff; not run by default; committed under test/data/backup/open_tail, made by its generate.sh);
 # diffs.sql, a full and a differential over it after E2's changes (spec 085 PR 4c: diffs_full, diffs_diff and
 # diffs_diff_xpress, paired in overlays.txt); schema_changes.sql, truncates, a shrink and a sliding window between a
 # full and its differential (PR 4c-3: schema_full, schema_diff; not run by default); lob_changes.sql, values stored
@@ -40,7 +44,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${OUT:?set OUT to the directory the backups go to}"
 VERSION="${VERSION:-2025}"
-FIXTURES="${FIXTURES:-samples catalog partition files load lob large rows dbcs cd names diffs}"
+FIXTURES="${FIXTURES:-samples catalog partition files load fuzzy lob large rows dbcs cd names diffs}"
 LARGE_ROWS="${LARGE_ROWS:-530000}"
 if [ -z "${IMAGE:-}" ]; then
 	IMAGE="$(awk -v v="${VERSION}" '$1 == v { print $2 }' "${HERE}/images.txt")"
@@ -227,6 +231,81 @@ for fixture in ${FIXTURES}; do
 		done
 		[ "${left}" = 0 ] || workload_failed "did not end 60 s after it was asked to stop (${left} session(s) left)"
 		sets+=("load_base|load_base.bak" "load_full|load_full.bak" "load_xpress|load_xpress.bak" "load_diff|load_diff.bak" "load_log|load_log.trn")
+		;;
+	fuzzy)
+		# Spec 085 PR 5: E3's controls under load. The workload in the background (three sessions), then the open transaction
+		# once it commits, then a committed change of pre_commit, then the backups (which end by setting
+		# backups_done, so the open transaction rolls back), then the workload stopped. Each program's output
+		# goes to its own log in /tmp, shown when it did not run.
+		for session in 0 1 2; do
+			docker exec -d -e SQLCMDPASSWORD "${CONTAINER}" sh -c '"$@" >>/tmp/fuzzy_workload.log 2>&1' sh \
+				"${SQLCMD[@]}" -S localhost -U sa -b -v SESSION="${session}" -i /tmp/gen/fuzzy_workload.sql
+		done
+		fuzzy_ticks() { scalar "SELECT ticks FROM bak_fuzzy.dbo.control WITH (READUNCOMMITTED)" || true; }
+		fuzzy_failed() {	# $1 = what went wrong
+			echo "ERROR: the fuzzy fixture $1; its logs:" >&2
+			docker exec "${CONTAINER}" sh -c 'cat /tmp/fuzzy_workload.log /tmp/fuzzy_open.log 2>/dev/null' >&2 || true
+			exit 1
+		}
+		for _ in $(seq 1 60); do
+			[ "$(fuzzy_ticks)" -ge 20 ] 2>/dev/null && break
+			sleep 1
+		done
+		[ "$(fuzzy_ticks)" -ge 20 ] 2>/dev/null || fuzzy_failed "workload did not commit 20 transactions in 60 s"
+		docker exec -d -e SQLCMDPASSWORD "${CONTAINER}" sh -c '"$@" >/tmp/fuzzy_open.log 2>&1' sh \
+			"${SQLCMD[@]}" -S localhost -U sa -b -i /tmp/gen/fuzzy_open.sql
+		opened=""
+		for _ in $(seq 1 60); do
+			opened="$(scalar "SELECT COUNT(*) FROM bak_fuzzy.dbo.open_only WITH (READUNCOMMITTED) WHERE id > 100000" || true)"
+			[ "${opened}" -gt 0 ] 2>/dev/null && break
+			sleep 1
+		done
+		[ "${opened}" -gt 0 ] 2>/dev/null || fuzzy_failed "open transaction did not make its changes in 60 s"
+		sql -Q "UPDATE bak_fuzzy.dbo.pre_commit SET v = v + 1 WHERE id % 2 = 0" >/dev/null
+		before="$(fuzzy_ticks)"
+		echo ">> fuzzy: workload at ${before} transactions, a transaction open; backing up under them"
+		run_sql fuzzy_backup.sql
+		after="$(fuzzy_ticks)"
+		echo ">> fuzzy: backups done at ${after} transactions"
+		[ "${after}" -gt "${before}" ] 2>/dev/null || fuzzy_failed "workload stopped before the backups ended (${before} -> ${after})"
+		sql -Q "UPDATE bak_fuzzy.dbo.control SET stop_requested = 1" >/dev/null
+		left=""
+		for _ in $(seq 1 60); do
+			left="$(scalar "SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE database_id = DB_ID('bak_fuzzy') AND session_id <> @@SPID" || true)"
+			[ "${left}" = 0 ] && break
+			sleep 1
+		done
+		[ "${left}" = 0 ] || fuzzy_failed "programs did not end 60 s after they were asked to (${left} session(s) left)"
+		sets+=("fuzzy_base|fuzzy_base.bak" "fuzzy_full|fuzzy_full.bak" "fuzzy_xpress|fuzzy_xpress.bak" "fuzzy_diff|fuzzy_diff.bak")
+		overlays+=("fuzzy_over|fuzzy_base|fuzzy_diff")
+		;;
+	open_tail)
+		# Spec 085 PR 5: one transaction held open across a full and a differential (committed under
+		# test/data/backup/open_tail by its generate.sh; not run by default). Its program's output goes to a
+		# log in /tmp, shown when it did not run.
+		docker exec -d -e SQLCMDPASSWORD "${CONTAINER}" sh -c '"$@" >/tmp/open_tail.log 2>&1' sh \
+			"${SQLCMD[@]}" -S localhost -U sa -b -i /tmp/gen/open_tail_open.sql
+		open_tail_failed() {	# $1 = what went wrong
+			echo "ERROR: the open_tail fixture $1; its log:" >&2
+			docker exec "${CONTAINER}" cat /tmp/open_tail.log >&2 || true
+			exit 1
+		}
+		opened=""
+		for _ in $(seq 1 60); do
+			opened="$(scalar "SELECT COUNT(*) FROM bak_open_tail.dbo.changed WITH (READUNCOMMITTED) WHERE id > 200" || true)"
+			[ "${opened}" = 3 ] && break
+			sleep 1
+		done
+		[ "${opened}" = 3 ] || open_tail_failed "transaction did not make its changes in 60 s"
+		run_sql open_tail_backup.sql
+		left=""
+		for _ in $(seq 1 60); do
+			left="$(scalar "SELECT COUNT(*) FROM sys.dm_exec_sessions WHERE database_id = DB_ID('bak_open_tail') AND session_id <> @@SPID" || true)"
+			[ "${left}" = 0 ] && break
+			sleep 1
+		done
+		[ "${left}" = 0 ] || open_tail_failed "transaction did not end 60 s after it was asked to"
+		sets+=("open_tail_base|open_tail_base.bak" "open_tail_full|open_tail_full.bak" "open_tail_diff|open_tail_diff.bak")
 		;;
 	rows)
 		golden bak_rows rows_full
