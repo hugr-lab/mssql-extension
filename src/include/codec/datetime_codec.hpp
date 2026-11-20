@@ -103,6 +103,12 @@ void EncodeToBcp(const Value &value, const mssql::BCPColumnMetadata &col, duckdb
 //! such a value (BCPRowEncoder::RequireServerDay); a pushed filter with one
 //! stays with DuckDB instead.
 bool ServerHoldsTemporal(const Value &value);
+//! A timestamp of `source_type`'s unit (`raw_ticks` since the epoch) as datetime2(`target_scale`)'s time
+//! and date values: narrowing rounds as the server's conversion does, carrying into the next day; a
+//! value the server cannot hold throws (BCPRowEncoder's range errors). Shared by the bulk encoder and
+//! spec 093 T2's sql_variant writer.
+void ComputeDatetime2Components(int64_t raw_ticks, LogicalTypeId source_type, uint8_t target_scale,
+								uint64_t &time_value, uint32_t &date_value);
 std::string FormatSqlLiteral(const Value &v, const LogicalType &type, LiteralContext ctx);
 std::string FormatDdlTypeName(const LogicalType &type, const mssql::CTASConfig &cfg, DdlContext ctx);
 size_t EstimateLiteralSize(const LogicalType &type);

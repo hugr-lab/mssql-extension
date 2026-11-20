@@ -722,7 +722,8 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/codec/test_string_codec.cpp \
     test/cpp/codec/test_uuid_codec.cpp \
     test/cpp/codec/test_code_page.cpp \
-    test/cpp/codec/test_variant_envelope.cpp
+    test/cpp/codec/test_variant_envelope.cpp \
+    test/cpp/codec/test_variant_write.cpp
 
 STANDALONE_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
 STANDALONE_TEST_INCLUDES := -I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include

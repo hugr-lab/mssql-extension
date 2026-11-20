@@ -754,6 +754,24 @@ spec 093 D3's table -- a string through spec 091's code-page kernels by its own 
 in the vector. The column stays out of pushed comparisons and keys (`comparison_differs`): the server
 compares a `sql_variant` by its base type (#514).
 
+**A `VARIANT` is written into a `sql_variant` (spec 093 T2).** `codec/variant/variant_write` gives each
+value one write form by its VARIANT tag -- D3's write table, the narrowest base type for every value of
+the tag -- and two writers read it: the statement path's literal (`MSSQLValueSerializer`:
+`CAST(CAST(<literal> AS <base type>) AS sql_variant)`) and the bulk wire's SSVARIANT envelope
+(`BCPRowEncoder`: a VARIANT column is read through DuckDB's variant layout once a chunk and encoded
+row by row, the chunk taking the row loop -- an envelope has no scatter arm --; `BCPColumnMetadata`
+declares it `0x62`, LONGLEN 8009, `sql_variant`, NULL a length of 0). A string base value carries the
+database's default collation on both: the literal by T-SQL's rule, the envelope through
+`code_page::WireCollationForName` of the name a writer is given -- `MSSQLColumnInfo::BulkCollationName`
+(INSERT BULK, `#stage`, a staged MERGE's like-target `#src` columns), the COPY probe's
+`DATABASEPROPERTYEX(DB_NAME(), 'Collation')` for an existing column, and `GenerateColumnMetadata`'s
+`database_collation` (CTAS, a COPY that creates the table -- which reads the database's collation on its
+own connection when the catalog has none, `catalog false` or a failed ATTACH query --, and a staged
+MERGE's CTAS-typed `#src` columns), all through `codec::variant::StringCollationBytes`. A name the build's table lacks is written
+as `Latin1_General_100_BIN2_UTF8` (`mssql_utf8_collation`'s default; every target with `sql_variant`
+has UTF-8 collations), and such a value then compares and sorts by BIN2_UTF8, not by the database's
+collation -- the statement path's literal keeps the database's.
+
 ### Reading a column's collation
 
 `ColumnMetadata` carries all five wire bytes of the TDS collation

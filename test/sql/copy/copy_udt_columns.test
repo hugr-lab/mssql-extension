@@ -134,9 +134,10 @@ SELECT mssql_exec('udtc', 'DROP TABLE dbo.UdtCopyTgt');
 # rowversion: refused too, and that loses nothing. Measured by exempting the
 # type and running the load — the server answers error 273, "Cannot insert an
 # explicit value into a timestamp column". So the refusal moves a mid-stream
-# server error to a named one at init. sql_variant is the same story with a
-# different message: "Operand type clash: nvarchar(max) is incompatible with
-# sql_variant" — it does NOT convert implicitly, as one might assume.
+# server error to a named one at init. sql_variant, once refused the same way
+# ("Operand type clash: nvarchar(max) is incompatible with sql_variant"), is
+# carried since spec 093 T2 -- SSVARIANT envelopes of VARIANT values; any other
+# source is a type mismatch (cast it to VARIANT).
 # =============================================================================
 
 statement ok
@@ -156,7 +157,18 @@ the bulk-load wire cannot carry
 statement error
 COPY (SELECT 1 AS id, 'anything' AS v, 5 AS n) TO 'mssql://udtc/dbo/UdtRowver' (FORMAT 'bcp', CREATE_TABLE false);
 ----
-the bulk-load wire cannot carry
+type mismatch
+
+statement ok
+COPY (SELECT 2 AS id, 'anything'::VARIANT AS v, 6 AS n) TO 'mssql://udtc/dbo/UdtRowver' (FORMAT 'bcp', CREATE_TABLE false);
+
+query IT
+SELECT * FROM mssql_scan('udtc', 'SELECT id, CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS nvarchar(20)) FROM dbo.UdtRowver WHERE id = 2');
+----
+2	nvarchar
+
+statement ok
+SELECT mssql_exec('udtc', 'DELETE FROM dbo.UdtRowver WHERE id = 2');
 
 # --- omitting them loads, and the server generates the rowversion itself.
 statement ok

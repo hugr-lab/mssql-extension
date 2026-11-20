@@ -425,6 +425,22 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 		// for COLMETADATA. The BCP protocol requires COLMETADATA to match the target table exactly.
 		// For newly created tables, we use source types since the table was created from them.
 		bool need_target_metadata = !bdata.config.overwrite;
+		// Spec 093 T2: a VARIANT column the load creates writes its string values under the database's
+		// collation. The catalog's is empty when it never read it (catalog false) or its query failed;
+		// then this COPY's own connection is asked, once, and only when a VARIANT is loaded. Empty again
+		// (the read failed too) gives Latin1_General_100_BIN2_UTF8 (codec::variant::StringCollationBytes).
+		auto variant_collation = [&]() -> string {
+			const auto &known = mssql_catalog.GetDatabaseCollation();
+			bool has_variant = false;
+			for (const auto &type : bdata.source_types) {
+				has_variant = has_variant || type.id() == LogicalTypeId::VARIANT;
+			}
+			if (!known.empty() || !has_variant) {
+				return known;
+			}
+			return MSSQLSimpleQuery::ExecuteScalar(
+				*gstate->connection, "SELECT CONVERT(sysname, DATABASEPROPERTYEX(DB_NAME(), 'Collation'))");
+		};
 		bool need_column_mapping = false;
 		// "Nothing left to load" has to be raised OUTSIDE the try below, because
 		// that block ends in a bare `catch (...)` meant for "the table was just
@@ -549,17 +565,17 @@ unique_ptr<GlobalFunctionData> BCPCopyInitGlobal(ClientContext &context, Functio
 				target_metadata_used = true;
 			} catch (...) {
 				// If we can't get target metadata (e.g., table was just created), use source types
-				gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names,
-																		 bdata.config.wire_varchar_collation,
-																		 bdata.config.text_type_varchar);
+				gstate->columns = TargetResolver::GenerateColumnMetadata(
+					bdata.source_types, bdata.source_names, bdata.config.wire_varchar_collation,
+					bdata.config.text_type_varchar, variant_collation());
 				CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (%llu columns)",
 							 (unsigned long long)gstate->columns.size());
 			}
 		} else {
 			// Table was replaced or created, use source types
-			gstate->columns = TargetResolver::GenerateColumnMetadata(bdata.source_types, bdata.source_names,
-																	 bdata.config.wire_varchar_collation,
-																	 bdata.config.text_type_varchar);
+			gstate->columns = TargetResolver::GenerateColumnMetadata(
+				bdata.source_types, bdata.source_names, bdata.config.wire_varchar_collation,
+				bdata.config.text_type_varchar, variant_collation());
 			CopyDebugLog(1, "BCPCopyInitGlobal: using source column metadata (table created/replaced)");
 		}
 

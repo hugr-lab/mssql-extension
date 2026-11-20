@@ -587,8 +587,9 @@ void CTASExecutionState::InitializeBCP(ClientContext &context) {
 	}
 
 	// Use TargetResolver to generate proper BCP column metadata
-	bcp_columns = TargetResolver::GenerateColumnMetadata(source_types, source_names, config.wire_varchar_collation,
-														 config.text_type == CTASTextType::VARCHAR);
+	bcp_columns = TargetResolver::GenerateColumnMetadata(
+		source_types, source_names, config.wire_varchar_collation, config.text_type == CTASTextType::VARCHAR,
+		Catalog::GetCatalog(context, Identifier(target.catalog_name)).Cast<MSSQLCatalog>().GetDatabaseCollation());
 
 	DebugLog(2, "BCP columns initialized: %llu columns", (unsigned long long)bcp_columns.size());
 }
