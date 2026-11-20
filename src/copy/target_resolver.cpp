@@ -1073,9 +1073,10 @@ namespace {
 //! decodes their stored bytes into WKB on the client (spec 093 T5), which is why
 //! `IsKnownSQLServerType` admits them — but a DuckDB GEOMETRY holds WKB, not
 //! SQL Server's own Spatial Type Binary Format the column takes, so a bulk load
-//! cannot send them (spec 093 T6). And the types with no decodable wire form at all
-//! (`sql_variant`, `hierarchyid`, any other CLR UDT) are exactly the ones
-//! `IsKnownSQLServerType` already rejects.
+//! cannot send them (spec 093 T6). And the types the bulk wire cannot carry for
+//! reasons of their own (`sql_variant`, `hierarchyid`, any other CLR UDT -- the
+//! first two are read, by the VARIANT and hierarchyid kernels) are exactly the
+//! ones `IsKnownSQLServerType` already rejects.
 //!
 //! Two of those the join DID return before #353, so it is worth saying what
 //! they used to do rather than leaving a silent behaviour change. Both were

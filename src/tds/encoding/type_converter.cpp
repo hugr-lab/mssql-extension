@@ -290,7 +290,8 @@ std::string TypeConverter::GetTypeName(uint8_t type_id) {
 
 void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null, const ColumnMetadata &column,
 								 Vector &vector, idx_t row_idx,
-								 mssql::codec::variant::VariantColumnNotes *variant_notes) {
+								 mssql::codec::variant::VariantColumnNotes *variant_notes,
+								 mssql::codec::spatial::SpatialColumnNotes *spatial_notes) {
 	if (is_null) {
 		FlatVector::SetNull(vector, row_idx, true);
 		return;
@@ -364,7 +365,7 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 		if (vector.GetType().id() == LogicalTypeId::BLOB && column.geometry_as == GeometryAs::Native) {
 			mssql::codec::binary::DecodeFromTds(value, column, vector, row_idx);
 		} else {
-			mssql::codec::spatial::DecodeFromTds(value, column, vector, row_idx);
+			mssql::codec::spatial::DecodeFromTds(value, column, vector, row_idx, spatial_notes);
 		}
 		break;
 

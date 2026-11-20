@@ -169,6 +169,18 @@ scan refused them.
 
   Collections nested deeper than 15, which DuckDB's `GEOMETRY` does not read, are NULL the same way.
 
+- **A value whose bytes are not MS-SSCLRT** (truncated, a figure, shape or segment out of place) is
+  NULL too, under `'geometry'` and `'wkb'` alike, never an error: one value does not fail the scan of
+  its table. Its own `WARNING`, once per column, names the count and the first value's fault:
+
+  ```
+  mssql: column "g" (geometry): 1 value(s) whose stored bytes cannot be read as geometry (the first:
+  ...), read as NULL; attach with geometry_as 'native' to read the stored bytes
+  ```
+
+  A compound curve's segments are checked before it is answered a curve, so corrupt segments are this
+  case under `'geometry'` as well.
+
   The query is not failed. `IS NULL` / `IS NOT NULL` and `count(g)` go to the server, which answers by the
   real values: `WHERE g IS NULL` matches true NULLs only, so a `DELETE … WHERE g IS NULL` leaves the curves
   alone, and `count(g)` counts them where DuckDB read NULL (owner, 2026-11-20). Under `'geometry'` DuckDB holds a curve as NULL, so anything DuckDB computes over the column sees NULL: an

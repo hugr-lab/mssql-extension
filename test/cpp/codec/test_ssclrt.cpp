@@ -964,6 +964,35 @@ void TestMalformed() {
 	Bytes bad_kind = compound;
 	bad_kind.U32(2).U8(2).U8(4);
 	Refused(bad_kind.b, SpatialStatus::BadSegment, "segment kind 4");
+	std::string kept;
+	Bytes opens_continued = compound;
+	opens_continued.U32(2).U8(0).U8(0);	 // a Line with no FirstLine before it
+	Refused(opens_continued.b, SpatialStatus::BadSegment, "a compound curve opening with a continuation (0)");
+	Bytes compound4;
+	compound4.Header(2, 0x04)
+		.U32(4)
+		.F64(0)
+		.F64(0)
+		.F64(1)
+		.F64(1)
+		.F64(2)
+		.F64(0)
+		.F64(3)
+		.F64(1)
+		.U32(1)
+		.Figure(3, 0)
+		.U32(1)
+		.Shape(-1, 0, 9);
+	Bytes kind_change = compound4;
+	kind_change.U32(2).U8(2).U8(1);	 // a line, then an Arc continuing it: a new kind needs a First marker
+	Refused(kind_change.b, SpatialStatus::BadSegment, "a line continued by an arc with no FirstArc");
+	Bytes line_then_arc = compound4;
+	line_then_arc.U32(2).U8(2).U8(3);
+	Check(ToWkb(line_then_arc.b.data(), line_then_arc.b.size(), false, true, kept) == SpatialStatus::Ok,
+		  "a line, then a FirstArc: two parts");
+	// Under 'geometry' too: the segments are checked before a curve is answered NotGeometry.
+	Check(ToWkb(opens_continued.b.data(), opens_continued.b.size(), false, false, kept) == SpatialStatus::BadSegment,
+		  "malformed segments are BadSegment under 'geometry', not NotGeometry");
 	Bytes good = compound;
 	good.U32(2).U8(2).U8(0);
 	std::string out;
@@ -1039,7 +1068,11 @@ void AppendPlp(std::vector<uint8_t> &row, const std::vector<uint8_t> *value) {
 	put(0, 4);
 }
 
-//! Stage `values` (nullptr = NULL) as one column into a vector of `type`; the out-of-range count beside.
+//! The last Stage's spatial counts.
+duckdb::mssql::codec::spatial::SpatialColumnNotes last_notes;
+
+//! Stage `values` (nullptr = NULL) as one column into a vector of `type`; the values a GEOMETRY cannot
+//! hold beside (out_of_range), and every count in last_notes.
 std::vector<std::string> Stage(const ColumnMetadata &column, const LogicalType &type,
 							   const std::vector<const std::vector<uint8_t> *> &values, idx_t &out_of_range,
 							   bool &constant) {
@@ -1057,7 +1090,8 @@ std::vector<std::string> Stage(const ColumnMetadata &column, const LogicalType &
 	}
 	stager.FinalizeChunk(values.size());
 	chunk.SetChildCardinality(values.size());
-	out_of_range = stager.ChunkOutOfRange(0);
+	last_notes = stager.SpatialNotes(0);
+	out_of_range = last_notes.not_geometry;
 	constant = chunk.data[0].GetVectorType() == duckdb::VectorType::CONSTANT_VECTOR;
 	std::vector<std::string> got;
 	for (idx_t r = 0; r < values.size(); r++) {
@@ -1133,23 +1167,26 @@ void TestReadPath() {
 			  ToHex(duckdb::StringValue::Get(blob.GetValue(1))) == circ_v.stored,
 		  "per value, BLOB: the WKB under 'wkb', the stored bytes under 'native'");
 
-	// A malformed value is an error naming the column, staged or per value.
-	std::string staged_error;
+	// A malformed value is NULL and counted, never an error: one value does not fail the scan (owner,
+	// 2026-11-20). Staged, per value, under 'geometry' and 'wkb' alike.
 	const auto junk = FromHex("0000000003");
-	try {
-		Stage(geometry, LogicalType::GEOMETRY(), {&junk}, out_of_range, constant);
-	} catch (std::exception &e) {
-		staged_error = e.what();
-	}
-	Check(staged_error.find("'shape'") != std::string::npos && staged_error.find("geometry") != std::string::npos,
-		  "staged, malformed: " + staged_error);
-	std::string value_error;
-	try {
-		TypeConverter::ConvertValue(junk, false, geography, out, 3);
-	} catch (std::exception &e) {
-		value_error = e.what();
-	}
-	Check(value_error.find("'where_at'") != std::string::npos, "per value, malformed: " + value_error);
+	got = Stage(geometry, LogicalType::GEOMETRY(), {&point, &junk, &junk}, out_of_range, constant);
+	Check(got[0] == point_v.wkb && got[1] == "NULL" && got[2] == "NULL" && last_notes.malformed == 2 &&
+			  last_notes.first_malformed == SpatialStatus::Truncated && out_of_range == 0,
+		  "staged, malformed: NULL, 2 counted, the first Truncated");
+	got = Stage(SpatialColumn("shape", "geometry", GeometryAs::Wkb), LogicalType::BLOB, {&junk, &circ}, out_of_range,
+				constant);
+	Check(got[0] == "NULL" && got[1] == circ_v.wkb && last_notes.malformed == 1 && last_notes.not_geometry == 0,
+		  "staged under 'wkb', malformed: NULL and counted, the curve read");
+	got = Stage(geometry, LogicalType::GEOMETRY(), {&junk, &junk, &junk}, out_of_range, constant);
+	Check(constant && got[2] == "NULL" && last_notes.malformed == 3,
+		  "three equal malformed values: a constant NULL, 3 counted");
+	duckdb::mssql::codec::spatial::SpatialColumnNotes notes;
+	duckdb::Vector one(LogicalType::GEOMETRY("OGC:CRS84"), 1);
+	TypeConverter::ConvertValue(junk, false, geography, one, 0, nullptr, &notes);
+	Check(one.GetValue(0).IsNull() && notes.malformed == 1, "per value, malformed: NULL and counted");
+	TypeConverter::ConvertValue(circ, false, geometry, out, 3, nullptr, &notes);
+	Check(out.GetValue(3).IsNull() && notes.not_geometry == 1, "per value, a curve into GEOMETRY: NULL and counted");
 }
 
 //! Not a check: ns per value, kernel alone and through the stager (G6's 1M points measured 163 ns a value

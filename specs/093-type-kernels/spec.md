@@ -436,7 +436,7 @@ A raw `mssql_scan` takes the type from UDT_INFO's type name (geometry, geography
 - **The codec**: `codec/clr/spatial_codec` (`FinalizeKernel::Spatial`, the per-value and constant
   paths). A GEOMETRY target is decoded whatever `geometry_as` says (a raw scan's `column_types :=
   ['GEOMETRY']` under `'native'`); a BLOB target is the WKB under `'wkb'`, the binary kernel's bytes
-  under `'native'`. A malformed value is an error naming the column.
+  under `'native'`. A malformed value (bytes that are not MS-SSCLRT) is NULL too, with a `WARNING` of its own naming the column, the count and the first value's fault, in every mode that decodes: one value that cannot be read never fails the scan of its table (owner, 2026-11-20). A compound curve's segments are checked before a curve is answered NULL, so corrupt segments are a malformed value, not a curve (review of T5).
 - **`geometry_as`**: an ATTACH option of `TYPE mssql` only (no setting: DQ-45 names an ATTACH option),
   parsed before the network (`ParseGeometryAs`), held in `MSSQLCatalogStartup::geometry_as` and set on
   `tds::ColumnMetadata::geometry_as` by every reader of a catalog's COLMETADATA -- the stream after
@@ -631,8 +631,8 @@ the PR it decides.
   `datetime2(0,3,6)`, an in-range `datetime2(7)`, `uniqueidentifier`, `varbinary(n)`, `nvarchar(n)`
   -- returns as itself. The test composes the two tables rather than repeating this one, so a change
   to either cannot leave it stale; every spatial form of G1
-  read and compared with `AsBinaryZM()` on the server; geography's CRS; the curve error and
-  `geometry_as`; spatial COPY / INSERT / UPDATE / DELETE / MERGE round trips with SRIDs 0, 4326 and
+  read and compared with `AsBinaryZM()` on the server; geography's CRS; the curves' and malformed values' NULLs and
+  WARNINGs, `geometry_as`; spatial COPY / INSERT / UPDATE / DELETE / MERGE round trips with SRIDs 0, 4326 and
   3857; `hierarchyid` against `ToString()`; `datetime2(7)` 9999-12-31 under both settings, with the
   warning in `duckdb_logs` and filters `=`, `<`, `>=` on the sentinel. Two obligations the design
   sections add, named here so this list stands on its own: the warning's **text** asserted for an
@@ -677,7 +677,7 @@ it carries DQ-44, decided after the split.
 | **T2** | `sql_variant` write (D3): literals, refusals, the bulk encoder (S2: INSERT BULK takes `0x62` with the row envelope); CTAS | 3–4 |
 | **T3** | `vector(n)` as `FLOAT[n]` (D4): the `0xF5` TYPE_INFO and row framing (moved from T0: the server sends it only under VECTORSUPPORT), VECTORSUPPORT, `mssql_vector_support`, the kernel, the JSON fallback (float16 under version 1, every vector without the feature), writes (the bytes as `varbinary` on the bulk path), CTAS / COPY; V1–V6 (measured); the 2025 CI job; `fuzz_vector` | 4.5–5.5 |
 | **T4** | `hierarchyid` on the client (D5); H1; `fuzz_hierarchyid`; a user CLR type read as `BLOB` in a raw scan (moved from T0: testing how the describe reports one needs a CLR assembly, built in a .NET SDK container) | 2–3 |
-| **T5** | spatial read (D6): the MS-SSCLRT kernel, bare read, `GEOMETRY('OGC:CRS84')`, the curve error, `geometry_as`; G1, G3, G6, K1; `fuzz_ssclrt` | 5–7 |
+| **T5** | spatial read (D6): the MS-SSCLRT kernel, bare read, `GEOMETRY('OGC:CRS84')`, curves and malformed values NULL with a WARNING, `geometry_as`; G1, G3, G6, K1; `fuzz_ssclrt` | 5–7 |
 | **T6** | spatial write (D6): SRID from the CRS, the stage, client MS-SSCLRT for geometry if G4 passes, CTAS creates `geometry`; G4, G7 | 4–5 |
 | **T7** | `json` as `JSON` (D7) | 0.5 |
 | **T8** | the backup hookup (D9): `backup_type_forms.cpp`, the vector detection fixed, fixtures per type on 2017–2025; C1 | 2–3 |

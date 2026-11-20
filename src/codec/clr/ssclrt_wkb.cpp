@@ -293,8 +293,10 @@ private:
 	}
 	//! A CompoundCurve's body: its figure's points cut into parts by the segments, from where the last
 	//! compound figure left them. A segment 2 / 3 starts a line / an arc, 0 / 1 continues one; a line
-	//! segment takes one point more, an arc two, and a part starts at the previous one's last point. The
-	//! part count precedes the parts, so the segments are walked twice: to count and check, then to write.
+	//! segment takes one point more, an arc two, and a part starts at the previous one's last point. A part
+	//! starts only at a 2 / 3: a figure opening with a 0 / 1, or a 0 / 1 of the other kind than the part it
+	//! would continue, is refused (review of #594). The part count precedes the parts, so the segments are
+	//! walked twice: to count and check, then to write.
 	bool Compound(uint32_t f) {
 		const uint32_t begin = d_.figures_[f].first_point;
 		const uint32_t end = FigureEndPoint(f);
@@ -319,9 +321,11 @@ private:
 			if (i + step > end - 1) {
 				return false;  // the segment runs past the figure
 			}
-			if (segment >= 2 || parts == 0 || previous_arc != arc) {
+			if (segment >= 2) {
 				parts++;
 				previous_arc = arc;
+			} else if (parts == 0 || previous_arc != arc) {
+				return false;  // a continuation with no part of its kind to continue
 			}
 			i += step;
 		}
@@ -583,12 +587,14 @@ SpatialStatus WkbDecoder::Read(const uint8_t *data, size_t size, bool geography,
 	if (valid != SpatialStatus::Ok) {
 		return valid;
 	}
-	if (!geometry_holds && !curves) {
-		return SpatialStatus::NotGeometry;
-	}
+	// The segments are checked before a curve is answered NotGeometry, so a value whose segments do not cut
+	// its points is BadSegment whatever geometry_as says (review of #594).
 	Emitter<false> sizing(*this, nullptr);
 	if (!sizing.Emit(0) || !sizing.SegmentsUsed()) {
 		return SpatialStatus::BadSegment;
+	}
+	if (!geometry_holds && !curves) {
+		return SpatialStatus::NotGeometry;
 	}
 	if (sizing.Bytes() > MAX_WKB_BYTES) {
 		return SpatialStatus::TooLarge;

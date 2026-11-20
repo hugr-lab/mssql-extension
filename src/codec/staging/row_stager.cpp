@@ -303,7 +303,8 @@ void FinalizeFallbackColumn(const ColumnStaging &st, idx_t count, const tds::Col
 }  // namespace
 
 void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
-						  Vector &out, variant::VariantColumnNotes *variant_notes) {
+						  Vector &out, variant::VariantColumnNotes *variant_notes,
+						  spatial::SpatialColumnNotes *spatial_notes) {
 	switch (kernel) {
 	case FinalizeKernel::None:
 		break;
@@ -335,7 +336,7 @@ void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t 
 		variant::DecodeChunkFromStaging(st, count, meta, out, variant_notes);
 		break;
 	case FinalizeKernel::Spatial:
-		spatial::DecodeChunkFromStaging(st, count, meta, out);
+		spatial::DecodeChunkFromStaging(st, count, meta, out, spatial_notes);
 		break;
 	}
 }
@@ -370,6 +371,7 @@ void RowStager::Configure(const std::vector<tds::ColumnMetadata> &metadata, cons
 	chunk_nulls_.assign(column_count, 0);
 	chunk_out_of_range_.assign(column_count, 0);
 	variant_notes_.assign(column_count, variant::VariantColumnNotes());
+	spatial_notes_.assign(column_count, spatial::SpatialColumnNotes());
 	unbounded_columns_.clear();
 	arena_.Configure(column_count);
 	// Bind the staging addresses ONCE. They are stable for as long as the arena
@@ -683,14 +685,13 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		}
 		const ColumnStaging &st = *staging_[c];
 		const tds::ColumnMetadata &meta = (*metadata_)[c];
-		// Two kernels read a value as NULL for not fitting the target: a datetime2 read as TIMESTAMP_NS
-		// (issue #168, spec 093 D8's warning) and a curve or FullGlobe read as GEOMETRY (spec 093 T5).
-		// Counted for the stream's WARNING. The kernel's NULLs are in the mask before the staged validity
-		// is ANDed in, so the mask's NULLs then are exactly the values that did not fit.
-		const bool out_of_range_counted =
-			(ops_[c].kernel == FinalizeKernel::Datetime && meta.type_id == tds::TDS_TYPE_DATETIME2 &&
-			 targets_[c]->GetType().id() == LogicalTypeId::TIMESTAMP_NS) ||
-			(ops_[c].kernel == FinalizeKernel::Spatial && targets_[c]->GetType().id() == LogicalTypeId::GEOMETRY);
+		// A datetime2 read as TIMESTAMP_NS is NULL for not fitting (issue #168, spec 093 D8's warning),
+		// counted for the stream's WARNING. The kernel's NULLs are in the mask before the staged validity
+		// is ANDed in, so the mask's NULLs then are exactly the values that did not fit. (The spatial
+		// kernel counts its own NULLs, by reason: SpatialNotes.)
+		const bool out_of_range_counted = ops_[c].kernel == FinalizeKernel::Datetime &&
+										  meta.type_id == tds::TDS_TYPE_DATETIME2 &&
+										  targets_[c]->GetType().id() == LogicalTypeId::TIMESTAMP_NS;
 		chunk_out_of_range_[c] = 0;
 		if (TryEmitConstant(c, st, meta, row_count)) {
 			chunk_nulls_[c] = st.null_count;
@@ -706,7 +707,7 @@ void RowStager::FinalizeChunk(idx_t row_count) {
 		// Which kernel is a property of the column, resolved with the append arm
 		// after COLMETADATA, so this is one switch on one invariant value and the
 		// kernel's own loop carries no dispatch at all.
-		FinalizeStagedColumn(ops_[c].kernel, st, row_count, meta, *targets_[c], &variant_notes_[c]);
+		FinalizeStagedColumn(ops_[c].kernel, st, row_count, meta, *targets_[c], &variant_notes_[c], &spatial_notes_[c]);
 		if (out_of_range_counted) {
 			const ValidityMask &kernel_nulls = FlatVector::Validity(*targets_[c]);
 			chunk_out_of_range_[c] = kernel_nulls.CannotHaveNull() ? 0 : row_count - kernel_nulls.CountValid(row_count);
@@ -842,7 +843,12 @@ bool RowStager::TryEmitConstant(idx_t c, const ColumnStaging &st, const tds::Col
 	// the batch kernel with count = 1 because the string kernel sizes its work
 	// from the whole staged payload and would convert all 2048 values to publish
 	// one.
+	const spatial::SpatialColumnNotes before = spatial_notes_[c];
 	DecodeFirstValue(c, st, meta, out);
+	// One value stands for every row: a spatial one read as NULL is counted row_count times.
+	auto &notes = spatial_notes_[c];
+	notes.not_geometry += (notes.not_geometry - before.not_geometry) * (row_count - 1);
+	notes.malformed += (notes.malformed - before.malformed) * (row_count - 1);
 	out.SetVectorType(VectorType::CONSTANT_VECTOR);
 	if (counters_enabled_) {
 		counters_.constant_columns++;
@@ -883,7 +889,7 @@ void RowStager::DecodeFirstValue(idx_t c, const ColumnStaging &st, const tds::Co
 		code_page::DecodeFromTds(bytes, meta, out, 0);
 		break;
 	case FinalizeKernel::Spatial:
-		spatial::DecodeFromTds(bytes, meta, out, 0);
+		spatial::DecodeFromTds(bytes, meta, out, 0, &spatial_notes_[c]);
 		break;
 	case FinalizeKernel::Variant:  // never constant (TryEmitConstant)
 	case FinalizeKernel::None:

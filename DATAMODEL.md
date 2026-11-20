@@ -768,8 +768,12 @@ parser -- before `TypeConverter::GetDuckDBType` is asked:
 
 | `geometry_as` | column type | kernel |
 |---|---|---|
-| `geometry` | `GEOMETRY` / `GEOMETRY('OGC:CRS84')` (geography) | `Spatial`: a curve or FullGlobe set NULL, counted by the stager (`ChunkOutOfRange`, as D8's datetime2), one WARNING per column per stream |
+| `geometry` | `GEOMETRY` / `GEOMETRY('OGC:CRS84')` (geography) | `Spatial`: a curve or FullGlobe set NULL, counted by the kernel (`SpatialColumnNotes::not_geometry`, the stager's `SpatialNotes` and the per-value path's), one WARNING per column per stream |
 | `wkb` | `BLOB` | `Spatial`, curves written |
+
+In both decoding modes a value whose bytes are not MS-SSCLRT is set NULL and counted
+(`SpatialColumnNotes::malformed`, the first one's status kept), with a WARNING of its own: the kernel
+never throws, so one value does not fail a scan (owner, 2026-11-20).
 | `native` | `BLOB` | `Binary`: the bytes as they arrived |
 
 A `GEOMETRY` target is decoded whatever `geometry_as` says (a raw scan's `column_types`). The column is

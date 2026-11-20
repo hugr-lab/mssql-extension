@@ -491,6 +491,10 @@ exit_loop:
 					warnings_pending_ = true;
 				}
 			}
+			// Spec 093 T5: a spatial value read as NULL, likewise.
+			if (column_metadata_[c].IsSpatialUdt() && SpatialWarningPending(c)) {
+				warnings_pending_ = true;
+			}
 		}
 		if (counters_enabled_) {
 			CountChunkForDebug(chunk, row_count);
@@ -576,20 +580,26 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 			row_variant_notes_.resize(column_metadata_.size());
 			variant_notes = &row_variant_notes_[col_idx];
 		}
+		mssql::codec::spatial::SpatialColumnNotes *spatial_notes = nullptr;
+		if (column_metadata_[col_idx].IsSpatialUdt()) {
+			row_spatial_notes_.resize(column_metadata_.size());
+			spatial_notes = &row_spatial_notes_[col_idx];
+		}
 		tds::encoding::TypeConverter::ConvertValue(row.values[col_idx], row.null_mask[col_idx],
-												   column_metadata_[col_idx], *target_vector, row_idx, variant_notes);
+												   column_metadata_[col_idx], *target_vector, row_idx, variant_notes,
+												   spatial_notes);
+		if (spatial_notes && SpatialWarningPending(col_idx)) {
+			warnings_pending_ = true;
+		}
 		// Spec 093 T1: as the staged path, said as soon as the scan meets one.
 		if (variant_notes && variant_notes->unknown_collation + variant_notes->invalid_utf8 > 0 &&
 			(col_idx >= variant_notes_warned_.size() || !variant_notes_warned_[col_idx])) {
 			warnings_pending_ = true;
 		}
-		// A datetime2 value read as NULL for not fitting TIMESTAMP_NS (issue #168): spec 093 D8's warning;
-		// a curve or FullGlobe read as NULL for not fitting GEOMETRY: T5's.
+		// A datetime2 value read as NULL for not fitting TIMESTAMP_NS (issue #168): spec 093 D8's warning.
 		const auto &meta = column_metadata_[col_idx];
-		const auto target_id = target_vector->GetType().id();
-		if (!row.null_mask[col_idx] &&
-			((meta.type_id == tds::TDS_TYPE_DATETIME2 && target_id == LogicalTypeId::TIMESTAMP_NS) ||
-			 (meta.IsSpatialUdt() && target_id == LogicalTypeId::GEOMETRY)) &&
+		if (!row.null_mask[col_idx] && meta.type_id == tds::TDS_TYPE_DATETIME2 &&
+			target_vector->GetType().id() == LogicalTypeId::TIMESTAMP_NS &&
 			FlatVector::IsNull(*target_vector, row_idx)) {
 			NoteOutOfRange(col_idx);
 		}
@@ -981,6 +991,60 @@ void MSSQLResultStream::DrainRemainingTokens() {
 	}
 }
 
+mssql::codec::spatial::SpatialColumnNotes MSSQLResultStream::SpatialNotesOf(idx_t c) const {
+	mssql::codec::spatial::SpatialColumnNotes notes;
+	if (stager_.IsConfigured()) {
+		notes = stager_.SpatialNotes(c);
+	}
+	if (c < row_spatial_notes_.size()) {
+		const auto &row = row_spatial_notes_[c];
+		notes.not_geometry += row.not_geometry;
+		if (notes.malformed == 0) {
+			notes.first_malformed = row.first_malformed;
+		}
+		notes.malformed += row.malformed;
+	}
+	return notes;
+}
+
+bool MSSQLResultStream::SpatialWarningPending(idx_t c) const {
+	const uint8_t warned = c < spatial_warned_.size() ? spatial_warned_[c] : 0;
+	const auto notes = SpatialNotesOf(c);
+	return (notes.not_geometry > 0 && !(warned & SPATIAL_NOT_GEOMETRY)) ||
+		   (notes.malformed > 0 && !(warned & SPATIAL_MALFORMED));
+}
+
+void MSSQLResultStream::SurfaceSpatialWarnings(ClientContext &context) {
+	spatial_warned_.resize(column_metadata_.size(), 0);
+	for (idx_t c = 0; c < column_metadata_.size(); c++) {
+		const auto &meta = column_metadata_[c];
+		if (!meta.IsSpatialUdt()) {
+			continue;
+		}
+		const auto notes = SpatialNotesOf(c);
+		// The ATTACH option first: it is read at ATTACH.
+		if (notes.not_geometry > 0 && !(spatial_warned_[c] & SPATIAL_NOT_GEOMETRY)) {
+			spatial_warned_[c] |= SPATIAL_NOT_GEOMETRY;
+			DUCKDB_LOG_WARNING(context,
+							   "mssql: column \"%s\" (%s) holds values a GEOMETRY cannot hold (a CircularString, "
+							   "CompoundCurve, CurvePolygon or FullGlobe, or collections nested deeper than 15), "
+							   "read as NULL; attach with geometry_as "
+							   "'wkb' (ISO WKB, the curves included) or 'native' (the stored bytes) to read them",
+							   meta.name.c_str(), meta.udt_type_name.c_str());
+		}
+		// A value that is not MS-SSCLRT is NULL, never an error: one value does not fail the scan of its
+		// table (owner, 2026-11-20).
+		if (notes.malformed > 0 && !(spatial_warned_[c] & SPATIAL_MALFORMED)) {
+			spatial_warned_[c] |= SPATIAL_MALFORMED;
+			DUCKDB_LOG_WARNING(context,
+							   "mssql: column \"%s\" (%s): %llu value(s) whose stored bytes cannot be read as %s (the "
+							   "first: %s), read as NULL; attach with geometry_as 'native' to read the stored bytes",
+							   meta.name.c_str(), meta.udt_type_name.c_str(), (unsigned long long)notes.malformed,
+							   meta.udt_type_name.c_str(), mssql::codec::ssclrt::DescribeStatus(notes.first_malformed));
+		}
+	}
+}
+
 void MSSQLResultStream::NoteOutOfRange(idx_t c) {
 	if (c < refuse_out_of_range_.size() && refuse_out_of_range_[c]) {
 		// Issue #559: under TIMESTAMP_NS a value outside 1677-2262 reads as NULL, and a table with no usable
@@ -1022,24 +1086,15 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 
 	// Spec 093 D8: a datetime2 column read as TIMESTAMP_NS whose values outside 1677-2262 were read
 	// as NULL (issue #168), once per column per statement, as soon as the scan meets one; T5: a
-	// geometry / geography column read as GEOMETRY whose curves or FullGlobe were read as NULL, likewise.
+	// geometry / geography column's values read as NULL, likewise (SurfaceSpatialWarnings).
 	if (warnings_pending_) {
 		warnings_pending_ = false;
+		SurfaceSpatialWarnings(context);
 		for (idx_t c = 0; c < out_of_range_.size(); c++) {
 			if (out_of_range_[c] != 1) {
 				continue;
 			}
 			out_of_range_[c] = 2;
-			if (column_metadata_[c].IsSpatialUdt()) {
-				// The ATTACH option first, as below: it is read at ATTACH.
-				DUCKDB_LOG_WARNING(context,
-								   "mssql: column \"%s\" (%s) holds values a GEOMETRY cannot hold (a CircularString, "
-								   "CompoundCurve, CurvePolygon or FullGlobe, or collections nested deeper than 15), "
-								   "read as NULL; attach with geometry_as "
-								   "'wkb' (ISO WKB, the curves included) or 'native' (the stored bytes) to read them",
-								   column_metadata_[c].name.c_str(), column_metadata_[c].udt_type_name.c_str());
-				continue;
-			}
 			// The ATTACH form first: the setting is read at ATTACH, and whoever reads this has an attached
 			// catalog, on which a bare SET changes nothing (review of #560).
 			DUCKDB_LOG_WARNING(context,

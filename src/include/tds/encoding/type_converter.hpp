@@ -13,6 +13,9 @@ namespace codec {
 namespace variant {
 struct VariantColumnNotes;
 }  // namespace variant
+namespace spatial {
+struct SpatialColumnNotes;
+}  // namespace spatial
 }  // namespace codec
 }  // namespace mssql
 
@@ -35,9 +38,11 @@ public:
 	// vector: target DuckDB vector
 	// row_idx: row index within the vector
 	// variant_notes: a sql_variant column's counts for the stream's WARNING (spec 093 T1), or none
+	// spatial_notes: a geometry / geography column's values read as NULL (spec 093 T5), or none
 	static void ConvertValue(const std::vector<uint8_t> &value, bool is_null, const tds::ColumnMetadata &column,
 							 Vector &vector, idx_t row_idx,
-							 mssql::codec::variant::VariantColumnNotes *variant_notes = nullptr);
+							 mssql::codec::variant::VariantColumnNotes *variant_notes = nullptr,
+							 mssql::codec::spatial::SpatialColumnNotes *spatial_notes = nullptr);
 
 	// Check if a SQL Server type is supported
 	static bool IsSupported(uint8_t type_id);

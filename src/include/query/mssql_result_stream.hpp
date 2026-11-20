@@ -275,6 +275,18 @@ private:
 	//! per-value path's counts (ProcessRow: target vectors, e.g. a composite rowid), beside the stager's.
 	std::vector<bool> variant_notes_warned_;
 	std::vector<mssql::codec::variant::VariantColumnNotes> row_variant_notes_;
+	//! Spec 093 T5: per column, which of its spatial WARNINGs were logged (SPATIAL_* bits); and the
+	//! per-value path's counts, beside the stager's.
+	static constexpr uint8_t SPATIAL_NOT_GEOMETRY = 1;
+	static constexpr uint8_t SPATIAL_MALFORMED = 2;
+	std::vector<uint8_t> spatial_warned_;
+	std::vector<mssql::codec::spatial::SpatialColumnNotes> row_spatial_notes_;
+	//! The column's spatial counts, the stager's and the per-value path's together.
+	mssql::codec::spatial::SpatialColumnNotes SpatialNotesOf(idx_t c) const;
+	//! Whether column `c` has spatial NULLs of a kind not yet logged.
+	bool SpatialWarningPending(idx_t c) const;
+	//! Log the spatial WARNINGs not yet logged, one a column for each kind.
+	void SurfaceSpatialWarnings(ClientContext &context);
 	bool is_catalog_scan_ = false;
 
 	// Statistics

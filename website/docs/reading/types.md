@@ -196,9 +196,14 @@ catalog and a raw `mssql_scan()` alike, so they compose with the DuckDB `spatial
   | `'wkb'` | `BLOB` | ISO WKB, the curves included (types 8 - 10) and FullGlobe as type 126, as `AsBinaryZM()` writes them |
   | `'native'` | `BLOB` | the stored bytes, `CAST(g AS varbinary(max))`; they load back by `CAST(… AS geometry)` |
 
-  Under `'native'` an `INSERT` or `UPDATE` of a spatial column through the catalog is refused by name
-  (the write path sends WKB, which these bytes are not); write through a catalog attached with
-  `'geometry'`, or with `mssql_exec()`.
+  Under `'geometry'` and `'wkb'` a stored value whose bytes cannot be read is NULL, with a WARNING of
+  its own naming the column, how many and the first one's fault; the scan goes on. `'native'` reads
+  such a value's bytes as they are.
+
+  Under `'native'` an `INSERT` or `UPDATE` of a spatial column that the extension writes row by row
+  is refused by name (the write path sends WKB, which these bytes are not); write through a catalog
+  attached with `'geometry'`, or with `mssql_exec()`. A statement pushed to the server whole (an
+  `INSERT … SELECT` between two tables of the catalog, say) copies the values there and is not refused.
 
 - A filter, an `ORDER BY` or a key on a spatial column runs in DuckDB, never on the server. `IS NULL` /
   `IS NOT NULL` and `count(g)` go to the server, which answers by the real values: under `'geometry'` a

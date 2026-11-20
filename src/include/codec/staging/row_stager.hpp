@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include "codec/clr/spatial_codec.hpp"
 #include "codec/staging/column_ops.hpp"
 #include "codec/staging/column_staging.hpp"
 #include "codec/variant/variant_codec.hpp"
@@ -91,7 +92,8 @@ struct StagingCounters {
 //! the backup reader's RecordStager (spec 085 PR 2d), so a column decodes the one way.
 //! `variant_notes`, for a Variant column: what its values needed beyond their decode (spec 093 T1).
 void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t count, const tds::ColumnMetadata &meta,
-						  Vector &out, variant::VariantColumnNotes *variant_notes = nullptr);
+						  Vector &out, variant::VariantColumnNotes *variant_notes = nullptr,
+						  spatial::SpatialColumnNotes *spatial_notes = nullptr);
 
 //! AND the staged NULLs of `count` rows into `out`'s mask (a kernel may have set NULLs of its own,
 //! which must stay); nothing when the column staged none.
@@ -182,8 +184,8 @@ public:
 
 	//! Values of column `c` in the chunk just finalized that its kernel read as NULL because they do
 	//! not fit the target -- a datetime2 outside 1677-2262 read as TIMESTAMP_NS (issue #168; spec 093
-	//! D8's warning), a curve or FullGlobe read as GEOMETRY (spec 093 T5). Counted only for a datetime2
-	//! column read as TIMESTAMP_NS and a spatial one read as GEOMETRY, else 0.
+	//! D8's warning). Counted only for a datetime2 column read as TIMESTAMP_NS, else 0; a spatial column's
+	//! NULLs are its SpatialNotes.
 	idx_t ChunkOutOfRange(idx_t c) const {
 		return chunk_out_of_range_[c];
 	}
@@ -191,6 +193,11 @@ public:
 	//! collation with no code page, UTF-8 bytes that are not UTF-8. For the stream's WARNING.
 	const variant::VariantColumnNotes &VariantNotes(idx_t c) const {
 		return variant_notes_[c];
+	}
+	//! A Spatial column's values read as NULL since the stager was configured (spec 093 T5): curves etc.
+	//! into a GEOMETRY, values that cannot be read. For the stream's WARNINGs.
+	const spatial::SpatialColumnNotes &SpatialNotes(idx_t c) const {
+		return spatial_notes_[c];
 	}
 
 	//! True when column `c` never reaches an output vector (Skip arm).
@@ -232,6 +239,8 @@ private:
 	std::vector<idx_t> chunk_out_of_range_;
 	//! Per-column VariantNotes.
 	std::vector<variant::VariantColumnNotes> variant_notes_;
+	//! Per-column SpatialNotes.
+	std::vector<spatial::SpatialColumnNotes> spatial_notes_;
 	//! Columns whose staged size is not bounded by their declared width (PLP).
 	//! Pointers, not indices: this list is walked once per ROW.
 	std::vector<ColumnStaging *> unbounded_columns_;
