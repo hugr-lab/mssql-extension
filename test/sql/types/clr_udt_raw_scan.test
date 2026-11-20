@@ -1,0 +1,122 @@
+# name: test/sql/types/clr_udt_raw_scan.test
+# description: A user CLR type read as a BLOB of its stored bytes by a raw mssql_scan, and as its ToString() text through the catalog (spec 093 T4)
+# group: [mssql]
+#
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to the test database (SQL Server 2017 or later: sys.sp_add_trusted_assembly)
+#   MSSQL_TEST_CLR   - set to 1 to run it. It turns the server's `clr enabled` on (sp_configure, server
+#                      wide; left on: switching it off would break another session's CLR objects), trusts
+#                      the assembly by its SHA-512 and deploys it; everything it creates is dropped at the end.
+#                      Needs sysadmin.
+#
+# The assembly: test/clr/TestTypes.cs, built by test/clr/build.sh into test/data/clr/mssql_test_udt.dll.hex.
+# dbo.TestPoint is Format.Native (a MAX_BYTE_SIZE of 9 in UDT_INFO), dbo.TestLabel Format.UserDefined
+# with MaxByteSize -1 (0xFFFF), one value of it past 8000 bytes. A raw scan's value is the server's own
+# CAST(... AS varbinary(max)), byte for byte, typed BLOB by the describe (user_type_schema /
+# user_type_name: system_type_name is NULL for a CLR type) and by the stream's UDT_INFO alike.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+require-env MSSQL_TEST_CLR
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS clr (TYPE mssql);
+
+statement ok
+SET VARIABLE udt_hex = (SELECT trim(content) FROM read_text('test/data/clr/mssql_test_udt.dll.hex'));
+
+statement ok
+SELECT mssql_exec('clr', 'EXEC sp_configure ''show advanced options'', 1; RECONFIGURE; EXEC sp_configure ''clr enabled'', 1; RECONFIGURE;');
+
+statement ok
+SELECT mssql_exec('clr', 'DROP TABLE IF EXISTS dbo.ClrUdtT;
+IF TYPE_ID(''dbo.TestPoint'') IS NOT NULL DROP TYPE dbo.TestPoint;
+IF TYPE_ID(''dbo.TestLabel'') IS NOT NULL DROP TYPE dbo.TestLabel;
+IF EXISTS (SELECT 1 FROM sys.assemblies WHERE name = ''MssqlTestUdt'') DROP ASSEMBLY MssqlTestUdt;
+DECLARE @b varbinary(max) = 0x' || getvariable('udt_hex') || ';
+DECLARE @h varbinary(64) = HASHBYTES(''SHA2_512'', @b);
+IF NOT EXISTS (SELECT 1 FROM sys.trusted_assemblies WHERE hash = @h)
+  EXEC sys.sp_add_trusted_assembly @h, N''mssql_test_udt'';
+CREATE ASSEMBLY MssqlTestUdt FROM @b WITH PERMISSION_SET = SAFE;');
+
+statement ok
+SELECT mssql_exec('clr', 'CREATE TYPE dbo.TestPoint EXTERNAL NAME MssqlTestUdt.[MssqlTest.TestPoint];
+CREATE TYPE dbo.TestLabel EXTERNAL NAME MssqlTestUdt.[MssqlTest.TestLabel];');
+
+statement ok
+SELECT mssql_exec('clr', 'CREATE TABLE dbo.ClrUdtT (id int PRIMARY KEY, p dbo.TestPoint NULL, l dbo.TestLabel NULL);
+INSERT INTO dbo.ClrUdtT VALUES (1, ''1,2'', ''one''), (2, ''-7,2147483647'', REPLICATE(CAST(N''x'' AS nvarchar(max)), 9000)), (3, NULL, NULL);');
+
+statement ok
+SELECT mssql_invalidate_cache('clr');
+
+# --- a raw scan: a BLOB, the server's own bytes
+query TT
+SELECT typeof(p), typeof(l) FROM mssql_scan('clr', 'SELECT p, l FROM dbo.ClrUdtT') LIMIT 1;
+----
+BLOB	BLOB
+
+query III
+SELECT count(*), count(*) FILTER (WHERE p IS DISTINCT FROM pb), count(*) FILTER (WHERE l IS DISTINCT FROM lb)
+FROM mssql_scan('clr', 'SELECT p, CAST(p AS varbinary(max)) AS pb, l, CAST(l AS varbinary(max)) AS lb FROM dbo.ClrUdtT');
+----
+3	0	0
+
+# The 9000-character label: its bytes past 8000 (a length prefix and UTF-8 x's).
+query I
+SELECT octet_length(l) > 9000 FROM mssql_scan('clr', 'SELECT l FROM dbo.ClrUdtT WHERE id = 2');
+----
+true
+
+query II
+SELECT p IS NULL, l IS NULL FROM mssql_scan('clr', 'SELECT p, l FROM dbo.ClrUdtT WHERE id = 3');
+----
+true	true
+
+# Prepared (sp_prepare's COLMETADATA) and with parameters (the describe) alike.
+query III
+SELECT count(*), count(*) FILTER (WHERE p IS DISTINCT FROM pb), count(*) FILTER (WHERE l IS DISTINCT FROM lb)
+FROM mssql_scan('clr', 'SELECT p, CAST(p AS varbinary(max)) AS pb, l, CAST(l AS varbinary(max)) AS lb FROM dbo.ClrUdtT', prepared := true);
+----
+3	0	0
+
+query II
+SELECT typeof(p), p = pb FROM mssql_scan_params('clr', 'SELECT p, CAST(p AS varbinary(max)) AS pb FROM dbo.ClrUdtT WHERE id = @i', {'i': 1});
+----
+BLOB	true
+
+# Inside a transaction the describe types the scan (it is materialised at init).
+statement ok
+BEGIN TRANSACTION;
+
+query T
+SELECT typeof(p) FROM mssql_scan('clr', 'SELECT p FROM dbo.ClrUdtT WHERE id = 1');
+----
+BLOB
+
+statement ok
+COMMIT;
+
+# --- the catalog: through CAST(... AS NVARCHAR(MAX)), the type's ToString()
+query ITT
+SELECT id, p, l FROM clr.dbo.ClrUdtT WHERE id = 1;
+----
+1	1,2	one
+
+query TT
+SELECT typeof(p), typeof(l) FROM clr.dbo.ClrUdtT LIMIT 1;
+----
+VARCHAR	VARCHAR
+
+# --- cleanup (clr enabled stays as it is; see the header)
+statement ok
+SELECT mssql_exec('clr', 'DROP TABLE dbo.ClrUdtT; DROP TYPE dbo.TestPoint; DROP TYPE dbo.TestLabel;
+DECLARE @h varbinary(64) = (SELECT HASHBYTES(''SHA2_512'', content) FROM sys.assembly_files f JOIN sys.assemblies a ON a.assembly_id = f.assembly_id WHERE a.name = ''MssqlTestUdt'' AND f.file_id = 1);
+DROP ASSEMBLY MssqlTestUdt;
+IF @h IS NOT NULL AND EXISTS (SELECT 1 FROM sys.trusted_assemblies WHERE hash = @h AND description = N''mssql_test_udt'')
+  EXEC sys.sp_drop_trusted_assembly @h;');
+
+statement ok
+DETACH clr;

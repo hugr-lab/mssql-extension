@@ -27,10 +27,10 @@ enum class MSSQLDatetime2Read : uint8_t { Nanoseconds, Microseconds };
 MSSQLDatetime2Read ParseDatetime2Read(const string &value, const string &source);
 
 //! How the scan reads a column (spec 093 D2): as itself; through a server-side cast, for a type the
-//! extension does not decode yet (sql_variant's CASE, hierarchyid and CLR types as NVARCHAR(MAX):
-//! BuildReadExpression); or as OGC WKB through `.STAsBinary()` (geometry, geography). A type's PR
-//! moves it to Bare when its kernel lands; what the server's comparison does with it is a separate
-//! answer (MSSQLColumnInfo::comparison_differs).
+//! extension does not decode yet (a user CLR type as NVARCHAR(MAX): BuildReadExpression; sql_variant
+//! (T1) and hierarchyid (T4) are read bare now); or as OGC WKB through `.STAsBinary()` (geometry, geography). A type's
+//! PR moves it to Bare when its kernel lands; what the server's comparison does with it is a separate answer
+//! (MSSQLColumnInfo::comparison_differs).
 enum class MSSQLReadForm : uint8_t { Bare, ServerCast, SpatialBinary };
 
 //===----------------------------------------------------------------------===//
@@ -207,8 +207,9 @@ struct MSSQLColumnInfo {
 	//!     than SQL Server's own Spatial Type Binary Format;
 	//!   - `ntext` -> `NVARCHAR(MAX)`, `image` -> `VARBINARY(MAX)`: the per-value
 	//!     decoders have no arm for their wire tokens;
-	//!   - a type with no decodable wire form at all (sql_variant, hierarchyid,
-	//!     a CLR UDT) -> `NVARCHAR(MAX)`;
+	//!   - a type with no decodable wire form at all (a user CLR UDT) ->
+	//!     `NVARCHAR(MAX)`; sql_variant and hierarchyid are decoded on the
+	//!     client (spec 093 T1, T4) and read bare;
 	//!   - a non-UTF-8 CHAR/VARCHAR/TEXT -> `NVARCHAR(n)`, because a DuckDB
 	//!     VARCHAR is UTF-8 by contract, unless the client transcodes it
 	//!     (`client_transcode` below).

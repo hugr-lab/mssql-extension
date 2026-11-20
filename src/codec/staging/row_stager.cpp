@@ -7,6 +7,7 @@
 #include "codec/staging/row_stager.hpp"
 
 #include "codec/binary_codec.hpp"
+#include "codec/clr/hierarchyid_codec.hpp"
 #include "codec/code_page/code_page_codec.hpp"
 #include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
@@ -333,6 +334,9 @@ void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t 
 		break;
 	case FinalizeKernel::Variant:
 		variant::DecodeChunkFromStaging(st, count, meta, out, variant_notes);
+		break;
+	case FinalizeKernel::HierarchyId:
+		hierarchyid::DecodeChunkFromStaging(st, count, meta, out);
 		break;
 	case FinalizeKernel::Vector:
 		sql_vector::DecodeChunkFromStaging(st, count, meta, out);
@@ -880,6 +884,9 @@ void RowStager::DecodeFirstValue(idx_t c, const ColumnStaging &st, const tds::Co
 		break;
 	case FinalizeKernel::CodePage:
 		code_page::DecodeFromTds(bytes, meta, out, 0);
+		break;
+	case FinalizeKernel::HierarchyId:
+		hierarchyid::DecodeFromTds(bytes, meta, out, 0);
 		break;
 	case FinalizeKernel::Variant:  // never constant (TryEmitConstant)
 	case FinalizeKernel::Vector:

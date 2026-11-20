@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Spec 093 T4: the user CLR types of test/clr/TestTypes.cs. SQL Server hosts .NET Framework 4 (CLR 4),
+       on Linux too, so the assembly targets net48, built on the .NET SDK with the Framework's reference
+       assemblies (a NuGet package). test/clr/build.sh builds it in a container. -->
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>MssqlTestUdt</AssemblyName>
+    <RootNamespace>MssqlTest</RootNamespace>
+    <LangVersion>7.3</LangVersion>
+    <Deterministic>true</Deterministic>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <Reference Include="System.Data" />
+  </ItemGroup>
+</Project>

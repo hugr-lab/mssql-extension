@@ -112,10 +112,17 @@ SELECT typeof(v), variant_typeof(v) FROM mssql_scan('dt75', 'SELECT CAST(1 AS sq
 ----
 VARIANT	INT32
 
-statement error
-SELECT * FROM mssql_scan('dt75', 'SELECT hierarchyid::Parse(''/1/'') AS h');
+# Spec 093 T4: a hierarchyid is decoded on the client into its ToString() text; geometry and
+# geography are still refused by a raw scan (T5).
+query TT
+SELECT typeof(h), h FROM mssql_scan('dt75', 'SELECT hierarchyid::Parse(''/1.5/-2/'') AS h');
 ----
-column 'h' is of the CLR type sys.hierarchyid, which a raw mssql_scan does not read yet
+VARCHAR	/1.5/-2/
+
+statement error
+SELECT * FROM mssql_scan('dt75', 'SELECT geometry::Point(1, 2, 0) AS g');
+----
+column 'g' is of the CLR type sys.geometry, which a raw mssql_scan does not read yet
 
 # Spec 093 T0: the COLMETADATA and rows of a UDT / sql_variant column are parsed, so the
 # prepared path refuses with the same message, and a batch that returns one to mssql_exec runs
@@ -124,6 +131,11 @@ query TT
 SELECT typeof(v), variant_typeof(v) FROM mssql_scan('dt75', 'SELECT CAST(1 AS sql_variant) AS v', prepared := true);
 ----
 VARIANT	INT32
+
+query TT
+SELECT typeof(h), h FROM mssql_scan('dt75', 'SELECT hierarchyid::GetRoot() AS h', prepared := true);
+----
+VARCHAR	/
 
 statement ok
 SELECT mssql_exec('dt75', 'SELECT hierarchyid::GetRoot() AS h, CAST(1 AS sql_variant) AS v, geometry::Point(1, 2, 0) AS g');

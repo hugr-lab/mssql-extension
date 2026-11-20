@@ -22,19 +22,21 @@ namespace tds {
 // ColumnMetadata - Describes a single result column from COLMETADATA token
 //===----------------------------------------------------------------------===//
 
+// Every scalar starts at 0 (spec 093 T4): one default-constructed in a loop took the previous
+// iteration's type_id from the stack, and the describe read a stale 0xF0 as a user CLR type.
 struct ColumnMetadata {
-	std::string name;	  // Column name (UTF-8)
-	uint8_t type_id;	  // TDS type identifier
-	uint16_t max_length;  // Maximum length for variable types
-	uint8_t precision;	  // Precision for DECIMAL/NUMERIC
-	uint8_t scale;		  // Scale for DECIMAL/NUMERIC or TIME
-	uint32_t collation;	  // Collation LCID + flags: the first 4 of the 5 wire bytes
+	std::string name;		  // Column name (UTF-8)
+	uint8_t type_id = 0;	  // TDS type identifier
+	uint16_t max_length = 0;  // Maximum length for variable types
+	uint8_t precision = 0;	  // Precision for DECIMAL/NUMERIC
+	uint8_t scale = 0;		  // Scale for DECIMAL/NUMERIC or TIME
+	uint32_t collation = 0;	  // Collation LCID + flags: the first 4 of the 5 wire bytes
 	// The 5th collation byte, previously parsed and thrown away. It is the
 	// SortId, and for the SQL_* collations it is what names the CODE PAGE --
 	// the first four carry LCID and flags only, so without it a message about
 	// a collation cannot say which one it met (issue #224, from @oluies' #305).
-	uint8_t collation_sort_id;
-	uint16_t flags;	 // Column flags (nullable, identity, etc.)
+	uint8_t collation_sort_id = 0;
+	uint16_t flags = 0;	 // Column flags (nullable, identity, etc.)
 	// The code page this column's bytes are transcoded from (spec 092 D2), or
 	// nullptr: read them verbatim. Set once per column by the stream, after
 	// COLMETADATA and only when its catalog transcodes, so no decoder looks a page
@@ -64,6 +66,20 @@ struct ColumnMetadata {
 	//! The dimensions of a VECTORTYPE column (ParseTypeInfo checked them).
 	uint16_t VectorDimensions() const {
 		return static_cast<uint16_t>((max_length - VECTOR_HEADER_BYTES) / VectorElementBytes(vector_element_type));
+	}
+
+	//! A UDT column of the system CLR type hierarchyid (spec 093 T4: decoded on the client).
+	bool IsHierarchyIdUdt() const {
+		return type_id == TDS_TYPE_UDT && udt_schema == "sys" && udt_type_name == "hierarchyid";
+	}
+	//! A UDT column of geometry / geography (spec 093 T5 decodes them; a raw scan refuses them until then).
+	bool IsSpatialUdt() const {
+		return type_id == TDS_TYPE_UDT && udt_schema == "sys" &&
+			   (udt_type_name == "geometry" || udt_type_name == "geography");
+	}
+	//! A user CLR type (not one of the three system ones): its bytes are opaque, a BLOB (spec 093 T4).
+	bool IsUserClrUdt() const {
+		return type_id == TDS_TYPE_UDT && !IsHierarchyIdUdt() && !IsSpatialUdt();
 	}
 
 	// Derived properties

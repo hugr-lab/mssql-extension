@@ -151,6 +151,21 @@ would remove the difference. A plain `float` column's statement path also stores
 literal `-0.0` is a decimal literal to T-SQL; the float codec's behaviour before T2); a `VARIANT`'s
 literal is a float literal and keeps the sign. A CTAS creates the column as `sql_variant`.
 
+### HIERARCHYID and user CLR types
+
+| SQL Server Type | TDS Type ID | Wire Format | DuckDB Type | Notes |
+|---|---|---|---|---|
+| HIERARCHYID | 0xF0 (UDT `sys.hierarchyid`) | PLP, the MS-SSCLRT 2.2.2 bit string (at most 892 bytes) | VARCHAR | Decoded on the client into its `ToString()` text, `/1/2.5/-3/` (spec 093 T4) |
+| user CLR type | 0xF0 (UDT `schema.name`) | PLP, the type's own serialized bytes | BLOB (raw scan) / VARCHAR (catalog) | A raw scan reads the bytes, as `CAST(x AS varbinary(max))` gives them; the catalog reads `CAST(x AS NVARCHAR(MAX))`, the type's `ToString()` |
+
+A `hierarchyid` is read bare by the catalog and a raw `mssql_scan` / `mssql_scan_params` alike, with
+no conversion on the server. Its text does not compare or sort like the tree (`/10/` comes after `/2/`
+in the tree, before it as text), so a filter or an ORDER BY on the column runs in DuckDB, over the text,
+and the column is never a row key; `IS NULL` is pushed. A value is written as a string literal the
+server parses (`INSERT … VALUES ('/1/2/')`). A user CLR type's bytes mean nothing without its
+assembly, so a raw scan gives them as they are; the describe names it by `user_type_schema` /
+`user_type_name` (its `system_type_name` is NULL).
+
 ### VECTOR Type (SQL Server 2025)
 
 | SQL Server Type | TDS Type ID | Wire Format | DuckDB Type | Notes |
@@ -183,15 +198,14 @@ cast `::FLOAT[n]` named.
 
 ### Not read by a raw scan yet
 
-An attached catalog reads these columns through a server-side conversion (spatial as WKB,
-`hierarchyid` and other CLR types as text). A raw `mssql_scan` /
-`mssql_scan_params` that selects one bare is refused at bind, naming the column and the type; spec 093
-decodes them on the client type by type. Their COLMETADATA and rows are parsed, so a batch that returns
-them to `mssql_exec`, or a DML whose trigger does, no longer fails.
+An attached catalog reads `geometry` / `geography` as WKB through `.STAsBinary()`. A raw
+`mssql_scan` / `mssql_scan_params` that selects one bare is refused at bind, naming the column and the
+type; spec 093 T5 decodes them on the client. Their COLMETADATA and rows are parsed, so a batch that
+returns them to `mssql_exec`, or a DML whose trigger does, does not fail.
 
 | SQL Server Type | TDS Type ID | Read by a raw scan |
 |---|---|---|
-| UDT (GEOGRAPHY, GEOMETRY, HIERARCHYID, user CLR types) | 0xF0 | not yet (spec 093 T4, T5) |
+| UDT (GEOGRAPHY, GEOMETRY) | 0xF0 | not yet (spec 093 T5) |
 
 ```
 MSSQL Error: column 'g' is of the CLR type sys.geometry, which a raw mssql_scan does not read yet. ...

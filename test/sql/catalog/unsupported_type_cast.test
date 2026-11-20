@@ -1,12 +1,12 @@
 # name: test/sql/catalog/unsupported_type_cast.test
-# description: Test that a SQL Server type with no client decoder (hierarchyid) is auto-CAST to NVARCHAR(MAX) beside a sql_variant read as VARIANT
+# description: A hierarchyid (decoded on the client, spec 093 T4) and a sql_variant (a VARIANT, T1) read through the catalog
 # group: [mssql]
 #
-# When a column uses a SQL Server type that has no native TDS decoder (hierarchyid, CLR
-# UDTs), the extension maps it to VARCHAR in the catalog and wraps it with
-# CAST([col] AS NVARCHAR(MAX)) in the pushdown SELECT to ensure SQL Server sends text instead
-# of the native wire format. A sql_variant is read bare as a VARIANT since spec 093 T1; it
-# renders here as its value's text.
+# Both types used to be CAST to NVARCHAR(MAX) in the scan's SELECT, the only way the server sent
+# them as something the client read. A sql_variant is read bare as a VARIANT since spec 093 T1 (it
+# renders here as its value's text), a hierarchyid as its UDT bytes decoded into its ToString() text
+# since T4: the same VARCHAR, the same text. A user CLR type keeps the cast
+# (test/sql/types/clr_udt_raw_scan.test); test/sql/types/hierarchyid_read.test checks H1.
 #
 # REQUIRES: SQL Server running with TestDB initialized
 # Run with: make integration-test
