@@ -182,6 +182,12 @@ size_t ExactUtf8Length(const CodePageTable &page, const uint8_t *src, size_t n);
 const CollationRow *FindCollationById(int32_t collation_id);
 const CollationRow *FindCollationByName(const char *name, size_t length);
 
+//! The five bytes the wire carries for the collation named `name` (COLMETADATA's, a sql_variant
+//! envelope's: LCID, flags, version, SortId), into `out`. The flags from the name's parts (_CI / _AI,
+//! kana and width insensitive unless _KS / _WS, _BIN / _BIN2, _UTF8). False for a name the generated
+//! tables do not have.
+bool WireCollationForName(const char *name, size_t length, uint8_t out[5]);
+
 //! The code page of a collation as the wire carries it (COLMETADATA's five
 //! bytes: LCID, flags, version, SortId). A non-zero SortId names a SQL_
 //! collation and decides alone; otherwise the LCID and the UTF-8 flag do.

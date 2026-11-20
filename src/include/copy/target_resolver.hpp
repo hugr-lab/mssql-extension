@@ -6,6 +6,7 @@
 #include "catalog/mssql_index_kind.hpp"
 #include "catalog/mssql_table_options.hpp"
 #include "duckdb/common/types.hpp"
+#include "tds/tds_types.hpp"
 
 namespace duckdb {
 
@@ -210,6 +211,11 @@ struct BCPColumnMetadata {
 	// Check if this is a fixed-length type
 	bool IsFixedLength() const;
 
+	// A sql_variant column (spec 093 T2): SSVARIANT, a u32 length (LONGLEN) and the envelope, 0 for NULL.
+	bool IsSqlVariant() const {
+		return tds_type_token == tds::TDS_TYPE_SQL_VARIANT;
+	}
+
 	// Get the wire size for the length prefix (0 for fixed, 1 for BYTELEN, 2 for USHORTLEN)
 	uint8_t GetLengthPrefixSize() const;
 
@@ -376,10 +382,14 @@ struct TargetResolver {
 	//        but names none itself; empty leaves the column on the UTF-16 wire
 	// @param varchar_collation collation for a column whose type states varchar
 	//        but names none itself; empty leaves such a column on the UTF-16 wire
+	// @param database_collation the database's default collation: a VARIANT column's string values
+	//        are written under it (spec 093 T2); empty, or a name the build's table lacks, gives
+	//        Latin1_General_100_BIN2_UTF8's bytes (codec::variant::StringCollationBytes)
 	static vector<BCPColumnMetadata> GenerateColumnMetadata(const vector<LogicalType> &source_types,
 															const vector<string> &source_names,
 															const string &varchar_collation = "",
-															bool single_byte_text = false);
+															bool single_byte_text = false,
+															const string &database_collation = "");
 
 	//===----------------------------------------------------------------------===//
 	// Type Mapping

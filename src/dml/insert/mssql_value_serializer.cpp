@@ -5,6 +5,7 @@
 #include "codec/literal_format.hpp"
 #include "codec/sql_vector/vector_codec.hpp"
 #include "codec/string_codec.hpp"
+#include "codec/variant/variant_write.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "query/mssql_identifier.hpp"
@@ -83,13 +84,12 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 		// the column themselves).
 		return mssql::codec::sql_vector::FormatLiteral(value, column);
 	}
+	if (type.id() == LogicalTypeId::VARIANT) {
+		// Spec 093 T2 (D3): CAST(CAST(<literal> AS <base type>) AS sql_variant), the base type by the
+		// value's VARIANT tag; a value sql_variant cannot hold is refused naming the column.
+		return mssql::codec::variant::FormatLiteral(value, column);
+	}
 	try {
-		if (type.id() == LogicalTypeId::VARIANT && !value.IsNull()) {
-			// Spec 093: a sql_variant column reads as VARIANT (T1); writing one is T2.
-			throw InvalidInputException(
-				"a VARIANT value cannot be written to SQL Server yet (a sql_variant column "
-				"is written from spec 093 T2 on); write it with mssql_exec");
-		}
 		try {
 			return mssql::codec::FormatSqlLiteral(value, type, mssql::codec::LiteralContext::InsertValues);
 		} catch (const NotImplementedException &) {

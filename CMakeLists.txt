@@ -168,6 +168,7 @@ set(EXTENSION_SOURCES
     src/codec/variant/variant_codec.cpp
     src/codec/sql_vector/vector_bytes.cpp
     src/codec/sql_vector/vector_codec.cpp
+    src/codec/variant/variant_write.cpp
     # Backup reader (spec 085): the parsers over byte spans, DuckDB-free (D15).
     src/backup/backup_allocation.cpp
     src/backup/backup_boot.cpp

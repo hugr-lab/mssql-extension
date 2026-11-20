@@ -2,6 +2,8 @@
 #include "catalog/mssql_column_info.hpp"
 #include "catalog/mssql_column_names.hpp"
 #include "codec/sql_vector/vector_codec.hpp"
+#include "codec/code_page/code_page.hpp"
+#include "codec/variant/variant_write.hpp"
 #include "query/mssql_identifier.hpp"
 #include "query/mssql_sql_params.hpp"
 
@@ -222,6 +224,9 @@ string BCPColumnMetadata::GetSQLServerTypeDeclaration() const {
 		// No length limitation: nvarchar(max) supports up to 2 GB, same as XML.
 		return "nvarchar(max)";
 
+	case tds::TDS_TYPE_SQL_VARIANT:
+		return "sql_variant";
+
 	default:
 		// Fallback to DuckDB type-based declaration
 		return TargetResolver::GetSQLServerTypeDeclaration(duckdb_type);
@@ -229,6 +234,9 @@ string BCPColumnMetadata::GetSQLServerTypeDeclaration() const {
 }
 
 uint8_t BCPColumnMetadata::GetLengthPrefixSize() const {
+	if (IsSqlVariant()) {
+		return 4;  // LONGLEN
+	}
 	if (IsVariableLengthUSHORT()) {
 		return 2;  // USHORTLEN
 	} else if (IsFixedLength()) {
@@ -718,7 +726,15 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 	// Normalize target type name to lowercase for comparison
 	string target_lower = StringUtil::Lower(target_type_name);
 
+	if (target_lower == "sql_variant") {
+		// Spec 093 T2: the envelope's base type comes from a VARIANT value's tag (D3); another source
+		// is a type mismatch here -- cast it to VARIANT in the COPY's query.
+		return source_type.id() == LogicalTypeId::VARIANT;
+	}
 	switch (source_type.id()) {
+	case LogicalTypeId::VARIANT:
+		return false;  // only into a sql_variant column (above)
+
 	case LogicalTypeId::BOOLEAN:
 		return target_lower == "bit";
 
@@ -1120,6 +1136,9 @@ bool BulkWireCanCarry(const string &type_name) {
 	if (lower == "vector") {
 		return true;  // spec 093 T3: varbinary under a declared vector(n), measured V6
 	}
+	if (lower == "sql_variant") {
+		return true;  // spec 093 T2: SSVARIANT envelopes (S2), FromServerColumn's 0x62
+	}
 	return MSSQLColumnInfo::IsKnownSQLServerType(type_name);
 }
 
@@ -1200,6 +1219,15 @@ BCPColumnMetadata BCPColumnMetadata::FromServerColumn(const string &name, const 
 		col.max_length = static_cast<uint16_t>(max_length);
 		col.scale = 0;
 		col.duckdb_type = mssql::codec::sql_vector::FloatArrayType(col.vector_dims);
+	} else if (type_lower == "sql_variant") {
+		// Spec 093 T2 (D3): a VARIANT, written as SSVARIANT envelopes (S2: INSERT BULK takes them). A
+		// string base value carries `collation_name`'s collation -- the callers give the database's
+		// default, which is what the statement path's CAST gives one --, or Latin1_General_100_BIN2_UTF8
+		// when the build's table lacks it (StringCollationBytes).
+		col.tds_type_token = tds::TDS_TYPE_SQL_VARIANT;
+		col.max_length = static_cast<uint16_t>(mssql::codec::variant::SQL_VARIANT_MAX_LENGTH);
+		col.duckdb_type = LogicalType::VARIANT();
+		col.collation = mssql::codec::variant::StringCollationBytes(collation_name);
 	} else {
 		// Default to VARCHAR for text types
 		col.duckdb_type = LogicalType::VARCHAR;
@@ -1232,7 +1260,10 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 		"SELECT c.name AS column_name, CASE WHEN c.user_type_id = 255 THEN N'vector' ELSE "
 		"ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) END AS "
 		"type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
-		"ISNULL(c.collation_name, '') AS collation_name "
+		// A sql_variant has no collation of its own: its string values are written under the database's
+		// default, as the statement path's CAST writes them (spec 093 T2).
+		"ISNULL(c.collation_name, CASE WHEN c.system_type_id = 98 THEN CONVERT(sysname, "
+		"DATABASEPROPERTYEX(DB_NAME(), 'Collation')) ELSE '' END) AS collation_name "
 		"FROM " +
 			string(target.IsTempTable() ? "tempdb.sys" : "sys") +
 			".columns c "
@@ -1325,8 +1356,8 @@ vector<int32_t> TargetResolver::BuildColumnMapping(const vector<string> &source_
 
 vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<LogicalType> &source_types,
 																 const vector<string> &source_names,
-																 const string &varchar_collation,
-																 bool single_byte_text) {
+																 const string &varchar_collation, bool single_byte_text,
+																 const string &database_collation) {
 	vector<BCPColumnMetadata> columns;
 	columns.reserve(source_types.size());
 
@@ -1334,6 +1365,11 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 		BCPColumnMetadata col;
 		col.name = source_names[i];
 		col.duckdb_type = source_types[i];
+		if (source_types[i].id() == LogicalTypeId::VARIANT) {
+			// A sql_variant's string values under the database's default (spec 093 T2), as the statement
+			// path's CAST and an existing column's load write them.
+			col.collation = mssql::codec::variant::StringCollationBytes(database_collation);
+		}
 		col.nullable = true;  // All columns nullable by default for COPY
 
 		// Spec 093 T3: a FLOAT[n] creates vector(n) (FormatDdlTypeName), loaded as its bytes.
@@ -1488,6 +1524,8 @@ string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_typ
 	switch (duckdb_type.id()) {
 	case LogicalTypeId::ARRAY:
 		return codec::sql_vector::FormatDdlTypeName(duckdb_type);  // spec 093 T3: FLOAT[n] -> vector(n)
+	case LogicalTypeId::VARIANT:
+		return "sql_variant";  // spec 093 T2 (D3)
 
 	case LogicalTypeId::BOOLEAN:
 		return "bit";
@@ -1584,6 +1622,9 @@ string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_typ
 
 uint8_t TargetResolver::GetTDSTypeToken(const LogicalType &duckdb_type) {
 	switch (duckdb_type.id()) {
+	case LogicalTypeId::VARIANT:
+		return tds::TDS_TYPE_SQL_VARIANT;  // 0x62, spec 093 T2
+
 	case LogicalTypeId::BOOLEAN:
 		return tds::TDS_TYPE_BITN;	// 0x68
 
@@ -1672,6 +1713,9 @@ uint16_t TargetResolver::GetTDSMaxLength(const LogicalType &duckdb_type) {
 	}
 
 	switch (duckdb_type.id()) {
+	case LogicalTypeId::VARIANT:
+		return static_cast<uint16_t>(mssql::codec::variant::SQL_VARIANT_MAX_LENGTH);
+
 	case LogicalTypeId::BOOLEAN:
 		return 1;
 

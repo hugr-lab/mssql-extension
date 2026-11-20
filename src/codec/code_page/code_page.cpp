@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <cctype>
 
 #include <cstring>
 #include <vector>
@@ -1540,6 +1541,61 @@ const CollationRow *FindCollationByName(const char *name, size_t length) {
 		}
 	}
 	return nullptr;
+}
+
+bool WireCollationForName(const char *name, size_t length, uint8_t out[5]) {
+	const CollationRow *row = FindCollationByName(name, length);
+	if (!row) {
+		return false;
+	}
+	// The flags by the name's parts, as SQL Server spells them: _BIN / _BIN2 alone; else case and accent
+	// insensitive by _CI / _AI, kana and width insensitive unless _KS / _WS; _UTF8.
+	bool ci = false, ai = false, ks = false, ws = false, bin = false, bin2 = false, utf8 = false;
+	size_t at = 0;
+	while (at <= length) {
+		size_t end = at;
+		while (end < length && name[end] != '_') {
+			end++;
+		}
+		auto is = [&](const char *part) {
+			const size_t n = std::strlen(part);
+			if (end - at != n) {
+				return false;
+			}
+			for (size_t i = 0; i < n; i++) {
+				if (std::toupper(static_cast<unsigned char>(name[at + i])) != part[i]) {
+					return false;
+				}
+			}
+			return true;
+		};
+		ci = ci || is("CI");
+		ai = ai || is("AI");
+		ks = ks || is("KS");
+		ws = ws || is("WS");
+		bin = bin || is("BIN");
+		bin2 = bin2 || is("BIN2");
+		utf8 = utf8 || is("UTF8");
+		at = end + 1;
+	}
+	uint32_t flags = 0;
+	if (bin2) {
+		flags = 0x20;
+	} else if (bin) {
+		flags = 0x10;
+	} else {
+		flags = (ci ? 0x01u : 0u) | (ai ? 0x02u : 0u) | (ks ? 0u : 0x04u) | (ws ? 0u : 0x08u);
+	}
+	if (utf8) {
+		flags |= 0x40;
+	}
+	const uint32_t info = (row->lcid & 0xFFFFFu) | (flags << 20) | (static_cast<uint32_t>(row->version & 0x0F) << 28);
+	for (int i = 0; i < 4; i++) {
+		out[i] = static_cast<uint8_t>((info >> (8 * i)) & 0xFF);
+	}
+	// A SQL_ collation's SortId is the top octet of its CollationId; a Windows collation has none.
+	out[4] = static_cast<uint8_t>((static_cast<uint32_t>(row->collation_id) >> 24) & 0xFF);
+	return true;
 }
 
 int32_t CodePageForWireCollation(uint32_t lcid, bool utf8, uint8_t sort_id) {

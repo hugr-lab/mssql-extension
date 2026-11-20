@@ -1,0 +1,314 @@
+# name: test/sql/catalog/sql_variant_write.test
+# description: Spec 093 T2 -- a VARIANT written into a sql_variant column, each value under the base type its tag says, on the statement path, the bulk wire, CTAS, COPY, UPDATE and MERGE
+# group: [catalog]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to test database
+#
+# D3's write table: a VARIANT value is written as CAST(CAST(<literal> AS <base type>) AS sql_variant) on
+# the statement path and as an SSVARIANT envelope on the bulk wire (S2), the base type the narrowest that
+# holds every value of the tag. The source is S1's 50 values (sql_variant_read.test's table): each
+# copied on every write path and read back equal -- the same VARIANT tag, the same text -- while its
+# base type is D3's write table applied to the tag it read as (numeric -> decimal, money -> decimal(19,4),
+# time(0-5) -> time(6), datetime2(1-5) -> (3) / (6), datetime / smalldatetime -> datetime2(6), a
+# datetime2(7) / datetimeoffset(7) outside 1677-2262 -> (6), datetimeoffset(0-6) -> (6) at +00:00,
+# binary -> varbinary, char / varchar / nchar -> nvarchar). A value sql_variant cannot hold is refused
+# by name.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS svw (TYPE mssql);
+
+# An INSERT ... SELECT within the catalog is pushed whole by default (spec 080 D5: the server copies the
+# sql_variant itself, base type and all -- the last case below); off, the rows come through DuckDB and
+# are written as VARIANTs, which is what this file tests.
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+SELECT mssql_exec('svw', 'DROP TABLE IF EXISTS dbo.svw_src; CREATE TABLE dbo.svw_src (id int NOT NULL PRIMARY KEY, v sql_variant NULL); INSERT INTO dbo.svw_src VALUES  (1, CAST(CAST(1 AS bit) AS sql_variant)), (2, CAST(CAST(0 AS bit) AS sql_variant)),  (3, CAST(CAST(255 AS tinyint) AS sql_variant)), (4, CAST(CAST(-32768 AS smallint) AS sql_variant)),  (5, CAST(CAST(-2147483648 AS int) AS sql_variant)), (6, CAST(CAST(-9223372036854775808 AS bigint) AS sql_variant)),  (7, CAST(CAST(1.5 AS real) AS sql_variant)), (8, CAST(CAST(-1.25e300 AS float) AS sql_variant)),  (9, CAST(CAST(0.5 AS decimal(1,1)) AS sql_variant)), (10, CAST(CAST(-1234567.89 AS decimal(9,2)) AS sql_variant)),  (11, CAST(CAST(123456789012345678 AS decimal(18,0)) AS sql_variant)), (12, CAST(CAST(1234567890.123456789 AS decimal(19,9)) AS sql_variant)),  (13, CAST(CAST(-12345678901234567890.12345678 AS decimal(28,8)) AS sql_variant)), (14, CAST(CAST(99999999999999999999999999999999999999 AS decimal(38,0)) AS sql_variant)),  (15, CAST(CAST(-0.00000000000000000000000000000000000001 AS decimal(38,38)) AS sql_variant)), (16, CAST(CAST(12.5 AS numeric(10,3)) AS sql_variant)),  (17, CAST(CAST(-922337203685477.5808 AS money) AS sql_variant)), (18, CAST(CAST(214748.3647 AS smallmoney) AS sql_variant)),  (19, CAST(CAST(''0001-01-01'' AS date) AS sql_variant)), (20, CAST(CAST(''9999-12-31'' AS date) AS sql_variant)),  (21, CAST(CAST(''23:59:59'' AS time(0)) AS sql_variant)), (22, CAST(CAST(''10:00:00.123'' AS time(3)) AS sql_variant)),  (23, CAST(CAST(''10:00:00.123456'' AS time(6)) AS sql_variant)), (24, CAST(CAST(''10:00:00.1234567'' AS time(7)) AS sql_variant)),  (25, CAST(CAST(''2026-01-01 10:00:00'' AS datetime2(0)) AS sql_variant)), (26, CAST(CAST(''2026-01-01 10:00:00.123'' AS datetime2(3)) AS sql_variant)),  (27, CAST(CAST(''2026-01-01 10:00:00.123456'' AS datetime2(6)) AS sql_variant)), (28, CAST(CAST(''2026-01-01 10:00:00.1234567'' AS datetime2(7)) AS sql_variant)),  (29, CAST(CAST(''9999-12-31 23:59:59.9999999'' AS datetime2(7)) AS sql_variant)), (30, CAST(CAST(''0001-01-01 00:00:00'' AS datetime2(7)) AS sql_variant)),  (31, CAST(CAST(''2026-11-13 07:08:09.123'' AS datetime) AS sql_variant)), (32, CAST(CAST(''2026-11-13 07:08:00'' AS smalldatetime) AS sql_variant)),  (33, CAST(CAST(''2026-01-01 10:00:00 +14:00'' AS datetimeoffset(0)) AS sql_variant)), (34, CAST(CAST(''2026-01-01 10:00:00.123456 -14:00'' AS datetimeoffset(6)) AS sql_variant)),  (35, CAST(CAST(''2026-01-01 10:00:00.1234567 +05:30'' AS datetimeoffset(7)) AS sql_variant)), (36, CAST(CAST(''9999-12-31 23:59:59.9999999 +00:00'' AS datetimeoffset(7)) AS sql_variant)),  (37, CAST(CAST(''6F9619FF-8B86-D011-B42D-00C04FC964FF'' AS uniqueidentifier) AS sql_variant)), (38, CAST(CAST(0x0102 AS binary(4)) AS sql_variant)),  (39, CAST(CAST(0x010203 AS varbinary(10)) AS sql_variant)), (40, CAST(CAST(''ab'' AS char(5)) AS sql_variant)),  (41, CAST(CAST(''café'' COLLATE SQL_Latin1_General_CP1_CI_AS AS varchar(10)) AS sql_variant)),  (42, CAST(CAST(N''дом'' COLLATE Cyrillic_General_CI_AS AS varchar(10)) AS sql_variant)),  (43, CAST(CAST(N''漢字'' COLLATE Japanese_CI_AS AS varchar(10)) AS sql_variant)),  (44, CAST(CAST(N''😀é'' COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS varchar(20)) AS sql_variant)),  (45, CAST(CAST(N''ab'' AS nchar(5)) AS sql_variant)), (46, CAST(CAST(N''😀x'' COLLATE Latin1_General_100_CI_AS_SC AS nvarchar(10)) AS sql_variant)),  (47, CAST(CAST(N''дом'' COLLATE Cyrillic_General_CI_AS AS char(6)) AS sql_variant)), (48, NULL),  (49, CAST(CAST('''' AS varchar(5)) AS sql_variant)), (50, CAST(CAST(0x AS varbinary(5)) AS sql_variant)); ');
+
+statement ok
+SELECT mssql_exec('svw', 'DROP TABLE IF EXISTS dbo.svw_stmt; DROP TABLE IF EXISTS dbo.svw_bulk; DROP TABLE IF EXISTS dbo.svw_ctas; DROP TABLE IF EXISTS dbo.svw_copy; DROP TABLE IF EXISTS dbo.svw_upd; CREATE TABLE dbo.svw_stmt (id int NOT NULL PRIMARY KEY, v sql_variant NULL); CREATE TABLE dbo.svw_bulk (id int NOT NULL PRIMARY KEY, v sql_variant NULL); CREATE TABLE dbo.svw_copy (id int NOT NULL PRIMARY KEY, v sql_variant NULL); CREATE TABLE dbo.svw_upd (id int NOT NULL PRIMARY KEY, v sql_variant NULL); INSERT INTO dbo.svw_upd SELECT id, NULL FROM dbo.svw_src');
+
+statement ok
+SELECT mssql_invalidate_cache('svw');
+
+# --- the statement path (below the bulk threshold): one multi-row VALUES, the rows of many base types
+statement ok
+SET mssql_insert_bcp_threshold = 100000;
+
+statement ok
+INSERT INTO svw.dbo.svw_stmt SELECT id, v FROM svw.dbo.svw_src;
+
+query I
+SELECT count(*) FROM ((SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_src EXCEPT ALL SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_stmt) UNION ALL (SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_stmt EXCEPT ALL SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_src));
+----
+0
+
+query T
+SELECT * FROM mssql_scan('svw', 'SELECT STRING_AGG(CONCAT(id, '':'', CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS nvarchar(20)), ''('', CAST(SQL_VARIANT_PROPERTY(v, ''Precision'') AS nvarchar(5)), '','', CAST(SQL_VARIANT_PROPERTY(v, ''Scale'') AS nvarchar(5)), '')''), '' '') WITHIN GROUP (ORDER BY id) FROM dbo.svw_stmt');
+----
+1:bit(1,0) 2:bit(1,0) 3:tinyint(3,0) 4:smallint(5,0) 5:int(10,0) 6:bigint(19,0) 7:real(24,0) 8:float(53,0) 9:decimal(1,1) 10:decimal(9,2) 11:decimal(18,0) 12:decimal(19,9) 13:decimal(28,8) 14:decimal(38,0) 15:decimal(38,38) 16:decimal(10,3) 17:decimal(19,4) 18:decimal(10,4) 19:date(10,0) 20:date(10,0) 21:time(15,6) 22:time(15,6) 23:time(15,6) 24:time(16,7) 25:datetime2(19,0) 26:datetime2(23,3) 27:datetime2(26,6) 28:datetime2(27,7) 29:datetime2(26,6) 30:datetime2(26,6) 31:datetime2(26,6) 32:datetime2(26,6) 33:datetimeoffset(33,6) 34:datetimeoffset(33,6) 35:datetimeoffset(34,7) 36:datetimeoffset(33,6) 37:uniqueidentifier(0,0) 38:varbinary(0,0) 39:varbinary(0,0) 40:nvarchar(0,0) 41:nvarchar(0,0) 42:nvarchar(0,0) 43:nvarchar(0,0) 44:nvarchar(0,0) 45:nvarchar(0,0) 46:nvarchar(0,0) 47:nvarchar(0,0) 48:(,) 49:nvarchar(0,0) 50:varbinary(0,0)
+
+# --- the bulk wire: SSVARIANT envelopes (the threshold is the rows up to which statements are used: 1
+# sends any INSERT of two rows or more in bulk)
+statement ok
+SET mssql_insert_bcp_threshold = 1;
+
+statement ok
+INSERT INTO svw.dbo.svw_bulk SELECT id, v FROM svw.dbo.svw_src;
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+query I
+SELECT count(*) FROM ((SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_src EXCEPT ALL SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_bulk) UNION ALL (SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_bulk EXCEPT ALL SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_src));
+----
+0
+
+query T
+SELECT * FROM mssql_scan('svw', 'SELECT STRING_AGG(CONCAT(id, '':'', CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS nvarchar(20)), ''('', CAST(SQL_VARIANT_PROPERTY(v, ''Precision'') AS nvarchar(5)), '','', CAST(SQL_VARIANT_PROPERTY(v, ''Scale'') AS nvarchar(5)), '')''), '' '') WITHIN GROUP (ORDER BY id) FROM dbo.svw_bulk');
+----
+1:bit(1,0) 2:bit(1,0) 3:tinyint(3,0) 4:smallint(5,0) 5:int(10,0) 6:bigint(19,0) 7:real(24,0) 8:float(53,0) 9:decimal(1,1) 10:decimal(9,2) 11:decimal(18,0) 12:decimal(19,9) 13:decimal(28,8) 14:decimal(38,0) 15:decimal(38,38) 16:decimal(10,3) 17:decimal(19,4) 18:decimal(10,4) 19:date(10,0) 20:date(10,0) 21:time(15,6) 22:time(15,6) 23:time(15,6) 24:time(16,7) 25:datetime2(19,0) 26:datetime2(23,3) 27:datetime2(26,6) 28:datetime2(27,7) 29:datetime2(26,6) 30:datetime2(26,6) 31:datetime2(26,6) 32:datetime2(26,6) 33:datetimeoffset(33,6) 34:datetimeoffset(33,6) 35:datetimeoffset(34,7) 36:datetimeoffset(33,6) 37:uniqueidentifier(0,0) 38:varbinary(0,0) 39:varbinary(0,0) 40:nvarchar(0,0) 41:nvarchar(0,0) 42:nvarchar(0,0) 43:nvarchar(0,0) 44:nvarchar(0,0) 45:nvarchar(0,0) 46:nvarchar(0,0) 47:nvarchar(0,0) 48:(,) 49:nvarchar(0,0) 50:varbinary(0,0)
+
+# --- CTAS creates a sql_variant column
+statement ok
+CREATE TABLE svw.dbo.svw_ctas AS SELECT id, v FROM svw.dbo.svw_src;
+
+query T
+SELECT * FROM mssql_scan('svw', 'SELECT TYPE_NAME(system_type_id) FROM sys.columns WHERE object_id = OBJECT_ID(''dbo.svw_ctas'') AND name = ''v''');
+----
+sql_variant
+
+query I
+SELECT count(*) FROM ((SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_src EXCEPT ALL SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_ctas) UNION ALL (SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_ctas EXCEPT ALL SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_src));
+----
+0
+
+query T
+SELECT * FROM mssql_scan('svw', 'SELECT STRING_AGG(CONCAT(id, '':'', CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS nvarchar(20)), ''('', CAST(SQL_VARIANT_PROPERTY(v, ''Precision'') AS nvarchar(5)), '','', CAST(SQL_VARIANT_PROPERTY(v, ''Scale'') AS nvarchar(5)), '')''), '' '') WITHIN GROUP (ORDER BY id) FROM dbo.svw_ctas');
+----
+1:bit(1,0) 2:bit(1,0) 3:tinyint(3,0) 4:smallint(5,0) 5:int(10,0) 6:bigint(19,0) 7:real(24,0) 8:float(53,0) 9:decimal(1,1) 10:decimal(9,2) 11:decimal(18,0) 12:decimal(19,9) 13:decimal(28,8) 14:decimal(38,0) 15:decimal(38,38) 16:decimal(10,3) 17:decimal(19,4) 18:decimal(10,4) 19:date(10,0) 20:date(10,0) 21:time(15,6) 22:time(15,6) 23:time(15,6) 24:time(16,7) 25:datetime2(19,0) 26:datetime2(23,3) 27:datetime2(26,6) 28:datetime2(27,7) 29:datetime2(26,6) 30:datetime2(26,6) 31:datetime2(26,6) 32:datetime2(26,6) 33:datetimeoffset(33,6) 34:datetimeoffset(33,6) 35:datetimeoffset(34,7) 36:datetimeoffset(33,6) 37:uniqueidentifier(0,0) 38:varbinary(0,0) 39:varbinary(0,0) 40:nvarchar(0,0) 41:nvarchar(0,0) 42:nvarchar(0,0) 43:nvarchar(0,0) 44:nvarchar(0,0) 45:nvarchar(0,0) 46:nvarchar(0,0) 47:nvarchar(0,0) 48:(,) 49:nvarchar(0,0) 50:varbinary(0,0)
+
+# --- COPY into an existing sql_variant column
+statement ok
+COPY (SELECT id, v FROM svw.dbo.svw_src) TO 'mssql://svw/dbo/svw_copy' (FORMAT 'bcp', CREATE_TABLE false);
+
+query I
+SELECT count(*) FROM ((SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_src EXCEPT ALL SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_copy) UNION ALL (SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_copy EXCEPT ALL SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_src));
+----
+0
+
+query T
+SELECT * FROM mssql_scan('svw', 'SELECT STRING_AGG(CONCAT(id, '':'', CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS nvarchar(20)), ''('', CAST(SQL_VARIANT_PROPERTY(v, ''Precision'') AS nvarchar(5)), '','', CAST(SQL_VARIANT_PROPERTY(v, ''Scale'') AS nvarchar(5)), '')''), '' '') WITHIN GROUP (ORDER BY id) FROM dbo.svw_copy');
+----
+1:bit(1,0) 2:bit(1,0) 3:tinyint(3,0) 4:smallint(5,0) 5:int(10,0) 6:bigint(19,0) 7:real(24,0) 8:float(53,0) 9:decimal(1,1) 10:decimal(9,2) 11:decimal(18,0) 12:decimal(19,9) 13:decimal(28,8) 14:decimal(38,0) 15:decimal(38,38) 16:decimal(10,3) 17:decimal(19,4) 18:decimal(10,4) 19:date(10,0) 20:date(10,0) 21:time(15,6) 22:time(15,6) 23:time(15,6) 24:time(16,7) 25:datetime2(19,0) 26:datetime2(23,3) 27:datetime2(26,6) 28:datetime2(27,7) 29:datetime2(26,6) 30:datetime2(26,6) 31:datetime2(26,6) 32:datetime2(26,6) 33:datetimeoffset(33,6) 34:datetimeoffset(33,6) 35:datetimeoffset(34,7) 36:datetimeoffset(33,6) 37:uniqueidentifier(0,0) 38:varbinary(0,0) 39:varbinary(0,0) 40:nvarchar(0,0) 41:nvarchar(0,0) 42:nvarchar(0,0) 43:nvarchar(0,0) 44:nvarchar(0,0) 45:nvarchar(0,0) 46:nvarchar(0,0) 47:nvarchar(0,0) 48:(,) 49:nvarchar(0,0) 50:varbinary(0,0)
+
+# --- UPDATE: the VALUES join (below the stage threshold), then the staged #stage (above it)
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+UPDATE svw.dbo.svw_upd SET v = s.v FROM svw.dbo.svw_src s WHERE svw_upd.id = s.id AND s.id <= 25;
+
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+statement ok
+UPDATE svw.dbo.svw_upd SET v = s.v FROM svw.dbo.svw_src s WHERE svw_upd.id = s.id AND s.id > 25;
+
+statement ok
+RESET mssql_dml_stage_threshold;
+
+query I
+SELECT count(*) FROM ((SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_src EXCEPT ALL SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_upd) UNION ALL (SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_upd EXCEPT ALL SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_src));
+----
+0
+
+query T
+SELECT * FROM mssql_scan('svw', 'SELECT STRING_AGG(CONCAT(id, '':'', CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS nvarchar(20)), ''('', CAST(SQL_VARIANT_PROPERTY(v, ''Precision'') AS nvarchar(5)), '','', CAST(SQL_VARIANT_PROPERTY(v, ''Scale'') AS nvarchar(5)), '')''), '' '') WITHIN GROUP (ORDER BY id) FROM dbo.svw_upd');
+----
+1:bit(1,0) 2:bit(1,0) 3:tinyint(3,0) 4:smallint(5,0) 5:int(10,0) 6:bigint(19,0) 7:real(24,0) 8:float(53,0) 9:decimal(1,1) 10:decimal(9,2) 11:decimal(18,0) 12:decimal(19,9) 13:decimal(28,8) 14:decimal(38,0) 15:decimal(38,38) 16:decimal(10,3) 17:decimal(19,4) 18:decimal(10,4) 19:date(10,0) 20:date(10,0) 21:time(15,6) 22:time(15,6) 23:time(15,6) 24:time(16,7) 25:datetime2(19,0) 26:datetime2(23,3) 27:datetime2(26,6) 28:datetime2(27,7) 29:datetime2(26,6) 30:datetime2(26,6) 31:datetime2(26,6) 32:datetime2(26,6) 33:datetimeoffset(33,6) 34:datetimeoffset(33,6) 35:datetimeoffset(34,7) 36:datetimeoffset(33,6) 37:uniqueidentifier(0,0) 38:varbinary(0,0) 39:varbinary(0,0) 40:nvarchar(0,0) 41:nvarchar(0,0) 42:nvarchar(0,0) 43:nvarchar(0,0) 44:nvarchar(0,0) 45:nvarchar(0,0) 46:nvarchar(0,0) 47:nvarchar(0,0) 48:(,) 49:nvarchar(0,0) 50:varbinary(0,0)
+
+# --- a staged MERGE, the VARIANT in its #src
+statement ok
+SELECT mssql_exec('svw', 'UPDATE dbo.svw_upd SET v = NULL');
+
+statement ok
+MERGE INTO svw.dbo.svw_upd t USING (SELECT id, v FROM svw.dbo.svw_src) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v;
+
+statement ok
+RESET mssql_dml_pushdown;
+
+query I
+SELECT count(*) FROM ((SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_src EXCEPT ALL SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_upd) UNION ALL (SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_upd EXCEPT ALL SELECT id, variant_typeof(v), v::VARCHAR FROM svw.dbo.svw_src));
+----
+0
+
+query T
+SELECT * FROM mssql_scan('svw', 'SELECT STRING_AGG(CONCAT(id, '':'', CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS nvarchar(20)), ''('', CAST(SQL_VARIANT_PROPERTY(v, ''Precision'') AS nvarchar(5)), '','', CAST(SQL_VARIANT_PROPERTY(v, ''Scale'') AS nvarchar(5)), '')''), '' '') WITHIN GROUP (ORDER BY id) FROM dbo.svw_upd');
+----
+1:bit(1,0) 2:bit(1,0) 3:tinyint(3,0) 4:smallint(5,0) 5:int(10,0) 6:bigint(19,0) 7:real(24,0) 8:float(53,0) 9:decimal(1,1) 10:decimal(9,2) 11:decimal(18,0) 12:decimal(19,9) 13:decimal(28,8) 14:decimal(38,0) 15:decimal(38,38) 16:decimal(10,3) 17:decimal(19,4) 18:decimal(10,4) 19:date(10,0) 20:date(10,0) 21:time(15,6) 22:time(15,6) 23:time(15,6) 24:time(16,7) 25:datetime2(19,0) 26:datetime2(23,3) 27:datetime2(26,6) 28:datetime2(27,7) 29:datetime2(26,6) 30:datetime2(26,6) 31:datetime2(26,6) 32:datetime2(26,6) 33:datetimeoffset(33,6) 34:datetimeoffset(33,6) 35:datetimeoffset(34,7) 36:datetimeoffset(33,6) 37:uniqueidentifier(0,0) 38:varbinary(0,0) 39:varbinary(0,0) 40:nvarchar(0,0) 41:nvarchar(0,0) 42:nvarchar(0,0) 43:nvarchar(0,0) 44:nvarchar(0,0) 45:nvarchar(0,0) 46:nvarchar(0,0) 47:nvarchar(0,0) 48:(,) 49:nvarchar(0,0) 50:varbinary(0,0)
+
+# --- DuckDB's own values: the base type by the tag (D3's write table)
+statement ok
+SELECT mssql_exec('svw', 'DELETE FROM dbo.svw_stmt');
+
+statement ok
+INSERT INTO svw.dbo.svw_stmt VALUES (1, (-5)::TINYINT::VARIANT), (2, 65535::USMALLINT::VARIANT), (3, 4294967295::UINTEGER::VARIANT), (4, 18446744073709551615::UBIGINT::VARIANT), (5, TIMESTAMP_NS '2026-01-01 00:00:00.123456789'::VARIANT), (6, TIMESTAMPTZ '2026-01-01 10:00:00+05:30'::VARIANT), (7, 'x'::VARIANT), (8, NULL);
+
+query T
+SELECT * FROM mssql_scan('svw', 'SELECT STRING_AGG(CONCAT(id, '':'', CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS nvarchar(20)), ''='', CONVERT(nvarchar(60), v, 121)), '' '') WITHIN GROUP (ORDER BY id) FROM dbo.svw_stmt');
+----
+1:smallint=-5 2:int=65535 3:bigint=4294967295 4:decimal=18446744073709551615 5:datetime2=2026-01-01 00:00:00.1234568 6:datetimeoffset=2026-01-01 04:30:00.000000 +00:00 7:nvarchar=x 8:=
+
+# --- refused by name: the column and the tag
+statement error
+INSERT INTO svw.dbo.svw_stmt VALUES (20, [1, 2]::VARIANT);
+----
+ARRAY
+
+statement error
+INSERT INTO svw.dbo.svw_stmt VALUES (21, CAST('1 day' AS INTERVAL)::VARIANT);
+----
+INTERVAL
+
+statement error
+INSERT INTO svw.dbo.svw_stmt VALUES (22, 'NaN'::DOUBLE::VARIANT);
+----
+NaN
+
+statement error
+INSERT INTO svw.dbo.svw_stmt SELECT 23, repeat('é', 4001)::VARIANT;
+----
+4001 UTF-16 units
+
+statement ok
+SET mssql_insert_bcp_threshold = 1;
+
+statement error
+INSERT INTO svw.dbo.svw_stmt VALUES (24, 1::VARIANT), (25, [1, 2]::VARIANT);
+----
+ARRAY
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+# --- pushed whole (the default): the server copies each value as it is, its base type, precision,
+# scale, length and collation unchanged -- no VARIANT is written
+statement ok
+RESET mssql_dml_pushdown;
+
+statement ok
+SELECT mssql_exec('svw', 'DROP TABLE IF EXISTS dbo.svw_push; CREATE TABLE dbo.svw_push (id int NOT NULL PRIMARY KEY, v sql_variant NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('svw');
+
+statement ok
+INSERT INTO svw.dbo.svw_push SELECT id, v FROM svw.dbo.svw_src;
+
+query II
+SELECT * FROM mssql_scan('svw', 'SELECT (SELECT COUNT(*) FROM dbo.svw_push), COUNT(*) FROM (SELECT id, CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS sysname) AS b, CAST(SQL_VARIANT_PROPERTY(v, ''Precision'') AS int) AS p, CAST(SQL_VARIANT_PROPERTY(v, ''Scale'') AS int) AS s, CAST(SQL_VARIANT_PROPERTY(v, ''MaxLength'') AS int) AS m, CAST(SQL_VARIANT_PROPERTY(v, ''Collation'') AS sysname) AS c FROM dbo.svw_src EXCEPT SELECT id, CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS sysname), CAST(SQL_VARIANT_PROPERTY(v, ''Precision'') AS int), CAST(SQL_VARIANT_PROPERTY(v, ''Scale'') AS int), CAST(SQL_VARIANT_PROPERTY(v, ''MaxLength'') AS int), CAST(SQL_VARIANT_PROPERTY(v, ''Collation'') AS sysname) FROM dbo.svw_push) x');
+----
+50	0
+
+# --- real / float at their edges, on each path: FLT_MAX as real, 0.1, DBL_MAX, the least subnormal,
+# -0.0. The bulk envelope carries the value's bits; the statement path's literal is the double in 17
+# significant digits, which the server parses (CAST(v AS float) widens a real exactly, so one bit
+# pattern -- big-endian -- shows each stored value).
+statement ok
+SELECT mssql_exec('svw', 'DROP TABLE IF EXISTS dbo.svw_flt_stmt; DROP TABLE IF EXISTS dbo.svw_flt_bulk; DROP TABLE IF EXISTS dbo.svw_flt_copy; DROP TABLE IF EXISTS dbo.svw_flt_ctas; DROP TABLE IF EXISTS dbo.svw_flt_plain_stmt; DROP TABLE IF EXISTS dbo.svw_flt_plain_bulk; CREATE TABLE dbo.svw_flt_stmt (id int NOT NULL PRIMARY KEY, v sql_variant NULL); CREATE TABLE dbo.svw_flt_bulk (id int NOT NULL PRIMARY KEY, v sql_variant NULL); CREATE TABLE dbo.svw_flt_copy (id int NOT NULL PRIMARY KEY, v sql_variant NULL); CREATE TABLE dbo.svw_flt_plain_stmt (id int NOT NULL PRIMARY KEY, f float NULL); CREATE TABLE dbo.svw_flt_plain_bulk (id int NOT NULL PRIMARY KEY, f float NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('svw');
+
+statement ok
+CREATE TEMP TABLE svw_flt AS SELECT * FROM (VALUES (1, '3.4028235e38'::FLOAT::VARIANT), (2, '0.1'::DOUBLE::VARIANT), (3, '1.7976931348623157e308'::DOUBLE::VARIANT), (4, '4.9406564584124654e-324'::DOUBLE::VARIANT), (5, '-0.0'::DOUBLE::VARIANT)) t(id, v);
+
+statement ok
+SET mssql_insert_bcp_threshold = 100000;
+
+statement ok
+INSERT INTO svw.dbo.svw_flt_stmt SELECT id, v FROM svw_flt;
+
+statement ok
+SET mssql_insert_bcp_threshold = 1;
+
+statement ok
+INSERT INTO svw.dbo.svw_flt_bulk SELECT id, v FROM svw_flt;
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+statement ok
+COPY (SELECT id, v FROM svw_flt) TO 'mssql://svw/dbo/svw_flt_copy' (FORMAT 'bcp', CREATE_TABLE false);
+
+statement ok
+CREATE TABLE svw.dbo.svw_flt_ctas AS SELECT id, v FROM svw_flt;
+
+# The statement path stores the least subnormal as 0 (measured on the integration server): the server's parse of
+# the literal 4.9406564584124654E-324 flushes it to zero, while the bulk paths below keep its bits. No
+# workaround (T-SQL converts no varbinary to float); native RPC parameters (#515) are what remove it.
+query T
+SELECT * FROM mssql_scan('svw', 'SELECT STRING_AGG(CONCAT(id, '':'', CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS sysname), ''='', CONVERT(varchar(20), CONVERT(varbinary(8), CAST(v AS float)), 2)), '' '') WITHIN GROUP (ORDER BY id) FROM dbo.svw_flt_stmt');
+----
+1:real=47EFFFFFE0000000 2:float=3FB999999999999A 3:float=7FEFFFFFFFFFFFFF 4:float=0000000000000000 5:float=8000000000000000
+
+query T
+SELECT * FROM mssql_scan('svw', 'SELECT STRING_AGG(CONCAT(id, '':'', CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS sysname), ''='', CONVERT(varchar(20), CONVERT(varbinary(8), CAST(v AS float)), 2)), '' '') WITHIN GROUP (ORDER BY id) FROM dbo.svw_flt_bulk');
+----
+1:real=47EFFFFFE0000000 2:float=3FB999999999999A 3:float=7FEFFFFFFFFFFFFF 4:float=0000000000000001 5:float=8000000000000000
+
+query T
+SELECT * FROM mssql_scan('svw', 'SELECT STRING_AGG(CONCAT(id, '':'', CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS sysname), ''='', CONVERT(varchar(20), CONVERT(varbinary(8), CAST(v AS float)), 2)), '' '') WITHIN GROUP (ORDER BY id) FROM dbo.svw_flt_copy');
+----
+1:real=47EFFFFFE0000000 2:float=3FB999999999999A 3:float=7FEFFFFFFFFFFFFF 4:float=0000000000000001 5:float=8000000000000000
+
+query T
+SELECT * FROM mssql_scan('svw', 'SELECT STRING_AGG(CONCAT(id, '':'', CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS sysname), ''='', CONVERT(varchar(20), CONVERT(varbinary(8), CAST(v AS float)), 2)), '' '') WITHIN GROUP (ORDER BY id) FROM dbo.svw_flt_ctas');
+----
+1:real=47EFFFFFE0000000 2:float=3FB999999999999A 3:float=7FEFFFFFFFFFFFFF 4:float=0000000000000001 5:float=8000000000000000
+
+# A plain float column, not a sql_variant: its statement path's literal (FormatSqlLiteral, 17 digits:
+# 4.9406564584124654e-324) meets the same parse, so the same subnormal is stored as 0 there too -- the
+# behaviour of every float literal, not new with VARIANT --, and its bulk path keeps the bits. It also
+# stores -0.0 as +0 (measured), the float codec's own behaviour before T2: RenderFloatLiteral writes
+# -0.0 as `-0.0` (no exponent), which T-SQL types as a decimal literal, and a decimal has no negative
+# zero. The VARIANT literal (`-0.0000000000000000E+00`, a float literal) keeps the sign (above).
+statement ok
+SET mssql_insert_bcp_threshold = 100000;
+
+statement ok
+INSERT INTO svw.dbo.svw_flt_plain_stmt VALUES (4, '4.9406564584124654e-324'::DOUBLE), (5, '-0.0'::DOUBLE);
+
+statement ok
+SET mssql_insert_bcp_threshold = 1;
+
+statement ok
+INSERT INTO svw.dbo.svw_flt_plain_bulk VALUES (4, '4.9406564584124654e-324'::DOUBLE), (5, '-0.0'::DOUBLE);
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+query T
+SELECT * FROM mssql_scan('svw', 'SELECT STRING_AGG(CONCAT(t, id, ''='', CONVERT(varchar(20), CONVERT(varbinary(8), f), 2)), '' '') WITHIN GROUP (ORDER BY t, id) FROM (SELECT ''a_stmt'' AS t, id, f FROM dbo.svw_flt_plain_stmt UNION ALL SELECT ''b_bulk'', id, f FROM dbo.svw_flt_plain_bulk) x');
+----
+a_stmt4=0000000000000000 a_stmt5=0000000000000000 b_bulk4=0000000000000001 b_bulk5=8000000000000000
+
+# Read back through DuckDB: the same values (-0.0 keeps its sign).
+query IT
+SELECT id, v::VARCHAR FROM svw.dbo.svw_flt_bulk ORDER BY id;
+----
+1	3.4028235e+38
+2	0.1
+3	1.7976931348623157e+308
+4	5e-324
+5	-0.0
+
+statement ok
+SELECT mssql_exec('svw', 'DROP TABLE IF EXISTS dbo.svw_src; DROP TABLE IF EXISTS dbo.svw_stmt; DROP TABLE IF EXISTS dbo.svw_bulk; DROP TABLE IF EXISTS dbo.svw_ctas; DROP TABLE IF EXISTS dbo.svw_copy; DROP TABLE IF EXISTS dbo.svw_upd; DROP TABLE IF EXISTS dbo.svw_push; DROP TABLE IF EXISTS dbo.svw_flt_stmt; DROP TABLE IF EXISTS dbo.svw_flt_bulk; DROP TABLE IF EXISTS dbo.svw_flt_copy; DROP TABLE IF EXISTS dbo.svw_flt_ctas; DROP TABLE IF EXISTS dbo.svw_flt_plain_stmt; DROP TABLE IF EXISTS dbo.svw_flt_plain_bulk');

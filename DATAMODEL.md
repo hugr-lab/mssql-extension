@@ -772,6 +772,24 @@ float16 a narrowing loop, a NULL element refused naming the row. A chunk holding
 columnar; `sql_vector::EncodeToBcp` is the row path's and `EncodeValueToBcp` the per-value one's. The
 statement path sends a `N'[...]'` literal.
 
+**A `VARIANT` is written into a `sql_variant` (spec 093 T2).** `codec/variant/variant_write` gives each
+value one write form by its VARIANT tag -- D3's write table, the narrowest base type for every value of
+the tag -- and two writers read it: the statement path's literal (`MSSQLValueSerializer`:
+`CAST(CAST(<literal> AS <base type>) AS sql_variant)`) and the bulk wire's SSVARIANT envelope
+(`BCPRowEncoder`: a VARIANT column is read through DuckDB's variant layout once a chunk and encoded
+row by row, the chunk taking the row loop -- an envelope has no scatter arm --; `BCPColumnMetadata`
+declares it `0x62`, LONGLEN 8009, `sql_variant`, NULL a length of 0). A string base value carries the
+database's default collation on both: the literal by T-SQL's rule, the envelope through
+`code_page::WireCollationForName` of the name a writer is given -- `MSSQLColumnInfo::BulkCollationName`
+(INSERT BULK, `#stage`, a staged MERGE's like-target `#src` columns), the COPY probe's
+`DATABASEPROPERTYEX(DB_NAME(), 'Collation')` for an existing column, and `GenerateColumnMetadata`'s
+`database_collation` (CTAS, a COPY that creates the table -- which reads the database's collation on its
+own connection when the catalog has none, `catalog false` or a failed ATTACH query --, and a staged
+MERGE's CTAS-typed `#src` columns), all through `codec::variant::StringCollationBytes`. A name the build's table lacks is written
+as `Latin1_General_100_BIN2_UTF8` (`mssql_utf8_collation`'s default; every target with `sql_variant`
+has UTF-8 collations), and such a value then compares and sorts by BIN2_UTF8, not by the database's
+collation -- the statement path's literal keeps the database's.
+
 ### Reading a column's collation
 
 `ColumnMetadata` carries all five wire bytes of the TDS collation
@@ -1662,7 +1680,21 @@ flowchart LR
   holds it (an integer from its sign-flipped big-endian bytes, a decimal from vardecimal, a float
   padded back, a datetime from its one integer, char / binary / nchar padded, SCSU decoded to
   UTF-16), so the stager's arms, the family kernels and `_mssql_rid`'s key bytes are the uncompressed
-  path's: a `RowRecord` is either form. PAGE compression (the page dictionary) is PR 2's, refused by name.
+  path's: a `RowRecord` is either form.
+- **PAGE compression** (spec 086 PR 2; E23's measurements): a page whose header flags carry `0x80`
+  holds a compression-information record at offset 96 (`ReadPageCompression`: flags, the anchor record --
+  a CD record of each column's prefix, not padded --, the dictionary's entries in their CD form). Its
+  records are CD records whose values `CdRow::Read` rebuilds with it before the ROW decoding: a symbol
+  (code 12, one byte) is its entry, an anchored column's value its prefix of the anchor's (one byte, or two
+  with `0x80`) and its suffix, EMPTY there the anchor's value. A page without the flag is a ROW page of
+  the rowset. The scan reads a page's record once per page; `table_changes` compares a PAGE row by its
+  values in the uncompressed form (`PageRow::bytes`, by column id in the newer state's columns, as
+  `masked`), so a row moved, a page rebuilt with another anchor and dictionary, or a column added between
+  the states is no change -- every row of a table one of whose states holds a PAGE rowset
+  (`ValueForm`), and passes over a page's unchanged records only when both
+  versions' compression information is the same (`SameCompressionInfo`). A ghost forwarded record (type 5,
+  a forwarded row deleted under row versioning) is a ghost, under ROW too. Fuzzed by
+  `fuzz_backup_page_ci`; compared with RESTORE on `page.sql`'s fixture.
 - **Prepared statements** keep the row their bind read (`SupportStatementCache`); `reread := true`
   binds again on every `EXECUTE`.
 - **The opened-file cache** (D9, PR 4a): what an open read -- headers, page index, allocation map,

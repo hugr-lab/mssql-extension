@@ -152,6 +152,40 @@ struct OffRowCheck {
 	bool sha256 = false;	   // mssql_backup_change_hash
 };
 
+//! How rows are compared by their values rather than their record bytes (spec 086 PR 2): every row of the
+//! table when a rowset of either state is PAGE-compressed (`by_value`: a PAGE record's bytes are its page's,
+//! and a rowset rebuilt between ROW / none and PAGE holds the same rows in other bytes), in the newer
+//! state's columns as OffRowCheck's lists say (none: every column of the row's own layout).
+struct ValueForm {
+	bool by_value = false;
+	const std::vector<int32_t> *newer_columns = nullptr;
+	const std::vector<int32_t> *older_columns = nullptr;
+	bool Compared(int32_t id) const {
+		return !newer_columns || std::binary_search(newer_columns->begin(), newer_columns->end(), id);
+	}
+	bool OlderHas(int32_t id) const {
+		return !older_columns || std::binary_search(older_columns->begin(), older_columns->end(), id);
+	}
+};
+
+//! Whether `v` (not NULL) of `c` reads as a record that holds no value of `c`: its default (a column added
+//! with a default reads it from every older record; a rebuild then stores it in them).
+bool IsColumnDefault(const PhysicalColumn &c, const ValueRef &v) {
+	if (v.state == ValueState::Default) {
+		return true;
+	}
+	if (!c.has_default || v.state == ValueState::OffRow) {
+		return false;
+	}
+	const uint8_t *d = reinterpret_cast<const uint8_t *>(c.default_bytes.data());
+	const uint32_t n = static_cast<uint32_t>(c.default_bytes.size());
+	if (c.xtype == XTYPE_BIT) {
+		return v.size >= 1 && n >= 1 && (((v.data[0] >> c.bit_position) & 1) != 0) == (d[0] != 0);
+	}
+	const uint32_t size = c.Unpadded(d, n);
+	return v.size == size && std::memcmp(v.data, d, size) == 0;
+}
+
 //! Each off-row value of `row`, by layout index.
 void ForEachOffRow(const RowsetLayout &layout, const RowRecord &row,
 				   const std::function<void(size_t, const OffRowPointer &)> &fn) {
@@ -233,7 +267,8 @@ void CheckOffRow(const RowsetLayout &layout, const RowRecord &row, const OffRowC
 //! The live rows of `page` (a data page of `cursor`'s unit, read) as the scan finds them: ghosts and
 //! stubs skipped, a forwarded record at its place before it moved.
 void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const Page &page, std::vector<PageRow> &out,
-				  const OffRowCheck *check = nullptr, int32_t only_slot = -1, const std::vector<bool> *skip = nullptr) {
+				  const OffRowCheck *check = nullptr, int32_t only_slot = -1, const std::vector<bool> *skip = nullptr,
+				  const ValueForm *form = nullptr) {
 	out.clear();
 	const RowsetLayout &layout = data.entry->Layout(*cursor.partition);
 	const uint16_t slots = page.header.slot_count;
@@ -241,8 +276,11 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 		throw FormatError("backup: page " + page.header.page_id.ToString() + " has " + std::to_string(slots) +
 						  " slots, more than an 8 KB page holds");
 	}
-	// A compressed row's values read: its key's, and every column's when its off-row values are checked.
-	std::vector<bool> needed(layout.columns.size(), check != nullptr);
+	// A compressed row's values read: its key's, and every column's when its off-row values are checked or
+	// its rows are compared by their values (below).
+	const bool page_compressed = layout.compression == 2;
+	const bool by_value = page_compressed || (form && form->by_value);
+	std::vector<bool> needed(layout.columns.size(), check != nullptr || by_value);
 	for (size_t k : cursor.key) {
 		needed[k] = true;
 	}
@@ -265,6 +303,10 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 	}
 	CdRecord cd;
 	CdRow cd_row;
+	PageCompression page_ci;  // a PAGE page's compression information (spec 086 PR 2)
+	if (page_compressed && (page.header.type_flags & 0x80)) {
+		ReadPageCompression(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * slots, data.table.c_str(), page_ci);
+	}
 	for (uint16_t slot = 0; slot < slots; slot++) {
 		if ((only_slot >= 0 && slot != only_slot) || (skip && slot < skip->size() && (*skip)[slot])) {
 			continue;
@@ -280,7 +322,12 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 		RowRecord row;
 		uint32_t record_end = 0;
 		RecordView fixed;
-		if (layout.compression == 1) {
+		if (layout.compression == 1 || page_compressed) {
+			if (page_ci.present && offset < page_ci.end) {
+				throw FormatError("backup: page " + page.header.page_id.ToString() + " has a record at offset " +
+								  std::to_string(offset) + " inside its compression information (to " +
+								  std::to_string(page_ci.end) + ")");
+			}
 			ReadCdRecord(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * slots, offset, data.table.c_str(), cd);
 			if (cd.kind == CdRecord::Kind::Ghost || cd.kind == CdRecord::Kind::Stub) {
 				continue;
@@ -288,7 +335,7 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 			if (cd.kind == CdRecord::Kind::Forwarded) {
 				cd.BackPointer(at.page.page, at.page.file, at.slot);
 			}
-			cd_row.Read(cd, layout, &needed);
+			cd_row.Read(cd, layout, &needed, page_compressed ? &page_ci : nullptr);
 			row = RowRecord::Compressed(cd, cd_row);
 			record_end = cd.end;
 		} else {
@@ -312,13 +359,13 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 		r.rid = RowId(data, cursor, row, at);
 		// Compared without a version tag (row versioning adds and rewrites it, the values the same): its
 		// 14 bytes at the end and the header bit that says it is there.
-		const bool tagged = layout.compression == 1 ? (cd.header & CD_VERSION_TAG) != 0 : fixed.HasVersionTag();
+		const bool tagged = layout.compression != 0 ? (cd.header & CD_VERSION_TAG) != 0 : fixed.HasVersionTag();
 		const uint32_t compared_end =
 			tagged && record_end >= VERSION_TAG_BYTES ? record_end - VERSION_TAG_BYTES : record_end;
 		r.bytes.assign(reinterpret_cast<const char *>(page.bytes.data()) + offset, compared_end);
 		if (tagged && !r.bytes.empty()) {
 			r.bytes[0] = static_cast<char>(static_cast<uint8_t>(r.bytes[0]) &
-										   ~(layout.compression == 1 ? CD_VERSION_TAG : STATUS_VERSION_TAG));
+										   ~(layout.compression != 0 ? CD_VERSION_TAG : STATUS_VERSION_TAG));
 		}
 		if (check) {
 			CheckOffRow(layout, row, *check, r);
@@ -348,7 +395,7 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 				}
 				const ValueRef v = row.Locate(layout, k);
 				if (!check->Compared(c.rscolid) || v.state == ValueState::Null ||
-					(v.state == ValueState::Default && !check->OlderHas(c.rscolid))) {
+					(!check->OlderHas(c.rscolid) && IsColumnDefault(c, v))) {
 					continue;
 				}
 				const uint32_t id = static_cast<uint32_t>(c.rscolid);
@@ -374,8 +421,72 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 				r.masked.append(reinterpret_cast<const char *>(v.data), v.size);
 			}
 		}
+		if (by_value) {
+			// A PAGE record's bytes are its page's: a symbol of its dictionary, a prefix of its anchor -- the
+			// same row on another page (a split, a rebuild) or under another anchor is other bytes, and so is
+			// the same row before a rebuild into PAGE. Compared, and digested when it is unpaired, by its
+			// values in the uncompressed form instead, as `masked` is built (review of spec 086 PR 2: by the
+			// layout's positions, a column added between the states or a default stored by a rebuild made
+			// every row of a page an update): per column of the newer state that holds a value (dropped ones
+			// and the uniquifier, which the _mssql_rid holds, left out; NULL none, and a default of a column
+			// the older state did not have none) its column id and its bytes, a default and a stored value
+			// alike; an off-row value by its pointer (a pointer rewritten by a shrink decides by `masked` and
+			// the digests, as for any record).
+			ValueForm columns;
+			if (form) {
+				columns = *form;
+			} else if (check) {
+				columns.newer_columns = check->newer_columns;
+				columns.older_columns = check->older_columns;
+			}
+			r.bytes.assign(1, '\3');
+			for (size_t k = 0; k < layout.columns.size(); k++) {
+				const PhysicalColumn &c = layout.columns[k];
+				if (c.Dropped() || c.Uniquifier()) {
+					continue;
+				}
+				const ValueRef v = row.Locate(layout, k);
+				if (!columns.Compared(c.rscolid) || v.state == ValueState::Null ||
+					(!columns.OlderHas(c.rscolid) && IsColumnDefault(c, v))) {
+					continue;
+				}
+				const uint32_t id = static_cast<uint32_t>(c.rscolid);
+				r.bytes.append(reinterpret_cast<const char *>(&id), sizeof(id));
+				r.bytes.push_back(v.state == ValueState::OffRow ? '\2' : '\1');
+				if (c.xtype == XTYPE_BIT && v.size >= 1 && v.state != ValueState::OffRow) {
+					const bool set =
+						v.state == ValueState::Default ? v.data[0] != 0 : ((v.data[0] >> c.bit_position) & 1) != 0;
+					r.bytes.push_back(set ? '\1' : '\0');
+					continue;
+				}
+				const uint32_t size = v.size;
+				r.bytes.append(reinterpret_cast<const char *>(&size), sizeof(size));
+				r.bytes.append(reinterpret_cast<const char *>(v.data), v.size);
+			}
+		}
 		out.push_back(std::move(r));
 	}
+}
+
+//! Whether two versions of a page hold the same PAGE compression information (spec 086 PR 2): neither holds
+//! one, or both the same bytes. A record the two share unchanged is then the same row.
+bool SameCompressionInfo(const Page &a, const Page &b) {
+	const bool in_a = (a.header.type_flags & 0x80) != 0, in_b = (b.header.type_flags & 0x80) != 0;
+	if (!in_a && !in_b) {
+		return true;
+	}
+	if (in_a != in_b) {
+		return false;
+	}
+	// The record's size: u16 at 3, or at 5 when it holds a dictionary (E23); a wrong one fails the compare.
+	auto size_of = [](const Page &p) -> size_t {
+		const uint8_t *ci = p.bytes.data() + PAGE_HEADER_SIZE;
+		return (ci[0] & 0x04) ? static_cast<size_t>(ci[5] | (ci[6] << 8)) : static_cast<size_t>(ci[3] | (ci[4] << 8));
+	};
+	const size_t size = size_of(a);
+	return size == size_of(b) && PAGE_HEADER_SIZE + size <= PAGE_SIZE &&
+		   std::equal(a.bytes.begin() + PAGE_HEADER_SIZE, a.bytes.begin() + PAGE_HEADER_SIZE + size,
+					  b.bytes.begin() + PAGE_HEADER_SIZE);
 }
 
 //! A page of a state's table and its partition index; a state's are sorted by page.
@@ -886,6 +997,13 @@ public:
 		}
 		std::sort(newer_columns_.begin(), newer_columns_.end());
 		std::sort(older_columns_.begin(), older_columns_.end());
+		form_.newer_columns = &newer_columns_;
+		form_.older_columns = &older_columns_;
+		for (const ChangeSide *side : {&now, before}) {
+			for (const auto &cursor : side->cursors) {
+				form_.by_value = form_.by_value || side->data.entry->Layout(*cursor.partition).compression == 2;
+			}
+		}
 		checkpoint_ = data.states.old_checkpoint;
 		old_owners_ = OwnersOf(*before);
 		const PageOwners new_owners = OwnersOf(now);
@@ -1119,7 +1237,7 @@ private:
 		static thread_local Page one_page;	// kept by the thread: no page allocated a value
 		std::vector<PageRow> one;
 		if (ReadUnitDataPage(store, *side.cursors[partition].unit, p, name_, one_page)) {
-			ReadPageRows(side.data, side.cursors[partition], one_page, one, &check, slot);
+			ReadPageRows(side.data, side.cursors[partition], one_page, one, &check, slot, nullptr, &form_);
 		}
 		return one.empty() ? std::vector<ValueDigest>() : one.front().hashes;
 	}
@@ -1180,7 +1298,7 @@ private:
 		if (!ReadUnitDataPage(new_store_, *now_.cursors[w.partition].unit, w.page, name_, task.page)) {
 			return;
 		}
-		ReadPageRows(now_.data, now_.cursors[w.partition], task.page, task.rows);
+		ReadPageRows(now_.data, now_.cursors[w.partition], task.page, task.rows, nullptr, -1, nullptr, &form_);
 		for (const auto &r : task.rows) {
 			AddChange(task.items, false, w.partition, w.page, r, ChangeKind::Insert);
 		}
@@ -1193,7 +1311,7 @@ private:
 		}
 		const OffRowCheck mask_only = MaskOnly(w.partition);
 		ReadPageRows(before_->data, before_->cursors[w.partition], task.page, task.old_rows,
-					 off_row_table_ ? &mask_only : nullptr);
+					 off_row_table_ ? &mask_only : nullptr, -1, nullptr, &form_);
 		for (const auto &r : task.old_rows) {
 			KeepLone(task, true, w.partition, w.page, r);
 		}
@@ -1212,7 +1330,7 @@ private:
 		}
 		OffRowCheck check = NewCheck(w.partition);
 		check.node_pages = &task.node_pages;
-		ReadPageRows(now_.data, now_.cursors[w.partition], task.page, task.rows, &check);
+		ReadPageRows(now_.data, now_.cursors[w.partition], task.page, task.rows, &check, -1, nullptr, &form_);
 		for (const auto &r : task.rows) {
 			if (!r.touches || HashesOf(true, owner->partition, w.page, r.slot) == r.hashes) {
 				continue;
@@ -1249,7 +1367,9 @@ private:
 		}
 		// The records both versions hold unchanged are skipped (no _mssql_rid built for them) -- unless a
 		// value stored off row may have changed under one (its record the same, its LOB pages not).
-		const bool skip_same = live && old_live && !lob_changed_;
+		// On a PAGE page a record's bytes mean what its page's compression information says: unchanged bytes
+		// are an unchanged row only beside an unchanged record of it (spec 086 PR 2).
+		const bool skip_same = live && old_live && !lob_changed_ && SameCompressionInfo(task.old_page, task.page);
 		if (skip_same) {
 			SameRecords(task.old_page.bytes.data(), task.old_page.header.slot_count, task.page.bytes.data(),
 						task.page.header.slot_count, PAGE_SIZE, now_.data.entry->shape == TableShape::Heap,
@@ -1259,12 +1379,12 @@ private:
 		check.node_pages = &task.node_pages;
 		if (live) {
 			ReadPageRows(now_.data, now_.cursors[i], task.page, task.rows, off_row_table_ ? &check : nullptr, -1,
-						 skip_same ? &task.new_same : nullptr);
+						 skip_same ? &task.new_same : nullptr, &form_);
 		}
 		if (old_live) {
 			const OffRowCheck mask_only = MaskOnly(old_partition);
 			ReadPageRows(before_->data, before_->cursors[old_partition], task.old_page, task.old_rows,
-						 off_row_table_ ? &mask_only : nullptr, -1, skip_same ? &task.old_same : nullptr);
+						 off_row_table_ ? &mask_only : nullptr, -1, skip_same ? &task.old_same : nullptr, &form_);
 		}
 		std::map<std::string, const PageRow *> old_by_rid;
 		for (const auto &r : task.old_rows) {
@@ -1303,6 +1423,7 @@ private:
 	const PageStore &new_store_;
 	const PageStore *old_store_ = nullptr;
 	std::vector<int32_t> newer_columns_, older_columns_;  // the two tables' column ids, sorted (OffRowCheck)
+	ValueForm form_;									  // how rows are compared by value (ReadPageRows)
 	std::string name_;
 	bool sha256_;
 	Lsn checkpoint_;
