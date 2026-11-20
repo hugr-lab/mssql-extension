@@ -754,6 +754,24 @@ spec 093 D3's table -- a string through spec 091's code-page kernels by its own 
 in the vector. The column stays out of pushed comparisons and keys (`comparison_differs`): the server
 compares a `sql_variant` by its base type (#514).
 
+**A `vector(n)` is a `FLOAT[n]` (spec 093 T3).** `codec/sql_vector`: `vector_bytes` (DuckDB-free, the
+fuzz harness's) checks a value's header against its column and widens or encodes the elements (float16
+both ways, rounded to nearest even), and parses the JSON text locale-free; `vector_codec` writes them
+into an `ARRAY(FLOAT, n)` child or reads them out of one. COLMETADATA keeps the UserType (255 marks a
+vector in both wire forms) and VECTORTYPE's element type; a vector column takes the Vector kernel from
+`ResolveAppend` before the divergence test, staged on the bounded-binary arm (0xF5) or the PLP one (the
+text). VECTORSUPPORT is asked for per catalog (`mssql_vector_support` at ATTACH, through
+`MSSQLConnectionInfo::vector_support` and `TdsConnection::SetRequestVectorSupport`; `Login7Features` is
+what the four LOGIN7 builders take), and the granted version is kept per connection, read by the
+stream's fallback `WARNING`. The bulk wire sends the bytes as varbinary under a declared `vector(n)`
+(`BCPColumnMetadata::vector_dims`) on the columnar scatter: `ScatterArm::Vector`, one width per non-NULL
+row (a u16 length, the header, the elements), so the strided path when the chunk has no NULL and the
+cursor when it has, one `sql_vector::ScatterChunkStrided` / `ScatterChunkCursor` call per column per
+block -- float32 the header and a memcpy of the row's elements after a branchless finiteness check,
+float16 a narrowing loop, a NULL element refused naming the row. A chunk holding a vector column stays
+columnar; `sql_vector::EncodeToBcp` is the row path's and `EncodeValueToBcp` the per-value one's. The
+statement path sends a `N'[...]'` literal.
+
 **A `VARIANT` is written into a `sql_variant` (spec 093 T2).** `codec/variant/variant_write` gives each
 value one write form by its VARIANT tag -- D3's write table, the narrowest base type for every value of
 the tag -- and two writers read it: the statement path's literal (`MSSQLValueSerializer`:

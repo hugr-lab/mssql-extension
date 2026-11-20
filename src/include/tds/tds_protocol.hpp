@@ -57,6 +57,23 @@ struct LoginResponse {
 	bool has_feature_ext_ack = false;
 	bool fedauth_acked = false;		  // FeatureId 0x02
 	bool utf8_support_acked = false;  // FeatureId 0x0A -- UTF-8 collations arrive as UTF-8
+	//! FeatureId 0x0E VECTORSUPPORT: the version the server granted, 0 when it did not answer (spec 093
+	//! D4; SQL Server 2025 answers 1, measured V1).
+	uint8_t vector_support_version = 0;
+};
+
+//! The LOGIN7 feature extensions a login asks for besides FEDAUTH. Built from a bool, which is what every
+//! builder's `request_utf8_support` used to be, so a caller that names only that keeps compiling.
+struct Login7Features {
+	Login7Features(bool utf8_support_p = true, uint8_t vector_version_p = 0)  // NOLINT: implicit by design
+		: utf8_support(utf8_support_p), vector_version(vector_version_p) {}
+	//! UTF8SUPPORT (0x0A, issue #225).
+	bool utf8_support;
+	//! VECTORSUPPORT (0x0E, spec 093 D4): the version to request, 0 for none.
+	uint8_t vector_version;
+	bool Any() const {
+		return utf8_support || vector_version > 0;
+	}
 };
 
 // TDS Protocol message builders and parsers
@@ -100,7 +117,8 @@ public:
 	// unaffected.
 	static TdsPacket BuildLogin7(const std::string &host, const std::string &username, const std::string &password,
 								 const std::string &database, const std::string &app_name = "DuckDB MSSQL Extension",
-								 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE, bool request_utf8_support = true,
+								 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE,
+								 Login7Features request_utf8_support = Login7Features(),
 								 const std::string &server_name = "");
 
 	// Parse LOGIN7 response (LOGINACK token and potential errors)
@@ -123,7 +141,7 @@ public:
 											bool fedauth_echo = false,
 											const std::string &app_name = "DuckDB MSSQL Extension",
 											uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE,
-											bool request_utf8_support = true);
+											Login7Features request_utf8_support = Login7Features());
 
 	// Build LOGIN7 packet for Integrated Authentication (Kerberos / SSPI) -- Spec 042
 	//
@@ -144,7 +162,7 @@ public:
 										 const std::string &database, const std::vector<uint8_t> &sspi_initial_blob,
 										 const std::string &app_name = "DuckDB MSSQL Extension",
 										 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE,
-										 bool request_utf8_support = true);
+										 Login7Features request_utf8_support = Login7Features());
 
 	// Build SSPI Message continuation packet -- Spec 042
 	//
@@ -171,7 +189,7 @@ public:
 										 const std::string &database, bool fedauth_echo = false,
 										 const std::string &app_name = "DuckDB MSSQL Extension",
 										 uint32_t packet_size = TDS_DEFAULT_PACKET_SIZE,
-										 bool request_utf8_support = true);
+										 Login7Features request_utf8_support = Login7Features());
 
 	// Build FEDAUTH_TOKEN packet to send access token after receiving FEDAUTHINFO
 	// Used in ADAL workflow: server sends FEDAUTHINFO with STS URL, client fetches token,

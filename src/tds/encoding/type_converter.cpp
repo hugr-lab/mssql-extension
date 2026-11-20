@@ -11,6 +11,7 @@
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/money_codec.hpp"
+#include "codec/sql_vector/vector_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "codec/uuid_codec.hpp"
 #include "codec/variant/variant_codec.hpp"
@@ -155,6 +156,12 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata &column) {
 	case TDS_TYPE_SQL_VARIANT:
 		return LogicalType::VARIANT();
 
+	// vector(n) as VECTORTYPE (spec 093 T3, D4): FLOAT[n], n from the TYPE_INFO. Its JSON form is a
+	// varchar(max) and reads VARCHAR here, the server's text: no n is on the wire (D4); a catalog,
+	// which knows n, reads it into FLOAT[n] (ResolveColumnOps).
+	case TDS_TYPE_VECTOR:
+		return mssql::codec::sql_vector::FloatArrayType(column.VectorDimensions());
+
 	default:
 		throw InvalidInputException("MSSQL Error: Unknown SQL Server type (0x%02X) for column '%s'.", column.type_id,
 									column.name.c_str());
@@ -197,6 +204,7 @@ bool TypeConverter::IsSupported(uint8_t type_id) {
 	case TDS_TYPE_NTEXT:
 	case TDS_TYPE_IMAGE:
 	case TDS_TYPE_SQL_VARIANT:
+	case TDS_TYPE_VECTOR:
 		return true;
 	default:
 		return false;
@@ -269,6 +277,8 @@ std::string TypeConverter::GetTypeName(uint8_t type_id) {
 		return "UDT";
 	case TDS_TYPE_SQL_VARIANT:
 		return "SQL_VARIANT";
+	case TDS_TYPE_VECTOR:
+		return "VECTOR";
 	case TDS_TYPE_IMAGE:
 		return "IMAGE";
 	case TDS_TYPE_TEXT:
@@ -285,6 +295,12 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 								 mssql::codec::variant::VariantColumnNotes *variant_notes) {
 	if (is_null) {
 		FlatVector::SetNull(vector, row_idx, true);
+		return;
+	}
+	// Spec 093 T3: a vector column into FLOAT[n], from VECTORTYPE or its JSON text (whose wire type is a
+	// string's, so before the switch).
+	if (vector.GetType().id() == LogicalTypeId::ARRAY && (column.IsVectorWire() || column.IsVectorText())) {
+		mssql::codec::sql_vector::DecodeFromTds(value, column, vector, row_idx);
 		return;
 	}
 

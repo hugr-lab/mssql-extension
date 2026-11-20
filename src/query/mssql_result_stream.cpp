@@ -476,6 +476,10 @@ exit_loop:
 			if (stager_.ChunkOutOfRange(c) > 0) {
 				NoteOutOfRange(c);
 			}
+			if (stager_.KernelOf(c) == mssql::codec::staging::FinalizeKernel::Vector &&
+				column_metadata_[c].IsVectorText()) {
+				NoteVectorText(c);
+			}
 			// Spec 093 T1: a sql_variant value read as its bytes is said as soon as the scan meets
 			// one, like D8's out-of-range values, so a query that stops early still says it.
 			if (column_metadata_[c].type_id == tds::TDS_TYPE_SQL_VARIANT &&
@@ -572,6 +576,9 @@ void MSSQLResultStream::ProcessRow(DataChunk &chunk, idx_t row_idx) {
 		}
 		tds::encoding::TypeConverter::ConvertValue(row.values[col_idx], row.null_mask[col_idx],
 												   column_metadata_[col_idx], *target_vector, row_idx, variant_notes);
+		if (column_metadata_[col_idx].IsVectorText() && target_vector->GetType().id() == LogicalTypeId::ARRAY) {
+			NoteVectorText(col_idx);
+		}
 		// Spec 093 T1: as the staged path, said as soon as the scan meets one.
 		if (variant_notes && variant_notes->unknown_collation + variant_notes->invalid_utf8 > 0 &&
 			(col_idx >= variant_notes_warned_.size() || !variant_notes_warned_[col_idx])) {
@@ -993,6 +1000,16 @@ void MSSQLResultStream::NoteOutOfRange(idx_t c) {
 	}
 }
 
+void MSSQLResultStream::NoteVectorText(idx_t c) {
+	if (vector_text_.size() < column_metadata_.size()) {
+		vector_text_.resize(column_metadata_.size(), 0);
+	}
+	if (vector_text_[c] == 0) {
+		vector_text_[c] = 1;
+		warnings_pending_ = true;
+	}
+}
+
 void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 	// Called when the stream has its COLMETADATA and again when it is drained --
 	// never per row, never per chunk. Both loops below walk metadata, not data,
@@ -1026,6 +1043,30 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 							   "table's 9999-12-31, say), read as NULL as TIMESTAMP_NS cannot hold them; attach with "
 							   "datetime2_7_as 'timestamp' (or SET mssql_datetime2_7_as = 'timestamp' before ATTACH) "
 							   "to read them as TIMESTAMP, the 100 ns digit truncated",
+							   column_metadata_[c].name.c_str());
+		}
+	}
+
+	// Spec 093 D4: a vector column read from its JSON text on a connection that was not granted
+	// VECTORSUPPORT, where a float32 column arrives that way too and its 8 significant digits can put an
+	// element one ulp from the stored one (V2: about 1.5 % of values). Under the feature only a float16
+	// column is text, and exact, so it is not said. Once per column per statement.
+	{
+		auto connection = GetConnection();
+		const bool granted = connection && connection->VectorSupportVersion() > 0;
+		for (idx_t c = 0; c < vector_text_.size(); c++) {
+			if (vector_text_[c] != 1) {
+				continue;
+			}
+			vector_text_[c] = 2;
+			if (granted) {
+				continue;
+			}
+			DUCKDB_LOG_WARNING(context,
+							   "mssql: column \"%s\" is a vector read from its JSON text, as a session without "
+							   "VECTORSUPPORT receives it (mssql_vector_support false at ATTACH, or a server that does "
+							   "not grant it): a float32 element can read one ulp from its stored value (8 significant "
+							   "digits); with the feature (SQL Server 2025) a float32 vector streams its bytes",
 							   column_metadata_[c].name.c_str());
 		}
 	}

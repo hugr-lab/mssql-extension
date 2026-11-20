@@ -151,6 +151,10 @@ struct MSSQLConnectionInfo {
 	// wire form or two connections would decode the same column differently.
 	bool utf8_support = true;
 
+	// Spec 093 D4: ask for VECTORSUPPORT in LOGIN7, from mssql_vector_support at ATTACH; for the same
+	// reason as utf8_support -- one catalog's logins ask alike.
+	bool vector_support = true;
+
 	//===----------------------------------------------------------------------===//
 	// Catalog Visibility Filters (Spec 033: regex-based object filtering)
 	//===----------------------------------------------------------------------===//

@@ -11,6 +11,7 @@
 #include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/money_codec.hpp"
+#include "codec/sql_vector/vector_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "codec/uuid_codec.hpp"
 #include "codec/variant/variant_codec.hpp"
@@ -332,6 +333,9 @@ void FinalizeStagedColumn(FinalizeKernel kernel, const ColumnStaging &st, idx_t 
 		break;
 	case FinalizeKernel::Variant:
 		variant::DecodeChunkFromStaging(st, count, meta, out, variant_notes);
+		break;
+	case FinalizeKernel::Vector:
+		sql_vector::DecodeChunkFromStaging(st, count, meta, out);
 		break;
 	}
 }
@@ -788,8 +792,9 @@ bool RowStager::TryEmitConstant(idx_t c, const ColumnStaging &st, const tds::Col
 		return false;
 	}
 	Vector &out = *targets_[c];
-	if (ops_[c].kernel == FinalizeKernel::Variant) {
-		// A VARIANT vector is lists and a blob: its kernel builds it whole, NULLs included (spec 093 T1).
+	if (ops_[c].kernel == FinalizeKernel::Variant || ops_[c].kernel == FinalizeKernel::Vector) {
+		// A VARIANT vector is lists and a blob, a FLOAT[n] an array: their kernels build them whole, NULLs
+		// included (spec 093 T1, T3).
 		return false;
 	}
 
@@ -877,6 +882,7 @@ void RowStager::DecodeFirstValue(idx_t c, const ColumnStaging &st, const tds::Co
 		code_page::DecodeFromTds(bytes, meta, out, 0);
 		break;
 	case FinalizeKernel::Variant:  // never constant (TryEmitConstant)
+	case FinalizeKernel::Vector:
 	case FinalizeKernel::None:
 	case FinalizeKernel::Text:
 		break;

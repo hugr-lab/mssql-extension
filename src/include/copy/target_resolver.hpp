@@ -156,6 +156,15 @@ struct BCPColumnMetadata {
 	// discarding the data.
 	bool bulk_unsupported = false;
 
+	//! A vector(n) target (spec 093 T3, D4): its dimensions and element type (0 float32, 1 float16). Sent
+	//! as varbinary(8 + n x element size) -- the value's header and elements, measured V6 to be taken
+	//! on every session -- under a declared vector(n) / vector(n, float16) in INSERT BULK.
+	uint16_t vector_dims = 0;
+	uint8_t vector_element_type = 0;
+	bool IsVector() const {
+		return vector_dims > 0;
+	}
+
 	// Default constructor
 	BCPColumnMetadata() = default;
 

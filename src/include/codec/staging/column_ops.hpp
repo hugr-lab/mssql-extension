@@ -123,12 +123,15 @@ enum class FinalizeKernel : uint8_t {
 	CodePage,
 	//! Spec 093 T1: a SQL_VARIANT column, each value written as a VARIANT
 	//! (`src/codec/variant/variant_codec.cpp`).
-	Variant
+	Variant,
+	//! Spec 093 T3: a vector column into FLOAT[n], from VECTORTYPE bytes or the
+	//! JSON text (`src/codec/sql_vector/vector_codec.cpp`).
+	Vector
 };
 
 //! Number of FinalizeKernel values, for counter arrays.
-static const uint8_t FINALIZE_KERNEL_COUNT = 10;
-static_assert(FINALIZE_KERNEL_COUNT == static_cast<uint8_t>(FinalizeKernel::Variant) + 1,
+static const uint8_t FINALIZE_KERNEL_COUNT = 11;
+static_assert(FINALIZE_KERNEL_COUNT == static_cast<uint8_t>(FinalizeKernel::Vector) + 1,
 			  "a new kernel must not index past the counter arrays");
 
 //! Short lowercase name, for the debug counters.
@@ -163,6 +166,9 @@ struct ColumnOps {
 	//! Buffer cost, not wire size: a delimited string column stages a U+0000
 	//! after every value, and those two bytes are as real as the value's own.
 	uint32_t max_value_bytes = 0;
+	//! Spec 093 T3: a vector column read into FLOAT[n]: the arm stages its bytes (VECTORTYPE) or its text
+	//! (the JSON form), and the Vector kernel publishes them.
+	bool vector_kernel = false;
 };
 
 //! Resolve a column.

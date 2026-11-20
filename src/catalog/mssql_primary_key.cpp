@@ -58,7 +58,7 @@ static const char *PK_DISCOVERY_COLUMNS = R"(
     c.name AS column_name,
     c.column_id,
     ic.key_ordinal,
-    ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS type_name,
+    CASE WHEN c.user_type_id = 255 THEN N'vector' ELSE ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) END AS type_name,
     c.max_length,
     c.precision,
     c.scale,

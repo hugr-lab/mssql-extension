@@ -160,6 +160,38 @@ A raw `mssql_scan` reads any `datetime2` as `TIMESTAMP`, whatever the setting.
 - **CTAS**: Supported via BCP protocol
 - **INSERT/UPDATE via SQL literals**: Supported for small values (up to 4096 bytes). Larger XML values error with a recommendation to use COPY TO with BCP protocol
 
+### Vector Type (SQL Server 2025)
+
+| SQL Server Type          | DuckDB Type | Notes |
+| ------------------------ | ----------- | ----- |
+| `vector(n)`              | `FLOAT[n]`  | n from 1 to 1998; read from its bytes |
+| `vector(n, float16)`     | `FLOAT[n]`  | each element widened exactly |
+
+The extension asks the server for its vector wire form at login (`mssql_vector_support`, default
+`true`, read when the database is attached). SQL Server 2025 then sends a float32 `vector(n)` as its
+bytes, which read exactly. A `vector(n, float16)` still arrives as JSON text, and so does every vector
+when the setting is off or the server does not grant the feature: the text is parsed on the client,
+exactly for float16 and to within one unit in the last place for float32 (the server prints 8
+significant digits, which do not name every float32). A `WARNING` in `duckdb_logs` says so when it
+happens to a float32 column.
+
+```sql
+SELECT id, embedding FROM sqlserver.dbo.docs;             -- embedding: FLOAT[1536]
+SELECT * FROM mssql_scan('sqlserver', 'SELECT embedding FROM dbo.docs');
+```
+
+A raw `mssql_scan()` reads a vector the server sends as bytes as `FLOAT[n]`, and one it sends as text
+as `VARCHAR`, the server's own text: the text carries no dimension count to type it by.
+
+**Writing.** `INSERT`, `UPDATE`, `MERGE`, `COPY` and CTAS take a `FLOAT[n]` value. A small `INSERT` or
+`UPDATE` sends it as text with 9 significant digits, exact for float32, and the server converts it to
+the column's type. COPY, a large `INSERT`, CTAS and a staged `UPDATE` / `MERGE` send its bytes, a
+float16 column's elements rounded to nearest even. A CTAS or a COPY that creates its table creates
+`vector(n)` from `FLOAT[n]`; a `DOUBLE[n]` is refused with the fix named (`::FLOAT[n]`), and so are a
+NULL element, a NaN or an infinity, and a float16 value that rounds past 65504 (65520 or more; a
+value below that is rounded to 65504). A filter on a vector column runs in
+DuckDB, and it is never a row key.
+
 ### Legacy LOB Types
 
 `TEXT`, `NTEXT` and `IMAGE` columns **are readable**: `TEXT`/`NTEXT` arrive as

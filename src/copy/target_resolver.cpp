@@ -2,6 +2,7 @@
 #include "catalog/mssql_column_info.hpp"
 #include "catalog/mssql_column_names.hpp"
 #include "codec/code_page/code_page.hpp"
+#include "codec/sql_vector/vector_codec.hpp"
 #include "codec/variant/variant_write.hpp"
 #include "query/mssql_identifier.hpp"
 #include "query/mssql_sql_params.hpp"
@@ -146,6 +147,9 @@ bool BCPColumnMetadata::IsFixedLength() const {
 }
 
 string BCPColumnMetadata::GetSQLServerTypeDeclaration() const {
+	if (IsVector()) {
+		return "vector(" + std::to_string(vector_dims) + (vector_element_type == 1 ? ", float16)" : ")");
+	}
 	switch (tds_type_token) {
 	case tds::TDS_TYPE_BITN:
 		return "bit";
@@ -814,6 +818,11 @@ static bool IsTypeCompatible(const LogicalType &source_type, const string &targe
 	case LogicalTypeId::UUID:
 		return target_lower == "uniqueidentifier";
 
+	case LogicalTypeId::ARRAY:
+		// Spec 093 T3: a FLOAT[n] into a vector column; the dimensions are the encoder's to check (the
+		// target's are not in its name). A DOUBLE[n] is a mismatch: the cast to FLOAT[n] is the user's.
+		return target_lower == "vector" && ArrayType::GetChildType(source_type).id() == LogicalTypeId::FLOAT;
+
 	case LogicalTypeId::DATE:
 		return target_lower == "date" || target_lower == "datetime" || target_lower == "datetime2" ||
 			   target_lower == "smalldatetime";
@@ -1124,6 +1133,9 @@ bool BulkWireCanCarry(const string &type_name) {
 	if (lower == "timestamp" || lower == "rowversion") {
 		return false;
 	}
+	if (lower == "vector") {
+		return true;  // spec 093 T3: varbinary under a declared vector(n), measured V6
+	}
 	if (lower == "sql_variant") {
 		return true;  // spec 093 T2: SSVARIANT envelopes (S2), FromServerColumn's 0x62
 	}
@@ -1199,6 +1211,14 @@ BCPColumnMetadata BCPColumnMetadata::FromServerColumn(const string &name, const 
 		col.duckdb_type = LogicalType::TIMESTAMP_TZ;
 	} else if (type_lower == "varbinary" || type_lower == "binary" || type_lower == "image") {
 		col.duckdb_type = LogicalType::BLOB;
+	} else if (type_lower == "vector") {
+		// Spec 093 T3: sys.columns' scale is the element type and max_length 8 + n x element size (V5).
+		col.vector_element_type = scale == 1 ? 1 : 0;
+		col.vector_dims = static_cast<uint16_t>(max_length > 8 ? (max_length - 8) / (scale == 1 ? 2 : 4) : 1);
+		col.tds_type_token = tds::TDS_TYPE_BIGVARBINARY;
+		col.max_length = static_cast<uint16_t>(max_length);
+		col.scale = 0;
+		col.duckdb_type = mssql::codec::sql_vector::FloatArrayType(col.vector_dims);
 	} else if (type_lower == "sql_variant") {
 		// Spec 093 T2 (D3): a VARIANT, written as SSVARIANT envelopes (S2: INSERT BULK takes them). A
 		// string base value carries `collation_name`'s collation -- the callers give the database's
@@ -1235,7 +1255,10 @@ vector<BCPColumnMetadata> TargetResolver::GetExistingTableColumnMetadata(tds::Td
 																		 const BCPCopyTarget &target) {
 	// Query the target table's column information
 	const tds::Request column_sql = ObjectProbe(
-		"SELECT c.name AS column_name, ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS "
+		// A vector column is named `vector` (user_type_id 255: TYPE_NAME of its system type says varbinary,
+		// spec 093 V5), its element type in scale.
+		"SELECT c.name AS column_name, CASE WHEN c.user_type_id = 255 THEN N'vector' ELSE "
+		"ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) END AS "
 		"type_name, c.max_length, c.precision, c.scale, c.is_nullable, "
 		// A sql_variant has no collation of its own: its string values are written under the database's
 		// default, as the statement path's CAST writes them (spec 093 T2).
@@ -1348,6 +1371,16 @@ vector<BCPColumnMetadata> TargetResolver::GenerateColumnMetadata(const vector<Lo
 			col.collation = mssql::codec::variant::StringCollationBytes(database_collation);
 		}
 		col.nullable = true;  // All columns nullable by default for COPY
+
+		// Spec 093 T3: a FLOAT[n] creates vector(n) (FormatDdlTypeName), loaded as its bytes.
+		if (mssql::codec::sql_vector::IsVectorType(source_types[i])) {
+			mssql::codec::sql_vector::FormatDdlTypeName(source_types[i]);  // n within 1..1998
+			col.vector_dims = static_cast<uint16_t>(ArrayType::GetSize(source_types[i]));
+			col.tds_type_token = tds::TDS_TYPE_BIGVARBINARY;
+			col.max_length = static_cast<uint16_t>(tds::VECTOR_HEADER_BYTES + 4 * col.vector_dims);
+			columns.push_back(std::move(col));
+			continue;
+		}
 
 		// Map DuckDB type to TDS type
 		col.tds_type_token = GetTDSTypeToken(source_types[i]);
@@ -1489,6 +1522,8 @@ string TargetResolver::GetSQLServerTypeDeclaration(const LogicalType &duckdb_typ
 	}
 
 	switch (duckdb_type.id()) {
+	case LogicalTypeId::ARRAY:
+		return codec::sql_vector::FormatDdlTypeName(duckdb_type);  // spec 093 T3: FLOAT[n] -> vector(n)
 	case LogicalTypeId::VARIANT:
 		return "sql_variant";  // spec 093 T2 (D3)
 

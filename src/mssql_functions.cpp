@@ -283,6 +283,21 @@ static bool DescribedTypeToTdsMetadata(const string &base, int16_t max_length, u
 		column.type_id = tds::TDS_TYPE_XML;
 	} else if (base == "sql_variant") {
 		column.type_id = tds::TDS_TYPE_SQL_VARIANT;
+	} else if (base == "vector") {
+		// Spec 093 D4 (V3): a session granted VECTORSUPPORT describes a float32 vector as `vector(n)`, max
+		// length 8 + 4n, and streams it as VECTORTYPE. A float16 one, and any vector without the feature,
+		// describe as varchar(max) and never reach here.
+		// The element type in scale, as sys.columns gives it (V5); a float16 one is not described so today.
+		const uint8_t element_type = scale == 1 ? tds::VECTOR_ELEMENT_FLOAT16 : tds::VECTOR_ELEMENT_FLOAT32;
+		const int16_t element_bytes = static_cast<int16_t>(tds::VectorElementBytes(element_type));
+		if (max_length < static_cast<int16_t>(tds::VECTOR_HEADER_BYTES) + element_bytes ||
+			(max_length - tds::VECTOR_HEADER_BYTES) % element_bytes != 0) {
+			return false;
+		}
+		column.type_id = tds::TDS_TYPE_VECTOR;
+		column.vector_element_type = element_type;
+		column.scale = 0;
+		column.user_type = tds::VECTOR_USER_TYPE;
 	} else if (base == "hierarchyid" || base == "geography" || base == "geometry") {
 		column.type_id = tds::TDS_TYPE_UDT;
 		column.udt_schema = "sys";	// as COLMETADATA's UDT_INFO names the system CLR types (spec 093 G2)
@@ -730,6 +745,8 @@ static bool StreamCanProduce(const LogicalType &declared) {
 	case LogicalTypeId::UUID:
 	case LogicalTypeId::VARIANT:  // a sql_variant (spec 093 T1)
 		return true;
+	case LogicalTypeId::ARRAY:	// a vector(n) streamed as VECTORTYPE (spec 093 T3)
+		return ArrayType::GetChildType(declared).id() == LogicalTypeId::FLOAT;
 	default:
 		return false;
 	}
