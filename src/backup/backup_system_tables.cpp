@@ -751,6 +751,9 @@ bool ReadUnitDataPage(const PageStore &store, const SysAllocUnit &unit, const Pa
 	} catch (PendingPageError &e) {
 		// Kept a PendingPageError: the catalog model names it on the objects that need the table (D13).
 		throw PendingPageError(std::string(e.what()) + " (reading " + table + ")");
+	} catch (ZeroCopyError &e) {
+		// Kept a ZeroCopyError: the scan asks the log tail whether the page became live while the backup ran.
+		throw ZeroCopyError(std::string(e.what()) + " (reading " + table + ")", e.page);
 	} catch (FormatError &e) {
 		throw FormatError(std::string(e.what()) + " (reading " + table + ")");
 	}

@@ -768,12 +768,17 @@ bool NextPage(ClientContext &context, const ScanBindData &data, ScanLocalState &
 			} catch (ZeroCopyError &e) {
 				// A zero unit beside one data pass (2017): Pending when the tail formats the page.
 				const FuzzySummary *tail = nullptr;
+				std::string why;
 				try {
 					tail = &StatementTail(context, data.catalog->opened);
-				} catch (FormatError &) {
+				} catch (FormatError &t) {
+					why = std::string("; the backup's log tail is not read: ") + t.what();
 				}
 				if (!tail || !tail->formatted.count(static_cast<uint64_t>(e.page.file) << 32 | e.page.page)) {
-					throw;
+					throw FormatError(std::string(e.what()) +
+									  (tail ? "; the backup's log tail formats no such page (" +
+												  std::to_string(tail->formatted.size()) + " pages formatted in it)"
+											: why));
 				}
 				throw PendingPageError("backup: page " + e.page.ToString() +
 									   " became live while the backup ran: its content is in the backup's log tail "
