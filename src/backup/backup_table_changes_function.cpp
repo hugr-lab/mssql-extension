@@ -454,6 +454,7 @@ void TableChangesExecute(ClientContext &context, TableFunctionInput &input, Data
 		}
 		CdRecord cd;
 		CdRow cd_row;
+		PageCompression page_ci;  // the current page's, a PAGE rowset's (spec 086 PR 2)
 		std::vector<std::string> rids;
 		std::vector<ChangeKind> kinds;
 		size_t i = begin;
@@ -465,21 +466,31 @@ void TableChangesExecute(ClientContext &context, TableFunctionInput &input, Data
 									  " is no longer a data page of the table on its second read");
 				}
 				have = true;
+				page_ci.present = false;
+				if (layout.compression == 2 && (page.header.type_flags & 0x80)) {
+					ReadPageCompression(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * page.header.slot_count,
+										side.data.table.c_str(), page_ci);
+				}
 			}
 			RowLocation at;
 			at.page = page.header.page_id;
 			at.slot = item.slot;
 			RowRecord row;
 			RecordView fixed;
-			if (layout.compression == 1) {
+			if (layout.compression == 1 || layout.compression == 2) {
 				const size_t pos = PAGE_SIZE - 2 - 2 * static_cast<size_t>(item.slot);
 				const uint16_t offset = static_cast<uint16_t>(page.bytes[pos] | (page.bytes[pos + 1] << 8));
+				if (page_ci.present && offset < page_ci.end) {
+					throw FormatError("backup: page " + item.page.ToString() + " has a record at offset " +
+									  std::to_string(offset) + " inside its compression information (to " +
+									  std::to_string(page_ci.end) + ")");
+				}
 				ReadCdRecord(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * page.header.slot_count, offset,
 							 side.data.table.c_str(), cd);
 				if (cd.kind == CdRecord::Kind::Forwarded) {
 					cd.BackPointer(at.page.page, at.page.file, at.slot);
 				}
-				cd_row.Read(cd, layout, &needed);
+				cd_row.Read(cd, layout, &needed, layout.compression == 2 ? &page_ci : nullptr);
 				row = RowRecord::Compressed(cd, cd_row);
 			} else {
 				fixed =
