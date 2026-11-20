@@ -1470,7 +1470,7 @@ sysadmin, so it runs only with `MSSQL_TEST_CLR=1`:
 
 ```bash
 test/clr/build.sh                               # once, or after TestTypes.cs changes
-MSSQL_TEST_CLR=1 make integration-test          # or: build/release/test/unittest test/sql/types/clr_udt_raw_scan.test
+MSSQL_TEST_CLR=1 make integration-test          # or: MSSQL_TEST_CLR=1 build/release/test/unittest test/sql/types/clr_udt_raw_scan.test
 ```
 
 SQL Server 2017 or later (`sp_add_trusted_assembly`). `clr enabled` is left on afterwards; everything

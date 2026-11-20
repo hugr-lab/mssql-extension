@@ -1130,6 +1130,25 @@ bool NodeWriter::WriteSetOperation(const SetOperationNode &node) {
 					return Veto("set operation string columns that are not columns of one type and collation");
 				}
 			}
+			{
+				// A type the server converts by its own rules (hierarchyid read as its text, sql_variant, ...:
+				// comparison_differs) unifies with another member there by the server's precedence, which
+				// DuckDB's type does not show: an nvarchar member beside a hierarchyid one is converted to
+				// hierarchyid on the server. Every member is then a plain column of that one server type,
+				// whichever comes first (review of #593: the String check above saw only one order).
+				auto &reference = first.Outputs()[i];
+				const bool ref_column = reference.column_index != DConstants::INVALID_INDEX;
+				const bool mine_differs = column && child.FlatColumn(output.column_index).comparison_differs;
+				const bool theirs_differs = ref_column && first.FlatColumn(reference.column_index).comparison_differs;
+				if ((mine_differs || theirs_differs) &&
+					(!column || !ref_column || !output.plain_read || !reference.plain_read ||
+					 !StringUtil::CIEquals(child.FlatColumn(output.column_index).sql_type_name,
+										   first.FlatColumn(reference.column_index).sql_type_name))) {
+					return Veto(
+						"set operation columns of different server types, one converted by the server's "
+						"own rules");
+				}
+			}
 			if (compares) {
 				if (column ? !IsGroupable(child.FlatColumn(output.column_index))
 						   : output.value.kind == ComparableKind::None || output.value.approximate ||

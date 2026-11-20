@@ -115,7 +115,8 @@ statement ok
 SELECT mssql_exec('clr', 'DROP TABLE dbo.ClrUdtT; DROP TYPE dbo.TestPoint; DROP TYPE dbo.TestLabel;
 DECLARE @h varbinary(64) = (SELECT HASHBYTES(''SHA2_512'', content) FROM sys.assembly_files f JOIN sys.assemblies a ON a.assembly_id = f.assembly_id WHERE a.name = ''MssqlTestUdt'' AND f.file_id = 1);
 DROP ASSEMBLY MssqlTestUdt;
-IF @h IS NOT NULL AND EXISTS (SELECT 1 FROM sys.trusted_assemblies WHERE hash = @h) EXEC sys.sp_drop_trusted_assembly @h;');
+IF @h IS NOT NULL AND EXISTS (SELECT 1 FROM sys.trusted_assemblies WHERE hash = @h AND description = N''mssql_test_udt'')
+  EXEC sys.sp_drop_trusted_assembly @h;');
 
 statement ok
 DETACH clr;

@@ -22,7 +22,7 @@ statement ok
 ATTACH '{MSSQL_TESTDB_DSN}' AS hr (TYPE mssql, order_pushdown true);
 
 statement ok
-SELECT mssql_exec('hr', 'DROP TABLE IF EXISTS dbo.HidH1; DROP TABLE IF EXISTS dbo.HidOrder;
+SELECT mssql_exec('hr', 'DROP TABLE IF EXISTS dbo.HidH1; DROP TABLE IF EXISTS dbo.HidOrder; DROP TABLE IF EXISTS dbo.HidText;
 CREATE TABLE dbo.HidH1 (id int IDENTITY PRIMARY KEY, h hierarchyid NULL, s AS h.ToString());
 INSERT INTO dbo.HidH1 (h) SELECT hierarchyid::Parse(t) FROM (VALUES
   (''/''), (''/0/''), (''/3/''), (''/4/''), (''/7/''), (''/8/''), (''/15/''), (''/16/''), (''/79/''), (''/80/''),
@@ -51,7 +51,54 @@ CREATE TABLE dbo.HidOrder (id int PRIMARY KEY, h hierarchyid NOT NULL);
 INSERT INTO dbo.HidOrder VALUES (1, ''/2/''), (2, ''/10/''), (3, ''/3/''), (4, ''/1/'')');
 
 statement ok
+SELECT mssql_exec('hr', 'DROP TABLE IF EXISTS dbo.HidText; CREATE TABLE dbo.HidText (id int PRIMARY KEY, t nvarchar(max) NOT NULL);
+INSERT INTO dbo.HidText VALUES (1, N''/01/''), (2, N''not a path'')');
+
+statement ok
 SELECT mssql_invalidate_cache('hr');
+
+# A set operation of a hierarchyid and an nvarchar is not pushed, in either order (review of #593): on the
+# server the nvarchar member would be converted to hierarchyid ('/01/' read back as '/1/', 'not a path' an
+# error); in DuckDB both are the text read.
+query T
+SELECT v FROM (SELECT t AS v FROM hr.dbo.HidText UNION ALL SELECT h FROM hr.dbo.HidOrder) ORDER BY v;
+----
+/01/
+/1/
+/10/
+/2/
+/3/
+not a path
+
+query T
+SELECT v FROM (SELECT v FROM (SELECT t AS v FROM hr.dbo.HidText UNION ALL SELECT h FROM hr.dbo.HidOrder) LIMIT 100) ORDER BY v;
+----
+/01/
+/1/
+/10/
+/2/
+/3/
+not a path
+
+query T
+SELECT v FROM (SELECT v FROM (SELECT h AS v FROM hr.dbo.HidOrder UNION ALL SELECT t FROM hr.dbo.HidText) LIMIT 100) ORDER BY v;
+----
+/01/
+/1/
+/10/
+/2/
+/3/
+not a path
+
+query T
+SELECT v FROM (SELECT h AS v FROM hr.dbo.HidOrder UNION ALL SELECT t FROM hr.dbo.HidText) ORDER BY v;
+----
+/01/
+/1/
+/10/
+/2/
+/3/
+not a path
 
 # --- typed as before: VARCHAR
 query T
