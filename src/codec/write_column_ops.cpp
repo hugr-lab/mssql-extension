@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "codec/write_column_ops.hpp"
+#include "codec/sql_vector/vector_bytes.hpp"
 
 #include "duckdb/common/types.hpp"
 #include "tds/encoding/bcp_row_encoder.hpp"
@@ -67,6 +68,16 @@ WriteColumnOps ResolveWriteColumnOps(const LogicalType &source, const mssql::BCP
 	ops.kind = target.IsPLPType() ? WireKind::Plp
 								  : (target.IsVariableLengthUSHORT() ? WireKind::VariableUShort : WireKind::Fixed);
 
+	if (target.IsVector()) {
+		// Spec 093 T3: a FLOAT[n] of the column's n; anything else is the row path's to refuse by name.
+		ops.kind = WireKind::VariableUShort;
+		const bool fits = source.id() == LogicalTypeId::ARRAY &&
+						  ArrayType::GetChildType(source).id() == LogicalTypeId::FLOAT &&
+						  ArrayType::GetSize(source) == target.vector_dims;
+		ops.arm = fits ? ScatterArm::Vector : ScatterArm::RowFallback;
+		ops.wire_width = static_cast<uint32_t>(sql_vector::ValueBytes(target.vector_dims, target.vector_element_type));
+		return ops;
+	}
 	if (ops.kind == WireKind::VariableUShort) {
 		// nvarchar(n) and the UTF-8 varchar(n) form. PLP/MAX is not planned yet.
 		//

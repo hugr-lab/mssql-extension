@@ -1062,6 +1062,100 @@ jobs:
           scripts/ci/integration_test.sh ./cli/duckdb ./extension/mssql.duckdb_extension ./unittest/unittest
 
   # ============================================================================
+  # Integration Test Job - SQL Server 2025 types (spec 093 T3: vector; T7: json)
+  # The types SQL Server 2022 does not have, on the 2025 image pinned by digest in
+  # test/backup/gen/images.txt. Runs only test/sql/types_2025, whose files need
+  # MSSQL_TEST_SQLSERVER_2025 (so the 2022 job above skips them), with the same
+  # seed and runner as the 2022 job.
+  # ============================================================================
+  integration-test-2025:
+    name: Integration Test, SQL Server 2025 types (linux_amd64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    needs: build
+    if: >-
+      ${{ (github.event_name == 'workflow_dispatch' && inputs.run_build && inputs.run_integration_tests)
+          || github.event_name == 'schedule'
+          || github.event_name == 'push'
+          || github.event_name == 'pull_request' }}
+
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2025-latest@sha256:245f6b1c8903edae52cb20fa31419cefcde1a49938bb8c3447099011fc871ca3
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: TestPassword1
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P TestPassword1 -C -Q 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 30s
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download extension artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: mssql-extension-linux_amd64
+          path: extension
+
+      - name: Download DuckDB CLI artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: duckdb-cli-linux_amd64
+          path: cli
+
+      - name: Download unittest artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: unittest-linux_amd64
+          path: unittest
+
+      - name: Download libduckdb artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: libduckdb-linux_amd64
+          path: lib
+
+      - name: Setup executables
+        run: |
+          chmod +x cli/duckdb
+          chmod +x unittest/unittest
+          chmod +x scripts/ci/integration_test.sh
+
+      - name: Wait for SQL Server
+        run: |
+          timeout 180 bash -c 'until echo > /dev/tcp/localhost/1433 2>/dev/null; do sleep 5; done'
+
+      # The same seed as the 2022 job (TestDB, which the files attach to).
+      - name: Seed test database
+        env:
+          SQLSERVER_ID: ${{ job.services.sqlserver.id }}
+        run: |
+          docker cp docker/init/init.sql "$SQLSERVER_ID:/tmp/init.sql"
+          docker exec "$SQLSERVER_ID" /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost -U sa -P TestPassword1 -C -i /tmp/init.sql
+          echo "Seed applied."
+
+      - name: Run the 2025 type tests
+        env:
+          MSSQL_TEST_HOST: localhost
+          MSSQL_TEST_PORT: 1433
+          MSSQL_TEST_USER: sa
+          MSSQL_TEST_PASS: TestPassword1
+          MSSQL_TEST_DB: master
+          MSSQL_TEST_SQLSERVER_2025: "1"
+          MSSQL_TEST_SUITE_DIR: test/sql/types_2025
+          MSSQL_MIN_TEST_CASES: "2"
+        run: |
+          export LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          scripts/ci/integration_test.sh ./cli/duckdb ./extension/mssql.duckdb_extension ./unittest/unittest
+
+  # ============================================================================
   # Windows Build Job - MSVC (Visual Studio 2022)
   # Matches community-extensions CI configuration
   # (Manual trigger only via workflow_dispatch)

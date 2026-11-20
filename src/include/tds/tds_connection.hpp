@@ -299,6 +299,19 @@ public:
 		request_utf8_support_ = request;
 	}
 
+	// Spec 093 D4: whether LOGIN7 asks for VECTORSUPPORT (mssql_vector_support, read per catalog at
+	// ATTACH). Granted, a float32 vector column streams VECTORTYPE (0xF5); not, every vector arrives as
+	// its JSON text.
+	void SetRequestVectorSupport(bool request) {
+		request_vector_support_ = request;
+	}
+
+	// The VECTORSUPPORT version this connection's server granted, 0 when it asked for none or none was
+	// granted (SQL Server 2025: 1, measured V1).
+	uint8_t VectorSupportVersion() const {
+		return vector_support_version_;
+	}
+
 	// Spec 074: the server-certificate policy for every TLS handshake this
 	// connection performs, including the one after a routing hop. Set before
 	// Authenticate*, like SetRequestedPacketSize. The default verifies against
@@ -324,6 +337,12 @@ private:
 	// server answers requests, so an ack for anything else is not ours to honour.
 	void NoteFeatureAcks(const LoginResponse &login_response) {
 		utf8_support_acked_ = request_utf8_support_ && login_response.utf8_support_acked;
+		vector_support_version_ = request_vector_support_ ? login_response.vector_support_version : 0;
+	}
+
+	// The features this connection's LOGIN7 asks for.
+	Login7Features RequestedFeatures() const {
+		return Login7Features(request_utf8_support_, request_vector_support_ ? VECTOR_SUPPORT_REQUESTED_VERSION : 0);
 	}
 
 	// Size the socket's receive staging from the frame size the server confirmed
@@ -350,6 +369,10 @@ private:
 	// Issue #225: requested in LOGIN7, confirmed by FEATUREEXTACK.
 	bool request_utf8_support_ = true;
 	bool utf8_support_acked_ = false;
+
+	// Spec 093 D4: requested in LOGIN7, the granted version from FEATUREEXTACK.
+	bool request_vector_support_ = false;
+	uint8_t vector_support_version_ = 0;
 
 	// Connection info
 	std::string host_;

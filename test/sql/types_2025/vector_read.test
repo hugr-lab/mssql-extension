@@ -1,0 +1,162 @@
+# name: test/sql/types_2025/vector_read.test
+# description: Spec 093 T3 (D4) -- a vector(n) column read as FLOAT[n]: through the catalog in both wire forms (VECTORTYPE under VECTORSUPPORT, the JSON text without it and for float16), by a raw scan, with the fallback's WARNING
+# group: [types_2025]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN           - Connection string to the test database
+#   MSSQL_TEST_SQLSERVER_2025  - set (to anything) when the server is SQL Server 2025, which has the
+#                                vector type; the 2025 CI job sets it, the 2022 job does not, so this
+#                                file skips there
+#
+# V1: under VECTORSUPPORT (2025 grants version 1) a float32 column streams VECTORTYPE (0xF5), its bytes;
+# a float16 column, and every vector on a session without the feature, stream the JSON text
+# `[e1,...]` (each element %.7e). The catalog reads both into FLOAT[n]; the text is exact for float16
+# and can be one ulp off for float32 (V2), which the WARNING says. A raw scan types VECTORTYPE as
+# FLOAT[n] and the text as VARCHAR (no n on the wire, D4).
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+require-env MSSQL_TEST_SQLSERVER_2025
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS vec (TYPE mssql);
+
+# float16 is a preview feature on 2025 17.0.
+statement ok
+SELECT mssql_exec('vec', 'ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON');
+
+statement ok
+SELECT mssql_exec('vec', 'DROP TABLE IF EXISTS dbo.vec_read; DROP TABLE IF EXISTS dbo.vec_big');
+
+statement ok
+SELECT mssql_exec('vec', 'CREATE TABLE dbo.vec_read (id int NOT NULL PRIMARY KEY, v vector(3) NULL, h vector(3, float16) NULL); INSERT INTO dbo.vec_read VALUES (1, ''[1,2,3]'', ''[1,2,3]''), (2, ''[0.1,-0.0,3.4028235e38]'', ''[0.1,-0.0,65504]''), (3, ''[-103.217316,-1.16638425e-07,1.00584066e+18]'', ''[0.5,-2,0.25]''), (4, NULL, NULL)');
+
+statement ok
+SELECT mssql_exec('vec', 'CREATE TABLE dbo.vec_big (id int NOT NULL PRIMARY KEY, b vector(1998) NULL); INSERT INTO dbo.vec_big SELECT 1, CAST(''['' + STRING_AGG(CAST(CAST(value AS float) AS varchar(max)), '','') WITHIN GROUP (ORDER BY value) + '']'' AS vector(1998)) FROM GENERATE_SERIES(1, 1998)');
+
+statement ok
+SELECT mssql_invalidate_cache('vec');
+
+# What the server stores: -0.0 as +0 (the JSON input loses the sign, V2), float16 0.1 as 0.0999755859375.
+statement ok
+CREATE TEMP TABLE vec_expected AS SELECT * FROM (VALUES (1, '[1,2,3]'::FLOAT[3], '[1,2,3]'::FLOAT[3]), (2, '[0.1,0,3.4028235e38]'::FLOAT[3], '[0.0999755859375,0,65504]'::FLOAT[3]), (3, '[-103.217316,-1.16638425e-07,1.00584066e+18]'::FLOAT[3], '[0.5,-2,0.25]'::FLOAT[3]), (4, NULL, NULL)) t(id, v, h);
+
+statement ok
+SET enable_logging = true;
+
+# --- the catalog: FLOAT[n], float16 widened
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'vec' AND table_name = 'vec_read' ORDER BY column_index;
+----
+id	INTEGER
+v	FLOAT[3]
+h	FLOAT[3]
+
+# Under the feature v streams its bytes, so every float32 element is exact -- -103.217316 included,
+# which the text cannot tell from its neighbour (V2); h streams the text, exact for float16.
+query I
+SELECT count(*) FROM vec.dbo.vec_read r JOIN vec_expected e USING (id) WHERE r.v IS NOT DISTINCT FROM e.v AND r.h IS NOT DISTINCT FROM e.h;
+----
+4
+
+query T
+SELECT v::VARCHAR FROM vec.dbo.vec_read WHERE id = 1;
+----
+[1.0, 2.0, 3.0]
+
+query I
+SELECT count(*) FROM vec.dbo.vec_read WHERE v IS NULL AND h IS NULL;
+----
+1
+
+# vector(1998): 8000 bytes a value.
+query TT
+SELECT typeof(b), b::VARCHAR LIKE '[1.0, 2.0, 3.0, %, 1997.0, 1998.0]' FROM vec.dbo.vec_big;
+----
+FLOAT[1998]	true
+
+# Filters on a vector run in DuckDB (D2), and a pushed SELECT never carries one in its result (its
+# form follows the session); both still answer.
+query I
+SELECT id FROM vec.dbo.vec_read WHERE v = '[1,2,3]'::FLOAT[3];
+----
+1
+
+query II
+SELECT q.id, q.v IS NOT DISTINCT FROM e.v FROM (SELECT id, v FROM vec.dbo.vec_read ORDER BY id DESC LIMIT 2) q JOIN vec_expected e USING (id) ORDER BY q.id;
+----
+3	true
+4	true
+
+# No WARNING: under the feature only the float16 column is text, and it is exact.
+query I
+SELECT count(*) FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%is a vector read from its JSON text%';
+----
+0
+
+# --- a raw scan: VECTORTYPE as FLOAT[n], the text as VARCHAR (the server's own)
+query TT
+SELECT typeof(v), typeof(h) FROM mssql_scan('vec', 'SELECT v, h FROM dbo.vec_read WHERE id = 1');
+----
+FLOAT[3]	VARCHAR
+
+query TT
+SELECT v::VARCHAR, h FROM mssql_scan('vec', 'SELECT v, h FROM dbo.vec_read WHERE id = 1');
+----
+[1.0, 2.0, 3.0]	[1.0000000e+000,2.0000000e+000,3.0000000e+000]
+
+query I
+SELECT count(*) FROM mssql_scan('vec', 'SELECT id, v FROM dbo.vec_read') r JOIN vec_expected e USING (id) WHERE r.v IS NOT DISTINCT FROM e.v;
+----
+4
+
+# --- without the feature (read at ATTACH): every vector is text, the catalog still FLOAT[n]
+statement ok
+SET mssql_vector_support = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS vecj (TYPE mssql);
+
+statement ok
+RESET mssql_vector_support;
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'vecj' AND table_name = 'vec_read' ORDER BY column_index;
+----
+id	INTEGER
+v	FLOAT[3]
+h	FLOAT[3]
+
+# Rows 1, 2 and 4 read exactly from the text (V2: their 8 digits name their floats); row 3's
+# -103.217316 prints as its neighbour's text too, so only its float16 column is compared.
+query I
+SELECT count(*) FROM vecj.dbo.vec_read r JOIN vec_expected e USING (id) WHERE id <> 3 AND r.v IS NOT DISTINCT FROM e.v AND r.h IS NOT DISTINCT FROM e.h;
+----
+3
+
+query II
+SELECT r.h IS NOT DISTINCT FROM e.h, r.v IS NOT NULL FROM vecj.dbo.vec_read r JOIN vec_expected e USING (id) WHERE id = 3;
+----
+true	true
+
+# The WARNING, once per column of the statement that read the text.
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE log_level = 'WARNING' AND message LIKE '%column "v" is a vector read from its JSON text%mssql_vector_support false%';
+----
+true
+
+query T
+SELECT typeof(v) FROM mssql_scan('vecj', 'SELECT v FROM dbo.vec_read WHERE id = 1');
+----
+VARCHAR
+
+statement ok
+DETACH vecj;
+
+statement ok
+SELECT mssql_exec('vec', 'DROP TABLE IF EXISTS dbo.vec_read; DROP TABLE IF EXISTS dbo.vec_big');
+
+statement ok
+DETACH vec;

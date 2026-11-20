@@ -47,6 +47,26 @@ struct ColumnMetadata {
 	// (0xFFFF for the spatial types, 892 for hierarchyid). Empty for every other type.
 	std::string udt_schema;
 	std::string udt_type_name;
+	//! COLMETADATA's UserType (4 bytes), kept since spec 093 T3: VECTOR_USER_TYPE marks a vector column
+	//! in every form it streams, the JSON text included (measured V1).
+	uint32_t user_type = 0;
+	//! A VECTORTYPE (0xF5) column's element type, VECTOR_ELEMENT_FLOAT32 / _FLOAT16; its dimensions are
+	//! (max_length - 8) / element size.
+	uint8_t vector_element_type = 0;
+
+	//! A vector column streamed as VECTORTYPE (spec 093 D4).
+	bool IsVectorWire() const {
+		return type_id == TDS_TYPE_VECTOR;
+	}
+	//! A vector column streamed as its JSON text: varchar(max) / nvarchar(max) carrying UserType 255 --
+	//! a float16 column under VECTORSUPPORT version 1, any vector on a session without the feature.
+	bool IsVectorText() const {
+		return user_type == VECTOR_USER_TYPE && (type_id == TDS_TYPE_BIGVARCHAR || type_id == TDS_TYPE_NVARCHAR);
+	}
+	//! The dimensions of a VECTORTYPE column (ParseTypeInfo checked them).
+	uint16_t VectorDimensions() const {
+		return static_cast<uint16_t>((max_length - VECTOR_HEADER_BYTES) / VectorElementBytes(vector_element_type));
+	}
 
 	//! A UDT column of the system CLR type hierarchyid (spec 093 T4: decoded on the client).
 	bool IsHierarchyIdUdt() const {

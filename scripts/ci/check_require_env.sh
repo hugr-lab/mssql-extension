@@ -54,7 +54,9 @@ cd "$(dirname "$0")/../.." || exit 1
 
 # Variables a developer or a workflow supplies deliberately, and whose absence is
 # meant to skip the file. Anything NOT here must be exported by the Makefile.
-OPT_IN='^(AZURE_|MSSQL_COUNTERS$|MSSQL_TEST_CLR$|MSSQL_KERBEROS_TEST$|MSSQL_WINSSPI_TEST$|MSSQL_NAMED_INSTANCE_HOST$)'
+# MSSQL_TEST_SQLSERVER_2025: the SQL Server 2025 job (ci.yml's integration-test-2025) sets it for
+# test/sql/types_2025, whose types 2022 does not have.
+OPT_IN='^(AZURE_|MSSQL_COUNTERS$|MSSQL_TEST_CLR$|MSSQL_KERBEROS_TEST$|MSSQL_WINSSPI_TEST$|MSSQL_NAMED_INSTANCE_HOST$|MSSQL_TEST_SQLSERVER_2025$)'
 
 # The OTHER lane that runs this suite. `make integration-test` is not what CI
 # uses; this is (.github/workflows/ci.yml, "Run integration tests").

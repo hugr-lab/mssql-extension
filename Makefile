@@ -724,6 +724,8 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/codec/test_code_page.cpp \
     test/cpp/codec/test_variant_envelope.cpp \
     test/cpp/codec/test_hierarchyid.cpp \
+    test/cpp/codec/test_vector_codec.cpp \
+    test/cpp/codec/test_vector_scatter.cpp \
     test/cpp/codec/test_variant_write.cpp
 
 STANDALONE_TEST_FLAGS := -std=c++17 -pthread -Wno-deprecated-declarations
@@ -1429,9 +1431,9 @@ fuzz-encode-replay: release
 # Linux leak-check lane replays the same corpora under ASan + LSan. The corpora are synthetic
 # (fuzz/gen_backup_seeds.cc): no backup of a server whose data is not ours (spec 085 T4).
 fuzz-backup-replay:
-	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_page_ci variant_envelope hierarchyid" \
+	REPLAY=1 SANITIZE=$(FUZZ_REPLAY_SANITIZE) TARGETS="backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_page_ci variant_envelope vector hierarchyid" \
 	    $(PROJ_DIR)fuzz/build.sh
-	@for t in backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_page_ci variant_envelope hierarchyid; do \
+	@for t in backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_page_ci variant_envelope vector hierarchyid; do \
 	    $(PROJ_DIR)fuzz/out/fuzz_$$t $(PROJ_DIR)fuzz/corpus/$$t || exit 1; \
 	done
 # Spec 085 acceptance 2 over the committed samples: mssql_backup_info against the golden RESTORE

@@ -77,6 +77,7 @@ enum class FeatureExtId : uint8_t {
 	DATACLASSIFICATION = 0x09,	// Data classification (not supported)
 	UTF8SUPPORT = 0x0A,			// UTF-8 collation support
 	AZURESQLDNSCACHING = 0x0B,	// Azure SQL DNS caching
+	VECTORSUPPORT = 0x0E,		// vector(n) as VECTORTYPE 0xF5 (MS-TDS 2.2.6.4; spec 093 D4)
 	TERMINATOR = 0xFF			// End of feature extensions
 };
 
@@ -187,6 +188,25 @@ constexpr uint8_t TDS_TYPE_SQL_VARIANT = 0x62;
 //! The longest sql_variant value: 8,000 bytes of value plus its header (MS-TDS 2.2.5.5.4; the
 //! TYPE_INFO maximum measured on 2022, spec 093 G2).
 constexpr uint16_t SQL_VARIANT_MAX_BYTES = 8009;
+//! VECTORTYPE (MS-TDS 2.2.5.5.7; spec 093 D4, measured V1): TYPE_INFO is a u16 max length and an element
+//! type byte (0 float32, 1 float16); a value is a u16 length (0xFFFF NULL) and exactly that many bytes,
+//! an 8-byte header (A9 01, the dimensions as a u16, the element type, three zero bytes) and the
+//! little-endian elements. Sent only on a session that acknowledged VECTORSUPPORT.
+constexpr uint8_t TDS_TYPE_VECTOR = 0xF5;
+//! The UserType COLMETADATA gives a vector column in every form it streams, 0xF5 and the JSON text
+//! alike, and sys.columns.user_type_id gives it (measured V1, V5).
+constexpr uint32_t VECTOR_USER_TYPE = 255;
+constexpr uint16_t VECTOR_HEADER_BYTES = 8;
+//! vector(n): 1 to 1998 dimensions (a float32 value then fills varbinary(8000)).
+constexpr uint16_t VECTOR_MAX_DIMENSIONS = 1998;
+constexpr uint8_t VECTOR_ELEMENT_FLOAT32 = 0;
+constexpr uint8_t VECTOR_ELEMENT_FLOAT16 = 1;
+//! The VECTORSUPPORT version requested: 2 (float32 and float16). SQL Server 2025 17.0.5035.5 answers 1
+//! to a request for 1, 2 or 3, and drops a login asking for 0 (measured V1).
+constexpr uint8_t VECTOR_SUPPORT_REQUESTED_VERSION = 2;
+inline uint16_t VectorElementBytes(uint8_t element_type) {
+	return element_type == VECTOR_ELEMENT_FLOAT16 ? 2 : 4;
+}
 constexpr uint8_t TDS_TYPE_IMAGE = 0x22;  // Deprecated
 constexpr uint8_t TDS_TYPE_TEXT = 0x23;	  // Deprecated
 constexpr uint8_t TDS_TYPE_NTEXT = 0x63;  // Deprecated

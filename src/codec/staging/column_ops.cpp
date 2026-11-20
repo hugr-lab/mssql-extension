@@ -242,6 +242,9 @@ AppendArm DirectArm(uint8_t type_id, uint32_t width) {
 //! how it finalizes: there is no `default`, and -Wswitch makes the omission a
 //! build failure rather than a column that silently publishes nothing.
 FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &column) {
+	if (ops.vector_kernel) {
+		return FinalizeKernel::Vector;
+	}
 	if (ops.needs_value_fallback) {
 		// Wins over the family: the bytes staged are the WIRE type's, and the
 		// output vector is a different type entirely (issue #89).
@@ -296,6 +299,22 @@ FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &co
 //! The arm/kind/stride half of the resolution; ResolveColumnOps adds the kernel.
 ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &target_type) {
 	ColumnOps ops;
+
+	// Spec 093 T3 (D4): a vector column into FLOAT[n], in whichever form the session streams it --
+	// VECTORTYPE, framed as a bounded varbinary, or the JSON text, a varchar(max) / nvarchar(max) PLP --
+	// so before the divergence test, which would take the text form for a VARCHAR and render it.
+	if (target_type.id() == LogicalTypeId::ARRAY && ArrayType::GetChildType(target_type).id() == LogicalTypeId::FLOAT &&
+		(column.IsVectorWire() || (column.IsVectorText() && column.IsPLPType()))) {
+		ops.kind = StagingKind::Var;
+		ops.vector_kernel = true;
+		if (column.IsVectorWire()) {
+			ops.arm = AppendArm::P2StageBinary;
+			ops.max_value_bytes = column.max_length;
+		} else {
+			ops.arm = AppendArm::PlpStageBinary;
+		}
+		return ops;
+	}
 
 	// Does the wire type agree with the vector being written into? A view with an
 	// inline CAST can make the catalog promise VARCHAR while TDS delivers
@@ -524,6 +543,8 @@ const char *FinalizeKernelName(FinalizeKernel kernel) {
 		return "variant";
 	case FinalizeKernel::HierarchyId:
 		return "hierarchyid";
+	case FinalizeKernel::Vector:
+		return "vector";
 	}
 	return "?";
 }

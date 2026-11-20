@@ -353,6 +353,27 @@ which S2 measured the server to take (`measured/S2.md`). A CTAS from a `VARIANT`
   that has the type (2025, Azure SQL), and refuses by name elsewhere. `DOUBLE[n]` is refused with the
   fix named (`::FLOAT[n]`) **(derived)**: a narrowing the user should write.
 - Filters on a vector are never pushed, and it is never a key (D2).
+- **As built (T3).** `codec/sql_vector` (`vector_bytes`, DuckDB-free and fuzzed by `fuzz_vector`;
+  `vector_codec`, the vectors). Where it departs from the text above:
+  - The statement path's literal is `N'[e1,...]'` (`%.9g`), not `CAST(N'[…]' AS vector(n))`. The
+    server converts a string to the column's own vector type, float16 included. A CAST would need
+    the element type, which an UPDATE's VALUES-join rows do not carry, and a `vector(n)` cast into a
+    float16 column is a conversion nobody measured. Accepted by the owner, 2026-11-20: the literal
+    stays until the RPC-parameter spec (#515) replaces it.
+  - The fallback's `WARNING` is said once per column per statement, as D8's is, not once per catalog:
+    the stream holds no catalog. It is said when a vector column was read into FLOAT[n] from its text
+    on a connection that was not granted VECTORSUPPORT. Under a grant only a float16 column is text,
+    and that text is exact. Accepted by the owner, 2026-11-20.
+  - A CTAS / COPY into a server without the type is refused by the server itself (Msg 2715, "Cannot
+    find data type vector"); no version check runs on the client. Accepted by the owner, 2026-11-20.
+  - The remote-pushdown writer vetoes a vector column in a pushed result. A pushed statement's types
+    are fixed before it runs, and a vector's wire form follows the session (V3: varchar(max) for
+    float16). A pushed INSERT ... SELECT, which copies its columns as written, is not vetoed.
+  - The JSON text may also arrive as nvarchar(max), on a session without UTF8SUPPORT; it is parsed
+    from UTF-16 then.
+  - A staged MERGE stages every value assigned to a vector column as that column (like-target), not
+    CTAS-typed from FLOAT[n]: a float32 vector(n) in #src is not assigned to a float16 column (42238,
+    measured on 2025).
 
 ### D5: `hierarchyid`
 

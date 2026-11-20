@@ -574,7 +574,6 @@ void TestLogin7SspiFragmentation() {
 	}
 }
 
-
 //===----------------------------------------------------------------------===//
 // [9] UTF8_SUPPORT feature extension across every LOGIN7 builder (issue #225)
 //
@@ -730,6 +729,74 @@ void TestUtf8SupportFeatureExtension() {
 		"BuildLogin7WithSSPI non-ASCII db", true, /*expect_fedauth=*/false);
 }
 
+//===----------------------------------------------------------------------===//
+// [10] VECTORSUPPORT feature extension (spec 093 D4): `0E 01000000 <version>` (measured V1), on every
+// builder, with and without UTF8SUPPORT beside it; the acknowledgement's version read back.
+//===----------------------------------------------------------------------===//
+
+void CheckVectorFeature(const TdsPacket &packet, const char *builder, bool utf8, bool expect_fedauth) {
+	const auto &rec = packet.GetPayload();
+	const std::string label = std::string(builder) + (utf8 ? " [utf8+vector]" : " [vector]");
+	CHECK_EQ(static_cast<size_t>(ReadU32LE(rec.data())), rec.size(), label + ": declared Length == bytes produced");
+	CHECK_TRUE((rec[LOGIN7_OFF_OPTIONFLAGS3] & 0x10) != 0, label + ": OptionFlags3 fExtension set");
+	std::vector<ParsedFeature> features;
+	std::string why;
+	CHECK_TRUE(WalkFeatureExt(rec, features, why), label + ": an extension block is present " + why);
+	bool has_vector = false;
+	bool has_utf8 = false;
+	bool has_fedauth = false;
+	for (const auto &f : features) {
+		if (f.id == static_cast<uint8_t>(FeatureExtId::VECTORSUPPORT)) {
+			has_vector = true;
+			CHECK_EQ(f.data.size(), static_cast<size_t>(1), label + ": VECTORSUPPORT carries one byte");
+			CHECK_EQ(static_cast<int>(f.data.empty() ? 0 : f.data[0]),
+					 static_cast<int>(VECTOR_SUPPORT_REQUESTED_VERSION), label + ": the version requested");
+		} else if (f.id == static_cast<uint8_t>(FeatureExtId::UTF8SUPPORT)) {
+			has_utf8 = true;
+		} else if (f.id == static_cast<uint8_t>(FeatureExtId::FEDAUTH)) {
+			has_fedauth = true;
+		}
+	}
+	CHECK_TRUE(has_vector, label + ": VECTORSUPPORT requested");
+	CHECK_EQ(has_utf8, utf8, label + ": UTF8SUPPORT as asked");
+	CHECK_EQ(has_fedauth, expect_fedauth, label + ": FEDAUTH presence unchanged");
+	if (expect_fedauth && !features.empty()) {
+		CHECK_EQ(static_cast<int>(features.front().id), static_cast<int>(FeatureExtId::FEDAUTH),
+				 label + ": FEDAUTH still leads the list");
+	}
+}
+
+void TestVectorSupportFeatureExtension() {
+	std::cout << "[10] VECTORSUPPORT feature extension per builder (spec 093 D4)..." << std::endl;
+	const std::string host = "client-host";
+	const std::string server = "sql.example.com";
+	const std::string db = "TestDB";
+	const std::string app = "DuckDB MSSQL Extension";
+	const std::vector<uint8_t> token(64, 0xAB);
+	const std::vector<uint8_t> blob(96, 0x5A);
+	for (bool utf8 : {true, false}) {
+		const Login7Features features(utf8, VECTOR_SUPPORT_REQUESTED_VERSION);
+		CheckVectorFeature(TdsProtocol::BuildLogin7(host, "sa", "pw", db, app, TDS_DEFAULT_PACKET_SIZE, features),
+						   "BuildLogin7", utf8, false);
+		CheckVectorFeature(
+			TdsProtocol::BuildLogin7WithSSPI(host, server, db, blob, app, TDS_DEFAULT_PACKET_SIZE, features),
+			"BuildLogin7WithSSPI", utf8, false);
+		CheckVectorFeature(
+			TdsProtocol::BuildLogin7WithFedAuth(host, server, db, token, false, app, TDS_DEFAULT_PACKET_SIZE, features),
+			"BuildLogin7WithFedAuth", utf8, true);
+		CheckVectorFeature(
+			TdsProtocol::BuildLogin7WithADAL(host, server, db, false, app, TDS_DEFAULT_PACKET_SIZE, features),
+			"BuildLogin7WithADAL", utf8, true);
+	}
+	// The acknowledgement: FEATUREEXTACK (0xAE), 0E 01000000 01 -- what SQL Server 2025 answers (V1).
+	const std::vector<uint8_t> ack = {0xAE, 0x0E, 0x01, 0x00, 0x00, 0x00, 0x01, 0xFF};
+	CHECK_EQ(static_cast<int>(TdsProtocol::ParseLoginResponse(ack).vector_support_version), 1,
+			 "FEATUREEXTACK: VECTORSUPPORT version 1 read");
+	const std::vector<uint8_t> none = {0xAE, 0x0A, 0x01, 0x00, 0x00, 0x00, 0x01, 0xFF};
+	CHECK_EQ(static_cast<int>(TdsProtocol::ParseLoginResponse(none).vector_support_version), 0,
+			 "FEATUREEXTACK without VECTORSUPPORT: version 0");
+}
+
 int main() {
 	std::cout << "============================================================" << std::endl;
 	std::cout << "LOGIN7 non-ASCII fix + simdutf wrapper unit tests (spec 043)" << std::endl;
@@ -746,6 +813,7 @@ int main() {
 		TestUtf16DecodeReplacement();
 		TestLogin7SspiFragmentation();
 		TestUtf8SupportFeatureExtension();
+		TestVectorSupportFeatureExtension();
 	} catch (const std::exception &e) {
 		std::cerr << "UNCAUGHT EXCEPTION: " << e.what() << std::endl;
 		return 2;

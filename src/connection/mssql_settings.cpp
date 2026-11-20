@@ -145,6 +145,18 @@ void RegisterMSSQLSettings(ExtensionLoader &loader) {
 							  "UTF-8 instead of UTF-16 (default: true)",
 							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 
+	// mssql_vector_support - ask for VECTORSUPPORT (0x0E, version 2) in LOGIN7 (spec 093 D4). Granted (SQL
+	// Server 2025 grants version 1, measured V1), a float32 vector(n) streams its bytes (VECTORTYPE 0xF5);
+	// a float16 one, and every vector on a session without the feature, arrive as their JSON text, which
+	// the catalog parses -- inexact for float32 (8 significant digits, about 1.5 % of values one ulp off,
+	// V2). Read once per catalog at ATTACH, so the logins of one catalog's pool ask alike and its describe
+	// and its stream agree (V3). Requesting it is safe on any server: one without the feature omits the
+	// acknowledgement. This exists to turn the request OFF, as mssql_utf8_support does.
+	config.AddExtensionOption("mssql_vector_support",
+							  "Ask for the VECTORSUPPORT feature in LOGIN7 so a float32 vector(n) column streams its "
+							  "bytes instead of its JSON text (read at ATTACH; default: true)",
+							  LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+
 	// mssql_warn_non_utf8_collation - the off switch for the issue #224 warning.
 	// Narrowed by spec 092 D9 to the two cases in which code-page bytes still reach
 	// a DuckDB VARCHAR verbatim: a catalog with client_transcode false, and a
@@ -711,6 +723,10 @@ MSSQLPoolConfig LoadPoolConfig(ClientContext &context) {
 
 	if (context.TryGetCurrentSetting("mssql_utf8_support", val)) {
 		config.utf8_support = val.GetValue<bool>();
+	}
+
+	if (context.TryGetCurrentSetting("mssql_vector_support", val)) {
+		config.vector_support = val.GetValue<bool>();
 	}
 
 	return config;

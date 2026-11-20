@@ -78,6 +78,8 @@ std::string ColumnMetadata::GetTypeName() const {
 		return "UDT";
 	case TDS_TYPE_SQL_VARIANT:
 		return "SQL_VARIANT";
+	case TDS_TYPE_VECTOR:
+		return "VECTOR";
 	case TDS_TYPE_IMAGE:
 		return "IMAGE";
 	case TDS_TYPE_TEXT:
@@ -225,7 +227,9 @@ bool ColumnMetadataParser::ParseColumn(const uint8_t *data, size_t length, size_
 		return false;
 	}
 
-	// Skip UserType (4 bytes, legacy)
+	// UserType (4 bytes): 255 marks a vector column in every form it streams (spec 093 T3).
+	column.user_type = static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8) |
+					   (static_cast<uint32_t>(data[2]) << 16) | (static_cast<uint32_t>(data[3]) << 24);
 	local_offset += 4;
 
 	// Need 2 more bytes for flags
@@ -432,6 +436,31 @@ bool ColumnMetadataParser::ParseTypeInfo(const uint8_t *data, size_t length, siz
 								  (static_cast<uint32_t>(data[offset + 3]) << 24);
 		offset += 4;
 		column.max_length = static_cast<uint16_t>(declared < SQL_VARIANT_MAX_BYTES ? declared : SQL_VARIANT_MAX_BYTES);
+		break;
+	}
+
+	// VECTORTYPE (spec 093 D4, measured V1): a u16 max length -- 8 + dimensions x element size -- and the
+	// element type. Checked once here, as the temporal scale is: the read divides by the element size
+	// and sizes the output's arrays by the dimensions.
+	case TDS_TYPE_VECTOR: {
+		if (offset + 3 > length)
+			return false;
+		column.max_length = static_cast<uint16_t>(data[offset]) | (static_cast<uint16_t>(data[offset + 1]) << 8);
+		column.vector_element_type = data[offset + 2];
+		offset += 3;
+		if (column.vector_element_type != VECTOR_ELEMENT_FLOAT32 &&
+			column.vector_element_type != VECTOR_ELEMENT_FLOAT16) {
+			throw std::runtime_error("a vector column declares element type " +
+									 std::to_string(column.vector_element_type) +
+									 " (0 float32, 1 float16). The TDS stream is malformed.");
+		}
+		const uint16_t element = VectorElementBytes(column.vector_element_type);
+		if (column.max_length <= VECTOR_HEADER_BYTES || (column.max_length - VECTOR_HEADER_BYTES) % element != 0 ||
+			(column.max_length - VECTOR_HEADER_BYTES) / element > VECTOR_MAX_DIMENSIONS) {
+			throw std::runtime_error("a vector column declares a maximum length of " +
+									 std::to_string(column.max_length) +
+									 " bytes, which no vector(1..1998) has. The TDS stream is malformed.");
+		}
 		break;
 	}
 

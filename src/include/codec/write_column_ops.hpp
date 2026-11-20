@@ -92,6 +92,10 @@ enum class ScatterArm : uint8_t {
 	//! constant-stride path; it is planned per column first (string::PlanColumn)
 	//! and then written with the cursor.
 	VarString,
+	//! A vector(n) target from a FLOAT[n] source (spec 093 T3): a u16 length and the value's bytes, header
+	//! and elements -- one width for every non-NULL row (`wire_width`, the bytes after the length), so it
+	//! takes the strided path when the chunk has no NULL and the cursor otherwise; 0xFFFF for a NULL.
+	Vector,
 	//! Resolvable, but not by a scatter. Distinct from Unsupported: this pair IS
 	//! encodable, just not columnar, so it must not be read as an
 	//! incompatibility.

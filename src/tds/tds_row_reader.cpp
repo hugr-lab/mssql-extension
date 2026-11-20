@@ -86,6 +86,7 @@ SkipDesc ResolveSkipForm(const ColumnMetadata &col) {
 	case TDS_TYPE_NVARCHAR:
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY:
+	case TDS_TYPE_VECTOR:  // spec 093 D4: u16 length, 0xFFFF NULL
 		// PLP (MAX) framing is a chunk list, not a prefix — legacy code owns it.
 		return col.IsPLPType() ? SkipDesc{SkipForm::SLOW, 0} : SkipDesc{SkipForm::PREFIX2, 0};
 	default:
@@ -330,7 +331,8 @@ size_t RowReader::SkipValue(const uint8_t *data, size_t length, size_t col_idx) 
 	case TDS_TYPE_NCHAR:
 	case TDS_TYPE_NVARCHAR:
 	case TDS_TYPE_BIGBINARY:
-	case TDS_TYPE_BIGVARBINARY: {
+	case TDS_TYPE_BIGVARBINARY:
+	case TDS_TYPE_VECTOR: {	 // spec 093 D4: u16 length, 0xFFFF NULL
 		// Check for MAX types (PLP encoding)
 		if (col.IsPLPType()) {
 			return SkipPLPType(data, length);
@@ -392,6 +394,7 @@ size_t RowReader::ReadValue(const uint8_t *data, size_t length, size_t col_idx, 
 	case TDS_TYPE_NVARCHAR:
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY:
+	case TDS_TYPE_VECTOR:  // spec 093 D4: u16 length, 0xFFFF NULL
 		// Check for MAX types (PLP encoding)
 		if (col.IsPLPType()) {
 			return ReadPLPType(data, length, value, is_null);
@@ -898,6 +901,7 @@ size_t RowReader::ReadValueNBC(const uint8_t *data, size_t length, size_t col_id
 	case TDS_TYPE_NVARCHAR:
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY:
+	case TDS_TYPE_VECTOR:  // spec 093 D4: u16 length, 0xFFFF NULL
 		// Check for MAX types (PLP encoding)
 		if (col.IsPLPType()) {
 			return ReadPLPType(data, length, value, is_null);
@@ -1057,7 +1061,8 @@ size_t RowReader::SkipValueNBC(const uint8_t *data, size_t length, size_t col_id
 	case TDS_TYPE_NCHAR:
 	case TDS_TYPE_NVARCHAR:
 	case TDS_TYPE_BIGBINARY:
-	case TDS_TYPE_BIGVARBINARY: {
+	case TDS_TYPE_BIGVARBINARY:
+	case TDS_TYPE_VECTOR: {	 // spec 093 D4: u16 length, 0xFFFF NULL
 		// Check for MAX types (PLP encoding)
 		if (col.IsPLPType()) {
 			return SkipPLPType(data, length);
