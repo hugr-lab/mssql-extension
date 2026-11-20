@@ -34,6 +34,9 @@ public:
 			return;	 // LastLSN is the next record after the backup's (HEADERONLY): not the backup's
 		}
 		summary_.records++;
+		if (r.op == log_op::FORMAT_PAGE && r.has_page) {
+			summary_.formatted.insert(static_cast<uint64_t>(r.file) << 32 | r.page);
+		}
 		FuzzySummary::Transaction *t = nullptr;
 		if (r.transaction != 0) {
 			t = &summary_.transactions[r.transaction];

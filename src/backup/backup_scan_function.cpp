@@ -761,8 +761,24 @@ bool NextPage(ClientContext &context, const ScanBindData &data, ScanLocalState &
 		}
 		const PagePointer at = (*local.cursor->pages)[local.next_page++];
 		try {
-			if (!ReadUnitDataPage(store, *local.cursor->unit, at, data.schema + "." + data.table, local.page)) {
-				continue;
+			try {
+				if (!ReadUnitDataPage(store, *local.cursor->unit, at, data.schema + "." + data.table, local.page)) {
+					continue;
+				}
+			} catch (ZeroCopyError &e) {
+				// A zero unit beside one data pass (2017): Pending when the tail formats the page.
+				const FuzzySummary *tail = nullptr;
+				try {
+					tail = &StatementTail(context, data.catalog->opened);
+				} catch (FormatError &) {
+				}
+				if (!tail || !tail->formatted.count(static_cast<uint64_t>(e.page.file) << 32 | e.page.page)) {
+					throw;
+				}
+				throw PendingPageError("backup: page " + e.page.ToString() +
+									   " became live while the backup ran: its content is in the backup's log tail "
+									   "only (a fuzzy backup), which is not replayed yet (a zero copy in a backup of "
+									   "one data pass, the page formatted in its tail)");
 			}
 		} catch (PendingPageError &e) {
 			// A page that became live while the backup ran: its rows are in the log tail only (spec 090

@@ -129,8 +129,13 @@ PageState PageStore::Fetch(uint16_t file, uint32_t page, Page &out) const {
 		return PageState::Pending;
 	}
 	if (out.header.version != PAGE_HEADER_VERSION) {
-		throw FormatError("backup: page " + want.ToString() + " is live, and its copy is not a page (header version " +
-						  std::to_string(out.header.version) + "; " + DescribeCopy(index_, out) + ")");
+		const std::string message = "backup: page " + want.ToString() +
+									" is live, and its copy is not a page (header version " +
+									std::to_string(out.header.version) + "; " + DescribeCopy(index_, out) + ")";
+		if (std::all_of(out.bytes.begin(), out.bytes.end(), [](uint8_t b) { return b == 0; })) {
+			throw ZeroCopyError(message, want);
+		}
+		throw FormatError(message);
 	}
 	if (out.header.type == PAGE_TYPE_PAD) {
 		// A pad is never read further (spec 085 § Rules, page index), whatever page it names.

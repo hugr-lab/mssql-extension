@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "backup/backup_bytes.hpp"
+#include "backup/backup_fuzzy.hpp"
 #include "backup/backup_log_tail.hpp"
 #include "backup/backup_mtf.hpp"
 
@@ -216,6 +217,30 @@ int main() {
 		auto e = Block(1, 600);
 		Check(ErrorOf([&] { ParseLogBlock(e.data(), e.size(), 72, "test", keep); }).find("runs past") != std::string::npos,
 			  "a record's fixed part past the records");
+	}
+	std::cout << "the pages the tail formats (a zero copy in a one-pass backup: Pending)" << std::endl;
+	{
+		auto record = [](uint32_t block, uint16_t slot, uint8_t op, uint32_t page) {
+			LogRecord r;
+			r.lsn.vlf = 1;
+			r.lsn.block = block;
+			r.lsn.slot = slot;
+			r.op = op;
+			r.has_page = true;
+			r.file = 1;
+			r.page = page;
+			return r;
+		};
+		Lsn first, last, checkpoint;
+		first.vlf = last.vlf = checkpoint.vlf = 1;
+		first.block = checkpoint.block = 1;
+		last.block = 9;
+		const std::vector<LogRecord> records = {record(2, 1, log_op::FORMAT_PAGE, 44586),
+												record(3, 1, log_op::INSERT_ROWS, 44586),
+												record(9, 2, log_op::FORMAT_PAGE, 50000)};	// past LastLSN
+		const FuzzySummary summary = SummarizeLogRecords(records, first, last, checkpoint);
+		Check(summary.formatted.count(uint64_t(1) << 32 | 44586) == 1 && summary.formatted.size() == 1,
+			  "a FORMAT_PAGE before LastLSN names its page; one past it, none");
 	}
 	std::cout << (failures ? "FAILED" : "all passed") << std::endl;
 	return failures ? 1 : 0;
