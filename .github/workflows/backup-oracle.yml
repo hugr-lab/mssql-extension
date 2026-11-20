@@ -391,6 +391,9 @@ jobs:
           # The full + differential pairs of overlays.txt (spec 085 PR 4c), and the differentials they read.
           OVERLAYS: diffs_over diffs_over_xpress
           OVERLAY_SETS: diffs_diff diffs_diff_xpress
+          # The backups taken under load that compare_rows.sh compares with --fuzzy (its FUZZY and
+          # FUZZY_OVERLAYS defaults: spec 085 PR 5), and fuzzy_over's two sets.
+          FUZZY_SETS: fuzzy_full fuzzy_xpress load_full load_xpress fuzzy_base fuzzy_diff
         run: |
           export AWS_ACCESS_KEY_ID="${MSSQL_R2_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${MSSQL_R2_ACCESS_SECRET_KEY}" \
                  AWS_DEFAULT_REGION=auto AWS_ENDPOINT_URL="${MSSQL_R2_URL%/}"
@@ -400,7 +403,7 @@ jobs:
           dir="${RUNNER_TEMP}/rows"
           mkdir -p "${dir}"
           include=(--exclude '*' --include sets.txt --include overlays.txt)
-          for s in ${QUIET} ${OVERLAY_SETS}; do include+=(--include "${s}.bak" --include "${s}.filelistonly.txt"); done
+          for s in ${QUIET} ${OVERLAY_SETS} ${FUZZY_SETS}; do include+=(--include "${s}.bak" --include "${s}.filelistonly.txt"); done
           aws s3 cp --recursive --only-show-errors "${include[@]}" "${prefix}/${run}/" "${dir}/"
           VERSION=${{ matrix.version }} DUCKDB=cli/duckdb test/backup/compare_rows.sh "${dir}"
 
