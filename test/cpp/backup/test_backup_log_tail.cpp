@@ -42,7 +42,7 @@ std::vector<LogRecord> RecordsOf(const std::string &name) {
 	const auto bytes = ReadAll(DIR + name);
 	MemoryAccess file(name, bytes.data(), bytes.size());
 	const auto layout = WalkMtf(file);
-	LogTailReader tail(file, layout);
+	LogTailReader tail(file, layout, LogBlockHeaderBytes(16));
 	std::vector<LogRecord> records;
 	tail.ForEach([&](const LogRecord &r) { records.push_back(r); });
 	return records;
@@ -63,8 +63,9 @@ std::string ErrorOf(const std::function<void()> &f) {
 	return "";
 }
 
-//! A 512-byte log block holding `records` empty records of fixed length `fixed` after the header.
-std::vector<uint8_t> Block(uint16_t records, uint16_t fixed) {
+//! A 512-byte log block holding `records` empty records of fixed length `fixed` after its header of
+//! `header` bytes.
+std::vector<uint8_t> Block(uint16_t records, uint16_t fixed, uint16_t header = 72) {
 	std::vector<uint8_t> b(512, 0);
 	auto put16 = [&](size_t at, uint16_t v) {
 		b[at] = static_cast<uint8_t>(v);
@@ -75,7 +76,7 @@ std::vector<uint8_t> Block(uint16_t records, uint16_t fixed) {
 	put16(4, slot_end);
 	put16(6, 512);
 	for (uint16_t i = 0; i < records; i++) {
-		const uint16_t at = static_cast<uint16_t>(72 + i * 64);
+		const uint16_t at = static_cast<uint16_t>(header + i * 64);
 		put16(slot_end - 2 * (i + 1), at);
 		put16(at + 2, fixed);
 		b[at + 22] = log_op::INSERT_ROWS;
@@ -128,7 +129,7 @@ int main() {
 		const auto bytes = ReadAll(DIR + "log.trn");
 		MemoryAccess file("log.trn", bytes.data(), bytes.size());
 		const auto layout = WalkMtf(file);
-		LogTailReader tail(file, layout);
+		LogTailReader tail(file, layout, LogBlockHeaderBytes(16));
 		LogTailCursor cursor(tail);
 		LogRecord r;
 		while (cursor.Next(r)) {
@@ -188,23 +189,32 @@ int main() {
 		std::vector<LogRecord> got;
 		auto keep = [&](const LogRecord &r) { got.push_back(r); };
 		auto b = Block(2, 48);
-		ParseLogBlock(b.data(), b.size(), "test", keep);
+		ParseLogBlock(b.data(), b.size(), 72, "test", keep);
 		Check(got.size() == 2 && got[0].lsn.slot == 1 && got[1].lsn.slot == 2 && got[0].has_allocation_unit,
 			  "a well-formed block: its records, slots 1 and 2");
-		Check(ErrorOf([&] { ParseLogBlock(b.data(), 500, "test", keep); }).find("multiple of 512") != std::string::npos,
+		Check(ErrorOf([&] { ParseLogBlock(b.data(), 500, 72, "test", keep); }).find("multiple of 512") != std::string::npos,
 			  "a size that is no multiple of 512");
 		auto c = b;
 		c[4] = 0x10;
 		c[5] = 0x02;  // the slot array's end: 528, past the 512-byte block
-		Check(ErrorOf([&] { ParseLogBlock(c.data(), c.size(), "test", keep); }).find("slot array") != std::string::npos,
+		Check(ErrorOf([&] { ParseLogBlock(c.data(), c.size(), 72, "test", keep); }).find("slot array") != std::string::npos,
 			  "a slot array past the block");
 		auto d = b;
 		d[498] = 0x10;	// the first record's offset: 16, inside the header
 		d[499] = 0x00;
-		Check(ErrorOf([&] { ParseLogBlock(d.data(), d.size(), "test", keep); }).find("outside") != std::string::npos,
+		Check(ErrorOf([&] { ParseLogBlock(d.data(), d.size(), 72, "test", keep); }).find("outside") != std::string::npos,
 			  "a record offset inside the header");
+		// SQL Server 2017's blocks: a header of 48 bytes, records from there on (the oracle lane's 2017 backups).
+		Check(LogBlockHeaderBytes(14) == 48 && LogBlockHeaderBytes(15) == 72 && LogBlockHeaderBytes(17) == 72,
+			  "a block header of 48 bytes before SQL Server 2019 (15), 72 from it on");
+		auto old = Block(2, 48, 48);
+		got.clear();
+		ParseLogBlock(old.data(), old.size(), 48, "test", keep);
+		Check(got.size() == 2, "a 2017 block: its records from 48");
+		Check(ErrorOf([&] { ParseLogBlock(old.data(), old.size(), 72, "test", keep); }).find("outside") != std::string::npos,
+			  "the same block read as a 2019 one: its first record inside the header");
 		auto e = Block(1, 600);
-		Check(ErrorOf([&] { ParseLogBlock(e.data(), e.size(), "test", keep); }).find("runs past") != std::string::npos,
+		Check(ErrorOf([&] { ParseLogBlock(e.data(), e.size(), 72, "test", keep); }).find("runs past") != std::string::npos,
 			  "a record's fixed part past the records");
 	}
 	std::cout << (failures ? "FAILED" : "all passed") << std::endl;

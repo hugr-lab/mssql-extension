@@ -14,8 +14,10 @@ namespace backup {
 namespace {
 
 //! A log block's header: u16 record count @2, u16 end of the slot array @4, u16 size @6, u32 VLF
-//! sequence @12, u32 block id @16; its first record at 72 (E3§6).
-constexpr size_t BLOCK_HEADER = 72;
+//! sequence @12, u32 block id @16; its first record at 72 (E3§6), at 48 on SQL Server 2017
+//! (LogBlockHeaderBytes).
+constexpr size_t LONGEST_BLOCK_HEADER = 72;
+constexpr size_t SHORTEST_BLOCK_HEADER = 48;
 constexpr size_t SECTOR = 512;
 //! A record's header up to its page and slot (@24 .. @31), and up to its allocation unit's high part (@46).
 constexpr size_t RECORD_WITH_PAGE = 32;
@@ -77,14 +79,20 @@ void RestoreSectorParity(uint8_t *block, size_t size) {
 	}
 }
 
-void ParseLogBlock(const uint8_t *block, size_t size, const std::string &where,
+size_t LogBlockHeaderBytes(uint8_t software_major) {
+	// SQL Server 2017 (major 14) and before: records from 48 on (measured in the oracle lane: record 1 of
+	// every block of a 2017 backup at 48, where 2019's and later are at 72).
+	return software_major != 0 && software_major < 15 ? SHORTEST_BLOCK_HEADER : LONGEST_BLOCK_HEADER;
+}
+
+void ParseLogBlock(const uint8_t *block, size_t size, size_t header_bytes, const std::string &where,
 				   const std::function<void(const LogRecord &)> &visit) {
-	if (size < BLOCK_HEADER || size % SECTOR) {
+	if (size < header_bytes || size % SECTOR) {
 		throw FormatError(where + ": a log block of " + std::to_string(size) + " bytes (a multiple of 512 expected)");
 	}
 	const uint16_t count = U16(block + 2);
 	const uint16_t slot_end = U16(block + 4);
-	if (slot_end > size || slot_end < BLOCK_HEADER + 2u * count) {
+	if (slot_end > size || slot_end < header_bytes + 2u * count) {
 		throw FormatError(where + ": a log block whose slot array ends at " + std::to_string(slot_end) + " for " +
 						  std::to_string(count) + " records in " + std::to_string(size) + " bytes");
 	}
@@ -103,9 +111,9 @@ void ParseLogBlock(const uint8_t *block, size_t size, const std::string &where,
 		// The slot array runs backwards from its end: the first record's offset is its last entry.
 		const size_t at = U16(block + slot_end - 2u * (i + 1u));
 		const std::string record_where = where + ", record " + std::to_string(i + 1u);
-		if (at < BLOCK_HEADER || at + 4 > records_end) {
+		if (at < header_bytes || at + 4 > records_end) {
 			throw FormatError(record_where + " at " + std::to_string(at) + ": outside the block's records (" +
-							  std::to_string(BLOCK_HEADER) + " .. " + std::to_string(records_end) + ")");
+							  std::to_string(header_bytes) + " .. " + std::to_string(records_end) + ")");
 		}
 		const uint16_t fixed = U16(block + at + 2);
 		const size_t header = std::max<size_t>(fixed, 24);
@@ -139,7 +147,8 @@ void ParseLogBlock(const uint8_t *block, size_t size, const std::string &where,
 	}
 }
 
-LogTailReader::LogTailReader(const RandomAccess &stream, const MtfLayout &layout) : stream_(stream) {
+LogTailReader::LogTailReader(const RandomAccess &stream, const MtfLayout &layout, size_t block_header)
+	: stream_(stream), block_header_(block_header) {
 	for (const auto &block : layout.blocks) {
 		for (const auto &s : block.streams) {
 			if (s.id != "MQTL" || s.length <= 2) {
@@ -192,7 +201,7 @@ bool LogTailCursor::NextBlock() {
 	const auto &stream = tail_.stream_;
 	while (span_ < tail_.spans_.size()) {
 		const auto &span = tail_.spans_[span_];
-		if (span_ended_ || at_ + in_ + BLOCK_HEADER > span.length) {
+		if (span_ended_ || at_ + in_ + tail_.block_header_ > span.length) {
 			span_++;
 			at_ = 0;
 			in_ = 0;
@@ -200,14 +209,14 @@ bool LogTailCursor::NextBlock() {
 			span_ended_ = false;
 			continue;
 		}
-		if (in_ + BLOCK_HEADER > chunk_.size()) {
+		if (in_ + tail_.block_header_ > chunk_.size()) {
 			// A chunk from the next block on: whole blocks are parsed from it.
 			at_ += in_;
 			in_ = 0;
 			const size_t take = static_cast<size_t>(std::min<uint64_t>(CHUNK, span.length - at_));
 			chunk_.resize(take);
 			stream.ReadAt(span.offset + at_, chunk_.data(), take);
-			if (take < BLOCK_HEADER) {
+			if (take < tail_.block_header_) {
 				span_ended_ = true;
 				continue;
 			}
@@ -217,7 +226,7 @@ bool LogTailCursor::NextBlock() {
 		const std::string where =
 			"backup file \"" + stream.Name() + "\", the log block at " + std::to_string(span.offset + at_ + in_);
 		if (size == 0) {
-			if (!AllZero(head, BLOCK_HEADER)) {
+			if (!AllZero(head, tail_.block_header_)) {
 				throw FormatError(where + ": a block of size 0");
 			}
 			span_ended_ = true;	 // the stream's unused end
@@ -243,7 +252,8 @@ bool LogTailCursor::NextBlock() {
 		}
 		records_.clear();
 		next_ = 0;
-		ParseLogBlock(block_.data(), size, where, [&](const LogRecord &r) { records_.push_back(r); });
+		ParseLogBlock(block_.data(), size, tail_.block_header_, where,
+					  [&](const LogRecord &r) { records_.push_back(r); });
 		if (!records_.empty()) {
 			return true;
 		}

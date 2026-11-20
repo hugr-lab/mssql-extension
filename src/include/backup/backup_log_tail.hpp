@@ -119,7 +119,8 @@ private:
 //! order, as one sequence of log blocks. `stream` and `layout` are kept by reference.
 class LogTailReader {
 public:
-	LogTailReader(const RandomAccess &stream, const MtfLayout &layout);
+	//! `block_header`: its blocks' header size, LogBlockHeaderBytes of the backup's SQL Server version.
+	LogTailReader(const RandomAccess &stream, const MtfLayout &layout, size_t block_header);
 
 	//! The tail's bytes.
 	uint64_t Bytes() const {
@@ -138,6 +139,7 @@ private:
 		uint64_t length;
 	};
 	const RandomAccess &stream_;
+	size_t block_header_;
 	std::vector<Span> spans_;
 	uint64_t bytes_ = 0;
 };
@@ -145,8 +147,11 @@ private:
 //! The records of one log block of `size` bytes at `block` (sector parity already put back), each
 //! given to `visit`; `where` names the block in a FormatError. What ForEach does per block: the
 //! fuzz harness's entry point.
-void ParseLogBlock(const uint8_t *block, size_t size, const std::string &where,
+void ParseLogBlock(const uint8_t *block, size_t size, size_t header_bytes, const std::string &where,
 				   const std::function<void(const LogRecord &)> &visit);
+//! The size of a log block's header in a backup SQL Server `software_major` wrote (SSET): 72 bytes, the
+//! first record after it (E3§6), from SQL Server 2019 (15) on; 48 on 2017 (14) and before.
+size_t LogBlockHeaderBytes(uint8_t software_major);
 
 //! Puts back the first byte of every 512-byte sector after the first, which the log overwrites with
 //! its parity byte and keeps at `block[size - 1 - k]` (E3§6: 1.6 % of records misparsed without it).

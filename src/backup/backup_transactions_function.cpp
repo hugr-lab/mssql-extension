@@ -427,7 +427,8 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 		state->tail = &StatementTail(context, state->catalog ? state->catalog->opened : state->opened);
 		if (data.records) {
 			const auto &family = *state->headers->families.front();
-			state->reader.reset(new LogTailReader(family.Stream(), family.layout));
+			state->reader.reset(new LogTailReader(family.Stream(), family.layout,
+												  LogBlockHeaderBytes(state->headers->Set().software_major)));
 			state->cursor.reset(new LogTailCursor(*state->reader));
 			return std::move(state);
 		}

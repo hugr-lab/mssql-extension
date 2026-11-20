@@ -474,7 +474,7 @@ const FuzzySummary &OpenedBackup::Fuzzy(ClientContext &context, bool *built) con
 		const auto &family = *headers_->families.front();
 		const auto &set = headers_->Set();
 		try {
-			LogTailReader tail(family.Stream(), family.layout);
+			LogTailReader tail(family.Stream(), family.layout, LogBlockHeaderBytes(set.software_major));
 			summary.reset(new FuzzySummary(SummarizeLogTail(tail, set.first_lsn, set.last_lsn, set.checkpoint_lsn)));
 		} catch (FormatError &e) {
 			throw FormatError("backup file \"" + headers_->Path(family.file) + "\": its log tail: " + WithoutPrefix(e));

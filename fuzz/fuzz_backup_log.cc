@@ -39,7 +39,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 		std::vector<uint8_t> block(data, data + block_size);
 		RestoreSectorParity(block.data(), block.size());
 		try {
-			ParseLogBlock(block.data(), block.size(), "fuzz", Visit);
+			ParseLogBlock(block.data(), block.size(), (data[0] & 1) ? 48 : 72, "fuzz", Visit);
 		} catch (FormatError &) {
 		}
 	}
@@ -56,7 +56,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 		mtf.streams.push_back(stream);
 		layout.blocks.push_back(mtf);
 		try {
-			LogTailReader tail(file, layout);
+			LogTailReader tail(file, layout, LogBlockHeaderBytes(15));
 			LogTailCursor cursor(tail);
 			LogRecord r;
 			while (cursor.Next(r)) {
