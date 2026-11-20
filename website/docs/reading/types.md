@@ -306,9 +306,15 @@ literal -- an INSERT of up to `mssql_insert_bcp_threshold` rows, an UPDATE of up
 keep it (an UPDATE past its threshold stages). A plain `float` column written as a literal also
 stores -0.0 as 0; a `VARIANT` keeps its sign.
 
-`hierarchyid` and CLR UDT columns are read as text by the catalog scan, so three-part-name queries
-return a `VARCHAR`; a raw `mssql_scan()` that selects one without a conversion fails: convert it in
-the T-SQL.
+A `hierarchyid` column is a `VARCHAR` of its `ToString()` text (`/1/2.5/-3/`), through the catalog
+and a raw `mssql_scan()` alike: the value comes as the server stores it and is decoded on the client.
+The text does not sort or compare like the tree -- `/10/` follows `/2/` in the tree and precedes it as
+text --, so a filter or `ORDER BY` on the column runs in DuckDB, over the text, and the column is never
+a row key. Write one as its text: `INSERT INTO db.dbo.t (h) VALUES ('/1/2/')`. To order by the tree,
+order in the T-SQL of an `mssql_scan()` (`ORDER BY h`).
+
+A column of a user CLR type is read through the catalog as its `ToString()` text (a `VARCHAR`), and by
+a raw `mssql_scan()` as its bytes, a `BLOB` -- what `CAST(x AS varbinary(max))` returns.
 
 ### Catalog-Reported String Types
 

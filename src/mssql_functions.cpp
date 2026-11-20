@@ -521,6 +521,9 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 	const int hidden_idx = FindResultColumn(result.column_names, "is_hidden");
 	const int err_idx = FindResultColumn(result.column_names, "error_number");
 	const int collation_idx = FindResultColumn(result.column_names, "collation_name");
+	const int sys_type_idx = FindResultColumn(result.column_names, "system_type_id");
+	const int user_schema_idx = FindResultColumn(result.column_names, "user_type_schema");
+	const int user_name_idx = FindResultColumn(result.column_names, "user_type_name");
 	if (name_idx < 0 || type_idx < 0 || len_idx < 0 || prec_idx < 0 || scale_idx < 0) {
 		shape.reason = "sp_describe_first_result_set answered with an unexpected shape";
 		return shape;
@@ -542,6 +545,23 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 			continue;
 		}
 		const string &type_name = row[type_idx];
+		// A user CLR type (spec 093 T4): system_type_id 240, named by user_type_schema / user_type_name
+		// (system_type_name is NULL for it). Its bytes are opaque, read as a BLOB as the stream's UDT_INFO
+		// would give it; the three system CLR types keep their names below.
+		if (sys_type_idx >= 0 && row[sys_type_idx] == "240" && user_schema_idx >= 0 && user_name_idx >= 0 &&
+			!row[user_name_idx].empty()) {
+			tds::ColumnMetadata clr_column;
+			clr_column.name = row[name_idx];
+			clr_column.type_id = tds::TDS_TYPE_UDT;
+			clr_column.udt_schema = row[user_schema_idx];
+			clr_column.udt_type_name = row[user_name_idx];
+			if (clr_column.IsUserClrUdt()) {
+				shape.types.push_back(tds::encoding::TypeConverter::GetDuckDBType(clr_column));
+				shape.names.push_back(clr_column.name);
+				shape.datetime2.push_back(false);
+				continue;
+			}
+		}
 		if (type_name.empty()) {
 			shape.reason = "sp_describe_first_result_set reported a column without a type";
 			return shape;

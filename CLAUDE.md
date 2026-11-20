@@ -53,6 +53,8 @@ src/
                         # variant/ (spec 093 T1): a sql_variant as a DuckDB VARIANT --
                         # variant_envelope (the TDS envelope -> VARIANT payload, DuckDB-free)
                         # and variant_codec (the vector, through DuckDB's VariantBuilder).
+                        # clr/ (spec 093 T4): hierarchyid's bit string as its ToString() text --
+                        # hierarchyid (DuckDB-free, fuzz_hierarchyid) and hierarchyid_codec.
   connection/           # Connection pooling, provider, settings
   dml/                  # DML operations
     insert/             # INSERT (batched VALUES, OUTPUT INSERTED for RETURNING)
@@ -70,6 +72,8 @@ test/
     attach/             # ATTACH/DETACH tests
     azure/              # Azure AD authentication tests (no SQL Server required)
     backup/             # mssql_backup_info / _tables / _views / _columns / _catalog / _scan over test/data/backup (no SQL Server required)
+    types/              # Spec 093 types on any server: hierarchyid (H1 vs ToString()); a user CLR type
+                        # (MSSQL_TEST_CLR=1; assembly from test/clr/build.sh, a .NET SDK container)
     catalog/            # Catalog, DDL, filter pushdown, statistics
     copy/               # COPY TO MSSQL (BulkLoadBCP) tests
     ctas/               # CREATE TABLE AS SELECT tests

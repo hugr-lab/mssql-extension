@@ -57,6 +57,7 @@ Three modes:
 | `fuzz_vector` | a SQL Server vector(n) value (spec 093 T3): its bytes (`CheckValue`, `WidenElements`, `EncodeValue` -- an accepted value with finite elements encodes back to exactly its bytes, float16 included) and its JSON text (`ParseText` -- the column's count of elements, float16 round trips). Seeds: experiments V1, V2, V4 | `src/codec/sql_vector/` | ✅ |
 | `fuzz_backup_page_ci` | PAGE compression (spec 086 PR 2): fuzz_backup_cd's input read as a PAGE rowset's page -- `ReadPageCompression` (the flags, the size, the anchor record within the record, the dictionary's count and ascending ends), every anchor value's and entry's bytes read, and every slot's `CdRow::Read` with and without that compression information (symbols, prefixes of one and two bytes, EMPTY as the anchor's value). Seeds: E23's measured pages | `src/backup/` (spec 086 PR 2) | ✅ |
 | `fuzz_variant_envelope` | a sql_variant value's TDS envelope as a DuckDB VARIANT payload (spec 093 T1): `SplitTdsVariant`, `EncodeVariant` -- a value split is encoded or refused with a reason, its payload well-formed for its tag, a VARCHAR valid UTF-8. Seeds: experiment S1's values | `src/codec/variant/` | ✅ |
+| `fuzz_hierarchyid` | a hierarchyid's MS-SSCLRT 2.2.2 bit string as its `ToString()` text (spec 093 T4, D5): `Decode` -- a value decoded is a path of integer labels, and `Encode` of that text gives back exactly the input (one encoding per value, padding included); past 892 bytes refused. Seeds: G2's server bytes and H1's shapes | `src/codec/clr/hierarchyid.cpp` | ✅ |
 | `fuzz_backup_record` | a user table's records through a layout the input gives (types, `sysrscols.ti`, offsets, null bits, bit positions, dropped / uniquifier / added-with-default flags) over one page: `ReadSlot`, `RowVarCount`, `ForwardedFrom`, `LocateValue` (every byte it names read, and required to lie in the page or the default), `DecodeRecord`, `FixedLength`, `KnownFixedXtype` | `src/backup/` (spec 085 PR 2d) | ✅ |
 
 `fuzz_code_page` (spec 091) is in the default `TARGETS`, so it shares the per-PR
@@ -103,7 +104,7 @@ instance) beside a built LOB tree, and for `backup_lob` every off-row form over 
 (`scripts/ci/leak_check.sh`) replays them under ASan + LSan; the weekly ClusterFuzzLite UBSan run
 (`ubsan-weekly` in `cflite-pr.yml`) fuzzes them beside the default targets, which it adds through
 `.clusterfuzzlite/extra_targets` (read by `.clusterfuzzlite/build.sh` as `TARGETS_EXTRA`); local
-discovery is `fuzz/run.sh <target>`, which builds a backup target or `variant_envelope` on its own (`fuzz/run.sh backup_lob 600 6`).
+discovery is `fuzz/run.sh <target>`, which builds a backup target, `variant_envelope` or `hierarchyid` on its own (`fuzz/run.sh backup_lob 600 6`).
 On macOS, where ASan hangs at the process's start, replay with `make fuzz-backup-replay FUZZ_REPLAY_SANITIZE=0`.
 
 ### `fuzz_bcp_encode`'s three oracles
@@ -189,7 +190,7 @@ docker build -t mssql-fuzz -f fuzz/Dockerfile .
 
 # Run a campaign (CmpLog + dict + all cores). Findings persist on the host.
 docker run --rm -it -v "$PWD/fuzz/findings:/repo/fuzz/findings" mssql-fuzz \
-    fuzz/run.sh tds_tokens          # or: browser_response | utf16 | envchange_txn | login_response | code_page | backup_* | variant_envelope
+    fuzz/run.sh tds_tokens          # or: browser_response | utf16 | envchange_txn | login_response | code_page | backup_* | variant_envelope | hierarchyid
 #   fuzz/run.sh tds_tokens 600 4    # 600s/core, 4 cores
 ```
 
