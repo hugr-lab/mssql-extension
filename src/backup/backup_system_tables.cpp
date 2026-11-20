@@ -748,14 +748,11 @@ bool ReadUnitDataPage(const PageStore &store, const SysAllocUnit &unit, const Pa
 		if (!store.Read(at.file, at.page, out)) {
 			return false;  // in one of the unit's extents, and not in use
 		}
-	} catch (PendingPageError &e) {
-		// Kept a PendingPageError: the catalog model names it on the objects that need the table (D13).
-		throw PendingPageError(std::string(e.what()) + " (reading " + table + ")");
-	} catch (ZeroCopyError &e) {
-		// Kept a ZeroCopyError: the scan asks the log tail whether the page became live while the backup ran.
-		throw ZeroCopyError(std::string(e.what()) + " (reading " + table + ")", e.page);
 	} catch (FormatError &e) {
-		throw FormatError(std::string(e.what()) + " (reading " + table + ")");
+		// Rethrown as it was thrown, the table named: a PendingPageError (the catalog model names it on the
+		// objects that need the table, D13) or a ZeroCopyError (the scan asks the log tail about it) stays one.
+		e.AddContext(" (reading " + table + ")");
+		throw;
 	}
 	if (out.header.type != static_cast<uint8_t>(PageType::Data) || out.header.level != 0) {
 		return false;  // its IAM pages, a clustered index's upper levels

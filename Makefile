@@ -656,7 +656,6 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_boot.cpp \
     test/cpp/backup/test_backup_bytes.cpp \
     test/cpp/backup/test_backup_cache.cpp \
-    test/cpp/backup/test_backup_zero_copy.cpp \
     test/cpp/backup/test_backup_catalog_model.cpp \
     test/cpp/backup/test_backup_cd.cpp \
     test/cpp/backup/test_backup_container.cpp \
@@ -682,6 +681,7 @@ STANDALONE_TEST_SOURCES := \
     test/cpp/backup/test_backup_system_tables.cpp \
     test/cpp/backup/test_backup_xpress.cpp \
     test/cpp/backup/test_backup_xpress_diff.cpp \
+    test/cpp/backup/test_backup_zero_copy.cpp \
     test/cpp/backup/test_backup_zstd.cpp \
     test/cpp/test_catalog_filter.cpp \
     test/cpp/test_filter_encoder.cpp \

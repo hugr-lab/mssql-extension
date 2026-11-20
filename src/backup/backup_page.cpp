@@ -132,8 +132,12 @@ PageState PageStore::Fetch(uint16_t file, uint32_t page, Page &out) const {
 		const std::string message = "backup: page " + want.ToString() +
 									" is live, and its copy is not a page (header version " +
 									std::to_string(out.header.version) + "; " + DescribeCopy(index_, out) + ")";
-		if (out.header.version == 0) {
-			throw ZeroCopyError(message, want);	 // all zeros, or a page caught being formatted (2017)
+		// All zeros, or a page caught being formatted that names itself (2017's 1:44592: version 0, its own
+		// id, an LSN and a flag set). A unit with bytes in it that names another page is a misplaced copy, a
+		// locator's fault: refused, never taken for Pending (as IsPendingCopy draws it; review of #591).
+		const bool zero = std::all_of(out.bytes.begin(), out.bytes.end(), [](uint8_t b) { return b == 0; });
+		if (out.header.version == 0 && (zero || out.header.page_id == want)) {
+			throw ZeroCopyError(message, want);
 		}
 		throw FormatError(message);
 	}

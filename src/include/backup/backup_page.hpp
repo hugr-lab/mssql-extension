@@ -116,7 +116,8 @@ public:
 //! A live page whose copy is no formatted page (header version 0) in a backup of one data pass: SQL Server
 //! 2017 under writes copies the data once, no later pass copies what changed (measured in the oracle
 //! lane), and a page taken into use while it ran is copied as a zero unit, or caught being formatted (7
-//! bytes set, the rest zeros, measured). Pending when the backup's log tail formats the page
+//! bytes set, its own id among them, the rest zeros, measured; one naming another page is a misplaced
+//! copy, refused). Pending when the backup's log tail formats the page
 //! (FormattedInTail), which only a reader holding the tail can tell -- the scan asks it; else a
 //! locator's or a short backup's fault, refused.
 class ZeroCopyError : public FormatError {
