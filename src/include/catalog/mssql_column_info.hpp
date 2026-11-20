@@ -32,9 +32,9 @@ MSSQLDatetime2Read ParseDatetime2Read(const string &value, const string &source)
 tds::GeometryAs ParseGeometryAs(const string &value, const string &source);
 
 //! How the scan reads a column (spec 093 D2): as itself, or through a server-side cast, for a type the
-//! extension does not decode yet (hierarchyid and CLR types as NVARCHAR(MAX): BuildReadExpression).
-//! A type's PR moves it to Bare when its kernel lands (sql_variant T1, geometry / geography T5, read
-//! as their UDT bytes and decoded on the client); what the server's comparison does with it is a
+//! extension does not decode yet (a user CLR type as NVARCHAR(MAX): BuildReadExpression). A type's PR
+//! moves it to Bare when its kernel lands (sql_variant T1, hierarchyid T4, geometry / geography T5,
+//! read as their UDT bytes and decoded on the client); what the server's comparison does with it is a
 //! separate answer (MSSQLColumnInfo::comparison_differs).
 enum class MSSQLReadForm : uint8_t { Bare, ServerCast };
 
@@ -65,7 +65,14 @@ struct MSSQLColumnInfo {
 	bool is_nullable;  // Allows NULL values
 
 	// Collation info (for text types)
-	string collation_name;			 // Column collation (may be empty for non-text)
+	string collation_name;	// Column collation (may be empty for non-text)
+
+	//! The collation a bulk load declares for this column: its own, but for a sql_variant (which has
+	//! none) the database's default -- the one the statement path's CAST gives a string base value
+	//! (spec 093 T2), so the two paths store a value under one collation.
+	string BulkCollationName(const string &database_collation) const {
+		return StringUtil::CIEquals(sql_type_name, "sql_variant") ? database_collation : collation_name;
+	}
 	bool is_case_sensitive;			 // Derived from collation (_CS_ or _BIN)
 	bool is_unicode;				 // True for NVARCHAR/NCHAR/NTEXT
 	bool is_utf8;					 // Derived from collation (_UTF8)
@@ -204,8 +211,9 @@ struct MSSQLColumnInfo {
 	//!     MS-SSCLRT bytes, decoded on the client (codec/clr/ssclrt_wkb.hpp);
 	//!   - `ntext` -> `NVARCHAR(MAX)`, `image` -> `VARBINARY(MAX)`: the per-value
 	//!     decoders have no arm for their wire tokens;
-	//!   - a type with no decodable wire form at all (sql_variant, hierarchyid,
-	//!     a CLR UDT) -> `NVARCHAR(MAX)`;
+	//!   - a type with no decodable wire form at all (a user CLR UDT) ->
+	//!     `NVARCHAR(MAX)`; sql_variant and hierarchyid are decoded on the
+	//!     client (spec 093 T1, T4) and read bare;
 	//!   - a non-UTF-8 CHAR/VARCHAR/TEXT -> `NVARCHAR(n)`, because a DuckDB
 	//!     VARCHAR is UTF-8 by contract, unless the client transcodes it
 	//!     (`client_transcode` below).

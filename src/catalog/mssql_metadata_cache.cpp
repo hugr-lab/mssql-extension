@@ -202,7 +202,7 @@ END CATCH;
 	batch += R"(SELECT c.object_id,
     c.name AS column_name,
     c.column_id,
-    ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS type_name,
+    CASE WHEN c.user_type_id = 255 THEN N'vector' ELSE ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) END AS type_name,
     c.max_length,
     c.precision,
     c.scale,
@@ -234,7 +234,7 @@ static const char *COLUMN_DISCOVERY_SQL_TEMPLATE = R"(
 SELECT
     c.name AS column_name,
     c.column_id,
-    ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS type_name,
+    CASE WHEN c.user_type_id = 255 THEN N'vector' ELSE ISNULL(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) END AS type_name,
     c.max_length,
     c.precision,
     c.scale,

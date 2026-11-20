@@ -1,0 +1,253 @@
+# name: test/sql/types/hierarchyid_read.test
+# description: hierarchyid read bare and decoded on the client into its ToString() text (spec 093 T4, D5; experiment H1 against the server)
+# group: [mssql]
+#
+# Environment variables required:
+#   MSSQL_TESTDB_DSN - Connection string to the test database (SQL Server 2008 or later; CI runs 2022)
+#
+# Until T4 a hierarchyid column was read through CAST(... AS NVARCHAR(MAX)), and a raw mssql_scan
+# refused it. Now the UDT's bytes (MS-SSCLRT 2.2.2) come bare and the client decodes them: the same
+# VARCHAR, the same text. H1: every value below -- each label range's first and last value, at a
+# level's end and inside one, negative and fractional labels, depth 20, a path of 885 bytes, and the
+# fractional labels GetDescendant makes -- is compared with the server's own ToString(). The text does
+# not sort or compare like the tree (/10/ is after /2/ in the tree, before it as text), so a filter or
+# an ORDER BY on the column stays in DuckDB, which compares the text it read. Writes are unchanged: a
+# string literal the server parses.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS hr (TYPE mssql, order_pushdown true);
+
+statement ok
+SELECT mssql_exec('hr', 'DROP TABLE IF EXISTS dbo.HidH1; DROP TABLE IF EXISTS dbo.HidOrder; DROP TABLE IF EXISTS dbo.HidText;
+CREATE TABLE dbo.HidH1 (id int IDENTITY PRIMARY KEY, h hierarchyid NULL, s AS h.ToString());
+INSERT INTO dbo.HidH1 (h) SELECT hierarchyid::Parse(t) FROM (VALUES
+  (''/''), (''/0/''), (''/3/''), (''/4/''), (''/7/''), (''/8/''), (''/15/''), (''/16/''), (''/79/''), (''/80/''),
+  (''/1103/''), (''/1104/''), (''/5199/''), (''/5200/''), (''/4294972495/''), (''/4294972496/''),
+  (''/281479271683151/''), (''/-1/''), (''/-8/''), (''/-9/''), (''/-72/''), (''/-73/''), (''/-4168/''),
+  (''/-4169/''), (''/-4294971464/''), (''/-4294971465/''), (''/-281479271682120/''),
+  (''/-1.1/''), (''/2.1/''), (''/3.1/''), (''/6.1/''), (''/7.1/''), (''/14.1/''), (''/15.1/''), (''/78.1/''),
+  (''/79.1/''), (''/1102.1/''), (''/1103.1/''), (''/5198.1/''), (''/5199.1/''), (''/4294972494.1/''),
+  (''/4294972495.1/''), (''/281479271683150.1/''), (''/-2.1/''), (''/-9.1/''), (''/-10.1/''), (''/-73.1/''),
+  (''/-74.1/''), (''/-4169.1/''), (''/-4170.1/''), (''/-4294971465.1/''), (''/-4294971466.1/''),
+  (''/-281479271682121.1/''),
+  (''/1.5/''), (''/1.-2/''), (''/1.5/-2/''), (''/0.0.0.1/''), (''/-5.-7.3/''), (''/1/1.1/1.1.1/''),
+  (''/-63/-26/11/48/85/122/159/196/233/270/307/344/381/418/455/492/529/566/603/640/'')
+) v(t);
+INSERT INTO dbo.HidH1 (h) VALUES (NULL);
+DECLARE @deep nvarchar(max) = N''/'' + REPLICATE(CAST(N''281479271683151/'' AS nvarchar(max)), 118);
+INSERT INTO dbo.HidH1 (h) VALUES (hierarchyid::Parse(@deep));
+DECLARE @lo hierarchyid = hierarchyid::Parse(''/1/''), @hi hierarchyid = hierarchyid::Parse(''/2/''), @i int = 0;
+WHILE @i < 200
+BEGIN
+  SET @hi = hierarchyid::GetRoot().GetDescendant(@lo, @hi);
+  INSERT INTO dbo.HidH1 (h) VALUES (@hi);
+  SET @i += 1;
+END;
+CREATE TABLE dbo.HidOrder (id int PRIMARY KEY, h hierarchyid NOT NULL);
+INSERT INTO dbo.HidOrder VALUES (1, ''/2/''), (2, ''/10/''), (3, ''/3/''), (4, ''/1/'')');
+
+statement ok
+SELECT mssql_exec('hr', 'DROP TABLE IF EXISTS dbo.HidText; CREATE TABLE dbo.HidText (id int PRIMARY KEY, t nvarchar(max) NOT NULL);
+INSERT INTO dbo.HidText VALUES (1, N''/01/''), (2, N''not a path'')');
+
+statement ok
+SELECT mssql_invalidate_cache('hr');
+
+# A set operation of a hierarchyid and an nvarchar is not pushed, in either order (review of #593): on the
+# server the nvarchar member would be converted to hierarchyid ('/01/' read back as '/1/', 'not a path' an
+# error); in DuckDB both are the text read.
+query T
+SELECT v FROM (SELECT t AS v FROM hr.dbo.HidText UNION ALL SELECT h FROM hr.dbo.HidOrder) ORDER BY v;
+----
+/01/
+/1/
+/10/
+/2/
+/3/
+not a path
+
+query T
+SELECT v FROM (SELECT v FROM (SELECT t AS v FROM hr.dbo.HidText UNION ALL SELECT h FROM hr.dbo.HidOrder) LIMIT 100) ORDER BY v;
+----
+/01/
+/1/
+/10/
+/2/
+/3/
+not a path
+
+query T
+SELECT v FROM (SELECT v FROM (SELECT h AS v FROM hr.dbo.HidOrder UNION ALL SELECT t FROM hr.dbo.HidText) LIMIT 100) ORDER BY v;
+----
+/01/
+/1/
+/10/
+/2/
+/3/
+not a path
+
+query T
+SELECT v FROM (SELECT h AS v FROM hr.dbo.HidOrder UNION ALL SELECT t FROM hr.dbo.HidText) ORDER BY v;
+----
+/01/
+/1/
+/10/
+/2/
+/3/
+not a path
+
+# --- typed as before: VARCHAR
+query T
+SELECT typeof(h) FROM hr.dbo.HidH1 LIMIT 1;
+----
+VARCHAR
+
+# --- H1: every value the server's ToString(), through the catalog
+query II
+SELECT count(*), count(*) FILTER (WHERE h IS DISTINCT FROM s) FROM hr.dbo.HidH1;
+----
+262	0
+
+# The 885-byte path and the root, as the server prints them.
+query II
+SELECT length(h), h = '/' || repeat('281479271683151/', 118) FROM hr.dbo.HidH1 WHERE length(h) > 1000;
+----
+1889	true
+
+query I
+SELECT count(*) FROM hr.dbo.HidH1 WHERE h = '/';
+----
+1
+
+query I
+SELECT count(*) FROM hr.dbo.HidH1 WHERE h IS NULL;
+----
+1
+
+# --- the raw scan's shape, described and prepared: the columns after the UDT keep their names and
+# types (a stale type_id once made the describe's next row an unnamed BLOB, `C1`)
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('hr', 'SELECT h, h.ToString() AS s, id, CAST(h AS varbinary(892)) AS b FROM dbo.HidH1'));
+----
+h	VARCHAR
+s	MSSQL_NVARCHAR(4000)
+id	INTEGER
+b	BLOB
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM mssql_scan('hr', 'SELECT h, h.ToString() AS s, id, CAST(h AS varbinary(892)) AS b FROM dbo.HidH1', prepared := true));
+----
+h	VARCHAR
+s	MSSQL_NVARCHAR(4000)
+id	INTEGER
+b	BLOB
+
+# --- through a raw scan (it refused the type until T4), prepared, and with parameters
+query II
+SELECT count(*), count(*) FILTER (WHERE h IS DISTINCT FROM s)
+FROM mssql_scan('hr', 'SELECT h, h.ToString() AS s FROM dbo.HidH1');
+----
+262	0
+
+query II
+SELECT count(*), count(*) FILTER (WHERE h IS DISTINCT FROM s)
+FROM mssql_scan('hr', 'SELECT h, h.ToString() AS s FROM dbo.HidH1', prepared := true);
+----
+262	0
+
+query T
+SELECT h FROM mssql_scan_params('hr', 'SELECT hierarchyid::Parse(@t) AS h', {'t': '/1.5/-2/'});
+----
+/1.5/-2/
+
+query TT
+SELECT typeof(h), h FROM mssql_scan('hr', 'SELECT hierarchyid::GetRoot() AS h');
+----
+VARCHAR	/
+
+# --- comparisons and ORDER BY stay in DuckDB, over the text: as a tree /10/ > /2/, as text not.
+query I
+SELECT count(*) FROM hr.dbo.HidOrder WHERE h > '/2/';
+----
+1
+
+query I
+SELECT id FROM hr.dbo.HidOrder WHERE h = '/10/';
+----
+2
+
+query II
+EXPLAIN SELECT id FROM hr.dbo.HidOrder ORDER BY h LIMIT 2;
+----
+physical_plan	<REGEX>:.*(TOP_N|Top N).*
+
+query T
+SELECT h FROM hr.dbo.HidOrder ORDER BY h LIMIT 3;
+----
+/1/
+/10/
+/2/
+
+query TI
+SELECT h, count(*) FROM hr.dbo.HidOrder GROUP BY h ORDER BY h;
+----
+/1/	1
+/10/	1
+/2/	1
+/3/	1
+
+# IS NULL is the server's (the value is NULL exactly when the column is).
+query I
+SELECT count(*) FROM hr.dbo.HidH1 WHERE h IS NOT NULL;
+----
+261
+
+# --- writes are a string literal the server parses; RETURNING reads the column bare
+query IT
+INSERT INTO hr.dbo.HidOrder VALUES (5, '/4.1/') RETURNING id, h;
+----
+5	/4.1/
+
+statement ok
+UPDATE hr.dbo.HidOrder SET h = '/6/' WHERE id = 5;
+
+query T
+SELECT h FROM mssql_scan('hr', 'SELECT h.ToString() AS h FROM dbo.HidOrder WHERE id = 5');
+----
+/6/
+
+# UPDATE ... RETURNING runs through #stage, which INSERT BULK fills, and a hierarchyid has no bulk-load
+# encoding: refused by name, nothing sent (as before T4).
+statement error
+UPDATE hr.dbo.HidOrder SET h = '/7/1/' WHERE id = 5 RETURNING id, h;
+----
+cannot be bulk-loaded into the #stage
+
+query IT
+DELETE FROM hr.dbo.HidOrder WHERE h = '/6/' RETURNING id, h;
+----
+5	/6/
+
+query I
+SELECT count(*) FROM hr.dbo.HidOrder;
+----
+4
+
+# A row read and written back through DuckDB keeps its value (text in, text out).
+statement ok
+UPDATE hr.dbo.HidOrder SET h = (SELECT h FROM hr.dbo.HidH1 WHERE s = '/1.-2/' ORDER BY id LIMIT 1) WHERE id = 1;
+
+query T
+SELECT h FROM hr.dbo.HidOrder WHERE id = 1;
+----
+/1.-2/
+
+statement ok
+SELECT mssql_exec('hr', 'DROP TABLE dbo.HidH1; DROP TABLE dbo.HidOrder; DROP TABLE dbo.HidText');
+
+statement ok
+DETACH hr;

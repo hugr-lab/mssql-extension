@@ -134,6 +134,23 @@ Read the same way by an attached catalog and by a raw `mssql_scan` / `mssql_scan
 conversion on the server: the envelope's base type picks the family codec that decodes the value. See
 the types page for each base type's DuckDB type.
 
+Written from a `VARIANT` (spec 093 T2): each value's base type is the narrowest SQL Server type that
+holds every value of its VARIANT tag (spec 093 D3's write table, `codec/variant/variant_write`). On the
+statement path the value is `CAST(CAST(<literal> AS <base type>) AS sql_variant)` -- the outer cast
+keeps a multi-row `VALUES` list from folding its rows to one type by data type precedence; on the bulk
+wire (INSERT BULK, COPY, CTAS, a staged UPDATE / DELETE's `#stage`, a staged MERGE's `#src`) the
+column is declared `0x62` with a LONGLEN maximum of 8009 and each value is its envelope (measured to
+be taken: `specs/093-type-kernels/measured/S2.md`), a string base value under the database's default
+collation on every path (the literal by T-SQL's rule; the envelope from the catalog's database
+collation, or the COPY probe's for an existing table). A database collation this build's table lacks
+is written on the bulk path as `Latin1_General_100_BIN2_UTF8`, so such a value compares and sorts by
+BIN2_UTF8 rather than the database's collation. A subnormal `DOUBLE` (a `float` base value) written by the
+statement path is stored as 0 -- the server's parse of the literal flushes it, as it does for a plain
+`float` column's literal --, while the bulk paths keep its bits; native RPC parameters (#515) are what
+would remove the difference. A plain `float` column's statement path also stores -0.0 as +0 (its
+literal `-0.0` is a decimal literal to T-SQL; the float codec's behaviour before T2); a `VARIANT`'s
+literal is a float literal and keeps the sign. A CTAS creates the column as `sql_variant`.
+
 ### Spatial Types (GEOMETRY, GEOGRAPHY)
 
 | SQL Server Type | TDS Type ID | Wire Format | DuckDB Type | Notes |
@@ -201,21 +218,50 @@ scan refused them.
   `STGeomFromWKB(0x…, 0)` (`geography`: 4326), which takes ISO Z / M (G7). The server refuses a NaN
   point, so a POINT EMPTY read this way does not write back until T6.
 
-### Not read by a raw scan yet
+### HIERARCHYID and user CLR types
 
-An attached catalog reads these columns through a server-side conversion (`hierarchyid` and other CLR
-types as text). A raw `mssql_scan` / `mssql_scan_params` that selects one bare is refused at bind,
-naming the column and the type; spec 093 decodes them on the client type by type. Their COLMETADATA and
-rows are parsed, so a batch that returns them to `mssql_exec`, or a DML whose trigger does, no longer
-fails.
+| SQL Server Type | TDS Type ID | Wire Format | DuckDB Type | Notes |
+|---|---|---|---|---|
+| HIERARCHYID | 0xF0 (UDT `sys.hierarchyid`) | PLP, the MS-SSCLRT 2.2.2 bit string (at most 892 bytes) | VARCHAR | Decoded on the client into its `ToString()` text, `/1/2.5/-3/` (spec 093 T4) |
+| user CLR type | 0xF0 (UDT `schema.name`) | PLP, the type's own serialized bytes | BLOB (raw scan) / VARCHAR (catalog) | A raw scan reads the bytes, as `CAST(x AS varbinary(max))` gives them; the catalog reads `CAST(x AS NVARCHAR(MAX))`, the type's `ToString()` |
 
-| SQL Server Type | TDS Type ID | Read by a raw scan |
-|---|---|---|
-| UDT (HIERARCHYID, user CLR types) | 0xF0 | not yet (spec 093 T4) |
+A `hierarchyid` is read bare by the catalog and a raw `mssql_scan` / `mssql_scan_params` alike, with
+no conversion on the server. Its text does not compare or sort like the tree (`/10/` comes after `/2/`
+in the tree, before it as text), so a filter or an ORDER BY on the column runs in DuckDB, over the text,
+and the column is never a row key; `IS NULL` is pushed. A value is written as a string literal the
+server parses (`INSERT … VALUES ('/1/2/')`). A user CLR type's bytes mean nothing without its
+assembly, so a raw scan gives them as they are; the describe names it by `user_type_schema` /
+`user_type_name` (its `system_type_name` is NULL).
 
-```
-MSSQL Error: column 'h' is of the CLR type sys.hierarchyid, which a raw mssql_scan does not read yet. ...
-```
+### VECTOR Type (SQL Server 2025)
+
+| SQL Server Type | TDS Type ID | Wire Format | DuckDB Type | Notes |
+|---|---|---|---|---|
+| vector(n), vector(n, float16) | 0xF5 VECTORTYPE (with VECTORSUPPORT) | u16 length (0xFFFF NULL): an 8-byte header (`A9 01`, n as u16, the element type, 3 zero bytes) and the little-endian elements | FLOAT[n] | spec 093 T3 (D4); float16 widened exactly |
+| the same, as text | 0xA7 varchar(max) PLP under UserType 255 | `[e1,...]`, each element `%.7e` | FLOAT[n] through the catalog; VARCHAR by a raw scan | a float16 column under VECTORSUPPORT version 1, any vector without the feature |
+
+**Negotiation.** LOGIN7 asks for VECTORSUPPORT (feature 0x0E) version 2 while `mssql_vector_support` is
+true (read at ATTACH); SQL Server 2025 grants version 1 (measured V1), so a float32 column streams its
+bytes and a float16 column its text. A session without the feature receives every vector as text. The
+catalog names the column `vector` from `sys.columns.user_type_id` 255, its element type from `scale`, n
+from `(max_length - 8) / element size`.
+
+**Read path.** `codec/sql_vector`: the header checked against the column (dimensions, element type,
+reserved bytes), then a copy (float32) or a widening loop (float16) into the array's child; the text
+parsed locale-free (DuckDB's fast_float), exact for float16, within one ulp for float32 (V2: 8 digits
+do not identify every float32), which a `WARNING` says once per column of a statement on a connection
+without the feature. A raw scan types VECTORTYPE as FLOAT[n] and the text as VARCHAR (no n on the wire).
+Filters on a vector run in DuckDB, it is never a key, and a pushed SELECT does not carry one in its
+result (its wire form follows the session).
+
+**Write path.** The statement path sends `N'[e1,...]'` with 9 significant digits (exact for float32),
+which the server converts to the column's type, rounding to float16 itself. COPY, INSERT BULK, `#stage`
+and a staged MERGE's `#src` declare `vector(n)` / `vector(n, float16)` in INSERT BULK and send each value's
+bytes as `varbinary(8 + n x size)` -- taken with the feature and without it (measured V6) -- float16
+rounded to nearest even on the client. A NULL element, a NaN / infinity and a float16 value that rounds past
+65504 (a magnitude of 65520 or more; below that it rounds to 65504) are refused by name. A CTAS or COPY that creates the table creates `vector(n)` from FLOAT[n]
+(n up to 1998); a server without the type refuses it (error 2715), and a DOUBLE[n] is refused with the
+cast `::FLOAT[n]` named.
 
 ## NULL Handling
 

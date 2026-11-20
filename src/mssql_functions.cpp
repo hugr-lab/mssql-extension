@@ -283,6 +283,21 @@ static bool DescribedTypeToTdsMetadata(const string &base, int16_t max_length, u
 		column.type_id = tds::TDS_TYPE_XML;
 	} else if (base == "sql_variant") {
 		column.type_id = tds::TDS_TYPE_SQL_VARIANT;
+	} else if (base == "vector") {
+		// Spec 093 D4 (V3): a session granted VECTORSUPPORT describes a float32 vector as `vector(n)`, max
+		// length 8 + 4n, and streams it as VECTORTYPE. A float16 one, and any vector without the feature,
+		// describe as varchar(max) and never reach here.
+		// The element type in scale, as sys.columns gives it (V5); a float16 one is not described so today.
+		const uint8_t element_type = scale == 1 ? tds::VECTOR_ELEMENT_FLOAT16 : tds::VECTOR_ELEMENT_FLOAT32;
+		const int16_t element_bytes = static_cast<int16_t>(tds::VectorElementBytes(element_type));
+		if (max_length < static_cast<int16_t>(tds::VECTOR_HEADER_BYTES) + element_bytes ||
+			(max_length - tds::VECTOR_HEADER_BYTES) % element_bytes != 0) {
+			return false;
+		}
+		column.type_id = tds::TDS_TYPE_VECTOR;
+		column.vector_element_type = element_type;
+		column.scale = 0;
+		column.user_type = tds::VECTOR_USER_TYPE;
 	} else if (base == "hierarchyid" || base == "geography" || base == "geometry") {
 		column.type_id = tds::TDS_TYPE_UDT;
 		column.udt_schema = "sys";	// as COLMETADATA's UDT_INFO names the system CLR types (spec 093 G2)
@@ -514,6 +529,9 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 	const int hidden_idx = FindResultColumn(result.column_names, "is_hidden");
 	const int err_idx = FindResultColumn(result.column_names, "error_number");
 	const int collation_idx = FindResultColumn(result.column_names, "collation_name");
+	const int sys_type_idx = FindResultColumn(result.column_names, "system_type_id");
+	const int user_schema_idx = FindResultColumn(result.column_names, "user_type_schema");
+	const int user_name_idx = FindResultColumn(result.column_names, "user_type_name");
 	if (name_idx < 0 || type_idx < 0 || len_idx < 0 || prec_idx < 0 || scale_idx < 0) {
 		shape.reason = "sp_describe_first_result_set answered with an unexpected shape";
 		return shape;
@@ -535,6 +553,23 @@ static MSSQLDescribedShape DescribeFirstResultSet(tds::TdsConnection &connection
 			continue;
 		}
 		const string &type_name = row[type_idx];
+		// A user CLR type (spec 093 T4): system_type_id 240, named by user_type_schema / user_type_name
+		// (system_type_name is NULL for it). Its bytes are opaque, read as a BLOB as the stream's UDT_INFO
+		// would give it; the three system CLR types keep their names below.
+		if (sys_type_idx >= 0 && row[sys_type_idx] == "240" && user_schema_idx >= 0 && user_name_idx >= 0 &&
+			!row[user_name_idx].empty()) {
+			tds::ColumnMetadata clr_column;
+			clr_column.name = row[name_idx];
+			clr_column.type_id = tds::TDS_TYPE_UDT;
+			clr_column.udt_schema = row[user_schema_idx];
+			clr_column.udt_type_name = row[user_name_idx];
+			if (clr_column.IsUserClrUdt()) {
+				shape.types.push_back(tds::encoding::TypeConverter::GetDuckDBType(clr_column));
+				shape.names.push_back(clr_column.name);
+				shape.datetime2.push_back(false);
+				continue;
+			}
+		}
 		if (type_name.empty()) {
 			shape.reason = "sp_describe_first_result_set reported a column without a type";
 			return shape;
@@ -742,6 +777,8 @@ static bool StreamCanProduce(const LogicalType &declared) {
 	case LogicalTypeId::UUID:
 	case LogicalTypeId::VARIANT:  // a sql_variant (spec 093 T1)
 		return true;
+	case LogicalTypeId::ARRAY:	// a vector(n) streamed as VECTORTYPE (spec 093 T3)
+		return ArrayType::GetChildType(declared).id() == LogicalTypeId::FLOAT;
 	default:
 		return false;
 	}

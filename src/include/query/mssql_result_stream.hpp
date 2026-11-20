@@ -274,6 +274,9 @@ private:
 	//! Spec 093 T1: per column, whether its sql_variant values read as bytes were logged; and the
 	//! per-value path's counts (ProcessRow: target vectors, e.g. a composite rowid), beside the stager's.
 	std::vector<bool> variant_notes_warned_;
+	//! Spec 093 D4: per column, a vector read into FLOAT[n] from its JSON text (1), and said (2).
+	std::vector<uint8_t> vector_text_;
+	void NoteVectorText(idx_t c);
 	std::vector<mssql::codec::variant::VariantColumnNotes> row_variant_notes_;
 	//! Spec 093 T5: per column, which of its spatial WARNINGs were logged (SPATIAL_* bits); and the
 	//! per-value path's counts, beside the stager's.

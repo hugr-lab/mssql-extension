@@ -200,6 +200,12 @@ public:
 		return spatial_notes_[c];
 	}
 
+	//! The kernel that publishes column `c` (spec 093 T3: the stream asks whether a vector column was read
+	//! from its text).
+	FinalizeKernel KernelOf(idx_t c) const {
+		return ops_[c].kernel;
+	}
+
 	//! True when column `c` never reaches an output vector (Skip arm).
 	bool IsSkipped(idx_t c) const {
 		return ops_[c].arm == AppendArm::Skip;

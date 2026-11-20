@@ -246,13 +246,15 @@ void MSSQLStagedDml::Start(ClientContext &context) {
 	// The stage's columns, in the order BuildFillChunk lays them out: the key,
 	// then the new values.
 	vector<mssql::BCPColumnMetadata> columns;
+	const string database_collation =
+		Catalog::GetCatalog(context, Identifier(target_.catalog_name)).Cast<MSSQLCatalog>().GetDatabaseCollation();
 	auto add_column = [&](const MSSQLColumnInfo &col, const string &name) {
 		if (IsRowVersion(col)) {
 			columns.push_back(mssql::BCPColumnMetadata::FromServerColumn(name, "binary", 8, 0, 0, true, string()));
 		} else {
 			columns.push_back(mssql::BCPColumnMetadata::FromServerColumn(name, col.sql_type_name, col.max_length,
 																		 col.precision, col.scale, col.is_nullable,
-																		 col.collation_name));
+																		 col.BulkCollationName(database_collation)));
 		}
 		// A refused value names the target's column, not the stage's (#460).
 		columns.back().reported_name = col.name;

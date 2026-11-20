@@ -1,0 +1,303 @@
+# name: test/sql/types_2025/vector_write.test
+# description: Spec 093 T3 (D4) -- a FLOAT[n] written into a vector(n) column on every write path (statement literal, INSERT BULK, COPY, CTAS, UPDATE through VALUES and #stage, a staged MERGE, RETURNING), with and without VECTORSUPPORT, and the refusals by name
+# group: [types_2025]
+
+# Environment variables required:
+#   MSSQL_TESTDB_DSN           - Connection string to the test database
+#   MSSQL_TEST_SQLSERVER_2025  - set when the server is SQL Server 2025 (the 2025 CI job); the file
+#                                skips on 2022, which has no vector type
+#
+# The statement path sends N'[...]' with 9 significant digits (exact for float32), which the server
+# converts to the column's type, rounding to float16 for a float16 column. The bulk wire sends each
+# value's bytes -- header and elements, float16 rounded to nearest even on the client -- as varbinary
+# under a declared vector(n) / vector(n, float16), which V6 measured the server to take with the feature
+# and without it. Read back through the catalog under the feature, so every float32 bit is compared.
+
+require mssql
+
+require-env MSSQL_TESTDB_DSN
+
+require-env MSSQL_TEST_SQLSERVER_2025
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS vw (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('vw', 'ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON');
+
+statement ok
+SELECT mssql_exec('vw', 'DROP TABLE IF EXISTS dbo.vec_w; DROP TABLE IF EXISTS dbo.vec_w2; DROP TABLE IF EXISTS dbo.vec_copy; DROP TABLE IF EXISTS dbo.vec_copy_new; DROP TABLE IF EXISTS dbo.vec_ctas; DROP TABLE IF EXISTS dbo.vec_bad');
+
+statement ok
+SELECT mssql_exec('vw', 'CREATE TABLE dbo.vec_w (id int NOT NULL PRIMARY KEY, v vector(3) NULL, h vector(3, float16) NULL); CREATE TABLE dbo.vec_w2 (id int NOT NULL PRIMARY KEY, v vector(3) NULL, h vector(3, float16) NULL); CREATE TABLE dbo.vec_copy (id int NOT NULL PRIMARY KEY, v vector(3) NULL, h vector(3, float16) NULL)');
+
+statement ok
+SELECT mssql_invalidate_cache('vw');
+
+# The source, and what a float16 column holds of it (0.1 -> 0.0999755859375; -2, 65504, 0.5, 0.25 exact).
+statement ok
+CREATE TEMP TABLE vw_src AS SELECT * FROM (VALUES (1, '[1,2,3]'::FLOAT[3], '[1,2,3]'::FLOAT[3]), (2, '[0.1,0.33333334,3.4028235e38]'::FLOAT[3], '[0.1,-2,65504]'::FLOAT[3]), (3, '[-103.217316,-1.16638425e-07,1.00584066e+18]'::FLOAT[3], '[0.5,-2,0.25]'::FLOAT[3]), (4, NULL, NULL)) t(id, v, h);
+
+statement ok
+CREATE TEMP TABLE vw_exp AS SELECT * FROM (VALUES (1, '[1,2,3]'::FLOAT[3], '[1,2,3]'::FLOAT[3]), (2, '[0.1,0.33333334,3.4028235e38]'::FLOAT[3], '[0.0999755859375,-2,65504]'::FLOAT[3]), (3, '[-103.217316,-1.16638425e-07,1.00584066e+18]'::FLOAT[3], '[0.5,-2,0.25]'::FLOAT[3]), (4, NULL, NULL)) t(id, v, h);
+
+# --- the statement path (below the bulk threshold): one VALUES, N'[...]' literals
+statement ok
+SET mssql_insert_bcp_threshold = 100000;
+
+statement ok
+INSERT INTO vw.dbo.vec_w SELECT * FROM vw_src;
+
+query I
+SELECT count(*) FROM vw.dbo.vec_w r JOIN vw_exp e USING (id) WHERE r.v IS NOT DISTINCT FROM e.v AND r.h IS NOT DISTINCT FROM e.h;
+----
+4
+
+# --- INSERT BULK: the bytes as varbinary (the threshold is the rows up to which statements are used)
+statement ok
+SELECT mssql_exec('vw', 'DELETE FROM dbo.vec_w');
+
+statement ok
+SET mssql_insert_bcp_threshold = 1;
+
+statement ok
+INSERT INTO vw.dbo.vec_w SELECT * FROM vw_src;
+
+query I
+SELECT count(*) FROM vw.dbo.vec_w r JOIN vw_exp e USING (id) WHERE r.v IS NOT DISTINCT FROM e.v AND r.h IS NOT DISTINCT FROM e.h;
+----
+4
+
+# A float16 value past 65504 is refused by name on the bulk wire, before anything is sent.
+statement error
+INSERT INTO vw.dbo.vec_w VALUES (20, NULL, '[1,1,70000]'::FLOAT[3]), (21, NULL, NULL);
+----
+65504
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+# A NaN on the statement path: refused by name.
+statement error
+INSERT INTO vw.dbo.vec_w VALUES (22, '[1,nan,3]'::FLOAT[3], NULL);
+----
+NaN
+
+# --- INSERT ... RETURNING reads the vector back
+query IT
+INSERT INTO vw.dbo.vec_w VALUES (10, '[7,8,9]'::FLOAT[3], NULL) RETURNING id, v::VARCHAR;
+----
+10	[7.0, 8.0, 9.0]
+
+# --- a pushed INSERT ... SELECT (within the catalog): the server copies the vectors as stored
+statement ok
+INSERT INTO vw.dbo.vec_w2 SELECT * FROM vw.dbo.vec_w;
+
+query I
+SELECT count(*) FROM vw.dbo.vec_w2 r JOIN vw_exp e USING (id) WHERE r.v IS NOT DISTINCT FROM e.v AND r.h IS NOT DISTINCT FROM e.h;
+----
+4
+
+# --- COPY into an existing table
+statement ok
+COPY (SELECT * FROM vw_src) TO 'mssql://vw/dbo/vec_copy' (FORMAT 'bcp', CREATE_TABLE false);
+
+query I
+SELECT count(*) FROM vw.dbo.vec_copy r JOIN vw_exp e USING (id) WHERE r.v IS NOT DISTINCT FROM e.v AND r.h IS NOT DISTINCT FROM e.h;
+----
+4
+
+# --- COPY creating the table, and CTAS: FLOAT[3] creates vector(3) (float32: h is not rounded there)
+statement ok
+COPY (SELECT * FROM vw_src) TO 'mssql://vw/dbo/vec_copy_new' (FORMAT 'bcp');
+
+statement ok
+CREATE TABLE vw.dbo.vec_ctas AS SELECT * FROM vw_src;
+
+query TTIII
+SELECT * FROM mssql_scan('vw', 'SELECT OBJECT_NAME(c.object_id), c.name, c.user_type_id, c.max_length, c.scale FROM sys.columns c WHERE c.object_id IN (OBJECT_ID(''dbo.vec_copy_new''), OBJECT_ID(''dbo.vec_ctas'')) AND c.name IN (''v'', ''h'') ORDER BY 1, 2');
+----
+vec_copy_new	h	255	20	0
+vec_copy_new	v	255	20	0
+vec_ctas	h	255	20	0
+vec_ctas	v	255	20	0
+
+statement ok
+SELECT mssql_invalidate_cache('vw');
+
+query I
+SELECT count(*) FROM vw.dbo.vec_ctas r JOIN vw_src s USING (id) WHERE r.v IS NOT DISTINCT FROM s.v AND r.h IS NOT DISTINCT FROM s.h;
+----
+4
+
+query I
+SELECT count(*) FROM vw.dbo.vec_copy_new r JOIN vw_src s USING (id) WHERE r.v IS NOT DISTINCT FROM s.v AND r.h IS NOT DISTINCT FROM s.h;
+----
+4
+
+# An all-NULL source into an existing vector column -- a bare NULL, a typed one -- loads NULLs: bind
+# admits the pair for NULLs only, and the encoder writes the NULL markers.
+statement ok
+SELECT mssql_exec('vw', 'DELETE FROM dbo.vec_copy');
+
+statement ok
+COPY (SELECT 1 AS id, NULL AS v, NULL AS h) TO 'mssql://vw/dbo/vec_copy' (FORMAT 'bcp', CREATE_TABLE false);
+
+statement ok
+COPY (SELECT 2 AS id, CAST(NULL AS INTEGER) AS v, CAST(NULL AS INTEGER) AS h) TO 'mssql://vw/dbo/vec_copy' (FORMAT 'bcp', CREATE_TABLE false);
+
+query I
+SELECT count(*) FROM vw.dbo.vec_copy WHERE v IS NULL AND h IS NULL;
+----
+2
+
+# ALTER ... SET / DROP NOT NULL restates the column's declaration: vector(3) and vector(3, float16) stay.
+statement ok
+SELECT mssql_exec('vw', 'DROP TABLE IF EXISTS dbo.vec_alter; CREATE TABLE dbo.vec_alter (id int NOT NULL PRIMARY KEY, v vector(3) NULL, h vector(3, float16) NULL); INSERT INTO dbo.vec_alter VALUES (1, ''[1,2,3]'', ''[1,2,3]'')');
+
+statement ok
+SELECT mssql_invalidate_cache('vw');
+
+statement ok
+ALTER TABLE vw.dbo.vec_alter ALTER COLUMN v SET NOT NULL;
+
+statement ok
+ALTER TABLE vw.dbo.vec_alter ALTER COLUMN h SET NOT NULL;
+
+query TIIII
+SELECT * FROM mssql_scan('vw', 'SELECT c.name, c.user_type_id, c.max_length, CAST(c.scale AS int), CAST(c.is_nullable AS int) FROM sys.columns c WHERE c.object_id = OBJECT_ID(''dbo.vec_alter'') AND c.name IN (''v'', ''h'') ORDER BY c.name');
+----
+h	255	14	1	0
+v	255	20	0	0
+
+statement ok
+ALTER TABLE vw.dbo.vec_alter ALTER COLUMN v DROP NOT NULL;
+
+statement ok
+ALTER TABLE vw.dbo.vec_alter ALTER COLUMN h DROP NOT NULL;
+
+query TIIII
+SELECT * FROM mssql_scan('vw', 'SELECT c.name, c.user_type_id, c.max_length, CAST(c.scale AS int), CAST(c.is_nullable AS int) FROM sys.columns c WHERE c.object_id = OBJECT_ID(''dbo.vec_alter'') AND c.name IN (''v'', ''h'') ORDER BY c.name');
+----
+h	255	14	1	1
+v	255	20	0	1
+
+statement ok
+SELECT mssql_exec('vw', 'DROP TABLE IF EXISTS dbo.vec_alter');
+
+# A DOUBLE[n] is not narrowed for the user: the cast is named.
+statement error
+CREATE TABLE vw.dbo.vec_bad AS SELECT '[1,2,3]'::DOUBLE[3] AS v;
+----
+::FLOAT[3]
+
+# --- UPDATE through the VALUES join, then through #stage (threshold 0)
+statement ok
+SELECT mssql_exec('vw', 'UPDATE dbo.vec_w SET v = NULL, h = NULL');
+
+statement ok
+SET mssql_dml_pushdown = false;
+
+statement ok
+UPDATE vw.dbo.vec_w SET v = s.v, h = s.h FROM vw_src s WHERE vec_w.id = s.id AND s.id <= 2;
+
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+statement ok
+UPDATE vw.dbo.vec_w SET v = s.v, h = s.h FROM vw_src s WHERE vec_w.id = s.id AND s.id > 2;
+
+statement ok
+RESET mssql_dml_stage_threshold;
+
+query I
+SELECT count(*) FROM vw.dbo.vec_w r JOIN vw_exp e USING (id) WHERE r.v IS NOT DISTINCT FROM e.v AND r.h IS NOT DISTINCT FROM e.h;
+----
+4
+
+# --- a staged MERGE (its source is DuckDB's: the values go through #src)
+statement ok
+SELECT mssql_exec('vw', 'UPDATE dbo.vec_w SET v = NULL, h = NULL');
+
+# Each value assigned to a vector column is a #src column declared as that column (like-target):
+# CTAS-typed from FLOAT[3] it was a float32 vector(3), which the server does not assign to h's
+# vector(3, float16) (42238, measured on 2025).
+statement ok
+MERGE INTO vw.dbo.vec_w t USING vw_src s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v, h = s.h;
+
+query I
+SELECT count(*) FROM vw.dbo.vec_w r JOIN vw_exp e USING (id) WHERE r.v IS NOT DISTINCT FROM e.v AND r.h IS NOT DISTINCT FROM e.h;
+----
+4
+
+# A MERGE INSERT of a float16 value, and a constant assigned in a MERGE (staged like-target too).
+statement ok
+MERGE INTO vw.dbo.vec_w t USING (SELECT 30 AS id, '[1,1,1]'::FLOAT[3] AS v, '[0.1,0.1,0.1]'::FLOAT[3] AS h) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v, h = s.h WHEN NOT MATCHED THEN INSERT (id, v, h) VALUES (s.id, s.v, s.h);
+
+statement ok
+MERGE INTO vw.dbo.vec_w t USING (SELECT 1 AS id) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET h = '[0.5,0.25,0.1]'::FLOAT[3];
+
+query II
+SELECT id, h IS NOT DISTINCT FROM (CASE id WHEN 30 THEN '[0.0999755859375,0.0999755859375,0.0999755859375]' ELSE '[0.5,0.25,0.0999755859375]' END)::FLOAT[3] FROM vw.dbo.vec_w WHERE id IN (1, 30) ORDER BY id;
+----
+1	true
+30	true
+
+statement ok
+RESET mssql_dml_pushdown;
+
+# A constant assigned to a float16 column through #stage (UPDATE past the stage threshold): the stage
+# is declared as the target, so the value is sent as float16 bytes.
+statement ok
+SET mssql_dml_stage_threshold = 0;
+
+statement ok
+UPDATE vw.dbo.vec_w SET h = '[0.1,-2,0.5]'::FLOAT[3] WHERE id = 2;
+
+statement ok
+RESET mssql_dml_stage_threshold;
+
+query I
+SELECT h IS NOT DISTINCT FROM '[0.0999755859375,-2,0.5]'::FLOAT[3] FROM vw.dbo.vec_w WHERE id = 2;
+----
+true
+
+# --- without VECTORSUPPORT: the bulk wire's varbinary is taken on every session (V6), and so is the
+# literal; read back through the catalog that has the feature
+statement ok
+SET mssql_vector_support = false;
+
+statement ok
+ATTACH '{MSSQL_TESTDB_DSN}' AS vwj (TYPE mssql);
+
+statement ok
+RESET mssql_vector_support;
+
+statement ok
+SELECT mssql_exec('vw', 'DELETE FROM dbo.vec_w2');
+
+statement ok
+SET mssql_insert_bcp_threshold = 1;
+
+statement ok
+INSERT INTO vwj.dbo.vec_w2 SELECT * FROM vw_src WHERE id <= 2;
+
+statement ok
+RESET mssql_insert_bcp_threshold;
+
+statement ok
+INSERT INTO vwj.dbo.vec_w2 SELECT * FROM vw_src WHERE id > 2;
+
+query I
+SELECT count(*) FROM vw.dbo.vec_w2 r JOIN vw_exp e USING (id) WHERE r.v IS NOT DISTINCT FROM e.v AND r.h IS NOT DISTINCT FROM e.h;
+----
+4
+
+statement ok
+DETACH vwj;
+
+statement ok
+SELECT mssql_exec('vw', 'DROP TABLE IF EXISTS dbo.vec_w; DROP TABLE IF EXISTS dbo.vec_w2; DROP TABLE IF EXISTS dbo.vec_copy; DROP TABLE IF EXISTS dbo.vec_copy_new; DROP TABLE IF EXISTS dbo.vec_ctas; DROP TABLE IF EXISTS dbo.vec_bad');
+
+statement ok
+DETACH vw;

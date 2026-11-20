@@ -160,6 +160,38 @@ A raw `mssql_scan` reads any `datetime2` as `TIMESTAMP`, whatever the setting.
 - **CTAS**: Supported via BCP protocol
 - **INSERT/UPDATE via SQL literals**: Supported for small values (up to 4096 bytes). Larger XML values error with a recommendation to use COPY TO with BCP protocol
 
+### Vector Type (SQL Server 2025)
+
+| SQL Server Type          | DuckDB Type | Notes |
+| ------------------------ | ----------- | ----- |
+| `vector(n)`              | `FLOAT[n]`  | n from 1 to 1998; read from its bytes |
+| `vector(n, float16)`     | `FLOAT[n]`  | each element widened exactly |
+
+The extension asks the server for its vector wire form at login (`mssql_vector_support`, default
+`true`, read when the database is attached). SQL Server 2025 then sends a float32 `vector(n)` as its
+bytes, which read exactly. A `vector(n, float16)` still arrives as JSON text, and so does every vector
+when the setting is off or the server does not grant the feature: the text is parsed on the client,
+exactly for float16 and to within one unit in the last place for float32 (the server prints 8
+significant digits, which do not name every float32). A `WARNING` in `duckdb_logs` says so when it
+happens to a float32 column.
+
+```sql
+SELECT id, embedding FROM sqlserver.dbo.docs;             -- embedding: FLOAT[1536]
+SELECT * FROM mssql_scan('sqlserver', 'SELECT embedding FROM dbo.docs');
+```
+
+A raw `mssql_scan()` reads a vector the server sends as bytes as `FLOAT[n]`, and one it sends as text
+as `VARCHAR`, the server's own text: the text carries no dimension count to type it by.
+
+**Writing.** `INSERT`, `UPDATE`, `MERGE`, `COPY` and CTAS take a `FLOAT[n]` value. A small `INSERT` or
+`UPDATE` sends it as text with 9 significant digits, exact for float32, and the server converts it to
+the column's type. COPY, a large `INSERT`, CTAS and a staged `UPDATE` / `MERGE` send its bytes, a
+float16 column's elements rounded to nearest even. A CTAS or a COPY that creates its table creates
+`vector(n)` from `FLOAT[n]`; a `DOUBLE[n]` is refused with the fix named (`::FLOAT[n]`), and so are a
+NULL element, a NaN or an infinity, and a float16 value that rounds past 65504 (65520 or more; a
+value below that is rounded to 65504). A filter on a vector column runs in
+DuckDB, and it is never a row key.
+
 ### Legacy LOB Types
 
 `TEXT`, `NTEXT` and `IMAGE` columns **are readable**: `TEXT`/`NTEXT` arrive as
@@ -282,13 +314,53 @@ declared length -- is not kept.
 
 A filter on the column runs in DuckDB, over the `VARIANT`: SQL Server compares a `sql_variant` by its
 base type in an order of its own, so `WHERE v = 5` finds the `int` 5 and `WHERE v = '5'` the string
-`'5'`, in DuckDB as on the server. Such a column is never a row key. Writing a `VARIANT` into SQL
-Server comes with a later release: an `INSERT` / `UPDATE` / `COPY` / CTAS of one is refused by name
-(a `NULL` is written as before); write such values with `mssql_exec()`.
+`'5'`, in DuckDB as on the server. Such a column is never a row key.
 
-`hierarchyid` and CLR UDT columns are read as text by the catalog scan, so three-part-name queries
-return a `VARCHAR`; a raw `mssql_scan()` that selects one without a conversion fails: convert it in
-the T-SQL.
+A `VARIANT` is written into a `sql_variant` column -- `INSERT`, `UPDATE`, `MERGE`, `COPY`, and a
+CTAS, which creates the column as `sql_variant` -- each value under the narrowest SQL Server type that
+holds every value of its DuckDB type:
+
+| inside the `VARIANT` | written as |
+|---|---|
+| `BOOLEAN` | `bit` |
+| `TINYINT` / `SMALLINT` / `UTINYINT` | `smallint` / `smallint` / `tinyint` |
+| `INTEGER` / `USMALLINT` / `BIGINT` / `UINTEGER` | `int` / `int` / `bigint` / `bigint` |
+| `UBIGINT` / `HUGEINT` / `UHUGEINT` | `decimal(38,0)` when it has 38 digits or fewer |
+| `FLOAT` / `DOUBLE` | `real` / `float` |
+| `DECIMAL(w,s)` | `decimal(w,s)` |
+| `DATE` / `TIME` / `TIME_NS` | `date` / `time(6)` / `time(7)` |
+| `TIMESTAMP_S` / `_MS` / `TIMESTAMP` / `_NS` | `datetime2(0)` / `(3)` / `(6)` / `(7)` (nanoseconds rounded to 100 ns) |
+| `TIMESTAMPTZ` (microseconds / nanoseconds) | `datetimeoffset(6)` / `(7)` at `+00:00` |
+| `UUID` | `uniqueidentifier` |
+| `BLOB` | `varbinary(n)`, up to 8000 bytes |
+| `VARCHAR` | `nvarchar(n)`, up to 4000 UTF-16 units; longer, `varchar(n)` when it is all ASCII (up to 8000) |
+
+An `INSERT ... SELECT` from a table of the same attached database is sent to the server whole by default
+(`mssql_dml_pushdown`), and the server copies each `sql_variant` value as it is -- its base type,
+precision, scale, length and collation unchanged. The table above is what a `VARIANT` that comes
+through DuckDB is written as. So a value read and written back keeps its value and its `VARIANT` type,
+while its SQL Server type may change: a `numeric` returns as a `decimal`, `money` as `decimal(19,4)`, `smallmoney` as `decimal(10,4)`, a `time(0)`-`(5)` as `time(6)`, a `datetime2(1)` / `(2)` as `datetime2(3)` and `(4)` / `(5)` as `datetime2(6)`, a `datetime` / `smalldatetime` as `datetime2(6)`, a `datetime2(7)` / `datetimeoffset(7)` outside 1677-2262 at scale 6, a `datetimeoffset` at `+00:00` (scale 6 below 7), a `char` / `varchar` / `nchar` as `nvarchar`, a `binary` as `varbinary`. A string value is written under the
+database's default collation -- except, on the bulk path (COPY, a large INSERT, CTAS, a staged UPDATE
+or MERGE), a database collation this version does not know, which is written as
+`Latin1_General_100_BIN2_UTF8`: such a value then compares and sorts by that collation rather than the
+database's. A value `sql_variant` cannot hold -- a list or struct, an `INTERVAL`, a
+`TIMETZ`, `NaN` or an infinity, a date outside 0001-9999, a number past 38 digits, a longer string or
+blob, a `VARCHAR` whose bytes are not valid UTF-8 -- is refused, the column and the value's type named;
+write such values with `mssql_exec()`. A subnormal `DOUBLE` (below about 2.2e-308) written as a
+literal -- an INSERT of up to `mssql_insert_bcp_threshold` rows, an UPDATE of up to
+`mssql_dml_stage_threshold` rows -- is stored as 0, as it is for a plain `float` column; the bulk paths (COPY, a large INSERT, CTAS, a staged UPDATE / DELETE / MERGE)
+keep it (an UPDATE past its threshold stages). A plain `float` column written as a literal also
+stores -0.0 as 0; a `VARIANT` keeps its sign.
+
+A `hierarchyid` column is a `VARCHAR` of its `ToString()` text (`/1/2.5/-3/`), through the catalog
+and a raw `mssql_scan()` alike: the value comes as the server stores it and is decoded on the client.
+The text does not sort or compare like the tree -- `/10/` follows `/2/` in the tree and precedes it as
+text --, so a filter or `ORDER BY` on the column runs in DuckDB, over the text, and the column is never
+a row key. Write one as its text: `INSERT INTO db.dbo.t (h) VALUES ('/1/2/')`. To order by the tree,
+order in the T-SQL of an `mssql_scan()` (`ORDER BY h`).
+
+A column of a user CLR type is read through the catalog as its `ToString()` text (a `VARCHAR`), and by
+a raw `mssql_scan()` as its bytes, a `BLOB` -- what `CAST(x AS varbinary(max))` returns.
 
 ### Catalog-Reported String Types
 

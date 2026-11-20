@@ -130,7 +130,7 @@ TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn login_respon
 # whole space-separated words, so a stray separator or a typo would otherwise build fewer harnesses
 # than asked, green.
 TARGETS="$(printf '%s %s' "${TARGETS}" "${TARGETS_EXTRA:-}" | tr ',\n\r\t' '    ')"
-KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd variant_envelope ssclrt "
+KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_page_ci variant_envelope vector hierarchyid ssclrt "
 for t in ${TARGETS}; do
 	if [[ "${KNOWN_TARGETS}" != *" ${t} "* ]]; then
 		echo "ERROR: unknown fuzz target '${t}' in TARGETS / TARGETS_EXTRA (known:${KNOWN_TARGETS})" >&2
@@ -196,6 +196,39 @@ if want ssclrt; then
 	SSCLRT_OBJS="$(compile_objs ssclrt "${REPO}/src/codec/clr/ssclrt_wkb.cpp")"
 	build_harness fuzz_ssclrt fuzz_ssclrt.cc ${SSCLRT_OBJS}
 fi
+# 5b'''. A hierarchyid's bit string as its ToString() text (spec 093 T4, D5): one source, DuckDB-free.
+#       Not a default target either; the weekly run fuzzes it through .clusterfuzzlite/extra_targets.
+if want hierarchyid; then
+	HID_OBJS="$(compile_objs hid "${REPO}/src/codec/clr/hierarchyid.cpp")"
+	build_harness fuzz_hierarchyid fuzz_hierarchyid.cc ${HID_OBJS}
+fi
+# 5b''''. A SQL Server vector(n) value (spec 093 T3): its bytes and its JSON text, standalone like
+#       variant_envelope. The text parse is DuckDB's fast_float (namespace duckdb_fast_float), header-only:
+#       the submodule's when it is checked out, else that file fetched at the submodule's commit (the
+#       ClusterFuzzLite checkout has no submodules), as simdutf is fetched. Not a default target.
+FAST_FLOAT_INC=""
+ensure_fast_float() {
+	[[ -n "${FAST_FLOAT_INC}" ]] && return 0
+	local in_tree="${REPO}/duckdb/third_party/fast_float"
+	if [[ -f "${in_tree}/fast_float/fast_float.h" ]]; then
+		FAST_FLOAT_INC="-I${in_tree}"
+		return 0
+	fi
+	local sha
+	sha="$(git -C "${REPO}" ls-tree HEAD duckdb 2>/dev/null | awk '{print $3}')"
+	[[ -n "${sha}" ]] || sha="v2.0.0"
+	mkdir -p "${WORK}/fast_float/fast_float"
+	echo ">> fetching DuckDB's fast_float.h at ${sha}"
+	curl -fsSL "https://raw.githubusercontent.com/duckdb/duckdb/${sha}/third_party/fast_float/fast_float/fast_float.h" \
+		-o "${WORK}/fast_float/fast_float/fast_float.h"
+	FAST_FLOAT_INC="-I${WORK}/fast_float"
+}
+if want vector; then
+	ensure_fast_float
+	INC="${INC} ${FAST_FLOAT_INC}"
+	VEC_OBJS="$(compile_objs vec "${REPO}/src/codec/sql_vector/vector_bytes.cpp")"
+	build_harness fuzz_vector fuzz_vector.cc ${VEC_OBJS}
+fi
 
 # 5c. The backup reader (spec 085): the MTF walk and header fields, the MSSQLBAK container (chain,
 #     tail, media label, data set, resync search), the MS_XPRESS decoder, and the page index with the
@@ -235,14 +268,14 @@ BACKUP_LOB_SRCS=("${BACKUP}/backup_lob_map.cpp")
 BACKUP_CD_SRCS=("${BACKUP}/backup_cd_record.cpp")
 BACKUP_OBJS=""
 if want backup_mtf || want backup_container || want backup_xpress || want backup_page || want backup_catalog ||
-	want backup_record || want backup_lob || want backup_cd; then
+	want backup_record || want backup_lob || want backup_cd || want backup_page_ci; then
 	BACKUP_OBJS="$(compile_objs backup "${BACKUP_SRCS[@]}")"
 fi
 want backup_mtf && build_harness fuzz_backup_mtf fuzz_backup_mtf.cc ${BACKUP_OBJS}
 want backup_container && build_harness fuzz_backup_container fuzz_backup_container.cc ${BACKUP_OBJS}
 want backup_xpress && build_harness fuzz_backup_xpress fuzz_backup_xpress.cc ${BACKUP_OBJS}
 want backup_page && build_harness fuzz_backup_page fuzz_backup_page.cc ${BACKUP_OBJS}
-if want backup_catalog || want backup_record || want backup_lob || want backup_cd; then
+if want backup_catalog || want backup_record || want backup_lob || want backup_cd || want backup_page_ci; then
 	BACKUP_CATALOG_OBJS="$(compile_objs backup_catalog "${BACKUP_CATALOG_SRCS[@]}")"
 fi
 want backup_catalog && build_harness fuzz_backup_catalog fuzz_backup_catalog.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS}
@@ -257,6 +290,11 @@ fi
 if want backup_cd; then
 	BACKUP_CD_OBJS="$(compile_objs backup_cd "${BACKUP_CD_SRCS[@]}")"
 	build_harness fuzz_backup_cd fuzz_backup_cd.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS} ${BACKUP_CD_OBJS}
+fi
+# PAGE compression (spec 086 PR 2): ReadPageCompression, and CdRow::Read with a page's compression information.
+if want backup_page_ci; then
+	BACKUP_PAGE_CI_OBJS="$(compile_objs backup_page_ci "${BACKUP_CD_SRCS[@]}")"
+	build_harness fuzz_backup_page_ci fuzz_backup_page_ci.cc ${BACKUP_OBJS} ${BACKUP_CATALOG_OBJS} ${BACKUP_PAGE_CI_OBJS}
 fi
 
 # 6. The STAGED read path (spec 059 D4): parser in raw-row mode feeding
@@ -313,9 +351,12 @@ if want row_stager; then
 		"${REPO}/src/dml/insert/mssql_value_serializer.cpp"
 	)
 	# The family codecs supply the finalize kernels, the code-page module one of them.
-	for f in "${REPO}"/src/codec/*.cpp "${REPO}"/src/codec/code_page/*.cpp; do
+	for f in "${REPO}"/src/codec/*.cpp "${REPO}"/src/codec/code_page/*.cpp "${REPO}"/src/codec/variant/*.cpp \
+		"${REPO}"/src/codec/sql_vector/*.cpp; do
 		STAGER_SRCS+=("${f}")
 	done
+	ensure_fast_float  # src/codec/sql_vector (spec 093 T3)
+	INC="${INC} ${FAST_FLOAT_INC}"
 	STAGER_OBJS="$(compile_objs stager "${STAGER_SRCS[@]}")"
 	echo ">> linking fuzz_row_stager"
 	"${CXX}" ${CXXFLAGS} ${INC} ${SIMDUTF_INC} \
@@ -355,9 +396,12 @@ if want bcp_encode; then
 	# The family codecs: string_codec.cpp is the target, and the dispatchers
 	# beside it (literal_format, type_family) are what it links against, and it
 	# calls the code-page module.
-	for f in "${REPO}"/src/codec/*.cpp "${REPO}"/src/codec/code_page/*.cpp; do
+	for f in "${REPO}"/src/codec/*.cpp "${REPO}"/src/codec/code_page/*.cpp "${REPO}"/src/codec/variant/*.cpp \
+		"${REPO}"/src/codec/sql_vector/*.cpp; do
 		ENCODE_SRCS+=("${f}")
 	done
+	ensure_fast_float  # src/codec/sql_vector (spec 093 T3)
+	INC="${INC} ${FAST_FLOAT_INC}"
 	ENCODE_OBJS="$(compile_objs encode "${ENCODE_SRCS[@]}")"
 	echo ">> linking fuzz_bcp_encode"
 	"${CXX}" ${CXXFLAGS} ${INC} ${SIMDUTF_INC} \
@@ -367,8 +411,8 @@ fi
 
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---
 for t in browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode \
-	backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd variant_envelope \
-	ssclrt; do
+	backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_page_ci \
+	variant_envelope vector hierarchyid ssclrt; do
 	# Only the corpora of the targets this build makes: OSS-Fuzz pairs a zip with its binary.
 	want "${t}" || continue
 	if [[ -d "${HERE}/corpus/${t}" ]]; then

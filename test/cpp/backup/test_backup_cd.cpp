@@ -307,7 +307,8 @@ int main() {
 	// Malformed records: named, never read past.
 	Check(Throws([] { OnPage p(Hex("010222838100000080"), 3); }, "runs past"), "a record past its limit");
 	Check(Throws([] { OnPage p(Hex("0102d2838100000080")); }, "CD code 13"), "a CD code no value has");
-	Check(Throws([] { OnPage p(Hex("1502228381000000")); }, "record type 5"), "a record type the reader does not know");
+	Check(Throws([] { OnPage p(Hex("1902228381000000")); }, "record type 6"),
+		  "a record type the reader does not know (6; 5 is a ghost forwarded record, E23)");
 	Check(Throws([] { OnPage p(Hex("4102228381000000")); }, "not a CD record the reader knows"),
 		  "a header bit the reader does not know (0x40)");
 	Check(Throws([] { Value(Record(6, "0ff2610010"), Column("v", XTYPE_NVARCHAR, -2, 80)); }, "reserved SCSU tag 242"),

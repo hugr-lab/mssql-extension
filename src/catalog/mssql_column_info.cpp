@@ -113,6 +113,17 @@ MSSQLReadForm MSSQLColumnInfo::ReadFormFor(const string &sql_type_name) {
 	if (StringUtil::CIEquals(sql_type_name, "sql_variant")) {
 		return MSSQLReadForm::Bare;
 	}
+	// hierarchyid (spec 093 T4, D5): read bare (UDT 0xF0) and decoded on the client into its ToString()
+	// text; the server compares and sorts it unlike its text, so ComparisonDiffersFor keeps it out of
+	// pushed filters, ORDER BY and keys. A user CLR type keeps its cast (opaque bytes otherwise).
+	if (StringUtil::CIEquals(sql_type_name, "hierarchyid")) {
+		return MSSQLReadForm::Bare;
+	}
+	// vector (spec 093 T3, D4): read bare, as the session streams it (VECTORTYPE under VECTORSUPPORT, its
+	// JSON text otherwise); compared by the server unlike DuckDB (not on ComparisonDiffersFor's list).
+	if (StringUtil::CIEquals(sql_type_name, "vector")) {
+		return MSSQLReadForm::Bare;
+	}
 	return IsKnownSQLServerType(sql_type_name) ? MSSQLReadForm::Bare : MSSQLReadForm::ServerCast;
 }
 
@@ -138,16 +149,19 @@ bool MSSQLColumnInfo::BulkWireTakesType(const string &sql_type_name) {
 	// measured first (spec 093 T2, T6), never because it became decodable (#296). A geometry /
 	// geography value is WKB in DuckDB, which the statement path renders as a 0x literal the server
 	// converts (STGeomFromWKB); on the bulk wire FromServerColumn would declare it nvarchar and send the
-	// bytes as text (T6 writes it). The same for hierarchyid, read through a cast: the statement path
-	// sends a string literal the server converts, the bulk wire would not. sql_variant's write is T2's
-	// (refused until then).
+	// bytes as text (T6 writes it). The same for hierarchyid, read as its text (decoded on the client, T4):
+	// the statement path sends a string literal the server parses, the bulk wire would not. sql_variant's
+	// write is T2's (refused until then).
+	// vector (spec 093 T3): its bytes as varbinary under a declared vector(n), measured V6.
 	const string t = StringUtil::Lower(sql_type_name);
-	return t == "bit" || t == "tinyint" || t == "smallint" || t == "int" || t == "bigint" || t == "real" ||
-		   t == "float" || t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" || t == "char" ||
-		   t == "varchar" || t == "text" || t == "nchar" || t == "nvarchar" || t == "ntext" || t == "date" ||
-		   t == "time" || t == "datetime" || t == "datetime2" || t == "smalldatetime" || t == "datetimeoffset" ||
-		   t == "binary" || t == "varbinary" || t == "image" || t == "uniqueidentifier" || t == "timestamp" ||
-		   t == "rowversion" || t == "json" || t == "xml";
+	return t == "vector" || t == "bit" || t == "tinyint" || t == "smallint" || t == "int" || t == "bigint" ||
+		   t == "real" || t == "float" || t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" ||
+		   t == "char" || t == "varchar" || t == "text" || t == "nchar" || t == "nvarchar" || t == "ntext" ||
+		   t == "date" || t == "time" || t == "datetime" || t == "datetime2" || t == "smalldatetime" ||
+		   t == "datetimeoffset" || t == "binary" || t == "varbinary" || t == "image" || t == "uniqueidentifier" ||
+		   t == "timestamp" || t == "rowversion" || t == "json" || t == "xml" ||
+		   // Spec 093 T2: SSVARIANT envelopes (S2: INSERT BULK takes them, base type and value kept).
+		   t == "sql_variant";
 }
 
 //===----------------------------------------------------------------------===//
@@ -157,8 +171,9 @@ bool MSSQLColumnInfo::BulkWireTakesType(const string &sql_type_name) {
 LogicalType MSSQLColumnInfo::NativeDuckDBType() const {
 	// Only a bounded character column has anything to state. A MAX column
 	// (max_length -1) is already what a plain VARCHAR means, and a column that is
-	// not read as a bare string -- geometry, hierarchyid (a CAST), sql_variant (a
-	// VARIANT) -- does not arrive as the type the catalog names anyway.
+	// not read as a bare string -- geometry, sql_variant (a VARIANT) -- does
+	// not arrive as the type the catalog names anyway; hierarchyid (its text,
+	// spec 093 T4) falls through to the plain VARCHAR below.
 	//
 	// text/ntext are NOT caught by this guard, despite being MAX by nature:
 	// sys.columns reports max_length 16 for them (the in-row pointer size, which
@@ -399,6 +414,14 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 	// already what the vector wants. A raw scan, typed by the describe, reads VARCHAR.
 	if (lower_type == "json") {
 		return LogicalType::JSON();
+	}
+
+	// vector(n) (SQL Server 2025, spec 093 D4): FLOAT[n], float16 elements widened exactly. sys.columns
+	// gives the element type in scale (0 float32, 1 float16) and 8 + n x element size in max_length (V5).
+	if (lower_type == "vector") {
+		const int element = scale == 1 ? 2 : 4;
+		const int dimensions = max_length > 8 ? (max_length - 8) / element : 1;
+		return LogicalType::ARRAY(LogicalType::FLOAT, static_cast<idx_t>(dimensions));
 	}
 
 	// Special types
@@ -660,7 +683,7 @@ string MSSQLColumnInfo::BuildReadExpression(const string &col_name, const string
 		return "CAST(" + reference + " AS VARBINARY(MAX)) AS " + escaped_name;
 	}
 
-	// Unsupported SQL Server types (hierarchyid, CLR UDTs) must be CAST to
+	// Unsupported SQL Server types (a user CLR UDT) must be CAST to
 	// NVARCHAR(MAX) so the server sends text instead of a native wire form
 	// nothing decodes.
 	if (ReadFormFor(sql_type_name) == MSSQLReadForm::ServerCast) {

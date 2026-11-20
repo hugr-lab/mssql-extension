@@ -425,6 +425,12 @@ bool NodeWriter::WriteSelectList(const SelectNode &node) {
 	std::string list;
 	auto add = [&](idx_t index, const std::string &alias) {
 		const auto &column = columns_[index];
+		// Spec 093 D4: a vector column streams VECTORTYPE or its JSON text as the session negotiated, and a
+		// pushed statement's result types are fixed before it runs; the catalog scan reads either form.
+		// Copied as written (a pushed INSERT ... SELECT), the server keeps its bytes.
+		if (!raw_columns_ && StringUtil::CIEquals(column.sql_type_name, "vector")) {
+			return Veto("a vector column in the result");
+		}
 		// A column's result name is its DuckDB name (issue #572: the server's `ID` beside `Id` reads as
 		// ID_1), sent as an alias where the two differ.
 		const std::string output = alias.empty() ? column.DuckDBName() : alias;
@@ -1129,6 +1135,25 @@ bool NodeWriter::WriteSetOperation(const SetOperationNode &node) {
 					!StringUtil::CIEquals(child.FlatColumn(output.column_index).sql_type_name,
 										  first.FlatColumn(reference.column_index).sql_type_name)) {
 					return Veto("set operation string columns that are not columns of one type and collation");
+				}
+			}
+			{
+				// A type the server converts by its own rules (hierarchyid read as its text, sql_variant, ...:
+				// comparison_differs) unifies with another member there by the server's precedence, which
+				// DuckDB's type does not show: an nvarchar member beside a hierarchyid one is converted to
+				// hierarchyid on the server. Every member is then a plain column of that one server type,
+				// whichever comes first (review of #593: the String check above saw only one order).
+				auto &reference = first.Outputs()[i];
+				const bool ref_column = reference.column_index != DConstants::INVALID_INDEX;
+				const bool mine_differs = column && child.FlatColumn(output.column_index).comparison_differs;
+				const bool theirs_differs = ref_column && first.FlatColumn(reference.column_index).comparison_differs;
+				if ((mine_differs || theirs_differs) &&
+					(!column || !ref_column || !output.plain_read || !reference.plain_read ||
+					 !StringUtil::CIEquals(child.FlatColumn(output.column_index).sql_type_name,
+										   first.FlatColumn(reference.column_index).sql_type_name))) {
+					return Veto(
+						"set operation columns of different server types, one converted by the server's "
+						"own rules");
 				}
 			}
 			if (compares) {

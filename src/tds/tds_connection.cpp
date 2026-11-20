@@ -123,6 +123,8 @@ TdsConnection::TdsConnection(TdsConnection &&other) noexcept
 	  state_(other.state_.load()),
 	  tls_options_(std::move(other.tls_options_)),
 	  request_utf8_support_(other.request_utf8_support_),
+	  request_vector_support_(other.request_vector_support_),
+	  vector_support_version_(other.vector_support_version_),
 	  host_(std::move(other.host_)),
 	  port_(other.port_),
 	  database_(std::move(other.database_)),
@@ -159,6 +161,8 @@ TdsConnection &TdsConnection::operator=(TdsConnection &&other) noexcept {
 		negotiated_packet_size_ = other.negotiated_packet_size_;
 		tls_options_ = std::move(other.tls_options_);
 		request_utf8_support_ = other.request_utf8_support_;
+		request_vector_support_ = other.request_vector_support_;
+		vector_support_version_ = other.vector_support_version_;
 		requested_packet_size_ = other.requested_packet_size_;
 
 		other.state_.store(ConnectionState::Disconnected);
@@ -611,7 +615,7 @@ LoginAttemptOutcome TdsConnection::DoLogin7WithFedAuth(const std::string &databa
 
 	// Step 1: Send LOGIN7 with ADAL FEDAUTH extension (no token embedded)
 	TdsPacket login = TdsProtocol::BuildLogin7WithADAL(client_hostname, tds_server_name_, database, fedauth_echo_,
-													   login7_app_name, requested_packet_size_, request_utf8_support_);
+													   login7_app_name, requested_packet_size_, RequestedFeatures());
 	login.SetPacketId(next_packet_id_++);
 
 	// Debug: dump LOGIN7 payload (last 20 bytes should contain FEDAUTH extension)
@@ -882,7 +886,7 @@ bool TdsConnection::AuthenticateIntegrated(const std::string &database, Authenti
 		const std::string login7_app_name = app_name.empty() ? "DuckDB MSSQL Extension" : app_name;
 		TdsPacket login = TdsProtocol::BuildLogin7WithSSPI(
 			client_hostname, tds_server_name_.empty() ? host_ : tds_server_name_, database, initial_blob,
-			login7_app_name, requested_packet_size_, request_utf8_support_);
+			login7_app_name, requested_packet_size_, RequestedFeatures());
 
 		// A Kerberos LOGIN7 carrying a real Active Directory PAC routinely exceeds
 		// the 4096-byte pre-negotiation packet size. LOGIN7 is sent before
@@ -1035,7 +1039,7 @@ LoginAttemptOutcome TdsConnection::DoLogin7(const std::string &username, const s
 	// unconditionally before spec 055) pinned every packet in both directions
 	// at 4096 for the life of the connection.
 	TdsPacket login = TdsProtocol::BuildLogin7(host_, username, password, database, login7_app_name,
-											   requested_packet_size_, request_utf8_support_, tds_server_name_);
+											   requested_packet_size_, RequestedFeatures(), tds_server_name_);
 	login.SetPacketId(next_packet_id_++);
 
 	if (!socket_->SendPacket(login)) {

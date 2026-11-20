@@ -67,7 +67,7 @@ SELECT * FROM mssql_scan('retu', 'SELECT id, g.STAsText() AS wkt FROM dbo.RetUdt
 2	POINT (3 4)
 
 # --- a sql_variant column comes back as a VARIANT of its base type, as a catalog scan reads it
-# (spec 093 T1); writing one is spec 093 T2, refused by name until then.
+# (spec 093 T1), and is written from one (T2): 'hello' as nvarchar(5).
 statement ok
 SELECT mssql_exec('retu', 'INSERT INTO dbo.RetUdt (v, n) VALUES (CAST(N''hello'' AS nvarchar(10)), 9)');
 
@@ -76,10 +76,15 @@ UPDATE retu.dbo.RetUdt SET n = 10 WHERE n = 9 RETURNING id, variant_typeof(v), v
 ----
 3	VARCHAR	hello	10
 
-statement error
-INSERT INTO retu.dbo.RetUdt (v, n) VALUES ('hello', 9) RETURNING id, v, n;
+query ITI
+INSERT INTO retu.dbo.RetUdt (v, n) VALUES ('hello', 9) RETURNING id, v::VARCHAR, n;
 ----
-a VARIANT value cannot be written to SQL Server yet
+4	hello	9
+
+query T
+SELECT * FROM mssql_scan('retu', 'SELECT CAST(SQL_VARIANT_PROPERTY(v, ''BaseType'') AS nvarchar(20)) FROM dbo.RetUdt WHERE id = 4');
+----
+nvarchar
 
 # --- RETURNING * takes the whole width, which is what the OUTPUT clause always
 # built. The types are the catalog's: GEOMETRY for the spatial column, VARCHAR
@@ -87,12 +92,12 @@ a VARIANT value cannot be written to SQL Server yet
 query IIIII
 INSERT INTO retu.dbo.RetUdt (n) VALUES (11) RETURNING id, ST_AsText(g), h, v, n;
 ----
-4	NULL	NULL	NULL	11
+5	NULL	NULL	NULL	11
 
 query I
 SELECT count(*) FROM retu.dbo.RetUdt;
 ----
-4
+5
 
 statement ok
 SELECT mssql_exec('retu', 'DROP TABLE dbo.RetUdt; DROP TABLE dbo.RetUdtSrc');

@@ -1031,15 +1031,26 @@ static void TestD2AnswersAreSeparate() {
 	for (const char *t : {"int", "nvarchar", "datetime2", "datetimeoffset", "uniqueidentifier", "xml"}) {
 		ASSERT_TRUE(!MSSQLColumnInfo::ComparisonDiffersFor(t));
 	}
-	for (const char *t : {"sql_variant", "hierarchyid", "vector", "geometry", "geography", "my_clr_type"}) {
+	for (const char *t : {"hierarchyid", "geometry", "geography", "my_clr_type"}) {
 		ASSERT_TRUE(!MSSQLColumnInfo::BulkWireTakesType(t));
 	}
-	for (const char *t : {"int", "nvarchar", "datetime2", "rowversion", "json", "xml"}) {
+	// vector and sql_variant joined the bulk wire in their own write PRs (spec 093 T3: its bytes as
+	// varbinary, V6; T2: SSVARIANT envelopes, S2), and stay out of comparisons (above).
+	for (const char *t : {"int", "nvarchar", "datetime2", "rowversion", "json", "xml", "vector", "sql_variant"}) {
 		ASSERT_TRUE(MSSQLColumnInfo::BulkWireTakesType(t));
 	}
+	// T4: hierarchyid read bare (decoded on the client) and still compared unlike its text; a user CLR
+	// type keeps its cast.
+	ASSERT_TRUE(MSSQLColumnInfo::ReadFormFor("hierarchyid") == MSSQLReadForm::Bare);
+	ASSERT_TRUE(MSSQLColumnInfo::ReadFormFor("HierarchyId") == MSSQLReadForm::Bare);
+	ASSERT_TRUE(MSSQLColumnInfo::ReadFormFor("my_clr_type") == MSSQLReadForm::ServerCast);
+	ASSERT_TRUE(MSSQLColumnInfo::BuildReadExpression("h", "hierarchyid", 892, "", true, true) == "[h]");
+	ASSERT_TRUE(MSSQLColumnInfo::BuildReadExpression("u", "my_clr_type", 20, "", true, true) ==
+				"CAST([u] AS NVARCHAR(MAX)) AS [u]");
 	// Case as the server spells it in sys.types, or not.
 	ASSERT_TRUE(MSSQLColumnInfo::ComparisonDiffersFor("JSON"));
-	ASSERT_TRUE(!MSSQLColumnInfo::BulkWireTakesType("SQL_VARIANT"));
+	ASSERT_TRUE(MSSQLColumnInfo::BulkWireTakesType("SQL_VARIANT"));
+	ASSERT_TRUE(!MSSQLColumnInfo::BulkWireTakesType("HIERARCHYID"));
 }
 
 // J1 (measured/J1.md): the 2025 json type is compared by nothing but IS NULL on the server (402,

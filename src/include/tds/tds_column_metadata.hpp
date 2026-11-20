@@ -28,19 +28,21 @@ enum class GeometryAs : uint8_t { Geometry, Wkb, Native };
 // ColumnMetadata - Describes a single result column from COLMETADATA token
 //===----------------------------------------------------------------------===//
 
+// Every scalar starts at 0 (spec 093 T4): one default-constructed in a loop took the previous
+// iteration's type_id from the stack, and the describe read a stale 0xF0 as a user CLR type.
 struct ColumnMetadata {
-	std::string name;	  // Column name (UTF-8)
-	uint8_t type_id;	  // TDS type identifier
-	uint16_t max_length;  // Maximum length for variable types
-	uint8_t precision;	  // Precision for DECIMAL/NUMERIC
-	uint8_t scale;		  // Scale for DECIMAL/NUMERIC or TIME
-	uint32_t collation;	  // Collation LCID + flags: the first 4 of the 5 wire bytes
+	std::string name;		  // Column name (UTF-8)
+	uint8_t type_id = 0;	  // TDS type identifier
+	uint16_t max_length = 0;  // Maximum length for variable types
+	uint8_t precision = 0;	  // Precision for DECIMAL/NUMERIC
+	uint8_t scale = 0;		  // Scale for DECIMAL/NUMERIC or TIME
+	uint32_t collation = 0;	  // Collation LCID + flags: the first 4 of the 5 wire bytes
 	// The 5th collation byte, previously parsed and thrown away. It is the
 	// SortId, and for the SQL_* collations it is what names the CODE PAGE --
 	// the first four carry LCID and flags only, so without it a message about
 	// a collation cannot say which one it met (issue #224, from @oluies' #305).
-	uint8_t collation_sort_id;
-	uint16_t flags;	 // Column flags (nullable, identity, etc.)
+	uint8_t collation_sort_id = 0;
+	uint16_t flags = 0;	 // Column flags (nullable, identity, etc.)
 	// The code page this column's bytes are transcoded from (spec 092 D2), or
 	// nullptr: read them verbatim. Set once per column by the stream, after
 	// COLMETADATA and only when its catalog transcodes, so no decoder looks a page
@@ -56,6 +58,31 @@ struct ColumnMetadata {
 	// parser), before its type is asked. The parser leaves the default.
 	GeometryAs geometry_as = GeometryAs::Geometry;
 
+	//! COLMETADATA's UserType (4 bytes), kept since spec 093 T3: VECTOR_USER_TYPE marks a vector column
+	//! in every form it streams, the JSON text included (measured V1).
+	uint32_t user_type = 0;
+	//! A VECTORTYPE (0xF5) column's element type, VECTOR_ELEMENT_FLOAT32 / _FLOAT16; its dimensions are
+	//! (max_length - 8) / element size.
+	uint8_t vector_element_type = 0;
+
+	//! A vector column streamed as VECTORTYPE (spec 093 D4).
+	bool IsVectorWire() const {
+		return type_id == TDS_TYPE_VECTOR;
+	}
+	//! A vector column streamed as its JSON text: varchar(max) / nvarchar(max) carrying UserType 255 --
+	//! a float16 column under VECTORSUPPORT version 1, any vector on a session without the feature.
+	bool IsVectorText() const {
+		return user_type == VECTOR_USER_TYPE && (type_id == TDS_TYPE_BIGVARCHAR || type_id == TDS_TYPE_NVARCHAR);
+	}
+	//! The dimensions of a VECTORTYPE column (ParseTypeInfo checked them).
+	uint16_t VectorDimensions() const {
+		return static_cast<uint16_t>((max_length - VECTOR_HEADER_BYTES) / VectorElementBytes(vector_element_type));
+	}
+
+	//! A UDT column of the system CLR type hierarchyid (spec 093 T4: decoded on the client).
+	bool IsHierarchyIdUdt() const {
+		return type_id == TDS_TYPE_UDT && udt_schema == "sys" && udt_type_name == "hierarchyid";
+	}
 	//! A UDT column of geometry / geography (spec 093 T5: decoded on the client).
 	bool IsSpatialUdt() const {
 		return type_id == TDS_TYPE_UDT && udt_schema == "sys" &&
@@ -64,6 +91,10 @@ struct ColumnMetadata {
 	//! A UDT column of geography: its points are stored latitude first (G3), its type GEOMETRY('OGC:CRS84').
 	bool IsGeographyUdt() const {
 		return type_id == TDS_TYPE_UDT && udt_schema == "sys" && udt_type_name == "geography";
+	}
+	//! A user CLR type (not one of the three system ones): its bytes are opaque, a BLOB (spec 093 T4).
+	bool IsUserClrUdt() const {
+		return type_id == TDS_TYPE_UDT && !IsHierarchyIdUdt() && !IsSpatialUdt();
 	}
 
 	// Derived properties

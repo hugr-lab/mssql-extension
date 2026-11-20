@@ -241,14 +241,38 @@ int main() {
 			}
 		}
 		Check(short_ok, "cut inside any UDT_INFO field: more data needed, not a parse");
-		std::string message;
-		try {
-			duckdb::tds::encoding::TypeConverter::GetDuckDBType(columns[0]);
-		} catch (std::exception &e) {
-			message = e.what();
+		// Spec 093 T4: a ColumnMetadata starts with every scalar 0. The describe built one per row, and
+		// with the scalars uninitialised the row after a UDT one took its stale 0xF0 and read as an
+		// unnamed user CLR type (a BLOB named C1) -- the shape of that loop:
+		bool fresh_ok = true;
+		for (int i = 0; i < 3; i++) {
+			ColumnMetadata c;
+			fresh_ok = fresh_ok && c.type_id == 0 && c.max_length == 0 && c.flags == 0 && !c.IsUserClrUdt();
+			c.type_id = TDS_TYPE_UDT;
+			c.max_length = 892;
+			c.flags = 1;
 		}
-		Check(message.find("column 'u' is of the CLR type dbo.MyType") != std::string::npos,
-			  "a raw scan's refusal names the type: " + message);
+		Check(fresh_ok, "a default ColumnMetadata: type 0, length 0, flags 0, not a UDT");
+		// Spec 093 T4: a user CLR type's bytes are opaque, read as a BLOB.
+		Check(columns[0].IsUserClrUdt() &&
+				  duckdb::tds::encoding::TypeConverter::GetDuckDBType(columns[0]) == duckdb::LogicalType::BLOB,
+			  "a user CLR type reads as a BLOB");
+		// A user type that borrows a system name in another schema is still a user type.
+		ColumnMetadata borrowed = columns[0];
+		borrowed.udt_type_name = "hierarchyid";
+		Check(borrowed.IsUserClrUdt() && !borrowed.IsHierarchyIdUdt(), "dbo.hierarchyid is a user type, not sys's");
+		// hierarchyid is decoded into its text (T4), geometry / geography into GEOMETRY (T5).
+		ColumnMetadata h = columns[0];
+		h.udt_schema = "sys";
+		h.udt_type_name = "hierarchyid";
+		Check(duckdb::tds::encoding::TypeConverter::GetDuckDBType(h) == duckdb::LogicalType::VARCHAR,
+			  "sys.hierarchyid reads as VARCHAR");
+		ColumnMetadata g = columns[0];
+		g.udt_schema = "sys";
+		g.udt_type_name = "geometry";
+		Check(!g.IsUserClrUdt() &&
+				  duckdb::tds::encoding::TypeConverter::GetDuckDBType(g) == duckdb::LogicalType::GEOMETRY(),
+			  "sys.geometry reads as GEOMETRY");
 	}
 
 	std::cout << "An NBCROW variant present by its bitmap but of length 0" << std::endl;

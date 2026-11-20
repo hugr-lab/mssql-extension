@@ -220,8 +220,9 @@ What a `VARIANT` cannot say: decimal vs numeric, money vs decimal(19,4), datetim
 smalldatetime, varchar vs nvarchar, the collation, the declared length. So a `sql_variant` column
 stays out of rowid keys, keyless DML and MERGE ON (D2's comparison fidelity), as #515 records.
 
-**Write** (T2). A `VARIANT` value is written as `CAST(<typed literal> AS <base type>)`, the base
-type chosen from its tag; the server converts it to `sql_variant`. The table is **(derived)**: the
+**Write** (T2). A `VARIANT` value is written as `CAST(CAST(<typed literal> AS <base type>) AS
+sql_variant)`, the base type chosen from its tag (as built, T2: the outer cast keeps a multi-row
+`VALUES` from converting its rows to one type by data type precedence). The table is **(derived)**: the
 narrowest base type that holds every value of the tag.
 
 | `VARIANT` tag | base type written |
@@ -243,19 +244,41 @@ narrowest base type that holds every value of the tag.
 | SQL NULL / VARIANT NULL | NULL |
 
 Refused by name (DQ-43), the column and the value's tag in the message: OBJECT, ARRAY, BIGNUM,
-BITSTRING, GEOMETRY, INTERVAL, TIME_MICROS_TZ, an integer past decimal(38,0), a string that fits
-neither form above, a blob past 8000 bytes, a date or timestamp the server cannot hold (`ServerHoldsTemporal`). The
-value-level literal goes through the existing `FormatSqlLiteral` of the base type's family.
+BITSTRING, GEOMETRY, INTERVAL, TIME_MICROS_TZ, a FLOAT / DOUBLE NaN or ±infinity (real and float
+hold neither), an integer past decimal(38,0), a string that fits neither form above or whose bytes
+are not valid UTF-8, a blob past 8000 bytes, a date or timestamp the server cannot hold
+(`ServerHoldsTemporal`). As built (T2), the literal is `codec/variant/variant_write`'s own, from the
+value's VARIANT bytes -- one write form serves the literal and the bulk envelope --, not
+`FormatSqlLiteral` of the base type's family: a real or float as its double in 17 significant
+digits (duckdb_fmt, whatever the host's locale), a decimal by `Decimal::ToString`. A subnormal
+DOUBLE written as a literal is stored as 0 (measured: the server's parse of `4.9406564584124654E-324`
+flushes it to zero), while the bulk paths keep its bits; a plain `float` column's statement path
+(`FormatSqlLiteral`, the same 17 digits) does the same, so this is the literal's behaviour, not new
+with VARIANT, and no workaround is attempted (T-SQL converts no `varbinary` to `float`). A plain
+`float` column's literal also stores -0.0 as +0 (measured; the float codec's behaviour before T2:
+`RenderFloatLiteral` writes `-0.0`, which T-SQL types as a decimal literal, and a decimal has no
+negative zero); the VARIANT literal (`-0.0000000000000000E+00`, a float literal) keeps the sign. The
+plain codec is left as it is, for the RPC-parameter spec (#515). The literal is the
+statement path's form until the spec that moves row-path DML to native RPC parameters (a
+`sql_variant` as `0x62` with the same envelope; #515) replaces it.
 
-COPY, INSERT BULK and `#stage`: an SSVARIANT bulk encoder (`0x62` in INSERT BULK's COLMETADATA) if
-S2 shows the server takes it. Otherwise:
-- an INSERT of `VARIANT` values stays on the statement path, and COPY of one is refused by name, as
-  geometry is today;
-- an UPDATE of a keyed table setting a `sql_variant` column stays on the VALUES path whatever
-  `mssql_dml_stage_threshold` says;
-- the paths that always stage refuse by name: keyless UPDATE / DELETE whose stage holds a
-  `sql_variant` column, and a staged MERGE whose `#src` would. A CTAS from a `VARIANT` creates a `sql_variant`
-column.
+A string value carries the database's default collation on both paths: the literal by T-SQL's own
+rule, the envelope through the collation the catalog read at ATTACH (`GetDatabaseCollation`) or, for
+COPY into an existing table, the probe's `DATABASEPROPERTYEX(DB_NAME(), 'Collation')`, its bytes
+from the build's collation table (`code_page::WireCollationForName`). A collation the table lacks is
+written on the bulk path as `Latin1_General_100_BIN2_UTF8` (`mssql_utf8_collation`'s default; UTF-8
+collations exist on every target with `sql_variant`: SQL Server 2019+, Azure SQL -- Fabric has no
+`sql_variant`), with no warning (owner, 2026-11-19): such a value then compares and sorts by
+BIN2_UTF8 rather than the database's collation, while the statement path's literal takes the
+database's. The catalog's collation can be empty -- `catalog false` skips the ATTACH query, and a
+server error in it leaves none --; a COPY that creates a table with a `VARIANT` column then reads
+`DATABASEPROPERTYEX(DB_NAME(), 'Collation')` on its own connection (once, only then), and only where
+that read fails too are the string values written as `Latin1_General_100_BIN2_UTF8`.
+
+COPY, INSERT BULK, `#stage` and a staged MERGE's `#src`: the SSVARIANT bulk encoder (`0x62` in
+INSERT BULK's COLMETADATA, LONGLEN maximum 8009; each value its envelope, a NULL a length of 0),
+which S2 measured the server to take (`measured/S2.md`). A CTAS from a `VARIANT` creates a
+`sql_variant` column.
 
 ### D4: `vector(n)` → `FLOAT[n]`
 
@@ -331,6 +354,27 @@ column.
   that has the type (2025, Azure SQL), and refuses by name elsewhere. `DOUBLE[n]` is refused with the
   fix named (`::FLOAT[n]`) **(derived)**: a narrowing the user should write.
 - Filters on a vector are never pushed, and it is never a key (D2).
+- **As built (T3).** `codec/sql_vector` (`vector_bytes`, DuckDB-free and fuzzed by `fuzz_vector`;
+  `vector_codec`, the vectors). Where it departs from the text above:
+  - The statement path's literal is `N'[e1,...]'` (`%.9g`), not `CAST(N'[…]' AS vector(n))`. The
+    server converts a string to the column's own vector type, float16 included. A CAST would need
+    the element type, which an UPDATE's VALUES-join rows do not carry, and a `vector(n)` cast into a
+    float16 column is a conversion nobody measured. Accepted by the owner, 2026-11-20: the literal
+    stays until the RPC-parameter spec (#515) replaces it.
+  - The fallback's `WARNING` is said once per column per statement, as D8's is, not once per catalog:
+    the stream holds no catalog. It is said when a vector column was read into FLOAT[n] from its text
+    on a connection that was not granted VECTORSUPPORT. Under a grant only a float16 column is text,
+    and that text is exact. Accepted by the owner, 2026-11-20.
+  - A CTAS / COPY into a server without the type is refused by the server itself (Msg 2715, "Cannot
+    find data type vector"); no version check runs on the client. Accepted by the owner, 2026-11-20.
+  - The remote-pushdown writer vetoes a vector column in a pushed result. A pushed statement's types
+    are fixed before it runs, and a vector's wire form follows the session (V3: varchar(max) for
+    float16). A pushed INSERT ... SELECT, which copies its columns as written, is not vetoed.
+  - The JSON text may also arrive as nvarchar(max), on a session without UTF8SUPPORT; it is parsed
+    from UTF-16 then.
+  - A staged MERGE stages every value assigned to a vector column as that column (like-target), not
+    CTAS-typed from FLOAT[n]: a float32 vector(n) in #src is not assigned to a float16 column (42238,
+    measured on 2025).
 
 ### D5: `hierarchyid`
 
@@ -338,6 +382,20 @@ The column is read bare (UDT `0xF0`) and decoded on the client into the `ToStrin
 type stays `VARCHAR`. It is non-breaking, and the server's `CAST … NVARCHAR(MAX)` goes. The text does
 not sort like the tree, so it stays out of ORDER BY pushdown, and filters stay in DuckDB (D2). Writes
 are unchanged (a string literal the server parses).
+
+**As built (T4).** `codec/clr/hierarchyid` decodes the bit string (13 label ranges, a level bit, a
+continuing label stored as its value + 1, zero padding shorter than a byte) and encodes it back, for
+the tests and the fuzz harness: one encoding per value, so `fuzz_hierarchyid` asserts a decoded value
+encodes to its own bytes. Checked against G2's server bytes (the root, `/1/2/`, `/1.5/-2/`) and each
+range's bit layout at its ends (`test/cpp/codec/test_hierarchyid.cpp`). H1 is run against the server
+by `test/sql/types/hierarchyid_read.test`, not recorded in `measured/`: every range's first and last
+value at a level's end and inside one, negative and fractional labels, depth 20, an 885-byte path
+and 200 values `GetDescendant` made, each compared with `ToString()` through the catalog and a raw scan.
+`MSSQLColumnInfo::ReadFormFor` answers Bare; `comparison_differs` stays true. A user CLR type is a
+`BLOB` in a raw scan (`ColumnMetadata::IsUserClrUdt`; the describe names it by `system_type_id` 240
+and `user_type_schema` / `user_type_name`, its `system_type_name` NULL -- from the documentation,
+checked by `test/sql/types/clr_udt_raw_scan.test`, whose assembly `test/clr/build.sh` builds in a .NET
+SDK container); through the catalog it keeps `CAST(… AS NVARCHAR(MAX))`.
 
 ### D6: `geometry` / `geography`
 

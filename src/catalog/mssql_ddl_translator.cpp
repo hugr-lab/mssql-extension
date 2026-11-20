@@ -5,6 +5,7 @@
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
+#include "codec/sql_vector/vector_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "codec/type_family.hpp"
 #include "codec/uuid_codec.hpp"
@@ -27,6 +28,9 @@ namespace {
 // (LIST/STRUCT/MAP/UNION/ENUM/BIT/ARRAY — caller may pre-filter for friendlier
 // CTAS-specific error messages).
 string DispatchDdlTypeName(const LogicalType &type, const mssql::CTASConfig &cfg, mssql::codec::DdlContext ctx) {
+	if (type.id() == LogicalTypeId::ARRAY) {
+		return mssql::codec::sql_vector::FormatDdlTypeName(type);  // spec 093 T3: FLOAT[n] -> vector(n)
+	}
 	switch (mssql::codec::FamilyFromLogicalType(type)) {
 	case mssql::codec::TypeFamily::Boolean:
 		return mssql::codec::boolean::FormatDdlTypeName(type, cfg, ctx);
@@ -348,6 +352,11 @@ string MSSQLDDLTranslator::ColumnDeclaration(const MSSQLServerColumnType &column
 			result += "(" + std::to_string(column.precision) + ", " + std::to_string(column.scale) + ")";
 		} else if (type == "time" || type == "datetime2" || type == "datetimeoffset") {
 			result += "(" + std::to_string(column.scale) + ")";
+		} else if (type == "vector") {
+			// Spec 093 T3: sys.columns' scale is the element type, max_length 8 + n x element size (V5).
+			const bool float16 = column.scale == 1;
+			result +=
+				"(" + std::to_string((column.max_length - 8) / (float16 ? 2 : 4)) + (float16 ? ", float16)" : ")");
 		} else if (type == "xml" && !column.xml_collection.empty()) {
 			result += string(column.xml_document ? "(DOCUMENT " : "(CONTENT ") +
 					  mssql::QuoteIdentifier(column.xml_collection_schema) + "." +
@@ -434,14 +443,11 @@ string MSSQLDDLTranslator::MapLogicalTypeToCTAS(const LogicalType &type, const m
 			"CTAS does not support DuckDB type BIT. "
 			"Consider using BOOLEAN or BLOB.");
 	case LogicalTypeId::ARRAY:
-		throw NotImplementedException(
-			"CTAS does not support DuckDB type ARRAY. "
-			"SQL Server has no array type. Consider flattening or serializing to JSON.");
+		// Spec 093 T3: a FLOAT[n] creates vector(n); any other array is refused by name.
+		return mssql::codec::sql_vector::FormatDdlTypeName(type);
 	case LogicalTypeId::VARIANT:
-		// Spec 093: read from a sql_variant (T1); a CTAS creates one from T2 on.
-		throw NotImplementedException(
-			"a VARIANT value cannot be written to SQL Server yet (a sql_variant column is "
-			"written, and created by CTAS, from spec 093 T2 on)");
+		// Spec 093 T2 (D3): each value's base type is its own, in the envelope.
+		return "sql_variant";
 	default:
 		break;
 	}

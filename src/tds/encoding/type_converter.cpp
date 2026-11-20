@@ -6,12 +6,14 @@
 #include <sstream>
 #include "codec/binary_codec.hpp"
 #include "codec/boolean_codec.hpp"
+#include "codec/clr/hierarchyid_codec.hpp"
 #include "codec/clr/spatial_codec.hpp"
 #include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
 #include "codec/float_codec.hpp"
 #include "codec/integer_codec.hpp"
 #include "codec/money_codec.hpp"
+#include "codec/sql_vector/vector_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "codec/uuid_codec.hpp"
 #include "codec/variant/variant_codec.hpp"
@@ -141,27 +143,30 @@ LogicalType TypeConverter::GetDuckDBType(const ColumnMetadata &column) {
 	case TDS_TYPE_IMAGE:
 		return LogicalType::BLOB;
 
-	// A CLR type. geometry / geography (spec 093 T5, D6) are decoded on the client: GEOMETRY of the ISO WKB,
-	// geography's labelled OGC:CRS84 (DQ-45), or a BLOB under the catalog's geometry_as 'wkb' / 'native'.
-	// The rest are not read by a raw scan yet (T4): their COLMETADATA and rows are parsed (T0), so the
-	// refusal names the type; an attached catalog reads them through a server-side conversion.
+	// A CLR type: hierarchyid decoded on the client into its ToString() text (spec 093 T4), geometry /
+	// geography into GEOMETRY of the ISO WKB, geography's labelled OGC:CRS84 (DQ-45), or a BLOB under the
+	// catalog's geometry_as 'wkb' / 'native' (T5, D6), and a user CLR type as its bytes (opaque by design).
 	case TDS_TYPE_UDT: {
+		if (column.IsHierarchyIdUdt()) {
+			return LogicalType::VARCHAR;
+		}
 		if (column.IsSpatialUdt()) {
 			if (column.geometry_as != GeometryAs::Geometry) {
 				return LogicalType::BLOB;
 			}
 			return column.IsGeographyUdt() ? LogicalType::GEOMETRY("OGC:CRS84") : LogicalType::GEOMETRY();
 		}
-		const std::string type_name =
-			column.udt_type_name.empty() ? std::string("UDT") : column.udt_schema + "." + column.udt_type_name;
-		throw InvalidInputException(
-			"MSSQL Error: column '%s' is of the CLR type %s, which a raw mssql_scan does not read yet. Read it "
-			"through an attached catalog, or convert it in the query (CAST(... AS nvarchar(max))).",
-			column.name.c_str(), type_name.c_str());
+		return LogicalType::BLOB;  // IsUserClrUdt
 	}
 	// sql_variant (spec 093 T1, D3): each value a VARIANT of its base type.
 	case TDS_TYPE_SQL_VARIANT:
 		return LogicalType::VARIANT();
+
+	// vector(n) as VECTORTYPE (spec 093 T3, D4): FLOAT[n], n from the TYPE_INFO. Its JSON form is a
+	// varchar(max) and reads VARCHAR here, the server's text: no n is on the wire (D4); a catalog,
+	// which knows n, reads it into FLOAT[n] (ResolveColumnOps).
+	case TDS_TYPE_VECTOR:
+		return mssql::codec::sql_vector::FloatArrayType(column.VectorDimensions());
 
 	default:
 		throw InvalidInputException("MSSQL Error: Unknown SQL Server type (0x%02X) for column '%s'.", column.type_id,
@@ -205,6 +210,7 @@ bool TypeConverter::IsSupported(uint8_t type_id) {
 	case TDS_TYPE_NTEXT:
 	case TDS_TYPE_IMAGE:
 	case TDS_TYPE_SQL_VARIANT:
+	case TDS_TYPE_VECTOR:
 		return true;
 	default:
 		return false;
@@ -277,6 +283,8 @@ std::string TypeConverter::GetTypeName(uint8_t type_id) {
 		return "UDT";
 	case TDS_TYPE_SQL_VARIANT:
 		return "SQL_VARIANT";
+	case TDS_TYPE_VECTOR:
+		return "VECTOR";
 	case TDS_TYPE_IMAGE:
 		return "IMAGE";
 	case TDS_TYPE_TEXT:
@@ -296,13 +304,21 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 		FlatVector::SetNull(vector, row_idx, true);
 		return;
 	}
+	// Spec 093 T3: a vector column into FLOAT[n], from VECTORTYPE or its JSON text (whose wire type is a
+	// string's, so before the switch).
+	if (vector.GetType().id() == LogicalTypeId::ARRAY && (column.IsVectorWire() || column.IsVectorText())) {
+		mssql::codec::sql_vector::DecodeFromTds(value, column, vector, row_idx);
+		return;
+	}
 
 	// Issue #89: catalog vs runtime type divergence. SQL Server views can project a column
 	// at a different type than sys.columns reports (typically via CAST/CONVERT inside the
 	// view definition). When the destination vector was allocated as VARCHAR from the catalog
 	// but TDS sends back a non-string type, render the value as a string instead of crashing
 	// inside FlatVector::GetData<T> with a vector-type assertion.
-	if (vector.GetType().id() == LogicalTypeId::VARCHAR && !IsStringTdsType(column.type_id)) {
+	// A hierarchyid's VARCHAR is its own decoded text (spec 093 T4), not a divergence.
+	if (vector.GetType().id() == LogicalTypeId::VARCHAR && !IsStringTdsType(column.type_id) &&
+		!column.IsHierarchyIdUdt()) {
 		WriteAsStringFallback(value, column, vector, row_idx);
 		return;
 	}
@@ -350,23 +366,23 @@ void TypeConverter::ConvertValue(const std::vector<uint8_t> &value, bool is_null
 		mssql::codec::variant::DecodeFromTds(value, column, vector, row_idx, variant_notes);
 		break;
 
+	// A CLR type: hierarchyid as its text (spec 093 T4); geometry / geography the WKB the client decodes,
+	// or under geometry_as 'native' the stored bytes into a BLOB -- into a GEOMETRY always the WKB (T5); a
+	// user CLR type as its bytes.
+	case TDS_TYPE_UDT:
+		if (column.IsHierarchyIdUdt()) {
+			mssql::codec::hierarchyid::DecodeFromTds(value, column, vector, row_idx);
+		} else if (column.IsSpatialUdt() &&
+				   !(vector.GetType().id() == LogicalTypeId::BLOB && column.geometry_as == GeometryAs::Native)) {
+			mssql::codec::spatial::DecodeFromTds(value, column, vector, row_idx, spatial_notes);
+		} else {
+			mssql::codec::binary::DecodeFromTds(value, column, vector, row_idx);
+		}
+		break;
+
 	case TDS_TYPE_BIGBINARY:
 	case TDS_TYPE_BIGVARBINARY:
 		mssql::codec::binary::DecodeFromTds(value, column, vector, row_idx);
-		break;
-
-	// geometry / geography (spec 093 T5): the WKB the client decodes, or under geometry_as 'native' the
-	// stored bytes into a BLOB. Into a GEOMETRY it is always the WKB, whatever geometry_as says.
-	case TDS_TYPE_UDT:
-		if (!column.IsSpatialUdt()) {
-			throw InvalidInputException("Type conversion not implemented for the CLR type %s.%s", column.udt_schema,
-										column.udt_type_name);
-		}
-		if (vector.GetType().id() == LogicalTypeId::BLOB && column.geometry_as == GeometryAs::Native) {
-			mssql::codec::binary::DecodeFromTds(value, column, vector, row_idx);
-		} else {
-			mssql::codec::spatial::DecodeFromTds(value, column, vector, row_idx, spatial_notes);
-		}
 		break;
 
 	case TDS_TYPE_DATE:

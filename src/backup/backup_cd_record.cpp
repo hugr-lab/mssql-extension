@@ -24,7 +24,7 @@ void CdRecord::BackPointer(uint32_t &page, uint16_t &file, uint16_t &slot) const
 }
 
 void ReadCdRecord(const uint8_t *page, size_t page_size, size_t slot_array, uint16_t offset, const char *what,
-				  CdRecord &out) {
+				  CdRecord &out, bool padded) {
 	if (offset < 96 || slot_array > page_size || offset >= slot_array) {
 		throw FormatError(Where(what, offset) + " lies outside the page's records");
 	}
@@ -44,7 +44,7 @@ void ReadCdRecord(const uint8_t *page, size_t page_size, size_t slot_array, uint
 	out.header = d[0];
 	if (!(out.header & 0x01) || (out.header & 0xC0)) {
 		throw FormatError(Where(what, offset) + " has header " + std::to_string(out.header) +
-						  ", not a CD record the reader knows, in a ROW-compressed rowset");
+						  ", not a CD record the reader knows, in a compressed rowset");
 	}
 	const bool tagged = (out.header & CD_VERSION_TAG) != 0;
 	const size_t tag = tagged ? CD_VERSION_TAG_BYTES : 0;
@@ -72,7 +72,8 @@ void ReadCdRecord(const uint8_t *page, size_t page_size, size_t slot_array, uint
 		out.kind = CdRecord::Kind::Row;
 		break;
 	case CD_TYPE_FORWARDED:
-		out.kind = CdRecord::Kind::Forwarded;
+	case CD_TYPE_GHOST_FORWARDED:
+		out.kind = CdRecord::Kind::Forwarded;  // a ghost forwarded record is laid out as one: made a ghost below
 		break;
 	default:
 		// Not seen (E22): it could be a row, so it is named rather than skipped.
@@ -110,6 +111,12 @@ void ReadCdRecord(const uint8_t *page, size_t page_size, size_t slot_array, uint
 			v.offset = static_cast<uint16_t>(short_at);
 			v.size = static_cast<uint16_t>(v.code - 1);
 			short_at += v.size;
+			need(short_at, "short region");
+		} else if (v.code == CD_SYMBOL) {
+			// A page-dictionary symbol (PAGE compression, E23): its one byte in the short region.
+			v.offset = static_cast<uint16_t>(short_at);
+			v.size = 1;
+			short_at += 1;
 			need(short_at, "short region");
 		} else if (v.code == CD_LONG) {
 			longs++;
@@ -187,11 +194,14 @@ void ReadCdRecord(const uint8_t *page, size_t page_size, size_t slot_array, uint
 		end += tag;
 		need(end, "version tag");
 	}
-	if (end < 9) {
-		end = 9;  // every record is padded to 9 bytes (E22)
+	if (padded && end < 9) {
+		end = 9;  // every row record is padded to 9 bytes (E22)
 		need(end, "padding");
 	}
 	out.end = static_cast<uint16_t>(end);
+	if (type == CD_TYPE_GHOST_FORWARDED) {
+		out.kind = CdRecord::Kind::Ghost;  // no row: the row it was is deleted (E23)
+	}
 }
 
 //===----------------------------------------------------------------------===//
@@ -449,7 +459,75 @@ void DecodeCompressedUnicode(const uint8_t *data, size_t size, std::vector<uint8
 	}
 }
 
-void CdRow::Read(const CdRecord &record, const RowsetLayout &layout, const std::vector<bool> *needed) {
+void ReadPageCompression(const uint8_t *page, size_t page_size, size_t slot_array, const char *what,
+						 PageCompression &out) {
+	constexpr size_t AT = 96;  // the page header's length: the record follows it
+	out.present = true;
+	out.has_anchor = false;
+	out.dictionary.clear();
+	out.page = page;
+	auto fail = [&](const std::string &why) {
+		throw FormatError(std::string("backup: ") + what + ": its compression-information record " + why);
+	};
+	if (slot_array > page_size || slot_array < AT + 5) {
+		fail("has no room before the slot array");
+	}
+	const uint8_t *ci = page + AT;
+	const size_t room = slot_array - AT;
+	const uint8_t flags = ci[0];
+	if (flags & ~0x06) {
+		fail("has flags " + std::to_string(flags) + ", which the reader does not know");
+	}
+	const bool has_dictionary = (flags & 0x04) != 0;
+	const size_t fields = has_dictionary ? 7 : 5;
+	if (fields > room) {
+		fail("runs past the page's slot array");
+	}
+	const size_t dictionary_at = has_dictionary ? static_cast<size_t>(ci[3] | (ci[4] << 8)) : 0;
+	const size_t size =
+		has_dictionary ? static_cast<size_t>(ci[5] | (ci[6] << 8)) : static_cast<size_t>(ci[3] | (ci[4] << 8));
+	if (size < fields || size > room) {
+		fail("of " + std::to_string(size) + " bytes runs past the page's records (" + std::to_string(room) + ")");
+	}
+	out.end = static_cast<uint16_t>(AT + size);
+	const size_t anchor_end = has_dictionary ? dictionary_at : size;
+	if (has_dictionary && (dictionary_at < fields || dictionary_at > size)) {
+		fail("places its dictionary at " + std::to_string(dictionary_at) + ", outside it");
+	}
+	if (flags & 0x02) {
+		ReadCdRecord(page, page_size, AT + anchor_end, static_cast<uint16_t>(AT + fields), what, out.anchor, false);
+		if (out.anchor.kind != CdRecord::Kind::Row) {
+			fail("holds an anchor record that is not a row");
+		}
+		out.has_anchor = true;
+	}
+	if (has_dictionary) {
+		const uint8_t *d = ci + dictionary_at;
+		const size_t length = size - dictionary_at;
+		if (length < 2) {
+			fail("has a dictionary with no entry count");
+		}
+		const size_t count = d[0] | (d[1] << 8);
+		const size_t data_at = 2 + 2 * count;
+		if (data_at > length) {
+			fail("lists " + std::to_string(count) + " dictionary entries past its end");
+		}
+		size_t previous = data_at;
+		for (size_t i = 0; i < count; i++) {
+			const size_t stop = d[2 + 2 * i] | (d[3 + 2 * i] << 8);
+			if (stop < previous || stop > length) {
+				fail("has dictionary entry " + std::to_string(i) + " ending at " + std::to_string(stop) +
+					 ", outside its dictionary");
+			}
+			out.dictionary.emplace_back(static_cast<uint16_t>(AT + dictionary_at + previous),
+										static_cast<uint16_t>(stop - previous));
+			previous = stop;
+		}
+	}
+}
+
+void CdRow::Read(const CdRecord &record, const RowsetLayout &layout, const std::vector<bool> *needed,
+				 const PageCompression *page) {
 	const size_t n = layout.columns.size();
 	values_.assign(n, ValueRef());
 	at_.assign(n, SIZE_MAX);
@@ -464,7 +542,7 @@ void CdRow::Read(const CdRecord &record, const RowsetLayout &layout, const std::
 		auto what = [&]() { return layout.table + "." + c.name; };
 		if (c.offset >= 0) {
 			throw FormatError("backup: " + what() + " is described at fixed offset " + std::to_string(c.offset) +
-							  " in a ROW-compressed rowset, whose columns are CD indexes");
+							  " in a compressed rowset, whose columns are CD indexes");
 		}
 		const size_t index = static_cast<size_t>(-static_cast<int32_t>(c.offset)) - 1;
 		if (index >= record.column_count) {
@@ -483,11 +561,62 @@ void CdRow::Read(const CdRecord &record, const RowsetLayout &layout, const std::
 		if (cd.code == CD_NULL) {
 			continue;
 		}
-		if (cd.code == CD_SYMBOL) {
+		const uint8_t *p = record.data + cd.offset;
+		size_t size = (cd.code == CD_EMPTY || cd.code == CD_BIT_ONE) ? 0 : cd.size;
+		bool rebuilt = false;
+		if (page && page->present && !cd.complex) {
+			// PAGE compression (E23): a symbol is its dictionary entry; an anchored column's value (an entry
+			// too) is its prefix of the anchor's value and its suffix; EMPTY there, the anchor's value whole.
+			const CdValue *anchor =
+				page->has_anchor && index < page->anchor.column_count && page->anchor.values[index].code != CD_NULL
+					? &page->anchor.values[index]
+					: nullptr;
+			if (anchor && (anchor->complex || anchor->code == CD_SYMBOL)) {
+				throw FormatError("backup: " + what() + " has an anchor value the reader does not know (code " +
+								  std::to_string(anchor->code) + ")");
+			}
+			const uint8_t *anchor_data = anchor ? page->anchor.data + anchor->offset : nullptr;
+			const size_t anchor_size = anchor ? (anchor->code == CD_EMPTY ? 0 : anchor->size) : 0;
+			bool prefixed = anchor && cd.code != CD_EMPTY && cd.code != CD_BIT_ONE;
+			if (cd.code == CD_SYMBOL) {
+				const size_t symbol = p[0];
+				if (symbol >= page->dictionary.size()) {
+					throw FormatError("backup: " + what() + " holds dictionary symbol " + std::to_string(symbol) +
+									  " of a page dictionary of " + std::to_string(page->dictionary.size()));
+				}
+				p = page->page + page->dictionary[symbol].first;
+				size = page->dictionary[symbol].second;
+			} else if (cd.code == CD_EMPTY && anchor) {
+				p = anchor_data;
+				size = anchor_size;
+				rebuilt = true;	 // the anchor's value: stored, not empty
+			}
+			if (prefixed) {
+				if (size == 0) {
+					throw FormatError("backup: " + what() + " holds no prefix length beside its anchor");
+				}
+				size_t prefix = p[0];
+				size_t skip = 1;
+				if (prefix & 0x80) {
+					if (size < 2) {
+						throw FormatError("backup: " + what() + " holds a two-byte prefix length of one byte");
+					}
+					prefix = ((prefix & 0x7F) << 8) | p[1];
+					skip = 2;
+				}
+				if (prefix > anchor_size) {
+					throw FormatError("backup: " + what() + " holds a prefix of " + std::to_string(prefix) +
+									  " bytes of an anchor value of " + std::to_string(anchor_size));
+				}
+				rebuilt_.assign(anchor_data, anchor_data + prefix);
+				rebuilt_.insert(rebuilt_.end(), p + skip, p + size);
+				p = rebuilt_.data();
+				size = rebuilt_.size();
+				rebuilt = true;
+			}
+		} else if (cd.code == CD_SYMBOL) {
 			throw FormatError("backup: " + what() + " holds a page-dictionary symbol outside PAGE compression");
 		}
-		const uint8_t *p = record.data + cd.offset;
-		const size_t size = (cd.code == CD_EMPTY || cd.code == CD_BIT_ONE) ? 0 : cd.size;
 		if (cd.complex) {
 			v.state = ValueState::OffRow;
 			v.data = p;
@@ -495,23 +624,29 @@ void CdRow::Read(const CdRecord &record, const RowsetLayout &layout, const std::
 			continue;
 		}
 		v.state = ValueState::Inline;
+		const size_t start = buffer_.size();
+		auto stored = [&](size_t bytes) {
+			at_[k] = start;
+			v.size = static_cast<uint32_t>(bytes);
+		};
+		// A PAGE value put together here lives in rebuilt_, which the next column reuses: kept in the row's
+		// buffer instead.
+		auto as_is = [&]() {
+			if (rebuilt) {
+				buffer_.insert(buffer_.end(), p, p + size);
+				stored(size);
+			} else {
+				v.data = p;
+				v.size = static_cast<uint32_t>(size);
+			}
+		};
 		if (needed && (k >= needed->size() || !(*needed)[k])) {
-			v.data = p;	 // located only: not read by this scan
-			v.size = static_cast<uint32_t>(size);
+			as_is();  // located only: not read by this scan
 			continue;
 		}
 		if (cd.code == CD_BIT_ONE && c.xtype != XTYPE_BIT) {
 			throw FormatError("backup: " + what() + " holds CD code 11 (bit 1) and is not a bit");
 		}
-		const size_t start = buffer_.size();
-		auto as_is = [&]() {
-			v.data = p;
-			v.size = static_cast<uint32_t>(size);
-		};
-		auto stored = [&](size_t bytes) {
-			at_[k] = start;
-			v.size = static_cast<uint32_t>(bytes);
-		};
 		auto integer = [&](size_t width) {
 			if (size > width) {
 				throw FormatError("backup: " + what() + " holds " + std::to_string(size) + " bytes for a " +

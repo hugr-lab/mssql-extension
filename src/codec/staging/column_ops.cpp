@@ -246,6 +246,9 @@ AppendArm DirectArm(uint8_t type_id, uint32_t width) {
 //! how it finalizes: there is no `default`, and -Wswitch makes the omission a
 //! build failure rather than a column that silently publishes nothing.
 FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &column, const LogicalType &target_type) {
+	if (ops.vector_kernel) {
+		return FinalizeKernel::Vector;
+	}
 	if (ops.needs_value_fallback) {
 		// Wins over the family: the bytes staged are the WIRE type's, and the
 		// output vector is a different type entirely (issue #89).
@@ -277,6 +280,11 @@ FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &co
 			(target_type.id() == LogicalTypeId::GEOMETRY || column.geometry_as != tds::GeometryAs::Native)) {
 			return FinalizeKernel::Spatial;
 		}
+		// Spec 093 T4: a hierarchyid UDT stages its bytes on the PLP binary arm and is decoded to text; a
+		// user CLR type stays bytes.
+		if (column.IsHierarchyIdUdt()) {
+			return FinalizeKernel::HierarchyId;
+		}
 		// The binary arms carry VARBINARY / IMAGE as well; code_page is set on
 		// single-byte text only, and only when its catalog transcodes.
 		return column.code_page != nullptr ? FinalizeKernel::CodePage : FinalizeKernel::Binary;
@@ -302,6 +310,22 @@ FinalizeKernel ResolveKernel(const ColumnOps &ops, const tds::ColumnMetadata &co
 //! The arm/kind/stride half of the resolution; ResolveColumnOps adds the kernel.
 ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &target_type) {
 	ColumnOps ops;
+
+	// Spec 093 T3 (D4): a vector column into FLOAT[n], in whichever form the session streams it --
+	// VECTORTYPE, framed as a bounded varbinary, or the JSON text, a varchar(max) / nvarchar(max) PLP --
+	// so before the divergence test, which would take the text form for a VARCHAR and render it.
+	if (target_type.id() == LogicalTypeId::ARRAY && ArrayType::GetChildType(target_type).id() == LogicalTypeId::FLOAT &&
+		(column.IsVectorWire() || (column.IsVectorText() && column.IsPLPType()))) {
+		ops.kind = StagingKind::Var;
+		ops.vector_kernel = true;
+		if (column.IsVectorWire()) {
+			ops.arm = AppendArm::P2StageBinary;
+			ops.max_value_bytes = column.max_length;
+		} else {
+			ops.arm = AppendArm::PlpStageBinary;
+		}
+		return ops;
+	}
 
 	// Does the wire type agree with the vector being written into? A view with an
 	// inline CAST can make the catalog promise VARCHAR while TDS delivers
@@ -417,11 +441,13 @@ ColumnOps ResolveAppend(const tds::ColumnMetadata &column, const LogicalType &ta
 		return ops;
 	}
 
-	// geometry / geography (spec 093 T5), always PLP: into a GEOMETRY (the WKB) or a
-	// BLOB (the WKB, or the stored bytes under geometry_as 'native'). Both stage the
-	// assembled bytes; ResolveKernel picks the kernel.
-	if (column.IsSpatialUdt() &&
-		(target_type.id() == LogicalTypeId::GEOMETRY || target_type.id() == LogicalTypeId::BLOB)) {
+	// A CLR type, always PLP (spec 093 T4, T5): hierarchyid into VARCHAR (its text), a user CLR type into
+	// BLOB (its bytes), geometry / geography into a GEOMETRY (the WKB) or a BLOB (the WKB, or the stored
+	// bytes under geometry_as 'native'). All stage the assembled bytes; ResolveKernel picks the kernel.
+	if ((column.IsHierarchyIdUdt() && target_type.id() == LogicalTypeId::VARCHAR) ||
+		(column.IsUserClrUdt() && target_type.id() == LogicalTypeId::BLOB) ||
+		(column.IsSpatialUdt() &&
+		 (target_type.id() == LogicalTypeId::GEOMETRY || target_type.id() == LogicalTypeId::BLOB))) {
 		ops.kind = StagingKind::Var;
 		ops.arm = AppendArm::PlpStageBinary;
 		return ops;
@@ -531,6 +557,10 @@ const char *FinalizeKernelName(FinalizeKernel kernel) {
 		return "variant";
 	case FinalizeKernel::Spatial:
 		return "spatial";
+	case FinalizeKernel::HierarchyId:
+		return "hierarchyid";
+	case FinalizeKernel::Vector:
+		return "vector";
 	}
 	return "?";
 }
