@@ -66,6 +66,8 @@ std::string OperationName(uint8_t op) {
 		return "LOP_EXPUNGE_ROWS";
 	case 0x10:
 		return "LOP_FILE_HDR_MODIFY";
+	case 0x11:
+		return "LOP_CLEAR_GAM_BITS";  // met on 2017 (fn_dump_dblog of log.trn)
 	case 0x12:
 		return "LOP_COUNT_DELTA";
 	case 0x13:

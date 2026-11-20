@@ -111,14 +111,19 @@ def compare_log(session, args, paths):
 
     want = {}
     for r in server:
-        if r["lsn"] >= last:
+        # Up to 2019 the server spells an LSN's hex in lower case (00000028:000007d0:000a), from 2022 on in
+        # upper case, as lsn_text does: compared, and ordered against LastLSN, in upper case. A transaction id
+        # is compared in lower case, as the reader spells it.
+        lsn = r["lsn"].upper()
+        xid = r["xid"].lower() if r["xid"] else r["xid"]
+        if lsn >= last:
             continue  # LastLSN is the next record after the backup's (HEADERONLY): not the backup's
-        want[r["lsn"]] = (r["operation"], r["context"], r["xid"] if r["xid"] != "0000:00000000" else None,
+        want[lsn] = (r["operation"], r["context"], xid if xid != "0000:00000000" else None,
                           server_page(r["page"]), int(r["au"]) if r["au"] not in (None, "") else None, r["name"])
     got = {}
     for r in ours:
         key = lsn_text(r["lsn"])
-        got[key] = (r["operation"], r["context"], r["xid"], r["page"], int(r["au"]) if r["au"] is not None else None,
+        got[key] = (r["operation"], r["context"], r["xid"].lower() if r["xid"] else r["xid"], r["page"], int(r["au"]) if r["au"] is not None else None,
                     r["name"])
     failures = []
     for lsn in sorted(set(want) | set(got)):
