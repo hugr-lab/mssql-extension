@@ -163,6 +163,99 @@ void EncodeToBcp(Vector &vec, const UnifiedVectorFormat &fmt, idx_t row, const B
 	}
 }
 
+namespace {
+
+[[noreturn]] void RefuseRowElement(const BCPColumnMetadata &col, idx_t row, idx_t element, VectorStatus status) {
+	RefuseWrite(col.ReportedName(),
+				StringUtil::Format("row %llu of the chunk, element %llu: %s", (unsigned long long)row + 1,
+								   (unsigned long long)element + 1, DescribeStatus(status)));
+}
+
+[[noreturn]] void RefuseNullElement(const BCPColumnMetadata &col, idx_t row, idx_t element) {
+	RefuseWrite(col.ReportedName(), StringUtil::Format("row %llu of the chunk, element %llu is NULL, which a vector "
+													   "cannot hold",
+													   (unsigned long long)row + 1, (unsigned long long)element + 1));
+}
+
+//! The scatter's one loop: CURSOR the per-row position (NULL rows possible), else a stride (none);
+//! FLOAT16 the element type, so the row's body carries no type branch.
+template <bool CURSOR, bool FLOAT16>
+void ScatterRows(uint8_t *dst, size_t stride, size_t *cursor, idx_t row_begin, idx_t rows, const Vector &vec,
+				 const UnifiedVectorFormat &fmt, const BCPColumnMetadata &col) {
+	const uint16_t dimensions = col.vector_dims;
+	const size_t payload = ValueBytes(dimensions, FLOAT16 ? 1 : 0);
+	const Vector &child = ArrayVector::GetChild(vec);
+	const float *elements = FlatVector::GetData<float>(child);
+	const auto &child_validity = FlatVector::Validity(child);
+	const bool check_elements = !child_validity.CannotHaveNull();
+	uint8_t header[8];
+	WriteHeader(dimensions, FLOAT16 ? 1 : 0, header);
+	const uint8_t length_lo = static_cast<uint8_t>(payload & 0xFF);
+	const uint8_t length_hi = static_cast<uint8_t>(payload >> 8);
+	for (idx_t i = 0; i < rows; i++) {
+		const idx_t row = row_begin + i;
+		uint8_t *out = CURSOR ? dst + cursor[row] : dst + i * stride;
+		const idx_t source = fmt.sel->get_index(row);
+		if (CURSOR && !fmt.validity.RowIsValid(source)) {
+			out[0] = 0xFF;
+			out[1] = 0xFF;
+			cursor[row] += 2;
+			continue;
+		}
+		const idx_t first = source * dimensions;
+		if (check_elements) {
+			for (idx_t e = 0; e < dimensions; e++) {
+				if (!child_validity.RowIsValid(first + e)) {
+					RefuseNullElement(col, row, e);
+				}
+			}
+		}
+		const float *row_elements = elements + first;
+		out[0] = length_lo;
+		out[1] = length_hi;
+		std::memcpy(out + 2, header, 8);
+		if (FLOAT16) {
+			size_t bad = 0;
+			const auto status = NarrowToHalf(row_elements, dimensions, out + 10, bad);
+			if (status != VectorStatus::Ok) {
+				RefuseRowElement(col, row, bad, status);
+			}
+		} else {
+			if (!AllFinite(row_elements, dimensions)) {
+				idx_t bad = 0;
+				while (std::isfinite(row_elements[bad])) {
+					bad++;
+				}
+				RefuseRowElement(col, row, bad, VectorStatus::NotFinite);
+			}
+			std::memcpy(out + 10, row_elements, static_cast<size_t>(dimensions) * 4);
+		}
+		if (CURSOR) {
+			cursor[row] += 2 + payload;
+		}
+	}
+}
+
+}  // namespace
+
+void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const Vector &vec,
+						 const UnifiedVectorFormat &fmt, const BCPColumnMetadata &col) {
+	if (col.vector_element_type == 1) {
+		ScatterRows<false, true>(dst, stride, nullptr, row_begin, rows, vec, fmt, col);
+	} else {
+		ScatterRows<false, false>(dst, stride, nullptr, row_begin, rows, vec, fmt, col);
+	}
+}
+
+void ScatterChunkCursor(uint8_t *dst, size_t *cursor, idx_t row_begin, idx_t rows, const Vector &vec,
+						const UnifiedVectorFormat &fmt, const BCPColumnMetadata &col) {
+	if (col.vector_element_type == 1) {
+		ScatterRows<true, true>(dst, 0, cursor, row_begin, rows, vec, fmt, col);
+	} else {
+		ScatterRows<true, false>(dst, 0, cursor, row_begin, rows, vec, fmt, col);
+	}
+}
+
 void EncodeValueToBcp(const Value &value, const BCPColumnMetadata &col, vector<uint8_t> &out) {
 	if (value.IsNull()) {
 		out.push_back(0xFF);

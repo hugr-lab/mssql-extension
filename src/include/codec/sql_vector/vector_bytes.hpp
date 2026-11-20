@@ -66,6 +66,17 @@ float HalfToFloat(uint16_t half);
 //! past +-65504.
 bool FloatToHalf(float value, uint16_t &half);
 
+//! The 8-byte header of a value of `dimensions` elements of `element_type`.
+void WriteHeader(uint16_t dimensions, uint8_t element_type, uint8_t out[8]);
+
+//! Whether every one of `count` floats is finite: one pass with no branch per element (the bulk path's
+//! check of a block, before its float32 elements are copied as they are).
+bool AllFinite(const float *values, size_t count);
+
+//! `count` floats as float16 into `out` (2 bytes each, little-endian), rounded to nearest even. On a
+//! value it cannot hold (NotFinite, Float16Overflow) `bad_element` is its index.
+VectorStatus NarrowToHalf(const float *values, size_t count, uint8_t *out, size_t &bad_element);
+
 //! A value's bytes from `dimensions` floats into `out` (ValueBytes of them). On a value it cannot hold
 //! (NotFinite, Float16Overflow) `bad_element` is the element's index and nothing is guaranteed in `out`.
 VectorStatus EncodeValue(const float *values, uint16_t dimensions, uint8_t element_type, uint8_t *out,

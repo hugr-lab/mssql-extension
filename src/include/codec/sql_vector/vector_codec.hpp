@@ -60,6 +60,17 @@ std::string FormatLiteral(const Value &value, const std::string &column);
 //! the column. The family encoder's signature (BCPRowEncoder); `fmt` is `vec`'s.
 void EncodeToBcp(Vector &vec, const UnifiedVectorFormat &fmt, idx_t row, const BCPColumnMetadata &col,
 				 vector<uint8_t> &out);
+//! The columnar bulk path (BCPRowEncoder's scatter, one call per column per block of rows): rows
+//! [row_begin, row_begin + rows) of a FLOAT[n] `vec` (its child flat, as PrepareColumnStates leaves it),
+//! each its u16 length and bytes -- the header and, for float32, the row's elements copied whole, for
+//! float16 narrowed -- or 0xFFFF for a NULL row. Strided: row i at `dst + i * stride`, every row valid.
+//! Cursor: row r at `dst + cursor[r]`, which it advances. A NULL element, a NaN / infinity or a float16
+//! overflow is refused by name, the row named.
+void ScatterChunkStrided(uint8_t *dst, size_t stride, idx_t row_begin, idx_t rows, const Vector &vec,
+						 const UnifiedVectorFormat &fmt, const BCPColumnMetadata &col);
+void ScatterChunkCursor(uint8_t *dst, size_t *cursor, idx_t row_begin, idx_t rows, const Vector &vec,
+						const UnifiedVectorFormat &fmt, const BCPColumnMetadata &col);
+
 //! The same for one Value (BCPRowEncoder::EncodeValue).
 void EncodeValueToBcp(const Value &value, const BCPColumnMetadata &col, vector<uint8_t> &out);
 

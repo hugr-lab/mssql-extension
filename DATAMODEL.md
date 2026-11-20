@@ -764,8 +764,13 @@ text). VECTORSUPPORT is asked for per catalog (`mssql_vector_support` at ATTACH,
 `MSSQLConnectionInfo::vector_support` and `TdsConnection::SetRequestVectorSupport`; `Login7Features` is
 what the four LOGIN7 builders take), and the granted version is kept per connection, read by the
 stream's fallback `WARNING`. The bulk wire sends the bytes as varbinary under a declared `vector(n)`
-(`BCPColumnMetadata::vector_dims`, `sql_vector::EncodeToBcp` as the family encoder); the statement path
-a `N'[...]'` literal.
+(`BCPColumnMetadata::vector_dims`) on the columnar scatter: `ScatterArm::Vector`, one width per non-NULL
+row (a u16 length, the header, the elements), so the strided path when the chunk has no NULL and the
+cursor when it has, one `sql_vector::ScatterChunkStrided` / `ScatterChunkCursor` call per column per
+block -- float32 the header and a memcpy of the row's elements after a branchless finiteness check,
+float16 a narrowing loop, a NULL element refused naming the row. A chunk holding a vector column stays
+columnar; `sql_vector::EncodeToBcp` is the row path's and `EncodeValueToBcp` the per-value one's. The
+statement path sends a `N'[...]'` literal.
 
 ### Reading a column's collation
 

@@ -214,6 +214,39 @@ bool FloatToHalf(float value, uint16_t &half) {
 	return true;
 }
 
+void WriteHeader(uint16_t dimensions, uint8_t element_type, uint8_t out[8]) {
+	out[0] = MAGIC_0;
+	out[1] = MAGIC_1;
+	out[2] = static_cast<uint8_t>(dimensions & 0xFF);
+	out[3] = static_cast<uint8_t>(dimensions >> 8);
+	out[4] = element_type;
+	out[5] = out[6] = out[7] = 0;
+}
+
+bool AllFinite(const float *values, size_t count) {
+	// An exponent of all ones is an infinity or a NaN; OR-reduced, so the loop has no branch.
+	uint32_t non_finite = 0;
+	for (size_t i = 0; i < count; i++) {
+		uint32_t bits;
+		std::memcpy(&bits, values + i, 4);
+		non_finite |= static_cast<uint32_t>((bits & 0x7F800000u) == 0x7F800000u);
+	}
+	return non_finite == 0;
+}
+
+VectorStatus NarrowToHalf(const float *values, size_t count, uint8_t *out, size_t &bad_element) {
+	for (size_t i = 0; i < count; i++) {
+		uint16_t half;
+		if (!FloatToHalf(values[i], half)) {
+			bad_element = i;
+			return std::isfinite(values[i]) ? VectorStatus::Float16Overflow : VectorStatus::NotFinite;
+		}
+		out[2 * i] = static_cast<uint8_t>(half & 0xFF);
+		out[2 * i + 1] = static_cast<uint8_t>(half >> 8);
+	}
+	return VectorStatus::Ok;
+}
+
 VectorStatus EncodeValue(const float *values, uint16_t dimensions, uint8_t element_type, uint8_t *out,
 						 uint16_t &bad_element) {
 	out[0] = MAGIC_0;

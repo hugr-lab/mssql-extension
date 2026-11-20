@@ -591,6 +591,10 @@ inline void ScatterBlock(uint8_t *bdst, size_t stride, idx_t row_begin, idx_t ro
 		case mssql::codec::ScatterArm::FloatConvert:
 			ScatterConvFloat(bdst + col_off, stride, row_begin, rows, st.fmt, ops[c]);
 			break;
+		case mssql::codec::ScatterArm::Vector:
+			mssql::codec::sql_vector::ScatterChunkStrided(bdst + col_off, stride, row_begin, rows, *st.vec, st.fmt,
+														  columns[c]);
+			break;
 		default:
 			throw InternalException("BCPRowEncoder: unreachable scatter arm");
 		}
@@ -689,6 +693,9 @@ inline void ScatterBlockCursor(uint8_t *dst, size_t *cursor, idx_t r0, idx_t ren
 			mssql::codec::datetime::ScatterChunkCursor(dst, cursor, r0, rend - r0, *st.vec, st.fmt, columns[c],
 													   col_all_valid);
 			break;
+		case mssql::codec::ScatterArm::Vector:
+			mssql::codec::sql_vector::ScatterChunkCursor(dst, cursor, r0, rend - r0, *st.vec, st.fmt, columns[c]);
+			break;
 		default:
 			throw InternalException("BCPRowEncoder: unreachable cursor arm");
 		}
@@ -771,7 +778,9 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 		// — and the cast truncates silently, stride comes out short, and the
 		// kernel writes the full width into it. Widening costs nothing: widths is
 		// indexed per column, not per value.
-		widths[c] = ops[c].wire_width;
+		// A vector's length is two bytes, not one: its width holds the second, so `1 + widths[c]` is
+		// its whole non-NULL value as for every other column (spec 093 T3).
+		widths[c] = ops[c].arm == mssql::codec::ScatterArm::Vector ? 1 + ops[c].wire_width : ops[c].wire_width;
 		stride += 1 + widths[c];
 		if (states[c].vec && !states[c].fmt.validity.CannotHaveNull()) {
 			all_valid = false;
@@ -824,7 +833,9 @@ bool TryEncodeChunkColumnar(vector<uint8_t> &buffer, idx_t row_count, const vect
 			if (st.fmt.validity.CannotHaveNull()) {
 				continue;  // contributes its full width to every row already
 			}
-			const uint32_t w = widths[c];
+			// A NULL row drops the value and keeps its marker: 1 byte for a fixed column, 2 (0xFFFF) for
+			// a vector's u16 length.
+			const uint32_t w = widths[c] - (NullMarkerSize(st.null_kind) - 1);
 			if (st.fmt.sel->IsSet()) {
 				const auto *sel = st.fmt.sel;
 				for (idx_t r = 0; r < row_count; r++) {
