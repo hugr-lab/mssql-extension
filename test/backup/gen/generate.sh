@@ -252,8 +252,10 @@ for fixture in ${FIXTURES}; do
 		;;
 	page)
 		# PAGE compression (spec 086 PR 2: anchor records and page dictionaries); the compressed set a copy-only
-		# backup taken after the plain one.
+		# backup taken after the plain one. Two states of one database, as files': the golden of page_full taken
+		# right after its backups, then page_changes.sql's changes and differential.
 		golden bak_page page_full
+		run_sql page_changes.sql
 		sets+=("page_full|page_full.bak" "page_xpress|page_xpress.bak" "page_diff|page_diff.bak")
 		overlays+=("page_over|page_full|page_diff")
 		;;
