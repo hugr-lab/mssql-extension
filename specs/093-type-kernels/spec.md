@@ -64,7 +64,7 @@ Out:
 - Decoding user CLR types: opaque bytes by design (`BLOB`).
 - Two DuckDB functions over the MS-SSCLRT bytes, possible later, once T5's kernel has the format
   (owner, 2026-11-14), not here:
-  - from bytes: `BLOB` → `GEOMETRY`, for bytes read with `geometry_as 'blob'` or kept elsewhere
+  - from bytes: `BLOB` → `GEOMETRY`, for bytes read with `geometry_as 'native'` or kept elsewhere
     (`geography` latitude-first, as D1's kernel reads it);
   - to bytes: `GEOMETRY` → `BLOB`, so such bytes can be written back (an SRID, and whether the
     target is `geometry` or `geography`, as parameters: the bytes carry both).
@@ -109,9 +109,10 @@ Out:
   - `geometry` → `GEOMETRY` with no CRS. A SQL Server column declares no SRID and the bind sees no
     values, so the type cannot follow them;
   - a CTAS from a `GEOMETRY` creates a `geometry` column;
-  - a curve or `FullGlobe` value read into a `GEOMETRY` column is an error. It names the column and
-    the escape hatch `geometry_as := 'blob'`, an ATTACH option and a `mssql_backup_scan` parameter
-    that reads the whole column as its bytes. Curves are not linearised;
+  - a curve or `FullGlobe` value read into a `GEOMETRY` column is NULL with a WARNING naming the
+    column and `geometry_as`, an ATTACH option and a `mssql_backup_scan` parameter that reads the
+    whole column as WKB (`'wkb'`) or its stored bytes (`'native'`). Curves are not linearised
+    (amended 2026-11-20: first an error);
   - full support, both paths ("Если можем то и геометрию сделать", 2026-11-12).
 - **One decoder per type for both paths** (086 D8a, owner 2026-11-11). Restated here because this
   spec carries it out.
@@ -348,20 +349,44 @@ types:
   carries. A value in another SRID
   (4120 – 4999 are allowed) keeps the label; this is documented;
 - `geometry` → `GEOMETRY`;
-- with `geometry_as := 'blob'`: `BLOB`, the MS-SSCLRT bytes, read bare (the UDT `0xF0` value as
-  it arrives, no server cast). They are the bytes `CAST(g AS varbinary(max))` returns (G2: 15 of 15,
-  NULLs included) and a backup stores, so the catalog, a raw scan and the backup scan agree; a
-  server cast would have made the TDS path differ from the backup, which has no server (owner,
-  2026-11-14, on #555's review). They load back by `CAST(… AS geometry)`.
+- `geometry_as` (ATTACH option of `TYPE mssql` and `TYPE mssql_backup`, a `mssql_backup_scan` parameter;
+  the whole column) says what the column is instead (owner, 2026-11-20):
+  - `'geometry'` (the default): the types above;
+  - `'wkb'`: `BLOB`, the ISO WKB the kernel writes, the curves included (8 – 10, G1's forms), which
+    other tools read;
+  - `'native'` (D6's first `'blob'`): `BLOB`, the MS-SSCLRT bytes, read bare (the UDT `0xF0` value as
+    it arrives, no server cast). They are the bytes `CAST(g AS varbinary(max))` returns (G2: 15 of 15,
+    NULLs included) and a backup stores, so the catalog, a raw scan and the backup scan agree; a
+    server cast would have made the TDS path differ from the backup, which has no server (owner,
+    2026-11-14, on #555's review). They load back by `CAST(… AS geometry)` (G7).
 
 A curve (version 2 shape types 8 – 10, figure attributes 2 / 3) or a `FullGlobe` (shape type 11)
-fails the query: `column "dbo"."t"."g" holds a CircularString, which GEOMETRY cannot hold; read the
-column as bytes with ATTACH option geometry_as 'blob' (or mssql_backup_scan(…, geometry_as := 'blob'))`.
-DuckDB's GEOMETRY holds types 1 – 7 only (`FromBinary`), so writing the bytes unchecked, as the
-binary kernel does today with `STAsBinary()`'s output, could let an invalid value in.
+under `'geometry'` is **NULL, and one WARNING per column per scan** as it meets one, as D8's
+datetime2(7) out of range: `column "dbo"."t"."g": 3 values a GEOMETRY cannot hold (a CircularString,
+…) read as NULL; geometry_as 'wkb' or 'native' reads them` (owner, 2026-11-20: a query is not failed
+for a value; first decided as an error, DQ-45). DuckDB's GEOMETRY holds types 1 – 7 only
+(`FromBinary`; K1: the curve codes and 126 refused), so writing the bytes unchecked could let an
+invalid value in. A stored POINT EMPTY is read as DuckDB's POINT EMPTY, not the server's MULTIPOINT
+EMPTY (owner, 2026-11-20; G1).
 
 A raw `mssql_scan` takes the type from UDT_INFO's type name (geometry, geography, hierarchyid, else
 `BLOB`) and the catalog's `geometry_as`.
+
+**Measured** (2026-11-20: G1, G3 and K1 for the read; G7 for the write; `measured/`).
+- **The decoder.** A prototype of the kernel's mapping gave `AsBinaryZM()` and `STAsBinary()` byte for
+  byte for every one of 65 values: every OGC type, EMPTY of each, holes, collections, Z / M / ZM, the
+  curves and FullGlobe. It did so on 2019, 2022 and 2025, which store every value alike. The only
+  conversions are:
+  - `geography` stores latitude first (G3), and WKB gives longitude first;
+  - a missing Z / M is stored as NaN `0xFFF8…`, and WKB gives `0x7FF8…`.
+- **What `AsBinaryZM()` does with EMPTY and FullGlobe.** POINT EMPTY becomes MULTIPOINT EMPTY, an
+  EMPTY member of a MULTIPOINT is left out, and FullGlobe is type 126.
+- **What DuckDB takes.** `GEOMETRY('OGC:CRS84')` needs no extension, and DuckDB takes ISO Z / M / ZM
+  and MULTIPOINT EMPTY. It refuses the curve codes and 126, as this section says. A POINT EMPTY of its
+  own is a point of NaN coordinates (K1).
+- **The write.** `STGeomFromWKB` takes ISO Z / M / ZM, so the write keeps them. The server refuses a
+  NaN point, which is DuckDB's POINT EMPTY: the writer sends `POINT EMPTY` (G7).
+- **POINT EMPTY** is read as POINT EMPTY, the value as stored (owner, 2026-11-20).
 
 **Write** (T6).
 - The SRID comes from the source's CRS: `EPSG:n` → n, `OGC:CRS84` → 4326, no CRS → 0 for a
@@ -594,8 +619,15 @@ it carries DQ-44, decided after the split.
 
 ## Risks
 
-- **The geography CRS downstream**: `OGC:CRS84` is built in and GeoParquet's default; whether
-  DuckLake keeps it on a geometry column is K1.
+- **The geography CRS downstream** (K1, measured): `OGC:CRS84` is built in, and Parquet keeps it.
+  **DuckLake does not**: the column created as `GEOMETRY('OGC:CRS84')` describes as `GEOMETRY`, and its
+  data file says `crs=<null>`. So a lake does not tell `geography` from `geometry` by type, and the
+  importer (mssql-ducklake) must carry it some other way. The owner's direction (2026-11-20): an
+  explicit import parameter says whether a spatial column's CRS is kept; by default it is not. A
+  column's values rarely mix SRIDs, so the importer can take the column's CRS from its values' SRID
+  (the reader's kernel reads it per value, D6) and say when another one appears. A COPY TO Parquet under GeoParquet 1.0, the
+  default, reads a `GEOMETRY` with no CRS back as CRS84, and one with M as `BLOB`; `GEOPARQUET_VERSION
+  'V2'` keeps both.
 - **Z / M values change** for anyone who reads them today (they were dropped). Documented as breaking.
 - **The vector JSON fallback** is inexact for float32 (V2: about 1.5 % of values a neighbour away).
   A server without VECTORSUPPORT reads them so, and the warning says so. On 2025 that takes

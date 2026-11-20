@@ -734,6 +734,15 @@ the DuckDB pin `EPSG:4326` cannot be written in SQL without the spatial extensio
 GeoParquet write, so the label is `OGC:CRS84`: the same WGS 84, longitude first, built in (spec 093
 § Why `OGC:CRS84`). The rest of DQ-45 stands.
 
+**Amended (owner, 2026-11-20, on G1 / K1):**
+- a curve or `FullGlobe` value read as `GEOMETRY` is NULL with one WARNING per column per scan, not an
+  error ("так не пойдет": a query is not failed for a value);
+- `geometry_as` takes `'geometry'` (default), `'wkb'` (ISO WKB as BLOB, curves included) and `'native'`
+  (the MS-SSCLRT bytes, the first `'blob'`), on both paths;
+- a stored POINT EMPTY is POINT EMPTY;
+- the lake's CRS (DuckLake keeps none, K1) is an explicit import parameter of mssql-ducklake, off by
+  default; a column rarely mixes SRIDs.
+
 ### DQ-46 — 085 PR 3's open points — **DECIDED** (owner, 2026-11-13)
 
 **DECIDED as recommended by PR 3's recon:**
