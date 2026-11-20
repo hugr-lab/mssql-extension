@@ -343,6 +343,8 @@ struct ScanGlobalState : public GlobalTableFunctionState {
 
 	//! For the progress bar: rows staged by every task, and the catalog's count (-1 unknown).
 	std::atomic<uint64_t> rows_read{0};
+	//! A page taken into use while the backup ran met by any task: said once per scan.
+	mutable std::atomic<bool> pending_warned{false};
 	int64_t row_count = -1;
 
 	idx_t MaxThreads() const override {
@@ -356,6 +358,7 @@ struct ScanLocalState : public LocalTableFunctionState {
 	const RowsetLayout *layout = nullptr;  // the stager's (UseLayout), to switch only between partitions
 	LobPageFetch off_row_fetch;			   // the stager's pages for values stored off row (live ones only)
 
+	std::atomic<bool> *pending_warned = nullptr;	// the scan's: a Pending page said once (ScanGlobalState)
 	std::shared_ptr<const PartitionCursor> cursor;	// of the unit being read
 	idx_t batch = 0;								// the unit's batch index
 	bool have_unit = false;
@@ -561,6 +564,7 @@ unique_ptr<LocalTableFunctionState> InitLocal(ExecutionContext &execution, Table
 	const auto &data = input.bind_data->Cast<ScanBindData>();
 	const auto &global = global_state->Cast<ScanGlobalState>();
 	auto local = make_uniq<ScanLocalState>();
+	local->pending_warned = &global.pending_warned;
 	local->stager = make_uniq<RecordStager>(*data.entry, global.staged);
 	local->stager->LimitBytes(global.chunk_allowance, global.virtual_row);
 	const PageStore &store = *data.catalog->pages->store;
@@ -774,7 +778,7 @@ bool NextPage(ClientContext &context, const ScanBindData &data, ScanLocalState &
 				} catch (FormatError &t) {
 					why = std::string("; the backup's log tail is not read: ") + t.what();
 				}
-				if (!tail || !tail->formatted.count(static_cast<uint64_t>(e.page.file) << 32 | e.page.page)) {
+				if (!tail || !FormattedInTail(*tail, e.page.file, e.page.page)) {
 					throw FormatError(std::string(e.what()) +
 									  (tail ? "; the backup's log tail formats no such page (" +
 												  std::to_string(tail->formatted.size()) + " pages formatted in it)"
@@ -797,10 +801,12 @@ bool NextPage(ClientContext &context, const ScanBindData &data, ScanLocalState &
 					"are read)",
 					FUNCTION, data.schema, data.table, e.what());
 			}
-			if (mode == FuzzyMode::Warn) {
+			// One WARNING per table and scan, as for the table's status (review of #591): the first page met.
+			if (mode == FuzzyMode::Warn && local.pending_warned && !local.pending_warned->exchange(true)) {
 				DUCKDB_LOG_WARNING(context,
 								   "%s: %s.%s: %s; its rows are not read, the table's other pages are (a fuzzy "
-								   "backup: spec 090 replays the tail)",
+								   "backup: spec 090 replays the tail; any further such page of the table is "
+								   "passed over without another WARNING)",
 								   FUNCTION, data.schema, data.table, e.what());
 			}
 			continue;

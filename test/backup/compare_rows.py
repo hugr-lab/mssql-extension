@@ -121,11 +121,14 @@ def compare_log(session, args, paths):
         want[lsn] = (r["operation"], r["context"], xid if xid != "0000:00000000" else None,
                           server_page(r["page"]), int(r["au"]) if r["au"] not in (None, "") else None, r["name"])
     got = {}
+    duplicates = []
     for r in ours:
         key = lsn_text(r["lsn"])
+        if key in got:
+            duplicates.append(key)  # the reader under test giving one record twice (review of #591)
         got[key] = (r["operation"], r["context"], r["xid"].lower() if r["xid"] else r["xid"], r["page"], int(r["au"]) if r["au"] is not None else None,
                     r["name"])
-    failures = []
+    failures = [f"{lsn}: given twice by the reader" for lsn in duplicates]
     for lsn in sorted(set(want) | set(got)):
         w, g = want.get(lsn), got.get(lsn)
         if w is None or g is None:
@@ -333,14 +336,15 @@ def main():
 
     # Spec 086 acceptance 2: a compressed table <x>_row beside its uncompressed twin <x>_plain (the same rows,
     # cd.sql) reads alike, _mssql_rid included -- the key bytes are the uncompressed form's.
-    names = {(t["schema_name"], t["table_name"]): t for t in tables}
+    # Not on a backup taken under load (--fuzzy): its tables may differ, which the status checks above judge.
+    names = {} if args.fuzzy else {(t["schema_name"], t["table_name"]): t for t in tables}
     for (schema, table), t in sorted(names.items()):
         twin = names.get((schema, table[:-4] + "_plain")) if table.endswith("_row") else None
         if not twin or t["decodable"] in (False, "false") or twin["decodable"] in (False, "false"):
             continue
         where = f"{schema}.{table} against {twin['table_name']}"
         a = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(table)}{scan_opts})"
-        b = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(twin['table_name'])}{opts})"
+        b = f"mssql_backup_scan({paths}, {sql_string(schema)}, {sql_string(twin['table_name'])}{scan_opts})"
         ok, result = session.query(
             f"SELECT (SELECT count(*) FROM (SELECT *, _mssql_rid FROM {a} EXCEPT ALL SELECT *, _mssql_rid FROM {b})) "
             f"AS only_row, (SELECT count(*) FROM (SELECT *, _mssql_rid FROM {b} EXCEPT ALL "

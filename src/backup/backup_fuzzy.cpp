@@ -141,7 +141,9 @@ PageState CopyOf(const PageStore &pages, uint64_t key, Page &copy) {
 }  // namespace
 
 size_t FuzzySummary::MemoryBytes() const {
-	size_t bytes = sizeof(*this) + transactions.size() * (sizeof(Transaction) + 48);
+	size_t bytes = sizeof(*this) + transactions.size() * (sizeof(Transaction) + 48) +
+				   formatted.size() * (sizeof(uint64_t) + 2 * sizeof(void *)) +
+				   formatted.bucket_count() * sizeof(void *);
 	for (const auto &unit : units) {
 		for (const auto *pages : {&unit.second.finished, &unit.second.open}) {
 			for (const auto &page : *pages) {
@@ -150,6 +152,10 @@ size_t FuzzySummary::MemoryBytes() const {
 		}
 	}
 	return bytes;
+}
+
+bool FormattedInTail(const FuzzySummary &tail, uint16_t file, uint32_t page) {
+	return tail.formatted.count(static_cast<uint64_t>(file) << 32 | page) != 0;
 }
 
 FuzzySummary SummarizeLogTail(const LogTailReader &tail, const Lsn &first, const Lsn &last, const Lsn &checkpoint) {

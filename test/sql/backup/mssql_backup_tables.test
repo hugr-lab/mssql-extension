@@ -68,8 +68,8 @@ true
 # A quiet backup (D11, spec 085 PR 5: its tail a checkpoint only): every table consistent. The samples'
 # tables are not partitioned: no partitioning, one partition on PRIMARY.
 query TTTT
-SELECT bool_and(fuzzy_status = 'consistent'), bool_and(open_transactions = 0), bool_and(stale_transactions = 0),
-       bool_and(partitioning IS NULL)
+SELECT bool_and(fuzzy_status IS NOT DISTINCT FROM 'consistent'), bool_and(open_transactions IS NOT DISTINCT FROM 0),
+       bool_and(stale_transactions IS NOT DISTINCT FROM 0), bool_and(partitioning IS NULL)
 FROM mssql_backup_tables('test/data/backup/full.bak');
 ----
 true	true	true	true

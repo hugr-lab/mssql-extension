@@ -50,7 +50,7 @@ control	consistent	0	0
 static	consistent	0	0
 
 query I
-SELECT count(*) FROM mssql_backup_tables('test/data/backup/full.bak') WHERE fuzzy_status <> 'consistent';
+SELECT count(*) FROM mssql_backup_tables('test/data/backup/full.bak') WHERE fuzzy_status IS DISTINCT FROM 'consistent';
 ----
 0
 

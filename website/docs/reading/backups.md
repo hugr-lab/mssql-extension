@@ -271,8 +271,8 @@ rows with `mssql_backup_scan`'s, both ways, through `TYPE mssql`.
 
 ## A backup taken under writes
 
-A backup of a database that was being written holds its pages as of its checkpoint, written by
-transactions finished or not, and the log from then to its end (its *tail*). `RESTORE … WITH RECOVERY`
+A backup of a database that was being written holds each page as it was when the backup copied it,
+written by transactions finished or not, and the log from its checkpoint to its end (its *tail*). `RESTORE … WITH RECOVERY`
 replays that log: it redoes what was committed after the pages were copied and undoes what was still
 open. This reader does not replay it (yet). It reads the tail and says, table by table, where its rows
 can differ from the restored database's:

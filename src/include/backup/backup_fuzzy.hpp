@@ -94,6 +94,9 @@ struct FuzzySummary {
 	size_t MemoryBytes() const;
 };
 
+//! Whether the tail lays `page` out (a FORMAT_PAGE before LastLSN): taken into use while the backup ran.
+bool FormattedInTail(const FuzzySummary &tail, uint16_t file, uint32_t page);
+
 //! The summary of the records `tail` gives, for a backup set with those LSNs.
 FuzzySummary SummarizeLogTail(const LogTailReader &tail, const Lsn &first, const Lsn &last, const Lsn &checkpoint);
 //! The same over records already read (the tests, the fuzz harness).
