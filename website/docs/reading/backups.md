@@ -263,8 +263,7 @@ A ROW-compressed table, or partition, is read like an uncompressed one: the same
 (see `mssql_backup_tables.reason`); a column the scan cannot read, when it is named (above); a
 value stored off row that cannot fit in half of `max_memory` even with nothing else of the scan
 held, or in DuckDB's memory (named by its row's `_mssql_rid`, its page and slot, and its columns and
-sizes), or whose stored pieces do not form its tree; and a page that became live while the backup ran (a backup taken under writes), whose content is only in the
-backup's log tail. A backup taken under writes is read as its data pages hold it, which may differ
+sizes), or whose stored pieces do not form its tree. A backup taken under writes is read as its data pages hold it, which may differ
 from what `RESTORE` makes of it by replaying the log tail: each table says whether it does (next section).
 
 The oracle lane restores every fixture backup of SQL Server 2017 to 2025 and compares each table's
@@ -307,6 +306,13 @@ from the log tail, not the pages' LSNs, which miss a page copied before it chang
 lane checks it against `RESTORE` on every version: every table that differs from the restored one is
 flagged, and no table equal to it is. When the tail cannot be read, the listings give NULL for the
 status with a WARNING, and a scan with `fuzzy := 'error'` is refused.
+
+A page the database took into use while the backup ran has no copy in the data the backup carries: its
+content is only in the backup's log tail, which the reader does not replay yet. Its table is never
+`consistent`. Its other pages are read as for any table that is not -- what was committed when the
+backup began is in them -- and the page is passed over: with a WARNING naming it under `'warn'`,
+silently under `'ignore'`; `'error'` refuses the table by name. `RESTORE` holds its rows, and so will
+the reader once it replays the tail.
 
 ### The log a backup carries
 

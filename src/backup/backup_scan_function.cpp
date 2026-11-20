@@ -760,7 +760,28 @@ bool NextPage(ClientContext &context, const ScanBindData &data, ScanLocalState &
 			throw InterruptException();
 		}
 		const PagePointer at = (*local.cursor->pages)[local.next_page++];
-		if (!ReadUnitDataPage(store, *local.cursor->unit, at, data.schema + "." + data.table, local.page)) {
+		try {
+			if (!ReadUnitDataPage(store, *local.cursor->unit, at, data.schema + "." + data.table, local.page)) {
+				continue;
+			}
+		} catch (PendingPageError &e) {
+			// A page that became live while the backup ran: its rows are in the log tail only (spec 090
+			// replays it). Until then the table's other pages are read as of the copy, as every fuzzy table
+			// is -- what was committed when the backup began is in them -- and the page is named: refused
+			// under fuzzy := 'error', said under 'warn', passed over under 'ignore'.
+			const FuzzyMode mode = FuzzyModeOf(context, data.fuzzy, FUNCTION);
+			if (mode == FuzzyMode::Error) {
+				throw InvalidInputException(
+					"%s: %s.%s: %s (fuzzy := 'error'; under 'warn' the table's other pages "
+					"are read)",
+					FUNCTION, data.schema, data.table, e.what());
+			}
+			if (mode == FuzzyMode::Warn) {
+				DUCKDB_LOG_WARNING(context,
+								   "%s: %s.%s: %s; its rows are not read, the table's other pages are (a fuzzy "
+								   "backup: spec 090 replays the tail)",
+								   FUNCTION, data.schema, data.table, e.what());
+			}
 			continue;
 		}
 		const uint16_t slots = local.page.header.slot_count;
