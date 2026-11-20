@@ -3,6 +3,7 @@
 #include <cctype>
 #include "catalog/mssql_column_info.hpp"
 #include "codec/literal_format.hpp"
+#include "codec/sql_vector/vector_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hugeint.hpp"
@@ -77,6 +78,11 @@ string MSSQLValueSerializer::Serialize(const Value &value, const LogicalType &ta
 	// (handles NULL + 9-arm family switch internally; FR-022 guarantees
 	// byte-identity for LiteralContext::InsertValues vs Filter).
 	auto &type = value.type();
+	if (mssql::codec::sql_vector::IsVectorType(type)) {
+		// Spec 093 T3: N'[...]', which the server converts to the column's vector type (its refusals name
+		// the column themselves).
+		return mssql::codec::sql_vector::FormatLiteral(value, column);
+	}
 	try {
 		if (type.id() == LogicalTypeId::VARIANT && !value.IsNull()) {
 			// Spec 093: a sql_variant column reads as VARIANT (T1); writing one is T2.

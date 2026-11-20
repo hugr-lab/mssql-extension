@@ -31,6 +31,8 @@ struct MSSQLPoolConfig {
 	// keeps sending UTF-16, so this is an opt-OUT for environments that want the
 	// pre-#225 wire form back.
 	bool utf8_support = true;
+	//! Spec 093 D4: mssql_vector_support, read at ATTACH.
+	bool vector_support = true;
 };
 
 //===----------------------------------------------------------------------===//

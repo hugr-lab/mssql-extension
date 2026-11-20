@@ -219,7 +219,11 @@ fi
 # Filtering the OWNED list (not just the selection) keeps the
 # every-file-must-be-registered invariant below intact: both counts come from
 # this one file.
-find test/sql -name '*.test' \
+# MSSQL_TEST_SUITE_DIR narrows the suite to one directory: the SQL Server 2025 job (ci.yml's
+# integration-test-2025) runs test/sql/types_2025 alone, whose files need the 2025 types and skip
+# elsewhere (require-env MSSQL_TEST_SQLSERVER_2025); it sets MSSQL_MIN_TEST_CASES to their count.
+SUITE_DIR="${MSSQL_TEST_SUITE_DIR:-test/sql}"
+find "$SUITE_DIR" -name '*.test' \
     | grep -v -e '^test/sql/azure/' -e '^test/sql/fabric/' \
     | sort > /tmp/mssql_our_files.txt
 : > /tmp/mssql_selected.txt

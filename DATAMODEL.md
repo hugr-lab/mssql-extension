@@ -754,6 +754,19 @@ spec 093 D3's table -- a string through spec 091's code-page kernels by its own 
 in the vector. The column stays out of pushed comparisons and keys (`comparison_differs`): the server
 compares a `sql_variant` by its base type (#514).
 
+**A `vector(n)` is a `FLOAT[n]` (spec 093 T3).** `codec/sql_vector`: `vector_bytes` (DuckDB-free, the
+fuzz harness's) checks a value's header against its column and widens or encodes the elements (float16
+both ways, rounded to nearest even), and parses the JSON text locale-free; `vector_codec` writes them
+into an `ARRAY(FLOAT, n)` child or reads them out of one. COLMETADATA keeps the UserType (255 marks a
+vector in both wire forms) and VECTORTYPE's element type; a vector column takes the Vector kernel from
+`ResolveAppend` before the divergence test, staged on the bounded-binary arm (0xF5) or the PLP one (the
+text). VECTORSUPPORT is asked for per catalog (`mssql_vector_support` at ATTACH, through
+`MSSQLConnectionInfo::vector_support` and `TdsConnection::SetRequestVectorSupport`; `Login7Features` is
+what the four LOGIN7 builders take), and the granted version is kept per connection, read by the
+stream's fallback `WARNING`. The bulk wire sends the bytes as varbinary under a declared `vector(n)`
+(`BCPColumnMetadata::vector_dims`, `sql_vector::EncodeToBcp` as the family encoder); the statement path
+a `N'[...]'` literal.
+
 ### Reading a column's collation
 
 `ColumnMetadata` carries all five wire bytes of the TDS collation

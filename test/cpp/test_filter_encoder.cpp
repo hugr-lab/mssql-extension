@@ -1029,10 +1029,12 @@ static void TestD2AnswersAreSeparate() {
 	for (const char *t : {"int", "nvarchar", "datetime2", "datetimeoffset", "uniqueidentifier", "xml", "geometry"}) {
 		ASSERT_TRUE(!MSSQLColumnInfo::ComparisonDiffersFor(t));
 	}
-	for (const char *t : {"sql_variant", "hierarchyid", "vector", "geometry", "geography", "my_clr_type"}) {
+	for (const char *t : {"sql_variant", "hierarchyid", "geometry", "geography", "my_clr_type"}) {
 		ASSERT_TRUE(!MSSQLColumnInfo::BulkWireTakesType(t));
 	}
-	for (const char *t : {"int", "nvarchar", "datetime2", "rowversion", "json", "xml"}) {
+	// vector joined the bulk wire in its own write PR (spec 093 T3: its bytes as varbinary, V6) and stays
+	// out of comparisons (above).
+	for (const char *t : {"int", "nvarchar", "datetime2", "rowversion", "json", "xml", "vector"}) {
 		ASSERT_TRUE(MSSQLColumnInfo::BulkWireTakesType(t));
 	}
 	// Case as the server spells it in sys.types, or not.

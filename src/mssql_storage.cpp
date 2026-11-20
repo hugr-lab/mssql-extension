@@ -1585,6 +1585,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 		pool_config.tds_packet_size > 0 ? static_cast<size_t>(pool_config.tds_packet_size) : 0;
 	// Issue #225: ask for UTF-8 unless the user turned the request off.
 	connection_info->utf8_support = pool_config.utf8_support;
+	connection_info->vector_support = pool_config.vector_support;
 	auto attach_validation_timeout = LoadAttachValidationTimeout(context);
 	MSSQL_STORAGE_DEBUG_LOG(1, "ATTACH %s: lazy_validation=%s, attach_validation_timeout=%ds", name.c_str(),
 							lazy_validation ? "true" : "false", attach_validation_timeout);

@@ -2,9 +2,11 @@
 
 #include "codec/datetime_codec.hpp"
 #include "codec/decimal_codec.hpp"
+#include "codec/sql_vector/vector_codec.hpp"
 #include "codec/string_codec.hpp"
 #include "codec/uuid_codec.hpp"
 #include "codec/write_column_ops.hpp"
+#include "duckdb/common/vector/array_vector.hpp"
 #include "mssql_counters.hpp"
 
 #include "tds/tds_types.hpp"
@@ -74,6 +76,9 @@ enum class NullWireKind : uint8_t { Plp, VariableUShort, Fixed };
 
 // W2: resolve the family encoder once per column (was a 9-way switch per row).
 EncodeFn ResolveEncoder(const mssql::BCPColumnMetadata &col) {
+	if (col.IsVector()) {
+		return mssql::codec::sql_vector::EncodeToBcp;  // spec 093 T3: header + elements as varbinary
+	}
 	mssql::codec::TypeFamily family;
 	try {
 		family = mssql::codec::FamilyFromLogicalType(col.duckdb_type);
@@ -182,6 +187,23 @@ void PrepareColumnStates(DataChunk &chunk, idx_t format_count, const vector<mssq
 			continue;
 		}
 		state.vec = &chunk.data[source_idx];
+		if (col.IsVector() && !col.null_only_source) {
+			// Spec 093 T3: the encoder reads the elements as float, a row's dimensions apart in a flat child.
+			// Once per chunk: the source is FLOAT[n] of the column's n (a DOUBLE[n] is the user's cast to
+			// write, IsTypeCompatible; another n is no vector(n) value), its child flattened if it is not.
+			const auto &source_type = state.vec->GetType();
+			if (!mssql::codec::sql_vector::IsVectorType(source_type) ||
+				ArrayType::GetSize(source_type) != col.vector_dims) {
+				throw InvalidInputException(
+					"MSSQL: column \"%s\" is a vector(%d), which takes a FLOAT[%d] value, not %s%s", col.ReportedName(),
+					static_cast<int>(col.vector_dims), static_cast<int>(col.vector_dims), source_type.ToString(),
+					source_type.id() == LogicalTypeId::ARRAY ? " (cast it)" : "");
+			}
+			auto &child = ArrayVector::GetChildMutable(*state.vec);
+			if (child.GetVectorType() != VectorType::FLAT_VECTOR) {
+				child.Flatten();
+			}
+		}
 		state.vec->ToUnifiedFormat(state.fmt);
 		if (col.null_only_source) {
 			// Bind admitted this pair for the all-NULL case only (a constant
@@ -947,6 +969,10 @@ void BCPRowEncoder::EncodeRow(vector<uint8_t> &buffer, DataChunk &chunk, idx_t r
 }
 
 void BCPRowEncoder::EncodeValue(vector<uint8_t> &buffer, const Value &value, const mssql::BCPColumnMetadata &col) {
+	if (col.IsVector()) {
+		mssql::codec::sql_vector::EncodeValueToBcp(value, col, buffer);	 // spec 093 T3, its NULL included
+		return;
+	}
 	if (value.IsNull()) {
 		if (col.IsPLPType()) {
 			EncodeNullPLP(buffer);

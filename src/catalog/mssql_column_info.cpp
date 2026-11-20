@@ -90,6 +90,11 @@ MSSQLReadForm MSSQLColumnInfo::ReadFormFor(const string &sql_type_name) {
 	if (StringUtil::CIEquals(sql_type_name, "sql_variant")) {
 		return MSSQLReadForm::Bare;
 	}
+	// vector (spec 093 T3, D4): read bare, as the session streams it (VECTORTYPE under VECTORSUPPORT, its
+	// JSON text otherwise); compared by the server unlike DuckDB (not on ComparisonDiffersFor's list).
+	if (StringUtil::CIEquals(sql_type_name, "vector")) {
+		return MSSQLReadForm::Bare;
+	}
 	return IsKnownSQLServerType(sql_type_name) ? MSSQLReadForm::Bare : MSSQLReadForm::ServerCast;
 }
 
@@ -115,13 +120,14 @@ bool MSSQLColumnInfo::BulkWireTakesType(const string &sql_type_name) {
 	// converts; on the bulk wire FromServerColumn would declare it nvarchar and send the bytes as
 	// text. The same for hierarchyid, read through a cast: the statement path sends a string literal
 	// the server converts, the bulk wire would not. sql_variant's write is T2's (refused until then).
+	// vector (spec 093 T3): its bytes as varbinary under a declared vector(n), measured V6.
 	const string t = StringUtil::Lower(sql_type_name);
-	return t == "bit" || t == "tinyint" || t == "smallint" || t == "int" || t == "bigint" || t == "real" ||
-		   t == "float" || t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" || t == "char" ||
-		   t == "varchar" || t == "text" || t == "nchar" || t == "nvarchar" || t == "ntext" || t == "date" ||
-		   t == "time" || t == "datetime" || t == "datetime2" || t == "smalldatetime" || t == "datetimeoffset" ||
-		   t == "binary" || t == "varbinary" || t == "image" || t == "uniqueidentifier" || t == "timestamp" ||
-		   t == "rowversion" || t == "json" || t == "xml";
+	return t == "vector" || t == "bit" || t == "tinyint" || t == "smallint" || t == "int" || t == "bigint" ||
+		   t == "real" || t == "float" || t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" ||
+		   t == "char" || t == "varchar" || t == "text" || t == "nchar" || t == "nvarchar" || t == "ntext" ||
+		   t == "date" || t == "time" || t == "datetime" || t == "datetime2" || t == "smalldatetime" ||
+		   t == "datetimeoffset" || t == "binary" || t == "varbinary" || t == "image" || t == "uniqueidentifier" ||
+		   t == "timestamp" || t == "rowversion" || t == "json" || t == "xml";
 }
 
 //===----------------------------------------------------------------------===//
@@ -373,6 +379,14 @@ LogicalType MSSQLColumnInfo::MapSQLServerTypeToDuckDB(const string &sql_type_nam
 	// already what the vector wants. A raw scan, typed by the describe, reads VARCHAR.
 	if (lower_type == "json") {
 		return LogicalType::JSON();
+	}
+
+	// vector(n) (SQL Server 2025, spec 093 D4): FLOAT[n], float16 elements widened exactly. sys.columns
+	// gives the element type in scale (0 float32, 1 float16) and 8 + n x element size in max_length (V5).
+	if (lower_type == "vector") {
+		const int element = scale == 1 ? 2 : 4;
+		const int dimensions = max_length > 8 ? (max_length - 8) / element : 1;
+		return LogicalType::ARRAY(LogicalType::FLOAT, static_cast<idx_t>(dimensions));
 	}
 
 	// Special types
