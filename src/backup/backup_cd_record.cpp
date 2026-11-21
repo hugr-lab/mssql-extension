@@ -23,6 +23,175 @@ void CdRecord::BackPointer(uint32_t &page, uint16_t &file, uint16_t &slot) const
 	slot = static_cast<uint16_t>(p[6] | (p[7] << 8));
 }
 
+namespace {
+
+//! A CD record being walked: its bytes up to the page's slot array, and what to call it in an error.
+struct CdWalk {
+	const uint8_t *d;
+	size_t limit;
+	const char *what;
+	uint16_t offset;
+
+	//! `bytes` of the record lie before the slot array, or a FormatError naming `part`.
+	void Need(size_t bytes, const char *part) const {
+		if (bytes > limit) {
+			throw FormatError(Where(what, offset) + ": its " + part + " runs past the page's slot array");
+		}
+	}
+	std::string Here() const {
+		return Where(what, offset);
+	}
+};
+
+//! The record's kind from its header's type: true when the record is all read (a forwarding stub, a
+//! version ghost), which hold no values.
+bool ReadCdKind(const CdWalk &w, uint8_t type, bool tagged, size_t tag, CdRecord &out) {
+	switch (type) {
+	case CD_TYPE_STUB:
+		// Not a CD record: the RID it forwards to (E22: header 0x09).
+		w.Need(9 + tag, "forwarding stub");
+		out.kind = CdRecord::Kind::Stub;
+		out.end = static_cast<uint16_t>(9 + tag);
+		return true;
+	case CD_TYPE_GHOST_VERSION:
+		// A heap row deleted under row versioning: the header and its version tag only (E22: 0x07).
+		if (!tagged) {
+			throw FormatError(w.Here() + " is a version ghost with no version tag");
+		}
+		w.Need(1 + tag, "version ghost");
+		out.kind = CdRecord::Kind::Ghost;
+		out.end = static_cast<uint16_t>(1 + tag < 9 ? 9 : 1 + tag);
+		return true;
+	case CD_TYPE_GHOST:
+		out.kind = CdRecord::Kind::Ghost;
+		return false;
+	case CD_TYPE_PRIMARY:
+		out.kind = CdRecord::Kind::Row;
+		return false;
+	case CD_TYPE_FORWARDED:
+	case CD_TYPE_GHOST_FORWARDED:
+		out.kind = CdRecord::Kind::Forwarded;  // a ghost forwarded record is laid out as one: made a ghost later
+		return false;
+	default:
+		// Not seen (E22): it could be a row, so it is named rather than skipped.
+		throw FormatError(w.Here() + " is of record type " + std::to_string(type) + ", which the reader does not know");
+	}
+}
+
+//! The column count at `pos` (one byte, or two with the high bit of the first set); `pos` moves past it.
+size_t ReadCdColumnCount(const CdWalk &w, size_t &pos) {
+	w.Need(pos + 1, "column count");
+	size_t n = w.d[pos];
+	if (n & 0x80) {
+		w.Need(pos + 2, "column count");
+		n = ((n & 0x7F) << 8) | w.d[pos + 1];
+		pos += 2;
+	} else {
+		pos += 1;
+	}
+	return n;
+}
+
+//! Each column's CD code from the CD array `cd`, and the place of the values in the short region, which
+//! starts at `short_at` and ends where it is left; `cluster_sizes` is checked as each full cluster ends.
+//! Returns how many values are long ones.
+size_t ReadCdShortRegion(const CdWalk &w, const uint8_t *cd, const uint8_t *cluster_sizes, size_t &short_at,
+						 std::vector<CdValue> &values) {
+	const size_t n = values.size();
+	size_t longs = 0;
+	size_t cluster_start = short_at;
+	for (size_t i = 0; i < n; i++) {
+		CdValue &v = values[i];
+		v.code = (i % 2 == 0) ? (cd[i / 2] & 0x0F) : (cd[i / 2] >> 4);
+		if (v.code >= 2 && v.code <= 9) {
+			v.offset = static_cast<uint16_t>(short_at);
+			v.size = static_cast<uint16_t>(v.code - 1);
+			short_at += v.size;
+			w.Need(short_at, "short region");
+		} else if (v.code == CD_SYMBOL) {
+			// A page-dictionary symbol (PAGE compression, E23): its one byte in the short region.
+			v.offset = static_cast<uint16_t>(short_at);
+			v.size = 1;
+			short_at += 1;
+			w.Need(short_at, "short region");
+		} else if (v.code == CD_LONG) {
+			longs++;
+		} else if (v.code > CD_SYMBOL) {
+			throw FormatError(w.Here() + ": column " + std::to_string(i + 1) + " has CD code " +
+							  std::to_string(v.code) + ", which no value has");
+		}
+		// The cluster array says how many short bytes each full cluster holds: checked as a cluster ends.
+		if ((i + 1) % CD_CLUSTER_COLUMNS == 0 && (i + 1) < n) {
+			const size_t c = i / CD_CLUSTER_COLUMNS;
+			if (short_at - cluster_start != cluster_sizes[c]) {
+				throw FormatError(w.Here() + ": its cluster " + std::to_string(c) + " holds " +
+								  std::to_string(short_at - cluster_start) + " short bytes, its cluster array says " +
+								  std::to_string(cluster_sizes[c]));
+			}
+			cluster_start = short_at;
+		}
+	}
+	return longs;
+}
+
+//! With more than one cluster, a byte per cluster but the last follows the long region's end offsets:
+//! how many long values that cluster holds (E22), checked against the CD array's.
+void CheckCdLongClusters(const CdWalk &w, const std::vector<CdValue> &values, size_t clusters, size_t cluster_bytes,
+						 size_t counts_at) {
+	std::vector<size_t> per_cluster(clusters, 0);
+	for (size_t i = 0; i < values.size(); i++) {
+		if (values[i].code == CD_LONG) {
+			per_cluster[i / CD_CLUSTER_COLUMNS]++;
+		}
+	}
+	for (size_t c = 0; c < cluster_bytes; c++) {
+		if (w.d[counts_at + c] != per_cluster[c]) {
+			throw FormatError(w.Here() + ": its cluster " + std::to_string(c) + " holds " +
+							  std::to_string(per_cluster[c]) + " long values, its long region says " +
+							  std::to_string(w.d[counts_at + c]));
+		}
+	}
+}
+
+//! The long region at `at` (after the short one): its count against the CD array's `longs`, its
+//! clusters' counts, and each long value's place from the end offsets. Returns where the region ends.
+size_t ReadCdLongRegion(const CdWalk &w, size_t at, size_t longs, size_t clusters, size_t cluster_bytes,
+						std::vector<CdValue> &values) {
+	const uint8_t *d = w.d;
+	w.Need(at + 3, "long region");
+	const size_t count = d[at + 1] | (d[at + 2] << 8);
+	if (count != longs) {
+		throw FormatError(w.Here() + ": its long region lists " + std::to_string(count) + " values, its CD array " +
+						  std::to_string(longs));
+	}
+	const size_t ends_at = at + 3;
+	const size_t counts_at = ends_at + 2 * count;
+	w.Need(counts_at + cluster_bytes, "long region's offsets");
+	CheckCdLongClusters(w, values, clusters, cluster_bytes, counts_at);
+	const size_t data_at = counts_at + cluster_bytes;
+	size_t previous = 0;
+	size_t k = 0;
+	for (CdValue &v : values) {
+		if (v.code != CD_LONG) {
+			continue;
+		}
+		const uint16_t raw = static_cast<uint16_t>(d[ends_at + 2 * k] | (d[ends_at + 2 * k + 1] << 8));
+		const size_t stop = raw & 0x7FFF;
+		if (stop < previous) {
+			throw FormatError(w.Here() + ": its long values' end offsets are not ascending");
+		}
+		w.Need(data_at + stop, "long region");
+		v.complex = (raw & 0x8000) != 0;
+		v.offset = static_cast<uint16_t>(data_at + previous);
+		v.size = static_cast<uint16_t>(stop - previous);
+		previous = stop;
+		k++;
+	}
+	return data_at + previous;
+}
+
+}  // namespace
+
 void ReadCdRecord(const uint8_t *page, size_t page_size, size_t slot_array, uint16_t offset, const char *what,
 				  CdRecord &out, bool padded) {
 	if (offset < 96 || slot_array > page_size || offset >= slot_array) {
@@ -34,169 +203,51 @@ void ReadCdRecord(const uint8_t *page, size_t page_size, size_t slot_array, uint
 	out.values.clear();
 	out.column_count = 0;
 	const uint8_t *d = out.data;
-	const size_t limit = out.limit;
-	auto need = [&](size_t bytes, const char *part) {
-		if (bytes > limit) {
-			throw FormatError(Where(what, offset) + ": its " + part + " runs past the page's slot array");
-		}
-	};
-	need(1, "header");
+	const CdWalk w = {d, out.limit, what, offset};
+	w.Need(1, "header");
 	out.header = d[0];
 	if (!(out.header & 0x01) || (out.header & 0xC0)) {
-		throw FormatError(Where(what, offset) + " has header " + std::to_string(out.header) +
+		throw FormatError(w.Here() + " has header " + std::to_string(out.header) +
 						  ", not a CD record the reader knows, in a compressed rowset");
 	}
 	const bool tagged = (out.header & CD_VERSION_TAG) != 0;
 	const size_t tag = tagged ? CD_VERSION_TAG_BYTES : 0;
 	const uint8_t type = (out.header >> 2) & 7;
-	switch (type) {
-	case CD_TYPE_STUB:
-		// Not a CD record: the RID it forwards to (E22: header 0x09).
-		need(9 + tag, "forwarding stub");
-		out.kind = CdRecord::Kind::Stub;
-		out.end = static_cast<uint16_t>(9 + tag);
+	if (ReadCdKind(w, type, tagged, tag, out)) {
 		return;
-	case CD_TYPE_GHOST_VERSION:
-		// A heap row deleted under row versioning: the header and its version tag only (E22: 0x07).
-		if (!tagged) {
-			throw FormatError(Where(what, offset) + " is a version ghost with no version tag");
-		}
-		need(1 + tag, "version ghost");
-		out.kind = CdRecord::Kind::Ghost;
-		out.end = static_cast<uint16_t>(1 + tag < 9 ? 9 : 1 + tag);
-		return;
-	case CD_TYPE_GHOST:
-		out.kind = CdRecord::Kind::Ghost;
-		break;
-	case CD_TYPE_PRIMARY:
-		out.kind = CdRecord::Kind::Row;
-		break;
-	case CD_TYPE_FORWARDED:
-	case CD_TYPE_GHOST_FORWARDED:
-		out.kind = CdRecord::Kind::Forwarded;  // a ghost forwarded record is laid out as one: made a ghost below
-		break;
-	default:
-		// Not seen (E22): it could be a row, so it is named rather than skipped.
-		throw FormatError(Where(what, offset) + " is of record type " + std::to_string(type) +
-						  ", which the reader does not know");
 	}
 	size_t pos = 1;
-	need(pos + 1, "column count");
-	size_t n = d[pos];
-	if (n & 0x80) {
-		need(pos + 2, "column count");
-		n = ((n & 0x7F) << 8) | d[pos + 1];
-		pos += 2;
-	} else {
-		pos += 1;
-	}
+	const size_t n = ReadCdColumnCount(w, pos);
 	out.column_count = static_cast<uint16_t>(n);
 	const size_t cd_bytes = (n + 1) / 2;
-	need(pos + cd_bytes, "CD array");
+	w.Need(pos + cd_bytes, "CD array");
 	const uint8_t *cd = d + pos;
 	pos += cd_bytes;
 	const size_t clusters = (n + CD_CLUSTER_COLUMNS - 1) / CD_CLUSTER_COLUMNS;
 	const size_t cluster_bytes = clusters > 1 ? clusters - 1 : 0;
-	need(pos + cluster_bytes, "cluster array");
+	w.Need(pos + cluster_bytes, "cluster array");
 	const uint8_t *cluster_sizes = d + pos;
 	pos += cluster_bytes;
 	out.values.resize(n);
-	size_t short_at = pos;
-	size_t longs = 0;
-	size_t cluster_start = short_at;
-	for (size_t i = 0; i < n; i++) {
-		CdValue &v = out.values[i];
-		v.code = (i % 2 == 0) ? (cd[i / 2] & 0x0F) : (cd[i / 2] >> 4);
-		if (v.code >= 2 && v.code <= 9) {
-			v.offset = static_cast<uint16_t>(short_at);
-			v.size = static_cast<uint16_t>(v.code - 1);
-			short_at += v.size;
-			need(short_at, "short region");
-		} else if (v.code == CD_SYMBOL) {
-			// A page-dictionary symbol (PAGE compression, E23): its one byte in the short region.
-			v.offset = static_cast<uint16_t>(short_at);
-			v.size = 1;
-			short_at += 1;
-			need(short_at, "short region");
-		} else if (v.code == CD_LONG) {
-			longs++;
-		} else if (v.code > CD_SYMBOL) {
-			throw FormatError(Where(what, offset) + ": column " + std::to_string(i + 1) + " has CD code " +
-							  std::to_string(v.code) + ", which no value has");
-		}
-		// The cluster array says how many short bytes each full cluster holds: checked as a cluster ends.
-		if ((i + 1) % CD_CLUSTER_COLUMNS == 0 && (i + 1) < n) {
-			const size_t c = i / CD_CLUSTER_COLUMNS;
-			if (short_at - cluster_start != cluster_sizes[c]) {
-				throw FormatError(Where(what, offset) + ": its cluster " + std::to_string(c) + " holds " +
-								  std::to_string(short_at - cluster_start) + " short bytes, its cluster array says " +
-								  std::to_string(cluster_sizes[c]));
-			}
-			cluster_start = short_at;
-		}
-	}
-	size_t end = short_at;
+	size_t end = pos;
+	const size_t longs = ReadCdShortRegion(w, cd, cluster_sizes, end, out.values);
 	if (out.header & 0x20) {
-		need(end + 3, "long region");
-		const size_t count = d[end + 1] | (d[end + 2] << 8);
-		if (count != longs) {
-			throw FormatError(Where(what, offset) + ": its long region lists " + std::to_string(count) +
-							  " values, its CD array " + std::to_string(longs));
-		}
-		const size_t ends_at = end + 3;
-		// With more than one cluster, a byte per cluster but the last follows the end offsets: how many
-		// long values that cluster holds (E22).
-		const size_t counts_at = ends_at + 2 * count;
-		need(counts_at + cluster_bytes, "long region's offsets");
-		std::vector<size_t> per_cluster(clusters, 0);
-		for (size_t i = 0; i < n; i++) {
-			if (out.values[i].code == CD_LONG) {
-				per_cluster[i / CD_CLUSTER_COLUMNS]++;
-			}
-		}
-		for (size_t c = 0; c < cluster_bytes; c++) {
-			if (d[counts_at + c] != per_cluster[c]) {
-				throw FormatError(Where(what, offset) + ": its cluster " + std::to_string(c) + " holds " +
-								  std::to_string(per_cluster[c]) + " long values, its long region says " +
-								  std::to_string(d[counts_at + c]));
-			}
-		}
-		const size_t data_at = counts_at + cluster_bytes;
-		size_t previous = 0;
-		size_t k = 0;
-		for (size_t i = 0; i < n; i++) {
-			CdValue &v = out.values[i];
-			if (v.code != CD_LONG) {
-				continue;
-			}
-			const uint16_t raw = static_cast<uint16_t>(d[ends_at + 2 * k] | (d[ends_at + 2 * k + 1] << 8));
-			const size_t stop = raw & 0x7FFF;
-			if (stop < previous) {
-				throw FormatError(Where(what, offset) + ": its long values' end offsets are not ascending");
-			}
-			need(data_at + stop, "long region");
-			v.complex = (raw & 0x8000) != 0;
-			v.offset = static_cast<uint16_t>(data_at + previous);
-			v.size = static_cast<uint16_t>(stop - previous);
-			previous = stop;
-			k++;
-		}
-		end = data_at + previous;
+		end = ReadCdLongRegion(w, end, longs, clusters, cluster_bytes, out.values);
 	} else if (longs) {
-		throw FormatError(Where(what, offset) + ": " + std::to_string(longs) + " long values and no long region");
+		throw FormatError(w.Here() + ": " + std::to_string(longs) + " long values and no long region");
 	}
 	if (out.kind == CdRecord::Kind::Forwarded) {
 		out.back_pointer = static_cast<uint16_t>(end);	// after the data, before a version tag (E22)
 		end += 8;
-		need(end, "back pointer");
+		w.Need(end, "back pointer");
 	}
 	if (tagged) {
 		end += tag;
-		need(end, "version tag");
+		w.Need(end, "version tag");
 	}
 	if (padded && end < 9) {
 		end = 9;  // every row record is padded to 9 bytes (E22)
-		need(end, "padding");
+		w.Need(end, "padding");
 	}
 	out.end = static_cast<uint16_t>(end);
 	if (type == CD_TYPE_GHOST_FORWARDED) {
