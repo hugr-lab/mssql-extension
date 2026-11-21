@@ -629,62 +629,63 @@ std::string BoundaryRefusal(const CatalogPartitioning &p, const PartitionBoundar
 	return std::string();
 }
 
-}  // namespace
-
-void DescribePartitioning(const PartitionCatalog &pc, const std::unordered_map<int32_t, std::string> &type_names,
-						  int32_t base_index, const BoundaryCheck &check, CatalogTable &t) {
+// A reason clears every list: never a partial one (D13).
+void FailPartitioning(CatalogTable &t, const std::string &why) {
 	CatalogPartitioning &p = t.partitioning;
-	// A reason clears every list: never a partial one (D13).
-	auto fail = [&](const std::string &why) {
-		t.partitioned = true;
-		p.reason = why;
-		p.boundaries.clear();
-		p.destinations.clear();
-		p.next_used.clear();
-	};
-	const auto space_key = std::make_pair(t.object_id, base_index);
+	t.partitioned = true;
+	p.reason = why;
+	p.boundaries.clear();
+	p.destinations.clear();
+	p.next_used.clear();
+}
+
+// Whether the table's base index is on a partition scheme, its data space into `data_space`. False with
+// `why` when the catalog cannot say; false without one when it is on a filegroup or the default data space.
+bool OnScheme(const PartitionCatalog &pc, const std::pair<int32_t, int32_t> &space_key, int32_t &data_space,
+			  std::string &why) {
 	if (pc.data_space_twice.count(space_key)) {
-		return fail("syssingleobjrefs lists its index's data space twice");
+		why = "syssingleobjrefs lists its index's data space twice";
+		return false;
 	}
 	auto space = pc.data_space.find(space_key);
 	if (space == pc.data_space.end()) {
 		// No class-7 row: the index is on the default data space (measured: tables on a scheme have one,
 		// tables on the default filegroup none), unless syssingleobjrefs itself could not be read.
 		if (!pc.data_spaces_read && !pc.reason.empty() && !pc.schemes.empty()) {
-			return fail(pc.reason);
+			why = pc.reason;
 		}
-		return;
+		return false;
 	}
-	const int32_t data_space = space->second;
+	data_space = space->second;
 	if (pc.data_spaces_twice.count(data_space)) {
-		return fail("sysclsobjs lists its index's data space " + std::to_string(data_space) + " twice");
+		why = "sysclsobjs lists its index's data space " + std::to_string(data_space) + " twice";
+		return false;
 	}
-	auto scheme = pc.schemes.find(data_space);
-	if (scheme == pc.schemes.end()) {
-		return;	 // on a filegroup
-	}
-	t.partitioned = true;
-	p.scheme_id = data_space;
-	p.scheme_name = scheme->second;
+	return pc.schemes.count(data_space) != 0;  // else on a filegroup
+}
+
+// The scheme's partition function and its parameter into `p`; why not, or "".
+std::string DescribeFunction(const PartitionCatalog &pc, const std::unordered_map<int32_t, std::string> &type_names,
+							 int32_t data_space, CatalogPartitioning &p) {
 	if (!pc.reason.empty()) {
-		return fail(pc.reason);
+		return pc.reason;
 	}
 	if (pc.schemes_twice.count(data_space)) {
-		return fail("syssingleobjrefs lists scheme " + p.scheme_name + "'s function twice");
+		return "syssingleobjrefs lists scheme " + p.scheme_name + "'s function twice";
 	}
 	auto fn_id = pc.scheme_function.find(data_space);
 	if (fn_id == pc.scheme_function.end()) {
-		return fail("scheme " + p.scheme_name + " names no partition function");
+		return "scheme " + p.scheme_name + " names no partition function";
 	}
 	p.function_id = fn_id->second;
 	auto fn = pc.functions.find(p.function_id);
 	auto param = pc.parameters.find(p.function_id);
 	if (fn == pc.functions.end() || param == pc.parameters.end()) {
-		return fail("scheme " + p.scheme_name + "'s partition function " + std::to_string(p.function_id) +
-					" is not in the catalog");
+		return "scheme " + p.scheme_name + "'s partition function " + std::to_string(p.function_id) +
+			   " is not in the catalog";
 	}
 	if (pc.functions_twice.count(p.function_id) || pc.parameters_twice.count(p.function_id)) {
-		return fail("partition function " + std::to_string(p.function_id) + " is listed twice in the catalog");
+		return "partition function " + std::to_string(p.function_id) + " is listed twice in the catalog";
 	}
 	p.function_name = fn->second.name;
 	p.range_right = fn->second.range_right;
@@ -697,17 +698,23 @@ void DescribePartitioning(const PartitionCatalog &pc, const std::unordered_map<i
 	auto type = type_names.find(param->second.user_type);
 	auto system = type_names.find(param->second.xtype);
 	if (type == type_names.end() || system == type_names.end()) {
-		return fail("function " + p.function_name + "'s parameter type " + std::to_string(param->second.user_type) +
-					" is not in sysscalartypes");
+		return "function " + p.function_name + "'s parameter type " + std::to_string(param->second.user_type) +
+			   " is not in sysscalartypes";
 	}
 	p.parameter_type_name = type->second;
 	p.parameter_system_type_name = system->second;
+	return std::string();
+}
+
+// The table's partitioning column into `p`, and the function's fanout checked; why not, or "".
+std::string PartitioningColumn(const PartitionCatalog &pc, const std::pair<int32_t, int32_t> &space_key,
+							   int32_t base_index, const CatalogTable &t, CatalogPartitioning &p) {
 	if (pc.partition_column_twice.count(space_key)) {
-		return fail("sysiscols lists two partitioning columns for its index " + std::to_string(base_index));
+		return "sysiscols lists two partitioning columns for its index " + std::to_string(base_index);
 	}
 	auto column = pc.partition_column.find(space_key);
 	if (column == pc.partition_column.end()) {
-		return fail("its index " + std::to_string(base_index) + " has no partitioning column in sysiscols");
+		return "its index " + std::to_string(base_index) + " has no partitioning column in sysiscols";
 	}
 	p.column_id = column->second;
 	for (const auto &c : t.columns) {
@@ -716,62 +723,70 @@ void DescribePartitioning(const PartitionCatalog &pc, const std::unordered_map<i
 		}
 	}
 	if (p.column_name.empty()) {
-		return fail("its partitioning column " + std::to_string(p.column_id) + " is not one of its columns");
+		return "its partitioning column " + std::to_string(p.column_id) + " is not one of its columns";
 	}
 	if (p.fanout < 1 || p.fanout > 15000) {
-		return fail("function " + p.function_name + " has a fanout of " + std::to_string(p.fanout));
+		return "function " + p.function_name + " has a fanout of " + std::to_string(p.fanout);
 	}
-	// The boundaries: ids 1..fanout-1, each once, each NULL or a value of the parameter's own type, as
-	// the parameter declares it (a string's collation and length too, as AddedDefault checks a default).
-	// They are reference only -- the rows are read whatever they hold -- and the destinations do not
-	// depend on them: a boundary the reader cannot give is the reason, the boundaries are not given,
-	// and the destinations and NEXT USED still are (owner, review of #551).
-	std::string boundary_reason;
-	std::vector<PartitionBoundary> boundaries;
+	return std::string();
+}
+
+// The boundaries: ids 1..fanout-1, each once, each NULL or a value of the parameter's own type, as
+// the parameter declares it (a string's collation and length too, as AddedDefault checks a default).
+// They are reference only -- the rows are read whatever they hold -- and the destinations do not
+// depend on them: a boundary the reader cannot give is the reason returned, the boundaries are not
+// given, and the destinations and NEXT USED still are (owner, review of #551).
+std::string ReadBoundaries(const PartitionCatalog &pc, const BoundaryCheck &check, const CatalogPartitioning &p,
+						   std::vector<PartitionBoundary> &boundaries) {
 	auto values = pc.boundaries.find(p.function_id);
 	const size_t count = values == pc.boundaries.end() ? 0 : values->second.size();
 	if (pc.boundaries_off_row.count(p.function_id)) {
-		boundary_reason = "function " + p.function_name + " has a boundary stored off-row";
-	} else if (count != static_cast<size_t>(p.fanout - 1)) {
-		boundary_reason = "function " + p.function_name + " has " + std::to_string(count) + " boundaries, its fanout " +
-						  std::to_string(p.fanout) + " says " + std::to_string(p.fanout - 1);
+		return "function " + p.function_name + " has a boundary stored off-row";
 	}
-	for (int32_t b = 1; boundary_reason.empty() && b < p.fanout; b++) {
+	if (count != static_cast<size_t>(p.fanout - 1)) {
+		return "function " + p.function_name + " has " + std::to_string(count) + " boundaries, its fanout " +
+			   std::to_string(p.fanout) + " says " + std::to_string(p.fanout - 1);
+	}
+	for (int32_t b = 1; b < p.fanout; b++) {
 		auto v = values->second.find(b);
 		const std::string what = "boundary " + std::to_string(b) + " of " + p.function_name;
 		if (v == values->second.end() || pc.boundaries_twice.count(std::make_pair(p.function_id, b))) {
-			boundary_reason = "function " + p.function_name + "'s boundary " + std::to_string(b) +
-							  (v == values->second.end() ? " is missing" : " is listed twice");
-			break;
+			return "function " + p.function_name + "'s boundary " + std::to_string(b) +
+				   (v == values->second.end() ? " is missing" : " is listed twice");
 		}
 		if (!v->second.is_null) {
-			boundary_reason = BoundaryRefusal(p, v->second, what, check);
-			if (!boundary_reason.empty()) {
-				break;
+			const std::string refusal = BoundaryRefusal(p, v->second, what, check);
+			if (!refusal.empty()) {
+				return refusal;
 			}
 		}
 		boundaries.push_back(v->second);
 	}
-	// The destinations: 1..fanout each a filegroup, and NEXT USED at fanout + 1 when there is one.
+	return std::string();
+}
+
+// The destinations: 1..fanout each a filegroup, and NEXT USED (into `p`) at fanout + 1 when there is
+// one; why not, or "".
+std::string ReadDestinations(const PartitionCatalog &pc, int32_t data_space, CatalogPartitioning &p,
+							 std::vector<std::string> &destinations) {
 	auto dests = pc.destinations.find(data_space);
 	if (dests == pc.destinations.end()) {
-		return fail("scheme " + p.scheme_name + " has no destination 1");
+		return "scheme " + p.scheme_name + " has no destination 1";
 	}
 	auto filegroup = [&](int32_t fg) {
 		auto it = pc.filegroups.find(fg);
 		return it == pc.filegroups.end() ? "filegroup " + std::to_string(fg) : it->second;
 	};
-	std::vector<std::string> destinations;
 	for (int32_t d = 1; d <= p.fanout + 1; d++) {
 		auto it = dests->second.find(d);
 		if (it == dests->second.end()) {
 			if (d <= p.fanout) {
-				return fail("scheme " + p.scheme_name + " has no destination " + std::to_string(d));
+				return "scheme " + p.scheme_name + " has no destination " + std::to_string(d);
 			}
 			break;
 		}
 		if (pc.destinations_twice.count(std::make_pair(data_space, d)) || pc.data_spaces_twice.count(it->second)) {
-			return fail("scheme " + p.scheme_name + "'s destination " + std::to_string(d) + " is listed twice");
+			return "scheme " + p.scheme_name + "'s destination " + std::to_string(d) + " is listed twice";
 		}
 		if (d <= p.fanout) {
 			destinations.push_back(filegroup(it->second));
@@ -779,14 +794,55 @@ void DescribePartitioning(const PartitionCatalog &pc, const std::unordered_map<i
 			p.next_used = filegroup(it->second);
 		}
 	}
-	// Its partitions: 1..fanout, each once (t.partitions is sorted by number).
+	return std::string();
+}
+
+// Its partitions: 1..fanout, each once (t.partitions is sorted by number); why not, or "".
+std::string PartitionsNumbered(const CatalogTable &t, const CatalogPartitioning &p) {
 	bool numbered = t.partitions.size() == static_cast<size_t>(p.fanout);
 	for (size_t i = 0; numbered && i < t.partitions.size(); i++) {
 		numbered = t.partitions[i].partition_number == static_cast<int32_t>(i + 1);
 	}
-	if (!numbered) {
-		return fail(std::to_string(t.partitions.size()) + " partitions where function " + p.function_name + " has " +
-					std::to_string(p.fanout) + " (1.." + std::to_string(p.fanout) + ", each once)");
+	if (numbered) {
+		return std::string();
+	}
+	return std::to_string(t.partitions.size()) + " partitions where function " + p.function_name + " has " +
+		   std::to_string(p.fanout) + " (1.." + std::to_string(p.fanout) + ", each once)";
+}
+
+}  // namespace
+
+void DescribePartitioning(const PartitionCatalog &pc, const std::unordered_map<int32_t, std::string> &type_names,
+						  int32_t base_index, const BoundaryCheck &check, CatalogTable &t) {
+	CatalogPartitioning &p = t.partitioning;
+	const auto space_key = std::make_pair(t.object_id, base_index);
+	int32_t data_space = 0;
+	std::string why;
+	if (!OnScheme(pc, space_key, data_space, why)) {
+		if (!why.empty()) {
+			FailPartitioning(t, why);
+		}
+		return;
+	}
+	t.partitioned = true;
+	p.scheme_id = data_space;
+	p.scheme_name = pc.schemes.find(data_space)->second;
+	why = DescribeFunction(pc, type_names, data_space, p);
+	if (why.empty()) {
+		why = PartitioningColumn(pc, space_key, base_index, t, p);
+	}
+	if (!why.empty()) {
+		return FailPartitioning(t, why);
+	}
+	std::vector<PartitionBoundary> boundaries;
+	const std::string boundary_reason = ReadBoundaries(pc, check, p, boundaries);
+	std::vector<std::string> destinations;
+	why = ReadDestinations(pc, data_space, p, destinations);
+	if (why.empty()) {
+		why = PartitionsNumbered(t, p);
+	}
+	if (!why.empty()) {
+		return FailPartitioning(t, why);
 	}
 	p.destinations = std::move(destinations);
 	if (!boundary_reason.empty()) {

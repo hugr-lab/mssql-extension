@@ -191,6 +191,14 @@ private:
 		bool code_page_kernel = false;	// decoded from its code page (varchar, text): streamed when long
 	};
 
+	//! The constructor's steps: a projected column resolved to its staging (its arm chosen by ArmOf and
+	//! checked by CheckArm), the arena configured, the staging's bound measured.
+	static Column ResolveColumn(const std::string &table, const CatalogColumn &c, LogicalType &type);
+	static StageArm ArmOf(const CatalogColumn &c, const codec::staging::ColumnOps &ops);
+	static void CheckArm(const Column &col, const CatalogColumn &c);
+	void ConfigureArena();
+	void MeasureStaging();
+
 	void AppendValue(Column &c, codec::staging::ColumnStaging &st, const ValueRef &v);
 	struct PreparedValue {
 		bool off_row = false;
