@@ -42,108 +42,82 @@ const char *const RECORDS = "mssql_backup_transaction_records";
 
 //! fn_dblog's names of the operations and contexts the reader has met (checked against fn_dump_dblog on
 //! the committed samples and the load / fuzzy fixtures); another is spelled by its code.
+namespace {
+
+struct CodeName {
+	uint8_t code;
+	const char *name;
+};
+
+const CodeName OPERATION_NAMES[] = {
+	{0x01, "LOP_FORMAT_PAGE"},
+	{0x02, "LOP_INSERT_ROWS"},
+	{0x03, "LOP_DELETE_ROWS"},
+	{0x04, "LOP_MODIFY_ROW"},
+	{0x05, "LOP_MODIFY_HEADER"},
+	{0x06, "LOP_MODIFY_COLUMNS"},
+	{0x07, "LOP_SET_BITS"},
+	{0x0a, "LOP_SET_FREE_SPACE"},
+	{0x0b, "LOP_DELETE_SPLIT"},
+	{0x0d, "LOP_EXPUNGE_ROWS"},
+	{0x10, "LOP_FILE_HDR_MODIFY"},
+	{0x11, "LOP_CLEAR_GAM_BITS"},  // met on 2017 (fn_dump_dblog of log.trn)
+	{0x12, "LOP_COUNT_DELTA"},
+	{0x13, "LOP_ROOT_CHANGE"},
+	{0x16, "LOP_INSYSXACT"},
+	{0x80, "LOP_BEGIN_XACT"},
+	{0x81, "LOP_COMMIT_XACT"},
+	{0x82, "LOP_ABORT_XACT"},
+	{0x83, "LOP_PREP_XACT"},
+	{0x8c, "LOP_HOBT_DELTA"},
+	{0x8d, "LOP_LOCK_XACT"},
+	{0x8f, "LOP_MIGRATE_LOCKS"},
+	{0x96, "LOP_BEGIN_CKPT"},
+	{0x98, "LOP_XACT_CKPT"},
+	{0x99, "LOP_END_CKPT"},
+	{0x9a, "LOP_BUF_WRITE"},  // met on 2019 / 2022 (fn_dump_dblog of the load fixture's log)
+	{0xb0, "LOP_CREATE_ALLOCCHAIN"},
+};
+
+const CodeName CONTEXT_NAMES[] = {
+	{0x00, "LCX_NULL"},
+	{0x01, "LCX_HEAP"},
+	{0x02, "LCX_CLUSTERED"},
+	{0x03, "LCX_INDEX_LEAF"},
+	{0x04, "LCX_INDEX_INTERIOR"},
+	{0x05, "LCX_TEXT_MIX"},
+	{0x06, "LCX_TEXT_TREE"},
+	{0x08, "LCX_GAM"},
+	{0x0a, "LCX_IAM"},
+	{0x0b, "LCX_PFS"},
+	{0x11, "LCX_FILE_HEADER"},
+	{0x12, "LCX_SCHEMA_VERSION"},
+	{0x13, "LCX_MARK_AS_GHOST"},
+	{0x17, "LCX_BOOT_PAGE_CKPT"},
+	{0x18, "LCX_DIFF_MAP"},
+};
+
+//! `code`'s name among `names`, or `prefix` and the code in hex (LOP_0x9B) for one not met.
+template <size_t N>
+std::string NameOfCode(const CodeName (&names)[N], uint8_t code, const char *prefix) {
+	for (const CodeName &n : names) {
+		if (n.code == code) {
+			return n.name;
+		}
+	}
+	char buf[16];
+	snprintf(buf, sizeof(buf), "%s0x%02X", prefix, code);
+	return buf;
+}
+
+}  // namespace
+
 std::string OperationName(uint8_t op) {
-	switch (op) {
-	case 0x01:
-		return "LOP_FORMAT_PAGE";
-	case 0x02:
-		return "LOP_INSERT_ROWS";
-	case 0x03:
-		return "LOP_DELETE_ROWS";
-	case 0x04:
-		return "LOP_MODIFY_ROW";
-	case 0x05:
-		return "LOP_MODIFY_HEADER";
-	case 0x06:
-		return "LOP_MODIFY_COLUMNS";
-	case 0x07:
-		return "LOP_SET_BITS";
-	case 0x0a:
-		return "LOP_SET_FREE_SPACE";
-	case 0x0b:
-		return "LOP_DELETE_SPLIT";
-	case 0x0d:
-		return "LOP_EXPUNGE_ROWS";
-	case 0x10:
-		return "LOP_FILE_HDR_MODIFY";
-	case 0x11:
-		return "LOP_CLEAR_GAM_BITS";  // met on 2017 (fn_dump_dblog of log.trn)
-	case 0x12:
-		return "LOP_COUNT_DELTA";
-	case 0x13:
-		return "LOP_ROOT_CHANGE";
-	case 0x16:
-		return "LOP_INSYSXACT";
-	case 0x80:
-		return "LOP_BEGIN_XACT";
-	case 0x81:
-		return "LOP_COMMIT_XACT";
-	case 0x82:
-		return "LOP_ABORT_XACT";
-	case 0x83:
-		return "LOP_PREP_XACT";
-	case 0x8c:
-		return "LOP_HOBT_DELTA";
-	case 0x8d:
-		return "LOP_LOCK_XACT";
-	case 0x8f:
-		return "LOP_MIGRATE_LOCKS";
-	case 0x96:
-		return "LOP_BEGIN_CKPT";
-	case 0x98:
-		return "LOP_XACT_CKPT";
-	case 0x99:
-		return "LOP_END_CKPT";
-	case 0x9a:
-		return "LOP_BUF_WRITE";	 // met on 2019 / 2022 (fn_dump_dblog of the load fixture's log)
-	case 0xb0:
-		return "LOP_CREATE_ALLOCCHAIN";
-	default: {
-		char buf[16];
-		snprintf(buf, sizeof(buf), "LOP_0x%02X", op);
-		return buf;
-	}
-	}
+	return NameOfCode(OPERATION_NAMES, op, "LOP_");
 }
 
 std::string ContextName(uint8_t context) {
-	switch (context) {
-	case 0x00:
-		return "LCX_NULL";
-	case 0x01:
-		return "LCX_HEAP";
-	case 0x02:
-		return "LCX_CLUSTERED";
-	case 0x03:
-		return "LCX_INDEX_LEAF";
-	case 0x04:
-		return "LCX_INDEX_INTERIOR";
-	case 0x05:
-		return "LCX_TEXT_MIX";
-	case 0x06:
-		return "LCX_TEXT_TREE";
-	case 0x08:
-		return "LCX_GAM";
-	case 0x0a:
-		return "LCX_IAM";
-	case 0x0b:
-		return "LCX_PFS";
-	case 0x11:
-		return "LCX_FILE_HEADER";
-	case 0x12:
-		return "LCX_SCHEMA_VERSION";
-	case 0x13:
-		return "LCX_MARK_AS_GHOST";
-	case 0x17:
-		return "LCX_BOOT_PAGE_CKPT";
-	case 0x18:
-		return "LCX_DIFF_MAP";
-	default: {
-		char buf[16];
-		snprintf(buf, sizeof(buf), "LCX_0x%02X", context);
-		return buf;
-	}
-	}
+	return NameOfCode(CONTEXT_NAMES, context, "LCX_");
 }
 
 Value OptionalLsn(const Lsn &lsn) {

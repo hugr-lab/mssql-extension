@@ -2,6 +2,8 @@
 
 #include "backup/backup_bytes.hpp"
 
+#include <initializer_list>
+
 namespace duckdb {
 namespace mssql {
 namespace backup {
@@ -10,40 +12,31 @@ namespace {
 
 enum class Props { None, Scale, PrecisionScale, MaxLength, MaxLengthCollation, Unknown };
 
-Props PropsOf(uint8_t xtype) {
-	switch (xtype) {
-	case 36:   // uniqueidentifier
-	case 40:   // date
-	case 48:   // tinyint
-	case 52:   // smallint
-	case 56:   // int
-	case 58:   // smalldatetime
-	case 59:   // real
-	case 60:   // money
-	case 61:   // datetime
-	case 62:   // float
-	case 104:  // bit
-	case 122:  // smallmoney
-	case 127:  // bigint
-		return Props::None;
-	case 41:  // time
-	case 42:  // datetime2
-	case 43:  // datetimeoffset
-		return Props::Scale;
-	case 106:  // decimal
-	case 108:  // numeric
-		return Props::PrecisionScale;
-	case 165:  // varbinary
-	case 173:  // binary
-		return Props::MaxLength;
-	case 167:  // varchar
-	case 175:  // char
-	case 231:  // nvarchar
-	case 239:  // nchar
-		return Props::MaxLengthCollation;
-	default:
-		return Props::Unknown;
+//! The properties each base type's value is preceded by, by xtype; any other is Unknown.
+struct PropsTable {
+	Props of[256];
+	void Set(std::initializer_list<uint8_t> xtypes, Props props) {
+		for (const uint8_t xtype : xtypes) {
+			of[xtype] = props;
+		}
 	}
+	PropsTable() {
+		for (auto &p : of) {
+			p = Props::Unknown;
+		}
+		// uniqueidentifier, date, tinyint, smallint, int, smalldatetime, real, money, datetime, float, bit,
+		// smallmoney, bigint
+		Set({36, 40, 48, 52, 56, 58, 59, 60, 61, 62, 104, 122, 127}, Props::None);
+		Set({41, 42, 43}, Props::Scale);					   // time, datetime2, datetimeoffset
+		Set({106, 108}, Props::PrecisionScale);				   // decimal, numeric
+		Set({165, 173}, Props::MaxLength);					   // varbinary, binary
+		Set({167, 175, 231, 239}, Props::MaxLengthCollation);  // varchar, char, nvarchar, nchar
+	}
+};
+
+Props PropsOf(uint8_t xtype) {
+	static const PropsTable table;
+	return table.of[xtype];
 }
 
 }  // namespace

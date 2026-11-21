@@ -289,33 +289,9 @@ bool KnownVariableXtype(uint8_t xtype) {
 }
 
 bool KnownFixedXtype(uint8_t xtype) {
-	switch (xtype) {
-	case XTYPE_TINYINT:
-	case XTYPE_BIT:
-	case XTYPE_SMALLINT:
-	case XTYPE_DATE:
-	case XTYPE_INT:
-	case XTYPE_SMALLDATETIME:
-	case XTYPE_REAL:
-	case XTYPE_SMALLMONEY:
-	case XTYPE_BIGINT:
-	case XTYPE_DATETIME:
-	case XTYPE_FLOAT:
-	case XTYPE_MONEY:
-	case XTYPE_TIMESTAMP:
-	case XTYPE_UNIQUEIDENTIFIER:
-	case XTYPE_TIME:
-	case XTYPE_DATETIME2:
-	case XTYPE_DATETIMEOFFSET:
-	case XTYPE_DECIMAL:
-	case XTYPE_NUMERIC:
-	case XTYPE_BINARY:
-	case XTYPE_CHAR:
-	case XTYPE_NCHAR:
-		return true;
-	default:
-		return false;
-	}
+	// The types FixedLength has a width for: every rule but a variable type's and a type not known.
+	const WidthRule rule = FixedWidthOf(xtype).rule;
+	return rule != WidthRule::Unknown && rule != WidthRule::Variable;
 }
 
 void SetTypeInfo(PhysicalColumn &column, uint32_t ti) {
