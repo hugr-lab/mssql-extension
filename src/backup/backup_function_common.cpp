@@ -206,16 +206,17 @@ void Require(const SqlVariant &v, size_t size, const std::string &what) {
 	}
 }
 
+const uint8_t *VariantBytes(const SqlVariant &v) {
+	return reinterpret_cast<const uint8_t *>(v.value.data());
+}
+
 //! A sql_variant's value by type family (D6), one reader per family: `SqlVariantValue` was a single
 //! switch of 178 lines over 24 xtypes. Every refusal below is the one that switch raised, word for
 //! word -- the messages name the column and the tests quote them -- and each reader takes the same
-//! arguments so the table beneath can hold them all.
-[[noreturn]] void ThrowUnreadableVariant(uint8_t xtype, const std::string &what) {
-	throw FormatError("backup: " + what + " is a sql_variant of xtype " + std::to_string(xtype) +
-					  ", which the reader does not read");
-}
-
-Value VariantInteger(const SqlVariant &v, const uint8_t *b, const ByteReader &r, const std::string &what) {
+//! arguments so the table beneath can hold them all. A reader is reached only through that table, so
+//! one that reads two types tells them apart with a single test and has no refusal of its own.
+Value VariantInteger(const SqlVariant &v, const std::string &what) {
+	const ByteReader r(VariantBytes(v), v.value.size(), what.c_str());
 	switch (v.xtype) {
 	case 48:  // tinyint
 		Require(v, 1, what);
@@ -229,44 +230,39 @@ Value VariantInteger(const SqlVariant &v, const uint8_t *b, const ByteReader &r,
 	case 127:  // bigint
 		Require(v, 8, what);
 		return Value::BIGINT(r.I64(0));
-	case 104:  // bit
+	default:  // bit (104)
 		Require(v, 1, what);
 		return Value::BOOLEAN(r.U8(0) != 0);
-	default:
-		ThrowUnreadableVariant(v.xtype, what);
 	}
 }
 
-Value VariantApproximate(const SqlVariant &v, const uint8_t *b, const ByteReader &r, const std::string &what) {
+Value VariantApproximate(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
 	if (v.xtype == 59) {  // real
 		Require(v, 4, what);
 		float f;
 		std::memcpy(&f, b, 4);
 		return Value::FLOAT(f);
 	}
-	if (v.xtype == 62) {  // float
-		Require(v, 8, what);
-		double d;
-		std::memcpy(&d, b, 8);
-		return Value::DOUBLE(d);
-	}
-	ThrowUnreadableVariant(v.xtype, what);
+	Require(v, 8, what);  // float (62)
+	double d;
+	std::memcpy(&d, b, 8);
+	return Value::DOUBLE(d);
 }
 
-Value VariantMoney(const SqlVariant &v, const uint8_t *b, const ByteReader &r, const std::string &what) {
+Value VariantMoney(const SqlVariant &v, const std::string &what) {
+	const ByteReader r(VariantBytes(v), v.value.size(), what.c_str());
 	if (v.xtype == 60) {  // money: i64 of 1/10,000
 		Require(v, 8, what);
 		return Value::DECIMAL(r.I64(0), 19, 4);
 	}
-	if (v.xtype == 122) {  // smallmoney: i32 of 1/10,000
-		Require(v, 4, what);
-		return Value::DECIMAL(static_cast<int64_t>(r.I32(0)), 10, 4);
-	}
-	ThrowUnreadableVariant(v.xtype, what);
+	Require(v, 4, what);  // smallmoney (122): i32 of 1/10,000
+	return Value::DECIMAL(static_cast<int64_t>(r.I32(0)), 10, 4);
 }
 
 //! decimal / numeric: a sign byte (1 positive), then the magnitude, little-endian.
-Value VariantDecimal(const SqlVariant &v, const uint8_t *b, const ByteReader &r, const std::string &what) {
+Value VariantDecimal(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
 	if (v.value.size() < 2 || v.value.size() > 17 || v.precision < 1 || v.precision > 38 || v.scale > v.precision) {
 		throw FormatError("backup: " + what + " is a decimal of " + std::to_string(v.value.size()) +
 						  " bytes, precision " + std::to_string(v.precision) + ", scale " + std::to_string(v.scale));
@@ -292,13 +288,15 @@ Value VariantDecimal(const SqlVariant &v, const uint8_t *b, const ByteReader &r,
 }
 
 //! date: 3 bytes of days since 0001-01-01.
-Value VariantDate(const SqlVariant &v, const uint8_t *b, const ByteReader &r, const std::string &what) {
+Value VariantDate(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
 	Require(v, 3, what);
 	return Value::DATE(date_t(static_cast<int32_t>(Days(b, what))));
 }
 
 //! time: units of 10^-scale s since midnight.
-Value VariantTime(const SqlVariant &v, const uint8_t *b, const ByteReader &r, const std::string &what) {
+Value VariantTime(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
 	if (v.scale > 7) {
 		throw FormatError("backup: " + what + " is a time of scale " + std::to_string(v.scale));
 	}
@@ -313,7 +311,8 @@ Value VariantTime(const SqlVariant &v, const uint8_t *b, const ByteReader &r, co
 
 //! datetime2: the time, then 3 bytes of days since 0001-01-01. datetimeoffset: the UTC time and
 //! date, then i16 minutes of offset.
-Value VariantDatetime2(const SqlVariant &v, const uint8_t *b, const ByteReader &r, const std::string &what) {
+Value VariantDatetime2(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
 	if (v.scale > 7) {
 		throw FormatError("backup: " + what + " is of scale " + std::to_string(v.scale));
 	}
@@ -356,28 +355,26 @@ Value VariantDatetime2(const SqlVariant &v, const uint8_t *b, const ByteReader &
 }
 
 //! datetime and smalldatetime, both in record form.
-Value VariantRecordDatetime(const SqlVariant &v, const uint8_t *b, const ByteReader &r, const std::string &what) {
-	if (v.xtype == 61) {
+Value VariantRecordDatetime(const SqlVariant &v, const std::string &what) {
+	if (v.xtype == 61) {  // datetime
 		Require(v, 8, what);
 		return RecordDatetimeValue(v.value);
 	}
-	if (v.xtype == 58) {
-		Require(v, 4, what);
-		return RecordSmallDatetimeValue(v.value);
-	}
-	ThrowUnreadableVariant(v.xtype, what);
+	Require(v, 4, what);  // smalldatetime (58)
+	return RecordSmallDatetimeValue(v.value);
 }
 
-Value VariantGuid(const SqlVariant &v, const uint8_t *b, const ByteReader &r, const std::string &what) {
+Value VariantGuid(const SqlVariant &v, const std::string &what) {
 	return GuidValue(v.value, what);
 }
 
-Value VariantBinary(const SqlVariant &v, const uint8_t *b, const ByteReader &r, const std::string &what) {
+Value VariantBinary(const SqlVariant &v, const std::string &) {
 	return Value::BLOB(reinterpret_cast<const_data_ptr_t>(v.value.data()), v.value.size());
 }
 
 //! nvarchar / nchar: UTF-16LE, every surrogate paired.
-Value VariantUtf16(const SqlVariant &v, const uint8_t *b, const ByteReader &r, const std::string &what) {
+Value VariantUtf16(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
 	if (v.value.size() % 2) {
 		throw FormatError("backup: " + what + " holds an odd number of bytes of UTF-16");
 	}
@@ -396,7 +393,8 @@ Value VariantUtf16(const SqlVariant &v, const uint8_t *b, const ByteReader &r, c
 }
 
 //! varchar / char: the bytes of its collation's code page.
-Value VariantCodePage(const SqlVariant &v, const uint8_t *b, const ByteReader &r, const std::string &what) {
+Value VariantCodePage(const SqlVariant &v, const std::string &what) {
+	const uint8_t *b = VariantBytes(v);
 	const CollationRow *collation = CollationById(static_cast<int32_t>(v.collation));
 	if (!collation) {
 		throw FormatError("backup: " + what + " is a varchar of collation " + std::to_string(v.collation) +
@@ -420,10 +418,12 @@ Value VariantCodePage(const SqlVariant &v, const uint8_t *b, const ByteReader &r
 	return Value(out);
 }
 
+using VariantReader = Value (*)(const SqlVariant &, const std::string &);
+
 //! xtype -> reader, in the order the one switch had them, so a diff against it reads straight down.
 struct VariantCase {
 	uint8_t xtype;
-	Value (*read)(const SqlVariant &, const uint8_t *, const ByteReader &, const std::string &);
+	VariantReader read;
 };
 
 const VariantCase VARIANT_CASES[] = {
@@ -435,17 +435,27 @@ const VariantCase VARIANT_CASES[] = {
 	{231, VariantUtf16},		 {239, VariantUtf16},	   {167, VariantCodePage},	 {175, VariantCodePage},
 };
 
+//! The cases by xtype, so a value's reader is one lookup; null for a type the reader does not read.
+struct VariantReaders {
+	VariantReader of[256];
+	VariantReaders() : of() {
+		for (const VariantCase &c : VARIANT_CASES) {
+			of[c.xtype] = c.read;
+		}
+	}
+};
+
+const VariantReaders VARIANT_READERS;
+
 }  // namespace
 
 Value SqlVariantValue(const SqlVariant &v, const std::string &what) {
-	const uint8_t *b = reinterpret_cast<const uint8_t *>(v.value.data());
-	const ByteReader r(b, v.value.size(), what.c_str());
-	for (const VariantCase &c : VARIANT_CASES) {
-		if (c.xtype == v.xtype) {
-			return c.read(v, b, r, what);
-		}
+	const VariantReader read = VARIANT_READERS.of[v.xtype];
+	if (!read) {
+		throw FormatError("backup: " + what + " is a sql_variant of xtype " + std::to_string(v.xtype) +
+						  ", which the reader does not read");
 	}
-	ThrowUnreadableVariant(v.xtype, what);
+	return read(v, what);
 }
 
 namespace {

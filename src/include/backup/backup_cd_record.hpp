@@ -173,8 +173,8 @@ private:
 	};
 
 	void StageValue(const Staging &s, const std::vector<bool> *needed);
-	bool StageNumeric(const Staging &s);
-	bool StageTemporal(const Staging &s);
+	void StageNumeric(const Staging &s);
+	void StageTemporal(const Staging &s);
 	void StageBytes(const Staging &s);
 
 	void Store(const Staging &s, size_t bytes);

@@ -526,6 +526,33 @@ void ReadPageCompression(const uint8_t *page, size_t page_size, size_t slot_arra
 	}
 }
 
+namespace {
+
+//! Which of CdRow's staging functions puts a type in its uncompressed form. One lookup per value:
+//! the types named here are the numeric and temporal ones, every other xtype is staged as bytes.
+enum class CdFamily : uint8_t { Bytes, Numeric, Temporal };
+
+struct CdFamilies {
+	CdFamily of[256];
+	CdFamilies() {
+		for (auto &family : of) {
+			family = CdFamily::Bytes;
+		}
+		for (const uint8_t xtype : {XTYPE_TINYINT, XTYPE_SMALLINT, XTYPE_INT, XTYPE_SMALLMONEY, XTYPE_BIGINT,
+									XTYPE_MONEY, XTYPE_BIT, XTYPE_DECIMAL, XTYPE_NUMERIC, XTYPE_REAL, XTYPE_FLOAT}) {
+			of[xtype] = CdFamily::Numeric;
+		}
+		for (const uint8_t xtype : {XTYPE_DATETIME, XTYPE_SMALLDATETIME, XTYPE_DATE, XTYPE_TIME, XTYPE_DATETIME2,
+									XTYPE_DATETIMEOFFSET, XTYPE_UNIQUEIDENTIFIER}) {
+			of[xtype] = CdFamily::Temporal;
+		}
+	}
+};
+
+const CdFamilies CD_FAMILIES;
+
+}  // namespace
+
 void CdRow::Store(const Staging &s, size_t bytes) {
 	at_[s.k] = s.start;
 	values_[s.k].size = static_cast<uint32_t>(bytes);
@@ -562,8 +589,9 @@ void CdRow::StorePadded(const Staging &s, uint8_t pad, size_t width) {
 	Store(s, width);
 }
 
-//! The integer, bit, vardecimal and IEEE families, each put in the uncompressed record's form.
-bool CdRow::StageNumeric(const Staging &s) {
+//! The integer, bit, vardecimal and IEEE families, each put in the uncompressed record's form. Its
+//! cases are CD_FAMILIES' Numeric types, one for one.
+void CdRow::StageNumeric(const Staging &s) {
 	switch (s.c.xtype) {
 	case XTYPE_TINYINT:
 		if (s.size > 1) {
@@ -571,18 +599,18 @@ bool CdRow::StageNumeric(const Staging &s) {
 		}
 		buffer_.push_back(s.size ? s.p[0] : 0);	 // as it is, unflipped (E22)
 		Store(s, 1);
-		return true;
+		return;
 	case XTYPE_SMALLINT:
 		StoreInteger(s, 2);
-		return true;
+		return;
 	case XTYPE_INT:
 	case XTYPE_SMALLMONEY:
 		StoreInteger(s, 4);
-		return true;
+		return;
 	case XTYPE_BIGINT:
 	case XTYPE_MONEY:
 		StoreInteger(s, 8);
-		return true;
+		return;
 	case XTYPE_BIT:
 		if (s.cd.code != CD_EMPTY && s.cd.code != CD_BIT_ONE) {
 			throw FormatError("backup: " + s.What() + ", a bit, holds CD code " + std::to_string(s.cd.code));
@@ -592,12 +620,12 @@ bool CdRow::StageNumeric(const Staging &s) {
 		}
 		buffer_.push_back(s.cd.code == CD_BIT_ONE ? static_cast<uint8_t>(1u << s.c.bit_position) : 0);
 		Store(s, 1);
-		return true;
+		return;
 	case XTYPE_DECIMAL:
 	case XTYPE_NUMERIC:
 		DecodeVardecimal(s.p, s.size, s.c.precision, s.c.scale, buffer_, s.layout.table, s.c.name);
 		Store(s, buffer_.size() - s.start);
-		return true;
+		return;
 	case XTYPE_REAL:
 	case XTYPE_FLOAT: {
 		// The IEEE value's little-endian bytes without their low-order zero bytes (E22).
@@ -609,15 +637,13 @@ bool CdRow::StageNumeric(const Staging &s) {
 		buffer_.insert(buffer_.end(), width - s.size, 0);
 		buffer_.insert(buffer_.end(), s.p, s.p + s.size);
 		Store(s, width);
-		return true;
+		return;
 	}
-	default:
-		return false;  // another family's
 	}
 }
 
-//! datetime, smalldatetime, and the fixed-width date / time / guid types.
-bool CdRow::StageTemporal(const Staging &s) {
+//! datetime, smalldatetime, and the fixed-width date / time / guid types: CD_FAMILIES' Temporal ones.
+void CdRow::StageTemporal(const Staging &s) {
 	switch (s.c.xtype) {
 	case XTYPE_DATETIME: {
 		if (s.size > 8) {
@@ -627,7 +653,7 @@ bool CdRow::StageTemporal(const Staging &s) {
 		PutLE(buffer_, whole & 0xFFFFFFFFu, 4);	 // the uncompressed form: ticks, then days
 		PutLE(buffer_, whole >> 32, 4);
 		Store(s, 8);
-		return true;
+		return;
 	}
 	case XTYPE_SMALLDATETIME:
 		if (s.size == 2) {
@@ -641,7 +667,7 @@ bool CdRow::StageTemporal(const Staging &s) {
 			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) +
 							  " bytes for a smalldatetime");
 		}
-		return true;
+		return;
 	case XTYPE_DATE:
 	case XTYPE_TIME:
 	case XTYPE_DATETIME2:
@@ -656,10 +682,8 @@ bool CdRow::StageTemporal(const Staging &s) {
 			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes, its type " +
 							  std::to_string(width));
 		}
-		return true;
+		return;
 	}
-	default:
-		return false;  // another family's
 	}
 }
 
@@ -731,13 +755,17 @@ void CdRow::StageValue(const Staging &s, const std::vector<bool> *needed) {
 		}
 		return;
 	}
-	if (StageNumeric(s)) {
+	switch (CD_FAMILIES.of[s.c.xtype]) {
+	case CdFamily::Numeric:
+		StageNumeric(s);
+		return;
+	case CdFamily::Temporal:
+		StageTemporal(s);
+		return;
+	case CdFamily::Bytes:
+		StageBytes(s);
 		return;
 	}
-	if (StageTemporal(s)) {
-		return;
-	}
-	StageBytes(s);
 }
 
 //! A value's bytes under PAGE compression (E23): a symbol is its dictionary entry; an anchored
