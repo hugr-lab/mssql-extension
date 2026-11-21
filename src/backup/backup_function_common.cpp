@@ -460,6 +460,76 @@ Value SqlVariantValue(const SqlVariant &v, const std::string &what) {
 
 namespace {
 
+// Why column `c` (called `type` in a reason) is read as its stored bytes for what its type is, or "":
+// a type converted later with the TDS path's, one the reader does not know, or an xtype that is no
+// storage type.
+std::string RawByType(const CatalogColumn &c, const std::string &type) {
+	switch (c.system_type_id) {
+	case XTYPE_SQL_VARIANT:
+		return "sql_variant (its base type, properties and value) is converted later, with the TDS path's";
+	case XTYPE_XML:
+		return "xml (stored as binary XML) is converted to text later, with the TDS path's";
+	case XTYPE_CLR:
+		return type + " (its CLR serialization) is converted later, with the TDS path's";
+	default:
+		break;
+	}
+	if (c.system_type_name.empty()) {
+		return type + " is a type the reader does not know";
+	}
+	if (c.system_type_name == "json" || c.system_type_name == "vector") {
+		return type + " is converted later, with the TDS path's";
+	}
+	// Only a storage type the record decoder knows is converted: the kernels are keyed by the TDS id the
+	// xtype is passed as, and an xtype that is no storage type (a TDS-only id -- INTN, BITN, the legacy
+	// forms -- in a crafted catalog) would be decoded as a form its bytes are not. Any other is its bytes
+	// (review of #552).
+	if (!KnownFixedXtype(c.system_type_id) && !KnownVariableXtype(c.system_type_id)) {
+		return "xtype " + std::to_string(c.system_type_id) + " is not a storage type the reader decodes";
+	}
+	return std::string();
+}
+
+// A code-page text is converted through its collation's page: one the reader has no table for, or no
+// collation at all, is its bytes -- never bytes of another page in a VARCHAR, which is UTF-8 (#224;
+// review of #552). Why, or "".
+std::string RawByCodePage(const CatalogColumn &c) {
+	const bool code_page_text =
+		c.system_type_id == XTYPE_VARCHAR || c.system_type_id == XTYPE_CHAR || c.system_type_id == XTYPE_TEXT;
+	if (!code_page_text) {
+		return std::string();
+	}
+	const CollationRow *collation = c.collation_id ? CollationById(static_cast<int32_t>(c.collation_id)) : nullptr;
+	if (!collation) {
+		return c.collation_id ? "its collation (CollationId " + std::to_string(c.collation_id) +
+									") is newer than the code-page tables"
+							  : std::string("it has no collation");
+	}
+	if (collation->code_page != 65001 && !codec::code_page::FindCodePage(static_cast<int32_t>(collation->code_page))) {
+		return "its code page " + std::to_string(collation->code_page) + " has no table";
+	}
+	return std::string();
+}
+
+// The precision and scale are the file's: LogicalType::DECIMAL asserts what they must be (an
+// assertion, not an exception), so a declaration no server writes is caught here. By the name too,
+// which the type map dispatches on and the file's own sysscalartypes supplies (review of #549). Why
+// the column is its bytes, or "".
+std::string RawByDeclaration(const CatalogColumn &c, const std::string &type) {
+	std::string name = c.system_type_name;
+	std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
+	const bool decimal = c.system_type_id == XTYPE_DECIMAL || c.system_type_id == XTYPE_NUMERIC || name == "decimal" ||
+						 name == "numeric";
+	const bool scaled = c.system_type_id == XTYPE_TIME || c.system_type_id == XTYPE_DATETIME2 ||
+						c.system_type_id == XTYPE_DATETIMEOFFSET || name == "time" || name == "datetime2" ||
+						name == "datetimeoffset";
+	if ((decimal && (c.precision < 1 || c.precision > 38 || c.scale > c.precision)) || (scaled && c.scale > 7)) {
+		return type + " is declared with precision " + std::to_string(c.precision) + " and scale " +
+			   std::to_string(c.scale) + ", which no SQL Server type has";
+	}
+	return std::string();
+}
+
 // The type column `c` is read as, its readability aside: converted, or its stored bytes (`raw`).
 ColumnReading TypeReading(const CatalogColumn &c) {
 	ColumnReading r;
@@ -472,59 +542,15 @@ ColumnReading TypeReading(const CatalogColumn &c) {
 		r.note = "its stored bytes, not converted: " + why;
 		return r;
 	};
-	switch (c.system_type_id) {
-	case XTYPE_SQL_VARIANT:
-		return raw("sql_variant (its base type, properties and value) is converted later, with the TDS path's");
-	case XTYPE_XML:
-		return raw("xml (stored as binary XML) is converted to text later, with the TDS path's");
-	case XTYPE_CLR:
-		return raw(type + " (its CLR serialization) is converted later, with the TDS path's");
-	default:
-		break;
+	std::string why = RawByType(c, type);
+	if (why.empty()) {
+		why = RawByCodePage(c);
 	}
-	if (c.system_type_name.empty()) {
-		return raw(type + " is a type the reader does not know");
+	if (why.empty()) {
+		why = RawByDeclaration(c, type);
 	}
-	if (c.system_type_name == "json" || c.system_type_name == "vector") {
-		return raw(type + " is converted later, with the TDS path's");
-	}
-	// Only a storage type the record decoder knows is converted: the kernels are keyed by the TDS id the
-	// xtype is passed as, and an xtype that is no storage type (a TDS-only id -- INTN, BITN, the legacy
-	// forms -- in a crafted catalog) would be decoded as a form its bytes are not. Any other is its bytes
-	// (review of #552).
-	if (!KnownFixedXtype(c.system_type_id) && !KnownVariableXtype(c.system_type_id)) {
-		return raw("xtype " + std::to_string(c.system_type_id) + " is not a storage type the reader decodes");
-	}
-	// A code-page text is converted through its collation's page: one the reader has no table for, or no
-	// collation at all, is its bytes -- never bytes of another page in a VARCHAR, which is UTF-8 (#224;
-	// review of #552).
-	const bool code_page_text =
-		c.system_type_id == XTYPE_VARCHAR || c.system_type_id == XTYPE_CHAR || c.system_type_id == XTYPE_TEXT;
-	if (code_page_text) {
-		const CollationRow *collation = c.collation_id ? CollationById(static_cast<int32_t>(c.collation_id)) : nullptr;
-		if (!collation) {
-			return raw(c.collation_id ? "its collation (CollationId " + std::to_string(c.collation_id) +
-											") is newer than the code-page tables"
-									  : std::string("it has no collation"));
-		}
-		if (collation->code_page != 65001 &&
-			!codec::code_page::FindCodePage(static_cast<int32_t>(collation->code_page))) {
-			return raw("its code page " + std::to_string(collation->code_page) + " has no table");
-		}
-	}
-	// The precision and scale are the file's: LogicalType::DECIMAL asserts what they must be (an
-	// assertion, not an exception), so a declaration no server writes is caught here. By the name too,
-	// which the type map dispatches on and the file's own sysscalartypes supplies (review of #549).
-	std::string name = c.system_type_name;
-	std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
-	const bool decimal = c.system_type_id == XTYPE_DECIMAL || c.system_type_id == XTYPE_NUMERIC || name == "decimal" ||
-						 name == "numeric";
-	const bool scaled = c.system_type_id == XTYPE_TIME || c.system_type_id == XTYPE_DATETIME2 ||
-						c.system_type_id == XTYPE_DATETIMEOFFSET || name == "time" || name == "datetime2" ||
-						name == "datetimeoffset";
-	if ((decimal && (c.precision < 1 || c.precision > 38 || c.scale > c.precision)) || (scaled && c.scale > 7)) {
-		return raw(type + " is declared with precision " + std::to_string(c.precision) + " and scale " +
-				   std::to_string(c.scale) + ", which no SQL Server type has");
+	if (!why.empty()) {
+		return raw(why);
 	}
 	try {
 		// datetime2(7) as TIMESTAMP_NS until spec 093 T8 hooks mssql_datetime2_7_as into the backup scan.
