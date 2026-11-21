@@ -230,6 +230,129 @@ bool SameLayout(const RowsetLayout &a, const RowsetLayout &b) {
 	return true;
 }
 
+bool IsDecimalXtype(uint8_t xtype) {
+	return xtype == XTYPE_DECIMAL || xtype == XTYPE_NUMERIC;
+}
+
+// char / nchar / binary: fixed types that may be stored variable, padded when stored fixed.
+bool IsPaddedXtype(uint8_t xtype) {
+	return xtype == XTYPE_CHAR || xtype == XTYPE_NCHAR || xtype == XTYPE_BINARY;
+}
+
+bool IsVariableXtype(uint8_t xtype) {
+	return xtype == XTYPE_VARCHAR || xtype == XTYPE_NVARCHAR || xtype == XTYPE_VARBINARY ||
+		   xtype == XTYPE_SQL_VARIANT || xtype == XTYPE_XML || xtype == XTYPE_IMAGE || xtype == XTYPE_TEXT ||
+		   xtype == XTYPE_NTEXT;
+}
+
+// What sysrscols.ti says of `physical`'s type against syscolpars' row of it (`c`): false with `why`.
+bool CheckDeclaredType(const PhysicalColumn &physical, const CatalogColumn &c, std::string &why) {
+	const bool decimal = IsDecimalXtype(physical.xtype);
+	const bool scaled =
+		physical.xtype == XTYPE_TIME || physical.xtype == XTYPE_DATETIME2 || physical.xtype == XTYPE_DATETIMEOFFSET;
+	// A CLR type's column can be described as varbinary in sysrscols (E22: hierarchyid, geometry of a
+	// ROW-compressed rowset, and of an uncompressed one SELECT INTO made); its bytes are the type's as
+	// stored, read as such (ReadingOf).
+	const bool clr_as_varbinary = c.system_type_id == XTYPE_CLR && physical.xtype == XTYPE_VARBINARY;
+	if ((physical.xtype != c.system_type_id && !clr_as_varbinary) || (decimal && physical.precision != c.precision) ||
+		((decimal || scaled) && physical.scale != c.scale)) {
+		why = "column " + c.name + " is stored as xtype " + std::to_string(physical.xtype) + " (precision " +
+			  std::to_string(physical.precision) + ", scale " + std::to_string(physical.scale) +
+			  "), which its declaration does not say";
+		return false;
+	}
+	return true;
+}
+
+// Where `physical` is stored against what its type allows, and its width: false with `why`.
+bool CheckStorageForm(const PhysicalColumn &physical, const CatalogColumn &c, bool cd, const std::string &table,
+					  std::string &why) {
+	// A fixed type stored as a variable column is the vardecimal storage format (or a layout the
+	// reader does not know); a variable type at a fixed offset is not one either. Two are both: char /
+	// nchar / binary may be stored variable (and read so: their bytes, unpadded) -- a nullable one
+	// declared under ANSI_PADDING OFF with the table is stored fixed and padded, and trimmed on read
+	// (`unpadded`, E22) --, and a CLR type of fixed length is stored fixed (its bytes). A type
+	// the reader does not know is not checked: it is read as its bytes wherever it is stored (ReadingOf).
+	const bool padded = IsPaddedXtype(physical.xtype);
+	const bool fixed_type = KnownFixedXtype(physical.xtype) && !padded;
+	const bool variable_type = IsVariableXtype(physical.xtype);
+	if (!cd && ((fixed_type && physical.offset < 0) || (variable_type && physical.offset > 0))) {
+		why = "column " + c.name + " (xtype " + std::to_string(physical.xtype) + ") is stored as a " +
+			  (physical.offset < 0 ? "variable" : "fixed") +
+			  " column, which its type is not (the vardecimal storage format is not read)";
+		return false;
+	}
+	// A fixed char / nchar / binary is as wide as its declaration: a sysrscols width that disagrees
+	// with syscolpars' would read the neighbouring columns as its value (review of #552).
+	if (padded && physical.offset > 0 && physical.length != c.max_length) {
+		why = "column " + c.name + " is stored as " + std::to_string(physical.length) + " bytes, declared " +
+			  std::to_string(c.max_length);
+		return false;
+	}
+	if (physical.offset > 0) {
+		try {
+			(void)physical.FixedLength(table);
+		} catch (FormatError &e) {
+			why = e.what();
+			return false;
+		}
+	}
+	return true;
+}
+
+// What sysrscols.ti says of a live column, checked against syscolpars' row of it (E20 pinned ti's
+// fields): a disagreement, or a fixed column whose width is unknown, refuses the table here, by name,
+// rather than mid-scan. Marks a column read unpadded.
+bool CheckLiveColumn(const std::map<int32_t, const CatalogColumn *> &by_id, const CatalogTable &t, bool cd,
+					 PhysicalColumn &physical, std::string &why) {
+	if (cd && physical.offset >= 0) {
+		why = "column " + physical.name + " is at fixed offset " + std::to_string(physical.offset) +
+			  " in a compressed rowset, whose columns are CD indexes";
+		return false;
+	}
+	auto column = by_id.find(physical.rscolid);
+	if (column == by_id.end()) {
+		if (physical.ordkey > 0) {
+			// The scan builds _mssql_rid from the key columns: one unchecked here would fail on every row.
+			why = "key column " + std::to_string(physical.rscolid) + " has no column";
+			return false;
+		}
+		return true;  // named with the defaults when it matters (an added column), as before
+	}
+	const CatalogColumn &c = *column->second;
+	if (!CheckDeclaredType(physical, c, why)) {
+		return false;
+	}
+	// A nullable char / binary under ANSI_PADDING OFF is read as the server returns it, its trailing
+	// spaces / zero bytes left out (E22, measured: DATALENGTH 1 for 0x0100 in a binary(8)). An
+	// uncompressed rowset stores it at a fixed offset, padded, and a CD one trimmed: only the column
+	// says which. nchar and NOT NULL columns are padded whatever the setting (is_ansi_padded).
+	if ((physical.xtype == XTYPE_CHAR || physical.xtype == XTYPE_BINARY) && c.is_nullable && !c.is_ansi_padded) {
+		physical.unpadded = true;
+	}
+	return CheckStorageForm(physical, c, cd, t.name, why);
+}
+
+// The default of a column added with one, into `physical`: false with `why`.
+bool FillAddedDefault(const AddedDefaults &defaults, const std::map<int32_t, const CatalogColumn *> &by_id,
+					  const RowsetLayout &layout, PhysicalColumn &physical, std::string &why) {
+	auto column = by_id.find(physical.rscolid);
+	if (column == by_id.end()) {
+		why = "physical column " + std::to_string(physical.rscolid) + " has no column";
+		return false;
+	}
+	if (!defaults.pending.empty()) {
+		why = "column " + column->second->name + " was added with a default, and " + defaults.pending;
+		return false;
+	}
+	if (!AddedDefault(defaults.values, defaults.ambiguous, layout, physical, *column->second, physical.default_bytes,
+					  why)) {
+		return false;
+	}
+	physical.has_default = true;
+	return true;
+}
+
 // One partition's layout, its added columns' defaults filled in; false with `why`.
 bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &defaults,
 					 const std::map<int32_t, const CatalogColumn *> &by_id, const CatalogTable &t,
@@ -247,107 +370,26 @@ bool PartitionLayout(const BootstrapTables &tables, const AddedDefaults &default
 	const bool cd = rowset.compression == 1 || rowset.compression == 2;
 	if (cd) {
 		for (auto &physical : layout.columns) {
-			if (physical.xtype == XTYPE_DECIMAL || physical.xtype == XTYPE_NUMERIC) {
+			if (IsDecimalXtype(physical.xtype)) {
 				physical.precision &= 0x7F;
 			}
 		}
 	}
-	// What sysrscols.ti says of each live column, checked against syscolpars' row of it (E20 pinned
-	// ti's fields): a disagreement, or a fixed column whose width is unknown, refuses the table here,
-	// by name, rather than mid-scan.
 	for (auto &physical : layout.columns) {
 		if (physical.Dropped() || physical.Uniquifier()) {
 			continue;
 		}
-		if (cd && physical.offset >= 0) {
-			why = "column " + physical.name + " is at fixed offset " + std::to_string(physical.offset) +
-				  " in a compressed rowset, whose columns are CD indexes";
+		if (!CheckLiveColumn(by_id, t, cd, physical, why)) {
 			return false;
-		}
-		auto column = by_id.find(physical.rscolid);
-		if (column == by_id.end()) {
-			if (physical.ordkey > 0) {
-				// The scan builds _mssql_rid from the key columns: one unchecked here would fail on every row.
-				why = "key column " + std::to_string(physical.rscolid) + " has no column";
-				return false;
-			}
-			continue;  // named below when it matters (an added column), as before
-		}
-		const CatalogColumn &c = *column->second;
-		const bool decimal = physical.xtype == XTYPE_DECIMAL || physical.xtype == XTYPE_NUMERIC;
-		const bool scaled =
-			physical.xtype == XTYPE_TIME || physical.xtype == XTYPE_DATETIME2 || physical.xtype == XTYPE_DATETIMEOFFSET;
-		// A CLR type's column can be described as varbinary in sysrscols (E22: hierarchyid, geometry of a
-		// ROW-compressed rowset, and of an uncompressed one SELECT INTO made); its bytes are the type's as
-		// stored, read as such (ReadingOf).
-		const bool clr_as_varbinary = c.system_type_id == XTYPE_CLR && physical.xtype == XTYPE_VARBINARY;
-		if ((physical.xtype != c.system_type_id && !clr_as_varbinary) ||
-			(decimal && physical.precision != c.precision) || ((decimal || scaled) && physical.scale != c.scale)) {
-			why = "column " + c.name + " is stored as xtype " + std::to_string(physical.xtype) + " (precision " +
-				  std::to_string(physical.precision) + ", scale " + std::to_string(physical.scale) +
-				  "), which its declaration does not say";
-			return false;
-		}
-		// A fixed type stored as a variable column is the vardecimal storage format (or a layout the
-		// reader does not know); a variable type at a fixed offset is not one either. Two are both: char /
-		// nchar / binary may be stored variable (and read so: their bytes, unpadded) -- a nullable one
-		// declared under ANSI_PADDING OFF with the table is stored fixed and padded, and trimmed on read
-		// (`unpadded` below, E22) --, and a CLR type of fixed length is stored fixed (its bytes). A type
-		// the reader does not know is not checked: it is read as its bytes wherever it is stored (ReadingOf).
-		const bool padded =
-			physical.xtype == XTYPE_CHAR || physical.xtype == XTYPE_NCHAR || physical.xtype == XTYPE_BINARY;
-		const bool fixed_type = KnownFixedXtype(physical.xtype) && !padded;
-		const bool variable_type = physical.xtype == XTYPE_VARCHAR || physical.xtype == XTYPE_NVARCHAR ||
-								   physical.xtype == XTYPE_VARBINARY || physical.xtype == XTYPE_SQL_VARIANT ||
-								   physical.xtype == XTYPE_XML || physical.xtype == XTYPE_IMAGE ||
-								   physical.xtype == XTYPE_TEXT || physical.xtype == XTYPE_NTEXT;
-		// A nullable char / binary under ANSI_PADDING OFF is read as the server returns it, its trailing
-		// spaces / zero bytes left out (E22, measured: DATALENGTH 1 for 0x0100 in a binary(8)). An
-		// uncompressed rowset stores it at a fixed offset, padded, and a CD one trimmed: only the column
-		// says which. nchar and NOT NULL columns are padded whatever the setting (is_ansi_padded).
-		if ((physical.xtype == XTYPE_CHAR || physical.xtype == XTYPE_BINARY) && c.is_nullable && !c.is_ansi_padded) {
-			physical.unpadded = true;
-		}
-		if (!cd && ((fixed_type && physical.offset < 0) || (variable_type && physical.offset > 0))) {
-			why = "column " + c.name + " (xtype " + std::to_string(physical.xtype) + ") is stored as a " +
-				  (physical.offset < 0 ? "variable" : "fixed") +
-				  " column, which its type is not (the vardecimal storage format is not read)";
-			return false;
-		}
-		// A fixed char / nchar / binary is as wide as its declaration: a sysrscols width that disagrees
-		// with syscolpars' would read the neighbouring columns as its value (review of #552).
-		if (padded && physical.offset > 0 && physical.length != c.max_length) {
-			why = "column " + c.name + " is stored as " + std::to_string(physical.length) + " bytes, declared " +
-				  std::to_string(c.max_length);
-			return false;
-		}
-		if (physical.offset > 0) {
-			try {
-				(void)physical.FixedLength(t.name);
-			} catch (FormatError &e) {
-				why = e.what();
-				return false;
-			}
 		}
 	}
 	for (auto &physical : layout.columns) {
 		if (physical.Dropped() || physical.Uniquifier() || !physical.HasDefaultStatus()) {
 			continue;
 		}
-		auto column = by_id.find(physical.rscolid);
-		if (column == by_id.end()) {
-			why = "physical column " + std::to_string(physical.rscolid) + " has no column";
+		if (!FillAddedDefault(defaults, by_id, layout, physical, why)) {
 			return false;
 		}
-		if (!defaults.pending.empty()) {
-			why = "column " + column->second->name + " was added with a default, and " + defaults.pending;
-			return false;
-		}
-		if (!AddedDefault(defaults.values, defaults.ambiguous, layout, physical, *column->second,
-						  physical.default_bytes, why)) {
-			return false;
-		}
-		physical.has_default = true;
 	}
 	return true;
 }

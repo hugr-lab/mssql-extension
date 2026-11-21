@@ -1148,162 +1148,233 @@ size_t DcmSet::MemoryBytes() const {
 //! mapped by their headers.
 class StripedDcmBuilder {
 public:
-	static bool Build(PageIndex &index, const PageIndexOptions &options);
+	static bool Build(PageIndex &index, const PageIndexOptions &options) {
+		StripedDcmBuilder builder(index, options);
+		return builder.Run();
+	}
+
+private:
+	//! What follows an interval of a file: the next one pass 1 carries, the file's end, or passes the
+	//! rule does not hold for.
+	enum class Step { NextInterval, EndOfFile, Refuse };
+
+	StripedDcmBuilder(PageIndex &index, const PageIndexOptions &options)
+		: index_(index), options_(options), set_(std::make_shared<DcmSet>()) {}
+
+	bool Run();
+	bool FindFirstPasses();
+	const RandomAccess &StreamOf(size_t pass) const {
+		return *index_.families_[index_.passes_[pass].family].stream;
+	}
+	bool Find(const ExtentId &e, size_t &which, uint64_t &group) const;
+	bool ReadGroupOf(size_t pass, uint64_t group);
+	bool MapFile(uint16_t id);
+	Step NextInterval(uint16_t id, uint32_t size, uint32_t &interval, std::vector<uint8_t> &gam,
+					  std::vector<uint8_t> &dcm);
+	bool CountCarried(size_t pass, uint64_t &carried);
+	bool SamplesInSet(size_t pass, uint64_t carried);
+	bool AgreesWhereChanged();
+	int ReadAllocationPages(uint16_t file, uint32_t first_extent, std::vector<uint8_t> &gam,
+							std::vector<uint8_t> &dcm_page) const;
+
+	PageIndex &index_;
+	const PageIndexOptions &options_;
+	std::shared_ptr<DcmSet> set_;
+	std::vector<size_t> firsts_;  // the families' pass 1, by index into the index's passes
+	uint64_t total_groups_ = 0;
+	ReadGroup g_;
 };
 
 // Groups sampled in each family of a striped differential's pass 1.
 static constexpr uint32_t STRIPED_SAMPLES = 64;
 
-bool StripedDcmBuilder::Build(PageIndex &index, const PageIndexOptions &options) {
-	std::vector<size_t> firsts;
-	for (size_t i = 0; i < index.passes_.size(); i++) {
-		const auto &pass = index.passes_[i];
+//! The families' searched pass 1 into firsts_: false when one's positions are a resync's block
+//! offsets (trust_layout): no group read by index.
+bool StripedDcmBuilder::FindFirstPasses() {
+	for (size_t i = 0; i < index_.passes_.size(); i++) {
+		const auto &pass = index_.passes_[i];
 		if (pass.number == 0 && pass.search) {
 			if (pass.by_block) {
-				return false;  // positions are a resync's block offsets (trust_layout): no group read by index
+				return false;
 			}
-			firsts.push_back(i);
+			firsts_.push_back(i);
 		}
 	}
-	if (firsts.size() < 2 || options.data_files.empty()) {
-		return false;
-	}
-	auto stream_of = [&](size_t i) -> const RandomAccess & { return *index.families_[index.passes_[i].family].stream; };
-	// The family whose pass 1 carries `e`, and its group.
-	auto find = [&](const ExtentId &e, size_t &which, uint64_t &group) -> bool {
-		for (size_t i : firsts) {
-			if (index.passes_[i].search->Find(e, group)) {
-				which = i;
-				return true;
-			}
+	return true;
+}
+
+//! The family whose pass 1 carries `e`, and its group.
+bool StripedDcmBuilder::Find(const ExtentId &e, size_t &which, uint64_t &group) const {
+	for (size_t i : firsts_) {
+		if (index_.passes_[i].search->Find(e, group)) {
+			which = i;
+			return true;
 		}
-		return false;
-	};
-	uint64_t total_groups = 0;
-	for (size_t i : firsts) {
-		total_groups += index.passes_[i].groups;
 	}
-	auto set = std::make_shared<DcmSet>();
-	ReadGroup g;
-	for (const uint16_t id : options.data_files) {
-		ExtentId first;
-		first.file = id;
+	return false;
+}
+
+bool StripedDcmBuilder::ReadGroupOf(size_t pass, uint64_t group) {
+	return ReadPassGroup(StreamOf(pass), index_.passes_[pass].units_offset, index_.passes_[pass].groups, group, g_);
+}
+
+//! Data file `id`'s extents into the set: its intervals' GAM and DCM pages, wherever the searches find them.
+bool StripedDcmBuilder::MapFile(uint16_t id) {
+	ExtentId first;
+	first.file = id;
+	size_t which = 0;
+	uint64_t group = 0;
+	if (!Find(first, which, group) || !ReadGroupOf(which, group)) {
+		return false;  // every data file's extent 0 is in pass 1: its header, GAM and DCM
+	}
+	const uint8_t *header = GroupPage(g_, 0, PAGE_TYPE_FILE_HEADER);
+	const uint8_t *gam = GroupPage(g_, 2, PAGE_TYPE_GAM);
+	const uint8_t *dcm = GroupPage(g_, 6, PAGE_TYPE_DCM);
+	if (!header || !gam || !dcm) {
+		return false;
+	}
+	const FileHeaderRecord record = ReadFileHeaderRecord(header, PAGE_SIZE);
+	if (record.file_id != id || record.size == 0) {
+		return false;
+	}
+	const uint32_t size = record.size;
+	std::vector<uint8_t> gam_copy(gam, gam + PAGE_SIZE), dcm_copy(dcm, dcm + PAGE_SIZE);
+	ExtentBitmap bitmap;
+	for (uint32_t interval = 0;; interval++) {
+		ByteReader bm(gam_copy.data(), PAGE_SIZE, "a GAM page", 0);
+		ByteReader dm(dcm_copy.data(), PAGE_SIZE, "a DCM page", 0);
+		const size_t allocated = AddInterval(id, size, interval, bm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES),
+											 dm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES), bitmap);
+		if (bitmap.Count() > total_groups_) {
+			return false;
+		}
+		const bool past_size = static_cast<uint64_t>(interval) * GAM_INTERVAL_PAGES >= size;
+		if (past_size && allocated == 0) {
+			break;
+		}
+		const Step step = NextInterval(id, size, interval, gam_copy, dcm_copy);
+		if (step == Step::Refuse) {
+			return false;
+		}
+		if (step == Step::EndOfFile) {
+			break;
+		}
+	}
+	bitmap.Seal();
+	set_->files_.push_back(id);
+	set_->bitmaps_.push_back(std::move(bitmap));
+	return true;
+}
+
+//! The next interval pass 1 carries after `interval`: one that changed in nothing is left out, its GAM
+//! and DCM too. Found, its GAM and DCM pages are taken and `interval` set to the one before it.
+StripedDcmBuilder::Step StripedDcmBuilder::NextInterval(uint16_t id, uint32_t size, uint32_t &interval,
+														std::vector<uint8_t> &gam, std::vector<uint8_t> &dcm) {
+	bool past_tried = false;  // past the recorded Size only the next interval may carry data
+	for (uint32_t next = interval + 1;; next++) {
+		const uint64_t base = static_cast<uint64_t>(next) * GAM_INTERVAL_PAGES;
+		if (base >= (static_cast<uint64_t>(1) << 32) || (base >= size && past_tried)) {
+			return Step::EndOfFile;
+		}
+		past_tried = past_tried || base >= size;
+		ExtentId e;
+		e.file = id;
+		e.extent = static_cast<uint32_t>(base / PAGES_PER_EXTENT);
 		size_t which = 0;
 		uint64_t group = 0;
-		if (!find(first, which, group) || !ReadPassGroup(stream_of(which), index.passes_[which].units_offset,
-														 index.passes_[which].groups, group, g)) {
-			return false;  // every data file's extent 0 is in pass 1: its header, GAM and DCM
+		if (!Find(e, which, group)) {
+			if (base >= size) {
+				return Step::EndOfFile;	 // past the recorded Size: the file ends here
+			}
+			continue;
 		}
-		const uint8_t *header = GroupPage(g, 0, PAGE_TYPE_FILE_HEADER);
-		const uint8_t *gam = GroupPage(g, 2, PAGE_TYPE_GAM);
-		const uint8_t *dcm = GroupPage(g, 6, PAGE_TYPE_DCM);
-		if (!header || !gam || !dcm) {
+		if (!ReadGroupOf(which, group)) {
+			return Step::Refuse;
+		}
+		const uint8_t *next_gam = GroupPage(g_, 0, PAGE_TYPE_GAM);
+		const uint8_t *next_dcm = GroupPage(g_, 6, PAGE_TYPE_DCM);
+		if (!next_gam || !next_dcm) {
+			return Step::Refuse;
+		}
+		gam.assign(next_gam, next_gam + PAGE_SIZE);
+		dcm.assign(next_dcm, next_dcm + PAGE_SIZE);
+		interval = next - 1;
+		return Step::NextInterval;
+	}
+}
+
+//! A family's groups before its trailing pads (pads only trail, E13) into `carried`, its samples checked.
+bool StripedDcmBuilder::CountCarried(size_t i, uint64_t &carried) {
+	const auto &pass = index_.passes_[i];
+	uint64_t lo = 0, hi = pass.groups;
+	while (lo < hi) {
+		const uint64_t mid = lo + (hi - lo) / 2;
+		if (!ReadGroupOf(i, mid)) {
 			return false;
 		}
-		const FileHeaderRecord record = ReadFileHeaderRecord(header, PAGE_SIZE);
-		if (record.file_id != id || record.size == 0) {
-			return false;
+		if (g_.is_pad) {
+			hi = mid;
+		} else {
+			lo = mid + 1;
 		}
-		const uint32_t size = record.size;
-		std::vector<uint8_t> gam_copy(gam, gam + PAGE_SIZE), dcm_copy(dcm, dcm + PAGE_SIZE);
-		ExtentBitmap bitmap;
-		for (uint32_t interval = 0;; interval++) {
-			ByteReader bm(gam_copy.data(), PAGE_SIZE, "a GAM page", 0);
-			ByteReader dm(dcm_copy.data(), PAGE_SIZE, "a DCM page", 0);
-			const size_t allocated = AddInterval(id, size, interval, bm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES),
-												 dm.Bytes(GAM_BITMAP_AT, GAM_BITMAP_BYTES), bitmap);
-			if (bitmap.Count() > total_groups) {
-				return false;
-			}
-			const bool past_size = static_cast<uint64_t>(interval) * GAM_INTERVAL_PAGES >= size;
-			if (past_size && allocated == 0) {
-				break;
-			}
-			// The next interval pass 1 carries: one that changed in nothing is left out, its GAM and DCM too.
-			bool found = false;
-			bool past_tried = false;  // past the recorded Size only the next interval may carry data
-			for (uint32_t next = interval + 1; !found; next++) {
-				const uint64_t base = static_cast<uint64_t>(next) * GAM_INTERVAL_PAGES;
-				if (base >= (static_cast<uint64_t>(1) << 32) || (base >= size && past_tried)) {
-					break;
-				}
-				past_tried = past_tried || base >= size;
-				ExtentId e;
-				e.file = id;
-				e.extent = static_cast<uint32_t>(base / PAGES_PER_EXTENT);
-				if (!find(e, which, group)) {
-					if (base >= size) {
-						break;	// past the recorded Size: the file ends here
-					}
-					continue;
-				}
-				if (!ReadPassGroup(stream_of(which), index.passes_[which].units_offset, index.passes_[which].groups,
-								   group, g)) {
-					return false;
-				}
-				const uint8_t *next_gam = GroupPage(g, 0, PAGE_TYPE_GAM);
-				const uint8_t *next_dcm = GroupPage(g, 6, PAGE_TYPE_DCM);
-				if (!next_gam || !next_dcm) {
-					return false;
-				}
-				gam_copy.assign(next_gam, next_gam + PAGE_SIZE);
-				dcm_copy.assign(next_dcm, next_dcm + PAGE_SIZE);
-				interval = next - 1;
-				found = true;
-			}
-			if (!found) {
-				break;
-			}
-		}
-		bitmap.Seal();
-		set->files_.push_back(id);
-		set->bitmaps_.push_back(std::move(bitmap));
 	}
-	// The families' groups before their trailing pads (pads only trail, E13), together as many as the set.
-	uint64_t carried = 0;
-	for (size_t i : firsts) {
-		const auto &pass = index.passes_[i];
-		uint64_t lo = 0, hi = pass.groups;
-		while (lo < hi) {
-			const uint64_t mid = lo + (hi - lo) / 2;
-			if (!ReadPassGroup(stream_of(i), pass.units_offset, pass.groups, mid, g)) {
-				return false;
-			}
-			if (g.is_pad) {
-				hi = mid;
-			} else {
-				lo = mid + 1;
-			}
-		}
-		// Groups sampled over the family: each that names an extent names one of the set, ascending. (An extent
-		// swapped for another between two samples, the count kept, is what they do not see -- a file at odds
-		// with its own DCM, as a swap in place is for the ranked map.)
-		bool have_previous = false;
-		ExtentId previous;
-		for (uint32_t c = 0; c < STRIPED_SAMPLES && lo > 0; c++) {
-			const uint64_t at = (lo - 1) * c / (STRIPED_SAMPLES - 1);
-			if (!ReadPassGroup(stream_of(i), pass.units_offset, pass.groups, at, g) || g.is_pad ||
-				(g.has_extent && !set->Contains(g.extent)) ||
-				(g.has_extent && have_previous && !(previous < g.extent) && !(previous == g.extent))) {
-				return false;
-			}
-			if (g.has_extent) {
-				previous = g.extent;
-				have_previous = true;
-			}
-		}
-		carried += lo;
-	}
-	if (carried != set->Count()) {
+	if (!SamplesInSet(i, lo)) {
 		return false;
 	}
-	// Where the database changed while the backup ran: the set holds an extent exactly when a family has it.
+	carried += lo;
+	return true;
+}
+
+//! Groups sampled over the family's first `carried`: each that names an extent names one of the set,
+//! ascending. (An extent swapped for another between two samples, the count kept, is what they do not
+//! see -- a file at odds with its own DCM, as a swap in place is for the ranked map.)
+bool StripedDcmBuilder::SamplesInSet(size_t i, uint64_t carried) {
+	bool have_previous = false;
+	ExtentId previous;
+	for (uint32_t c = 0; c < STRIPED_SAMPLES && carried > 0; c++) {
+		const uint64_t at = (carried - 1) * c / (STRIPED_SAMPLES - 1);
+		if (!ReadGroupOf(i, at) || g_.is_pad || (g_.has_extent && !set_->Contains(g_.extent)) ||
+			(g_.has_extent && have_previous && !(previous < g_.extent) && !(previous == g_.extent))) {
+			return false;
+		}
+		if (g_.has_extent) {
+			previous = g_.extent;
+			have_previous = true;
+		}
+	}
+	return true;
+}
+
+//! The GAM and DCM pages of the interval starting at `first_extent`, as pass 1 copied them: 1 read, 0 an
+//! interval pass 1 leaves out, -1 one it should hold and does not.
+int StripedDcmBuilder::ReadAllocationPages(uint16_t file, uint32_t first_extent, std::vector<uint8_t> &gam,
+										   std::vector<uint8_t> &dcm_page) const {
+	ExtentId e;
+	e.file = file;
+	e.extent = first_extent;
+	size_t at_family = 0;
+	uint64_t at_group = 0;
+	if (!Find(e, at_family, at_group)) {
+		return first_extent == 0 ? -1 : 0;
+	}
+	const auto &pass = index_.passes_[at_family];
+	const uint32_t gam_unit = first_extent == 0 ? 2 : 0;
+	return ReadAllocationUnit(StreamOf(at_family), pass.units_offset, pass.groups, at_group, gam_unit, PAGE_TYPE_GAM,
+							  gam) &&
+				   ReadAllocationUnit(StreamOf(at_family), pass.units_offset, pass.groups, at_group, 6, PAGE_TYPE_DCM,
+									  dcm_page)
+			   ? 1
+			   : -1;
+}
+
+//! Where the database changed while the backup ran: the set holds an extent exactly when a family has it.
+bool StripedDcmBuilder::AgreesWhereChanged() {
 	std::vector<LaterPass> later;
-	for (const auto &pass : index.passes_) {
+	for (const auto &pass : index_.passes_) {
 		if (pass.number > 0 && !pass.search) {
 			LaterPass p;
 			p.map = &pass.map;
-			p.stream = index.families_[pass.family].stream;
+			p.stream = index_.families_[pass.family].stream;
 			later.push_back(p);
 		}
 	}
@@ -1312,36 +1383,46 @@ bool StripedDcmBuilder::Build(PageIndex &index, const PageIndexOptions &options)
 	const bool read = ChangedWhileBackedUp(
 		later,
 		[&](uint16_t file, uint32_t first_extent, std::vector<uint8_t> &gam, std::vector<uint8_t> &dcm_page) -> int {
-			ExtentId e;
-			e.file = file;
-			e.extent = first_extent;
-			size_t at_family = 0;
-			uint64_t at_group = 0;
-			if (!find(e, at_family, at_group)) {
-				return first_extent == 0 ? -1 : 0;
-			}
-			const auto &pass = index.passes_[at_family];
-			const uint32_t gam_unit = first_extent == 0 ? 2 : 0;
-			return ReadAllocationUnit(stream_of(at_family), pass.units_offset, pass.groups, at_group, gam_unit,
-									  PAGE_TYPE_GAM, gam) &&
-						   ReadAllocationUnit(stream_of(at_family), pass.units_offset, pass.groups, at_group, 6,
-											  PAGE_TYPE_DCM, dcm_page)
-					   ? 1
-					   : -1;
+			return ReadAllocationPages(file, first_extent, gam, dcm_page);
 		},
 		changed, reads);
-	if (!read || changed.size() * firsts.size() > std::max<uint64_t>(64, total_groups / 4)) {
+	if (!read || changed.size() * firsts_.size() > std::max<uint64_t>(64, total_groups_ / 4)) {
 		return false;  // as much as reading the passes through
 	}
 	for (const auto &e : changed) {
 		size_t which = 0;
 		uint64_t group = 0;
-		if (set->Contains(e) != find(e, which, group)) {
+		if (set_->Contains(e) != Find(e, which, group)) {
 			return false;
 		}
 	}
-	for (size_t i : firsts) {
-		index.passes_[i].dcm = set;
+	return true;
+}
+
+bool StripedDcmBuilder::Run() {
+	if (!FindFirstPasses() || firsts_.size() < 2 || options_.data_files.empty()) {
+		return false;
+	}
+	for (size_t i : firsts_) {
+		total_groups_ += index_.passes_[i].groups;
+	}
+	for (const uint16_t id : options_.data_files) {
+		if (!MapFile(id)) {
+			return false;
+		}
+	}
+	// The families' groups before their trailing pads, together as many as the set.
+	uint64_t carried = 0;
+	for (size_t i : firsts_) {
+		if (!CountCarried(i, carried)) {
+			return false;
+		}
+	}
+	if (carried != set_->Count() || !AgreesWhereChanged()) {
+		return false;
+	}
+	for (size_t i : firsts_) {
+		index_.passes_[i].dcm = set_;
 	}
 	return true;
 }
