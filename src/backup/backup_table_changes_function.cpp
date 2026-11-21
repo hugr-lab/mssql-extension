@@ -111,89 +111,123 @@ struct TableChangesLocal : public LocalTableFunctionState {
 	DataChunk old_values;  // the older state's columns, before their cast to the newer state's types
 };
 
+//! The call's arguments: the files, the table, the two versions.
+void ReadChangesArguments(TableChangesBindData &data, TableFunctionBindInput &input) {
+	data.paths = PathsOf(input.inputs[0], data.function);
+	data.diff = DiffPathsOf(input.named_parameters, data.function);
+	if (input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
+		throw InvalidInputException("%s: the schema and the table must not be NULL", data.function);
+	}
+	data.schema = input.inputs[1].ToString();
+	data.table = input.inputs[2].ToString();
+	for (const auto &kv : input.named_parameters) {
+		if (kv.first == "start_version") {
+			data.start = kv.second;
+		} else if (kv.first == "end_version") {
+			data.end = kv.second;
+		}
+	}
+	if (!data.diff.empty() && (!data.start.IsNull() || !data.end.IsNull())) {
+		throw InvalidInputException(
+			"%s: diff := names its two states (the full, and the full with the "
+			"differential): start_version / end_version do not go beside it",
+			data.function);
+	}
+}
+
+//! The newer state's table names the columns, whatever the states (one state: no rows; OpenTwoStates
+//! opened it).
+void FindNewTable(TableChangesBindData &data) {
+	const CatalogModel &new_model = data.states.new_catalog->Model();
+	data.new_table = new_model.FindTable(data.schema, data.table);
+	if (!data.new_table) {
+		throw InvalidInputException("%s: the newer state has no table %s.%s (mssql_backup_tables lists them)",
+									data.function, data.schema, data.table);
+	}
+	if (!data.new_table->decodable) {
+		throw InvalidInputException("%s: %s.%s is not read: %s", data.function, data.schema, data.table,
+									data.new_table->reason);
+	}
+}
+
+//! The older state's table: by object id (a rename is a rename), by name across a break.
+bool IsOlderTable(const TableChangesBindData &data, const CatalogTable &t) {
+	if (data.states.history_break) {
+		return t.schema_name == data.new_table->schema_name && t.name == data.new_table->name;
+	}
+	return t.object_id == data.new_table->object_id;
+}
+
+//! A reload (DQ-47): the table recreated, a partition switched in, a break -- its whole content.
+bool IsReload(const TableChangesBindData &data, const CatalogModel &old_model, const CatalogModel &new_model) {
+	bool reload = !data.old_table || data.states.history_break;
+	if (!reload) {
+		// Against the whole models: a partition switched in is a rowset another table owned, one an
+		// ATTACH's filters leave out too.
+		const ViewDefinition none = [](bool, const CatalogView &) { return std::string(); };
+		for (const auto &c : CompareCatalogs(old_model, new_model, false, none, data.states.old_whole.get(),
+											 data.states.new_whole.get())) {
+			reload = reload || (c.change_type == "table_reload" && c.object_id == data.new_table->object_id);
+		}
+	}
+	return reload;
+}
+
+void FindOldTable(TableChangesBindData &data) {
+	const CatalogModel &old_model = data.states.old_catalog->Model();
+	for (const auto &t : old_model.tables) {
+		if (IsOlderTable(data, t)) {
+			data.old_table = &t;
+		}
+	}
+	const bool reload = IsReload(data, old_model, data.states.new_catalog->Model());
+	data.all_inserts = reload;
+	if (!reload && !data.old_table->decodable) {
+		throw InvalidInputException("%s: %s.%s is not read in the older state: %s", data.function, data.schema,
+									data.table, data.old_table->reason);
+	}
+}
+
+//! The two states opened, and the table found in each.
+void OpenChangesStates(ClientContext &context, TableChangesBindData &data) {
+	try {
+		data.states = OpenTwoStates(context, std::vector<std::string>(data.paths.begin(), data.paths.end()),
+									std::vector<std::string>(data.diff.begin(), data.diff.end()), data.start, data.end,
+									data.function, true);
+		FindNewTable(data);
+		if (!data.states.same) {
+			FindOldTable(data);
+		}
+	} catch (FormatError &e) {
+		throw InvalidInputException("%s: %s", data.function, e.what());
+	}
+}
+
+//! The newer state's columns the older state's table reads too: staged from it, cast to the newer's types.
+void PairOldColumns(TableChangesBindData &data) {
+	if (!data.old_table || data.all_inserts) {
+		return;
+	}
+	const ScanColumns old_columns = ScanColumnsOf(*data.old_table);
+	std::set<int32_t> readable(old_columns.column_ids.begin(), old_columns.column_ids.end());
+	for (idx_t i = 0; i < data.columns.column_ids.size(); i++) {
+		if (readable.count(data.columns.column_ids[i])) {
+			data.old_staged.push_back(data.columns.column_ids[i]);
+			data.old_outputs.push_back(i);
+		}
+	}
+}
+
 unique_ptr<FunctionData> TableChangesBind(ClientContext &context, TableFunctionBindInput &input,
 										  vector<LogicalType> &return_types, vector<Identifier> &names,
 										  ChangeListing listing) {
 	auto data = make_uniq<TableChangesBindData>();
 	data->listing = listing;
 	data->function = ChangesFunction(listing);
-	data->paths = PathsOf(input.inputs[0], data->function);
-	data->diff = DiffPathsOf(input.named_parameters, data->function);
-	if (input.inputs[1].IsNull() || input.inputs[2].IsNull()) {
-		throw InvalidInputException("%s: the schema and the table must not be NULL", data->function);
-	}
-	data->schema = input.inputs[1].ToString();
-	data->table = input.inputs[2].ToString();
-	for (const auto &kv : input.named_parameters) {
-		if (kv.first == "start_version") {
-			data->start = kv.second;
-		} else if (kv.first == "end_version") {
-			data->end = kv.second;
-		}
-	}
-	if (!data->diff.empty() && (!data->start.IsNull() || !data->end.IsNull())) {
-		throw InvalidInputException(
-			"%s: diff := names its two states (the full, and the full with the "
-			"differential): start_version / end_version do not go beside it",
-			data->function);
-	}
-	try {
-		data->states = OpenTwoStates(context, std::vector<std::string>(data->paths.begin(), data->paths.end()),
-									 std::vector<std::string>(data->diff.begin(), data->diff.end()), data->start,
-									 data->end, data->function, true);
-		// The newer state's table names the columns, whatever the states (one state: no rows; OpenTwoStates
-		// opened it).
-		const CatalogModel &new_model = data->states.new_catalog->Model();
-		data->new_table = new_model.FindTable(data->schema, data->table);
-		if (!data->new_table) {
-			throw InvalidInputException("%s: the newer state has no table %s.%s (mssql_backup_tables lists them)",
-										data->function, data->schema, data->table);
-		}
-		if (!data->new_table->decodable) {
-			throw InvalidInputException("%s: %s.%s is not read: %s", data->function, data->schema, data->table,
-										data->new_table->reason);
-		}
-		if (!data->states.same) {
-			// The older state's table: by object id (a rename is a rename), by name across a break.
-			const CatalogModel &old_model = data->states.old_catalog->Model();
-			for (const auto &t : old_model.tables) {
-				if (data->states.history_break
-						? (t.schema_name == data->new_table->schema_name && t.name == data->new_table->name)
-						: t.object_id == data->new_table->object_id) {
-					data->old_table = &t;
-				}
-			}
-			// A reload (DQ-47): the table recreated, a partition switched in, a break -- its whole content.
-			bool reload = !data->old_table || data->states.history_break;
-			if (!reload) {
-				// Against the whole models: a partition switched in is a rowset another table owned, one an
-				// ATTACH's filters leave out too.
-				const ViewDefinition none = [](bool, const CatalogView &) { return std::string(); };
-				for (const auto &c : CompareCatalogs(old_model, new_model, false, none, data->states.old_whole.get(),
-													 data->states.new_whole.get())) {
-					reload = reload || (c.change_type == "table_reload" && c.object_id == data->new_table->object_id);
-				}
-			}
-			data->all_inserts = reload;
-			if (!reload && !data->old_table->decodable) {
-				throw InvalidInputException("%s: %s.%s is not read in the older state: %s", data->function,
-											data->schema, data->table, data->old_table->reason);
-			}
-		}
-	} catch (FormatError &e) {
-		throw InvalidInputException("%s: %s", data->function, e.what());
-	}
+	ReadChangesArguments(*data, input);
+	OpenChangesStates(context, *data);
 	data->columns = ScanColumnsOf(*data->new_table);
-	if (data->old_table && !data->all_inserts) {
-		const ScanColumns old_columns = ScanColumnsOf(*data->old_table);
-		std::set<int32_t> readable(old_columns.column_ids.begin(), old_columns.column_ids.end());
-		for (idx_t i = 0; i < data->columns.column_ids.size(); i++) {
-			if (readable.count(data->columns.column_ids[i])) {
-				data->old_staged.push_back(data->columns.column_ids[i]);
-				data->old_outputs.push_back(i);
-			}
-		}
-	}
+	PairOldColumns(*data);
 	names.emplace_back("change_type");
 	return_types.push_back(LogicalType::VARCHAR);
 	for (idx_t i = 0; i < data->columns.names.size(); i++) {
