@@ -1681,6 +1681,114 @@ static std::unique_ptr<PassSearch> SearchFor(const FamilyStream &family, const M
 	return std::unique_ptr<PassSearch>(new PassSearch(std::move(medium)));
 }
 
+//! The data stream of an MSDA block (MQDA, with bytes), or null when it has none: an encrypted one, or
+//! two in one block, refused by name.
+static const MtfStream *DataStreamOf(const RandomAccess &stream, const MtfBlock &block) {
+	const MtfStream *data = nullptr;
+	for (const auto &s : block.streams) {
+		if (s.id == "MQDA" && s.length > 0) {
+			if (s.encryption != 0) {
+				throw FormatError(Where(stream, s.header_offset) + ": an encrypted data stream (spec 087)");
+			}
+			if (data) {
+				throw FormatError(Where(stream, block.offset) +
+								  ": an MSDA block with two data streams, a layout the reader does not know");
+			}
+			data = &s;
+		}
+	}
+	return data;
+}
+
+//! A pass mapped by its page headers: the caller's mapper when it gave one.
+static PassMap MapByHeaders(const PageIndexOptions &options, const RandomAccess &stream, uint64_t offset,
+							uint64_t length, uint32_t number) {
+	return options.mapper ? options.mapper(stream, offset, length, number)
+						  : BuildPassMap(stream, offset, length, number);
+}
+
+//! How `pass` finds its extents: ranked from its allocation pages, searched, or mapped by its headers.
+//! Returns whether it was ranked or is searched (false: mapped by its headers).
+static bool MapOrSearchPass(const FamilyStream &family_stream, const MtfStream &data, const PassHeaderScan &bounds,
+							bool single_family, const PageIndexOptions &options, IndexedPass &pass) {
+	const RandomAccess &stream = *family_stream.stream;
+	const uint32_t number = pass.number;
+	const bool first_of_full = number == 0 && options.full_backup;
+	bool mapped = false;
+	if (first_of_full && single_family && !family_stream.container) {
+		// One plain family: its pass 1 from its allocation pages (E12); a rank that fails is
+		// searched instead.
+		mapped = BuildRankedPassMap(stream, data.data_offset, data.length, pass.map);
+	}
+	if (number == 0 && !options.full_backup && single_family) {
+		// A differential's pass 1, one family: from its own allocation and DCM pages, ranked as a full's
+		// (DQ-41 revisited: a large differential is not read through to map it; its "absent" as sure as the
+		// full's ranks, checked the same way); a rank that fails maps it by its headers. A compressed one's
+		// groups are read through its container's stream (the chain walked from known blocks, only the
+		// groups read decoded), so it is not decoded whole to be mapped.
+		mapped = BuildRankedPassMap(stream, data.data_offset, data.length, pass.map, nullptr, true);
+	}
+	if (!mapped && first_of_full) {
+		pass.search = SearchFor(family_stream, data, bounds, options.trust_layout, pass.by_block);
+		mapped = true;
+	}
+	if (number == 0 && !options.full_backup && !single_family) {
+		// A striped differential's pass 1: searched, its extents the families' DCM set (StripedDcmBuilder,
+		// once every family is added); mapped by its headers when the set does not hold.
+		pass.search = SearchFor(family_stream, data, bounds, options.trust_layout, pass.by_block);
+		mapped = true;
+	}
+	if (!mapped) {
+		pass.map = MapByHeaders(options, stream, data.data_offset, data.length, number);
+	}
+	return mapped;
+}
+
+//! The pass whose data stream is `data`, the family's pass `number`.
+static IndexedPass IndexPass(const FamilyStream &family_stream, uint32_t family, bool single_family,
+							 const PageIndexOptions &options, const MtfStream &data, uint32_t number) {
+	const RandomAccess &stream = *family_stream.stream;
+	IndexedPass pass;
+	pass.number = number;
+	pass.family = family;
+	pass.data_offset = data.data_offset;
+	pass.data_length = data.length;
+	PassHeaderScan bounds(stream.Name(), stream.Size(), data.data_offset, data.length, number);
+	pass.units_offset = bounds.GroupOffset(0);
+	pass.groups = bounds.GroupCount();
+	const bool mapped = MapOrSearchPass(family_stream, data, bounds, single_family, options, pass);
+	pass.from_dcm = number == 0 && !options.full_backup && mapped && pass.map.Ranked();
+	pass.map.number = number;
+	pass.map.family = family;
+	return pass;
+}
+
+//! A differential's pass 1 ranked from its DCM, checked where the database changed while the backup ran
+//! (a backup under load: its later passes copy again the extents written meanwhile, measured dozens on
+//! `load`; a quiet one only its allocation pages' extents): there its DCM / GAM copies may disagree with
+//! what pass 1 carries in ways the sampled ranks do not see (a changed extent and a freed one between two
+//! checks). When the checks fail, or would read as much as the pass, it is mapped by its headers.
+static void RecheckDifferentialRanks(const RandomAccess &stream, uint32_t family, const PageIndexOptions &options,
+									 std::vector<IndexedPass> &passes) {
+	for (auto &first : passes) {
+		if (first.family != family || !first.from_dcm) {
+			continue;
+		}
+		std::vector<const PassMap *> later;
+		for (const auto &pass : passes) {
+			if (pass.family == family && pass.number > first.number) {
+				later.push_back(&pass.map);
+			}
+		}
+		if (!CheckDifferentialRanks(stream, first.map, later)) {
+			first.map = MapByHeaders(options, stream, first.data_offset, first.data_length, first.number);
+			first.map.number = first.number;
+			first.map.family = family;
+			first.from_dcm = false;
+		}
+	}
+}
+
 //! One family's passes, appended to `passes` with their family and pass numbers.
 static void AddFamilyPasses(const FamilyStream &family_stream, uint32_t family, bool single_family,
 							const PageIndexOptions &options, std::vector<IndexedPass> &passes) {
@@ -1696,90 +1804,16 @@ static void AddFamilyPasses(const FamilyStream &family_stream, uint32_t family, 
 		if (block.type != "MSDA") {
 			continue;
 		}
-		const MtfStream *data = nullptr;
-		for (const auto &s : block.streams) {
-			if (s.id == "MQDA" && s.length > 0) {
-				if (s.encryption != 0) {
-					throw FormatError(Where(stream, s.header_offset) + ": an encrypted data stream (spec 087)");
-				}
-				if (data) {
-					throw FormatError(Where(stream, block.offset) +
-									  ": an MSDA block with two data streams, a layout the reader does not know");
-				}
-				data = &s;
-			}
-		}
+		const MtfStream *data = DataStreamOf(stream, block);
 		// Numbered by the MSDA block's position, not by the data streams met: a family whose pass
 		// has no data must not shift its later passes onto another family's earlier ones.
 		const uint32_t this_number = number++;
 		if (!data) {
 			continue;
 		}
-		IndexedPass pass;
-		pass.number = this_number;
-		pass.family = family;
-		pass.data_offset = data->data_offset;
-		pass.data_length = data->length;
-		PassHeaderScan bounds(stream.Name(), stream.Size(), data->data_offset, data->length, this_number);
-		pass.units_offset = bounds.GroupOffset(0);
-		pass.groups = bounds.GroupCount();
-		const bool first_of_full = this_number == 0 && options.full_backup;
-		bool mapped = false;
-		if (first_of_full && single_family && !family_stream.container) {
-			// One plain family: its pass 1 from its allocation pages (E12); a rank that fails is
-			// searched instead.
-			mapped = BuildRankedPassMap(stream, data->data_offset, data->length, pass.map);
-		}
-		if (this_number == 0 && !options.full_backup && single_family) {
-			// A differential's pass 1, one family: from its own allocation and DCM pages, ranked as a full's
-			// (DQ-41 revisited: a large differential is not read through to map it; its "absent" as sure as the
-			// full's ranks, checked the same way); a rank that fails maps it by its headers. A compressed one's
-			// groups are read through its container's stream (the chain walked from known blocks, only the
-			// groups read decoded), so it is not decoded whole to be mapped.
-			mapped = BuildRankedPassMap(stream, data->data_offset, data->length, pass.map, nullptr, true);
-		}
-		if (!mapped && first_of_full) {
-			pass.search = SearchFor(family_stream, *data, bounds, options.trust_layout, pass.by_block);
-			mapped = true;
-		}
-		if (this_number == 0 && !options.full_backup && !single_family) {
-			// A striped differential's pass 1: searched, its extents the families' DCM set (StripedDcmBuilder,
-			// once every family is added); mapped by its headers when the set does not hold.
-			pass.search = SearchFor(family_stream, *data, bounds, options.trust_layout, pass.by_block);
-			mapped = true;
-		}
-		if (!mapped) {
-			pass.map = options.mapper ? options.mapper(stream, data->data_offset, data->length, this_number)
-									  : BuildPassMap(stream, data->data_offset, data->length, this_number);
-		}
-		pass.from_dcm = this_number == 0 && !options.full_backup && mapped && pass.map.Ranked();
-		pass.map.number = this_number;
-		pass.map.family = family;
-		passes.push_back(std::move(pass));
+		passes.push_back(IndexPass(family_stream, family, single_family, options, *data, this_number));
 	}
-	// A differential's pass 1 ranked from its DCM, checked where the database changed while the backup ran
-	// (a backup under load: its later passes copy again the extents written meanwhile, measured dozens on
-	// `load`; a quiet one only its allocation pages' extents): there its DCM / GAM copies may disagree with
-	// what pass 1 carries in ways the sampled ranks do not see (a changed extent and a freed one between two
-	// checks). When the checks fail, or would read as much as the pass, it is mapped by its headers.
-	for (auto &first : passes) {
-		if (first.family != family || !first.from_dcm) {
-			continue;
-		}
-		std::vector<const PassMap *> later;
-		for (const auto &pass : passes) {
-			if (pass.family == family && pass.number > first.number) {
-				later.push_back(&pass.map);
-			}
-		}
-		if (!CheckDifferentialRanks(stream, first.map, later)) {
-			first.map = options.mapper ? options.mapper(stream, first.data_offset, first.data_length, first.number)
-									   : BuildPassMap(stream, first.data_offset, first.data_length, first.number);
-			first.map.number = first.number;
-			first.map.family = family;
-			first.from_dcm = false;
-		}
-	}
+	RecheckDifferentialRanks(stream, family, options, passes);
 }
 
 PageIndex BuildPageIndex(const std::vector<FamilyStream> &families, const PageIndexOptions &options) {
