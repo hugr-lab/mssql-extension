@@ -166,6 +166,8 @@ set(EXTENSION_SOURCES
     src/codec/uuid_codec.cpp
     src/codec/variant/variant_envelope.cpp
     src/codec/variant/variant_codec.cpp
+    src/codec/clr/ssclrt_wkb.cpp
+    src/codec/clr/spatial_codec.cpp
     src/codec/clr/hierarchyid.cpp
     src/codec/clr/hierarchyid_codec.cpp
     src/codec/sql_vector/vector_bytes.cpp

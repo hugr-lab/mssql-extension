@@ -130,7 +130,7 @@ TARGETS="${TARGETS:-browser_response tds_tokens utf16 envchange_txn login_respon
 # whole space-separated words, so a stray separator or a typo would otherwise build fewer harnesses
 # than asked, green.
 TARGETS="$(printf '%s %s' "${TARGETS}" "${TARGETS_EXTRA:-}" | tr ',\n\r\t' '    ')"
-KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_page_ci variant_envelope vector hierarchyid "
+KNOWN_TARGETS=" browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode row_stager backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_page_ci variant_envelope vector hierarchyid ssclrt "
 for t in ${TARGETS}; do
 	if [[ "${KNOWN_TARGETS}" != *" ${t} "* ]]; then
 		echo "ERROR: unknown fuzz target '${t}' in TARGETS / TARGETS_EXTRA (known:${KNOWN_TARGETS})" >&2
@@ -189,13 +189,20 @@ if want variant_envelope; then
 	build_harness fuzz_variant_envelope fuzz_variant_envelope.cc ${VE_OBJS}
 fi
 
-# 5b''. A hierarchyid's bit string as its ToString() text (spec 093 T4, D5): one source, DuckDB-free.
+# 5b''. A geometry / geography value's MS-SSCLRT bytes as ISO WKB (spec 093 T5, D6): one source,
+#       DuckDB-free. Not a default target either; the weekly run fuzzes it through
+#       .clusterfuzzlite/extra_targets.
+if want ssclrt; then
+	SSCLRT_OBJS="$(compile_objs ssclrt "${REPO}/src/codec/clr/ssclrt_wkb.cpp")"
+	build_harness fuzz_ssclrt fuzz_ssclrt.cc ${SSCLRT_OBJS}
+fi
+# 5b'''. A hierarchyid's bit string as its ToString() text (spec 093 T4, D5): one source, DuckDB-free.
 #       Not a default target either; the weekly run fuzzes it through .clusterfuzzlite/extra_targets.
 if want hierarchyid; then
 	HID_OBJS="$(compile_objs hid "${REPO}/src/codec/clr/hierarchyid.cpp")"
 	build_harness fuzz_hierarchyid fuzz_hierarchyid.cc ${HID_OBJS}
 fi
-# 5b'''. A SQL Server vector(n) value (spec 093 T3): its bytes and its JSON text, standalone like
+# 5b''''. A SQL Server vector(n) value (spec 093 T3): its bytes and its JSON text, standalone like
 #       variant_envelope. The text parse is DuckDB's fast_float (namespace duckdb_fast_float), header-only:
 #       the submodule's when it is checked out, else that file fetched at the submodule's commit (the
 #       ClusterFuzzLite checkout has no submodules), as simdutf is fetched. Not a default target.
@@ -405,7 +412,7 @@ fi
 # --- seed corpora + dictionary (OSS-Fuzz packages these next to the binary) ---
 for t in browser_response tds_tokens utf16 envchange_txn login_response code_page bcp_encode \
 	backup_mtf backup_container backup_xpress backup_page backup_catalog backup_record backup_lob backup_cd backup_page_ci \
-	variant_envelope vector hierarchyid; do
+	variant_envelope vector hierarchyid ssclrt; do
 	# Only the corpora of the targets this build makes: OSS-Fuzz pairs a zip with its binary.
 	want "${t}" || continue
 	if [[ -d "${HERE}/corpus/${t}" ]]; then

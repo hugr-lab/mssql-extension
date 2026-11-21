@@ -349,6 +349,10 @@ ColumnReading TypeReading(const CatalogColumn &c) {
 	case XTYPE_XML:
 		return raw("xml (stored as binary XML) is converted to text later, with the TDS path's");
 	case XTYPE_CLR:
+		// TODO(spec 093 T8): geometry / geography through T5's kernel (codec/clr/ssclrt_wkb, shared with the
+		// TDS path), with geometry_as registered then -- an ATTACH option of TYPE mssql_backup and a
+		// mssql_backup_scan parameter -- so its default 'geometry' never names these bytes. Until then the
+		// stored bytes, what geometry_as 'native' reads on the TDS path.
 		return raw(type + " (its CLR serialization) is converted later, with the TDS path's");
 	default:
 		break;

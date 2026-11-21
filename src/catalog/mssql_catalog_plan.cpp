@@ -30,6 +30,24 @@
 
 namespace duckdb {
 
+//! Spec 093 T5: under geometry_as 'native' a geometry / geography column is read as its stored MS-SSCLRT
+//! bytes, and a value written into it would go as `STGeomFromWKB(<those bytes>, srid)`, which takes WKB and
+//! fails with an opaque 24xxx error. Refused by name at planning, nothing sent. An INSERT ... SELECT or an
+//! UPDATE pushed to the server whole copies the column on the server and never comes here.
+static void RefuseNativeSpatialWrite(const MSSQLCatalog &catalog, MSSQLTableEntry &table, const MSSQLColumnInfo &col,
+									 const char *verb) {
+	if (!col.IsSpatial() || catalog.GeometryAs() != tds::GeometryAs::Native) {
+		return;
+	}
+	throw NotImplementedException(
+		"MSSQL: %s of column '%s' of '%s.%s' (%s) is refused: the catalog is attached with geometry_as 'native', so "
+		"its values are the stored MS-SSCLRT bytes, which the write path does not send. Write it through a catalog "
+		"attached with geometry_as 'geometry' (or 'wkb'), or with mssql_exec (CAST(0x... AS %s) takes the stored "
+		"bytes); a native write comes with spec 093 T6",
+		verb, col.name, table.ParentSchema().name.GetIdentifierName(), table.name.GetIdentifierName(),
+		col.sql_type_name, col.sql_type_name);
+}
+
 //===----------------------------------------------------------------------===//
 // Write Operations (all throw - read-only catalog)
 //===----------------------------------------------------------------------===//
@@ -91,6 +109,10 @@ PhysicalOperator &MSSQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 		for (auto &pair : col_pairs) {
 			insert_col_indices.push_back(pair.second);
 		}
+	}
+
+	for (auto col_idx : insert_col_indices) {
+		RefuseNativeSpatialWrite(*this, table_entry, mssql_columns[col_idx], "INSERT");
 	}
 
 	// Build column metadata for insert target
@@ -469,6 +491,7 @@ static void PrepareReturning(ClientContext &context, MSSQLTableEntry &table_entr
 	}
 	target.convert_varchar_max = LoadConvertVarcharMax(context);
 	target.client_transcode = table_entry.ParentCatalog().Cast<MSSQLCatalog>().ClientTranscode();
+	target.geometry_as = table_entry.ParentCatalog().Cast<MSSQLCatalog>().GeometryAs();
 	const idx_t ncols = target.table_types.size();
 	if (ncols != target.table_columns.size()) {
 		throw InternalException("MSSQL RETURNING: %llu DuckDB columns, %llu SQL Server columns",
@@ -709,6 +732,11 @@ PhysicalOperator &MSSQLCatalog::PlanUpdate(ClientContext &context, PhysicalPlanG
 
 	// Get MSSQL column info
 	auto &mssql_columns = table_entry.GetMSSQLColumns();
+	for (idx_t i = 0; i < op.columns.size(); i++) {
+		if (op.columns[i].index < mssql_columns.size()) {
+			RefuseNativeSpatialWrite(*this, table_entry, mssql_columns[op.columns[i].index], "UPDATE");
+		}
+	}
 
 	// Rung 1-2: the rowid key (loaded with its metadata, spec 084 D5); rung 3,
 	// a table with none: keyed by every column through #stage (spec 080 D3).

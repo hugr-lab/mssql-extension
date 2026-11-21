@@ -66,12 +66,13 @@ public:
 	// a cast the server could do for us. `STGeomFromWKB` is the server-side
 	// reader for the form we have.
 	//
-	// The SRID is the part we cannot know: `.STAsBinary()`, which the read path
-	// uses, does not carry one, so a value that has made the round trip has
-	// already lost it. `geometry` takes 0, the planar "undefined" SRID.
-	// `geography` REFUSES 0 (error 24204) and is given 4326 / WGS 84, which is
-	// the only defensible default and is documented as an assumption rather
-	// than a fact about the data.
+	// The SRID is the part we cannot know: WKB, which the read path gives
+	// (decoded on the client since spec 093 T5), does not carry one, so a value
+	// that has made the round trip has already lost it (T6 takes it from the
+	// CRS). `geometry` takes 0, the planar "undefined" SRID. `geography`
+	// REFUSES 0 (error 24204) and is given 4326 / WGS 84, which is the only
+	// defensible default and is documented as an assumption rather than a fact
+	// about the data.
 	//
 	// @param literal   the rendered literal; "NULL" is returned untouched
 	// @param mssql_type the TARGET column's SQL Server type name

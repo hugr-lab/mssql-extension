@@ -272,7 +272,7 @@ static bool FlagIsSet(const string &value) {
 // bulk queries carry the table's shape between collation_name and is_identity).
 static MSSQLColumnInfo ColumnFromRow(const vector<string> &values, idx_t base, idx_t identity_idx, idx_t code_page_idx,
 									 const string &database_collation, int32_t database_code_page,
-									 MSSQLDatetime2Read datetime2_read) {
+									 MSSQLDatetime2Read datetime2_read, tds::GeometryAs geometry_as) {
 	int32_t col_id = 0;
 	try {
 		col_id = static_cast<int32_t>(std::stoi(values[base + 1]));
@@ -294,7 +294,7 @@ static MSSQLColumnInfo ColumnFromRow(const vector<string> &values, idx_t base, i
 	} catch (...) {
 	}
 	MSSQLColumnInfo col_info(values[base], col_id, values[base + 2], max_len, prec, scl, FlagIsSet(values[base + 6]),
-							 values[base + 7], database_collation, datetime2_read);
+							 values[base + 7], database_collation, datetime2_read, geometry_as);
 	// sys.columns.is_identity (spec 062 W4, issue #327): what the INSERT planner
 	// needs to keep an explicit identity value on the statement path.
 	col_info.is_identity = values.size() > identity_idx && FlagIsSet(values[identity_idx]);
@@ -507,9 +507,11 @@ static void RunMetadataQuerySets(optional_ptr<ClientContext> context, tds::TdsCo
 // Constructor
 //===----------------------------------------------------------------------===//
 
-MSSQLMetadataCache::MSSQLMetadataCache(int64_t ttl_seconds, MSSQLDatetime2Read datetime2_read)
+MSSQLMetadataCache::MSSQLMetadataCache(int64_t ttl_seconds, MSSQLDatetime2Read datetime2_read,
+									   tds::GeometryAs geometry_as)
 	: state_(MSSQLCacheState::EMPTY),
 	  datetime2_read_(datetime2_read),
+	  geometry_as_(geometry_as),
 	  ttl_seconds_(ttl_seconds),
 	  // Pre-ATTACH placeholder only: EnsureCacheLoaded / RefreshCache overwrite
 	  // this from the mssql_metadata_timeout setting on every catalog lookup.
@@ -658,8 +660,8 @@ bool MSSQLMetadataCache::GetTableMetadata(optional_ptr<ClientContext> context, t
 					// COLUMN_DISCOVERY_SQL_TEMPLATE: the eight column fields, then
 					// is_identity and code_page.
 					if (values.size() >= 8) {
-						table_meta.columns.push_back(
-							ColumnFromRow(values, 0, 8, 9, database_collation_, database_code_page_, datetime2_read_));
+						table_meta.columns.push_back(ColumnFromRow(values, 0, 8, 9, database_collation_,
+																   database_code_page_, datetime2_read_, geometry_as_));
 					}
 					return;
 				}
@@ -1071,8 +1073,8 @@ void MSSQLMetadataCache::LoadObjectsAndColumnsLocked(optional_ptr<ClientContext>
 				if (found == by_object_id.end()) {
 					return;
 				}
-				found->second->columns.push_back(
-					ColumnFromRow(values, 1, 9, 10, database_collation_, database_code_page_, datetime2_read_));
+				found->second->columns.push_back(ColumnFromRow(values, 1, 9, 10, database_collation_,
+															   database_code_page_, datetime2_read_, geometry_as_));
 				stage.column_count++;
 				return;
 			}

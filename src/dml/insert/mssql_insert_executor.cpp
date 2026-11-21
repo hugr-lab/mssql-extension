@@ -195,7 +195,8 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 	EnsureIdentityInsert();
 
 	auto start_time = std::chrono::steady_clock::now();
-	MSSQLReturningParser output(target_, returning_column_ids, mssql_catalog.ClientTranscode());
+	MSSQLReturningParser output(target_, returning_column_ids, mssql_catalog.ClientTranscode(),
+								mssql_catalog.GeometryAs());
 	mssql::DmlBatchOptions options;
 	options.label = "insert statement batch";
 	output.Attach(options);
@@ -224,7 +225,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 	const idx_t rows = output.GetRowCount();
 	unique_ptr<DataChunk> result;
 	try {
-		result = output.TakeResult();
+		result = output.TakeResult(context_, returning_warned_);
 	} catch (const std::exception &e) {
 		ThrowClientFault(batch, e, mssql_catalog);
 	}

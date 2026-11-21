@@ -1272,6 +1272,8 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 	bool preload_option = false;		  // Issue #324: preload the catalog at ATTACH
 	int64_t min_connections_option = -1;  // Issue #324: ATTACH-level mssql_min_connections (-1=unset)
 	string application_name_option;		  // Spec 047 (US-AN): ATTACH-level program_name override
+	// Spec 093 T5: the geometry_as ATTACH option, what this catalog's geometry / geography columns are read as.
+	tds::GeometryAs geometry_as = tds::GeometryAs::Geometry;
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto lower_name = StringUtil::Lower(it->first);
 		if (lower_name == "secret") {
@@ -1335,6 +1337,11 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 			// Validated with the connection's own value, before anything touches the network.
 			datetime2_7_as_option = it->second.ToString();
 			datetime2_7_as_specified = true;
+			it = options.options.erase(it);
+		} else if (lower_name == "geometry_as") {
+			// Spec 093 T5 (D6, DQ-45): what this catalog's geometry / geography columns are read as.
+			// An ATTACH option only, as the owner decided; refused by name before the network.
+			geometry_as = ParseGeometryAs(it->second.ToString(), "MSSQL ATTACH error: the ATTACH option geometry_as");
 			it = options.options.erase(it);
 		} else if (lower_name == "lazy_validation" || lower_name == "lazyvalidation") {
 			// Spec 047 (US2): suppress the eager TCP+LOGIN7 round trip below.
@@ -1683,6 +1690,7 @@ unique_ptr<Catalog> MSSQLAttach(optional_ptr<StorageExtensionInfo> storage_info,
 								   client_transcode.IsNull() || client_transcode.GetValue<bool>();
 	}
 	startup.datetime2_read = datetime2_read;  // decided above, before the network
+	startup.geometry_as = geometry_as;
 	Value dml_platform;
 	if (context.TryGetCurrentSetting("mssql_test_dml_platform", dml_platform) && !dml_platform.IsNull()) {
 		startup.dml_platform = StringUtil::Lower(dml_platform.ToString());
