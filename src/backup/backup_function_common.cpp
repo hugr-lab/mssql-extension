@@ -6,6 +6,8 @@
 #include "codec/code_page/code_page.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/logging/logger.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "tds/encoding/datetime_encoding.hpp"
 #include "utf8proc_wrapper.hpp"
 
@@ -58,6 +60,62 @@ vector<std::string> DiffPathsOf(const named_argument_map_t &named, const char *f
 void AddDiffParameter(TableFunction &function) {
 	// VARCHAR or LIST(VARCHAR), as the path: one file, a glob, or a differential's stripes.
 	function.GetSignature().AddKeywordOnly("diff", LogicalType::ANY, Value());
+}
+
+FuzzyMode FuzzyModeOf(ClientContext &context, const std::string &given, const char *function) {
+	std::string text = given;
+	if (text.empty()) {
+		Value value;
+		if (context.TryGetCurrentSetting("mssql_backup_fuzzy", value) && !value.IsNull()) {
+			text = value.ToString();
+		}
+	}
+	FuzzyMode mode = FuzzyMode::Warn;
+	if (!text.empty() && !ParseFuzzyMode(text, mode)) {
+		throw InvalidInputException("%s: fuzzy '%s' is not 'warn', 'error' or 'ignore'", function, text);
+	}
+	return mode;
+}
+
+void AddFuzzyParameter(TableFunction &function) {
+	function.GetSignature().AddKeywordOnly("fuzzy", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
+}
+
+std::string FuzzyParameterOf(const named_argument_map_t &named, const char *function) {
+	auto it = named.find("fuzzy");
+	if (it == named.end() || it->second.IsNull()) {
+		return std::string();
+	}
+	FuzzyMode mode;
+	const std::string text = it->second.ToString();
+	if (!ParseFuzzyMode(text, mode)) {
+		throw InvalidInputException("%s: fuzzy '%s' is not 'warn', 'error' or 'ignore'", function, text);
+	}
+	return text;
+}
+
+TableFuzziness CheckFuzzy(ClientContext &context, const FuzzySummary &tail, const PageStore &pages,
+						  const CatalogTable &table, FuzzyMode mode, const char *function) {
+	if (mode == FuzzyMode::Ignore) {
+		return TableFuzziness();
+	}
+	const TableFuzziness fuzzy = FuzzinessOf(tail, table, pages);
+	if (fuzzy.Consistent()) {
+		return fuzzy;
+	}
+	const std::string what = StringUtil::Format(
+		"%s.%s is %s in this backup: %u transaction(s) open at its LastLSN changed it (their changes may show), "
+		"%u finished transaction(s) changed pages after their copy (those changes are missing); its rows are "
+		"each page's as the backup copied it",
+		table.schema_name, table.name, fuzzy.Status(), fuzzy.open_transactions, fuzzy.stale_transactions);
+	if (mode == FuzzyMode::Error) {
+		throw InvalidInputException(
+			"%s: %s. Refused (fuzzy := 'error'); fuzzy := 'warn' reads it anyway, as SQL Server would before "
+			"recovery (spec 090 replays the tail)",
+			function, what);
+	}
+	DUCKDB_LOG_WARNING(context, "%s: %s (fuzzy := 'error' refuses it)", function, what);
+	return fuzzy;
 }
 
 Value RecordDatetimeValue(const std::string &record_form) {

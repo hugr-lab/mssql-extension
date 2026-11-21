@@ -84,6 +84,21 @@ public:
 	//! Build each row's `_mssql_lob` map (LastRowLobMap): every value of the row stored off row,
 	//! projected or not. Off: no map is built.
 	void MapOffRow(bool on);
+	//! A value stored off row on a page that became live while the backup ran (PendingPageError: its
+	//! content in the log tail only) is read as NULL when on, counted in PendingValues, the row read; off,
+	//! a PendingValueError is the caller's (fuzzy := 'error'). Review of #591: it failed the scan whatever the
+	//! policy. The row's `_mssql_lob` still maps the value's tree as stored (MapRow reads no leaf), so a
+	//! value whose leaf alone is on a Pending page is NULL beside a map that names its pages.
+	void PendingValuesAsNull(bool on) {
+		pending_as_null_ = on;
+	}
+	//! Values read as NULL so since the stager was made, and the first one's error.
+	idx_t PendingValues() const {
+		return pending_values_;
+	}
+	const std::string &FirstPending() const {
+		return first_pending_;
+	}
 	//! The map of the row Append staged last (backup_lob_map's bytes); empty when the row has no value
 	//! stored off row (the column is NULL) or MapOffRow is off.
 	const std::string &LastRowLobMap() const {
@@ -190,6 +205,9 @@ private:
 	void AppendDirect(size_t column, Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);
 	void AppendStream(size_t column, Column &c, codec::staging::ColumnStaging &st, const PreparedValue &p);
 	void MapRow(const RowRecord &row);
+	//! `walk` run; a PendingPageError from it, when PendingValuesAsNull is on, counted and answered false.
+	template <class WALK>
+	bool UnlessPending(WALK &&walk);
 	const LobPageFetch &Fetch(const std::string &what) const;
 
 	std::string table_;
@@ -236,6 +254,9 @@ private:
 	uint64_t extra_row_ = 0;
 	//! An Append threw after staging part of a row; cleared by BeginChunk.
 	bool spoiled_ = false;
+	bool pending_as_null_ = false;
+	idx_t pending_values_ = 0;
+	std::string first_pending_;
 	//! BeginChunk ran and FinalizeChunk has not: Append and FinalizeChunk need it.
 	bool begun_ = false;
 };

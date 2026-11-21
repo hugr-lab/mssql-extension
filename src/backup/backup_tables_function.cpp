@@ -4,10 +4,10 @@
 //
 // The catalog is opened at init (stages 1-4, OpenBackupCatalog), so DESCRIBE reads no file. Every
 // execution opens the files anew, and takes the headers, pages and base tables from the opened-file
-// cache when an earlier call on the same unchanged files put them there (D9, task 22). Columns
-// whose source is a later PR are NULL until it lands: fuzzy_status / open_transactions /
-// stale_transactions (D11, PR 5), allocation_units.live_pages (a unit's IAM chain is walked at its
-// table's first scan, DQ-40, not to list it). A column's DuckDB type is D6's:
+// cache when an earlier call on the same unchanged files put them there (D9, task 22). fuzzy_status /
+// open_transactions / stale_transactions are D11's (task 27, the backup's log tail read at the first
+// table row). allocation_units.live_pages is NULL: a unit's IAM chain is walked at its table's first
+// scan (DQ-40), not to list it. A column's DuckDB type is D6's:
 // MSSQLColumnInfo::MapSQLServerTypeToDuckDB, TYPE mssql's map with native types off (a plain VARCHAR
 // where mssql_catalog_native_types reports MSSQL_NVARCHAR(n)).
 
@@ -324,7 +324,7 @@ std::string CompressionOf(const CatalogTable &t) {
 	return compression;
 }
 
-std::vector<Value> TableRow(const CatalogTable &t) {
+std::vector<Value> TableRow(const CatalogTable &t, const FuzzySummary *tail, const PageStore &pages) {
 	const std::string compression = CompressionOf(t);
 	vector<Value> columns, units;
 	for (const auto &c : t.columns) {
@@ -345,9 +345,16 @@ std::vector<Value> TableRow(const CatalogTable &t) {
 	row.push_back(RecordDatetimeValue(t.modified));
 	row.push_back(Value::BOOLEAN(t.decodable));
 	row.push_back(OptionalText(t.reason));
-	row.push_back(Value(LogicalType::VARCHAR));	 // fuzzy_status: D11 (PR 5)
-	row.push_back(Value(LogicalType::INTEGER));	 // open_transactions
-	row.push_back(Value(LogicalType::INTEGER));	 // stale_transactions
+	if (tail) {
+		const TableFuzziness fuzzy = FuzzinessOf(*tail, t, pages);	// D11 (task 27)
+		row.push_back(Text(fuzzy.Status()));
+		row.push_back(Value::INTEGER(static_cast<int32_t>(fuzzy.open_transactions)));
+		row.push_back(Value::INTEGER(static_cast<int32_t>(fuzzy.stale_transactions)));
+	} else {
+		row.push_back(Value(LogicalType::VARCHAR));	 // the tail not read: TailOrWarn said why
+		row.push_back(Value(LogicalType::INTEGER));
+		row.push_back(Value(LogicalType::INTEGER));
+	}
 	row.push_back(Value::LIST(ColumnStructType(), std::move(columns)));
 	row.push_back(Value::LIST(UnitStructType(), std::move(units)));
 	row.push_back(PartitioningValue(t));
@@ -490,8 +497,10 @@ struct CatalogListBindData : public TableFunctionData {
 struct CatalogListState : public GlobalTableFunctionState {
 	std::unique_ptr<OpenedCatalog> catalog;
 	size_t next = 0;
-	size_t next_column = 0;		 // mssql_backup_columns: the next column of table `next`
-	uint64_t off_row_bytes = 0;	 // the views' off-row definitions read so far
+	size_t next_column = 0;				  // mssql_backup_columns: the next column of table `next`
+	uint64_t off_row_bytes = 0;			  // the views' off-row definitions read so far
+	const FuzzySummary *fuzzy = nullptr;  // the backup's (its OpenedBackup holds it); none when not read
+	bool fuzzy_read = false;
 };
 
 const char *FunctionName(Listing listing) {
@@ -710,7 +719,17 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 	return std::move(state);
 }
 
-void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+//! The backup's log tail (D11, stage 5), read at the first table row, inside the statement's binding; none
+//! when it cannot be read (TailOrWarn: the status columns NULL).
+const FuzzySummary *Fuzzy(ClientContext &context, const CatalogListBindData &data, CatalogListState &state) {
+	if (!state.fuzzy_read) {
+		state.fuzzy = TailOrWarn(context, state.catalog->opened, FunctionName(data.listing));
+		state.fuzzy_read = true;
+	}
+	return state.fuzzy;
+}
+
+void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	const auto &data = input.bind_data->Cast<CatalogListBindData>();
 	auto &state = input.global_state->Cast<CatalogListState>();
 	BindFiles bound(state.catalog->Binding());	// a view's off-row definition is read here
@@ -740,7 +759,8 @@ void Execute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	idx_t count = 0;
 	while (state.next < total && count < STANDARD_VECTOR_SIZE) {
 		const std::vector<Value> row =
-			data.listing == Listing::Tables ? TableRow(model.tables[state.next])
+			data.listing == Listing::Tables
+				? TableRow(model.tables[state.next], Fuzzy(context, data, state), *state.catalog->pages->store)
 			: data.listing == Listing::Views
 				? ViewRow(*state.catalog->pages->store, model, model.views[state.next], state.off_row_bytes)
 				: SchemaRow(model, model.schemas[state.next]);

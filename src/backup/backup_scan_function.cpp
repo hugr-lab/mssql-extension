@@ -130,6 +130,28 @@ void BindTable(ClientContext &context, ScanBindData &data, vector<Identifier> *n
 	if (!data.entry->decodable) {
 		throw InvalidInputException("%s: %s.%s is not read: %s", FUNCTION, data.schema, data.table, data.entry->reason);
 	}
+	// D11 (task 27): the table's status from the backup's log tail, acted on as fuzzy := says.
+	const FuzzyMode mode = FuzzyModeOf(context, data.fuzzy, FUNCTION);
+	if (mode != FuzzyMode::Ignore) {
+		BindFiles bound(data.catalog->Binding());
+		const FuzzySummary *tail = nullptr;
+		try {
+			tail = &StatementTail(context, data.catalog->opened);
+		} catch (FormatError &e) {
+			// The status unknown: refused when the call asks for a consistent table, else said and read.
+			if (mode == FuzzyMode::Error) {
+				throw InvalidInputException(
+					"%s: %s.%s: the backup's log tail is not read, so whether the table is consistent is unknown "
+					"(fuzzy := 'error'): %s",
+					FUNCTION, data.schema, data.table, e.what());
+			}
+			DUCKDB_LOG_WARNING(context, "%s: %s.%s: the backup's log tail is not read, its fuzzy status unknown: %s",
+							   FUNCTION, data.schema, data.table, e.what());
+		}
+		if (tail) {
+			CheckFuzzy(context, *tail, *data.catalog->pages->store, *data.entry, mode, FUNCTION);
+		}
+	}
 	ScanColumns columns = ScanColumnsOf(*data.entry);
 	data.column_ids = std::move(columns.column_ids);
 	data.types = std::move(columns.types);
@@ -157,6 +179,11 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 	}
 	data->schema = input.inputs[1].ToString();
 	data->table = input.inputs[2].ToString();
+	data->fuzzy = FuzzyParameterOf(input.named_parameters, FUNCTION);
+	if (data->fuzzy.empty() && data->paths.size() == 1) {
+		// Over an attached name, the ATTACH's fuzzy option before the setting, as its tables' scans take it.
+		data->fuzzy = AttachedFuzzy(context, data->paths.front());
+	}
 	for (const auto &kv : input.named_parameters) {
 		if (kv.first == "max_threads" && !kv.second.IsNull()) {
 			if (kv.second.GetValue<int64_t>() < 1) {
@@ -228,6 +255,7 @@ void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_dat
 	serializer.WritePropertyWithDefault<std::string>(109, "at_unit", data.at.unit);
 	serializer.WritePropertyWithDefault<Value>(110, "at_value", data.at.value, Value());
 	serializer.WritePropertyWithDefault<std::string>(111, "at_key", data.at.key);
+	serializer.WritePropertyWithDefault<std::string>(112, "fuzzy", data.fuzzy);
 }
 
 unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunction &) {
@@ -244,6 +272,7 @@ unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, BoundTableFunct
 	data->at.unit = deserializer.ReadPropertyWithDefault<std::string>(109, "at_unit");
 	data->at.value = deserializer.ReadPropertyWithExplicitDefault<Value>(110, "at_value", Value());
 	data->at.key = deserializer.ReadPropertyWithDefault<std::string>(111, "at_key");
+	data->fuzzy = deserializer.ReadPropertyWithDefault<std::string>(112, "fuzzy");
 	BindTable(deserializer.Get<ClientContext &>(), *data, nullptr);
 	// The plan's column positions and vectors are those it was bound with: a file at the same path that
 	// reads otherwise now (a nightly backup replaced: a column added, dropped, renamed or retyped) is
@@ -318,6 +347,10 @@ struct ScanGlobalState : public GlobalTableFunctionState {
 
 	//! For the progress bar: rows staged by every task, and the catalog's count (-1 unknown).
 	std::atomic<uint64_t> rows_read{0};
+	//! A page taken into use while the backup ran met by any task: said once per scan.
+	mutable std::atomic<bool> pending_warned{false};
+	//! A value stored off row on a Pending page, read as NULL, said once a scan too (its own WARNING).
+	mutable std::atomic<bool> pending_values_warned{false};
 	int64_t row_count = -1;
 
 	idx_t MaxThreads() const override {
@@ -331,6 +364,7 @@ struct ScanLocalState : public LocalTableFunctionState {
 	const RowsetLayout *layout = nullptr;  // the stager's (UseLayout), to switch only between partitions
 	LobPageFetch off_row_fetch;			   // the stager's pages for values stored off row (live ones only)
 
+	std::atomic<bool> *pending_warned = nullptr;	// the scan's: a Pending page said once (ScanGlobalState)
 	std::shared_ptr<const PartitionCursor> cursor;	// of the unit being read
 	idx_t batch = 0;								// the unit's batch index
 	bool have_unit = false;
@@ -339,6 +373,9 @@ struct ScanLocalState : public LocalTableFunctionState {
 	Page page;
 	bool have_page = false;
 	uint16_t next_slot = 0;
+	//! The stager's PendingValues as of its last appended row: a row prepared and then left for the next
+	//! chunk (no reservation) is not one the WARNING may name (review of #591).
+	idx_t pending_appended = 0;
 	CdRecord cd_record;	 // a ROW-compressed rowset's record and its values (spec 086 PR 1), reused
 	CdRow cd_row;
 	PageCompression page_ci;		// a PAGE page's compression information (spec 086 PR 2); not present on a ROW page
@@ -532,11 +569,35 @@ unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionI
 	return std::move(state);
 }
 
+//! A zero copy beside one data pass (2017): a PendingPageError when the backup's tail formats the page
+//! (taken into use while the backup ran), else the FormatError it is, saying why. In-row and off-row
+//! pages alike.
+[[noreturn]] void ThrowPendingOrFormat(ClientContext &context, const ScanBindData &data, const ZeroCopyError &e) {
+	const FuzzySummary *tail = nullptr;
+	std::string why;
+	try {
+		tail = &StatementTail(context, data.catalog->opened);
+	} catch (FormatError &t) {
+		why = std::string("; the backup's log tail is not read: ") + t.what();
+	}
+	if (!tail || !FormattedInTail(*tail, e.page.file, e.page.page)) {
+		throw FormatError(std::string(e.what()) +
+						  (tail ? "; the backup's log tail formats no such page (" +
+									  std::to_string(tail->formatted.size()) + " pages formatted in it)"
+								: why));
+	}
+	throw PendingPageError("backup: page " + e.page.ToString() +
+						   " became live while the backup ran: its content is in the backup's log tail only (a fuzzy "
+						   "backup), which is not replayed yet (a zero copy in a backup of one data pass, the page "
+						   "formatted in its tail)");
+}
+
 unique_ptr<LocalTableFunctionState> InitLocal(ExecutionContext &execution, TableFunctionInitInput &input,
 											  GlobalTableFunctionState *global_state) {
 	const auto &data = input.bind_data->Cast<ScanBindData>();
 	const auto &global = global_state->Cast<ScanGlobalState>();
 	auto local = make_uniq<ScanLocalState>();
+	local->pending_warned = &global.pending_warned;
 	local->stager = make_uniq<RecordStager>(*data.entry, global.staged);
 	local->stager->LimitBytes(global.chunk_allowance, global.virtual_row);
 	const PageStore &store = *data.catalog->pages->store;
@@ -545,13 +606,21 @@ unique_ptr<LocalTableFunctionState> InitLocal(ExecutionContext &execution, Table
 	// them, read between two of the scan's own checks (NextPage's, per in-row page; review of S3).
 	ClientContext *context = &execution.client;
 	auto fetched = std::make_shared<uint32_t>(0);
-	local->off_row_fetch = [&store, fragment, context, fetched](const PagePointer &at, Page &out) {
+	const ScanBindData *bound = &data;
+	local->off_row_fetch = [&store, fragment, context, fetched, bound](const PagePointer &at, Page &out) {
 		if ((++*fetched & 255) == 0 && context->IsInterrupted()) {
 			throw InterruptException();
 		}
-		store.ReadLive(at.file, at.page, out, fragment.c_str());
+		try {
+			store.ReadLive(at.file, at.page, out, fragment.c_str());
+		} catch (ZeroCopyError &e) {
+			ThrowPendingOrFormat(*context, *bound, e);
+		}
 	};
 	local->stager->MapOffRow(global.lob_output != DConstants::INVALID_INDEX);
+	// A value stored off row on a Pending page, as the policy treats an in-row one: NULL under 'warn'
+	// (said once a table and scan) and 'ignore', the scan refused under 'error' (review of #591).
+	local->stager->PendingValuesAsNull(FuzzyModeOf(execution.client, data.fuzzy, FUNCTION) != FuzzyMode::Error);
 	return std::move(local);
 }
 
@@ -736,7 +805,34 @@ bool NextPage(ClientContext &context, const ScanBindData &data, ScanLocalState &
 			throw InterruptException();
 		}
 		const PagePointer at = (*local.cursor->pages)[local.next_page++];
-		if (!ReadUnitDataPage(store, *local.cursor->unit, at, data.schema + "." + data.table, local.page)) {
+		try {
+			try {
+				if (!ReadUnitDataPage(store, *local.cursor->unit, at, data.schema + "." + data.table, local.page)) {
+					continue;
+				}
+			} catch (ZeroCopyError &e) {
+				ThrowPendingOrFormat(context, data, e);
+			}
+		} catch (PendingPageError &e) {
+			// A page that became live while the backup ran: its rows are in the log tail only (spec 090
+			// replays it). Until then the table's other pages are read as of the copy, as every fuzzy table
+			// is -- what was committed when the backup began is in them -- and the page is named: refused
+			// under fuzzy := 'error', said under 'warn', passed over under 'ignore'.
+			const FuzzyMode mode = FuzzyModeOf(context, data.fuzzy, FUNCTION);
+			if (mode == FuzzyMode::Error) {
+				throw InvalidInputException(
+					"%s: %s.%s: %s (fuzzy := 'error'; under 'warn' the table's other pages "
+					"are read)",
+					FUNCTION, data.schema, data.table, e.what());
+			}
+			// One WARNING per table and scan, as for the table's status (review of #591): the first page met.
+			if (mode == FuzzyMode::Warn && local.pending_warned && !local.pending_warned->exchange(true)) {
+				DUCKDB_LOG_WARNING(context,
+								   "%s: %s.%s: %s; its rows are not read, the table's other pages are (a fuzzy "
+								   "backup: spec 090 replays the tail; any further such page of the table is "
+								   "passed over without another WARNING)",
+								   FUNCTION, data.schema, data.table, e.what());
+			}
 			continue;
 		}
 		const uint16_t slots = local.page.header.slot_count;
@@ -960,6 +1056,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 				}
 			}
 			local.stager->Append(row);
+			local.pending_appended = local.stager->PendingValues();
 			if (global.page_output != DConstants::INVALID_INDEX) {
 				local.page_keys.push_back(PageKey(local.page.header.page_id));
 			}
@@ -975,6 +1072,15 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		}
 		const idx_t count = local.stager->Count();
 		global.rows_read += count;
+		if (local.pending_appended > 0 && !global.pending_values_warned.load() &&
+			FuzzyModeOf(context, data.fuzzy, FUNCTION) == FuzzyMode::Warn &&
+			!global.pending_values_warned.exchange(true)) {
+			DUCKDB_LOG_WARNING(context,
+							   "%s: %s.%s: a value stored off row is read as NULL, its row read: %s (a fuzzy backup: "
+							   "spec 090 replays the tail; further such values of the table are NULL without another "
+							   "WARNING; fuzzy := 'error' refuses the table)",
+							   FUNCTION, data.schema, data.table, local.stager->FirstPending().c_str());
+		}
 		local.stager->FinalizeChunk();
 		WriteVirtual(global, local, output, count);
 		for (idx_t c : global.empty_outputs) {
@@ -982,6 +1088,11 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 			ConstantVector::SetNull(output.data[c], true);
 		}
 		output.SetChildCardinality(count);
+	} catch (PendingValueError &e) {
+		// A value stored off row on a Pending page under fuzzy := 'error' (the stager reads it as NULL
+		// otherwise). Any other Pending page met here (an IAM page) is the FormatError below.
+		throw InvalidInputException("%s: %s.%s: %s (fuzzy := 'error'; under 'warn' the value is read as NULL)",
+									FUNCTION, data.schema, data.table, e.what());
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", FUNCTION, e.what());
 	} catch (ReservationInterrupted &) {
@@ -1015,6 +1126,7 @@ TableFunction MakeScanFunction(const LogicalType &path) {
 	// NULL (the default): DuckDB's memory_limit. A size as memory_limit takes it ('2GB').
 	f.GetSignature().AddKeywordOnly("max_memory", LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
 	AddDiffParameter(f);
+	AddFuzzyParameter(f);
 	AddVersionParameters(f);
 	f.projection_pushdown = true;
 	f.get_partition_data = PartitionData;
@@ -1080,7 +1192,7 @@ virtual_column_map_t ScanVirtualColumns(const std::vector<UnreadColumn> &unread)
 
 TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &entry,
 								   std::shared_ptr<const AttachedBackup> attached, const std::string &key,
-								   const std::string &schema, const std::string &table,
+								   const std::string &schema, const std::string &table, const std::string &fuzzy,
 								   unique_ptr<FunctionData> &bind_data) {
 	auto data = make_uniq<ScanBindData>();
 	data->paths = {attached->name};
@@ -1089,6 +1201,7 @@ TableFunction AttachedScanFunction(ClientContext &context, TableCatalogEntry &en
 	data->schema = schema;
 	data->table = table;
 	data->table_entry = &entry;
+	data->fuzzy = fuzzy;
 	data->attached = std::move(attached);
 	BindTable(context, *data, nullptr);
 	bind_data = std::move(data);

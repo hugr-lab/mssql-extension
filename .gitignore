@@ -44,11 +44,12 @@ Thumbs.db
 *.log
 *.bak
 # The committed backup samples (spec 085 task 10): synthetic, made on a clean instance by
-# test/data/backup/generate.sh (switch_in/ and lob_changes/ too, databases of their own). No other .bak is ever
-# committed (spec 085 T4).
+# test/data/backup/generate.sh (switch_in/, lob_changes/ and open_tail/ too, databases of their own). No other .bak
+# is ever committed (spec 085 T4).
 !test/data/backup/*.bak
 !test/data/backup/switch_in/*.bak
 !test/data/backup/lob_changes/*.bak
+!test/data/backup/open_tail/*.bak
 
 # Environment
 .env

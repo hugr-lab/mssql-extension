@@ -20,5 +20,7 @@ OUT="${HERE}" VERSION="${VERSION}" FIXTURES=samples "${HERE}/../../backup/gen/ge
 # A database of its own, in a directory of its own (the samples' history globs *.bak, one database):
 # a partition switched in from another table (spec 085 PR 4c-3, review of #580).
 OUT="${HERE}/switch_in" VERSION="${VERSION}" FIXTURES=switch_in "${HERE}/../../backup/gen/generate.sh"
+# One transaction held open across a full and a differential (spec 085 PR 5: D11's status, the log functions).
+OUT="${HERE}/open_tail" VERSION="${VERSION}" FIXTURES=open_tail "${HERE}/../../backup/gen/generate.sh"
 # Values stored off row changed every way, then a shrink (spec 085 PR 4c-3, the LOB tail).
 OUT="${HERE}/lob_changes" VERSION="${VERSION}" FIXTURES=lob_changes exec "${HERE}/../../backup/gen/generate.sh"

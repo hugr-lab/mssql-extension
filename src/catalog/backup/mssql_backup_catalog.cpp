@@ -77,6 +77,8 @@ MSSQLBackupCatalog::MSSQLBackupCatalog(AttachedDatabase &db, std::string name,
 		{"tables", "mssql_backup_tables", versioned},
 		{"views", "mssql_backup_views", versioned},
 		{"columns", "mssql_backup_columns", versioned},
+		{"transactions", "mssql_backup_transactions", versioned},
+		{"transaction_records", "mssql_backup_transaction_records", versioned},
 		{"schema_changes", "mssql_backup_schema_changes", {"start_version", "end_version"}},
 		{"table_changes",
 		 "mssql_backup_table_changes",
@@ -606,7 +608,8 @@ TableFunction MSSQLBackupTableEntry::GetScanFunction(ClientContext &context, uni
 	const auto &backup = schema.Cast<MSSQLBackupSchemaEntry>().Backup();
 	// The version by its key: a plan run or deserialized after a refresh reads this one.
 	return mssql::backup::AttachedScanFunction(context, *this, backup, MSSQLBackupCatalog::StateKey(*backup),
-											   schema_name_, table_name_, bind_data);
+											   schema_name_, table_name_,
+											   ParentCatalog().Cast<MSSQLBackupCatalog>().Fuzzy(), bind_data);
 }
 
 TableStorageInfo MSSQLBackupTableEntry::GetStorageInfo(ClientContext &) {
@@ -666,6 +669,14 @@ std::shared_ptr<const AttachedBackup> mssql::backup::FindAttachedBackup(ClientCo
 	return catalog.Cast<MSSQLBackupCatalog>().BackupAt(context, at);
 }
 
+std::string mssql::backup::AttachedFuzzy(ClientContext &context, const std::string &name) {
+	auto db = DatabaseManager::Get(context).GetDatabase(Identifier(name));
+	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {
+		return std::string();
+	}
+	return db->GetCatalog().Cast<MSSQLBackupCatalog>().Fuzzy();
+}
+
 void mssql::backup::PinAttachedVersion(ClientContext &context, const std::string &name, BackupAt &at) {
 	auto db = DatabaseManager::Get(context).GetDatabase(Identifier(name));
 	if (!db || db->GetCatalog().GetCatalogType() != MSSQLBackupCatalog::TYPE) {
@@ -686,6 +697,7 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 	auto filter = std::make_shared<MSSQLCatalogFilter>();
 	auto exclude = std::make_shared<MSSQLCatalogFilter>();
 	std::vector<std::string> diff;
+	std::string fuzzy;	// D11 (task 27): "" = the setting
 	bool history_mode = false;
 	mssql::backup::BackupAt default_at;
 	for (auto it = options.options.begin(); it != options.options.end();) {
@@ -708,6 +720,19 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 			if (!it->second.IsNull()) {
 				default_at.unit = key == "snapshot_version" ? "version" : "timestamp";
 				default_at.value = it->second;
+			}
+			it = options.options.erase(it);
+			continue;
+		}
+		if (key == "fuzzy") {
+			// D11 (task 27): what the tables' scans do with one that is not consistent.
+			if (!it->second.IsNull()) {
+				fuzzy = it->second.ToString();
+				mssql::backup::FuzzyMode mode;
+				if (!mssql::backup::ParseFuzzyMode(fuzzy, mode)) {
+					throw InvalidInputException(
+						"ATTACH %s (TYPE mssql_backup): fuzzy '%s' is not 'warn', 'error' or 'ignore'", name, fuzzy);
+				}
 			}
 			it = options.options.erase(it);
 			continue;
@@ -748,7 +773,7 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 		throw InvalidInputException(
 			"ATTACH %s (TYPE mssql_backup): '%s' is not an option of an attached backup "
 			"(schema_filter, table_filter, schema_exclude, table_exclude, diff, history, snapshot_version, "
-			"snapshot_time)",
+			"snapshot_time, fuzzy)",
 			name, option.first);
 	}
 	// Always read-only (D1): DuckDB's own check refuses every write before the catalog sees it.
@@ -847,8 +872,10 @@ static unique_ptr<Catalog> MSSQLBackupAttach(optional_ptr<StorageExtensionInfo>,
 				}
 			};
 		}
-		return make_uniq<MSSQLBackupCatalog>(db, catalog_name, std::move(history), default_at, default_version,
-											 std::move(attached), std::move(opener), std::move(reader));
+		auto catalog = make_uniq<MSSQLBackupCatalog>(db, catalog_name, std::move(history), default_at, default_version,
+													 std::move(attached), std::move(opener), std::move(reader));
+		catalog->SetFuzzy(fuzzy);
+		return std::move(catalog);
 	} catch (mssql::backup::FormatError &e) {
 		throw InvalidInputException("ATTACH %s (TYPE mssql_backup): %s", name, e.what());
 	}

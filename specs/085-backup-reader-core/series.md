@@ -96,6 +96,12 @@ then columnstore (required, owner); then the long tail of types; then the export
 With one developer, interleave: 085, 089 PR 1, 086 PR 1–2, 090, 087, 088, 086 PR 3–6, 089 PR 2: 090
 before 088 (R§10.4; DQ-03, accepted). With two, the tracks run side by side.
 
+**Revised by the owner, 2026-11-19: coverage first, the import last.** The DuckLake import (089, then 090)
+is built once the reader covers everything a backup holds, so it is not reworked for each format: 085
+(PR 5 last) → 086 PR 2–4 (PAGE, sparse, `xml`) → 087 (encryption, TDE) → 088 (columnstore), spec 093's
+types beside them → 089 → 090. The dependencies above still hold (088 needs 086 PR 1's CD integers, merged;
+090 needs 089).
+
 Each PR merges before the next opens (no stacked PRs).
 
 ## Phase map: R§8 against this series

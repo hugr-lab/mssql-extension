@@ -44,6 +44,35 @@ PageHeader ReadPageHeader(const uint8_t *page) {
 	return h;
 }
 
+//! What a copy that is not a page holds, and the backup's data passes, for its refusal: a zero unit beside
+//! one pass is not taken as a page that became live while the backup ran (IsPendingCopy), and a version
+//! that copies such a page in another form is told apart only by this.
+static std::string DescribeCopy(const PageIndex &index, const Page &copy) {
+	std::string passes;
+	for (size_t i = 0; i < index.PassCount(); i++) {
+		passes += (passes.empty() ? "" : ", ") + std::to_string(index.Pass(i).number);
+	}
+	std::string out = "the backup's data passes: " + (passes.empty() ? std::string("none") : passes) + "; ";
+	size_t nonzero = 0, first = copy.bytes.size();
+	for (size_t i = 0; i < copy.bytes.size(); i++) {
+		if (copy.bytes[i]) {
+			nonzero++;
+			first = std::min(first, i);
+		}
+	}
+	if (nonzero == 0) {
+		return out + "the copy all zeros";
+	}
+	static const char *HEX = "0123456789abcdef";
+	std::string bytes;
+	for (size_t i = first; i < copy.bytes.size() && i < first + 32; i++) {
+		bytes += HEX[copy.bytes[i] >> 4];
+		bytes += HEX[copy.bytes[i] & 0xF];
+	}
+	return out + std::to_string(nonzero) + " non-zero bytes in the copy, from offset " + std::to_string(first) + ": " +
+		   bytes;
+}
+
 PageStore::PageStore(const PageIndex &index, const AllocationMap &allocation)
 	: index_(index), allocation_(allocation) {}
 
@@ -100,8 +129,17 @@ PageState PageStore::Fetch(uint16_t file, uint32_t page, Page &out) const {
 		return PageState::Pending;
 	}
 	if (out.header.version != PAGE_HEADER_VERSION) {
-		throw FormatError("backup: page " + want.ToString() + " is live, and its copy is not a page (header version " +
-						  std::to_string(out.header.version) + ")");
+		const std::string message = "backup: page " + want.ToString() +
+									" is live, and its copy is not a page (header version " +
+									std::to_string(out.header.version) + "; " + DescribeCopy(index_, out) + ")";
+		// All zeros, or a page caught being formatted that names itself (2017's 1:44592: version 0, its own
+		// id, an LSN and a flag set). A unit with bytes in it that names another page is a misplaced copy, a
+		// locator's fault: refused, never taken for Pending (as IsPendingCopy draws it; review of #591).
+		const bool zero = std::all_of(out.bytes.begin(), out.bytes.end(), [](uint8_t b) { return b == 0; });
+		if (out.header.version == 0 && (zero || out.header.page_id == want)) {
+			throw ZeroCopyError(message, want);
+		}
+		throw FormatError(message);
 	}
 	if (out.header.type == PAGE_TYPE_PAD) {
 		// A pad is never read further (spec 085 § Rules, page index), whatever page it names.
