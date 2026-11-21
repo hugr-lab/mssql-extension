@@ -526,6 +526,277 @@ void ReadPageCompression(const uint8_t *page, size_t page_size, size_t slot_arra
 	}
 }
 
+void CdRow::Store(const Staging &s, size_t bytes) {
+	at_[s.k] = s.start;
+	values_[s.k].size = static_cast<uint32_t>(bytes);
+}
+
+//! A PAGE value put together in rebuilt_, which the next column reuses, is kept in the row's buffer
+//! instead; anything else is pointed at where it already lies.
+void CdRow::StoreAsIs(const Staging &s) {
+	if (s.rebuilt) {
+		buffer_.insert(buffer_.end(), s.p, s.p + s.size);
+		Store(s, s.size);
+	} else {
+		values_[s.k].data = s.p;
+		values_[s.k].size = static_cast<uint32_t>(s.size);
+	}
+}
+
+void CdRow::StoreInteger(const Staging &s, size_t width) {
+	if (s.size > width) {
+		throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes for a " +
+						  std::to_string(width) + "-byte integer");
+	}
+	PutLE(buffer_, static_cast<uint64_t>(CdInteger(s.p, s.size)), width);
+	Store(s, width);
+}
+
+void CdRow::StorePadded(const Staging &s, uint8_t pad, size_t width) {
+	if (s.size > width) {
+		throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes, past its " +
+						  std::to_string(width));
+	}
+	buffer_.insert(buffer_.end(), s.p, s.p + s.size);
+	buffer_.insert(buffer_.end(), width - s.size, pad);
+	Store(s, width);
+}
+
+//! The integer, bit, vardecimal and IEEE families, each put in the uncompressed record's form.
+bool CdRow::StageNumeric(const Staging &s) {
+	switch (s.c.xtype) {
+	case XTYPE_TINYINT:
+		if (s.size > 1) {
+			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes for a tinyint");
+		}
+		buffer_.push_back(s.size ? s.p[0] : 0);	 // as it is, unflipped (E22)
+		Store(s, 1);
+		return true;
+	case XTYPE_SMALLINT:
+		StoreInteger(s, 2);
+		return true;
+	case XTYPE_INT:
+	case XTYPE_SMALLMONEY:
+		StoreInteger(s, 4);
+		return true;
+	case XTYPE_BIGINT:
+	case XTYPE_MONEY:
+		StoreInteger(s, 8);
+		return true;
+	case XTYPE_BIT:
+		if (s.cd.code != CD_EMPTY && s.cd.code != CD_BIT_ONE) {
+			throw FormatError("backup: " + s.What() + ", a bit, holds CD code " + std::to_string(s.cd.code));
+		}
+		if (s.c.bit_position > 7) {
+			throw FormatError("backup: " + s.What() + " has bit position " + std::to_string(s.c.bit_position));
+		}
+		buffer_.push_back(s.cd.code == CD_BIT_ONE ? static_cast<uint8_t>(1u << s.c.bit_position) : 0);
+		Store(s, 1);
+		return true;
+	case XTYPE_DECIMAL:
+	case XTYPE_NUMERIC:
+		DecodeVardecimal(s.p, s.size, s.c.precision, s.c.scale, buffer_, s.layout.table, s.c.name);
+		Store(s, buffer_.size() - s.start);
+		return true;
+	case XTYPE_REAL:
+	case XTYPE_FLOAT: {
+		// The IEEE value's little-endian bytes without their low-order zero bytes (E22).
+		const size_t width = s.c.xtype == XTYPE_REAL ? 4 : 8;
+		if (s.size > width) {
+			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes for a " +
+							  std::to_string(width) + "-byte float");
+		}
+		buffer_.insert(buffer_.end(), width - s.size, 0);
+		buffer_.insert(buffer_.end(), s.p, s.p + s.size);
+		Store(s, width);
+		return true;
+	}
+	default:
+		return false;  // another family's
+	}
+}
+
+//! datetime, smalldatetime, and the fixed-width date / time / guid types.
+bool CdRow::StageTemporal(const Staging &s) {
+	switch (s.c.xtype) {
+	case XTYPE_DATETIME: {
+		if (s.size > 8) {
+			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes for a datetime");
+		}
+		const uint64_t whole = static_cast<uint64_t>(CdInteger(s.p, s.size));  // days << 32 | ticks
+		PutLE(buffer_, whole & 0xFFFFFFFFu, 4);	 // the uncompressed form: ticks, then days
+		PutLE(buffer_, whole >> 32, 4);
+		Store(s, 8);
+		return true;
+	}
+	case XTYPE_SMALLDATETIME:
+		if (s.size == 2) {
+			buffer_.push_back(0);  // minutes 0: the day count alone (E22)
+			buffer_.push_back(0);
+			buffer_.insert(buffer_.end(), s.p, s.p + 2);
+			Store(s, 4);
+		} else if (s.size == 0 || s.size == 4) {
+			StorePadded(s, 0, 4);
+		} else {
+			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) +
+							  " bytes for a smalldatetime");
+		}
+		return true;
+	case XTYPE_DATE:
+	case XTYPE_TIME:
+	case XTYPE_DATETIME2:
+	case XTYPE_DATETIMEOFFSET:
+	case XTYPE_UNIQUEIDENTIFIER: {
+		const size_t width = s.c.FixedLength(s.layout.table);
+		if (s.size == width) {
+			StoreAsIs(s);
+		} else if (s.size == 0) {
+			StorePadded(s, 0, width);
+		} else {
+			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes, its type " +
+							  std::to_string(width));
+		}
+		return true;
+	}
+	default:
+		return false;  // another family's
+	}
+}
+
+//! char / binary (padded or as stored), rowversion, nchar / nvarchar (SCSU), and everything
+//! else -- varchar, varbinary, the MAX and LOB types -- as stored.
+void CdRow::StageBytes(const Staging &s) {
+	switch (s.c.xtype) {
+	case XTYPE_CHAR:
+	case XTYPE_BINARY:
+		if (s.c.unpadded) {
+			if (s.size > s.c.length) {
+				throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes, past its " +
+								  std::to_string(s.c.length));
+			}
+			StoreAsIs(s);  // nullable, under ANSI_PADDING OFF: stored and read as given (E22)
+		} else {
+			StorePadded(s, s.c.xtype == XTYPE_CHAR ? 0x20 : 0, s.c.length);
+		}
+		return;
+	case XTYPE_TIMESTAMP:
+		// Its 8 bytes big-endian, the leading zero bytes left out (E22: 0x7D1 -> 07 d1).
+		if (s.size > 8) {
+			throw FormatError("backup: " + s.What() + " holds " + std::to_string(s.size) + " bytes for a rowversion");
+		}
+		buffer_.insert(buffer_.end(), 8 - s.size, 0);
+		buffer_.insert(buffer_.end(), s.p, s.p + s.size);
+		Store(s, 8);
+		return;
+	case XTYPE_NCHAR:
+	case XTYPE_NVARCHAR: {
+		DecodeCompressedUnicode(s.p, s.size, buffer_, s.layout.table, s.c.name);
+		const size_t decoded = buffer_.size() - s.start;
+		if (s.c.xtype == XTYPE_NCHAR) {
+			if (decoded > s.c.length) {
+				throw FormatError("backup: " + s.What() + " holds " + std::to_string(decoded / 2) +
+								  " characters, past its " + std::to_string(s.c.length / 2));
+			}
+			for (size_t b = decoded; b < s.c.length; b += 2) {
+				buffer_.push_back(0x20);  // nchar's trailing spaces were left out
+				buffer_.push_back(0x00);
+			}
+		}
+		Store(s, buffer_.size() - s.start);
+		return;
+	}
+	default:
+		// varchar, varbinary, the MAX and LOB types, and the types read as their stored bytes: as stored.
+		StoreAsIs(s);
+		return;
+	}
+}
+
+//! `s`'s value staged into `buffer_` for column `s.k`: located only when the scan does not read
+//! it, else put in the form the uncompressed record holds it (E22).
+void CdRow::StageValue(const Staging &s, const std::vector<bool> *needed) {
+	if (needed && (s.k >= needed->size() || !(*needed)[s.k])) {
+		StoreAsIs(s);  // located only: not read by this scan
+		return;
+	}
+	if (s.cd.code == CD_BIT_ONE && s.c.xtype != XTYPE_BIT) {
+		throw FormatError("backup: " + s.What() + " holds CD code 11 (bit 1) and is not a bit");
+	}
+	if (s.c.Uniquifier()) {
+		if (s.size == 0) {
+			values_[s.k].size = 0;	// absent: 0, as the uncompressed record's empty uniquifier
+			values_[s.k].data = s.p;
+		} else {
+			StoreInteger(s, 4);
+		}
+		return;
+	}
+	if (StageNumeric(s)) {
+		return;
+	}
+	if (StageTemporal(s)) {
+		return;
+	}
+	StageBytes(s);
+}
+
+//! A value's bytes under PAGE compression (E23): a symbol is its dictionary entry; an anchored
+//! column's value is its prefix of the anchor's value and its suffix; EMPTY there, the anchor's
+//! value whole. `p` / `size` / `rebuilt` are moved on to what the value actually is.
+void CdRow::RebuildFromPage(const PageCompression &page, const CdValue &cd, size_t index, const RowsetLayout &layout,
+							const PhysicalColumn &c, const uint8_t *&p, size_t &size, bool &rebuilt) {
+	auto what = [&]() { return layout.table + "." + c.name; };
+	// PAGE compression (E23): a symbol is its dictionary entry; an anchored column's value (an entry
+	// too) is its prefix of the anchor's value and its suffix; EMPTY there, the anchor's value whole.
+	const CdValue *anchor =
+		page.has_anchor && index < page.anchor.column_count && page.anchor.values[index].code != CD_NULL
+			? &page.anchor.values[index]
+			: nullptr;
+	if (anchor && (anchor->complex || anchor->code == CD_SYMBOL)) {
+		throw FormatError("backup: " + what() + " has an anchor value the reader does not know (code " +
+						  std::to_string(anchor->code) + ")");
+	}
+	const uint8_t *anchor_data = anchor ? page.anchor.data + anchor->offset : nullptr;
+	const size_t anchor_size = anchor ? (anchor->code == CD_EMPTY ? 0 : anchor->size) : 0;
+	bool prefixed = anchor && cd.code != CD_EMPTY && cd.code != CD_BIT_ONE;
+	if (cd.code == CD_SYMBOL) {
+		const size_t symbol = p[0];
+		if (symbol >= page.dictionary.size()) {
+			throw FormatError("backup: " + what() + " holds dictionary symbol " + std::to_string(symbol) +
+							  " of a page dictionary of " + std::to_string(page.dictionary.size()));
+		}
+		p = page.page + page.dictionary[symbol].first;
+		size = page.dictionary[symbol].second;
+	} else if (cd.code == CD_EMPTY && anchor) {
+		p = anchor_data;
+		size = anchor_size;
+		rebuilt = true;	 // the anchor's value: stored, not empty
+	}
+	if (prefixed) {
+		if (size == 0) {
+			throw FormatError("backup: " + what() + " holds no prefix length beside its anchor");
+		}
+		size_t prefix = p[0];
+		size_t skip = 1;
+		if (prefix & 0x80) {
+			if (size < 2) {
+				throw FormatError("backup: " + what() + " holds a two-byte prefix length of one byte");
+			}
+			prefix = ((prefix & 0x7F) << 8) | p[1];
+			skip = 2;
+		}
+		if (prefix > anchor_size) {
+			throw FormatError("backup: " + what() + " holds a prefix of " + std::to_string(prefix) +
+							  " bytes of an anchor value of " + std::to_string(anchor_size));
+		}
+		rebuilt_.assign(anchor_data, anchor_data + prefix);
+		rebuilt_.insert(rebuilt_.end(), p + skip, p + size);
+		p = rebuilt_.data();
+		size = rebuilt_.size();
+		rebuilt = true;
+	}
+}
+
 void CdRow::Read(const CdRecord &record, const RowsetLayout &layout, const std::vector<bool> *needed,
 				 const PageCompression *page) {
 	const size_t n = layout.columns.size();
@@ -565,55 +836,7 @@ void CdRow::Read(const CdRecord &record, const RowsetLayout &layout, const std::
 		size_t size = (cd.code == CD_EMPTY || cd.code == CD_BIT_ONE) ? 0 : cd.size;
 		bool rebuilt = false;
 		if (page && page->present && !cd.complex) {
-			// PAGE compression (E23): a symbol is its dictionary entry; an anchored column's value (an entry
-			// too) is its prefix of the anchor's value and its suffix; EMPTY there, the anchor's value whole.
-			const CdValue *anchor =
-				page->has_anchor && index < page->anchor.column_count && page->anchor.values[index].code != CD_NULL
-					? &page->anchor.values[index]
-					: nullptr;
-			if (anchor && (anchor->complex || anchor->code == CD_SYMBOL)) {
-				throw FormatError("backup: " + what() + " has an anchor value the reader does not know (code " +
-								  std::to_string(anchor->code) + ")");
-			}
-			const uint8_t *anchor_data = anchor ? page->anchor.data + anchor->offset : nullptr;
-			const size_t anchor_size = anchor ? (anchor->code == CD_EMPTY ? 0 : anchor->size) : 0;
-			bool prefixed = anchor && cd.code != CD_EMPTY && cd.code != CD_BIT_ONE;
-			if (cd.code == CD_SYMBOL) {
-				const size_t symbol = p[0];
-				if (symbol >= page->dictionary.size()) {
-					throw FormatError("backup: " + what() + " holds dictionary symbol " + std::to_string(symbol) +
-									  " of a page dictionary of " + std::to_string(page->dictionary.size()));
-				}
-				p = page->page + page->dictionary[symbol].first;
-				size = page->dictionary[symbol].second;
-			} else if (cd.code == CD_EMPTY && anchor) {
-				p = anchor_data;
-				size = anchor_size;
-				rebuilt = true;	 // the anchor's value: stored, not empty
-			}
-			if (prefixed) {
-				if (size == 0) {
-					throw FormatError("backup: " + what() + " holds no prefix length beside its anchor");
-				}
-				size_t prefix = p[0];
-				size_t skip = 1;
-				if (prefix & 0x80) {
-					if (size < 2) {
-						throw FormatError("backup: " + what() + " holds a two-byte prefix length of one byte");
-					}
-					prefix = ((prefix & 0x7F) << 8) | p[1];
-					skip = 2;
-				}
-				if (prefix > anchor_size) {
-					throw FormatError("backup: " + what() + " holds a prefix of " + std::to_string(prefix) +
-									  " bytes of an anchor value of " + std::to_string(anchor_size));
-				}
-				rebuilt_.assign(anchor_data, anchor_data + prefix);
-				rebuilt_.insert(rebuilt_.end(), p + skip, p + size);
-				p = rebuilt_.data();
-				size = rebuilt_.size();
-				rebuilt = true;
-			}
+			RebuildFromPage(*page, cd, index, layout, c, p, size, rebuilt);
 		} else if (cd.code == CD_SYMBOL) {
 			throw FormatError("backup: " + what() + " holds a page-dictionary symbol outside PAGE compression");
 		}
@@ -624,184 +847,8 @@ void CdRow::Read(const CdRecord &record, const RowsetLayout &layout, const std::
 			continue;
 		}
 		v.state = ValueState::Inline;
-		const size_t start = buffer_.size();
-		auto stored = [&](size_t bytes) {
-			at_[k] = start;
-			v.size = static_cast<uint32_t>(bytes);
-		};
-		// A PAGE value put together here lives in rebuilt_, which the next column reuses: kept in the row's
-		// buffer instead.
-		auto as_is = [&]() {
-			if (rebuilt) {
-				buffer_.insert(buffer_.end(), p, p + size);
-				stored(size);
-			} else {
-				v.data = p;
-				v.size = static_cast<uint32_t>(size);
-			}
-		};
-		if (needed && (k >= needed->size() || !(*needed)[k])) {
-			as_is();  // located only: not read by this scan
-			continue;
-		}
-		if (cd.code == CD_BIT_ONE && c.xtype != XTYPE_BIT) {
-			throw FormatError("backup: " + what() + " holds CD code 11 (bit 1) and is not a bit");
-		}
-		auto integer = [&](size_t width) {
-			if (size > width) {
-				throw FormatError("backup: " + what() + " holds " + std::to_string(size) + " bytes for a " +
-								  std::to_string(width) + "-byte integer");
-			}
-			PutLE(buffer_, static_cast<uint64_t>(CdInteger(p, size)), width);
-			stored(width);
-		};
-		auto padded = [&](uint8_t pad, size_t width) {
-			if (size > width) {
-				throw FormatError("backup: " + what() + " holds " + std::to_string(size) + " bytes, past its " +
-								  std::to_string(width));
-			}
-			buffer_.insert(buffer_.end(), p, p + size);
-			buffer_.insert(buffer_.end(), width - size, pad);
-			stored(width);
-		};
-		if (c.Uniquifier()) {
-			if (size == 0) {
-				v.size = 0;	 // absent: 0, as the uncompressed record's empty uniquifier
-				v.data = p;
-			} else {
-				integer(4);
-			}
-			continue;
-		}
-		switch (c.xtype) {
-		case XTYPE_TINYINT:
-			if (size > 1) {
-				throw FormatError("backup: " + what() + " holds " + std::to_string(size) + " bytes for a tinyint");
-			}
-			buffer_.push_back(size ? p[0] : 0);	 // as it is, unflipped (E22)
-			stored(1);
-			break;
-		case XTYPE_SMALLINT:
-			integer(2);
-			break;
-		case XTYPE_INT:
-		case XTYPE_SMALLMONEY:
-			integer(4);
-			break;
-		case XTYPE_BIGINT:
-		case XTYPE_MONEY:
-			integer(8);
-			break;
-		case XTYPE_BIT:
-			if (cd.code != CD_EMPTY && cd.code != CD_BIT_ONE) {
-				throw FormatError("backup: " + what() + ", a bit, holds CD code " + std::to_string(cd.code));
-			}
-			if (c.bit_position > 7) {
-				throw FormatError("backup: " + what() + " has bit position " + std::to_string(c.bit_position));
-			}
-			buffer_.push_back(cd.code == CD_BIT_ONE ? static_cast<uint8_t>(1u << c.bit_position) : 0);
-			stored(1);
-			break;
-		case XTYPE_DECIMAL:
-		case XTYPE_NUMERIC:
-			DecodeVardecimal(p, size, c.precision, c.scale, buffer_, layout.table, c.name);
-			stored(buffer_.size() - start);
-			break;
-		case XTYPE_REAL:
-		case XTYPE_FLOAT: {
-			// The IEEE value's little-endian bytes without their low-order zero bytes (E22).
-			const size_t width = c.xtype == XTYPE_REAL ? 4 : 8;
-			if (size > width) {
-				throw FormatError("backup: " + what() + " holds " + std::to_string(size) + " bytes for a " +
-								  std::to_string(width) + "-byte float");
-			}
-			buffer_.insert(buffer_.end(), width - size, 0);
-			buffer_.insert(buffer_.end(), p, p + size);
-			stored(width);
-			break;
-		}
-		case XTYPE_DATETIME: {
-			if (size > 8) {
-				throw FormatError("backup: " + what() + " holds " + std::to_string(size) + " bytes for a datetime");
-			}
-			const uint64_t whole = static_cast<uint64_t>(CdInteger(p, size));  // days << 32 | ticks
-			PutLE(buffer_, whole & 0xFFFFFFFFu, 4);	 // the uncompressed form: ticks, then days
-			PutLE(buffer_, whole >> 32, 4);
-			stored(8);
-			break;
-		}
-		case XTYPE_SMALLDATETIME:
-			if (size == 2) {
-				buffer_.push_back(0);  // minutes 0: the day count alone (E22)
-				buffer_.push_back(0);
-				buffer_.insert(buffer_.end(), p, p + 2);
-				stored(4);
-			} else if (size == 0 || size == 4) {
-				padded(0, 4);
-			} else {
-				throw FormatError("backup: " + what() + " holds " + std::to_string(size) +
-								  " bytes for a smalldatetime");
-			}
-			break;
-		case XTYPE_DATE:
-		case XTYPE_TIME:
-		case XTYPE_DATETIME2:
-		case XTYPE_DATETIMEOFFSET:
-		case XTYPE_UNIQUEIDENTIFIER: {
-			const size_t width = c.FixedLength(layout.table);
-			if (size == width) {
-				as_is();
-			} else if (size == 0) {
-				padded(0, width);
-			} else {
-				throw FormatError("backup: " + what() + " holds " + std::to_string(size) + " bytes, its type " +
-								  std::to_string(width));
-			}
-			break;
-		}
-		case XTYPE_CHAR:
-		case XTYPE_BINARY:
-			if (c.unpadded) {
-				if (size > c.length) {
-					throw FormatError("backup: " + what() + " holds " + std::to_string(size) + " bytes, past its " +
-									  std::to_string(c.length));
-				}
-				as_is();  // nullable, under ANSI_PADDING OFF: stored and read as given (E22)
-			} else {
-				padded(c.xtype == XTYPE_CHAR ? 0x20 : 0, c.length);
-			}
-			break;
-		case XTYPE_TIMESTAMP:
-			// Its 8 bytes big-endian, the leading zero bytes left out (E22: 0x7D1 -> 07 d1).
-			if (size > 8) {
-				throw FormatError("backup: " + what() + " holds " + std::to_string(size) + " bytes for a rowversion");
-			}
-			buffer_.insert(buffer_.end(), 8 - size, 0);
-			buffer_.insert(buffer_.end(), p, p + size);
-			stored(8);
-			break;
-		case XTYPE_NCHAR:
-		case XTYPE_NVARCHAR: {
-			DecodeCompressedUnicode(p, size, buffer_, layout.table, c.name);
-			const size_t decoded = buffer_.size() - start;
-			if (c.xtype == XTYPE_NCHAR) {
-				if (decoded > c.length) {
-					throw FormatError("backup: " + what() + " holds " + std::to_string(decoded / 2) +
-									  " characters, past its " + std::to_string(c.length / 2));
-				}
-				for (size_t b = decoded; b < c.length; b += 2) {
-					buffer_.push_back(0x20);  // nchar's trailing spaces were left out
-					buffer_.push_back(0x00);
-				}
-			}
-			stored(buffer_.size() - start);
-			break;
-		}
-		default:
-			// varchar, varbinary, the MAX and LOB types, and the types read as their stored bytes: as stored.
-			as_is();
-			break;
-		}
+		const Staging s = {layout, c, cd, k, buffer_.size(), p, size, rebuilt};
+		StageValue(s, needed);
 	}
 	for (size_t k = 0; k < n; k++) {
 		if (at_[k] != SIZE_MAX) {
