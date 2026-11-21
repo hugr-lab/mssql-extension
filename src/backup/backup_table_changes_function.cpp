@@ -393,6 +393,245 @@ unique_ptr<LocalTableFunctionState> TableChangesInitLocal(ExecutionContext &exec
 	return std::move(local);
 }
 
+//! The rows of a chunk's items read from one state's pages: the page an item names (kept while the items
+//! stay on it, its compression information with it) and the item's record in either form. `row` points
+//! into this reader (its CD row or its record view), so the reader outlives every use of it.
+struct ChangeRowReader {
+	ChangeRowReader(const ChangeSide &side, const PartitionCursor &cursor, const RowsetLayout &layout,
+					std::vector<bool> needed_p)
+		: side(side),
+		  cursor(cursor),
+		  layout(layout),
+		  store(*side.data.catalog->pages->store),
+		  name(side.data.schema + "." + side.data.table),
+		  needed(std::move(needed_p)) {}
+
+	//! `item`'s row into `row`, and where it is (or was before it was forwarded) into `at`.
+	void Read(const ChangeItem &item, RowRecord &row, RowLocation &at) {
+		if (!have || !(page.header.page_id == item.page)) {
+			ReadPage(item);
+		}
+		at.page = page.header.page_id;
+		at.slot = item.slot;
+		if (layout.compression == 1 || layout.compression == 2) {
+			ReadCompressed(item, row, at);
+			return;
+		}
+		fixed = ReadSlot(page.bytes.data(), PAGE_SIZE, page.header.slot_count, item.slot, side.data.table.c_str());
+		if (fixed.Type() == RECORD_FORWARDED) {
+			at = ForwardedFrom(fixed, layout.table);
+		}
+		row = RowRecord::Fixed(fixed, RowVarCount(fixed, layout.table));
+	}
+
+	const ChangeSide &side;
+	const PartitionCursor &cursor;
+	const RowsetLayout &layout;
+	const PageStore &store;
+	const std::string name;
+
+private:
+	void ReadPage(const ChangeItem &item) {
+		if (!ReadUnitDataPage(store, *cursor.unit, item.page, name, page)) {
+			throw FormatError("backup: page " + item.page.ToString() + " of " + name +
+							  " is no longer a data page of the table on its second read");
+		}
+		have = true;
+		page_ci.present = false;
+		if (layout.compression == 2 && (page.header.type_flags & 0x80)) {
+			ReadPageCompression(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * page.header.slot_count,
+								side.data.table.c_str(), page_ci);
+		}
+	}
+
+	void ReadCompressed(const ChangeItem &item, RowRecord &row, RowLocation &at) {
+		const size_t pos = PAGE_SIZE - 2 - 2 * static_cast<size_t>(item.slot);
+		const uint16_t offset = static_cast<uint16_t>(page.bytes[pos] | (page.bytes[pos + 1] << 8));
+		if (page_ci.present && offset < page_ci.end) {
+			throw FormatError("backup: page " + item.page.ToString() + " has a record at offset " +
+							  std::to_string(offset) + " inside its compression information (to " +
+							  std::to_string(page_ci.end) + ")");
+		}
+		ReadCdRecord(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * page.header.slot_count, offset,
+					 side.data.table.c_str(), cd);
+		if (cd.kind == CdRecord::Kind::Forwarded) {
+			cd.BackPointer(at.page.page, at.page.file, at.slot);
+		}
+		cd_row.Read(cd, layout, &needed, layout.compression == 2 ? &page_ci : nullptr);
+		row = RowRecord::Compressed(cd, cd_row);
+	}
+
+	Page page;
+	bool have = false;
+	std::vector<bool> needed;
+	CdRecord cd;
+	CdRow cd_row;
+	PageCompression page_ci;  // the current page's, a PAGE rowset's (spec 086 PR 2)
+	RecordView fixed;
+};
+
+//! The columns a compressed row's values are read for: the stager's, and the row's key.
+std::vector<bool> NeededForChanges(const RecordStager &stager, const PartitionCursor &cursor) {
+	std::vector<bool> needed;
+	stager.MarkNeeded(needed);
+	for (size_t k : cursor.key) {
+		needed[k] = true;
+	}
+	if (cursor.has_uniquifier) {
+		needed[cursor.uniquifier] = true;
+	}
+	return needed;
+}
+
+//! Where the chunk starting at the queue's position ends: items of one state and one partition (one
+//! layout), STANDARD_VECTOR_SIZE at most.
+size_t ChunkEnd(const TableChangesLocal &local) {
+	const size_t begin = local.pos;
+	size_t end = begin;
+	while (end < local.queue.size() && end - begin < STANDARD_VECTOR_SIZE &&
+		   local.queue[end].old_side == local.queue[begin].old_side &&
+		   local.queue[end].partition == local.queue[begin].partition) {
+		end++;
+	}
+	return end;
+}
+
+//! The vectors the chunk's values are staged into: the output's for the newer state, the local chunk
+//! of the older state's own types for the older.
+std::vector<Vector *> ChangeTargets(const TableChangesBindData &data, TableChangesLocal &local, DataChunk &output,
+									bool old_side) {
+	std::vector<Vector *> targets;
+	if (old_side) {
+		local.old_values.Reset();
+		for (idx_t c = 0; c < local.old_values.ColumnCount(); c++) {
+			targets.push_back(&local.old_values.data[c]);
+		}
+	} else {
+		for (idx_t c = 0; c < data.columns.types.size(); c++) {
+			targets.push_back(&output.data[1 + c]);
+		}
+	}
+	return targets;
+}
+
+//! A row's values stored off row (`need`) reserved before it is staged (D17): a refusal with rows staged
+//! closes the chunk before this row (false); with none, the chunk's reservation is taken again with it.
+//! Refused, the row is named by its place, what it holds off row, and what was asked.
+bool ReserveChangeRow(const TableChangesBindData &data, CallReservations &held, RecordStager &stager,
+					  const OffRowNeed &need, const ChangeItem &item, uint64_t chunk_bytes) {
+	auto refused = [&](uint64_t bytes, const ReservationRefused &e) {
+		return OutOfMemoryException(
+			"%s: staging the row of %s.%s on page %s slot %u, whose values stored "
+			"off row (%s) take %s of the %s reserved: %s",
+			data.function, data.schema, data.table, item.page.ToString(), static_cast<unsigned>(item.slot),
+			stager.DescribePrepared(), StringUtil::BytesToHumanReadableString(need.Total()),
+			StringUtil::BytesToHumanReadableString(bytes), e.what());
+	};
+	bool fits = need.Total() == 0;
+	if (!fits) {
+		try {
+			fits = held.TryAcquire(need.Total(), need.Ours());
+		} catch (ReservationRefused &e) {
+			throw refused(need.Total(), e);
+		}
+	}
+	if (fits) {
+		return true;
+	}
+	if (stager.Count() > 0) {
+		return false;
+	}
+	held.ReleaseAll();
+	try {
+		held.Acquire(chunk_bytes + need.Total(), chunk_bytes + need.Ours());
+	} catch (ReservationRefused &e) {
+		throw refused(chunk_bytes + need.Total(), e);
+	}
+	return true;
+}
+
+//! The older state's values on the newer state's columns: by column id, cast to the newer types; a
+//! column the older state has not is NULL.
+void CastOldValues(ClientContext &context, const TableChangesBindData &data, TableChangesLocal &local,
+				   DataChunk &output, idx_t count) {
+	std::vector<bool> filled(data.columns.types.size(), false);
+	for (idx_t c = 0; c < data.old_outputs.size(); c++) {
+		Vector &target = output.data[1 + data.old_outputs[c]];
+		// An older value the newer type cannot take (the column's type changed) is NULL, said once a
+		// chunk; DuckDB's cast, not the server's ALTER COLUMN.
+		std::string error;
+		if (!VectorOperations::TryCast(context, local.old_values.data[c], target, count, &error)) {
+			DUCKDB_LOG_WARNING(context, "%s: %s.%s: an older value of %s is NULL in the newer type: %s", data.function,
+							   data.schema, data.table, data.columns.names[data.old_outputs[c]], error);
+		}
+		filled[data.old_outputs[c]] = true;
+	}
+	for (idx_t c = 0; c < filled.size(); c++) {
+		if (!filled[c]) {
+			output.data[1 + c].SetVectorType(VectorType::CONSTANT_VECTOR);
+			ConstantVector::SetNull(output.data[1 + c], true);
+		}
+	}
+}
+
+//! The chunk's change kinds (column 0) and _mssql_rid values (the last column).
+void WriteKindsAndRids(const TableChangesBindData &data, DataChunk &output, const std::vector<ChangeKind> &kinds,
+					   const std::vector<std::string> &rids, idx_t count) {
+	Vector &kind_vector = output.data[0];
+	Vector &rid_vector = output.data[1 + data.columns.types.size()];
+	auto *kind_out = FlatVector::GetDataMutable<string_t>(kind_vector);
+	auto *rid_out = FlatVector::GetDataMutable<string_t>(rid_vector);
+	for (idx_t i = 0; i < count; i++) {
+		kind_out[i] = StringVector::AddString(kind_vector, ChangeName(kinds[i]));
+		rid_out[i] = StringVector::AddStringOrBlob(rid_vector, rids[i]);
+	}
+}
+
+//! One chunk of the queue's items staged into `output`.
+void StageChanges(ClientContext &context, const TableChangesBindData &data, TableChangesState &global,
+				  TableChangesLocal &local, DataChunk &output) {
+	const size_t begin = local.pos;
+	const size_t end = ChunkEnd(local);
+	const ChangeItem &first = local.queue[begin];
+	const bool old_side = first.old_side;
+	// The chunk's staging reserved for this call only (D17, as the scan's Execute).
+	const uint64_t chunk_bytes = global.chunk_bytes[old_side ? 1 : 0];
+	CallReservations held(*global.gate, [&context]() { return context.IsInterrupted(); });
+	held.Acquire(chunk_bytes, chunk_bytes);
+	const ChangeSide &side = old_side ? *global.old_side : *global.new_side;
+	const PartitionCursor &cursor = side.cursors[first.partition];
+	RecordStager &stager = old_side ? *local.old_stager : *local.new_stager;
+	const RowsetLayout &layout = side.data.entry->Layout(*cursor.partition);
+	stager.UseLayout(layout);
+	stager.UseOffRow(old_side ? &local.old_fetch : &local.new_fetch, cursor.off_row);
+	stager.BeginChunk(ChangeTargets(data, local, output, old_side));
+	ChangeRowReader reader(side, cursor, layout, NeededForChanges(stager, cursor));
+	std::vector<std::string> rids;
+	std::vector<ChangeKind> kinds;
+	size_t i = begin;
+	for (; i < end && !stager.Full(); i++) {
+		const ChangeItem &item = local.queue[i];
+		RowLocation at;
+		RowRecord row;
+		reader.Read(item, row, at);
+		const OffRowNeed need = stager.PrepareRow(row);
+		if (!ReserveChangeRow(data, held, stager, need, item, chunk_bytes)) {
+			break;
+		}
+		stager.Append(row);
+		rids.push_back(RowId(side.data, cursor, row, at));
+		kinds.push_back(item.kind);
+	}
+	local.pos = i;
+	const idx_t count = stager.Count();
+	stager.FinalizeChunk();
+	if (old_side) {
+		CastOldValues(context, data, local, output, count);
+	}
+	WriteKindsAndRids(data, output, kinds, rids, count);
+	output.SetChildCardinality(count);
+}
+
 void TableChangesExecute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	const auto &data = input.bind_data->Cast<TableChangesBindData>();
 	auto &global = input.global_state->Cast<TableChangesState>();
@@ -404,172 +643,11 @@ void TableChangesExecute(ClientContext &context, TableFunctionInput &input, Data
 	try {
 		BindFiles bound_new(data.states.new_catalog->Binding());
 		BindFiles bound_old(data.states.old_catalog->Binding());
-		// A chunk's items: of one state and one partition (one layout), STANDARD_VECTOR_SIZE at most.
 		if (!NextChanges(context, data, global, local)) {
 			output.SetChildCardinality(0);
 			return;
 		}
-		const size_t begin = local.pos;
-		size_t end = begin;
-		while (end < local.queue.size() && end - begin < STANDARD_VECTOR_SIZE &&
-			   local.queue[end].old_side == local.queue[begin].old_side &&
-			   local.queue[end].partition == local.queue[begin].partition) {
-			end++;
-		}
-		const ChangeItem &first = local.queue[begin];
-		const bool old_side = first.old_side;
-		// The chunk's staging reserved for this call only (D17, as the scan's Execute).
-		const uint64_t chunk_bytes = global.chunk_bytes[old_side ? 1 : 0];
-		CallReservations held(*global.gate, [&context]() { return context.IsInterrupted(); });
-		held.Acquire(chunk_bytes, chunk_bytes);
-		const ChangeSide &side = old_side ? *global.old_side : *global.new_side;
-		const PartitionCursor &cursor = side.cursors[first.partition];
-		RecordStager &stager = old_side ? *local.old_stager : *local.new_stager;
-		const RowsetLayout &layout = side.data.entry->Layout(*cursor.partition);
-		stager.UseLayout(layout);
-		stager.UseOffRow(old_side ? &local.old_fetch : &local.new_fetch, cursor.off_row);
-		std::vector<Vector *> targets;
-		if (old_side) {
-			local.old_values.Reset();
-			for (idx_t c = 0; c < local.old_values.ColumnCount(); c++) {
-				targets.push_back(&local.old_values.data[c]);
-			}
-		} else {
-			for (idx_t c = 0; c < data.columns.types.size(); c++) {
-				targets.push_back(&output.data[1 + c]);
-			}
-		}
-		stager.BeginChunk(targets);
-		const PageStore &store = *side.data.catalog->pages->store;
-		const std::string name = side.data.schema + "." + side.data.table;
-		Page page;
-		bool have = false;
-		std::vector<bool> needed;
-		stager.MarkNeeded(needed);
-		for (size_t k : cursor.key) {
-			needed[k] = true;
-		}
-		if (cursor.has_uniquifier) {
-			needed[cursor.uniquifier] = true;
-		}
-		CdRecord cd;
-		CdRow cd_row;
-		PageCompression page_ci;  // the current page's, a PAGE rowset's (spec 086 PR 2)
-		std::vector<std::string> rids;
-		std::vector<ChangeKind> kinds;
-		size_t i = begin;
-		for (; i < end && !stager.Full(); i++) {
-			const ChangeItem &item = local.queue[i];
-			if (!have || !(page.header.page_id == item.page)) {
-				if (!ReadUnitDataPage(store, *cursor.unit, item.page, name, page)) {
-					throw FormatError("backup: page " + item.page.ToString() + " of " + name +
-									  " is no longer a data page of the table on its second read");
-				}
-				have = true;
-				page_ci.present = false;
-				if (layout.compression == 2 && (page.header.type_flags & 0x80)) {
-					ReadPageCompression(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * page.header.slot_count,
-										side.data.table.c_str(), page_ci);
-				}
-			}
-			RowLocation at;
-			at.page = page.header.page_id;
-			at.slot = item.slot;
-			RowRecord row;
-			RecordView fixed;
-			if (layout.compression == 1 || layout.compression == 2) {
-				const size_t pos = PAGE_SIZE - 2 - 2 * static_cast<size_t>(item.slot);
-				const uint16_t offset = static_cast<uint16_t>(page.bytes[pos] | (page.bytes[pos + 1] << 8));
-				if (page_ci.present && offset < page_ci.end) {
-					throw FormatError("backup: page " + item.page.ToString() + " has a record at offset " +
-									  std::to_string(offset) + " inside its compression information (to " +
-									  std::to_string(page_ci.end) + ")");
-				}
-				ReadCdRecord(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * page.header.slot_count, offset,
-							 side.data.table.c_str(), cd);
-				if (cd.kind == CdRecord::Kind::Forwarded) {
-					cd.BackPointer(at.page.page, at.page.file, at.slot);
-				}
-				cd_row.Read(cd, layout, &needed, layout.compression == 2 ? &page_ci : nullptr);
-				row = RowRecord::Compressed(cd, cd_row);
-			} else {
-				fixed =
-					ReadSlot(page.bytes.data(), PAGE_SIZE, page.header.slot_count, item.slot, side.data.table.c_str());
-				if (fixed.Type() == RECORD_FORWARDED) {
-					at = ForwardedFrom(fixed, layout.table);
-				}
-				row = RowRecord::Fixed(fixed, RowVarCount(fixed, layout.table));
-			}
-			// A row's values stored off row reserved before it is staged (D17): a refusal with rows staged
-			// closes the chunk before this row; with none, the chunk's reservation is taken again with it.
-			const OffRowNeed need = stager.PrepareRow(row);
-			// Named when refused: the row by its place, what it holds off row, what was asked.
-			auto refused = [&](uint64_t bytes, const ReservationRefused &e) {
-				return OutOfMemoryException(
-					"%s: staging the row of %s.%s on page %s slot %u, whose values stored "
-					"off row (%s) take %s of the %s reserved: %s",
-					data.function, data.schema, data.table, item.page.ToString(), static_cast<unsigned>(item.slot),
-					stager.DescribePrepared(), StringUtil::BytesToHumanReadableString(need.Total()),
-					StringUtil::BytesToHumanReadableString(bytes), e.what());
-			};
-			bool fits = need.Total() == 0;
-			if (!fits) {
-				try {
-					fits = held.TryAcquire(need.Total(), need.Ours());
-				} catch (ReservationRefused &e) {
-					throw refused(need.Total(), e);
-				}
-			}
-			if (!fits) {
-				if (stager.Count() > 0) {
-					break;
-				}
-				held.ReleaseAll();
-				try {
-					held.Acquire(chunk_bytes + need.Total(), chunk_bytes + need.Ours());
-				} catch (ReservationRefused &e) {
-					throw refused(chunk_bytes + need.Total(), e);
-				}
-			}
-			stager.Append(row);
-			rids.push_back(RowId(side.data, cursor, row, at));
-			kinds.push_back(item.kind);
-		}
-		local.pos = i;
-		const idx_t count = stager.Count();
-		stager.FinalizeChunk();
-		if (old_side) {
-			// The older state's values on the newer state's columns: by column id, cast to the newer types;
-			// a column the older state has not is NULL.
-			std::vector<bool> filled(data.columns.types.size(), false);
-			for (idx_t c = 0; c < data.old_outputs.size(); c++) {
-				Vector &target = output.data[1 + data.old_outputs[c]];
-				// An older value the newer type cannot take (the column's type changed) is NULL, said once a
-				// chunk; DuckDB's cast, not the server's ALTER COLUMN.
-				std::string error;
-				if (!VectorOperations::TryCast(context, local.old_values.data[c], target, count, &error)) {
-					DUCKDB_LOG_WARNING(context, "%s: %s.%s: an older value of %s is NULL in the newer type: %s",
-									   data.function, data.schema, data.table, data.columns.names[data.old_outputs[c]],
-									   error);
-				}
-				filled[data.old_outputs[c]] = true;
-			}
-			for (idx_t c = 0; c < filled.size(); c++) {
-				if (!filled[c]) {
-					output.data[1 + c].SetVectorType(VectorType::CONSTANT_VECTOR);
-					ConstantVector::SetNull(output.data[1 + c], true);
-				}
-			}
-		}
-		Vector &kind_vector = output.data[0];
-		Vector &rid_vector = output.data[1 + data.columns.types.size()];
-		auto *kind_out = FlatVector::GetDataMutable<string_t>(kind_vector);
-		auto *rid_out = FlatVector::GetDataMutable<string_t>(rid_vector);
-		for (idx_t i = 0; i < count; i++) {
-			kind_out[i] = StringVector::AddString(kind_vector, ChangeName(kinds[i]));
-			rid_out[i] = StringVector::AddStringOrBlob(rid_vector, rids[i]);
-		}
-		output.SetChildCardinality(count);
+		StageChanges(context, data, global, local, output);
 	} catch (FormatError &e) {
 		throw InvalidInputException("%s: %s", data.function, e.what());
 	} catch (ReservationInterrupted &) {
