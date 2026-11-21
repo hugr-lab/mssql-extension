@@ -264,31 +264,40 @@ void CheckOffRow(const RowsetLayout &layout, const RowRecord &row, const OffRowC
 	}
 }
 
-//! The live rows of `page` (a data page of `cursor`'s unit, read) as the scan finds them: ghosts and
-//! stubs skipped, a forwarded record at its place before it moved.
-void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const Page &page, std::vector<PageRow> &out,
-				  const OffRowCheck *check = nullptr, int32_t only_slot = -1, const std::vector<bool> *skip = nullptr,
-				  const ValueForm *form = nullptr) {
-	out.clear();
-	const RowsetLayout &layout = data.entry->Layout(*cursor.partition);
-	const uint16_t slots = page.header.slot_count;
-	if (static_cast<size_t>(slots) * 2 + PAGE_HEADER_SIZE > PAGE_SIZE) {
-		throw FormatError("backup: page " + page.header.page_id.ToString() + " has " + std::to_string(slots) +
-						  " slots, more than an 8 KB page holds");
-	}
-	// A compressed row's values read: its key's, and every column's when its off-row values are checked or
-	// its rows are compared by their values (below).
-	const bool page_compressed = layout.compression == 2;
-	const bool by_value = page_compressed || (form && form->by_value);
-	std::vector<bool> needed(layout.columns.size(), check != nullptr || by_value);
+//! Whether `v` of `c` is a value a comparison in `columns` takes: of a column the newer state has, not NULL,
+//! and not the default of a column the older state did not have (a record that holds none reads it).
+template <class COLUMNS>
+bool HoldsComparedValue(const COLUMNS &columns, const PhysicalColumn &c, const ValueRef &v) {
+	return columns.Compared(c.rscolid) && v.state != ValueState::Null &&
+		   !(!columns.OlderHas(c.rscolid) && IsColumnDefault(c, v));
+}
+
+//! A bit's value: from its byte in the record, or from its default (a metadata-only ADD COLUMN: the
+//! record has none).
+bool BitIsSet(const PhysicalColumn &c, const ValueRef &v) {
+	return v.state == ValueState::Default ? v.data[0] != 0 : ((v.data[0] >> c.bit_position) & 1) != 0;
+}
+
+void AppendU32(std::string &out, uint32_t value) {
+	out.append(reinterpret_cast<const char *>(&value), sizeof(value));
+}
+
+//! The columns a compressed row's values are read for: its key's, and every column's (`all`) when its
+//! off-row values are checked or its rows are compared by their values.
+std::vector<bool> NeededColumns(const RowsetLayout &layout, const PartitionCursor &cursor, bool all) {
+	std::vector<bool> needed(layout.columns.size(), all);
 	for (size_t k : cursor.key) {
 		needed[k] = true;
 	}
 	if (cursor.has_uniquifier) {
 		needed[cursor.uniquifier] = true;
 	}
-	// Each record bounded by the next one's start, as the scan bounds it; two slots naming one record
-	// refused (review of #549).
+	return needed;
+}
+
+//! Where each slot's record must end: each record bounded by the next one's start, as the scan bounds
+//! it; two slots naming one record refused (review of #549).
+const std::vector<uint16_t> &RecordBounds(const Page &page, uint16_t slots) {
 	static thread_local std::vector<RecordSpan> spans;	// kept by the thread, page to page
 	static thread_local std::vector<uint16_t> bound;
 	RecordSpans(page.bytes.data(), PAGE_SIZE, slots, spans);
@@ -301,168 +310,243 @@ void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const
 		}
 		bound[spans[i].slot] = spans[i].end;
 	}
+	return bound;
+}
+
+//! A page's records read one slot at a time, in either record form. `row` points into this reader (its
+//! CD row or its record view), so the reader outlives every use of it.
+struct SlotReader {
+	SlotReader(const ScanBindData &data, const RowsetLayout &layout, const Page &page, std::vector<bool> needed_p)
+		: data(data),
+		  layout(layout),
+		  page(page),
+		  slots(page.header.slot_count),
+		  page_compressed(layout.compression == 2),
+		  needed(std::move(needed_p)) {
+		if (page_compressed && (page.header.type_flags & 0x80)) {
+			ReadPageCompression(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * slots, data.table.c_str(), page_ci);
+		}
+	}
+
+	//! The record of `slot` at `offset`: false for one that is no live row (a ghost, a stub, another
+	//! record type). `at` is where the row is, or was before it was forwarded.
+	bool Read(uint16_t slot, uint16_t offset) {
+		at.page = page.header.page_id;
+		at.slot = slot;
+		return layout.compression == 1 || page_compressed ? ReadCompressed(offset) : ReadFixed(slot);
+	}
+
+	//! Whether the record carries a version tag: its 14 bytes at the end and the header bit that says so.
+	bool Tagged() const {
+		return layout.compression != 0 ? (cd.header & CD_VERSION_TAG) != 0 : fixed.HasVersionTag();
+	}
+
+	const ScanBindData &data;
+	const RowsetLayout &layout;
+	const Page &page;
+	const uint16_t slots;
+	const bool page_compressed;
+	std::vector<bool> needed;
+	PageCompression page_ci;  // a PAGE page's compression information (spec 086 PR 2)
 	CdRecord cd;
 	CdRow cd_row;
-	PageCompression page_ci;  // a PAGE page's compression information (spec 086 PR 2)
-	if (page_compressed && (page.header.type_flags & 0x80)) {
-		ReadPageCompression(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * slots, data.table.c_str(), page_ci);
+	RecordView fixed;
+	RowRecord row;
+	RowLocation at;
+	uint32_t record_end = 0;
+
+private:
+	bool ReadCompressed(uint16_t offset) {
+		if (page_ci.present && offset < page_ci.end) {
+			throw FormatError("backup: page " + page.header.page_id.ToString() + " has a record at offset " +
+							  std::to_string(offset) + " inside its compression information (to " +
+							  std::to_string(page_ci.end) + ")");
+		}
+		ReadCdRecord(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * slots, offset, data.table.c_str(), cd);
+		if (cd.kind == CdRecord::Kind::Ghost || cd.kind == CdRecord::Kind::Stub) {
+			return false;
+		}
+		if (cd.kind == CdRecord::Kind::Forwarded) {
+			cd.BackPointer(at.page.page, at.page.file, at.slot);
+		}
+		cd_row.Read(cd, layout, &needed, page_compressed ? &page_ci : nullptr);
+		row = RowRecord::Compressed(cd, cd_row);
+		record_end = cd.end;
+		return true;
 	}
+
+	bool ReadFixed(uint16_t slot) {
+		fixed = ReadSlot(page.bytes.data(), PAGE_SIZE, slots, slot, data.table.c_str());
+		if (fixed.Type() != RECORD_PRIMARY && fixed.Type() != RECORD_FORWARDED) {
+			return false;
+		}
+		if (fixed.Type() == RECORD_FORWARDED) {
+			at = ForwardedFrom(fixed, layout.table);
+		}
+		row = RowRecord::Fixed(fixed, RowVarCount(fixed, layout.table));
+		record_end = fixed.End();
+		return true;
+	}
+};
+
+//! The record's bytes as compared: without a version tag (row versioning adds and rewrites it, the values
+//! the same) -- its 14 bytes at the end and the header bit that says it is there.
+void ComparedRecordBytes(const SlotReader &reader, uint16_t offset, std::string &bytes) {
+	const bool tagged = reader.Tagged();
+	const uint32_t record_end = reader.record_end;
+	const uint32_t compared_end =
+		tagged && record_end >= VERSION_TAG_BYTES ? record_end - VERSION_TAG_BYTES : record_end;
+	bytes.assign(reinterpret_cast<const char *>(reader.page.bytes.data()) + offset, compared_end);
+	if (tagged && !bytes.empty()) {
+		bytes[0] = static_cast<char>(static_cast<uint8_t>(bytes[0]) &
+									 ~(reader.layout.compression != 0 ? CD_VERSION_TAG : STATUS_VERSION_TAG));
+	}
+}
+
+//! The row's values as the scan takes them, its off-row ones left to their digests: what decides
+//! whether a row whose record differs is another row. A shrink rewrites the off-row pointers (the
+//! values the same; measured, diffs.sql) and drops the bytes of a dropped column as it moves a
+//! record (measured on lob_changes.sql: the records of a table whose varchar(max) was dropped lost
+//! its variable column; review of #580), and a version tag comes and goes. Per column (dropped
+//! ones and the uniquifier, which the _mssql_rid holds, left out), in the layout's order: its
+//! column id (two states' layouts differ when the table's columns changed between them: a column
+//! copied into a new one and dropped holds the same value under another id) and the value -- off
+//! row (its digest compared beside), or its length and bytes, a bit as 0 or 1 from its byte in the
+//! record or from its default (a metadata-only ADD COLUMN: the record has none). Only the newer
+//! state's columns (`check.Compared`), and only those that hold a value: NULL is none, and so is a
+//! default of a column the older state did not have -- a column added between the two, the records
+//! unchanged, is no change however the records move (review of #582). An off-row pointer must lie
+//! in the compared bytes (`record`, `record_size`): equal records stand for equal pointers (the trees
+//! are compared by them). A leading byte: a row whose every compared value is NULL has a form too
+//! (empty means "not computed", no check).
+void MaskedValues(const SlotReader &reader, const OffRowCheck &check, const uint8_t *record, size_t record_size,
+				  uint16_t slot, std::string &masked) {
+	const RowsetLayout &layout = reader.layout;
+	masked.assign(1, '\1');
+	const uint8_t *compared = record + record_size;
+	for (size_t k = 0; k < layout.columns.size(); k++) {
+		const PhysicalColumn &c = layout.columns[k];
+		if (c.Dropped() || c.Uniquifier()) {
+			continue;
+		}
+		const ValueRef v = reader.row.Locate(layout, k);
+		if (!HoldsComparedValue(check, c, v)) {
+			continue;
+		}
+		AppendU32(masked, static_cast<uint32_t>(c.rscolid));
+		if (v.state == ValueState::OffRow) {
+			if (v.data < record || v.data > compared || v.size > static_cast<size_t>(compared - v.data)) {
+				throw FormatError("backup: page " + reader.page.header.page_id.ToString() + " slot " +
+								  std::to_string(slot) + ": the off-row pointer of " + c.name +
+								  " does not lie in its record");
+			}
+			masked.push_back('\2');
+			continue;
+		}
+		masked.push_back('\1');
+		if (c.xtype == XTYPE_BIT && v.size >= 1) {
+			masked.push_back(BitIsSet(c, v) ? '\1' : '\0');
+			continue;
+		}
+		AppendU32(masked, v.size);
+		masked.append(reinterpret_cast<const char *>(v.data), v.size);
+	}
+}
+
+//! A PAGE record's bytes are its page's: a symbol of its dictionary, a prefix of its anchor -- the
+//! same row on another page (a split, a rebuild) or under another anchor is other bytes, and so is
+//! the same row before a rebuild into PAGE. Compared, and digested when it is unpaired, by its
+//! values in the uncompressed form instead, as `masked` is built (review of spec 086 PR 2: by the
+//! layout's positions, a column added between the states or a default stored by a rebuild made
+//! every row of a page an update): per column of the newer state that holds a value (dropped ones
+//! and the uniquifier, which the _mssql_rid holds, left out; NULL none, and a default of a column
+//! the older state did not have none) its column id and its bytes, a default and a stored value
+//! alike; an off-row value by its pointer (a pointer rewritten by a shrink decides by `masked` and
+//! the digests, as for any record).
+void ValueBytes(const SlotReader &reader, const ValueForm &columns, std::string &bytes) {
+	const RowsetLayout &layout = reader.layout;
+	bytes.assign(1, '\3');
+	for (size_t k = 0; k < layout.columns.size(); k++) {
+		const PhysicalColumn &c = layout.columns[k];
+		if (c.Dropped() || c.Uniquifier()) {
+			continue;
+		}
+		const ValueRef v = reader.row.Locate(layout, k);
+		if (!HoldsComparedValue(columns, c, v)) {
+			continue;
+		}
+		AppendU32(bytes, static_cast<uint32_t>(c.rscolid));
+		bytes.push_back(v.state == ValueState::OffRow ? '\2' : '\1');
+		if (c.xtype == XTYPE_BIT && v.size >= 1 && v.state != ValueState::OffRow) {
+			bytes.push_back(BitIsSet(c, v) ? '\1' : '\0');
+			continue;
+		}
+		AppendU32(bytes, v.size);
+		bytes.append(reinterpret_cast<const char *>(v.data), v.size);
+	}
+}
+
+//! The columns rows are compared by value in: `form`'s, else `check`'s lists, else every column.
+ValueForm ValueColumns(const ValueForm *form, const OffRowCheck *check) {
+	ValueForm columns;
+	if (form) {
+		columns = *form;
+	} else if (check) {
+		columns.newer_columns = check->newer_columns;
+		columns.older_columns = check->older_columns;
+	}
+	return columns;
+}
+
+//! Slot `slot`'s record offset on `page`.
+uint16_t SlotOffset(const Page &page, uint16_t slot) {
+	const size_t pos = PAGE_SIZE - 2 - 2 * static_cast<size_t>(slot);
+	return static_cast<uint16_t>(page.bytes[pos] | (page.bytes[pos + 1] << 8));
+}
+
+//! The live rows of `page` (a data page of `cursor`'s unit, read) as the scan finds them: ghosts and
+//! stubs skipped, a forwarded record at its place before it moved.
+void ReadPageRows(const ScanBindData &data, const PartitionCursor &cursor, const Page &page, std::vector<PageRow> &out,
+				  const OffRowCheck *check = nullptr, int32_t only_slot = -1, const std::vector<bool> *skip = nullptr,
+				  const ValueForm *form = nullptr) {
+	out.clear();
+	const RowsetLayout &layout = data.entry->Layout(*cursor.partition);
+	const uint16_t slots = page.header.slot_count;
+	if (static_cast<size_t>(slots) * 2 + PAGE_HEADER_SIZE > PAGE_SIZE) {
+		throw FormatError("backup: page " + page.header.page_id.ToString() + " has " + std::to_string(slots) +
+						  " slots, more than an 8 KB page holds");
+	}
+	const bool by_value = layout.compression == 2 || (form && form->by_value);
+	std::vector<bool> needed = NeededColumns(layout, cursor, check != nullptr || by_value);
+	const std::vector<uint16_t> &bound = RecordBounds(page, slots);
+	SlotReader reader(data, layout, page, std::move(needed));
+	const ValueForm columns = ValueColumns(form, check);
 	for (uint16_t slot = 0; slot < slots; slot++) {
 		if ((only_slot >= 0 && slot != only_slot) || (skip && slot < skip->size() && (*skip)[slot])) {
 			continue;
 		}
-		const size_t pos = PAGE_SIZE - 2 - 2 * static_cast<size_t>(slot);
-		const uint16_t offset = static_cast<uint16_t>(page.bytes[pos] | (page.bytes[pos + 1] << 8));
+		const uint16_t offset = SlotOffset(page, slot);
 		if (offset < PAGE_HEADER_SIZE) {
 			continue;  // a freed slot
 		}
-		RowLocation at;
-		at.page = page.header.page_id;
-		at.slot = slot;
-		RowRecord row;
-		uint32_t record_end = 0;
-		RecordView fixed;
-		if (layout.compression == 1 || page_compressed) {
-			if (page_ci.present && offset < page_ci.end) {
-				throw FormatError("backup: page " + page.header.page_id.ToString() + " has a record at offset " +
-								  std::to_string(offset) + " inside its compression information (to " +
-								  std::to_string(page_ci.end) + ")");
-			}
-			ReadCdRecord(page.bytes.data(), PAGE_SIZE, PAGE_SIZE - 2u * slots, offset, data.table.c_str(), cd);
-			if (cd.kind == CdRecord::Kind::Ghost || cd.kind == CdRecord::Kind::Stub) {
-				continue;
-			}
-			if (cd.kind == CdRecord::Kind::Forwarded) {
-				cd.BackPointer(at.page.page, at.page.file, at.slot);
-			}
-			cd_row.Read(cd, layout, &needed, page_compressed ? &page_ci : nullptr);
-			row = RowRecord::Compressed(cd, cd_row);
-			record_end = cd.end;
-		} else {
-			fixed = ReadSlot(page.bytes.data(), PAGE_SIZE, slots, slot, data.table.c_str());
-			if (fixed.Type() != RECORD_PRIMARY && fixed.Type() != RECORD_FORWARDED) {
-				continue;
-			}
-			if (fixed.Type() == RECORD_FORWARDED) {
-				at = ForwardedFrom(fixed, layout.table);
-			}
-			row = RowRecord::Fixed(fixed, RowVarCount(fixed, layout.table));
-			record_end = fixed.End();
+		if (!reader.Read(slot, offset)) {
+			continue;
 		}
-		if (static_cast<size_t>(offset) + record_end > bound[slot]) {
+		if (static_cast<size_t>(offset) + reader.record_end > bound[slot]) {
 			throw FormatError("backup: page " + page.header.page_id.ToString() + " has a record at offset " +
 							  std::to_string(offset) + " that runs past the next record's start (" +
 							  std::to_string(bound[slot]) + ")");
 		}
 		PageRow r;
 		r.slot = slot;
-		r.rid = RowId(data, cursor, row, at);
-		// Compared without a version tag (row versioning adds and rewrites it, the values the same): its
-		// 14 bytes at the end and the header bit that says it is there.
-		const bool tagged = layout.compression != 0 ? (cd.header & CD_VERSION_TAG) != 0 : fixed.HasVersionTag();
-		const uint32_t compared_end =
-			tagged && record_end >= VERSION_TAG_BYTES ? record_end - VERSION_TAG_BYTES : record_end;
-		r.bytes.assign(reinterpret_cast<const char *>(page.bytes.data()) + offset, compared_end);
-		if (tagged && !r.bytes.empty()) {
-			r.bytes[0] = static_cast<char>(static_cast<uint8_t>(r.bytes[0]) &
-										   ~(layout.compression != 0 ? CD_VERSION_TAG : STATUS_VERSION_TAG));
-		}
+		r.rid = RowId(data, cursor, reader.row, reader.at);
+		ComparedRecordBytes(reader, offset, r.bytes);
 		if (check) {
-			CheckOffRow(layout, row, *check, r);
-			// The row's values as the scan takes them, its off-row ones left to their digests: what decides
-			// whether a row whose record differs is another row. A shrink rewrites the off-row pointers (the
-			// values the same; measured, diffs.sql) and drops the bytes of a dropped column as it moves a
-			// record (measured on lob_changes.sql: the records of a table whose varchar(max) was dropped lost
-			// its variable column; review of #580), and a version tag comes and goes. Per column (dropped
-			// ones and the uniquifier, which the _mssql_rid holds, left out), in the layout's order: its
-			// column id (two states' layouts differ when the table's columns changed between them: a column
-			// copied into a new one and dropped holds the same value under another id) and the value -- off
-			// row (its digest compared beside), or its length and bytes, a bit as 0 or 1 from its byte in the
-			// record or from its default (a metadata-only ADD COLUMN: the record has none). Only the newer
-			// state's columns (`check.Compared`), and only those that hold a value: NULL is none, and so is a
-			// default of a column the older state did not have -- a column added between the two, the records
-			// unchanged, is no change however the records move (review of #582). An off-row pointer must lie
-			// in the compared bytes: equal records stand for equal pointers (the trees are compared by them).
-			// A leading byte: a row whose every compared value is NULL has a form too (empty means "not
-			// computed", no check).
-			r.masked.assign(1, '\1');
-			const uint8_t *start = page.bytes.data() + offset;
-			const uint8_t *compared = start + r.bytes.size();
-			for (size_t k = 0; k < layout.columns.size(); k++) {
-				const PhysicalColumn &c = layout.columns[k];
-				if (c.Dropped() || c.Uniquifier()) {
-					continue;
-				}
-				const ValueRef v = row.Locate(layout, k);
-				if (!check->Compared(c.rscolid) || v.state == ValueState::Null ||
-					(!check->OlderHas(c.rscolid) && IsColumnDefault(c, v))) {
-					continue;
-				}
-				const uint32_t id = static_cast<uint32_t>(c.rscolid);
-				r.masked.append(reinterpret_cast<const char *>(&id), sizeof(id));
-				if (v.state == ValueState::OffRow) {
-					if (v.data < start || v.data > compared || v.size > static_cast<size_t>(compared - v.data)) {
-						throw FormatError("backup: page " + page.header.page_id.ToString() + " slot " +
-										  std::to_string(slot) + ": the off-row pointer of " + c.name +
-										  " does not lie in its record");
-					}
-					r.masked.push_back('\2');
-					continue;
-				}
-				r.masked.push_back('\1');
-				if (c.xtype == XTYPE_BIT && v.size >= 1) {
-					const bool set =
-						v.state == ValueState::Default ? v.data[0] != 0 : ((v.data[0] >> c.bit_position) & 1) != 0;
-					r.masked.push_back(set ? '\1' : '\0');
-					continue;
-				}
-				const uint32_t size = v.size;
-				r.masked.append(reinterpret_cast<const char *>(&size), sizeof(size));
-				r.masked.append(reinterpret_cast<const char *>(v.data), v.size);
-			}
+			CheckOffRow(layout, reader.row, *check, r);
+			MaskedValues(reader, *check, page.bytes.data() + offset, r.bytes.size(), slot, r.masked);
 		}
 		if (by_value) {
-			// A PAGE record's bytes are its page's: a symbol of its dictionary, a prefix of its anchor -- the
-			// same row on another page (a split, a rebuild) or under another anchor is other bytes, and so is
-			// the same row before a rebuild into PAGE. Compared, and digested when it is unpaired, by its
-			// values in the uncompressed form instead, as `masked` is built (review of spec 086 PR 2: by the
-			// layout's positions, a column added between the states or a default stored by a rebuild made
-			// every row of a page an update): per column of the newer state that holds a value (dropped ones
-			// and the uniquifier, which the _mssql_rid holds, left out; NULL none, and a default of a column
-			// the older state did not have none) its column id and its bytes, a default and a stored value
-			// alike; an off-row value by its pointer (a pointer rewritten by a shrink decides by `masked` and
-			// the digests, as for any record).
-			ValueForm columns;
-			if (form) {
-				columns = *form;
-			} else if (check) {
-				columns.newer_columns = check->newer_columns;
-				columns.older_columns = check->older_columns;
-			}
-			r.bytes.assign(1, '\3');
-			for (size_t k = 0; k < layout.columns.size(); k++) {
-				const PhysicalColumn &c = layout.columns[k];
-				if (c.Dropped() || c.Uniquifier()) {
-					continue;
-				}
-				const ValueRef v = row.Locate(layout, k);
-				if (!columns.Compared(c.rscolid) || v.state == ValueState::Null ||
-					(!columns.OlderHas(c.rscolid) && IsColumnDefault(c, v))) {
-					continue;
-				}
-				const uint32_t id = static_cast<uint32_t>(c.rscolid);
-				r.bytes.append(reinterpret_cast<const char *>(&id), sizeof(id));
-				r.bytes.push_back(v.state == ValueState::OffRow ? '\2' : '\1');
-				if (c.xtype == XTYPE_BIT && v.size >= 1 && v.state != ValueState::OffRow) {
-					const bool set =
-						v.state == ValueState::Default ? v.data[0] != 0 : ((v.data[0] >> c.bit_position) & 1) != 0;
-					r.bytes.push_back(set ? '\1' : '\0');
-					continue;
-				}
-				const uint32_t size = v.size;
-				r.bytes.append(reinterpret_cast<const char *>(&size), sizeof(size));
-				r.bytes.append(reinterpret_cast<const char *>(v.data), v.size);
-			}
+			ValueBytes(reader, columns, r.bytes);
 		}
 		out.push_back(std::move(r));
 	}
