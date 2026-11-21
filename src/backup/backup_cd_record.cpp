@@ -741,13 +741,11 @@ void CdRow::StageValue(const Staging &s, const std::vector<bool> *needed) {
 }
 
 //! A value's bytes under PAGE compression (E23): a symbol is its dictionary entry; an anchored
-//! column's value is its prefix of the anchor's value and its suffix; EMPTY there, the anchor's
-//! value whole. `p` / `size` / `rebuilt` are moved on to what the value actually is.
+//! column's value (an entry too) is its prefix of the anchor's value and its suffix; EMPTY there,
+//! the anchor's value whole. `p` / `size` / `rebuilt` are moved on to what the value actually is.
 void CdRow::RebuildFromPage(const PageCompression &page, const CdValue &cd, size_t index, const RowsetLayout &layout,
 							const PhysicalColumn &c, const uint8_t *&p, size_t &size, bool &rebuilt) {
 	auto what = [&]() { return layout.table + "." + c.name; };
-	// PAGE compression (E23): a symbol is its dictionary entry; an anchored column's value (an entry
-	// too) is its prefix of the anchor's value and its suffix; EMPTY there, the anchor's value whole.
 	const CdValue *anchor =
 		page.has_anchor && index < page.anchor.column_count && page.anchor.values[index].code != CD_NULL
 			? &page.anchor.values[index]

@@ -207,9 +207,9 @@ void Require(const SqlVariant &v, size_t size, const std::string &what) {
 }
 
 //! A sql_variant's value by type family (D6), one reader per family: `SqlVariantValue` was a single
-//! switch of 178 lines over 23 xtypes (CRAP 4830 at the complexity gate). Every refusal below is the
-//! one that switch raised, word for word -- the messages name the column and the tests quote them --
-//! and each reader takes the same arguments so the table beneath can hold them all.
+//! switch of 178 lines over 24 xtypes. Every refusal below is the one that switch raised, word for
+//! word -- the messages name the column and the tests quote them -- and each reader takes the same
+//! arguments so the table beneath can hold them all.
 [[noreturn]] void ThrowUnreadableVariant(uint8_t xtype, const std::string &what) {
 	throw FormatError("backup: " + what + " is a sql_variant of xtype " + std::to_string(xtype) +
 					  ", which the reader does not read");
