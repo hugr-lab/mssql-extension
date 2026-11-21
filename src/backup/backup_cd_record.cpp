@@ -319,6 +319,53 @@ std::string Hex(const uint8_t *data, size_t size) {
 	return out;
 }
 
+//! A vardecimal's digits (E22): ten bits a group of three digits, the last group's trailing zero bits
+//! not stored; trailing zero digits left out (they change nothing: the value is digits x
+//! 10^(exponent - n + 1)). `what` names the value in an error.
+template <class Name>
+std::string VardecimalDigits(const uint8_t *data, size_t size, const Name &what) {
+	std::string digits;
+	const size_t bits = 8 * (size - 1);
+	for (size_t at = 0; at < bits; at += 10) {
+		unsigned group = 0;
+		for (size_t b = 0; b < 10; b++) {
+			const size_t bit = at + b;
+			unsigned value = 0;
+			if (bit < bits) {
+				value = (data[1 + bit / 8] >> (7 - bit % 8)) & 1;
+			}
+			group = (group << 1) | value;
+		}
+		if (group > 999) {
+			throw FormatError("backup: " + what() + " holds a vardecimal group of " + std::to_string(group));
+		}
+		digits += static_cast<char>('0' + group / 100);
+		digits += static_cast<char>('0' + group / 10 % 10);
+		digits += static_cast<char>('0' + group % 10);
+	}
+	while (!digits.empty() && digits.back() == '0') {
+		digits.pop_back();
+	}
+	return digits;
+}
+
+//! digits x 10^shift into `magnitude`: false when it does not fit 128 bits or a decimal of `precision`.
+bool VardecimalMagnitude(const std::string &digits, int shift, uint8_t precision, U128 &magnitude) {
+	U128 limit;
+	for (int i = 0; i < precision; i++) {
+		limit.MulAdd(i == 0 ? 1 : 0);
+	}
+	limit.MulAdd(0);  // 10^precision
+	bool fits = true;
+	for (char ch : digits) {
+		fits = fits && magnitude.MulAdd(static_cast<unsigned>(ch - '0'));
+	}
+	for (int i = 0; i < shift && fits; i++) {
+		fits = magnitude.MulAdd(0);
+	}
+	return fits && magnitude.Less(limit);
+}
+
 }  // namespace
 
 void DecodeVardecimal(const uint8_t *data, size_t size, uint8_t precision, uint8_t scale, std::vector<uint8_t> &out,
@@ -335,28 +382,7 @@ void DecodeVardecimal(const uint8_t *data, size_t size, uint8_t precision, uint8
 	if (size > 0) {
 		positive = (data[0] & 0x80) != 0;
 		exponent = static_cast<int>(data[0] & 0x7F) - 64;
-		const size_t bits = 8 * (size - 1);
-		for (size_t at = 0; at < bits; at += 10) {
-			// Ten bits a group of three digits; the last group's trailing zero bits are not stored.
-			unsigned group = 0;
-			for (size_t b = 0; b < 10; b++) {
-				const size_t bit = at + b;
-				unsigned value = 0;
-				if (bit < bits) {
-					value = (data[1 + bit / 8] >> (7 - bit % 8)) & 1;
-				}
-				group = (group << 1) | value;
-			}
-			if (group > 999) {
-				throw FormatError("backup: " + what() + " holds a vardecimal group of " + std::to_string(group));
-			}
-			digits += static_cast<char>('0' + group / 100);
-			digits += static_cast<char>('0' + group / 10 % 10);
-			digits += static_cast<char>('0' + group % 10);
-		}
-		while (!digits.empty() && digits.back() == '0') {
-			digits.pop_back();	// trailing zeros change nothing; the value is digits x 10^(exponent - n + 1)
-		}
+		digits = VardecimalDigits(data, size, what);
 	}
 	// The unscaled value: digits x 10^shift, shift = exponent - n + 1 + scale.
 	const int shift = digits.empty() ? 0 : exponent - static_cast<int>(digits.size()) + 1 + scale;
@@ -365,19 +391,7 @@ void DecodeVardecimal(const uint8_t *data, size_t size, uint8_t precision, uint8
 						  ") with more fraction digits than its scale " + std::to_string(scale));
 	}
 	U128 magnitude;
-	U128 limit;
-	for (int i = 0; i < precision; i++) {
-		limit.MulAdd(i == 0 ? 1 : 0);
-	}
-	limit.MulAdd(0);  // 10^precision
-	bool fits = true;
-	for (char ch : digits) {
-		fits = fits && magnitude.MulAdd(static_cast<unsigned>(ch - '0'));
-	}
-	for (int i = 0; i < shift && fits; i++) {
-		fits = magnitude.MulAdd(0);
-	}
-	if (!fits || !magnitude.Less(limit)) {
+	if (!VardecimalMagnitude(digits, shift, precision, magnitude)) {
 		throw FormatError("backup: " + what() + " holds a vardecimal value (" + Hex(data, size) +
 						  ") past its precision " + std::to_string(precision));
 	}
@@ -437,78 +451,157 @@ void PutCodePoint(std::vector<uint8_t> &out, uint32_t cp) {
 	}
 }
 
+//! An SCSU sequence (UTS #6) decoded into UTF-16LE: its windows and its mode, a tag at a time.
+struct ScsuDecoder {
+	ScsuDecoder(const uint8_t *data_p, size_t size_p, std::vector<uint8_t> &out_p, const std::string &table_p,
+				const std::string &column_p)
+		: data(data_p), size(size_p), out(out_p), table(table_p), column(column_p) {
+		std::memcpy(windows, DYNAMIC_WINDOWS, sizeof(windows));
+	}
+
+	const uint8_t *data;
+	size_t size;
+	std::vector<uint8_t> &out;
+	const std::string &table;
+	const std::string &column;
+	uint32_t windows[8];
+	size_t active = 0;
+	bool unicode = false;
+	size_t i = 0;
+
+	//! The value's name, for an error only.
+	std::string operator()() const {
+		return table + "." + column;
+	}
+	uint8_t Byte() {
+		if (i >= size) {
+			throw FormatError("backup: " + (*this)() + " ends inside an SCSU sequence");
+		}
+		return data[i++];
+	}
+	//! A UTF-16 unit quoted: its two bytes, high first.
+	void QuoteUnit() {
+		const uint8_t hi = Byte(), lo = Byte();
+		PutUnit(out, (static_cast<uint32_t>(hi) << 8) | lo);
+	}
+	//! An extended window defined and made the active one.
+	void DefineExtended() {
+		const uint8_t hi = Byte(), lo = Byte();
+		active = hi >> 5;
+		windows[active] = 0x10000 + ((((hi & 0x1Fu) << 8) | lo) << 7);
+	}
+	//! Window `n` defined by the next byte and made the active one.
+	void Define(size_t n) {
+		active = n;
+		windows[active] = WindowOffset(Byte(), *this);
+	}
+
+	//! A tag of the single-byte mode, the bytes below 0x80 that are no character.
+	void SingleByteTag(uint8_t x) {
+		if (x >= 0x01 && x <= 0x08) {  // SQn: one character quoted from window n
+			const uint8_t y = Byte();
+			PutCodePoint(out, y < 0x80 ? STATIC_WINDOWS[x - 1] + y : windows[x - 1] + (y - 0x80));
+		} else if (x == 0x0B) {	 // SDX: an extended window
+			DefineExtended();
+		} else if (x == 0x0E) {	 // SQU: one UTF-16 unit quoted
+			QuoteUnit();
+		} else if (x == 0x0F) {	 // SCU: Unicode mode
+			unicode = true;
+		} else if (x >= 0x10 && x <= 0x17) {  // SCn
+			active = x - 0x10;
+		} else if (x >= 0x18 && x <= 0x1F) {  // SDn
+			Define(x - 0x18);
+		} else {
+			throw FormatError("backup: " + (*this)() + " holds the reserved SCSU tag " + std::to_string(x));
+		}
+	}
+
+	void SingleByte(uint8_t x) {
+		if (x >= 0x80) {
+			PutCodePoint(out, windows[active] + (x - 0x80));
+		} else if (x == 0x00 || x == 0x09 || x == 0x0A || x == 0x0D || x >= 0x20) {
+			PutUnit(out, x);
+		} else {
+			SingleByteTag(x);
+		}
+	}
+
+	void Unicode(uint8_t x) {
+		if (x >= 0xE0 && x <= 0xE7) {  // UCn
+			active = x - 0xE0;
+			unicode = false;
+		} else if (x >= 0xE8 && x <= 0xEF) {  // UDn
+			Define(x - 0xE8);
+			unicode = false;
+		} else if (x == 0xF0) {	 // UQU
+			QuoteUnit();
+		} else if (x == 0xF1) {	 // UDX
+			DefineExtended();
+			unicode = false;
+		} else if (x == 0xF2) {
+			throw FormatError("backup: " + (*this)() + " holds the reserved SCSU tag 242");
+		} else {
+			const uint8_t lo = Byte();
+			PutUnit(out, (static_cast<uint32_t>(x) << 8) | lo);
+		}
+	}
+
+	void Run() {
+		while (i < size) {
+			const uint8_t x = data[i++];
+			if (unicode) {
+				Unicode(x);
+			} else {
+				SingleByte(x);
+			}
+		}
+	}
+};
+
 }  // namespace
 
 void DecodeCompressedUnicode(const uint8_t *data, size_t size, std::vector<uint8_t> &out, const std::string &table,
 							 const std::string &column) {
-	auto what = [&]() { return table + "." + column; };
 	if (size % 2 == 0) {
 		out.insert(out.end(), data, data + size);  // not compressed: UTF-16LE as it is (E22)
 		return;
 	}
-	uint32_t windows[8];
-	std::memcpy(windows, DYNAMIC_WINDOWS, sizeof(windows));
-	size_t active = 0;
-	bool unicode = false;
-	size_t i = 0;
-	auto byte = [&]() -> uint8_t {
-		if (i >= size) {
-			throw FormatError("backup: " + what() + " ends inside an SCSU sequence");
+	ScsuDecoder decoder(data, size, out, table, column);
+	decoder.Run();
+}
+
+namespace {
+
+[[noreturn]] void FailCompressionInfo(const char *what, const std::string &why) {
+	throw FormatError(std::string("backup: ") + what + ": its compression-information record " + why);
+}
+
+//! The page dictionary at `d` (`length` bytes, `dictionary_at` into the record): its entry count, then
+//! each entry's end offset, ascending within it. Each entry's place on the page and size into `out`.
+void ReadPageDictionary(const uint8_t *d, size_t length, size_t dictionary_at, const char *what,
+						std::vector<std::pair<uint16_t, uint16_t>> &out) {
+	constexpr size_t AT = 96;
+	if (length < 2) {
+		FailCompressionInfo(what, "has a dictionary with no entry count");
+	}
+	const size_t count = d[0] | (d[1] << 8);
+	const size_t data_at = 2 + 2 * count;
+	if (data_at > length) {
+		FailCompressionInfo(what, "lists " + std::to_string(count) + " dictionary entries past its end");
+	}
+	size_t previous = data_at;
+	for (size_t i = 0; i < count; i++) {
+		const size_t stop = d[2 + 2 * i] | (d[3 + 2 * i] << 8);
+		if (stop < previous || stop > length) {
+			FailCompressionInfo(what, "has dictionary entry " + std::to_string(i) + " ending at " +
+										  std::to_string(stop) + ", outside its dictionary");
 		}
-		return data[i++];
-	};
-	while (i < size) {
-		const uint8_t x = data[i++];
-		if (!unicode) {
-			if (x >= 0x80) {
-				PutCodePoint(out, windows[active] + (x - 0x80));
-			} else if (x == 0x00 || x == 0x09 || x == 0x0A || x == 0x0D || x >= 0x20) {
-				PutUnit(out, x);
-			} else if (x >= 0x01 && x <= 0x08) {  // SQn: one character quoted from window n
-				const uint8_t y = byte();
-				PutCodePoint(out, y < 0x80 ? STATIC_WINDOWS[x - 1] + y : windows[x - 1] + (y - 0x80));
-			} else if (x == 0x0B) {	 // SDX: an extended window
-				const uint8_t hi = byte(), lo = byte();
-				active = hi >> 5;
-				windows[active] = 0x10000 + ((((hi & 0x1Fu) << 8) | lo) << 7);
-			} else if (x == 0x0E) {	 // SQU: one UTF-16 unit quoted
-				const uint8_t hi = byte(), lo = byte();
-				PutUnit(out, (static_cast<uint32_t>(hi) << 8) | lo);
-			} else if (x == 0x0F) {	 // SCU: Unicode mode
-				unicode = true;
-			} else if (x >= 0x10 && x <= 0x17) {  // SCn
-				active = x - 0x10;
-			} else if (x >= 0x18 && x <= 0x1F) {  // SDn
-				active = x - 0x18;
-				windows[active] = WindowOffset(byte(), what);
-			} else {
-				throw FormatError("backup: " + what() + " holds the reserved SCSU tag " + std::to_string(x));
-			}
-		} else {
-			if (x >= 0xE0 && x <= 0xE7) {  // UCn
-				active = x - 0xE0;
-				unicode = false;
-			} else if (x >= 0xE8 && x <= 0xEF) {  // UDn
-				active = x - 0xE8;
-				windows[active] = WindowOffset(byte(), what);
-				unicode = false;
-			} else if (x == 0xF0) {	 // UQU
-				const uint8_t hi = byte(), lo = byte();
-				PutUnit(out, (static_cast<uint32_t>(hi) << 8) | lo);
-			} else if (x == 0xF1) {	 // UDX
-				const uint8_t hi = byte(), lo = byte();
-				active = hi >> 5;
-				windows[active] = 0x10000 + ((((hi & 0x1Fu) << 8) | lo) << 7);
-				unicode = false;
-			} else if (x == 0xF2) {
-				throw FormatError("backup: " + what() + " holds the reserved SCSU tag 242");
-			} else {
-				const uint8_t lo = byte();
-				PutUnit(out, (static_cast<uint32_t>(x) << 8) | lo);
-			}
-		}
+		out.emplace_back(static_cast<uint16_t>(AT + dictionary_at + previous), static_cast<uint16_t>(stop - previous));
+		previous = stop;
 	}
 }
+
+}  // namespace
 
 void ReadPageCompression(const uint8_t *page, size_t page_size, size_t slot_array, const char *what,
 						 PageCompression &out) {
@@ -517,9 +610,7 @@ void ReadPageCompression(const uint8_t *page, size_t page_size, size_t slot_arra
 	out.has_anchor = false;
 	out.dictionary.clear();
 	out.page = page;
-	auto fail = [&](const std::string &why) {
-		throw FormatError(std::string("backup: ") + what + ": its compression-information record " + why);
-	};
+	auto fail = [&](const std::string &why) { FailCompressionInfo(what, why); };
 	if (slot_array > page_size || slot_array < AT + 5) {
 		fail("has no room before the slot array");
 	}
@@ -553,27 +644,7 @@ void ReadPageCompression(const uint8_t *page, size_t page_size, size_t slot_arra
 		out.has_anchor = true;
 	}
 	if (has_dictionary) {
-		const uint8_t *d = ci + dictionary_at;
-		const size_t length = size - dictionary_at;
-		if (length < 2) {
-			fail("has a dictionary with no entry count");
-		}
-		const size_t count = d[0] | (d[1] << 8);
-		const size_t data_at = 2 + 2 * count;
-		if (data_at > length) {
-			fail("lists " + std::to_string(count) + " dictionary entries past its end");
-		}
-		size_t previous = data_at;
-		for (size_t i = 0; i < count; i++) {
-			const size_t stop = d[2 + 2 * i] | (d[3 + 2 * i] << 8);
-			if (stop < previous || stop > length) {
-				fail("has dictionary entry " + std::to_string(i) + " ending at " + std::to_string(stop) +
-					 ", outside its dictionary");
-			}
-			out.dictionary.emplace_back(static_cast<uint16_t>(AT + dictionary_at + previous),
-										static_cast<uint16_t>(stop - previous));
-			previous = stop;
-		}
+		ReadPageDictionary(ci + dictionary_at, size - dictionary_at, dictionary_at, what, out.dictionary);
 	}
 }
 
