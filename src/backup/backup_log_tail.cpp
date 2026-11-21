@@ -72,6 +72,18 @@ bool IsRowContext(uint8_t context) {
 	}
 }
 
+bool TailReachesLast(const Lsn &reached, uint16_t block_size, const Lsn &last) {
+	if (last.slot > 1) {
+		return reached.vlf == last.vlf && reached.block == last.block && reached.slot + 1u == last.slot;
+	}
+	if (reached.vlf != last.vlf) {
+		// LastLSN opens the next VLF (a VLF's sequence number is its predecessor's plus one): where this
+		// one ends is not in the log. Not met in the fixtures (every tail measured ends in one VLF).
+		return reached.vlf + 1u == last.vlf;
+	}
+	return reached.block + block_size / SECTOR == last.block;
+}
+
 void RestoreSectorParity(uint8_t *block, size_t size) {
 	const size_t sectors = size / SECTOR;
 	for (size_t k = 1; k < sectors; k++) {
@@ -112,6 +124,7 @@ void ParseLogBlock(const uint8_t *block, size_t size, size_t header_bytes, const
 	LogRecord record;
 	record.lsn.vlf = U32(block + 12);
 	record.lsn.block = U32(block + 16);
+	record.block_size = static_cast<uint16_t>(size);
 	for (uint16_t i = 0; i < count; i++) {
 		// The slot array runs backwards from its end: the first record's offset is its last entry.
 		const size_t at = U16(block + slot_end - 2u * (i + 1u));

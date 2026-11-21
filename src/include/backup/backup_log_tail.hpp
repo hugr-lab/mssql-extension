@@ -78,7 +78,15 @@ struct LogRecord {
 	const uint8_t *bytes = nullptr;
 	uint16_t length = 0;
 	uint16_t fixed_length = 0;
+	//! The bytes of the record's log block: the next block's id is this one's plus its sectors.
+	uint16_t block_size = 0;
 };
+
+//! Whether `reached`, the last record a tail read holds before its LastLSN `last` (in the block of
+//! `block_size` bytes), is the one LastLSN follows: the record before it in its block, or the last of the
+//! block before it -- or of the VLF before LastLSN's, whose end is not known here. A tail that stops
+//! short of it was not read whole (review of #591).
+bool TailReachesLast(const Lsn &reached, uint16_t block_size, const Lsn &last);
 
 //! One element of a record's row-log contents.
 struct LogElement {

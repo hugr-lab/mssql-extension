@@ -269,6 +269,26 @@ int main() {
 				  !ChangeShows(true, c, PageState::Present, lsn(9), checkpoint),
 			  "open: dirty from its oldest change on");
 	}
+	std::cout << "a tail read to its LastLSN (TailReachesLast)" << std::endl;
+	{
+		auto lsn = [](uint32_t vlf, uint32_t block, uint16_t slot) {
+			Lsn l;
+			l.vlf = vlf;
+			l.block = block;
+			l.slot = slot;
+			return l;
+		};
+		// The committed samples: the last record slot 1 of a 4096-byte block, LastLSN the next block's first.
+		Check(TailReachesLast(lsn(44, 2088, 1), 4096, lsn(44, 2096, 1)), "full.bak: 2C:828:1 then 2C:830:1");
+		Check(!TailReachesLast(lsn(44, 2080, 1), 4096, lsn(44, 2096, 1)), "a block short of LastLSN: not whole");
+		Check(TailReachesLast(lsn(44, 2088, 3), 4096, lsn(44, 2088, 4)) &&
+				  !TailReachesLast(lsn(44, 2088, 2), 4096, lsn(44, 2088, 4)),
+			  "LastLSN within a block: the record before it");
+		Check(TailReachesLast(lsn(44, 9000, 1), 512, lsn(45, 16, 1)) &&
+				  !TailReachesLast(lsn(43, 9000, 1), 512, lsn(45, 16, 1)) &&
+				  !TailReachesLast(lsn(46, 16, 1), 512, lsn(45, 16, 1)),
+			  "LastLSN in the next VLF: taken; two VLFs on, or an earlier one: not");
+	}
 	std::cout << "the pages the tail formats (a zero copy in a one-pass backup: Pending)" << std::endl;
 	{
 		auto record = [](uint32_t block, uint16_t slot, uint8_t op, uint32_t page) {

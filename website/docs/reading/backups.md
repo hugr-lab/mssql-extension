@@ -290,12 +290,18 @@ can differ from the restored database's:
 
 ```sql
 SELECT table_name, fuzzy_status, open_transactions, stale_transactions
-FROM mssql_backup_tables('/backups/busy.bak') WHERE fuzzy_status <> 'consistent';
+FROM mssql_backup_tables('/backups/busy.bak') WHERE fuzzy_status IS DISTINCT FROM 'consistent';
 ```
 
 `mssql_backup_info` says it for the whole database: `consistent` when no transaction was open at the
-end and none committed or rolled back after the checkpoint. A table the status does not name is read exactly as the
-restored database holds it; one it names may differ in the rows those transactions changed.
+end and none committed or rolled back after the checkpoint. A table the status does not name is read as the
+restored database holds it in its rows' changes; one it names may differ in the rows those transactions
+changed. (The query above keeps a NULL status: the tail could not be read, so nothing is known.)
+
+The status counts the log's row changes -- inserts, deletes and updates of rows, a rollback's undo
+included. What the log records otherwise is not counted yet: a bulk load logged as pages rather than
+rows, a `TRUNCATE TABLE`, a partition switch and other DDL run while the backup ran leave the tables
+they touched `consistent` (for now), though `RESTORE` would give them as those left them.
 
 What a scan does with a table that is not consistent is `fuzzy :=` on `mssql_backup_scan`, the `fuzzy`
 option of `ATTACH … (TYPE mssql_backup)` for its tables, or the `mssql_backup_fuzzy` setting:

@@ -18,6 +18,7 @@
 // does not).
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -128,7 +129,10 @@ int main() {
 	}
 	const size_t offset = static_cast<size_t>(copy - file.begin());
 
-	const auto dir = std::filesystem::temp_directory_path() / "mssql_zero_copy_test";
+	// One directory per run: two runs at once must not write each other's fixture (review of #591).
+	const auto dir =
+		std::filesystem::temp_directory_path() /
+		("mssql_zero_copy_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 	std::filesystem::create_directories(dir);
 	struct Form {
 		const char *what;

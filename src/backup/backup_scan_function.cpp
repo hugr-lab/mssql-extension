@@ -373,6 +373,9 @@ struct ScanLocalState : public LocalTableFunctionState {
 	Page page;
 	bool have_page = false;
 	uint16_t next_slot = 0;
+	//! The stager's PendingValues as of its last appended row: a row prepared and then left for the next
+	//! chunk (no reservation) is not one the WARNING may name (review of #591).
+	idx_t pending_appended = 0;
 	CdRecord cd_record;	 // a ROW-compressed rowset's record and its values (spec 086 PR 1), reused
 	CdRow cd_row;
 	PageCompression page_ci;		// a PAGE page's compression information (spec 086 PR 2); not present on a ROW page
@@ -1053,6 +1056,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 				}
 			}
 			local.stager->Append(row);
+			local.pending_appended = local.stager->PendingValues();
 			if (global.page_output != DConstants::INVALID_INDEX) {
 				local.page_keys.push_back(PageKey(local.page.header.page_id));
 			}
@@ -1068,7 +1072,7 @@ void Execute(ClientContext &context, TableFunctionInput &input, DataChunk &outpu
 		}
 		const idx_t count = local.stager->Count();
 		global.rows_read += count;
-		if (local.stager->PendingValues() > 0 && !global.pending_values_warned.load() &&
+		if (local.pending_appended > 0 && !global.pending_values_warned.load() &&
 			FuzzyModeOf(context, data.fuzzy, FUNCTION) == FuzzyMode::Warn &&
 			!global.pending_values_warned.exchange(true)) {
 			DUCKDB_LOG_WARNING(context,

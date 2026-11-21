@@ -94,6 +94,8 @@ std::string OperationName(uint8_t op) {
 		return "LOP_XACT_CKPT";
 	case 0x99:
 		return "LOP_END_CKPT";
+	case 0x9a:
+		return "LOP_BUF_WRITE";	 // met on 2019 / 2022 (fn_dump_dblog of the load fixture's log)
 	case 0xb0:
 		return "LOP_CREATE_ALLOCCHAIN";
 	default: {
@@ -209,8 +211,9 @@ public:
 		try {
 			std::fill(page_.begin(), page_.end(), 0);
 			std::copy(image.data, image.data + image.length, page_.begin() + AT);
+			// Bounded by the image, not the page: a truncated image is refused, not read on into the zeros.
 			const RecordView view =
-				ReadRecord(page_.data(), PAGE_SIZE, PAGE_SIZE - 2, static_cast<uint16_t>(AT), table_.name.c_str());
+				ReadRecord(page_.data(), PAGE_SIZE, AT + image.length, static_cast<uint16_t>(AT), table_.name.c_str());
 			if (view.Type() != RECORD_PRIMARY && view.Type() != RECORD_FORWARDED) {
 				reason = "a record of type " + std::to_string(view.Type()) + ", not a row";
 				return false;

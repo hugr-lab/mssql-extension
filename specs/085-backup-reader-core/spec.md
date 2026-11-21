@@ -1212,6 +1212,11 @@ A backup file is untrusted input (R§9). Every parser:
   accepted); the oracle lane compares the served set with the one the server's catalog views give
   (`catalog_golden.sql`'s `.modules.txt`, the fixture holding a procedure, functions, an encrypted TVF,
   a trigger and a partition function).
+  **Revised by the owner, 2026-11-21 (review of #591):** whoever holds the backup -- and, for an
+  encrypted one (spec 087), its key -- may read all of it; protecting a backup is encryption's job, not
+  the reader's. So `mssql_backup_transaction_records` gives every record's bytes, a system table's row
+  included (a log backup has no catalog to tell them apart), and the allow-list above is to be removed
+  from `mssql_backup_catalog` in a PR of its own: every base table served, `sysobjvalues` whole.
 - **Fuzzing** (ClusterFuzzLite, `fuzz/`, D15): one harness per parser, each with a seed corpus cut from
   the committed samples: `fuzz_backup_mtf` (walker), `fuzz_backup_container` (MSSQLBAK chain),
   `fuzz_backup_xpress` (raw codec, with a differential oracle against a reference decode of the seed),

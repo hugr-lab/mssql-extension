@@ -52,6 +52,10 @@ public:
 			return;	 // LastLSN is the next record after the backup's (HEADERONLY): not the backup's
 		}
 		summary_.records++;
+		if (reached_.IsZero() || Newer(r.lsn, reached_)) {
+			reached_ = r.lsn;
+			reached_block_size_ = r.block_size;
+		}
 		if (r.lsn <= summary_.checkpoint && summary_.checkpoint <= r.lsn) {
 			saw_checkpoint_ = true;
 		}
@@ -123,6 +127,14 @@ public:
 		return saw_checkpoint_;
 	}
 
+	//! The last record read before LastLSN (zero for none), and its block's bytes.
+	const Lsn &Reached() const {
+		return reached_;
+	}
+	uint16_t ReachedBlockSize() const {
+		return reached_block_size_;
+	}
+
 	FuzzySummary Finish() {
 		auto open = [&](uint64_t transaction) {
 			auto it = summary_.transactions.find(transaction);
@@ -143,6 +155,9 @@ public:
 			}
 			(rolled_back(transaction) ? summary_.rolled_back_after_checkpoint : summary_.committed_after_checkpoint)++;
 		}
+		// Each page's changes freed once redistributed, and the index first: the peak stays about one copy
+		// (review of #591).
+		std::unordered_map<ChangeKey, size_t, ChangeKeyHash>().swap(index_);
 		for (auto &unit : changes_) {
 			auto &out = summary_.units[unit.first];
 			for (auto &page : unit.second) {
@@ -154,6 +169,7 @@ public:
 						out.finished[page.first].push_back(c);
 					}
 				}
+				std::vector<FuzzySummary::Change>().swap(page.second);
 			}
 		}
 		return std::move(summary_);
@@ -166,6 +182,8 @@ private:
 	//! Where each (unit, page, transaction)'s change is in its page's vector.
 	std::unordered_map<ChangeKey, size_t, ChangeKeyHash> index_;
 	bool saw_checkpoint_ = false;
+	Lsn reached_;
+	uint16_t reached_block_size_ = 0;
 };
 
 //! What the backup holds of a page: its copy's state, and its copy read when Present.
@@ -207,6 +225,16 @@ FuzzySummary SummarizeLogTail(const LogTailReader &tail, const Lsn &first, const
 		throw FormatError("backup: the log tail (" + first.ToDecimal() + " to " + last.ToDecimal() +
 						  ") holds no record at its CheckpointLSN " + checkpoint.ToDecimal() +
 						  ": it is not read whole");
+	}
+	// Nor one that stops before its end: a change committed past where it stops would read as consistent
+	// (review of #591). LastLSN is the record after the backup's, so the check is the record it follows.
+	if (!last.IsZero() && !(last <= first) &&
+		(summarizer.Reached().IsZero() ||
+		 !TailReachesLast(summarizer.Reached(), summarizer.ReachedBlockSize(), last))) {
+		throw FormatError("backup: the log tail (" + first.ToDecimal() + " to " + last.ToDecimal() + ") ends at " +
+						  (summarizer.Reached().IsZero() ? std::string("no record")
+														 : "the record " + summarizer.Reached().ToDecimal()) +
+						  ", not at the record its LastLSN follows: it is not read whole");
 	}
 	return summarizer.Finish();
 }
