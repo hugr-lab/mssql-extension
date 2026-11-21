@@ -1085,6 +1085,9 @@ static void TestSpatialComparisonNotPushed() {
 										 Col("d", 5, "float", 8, 53, 0)};
 	ASSERT_TRUE(cols[3].comparison_differs && cols[3].IsSpatial());
 	ASSERT_TRUE(cols[3].read_form == MSSQLReadForm::Bare && cols[3].duckdb_type == LogicalType::BLOB);
+	// The scan's column is the type the column is read as, so the comparison is BLOB with BLOB, as the
+	// binder leaves it (the fixture's VARCHAR would test a cast's refusal instead).
+	fx.column_types[COL_NAME] = cols[3].duckdb_type;
 	auto ctx = fx.Context();
 	ctx.mssql_columns = &cols;
 	const uint8_t wkb[] = {0x01, 0x01, 0x00, 0x00, 0x00};
@@ -1098,7 +1101,10 @@ static void TestSpatialComparisonNotPushed() {
 	// 2026-11-20), where a curve is NULL here.
 	cols[3] = Col("name", 4, "geometry", -1, 0, 0);
 	ASSERT_TRUE(cols[3].duckdb_type.id() == LogicalTypeId::GEOMETRY);
-	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*is_null, ctx), "([name] IS NULL)");
+	fx.column_types[COL_NAME] = cols[3].duckdb_type;
+	auto is_null_geometry = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
+	is_null_geometry->GetChildrenMutable().push_back(ColRef(fx, COL_NAME));
+	ASSERT_SQL(FilterEncoder::EncodeSearchCondition(*is_null_geometry, ctx), "([name] IS NULL)");
 	// geography is GEOMETRY('OGC:CRS84') under geometry_as 'geometry', a BLOB under 'native'
 	ASSERT_TRUE(Col("g", 1, "geography", -1, 0, 0).duckdb_type == LogicalType::GEOMETRY("OGC:CRS84"));
 	ASSERT_TRUE(Col("g", 1, "geometry", -1, 0, 0).duckdb_type == LogicalType::GEOMETRY());

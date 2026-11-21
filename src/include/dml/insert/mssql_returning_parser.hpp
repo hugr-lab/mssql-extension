@@ -10,6 +10,8 @@
 
 namespace duckdb {
 
+class ClientContext;
+
 //===----------------------------------------------------------------------===//
 // MSSQLReturningParser - Collects the RETURNING rows of an INSERT batch into a
 // DuckDB DataChunk
@@ -31,8 +33,17 @@ namespace duckdb {
 //   mssql::DmlBatchOptions options;
 //   output.Attach(options);
 //   ... mssql::ExecuteDmlBatch(context, connection, sql, options) ...
-//   auto chunk = output.TakeResult();
+//   auto chunk = output.TakeResult(context, warned);
 //===----------------------------------------------------------------------===//
+
+//! Which decode WARNINGs (spec 093 T1 / T5: a sql_variant value read as its bytes, a geometry /
+//! geography value read as NULL) each RETURNING column has logged, by result index. Kept by the
+//! statement (MSSQLInsertExecutor) across its batches, so each is said once a column a statement, as a
+//! scan says it.
+struct MSSQLReturningWarned {
+	std::vector<uint8_t> spatial;  // mssql::SPATIAL_WARNED_* bits
+	std::vector<bool> variant;
+};
 
 class MSSQLReturningParser {
 public:
@@ -53,8 +64,10 @@ public:
 	}
 
 	//! The rows of the last result set, decoded, or nullptr when there were
-	//! none. Throws when that set is not the RETURNING list's shape.
-	unique_ptr<DataChunk> TakeResult();
+	//! none. Throws when that set is not the RETURNING list's shape. A value read as NULL or as its
+	//! bytes is said by the result stream's WARNING (mssql::LogSpatialNotes / LogVariantNotes) on
+	//! `context`, unless `warned` says the statement has said it.
+	unique_ptr<DataChunk> TakeResult(ClientContext &context, MSSQLReturningWarned &warned);
 
 	// Get the DuckDB types for the result columns
 	const vector<LogicalType> &GetResultTypes() const {

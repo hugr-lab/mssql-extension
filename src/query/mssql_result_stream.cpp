@@ -1017,40 +1017,71 @@ mssql::codec::spatial::SpatialColumnNotes MSSQLResultStream::SpatialNotesOf(idx_
 bool MSSQLResultStream::SpatialWarningPending(idx_t c) const {
 	const uint8_t warned = c < spatial_warned_.size() ? spatial_warned_[c] : 0;
 	const auto notes = SpatialNotesOf(c);
-	return (notes.not_geometry > 0 && !(warned & SPATIAL_NOT_GEOMETRY)) ||
-		   (notes.malformed > 0 && !(warned & SPATIAL_MALFORMED));
+	return (notes.not_geometry > 0 && !(warned & mssql::SPATIAL_WARNED_NOT_GEOMETRY)) ||
+		   (notes.malformed > 0 && !(warned & mssql::SPATIAL_WARNED_MALFORMED));
 }
 
 void MSSQLResultStream::SurfaceSpatialWarnings(ClientContext &context) {
 	spatial_warned_.resize(column_metadata_.size(), 0);
 	for (idx_t c = 0; c < column_metadata_.size(); c++) {
-		const auto &meta = column_metadata_[c];
-		if (!meta.IsSpatialUdt()) {
-			continue;
-		}
-		const auto notes = SpatialNotesOf(c);
-		// The ATTACH option first: it is read at ATTACH.
-		if (notes.not_geometry > 0 && !(spatial_warned_[c] & SPATIAL_NOT_GEOMETRY)) {
-			spatial_warned_[c] |= SPATIAL_NOT_GEOMETRY;
-			DUCKDB_LOG_WARNING(context,
-							   "mssql: column \"%s\" (%s) holds values a GEOMETRY cannot hold (a CircularString, "
-							   "CompoundCurve, CurvePolygon or FullGlobe, or collections nested deeper than 15), "
-							   "read as NULL; attach with geometry_as "
-							   "'wkb' (ISO WKB, the curves included) or 'native' (the stored bytes) to read them",
-							   meta.name.c_str(), meta.udt_type_name.c_str());
-		}
-		// A value that is not MS-SSCLRT is NULL, never an error: one value does not fail the scan of its
-		// table (owner, 2026-11-20).
-		if (notes.malformed > 0 && !(spatial_warned_[c] & SPATIAL_MALFORMED)) {
-			spatial_warned_[c] |= SPATIAL_MALFORMED;
-			DUCKDB_LOG_WARNING(context,
-							   "mssql: column \"%s\" (%s): %llu value(s) whose stored bytes cannot be read as %s (the "
-							   "first: %s), read as NULL; attach with geometry_as 'native' to read the stored bytes",
-							   meta.name.c_str(), meta.udt_type_name.c_str(), (unsigned long long)notes.malformed,
-							   meta.udt_type_name.c_str(), mssql::codec::ssclrt::DescribeStatus(notes.first_malformed));
+		if (column_metadata_[c].IsSpatialUdt()) {
+			spatial_warned_[c] =
+				mssql::LogSpatialNotes(context, column_metadata_[c], SpatialNotesOf(c), spatial_warned_[c]);
 		}
 	}
 }
+
+namespace mssql {
+
+uint8_t LogSpatialNotes(ClientContext &context, const tds::ColumnMetadata &column,
+						const codec::spatial::SpatialColumnNotes &notes, uint8_t warned) {
+	// No count in either: on a streaming scan the WARNING is logged as soon as the scan meets the first
+	// such value, so a count would be the count of the chunks read so far, not the column's.
+	// The ATTACH option first: it is read at ATTACH. A column_types override to GEOMETRY decodes whatever
+	// the option says, so it has to go too.
+	if (notes.not_geometry > 0 && !(warned & SPATIAL_WARNED_NOT_GEOMETRY)) {
+		warned |= SPATIAL_WARNED_NOT_GEOMETRY;
+		DUCKDB_LOG_WARNING(context,
+						   "mssql: column \"%s\" (%s) holds values a GEOMETRY cannot hold (a CircularString, "
+						   "CompoundCurve, CurvePolygon or FullGlobe, or collections nested deeper than 15), "
+						   "read as NULL; attach with geometry_as 'wkb' (ISO WKB, the curves included) or 'native' "
+						   "(the stored bytes), and drop any column_types override to GEOMETRY (it still decodes "
+						   "into one), to read them",
+						   column.name.c_str(), column.udt_type_name.c_str());
+	}
+	// A value that is not MS-SSCLRT is NULL, never an error: one value does not fail the scan of its
+	// table (owner, 2026-11-20).
+	if (notes.malformed > 0 && !(warned & SPATIAL_WARNED_MALFORMED)) {
+		warned |= SPATIAL_WARNED_MALFORMED;
+		DUCKDB_LOG_WARNING(context,
+						   "mssql: column \"%s\" (%s) holds values whose stored bytes cannot be read as %s (the "
+						   "first: %s), read as NULL; attach with geometry_as 'native', and drop any column_types "
+						   "override to GEOMETRY (it still decodes into one), to read the stored bytes",
+						   column.name.c_str(), column.udt_type_name.c_str(), column.udt_type_name.c_str(),
+						   codec::ssclrt::DescribeStatus(notes.first_malformed));
+	}
+	return warned;
+}
+
+bool LogVariantNotes(ClientContext &context, const tds::ColumnMetadata &column,
+					 const codec::variant::VariantColumnNotes &notes) {
+	if (notes.unknown_collation + notes.invalid_utf8 == 0) {
+		return false;
+	}
+	// No count: logged at the first chunk (or batch) that meets one, a count would be that chunk's alone.
+	const char *why = notes.unknown_collation && notes.invalid_utf8
+						  ? "under a collation this build has no code page for, and under a UTF-8 collation but "
+							"not UTF-8"
+					  : notes.unknown_collation ? "under a collation this build has no code page for"
+												: "under a UTF-8 collation but not UTF-8";
+	DUCKDB_LOG_WARNING(context,
+					   "mssql: column \"%s\": sql_variant string values read as their bytes (a BLOB inside the "
+					   "VARIANT): %s",
+					   column.name.c_str(), why);
+	return true;
+}
+
+}  // namespace mssql
 
 void MSSQLResultStream::NoteOutOfRange(idx_t c) {
 	if (c < refuse_out_of_range_.size() && refuse_out_of_range_[c]) {
@@ -1163,17 +1194,9 @@ void MSSQLResultStream::SurfaceWarnings(ClientContext &context) {
 				notes.unknown_collation += row_variant_notes_[c].unknown_collation;
 				notes.invalid_utf8 += row_variant_notes_[c].invalid_utf8;
 			}
-			if (notes.unknown_collation + notes.invalid_utf8 == 0) {
-				continue;
+			if (mssql::LogVariantNotes(context, column_metadata_[c], notes)) {
+				variant_notes_warned_[c] = true;
 			}
-			variant_notes_warned_[c] = true;
-			DUCKDB_LOG_WARNING(context,
-							   "mssql: column \"%s\": %llu sql_variant string value(s) read as their bytes (a BLOB "
-							   "inside the VARIANT): %llu under a collation this build has no code page for, %llu "
-							   "under a UTF-8 collation but not UTF-8",
-							   column_metadata_[c].name.c_str(),
-							   (unsigned long long)(notes.unknown_collation + notes.invalid_utf8),
-							   (unsigned long long)notes.unknown_collation, (unsigned long long)notes.invalid_utf8);
 		}
 	}
 

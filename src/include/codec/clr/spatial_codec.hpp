@@ -4,12 +4,13 @@
 // Spec 093 T5 (D6): a geometry / geography column (UDT 0xF0, PLP) read bare and decoded on the client
 // (ssclrt_wkb.hpp) into ISO WKB -- no `.STAsBinary()` on the server, Z and M kept:
 //   - into a GEOMETRY vector (geometry_as 'geometry'): a curve or FullGlobe, which a GEOMETRY cannot hold,
-//     is NULL, and the stream logs one WARNING for the column (MSSQLResultStream::SurfaceWarnings);
+//     is NULL, and its reader logs one WARNING for the column (mssql::LogSpatialNotes: the result stream,
+//     INSERT ... RETURNING);
 //   - into a BLOB vector (geometry_as 'wkb'): the WKB, the curves in their ISO forms;
 //   - geometry_as 'native' never comes here: the stored bytes are the binary kernel's.
 // A value that is not MS-SSCLRT is NULL too, never a read past it and never an error: one value that
 // cannot be read does not fail the scan of its table (owner, 2026-11-20). Both are counted in
-// SpatialColumnNotes, from which the stream logs one WARNING a column for each.
+// SpatialColumnNotes, from which the reader logs one WARNING a column for each.
 //===----------------------------------------------------------------------===//
 
 #pragma once

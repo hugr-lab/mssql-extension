@@ -349,8 +349,8 @@ int main() {
 		const std::vector<uint8_t> envelope = FromHex("A7070904D02400140061FF");
 		duckdb::Vector out(duckdb::LogicalType::VARIANT(), 2);
 		duckdb::mssql::codec::variant::VariantColumnNotes notes;
-		encoding::TypeConverter::ConvertValue(envelope, false, col, out, 0, &notes);
-		encoding::TypeConverter::ConvertValue(envelope, false, col, out, 1);
+		encoding::TypeConverter::ConvertValue(envelope, false, col, out, 0, &notes, nullptr);
+		encoding::TypeConverter::ConvertValue(envelope, false, col, out, 1, nullptr, nullptr);
 		Check(notes.invalid_utf8 == 1 && notes.unknown_collation == 0,
 			  "invalid UTF-8 counted once, only where notes were passed");
 	}

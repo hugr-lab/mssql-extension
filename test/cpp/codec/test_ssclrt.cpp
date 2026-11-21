@@ -785,6 +785,20 @@ void TestDetails() {
 	Check(Decode(FromHex(Find("point_empty", false).stored), false, false, out) == SpatialStatus::Ok &&
 			  ToHex(out) == "0101000000000000000000F87F000000000000F87F",
 		  "POINT EMPTY: a point of two NaN, not the server's MULTIPOINT EMPTY");
+	// A collection whose only member is EMPTY: members, no figure, the member's figure offset -1 (measured on
+	// SQL Server 17.0, review of #594), read, not refused as malformed. The member is DuckDB's POINT EMPTY.
+	Check(Decode(FromHex("000000000104000000000000000002000000FFFFFFFFFFFFFFFF0700000000FFFFFFFF01"), false, false,
+				 out) == SpatialStatus::Ok &&
+			  ToHex(out) ==
+				  "010700000001000000"
+				  "0101000000000000000000F87F000000000000F87F",
+		  "GEOMETRYCOLLECTION(POINT EMPTY): one member, a point of two NaN");
+	Check(Decode(FromHex("000000000104000000000000000002000000FFFFFFFFFFFFFFFF0400000000FFFFFFFF01"), false, false,
+				 out) == SpatialStatus::Ok &&
+			  ToHex(out) ==
+				  "010400000001000000"
+				  "0101000000000000000000F87F000000000000F87F",
+		  "MULTIPOINT(EMPTY): one member, a point of two NaN");
 	// FullGlobe under 'wkb' is the server's type 126.
 	Check(Decode(FromHex(Find("g_fullglobe", true).stored), true, true, out) == SpatialStatus::Ok &&
 			  ToHex(out) == "017E000000",
@@ -1152,17 +1166,19 @@ void TestReadPath() {
 	got = Stage(geometry, LogicalType::GEOMETRY(), {&point, &point, &point}, out_of_range, constant);
 	Check(constant && got[2] == point_v.wkb && out_of_range == 0, "three equal points: a constant POINT ZM");
 
-	// Per value (the RETURNING parser's path).
+	// Per value (the RETURNING parser's path); the counting is checked below, with notes passed.
 	duckdb::Vector out(LogicalType::GEOMETRY(), 4);
-	TypeConverter::ConvertValue(point, false, geometry, out, 0);
-	TypeConverter::ConvertValue(circ, false, geometry, out, 1);
-	TypeConverter::ConvertValue(point, true, geometry, out, 2);
+	TypeConverter::ConvertValue(point, false, geometry, out, 0, nullptr, nullptr);
+	TypeConverter::ConvertValue(circ, false, geometry, out, 1, nullptr, nullptr);
+	TypeConverter::ConvertValue(point, true, geometry, out, 2, nullptr, nullptr);
 	Check(ToHex(duckdb::StringValue::Get(out.GetValue(0))) == point_v.wkb && out.GetValue(1).IsNull() &&
 			  out.GetValue(2).IsNull(),
 		  "per value: POINT ZM, the CircularString NULL, a NULL");
 	duckdb::Vector blob(LogicalType::BLOB, 2);
-	TypeConverter::ConvertValue(circ, false, SpatialColumn("g", "geometry", GeometryAs::Wkb), blob, 0);
-	TypeConverter::ConvertValue(circ, false, SpatialColumn("g", "geometry", GeometryAs::Native), blob, 1);
+	TypeConverter::ConvertValue(circ, false, SpatialColumn("g", "geometry", GeometryAs::Wkb), blob, 0, nullptr,
+								nullptr);
+	TypeConverter::ConvertValue(circ, false, SpatialColumn("g", "geometry", GeometryAs::Native), blob, 1, nullptr,
+								nullptr);
 	Check(ToHex(duckdb::StringValue::Get(blob.GetValue(0))) == circ_v.wkb &&
 			  ToHex(duckdb::StringValue::Get(blob.GetValue(1))) == circ_v.stored,
 		  "per value, BLOB: the WKB under 'wkb', the stored bytes under 'native'");

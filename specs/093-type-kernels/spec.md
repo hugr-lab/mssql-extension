@@ -502,11 +502,17 @@ A raw `mssql_scan` takes the type from UDT_INFO's type name (geometry, geography
   column type follows it in `MSSQLColumnInfo` (`'wkb'` / `'native'`: BLOB). **Not registered on the
   backup side**: there a spatial column is its stored bytes until T8 hooks the kernel, and a
   `geometry_as` defaulting to `'geometry'` would have named bytes; a TODO in `TypeReading` says so.
-- **The warning**: one per column per stream, as D8's (the stager's `ChunkOutOfRange` counts the
-  kernel's NULLs; `SurfaceWarnings` words it by the column's type): `mssql: column "g" (geometry) holds
-  values a GEOMETRY cannot hold (a CircularString, CompoundCurve, CurvePolygon or FullGlobe, or
-  collections nested deeper than 15), read as NULL; attach with geometry_as 'wkb' (ISO WKB, the curves
-  included) or 'native' (the stored bytes) to read them`. The stream knows the column, not its table, so the table is not named (D8's form).
+- **The warning**: one per column per stream, as D8's, but not counted through D8's `ChunkOutOfRange`
+  (0 for anything but a datetime2 read as TIMESTAMP_NS): the kernel counts its NULLs in
+  `SpatialColumnNotes` (`not_geometry`; `malformed` and the first one's status for a value that is not
+  MS-SSCLRT, NULL too since the owner's 2026-11-20 rule, with a WARNING of its own), the stager's
+  `SpatialNotes` and the per-value path's, and `mssql::LogSpatialNotes` words them by the column's type
+  -- for the stream (`SurfaceSpatialWarnings`) and for INSERT … RETURNING (`MSSQLReturningParser`) alike,
+  with no count, as a streaming scan says it at the first chunk that meets one: `mssql: column "g"
+  (geometry) holds values a GEOMETRY cannot hold (a CircularString, CompoundCurve, CurvePolygon or
+  FullGlobe, or collections nested deeper than 15), read as NULL; attach with geometry_as 'wkb' (ISO WKB,
+  the curves included) or 'native' (the stored bytes), and drop any column_types override to GEOMETRY
+  (it still decodes into one), to read them`. The stream knows the column, not its table, so the table is not named (D8's form).
 - **Comparisons**: `ComparisonDiffersFor` now names geometry / geography (D2's third answer: under
   `'wkb'` / `'native'` a `BLOB` filter would otherwise have been pushed against the column), so a
   filter on one runs in DuckDB; `IsSpatial()` asks the type name now that the read form is `Bare` (the

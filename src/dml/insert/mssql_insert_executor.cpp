@@ -225,7 +225,7 @@ unique_ptr<DataChunk> MSSQLInsertExecutor::ExecuteBatchWithOutput(const MSSQLIns
 	const idx_t rows = output.GetRowCount();
 	unique_ptr<DataChunk> result;
 	try {
-		result = output.TakeResult();
+		result = output.TakeResult(context_, returning_warned_);
 	} catch (const std::exception &e) {
 		ThrowClientFault(batch, e, mssql_catalog);
 	}

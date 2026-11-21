@@ -774,7 +774,11 @@ parser -- before `TypeConverter::GetDuckDBType` is asked:
 
 In both decoding modes a value whose bytes are not MS-SSCLRT is set NULL and counted
 (`SpatialColumnNotes::malformed`, the first one's status kept), with a WARNING of its own: the kernel
-never throws, so one value does not fail a scan (owner, 2026-11-20).
+never throws, so one value does not fail a scan (owner, 2026-11-20). Both WARNINGs are worded by one
+function, `mssql::LogSpatialNotes` (a sql_variant's by `LogVariantNotes`), for the stream and for
+INSERT … RETURNING (`MSSQLReturningParser`, its once-a-column state kept by the statement across its
+batches); neither spatial one gives a count, as a streaming scan logs at the first chunk that meets one.
+`TypeConverter::ConvertValue` takes both notes with no default, so a reader that counts nothing says so.
 
 A `GEOMETRY` target is decoded whatever `geometry_as` says (a raw scan's `column_types`). The column is
 out of pushed comparisons, ORDER BY and keys (`comparison_differs`, `IsSpatial()`); `IS NULL` and

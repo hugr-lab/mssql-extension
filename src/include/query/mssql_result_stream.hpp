@@ -23,6 +23,24 @@ class ConnectionPool;
 //! error numbers of the statement, decimal, comma-separated, in the order they came (issue #570).
 static constexpr const char *MSSQL_SERVER_ERROR_NUMBERS = "mssql_server_error_numbers";
 
+namespace mssql {
+
+//! Spec 093 T1 / T5: the WARNINGs a column's decode notes call for, in one wording for every reader of
+//! a result set -- MSSQLResultStream and INSERT ... RETURNING (MSSQLReturningParser). Each is said once
+//! a column a statement; the caller keeps what was said.
+//!
+//! The spatial ones, by kind: `warned` holds the SPATIAL_WARNED_* bits the column has logged; returned,
+//! the whole set after this call (`warned` and what it logged).
+static constexpr uint8_t SPATIAL_WARNED_NOT_GEOMETRY = 1;
+static constexpr uint8_t SPATIAL_WARNED_MALFORMED = 2;
+uint8_t LogSpatialNotes(ClientContext &context, const tds::ColumnMetadata &column,
+						const codec::spatial::SpatialColumnNotes &notes, uint8_t warned);
+//! The sql_variant one: whether it was logged (a column with no value read as its bytes logs nothing).
+bool LogVariantNotes(ClientContext &context, const tds::ColumnMetadata &column,
+					 const codec::variant::VariantColumnNotes &notes);
+
+}  // namespace mssql
+
 //===----------------------------------------------------------------------===//
 // MSSQLResultStream - Streaming result iterator that yields DataChunks
 //===----------------------------------------------------------------------===//
@@ -278,10 +296,8 @@ private:
 	std::vector<uint8_t> vector_text_;
 	void NoteVectorText(idx_t c);
 	std::vector<mssql::codec::variant::VariantColumnNotes> row_variant_notes_;
-	//! Spec 093 T5: per column, which of its spatial WARNINGs were logged (SPATIAL_* bits); and the
-	//! per-value path's counts, beside the stager's.
-	static constexpr uint8_t SPATIAL_NOT_GEOMETRY = 1;
-	static constexpr uint8_t SPATIAL_MALFORMED = 2;
+	//! Spec 093 T5: per column, which of its spatial WARNINGs were logged (mssql::SPATIAL_WARNED_* bits);
+	//! and the per-value path's counts, beside the stager's.
 	std::vector<uint8_t> spatial_warned_;
 	std::vector<mssql::codec::spatial::SpatialColumnNotes> row_spatial_notes_;
 	//! The column's spatial counts, the stager's and the per-value path's together.

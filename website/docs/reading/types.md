@@ -229,7 +229,8 @@ catalog and a raw `mssql_scan()` alike, so they compose with the DuckDB `spatial
   | `'native'` | `BLOB` | the stored bytes, `CAST(g AS varbinary(max))`; they load back by `CAST(… AS geometry)` |
 
   Under `'geometry'` and `'wkb'` a stored value whose bytes cannot be read is NULL, with a WARNING of
-  its own naming the column, how many and the first one's fault; the scan goes on. `'native'` reads
+  its own naming the column and the first one's fault (not how many: a streaming scan says it as soon
+  as it meets one); the scan goes on. `'native'` reads
   such a value's bytes as they are.
 
   Under `'native'` an `INSERT` or `UPDATE` of a spatial column that the extension writes row by row

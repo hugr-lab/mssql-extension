@@ -181,18 +181,21 @@ scan refused them.
   ```
   mssql: column "g" (geometry) holds values a GEOMETRY cannot hold (a CircularString, CompoundCurve,
   CurvePolygon or FullGlobe, or collections nested deeper than 15), read as NULL; attach with
-  geometry_as 'wkb' (ISO WKB, the curves included) or 'native' (the stored bytes) to read them
+  geometry_as 'wkb' (ISO WKB, the curves included) or 'native' (the stored bytes), and drop any
+  column_types override to GEOMETRY (it still decodes into one), to read them
   ```
 
   Collections nested deeper than 15, which DuckDB's `GEOMETRY` does not read, are NULL the same way.
 
 - **A value whose bytes are not MS-SSCLRT** (truncated, a figure, shape or segment out of place) is
   NULL too, under `'geometry'` and `'wkb'` alike, never an error: one value does not fail the scan of
-  its table. Its own `WARNING`, once per column, names the count and the first value's fault:
+  its table. Its own `WARNING`, once per column, names the first value's fault (not how many: a
+  streaming scan says it as soon as it meets one):
 
   ```
-  mssql: column "g" (geometry): 1 value(s) whose stored bytes cannot be read as geometry (the first:
-  ...), read as NULL; attach with geometry_as 'native' to read the stored bytes
+  mssql: column "g" (geometry) holds values whose stored bytes cannot be read as geometry (the first:
+  ...), read as NULL; attach with geometry_as 'native', and drop any column_types override to
+  GEOMETRY (it still decodes into one), to read the stored bytes
   ```
 
   A compound curve's segments are checked before it is answered a curve, so corrupt segments are this
